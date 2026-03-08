@@ -61,9 +61,357 @@ struct GemvBatchArgs
 
 static std::atomic<int> g_int8_vnni_tn_override{-1};
 static std::atomic<int> g_int8_vnni_kb_override{-1};
+static std::atomic<int> g_int8_vnni_wk_override{-1};
+static std::atomic<int> g_int8_vnni_unroll_override{-1};  // 1=standard, 2=2x act_block unroll
+static std::atomic<int> g_int8_vnni_act_block_override{-1};  // -1=default(32), 32, 64, 128
 static std::atomic<int> g_int8_vnni_wide_tn_override{-1};
 static std::atomic<int> g_int8_vnni_wide_cpt_override{-1};
 static std::atomic<int> g_int8_vnni_wide_vec_load_override{-1};
+static std::atomic<int> g_int8_vnni_skip_memset_override{0};  // 1 = skip hipMemsetAsync (for benchmarking)
+static std::atomic<int> g_int8_vnni_force_pair_override{0};  // 1 = force batched pair path (skip split-to-singles)
+
+static float* s_blockwise_single_partial[8] = {};
+static size_t s_blockwise_single_partial_elems[8] = {};
+
+static inline int select_blockwise_split_count(int grid_n, int act_blocks, int kb_override)
+{
+    constexpr int NUM_CUS = 60;
+    constexpr int MIN_ACT_BLOCKS_PER_WAVE = 2;
+
+    const int target_waves_per_cu = (grid_n <= 4) ? 2 : ((grid_n <= 8) ? 4 : 8);
+    int target_blocks = target_waves_per_cu * NUM_CUS;
+    int kb_raw = max(1, (target_blocks + grid_n - 1) / grid_n);
+    int kb_max = max(1, act_blocks / MIN_ACT_BLOCKS_PER_WAVE);
+    kb_raw = min(kb_raw, kb_max);
+
+    int kb = kb_raw;
+    if (act_blocks % kb_raw != 0)
+    {
+        for (int d = 1; d < kb_raw; ++d)
+        {
+            if (kb_raw - d >= 1 && act_blocks % (kb_raw - d) == 0) { kb = kb_raw - d; break; }
+            if (kb_raw + d <= kb_max && act_blocks % (kb_raw + d) == 0) { kb = kb_raw + d; break; }
+        }
+    }
+
+    if (kb_override > 0)
+    {
+        kb = min(kb_override, act_blocks);
+    }
+
+    return max(1, kb);
+}
+
+static inline int select_blockwise_lds_kreduce_outer_splits(int grid_n, int act_blocks, int kb_override)
+{
+    constexpr int NUM_CUS = 60;
+    constexpr int WK = 4;
+    constexpr int MIN_ACT_BLOCKS_PER_WAVE = 2;
+
+    const int target_waves = 8 * NUM_CUS;
+    int kb_raw = max(1, (target_waves + (grid_n * WK) - 1) / (grid_n * WK));
+    int kb_max = max(1, act_blocks / (MIN_ACT_BLOCKS_PER_WAVE * WK));
+    kb_raw = min(kb_raw, kb_max);
+
+    int kb = kb_raw;
+    if (act_blocks % kb_raw != 0)
+    {
+        for (int d = 1; d < kb_raw; ++d)
+        {
+            if (kb_raw - d >= 1 && act_blocks % (kb_raw - d) == 0) { kb = kb_raw - d; break; }
+            if (kb_raw + d <= kb_max && act_blocks % (kb_raw + d) == 0) { kb = kb_raw + d; break; }
+        }
+    }
+
+    if (kb_override > 0)
+    {
+        kb = min(kb_override, act_blocks);
+    }
+
+    return max(1, kb);
+}
+
+static inline int select_blockwise_tiny_kv_outer_splits(int grid_n, int act_blocks, int kb_override)
+{
+    constexpr int NUM_CUS = 60;
+    constexpr int WK = 8;
+    constexpr int MIN_ACT_BLOCKS_PER_WAVE = 1;
+
+    const int target_waves = 8 * NUM_CUS;
+    int kb_raw = max(1, (target_waves + (grid_n * WK) - 1) / (grid_n * WK));
+    int kb_max = max(1, act_blocks / (MIN_ACT_BLOCKS_PER_WAVE * WK));
+    kb_raw = min(kb_raw, kb_max);
+
+    int kb = kb_raw;
+    if (act_blocks % kb_raw != 0)
+    {
+        for (int d = 1; d < kb_raw; ++d)
+        {
+            if (kb_raw - d >= 1 && act_blocks % (kb_raw - d) == 0) { kb = kb_raw - d; break; }
+            if (kb_raw + d <= kb_max && act_blocks % (kb_raw + d) == 0) { kb = kb_raw + d; break; }
+        }
+    }
+
+    if (kb_override > 0)
+    {
+        kb = min(kb_override, act_blocks);
+    }
+
+    return max(1, kb);
+}
+
+static inline int select_blockwise_qwo_outer_splits(int grid_n, int act_blocks, int kb_override, int wk = 8)
+{
+    if (kb_override > 0)
+    {
+        return max(1, min(kb_override, act_blocks));
+    }
+
+    // Two regimes based on K-dimension work per wave:
+    //
+    // Small K (Q/Wo: act_blocks=112, acts_per_wave_single=14):
+    //   Each wave has little work at KB=1. Maximize CU parallelism by splitting
+    //   to ~1 act_block per wave → KB = act_blocks/wk (= 14 for Q/Wo).
+    //
+    // Large K (FFN Down: act_blocks=592, acts_per_wave_single=74):
+    //   Each wave has tons of work. Prefer FEWER splits for long memory-streaming
+    //   loops and fewer atomicAdd reductions. Target ~16 acts per wave.
+    //
+    // Occupancy floor: ensure at least 8 waves per CU (480 total on 60 CUs)
+    // to avoid leaving CUs idle on smaller grid_n shapes.
+    //
+    // Verified by sweep: Q/Wo 7B=14, FFN Down 7B=4, FFN Down 3B=4.
+    constexpr int TARGET_ACTS_PER_WAVE = 16;
+    constexpr int MIN_WAVES_PER_CU = 8;
+    constexpr int NUM_CUS = 60;
+
+    const int acts_per_wave_single_kb = act_blocks / wk;
+
+    int ideal_kb;
+    if (acts_per_wave_single_kb <= TARGET_ACTS_PER_WAVE)
+    {
+        ideal_kb = acts_per_wave_single_kb;
+    }
+    else
+    {
+        ideal_kb = act_blocks / (wk * TARGET_ACTS_PER_WAVE);
+    }
+
+    // Floor: fill CUs with enough waves for memory latency hiding
+    const int min_total_waves = MIN_WAVES_PER_CU * NUM_CUS;
+    const int min_kb = (min_total_waves + grid_n * wk - 1) / (grid_n * wk);
+    ideal_kb = max(ideal_kb, min_kb);
+
+    return max(1, min(ideal_kb, act_blocks));
+}
+
+static inline bool ensure_blockwise_single_partial_buffer(
+    int device_id,
+    size_t required_elements,
+    float** out_buffer)
+{
+    const int dev_slot = device_id & 7;
+    if (s_blockwise_single_partial[dev_slot] && s_blockwise_single_partial_elems[dev_slot] >= required_elements)
+    {
+        *out_buffer = s_blockwise_single_partial[dev_slot];
+        return true;
+    }
+
+    if (s_blockwise_single_partial[dev_slot])
+    {
+        hipError_t free_err = hipFree(s_blockwise_single_partial[dev_slot]);
+        if (free_err != hipSuccess)
+        {
+            fprintf(stderr, "[ensure_blockwise_single_partial_buffer] hipFree failed: %s\n",
+                    hipGetErrorString(free_err));
+            return false;
+        }
+        s_blockwise_single_partial[dev_slot] = nullptr;
+        s_blockwise_single_partial_elems[dev_slot] = 0;
+    }
+
+    hipError_t alloc_err = hipMalloc(&s_blockwise_single_partial[dev_slot], required_elements * sizeof(float));
+    if (alloc_err != hipSuccess)
+    {
+        fprintf(stderr, "[ensure_blockwise_single_partial_buffer] hipMalloc failed: %s (elements=%zu)\n",
+                hipGetErrorString(alloc_err), required_elements);
+        return false;
+    }
+
+    s_blockwise_single_partial_elems[dev_slot] = required_elements;
+    *out_buffer = s_blockwise_single_partial[dev_slot];
+    return true;
+}
+
+constexpr int GEMV_INT8_VNNI_ACT_BLOCK_K = 32;
+constexpr int GEMV_INT8_VNNI_KGROUPS_PER_ACT_BLOCK = GEMV_INT8_VNNI_ACT_BLOCK_K / 4;
+
+template <int CPT, int KGROUPS_PER_ACT = GEMV_INT8_VNNI_KGROUPS_PER_ACT_BLOCK>
+__device__ __forceinline__ void gemv_int8_accumulate_act_block(
+    int32_t (&acc)[CPT],
+    const int8_t* __restrict__ d_A_int8,
+    const int32_t* __restrict__ b_row,
+    size_t b_stride,
+    int kg_base)
+{
+    #pragma unroll
+    for (int kgi = 0; kgi < KGROUPS_PER_ACT; ++kgi)
+    {
+        const int kg = kg_base + kgi;
+        const int32_t a_packed = *reinterpret_cast<const int32_t*>(d_A_int8 + kg * 4);
+
+        if constexpr (CPT == 2)
+        {
+            const int2 b_pair = *reinterpret_cast<const int2*>(b_row + kg * b_stride);
+            acc[0] = __builtin_amdgcn_sdot4(a_packed, b_pair.x, acc[0], false);
+            acc[1] = __builtin_amdgcn_sdot4(a_packed, b_pair.y, acc[1], false);
+        }
+        else
+        {
+            #pragma unroll
+            for (int c = 0; c < CPT; ++c)
+            {
+                const int32_t b_packed = *(b_row + kg * b_stride + c);
+                acc[c] = __builtin_amdgcn_sdot4(a_packed, b_packed, acc[c], false);
+            }
+        }
+    }
+}
+
+template <int CPT>
+__device__ __forceinline__ void gemv_int8_flush_blockwise_acc(
+    int32_t (&block_acc)[CPT],
+    float (&fp_acc)[CPT],
+    const float* __restrict__ d_scale_A_blockwise,
+    int act_block_idx)
+{
+    const float scale_a = d_scale_A_blockwise[act_block_idx];
+    #pragma unroll
+    for (int c = 0; c < CPT; ++c)
+    {
+        fp_acc[c] += static_cast<float>(block_acc[c]) * scale_a;
+        block_acc[c] = 0;
+    }
+}
+
+__device__ __forceinline__ int gemv_find_batch_for_block(
+    const GemvBatchArgs& args,
+    int global_block_x)
+{
+    int batch = 0;
+    #pragma unroll
+    for (int b = 1; b < MAX_GEMV_BATCH; ++b)
+    {
+        if (b < args.num_batches && global_block_x >= args.grid_n_offset[b])
+        {
+            batch = b;
+        }
+    }
+    return batch;
+}
+
+template <int TILE_N, int CPT>
+__global__ void gemv_init_output_kernel_t(
+    float* __restrict__ d_C_fp32,
+    const float* __restrict__ d_C_existing,
+    const float* __restrict__ d_bias,
+    int N,
+    float beta)
+{
+    const int n_base = blockIdx.x * TILE_N + threadIdx.x * CPT;
+
+    #pragma unroll
+    for (int c = 0; c < CPT; ++c)
+    {
+        const int n = n_base + c;
+        if (n >= N)
+        {
+            return;
+        }
+
+        float result = 0.0f;
+        if (beta != 0.0f && d_C_existing)
+        {
+            result += beta * d_C_existing[n];
+        }
+        if (d_bias)
+        {
+            result += d_bias[n];
+        }
+        d_C_fp32[n] = result;
+    }
+}
+
+template <int TILE_N, int CPT>
+__global__ void gemv_init_output_batched_kernel_t(
+    GemvBatchArgs args,
+    float beta)
+{
+    const int batch = gemv_find_batch_for_block(args, blockIdx.x);
+    const int local_block_x = blockIdx.x - args.grid_n_offset[batch];
+    const int n_base = local_block_x * TILE_N + threadIdx.x * CPT;
+
+    #pragma unroll
+    for (int c = 0; c < CPT; ++c)
+    {
+        const int n = n_base + c;
+        if (n >= args.N[batch])
+        {
+            return;
+        }
+
+        float result = 0.0f;
+        if (beta != 0.0f)
+        {
+            result += beta * args.d_C[batch][n];
+        }
+        if (args.d_bias[batch])
+        {
+            result += args.d_bias[batch][n];
+        }
+        args.d_C[batch][n] = result;
+    }
+}
+
+template <int TILE_N, int CPT>
+__global__ void gemv_init_output_pair_kernel_t(
+    float* __restrict__ d_C0,
+    float* __restrict__ d_C1,
+    const float* __restrict__ d_bias0,
+    const float* __restrict__ d_bias1,
+    int N0,
+    int N1,
+    int grid_n0,
+    float beta)
+{
+    const bool second = (blockIdx.x >= grid_n0);
+    const int local_block_x = second ? (blockIdx.x - grid_n0) : blockIdx.x;
+    const int n_base = local_block_x * TILE_N + threadIdx.x * CPT;
+    float* __restrict__ d_C = second ? d_C1 : d_C0;
+    const float* __restrict__ d_bias = second ? d_bias1 : d_bias0;
+    const int N = second ? N1 : N0;
+
+    #pragma unroll
+    for (int c = 0; c < CPT; ++c)
+    {
+        const int n = n_base + c;
+        if (n >= N)
+        {
+            return;
+        }
+
+        float result = 0.0f;
+        if (beta != 0.0f)
+        {
+            result += beta * d_C[n];
+        }
+        if (d_bias)
+        {
+            result += d_bias[n];
+        }
+        d_C[n] = result;
+    }
+}
 
 __global__ void gemv_int8_int8_vnni_kernel(
     const int8_t* __restrict__ d_A_int8,
@@ -907,6 +1255,56 @@ __global__ void gemv_int8_int8_vnni_scaled_kernel(
     d_C_fp32[n] = result;
 }
 
+__global__ void gemv_int8_int8_vnni_blockwise_scaled_kernel(
+    const int8_t* __restrict__ d_A_int8,
+    const int8_t* __restrict__ d_B_int8_vnni,
+    float* __restrict__ d_C_fp32,
+    const float* __restrict__ d_scales_A_blockwise,
+    const float* __restrict__ d_scale_B,
+    int N,
+    int K,
+    float alpha,
+    float beta,
+    const float* __restrict__ d_C_existing,
+    const float* __restrict__ d_bias)
+{
+    const int n = blockIdx.x * GEMV_TILE_N + threadIdx.x;
+    if (n >= N) return;
+
+    float fp_acc = 0.0f;
+    const int32_t* __restrict__ b_row = reinterpret_cast<const int32_t*>(
+        d_B_int8_vnni + static_cast<size_t>(n) * 4);
+    const size_t b_stride = static_cast<size_t>(N);
+    const int act_blocks = K / GEMV_INT8_VNNI_ACT_BLOCK_K;
+
+    for (int act_block = 0; act_block < act_blocks; ++act_block)
+    {
+        int32_t block_acc = 0;
+        const int kg_base = act_block * GEMV_INT8_VNNI_KGROUPS_PER_ACT_BLOCK;
+        #pragma unroll
+        for (int kgi = 0; kgi < GEMV_INT8_VNNI_KGROUPS_PER_ACT_BLOCK; ++kgi)
+        {
+            const int kg = kg_base + kgi;
+            const int32_t a_packed = *reinterpret_cast<const int32_t*>(d_A_int8 + kg * 4);
+            const int32_t b_packed = *(b_row + kg * b_stride);
+            block_acc = __builtin_amdgcn_sdot4(a_packed, b_packed, block_acc, false);
+        }
+        fp_acc += static_cast<float>(block_acc) * d_scales_A_blockwise[act_block];
+    }
+
+    float result = fp_acc * d_scale_B[n];
+    result *= alpha;
+    if (beta != 0.0f)
+    {
+        result += beta * d_C_existing[n];
+    }
+    if (d_bias)
+    {
+        result += d_bias[n];
+    }
+    d_C_fp32[n] = result;
+}
+
 template <int TILE_N, int CPT, bool VEC_PACKED_LOAD>
 __global__ void gemv_int8_int8_wide_vnni_scaled_kernel_t(
     const int8_t* __restrict__ d_A_int8,
@@ -1017,6 +1415,134 @@ __global__ void gemv_int8_int8_wide_vnni_scaled_kernel_t(
     }
 }
 
+template <int TILE_N, int CPT, bool VEC_PACKED_LOAD>
+__global__ void gemv_int8_int8_wide_vnni_blockwise_scaled_kernel_t(
+    const int8_t* __restrict__ d_A_int8,
+    const int8_t* __restrict__ d_B_int8_vnni,
+    float* __restrict__ d_C_fp32,
+    const float* __restrict__ d_scales_A_blockwise,
+    const float* __restrict__ d_scale_B,
+    int N,
+    int K,
+    float alpha,
+    float beta,
+    const float* __restrict__ d_C_existing,
+    const float* __restrict__ d_bias)
+{
+    const int n_base = blockIdx.x * TILE_N + threadIdx.x * CPT;
+    if (n_base >= N) return;
+
+    float fp_acc[CPT];
+    #pragma unroll
+    for (int c = 0; c < CPT; ++c) fp_acc[c] = 0.0f;
+
+    const bool full_cols = (n_base + (CPT - 1) < N);
+    const int32_t* __restrict__ b_row = reinterpret_cast<const int32_t*>(
+        d_B_int8_vnni + static_cast<size_t>(n_base) * 4);
+    const size_t b_stride = static_cast<size_t>(N);
+    const int act_blocks = K / GEMV_INT8_VNNI_ACT_BLOCK_K;
+
+    for (int act_block = 0; act_block < act_blocks; ++act_block)
+    {
+        int32_t acc[CPT];
+        #pragma unroll
+        for (int c = 0; c < CPT; ++c) acc[c] = 0;
+
+        const int kg_base = act_block * GEMV_INT8_VNNI_KGROUPS_PER_ACT_BLOCK;
+        #pragma unroll
+        for (int kgi = 0; kgi < GEMV_INT8_VNNI_KGROUPS_PER_ACT_BLOCK; ++kgi)
+        {
+            const int kg = kg_base + kgi;
+            const int32_t a_packed = *reinterpret_cast<const int32_t*>(d_A_int8 + kg * 4);
+            const int32_t* __restrict__ b_pack_row = b_row + kg * b_stride;
+
+            if constexpr (VEC_PACKED_LOAD && CPT == 4)
+            {
+                if (full_cols)
+                {
+                    const int4 b = *reinterpret_cast<const int4*>(b_pack_row);
+                    acc[0] = __builtin_amdgcn_sdot4(a_packed, b.x, acc[0], false);
+                    acc[1] = __builtin_amdgcn_sdot4(a_packed, b.y, acc[1], false);
+                    acc[2] = __builtin_amdgcn_sdot4(a_packed, b.z, acc[2], false);
+                    acc[3] = __builtin_amdgcn_sdot4(a_packed, b.w, acc[3], false);
+                }
+                else
+                {
+                    #pragma unroll
+                    for (int c = 0; c < CPT; ++c)
+                    {
+                        if (n_base + c < N)
+                        {
+                            const int32_t b = *(b_pack_row + c);
+                            acc[c] = __builtin_amdgcn_sdot4(a_packed, b, acc[c], false);
+                        }
+                    }
+                }
+            }
+            else if constexpr (VEC_PACKED_LOAD && CPT == 2)
+            {
+                if (full_cols)
+                {
+                    const int2 b = *reinterpret_cast<const int2*>(b_pack_row);
+                    acc[0] = __builtin_amdgcn_sdot4(a_packed, b.x, acc[0], false);
+                    acc[1] = __builtin_amdgcn_sdot4(a_packed, b.y, acc[1], false);
+                }
+                else
+                {
+                    #pragma unroll
+                    for (int c = 0; c < CPT; ++c)
+                    {
+                        if (n_base + c < N)
+                        {
+                            const int32_t b = *(b_pack_row + c);
+                            acc[c] = __builtin_amdgcn_sdot4(a_packed, b, acc[c], false);
+                        }
+                    }
+                }
+            }
+            else
+            {
+                #pragma unroll
+                for (int c = 0; c < CPT; ++c)
+                {
+                    if (n_base + c < N)
+                    {
+                        const int32_t b = *(b_pack_row + c);
+                        acc[c] = __builtin_amdgcn_sdot4(a_packed, b, acc[c], false);
+                    }
+                }
+            }
+        }
+
+        const float scale_a = d_scales_A_blockwise[act_block];
+        #pragma unroll
+        for (int c = 0; c < CPT; ++c)
+        {
+            fp_acc[c] += static_cast<float>(acc[c]) * scale_a;
+        }
+    }
+
+    #pragma unroll
+    for (int c = 0; c < CPT; ++c)
+    {
+        const int n = n_base + c;
+        if (n < N)
+        {
+            float out = fp_acc[c] * d_scale_B[n];
+            out *= alpha;
+            if (beta != 0.0f)
+            {
+                out += beta * d_C_existing[n];
+            }
+            if (d_bias)
+            {
+                out += d_bias[n];
+            }
+            d_C_fp32[n] = out;
+        }
+    }
+}
+
 __global__ void gemv_int8_int8_square_vnni_scaled_kernel(
     const int8_t* __restrict__ d_A_int8,
     const int8_t* __restrict__ d_B_int8_vnni,
@@ -1063,6 +1589,345 @@ __global__ void gemv_int8_int8_square_vnni_scaled_kernel(
     if (beta != 0.0f)
     {
         result += beta * d_C_existing[n];
+    }
+    if (d_bias)
+    {
+        result += d_bias[n];
+    }
+    d_C_fp32[n] = result;
+}
+
+__global__ void gemv_int8_int8_square_vnni_blockwise_scaled_kernel(
+    const int8_t* __restrict__ d_A_int8,
+    const int8_t* __restrict__ d_B_int8_vnni,
+    float* __restrict__ d_C_fp32,
+    const float* __restrict__ d_scales_A_blockwise,
+    const float* __restrict__ d_scale_B,
+    int N,
+    int K,
+    float alpha,
+    float beta,
+    const float* __restrict__ d_C_existing,
+    const float* __restrict__ d_bias)
+{
+    const int n = blockIdx.x * GEMV_INT8_VNNI_SQUARE_TILE_N + threadIdx.x;
+    if (n >= N) return;
+
+    float fp_acc = 0.0f;
+    __shared__ int8_t sA[GEMV_INT8_VNNI_KPAR_TILE_K];
+
+    for (int k_tile_base = 0; k_tile_base < K; k_tile_base += GEMV_INT8_VNNI_KPAR_TILE_K)
+    {
+        const int tile_k = min(GEMV_INT8_VNNI_KPAR_TILE_K, K - k_tile_base);
+        for (int i = threadIdx.x; i < tile_k; i += blockDim.x)
+        {
+            sA[i] = d_A_int8[k_tile_base + i];
+        }
+        __syncthreads();
+
+        const int tile_act_blocks = tile_k / GEMV_INT8_VNNI_ACT_BLOCK_K;
+        const int act_block_base = k_tile_base / GEMV_INT8_VNNI_ACT_BLOCK_K;
+        const int tile_k_group_base = k_tile_base / 4;
+
+        #pragma unroll
+        for (int tile_block = 0; tile_block < GEMV_INT8_VNNI_KPAR_TILE_K / GEMV_INT8_VNNI_ACT_BLOCK_K; ++tile_block)
+        {
+            if (tile_block >= tile_act_blocks)
+            {
+                break;
+            }
+
+            int32_t block_acc = 0;
+            const int local_k_byte = tile_block * GEMV_INT8_VNNI_ACT_BLOCK_K;
+            const int k_group_base = tile_k_group_base + tile_block * GEMV_INT8_VNNI_KGROUPS_PER_ACT_BLOCK;
+            #pragma unroll
+            for (int kgi = 0; kgi < GEMV_INT8_VNNI_KGROUPS_PER_ACT_BLOCK; ++kgi)
+            {
+                const int32_t a_packed = *reinterpret_cast<const int32_t*>(sA + local_k_byte + kgi * 4);
+                const int32_t b_packed = *reinterpret_cast<const int32_t*>(
+                    d_B_int8_vnni + (static_cast<size_t>(k_group_base + kgi) * N + n) * 4);
+                block_acc = __builtin_amdgcn_sdot4(a_packed, b_packed, block_acc, false);
+            }
+
+            fp_acc += static_cast<float>(block_acc) * d_scales_A_blockwise[act_block_base + tile_block];
+        }
+        __syncthreads();
+    }
+
+    float result = fp_acc * d_scale_B[n];
+    result *= alpha;
+    if (beta != 0.0f)
+    {
+        result += beta * d_C_existing[n];
+    }
+    if (d_bias)
+    {
+        result += d_bias[n];
+    }
+    d_C_fp32[n] = result;
+}
+
+template <int TILE_N, int CPT>
+__global__ void gemv_int8_int8_batched_vnni_blockwise_scaled_kernel_t(
+    const int8_t* __restrict__ d_A_int8,
+    const float* __restrict__ d_scales_A_blockwise,
+    GemvBatchArgs args,
+    int K,
+    float alpha,
+    float beta)
+{
+    const int batch = gemv_find_batch_for_block(args, blockIdx.x);
+    const int local_block_x = blockIdx.x - args.grid_n_offset[batch];
+    const int n_base = local_block_x * TILE_N + threadIdx.x * CPT;
+    if (n_base >= args.N[batch]) return;
+
+    const int N = args.N[batch];
+    const int8_t* __restrict__ d_B_int8_vnni = args.d_B[batch];
+    float* __restrict__ d_C_fp32 = args.d_C[batch];
+    const float* __restrict__ d_scale_B = args.d_scales_B[batch];
+    const float* __restrict__ d_bias = args.d_bias[batch];
+    const bool full_cols = (n_base + (CPT - 1) < N);
+    const int32_t* __restrict__ b_row = reinterpret_cast<const int32_t*>(
+        d_B_int8_vnni + static_cast<size_t>(n_base) * 4);
+    const size_t b_stride = static_cast<size_t>(N);
+    const int act_blocks = K / GEMV_INT8_VNNI_ACT_BLOCK_K;
+
+    float fp_acc[CPT];
+    #pragma unroll
+    for (int c = 0; c < CPT; ++c) fp_acc[c] = 0.0f;
+
+    for (int act_block = 0; act_block < act_blocks; ++act_block)
+    {
+        int32_t acc[CPT];
+        #pragma unroll
+        for (int c = 0; c < CPT; ++c) acc[c] = 0;
+
+        gemv_int8_accumulate_act_block(acc, d_A_int8, b_row, b_stride,
+                                       act_block * GEMV_INT8_VNNI_KGROUPS_PER_ACT_BLOCK);
+
+        const float scale_a = d_scales_A_blockwise[act_block];
+        #pragma unroll
+        for (int c = 0; c < CPT; ++c)
+        {
+            fp_acc[c] += static_cast<float>(acc[c]) * scale_a;
+        }
+    }
+
+    #pragma unroll
+    for (int c = 0; c < CPT; ++c)
+    {
+        const int n = n_base + c;
+        if (n < N)
+        {
+            float result = fp_acc[c] * d_scale_B[n];
+            result *= alpha;
+            if (beta != 0.0f)
+            {
+                result += beta * d_C_fp32[n];
+            }
+            if (d_bias)
+            {
+                result += d_bias[n];
+            }
+            d_C_fp32[n] = result;
+        }
+    }
+}
+
+template <int TILE_N, int CPT, bool VEC_PACKED_LOAD>
+__global__ void gemv_int8_int8_wide_batched_vnni_blockwise_scaled_kernel_t(
+    const int8_t* __restrict__ d_A_int8,
+    const float* __restrict__ d_scales_A_blockwise,
+    GemvBatchArgs args,
+    int K,
+    float alpha,
+    float beta)
+{
+    const int batch = gemv_find_batch_for_block(args, blockIdx.x);
+    const int local_block_x = blockIdx.x - args.grid_n_offset[batch];
+    const int n_base = local_block_x * TILE_N + threadIdx.x * CPT;
+    if (n_base >= args.N[batch]) return;
+
+    const int N = args.N[batch];
+    const int8_t* __restrict__ d_B_int8_vnni = args.d_B[batch];
+    float* __restrict__ d_C_fp32 = args.d_C[batch];
+    const float* __restrict__ d_scale_B = args.d_scales_B[batch];
+    const float* __restrict__ d_bias = args.d_bias[batch];
+    const bool full_cols = (n_base + (CPT - 1) < N);
+
+    const int32_t* __restrict__ b_row = reinterpret_cast<const int32_t*>(
+        d_B_int8_vnni + static_cast<size_t>(n_base) * 4);
+    const size_t b_stride = static_cast<size_t>(N);
+    const int act_blocks = K / GEMV_INT8_VNNI_ACT_BLOCK_K;
+
+    float fp_acc[CPT];
+    #pragma unroll
+    for (int c = 0; c < CPT; ++c) fp_acc[c] = 0.0f;
+
+    for (int act_block = 0; act_block < act_blocks; ++act_block)
+    {
+        int32_t acc[CPT];
+        #pragma unroll
+        for (int c = 0; c < CPT; ++c) acc[c] = 0;
+
+        const int kg_base = act_block * GEMV_INT8_VNNI_KGROUPS_PER_ACT_BLOCK;
+        #pragma unroll
+        for (int kgi = 0; kgi < GEMV_INT8_VNNI_KGROUPS_PER_ACT_BLOCK; ++kgi)
+        {
+            const int kg = kg_base + kgi;
+            const int32_t a_packed = *reinterpret_cast<const int32_t*>(d_A_int8 + kg * 4);
+            const int32_t* __restrict__ b_pack_row = b_row + kg * b_stride;
+
+            if constexpr (VEC_PACKED_LOAD && CPT == 4)
+            {
+                if (full_cols)
+                {
+                    const int4 b = *reinterpret_cast<const int4*>(b_pack_row);
+                    acc[0] = __builtin_amdgcn_sdot4(a_packed, b.x, acc[0], false);
+                    acc[1] = __builtin_amdgcn_sdot4(a_packed, b.y, acc[1], false);
+                    acc[2] = __builtin_amdgcn_sdot4(a_packed, b.z, acc[2], false);
+                    acc[3] = __builtin_amdgcn_sdot4(a_packed, b.w, acc[3], false);
+                }
+                else
+                {
+                    #pragma unroll
+                    for (int c = 0; c < CPT; ++c)
+                    {
+                        if (n_base + c < N)
+                        {
+                            const int32_t b = *(b_pack_row + c);
+                            acc[c] = __builtin_amdgcn_sdot4(a_packed, b, acc[c], false);
+                        }
+                    }
+                }
+            }
+            else if constexpr (VEC_PACKED_LOAD && CPT == 2)
+            {
+                if (full_cols)
+                {
+                    const int2 b = *reinterpret_cast<const int2*>(b_pack_row);
+                    acc[0] = __builtin_amdgcn_sdot4(a_packed, b.x, acc[0], false);
+                    acc[1] = __builtin_amdgcn_sdot4(a_packed, b.y, acc[1], false);
+                }
+                else
+                {
+                    #pragma unroll
+                    for (int c = 0; c < CPT; ++c)
+                    {
+                        if (n_base + c < N)
+                        {
+                            const int32_t b = *(b_pack_row + c);
+                            acc[c] = __builtin_amdgcn_sdot4(a_packed, b, acc[c], false);
+                        }
+                    }
+                }
+            }
+            else
+            {
+                #pragma unroll
+                for (int c = 0; c < CPT; ++c)
+                {
+                    if (n_base + c < N)
+                    {
+                        const int32_t b = *(b_pack_row + c);
+                        acc[c] = __builtin_amdgcn_sdot4(a_packed, b, acc[c], false);
+                    }
+                }
+            }
+        }
+
+        const float scale_a = d_scales_A_blockwise[act_block];
+        #pragma unroll
+        for (int c = 0; c < CPT; ++c)
+        {
+            fp_acc[c] += static_cast<float>(acc[c]) * scale_a;
+        }
+    }
+
+    #pragma unroll
+    for (int c = 0; c < CPT; ++c)
+    {
+        const int n = n_base + c;
+        if (n < N)
+        {
+            float result = fp_acc[c] * d_scale_B[n];
+            result *= alpha;
+            if (beta != 0.0f)
+            {
+                result += beta * d_C_fp32[n];
+            }
+            if (d_bias)
+            {
+                result += d_bias[n];
+            }
+            d_C_fp32[n] = result;
+        }
+    }
+}
+
+__global__ void gemv_int8_int8_square_batched_vnni_blockwise_scaled_kernel(
+    const int8_t* __restrict__ d_A_int8,
+    const float* __restrict__ d_scales_A_blockwise,
+    GemvBatchArgs args,
+    int K,
+    float alpha,
+    float beta)
+{
+    const int batch = gemv_find_batch_for_block(args, blockIdx.x);
+    const int local_block_x = blockIdx.x - args.grid_n_offset[batch];
+    const int n = local_block_x * GEMV_INT8_VNNI_SQUARE_TILE_N + threadIdx.x;
+    if (n >= args.N[batch]) return;
+
+    const int8_t* __restrict__ d_B_int8_vnni = args.d_B[batch];
+    float* __restrict__ d_C_fp32 = args.d_C[batch];
+    const float* __restrict__ d_scale_B = args.d_scales_B[batch];
+    const float* __restrict__ d_bias = args.d_bias[batch];
+    __shared__ int8_t sA[GEMV_INT8_VNNI_KPAR_TILE_K];
+
+    float fp_acc = 0.0f;
+    for (int k_tile_base = 0; k_tile_base < K; k_tile_base += GEMV_INT8_VNNI_KPAR_TILE_K)
+    {
+        const int tile_k = min(GEMV_INT8_VNNI_KPAR_TILE_K, K - k_tile_base);
+        for (int i = threadIdx.x; i < tile_k; i += blockDim.x)
+        {
+            sA[i] = d_A_int8[k_tile_base + i];
+        }
+        __syncthreads();
+
+        const int tile_act_blocks = tile_k / GEMV_INT8_VNNI_ACT_BLOCK_K;
+        const int act_block_base = k_tile_base / GEMV_INT8_VNNI_ACT_BLOCK_K;
+        const int tile_k_group_base = k_tile_base / 4;
+
+        #pragma unroll
+        for (int tile_block = 0; tile_block < GEMV_INT8_VNNI_KPAR_TILE_K / GEMV_INT8_VNNI_ACT_BLOCK_K; ++tile_block)
+        {
+            if (tile_block >= tile_act_blocks)
+            {
+                break;
+            }
+
+            int32_t block_acc = 0;
+            const int local_k_byte = tile_block * GEMV_INT8_VNNI_ACT_BLOCK_K;
+            const int k_group_base = tile_k_group_base + tile_block * GEMV_INT8_VNNI_KGROUPS_PER_ACT_BLOCK;
+            #pragma unroll
+            for (int kgi = 0; kgi < GEMV_INT8_VNNI_KGROUPS_PER_ACT_BLOCK; ++kgi)
+            {
+                const int32_t a_packed = *reinterpret_cast<const int32_t*>(sA + local_k_byte + kgi * 4);
+                const int32_t b_packed = *reinterpret_cast<const int32_t*>(
+                    d_B_int8_vnni + (static_cast<size_t>(k_group_base + kgi) * args.N[batch] + n) * 4);
+                block_acc = __builtin_amdgcn_sdot4(a_packed, b_packed, block_acc, false);
+            }
+
+            fp_acc += static_cast<float>(block_acc) * d_scales_A_blockwise[act_block_base + tile_block];
+        }
+        __syncthreads();
+    }
+
+    float result = fp_acc * d_scale_B[n];
+    result *= alpha;
+    if (beta != 0.0f)
+    {
+        result += beta * d_C_fp32[n];
     }
     if (d_bias)
     {
@@ -1157,6 +2022,251 @@ __global__ void gemv_int8_int8_grid_kpar_vnni_kernel_t(
         for (int c = 0; c < CPT; ++c)
         {
             atomicAdd(&d_C_int32[n_base + c], acc[c]);
+        }
+    }
+}
+
+template <int TILE_N, int CPT>
+__global__ void gemv_int8_int8_grid_kpar_vnni_blockwise_scaled_kernel_t(
+    const int8_t* __restrict__ d_A_int8,
+    const int8_t* __restrict__ d_B_int8_vnni,
+    float* __restrict__ d_C_fp32,
+    const float* __restrict__ d_scales_A_blockwise,
+    const float* __restrict__ d_scale_B,
+    int N,
+    int K,
+    int act_block_splits,
+    float alpha)
+{
+    const int n_base = blockIdx.x * TILE_N + threadIdx.x * CPT;
+    const bool active = (n_base < N);
+    const int split_idx = blockIdx.y;
+    const int act_blocks = K / GEMV_INT8_VNNI_ACT_BLOCK_K;
+    const int act_blocks_per_split = (act_blocks + act_block_splits - 1) / act_block_splits;
+    const int act_block_start = split_idx * act_blocks_per_split;
+    const int act_block_end = min(act_block_start + act_blocks_per_split, act_blocks);
+
+    if (!active || act_block_start >= act_blocks)
+    {
+        return;
+    }
+
+    float fp_acc[CPT];
+    #pragma unroll
+    for (int c = 0; c < CPT; ++c)
+    {
+        fp_acc[c] = 0.0f;
+    }
+
+    const int32_t* __restrict__ b_row =
+        reinterpret_cast<const int32_t*>(d_B_int8_vnni) + n_base;
+    const size_t b_stride = static_cast<size_t>(N);
+    __shared__ int8_t sA[GEMV_INT8_VNNI_KPAR_TILE_K];
+
+    constexpr int ACT_BLOCKS_PER_TILE = GEMV_INT8_VNNI_KPAR_TILE_K / GEMV_INT8_VNNI_ACT_BLOCK_K;
+    for (int act_block_tile = act_block_start; act_block_tile < act_block_end; act_block_tile += ACT_BLOCKS_PER_TILE)
+    {
+        const int tile_act_blocks = min(ACT_BLOCKS_PER_TILE, act_block_end - act_block_tile);
+        const int tile_bytes = tile_act_blocks * GEMV_INT8_VNNI_ACT_BLOCK_K;
+        for (int i = threadIdx.x; i < tile_bytes; i += blockDim.x)
+        {
+            sA[i] = d_A_int8[act_block_tile * GEMV_INT8_VNNI_ACT_BLOCK_K + i];
+        }
+        __syncthreads();
+
+        #pragma unroll
+        for (int tile_block = 0; tile_block < ACT_BLOCKS_PER_TILE; ++tile_block)
+        {
+            if (tile_block >= tile_act_blocks)
+            {
+                break;
+            }
+
+            int32_t block_acc[CPT];
+            #pragma unroll
+            for (int c = 0; c < CPT; ++c)
+            {
+                block_acc[c] = 0;
+            }
+
+            const int local_k_byte = tile_block * GEMV_INT8_VNNI_ACT_BLOCK_K;
+            const int kg_base = (act_block_tile + tile_block) * GEMV_INT8_VNNI_KGROUPS_PER_ACT_BLOCK;
+            #pragma unroll
+            for (int kgi = 0; kgi < GEMV_INT8_VNNI_KGROUPS_PER_ACT_BLOCK; ++kgi)
+            {
+                const int32_t a_packed = *reinterpret_cast<const int32_t*>(sA + local_k_byte + kgi * 4);
+                if constexpr (CPT == 2)
+                {
+                    const int2 b_pair = *reinterpret_cast<const int2*>(b_row + (kg_base + kgi) * b_stride);
+                    block_acc[0] = __builtin_amdgcn_sdot4(a_packed, b_pair.x, block_acc[0], false);
+                    block_acc[1] = __builtin_amdgcn_sdot4(a_packed, b_pair.y, block_acc[1], false);
+                }
+                else
+                {
+                    #pragma unroll
+                    for (int c = 0; c < CPT; ++c)
+                    {
+                        const int32_t b_packed = *(b_row + (kg_base + kgi) * b_stride + c);
+                        block_acc[c] = __builtin_amdgcn_sdot4(a_packed, b_packed, block_acc[c], false);
+                    }
+                }
+            }
+
+            gemv_int8_flush_blockwise_acc(block_acc, fp_acc, d_scales_A_blockwise, act_block_tile + tile_block);
+        }
+        __syncthreads();
+    }
+
+    #pragma unroll
+    for (int c = 0; c < CPT; ++c)
+    {
+        const int n = n_base + c;
+        if (n < N)
+        {
+            const float val = fp_acc[c] * d_scale_B[n] * alpha;
+            if (act_block_splits == 1)
+            {
+                d_C_fp32[n] = val;
+            }
+            else
+            {
+                atomicAdd(&d_C_fp32[n], val);
+            }
+        }
+    }
+}
+
+template <int TILE_N, int CPT>
+__global__ void gemv_int8_int8_grid_kpar_batched_vnni_blockwise_scaled_kernel_t(
+    const int8_t* __restrict__ d_A_int8,
+    const float* __restrict__ d_scales_A_blockwise,
+    GemvBatchArgs args,
+    int K,
+    int act_block_splits,
+    float alpha)
+{
+    const int batch = gemv_find_batch_for_block(args, blockIdx.x);
+    const int local_block_x = blockIdx.x - args.grid_n_offset[batch];
+    const int n_base = local_block_x * TILE_N + threadIdx.x * CPT;
+    const int N = args.N[batch];
+    const bool active = (n_base < N);
+    const int split_idx = blockIdx.y;
+    const int act_blocks = K / GEMV_INT8_VNNI_ACT_BLOCK_K;
+    const int act_blocks_per_split = (act_blocks + act_block_splits - 1) / act_block_splits;
+    const int act_block_start = split_idx * act_blocks_per_split;
+    const int act_block_end = min(act_block_start + act_blocks_per_split, act_blocks);
+
+    if (!active || act_block_start >= act_blocks)
+    {
+        return;
+    }
+
+    float* __restrict__ d_C_fp32 = args.d_C[batch];
+    const float* __restrict__ d_scale_B = args.d_scales_B[batch];
+    const int32_t* __restrict__ b_row =
+        reinterpret_cast<const int32_t*>(args.d_B[batch]) + n_base;
+    const size_t b_stride = static_cast<size_t>(N);
+
+    float fp_acc[CPT];
+    #pragma unroll
+    for (int c = 0; c < CPT; ++c)
+    {
+        fp_acc[c] = 0.0f;
+    }
+
+    for (int act_block = act_block_start; act_block < act_block_end; ++act_block)
+    {
+        int32_t block_acc[CPT];
+        #pragma unroll
+        for (int c = 0; c < CPT; ++c)
+        {
+            block_acc[c] = 0;
+        }
+
+        gemv_int8_accumulate_act_block(block_acc, d_A_int8, b_row, b_stride,
+                                       act_block * GEMV_INT8_VNNI_KGROUPS_PER_ACT_BLOCK);
+        gemv_int8_flush_blockwise_acc(block_acc, fp_acc, d_scales_A_blockwise, act_block);
+    }
+
+    #pragma unroll
+    for (int c = 0; c < CPT; ++c)
+    {
+        const int n = n_base + c;
+        if (n < N)
+        {
+            atomicAdd(&d_C_fp32[n], fp_acc[c] * d_scale_B[n] * alpha);
+        }
+    }
+}
+
+template <int TILE_N, int CPT>
+__global__ void gemv_int8_int8_grid_kpar_pair_vnni_blockwise_scaled_kernel_t(
+    const int8_t* __restrict__ d_A_int8,
+    const float* __restrict__ d_scales_A_blockwise,
+    const int8_t* __restrict__ d_B0,
+    const int8_t* __restrict__ d_B1,
+    float* __restrict__ d_C0,
+    float* __restrict__ d_C1,
+    const float* __restrict__ d_scale_B0,
+    const float* __restrict__ d_scale_B1,
+    int N0,
+    int N1,
+    int grid_n0,
+    int K,
+    int act_block_splits,
+    float alpha)
+{
+    const bool second = (blockIdx.x >= grid_n0);
+    const int local_block_x = second ? (blockIdx.x - grid_n0) : blockIdx.x;
+    const int n_base = local_block_x * TILE_N + threadIdx.x * CPT;
+    const int N = second ? N1 : N0;
+    const bool active = (n_base < N);
+    const int split_idx = blockIdx.y;
+    const int act_blocks = K / GEMV_INT8_VNNI_ACT_BLOCK_K;
+    const int act_blocks_per_split = (act_blocks + act_block_splits - 1) / act_block_splits;
+    const int act_block_start = split_idx * act_blocks_per_split;
+    const int act_block_end = min(act_block_start + act_blocks_per_split, act_blocks);
+
+    if (!active || act_block_start >= act_blocks)
+    {
+        return;
+    }
+
+    float* __restrict__ d_C_fp32 = second ? d_C1 : d_C0;
+    const float* __restrict__ d_scale_B = second ? d_scale_B1 : d_scale_B0;
+    const int8_t* __restrict__ d_B_int8_vnni = second ? d_B1 : d_B0;
+    const int32_t* __restrict__ b_row =
+        reinterpret_cast<const int32_t*>(d_B_int8_vnni) + n_base;
+    const size_t b_stride = static_cast<size_t>(N);
+
+    float fp_acc[CPT];
+    #pragma unroll
+    for (int c = 0; c < CPT; ++c)
+    {
+        fp_acc[c] = 0.0f;
+    }
+
+    for (int act_block = act_block_start; act_block < act_block_end; ++act_block)
+    {
+        int32_t block_acc[CPT];
+        #pragma unroll
+        for (int c = 0; c < CPT; ++c)
+        {
+            block_acc[c] = 0;
+        }
+
+        gemv_int8_accumulate_act_block(block_acc, d_A_int8, b_row, b_stride,
+                                       act_block * GEMV_INT8_VNNI_KGROUPS_PER_ACT_BLOCK);
+        gemv_int8_flush_blockwise_acc(block_acc, fp_acc, d_scales_A_blockwise, act_block);
+    }
+
+    #pragma unroll
+    for (int c = 0; c < CPT; ++c)
+    {
+        const int n = n_base + c;
+        if (n < N)
+        {
+            atomicAdd(&d_C_fp32[n], fp_acc[c] * d_scale_B[n] * alpha);
         }
     }
 }
@@ -1340,6 +2450,751 @@ void gemv_int8_int8_lds_kreduce_kernel_t(
     }
 }
 
+template <int TILE_N, int CPT, int WK>
+__global__ __launch_bounds__(TILE_N / CPT * WK)
+void gemv_int8_int8_lds_kreduce_blockwise_scaled_kernel_t(
+    const int8_t* __restrict__ d_A_int8,
+    const int8_t* __restrict__ d_B_int8_vnni,
+    float* __restrict__ d_C_fp32,
+    const float* __restrict__ d_scales_A_blockwise,
+    const float* __restrict__ d_scale_B,
+    int N,
+    int K,
+    int kb_outer,
+    float alpha)
+{
+    static_assert(CPT == 2 || CPT == 4, "CPT must be 2 or 4");
+    static_assert(WK >= 2 && WK <= 8, "WK must be 2-8");
+    constexpr int THREADS_PER_WAVE = TILE_N / CPT;
+    static_assert(THREADS_PER_WAVE == 64, "TILE_N/CPT must equal 64 (one wavefront)");
+
+    const int wave_id = threadIdx.x / THREADS_PER_WAVE;
+    const int lane_id = threadIdx.x % THREADS_PER_WAVE;
+    const int n_base = blockIdx.x * TILE_N + lane_id * CPT;
+    const int outer_block = blockIdx.y;
+    const int act_blocks = K / GEMV_INT8_VNNI_ACT_BLOCK_K;
+
+    const int act_blocks_per_outer = (act_blocks + kb_outer - 1) / kb_outer;
+    const int outer_act_start = outer_block * act_blocks_per_outer;
+    const int outer_act_end = min(outer_act_start + act_blocks_per_outer, act_blocks);
+    if (outer_act_start >= act_blocks)
+    {
+        return;
+    }
+
+    const int outer_act_count = outer_act_end - outer_act_start;
+    const int act_per_wave_base = outer_act_count / WK;
+    const int act_remainder = outer_act_count % WK;
+    const int my_act_start = outer_act_start + wave_id * act_per_wave_base + min(wave_id, act_remainder);
+    const int my_act_count = act_per_wave_base + (wave_id < act_remainder ? 1 : 0);
+    const int my_act_end = my_act_start + my_act_count;
+
+    float fp_acc[CPT];
+    #pragma unroll
+    for (int c = 0; c < CPT; ++c) fp_acc[c] = 0.0f;
+
+    if (n_base < N && my_act_count > 0)
+    {
+        const int32_t* __restrict__ b_row =
+            reinterpret_cast<const int32_t*>(d_B_int8_vnni) + n_base;
+        const size_t b_stride = static_cast<size_t>(N);
+
+        #pragma unroll 1
+        for (int act_block = my_act_start; act_block < my_act_end; ++act_block)
+        {
+            int32_t block_acc[CPT];
+            #pragma unroll
+            for (int c = 0; c < CPT; ++c) block_acc[c] = 0;
+
+            gemv_int8_accumulate_act_block(block_acc, d_A_int8, b_row, b_stride,
+                                           act_block * GEMV_INT8_VNNI_KGROUPS_PER_ACT_BLOCK);
+            gemv_int8_flush_blockwise_acc(block_acc, fp_acc, d_scales_A_blockwise, act_block);
+        }
+    }
+
+    __shared__ float s_partial[WK - 1][TILE_N];
+
+    if (wave_id > 0 && n_base < N)
+    {
+        #pragma unroll
+        for (int c = 0; c < CPT; ++c)
+        {
+            s_partial[wave_id - 1][lane_id * CPT + c] = fp_acc[c];
+        }
+    }
+
+    __syncthreads();
+
+    if (wave_id == 0 && n_base < N)
+    {
+        #pragma unroll
+        for (int w = 0; w < WK - 1; ++w)
+        {
+            #pragma unroll
+            for (int c = 0; c < CPT; ++c)
+            {
+                fp_acc[c] += s_partial[w][lane_id * CPT + c];
+            }
+        }
+
+        #pragma unroll
+        for (int c = 0; c < CPT; ++c)
+        {
+            const int n = n_base + c;
+            const float partial = fp_acc[c] * d_scale_B[n] * alpha;
+            if (kb_outer == 1)
+            {
+                d_C_fp32[n] = partial;
+            }
+            else
+            {
+                atomicAdd(&d_C_fp32[n], partial);
+            }
+        }
+    }
+}
+
+// Pair variant of the tiny K/V LDS K-reduce kernel.
+// Dispatches two projections (e.g. K+V) in a single kernel launch
+// with combined grid_x = ceil(N0/TN) + ceil(N1/TN).
+// Doubles occupancy and saves one launch overhead vs 2x single.
+template <int TILE_N, int CPT, int WK>
+__global__ __launch_bounds__(64 * WK)
+void gemv_int8_int8_lds_kreduce_pair_blockwise_scaled_kernel_t(
+    const int8_t* __restrict__ d_A_int8,
+    const int8_t* __restrict__ d_B0,
+    const int8_t* __restrict__ d_B1,
+    float* __restrict__ d_C0,
+    float* __restrict__ d_C1,
+    const float* __restrict__ d_scales_A_blockwise,
+    const float* __restrict__ d_scales_B0,
+    const float* __restrict__ d_scales_B1,
+    int N0, int N1,
+    int grid_n_offset,
+    int K, int kb_outer,
+    float alpha)
+{
+    static_assert(CPT == 2 || CPT == 4, "CPT must be 2 or 4");
+    static_assert(WK >= 2 && WK <= 8, "WK must be 2-8");
+    constexpr int THREADS_PER_WAVE = TILE_N / CPT;
+    static_assert(THREADS_PER_WAVE == 64, "TILE_N/CPT must equal 64 (one wavefront)");
+
+    // Determine which projection this block serves
+    const bool is_proj1 = (static_cast<int>(blockIdx.x) >= grid_n_offset);
+    const int local_block_x = is_proj1 ? (static_cast<int>(blockIdx.x) - grid_n_offset) : static_cast<int>(blockIdx.x);
+    const int8_t* __restrict__ d_B = is_proj1 ? d_B1 : d_B0;
+    float* __restrict__ d_C = is_proj1 ? d_C1 : d_C0;
+    const float* __restrict__ d_scale_B = is_proj1 ? d_scales_B1 : d_scales_B0;
+    const int N = is_proj1 ? N1 : N0;
+
+    const int wave_id = threadIdx.x / THREADS_PER_WAVE;
+    const int lane_id = threadIdx.x % THREADS_PER_WAVE;
+    const int n_base = local_block_x * TILE_N + lane_id * CPT;
+    const int outer_block = blockIdx.y;
+    const int act_blocks = K / GEMV_INT8_VNNI_ACT_BLOCK_K;
+
+    const int act_blocks_per_outer = (act_blocks + kb_outer - 1) / kb_outer;
+    const int outer_act_start = outer_block * act_blocks_per_outer;
+    const int outer_act_end = min(outer_act_start + act_blocks_per_outer, act_blocks);
+    if (outer_act_start >= act_blocks)
+    {
+        return;
+    }
+
+    const int outer_act_count = outer_act_end - outer_act_start;
+    const int act_per_wave_base = outer_act_count / WK;
+    const int act_remainder = outer_act_count % WK;
+    const int my_act_start = outer_act_start + wave_id * act_per_wave_base + min(wave_id, act_remainder);
+    const int my_act_count = act_per_wave_base + (wave_id < act_remainder ? 1 : 0);
+    const int my_act_end = my_act_start + my_act_count;
+
+    float fp_acc[CPT];
+    #pragma unroll
+    for (int c = 0; c < CPT; ++c) fp_acc[c] = 0.0f;
+
+    if (n_base < N && my_act_count > 0)
+    {
+        const int32_t* __restrict__ b_row =
+            reinterpret_cast<const int32_t*>(d_B) + n_base;
+        const size_t b_stride = static_cast<size_t>(N);
+
+        #pragma unroll 1
+        for (int act_block = my_act_start; act_block < my_act_end; ++act_block)
+        {
+            int32_t block_acc[CPT];
+            #pragma unroll
+            for (int c = 0; c < CPT; ++c) block_acc[c] = 0;
+
+            gemv_int8_accumulate_act_block(block_acc, d_A_int8, b_row, b_stride,
+                                           act_block * GEMV_INT8_VNNI_KGROUPS_PER_ACT_BLOCK);
+            gemv_int8_flush_blockwise_acc(block_acc, fp_acc, d_scales_A_blockwise, act_block);
+        }
+    }
+
+    __shared__ float s_partial[WK - 1][TILE_N];
+
+    if (wave_id > 0 && n_base < N)
+    {
+        #pragma unroll
+        for (int c = 0; c < CPT; ++c)
+        {
+            s_partial[wave_id - 1][lane_id * CPT + c] = fp_acc[c];
+        }
+    }
+
+    __syncthreads();
+
+    if (wave_id == 0 && n_base < N)
+    {
+        #pragma unroll
+        for (int w = 0; w < WK - 1; ++w)
+        {
+            #pragma unroll
+            for (int c = 0; c < CPT; ++c)
+            {
+                fp_acc[c] += s_partial[w][lane_id * CPT + c];
+            }
+        }
+
+        #pragma unroll
+        for (int c = 0; c < CPT; ++c)
+        {
+            const int n = n_base + c;
+            const float partial = fp_acc[c] * d_scale_B[n] * alpha;
+            if (kb_outer == 1)
+            {
+                d_C[n] = partial;
+            }
+            else
+            {
+                atomicAdd(&d_C[n], partial);
+            }
+        }
+    }
+}
+
+template <int WK>
+__global__ __launch_bounds__(64 * WK)
+void gemv_int8_int8_qwo_lds_kreduce_blockwise_scaled_kernel_t(
+    const int8_t* __restrict__ d_A_int8,
+    const int8_t* __restrict__ d_B_int8_vnni,
+    float* __restrict__ d_C_fp32,
+    const float* __restrict__ d_scales_A_blockwise,
+    const float* __restrict__ d_scale_B,
+    int N,
+    int K,
+    int kb_outer,
+    float alpha)
+{
+    static_assert(WK >= 2 && WK <= 8, "WK must be 2-8");
+
+    constexpr int TILE_N = 256;
+    constexpr int CPT = 4;
+    constexpr int THREADS_PER_WAVE = TILE_N / CPT;
+    static_assert(THREADS_PER_WAVE == 64, "TILE_N/CPT must equal 64 (one wavefront)");
+
+    const int wave_id = threadIdx.x / THREADS_PER_WAVE;
+    const int lane_id = threadIdx.x % THREADS_PER_WAVE;
+    const int n_base = blockIdx.x * TILE_N + lane_id * CPT;
+    const bool full_cols = (n_base + 3) < N;
+    const int outer_block = blockIdx.y;
+    const int act_blocks = K / GEMV_INT8_VNNI_ACT_BLOCK_K;
+
+    const int act_blocks_per_outer = (act_blocks + kb_outer - 1) / kb_outer;
+    const int outer_act_start = outer_block * act_blocks_per_outer;
+    const int outer_act_end = min(outer_act_start + act_blocks_per_outer, act_blocks);
+    if (outer_act_start >= act_blocks)
+    {
+        return;
+    }
+
+    const int outer_act_count = outer_act_end - outer_act_start;
+    const int act_per_wave_base = outer_act_count / WK;
+    const int act_remainder = outer_act_count % WK;
+    const int my_act_start = outer_act_start + wave_id * act_per_wave_base + min(wave_id, act_remainder);
+    const int my_act_count = act_per_wave_base + (wave_id < act_remainder ? 1 : 0);
+    const int my_act_end = my_act_start + my_act_count;
+
+    float fp_acc[4];
+    #pragma unroll
+    for (int c = 0; c < 4; ++c)
+    {
+        fp_acc[c] = 0.0f;
+    }
+
+    if (n_base < N && my_act_count > 0)
+    {
+        const int32_t* __restrict__ b_row =
+            reinterpret_cast<const int32_t*>(d_B_int8_vnni) + n_base;
+        const size_t b_stride = static_cast<size_t>(N);
+
+        #pragma unroll 1
+        for (int act_block = my_act_start; act_block < my_act_end; ++act_block)
+        {
+            int32_t block_acc[4] = {0, 0, 0, 0};
+            const int kg_base = act_block * GEMV_INT8_VNNI_KGROUPS_PER_ACT_BLOCK;
+
+            #pragma unroll
+            for (int kgi = 0; kgi < GEMV_INT8_VNNI_KGROUPS_PER_ACT_BLOCK; ++kgi)
+            {
+                const int32_t a_packed = *reinterpret_cast<const int32_t*>(d_A_int8 + (kg_base + kgi) * 4);
+                const int32_t* __restrict__ b_pack_row = b_row + (kg_base + kgi) * b_stride;
+
+                if (full_cols)
+                {
+                    const int4 b = *reinterpret_cast<const int4*>(b_pack_row);
+                    block_acc[0] = __builtin_amdgcn_sdot4(a_packed, b.x, block_acc[0], false);
+                    block_acc[1] = __builtin_amdgcn_sdot4(a_packed, b.y, block_acc[1], false);
+                    block_acc[2] = __builtin_amdgcn_sdot4(a_packed, b.z, block_acc[2], false);
+                    block_acc[3] = __builtin_amdgcn_sdot4(a_packed, b.w, block_acc[3], false);
+                }
+                else
+                {
+                    #pragma unroll
+                    for (int c = 0; c < 4; ++c)
+                    {
+                        if (n_base + c < N)
+                        {
+                            const int32_t b = *(b_pack_row + c);
+                            block_acc[c] = __builtin_amdgcn_sdot4(a_packed, b, block_acc[c], false);
+                        }
+                    }
+                }
+            }
+
+            gemv_int8_flush_blockwise_acc(block_acc, fp_acc, d_scales_A_blockwise, act_block);
+        }
+    }
+
+    __shared__ float4 s_partial[WK - 1][64];
+
+    if (wave_id > 0 && n_base < N)
+    {
+        s_partial[wave_id - 1][lane_id] = make_float4(fp_acc[0], fp_acc[1], fp_acc[2], fp_acc[3]);
+    }
+
+    __syncthreads();
+
+    if (wave_id == 0 && n_base < N)
+    {
+        #pragma unroll
+        for (int w = 0; w < WK - 1; ++w)
+        {
+            const float4 partial = s_partial[w][lane_id];
+            fp_acc[0] += partial.x;
+            fp_acc[1] += partial.y;
+            fp_acc[2] += partial.z;
+            fp_acc[3] += partial.w;
+        }
+
+        if (full_cols)
+        {
+            const float4 scale = *reinterpret_cast<const float4*>(d_scale_B + n_base);
+            if (kb_outer == 1)
+            {
+                d_C_fp32[n_base + 0] = fp_acc[0] * scale.x * alpha;
+                d_C_fp32[n_base + 1] = fp_acc[1] * scale.y * alpha;
+                d_C_fp32[n_base + 2] = fp_acc[2] * scale.z * alpha;
+                d_C_fp32[n_base + 3] = fp_acc[3] * scale.w * alpha;
+            }
+            else
+            {
+                atomicAdd(&d_C_fp32[n_base + 0], fp_acc[0] * scale.x * alpha);
+                atomicAdd(&d_C_fp32[n_base + 1], fp_acc[1] * scale.y * alpha);
+                atomicAdd(&d_C_fp32[n_base + 2], fp_acc[2] * scale.z * alpha);
+                atomicAdd(&d_C_fp32[n_base + 3], fp_acc[3] * scale.w * alpha);
+            }
+        }
+        else
+        {
+            #pragma unroll
+            for (int c = 0; c < 4; ++c)
+            {
+                const int n = n_base + c;
+                if (n < N)
+                {
+                    const float partial = fp_acc[c] * d_scale_B[n] * alpha;
+                    if (kb_outer == 1)
+                    {
+                        d_C_fp32[n] = partial;
+                    }
+                    else
+                    {
+                        atomicAdd(&d_C_fp32[n], partial);
+                    }
+                }
+            }
+        }
+    }
+}
+
+
+// ============================================================================
+// Q/Wo 2x-unrolled LDS K-reduction blockwise kernel
+//
+// Processes 2 activation blocks simultaneously with separate INT32
+// accumulators, interleaving dot products for better ILP. The compiler
+// can overlap B loads for block1 with sdot4 computation for block0,
+// and pipeline flushes from both blocks.
+//
+// Register pressure: 2*4 = 8 INT32 acc + 4 FP32 acc = 12 VGPRs for accums.
+// ============================================================================
+template <int WK>
+__global__ __launch_bounds__(64 * WK)
+void gemv_int8_int8_qwo_unroll2_lds_kreduce_blockwise_scaled_kernel_t(
+    const int8_t* __restrict__ d_A_int8,
+    const int8_t* __restrict__ d_B_int8_vnni,
+    float* __restrict__ d_C_fp32,
+    const float* __restrict__ d_scales_A_blockwise,
+    const float* __restrict__ d_scale_B,
+    int N,
+    int K,
+    int kb_outer,
+    float alpha)
+{
+    static_assert(WK >= 2 && WK <= 8, "WK must be 2-8");
+
+    constexpr int TILE_N = 256;
+    constexpr int CPT = 4;
+    constexpr int THREADS_PER_WAVE = TILE_N / CPT;
+    static_assert(THREADS_PER_WAVE == 64, "TILE_N/CPT must equal 64 (one wavefront)");
+
+    const int wave_id = threadIdx.x / THREADS_PER_WAVE;
+    const int lane_id = threadIdx.x % THREADS_PER_WAVE;
+    const int n_base = blockIdx.x * TILE_N + lane_id * CPT;
+    const bool full_cols = (n_base + 3) < N;
+    const int outer_block = blockIdx.y;
+    const int act_blocks = K / GEMV_INT8_VNNI_ACT_BLOCK_K;
+
+    const int act_blocks_per_outer = (act_blocks + kb_outer - 1) / kb_outer;
+    const int outer_act_start = outer_block * act_blocks_per_outer;
+    const int outer_act_end = min(outer_act_start + act_blocks_per_outer, act_blocks);
+    if (outer_act_start >= act_blocks)
+    {
+        return;
+    }
+
+    const int outer_act_count = outer_act_end - outer_act_start;
+    const int act_per_wave_base = outer_act_count / WK;
+    const int act_remainder = outer_act_count % WK;
+    const int my_act_start = outer_act_start + wave_id * act_per_wave_base + min(wave_id, act_remainder);
+    const int my_act_count = act_per_wave_base + (wave_id < act_remainder ? 1 : 0);
+    const int my_act_end = my_act_start + my_act_count;
+
+    float fp_acc[4];
+    #pragma unroll
+    for (int c = 0; c < 4; ++c)
+    {
+        fp_acc[c] = 0.0f;
+    }
+
+    if (n_base < N && my_act_count > 0)
+    {
+        const int32_t* __restrict__ b_row =
+            reinterpret_cast<const int32_t*>(d_B_int8_vnni) + n_base;
+        const size_t b_stride = static_cast<size_t>(N);
+
+        // Process pairs of activation blocks for ILP
+        int act_block = my_act_start;
+        const int pair_end = my_act_start + (my_act_count & ~1);  // round down to even
+
+        #pragma unroll 1
+        for (; act_block < pair_end; act_block += 2)
+        {
+            int32_t acc0[4] = {0, 0, 0, 0};
+            int32_t acc1[4] = {0, 0, 0, 0};
+            const int kg_base0 = act_block * GEMV_INT8_VNNI_KGROUPS_PER_ACT_BLOCK;
+            const int kg_base1 = (act_block + 1) * GEMV_INT8_VNNI_KGROUPS_PER_ACT_BLOCK;
+
+            // Interleave k-groups from both blocks for ILP
+            #pragma unroll
+            for (int kgi = 0; kgi < GEMV_INT8_VNNI_KGROUPS_PER_ACT_BLOCK; ++kgi)
+            {
+                const int32_t a0 = *reinterpret_cast<const int32_t*>(d_A_int8 + (kg_base0 + kgi) * 4);
+                const int32_t a1 = *reinterpret_cast<const int32_t*>(d_A_int8 + (kg_base1 + kgi) * 4);
+
+                if (full_cols)
+                {
+                    const int4 b0 = *reinterpret_cast<const int4*>(b_row + (kg_base0 + kgi) * b_stride);
+                    acc0[0] = __builtin_amdgcn_sdot4(a0, b0.x, acc0[0], false);
+                    acc0[1] = __builtin_amdgcn_sdot4(a0, b0.y, acc0[1], false);
+                    acc0[2] = __builtin_amdgcn_sdot4(a0, b0.z, acc0[2], false);
+                    acc0[3] = __builtin_amdgcn_sdot4(a0, b0.w, acc0[3], false);
+
+                    const int4 b1 = *reinterpret_cast<const int4*>(b_row + (kg_base1 + kgi) * b_stride);
+                    acc1[0] = __builtin_amdgcn_sdot4(a1, b1.x, acc1[0], false);
+                    acc1[1] = __builtin_amdgcn_sdot4(a1, b1.y, acc1[1], false);
+                    acc1[2] = __builtin_amdgcn_sdot4(a1, b1.z, acc1[2], false);
+                    acc1[3] = __builtin_amdgcn_sdot4(a1, b1.w, acc1[3], false);
+                }
+                else
+                {
+                    #pragma unroll
+                    for (int c = 0; c < 4; ++c)
+                    {
+                        if (n_base + c < N)
+                        {
+                            const int32_t bv0 = *(b_row + (kg_base0 + kgi) * b_stride + c);
+                            acc0[c] = __builtin_amdgcn_sdot4(a0, bv0, acc0[c], false);
+                            const int32_t bv1 = *(b_row + (kg_base1 + kgi) * b_stride + c);
+                            acc1[c] = __builtin_amdgcn_sdot4(a1, bv1, acc1[c], false);
+                        }
+                    }
+                }
+            }
+
+            // Flush both blocks
+            const float scale0 = d_scales_A_blockwise[act_block];
+            const float scale1 = d_scales_A_blockwise[act_block + 1];
+            #pragma unroll
+            for (int c = 0; c < 4; ++c)
+            {
+                fp_acc[c] += static_cast<float>(acc0[c]) * scale0;
+                fp_acc[c] += static_cast<float>(acc1[c]) * scale1;
+            }
+        }
+
+        // Handle odd tail (at most 1 remaining block)
+        if (act_block < my_act_end)
+        {
+            int32_t block_acc[4] = {0, 0, 0, 0};
+            const int kg_base = act_block * GEMV_INT8_VNNI_KGROUPS_PER_ACT_BLOCK;
+
+            #pragma unroll
+            for (int kgi = 0; kgi < GEMV_INT8_VNNI_KGROUPS_PER_ACT_BLOCK; ++kgi)
+            {
+                const int32_t a_packed = *reinterpret_cast<const int32_t*>(d_A_int8 + (kg_base + kgi) * 4);
+
+                if (full_cols)
+                {
+                    const int4 b = *reinterpret_cast<const int4*>(b_row + (kg_base + kgi) * b_stride);
+                    block_acc[0] = __builtin_amdgcn_sdot4(a_packed, b.x, block_acc[0], false);
+                    block_acc[1] = __builtin_amdgcn_sdot4(a_packed, b.y, block_acc[1], false);
+                    block_acc[2] = __builtin_amdgcn_sdot4(a_packed, b.z, block_acc[2], false);
+                    block_acc[3] = __builtin_amdgcn_sdot4(a_packed, b.w, block_acc[3], false);
+                }
+                else
+                {
+                    #pragma unroll
+                    for (int c = 0; c < 4; ++c)
+                    {
+                        if (n_base + c < N)
+                        {
+                            const int32_t bv = *(b_row + (kg_base + kgi) * b_stride + c);
+                            block_acc[c] = __builtin_amdgcn_sdot4(a_packed, bv, block_acc[c], false);
+                        }
+                    }
+                }
+            }
+
+            gemv_int8_flush_blockwise_acc(block_acc, fp_acc, d_scales_A_blockwise, act_block);
+        }
+    }
+
+    // LDS K-reduction: same as standard Q/Wo kernel
+    __shared__ float4 s_partial[WK - 1][64];
+
+    if (wave_id > 0 && n_base < N)
+    {
+        s_partial[wave_id - 1][lane_id] = make_float4(fp_acc[0], fp_acc[1], fp_acc[2], fp_acc[3]);
+    }
+
+    __syncthreads();
+
+    if (wave_id == 0 && n_base < N)
+    {
+        #pragma unroll
+        for (int w = 0; w < WK - 1; ++w)
+        {
+            const float4 partial = s_partial[w][lane_id];
+            fp_acc[0] += partial.x;
+            fp_acc[1] += partial.y;
+            fp_acc[2] += partial.z;
+            fp_acc[3] += partial.w;
+        }
+
+        if (full_cols)
+        {
+            const float4 scale = *reinterpret_cast<const float4*>(d_scale_B + n_base);
+            if (kb_outer == 1)
+            {
+                d_C_fp32[n_base + 0] = fp_acc[0] * scale.x * alpha;
+                d_C_fp32[n_base + 1] = fp_acc[1] * scale.y * alpha;
+                d_C_fp32[n_base + 2] = fp_acc[2] * scale.z * alpha;
+                d_C_fp32[n_base + 3] = fp_acc[3] * scale.w * alpha;
+            }
+            else
+            {
+                atomicAdd(&d_C_fp32[n_base + 0], fp_acc[0] * scale.x * alpha);
+                atomicAdd(&d_C_fp32[n_base + 1], fp_acc[1] * scale.y * alpha);
+                atomicAdd(&d_C_fp32[n_base + 2], fp_acc[2] * scale.z * alpha);
+                atomicAdd(&d_C_fp32[n_base + 3], fp_acc[3] * scale.w * alpha);
+            }
+        }
+        else
+        {
+            #pragma unroll
+            for (int c = 0; c < 4; ++c)
+            {
+                const int n = n_base + c;
+                if (n < N)
+                {
+                    const float partial = fp_acc[c] * d_scale_B[n] * alpha;
+                    if (kb_outer == 1)
+                    {
+                        d_C_fp32[n] = partial;
+                    }
+                    else
+                    {
+                        atomicAdd(&d_C_fp32[n], partial);
+                    }
+                }
+            }
+        }
+    }
+}
+
+
+// ============================================================================
+// Q/Wo 2x-unrolled LDS K-reduction blockwise kernel — TN=128, CPT=2 variant
+//
+// Same ILP strategy as the TN=256 version but for the TN=128/CPT=2 tile.
+// Uses int2 vectorized loads (8 bytes) like the standard TN=128 kernel,
+// but processes 2 activation blocks simultaneously with separate accumulators.
+// Beneficial when WK is small enough that each wave gets 2+ blocks.
+// ============================================================================
+template <int WK, int ACT_BK = 32>
+__global__ __launch_bounds__(64 * WK)
+void gemv_int8_int8_qwo_unroll2_128_lds_kreduce_blockwise_scaled_kernel_t(
+    const int8_t* __restrict__ d_A_int8,
+    const int8_t* __restrict__ d_B_int8_vnni,
+    float* __restrict__ d_C_fp32,
+    const float* __restrict__ d_scales_A_blockwise,
+    const float* __restrict__ d_scale_B,
+    int N,
+    int K,
+    int kb_outer,
+    float alpha)
+{
+    static_assert(WK >= 2 && WK <= 8, "WK must be 2-8");
+    static_assert(ACT_BK == 32 || ACT_BK == 64 || ACT_BK == 128, "ACT_BK must be 32, 64, or 128");
+    constexpr int KGROUPS_PER_ACT = ACT_BK / 4;
+
+    constexpr int TILE_N = 128;
+    constexpr int CPT = 2;
+    constexpr int THREADS_PER_WAVE = TILE_N / CPT;
+    static_assert(THREADS_PER_WAVE == 64, "TILE_N/CPT must equal 64 (one wavefront)");
+
+    const int wave_id = threadIdx.x / THREADS_PER_WAVE;
+    const int lane_id = threadIdx.x % THREADS_PER_WAVE;
+    const int n_base = blockIdx.x * TILE_N + lane_id * CPT;
+    const int outer_block = blockIdx.y;
+    const int act_blocks = K / ACT_BK;
+
+    const int act_blocks_per_outer = (act_blocks + kb_outer - 1) / kb_outer;
+    const int outer_act_start = outer_block * act_blocks_per_outer;
+    const int outer_act_end = min(outer_act_start + act_blocks_per_outer, act_blocks);
+    if (outer_act_start >= act_blocks)
+    {
+        return;
+    }
+
+    const int outer_act_count = outer_act_end - outer_act_start;
+    const int act_per_wave_base = outer_act_count / WK;
+    const int act_remainder = outer_act_count % WK;
+    const int my_act_start = outer_act_start + wave_id * act_per_wave_base + min(wave_id, act_remainder);
+    const int my_act_count = act_per_wave_base + (wave_id < act_remainder ? 1 : 0);
+    const int my_act_end = my_act_start + my_act_count;
+
+    float fp_acc[2];
+    fp_acc[0] = 0.0f;
+    fp_acc[1] = 0.0f;
+
+    if (n_base < N && my_act_count > 0)
+    {
+        const int32_t* __restrict__ b_row =
+            reinterpret_cast<const int32_t*>(d_B_int8_vnni) + n_base;
+        const size_t b_stride = static_cast<size_t>(N);
+
+        // Process pairs of activation blocks for ILP
+        int act_block = my_act_start;
+        const int pair_end = my_act_start + (my_act_count & ~1);
+
+        #pragma unroll 1
+        for (; act_block < pair_end; act_block += 2)
+        {
+            int32_t acc0[2] = {0, 0};
+            int32_t acc1[2] = {0, 0};
+            const int kg_base0 = act_block * KGROUPS_PER_ACT;
+            const int kg_base1 = (act_block + 1) * KGROUPS_PER_ACT;
+
+            #pragma unroll
+            for (int kgi = 0; kgi < KGROUPS_PER_ACT; ++kgi)
+            {
+                const int32_t a0 = *reinterpret_cast<const int32_t*>(d_A_int8 + (kg_base0 + kgi) * 4);
+                const int2 b0 = *reinterpret_cast<const int2*>(b_row + (kg_base0 + kgi) * b_stride);
+                acc0[0] = __builtin_amdgcn_sdot4(a0, b0.x, acc0[0], false);
+                acc0[1] = __builtin_amdgcn_sdot4(a0, b0.y, acc0[1], false);
+
+                const int32_t a1 = *reinterpret_cast<const int32_t*>(d_A_int8 + (kg_base1 + kgi) * 4);
+                const int2 b1 = *reinterpret_cast<const int2*>(b_row + (kg_base1 + kgi) * b_stride);
+                acc1[0] = __builtin_amdgcn_sdot4(a1, b1.x, acc1[0], false);
+                acc1[1] = __builtin_amdgcn_sdot4(a1, b1.y, acc1[1], false);
+            }
+
+            const float scale0 = d_scales_A_blockwise[act_block];
+            const float scale1 = d_scales_A_blockwise[act_block + 1];
+            fp_acc[0] += static_cast<float>(acc0[0]) * scale0;
+            fp_acc[1] += static_cast<float>(acc0[1]) * scale0;
+            fp_acc[0] += static_cast<float>(acc1[0]) * scale1;
+            fp_acc[1] += static_cast<float>(acc1[1]) * scale1;
+        }
+
+        // Handle odd tail
+        if (act_block < my_act_end)
+        {
+            int32_t block_acc[2] = {0, 0};
+            gemv_int8_accumulate_act_block<2, KGROUPS_PER_ACT>(block_acc, d_A_int8, b_row, b_stride,
+                                           act_block * KGROUPS_PER_ACT);
+            gemv_int8_flush_blockwise_acc(block_acc, fp_acc, d_scales_A_blockwise, act_block);
+        }
+    }
+
+    // LDS K-reduction
+    __shared__ float s_partial[WK - 1][TILE_N];
+
+    if (wave_id > 0 && n_base < N)
+    {
+        s_partial[wave_id - 1][lane_id * CPT + 0] = fp_acc[0];
+        s_partial[wave_id - 1][lane_id * CPT + 1] = fp_acc[1];
+    }
+
+    __syncthreads();
+
+    if (wave_id == 0 && n_base < N)
+    {
+        #pragma unroll
+        for (int w = 0; w < WK - 1; ++w)
+        {
+            fp_acc[0] += s_partial[w][lane_id * CPT + 0];
+            fp_acc[1] += s_partial[w][lane_id * CPT + 1];
+        }
+
+        const float partial0 = fp_acc[0] * d_scale_B[n_base + 0] * alpha;
+        const float partial1 = fp_acc[1] * d_scale_B[n_base + 1] * alpha;
+        if (kb_outer == 1)
+        {
+            float2 out_val = make_float2(partial0, partial1);
+            *reinterpret_cast<int2*>(&d_C_fp32[n_base]) =
+                *reinterpret_cast<const int2*>(&out_val);
+        }
+        else
+        {
+            atomicAdd(&d_C_fp32[n_base + 0], partial0);
+            atomicAdd(&d_C_fp32[n_base + 1], partial1);
+        }
+    }
+}
 
 
 // ============================================================================
@@ -1921,12 +3776,12 @@ __global__ void gemv_fused_scatter_selfreduce_int8_vnni_kernel_t(
 //
 // Grid: dim3(grid_n), Block: dim3(TILE_N / CPT) = dim3(64)
 // ============================================================================
-template <int TILE_N, int CPT>
+template <int TILE_N, int CPT, bool UseBlockwise>
 __global__ void gemv_int8_direct_vnni_kernel_t(
     const int8_t* __restrict__ d_A_int8,        // [K] pre-quantized INT8 activations
     const int8_t* __restrict__ d_B_int8_vnni,   // [K/4][N][4] VNNI weights
     float* __restrict__ d_C_fp32,               // [N] FP32 output (final)
-    const float* __restrict__ d_scale_A,         // [1] activation scale (scalar)
+    const float* __restrict__ d_scale_A,         // [1] activation scale or [K/32] blockwise scales
     const float* __restrict__ d_scales_B,        // [N] per-column weight scales
     const float* __restrict__ d_bias,            // [N] optional bias (nullable)
     int N, int K,
@@ -1940,44 +3795,68 @@ __global__ void gemv_int8_direct_vnni_kernel_t(
     #pragma unroll
     for (int c = 0; c < CPT; ++c) acc[c] = 0;
 
+    float fp_acc[CPT];
+    #pragma unroll
+    for (int c = 0; c < CPT; ++c) fp_acc[c] = 0.0f;
+
     if (active)
     {
-        const int k_groups = K / 4;
-
         const int32_t* __restrict__ b_row =
             reinterpret_cast<const int32_t*>(d_B_int8_vnni) + n_base;
         const size_t b_stride = static_cast<size_t>(N);
 
-        #pragma unroll 4
-        for (int kg = 0; kg < k_groups; ++kg)
+        if constexpr (UseBlockwise)
         {
-            const int32_t a_packed = *reinterpret_cast<const int32_t*>(d_A_int8 + kg * 4);
-
-            if constexpr (CPT == 2)
-            {
-                const int2 b_pair = *reinterpret_cast<const int2*>(
-                    b_row + kg * b_stride);
-                acc[0] = __builtin_amdgcn_sdot4(a_packed, b_pair.x, acc[0], false);
-                acc[1] = __builtin_amdgcn_sdot4(a_packed, b_pair.y, acc[1], false);
-            }
-            else
+            const int act_blocks = K / GEMV_INT8_VNNI_ACT_BLOCK_K;
+            #pragma unroll 1
+            for (int act_block = 0; act_block < act_blocks; ++act_block)
             {
                 #pragma unroll
-                for (int c = 0; c < CPT; ++c)
-                {
-                    const int32_t b_packed = *(b_row + kg * b_stride + c);
-                    acc[c] = __builtin_amdgcn_sdot4(a_packed, b_packed, acc[c], false);
-                }
+                for (int c = 0; c < CPT; ++c) acc[c] = 0;
+
+                gemv_int8_accumulate_act_block(acc, d_A_int8, b_row, b_stride,
+                                               act_block * GEMV_INT8_VNNI_KGROUPS_PER_ACT_BLOCK);
+                gemv_int8_flush_blockwise_acc(acc, fp_acc, d_scale_A, act_block);
             }
         }
+        else
+        {
+            const int k_groups = K / 4;
 
-        // Write final FP32 output: acc * scale_A * scale_B + bias
-        const float sA = d_scale_A[0];
+            #pragma unroll 4
+            for (int kg = 0; kg < k_groups; ++kg)
+            {
+                const int32_t a_packed = *reinterpret_cast<const int32_t*>(d_A_int8 + kg * 4);
+
+                if constexpr (CPT == 2)
+                {
+                    const int2 b_pair = *reinterpret_cast<const int2*>(
+                        b_row + kg * b_stride);
+                    acc[0] = __builtin_amdgcn_sdot4(a_packed, b_pair.x, acc[0], false);
+                    acc[1] = __builtin_amdgcn_sdot4(a_packed, b_pair.y, acc[1], false);
+                }
+                else
+                {
+                    #pragma unroll
+                    for (int c = 0; c < CPT; ++c)
+                    {
+                        const int32_t b_packed = *(b_row + kg * b_stride + c);
+                        acc[c] = __builtin_amdgcn_sdot4(a_packed, b_packed, acc[c], false);
+                    }
+                }
+            }
+
+            const float sA = d_scale_A[0];
+            #pragma unroll
+            for (int c = 0; c < CPT; ++c)
+                fp_acc[c] = static_cast<float>(acc[c]) * sA;
+        }
+
         #pragma unroll
         for (int c = 0; c < CPT; ++c)
         {
             const int n = n_base + c;
-            float result = static_cast<float>(acc[c]) * sA * d_scales_B[n] * alpha;
+            float result = fp_acc[c] * d_scales_B[n] * alpha;
             if (beta != 0.0f && d_C_existing)
                 result += beta * d_C_existing[n];
             if (d_bias)
@@ -2003,12 +3882,12 @@ __global__ void gemv_int8_direct_vnni_kernel_t(
 //
 // Grid: dim3(grid_n, KB), Block: dim3(TILE_N / CPT) = dim3(64)
 // ============================================================================
-template <int TILE_N, int CPT>
+template <int TILE_N, int CPT, bool UseBlockwise>
 __global__ void gemv_int8_scatter_vnni_kernel_t(
     const int8_t* __restrict__ d_A_int8,        // [K] pre-quantized INT8 activations
     const int8_t* __restrict__ d_B_int8_vnni,   // [K/4][N][4] VNNI weights
     float* __restrict__ d_partial_fp32,          // [KB × N] FP32 partial buffer
-    const float* __restrict__ d_scale_A,         // [1] activation scale (scalar)
+    const float* __restrict__ d_scale_A,         // [1] activation scale or [K/32] blockwise scales
     int N, int K, int kblocks)
 {
     const int n_base = blockIdx.x * TILE_N + threadIdx.x * CPT;
@@ -2026,44 +3905,74 @@ __global__ void gemv_int8_scatter_vnni_kernel_t(
     #pragma unroll
     for (int c = 0; c < CPT; ++c) acc[c] = 0;
 
+    float fp_acc[CPT];
+    #pragma unroll
+    for (int c = 0; c < CPT; ++c) fp_acc[c] = 0.0f;
+
     if (active)
     {
-        const int kg_start = k_start / 4;
-        const int kg_end = k_end / 4;
-
         const int32_t* __restrict__ b_row =
             reinterpret_cast<const int32_t*>(d_B_int8_vnni) + n_base;
         const size_t b_stride = static_cast<size_t>(N);
 
-        #pragma unroll 4
-        for (int kg = kg_start; kg < kg_end; ++kg)
+        if constexpr (UseBlockwise)
         {
-            const int32_t a_packed = *reinterpret_cast<const int32_t*>(d_A_int8 + kg * 4);
+            const int act_blocks = K / GEMV_INT8_VNNI_ACT_BLOCK_K;
+            const int act_blocks_per_raw = (act_blocks + kblocks - 1) / kblocks;
+            const int act_block_start = k_block * act_blocks_per_raw;
+            const int act_block_end = min(act_block_start + act_blocks_per_raw, act_blocks);
 
-            if constexpr (CPT == 2)
-            {
-                const int2 b_pair = *reinterpret_cast<const int2*>(
-                    b_row + kg * b_stride);
-                acc[0] = __builtin_amdgcn_sdot4(a_packed, b_pair.x, acc[0], false);
-                acc[1] = __builtin_amdgcn_sdot4(a_packed, b_pair.y, acc[1], false);
-            }
-            else
+            if (act_block_start >= act_blocks) return;
+
+            #pragma unroll 1
+            for (int act_block = act_block_start; act_block < act_block_end; ++act_block)
             {
                 #pragma unroll
-                for (int c = 0; c < CPT; ++c)
-                {
-                    const int32_t b_packed = *(b_row + kg * b_stride + c);
-                    acc[c] = __builtin_amdgcn_sdot4(a_packed, b_packed, acc[c], false);
-                }
+                for (int c = 0; c < CPT; ++c) acc[c] = 0;
+
+                gemv_int8_accumulate_act_block(acc, d_A_int8, b_row, b_stride,
+                                               act_block * GEMV_INT8_VNNI_KGROUPS_PER_ACT_BLOCK);
+                gemv_int8_flush_blockwise_acc(acc, fp_acc, d_scale_A, act_block);
             }
         }
+        else
+        {
+            const int kg_start = k_start / 4;
+            const int kg_end = k_end / 4;
 
-        // Write FP32 partials with scale_A baked in (plain store, no atomicAdd)
-        const float sA = d_scale_A[0];
+            #pragma unroll 4
+            for (int kg = kg_start; kg < kg_end; ++kg)
+            {
+                const int32_t a_packed = *reinterpret_cast<const int32_t*>(d_A_int8 + kg * 4);
+
+                if constexpr (CPT == 2)
+                {
+                    const int2 b_pair = *reinterpret_cast<const int2*>(
+                        b_row + kg * b_stride);
+                    acc[0] = __builtin_amdgcn_sdot4(a_packed, b_pair.x, acc[0], false);
+                    acc[1] = __builtin_amdgcn_sdot4(a_packed, b_pair.y, acc[1], false);
+                }
+                else
+                {
+                    #pragma unroll
+                    for (int c = 0; c < CPT; ++c)
+                    {
+                        const int32_t b_packed = *(b_row + kg * b_stride + c);
+                        acc[c] = __builtin_amdgcn_sdot4(a_packed, b_packed, acc[c], false);
+                    }
+                }
+            }
+
+            const float sA = d_scale_A[0];
+            #pragma unroll
+            for (int c = 0; c < CPT; ++c)
+                fp_acc[c] = static_cast<float>(acc[c]) * sA;
+        }
+
         const size_t partial_offset = static_cast<size_t>(k_block) * N;
         #pragma unroll
         for (int c = 0; c < CPT; ++c)
-            d_partial_fp32[partial_offset + n_base + c] = static_cast<float>(acc[c]) * sA;
+            d_partial_fp32[partial_offset + n_base + c] = fp_acc[c];
     }
 }
 
@@ -2077,13 +3986,13 @@ __global__ void gemv_int8_scatter_vnni_kernel_t(
 //
 // Grid: dim3(grid_n, KB), Block: dim3(TILE_N / CPT) = dim3(64)
 // ============================================================================
-template <int TILE_N, int CPT>
+template <int TILE_N, int CPT, bool UseBlockwise>
 __global__ void gemv_int8_scatter_selfreduce_vnni_kernel_t(
     const int8_t* __restrict__ d_A_int8,        // [K] pre-quantized INT8 activations
     const int8_t* __restrict__ d_B_int8_vnni,   // [K/4][N][4] VNNI weights
     float* __restrict__ d_partial_fp32,          // [KB × N] FP32 partial buffer
     float* __restrict__ d_C_fp32,               // [N] FP32 output
-    const float* __restrict__ d_scale_A,         // [1] activation scale
+    const float* __restrict__ d_scale_A,         // [1] activation scale or [K/32] blockwise scales
     const float* __restrict__ d_scales_B,        // [N] per-column weight scales
     const float* __restrict__ d_bias,            // [N] optional bias (nullable)
     int* __restrict__ d_counter,                 // [grid_n] atomic completion counters
@@ -2107,44 +4016,74 @@ __global__ void gemv_int8_scatter_selfreduce_vnni_kernel_t(
     #pragma unroll
     for (int c = 0; c < CPT; ++c) acc[c] = 0;
 
+    float fp_acc[CPT];
+    #pragma unroll
+    for (int c = 0; c < CPT; ++c) fp_acc[c] = 0.0f;
+
     if (active)
     {
-        const int kg_start = k_start / 4;
-        const int kg_end = k_end / 4;
-
         const int32_t* __restrict__ b_row =
             reinterpret_cast<const int32_t*>(d_B_int8_vnni) + n_base;
         const size_t b_stride = static_cast<size_t>(N);
 
-        #pragma unroll 4
-        for (int kg = kg_start; kg < kg_end; ++kg)
+        if constexpr (UseBlockwise)
         {
-            const int32_t a_packed = *reinterpret_cast<const int32_t*>(d_A_int8 + kg * 4);
+            const int act_blocks = K / GEMV_INT8_VNNI_ACT_BLOCK_K;
+            const int act_blocks_per_raw = (act_blocks + kblocks - 1) / kblocks;
+            const int act_block_start = k_block * act_blocks_per_raw;
+            const int act_block_end = min(act_block_start + act_blocks_per_raw, act_blocks);
 
-            if constexpr (CPT == 2)
-            {
-                const int2 b_pair = *reinterpret_cast<const int2*>(
-                    b_row + kg * b_stride);
-                acc[0] = __builtin_amdgcn_sdot4(a_packed, b_pair.x, acc[0], false);
-                acc[1] = __builtin_amdgcn_sdot4(a_packed, b_pair.y, acc[1], false);
-            }
-            else
+            if (act_block_start >= act_blocks) return;
+
+            #pragma unroll 1
+            for (int act_block = act_block_start; act_block < act_block_end; ++act_block)
             {
                 #pragma unroll
-                for (int c = 0; c < CPT; ++c)
-                {
-                    const int32_t b_packed = *(b_row + kg * b_stride + c);
-                    acc[c] = __builtin_amdgcn_sdot4(a_packed, b_packed, acc[c], false);
-                }
+                for (int c = 0; c < CPT; ++c) acc[c] = 0;
+
+                gemv_int8_accumulate_act_block(acc, d_A_int8, b_row, b_stride,
+                                               act_block * GEMV_INT8_VNNI_KGROUPS_PER_ACT_BLOCK);
+                gemv_int8_flush_blockwise_acc(acc, fp_acc, d_scale_A, act_block);
             }
         }
+        else
+        {
+            const int kg_start = k_start / 4;
+            const int kg_end = k_end / 4;
 
-        // Write FP32 partials with scale_A baked in
-        const float sA = d_scale_A[0];
+            #pragma unroll 4
+            for (int kg = kg_start; kg < kg_end; ++kg)
+            {
+                const int32_t a_packed = *reinterpret_cast<const int32_t*>(d_A_int8 + kg * 4);
+
+                if constexpr (CPT == 2)
+                {
+                    const int2 b_pair = *reinterpret_cast<const int2*>(
+                        b_row + kg * b_stride);
+                    acc[0] = __builtin_amdgcn_sdot4(a_packed, b_pair.x, acc[0], false);
+                    acc[1] = __builtin_amdgcn_sdot4(a_packed, b_pair.y, acc[1], false);
+                }
+                else
+                {
+                    #pragma unroll
+                    for (int c = 0; c < CPT; ++c)
+                    {
+                        const int32_t b_packed = *(b_row + kg * b_stride + c);
+                        acc[c] = __builtin_amdgcn_sdot4(a_packed, b_packed, acc[c], false);
+                    }
+                }
+            }
+
+            const float sA = d_scale_A[0];
+            #pragma unroll
+            for (int c = 0; c < CPT; ++c)
+                fp_acc[c] = static_cast<float>(acc[c]) * sA;
+        }
+
         const size_t partial_offset = static_cast<size_t>(k_block) * N;
         #pragma unroll
         for (int c = 0; c < CPT; ++c)
-            d_partial_fp32[partial_offset + n_base + c] = static_cast<float>(acc[c]) * sA;
+            d_partial_fp32[partial_offset + n_base + c] = fp_acc[c];
     }
 
     // Phase 2: Last-to-arrive reduction via atomic counter
@@ -2208,10 +4147,10 @@ __global__ void gemv_int8_scatter_selfreduce_vnni_kernel_t(
 //
 // Grid: dim3(total_grid_n, KB), Block: dim3(TILE_N / CPT) = dim3(64)
 // ============================================================================
-template <int TILE_N, int CPT>
+template <int TILE_N, int CPT, bool UseBlockwise>
 __global__ void gemv_int8_scatter_batched_vnni_kernel_t(
     const int8_t* __restrict__ d_A_int8,    // [K] pre-quantized INT8 activations
-    const float* __restrict__ d_scale_A,     // [1] activation scale (scalar)
+    const float* __restrict__ d_scale_A,     // [1] activation scale or [K/32] blockwise scales
     float* __restrict__ d_partial_fp32,      // [KB × total_N] FP32 partial buffer
     GemvBatchArgs args,                      // Batch descriptors (by value)
     int K, int kblocks)
@@ -2242,46 +4181,76 @@ __global__ void gemv_int8_scatter_batched_vnni_kernel_t(
     #pragma unroll
     for (int c = 0; c < CPT; ++c) acc[c] = 0;
 
+    float fp_acc[CPT];
+    #pragma unroll
+    for (int c = 0; c < CPT; ++c) fp_acc[c] = 0.0f;
+
     if (active)
     {
-        const int kg_start = k_start / 4;
-        const int kg_end = k_end / 4;
-
         // Index into THIS batch's weight matrix using local n position
         const int32_t* __restrict__ b_row =
             reinterpret_cast<const int32_t*>(args.d_B[batch]) + n_local;
         const size_t b_stride = static_cast<size_t>(args.N[batch]);
 
-        #pragma unroll 4
-        for (int kg = kg_start; kg < kg_end; ++kg)
+        if constexpr (UseBlockwise)
         {
-            const int32_t a_packed = *reinterpret_cast<const int32_t*>(d_A_int8 + kg * 4);
+            const int act_blocks = K / GEMV_INT8_VNNI_ACT_BLOCK_K;
+            const int act_blocks_per_raw = (act_blocks + kblocks - 1) / kblocks;
+            const int act_block_start = k_block * act_blocks_per_raw;
+            const int act_block_end = min(act_block_start + act_blocks_per_raw, act_blocks);
 
-            if constexpr (CPT == 2)
-            {
-                const int2 b_pair = *reinterpret_cast<const int2*>(
-                    b_row + kg * b_stride);
-                acc[0] = __builtin_amdgcn_sdot4(a_packed, b_pair.x, acc[0], false);
-                acc[1] = __builtin_amdgcn_sdot4(a_packed, b_pair.y, acc[1], false);
-            }
-            else
+            if (act_block_start >= act_blocks) return;
+
+            #pragma unroll 1
+            for (int act_block = act_block_start; act_block < act_block_end; ++act_block)
             {
                 #pragma unroll
-                for (int c = 0; c < CPT; ++c)
-                {
-                    const int32_t b_packed = *(b_row + kg * b_stride + c);
-                    acc[c] = __builtin_amdgcn_sdot4(a_packed, b_packed, acc[c], false);
-                }
+                for (int c = 0; c < CPT; ++c) acc[c] = 0;
+
+                gemv_int8_accumulate_act_block(acc, d_A_int8, b_row, b_stride,
+                                               act_block * GEMV_INT8_VNNI_KGROUPS_PER_ACT_BLOCK);
+                gemv_int8_flush_blockwise_acc(acc, fp_acc, d_scale_A, act_block);
             }
         }
+        else
+        {
+            const int kg_start = k_start / 4;
+            const int kg_end = k_end / 4;
 
-        // Write to concatenated partial buffer: [kb * total_N + n_global]
-        const float sA = d_scale_A[0];
+            #pragma unroll 4
+            for (int kg = kg_start; kg < kg_end; ++kg)
+            {
+                const int32_t a_packed = *reinterpret_cast<const int32_t*>(d_A_int8 + kg * 4);
+
+                if constexpr (CPT == 2)
+                {
+                    const int2 b_pair = *reinterpret_cast<const int2*>(
+                        b_row + kg * b_stride);
+                    acc[0] = __builtin_amdgcn_sdot4(a_packed, b_pair.x, acc[0], false);
+                    acc[1] = __builtin_amdgcn_sdot4(a_packed, b_pair.y, acc[1], false);
+                }
+                else
+                {
+                    #pragma unroll
+                    for (int c = 0; c < CPT; ++c)
+                    {
+                        const int32_t b_packed = *(b_row + kg * b_stride + c);
+                        acc[c] = __builtin_amdgcn_sdot4(a_packed, b_packed, acc[c], false);
+                    }
+                }
+            }
+
+            const float sA = d_scale_A[0];
+            #pragma unroll
+            for (int c = 0; c < CPT; ++c)
+                fp_acc[c] = static_cast<float>(acc[c]) * sA;
+        }
+
         const int n_global = args.n_offset[batch] + n_local;
         const size_t partial_offset = static_cast<size_t>(k_block) * args.total_N;
         #pragma unroll
         for (int c = 0; c < CPT; ++c)
-            d_partial_fp32[partial_offset + n_global + c] = static_cast<float>(acc[c]) * sA;
+            d_partial_fp32[partial_offset + n_global + c] = fp_acc[c];
     }
 }
 
@@ -2340,6 +4309,19 @@ __global__ void gemv_reduce_scale_batched_kernel_t(
 
 extern "C" {
 
+bool rocmGemv_int8_scatter_vnni_blockwise(
+    const int8_t* d_A_int8,
+    const int8_t* d_B_int8_vnni,
+    float* d_C_fp32,
+    const float* d_scales_A_blockwise,
+    const float* d_scales_B,
+    const float* d_bias,
+    float* d_partial_buf,
+    int N, int K,
+    float alpha, float beta,
+    const float* d_C_existing,
+    int device_id, void* stream);
+
 
 void rocmGemv_int8_vnni_set_tuning_overrides(
     int tn,
@@ -2352,6 +4334,46 @@ void rocmGemv_int8_vnni_set_tuning_overrides(
 void rocmGemv_int8_vnni_reset_tuning_overrides()
 {
     rocmGemv_int8_vnni_set_tuning_overrides(-1, -1);
+}
+
+void rocmGemv_int8_vnni_set_wk_override(int wk)
+{
+    g_int8_vnni_wk_override.store(wk, std::memory_order_relaxed);
+}
+
+void rocmGemv_int8_vnni_set_unroll_override(int unroll)
+{
+    g_int8_vnni_unroll_override.store(unroll, std::memory_order_relaxed);
+}
+
+void rocmGemv_int8_vnni_set_act_block_override(int act_bk)
+{
+    g_int8_vnni_act_block_override.store(act_bk, std::memory_order_relaxed);
+}
+
+int rocmGemv_int8_vnni_get_act_block_k()
+{
+    int v = g_int8_vnni_act_block_override.load(std::memory_order_relaxed);
+    return (v == 64 || v == 128) ? v : 32;
+}
+
+void rocmGemv_int8_vnni_reset_qwo_overrides()
+{
+    g_int8_vnni_wk_override.store(-1, std::memory_order_relaxed);
+    g_int8_vnni_unroll_override.store(-1, std::memory_order_relaxed);
+    g_int8_vnni_act_block_override.store(-1, std::memory_order_relaxed);
+    g_int8_vnni_skip_memset_override.store(0, std::memory_order_relaxed);
+    g_int8_vnni_force_pair_override.store(0, std::memory_order_relaxed);
+}
+
+void rocmGemv_int8_vnni_set_skip_memset(int skip)
+{
+    g_int8_vnni_skip_memset_override.store(skip, std::memory_order_relaxed);
+}
+
+void rocmGemv_int8_vnni_set_force_pair(int force)
+{
+    g_int8_vnni_force_pair_override.store(force, std::memory_order_relaxed);
 }
 
 void rocmGemv_int8_vnni_set_wide_tuning_overrides(
@@ -2787,6 +4809,978 @@ bool rocmGemv_int8_int8_fp32_vnni_scaled(
         fprintf(stderr, "[rocmGemv_int8_int8_fp32_vnni_scaled] Kernel launch failed: %s (N=%d K=%d)\n",
                 hipGetErrorString(err), N, K);
         return false;
+    }
+
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Pair dispatch for tiny K/V shapes: launches the LDS K-reduce pair kernel
+// for two projections with same K, each with N <= 512 and K >= 2048.
+// ---------------------------------------------------------------------------
+bool rocmGemv_int8_int8_fp32_vnni_blockwise_scaled_pair(
+    const int8_t* d_A_int8,
+    const float* d_scales_A_blockwise,
+    const int8_t* d_B0,
+    const int8_t* d_B1,
+    float* d_C0,
+    float* d_C1,
+    const float* d_scales_B0,
+    const float* d_scales_B1,
+    int N0, int N1,
+    int K,
+    float alpha,
+    int device_id, void* stream)
+{
+    llaminar2::HipDeviceGuard::setDevice(device_id);
+
+    constexpr int TN = GEMV_INT8_VNNI_GRID_KPAR_TILE_N;  // 128
+    constexpr int CPT = GEMV_INT8_VNNI_GRID_KPAR_CPT;    // 2
+    constexpr int WK = 8;
+
+    const int grid_n0 = (N0 + TN - 1) / TN;
+    const int grid_n1 = (N1 + TN - 1) / TN;
+    const int total_grid_n = grid_n0 + grid_n1;
+    const int act_blocks = K / GEMV_INT8_VNNI_ACT_BLOCK_K;
+
+    const int int8_kb_override = g_int8_vnni_kb_override.load(std::memory_order_relaxed);
+    const int kb_outer = select_blockwise_tiny_kv_outer_splits(total_grid_n, act_blocks, int8_kb_override);
+
+    // Zero outputs when KB > 1 (kernel uses atomicAdd)
+    if (kb_outer > 1)
+    {
+        hipLaunchKernelGGL(
+            HIP_KERNEL_NAME(gemv_init_output_pair_kernel_t<TN, CPT>),
+            dim3(total_grid_n), dim3(TN / CPT), 0, static_cast<hipStream_t>(stream),
+            d_C0, d_C1, nullptr, nullptr,
+            N0, N1, grid_n0, 0.0f);
+    }
+
+    hipLaunchKernelGGL(
+        HIP_KERNEL_NAME(gemv_int8_int8_lds_kreduce_pair_blockwise_scaled_kernel_t<TN, CPT, WK>),
+        dim3(total_grid_n, kb_outer), dim3((TN / CPT) * WK), 0, static_cast<hipStream_t>(stream),
+        d_A_int8,
+        d_B0, d_B1,
+        d_C0, d_C1,
+        d_scales_A_blockwise,
+        d_scales_B0, d_scales_B1,
+        N0, N1, grid_n0,
+        K, kb_outer, alpha);
+
+    hipError_t err = hipGetLastError();
+    if (err != hipSuccess)
+    {
+        fprintf(stderr, "[rocmGemv_int8_int8_fp32_vnni_blockwise_scaled_pair] launch failed: %s (N0=%d N1=%d K=%d kb=%d)\n",
+                hipGetErrorString(err), N0, N1, K, kb_outer);
+        return false;
+    }
+
+    return true;
+}
+
+bool rocmGemv_int8_int8_fp32_vnni_blockwise_scaled(
+    const int8_t* d_A_int8,
+    const int8_t* d_B_int8_vnni,
+    float* d_C_fp32,
+    const float* d_scales_A_blockwise,
+    const float* d_scale_B,
+    int N, int K,
+    float alpha,
+    float beta,
+    const float* d_C_existing,
+    const float* d_bias,
+    int device_id, void* stream)
+{
+    llaminar2::HipDeviceGuard::setDevice(device_id);
+
+    if ((K % 4) != 0)
+    {
+        fprintf(stderr, "[rocmGemv_int8_int8_fp32_vnni_blockwise_scaled] K must be multiple of 4 (N=%d K=%d)\n", N, K);
+        return false;
+    }
+    // Check K is divisible by the current act_block size (32, 64, or 128)
+    const int effective_act_bk = rocmGemv_int8_vnni_get_act_block_k();
+    if ((K % effective_act_bk) != 0)
+    {
+        fprintf(stderr, "[rocmGemv_int8_int8_fp32_vnni_blockwise_scaled] K must be multiple of act_block_k=%d (N=%d K=%d)\n",
+                effective_act_bk, N, K);
+        return false;
+    }
+    if (beta != 0.0f && d_C_existing == nullptr)
+    {
+        fprintf(stderr, "[rocmGemv_int8_int8_fp32_vnni_blockwise_scaled] d_C_existing required when beta != 0 (N=%d K=%d)\n", N, K);
+        return false;
+    }
+
+    const bool use_vec4 = ((N % 4) == 0);
+    const int wide_tn_override = g_int8_vnni_wide_tn_override.load(std::memory_order_relaxed);
+    const int wide_cpt_override = g_int8_vnni_wide_cpt_override.load(std::memory_order_relaxed);
+    const int wide_vec_load_override = g_int8_vnni_wide_vec_load_override.load(std::memory_order_relaxed);
+
+    int wide_tn = GEMV_INT8_VNNI_WIDE_TILE_N;
+    if (wide_tn_override == 128 || wide_tn_override == 256 || wide_tn_override == 512)
+    {
+        wide_tn = wide_tn_override;
+    }
+
+    int wide_cpt = GEMV_INT8_VNNI_WIDE_DEFAULT_CPT;
+    if (wide_cpt_override == 2 || wide_cpt_override == 4)
+    {
+        wide_cpt = wide_cpt_override;
+    }
+
+    bool wide_vec_load = true;
+    if (wide_vec_load_override == 0)
+    {
+        wide_vec_load = false;
+    }
+    else if (wide_vec_load_override == 1)
+    {
+        wide_vec_load = true;
+    }
+
+    const bool use_wide_vec4 = (N >= 8 * K) && (N >= wide_tn);
+    const int int8_tn_override = g_int8_vnni_tn_override.load(std::memory_order_relaxed);
+    const int int8_kb_override = g_int8_vnni_kb_override.load(std::memory_order_relaxed);
+    const int qwo_tn = (int8_tn_override == 128 || int8_tn_override == 256) ? int8_tn_override : 128;
+
+    const bool use_tiny_kv_lds_kreduce_blockwise = !use_wide_vec4
+        && use_vec4
+        && (N <= 512)
+        && (K >= 2048);
+    const bool use_qwo_lds_kreduce_blockwise = !use_wide_vec4
+        && !use_tiny_kv_lds_kreduce_blockwise
+        && use_vec4
+        && (N >= 2048);
+    const bool use_grid_kpar = !use_wide_vec4 && !use_qwo_lds_kreduce_blockwise && use_vec4 && (N >= GEMV_INT8_VNNI_GRID_KPAR_TILE_N);
+    const bool use_square = !use_wide_vec4 && !use_grid_kpar && (N >= GEMV_INT8_VNNI_SQUARE_TILE_N);
+
+    if (use_tiny_kv_lds_kreduce_blockwise)
+    {
+        constexpr int TN = GEMV_INT8_VNNI_GRID_KPAR_TILE_N;
+        constexpr int CPT = GEMV_INT8_VNNI_GRID_KPAR_CPT;
+        constexpr int WK = 8;
+
+        const int grid_n = (N + TN - 1) / TN;
+        const int act_blocks = K / GEMV_INT8_VNNI_ACT_BLOCK_K;
+        const int kb_outer = select_blockwise_tiny_kv_outer_splits(grid_n, act_blocks, int8_kb_override);
+
+        // When kb_outer == 1, kernel does direct write (no atomicAdd),
+        // so no memset/init needed for the beta==0 && no-bias path.
+        if (kb_outer > 1 && beta == 0.0f && d_bias == nullptr)
+        {
+            hipMemsetAsync(d_C_fp32, 0, static_cast<size_t>(N) * sizeof(float), static_cast<hipStream_t>(stream));
+        }
+        else if (beta != 0.0f || d_bias != nullptr)
+        {
+            hipLaunchKernelGGL(
+                HIP_KERNEL_NAME(gemv_init_output_kernel_t<TN, CPT>),
+                dim3(grid_n), dim3(TN / CPT), 0, static_cast<hipStream_t>(stream),
+                d_C_fp32, d_C_existing, d_bias, N, beta);
+        }
+
+        hipLaunchKernelGGL(
+            HIP_KERNEL_NAME(gemv_int8_int8_lds_kreduce_blockwise_scaled_kernel_t<TN, CPT, WK>),
+            dim3(grid_n, kb_outer), dim3((TN / CPT) * WK), 0, static_cast<hipStream_t>(stream),
+            d_A_int8, d_B_int8_vnni, d_C_fp32, d_scales_A_blockwise, d_scale_B,
+            N, K, kb_outer, alpha);
+
+        hipError_t err = hipGetLastError();
+        if (err != hipSuccess)
+        {
+            fprintf(stderr, "[rocmGemv_int8_int8_fp32_vnni_blockwise_scaled] tiny-kv lds_kreduce launch failed: %s (N=%d K=%d kb_outer=%d)\n",
+                    hipGetErrorString(err), N, K, kb_outer);
+            return false;
+        }
+
+        return true;
+    }
+
+    if (use_qwo_lds_kreduce_blockwise)
+    {
+        // Unified Q/Wo dispatch with WK, unroll, and act_block overrides
+        const int wk_ov = g_int8_vnni_wk_override.load(std::memory_order_relaxed);
+        const int unroll_ov = g_int8_vnni_unroll_override.load(std::memory_order_relaxed);
+        const int tn = qwo_tn;  // 128 or 256
+        const int wk = (wk_ov >= 2 && wk_ov <= 8) ? wk_ov : 8;  // default WK=8 (tuned)
+        const bool use_unroll2 = (unroll_ov == -1) ? true : (unroll_ov == 2);  // default: unroll=2 (tuned)
+        const int act_bk = rocmGemv_int8_vnni_get_act_block_k();  // 32, 64, or 128
+
+        const int grid_n = (N + tn - 1) / tn;
+        const int act_blocks = K / act_bk;
+        const int kb_outer = select_blockwise_qwo_outer_splits(grid_n, act_blocks, int8_kb_override, wk);
+
+        if (kb_outer > 1 && beta == 0.0f && d_bias == nullptr)
+        {
+            hipMemsetAsync(d_C_fp32, 0, static_cast<size_t>(N) * sizeof(float), static_cast<hipStream_t>(stream));
+        }
+        else if (beta != 0.0f || d_bias != nullptr)
+        {
+            if (tn == 256)
+            {
+                hipLaunchKernelGGL(
+                    HIP_KERNEL_NAME(gemv_init_output_kernel_t<256, 4>),
+                    dim3(grid_n), dim3(64), 0, static_cast<hipStream_t>(stream),
+                    d_C_fp32, d_C_existing, d_bias, N, beta);
+            }
+            else
+            {
+                constexpr int TN = GEMV_INT8_VNNI_GRID_KPAR_TILE_N;
+                constexpr int CPT = GEMV_INT8_VNNI_GRID_KPAR_CPT;
+                hipLaunchKernelGGL(
+                    HIP_KERNEL_NAME(gemv_init_output_kernel_t<TN, CPT>),
+                    dim3(grid_n), dim3(TN / CPT), 0, static_cast<hipStream_t>(stream),
+                    d_C_fp32, d_C_existing, d_bias, N, beta);
+            }
+        }
+
+        // Macro to dispatch with runtime WK -> compile-time template arg
+        #define LAUNCH_QWO_KERNEL(KERNEL_TEMPLATE, WK_VAL)                                        \
+            hipLaunchKernelGGL(                                                                    \
+                HIP_KERNEL_NAME(KERNEL_TEMPLATE<WK_VAL>),                                         \
+                dim3(grid_n, kb_outer), dim3(64 * WK_VAL), 0, static_cast<hipStream_t>(stream),   \
+                d_A_int8, d_B_int8_vnni, d_C_fp32, d_scales_A_blockwise, d_scale_B,               \
+                N, K, kb_outer, alpha)
+
+        #define LAUNCH_QWO_KERNEL_ABK(KERNEL_TEMPLATE, WK_VAL, ABK_VAL)                            \
+            hipLaunchKernelGGL(                                                                    \
+                HIP_KERNEL_NAME(KERNEL_TEMPLATE<WK_VAL, ABK_VAL>),                                \
+                dim3(grid_n, kb_outer), dim3(64 * WK_VAL), 0, static_cast<hipStream_t>(stream),   \
+                d_A_int8, d_B_int8_vnni, d_C_fp32, d_scales_A_blockwise, d_scale_B,               \
+                N, K, kb_outer, alpha)
+
+        #define LAUNCH_LDS_KERNEL(TN_VAL, CPT_VAL, WK_VAL)                                       \
+            hipLaunchKernelGGL(                                                                    \
+                HIP_KERNEL_NAME(gemv_int8_int8_lds_kreduce_blockwise_scaled_kernel_t<TN_VAL, CPT_VAL, WK_VAL>), \
+                dim3(grid_n, kb_outer), dim3(64 * WK_VAL), 0, static_cast<hipStream_t>(stream),   \
+                d_A_int8, d_B_int8_vnni, d_C_fp32, d_scales_A_blockwise, d_scale_B,               \
+                N, K, kb_outer, alpha)
+
+        if (tn == 256 && use_unroll2)
+        {
+            switch (wk)
+            {
+            case 2: LAUNCH_QWO_KERNEL(gemv_int8_int8_qwo_unroll2_lds_kreduce_blockwise_scaled_kernel_t, 2); break;
+            case 3: LAUNCH_QWO_KERNEL(gemv_int8_int8_qwo_unroll2_lds_kreduce_blockwise_scaled_kernel_t, 3); break;
+            case 6: LAUNCH_QWO_KERNEL(gemv_int8_int8_qwo_unroll2_lds_kreduce_blockwise_scaled_kernel_t, 6); break;
+            case 8: LAUNCH_QWO_KERNEL(gemv_int8_int8_qwo_unroll2_lds_kreduce_blockwise_scaled_kernel_t, 8); break;
+            default: LAUNCH_QWO_KERNEL(gemv_int8_int8_qwo_unroll2_lds_kreduce_blockwise_scaled_kernel_t, 4); break;
+            }
+        }
+        else if (tn == 256)
+        {
+            switch (wk)
+            {
+            case 2: LAUNCH_QWO_KERNEL(gemv_int8_int8_qwo_lds_kreduce_blockwise_scaled_kernel_t, 2); break;
+            case 3: LAUNCH_QWO_KERNEL(gemv_int8_int8_qwo_lds_kreduce_blockwise_scaled_kernel_t, 3); break;
+            case 6: LAUNCH_QWO_KERNEL(gemv_int8_int8_qwo_lds_kreduce_blockwise_scaled_kernel_t, 6); break;
+            case 8: LAUNCH_QWO_KERNEL(gemv_int8_int8_qwo_lds_kreduce_blockwise_scaled_kernel_t, 8); break;
+            default: LAUNCH_QWO_KERNEL(gemv_int8_int8_qwo_lds_kreduce_blockwise_scaled_kernel_t, 4); break;
+            }
+        }
+        else if (tn == 128 && use_unroll2)
+        {
+            // TN=128, CPT=2, unroll2 variant — dispatch with act_block size
+            if (act_bk == 128)
+            {
+                switch (wk)
+                {
+                case 2: LAUNCH_QWO_KERNEL_ABK(gemv_int8_int8_qwo_unroll2_128_lds_kreduce_blockwise_scaled_kernel_t, 2, 128); break;
+                case 3: LAUNCH_QWO_KERNEL_ABK(gemv_int8_int8_qwo_unroll2_128_lds_kreduce_blockwise_scaled_kernel_t, 3, 128); break;
+                case 6: LAUNCH_QWO_KERNEL_ABK(gemv_int8_int8_qwo_unroll2_128_lds_kreduce_blockwise_scaled_kernel_t, 6, 128); break;
+                case 8: LAUNCH_QWO_KERNEL_ABK(gemv_int8_int8_qwo_unroll2_128_lds_kreduce_blockwise_scaled_kernel_t, 8, 128); break;
+                default: LAUNCH_QWO_KERNEL_ABK(gemv_int8_int8_qwo_unroll2_128_lds_kreduce_blockwise_scaled_kernel_t, 4, 128); break;
+                }
+            }
+            else if (act_bk == 64)
+            {
+                switch (wk)
+                {
+                case 2: LAUNCH_QWO_KERNEL_ABK(gemv_int8_int8_qwo_unroll2_128_lds_kreduce_blockwise_scaled_kernel_t, 2, 64); break;
+                case 3: LAUNCH_QWO_KERNEL_ABK(gemv_int8_int8_qwo_unroll2_128_lds_kreduce_blockwise_scaled_kernel_t, 3, 64); break;
+                case 6: LAUNCH_QWO_KERNEL_ABK(gemv_int8_int8_qwo_unroll2_128_lds_kreduce_blockwise_scaled_kernel_t, 6, 64); break;
+                case 8: LAUNCH_QWO_KERNEL_ABK(gemv_int8_int8_qwo_unroll2_128_lds_kreduce_blockwise_scaled_kernel_t, 8, 64); break;
+                default: LAUNCH_QWO_KERNEL_ABK(gemv_int8_int8_qwo_unroll2_128_lds_kreduce_blockwise_scaled_kernel_t, 4, 64); break;
+                }
+            }
+            else
+            {
+                switch (wk)
+                {
+                case 2: LAUNCH_QWO_KERNEL(gemv_int8_int8_qwo_unroll2_128_lds_kreduce_blockwise_scaled_kernel_t, 2); break;
+                case 3: LAUNCH_QWO_KERNEL(gemv_int8_int8_qwo_unroll2_128_lds_kreduce_blockwise_scaled_kernel_t, 3); break;
+                case 6: LAUNCH_QWO_KERNEL(gemv_int8_int8_qwo_unroll2_128_lds_kreduce_blockwise_scaled_kernel_t, 6); break;
+                case 8: LAUNCH_QWO_KERNEL(gemv_int8_int8_qwo_unroll2_128_lds_kreduce_blockwise_scaled_kernel_t, 8); break;
+                default: LAUNCH_QWO_KERNEL(gemv_int8_int8_qwo_unroll2_128_lds_kreduce_blockwise_scaled_kernel_t, 4); break;
+                }
+            }
+        }
+        else
+        {
+            // TN=128, CPT=2 standard
+            constexpr int TN = GEMV_INT8_VNNI_GRID_KPAR_TILE_N;
+            constexpr int CPT = GEMV_INT8_VNNI_GRID_KPAR_CPT;
+            switch (wk)
+            {
+            case 2: LAUNCH_LDS_KERNEL(TN, CPT, 2); break;
+            case 3: LAUNCH_LDS_KERNEL(TN, CPT, 3); break;
+            case 6: LAUNCH_LDS_KERNEL(TN, CPT, 6); break;
+            case 8: LAUNCH_LDS_KERNEL(TN, CPT, 8); break;
+            default: LAUNCH_LDS_KERNEL(TN, CPT, 4); break;
+            }
+        }
+
+        #undef LAUNCH_QWO_KERNEL
+        #undef LAUNCH_QWO_KERNEL_ABK
+        #undef LAUNCH_LDS_KERNEL
+
+        hipError_t err = hipGetLastError();
+        if (err != hipSuccess)
+        {
+            fprintf(stderr, "[rocmGemv_int8_int8_fp32_vnni_blockwise_scaled] qwo dispatch failed: %s (N=%d K=%d tn=%d wk=%d unroll=%d act_bk=%d kb=%d)\n",
+                    hipGetErrorString(err), N, K, tn, wk, use_unroll2 ? 2 : 1, act_bk, kb_outer);
+            return false;
+        }
+
+        return true;
+    }
+
+    if (use_grid_kpar)
+    {
+        constexpr int TN = GEMV_INT8_VNNI_GRID_KPAR_TILE_N;
+        constexpr int CPT = GEMV_INT8_VNNI_GRID_KPAR_CPT;
+        constexpr int TN_WIDE = GEMV_INT8_VNNI_WIDE2_TILE_N;
+
+        int tn = TN;
+        if (int8_tn_override == TN_WIDE)
+        {
+            tn = TN_WIDE;
+        }
+        else if (int8_tn_override == TN)
+        {
+            tn = TN;
+        }
+
+        const int grid_n = (N + tn - 1) / tn;
+        const int act_blocks = K / GEMV_INT8_VNNI_ACT_BLOCK_K;
+
+        // For tiny-grid decode shapes, the direct/scatter family is structurally better
+        // than atomic grid_kpar because it avoids repeated output updates and can reduce
+        // once per tile. Keep grid_kpar as the broad/default path for wider shapes.
+        if (grid_n <= 8)
+        {
+            const int kb_small = select_blockwise_split_count(grid_n, act_blocks, int8_kb_override);
+            float* d_partial_small = nullptr;
+            if (!ensure_blockwise_single_partial_buffer(
+                    device_id,
+                    static_cast<size_t>(kb_small) * static_cast<size_t>(N),
+                    &d_partial_small))
+            {
+                return false;
+            }
+
+            return rocmGemv_int8_scatter_vnni_blockwise(
+                d_A_int8,
+                d_B_int8_vnni,
+                d_C_fp32,
+                d_scales_A_blockwise,
+                d_scale_B,
+                d_bias,
+                d_partial_small,
+                N,
+                K,
+                alpha,
+                beta,
+                d_C_existing,
+                device_id,
+                stream);
+        }
+
+        const int kb = select_blockwise_split_count(grid_n, act_blocks, int8_kb_override);
+
+        if (kb > 1 && beta == 0.0f && d_bias == nullptr)
+        {
+            hipMemsetAsync(d_C_fp32, 0, static_cast<size_t>(N) * sizeof(float), static_cast<hipStream_t>(stream));
+        }
+        else if (beta != 0.0f || d_bias != nullptr)
+        {
+            if (tn == TN_WIDE)
+            {
+                hipLaunchKernelGGL(
+                    HIP_KERNEL_NAME(gemv_init_output_kernel_t<TN_WIDE, CPT>),
+                    dim3(grid_n), dim3(TN_WIDE / CPT), 0, static_cast<hipStream_t>(stream),
+                    d_C_fp32, d_C_existing, d_bias, N, beta);
+            }
+            else
+            {
+                hipLaunchKernelGGL(
+                    HIP_KERNEL_NAME(gemv_init_output_kernel_t<TN, CPT>),
+                    dim3(grid_n), dim3(TN / CPT), 0, static_cast<hipStream_t>(stream),
+                    d_C_fp32, d_C_existing, d_bias, N, beta);
+            }
+        }
+
+        if (tn == TN_WIDE)
+        {
+            hipLaunchKernelGGL(
+                HIP_KERNEL_NAME(gemv_int8_int8_grid_kpar_vnni_blockwise_scaled_kernel_t<TN_WIDE, CPT>),
+                dim3(grid_n, kb), dim3(TN_WIDE / CPT), 0, static_cast<hipStream_t>(stream),
+                d_A_int8, d_B_int8_vnni, d_C_fp32, d_scales_A_blockwise, d_scale_B, N, K, kb, alpha);
+        }
+        else
+        {
+            hipLaunchKernelGGL(
+                HIP_KERNEL_NAME(gemv_int8_int8_grid_kpar_vnni_blockwise_scaled_kernel_t<TN, CPT>),
+                dim3(grid_n, kb), dim3(TN / CPT), 0, static_cast<hipStream_t>(stream),
+                d_A_int8, d_B_int8_vnni, d_C_fp32, d_scales_A_blockwise, d_scale_B, N, K, kb, alpha);
+        }
+
+        hipError_t err = hipGetLastError();
+        if (err != hipSuccess)
+        {
+            fprintf(stderr, "[rocmGemv_int8_int8_fp32_vnni_blockwise_scaled] grid_kpar launch failed: %s (N=%d K=%d kb=%d)\n",
+                    hipGetErrorString(err), N, K, kb);
+            return false;
+        }
+
+        return true;
+    }
+
+    if (use_wide_vec4)
+    {
+        const int grid_n = (N + wide_tn - 1) / wide_tn;
+        dim3 block(wide_tn / wide_cpt, 1, 1);
+
+        if (wide_tn == 128)
+        {
+            if (wide_cpt == 2)
+            {
+                if (wide_vec_load)
+                {
+                    hipLaunchKernelGGL(HIP_KERNEL_NAME(gemv_int8_int8_wide_vnni_blockwise_scaled_kernel_t<128, 2, true>), dim3(grid_n), block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_fp32, d_scales_A_blockwise, d_scale_B, N, K, alpha, beta, d_C_existing, d_bias);
+                }
+                else
+                {
+                    hipLaunchKernelGGL(HIP_KERNEL_NAME(gemv_int8_int8_wide_vnni_blockwise_scaled_kernel_t<128, 2, false>), dim3(grid_n), block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_fp32, d_scales_A_blockwise, d_scale_B, N, K, alpha, beta, d_C_existing, d_bias);
+                }
+            }
+            else
+            {
+                if (wide_vec_load)
+                {
+                    hipLaunchKernelGGL(HIP_KERNEL_NAME(gemv_int8_int8_wide_vnni_blockwise_scaled_kernel_t<128, 4, true>), dim3(grid_n), block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_fp32, d_scales_A_blockwise, d_scale_B, N, K, alpha, beta, d_C_existing, d_bias);
+                }
+                else
+                {
+                    hipLaunchKernelGGL(HIP_KERNEL_NAME(gemv_int8_int8_wide_vnni_blockwise_scaled_kernel_t<128, 4, false>), dim3(grid_n), block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_fp32, d_scales_A_blockwise, d_scale_B, N, K, alpha, beta, d_C_existing, d_bias);
+                }
+            }
+        }
+        else if (wide_tn == 512)
+        {
+            if (wide_cpt == 2)
+            {
+                if (wide_vec_load)
+                {
+                    hipLaunchKernelGGL(HIP_KERNEL_NAME(gemv_int8_int8_wide_vnni_blockwise_scaled_kernel_t<512, 2, true>), dim3(grid_n), block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_fp32, d_scales_A_blockwise, d_scale_B, N, K, alpha, beta, d_C_existing, d_bias);
+                }
+                else
+                {
+                    hipLaunchKernelGGL(HIP_KERNEL_NAME(gemv_int8_int8_wide_vnni_blockwise_scaled_kernel_t<512, 2, false>), dim3(grid_n), block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_fp32, d_scales_A_blockwise, d_scale_B, N, K, alpha, beta, d_C_existing, d_bias);
+                }
+            }
+            else
+            {
+                if (wide_vec_load)
+                {
+                    hipLaunchKernelGGL(HIP_KERNEL_NAME(gemv_int8_int8_wide_vnni_blockwise_scaled_kernel_t<512, 4, true>), dim3(grid_n), block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_fp32, d_scales_A_blockwise, d_scale_B, N, K, alpha, beta, d_C_existing, d_bias);
+                }
+                else
+                {
+                    hipLaunchKernelGGL(HIP_KERNEL_NAME(gemv_int8_int8_wide_vnni_blockwise_scaled_kernel_t<512, 4, false>), dim3(grid_n), block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_fp32, d_scales_A_blockwise, d_scale_B, N, K, alpha, beta, d_C_existing, d_bias);
+                }
+            }
+        }
+        else
+        {
+            if (wide_cpt == 2)
+            {
+                if (wide_vec_load)
+                {
+                    hipLaunchKernelGGL(HIP_KERNEL_NAME(gemv_int8_int8_wide_vnni_blockwise_scaled_kernel_t<256, 2, true>), dim3(grid_n), block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_fp32, d_scales_A_blockwise, d_scale_B, N, K, alpha, beta, d_C_existing, d_bias);
+                }
+                else
+                {
+                    hipLaunchKernelGGL(HIP_KERNEL_NAME(gemv_int8_int8_wide_vnni_blockwise_scaled_kernel_t<256, 2, false>), dim3(grid_n), block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_fp32, d_scales_A_blockwise, d_scale_B, N, K, alpha, beta, d_C_existing, d_bias);
+                }
+            }
+            else
+            {
+                if (wide_vec_load)
+                {
+                    hipLaunchKernelGGL(HIP_KERNEL_NAME(gemv_int8_int8_wide_vnni_blockwise_scaled_kernel_t<256, 4, true>), dim3(grid_n), block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_fp32, d_scales_A_blockwise, d_scale_B, N, K, alpha, beta, d_C_existing, d_bias);
+                }
+                else
+                {
+                    hipLaunchKernelGGL(HIP_KERNEL_NAME(gemv_int8_int8_wide_vnni_blockwise_scaled_kernel_t<256, 4, false>), dim3(grid_n), block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_fp32, d_scales_A_blockwise, d_scale_B, N, K, alpha, beta, d_C_existing, d_bias);
+                }
+            }
+        }
+    }
+    else if (use_square)
+    {
+        const int grid_n = (N + GEMV_INT8_VNNI_SQUARE_TILE_N - 1) / GEMV_INT8_VNNI_SQUARE_TILE_N;
+        dim3 block(GEMV_INT8_VNNI_SQUARE_TILE_N, 1, 1);
+        hipLaunchKernelGGL(
+            gemv_int8_int8_square_vnni_blockwise_scaled_kernel,
+            dim3(grid_n), block, 0, static_cast<hipStream_t>(stream),
+            d_A_int8, d_B_int8_vnni, d_C_fp32, d_scales_A_blockwise, d_scale_B,
+            N, K, alpha, beta, d_C_existing, d_bias);
+    }
+    else
+    {
+        const int grid_n = (N + GEMV_TILE_N - 1) / GEMV_TILE_N;
+        hipLaunchKernelGGL(
+            gemv_int8_int8_vnni_blockwise_scaled_kernel,
+            dim3(grid_n), dim3(GEMV_TILE_N), 0, static_cast<hipStream_t>(stream),
+            d_A_int8, d_B_int8_vnni, d_C_fp32, d_scales_A_blockwise, d_scale_B,
+            N, K, alpha, beta, d_C_existing, d_bias);
+    }
+
+    hipError_t err = hipGetLastError();
+    if (err != hipSuccess)
+    {
+        fprintf(stderr, "[rocmGemv_int8_int8_fp32_vnni_blockwise_scaled] Kernel launch failed: %s (N=%d K=%d)\n",
+                hipGetErrorString(err), N, K);
+        return false;
+    }
+
+    return true;
+}
+
+bool rocmGemv_int8_int8_fp32_vnni_blockwise_scaled_batched(
+    const int8_t* d_A_int8,
+    const float* d_scales_A_blockwise,
+    int num_projections,
+    const int8_t* const* d_B_ptrs,
+    float* const* d_C_ptrs,
+    const float* const* d_scales_B_ptrs,
+    const float* const* d_bias_ptrs,
+    const int* N_per_proj,
+    int K,
+    float alpha,
+    float beta,
+    int device_id, void* stream)
+{
+    llaminar2::HipDeviceGuard::setDevice(device_id);
+
+    if (num_projections < 1 || num_projections > MAX_GEMV_BATCH)
+    {
+        fprintf(stderr, "[rocmGemv_int8_int8_fp32_vnni_blockwise_scaled_batched] Invalid num_projections=%d (max=%d)\n",
+                num_projections, MAX_GEMV_BATCH);
+        return false;
+    }
+    if ((K % 4) != 0 || (K % GEMV_INT8_VNNI_ACT_BLOCK_K) != 0)
+    {
+        return false;
+    }
+
+    const int wide_tn_override = g_int8_vnni_wide_tn_override.load(std::memory_order_relaxed);
+    const int wide_cpt_override = g_int8_vnni_wide_cpt_override.load(std::memory_order_relaxed);
+    const int wide_vec_load_override = g_int8_vnni_wide_vec_load_override.load(std::memory_order_relaxed);
+
+    int wide_tn = GEMV_INT8_VNNI_WIDE_TILE_N;
+    if (wide_tn_override == 128 || wide_tn_override == 256 || wide_tn_override == 512)
+    {
+        wide_tn = wide_tn_override;
+    }
+
+    int wide_cpt = GEMV_INT8_VNNI_WIDE_DEFAULT_CPT;
+    if (wide_cpt_override == 2 || wide_cpt_override == 4)
+    {
+        wide_cpt = wide_cpt_override;
+    }
+
+    bool wide_vec_load = true;
+    if (wide_vec_load_override == 0)
+    {
+        wide_vec_load = false;
+    }
+    else if (wide_vec_load_override == 1)
+    {
+        wide_vec_load = true;
+    }
+
+    enum class GemvBatchKernelFamily
+    {
+        Wide,
+        Square,
+        Generic
+    };
+
+    GemvBatchKernelFamily families[MAX_GEMV_BATCH] = {};
+    bool force_generic_pair_member[MAX_GEMV_BATCH] = {};
+
+    const bool prefer_generic_pair_path =
+        (num_projections == 2) &&
+        (N_per_proj[0] == N_per_proj[1]) &&
+        (N_per_proj[0] <= 2 * GEMV_INT8_VNNI_SQUARE_TILE_N);
+
+    for (int b = 0; b + 1 < num_projections; ++b)
+    {
+        const bool pair_same_n = (N_per_proj[b] == N_per_proj[b + 1]);
+        const bool pair_small_n = (N_per_proj[b] <= 2 * GEMV_INT8_VNNI_SQUARE_TILE_N);
+        const bool pair_use_wide = (N_per_proj[b] >= 8 * K) && (N_per_proj[b] >= wide_tn);
+        if (pair_same_n && pair_small_n && !pair_use_wide)
+        {
+            force_generic_pair_member[b] = true;
+            force_generic_pair_member[b + 1] = true;
+            ++b;
+        }
+    }
+
+    for (int b = 0; b < num_projections; ++b)
+    {
+        if ((N_per_proj[b] % 4) != 0)
+        {
+            return false;
+        }
+
+        const bool use_wide = (N_per_proj[b] >= 8 * K) && (N_per_proj[b] >= wide_tn);
+    const bool use_square = (!prefer_generic_pair_path) && (!force_generic_pair_member[b]) && (!use_wide) && (N_per_proj[b] >= GEMV_INT8_VNNI_SQUARE_TILE_N);
+        families[b] = use_wide ? GemvBatchKernelFamily::Wide
+                               : (use_square ? GemvBatchKernelFamily::Square
+                                             : GemvBatchKernelFamily::Generic);
+    }
+
+    auto launch_single_projection = [&](int proj) -> bool {
+        return rocmGemv_int8_int8_fp32_vnni_blockwise_scaled(
+            d_A_int8,
+            d_B_ptrs[proj],
+            d_C_ptrs[proj],
+            d_scales_A_blockwise,
+            d_scales_B_ptrs[proj],
+            N_per_proj[proj],
+            K,
+            alpha,
+            beta,
+            beta != 0.0f ? d_C_ptrs[proj] : nullptr,
+            d_bias_ptrs[proj],
+            device_id,
+            stream);
+    };
+
+    auto launch_group = [&](int start_idx, int end_idx, GemvBatchKernelFamily family) -> bool {
+        if ((end_idx - start_idx) == 1)
+        {
+            return launch_single_projection(start_idx);
+        }
+
+        // Fast path: LDS K-reduce pair kernel for tiny K/V projections.
+        // Provides ~1.75x speedup over 2× individual tiny_kv launches by
+        // doubling CU occupancy and eliminating launch overhead.
+        const bool is_tiny_kv_pair =
+            (family == GemvBatchKernelFamily::Generic) &&
+            ((end_idx - start_idx) == 2) &&
+            (N_per_proj[start_idx] <= 512) &&
+            (N_per_proj[start_idx + 1] <= 512) &&
+            (K >= 2048) &&
+            (beta == 0.0f) &&
+            (d_bias_ptrs[start_idx] == nullptr) &&
+            (d_bias_ptrs[start_idx + 1] == nullptr);
+
+        if (is_tiny_kv_pair)
+        {
+            return rocmGemv_int8_int8_fp32_vnni_blockwise_scaled_pair(
+                d_A_int8, d_scales_A_blockwise,
+                d_B_ptrs[start_idx], d_B_ptrs[start_idx + 1],
+                d_C_ptrs[start_idx], d_C_ptrs[start_idx + 1],
+                d_scales_B_ptrs[start_idx], d_scales_B_ptrs[start_idx + 1],
+                N_per_proj[start_idx], N_per_proj[start_idx + 1],
+                K, alpha,
+                device_id, stream);
+        }
+
+        const bool force_pair = g_int8_vnni_force_pair_override.load(std::memory_order_relaxed) != 0;
+        const bool use_split_single_pair_path =
+            !force_pair &&
+            (family == GemvBatchKernelFamily::Generic) &&
+            ((end_idx - start_idx) == 2) &&
+            (N_per_proj[start_idx + 1] == N_per_proj[start_idx]) &&
+            (N_per_proj[start_idx] <= 2 * GEMV_INT8_VNNI_SQUARE_TILE_N) &&
+            ((N_per_proj[start_idx] >= 2 * GEMV_INT8_VNNI_SQUARE_TILE_N) ||
+             ((N_per_proj[start_idx] <= GEMV_INT8_VNNI_SQUARE_TILE_N) && (K >= 2048)));
+
+        if (use_split_single_pair_path)
+        {
+            return launch_single_projection(start_idx) &&
+                   launch_single_projection(start_idx + 1);
+        }
+
+        GemvBatchArgs args = {};
+        args.num_batches = end_idx - start_idx;
+        args.total_grid_n = 0;
+        args.total_N = 0;
+
+        const int tile_n = family == GemvBatchKernelFamily::Wide
+            ? wide_tn
+            : (family == GemvBatchKernelFamily::Square ? GEMV_INT8_VNNI_SQUARE_TILE_N
+                                                       : GEMV_INT8_VNNI_GRID_KPAR_TILE_N);
+
+        for (int src = start_idx; src < end_idx; ++src)
+        {
+            const int dst = src - start_idx;
+            args.d_B[dst] = d_B_ptrs[src];
+            args.d_C[dst] = d_C_ptrs[src];
+            args.d_scales_B[dst] = d_scales_B_ptrs[src];
+            args.d_bias[dst] = d_bias_ptrs[src];
+            args.N[dst] = N_per_proj[src];
+            args.grid_n_offset[dst] = args.total_grid_n;
+            args.n_offset[dst] = args.total_N;
+
+            args.total_grid_n += (N_per_proj[src] + tile_n - 1) / tile_n;
+            args.total_N += N_per_proj[src];
+        }
+
+        if (family == GemvBatchKernelFamily::Wide)
+        {
+            dim3 block(wide_tn / wide_cpt, 1, 1);
+            if (wide_tn == 128)
+            {
+                if (wide_cpt == 2)
+                {
+                    if (wide_vec_load)
+                    {
+                        hipLaunchKernelGGL(HIP_KERNEL_NAME(gemv_int8_int8_wide_batched_vnni_blockwise_scaled_kernel_t<128, 2, true>), dim3(args.total_grid_n), block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_scales_A_blockwise, args, K, alpha, beta);
+                    }
+                    else
+                    {
+                        hipLaunchKernelGGL(HIP_KERNEL_NAME(gemv_int8_int8_wide_batched_vnni_blockwise_scaled_kernel_t<128, 2, false>), dim3(args.total_grid_n), block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_scales_A_blockwise, args, K, alpha, beta);
+                    }
+                }
+                else
+                {
+                    if (wide_vec_load)
+                    {
+                        hipLaunchKernelGGL(HIP_KERNEL_NAME(gemv_int8_int8_wide_batched_vnni_blockwise_scaled_kernel_t<128, 4, true>), dim3(args.total_grid_n), block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_scales_A_blockwise, args, K, alpha, beta);
+                    }
+                    else
+                    {
+                        hipLaunchKernelGGL(HIP_KERNEL_NAME(gemv_int8_int8_wide_batched_vnni_blockwise_scaled_kernel_t<128, 4, false>), dim3(args.total_grid_n), block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_scales_A_blockwise, args, K, alpha, beta);
+                    }
+                }
+            }
+            else if (wide_tn == 512)
+            {
+                if (wide_cpt == 2)
+                {
+                    if (wide_vec_load)
+                    {
+                        hipLaunchKernelGGL(HIP_KERNEL_NAME(gemv_int8_int8_wide_batched_vnni_blockwise_scaled_kernel_t<512, 2, true>), dim3(args.total_grid_n), block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_scales_A_blockwise, args, K, alpha, beta);
+                    }
+                    else
+                    {
+                        hipLaunchKernelGGL(HIP_KERNEL_NAME(gemv_int8_int8_wide_batched_vnni_blockwise_scaled_kernel_t<512, 2, false>), dim3(args.total_grid_n), block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_scales_A_blockwise, args, K, alpha, beta);
+                    }
+                }
+                else
+                {
+                    if (wide_vec_load)
+                    {
+                        hipLaunchKernelGGL(HIP_KERNEL_NAME(gemv_int8_int8_wide_batched_vnni_blockwise_scaled_kernel_t<512, 4, true>), dim3(args.total_grid_n), block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_scales_A_blockwise, args, K, alpha, beta);
+                    }
+                    else
+                    {
+                        hipLaunchKernelGGL(HIP_KERNEL_NAME(gemv_int8_int8_wide_batched_vnni_blockwise_scaled_kernel_t<512, 4, false>), dim3(args.total_grid_n), block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_scales_A_blockwise, args, K, alpha, beta);
+                    }
+                }
+            }
+            else
+            {
+                if (wide_cpt == 2)
+                {
+                    if (wide_vec_load)
+                    {
+                        hipLaunchKernelGGL(HIP_KERNEL_NAME(gemv_int8_int8_wide_batched_vnni_blockwise_scaled_kernel_t<256, 2, true>), dim3(args.total_grid_n), block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_scales_A_blockwise, args, K, alpha, beta);
+                    }
+                    else
+                    {
+                        hipLaunchKernelGGL(HIP_KERNEL_NAME(gemv_int8_int8_wide_batched_vnni_blockwise_scaled_kernel_t<256, 2, false>), dim3(args.total_grid_n), block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_scales_A_blockwise, args, K, alpha, beta);
+                    }
+                }
+                else
+                {
+                    if (wide_vec_load)
+                    {
+                        hipLaunchKernelGGL(HIP_KERNEL_NAME(gemv_int8_int8_wide_batched_vnni_blockwise_scaled_kernel_t<256, 4, true>), dim3(args.total_grid_n), block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_scales_A_blockwise, args, K, alpha, beta);
+                    }
+                    else
+                    {
+                        hipLaunchKernelGGL(HIP_KERNEL_NAME(gemv_int8_int8_wide_batched_vnni_blockwise_scaled_kernel_t<256, 4, false>), dim3(args.total_grid_n), block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_scales_A_blockwise, args, K, alpha, beta);
+                    }
+                }
+            }
+        }
+        else if (family == GemvBatchKernelFamily::Square)
+        {
+            dim3 block(GEMV_INT8_VNNI_SQUARE_TILE_N, 1, 1);
+            hipLaunchKernelGGL(
+                gemv_int8_int8_square_batched_vnni_blockwise_scaled_kernel,
+                dim3(args.total_grid_n), block, 0, static_cast<hipStream_t>(stream),
+                d_A_int8, d_scales_A_blockwise, args, K, alpha, beta);
+        }
+        else
+        {
+            constexpr int TN = GEMV_INT8_VNNI_GRID_KPAR_TILE_N;
+            constexpr int CPT = GEMV_INT8_VNNI_GRID_KPAR_CPT;
+            constexpr int TN_WIDE = GEMV_INT8_VNNI_WIDE2_TILE_N;
+            constexpr int NUM_CUS = 60;
+            constexpr int TARGET_WAVES_PER_CU = 8;
+            constexpr int MIN_ACT_BLOCKS_PER_WAVE = 2;
+            const int int8_tn_override = g_int8_vnni_tn_override.load(std::memory_order_relaxed);
+            const int int8_kb_override = g_int8_vnni_kb_override.load(std::memory_order_relaxed);
+            const int act_blocks = K / GEMV_INT8_VNNI_ACT_BLOCK_K;
+
+            int tn = TN;
+            if (int8_tn_override == TN_WIDE)
+            {
+                tn = TN_WIDE;
+            }
+            else if (int8_tn_override == TN)
+            {
+                tn = TN;
+            }
+
+            const int grid_n = (args.total_N + tn - 1) / tn;
+            int target_blocks = TARGET_WAVES_PER_CU * NUM_CUS;
+            int kb_raw = max(1, (target_blocks + args.total_grid_n - 1) / args.total_grid_n);
+            int kb_max = max(1, act_blocks / MIN_ACT_BLOCKS_PER_WAVE);
+            kb_raw = min(kb_raw, kb_max);
+
+            int kb = kb_raw;
+            if (act_blocks % kb_raw != 0)
+            {
+                for (int d = 1; d < kb_raw; ++d)
+                {
+                    if (kb_raw - d >= 1 && act_blocks % (kb_raw - d) == 0) { kb = kb_raw - d; break; }
+                    if (kb_raw + d <= kb_max && act_blocks % (kb_raw + d) == 0) { kb = kb_raw + d; break; }
+                }
+            }
+
+            if (int8_kb_override > 0)
+            {
+                kb = min(int8_kb_override, act_blocks);
+            }
+
+            // Small generic batched groups (for example decode KV pairs with
+            // 2x512 outputs) do not benefit from the aggressive occupancy-
+            // driven split count used by the single-projection path. The
+            // direct batched kernel is consistently best around KB<=4 there,
+            // while larger split counts just add atomic/update overhead.
+            if (args.total_grid_n <= 8 && int8_kb_override <= 0)
+            {
+                kb = min(kb, 4);
+            }
+
+            const bool use_pair_fast_path = (args.num_batches == 2);
+
+            if (use_pair_fast_path)
+            {
+                if (tn == TN_WIDE)
+                {
+                    hipLaunchKernelGGL(
+                        HIP_KERNEL_NAME(gemv_init_output_pair_kernel_t<TN_WIDE, CPT>),
+                        dim3(args.total_grid_n), dim3(TN_WIDE / CPT), 0, static_cast<hipStream_t>(stream),
+                        args.d_C[0], args.d_C[1], args.d_bias[0], args.d_bias[1],
+                        args.N[0], args.N[1], args.grid_n_offset[1], beta);
+                }
+                else
+                {
+                    hipLaunchKernelGGL(
+                        HIP_KERNEL_NAME(gemv_init_output_pair_kernel_t<TN, CPT>),
+                        dim3(args.total_grid_n), dim3(TN / CPT), 0, static_cast<hipStream_t>(stream),
+                        args.d_C[0], args.d_C[1], args.d_bias[0], args.d_bias[1],
+                        args.N[0], args.N[1], args.grid_n_offset[1], beta);
+                }
+
+                if (tn == TN_WIDE)
+                {
+                    hipLaunchKernelGGL(
+                        HIP_KERNEL_NAME(gemv_int8_int8_grid_kpar_pair_vnni_blockwise_scaled_kernel_t<TN_WIDE, CPT>),
+                        dim3(args.total_grid_n, kb), dim3(TN_WIDE / CPT), 0, static_cast<hipStream_t>(stream),
+                        d_A_int8, d_scales_A_blockwise,
+                        args.d_B[0], args.d_B[1],
+                        args.d_C[0], args.d_C[1],
+                        args.d_scales_B[0], args.d_scales_B[1],
+                        args.N[0], args.N[1], args.grid_n_offset[1],
+                        K, kb, alpha);
+                }
+                else
+                {
+                    hipLaunchKernelGGL(
+                        HIP_KERNEL_NAME(gemv_int8_int8_grid_kpar_pair_vnni_blockwise_scaled_kernel_t<TN, CPT>),
+                        dim3(args.total_grid_n, kb), dim3(TN / CPT), 0, static_cast<hipStream_t>(stream),
+                        d_A_int8, d_scales_A_blockwise,
+                        args.d_B[0], args.d_B[1],
+                        args.d_C[0], args.d_C[1],
+                        args.d_scales_B[0], args.d_scales_B[1],
+                        args.N[0], args.N[1], args.grid_n_offset[1],
+                        K, kb, alpha);
+                }
+            }
+            else if (tn == TN_WIDE)
+            {
+                hipLaunchKernelGGL(
+                    HIP_KERNEL_NAME(gemv_init_output_batched_kernel_t<TN_WIDE, CPT>),
+                    dim3(args.total_grid_n), dim3(TN_WIDE / CPT), 0, static_cast<hipStream_t>(stream),
+                    args, beta);
+
+                hipLaunchKernelGGL(
+                    HIP_KERNEL_NAME(gemv_int8_int8_grid_kpar_batched_vnni_blockwise_scaled_kernel_t<TN_WIDE, CPT>),
+                    dim3(args.total_grid_n, kb), dim3(TN_WIDE / CPT), 0, static_cast<hipStream_t>(stream),
+                    d_A_int8, d_scales_A_blockwise, args, K, kb, alpha);
+            }
+            else
+            {
+                hipLaunchKernelGGL(
+                    HIP_KERNEL_NAME(gemv_init_output_batched_kernel_t<TN, CPT>),
+                    dim3(args.total_grid_n), dim3(TN / CPT), 0, static_cast<hipStream_t>(stream),
+                    args, beta);
+
+                hipLaunchKernelGGL(
+                    HIP_KERNEL_NAME(gemv_int8_int8_grid_kpar_batched_vnni_blockwise_scaled_kernel_t<TN, CPT>),
+                    dim3(args.total_grid_n, kb), dim3(TN / CPT), 0, static_cast<hipStream_t>(stream),
+                    d_A_int8, d_scales_A_blockwise, args, K, kb, alpha);
+            }
+        }
+
+        hipError_t err = hipGetLastError();
+        if (err != hipSuccess)
+        {
+            fprintf(stderr, "[rocmGemv_int8_int8_fp32_vnni_blockwise_scaled_batched] Kernel launch failed: %s (K=%d num_proj=%d subgroup=%d)\n",
+                    hipGetErrorString(err), K, num_projections, args.num_batches);
+            return false;
+        }
+
+        return true;
+    };
+
+    int group_start = 0;
+    while (group_start < num_projections)
+    {
+        const GemvBatchKernelFamily family = families[group_start];
+        int group_end = group_start + 1;
+        while (group_end < num_projections && families[group_end] == family)
+        {
+            ++group_end;
+        }
+
+        if (!launch_group(group_start, group_end, family))
+        {
+            return false;
+        }
+
+        group_start = group_end;
     }
 
     return true;
@@ -3279,7 +6273,7 @@ bool rocmGemv_int8_scatter_vnni(
     {
         // Direct output path: no partial buffer, no reduce kernel
         hipLaunchKernelGGL(
-            HIP_KERNEL_NAME(gemv_int8_direct_vnni_kernel_t<TN, CPT>),
+            HIP_KERNEL_NAME(gemv_int8_direct_vnni_kernel_t<TN, CPT, false>),
             dim3(grid_n), dim3(TN / CPT), 0, static_cast<hipStream_t>(stream),
             d_A_int8, d_B_int8_vnni, d_C_fp32, d_scale_A,
             d_scales_B, d_bias, N, K,
@@ -3311,7 +6305,7 @@ bool rocmGemv_int8_scatter_vnni(
                            static_cast<hipStream_t>(stream));
 
             hipLaunchKernelGGL(
-                HIP_KERNEL_NAME(gemv_int8_scatter_selfreduce_vnni_kernel_t<TN, CPT>),
+                HIP_KERNEL_NAME(gemv_int8_scatter_selfreduce_vnni_kernel_t<TN, CPT, false>),
                 dim3(grid_n, kb), dim3(TN / CPT), 0, static_cast<hipStream_t>(stream),
                 d_A_int8, d_B_int8_vnni, d_partial_buf, d_C_fp32, d_scale_A,
                 d_scales_B, d_bias, d_counter, N, K, kb, valid_kb,
@@ -3321,7 +6315,7 @@ bool rocmGemv_int8_scatter_vnni(
         {
             // Two-kernel path: scatter + reduce
             hipLaunchKernelGGL(
-                HIP_KERNEL_NAME(gemv_int8_scatter_vnni_kernel_t<TN, CPT>),
+                HIP_KERNEL_NAME(gemv_int8_scatter_vnni_kernel_t<TN, CPT, false>),
                 dim3(grid_n, kb), dim3(TN / CPT), 0, static_cast<hipStream_t>(stream),
                 d_A_int8, d_B_int8_vnni, d_partial_buf, d_scale_A, N, K, kb);
 
@@ -3337,6 +6331,107 @@ bool rocmGemv_int8_scatter_vnni(
     if (err != hipSuccess)
     {
         fprintf(stderr, "[rocmGemv_int8_scatter] Kernel launch failed: %s (N=%d K=%d kb=%d)\n",
+                hipGetErrorString(err), N, K, kb);
+        return false;
+    }
+
+    return true;
+}
+
+
+bool rocmGemv_int8_scatter_vnni_blockwise(
+    const int8_t* d_A_int8,
+    const int8_t* d_B_int8_vnni,
+    float* d_C_fp32,
+    const float* d_scales_A_blockwise,
+    const float* d_scales_B,
+    const float* d_bias,
+    float* d_partial_buf,
+    int N, int K,
+    float alpha, float beta,
+    const float* d_C_existing,
+    int device_id, void* stream)
+{
+    llaminar2::HipDeviceGuard::setDevice(device_id);
+
+    if ((K % 4) != 0 || (N % 4) != 0)
+    {
+        fprintf(stderr, "[rocmGemv_int8_scatter_blockwise] N and K must be multiples of 4 (N=%d K=%d)\n", N, K);
+        return false;
+    }
+    if ((K % GEMV_INT8_VNNI_ACT_BLOCK_K) != 0)
+    {
+        fprintf(stderr, "[rocmGemv_int8_scatter_blockwise] K must be a multiple of %d for blockwise scales (K=%d)\n",
+                GEMV_INT8_VNNI_ACT_BLOCK_K, K);
+        return false;
+    }
+
+    constexpr int TN = GEMV_INT8_VNNI_GRID_KPAR_TILE_N;
+    constexpr int CPT = GEMV_INT8_VNNI_GRID_KPAR_CPT;
+    const int int8_kb_override = g_int8_vnni_kb_override.load(std::memory_order_relaxed);
+
+    const int grid_n = (N + TN - 1) / TN;
+    const int act_blocks = K / GEMV_INT8_VNNI_ACT_BLOCK_K;
+    const int kb = select_blockwise_split_count(grid_n, act_blocks, int8_kb_override);
+
+    if (kb == 1)
+    {
+        hipLaunchKernelGGL(
+            HIP_KERNEL_NAME(gemv_int8_direct_vnni_kernel_t<TN, CPT, true>),
+            dim3(grid_n), dim3(TN / CPT), 0, static_cast<hipStream_t>(stream),
+            d_A_int8, d_B_int8_vnni, d_C_fp32, d_scales_A_blockwise,
+            d_scales_B, d_bias, N, K,
+            alpha, beta, d_C_existing);
+    }
+    else
+    {
+        constexpr int SELFREDUCE_GRID_N_THRESHOLD = 16;
+
+        if (grid_n < SELFREDUCE_GRID_N_THRESHOLD)
+        {
+            constexpr int MAX_SELFREDUCE_BLOCKS = 16;
+            static int* s_int8_selfreduce_counters[8] = {};
+
+            int dev_slot = device_id & 7;
+            if (!s_int8_selfreduce_counters[dev_slot])
+            {
+                hipMalloc(&s_int8_selfreduce_counters[dev_slot],
+                          MAX_SELFREDUCE_BLOCKS * sizeof(int));
+            }
+            int* d_counter = s_int8_selfreduce_counters[dev_slot];
+
+            int act_blocks_per_block = (act_blocks + kb - 1) / kb;
+            int valid_kb = (act_blocks + act_blocks_per_block - 1) / act_blocks_per_block;
+
+            hipMemsetAsync(d_counter, 0, grid_n * sizeof(int),
+                           static_cast<hipStream_t>(stream));
+
+            hipLaunchKernelGGL(
+                HIP_KERNEL_NAME(gemv_int8_scatter_selfreduce_vnni_kernel_t<TN, CPT, true>),
+                dim3(grid_n, kb), dim3(TN / CPT), 0, static_cast<hipStream_t>(stream),
+                d_A_int8, d_B_int8_vnni, d_partial_buf, d_C_fp32, d_scales_A_blockwise,
+                d_scales_B, d_bias, d_counter, N, K, kb, valid_kb,
+                alpha, beta, d_C_existing);
+        }
+        else
+        {
+            hipLaunchKernelGGL(
+                HIP_KERNEL_NAME(gemv_int8_scatter_vnni_kernel_t<TN, CPT, true>),
+                dim3(grid_n, kb), dim3(TN / CPT), 0, static_cast<hipStream_t>(stream),
+                d_A_int8, d_B_int8_vnni, d_partial_buf, d_scales_A_blockwise, N, K, kb);
+
+            hipLaunchKernelGGL(
+                HIP_KERNEL_NAME(gemv_reduce_scale_kernel_t<TN, CPT>),
+                dim3(grid_n), dim3(TN / CPT), 0, static_cast<hipStream_t>(stream),
+                d_partial_buf, d_C_fp32, d_scales_B, d_bias, N, kb,
+                alpha, beta, d_C_existing);
+        }
+    }
+
+    hipError_t err = hipGetLastError();
+    if (err != hipSuccess)
+    {
+        fprintf(stderr, "[rocmGemv_int8_scatter_blockwise] Kernel launch failed: %s (N=%d K=%d kb=%d)\n",
                 hipGetErrorString(err), N, K, kb);
         return false;
     }
@@ -3450,7 +6545,7 @@ bool rocmGemv_int8_scatter_batched_vnni(
 
     // Launch batched scatter: dim3(total_grid_n, kb)
     hipLaunchKernelGGL(
-        HIP_KERNEL_NAME(gemv_int8_scatter_batched_vnni_kernel_t<TN, CPT>),
+        HIP_KERNEL_NAME(gemv_int8_scatter_batched_vnni_kernel_t<TN, CPT, false>),
         dim3(args.total_grid_n, kb), dim3(TN / CPT), 0, static_cast<hipStream_t>(stream),
         d_A_int8, d_scale_A, d_partial_buf, args, K, kb);
 
@@ -3464,6 +6559,122 @@ bool rocmGemv_int8_scatter_batched_vnni(
     if (err != hipSuccess)
     {
         fprintf(stderr, "[rocmGemv_int8_scatter_batched] Kernel launch failed: %s (K=%d kb=%d num_proj=%d)\n",
+                hipGetErrorString(err), K, kb, num_projections);
+        return false;
+    }
+
+    return true;
+}
+
+
+bool rocmGemv_int8_scatter_batched_vnni_blockwise(
+    const int8_t* d_A_int8,
+    const float* d_scales_A_blockwise,
+    float* d_partial_buf,
+    int num_projections,
+    const int8_t* const* d_B_ptrs,
+    float* const* d_C_ptrs,
+    const float* const* d_scales_B_ptrs,
+    const float* const* d_bias_ptrs,
+    const int* N_per_proj,
+    int K,
+    float alpha, float beta,
+    int device_id, void* stream)
+{
+    llaminar2::HipDeviceGuard::setDevice(device_id);
+
+    if (num_projections < 1 || num_projections > MAX_GEMV_BATCH)
+    {
+        fprintf(stderr, "[rocmGemv_int8_scatter_batched_blockwise] Invalid num_projections=%d (max=%d)\n",
+                num_projections, MAX_GEMV_BATCH);
+        return false;
+    }
+
+    if ((K % 4) != 0)
+    {
+        fprintf(stderr, "[rocmGemv_int8_scatter_batched_blockwise] K must be multiple of 4 (K=%d)\n", K);
+        return false;
+    }
+    if ((K % GEMV_INT8_VNNI_ACT_BLOCK_K) != 0)
+    {
+        fprintf(stderr, "[rocmGemv_int8_scatter_batched_blockwise] K must be a multiple of %d for blockwise scales (K=%d)\n",
+                GEMV_INT8_VNNI_ACT_BLOCK_K, K);
+        return false;
+    }
+
+    constexpr int TN = GEMV_INT8_VNNI_GRID_KPAR_TILE_N;
+    constexpr int CPT = GEMV_INT8_VNNI_GRID_KPAR_CPT;
+    constexpr int NUM_CUS = 60;
+    const int int8_kb_override = g_int8_vnni_kb_override.load(std::memory_order_relaxed);
+
+    GemvBatchArgs args = {};
+    args.num_batches = num_projections;
+    args.total_grid_n = 0;
+    args.total_N = 0;
+
+    for (int b = 0; b < num_projections; ++b)
+    {
+        if ((N_per_proj[b] % 4) != 0)
+        {
+            fprintf(stderr, "[rocmGemv_int8_scatter_batched_blockwise] N[%d]=%d must be multiple of 4\n",
+                    b, N_per_proj[b]);
+            return false;
+        }
+
+        args.d_B[b] = d_B_ptrs[b];
+        args.d_C[b] = d_C_ptrs[b];
+        args.d_scales_B[b] = d_scales_B_ptrs[b];
+        args.d_bias[b] = d_bias_ptrs[b];
+        args.N[b] = N_per_proj[b];
+        args.grid_n_offset[b] = args.total_grid_n;
+        args.n_offset[b] = args.total_N;
+
+        int grid_n_b = (N_per_proj[b] + TN - 1) / TN;
+        args.total_grid_n += grid_n_b;
+        args.total_N += N_per_proj[b];
+    }
+
+    const int act_blocks = K / GEMV_INT8_VNNI_ACT_BLOCK_K;
+    constexpr int TARGET_WAVES_PER_CU = 8;
+    constexpr int MIN_ACT_BLOCKS_PER_WAVE = 2;
+
+    int target_blocks = TARGET_WAVES_PER_CU * NUM_CUS;
+    int kb_raw = max(1, (target_blocks + args.total_grid_n - 1) / args.total_grid_n);
+
+    int kb_max = max(1, act_blocks / MIN_ACT_BLOCKS_PER_WAVE);
+    kb_raw = min(kb_raw, kb_max);
+
+    int kb = kb_raw;
+    if (act_blocks % kb_raw != 0)
+    {
+        for (int d = 1; d < kb_raw; ++d)
+        {
+            if (kb_raw - d >= 1 && act_blocks % (kb_raw - d) == 0) { kb = kb_raw - d; break; }
+            if (kb_raw + d <= kb_max && act_blocks % (kb_raw + d) == 0) { kb = kb_raw + d; break; }
+        }
+    }
+
+    if (kb < 1) kb = 1;
+
+    if (int8_kb_override > 0)
+    {
+        kb = min(int8_kb_override, act_blocks);
+    }
+
+    hipLaunchKernelGGL(
+        HIP_KERNEL_NAME(gemv_int8_scatter_batched_vnni_kernel_t<TN, CPT, true>),
+        dim3(args.total_grid_n, kb), dim3(TN / CPT), 0, static_cast<hipStream_t>(stream),
+        d_A_int8, d_scales_A_blockwise, d_partial_buf, args, K, kb);
+
+    hipLaunchKernelGGL(
+        HIP_KERNEL_NAME(gemv_reduce_scale_batched_kernel_t<TN, CPT>),
+        dim3(args.total_grid_n), dim3(TN / CPT), 0, static_cast<hipStream_t>(stream),
+        d_partial_buf, args, kb, alpha, beta);
+
+    hipError_t err = hipGetLastError();
+    if (err != hipSuccess)
+    {
+        fprintf(stderr, "[rocmGemv_int8_scatter_batched_blockwise] Kernel launch failed: %s (K=%d kb=%d num_proj=%d)\n",
                 hipGetErrorString(err), K, kb, num_projections);
         return false;
     }

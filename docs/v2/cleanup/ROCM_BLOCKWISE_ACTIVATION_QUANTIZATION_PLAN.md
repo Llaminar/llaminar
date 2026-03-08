@@ -554,6 +554,310 @@ Guardrail:
 
 ---
 
+## Implementation Sequence
+
+This section is the execution plan for the coding phase. The order matters because
+the native-VNNI decode path is already structurally close to blockwise support,
+while the INT8-VNNI decode path still assumes a row-wise activation scale contract.
+
+### Phase 1: Add Row-Wise Pathology Detection
+
+Goal:
+
+- detect row-wise activation quantization failure cases during the existing row-wise quantization kernel
+- avoid a second full read of the activation row
+
+Implementation:
+
+- extend `quantizeActivationsQ8_kernel_t` in `src/v2/kernels/rocm/gemm/ROCmQuantisedGemmKernel.hip`
+- compute additional row statistics during the existing max-reduction pass:
+  - `max_abs`
+  - `second_absmax`
+  - `sum_sq`
+- derive a cheap pathology score in-kernel before writing quantized output
+- write a single device flag per row, or a single scalar flag for `M=1` decode
+
+Recommended detector signals:
+
+- primary: `effective_levels = 127 * rms / max_abs`
+- where `rms = sqrt(sum_sq / K)`
+- fallback signal: `max_abs / second_absmax`
+
+Recommended initial trigger policy:
+
+- treat the row as pathological when `effective_levels` falls below a tuned threshold
+- use `max_abs / second_absmax` only as a secondary debug metric, not the primary trigger
+
+Rationale:
+
+- `max_abs / rms` measures whether a single outlier is stretching the row scale enough to collapse useful resolution for the rest of the row
+- it is more robust than a pure `max/second_max` rule for heavy-tailed but non-pathological rows
+
+Deliverables:
+
+- row-wise quant kernel emits a pathology flag
+- launcher API exposes a detection-capable variant
+- debug logging can report how often fallback is triggered
+
+### Phase 2: Native-VNNI Decode Fallback
+
+Goal:
+
+- make `M=1` native-VNNI decode correct for pathological rows by falling back to blockwise activation quantization
+
+Implementation:
+
+- update `ROCmQuantisedGemmKernel::multiply_tensor(...)` in `src/v2/kernels/rocm/gemm/ROCmQuantisedGemmKernel.cpp`
+- row-wise decode flow becomes:
+  - launch row-wise quantization with detection
+  - if no pathology, proceed with existing row-wise native-VNNI GEMV
+  - if pathology detected, launch existing blockwise quantization kernel
+  - rerun native-VNNI GEMV with `d_scales_A_blockwise`
+
+Notes:
+
+- native-VNNI GEMV already accepts `d_scale_A_blockwise` in `src/v2/kernels/rocm/gemm/ROCmGemvKernel_native_VNNI.hip`
+- this phase should not require a new native-VNNI GEMV kernel family
+
+Deliverables:
+
+- pathological native-VNNI decode rows transparently take the blockwise path
+- non-pathological rows preserve the current row-wise fast path
+
+### Phase 3: Shared Fused Decode Quantization
+
+Goal:
+
+- preserve quantize-once reuse for fused decode projections while allowing blockwise fallback
+
+Implementation:
+
+- update `ROCmQuantisedGemmKernel::multiply_fused_tensor(...)` in `src/v2/kernels/rocm/gemm/ROCmQuantisedGemmKernel.cpp`
+- shared decode quantization flow becomes:
+  - quantize once row-wise with detection
+  - if all participating projections are native-VNNI and no pathology is detected, reuse row-wise metadata
+  - if pathology is detected, quantize once blockwise and pass `d_scales_A_blockwise` to all compatible projections
+
+Deliverables:
+
+- QKV decode retains one quantization pass
+- Gate/Up decode retains one quantization pass
+- native-VNNI fused decode paths can switch contracts without requantizing per projection
+
+### Phase 4: INT8-VNNI Decode Blockwise Kernel Family
+
+Goal:
+
+- add a decode GEMV family for INT8-VNNI weights that consumes blockwise activation scales
+
+Implementation:
+
+- add a blockwise variant of the existing INT8-VNNI decode topology in `src/v2/kernels/rocm/gemm/ROCmGemvKernel_INT8_VNNI.hip`
+- keep the same dispatch structure as the current row-wise kernels:
+  - direct path for `kb = 1`
+  - self-reducing scatter for small `grid_n`
+  - scatter + reduce for larger `grid_n`
+- change activation scaling semantics from:
+  - one `scale_A[0]` applied across the whole row
+- to:
+  - one `scale_A_blockwise[k_block]` applied per 32-element activation block
+
+Recommended kernel strategy:
+
+- do not invent a new decode pipeline shape
+- mirror the existing prefill blockwise INT8 accumulation model in `src/v2/kernels/rocm/gemm/ROCmQuantisedGemmKernel_INT8_VNNI.hip`
+- accumulate one K-block at a time and bake activation block scaling into the FP32 partials
+
+Deliverables:
+
+- new blockwise INT8-VNNI decode dispatch entry point
+- decode dispatcher can route pathological INT8-VNNI rows to blockwise GEMV
+
+### Phase 5: Policy and Cleanup
+
+Goal:
+
+- decide whether decode remains dynamic row-wise-with-fallback or switches fully to blockwise for some kernel families
+
+Decision criteria:
+
+- if tuned blockwise M=1 quantization + GEMV is within a small latency delta of row-wise for decode, prefer the simpler always-blockwise contract
+- if row-wise remains materially faster on clean rows, keep the dynamic fallback path
+
+Deliverables:
+
+- explicit decode policy per kernel family
+- comments and debug env docs aligned with the chosen policy
+
+---
+
+## File-by-File Change Map
+
+### `src/v2/kernels/rocm/gemm/ROCmQuantisedGemmKernel.hip`
+
+Changes:
+
+- extend the row-wise quantization kernel to compute pathology metrics
+- add a launcher variant that can return a pathology flag buffer
+- keep the current no-detection launcher for legacy and non-decode callers if needed
+
+Expected additions:
+
+- device-side pathology flag write
+- optional debug counters or instrumentation hooks
+
+### `src/v2/kernels/rocm/gemm/ROCmQuantisedGemmKernel.cpp`
+
+Changes:
+
+- wire the detection-aware row-wise quantizer into `multiply_tensor(...)`
+- wire native-VNNI decode fallback to blockwise quantization
+- update `multiply_fused_tensor(...)` to preserve shared-quantization reuse with fallback
+- add any workspace binding for pathology status buffers if they are made workspace-managed
+
+### `src/v2/kernels/rocm/gemm/ROCmGemvKernel_native_VNNI.hip`
+
+Changes:
+
+- likely minimal functional changes only
+- verify row-wise and blockwise contracts are both handled correctly for decode and scatter-reduce split-K variants
+- add fast-path comments clarifying that `d_scale_A_blockwise == nullptr` means row-wise contract
+
+### `src/v2/kernels/rocm/gemm/ROCmGemvKernel_INT8_VNNI.hip`
+
+Changes:
+
+- add a blockwise-capable decode GEMV family
+- add dispatch wrappers analogous to the current row-wise scatter and direct wrappers
+- reuse the existing partial-buffer and reduce-kernel structure where possible
+
+Expected additions:
+
+- blockwise direct kernel
+- blockwise self-reduce kernel
+- blockwise scatter kernel
+- dispatch wrapper with the same tuning policy style as the existing INT8 decode path
+
+### `src/v2/execution/local_execution/device/WorkspaceDescriptor.h`
+
+Changes:
+
+- no scale-buffer redesign should be required because blockwise scale storage already exists
+- add a small fallback-status buffer only if status is workspace-managed rather than ad hoc device allocation
+
+### `src/v2/interfaces/IWorkspaceConsumer.h`
+
+Changes:
+
+- add a named buffer constant only if a workspace-managed pathology status buffer is introduced
+
+### `src/v2/utils/DebugEnv.h`
+
+Changes:
+
+- add detector threshold and enable knobs
+- add optional tracing knobs for fallback hit rate
+
+Recommended environment variables:
+
+- `LLAMINAR_ROCM_ROW_QUANT_PATHOLOGY_ENABLE`
+- `LLAMINAR_ROCM_ROW_QUANT_PATHOLOGY_EFFECTIVE_LEVELS_MIN`
+- `LLAMINAR_ROCM_ROW_QUANT_PATHOLOGY_MAX_TO_SECOND_RATIO`
+- `LLAMINAR_ROCM_ROW_QUANT_PATHOLOGY_TRACE`
+
+---
+
+## Test Matrix
+
+### Unit and Integration Coverage
+
+Primary existing test file:
+
+- `tests/v2/integration/kernels/rocm/Test__ROCmQuantisedGemmKernel.cpp`
+
+Required additions:
+
+- host reference helper for blockwise activation quantization
+- synthetic pathological-row generator
+- decode-native-VNNI row-wise vs blockwise correctness test
+- fused decode shared-quantization fallback test
+- INT8-VNNI blockwise decode correctness test once the kernel family exists
+
+Suggested new cases:
+
+1. `PathologicalRow_DetectsFallback_M1`
+2. `NativeVNNI_DecodeFallback_MatchesBlockwiseReference`
+3. `NativeVNNI_FusedQKV_FallbackQuantizesOnce`
+4. `NativeVNNI_FusedGateUp_FallbackQuantizesOnce`
+5. `Int8VNNI_BlockwiseDecode_MatchesReference`
+6. `Int8VNNI_BlockwiseDecode_SelfReduceParity`
+7. `Int8VNNI_BlockwiseDecode_ScatterReduceParity`
+
+### Performance Coverage
+
+Primary existing perf files:
+
+- `tests/v2/performance/kernels/rocm/Perf__ROCmGemvKernel.cpp`
+- `tests/v2/performance/kernels/rocm/Perf__BlockwiseQuantKernel.cpp`
+
+Required additions:
+
+- decode benchmark rows that explicitly trigger the pathology detector
+- side-by-side row-wise vs blockwise decode timing for native-VNNI
+- side-by-side row-wise vs blockwise decode timing for INT8-VNNI after the new kernels land
+- fallback-hit-rate reporting for synthetic and realistic activation distributions
+
+Benchmark table dimensions:
+
+- models: Qwen2.5-0.5B, Qwen2.5-7B
+- shapes: Q/K/V, Wo, Gate, Up, Down, LM Head
+- modes:
+  - row-wise clean
+  - row-wise pathological
+  - forced blockwise
+  - dynamic fallback
+
+### CTest Registration
+
+If new dedicated test binaries are needed, register them in `tests/v2/CMakeLists.txt` alongside:
+
+- `V2_Unit_ROCmQuantisedGemmKernel_Workspace`
+- `V2_Integration_ROCmQuantisedGemmKernel`-style integration coverage
+
+Use labels:
+
+- `V2;Integration;ROCm;GEMM;Decode;Blockwise;Parity`
+- `V2;Performance;ROCm;GEMV;Blockwise;Decode`
+
+---
+
+## Success Criteria by Requirement
+
+### Requirement 1: Detect pathological row-wise activations and abort early
+
+Done when:
+
+- row-wise quantization can classify a row as pathological without an extra device pass
+- decode dispatcher can observe that classification and avoid committing to the row-wise GEMV path
+- detector false-positive rate is low on realistic decode activations
+
+### Requirement 2: Fall back to blockwise activation quantization
+
+Done when:
+
+- native-VNNI decode automatically reroutes pathological rows through the existing blockwise quantizer
+- fused decode paths preserve quantize-once reuse even when blockwise fallback is selected
+
+### Requirement 3: Provide blockwise GEMV kernels for native-VNNI and INT8-VNNI
+
+Done when:
+
+- native-VNNI decode blockwise path is covered by parity and perf tests
+- INT8-VNNI decode has a blockwise-capable direct and split-K kernel family
+- dynamic fallback or always-blockwise policy can be enabled for both native-VNNI and INT8-VNNI decode
+
+---
+
 ## Recommended Scope Boundaries
 
 ### In Scope

@@ -160,7 +160,8 @@ namespace llaminar2
                 int8_t *d_A_int8,          // [M x K] output
                 float *d_scales_blockwise, // [M x blocks_per_row] output
                 int M, int K,
-                int rocm_device_id, void *stream);
+                int rocm_device_id, void *stream,
+                int block_size = 32);
 
             // Execute INT8 GEMM using CK with SEPARATE scaling (two-kernel approach)
             // This runs CK for INT8→INT32 GEMM, then a separate kernel for scaling. (common .hip)
@@ -321,6 +322,22 @@ namespace llaminar2
                 const float *d_bias,
                 int device_id, void *stream);
 
+            bool rocmGemv_int8_int8_fp32_vnni_blockwise_scaled(
+                const int8_t *d_A_int8,
+                const int8_t *d_B_int8_vnni,
+                float *d_C_fp32,
+                const float *d_scales_A_blockwise,
+                const float *d_scale_B,
+                int N, int K,
+                float alpha,
+                float beta,
+                const float *d_C_existing,
+                const float *d_bias,
+                int device_id, void *stream);
+
+            // Get current activation block size for blockwise quantization (32, 64, or 128)
+            int rocmGemv_int8_vnni_get_act_block_k();
+
             // Repack VNNI [K/4][N][4] → row-major [N×K] into scratch buffer
             // Used for CK GEMM prefill and legacy fp16/fp32 GEMV modes.
             // Cost: ~65-200μs for 18944×3584 (amortized over prefill).
@@ -424,6 +441,19 @@ namespace llaminar2
                 const float *d_C_existing, // [N] used when beta != 0
                 int device_id, void *stream);
 
+            bool rocmGemv_int8_scatter_vnni_blockwise(
+                const int8_t *d_A_int8,
+                const int8_t *d_B_int8_vnni,
+                float *d_C_fp32,
+                const float *d_scales_A_blockwise,
+                const float *d_scales_B,
+                const float *d_bias,
+                float *d_partial_buf,
+                int N, int K,
+                float alpha, float beta,
+                const float *d_C_existing,
+                int device_id, void *stream);
+
             // =========================================================================
             // Batched INT8 scatter GEMV: multiple projections in 2 kernel launches.
             // QKV: 6→2 launches, Gate/Up: 4→2 launches.
@@ -440,6 +470,33 @@ namespace llaminar2
                 const float *const *d_scales_B_ptrs, // [num_proj] weight scale pointers
                 const float *const *d_bias_ptrs,     // [num_proj] bias pointers
                 const int *N_per_proj,               // [num_proj] output dimensions
+                int K,
+                float alpha, float beta,
+                int device_id, void *stream);
+
+            bool rocmGemv_int8_scatter_batched_vnni_blockwise(
+                const int8_t *d_A_int8,
+                const float *d_scales_A_blockwise,
+                float *d_partial_buf,
+                int num_projections,
+                const int8_t *const *d_B_ptrs,
+                float *const *d_C_ptrs,
+                const float *const *d_scales_B_ptrs,
+                const float *const *d_bias_ptrs,
+                const int *N_per_proj,
+                int K,
+                float alpha, float beta,
+                int device_id, void *stream);
+
+            bool rocmGemv_int8_int8_fp32_vnni_blockwise_scaled_batched(
+                const int8_t *d_A_int8,
+                const float *d_scales_A_blockwise,
+                int num_projections,
+                const int8_t *const *d_B_ptrs,
+                float *const *d_C_ptrs,
+                const float *const *d_scales_B_ptrs,
+                const float *const *d_bias_ptrs,
+                const int *N_per_proj,
                 int K,
                 float alpha, float beta,
                 int device_id, void *stream);
@@ -2482,8 +2539,9 @@ namespace llaminar2
                     // =====================================================================
                     if (impl_->has_native_vnni && alpha == 1.0f && beta == 0.0f)
                     {
-                        const bool blockwise = (activation_quant_mode_ == ActivationQuantMode::BLOCKWISE);
-                        if (blockwise)
+                        const bool use_blockwise = (activation_quant_mode_ == ActivationQuantMode::BLOCKWISE);
+
+                        if (use_blockwise)
                         {
                             if (!rocmQuantGemm_quantizeActivationsBlockwise(
                                     d_input, impl_->d_A_int8, impl_->d_scales_A_blockwise, m, k, rocm_device_id_, gpu_stream_))
@@ -2514,7 +2572,7 @@ namespace llaminar2
                                 n, k,
                                 impl_->native_vnni_codebook_id,
                                 rocm_device_id_, gpu_stream_,
-                                blockwise ? impl_->d_scales_A_blockwise : nullptr))
+                                use_blockwise ? impl_->d_scales_A_blockwise : nullptr))
                         {
                             LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] Native-VNNI GEMV failed");
                             return false;
@@ -2542,18 +2600,57 @@ namespace llaminar2
                     // Use INT8 scatter+reduce GEMV when alpha=1, beta=0 AND VNNI weights available
                     if (alpha == 1.0f && beta == 0.0f && d_weights_vnni)
                     {
-                        // Quantize activations (uses shared INT8 buffer)
-                        if (!rocmQuantGemm_quantizeActivations(
-                                d_input, impl_->d_A_int8, impl_->d_scales_A, m, k, rocm_device_id_, gpu_stream_))
+                        const bool use_blockwise = (activation_quant_mode_ == ActivationQuantMode::BLOCKWISE);
+
+                        if (use_blockwise)
                         {
-                            LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] INT8 scatter activation quantization failed");
-                            return false;
+                            if (!rocmQuantGemm_quantizeActivationsBlockwise(
+                                    d_input, impl_->d_A_int8, impl_->d_scales_A_blockwise, m, k, rocm_device_id_, gpu_stream_))
+                            {
+                                LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] INT8 blockwise activation quantization failed");
+                                return false;
+                            }
                         }
-                        if (!rocmGemv_int8_scatter_vnni(
+                        else
+                        {
+                            if (!rocmQuantGemm_quantizeActivations(
+                                    d_input, impl_->d_A_int8, impl_->d_scales_A, m, k, rocm_device_id_, gpu_stream_))
+                            {
+                                LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] INT8 scatter activation quantization failed");
+                                return false;
+                            }
+                        }
+
+                        bool int8_decode_ok = false;
+                        if (use_blockwise)
+                        {
+                            int8_decode_ok = rocmGemv_int8_int8_fp32_vnni_blockwise_scaled(
+                                impl_->d_A_int8, d_weights_vnni, d_gemv_output,
+                                impl_->d_scales_A_blockwise, d_scales_B,
+                                n, k,
+                                alpha, beta,
+                                nullptr, d_bias,
+                                rocm_device_id_, gpu_stream_);
+
+                            if (!int8_decode_ok)
+                            {
+                                int8_decode_ok = rocmGemv_int8_scatter_vnni_blockwise(
+                                    impl_->d_A_int8, d_weights_vnni, d_gemv_output, impl_->d_scales_A_blockwise, d_scales_B, d_bias,
+                                    impl_->d_scatter_partial,
+                                    n, k, alpha, beta, nullptr,
+                                    rocm_device_id_, gpu_stream_);
+                            }
+                        }
+                        else
+                        {
+                            int8_decode_ok = rocmGemv_int8_scatter_vnni(
                                 impl_->d_A_int8, d_weights_vnni, d_gemv_output, impl_->d_scales_A, d_scales_B, d_bias,
                                 impl_->d_scatter_partial,
                                 n, k, alpha, beta, nullptr,
-                                rocm_device_id_, gpu_stream_))
+                                rocm_device_id_, gpu_stream_);
+                        }
+
+                        if (!int8_decode_ok)
                         {
                             LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] INT8 scatter GEMV failed");
                             return false;
@@ -2973,7 +3070,8 @@ namespace llaminar2
                 const bool blockwise = (activation_quant_mode_ == ActivationQuantMode::BLOCKWISE) && (impl_->has_native_vnni || impl_->d_weights_int8_vnni != nullptr);
                 if (blockwise)
                 {
-                    if (!rocmQuantGemm_quantizeActivationsBlockwise(d_A_fp32_src, d_A_int8, impl_->d_scales_A_blockwise, m, k, rocm_device_id_, gpu_stream_))
+                    const int act_block_k = rocmGemv_int8_vnni_get_act_block_k();
+                    if (!rocmQuantGemm_quantizeActivationsBlockwise(d_A_fp32_src, d_A_int8, impl_->d_scales_A_blockwise, m, k, rocm_device_id_, gpu_stream_, act_block_k))
                     {
                         LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] Failed to blockwise-quantize activations");
                         return false;
@@ -3706,8 +3804,8 @@ namespace llaminar2
             // activations. For M>1, CK GEMM also uses pre-quantized activations.
             //
             // Blockwise quantization is supported when ALL projection kernels support it.
-            // - Native-VNNI (Q4_0/IQ4_NL): blockwise at ANY M (GEMV handles blockwise scales)
-            // - INT8-VNNI (Q8_0): blockwise only for M>1 (GEMV scatter needs row-wise d_scales_A)
+            // - Native-VNNI (Q4_0/IQ4_NL): blockwise at any M.
+            // - INT8-VNNI (Q8_0/Q8_1): blockwise for both decode and prefill.
             bool all_projections_native_vnni = true;
             bool all_projections_have_vnni_weights = true;
             for (size_t pi = 0; pi < projections.size(); ++pi)
@@ -3724,13 +3822,14 @@ namespace llaminar2
                 if (!all_projections_native_vnni && !all_projections_have_vnni_weights)
                     break;
             }
+            bool fused_uses_blockwise_shared_quant = false;
             {
                 LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Quantizing activations once, m=" << m << " k=" << k);
 
-                // Native-VNNI GEMV handles blockwise scales natively (any M).
-                // INT8-VNNI GEMV scatter requires row-wise d_scales_A (M=1 only).
-                const bool blockwise = (activation_quant_mode_ == ActivationQuantMode::BLOCKWISE) && (all_projections_native_vnni || (all_projections_have_vnni_weights && m > 1));
-                if (blockwise)
+                const bool can_use_blockwise_shared_quant = all_projections_have_vnni_weights;
+                const bool use_blockwise_shared_quant = (activation_quant_mode_ == ActivationQuantMode::BLOCKWISE) && can_use_blockwise_shared_quant;
+
+                if (use_blockwise_shared_quant)
                 {
                     if (!rocmQuantGemm_quantizeActivationsBlockwise(
                             const_cast<float *>(d_input),
@@ -3755,6 +3854,8 @@ namespace llaminar2
                         return false;
                     }
                 }
+
+                fused_uses_blockwise_shared_quant = use_blockwise_shared_quant;
             }
 
             // Step 5: Execute projections using the SHARED quantized activations
@@ -4000,7 +4101,7 @@ namespace llaminar2
                                 n, k,
                                 rocm_kernel->impl_->native_vnni_codebook_id,
                                 rocm_device_id_, gpu_stream_,
-                                (activation_quant_mode_ == ActivationQuantMode::BLOCKWISE) ? impl_->d_scales_A_blockwise : nullptr))
+                                fused_uses_blockwise_shared_quant ? impl_->d_scales_A_blockwise : nullptr))
                         {
                             LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Native-VNNI GEMV failed for projection " << i);
                             all_success = false;
@@ -4044,12 +4145,38 @@ namespace llaminar2
                     {
                         LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Projection " << i
                                                                                                  << " SINGLE INT8 SCATTER M=1 N=" << n << " K=" << k);
-                        if (!rocmGemv_int8_scatter_vnni(
+                        bool projection_ok = false;
+                        if (fused_uses_blockwise_shared_quant)
+                        {
+                            projection_ok = rocmGemv_int8_int8_fp32_vnni_blockwise_scaled(
+                                impl_->d_A_int8, d_vnni, d_output,
+                                impl_->d_scales_A_blockwise, d_scales_B,
+                                n, k,
+                                1.0f, 0.0f,
+                                nullptr, d_bias,
+                                rocm_device_id_, gpu_stream_);
+
+                            if (!projection_ok)
+                            {
+                                projection_ok = rocmGemv_int8_scatter_vnni_blockwise(
+                                    impl_->d_A_int8, d_vnni, d_output,
+                                    impl_->d_scales_A_blockwise, d_scales_B, d_bias,
+                                    rocm_kernel->impl_->d_scatter_partial,
+                                    n, k, 1.0f, 0.0f, nullptr,
+                                    rocm_device_id_, gpu_stream_);
+                            }
+                        }
+                        else
+                        {
+                            projection_ok = rocmGemv_int8_scatter_vnni(
                                 impl_->d_A_int8, d_vnni, d_output,
                                 impl_->d_scales_A, d_scales_B, d_bias,
                                 rocm_kernel->impl_->d_scatter_partial,
                                 n, k, 1.0f, 0.0f, nullptr,
-                                rocm_device_id_, gpu_stream_))
+                                rocm_device_id_, gpu_stream_);
+                        }
+
+                        if (!projection_ok)
                         {
                             LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fused_tensor] INT8 scatter GEMV failed for projection " << i);
                             all_success = false;
@@ -4072,9 +4199,7 @@ namespace llaminar2
                 // PREFILL PATH: M>1 CK GEMM
                 // =========================================================================
 
-                const float *blockwise_ptr = (activation_quant_mode_ == ActivationQuantMode::BLOCKWISE && (all_projections_native_vnni || (all_projections_have_vnni_weights && m > 1)))
-                                                 ? impl_->d_scales_A_blockwise
-                                                 : nullptr;
+                const float *blockwise_ptr = fused_uses_blockwise_shared_quant ? impl_->d_scales_A_blockwise : nullptr;
 
                 if (rocm_kernel->tryPrefillNativeGemm(
                         impl_->d_A_int8,
@@ -4275,10 +4400,12 @@ namespace llaminar2
                 LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Dispatching BATCHED INT8 SCATTER: "
                           << batch_count << " projections, K=" << k);
 
-                if (!rocmGemv_int8_scatter_batched_vnni(
-                        impl_->d_A_int8,          // Pre-quantized INT8 activations
-                        impl_->d_scales_A,        // Activation scale
-                        impl_->d_scatter_partial, // Shared partial buffer (workspace-managed)
+                bool batched_ok = false;
+                if (fused_uses_blockwise_shared_quant)
+                {
+                    batched_ok = rocmGemv_int8_int8_fp32_vnni_blockwise_scaled_batched(
+                        impl_->d_A_int8,
+                        impl_->d_scales_A_blockwise,
                         batch_count,
                         batch_B_ptrs,
                         batch_C_ptrs,
@@ -4287,7 +4414,43 @@ namespace llaminar2
                         batch_N,
                         k,
                         1.0f, 0.0f,
-                        rocm_device_id_, gpu_stream_))
+                        rocm_device_id_, gpu_stream_);
+
+                    if (!batched_ok)
+                    {
+                        batched_ok = rocmGemv_int8_scatter_batched_vnni_blockwise(
+                            impl_->d_A_int8,
+                            impl_->d_scales_A_blockwise,
+                            impl_->d_scatter_partial,
+                            batch_count,
+                            batch_B_ptrs,
+                            batch_C_ptrs,
+                            batch_scales_B_ptrs,
+                            batch_bias_ptrs,
+                            batch_N,
+                            k,
+                            1.0f, 0.0f,
+                            rocm_device_id_, gpu_stream_);
+                    }
+                }
+                else
+                {
+                    batched_ok = rocmGemv_int8_scatter_batched_vnni(
+                        impl_->d_A_int8,
+                        impl_->d_scales_A,
+                        impl_->d_scatter_partial,
+                        batch_count,
+                        batch_B_ptrs,
+                        batch_C_ptrs,
+                        batch_scales_B_ptrs,
+                        batch_bias_ptrs,
+                        batch_N,
+                        k,
+                        1.0f, 0.0f,
+                        rocm_device_id_, gpu_stream_);
+                }
+
+                if (!batched_ok)
                 {
                     LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Batched INT8 scatter dispatch failed");
                     all_success = false;
@@ -5324,7 +5487,36 @@ namespace llaminar2
                     // Bias handled inside scatter reduce kernel
                     if (alpha == 1.0f && beta == 0.0f && d_vnni)
                     {
-                        // Quantize activations (uses shared INT8 buffer)
+                        const bool use_blockwise = (activation_quant_mode_ == ActivationQuantMode::BLOCKWISE);
+
+                        if (use_blockwise)
+                        {
+                            if (!rocmQuantGemm_quantizeActivationsBlockwise(
+                                    d_A, impl_->d_A_int8, impl_->d_scales_A_blockwise, m, k, rocm_device_id_, gpu_stream_))
+                            {
+                                LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32_with_bias] INT8 blockwise activation quantization failed");
+                                return false;
+                            }
+                            bool blockwise_ok = rocmGemv_int8_int8_fp32_vnni_blockwise_scaled(
+                                impl_->d_A_int8, d_vnni, d_C,
+                                impl_->d_scales_A_blockwise, d_s,
+                                n, k,
+                                alpha, beta,
+                                nullptr, d_bias,
+                                rocm_device_id_, gpu_stream_);
+
+                            if (!blockwise_ok)
+                            {
+                                blockwise_ok = rocmGemv_int8_scatter_vnni_blockwise(
+                                    impl_->d_A_int8, d_vnni, d_C, impl_->d_scales_A_blockwise, d_s, d_bias,
+                                    impl_->d_scatter_partial,
+                                    n, k, alpha, beta, nullptr,
+                                    rocm_device_id_, gpu_stream_);
+                            }
+
+                            return blockwise_ok;
+                        }
+
                         if (!rocmQuantGemm_quantizeActivations(
                                 d_A, impl_->d_A_int8, impl_->d_scales_A, m, k, rocm_device_id_, gpu_stream_))
                         {

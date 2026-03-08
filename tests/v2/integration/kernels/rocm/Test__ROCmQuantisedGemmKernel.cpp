@@ -48,6 +48,44 @@
 #ifdef HAVE_ROCM
 #include <hip/hip_runtime.h>
 
+extern "C" void rocmGemv_int8_vnni_reset_tuning_overrides();
+extern "C" void rocmGemv_int8_vnni_reset_wide_tuning_overrides();
+extern "C" void rocmGemv_int8_vnni_reset_qwo_overrides();
+
+extern "C" bool rocmQuantGemm_quantizeActivationsBlockwise(
+    const float *d_A_fp32,
+    int8_t *d_A_int8,
+    float *d_scales_A_blockwise,
+    int M, int K,
+    int rocm_device_id, void *stream);
+
+extern "C" bool rocmGemv_int8_int8_fp32_vnni_blockwise_scaled(
+    const int8_t* d_A_int8,
+    const int8_t* d_B_int8_vnni,
+    float* d_C_fp32,
+    const float* d_scales_A_blockwise,
+    const float* d_scale_B,
+    int N, int K,
+    float alpha,
+    float beta,
+    const float* d_C_existing,
+    const float* d_bias,
+    int device_id, void* stream);
+
+extern "C" bool rocmGemv_int8_int8_fp32_vnni_blockwise_scaled_pair(
+    const int8_t* d_A_int8,
+    const float* d_scales_A_blockwise,
+    const int8_t* d_B0,
+    const int8_t* d_B1,
+    float* d_C0,
+    float* d_C1,
+    const float* d_scales_B0,
+    const float* d_scales_B1,
+    int N0, int N1,
+    int K,
+    float alpha,
+    int device_id, void* stream);
+
 // Forward declarations for HIP functions used in integration tests
 extern "C"
 {
@@ -3658,6 +3696,309 @@ namespace llaminar2
                 cleanupWorkspace(kernel);
             }
 
+            TEST_F(ROCmQuantisedGemmIntegrationTest, Dispatch_Q8_0_Decode_MediumShapeBlockwiseMatchesReference)
+            {
+                if (!has_rocm_device_)
+                    GTEST_SKIP() << "No ROCm device available";
+
+                const int M = 1;
+                const int N = 3584;
+                const int K = 3584;
+
+                struct Int8VnniOverrideGuard
+                {
+                    ~Int8VnniOverrideGuard()
+                    {
+                        rocmGemv_int8_vnni_reset_tuning_overrides();
+                        rocmGemv_int8_vnni_reset_wide_tuning_overrides();
+                    }
+                } override_guard;
+
+                rocmGemv_int8_vnni_reset_tuning_overrides();
+                rocmGemv_int8_vnni_reset_wide_tuning_overrides();
+
+                auto weights = TestTensorFactory::createQ8_0Random({static_cast<size_t>(N), static_cast<size_t>(K)});
+                std::vector<float> W_fp32(static_cast<size_t>(N) * K);
+                weights->to_fp32(W_fp32.data());
+
+                ROCmPackedWeights packed;
+                ASSERT_TRUE(packWeightsToROCm(weights.get(), packed));
+                ASSERT_FALSE(packed.int8_data.empty());
+                ASSERT_TRUE(packed.native_vnni_payload.empty());
+
+                auto input = TestTensorFactory::createFP32Random({static_cast<size_t>(M), static_cast<size_t>(K)});
+                auto rowwise_output = TestTensorFactory::createFP32({static_cast<size_t>(M), static_cast<size_t>(N)});
+                auto blockwise_output = TestTensorFactory::createFP32({static_cast<size_t>(M), static_cast<size_t>(N)});
+
+                ASSERT_TRUE(input->ensureOnDevice(DeviceId::rocm(0)));
+                ASSERT_TRUE(rowwise_output->allocateOnDevice(DeviceId::rocm(0)));
+                ASSERT_TRUE(blockwise_output->allocateOnDevice(DeviceId::rocm(0)));
+
+                {
+                    ROCmQuantisedGemmKernel rowwise_kernel(&packed, 0);
+                    rowwise_kernel.setActivationQuantMode(ActivationQuantMode::ROW_WISE);
+                    ASSERT_TRUE(setupWorkspace(rowwise_kernel, M, N, K));
+                    ASSERT_TRUE(rowwise_kernel.multiply_tensor(input.get(), rowwise_output.get(), M, N, K));
+                    cleanupWorkspace(rowwise_kernel);
+                }
+
+                {
+                    ROCmQuantisedGemmKernel blockwise_kernel(&packed, 0);
+                    blockwise_kernel.setActivationQuantMode(ActivationQuantMode::BLOCKWISE);
+                    ASSERT_TRUE(setupWorkspace(blockwise_kernel, M, N, K));
+                    ASSERT_TRUE(blockwise_kernel.multiply_tensor(input.get(), blockwise_output.get(), M, N, K));
+                    cleanupWorkspace(blockwise_kernel);
+                }
+
+                ASSERT_EQ(hipDeviceSynchronize(), hipSuccess);
+                rowwise_output->mark_device_dirty();
+                blockwise_output->mark_device_dirty();
+
+                const float *in_host = input->data();
+                std::vector<float> ref(static_cast<size_t>(M) * N);
+                cpuFP32GemmRef(in_host, W_fp32.data(), ref.data(), M, N, K);
+
+                const float rowwise_cos = cosineSim(rowwise_output->data(), ref.data(), static_cast<size_t>(M) * N);
+                const float blockwise_cos = cosineSim(blockwise_output->data(), ref.data(), static_cast<size_t>(M) * N);
+                const float cross_cos = cosineSim(rowwise_output->data(), blockwise_output->data(), static_cast<size_t>(M) * N);
+
+                LOG_INFO("[Dispatch] Q8_0 decode medium-shape rowwise cosine=" << rowwise_cos
+                                                                                << " blockwise cosine=" << blockwise_cos
+                                                                                << " cross cosine=" << cross_cos);
+                EXPECT_GT(rowwise_cos, 0.985f) << "Row-wise medium-shape decode cosine too low";
+                EXPECT_GT(blockwise_cos, 0.985f) << "Blockwise medium-shape decode cosine too low";
+                EXPECT_GT(cross_cos, 0.995f) << "Medium-shape blockwise decode diverged from row-wise baseline";
+            }
+
+            TEST_F(ROCmQuantisedGemmIntegrationTest, Dispatch_Q8_0_Decode_KVShapeBlockwiseMatchesReference)
+            {
+                if (!has_rocm_device_)
+                    GTEST_SKIP() << "No ROCm device available";
+
+                const int M = 1;
+                const int N = 512;
+                const int K = 3584;
+
+                struct Int8VnniOverrideGuard
+                {
+                    ~Int8VnniOverrideGuard()
+                    {
+                        rocmGemv_int8_vnni_reset_tuning_overrides();
+                        rocmGemv_int8_vnni_reset_wide_tuning_overrides();
+                    }
+                } override_guard;
+
+                rocmGemv_int8_vnni_reset_tuning_overrides();
+                rocmGemv_int8_vnni_reset_wide_tuning_overrides();
+
+                auto weights = TestTensorFactory::createQ8_0Random({static_cast<size_t>(N), static_cast<size_t>(K)});
+                std::vector<float> W_fp32(static_cast<size_t>(N) * K);
+                weights->to_fp32(W_fp32.data());
+
+                ROCmPackedWeights packed;
+                ASSERT_TRUE(packWeightsToROCm(weights.get(), packed));
+                ASSERT_FALSE(packed.int8_data.empty());
+                ASSERT_TRUE(packed.native_vnni_payload.empty());
+
+                auto input = TestTensorFactory::createFP32Random({static_cast<size_t>(M), static_cast<size_t>(K)});
+                auto rowwise_output = TestTensorFactory::createFP32({static_cast<size_t>(M), static_cast<size_t>(N)});
+                auto blockwise_output = TestTensorFactory::createFP32({static_cast<size_t>(M), static_cast<size_t>(N)});
+
+                ASSERT_TRUE(input->ensureOnDevice(DeviceId::rocm(0)));
+                ASSERT_TRUE(rowwise_output->allocateOnDevice(DeviceId::rocm(0)));
+                ASSERT_TRUE(blockwise_output->allocateOnDevice(DeviceId::rocm(0)));
+
+                {
+                    ROCmQuantisedGemmKernel rowwise_kernel(&packed, 0);
+                    rowwise_kernel.setActivationQuantMode(ActivationQuantMode::ROW_WISE);
+                    ASSERT_TRUE(setupWorkspace(rowwise_kernel, M, N, K));
+                    ASSERT_TRUE(rowwise_kernel.multiply_tensor(input.get(), rowwise_output.get(), M, N, K));
+                    cleanupWorkspace(rowwise_kernel);
+                }
+
+                {
+                    ROCmQuantisedGemmKernel blockwise_kernel(&packed, 0);
+                    blockwise_kernel.setActivationQuantMode(ActivationQuantMode::BLOCKWISE);
+                    ASSERT_TRUE(setupWorkspace(blockwise_kernel, M, N, K));
+                    ASSERT_TRUE(blockwise_kernel.multiply_tensor(input.get(), blockwise_output.get(), M, N, K));
+                    cleanupWorkspace(blockwise_kernel);
+                }
+
+                ASSERT_EQ(hipDeviceSynchronize(), hipSuccess);
+                rowwise_output->mark_device_dirty();
+                blockwise_output->mark_device_dirty();
+
+                const float *in_host = input->data();
+                std::vector<float> ref(static_cast<size_t>(M) * N);
+                cpuFP32GemmRef(in_host, W_fp32.data(), ref.data(), M, N, K);
+
+                const float rowwise_cos = cosineSim(rowwise_output->data(), ref.data(), static_cast<size_t>(M) * N);
+                const float blockwise_cos = cosineSim(blockwise_output->data(), ref.data(), static_cast<size_t>(M) * N);
+                const float cross_cos = cosineSim(rowwise_output->data(), blockwise_output->data(), static_cast<size_t>(M) * N);
+
+                LOG_INFO("[Dispatch] Q8_0 decode KV-shape rowwise cosine=" << rowwise_cos
+                                                                            << " blockwise cosine=" << blockwise_cos
+                                                                            << " cross cosine=" << cross_cos);
+                EXPECT_GT(rowwise_cos, 0.985f) << "Row-wise KV-shape decode cosine too low";
+                EXPECT_GT(blockwise_cos, 0.985f) << "Blockwise KV-shape decode cosine too low";
+                EXPECT_GT(cross_cos, 0.995f) << "KV-shape blockwise decode diverged from row-wise baseline";
+            }
+
+            /**
+             * @test Pair kernel correctness: the LDS K-reduce pair kernel must match
+             * 2× individual blockwise GEMV calls for all K/V projection shapes.
+             *
+             * Tests the raw dispatch `rocmGemv_int8_int8_fp32_vnni_blockwise_scaled_pair()`
+             * against `rocmGemv_int8_int8_fp32_vnni_blockwise_scaled()` × 2.
+             * Both use the same blockwise activation quantization + per-column weight scales.
+             */
+            TEST_F(ROCmQuantisedGemmIntegrationTest, Dispatch_BlockwisePairMatchesIndividual)
+            {
+                if (!has_rocm_device_)
+                    GTEST_SKIP() << "No ROCm device available";
+
+                struct KVShape { const char* name; int N; int K; };
+                const std::vector<KVShape> shapes = {
+                    {"0.5B K/V", 128, 896},
+                    {"3B K/V",   256, 2048},
+                    {"7B K/V",   512, 3584},
+                };
+
+                struct OverrideGuard {
+                    ~OverrideGuard() {
+                        rocmGemv_int8_vnni_reset_tuning_overrides();
+                        rocmGemv_int8_vnni_reset_qwo_overrides();
+                    }
+                } guard;
+
+                // Helper: pack [K×N] row-major INT8 into VNNI [K/4][N][4]
+                auto packVnni = [](const std::vector<int8_t>& B, int N, int K,
+                                   std::vector<int8_t>& out) {
+                    const size_t kg = static_cast<size_t>(K) / 4;
+                    out.resize(kg * static_cast<size_t>(N) * 4);
+                    for (int n = 0; n < N; ++n) {
+                        for (size_t g = 0; g < kg; ++g) {
+                            const size_t src = (g * 4) * static_cast<size_t>(N) + static_cast<size_t>(n);
+                            const size_t dst = (g * static_cast<size_t>(N) + static_cast<size_t>(n)) * 4;
+                            out[dst + 0] = B[src + static_cast<size_t>(0) * N];
+                            out[dst + 1] = B[src + static_cast<size_t>(1) * N];
+                            out[dst + 2] = B[src + static_cast<size_t>(2) * N];
+                            out[dst + 3] = B[src + static_cast<size_t>(3) * N];
+                        }
+                    }
+                };
+
+                for (const auto& shape : shapes) {
+                    SCOPED_TRACE(shape.name);
+                    const int N = shape.N;
+                    const int K = shape.K;
+                    const int blocks_per_row = K / 32;
+
+                    rocmGemv_int8_vnni_reset_tuning_overrides();
+                    rocmGemv_int8_vnni_reset_qwo_overrides();
+
+                    // Generate random data
+                    std::mt19937 rng(42);
+                    std::uniform_real_distribution<float> dist_a(-1.0f, 1.0f);
+                    std::uniform_int_distribution<int> dist_b(-127, 127);
+                    std::uniform_real_distribution<float> dist_s(0.001f, 0.1f);
+
+                    std::vector<float> h_A(K);
+                    for (auto& v : h_A) v = dist_a(rng);
+
+                    // Create two separate weight matrices (K and V projections)
+                    auto makeWeights = [&](int proj_N) {
+                        struct W {
+                            std::vector<int8_t> h_B_vnni;
+                            std::vector<float> h_scale;
+                            int8_t* d_B = nullptr;
+                            float* d_scale = nullptr;
+                        };
+                        W w;
+                        std::vector<int8_t> h_B(static_cast<size_t>(K) * proj_N);
+                        w.h_scale.resize(proj_N);
+                        for (auto& v : h_B) v = static_cast<int8_t>(dist_b(rng));
+                        for (auto& v : w.h_scale) v = dist_s(rng);
+                        packVnni(h_B, proj_N, K, w.h_B_vnni);
+                        hipMalloc(&w.d_B, w.h_B_vnni.size());
+                        hipMalloc(&w.d_scale, proj_N * sizeof(float));
+                        hipMemcpy(w.d_B, w.h_B_vnni.data(), w.h_B_vnni.size(), hipMemcpyHostToDevice);
+                        hipMemcpy(w.d_scale, w.h_scale.data(), proj_N * sizeof(float), hipMemcpyHostToDevice);
+                        return w;
+                    };
+                    auto wk = makeWeights(N);
+                    auto wv = makeWeights(N);
+
+                    // Allocate activations + blockwise quant buffers on device
+                    float* d_A = nullptr;
+                    int8_t* d_A_int8 = nullptr;
+                    float* d_scale_A_bw = nullptr;
+                    hipMalloc(&d_A, K * sizeof(float));
+                    hipMalloc(&d_A_int8, K * sizeof(int8_t));
+                    hipMalloc(&d_scale_A_bw, blocks_per_row * sizeof(float));
+                    hipMemcpy(d_A, h_A.data(), K * sizeof(float), hipMemcpyHostToDevice);
+
+                    ASSERT_TRUE(rocmQuantGemm_quantizeActivationsBlockwise(
+                        d_A, d_A_int8, d_scale_A_bw, 1, K, 0, nullptr));
+                    hipDeviceSynchronize();
+
+                    // Output buffers: individual (reference) + pair (test)
+                    float *d_Ck_ref = nullptr, *d_Cv_ref = nullptr;
+                    float *d_Ck_pair = nullptr, *d_Cv_pair = nullptr;
+                    hipMalloc(&d_Ck_ref, N * sizeof(float));
+                    hipMalloc(&d_Cv_ref, N * sizeof(float));
+                    hipMalloc(&d_Ck_pair, N * sizeof(float));
+                    hipMalloc(&d_Cv_pair, N * sizeof(float));
+
+                    // Run 2× individual blockwise calls → reference
+                    ASSERT_TRUE(rocmGemv_int8_int8_fp32_vnni_blockwise_scaled(
+                        d_A_int8, wk.d_B, d_Ck_ref, d_scale_A_bw, wk.d_scale,
+                        N, K, 1.0f, 0.0f, nullptr, nullptr, 0, nullptr));
+                    ASSERT_TRUE(rocmGemv_int8_int8_fp32_vnni_blockwise_scaled(
+                        d_A_int8, wv.d_B, d_Cv_ref, d_scale_A_bw, wv.d_scale,
+                        N, K, 1.0f, 0.0f, nullptr, nullptr, 0, nullptr));
+                    hipDeviceSynchronize();
+
+                    // Run 1× pair dispatch → test
+                    ASSERT_TRUE(rocmGemv_int8_int8_fp32_vnni_blockwise_scaled_pair(
+                        d_A_int8, d_scale_A_bw,
+                        wk.d_B, wv.d_B,
+                        d_Ck_pair, d_Cv_pair,
+                        wk.d_scale, wv.d_scale,
+                        N, N, K, 1.0f, 0, nullptr));
+                    hipDeviceSynchronize();
+
+                    // Copy results back
+                    std::vector<float> h_Ck_ref(N), h_Cv_ref(N), h_Ck_pair(N), h_Cv_pair(N);
+                    hipMemcpy(h_Ck_ref.data(), d_Ck_ref, N * sizeof(float), hipMemcpyDeviceToHost);
+                    hipMemcpy(h_Cv_ref.data(), d_Cv_ref, N * sizeof(float), hipMemcpyDeviceToHost);
+                    hipMemcpy(h_Ck_pair.data(), d_Ck_pair, N * sizeof(float), hipMemcpyDeviceToHost);
+                    hipMemcpy(h_Cv_pair.data(), d_Cv_pair, N * sizeof(float), hipMemcpyDeviceToHost);
+
+                    // Compare pair vs individual
+                    const float k_cos = cosineSimilarity(h_Ck_ref, h_Ck_pair);
+                    const float v_cos = cosineSimilarity(h_Cv_ref, h_Cv_pair);
+
+                    LOG_INFO("[PairCorrectness] " << shape.name
+                             << " K-proj pair-vs-individual cosine=" << k_cos
+                             << " V-proj pair-vs-individual cosine=" << v_cos);
+
+                    // Pair must match individual within numerical noise.
+                    // KB selection may differ (pair doubles total_grid_n) so allow slight divergence.
+                    EXPECT_GT(k_cos, 0.999f)
+                        << shape.name << " K-proj pair diverged from individual";
+                    EXPECT_GT(v_cos, 0.999f)
+                        << shape.name << " V-proj pair diverged from individual";
+
+                    // Cleanup
+                    hipFree(d_A); hipFree(d_A_int8); hipFree(d_scale_A_bw);
+                    hipFree(d_Ck_ref); hipFree(d_Cv_ref);
+                    hipFree(d_Ck_pair); hipFree(d_Cv_pair);
+                    hipFree(wk.d_B); hipFree(wk.d_scale);
+                    hipFree(wv.d_B); hipFree(wv.d_scale);
+                }
+            }
+
             /**
              * @test End-to-end multiply_tensor for Q8_0 (INT8-VNNI path) — prefill (M=64)
              */
@@ -4269,6 +4610,268 @@ namespace llaminar2
                 EXPECT_GT(v_cos, 0.9999f) << "Fused V projection diverged from separate biased GEMM";
 
                 cleanupWorkspace(kernel);
+            }
+
+            TEST_F(ROCmQuantisedGemmIntegrationTest, FusedDecode_Q8_0_BlockwiseQKVBatch_MatchesSeparate)
+            {
+                if (!has_rocm_device_)
+                    GTEST_SKIP() << "No ROCm device available";
+
+                const int M = 1;
+                const int K = 896;
+                const int Nq = 896;
+                const int Nk = 128;
+                const int Nv = 128;
+
+                auto wq = TestTensorFactory::createQ8_0Random({static_cast<size_t>(Nq), static_cast<size_t>(K)});
+                auto wk = TestTensorFactory::createQ8_0Random({static_cast<size_t>(Nk), static_cast<size_t>(K)});
+                auto wv = TestTensorFactory::createQ8_0Random({static_cast<size_t>(Nv), static_cast<size_t>(K)});
+
+                ROCmPackedWeights packed_q;
+                ROCmPackedWeights packed_k;
+                ROCmPackedWeights packed_v;
+                ASSERT_TRUE(packWeightsToROCm(wq.get(), packed_q));
+                ASSERT_TRUE(packWeightsToROCm(wk.get(), packed_k));
+                ASSERT_TRUE(packWeightsToROCm(wv.get(), packed_v));
+
+                ROCmQuantisedGemmKernel q_kernel(&packed_q, 0);
+                ROCmQuantisedGemmKernel k_kernel(&packed_k, 0);
+                ROCmQuantisedGemmKernel v_kernel(&packed_v, 0);
+                q_kernel.setActivationQuantMode(ActivationQuantMode::BLOCKWISE);
+                k_kernel.setActivationQuantMode(ActivationQuantMode::BLOCKWISE);
+                v_kernel.setActivationQuantMode(ActivationQuantMode::BLOCKWISE);
+
+                auto q_workspace = std::make_unique<DeviceWorkspaceManager>(DeviceId::rocm(0), 64 * 1024 * 1024);
+                auto k_workspace = std::make_unique<DeviceWorkspaceManager>(DeviceId::rocm(0), 64 * 1024 * 1024);
+                auto v_workspace = std::make_unique<DeviceWorkspaceManager>(DeviceId::rocm(0), 64 * 1024 * 1024);
+                ASSERT_TRUE(q_workspace->allocate(q_kernel.getWorkspaceRequirements(M, Nq, K)));
+                ASSERT_TRUE(k_workspace->allocate(k_kernel.getWorkspaceRequirements(M, Nk, K)));
+                ASSERT_TRUE(v_workspace->allocate(v_kernel.getWorkspaceRequirements(M, Nv, K)));
+                q_kernel.bindWorkspace(q_workspace.get());
+                k_kernel.bindWorkspace(k_workspace.get());
+                v_kernel.bindWorkspace(v_workspace.get());
+
+                auto input = TestTensorFactory::createFP32Random({static_cast<size_t>(M), static_cast<size_t>(K)});
+                auto separate_q = TestTensorFactory::createFP32({static_cast<size_t>(M), static_cast<size_t>(Nq)});
+                auto separate_k = TestTensorFactory::createFP32({static_cast<size_t>(M), static_cast<size_t>(Nk)});
+                auto separate_v = TestTensorFactory::createFP32({static_cast<size_t>(M), static_cast<size_t>(Nv)});
+                auto fused_q = TestTensorFactory::createFP32({static_cast<size_t>(M), static_cast<size_t>(Nq)});
+                auto fused_k = TestTensorFactory::createFP32({static_cast<size_t>(M), static_cast<size_t>(Nk)});
+                auto fused_v = TestTensorFactory::createFP32({static_cast<size_t>(M), static_cast<size_t>(Nv)});
+                auto bias_q = TestTensorFactory::createFP32({static_cast<size_t>(Nq)});
+                auto bias_k = TestTensorFactory::createFP32({static_cast<size_t>(Nk)});
+                auto bias_v = TestTensorFactory::createFP32({static_cast<size_t>(Nv)});
+
+                for (int col = 0; col < Nq; ++col)
+                {
+                    bias_q->mutable_data()[col] = 0.03125f * static_cast<float>((col % 9) - 4);
+                }
+                for (int col = 0; col < Nk; ++col)
+                {
+                    bias_k->mutable_data()[col] = 0.03125f * static_cast<float>((col % 7) - 3);
+                    bias_v->mutable_data()[col] = 0.03125f * static_cast<float>((col % 5) - 2);
+                }
+
+                ASSERT_TRUE(input->ensureOnDevice(DeviceId::rocm(0)));
+                ASSERT_TRUE(separate_q->allocateOnDevice(DeviceId::rocm(0)));
+                ASSERT_TRUE(separate_k->allocateOnDevice(DeviceId::rocm(0)));
+                ASSERT_TRUE(separate_v->allocateOnDevice(DeviceId::rocm(0)));
+                ASSERT_TRUE(fused_q->allocateOnDevice(DeviceId::rocm(0)));
+                ASSERT_TRUE(fused_k->allocateOnDevice(DeviceId::rocm(0)));
+                ASSERT_TRUE(fused_v->allocateOnDevice(DeviceId::rocm(0)));
+
+                ASSERT_TRUE(q_kernel.multiply_tensor(input.get(), separate_q.get(), M, Nq, K,
+                                                     true, 1.0f, 0.0f, bias_q.get()));
+                ASSERT_TRUE(k_kernel.multiply_tensor(input.get(), separate_k.get(), M, Nk, K,
+                                                     true, 1.0f, 0.0f, bias_k.get()));
+                ASSERT_TRUE(v_kernel.multiply_tensor(input.get(), separate_v.get(), M, Nv, K,
+                                                     true, 1.0f, 0.0f, bias_v.get()));
+                ASSERT_EQ(hipDeviceSynchronize(), hipSuccess);
+                separate_q->mark_device_dirty();
+                separate_k->mark_device_dirty();
+                separate_v->mark_device_dirty();
+
+                std::vector<ITensorGemm::TensorProjectionDesc> projections;
+                projections.emplace_back(&q_kernel, fused_q.get(), Nq, bias_q.get(), nullptr, false, "q_q8_blockwise");
+                projections.emplace_back(&k_kernel, fused_k.get(), Nk, bias_k.get(), nullptr, false, "k_q8_blockwise");
+                projections.emplace_back(&v_kernel, fused_v.get(), Nv, bias_v.get(), nullptr, false, "v_q8_blockwise");
+
+                ASSERT_TRUE(q_kernel.multiply_fused_tensor(input.get(), projections, M, K));
+                ASSERT_EQ(hipDeviceSynchronize(), hipSuccess);
+                fused_q->mark_device_dirty();
+                fused_k->mark_device_dirty();
+                fused_v->mark_device_dirty();
+
+                const float q_cos = cosineSim(fused_q->data(), separate_q->data(), static_cast<size_t>(M) * Nq);
+                const float k_cos = cosineSim(fused_k->data(), separate_k->data(), static_cast<size_t>(M) * Nk);
+                const float v_cos = cosineSim(fused_v->data(), separate_v->data(), static_cast<size_t>(M) * Nv);
+
+                LOG_INFO("[Dispatch] Fused INT8 blockwise QKV cosine q=" << q_cos
+                                                                          << " k=" << k_cos
+                                                                          << " v=" << v_cos);
+                EXPECT_GT(q_cos, 0.9999f);
+                EXPECT_GT(k_cos, 0.9999f);
+                EXPECT_GT(v_cos, 0.9999f);
+
+                q_kernel.unbindWorkspace();
+                k_kernel.unbindWorkspace();
+                v_kernel.unbindWorkspace();
+            }
+
+            TEST_F(ROCmQuantisedGemmIntegrationTest, FusedDecode_Q8_0_BlockwiseGateUpBatch_MatchesSeparate)
+            {
+                if (!has_rocm_device_)
+                    GTEST_SKIP() << "No ROCm device available";
+
+                const int M = 1;
+                const int K = 896;
+                const int N = 4864;
+
+                auto w_gate = TestTensorFactory::createQ8_0Random({static_cast<size_t>(N), static_cast<size_t>(K)});
+                auto w_up = TestTensorFactory::createQ8_0Random({static_cast<size_t>(N), static_cast<size_t>(K)});
+
+                ROCmPackedWeights packed_gate;
+                ROCmPackedWeights packed_up;
+                ASSERT_TRUE(packWeightsToROCm(w_gate.get(), packed_gate));
+                ASSERT_TRUE(packWeightsToROCm(w_up.get(), packed_up));
+
+                ROCmQuantisedGemmKernel gate_kernel(&packed_gate, 0);
+                ROCmQuantisedGemmKernel up_kernel(&packed_up, 0);
+                gate_kernel.setActivationQuantMode(ActivationQuantMode::BLOCKWISE);
+                up_kernel.setActivationQuantMode(ActivationQuantMode::BLOCKWISE);
+
+                auto gate_workspace = std::make_unique<DeviceWorkspaceManager>(DeviceId::rocm(0), 64 * 1024 * 1024);
+                auto up_workspace = std::make_unique<DeviceWorkspaceManager>(DeviceId::rocm(0), 64 * 1024 * 1024);
+                ASSERT_TRUE(gate_workspace->allocate(gate_kernel.getWorkspaceRequirements(M, N, K)));
+                ASSERT_TRUE(up_workspace->allocate(up_kernel.getWorkspaceRequirements(M, N, K)));
+                gate_kernel.bindWorkspace(gate_workspace.get());
+                up_kernel.bindWorkspace(up_workspace.get());
+
+                auto input = TestTensorFactory::createFP32Random({static_cast<size_t>(M), static_cast<size_t>(K)});
+                auto separate_gate = TestTensorFactory::createFP32({static_cast<size_t>(M), static_cast<size_t>(N)});
+                auto separate_up = TestTensorFactory::createFP32({static_cast<size_t>(M), static_cast<size_t>(N)});
+                auto fused_gate = TestTensorFactory::createFP32({static_cast<size_t>(M), static_cast<size_t>(N)});
+                auto fused_up = TestTensorFactory::createFP32({static_cast<size_t>(M), static_cast<size_t>(N)});
+                auto bias_gate = TestTensorFactory::createFP32({static_cast<size_t>(N)});
+                auto bias_up = TestTensorFactory::createFP32({static_cast<size_t>(N)});
+
+                for (int col = 0; col < N; ++col)
+                {
+                    bias_gate->mutable_data()[col] = 0.015625f * static_cast<float>((col % 13) - 6);
+                    bias_up->mutable_data()[col] = 0.015625f * static_cast<float>((col % 11) - 5);
+                }
+
+                ASSERT_TRUE(input->ensureOnDevice(DeviceId::rocm(0)));
+                ASSERT_TRUE(separate_gate->allocateOnDevice(DeviceId::rocm(0)));
+                ASSERT_TRUE(separate_up->allocateOnDevice(DeviceId::rocm(0)));
+                ASSERT_TRUE(fused_gate->allocateOnDevice(DeviceId::rocm(0)));
+                ASSERT_TRUE(fused_up->allocateOnDevice(DeviceId::rocm(0)));
+
+                ASSERT_TRUE(gate_kernel.multiply_tensor(input.get(), separate_gate.get(), M, N, K,
+                                                        true, 1.0f, 0.0f, bias_gate.get()));
+                ASSERT_TRUE(up_kernel.multiply_tensor(input.get(), separate_up.get(), M, N, K,
+                                                      true, 1.0f, 0.0f, bias_up.get()));
+                ASSERT_EQ(hipDeviceSynchronize(), hipSuccess);
+                separate_gate->mark_device_dirty();
+                separate_up->mark_device_dirty();
+
+                std::vector<ITensorGemm::TensorProjectionDesc> projections;
+                projections.emplace_back(&gate_kernel, fused_gate.get(), N, bias_gate.get(), nullptr, false, "gate_q8_blockwise");
+                projections.emplace_back(&up_kernel, fused_up.get(), N, bias_up.get(), nullptr, false, "up_q8_blockwise");
+
+                ASSERT_TRUE(gate_kernel.multiply_fused_tensor(input.get(), projections, M, K));
+                ASSERT_EQ(hipDeviceSynchronize(), hipSuccess);
+                fused_gate->mark_device_dirty();
+                fused_up->mark_device_dirty();
+
+                const float gate_cos = cosineSim(fused_gate->data(), separate_gate->data(), static_cast<size_t>(M) * N);
+                const float up_cos = cosineSim(fused_up->data(), separate_up->data(), static_cast<size_t>(M) * N);
+
+                LOG_INFO("[Dispatch] Fused INT8 blockwise Gate/Up cosine gate=" << gate_cos
+                                                                                  << " up=" << up_cos);
+                EXPECT_GT(gate_cos, 0.9999f);
+                EXPECT_GT(up_cos, 0.9999f);
+
+                gate_kernel.unbindWorkspace();
+                up_kernel.unbindWorkspace();
+            }
+
+            TEST_F(ROCmQuantisedGemmIntegrationTest, FusedDecode_Q8_0_BlockwiseGridKparBatch_MatchesSeparate)
+            {
+                if (!has_rocm_device_)
+                    GTEST_SKIP() << "No ROCm device available";
+
+                const int M = 1;
+                const int K = 896;
+                const int N = 512;
+
+                auto w0 = TestTensorFactory::createQ8_0Random({static_cast<size_t>(N), static_cast<size_t>(K)});
+                auto w1 = TestTensorFactory::createQ8_0Random({static_cast<size_t>(N), static_cast<size_t>(K)});
+
+                ROCmPackedWeights packed0;
+                ROCmPackedWeights packed1;
+                ASSERT_TRUE(packWeightsToROCm(w0.get(), packed0));
+                ASSERT_TRUE(packWeightsToROCm(w1.get(), packed1));
+
+                ROCmQuantisedGemmKernel kernel0(&packed0, 0);
+                ROCmQuantisedGemmKernel kernel1(&packed1, 0);
+                kernel0.setActivationQuantMode(ActivationQuantMode::BLOCKWISE);
+                kernel1.setActivationQuantMode(ActivationQuantMode::BLOCKWISE);
+
+                auto workspace0 = std::make_unique<DeviceWorkspaceManager>(DeviceId::rocm(0), 64 * 1024 * 1024);
+                auto workspace1 = std::make_unique<DeviceWorkspaceManager>(DeviceId::rocm(0), 64 * 1024 * 1024);
+                ASSERT_TRUE(workspace0->allocate(kernel0.getWorkspaceRequirements(M, N, K)));
+                ASSERT_TRUE(workspace1->allocate(kernel1.getWorkspaceRequirements(M, N, K)));
+                kernel0.bindWorkspace(workspace0.get());
+                kernel1.bindWorkspace(workspace1.get());
+
+                auto input = TestTensorFactory::createFP32Random({static_cast<size_t>(M), static_cast<size_t>(K)});
+                auto separate0 = TestTensorFactory::createFP32({static_cast<size_t>(M), static_cast<size_t>(N)});
+                auto separate1 = TestTensorFactory::createFP32({static_cast<size_t>(M), static_cast<size_t>(N)});
+                auto fused0 = TestTensorFactory::createFP32({static_cast<size_t>(M), static_cast<size_t>(N)});
+                auto fused1 = TestTensorFactory::createFP32({static_cast<size_t>(M), static_cast<size_t>(N)});
+                auto bias0 = TestTensorFactory::createFP32({static_cast<size_t>(N)});
+                auto bias1 = TestTensorFactory::createFP32({static_cast<size_t>(N)});
+
+                for (int col = 0; col < N; ++col)
+                {
+                    bias0->mutable_data()[col] = 0.015625f * static_cast<float>((col % 9) - 4);
+                    bias1->mutable_data()[col] = 0.015625f * static_cast<float>((col % 7) - 3);
+                }
+
+                ASSERT_TRUE(input->ensureOnDevice(DeviceId::rocm(0)));
+                ASSERT_TRUE(separate0->allocateOnDevice(DeviceId::rocm(0)));
+                ASSERT_TRUE(separate1->allocateOnDevice(DeviceId::rocm(0)));
+                ASSERT_TRUE(fused0->allocateOnDevice(DeviceId::rocm(0)));
+                ASSERT_TRUE(fused1->allocateOnDevice(DeviceId::rocm(0)));
+
+                ASSERT_TRUE(kernel0.multiply_tensor(input.get(), separate0.get(), M, N, K,
+                                                    true, 1.0f, 0.0f, bias0.get()));
+                ASSERT_TRUE(kernel1.multiply_tensor(input.get(), separate1.get(), M, N, K,
+                                                    true, 1.0f, 0.0f, bias1.get()));
+                ASSERT_EQ(hipDeviceSynchronize(), hipSuccess);
+                separate0->mark_device_dirty();
+                separate1->mark_device_dirty();
+
+                std::vector<ITensorGemm::TensorProjectionDesc> projections;
+                projections.emplace_back(&kernel0, fused0.get(), N, bias0.get(), nullptr, false, "proj0_q8_blockwise_gridkpar");
+                projections.emplace_back(&kernel1, fused1.get(), N, bias1.get(), nullptr, false, "proj1_q8_blockwise_gridkpar");
+
+                ASSERT_TRUE(kernel0.multiply_fused_tensor(input.get(), projections, M, K));
+                ASSERT_EQ(hipDeviceSynchronize(), hipSuccess);
+                fused0->mark_device_dirty();
+                fused1->mark_device_dirty();
+
+                const float cos0 = cosineSim(fused0->data(), separate0->data(), static_cast<size_t>(M) * N);
+                const float cos1 = cosineSim(fused1->data(), separate1->data(), static_cast<size_t>(M) * N);
+
+                LOG_INFO("[Dispatch] Fused INT8 blockwise grid_kpar pair cosine proj0=" << cos0
+                                                                                           << " proj1=" << cos1);
+                EXPECT_GT(cos0, 0.9999f);
+                EXPECT_GT(cos1, 0.9999f);
+
+                kernel0.unbindWorkspace();
+                kernel1.unbindWorkspace();
             }
 
             /**

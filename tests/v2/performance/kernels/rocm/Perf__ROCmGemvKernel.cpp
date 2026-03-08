@@ -46,6 +46,13 @@ extern "C"
         int M, int K,
         int rocm_device_id, void *stream);
 
+    bool rocmQuantGemm_quantizeActivationsBlockwise(
+        const float *d_A_fp32,
+        int8_t *d_A_int8,
+        float *d_scales_A_blockwise,
+        int M, int K,
+        int rocm_device_id, void *stream);
+
     bool rocmQuantGemm_applyScaling(
         const int32_t *d_C_int32,
         float *d_C_fp32,
@@ -82,6 +89,25 @@ extern "C"
         int kb);
 
     void rocmGemv_int8_vnni_reset_tuning_overrides();
+    void rocmGemv_int8_vnni_set_wk_override(int wk);
+    void rocmGemv_int8_vnni_set_unroll_override(int unroll);
+    void rocmGemv_int8_vnni_set_act_block_override(int act_bk);
+    void rocmGemv_int8_vnni_reset_qwo_overrides();
+    void rocmGemv_int8_vnni_set_skip_memset(int skip);
+    void rocmGemv_int8_vnni_set_force_pair(int force);
+    bool rocmGemv_int8_int8_fp32_vnni_blockwise_scaled_pair(
+        const int8_t* d_A_int8,
+        const float* d_scales_A_blockwise,
+        const int8_t* d_B0,
+        const int8_t* d_B1,
+        float* d_C0,
+        float* d_C1,
+        const float* d_scales_B0,
+        const float* d_scales_B1,
+        int N0, int N1,
+        int K,
+        float alpha,
+        int device_id, void* stream);
     void rocmGemv_int8_vnni_set_wide_tuning_overrides(
         int wide_tn,
         int wide_cpt,
@@ -122,6 +148,60 @@ extern "C"
         float alpha, float beta,
         const float *d_C_existing,
         int device_id, void *stream);
+
+    bool rocmGemv_int8_scatter_vnni_blockwise(
+        const int8_t *d_A_int8,
+        const int8_t *d_B_int8_vnni,
+        float *d_C_fp32,
+        const float *d_scales_A_blockwise,
+        const float *d_scales_B,
+        const float *d_bias,
+        float *d_partial_buf,
+        int N, int K,
+        float alpha, float beta,
+        const float *d_C_existing,
+        int device_id, void *stream);
+
+    bool rocmGemv_int8_int8_fp32_vnni_blockwise_scaled(
+        const int8_t *d_A_int8,
+        const int8_t *d_B_int8_vnni,
+        float *d_C_fp32,
+        const float *d_scales_A_blockwise,
+        const float *d_scale_B,
+        int N, int K,
+        float alpha,
+        float beta,
+        const float *d_C_existing,
+        const float *d_bias,
+        int device_id, void *stream);
+
+    bool rocmGemv_int8_int8_fp32_vnni_blockwise_scaled_batched(
+        const int8_t *d_A_int8,
+        const float *d_scales_A_blockwise,
+        int num_projections,
+        const int8_t *const *d_B_ptrs,
+        float *const *d_C_ptrs,
+        const float *const *d_scales_B_ptrs,
+        const float *const *d_bias_ptrs,
+        const int *N_per_proj,
+        int K,
+        float alpha,
+        float beta,
+        int device_id, void *stream);
+
+    bool rocmGemv_int8_scatter_batched_vnni_blockwise(
+        const int8_t *d_A_int8,
+        const float *d_scales_A_blockwise,
+        float *d_partial_buf,
+        int num_projections,
+        const int8_t *const *d_B_ptrs,
+        float *const *d_C_ptrs,
+        const float *const *d_scales_B_ptrs,
+        const float *const *d_bias_ptrs,
+        const int *N_per_proj,
+        int K,
+        float alpha, float beta,
+        int device_id, void *stream);
 }
 
 namespace
@@ -148,6 +228,9 @@ namespace
 
     static constexpr ModelDims kQwen7B = {
         "Qwen2.5-7B", 3584, 18944, 28, 4, 128, 152064, 28};
+
+    static constexpr ModelDims kQwen3B = {
+        "Qwen2.5-3B", 2048, 11008, 16, 2, 128, 151936, 36};
 
     // ============================================================================
     // Per-layer GEMV shapes for M=1 decode
@@ -205,6 +288,13 @@ namespace
         double scale_mean_ms;
         double scale_min_ms;
         bool success;
+    };
+
+    struct BatchedDecodeGroup
+    {
+        const char *name;
+        std::vector<int> Ns;
+        int K;
     };
 
     struct CorrectnessResult
@@ -567,6 +657,578 @@ namespace
                            + N * 4                        // FP32 scales
                            + N * 4;                       // FP32 output
             result.total.gbps = (bytes / (result.total.min_ms * 1e-3)) / 1e9;
+            result.total.success = true;
+            result.success = true;
+            return result;
+#endif
+        }
+
+        BenchSplitResult benchmarkGemvSplitBlockwise(
+            int N, int K,
+            int warmup_runs = 5,
+            int bench_runs = 20)
+        {
+            BenchSplitResult result{};
+#ifndef HAVE_ROCM
+            return result;
+#else
+            std::mt19937 rng(42);
+            std::uniform_real_distribution<float> dist_a(-1.0f, 1.0f);
+            std::uniform_int_distribution<int> dist_b(-127, 127);
+            std::uniform_real_distribution<float> dist_s(0.001f, 0.1f);
+
+            std::vector<float> h_A(K);
+            std::vector<int8_t> h_B(static_cast<size_t>(K) * N);
+            std::vector<int8_t> h_B_vnni;
+            std::vector<float> h_scale(N);
+
+            for (auto &v : h_A)
+                v = dist_a(rng);
+            for (auto &v : h_B)
+                v = static_cast<int8_t>(dist_b(rng));
+            for (auto &v : h_scale)
+                v = dist_s(rng);
+
+            packVnniWeights(h_B, N, K, h_B_vnni);
+
+            float *d_A = nullptr, *d_scale = nullptr, *d_C = nullptr;
+            int8_t *d_B_vnni = nullptr;
+            int8_t *d_A_int8 = nullptr;
+            float *d_scale_A_blockwise = nullptr;
+            float *d_partial = nullptr;
+
+            const int blocks_per_row = K / 32;
+            constexpr int MAX_KB = 64;
+
+            hipMalloc(&d_A, K * sizeof(float));
+            hipMalloc(&d_scale, N * sizeof(float));
+            hipMalloc(&d_C, N * sizeof(float));
+            hipMalloc(&d_A_int8, K * sizeof(int8_t));
+            hipMalloc(&d_scale_A_blockwise, blocks_per_row * sizeof(float));
+            hipMalloc(&d_partial, static_cast<size_t>(MAX_KB) * N * sizeof(float));
+            hipMalloc(&d_B_vnni, h_B_vnni.size() * sizeof(int8_t));
+
+            hipMemcpy(d_A, h_A.data(), K * sizeof(float), hipMemcpyHostToDevice);
+            hipMemcpy(d_B_vnni, h_B_vnni.data(), h_B_vnni.size() * sizeof(int8_t), hipMemcpyHostToDevice);
+            hipMemcpy(d_scale, h_scale.data(), N * sizeof(float), hipMemcpyHostToDevice);
+            hipDeviceSynchronize();
+
+            for (int i = 0; i < warmup_runs; ++i)
+            {
+                rocmQuantGemm_quantizeActivationsBlockwise(d_A, d_A_int8, d_scale_A_blockwise, 1, K, device_id_, nullptr);
+                bool ok = rocmGemv_int8_int8_fp32_vnni_blockwise_scaled(
+                    d_A_int8, d_B_vnni, d_C, d_scale_A_blockwise, d_scale,
+                    N, K, 1.0f, 0.0f, nullptr, nullptr, device_id_, nullptr);
+                if (!ok)
+                {
+                    rocmGemv_int8_scatter_vnni_blockwise(
+                        d_A_int8, d_B_vnni, d_C, d_scale_A_blockwise, d_scale, nullptr,
+                        d_partial, N, K, 1.0f, 0.0f, nullptr, device_id_, nullptr);
+                }
+            }
+            hipDeviceSynchronize();
+
+            std::vector<double> total_times;
+            std::vector<double> quant_times;
+            std::vector<double> gemv_times;
+
+            total_times.reserve(bench_runs);
+            quant_times.reserve(bench_runs);
+            gemv_times.reserve(bench_runs);
+
+            hipEvent_t total_start, total_stop;
+            hipEvent_t quant_start, quant_stop;
+            hipEvent_t gemv_start, gemv_stop;
+            hipEventCreate(&total_start);
+            hipEventCreate(&total_stop);
+            hipEventCreate(&quant_start);
+            hipEventCreate(&quant_stop);
+            hipEventCreate(&gemv_start);
+            hipEventCreate(&gemv_stop);
+
+            for (int i = 0; i < bench_runs; ++i)
+            {
+                hipDeviceSynchronize();
+                hipEventRecord(total_start, 0);
+
+                float quant_ms = 0.0f;
+                float gemv_ms = 0.0f;
+
+                hipEventRecord(quant_start, 0);
+                bool ok = rocmQuantGemm_quantizeActivationsBlockwise(
+                    d_A, d_A_int8, d_scale_A_blockwise, 1, K, device_id_, nullptr);
+                hipEventRecord(quant_stop, 0);
+                hipEventSynchronize(quant_stop);
+                hipEventElapsedTime(&quant_ms, quant_start, quant_stop);
+
+                if (ok)
+                {
+                    hipEventRecord(gemv_start, 0);
+                    ok = rocmGemv_int8_int8_fp32_vnni_blockwise_scaled(
+                        d_A_int8, d_B_vnni, d_C, d_scale_A_blockwise, d_scale,
+                        N, K, 1.0f, 0.0f, nullptr, nullptr, device_id_, nullptr);
+                    if (!ok)
+                    {
+                        ok = rocmGemv_int8_scatter_vnni_blockwise(
+                            d_A_int8, d_B_vnni, d_C, d_scale_A_blockwise, d_scale, nullptr,
+                            d_partial, N, K, 1.0f, 0.0f, nullptr, device_id_, nullptr);
+                    }
+                    hipEventRecord(gemv_stop, 0);
+                    hipEventSynchronize(gemv_stop);
+                    hipEventElapsedTime(&gemv_ms, gemv_start, gemv_stop);
+                }
+
+                hipEventRecord(total_stop, 0);
+                hipEventSynchronize(total_stop);
+                float total_ms = 0.0f;
+                hipEventElapsedTime(&total_ms, total_start, total_stop);
+
+                if (!ok)
+                {
+                    hipFree(d_A);
+                    hipFree(d_scale);
+                    hipFree(d_C);
+                    hipFree(d_B_vnni);
+                    hipFree(d_A_int8);
+                    hipFree(d_scale_A_blockwise);
+                    hipFree(d_partial);
+                    return result;
+                }
+
+                total_times.push_back(static_cast<double>(total_ms));
+                quant_times.push_back(static_cast<double>(quant_ms));
+                gemv_times.push_back(static_cast<double>(gemv_ms));
+            }
+
+            hipEventDestroy(total_start);
+            hipEventDestroy(total_stop);
+            hipEventDestroy(quant_start);
+            hipEventDestroy(quant_stop);
+            hipEventDestroy(gemv_start);
+            hipEventDestroy(gemv_stop);
+
+            hipFree(d_A);
+            hipFree(d_scale);
+            hipFree(d_C);
+            hipFree(d_B_vnni);
+            hipFree(d_A_int8);
+            hipFree(d_scale_A_blockwise);
+            hipFree(d_partial);
+
+            computeStats(total_times, result.total.mean_ms, result.total.min_ms,
+                         result.total.max_ms, result.total.stddev_ms);
+
+            double gemv_max_ms = 0.0;
+            double gemv_stddev_ms = 0.0;
+            computeStats(gemv_times, result.gemv_mean_ms, result.gemv_min_ms,
+                         gemv_max_ms, gemv_stddev_ms);
+
+            double quant_max_ms = 0.0;
+            double quant_stddev_ms = 0.0;
+            computeStats(quant_times, result.quant_mean_ms, result.quant_min_ms,
+                         quant_max_ms, quant_stddev_ms);
+
+            result.scale_mean_ms = 0.0;
+            result.scale_min_ms = 0.0;
+
+            double bytes = static_cast<double>(K) * N * 1 + K * 4 + N * 4 + N * 4;
+            result.total.gbps = (bytes / (result.total.min_ms * 1e-3)) / 1e9;
+            result.total.success = true;
+            result.success = true;
+            return result;
+#endif
+        }
+
+        BenchSplitResult benchmarkGemvSplitBlockwiseSharedQuantSeparate(
+            const std::vector<int> &Ns,
+            int K,
+            int warmup_runs = 5,
+            int bench_runs = 20)
+        {
+            BenchSplitResult result{};
+#ifndef HAVE_ROCM
+            return result;
+#else
+            if (Ns.empty())
+                return result;
+
+            std::mt19937 rng(42);
+            std::uniform_real_distribution<float> dist_a(-1.0f, 1.0f);
+            std::uniform_int_distribution<int> dist_b(-127, 127);
+            std::uniform_real_distribution<float> dist_s(0.001f, 0.1f);
+
+            std::vector<float> h_A(K);
+            for (auto &v : h_A)
+                v = dist_a(rng);
+
+            float *d_A = nullptr;
+            int8_t *d_A_int8 = nullptr;
+            float *d_scale_A_blockwise = nullptr;
+            float *d_partial = nullptr;
+
+            const int blocks_per_row = K / 32;
+            constexpr int MAX_KB = 64;
+            const int max_n = *std::max_element(Ns.begin(), Ns.end());
+            hipMalloc(&d_A, K * sizeof(float));
+            hipMalloc(&d_A_int8, K * sizeof(int8_t));
+            hipMalloc(&d_scale_A_blockwise, blocks_per_row * sizeof(float));
+            hipMalloc(&d_partial, static_cast<size_t>(MAX_KB) * max_n * sizeof(float));
+            hipMemcpy(d_A, h_A.data(), K * sizeof(float), hipMemcpyHostToDevice);
+
+            std::vector<int8_t *> d_B_vnni(Ns.size(), nullptr);
+            std::vector<float *> d_scale(Ns.size(), nullptr);
+            std::vector<float *> d_C(Ns.size(), nullptr);
+            std::vector<std::vector<int8_t>> h_B_vnni(Ns.size());
+
+            for (size_t i = 0; i < Ns.size(); ++i)
+            {
+                std::vector<int8_t> h_B(static_cast<size_t>(K) * Ns[i]);
+                std::vector<float> h_scale(Ns[i]);
+                for (auto &v : h_B)
+                    v = static_cast<int8_t>(dist_b(rng));
+                for (auto &v : h_scale)
+                    v = dist_s(rng);
+
+                packVnniWeights(h_B, Ns[i], K, h_B_vnni[i]);
+                hipMalloc(&d_B_vnni[i], h_B_vnni[i].size() * sizeof(int8_t));
+                hipMalloc(&d_scale[i], Ns[i] * sizeof(float));
+                hipMalloc(&d_C[i], Ns[i] * sizeof(float));
+                hipMemcpy(d_B_vnni[i], h_B_vnni[i].data(), h_B_vnni[i].size() * sizeof(int8_t), hipMemcpyHostToDevice);
+                hipMemcpy(d_scale[i], h_scale.data(), Ns[i] * sizeof(float), hipMemcpyHostToDevice);
+            }
+
+            hipDeviceSynchronize();
+
+            for (int i = 0; i < warmup_runs; ++i)
+            {
+                rocmQuantGemm_quantizeActivationsBlockwise(d_A, d_A_int8, d_scale_A_blockwise, 1, K, device_id_, nullptr);
+                for (size_t proj = 0; proj < Ns.size(); ++proj)
+                {
+                    bool ok = rocmGemv_int8_int8_fp32_vnni_blockwise_scaled(
+                        d_A_int8, d_B_vnni[proj], d_C[proj], d_scale_A_blockwise, d_scale[proj],
+                        Ns[proj], K, 1.0f, 0.0f, nullptr, nullptr, device_id_, nullptr);
+                    if (!ok)
+                    {
+                        ok = rocmGemv_int8_scatter_vnni_blockwise(
+                            d_A_int8, d_B_vnni[proj], d_C[proj], d_scale_A_blockwise, d_scale[proj], nullptr,
+                            d_partial, Ns[proj], K, 1.0f, 0.0f, nullptr, device_id_, nullptr);
+                    }
+                    if (!ok)
+                    {
+                        result.success = false;
+                        return result;
+                    }
+                }
+            }
+            hipDeviceSynchronize();
+
+            std::vector<double> total_times;
+            std::vector<double> quant_times;
+            std::vector<double> gemv_times;
+            total_times.reserve(bench_runs);
+            quant_times.reserve(bench_runs);
+            gemv_times.reserve(bench_runs);
+
+            hipEvent_t total_start, total_stop;
+            hipEvent_t quant_start, quant_stop;
+            hipEvent_t gemv_start, gemv_stop;
+            hipEventCreate(&total_start);
+            hipEventCreate(&total_stop);
+            hipEventCreate(&quant_start);
+            hipEventCreate(&quant_stop);
+            hipEventCreate(&gemv_start);
+            hipEventCreate(&gemv_stop);
+
+            for (int i = 0; i < bench_runs; ++i)
+            {
+                hipDeviceSynchronize();
+                hipEventRecord(total_start, 0);
+
+                hipEventRecord(quant_start, 0);
+                bool ok = rocmQuantGemm_quantizeActivationsBlockwise(d_A, d_A_int8, d_scale_A_blockwise, 1, K, device_id_, nullptr);
+                hipEventRecord(quant_stop, 0);
+                hipEventSynchronize(quant_stop);
+                float quant_ms = 0.0f;
+                hipEventElapsedTime(&quant_ms, quant_start, quant_stop);
+
+                float gemv_ms = 0.0f;
+                if (ok)
+                {
+                    hipEventRecord(gemv_start, 0);
+                    for (size_t proj = 0; proj < Ns.size(); ++proj)
+                    {
+                        ok = rocmGemv_int8_int8_fp32_vnni_blockwise_scaled(
+                            d_A_int8, d_B_vnni[proj], d_C[proj], d_scale_A_blockwise, d_scale[proj],
+                            Ns[proj], K, 1.0f, 0.0f, nullptr, nullptr, device_id_, nullptr);
+                        if (!ok)
+                        {
+                            ok = rocmGemv_int8_scatter_vnni_blockwise(
+                                d_A_int8, d_B_vnni[proj], d_C[proj], d_scale_A_blockwise, d_scale[proj], nullptr,
+                                d_partial, Ns[proj], K, 1.0f, 0.0f, nullptr, device_id_, nullptr);
+                        }
+                        if (!ok)
+                            break;
+                    }
+                    hipEventRecord(gemv_stop, 0);
+                    hipEventSynchronize(gemv_stop);
+                    hipEventElapsedTime(&gemv_ms, gemv_start, gemv_stop);
+                }
+
+                hipEventRecord(total_stop, 0);
+                hipEventSynchronize(total_stop);
+                float total_ms = 0.0f;
+                hipEventElapsedTime(&total_ms, total_start, total_stop);
+
+                if (!ok)
+                {
+                    result.success = false;
+                    return result;
+                }
+
+                total_times.push_back(static_cast<double>(total_ms));
+                quant_times.push_back(static_cast<double>(quant_ms));
+                gemv_times.push_back(static_cast<double>(gemv_ms));
+            }
+
+            hipEventDestroy(total_start);
+            hipEventDestroy(total_stop);
+            hipEventDestroy(quant_start);
+            hipEventDestroy(quant_stop);
+            hipEventDestroy(gemv_start);
+            hipEventDestroy(gemv_stop);
+
+            hipFree(d_A);
+            hipFree(d_A_int8);
+            hipFree(d_scale_A_blockwise);
+            hipFree(d_partial);
+            for (size_t i = 0; i < Ns.size(); ++i)
+            {
+                hipFree(d_B_vnni[i]);
+                hipFree(d_scale[i]);
+                hipFree(d_C[i]);
+            }
+
+            computeStats(total_times, result.total.mean_ms, result.total.min_ms,
+                         result.total.max_ms, result.total.stddev_ms);
+
+            double gemv_max_ms = 0.0;
+            double gemv_stddev_ms = 0.0;
+            computeStats(gemv_times, result.gemv_mean_ms, result.gemv_min_ms,
+                         gemv_max_ms, gemv_stddev_ms);
+
+            double quant_max_ms = 0.0;
+            double quant_stddev_ms = 0.0;
+            computeStats(quant_times, result.quant_mean_ms, result.quant_min_ms,
+                         quant_max_ms, quant_stddev_ms);
+
+            result.scale_mean_ms = 0.0;
+            result.scale_min_ms = 0.0;
+
+            double total_bytes = K * 4.0;
+            for (int N : Ns)
+                total_bytes += static_cast<double>(K) * N + N * 4.0 + N * 4.0;
+            result.total.gbps = (total_bytes / (result.total.min_ms * 1e-3)) / 1e9;
+            result.total.success = true;
+            result.success = true;
+            return result;
+#endif
+        }
+
+        BenchSplitResult benchmarkGemvSplitBlockwiseBatched(
+            const std::vector<int> &Ns,
+            int K,
+            int warmup_runs = 5,
+            int bench_runs = 20)
+        {
+            BenchSplitResult result{};
+#ifndef HAVE_ROCM
+            return result;
+#else
+            if (Ns.empty() || Ns.size() > 8)
+                return result;
+
+            std::mt19937 rng(42);
+            std::uniform_real_distribution<float> dist_a(-1.0f, 1.0f);
+            std::uniform_int_distribution<int> dist_b(-127, 127);
+            std::uniform_real_distribution<float> dist_s(0.001f, 0.1f);
+
+            std::vector<float> h_A(K);
+            for (auto &v : h_A)
+                v = dist_a(rng);
+
+            float *d_A = nullptr;
+            int8_t *d_A_int8 = nullptr;
+            float *d_scale_A_blockwise = nullptr;
+            float *d_partial = nullptr;
+            const int blocks_per_row = K / 32;
+            constexpr int MAX_KB = 64;
+            const int max_n = *std::max_element(Ns.begin(), Ns.end());
+            hipMalloc(&d_A, K * sizeof(float));
+            hipMalloc(&d_A_int8, K * sizeof(int8_t));
+            hipMalloc(&d_scale_A_blockwise, blocks_per_row * sizeof(float));
+            hipMalloc(&d_partial, static_cast<size_t>(MAX_KB) * max_n * sizeof(float));
+            hipMemcpy(d_A, h_A.data(), K * sizeof(float), hipMemcpyHostToDevice);
+
+            std::vector<int8_t *> d_B_vnni(Ns.size(), nullptr);
+            std::vector<float *> d_scale(Ns.size(), nullptr);
+            std::vector<float *> d_C(Ns.size(), nullptr);
+            std::vector<std::vector<int8_t>> h_B_vnni(Ns.size());
+
+            for (size_t i = 0; i < Ns.size(); ++i)
+            {
+                std::vector<int8_t> h_B(static_cast<size_t>(K) * Ns[i]);
+                std::vector<float> h_scale(Ns[i]);
+                for (auto &v : h_B)
+                    v = static_cast<int8_t>(dist_b(rng));
+                for (auto &v : h_scale)
+                    v = dist_s(rng);
+
+                packVnniWeights(h_B, Ns[i], K, h_B_vnni[i]);
+                hipMalloc(&d_B_vnni[i], h_B_vnni[i].size() * sizeof(int8_t));
+                hipMalloc(&d_scale[i], Ns[i] * sizeof(float));
+                hipMalloc(&d_C[i], Ns[i] * sizeof(float));
+                hipMemcpy(d_B_vnni[i], h_B_vnni[i].data(), h_B_vnni[i].size() * sizeof(int8_t), hipMemcpyHostToDevice);
+                hipMemcpy(d_scale[i], h_scale.data(), Ns[i] * sizeof(float), hipMemcpyHostToDevice);
+            }
+
+            std::vector<const int8_t *> d_B_ptrs(Ns.size());
+            std::vector<float *> d_C_ptrs(Ns.size());
+            std::vector<const float *> d_scale_ptrs(Ns.size());
+            std::vector<const float *> d_bias_ptrs(Ns.size(), nullptr);
+            for (size_t i = 0; i < Ns.size(); ++i)
+            {
+                d_B_ptrs[i] = d_B_vnni[i];
+                d_C_ptrs[i] = d_C[i];
+                d_scale_ptrs[i] = d_scale[i];
+            }
+
+            hipDeviceSynchronize();
+
+            for (int i = 0; i < warmup_runs; ++i)
+            {
+                rocmQuantGemm_quantizeActivationsBlockwise(d_A, d_A_int8, d_scale_A_blockwise, 1, K, device_id_, nullptr);
+                bool ok = rocmGemv_int8_int8_fp32_vnni_blockwise_scaled_batched(
+                    d_A_int8, d_scale_A_blockwise, static_cast<int>(Ns.size()),
+                    d_B_ptrs.data(), d_C_ptrs.data(), d_scale_ptrs.data(), d_bias_ptrs.data(), Ns.data(),
+                    K, 1.0f, 0.0f, device_id_, nullptr);
+                if (!ok)
+                {
+                    ok = rocmGemv_int8_scatter_batched_vnni_blockwise(
+                        d_A_int8, d_scale_A_blockwise, d_partial, static_cast<int>(Ns.size()),
+                        d_B_ptrs.data(), d_C_ptrs.data(), d_scale_ptrs.data(), d_bias_ptrs.data(), Ns.data(),
+                        K, 1.0f, 0.0f, device_id_, nullptr);
+                }
+                if (!ok)
+                {
+                    result.success = false;
+                    return result;
+                }
+            }
+            hipDeviceSynchronize();
+
+            std::vector<double> total_times;
+            std::vector<double> quant_times;
+            std::vector<double> gemv_times;
+            total_times.reserve(bench_runs);
+            quant_times.reserve(bench_runs);
+            gemv_times.reserve(bench_runs);
+
+            hipEvent_t total_start, total_stop;
+            hipEvent_t quant_start, quant_stop;
+            hipEvent_t gemv_start, gemv_stop;
+            hipEventCreate(&total_start);
+            hipEventCreate(&total_stop);
+            hipEventCreate(&quant_start);
+            hipEventCreate(&quant_stop);
+            hipEventCreate(&gemv_start);
+            hipEventCreate(&gemv_stop);
+
+            for (int i = 0; i < bench_runs; ++i)
+            {
+                hipDeviceSynchronize();
+                hipEventRecord(total_start, 0);
+
+                hipEventRecord(quant_start, 0);
+                bool ok = rocmQuantGemm_quantizeActivationsBlockwise(d_A, d_A_int8, d_scale_A_blockwise, 1, K, device_id_, nullptr);
+                hipEventRecord(quant_stop, 0);
+                hipEventSynchronize(quant_stop);
+                float quant_ms = 0.0f;
+                hipEventElapsedTime(&quant_ms, quant_start, quant_stop);
+
+                float gemv_ms = 0.0f;
+                if (ok)
+                {
+                    hipEventRecord(gemv_start, 0);
+                    ok = rocmGemv_int8_int8_fp32_vnni_blockwise_scaled_batched(
+                        d_A_int8, d_scale_A_blockwise, static_cast<int>(Ns.size()),
+                        d_B_ptrs.data(), d_C_ptrs.data(), d_scale_ptrs.data(), d_bias_ptrs.data(), Ns.data(),
+                        K, 1.0f, 0.0f, device_id_, nullptr);
+                    if (!ok)
+                    {
+                        ok = rocmGemv_int8_scatter_batched_vnni_blockwise(
+                            d_A_int8, d_scale_A_blockwise, d_partial, static_cast<int>(Ns.size()),
+                            d_B_ptrs.data(), d_C_ptrs.data(), d_scale_ptrs.data(), d_bias_ptrs.data(), Ns.data(),
+                            K, 1.0f, 0.0f, device_id_, nullptr);
+                    }
+                    hipEventRecord(gemv_stop, 0);
+                    hipEventSynchronize(gemv_stop);
+                    hipEventElapsedTime(&gemv_ms, gemv_start, gemv_stop);
+                }
+
+                hipEventRecord(total_stop, 0);
+                hipEventSynchronize(total_stop);
+                float total_ms = 0.0f;
+                hipEventElapsedTime(&total_ms, total_start, total_stop);
+
+                if (!ok)
+                {
+                    result.success = false;
+                    return result;
+                }
+
+                total_times.push_back(static_cast<double>(total_ms));
+                quant_times.push_back(static_cast<double>(quant_ms));
+                gemv_times.push_back(static_cast<double>(gemv_ms));
+            }
+
+            hipEventDestroy(total_start);
+            hipEventDestroy(total_stop);
+            hipEventDestroy(quant_start);
+            hipEventDestroy(quant_stop);
+            hipEventDestroy(gemv_start);
+            hipEventDestroy(gemv_stop);
+
+            hipFree(d_A);
+            hipFree(d_A_int8);
+            hipFree(d_scale_A_blockwise);
+            hipFree(d_partial);
+            for (size_t i = 0; i < Ns.size(); ++i)
+            {
+                hipFree(d_B_vnni[i]);
+                hipFree(d_scale[i]);
+                hipFree(d_C[i]);
+            }
+
+            computeStats(total_times, result.total.mean_ms, result.total.min_ms,
+                         result.total.max_ms, result.total.stddev_ms);
+
+            double gemv_max_ms = 0.0;
+            double gemv_stddev_ms = 0.0;
+            computeStats(gemv_times, result.gemv_mean_ms, result.gemv_min_ms,
+                         gemv_max_ms, gemv_stddev_ms);
+
+            double quant_max_ms = 0.0;
+            double quant_stddev_ms = 0.0;
+            computeStats(quant_times, result.quant_mean_ms, result.quant_min_ms,
+                         quant_max_ms, quant_stddev_ms);
+
+            result.scale_mean_ms = 0.0;
+            result.scale_min_ms = 0.0;
+
+            double total_bytes = K * 4.0;
+            for (int N : Ns)
+                total_bytes += static_cast<double>(K) * N + N * 4.0 + N * 4.0;
+            result.total.gbps = (total_bytes / (result.total.min_ms * 1e-3)) / 1e9;
             result.total.success = true;
             result.success = true;
             return result;
@@ -1875,6 +2537,334 @@ namespace
 #endif
     }
 
+    TEST_F(ROCmGemvPerfTest, Benchmark_INT8VNNI_Blockwise_AllShapes)
+    {
+#ifndef HAVE_ROCM
+        GTEST_SKIP() << "No ROCm support";
+#else
+        if (!has_device_)
+            GTEST_SKIP() << "No ROCm device";
+
+        const char *run_sweep = std::getenv("LLAMINAR_RUN_INT8_BLOCKWISE_ALLSHAPES");
+        if (!run_sweep || std::string(run_sweep) != "1")
+        {
+            GTEST_SKIP() << "Set LLAMINAR_RUN_INT8_BLOCKWISE_ALLSHAPES=1 to run";
+        }
+
+        fprintf(stderr, "\nDevice: %s\n", device_name_.c_str());
+
+        const std::vector<const ModelDims *> models = {&kQwen05B, &kQwen3B, &kQwen7B};
+        const double HBM2_PEAK_GBPS = 1000.0;
+
+        for (const ModelDims *model : models)
+        {
+            fort::utf8_table table;
+            table.set_border_style(FT_DOUBLE2_STYLE);
+            table << fort::header
+                  << "Shape" << "N" << "K" << "Row GEMV(ms)" << "Block GEMV(ms)" << "Block BW(GB/s)" << "%Peak" << "Speedup"
+                  << fort::endr;
+            table.column(0).set_cell_text_align(fort::text_align::left);
+            for (int i = 1; i < 8; ++i)
+                table.column(i).set_cell_text_align(fort::text_align::right);
+
+            auto shapes = getDecodeShapes(*model);
+            shapes.push_back(getLMHeadShape(*model));
+
+            for (const auto &shape : shapes)
+            {
+                const auto rowwise = benchmarkGemvSplit(shape.N, shape.K, 3, 10);
+                const auto blockwise = benchmarkGemvSplitBlockwise(shape.N, shape.K, 3, 10);
+                ASSERT_TRUE(rowwise.success) << shape.name;
+                ASSERT_TRUE(blockwise.success) << shape.name;
+
+                const double weight_mb = static_cast<double>(shape.N) * shape.K / 1e6;
+                const double bw = weight_mb / std::max(1e-9, blockwise.gemv_min_ms);
+                const double pct = (bw / HBM2_PEAK_GBPS) * 100.0;
+                const double speedup = rowwise.gemv_min_ms / std::max(1e-9, blockwise.gemv_min_ms);
+
+                char buf_bw[32], buf_pct[32], buf_spd[32];
+                snprintf(buf_bw, sizeof(buf_bw), "%.0f", bw);
+                snprintf(buf_pct, sizeof(buf_pct), "%.1f%%", pct);
+                snprintf(buf_spd, sizeof(buf_spd), "%.3f", speedup);
+
+                table << shape.name
+                      << shape.N
+                      << shape.K
+                      << formatMs(rowwise.gemv_min_ms)
+                      << formatMs(blockwise.gemv_min_ms)
+                      << buf_bw
+                      << buf_pct
+                      << buf_spd
+                      << fort::endr;
+            }
+
+            fprintf(stderr, "\nINT8 blockwise decode shapes for %s\n%s\n", model->name, table.to_string().c_str());
+        }
+#endif
+    }
+
+    TEST_F(ROCmGemvPerfTest, Benchmark_INT8VNNI_Blockwise_BatchedDecodeGroups)
+    {
+#ifndef HAVE_ROCM
+        GTEST_SKIP() << "No ROCm support";
+#else
+        if (!has_device_)
+            GTEST_SKIP() << "No ROCm device";
+
+        const char *run_sweep = std::getenv("LLAMINAR_RUN_INT8_BLOCKWISE_BATCHED");
+        if (!run_sweep || std::string(run_sweep) != "1")
+        {
+            GTEST_SKIP() << "Set LLAMINAR_RUN_INT8_BLOCKWISE_BATCHED=1 to run";
+        }
+
+        fprintf(stderr, "\nDevice: %s\n", device_name_.c_str());
+
+        const std::vector<BatchedDecodeGroup> groups = {
+            {"0.5B QKV", {kQwen05B.hidden, kQwen05B.num_kv_heads * kQwen05B.head_dim, kQwen05B.num_kv_heads * kQwen05B.head_dim}, kQwen05B.hidden},
+            {"0.5B GateUp", {kQwen05B.intermediate, kQwen05B.intermediate}, kQwen05B.hidden},
+            {"3B QKV", {kQwen3B.hidden, kQwen3B.num_kv_heads * kQwen3B.head_dim, kQwen3B.num_kv_heads * kQwen3B.head_dim}, kQwen3B.hidden},
+            {"3B GateUp", {kQwen3B.intermediate, kQwen3B.intermediate}, kQwen3B.hidden},
+            {"7B QKV", {kQwen7B.hidden, kQwen7B.num_kv_heads * kQwen7B.head_dim, kQwen7B.num_kv_heads * kQwen7B.head_dim}, kQwen7B.hidden},
+            {"7B GateUp", {kQwen7B.intermediate, kQwen7B.intermediate}, kQwen7B.hidden},
+        };
+
+        fort::utf8_table table;
+        table.set_border_style(FT_DOUBLE2_STYLE);
+        table << fort::header
+              << "Group" << "K" << "Total N" << "Separate quant(ms)" << "Separate gemv(ms)"
+              << "Batched quant(ms)" << "Batched gemv(ms)" << "GEMV speedup" << fort::endr;
+        table.column(0).set_cell_text_align(fort::text_align::left);
+        for (int i = 1; i < 8; ++i)
+            table.column(i).set_cell_text_align(fort::text_align::right);
+
+        for (const auto &group : groups)
+        {
+            const auto separate = benchmarkGemvSplitBlockwiseSharedQuantSeparate(group.Ns, group.K, 3, 10);
+            const auto batched = benchmarkGemvSplitBlockwiseBatched(group.Ns, group.K, 3, 10);
+            ASSERT_TRUE(separate.success) << group.name;
+            ASSERT_TRUE(batched.success) << group.name;
+
+            int total_n = 0;
+            for (int n : group.Ns)
+                total_n += n;
+
+            char spd[32];
+            snprintf(spd, sizeof(spd), "%.3f", separate.gemv_min_ms / std::max(1e-9, batched.gemv_min_ms));
+
+            table << group.name
+                  << group.K
+                  << total_n
+                  << formatMs(separate.quant_min_ms)
+                  << formatMs(separate.gemv_min_ms)
+                  << formatMs(batched.quant_min_ms)
+                  << formatMs(batched.gemv_min_ms)
+                  << spd
+                  << fort::endr;
+        }
+
+        fprintf(stderr, "\nINT8 blockwise batched decode groups\n%s\n", table.to_string().c_str());
+#endif
+    }
+
+    TEST_F(ROCmGemvPerfTest, Benchmark_INT8VNNI_Blockwise_BatchedDecodeQkvBreakdown)
+    {
+#ifndef HAVE_ROCM
+        GTEST_SKIP() << "No ROCm support";
+#else
+        if (!has_device_)
+            GTEST_SKIP() << "No ROCm device";
+
+        const char *run_sweep = std::getenv("LLAMINAR_RUN_INT8_BLOCKWISE_BATCHED");
+        if (!run_sweep || std::string(run_sweep) != "1")
+        {
+            GTEST_SKIP() << "Set LLAMINAR_RUN_INT8_BLOCKWISE_BATCHED=1 to run";
+        }
+
+        const std::vector<BatchedDecodeGroup> groups = {
+            {"7B Q only", {kQwen7B.hidden}, kQwen7B.hidden},
+            {"7B KV pair", {kQwen7B.num_kv_heads * kQwen7B.head_dim, kQwen7B.num_kv_heads * kQwen7B.head_dim}, kQwen7B.hidden},
+            {"7B full QKV", {kQwen7B.hidden, kQwen7B.num_kv_heads * kQwen7B.head_dim, kQwen7B.num_kv_heads * kQwen7B.head_dim}, kQwen7B.hidden},
+        };
+
+        fort::utf8_table table;
+        table.set_border_style(FT_DOUBLE2_STYLE);
+        table << fort::header
+              << "Group" << "K" << "Total N" << "Separate gemv(ms)" << "Batched gemv(ms)" << "GEMV speedup" << fort::endr;
+        table.column(0).set_cell_text_align(fort::text_align::left);
+        for (int i = 1; i < 6; ++i)
+            table.column(i).set_cell_text_align(fort::text_align::right);
+
+        for (const auto &group : groups)
+        {
+            const auto separate = benchmarkGemvSplitBlockwiseSharedQuantSeparate(group.Ns, group.K, 3, 10);
+            const auto batched = benchmarkGemvSplitBlockwiseBatched(group.Ns, group.K, 3, 10);
+            ASSERT_TRUE(separate.success) << group.name;
+            ASSERT_TRUE(batched.success) << group.name;
+
+            int total_n = 0;
+            for (int n : group.Ns)
+                total_n += n;
+
+            char spd[32];
+            snprintf(spd, sizeof(spd), "%.3f", separate.gemv_min_ms / std::max(1e-9, batched.gemv_min_ms));
+
+            table << group.name
+                  << group.K
+                  << total_n
+                  << formatMs(separate.gemv_min_ms)
+                  << formatMs(batched.gemv_min_ms)
+                  << spd
+                  << fort::endr;
+        }
+
+        fprintf(stderr, "\nINT8 blockwise QKV breakdown\n%s\n", table.to_string().c_str());
+#endif
+    }
+
+    TEST_F(ROCmGemvPerfTest, Benchmark_INT8VNNI_Blockwise_KVPairFixed)
+    {
+#ifndef HAVE_ROCM
+        GTEST_SKIP() << "No ROCm support";
+#else
+        if (!has_device_)
+            GTEST_SKIP() << "No ROCm device";
+
+        const char *run_sweep = std::getenv("LLAMINAR_RUN_INT8_BLOCKWISE_BATCHED");
+        if (!run_sweep || std::string(run_sweep) != "1")
+        {
+            GTEST_SKIP() << "Set LLAMINAR_RUN_INT8_BLOCKWISE_BATCHED=1 to run";
+        }
+
+        const std::vector<int> Ns = {
+            kQwen7B.num_kv_heads * kQwen7B.head_dim,
+            kQwen7B.num_kv_heads * kQwen7B.head_dim,
+        };
+        const int K = kQwen7B.hidden;
+
+        const auto separate = benchmarkGemvSplitBlockwiseSharedQuantSeparate(Ns, K, 3, 20);
+        const auto batched = benchmarkGemvSplitBlockwiseBatched(Ns, K, 3, 20);
+        ASSERT_TRUE(separate.success);
+        ASSERT_TRUE(batched.success);
+
+        fort::utf8_table table;
+        table.set_border_style(FT_DOUBLE2_STYLE);
+        table << fort::header
+              << "Case" << "K" << "Total N" << "Separate gemv(ms)" << "Batched gemv(ms)" << "GEMV speedup" << fort::endr;
+        table.column(0).set_cell_text_align(fort::text_align::left);
+        for (int i = 1; i < 6; ++i)
+            table.column(i).set_cell_text_align(fort::text_align::right);
+
+        char spd[32];
+        snprintf(spd, sizeof(spd), "%.3f", separate.gemv_min_ms / std::max(1e-9, batched.gemv_min_ms));
+
+        table << "7B KV pair"
+              << K
+              << (Ns[0] + Ns[1])
+              << formatMs(separate.gemv_min_ms)
+              << formatMs(batched.gemv_min_ms)
+              << spd
+              << fort::endr;
+
+        fprintf(stderr, "\nINT8 blockwise fixed KV pair\n%s\n", table.to_string().c_str());
+#endif
+    }
+
+    TEST_F(ROCmGemvPerfTest, Benchmark_INT8VNNI_Blockwise_EqualPairShapeGrid)
+    {
+#ifndef HAVE_ROCM
+        GTEST_SKIP() << "No ROCm support";
+#else
+        if (!has_device_)
+            GTEST_SKIP() << "No ROCm device";
+
+        const char *run_sweep = std::getenv("LLAMINAR_RUN_INT8_BLOCKWISE_BATCHED");
+        if (!run_sweep || std::string(run_sweep) != "1")
+        {
+            GTEST_SKIP() << "Set LLAMINAR_RUN_INT8_BLOCKWISE_BATCHED=1 to run";
+        }
+
+        const std::vector<int> n_values = {128, 256, 512};
+        const std::vector<int> k_values = {896, 2048, 3584, 5120, 8192};
+
+        fort::utf8_table table;
+        table.set_border_style(FT_DOUBLE2_STYLE);
+        table << fort::header
+              << "Pair N" << "K" << "Separate gemv(ms)" << "Batched gemv(ms)" << "Batched speedup" << fort::endr;
+        for (int i = 0; i < 5; ++i)
+            table.column(i).set_cell_text_align(fort::text_align::right);
+
+        for (const int n : n_values)
+        {
+            for (const int k : k_values)
+            {
+                const std::vector<int> ns = {n, n};
+                const auto separate = benchmarkGemvSplitBlockwiseSharedQuantSeparate(ns, k, 3, 10);
+                const auto batched = benchmarkGemvSplitBlockwiseBatched(ns, k, 3, 10);
+                ASSERT_TRUE(separate.success) << "N=" << n << " K=" << k;
+                ASSERT_TRUE(batched.success) << "N=" << n << " K=" << k;
+
+                char spd[32];
+                snprintf(spd, sizeof(spd), "%.3f", separate.gemv_min_ms / std::max(1e-9, batched.gemv_min_ms));
+
+                table << n
+                      << k
+                      << formatMs(separate.gemv_min_ms)
+                      << formatMs(batched.gemv_min_ms)
+                      << spd
+                      << fort::endr;
+            }
+        }
+
+        fprintf(stderr, "\nINT8 blockwise equal-pair shape grid\n%s\n", table.to_string().c_str());
+#endif
+    }
+
+    TEST_F(ROCmGemvPerfTest, Benchmark_INT8VNNI_Blockwise_SingleKVFixed)
+    {
+#ifndef HAVE_ROCM
+        GTEST_SKIP() << "No ROCm support";
+#else
+        if (!has_device_)
+            GTEST_SKIP() << "No ROCm device";
+
+        const char *run_sweep = std::getenv("LLAMINAR_RUN_INT8_BLOCKWISE_ALLSHAPES");
+        if (!run_sweep || std::string(run_sweep) != "1")
+        {
+            GTEST_SKIP() << "Set LLAMINAR_RUN_INT8_BLOCKWISE_ALLSHAPES=1 to run";
+        }
+
+        const int N = kQwen7B.num_kv_heads * kQwen7B.head_dim;
+        const int K = kQwen7B.hidden;
+
+        rocmGemv_int8_vnni_reset_tuning_overrides();
+        const auto rowwise = benchmarkGemvSplit(N, K, 5, 20);
+        const auto blockwise = benchmarkGemvSplitBlockwise(N, K, 5, 20);
+        ASSERT_TRUE(rowwise.success);
+        ASSERT_TRUE(blockwise.success);
+
+        fort::utf8_table table;
+        table.set_border_style(FT_DOUBLE2_STYLE);
+        table << fort::header
+              << "Shape" << "N" << "K" << "Row GEMV(ms)" << "Block GEMV(ms)" << "Speedup" << fort::endr;
+        table.column(0).set_cell_text_align(fort::text_align::left);
+        for (int i = 1; i < 6; ++i)
+            table.column(i).set_cell_text_align(fort::text_align::right);
+
+        char spd[32];
+        snprintf(spd, sizeof(spd), "%.3f", rowwise.gemv_min_ms / std::max(1e-9, blockwise.gemv_min_ms));
+
+        table << "7B single KV"
+              << N
+              << K
+              << formatMs(rowwise.gemv_min_ms)
+              << formatMs(blockwise.gemv_min_ms)
+              << spd
+              << fort::endr;
+
+        fprintf(stderr, "\nINT8 blockwise single KV fixed\n%s\n", table.to_string().c_str());
+#endif
+    }
+
     TEST_F(ROCmGemvPerfTest, Benchmark_INT8VNNI_QWo_AutoSweep)
     {
 #ifndef HAVE_ROCM
@@ -1950,6 +2940,247 @@ namespace
         fprintf(stderr, "\nINT8 Q/Wo autosweep (N=%d, K=%d)\n%s\n", N, K, table.to_string().c_str());
 #endif
     }
+
+    TEST_F(ROCmGemvPerfTest, Benchmark_INT8VNNI_Blockwise_QWo_AutoSweep)
+    {
+#ifndef HAVE_ROCM
+        GTEST_SKIP() << "No ROCm support";
+#else
+        if (!has_device_)
+            GTEST_SKIP() << "No ROCm device";
+
+        const char *run_sweep = std::getenv("LLAMINAR_RUN_INT8_BLOCKWISE_ALLSHAPES");
+        if (!run_sweep || std::string(run_sweep) != "1")
+        {
+            GTEST_SKIP() << "Set LLAMINAR_RUN_INT8_BLOCKWISE_ALLSHAPES=1 to run INT8 blockwise Q/Wo autosweep";
+        }
+
+        fprintf(stderr, "\nDevice: %s\n", device_name_.c_str());
+
+        const int N = kQwen7B.hidden;
+        const int K = kQwen7B.hidden;
+
+        // Sweep: TN × WK × Unroll × KB × ACT_BK
+        const std::vector<int> tn_candidates = {128, 256};
+        const std::vector<int> wk_candidates = {2, 3, 4, 6, 8};
+        const std::vector<int> unroll_candidates = {1, 2};  // 2 = 2x act_block unroll (TN=256 only)
+        const std::vector<int> kb_candidates = {6, 8, 10, 12, 14};
+        const std::vector<int> act_bk_candidates = {32, 64, 128};
+
+        rocmGemv_int8_vnni_reset_tuning_overrides();
+        rocmGemv_int8_vnni_reset_qwo_overrides();
+        const auto baseline = benchmarkGemvSplitBlockwise(N, K, 5, 20);
+        ASSERT_TRUE(baseline.success);
+
+        fort::utf8_table table;
+        table.set_border_style(FT_DOUBLE2_STYLE);
+        table << fort::header
+              << "TN" << "WK" << "Unroll" << "KB" << "ACT_BK" << "GEMV min(ms)" << "Total min(ms)" << "GEMV speedup"
+              << fort::endr;
+
+        for (int i = 0; i < 8; ++i)
+            table.column(i).set_cell_text_align(fort::text_align::right);
+
+        double best_gemv_min = std::numeric_limits<double>::max();
+        int best_tn = -1, best_wk = -1, best_unroll = -1, best_kb = -1, best_act_bk = -1;
+
+        for (const int act_bk : act_bk_candidates)
+        {
+            for (const int tn : tn_candidates)
+            {
+                // ACT_BK > 32 only implemented for TN=128/unroll=2 path
+                if (act_bk > 32 && tn != 128) continue;
+
+                for (const int wk : wk_candidates)
+                {
+                    for (const int unroll : unroll_candidates)
+                    {
+                        // ACT_BK > 32 only implemented for unroll=2
+                        if (act_bk > 32 && unroll != 2) continue;
+
+                        for (const int kb : kb_candidates)
+                        {
+                            rocmGemv_int8_vnni_set_tuning_overrides(tn, kb);
+                            rocmGemv_int8_vnni_set_wk_override(wk);
+                            rocmGemv_int8_vnni_set_unroll_override(unroll);
+                            rocmGemv_int8_vnni_set_act_block_override(act_bk);
+
+                            const auto r = benchmarkGemvSplitBlockwise(N, K, 3, 15);
+                            ASSERT_TRUE(r.success);
+
+                            const double speedup = baseline.gemv_min_ms / std::max(1e-9, r.gemv_min_ms);
+                            table << tn << wk << unroll << kb << act_bk
+                                  << formatMs(r.gemv_min_ms)
+                                  << formatMs(r.total.min_ms)
+                                  << formatMs(speedup)
+                                  << fort::endr;
+
+                            if (r.gemv_min_ms < best_gemv_min)
+                            {
+                                best_gemv_min = r.gemv_min_ms;
+                                best_tn = tn;
+                                best_wk = wk;
+                                best_unroll = unroll;
+                                best_kb = kb;
+                                best_act_bk = act_bk;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        rocmGemv_int8_vnni_reset_tuning_overrides();
+        rocmGemv_int8_vnni_reset_qwo_overrides();
+
+        const double best_speedup = baseline.gemv_min_ms / std::max(1e-9, best_gemv_min);
+        fprintf(stderr, "\nINT8 blockwise Q/Wo baseline GEMV min: %.6f ms\n", baseline.gemv_min_ms);
+        fprintf(stderr, "INT8 blockwise Q/Wo best config: TN=%d WK=%d Unroll=%d KB=%d ACT_BK=%d GEMV min=%.6f ms speedup=%.4fx\n",
+                best_tn, best_wk, best_unroll, best_kb, best_act_bk, best_gemv_min, best_speedup);
+        fprintf(stderr, "\nINT8 blockwise Q/Wo autosweep (N=%d, K=%d)\n%s\n", N, K, table.to_string().c_str());
+#endif
+    }
+
+    TEST_F(ROCmGemvPerfTest, Benchmark_INT8VNNI_Blockwise_GenericKVPair_AutoSweep)
+    {
+#ifndef HAVE_ROCM
+        GTEST_SKIP() << "No ROCm support";
+#else
+        if (!has_device_)
+            GTEST_SKIP() << "No ROCm device";
+
+        const char *run_sweep = std::getenv("LLAMINAR_RUN_INT8_BLOCKWISE_BATCHED");
+        if (!run_sweep || std::string(run_sweep) != "1")
+        {
+            GTEST_SKIP() << "Set LLAMINAR_RUN_INT8_BLOCKWISE_BATCHED=1 to run";
+        }
+
+        const std::vector<int> Ns = {kQwen7B.num_kv_heads * kQwen7B.head_dim,
+                                     kQwen7B.num_kv_heads * kQwen7B.head_dim};
+        const int K = kQwen7B.hidden;
+        const std::vector<int> tn_candidates = {128, 256};
+        const std::vector<int> kb_candidates = {1, 2, 4, 7, 14};
+
+        fort::utf8_table table;
+        table.set_border_style(FT_DOUBLE2_STYLE);
+        table << fort::header
+              << "TN" << "KB" << "Separate gemv(ms)" << "Batched gemv(ms)" << "Batched speedup" << fort::endr;
+        for (int i = 0; i < 5; ++i)
+            table.column(i).set_cell_text_align(fort::text_align::right);
+
+        double best_batched = std::numeric_limits<double>::max();
+        int best_tn = -1;
+        int best_kb = -1;
+
+        rocmGemv_int8_vnni_reset_tuning_overrides();
+
+        for (const int tn : tn_candidates)
+        {
+            for (const int kb : kb_candidates)
+            {
+                rocmGemv_int8_vnni_set_tuning_overrides(tn, kb);
+                const auto separate = benchmarkGemvSplitBlockwiseSharedQuantSeparate(Ns, K, 3, 10);
+                const auto batched = benchmarkGemvSplitBlockwiseBatched(Ns, K, 3, 10);
+                ASSERT_TRUE(separate.success) << "tn=" << tn << " kb=" << kb;
+                ASSERT_TRUE(batched.success) << "tn=" << tn << " kb=" << kb;
+
+                const double speedup = separate.gemv_min_ms / std::max(1e-9, batched.gemv_min_ms);
+                table << tn
+                      << kb
+                      << formatMs(separate.gemv_min_ms)
+                      << formatMs(batched.gemv_min_ms)
+                      << formatMs(speedup)
+                      << fort::endr;
+
+                if (batched.gemv_min_ms < best_batched)
+                {
+                    best_batched = batched.gemv_min_ms;
+                    best_tn = tn;
+                    best_kb = kb;
+                }
+            }
+        }
+
+        rocmGemv_int8_vnni_reset_tuning_overrides();
+
+        fprintf(stderr,
+                "\nINT8 blockwise generic KV-pair autosweep best: TN=%d KB=%d batched gemv=%.6f ms\n",
+                best_tn, best_kb, best_batched);
+        fprintf(stderr, "\nINT8 blockwise generic KV-pair autosweep\n%s\n", table.to_string().c_str());
+#endif
+    }
+
+    TEST_F(ROCmGemvPerfTest, Benchmark_INT8VNNI_Blockwise_SingleKV_AutoSweep)
+    {
+#ifndef HAVE_ROCM
+        GTEST_SKIP() << "No ROCm support";
+#else
+        if (!has_device_)
+            GTEST_SKIP() << "No ROCm device";
+
+        const char *run_sweep = std::getenv("LLAMINAR_RUN_INT8_BLOCKWISE_ALLSHAPES");
+        if (!run_sweep || std::string(run_sweep) != "1")
+        {
+            GTEST_SKIP() << "Set LLAMINAR_RUN_INT8_BLOCKWISE_ALLSHAPES=1 to run";
+        }
+
+        fprintf(stderr, "\nDevice: %s\n", device_name_.c_str());
+
+        const int N = kQwen7B.num_kv_heads * kQwen7B.head_dim;
+        const int K = kQwen7B.hidden;
+        const std::vector<int> tn_candidates = {128, 256};
+        const std::vector<int> kb_candidates = {1, 2, 4, 7, 14, 16, 28, 56};
+
+        rocmGemv_int8_vnni_reset_tuning_overrides();
+        const auto baseline = benchmarkGemvSplitBlockwise(N, K, 5, 20);
+        ASSERT_TRUE(baseline.success);
+
+        fort::utf8_table table;
+        table.set_border_style(FT_DOUBLE2_STYLE);
+        table << fort::header
+              << "TN" << "KB" << "Quant min(ms)" << "GEMV min(ms)" << "Total min(ms)" << "GEMV speedup" << fort::endr;
+        for (int i = 0; i < 6; ++i)
+            table.column(i).set_cell_text_align(fort::text_align::right);
+
+        double best_gemv_min = std::numeric_limits<double>::max();
+        int best_tn = -1;
+        int best_kb = -1;
+
+        for (const int tn : tn_candidates)
+        {
+            for (const int kb : kb_candidates)
+            {
+                rocmGemv_int8_vnni_set_tuning_overrides(tn, kb);
+                const auto r = benchmarkGemvSplitBlockwise(N, K, 3, 15);
+                ASSERT_TRUE(r.success);
+
+                const double speedup = baseline.gemv_min_ms / std::max(1e-9, r.gemv_min_ms);
+                table << tn
+                      << kb
+                      << formatMs(r.quant_min_ms)
+                      << formatMs(r.gemv_min_ms)
+                      << formatMs(r.total.min_ms)
+                      << formatMs(speedup)
+                      << fort::endr;
+
+                if (r.gemv_min_ms < best_gemv_min)
+                {
+                    best_gemv_min = r.gemv_min_ms;
+                    best_tn = tn;
+                    best_kb = kb;
+                }
+            }
+        }
+
+        rocmGemv_int8_vnni_reset_tuning_overrides();
+
+        const double best_speedup = baseline.gemv_min_ms / std::max(1e-9, best_gemv_min);
+        fprintf(stderr, "\nINT8 blockwise single KV baseline GEMV min: %.6f ms\n", baseline.gemv_min_ms);
+        fprintf(stderr, "INT8 blockwise single KV best config: TN=%d KB=%d GEMV min=%.6f ms speedup=%.4fx\n", best_tn, best_kb, best_gemv_min, best_speedup);
+        fprintf(stderr, "\nINT8 blockwise single KV autosweep (N=%d, K=%d)\n%s\n", N, K, table.to_string().c_str());
+#endif
+    }
+
     TEST_F(ROCmGemvPerfTest, Benchmark_INT8VNNI_LMHead_AutoSweep)
     {
 #ifndef HAVE_ROCM
@@ -2033,6 +3264,625 @@ namespace
         fprintf(stderr, "INT8 LM Head best config: TN=%d CPT=%d VecLoad=%s GEMV min=%.6f ms speedup=%.4fx\n",
                 best_tn, best_cpt, best_vec_load ? "on" : "off", best_gemv_min, best_speedup);
         fprintf(stderr, "\nINT8 LM Head autosweep (N=%d, K=%d)\n%s\n", N, K, table.to_string().c_str());
+#endif
+    }
+
+    // ============================================================================
+    // TEST: K/V proj targeted KB+WK sweep
+    // ============================================================================
+
+    TEST_F(ROCmGemvPerfTest, Benchmark_INT8VNNI_Blockwise_KVProj_KBSweep)
+    {
+#ifndef HAVE_ROCM
+        GTEST_SKIP() << "No ROCm support";
+#else
+        if (!has_device_)
+            GTEST_SKIP() << "No ROCm device";
+
+        const char *run_sweep = std::getenv("LLAMINAR_RUN_INT8_BLOCKWISE_ALLSHAPES");
+        if (!run_sweep || std::string(run_sweep) != "1")
+        {
+            GTEST_SKIP() << "Set LLAMINAR_RUN_INT8_BLOCKWISE_ALLSHAPES=1 to run";
+        }
+
+        fprintf(stderr, "\nDevice: %s\n", device_name_.c_str());
+
+        struct KVShape { const char* name; int N; int K; };
+        std::vector<KVShape> shapes = {
+            {"3B K proj", kQwen3B.num_kv_heads * kQwen3B.head_dim, kQwen3B.hidden},
+            {"3B V proj", kQwen3B.num_kv_heads * kQwen3B.head_dim, kQwen3B.hidden},
+            {"7B K proj", kQwen7B.num_kv_heads * kQwen7B.head_dim, kQwen7B.hidden},
+            {"7B V proj", kQwen7B.num_kv_heads * kQwen7B.head_dim, kQwen7B.hidden},
+        };
+
+        const std::vector<int> kb_candidates = {1, 2, 4, 7, 8, 14, 16, 28, 56, 112};
+        const std::vector<int> wk_candidates = {2, 4, 8};
+
+        for (const auto& shape : shapes)
+        {
+            rocmGemv_int8_vnni_reset_tuning_overrides();
+            rocmGemv_int8_vnni_reset_qwo_overrides();
+
+            const auto rowwise = benchmarkGemvSplit(shape.N, shape.K, 5, 20);
+            ASSERT_TRUE(rowwise.success);
+
+            const auto blockwise_default = benchmarkGemvSplitBlockwise(shape.N, shape.K, 5, 20);
+            ASSERT_TRUE(blockwise_default.success);
+
+            fort::utf8_table table;
+            table.set_border_style(FT_DOUBLE2_STYLE);
+            table << fort::header
+                  << "WK" << "KB" << "Waves" << "Acts/Wv" << "Quant(ms)" << "GEMV(ms)" << "Total(ms)"
+                  << "vs Row" << fort::endr;
+            for (int i = 0; i < 8; ++i)
+                table.column(i).set_cell_text_align(fort::text_align::right);
+
+            double best_gemv = std::numeric_limits<double>::max();
+            int best_wk = -1, best_kb = -1;
+            const int grid_n = (shape.N + 127) / 128;
+            const int act_blocks = shape.K / 32;
+
+            for (const int wk : wk_candidates)
+            {
+                for (const int kb : kb_candidates)
+                {
+                    if (kb > act_blocks) continue;
+                    const int total_waves = grid_n * wk * kb;
+                    const double acts_per_wave = static_cast<double>(act_blocks) / (wk * kb);
+
+                    rocmGemv_int8_vnni_set_tuning_overrides(128, kb);
+                    rocmGemv_int8_vnni_set_wk_override(wk);
+
+                    const auto r = benchmarkGemvSplitBlockwise(shape.N, shape.K, 3, 15);
+                    ASSERT_TRUE(r.success);
+
+                    const double vs_row = rowwise.gemv_min_ms / std::max(1e-9, r.gemv_min_ms);
+
+                    char buf_waves[16], buf_apw[16];
+                    snprintf(buf_waves, sizeof(buf_waves), "%d", total_waves);
+                    snprintf(buf_apw, sizeof(buf_apw), "%.1f", acts_per_wave);
+
+                    table << wk << kb << buf_waves << buf_apw
+                          << formatMs(r.quant_min_ms)
+                          << formatMs(r.gemv_min_ms)
+                          << formatMs(r.total.min_ms)
+                          << formatMs(vs_row)
+                          << fort::endr;
+
+                    if (r.gemv_min_ms < best_gemv)
+                    {
+                        best_gemv = r.gemv_min_ms;
+                        best_wk = wk;
+                        best_kb = kb;
+                    }
+                }
+            }
+
+            rocmGemv_int8_vnni_reset_tuning_overrides();
+            rocmGemv_int8_vnni_reset_qwo_overrides();
+
+            const double best_vs_row = rowwise.gemv_min_ms / std::max(1e-9, best_gemv);
+            fprintf(stderr, "\n%s (N=%d, K=%d)\n", shape.name, shape.N, shape.K);
+            fprintf(stderr, "  Row-wise baseline: %.6f ms\n", rowwise.gemv_min_ms);
+            fprintf(stderr, "  Block-wise default: %.6f ms (%.3fx row)\n",
+                    blockwise_default.gemv_min_ms,
+                    rowwise.gemv_min_ms / std::max(1e-9, blockwise_default.gemv_min_ms));
+            fprintf(stderr, "  Best: WK=%d KB=%d GEMV=%.6f ms (%.3fx row)\n",
+                    best_wk, best_kb, best_gemv, best_vs_row);
+            fprintf(stderr, "%s\n", table.to_string().c_str());
+
+            // --- Memset overhead measurement ---
+            // Run default heuristic with memset skipped to measure its overhead
+            rocmGemv_int8_vnni_reset_tuning_overrides();
+            rocmGemv_int8_vnni_reset_qwo_overrides();
+            rocmGemv_int8_vnni_set_skip_memset(1);
+            const auto no_memset = benchmarkGemvSplitBlockwise(shape.N, shape.K, 5, 30);
+            rocmGemv_int8_vnni_set_skip_memset(0);
+            ASSERT_TRUE(no_memset.success);
+
+            const double memset_cost = blockwise_default.gemv_min_ms - no_memset.gemv_min_ms;
+            const double no_memset_parity = rowwise.gemv_min_ms / std::max(1e-9, no_memset.gemv_min_ms);
+            fprintf(stderr, "  Without memset: %.6f ms (%.3fx row) → memset overhead: %.3f us\n",
+                    no_memset.gemv_min_ms, no_memset_parity, memset_cost * 1000.0);
+        }
+#endif
+    }
+
+    // ============================================================================
+    // TEST: FFN Down targeted KB+WK sweep
+    // ============================================================================
+
+    TEST_F(ROCmGemvPerfTest, Benchmark_INT8VNNI_Blockwise_FFNDown_KBSweep)
+    {
+#ifndef HAVE_ROCM
+        GTEST_SKIP() << "No ROCm support";
+#else
+        if (!has_device_)
+            GTEST_SKIP() << "No ROCm device";
+
+        const char *run_sweep = std::getenv("LLAMINAR_RUN_INT8_BLOCKWISE_ALLSHAPES");
+        if (!run_sweep || std::string(run_sweep) != "1")
+        {
+            GTEST_SKIP() << "Set LLAMINAR_RUN_INT8_BLOCKWISE_ALLSHAPES=1 to run";
+        }
+
+        fprintf(stderr, "\nDevice: %s\n", device_name_.c_str());
+
+        struct FFNDownShape { const char* name; int N; int K; };
+        std::vector<FFNDownShape> shapes = {
+            {"3B FFN Down", kQwen3B.hidden, kQwen3B.intermediate},
+            {"7B FFN Down", kQwen7B.hidden, kQwen7B.intermediate},
+        };
+
+        const std::vector<int> kb_candidates = {1, 2, 4, 7, 10, 14, 20, 30, 40, 50, 74};
+        const std::vector<int> wk_candidates = {4, 6, 8};
+
+        for (const auto& shape : shapes)
+        {
+            rocmGemv_int8_vnni_reset_tuning_overrides();
+            rocmGemv_int8_vnni_reset_qwo_overrides();
+
+            // Rowwise baseline
+            const auto rowwise = benchmarkGemvSplit(shape.N, shape.K, 5, 20);
+            ASSERT_TRUE(rowwise.success);
+
+            // Blockwise default
+            const auto blockwise_default = benchmarkGemvSplitBlockwise(shape.N, shape.K, 5, 20);
+            ASSERT_TRUE(blockwise_default.success);
+
+            fort::utf8_table table;
+            table.set_border_style(FT_DOUBLE2_STYLE);
+            table << fort::header
+                  << "WK" << "KB" << "Quant(ms)" << "GEMV(ms)" << "Total(ms)"
+                  << "vs Row" << "vs Default" << "BW(GB/s)" << fort::endr;
+            for (int i = 0; i < 8; ++i)
+                table.column(i).set_cell_text_align(fort::text_align::right);
+
+            double best_gemv = std::numeric_limits<double>::max();
+            int best_wk = -1, best_kb = -1;
+
+            for (const int wk : wk_candidates)
+            {
+                for (const int kb : kb_candidates)
+                {
+                    rocmGemv_int8_vnni_set_tuning_overrides(128, kb);
+                    rocmGemv_int8_vnni_set_wk_override(wk);
+
+                    const auto r = benchmarkGemvSplitBlockwise(shape.N, shape.K, 3, 15);
+                    ASSERT_TRUE(r.success);
+
+                    const double vs_row = rowwise.gemv_min_ms / std::max(1e-9, r.gemv_min_ms);
+                    const double vs_def = blockwise_default.gemv_min_ms / std::max(1e-9, r.gemv_min_ms);
+                    const double bw = (static_cast<double>(shape.N) * shape.K) / (r.gemv_min_ms * 1e-3) / 1e9;
+
+                    table << wk << kb
+                          << formatMs(r.quant_min_ms)
+                          << formatMs(r.gemv_min_ms)
+                          << formatMs(r.total.min_ms)
+                          << formatMs(vs_row)
+                          << formatMs(vs_def)
+                          << formatMs(bw)
+                          << fort::endr;
+
+                    if (r.gemv_min_ms < best_gemv)
+                    {
+                        best_gemv = r.gemv_min_ms;
+                        best_wk = wk;
+                        best_kb = kb;
+                    }
+                }
+            }
+
+            rocmGemv_int8_vnni_reset_tuning_overrides();
+            rocmGemv_int8_vnni_reset_qwo_overrides();
+
+            const double best_vs_row = rowwise.gemv_min_ms / std::max(1e-9, best_gemv);
+            fprintf(stderr, "\n%s (N=%d, K=%d)\n", shape.name, shape.N, shape.K);
+            fprintf(stderr, "  Row-wise baseline: %.6f ms\n", rowwise.gemv_min_ms);
+            fprintf(stderr, "  Block-wise default: %.6f ms (%.3fx row)\n",
+                    blockwise_default.gemv_min_ms,
+                    rowwise.gemv_min_ms / std::max(1e-9, blockwise_default.gemv_min_ms));
+            fprintf(stderr, "  Best: WK=%d KB=%d GEMV=%.6f ms (%.3fx row)\n",
+                    best_wk, best_kb, best_gemv, best_vs_row);
+            fprintf(stderr, "%s\n", table.to_string().c_str());
+        }
+#endif
+    }
+
+    // ============================================================================
+    // TEST: K+V batched pair experiment
+    //
+    // Compares three approaches for dispatching K and V projections:
+    //   1. 2× individual GEMV calls (serial, same stream) — current production
+    //   2. 1× batched API (currently splits to 2 singles internally)
+    //   3. 1× batched API with force_pair (uses grid_kpar_pair kernel)
+    //   4. 2× individual GEMV on separate HIP streams (concurrent test)
+    // ============================================================================
+
+    TEST_F(ROCmGemvPerfTest, Benchmark_INT8VNNI_Blockwise_KVPairBatching)
+    {
+#ifndef HAVE_ROCM
+        GTEST_SKIP() << "No ROCm support";
+#else
+        if (!has_device_)
+            GTEST_SKIP() << "No ROCm device";
+
+        const char *run_sweep = std::getenv("LLAMINAR_RUN_INT8_BLOCKWISE_ALLSHAPES");
+        if (!run_sweep || std::string(run_sweep) != "1")
+        {
+            GTEST_SKIP() << "Set LLAMINAR_RUN_INT8_BLOCKWISE_ALLSHAPES=1 to run";
+        }
+
+        fprintf(stderr, "\nDevice: %s\n", device_name_.c_str());
+
+        struct KVShape { const char* name; int N; int K; };
+        std::vector<KVShape> shapes = {
+            {"3B K/V", kQwen3B.num_kv_heads * kQwen3B.head_dim, kQwen3B.hidden},
+            {"7B K/V", kQwen7B.num_kv_heads * kQwen7B.head_dim, kQwen7B.hidden},
+        };
+
+        constexpr int WARMUP = 5;
+        constexpr int BENCH = 30;
+
+        for (const auto& shape : shapes)
+        {
+            const int N = shape.N;
+            const int K = shape.K;
+
+            rocmGemv_int8_vnni_reset_tuning_overrides();
+            rocmGemv_int8_vnni_reset_qwo_overrides();
+
+            // --- Allocate: shared A, separate B_k/B_v/C_k/C_v ---
+            std::mt19937 rng(42);
+            std::uniform_real_distribution<float> dist_a(-1.0f, 1.0f);
+            std::uniform_int_distribution<int> dist_b(-127, 127);
+            std::uniform_real_distribution<float> dist_s(0.001f, 0.1f);
+
+            std::vector<float> h_A(K);
+            for (auto &v : h_A) v = dist_a(rng);
+
+            auto make_projection = [&](int proj_N) {
+                struct ProjData {
+                    std::vector<int8_t> h_B_vnni;
+                    std::vector<float> h_scale;
+                    int8_t* d_B = nullptr;
+                    float* d_scale = nullptr;
+                    float* d_C = nullptr;
+                };
+                ProjData p;
+                std::vector<int8_t> h_B(static_cast<size_t>(K) * proj_N);
+                p.h_scale.resize(proj_N);
+                for (auto &v : h_B) v = static_cast<int8_t>(dist_b(rng));
+                for (auto &v : p.h_scale) v = dist_s(rng);
+                packVnniWeights(h_B, proj_N, K, p.h_B_vnni);
+                hipMalloc(&p.d_B, p.h_B_vnni.size() * sizeof(int8_t));
+                hipMalloc(&p.d_scale, proj_N * sizeof(float));
+                hipMalloc(&p.d_C, proj_N * sizeof(float));
+                hipMemcpy(p.d_B, p.h_B_vnni.data(), p.h_B_vnni.size() * sizeof(int8_t), hipMemcpyHostToDevice);
+                hipMemcpy(p.d_scale, p.h_scale.data(), proj_N * sizeof(float), hipMemcpyHostToDevice);
+                return p;
+            };
+
+            auto proj_k = make_projection(N);
+            auto proj_v = make_projection(N);
+
+            float *d_A = nullptr;
+            int8_t *d_A_int8 = nullptr;
+            float *d_scale_A_bw = nullptr;
+            const int blocks_per_row = K / 32;
+
+            hipMalloc(&d_A, K * sizeof(float));
+            hipMalloc(&d_A_int8, K * sizeof(int8_t));
+            hipMalloc(&d_scale_A_bw, blocks_per_row * sizeof(float));
+            hipMemcpy(d_A, h_A.data(), K * sizeof(float), hipMemcpyHostToDevice);
+            hipDeviceSynchronize();
+
+            // Quantize activations once
+            rocmQuantGemm_quantizeActivationsBlockwise(d_A, d_A_int8, d_scale_A_bw, 1, K, device_id_, nullptr);
+            hipDeviceSynchronize();
+
+            // Create HIP events and second stream
+            hipEvent_t ev_start, ev_stop, ev_mid;
+            hipEventCreate(&ev_start);
+            hipEventCreate(&ev_stop);
+            hipEventCreate(&ev_mid);
+            hipStream_t stream2 = nullptr;
+            hipStreamCreate(&stream2);
+
+            // Batched API arrays
+            const int8_t* d_B_ptrs[2] = { proj_k.d_B, proj_v.d_B };
+            float* d_C_ptrs[2] = { proj_k.d_C, proj_v.d_C };
+            const float* d_scale_ptrs[2] = { proj_k.d_scale, proj_v.d_scale };
+            const float* d_bias_ptrs[2] = { nullptr, nullptr };
+            int N_per_proj[2] = { N, N };
+
+            // ---- Warmup all paths ----
+            for (int i = 0; i < WARMUP; ++i) {
+                rocmGemv_int8_int8_fp32_vnni_blockwise_scaled(
+                    d_A_int8, proj_k.d_B, proj_k.d_C, d_scale_A_bw, proj_k.d_scale,
+                    N, K, 1.0f, 0.0f, nullptr, nullptr, device_id_, nullptr);
+                rocmGemv_int8_int8_fp32_vnni_blockwise_scaled(
+                    d_A_int8, proj_v.d_B, proj_v.d_C, d_scale_A_bw, proj_v.d_scale,
+                    N, K, 1.0f, 0.0f, nullptr, nullptr, device_id_, nullptr);
+            }
+            hipDeviceSynchronize();
+
+            // ===== Approach 1: 2× serial on default stream =====
+            std::vector<double> serial_times;
+            serial_times.reserve(BENCH);
+            for (int i = 0; i < BENCH; ++i) {
+                hipDeviceSynchronize();
+                hipEventRecord(ev_start, 0);
+                rocmGemv_int8_int8_fp32_vnni_blockwise_scaled(
+                    d_A_int8, proj_k.d_B, proj_k.d_C, d_scale_A_bw, proj_k.d_scale,
+                    N, K, 1.0f, 0.0f, nullptr, nullptr, device_id_, nullptr);
+                rocmGemv_int8_int8_fp32_vnni_blockwise_scaled(
+                    d_A_int8, proj_v.d_B, proj_v.d_C, d_scale_A_bw, proj_v.d_scale,
+                    N, K, 1.0f, 0.0f, nullptr, nullptr, device_id_, nullptr);
+                hipEventRecord(ev_stop, 0);
+                hipEventSynchronize(ev_stop);
+                float ms = 0;
+                hipEventElapsedTime(&ms, ev_start, ev_stop);
+                serial_times.push_back(ms);
+            }
+
+            // ===== Approach 2: batched API (default — splits to 2 singles) =====
+            std::vector<double> batched_split_times;
+            batched_split_times.reserve(BENCH);
+            for (int i = 0; i < BENCH; ++i) {
+                hipDeviceSynchronize();
+                hipEventRecord(ev_start, 0);
+                rocmGemv_int8_int8_fp32_vnni_blockwise_scaled_batched(
+                    d_A_int8, d_scale_A_bw, 2,
+                    d_B_ptrs, d_C_ptrs, d_scale_ptrs, d_bias_ptrs, N_per_proj,
+                    K, 1.0f, 0.0f, device_id_, nullptr);
+                hipEventRecord(ev_stop, 0);
+                hipEventSynchronize(ev_stop);
+                float ms = 0;
+                hipEventElapsedTime(&ms, ev_start, ev_stop);
+                batched_split_times.push_back(ms);
+            }
+
+            // ===== Approach 3: batched API with force_pair (grid_kpar_pair kernel) =====
+            // Sweep KB values for the pair kernel
+            std::vector<int> pair_kb_values = {2, 4, 7, 8, 14};
+            struct PairResult { int kb; double min_ms; };
+            std::vector<PairResult> pair_results;
+
+            for (int kb : pair_kb_values) {
+                rocmGemv_int8_vnni_set_force_pair(1);
+                rocmGemv_int8_vnni_set_tuning_overrides(128, kb);
+
+                // Warmup
+                for (int i = 0; i < 3; ++i) {
+                    rocmGemv_int8_int8_fp32_vnni_blockwise_scaled_batched(
+                        d_A_int8, d_scale_A_bw, 2,
+                        d_B_ptrs, d_C_ptrs, d_scale_ptrs, d_bias_ptrs, N_per_proj,
+                        K, 1.0f, 0.0f, device_id_, nullptr);
+                }
+                hipDeviceSynchronize();
+
+                std::vector<double> times;
+                times.reserve(BENCH);
+                for (int i = 0; i < BENCH; ++i) {
+                    hipDeviceSynchronize();
+                    hipEventRecord(ev_start, 0);
+                    rocmGemv_int8_int8_fp32_vnni_blockwise_scaled_batched(
+                        d_A_int8, d_scale_A_bw, 2,
+                        d_B_ptrs, d_C_ptrs, d_scale_ptrs, d_bias_ptrs, N_per_proj,
+                        K, 1.0f, 0.0f, device_id_, nullptr);
+                    hipEventRecord(ev_stop, 0);
+                    hipEventSynchronize(ev_stop);
+                    float ms = 0;
+                    hipEventElapsedTime(&ms, ev_start, ev_stop);
+                    times.push_back(ms);
+                }
+                std::sort(times.begin(), times.end());
+                pair_results.push_back({kb, times[0]});
+
+                rocmGemv_int8_vnni_set_force_pair(0);
+                rocmGemv_int8_vnni_reset_tuning_overrides();
+                rocmGemv_int8_vnni_reset_qwo_overrides();
+            }
+
+            // ===== Approach 4: 2× on separate HIP streams (concurrent) =====
+            // Warmup on stream2
+            for (int i = 0; i < WARMUP; ++i) {
+                rocmGemv_int8_int8_fp32_vnni_blockwise_scaled(
+                    d_A_int8, proj_v.d_B, proj_v.d_C, d_scale_A_bw, proj_v.d_scale,
+                    N, K, 1.0f, 0.0f, nullptr, nullptr, device_id_, stream2);
+            }
+            hipStreamSynchronize(stream2);
+
+            std::vector<double> concurrent_times;
+            concurrent_times.reserve(BENCH);
+            for (int i = 0; i < BENCH; ++i) {
+                hipDeviceSynchronize();
+                hipEventRecord(ev_start, 0);
+                rocmGemv_int8_int8_fp32_vnni_blockwise_scaled(
+                    d_A_int8, proj_k.d_B, proj_k.d_C, d_scale_A_bw, proj_k.d_scale,
+                    N, K, 1.0f, 0.0f, nullptr, nullptr, device_id_, nullptr);
+                rocmGemv_int8_int8_fp32_vnni_blockwise_scaled(
+                    d_A_int8, proj_v.d_B, proj_v.d_C, d_scale_A_bw, proj_v.d_scale,
+                    N, K, 1.0f, 0.0f, nullptr, nullptr, device_id_, stream2);
+                hipStreamSynchronize(stream2);
+                hipEventRecord(ev_stop, 0);
+                hipEventSynchronize(ev_stop);
+                float ms = 0;
+                hipEventElapsedTime(&ms, ev_start, ev_stop);
+                concurrent_times.push_back(ms);
+            }
+
+            // ===== Approach 5: LDS K-reduce pair kernel =====
+            // Warmup
+            for (int i = 0; i < WARMUP; ++i) {
+                rocmGemv_int8_int8_fp32_vnni_blockwise_scaled_pair(
+                    d_A_int8, d_scale_A_bw,
+                    proj_k.d_B, proj_v.d_B,
+                    proj_k.d_C, proj_v.d_C,
+                    proj_k.d_scale, proj_v.d_scale,
+                    N, N, K, 1.0f, device_id_, nullptr);
+            }
+            hipDeviceSynchronize();
+
+            std::vector<double> lds_pair_times;
+            lds_pair_times.reserve(BENCH);
+            for (int i = 0; i < BENCH; ++i) {
+                hipDeviceSynchronize();
+                hipEventRecord(ev_start, 0);
+                rocmGemv_int8_int8_fp32_vnni_blockwise_scaled_pair(
+                    d_A_int8, d_scale_A_bw,
+                    proj_k.d_B, proj_v.d_B,
+                    proj_k.d_C, proj_v.d_C,
+                    proj_k.d_scale, proj_v.d_scale,
+                    N, N, K, 1.0f, device_id_, nullptr);
+                hipEventRecord(ev_stop, 0);
+                hipEventSynchronize(ev_stop);
+                float ms = 0;
+                hipEventElapsedTime(&ms, ev_start, ev_stop);
+                lds_pair_times.push_back(ms);
+            }
+
+            // Also sweep KB for the lds pair kernel
+            std::vector<int> lds_pair_kb_values = {4, 7, 8, 14, 28};
+            struct LdsPairResult { int kb; double min_ms; };
+            std::vector<LdsPairResult> lds_pair_results;
+
+            for (int kb : lds_pair_kb_values) {
+                rocmGemv_int8_vnni_set_tuning_overrides(128, kb);
+
+                for (int i = 0; i < 3; ++i) {
+                    rocmGemv_int8_int8_fp32_vnni_blockwise_scaled_pair(
+                        d_A_int8, d_scale_A_bw,
+                        proj_k.d_B, proj_v.d_B,
+                        proj_k.d_C, proj_v.d_C,
+                        proj_k.d_scale, proj_v.d_scale,
+                        N, N, K, 1.0f, device_id_, nullptr);
+                }
+                hipDeviceSynchronize();
+
+                std::vector<double> times;
+                times.reserve(BENCH);
+                for (int i = 0; i < BENCH; ++i) {
+                    hipDeviceSynchronize();
+                    hipEventRecord(ev_start, 0);
+                    rocmGemv_int8_int8_fp32_vnni_blockwise_scaled_pair(
+                        d_A_int8, d_scale_A_bw,
+                        proj_k.d_B, proj_v.d_B,
+                        proj_k.d_C, proj_v.d_C,
+                        proj_k.d_scale, proj_v.d_scale,
+                        N, N, K, 1.0f, device_id_, nullptr);
+                    hipEventRecord(ev_stop, 0);
+                    hipEventSynchronize(ev_stop);
+                    float ms = 0;
+                    hipEventElapsedTime(&ms, ev_start, ev_stop);
+                    times.push_back(ms);
+                }
+                std::sort(times.begin(), times.end());
+                lds_pair_results.push_back({kb, times[0]});
+
+                rocmGemv_int8_vnni_reset_tuning_overrides();
+            }
+
+            // --- Compute stats ---
+            auto min_of = [](const std::vector<double>& v) {
+                return *std::min_element(v.begin(), v.end());
+            };
+            auto median_of = [](std::vector<double> v) {
+                std::sort(v.begin(), v.end());
+                return v[v.size() / 2];
+            };
+
+            const double serial_min = min_of(serial_times);
+            const double batched_split_min = min_of(batched_split_times);
+            const double concurrent_min = min_of(concurrent_times);
+            const double lds_pair_default_min = min_of(lds_pair_times);
+            const double serial_med = median_of(serial_times);
+            const double batched_split_med = median_of(batched_split_times);
+            const double concurrent_med = median_of(concurrent_times);
+            const double lds_pair_default_med = median_of(lds_pair_times);
+
+            // Rowwise baseline for parity context
+            const auto rowwise_single = benchmarkGemvSplit(N, K, 5, 20);
+
+            // Find best pair result (grid_kpar_pair)
+            double best_pair_min = std::numeric_limits<double>::max();
+            int best_pair_kb = -1;
+            for (const auto& pr : pair_results) {
+                if (pr.min_ms < best_pair_min) {
+                    best_pair_min = pr.min_ms;
+                    best_pair_kb = pr.kb;
+                }
+            }
+
+            // Find best lds pair result
+            double best_lds_pair_min = lds_pair_default_min;
+            int best_lds_pair_kb = -1;
+            for (const auto& pr : lds_pair_results) {
+                if (pr.min_ms < best_lds_pair_min) {
+                    best_lds_pair_min = pr.min_ms;
+                    best_lds_pair_kb = pr.kb;
+                }
+            }
+
+            // --- Print results ---
+            fprintf(stderr, "\n╔══════════════════════════════════════════════════════════════════╗\n");
+            fprintf(stderr, "║  %s  K+V Pair Batching Experiment (N=%d, K=%d)               \n", shape.name, N, K);
+            fprintf(stderr, "╠══════════════════════════════════════════════════════════════════╣\n");
+            fprintf(stderr, "║  rocBLAS single (K or V):    %.3f ms                             \n", rowwise_single.gemv_min_ms);
+            fprintf(stderr, "║  rocBLAS K+V serial (est):   %.3f ms                             \n", rowwise_single.gemv_min_ms * 2);
+            fprintf(stderr, "╠══════════════════════════════════════════════════════════════════╣\n");
+            fprintf(stderr, "║  Approach                       Min(ms)   Med(ms)  vs Serial    \n");
+            fprintf(stderr, "╠══════════════════════════════════════════════════════════════════╣\n");
+            fprintf(stderr, "║  1. 2×serial (baseline)         %.3f     %.3f     1.000x       \n", serial_min, serial_med);
+            fprintf(stderr, "║  2. batched(split-to-2)         %.3f     %.3f     %.3fx       \n",
+                    batched_split_min, batched_split_med, serial_min / std::max(1e-9, batched_split_min));
+            fprintf(stderr, "║  3. batched(force grid_kpar)    %.3f     %.3f     %.3fx  KB=%d\n",
+                    best_pair_min, best_pair_min, serial_min / std::max(1e-9, best_pair_min), best_pair_kb);
+            fprintf(stderr, "║  4. 2×concurrent streams        %.3f     %.3f     %.3fx       \n",
+                    concurrent_min, concurrent_med, serial_min / std::max(1e-9, concurrent_min));
+            fprintf(stderr, "║  5. LDS K-reduce pair (default) %.3f     %.3f     %.3fx       \n",
+                    lds_pair_default_min, lds_pair_default_med, serial_min / std::max(1e-9, lds_pair_default_min));
+            fprintf(stderr, "║  5. LDS K-reduce pair (best KB) %.3f     -         %.3fx  KB=%d\n",
+                    best_lds_pair_min, serial_min / std::max(1e-9, best_lds_pair_min), best_lds_pair_kb);
+            fprintf(stderr, "╠══════════════════════════════════════════════════════════════════╣\n");
+            fprintf(stderr, "║  K+V parity vs rocBLAS K+V:                                      \n");
+            fprintf(stderr, "║    Serial:     %.3fx                                             \n", (rowwise_single.gemv_min_ms * 2) / std::max(1e-9, serial_min));
+            fprintf(stderr, "║    Grid pair:  %.3fx                                             \n", (rowwise_single.gemv_min_ms * 2) / std::max(1e-9, best_pair_min));
+            fprintf(stderr, "║    LDS pair:   %.3fx                                             \n", (rowwise_single.gemv_min_ms * 2) / std::max(1e-9, best_lds_pair_min));
+            fprintf(stderr, "╚══════════════════════════════════════════════════════════════════╝\n");
+
+            // LDS pair KB sweep detail
+            fprintf(stderr, "\n  LDS K-reduce pair KB sweep:\n");
+            fprintf(stderr, "    default → %.3f ms (%.3fx vs serial)\n",
+                    lds_pair_default_min, serial_min / std::max(1e-9, lds_pair_default_min));
+            for (const auto& pr : lds_pair_results) {
+                fprintf(stderr, "    KB=%2d → %.3f ms (%.3fx vs serial)\n",
+                        pr.kb, pr.min_ms, serial_min / std::max(1e-9, pr.min_ms));
+            }
+
+            // Grid_kpar pair KB sweep detail
+            fprintf(stderr, "\n  Force grid_kpar pair KB sweep:\n");
+            for (const auto& pr : pair_results) {
+                fprintf(stderr, "    KB=%2d → %.3f ms (%.3fx vs serial)\n",
+                        pr.kb, pr.min_ms, serial_min / std::max(1e-9, pr.min_ms));
+            }
+
+            // Cleanup
+            hipStreamDestroy(stream2);
+            hipEventDestroy(ev_start);
+            hipEventDestroy(ev_stop);
+            hipEventDestroy(ev_mid);
+            hipFree(d_A);
+            hipFree(d_A_int8);
+            hipFree(d_scale_A_bw);
+            hipFree(proj_k.d_B);
+            hipFree(proj_k.d_scale);
+            hipFree(proj_k.d_C);
+            hipFree(proj_v.d_B);
+            hipFree(proj_v.d_scale);
+            hipFree(proj_v.d_C);
+        }
 #endif
     }
 

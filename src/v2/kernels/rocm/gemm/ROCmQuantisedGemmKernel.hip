@@ -161,17 +161,13 @@ __global__ void quantizeActivationsQ8_kernel_t(
     const int tid = threadIdx.x;
     const int block_size = blockDim.x;
 
-    // Shared memory for wavefront-level max merge.
-    // Largest launch uses 512 threads => 8 wave64 groups.
     __shared__ float s_wave_max[8];
     __shared__ float s_absmax;
 
     extern __shared__ float s_row[];
 
-    // Step 1: Find max absolute value in this row (parallel reduction)
     float local_max = 0.0f;
     const float *row_ptr = d_A_fp32 + static_cast<size_t>(row) * K;
-    const bool fp32_aligned16 = ((reinterpret_cast<uintptr_t>(row_ptr) & 0x0F) == 0);
 
     if constexpr (UseLdsRowStaging)
     {
@@ -182,7 +178,7 @@ __global__ void quantizeActivationsQ8_kernel_t(
         __syncthreads();
     }
 
-    const float* src_ptr = UseLdsRowStaging ? s_row : row_ptr;
+    const float *src_ptr = UseLdsRowStaging ? s_row : row_ptr;
     const int vec_len = NoTail ? K : ((K / 4) * 4);
     const bool src_aligned16 = ((reinterpret_cast<uintptr_t>(src_ptr) & 0x0F) == 0);
 
@@ -200,7 +196,8 @@ __global__ void quantizeActivationsQ8_kernel_t(
         {
             for (int k = vec_len + tid; k < K; k += block_size)
             {
-                local_max = fmaxf(local_max, fabsf(src_ptr[k]));
+                const float value = src_ptr[k];
+                local_max = fmaxf(local_max, fabsf(value));
             }
         }
     }
@@ -208,13 +205,11 @@ __global__ void quantizeActivationsQ8_kernel_t(
     {
         for (int k = tid; k < K; k += block_size)
         {
-            float val = src_ptr[k];
-            float abs_val = fabsf(val);
-            local_max = fmaxf(local_max, abs_val);
+            const float value = src_ptr[k];
+            local_max = fmaxf(local_max, fabsf(value));
         }
     }
 
-    // Wavefront reduction (wave64 on gfx906)
     const int lane = tid & 63;
     const int wave = tid >> 6;
     const int wave_count = block_size >> 6;
@@ -230,7 +225,6 @@ __global__ void quantizeActivationsQ8_kernel_t(
     }
     __syncthreads();
 
-    // First wave merges all per-wave maxima
     if (wave == 0)
     {
         float v = (tid < wave_count) ? s_wave_max[tid] : 0.0f;
@@ -246,17 +240,15 @@ __global__ void quantizeActivationsQ8_kernel_t(
     }
     __syncthreads();
 
-    // Step 2: Compute scale (thread 0 writes to global memory)
-    float max_abs = s_absmax;
-    float scale = (max_abs > 0.0f) ? (max_abs / 127.0f) : 1.0f;
-    float inv_scale = 1.0f / scale;
+    const float max_abs = s_absmax;
+    const float scale = (max_abs > 0.0f) ? (max_abs / 127.0f) : 1.0f;
+    const float inv_scale = 1.0f / scale;
 
     if (tid == 0)
     {
         d_scales[row] = scale;
     }
 
-    // Step 3: Quantize all elements in this row
     int8_t *out_row = d_A_int8 + static_cast<size_t>(row) * K;
     const bool int8_aligned4 = ((reinterpret_cast<uintptr_t>(out_row) & 0x03) == 0);
 
@@ -299,16 +291,9 @@ __global__ void quantizeActivationsQ8_kernel_t(
     {
         for (int k = tid; k < K; k += block_size)
         {
-            float val = src_ptr[k];
-            float scaled = val * inv_scale;
-
-            // rintf() maps to v_rndne_f32 (1 instruction) instead of
-            // roundf() which decomposes to trunc+sub+cmp+cndmask+bfi+add (6 instructions).
-            // For int8 quantization, round-to-nearest-even vs round-half-away-from-zero
-            // has negligible quality impact (differs only at exact x.5 tie points).
+            const float scaled = src_ptr[k] * inv_scale;
             int q = static_cast<int>(rintf(scaled));
             q = (q < -127) ? -127 : ((q > 127) ? 127 : q);
-
             out_row[k] = static_cast<int8_t>(q);
         }
     }
@@ -846,6 +831,88 @@ void quantizeActivationsQ8_blockwise_v4_kernel(
     {
         int q = max(-127, min(127, static_cast<int>(rintf(val * inv_scale))));
         dst[tid] = static_cast<int8_t>(q);
+    }
+}
+
+/**
+ * Generic blockwise quantization kernel for arbitrary block sizes (32, 64, 128).
+ *
+ * Uses a single wavefront (64 threads) per block. Each thread handles
+ * BLOCK_SIZE/64 elements (rounded up), enabling block sizes larger than 64.
+ * For BLOCK_SIZE=32: 1 element/thread (32 active, 32 masked).
+ * For BLOCK_SIZE=64: 1 element/thread (all 64 active).
+ * For BLOCK_SIZE=128: 2 elements/thread (all 64 active).
+ *
+ * Grid:  (total_blocks, 1, 1)
+ * Block: (64, 1, 1) — one wave64 on gfx906
+ */
+template <int BLOCK_SIZE>
+__global__ __launch_bounds__(64, 8)
+void quantizeActivationsQ8_blockwise_generic_kernel(
+    const float *__restrict__ d_A_fp32,
+    int8_t *__restrict__ d_A_int8,
+    float *__restrict__ d_scales,
+    int M, int K, int blocks_per_row)
+{
+    constexpr int ELEMS_PER_THREAD = (BLOCK_SIZE + 63) / 64;
+
+    const int global_block = blockIdx.x;
+    const int row = global_block / blocks_per_row;
+    const int block_idx = global_block % blocks_per_row;
+    if (row >= M) return;
+
+    const int tid = threadIdx.x;
+    const int k_start = block_idx * BLOCK_SIZE;
+    const int k_end = min(k_start + BLOCK_SIZE, K);
+    const int block_len = k_end - k_start;
+
+    const float *src = d_A_fp32 + static_cast<size_t>(row) * K + k_start;
+    int8_t *dst = d_A_int8 + static_cast<size_t>(row) * K + k_start;
+
+    // Load elements and find local max
+    float vals[ELEMS_PER_THREAD];
+    float local_max = 0.0f;
+
+    #pragma unroll
+    for (int e = 0; e < ELEMS_PER_THREAD; ++e)
+    {
+        const int idx = tid + e * 64;
+        if (idx < block_len)
+        {
+            vals[e] = src[idx];
+            local_max = fmaxf(local_max, fabsf(vals[e]));
+        }
+        else
+        {
+            vals[e] = 0.0f;
+        }
+    }
+
+    // Wave shuffle reduction (wave64)
+    #pragma unroll
+    for (int offset = 32; offset > 0; offset >>= 1)
+    {
+        local_max = fmaxf(local_max, __shfl_down(local_max, offset));
+    }
+    local_max = __shfl(local_max, 0);
+
+    float scale = (local_max > 0.0f) ? (local_max / 127.0f) : 1.0f;
+    float inv_scale = 1.0f / scale;
+
+    if (tid == 0)
+    {
+        d_scales[static_cast<size_t>(row) * blocks_per_row + block_idx] = scale;
+    }
+
+    #pragma unroll
+    for (int e = 0; e < ELEMS_PER_THREAD; ++e)
+    {
+        const int idx = tid + e * 64;
+        if (idx < block_len)
+        {
+            int q = max(-127, min(127, static_cast<int>(rintf(vals[e] * inv_scale))));
+            dst[idx] = static_cast<int8_t>(q);
+        }
     }
 }
 
@@ -1740,20 +1807,18 @@ extern "C"
     /**
      * @brief Launch blockwise activation quantization kernel
      *
-     * Quantizes activations with per-block scales (block_size=32).
-     * Variant selected by LLAMINAR_ROCM_BLOCKWISE_QUANT_VARIANT env var:
-     *   1 (V1): Original — 64 threads, 1 block/WG (default)
-     *   2 (V2): Multi-block — 256 threads, 8 blocks/WG, wave shuffle
-     *   3 (V3): Row-coarsened — 256 threads, 1 row/WG, sequential blocks, vec4
-     *   4 (V4): Minimal — 32 threads/WG, 1 block/WG, wave shuffle
-     *   5 (V5): Two-pass vectorized — 256 threads, 1 row/WG, vec4+atomicCAS
+     * Quantizes activations with per-block scales.
+     * block_size: quantization block size (32, 64, or 128 elements).
+     * For block_size=32: Variant selected by LLAMINAR_ROCM_BLOCKWISE_QUANT_VARIANT env var.
+     * For block_size=64/128: Uses generic kernel (1 wave64 per block).
      */
     bool rocmQuantGemm_quantizeActivationsBlockwise(
         const float *d_A_fp32,
         int8_t *d_A_int8,
         float *d_scales_blockwise,
         int M, int K,
-        int rocm_device_id, void *stream)
+        int rocm_device_id, void *stream,
+        int block_size)
     {
         if (!rocmQuantGemm_setDevice(rocm_device_id))
             return false;
@@ -1761,6 +1826,42 @@ extern "C"
         if (M <= 0 || K <= 0)
             return true;
 
+        hipStream_t s = static_cast<hipStream_t>(stream);
+
+        // For non-standard block sizes, use the generic kernel
+        if (block_size == 64 || block_size == 128)
+        {
+            const int blocks_per_row = (K + block_size - 1) / block_size;
+            const int total_blocks = M * blocks_per_row;
+            dim3 grid(total_blocks, 1, 1);
+            dim3 blk(64, 1, 1);
+
+            if (block_size == 64)
+            {
+                hipLaunchKernelGGL(
+                    HIP_KERNEL_NAME(quantizeActivationsQ8_blockwise_generic_kernel<64>),
+                    grid, blk, 0, s,
+                    d_A_fp32, d_A_int8, d_scales_blockwise, M, K, blocks_per_row);
+            }
+            else
+            {
+                hipLaunchKernelGGL(
+                    HIP_KERNEL_NAME(quantizeActivationsQ8_blockwise_generic_kernel<128>),
+                    grid, blk, 0, s,
+                    d_A_fp32, d_A_int8, d_scales_blockwise, M, K, blocks_per_row);
+            }
+
+            hipError_t err = hipGetLastError();
+            if (err != hipSuccess)
+            {
+                fprintf(stderr, "[rocmQuantGemm_quantizeActivationsBlockwise] Generic kernel (block_size=%d) launch failed: %s\n",
+                        block_size, hipGetErrorString(err));
+                return false;
+            }
+            return true;
+        }
+
+        // Standard block_size=32 path
         constexpr int QUANT_BLOCK = 32;
         const int blocks_per_row = (K + QUANT_BLOCK - 1) / QUANT_BLOCK;
         const int total_blocks = M * blocks_per_row;
@@ -1773,7 +1874,6 @@ extern "C"
             else if (M <= 64) variant = 2;  // V2: Multi-block, amortized launch overhead
             else              variant = 5;  // V5: Two-pass vec4, bandwidth-dominated
         }
-        hipStream_t s = static_cast<hipStream_t>(stream);
 
         switch (variant)
         {
