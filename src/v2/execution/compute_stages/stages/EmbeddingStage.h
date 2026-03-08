@@ -54,7 +54,18 @@ namespace llaminar2
         size_t estimatedFlops() const override;
         size_t estimatedMemoryBytes() const override;
         bool supportsBackend(ComputeBackendType backend) const override;
-        bool isGraphCapturable() const override { return false; } // token_ids change each step
+        bool isGraphCapturable() const override { return true; }
+        bool hasDynamicParams() const override { return true; }
+        void updateDynamicParams(int pos_offset, int seq_len) override
+        {
+            (void)pos_offset;
+            (void)seq_len;
+            if (cached_kernel_ && params_.token_ids && params_.num_tokens > 0)
+            {
+                cached_kernel_->setGPUStream(gpuStream());
+                cached_kernel_->setDynamicTokenIds(params_.token_ids, params_.num_tokens);
+            }
+        }
         StageDumpInfo buildDumpInfoImpl() const override;
         StageBufferRequirements getBufferRequirements() const override;
 

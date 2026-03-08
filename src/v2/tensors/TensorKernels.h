@@ -3082,6 +3082,20 @@ namespace llaminar2
             TensorBase *output,
             const MPIContext *mpi_ctx = nullptr,
             int device_idx = -1) { return false; }
+
+        /**
+         * @brief Update token IDs stored in a graph-safe device-side buffer for replay
+         *
+         * GPU embedding kernels can override this to copy token IDs from the caller's
+         * host buffer into pinned host memory and then into the stable device workspace
+         * buffer captured by the decode graph. CPU implementations can keep the default
+         * no-op behavior.
+         */
+        virtual void setDynamicTokenIds(const int *token_ids, int num_tokens)
+        {
+            (void)token_ids;
+            (void)num_tokens;
+        }
     };
 
     /**

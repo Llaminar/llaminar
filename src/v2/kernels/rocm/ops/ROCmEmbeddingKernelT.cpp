@@ -15,6 +15,7 @@
 
 #include <hip/hip_runtime.h>
 #include <algorithm>
+#include <cstring>
 #include <mutex>
 #include <vector>
 
@@ -70,6 +71,12 @@ namespace llaminar2
 
     ROCmEmbeddingKernelT::~ROCmEmbeddingKernelT()
     {
+        if (h_token_ids_)
+        {
+            (void)hipHostFree(h_token_ids_);
+            h_token_ids_ = nullptr;
+        }
+
         std::lock_guard<std::mutex> lock(canary_mutex_);
         for (auto &entry : canary_by_device_)
         {
@@ -119,6 +126,87 @@ namespace llaminar2
         }
 
         return gpu_stream_ ? gpu_stream_ : (device_ctx_ ? device_ctx_->defaultStream() : nullptr);
+    }
+
+    void ROCmEmbeddingKernelT::setDynamicTokenIds(const int *token_ids, int num_tokens)
+    {
+        dynamic_params_active_ = false;
+        dynamic_token_count_ = 0;
+
+        if (!token_ids || num_tokens <= 0)
+        {
+            return;
+        }
+
+        if (num_tokens > max_token_ids_)
+        {
+            if (h_token_ids_)
+            {
+                (void)hipHostFree(h_token_ids_);
+                h_token_ids_ = nullptr;
+            }
+
+            hipError_t alloc_err = hipHostMalloc(reinterpret_cast<void **>(&h_token_ids_),
+                                                 static_cast<size_t>(num_tokens) * sizeof(int),
+                                                 hipHostMallocDefault);
+            if (alloc_err != hipSuccess)
+            {
+                LOG_ERROR("[ROCmEmbeddingKernelT] Failed to allocate pinned token buffer: "
+                          << hipGetErrorString(alloc_err));
+                return;
+            }
+            max_token_ids_ = num_tokens;
+        }
+
+        std::memcpy(h_token_ids_, token_ids, static_cast<size_t>(num_tokens) * sizeof(int));
+
+        int dev = (device_idx_ >= 0) ? device_idx_ : 0;
+        hipError_t set_err = static_cast<hipError_t>(HipDeviceGuard::setDevice(dev));
+        if (set_err != hipSuccess)
+        {
+            LOG_ERROR("[ROCmEmbeddingKernelT] Failed to set device " << dev << ": " << hipGetErrorString(set_err));
+            return;
+        }
+
+        DeviceWorkspaceManager *workspace = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(workspace_mutex_);
+            auto it = workspace_by_device_.find(dev);
+            if (it != workspace_by_device_.end())
+            {
+                workspace = it->second;
+            }
+            else
+            {
+                workspace = workspace_;
+            }
+        }
+
+        if (!workspace || !workspace->isAllocated())
+        {
+            return;
+        }
+
+        int *d_token_ids = static_cast<int *>(workspace->getBuffer(EmbeddingWorkspaceBuffers::TOKEN_IDS));
+        if (!d_token_ids)
+        {
+            return;
+        }
+
+        hipStream_t stream = static_cast<hipStream_t>(getStream());
+        hipError_t copy_err = hipMemcpyAsync(d_token_ids, h_token_ids_,
+                                             static_cast<size_t>(num_tokens) * sizeof(int),
+                                             hipMemcpyHostToDevice,
+                                             stream);
+        if (copy_err != hipSuccess)
+        {
+            LOG_ERROR("[ROCmEmbeddingKernelT] Failed to preload token_ids to GPU: "
+                      << hipGetErrorString(copy_err));
+            return;
+        }
+
+        dynamic_token_count_ = num_tokens;
+        dynamic_params_active_ = true;
     }
 
     namespace
@@ -439,11 +527,18 @@ namespace llaminar2
         // hipMemcpy uses the legacy stream which would create a dependency on
         // a capturing stream, causing capture to fail.
         hipStream_t stream = static_cast<hipStream_t>(getStream());
-        hipError_t err = hipMemcpyAsync(d_token_ids, token_ids, token_bytes, hipMemcpyHostToDevice, stream);
-        if (err != hipSuccess)
+        hipError_t err = hipSuccess;
+        const bool token_ids_preloaded = dynamic_params_active_ && dynamic_token_count_ == num_tokens;
+        if (!token_ids_preloaded)
         {
-            LOG_ERROR("[ROCmEmbeddingKernelT] Failed to copy token_ids to GPU: " << hipGetErrorString(err));
-            return false;
+            dynamic_params_active_ = false;
+            dynamic_token_count_ = 0;
+            err = hipMemcpyAsync(d_token_ids, token_ids, token_bytes, hipMemcpyHostToDevice, stream);
+            if (err != hipSuccess)
+            {
+                LOG_ERROR("[ROCmEmbeddingKernelT] Failed to copy token_ids to GPU: " << hipGetErrorString(err));
+                return false;
+            }
         }
 
         // =====================================================================

@@ -2746,6 +2746,19 @@ add_v2_test(V2_Unit_AttentionComputeStage_DynamicKVLen
     MPI_PROCS 1  # Single rank for unit testing
 )
 
+# Test: EmbeddingStage graph capture support
+add_executable(v2_test_embedding_stage_graph_capture unit/execution/compute_stages/stages/Test__EmbeddingStage_GraphCapture.cpp)
+target_link_libraries(v2_test_embedding_stage_graph_capture
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_EmbeddingStage_GraphCapture
+    COMMAND $<TARGET_FILE:v2_test_embedding_stage_graph_capture>
+    LABELS "V2;Unit;Execution;ComputeStage;Embedding;GraphCapture;DynamicParams;CPU"
+    MPI_PROCS 1
+)
+
 # Test: SwiGLU parity regression tests (locks in correct formula: gate * silu(up))
 add_executable(v2_test_swiglu_parity unit/kernels/cpu/ops/Test__SwiGLUParity.cpp)
 target_link_libraries(v2_test_swiglu_parity 

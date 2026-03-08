@@ -20,6 +20,7 @@
 #include <gtest/gtest.h>
 #include <vector>
 #include <cmath>
+#include <cstring>
 #include <random>
 #include <memory>
 #include <numeric>

@@ -25,6 +25,7 @@
 
 #include <cuda_runtime.h>
 #include <cstdio>
+#include <cstring>
 
 // =========================================================================
 // Extern "C" declarations for CUDA kernel wrappers
@@ -158,6 +159,15 @@ extern "C"
 
 namespace llaminar2
 {
+
+    CUDAEmbeddingKernelT::~CUDAEmbeddingKernelT()
+    {
+        if (h_token_ids_)
+        {
+            cudaFreeHost(h_token_ids_);
+            h_token_ids_ = nullptr;
+        }
+    }
     namespace cuda
     {
 
@@ -1211,6 +1221,63 @@ namespace llaminar2
         return false;
     }
 
+    void CUDAEmbeddingKernelT::setDynamicTokenIds(const int *token_ids, int num_tokens)
+    {
+        dynamic_params_active_ = false;
+        dynamic_token_count_ = 0;
+
+        if (!token_ids || num_tokens <= 0)
+        {
+            return;
+        }
+
+        if (num_tokens > max_token_ids_)
+        {
+            if (h_token_ids_)
+            {
+                cudaFreeHost(h_token_ids_);
+                h_token_ids_ = nullptr;
+            }
+
+            cudaError_t alloc_err = cudaMallocHost(reinterpret_cast<void **>(&h_token_ids_),
+                                                   static_cast<size_t>(num_tokens) * sizeof(int));
+            if (alloc_err != cudaSuccess)
+            {
+                fprintf(stderr, "[CUDAEmbeddingKernelT] Failed to allocate pinned token buffer: %s\n",
+                        cudaGetErrorString(alloc_err));
+                return;
+            }
+            max_token_ids_ = num_tokens;
+        }
+
+        std::memcpy(h_token_ids_, token_ids, static_cast<size_t>(num_tokens) * sizeof(int));
+
+        if (!workspace_ || !workspace_->isAllocated())
+        {
+            return;
+        }
+
+        int *d_token_ids = static_cast<int *>(workspace_->getBuffer(EmbeddingWorkspaceBuffers::TOKEN_IDS));
+        if (!d_token_ids)
+        {
+            return;
+        }
+
+        cudaError_t copy_err = cudaMemcpyAsync(d_token_ids, h_token_ids_,
+                                               static_cast<size_t>(num_tokens) * sizeof(int),
+                                               cudaMemcpyHostToDevice,
+                                               static_cast<cudaStream_t>(gpu_stream_));
+        if (copy_err != cudaSuccess)
+        {
+            fprintf(stderr, "[CUDAEmbeddingKernelT] Failed to preload token_ids to GPU: %s\n",
+                    cudaGetErrorString(copy_err));
+            return;
+        }
+
+        dynamic_token_count_ = num_tokens;
+        dynamic_params_active_ = true;
+    }
+
     bool CUDAEmbeddingKernelT::apply_tensor(
         const TensorBase *embed_table,
         const int *token_ids,
@@ -1266,13 +1333,20 @@ namespace llaminar2
         }
 
         size_t token_bytes = static_cast<size_t>(num_tokens) * sizeof(int);
-        cudaError_t err = cudaMemcpyAsync(d_token_ids, token_ids, token_bytes, cudaMemcpyHostToDevice,
-                                          static_cast<cudaStream_t>(gpu_stream_));
-        if (err != cudaSuccess)
+        cudaError_t err = cudaSuccess;
+        const bool token_ids_preloaded = dynamic_params_active_ && dynamic_token_count_ == num_tokens;
+        if (!token_ids_preloaded)
         {
-            fprintf(stderr, "[CUDAEmbeddingKernelT] Failed to copy token_ids to GPU: %s\n",
-                    cudaGetErrorString(err));
-            return false;
+            dynamic_params_active_ = false;
+            dynamic_token_count_ = 0;
+            err = cudaMemcpyAsync(d_token_ids, token_ids, token_bytes, cudaMemcpyHostToDevice,
+                                  static_cast<cudaStream_t>(gpu_stream_));
+            if (err != cudaSuccess)
+            {
+                fprintf(stderr, "[CUDAEmbeddingKernelT] Failed to copy token_ids to GPU: %s\n",
+                        cudaGetErrorString(err));
+                return false;
+            }
         }
 
         // =====================================================================

@@ -58,7 +58,7 @@ namespace llaminar2
             device_idx_ = ctx->deviceOrdinal();
         }
 
-        ~CUDAEmbeddingKernelT() override = default;
+        ~CUDAEmbeddingKernelT() override;
 
         // ===== Device Context Support (Phase 4) =====
         void setDeviceContext(IWorkerGPUContext *ctx) { device_ctx_ = ctx; }
@@ -133,6 +133,8 @@ namespace llaminar2
             TensorBase *output,
             const MPIContext *mpi_ctx = nullptr,
             int device_idx = -1) override;
+
+        void setDynamicTokenIds(const int *token_ids, int num_tokens) override;
 
         KernelSnapshotInfo getKernelSnapshotInfo() const override
         {
@@ -227,6 +229,11 @@ namespace llaminar2
         // THREAD SAFETY: Protected by s_embed_cache_mutex_ for LocalTP multi-device access.
         static inline std::mutex s_embed_cache_mutex_;
         static inline std::unordered_map<DeviceWorkspaceManager *, const TensorBase *> s_workspace_embed_cache_;
+
+        int *h_token_ids_ = nullptr;
+        int max_token_ids_ = 0;
+        int dynamic_token_count_ = 0;
+        bool dynamic_params_active_ = false;
     };
 
     // Convenience alias

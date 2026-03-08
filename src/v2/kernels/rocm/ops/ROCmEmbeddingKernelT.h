@@ -121,6 +121,8 @@ namespace llaminar2
             const MPIContext *mpi_ctx = nullptr,
             int device_idx = -1) override;
 
+        void setDynamicTokenIds(const int *token_ids, int num_tokens) override;
+
         // =========================================================================
         // IWorkspaceConsumer Interface
         // =========================================================================
@@ -206,6 +208,11 @@ namespace llaminar2
 
         mutable std::mutex canary_mutex_;
         std::unordered_map<int, DebugCanaryBuffer> canary_by_device_;
+
+        int *h_token_ids_ = nullptr;
+        int max_token_ids_ = 0;
+        int dynamic_token_count_ = 0;
+        bool dynamic_params_active_ = false;
     };
 
 } // namespace llaminar2
