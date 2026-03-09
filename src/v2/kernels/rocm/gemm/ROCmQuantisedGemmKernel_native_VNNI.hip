@@ -1,5 +1,5 @@
 /**
- * @file ROCmGemmKernel_native_VNNI.hip
+ * @file ROCmQuantisedGemmKernel_native_VNNI.hip
  * @brief Native-VNNI GEMM kernels for lossless sub-8-bit prefill on AMD MI50/MI60 (gfx906)
  *
  * @target AMD Instinct MI50 / MI60 (gfx906), 60 CUs, 4 SIMDs/CU

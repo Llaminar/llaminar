@@ -41,7 +41,7 @@ extern "C" bool rocmInitIQGridTables(
     const void *h_iq2s_grid, const void *h_iq2xs_grid,
     const void *h_iq2xxs_grid, const void *h_iq1s_grid);
 
-// IQ grid table initialization for GEMM TU (implemented in ROCmGemmKernel_native_VNNI.hip)
+// IQ grid table initialization for GEMM TU (implemented in ROCmQuantisedGemmKernel_native_VNNI.hip)
 extern "C" bool rocmInitIQGridTables_gemm(
     int device_id,
     const void *h_iq3s_grid, const void *h_iq3xxs_grid,

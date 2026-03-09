@@ -15,7 +15,7 @@ Recent parity debugging established that this contract is the source of the curr
 
 That result changes the framing of the work:
 
-- This is not a narrow arithmetic bug in `ROCmGemmKernel_native_VNNI.hip`.
+- This is not a narrow arithmetic bug in `ROCmQuantisedGemmKernel_native_VNNI.hip`.
 - This is a **contract problem** in how activations are quantized and represented.
 - The correct fix is a coordinated redesign of the ROCm activation-quantization pipeline, not more kernel-local patching.
 
@@ -100,7 +100,7 @@ Kernel-side quantization and scaling live in:
 Native decode kernels that currently consume row-scale activation metadata:
 
 - `src/v2/kernels/rocm/gemm/ROCmGemvKernel_native_VNNI.hip`
-- `src/v2/kernels/rocm/gemm/ROCmGemmKernel_native_VNNI.hip`
+- `src/v2/kernels/rocm/gemm/ROCmQuantisedGemmKernel_native_VNNI.hip`
 
 INT8/VNNI fallback or alternate routes that also depend on row-scale activation metadata:
 
@@ -161,7 +161,7 @@ Why this matters:
 Primary files:
 
 - `src/v2/kernels/rocm/gemm/ROCmQuantisedGemmKernel.cpp`
-- `src/v2/kernels/rocm/gemm/ROCmGemmKernel_native_VNNI.hip`
+- `src/v2/kernels/rocm/gemm/ROCmQuantisedGemmKernel_native_VNNI.hip`
 
 Current assumption to remove:
 
@@ -386,7 +386,7 @@ Deliverables:
 
 Primary files:
 
-- `src/v2/kernels/rocm/gemm/ROCmGemmKernel_native_VNNI.hip`
+- `src/v2/kernels/rocm/gemm/ROCmQuantisedGemmKernel_native_VNNI.hip`
 - `src/v2/kernels/rocm/gemm/ROCmQuantisedGemmKernel.cpp`
 
 ### Workstream 5: Compatibility and Fallbacks

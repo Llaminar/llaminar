@@ -2,7 +2,7 @@
 
 ## 1. Executive Summary
 
-**Goal**: Design a new family of GEMM kernels (`ROCmGemmKernel_native_VNNI.hip`) that execute M>1 prefill using native sub-8-bit quantization formats (1-bit to 6-bit), bypassing the current INT8 intermediary path.
+**Goal**: Design a new family of GEMM kernels (`ROCmQuantisedGemmKernel_native_VNNI.hip`) that execute M>1 prefill using native sub-8-bit quantization formats (1-bit to 6-bit), bypassing the current INT8 intermediary path.
 
 **Why**: Today, M>1 prefill for all quantization formats goes through the INT8 VNNI GEMM pipeline: weights are dequantized to INT8, VNNI-packed into `[K/4 × N × 4]`, and processed by V3/V7 kernels. This works but discards per-block FP16 scales (replaced by a single global scale pair), and reads 8 bpw of weight data regardless of the original quantization. A native-VNNI GEMM kernel would:
 
@@ -803,7 +803,7 @@ Per-format ISA analysis. Determine optimal M-threshold for native vs INT8 dispat
 |------|---------|
 | `src/v2/kernels/rocm/NativeVNNICommon.h` | Shared: `NativeVNNIFormat` enum, `NVNNITraits`, constants |
 | `src/v2/kernels/rocm/NativeVNNIDecode.hip` | Shared: `decode_native_vnni_block<FMT>()` device functions |
-| `src/v2/kernels/rocm/ROCmGemmKernel_native_VNNI.hip` | **NEW**: Native-VNNI GEMM kernels |
+| `src/v2/kernels/rocm/gemm/ROCmQuantisedGemmKernel_native_VNNI.hip` | **NEW**: Native-VNNI GEMM kernels |
 | `src/v2/kernels/rocm/ROCmGemvKernel_native_VNNI.hip` | Existing GEMV — refactored to use shared headers |
 | `src/v2/kernels/rocm/ROCmQuantisedGemmKernel.cpp` | Dispatch: add `tryPrefillNativeGemm()` path |
 | `tests/v2/unit/kernels/rocm/Test__NativeVNNI_GEMM.cpp` | Unit tests: per-format GEMM accuracy |
