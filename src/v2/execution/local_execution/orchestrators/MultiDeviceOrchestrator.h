@@ -556,6 +556,13 @@ namespace llaminar2
         const float *getSnapshot(const std::string &key, size_t &out_size) const override;
 
         /**
+         * @brief Get snapshot with 2D shape metadata
+         *
+         * Delegates to device runners/PP stages, preserving shape info.
+         */
+        SnapshotInfo getSnapshotWithShape(const std::string &key) const override;
+
+        /**
          * @brief Get all snapshot keys from primary device runner
          */
         std::vector<std::string> getSnapshotKeys() const override;

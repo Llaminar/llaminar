@@ -2565,6 +2565,31 @@ namespace llaminar2
         return std::vector<std::string>(all_keys.begin(), all_keys.end());
     }
 
+    SnapshotInfo MultiDeviceOrchestrator::getSnapshotWithShape(const std::string &key) const
+    {
+        // PP mode: search across all PP stage runners
+        if (!pp_stage_runners_.empty())
+        {
+            for (const auto &runner : pp_stage_runners_)
+            {
+                if (runner)
+                {
+                    auto snap = runner->getSnapshotWithShape(key);
+                    if (snap)
+                        return snap;
+                }
+            }
+            return {};
+        }
+
+        // Default (TP mode): get from primary device
+        if (!device_runners_.empty() && device_runners_[0])
+        {
+            return device_runners_[0]->getSnapshotWithShape(key);
+        }
+        return {};
+    }
+
     TPSnapshot MultiDeviceOrchestrator::getTPSnapshot(const std::string &key) const
     {
         TPSnapshot result;
@@ -2588,10 +2613,9 @@ namespace llaminar2
                 if (!pp_stage_runners_[stage_idx])
                     continue;
 
-                // Check if this stage has the snapshot
-                size_t temp_size = 0;
-                const float *temp_data = pp_stage_runners_[stage_idx]->getSnapshot(key, temp_size);
-                if (!temp_data || temp_size == 0)
+                // Check if this stage has the snapshot (with shape metadata)
+                auto snap = pp_stage_runners_[stage_idx]->getSnapshotWithShape(key);
+                if (!snap)
                     continue;
 
                 // Found the owning stage - check if it's a TP domain (MultiDeviceOrchestrator)
@@ -2616,17 +2640,17 @@ namespace llaminar2
 
                     DeviceSnapshotData dev_data;
                     dev_data.device_index = 0;
-                    dev_data.rows = 1;
-                    dev_data.cols = temp_size;
+                    dev_data.rows = snap.rows;
+                    dev_data.cols = snap.cols;
                     dev_data.global_start_col = 0;
-                    dev_data.global_total_cols = temp_size;
-                    dev_data.data.assign(temp_data, temp_data + temp_size);
+                    dev_data.global_total_cols = snap.cols;
+                    dev_data.data.assign(snap.data, snap.data + snap.size);
 
                     result.device_data.push_back(std::move(dev_data));
                     result.combined_valid = true;
                     result.combined_data = result.device_data[0].data;
-                    result.combined_rows = 1;
-                    result.combined_cols = temp_size;
+                    result.combined_rows = snap.rows;
+                    result.combined_cols = snap.cols;
 
                     return result;
                 }
@@ -2691,10 +2715,12 @@ namespace llaminar2
             if (!device_runners_[i])
                 continue;
 
-            size_t size = 0;
-            const float *data = device_runners_[i]->getSnapshot(key, size);
+            // Use shape-aware snapshot retrieval — the stage itself reported
+            // its output rows/cols via getDumpInfo() at capture time, so we
+            // don't need model-specific dimension calculations here.
+            auto snap = device_runners_[i]->getSnapshotWithShape(key);
 
-            if (!data || size == 0)
+            if (!snap)
             {
                 LOG_DEBUG("MultiDeviceOrchestrator::getTPSnapshot: device " << i
                                                                             << " has no data for key=" << key);
@@ -2703,9 +2729,10 @@ namespace llaminar2
 
             // Debug: log data pointer and first 4 values to verify each device has different data
             LOG_INFO("MultiDeviceOrchestrator::getTPSnapshot: device " << i
-                                                                       << " key=" << key << " ptr=" << static_cast<const void *>(data)
-                                                                       << " size=" << size
-                                                                       << " val[0-3]=" << data[0] << "," << data[1] << "," << data[2] << "," << data[3]);
+                                                                       << " key=" << key << " ptr=" << static_cast<const void *>(snap.data)
+                                                                       << " size=" << snap.size
+                                                                       << " shape=[" << snap.rows << "x" << snap.cols << "]"
+                                                                       << " val[0-3]=" << snap.data[0] << "," << snap.data[1] << "," << snap.data[2] << "," << snap.data[3]);
 
             DeviceSnapshotData dev_data;
             // Use device type from config if available, otherwise default to CUDA
@@ -2716,92 +2743,29 @@ namespace llaminar2
             }
             dev_data.device_id = GlobalDeviceId::gpu(0, static_cast<int>(i), dev_type);
             dev_data.device_index = static_cast<int>(i);
-            dev_data.data.assign(data, data + size);
+            dev_data.data.assign(snap.data, snap.data + snap.size);
 
-            // Infer rows and cols from size and TP configuration
-            // For column-parallel stages, we need to compute actual row/col dimensions
+            // Use shape metadata from the stage's getDumpInfo() output.
+            // This is model-agnostic: stages report their own dimensions
+            // (e.g., KV projections report kv_dim cols, FFN reports d_ff cols).
             if (result.mode == SnapshotShardingMode::COLUMN_PARALLEL)
             {
-                // For column-parallel, each device has shape [seq_len, local_cols]
-                // local_cols = global_cols / tp_degree
-                // Different stages have different global widths:
-                //   - ATTENTION_CONTEXT: hidden_size (896 for Qwen2.5-0.5B)
-                //   - FFN_SWIGLU: d_ff (4864 for Qwen2.5-0.5B)
-                //   - FFN_RESIDUAL: hidden_size after allreduce (back to 896)
-                size_t local_cols = 0;
-                if (model_ctx_)
-                {
-                    // Check if this is an FFN stage (contains "FFN" but NOT "RESIDUAL")
-                    // FFN_SWIGLU output is [seq_len, d_ff_local] where d_ff_local = d_ff / tp_degree
-                    bool is_ffn_stage =
-                        (key.find("FFN") != std::string::npos && key.find("RESIDUAL") == std::string::npos);
-
-                    // Check if this is a K/V projection or K_ROPE stage
-                    // These use n_kv_heads (GQA) instead of n_heads, so their column width
-                    // is kv_dim = n_kv_heads * head_dim, NOT hidden_size = n_heads * head_dim
-                    bool is_kv_stage =
-                        (key.find("K_PROJECTION") != std::string::npos ||
-                         key.find("V_PROJECTION") != std::string::npos ||
-                         key.find("K_ROPE") != std::string::npos);
-
-                    if (is_ffn_stage)
-                    {
-                        size_t d_ff = static_cast<size_t>(model_ctx_->feedForwardLength());
-                        local_cols = d_ff / static_cast<size_t>(result.tp_degree);
-                    }
-                    else if (is_kv_stage)
-                    {
-                        size_t n_kv_heads = static_cast<size_t>(model_ctx_->headCountKV());
-                        size_t n_heads = static_cast<size_t>(model_ctx_->headCount());
-                        size_t hidden_size = model_ctx_->embeddingLength();
-                        size_t head_dim = hidden_size / n_heads;
-                        size_t kv_dim = n_kv_heads * head_dim;
-                        local_cols = kv_dim / static_cast<size_t>(result.tp_degree);
-                    }
-                    else
-                    {
-                        size_t hidden_size = model_ctx_->embeddingLength();
-                        local_cols = hidden_size / static_cast<size_t>(result.tp_degree);
-                    }
-                }
-
-                // If we couldn't get from model config, estimate from data size
-                // Assume square-ish data or use global_col_offset pattern
-                if (local_cols == 0 && result.tp_degree > 0)
-                {
-                    // Fallback: assume all devices have equal cols
-                    // This will be validated when we have multiple devices
-                    local_cols = size; // Will be rows=1 in worst case
-                }
-
-                // Compute rows from size and cols
-                size_t rows = (local_cols > 0) ? (size / local_cols) : 1;
-                if (rows * local_cols != size && local_cols > 0)
-                {
-                    // Size doesn't divide evenly - log warning and fallback
-                    LOG_WARN("MultiDeviceOrchestrator::getTPSnapshot: size=" << size
-                                                                             << " doesn't divide evenly by local_cols=" << local_cols
-                                                                             << " for key=" << key);
-                    rows = 1;
-                    local_cols = size;
-                }
-
-                dev_data.rows = rows;
-                dev_data.cols = local_cols;
+                dev_data.rows = snap.rows;
+                dev_data.cols = snap.cols;
                 dev_data.global_start_col = global_col_offset;
-                global_col_offset += local_cols;
+                global_col_offset += snap.cols;
             }
             else
             {
                 // Replicated or row-parallel - each device has full output
-                dev_data.rows = 1;
-                dev_data.cols = size;
+                dev_data.rows = snap.rows;
+                dev_data.cols = snap.cols;
                 dev_data.global_start_col = 0;
-                dev_data.global_total_cols = size;
+                dev_data.global_total_cols = snap.cols;
             }
 
             LOG_DEBUG("MultiDeviceOrchestrator::getTPSnapshot: device " << i
-                                                                        << " size=" << size
+                                                                        << " size=" << snap.size
                                                                         << " cols=" << dev_data.cols
                                                                         << " start_col=" << dev_data.global_start_col);
 

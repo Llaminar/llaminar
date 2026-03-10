@@ -1560,21 +1560,21 @@ namespace llaminar2
                             {
                                 auto data = extractFp32FromOutput(dump.outputs[0]);
                                 if (!data.empty())
-                                    snapshots_[prefix + "_Q_PROJECTION"] = std::move(data);
+                                    snapshots_[prefix + "_Q_PROJECTION"] = {std::move(data), dump.outputs[0].rows, dump.outputs[0].cols};
                             }
                             // Output 1 = K
                             if (dump.outputs[1].data)
                             {
                                 auto data = extractFp32FromOutput(dump.outputs[1]);
                                 if (!data.empty())
-                                    snapshots_[prefix + "_K_PROJECTION"] = std::move(data);
+                                    snapshots_[prefix + "_K_PROJECTION"] = {std::move(data), dump.outputs[1].rows, dump.outputs[1].cols};
                             }
                             // Output 2 = V
                             if (dump.outputs[2].data)
                             {
                                 auto data = extractFp32FromOutput(dump.outputs[2]);
                                 if (!data.empty())
-                                    snapshots_[prefix + "_V_PROJECTION"] = std::move(data);
+                                    snapshots_[prefix + "_V_PROJECTION"] = {std::move(data), dump.outputs[2].rows, dump.outputs[2].cols};
                             }
                         }
                         return;
@@ -1593,14 +1593,14 @@ namespace llaminar2
                             {
                                 auto data = extractFp32FromOutput(dump.outputs[0]);
                                 if (!data.empty())
-                                    snapshots_[prefix + "_FFN_GATE"] = std::move(data);
+                                    snapshots_[prefix + "_FFN_GATE"] = {std::move(data), dump.outputs[0].rows, dump.outputs[0].cols};
                             }
                             // Output 1 = up
                             if (dump.outputs[1].data)
                             {
                                 auto data = extractFp32FromOutput(dump.outputs[1]);
                                 if (!data.empty())
-                                    snapshots_[prefix + "_FFN_UP"] = std::move(data);
+                                    snapshots_[prefix + "_FFN_UP"] = {std::move(data), dump.outputs[1].rows, dump.outputs[1].cols};
                             }
                         }
                         return;
@@ -1620,13 +1620,13 @@ namespace llaminar2
                             {
                                 auto data = extractFp32FromOutput(dump.outputs[0]);
                                 if (!data.empty())
-                                    snapshots_[prefix + "_Q_ROPE"] = std::move(data);
+                                    snapshots_[prefix + "_Q_ROPE"] = {std::move(data), dump.outputs[0].rows, dump.outputs[0].cols};
                             }
                             if (dump.outputs[1].data)
                             {
                                 auto data = extractFp32FromOutput(dump.outputs[1]);
                                 if (!data.empty())
-                                    snapshots_[prefix + "_K_ROPE"] = std::move(data);
+                                    snapshots_[prefix + "_K_ROPE"] = {std::move(data), dump.outputs[1].rows, dump.outputs[1].cols};
                             }
                         }
                         return;
@@ -1685,7 +1685,7 @@ namespace llaminar2
                                                             << " cols=" << out.cols);
                             auto data = extractFp32FromOutput(out);
                             if (!data.empty())
-                                snapshots_[key] = std::move(data);
+                                snapshots_[key] = {std::move(data), out.rows, out.cols};
                         }
                         return;
                     }
@@ -1701,7 +1701,7 @@ namespace llaminar2
                             auto data = extractFp32FromOutput(out);
                             LOG_DEBUG("[Snapshot] lm_head_allgather handler: storing as LM_HEAD (overwriting partial), count=" << data.size());
                             if (!data.empty())
-                                snapshots_["LM_HEAD"] = std::move(data); // Overwrite partial with full
+                                snapshots_["LM_HEAD"] = {std::move(data), out.rows, out.cols}; // Overwrite partial with full
                         }
                         return;
                     }
@@ -1728,7 +1728,7 @@ namespace llaminar2
                         }
 
                         if (!data.empty())
-                            snapshots_[key] = std::move(data);
+                            snapshots_[key] = {std::move(data), out.rows, out.cols};
                     }
                 });
         }
@@ -1768,9 +1768,24 @@ namespace llaminar2
                 out_size = 0;
                 return nullptr;
             }
-            out_size = it->second.size();
+            out_size = it->second.data.size();
             LOG_TRACE("[DeviceGraphOrchestrator::getSnapshot] Key found: " << key << " size=" << out_size);
-            return it->second.data();
+            return it->second.data.data();
+        }
+
+        /**
+         * @brief Retrieve a captured snapshot with 2D shape metadata
+         *
+         * Returns the snapshot data along with the rows/cols that the stage
+         * reported via getDumpInfo() at capture time.
+         */
+        SnapshotInfo getSnapshotWithShape(const std::string &key) const override
+        {
+            auto it = snapshots_.find(key);
+            if (it == snapshots_.end())
+                return {};
+            const auto &snap = it->second;
+            return {snap.data.data(), snap.data.size(), snap.rows, snap.cols};
         }
 
         /**
@@ -2138,8 +2153,16 @@ namespace llaminar2
         /// Whether snapshot capture is enabled
         bool snapshot_enabled_ = false;
 
-        /// Captured snapshots (key -> FP32 data)
-        std::unordered_map<std::string, std::vector<float>> snapshots_;
+        /// Internal storage for a captured snapshot with shape metadata
+        struct StoredSnapshot
+        {
+            std::vector<float> data;
+            size_t rows = 0;
+            size_t cols = 0;
+        };
+
+        /// Captured snapshots (key -> FP32 data with shape)
+        std::unordered_map<std::string, StoredSnapshot> snapshots_;
 
         // =========================================================================
         // Graph Buffer Management Members (Phase 3 - moved from Qwen2Graph)

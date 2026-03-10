@@ -22,6 +22,24 @@ namespace llaminar2
     struct SamplingParams;
 
     /**
+     * @brief Lightweight view of a captured snapshot with 2D shape metadata
+     *
+     * Returned by getSnapshotWithShape() to provide shape information
+     * alongside the raw FP32 data pointer. The shape (rows, cols) comes
+     * from the stage's getDumpInfo() at capture time, so stages own their
+     * own dimension reporting.
+     */
+    struct SnapshotInfo
+    {
+        const float *data = nullptr; ///< Pointer to FP32 snapshot data (not owned)
+        size_t size = 0;             ///< Total element count (rows * cols)
+        size_t rows = 0;             ///< Logical rows (e.g. seq_len)
+        size_t cols = 0;             ///< Logical cols (e.g. hidden_dim, kv_dim, d_ff)
+
+        explicit operator bool() const { return data != nullptr && size > 0; }
+    };
+
+    /**
      * @brief Execution path type
      */
     enum class ExecutionPath
@@ -226,6 +244,22 @@ namespace llaminar2
             (void)key;
             out_size = 0;
             return nullptr; // No snapshot support by default
+        }
+
+        /**
+         * @brief Retrieve a captured snapshot with 2D shape metadata
+         *
+         * Returns the snapshot data along with the rows/cols that the stage
+         * reported via getDumpInfo() at capture time. This allows callers to
+         * understand the 2D layout without model-specific inference logic.
+         *
+         * @param key Snapshot identifier (e.g., "layer0_Q_PROJECTION")
+         * @return SnapshotInfo with data pointer and shape, or empty if not found
+         */
+        virtual SnapshotInfo getSnapshotWithShape(const std::string &key) const
+        {
+            (void)key;
+            return {};
         }
 
         /**
