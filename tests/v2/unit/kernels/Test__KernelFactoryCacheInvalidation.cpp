@@ -14,6 +14,7 @@
 
 #include <gtest/gtest.h>
 #include "kernels/KernelFactory.h"
+#include "kernels/cuda/CUDAWeightPacker.h"
 #include "tensors/Tensors.h"
 #include "backends/ComputeBackend.h"
 #include <memory>
@@ -471,6 +472,65 @@ TEST_F(Test__KernelFactoryCacheInvalidation, CUDAPackedWeights_ClearedByExplicit
     // cuda_cache_ should now be empty
     EXPECT_FALSE(tensor->cuda_cache_.has_value())
         << "clearCacheFor should reset cuda_cache_";
+}
+
+TEST_F(Test__KernelFactoryCacheInvalidation, CUDAPackedWeights_NativeFormatsPopulateHostFallbackAndNativePayload)
+{
+    auto tensor = createTestTensor();
+
+    auto *packed = KernelFactory::ensureCUDAPackedWeightsInTensorCache(tensor.get());
+    ASSERT_NE(packed, nullptr);
+
+    EXPECT_EQ(packed->preferred_family, llaminar2::cuda::CUDAPackedWeightFamily::NativePayload);
+    EXPECT_EQ(packed->active_family, llaminar2::cuda::CUDAPackedWeightFamily::NativePayload);
+
+    EXPECT_EQ(packed->N, 32);
+    EXPECT_EQ(packed->K, 32);
+    EXPECT_EQ(packed->native_blocks_per_row, 1u);
+
+    EXPECT_FALSE(packed->int8_data.empty()) << "Native formats should still build the INT8 fallback mirror";
+    EXPECT_FALSE(packed->scales.empty()) << "INT8 fallback scales should be populated";
+    EXPECT_FALSE(packed->native_payload.empty()) << "Native formats should keep compact native payload in cache";
+    EXPECT_FALSE(packed->native_scales.empty()) << "Native payload scales should be populated";
+    EXPECT_EQ(packed->native_mins.size(), 0u) << "IQ4_NL is symmetric and should not allocate mins";
+    EXPECT_EQ(packed->native_emins.size(), 0u) << "IQ4_NL should not allocate emins";
+    EXPECT_EQ(packed->native_codebook_id, 4u) << "IQ4_NL should use the IQ4_NL native codebook";
+}
+
+TEST_F(Test__KernelFactoryCacheInvalidation, CUDAPackedWeights_NativeFormatsRemainLazyBeforeFirstExecution)
+{
+    const auto &dm = DeviceManager::instance();
+    const auto &devices = dm.devices();
+    bool has_cuda = false;
+
+    for (const auto &dev : devices)
+    {
+        if (dev.type == ComputeBackendType::GPU_CUDA)
+        {
+            has_cuda = true;
+            break;
+        }
+    }
+
+    if (!has_cuda)
+    {
+        GTEST_SKIP() << "No CUDA device available";
+    }
+
+    auto tensor = createTestTensor();
+
+    KernelFactory::CUDAOrdinalGuard guard(0);
+    auto kernel = KernelFactory::createGemm(
+        dynamic_cast<const IQ4_NLTensor *>(tensor.get()),
+        DeviceType::CUDA);
+    ASSERT_NE(kernel, nullptr);
+
+    auto *packed = KernelFactory::ensureCUDAPackedWeightsInTensorCache(tensor.get());
+    ASSERT_NE(packed, nullptr);
+    EXPECT_FALSE(packed->uploaded) << "CUDA packed weights should remain lazy until first execution";
+    EXPECT_TRUE(packed->device_uploads.empty()) << "Kernel construction alone should not populate device upload state";
+    EXPECT_FALSE(packed->int8_data.empty()) << "Lazy CUDA cache should retain INT8 fallback host buffers";
+    EXPECT_FALSE(packed->native_payload.empty()) << "Lazy CUDA cache should retain native payload host buffers";
 }
 
 TEST_F(Test__KernelFactoryCacheInvalidation, BothCaches_CleanedUpTogether)

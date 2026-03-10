@@ -34,12 +34,16 @@
 #include "utils/Logger.h"
 #include "utils/CUDAKernelProfiler.h"
 
+#include <cuda_runtime.h>
+
 #include <stdexcept>
 #include <vector>
 #include <cmath>
 #include <algorithm>
 #include <cstring>
 #include <mutex>
+#include <atomic>
+#include <unordered_set>
 
 namespace llaminar2
 {
@@ -125,6 +129,27 @@ namespace llaminar2
                 int cuda_device_id,
                 void *stream = nullptr);
 
+            bool cudaQuantGemm_prepareTensorCoreBlockedWeights(
+                const int8_t *d_weights_int8,
+                int8_t **d_weights_int8_tc_blocked,
+                int K, int N,
+                int cuda_device_id,
+                void *stream = nullptr);
+
+            bool cudaQuantGemm_blockwiseTensorCoreGemm(
+                const int8_t *d_A_int8,
+                const int8_t *d_weights_int8_tc_blocked,
+                int32_t *d_partial_int32,
+                float *d_C_fp32,
+                const float *d_scales_A_blockwise,
+                const float *d_scales_B,
+                int M, int N, int K,
+                float alpha, float beta,
+                const float *d_C_existing,
+                const float *d_bias,
+                int cuda_device_id,
+                void *stream = nullptr);
+
             // Free device memory
             void cudaQuantGemm_freeDevice(void *d_ptr);
 
@@ -136,6 +161,83 @@ namespace llaminar2
             bool cudaQuantGemm_copyDeviceToDeviceAsync(float *d_dst, const float *d_src, size_t count, int cuda_device_id, void *stream);
             bool cudaQuantGemm_setDevice(int cuda_device_id);
             bool cudaQuantGemm_streamSync(int cuda_device_id, void *stream);
+
+            // -----------------------------------------------------------------
+            // Per-shape tensor-core GEMV kernel family
+            // (CUDATensorCoreGemvKernels.cu)
+            // -----------------------------------------------------------------
+            void cudaTCGemv_setTuningOverrides(int tn, int cpt, int kb, int wk);
+
+            bool cudaTCGemv_blockwiseGemv(
+                const int8_t *d_A_int8,
+                const int8_t *d_B_int8,
+                float *d_C_fp32,
+                const float *d_scales_A_block,
+                const float *d_scales_B,
+                int N, int K,
+                float alpha, float beta,
+                const float *d_C_existing,
+                const float *d_bias,
+                int cuda_device_id,
+                void *stream);
+
+            bool cudaNativePayloadGemv_supportsCodebook(uint8_t codebook_id);
+
+            bool cudaNativePayloadInitIQGridTables();
+
+            bool cudaNativePayloadGemv_fp32(
+                const int8_t *d_A_int8,
+                const uint8_t *d_payload,
+                const uint16_t *d_scales,
+                const uint16_t *d_mins,
+                const uint32_t *d_emins,
+                float *d_C_fp32,
+                const float *d_scales_A_block,
+                int N, int K,
+                float alpha, float beta,
+                const float *d_C_existing,
+                const float *d_bias,
+                uint8_t codebook_id,
+                int cuda_device_id,
+                void *stream);
+
+            bool cudaNativePayloadInitIQGridTables_gemm();
+
+            bool cudaNativePayloadGemm_fp32(
+                const int8_t *d_A_int8,
+                const uint8_t *d_payload,
+                const uint16_t *d_scales,
+                const uint16_t *d_mins,
+                const uint32_t *d_emins,
+                float *d_C_fp32,
+                const float *d_scales_A_block,
+                int M, int N, int K,
+                float alpha, float beta,
+                const float *d_C_existing,
+                const float *d_bias,
+                uint8_t codebook_id,
+                int cuda_device_id,
+                void *stream);
+
+            // -----------------------------------------------------------------
+            // Per-shape tensor-core GEMM kernel family
+            // (CUDATensorCoreGemmKernels.cu)
+            // -----------------------------------------------------------------
+            void cudaTCGemm_setTuningOverrides(int force_v3, int force_v7, int mt, int kt, int splitk);
+
+            bool cudaTCGemm_blockwiseGemm(
+                const int8_t *d_A_int8,
+                const int8_t *d_B_int8_tc_blocked,
+                int32_t *d_partial_int32,
+                float *d_C_fp32,
+                const float *d_scales_A_block,
+                const float *d_scales_B,
+                int M, int N, int K,
+                float alpha, float beta,
+                const float *d_C_existing,
+                const float *d_bias,
+                int cuda_device_id,
+                void *stream);
         }
 
         // =====================================================================
@@ -147,6 +249,13 @@ namespace llaminar2
             // Device memory for converted weights (only used when owns_weight_memory_ = true)
             int8_t *d_weights_int8 = nullptr; // [K x N] ColumnMajor
             float *d_scales_B = nullptr;      // [N] per-column scales
+            int8_t *d_weights_int8_tc_blocked = nullptr; // [K/32][N][32] tensor-core layout
+            uint8_t *d_weights_native_payload = nullptr;
+            uint16_t *d_weights_native_scales = nullptr;
+            uint16_t *d_weights_native_mins = nullptr;
+            uint32_t *d_weights_native_emins = nullptr;
+            uint8_t native_codebook_id = 0;
+            uint32_t native_blocks_per_row = 0;
 
             // Work buffers - ALWAYS from workspace (never owned by kernel)
             // These pointers are set from workspace in validateWorkspace()
@@ -156,6 +265,7 @@ namespace llaminar2
 
             // Flag to track if we own weight memory
             bool owns_weight_memory = false;
+            bool owns_tc_blocked_weight_memory = false;
 
             ~Impl()
             {
@@ -167,96 +277,298 @@ namespace llaminar2
                     if (d_scales_B)
                         cudaQuantGemm_freeDevice(d_scales_B);
                 }
+                if (owns_tc_blocked_weight_memory && d_weights_int8_tc_blocked)
+                {
+                    cudaQuantGemm_freeDevice(d_weights_int8_tc_blocked);
+                }
+                if (owns_weight_memory)
+                {
+                    if (d_weights_native_payload)
+                        cudaQuantGemm_freeDevice(d_weights_native_payload);
+                    if (d_weights_native_scales)
+                        cudaQuantGemm_freeDevice(d_weights_native_scales);
+                    if (d_weights_native_mins)
+                        cudaQuantGemm_freeDevice(d_weights_native_mins);
+                    if (d_weights_native_emins)
+                        cudaQuantGemm_freeDevice(d_weights_native_emins);
+                }
                 // Work buffers are NEVER owned by kernel - they come from workspace
             }
         };
 
-        // =====================================================================
-        // CUDAPackedWeights destructor
-        // =====================================================================
-
-        CUDAPackedWeights::~CUDAPackedWeights()
+        namespace
         {
-            for (auto &[device_id, upload] : device_uploads)
+            std::atomic<CUDABlockwiseExecutionBackend> g_blockwise_backend{CUDABlockwiseExecutionBackend::LegacyDP4A};
+
+            template <typename T>
+            bool uploadHostArrayToDevice(
+                const std::vector<T> &host,
+                T **device,
+                int cuda_device_id)
             {
-                (void)device_id;
-                if (upload.d_int8_data)
-                    cudaQuantGemm_freeDevice(upload.d_int8_data);
-                if (upload.d_scales)
-                    cudaQuantGemm_freeDevice(upload.d_scales);
+                *device = nullptr;
+                if (host.empty())
+                {
+                    return true;
+                }
+
+                if (cudaSetDevice(cuda_device_id) != cudaSuccess)
+                {
+                    return false;
+                }
+
+                const size_t bytes = host.size() * sizeof(T);
+                if (cudaMalloc(reinterpret_cast<void **>(device), bytes) != cudaSuccess)
+                {
+                    *device = nullptr;
+                    return false;
+                }
+
+                if (cudaMemcpy(*device, host.data(), bytes, cudaMemcpyHostToDevice) != cudaSuccess)
+                {
+                    cudaFree(*device);
+                    *device = nullptr;
+                    return false;
+                }
+
+                return true;
             }
 
-            if (device_uploads.empty())
+            void freeDeviceUploadNativeBuffers(CUDAPackedWeights::DeviceUpload &upload)
             {
-                if (d_int8_data)
-                    cudaQuantGemm_freeDevice(d_int8_data);
-                if (d_scales)
-                    cudaQuantGemm_freeDevice(d_scales);
+                if (upload.d_native_payload)
+                    cudaQuantGemm_freeDevice(upload.d_native_payload);
+                if (upload.d_native_scales)
+                    cudaQuantGemm_freeDevice(upload.d_native_scales);
+                if (upload.d_native_mins)
+                    cudaQuantGemm_freeDevice(upload.d_native_mins);
+                if (upload.d_native_emins)
+                    cudaQuantGemm_freeDevice(upload.d_native_emins);
+
+                upload.d_native_payload = nullptr;
+                upload.d_native_scales = nullptr;
+                upload.d_native_mins = nullptr;
+                upload.d_native_emins = nullptr;
+            }
+
+            bool uploadNativePackedWeights(
+                const CUDAPackedWeights &packed,
+                CUDAPackedWeights::DeviceUpload &upload,
+                int cuda_device_id)
+            {
+                if (!uploadHostArrayToDevice(packed.native_payload, &upload.d_native_payload, cuda_device_id) ||
+                    !uploadHostArrayToDevice(packed.native_scales, &upload.d_native_scales, cuda_device_id) ||
+                    !uploadHostArrayToDevice(packed.native_mins, &upload.d_native_mins, cuda_device_id) ||
+                    !uploadHostArrayToDevice(packed.native_emins, &upload.d_native_emins, cuda_device_id))
+                {
+                    freeDeviceUploadNativeBuffers(upload);
+                    return false;
+                }
+
+                return true;
+            }
+
+            bool runSelectedBlockwiseBackend(
+                const int8_t *d_A_int8,
+                const int8_t *d_weights_int8,
+                const int8_t *d_weights_int8_tc_blocked,
+                int32_t *d_partial_int32,
+                float *d_C_fp32,
+                const float *d_scales_A_blockwise,
+                const float *d_scales_B,
+                int m, int n, int k,
+                float alpha, float beta,
+                const float *d_C_existing,
+                const float *d_bias,
+                int cuda_device_id,
+                void *stream)
+            {
+                const auto backend = g_blockwise_backend.load(std::memory_order_relaxed);
+
+                // ── New per-shape kernel family (GEMV M=1, GEMM M>1) ──
+                if (backend == CUDABlockwiseExecutionBackend::SpecializedBlockwise)
+                {
+                    bool ok = false;
+                    if (m <= 1)
+                    {
+                        // GEMV path: d_A_int8 is [K], d_scales_A_blockwise is [K/32]
+                        ok = cudaTCGemv_blockwiseGemv(
+                            d_A_int8, d_weights_int8, d_C_fp32,
+                            d_scales_A_blockwise, d_scales_B,
+                            n, k,
+                            alpha, beta, d_C_existing, d_bias,
+                            cuda_device_id, stream);
+                    }
+                    else
+                    {
+                        // GEMM path: blocked weights + INT32 partial workspace.
+                        ok = d_weights_int8_tc_blocked && cudaTCGemm_blockwiseGemm(
+                            d_A_int8, d_weights_int8_tc_blocked, d_partial_int32, d_C_fp32,
+                            d_scales_A_blockwise, d_scales_B,
+                            m, n, k,
+                            alpha, beta, d_C_existing, d_bias,
+                            cuda_device_id, stream);
+                    }
+
+                    if (ok) return true;
+
+                    LOG_WARN("[CUDAQuantisedGemmKernel] SpecializedBlockwise path failed (M=" << m
+                             << "), falling back to legacy dp4a");
+                }
+
+                // ── Original tensor-core scaffold ──
+                if (backend == CUDABlockwiseExecutionBackend::TensorCoreScaffold && d_weights_int8_tc_blocked)
+                {
+                    if (cudaQuantGemm_blockwiseTensorCoreGemm(
+                            d_A_int8,
+                            d_weights_int8_tc_blocked,
+                            d_partial_int32,
+                            d_C_fp32,
+                            d_scales_A_blockwise,
+                            d_scales_B,
+                            m, n, k,
+                            alpha, beta,
+                            d_C_existing,
+                            d_bias,
+                            cuda_device_id,
+                            stream))
+                    {
+                        return true;
+                    }
+
+                    LOG_WARN("[CUDAQuantisedGemmKernel] TensorCore scaffold blockwise path failed, falling back to legacy dp4a");
+                }
+
+                return cudaQuantGemm_blockwiseGemm(
+                    d_A_int8,
+                    d_weights_int8,
+                    d_C_fp32,
+                    d_scales_A_blockwise,
+                    d_scales_B,
+                    m, n, k,
+                    alpha, beta,
+                    d_C_existing,
+                    d_bias,
+                    cuda_device_id,
+                    stream);
+            }
+
+            template <typename ImplT>
+            bool canUseNativePayloadBlockwise(const ImplT *impl, int m, int k)
+            {
+                return impl &&
+                       m > 0 &&
+                       k > 0 &&
+                       (k % 32) == 0 &&
+                       impl->d_weights_native_payload &&
+                       impl->d_weights_native_scales &&
+                       cudaNativePayloadGemv_supportsCodebook(impl->native_codebook_id);
+            }
+
+            template <typename ImplT>
+            bool runNativePayloadBlockwiseIfSupported(
+                const ImplT *impl,
+                const int8_t *d_A_int8,
+                float *d_C_fp32,
+                const float *d_scales_A_blockwise,
+                int m, int n, int k,
+                float alpha, float beta,
+                const float *d_C_existing,
+                const float *d_bias,
+                int cuda_device_id,
+                void *stream)
+            {
+                if (!canUseNativePayloadBlockwise(impl, m, k))
+                {
+                    return false;
+                }
+
+                const bool needs_iq_tables = impl->native_codebook_id >= 11 && impl->native_codebook_id <= 17;
+                if (needs_iq_tables)
+                {
+                    static std::mutex iq_table_mutex;
+                    static std::unordered_set<int> gemv_init_devices;
+                    static std::unordered_set<int> gemm_init_devices;
+
+                    std::lock_guard<std::mutex> lock(iq_table_mutex);
+                    auto &initialized = (m == 1) ? gemv_init_devices : gemm_init_devices;
+                    if (!initialized.count(cuda_device_id))
+                    {
+                        if (!cudaQuantGemm_setDevice(cuda_device_id))
+                        {
+                            LOG_ERROR("[CUDAQuantisedGemmKernel] Failed to set CUDA device " << cuda_device_id
+                                                                                               << " before IQ grid table initialization");
+                            return false;
+                        }
+                        const bool ok = (m == 1)
+                            ? cudaNativePayloadInitIQGridTables()
+                            : cudaNativePayloadInitIQGridTables_gemm();
+                        if (!ok)
+                        {
+                            LOG_ERROR("[CUDAQuantisedGemmKernel] Failed to initialize IQ grid tables for CUDA device " << cuda_device_id);
+                            return false;
+                        }
+                        initialized.insert(cuda_device_id);
+                    }
+                }
+
+                if (m == 1)
+                {
+                    static std::once_flag native_payload_decode_once;
+                    std::call_once(native_payload_decode_once, [&]()
+                    {
+                        LOG_INFO("[CUDAQuantisedGemmKernel] NativePayload GEMV decode enabled for supported CUDA codebooks");
+                    });
+
+                    return cudaNativePayloadGemv_fp32(
+                        d_A_int8,
+                        impl->d_weights_native_payload,
+                        impl->d_weights_native_scales,
+                        impl->d_weights_native_mins,
+                        impl->d_weights_native_emins,
+                        d_C_fp32,
+                        d_scales_A_blockwise,
+                        n, k,
+                        alpha, beta,
+                        d_C_existing,
+                        d_bias,
+                        impl->native_codebook_id,
+                        cuda_device_id,
+                        stream);
+                }
+
+                static std::once_flag native_payload_prefill_once;
+                std::call_once(native_payload_prefill_once, [&]()
+                {
+                    LOG_INFO("[CUDAQuantisedGemmKernel] NativePayload GEMM prefill enabled for supported CUDA codebooks");
+                });
+
+                return cudaNativePayloadGemm_fp32(
+                    d_A_int8,
+                    impl->d_weights_native_payload,
+                    impl->d_weights_native_scales,
+                    impl->d_weights_native_mins,
+                    impl->d_weights_native_emins,
+                    d_C_fp32,
+                    d_scales_A_blockwise,
+                    m, n, k,
+                    alpha, beta,
+                    d_C_existing,
+                    d_bias,
+                    impl->native_codebook_id,
+                    cuda_device_id,
+                    stream);
             }
         }
 
-        // =====================================================================
-        // packWeightsToCUDA: Convert any quantized tensor to INT8 + scales
-        // =====================================================================
-
-        bool packWeightsToCUDA(const TensorBase *tensor, CUDAPackedWeights &out)
+        void CUDAQuantisedGemmKernel::setBlockwiseExecutionBackend(CUDABlockwiseExecutionBackend backend)
         {
-            if (!tensor)
-            {
-                LOG_ERROR("[packWeightsToCUDA] Null tensor");
-                return false;
-            }
+            g_blockwise_backend.store(backend, std::memory_order_relaxed);
+        }
 
-            const int N = static_cast<int>(tensor->rows()); // Output features
-            const int K = static_cast<int>(tensor->cols()); // Input features
-
-            // Get dequantized FP32 data
-            const float *h_weights_fp32 = tensor->data();
-            if (!h_weights_fp32)
-            {
-                LOG_ERROR("[packWeightsToCUDA] Failed to get FP32 data from tensor");
-                return false;
-            }
-
-            // Allocate output vectors
-            out.int8_data.resize(static_cast<size_t>(K) * N);
-            out.scales.resize(N);
-            out.K = K;
-            out.N = N;
-
-            // Per-column (per-output-feature) symmetric quantization
-            // Weight tensor is [N x K] row-major (output_features × input_features)
-            // CUTLASS wants [K × N] column-major, but memory layout is same!
-            for (int n = 0; n < N; ++n)
-            {
-                // Find max_abs for this output feature
-                float max_abs = 0.0f;
-                for (int k = 0; k < K; ++k)
-                {
-                    float val = h_weights_fp32[n * K + k];
-                    max_abs = std::max(max_abs, std::abs(val));
-                }
-
-                float scale = (max_abs > 0.0f) ? (max_abs / 127.0f) : 1.0f;
-                float inv_scale = 1.0f / scale;
-                out.scales[n] = scale;
-
-                // Quantize: column-major layout [K × N] means element (k, n) at offset n * K + k
-                for (int k = 0; k < K; ++k)
-                {
-                    float val = h_weights_fp32[n * K + k];
-                    int8_t quantized = static_cast<int8_t>(
-                        std::round(std::clamp(val * inv_scale, -127.0f, 127.0f)));
-                    out.int8_data[n * K + k] = quantized;
-                }
-            }
-
-            LOG_DEBUG("[packWeightsToCUDA] Packed " << N << "x" << K << " weights to INT8");
-            // Debug: verify scales are all positive (should be since scale = max_abs / 127.0f)
-            LOG_DEBUG("[packWeightsToCUDA] First 4 host scales: "
-                      << out.scales[0] << "," << (N > 1 ? out.scales[1] : 0.f) << ","
-                      << (N > 2 ? out.scales[2] : 0.f) << "," << (N > 3 ? out.scales[3] : 0.f));
-            return true;
+        CUDABlockwiseExecutionBackend CUDAQuantisedGemmKernel::getBlockwiseExecutionBackend()
+        {
+            return g_blockwise_backend.load(std::memory_order_relaxed);
         }
 
         // =====================================================================
@@ -426,6 +738,25 @@ namespace llaminar2
                         throw std::runtime_error("[CUDAQuantisedGemmKernel] Failed to upload pre-packed weights");
                     }
 
+                    if (!uploadNativePackedWeights(*packed_, upload, cuda_device_id_))
+                    {
+                        if (upload.d_int8_data)
+                            cudaQuantGemm_freeDevice(upload.d_int8_data);
+                        if (upload.d_scales)
+                            cudaQuantGemm_freeDevice(upload.d_scales);
+                        throw std::runtime_error("[CUDAQuantisedGemmKernel] Failed to upload pre-packed native buffers");
+                    }
+
+                    if (!cudaQuantGemm_prepareTensorCoreBlockedWeights(
+                            upload.d_int8_data,
+                            &upload.d_int8_data_tc_blocked,
+                            packed_->K,
+                            packed_->N,
+                            cuda_device_id_))
+                    {
+                        LOG_WARN("[CUDAQuantisedGemmKernel] Failed to prepare tensor-core blocked weights; legacy blockwise path remains available");
+                    }
+
                     auto emplaced = packed_->device_uploads.emplace(cuda_device_id_, upload);
                     upload_it = emplaced.first;
                 }
@@ -433,12 +764,23 @@ namespace llaminar2
                 const auto &upload = upload_it->second;
                 packed_->d_int8_data = upload.d_int8_data;
                 packed_->d_scales = upload.d_scales;
+                packed_->d_int8_data_tc_blocked = upload.d_int8_data_tc_blocked;
+                packed_->d_native_payload = upload.d_native_payload;
+                packed_->d_native_scales = upload.d_native_scales;
+                packed_->d_native_mins = upload.d_native_mins;
+                packed_->d_native_emins = upload.d_native_emins;
                 packed_->cuda_device_id = cuda_device_id_;
                 packed_->uploaded = true;
 
-                // Reference device pointers from packed cache
                 impl_->d_weights_int8 = upload.d_int8_data;
                 impl_->d_scales_B = upload.d_scales;
+                impl_->d_weights_int8_tc_blocked = upload.d_int8_data_tc_blocked;
+                impl_->d_weights_native_payload = upload.d_native_payload;
+                impl_->d_weights_native_scales = upload.d_native_scales;
+                impl_->d_weights_native_mins = upload.d_native_mins;
+                impl_->d_weights_native_emins = upload.d_native_emins;
+                impl_->native_codebook_id = packed_->native_codebook_id;
+                impl_->native_blocks_per_row = packed_->native_blocks_per_row;
                 weights_converted_ = true;
 
                 // Release host-side packing buffers — data is now on GPU.
@@ -450,11 +792,23 @@ namespace llaminar2
                 {
                     const size_t freed_bytes =
                         packed_->int8_data.capacity() +
-                        packed_->scales.capacity() * sizeof(float);
+                        packed_->scales.capacity() * sizeof(float) +
+                        packed_->native_payload.capacity() +
+                        packed_->native_scales.capacity() * sizeof(uint16_t) +
+                        packed_->native_mins.capacity() * sizeof(uint16_t) +
+                        packed_->native_emins.capacity() * sizeof(uint32_t);
                     packed_->int8_data.clear();
                     packed_->int8_data.shrink_to_fit();
                     packed_->scales.clear();
                     packed_->scales.shrink_to_fit();
+                    packed_->native_payload.clear();
+                    packed_->native_payload.shrink_to_fit();
+                    packed_->native_scales.clear();
+                    packed_->native_scales.shrink_to_fit();
+                    packed_->native_mins.clear();
+                    packed_->native_mins.shrink_to_fit();
+                    packed_->native_emins.clear();
+                    packed_->native_emins.shrink_to_fit();
                     if (freed_bytes > 0)
                     {
                         LOG_DEBUG("[CUDAQuantisedGemmKernel] Released host packing buffers: "
@@ -492,38 +846,17 @@ namespace llaminar2
                                                                        << h_weights_fp32[3] << ", " << h_weights_fp32[4]);
             }
 
-            // Per-column symmetric quantization to INT8
-            std::vector<int8_t> h_weights_int8(K_ * N_);
-            std::vector<float> h_scales_B(N_);
-
-            for (size_t n = 0; n < N_; ++n) // For each output feature
+            CUDAPackedWeights legacy_packed;
+            if (!packWeightsToCUDA(weights_, legacy_packed))
             {
-                // Find max_abs for this output feature
-                float max_abs = 0.0f;
-                for (size_t k = 0; k < K_; ++k)
-                {
-                    float val = h_weights_fp32[n * K_ + k];
-                    max_abs = std::max(max_abs, std::abs(val));
-                }
-
-                float scale = (max_abs > 0.0f) ? (max_abs / 127.0f) : 1.0f;
-                float inv_scale = 1.0f / scale;
-                h_scales_B[n] = scale;
-
-                // Quantize: column-major layout means element (k, n) at offset n * K + k
-                for (size_t k = 0; k < K_; ++k)
-                {
-                    float val = h_weights_fp32[n * K_ + k];
-                    int8_t quantized = static_cast<int8_t>(
-                        std::round(std::clamp(val * inv_scale, -127.0f, 127.0f)));
-                    h_weights_int8[n * K_ + k] = quantized;
-                }
+                throw std::runtime_error(
+                    "[CUDAQuantisedGemmKernel] Failed to pack converted weights");
             }
 
             // Upload to device
             if (!cudaQuantGemm_uploadWeights(
-                    h_weights_int8.data(),
-                    h_scales_B.data(),
+                    legacy_packed.int8_data.data(),
+                    legacy_packed.scales.data(),
                     &impl_->d_weights_int8,
                     &impl_->d_scales_B,
                     static_cast<int>(K_),
@@ -532,6 +865,36 @@ namespace llaminar2
             {
                 throw std::runtime_error("[CUDAQuantisedGemmKernel] Failed to upload converted weights");
             }
+
+            if (!uploadNativePackedWeights(legacy_packed, legacy_packed.device_uploads[cuda_device_id_], cuda_device_id_))
+            {
+                throw std::runtime_error("[CUDAQuantisedGemmKernel] Failed to upload converted native buffers");
+            }
+
+            legacy_packed.device_uploads[cuda_device_id_].d_int8_data = impl_->d_weights_int8;
+            legacy_packed.device_uploads[cuda_device_id_].d_scales = impl_->d_scales_B;
+
+            if (cudaQuantGemm_prepareTensorCoreBlockedWeights(
+                    impl_->d_weights_int8,
+                    &impl_->d_weights_int8_tc_blocked,
+                    static_cast<int>(K_),
+                    static_cast<int>(N_),
+                    cuda_device_id_))
+            {
+                impl_->owns_tc_blocked_weight_memory = true;
+            }
+            else
+            {
+                LOG_WARN("[CUDAQuantisedGemmKernel] Failed to prepare tensor-core blocked weights in legacy path; legacy blockwise path remains available");
+            }
+
+            legacy_packed.device_uploads[cuda_device_id_].d_int8_data_tc_blocked = impl_->d_weights_int8_tc_blocked;
+            impl_->d_weights_native_payload = legacy_packed.device_uploads[cuda_device_id_].d_native_payload;
+            impl_->d_weights_native_scales = legacy_packed.device_uploads[cuda_device_id_].d_native_scales;
+            impl_->d_weights_native_mins = legacy_packed.device_uploads[cuda_device_id_].d_native_mins;
+            impl_->d_weights_native_emins = legacy_packed.device_uploads[cuda_device_id_].d_native_emins;
+            impl_->native_codebook_id = legacy_packed.native_codebook_id;
+            impl_->native_blocks_per_row = legacy_packed.native_blocks_per_row;
 
             weights_converted_ = true;
             LOG_DEBUG("[CUDAQuantisedGemmKernel] Weight conversion complete (legacy)");
@@ -1065,9 +1428,9 @@ namespace llaminar2
             validateWorkspace();
             int8_t *d_A_int8 = static_cast<int8_t *>(workspace_->getBuffer(GemmWorkspaceBuffers::QUANT_A));
 
-            // Use blockwise quantization for prefill (M>1) when K is block-aligned.
-            // For M=1 decode, CUTLASS Tensor Cores are faster than our custom dp4a kernel.
-            const bool use_blockwise = (m > 1 && k % 32 == 0);
+            // Use blockwise quantization for prefill and for decode when a native
+            // payload GEMV path is available.
+            const bool use_blockwise = (k % 32 == 0) && (m > 1 || canUseNativePayloadBlockwise(impl_.get(), m, k));
             float *d_scales_A = nullptr;
             float *d_scales_A_blockwise = nullptr;
 
@@ -1245,15 +1608,35 @@ namespace llaminar2
 
                 if (use_blockwise)
                 {
+                        if (runNativePayloadBlockwiseIfSupported(
+                            cuda_kernel->impl_.get(),
+                            d_A_int8,
+                            d_output,
+                            d_scales_A_blockwise,
+                            m, n, k,
+                            1.0f, 0.0f,
+                            nullptr,
+                            d_bias,
+                            cuda_device_id_, gpu_stream_))
+                    {
+                        continue;
+                    }
+
                     // Blockwise GEMM: produces final FP32 output directly (includes per-block scales, weight scales, bias)
                     CUDA_KERNEL_PROFILE_SCOPE(CUDAKernelType::GEMM);
-                    if (!cudaQuantGemm_blockwiseGemm(
-                            d_A_int8,                           // SHARED blockwise-quantized activations
-                            cuda_kernel->impl_->d_weights_int8, // This projection's weights
-                            d_output,                           // Output FP32 (direct)
-                            d_scales_A_blockwise,               // SHARED blockwise activation scales
-                            cuda_kernel->impl_->d_scales_B,     // This projection's weight scales
-                            m, n, k, 1.0f, 0.0f, nullptr, d_bias, cuda_device_id_, gpu_stream_))
+                        if (!runSelectedBlockwiseBackend(
+                            d_A_int8,
+                            cuda_kernel->impl_->d_weights_int8,
+                            cuda_kernel->impl_->d_weights_int8_tc_blocked,
+                            proj_d_C_int32,
+                            d_output,
+                            d_scales_A_blockwise,
+                            cuda_kernel->impl_->d_scales_B,
+                            m, n, k,
+                            1.0f, 0.0f,
+                            nullptr,
+                            d_bias,
+                            cuda_device_id_, gpu_stream_))
                     {
                         LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fused_tensor] Blockwise GEMM failed for projection " << i);
                         all_success = false;
@@ -1349,13 +1732,14 @@ namespace llaminar2
 
             // Get workspace buffer pointers
             int8_t *d_A_int8 = static_cast<int8_t *>(workspace_->getBuffer(GemmWorkspaceBuffers::QUANT_A));
+            int32_t *d_C_int32 = static_cast<int32_t *>(workspace_->getBuffer(GemmWorkspaceBuffers::ACC_INT32));
 
             // Ensure weights converted
             ensureWeightsConverted();
 
-            // Use blockwise quantization for prefill (M>1) when K is block-aligned.
-            // For M=1 decode, CUTLASS Tensor Cores are faster than our custom dp4a kernel.
-            const bool use_blockwise = (m > 1 && k % 32 == 0);
+            // Use blockwise quantization for prefill and for decode when a native
+            // payload GEMV path is available.
+            const bool use_blockwise = (k % 32 == 0) && (m > 1 || canUseNativePayloadBlockwise(impl_.get(), m, k));
 
             if (use_blockwise)
             {
@@ -1369,14 +1753,38 @@ namespace llaminar2
                     return false;
                 }
 
-                // Step 2: Blockwise GEMM (produces FP32 directly, includes scaling)
                 const float *d_C_existing = (beta != 0.0f) ? d_C : nullptr;
+                if (runNativePayloadBlockwiseIfSupported(
+                        impl_.get(),
+                        d_A_int8,
+                        d_C,
+                        d_scales_A_blockwise,
+                        m, n, k,
+                        alpha, beta,
+                        d_C_existing,
+                        nullptr,
+                        cuda_device_id_, gpu_stream_))
+                {
+                    LOG_DEBUG("[CUDAQuantisedGemmKernel::multiply_fp32_to_fp32] Complete (native payload GEMV)");
+                    return true;
+                }
+
+                // Step 2: Blockwise GEMM (produces FP32 directly, includes scaling)
                 {
                     CUDA_KERNEL_PROFILE_SCOPE(CUDAKernelType::GEMM);
-                    if (!cudaQuantGemm_blockwiseGemm(
-                            d_A_int8, impl_->d_weights_int8, d_C,
-                            d_scales_A_blockwise, impl_->d_scales_B,
-                            m, n, k, alpha, beta, d_C_existing, nullptr, cuda_device_id_, gpu_stream_))
+                        if (!runSelectedBlockwiseBackend(
+                            d_A_int8,
+                            impl_->d_weights_int8,
+                            impl_->d_weights_int8_tc_blocked,
+                            d_C_int32,
+                            d_C,
+                            d_scales_A_blockwise,
+                            impl_->d_scales_B,
+                            m, n, k,
+                            alpha, beta,
+                            d_C_existing,
+                            nullptr,
+                            cuda_device_id_, gpu_stream_))
                     {
                         LOG_ERROR("[CUDAQuantisedGemmKernel] Blockwise GEMM failed");
                         return false;
@@ -1389,7 +1797,6 @@ namespace llaminar2
 
             // Row-wise CUTLASS path (fallback when K not divisible by 32)
             float *d_scales_A = static_cast<float *>(workspace_->getBuffer(GemmWorkspaceBuffers::SCALES_A));
-            int32_t *d_C_int32 = static_cast<int32_t *>(workspace_->getBuffer(GemmWorkspaceBuffers::ACC_INT32));
 
 #ifdef LLAMINAR_DEBUG_GEMM_VALUES
             // Debug: Sample scales_B (weight scales) - EXPENSIVE, guarded by compile flag
@@ -1508,13 +1915,15 @@ namespace llaminar2
 
             // Get workspace buffer pointers
             int8_t *d_A_int8 = static_cast<int8_t *>(workspace_->getBuffer(GemmWorkspaceBuffers::QUANT_A));
+            int32_t *d_C_int32 = static_cast<int32_t *>(workspace_->getBuffer(GemmWorkspaceBuffers::ACC_INT32));
 
             // Ensure weights converted
             ensureWeightsConverted();
 
-            // Use blockwise quantization for prefill (M>1) when K is block-aligned.
-            // For M=1 decode, CUTLASS Tensor Cores are faster than our custom dp4a kernel.
-            const bool use_blockwise = (m > 1 && k % 32 == 0);
+            // Use blockwise quantization whenever K is block-aligned so decode can
+            // share one quantization pass across projections and choose either the
+            // NativePayload or Int8Expanded GEMV path per projection.
+            const bool use_blockwise = (k % 32 == 0);
 
             if (use_blockwise)
             {
@@ -1531,14 +1940,38 @@ namespace llaminar2
                     }
                 }
 
-                // Step 2: Blockwise GEMM (produces FP32 directly, includes scaling + bias)
                 const float *d_C_existing = (beta != 0.0f) ? d_C : nullptr;
+                if (runNativePayloadBlockwiseIfSupported(
+                        impl_.get(),
+                        d_A_int8,
+                        d_C,
+                        d_scales_A_blockwise,
+                        m, n, k,
+                        alpha, beta,
+                        d_C_existing,
+                        d_bias,
+                        cuda_device_id_, gpu_stream_))
+                {
+                    LOG_DEBUG("[CUDAQuantisedGemmKernel::multiply_fp32_to_fp32_with_bias] Complete (native payload GEMV)");
+                    return true;
+                }
+
+                // Step 2: Blockwise GEMM (produces FP32 directly, includes scaling + bias)
                 {
                     CUDA_KERNEL_PROFILE_SCOPE(CUDAKernelType::GEMM);
-                    if (!cudaQuantGemm_blockwiseGemm(
-                            d_A_int8, impl_->d_weights_int8, d_C,
-                            d_scales_A_blockwise, impl_->d_scales_B,
-                            m, n, k, alpha, beta, d_C_existing, d_bias, cuda_device_id_, gpu_stream_))
+                        if (!runSelectedBlockwiseBackend(
+                            d_A_int8,
+                            impl_->d_weights_int8,
+                            impl_->d_weights_int8_tc_blocked,
+                            d_C_int32,
+                            d_C,
+                            d_scales_A_blockwise,
+                            impl_->d_scales_B,
+                            m, n, k,
+                            alpha, beta,
+                            d_C_existing,
+                            d_bias,
+                            cuda_device_id_, gpu_stream_))
                     {
                         LOG_ERROR("[CUDAQuantisedGemmKernel] Blockwise GEMM with bias failed");
                         return false;
@@ -1550,7 +1983,6 @@ namespace llaminar2
 
             // Row-wise CUTLASS path (fallback when K not divisible by 32)
             float *d_scales_A = static_cast<float *>(workspace_->getBuffer(GemmWorkspaceBuffers::SCALES_A));
-            int32_t *d_C_int32 = static_cast<int32_t *>(workspace_->getBuffer(GemmWorkspaceBuffers::ACC_INT32));
 
             // Step 1: Quantize activations
             {

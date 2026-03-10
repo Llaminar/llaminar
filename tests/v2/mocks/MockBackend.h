@@ -162,14 +162,16 @@ namespace llaminar2
 
             bool synchronize(int device_id) override
             {
-                // Mock: nothing to synchronize
+                std::lock_guard<std::mutex> lock(mutex_);
+                sync_count_++;
                 (void)device_id;
                 return true;
             }
 
             bool streamSynchronize(int device_id) override
             {
-                // Mock: nothing to synchronize
+                std::lock_guard<std::mutex> lock(mutex_);
+                stream_sync_count_++;
                 (void)device_id;
                 return true;
             }
@@ -495,6 +497,24 @@ namespace llaminar2
                 return stats_.d2h_count;
             }
 
+            /**
+             * @brief Get count of synchronize() calls
+             */
+            size_t getSyncCount() const
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                return sync_count_;
+            }
+
+            /**
+             * @brief Get count of streamSynchronize() calls
+             */
+            size_t getStreamSyncCount() const
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                return stream_sync_count_;
+            }
+
             // =================================================================
             // Allocation Tracking API (Test-specific)
             // =================================================================
@@ -630,6 +650,8 @@ namespace llaminar2
                 std::lock_guard<std::mutex> lock(mutex_);
                 stats_.clear();
                 event_records_.clear();
+                sync_count_ = 0;
+                stream_sync_count_ = 0;
             }
 
         private:
@@ -648,6 +670,8 @@ namespace llaminar2
 
             mutable std::mutex mutex_;
             TransferStats stats_;
+            size_t sync_count_ = 0;
+            size_t stream_sync_count_ = 0;
             std::vector<EventRecord> event_records_;
             std::map<void *, AllocationInfo> allocations_;
             std::map<void *, AllocationInfo> mapped_allocations_;

@@ -26,6 +26,7 @@
 #include "tensors/Tensors.h"
 #include "tensors/TensorKernels.h" // For TensorProjectionDesc
 #include "kernels/KernelFactory.h"
+#include "kernels/cuda/CUDAWeightPacker.h"
 #include "backends/ComputeBackend.h"
 #include "execution/local_execution/device/DeviceContext.h"
 #include "execution/local_execution/coherence/GpuCoherence.h"        // For gpu_output(), with_gpu_coherence()
@@ -310,8 +311,9 @@ protected:
         const std::vector<int> &Ns,
         int K)
     {
-        // Find max requirements across all kernels
-        size_t max_quant_a = 0, max_scales_a = 0, max_acc = 0;
+        // Merge requirements across all kernels by buffer name so fused paths
+        // keep pace with the evolving CUDA workspace contract.
+        WorkspaceRequirements shared_reqs;
 
         for (size_t i = 0; i < kernels.size(); ++i)
         {
@@ -321,21 +323,26 @@ protected:
                 auto reqs = ws_consumer->getWorkspaceRequirements(M, Ns[i], K);
                 for (const auto &buf : reqs.buffers)
                 {
-                    if (buf.name == "gemm_quant_a")
-                        max_quant_a = std::max(max_quant_a, buf.size_bytes);
-                    else if (buf.name == "gemm_scales_a")
-                        max_scales_a = std::max(max_scales_a, buf.size_bytes);
-                    else if (buf.name == "gemm_acc_int32")
-                        max_acc = std::max(max_acc, buf.size_bytes);
+                    auto it = std::find_if(
+                        shared_reqs.buffers.begin(),
+                        shared_reqs.buffers.end(),
+                        [&](const WorkspaceDescriptor &existing)
+                        {
+                            return existing.name == buf.name;
+                        });
+
+                    if (it == shared_reqs.buffers.end())
+                    {
+                        shared_reqs.buffers.push_back(buf);
+                        continue;
+                    }
+
+                    it->size_bytes = std::max(it->size_bytes, buf.size_bytes);
+                    it->alignment = std::max(it->alignment, buf.alignment);
+                    it->required = it->required || buf.required;
                 }
             }
         }
-
-        // Create shared workspace with max requirements
-        WorkspaceRequirements shared_reqs;
-        shared_reqs.buffers.push_back({"gemm_quant_a", max_quant_a, 256, true});
-        shared_reqs.buffers.push_back({"gemm_scales_a", max_scales_a, 256, true});
-        shared_reqs.buffers.push_back({"gemm_acc_int32", max_acc, 256, true});
 
         workspace_ = std::make_unique<DeviceWorkspaceManager>(gpu_device_, 64 * 1024 * 1024); // 64MB
         if (!workspace_->allocate(shared_reqs))
@@ -861,6 +868,51 @@ TEST_F(Test__CUDAGemmParity, Q4_0_DecodeSize_1x896x896)
     cudaFree(d_C);
 }
 
+TEST_F(Test__CUDAGemmParity, Q4_1_DecodeSize_1x896x896)
+{
+    const int M = 1;
+    const int N = 896;
+    const int K = 896;
+
+    auto weights = TestTensorFactory::createQ4_1Random({(size_t)N, (size_t)K}, 122);
+    auto A_data = randomFP32(M * K);
+
+    std::vector<float> C_cpu(M * N, 0.0f);
+    auto cpu_kernel = llaminar::v2::kernels::KernelFactory::createGemm(
+        weights.get(), KernelDeviceType::CPU);
+    ASSERT_NE(cpu_kernel, nullptr);
+    ASSERT_TRUE(cpu_kernel->multiply(A_data.data(), C_cpu.data(), M, N, K));
+
+    ASSERT_TRUE(weights->ensureOnDevice(gpu_device_));
+    auto cuda_kernel = llaminar::v2::kernels::KernelFactory::createGemm(
+        weights.get(), KernelDeviceType::CUDA);
+    ASSERT_NE(cuda_kernel, nullptr);
+
+    ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel.get(), M, N, K));
+
+    float *d_A = nullptr;
+    float *d_C = nullptr;
+    ASSERT_EQ(cudaSuccess, cudaMalloc(&d_A, M * K * sizeof(float)));
+    ASSERT_EQ(cudaSuccess, cudaMalloc(&d_C, M * N * sizeof(float)));
+    ASSERT_EQ(cudaSuccess, cudaMemcpy(d_A, A_data.data(), M * K * sizeof(float), cudaMemcpyHostToDevice));
+    ASSERT_EQ(cudaSuccess, cudaMemset(d_C, 0, M * N * sizeof(float)));
+
+    ASSERT_TRUE(cuda_kernel->multiply(d_A, d_C, M, N, K));
+
+    std::vector<float> C_cuda(M * N);
+    ASSERT_EQ(cudaSuccess, cudaMemcpy(C_cuda.data(), d_C, M * N * sizeof(float), cudaMemcpyDeviceToHost));
+
+    auto result = checkParity(C_cuda.data(), C_cpu.data(), M * N, 0.99, 0.10);
+    result.print("Q4_1 Decode 1x896x896");
+
+    EXPECT_GE(result.cosine_similarity, 0.99);
+    EXPECT_FALSE(result.has_nan_inf);
+
+    cleanupWorkspaceIfNeeded(cuda_kernel.get());
+    cudaFree(d_A);
+    cudaFree(d_C);
+}
+
 // ============================================================================
 // Q4_1 Parity Tests
 // ============================================================================
@@ -873,40 +925,124 @@ DEFINE_QUANTIZED_PARITY_TEST(Q4_1_SmallMatrix, Q4_1Tensor, createQ4_1Random, 32,
 
 DEFINE_QUANTIZED_PARITY_TEST(Q5_0_SmallMatrix, Q5_0Tensor, createQ5_0Random, 32, 104)
 
+TEST_F(Test__CUDAGemmParity, Q5_0_DecodeSize_1x896x896)
+{
+    const int M = 1;
+    const int N = 896;
+    const int K = 896;
+
+    auto weights = TestTensorFactory::createQ5_0Random({(size_t)N, (size_t)K}, 124);
+    auto A_data = randomFP32(M * K);
+
+    std::vector<float> C_cpu(M * N, 0.0f);
+    auto cpu_kernel = llaminar::v2::kernels::KernelFactory::createGemm(
+        weights.get(), KernelDeviceType::CPU);
+    ASSERT_NE(cpu_kernel, nullptr);
+    ASSERT_TRUE(cpu_kernel->multiply(A_data.data(), C_cpu.data(), M, N, K));
+
+    ASSERT_TRUE(weights->ensureOnDevice(gpu_device_));
+    auto cuda_kernel = llaminar::v2::kernels::KernelFactory::createGemm(
+        weights.get(), KernelDeviceType::CUDA);
+    ASSERT_NE(cuda_kernel, nullptr);
+
+    ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel.get(), M, N, K));
+
+    float *d_A = nullptr;
+    float *d_C = nullptr;
+    ASSERT_EQ(cudaSuccess, cudaMalloc(&d_A, M * K * sizeof(float)));
+    ASSERT_EQ(cudaSuccess, cudaMalloc(&d_C, M * N * sizeof(float)));
+    ASSERT_EQ(cudaSuccess, cudaMemcpy(d_A, A_data.data(), M * K * sizeof(float), cudaMemcpyHostToDevice));
+    ASSERT_EQ(cudaSuccess, cudaMemset(d_C, 0, M * N * sizeof(float)));
+
+    ASSERT_TRUE(cuda_kernel->multiply(d_A, d_C, M, N, K));
+
+    std::vector<float> C_cuda(M * N);
+    ASSERT_EQ(cudaSuccess, cudaMemcpy(C_cuda.data(), d_C, M * N * sizeof(float), cudaMemcpyDeviceToHost));
+
+    auto result = checkParity(C_cuda.data(), C_cpu.data(), M * N, 0.99, 0.10);
+    result.print("Q5_0 Decode 1x896x896");
+
+    EXPECT_GE(result.cosine_similarity, 0.99);
+    EXPECT_FALSE(result.has_nan_inf);
+
+    cleanupWorkspaceIfNeeded(cuda_kernel.get());
+    cudaFree(d_A);
+    cudaFree(d_C);
+}
+
 // ============================================================================
 // Q5_1 Parity Tests
 // ============================================================================
 
 DEFINE_QUANTIZED_PARITY_TEST(Q5_1_SmallMatrix, Q5_1Tensor, createQ5_1Random, 32, 105)
 
+TEST_F(Test__CUDAGemmParity, Q5_1_DecodeSize_1x896x896)
+{
+    const int M = 1;
+    const int N = 896;
+    const int K = 896;
+
+    auto weights = TestTensorFactory::createQ5_1Random({(size_t)N, (size_t)K}, 125);
+    auto A_data = randomFP32(M * K);
+
+    std::vector<float> C_cpu(M * N, 0.0f);
+    auto cpu_kernel = llaminar::v2::kernels::KernelFactory::createGemm(
+        weights.get(), KernelDeviceType::CPU);
+    ASSERT_NE(cpu_kernel, nullptr);
+    ASSERT_TRUE(cpu_kernel->multiply(A_data.data(), C_cpu.data(), M, N, K));
+
+    ASSERT_TRUE(weights->ensureOnDevice(gpu_device_));
+    auto cuda_kernel = llaminar::v2::kernels::KernelFactory::createGemm(
+        weights.get(), KernelDeviceType::CUDA);
+    ASSERT_NE(cuda_kernel, nullptr);
+
+    ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel.get(), M, N, K));
+
+    float *d_A = nullptr;
+    float *d_C = nullptr;
+    ASSERT_EQ(cudaSuccess, cudaMalloc(&d_A, M * K * sizeof(float)));
+    ASSERT_EQ(cudaSuccess, cudaMalloc(&d_C, M * N * sizeof(float)));
+    ASSERT_EQ(cudaSuccess, cudaMemcpy(d_A, A_data.data(), M * K * sizeof(float), cudaMemcpyHostToDevice));
+    ASSERT_EQ(cudaSuccess, cudaMemset(d_C, 0, M * N * sizeof(float)));
+
+    ASSERT_TRUE(cuda_kernel->multiply(d_A, d_C, M, N, K));
+
+    std::vector<float> C_cuda(M * N);
+    ASSERT_EQ(cudaSuccess, cudaMemcpy(C_cuda.data(), d_C, M * N * sizeof(float), cudaMemcpyDeviceToHost));
+
+    auto result = checkParity(C_cuda.data(), C_cpu.data(), M * N, 0.99, 0.10);
+    result.print("Q5_1 Decode 1x896x896");
+
+    EXPECT_GE(result.cosine_similarity, 0.99);
+    EXPECT_FALSE(result.has_nan_inf);
+
+    cleanupWorkspaceIfNeeded(cuda_kernel.get());
+    cudaFree(d_A);
+    cudaFree(d_C);
+}
+
 // ============================================================================
 // K-Quant Parity Tests (256-element super-blocks)
-// NOTE: These require proper K-quant encoding which the simple factory methods
-// don't implement. The tests are disabled until proper quantization is added.
-// The CUDA kernel itself supports these formats - just needs proper test data.
 // ============================================================================
 
-// DEFINE_QUANTIZED_PARITY_TEST(Q6_K_SmallMatrix, Q6_KTensor, createQ6_KRandom, 256, 201)
-// DEFINE_QUANTIZED_PARITY_TEST(Q2_K_SmallMatrix, Q2_KTensor, createQ2_KRandom, 256, 202)
-// DEFINE_QUANTIZED_PARITY_TEST(Q3_K_SmallMatrix, Q3_KTensor, createQ3_KRandom, 256, 203)
-// DEFINE_QUANTIZED_PARITY_TEST(Q4_K_SmallMatrix, Q4_KTensor, createQ4_KRandom, 256, 204)
-// DEFINE_QUANTIZED_PARITY_TEST(Q5_K_SmallMatrix, Q5_KTensor, createQ5_KRandom, 256, 205)
+DEFINE_QUANTIZED_PARITY_TEST(Q6_K_SmallMatrix, Q6_KTensor, createQ6_KRandom, 256, 201)
+DEFINE_QUANTIZED_PARITY_TEST(Q2_K_SmallMatrix, Q2_KTensor, createQ2_KRandom, 256, 202)
+DEFINE_QUANTIZED_PARITY_TEST(Q3_K_SmallMatrix, Q3_KTensor, createQ3_KRandom, 256, 203)
+DEFINE_QUANTIZED_PARITY_TEST(Q4_K_SmallMatrix, Q4_KTensor, createQ4_KRandom, 256, 204)
+DEFINE_QUANTIZED_PARITY_TEST(Q5_K_SmallMatrix, Q5_KTensor, createQ5_KRandom, 256, 205)
 
 // ============================================================================
 // IQ (Importance Quantization) Parity Tests
-// NOTE: IQ formats use complex lookup tables and grid indices.
-// Only IQ4_NL has a proper factory implementation.
-// Other IQ formats are disabled until proper quantization is added.
 // ============================================================================
 
-// DEFINE_QUANTIZED_PARITY_TEST(IQ4_XS_SmallMatrix, IQ4_XSTensor, createIQ4_XSRandom, 256, 301)
-// DEFINE_QUANTIZED_PARITY_TEST(IQ2_XXS_SmallMatrix, IQ2_XXSTensor, createIQ2_XXSRandom, 256, 302)
-// DEFINE_QUANTIZED_PARITY_TEST(IQ2_XS_SmallMatrix, IQ2_XSTensor, createIQ2_XSRandom, 256, 303)
-// DEFINE_QUANTIZED_PARITY_TEST(IQ2_S_SmallMatrix, IQ2_STensor, createIQ2_SRandom, 256, 304)
-// DEFINE_QUANTIZED_PARITY_TEST(IQ3_XXS_SmallMatrix, IQ3_XXSTensor, createIQ3_XXSRandom, 256, 305)
-// DEFINE_QUANTIZED_PARITY_TEST(IQ3_S_SmallMatrix, IQ3_STensor, createIQ3_SRandom, 256, 306)
-// DEFINE_QUANTIZED_PARITY_TEST(IQ1_S_SmallMatrix, IQ1_STensor, createIQ1_SRandom, 256, 307)
-// DEFINE_QUANTIZED_PARITY_TEST(IQ1_M_SmallMatrix, IQ1_MTensor, createIQ1_MRandom, 256, 308)
+DEFINE_QUANTIZED_PARITY_TEST(IQ4_XS_SmallMatrix, IQ4_XSTensor, createIQ4_XSRandom, 256, 301)
+DEFINE_QUANTIZED_PARITY_TEST(IQ2_XXS_SmallMatrix, IQ2_XXSTensor, createIQ2_XXSRandom, 256, 302)
+DEFINE_QUANTIZED_PARITY_TEST(IQ2_XS_SmallMatrix, IQ2_XSTensor, createIQ2_XSRandom, 256, 303)
+DEFINE_QUANTIZED_PARITY_TEST(IQ2_S_SmallMatrix, IQ2_STensor, createIQ2_SRandom, 256, 304)
+DEFINE_QUANTIZED_PARITY_TEST(IQ3_XXS_SmallMatrix, IQ3_XXSTensor, createIQ3_XXSRandom, 256, 305)
+DEFINE_QUANTIZED_PARITY_TEST(IQ3_S_SmallMatrix, IQ3_STensor, createIQ3_SRandom, 256, 306)
+DEFINE_QUANTIZED_PARITY_TEST(IQ1_S_SmallMatrix, IQ1_STensor, createIQ1_SRandom, 256, 307)
+DEFINE_QUANTIZED_PARITY_TEST(IQ1_M_SmallMatrix, IQ1_MTensor, createIQ1_MRandom, 256, 308)
 
 // ============================================================================
 // Real Model Weight Parity Tests
@@ -1850,6 +1986,66 @@ TEST_F(Test__CUDAGemmParity, CachedKernel_vs_FreshKernel)
     cleanupSharedWorkspace({fresh_kernel.get(), cached_kernel});
 
     // Clear cache for next test
+    llaminar::v2::kernels::KernelFactory::clearCache();
+}
+
+TEST_F(Test__CUDAGemmParity, CachedIQ4_NLKernel_FirstExecutionPopulatesLazyCUDAUploads)
+{
+    const int M = 8;
+    const int N = 128;
+    const int K = 128;
+
+    auto weights = TestTensorFactory::createIQ4_NLRandom({static_cast<size_t>(N), static_cast<size_t>(K)}, 2026);
+    auto input = TestTensorFactory::createFP32Random({static_cast<size_t>(M), static_cast<size_t>(K)}, -0.25f, 0.25f, 17);
+    auto output = TestTensorFactory::createFP32Zeros({static_cast<size_t>(M), static_cast<size_t>(N)});
+
+    ASSERT_TRUE(weights->ensureOnDevice(gpu_device_));
+
+    auto *packed = llaminar::v2::kernels::KernelFactory::ensureCUDAPackedWeightsInTensorCache(weights.get());
+    ASSERT_NE(packed, nullptr);
+    EXPECT_EQ(packed->preferred_family, llaminar2::cuda::CUDAPackedWeightFamily::NativePayload);
+    EXPECT_EQ(packed->active_family, llaminar2::cuda::CUDAPackedWeightFamily::NativePayload);
+    EXPECT_FALSE(packed->uploaded);
+    EXPECT_TRUE(packed->device_uploads.empty());
+    EXPECT_FALSE(packed->int8_data.empty());
+    EXPECT_FALSE(packed->native_payload.empty());
+
+    auto *cached_kernel = getPreparedKernel(weights.get(), gpu_device_);
+    ASSERT_NE(cached_kernel, nullptr);
+    ASSERT_TRUE(setupWorkspaceIfNeeded(cached_kernel, M, N, K));
+
+    ASSERT_TRUE(with_gpu_coherence(
+        gpu_device_,
+        {input.get()},
+        {output.get()},
+        [&]
+        {
+            return cached_kernel->multiply_tensor(
+                input.get(), output.get(),
+                M, N, K,
+                true, 1.0f, 0.0f,
+                nullptr, nullptr, -1);
+        }));
+
+    EXPECT_TRUE(packed->uploaded);
+    auto upload_it = packed->device_uploads.find(gpu_device_.cuda_ordinal());
+    ASSERT_NE(upload_it, packed->device_uploads.end());
+
+    const auto &upload = upload_it->second;
+    EXPECT_NE(upload.d_int8_data, nullptr);
+    EXPECT_NE(upload.d_scales, nullptr);
+    EXPECT_NE(upload.d_int8_data_tc_blocked, nullptr);
+    EXPECT_NE(upload.d_native_payload, nullptr);
+    EXPECT_NE(upload.d_native_scales, nullptr);
+    EXPECT_EQ(upload.d_native_mins, nullptr);
+    EXPECT_EQ(upload.d_native_emins, nullptr);
+
+    EXPECT_TRUE(packed->int8_data.empty()) << "INT8 fallback host buffers should be released after first upload";
+    EXPECT_TRUE(packed->scales.empty()) << "INT8 fallback host scales should be released after first upload";
+    EXPECT_TRUE(packed->native_payload.empty()) << "Native payload host buffers should be released after first upload";
+    EXPECT_TRUE(packed->native_scales.empty()) << "Native payload host scales should be released after first upload";
+
+    cleanupWorkspaceIfNeeded(cached_kernel);
     llaminar::v2::kernels::KernelFactory::clearCache();
 }
 

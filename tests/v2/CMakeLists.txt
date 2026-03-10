@@ -3961,6 +3961,14 @@ add_v2_test(V2_Perf_CUDAFlashAttention
     MPI_PROCS 1  # Tests GPU attention locally, no MPI needed
 )
 
+add_executable(v2_perf_cuda_blockwise_tensorcore_gemm performance/kernels/cuda/gemm/Perf__CUDABlockwiseTensorCoreGemm.cpp)
+target_link_libraries(v2_perf_cuda_blockwise_tensorcore_gemm llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Perf_CUDABlockwiseTensorCoreGemm
+    COMMAND $<TARGET_FILE:v2_perf_cuda_blockwise_tensorcore_gemm>
+    LABELS "V2;Performance;CUDA;GEMM;GEMV;TensorCore;BlockwiseQuantization;Qwen;Tuning"
+    MPI_PROCS 1
+)
+
 # Test: CUDA Ring Buffer KV Cache Parity
 # Tests ring buffer KV cache with O(1) eviction, wrap-around, batched gather, FP32/FP16/BF16
 if(HAVE_CUDA)
@@ -5191,6 +5199,18 @@ target_link_libraries(v2_test_stream_coherence llaminar2_core GTest::gtest GTest
 add_v2_test(V2_Unit_StreamCoherence
     COMMAND $<TARGET_FILE:v2_test_stream_coherence>
     LABELS "V2;Unit;Coherence;StreamCoherence;StaleEvent;TPAllreduce;AllGather;Regression"
+    MPI_PROCS 1
+)
+
+# Test: CoherenceProtocol (comprehensive GPU tensor coherence protocol tests)
+# Tests all major data paths: ensureOnDevice H2D, data() D2H trigger, allocateOnDevice,
+# ensureOnHost no-op, mark_device_dirty_with_event lifecycle, full state machine, failures.
+# Uses MockBackend DI injection for deterministic testing without GPU hardware.
+add_executable(v2_test_coherence_protocol unit/execution/local_execution/coherence/Test__CoherenceProtocol.cpp)
+target_link_libraries(v2_test_coherence_protocol llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_CoherenceProtocol
+    COMMAND $<TARGET_FILE:v2_test_coherence_protocol>
+    LABELS "V2;Unit;Coherence;CoherenceProtocol;H2D;D2H;DeviceDirty;StateMachine;FailurePath"
     MPI_PROCS 1
 )
 

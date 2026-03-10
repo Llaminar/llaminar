@@ -3024,8 +3024,14 @@ namespace llaminar
                 // destroys shared_ptr on overwrite/destruction, preventing leaks)
                 tensor->cuda_cache_ = new_cache;
 
-                LOG_DEBUG("[KernelFactory] Packed CUDA INT8 weights for tensor "
-                          << tensor << " (" << new_cache->packed.N << "x" << new_cache->packed.K << ")");
+                LOG_DEBUG("[KernelFactory] Packed CUDA weights for tensor "
+                          << tensor << " type=" << llaminar2::tensorTypeName(tensor->native_type())
+                          << " dims=" << new_cache->packed.N << "x" << new_cache->packed.K
+                          << " preferred_family="
+                          << llaminar2::cuda::cudaPackedWeightFamilyName(new_cache->packed.preferred_family)
+                          << " active_family="
+                          << llaminar2::cuda::cudaPackedWeightFamilyName(new_cache->packed.active_family)
+                          << " int8_fallback=" << (!new_cache->packed.int8_data.empty()));
 
                 return &new_cache->packed;
             }

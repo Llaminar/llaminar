@@ -481,8 +481,8 @@ namespace llaminar2
         payload_buf[5] = qh[1];
 
         std::memcpy(vnniPayloadDst(ctx, linear), payload_buf, 6);
-        ctx.scales_array[linear] = fp32_to_fp16(dl1 * 0.125f);
-        ctx.mins_array[linear] = fp32_to_fp16(dl2 * 0.125f);
+        ctx.scales_array[linear] = fp32_to_fp16(dl1);
+        ctx.mins_array[linear] = fp32_to_fp16(dl2);
     }
 
 } // namespace llaminar2

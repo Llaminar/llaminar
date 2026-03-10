@@ -21,15 +21,19 @@
 #include "../execution/local_execution/device/LayerDevicePlacement.h"
 #include "../execution/mpi_orchestration/IExecutionPlanBuilder.h" // For ModelConfig
 #include "../loaders/IWeightManager.h"                            // For IWeightManager interface
+#include <functional>
 #include <memory>
+#include <string>
 
 namespace llaminar2
 {
 
     // Forward declarations - model-specific configs
     struct Qwen2GraphConfig;
+    struct Qwen2ModelWeights;
+    class IModelContext;
     class IKVCache;
-
+    class TensorBase;
     /**
      * @brief Result of building graph configuration
      *
@@ -86,6 +90,9 @@ namespace llaminar2
     public:
         virtual ~IGraphConfigBuilder() = default;
 
+        /// Weight accessor: maps GGUF tensor name to tensor pointer
+        using WeightAccessor = std::function<std::shared_ptr<TensorBase>(const std::string &)>;
+
         /**
          * @brief Build graph configuration from execution plan
          *
@@ -119,6 +126,37 @@ namespace llaminar2
             const ModelConfig &model_config,
             IWeightManager &weight_manager,
             Qwen2GraphConfig &config) = 0;
+
+        /**
+         * @brief Populate architecture fields of Qwen2GraphConfig from IModelContext
+         *
+         * Fills: n_layers, d_model, n_heads, n_kv_heads, head_dim, d_ff,
+         *        vocab_size, rope_theta, rms_norm_eps.
+         *
+         * Caller sets execution-specific fields (device, TP, PP, precision, etc.)
+         * after this returns.
+         *
+         * @param ctx Model context with loader and hyperparameters
+         * @param[out] config Configuration to populate
+         * @return true if successful
+         */
+        virtual bool populateFromModelContext(
+            IModelContext &ctx,
+            Qwen2GraphConfig &config) = 0;
+
+        /**
+         * @brief Build model weights from a generic weight accessor
+         *
+         * Centralizes architecture-specific weight name knowledge so callers
+         * don't hardcode GGUF names like "blk.N.attn_q.weight".
+         *
+         * Architecture specializations override this to handle differences
+         * (e.g., Qwen2 has QKV biases, Qwen3 has QK norms instead).
+         *
+         * @param get_weight Accessor mapping GGUF name to tensor
+         * @return Populated weights struct (embedding, norms, lm_head, layer accessor)
+         */
+        virtual Qwen2ModelWeights buildWeights(WeightAccessor get_weight) = 0;
     };
 
     // =========================================================================

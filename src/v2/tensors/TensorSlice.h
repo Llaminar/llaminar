@@ -414,6 +414,25 @@ namespace llaminar2
             return dynamic_cast<const IINT8Unpackable *>(inner()) != nullptr;
         }
 
+        const NativeVnniFormatInfo *vnniFormatInfo() const override
+        {
+            auto *unpackable = dynamic_cast<const IINT8Unpackable *>(inner());
+            if (unpackable)
+            {
+                return unpackable->vnniFormatInfo();
+            }
+            return nullptr;
+        }
+
+        void packVnniBlock(const VnniPackContext &ctx, int n, int b) const override
+        {
+            auto *unpackable = dynamic_cast<const IINT8Unpackable *>(inner());
+            if (unpackable)
+            {
+                unpackable->packVnniBlock(ctx, n, b);
+            }
+        }
+
         /**
          * @brief Unpack a single block to INT8 values
          */
@@ -488,6 +507,19 @@ namespace llaminar2
                 // Fallback: use default implementation from base
                 IINT8Unpackable::unpack_superblock_to_int8(row_idx, superblock_idx, output, scales, mins);
             }
+        }
+
+        float requantizeRowToInt8(
+            size_t row_idx,
+            size_t K,
+            int8_t *output) const override
+        {
+            auto *unpackable = dynamic_cast<const IINT8Unpackable *>(inner());
+            if (unpackable)
+            {
+                return unpackable->requantizeRowToInt8(row_idx, K, output);
+            }
+            return IINT8Unpackable::requantizeRowToInt8(row_idx, K, output);
         }
 
         // =======================================================================

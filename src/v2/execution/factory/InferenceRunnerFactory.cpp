@@ -12,6 +12,7 @@
 #include "../local_execution/collective/CollectiveContext.h"
 #include "../mpi_orchestration/DeviceInventory.h"
 #include "../../models/qwen/Qwen2Graph.h"
+#include "../../models/IGraphConfigBuilder.h"
 #include "../local_execution/graph/SchemaFactoryRegistry.h" // Model-agnostic sharding config
 #include "../local_execution/orchestrators/DeviceGraphOrchestrator.h"
 #include "../../loaders/ModelContext.h"
@@ -191,22 +192,13 @@ namespace llaminar2
         ModelLoader &loader = model_ctx->concreteLoader();
         const auto &model = loader.getModel();
 
-        // Build Qwen2GraphConfig from model metadata
+        // Build Qwen2GraphConfig via polymorphic builder
+        auto config_builder = createGraphConfigBuilder(architecture);
         Qwen2GraphConfig graph_config;
-        graph_config.vocab_size = static_cast<int>(model.vocab_size);
-        graph_config.d_model = static_cast<int>(model.embedding_length);
-        graph_config.n_layers = static_cast<int>(model.block_count);
-        graph_config.n_heads = static_cast<int>(model.head_count);
-        graph_config.n_kv_heads = static_cast<int>(model.head_count_kv);
-        // Use explicit head_dim from GGUF (attention.key_length) if available,
-        // otherwise fall back to d_model / n_heads (works for Qwen2, LLaMA, etc.)
-        graph_config.head_dim = model.key_length > 0
-                                    ? static_cast<int>(model.key_length)
-                                    : graph_config.d_model / graph_config.n_heads;
-        graph_config.d_ff = 0; // Will need to compute from intermediate_size metadata
+        config_builder->populateFromModelContext(*model_ctx, graph_config);
+
+        // Execution-specific settings
         graph_config.max_seq_len = config.max_seq_len;
-        graph_config.rope_theta = model.rope_theta;
-        graph_config.rms_norm_eps = model.rms_norm_eps;
 
         // CRITICAL: Set default device for kernel dispatch
         // This determines which kernels (CPU vs CUDA) are selected for execution
@@ -239,60 +231,6 @@ namespace llaminar2
                                                        << " (±" << config.kv_cache_scale << " FP32 range)");
         LOG_DEBUG("[InferenceRunner] KV cache precision mode: "
                   << kvCachePrecisionToString(config.kv_cache_precision));
-
-        // Try to get d_ff from metadata (intermediate_size)
-        if (model.hasMetadata("llama.feed_forward_length"))
-        {
-            auto it = model.metadata.find("llama.feed_forward_length");
-            if (it != model.metadata.end())
-            {
-                if (it->second.type == GGUFValueType::UINT64)
-                {
-                    graph_config.d_ff = static_cast<int>(it->second.asUInt64());
-                }
-                else if (it->second.type == GGUFValueType::UINT32)
-                {
-                    graph_config.d_ff = static_cast<int>(it->second.asUInt32());
-                }
-            }
-        }
-        else if (model.hasMetadata("qwen2.feed_forward_length"))
-        {
-            auto it = model.metadata.find("qwen2.feed_forward_length");
-            if (it != model.metadata.end())
-            {
-                if (it->second.type == GGUFValueType::UINT64)
-                {
-                    graph_config.d_ff = static_cast<int>(it->second.asUInt64());
-                }
-                else if (it->second.type == GGUFValueType::UINT32)
-                {
-                    graph_config.d_ff = static_cast<int>(it->second.asUInt32());
-                }
-            }
-        }
-        else if (model.hasMetadata("qwen3.feed_forward_length"))
-        {
-            auto it = model.metadata.find("qwen3.feed_forward_length");
-            if (it != model.metadata.end())
-            {
-                if (it->second.type == GGUFValueType::UINT64)
-                {
-                    graph_config.d_ff = static_cast<int>(it->second.asUInt64());
-                }
-                else if (it->second.type == GGUFValueType::UINT32)
-                {
-                    graph_config.d_ff = static_cast<int>(it->second.asUInt32());
-                }
-            }
-        }
-
-        // Fallback: estimate d_ff as ~4x d_model (common SwiGLU ratio)
-        if (graph_config.d_ff == 0)
-        {
-            graph_config.d_ff = graph_config.d_model * 4;
-            LOG_WARN("[InferenceRunner] Could not find feed_forward_length, using estimate: " << graph_config.d_ff);
-        }
 
         // =====================================================================
         // Phase 3+: Tensor-Parallel Configuration
@@ -1461,27 +1399,13 @@ namespace llaminar2
         }
 
         // =====================================================================
-        // Build Qwen2GraphConfig from model metadata
+        // Build Qwen2GraphConfig via polymorphic builder
         // =====================================================================
-        auto loader = model_ctx->loader();
-        if (!loader)
-        {
-            LOG_ERROR("[UnifiedPipeline] Model loader is null");
-            return nullptr;
-        }
-
+        auto config_builder = createGraphConfigBuilder(architecture);
         Qwen2GraphConfig graph_config;
-        graph_config.n_layers = loader->blockCount();
-        graph_config.d_model = loader->embeddingLength();
-        graph_config.n_heads = loader->headCount();
-        graph_config.n_kv_heads = loader->headCountKV();
-        graph_config.head_dim = loader->keyLength() > 0
-                                    ? static_cast<int>(loader->keyLength())
-                                    : graph_config.d_model / graph_config.n_heads;
-        graph_config.d_ff = loader->feedForwardLength();
-        graph_config.vocab_size = loader->vocabSize();
-        graph_config.rms_norm_eps = loader->rmsNormEps();
-        graph_config.rope_theta = loader->ropeTheta();
+        config_builder->populateFromModelContext(*model_ctx, graph_config);
+
+        // Execution-specific settings
         graph_config.max_seq_len = config.max_seq_len;
         graph_config.activation_precision = config.activation_precision;
 
@@ -1602,31 +1526,15 @@ namespace llaminar2
         }
 
         // =====================================================================
-        // Build Qwen2GraphConfig from model metadata
+        // Build Qwen2GraphConfig via polymorphic builder
         // =====================================================================
-        ModelLoader &loader = stage_ctx->concreteLoader();
-        const auto &model = loader.getModel();
-
+        auto config_builder = createGraphConfigBuilder(architecture);
         Qwen2GraphConfig graph_config;
-        graph_config.vocab_size = static_cast<int>(model.vocab_size);
-        graph_config.d_model = static_cast<int>(model.embedding_length);
-        // For PP stages: n_layers is the FULL model layer count (needed for layer range validation)
-        // The actual layer count for this stage is in pp_config.layerCount()
-        graph_config.n_layers = static_cast<int>(model.block_count);
-        graph_config.n_heads = static_cast<int>(model.head_count);
-        graph_config.n_kv_heads = static_cast<int>(model.head_count_kv);
-        graph_config.head_dim = model.key_length > 0
-                                    ? static_cast<int>(model.key_length)
-                                    : graph_config.d_model / graph_config.n_heads;
-        graph_config.d_ff = 0;
+        config_builder->populateFromModelContext(*stage_ctx, graph_config);
+
+        // Execution-specific settings
         graph_config.max_seq_len = config.max_seq_len;
-        graph_config.rope_theta = model.rope_theta;
-        graph_config.rms_norm_eps = model.rms_norm_eps;
-
-        // Set default device for kernel dispatch
         graph_config.default_device = device;
-
-        // Propagate activation precision and fused attention backend
         graph_config.activation_precision = config.activation_precision;
 
         FusedAttentionBackend effective_backend = config.fused_attention_backend;
@@ -1647,55 +1555,10 @@ namespace llaminar2
         // is subtracted from global layer index to get local KV cache index.
         graph_config.pp_layer_offset = pp_config.first_layer;
 
-        // Note: For PP stages, n_layers stays at full model count in the config.
-        // The stage only executes pp_config.layerCount() layers, but the graph
-        // config represents the full model architecture. The stage runner knows
-        // which layers to actually execute via the PP config.
-
         LOG_DEBUG("[PPStageRunner] GraphConfig: n_layers=" << graph_config.n_layers
                                                            << " (PP stage owns layers ["
                                                            << pp_config.first_layer << ", " << pp_config.last_layer << "))"
                                                            << " pp_layer_offset=" << graph_config.pp_layer_offset);
-
-        // =====================================================================
-        // Get d_ff from metadata
-        // =====================================================================
-        if (model.hasMetadata("llama.feed_forward_length"))
-        {
-            auto it = model.metadata.find("llama.feed_forward_length");
-            if (it != model.metadata.end())
-            {
-                if (it->second.type == GGUFValueType::UINT64)
-                {
-                    graph_config.d_ff = static_cast<int>(it->second.asUInt64());
-                }
-                else if (it->second.type == GGUFValueType::UINT32)
-                {
-                    graph_config.d_ff = static_cast<int>(it->second.asUInt32());
-                }
-            }
-        }
-        else if (model.hasMetadata("qwen2.feed_forward_length"))
-        {
-            auto it = model.metadata.find("qwen2.feed_forward_length");
-            if (it != model.metadata.end())
-            {
-                if (it->second.type == GGUFValueType::UINT64)
-                {
-                    graph_config.d_ff = static_cast<int>(it->second.asUInt64());
-                }
-                else if (it->second.type == GGUFValueType::UINT32)
-                {
-                    graph_config.d_ff = static_cast<int>(it->second.asUInt32());
-                }
-            }
-        }
-
-        if (graph_config.d_ff == 0)
-        {
-            graph_config.d_ff = graph_config.d_model * 4;
-            LOG_WARN("[PPStageRunner] Could not find feed_forward_length, using estimate: " << graph_config.d_ff);
-        }
 
         // =====================================================================
         // PP stages don't use tensor parallelism (TP) - they use full dimensions
@@ -1820,34 +1683,18 @@ namespace llaminar2
             return nullptr;
         }
 
-        // Build Qwen2GraphConfig from IModelContext
+        // Build Qwen2GraphConfig via polymorphic builder
+        auto config_builder = createGraphConfigBuilder(architecture);
         Qwen2GraphConfig graph_config;
-        graph_config.vocab_size = model_ctx->vocabSize();
-        graph_config.d_model = model_ctx->embeddingLength();
-        graph_config.n_layers = model_ctx->blockCount();
-        graph_config.n_heads = model_ctx->headCount();
-        graph_config.n_kv_heads = model_ctx->headCountKV();
-        graph_config.head_dim = model_ctx->keyLength() > 0
-                                    ? model_ctx->keyLength()
-                                    : graph_config.d_model / graph_config.n_heads;
+        config_builder->populateFromModelContext(*model_ctx, graph_config);
+
+        // Execution-specific settings
         graph_config.max_seq_len = config.max_seq_len;
         graph_config.default_device = device;
         graph_config.activation_precision = config.activation_precision;
         graph_config.fused_attention_backend = config.fused_attention_backend;
         graph_config.kv_cache_scale = config.kv_cache_scale;
         graph_config.kv_cache_precision = config.kv_cache_precision;
-
-        // Get d_ff from model context if available, otherwise estimate as ~4x d_model
-        int d_ff = model_ctx->feedForwardLength();
-        if (d_ff > 0)
-        {
-            graph_config.d_ff = d_ff;
-        }
-        else
-        {
-            graph_config.d_ff = graph_config.d_model * 4;
-            LOG_WARN("[InferenceRunner] feedForwardLength() returned 0, using estimate: " << graph_config.d_ff);
-        }
 
         // Check for LOCAL TP configuration
         ILocalTPContext *local_tp_ctx = config.local_tp_ctx;
@@ -1981,74 +1828,19 @@ namespace llaminar2
             return nullptr;
         }
 
-        // Configure weights from IModelContext
-        // Build Qwen2ModelWeights using IModelContext::getWeightForDevice
-        //
-        // IMPORTANT: Use getWeightForDevice() instead of getWeightForDevice() to get
-        // device-specific tensor instances. This is critical for multi-device
-        // scenarios where each device needs its own tensor for coherence tracking.
-        // The WeightManager handles cloning automatically when called from
-        // different devices.
-        Qwen2ModelWeights weights;
+        // Configure weights via polymorphic builder
+        // Captures model_ctx and device by value for lambda lifetime safety
+        auto weights = config_builder->buildWeights(
+            [model_ctx, device](const std::string &name)
+            {
+                return model_ctx->getWeightForDevice(name, device);
+            });
 
-        // Get global weights via interface - use device-specific instances
-        auto embedding = model_ctx->getWeightForDevice("token_embd.weight", device);
-        auto final_norm = model_ctx->getWeightForDevice("output_norm.weight", device);
-        auto lm_head = model_ctx->getWeightForDevice("output.weight", device);
-
-        // Tied embeddings: if output.weight is missing, reuse token_embd.weight
-        if (!lm_head && embedding)
-        {
-            LOG_INFO("[InferenceRunner] output.weight not found, using tied embeddings (token_embd.weight)");
-            lm_head = embedding;
-        }
-
-        if (!embedding || !final_norm || !lm_head)
+        if (!weights.embedding_table || !weights.final_norm || !weights.lm_head)
         {
             LOG_ERROR("[InferenceRunner] Missing global weights from IModelContext");
             return nullptr;
         }
-
-        weights.embedding_table = embedding.get();
-        weights.final_norm = final_norm.get();
-        weights.lm_head = lm_head.get();
-
-        // Layer weight accessor using IModelContext interface
-        // Capture model_ctx AND device by value for lambda lifetime
-        weights.get_layer_weights = [model_ctx, device](int layer_idx) -> Qwen2LayerWeights
-        {
-            Qwen2LayerWeights layer;
-            std::string prefix = "blk." + std::to_string(layer_idx) + ".";
-
-            // Attention weights - device-specific instances
-            layer.wq = model_ctx->getWeightForDevice(prefix + "attn_q.weight", device).get();
-            layer.wk = model_ctx->getWeightForDevice(prefix + "attn_k.weight", device).get();
-            layer.wv = model_ctx->getWeightForDevice(prefix + "attn_v.weight", device).get();
-            layer.wo = model_ctx->getWeightForDevice(prefix + "attn_output.weight", device).get();
-            layer.attn_norm = model_ctx->getWeightForDevice(prefix + "attn_norm.weight", device).get();
-
-            // Attention biases (may be null)
-            auto q_bias = model_ctx->getWeightForDevice(prefix + "attn_q.bias", device);
-            auto k_bias = model_ctx->getWeightForDevice(prefix + "attn_k.bias", device);
-            auto v_bias = model_ctx->getWeightForDevice(prefix + "attn_v.bias", device);
-            layer.q_bias = q_bias ? q_bias.get() : nullptr;
-            layer.k_bias = k_bias ? k_bias.get() : nullptr;
-            layer.v_bias = v_bias ? v_bias.get() : nullptr;
-
-            // QK norm weights (Qwen3: per-head RMSNorm, may be null for Qwen2)
-            auto q_norm = model_ctx->getWeightForDevice(prefix + "attn_q_norm.weight", device);
-            auto k_norm = model_ctx->getWeightForDevice(prefix + "attn_k_norm.weight", device);
-            layer.q_norm = q_norm ? q_norm.get() : nullptr;
-            layer.k_norm = k_norm ? k_norm.get() : nullptr;
-
-            // FFN weights
-            layer.gate_proj = model_ctx->getWeightForDevice(prefix + "ffn_gate.weight", device).get();
-            layer.up_proj = model_ctx->getWeightForDevice(prefix + "ffn_up.weight", device).get();
-            layer.down_proj = model_ctx->getWeightForDevice(prefix + "ffn_down.weight", device).get();
-            layer.ffn_norm = model_ctx->getWeightForDevice(prefix + "ffn_norm.weight", device).get();
-
-            return layer;
-        };
 
         orchestrator->setWeights(weights);
         LOG_INFO("[InferenceRunner] Testable DeviceGraphOrchestrator created successfully");

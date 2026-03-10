@@ -1657,8 +1657,9 @@ namespace llaminar2::test::parity
                     std::vector<float> pytorch_slice = extractColumnSlice(
                         pytorch_data.data(), pytorch_rows, pytorch_cols, slice_start, slice_cols);
 
-                    // Debug: print actual values for diagnosis - VERBOSE for all ATTENTION_CONTEXT stages
-                    bool debug_verbose = (tp_snapshot.key.find("ATTENTION_CONTEXT") != std::string::npos);
+                    // Debug: print actual values for diagnosis - VERBOSE for ATTENTION_CONTEXT and Q_ROPE stages
+                    bool debug_verbose = (tp_snapshot.key.find("ATTENTION_CONTEXT") != std::string::npos) ||
+                                         (tp_snapshot.key.find("Q_ROPE") != std::string::npos && tp_snapshot.key.find("layer0") != std::string::npos);
                     if (debug_verbose)
                     {
                         LOG_INFO("[TP Debug] " << tp_snapshot.key << " device " << dev_idx
@@ -1698,6 +1699,42 @@ namespace llaminar2::test::parity
                     size_t compare_size = std::min(dev_data.data.size(), pytorch_slice.size());
                     float cosine = computeCosineSimilarity(
                         dev_data.data.data(), pytorch_slice.data(), compare_size);
+
+                    // Per-row cosine diagnostic for ATTENTION_CONTEXT
+                    if (debug_verbose && slice_cols > 0)
+                    {
+                        size_t num_rows = compare_size / slice_cols;
+                        float max_abs_diff = 0.0f;
+                        size_t max_diff_idx = 0;
+                        std::stringstream row_cosines;
+                        for (size_t r = 0; r < num_rows && r < 9; ++r)
+                        {
+                            float rc = computeCosineSimilarity(
+                                dev_data.data.data() + r * slice_cols,
+                                pytorch_slice.data() + r * slice_cols,
+                                slice_cols);
+                            row_cosines << "row" << r << "=" << std::fixed << std::setprecision(6) << rc << " ";
+                            // Find max absolute difference in this row
+                            for (size_t c = 0; c < slice_cols; ++c)
+                            {
+                                float diff = std::abs(dev_data.data[r * slice_cols + c] - pytorch_slice[r * slice_cols + c]);
+                                if (diff > max_abs_diff)
+                                {
+                                    max_abs_diff = diff;
+                                    max_diff_idx = r * slice_cols + c;
+                                }
+                            }
+                        }
+                        LOG_INFO("[TP Diag] " << tp_snapshot.key << " dev" << dev_idx
+                                              << " per-row cosine: " << row_cosines.str());
+                        LOG_INFO("[TP Diag] " << tp_snapshot.key << " dev" << dev_idx
+                                              << " max_abs_diff=" << max_abs_diff
+                                              << " at idx=" << max_diff_idx
+                                              << " (row=" << max_diff_idx / slice_cols
+                                              << " col=" << max_diff_idx % slice_cols << ")"
+                                              << " llaminar=" << dev_data.data[max_diff_idx]
+                                              << " pytorch=" << pytorch_slice[max_diff_idx]);
+                    }
 
                     TPDeviceComparisonResult dev_result;
                     dev_result.device_id = dev_data.device_id.toString();
@@ -2442,6 +2479,43 @@ namespace llaminar2::test::parity
                                                << " cosine=" << std::fixed << std::setprecision(6) << result.cosine_similarity
                                                << " size=" << llaminar_size);
 
+                    // Per-row cosine diagnostic for ATTENTION_CONTEXT (layer 0 only)
+                    if (stage == "ATTENTION_CONTEXT" && layer_idx == 0)
+                    {
+                        size_t compare_size = std::min(llaminar_size, pytorch_data.size());
+                        size_t head_dim_val = model_ctx_->model().key_length > 0 ? model_ctx_->model().key_length : (model_ctx_->model().embedding_length / model_ctx_->model().head_count);
+                        size_t n_cols = model_ctx_->model().head_count * head_dim_val;
+                        size_t n_rows = compare_size / n_cols;
+                        std::stringstream row_cosines;
+                        float max_abs_diff = 0.0f;
+                        size_t max_diff_idx = 0;
+                        for (size_t r = 0; r < n_rows && r < 9; ++r)
+                        {
+                            float rc = computeCosineSimilarity(
+                                llaminar_data + r * n_cols,
+                                pytorch_data.data() + r * n_cols,
+                                n_cols);
+                            row_cosines << "row" << r << "=" << std::fixed << std::setprecision(6) << rc << " ";
+                            for (size_t c = 0; c < n_cols; ++c)
+                            {
+                                float diff = std::abs(llaminar_data[r * n_cols + c] - pytorch_data[r * n_cols + c]);
+                                if (diff > max_abs_diff)
+                                {
+                                    max_abs_diff = diff;
+                                    max_diff_idx = r * n_cols + c;
+                                }
+                            }
+                        }
+                        LOG_INFO("[SingleGPU Diag] " << stage << " per-row cosine: " << row_cosines.str());
+                        LOG_INFO("[SingleGPU Diag] " << stage
+                                                     << " max_abs_diff=" << max_abs_diff
+                                                     << " at idx=" << max_diff_idx
+                                                     << " (row=" << max_diff_idx / n_cols
+                                                     << " col=" << max_diff_idx % n_cols << ")"
+                                                     << " llaminar=" << llaminar_data[max_diff_idx]
+                                                     << " pytorch=" << pytorch_data[max_diff_idx]);
+                    }
+
                     if (result.cosine_similarity < stats.min_cosine_sim)
                     {
                         stats.min_cosine_sim = result.cosine_similarity;
@@ -2600,8 +2674,16 @@ namespace llaminar2::test::parity
                 std::string name;
                 size_t cols; // Expected columns (may be sharded)
             };
+            size_t n_kv_heads = model_ctx_->headCountKV();
+            size_t head_dim = d_model / n_heads;
+            size_t kv_dim = n_kv_heads * head_dim;
             std::vector<StageInfo> per_layer_stages = {
                 {"ATTENTION_NORM", d_model},
+                {"Q_PROJECTION", d_model},     // DIAGNOSTIC: check QKV GEMM output
+                {"K_PROJECTION", kv_dim},      // DIAGNOSTIC: check K projection
+                {"V_PROJECTION", kv_dim},      // DIAGNOSTIC: check V projection
+                {"Q_ROPE", d_model},           // DIAGNOSTIC: check RoPE output
+                {"K_ROPE", kv_dim},            // DIAGNOSTIC: check K RoPE output
                 {"ATTENTION_CONTEXT", d_model}, // num_heads * head_dim = d_model
                 {"ATTENTION_OUTPUT", d_model},
                 {"FFN_NORM", d_model},
@@ -2670,6 +2752,126 @@ namespace llaminar2::test::parity
                 if (layer_stats.stages_compared > 0)
                 {
                     layer_stats.avg_combined_cosine = sum_combined_cosine / layer_stats.stages_compared;
+                }
+
+                // ====================================================================
+                // CPU-side RoPE crosscheck for layer 0 to diagnose TP Q_ROPE divergence
+                // ====================================================================
+                if (layer_idx == 0)
+                {
+                    auto pytorch_qp = loadPyTorchSnapshot("layer0_Q_PROJECTION");
+                    auto pytorch_qr = loadPyTorchSnapshot("layer0_Q_ROPE");
+                    TPSnapshot tp_qp = multi_device->getTPSnapshot("layer0_Q_PROJECTION");
+                    TPSnapshot tp_qr = multi_device->getTPSnapshot("layer0_Q_ROPE");
+
+                    if (!tp_qp.device_data.empty() && !tp_qr.device_data.empty() &&
+                        !pytorch_qp.empty() && !pytorch_qr.empty())
+                    {
+                        const auto &qp_dev0 = tp_qp.device_data[0].data;
+                        const auto &qr_dev0 = tp_qr.device_data[0].data;
+                        size_t local_cols = tp_qp.device_data[0].cols;
+
+                        if (local_cols > 0 && qp_dev0.size() >= seq_len * local_cols &&
+                            qr_dev0.size() >= seq_len * local_cols)
+                        {
+                            float theta_base = model_ctx_->model().rope_theta;
+                            size_t hd = head_dim;
+                            size_t half_hd = hd / 2;
+
+                            LOG_INFO("[RoPE CrossCheck] theta_base=" << theta_base
+                                     << " head_dim=" << hd << " local_cols=" << local_cols
+                                     << " pytorch_qp_cols=" << d_model);
+
+                            // Check multiple RoPE pairs across different rows and heads
+                            for (size_t row : {0ul, 4ul, 8ul})
+                            {
+                                if (row >= seq_len) break;
+                                for (size_t pair_i : {0ul, 4ul, 15ul, 31ul})
+                                {
+                                    if (pair_i >= half_hd) continue;
+                                    // Check head 0 and head 1
+                                    for (size_t h : {0ul, 1ul})
+                                    {
+                                        size_t col_i0 = h * hd + pair_i;           // first half
+                                        size_t col_i1 = h * hd + pair_i + half_hd; // second half
+                                        if (col_i1 >= local_cols) continue;
+
+                                        size_t idx_i0 = row * local_cols + col_i0;
+                                        size_t idx_i1 = row * local_cols + col_i1;
+
+                                        // Llaminar Q_PROJ values
+                                        float x0_ll = qp_dev0[idx_i0];
+                                        float x1_ll = qp_dev0[idx_i1];
+
+                                        // PyTorch Q_PROJ values (full 896 cols)
+                                        float x0_pt = pytorch_qp[row * d_model + col_i0];
+                                        float x1_pt = pytorch_qp[row * d_model + col_i1];
+
+                                        // Compute expected RoPE
+                                        float inv_freq_i = std::exp(-std::log(theta_base) * 2.0f * static_cast<float>(pair_i) / static_cast<float>(hd));
+                                        float angle = static_cast<float>(row) * inv_freq_i;
+                                        float cos_a = std::cos(angle);
+                                        float sin_a = std::sin(angle);
+
+                                        float cpu_i0 = x0_ll * cos_a - x1_ll * sin_a;
+                                        float cpu_i1 = x0_ll * sin_a + x1_ll * cos_a;
+
+                                        // Actual outputs
+                                        float ll_i0 = qr_dev0[idx_i0];
+                                        float ll_i1 = qr_dev0[idx_i1];
+                                        float pt_i0 = pytorch_qr[row * d_model + col_i0];
+                                        float pt_i1 = pytorch_qr[row * d_model + col_i1];
+
+                                        float diff_i0 = std::abs(ll_i0 - pt_i0);
+                                        float diff_i1 = std::abs(ll_i1 - pt_i1);
+
+                                        if (diff_i0 > 0.01f || diff_i1 > 0.01f)
+                                        {
+                                            LOG_INFO("[RoPE CrossCheck] MISMATCH row=" << row
+                                                     << " head=" << h << " pair=" << pair_i
+                                                     << " | Q_PROJ: ll_x0=" << x0_ll << " pt_x0=" << x0_pt
+                                                     << " ll_x1=" << x1_ll << " pt_x1=" << x1_pt
+                                                     << " | inv_freq=" << inv_freq_i << " angle=" << angle
+                                                     << " cos=" << cos_a << " sin=" << sin_a
+                                                     << " | CPU_expected: i0=" << cpu_i0 << " i1=" << cpu_i1
+                                                     << " | GPU_actual: i0=" << ll_i0 << " i1=" << ll_i1
+                                                     << " | PyTorch: i0=" << pt_i0 << " i1=" << pt_i1
+                                                     << " | diff_i0=" << diff_i0 << " diff_i1=" << diff_i1);
+                                        }
+                                    }
+                                }
+                            }
+                            // Summary: compute full CPU RoPE on row 8 and measure cosine
+                            if (seq_len > 8)
+                            {
+                                std::vector<float> cpu_rope_row8(local_cols);
+                                const float *qp_row8 = qp_dev0.data() + 8 * local_cols;
+                                size_t local_heads = local_cols / hd;
+                                for (size_t h = 0; h < local_heads; ++h)
+                                {
+                                    for (size_t i = 0; i < half_hd; ++i)
+                                    {
+                                        float inv_f = std::exp(-std::log(theta_base) * 2.0f * static_cast<float>(i) / static_cast<float>(hd));
+                                        float ang = 8.0f * inv_f;
+                                        float c = std::cos(ang);
+                                        float s = std::sin(ang);
+                                        float x0 = qp_row8[h * hd + i];
+                                        float x1 = qp_row8[h * hd + i + half_hd];
+                                        cpu_rope_row8[h * hd + i] = x0 * c - x1 * s;
+                                        cpu_rope_row8[h * hd + i + half_hd] = x0 * s + x1 * c;
+                                    }
+                                }
+                                float cos_cpu_vs_ll = computeCosineSimilarity(
+                                    cpu_rope_row8.data(), qr_dev0.data() + 8 * local_cols, local_cols);
+                                float cos_cpu_vs_pt = computeCosineSimilarity(
+                                    cpu_rope_row8.data(),
+                                    extractColumnSlice(pytorch_qr.data(), seq_len, d_model, 0, local_cols).data() + 8 * local_cols,
+                                    local_cols);
+                                LOG_INFO("[RoPE CrossCheck] Row8 cosine: CPU_vs_llaminar=" << std::fixed << std::setprecision(6) << cos_cpu_vs_ll
+                                         << " CPU_vs_pytorch=" << cos_cpu_vs_pt);
+                            }
+                        }
+                    }
                 }
 
                 // Pass criteria based on combined cosine

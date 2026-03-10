@@ -76,6 +76,22 @@ namespace llaminar2
         return nullptr;
     }
 
+    /**
+     * @brief Instance method to resolve backend, checking injected_backend_ first
+     *
+     * If a test has injected a backend via setBackendForTesting(), returns that.
+     * Otherwise falls back to the global backend lookup via resolveBackend().
+     *
+     * @param device DeviceId specifying the target device
+     * @return IBackend* for the device, or nullptr for CPU (with no injected backend)
+     */
+    IBackend *TensorBase::resolveBackend(DeviceId device) const
+    {
+        if (injected_backend_)
+            return injected_backend_;
+        return getBackendForDevice(device);
+    }
+
     static bool waitForEventWithProxy(IBackend *backend, void *event, int device_id,
                                       const DeviceId &gpu_device);
 
@@ -88,7 +104,7 @@ namespace llaminar2
      * based on the device type from DeviceManager.
      *
      * @param device_idx Global device index (0 = CPU, 1+ = GPUs)
-     * @deprecated Use getBackendForDevice(DeviceId) instead
+     * @deprecated Use resolveBackend(DeviceId) instead
      * @return IBackend* for the device, or nullptr for CPU/invalid
      */
     static IBackend *getBackendForGlobalDeviceIdx(int device_idx)
@@ -164,7 +180,7 @@ namespace llaminar2
                 int ordinal = key & 0xFFFF;
                 DeviceId device(type, ordinal);
 
-                IBackend *backend = getBackendForDevice(device);
+                IBackend *backend = resolveBackend(device);
                 if (backend)
                 {
                     backend->free(ptr, ordinal);
@@ -178,7 +194,7 @@ namespace llaminar2
         // Skip if gpu_data_ptr_ was pointing to BAR memory (already freed above)
         if (gpu_data_ptr_ && gpu_device_.has_value() && !is_bar_backed_)
         {
-            IBackend *backend = getBackendForDevice(*gpu_device_);
+            IBackend *backend = resolveBackend(*gpu_device_);
             if (backend)
             {
                 int backend_device_id = gpu_device_->gpu_ordinal();
@@ -214,7 +230,7 @@ namespace llaminar2
         }
 
         // Get backend for target device
-        IBackend *backend = getBackendForDevice(target_device);
+        IBackend *backend = resolveBackend(target_device);
         if (!backend)
         {
             LOG_ERROR("[TensorBase::initMappedMemory] No backend available for device " << target_device.toString());
@@ -263,7 +279,7 @@ namespace llaminar2
 
         if (gpu_device_.has_value())
         {
-            IBackend *backend = getBackendForDevice(*gpu_device_);
+            IBackend *backend = resolveBackend(*gpu_device_);
             if (backend)
             {
                 int backend_device_id = gpu_device_->gpu_ordinal();
@@ -388,7 +404,7 @@ namespace llaminar2
 #if defined(HAVE_ROCM)
         if (hip_staging_ptr_ && owns_hip_staging_)
         {
-            IBackend *rocm_backend = getBackendForDevice(bar_host_device_);
+            IBackend *rocm_backend = resolveBackend(bar_host_device_);
             if (rocm_backend)
             {
                 rocm_backend->setDevice(bar_host_device_.toKernelDeviceIndex());
@@ -443,7 +459,7 @@ namespace llaminar2
         // copy to BAR via hipMemcpy(D2D) which uses the AMD DMA engine.
 #if defined(HAVE_ROCM)
         // Get ROCm backend for allocation
-        IBackend *rocm_backend = getBackendForDevice(rocm_device);
+        IBackend *rocm_backend = resolveBackend(rocm_device);
         if (rocm_backend)
         {
             // Set device context
@@ -1254,7 +1270,7 @@ namespace llaminar2
         {
             if (device_completion_event_)
             {
-                IBackend *backend = getBackendForDevice(target_device);
+                IBackend *backend = resolveBackend(target_device);
                 if (backend)
                 {
                     const int backend_device_id = target_device.gpu_ordinal();
@@ -1280,7 +1296,7 @@ namespace llaminar2
         }
 
         // Get backend for target device directly from DeviceId type
-        IBackend *target_backend = getBackendForDevice(target_device);
+        IBackend *target_backend = resolveBackend(target_device);
         if (!target_backend)
         {
             LOG_ERROR("[TensorBase::ensureOnDevice] No backend available for device " << target_device.toString());
@@ -1336,7 +1352,7 @@ namespace llaminar2
 
                 if (device_completion_event_)
                 {
-                    IBackend *old_backend = getBackendForDevice(old_device);
+                    IBackend *old_backend = resolveBackend(old_device);
                     int old_backend_device_id = old_device.gpu_ordinal();
                     if (old_backend)
                     {
@@ -1365,7 +1381,7 @@ namespace llaminar2
 
                 if (device_completion_event_)
                 {
-                    IBackend *old_backend = getBackendForDevice(*gpu_device_);
+                    IBackend *old_backend = resolveBackend(*gpu_device_);
                     int old_backend_device_id = gpu_device_->gpu_ordinal();
                     if (old_backend)
                     {
@@ -1667,7 +1683,7 @@ namespace llaminar2
         }
 
         // Get backend for target device
-        IBackend *target_backend = getBackendForDevice(target_device);
+        IBackend *target_backend = resolveBackend(target_device);
         if (!target_backend)
         {
             LOG_ERROR("[TensorBase::allocateOnDevice] No backend available for device " << target_device.toString());
@@ -1732,7 +1748,7 @@ namespace llaminar2
         // Free existing device memory if on different device
         if (gpu_data_ptr_ && gpu_device_.has_value() && *gpu_device_ != target_device)
         {
-            IBackend *old_backend = getBackendForDevice(*gpu_device_);
+            IBackend *old_backend = resolveBackend(*gpu_device_);
             int old_backend_device_id = gpu_device_->gpu_ordinal();
             if (old_backend)
             {
@@ -1822,7 +1838,7 @@ namespace llaminar2
             // Only synchronize if GPU has written since last sync
             if (mapped_needs_sync_ && gpu_device_.has_value())
             {
-                IBackend *backend = getBackendForDevice(*gpu_device_);
+                IBackend *backend = resolveBackend(*gpu_device_);
                 if (backend)
                 {
                     int backend_device_id = gpu_device_->gpu_ordinal();
@@ -1879,9 +1895,9 @@ namespace llaminar2
         }
 
         // ===== BAR-BACKED BUFFER PATH =====
-        // If the tensor's gpu_data_ptr_ is a BAR-allocated pointer (host-mapped to GPU BAR region),
-        // we can read it directly via memcpy since it's already host-accessible.
-        // This happens after transferTo() with cross-vendor (CUDA↔ROCm) transfers.
+        // BAR-backed tensors are host-readable through the BAR mmap address.
+        // For ROCm execution, gpu_data_ptr_ usually points at the HIP staging buffer,
+        // so we must flush staging -> BAR before host reads.
         if (is_bar_backed_ && gpu_data_ptr_ && gpu_device_.has_value())
         {
             size_t bytes = byte_size();
@@ -1896,7 +1912,7 @@ namespace llaminar2
             // (need to ensure any pending writes are complete)
             if (device_completion_event_)
             {
-                IBackend *backend = getBackendForDevice(*gpu_device_);
+                IBackend *backend = resolveBackend(*gpu_device_);
                 int backend_device_id = gpu_device_->gpu_ordinal();
                 if (backend && !waitForEventWithProxy(backend, device_completion_event_, backend_device_id, *gpu_device_))
                 {
@@ -1904,12 +1920,45 @@ namespace llaminar2
                 }
             }
 
+            const void *host_visible_src = bar_rocm_ptr_ ? bar_rocm_ptr_ : gpu_data_ptr_;
+
+#if defined(HAVE_ROCM)
+            if (gpu_device_->is_rocm() && hip_staging_ptr_ && bar_rocm_ptr_ && gpu_data_ptr_ == hip_staging_ptr_)
+            {
+                hipError_t hip_err = hipSetDevice(gpu_device_->rocm_ordinal());
+                if (hip_err != hipSuccess)
+                {
+                    LOG_ERROR("[TensorBase::ensureOnHost] hipSetDevice failed for BAR-backed ROCm tensor: "
+                              << hipGetErrorString(hip_err));
+                    return false;
+                }
+
+                hip_err = hipMemcpy(bar_rocm_ptr_, hip_staging_ptr_, bytes, hipMemcpyDeviceToDevice);
+                if (hip_err != hipSuccess)
+                {
+                    LOG_ERROR("[TensorBase::ensureOnHost] hipMemcpy staging->BAR failed: "
+                              << hipGetErrorString(hip_err));
+                    return false;
+                }
+
+                hip_err = hipDeviceSynchronize();
+                if (hip_err != hipSuccess)
+                {
+                    LOG_ERROR("[TensorBase::ensureOnHost] hipDeviceSynchronize failed after staging->BAR copy: "
+                              << hipGetErrorString(hip_err));
+                    return false;
+                }
+
+                host_visible_src = bar_rocm_ptr_;
+            }
+#endif
+
             LOG_DEBUG("[TensorBase::ensureOnHost] BAR-BACKED: Direct memcpy from BAR region "
-                      << static_cast<const void *>(gpu_data_ptr_) << " -> " << dst
+                      << host_visible_src << " -> " << dst
                       << " (" << bytes << " bytes)");
 
             // Direct memcpy since BAR region is host-accessible
-            std::memcpy(dst, gpu_data_ptr_, bytes);
+            std::memcpy(dst, host_visible_src, bytes);
 
             host_valid_ = true;
             authoritative_device_ = std::nullopt; // Host is now authoritative
@@ -1921,7 +1970,7 @@ namespace llaminar2
         // If GPU has data, download it
         if (gpu_data_ptr_ && gpu_device_.has_value())
         {
-            IBackend *backend = getBackendForDevice(*gpu_device_);
+            IBackend *backend = resolveBackend(*gpu_device_);
             if (!backend)
             {
                 LOG_ERROR("[TensorBase::ensureOnHost] No backend available for device " << gpu_device_->toString());
@@ -1946,8 +1995,18 @@ namespace llaminar2
                 if (!waitForEventWithProxy(backend, device_completion_event_, backend_device_id, *gpu_device_))
                 {
                     LOG_WARN("[TensorBase::ensureOnHost] Event wait failed, falling back to full sync");
-                    // Fall through to deviceToHost which does implicit full sync
+                    backend->synchronize(backend_device_id);
                 }
+            }
+            else
+            {
+                // No completion event recorded (e.g., markOutputsDirtyFlagsOnly was used).
+                // We MUST do an explicit device sync because the worker stream is created
+                // with cudaStreamNonBlocking, which means cudaMemcpy on the legacy default
+                // stream (stream 0) does NOT implicitly synchronize with it. Without this
+                // sync, the D2H copy can race with the kernel, reading stale/zero data.
+                LOG_TRACE("[TensorBase::ensureOnHost] No completion event, using full device sync");
+                backend->synchronize(backend_device_id);
             }
 
             // Transfer tracing for D2H debugging
@@ -2044,7 +2103,7 @@ namespace llaminar2
         if (gpu_device_.has_value())
         {
             LOG_DEBUG("[TensorBase::mark_device_dirty_with_event] Getting backend for device " << gpu_device_->toString());
-            IBackend *backend = getBackendForDevice(*gpu_device_);
+            IBackend *backend = resolveBackend(*gpu_device_);
             if (backend)
             {
                 int backend_device_id = gpu_device_->gpu_ordinal();
@@ -2122,7 +2181,7 @@ namespace llaminar2
         // Free device memory
         if (gpu_data_ptr_ && gpu_device_.has_value())
         {
-            IBackend *backend = getBackendForDevice(*gpu_device_);
+            IBackend *backend = resolveBackend(*gpu_device_);
             if (backend)
             {
                 int backend_device_id = gpu_device_->gpu_ordinal();
@@ -2864,7 +2923,7 @@ namespace llaminar2
 #endif
 
         // Standard allocation via device backend
-        IBackend *backend = getBackendForDevice(device);
+        IBackend *backend = resolveBackend(device);
         if (!backend)
         {
             LOG_ERROR("[TensorBase::getOrAllocateDeviceBuffer] No backend for device "

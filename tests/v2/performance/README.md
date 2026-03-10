@@ -21,7 +21,7 @@ Performance tests differ from unit/integration tests:
 
 ```bash
 # From workspace root
-cd build_v2
+cd build_v2_release
 ctest -L Performance --verbose
 
 # Or with specific test filter
@@ -40,16 +40,16 @@ If you prefer to build Release manually:
 
 ```bash
 # From workspace root
-cmake -B build_v2_release -S src/v2 -DCMAKE_BUILD_TYPE=Release
+cmake -B build_v2_release -S src/v2 -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build_v2_release --parallel
-cd build_v2
+cd build_v2_release
 ctest -L Performance --verbose
 ```
 
 ### Running Individual Benchmarks
 
 ```bash
-# From build_v2_release/tests/v2/performance/
+# From build_v2_release/tests/v2/
 ./v2_perf_iq4nl_gemm
 
 # Or with MPI (matches CTest configuration)
@@ -143,6 +143,56 @@ mpirun -np 1 \                             # Single rank for pure performance
 
 **Example output:**
 ```
+
+### Perf__CUDABlockwiseTensorCoreGemm
+
+**Purpose**: Benchmark the CUDA blockwise-activation INT8 GEMV/GEMM path against the new tensor-core scaffold.
+
+**What it tests:**
+- Legacy blockwise CUDA path vs tensor-core scaffold dispatch
+- GEMV (`M=1`) and GEMM/prefill shapes (`M in {32,64,128}` by default)
+- Qwen 0.5B, 3B, and 7B attention, FFN, and LM-head projection sizes
+- Correctness gating via cosine similarity before using timing data
+
+**Default execution model:**
+- `Correctness_AllFormats_KeyShapes`: full correctness sweep over supported quantized formats and Qwen shapes
+- `Performance_AllFormats_AllShapes`: release timing sweep over the same matrix
+
+**Tight tuning loop controls:**
+
+```bash
+# Smoke-sized release validation
+LLAMINAR_CUDA_TC_SMOKE=1 \
+LLAMINAR_CUDA_TC_FORMATS=Q4_0 \
+LLAMINAR_CUDA_TC_SHAPES=0.5B_Attn,0.5B_FFN_Up \
+./build_v2_release/tests/v2/v2_perf_cuda_blockwise_tensorcore_gemm \
+    --gtest_filter=CUDABlockwiseTensorCorePerf.Performance_AllFormats_AllShapes
+
+# Focus one shape/format with explicit loop sizes
+LLAMINAR_CUDA_TC_FORMATS=IQ4_NL \
+LLAMINAR_CUDA_TC_SHAPES=7B_FFN_Up \
+LLAMINAR_CUDA_TC_PREFILL_M=32,64 \
+LLAMINAR_CUDA_TC_WARMUP_RUNS=3 \
+LLAMINAR_CUDA_TC_BENCH_RUNS=10 \
+./build_v2_release/tests/v2/v2_perf_cuda_blockwise_tensorcore_gemm \
+    --gtest_filter=CUDABlockwiseTensorCorePerf.Correctness_AllFormats_KeyShapes
+```
+
+**Supported environment filters:**
+- `LLAMINAR_CUDA_TC_SMOKE=1`: reduce the matrix to a small release-validation subset
+- `LLAMINAR_CUDA_TC_FORMATS=<csv>`: select quantized formats, e.g. `Q4_0,IQ4_NL`
+- `LLAMINAR_CUDA_TC_SHAPES=<csv>`: select Qwen shapes, e.g. `0.5B_Attn,3B_FFN_Up`
+- `LLAMINAR_CUDA_TC_PREFILL_M=<csv>`: override performance GEMM `M` values
+- `LLAMINAR_CUDA_TC_CORRECTNESS_PREFILL_M=<n>`: override correctness prefill `M`
+- `LLAMINAR_CUDA_TC_WARMUP_RUNS=<n>`: override warmup count
+- `LLAMINAR_CUDA_TC_BENCH_RUNS=<n>`: override timed iterations
+- `LLAMINAR_CUDA_TC_MAX_CASES=<n>`: stop after `n` selected cases
+- `LLAMINAR_CUDA_TC_GEMM_DISPATCH=<auto|small_m|wide_n|balanced>`: force a specialized GEMM dispatch class during tuning sweeps
+
+**Current intent:**
+- This benchmark is designed for release-build kernel tuning.
+- The tensor-core path is a correct-first scaffold, not yet a final optimized kernel family.
+- Auto GEMM dispatch currently uses only aspect ratio and total work size: `wide_n` is reserved for sufficiently wide, sufficiently large matrices; all other shapes default to `small_m`.
 ╔════════════════════════════════════════════════════════════════╗
 ║ Small Batch (32 tokens, 896x896)                              ║
 ╠════════════════════════════════════════════════════════════════╣

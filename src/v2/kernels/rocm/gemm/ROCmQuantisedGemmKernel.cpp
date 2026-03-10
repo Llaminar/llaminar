@@ -2460,8 +2460,10 @@ namespace llaminar2
                     // Fix: redirect kernel output to HBM workspace, then bulk DMA.
                     // =================================================================
                     const bool gemv_output_is_mapped = C_fp32->isMapped();
+                    const bool gemv_output_is_bar = C_fp32->isBARBacked() && C_fp32->bar_address() != nullptr;
+                    const bool gemv_output_needs_copyout = gemv_output_is_mapped || gemv_output_is_bar;
                     float *d_gemv_output = d_output;
-                    if (gemv_output_is_mapped)
+                    if (gemv_output_needs_copyout)
                     {
                         d_gemv_output = impl_->d_C_fp32;
                         static std::once_flag gemv_mapped_once;
@@ -2529,8 +2531,10 @@ namespace llaminar2
                                 return false;
                             }
                         }
-                        // Bulk DMA from HBM workspace to mapped output
-                        if (gemv_output_is_mapped)
+                        // Bulk DMA from HBM workspace to output (d_output = hip_staging_ptr for BAR-backed)
+                        // IMPORTANT: Always copy to d_output, NOT bar_address(). The allreduce
+                        // pipeline reads from hip_staging_ptr and handles the staging→BAR→CUDA transfer.
+                        if (gemv_output_needs_copyout)
                         {
                             hipMemcpyAsync(d_output, impl_->d_C_fp32,
                                            static_cast<size_t>(n) * sizeof(float),
@@ -2574,8 +2578,8 @@ namespace llaminar2
                         }
                     }
 
-                    // Bulk DMA from HBM workspace to mapped output
-                    if (gemv_output_is_mapped)
+                    // Bulk DMA from HBM workspace to output (d_output = hip_staging_ptr for BAR-backed)
+                    if (gemv_output_needs_copyout)
                     {
                         hipMemcpyAsync(d_output, impl_->d_C_fp32,
                                        static_cast<size_t>(n) * sizeof(float),
@@ -2962,7 +2966,9 @@ namespace llaminar2
                 // Fix: redirect scaling output to device workspace (d_C_fp32), then
                 // do a bulk hipMemcpyAsync to the mapped output.
                 const bool output_is_mapped = use_gpu_path && C_fp32->isMapped();
-                float *d_prefill_output = (use_gpu_path && !output_is_mapped) ? d_output : impl_->d_C_fp32;
+                const bool output_is_bar = use_gpu_path && C_fp32->isBARBacked() && C_fp32->bar_address() != nullptr;
+                const bool output_needs_copyout = output_is_mapped || output_is_bar;
+                float *d_prefill_output = (use_gpu_path && !output_needs_copyout) ? d_output : impl_->d_C_fp32;
 
                 // One-time diagnostic for mapped output redirect
                 if (output_is_mapped && n > 100000)
@@ -3031,11 +3037,23 @@ namespace llaminar2
                                 }
                             }
 
-                            // Handle mapped output redirect (same copy-out as INT8 path)
-                            if (!use_gpu_path || output_is_mapped)
+                            // Handle host/BAR output redirect after native prefill.
+                            // IMPORTANT: For BAR-backed outputs, copy to d_output (= hip_staging_ptr),
+                            // NOT bar_address(). The allreduce pipeline reads from hip_staging_ptr
+                            // and handles the staging→BAR→CUDA transfer.
+                            if (!use_gpu_path || output_needs_copyout)
                             {
                                 const size_t nvnni_c_size = static_cast<size_t>(m) * n;
-                                if (output_is_mapped)
+                                if (!use_gpu_path)
+                                {
+                                    float *host_dst = C_fp32->mutable_data();
+                                    hipMemcpyAsync(host_dst, d_prefill_output,
+                                                   nvnni_c_size * sizeof(float),
+                                                   hipMemcpyDeviceToHost,
+                                                   static_cast<hipStream_t>(gpu_stream_));
+                                    hipStreamSynchronize(static_cast<hipStream_t>(gpu_stream_));
+                                }
+                                else if (output_is_mapped)
                                 {
                                     float *host_dst = C_fp32->mutable_data();
                                     hipMemcpyAsync(host_dst, d_prefill_output,
@@ -3783,7 +3801,7 @@ namespace llaminar2
                 }
 
                 // Coherence handled automatically by DeviceGraphExecutor
-                // IMPORTANT: For BAR-backed tensors, use rocm_data_ptr() (HIP pointer)
+                // IMPORTANT: For BAR-backed tensors, use rocm_data_ptr() (HIP staging pointer)
                 float *d_output = nullptr;
                 if (fp32_output->isBARBacked() && fp32_output->rocm_data_ptr() != nullptr)
                 {
@@ -3923,6 +3941,11 @@ namespace llaminar2
                     // Native-VNNI path: lossless Q4/IQ4 decode with FP16 block scales
                     if (rocm_kernel->impl_->has_native_vnni)
                     {
+                        const bool output_is_mapped = fp32_output->isMapped();
+                        const bool output_is_bar = fp32_output->isBARBacked() && fp32_output->bar_address() != nullptr;
+                        const bool output_needs_copyout = output_is_mapped || output_is_bar;
+                        float *d_native_output = output_needs_copyout ? impl_->d_C_fp32 : d_output;
+
                         // Activations are always pre-quantized above (Step 3)
                         LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Projection " << i
                                                                                                  << " NATIVE-VNNI GEMV M=1 N=" << n << " K=" << k
@@ -3934,7 +3957,7 @@ namespace llaminar2
                                 rocm_kernel->impl_->d_weights_native_scales,
                                 rocm_kernel->impl_->d_weights_native_mins,
                                 rocm_kernel->impl_->d_weights_native_emins,
-                                d_output,
+                                d_native_output,
                                 impl_->d_scales_A,
                                 impl_->d_scatter_partial,
                                 n, k,
@@ -3949,11 +3972,33 @@ namespace llaminar2
 
                         if (d_bias)
                         {
-                            if (!rocmQuantGemm_biasAdd(d_output, d_bias, m, n, rocm_device_id_, gpu_stream_))
+                            if (!rocmQuantGemm_biasAdd(d_native_output, d_bias, m, n, rocm_device_id_, gpu_stream_))
                             {
                                 LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Native-VNNI bias add failed for projection " << i);
                                 all_success = false;
                                 break;
+                            }
+                        }
+
+                        // Copy back from workspace to d_output (= hip_staging_ptr for BAR-backed)
+                        if (output_needs_copyout)
+                        {
+                            const size_t output_bytes = static_cast<size_t>(m) * n * sizeof(float);
+                            if (output_is_mapped)
+                            {
+                                float *host_dst = fp32_output->mutable_data();
+                                hipMemcpyAsync(host_dst, d_native_output,
+                                               output_bytes,
+                                               hipMemcpyDeviceToHost,
+                                               static_cast<hipStream_t>(gpu_stream_));
+                                hipStreamSynchronize(static_cast<hipStream_t>(gpu_stream_));
+                            }
+                            else
+                            {
+                                hipMemcpyAsync(d_output, d_native_output,
+                                               output_bytes,
+                                               hipMemcpyDeviceToDevice,
+                                               static_cast<hipStream_t>(gpu_stream_));
                             }
                         }
 
@@ -4025,9 +4070,14 @@ namespace llaminar2
                 // PREFILL PATH: M>1 CK GEMM
                 // =========================================================================
 
+                const bool output_is_mapped = fp32_output->isMapped();
+                const bool output_is_bar = fp32_output->isBARBacked() && fp32_output->bar_address() != nullptr;
+                const bool output_needs_copyout = output_is_mapped || output_is_bar;
+                float *d_prefill_output = output_needs_copyout ? impl_->d_C_fp32 : d_output;
+
                 if (rocm_kernel->tryPrefillNativeGemm(
                         impl_->d_A_int8,
-                        d_output,
+                        d_prefill_output,
                         impl_->d_scales_A,
                         impl_->d_scales_A_blockwise,
                         d_scales_B,
@@ -4036,6 +4086,28 @@ namespace llaminar2
                         1.0f, 0.0f,
                         "ROCmQuantisedGemmKernel::multiply_fused_tensor"))
                 {
+                    // Copy back from workspace to d_output (= hip_staging_ptr for BAR-backed)
+                    if (output_needs_copyout)
+                    {
+                        const size_t output_bytes = static_cast<size_t>(m) * n * sizeof(float);
+                        if (output_is_mapped)
+                        {
+                            float *host_dst = fp32_output->mutable_data();
+                            hipMemcpyAsync(host_dst, d_prefill_output,
+                                           output_bytes,
+                                           hipMemcpyDeviceToHost,
+                                           static_cast<hipStream_t>(gpu_stream_));
+                            hipStreamSynchronize(static_cast<hipStream_t>(gpu_stream_));
+                        }
+                        else
+                        {
+                            hipMemcpyAsync(d_output, d_prefill_output,
+                                           output_bytes,
+                                           hipMemcpyDeviceToDevice,
+                                           static_cast<hipStream_t>(gpu_stream_));
+                        }
+                    }
+
                     LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Projection " << i
                                                                                              << " native prefill complete");
                     continue;

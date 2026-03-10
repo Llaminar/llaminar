@@ -1,14 +1,16 @@
 /**
  * @file CUDAQuantisedGemmKernel.h
- * @brief CUDA INT8 Tensor Core GEMM kernel for quantized tensors
+ * @brief CUDA quantized GEMM kernel for quantized tensors
  *
- * Implements ITensorGemm using CUTLASS INT8 GEMM for any quantized weight tensor.
+ * Implements ITensorGemm using CUDA quantized GEMM backends for any quantized weight tensor.
  * This is the CUDA counterpart to CPU QuantisedGemmKernel.
  *
  * **Design**:
  * - Primary entry point: multiply_tensor() with type introspection
  * - Supports any quantized weight type (IQ4_NL, Q8_0, Q4_0, Q4_K, etc.)
- * - Weights pre-converted to INT8 + per-column scales on first use
+ * - Weights are packed once and cached with preferred and active execution families
+ * - NativePayload-native formats keep compact payloads as the active execution family while
+ *   still retaining an Int8Expanded fallback mirror in the cache
  * - Activations quantized on-the-fly or used directly if already Q8_1
  * - Uses CUTLASS INT8 Tensor Core GEMM (SM 8.0+ Ampere)
  *
@@ -32,6 +34,7 @@
 
 #pragma once
 
+#include "CUDAWeightPacker.h"
 #include "../../tensors/TensorKernels.h"
 #include "../../tensors/BlockStructures.h"
 #include "../../interfaces/IWorkspaceConsumer.h"
@@ -52,102 +55,15 @@ namespace llaminar2
     namespace cuda
     {
 
-        /**
-         * @struct CUDAPackedWeights
-         * @brief Pre-packed INT8 weights for CUDA CUTLASS GEMM (analogous to CPU QuantisedPackedWeights)
-         *
-         * Stores weights converted from any quantized format to symmetric INT8 with per-column scales.
-         * Unlike CPU's VNNI packing, this is simple column-major INT8 data suitable for CUTLASS.
-         *
-         * **Memory Layout**:
-         * - `int8_data`: [K × N] ColumnMajor INT8 weights (CUTLASS Tensor Core requirement)
-         * - `scales`: [N] per-column FP32 scale factors
-         *
-         * **Conversion**: max_abs = max(abs(col)), scale = max_abs / 127, int8 = round(fp32 / scale * 127)
-         *
-         * This structure is cached in tensor->cache_ to avoid re-conversion on every kernel call.
-         */
-        struct CUDAPackedWeights
+        enum class CUDABlockwiseExecutionBackend
         {
-            struct DeviceUpload
-            {
-                int8_t *d_int8_data = nullptr;
-                float *d_scales = nullptr;
-            };
-
-            std::vector<int8_t> int8_data; ///< [K × N] ColumnMajor INT8 weights
-            std::vector<float> scales;     ///< [N] per-column scale factors
-            int K = 0;                     ///< Input features (rows in CUTLASS B matrix)
-            int N = 0;                     ///< Output features (cols in CUTLASS B matrix)
-
-            mutable std::mutex upload_mutex;
-            std::unordered_map<int, DeviceUpload> device_uploads;
-
-            // Device memory pointers (uploaded once, cached)
-            // Legacy compatibility fields, mirrored from the active device upload.
-            int8_t *d_int8_data = nullptr; ///< Device pointer to INT8 weights
-            float *d_scales = nullptr;     ///< Device pointer to scales
-            int cuda_device_id = -1;       ///< Device where data is uploaded
-            bool uploaded = false;         ///< Whether device memory is allocated
-
-            // Back-reference to source tensor for coherence marking
-            // When weights are uploaded, we mark source_tensor_->device_valid_ = true
-            // so StageCoherence doesn't try to re-upload the raw tensor data
-            TensorBase *source_tensor_ = nullptr;
-
-            CUDAPackedWeights() = default;
-            CUDAPackedWeights(const CUDAPackedWeights &) = delete;
-            CUDAPackedWeights &operator=(const CUDAPackedWeights &) = delete;
-
-            CUDAPackedWeights(CUDAPackedWeights &&other) noexcept
-            {
-                *this = std::move(other);
-            }
-
-            CUDAPackedWeights &operator=(CUDAPackedWeights &&other) noexcept
-            {
-                if (this != &other)
-                {
-                    std::scoped_lock guard(upload_mutex, other.upload_mutex);
-                    int8_data = std::move(other.int8_data);
-                    scales = std::move(other.scales);
-                    K = other.K;
-                    N = other.N;
-                    device_uploads = std::move(other.device_uploads);
-                    d_int8_data = other.d_int8_data;
-                    d_scales = other.d_scales;
-                    cuda_device_id = other.cuda_device_id;
-                    uploaded = other.uploaded;
-                    source_tensor_ = other.source_tensor_;
-
-                    other.d_int8_data = nullptr;
-                    other.d_scales = nullptr;
-                    other.cuda_device_id = -1;
-                    other.uploaded = false;
-                    other.K = 0;
-                    other.N = 0;
-                    other.source_tensor_ = nullptr;
-                }
-                return *this;
-            }
-
-            ~CUDAPackedWeights();
+            LegacyDP4A = 0,
+            TensorCoreScaffold = 1,
+            SpecializedBlockwise = 2, // DP4A GEMV + tensor-core GEMM chosen by shape/M
         };
 
         /**
-         * @brief Pack any quantized tensor to CUDAPackedWeights (host-side)
-         *
-         * Dequantizes the tensor to FP32, then re-quantizes symmetrically to INT8.
-         * Device upload happens separately when the kernel is first used.
-         *
-         * @param tensor Source quantized tensor
-         * @param out Output packed weights structure
-         * @return true on success
-         */
-        bool packWeightsToCUDA(const TensorBase *tensor, CUDAPackedWeights &out);
-
-        /**
-         * @brief CUDA GEMM kernel for quantized weight tensors using CUTLASS INT8
+         * @brief CUDA GEMM kernel for quantized weight tensors using CUDA packed weights
          *
          * Implements ITensorGemm for any quantized weight tensor type.
          *
@@ -159,13 +75,15 @@ namespace llaminar2
          * - Any tensor implementing dequantization
          *
          * **Compute Path**:
-         * 1. Weights: Dequantize → Requantize symmetric INT8 + per-column scales
-         * 2. Activations: Q8_1 blocks used directly, or FP32→INT8 quantized
-         * 3. GEMM: CUTLASS INT8×INT8→INT32 (Tensor Core mma.sync.m16n8k32)
-         * 4. Output: INT32 × scale_A × scale_B → FP32 (or requant to Q8_1)
+         * 1. Weights: Pack once, recording preferred and active CUDA weight families
+         * 2. Current execution: active_family selects the primary path; NativePayload-native
+         *    formats still retain an Int8Expanded fallback mirror for fallback/tuning paths
+         * 3. Activations: Q8_1 blocks used directly, or FP32→INT8 quantized
+         * 4. GEMM: CUTLASS INT8×INT8→INT32 (Tensor Core mma.sync.m16n8k32)
+         * 5. Output: INT32 × scale_A × scale_B → FP32 (or requant to Q8_1)
          *
          * **Memory Layout**:
-         * - Weights: INT8 [K × N] ColumnMajor (CUTLASS Tensor Core requirement)
+         * - Int8Expanded fallback weights: INT8 [K × N] ColumnMajor (CUTLASS Tensor Core requirement)
          * - Activations: INT8 [M × K] RowMajor
          * - Output: FP32/INT32 [M × N] RowMajor
          *
@@ -177,6 +95,9 @@ namespace llaminar2
         class CUDAQuantisedGemmKernel : public ITensorGemm, public IWorkspaceConsumer
         {
         public:
+            static void setBlockwiseExecutionBackend(CUDABlockwiseExecutionBackend backend);
+            static CUDABlockwiseExecutionBackend getBlockwiseExecutionBackend();
+
             /**
              * @brief Construct kernel for quantized weight tensor (lazy conversion)
              *
@@ -188,12 +109,12 @@ namespace llaminar2
             CUDAQuantisedGemmKernel(const TensorBase *weights, int cuda_device_id);
 
             /**
-             * @brief Construct kernel from pre-packed INT8 weights (PREFERRED)
+             * @brief Construct kernel from pre-packed CUDA weights (preferred path)
              *
-             * This constructor avoids redundant weight conversion by using pre-packed
+             * This constructor avoids redundant weight conversion by using packed
              * CUDAPackedWeights that are cached in the tensor's cache_ field.
              *
-             * @param packed Pre-packed INT8 weights with scales (from KernelFactory cache)
+             * @param packed Pre-packed CUDA weights from KernelFactory cache
              * @param cuda_device_id CUDA device ID
              *
              * @throws std::runtime_error if packed is null or has invalid dimensions

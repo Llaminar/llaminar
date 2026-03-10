@@ -111,6 +111,10 @@ namespace llaminar2
             stage_type == "V_PROJECTION" || stage_type == "QKV_PROJECTION")
             return SnapshotShardingMode::COLUMN_PARALLEL;
 
+        // RoPE outputs - column-parallel (split on num_heads for Q, num_kv_heads for K)
+        if (stage_type == "Q_ROPE" || stage_type == "K_ROPE")
+            return SnapshotShardingMode::COLUMN_PARALLEL;
+
         // Attention context - column-parallel (split on num_heads)
         if (stage_type == "ATTENTION_CONTEXT" || stage_type == "FUSED_ATTENTION_WO_CONTEXT")
             return SnapshotShardingMode::COLUMN_PARALLEL;

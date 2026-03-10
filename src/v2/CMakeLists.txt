@@ -220,6 +220,12 @@ if(HAVE_CUDA)
     set(CUDA_KERNEL_SOURCES
         kernels/cuda/CuBLASGemmKernel.cu              # cuBLAS wrapper for FP32/FP16/BF16 dense GEMM
         kernels/cuda/CUDAQuantisedGemmKernel_CUTLASS.cu  # CUTLASS INT8 GEMM implementation
+        kernels/cuda/CUDATensorCoreBlockwiseGemm.cu   # blockwise tensor-core GEMM/GEMV scaffold
+        kernels/cuda/CUDATensorCoreGemvKernels.cu    # per-shape DP4A GEMV family (Wide, GridKPar, LDSKReduce, Direct)
+        kernels/cuda/CUDANativePayloadIQTables.cu    # shared IQ lookup table symbol definitions for native-payload decode
+        kernels/cuda/CUDANativePayloadGemvKernels.cu # native-payload decode GEMV for Q4_0/Q4_1/IQ4_NL
+        kernels/cuda/CUDANativePayloadGemmKernels.cu # native-payload prefill GEMM for Q4_0/Q4_1/IQ4_NL
+        kernels/cuda/CUDATensorCoreGemmKernels.cu    # per-shape tensor-core GEMM family (SmallM, WideN, Balanced)
         # Ops kernels (split from monolithic CUDAOpsKernels.cu)
         kernels/cuda/ops/CUDARMSNormKernels.cu        # RMSNorm kernels (FP32, BF16, FP16)
         kernels/cuda/ops/CUDAResidualAddKernels.cu    # Residual Add kernels (FP32, BF16, FP16)
@@ -1483,6 +1489,7 @@ if(HAVE_CUDA)
     # template instantiation dependencies from CUDARingKVCache.cu
     target_sources(llaminar2_core PRIVATE
         kernels/cuda/CUDAFloatingPointGemmKernel.cpp
+        kernels/cuda/CUDAWeightPacker.cpp
         kernels/cuda/CUDAQuantisedGemmKernel.cpp
         kernels/cuda/ops/CUDAOpsKernels.cpp           # RMSNorm, SwiGLU, RoPE, Embedding ITensor implementations
         kernels/cuda/attention/CUDAFlashAttentionKernelT.cpp  # Flash Attention ITensor implementation

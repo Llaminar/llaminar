@@ -107,6 +107,9 @@
 
 namespace llaminar2
 {
+    // Forward declaration for backend dependency injection
+    class IBackend;
+
     // All block structures are now defined in BlockStructures.h
     // This eliminates circular dependencies between Tensors.h and SIMDHelpers.h
 
@@ -1145,6 +1148,17 @@ namespace llaminar2
         const void *bar_address() const { return bar_rocm_ptr_; }
 
         /**
+         * @brief Get the CUDA device pointer for BAR memory
+         *
+         * Returns the CUDA-accessible pointer obtained via cuMemHostGetDevicePointer().
+         * This pointer MUST be used for CUDA kernel access to BAR memory, not bar_address().
+         *
+         * @return void* CUDA device pointer to BAR, or nullptr if not BAR-backed
+         */
+        void *bar_cuda_ptr() { return bar_cuda_device_ptr_; }
+        const void *bar_cuda_ptr() const { return bar_cuda_device_ptr_; }
+
+        /**
          * @brief Initialize BAR-backed state with direct pointers
          *
          * Sets up BAR-backed memory state using pre-obtained pointers from DirectP2PEngine.
@@ -1621,6 +1635,36 @@ namespace llaminar2
          */
         virtual void setLayout(TensorLayout layout) { layout_ = layout; }
 
+        // =========================================================================
+        // Backend Dependency Injection (for testing)
+        // =========================================================================
+
+        /**
+         * @brief Inject a custom backend for this tensor (test-only)
+         *
+         * When set, all backend operations (ensureOnDevice, ensureOnHost, etc.)
+         * use this backend instead of the global CUDA/ROCm backend lookup.
+         * This enables unit testing of coherence logic with MockBackend.
+         *
+         * @param backend Pointer to IBackend implementation (caller retains ownership)
+         * @note Non-owning: caller must ensure backend outlives the tensor
+         * @note Thread-safe: acquires coherence_mutex_
+         */
+        void setBackendForTesting(IBackend *backend)
+        {
+            std::lock_guard<std::mutex> lock(coherence_mutex_);
+            injected_backend_ = backend;
+        }
+
+        /**
+         * @brief Clear the injected backend, reverting to global backend lookup
+         */
+        void clearBackendForTesting()
+        {
+            std::lock_guard<std::mutex> lock(coherence_mutex_);
+            injected_backend_ = nullptr;
+        }
+
     protected:
         // Default constructor for derived classes
         TensorBase() = default;
@@ -1686,6 +1730,19 @@ namespace llaminar2
         void *gpu_data_ptr_ = nullptr;            // GPU buffer pointer (nullptr = not on GPU)
         bool host_valid_ = true;                  // Host data is current (starts true - data created on host)
         bool device_valid_ = false;               // Device data is current (starts false - no GPU alloc)
+
+        // Injected backend for testing (non-owning). When non-null, resolveBackend()
+        // returns this instead of looking up the global CUDA/ROCm backend.
+        IBackend *injected_backend_ = nullptr;
+
+        /**
+         * @brief Resolve the backend for a given device
+         *
+         * Returns injected_backend_ if set (for testing), otherwise
+         * falls back to global CUDA/ROCm backend lookup.
+         */
+        IBackend *resolveBackend(DeviceId device) const;
+
         std::optional<DeviceId> gpu_device_;      // Which GPU device (nullopt = not on GPU)
         void *device_completion_event_ = nullptr; // Event marking last kernel write (for fine-grained sync)
         std::optional<DeviceId> event_device_;    // Device where device_completion_event_ was created

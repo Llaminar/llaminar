@@ -7,6 +7,7 @@
 
 #include "Qwen2GraphConfigBuilder.h"
 #include "Qwen2Graph.h" // For Qwen2GraphConfig definition
+#include "../../interfaces/IModelContext.h"
 #include "../../loaders/WeightManager.h"
 #include <algorithm>
 #include <cmath>
@@ -329,6 +330,111 @@ namespace llaminar2
         }
 
         return total_heads / total_shards;
+    }
+
+    // =========================================================================
+    // IModelContext-Based Configuration (Polymorphic API)
+    // =========================================================================
+
+    bool Qwen2GraphConfigBuilder::populateFromModelContext(
+        IModelContext &ctx,
+        Qwen2GraphConfig &config)
+    {
+        config.n_layers = ctx.blockCount();
+        config.d_model = ctx.embeddingLength();
+        config.n_heads = ctx.headCount();
+        config.n_kv_heads = ctx.headCountKV();
+        config.vocab_size = ctx.vocabSize();
+
+        // head_dim: prefer explicit key_length, fall back to d_model / n_heads
+        config.head_dim = ctx.keyLength() > 0
+                              ? ctx.keyLength()
+                              : config.d_model / config.n_heads;
+
+        // d_ff: prefer explicit value, fall back to 4x d_model
+        int d_ff = ctx.feedForwardLength();
+        if (d_ff > 0)
+        {
+            config.d_ff = d_ff;
+        }
+        else
+        {
+            config.d_ff = config.d_model * 4;
+            LOG_WARN("[Qwen2GraphConfigBuilder] feedForwardLength() returned 0, using estimate: "
+                     << config.d_ff);
+        }
+
+        // Hyperparameters from loader (rope_theta, rms_norm_eps)
+        auto loader = ctx.loader();
+        if (loader)
+        {
+            config.rope_theta = loader->ropeTheta();
+            config.rms_norm_eps = loader->rmsNormEps();
+        }
+
+        return true;
+    }
+
+    // =========================================================================
+    // Weight Building (Polymorphic API)
+    // =========================================================================
+
+    Qwen2ModelWeights Qwen2GraphConfigBuilder::buildWeights(WeightAccessor get_weight)
+    {
+        Qwen2ModelWeights weights;
+
+        auto embedding = get_weight("token_embd.weight");
+        auto final_norm = get_weight("output_norm.weight");
+        auto lm_head = get_weight("output.weight");
+
+        // Tied embeddings: if output.weight is missing, reuse token_embd.weight
+        if (!lm_head && embedding)
+        {
+            LOG_INFO("[Qwen2GraphConfigBuilder] output.weight not found, using tied embeddings");
+            lm_head = embedding;
+        }
+
+        weights.embedding_table = embedding.get();
+        weights.final_norm = final_norm.get();
+        weights.lm_head = lm_head.get();
+
+        // Layer weight accessor — captures get_weight for deferred per-layer resolution
+        weights.get_layer_weights = [get_weight](int layer_idx) -> Qwen2LayerWeights
+        {
+            Qwen2LayerWeights layer;
+            std::string prefix = "blk." + std::to_string(layer_idx) + ".";
+
+            // Attention weights
+            layer.wq = get_weight(prefix + "attn_q.weight").get();
+            layer.wk = get_weight(prefix + "attn_k.weight").get();
+            layer.wv = get_weight(prefix + "attn_v.weight").get();
+            layer.wo = get_weight(prefix + "attn_output.weight").get();
+            layer.attn_norm = get_weight(prefix + "attn_norm.weight").get();
+
+            // Attention biases (Qwen2 has these, Qwen3 does not)
+            auto q_bias = get_weight(prefix + "attn_q.bias");
+            auto k_bias = get_weight(prefix + "attn_k.bias");
+            auto v_bias = get_weight(prefix + "attn_v.bias");
+            layer.q_bias = q_bias ? q_bias.get() : nullptr;
+            layer.k_bias = k_bias ? k_bias.get() : nullptr;
+            layer.v_bias = v_bias ? v_bias.get() : nullptr;
+
+            // QK norm weights (Qwen3: per-head RMSNorm, null for Qwen2)
+            auto q_norm = get_weight(prefix + "attn_q_norm.weight");
+            auto k_norm = get_weight(prefix + "attn_k_norm.weight");
+            layer.q_norm = q_norm ? q_norm.get() : nullptr;
+            layer.k_norm = k_norm ? k_norm.get() : nullptr;
+
+            // FFN weights
+            layer.gate_proj = get_weight(prefix + "ffn_gate.weight").get();
+            layer.up_proj = get_weight(prefix + "ffn_up.weight").get();
+            layer.down_proj = get_weight(prefix + "ffn_down.weight").get();
+            layer.ffn_norm = get_weight(prefix + "ffn_norm.weight").get();
+
+            return layer;
+        };
+
+        return weights;
     }
 
 } // namespace llaminar2

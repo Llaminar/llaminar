@@ -2735,10 +2735,28 @@ namespace llaminar2
                     // FFN_SWIGLU output is [seq_len, d_ff_local] where d_ff_local = d_ff / tp_degree
                     bool is_ffn_stage =
                         (key.find("FFN") != std::string::npos && key.find("RESIDUAL") == std::string::npos);
+
+                    // Check if this is a K/V projection or K_ROPE stage
+                    // These use n_kv_heads (GQA) instead of n_heads, so their column width
+                    // is kv_dim = n_kv_heads * head_dim, NOT hidden_size = n_heads * head_dim
+                    bool is_kv_stage =
+                        (key.find("K_PROJECTION") != std::string::npos ||
+                         key.find("V_PROJECTION") != std::string::npos ||
+                         key.find("K_ROPE") != std::string::npos);
+
                     if (is_ffn_stage)
                     {
                         size_t d_ff = static_cast<size_t>(model_ctx_->feedForwardLength());
                         local_cols = d_ff / static_cast<size_t>(result.tp_degree);
+                    }
+                    else if (is_kv_stage)
+                    {
+                        size_t n_kv_heads = static_cast<size_t>(model_ctx_->headCountKV());
+                        size_t n_heads = static_cast<size_t>(model_ctx_->headCount());
+                        size_t hidden_size = model_ctx_->embeddingLength();
+                        size_t head_dim = hidden_size / n_heads;
+                        size_t kv_dim = n_kv_heads * head_dim;
+                        local_cols = kv_dim / static_cast<size_t>(result.tp_degree);
                     }
                     else
                     {

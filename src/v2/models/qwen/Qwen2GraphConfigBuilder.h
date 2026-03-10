@@ -59,6 +59,18 @@ namespace llaminar2
             IWeightManager &weight_manager,
             Qwen2GraphConfig &config) override;
 
+        /**
+         * @brief Populate config from IModelContext (architecture fields)
+         */
+        bool populateFromModelContext(
+            IModelContext &ctx,
+            Qwen2GraphConfig &config) override;
+
+        /**
+         * @brief Build weights from accessor (Qwen2/3 weight names)
+         */
+        Qwen2ModelWeights buildWeights(WeightAccessor get_weight) override;
+
     private:
         /**
          * @brief Create appropriate LayerDevicePlacement from plan
