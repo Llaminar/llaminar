@@ -288,6 +288,9 @@ namespace llaminar2
          *
          * CPU kernels should be called directly, not through the backend interface.
          */
+        // Backend identity
+        DeviceType backendDeviceType() const override { return DeviceType::CPU; }
+
         bool gemmIQ4NL(
             const void *A_device,
             const void *B_device,

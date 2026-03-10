@@ -60,7 +60,7 @@ namespace
         // =========================================================================
         std::unique_ptr<Qwen2Graph> createGraph(int pp_layer_offset)
         {
-            Qwen2GraphConfig config;
+            GraphConfig config;
             config.n_layers = N_LAYERS;
             config.d_model = D_MODEL;
             config.n_heads = N_HEADS;
@@ -119,14 +119,14 @@ namespace
         }
 
         // =========================================================================
-        // Get Qwen2LayerWeights for a layer index
+        // Get LayerWeights for a layer index
         // =========================================================================
-        Qwen2LayerWeights getLayerWeights(int idx)
+        LayerWeights getLayerWeights(int idx)
         {
             // Clamp to available weights (we only create N_LAYERS worth)
             int safe_idx = idx % N_LAYERS;
             const auto &lw = layer_weights_[safe_idx];
-            Qwen2LayerWeights result;
+            LayerWeights result;
             result.wq = lw.wq.get();
             result.wk = lw.wk.get();
             result.wv = lw.wv.get();
@@ -284,7 +284,7 @@ namespace
     protected:
         std::shared_ptr<MPIContext> mpi_ctx_;
         std::unique_ptr<TensorFactory> tensor_factory_;
-        Qwen2ActivationBuffers buffers_{};
+        ActivationBuffers buffers_{};
 
         // Weight storage
         std::vector<LayerWeightSet> layer_weights_;

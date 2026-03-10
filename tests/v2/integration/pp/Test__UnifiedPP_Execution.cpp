@@ -186,9 +186,9 @@ namespace
         // =========================================================================
         // Helper: Create graph configuration
         // =========================================================================
-        Qwen2GraphConfig createGraphConfig()
+        GraphConfig createGraphConfig()
         {
-            Qwen2GraphConfig config;
+            GraphConfig config;
 
             config.n_layers = n_layers_;
             config.d_model = d_model_;
@@ -214,9 +214,9 @@ namespace
         // =========================================================================
         // Helper: Create model weights accessor
         // =========================================================================
-        Qwen2ModelWeights createModelWeights()
+        ModelWeights createModelWeights()
         {
-            Qwen2ModelWeights weights;
+            ModelWeights weights;
 
             // Load global weights
             embedding_table_ = model_ctx_->getWeightForDevice("token_embd.weight", cpu_device_);
@@ -228,7 +228,7 @@ namespace
             weights.lm_head = lm_head_.get();
 
             // Create layer weights accessor
-            weights.get_layer_weights = [this](int layer_idx) -> Qwen2LayerWeights
+            weights.get_layer_weights = [this](int layer_idx) -> LayerWeights
             {
                 return loadLayerWeights(layer_idx);
             };
@@ -239,7 +239,7 @@ namespace
         // =========================================================================
         // Helper: Load weights for a single layer
         // =========================================================================
-        Qwen2LayerWeights loadLayerWeights(int layer_idx)
+        LayerWeights loadLayerWeights(int layer_idx)
         {
             // Check cache
             if (layer_weights_cache_.count(layer_idx))
@@ -295,12 +295,12 @@ namespace
         // =========================================================================
         // Helper: Create activation buffers
         // =========================================================================
-        Qwen2ModelBuffers createBuffers(int seq_len)
+        ModelBuffers createBuffers(int seq_len)
         {
             // Helper to avoid narrowing conversions (int -> size_t)
             auto sz = [](int x) { return static_cast<size_t>(x); };
 
-            Qwen2ModelBuffers buffers;
+            ModelBuffers buffers;
 
             // Current hidden [seq_len, d_model]
             // NOTE: Both buffers.current_hidden (model-level) and buffers.layer_buffers.current_hidden
@@ -440,7 +440,7 @@ namespace
         std::unique_ptr<CPUDeviceContext> cpu_context_;
 
         // Graph config
-        Qwen2GraphConfig graph_config_;
+        GraphConfig graph_config_;
 
         // Mock PP contexts
         std::vector<std::unique_ptr<MockLocalPPContext>> mock_pp_contexts_;
@@ -456,7 +456,7 @@ namespace
             std::shared_ptr<TensorBase> wq, wk, wv, wo, attn_norm;
             std::shared_ptr<TensorBase> q_bias, k_bias, v_bias;
             std::shared_ptr<TensorBase> gate_proj, up_proj, down_proj, ffn_norm;
-            Qwen2LayerWeights weights;
+            LayerWeights weights;
         };
         std::unordered_map<int, LayerWeightsStorage> layer_weights_cache_;
 

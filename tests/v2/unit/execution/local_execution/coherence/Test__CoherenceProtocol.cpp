@@ -69,9 +69,11 @@ protected:
     static constexpr size_t kBytes = kElements * sizeof(float);
 
     // Use ROCm device to avoid PCIeBAR proxy in waitForEventWithProxy
+    // Use ROCm device to avoid PCIeBAR proxy in waitForEventWithProxy
     DeviceId device_ = DeviceId::rocm(0);
 
-    MockBackend mock_backend_;
+    // Mock backend configured as ROCm type to match device_
+    MockBackend mock_backend_{DeviceType::ROCm};
 
     /// Create a tensor with known data pattern and inject mock backend
     std::unique_ptr<CoherenceProtocolTensor> createTensor(float fill_value = 1.0f)

@@ -42,10 +42,10 @@ protected:
         tensor_factory_ = std::make_unique<TensorFactory>(*mpi_ctx_);
     }
 
-    Qwen2GraphConfig createMinimalConfig()
+    GraphConfig createMinimalConfig()
     {
         // Create minimal config for Qwen2.5-0.5B-like model
-        Qwen2GraphConfig config;
+        GraphConfig config;
         config.d_model = 896;
         config.n_heads = 14;
         config.n_kv_heads = 2;

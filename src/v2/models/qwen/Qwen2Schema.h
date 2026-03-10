@@ -408,6 +408,72 @@ namespace llaminar2
             // All other weights are required
             return false;
         }
+
+        std::vector<std::string> layerWeightSuffixes() const override
+        {
+            return {
+                // Attention weights (required)
+                "attn_q.weight", "attn_k.weight", "attn_v.weight",
+                "attn_output.weight", "attn_norm.weight",
+                // Attention biases (optional per isWeightOptional)
+                "attn_q.bias", "attn_k.bias", "attn_v.bias",
+                // QK norm weights (optional per isWeightOptional)
+                "attn_q_norm.weight", "attn_k_norm.weight",
+                // FFN weights (required)
+                "ffn_gate.weight", "ffn_up.weight",
+                "ffn_down.weight", "ffn_norm.weight"};
+        }
+
+        /**
+         * @brief Stage output sharding config for Qwen2 tensor parallelism
+         *
+         * Maps each stage type to how its output is distributed across TP devices.
+         * This replaces the hardcoded if-chain in TPSnapshot.h::getStageShardingMode().
+         */
+        StageShardingConfig getStageShardingConfig() const override
+        {
+            return {
+                // Embedding - replicated (full table on each device)
+                {"EMBEDDING", SnapshotShardingMode::REPLICATED},
+
+                // Attention projections - column-parallel (split by heads)
+                {"Q_PROJECTION", SnapshotShardingMode::COLUMN_PARALLEL},
+                {"K_PROJECTION", SnapshotShardingMode::COLUMN_PARALLEL},
+                {"V_PROJECTION", SnapshotShardingMode::COLUMN_PARALLEL},
+                {"QKV_PROJECTION", SnapshotShardingMode::COLUMN_PARALLEL},
+
+                // RoPE outputs - column-parallel (per-head)
+                {"Q_ROPE", SnapshotShardingMode::COLUMN_PARALLEL},
+                {"K_ROPE", SnapshotShardingMode::COLUMN_PARALLEL},
+
+                // Attention context - column-parallel (split by heads)
+                {"ATTENTION_CONTEXT", SnapshotShardingMode::COLUMN_PARALLEL},
+                {"FUSED_ATTENTION_WO_CONTEXT", SnapshotShardingMode::COLUMN_PARALLEL},
+
+                // Attention output (Wo) - row-parallel (AllReduce combines)
+                {"ATTENTION_OUTPUT", SnapshotShardingMode::ROW_PARALLEL},
+                {"FUSED_ATTENTION_WO", SnapshotShardingMode::ROW_PARALLEL},
+
+                // Norms - replicated
+                {"ATTENTION_NORM", SnapshotShardingMode::REPLICATED},
+                {"FFN_NORM", SnapshotShardingMode::REPLICATED},
+                {"FINAL_NORM", SnapshotShardingMode::REPLICATED},
+
+                // FFN - column-parallel for gate/up, row-parallel for down
+                {"FFN_GATE", SnapshotShardingMode::COLUMN_PARALLEL},
+                {"FFN_UP", SnapshotShardingMode::COLUMN_PARALLEL},
+                {"FFN_GATE_UP", SnapshotShardingMode::COLUMN_PARALLEL},
+                {"FUSED_FFN_GATE_UP", SnapshotShardingMode::COLUMN_PARALLEL},
+                {"FFN_SWIGLU", SnapshotShardingMode::COLUMN_PARALLEL},
+                {"FFN_DOWN", SnapshotShardingMode::ROW_PARALLEL},
+
+                // Residuals - replicated (after AllReduce)
+                {"FFN_RESIDUAL", SnapshotShardingMode::REPLICATED},
+
+                // LM head - column-parallel then AllGather
+                {"LM_HEAD", SnapshotShardingMode::GATHERED},
+            };
+        }
     };
 
 } // namespace llaminar2

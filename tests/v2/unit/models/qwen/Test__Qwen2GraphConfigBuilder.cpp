@@ -15,7 +15,7 @@
 
 #include <gtest/gtest.h>
 #include "models/qwen/Qwen2GraphConfigBuilder.h"
-#include "models/qwen/Qwen2Graph.h" // For Qwen2GraphConfig
+#include "models/qwen/Qwen2Graph.h" // For GraphConfig
 #include "models/IGraphConfigBuilder.h"
 #include "execution/mpi_orchestration/RankExecutionPlan.h"
 #include "config/OrchestrationConfig.h"

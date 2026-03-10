@@ -252,6 +252,9 @@ namespace llaminar2
             throw std::invalid_argument("Invalid MultiDeviceOrchestrator configuration");
         }
 
+        // Initialize stage sharding map from model architecture
+        stage_sharding_map_ = SchemaFactoryRegistry::getStageShardingConfig(model_ctx_->architecture());
+
         // Determine effective parallelism mode
         mode_ = config_.effectiveMode();
 
@@ -307,6 +310,9 @@ namespace llaminar2
             throw std::invalid_argument("tp_ctx cannot be null");
         }
 
+        // Initialize stage sharding map from model architecture
+        stage_sharding_map_ = SchemaFactoryRegistry::getStageShardingConfig(model_ctx_->architecture());
+
         // Validate TP degree
         if (tp_ctx_->degree() < 2)
         {
@@ -335,6 +341,9 @@ namespace llaminar2
           device_runners_(std::move(device_runners)),
           config_(config)
     {
+        // Initialize stage sharding map from model architecture
+        stage_sharding_map_ = SchemaFactoryRegistry::getStageShardingConfig(model_ctx_->architecture());
+
         LOG_DEBUG("MultiDeviceOrchestrator: Created via createForTest with "
                   << device_runners_.size() << " injected device runners");
     }
@@ -390,11 +399,13 @@ namespace llaminar2
                 int d_ff = model_ctx_->feedForwardLength();
                 int vocab_size = model_ctx_->vocabSize();
 
-                // Estimate d_ff if not available (common SwiGLU ratio)
+                // feedForwardLength must be available from model metadata for correct TP sharding
                 if (d_ff <= 0)
                 {
-                    d_ff = model_ctx_->embeddingLength() * 4;
-                    LOG_WARN("MultiDeviceOrchestrator: feedForwardLength() unavailable, using estimate: " << d_ff);
+                    throw std::runtime_error(
+                        "MultiDeviceOrchestrator: feedForwardLength() unavailable from model context. "
+                        "This value is required for correct tensor parallel weight sharding. "
+                        "Ensure the GGUF model contains the feed_forward_length metadata field.");
                 }
 
                 auto tp_config = std::make_shared<TensorParallelConfig>(
@@ -1591,6 +1602,27 @@ namespace llaminar2
             return false;
         }
 
+        // PP device coherence: After PP transfer in the previous iteration, the
+        // hidden state tensor's gpu_device_ may point to the *destination* device
+        // (e.g., ROCm:1) instead of this stage's device (ROCm:0). Promote the
+        // secondary buffer back to primary so kernels and mark_device_dirty_with_event
+        // operate on the correct device.
+        if (pp_ctx_ && num_stages > 1)
+        {
+            TensorBase *hidden = stage0_runner->getHiddenState();
+            if (hidden)
+            {
+                DeviceId stage0_device = pp_ctx_->deviceForStage(0).toLocalDeviceId();
+                auto cur = hidden->current_device();
+                if (cur.has_value() && *cur != stage0_device)
+                {
+                    LOG_DEBUG("MultiDeviceOrchestrator::forwardPP: Re-asserting hidden state device from "
+                              << cur->toString() << " to " << stage0_device.toString());
+                    hidden->allocateOnDevice(stage0_device);
+                }
+            }
+        }
+
         LOG_DEBUG("MultiDeviceOrchestrator::forwardPP: Executing stage 0 (embedding)");
         if (!stage0_runner->forward(tokens, seq_len))
         {
@@ -1623,11 +1655,15 @@ namespace llaminar2
             }
 
             // Transfer activations from previous stage to current stage
+            // Only transfer the active region (seq_len tokens), not the full buffer
+            const size_t active_bytes =
+                static_cast<size_t>(seq_len) * model_ctx_->embeddingLength() * sizeof(float);
             LOG_DEBUG("MultiDeviceOrchestrator::forwardPP: Transferring hidden state from stage "
-                      << (stage_idx - 1) << " to stage " << stage_idx);
+                      << (stage_idx - 1) << " to stage " << stage_idx
+                      << " (" << active_bytes << " bytes for " << seq_len << " tokens)");
 
             if (!pp_ctx_->transfer(hidden_state, static_cast<int>(stage_idx - 1),
-                                   static_cast<int>(stage_idx)))
+                                   static_cast<int>(stage_idx), active_bytes))
             {
                 LOG_ERROR("MultiDeviceOrchestrator::forwardPP: Transfer from stage "
                           << (stage_idx - 1) << " to stage " << stage_idx << " failed");
@@ -2444,14 +2480,15 @@ namespace llaminar2
 
     const float *MultiDeviceOrchestrator::getSnapshot(const std::string &key, size_t &out_size) const
     {
-        // For LM_HEAD with multi-device TP, return the gathered combined_logits
+        // For GATHERED stages (e.g., LM_HEAD) with multi-device TP, return the gathered combined_logits.
         // This is necessary because each device only has logits_local with vocab_local entries,
         // but tests expect the full vocab_size logits.
         //
         // CRITICAL: For hybrid PP+TP, only the stage that actually HAS the LM head should
         // return combined_logits. Otherwise, a nested TP stage (like PP stage 0) that has
         // logits_local buffers allocated but never computes LM_HEAD would return stale data.
-        if (key == "LM_HEAD" && device_runners_.size() > 1 && combined_logits_ && tp_ctx_)
+        if (getStageShardingMode(key, stage_sharding_map_) == SnapshotShardingMode::GATHERED &&
+            device_runners_.size() > 1 && combined_logits_ && tp_ctx_)
         {
             // First, verify this stage actually owns the LM_HEAD.
             // Check nested_pp_stage_config first — when this MDO is a TP stage inside PP,
@@ -2594,7 +2631,7 @@ namespace llaminar2
     {
         TPSnapshot result;
         result.key = key;
-        result.mode = getStageShardingMode(key);
+        result.mode = getStageShardingMode(key, stage_sharding_map_);
         result.tp_degree = static_cast<int>(device_runners_.size());
 
         LOG_DEBUG("MultiDeviceOrchestrator::getTPSnapshot: key=" << key
@@ -2666,8 +2703,9 @@ namespace llaminar2
         // TP Mode (non-PP): Collect from device_runners_
         // =========================================================================
 
-        // Special case: LM_HEAD with combined_logits_ already gathered
-        if (key == "LM_HEAD" && device_runners_.size() > 1 && combined_logits_ && tp_ctx_)
+        // Special case: GATHERED stages (e.g., LM_HEAD) with combined_logits_ already gathered
+        if (getStageShardingMode(key, stage_sharding_map_) == SnapshotShardingMode::GATHERED &&
+            device_runners_.size() > 1 && combined_logits_ && tp_ctx_)
         {
             bool has_column_parallel_lm_head = false;
             for (const auto &runner : device_runners_)
@@ -2794,7 +2832,7 @@ namespace llaminar2
 
         for (const auto &key : keys)
         {
-            result.emplace_back(key, getStageShardingMode(key));
+            result.emplace_back(key, getStageShardingMode(key, stage_sharding_map_));
         }
 
         return result;

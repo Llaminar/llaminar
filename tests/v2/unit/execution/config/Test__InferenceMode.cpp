@@ -37,9 +37,9 @@ protected:
     std::unique_ptr<FP32Tensor> Q, K, V, attn_output;
     std::unique_ptr<FP32Tensor> Q_rope, K_rope, V_dequant;
 
-    Qwen2ActivationBuffers makeBaseBuffers()
+    ActivationBuffers makeBaseBuffers()
     {
-        Qwen2ActivationBuffers buffers;
+        ActivationBuffers buffers;
         buffers.Q = Q.get();
         buffers.K = K.get();
         buffers.V = V.get();
@@ -47,7 +47,7 @@ protected:
         return buffers;
     }
 
-    Qwen2ActivationBuffers makeHybridBuffers()
+    ActivationBuffers makeHybridBuffers()
     {
         auto buffers = makeBaseBuffers();
         buffers.Q_rope = Q_rope.get();
@@ -231,7 +231,7 @@ TEST_F(InferenceModeTest, HybridMode_ValidatesWithHybridBuffers)
 TEST_F(InferenceModeTest, Validation_DetectsMissingCoreBuffers)
 {
     InferenceMode mode = InferenceMode::FP32();
-    Qwen2ActivationBuffers buffers; // All null
+    ActivationBuffers buffers; // All null
 
     auto result = mode.validateBuffers(buffers);
 
@@ -247,7 +247,7 @@ TEST_F(InferenceModeTest, ValidationResult_BoolConversion)
     auto valid_result = mode.validateBuffers(valid_buffers);
     EXPECT_TRUE(static_cast<bool>(valid_result));
 
-    Qwen2ActivationBuffers empty_buffers;
+    ActivationBuffers empty_buffers;
     auto invalid_result = mode.validateBuffers(empty_buffers);
     EXPECT_FALSE(static_cast<bool>(invalid_result));
 }

@@ -6,7 +6,7 @@
  */
 
 #include "Qwen2GraphConfigBuilder.h"
-#include "Qwen2Graph.h" // For Qwen2GraphConfig definition
+#include "Qwen2Graph.h" // For GraphConfig definition (via GraphTypes.h)
 #include "../../interfaces/IModelContext.h"
 #include "../../loaders/WeightManager.h"
 #include <algorithm>
@@ -84,11 +84,11 @@ namespace llaminar2
         return result;
     }
 
-    bool Qwen2GraphConfigBuilder::buildQwen2Config(
+    bool Qwen2GraphConfigBuilder::buildGraphConfig(
         const RankExecutionPlan &plan,
         const ModelConfig &model_config,
         IWeightManager & /*weight_manager*/,
-        Qwen2GraphConfig &config)
+        GraphConfig &config)
     {
         // Create placement strategy
         auto placement = createPlacement(plan, model_config);
@@ -99,8 +99,9 @@ namespace llaminar2
 
         // Basic model architecture
         // Note: ModelConfig uses hidden_size/intermediate_size,
-        // Qwen2GraphConfig uses d_model/d_ff
+        // GraphConfig uses d_model/d_ff
         config.n_layers = model_config.n_layers;
+        config.total_n_layers = model_config.n_layers; // In MPI path, n_layers is always total
         config.d_model = model_config.hidden_size;
         config.n_heads = model_config.n_heads;
         config.n_kv_heads = model_config.n_kv_heads;
@@ -108,7 +109,7 @@ namespace llaminar2
         config.d_ff = model_config.intermediate_size;
         config.vocab_size = model_config.vocab_size;
 
-        // Precision settings: use defaults from Qwen2GraphConfig
+        // Precision settings: use defaults from GraphConfig
         // (ModelConfig doesn't carry rms_norm_eps/rope_theta)
         // config.rms_norm_eps = 1e-6f;  // default
         // config.rope_theta = 10000.0f; // default
@@ -143,7 +144,7 @@ namespace llaminar2
     }
 
     void Qwen2GraphConfigBuilder::configureAttentionTP(
-        Qwen2GraphConfig &config,
+        GraphConfig &config,
         const RankExecutionPlan &plan,
         const ModelConfig &model_config,
         const LayerDevicePlacement &placement)
@@ -178,7 +179,7 @@ namespace llaminar2
     }
 
     void Qwen2GraphConfigBuilder::configureFFNTP(
-        Qwen2GraphConfig &config,
+        GraphConfig &config,
         const RankExecutionPlan &plan,
         const ModelConfig &model_config)
     {
@@ -213,7 +214,7 @@ namespace llaminar2
     }
 
     void Qwen2GraphConfigBuilder::configureLMHeadTP(
-        Qwen2GraphConfig &config,
+        GraphConfig &config,
         const RankExecutionPlan &plan,
         const ModelConfig &model_config)
     {
@@ -244,11 +245,11 @@ namespace llaminar2
     }
 
     void Qwen2GraphConfigBuilder::configurePipelineParallel(
-        Qwen2GraphConfig & /*config*/,
+        GraphConfig & /*config*/,
         const RankExecutionPlan & /*plan*/,
         const ModelConfig & /*model_config*/)
     {
-        // Pipeline parallelism doesn't directly modify Qwen2GraphConfig fields.
+        // Pipeline parallelism doesn't directly modify GraphConfig fields.
         // The layer building decisions (which layers, embedding, lm_head) are
         // determined by LayerDevicePlacement::shouldBuildLayer(),
         // shouldBuildEmbedding(), and shouldBuildLMHead().
@@ -338,9 +339,10 @@ namespace llaminar2
 
     bool Qwen2GraphConfigBuilder::populateFromModelContext(
         IModelContext &ctx,
-        Qwen2GraphConfig &config)
+        GraphConfig &config)
     {
         config.n_layers = ctx.blockCount();
+        config.total_n_layers = ctx.totalBlockCount();
         config.d_model = ctx.embeddingLength();
         config.n_heads = ctx.headCount();
         config.n_kv_heads = ctx.headCountKV();
@@ -379,9 +381,9 @@ namespace llaminar2
     // Weight Building (Polymorphic API)
     // =========================================================================
 
-    Qwen2ModelWeights Qwen2GraphConfigBuilder::buildWeights(WeightAccessor get_weight)
+    ModelWeights Qwen2GraphConfigBuilder::buildWeights(WeightAccessor get_weight)
     {
-        Qwen2ModelWeights weights;
+        ModelWeights weights;
 
         auto embedding = get_weight("token_embd.weight");
         auto final_norm = get_weight("output_norm.weight");
@@ -399,9 +401,9 @@ namespace llaminar2
         weights.lm_head = lm_head.get();
 
         // Layer weight accessor — captures get_weight for deferred per-layer resolution
-        weights.get_layer_weights = [get_weight](int layer_idx) -> Qwen2LayerWeights
+        weights.get_layer_weights = [get_weight](int layer_idx) -> LayerWeights
         {
-            Qwen2LayerWeights layer;
+            LayerWeights layer;
             std::string prefix = "blk." + std::to_string(layer_idx) + ".";
 
             // Attention weights

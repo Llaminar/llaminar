@@ -45,7 +45,7 @@ namespace llaminar2
 
     Qwen2Graph::Qwen2Graph(std::shared_ptr<ModelContext> model_ctx,
                            std::shared_ptr<MPIContext> mpi_ctx,
-                           const Qwen2GraphConfig &config)
+                           const GraphConfig &config)
         : config_(config),
           model_ctx_(std::move(model_ctx)),
           mpi_ctx_(std::move(mpi_ctx))
@@ -76,7 +76,7 @@ namespace llaminar2
                                                           << activationPrecisionToString(config_.activation_precision));
     }
 
-    Qwen2Graph::Qwen2Graph(const Qwen2GraphConfig &config,
+    Qwen2Graph::Qwen2Graph(const GraphConfig &config,
                            std::shared_ptr<MPIContext> mpi_ctx)
         : config_(config),
           model_ctx_(nullptr),
@@ -106,15 +106,15 @@ namespace llaminar2
     }
 
     // =============================================================================
-    // Qwen2GraphConfig Helper Methods
+    // GraphConfig Helper Methods
     // =============================================================================
 
-    bool Qwen2GraphConfig::hasUnifiedPP() const
+    bool GraphConfig::hasUnifiedPP() const
     {
         return pipeline_config != nullptr && pipeline_config->hasPP();
     }
 
-    DeviceId Qwen2GraphConfig::getDeviceForLayer(int layer_idx) const
+    DeviceId GraphConfig::getDeviceForLayer(int layer_idx) const
     {
         if (pipeline_config)
         {
@@ -158,8 +158,9 @@ namespace llaminar2
 
     ComputeGraph Qwen2Graph::buildLayerGraph(const LayerContext &ctx)
     {
-        // Validate layer index
-        if (ctx.layer_idx < 0 || ctx.layer_idx >= config_.n_layers)
+        // Validate layer index against total model layers (supports absolute PP indices)
+        int max_layers = config_.total_n_layers > 0 ? config_.total_n_layers : config_.n_layers;
+        if (ctx.layer_idx < 0 || ctx.layer_idx >= max_layers)
         {
             LOG_ERROR("[Qwen2Graph::buildLayerGraph] Invalid layer index: " << ctx.layer_idx);
             return ComputeGraph{};
@@ -172,7 +173,7 @@ namespace llaminar2
             return ComputeGraph{};
         }
 
-        Qwen2LayerWeights layer_weights = weights_.get_layer_weights(ctx.layer_idx);
+        LayerWeights layer_weights = weights_.get_layer_weights(ctx.layer_idx);
 
         // Build attention graph
         ComputeGraph attn_graph = buildAttentionGraph(
@@ -272,7 +273,7 @@ namespace llaminar2
         for (int layer = 0; layer < config_.n_layers; ++layer)
         {
             // Get layer weights
-            Qwen2LayerWeights layer_weights = weights_.get_layer_weights(layer);
+            LayerWeights layer_weights = weights_.get_layer_weights(layer);
 
             // Build attention graph for this layer
             // Pass sequence_lengths for proper batch-aware attention masking
@@ -434,11 +435,12 @@ namespace llaminar2
                   << ", has_embedding=" << has_embedding
                   << ", has_lm_head=" << has_lm_head);
 
-        // Validate layer range
-        if (first_layer < 0 || last_layer > config_.n_layers || first_layer >= last_layer)
+        // Validate layer range against total model layers (not local PP stage count)
+        int max_layers = config_.total_n_layers > 0 ? config_.total_n_layers : config_.n_layers;
+        if (first_layer < 0 || last_layer > max_layers || first_layer >= last_layer)
         {
             LOG_ERROR("[Qwen2Graph] Invalid layer range: [" << first_layer << ", " << last_layer
-                                                            << ") for model with " << config_.n_layers << " layers");
+                                                            << ") for model with " << max_layers << " total layers");
             throw std::invalid_argument("Invalid layer range for partial forward graph");
         }
 
@@ -678,7 +680,7 @@ namespace llaminar2
         for (int layer = first_layer; layer < last_layer; ++layer)
         {
             // Get layer weights
-            Qwen2LayerWeights layer_weights = weights_.get_layer_weights(layer);
+            LayerWeights layer_weights = weights_.get_layer_weights(layer);
 
             // Build attention graph for this layer
             ComputeGraph attn_graph = buildAttentionGraph(
@@ -973,7 +975,7 @@ namespace llaminar2
             for (int layer = pp_stage.first_layer; layer < pp_stage.last_layer; ++layer)
             {
                 // Get layer weights
-                Qwen2LayerWeights layer_weights = weights_.get_layer_weights(layer);
+                LayerWeights layer_weights = weights_.get_layer_weights(layer);
 
                 // Get KV cache for this stage's device (PP-aware)
                 IKVCache *layer_kv_cache = input.getKVCacheForDevice(stage_device);
@@ -1266,7 +1268,7 @@ namespace llaminar2
             if (!weights_.get_layer_weights)
                 return nullptr;
 
-            Qwen2LayerWeights layer = weights_.get_layer_weights(layer_idx);
+            LayerWeights layer = weights_.get_layer_weights(layer_idx);
 
             if (name == "wq")
                 return layer.wq;
@@ -1485,8 +1487,8 @@ namespace llaminar2
     // =============================================================================
 
     ComputeGraph Qwen2Graph::buildAttentionGraph(
-        const Qwen2LayerWeights &layer,
-        Qwen2ActivationBuffers &buffers,
+        const LayerWeights &layer,
+        ActivationBuffers &buffers,
         int layer_idx,
         int seq_len,
         int batch_size,
@@ -2175,8 +2177,8 @@ namespace llaminar2
     }
 
     ComputeGraph Qwen2Graph::buildFFNGraph(
-        const Qwen2LayerWeights &layer,
-        Qwen2ActivationBuffers &buffers,
+        const LayerWeights &layer,
+        ActivationBuffers &buffers,
         int layer_idx,
         int seq_len,
         int batch_size,

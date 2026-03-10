@@ -25,8 +25,8 @@ namespace llaminar2
     // Forward declarations
     class TensorBase;
     class ICPUKVCache;
-    struct Qwen2LayerWeights;
-    struct Qwen2ActivationBuffers;
+    struct LayerWeights;
+    struct ActivationBuffers;
 
     // =========================================================================
     // Generic Input/Output Structures

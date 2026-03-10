@@ -828,6 +828,11 @@ namespace llaminar2
         /// Flag indicating if stats need re-aggregation
         mutable bool stats_dirty_ = true;
 
+        /// Stage type → sharding mode map from the model's schema factory.
+        /// Initialized at construction from SchemaFactoryRegistry::getStageShardingConfig().
+        /// Replaces hardcoded getStageShardingMode() lookups for snapshot reassembly.
+        StageShardingConfig stage_sharding_map_;
+
         /// Hidden state input for PP nesting (when this orchestrator is a PP stage)
         /// Set via setHiddenState(), cleared after forward or via clearHiddenStateInput()
         TensorBase *hidden_state_input_ = nullptr;

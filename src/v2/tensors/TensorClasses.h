@@ -851,7 +851,7 @@ namespace llaminar2
          *   tensor->mark_device_dirty();  // GPU computed new values
          *   tensor->transferTo(rocm0);    // Direct transfer, no host staging
          */
-        bool transferTo(DeviceId dst_device);
+        bool transferTo(DeviceId dst_device, size_t bytes_override = 0);
 
         /**
          * @brief Copy tensor data to another GPU, keeping both devices valid
@@ -1727,9 +1727,9 @@ namespace llaminar2
         //
         // See docs/v2/TENSOR_MEMORY_COHERENCE_DESIGN.md for full design.
 
-        void *gpu_data_ptr_ = nullptr;            // GPU buffer pointer (nullptr = not on GPU)
-        bool host_valid_ = true;                  // Host data is current (starts true - data created on host)
-        bool device_valid_ = false;               // Device data is current (starts false - no GPU alloc)
+        void *gpu_data_ptr_ = nullptr; // GPU buffer pointer (nullptr = not on GPU)
+        bool host_valid_ = true;       // Host data is current (starts true - data created on host)
+        bool device_valid_ = false;    // Device data is current (starts false - no GPU alloc)
 
         // Injected backend for testing (non-owning). When non-null, resolveBackend()
         // returns this instead of looking up the global CUDA/ROCm backend.

@@ -24,6 +24,7 @@
 #pragma once
 
 #include "../../../backends/DeviceId.h"
+#include "../../StageShardingMode.h"
 #include <string>
 #include <vector>
 #include <unordered_map>
@@ -625,6 +626,20 @@ namespace llaminar2
         virtual WeightShardingConfig getWeightShardingConfig() const = 0;
 
         /**
+         * @brief Get stage output sharding configuration for tensor parallelism
+         *
+         * Returns a map from stage type strings (e.g., "Q_PROJECTION", "FFN_DOWN",
+         * "LM_HEAD") to their SnapshotShardingMode. This drives snapshot reassembly
+         * in MultiDeviceOrchestrator and parity testing.
+         *
+         * Each model architecture declares how its stage outputs are distributed
+         * across TP devices, replacing the hardcoded if-chain in getStageShardingMode().
+         *
+         * @return StageShardingConfig mapping stage type → SnapshotShardingMode
+         */
+        virtual StageShardingConfig getStageShardingConfig() const = 0;
+
+        /**
          * @brief Check if a weight tensor is optional in this architecture
          *
          * This allows callers to distinguish between:
@@ -635,6 +650,18 @@ namespace llaminar2
          * @return true if the weight is optional, false if it's required
          */
         virtual bool isWeightOptional(const std::string &gguf_weight_name) const = 0;
+
+        /**
+         * @brief Get per-layer weight suffixes for this architecture
+         *
+         * Returns the list of weight name suffixes (without the "blk.N." prefix)
+         * that should be checked for each transformer layer. The validator
+         * constructs full names as "blk.<layer_idx>.<suffix>" and uses
+         * isWeightOptional() to classify each as required or optional.
+         *
+         * @return Vector of weight suffixes (e.g., "attn_q.weight", "attn_q.bias")
+         */
+        virtual std::vector<std::string> layerWeightSuffixes() const = 0;
     };
 
 } // namespace llaminar2

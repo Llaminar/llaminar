@@ -69,7 +69,7 @@ namespace llaminar2
             mock_streamer_ = std::make_shared<MockWeightStreamer>();
 
             // Create minimal graph config for orchestrator
-            Qwen2GraphConfig config;
+            GraphConfig config;
             config.vocab_size = 1000;
             config.d_model = 64;
             config.n_layers = 4;

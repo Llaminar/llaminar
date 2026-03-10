@@ -85,6 +85,7 @@ namespace llaminar2
         {
         public:
             MockBackend() = default;
+            explicit MockBackend(DeviceType device_type) : mock_device_type_(device_type) {}
             ~MockBackend() override
             {
                 // Free all allocations
@@ -409,6 +410,11 @@ namespace llaminar2
                 return true;
             }
 
+            DeviceType backendDeviceType() const override { return mock_device_type_; }
+
+            /// Set the device type reported by backendDeviceType() (default: CPU)
+            void setMockDeviceType(DeviceType type) { mock_device_type_ = type; }
+
             // =================================================================
             // IBackend Async Operations (trivial mock implementations)
             // =================================================================
@@ -678,6 +684,7 @@ namespace llaminar2
             int num_devices_ = 1;
             int current_device_ = 0;
             uintptr_t next_event_id_ = 0x1000;
+            DeviceType mock_device_type_ = DeviceType::CPU;
         };
 
     } // namespace test

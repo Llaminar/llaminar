@@ -2106,6 +2106,20 @@ namespace llaminar2
             IBackend *backend = resolveBackend(*gpu_device_);
             if (backend)
             {
+                // Defensive check: verify the resolved backend type matches the tensor's
+                // gpu_device_ type. In Pipeline Parallel mode, a tensor may be migrated
+                // to a different device type (e.g., CUDA→ROCm) by a downstream stage.
+                // If the caller's stream is from a different backend, recording the event
+                // would pass a CUDA stream to hipEventRecord (or vice versa), causing a
+                // segfault. Skip event recording and log an error instead of crashing.
+                if (stream && backend->backendDeviceType() != gpu_device_->type)
+                {
+                    LOG_ERROR("[TensorBase::mark_device_dirty_with_event] CROSS-BACKEND MISMATCH: "
+                              << "tensor gpu_device_=" << gpu_device_->toString()
+                              << " but resolved backend type=" << static_cast<int>(backend->backendDeviceType())
+                              << " — skipping event recording to avoid crash");
+                    return;
+                }
                 int backend_device_id = gpu_device_->gpu_ordinal();
                 LOG_DEBUG("[TensorBase::mark_device_dirty_with_event] Got backend, device_id=" << backend_device_id);
 
@@ -2601,7 +2615,7 @@ namespace llaminar2
     // Direct GPU-to-GPU Transfer (Phase 2 GPU-Native Coherence)
     // =========================================================================
 
-    bool TensorBase::transferTo(DeviceId dst_device)
+    bool TensorBase::transferTo(DeviceId dst_device, size_t bytes_override)
     {
         // 1. Validate preconditions
         if (!authoritative_device_.has_value())
@@ -2676,8 +2690,8 @@ namespace llaminar2
         int dst_key = packDeviceId(dst_device);
         bool dst_is_bar_backed = (secondary_bar_allocated_keys_.count(dst_key) > 0);
 
-        // 5. Get transfer size
-        size_t bytes = byte_size();
+        // 5. Get transfer size (use override if provided, otherwise full buffer)
+        size_t bytes = (bytes_override > 0 && bytes_override <= byte_size()) ? bytes_override : byte_size();
         if (bytes == 0)
         {
             LOG_WARN("[TensorBase::transferTo] Zero-byte tensor, nothing to transfer");

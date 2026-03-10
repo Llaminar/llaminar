@@ -4,7 +4,7 @@
  *
  * These tests lock in the VNNI-safe quantization contract:
  * 1. GraphSchema.kv_cache_scale defines the fixed Q16 scale (default 8.0)
- * 2. Qwen2GraphConfig.kv_cache_scale copies this value for graph building
+ * 2. GraphConfig.kv_cache_scale copies this value for graph building
  * 3. KVCacheAppendStage::Params.kv_cache_scale receives the value
  * 4. Fixed-scale quantization uses scale = kv_cache_scale / 32767.0f
  *
@@ -193,21 +193,21 @@ namespace llaminar2::test
     }
 
     // =========================================================================
-    // Qwen2GraphConfig Propagation Tests
+    // GraphConfig Propagation Tests
     // =========================================================================
 
-    TEST_F(KVCacheScalePropagationTest, Qwen2GraphConfig_DefaultScale_MatchesGraphSchema)
+    TEST_F(KVCacheScalePropagationTest, GraphConfig_DefaultScale_MatchesGraphSchema)
     {
-        Qwen2GraphConfig config;
+        GraphConfig config;
 
         // Config default should match GraphSchema default
         EXPECT_FLOAT_EQ(config.kv_cache_scale, DEFAULT_KV_CACHE_SCALE)
-            << "Qwen2GraphConfig.kv_cache_scale default should match GraphSchema default";
+            << "GraphConfig.kv_cache_scale default should match GraphSchema default";
     }
 
-    TEST_F(KVCacheScalePropagationTest, Qwen2GraphConfig_HeadDim_PropagatedCorrectly)
+    TEST_F(KVCacheScalePropagationTest, GraphConfig_HeadDim_PropagatedCorrectly)
     {
-        Qwen2GraphConfig config;
+        GraphConfig config;
         config.head_dim = HEAD_DIM;
         config.kv_cache_scale = CUSTOM_KV_CACHE_SCALE;
 
@@ -264,7 +264,7 @@ namespace llaminar2::test
         // Verify all components use the same default value
         GraphSchema schema;
         KVCacheAppendStage::Params stage_params;
-        Qwen2GraphConfig config;
+        GraphConfig config;
         RuntimeConfig runtime_config;
         InferenceRunnerConfig runner_config;
 
@@ -272,16 +272,16 @@ namespace llaminar2::test
             << "GraphSchema and KVCacheAppendStage::Params must have same default";
 
         EXPECT_FLOAT_EQ(schema.kv_cache_scale, config.kv_cache_scale)
-            << "GraphSchema and Qwen2GraphConfig must have same default";
+            << "GraphSchema and GraphConfig must have same default";
 
         EXPECT_FLOAT_EQ(stage_params.kv_cache_scale, config.kv_cache_scale)
-            << "KVCacheAppendStage::Params and Qwen2GraphConfig must have same default";
+            << "KVCacheAppendStage::Params and GraphConfig must have same default";
 
         EXPECT_FLOAT_EQ(runtime_config.kv_cache_scale, config.kv_cache_scale)
-            << "RuntimeConfig and Qwen2GraphConfig must have same default";
+            << "RuntimeConfig and GraphConfig must have same default";
 
         EXPECT_FLOAT_EQ(runner_config.kv_cache_scale, config.kv_cache_scale)
-            << "InferenceRunnerConfig and Qwen2GraphConfig must have same default";
+            << "InferenceRunnerConfig and GraphConfig must have same default";
 
         EXPECT_FLOAT_EQ(runtime_config.kv_cache_scale, DEFAULT_KV_CACHE_SCALE)
             << "RuntimeConfig default kv_cache_scale must be 8.0f";

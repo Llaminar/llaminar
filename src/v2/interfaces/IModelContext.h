@@ -103,8 +103,22 @@ namespace llaminar2
 
         /**
          * @brief Get number of transformer layers
+         *
+         * For PP stages, this returns the LOCAL stage layer count (e.g., 12 for a stage
+         * with layers [12, 24)). Use totalBlockCount() for the full model layer count.
          */
         virtual int blockCount() const = 0;
+
+        /**
+         * @brief Get TOTAL number of transformer layers in the full model
+         *
+         * Unlike blockCount(), this always returns the full model layer count,
+         * even for PP stages where blockCount() returns only the local stage layer count.
+         * Used for validation when absolute layer indices are involved.
+         *
+         * Default: returns blockCount() (correct for non-PP contexts).
+         */
+        virtual int totalBlockCount() const { return blockCount(); }
 
         /**
          * @brief Get hidden dimension (d_model)

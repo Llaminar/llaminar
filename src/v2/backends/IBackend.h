@@ -18,6 +18,7 @@
 
 #pragma once
 
+#include "DeviceType.h"
 #include <cstddef>
 #include <future>
 #include <string>
@@ -604,6 +605,18 @@ namespace llaminar2
             int n,
             int k,
             int device_id) = 0;
+
+        // ====================================================================
+        // Backend Identity
+        // ====================================================================
+
+        /**
+         * @brief Return the DeviceType this backend handles
+         *
+         * Used for defensive validation in cross-device scenarios (e.g., verifying
+         * that a GPU stream matches the backend before calling recordEvent).
+         */
+        virtual DeviceType backendDeviceType() const = 0;
     };
 
 } // namespace llaminar2

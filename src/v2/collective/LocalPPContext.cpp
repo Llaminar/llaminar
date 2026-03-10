@@ -186,7 +186,8 @@ namespace llaminar2
         // Activation Transfer Operations
         // =====================================================================
 
-        bool transfer(TensorBase *activations, int stage_from, int stage_to) override;
+        bool transfer(TensorBase *activations, int stage_from, int stage_to,
+                      size_t active_bytes = 0) override;
         bool transferAsync(TensorBase *activations, int stage_from, int stage_to, void *stream) override;
 
         // =====================================================================
@@ -261,7 +262,8 @@ namespace llaminar2
     // Transfer Operations
     // =========================================================================
 
-    bool LocalPPContext::transfer(TensorBase *activations, int stage_from, int stage_to)
+    bool LocalPPContext::transfer(TensorBase *activations, int stage_from, int stage_to,
+                                  size_t active_bytes)
     {
         if (!activations)
         {
@@ -375,7 +377,7 @@ namespace llaminar2
         }
 
         // Same-vendor GPU-to-GPU or BAR-backed cross-vendor: direct transfer
-        if (!activations->transferTo(dst_device))
+        if (!activations->transferTo(dst_device, active_bytes))
         {
             LOG_ERROR("LocalPPContext::transfer: transferTo() failed "
                       << src_device.toString() << " → " << dst_device.toString());
@@ -554,7 +556,8 @@ namespace llaminar2
         // Activation Transfer Operations
         // =====================================================================
 
-        bool transfer(TensorBase *activations, int stage_from, int stage_to) override;
+        bool transfer(TensorBase *activations, int stage_from, int stage_to,
+                      size_t active_bytes = 0) override;
         bool transferAsync(TensorBase *activations, int stage_from, int stage_to, void *stream) override;
 
         // =====================================================================
@@ -615,7 +618,8 @@ namespace llaminar2
          */
         bool transferFromTPDomain(TensorBase *activations,
                                   const PPStage &src_stage,
-                                  const PPStage &dst_stage);
+                                  const PPStage &dst_stage,
+                                  size_t active_bytes = 0);
 
         /**
          * @brief Transfer to TP domain from another stage
@@ -627,7 +631,8 @@ namespace llaminar2
          */
         bool transferToTPDomain(TensorBase *activations,
                                 const PPStage &src_stage,
-                                const PPStage &dst_stage);
+                                const PPStage &dst_stage,
+                                size_t active_bytes = 0);
 
         /**
          * @brief Transfer from a global TP domain to another stage
@@ -640,7 +645,8 @@ namespace llaminar2
          */
         bool transferFromGlobalTPDomain(TensorBase *activations,
                                         const PPStage &src_stage,
-                                        const PPStage &dst_stage);
+                                        const PPStage &dst_stage,
+                                        size_t active_bytes = 0);
 
         /**
          * @brief Transfer to a global TP domain from another stage
@@ -652,14 +658,16 @@ namespace llaminar2
          */
         bool transferToGlobalTPDomain(TensorBase *activations,
                                       const PPStage &src_stage,
-                                      const PPStage &dst_stage);
+                                      const PPStage &dst_stage,
+                                      size_t active_bytes = 0);
 
         /**
          * @brief Standard transfer between single devices
          */
         bool transferSingleToSingle(TensorBase *activations,
                                     const DeviceId &src_device,
-                                    const DeviceId &dst_device);
+                                    const DeviceId &dst_device,
+                                    size_t active_bytes = 0);
 
         // =====================================================================
         // Member Variables
@@ -712,7 +720,8 @@ namespace llaminar2
         LOG_DEBUG("HierarchicalPPContext destroyed");
     }
 
-    bool HierarchicalPPContext::transfer(TensorBase *activations, int stage_from, int stage_to)
+    bool HierarchicalPPContext::transfer(TensorBase *activations, int stage_from, int stage_to,
+                                         size_t active_bytes)
     {
         if (!activations)
         {
@@ -748,20 +757,20 @@ namespace llaminar2
         // Handle Global TP domains first (CPU-only, cross-MPI-rank)
         if (src_stage.isGlobalTPDomain())
         {
-            return transferFromGlobalTPDomain(activations, src_stage, dst_stage);
+            return transferFromGlobalTPDomain(activations, src_stage, dst_stage, active_bytes);
         }
         else if (dst_stage.isGlobalTPDomain())
         {
-            return transferToGlobalTPDomain(activations, src_stage, dst_stage);
+            return transferToGlobalTPDomain(activations, src_stage, dst_stage, active_bytes);
         }
         // Handle Local TP domains
         else if (src_stage.isTPDomain())
         {
-            return transferFromTPDomain(activations, src_stage, dst_stage);
+            return transferFromTPDomain(activations, src_stage, dst_stage, active_bytes);
         }
         else if (dst_stage.isTPDomain())
         {
-            return transferToTPDomain(activations, src_stage, dst_stage);
+            return transferToTPDomain(activations, src_stage, dst_stage, active_bytes);
         }
         else
         {
@@ -769,7 +778,8 @@ namespace llaminar2
             return transferSingleToSingle(
                 activations,
                 src_stage.device().toLocalDeviceId(),
-                dst_stage.device().toLocalDeviceId());
+                dst_stage.device().toLocalDeviceId(),
+                active_bytes);
         }
     }
 
@@ -826,7 +836,8 @@ namespace llaminar2
 
     bool HierarchicalPPContext::transferFromTPDomain(TensorBase *activations,
                                                      const PPStage &src_stage,
-                                                     const PPStage &dst_stage)
+                                                     const PPStage &dst_stage,
+                                                     size_t active_bytes)
     {
         ILocalTPContext *tp_ctx = src_stage.asTPContext();
         if (!tp_ctx)
@@ -855,7 +866,7 @@ namespace llaminar2
         if (!is_cross_vendor)
         {
             // Same-vendor transfer: use standard path
-            return transferSingleToSingle(activations, src_device, dst_device);
+            return transferSingleToSingle(activations, src_device, dst_device, active_bytes);
         }
 
         // Cross-vendor transfer: check for BAR-backed fast path
@@ -895,7 +906,9 @@ namespace llaminar2
         LOG_DEBUG("HierarchicalPPContext::transferFromTPDomain: PCIe BAR staging "
                   << src_device.toString() << " → BAR → " << dst_device.toString());
 
-        const size_t bytes = activations->size_bytes();
+        const size_t bytes = (active_bytes > 0 && active_bytes <= activations->size_bytes())
+                                 ? active_bytes
+                                 : activations->size_bytes();
 
         // Ensure tensor has data on the source device
         if (!activations->ensureOnDevice(src_device))
@@ -1085,7 +1098,8 @@ namespace llaminar2
 
     bool HierarchicalPPContext::transferFromGlobalTPDomain(TensorBase *activations,
                                                            const PPStage &src_stage,
-                                                           const PPStage &dst_stage)
+                                                           const PPStage &dst_stage,
+                                                           size_t active_bytes)
     {
         IGlobalTPContext *global_tp_ctx = src_stage.asGlobalTPContext();
         if (!global_tp_ctx)
@@ -1119,7 +1133,7 @@ namespace llaminar2
             // Transfer to TP domain's first device (or best match)
             DeviceId dst_device = tp_ctx->deviceAt(0).toLocalDeviceId();
 
-            if (!transferSingleToSingle(activations, src_device, dst_device))
+            if (!transferSingleToSingle(activations, src_device, dst_device, active_bytes))
             {
                 LOG_ERROR("HierarchicalPPContext::transferFromGlobalTPDomain: "
                           "Failed to transfer to TP domain representative");
@@ -1150,19 +1164,20 @@ namespace llaminar2
             LOG_WARN("HierarchicalPPContext::transferFromGlobalTPDomain: "
                      "Transferring between two global TP domains - this is unusual");
             DeviceId dst_device = dst_stage.asGlobalTPContext()->localDevice().toLocalDeviceId();
-            return transferSingleToSingle(activations, src_device, dst_device);
+            return transferSingleToSingle(activations, src_device, dst_device, active_bytes);
         }
         else
         {
             // Global TP → Single device
             DeviceId dst_device = dst_stage.device().toLocalDeviceId();
-            return transferSingleToSingle(activations, src_device, dst_device);
+            return transferSingleToSingle(activations, src_device, dst_device, active_bytes);
         }
     }
 
     bool HierarchicalPPContext::transferToGlobalTPDomain(TensorBase *activations,
                                                          const PPStage &src_stage,
-                                                         const PPStage &dst_stage)
+                                                         const PPStage &dst_stage,
+                                                         size_t active_bytes)
     {
         IGlobalTPContext *global_tp_ctx = dst_stage.asGlobalTPContext();
         if (!global_tp_ctx)
@@ -1200,7 +1215,7 @@ namespace llaminar2
                       << "Local TP (" << tp_ctx->degree() << " devices) → Global TP CPU "
                       << "using TP device 0: " << src_device.toString());
 
-            return transferSingleToSingle(activations, src_device, dst_device);
+            return transferSingleToSingle(activations, src_device, dst_device, active_bytes);
         }
         else if (src_stage.isGlobalTPDomain())
         {
@@ -1208,19 +1223,20 @@ namespace llaminar2
             LOG_WARN("HierarchicalPPContext::transferToGlobalTPDomain: "
                      "Transferring between two global TP domains - this is unusual");
             DeviceId src_device = src_stage.asGlobalTPContext()->localDevice().toLocalDeviceId();
-            return transferSingleToSingle(activations, src_device, dst_device);
+            return transferSingleToSingle(activations, src_device, dst_device, active_bytes);
         }
         else
         {
             // Single device → Global TP
             DeviceId src_device = src_stage.device().toLocalDeviceId();
-            return transferSingleToSingle(activations, src_device, dst_device);
+            return transferSingleToSingle(activations, src_device, dst_device, active_bytes);
         }
     }
 
     bool HierarchicalPPContext::transferToTPDomain(TensorBase *activations,
                                                    const PPStage &src_stage,
-                                                   const PPStage &dst_stage)
+                                                   const PPStage &dst_stage,
+                                                   size_t active_bytes)
     {
         ILocalTPContext *tp_ctx = dst_stage.asTPContext();
         if (!tp_ctx)
@@ -1239,7 +1255,7 @@ namespace llaminar2
             LOG_DEBUG("HierarchicalPPContext::transferToTPDomain: "
                       << src_device.toString() << " → single-device TP domain ("
                       << dst_device.toString() << ")");
-            return transferSingleToSingle(activations, src_device, dst_device);
+            return transferSingleToSingle(activations, src_device, dst_device, active_bytes);
         }
 
         // Multi-device TP domain: find best initial destination (same vendor as source)
@@ -1278,7 +1294,7 @@ namespace llaminar2
                   << " (index " << initial_dst_index << ")");
 
         // Step 1: Transfer to initial destination device
-        if (!transferSingleToSingle(activations, src_device, initial_dst_device))
+        if (!transferSingleToSingle(activations, src_device, initial_dst_device, active_bytes))
         {
             LOG_ERROR("HierarchicalPPContext::transferToTPDomain: "
                       "Failed to transfer to initial destination "
@@ -1305,7 +1321,8 @@ namespace llaminar2
 
     bool HierarchicalPPContext::transferSingleToSingle(TensorBase *activations,
                                                        const DeviceId &src_device,
-                                                       const DeviceId &dst_device)
+                                                       const DeviceId &dst_device,
+                                                       size_t active_bytes)
     {
         // Same device - no-op
         if (src_device == dst_device)
@@ -1413,7 +1430,7 @@ namespace llaminar2
         }
 
         // Same-vendor GPU-to-GPU or BAR-backed cross-vendor: use direct transfer
-        if (!activations->transferTo(dst_device))
+        if (!activations->transferTo(dst_device, active_bytes))
         {
             LOG_ERROR("HierarchicalPPContext::transferSingleToSingle: transferTo() failed "
                       << src_device.toString() << " → " << dst_device.toString());
@@ -1430,7 +1447,7 @@ namespace llaminar2
     {
         // For now, delegate to synchronous transfer
         (void)stream;
-        return transfer(activations, stage_from, stage_to);
+        return transfer(activations, stage_from, stage_to, 0);
     }
 
     void HierarchicalPPContext::synchronize()

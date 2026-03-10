@@ -35,14 +35,14 @@ protected:
     }
 
     /**
-     * @brief Create Qwen2GraphConfig with given TP settings
+     * @brief Create GraphConfig with given TP settings
      */
-    Qwen2GraphConfig createConfig(
+    GraphConfig createConfig(
         int local_n_heads = -1,
         int local_n_kv_heads = -1,
         int head_start = 0)
     {
-        Qwen2GraphConfig config;
+        GraphConfig config;
         config.n_layers = n_layers_;
         config.d_model = d_model_;
         config.n_heads = n_heads_;
@@ -76,7 +76,7 @@ protected:
 // =============================================================================
 
 /**
- * @brief Test that TensorParallelConfig can be added to Qwen2GraphConfig
+ * @brief Test that TensorParallelConfig can be added to GraphConfig
  */
 TEST_F(Test__Qwen2GraphProportionalTP, ConfigAcceptsTensorParallelConfig)
 {
@@ -92,8 +92,8 @@ TEST_F(Test__Qwen2GraphProportionalTP, ConfigAcceptsTensorParallelConfig)
     EXPECT_EQ(tp_config->worldSize(), 2);
     EXPECT_TRUE(tp_config->isProportional());
 
-    // Add to Qwen2GraphConfig
-    Qwen2GraphConfig config = createConfig();
+    // Add to GraphConfig
+    GraphConfig config = createConfig();
     config.tp_config = tp_config;
     config.local_rank = 0;
 
@@ -179,7 +179,7 @@ TEST_F(Test__Qwen2GraphProportionalTP, ProportionalTP_BufferSizes)
             n_heads_, n_kv_heads_, d_ff_, vocab_size_));
 
     // Rank 0 config
-    Qwen2GraphConfig config = createConfig();
+    GraphConfig config = createConfig();
     config.tp_config = tp_config;
     config.local_rank = 0;
 
@@ -235,7 +235,7 @@ TEST_F(Test__Qwen2GraphProportionalTP, ProportionalTP_FFNDimension)
  */
 TEST_F(Test__Qwen2GraphProportionalTP, BackwardCompatible_NoConfig)
 {
-    Qwen2GraphConfig config = createConfig();
+    GraphConfig config = createConfig();
 
     // Verify tp_config defaults to nullptr
     EXPECT_EQ(config.tp_config, nullptr);
@@ -284,7 +284,7 @@ TEST_F(Test__Qwen2GraphProportionalTP, OrchestratorAcceptsTPConfig)
             {0.73f, 0.27f},
             n_heads_, n_kv_heads_, d_ff_, vocab_size_));
 
-    Qwen2GraphConfig config = createConfig();
+    GraphConfig config = createConfig();
     config.tp_config = tp_config;
     config.local_rank = 0;
 
@@ -340,7 +340,7 @@ TEST_F(Test__Qwen2GraphProportionalTP, WorkFractionSumsToOne)
 }
 
 /**
- * @brief Test config propagation from Qwen2GraphConfig to assignment
+ * @brief Test config propagation from GraphConfig to assignment
  */
 TEST_F(Test__Qwen2GraphProportionalTP, ConfigPropagation_AssignmentValues)
 {
@@ -351,7 +351,7 @@ TEST_F(Test__Qwen2GraphProportionalTP, ConfigPropagation_AssignmentValues)
             n_heads_, n_kv_heads_, d_ff_, vocab_size_));
 
     // Create config for rank 0
-    Qwen2GraphConfig config = createConfig();
+    GraphConfig config = createConfig();
     config.tp_config = tp_config;
     config.local_rank = 0;
 

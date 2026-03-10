@@ -278,14 +278,14 @@ namespace
             weights_.embedding_table = embedding_table_.get();
             weights_.final_norm = final_norm_.get();
             weights_.lm_head = lm_head_.get();
-            weights_.get_layer_weights = [this](int layer_idx) -> Qwen2LayerWeights
+            weights_.get_layer_weights = [this](int layer_idx) -> LayerWeights
             {
                 if (layer_idx < 0 || layer_idx >= static_cast<int>(layer_weights_.size()))
                 {
-                    return Qwen2LayerWeights{};
+                    return LayerWeights{};
                 }
                 const auto &lw = layer_weights_[layer_idx];
-                Qwen2LayerWeights result;
+                LayerWeights result;
                 result.wq = lw.wq.get();
                 result.wk = lw.wk.get();
                 result.wv = lw.wv.get();
@@ -412,7 +412,7 @@ namespace
         // =========================================================================
         // Member Variables
         // =========================================================================
-        Qwen2GraphConfig config_;
+        GraphConfig config_;
         std::shared_ptr<MPIContext> mpi_ctx_;
         std::unique_ptr<TensorFactory> tensor_factory_;
 
@@ -427,7 +427,7 @@ namespace
         std::shared_ptr<TensorBase> embedding_table_;
         std::shared_ptr<TensorBase> final_norm_;
         std::shared_ptr<TensorBase> lm_head_;
-        Qwen2ModelWeights weights_;
+        ModelWeights weights_;
 
         // Mock buffers storage
         std::shared_ptr<TensorBase> current_hidden_;
@@ -438,7 +438,7 @@ namespace
         std::shared_ptr<TensorBase> attn_output_, attn_proj_;
         std::shared_ptr<TensorBase> gate_, up_;
         std::shared_ptr<TensorBase> ffn_output_;
-        Qwen2ModelBuffers buffers_;
+        ModelBuffers buffers_;
 
         // Mock PP contexts
         std::vector<std::unique_ptr<MockLocalPPContext>> mock_pp_contexts_;
@@ -507,7 +507,7 @@ namespace
         Qwen2Graph graph(config_, mpi_ctx_);
 
         // Set weights without get_layer_weights accessor
-        Qwen2ModelWeights incomplete_weights;
+        ModelWeights incomplete_weights;
         incomplete_weights.embedding_table = embedding_table_.get();
         incomplete_weights.final_norm = final_norm_.get();
         incomplete_weights.lm_head = lm_head_.get();

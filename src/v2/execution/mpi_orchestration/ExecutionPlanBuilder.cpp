@@ -318,8 +318,9 @@ namespace llaminar2
                     if (gpu.type == device.device_type &&
                         gpu.local_device_id == device.device_ordinal)
                     {
-                        // Check NUMA if specified
-                        if (gpu.numa_node < 0 || gpu.numa_node == device.numa_node)
+                        // Check NUMA if both sides specify it
+                        if (gpu.numa_node < 0 || device.numa_node < 0 ||
+                            gpu.numa_node == device.numa_node)
                         {
                             return rank_inv.rank;
                         }
@@ -522,36 +523,40 @@ namespace llaminar2
             plan.numa_node = rank_inv.local_rank; // Approximate
         }
 
-        // Find which PP stage this rank belongs to
-        const ResolvedPPStage *my_stage = nullptr;
+        // Collect ALL PP stages this rank participates in (sorted by stage_id)
+        std::vector<const ResolvedPPStage *> my_stages;
         for (const auto &stage : pp_stages)
         {
             for (int r : stage.ranks)
             {
                 if (r == rank)
                 {
-                    my_stage = &stage;
+                    my_stages.push_back(&stage);
                     break;
                 }
             }
-            if (my_stage)
-                break;
         }
+        std::sort(my_stages.begin(), my_stages.end(),
+                  [](const auto *a, const auto *b)
+                  { return a->stage_id < b->stage_id; });
 
-        if (my_stage)
+        if (!my_stages.empty())
         {
-            plan.pp_stage_id = my_stage->stage_id;
-            plan.first_layer = my_stage->first_layer;
-            plan.last_layer = my_stage->last_layer;
+            const auto *first_stage = my_stages.front();
+            const auto *last_stage = my_stages.back();
+
+            plan.pp_stage_id = first_stage->stage_id;
+            plan.first_layer = first_stage->first_layer;
+            plan.last_layer = last_stage->last_layer;
 
             // First stage has embedding
-            plan.has_embedding = (my_stage->stage_id == 0);
+            plan.has_embedding = (first_stage->stage_id == 0);
 
             // Last stage has LM head
             bool is_last = true;
             for (const auto &stage : pp_stages)
             {
-                if (stage.stage_id > my_stage->stage_id)
+                if (stage.stage_id > last_stage->stage_id)
                 {
                     is_last = false;
                     break;
@@ -559,17 +564,39 @@ namespace llaminar2
             }
             plan.has_lm_head = is_last;
 
-            // PP neighbors
+            // PP neighbors (relative to outermost stages of this rank)
             for (const auto &stage : pp_stages)
             {
-                if (stage.stage_id == my_stage->stage_id - 1 && !stage.ranks.empty())
+                if (stage.stage_id == first_stage->stage_id - 1 && !stage.ranks.empty())
                 {
-                    plan.prev_rank = stage.ranks[0]; // First rank of previous stage
+                    plan.prev_rank = stage.ranks[0];
                 }
-                if (stage.stage_id == my_stage->stage_id + 1 && !stage.ranks.empty())
+                if (stage.stage_id == last_stage->stage_id + 1 && !stage.ranks.empty())
                 {
-                    plan.next_rank = stage.ranks[0]; // First rank of next stage
+                    plan.next_rank = stage.ranks[0];
                 }
+            }
+
+            // LOCAL PP: multiple PP stages on the same rank → populate local_pp_devices
+            if (my_stages.size() > 1)
+            {
+                for (const auto *stage : my_stages)
+                {
+                    // Find the domain for this stage and pick its device
+                    for (const auto &domain : domains)
+                    {
+                        if (domain.name == stage->domain_name && !domain.devices.empty())
+                        {
+                            plan.local_pp_devices.push_back(domain.devices[0]);
+                            break;
+                        }
+                    }
+                    plan.local_pp_layer_boundaries.push_back(stage->first_layer);
+                }
+                // Final sentinel: total layers
+                plan.local_pp_layer_boundaries.push_back(model_config.n_layers);
+
+                plan.local_pp_backend = selectBackend(plan.local_pp_devices);
             }
         }
         else
@@ -1004,7 +1031,8 @@ namespace llaminar2
             const auto &dm = DeviceManager::instance();
             for (const auto &dev : devices)
             {
-                if (!dev.isGPU()) continue;
+                if (!dev.isGPU())
+                    continue;
                 int dev_numa = -1;
                 for (const auto &cd : dm.devices())
                 {
@@ -1017,7 +1045,8 @@ namespace llaminar2
                         break;
                     }
                 }
-                if (dev_numa < 0) continue;  // Unknown NUMA — don't block
+                if (dev_numa < 0)
+                    continue; // Unknown NUMA — don't block
                 if (real_first_numa < 0)
                     real_first_numa = dev_numa;
                 else if (dev_numa != real_first_numa)

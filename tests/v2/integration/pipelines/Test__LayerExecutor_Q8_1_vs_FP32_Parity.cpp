@@ -203,7 +203,7 @@ protected:
      */
     std::unique_ptr<DeviceGraphOrchestrator> createExecutor(ActivationPrecision precision)
     {
-        Qwen2GraphConfig config;
+        GraphConfig config;
         config.d_model = d_model_;
         config.n_heads = n_heads_;
         config.n_kv_heads = n_kv_heads_;
@@ -222,9 +222,9 @@ protected:
     /**
      * @brief Load weights for specified layer from the model
      */
-    Qwen2LayerWeights loadLayerWeights(int layer_idx)
+    LayerWeights loadLayerWeights(int layer_idx)
     {
-        Qwen2LayerWeights weights;
+        LayerWeights weights;
         std::string prefix = "blk." + std::to_string(layer_idx) + ".";
 
         // Load attention weights
@@ -317,9 +317,9 @@ protected:
     /**
      * @brief Create activation buffers for specified precision
      */
-    Qwen2ActivationBuffers createBuffers(int seq_len, ActivationPrecision precision)
+    ActivationBuffers createBuffers(int seq_len, ActivationPrecision precision)
     {
-        Qwen2ActivationBuffers buffers;
+        ActivationBuffers buffers;
 
         OwnedActivationBuffers &owned = (precision == ActivationPrecision::Q8_1)
                                             ? q8_1_owned_buffers_

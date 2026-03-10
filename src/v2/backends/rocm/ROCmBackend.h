@@ -90,6 +90,9 @@ namespace llaminar2
         bool supportsFP16(int device_id) const override;
         bool supportsINT8(int device_id) const override;
 
+        // Backend identity
+        DeviceType backendDeviceType() const override { return DeviceType::ROCm; }
+
         // Compute operations
         bool gemmIQ4NL(
             const void *A_device,

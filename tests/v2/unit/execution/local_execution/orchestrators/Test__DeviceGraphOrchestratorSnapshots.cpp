@@ -106,7 +106,7 @@ TEST(Test__DeviceGraphOrchestratorSnapshots, StageNameConversion_UnknownStage)
 TEST(Test__DeviceGraphOrchestratorSnapshots, SnapshotState_InitiallyDisabled)
 {
     // Create minimal config for orchestrator
-    Qwen2GraphConfig config;
+    GraphConfig config;
     config.d_model = 896;
     config.n_layers = 24;
     config.n_heads = 14;
@@ -124,7 +124,7 @@ TEST(Test__DeviceGraphOrchestratorSnapshots, SnapshotState_InitiallyDisabled)
 
 TEST(Test__DeviceGraphOrchestratorSnapshots, SnapshotState_EnableDisable)
 {
-    Qwen2GraphConfig config;
+    GraphConfig config;
     config.d_model = 896;
     config.n_layers = 24;
     config.n_heads = 14;
@@ -146,7 +146,7 @@ TEST(Test__DeviceGraphOrchestratorSnapshots, SnapshotState_EnableDisable)
 
 TEST(Test__DeviceGraphOrchestratorSnapshots, GetSnapshot_ReturnsNullForMissingKey)
 {
-    Qwen2GraphConfig config;
+    GraphConfig config;
     config.d_model = 896;
     config.n_layers = 24;
     config.n_heads = 14;

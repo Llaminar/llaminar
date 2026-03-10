@@ -71,6 +71,18 @@ namespace llaminar2
         static WeightShardingConfig getWeightShardingConfig(const std::string &architecture);
 
         /**
+         * @brief Get stage output sharding config for a given architecture
+         *
+         * Convenience method that creates a temporary factory and extracts
+         * the stage sharding configuration used for TP snapshot reassembly.
+         *
+         * @param architecture Model architecture string (e.g., "qwen2")
+         * @return StageShardingConfig mapping stage type → SnapshotShardingMode
+         * @throws std::runtime_error if architecture is not supported
+         */
+        static StageShardingConfig getStageShardingConfig(const std::string &architecture);
+
+        /**
          * @brief Check if an architecture is supported
          *
          * @param architecture Model architecture string

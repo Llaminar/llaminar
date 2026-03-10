@@ -213,8 +213,10 @@ namespace llaminar2::test
         // ILocalPPContext Implementation - Transfer Operations
         // =====================================================================
 
-        bool transfer(TensorBase *activations, int stage_from, int stage_to) override
+        bool transfer(TensorBase *activations, int stage_from, int stage_to,
+                      size_t active_bytes = 0) override
         {
+            (void)active_bytes;
             // Track the call
             {
                 std::lock_guard<std::mutex> lock(calls_mutex_);

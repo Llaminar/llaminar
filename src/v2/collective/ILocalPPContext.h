@@ -425,12 +425,17 @@ namespace llaminar2
          * @param activations Tensor to transfer (must be on stage_from's device)
          * @param stage_from Source stage index
          * @param stage_to Destination stage index
+         * @param active_bytes If non-zero, transfer only this many bytes instead of
+         *        the full tensor buffer. Used during decode to avoid transferring
+         *        the entire pre-allocated buffer when only a small active region
+         *        (e.g., 1 × d_model × sizeof(float)) is needed.
          * @return true on success, false on error
          *
          * @note For same-device stages (stage_from device == stage_to device),
          *       this is a no-op and returns true immediately.
          */
-        virtual bool transfer(TensorBase *activations, int stage_from, int stage_to) = 0;
+        virtual bool transfer(TensorBase *activations, int stage_from, int stage_to,
+                              size_t active_bytes = 0) = 0;
 
         /**
          * @brief Transfer activations between PP stages (asynchronous)

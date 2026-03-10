@@ -101,12 +101,12 @@ namespace llaminar2
             }
 
             LOG_ERROR("[GPU_PTR_VIOLATION] Stage='" << stage_name
-                                                     << "' tensor=" << (tensor_name ? tensor_name : "(unnamed)")
-                                                     << " (" << label << ")"
-                                                     << " gpu_ptr=" << gpu_ptr
-                                                     << " actual=" << validation.actual_device
-                                                     << " expected=" << expected_ordinal
-                                                     << " " << validation.details);
+                                                    << "' tensor=" << (tensor_name ? tensor_name : "(unnamed)")
+                                                    << " (" << label << ")"
+                                                    << " gpu_ptr=" << gpu_ptr
+                                                    << " actual=" << validation.actual_device
+                                                    << " expected=" << expected_ordinal
+                                                    << " " << validation.details);
 
             if (dump_pointer_events)
             {
@@ -1827,24 +1827,32 @@ namespace llaminar2
                 }
             }
 
-            // For GPU targets, outputs also need GPU buffers allocated before kernel runs
-            // OPTIMIZATION: Skip if outputs were already allocated on device
-            // (GPU output buffers persist across iterations, never need re-allocation)
-            if ((policy == CoherencePolicy::OUTPUT || policy == CoherencePolicy::FULL) && !node.outputs_allocated)
+            // For GPU targets, outputs also need GPU buffers allocated before kernel runs.
+            // IMPORTANT: We must ALWAYS call cohereOutputs (not just on first iteration)
+            // because in Pipeline Parallel mode, a downstream stage on a different GPU
+            // may have migrated the output tensor to another device via cohereInputs.
+            // The outputs_allocated flag only gates buffer extraction, not coherence.
+            if (policy == CoherencePolicy::OUTPUT || policy == CoherencePolicy::FULL)
             {
-                // Use cached dump_info (no separate getDumpInfo call needed)
-
-                if (profiling)
-                    phase_start = std::chrono::high_resolution_clock::now();
-                auto outputs = extractOutputBuffers(cached_dump_info);
-                if (profiling)
+                if (!node.outputs_allocated)
                 {
-                    phase_end = std::chrono::high_resolution_clock::now();
-                    extract_buffers_ms += std::chrono::duration<double, std::milli>(phase_end - phase_start).count();
-                    phase_start = phase_end;
+                    // First iteration: extract and cache output buffers
+                    if (profiling)
+                        phase_start = std::chrono::high_resolution_clock::now();
+                    node.cached_output_buffers = extractOutputBuffers(cached_dump_info);
+                    if (profiling)
+                    {
+                        phase_end = std::chrono::high_resolution_clock::now();
+                        extract_buffers_ms += std::chrono::duration<double, std::milli>(phase_end - phase_start).count();
+                        phase_start = phase_end;
+                    }
+                }
+                else if (profiling)
+                {
+                    phase_start = std::chrono::high_resolution_clock::now();
                 }
 
-                if (!cohereOutputs(outputs, target_device))
+                if (!cohereOutputs(node.cached_output_buffers, target_device))
                 {
                     LOG_ERROR("[DeviceGraphExecutor] Failed to allocate output buffers for stage '" << node.name << "'");
                     return false;
@@ -1855,8 +1863,6 @@ namespace llaminar2
                     output_alloc_ms = std::chrono::duration<double, std::milli>(phase_end - phase_start).count();
                 }
 
-                // Cache output buffers for mark_dirty (avoid re-extracting every iteration)
-                node.cached_output_buffers = std::move(outputs);
                 node.outputs_allocated = true;
             }
         }

@@ -64,8 +64,8 @@ protected:
         tensor_storage_.push_back(std::move(down_proj));
         tensor_storage_.push_back(std::move(ffn_norm));
 
-        // Populate Qwen2LayerWeights
-        Qwen2LayerWeights layer_weights;
+        // Populate LayerWeights
+        LayerWeights layer_weights;
         layer_weights.wq = tensor_storage_[0].get();
         layer_weights.wk = tensor_storage_[1].get();
         layer_weights.wv = tensor_storage_[2].get();
@@ -154,14 +154,14 @@ protected:
     }
 
     std::shared_ptr<MPIContext> mpi_ctx_;
-    Qwen2GraphConfig config_;
-    Qwen2ModelWeights weights_;
-    Qwen2ModelBuffers buffers_;
+    GraphConfig config_;
+    ModelWeights weights_;
+    ModelBuffers buffers_;
     std::unique_ptr<Qwen2Graph> graph_builder_;
 
     // Storage to keep tensors alive
     std::vector<std::unique_ptr<TensorBase>> tensor_storage_;
-    std::vector<Qwen2LayerWeights> layer_weights_storage_;
+    std::vector<LayerWeights> layer_weights_storage_;
 };
 
 TEST_F(Test__Qwen2Graph_FusedAttention, FusedAttentionEnabled)

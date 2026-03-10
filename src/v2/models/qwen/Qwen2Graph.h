@@ -23,6 +23,7 @@
 
 #pragma once
 
+#include "../GraphTypes.h"
 #include "../../execution/local_execution/graph/DeviceGraphExecutor.h"
 #include "../../execution/local_execution/graph/DeviceGraphBufferManager.h"
 #include "../../execution/compute_stages/ComputeStages.h"
@@ -50,389 +51,11 @@ namespace llaminar2
 {
 
     // Forward declarations
-    class ILocalTPContext;
-    class ILocalPPContext;
-    struct PipelineConfig;
-
-    // Forward declarations
     class Qwen2Pipeline;
 
-    // =========================================================================
-    // Configuration
-    // =========================================================================
-
-    /**
-     * @brief Configuration for Qwen2Graph
-     *
-     * Combines architecture parameters with execution settings.
-     */
-    struct Qwen2GraphConfig
-    {
-        // Model architecture
-        int n_layers = 0;   ///< Number of transformer layers (full model count for validation)
-        int d_model = 0;    ///< Model hidden dimension
-        int n_heads = 0;    ///< Number of attention heads
-        int n_kv_heads = 0; ///< Number of KV heads (GQA)
-        int head_dim = 0;   ///< Dimension per head
-        int d_ff = 0;       ///< FFN intermediate dimension
-        int vocab_size = 0; ///< Vocabulary size
-
-        /// Pipeline Parallelism layer offset for KV cache indexing.
-        /// When building graphs for PP stage [first_layer, last_layer), this offset
-        /// is subtracted from the global layer index to get the local KV cache index.
-        /// E.g., for PP stage 1 with layers [12, 24), pp_layer_offset=12, so layer 12
-        /// maps to KV cache layer 0.
-        int pp_layer_offset = 0;
-
-        // FFN sharding (for tensor parallelism)
-        int d_ff_local = 0; ///< Local FFN dim per rank
-        bool ffn_column_parallel = false;
-
-        // =================================================================
-        // LM Head TP Parameters (Phase 5: Column-Parallel LM Head)
-        // =================================================================
-        /// Local vocab size per rank (vocab_size / world_size)
-        int vocab_local = 0;
-
-        /// Enable column-parallel LM head projection (weights sharded by vocab)
-        bool lm_head_column_parallel = false;
-
-        // =================================================================
-        // Attention TP Parameters (Phase 3: Column-Parallel QKV)
-        // =================================================================
-        /// First query head for this rank (0-indexed, default 0 = no sharding)
-        int head_start = 0;
-
-        /// Number of query heads for this rank (default -1 = use full n_heads)
-        int local_n_heads = -1;
-
-        /// Number of KV heads for this rank (default -1 = use full n_kv_heads)
-        /// For GQA: may equal local_n_heads / gqa_ratio
-        int local_n_kv_heads = -1;
-
-        /// Enable column-parallel QKV projection (weights sharded by head)
-        bool qkv_column_parallel = false;
-
-        // Precision and execution
-        float rms_norm_eps = 1e-6f;
-        float rope_theta = 10000.0f;
-        ActivationPrecision activation_precision = ActivationPrecision::FP32;
-
-        // =================================================================
-        // Q16 KV Cache VNNI Safety (Phase 5.4)
-        // =================================================================
-        /// Fixed scale for Q16 KV cache quantization (FP32 range: ±kv_cache_scale).
-        /// All K/V values are quantized with this scale, producing INT16 values in
-        /// range [-32767 * kv_cache_scale, +32767 * kv_cache_scale]. The value must
-        /// match the expected activation range to avoid clipping. Default 8.0f works
-        /// for typical Qwen2 models. See VNNISafetyConstants.h for VNNI overflow limits.
-        float kv_cache_scale = 256.0f; ///< Fixed Q16 scale. Must cover Q projection max (~130)
-
-        /// Explicit KV cache precision mode (AUTO preserves legacy behavior).
-        KVCachePrecision kv_cache_precision = KVCachePrecision::AUTO;
-
-        // Execution settings
-        DeviceId default_device = DeviceId::cpu(); ///< Default device for execution
-        bool enable_profiling = false;
-        bool enable_validation = false;
-
-        // NOTE: Decomposed attention (Phase 9: KVCacheAppendStage + AttentionComputeStage)
-        // is now the ONLY supported path. The legacy AttentionWithKVCacheStage path has been
-        // removed as part of Phase 7 cleanup. See DISTRIBUTED_ARCHITECTURE_PROPOSAL.md.
-
-        /// Use graph-managed buffer allocation with aliasing optimization.
-        /// When true, Qwen2Graph will use DeviceGraphBufferManager to allocate activation
-        /// buffers with automatic aliasing of non-overlapping SCRATCH buffers.
-        /// NOTE: As of December 2025, this defaults to true (Graph is primary path).
-        bool use_graph_buffer_management = true;
-
-        /// Maximum sequence length for buffer allocation (when use_graph_buffer_management=true)
-        int max_seq_len = 2048;
-
-        /// Execution policy controlling which operations run
-        ExecutionPolicy execution_policy = ExecutionPolicy::allEnabled();
-
-        /// Base DeviceGraphExecutor configuration
-        GraphExecutorConfig executor_config = GraphExecutorConfig{};
-
-        /// Fused attention backend selection
-        /// - JIT: AVX-512 VNNI optimized (default)
-        /// - REFERENCE: Pure C++ implementation for testing
-        /// - TILED: Cache-blocked implementation
-        /// - Q16_INTEGER: Pure Q16 integer-domain kernel (experimental, requires HybridQ16)
-        FusedAttentionBackend fused_attention_backend = FusedAttentionBackend::JIT;
-
-        // =================================================================
-        // Heterogeneous Tensor Parallelism (Phase 1c: Proportional TP)
-        // =================================================================
-        /// Optional TensorParallelConfig for proportional head/FFN/vocab assignment.
-        /// When set, overrides equal-split head/KV/FFN computation.
-        /// Use for heterogeneous GPU setups (e.g., NVIDIA 73% + AMD 27%).
-        std::shared_ptr<TensorParallelConfig> tp_config = nullptr;
-
-        /// Local rank index (used with tp_config to look up assignment)
-        int local_rank = 0;
-
-        // =================================================================
-        // Multi-Domain Tensor Parallelism (Phase 4.3: Heterogeneous TP)
-        // =================================================================
-        /// Optional MultiDomainTPConfig for domain-based collective routing.
-        /// When set, collective operations (AllreduceStage, AllGatherStage) will
-        /// use the domain communicator instead of the global MPI communicator.
-        /// This enables heterogeneous TP with separate GPU and CPU domains.
-        MultiDomainTPConfig *multi_domain_tp_config = nullptr;
-
-        // =================================================================
-        // LOCAL Tensor Parallelism (Intra-Rank Multi-Device)
-        // =================================================================
-        /// Optional ILocalTPContext for LOCAL tensor parallelism.
-        /// When set, collective operations use TPAllreduceStage with the local
-        /// TP context. LOCAL TP runs on a single MPI rank with multiple devices,
-        /// using high-bandwidth backends like NCCL, RCCL, or PCIeBAR for collectives.
-        ///
-        /// Distinction from GLOBAL TP:
-        /// - GLOBAL TP: Multiple MPI ranks (world_size > 1), MPI collectives
-        /// - LOCAL TP: Single MPI rank (world_size = 1), ILocalTPContext collectives
-        ///
-        /// Note: Either mpi_ctx (for GLOBAL TP) OR local_tp_ctx (for LOCAL TP) should
-        /// be active, not both. If both are set, LOCAL TP takes precedence for collectives.
-        ILocalTPContext *local_tp_ctx = nullptr;
-
-        /// Device index within the LOCAL TP context (0 to degree-1).
-        /// Each device runs a separate graph instance with sharded weights.
-        int local_tp_device_idx = 0;
-
-        // =================================================================
-        // Unified Pipeline Parallel Configuration (Phase 2)
-        // =================================================================
-        /// Pipeline configuration for PP + TP composition.
-        /// When set, graph building uses multi-stage PP-aware logic.
-        /// See docs/v2/UNIFIED_PP_GRAPH_ARCHITECTURE_PLAN.md
-        std::shared_ptr<PipelineConfig> pipeline_config = nullptr;
-
-        /// PP contexts for inter-stage activation transfers.
-        /// Key: {from_stage_id, to_stage_id}
-        /// Created by the orchestrator and passed to Qwen2Graph.
-        std::map<std::pair<int, int>, ILocalPPContext *> pp_contexts;
-
-        /// TP contexts for each domain (one per domain name).
-        /// Each domain may have internal tensor parallelism.
-        /// Created by the orchestrator and passed to Qwen2Graph.
-        std::map<std::string, ILocalTPContext *> domain_tp_contexts;
-
-        /// Helper: Check if unified PP mode is enabled
-        /// Implementation in Qwen2Graph.cpp (requires full PipelineConfig definition)
-        bool hasUnifiedPP() const;
-
-        /// Helper: Get the device for a specific layer in unified PP mode
-        /// Implementation in Qwen2Graph.cpp (requires full PipelineConfig definition)
-        DeviceId getDeviceForLayer(int layer_idx) const;
-
-        /**
-         * @brief Helper to get DeviceShardingAssignment for current rank
-         * @return Pointer to assignment, or nullptr if tp_config is not set
-         */
-        const DeviceShardingAssignment *getAssignment() const
-        {
-            if (!tp_config)
-                return nullptr;
-            return &tp_config->forRank(local_rank);
-        }
-
-        // =================================================================
-        // Per-Layer TP Allreduce Precision
-        // =================================================================
-
-        /// Per-layer allreduce precision map: layer_idx → precision string.
-        /// Populated from the GraphSchema precision policy (first N layers FP32,
-        /// rest use schema default). Layers not in the map fall back to the
-        /// global DebugEnv::allreduce_precision ("fp32" by default).
-        std::unordered_map<int, std::string> tp_allreduce_precision;
-
-        /**
-         * @brief Get allreduce precision for a specific layer
-         *
-         * Resolution order:
-         * 1. Per-layer override from tp_allreduce_precision map
-         * 2. Global fallback from debugEnv().allreduce_precision
-         *
-         * @param layer_idx Transformer layer index (0-based)
-         * @return Precision string ("fp32", "fp16", "bf16")
-         */
-        std::string getAllreducePrecisionForLayer(int layer_idx) const
-        {
-            auto it = tp_allreduce_precision.find(layer_idx);
-            if (it != tp_allreduce_precision.end())
-                return it->second;
-            return ""; // Empty = defer to global DebugEnv default
-        }
-
-        /**
-         * @brief Populate the precision map from a GraphSchema precision policy
-         *
-         * Applies the schema's fp32_layer_count + default_precision to build
-         * the per-layer map for this model's n_layers.
-         *
-         * @param schema_default Default precision for layers beyond fp32 count
-         * @param fp32_count Number of initial layers forced to FP32
-         */
-        void populateAllreducePrecision(const std::string &schema_default, int fp32_count)
-        {
-            tp_allreduce_precision.clear();
-            for (int i = 0; i < n_layers; ++i)
-            {
-                tp_allreduce_precision[i] = (i < fp32_count) ? "fp32" : schema_default;
-            }
-        }
-    };
-
-    // =========================================================================
-    // Weight Structures
-    // =========================================================================
-
-    /**
-     * @brief Layer weights for attention and FFN blocks
-     *
-     * Raw pointers since Qwen2Graph does NOT own these weights.
-     */
-    struct Qwen2LayerWeights
-    {
-        // Attention weights
-        TensorBase *wq = nullptr;        ///< Query projection
-        TensorBase *wk = nullptr;        ///< Key projection
-        TensorBase *wv = nullptr;        ///< Value projection
-        TensorBase *wo = nullptr;        ///< Output projection
-        TensorBase *attn_norm = nullptr; ///< Pre-attention norm gamma
-
-        // Attention biases (Qwen2 uses Q/K/V biases)
-        TensorBase *q_bias = nullptr; ///< Query bias [d_model]
-        TensorBase *k_bias = nullptr; ///< Key bias [n_kv_heads * head_dim]
-        TensorBase *v_bias = nullptr; ///< Value bias [n_kv_heads * head_dim]
-
-        // QK norm weights (Qwen3: per-head RMSNorm before RoPE)
-        TensorBase *q_norm = nullptr; ///< Q norm gamma [head_dim]
-        TensorBase *k_norm = nullptr; ///< K norm gamma [head_dim]
-
-        // FFN weights
-        TensorBase *gate_proj = nullptr; ///< FFN gate projection
-        TensorBase *up_proj = nullptr;   ///< FFN up projection
-        TensorBase *down_proj = nullptr; ///< FFN down projection
-        TensorBase *ffn_norm = nullptr;  ///< Pre-FFN norm gamma
-    };
-
-    /**
-     * @brief Model-level weights
-     *
-     * Provides access to global weights and per-layer accessor.
-     */
-    struct Qwen2ModelWeights
-    {
-        TensorBase *embedding_table = nullptr; ///< [vocab_size, d_model]
-        TensorBase *final_norm = nullptr;      ///< [d_model]
-        TensorBase *lm_head = nullptr;         ///< [vocab_size, d_model]
-
-        /// Accessor for per-layer weights
-        std::function<Qwen2LayerWeights(int layer_idx)> get_layer_weights;
-    };
-
-    // =========================================================================
-    // Activation Buffers
-    // =========================================================================
-
-    /**
-     * @brief Activation buffers for layer execution
-     *
-     * ## Buffer Lifecycle Semantics
-     *
-     * **INOUT (Input modified in-place)**:
-     *   - `residual`: Accumulates attention/FFN outputs via +=
-     *   - `normalized`: Receives norm output, may be reused
-     *
-     * **SCRATCH (Temporary workspace)**:
-     *   - `Q`, `K`, `V`: Projection outputs, consumed by attention
-     *   - `attn_output`: Pre-Wo output, consumed by projection
-     *   - `gate`, `up`: FFN projections, consumed by SwiGLU
-     *   - `ffn_output`: SwiGLU output, consumed by down projection
-     *   - `workspace_scores`, `workspace_context`, `workspace_mask`: Attention scratch
-     *
-     * **OUTPUT (Write-only)**:
-     *   - `current_hidden`: Final hidden state output
-     *   - `attn_proj`: After Wo projection, before residual add
-     */
-    struct Qwen2ActivationBuffers
-    {
-        // === INOUT Buffers ===
-        TensorBase *residual = nullptr;
-        TensorBase *normalized = nullptr;
-
-        // === SCRATCH Buffers ===
-        TensorBase *Q = nullptr;
-        TensorBase *K = nullptr;
-        TensorBase *V = nullptr;
-        TensorBase *attn_output = nullptr;
-        TensorBase *gate = nullptr;
-        TensorBase *up = nullptr;
-        TensorBase *ffn_output = nullptr;
-        TensorBase *workspace_scores = nullptr;
-        TensorBase *workspace_context = nullptr;
-        TensorBase *workspace_mask = nullptr;
-
-        // === Hybrid Mode Buffers ===
-        /// FP32 Q after RoPE (Hybrid mode only - avoids requantization)
-        /// When set, RoPE outputs to this buffer instead of modifying Q in-place
-        TensorBase *Q_rope = nullptr;
-        /// FP32 K after RoPE (Hybrid mode only - avoids requantization)
-        /// When set, RoPE outputs to this buffer instead of modifying K in-place
-        TensorBase *K_rope = nullptr;
-        /// FP32 V dequantized (Hybrid mode only - for KV cache when V is Q8_1)
-        /// V doesn't go through RoPE but needs to match KV cache precision
-        TensorBase *V_dequant = nullptr;
-
-        // === Batched Decode Buffers (for gather from multiple cache slots) ===
-        TensorBase *gathered_K = nullptr; ///< [batch_size * max_kv_len, kv_dim]
-        TensorBase *gathered_V = nullptr; ///< [batch_size * max_kv_len, kv_dim]
-
-        // === HybridQ16 K Precision Fix: Per-head K scales ===
-        /// Per-head dynamic scales from RoPE Q16→Q16 path
-        /// Shape: [seq_len * n_kv_heads] for prefill, stored in KV cache for decode
-        /// Only used when GEMM outputs K as Q16_1 (K precision fix mode)
-        float *K_head_scales = nullptr;
-        /// Capacity of K_head_scales buffer (in floats)
-        size_t K_head_scales_capacity = 0;
-
-        // === OUTPUT Buffers ===
-        TensorBase *attn_proj = nullptr;
-        TensorBase *current_hidden = nullptr;
-
-        // === SNAPSHOT Buffers (for debugging, enabled with ENABLE_PIPELINE_SNAPSHOTS) ===
-        /// Optional buffer to capture attention context before Wo projection
-        /// Shape: [batch_size * seq_len, n_heads * head_dim]
-        TensorBase *context_snapshot = nullptr;
-
-        /// Optional buffer to capture attention output (Wo projection result, before residual add)
-        /// Shape: [batch_size * seq_len, d_model] - corresponds to ATTENTION_OUTPUT
-        TensorBase *attention_output_snapshot = nullptr;
-
-        /// Optional buffer to capture attention residual (after residual add)
-        /// Shape: [batch_size * seq_len, d_model] - corresponds to ATTENTION_RESIDUAL
-        TensorBase *attention_residual_snapshot = nullptr;
-    };
-
-    /**
-     * @brief Model-level buffers for full forward pass
-     */
-    struct Qwen2ModelBuffers
-    {
-        TensorBase *current_hidden = nullptr; ///< [batch_size * seq_len, d_model]
-        TensorBase *logits = nullptr;         ///< [batch_size * seq_len, vocab_size]
-
-        /// Local logits for column-parallel LM head [batch_size * seq_len, vocab_local]
-        /// Only used when lm_head_column_parallel is enabled
-        TensorBase *logits_local = nullptr;
-
-        /// Per-layer activation buffers
-        Qwen2ActivationBuffers layer_buffers;
-    };
+    // Type definitions (GraphConfig, LayerWeights, ModelWeights, ActivationBuffers,
+    // ModelBuffers) and backward-compatible aliases (GraphConfig, LayerWeights,
+    // etc.) are provided by models/GraphTypes.h, included above.
 
     // =========================================================================
     // Forward Input/Output
@@ -529,7 +152,7 @@ namespace llaminar2
          */
         Qwen2Graph(std::shared_ptr<ModelContext> model_ctx,
                    std::shared_ptr<MPIContext> mpi_ctx,
-                   const Qwen2GraphConfig &config);
+                   const GraphConfig &config);
 
         /**
          * @brief Construct Qwen2Graph for layer-level operations only
@@ -541,7 +164,7 @@ namespace llaminar2
          * @param config Qwen2-specific configuration
          * @param mpi_ctx MPI context (nullptr for single-rank)
          */
-        Qwen2Graph(const Qwen2GraphConfig &config,
+        Qwen2Graph(const GraphConfig &config,
                    std::shared_ptr<MPIContext> mpi_ctx = nullptr);
 
         ~Qwen2Graph() = default;
@@ -554,7 +177,7 @@ namespace llaminar2
         // Configuration
         // =====================================================================
 
-        const Qwen2GraphConfig &config() const { return config_; }
+        const GraphConfig &config() const { return config_; }
 
         // =====================================================================
         // Unified PP Configuration Mutators (Phase 6)
@@ -602,7 +225,7 @@ namespace llaminar2
         /**
          * @brief Set weight accessors (called by pipeline)
          */
-        void setWeights(const Qwen2ModelWeights &weights) { weights_ = weights; }
+        void setWeights(const ModelWeights &weights) { weights_ = weights; }
 
         /**
          * @brief Set activation buffers (called by pipeline)
@@ -610,7 +233,10 @@ namespace llaminar2
          * Use this for manual buffer management (default behavior).
          * Alternative: Use initializeBuffers() for graph-managed allocation.
          */
-        void setBuffers(const Qwen2ModelBuffers &buffers) { buffers_ = buffers; }
+        void setBuffers(const ModelBuffers &buffers) { buffers_ = buffers; }
+
+        /// Get the current buffers (for cache-replay PP copy)
+        const ModelBuffers &buffers() const { return buffers_; }
 
         /**
          * @brief Set TensorFactory for graph-managed buffer allocation
@@ -836,8 +462,8 @@ namespace llaminar2
          * @param sequence_lengths Actual lengths per sequence (nullptr = all equal to seq_len)
          */
         ComputeGraph buildAttentionGraph(
-            const Qwen2LayerWeights &layer,
-            Qwen2ActivationBuffers &buffers,
+            const LayerWeights &layer,
+            ActivationBuffers &buffers,
             int layer_idx,
             int seq_len,
             int batch_size,
@@ -850,8 +476,8 @@ namespace llaminar2
          * @brief Build FFN block graph
          */
         ComputeGraph buildFFNGraph(
-            const Qwen2LayerWeights &layer,
-            Qwen2ActivationBuffers &buffers,
+            const LayerWeights &layer,
+            ActivationBuffers &buffers,
             int layer_idx,
             int seq_len,
             int batch_size,
@@ -861,7 +487,7 @@ namespace llaminar2
         // =====================================================================
         // Configuration
         // =====================================================================
-        Qwen2GraphConfig config_;
+        GraphConfig config_;
         std::shared_ptr<ModelContext> model_ctx_;
         std::shared_ptr<MPIContext> mpi_ctx_;
 
@@ -869,8 +495,8 @@ namespace llaminar2
         TensorFactory *tensor_factory_ = nullptr;
 
         // Weights and buffers (not owned)
-        Qwen2ModelWeights weights_;
-        Qwen2ModelBuffers buffers_;
+        ModelWeights weights_;
+        ModelBuffers buffers_;
 
         // Snapshot callback
         StageSnapshotCallback snapshot_callback_;

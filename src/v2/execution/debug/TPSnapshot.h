@@ -26,6 +26,7 @@
 
 #pragma once
 
+#include "../StageShardingMode.h"
 #include "../mpi_orchestration/DeviceInventory.h"
 #include <vector>
 #include <string>
@@ -37,48 +38,57 @@ namespace llaminar2
 {
 
     // =========================================================================
-    // Sharding Mode Enumeration
-    // =========================================================================
-
-    /**
-     * @brief How a stage's output is sharded across TP devices
-     */
-    enum class SnapshotShardingMode
-    {
-        REPLICATED,      ///< Full output on each device (norms, residuals after AllReduce)
-        COLUMN_PARALLEL, ///< Split on output dimension (Q/K/V, FFN_GATE, FFN_UP, ATTENTION_CONTEXT)
-        ROW_PARALLEL,    ///< Split on input dimension, combined after AllReduce (Wo, FFN_DOWN)
-        GATHERED,        ///< Column-parallel then AllGather (LM_HEAD)
-        UNKNOWN          ///< Sharding mode not determined
-    };
-
-    /**
-     * @brief Convert SnapshotShardingMode to string
-     */
-    inline const char *shardingModeToString(SnapshotShardingMode mode)
-    {
-        switch (mode)
-        {
-        case SnapshotShardingMode::REPLICATED:
-            return "REPLICATED";
-        case SnapshotShardingMode::COLUMN_PARALLEL:
-            return "COLUMN_PARALLEL";
-        case SnapshotShardingMode::ROW_PARALLEL:
-            return "ROW_PARALLEL";
-        case SnapshotShardingMode::GATHERED:
-            return "GATHERED";
-        case SnapshotShardingMode::UNKNOWN:
-        default:
-            return "UNKNOWN";
-        }
-    }
-
-    // =========================================================================
     // Stage Sharding Mode Registry
     // =========================================================================
 
     /**
-     * @brief Get the expected sharding mode for a stage key
+     * @brief Extract stage type suffix from a snapshot key
+     *
+     * Strips the "layerN_" prefix if present.
+     * E.g., "layer0_ATTENTION_CONTEXT" → "ATTENTION_CONTEXT", "LM_HEAD" → "LM_HEAD"
+     */
+    inline std::string extractStageType(const std::string &stage_key)
+    {
+        std::string stage_type = stage_key;
+        if (stage_key.substr(0, 5) == "layer")
+        {
+            auto underscore_pos = stage_key.find('_');
+            if (underscore_pos != std::string::npos)
+            {
+                stage_type = stage_key.substr(underscore_pos + 1);
+            }
+        }
+        return stage_type;
+    }
+
+    /**
+     * @brief Get sharding mode for a stage key using a schema-provided config map
+     *
+     * Preferred overload: uses a model-specific StageShardingConfig returned
+     * by ISchemaFactory::getStageShardingConfig(). Falls back to UNKNOWN for
+     * stage types not present in the map.
+     *
+     * @param stage_key The snapshot key (e.g., "layer0_ATTENTION_CONTEXT")
+     * @param config    Stage type → SnapshotShardingMode map from the schema factory
+     * @return The expected sharding mode for this stage
+     */
+    inline SnapshotShardingMode getStageShardingMode(
+        const std::string &stage_key,
+        const StageShardingConfig &config)
+    {
+        std::string stage_type = extractStageType(stage_key);
+        auto it = config.find(stage_type);
+        if (it != config.end())
+        {
+            return it->second;
+        }
+        return SnapshotShardingMode::UNKNOWN;
+    }
+
+    /**
+     * @brief Get the expected sharding mode for a stage key (legacy hardcoded version)
+     *
+     * @deprecated Prefer the overload taking StageShardingConfig from ISchemaFactory.
      *
      * Stage keys follow the pattern: "layerN_STAGE_TYPE" or "STAGE_TYPE"
      * This function extracts the stage type and returns its sharding mode.

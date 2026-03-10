@@ -4,7 +4,7 @@
  */
 
 #include "InferenceMode.h"
-#include "../../models/qwen/Qwen2Graph.h" // For Qwen2ActivationBuffers
+#include "../../models/GraphTypes.h" // For ActivationBuffers
 #include <sstream>
 
 namespace llaminar2
@@ -47,7 +47,7 @@ namespace llaminar2
     }
 
     InferenceMode::ValidationResult InferenceMode::validateBuffers(
-        const Qwen2ActivationBuffers &buffers) const
+        const ActivationBuffers &buffers) const
     {
         ValidationResult result;
 
@@ -107,7 +107,7 @@ namespace llaminar2
         return result;
     }
 
-    bool isHybridModeActive(const InferenceMode &mode, const Qwen2ActivationBuffers &buffers)
+    bool isHybridModeActive(const InferenceMode &mode, const ActivationBuffers &buffers)
     {
         // Hybrid mode is active when:
         // 1. Mode is any Hybrid variant (Hybrid or HybridQ16)

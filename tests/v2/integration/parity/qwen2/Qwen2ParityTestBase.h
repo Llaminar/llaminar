@@ -322,7 +322,7 @@ namespace llaminar2::test::parity::qwen2
          * @brief Factory that creates a DeviceGraphOrchestrator from a DEVICE node
          *
          * Uses the existing createInferenceRunner() factory which handles all the
-         * Qwen2GraphConfig setup, weight loading, and graph construction.
+         * GraphConfig setup, weight loading, and graph construction.
          */
         inline TreeToRunnerCompiler::DeviceRunnerFactory makeDeviceFactory(
             std::shared_ptr<MPIContext> mpi_ctx,

@@ -97,6 +97,9 @@ namespace llaminar2
             int k,
             int device_id) override;
 
+        // Backend identity
+        DeviceType backendDeviceType() const override { return DeviceType::CUDA; }
+
     private:
         int device_count_;
 

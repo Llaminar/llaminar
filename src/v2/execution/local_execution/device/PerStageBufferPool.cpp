@@ -77,7 +77,7 @@ bool PerStageBufferPool::initialize(const PipelineConfig &config, const PPStageB
     return true;
 }
 
-Qwen2ActivationBuffers &PerStageBufferPool::forStage(int stage_id)
+ActivationBuffers &PerStageBufferPool::forStage(int stage_id)
 {
     auto it = stage_buffers_.find(stage_id);
     if (it == stage_buffers_.end())
@@ -88,7 +88,7 @@ Qwen2ActivationBuffers &PerStageBufferPool::forStage(int stage_id)
     return it->second;
 }
 
-const Qwen2ActivationBuffers &PerStageBufferPool::forStage(int stage_id) const
+const ActivationBuffers &PerStageBufferPool::forStage(int stage_id) const
 {
     auto it = stage_buffers_.find(stage_id);
     if (it == stage_buffers_.end())
@@ -99,7 +99,7 @@ const Qwen2ActivationBuffers &PerStageBufferPool::forStage(int stage_id) const
     return it->second;
 }
 
-Qwen2ActivationBuffers &PerStageBufferPool::forLayer(int layer_idx)
+ActivationBuffers &PerStageBufferPool::forLayer(int layer_idx)
 {
     if (!config_)
     {
@@ -114,7 +114,7 @@ Qwen2ActivationBuffers &PerStageBufferPool::forLayer(int layer_idx)
     return forStage(stage_id);
 }
 
-const Qwen2ActivationBuffers &PerStageBufferPool::forLayer(int layer_idx) const
+const ActivationBuffers &PerStageBufferPool::forLayer(int layer_idx) const
 {
     if (!config_)
     {

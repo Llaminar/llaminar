@@ -54,7 +54,7 @@ protected:
         orchestrator_ = std::make_unique<DeviceGraphOrchestrator>(config_, nullptr);
     }
 
-    Qwen2GraphConfig config_;
+    GraphConfig config_;
     std::unique_ptr<DeviceGraphOrchestrator> orchestrator_;
 };
 
@@ -174,7 +174,7 @@ protected:
         return map;
     }
 
-    Qwen2GraphConfig config_;
+    GraphConfig config_;
     std::unique_ptr<DeviceGraphOrchestrator> orchestrator_;
 };
 
@@ -336,7 +336,7 @@ protected:
         mutableDebugEnv().execution.reload();
     }
 
-    Qwen2GraphConfig config_;
+    GraphConfig config_;
     std::unique_ptr<DeviceGraphOrchestrator> orchestrator_;
     std::string original_env_value_;
     bool original_env_was_set_ = false;

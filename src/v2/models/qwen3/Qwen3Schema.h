@@ -263,6 +263,31 @@ namespace llaminar2
             }
             return false;
         }
+
+        std::vector<std::string> layerWeightSuffixes() const override
+        {
+            return {
+                // Attention weights (required)
+                "attn_q.weight", "attn_k.weight", "attn_v.weight",
+                "attn_output.weight", "attn_norm.weight",
+                // Attention biases (optional — Qwen3 has none)
+                "attn_q.bias", "attn_k.bias", "attn_v.bias",
+                // QK norm weights (optional per isWeightOptional)
+                "attn_q_norm.weight", "attn_k_norm.weight",
+                // FFN weights (required)
+                "ffn_gate.weight", "ffn_up.weight",
+                "ffn_down.weight", "ffn_norm.weight"};
+        }
+
+        /**
+         * Identical to Qwen2 - TP annotations are the same (see header comment).
+         */
+        StageShardingConfig getStageShardingConfig() const override
+        {
+            // Reuse Qwen2's config since TP layout is identical
+            Qwen2SchemaFactory qwen2;
+            return qwen2.getStageShardingConfig();
+        }
     };
 
 } // namespace llaminar2

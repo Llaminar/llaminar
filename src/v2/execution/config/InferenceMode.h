@@ -32,7 +32,7 @@
  * 4. **Extensible**: Easy to add new modes without touching multiple files
  *
  * @see HybridPrecisionConfig for per-buffer precision configuration
- * @see Qwen2ActivationBuffers for buffer struct
+ * @see ActivationBuffers for buffer struct
  */
 
 #pragma once
@@ -45,7 +45,7 @@ namespace llaminar2
 {
 
     // Forward declarations
-    struct Qwen2ActivationBuffers;
+    struct ActivationBuffers;
 
     /**
      * @brief Centralized inference mode context
@@ -193,7 +193,7 @@ namespace llaminar2
          * @param buffers The activation buffers to validate
          * @return ValidationResult with error details if invalid
          */
-        ValidationResult validateBuffers(const Qwen2ActivationBuffers &buffers) const;
+        ValidationResult validateBuffers(const ActivationBuffers &buffers) const;
 
         // =========================================================================
         // Factory Methods
@@ -230,6 +230,6 @@ namespace llaminar2
      * @param buffers The activation buffers
      * @return true if Hybrid mode and required buffers are available
      */
-    bool isHybridModeActive(const InferenceMode &mode, const Qwen2ActivationBuffers &buffers);
+    bool isHybridModeActive(const InferenceMode &mode, const ActivationBuffers &buffers);
 
 } // namespace llaminar2

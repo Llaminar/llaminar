@@ -13,8 +13,10 @@
 #include "../factory/InferenceRunnerFactory.h"
 #include "../local_execution/orchestrators/MultiDeviceOrchestrator.h"
 #include "../parallelism_tree/ParallelismTree.h"
+#include "../parallelism_tree/TreeToRunnerCompiler.h"
 #include "../../collective/LocalTPContext.h"
 #include "../../collective/ILocalPPContext.h"
+#include "../../collective/BackendRouter.h"
 #include "../../loaders/ModelContext.h"
 #include "../../loaders/ModelContextConfig.h"
 #include "../../loaders/ModelLoader.h"
@@ -1017,6 +1019,12 @@ namespace llaminar2
             return buildMultiDeviceComputeGraph();
         }
 
+        // Check if LOCAL PP is configured (multiple PP stages within this rank)
+        if (plan_.usesLocalPP())
+        {
+            return buildLocalPPComputeGraph();
+        }
+
         // Single-device path
         return buildSingleDeviceComputeGraph();
     }
@@ -1116,6 +1124,85 @@ namespace llaminar2
         runner_ = std::move(multi_orchestrator);
 
         LOG_INFO("Multi-device compute graph built successfully");
+        return true;
+    }
+
+    bool OrchestrationRunner::buildLocalPPComputeGraph()
+    {
+        const auto &pp_devices = plan_.local_pp_devices;
+        const auto &boundaries = plan_.local_pp_layer_boundaries;
+
+        if (pp_devices.size() < 2 || boundaries.size() < pp_devices.size() + 1)
+        {
+            return setError("Invalid LOCAL PP plan: need >=2 devices and matching layer boundaries");
+        }
+
+        LOG_INFO("[OrchestrationRunner] Execution strategy: LOCAL PIPELINE PARALLEL");
+        LOG_INFO("[OrchestrationRunner]   PP stages: " << pp_devices.size());
+
+        // Validate all devices exist
+        const auto &dm = DeviceManager::instance();
+        for (size_t i = 0; i < pp_devices.size(); ++i)
+        {
+            auto local_device = pp_devices[i].toLocalDeviceId();
+            if (!dm.deviceExists(local_device))
+            {
+                return setError("PP device " + std::to_string(i) + " (" +
+                                local_device.toString() +
+                                ") is not available. Available devices: " +
+                                dm.availableDevicesString());
+            }
+        }
+
+        // Build MultiDeviceOrchestrator with PP config
+        MultiDeviceOrchestrator::Config mdo_config;
+        mdo_config.mode = MultiDeviceOrchestrator::ParallelismMode::PP;
+        mdo_config.max_seq_len = config_.max_seq_len;
+        mdo_config.batch_size = 1;
+        mdo_config.activation_precision = parseActivationPrecisionString(config_.activation_precision);
+        mdo_config.kv_cache_precision = parseKVCachePrecision(config_.kv_cache_precision);
+
+        int total_layers = model_ctx_ ? model_ctx_->blockCount() : 0;
+
+        for (size_t i = 0; i < pp_devices.size(); ++i)
+        {
+            MultiDeviceOrchestrator::PPStageConfig stage_cfg;
+            stage_cfg.first_layer = boundaries[i];
+            stage_cfg.last_layer = boundaries[i + 1]; // exclusive (next stage start or total_layers)
+            stage_cfg.has_embedding = (i == 0);
+            stage_cfg.has_lm_head = (i == pp_devices.size() - 1);
+            stage_cfg.stage_devices = {pp_devices[i]};
+
+            // Mark cross-vendor stages for BAR-backed hidden state transfer
+            if (i + 1 < pp_devices.size() &&
+                pp_devices[i].device_type != pp_devices[i + 1].device_type)
+            {
+                stage_cfg.requires_bar_backed_hidden = true;
+            }
+
+            LOG_INFO("[OrchestrationRunner]   Stage " << i << ": "
+                                                      << pp_devices[i].toString()
+                                                      << " layers [" << stage_cfg.first_layer << ", "
+                                                      << stage_cfg.last_layer << ") "
+                                                      << (stage_cfg.has_embedding ? "[+embed] " : "")
+                                                      << (stage_cfg.has_lm_head ? "[+lm_head] " : ""));
+
+            mdo_config.pp_stages.push_back(std::move(stage_cfg));
+        }
+
+        if (!mdo_config.validate())
+        {
+            return setError("Invalid LOCAL PP configuration");
+        }
+
+        // Ensure GlobalBackendRouter is initialized for inter-stage transfers.
+        // LOCAL PP uses TensorBase::transferTo() which routes through the backend router.
+        GlobalBackendRouter::initForTests();
+
+        auto orch = std::make_unique<MultiDeviceOrchestrator>(model_ctx_, mdo_config);
+        runner_ = std::move(orch);
+
+        LOG_INFO("Local PP compute graph built successfully");
         return true;
     }
 

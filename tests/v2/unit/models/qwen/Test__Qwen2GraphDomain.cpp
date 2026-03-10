@@ -74,7 +74,7 @@ protected:
         return cpu_domain;
     }
 
-    Qwen2GraphConfig config_;
+    GraphConfig config_;
 };
 
 // =============================================================================
@@ -227,7 +227,7 @@ TEST_F(Test__Qwen2GraphDomain, AllreduceWithoutDomainHasNullDomain)
  */
 TEST_F(Test__Qwen2GraphDomain, DefaultConfigHasNullDomainConfig)
 {
-    Qwen2GraphConfig default_config;
+    GraphConfig default_config;
     EXPECT_EQ(default_config.multi_domain_tp_config, nullptr);
 }
 

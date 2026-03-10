@@ -186,7 +186,7 @@ namespace llaminar2
         std::vector<int> positions;        ///< Per-sequence position offset
         std::vector<int> sequence_lengths; ///< Per-sequence length (for padding)
 
-        // === Activation Buffers (shared with Qwen2ActivationBuffers) ===
+        // === Activation Buffers (shared with ActivationBuffers) ===
         std::shared_ptr<TensorBase> normalized;
         std::shared_ptr<TensorBase> residual;
         std::shared_ptr<TensorBase> Q;
@@ -330,7 +330,7 @@ namespace llaminar2
          */
         DeviceGraphOrchestrator(
             Dependencies deps,
-            const Qwen2GraphConfig &graph_config,
+            const GraphConfig &graph_config,
             const GraphCacheConfig &cache_config = {});
 
         /**
@@ -353,7 +353,7 @@ namespace llaminar2
          * @param cache_config Graph caching configuration
          */
         DeviceGraphOrchestrator(
-            const Qwen2GraphConfig &graph_config,
+            const GraphConfig &graph_config,
             std::shared_ptr<MPIContext> mpi_ctx = nullptr,
             const GraphCacheConfig &cache_config = {});
 
@@ -409,8 +409,8 @@ namespace llaminar2
          * @return true if execution succeeded
          */
         bool executeAttention(
-            const Qwen2LayerWeights &layer,
-            Qwen2ActivationBuffers &buffers,
+            const LayerWeights &layer,
+            ActivationBuffers &buffers,
             int layer_idx,
             int seq_len,
             IKVCache *kv_cache,
@@ -437,8 +437,8 @@ namespace llaminar2
          * @return true if execution succeeded
          */
         bool executeFFN(
-            const Qwen2LayerWeights &layer,
-            Qwen2ActivationBuffers &buffers,
+            const LayerWeights &layer,
+            ActivationBuffers &buffers,
             int layer_idx,
             int seq_len,
             DeviceId device);
@@ -458,8 +458,8 @@ namespace llaminar2
          * @return true if execution succeeded
          */
         bool executeLayer(
-            const Qwen2LayerWeights &layer,
-            Qwen2ActivationBuffers &buffers,
+            const LayerWeights &layer,
+            ActivationBuffers &buffers,
             int layer_idx,
             int seq_len,
             IKVCache *kv_cache,
@@ -535,14 +535,14 @@ namespace llaminar2
          *
          * @param weights Model weights including embedding_table, final_norm, lm_head
          */
-        void setWeights(const Qwen2ModelWeights &weights);
+        void setWeights(const ModelWeights &weights);
 
         /**
          * @brief Set activation buffers for full forward pass
          *
          * @param buffers Model buffers including current_hidden, logits, layer_buffers
          */
-        void setBuffers(const Qwen2ModelBuffers &buffers);
+        void setBuffers(const ModelBuffers &buffers);
 
         /**
          * @brief Check if weights are configured for full forward
@@ -626,6 +626,20 @@ namespace llaminar2
          * @param weight_manager Shared pointer to WeightManager
          */
         void setWeightManager(std::shared_ptr<WeightManager> weight_manager);
+
+        /**
+         * @brief Retain model context to prevent dangling WeightManager references
+         *
+         * WeightManager stores an IModelLoader& reference to a ModelContext member.
+         * For PP stages, the ModelContext must outlive the orchestrator to prevent
+         * use-after-free when loading weights during inference.
+         *
+         * @param ctx Shared pointer to ModelContext (extends lifetime)
+         */
+        void retainModelContext(std::shared_ptr<IModelContext> ctx)
+        {
+            injected_model_ctx_ = std::move(ctx);
+        }
 
         /**
          * @brief Get weight manager
@@ -768,7 +782,7 @@ namespace llaminar2
         /**
          * @brief Initialize per-stage buffer pool for PP execution
          *
-         * Allocates Qwen2ActivationBuffers for each PP stage, placing buffers
+         * Allocates ActivationBuffers for each PP stage, placing buffers
          * on each stage's primary device. Must be called after setPipelineConfig()
          * and requires a valid PipelineConfig with PP stages.
          *
@@ -966,8 +980,8 @@ namespace llaminar2
          *
          * @return Reference to internal activation buffers
          */
-        Qwen2ActivationBuffers &getInternalBuffers();
-        const Qwen2ActivationBuffers &getInternalBuffers() const;
+        ActivationBuffers &getInternalBuffers();
+        const ActivationBuffers &getInternalBuffers() const;
 
         /**
          * @brief Get model-level buffers (current_hidden, logits)
@@ -976,7 +990,7 @@ namespace llaminar2
          *
          * @return Reference to model buffers
          */
-        const Qwen2ModelBuffers &getModelBuffers() const;
+        const ModelBuffers &getModelBuffers() const;
 
         /**
          * @brief Get buffer manager statistics
@@ -1107,8 +1121,8 @@ namespace llaminar2
             GraphBuildSession &withTPContext(const std::string &domain_name, ILocalTPContext *context);
 
             // Resource configuration
-            GraphBuildSession &withWeights(const Qwen2ModelWeights &weights);
-            GraphBuildSession &withBuffers(const Qwen2ModelBuffers &buffers);
+            GraphBuildSession &withWeights(const ModelWeights &weights);
+            GraphBuildSession &withBuffers(const ModelBuffers &buffers);
             GraphBuildSession &withKVCache(IKVCache *kv_cache);
             GraphBuildSession &withBufferPool(PerStageBufferPool *pool);
 
@@ -1138,8 +1152,8 @@ namespace llaminar2
             std::optional<PPStageSpec> pp_stage_;
             std::map<std::pair<int, int>, ILocalPPContext *> pp_contexts_;
             std::map<std::string, ILocalTPContext *> tp_contexts_;
-            std::optional<Qwen2ModelWeights> weights_;
-            std::optional<Qwen2ModelBuffers> buffers_;
+            std::optional<ModelWeights> weights_;
+            std::optional<ModelBuffers> buffers_;
             IKVCache *kv_cache_ = nullptr;
             PerStageBufferPool *buffer_pool_ = nullptr;
 
@@ -1198,8 +1212,8 @@ namespace llaminar2
                 : orchestrator_(orchestrator) {}
 
             // Required configuration
-            AttentionGraphSession &forLayer(const Qwen2LayerWeights &layer, int layer_idx);
-            AttentionGraphSession &withBuffers(Qwen2ActivationBuffers &buffers);
+            AttentionGraphSession &forLayer(const LayerWeights &layer, int layer_idx);
+            AttentionGraphSession &withBuffers(ActivationBuffers &buffers);
             AttentionGraphSession &withSequence(int seq_len, int batch_size = 1);
             AttentionGraphSession &onDevice(DeviceId device);
 
@@ -1219,8 +1233,8 @@ namespace llaminar2
             DeviceGraphOrchestrator &orchestrator_;
 
             // Required
-            const Qwen2LayerWeights *layer_ = nullptr;
-            Qwen2ActivationBuffers *buffers_ = nullptr;
+            const LayerWeights *layer_ = nullptr;
+            ActivationBuffers *buffers_ = nullptr;
             int layer_idx_ = -1;
             int seq_len_ = 0;
             int batch_size_ = 1;
@@ -1253,8 +1267,8 @@ namespace llaminar2
                 : orchestrator_(orchestrator) {}
 
             // Required configuration
-            FFNGraphSession &forLayer(const Qwen2LayerWeights &layer, int layer_idx);
-            FFNGraphSession &withBuffers(Qwen2ActivationBuffers &buffers);
+            FFNGraphSession &forLayer(const LayerWeights &layer, int layer_idx);
+            FFNGraphSession &withBuffers(ActivationBuffers &buffers);
             FFNGraphSession &withSequence(int seq_len, int batch_size = 1);
             FFNGraphSession &onDevice(DeviceId device);
 
@@ -1269,8 +1283,8 @@ namespace llaminar2
             DeviceGraphOrchestrator &orchestrator_;
 
             // Required
-            const Qwen2LayerWeights *layer_ = nullptr;
-            Qwen2ActivationBuffers *buffers_ = nullptr;
+            const LayerWeights *layer_ = nullptr;
+            ActivationBuffers *buffers_ = nullptr;
             int layer_idx_ = -1;
             int seq_len_ = 0;
             int batch_size_ = 1;
@@ -2080,6 +2094,17 @@ namespace llaminar2
             std::vector<int> token_ids;    ///< Persistent decode token storage
             std::vector<int> position_ids; ///< Persistent decode position IDs
 
+            // PP hidden state copy — for non-embedding PP stages, the external
+            // hidden state must be copied to the working buffer on every forward.
+            // During graph build (cache MISS) this copy happens inline in
+            // Qwen2Graph::buildPartialForwardGraph(). On cache HIT we must redo
+            // the copy here because the graph build code is not re-executed.
+            TensorBase *pp_external_hidden_state = nullptr; ///< Source (stage N-1 output)
+            TensorBase *pp_working_buffer = nullptr;        ///< Destination (local residual/hidden)
+            size_t pp_copy_bytes = 0;
+            DeviceId pp_device;
+            bool pp_needs_copy = false;
+
             // Pre-computed collective stage names for fast decode intercept
             std::unordered_set<std::string> collective_nodes;
 
@@ -2138,6 +2163,10 @@ namespace llaminar2
                 dynamic_param_stages_cached = false;
                 gpu_stream_applied = false;
                 phase3_active = false;
+                pp_external_hidden_state = nullptr;
+                pp_working_buffer = nullptr;
+                pp_copy_bytes = 0;
+                pp_needs_copy = false;
             }
         };
 
@@ -2182,7 +2211,7 @@ namespace llaminar2
         std::vector<std::unique_ptr<TensorBase>> owned_buffers_;
 
         /// Model-level buffers (when using graph-managed allocation)
-        Qwen2ModelBuffers managed_buffers_;
+        ModelBuffers managed_buffers_;
 
         /**
          * @brief Allocate GPU workspace for stages in a graph

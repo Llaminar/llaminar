@@ -82,33 +82,16 @@ namespace llaminar2
 
         result.weights_to_load.reserve(static_cast<size_t>(last_layer - first_layer) * 15);
 
+        // Get per-layer weight suffixes from the architecture schema
+        const auto suffixes = schema_factory.layerWeightSuffixes();
+
         for (int layer_idx = first_layer; layer_idx < last_layer; ++layer_idx)
         {
             std::string prefix = "blk." + std::to_string(layer_idx) + ".";
 
-            // All possible layer weights (mirroring InferenceRunnerFactory)
-            const std::vector<std::string> layer_weights = {
-                // Attention weights (required)
-                prefix + "attn_q.weight",
-                prefix + "attn_k.weight",
-                prefix + "attn_v.weight",
-                prefix + "attn_output.weight",
-                prefix + "attn_norm.weight",
-                // Attention biases (optional per schema)
-                prefix + "attn_q.bias",
-                prefix + "attn_k.bias",
-                prefix + "attn_v.bias",
-                // QK norm weights (optional per schema)
-                prefix + "attn_q_norm.weight",
-                prefix + "attn_k_norm.weight",
-                // FFN weights (required)
-                prefix + "ffn_gate.weight",
-                prefix + "ffn_up.weight",
-                prefix + "ffn_down.weight",
-                prefix + "ffn_norm.weight"};
-
-            for (const auto &weight_name : layer_weights)
+            for (const auto &suffix : suffixes)
             {
+                std::string weight_name = prefix + suffix;
                 bool is_optional = schema_factory.isWeightOptional(weight_name);
                 bool exists = has_tensor(weight_name);
 

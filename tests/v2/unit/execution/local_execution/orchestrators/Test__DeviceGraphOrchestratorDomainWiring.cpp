@@ -75,7 +75,7 @@ protected:
         return cpu_domain;
     }
 
-    Qwen2GraphConfig config_;
+    GraphConfig config_;
 };
 
 // =============================================================================

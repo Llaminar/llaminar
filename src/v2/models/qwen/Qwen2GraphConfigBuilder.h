@@ -25,7 +25,7 @@ namespace llaminar2
     // Forward declaration to avoid include chain that triggers
     // duplicate CollectiveBackendType definition.
     // Full definition included in Qwen2GraphConfigBuilder.cpp.
-    struct Qwen2GraphConfig;
+    struct GraphConfig;
 
     /**
      * @brief Qwen2-specific implementation of IGraphConfigBuilder
@@ -53,23 +53,23 @@ namespace llaminar2
         /**
          * @brief Build Qwen2-specific configuration
          */
-        bool buildQwen2Config(
+        bool buildGraphConfig(
             const RankExecutionPlan &plan,
             const ModelConfig &model_config,
             IWeightManager &weight_manager,
-            Qwen2GraphConfig &config) override;
+            GraphConfig &config) override;
 
         /**
          * @brief Populate config from IModelContext (architecture fields)
          */
         bool populateFromModelContext(
             IModelContext &ctx,
-            Qwen2GraphConfig &config) override;
+            GraphConfig &config) override;
 
         /**
          * @brief Build weights from accessor (Qwen2/3 weight names)
          */
-        Qwen2ModelWeights buildWeights(WeightAccessor get_weight) override;
+        ModelWeights buildWeights(WeightAccessor get_weight) override;
 
     private:
         /**
@@ -83,7 +83,7 @@ namespace llaminar2
          * @brief Configure attention TP parameters
          */
         void configureAttentionTP(
-            Qwen2GraphConfig &config,
+            GraphConfig &config,
             const RankExecutionPlan &plan,
             const ModelConfig &model_config,
             const LayerDevicePlacement &placement);
@@ -92,7 +92,7 @@ namespace llaminar2
          * @brief Configure FFN TP parameters
          */
         void configureFFNTP(
-            Qwen2GraphConfig &config,
+            GraphConfig &config,
             const RankExecutionPlan &plan,
             const ModelConfig &model_config);
 
@@ -100,7 +100,7 @@ namespace llaminar2
          * @brief Configure LM head TP parameters
          */
         void configureLMHeadTP(
-            Qwen2GraphConfig &config,
+            GraphConfig &config,
             const RankExecutionPlan &plan,
             const ModelConfig &model_config);
 
@@ -108,7 +108,7 @@ namespace llaminar2
          * @brief Configure pipeline parallelism parameters
          */
         void configurePipelineParallel(
-            Qwen2GraphConfig &config,
+            GraphConfig &config,
             const RankExecutionPlan &plan,
             const ModelConfig &model_config);
 

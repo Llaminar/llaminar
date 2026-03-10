@@ -270,6 +270,14 @@ namespace llaminar2
         bool buildMultiDeviceComputeGraph();
 
         /**
+         * @brief Build compute graph for local pipeline parallel execution
+         *
+         * Uses TreeToRunnerCompiler to create a PP pipeline from
+         * plan_.local_pp_devices and plan_.local_pp_layer_boundaries.
+         */
+        bool buildLocalPPComputeGraph();
+
+        /**
          * @brief Build compute graph for single-device execution
          */
         bool buildSingleDeviceComputeGraph();

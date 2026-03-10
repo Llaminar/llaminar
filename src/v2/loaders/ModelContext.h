@@ -206,6 +206,11 @@ namespace llaminar2
             }
             return static_cast<int>(loader_.blockCount());
         }
+        int totalBlockCount() const override
+        {
+            // Always return the full model layer count (ignoring PP override)
+            return static_cast<int>(loader_.blockCount());
+        }
         int embeddingLength() const override { return static_cast<int>(loader_.embeddingLength()); }
         int headCount() const override { return static_cast<int>(loader_.headCount()); }
         int headCountKV() const override { return static_cast<int>(loader_.headCountKV()); }

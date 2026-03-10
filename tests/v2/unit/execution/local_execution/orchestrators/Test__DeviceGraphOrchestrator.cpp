@@ -55,7 +55,7 @@ protected:
         graph_builder_ = std::make_shared<Qwen2Graph>(config_, nullptr);
     }
 
-    Qwen2GraphConfig config_;
+    GraphConfig config_;
     std::shared_ptr<Qwen2Graph> graph_builder_;
 };
 
@@ -427,7 +427,7 @@ TEST_F(Test__DeviceGraphOrchestrator, SetWeightsDelegatesToGraphBuilder)
     auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(graph_builder_, nullptr);
 
     // Create mock weights (don't need valid data, just pointers)
-    Qwen2ModelWeights weights;
+    ModelWeights weights;
     std::unique_ptr<FP32Tensor> embed = std::make_unique<FP32Tensor>(
         std::vector<size_t>{151936, 896}, DeviceId::cpu());
     std::unique_ptr<FP32Tensor> norm = std::make_unique<FP32Tensor>(
@@ -438,7 +438,7 @@ TEST_F(Test__DeviceGraphOrchestrator, SetWeightsDelegatesToGraphBuilder)
     weights.embedding_table = embed.get();
     weights.final_norm = norm.get();
     weights.lm_head = lm.get();
-    weights.get_layer_weights = [](int) -> Qwen2LayerWeights
+    weights.get_layer_weights = [](int) -> LayerWeights
     { return {}; };
 
     // Set weights via orchestrator
@@ -453,7 +453,7 @@ TEST_F(Test__DeviceGraphOrchestrator, SetBuffersDelegatesToGraphBuilder)
     auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(graph_builder_, nullptr);
 
     // Create mock buffers
-    Qwen2ModelBuffers buffers;
+    ModelBuffers buffers;
     std::unique_ptr<FP32Tensor> hidden = std::make_unique<FP32Tensor>(
         std::vector<size_t>{128, 896}, DeviceId::cpu());
     std::unique_ptr<FP32Tensor> logits = std::make_unique<FP32Tensor>(
@@ -480,7 +480,7 @@ TEST_F(Test__DeviceGraphOrchestrator, HasGlobalWeightsReturnsTrueWhenSet)
     auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(graph_builder_, nullptr);
 
     // Set up minimal weights with layer accessor
-    Qwen2ModelWeights weights;
+    ModelWeights weights;
     std::unique_ptr<FP32Tensor> embed = std::make_unique<FP32Tensor>(
         std::vector<size_t>{151936, 896}, DeviceId::cpu());
     std::unique_ptr<FP32Tensor> norm = std::make_unique<FP32Tensor>(
@@ -491,7 +491,7 @@ TEST_F(Test__DeviceGraphOrchestrator, HasGlobalWeightsReturnsTrueWhenSet)
     weights.embedding_table = embed.get();
     weights.final_norm = norm.get();
     weights.lm_head = lm.get();
-    weights.get_layer_weights = [](int) -> Qwen2LayerWeights
+    weights.get_layer_weights = [](int) -> LayerWeights
     { return {}; };
 
     orchestrator->setWeights(weights);
@@ -1293,7 +1293,7 @@ TEST_F(Test__DeviceGraphOrchestrator, DISABLED_WorkspaceSizing_AllDimensionsFrom
 {
     // DISABLED: Tests unimplemented feature (passing n_heads/head_dim to workspace consumers)
     // Test with a realistic Qwen2-0.5B configuration
-    Qwen2GraphConfig qwen_config;
+    GraphConfig qwen_config;
     qwen_config.d_model = 896;
     qwen_config.d_ff = 4864;
     qwen_config.n_heads = 14;
@@ -1329,7 +1329,7 @@ TEST_F(Test__DeviceGraphOrchestrator, DISABLED_WorkspaceSizing_LlamaStyleConfig)
 {
     // DISABLED: Tests unimplemented feature (passing n_heads/head_dim to workspace consumers)
     // Test with a Llama-style configuration (different head_dim)
-    Qwen2GraphConfig llama_config;
+    GraphConfig llama_config;
     llama_config.d_model = 4096;
     llama_config.d_ff = 14336;
     llama_config.n_heads = 32;
@@ -1643,7 +1643,7 @@ TEST_F(Test__DeviceGraphOrchestrator, DISABLED_WorkspaceSizing_LargeModelConfig_
 {
     // DISABLED: Tests unimplemented feature (passing n_heads/head_dim to workspace consumers)
     // Large model configuration (e.g., 70B-scale)
-    Qwen2GraphConfig large_config;
+    GraphConfig large_config;
     large_config.d_model = 8192;
     large_config.d_ff = 28672;
     large_config.n_heads = 64;

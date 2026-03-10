@@ -51,6 +51,12 @@ namespace llaminar2
         return factory->getWeightShardingConfig();
     }
 
+    StageShardingConfig SchemaFactoryRegistry::getStageShardingConfig(const std::string &architecture)
+    {
+        auto factory = getFactory(architecture);
+        return factory->getStageShardingConfig();
+    }
+
     bool SchemaFactoryRegistry::isSupported(const std::string &architecture)
     {
         std::string arch_lower = architecture;

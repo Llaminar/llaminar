@@ -9,7 +9,7 @@
  *
  * This file provides factory functions for creating inference runners.
  * The factory handles:
- * - Building Qwen2GraphConfig from GGUF model metadata
+ * - Building GraphConfig from GGUF model metadata
  * - Configuring tensor parallelism (GLOBAL via MPI or LOCAL via ILocalTPContext)
  * - Loading and wiring up model weights
  * - Initializing DeviceGraphOrchestrator with proper state
@@ -197,7 +197,7 @@ namespace llaminar2
      * Creates a DeviceGraphOrchestrator configured for LOCAL Pipeline Parallelism
      * (multiple PP stages on multiple local devices within a single MPI rank).
      * The factory handles:
-     * - Building Qwen2GraphConfig from model metadata
+     * - Building GraphConfig from model metadata
      * - Calling setPipelineConfig() on the orchestrator
      * - Auto-configuring weights for each layer's device using getWeightForDevice()
      * - Initializing PP contexts for inter-stage activation transfers

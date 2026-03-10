@@ -10,6 +10,7 @@
 
 #include "DeviceGraphOrchestrator.h"
 #include "../../config/HybridPrecisionConfig.h"
+#include "../../config/InferenceMode.h"
 #include "../../../loaders/WeightManager.h"
 #include "../../../loaders/WeightPlacementMap.h"
 #include "../../../config/TensorParallelConfig.h"
@@ -17,6 +18,7 @@
 #include "../../../collective/ILocalTPContext.h" // createLocalTPContext()
 #include "../../../collective/ILocalPPContext.h" // createLocalPPContext(), HierarchicalPPConfig
 #include "../../../collective/PPStage.h"         // PPStage variant type
+#include "../../../collective/BackendRouter.h"   // GlobalBackendRouter for PP copy
 #include "../../../backends/p2p/DirectP2P.h"     // DirectP2PEngine for BAR-backed allocation
 #include "../../../backends/GPUDeviceContextPool.h"
 #include "../../../utils/Logger.h"
@@ -39,7 +41,7 @@ namespace llaminar2
 
     DeviceGraphOrchestrator::DeviceGraphOrchestrator(
         Dependencies deps,
-        const Qwen2GraphConfig &graph_config,
+        const GraphConfig &graph_config,
         const GraphCacheConfig &cache_config)
         : graph_builder_(std::make_shared<Qwen2Graph>(graph_config, nullptr)), // Create graph without MPI (uses topology)
           mpi_ctx_(nullptr),                                                   // No direct MPI context - use injected topology
@@ -153,7 +155,7 @@ namespace llaminar2
     }
 
     DeviceGraphOrchestrator::DeviceGraphOrchestrator(
-        const Qwen2GraphConfig &graph_config,
+        const GraphConfig &graph_config,
         std::shared_ptr<MPIContext> mpi_ctx,
         const GraphCacheConfig &cache_config)
         // Create Qwen2Graph with MPI context FIRST (before any move)
@@ -233,7 +235,7 @@ namespace llaminar2
     // Weight and Buffer Configuration
     // =========================================================================
 
-    void DeviceGraphOrchestrator::setWeights(const Qwen2ModelWeights &weights)
+    void DeviceGraphOrchestrator::setWeights(const ModelWeights &weights)
     {
         if (!graph_builder_)
         {
@@ -244,7 +246,7 @@ namespace llaminar2
         LOG_DEBUG("[DeviceGraphOrchestrator] Model weights configured for full forward pass");
     }
 
-    void DeviceGraphOrchestrator::setBuffers(const Qwen2ModelBuffers &buffers)
+    void DeviceGraphOrchestrator::setBuffers(const ModelBuffers &buffers)
     {
         if (!graph_builder_)
         {
@@ -423,20 +425,20 @@ namespace llaminar2
         owned_buffers_.clear();
 
         // Clear buffer pointers
-        managed_buffers_ = Qwen2ModelBuffers{};
+        managed_buffers_ = ModelBuffers{};
     }
 
-    Qwen2ActivationBuffers &DeviceGraphOrchestrator::getInternalBuffers()
+    ActivationBuffers &DeviceGraphOrchestrator::getInternalBuffers()
     {
         return managed_buffers_.layer_buffers;
     }
 
-    const Qwen2ActivationBuffers &DeviceGraphOrchestrator::getInternalBuffers() const
+    const ActivationBuffers &DeviceGraphOrchestrator::getInternalBuffers() const
     {
         return managed_buffers_.layer_buffers;
     }
 
-    const Qwen2ModelBuffers &DeviceGraphOrchestrator::getModelBuffers() const
+    const ModelBuffers &DeviceGraphOrchestrator::getModelBuffers() const
     {
         return managed_buffers_;
     }
@@ -582,8 +584,14 @@ namespace llaminar2
 
         ForwardGraphSignature forward_signature;
         ForwardGraphCache *active_forward_cache = nullptr;
+        // PP non-embedding stages receive hidden state instead of tokens,
+        // so token_ids is legitimately nullptr. They still have stable inputs
+        // (position_ids for RoPE, hidden state via setHiddenState).
+        const bool is_pp_non_embedding_stage =
+            pp_stage_config_.has_value() && !pp_stage_config_->has_embedding;
         const bool has_stable_forward_inputs =
-            (effective_input.token_ids != nullptr) && (effective_input.position_ids != nullptr);
+            ((effective_input.token_ids != nullptr) && (effective_input.position_ids != nullptr)) ||
+            (is_pp_non_embedding_stage && (effective_input.position_ids != nullptr));
         const bool forward_cache_eligible =
             cache_config_.enabled &&
             !has_unified_pp_path &&
@@ -633,19 +641,66 @@ namespace llaminar2
             // Update stable buffers — stages hold pointers to these, so the
             // pointed-to values change but the pointers remain valid
             int total_tokens = effective_input.batch_size * effective_input.seq_len;
-            if (static_cast<int>(forward_cache.token_ids.size()) == total_tokens)
+            if (effective_input.token_ids)
             {
-                std::memcpy(forward_cache.token_ids.data(), effective_input.token_ids,
-                            static_cast<size_t>(total_tokens) * sizeof(int));
-                std::memcpy(forward_cache.position_ids.data(), effective_input.position_ids,
-                            static_cast<size_t>(total_tokens) * sizeof(int));
+                if (static_cast<int>(forward_cache.token_ids.size()) == total_tokens)
+                {
+                    std::memcpy(forward_cache.token_ids.data(), effective_input.token_ids,
+                                static_cast<size_t>(total_tokens) * sizeof(int));
+                }
+                else
+                {
+                    forward_cache.token_ids.assign(effective_input.token_ids,
+                                                   effective_input.token_ids + total_tokens);
+                }
             }
-            else
+            if (effective_input.position_ids)
             {
-                forward_cache.token_ids.assign(effective_input.token_ids,
-                                               effective_input.token_ids + total_tokens);
-                forward_cache.position_ids.assign(effective_input.position_ids,
-                                                  effective_input.position_ids + total_tokens);
+                if (static_cast<int>(forward_cache.position_ids.size()) == total_tokens)
+                {
+                    std::memcpy(forward_cache.position_ids.data(), effective_input.position_ids,
+                                static_cast<size_t>(total_tokens) * sizeof(int));
+                }
+                else
+                {
+                    forward_cache.position_ids.assign(effective_input.position_ids,
+                                                      effective_input.position_ids + total_tokens);
+                }
+            }
+
+            // PP hidden state copy: for non-embedding PP stages, copy the
+            // external hidden state (from previous PP stage) to the working
+            // buffer before executing the cached graph.
+            if (forward_cache.pp_needs_copy &&
+                forward_cache.pp_external_hidden_state &&
+                forward_cache.pp_working_buffer)
+            {
+                const auto &dev = forward_cache.pp_device;
+                if (dev.is_gpu())
+                {
+                    const void *src_ptr = forward_cache.pp_external_hidden_state->gpu_data_ptr();
+                    void *dst_ptr = forward_cache.pp_working_buffer->gpu_data_ptr();
+                    if (src_ptr && dst_ptr)
+                    {
+                        auto *router = GlobalBackendRouter::get();
+                        if (router)
+                        {
+                            auto *backend = router->getBackendForCopy(dev, dev);
+                            if (backend)
+                            {
+                                backend->copy(dst_ptr, dev, src_ptr, dev,
+                                              forward_cache.pp_copy_bytes);
+                                forward_cache.pp_working_buffer->mark_device_dirty();
+                            }
+                        }
+                    }
+                }
+                else
+                {
+                    std::memcpy(forward_cache.pp_working_buffer->mutable_data(),
+                                forward_cache.pp_external_hidden_state->data(),
+                                forward_cache.pp_copy_bytes);
+                }
             }
 
             // For GPU graph replay: set the capture stream on all stages ONCE.
@@ -815,16 +870,20 @@ namespace llaminar2
         if (should_cache_after_build)
         {
             int total_tokens = effective_input.batch_size * effective_input.seq_len;
-            build_cache->token_ids.assign(
-                effective_input.token_ids,
-                effective_input.token_ids + total_tokens);
-            build_cache->position_ids.assign(
-                effective_input.position_ids,
-                effective_input.position_ids + total_tokens);
-
-            // Redirect input to stable buffers before graph build
-            effective_input.token_ids = build_cache->token_ids.data();
-            effective_input.position_ids = build_cache->position_ids.data();
+            if (effective_input.token_ids)
+            {
+                build_cache->token_ids.assign(
+                    effective_input.token_ids,
+                    effective_input.token_ids + total_tokens);
+                effective_input.token_ids = build_cache->token_ids.data();
+            }
+            if (effective_input.position_ids)
+            {
+                build_cache->position_ids.assign(
+                    effective_input.position_ids,
+                    effective_input.position_ids + total_tokens);
+                effective_input.position_ids = build_cache->position_ids.data();
+            }
         }
 
         // Build forward graph via fluent builder API
@@ -985,6 +1044,47 @@ namespace llaminar2
             }
 
             build_cache->valid = true;
+
+            // Store PP hidden state copy info for cache HIT replay.
+            // On cache MISS the copy was done inline by buildPartialForwardGraph().
+            // On cache HIT we must redo it since graph build code is not re-executed.
+            if (effective_input.external_hidden_state && graph_builder_)
+            {
+                const auto &cfg = graph_builder_->config();
+                const auto &bufs = graph_builder_->buffers();
+                InferenceMode mode(cfg.activation_precision);
+                TensorBase *working_buffer =
+                    bufs.layer_buffers.residual && mode.isHybridQ16()
+                        ? bufs.layer_buffers.residual
+                        : bufs.current_hidden;
+
+                if (working_buffer &&
+                    effective_input.external_hidden_state != working_buffer)
+                {
+                    size_t copy_elems = static_cast<size_t>(
+                        effective_input.batch_size * effective_input.seq_len * cfg.d_model);
+                    size_t copy_bytes;
+                    if (mode.isHybridQ16())
+                    {
+                        size_t num_blocks = (copy_elems + 31) / 32;
+                        copy_bytes = num_blocks * sizeof(Q16_1Block);
+                    }
+                    else
+                    {
+                        copy_bytes = copy_elems * sizeof(float);
+                    }
+
+                    build_cache->pp_external_hidden_state = effective_input.external_hidden_state;
+                    build_cache->pp_working_buffer = working_buffer;
+                    build_cache->pp_copy_bytes = copy_bytes;
+                    build_cache->pp_device = cfg.default_device;
+                    build_cache->pp_needs_copy = true;
+
+                    LOG_DEBUG("[DeviceGraphOrchestrator] Stored PP copy info: "
+                              << copy_bytes << " bytes on " << cfg.default_device.toString());
+                }
+            }
+
             LOG_INFO("[DeviceGraphOrchestrator] Cached forward graph for signature "
                      << "[seq_len=" << forward_signature.seq_len
                      << ", batch_size=" << forward_signature.batch_size
@@ -1168,8 +1268,8 @@ namespace llaminar2
     }
 
     bool DeviceGraphOrchestrator::executeAttention(
-        const Qwen2LayerWeights &layer,
-        Qwen2ActivationBuffers &buffers,
+        const LayerWeights &layer,
+        ActivationBuffers &buffers,
         int layer_idx,
         int seq_len,
         IKVCache *kv_cache,
@@ -1313,8 +1413,8 @@ namespace llaminar2
     }
 
     bool DeviceGraphOrchestrator::executeFFN(
-        const Qwen2LayerWeights &layer,
-        Qwen2ActivationBuffers &buffers,
+        const LayerWeights &layer,
+        ActivationBuffers &buffers,
         int layer_idx,
         int seq_len,
         DeviceId device)
@@ -1414,8 +1514,8 @@ namespace llaminar2
     }
 
     bool DeviceGraphOrchestrator::executeLayer(
-        const Qwen2LayerWeights &layer,
-        Qwen2ActivationBuffers &buffers,
+        const LayerWeights &layer,
+        ActivationBuffers &buffers,
         int layer_idx,
         int seq_len,
         IKVCache *kv_cache,
@@ -2289,7 +2389,7 @@ namespace llaminar2
         }
 
         // Prepare model buffers from state
-        Qwen2ModelBuffers model_buffers;
+        ModelBuffers model_buffers;
         model_buffers.current_hidden = state_.hidden.get();
         model_buffers.logits = state_.logits.get();
 
@@ -3246,14 +3346,14 @@ namespace llaminar2
     }
 
     DeviceGraphOrchestrator::GraphBuildSession &
-    DeviceGraphOrchestrator::GraphBuildSession::withWeights(const Qwen2ModelWeights &weights)
+    DeviceGraphOrchestrator::GraphBuildSession::withWeights(const ModelWeights &weights)
     {
         weights_ = weights;
         return *this;
     }
 
     DeviceGraphOrchestrator::GraphBuildSession &
-    DeviceGraphOrchestrator::GraphBuildSession::withBuffers(const Qwen2ModelBuffers &buffers)
+    DeviceGraphOrchestrator::GraphBuildSession::withBuffers(const ModelBuffers &buffers)
     {
         buffers_ = buffers;
         return *this;
@@ -3528,7 +3628,7 @@ namespace llaminar2
     // =========================================================================
 
     DeviceGraphOrchestrator::AttentionGraphSession &
-    DeviceGraphOrchestrator::AttentionGraphSession::forLayer(const Qwen2LayerWeights &layer, int layer_idx)
+    DeviceGraphOrchestrator::AttentionGraphSession::forLayer(const LayerWeights &layer, int layer_idx)
     {
         layer_ = &layer;
         layer_idx_ = layer_idx;
@@ -3536,7 +3636,7 @@ namespace llaminar2
     }
 
     DeviceGraphOrchestrator::AttentionGraphSession &
-    DeviceGraphOrchestrator::AttentionGraphSession::withBuffers(Qwen2ActivationBuffers &buffers)
+    DeviceGraphOrchestrator::AttentionGraphSession::withBuffers(ActivationBuffers &buffers)
     {
         buffers_ = &buffers;
         return *this;
@@ -3646,7 +3746,7 @@ namespace llaminar2
     // =========================================================================
 
     DeviceGraphOrchestrator::FFNGraphSession &
-    DeviceGraphOrchestrator::FFNGraphSession::forLayer(const Qwen2LayerWeights &layer, int layer_idx)
+    DeviceGraphOrchestrator::FFNGraphSession::forLayer(const LayerWeights &layer, int layer_idx)
     {
         layer_ = &layer;
         layer_idx_ = layer_idx;
@@ -3654,7 +3754,7 @@ namespace llaminar2
     }
 
     DeviceGraphOrchestrator::FFNGraphSession &
-    DeviceGraphOrchestrator::FFNGraphSession::withBuffers(Qwen2ActivationBuffers &buffers)
+    DeviceGraphOrchestrator::FFNGraphSession::withBuffers(ActivationBuffers &buffers)
     {
         buffers_ = &buffers;
         return *this;

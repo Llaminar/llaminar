@@ -122,7 +122,7 @@ namespace llaminar2::verification
     struct LayoutExpectation
     {
         // =================================================================
-        // Global model dimensions (from Qwen2GraphConfig)
+        // Global model dimensions (from GraphConfig)
         // =================================================================
         int head_dim = 0;      ///< Dimension per attention head (e.g., 128)
         int n_heads = 0;       ///< Total number of query heads
@@ -188,7 +188,7 @@ namespace llaminar2::verification
          * @param local_n_kv_heads KV heads on this rank (-1 = use n_kv_heads)
          * @return Configured LayoutExpectation
          *
-         * Example usage with Qwen2GraphConfig:
+         * Example usage with GraphConfig:
          * @code
          * auto expect = LayoutExpectation::forAttention(
          *     config.head_dim, config.n_heads, config.n_kv_heads,

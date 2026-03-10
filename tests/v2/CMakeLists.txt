@@ -5214,6 +5214,18 @@ add_v2_test(V2_Unit_CoherenceProtocol
     MPI_PROCS 1
 )
 
+# Test: CrossBackendCoherence (cross-backend safety in Pipeline Parallel mode)
+# Validates that mark_device_dirty_with_event() detects cross-backend stream mismatches
+# and skips event recording instead of crashing (e.g., CUDA stream → ROCm backend).
+# Regression test for HybridPPTP segfault in hipEventRecord.
+add_executable(v2_test_cross_backend_coherence unit/execution/local_execution/coherence/Test__CrossBackendCoherence.cpp)
+target_link_libraries(v2_test_cross_backend_coherence llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_CrossBackendCoherence
+    COMMAND $<TARGET_FILE:v2_test_cross_backend_coherence>
+    LABELS "V2;Unit;Coherence;CrossBackend;PipelineParallel;DeviceMigration;Regression"
+    MPI_PROCS 1
+)
+
 # Test: LivenessAnalyzer (buffer lifetime analysis for memory optimization)
 # Tests buffer liveness tracking, aliasing group computation, memory savings calculation.
 # Part of Phase 4: Liveness Analysis for buffer management infrastructure
@@ -6132,6 +6144,19 @@ add_v2_test(V2_Unit_Qwen2Graph_KVCachePP
     LABELS "V2;Unit;Models;Qwen2;Qwen2Graph;PipelineParallelism;KVCache;Regression"
 )
 
+# Test: PP absolute layer range validation (regression test for LocalPP crash)
+add_executable(v2_test_qwen2graph_pp_layer_range unit/models/qwen/Test__Qwen2Graph_PPLayerRange.cpp)
+target_link_libraries(v2_test_qwen2graph_pp_layer_range 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_Qwen2Graph_PPLayerRange 
+    COMMAND $<TARGET_FILE:v2_test_qwen2graph_pp_layer_range>
+    MPI_PROCS 1
+    LABELS "V2;Unit;Models;Qwen2;Qwen2Graph;PipelineParallelism;Regression"
+)
+
 # Test: PlacementStrategy and PlacementPlan (weight/compute placement algorithms)
 add_executable(v2_test_placement_strategy unit/execution/mpi_orchestration/Test__PlacementStrategy.cpp)
 target_link_libraries(v2_test_placement_strategy 
@@ -6855,23 +6880,7 @@ add_v2_test(V2_Unit_IQ4_XSTensor
 # -----------------------------------------------------------------------------
 # Integration Parity: MPI Tensor-Parallel vs Single-Rank
 # -----------------------------------------------------------------------------
-# Compares distributed execution against single-node to ensure TP correctness
-if(CMAKE_BUILD_TYPE MATCHES "Debug" OR CMAKE_BUILD_TYPE MATCHES "E2ERelease" OR CMAKE_BUILD_TYPE MATCHES "Integration" OR ENABLE_SNAPSHOTS)
-    add_executable(v2_integration_parity_mpi_vs_single_rank 
-        e2e/parity/internal/mpi_vs_single_rank/Test__MPIPipeline_vs_SingleRank.cpp
-        e2e/parity/gtest_mpi_main.cpp
-    )
-    target_link_libraries(v2_integration_parity_mpi_vs_single_rank llaminar2_core GTest::gtest MPI::MPI_CXX)
-
-    add_v2_test(V2_Integration_Parity_MPIPipeline_vs_SingleRank
-        COMMAND $<TARGET_FILE:v2_integration_parity_mpi_vs_single_rank>
-        LABELS "V2;Integration;Parity;MPI;TensorParallel"
-        MPI_PROCS 2
-    )
-else()
-    message(STATUS "V2: Integration MPI parity test disabled (snapshots not available in Release build)")
-    message(STATUS "     Use -DCMAKE_BUILD_TYPE=Integration or -DENABLE_SNAPSHOTS=ON to enable")
-endif()
+# MPIPipeline_vs_SingleRank removed — superseded by per-backend LocalTP/LocalPP/HybridPPTP parity tests
 
 # -----------------------------------------------------------------------------
 # DISABLED: E2E Parity tests moved to Integration or deprecated

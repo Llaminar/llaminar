@@ -28,9 +28,9 @@
 namespace llaminar2
 {
 
-    // Forward declarations - model-specific configs
-    struct Qwen2GraphConfig;
-    struct Qwen2ModelWeights;
+    // Forward declarations
+    struct GraphConfig;
+    struct ModelWeights;
     class IModelContext;
     class IKVCache;
     class TensorBase;
@@ -112,7 +112,7 @@ namespace llaminar2
         /**
          * @brief Build Qwen2-specific graph configuration
          *
-         * Convenience method that returns the Qwen2GraphConfig directly.
+         * Convenience method that returns the GraphConfig directly.
          * Only valid for Qwen2-based models.
          *
          * @param plan Execution plan for this rank
@@ -121,14 +121,14 @@ namespace llaminar2
          * @param[out] config Output configuration to populate
          * @return true if successful
          */
-        virtual bool buildQwen2Config(
+        virtual bool buildGraphConfig(
             const RankExecutionPlan &plan,
             const ModelConfig &model_config,
             IWeightManager &weight_manager,
-            Qwen2GraphConfig &config) = 0;
+            GraphConfig &config) = 0;
 
         /**
-         * @brief Populate architecture fields of Qwen2GraphConfig from IModelContext
+         * @brief Populate architecture fields of GraphConfig from IModelContext
          *
          * Fills: n_layers, d_model, n_heads, n_kv_heads, head_dim, d_ff,
          *        vocab_size, rope_theta, rms_norm_eps.
@@ -142,7 +142,7 @@ namespace llaminar2
          */
         virtual bool populateFromModelContext(
             IModelContext &ctx,
-            Qwen2GraphConfig &config) = 0;
+            GraphConfig &config) = 0;
 
         /**
          * @brief Build model weights from a generic weight accessor
@@ -156,7 +156,7 @@ namespace llaminar2
          * @param get_weight Accessor mapping GGUF name to tensor
          * @return Populated weights struct (embedding, norms, lm_head, layer accessor)
          */
-        virtual Qwen2ModelWeights buildWeights(WeightAccessor get_weight) = 0;
+        virtual ModelWeights buildWeights(WeightAccessor get_weight) = 0;
     };
 
     // =========================================================================
