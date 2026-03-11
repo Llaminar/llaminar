@@ -8,6 +8,9 @@
 #include "../IComputeStage.h"
 #include "../IWorkspaceConsumerStage.h"
 #include "../StageParamsBase.h"
+#include "../../../memory/BufferId.h"
+
+#include <optional>
 
 namespace llaminar2
 {
@@ -48,6 +51,10 @@ namespace llaminar2
 
             // Optional bias tensor [vocab_size] - passed to GEMM for fused addition
             const TensorBase *bias_tensor = nullptr;
+
+            // Optional BufferIds for contract-based coherence
+            std::optional<BufferId> input_buffer_id;
+            std::optional<BufferId> output_buffer_id;
         };
 
         explicit LMHeadStage(Params params);
@@ -59,6 +66,7 @@ namespace llaminar2
         bool supportsBackend(ComputeBackendType backend) const override;
         StageDumpInfo buildDumpInfoImpl() const override;
         StageBufferRequirements getBufferRequirements() const override;
+        StageBufferContract bufferContract() const override;
 
         /**
          * @brief Return FULL policy - cohere inputs AND allocate output GPU buffers

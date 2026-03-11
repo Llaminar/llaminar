@@ -2706,6 +2706,19 @@ add_v2_test(V2_Unit_NUMAAllocator
     MPI_PROCS 1  # NUMAAllocator is single-rank only (memory allocation)
 )
 
+# Test: BufferArena (centralized buffer management, coherence tracking, borrow validation)
+add_executable(v2_test_buffer_arena unit/memory/Test__BufferArena.cpp)
+target_link_libraries(v2_test_buffer_arena 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_BufferArena 
+    COMMAND $<TARGET_FILE:v2_test_buffer_arena>
+    LABELS "V2;Unit;Memory;BufferArena;Coherence;BufferHarmonization"
+    MPI_PROCS 1
+)
+
 # Test: NUMATopology sysfs detection (hardware-independent unit tests with temp files)
 add_executable(v2_test_numa_topology_sysfs unit/utils/Test__NUMATopologySysfs.cpp)
 target_link_libraries(v2_test_numa_topology_sysfs 

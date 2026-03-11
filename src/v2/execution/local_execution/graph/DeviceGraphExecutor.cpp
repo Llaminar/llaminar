@@ -330,7 +330,6 @@ namespace llaminar2
         table << fort::separator;
         table << "FRAMEWORK OVERHEAD:" << "" << "" << "" << fort::endr;
         table << "  getDumpInfo() calls" << fmt(overhead.get_dump_info_ms, 2) << per_tok(overhead.get_dump_info_ms) << pct(overhead.get_dump_info_ms) << fort::endr;
-        table << "  extractBuffers() calls" << fmt(overhead.extract_buffers_ms, 2) << per_tok(overhead.extract_buffers_ms) << pct(overhead.extract_buffers_ms) << fort::endr;
         table << "  Buffer Verification" << fmt(overhead.verify_ms, 2) << per_tok(overhead.verify_ms) << pct(overhead.verify_ms) << fort::endr;
         table << "  Snapshot Callbacks" << fmt(overhead.callback_ms, 2) << per_tok(overhead.callback_ms) << pct(overhead.callback_ms) << fort::endr;
 
@@ -1217,9 +1216,16 @@ namespace llaminar2
 
         auto mark_stage_outputs_dirty = [&](ComputeNode &node, void *stream)
         {
-            const auto &dump_info = node.stage->getDumpInfo();
-            auto outputs = extractOutputBuffers(dump_info);
-            markOutputsDirty(outputs, stream);
+            if (!arena_)
+                return;
+            const StageBufferContract contract = node.stage->bufferContract();
+            if (contract.empty())
+                return;
+            DeviceId target_device = node.device.is_valid() ? node.device : node.stage->device();
+            for (const auto &binding : contract.allWrites())
+            {
+                arena_->markWritten(binding.id, target_device, stream);
+            }
         };
 
         auto post_captured_segment_launch = [&](GraphSegment &seg, void *stream)
@@ -1243,29 +1249,44 @@ namespace llaminar2
                 return true;
             }
 
+            if (!arena_)
+            {
+                LOG_ERROR("[DeviceGraphExecutor] No arena for replay coherence on stage: " << node.name);
+                return false;
+            }
+
             DeviceId target_device = node.device.is_valid() ? node.device : node.stage->device();
-            const auto &dump_info = node.stage->getDumpInfo();
+            const StageBufferContract contract = node.stage->bufferContract();
 
-            auto inputs = extractInputBuffers(dump_info);
-            if (!cohereInputs(inputs, target_device))
+            // Cohere arena-managed reads (inputs + inouts)
+            for (const auto &binding : contract.allArenaReads())
             {
-                LOG_ERROR("[DeviceGraphExecutor] Failed to cohere replay inputs for stage: " << node.name);
-                return false;
-            }
-
-            auto weights = extractWeightBuffers(dump_info);
-            if (!cohereInputs(weights, target_device))
-            {
-                LOG_ERROR("[DeviceGraphExecutor] Failed to cohere replay weights for stage: " << node.name);
-                return false;
-            }
-
-            if (policy == CoherencePolicy::OUTPUT || policy == CoherencePolicy::FULL)
-            {
-                auto outputs = extractOutputBuffers(dump_info);
-                if (!cohereOutputs(outputs, target_device))
+                if (!arena_->prepareForRead(binding.id, target_device))
                 {
-                    LOG_ERROR("[DeviceGraphExecutor] Failed to cohere replay outputs for stage: " << node.name);
+                    LOG_ERROR("[DeviceGraphExecutor] Arena prepareForRead failed for replay stage: " << node.name);
+                    return false;
+                }
+            }
+
+            // Cohere weights (not arena-managed)
+            if (!node.weights_cohered)
+            {
+                for (auto *weight : contract.weight_tensors)
+                {
+                    if (auto *tb = dynamic_cast<TensorBase *>(weight))
+                    {
+                        tb->ensureOnDevice(target_device);
+                    }
+                }
+                node.weights_cohered = true;
+            }
+
+            // Cohere arena-managed writes (outputs + inouts)
+            for (const auto &binding : contract.allWrites())
+            {
+                if (!arena_->prepareForWrite(binding.id, target_device))
+                {
+                    LOG_ERROR("[DeviceGraphExecutor] Arena prepareForWrite failed for replay stage: " << node.name);
                     return false;
                 }
             }
@@ -1747,7 +1768,6 @@ namespace llaminar2
         double execute_ms = 0.0;
         double mark_dirty_ms = 0.0;
         double get_dump_info_ms = 0.0;
-        double extract_buffers_ms = 0.0;
 
         // =========================================================================
         // OPTIMIZATION: Cache getDumpInfo() once at start (avoid 3-4 calls per stage)
@@ -1765,59 +1785,75 @@ namespace llaminar2
         // =========================================================================
         // Stage Coherence: Ensure inputs are on target device BEFORE execution
         // =========================================================================
+
+        // Phase 2: Check if this stage has a contract and arena is available
+        const StageBufferContract contract = (arena_) ? node.stage->bufferContract() : StageBufferContract{};
+        const bool use_contract = !contract.empty() && arena_ != nullptr;
+
         {
             auto policy = node.stage->coherencePolicy();
             DeviceId target_device = node.device.is_valid() ? node.device : node.stage->device();
 
             LOG_DEBUG("[DeviceGraphExecutor] Stage '" << node.name << "' coherencePolicy=" << toString(policy)
-                                                      << " target_device=" << target_device.to_string());
+                                                      << " target_device=" << target_device.to_string()
+                                                      << " use_contract=" << use_contract);
 
-            if (policy == CoherencePolicy::INPUT || policy == CoherencePolicy::FULL)
+            if (use_contract)
             {
-                // Use cached dump_info (no separate getDumpInfo call needed)
-
-                // Cohere inputs (includes extract time)
+                // ── Contract-based coherence (Phase 2) ──────────────────────
+                // The arena handles all H2D/D2H transfers based on the contract.
                 if (profiling)
                     phase_start = std::chrono::high_resolution_clock::now();
-                auto inputs = extractInputBuffers(cached_dump_info);
-                if (profiling)
+
+                // Cohere arena-managed reads (inputs + inouts)
+                for (const auto &binding : contract.allArenaReads())
                 {
-                    phase_end = std::chrono::high_resolution_clock::now();
-                    extract_buffers_ms += std::chrono::duration<double, std::milli>(phase_end - phase_start).count();
-                    phase_start = phase_end;
+                    if (!arena_->prepareForRead(binding.id, target_device))
+                    {
+                        LOG_ERROR("[DeviceGraphExecutor] Arena prepareForRead failed for "
+                                  << bufferIdName(binding.id) << " in stage '" << node.name << "'");
+                        return false;
+                    }
                 }
 
-                if (!cohereInputs(inputs, target_device))
-                {
-                    LOG_ERROR("[DeviceGraphExecutor] Failed to cohere inputs for stage '" << node.name << "'");
-                    return false;
-                }
                 if (profiling)
                 {
                     phase_end = std::chrono::high_resolution_clock::now();
                     input_cohere_ms = std::chrono::duration<double, std::milli>(phase_end - phase_start).count();
                 }
 
-                // Cohere weights (needed for GPU execution - biases, etc.)
-                // OPTIMIZATION: Skip if weights were already confirmed on device
-                // (weights are immutable after loading, so first-pass coherence is sufficient)
+                // Cohere weights (not arena-managed, use direct ensureOnDevice)
                 if (!node.weights_cohered)
                 {
                     if (profiling)
                         phase_start = std::chrono::high_resolution_clock::now();
-                    auto weights = extractWeightBuffers(cached_dump_info);
-                    if (profiling)
+
+                    if (!contract.weight_tensors.empty())
                     {
-                        phase_end = std::chrono::high_resolution_clock::now();
-                        extract_buffers_ms += std::chrono::duration<double, std::milli>(phase_end - phase_start).count();
-                        phase_start = phase_end;
+                        // Contract-declared weights (highest priority)
+                        for (auto *weight : contract.weight_tensors)
+                        {
+                            if (auto *tb = dynamic_cast<TensorBase *>(weight))
+                                tb->ensureOnDevice(target_device);
+                        }
                     }
 
-                    if (!cohereInputs(weights, target_device)) // Weights are read-only like inputs
+                    // Upload getDumpInfo weights (covers correctly-classified weights)
+                    for (const auto &wi : cached_dump_info.weights)
                     {
-                        LOG_ERROR("[DeviceGraphExecutor] Failed to cohere weights for stage '" << node.name << "'");
-                        return false;
+                        if (wi.tensor)
+                            const_cast<ITensor *>(wi.tensor)->ensureOnDevice(target_device);
                     }
+
+                    // Upload non-arena getDumpInfo inputs (e.g., gamma norms classified
+                    // as inputs rather than weights). For arena-managed tensors already
+                    // on device, ensureOnDevice() returns early (near-no-op).
+                    for (const auto &ii : cached_dump_info.inputs)
+                    {
+                        if (ii.tensor)
+                            ii.tensor->ensureOnDevice(target_device);
+                    }
+
                     if (profiling)
                     {
                         phase_end = std::chrono::high_resolution_clock::now();
@@ -1825,45 +1861,38 @@ namespace llaminar2
                     }
                     node.weights_cohered = true;
                 }
-            }
 
-            // For GPU targets, outputs also need GPU buffers allocated before kernel runs.
-            // IMPORTANT: We must ALWAYS call cohereOutputs (not just on first iteration)
-            // because in Pipeline Parallel mode, a downstream stage on a different GPU
-            // may have migrated the output tensor to another device via cohereInputs.
-            // The outputs_allocated flag only gates buffer extraction, not coherence.
-            if (policy == CoherencePolicy::OUTPUT || policy == CoherencePolicy::FULL)
-            {
-                if (!node.outputs_allocated)
+                // Cohere arena-managed writes (outputs + inouts)
+                if (profiling)
+                    phase_start = std::chrono::high_resolution_clock::now();
+
+                for (const auto &binding : contract.allWrites())
                 {
-                    // First iteration: extract and cache output buffers
-                    if (profiling)
-                        phase_start = std::chrono::high_resolution_clock::now();
-                    node.cached_output_buffers = extractOutputBuffers(cached_dump_info);
-                    if (profiling)
+                    if (!arena_->prepareForWrite(binding.id, target_device))
                     {
-                        phase_end = std::chrono::high_resolution_clock::now();
-                        extract_buffers_ms += std::chrono::duration<double, std::milli>(phase_end - phase_start).count();
-                        phase_start = phase_end;
+                        LOG_ERROR("[DeviceGraphExecutor] Arena prepareForWrite failed for "
+                                  << bufferIdName(binding.id) << " in stage '" << node.name << "'");
+                        return false;
                     }
                 }
-                else if (profiling)
-                {
-                    phase_start = std::chrono::high_resolution_clock::now();
-                }
 
-                if (!cohereOutputs(node.cached_output_buffers, target_device))
-                {
-                    LOG_ERROR("[DeviceGraphExecutor] Failed to allocate output buffers for stage '" << node.name << "'");
-                    return false;
-                }
                 if (profiling)
                 {
                     phase_end = std::chrono::high_resolution_clock::now();
                     output_alloc_ms = std::chrono::duration<double, std::milli>(phase_end - phase_start).count();
                 }
-
-                node.outputs_allocated = true;
+            }
+            else if (policy != CoherencePolicy::NONE)
+            {
+                if (!target_device.is_cpu())
+                {
+                    // GPU stages with INPUT/OUTPUT/FULL policy must have a contract + arena.
+                    LOG_ERROR("[DeviceGraphExecutor] Stage '" << node.name
+                                                              << "' has coherencePolicy=" << toString(policy)
+                                                              << " but no BufferArena + contract. All GPU stages must implement bufferContract().");
+                    return false;
+                }
+                // CPU stages: coherence is a no-op (data already on host), safe to continue without arena
             }
         }
 
@@ -2010,52 +2039,43 @@ namespace llaminar2
         if (success)
         {
             auto policy = node.stage->coherencePolicy();
+            DeviceId target_device = node.device.is_valid() ? node.device : node.stage->device();
 
-            if (policy == CoherencePolicy::OUTPUT || policy == CoherencePolicy::FULL)
+            if (use_contract)
             {
-                // OPTIMIZATION: Use cached output buffers instead of re-extracting
-                // The cached_output_buffers were populated during the first-pass output allocation
-                if (node.cached_output_buffers.empty())
+                // ── Contract-based output marking (Phase 2) ─────────────────
+                if (profiling)
+                    phase_start = std::chrono::high_resolution_clock::now();
+
+                const bool need_event = node.is_final_output
+#if LLAMINAR_ASSERTIONS_ACTIVE
+                                        || debugEnv().validation.validate_buffers
+#endif
+                    ;
+
+                for (const auto &binding : contract.allWrites())
                 {
-                    // First time or cache not populated — extract and cache
-                    if (profiling)
-                        phase_start = std::chrono::high_resolution_clock::now();
-                    node.cached_output_buffers = extractOutputBuffers(cached_dump_info);
-                    if (profiling)
+                    if (need_event)
                     {
-                        phase_end = std::chrono::high_resolution_clock::now();
-                        extract_buffers_ms += std::chrono::duration<double, std::milli>(phase_end - phase_start).count();
-                        phase_start = phase_end;
+                        arena_->markWritten(binding.id, target_device, node.stage->gpuStream());
+                    }
+                    else
+                    {
+                        arena_->markWrittenFlagsOnly(binding.id, target_device);
                     }
                 }
-                else if (profiling)
-                {
-                    phase_start = std::chrono::high_resolution_clock::now();
-                }
 
-                // OPTIMIZATION: Use flags-only dirty marking for intermediate stages.
-                // Only the final stage (producing logits for CPU readback) needs event
-                // recording. Intermediate GPU→GPU stages skip hipEventRecord overhead.
-                if (node.is_final_output)
-                {
-                    markOutputsDirty(node.cached_output_buffers, node.stage->gpuStream());
-                }
-                else
-                {
-                    markOutputsDirtyFlagsOnly(node.cached_output_buffers);
-                }
                 if (profiling)
                 {
                     phase_end = std::chrono::high_resolution_clock::now();
                     mark_dirty_ms = std::chrono::duration<double, std::milli>(phase_end - phase_start).count();
                 }
 
+                // Stage output printing (after coherence, so GPU→host sync has occurred)
                 logWatchedPointerProducer(
                     node.name,
                     cached_dump_info,
                     tryGetWorkerContext(node.device.is_valid() ? node.device : node.stage->device()));
-
-                // Stage output printing (after coherence, so GPU→host sync has occurred)
                 printStageOutputs(node.name, cached_dump_info);
             }
         }
@@ -2130,7 +2150,7 @@ namespace llaminar2
         }
 
         // Log phase breakdown at TRACE level (only for stages taking >1ms total or any phase >0.5ms)
-        double total_overhead_ms = input_cohere_ms + weight_cohere_ms + output_alloc_ms + dump_input_ms + mark_dirty_ms + dump_output_ms + verify_ms + callback_ms + get_dump_info_ms + extract_buffers_ms;
+        double total_overhead_ms = input_cohere_ms + weight_cohere_ms + output_alloc_ms + dump_input_ms + mark_dirty_ms + dump_output_ms + verify_ms + callback_ms + get_dump_info_ms;
         double total_ms = total_overhead_ms + execute_ms;
         if (profiling && (total_ms > 1.0 || input_cohere_ms > 0.5 || weight_cohere_ms > 0.5 ||
                           output_alloc_ms > 0.5 || execute_ms > 0.5 || verify_ms > 0.5 || callback_ms > 0.5))
@@ -2146,7 +2166,6 @@ namespace llaminar2
                                                        << " verify=" << verify_ms << "ms"
                                                        << " callback=" << callback_ms << "ms"
                                                        << " get_dump_info=" << get_dump_info_ms << "ms"
-                                                       << " extract_buffers=" << extract_buffers_ms << "ms"
                                                        << " total=" << total_ms << "ms");
         }
 
@@ -2169,7 +2188,6 @@ namespace llaminar2
             stats_.overhead.verify_ms += verify_ms;
             stats_.overhead.callback_ms += callback_ms;
             stats_.overhead.get_dump_info_ms += get_dump_info_ms;
-            stats_.overhead.extract_buffers_ms += extract_buffers_ms;
 
             LOG_DEBUG("[DeviceGraphExecutor] Stage '" << node.name << "' took " << total_ms << " ms (execute=" << execute_ms << "ms, overhead=" << total_overhead_ms << "ms)");
         }
@@ -2299,12 +2317,54 @@ namespace llaminar2
 
         // Verify all outputs (NaN/Inf/null checks)
         // IMPORTANT: Sync outputs from GPU BEFORE reading data
+
+        // DEBUG: Log coherence state BEFORE ensureOutputsOnHost
+        for (const auto &output : dump_info.outputs)
+        {
+            if (output.tensor)
+            {
+                auto *tb = dynamic_cast<TensorBase *>(output.tensor);
+                if (tb)
+                {
+                    LOG_WARN("[VERIFY-DIAG] PRE-SYNC stage=" << node.name
+                                                             << " output=" << (output.name ? output.name : "?")
+                                                             << " isOnCPU=" << tb->isOnCPU()
+                                                             << " isDeviceValid=" << tb->isDeviceValid()
+                                                             << " gpu_device=" << (tb->current_device().has_value() ? tb->current_device()->to_string() : "none")
+                                                             << " rows=" << output.rows << " cols=" << output.cols
+                                                             << " raw_data=" << output.data);
+                }
+            }
+        }
+
         dump_info.ensureOutputsOnHost();
 
         for (const auto &output : dump_info.outputs)
         {
             if (!output.data)
                 continue;
+
+            // DEBUG: Log first few values after sync
+            {
+                const float *fp = static_cast<const float *>(output.data);
+                size_t total = output.rows * output.cols;
+                size_t check = std::min(total, static_cast<size_t>(4));
+                bool all_zero = true;
+                std::ostringstream vals;
+                for (size_t i = 0; i < check; ++i)
+                {
+                    vals << fp[i];
+                    if (i + 1 < check)
+                        vals << ",";
+                    if (fp[i] != 0.0f)
+                        all_zero = false;
+                }
+                LOG_WARN("[VERIFY-DIAG] POST-SYNC stage=" << node.name
+                                                          << " output=" << (output.name ? output.name : "?")
+                                                          << " first_vals=[" << vals.str() << "]"
+                                                          << " all_zero=" << all_zero
+                                                          << " total_elements=" << total);
+            }
 
             auto result = verifyRawBuffer(
                 output.data, output.rows, output.cols,

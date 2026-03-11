@@ -254,6 +254,7 @@ namespace llaminar2
             return;
         }
         graph_builder_->setBuffers(buffers);
+        managed_buffers_ = buffers;
         LOG_DEBUG("[DeviceGraphOrchestrator] Model buffers configured for full forward pass");
     }
 
@@ -394,6 +395,9 @@ namespace llaminar2
         // Bind allocated buffers to managed_buffers_ struct
         bindGraphManagedBuffers(seq_len);
 
+        // Initialize BufferArena with the managed buffers (Phase 2)
+        initializeArena();
+
         auto &stats = buffer_manager_->stats();
         LOG_INFO("[DeviceGraphOrchestrator] Buffer initialization complete: "
                  << "total=" << (stats.total_bytes / (1024.0 * 1024.0)) << " MB, "
@@ -495,6 +499,54 @@ namespace llaminar2
                   << " logits=" << managed_buffers_.logits);
     }
 
+    void DeviceGraphOrchestrator::initializeArena()
+    {
+        // Idempotent: skip if already initialized (allows safe re-calls)
+        if (arena_)
+            return;
+
+        arena_ = std::make_unique<BufferArena>();
+
+        auto &lb = managed_buffers_.layer_buffers;
+
+        // Register layer activation buffers as external (non-owning).
+        // The arena tracks coherence; buffer_manager_ still owns the tensors.
+        auto reg = [&](BufferId id, TensorBase *t)
+        {
+            if (t)
+                arena_->registerExternalBuffer(id, t);
+        };
+
+        reg(BufferId::RESIDUAL, lb.residual);
+        reg(BufferId::NORMALIZED, lb.normalized);
+        reg(BufferId::Q_PROJ, lb.Q);
+        reg(BufferId::K_PROJ, lb.K);
+        reg(BufferId::V_PROJ, lb.V);
+        reg(BufferId::ATTN_OUTPUT, lb.attn_output);
+        reg(BufferId::ATTN_PROJ, lb.attn_proj);
+        reg(BufferId::GATE_PROJ, lb.gate);
+        reg(BufferId::UP_PROJ, lb.up);
+        reg(BufferId::FFN_OUTPUT, lb.ffn_output);
+        reg(BufferId::ATTN_SCORES_WORKSPACE, lb.workspace_scores);
+        reg(BufferId::ATTN_CONTEXT_WORKSPACE, lb.workspace_context);
+
+        // Hybrid mode buffers
+        reg(BufferId::Q_ROPE, lb.Q_rope);
+        reg(BufferId::K_ROPE, lb.K_rope);
+        reg(BufferId::V_DEQUANT, lb.V_dequant);
+
+        // Model-level buffers
+        reg(BufferId::HIDDEN_STATE, managed_buffers_.current_hidden);
+        reg(BufferId::LOGITS, managed_buffers_.logits);
+        reg(BufferId::LOGITS_LOCAL, managed_buffers_.logits_local);
+
+        // Wire arena to executor for contract-based coherence
+        executor_.setArena(arena_.get());
+
+        LOG_INFO("[DeviceGraphOrchestrator] BufferArena initialized with "
+                 << arena_->registeredCount() << " external buffers");
+    }
+
     // =========================================================================
     // Execution Methods
     // =========================================================================
@@ -534,6 +586,16 @@ namespace llaminar2
         {
             LOG_ERROR("[DeviceGraphOrchestrator] Invalid sequence length: " << input.seq_len);
             return false;
+        }
+
+        // Lazy arena initialization: ensures contract-based coherence works
+        // for both single-device and PP paths. In the graph-managed buffer path,
+        // initializeArena() is called from initializeBuffers(). In the PP path
+        // (where initializeBuffers() is not used), managed_buffers_ is populated
+        // by forward() → setBuffers() before reaching this point.
+        if (!arena_ && managed_buffers_.current_hidden)
+        {
+            initializeArena();
         }
 
         LOG_TRACE("[DeviceGraphOrchestrator] executeForward: batch_size=" << input.batch_size

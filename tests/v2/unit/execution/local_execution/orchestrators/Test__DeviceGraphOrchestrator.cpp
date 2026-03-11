@@ -845,6 +845,8 @@ namespace
 
         std::string name() const override { return name_; }
 
+        CoherencePolicy coherencePolicy() const override { return CoherencePolicy::NONE; }
+
         bool supportsBackend(ComputeBackendType backend) const override
         {
             (void)backend;
@@ -933,6 +935,8 @@ namespace
         ComputeStageType type() const override { return ComputeStageType::COPY; }
 
         std::string name() const override { return name_; }
+
+        CoherencePolicy coherencePolicy() const override { return CoherencePolicy::NONE; }
 
         bool supportsBackend(ComputeBackendType backend) const override
         {

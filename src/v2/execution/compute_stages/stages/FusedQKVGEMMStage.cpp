@@ -668,4 +668,17 @@ namespace llaminar2
         bound_workspace_ = nullptr;
     }
 
+    StageBufferContract FusedQKVGEMMStage::bufferContract() const
+    {
+        if (!params_.input_buffer_id || !params_.output_q_buffer_id ||
+            !params_.output_k_buffer_id || !params_.output_v_buffer_id)
+            return {};
+
+        return StageBufferContract::build()
+            .addInput(*params_.input_buffer_id)
+            .addOutput(*params_.output_q_buffer_id)
+            .addOutput(*params_.output_k_buffer_id)
+            .addOutput(*params_.output_v_buffer_id);
+    }
+
 } // namespace llaminar2

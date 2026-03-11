@@ -6,6 +6,7 @@
  */
 
 #include "TPAllreduceStage.h"
+#include "../../../memory/StageBufferContract.h"
 #include "../../../tensors/TensorClasses.h"
 #include "../../../utils/Logger.h"
 #include "../../../utils/KernelProfiler.h"
@@ -192,6 +193,15 @@ namespace llaminar2
         }
 
         return info;
+    }
+
+    StageBufferContract TPAllreduceStage::bufferContract() const
+    {
+        if (!params_.tensor_buffer_id)
+            return {};
+
+        return StageBufferContract::build()
+            .addInOut(*params_.tensor_buffer_id);
     }
 
     void TPAllreduceStage::setParams(const Params &params)

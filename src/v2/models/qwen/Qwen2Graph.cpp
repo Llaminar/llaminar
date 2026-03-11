@@ -28,6 +28,7 @@
 #include "../../execution/compute_stages/stages/LocalPPTransferStage.h"
 #include "../../execution/compute_stages/stages/QKNormStage.h"
 #include "../../config/PipelineConfig.h"
+#include "../../memory/BufferId.h" // Phase 2: contract BufferIds
 #include <algorithm>
 #include <chrono>
 #include <cstring>
@@ -241,6 +242,7 @@ namespace llaminar2
         embed_params.d_model = config_.d_model;
         embed_params.vocab_size = config_.vocab_size;
         embed_params.device_id = config_.default_device;
+        embed_params.output_buffer_id = BufferId::HIDDEN_STATE;
 
         graph.addNode("embedding",
                       ComputeStageFactory::createEmbedding(embed_params),
@@ -379,6 +381,8 @@ namespace llaminar2
         lm_params.vocab_size = lm_head_vocab_size;
         lm_params.bias_tensor = nullptr; // Qwen2 has no LM head bias
         lm_params.device_id = config_.default_device;
+        lm_params.input_buffer_id = BufferId::NORMALIZED;
+        lm_params.output_buffer_id = use_column_parallel ? BufferId::LOGITS_LOCAL : BufferId::LOGITS;
 
         graph.addNode("lm_head",
                       ComputeStageFactory::createLMHead(lm_params),
@@ -400,6 +404,8 @@ namespace llaminar2
             // LM head is not layer-specific; use nullptr for domain (legacy MPI path)
             // Multi-domain TP typically doesn't route LM head to a specific domain
             allgather_params.domain = nullptr;
+            allgather_params.input_buffer_id = BufferId::LOGITS_LOCAL;
+            allgather_params.output_buffer_id = BufferId::LOGITS;
 
             graph.addNode("lm_head_allgather",
                           ComputeStageFactory::createAllGather(allgather_params),
@@ -500,6 +506,7 @@ namespace llaminar2
             embed_params.d_model = config_.d_model;
             embed_params.vocab_size = config_.vocab_size;
             embed_params.device_id = config_.default_device;
+            embed_params.output_buffer_id = BufferId::HIDDEN_STATE;
 
             graph.addNode("embedding",
                           ComputeStageFactory::createEmbedding(embed_params),
@@ -785,6 +792,8 @@ namespace llaminar2
             lm_params.vocab_size = lm_head_vocab_size;
             lm_params.bias_tensor = nullptr;
             lm_params.device_id = config_.default_device;
+            lm_params.input_buffer_id = BufferId::NORMALIZED;
+            lm_params.output_buffer_id = use_column_parallel ? BufferId::LOGITS_LOCAL : BufferId::LOGITS;
 
             graph.addNode("lm_head",
                           ComputeStageFactory::createLMHead(lm_params),
@@ -804,6 +813,8 @@ namespace llaminar2
                 allgather_params.mpi_ctx = mpi_ctx_.get();
                 allgather_params.actual_seq_len = static_cast<size_t>(total_tokens);
                 allgather_params.domain = nullptr;
+                allgather_params.input_buffer_id = BufferId::LOGITS_LOCAL;
+                allgather_params.output_buffer_id = BufferId::LOGITS;
 
                 graph.addNode("lm_head_allgather",
                               ComputeStageFactory::createAllGather(allgather_params),
@@ -1155,6 +1166,8 @@ namespace llaminar2
                     allgather_params.mpi_ctx = mpi_ctx_.get();
                     allgather_params.actual_seq_len = static_cast<size_t>(total_tokens);
                     allgather_params.domain = nullptr;
+                    allgather_params.input_buffer_id = BufferId::LOGITS_LOCAL;
+                    allgather_params.output_buffer_id = BufferId::LOGITS;
 
                     graph.addNode("lm_head_allgather",
                                   ComputeStageFactory::createAllGather(allgather_params),
@@ -1472,6 +1485,8 @@ namespace llaminar2
             allgather_params.actual_seq_len = static_cast<size_t>(total_tokens);
             // LM head is not layer-specific; use nullptr for domain (legacy MPI path)
             allgather_params.domain = nullptr;
+            allgather_params.input_buffer_id = BufferId::LOGITS_LOCAL;
+            allgather_params.output_buffer_id = BufferId::LOGITS;
 
             graph.addNode("lm_head_allgather",
                           ComputeStageFactory::createAllGather(allgather_params),
@@ -1541,6 +1556,8 @@ namespace llaminar2
             attn_norm_params.eps = config_.rms_norm_eps;
             attn_norm_params.seq_len = total_tokens; // Use total_tokens = batch_size * seq_len
             attn_norm_params.device_id = device;     // Use graph's target device for kernel dispatch
+            attn_norm_params.input_buffer_id = BufferId::HIDDEN_STATE;
+            attn_norm_params.output_buffer_id = BufferId::NORMALIZED;
 
             graph.addNode(prefix + "attn_norm",
                           ComputeStageFactory::createRMSNorm(attn_norm_params),
@@ -1579,6 +1596,10 @@ namespace llaminar2
             qkv_params.n_v = v_n;
             qkv_params.bias_v = layer.v_bias; // TensorBase* for tensor-aware GPU path
             qkv_params.device_id = device;
+            qkv_params.input_buffer_id = BufferId::NORMALIZED;
+            qkv_params.output_q_buffer_id = BufferId::Q_PROJ;
+            qkv_params.output_k_buffer_id = BufferId::K_PROJ;
+            qkv_params.output_v_buffer_id = BufferId::V_PROJ;
             LOG_DEBUG("[Qwen2Graph] Creating FusedQKVGEMM with device_id=" << device.to_string());
 
             graph.addNode(prefix + "qkv_proj",
@@ -1634,6 +1655,8 @@ namespace llaminar2
             q_norm_params.eps = config_.rms_norm_eps;
             q_norm_params.seq_len = total_tokens;
             q_norm_params.device_id = device;
+            q_norm_params.input_buffer_id = BufferId::Q_PROJ;
+            q_norm_params.output_buffer_id = BufferId::Q_PROJ; // In-place
 
             graph.addNode(prefix + "q_norm",
                           ComputeStageFactory::createQKNorm(q_norm_params),
@@ -1654,6 +1677,8 @@ namespace llaminar2
             k_norm_params.eps = config_.rms_norm_eps;
             k_norm_params.seq_len = total_tokens;
             k_norm_params.device_id = device;
+            k_norm_params.input_buffer_id = BufferId::K_PROJ;
+            k_norm_params.output_buffer_id = BufferId::K_PROJ; // In-place
 
             graph.addNode(prefix + "k_norm",
                           ComputeStageFactory::createQKNorm(k_norm_params),
@@ -1684,6 +1709,8 @@ namespace llaminar2
             rope_params.position_ids = position_ids; // Pass full array for batched execution
             rope_params.theta_base = config_.rope_theta;
             rope_params.seq_len = total_tokens; // Use total_tokens = batch_size * seq_len
+            rope_params.q_buffer_id = BufferId::Q_PROJ;
+            rope_params.k_buffer_id = BufferId::K_PROJ;
 
             // Hybrid/HybridQ16 mode: output to separate buffers to avoid requantization
             // Hybrid: Q8_1 → FP32, HybridQ16: Q8_1 → Q16_1
@@ -1691,6 +1718,8 @@ namespace llaminar2
             {
                 rope_params.Q_out = buffers.Q_rope;
                 rope_params.K_out = buffers.K_rope;
+                rope_params.q_out_buffer_id = BufferId::Q_ROPE;
+                rope_params.k_out_buffer_id = BufferId::K_ROPE;
                 LOG_DEBUG("[Qwen2Graph] Layer " << layer_idx
                                                 << " using " << (inference_mode.isHybridQ16() ? "HybridQ16" : "Hybrid")
                                                 << " RoPE: Q8_1→" << (inference_mode.isHybridQ16() ? "Q16_1" : "FP32") << " output");
@@ -1747,6 +1776,7 @@ namespace llaminar2
                 if (use_hybrid_mode && inference_mode.needsKRope())
                 {
                     kv_append_params.K = buffers.K_rope;
+                    kv_append_params.k_buffer_id = BufferId::K_ROPE;
                     LOG_DEBUG("[Qwen2Graph] Layer " << layer_idx
                                                     << " KVCacheAppend using K_rope (post-RoPE "
                                                     << (inference_mode.isHybridQ16() ? "Q16_1" : "FP32") << ")");
@@ -1754,9 +1784,11 @@ namespace llaminar2
                 else
                 {
                     kv_append_params.K = buffers.K;
+                    kv_append_params.k_buffer_id = BufferId::K_PROJ;
                 }
 
                 kv_append_params.V = buffers.V;
+                kv_append_params.v_buffer_id = BufferId::V_PROJ;
                 kv_append_params.kv_cache = kv_cache;
                 // For PP stages: map global layer index to local KV cache index
                 kv_append_params.layer_idx = layer_idx - config_.pp_layer_offset;
@@ -2066,6 +2098,12 @@ namespace llaminar2
                     attn_params.position_offset = position_ids ? position_ids[0] : 0;
                     attn_params.mpi_ctx = mpi_ctx_.get();
                     attn_params.device_id = device;
+                    attn_params.q_buffer_id = (use_hybrid_mode && inference_mode.needsQRope())
+                                                  ? BufferId::Q_ROPE
+                                                  : BufferId::Q_PROJ;
+                    attn_params.output_buffer_id = BufferId::ATTN_OUTPUT;
+                    attn_params.workspace_scores_buffer_id = BufferId::ATTN_SCORES_WORKSPACE;
+                    attn_params.workspace_context_buffer_id = BufferId::ATTN_CONTEXT_WORKSPACE;
 
                     graph.addNode(prefix + "attention",
                                   ComputeStageFactory::createAttentionCompute(attn_params),
@@ -2108,7 +2146,9 @@ namespace llaminar2
                                           .alpha = 1.0f,
                                           .beta = 0.0f,
                                           .transpose_B = false,
-                                          .gemm_context = GemmContext::ATTN}),
+                                          .gemm_context = GemmContext::ATTN,
+                                          .a_buffer_id = BufferId::ATTN_OUTPUT,
+                                          .c_buffer_id = BufferId::ATTN_PROJ}),
                                   device);
 
                     if (env.execution.exec_attention)
@@ -2133,10 +2173,14 @@ namespace llaminar2
                     TensorBase *allreduce_buffer = inference_mode.isHybridQ16()
                                                        ? buffers.residual
                                                        : buffers.attn_proj;
+                    BufferId wo_allreduce_bid = inference_mode.isHybridQ16()
+                                                    ? BufferId::RESIDUAL
+                                                    : BufferId::ATTN_PROJ;
 
                     std::string stage_name = prefix + "wo_allreduce";
                     auto allreduce_stage = createTPAllreduceStage(
-                        allreduce_buffer, allreduce_count, device, layer_idx, /*is_attention=*/true, stage_name);
+                        allreduce_buffer, allreduce_count, device, layer_idx, /*is_attention=*/true, stage_name,
+                        wo_allreduce_bid);
 
                     if (allreduce_stage)
                     {
@@ -2162,6 +2206,9 @@ namespace llaminar2
             res_params.residual = buffers.current_hidden;
             res_params.output = buffers.current_hidden;
             res_params.num_elements = static_cast<size_t>(total_tokens) * static_cast<size_t>(config_.d_model);
+            res_params.input_buffer_id = BufferId::ATTN_PROJ;
+            res_params.residual_buffer_id = BufferId::HIDDEN_STATE;
+            res_params.output_buffer_id = BufferId::HIDDEN_STATE; // In-place with residual
 
             graph.addNode(prefix + "attn_residual",
                           ComputeStageFactory::createResidualAdd(res_params),
@@ -2217,6 +2264,8 @@ namespace llaminar2
             ffn_norm_params.eps = config_.rms_norm_eps;
             ffn_norm_params.seq_len = total_tokens; // Use total_tokens = batch_size * seq_len
             ffn_norm_params.device_id = device;     // Use graph's target device for kernel dispatch
+            ffn_norm_params.input_buffer_id = BufferId::HIDDEN_STATE;
+            ffn_norm_params.output_buffer_id = BufferId::NORMALIZED;
 
             graph.addNode(prefix + "ffn_norm",
                           ComputeStageFactory::createRMSNorm(ffn_norm_params),
@@ -2244,6 +2293,9 @@ namespace llaminar2
             gate_up_params.n_up = up_n;
             gate_up_params.mpi_ctx = mpi_ctx_.get();
             gate_up_params.device_id = device;
+            gate_up_params.input_buffer_id = BufferId::NORMALIZED;
+            gate_up_params.output_gate_buffer_id = BufferId::GATE_PROJ;
+            gate_up_params.output_up_buffer_id = BufferId::UP_PROJ;
 
             graph.addNode(prefix + "gate_up_proj",
                           ComputeStageFactory::createFusedGateUpGEMM(gate_up_params),
@@ -2264,6 +2316,11 @@ namespace llaminar2
             swiglu_params.output = buffers.up;    // In-place
             swiglu_params.seq_len = total_tokens; // Use total_tokens = batch_size * seq_len
             swiglu_params.device_id = device;     // Use graph's target device for kernel dispatch
+
+            // Phase 2: Set BufferIds for contract-based coherence
+            swiglu_params.gate_buffer_id = BufferId::GATE_PROJ;
+            swiglu_params.up_buffer_id = BufferId::UP_PROJ;
+            swiglu_params.output_buffer_id = BufferId::UP_PROJ; // In-place with up
 
             graph.addNode(prefix + "swiglu",
                           ComputeStageFactory::createSwiGLU(swiglu_params),
@@ -2294,7 +2351,9 @@ namespace llaminar2
                                   .alpha = 1.0f,
                                   .beta = 0.0f,
                                   .transpose_B = false,
-                                  .gemm_context = GemmContext::FFN}),
+                                  .gemm_context = GemmContext::FFN,
+                                  .a_buffer_id = BufferId::UP_PROJ,
+                                  .c_buffer_id = BufferId::ATTN_PROJ}),
                           device);
 
             if (env.execution.exec_swiglu)
@@ -2314,7 +2373,8 @@ namespace llaminar2
 
                 std::string stage_name = prefix + "down_allreduce";
                 auto allreduce_stage = createTPAllreduceStage(
-                    buffers.attn_proj, allreduce_count, device, layer_idx, /*is_attention=*/false, stage_name);
+                    buffers.attn_proj, allreduce_count, device, layer_idx, /*is_attention=*/false, stage_name,
+                    BufferId::ATTN_PROJ);
 
                 if (allreduce_stage)
                 {
@@ -2340,6 +2400,9 @@ namespace llaminar2
                                     ? buffers.residual
                                     : buffers.current_hidden;
             res_params.num_elements = static_cast<size_t>(total_tokens) * static_cast<size_t>(config_.d_model);
+            res_params.input_buffer_id = BufferId::ATTN_PROJ;
+            res_params.residual_buffer_id = BufferId::HIDDEN_STATE;
+            res_params.output_buffer_id = BufferId::HIDDEN_STATE; // In-place with residual
 
             graph.addNode(prefix + "ffn_residual",
                           ComputeStageFactory::createResidualAdd(res_params),
@@ -2476,6 +2539,8 @@ namespace llaminar2
         norm_params.eps = config_.rms_norm_eps;
         norm_params.seq_len = n_tokens;
         norm_params.device_id = device;
+        norm_params.input_buffer_id = BufferId::HIDDEN_STATE;
+        norm_params.output_buffer_id = BufferId::NORMALIZED;
 
         graph.addNode("final_norm",
                       ComputeStageFactory::createRMSNorm(norm_params),
@@ -2521,7 +2586,8 @@ namespace llaminar2
         DeviceId device,
         int layer_idx,
         bool is_attention,
-        const std::string &stage_name) const
+        const std::string &stage_name,
+        std::optional<BufferId> tensor_buffer_id) const
     {
         // LOCAL TP takes precedence if configured
         if (config_.local_tp_ctx && config_.local_tp_ctx->degree() > 1)
@@ -2563,6 +2629,7 @@ namespace llaminar2
             params.count = count;
             params.stage_name = stage_name;
             params.precision = config_.getAllreducePrecisionForLayer(layer_idx);
+            params.tensor_buffer_id = tensor_buffer_id;
 
             return std::make_unique<TPAllreduceStage>(params);
         }

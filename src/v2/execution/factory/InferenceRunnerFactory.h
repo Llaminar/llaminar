@@ -66,6 +66,7 @@
 #include "../../backends/DeviceId.h"
 #include "../../utils/MPIContext.h"
 #include "../mpi_orchestration/PlacementPlan.h"
+#include "../mpi_orchestration/RankExecutionPlan.h"
 #include "../../config/PipelineConfig.h"
 #include "FactoryPPStageConfig.h"
 #include <memory>
@@ -148,6 +149,27 @@ namespace llaminar2
         /// via PCIeBARBackend::allocateInBarRegion() to enable zero-copy transfers
         /// to CUDA devices in subsequent PP stages.
         bool use_bar_backed_hidden = false;
+
+        /**
+         * @brief Canonical factory: build InferenceRunnerConfig from a RankExecutionPlan
+         *
+         * Copies runtime fields (max_seq_len, activation_precision, etc.) from
+         * plan.runtime which was pre-parsed in ExecutionPlanBuilder.
+         *
+         * @param plan The rank execution plan
+         * @return Populated config
+         */
+        static InferenceRunnerConfig fromPlan(const RankExecutionPlan &plan)
+        {
+            InferenceRunnerConfig config;
+            config.max_seq_len = plan.runtime.max_seq_len;
+            config.batch_size = plan.runtime.batch_size;
+            config.activation_precision = plan.runtime.activation_precision;
+            config.kv_cache_precision = plan.runtime.kv_cache_precision;
+            config.fused_attention_backend = plan.runtime.fused_attention_backend;
+            config.kv_cache_scale = plan.runtime.kv_cache_scale;
+            return config;
+        }
     };
 
     /**

@@ -7,6 +7,9 @@
 
 #include "../IComputeStage.h"
 #include "../StageParamsBase.h"
+#include "../../../memory/BufferId.h"
+
+#include <optional>
 
 namespace llaminar2
 {
@@ -35,6 +38,13 @@ namespace llaminar2
             // Explicit seq_len override (for pre-allocated buffers)
             // If 0, derives from tensor dimensions
             int seq_len = 0;
+
+            // Optional BufferIds for contract-based coherence (Phase 2)
+            // When set, bufferContract() returns a non-empty contract and
+            // the executor uses BufferArena for coherence instead of getDumpInfo.
+            std::optional<BufferId> gate_buffer_id;
+            std::optional<BufferId> up_buffer_id;
+            std::optional<BufferId> output_buffer_id;
         };
 
         explicit SwiGLUStage(Params params);
@@ -46,9 +56,9 @@ namespace llaminar2
         bool supportsBackend(ComputeBackendType backend) const override;
         StageDumpInfo buildDumpInfoImpl() const override;
         StageBufferRequirements getBufferRequirements() const override;
+        StageBufferContract bufferContract() const override;
 
         /// Target device for coherence management
-
 
     private:
         Params params_;

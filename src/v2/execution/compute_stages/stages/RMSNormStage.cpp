@@ -29,10 +29,10 @@ namespace llaminar2
         }
 
         if (!ensureRequiredPointers("RMSNormStage", {
-                                                    {"input", params_.input},
-                                                    {"output", params_.output},
-                                                    {"gamma", params_.gamma},
-                                                }))
+                                                        {"input", params_.input},
+                                                        {"output", params_.output},
+                                                        {"gamma", params_.gamma},
+                                                    }))
         {
             return false;
         }
@@ -235,6 +235,26 @@ namespace llaminar2
         }
 
         return reqs;
+    }
+
+    StageBufferContract RMSNormStage::bufferContract() const
+    {
+        if (!params_.input_buffer_id || !params_.output_buffer_id)
+            return {};
+
+        auto contract = StageBufferContract::build();
+
+        if (*params_.input_buffer_id == *params_.output_buffer_id)
+        {
+            contract.addInOut(*params_.input_buffer_id);
+        }
+        else
+        {
+            contract.addInput(*params_.input_buffer_id);
+            contract.addOutput(*params_.output_buffer_id);
+        }
+
+        return contract;
     }
 
 } // namespace llaminar2

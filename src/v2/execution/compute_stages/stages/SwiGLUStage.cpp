@@ -29,10 +29,10 @@ namespace llaminar2
         }
 
         if (!ensureRequiredPointers("SwiGLUStage", {
-                                                   {"gate", params_.gate},
-                                                   {"up", params_.up},
-                                                   {"output", params_.output},
-                                               }))
+                                                       {"gate", params_.gate},
+                                                       {"up", params_.up},
+                                                       {"output", params_.output},
+                                                   }))
         {
             return false;
         }
@@ -173,6 +173,33 @@ namespace llaminar2
         reqs.addOutput("output", {rows, cols}, buf_type);
 
         return reqs;
+    }
+
+    StageBufferContract SwiGLUStage::bufferContract() const
+    {
+        // Only return a non-empty contract if BufferIds were configured.
+        // This allows gradual migration: stages without BufferIds use the old getDumpInfo path.
+        if (!params_.gate_buffer_id || !params_.up_buffer_id || !params_.output_buffer_id)
+            return {};
+
+        auto contract = StageBufferContract::build();
+
+        // Check if output is in-place with up (same BufferId)
+        if (*params_.output_buffer_id == *params_.up_buffer_id)
+        {
+            // In-place: gate is READ, up/output is READWRITE
+            contract.addInput(*params_.gate_buffer_id);
+            contract.addInOut(*params_.up_buffer_id);
+        }
+        else
+        {
+            // Out-of-place: gate and up are READ, output is WRITE
+            contract.addInput(*params_.gate_buffer_id);
+            contract.addInput(*params_.up_buffer_id);
+            contract.addOutput(*params_.output_buffer_id);
+        }
+
+        return contract;
     }
 
 } // namespace llaminar2

@@ -38,7 +38,8 @@
 #include "../../../interfaces/ICollectiveContext.h"
 #include "../../../backends/IGPUGraphCapture.h"
 #include "../../../backends/IWorkerGPUContext.h"
-#include "../coherence/StageCoherence.h" // For CoherenceBuffer (cached in ComputeNode)
+#include "../coherence/StageCoherence.h" // For CoherenceBuffer (cached in GraphSegment)
+#include "../../../memory/BufferArena.h" // Phase 2: contract-based coherence
 #include <memory>
 #include <vector>
 #include <string>
@@ -67,12 +68,8 @@ namespace llaminar2
         // Once weights are on-device and outputs are allocated, subsequent
         // iterations can skip the entire coherence check + vector extraction.
         // =====================================================================
-        mutable bool weights_cohered = false;   ///< Weights confirmed on device
-        mutable bool outputs_allocated = false; ///< Output GPU buffers allocated
-        mutable bool is_final_output = false;   ///< Outputs will be read by CPU (needs event sync)
-
-        /// Cached output buffers for mark_dirty (avoids re-extracting every iteration)
-        mutable std::vector<CoherenceBuffer> cached_output_buffers;
+        mutable bool weights_cohered = false; ///< Weights confirmed on device
+        mutable bool is_final_output = false; ///< Outputs will be read by CPU (needs event sync)
 
         ComputeNode() : device(DeviceId::cpu()), completed(false) {}
         ComputeNode(std::string n, std::unique_ptr<IComputeStage> s, DeviceId dev = DeviceId::cpu())
@@ -370,6 +367,22 @@ namespace llaminar2
         DeviceGraphBufferManager *bufferManager() const { return buffer_manager_; }
 
         /**
+         * @brief Set the BufferArena for contract-based coherence (Phase 2)
+         *
+         * When both the arena is set and a stage returns a non-empty bufferContract(),
+         * the executor uses the arena for coherence instead of getDumpInfo().
+         *
+         * @param arena BufferArena (not owned, must outlive executor)
+         */
+        void setArena(BufferArena *arena) { arena_ = arena; }
+
+        /**
+         * @brief Get the current BufferArena
+         * @return Pointer to arena (nullptr if not set)
+         */
+        BufferArena *arena() const { return arena_; }
+
+        /**
          * @brief Execute a graph with automatic buffer management
          *
          * This method:
@@ -613,6 +626,7 @@ namespace llaminar2
         GraphExecutorStats stats_;
         DeviceGraphBufferManager *buffer_manager_ = nullptr; ///< Optional buffer manager (not owned)
         ICollectiveContext *collective_ctx_ = nullptr;       ///< Optional collective context (not owned)
+        BufferArena *arena_ = nullptr;                       ///< Optional arena for contract coherence (not owned)
 
         // Internal execution helpers
         bool executeSequential(ComputeGraph &graph, IDeviceContext *ctx);

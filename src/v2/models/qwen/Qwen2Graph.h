@@ -530,7 +530,8 @@ namespace llaminar2
             DeviceId device,
             int layer_idx,
             bool is_attention,
-            const std::string &stage_name = "") const;
+            const std::string &stage_name = "",
+            std::optional<BufferId> tensor_buffer_id = std::nullopt) const;
 
     public:
         /**

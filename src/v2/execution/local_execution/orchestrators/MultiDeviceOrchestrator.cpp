@@ -28,7 +28,8 @@
 #include "../../../backends/BackendManager.h"       // getBackendFor() for partial D2H in gatherLogits
 #include "../../../backends/GPUDeviceContextPool.h" // Compute stream registration for event-based collective sync
 #include "../../../utils/Logger.h"
-#include "../../../utils/Sampler.h" // SamplingParams for sampleOnDevice()
+#include "../../../utils/Sampler.h"                    // SamplingParams for sampleOnDevice()
+#include "../../mpi_orchestration/RankExecutionPlan.h" // For Config::fromPlan()
 #include <algorithm>
 #include <future>
 #include <iomanip>
@@ -220,6 +221,62 @@ namespace llaminar2
     }
 
     // =========================================================================
+    // Config::fromPlan — Canonical translation from RankExecutionPlan
+    // =========================================================================
+
+    MultiDeviceOrchestrator::Config
+    MultiDeviceOrchestrator::Config::fromPlan(const RankExecutionPlan &plan)
+    {
+        Config config;
+
+        // Runtime fields from pre-parsed RuntimeConfig
+        config.max_seq_len = plan.runtime.max_seq_len;
+        config.batch_size = plan.runtime.batch_size;
+        config.activation_precision = plan.runtime.activation_precision;
+        config.kv_cache_precision = plan.runtime.kv_cache_precision;
+
+        if (plan.usesLocalPP())
+        {
+            // PP mode: build stage configs from plan boundaries
+            config.mode = ParallelismMode::PP;
+
+            const auto &pp_devices = plan.local_pp_devices;
+            const auto &boundaries = plan.local_pp_layer_boundaries;
+
+            for (size_t i = 0; i < pp_devices.size(); ++i)
+            {
+                PPStageConfig stage_cfg;
+                stage_cfg.first_layer = boundaries[i];
+                stage_cfg.last_layer = boundaries[i + 1]; // exclusive
+                stage_cfg.has_embedding = (i == 0);
+                stage_cfg.has_lm_head = (i == pp_devices.size() - 1);
+                stage_cfg.stage_devices = {pp_devices[i]};
+
+                // Cross-vendor detection for BAR-backed hidden state transfer
+                if (i + 1 < pp_devices.size() &&
+                    pp_devices[i].device_type != pp_devices[i + 1].device_type)
+                {
+                    stage_cfg.requires_bar_backed_hidden = true;
+                }
+
+                config.pp_stages.push_back(std::move(stage_cfg));
+            }
+        }
+        else
+        {
+            // TP mode: copy devices, weights, backend
+            config.devices = plan.local_tp_devices;
+            if (!plan.local_tp_weights.empty())
+            {
+                config.weights = plan.local_tp_weights;
+            }
+            config.backend = plan.local_tp_backend;
+        }
+
+        return config;
+    }
+
+    // =========================================================================
     // Factory Methods
     // =========================================================================
 
@@ -244,7 +301,8 @@ namespace llaminar2
 
     MultiDeviceOrchestrator::MultiDeviceOrchestrator(
         std::shared_ptr<IModelContext> model_ctx,
-        const Config &config)
+        const Config &config,
+        std::unique_ptr<ILocalTPContext> tp_ctx)
         : model_ctx_(std::move(model_ctx)), config_(config)
     {
         if (!config_.validate())
@@ -255,78 +313,67 @@ namespace llaminar2
         // Initialize stage sharding map from model architecture
         stage_sharding_map_ = SchemaFactoryRegistry::getStageShardingConfig(model_ctx_->architecture());
 
-        // Determine effective parallelism mode
-        mode_ = config_.effectiveMode();
-
-        LOG_INFO("MultiDeviceOrchestrator: Creating with mode="
-                 << (mode_ == ParallelismMode::TP ? "TP" : mode_ == ParallelismMode::PP ? "PP"
-                                                                                        : "TP_PP")
-                 << ", backend=" << static_cast<int>(config_.backend));
-
-        if (mode_ == ParallelismMode::TP)
+        if (tp_ctx)
         {
-            // Pure TP mode - create LOCAL TP context from config
-            tp_ctx_ = createLocalTPContext(
-                config_.devices,
-                config_.getNormalizedWeights(),
-                config_.backend);
+            // Pre-existing TP context provided — force TP mode
+            tp_ctx_ = std::move(tp_ctx);
+            mode_ = ParallelismMode::TP;
 
-            if (!tp_ctx_)
-            {
-                throw std::runtime_error("Failed to create LOCAL TP context");
-            }
-
-            // Validate TP degree
             if (tp_ctx_->degree() < 2)
             {
                 LOG_WARN("MultiDeviceOrchestrator: TP degree is " << tp_ctx_->degree()
                                                                   << ", multi-device orchestration may not be beneficial");
             }
 
-            // Initialize device runners for TP mode
+            LOG_INFO("MultiDeviceOrchestrator: Creating with pre-existing TP context, "
+                     << tp_ctx_->degree() << " devices");
+
             initializeDeviceRunners();
 
-            LOG_INFO("MultiDeviceOrchestrator: Initialized TP mode with " << device_runners_.size() << " device runners");
+            LOG_INFO("MultiDeviceOrchestrator: Initialized with " << device_runners_.size() << " device runners");
         }
         else
         {
-            // PP or TP_PP mode - create PP context and stage runners
-            initializePPDeviceRunners();
-            initializePPContext();
+            // Auto-detect mode from config
+            mode_ = config_.effectiveMode();
 
-            LOG_INFO("MultiDeviceOrchestrator: Initialized PP mode with " << config_.pp_stages.size() << " stages");
+            LOG_INFO("MultiDeviceOrchestrator: Creating with mode="
+                     << (mode_ == ParallelismMode::TP ? "TP" : mode_ == ParallelismMode::PP ? "PP"
+                                                                                            : "TP_PP")
+                     << ", backend=" << static_cast<int>(config_.backend));
+
+            if (mode_ == ParallelismMode::TP)
+            {
+                // Pure TP mode - create LOCAL TP context from config
+                tp_ctx_ = createLocalTPContext(
+                    config_.devices,
+                    config_.getNormalizedWeights(),
+                    config_.backend);
+
+                if (!tp_ctx_)
+                {
+                    throw std::runtime_error("Failed to create LOCAL TP context");
+                }
+
+                if (tp_ctx_->degree() < 2)
+                {
+                    LOG_WARN("MultiDeviceOrchestrator: TP degree is " << tp_ctx_->degree()
+                                                                      << ", multi-device orchestration may not be beneficial");
+                }
+
+                initializeDeviceRunners();
+
+                LOG_INFO("MultiDeviceOrchestrator: Initialized TP mode with " << device_runners_.size() << " device runners");
+            }
+            else
+            {
+                // PP or TP_PP mode - create PP context and stage runners
+                initializePPDeviceRunners();
+                initializePPContext();
+
+                LOG_INFO("MultiDeviceOrchestrator: Initialized PP mode with " << config_.pp_stages.size() << " stages");
+            }
         }
-    }
-
-    MultiDeviceOrchestrator::MultiDeviceOrchestrator(
-        std::shared_ptr<IModelContext> model_ctx,
-        std::unique_ptr<ILocalTPContext> tp_ctx,
-        const Config &config)
-        : model_ctx_(std::move(model_ctx)), tp_ctx_(std::move(tp_ctx)), config_(config),
-          mode_(ParallelismMode::TP) // Pre-existing TP context implies TP mode
-    {
-        if (!tp_ctx_)
-        {
-            throw std::invalid_argument("tp_ctx cannot be null");
-        }
-
-        // Initialize stage sharding map from model architecture
-        stage_sharding_map_ = SchemaFactoryRegistry::getStageShardingConfig(model_ctx_->architecture());
-
-        // Validate TP degree
-        if (tp_ctx_->degree() < 2)
-        {
-            LOG_WARN("MultiDeviceOrchestrator: TP degree is " << tp_ctx_->degree()
-                                                              << ", multi-device orchestration may not be beneficial");
-        }
-
-        LOG_INFO("MultiDeviceOrchestrator: Creating with pre-existing TP context, "
-                 << tp_ctx_->degree() << " devices");
-
-        // Initialize device runners
-        initializeDeviceRunners();
-
-        LOG_INFO("MultiDeviceOrchestrator: Initialized with " << device_runners_.size() << " device runners");
     }
 
     // Private constructor for createForTest

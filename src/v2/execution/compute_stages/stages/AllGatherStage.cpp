@@ -9,6 +9,7 @@
 
 #include "AllGatherStage.h"
 #include "../ComputeStageUtils.h"
+#include "../../../memory/StageBufferContract.h"
 #include "../../../execution/local_execution/collective/CollectiveContext.h"
 #include "../../../collective/ICollectiveBackend.h"
 #include "../../../utils/DebugEnv.h"
@@ -392,6 +393,16 @@ namespace llaminar2
         info.addScalarInt("actual_seq_len", static_cast<int>(params_.actual_seq_len));
 
         return info;
+    }
+
+    StageBufferContract AllGatherStage::bufferContract() const
+    {
+        if (!params_.input_buffer_id || !params_.output_buffer_id)
+            return {};
+
+        return StageBufferContract::build()
+            .addInput(*params_.input_buffer_id)
+            .addOutput(*params_.output_buffer_id);
     }
 
 } // namespace llaminar2

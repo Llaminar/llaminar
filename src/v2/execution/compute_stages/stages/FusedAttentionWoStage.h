@@ -7,6 +7,9 @@
 
 #include "../IComputeStage.h"
 #include "../StageParamsBase.h"
+#include "../../../memory/BufferId.h"
+
+#include <optional>
 #include <memory>
 
 namespace llaminar2
@@ -90,6 +93,12 @@ namespace llaminar2
             // Shape: [kv_len * n_kv_heads] when non-null
             // For prefill: fresh K vectors; for decode: comes from KV cache
             const float *K_head_scales = nullptr;
+
+            // Optional BufferIds for contract-based coherence
+            std::optional<BufferId> q_buffer_id;
+            std::optional<BufferId> k_buffer_id;
+            std::optional<BufferId> v_buffer_id;
+            std::optional<BufferId> output_buffer_id;
         };
 
         explicit FusedAttentionWoStage(Params params);
@@ -102,6 +111,7 @@ namespace llaminar2
         bool isGraphCapturable() const override { return false; } // position_offset changes each step
         StageDumpInfo buildDumpInfoImpl() const override;
         StageBufferRequirements getBufferRequirements() const override;
+        StageBufferContract bufferContract() const override;
         verification::LayoutExpectation getLayoutExpectation() const override;
 
         void updateDynamicParams(int pos_offset, int seq_len) override

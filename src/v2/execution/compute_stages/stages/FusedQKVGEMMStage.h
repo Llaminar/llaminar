@@ -8,6 +8,9 @@
 #include "../IComputeStage.h"
 #include "../IWorkspaceConsumerStage.h"
 #include "../StageParamsBase.h"
+#include "../../../memory/BufferId.h"
+
+#include <optional>
 
 namespace llaminar2
 {
@@ -58,6 +61,12 @@ namespace llaminar2
             ITensor *output_v = nullptr;
             int n_v = 0;
             const TensorBase *bias_v = nullptr; ///< Optional bias tensor for tensor-aware GPU path
+
+            // Optional BufferIds for contract-based coherence
+            std::optional<BufferId> input_buffer_id;
+            std::optional<BufferId> output_q_buffer_id;
+            std::optional<BufferId> output_k_buffer_id;
+            std::optional<BufferId> output_v_buffer_id;
         };
 
         explicit FusedQKVGEMMStage(Params params);
@@ -69,6 +78,7 @@ namespace llaminar2
         bool supportsBackend(ComputeBackendType backend) const override;
         StageDumpInfo buildDumpInfoImpl() const override;
         StageBufferRequirements getBufferRequirements() const override;
+        StageBufferContract bufferContract() const override;
 
         // =================================================================
         // IWorkspaceConsumerStage Implementation

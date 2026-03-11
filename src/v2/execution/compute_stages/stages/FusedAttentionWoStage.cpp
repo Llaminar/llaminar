@@ -1008,4 +1008,21 @@ namespace llaminar2
             params_.n_kv_heads);
     }
 
+    StageBufferContract FusedAttentionWoStage::bufferContract() const
+    {
+        if (!params_.q_buffer_id || !params_.output_buffer_id)
+            return {};
+
+        auto contract = StageBufferContract::build()
+                            .addOutput(*params_.output_buffer_id);
+
+        contract.addInput(*params_.q_buffer_id);
+        if (params_.k_buffer_id)
+            contract.addInput(*params_.k_buffer_id);
+        if (params_.v_buffer_id)
+            contract.addInput(*params_.v_buffer_id);
+
+        return contract;
+    }
+
 } // namespace llaminar2

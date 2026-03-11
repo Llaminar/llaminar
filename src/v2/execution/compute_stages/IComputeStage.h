@@ -31,6 +31,7 @@
 #include "../../tensors/BlockStructures.h"
 #include "../../tensors/TensorKernels.h"
 #include "../../utils/MPITopology.h"
+#include "../../memory/StageBufferContract.h"
 
 namespace llaminar2
 {
@@ -443,6 +444,36 @@ namespace llaminar2
         }
 
         /**
+         * @brief Get the declarative buffer contract for this stage.
+         *
+         * Returns which arena-managed buffers this stage reads, writes, and
+         * uses in-place, plus direct weight tensor pointers. The executor
+         * uses this contract (instead of StageDumpInfo) to drive coherence:
+         *
+         *   1. For each input binding: arena.prepareForRead(id, device)
+         *   2. For each weight tensor: tensor->ensureOnDevice(device)
+         *   3. For each output binding: arena.prepareForWrite(id, device)
+         *   4. stage->execute(ctx)
+         *   5. For each output/inout: arena.markWritten(id, device, stream)
+         *
+         * Default returns empty contract (not yet migrated). Stages opt-in
+         * by overriding this and returning a non-empty contract.
+         *
+         * Design notes:
+         *   - Activations use BufferId keys (arena-managed)
+         *   - Weights use direct ITensor* (external, read-only)
+         *   - KV caches are out of scope (managed by IKVCache)
+         *   - Effective dimensions (M in GEMM) are stage-internal
+         *   - updateDynamicParams/onGraphReplayed remain orthogonal
+         *
+         * @return StageBufferContract (empty if not migrated)
+         */
+        virtual StageBufferContract bufferContract() const
+        {
+            return StageBufferContract{};
+        }
+
+        /**
          * @brief Get layout expectation for automatic validation
          *
          * If a stage returns a non-empty LayoutExpectation, the DeviceGraphExecutor
@@ -632,6 +663,36 @@ namespace llaminar2
          *       the TensorVerification framework to work correctly.
          */
         virtual StageDumpInfo buildDumpInfoImpl() const = 0;
+
+        /**
+         * @brief Build partial StageDumpInfo from this stage's bufferContract().
+         *
+         * Populates the weight entries from the contract's weight_tensors list.
+         * Stages that implement bufferContract() can call this in their
+         * buildDumpInfoImpl() and then append inputs/outputs with dynamic dims:
+         *
+         * @code
+         * StageDumpInfo buildDumpInfoImpl() const override {
+         *     auto info = buildDumpInfoFromContract();
+         *     info.addInput("hidden_state", hidden_state_, M, K);
+         *     info.addOutput("output", output_, M, N);
+         *     return info;
+         * }
+         * @endcode
+         */
+        StageDumpInfo buildDumpInfoFromContract() const
+        {
+            StageDumpInfo info;
+            const auto contract = bufferContract();
+            for (size_t i = 0; i < contract.weight_tensors.size(); ++i)
+            {
+                const ITensor *w = contract.weight_tensors[i];
+                if (w)
+                    info.addWeight("weight", w);
+            }
+            return info;
+        }
+
         // =========================================================================
         // Tracing Infrastructure (for debugging/profiling)
         // =========================================================================

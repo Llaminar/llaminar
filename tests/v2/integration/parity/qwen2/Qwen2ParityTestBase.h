@@ -422,7 +422,7 @@ namespace llaminar2::test::parity::qwen2
                 }
 
                 auto orch = std::make_unique<MultiDeviceOrchestrator>(
-                    model_ctx, std::move(tp_ctx), mdo_config);
+                    model_ctx, mdo_config, std::move(tp_ctx));
 
                 return orch;
             };
@@ -1145,7 +1145,7 @@ namespace llaminar2::test::parity::qwen2
             orch_config.batch_size = 1;
 
             multi_orch_ = std::make_unique<MultiDeviceOrchestrator>(
-                model_ctx_, std::move(tp_ctx), orch_config);
+                model_ctx_, orch_config, std::move(tp_ctx));
 
             if (!multi_orch_)
             {

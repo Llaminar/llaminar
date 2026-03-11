@@ -321,214 +321,85 @@ namespace llaminar2
     }
 
     /**
-     * @brief Runtime configuration for pipeline initialization
+     * @brief Parse ActivationPrecision from string
+     * @param value Precision name ("fp32", "bf16", "fp16", "q8_1", "q16_1", "hybrid", "hybridq16")
+     * @return Corresponding enum value, or FP32 if unrecognized
+     */
+    inline ActivationPrecision parseActivationPrecision(const std::string &value)
+    {
+        std::string lower = value;
+        std::transform(lower.begin(), lower.end(), lower.begin(),
+                       [](unsigned char c)
+                       { return static_cast<char>(std::tolower(c)); });
+
+        if (lower == "bf16")
+            return ActivationPrecision::BF16;
+        if (lower == "fp16")
+            return ActivationPrecision::FP16;
+        if (lower == "q8_1")
+            return ActivationPrecision::Q8_1;
+        if (lower == "q16_1")
+            return ActivationPrecision::Q16_1;
+        if (lower == "hybrid")
+            return ActivationPrecision::Hybrid;
+        if (lower == "hybridq16")
+            return ActivationPrecision::HybridQ16;
+        return ActivationPrecision::FP32;
+    }
+
+    /**
+     * @brief Canonical runtime configuration carried through the config chain
      *
-     * This struct separates runtime configuration (user-specified parameters)
-     * from model architecture (GGUF metadata) and device placement (WeightPlacementMap).
+     * RuntimeConfig holds pre-parsed runtime parameters that flow from
+     * CLI/YAML (OrchestrationConfig) through the execution plan into
+     * per-device runner configs. Fields are parsed once during plan
+     * building and carried as typed values thereafter.
      *
-     * Design rationale:
-     * - ModelContext: Model file metadata (immutable, from GGUF)
-     * - WeightPlacementMap: Device placement decisions (Phase 4)
-     * - RuntimeConfig: Runtime behavior settings (this struct)
-     *
-     * This separation follows V2's philosophy of clear ownership and composability.
+     * The config chain: OrchestrationConfig (raw strings)
+     *   → ExecutionPlanBuilder parses once → RankExecutionPlan.runtime
+     *     → MDO::Config / InferenceRunnerConfig read from it
+     *       → GraphConfig consumes the values
      */
     struct RuntimeConfig
     {
-        /**
-         * @brief Maximum sequence length for inference
-         *
-         * Determines buffer allocation size for:
-         * - KV cache: n_layers × max_seq_len × n_kv_heads × head_dim
-         * - Activation buffers: max_seq_len × d_model (various stages)
-         *
-         * Typical values:
-         * - 512: Short conversations, low memory
-         * - 2048: Standard conversations (default)
-         * - 4096: Long context
-         * - 8192+: Extended context models
-         *
-         * Note: Actual sequence can be shorter, but cannot exceed this limit.
-         */
+        /// Maximum sequence length (buffer allocation sizing)
         int max_seq_len = 2048;
 
-        /**
-         * @brief Number of OpenMP threads for CPU operations
-         *
-         * -1 = auto-detect (use all available cores)
-         * 0 = single-threaded
-         * >0 = explicit thread count
-         *
-         * Note: Ignored for GPU operations
-         */
-        int n_threads = -1;
-
-        /**
-         * @brief Batch size for batched inference
-         *
-         * Future extension for batched processing (not yet implemented in V2).
-         * Currently must be 1.
-         */
+        /// Batch size (currently must be 1)
         int batch_size = 1;
 
-        /**
-         * @brief Enable memory-mapped file access for weights
-         *
-         * true = mmap weights (lower memory, slower first access)
-         * false = load all weights to RAM (higher memory, faster access)
-         */
-        bool use_mmap = true;
-
-        /**
-         * @brief Random seed for sampling
-         *
-         * -1 = random seed (time-based)
-         * ≥0 = deterministic seed for reproducibility
-         */
-        int seed = -1;
-
-        /**
-         * @brief Activation buffer format
-         *
-         * Determines the format for all activation buffers in DRAM:
-         * - Hidden states between layers
-         * - KV cache entries
-         * - Residual buffers
-         * - Intermediate computation results
-         *
-         * Memory per element:
-         * - FP32: 4.0 bytes (highest accuracy)
-         * - BF16: 2.0 bytes (Intel AMX optimization)
-         * - FP16: 2.0 bytes (ARM/GPU optimization)
-         * - Q8_1: 1.125 bytes (36 bytes per 32 elements, maximum compression)
-         *
-         * Kernels handle format conversion internally. This setting only
-         * affects how data is stored in DRAM between kernel invocations.
-         *
-         * Default: FP32 (standard baseline)
-         */
+        /// Activation buffer precision
         ActivationPrecision activation_precision = ActivationPrecision::FP32;
 
-        /**
-         * @brief Enable fused attention + Wo projection kernel
-         *
-         * When enabled, replaces the separate attention + Wo GEMM calls with
-         * a single fused kernel that:
-         * 1. Eliminates the context quantization round-trip (FP32 → Q8_1 → FP32)
-         * 2. Improves cache locality (context stays in registers through projection)
-         * 3. Reduces memory bandwidth (single pass over V and Wo)
-         *
-         * Requirements:
-         * - Q8_1 activation precision (activation_precision == Q8_1)
-         * - Will fall back to unfused path if requirements not met
-         *
-         * Performance impact:
-         * - ~10-15% faster attention computation (fewer memory passes)
-         * - ~5% better numerical accuracy (eliminates one quantization step)
-         *
-         * Default: false (use proven unfused path)
-         */
-        bool use_fused_attention = false;
-
-        /**
-         * @brief Fused attention execution backend
-         *
-         * Selects which implementation to use when use_fused_attention=true:
-         * - JIT (default): AVX-512 VNNI optimized, fastest
-         * - REFERENCE: Pure C++ implementation, for testing
-         * - TILED: Cache-blocked implementation, good balance
-         *
-         * Only affects fused attention path; ignored if use_fused_attention=false.
-         */
+        /// Fused attention backend selection
         FusedAttentionBackend fused_attention_backend = FusedAttentionBackend::JIT;
 
-        /**
-         * @brief Fixed scale for Q16_1 KV cache quantization
-         *
-         * Defines the FP32 range that maps to INT16 [-32767, +32767]:
-         * - 8.0f (default): ±8.0 range, good for most models
-         * - 4.0f: ±4.0 range, 2× better precision for smaller activations
-         *
-         * The scale is "fixed" meaning all K/V values across the entire inference
-         * session use this scale. This avoids the "growing scale" problem where
-         * new tokens with larger activations would require re-quantizing the
-         * entire KV cache.
-         *
-         * Use the KV activation profiling tool to determine optimal scale:
-         *   python python/tools/profile_kv_activations.py --model <model.gguf>
-         *
-         * Typical activation ranges by model:
-         * - Post-RMSNorm: typically [-3.0, 3.0]
-         * - Post-QKV projection: typically [-5.0, 5.0]
-         * - Default 8.0 provides ~60% headroom over typical maximums
-         *
-         * @note Only applies when activation_precision is HybridQ16.
-         * @see VNNISafetyConstants.h for VNNI overflow limits
-         */
-        float kv_cache_scale = 256.0f; ///< Fixed Q16 scale. Must cover Q projection max (~130 for Qwen2)
+        /// Fixed scale for Q16_1 KV cache quantization
+        float kv_cache_scale = 256.0f;
 
-        /// Explicit KV cache storage precision mode (AUTO preserves existing behavior)
+        /// Explicit KV cache precision (AUTO defaults to FP16)
         KVCachePrecision kv_cache_precision = KVCachePrecision::AUTO;
 
-        // ===== Multi-Device Executor Feature Flags (Incremental Rollout) =====
-
-        /**
-         * @brief Enable LayerExecutor for FFN RMSNorm operations
-         *
-         * When enabled, FFN pre-normalization uses the new LayerExecutor framework
-         * for multi-device work distribution. Default disabled for safety.
-         */
-        bool executor_ffn_norm = false;
-
-        /**
-         * @brief Enable LayerExecutor for FFN SwiGLU operations
-         *
-         * When enabled, SwiGLU activation uses the new LayerExecutor framework.
-         * Default disabled for safety.
-         */
-        bool executor_ffn_swiglu = false;
-
-        /**
-         * @brief Enable LayerExecutor for FFN residual add operations
-         *
-         * When enabled, FFN residual connections use the new LayerExecutor framework.
-         * Default disabled for safety.
-         */
-        bool executor_ffn_residual = false;
-
-        /**
-         * @brief Enable LayerExecutor for attention RMSNorm operations
-         *
-         * When enabled, pre-attention RMSNorm uses the new LayerExecutor framework.
-         * Default disabled for safety.
-         */
-        bool executor_attn_norm = false;
-
-        /**
-         * @brief Enable LayerExecutor for attention residual add operations
-         *
-         * When enabled, attention residual connections use the new LayerExecutor framework.
-         * Default disabled for safety.
-         */
-        bool executor_attn_residual = false;
-
-        /**
-         * @brief Enable LayerExecutor for RoPE operations
-         *
-         * When enabled, RoPE positional encoding uses the new LayerExecutor framework.
-         * Default disabled for safety.
-         */
-        bool executor_rope = false;
-
-        /**
-         * @brief Default constructor with standard settings
-         */
         RuntimeConfig() = default;
 
-        /**
-         * @brief Construct with explicit max_seq_len (common case)
-         */
         explicit RuntimeConfig(int max_seq_len_) : max_seq_len(max_seq_len_) {}
+
+        /**
+         * @brief Create RuntimeConfig by parsing raw strings from OrchestrationConfig
+         */
+        static RuntimeConfig fromOrchestrationConfig(
+            int max_seq_len,
+            const std::string &activation_precision_str,
+            const std::string &kv_cache_precision_str,
+            FusedAttentionBackend fused_backend = FusedAttentionBackend::JIT)
+        {
+            RuntimeConfig rc;
+            rc.max_seq_len = max_seq_len;
+            rc.activation_precision = parseActivationPrecision(activation_precision_str);
+            rc.kv_cache_precision = parseKVCachePrecision(kv_cache_precision_str);
+            rc.fused_attention_backend = fused_backend;
+            return rc;
+        }
     };
 
     /**

@@ -57,6 +57,12 @@
 #include <vector>
 #include <string>
 
+// Forward declaration for fromPlan() factory method
+namespace llaminar2
+{
+    struct RankExecutionPlan;
+}
+
 namespace llaminar2
 {
 
@@ -286,6 +292,23 @@ namespace llaminar2
              * @return Layer boundary indices
              */
             std::vector<int> buildLayerBoundaries() const;
+
+            /**
+             * @brief Canonical factory: build Config from a RankExecutionPlan
+             *
+             * Handles both TP and PP modes:
+             * - TP: Copies devices, weights, backend from plan.local_tp_*
+             * - PP: Sets mode=PP, builds PPStageConfig entries from
+             *       plan.local_pp_devices + plan.local_pp_layer_boundaries
+             *       with cross-vendor BAR detection
+             *
+             * Runtime fields (max_seq_len, activation_precision, etc.) come
+             * from plan.runtime which was pre-parsed in ExecutionPlanBuilder.
+             *
+             * @param plan The rank execution plan
+             * @return Populated Config
+             */
+            static Config fromPlan(const RankExecutionPlan &plan);
         };
 
         // =====================================================================
@@ -330,28 +353,17 @@ namespace llaminar2
          * @brief Construct with model context and configuration
          *
          * Creates device runners and TP context based on configuration.
+         * If a pre-existing TP context is provided, uses it directly (TP mode).
+         * Otherwise, auto-detects mode from config and creates TP context if needed.
          *
          * @param model_ctx Model context with weights and metadata
          * @param config Multi-device configuration
+         * @param tp_ctx Optional pre-constructed LOCAL TP context (ownership transferred)
          */
         MultiDeviceOrchestrator(
             std::shared_ptr<IModelContext> model_ctx,
-            const Config &config);
-
-        /**
-         * @brief Construct with pre-existing TP context
-         *
-         * Uses provided TP context instead of creating one from config.
-         * Useful when sharing TP context across multiple orchestrators.
-         *
-         * @param model_ctx Model context with weights and metadata
-         * @param tp_ctx Pre-constructed LOCAL TP context (ownership transferred)
-         * @param config Multi-device configuration (devices/weights from tp_ctx take precedence)
-         */
-        MultiDeviceOrchestrator(
-            std::shared_ptr<IModelContext> model_ctx,
-            std::unique_ptr<ILocalTPContext> tp_ctx,
-            const Config &config);
+            const Config &config,
+            std::unique_ptr<ILocalTPContext> tp_ctx = nullptr);
 
         /// Destructor
         ~MultiDeviceOrchestrator() override;

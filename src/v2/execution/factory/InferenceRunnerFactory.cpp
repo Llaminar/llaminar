@@ -265,6 +265,184 @@ namespace llaminar2
     }
 
     // =========================================================================
+    // Helper: Apply PROPORTIONAL GLOBAL TP assignment to graph config
+    // =========================================================================
+
+    /**
+     * @brief Apply proportional TP assignment from TensorParallelConfig
+     *
+     * Used for heterogeneous GLOBAL TP (e.g., NVIDIA 73% + AMD 27%).
+     * Gets per-rank DeviceShardingAssignment from the TensorParallelConfig.
+     *
+     * @param graph_config Config to modify with TP dimensions
+     * @param tp_config Tensor parallel configuration with per-device assignments
+     * @param current_rank MPI rank index for assignment lookup
+     */
+    static void applyProportionalGlobalTPAssignment(
+        GraphConfig &graph_config,
+        const TensorParallelConfig *tp_config,
+        int current_rank)
+    {
+        const DeviceShardingAssignment &assignment = tp_config->forRank(current_rank);
+
+        // Store config and rank in graph_config for downstream use
+        graph_config.tp_config = std::make_shared<TensorParallelConfig>(*tp_config);
+        graph_config.local_rank = current_rank;
+
+        // QKV head assignment
+        graph_config.head_start = assignment.head_start;
+        graph_config.local_n_heads = assignment.head_count;
+        graph_config.local_n_kv_heads = assignment.kv_head_count;
+        graph_config.qkv_column_parallel = true;
+
+        // FFN dimension assignment
+        graph_config.d_ff_local = assignment.d_ff_count;
+        graph_config.ffn_column_parallel = true;
+
+        // Vocab/LM head assignment
+        graph_config.vocab_local = assignment.vocab_count;
+        graph_config.lm_head_column_parallel = true;
+
+        LOG_INFO("[InferenceRunner] Using TensorParallelConfig (proportional split): "
+                 << "rank=" << current_rank << "/" << tp_config->worldSize()
+                 << " device=" << assignment.device.to_string()
+                 << " work_fraction=" << (assignment.work_fraction * 100.0f) << "%");
+        LOG_DEBUG("[InferenceRunner] QKV: head_start=" << graph_config.head_start
+                                                       << " local_n_heads=" << graph_config.local_n_heads << "/" << graph_config.n_heads
+                                                       << " local_n_kv_heads=" << graph_config.local_n_kv_heads << "/" << graph_config.n_kv_heads);
+        LOG_DEBUG("[InferenceRunner] FFN: d_ff_local=" << graph_config.d_ff_local << "/" << graph_config.d_ff);
+        LOG_DEBUG("[InferenceRunner] LMHead: vocab_local=" << graph_config.vocab_local << "/" << graph_config.vocab_size);
+    }
+
+    // =========================================================================
+    // Helper: Apply EQUAL-SPLIT GLOBAL TP assignment to graph config
+    // =========================================================================
+
+    /**
+     * @brief Apply equal 1/world_size TP split via MPI context
+     *
+     * Used for homogeneous GLOBAL TP where all ranks get equal work.
+     * Validates that FFN and vocab dimensions are evenly divisible.
+     *
+     * @param graph_config Config to modify with TP dimensions
+     * @param mpi_ctx MPI context with rank/world_size info
+     * @return true if assignment succeeded, false if dimensions not divisible
+     */
+    static bool applyEqualSplitGlobalTPAssignment(
+        GraphConfig &graph_config,
+        const std::shared_ptr<MPIContext> &mpi_ctx)
+    {
+        const int current_rank = mpi_ctx->rank();
+        const int world_size = mpi_ctx->world_size();
+
+        // Compute local head distribution
+        auto [q_head_start, local_n_q_heads] = mpi_ctx->get_local_slice(
+            static_cast<size_t>(graph_config.n_heads));
+        auto [kv_head_start, local_n_kv_h] = mpi_ctx->get_local_slice(
+            static_cast<size_t>(graph_config.n_kv_heads));
+
+        graph_config.head_start = static_cast<int>(q_head_start);
+        graph_config.local_n_heads = static_cast<int>(local_n_q_heads);
+        graph_config.local_n_kv_heads = static_cast<int>(local_n_kv_h);
+        graph_config.qkv_column_parallel = true;
+        graph_config.local_rank = current_rank;
+
+        LOG_DEBUG("[InferenceRunner] QKV Column-Parallel enabled (equal split): "
+                  << "head_start=" << graph_config.head_start
+                  << ", local_n_heads=" << graph_config.local_n_heads << "/" << graph_config.n_heads
+                  << ", local_n_kv_heads=" << graph_config.local_n_kv_heads << "/" << graph_config.n_kv_heads
+                  << " (rank " << current_rank << "/" << world_size << ")");
+
+        // FFN dimension (equal split)
+        if (graph_config.d_ff % world_size != 0)
+        {
+            LOG_ERROR("[InferenceRunner] d_ff (" << graph_config.d_ff
+                                                 << ") not divisible by world_size (" << world_size << ")");
+            return false;
+        }
+        graph_config.d_ff_local = graph_config.d_ff / world_size;
+        graph_config.ffn_column_parallel = true;
+
+        LOG_DEBUG("[InferenceRunner] FFN Column-Parallel enabled (equal split): "
+                  << "d_ff_local=" << graph_config.d_ff_local << "/" << graph_config.d_ff
+                  << " (rank " << current_rank << "/" << world_size << ")");
+
+        // Vocab/LM head (equal split)
+        if (graph_config.vocab_size % world_size != 0)
+        {
+            LOG_ERROR("[InferenceRunner] vocab_size (" << graph_config.vocab_size
+                                                       << ") not divisible by world_size (" << world_size << ")");
+            return false;
+        }
+        graph_config.vocab_local = graph_config.vocab_size / world_size;
+        graph_config.lm_head_column_parallel = true;
+
+        LOG_DEBUG("[InferenceRunner] LM Head Column-Parallel enabled (equal split): "
+                  << "vocab_local=" << graph_config.vocab_local << "/" << graph_config.vocab_size
+                  << " (rank " << current_rank << "/" << world_size << ")");
+
+        return true;
+    }
+
+    // =========================================================================
+    // Helper: Select and apply TP assignment strategy
+    // =========================================================================
+
+    /**
+     * @brief Select and apply the appropriate TP assignment to GraphConfig
+     *
+     * Precedence (highest to lowest):
+     *   1. LOCAL TP — single rank, multiple devices via ILocalTPContext
+     *   2. Proportional GLOBAL TP — heterogeneous multi-rank via TensorParallelConfig
+     *   3. Equal-split GLOBAL TP — homogeneous multi-rank via MPI equal slicing
+     *   4. No TP — single rank or replicated weights, use full dimensions
+     *
+     * @return true if assignment succeeded, false on error
+     */
+    static bool applyTPAssignment(
+        GraphConfig &graph_config,
+        ILocalTPContext *local_tp_ctx,
+        int local_tp_device_idx,
+        const TensorParallelConfig *tp_config,
+        const std::shared_ptr<MPIContext> &mpi_ctx,
+        bool weights_sharded)
+    {
+        // LOCAL TP activation: also activate if tp_config is set on WeightManager,
+        // which indicates MDO configured it for TP weight slicing within a PP stage
+        const bool local_tp_weights_configured = tp_config != nullptr;
+
+        if (local_tp_ctx && local_tp_ctx->degree() > 1 && (weights_sharded || local_tp_weights_configured))
+        {
+            return applyLocalTPAssignment(graph_config, local_tp_ctx, local_tp_device_idx);
+        }
+
+        if (tp_config && weights_sharded)
+        {
+            const int current_rank = mpi_ctx ? mpi_ctx->rank() : 0;
+            applyProportionalGlobalTPAssignment(graph_config, tp_config, current_rank);
+            return true;
+        }
+
+        if (mpi_ctx && mpi_ctx->world_size() > 1 && weights_sharded)
+        {
+            return applyEqualSplitGlobalTPAssignment(graph_config, mpi_ctx);
+        }
+
+        // No TP — use full dimensions
+        setFullDimensions(graph_config);
+
+        if (mpi_ctx && mpi_ctx->world_size() > 1 && !weights_sharded)
+        {
+            LOG_WARN("[InferenceRunner] MPI world_size > 1 but weights are REPLICATED, "
+                     << "not SHARDED. Using full buffer sizes (no tensor parallelism). "
+                     << "Pass WeightDistributionStrategy::SHARDED to ModelContext::create() "
+                     << "to enable tensor parallelism.");
+        }
+
+        return true;
+    }
+
+    // =========================================================================
     // Helper: Preload, pack, and upload weights to target device
     // =========================================================================
 
@@ -484,131 +662,11 @@ namespace llaminar2
 
         // Check if TensorParallelConfig is available from WeightManager (for GLOBAL TP)
         const TensorParallelConfig *tp_config = weight_mgr ? weight_mgr->tensorParallelConfig() : nullptr;
-        const int current_rank = mpi_ctx ? mpi_ctx->rank() : 0;
 
-        // =====================================================================
-        // LOCAL TP ACTIVATION FIX (TP domain within PP stage)
-        // =====================================================================
-        // When a PP stage is a TP domain (multiple devices), the nested MDO:
-        // 1. Creates stage_ctx with LAYER_PARTITIONED strategy (for PP layer filtering)
-        // 2. Sets TensorParallelConfig on the WeightManager (for TP weight slicing)
-        // 3. Passes local_tp_ctx via runner config
-        //
-        // The original check `weights_sharded` fails because strategy is LAYER_PARTITIONED.
-        // Instead, we should activate LOCAL TP if tp_config is set on WeightManager,
-        // which indicates MDO configured it for TP weight slicing.
-        // =====================================================================
-        const bool local_tp_weights_configured = tp_config != nullptr;
-
-        if (local_tp_ctx && local_tp_ctx->degree() > 1 && (weights_sharded || local_tp_weights_configured))
+        if (!applyTPAssignment(graph_config, local_tp_ctx, local_tp_device_idx,
+                               tp_config, mpi_ctx, weights_sharded))
         {
-            // =====================================================================
-            // LOCAL TP: Single rank with multiple devices via ILocalTPContext
-            // =====================================================================
-            if (!applyLocalTPAssignment(graph_config, local_tp_ctx, local_tp_device_idx))
-            {
-                return nullptr;
-            }
-        }
-        else if (tp_config && weights_sharded)
-        {
-            // =====================================================================
-            // Phase 1c: Use TensorParallelConfig for proportional assignment
-            // =====================================================================
-            const DeviceShardingAssignment &assignment = tp_config->forRank(current_rank);
-
-            // Store config and rank in graph_config for downstream use
-            graph_config.tp_config = std::make_shared<TensorParallelConfig>(*tp_config);
-            graph_config.local_rank = current_rank;
-
-            // QKV head assignment
-            graph_config.head_start = assignment.head_start;
-            graph_config.local_n_heads = assignment.head_count;
-            graph_config.local_n_kv_heads = assignment.kv_head_count;
-            graph_config.qkv_column_parallel = true;
-
-            // FFN dimension assignment
-            graph_config.d_ff_local = assignment.d_ff_count;
-            graph_config.ffn_column_parallel = true;
-
-            // Vocab/LM head assignment
-            graph_config.vocab_local = assignment.vocab_count;
-            graph_config.lm_head_column_parallel = true;
-
-            LOG_INFO("[InferenceRunner] Using TensorParallelConfig (proportional split): "
-                     << "rank=" << current_rank << "/" << tp_config->worldSize()
-                     << " device=" << assignment.device.to_string()
-                     << " work_fraction=" << (assignment.work_fraction * 100.0f) << "%");
-            LOG_DEBUG("[InferenceRunner] QKV: head_start=" << graph_config.head_start
-                                                           << " local_n_heads=" << graph_config.local_n_heads << "/" << graph_config.n_heads
-                                                           << " local_n_kv_heads=" << graph_config.local_n_kv_heads << "/" << graph_config.n_kv_heads);
-            LOG_DEBUG("[InferenceRunner] FFN: d_ff_local=" << graph_config.d_ff_local << "/" << graph_config.d_ff);
-            LOG_DEBUG("[InferenceRunner] LMHead: vocab_local=" << graph_config.vocab_local << "/" << graph_config.vocab_size);
-        }
-        else if (mpi_ctx && mpi_ctx->world_size() > 1 && weights_sharded)
-        {
-            // =====================================================================
-            // Legacy: Equal 1/world_size split
-            // =====================================================================
-            // Compute local head distribution
-            auto [q_head_start, local_n_q_heads] = mpi_ctx->get_local_slice(
-                static_cast<size_t>(graph_config.n_heads));
-            auto [kv_head_start, local_n_kv_h] = mpi_ctx->get_local_slice(
-                static_cast<size_t>(graph_config.n_kv_heads));
-
-            graph_config.head_start = static_cast<int>(q_head_start);
-            graph_config.local_n_heads = static_cast<int>(local_n_q_heads);
-            graph_config.local_n_kv_heads = static_cast<int>(local_n_kv_h);
-            graph_config.qkv_column_parallel = true;
-            graph_config.local_rank = current_rank;
-
-            LOG_DEBUG("[InferenceRunner] QKV Column-Parallel enabled (equal split): "
-                      << "head_start=" << graph_config.head_start
-                      << ", local_n_heads=" << graph_config.local_n_heads << "/" << graph_config.n_heads
-                      << ", local_n_kv_heads=" << graph_config.local_n_kv_heads << "/" << graph_config.n_kv_heads
-                      << " (rank " << mpi_ctx->rank() << "/" << mpi_ctx->world_size() << ")");
-
-            // FFN dimension (equal split)
-            int world_size = mpi_ctx->world_size();
-            if (graph_config.d_ff % world_size != 0)
-            {
-                LOG_ERROR("[InferenceRunner] d_ff (" << graph_config.d_ff
-                                                     << ") not divisible by world_size (" << world_size << ")");
-                throw std::runtime_error("FFN dimension not divisible by world_size for tensor parallelism");
-            }
-            graph_config.d_ff_local = graph_config.d_ff / world_size;
-            graph_config.ffn_column_parallel = true;
-
-            LOG_DEBUG("[InferenceRunner] FFN Column-Parallel enabled (equal split): "
-                      << "d_ff_local=" << graph_config.d_ff_local << "/" << graph_config.d_ff
-                      << " (rank " << mpi_ctx->rank() << "/" << world_size << ")");
-
-            // Vocab/LM head (equal split)
-            if (graph_config.vocab_size % world_size != 0)
-            {
-                LOG_ERROR("[InferenceRunner] vocab_size (" << graph_config.vocab_size
-                                                           << ") not divisible by world_size (" << world_size << ")");
-                throw std::runtime_error("Vocab size not divisible by world_size for tensor parallelism");
-            }
-            graph_config.vocab_local = graph_config.vocab_size / world_size;
-            graph_config.lm_head_column_parallel = true;
-
-            LOG_DEBUG("[InferenceRunner] LM Head Column-Parallel enabled (equal split): "
-                      << "vocab_local=" << graph_config.vocab_local << "/" << graph_config.vocab_size
-                      << " (rank " << mpi_ctx->rank() << "/" << world_size << ")");
-        }
-        else
-        {
-            // Single rank OR weights not sharded: use full dimensions (no sharding)
-            setFullDimensions(graph_config);
-
-            if (mpi_ctx && mpi_ctx->world_size() > 1 && !weights_sharded)
-            {
-                LOG_WARN("[InferenceRunner] MPI world_size > 1 but weights are REPLICATED, "
-                         << "not SHARDED. Using full buffer sizes (no tensor parallelism). "
-                         << "Pass WeightDistributionStrategy::SHARDED to ModelContext::create() "
-                         << "to enable tensor parallelism.");
-            }
+            return nullptr;
         }
 
         LOG_DEBUG("[InferenceRunner] GraphConfig: "
@@ -1705,7 +1763,7 @@ namespace llaminar2
         try
         {
             return std::make_unique<MultiDeviceOrchestrator>(
-                model_ctx, std::move(tp_ctx), config);
+                model_ctx, config, std::move(tp_ctx));
         }
         catch (const std::exception &e)
         {

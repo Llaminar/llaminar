@@ -16,6 +16,8 @@
 #include "../IComputeStage.h"
 #include "../StageParamsBase.h"
 #include "../../../config/TPDomain.h"
+#include "../../../memory/BufferId.h"
+#include <optional>
 
 namespace llaminar2
 {
@@ -47,6 +49,8 @@ namespace llaminar2
             size_t actual_seq_len = 0;
             CollectiveContext *collective_ctx = nullptr; ///< Collective context (preferred over direct MPI)
             const TPDomain *domain = nullptr;            ///< Domain for routing (nullptr = use mpi_ctx legacy path)
+            std::optional<BufferId> input_buffer_id;     ///< Arena BufferId for local_input (enables contract-based coherence)
+            std::optional<BufferId> output_buffer_id;    ///< Arena BufferId for full_output (enables contract-based coherence)
         };
 
         explicit AllGatherStage(Params params);
@@ -57,6 +61,7 @@ namespace llaminar2
         bool supportsBackend(ComputeBackendType backend) const override;
         StageBufferRequirements getBufferRequirements() const override;
         StageDumpInfo buildDumpInfoImpl() const override;
+        StageBufferContract bufferContract() const override;
 
         /// MPI stages handle their own synchronization - no automatic coherence
         CoherencePolicy coherencePolicy() const override { return CoherencePolicy::OUTPUT; }

@@ -1228,6 +1228,16 @@ add_library(llaminar2_core STATIC
     execution/local_execution/graph/PipelineParallelGraphBuilder.cpp
     # Inference dispatch (InferenceRunner decouples pipeline vs graph paths)
     execution/factory/InferenceRunnerFactory.cpp
+    # App-level components (extracted from Main.cpp)
+    app/AppLifecycle.cpp
+    app/InferenceRunnerAdapter.cpp
+    app/ChatTemplateResolver.cpp
+    app/MPIBootstrapPhase.cpp
+    app/RuntimeInitPhase.cpp
+    app/modes/InteractiveChatMode.cpp
+    app/modes/SingleShotChatMode.cpp
+    app/modes/BenchmarkMode.cpp
+    app/modes/CompletionMode.cpp
     loaders/ModelLoader.cpp
     loaders/ModelContext.cpp
     loaders/ModelContextConfig.cpp
@@ -1351,6 +1361,9 @@ add_library(llaminar2_core STATIC
     execution/local_execution/collective/CollectiveContext.cpp
     # NUMA-aware memory allocation
     memory/NUMAAllocator.cpp
+    # Buffer harmonization (Phase 1: BufferArena + CoherenceTracker)
+    memory/BufferArena.cpp
+    memory/CoherenceTracker.cpp
     # LOCAL tensor parallelism (Phase 4: multi-device within single MPI rank)
     collective/LocalTPContext.cpp
     collective/LocalPPContext.cpp

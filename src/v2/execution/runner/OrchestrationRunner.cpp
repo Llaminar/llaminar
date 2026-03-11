@@ -34,31 +34,6 @@
 namespace llaminar2
 {
 
-    namespace
-    {
-        ActivationPrecision parseActivationPrecisionString(const std::string &value)
-        {
-            std::string lower = value;
-            std::transform(lower.begin(), lower.end(), lower.begin(),
-                           [](unsigned char c)
-                           { return static_cast<char>(std::tolower(c)); });
-
-            if (lower == "bf16")
-                return ActivationPrecision::BF16;
-            if (lower == "fp16")
-                return ActivationPrecision::FP16;
-            if (lower == "q8_1")
-                return ActivationPrecision::Q8_1;
-            if (lower == "q16_1")
-                return ActivationPrecision::Q16_1;
-            if (lower == "hybrid")
-                return ActivationPrecision::Hybrid;
-            if (lower == "hybridq16")
-                return ActivationPrecision::HybridQ16;
-            return ActivationPrecision::FP32;
-        }
-    } // namespace
-
     // =========================================================================
     // Construction
     // =========================================================================
@@ -1034,35 +1009,6 @@ namespace llaminar2
         return plan_.local_tp_devices.size() > 1;
     }
 
-    MultiDeviceOrchestrator::Config OrchestrationRunner::buildMultiDeviceConfig() const
-    {
-        MultiDeviceOrchestrator::Config config;
-
-        // Copy devices from execution plan
-        config.devices = plan_.local_tp_devices;
-
-        // Copy weights (or default to equal)
-        if (!plan_.local_tp_weights.empty())
-        {
-            config.weights = plan_.local_tp_weights;
-        }
-
-        // Copy backend selection
-        config.backend = plan_.local_tp_backend;
-
-        // Copy runtime settings from orchestration config
-        config.max_seq_len = config_.max_seq_len;
-        config.batch_size = 1;
-        config.activation_precision = parseActivationPrecisionString(config_.activation_precision);
-        config.kv_cache_precision = parseKVCachePrecision(config_.kv_cache_precision);
-
-        LOG_INFO("[OrchestrationRunner] Multi-device precision config: activation="
-                 << activationPrecisionToString(config.activation_precision)
-                 << ", kv_cache=" << kvCachePrecisionToString(config.kv_cache_precision));
-
-        return config;
-    }
-
     std::shared_ptr<ITokenizer> OrchestrationRunner::tokenizer() const
     {
         return tokenizer_;
@@ -1099,8 +1045,12 @@ namespace llaminar2
             LOG_INFO("[OrchestrationRunner]   Device " << i << ": " << dev.toString() << weight_str);
         }
 
-        // Build multi-device config from execution plan
-        auto mdo_config = buildMultiDeviceConfig();
+        // Build config from execution plan via canonical factory
+        auto mdo_config = MultiDeviceOrchestrator::Config::fromPlan(plan_);
+
+        LOG_INFO("[OrchestrationRunner] Multi-device precision config: activation="
+                 << activationPrecisionToString(mdo_config.activation_precision)
+                 << ", kv_cache=" << kvCachePrecisionToString(mdo_config.kv_cache_precision));
 
         // Validate config
         if (!mdo_config.validate())
@@ -1154,40 +1104,19 @@ namespace llaminar2
             }
         }
 
-        // Build MultiDeviceOrchestrator with PP config
-        MultiDeviceOrchestrator::Config mdo_config;
-        mdo_config.mode = MultiDeviceOrchestrator::ParallelismMode::PP;
-        mdo_config.max_seq_len = config_.max_seq_len;
-        mdo_config.batch_size = 1;
-        mdo_config.activation_precision = parseActivationPrecisionString(config_.activation_precision);
-        mdo_config.kv_cache_precision = parseKVCachePrecision(config_.kv_cache_precision);
+        // Build config from execution plan via canonical factory
+        auto mdo_config = MultiDeviceOrchestrator::Config::fromPlan(plan_);
 
-        int total_layers = model_ctx_ ? model_ctx_->blockCount() : 0;
-
-        for (size_t i = 0; i < pp_devices.size(); ++i)
+        // Log PP stage details
+        for (size_t i = 0; i < mdo_config.pp_stages.size(); ++i)
         {
-            MultiDeviceOrchestrator::PPStageConfig stage_cfg;
-            stage_cfg.first_layer = boundaries[i];
-            stage_cfg.last_layer = boundaries[i + 1]; // exclusive (next stage start or total_layers)
-            stage_cfg.has_embedding = (i == 0);
-            stage_cfg.has_lm_head = (i == pp_devices.size() - 1);
-            stage_cfg.stage_devices = {pp_devices[i]};
-
-            // Mark cross-vendor stages for BAR-backed hidden state transfer
-            if (i + 1 < pp_devices.size() &&
-                pp_devices[i].device_type != pp_devices[i + 1].device_type)
-            {
-                stage_cfg.requires_bar_backed_hidden = true;
-            }
-
+            const auto &stage = mdo_config.pp_stages[i];
             LOG_INFO("[OrchestrationRunner]   Stage " << i << ": "
                                                       << pp_devices[i].toString()
-                                                      << " layers [" << stage_cfg.first_layer << ", "
-                                                      << stage_cfg.last_layer << ") "
-                                                      << (stage_cfg.has_embedding ? "[+embed] " : "")
-                                                      << (stage_cfg.has_lm_head ? "[+lm_head] " : ""));
-
-            mdo_config.pp_stages.push_back(std::move(stage_cfg));
+                                                      << " layers [" << stage.first_layer << ", "
+                                                      << stage.last_layer << ") "
+                                                      << (stage.has_embedding ? "[+embed] " : "")
+                                                      << (stage.has_lm_head ? "[+lm_head] " : ""));
         }
 
         if (!mdo_config.validate())
@@ -1262,12 +1191,8 @@ namespace llaminar2
             LOG_INFO("[OrchestrationRunner]   Backend: ROCm (GPU " << device.ordinal << ")");
         }
 
-        // Configure inference runner
-        InferenceRunnerConfig runner_config;
-        runner_config.max_seq_len = config_.max_seq_len;
-        runner_config.batch_size = 1;
-        runner_config.activation_precision = parseActivationPrecisionString(config_.activation_precision);
-        runner_config.kv_cache_precision = parseKVCachePrecision(config_.kv_cache_precision);
+        // Build config from execution plan via canonical factory
+        auto runner_config = InferenceRunnerConfig::fromPlan(plan_);
 
         LOG_INFO("[OrchestrationRunner] Single-device precision config: activation="
                  << activationPrecisionToString(runner_config.activation_precision)

@@ -90,9 +90,9 @@ namespace llaminar2
 
         // Validate inputs
         if (!ensureRequiredPointers("EmbeddingStage", {
-                                                     {"embed_table", params_.embed_table},
-                                                     {"output", params_.output},
-                                                 }))
+                                                          {"embed_table", params_.embed_table},
+                                                          {"output", params_.output},
+                                                      }))
         {
             return false;
         }
@@ -468,6 +468,15 @@ namespace llaminar2
         // declare it as a buffer (it's typically a small CPU array)
 
         return reqs;
+    }
+
+    StageBufferContract EmbeddingStage::bufferContract() const
+    {
+        if (!params_.output_buffer_id)
+            return {};
+
+        return StageBufferContract::build()
+            .addOutput(*params_.output_buffer_id);
     }
 
 } // namespace llaminar2

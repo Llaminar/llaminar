@@ -980,4 +980,14 @@ namespace llaminar2
         return info;
     }
 
+    StageBufferContract KVCacheAppendStage::bufferContract() const
+    {
+        if (!params_.k_buffer_id || !params_.v_buffer_id)
+            return {};
+
+        return StageBufferContract::build()
+            .addInput(*params_.k_buffer_id)
+            .addInput(*params_.v_buffer_id);
+    }
+
 } // namespace llaminar2

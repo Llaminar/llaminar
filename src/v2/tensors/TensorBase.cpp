@@ -2055,6 +2055,28 @@ namespace llaminar2
                 return false;
             }
 
+            // DEBUG DIAGNOSTIC: Check if D2H produced all zeros (possible race)
+            {
+                const float *fp = static_cast<const float *>(dst);
+                size_t check_count = std::min(bytes / sizeof(float), static_cast<size_t>(8));
+                bool all_zero = true;
+                for (size_t i = 0; i < check_count; ++i)
+                {
+                    if (fp[i] != 0.0f) { all_zero = false; break; }
+                }
+                if (all_zero && check_count > 0 && bytes >= 1024)
+                {
+                    LOG_WARN("[TensorBase::ensureOnHost] D2H ALL ZEROS: tensor=" 
+                             << (debug_name_.empty() ? "(unnamed)" : debug_name_)
+                             << " bytes=" << bytes
+                             << " device=" << gpu_device_->toString()
+                             << " gpu_ptr=" << static_cast<const void *>(gpu_data_ptr_)
+                             << " dst=" << static_cast<const void *>(dst)
+                             << " d2h_ns=" << d2h_ns
+                             << " had_event=" << (device_completion_event_ ? "yes" : "no"));
+                }
+            }
+
             // Record transfer for profiling (when LLAMINAR_PROFILING=1)
             TransferProfiler::recordD2H(bytes, static_cast<uint64_t>(d2h_ns));
 

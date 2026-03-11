@@ -8,6 +8,9 @@
 #include "../IComputeStage.h"
 #include "../StageParamsBase.h"
 #include "kernels/IKVCache.h"
+#include "../../../memory/BufferId.h"
+
+#include <optional>
 #include <memory>
 
 namespace llaminar2
@@ -66,12 +69,17 @@ namespace llaminar2
             /// Attention head dimension (for VNNI clipping limits)
             /// Required for proper MAX_SAFE_INT16 selection. Common values: 64, 96, 128, 192.
             int head_dim = 128;
+
+            // Optional BufferIds for contract-based coherence
+            std::optional<BufferId> k_buffer_id;
+            std::optional<BufferId> v_buffer_id;
         };
 
         explicit KVCacheAppendStage(Params params);
 
         bool execute(IDeviceContext *ctx) override;
         ComputeStageType type() const override { return ComputeStageType::COPY; }
+        StageBufferContract bufferContract() const override;
         // KV cache append is graph-capturable when the KV cache supports
         // device-side head parameters. The H2D memcpy + dynamic kernel are
         // captured once; on replay, updateDynamicParams() writes the new head

@@ -9,6 +9,9 @@
 #include "../IWorkspaceConsumerStage.h"
 #include "../StageParamsBase.h"
 #include "../../../utils/GemmContext.h"
+#include "../../../memory/BufferId.h"
+
+#include <optional>
 
 namespace llaminar2
 {
@@ -107,6 +110,10 @@ namespace llaminar2
              * correct functional category. Set by the graph builder.
              */
             GemmContext gemm_context = GemmContext::NONE;
+
+            // Optional BufferIds for contract-based coherence
+            std::optional<BufferId> a_buffer_id;
+            std::optional<BufferId> c_buffer_id;
         };
 
         explicit GEMMStage(Params params);
@@ -118,6 +125,7 @@ namespace llaminar2
         bool supportsBackend(ComputeBackendType backend) const override;
         StageDumpInfo buildDumpInfoImpl() const override;
         StageBufferRequirements getBufferRequirements() const override;
+        StageBufferContract bufferContract() const override;
         bool requiresAllreduce() const override { return params_.needs_allreduce; }
 
         /// Target device for coherence management

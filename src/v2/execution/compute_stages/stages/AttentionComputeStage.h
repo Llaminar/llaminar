@@ -9,6 +9,9 @@
 #include "../IWorkspaceConsumerStage.h"
 #include "../StageParamsBase.h"
 #include "kernels/IKVCache.h"
+#include "../../../memory/BufferId.h"
+
+#include <optional>
 
 namespace llaminar2
 {
@@ -70,6 +73,12 @@ namespace llaminar2
 
             // Position offset for decode mode causal masking
             int position_offset = 0;
+
+            // Optional BufferIds for contract-based coherence
+            std::optional<BufferId> q_buffer_id;
+            std::optional<BufferId> output_buffer_id;
+            std::optional<BufferId> workspace_scores_buffer_id;
+            std::optional<BufferId> workspace_context_buffer_id;
         };
 
         explicit AttentionComputeStage(Params params);
@@ -82,6 +91,7 @@ namespace llaminar2
         bool isGraphCapturable() const override { return true; } // Device-side params buffer handles dynamic kv_len/position
         StageDumpInfo buildDumpInfoImpl() const override;
         StageBufferRequirements getBufferRequirements() const override;
+        StageBufferContract bufferContract() const override;
 
         /// Target device for coherence management
 

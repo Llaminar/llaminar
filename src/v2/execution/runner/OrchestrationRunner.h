@@ -256,15 +256,6 @@ namespace llaminar2
         bool hasLocalTP() const;
 
         /**
-         * @brief Build multi-device configuration from execution plan
-         *
-         * Converts RankExecutionPlan LOCAL TP settings to MultiDeviceOrchestrator::Config.
-         *
-         * @return Multi-device configuration
-         */
-        MultiDeviceOrchestrator::Config buildMultiDeviceConfig() const;
-
-        /**
          * @brief Build compute graph for multi-device (LOCAL TP) execution
          */
         bool buildMultiDeviceComputeGraph();

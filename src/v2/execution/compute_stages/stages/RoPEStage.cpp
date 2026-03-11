@@ -57,8 +57,8 @@ namespace llaminar2
         }
 
         if (!ensureRequiredPointers("RoPEStage", {
-                                                 {"Q", params_.Q},
-                                             }))
+                                                     {"Q", params_.Q},
+                                                 }))
         {
             return false;
         }
@@ -598,6 +598,38 @@ namespace llaminar2
 
         // Cast to IWorkspaceConsumer (CUDA/ROCm RoPE kernels implement both ITensorRoPE and IWorkspaceConsumer)
         return dynamic_cast<IWorkspaceConsumer *>(kernel);
+    }
+
+    StageBufferContract RoPEStage::bufferContract() const
+    {
+        if (!params_.q_buffer_id || !params_.k_buffer_id)
+            return {};
+
+        auto contract = StageBufferContract::build();
+
+        // Hybrid mode: separate input → output buffers
+        if (params_.Q_out && params_.q_out_buffer_id)
+        {
+            contract.addInput(*params_.q_buffer_id);
+            contract.addOutput(*params_.q_out_buffer_id);
+        }
+        else
+        {
+            // Standard in-place mode
+            contract.addInOut(*params_.q_buffer_id);
+        }
+
+        if (params_.K_out && params_.k_out_buffer_id)
+        {
+            contract.addInput(*params_.k_buffer_id);
+            contract.addOutput(*params_.k_out_buffer_id);
+        }
+        else
+        {
+            contract.addInOut(*params_.k_buffer_id);
+        }
+
+        return contract;
     }
 
 } // namespace llaminar2

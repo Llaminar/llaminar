@@ -43,6 +43,7 @@
 #include "../../../tensors/BlockStructures.h"          // For Q8_1Block, Q16_1Block
 #include "../../../loaders/IWeightStreamer.h"          // For weight streaming (Option B)
 #include "../../../interfaces/IModelContext.h"         // For interface-based construction
+#include "../../../memory/BufferArena.h"               // Phase 2: unified buffer management
 #include "../../../interfaces/IMPITopology.h"          // For interface-based construction
 #include "../../../interfaces/ICollectiveContext.h"    // For interface-based construction
 #include "../../../config/TPDomain.h"                  // For MultiDomainTPConfig (Phase 6.3)
@@ -2207,6 +2208,11 @@ namespace llaminar2
         /// Buffer manager for graph-managed allocation (nullptr if using manual buffers)
         std::unique_ptr<DeviceGraphBufferManager> buffer_manager_;
 
+        /// Unified buffer arena (Phase 2) — tracks coherence for all activation buffers
+        /// Registered as external buffers (non-owning) alongside buffer_manager_ during
+        /// the migration. In Phase 5, arena will own buffers directly.
+        std::unique_ptr<BufferArena> arena_;
+
         /// Owned tensors when using graph-managed allocation
         std::vector<std::unique_ptr<TensorBase>> owned_buffers_;
 
@@ -2229,6 +2235,14 @@ namespace llaminar2
          * @param seq_len Sequence length for buffer sizing
          */
         void bindGraphManagedBuffers(int seq_len);
+
+        /**
+         * @brief Initialize the BufferArena with existing managed buffers (Phase 2)
+         *
+         * Registers all managed_buffers_ activation buffers as external (non-owning)
+         * entries in the arena, enabling contract-based coherence for opted-in stages.
+         */
+        void initializeArena();
 
         // =========================================================================
         // Phase-Aware Weight Access Members (Gap 3 - CPU Decode Participation)

@@ -277,6 +277,15 @@ namespace llaminar2
         CollectiveBackendType cross_rank_backend = CollectiveBackendType::MPI;
 
         // =====================================================================
+        // Runtime Configuration (pre-parsed from OrchestrationConfig)
+        // =====================================================================
+
+        /// Pre-parsed runtime config. Populated by ExecutionPlanBuilder so that
+        /// downstream consumers (MDO::Config, InferenceRunnerConfig) never
+        /// re-parse raw strings from OrchestrationConfig.
+        RuntimeConfig runtime;
+
+        // =====================================================================
         // Primary device for this rank
         // =====================================================================
 
@@ -524,6 +533,11 @@ namespace llaminar2
             }
 
             ss << "  Cross-rank backend: " << collectiveBackendTypeToString(cross_rank_backend) << "\n";
+            ss << "  Runtime Config:\n";
+            ss << "    max_seq_len: " << runtime.max_seq_len << "\n";
+            ss << "    activation_precision: " << activationPrecisionToString(runtime.activation_precision) << "\n";
+            ss << "    kv_cache_precision: " << kvCachePrecisionToString(runtime.kv_cache_precision) << "\n";
+            ss << "    fused_attention_backend: " << fusedAttentionBackendToString(runtime.fused_attention_backend) << "\n";
             ss << "}";
             return ss.str();
         }

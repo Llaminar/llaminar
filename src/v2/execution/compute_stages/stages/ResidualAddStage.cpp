@@ -31,10 +31,10 @@ namespace llaminar2
         }
 
         if (!ensureRequiredPointers("ResidualAddStage", {
-                                                        {"input", params_.input},
-                                                        {"residual", params_.residual},
-                                                        {"output", params_.output},
-                                                    }))
+                                                            {"input", params_.input},
+                                                            {"residual", params_.residual},
+                                                            {"output", params_.output},
+                                                        }))
         {
             return false;
         }
@@ -204,7 +204,7 @@ namespace llaminar2
 
         // Use apply_tensor() which handles GPU pointers correctly via active_data_ptr()
         bool ok = kernel->apply_tensor(input_base, residual_base, output_base, n, params_.mpi_ctx,
-                           params_.device_id.toKernelDeviceIndex());
+                                       params_.device_id.toKernelDeviceIndex());
 
         if (Logger::getInstance().shouldLog(LogLevel::TRACE) && !params_.device_id.is_gpu())
         {
@@ -702,6 +702,27 @@ namespace llaminar2
         reqs.addOutput("output", {rows, cols}, buf_type);
 
         return reqs;
+    }
+
+    StageBufferContract ResidualAddStage::bufferContract() const
+    {
+        if (!params_.input_buffer_id || !params_.residual_buffer_id || !params_.output_buffer_id)
+            return {};
+
+        auto contract = StageBufferContract::build();
+        contract.addInput(*params_.input_buffer_id);
+
+        if (*params_.output_buffer_id == *params_.residual_buffer_id)
+        {
+            contract.addInOut(*params_.residual_buffer_id);
+        }
+        else
+        {
+            contract.addInput(*params_.residual_buffer_id);
+            contract.addOutput(*params_.output_buffer_id);
+        }
+
+        return contract;
     }
 
 } // namespace llaminar2

@@ -7,6 +7,9 @@
 
 #include "../IComputeStage.h"
 #include "../StageParamsBase.h"
+#include "../../../memory/BufferId.h"
+
+#include <optional>
 
 namespace llaminar2
 {
@@ -40,6 +43,11 @@ namespace llaminar2
             // IMPORTANT: For decode mode with pre-allocated buffers, this must be set to
             // seq_len * hidden_dim to avoid processing garbage data beyond the actual sequence.
             size_t num_elements = 0;
+
+            // Optional BufferIds for contract-based coherence
+            std::optional<BufferId> input_buffer_id;
+            std::optional<BufferId> residual_buffer_id;
+            std::optional<BufferId> output_buffer_id;
         };
 
         explicit ResidualAddStage(Params params);
@@ -51,6 +59,7 @@ namespace llaminar2
         bool supportsBackend(ComputeBackendType backend) const override;
         StageDumpInfo buildDumpInfoImpl() const override;
         StageBufferRequirements getBufferRequirements() const override;
+        StageBufferContract bufferContract() const override;
 
     private:
         Params params_;

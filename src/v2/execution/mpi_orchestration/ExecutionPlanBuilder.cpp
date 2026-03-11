@@ -710,6 +710,13 @@ namespace llaminar2
         // Cross-rank backend
         plan.cross_rank_backend = selectCrossRankBackend(cluster_inventory);
 
+        // Runtime config: parse once from OrchestrationConfig raw strings
+        plan.runtime = RuntimeConfig::fromOrchestrationConfig(
+            config.max_seq_len,
+            config.activation_precision,
+            config.kv_cache_precision,
+            config.fused_attention_backend);
+
         return plan;
     }
 
@@ -966,6 +973,13 @@ namespace llaminar2
 
         // Cross-rank backend
         plan.cross_rank_backend = selectCrossRankBackend(cluster_inventory);
+
+        // Runtime config: parse once from OrchestrationConfig raw strings
+        plan.runtime = RuntimeConfig::fromOrchestrationConfig(
+            config.max_seq_len,
+            config.activation_precision,
+            config.kv_cache_precision,
+            config.fused_attention_backend);
 
         return plan;
     }

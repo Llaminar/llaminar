@@ -8,6 +8,9 @@
 #include "../IComputeStage.h"
 #include "../IWorkspaceConsumerStage.h"
 #include "../StageParamsBase.h"
+#include "../../../memory/BufferId.h"
+
+#include <optional>
 #include <vector>
 #include <memory>
 
@@ -57,6 +60,12 @@ namespace llaminar2
             // Dynamic-scale K output (for HybridQ16 K precision fix)
             // When K is Q16_1 from GEMM, RoPE outputs per-head scales for attention
             float *K_head_scales = nullptr; ///< Output: per-head K scales [seq_len * n_kv_heads]
+
+            // Optional BufferIds for contract-based coherence
+            std::optional<BufferId> q_buffer_id;
+            std::optional<BufferId> k_buffer_id;
+            std::optional<BufferId> q_out_buffer_id;
+            std::optional<BufferId> k_out_buffer_id;
         };
 
         explicit RoPEStage(Params params);
@@ -69,6 +78,7 @@ namespace llaminar2
         bool isGraphCapturable() const override { return true; }
         StageDumpInfo buildDumpInfoImpl() const override;
         StageBufferRequirements getBufferRequirements() const override;
+        StageBufferContract bufferContract() const override;
 
         /// Update position offset for cached graph reuse.
         /// Also updates the kernel's pinned host device-params so the next

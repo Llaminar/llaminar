@@ -244,4 +244,14 @@ namespace llaminar2
         return consumer;
     }
 
+    StageBufferContract LMHeadStage::bufferContract() const
+    {
+        if (!params_.input_buffer_id || !params_.output_buffer_id)
+            return {};
+
+        return StageBufferContract::build()
+            .addInput(*params_.input_buffer_id)
+            .addOutput(*params_.output_buffer_id);
+    }
+
 } // namespace llaminar2

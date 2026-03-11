@@ -21,6 +21,8 @@
 #include "../IComputeStage.h"
 #include "../StageParamsBase.h"
 #include "../../../collective/ITPContext.h"
+#include "../../../memory/BufferId.h"
+#include <optional>
 #include <string>
 
 namespace llaminar2
@@ -33,11 +35,12 @@ namespace llaminar2
     {
         STAGE_PARAMS_COMMON_FIELDS;
 
-        ITPContext *tp_ctx = nullptr; ///< TP context (LOCAL or GLOBAL, required)
-        TensorBase *tensor = nullptr; ///< Tensor to all-reduce (in-place)
-        size_t count = 0;             ///< Elements to reduce (0 = use tensor->numel())
-        std::string stage_name;       ///< Stage identifier for BAR-backed tensor lookup (optional)
-        std::string precision;        ///< Allreduce precision override ("fp32", "fp16", "bf16", "" = use global default)
+        ITPContext *tp_ctx = nullptr;             ///< TP context (LOCAL or GLOBAL, required)
+        TensorBase *tensor = nullptr;             ///< Tensor to all-reduce (in-place)
+        size_t count = 0;                         ///< Elements to reduce (0 = use tensor->numel())
+        std::string stage_name;                   ///< Stage identifier for BAR-backed tensor lookup (optional)
+        std::string precision;                    ///< Allreduce precision override ("fp32", "fp16", "bf16", "" = use global default)
+        std::optional<BufferId> tensor_buffer_id; ///< Arena BufferId for the in-place tensor (enables contract-based coherence)
     };
 
     /**
@@ -114,6 +117,12 @@ namespace llaminar2
          * @return StageDumpInfo with tensor info
          */
         StageDumpInfo buildDumpInfoImpl() const override;
+
+        /**
+         * @brief Declarative buffer contract for arena-based coherence
+         * @return Contract with single inout binding, or empty if no buffer_id set
+         */
+        StageBufferContract bufferContract() const override;
 
         /**
          * @brief Get coherence policy

@@ -1,7 +1,7 @@
 # Config-to-Execution Flow Cleanup Proposal
 
 **Date**: 2026-03-10  
-**Status**: Proposed  
+**Status**: Complete (all 4 phases done)  
 **Scope**: `OrchestrationRunner`, `ExecutionPlanBuilder`, `MultiDeviceOrchestrator`, `InferenceRunnerFactory`
 
 ---
@@ -86,29 +86,20 @@ OrchestrationConfig
 
 ## Identified Code Smells
 
-### Smell 1: Triplicated Precision Parsing
+### Smell 1: Triplicated Precision Parsing ✅ FIXED (Phase 1)
 
-`config_.activation_precision` is a raw `std::string` that gets parsed via `parseActivationPrecisionString()` at three independent call sites:
+~~`config_.activation_precision` is a raw `std::string` that gets parsed via `parseActivationPrecisionString()` at three independent call sites.~~ **Fixed**: Parsing now happens once in `ExecutionPlanBuilder` via `RuntimeConfig::fromOrchestrationConfig()`. All three build methods read pre-parsed enums from `plan_.runtime`.
 
-| Site | File:Line |
-|------|-----------|
-| `buildMultiDeviceConfig()` | `OrchestrationRunner.cpp:1056` |
-| `buildLocalPPComputeGraph()` | `OrchestrationRunner.cpp:1162` |
-| `buildSingleDeviceComputeGraph()` | `OrchestrationRunner.cpp:1269` |
+### Smell 2: Triplicated Field-Copy Boilerplate ✅ FIXED (Phases 1+2)
 
-Same issue with `parseKVCachePrecision()`. The string→enum conversion should happen **once** during config initialization.
+The pattern `max_seq_len = X; activation_precision = ...; kv_cache_precision = ...` was manually repeated at **five** sites. Phase 1 eliminated the string re-parsing. Phase 2 eliminated the remaining field copies via `MDO::Config::fromPlan()` and `InferenceRunnerConfig::fromPlan()`.
 
-### Smell 2: Triplicated Field-Copy Boilerplate
-
-The pattern `max_seq_len = X; activation_precision = parse(...); kv_cache_precision = parse(...)` is manually repeated at **five** sites:
-
-1. `buildSingleDeviceComputeGraph()` → populates `InferenceRunnerConfig`
-2. `buildMultiDeviceConfig()` → populates `MDO::Config`
-3. `buildLocalPPComputeGraph()` → populates `MDO::Config`
+Sites remaining after Phase 1:
+1. ~~`buildMultiDeviceConfig()` → copies `plan_.runtime` fields to `MDO::Config`~~ ✅ Replaced by `MDO::Config::fromPlan()`
+2. ~~`buildLocalPPComputeGraph()` → copies `plan_.runtime` fields to `MDO::Config`~~ ✅ Replaced by `MDO::Config::fromPlan()`
+3. ~~`buildSingleDeviceComputeGraph()` → copies `plan_.runtime` fields to `InferenceRunnerConfig`~~ ✅ Replaced by `InferenceRunnerConfig::fromPlan()`
 4. `MDO::initializeDeviceRunners()` → copies `MDO::Config` → `InferenceRunnerConfig`
 5. `MDO::initializePPDeviceRunners()` → copies `MDO::Config` → `InferenceRunnerConfig`
-
-No single "translate config once" function exists. Each path manually copies the same ~6 fields.
 
 ### Smell 3: Three Entirely Separate Build Methods
 
@@ -151,117 +142,100 @@ Each TP variant was bolted on as a new `else if` branch rather than being unifie
 
 The two paths don't even read from the same intermediate struct consistently.
 
-### Smell 7: `RankExecutionPlan` Doesn't Carry Runtime Config
+### Smell 7: `RankExecutionPlan` Doesn't Carry Runtime Config ✅ FIXED (Phase 1)
 
-`RankExecutionPlan` carries topology info (devices, layers, weights, backends) but **not** runtime config (max_seq_len, activation_precision, kv_cache_precision). This is why all three build methods must reach back to `config_` (OrchestrationConfig) to get runtime values. If `RankExecutionPlan` carried the pre-parsed runtime config, the triplicated parsing would vanish.
+~~`RankExecutionPlan` carries topology info but **not** runtime config.~~ **Fixed**: `RankExecutionPlan` now has a `RuntimeConfig runtime` member populated by `ExecutionPlanBuilder`. All three build methods read from `plan_.runtime` instead of reaching back to `config_`.
 
 ---
 
-## Root Cause
+## Root Cause ⬜ PARTIALLY ADDRESSED
 
-`RankExecutionPlan` was designed as a **topology document** ("what devices and layers does this rank own") rather than a **complete execution contract** ("everything this rank needs to run, fully parsed"). This forces `OrchestrationRunner` to serve as a manual bridge, re-reading `OrchestrationConfig` raw fields for every build path.
-
-Current flow:
-
-```
-OrchestrationConfig (raw CLI)
-    → partially translated into RankExecutionPlan (topology only)
-    → OrchestrationRunner selects build path
-        → each path re-reads OrchestrationConfig for runtime fields
-        → each path manually constructs MDO::Config or InferenceRunnerConfig
-            → MDO::Config re-copies fields into InferenceRunnerConfig
-                → InferenceRunnerFactory re-copies into GraphConfig
-```
-
-That's **4–5 manual field-copy hops** with 3 parallel paths doing the same copies differently.
+`RankExecutionPlan` was designed as a **topology document** rather than a **complete execution contract**. Phase 1 fixed this by adding `RuntimeConfig runtime` — the plan now carries pre-parsed runtime config. Phase 2 centralized the downstream translation into `fromPlan()` factories on `MDO::Config` and `InferenceRunnerConfig`, eliminating all manual field copies from OrchestrationRunner.
 
 ---
 
 ## Proposed Changes
 
-### Phase 1: Parse Once, Copy Never
+### Phase 1: Parse Once, Copy Never ✅ COMPLETED
 
 **Goal**: Eliminate triplicated string→enum parsing and field-copy boilerplate.
 
-1. **Add a `RuntimeConfig` sub-struct** to `RankExecutionPlan`:
+**Decision**: Instead of creating a new `PlanRuntimeConfig` sub-struct as originally proposed, we **slimmed the existing `RuntimeConfig` struct** (which was dead code — only one test instantiated it, but its header was `#include`d by ~15 files for the enum types) and promoted it to be the canonical first-class config carrier. This avoids creating a new type and cleans up the dead code.
 
-```cpp
-struct RuntimeConfig {
-    int max_seq_len = 2048;
-    int batch_size = 1;
-    ActivationPrecision activation_precision = ActivationPrecision::FP32;
-    KVCachePrecision kv_cache_precision = KVCachePrecision::FP32;
-    float kv_cache_scale = 3.0f;
-    FusedAttentionBackend fused_attention_backend = FusedAttentionBackend::AUTO;
-    bool use_mapped_memory = false;
-};
-```
+**What was done**:
 
-2. **Parse raw strings once** in `ExecutionPlanBuilder::buildSimplePlan()` (and `buildPlanWithDomains()`), storing pre-parsed enums into `plan.runtime`.
+1. **Slimmed `RuntimeConfig`** from ~20 fields to 6: removed `n_threads`, `use_mmap`, `seed`, `use_fused_attention`, 6 `executor_*` flags. Kept: `max_seq_len`, `batch_size`, `activation_precision`, `fused_attention_backend`, `kv_cache_scale`, `kv_cache_precision`.
 
-3. **MDO::Config and InferenceRunnerConfig embed `RuntimeConfig`** (or a const reference) instead of having their own copies of the same fields.
+2. **Added `parseActivationPrecision()`** to `RuntimeConfig.h` (promoted from anonymous-namespace function in OrchestrationRunner.cpp).
 
-4. **Remove** `parseActivationPrecisionString()` and `parseKVCachePrecision()` calls from all three build methods in OrchestrationRunner.
+3. **Added `RuntimeConfig::fromOrchestrationConfig()`** static factory that parses raw strings once.
 
-**Files changed**: `RankExecutionPlan.h`, `ExecutionPlanBuilder.cpp`, `OrchestrationRunner.cpp`, `MultiDeviceOrchestrator.h`, `InferenceRunnerFactory.h`.
+4. **Added `RuntimeConfig runtime` member** to `RankExecutionPlan`.
 
-**Risk**: Low. Purely structural — no behavioral change.
+5. **Populated `plan.runtime`** in `ExecutionPlanBuilder` — both `buildSimplePlan()` and `buildPlanWithDomains()` call `RuntimeConfig::fromOrchestrationConfig()`.
 
-### Phase 2: Unify Build Paths
+6. **Updated all 3 `OrchestrationRunner` build paths** to read from `plan_.runtime` instead of re-parsing `config_` strings.
 
-**Goal**: Replace the three `build*ComputeGraph()` methods with a single method that dispatches based on `RankExecutionPlan` attributes.
+7. **Removed** the anonymous `parseActivationPrecisionString()` from OrchestrationRunner.cpp.
 
-1. **Extract shared logic** (device validation, strategy logging) into helper methods.
+**Files changed**: `RuntimeConfig.h`, `RankExecutionPlan.h`, `ExecutionPlanBuilder.cpp`, `OrchestrationRunner.cpp`.
 
-2. **Single `buildComputeGraph()` implementation** that constructs the appropriate runner based on plan attributes, eliminating the three-way `if/else if/else` entirely. Pseudocode:
+**Verification**: 1609 build targets, 0 errors. 374/374 unit tests pass.
 
-```cpp
-bool OrchestrationRunner::buildComputeGraph() {
-    validateDevices(plan_);   // shared
-    logStrategy(plan_);       // shared
+### Phase 2: Centralize Config Translation ✅ COMPLETED
 
-    if (plan_.usesLocalTP() || plan_.usesLocalPP()) {
-        auto mdo_config = MDO::Config::fromPlan(plan_);  // single translation point
-        runner_ = std::make_unique<MultiDeviceOrchestrator>(model_ctx_, mdo_config);
-    } else {
-        auto runner_config = InferenceRunnerConfig::fromPlan(plan_);
-        runner_ = createInferenceRunner(model_ctx_, mpi_ctx_, plan_.primaryDevice(), runner_config);
-    }
-    return runner_ != nullptr;
-}
-```
+**Goal**: Replace manual field-copy boilerplate in OrchestrationRunner with canonical `fromPlan()` factory methods on the config structs.
 
-3. **`MDO::Config::fromPlan()`** and **`InferenceRunnerConfig::fromPlan()`** become the single, canonical translation points from plan to sub-config.
+**Refined scope** (updated after code analysis): The original proposal suggested replacing all three `build*ComputeGraph()` methods with a single method. After examining the code, each path has genuinely distinct logic:
+- **TP path**: Passes pre-created `local_tp_ctx_`, uses `createMultiDeviceOrchestrator()` factory
+- **PP path**: Builds `PPStageConfig` entries with cross-vendor detection, creates MDO directly, initializes `GlobalBackendRouter`
+- **Single-device path**: Resolves device from multiple sources with NUMA support, passes `mpi_ctx_`, uses `createInferenceRunner()` factory
 
-**Files changed**: `OrchestrationRunner.cpp`, `MultiDeviceOrchestrator.h/.cpp`, `InferenceRunnerFactory.h`.
+Forcing these into a single method would create an unreadable if/else. Instead, Phase 2 focuses on the higher-value win: **centralizing config translation** via `fromPlan()` factories.
 
-**Risk**: Medium. Changes the construction flow but not the runtime behavior. Existing tests provide safety net.
+**Changes**:
 
-### Phase 3: Consolidate MDO Constructors
+1. **Add `MDO::Config::fromPlan(const RankExecutionPlan&)`** static factory that handles both TP and PP config construction. For TP: copies devices, weights, backend. For PP: sets `mode=PP`, builds `PPStageConfig` entries from plan boundaries with cross-vendor BAR detection.
+
+2. **Add `InferenceRunnerConfig::fromPlan(const RankExecutionPlan&)`** static factory — eliminates the field-copy block in `buildSingleDeviceComputeGraph()`.
+
+3. **Remove `buildMultiDeviceConfig()`** helper from OrchestrationRunner (its logic moves into `MDO::Config::fromPlan()`).
+
+4. **Simplify the three build methods** to use the new factories. They keep their path-specific logic (device validation, strategy logging, runner creation) but lose the config-construction boilerplate.
+
+**Files changed**: `MultiDeviceOrchestrator.h`, `InferenceRunnerFactory.h`, `OrchestrationRunner.h`, `OrchestrationRunner.cpp`.
+
+**Risk**: Low. Config translation moves but its logic is unchanged.
+
+### Phase 3: Consolidate MDO Constructors ✅ COMPLETED
 
 **Goal**: Reduce MDO's three constructors to two (production + test injection).
 
-1. **Merge the Config-only and TP-context constructors**. The Config-only constructor already creates a TP context for TP mode — the pre-made-TP-context constructor is redundant. Have the caller set the TP context on the config or pass it alongside.
+1. **Merged the Config-only and TP-context constructors** into a single constructor with an optional `tp_ctx` parameter: `MultiDeviceOrchestrator(model_ctx, config, tp_ctx = nullptr)`. If `tp_ctx` is provided, uses it directly (TP mode). Otherwise, auto-detects mode from config and creates TP context if needed.
 
-2. **Keep the test-injection constructor** (it serves a legitimate purpose for unit testing with mocked runners).
+2. **Kept the test-injection constructor** (private, via `createForTest()`) — unchanged.
 
-**Files changed**: `MultiDeviceOrchestrator.h/.cpp`, `OrchestrationRunner.cpp`.
+**Files changed**: `MultiDeviceOrchestrator.h/.cpp`, `InferenceRunnerFactory.cpp`, `Qwen2ParityTestBase.h`.
 
-**Risk**: Medium. Must verify no external callers depend on the pre-made-TP-context constructor signature.
+**Result**: 3 constructors → 2 (unified production + private test injection). All 374 unit tests pass.
 
-### Phase 4: Unify TP Assignment in InferenceRunnerFactory
+### Phase 4: Unify TP Assignment in InferenceRunnerFactory ✅ COMPLETED
 
-**Goal**: Replace the 4-way `if/else if/else if/else` TP cascade with a strategy pattern.
+**Goal**: Replace the 4-way `if/else if/else if/else` TP cascade with named functions and a clean selector.
 
-1. **Define `ITPAssignment` interface** with a single method: `apply(GraphConfig&)`.
+**Refined scope** (updated during implementation): The original proposal called for a virtual `ITPAssignment` interface with 4 class implementations and a new header file. Since all strategies are internal to one file and unlikely to grow, a lighter approach was used: named static functions with a selector, avoiding unnecessary abstraction.
 
-2. **Four implementations**: `LocalTPAssignment`, `ProportionalGlobalTPAssignment`, `EqualSplitGlobalTPAssignment`, `NoTPAssignment`.
+1. **Extracted `applyProportionalGlobalTPAssignment()`** — proportional GLOBAL TP via `TensorParallelConfig`.
 
-3. **Factory selects the appropriate strategy** once, then calls `strategy->apply(graph_config)`.
+2. **Extracted `applyEqualSplitGlobalTPAssignment()`** — equal 1/world_size GLOBAL TP via MPI context.
 
-**Files changed**: `InferenceRunnerFactory.cpp`, new `TPAssignment.h`.
+3. **Created `applyTPAssignment()` selector** — picks the right strategy based on precedence (LOCAL > Proportional > Equal-Split > No TP) and delegates. Replaces the inline 4-way cascade.
 
-**Risk**: Low. Localized refactor within the factory.
+4. **Existing functions preserved**: `applyLocalTPAssignment()` (already extracted) and `setFullDimensions()` (no-TP path).
+
+**Files changed**: `InferenceRunnerFactory.cpp` only (no new header needed).
+
+**Result**: ~100-line inline cascade → 5 focused static functions + 1 selector. Each TP mode is independently readable and testable. All 374 unit tests pass.
 
 ---
 
@@ -278,14 +252,14 @@ Each phase must pass:
 
 ## Estimated Impact
 
-| Metric | Before | After |
-|--------|--------|-------|
-| `parseActivationPrecisionString()` call sites | 3 | 1 |
-| Manual field-copy sites | 5 | 1–2 |
-| `build*ComputeGraph()` methods | 3 | 1 |
-| MDO constructors (non-test) | 2 | 1 |
-| TP assignment branches in factory | 4-way cascade | Strategy dispatch |
-| Net lines removed (estimated) | — | ~200–300 |
+| Metric | Before | Phase 1 | All Phases |
+|--------|--------|---------|------------|
+| `parseActivationPrecisionString()` call sites | 3 | **1** ✅ | 1 ✅ |
+| Manual field-copy sites (OrchestrationRunner) | 5 | **3** ✅ | 0 ✅ |
+| `build*ComputeGraph()` methods | 3 | 3 | 3 (simplified) ✅ |
+| MDO constructors (non-test) | 2 | 2 | 1 ✅ |
+| TP assignment branches in factory | 4-way cascade | 4-way cascade | Selector + named functions ✅ |
+| Net lines removed (cumulative) | — | ~40 | ~200–300 |
 
 ---
 

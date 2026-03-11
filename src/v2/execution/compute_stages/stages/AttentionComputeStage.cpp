@@ -42,7 +42,7 @@ namespace llaminar2
             cached_kernel_,
             cached_kernel_tensor_type_,
             params_.Q,
-            [&]() 
+            [&]()
             {
                 return llaminar::v2::kernels::KernelFactory::getOrCreateAttention(params_.Q, params_.device_id);
             });
@@ -107,11 +107,11 @@ namespace llaminar2
 
         // Validate inputs
         if (!ensureRequiredPointers("AttentionComputeStage", {
-                                                         {"Q", params_.Q},
-                                                         {"K", params_.K},
-                                                         {"V", params_.V},
-                                                         {"output", params_.output},
-                                                     }))
+                                                                 {"Q", params_.Q},
+                                                                 {"K", params_.K},
+                                                                 {"V", params_.V},
+                                                                 {"output", params_.output},
+                                                             }))
         {
             return false;
         }
@@ -211,11 +211,11 @@ namespace llaminar2
         // This allows GPU tensor wrappers (like GpuTensorView from CUDA KV cache) to work.
 
         if (!ensureRequiredPointers("AttentionComputeStage", {
-                                                         {"Q", params_.Q},
-                                                         {"K", params_.K},
-                                                         {"V", params_.V},
-                                                         {"output", params_.output},
-                                                     }))
+                                                                 {"Q", params_.Q},
+                                                                 {"K", params_.K},
+                                                                 {"V", params_.V},
+                                                                 {"output", params_.output},
+                                                             }))
         {
             return false;
         }
@@ -410,6 +410,23 @@ namespace llaminar2
         }
 
         return reqs;
+    }
+
+    StageBufferContract AttentionComputeStage::bufferContract() const
+    {
+        if (!params_.q_buffer_id || !params_.output_buffer_id)
+            return {};
+
+        auto contract = StageBufferContract::build()
+                            .addInput(*params_.q_buffer_id)
+                            .addOutput(*params_.output_buffer_id);
+
+        if (params_.workspace_scores_buffer_id)
+            contract.addInOut(*params_.workspace_scores_buffer_id);
+        if (params_.workspace_context_buffer_id)
+            contract.addInOut(*params_.workspace_context_buffer_id);
+
+        return contract;
     }
 
 } // namespace llaminar2

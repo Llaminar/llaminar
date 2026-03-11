@@ -1,0 +1,268 @@
+/**
+ * @file RuntimeInitPhase.cpp
+ * @brief Post-MPI runtime initialization
+ */
+
+#include "app/RuntimeInitPhase.h"
+#include "app/MPIBootstrapPhase.h"
+#include "app/ChatTemplateResolver.h"
+#include "backends/ComputeBackend.h"
+#include "config/OrchestrationConfigParser.h"
+#include "execution/runner/IOrchestrationRunnerFactory.h"
+#include "utils/Logger.h"
+#include "utils/DebugEnv.h"
+#include "utils/NUMATopology.h"
+#include <mpi.h>
+#include <iostream>
+#include <algorithm>
+#include <cstdlib>
+
+namespace llaminar2
+{
+
+    std::optional<AppContext> RuntimeInitPhase::execute(OrchestrationConfig &config,
+                                                        int &argc, char **&argv)
+    {
+        // OpenMPI vader CMA workaround
+        MPIEnvironmentInfo mpi_env = MPIBootstrap::detectMPIEnvironment();
+        if (mpi_env.is_mpi_process && debugEnv().mpi_bootstrap.ompi_mca_btl_vader_single_copy_mechanism.empty())
+        {
+            setenv("OMPI_MCA_btl_vader_single_copy_mechanism", "none", 0);
+        }
+
+        // Initialize MPI
+        int provided;
+        MPI_Init_thread(&argc, &argv, MPI_THREAD_MULTIPLE, &provided);
+
+        // Re-parse arguments (MPI_Init may modify argc/argv)
+        OrchestrationConfigParser parser;
+        config = parser.parseArgs(argc, argv);
+
+        auto mpi_ctx = MPIContextFactory::global();
+
+        // Check OMP_NUM_THREADS
+        if (std::getenv("OMP_NUM_THREADS") == nullptr)
+        {
+            LOG_WARN("[Main] Running under MPI without OMP_NUM_THREADS set. For strict per-rank core pinning, "
+                     "launch with canonical wrapper or set OMP_NUM_THREADS/OMP_PLACES/OMP_PROC_BIND in the launcher.");
+        }
+
+        // Detect NUMA node for MPI rank
+        auto numa_info = NUMATopology::detectLocalNUMANode();
+
+        const bool cpu_explicit_numa_mode =
+            config.device_for_this_rank.has_value() &&
+            config.device_for_this_rank->isCPU() &&
+            config.device_for_this_rank_numa_explicit;
+
+        const bool cpu_global_mode = config.cpu_global_tp_all_local;
+
+        // CPU affinity verification
+        if (cpu_explicit_numa_mode || cpu_global_mode)
+        {
+            int required_numa = -1;
+            if (cpu_explicit_numa_mode)
+            {
+                required_numa = config.device_for_this_rank->numa_node;
+            }
+            else if (numa_info.detection_succeeded)
+            {
+                required_numa = numa_info.local_numa_node;
+            }
+
+            std::string affinity_details;
+            const bool affinity_ok = MPIBootstrapPhase::verifyStartupThreadAffinity(
+                required_numa, true, affinity_details);
+
+            const bool strict_assert = []()
+            {
+                const char *value = std::getenv("LLAMINAR_ASSERT_THREAD_AFFINITY");
+                return value != nullptr && std::string(value) == "1";
+            }();
+
+            if (!affinity_ok)
+            {
+                const bool fail_fast = strict_assert || cpu_explicit_numa_mode;
+                if (fail_fast)
+                {
+                    LOG_ERROR("[Main] Startup thread affinity verification failed: " << affinity_details);
+                    LOG_ERROR("[Main] Fix launcher pinning (mpirun binding/cpu-set) or set LLAMINAR_ASSERT_THREAD_AFFINITY=0 to downgrade to warning");
+                    MPI_Finalize();
+                    return std::nullopt;
+                }
+
+                LOG_WARN("[Main] Startup thread affinity verification warning: " << affinity_details);
+            }
+            else
+            {
+                LOG_INFO("[Main] Startup thread affinity verification passed");
+            }
+        }
+
+        // CPU shorthand runtime semantics
+        if (config.cpu_global_tp_all_local)
+        {
+            int local_rank = 0;
+            MPI_Comm local_comm = MPI_COMM_NULL;
+            if (MPI_Comm_split_type(MPI_COMM_WORLD, MPI_COMM_TYPE_SHARED, mpi_ctx->rank(), MPI_INFO_NULL, &local_comm) == MPI_SUCCESS)
+            {
+                MPI_Comm_rank(local_comm, &local_rank);
+                MPI_Comm_free(&local_comm);
+            }
+
+            config.device_mode = DeviceAssignmentMode::EXPLICIT;
+            config.device_map.clear();
+            config.device_map.emplace_back(mpi_ctx->rank(), GlobalDeviceAddress::cpu(local_rank));
+            config.device_map_numa_explicit.clear();
+            config.device_map_numa_explicit.emplace_back(mpi_ctx->rank(), true);
+
+            if (config.tp_scope == TPScope::AUTO)
+            {
+                config.tp_scope = TPScope::GLOBAL;
+            }
+            if (config.tp_degree <= 1)
+            {
+                config.tp_degree = mpi_ctx->world_size();
+            }
+
+            if (mpi_ctx->rank() == 0)
+            {
+                LOG_INFO("[Main] CPU shorthand runtime mapping enabled: GLOBAL TP degree="
+                         << config.tp_degree << ", world_size=" << mpi_ctx->world_size());
+            }
+        }
+
+        // Set logger rank
+        Logger::getInstance().setRank(mpi_ctx->rank());
+
+        if (mpi_ctx->rank() == 0)
+        {
+            LOG_DEBUG("=== NUMA Topology Detection ===");
+        }
+
+        LOG_DEBUG("[Rank " << mpi_ctx->rank() << "] NUMA node: " << numa_info.local_numa_node
+                           << " (detection: " << numa_info.detection_method << ")");
+
+        if (!numa_info.detection_succeeded && mpi_ctx->rank() == 0)
+        {
+            LOG_WARN("NUMA detection failed, using fallback node 0. This may impact multi-socket performance.");
+        }
+
+        // Initialize DeviceManager
+        const bool self_bootstrapped = (std::getenv("LLAMINAR_SELF_BOOTSTRAPPED") != nullptr);
+
+        int device_manager_numa_filter;
+        if (self_bootstrapped)
+        {
+            device_manager_numa_filter = -1;
+            LOG_DEBUG("[Rank " << mpi_ctx->rank() << "] Self-bootstrapped: initialising DeviceManager without NUMA filtering");
+        }
+        else
+        {
+            device_manager_numa_filter = numa_info.local_numa_node;
+
+            std::optional<GlobalDeviceAddress> mapped_device_for_rank;
+            for (const auto &[mapped_rank, mapped_addr] : config.device_map)
+            {
+                if (mapped_rank == mpi_ctx->rank())
+                {
+                    mapped_device_for_rank = mapped_addr;
+                    break;
+                }
+            }
+
+            const bool has_gpu_request =
+                (config.device_for_this_rank.has_value() && config.device_for_this_rank->isGPU()) ||
+                (mapped_device_for_rank.has_value() && mapped_device_for_rank->isGPU()) ||
+                std::any_of(config.tp_devices.begin(), config.tp_devices.end(),
+                            [](const GlobalDeviceAddress &d)
+                            { return d.isGPU(); }) ||
+                std::any_of(config.domain_definitions.begin(), config.domain_definitions.end(),
+                            [](const DomainDefinition &dom)
+                            {
+                                return std::any_of(dom.devices.begin(), dom.devices.end(),
+                                                   [](const GlobalDeviceAddress &d)
+                                                   { return d.isGPU(); });
+                            }) ||
+                (config.tp_degree > 1);
+
+            if (has_gpu_request)
+            {
+                device_manager_numa_filter = -1;
+                LOG_INFO("[Main] GPU device(s) requested; initialising DeviceManager without NUMA filtering");
+            }
+        }
+
+        auto &dm = DeviceManager::instance();
+        dm.initialize(device_manager_numa_filter);
+
+        // Dry-run check (post-MPI)
+        if (config.dry_run)
+        {
+            if (mpi_ctx->rank() == 0)
+            {
+                LOG_INFO("[Main] --dry-run requested: configuration validated, skipping model load/inference");
+            }
+            MPI_Finalize();
+            return std::nullopt;
+        }
+
+        // Validate model path
+        if (config.model_path.empty())
+        {
+            if (mpi_ctx->rank() == 0)
+            {
+                LOG_ERROR("Error: Model path required (-m)\n\n");
+                std::cout << OrchestrationConfigParser::getHelpText() << std::endl;
+            }
+            MPI_Finalize();
+            return std::nullopt;
+        }
+
+        // Create and initialize OrchestrationRunner
+        auto factory = createOrchestrationRunnerFactory();
+        auto runner = factory->createFromOrchestrationConfig(config);
+
+        if (!runner)
+        {
+            if (mpi_ctx->rank() == 0)
+            {
+                LOG_ERROR("Error: Failed to create orchestration runner");
+            }
+            MPI_Finalize();
+            return std::nullopt;
+        }
+
+        if (!runner->initialize())
+        {
+            if (mpi_ctx->rank() == 0)
+            {
+                LOG_ERROR("Failed to initialize: " << runner->lastError());
+            }
+            MPI_Finalize();
+            return std::nullopt;
+        }
+
+        // Get tokenizer
+        auto tokenizer = runner->tokenizer();
+        if (!tokenizer)
+        {
+            if (mpi_ctx->rank() == 0)
+            {
+                LOG_ERROR("Failed to get tokenizer from runner");
+            }
+            MPI_Finalize();
+            return std::nullopt;
+        }
+
+        // Apply chat template override
+        ChatTemplateResolver::resolve(config.chat_template_override, tokenizer, mpi_ctx->rank());
+
+        return AppContext{
+            .config = config,
+            .mpi_ctx = std::move(mpi_ctx),
+            .runner = std::move(runner),
+            .tokenizer = std::move(tokenizer)};
+    }
+
+} // namespace llaminar2

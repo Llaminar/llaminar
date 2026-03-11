@@ -15,6 +15,9 @@
 
 #include "../IComputeStage.h"
 #include "../StageParamsBase.h"
+#include "../../../memory/BufferId.h"
+
+#include <optional>
 
 namespace llaminar2
 {
@@ -62,6 +65,10 @@ namespace llaminar2
             /// Number of tokens (seq_len * batch_size)
             /// If 0, derives from input tensor dimensions
             int seq_len = 0;
+
+            // Optional BufferIds for contract-based coherence
+            std::optional<BufferId> input_buffer_id;
+            std::optional<BufferId> output_buffer_id;
         };
 
         static_assert(StageParamsRequired<Params>);
@@ -75,6 +82,7 @@ namespace llaminar2
         bool supportsBackend(ComputeBackendType backend) const override;
         StageDumpInfo buildDumpInfoImpl() const override;
         StageBufferRequirements getBufferRequirements() const override;
+        StageBufferContract bufferContract() const override;
 
         const Params &getParams() const { return params_; }
 

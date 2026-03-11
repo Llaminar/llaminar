@@ -9,6 +9,9 @@
 #include "../IWorkspaceConsumerStage.h"
 #include "../StageParamsBase.h"
 #include "../../../tensors/TensorKernels.h"
+#include "../../../memory/BufferId.h"
+
+#include <optional>
 
 namespace llaminar2
 {
@@ -45,6 +48,9 @@ namespace llaminar2
             // Batched input (alternative to token_ids)
             const std::vector<std::vector<int>> *token_batches = nullptr;
             int padded_seq_len = 0;
+
+            // Optional BufferIds for contract-based coherence
+            std::optional<BufferId> output_buffer_id;
         };
 
         explicit EmbeddingStage(Params params);
@@ -68,6 +74,7 @@ namespace llaminar2
         }
         StageDumpInfo buildDumpInfoImpl() const override;
         StageBufferRequirements getBufferRequirements() const override;
+        StageBufferContract bufferContract() const override;
 
         // IWorkspaceConsumerStage Implementation
         IWorkspaceConsumer *getKernelAsWorkspaceConsumer() override;

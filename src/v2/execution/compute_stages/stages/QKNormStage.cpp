@@ -205,4 +205,24 @@ namespace llaminar2
         return reqs;
     }
 
+    StageBufferContract QKNormStage::bufferContract() const
+    {
+        if (!params_.input_buffer_id || !params_.output_buffer_id)
+            return {};
+
+        auto contract = StageBufferContract::build();
+
+        if (*params_.input_buffer_id == *params_.output_buffer_id)
+        {
+            contract.addInOut(*params_.input_buffer_id);
+        }
+        else
+        {
+            contract.addInput(*params_.input_buffer_id);
+            contract.addOutput(*params_.output_buffer_id);
+        }
+
+        return contract;
+    }
+
 } // namespace llaminar2

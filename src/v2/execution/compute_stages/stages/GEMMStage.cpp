@@ -512,4 +512,14 @@ namespace llaminar2
         return dynamic_cast<IWorkspaceConsumer *>(gemm);
     }
 
+    StageBufferContract GEMMStage::bufferContract() const
+    {
+        if (!params_.a_buffer_id || !params_.c_buffer_id)
+            return {};
+
+        return StageBufferContract::build()
+            .addInput(*params_.a_buffer_id)
+            .addOutput(*params_.c_buffer_id);
+    }
+
 } // namespace llaminar2

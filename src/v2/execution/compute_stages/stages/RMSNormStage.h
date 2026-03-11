@@ -7,6 +7,10 @@
 
 #include "../IComputeStage.h"
 #include "../StageParamsBase.h"
+#include "../../../memory/BufferId.h"
+
+#include <optional>
+
 namespace llaminar2
 {
     // Forward declaration
@@ -39,6 +43,10 @@ namespace llaminar2
             // If 0, derives from input tensor dimensions
             // CRITICAL: Must be set during decode when using pre-allocated buffers
             int seq_len = 0;
+
+            // Optional BufferIds for contract-based coherence
+            std::optional<BufferId> input_buffer_id;
+            std::optional<BufferId> output_buffer_id;
         };
 
         explicit RMSNormStage(Params params);
@@ -50,9 +58,9 @@ namespace llaminar2
         bool supportsBackend(ComputeBackendType backend) const override;
         StageDumpInfo buildDumpInfoImpl() const override;
         StageBufferRequirements getBufferRequirements() const override;
+        StageBufferContract bufferContract() const override;
 
         /// Target device for coherence management
-
 
         const Params &getParams() const { return params_; }
 

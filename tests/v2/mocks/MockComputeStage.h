@@ -70,6 +70,7 @@ namespace llaminar2
 
             ComputeStageType type() const override { return type_; }
             std::string name() const override { return name_; }
+            CoherencePolicy coherencePolicy() const override { return CoherencePolicy::NONE; }
             size_t estimatedFlops() const override { return estimated_flops_; }
             size_t estimatedMemoryBytes() const override { return estimated_memory_; }
             bool requiresAllreduce() const override { return requires_allreduce_; }
