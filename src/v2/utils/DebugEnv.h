@@ -2259,6 +2259,8 @@ namespace llaminar2
         int repack_budget_mb = 1024;           ///< VRAM budget cap for startup GPU repack staging buffers
         int repack_streams = 3;                ///< Stream count hint for startup GPU repack pipeline
         bool force_ck = false;                 ///< Force CK ComposableKernel dispatch for all GEMMs (LLAMINAR_ROCM_FORCE_CK)
+        bool concurrent_prefill = true;        ///< Multi-stream concurrent fused GEMM projections during prefill (LLAMINAR_ROCM_CONCURRENT_PREFILL, default ON)
+        bool concurrent_decode = false;        ///< Enable multi-stream concurrent fused GEMV projections during decode (LLAMINAR_ROCM_CONCURRENT_DECODE)
 
         ROCmConfig()
         {
@@ -2313,6 +2315,8 @@ namespace llaminar2
             repack_budget_mb = 1024;
             repack_streams = 3;
             force_ck = false;
+            concurrent_prefill = true;
+            concurrent_decode = false;
 
             const char *trace_coh_env = std::getenv("LLAMINAR_ROCM_TRACE_COHERENCE");
             if (trace_coh_env)
@@ -2606,6 +2610,18 @@ namespace llaminar2
             if (force_ck_env)
             {
                 force_ck = (std::atoi(force_ck_env) != 0);
+            }
+
+            const char *concurrent_prefill_env = std::getenv("LLAMINAR_ROCM_CONCURRENT_PREFILL");
+            if (concurrent_prefill_env)
+            {
+                concurrent_prefill = (std::atoi(concurrent_prefill_env) != 0);
+            }
+
+            const char *concurrent_decode_env = std::getenv("LLAMINAR_ROCM_CONCURRENT_DECODE");
+            if (concurrent_decode_env)
+            {
+                concurrent_decode = (std::atoi(concurrent_decode_env) != 0);
             }
         }
     };

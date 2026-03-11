@@ -841,6 +841,162 @@ namespace llaminar2
                 return true;
             }
 
+            // =================================================================
+            // ConcurrentPrefillPool: lightweight stream + scratch pool for
+            // overlapping fused GEMM projections during prefill (M>1).
+            //
+            // Each stream gets its own scratch buffer so blockwise GEMM kernels
+            // can write intermediate results without conflicting with projections
+            // on other streams.  The pool is lazily initialized on first use and
+            // persisted for the process lifetime (trivially small: 2-3 HIP streams
+            // + events + a few MB of scratch).
+            // =================================================================
+            struct ConcurrentPrefillPool
+            {
+                static constexpr int MAX_STREAMS = 8;
+
+                hipStream_t streams[MAX_STREAMS] = {};
+                hipEvent_t completion[MAX_STREAMS] = {};
+                hipEvent_t quant_ready = nullptr;
+                int32_t *scratch[MAX_STREAMS] = {};
+                size_t scratch_capacity[MAX_STREAMS] = {}; // in elements (M*N)
+                float *scatter_partial[MAX_STREAMS] = {};
+                size_t scatter_partial_capacity[MAX_STREAMS] = {}; // in elements (KB_MAX*N)
+                int count = 0;
+                int device_id = -1;
+                bool initialized = false;
+
+                void init(int dev_id, int num_streams)
+                {
+                    if (initialized)
+                        return;
+                    device_id = dev_id;
+                    count = std::min(num_streams, MAX_STREAMS);
+                    hipSetDevice(dev_id);
+                    for (int i = 0; i < count; ++i)
+                    {
+                        hipStreamCreateWithFlags(&streams[i], hipStreamNonBlocking);
+                        hipEventCreateWithFlags(&completion[i], hipEventDisableTiming);
+                    }
+                    hipEventCreateWithFlags(&quant_ready, hipEventDisableTiming);
+                    initialized = true;
+                    LOG_INFO("[ConcurrentPrefillPool] Initialized " << count
+                                                                     << " streams on device " << dev_id);
+                }
+
+                // Ensure scratch buffer i has at least `elements` int32s
+                bool ensureScratch(int idx, size_t elements)
+                {
+                    if (idx < 0 || idx >= count)
+                        return false;
+                    if (scratch_capacity[idx] >= elements)
+                        return true; // Already big enough
+
+                    // Free old
+                    if (scratch[idx])
+                    {
+                        hipSetDevice(device_id);
+                        hipFree(scratch[idx]);
+                        scratch[idx] = nullptr;
+                        scratch_capacity[idx] = 0;
+                    }
+
+                    hipSetDevice(device_id);
+                    hipError_t err = hipMalloc(&scratch[idx], elements * sizeof(int32_t));
+                    if (err != hipSuccess)
+                    {
+                        LOG_ERROR("[ConcurrentPrefillPool] Failed to allocate scratch["
+                                  << idx << "] (" << (elements * 4 / 1024) << " KB): "
+                                  << hipGetErrorString(err));
+                        return false;
+                    }
+                    scratch_capacity[idx] = elements;
+                    LOG_DEBUG("[ConcurrentPrefillPool] Allocated scratch[" << idx
+                                                                           << "] = " << (elements * 4 / 1024) << " KB");
+                    return true;
+                }
+
+                // Ensure scatter partial buffer i has at least `elements` floats
+                bool ensureScatterPartial(int idx, size_t elements)
+                {
+                    if (idx < 0 || idx >= count)
+                        return false;
+                    if (scatter_partial_capacity[idx] >= elements)
+                        return true;
+
+                    if (scatter_partial[idx])
+                    {
+                        hipSetDevice(device_id);
+                        hipFree(scatter_partial[idx]);
+                        scatter_partial[idx] = nullptr;
+                        scatter_partial_capacity[idx] = 0;
+                    }
+
+                    hipSetDevice(device_id);
+                    hipError_t err = hipMalloc(&scatter_partial[idx], elements * sizeof(float));
+                    if (err != hipSuccess)
+                    {
+                        LOG_ERROR("[ConcurrentPool] Failed to allocate scatter_partial["
+                                  << idx << "] (" << (elements * 4 / 1024) << " KB): "
+                                  << hipGetErrorString(err));
+                        return false;
+                    }
+                    scatter_partial_capacity[idx] = elements;
+                    LOG_DEBUG("[ConcurrentPool] Allocated scatter_partial[" << idx
+                                                                           << "] = " << (elements * 4 / 1024) << " KB");
+                    return true;
+                }
+
+                void destroy()
+                {
+                    if (!initialized)
+                        return;
+                    hipSetDevice(device_id);
+                    for (int i = 0; i < count; ++i)
+                    {
+                        if (streams[i])
+                        {
+                            hipStreamDestroy(streams[i]);
+                            streams[i] = nullptr;
+                        }
+                        if (completion[i])
+                        {
+                            hipEventDestroy(completion[i]);
+                            completion[i] = nullptr;
+                        }
+                        if (scratch[i])
+                        {
+                            hipFree(scratch[i]);
+                            scratch[i] = nullptr;
+                            scratch_capacity[i] = 0;
+                        }
+                        if (scatter_partial[i])
+                        {
+                            hipFree(scatter_partial[i]);
+                            scatter_partial[i] = nullptr;
+                            scatter_partial_capacity[i] = 0;
+                        }
+                    }
+                    if (quant_ready)
+                    {
+                        hipEventDestroy(quant_ready);
+                        quant_ready = nullptr;
+                    }
+                    initialized = false;
+                    count = 0;
+                }
+
+                ~ConcurrentPrefillPool() { destroy(); }
+            };
+
+            // Per-device singleton pool (indexed by device_id)
+            ConcurrentPrefillPool &getConcurrentPrefillPool(int device_id)
+            {
+                static ConcurrentPrefillPool pools[8]; // up to 8 devices
+                int idx = std::clamp(device_id, 0, 7);
+                return pools[idx];
+            }
+
             template <typename ImplT>
             inline bool waitForStartupRepackIfNeeded(
                 ImplT *impl,
@@ -1514,8 +1670,13 @@ namespace llaminar2
             const float *d_bias,
             int m, int n, int k,
             float alpha, float beta,
-            const char *callsite)
+            const char *callsite,
+            void *stream_override,
+            int32_t *scratch_int32_override)
         {
+            // Use overrides when provided (concurrent prefill dispatch)
+            void *effective_stream = stream_override ? stream_override : gpu_stream_;
+            int32_t *effective_scratch_int32 = scratch_int32_override ? scratch_int32_override : (impl_ ? impl_->d_C_int32 : nullptr);
             const auto path_label = [&](PrefillDispatchPath p) -> const char *
             {
                 switch (p)
@@ -1597,7 +1758,7 @@ namespace llaminar2
                                               << reason << ")"); });
             };
 
-            if (!impl_ || !d_A_int8 || !d_output || !d_scales_A || !d_scales_B || !impl_->d_C_int32)
+            if (!impl_ || !d_A_int8 || !d_output || !d_scales_A || !d_scales_B || !effective_scratch_int32)
             {
                 logFallback("buffers");
                 return false;
@@ -1640,7 +1801,7 @@ namespace llaminar2
                     d_scales_A_blockwise,
                     m, n, k,
                     impl_->native_vnni_codebook_id,
-                    rocm_device_id_, gpu_stream_);
+                    rocm_device_id_, effective_stream);
 
                 if (profiling_enabled)
                     kernel_end = std::chrono::high_resolution_clock::now();
@@ -1670,7 +1831,7 @@ namespace llaminar2
                             m,
                             n,
                             rocm_device_id_,
-                            gpu_stream_))
+                            effective_stream))
                     {
                         logFallback("launch_error");
                         return false;
@@ -1843,7 +2004,7 @@ namespace llaminar2
                 {
                     // Reinterpret d_C_int32 buffer as float* — same 4-byte-per-element
                     // layout, device memory, no reallocation needed.
-                    float *d_C_fp32_blockwise = reinterpret_cast<float *>(impl_->d_C_int32);
+                    float *d_C_fp32_blockwise = reinterpret_cast<float *>(effective_scratch_int32);
 
                     const auto &bw_env = debugEnv().rocm;
                     // Data-driven dispatch (tuned on gfx906 MI50/MI60, UNROLL_KK sweep):
@@ -1874,7 +2035,7 @@ namespace llaminar2
                             d_C_fp32_blockwise,
                             d_scales_A_blockwise,
                             m, n, k,
-                            rocm_device_id_, gpu_stream_,
+                            rocm_device_id_, effective_stream,
                             v3_mt,
                             bw_env.blockwise_v3_unroll);
                     }
@@ -1886,7 +2047,7 @@ namespace llaminar2
                             d_C_fp32_blockwise,
                             d_scales_A_blockwise,
                             m, n, k,
-                            rocm_device_id_, gpu_stream_,
+                            rocm_device_id_, effective_stream,
                             bw_env.blockwise_v7_mt,
                             bw_env.blockwise_v7_unroll);
                     }
@@ -1917,7 +2078,7 @@ namespace llaminar2
                                 alpha, beta,
                                 d_existing,
                                 d_bias,
-                                rocm_device_id_, gpu_stream_))
+                                rocm_device_id_, effective_stream))
                         {
                             logFallback("launch_error");
                             return false;
@@ -1953,10 +2114,10 @@ namespace llaminar2
                         native_ok = rocmQuantGemm_int8_int8_int32_vnni_prefill_wide_tile_v7(
                             d_A_int8,
                             impl_->d_weights_int8_vnni,
-                            impl_->d_C_int32,
+                            effective_scratch_int32,
                             m, n, k,
                             rocm_env.wide_tile_kt,
-                            rocm_device_id_, gpu_stream_);
+                            rocm_device_id_, effective_stream);
                     }
                     else if (rocm_env.wide_tile_v3)
                     {
@@ -1964,10 +2125,10 @@ namespace llaminar2
                         native_ok = rocmQuantGemm_int8_int8_int32_vnni_prefill_wide_tile_v3(
                             d_A_int8,
                             impl_->d_weights_int8_vnni,
-                            impl_->d_C_int32,
+                            effective_scratch_int32,
                             m, n, k,
                             rocm_env.wide_tile_kt,
-                            rocm_device_id_, gpu_stream_);
+                            rocm_device_id_, effective_stream);
                     }
                     else if (k >= n)
                     {
@@ -1978,10 +2139,10 @@ namespace llaminar2
                         native_ok = rocmQuantGemm_int8_int8_int32_vnni_prefill_wide_tile_v3(
                             d_A_int8,
                             impl_->d_weights_int8_vnni,
-                            impl_->d_C_int32,
+                            effective_scratch_int32,
                             m, n, k,
                             16, // KT=16: best throughput for V3 auto-dispatch (perf sweep shows KT=16 wins 10/12 shapes)
-                            rocm_device_id_, gpu_stream_);
+                            rocm_device_id_, effective_stream);
                     }
                     else
                     {
@@ -1995,10 +2156,10 @@ namespace llaminar2
                         native_ok = rocmQuantGemm_int8_int8_int32_vnni_prefill_wide_tile_v7(
                             d_A_int8,
                             impl_->d_weights_int8_vnni,
-                            impl_->d_C_int32,
+                            effective_scratch_int32,
                             m, n, k,
                             16, // KT=16: best for V7 (safe-tile split, 2 waves/SIMD)
-                            rocm_device_id_, gpu_stream_);
+                            rocm_device_id_, effective_stream);
                     }
                     if (!native_ok)
                     {
@@ -2124,14 +2285,14 @@ namespace llaminar2
                         native_ok = rocmQuantGemm_int8_int8_int32_vnni_prefill_grid_kpar(
                             d_A_int8,
                             impl_->d_weights_int8_vnni,
-                            impl_->d_C_int32,
+                            effective_scratch_int32,
                             m, n, k,
                             requested_slices,
                             grid_variant,
                             cpt,
                             kernel_body_variant,
                             grid_swizzle_variant,
-                            rocm_device_id_, gpu_stream_);
+                            rocm_device_id_, effective_stream);
 
                         if (!native_ok)
                         {
@@ -2146,11 +2307,11 @@ namespace llaminar2
                         native_ok = rocmQuantGemm_int8_int8_int32_vnni_prefill(
                             d_A_int8,
                             impl_->d_weights_int8_vnni,
-                            impl_->d_C_int32,
+                            effective_scratch_int32,
                             m, n, k,
                             baseline_variant,
                             cpt,
-                            rocm_device_id_, gpu_stream_);
+                            rocm_device_id_, effective_stream);
                     }
                 } // end if (!native_ok) — grid-kpar / baseline fallback scope
                 if (profiling_enabled)
@@ -2183,7 +2344,7 @@ namespace llaminar2
             if (profiling_enabled)
                 epilogue_start = std::chrono::high_resolution_clock::now();
             if (!rocmQuantGemm_applyScaling(
-                    impl_->d_C_int32,
+                    effective_scratch_int32,
                     d_output,
                     d_scales_A,
                     d_scales_B,
@@ -2191,7 +2352,7 @@ namespace llaminar2
                     alpha, beta,
                     d_existing,
                     d_bias,
-                    rocm_device_id_, gpu_stream_))
+                    rocm_device_id_, effective_stream))
             {
                 logFallback("launch_error");
                 return false;
@@ -3755,6 +3916,400 @@ namespace llaminar2
 #endif
                 return true;
             };
+
+            // =========================================================================
+            // CONCURRENT PREFILL PATH: Multi-stream dispatch for M>1 projections
+            //
+            // When enabled (LLAMINAR_ROCM_CONCURRENT_PREFILL=1), overlaps fused GEMM
+            // projections on separate HIP streams.  Each projection gets its own
+            // stream + scratch buffer so blockwise V7 kernels can write intermediate
+            // results without conflicting.
+            //
+            // Prerequisites:
+            //   - M > 1 (prefill, not decode)
+            //   - >= 2 projections
+            //   - All projections have VNNI weights (tryPrefillNativeGemm path)
+            //   - No BAR-backed or mapped outputs (those need shared d_C_fp32)
+            //
+            // DAG: quantization (main stream)
+            //        ├──> projection 0 (stream 0, scratch 0)
+            //        ├──> projection 1 (stream 1, scratch 1)
+            //        └──> ...
+            //      main stream waits on all completion events
+            // =========================================================================
+#ifdef HAVE_ROCM
+            if (m > 1 && projections.size() >= 2 &&
+                fused_uses_blockwise_shared_quant &&
+                debugEnv().rocm.concurrent_prefill)
+            {
+                // Check eligibility: all outputs must be direct device memory (not BAR/mapped)
+                bool concurrent_eligible = true;
+                for (size_t i = 0; i < projections.size(); ++i)
+                {
+                    const auto &proj = projections[i];
+                    if (!proj.kernel || !proj.output)
+                    {
+                        concurrent_eligible = false;
+                        break;
+                    }
+                    auto *fp32_out = dynamic_cast<FP32Tensor *>(proj.output);
+                    if (!fp32_out)
+                    {
+                        concurrent_eligible = false;
+                        break;
+                    }
+                    if (fp32_out->isMapped() ||
+                        (fp32_out->isBARBacked() && fp32_out->bar_address() != nullptr))
+                    {
+                        concurrent_eligible = false;
+                        break;
+                    }
+                    auto *rk = dynamic_cast<ROCmQuantisedGemmKernel *>(proj.kernel);
+                    if (!rk || !rk->impl_)
+                    {
+                        concurrent_eligible = false;
+                        break;
+                    }
+                }
+
+                if (concurrent_eligible)
+                {
+                    const int num_proj = static_cast<int>(projections.size());
+                    auto &pool = getConcurrentPrefillPool(rocm_device_id_);
+                    pool.init(rocm_device_id_, num_proj);
+
+                    // Record event after quantization completes on main stream
+                    hipEventRecord(pool.quant_ready,
+                                   static_cast<hipStream_t>(gpu_stream_));
+
+                    bool concurrent_ok = true;
+                    for (int pi = 0; pi < num_proj && concurrent_ok; ++pi)
+                    {
+                        const auto &proj = projections[pi];
+                        auto *rocm_kernel = dynamic_cast<ROCmQuantisedGemmKernel *>(proj.kernel);
+                        const int n = proj.n;
+
+                        // Validate and prepare this projection's workspace
+                        rocm_kernel->validateWorkspace();
+
+                        // Get output pointer
+                        auto *fp32_output = dynamic_cast<FP32Tensor *>(proj.output);
+                        float *d_output = nullptr;
+                        if (fp32_output->isBARBacked() && fp32_output->rocm_data_ptr() != nullptr)
+                            d_output = static_cast<float *>(fp32_output->rocm_data_ptr());
+                        else
+                            d_output = static_cast<float *>(fp32_output->gpu_data_ptr());
+
+                        if (!d_output)
+                        {
+                            LOG_ERROR("[ConcurrentPrefill] Projection " << pi << " output has no GPU data");
+                            concurrent_ok = false;
+                            break;
+                        }
+
+                        // Get per-projection weight scales and bias
+                        const float *d_scales_B = rocm_kernel->impl_->d_scales_B;
+                        const float *d_bias = nullptr;
+                        if (proj.bias)
+                        {
+                            auto *bias_fp32 = dynamic_cast<FP32Tensor *>(const_cast<TensorBase *>(proj.bias));
+                            if (bias_fp32)
+                            {
+                                if (bias_fp32->isBARBacked() && bias_fp32->rocm_data_ptr() != nullptr)
+                                    d_bias = static_cast<const float *>(bias_fp32->rocm_data_ptr());
+                                else
+                                    d_bias = static_cast<const float *>(bias_fp32->gpu_data_ptr());
+                            }
+                        }
+
+                        // Ensure scratch buffer for this stream
+                        const size_t scratch_elements = static_cast<size_t>(m) * n;
+                        int stream_idx = pi % pool.count;
+                        if (!pool.ensureScratch(stream_idx, scratch_elements))
+                        {
+                            LOG_ERROR("[ConcurrentPrefill] Failed to allocate scratch for projection " << pi);
+                            concurrent_ok = false;
+                            break;
+                        }
+
+                        // This stream waits for quantization to complete
+                        hipStreamWaitEvent(pool.streams[stream_idx], pool.quant_ready, 0);
+
+                        // If projections > streams, wait for previous projection on this stream
+                        if (pi >= pool.count)
+                        {
+                            hipStreamWaitEvent(pool.streams[stream_idx],
+                                               pool.completion[stream_idx], 0);
+                        }
+
+                        // Dispatch with stream + scratch overrides
+                        LOG_DEBUG("[ConcurrentPrefill] Projection " << pi
+                                                                     << " (" << (proj.name ? proj.name : "?")
+                                                                     << ") M=" << m << " N=" << n << " K=" << k
+                                                                     << " on stream " << stream_idx);
+
+                        bool proj_ok = rocm_kernel->tryPrefillNativeGemm(
+                            impl_->d_A_int8,
+                            d_output,
+                            impl_->d_scales_A,
+                            impl_->d_scales_A_blockwise,
+                            d_scales_B,
+                            d_bias,
+                            m, n, k,
+                            1.0f, 0.0f,
+                            "ConcurrentPrefill",
+                            pool.streams[stream_idx],
+                            pool.scratch[stream_idx]);
+
+                        if (!proj_ok)
+                        {
+                            LOG_WARN("[ConcurrentPrefill] Projection " << pi
+                                                                        << " failed on concurrent path; falling back to sequential");
+                            concurrent_ok = false;
+                            break;
+                        }
+
+                        // Record completion event for this stream
+                        hipEventRecord(pool.completion[stream_idx],
+                                       pool.streams[stream_idx]);
+                    }
+
+                    if (concurrent_ok)
+                    {
+                        // Main stream waits for all projection streams to finish
+                        for (int si = 0; si < std::min(num_proj, pool.count); ++si)
+                        {
+                            hipStreamWaitEvent(
+                                static_cast<hipStream_t>(gpu_stream_),
+                                pool.completion[si], 0);
+                        }
+
+                        LOG_DEBUG("[ConcurrentPrefill] All " << num_proj
+                                                              << " projections dispatched concurrently");
+
+                        // Restore workspace and return success
+                        if (ws && ws != saved_workspace)
+                            workspace_ = saved_workspace;
+                        return true;
+                    }
+
+                    // Concurrent path failed — fall through to sequential path below
+                    // Sync all concurrent streams to avoid data races with sequential fallback
+                    for (int si = 0; si < pool.count; ++si)
+                    {
+                        hipStreamSynchronize(pool.streams[si]);
+                    }
+                    LOG_WARN("[ConcurrentPrefill] Falling back to sequential dispatch");
+                }
+            }
+#endif // HAVE_ROCM
+
+            // =========================================================================
+            // CONCURRENT DECODE PATH: Multi-stream dispatch for M=1 GEMV projections
+            //
+            // When enabled (LLAMINAR_ROCM_CONCURRENT_DECODE=1), overlaps fused GEMV
+            // projections on separate HIP streams.  At small TP-sharded N dimensions,
+            // individual GEMVs may not saturate all CUs, so overlapping them can
+            // improve utilization.
+            //
+            // INT8-VNNI projections use rocmGemv_int8_int8_fp32_vnni_blockwise_scaled
+            //   which has no shared scratch dependency (atomicAdd to output).
+            // Native-VNNI projections use rocmGemv_native_vnni_fp32 which needs a
+            //   per-stream scatter_partial buffer from the pool.
+            //
+            // DAG: quantization (main stream)
+            //        ├──> projection 0 GEMV (stream 0)
+            //        ├──> projection 1 GEMV (stream 1)
+            //        └──> ...
+            //      main stream waits on all completion events
+            // =========================================================================
+#ifdef HAVE_ROCM
+            if (m == 1 && projections.size() >= 2 &&
+                fused_uses_blockwise_shared_quant &&
+                debugEnv().rocm.concurrent_decode)
+            {
+                bool decode_concurrent_eligible = true;
+                for (size_t i = 0; i < projections.size(); ++i)
+                {
+                    const auto &proj = projections[i];
+                    if (!proj.kernel || !proj.output)
+                    {
+                        decode_concurrent_eligible = false;
+                        break;
+                    }
+                    auto *fp32_out = dynamic_cast<FP32Tensor *>(proj.output);
+                    if (!fp32_out)
+                    {
+                        decode_concurrent_eligible = false;
+                        break;
+                    }
+                    // Mapped or BAR outputs use shared d_C_fp32 — cannot overlap
+                    if (fp32_out->isMapped() ||
+                        (fp32_out->isBARBacked() && fp32_out->bar_address() != nullptr))
+                    {
+                        decode_concurrent_eligible = false;
+                        break;
+                    }
+                    auto *rk = dynamic_cast<ROCmQuantisedGemmKernel *>(proj.kernel);
+                    if (!rk || !rk->impl_)
+                    {
+                        decode_concurrent_eligible = false;
+                        break;
+                    }
+                }
+
+                if (decode_concurrent_eligible)
+                {
+                    const int num_proj = static_cast<int>(projections.size());
+                    auto &pool = getConcurrentPrefillPool(rocm_device_id_);
+                    pool.init(rocm_device_id_, num_proj);
+
+                    // Record event after quantization completes on main stream
+                    hipEventRecord(pool.quant_ready,
+                                   static_cast<hipStream_t>(gpu_stream_));
+
+                    bool concurrent_ok = true;
+                    for (int pi = 0; pi < num_proj && concurrent_ok; ++pi)
+                    {
+                        const auto &proj = projections[pi];
+                        auto *rocm_kernel = dynamic_cast<ROCmQuantisedGemmKernel *>(proj.kernel);
+                        const int n = proj.n;
+
+                        auto *fp32_output = dynamic_cast<FP32Tensor *>(proj.output);
+                        float *d_output = nullptr;
+                        if (fp32_output->isBARBacked() && fp32_output->rocm_data_ptr() != nullptr)
+                            d_output = static_cast<float *>(fp32_output->rocm_data_ptr());
+                        else
+                            d_output = static_cast<float *>(fp32_output->gpu_data_ptr());
+
+                        if (!d_output)
+                        {
+                            concurrent_ok = false;
+                            break;
+                        }
+
+                        const float *d_scales_B = rocm_kernel->impl_->d_scales_B;
+                        const float *d_bias = nullptr;
+                        if (proj.bias)
+                        {
+                            auto *bias_fp32 = dynamic_cast<FP32Tensor *>(const_cast<TensorBase *>(proj.bias));
+                            if (bias_fp32)
+                            {
+                                if (bias_fp32->isBARBacked() && bias_fp32->rocm_data_ptr() != nullptr)
+                                    d_bias = static_cast<const float *>(bias_fp32->rocm_data_ptr());
+                                else
+                                    d_bias = static_cast<const float *>(bias_fp32->gpu_data_ptr());
+                            }
+                        }
+
+                        int stream_idx = pi % pool.count;
+
+                        // This stream waits for quantization
+                        hipStreamWaitEvent(pool.streams[stream_idx], pool.quant_ready, 0);
+
+                        // If reusing a stream, wait for its previous work
+                        if (pi >= pool.count)
+                        {
+                            hipStreamWaitEvent(pool.streams[stream_idx],
+                                               pool.completion[stream_idx], 0);
+                        }
+
+                        bool proj_ok = false;
+
+                        if (rocm_kernel->impl_->has_native_vnni)
+                        {
+                            // Native-VNNI GEMV: needs per-stream scatter_partial
+                            constexpr int SCATTER_KB_MAX = 64;
+                            const size_t partial_elements = static_cast<size_t>(SCATTER_KB_MAX) * n;
+                            if (!pool.ensureScatterPartial(stream_idx, partial_elements))
+                            {
+                                concurrent_ok = false;
+                                break;
+                            }
+
+                            proj_ok = rocmGemv_native_vnni_fp32(
+                                impl_->d_A_int8,
+                                rocm_kernel->impl_->d_weights_native_payload,
+                                rocm_kernel->impl_->d_weights_native_scales,
+                                rocm_kernel->impl_->d_weights_native_mins,
+                                rocm_kernel->impl_->d_weights_native_emins,
+                                d_output,
+                                impl_->d_scales_A,
+                                pool.scatter_partial[stream_idx],
+                                n, k,
+                                rocm_kernel->impl_->native_vnni_codebook_id,
+                                rocm_device_id_, pool.streams[stream_idx],
+                                fused_uses_blockwise_shared_quant ? impl_->d_scales_A_blockwise : nullptr);
+                        }
+                        else
+                        {
+                            // INT8-VNNI GEMV: no shared scratch needed
+                            int8_t *d_vnni = rocm_kernel->impl_->d_weights_int8_vnni;
+                            if (!d_vnni)
+                            {
+                                concurrent_ok = false;
+                                break;
+                            }
+
+                            proj_ok = rocmGemv_int8_int8_fp32_vnni_blockwise_scaled(
+                                impl_->d_A_int8, d_vnni, d_output,
+                                impl_->d_scales_A_blockwise, d_scales_B,
+                                n, k,
+                                1.0f, 0.0f,
+                                nullptr, d_bias,
+                                rocm_device_id_, pool.streams[stream_idx]);
+                        }
+
+                        if (!proj_ok)
+                        {
+                            LOG_WARN("[ConcurrentDecode] Projection " << pi
+                                                                       << " failed; falling back to sequential");
+                            concurrent_ok = false;
+                            break;
+                        }
+
+                        // Bias for native-VNNI (INT8-VNNI handles bias in-kernel)
+                        if (rocm_kernel->impl_->has_native_vnni && d_bias)
+                        {
+                            if (!rocmQuantGemm_biasAdd(d_output, d_bias, m, n,
+                                                       rocm_device_id_, pool.streams[stream_idx]))
+                            {
+                                concurrent_ok = false;
+                                break;
+                            }
+                        }
+
+                        hipEventRecord(pool.completion[stream_idx],
+                                       pool.streams[stream_idx]);
+                    }
+
+                    if (concurrent_ok)
+                    {
+                        for (int si = 0; si < std::min(num_proj, pool.count); ++si)
+                        {
+                            hipStreamWaitEvent(
+                                static_cast<hipStream_t>(gpu_stream_),
+                                pool.completion[si], 0);
+                        }
+
+                        LOG_DEBUG("[ConcurrentDecode] All " << num_proj
+                                                             << " projections dispatched concurrently");
+
+                        if (ws && ws != saved_workspace)
+                            workspace_ = saved_workspace;
+                        return true;
+                    }
+
+                    // Fallback: sync all streams, fall through to sequential
+                    for (int si = 0; si < pool.count; ++si)
+                    {
+                        hipStreamSynchronize(pool.streams[si]);
+                    }
+                    LOG_WARN("[ConcurrentDecode] Falling back to sequential dispatch");
+                }
+            }
+#endif // HAVE_ROCM
+
             for (size_t i = 0; i < projections.size() && all_success; ++i)
             {
                 const auto &proj = projections[i];

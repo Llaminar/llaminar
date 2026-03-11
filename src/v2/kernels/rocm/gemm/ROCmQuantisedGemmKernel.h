@@ -725,7 +725,9 @@ namespace llaminar2
                 const float *d_bias,
                 int m, int n, int k,
                 float alpha, float beta,
-                const char *callsite);
+                const char *callsite,
+                void *stream_override = nullptr,
+                int32_t *scratch_int32_override = nullptr);
 
             /**
              * @brief Q8_1 activations → INT8 GEMM → FP32 output
