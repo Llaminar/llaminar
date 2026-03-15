@@ -1669,8 +1669,10 @@ TEST_F(Test__ROCmFlashAttentionParity, FlashAttn2_RealQwen2Layer3InputSensitivit
               << ", k_only_cos=" << k_only_cos
               << ", v_only_cos=" << v_only_cos << std::endl;
 
-    EXPECT_LT(all_inputs_cos, 0.995)
-        << "ROCm layer-3 Q/K/V snapshots should reproduce the bad attention-context cosine on CPU";
+    // With rocBLAS prefill, GPU Q/K/V snapshots closely match CPU reference.
+    // (The old cooperative kernel diverged here — cosine < 0.995.)
+    EXPECT_GT(all_inputs_cos, 0.999)
+        << "ROCm layer-3 Q/K/V snapshots should produce attention-context close to CPU reference";
 }
 
 TEST_F(Test__ROCmFlashAttentionParity, FlashDecode_FP32_VeryLong_Parity)
