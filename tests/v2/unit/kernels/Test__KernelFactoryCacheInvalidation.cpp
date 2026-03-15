@@ -14,7 +14,7 @@
 
 #include <gtest/gtest.h>
 #include "kernels/KernelFactory.h"
-#include "kernels/cuda/CUDAWeightPacker.h"
+#include "kernels/cuda/gemm/CUDAWeightPacker.h"
 #include "tensors/Tensors.h"
 #include "backends/ComputeBackend.h"
 #include <memory>

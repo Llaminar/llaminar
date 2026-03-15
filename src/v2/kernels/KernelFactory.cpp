@@ -35,8 +35,8 @@
 
 // CUDA kernel classes
 #ifdef HAVE_CUDA
-#include "cuda/CUDAQuantisedGemmKernel.h"             // Quantized tensors via CUTLASS INT8
-#include "cuda/CUDAFloatingPointGemmKernel.h"         // FP32/FP16/BF16 via cuBLAS
+#include "cuda/gemm/CUDAQuantisedGemmKernel.h"             // Quantized tensors via CUTLASS INT8
+#include "cuda/gemm/CUDAFloatingPointGemmKernel.h"         // FP32/FP16/BF16 via cuBLAS
 #include "cuda/ops/CUDARMSNormKernelT.h"              // RMSNorm FP32/FP16/BF16
 #include "cuda/ops/CUDARoPEKernelT.h"                 // RoPE FP32/FP16/BF16
 #include "cuda/ops/CUDASwiGLUKernelT.h"               // SwiGLU FP32/FP16/BF16

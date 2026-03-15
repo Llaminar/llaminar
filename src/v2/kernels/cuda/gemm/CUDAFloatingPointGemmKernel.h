@@ -23,7 +23,7 @@
 
 #pragma once
 
-#include "../../tensors/TensorKernels.h"
+#include "tensors/TensorKernels.h"
 #include <memory>
 #include <cstdint>
 

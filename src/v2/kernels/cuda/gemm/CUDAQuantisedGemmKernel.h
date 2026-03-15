@@ -35,9 +35,9 @@
 #pragma once
 
 #include "CUDAWeightPacker.h"
-#include "../../tensors/TensorKernels.h"
-#include "../../tensors/BlockStructures.h"
-#include "../../interfaces/IWorkspaceConsumer.h"
+#include "tensors/TensorKernels.h"
+#include "tensors/BlockStructures.h"
+#include "interfaces/IWorkspaceConsumer.h"
 #include <memory>
 #include <cstdint>
 #include <vector>

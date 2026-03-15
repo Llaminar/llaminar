@@ -32,7 +32,7 @@
 
 #pragma once
 
-#include "CUDAKernelBase.h"
+#include "kernels/cuda/CUDAKernelBase.h"
 #include <cstddef>
 #include <memory>
 #include <stdexcept>

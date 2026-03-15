@@ -32,7 +32,7 @@
 #endif
 
 #ifdef HAVE_CUDA
-#include "kernels/cuda/CuBLASGemmKernel.h"
+#include "kernels/cuda/gemm/CuBLASGemmKernel.h"
 #include "backends/GPUDeviceContextPool.h"
 #include <cuda_runtime.h>
 #endif

@@ -23,7 +23,7 @@
  * codebooks and representative Qwen decode shapes.
  */
 
-#include "kernels/cuda/CUDANativeVNNIDecodeCommon.cuh"
+#include "kernels/cuda/gemm/CUDANativeVNNIDecodeCommon.cuh"
 
 #include <cuda_runtime.h>
 #include <cstdint>
@@ -63,7 +63,7 @@ namespace
         DIRECT
     };
 
-#include "kernels/cuda/CUDANativeVNNIGemvDispatchHeuristicGenerated.inc"
+#include "kernels/cuda/gemm/CUDANativeVNNIGemvDispatchHeuristicGenerated.inc"
 
     [[maybe_unused]] static __host__ NativeGemvShape classifyShape(int N, int K)
     {

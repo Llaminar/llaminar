@@ -21,7 +21,7 @@
 #include "execution/local_execution/device/DeviceContext.h"
 #ifdef HAVE_CUDA
 #include "backends/cuda/CUDABackend.h"
-#include "kernels/cuda/CuBLASGemmKernel.h"
+#include "kernels/cuda/gemm/CuBLASGemmKernel.h"
 #include <cuda_runtime.h>
 #endif
 

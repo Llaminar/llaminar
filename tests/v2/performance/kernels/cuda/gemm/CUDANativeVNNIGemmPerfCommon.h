@@ -11,7 +11,7 @@
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "interfaces/IWorkspaceConsumer.h"
 #include "kernels/KernelFactory.h"
-#include "kernels/cuda/CUDAQuantisedGemmKernel.h"
+#include "kernels/cuda/gemm/CUDAQuantisedGemmKernel.h"
 #include "../../../../utils/TestTensorFactory.h"
 
 #include <algorithm>

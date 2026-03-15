@@ -15,7 +15,7 @@
  * Unsupported codebooks fall back to the existing Int8Expanded GEMV path.
  */
 
-#include "kernels/cuda/CUDANativeVNNIDecodeCommon.cuh"
+#include "kernels/cuda/gemm/CUDANativeVNNIDecodeCommon.cuh"
 
 #include <cstdint>
 

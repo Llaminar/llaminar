@@ -26,7 +26,7 @@
 #include "tensors/Tensors.h"
 #include "tensors/TensorKernels.h" // For TensorProjectionDesc
 #include "kernels/KernelFactory.h"
-#include "kernels/cuda/CUDAWeightPacker.h"
+#include "kernels/cuda/gemm/CUDAWeightPacker.h"
 #include "backends/ComputeBackend.h"
 #include "execution/local_execution/device/DeviceContext.h"
 #include "execution/local_execution/coherence/GpuCoherence.h"        // For gpu_output(), with_gpu_coherence()

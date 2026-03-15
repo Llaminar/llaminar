@@ -218,16 +218,16 @@ if(HAVE_CUDA)
     
     # CUDA kernels
     set(CUDA_KERNEL_SOURCES
-        kernels/cuda/CuBLASGemmKernel.cu              # cuBLAS wrapper for FP32/FP16/BF16 dense GEMM
-        kernels/cuda/CUDAQuantisedGemmKernel_CUTLASS.cu  # CUTLASS INT8 GEMM + TC weight repacking
-        kernels/cuda/CUDATensorCoreGemvKernels.cu    # per-shape DP4A GEMV family (Wide, GridKPar, LDSKReduce, Direct)
-        kernels/cuda/CUDANativeVNNIIQTables.cu    # shared IQ lookup table symbol definitions for native-vnni decode
-        kernels/cuda/CUDANativeVNNIGemvKernels.cu # native-vnni decode GEMV for Q4_0/Q4_1/IQ4_NL
-        kernels/cuda/CUDANativeVNNIGemvTuned.cu  # tuned shape-specific native-vnni GEMV (Wide/KPar/Direct)
-        kernels/cuda/CUDANativeVNNIPrefillKernels.cu  # custom native-vnni prefill GEMM family (Q4_0 first)
-        kernels/cuda/CUDAFusedTCGemm.cu              # fused tensor-core GEMM: single-launch WMMA over full K (sm_75+)
-        kernels/cuda/CUDAFusedTCGemmV2.cu             # V2 fused TC GEMM: mma.sync m16n8k32 (sm_80+ Ampere)
-        kernels/cuda/CUDATensorCoreGemmKernels.cu    # per-shape tensor-core GEMM family (SmallM, WideN, Balanced)
+        kernels/cuda/gemm/CuBLASGemmKernel.cu              # cuBLAS wrapper for FP32/FP16/BF16 dense GEMM
+        kernels/cuda/gemm/CUDAQuantisedGemmKernel_CUTLASS.cu  # CUTLASS INT8 GEMM + TC weight repacking
+        kernels/cuda/gemm/CUDATensorCoreGemvKernels.cu    # per-shape DP4A GEMV family (Wide, GridKPar, LDSKReduce, Direct)
+        kernels/cuda/gemm/CUDANativeVNNIIQTables.cu    # shared IQ lookup table symbol definitions for native-vnni decode
+        kernels/cuda/gemm/CUDANativeVNNIGemvKernels.cu # native-vnni decode GEMV for Q4_0/Q4_1/IQ4_NL
+        kernels/cuda/gemm/CUDANativeVNNIGemvTuned.cu  # tuned shape-specific native-vnni GEMV (Wide/KPar/Direct)
+        kernels/cuda/gemm/CUDANativeVNNIPrefillKernels.cu  # custom native-vnni prefill GEMM family (Q4_0 first)
+        kernels/cuda/gemm/CUDAFusedTCGemm.cu              # fused tensor-core GEMM: single-launch WMMA over full K (sm_75+)
+        kernels/cuda/gemm/CUDAFusedTCGemmV2.cu             # V2 fused TC GEMM: mma.sync m16n8k32 (sm_80+ Ampere)
+        kernels/cuda/gemm/CUDATensorCoreGemmKernels.cu    # per-shape tensor-core GEMM family (SmallM, WideN, Balanced)
         # Ops kernels (split from monolithic CUDAOpsKernels.cu)
         kernels/cuda/ops/CUDARMSNormKernels.cu        # RMSNorm kernels (FP32, BF16, FP16)
         kernels/cuda/ops/CUDAResidualAddKernels.cu    # Residual Add kernels (FP32, BF16, FP16)
@@ -1501,9 +1501,9 @@ if(HAVE_CUDA)
     # NOTE: CUDARingKVCacheTensorAdapter.cpp moved to cuda_backend to satisfy
     # template instantiation dependencies from CUDARingKVCache.cu
     target_sources(llaminar2_core PRIVATE
-        kernels/cuda/CUDAFloatingPointGemmKernel.cpp
-        kernels/cuda/CUDAWeightPacker.cpp
-        kernels/cuda/CUDAQuantisedGemmKernel.cpp
+        kernels/cuda/gemm/CUDAFloatingPointGemmKernel.cpp
+        kernels/cuda/gemm/CUDAWeightPacker.cpp
+        kernels/cuda/gemm/CUDAQuantisedGemmKernel.cpp
         kernels/cuda/ops/CUDAOpsKernels.cpp           # RMSNorm, SwiGLU, RoPE, Embedding ITensor implementations
         kernels/cuda/attention/CUDAFlashAttentionKernelT.cpp  # Flash Attention ITensor implementation
     )
