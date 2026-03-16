@@ -86,6 +86,29 @@ namespace llaminar2
                                                                             << " (static was: " << params_.kv_len << ")");
         }
 
+        // Read K/V from cache at execution time when requested.
+        // This allows GPU prefill to use the FP16 tensors in the KV cache
+        // (populated by KVCacheAppendStage) instead of the Q8_1 projection
+        // buffers, eliminating the Q8_1→FP32→FP16 triple conversion.
+        ITensor *effective_K = params_.K;
+        ITensor *effective_V = params_.V;
+        if (params_.read_kv_from_cache && params_.kv_cache && params_.layer_idx >= 0)
+        {
+            ITensor *cache_k = params_.kv_cache->get_k(params_.layer_idx, 0);
+            ITensor *cache_v = params_.kv_cache->get_v(params_.layer_idx, 0);
+            if (cache_k && cache_v)
+            {
+                effective_K = cache_k;
+                effective_V = cache_v;
+                LOG_TRACE("[AttentionComputeStage] Using cache K/V ("
+                          << cache_k->dtype_name() << ") for layer " << params_.layer_idx);
+            }
+            else
+            {
+                LOG_TRACE("[AttentionComputeStage] Cache K/V not available yet, using wired tensors");
+            }
+        }
+
         // Detect attention mode if auto-detection enabled
         AttentionMode mode = params_.attention_mode;
         if (params_.auto_detect_mode)
@@ -108,8 +131,8 @@ namespace llaminar2
         // Validate inputs
         if (!ensureRequiredPointers("AttentionComputeStage", {
                                                                  {"Q", params_.Q},
-                                                                 {"K", params_.K},
-                                                                 {"V", params_.V},
+                                                                 {"K", effective_K},
+                                                                 {"V", effective_V},
                                                                  {"output", params_.output},
                                                              }))
         {
@@ -228,7 +251,7 @@ namespace llaminar2
                                                                       << " device_idx=" << device_idx);
 
         bool success = kernel->compute_tensor(
-            params_.Q, params_.K, params_.V, params_.output,
+            params_.Q, effective_K, effective_V, params_.output,
             params_.batch_size,
             params_.seq_len,
             effective_kv_len,

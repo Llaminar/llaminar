@@ -71,6 +71,11 @@ namespace llaminar2
             IKVCache *kv_cache = nullptr;
             int layer_idx = -1;
 
+            // When true, read K/V from kv_cache at execution time instead of
+            // using the statically-wired K/V pointers. Enables GPU prefill to
+            // use post-append FP16 cache tensors instead of Q8_1 projections.
+            bool read_kv_from_cache = false;
+
             // Position offset for decode mode causal masking
             int position_offset = 0;
 

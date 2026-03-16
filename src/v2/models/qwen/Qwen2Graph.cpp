@@ -2095,6 +2095,9 @@ namespace llaminar2
                     attn_params.kv_cache = kv_cache; // Pass for dynamic kv_len query at execution
                     // For PP stages: map global layer index to local KV cache index
                     attn_params.layer_idx = layer_idx - config_.pp_layer_offset;
+                    // GPU prefill: read K/V from cache at execution time to get FP16
+                    // tensors directly, avoiding Q8_1→FP32→FP16 triple conversion.
+                    attn_params.read_kv_from_cache = device.is_gpu();
                     attn_params.position_offset = position_ids ? position_ids[0] : 0;
                     attn_params.mpi_ctx = mpi_ctx_.get();
                     attn_params.device_id = device;

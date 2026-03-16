@@ -34,6 +34,17 @@ extern "C"
         void *stream,
         int device_idx);
 
+    // FA2 with FP16 K/V inputs — skips FP16→FP32→FP16 round-trip when KV cache is FP16
+    int cudaFlashAttn_prefill_fa2_fp16kv(
+        const float *Q, const void *K_fp16, const void *V_fp16, float *O,
+        int batch_size, int seq_len, int kv_len,
+        int n_heads, int n_kv_heads, int head_dim,
+        bool causal, int window_size, int position_offset,
+        const llaminar2::attention::AttentionDeviceParams *device_params,
+        const float *mask,
+        void *stream,
+        int device_idx);
+
     // Flash Decoding for single-token decode with split-K parallelism
     int cudaFlashAttn_decode_fp32(
         const float *Q, const float *K_cache, const float *V_cache, float *O,
@@ -505,6 +516,13 @@ namespace llaminar2
             }
 
             // === Mixed-precision KV conversion (FP16→FP32 or Q8_1→FP32) ===
+            // For FP16 KV + prefill (seq_len > 1), we skip conversion entirely and
+            // pass the FP16 pointers directly to the FA2 FP16KV kernel variant,
+            // eliminating the FP16→FP32→FP16 round-trip through global memory.
+            bool use_fp16kv_direct = false;
+            const void *K_fp16_ptr = nullptr;
+            const void *V_fp16_ptr = nullptr;
+
             if (K->native_type() != TensorType::FP32 || V->native_type() != TensorType::FP32)
             {
                 if (K->native_type() != V->native_type())
@@ -514,105 +532,113 @@ namespace llaminar2
                     return false;
                 }
 
-                if (!workspace_)
+                if (K->native_type() == TensorType::FP16 && seq_len > 1)
                 {
-                    LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>::compute_tensor] Mixed-precision KV requires workspace-bound conversion buffers");
-                    return false;
-                }
-
-                const size_t rows = static_cast<size_t>(batch_size) * static_cast<size_t>(kv_len);
-                const size_t logical_cols = static_cast<size_t>(n_kv_heads) * static_cast<size_t>(head_dim);
-                const size_t logical_elements = rows * logical_cols;
-
-                float *d_k_tmp = static_cast<float *>(workspace_->getBuffer(AttentionWorkspaceBuffers::K_TMP_FP32));
-                float *d_v_tmp = static_cast<float *>(workspace_->getBuffer(AttentionWorkspaceBuffers::V_TMP_FP32));
-                if (!d_k_tmp || !d_v_tmp)
-                {
-                    LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>::compute_tensor] Missing workspace conversion buffers: "
-                              << AttentionWorkspaceBuffers::K_TMP_FP32 << " / "
-                              << AttentionWorkspaceBuffers::V_TMP_FP32);
-                    return false;
-                }
-
-                if (K->native_type() == TensorType::FP16)
-                {
-                    int k_ret, v_ret;
-                    if (d_attn_params)
-                    {
-                        // GRAPH-SAFE: Dynamic conversion reads kv_len from device_params
-                        // at runtime, so the captured graph handles growing kv_len correctly.
-                        // Grid is oversized for max_kv_len; excess threads return early.
-                        constexpr int MAX_KV_LEN = 4096; // Must match workspace sizing
-                        k_ret = cudaFlashAttn_convert_fp16_to_fp32_dynamic(
-                            K->gpu_data_ptr(), d_k_tmp,
-                            static_cast<int>(logical_cols), MAX_KV_LEN,
-                            d_attn_params, stream_);
-                        v_ret = cudaFlashAttn_convert_fp16_to_fp32_dynamic(
-                            V->gpu_data_ptr(), d_v_tmp,
-                            static_cast<int>(logical_cols), MAX_KV_LEN,
-                            d_attn_params, stream_);
-                    }
-                    else
-                    {
-                        // Standard path: static element count (no graph capture)
-                        k_ret = cudaFlashAttn_convert_fp16_to_fp32(
-                            K->gpu_data_ptr(), d_k_tmp,
-                            static_cast<int>(logical_elements), stream_);
-                        v_ret = cudaFlashAttn_convert_fp16_to_fp32(
-                            V->gpu_data_ptr(), d_v_tmp,
-                            static_cast<int>(logical_elements), stream_);
-                    }
-                    if (k_ret != 0 || v_ret != 0)
-                    {
-                        LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>::compute_tensor] GPU FP16→FP32 conversion failed"
-                                  << " k_ret=" << k_ret << " v_ret=" << v_ret
-                                  << " dynamic=" << (d_attn_params != nullptr));
-                        return false;
-                    }
-                }
-                else if (K->native_type() == TensorType::Q8_1)
-                {
-                    int k_ret, v_ret;
-                    if (d_attn_params)
-                    {
-                        // GRAPH-SAFE: Dynamic dequant reads kv_len from device_params
-                        constexpr int MAX_KV_LEN = 4096;
-                        k_ret = cudaFlashAttn_dequant_q8_1_to_fp32_dynamic(
-                            K->gpu_data_ptr(), d_k_tmp,
-                            static_cast<int>(logical_cols), MAX_KV_LEN,
-                            d_attn_params, stream_);
-                        v_ret = cudaFlashAttn_dequant_q8_1_to_fp32_dynamic(
-                            V->gpu_data_ptr(), d_v_tmp,
-                            static_cast<int>(logical_cols), MAX_KV_LEN,
-                            d_attn_params, stream_);
-                    }
-                    else
-                    {
-                        // Standard path: static row count (no graph capture)
-                        k_ret = cudaFlashAttn_dequant_q8_1_to_fp32(
-                            K->gpu_data_ptr(), d_k_tmp,
-                            static_cast<int>(rows), static_cast<int>(logical_cols), stream_);
-                        v_ret = cudaFlashAttn_dequant_q8_1_to_fp32(
-                            V->gpu_data_ptr(), d_v_tmp,
-                            static_cast<int>(rows), static_cast<int>(logical_cols), stream_);
-                    }
-                    if (k_ret != 0 || v_ret != 0)
-                    {
-                        LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>::compute_tensor] GPU Q8_1→FP32 dequantization failed"
-                                  << " k_ret=" << k_ret << " v_ret=" << v_ret
-                                  << " dynamic=" << (d_attn_params != nullptr));
-                        return false;
-                    }
+                    // FAST PATH: FP16 KV + prefill → pass FP16 pointers directly to FA2
+                    // The FA2 FP16KV kernel loads half from global memory into shared memory
+                    // without any FP32 intermediate, saving ~2× K/V bandwidth.
+                    use_fp16kv_direct = true;
+                    K_fp16_ptr = K->gpu_data_ptr();
+                    V_fp16_ptr = V->gpu_data_ptr();
+                    LOG_DEBUG("[CUDAFlashAttentionKernelT<FP32>::compute_tensor] FP16 KV direct path (no conversion)");
                 }
                 else
                 {
-                    LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>::compute_tensor] Unsupported KV tensor type for FP32 attention: "
-                              << K->dtype_name());
-                    return false;
-                }
+                    // CONVERSION PATH: FP16 decode or Q8_1 → convert to FP32 workspace
+                    if (!workspace_)
+                    {
+                        LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>::compute_tensor] Mixed-precision KV requires workspace-bound conversion buffers");
+                        return false;
+                    }
 
-                K_ptr = d_k_tmp;
-                V_ptr = d_v_tmp;
+                    const size_t rows = static_cast<size_t>(batch_size) * static_cast<size_t>(kv_len);
+                    const size_t logical_cols = static_cast<size_t>(n_kv_heads) * static_cast<size_t>(head_dim);
+                    const size_t logical_elements = rows * logical_cols;
+
+                    float *d_k_tmp = static_cast<float *>(workspace_->getBuffer(AttentionWorkspaceBuffers::K_TMP_FP32));
+                    float *d_v_tmp = static_cast<float *>(workspace_->getBuffer(AttentionWorkspaceBuffers::V_TMP_FP32));
+                    if (!d_k_tmp || !d_v_tmp)
+                    {
+                        LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>::compute_tensor] Missing workspace conversion buffers: "
+                                  << AttentionWorkspaceBuffers::K_TMP_FP32 << " / "
+                                  << AttentionWorkspaceBuffers::V_TMP_FP32);
+                        return false;
+                    }
+
+                    if (K->native_type() == TensorType::FP16)
+                    {
+                        int k_ret, v_ret;
+                        if (d_attn_params)
+                        {
+                            constexpr int MAX_KV_LEN = 4096;
+                            k_ret = cudaFlashAttn_convert_fp16_to_fp32_dynamic(
+                                K->gpu_data_ptr(), d_k_tmp,
+                                static_cast<int>(logical_cols), MAX_KV_LEN,
+                                d_attn_params, stream_);
+                            v_ret = cudaFlashAttn_convert_fp16_to_fp32_dynamic(
+                                V->gpu_data_ptr(), d_v_tmp,
+                                static_cast<int>(logical_cols), MAX_KV_LEN,
+                                d_attn_params, stream_);
+                        }
+                        else
+                        {
+                            k_ret = cudaFlashAttn_convert_fp16_to_fp32(
+                                K->gpu_data_ptr(), d_k_tmp,
+                                static_cast<int>(logical_elements), stream_);
+                            v_ret = cudaFlashAttn_convert_fp16_to_fp32(
+                                V->gpu_data_ptr(), d_v_tmp,
+                                static_cast<int>(logical_elements), stream_);
+                        }
+                        if (k_ret != 0 || v_ret != 0)
+                        {
+                            LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>::compute_tensor] GPU FP16→FP32 conversion failed"
+                                      << " k_ret=" << k_ret << " v_ret=" << v_ret
+                                      << " dynamic=" << (d_attn_params != nullptr));
+                            return false;
+                        }
+                    }
+                    else if (K->native_type() == TensorType::Q8_1)
+                    {
+                        int k_ret, v_ret;
+                        if (d_attn_params)
+                        {
+                            constexpr int MAX_KV_LEN = 4096;
+                            k_ret = cudaFlashAttn_dequant_q8_1_to_fp32_dynamic(
+                                K->gpu_data_ptr(), d_k_tmp,
+                                static_cast<int>(logical_cols), MAX_KV_LEN,
+                                d_attn_params, stream_);
+                            v_ret = cudaFlashAttn_dequant_q8_1_to_fp32_dynamic(
+                                V->gpu_data_ptr(), d_v_tmp,
+                                static_cast<int>(logical_cols), MAX_KV_LEN,
+                                d_attn_params, stream_);
+                        }
+                        else
+                        {
+                            k_ret = cudaFlashAttn_dequant_q8_1_to_fp32(
+                                K->gpu_data_ptr(), d_k_tmp,
+                                static_cast<int>(rows), static_cast<int>(logical_cols), stream_);
+                            v_ret = cudaFlashAttn_dequant_q8_1_to_fp32(
+                                V->gpu_data_ptr(), d_v_tmp,
+                                static_cast<int>(rows), static_cast<int>(logical_cols), stream_);
+                        }
+                        if (k_ret != 0 || v_ret != 0)
+                        {
+                            LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>::compute_tensor] GPU Q8_1→FP32 dequantization failed"
+                                      << " k_ret=" << k_ret << " v_ret=" << v_ret
+                                      << " dynamic=" << (d_attn_params != nullptr));
+                            return false;
+                        }
+                    }
+                    else
+                    {
+                        LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>::compute_tensor] Unsupported KV tensor type for FP32 attention: "
+                                  << K->dtype_name());
+                        return false;
+                    }
+
+                    K_ptr = d_k_tmp;
+                    V_ptr = d_v_tmp;
+                }
             }
 
             if (!Q_ptr || !K_ptr || !V_ptr || !output_ptr)
@@ -635,7 +661,35 @@ namespace llaminar2
 
             int dev = (device_idx >= 0) ? device_idx : device_idx_;
 
-            // Dispatch to apply_typed which handles algorithm selection
+            // Dispatch: FP16 KV direct path (prefill only) or standard apply_typed
+            if (use_fp16kv_direct)
+            {
+                // FP16 KV direct: skip FP32 conversion, pass FP16 pointers to FA2 kernel
+                if (cudaFlashAttn_setDevice(dev) != 0)
+                {
+                    LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>] Failed to set device " << dev);
+                    return false;
+                }
+                int result;
+                {
+                    CUDA_KERNEL_PROFILE_SCOPE(CUDAKernelType::FLASH_ATTN_PREFILL);
+                    result = cudaFlashAttn_prefill_fa2_fp16kv(
+                        Q_ptr, K_fp16_ptr, V_fp16_ptr, output_ptr,
+                        batch_size, seq_len, kv_len,
+                        n_heads, n_kv_heads, head_dim,
+                        causal, window_size, 0,
+                        d_attn_params, mask_ptr,
+                        stream_, dev);
+                }
+                if (result != 0)
+                {
+                    LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>] FA2 FP16KV kernel failed");
+                    return false;
+                }
+                return true;
+            }
+
+            // Standard path: K/V are FP32 (either native or converted)
             if (kv_len != seq_len)
             {
                 // Decode path (different Q and KV lengths)

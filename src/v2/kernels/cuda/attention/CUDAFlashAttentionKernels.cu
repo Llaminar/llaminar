@@ -273,12 +273,17 @@ namespace
      *
      * Runtime parameters tile_q and tile_kv must be consistent with NUM_CONSUMER_WARPS:
      *   - tile_q should be NUM_CONSUMER_WARPS * 16 (WMMA_M)
+     *   KV_FP16: When true, K/V pointers are const half* (FP16) — loaded via
+     *            cp.async directly into shared memory with no register staging.
+     *            When false, K/V are const float* — converted to FP16 per element.
+     *            FP16 path eliminates the FP16→FP32→FP16 round-trip when KV cache
+     *            is already FP16, roughly halving K/V global memory bandwidth.
      */
-    template <int NUM_CONSUMER_WARPS, int HEAD_DIM, int TILE_KV>
+    template <int NUM_CONSUMER_WARPS, int HEAD_DIM, int TILE_KV, bool KV_FP16 = false>
     __global__ void flash_attention_2_pipelined_kernel(
         const float *__restrict__ Q,
-        const float *__restrict__ K,
-        const float *__restrict__ V,
+        const void *__restrict__ K,
+        const void *__restrict__ V,
         float *__restrict__ O,
         int batch_size,
         int seq_len,
@@ -389,10 +394,12 @@ namespace
 
         // Pointers for this batch/head
         const float *Q_batch = Q + batch_idx * seq_len * n_heads * head_dim;
-        const float *K_batch = K + batch_idx * kv_stride * n_kv_heads * head_dim;
-        const float *V_batch = V + batch_idx * kv_stride * n_kv_heads * head_dim;
 
-        // ALL warps: Load Q tile (done once)
+        // K/V pointers depend on KV_FP16 template parameter.
+        // When KV_FP16=true, K/V are already FP16 in global memory (KV cache);
+        // when false, they are FP32 workspace buffers.
+
+        // ALL warps: Load Q tile (done once, always FP32→FP16)
         for (int i = threadIdx.x; i < q_tile_rows * head_dim; i += blockDim.x)
         {
             int local_row = i / head_dim;
@@ -405,7 +412,7 @@ namespace
         const int num_kv_tiles = (kv_len_runtime + tile_kv - 1) / tile_kv;
 
         // =====================================================================
-        // Pipeline prologue: Start loading first tile(s) asynchronously
+        // Pipeline prologue: Start loading first tile(s)
         // =====================================================================
         if (is_producer)
         {
@@ -421,15 +428,35 @@ namespace
             const int my_start = producer_local_id * elems_per_producer;
             const int my_end = min(my_start + elems_per_producer, actual_len_0 * head_dim);
 
-            for (int i = my_start + lane_id; i < my_end; i += WARP_SIZE)
+            if constexpr (KV_FP16)
             {
-                int local_row = i / head_dim;
-                int d = i % head_dim;
-                int global_row = kv_start_0 + local_row;
-                float k_val = K_batch[global_row * n_kv_heads * head_dim + kv_head_idx * head_dim + d];
-                float v_val = V_batch[global_row * n_kv_heads * head_dim + kv_head_idx * head_dim + d];
-                K_dst_0[local_row * smem_stride + d] = __float2half(k_val);
-                V_dst_0[local_row * smem_stride + d] = __float2half(v_val);
+                // FP16 path: K/V already half in global — direct copy
+                const half *K_batch_fp16 = static_cast<const half *>(K) + batch_idx * kv_stride * n_kv_heads * head_dim;
+                const half *V_batch_fp16 = static_cast<const half *>(V) + batch_idx * kv_stride * n_kv_heads * head_dim;
+                for (int i = my_start + lane_id; i < my_end; i += WARP_SIZE)
+                {
+                    int local_row = i / head_dim;
+                    int d = i % head_dim;
+                    int global_row = kv_start_0 + local_row;
+                    int kv_offset = global_row * n_kv_heads * head_dim + kv_head_idx * head_dim + d;
+                    K_dst_0[local_row * smem_stride + d] = K_batch_fp16[kv_offset];
+                    V_dst_0[local_row * smem_stride + d] = V_batch_fp16[kv_offset];
+                }
+            }
+            else
+            {
+                // FP32 path: convert float → half per element
+                const float *K_batch_fp32 = static_cast<const float *>(K) + batch_idx * kv_stride * n_kv_heads * head_dim;
+                const float *V_batch_fp32 = static_cast<const float *>(V) + batch_idx * kv_stride * n_kv_heads * head_dim;
+                for (int i = my_start + lane_id; i < my_end; i += WARP_SIZE)
+                {
+                    int local_row = i / head_dim;
+                    int d = i % head_dim;
+                    int global_row = kv_start_0 + local_row;
+                    int kv_offset = global_row * n_kv_heads * head_dim + kv_head_idx * head_dim + d;
+                    K_dst_0[local_row * smem_stride + d] = __float2half(K_batch_fp32[kv_offset]);
+                    V_dst_0[local_row * smem_stride + d] = __float2half(V_batch_fp32[kv_offset]);
+                }
             }
         }
         __syncthreads();
@@ -478,15 +505,35 @@ namespace
                 const int my_start = producer_local_id * elems_per_producer;
                 const int my_end = min(my_start + elems_per_producer, next_actual_len * head_dim);
 
-                for (int i = my_start + lane_id; i < my_end; i += WARP_SIZE)
+                if constexpr (KV_FP16)
                 {
-                    int local_row = i / head_dim;
-                    int d = i % head_dim;
-                    int global_row = next_kv_start + local_row;
-                    float k_val = K_batch[global_row * n_kv_heads * head_dim + kv_head_idx * head_dim + d];
-                    float v_val = V_batch[global_row * n_kv_heads * head_dim + kv_head_idx * head_dim + d];
-                    K_dst[local_row * smem_stride + d] = __float2half(k_val);
-                    V_dst[local_row * smem_stride + d] = __float2half(v_val);
+                    // FP16 path: direct half copy from KV cache
+                    const half *K_batch_fp16 = static_cast<const half *>(K) + batch_idx * kv_stride * n_kv_heads * head_dim;
+                    const half *V_batch_fp16 = static_cast<const half *>(V) + batch_idx * kv_stride * n_kv_heads * head_dim;
+                    for (int i = my_start + lane_id; i < my_end; i += WARP_SIZE)
+                    {
+                        int local_row = i / head_dim;
+                        int d = i % head_dim;
+                        int global_row = next_kv_start + local_row;
+                        int kv_offset = global_row * n_kv_heads * head_dim + kv_head_idx * head_dim + d;
+                        K_dst[local_row * smem_stride + d] = K_batch_fp16[kv_offset];
+                        V_dst[local_row * smem_stride + d] = V_batch_fp16[kv_offset];
+                    }
+                }
+                else
+                {
+                    // FP32 path: float→half conversion per element
+                    const float *K_batch_fp32 = static_cast<const float *>(K) + batch_idx * kv_stride * n_kv_heads * head_dim;
+                    const float *V_batch_fp32 = static_cast<const float *>(V) + batch_idx * kv_stride * n_kv_heads * head_dim;
+                    for (int i = my_start + lane_id; i < my_end; i += WARP_SIZE)
+                    {
+                        int local_row = i / head_dim;
+                        int d = i % head_dim;
+                        int global_row = next_kv_start + local_row;
+                        int kv_offset = global_row * n_kv_heads * head_dim + kv_head_idx * head_dim + d;
+                        K_dst[local_row * smem_stride + d] = __float2half(K_batch_fp32[kv_offset]);
+                        V_dst[local_row * smem_stride + d] = __float2half(V_batch_fp32[kv_offset]);
+                    }
                 }
             }
 
@@ -654,25 +701,48 @@ namespace
     }
 
     // Explicit template instantiations for supported configurations
+    // KV_FP16=false (legacy FP32 K/V inputs)
     // head_dim=64: 6 consumer warps, tile_q=96
-    template __global__ void flash_attention_2_pipelined_kernel<6, 64, 32>(
-        const float *, const float *, const float *, float *,
+    template __global__ void flash_attention_2_pipelined_kernel<6, 64, 32, false>(
+        const float *, const void *, const void *, float *,
         int, int, int, int, int, int, float, bool, int, int,
         const llaminar2::attention::AttentionDeviceParams *, const float *,
         int, int, int, int);
-    template __global__ void flash_attention_2_pipelined_kernel<6, 64, 64>(
-        const float *, const float *, const float *, float *,
+    template __global__ void flash_attention_2_pipelined_kernel<6, 64, 64, false>(
+        const float *, const void *, const void *, float *,
         int, int, int, int, int, int, float, bool, int, int,
         const llaminar2::attention::AttentionDeviceParams *, const float *,
         int, int, int, int);
     // head_dim=128: 4 consumer warps, tile_q=64
-    template __global__ void flash_attention_2_pipelined_kernel<4, 128, 32>(
-        const float *, const float *, const float *, float *,
+    template __global__ void flash_attention_2_pipelined_kernel<4, 128, 32, false>(
+        const float *, const void *, const void *, float *,
         int, int, int, int, int, int, float, bool, int, int,
         const llaminar2::attention::AttentionDeviceParams *, const float *,
         int, int, int, int);
-    template __global__ void flash_attention_2_pipelined_kernel<4, 128, 64>(
-        const float *, const float *, const float *, float *,
+    template __global__ void flash_attention_2_pipelined_kernel<4, 128, 64, false>(
+        const float *, const void *, const void *, float *,
+        int, int, int, int, int, int, float, bool, int, int,
+        const llaminar2::attention::AttentionDeviceParams *, const float *,
+        int, int, int, int);
+
+    // KV_FP16=true (FP16 K/V from KV cache — eliminates FP16→FP32→FP16 round-trip)
+    template __global__ void flash_attention_2_pipelined_kernel<6, 64, 32, true>(
+        const float *, const void *, const void *, float *,
+        int, int, int, int, int, int, float, bool, int, int,
+        const llaminar2::attention::AttentionDeviceParams *, const float *,
+        int, int, int, int);
+    template __global__ void flash_attention_2_pipelined_kernel<6, 64, 64, true>(
+        const float *, const void *, const void *, float *,
+        int, int, int, int, int, int, float, bool, int, int,
+        const llaminar2::attention::AttentionDeviceParams *, const float *,
+        int, int, int, int);
+    template __global__ void flash_attention_2_pipelined_kernel<4, 128, 32, true>(
+        const float *, const void *, const void *, float *,
+        int, int, int, int, int, int, float, bool, int, int,
+        const llaminar2::attention::AttentionDeviceParams *, const float *,
+        int, int, int, int);
+    template __global__ void flash_attention_2_pipelined_kernel<4, 128, 64, true>(
+        const float *, const void *, const void *, float *,
         int, int, int, int, int, int, float, bool, int, int,
         const llaminar2::attention::AttentionDeviceParams *, const float *,
         int, int, int, int);
@@ -1109,39 +1179,28 @@ __global__ void dequant_q8_1_to_fp32_dynamic_kernel(
 }
 
 // =============================================================================
-// Extern "C" Wrapper Functions
+// Internal template launcher (cannot have extern "C" linkage)
 // =============================================================================
 
-extern "C"
-{
-    /**
-     * @brief Launch Flash Attention 2 pipelined kernel (SM >= 8.0)
-     *
-     * Dispatches to different kernel variants based on head_dim:
-     *   - head_dim <= 64:  6 consumer warps, tile_q=96, 256 threads
-     *   - head_dim <= 128: 4 consumer warps, tile_q=64, 192 threads
-     *
-     * Returns -1 on invalid input, -2 if GPU doesn't support SM 8.0.
-     */
-    int cudaFlashAttn_prefill_fa2(
-        const float *Q, const float *K, const float *V, float *O,
-        int batch_size, int seq_len, int kv_len,
+/**
+ * @brief Internal templated FA2 launcher — dispatches based on head_dim + KV_FP16 flag.
+ *   - head_dim <= 64:  6 consumer warps, tile_q=96, 256 threads
+ *   - head_dim <= 128: 4 consumer warps, tile_q=64, 192 threads
+ * Returns -1 on invalid input, -2 if GPU doesn't support SM 8.0.
+ */
+template <bool KV_FP16>
+static int fa2_prefill_launch(
+    const float *Q, const void *K, const void *V, float *O,
+    int batch_size, int seq_len, int kv_len,
         int n_heads, int n_kv_heads, int head_dim,
         bool causal, int window_size, int position_offset,
         const llaminar2::attention::AttentionDeviceParams *device_params,
         const float *mask,
-        void *stream,
+        cudaStream_t cuda_stream,
         int device_idx)
     {
-        cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
-
         float softmax_scale = 1.0f / sqrtf(static_cast<float>(head_dim));
 
-        // Use explicit device_idx instead of cudaGetDevice() — the thread-local
-        // active device may be wrong in multi-GPU TP mode where each worker thread
-        // operates on a different device via streams.
-        // We MUST cudaSetDevice() before cudaFuncSetAttribute() below since that
-        // API applies to the currently active device, not the stream's device.
         cudaSetDevice(device_idx);
         const FA2DeviceConfig &dev_cfg = getFA2DeviceConfig(device_idx);
 
@@ -1152,130 +1211,112 @@ extern "C"
             return -2;
         }
 
-        // Input validation
-        if (head_dim <= 0)
+        if (head_dim <= 0 || head_dim % 16 != 0 || head_dim > 256)
         {
-            printf("[cudaFlashAttn_prefill_fa2] Error: head_dim=%d must be positive\n", head_dim);
-            return -1;
-        }
-        if (head_dim % 16 != 0)
-        {
-            printf("[cudaFlashAttn_prefill_fa2] Error: head_dim=%d must be multiple of 16 for WMMA\n", head_dim);
-            return -1;
-        }
-        if (head_dim > 256)
-        {
-            printf("[cudaFlashAttn_prefill_fa2] Error: head_dim=%d exceeds maximum supported (256)\n", head_dim);
+            printf("[cudaFlashAttn_prefill_fa2] Error: head_dim=%d invalid (must be 16-256, multiple of 16)\n", head_dim);
             return -1;
         }
 
-        // Compute kernel configuration based on head_dim
         FA2KernelConfig cfg = computeFA2Config(head_dim, dev_cfg.max_smem_optin);
 
-        // Grid: (n_heads, num_q_tiles, batch_size)
         int num_q_tiles = (seq_len + cfg.tile_q - 1) / cfg.tile_q;
         dim3 grid(n_heads, num_q_tiles, batch_size);
 
         cudaError_t err;
 
-        // Dispatch to correct kernel variant based on consumer warp count, head_dim, and tile_kv
+        // Macro to reduce dispatch boilerplate
+#define FA2_LAUNCH(CW, HD, TKV)                                                                                  \
+    do                                                                                                            \
+    {                                                                                                             \
+        auto kernel_fn = flash_attention_2_pipelined_kernel<CW, HD, TKV, KV_FP16>;                               \
+        err = cudaFuncSetAttribute(kernel_fn, cudaFuncAttributeMaxDynamicSharedMemorySize, cfg.smem_size);        \
+        if (err != cudaSuccess)                                                                                   \
+        {                                                                                                         \
+            printf("[cudaFlashAttn_prefill_fa2] cudaFuncSetAttribute<%d,%d,%d,%d>(smem=%zu) FAILED: %s\n",        \
+                   CW, HD, TKV, (int)KV_FP16, cfg.smem_size, cudaGetErrorString(err));                            \
+            return -1;                                                                                            \
+        }                                                                                                         \
+        kernel_fn<<<grid, cfg.block_size, cfg.smem_size, cuda_stream>>>(                                          \
+            Q, K, V, O,                                                                                           \
+            batch_size, seq_len, kv_len, n_heads, n_kv_heads, head_dim,                                           \
+            softmax_scale, causal, window_size, position_offset,                                                  \
+            device_params, mask, cfg.tile_q, cfg.tile_kv, cfg.qkv_pad, cfg.scores_pad);                           \
+    } while (0)
+
         if (cfg.num_consumer_warps == 6)
         {
-            // head_dim <= 64: 6 consumer warps
             if (cfg.tile_kv == 64)
-            {
-                err = cudaFuncSetAttribute(flash_attention_2_pipelined_kernel<6, 64, 64>,
-                                           cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                           cfg.smem_size);
-                if (err != cudaSuccess)
-                {
-                    printf("[cudaFlashAttn_prefill_fa2] cudaFuncSetAttribute<6,64,64>(smem=%zu) on dev %d FAILED: %s\n",
-                           cfg.smem_size, device_idx, cudaGetErrorString(err));
-                    return -1;
-                }
-                flash_attention_2_pipelined_kernel<6, 64, 64><<<grid, cfg.block_size, cfg.smem_size, cuda_stream>>>(
-                    Q, K, V, O,
-                    batch_size, seq_len, kv_len,
-                    n_heads, n_kv_heads, head_dim,
-                    softmax_scale, causal, window_size, position_offset,
-                    device_params, mask,
-                    cfg.tile_q, cfg.tile_kv, cfg.qkv_pad, cfg.scores_pad);
-            }
+                FA2_LAUNCH(6, 64, 64);
             else
-            {
-                err = cudaFuncSetAttribute(flash_attention_2_pipelined_kernel<6, 64, 32>,
-                                           cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                           cfg.smem_size);
-                if (err != cudaSuccess)
-                {
-                    printf("[cudaFlashAttn_prefill_fa2] cudaFuncSetAttribute<6,64,32>(smem=%zu) on dev %d FAILED: %s\n",
-                           cfg.smem_size, device_idx, cudaGetErrorString(err));
-                    return -1;
-                }
-                flash_attention_2_pipelined_kernel<6, 64, 32><<<grid, cfg.block_size, cfg.smem_size, cuda_stream>>>(
-                    Q, K, V, O,
-                    batch_size, seq_len, kv_len,
-                    n_heads, n_kv_heads, head_dim,
-                    softmax_scale, causal, window_size, position_offset,
-                    device_params, mask,
-                    cfg.tile_q, cfg.tile_kv, cfg.qkv_pad, cfg.scores_pad);
-            }
+                FA2_LAUNCH(6, 64, 32);
         }
         else
         {
-            // head_dim <= 128: 4 consumer warps
             if (cfg.tile_kv == 64)
-            {
-                err = cudaFuncSetAttribute(flash_attention_2_pipelined_kernel<4, 128, 64>,
-                                           cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                           cfg.smem_size);
-                if (err != cudaSuccess)
-                {
-                    printf("[cudaFlashAttn_prefill_fa2] cudaFuncSetAttribute<4,128,64>(smem=%zu) on dev %d FAILED: %s\n",
-                           cfg.smem_size, device_idx, cudaGetErrorString(err));
-                    return -1;
-                }
-                flash_attention_2_pipelined_kernel<4, 128, 64><<<grid, cfg.block_size, cfg.smem_size, cuda_stream>>>(
-                    Q, K, V, O,
-                    batch_size, seq_len, kv_len,
-                    n_heads, n_kv_heads, head_dim,
-                    softmax_scale, causal, window_size, position_offset,
-                    device_params, mask,
-                    cfg.tile_q, cfg.tile_kv, cfg.qkv_pad, cfg.scores_pad);
-            }
+                FA2_LAUNCH(4, 128, 64);
             else
-            {
-                err = cudaFuncSetAttribute(flash_attention_2_pipelined_kernel<4, 128, 32>,
-                                           cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                           cfg.smem_size);
-                if (err != cudaSuccess)
-                {
-                    printf("[cudaFlashAttn_prefill_fa2] cudaFuncSetAttribute<4,128,32>(smem=%zu) on dev %d FAILED: %s\n",
-                           cfg.smem_size, device_idx, cudaGetErrorString(err));
-                    return -1;
-                }
-                flash_attention_2_pipelined_kernel<4, 128, 32><<<grid, cfg.block_size, cfg.smem_size, cuda_stream>>>(
-                    Q, K, V, O,
-                    batch_size, seq_len, kv_len,
-                    n_heads, n_kv_heads, head_dim,
-                    softmax_scale, causal, window_size, position_offset,
-                    device_params, mask,
-                    cfg.tile_q, cfg.tile_kv, cfg.qkv_pad, cfg.scores_pad);
-            }
+                FA2_LAUNCH(4, 128, 32);
         }
 
-        err = cudaGetLastError();
+#undef FA2_LAUNCH
 
+        err = cudaGetLastError();
         if (err != cudaSuccess)
         {
             printf("[cudaFlashAttn_prefill_fa2] CUDA error: %s (smem=%zu bytes, tile_q=%d, tile_kv=%d, head_dim=%d, "
-                   "consumer_warps=%d, qkv_pad=%d, scores_pad=%d, max_smem=%d, grid=(%d,%d,%d), block=%d)\n",
+                   "consumer_warps=%d, kv_fp16=%d, grid=(%d,%d,%d), block=%d)\n",
                    cudaGetErrorString(err), cfg.smem_size, cfg.tile_q, cfg.tile_kv, head_dim,
-                   cfg.num_consumer_warps, cfg.qkv_pad, cfg.scores_pad, dev_cfg.max_smem_optin,
-                   grid.x, grid.y, grid.z, cfg.block_size);
+                   cfg.num_consumer_warps, (int)KV_FP16, grid.x, grid.y, grid.z, cfg.block_size);
             return -1;
         }
         return 0;
+    }
+
+// =============================================================================
+// Extern "C" Wrapper Functions
+// =============================================================================
+
+extern "C"
+{
+    int cudaFlashAttn_prefill_fa2(
+        const float *Q, const float *K, const float *V, float *O,
+        int batch_size, int seq_len, int kv_len,
+        int n_heads, int n_kv_heads, int head_dim,
+        bool causal, int window_size, int position_offset,
+        const llaminar2::attention::AttentionDeviceParams *device_params,
+        const float *mask,
+        void *stream,
+        int device_idx)
+    {
+        return fa2_prefill_launch<false>(
+            Q, static_cast<const void *>(K), static_cast<const void *>(V), O,
+            batch_size, seq_len, kv_len, n_heads, n_kv_heads, head_dim,
+            causal, window_size, position_offset, device_params, mask,
+            static_cast<cudaStream_t>(stream), device_idx);
+    }
+
+    /**
+     * @brief Launch FA2 with FP16 K/V inputs (eliminates FP16→FP32→FP16 round-trip)
+     *
+     * When the KV cache is already FP16, this function passes the half pointers
+     * directly to the kernel. The kernel loads K/V as half and writes to shared
+     * memory without any FP32 intermediate conversion, saving ~2× bandwidth.
+     */
+    int cudaFlashAttn_prefill_fa2_fp16kv(
+        const float *Q, const void *K_fp16, const void *V_fp16, float *O,
+        int batch_size, int seq_len, int kv_len,
+        int n_heads, int n_kv_heads, int head_dim,
+        bool causal, int window_size, int position_offset,
+        const llaminar2::attention::AttentionDeviceParams *device_params,
+        const float *mask,
+        void *stream,
+        int device_idx)
+    {
+        return fa2_prefill_launch<true>(
+            Q, K_fp16, V_fp16, O,
+            batch_size, seq_len, kv_len, n_heads, n_kv_heads, head_dim,
+            causal, window_size, position_offset, device_params, mask,
+            static_cast<cudaStream_t>(stream), device_idx);
     }
 
     /**
