@@ -594,11 +594,15 @@ namespace
               int STAGES_ = 2,
               bool STREAM_K = false,
               int BLOCK_SIZE_ = WARPS_M * WARPS_N * 32,
-              // Stream-K persistent loop needs more live registers for loop bookkeeping
-              // (kbc, kbc_stop, tile bounds, fixup writes). Using MIN_BLOCKS_HINT=1
-              // avoids local memory spilling. The occupancy-based grid in
-              // launchNativeVNNITC_BK64_StreamK launches max_blocks_per_sm * nsm
-              // blocks to fill as many SM slots as registers allow (typically 2/SM).
+              // Stream-K needs extra live registers for tile loop bookkeeping
+              // (kbc, kbc_stop, tile coordinates, atomicAdd epilogue) beyond the
+              // standard kernel. With 512-thread blocks, there's a register cliff:
+              //   ≤64 regs → 2 blocks/SM (66.67% occupancy)
+              //   65-128 regs → 1 block/SM (33.33% occupancy)
+              // MIN_BLOCKS_HINT=2 forces ≤64 regs which causes massive spilling.
+              // MIN_BLOCKS_HINT=1 allows up to 128 regs. The stream-K launcher
+              // queries cudaOccupancyMaxActiveBlocksPerMultiprocessor to set grid
+              // size based on actual achieved occupancy.
               int MIN_BLOCKS_HINT = STREAM_K ? 1
                                     : (STAGES_ == 1)
                                         ? ((BLOCK_SIZE_ >= 256) ? 3 : 4)
@@ -1667,62 +1671,26 @@ namespace
                 }
             };
 
-            auto write_epilogue = [&]() __attribute__((always_inline))
-            {
-                const bool simple_epilogue = (beta == 0.0f) && (bias == nullptr);
-#pragma unroll
-                for (int wj = 0; wj < WN; ++wj)
-                {
-                    const int tile_n = block_n + wc * WARP_N + wj * 8;
-                    const int gc0 = tile_n + frag_col(lane_id, 0);
-                    const int gc1 = tile_n + frag_col(lane_id, 1);
-                    const bool gc0_valid = gc0 < N;
-                    const bool gc1_valid = gc1 < N;
-                    const float bias0 = (bias && gc0_valid) ? bias[gc0] : 0.0f;
-                    const float bias1 = (bias && gc1_valid) ? bias[gc1] : 0.0f;
-#pragma unroll
-                    for (int wi = 0; wi < WM; ++wi)
-                    {
-                        const int tile_m = block_m + wr * WARP_M + wi * 16;
-                        const bool interior = (tile_m + 15 < M) && (tile_n + 7 < N);
-                        if (interior && simple_epilogue)
-                        {
-                            const int out_idx0 = (tile_m + frag_row(lane_id, 0)) * N + gc0;
-                            const int out_idx1 = (tile_m + frag_row(lane_id, 1)) * N + gc1;
-                            const int out_idx2 = (tile_m + frag_row(lane_id, 2)) * N + gc0;
-                            const int out_idx3 = (tile_m + frag_row(lane_id, 3)) * N + gc1;
-                            C[out_idx0] = acc[wi][wj][0] * alpha;
-                            C[out_idx1] = acc[wi][wj][1] * alpha;
-                            C[out_idx2] = acc[wi][wj][2] * alpha;
-                            C[out_idx3] = acc[wi][wj][3] * alpha;
-                            continue;
-                        }
-#pragma unroll
-                        for (int e = 0; e < 4; ++e)
-                        {
-                            const int gr = tile_m + frag_row(lane_id, e);
-                            const int gc = (e & 1) ? gc1 : gc0;
-                            if (gr < M && gc < N)
-                            {
-                                const int out_idx = gr * N + gc;
-                                float val = acc[wi][wj][e] * alpha;
-                                if (beta != 0.0f && C_existing)
-                                    val += beta * C_existing[out_idx];
-                                if (bias)
-                                    val += (e & 1) ? bias1 : bias0;
-                                C[out_idx] = val;
-                            }
-                        }
-                    }
-                }
-            };
+            // Stream-K uses atomicAdd on pre-zeroed C — no need for beta/bias epilogue.
+            // Suppress unused-parameter warnings for kernel args only used by write_epilogue
+            // (which doesn't exist in the stream-K path). Also helps the register allocator
+            // by signaling these captures are truly dead.
+            (void)beta;
+            (void)C_existing;
+            (void)bias;
+            (void)tmp_fixup;
 
             auto write_to_fixup = [&]() __attribute__((always_inline))
             {
-                // Atomically accumulate partial sums directly into C.
-                // This eliminates the fixup buffer and the separate fixup kernel,
-                // reducing memory traffic from 3× (write fixup + read fixup + write C)
-                // to 1× (atomic on C). SM 8.6+ has hardware float atomicAdd.
+            // Atomically accumulate partial sums directly into C.
+            // This eliminates the fixup buffer and the separate fixup kernel,
+            // reducing memory traffic from 3× (write fixup + read fixup + write C)
+            // to 1× (atomic on C). SM 8.6+ has hardware float atomicAdd.
+            //
+            // Keep all three loops fully unrolled (#pragma unroll): the 16-wide
+            // atomicAdd ILP is critical for performance. Partial unrolling
+            // (e.g., #pragma unroll 1 on outer loops) eliminates the ~8K spills
+            // but serializes the atomics, losing ~10% on winning shapes.
 #pragma unroll
                 for (int wj = 0; wj < WN; ++wj)
                 {
