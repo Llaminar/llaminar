@@ -70,8 +70,8 @@ namespace
     // =========================================================================
 
     // Pipeline configuration
-    constexpr int FA2_NUM_STAGES = 2;     // Double buffering
-    constexpr int FA2_PRODUCER_WARPS = 2; // Warps dedicated to loading (fixed)
+    constexpr int FA2_NUM_STAGES = 2;       // Double buffering
+    constexpr int FA2_PRODUCER_WARPS = 2;   // Warps dedicated to loading (fixed)
     constexpr int FA2_TILE_KV_DEFAULT = 64; // Default KV tile size
     // Shared-memory padding constants. QKV padding is critical for avoiding
     // bank conflicts on WMMA load_matrix_sync: with head_dim=128, stride=128
@@ -243,8 +243,10 @@ namespace
                 }
             }
             cfg.num_consumer_warps = cfg.tile_q / 16;
-            if (cfg.num_consumer_warps < 2) cfg.num_consumer_warps = 2;
-            if (cfg.num_consumer_warps > 6) cfg.num_consumer_warps = 6;
+            if (cfg.num_consumer_warps < 2)
+                cfg.num_consumer_warps = 2;
+            if (cfg.num_consumer_warps > 6)
+                cfg.num_consumer_warps = 6;
             cfg.smem_size = computeFA2SmemSize(cfg.tile_q, cfg.tile_kv,
                                                head_dim, cfg.qkv_pad, cfg.scores_pad);
         }
@@ -366,8 +368,8 @@ namespace
         // This halves register pressure (O_acc[64] vs [128]) and doubles
         // throughput of the P@V accumulation loop.
         const int q_tile_rows = min(tile_q, seq_len - q_block_start);
-        const int row_in_warp = lane_id & (WMMA_M - 1);  // lane_id % 16
-        const int dim_half = lane_id >> 4;                 // 0 for lanes 0-15, 1 for 16-31
+        const int row_in_warp = lane_id & (WMMA_M - 1); // lane_id % 16
+        const int dim_half = lane_id >> 4;              // 0 for lanes 0-15, 1 for 16-31
         const int my_consumer_q_row = is_active_consumer
                                           ? q_block_start + consumer_warp_id * WMMA_M + row_in_warp
                                           : -1;
@@ -651,24 +653,34 @@ namespace
                         O_acc[d] *= scale_old;
                     l_i *= scale_old;
 
-                    // Accumulate P @ V (each lane processes its half of head dims)
-                    // Uses constexpr dims_per_lane for full unrolling. When
-                    // head_dim < HEAD_DIM, extra dims read padding/garbage from V smem
-                    // but those O_acc entries are never written to output.
+                    // Accumulate P @ V (branchless with compile-time unrolling)
+                    //
+                    // Optimizations over original scalar loop:
+                    //   1. TILE_KV compile-time loop bound enables full #pragma unroll,
+                    //      letting NVCC interleave V loads with FMAs for ILP.
+                    //   2. Removed per-score branch (if s > -FLT_MAX/2): masked scores
+                    //      are -FLT_MAX, so exp(-FLT_MAX - m) = 0 → zero contribution.
+                    //      Eliminates warp divergence on causal masking boundaries.
+                    //   3. j < actual_tile_kv_len is warp-uniform (same for all lanes)
+                    //      → no divergence; just skips tail iterations.
+                    //   4. Vectorized half2 V loads: 2× shared memory throughput.
                     float l_ij = 0.0f;
-                    for (int j = 0; j < actual_tile_kv_len; j++)
+#pragma unroll 8
+                    for (int j = 0; j < TILE_KV; j++)
                     {
-                        float s = my_scores[j];
-                        if (s > -FLT_MAX / 2)
+                        if (j < actual_tile_kv_len)
                         {
-                            float p = __expf(s - m_i_new);
+                            float p = __expf(my_scores[j] - m_i_new);
                             l_ij += p;
 
-                            const half *V_row = V_tile_fp16 + j * smem_stride + dim_start;
+                            const half2 *V_row_h2 = reinterpret_cast<const half2 *>(
+                                V_tile_fp16 + j * smem_stride + dim_start);
 #pragma unroll
-                            for (int d = 0; d < dims_per_lane; d++)
+                            for (int d = 0; d < dims_per_lane; d += 2)
                             {
-                                O_acc[d] += p * __half2float(V_row[d]);
+                                float2 v = __half22float2(V_row_h2[d >> 1]);
+                                O_acc[d] += p * v.x;
+                                O_acc[d + 1] += p * v.y;
                             }
                         }
                     }
@@ -786,8 +798,7 @@ namespace
      * dot product and V accumulation for each position. For head_dim=128,
      * each lane owns 4 output dimensions (128/32 = 4).
      */
-    __global__ __launch_bounds__(256, 4)
-    void flash_decoding_fp32_kernel(
+    __global__ __launch_bounds__(256, 4) void flash_decoding_fp32_kernel(
         const float *__restrict__ Q,
         const float *__restrict__ K_cache,
         const float *__restrict__ V_cache,
@@ -1192,85 +1203,85 @@ template <bool KV_FP16>
 static int fa2_prefill_launch(
     const float *Q, const void *K, const void *V, float *O,
     int batch_size, int seq_len, int kv_len,
-        int n_heads, int n_kv_heads, int head_dim,
-        bool causal, int window_size, int position_offset,
-        const llaminar2::attention::AttentionDeviceParams *device_params,
-        const float *mask,
-        cudaStream_t cuda_stream,
-        int device_idx)
+    int n_heads, int n_kv_heads, int head_dim,
+    bool causal, int window_size, int position_offset,
+    const llaminar2::attention::AttentionDeviceParams *device_params,
+    const float *mask,
+    cudaStream_t cuda_stream,
+    int device_idx)
+{
+    float softmax_scale = 1.0f / sqrtf(static_cast<float>(head_dim));
+
+    cudaSetDevice(device_idx);
+    const FA2DeviceConfig &dev_cfg = getFA2DeviceConfig(device_idx);
+
+    if (dev_cfg.sm_major < 8)
     {
-        float softmax_scale = 1.0f / sqrtf(static_cast<float>(head_dim));
+        printf("[cudaFlashAttn_prefill_fa2] Error: SM %d.%d not supported, requires SM >= 8.0\n",
+               dev_cfg.sm_major, dev_cfg.sm_minor);
+        return -2;
+    }
 
-        cudaSetDevice(device_idx);
-        const FA2DeviceConfig &dev_cfg = getFA2DeviceConfig(device_idx);
+    if (head_dim <= 0 || head_dim % 16 != 0 || head_dim > 256)
+    {
+        printf("[cudaFlashAttn_prefill_fa2] Error: head_dim=%d invalid (must be 16-256, multiple of 16)\n", head_dim);
+        return -1;
+    }
 
-        if (dev_cfg.sm_major < 8)
-        {
-            printf("[cudaFlashAttn_prefill_fa2] Error: SM %d.%d not supported, requires SM >= 8.0\n",
-                   dev_cfg.sm_major, dev_cfg.sm_minor);
-            return -2;
-        }
+    FA2KernelConfig cfg = computeFA2Config(head_dim, dev_cfg.max_smem_optin);
 
-        if (head_dim <= 0 || head_dim % 16 != 0 || head_dim > 256)
-        {
-            printf("[cudaFlashAttn_prefill_fa2] Error: head_dim=%d invalid (must be 16-256, multiple of 16)\n", head_dim);
-            return -1;
-        }
+    int num_q_tiles = (seq_len + cfg.tile_q - 1) / cfg.tile_q;
+    dim3 grid(n_heads, num_q_tiles, batch_size);
 
-        FA2KernelConfig cfg = computeFA2Config(head_dim, dev_cfg.max_smem_optin);
+    cudaError_t err;
 
-        int num_q_tiles = (seq_len + cfg.tile_q - 1) / cfg.tile_q;
-        dim3 grid(n_heads, num_q_tiles, batch_size);
-
-        cudaError_t err;
-
-        // Macro to reduce dispatch boilerplate
-#define FA2_LAUNCH(CW, HD, TKV)                                                                                  \
-    do                                                                                                            \
-    {                                                                                                             \
-        auto kernel_fn = flash_attention_2_pipelined_kernel<CW, HD, TKV, KV_FP16>;                               \
-        err = cudaFuncSetAttribute(kernel_fn, cudaFuncAttributeMaxDynamicSharedMemorySize, cfg.smem_size);        \
-        if (err != cudaSuccess)                                                                                   \
-        {                                                                                                         \
-            printf("[cudaFlashAttn_prefill_fa2] cudaFuncSetAttribute<%d,%d,%d,%d>(smem=%zu) FAILED: %s\n",        \
-                   CW, HD, TKV, (int)KV_FP16, cfg.smem_size, cudaGetErrorString(err));                            \
-            return -1;                                                                                            \
-        }                                                                                                         \
-        kernel_fn<<<grid, cfg.block_size, cfg.smem_size, cuda_stream>>>(                                          \
-            Q, K, V, O,                                                                                           \
-            batch_size, seq_len, kv_len, n_heads, n_kv_heads, head_dim,                                           \
-            softmax_scale, causal, window_size, position_offset,                                                  \
-            device_params, mask, cfg.tile_q, cfg.tile_kv, cfg.qkv_pad, cfg.scores_pad);                           \
+    // Macro to reduce dispatch boilerplate
+#define FA2_LAUNCH(CW, HD, TKV)                                                                            \
+    do                                                                                                     \
+    {                                                                                                      \
+        auto kernel_fn = flash_attention_2_pipelined_kernel<CW, HD, TKV, KV_FP16>;                         \
+        err = cudaFuncSetAttribute(kernel_fn, cudaFuncAttributeMaxDynamicSharedMemorySize, cfg.smem_size); \
+        if (err != cudaSuccess)                                                                            \
+        {                                                                                                  \
+            printf("[cudaFlashAttn_prefill_fa2] cudaFuncSetAttribute<%d,%d,%d,%d>(smem=%zu) FAILED: %s\n", \
+                   CW, HD, TKV, (int)KV_FP16, cfg.smem_size, cudaGetErrorString(err));                     \
+            return -1;                                                                                     \
+        }                                                                                                  \
+        kernel_fn<<<grid, cfg.block_size, cfg.smem_size, cuda_stream>>>(                                   \
+            Q, K, V, O,                                                                                    \
+            batch_size, seq_len, kv_len, n_heads, n_kv_heads, head_dim,                                    \
+            softmax_scale, causal, window_size, position_offset,                                           \
+            device_params, mask, cfg.tile_q, cfg.tile_kv, cfg.qkv_pad, cfg.scores_pad);                    \
     } while (0)
 
-        if (cfg.num_consumer_warps == 6)
-        {
-            if (cfg.tile_kv == 64)
-                FA2_LAUNCH(6, 64, 64);
-            else
-                FA2_LAUNCH(6, 64, 32);
-        }
+    if (cfg.num_consumer_warps == 6)
+    {
+        if (cfg.tile_kv == 64)
+            FA2_LAUNCH(6, 64, 64);
         else
-        {
-            if (cfg.tile_kv == 64)
-                FA2_LAUNCH(4, 128, 64);
-            else
-                FA2_LAUNCH(4, 128, 32);
-        }
+            FA2_LAUNCH(6, 64, 32);
+    }
+    else
+    {
+        if (cfg.tile_kv == 64)
+            FA2_LAUNCH(4, 128, 64);
+        else
+            FA2_LAUNCH(4, 128, 32);
+    }
 
 #undef FA2_LAUNCH
 
-        err = cudaGetLastError();
-        if (err != cudaSuccess)
-        {
-            printf("[cudaFlashAttn_prefill_fa2] CUDA error: %s (smem=%zu bytes, tile_q=%d, tile_kv=%d, head_dim=%d, "
-                   "consumer_warps=%d, kv_fp16=%d, grid=(%d,%d,%d), block=%d)\n",
-                   cudaGetErrorString(err), cfg.smem_size, cfg.tile_q, cfg.tile_kv, head_dim,
-                   cfg.num_consumer_warps, (int)KV_FP16, grid.x, grid.y, grid.z, cfg.block_size);
-            return -1;
-        }
-        return 0;
+    err = cudaGetLastError();
+    if (err != cudaSuccess)
+    {
+        printf("[cudaFlashAttn_prefill_fa2] CUDA error: %s (smem=%zu bytes, tile_q=%d, tile_kv=%d, head_dim=%d, "
+               "consumer_warps=%d, kv_fp16=%d, grid=(%d,%d,%d), block=%d)\n",
+               cudaGetErrorString(err), cfg.smem_size, cfg.tile_q, cfg.tile_kv, head_dim,
+               cfg.num_consumer_warps, (int)KV_FP16, grid.x, grid.y, grid.z, cfg.block_size);
+        return -1;
     }
+    return 0;
+}
 
 // =============================================================================
 // Extern "C" Wrapper Functions
