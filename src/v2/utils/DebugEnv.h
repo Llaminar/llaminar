@@ -2681,7 +2681,7 @@ namespace llaminar2
 
         bool tp_timing = false;               ///< Enable TP forward timing breakdown (env: LLAMINAR_TP_TIMING)
         bool skip_allreduce = false;          ///< DIAGNOSTIC: Skip allreduce for profiling (env: LLAMINAR_SKIP_ALLREDUCE)
-        bool gpu_stage_timing = false;        ///< GPU event-based per-stage timing (env: LLAMINAR_GPU_STAGE_TIMING)
+        bool gpu_stage_timing = true;         ///< GPU event-based per-stage timing (env: LLAMINAR_GPU_STAGE_TIMING)
         bool gpu_stage_timing_detail = false; ///< Print per-stage detail (env: LLAMINAR_GPU_STAGE_TIMING_DETAIL)
 
         /// Global allreduce precision fallback: "fp16", "bf16", or "fp32"
@@ -2702,13 +2702,11 @@ namespace llaminar2
             const char *skip_ar = std::getenv("LLAMINAR_SKIP_ALLREDUCE");
             skip_allreduce = skip_ar && std::string(skip_ar) == "1";
             const char *stl_env = std::getenv("LLAMINAR_GPU_STAGE_TIMING");
-            gpu_stage_timing = stl_env && std::string(stl_env) == "1";
+            if (stl_env && std::string(stl_env) == "0")
+                gpu_stage_timing = false;
             const char *stl_detail = std::getenv("LLAMINAR_GPU_STAGE_TIMING_DETAIL");
             gpu_stage_timing_detail = stl_detail && std::string(stl_detail) == "1";
             if (gpu_stage_timing_detail)
-                gpu_stage_timing = true;
-            // LLAMINAR_PROFILING=1 also enables GPU stage timing on GPU backends
-            if (profile.enabled)
                 gpu_stage_timing = true;
             const char *ar_prec = std::getenv("LLAMINAR_ALLREDUCE_PRECISION");
             if (ar_prec)
@@ -2724,8 +2722,10 @@ namespace llaminar2
             tp_timing = tp_env && std::string(tp_env) == "1";
             const char *skip_ar = std::getenv("LLAMINAR_SKIP_ALLREDUCE");
             skip_allreduce = skip_ar && std::string(skip_ar) == "1";
+            gpu_stage_timing = true; // default on
             const char *stl_env = std::getenv("LLAMINAR_GPU_STAGE_TIMING");
-            gpu_stage_timing = stl_env && std::string(stl_env) == "1";
+            if (stl_env && std::string(stl_env) == "0")
+                gpu_stage_timing = false;
             const char *stl_detail = std::getenv("LLAMINAR_GPU_STAGE_TIMING_DETAIL");
             gpu_stage_timing_detail = stl_detail && std::string(stl_detail) == "1";
             if (gpu_stage_timing_detail)
@@ -2738,9 +2738,6 @@ namespace llaminar2
                 tp_collect_timeout_ms = std::atoi(collect_timeout);
             gemm.reload();
             profile.reload();
-            // LLAMINAR_PROFILING=1 also enables GPU stage timing on GPU backends
-            if (profile.enabled)
-                gpu_stage_timing = true;
             rmsnorm.reload();
             attention.reload();
             q16_attention_dump.reload();

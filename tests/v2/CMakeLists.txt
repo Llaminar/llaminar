@@ -3985,6 +3985,14 @@ add_v2_test(V2_Perf_CUDANativeVNNIGemm
     MPI_PROCS 1
 )
 
+add_executable(v2_perf_cuda_streamk_ab performance/kernels/cuda/gemm/Perf__CUDAStreamKAB.cpp)
+target_link_libraries(v2_perf_cuda_streamk_ab llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Perf_CUDAStreamKAB
+    COMMAND $<TARGET_FILE:v2_perf_cuda_streamk_ab>
+    LABELS "V2;Performance;CUDA;GEMM;StreamK;Prefill;Qwen"
+    MPI_PROCS 1
+)
+
 # Test: CUDA Ring Buffer KV Cache Parity
 # Tests ring buffer KV cache with O(1) eviction, wrap-around, batched gather, FP32/FP16/BF16
 if(HAVE_CUDA)

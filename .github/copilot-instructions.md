@@ -14,6 +14,7 @@ This document provides practical guidelines for working with the **Llaminar V2**
 - [Build System](#build-system)
 - [Canonical Runtime Configuration](#canonical-runtime-configuration)
 - [Benchmark Mode](#benchmark-mode)
+- [NVIDIA Nsight Profiling (ncu / nsys)](#nvidia-nsight-profiling-ncu--nsys)
 - [Testing Guidelines](#testing-guidelines)
 - [Debugging](#debugging)
 - [Stage Dump Framework](#stage-dump-framework)
@@ -302,6 +303,187 @@ LLAMINAR_PROFILING=1 ./build_v2_release/llaminar2 --benchmark -m model.gguf -n 5
 **Profiled Operations**: `GEMM_Q8`, `ATTENTION`, `FFN_DOWN`, `FFN_GATE`, `FFN_UP`, `LM_HEAD`, `QUANTIZE_Q8`, `RMS_NORM`, `SWIGLU`, `ROPE`, `RESIDUAL_ADD`, `EMBEDDING`
 
 **Note**: `LLAMINAR_PROFILING=1` enables kernel timing, executor overhead profiling, and GPU stage timing in a single flag.
+
+---
+
+## NVIDIA Nsight Profiling (ncu / nsys)
+
+### Overview
+
+For low-level GPU kernel analysis, use NVIDIA's Nsight tools:
+- **nsys** (Nsight Systems): Timeline traces, kernel launch counts, CPU/GPU overlap, high-level throughput
+- **ncu** (Nsight Compute): Per-kernel metrics — occupancy, register usage, memory throughput, warp stall breakdown
+
+Both tools are located at `/usr/local/cuda/bin/` and require `sudo` for hardware counter access.
+
+### CRITICAL: Use `--no-mpi-bootstrap` for llaminar2
+
+Llaminar auto-bootstraps MPI via `mpirun` when launched directly. Profiling tools like `ncu` and `nsys` will attach to the **mpirun wrapper process** instead of the actual `llaminar2` GPU process unless you disable this.
+
+**Always pass `--no-mpi-bootstrap`** when profiling `llaminar2` directly:
+
+```bash
+# ❌ WRONG - ncu attaches to mpirun, not llaminar2
+sudo /usr/local/cuda/bin/ncu ./build_v2_release/llaminar2 -d cuda:0 -m model.gguf -p "test" -n 5
+
+# ✅ CORRECT - ncu profiles the actual GPU process
+sudo /usr/local/cuda/bin/ncu ./build_v2_release/llaminar2 --no-mpi-bootstrap -d cuda:0 -m model.gguf -p "test" -n 5
+```
+
+This flag is **not needed** when profiling standalone test binaries (e.g., `v2_perf_cuda_streamk_ab`) since they don't auto-bootstrap MPI.
+
+### sudo and Environment Variables
+
+`sudo` strips environment variables by default. Use `sudo -E` to preserve them:
+
+```bash
+# ❌ WRONG - LLAMINAR_LOG_LEVEL is stripped by sudo
+sudo /usr/local/cuda/bin/ncu ... LLAMINAR_LOG_LEVEL=ERROR ./build_v2_release/llaminar2 ...
+
+# ✅ CORRECT - preserves environment
+sudo -E /usr/local/cuda/bin/ncu ... ./build_v2_release/llaminar2 ...
+
+# Alternative: pass env vars explicitly inside sudo
+sudo LLAMINAR_LOG_LEVEL=ERROR /usr/local/cuda/bin/ncu ... ./build_v2_release/llaminar2 ...
+```
+
+### nsys: Timeline Traces
+
+Use nsys for a high-level view of kernel launches, durations, and CPU/GPU overlap:
+
+```bash
+# Full trace with kernel summary statistics
+sudo /usr/local/cuda/bin/nsys profile -t cuda --stats=true \
+  -o /tmp/my_trace -f true \
+  ./build_v2_release/llaminar2 --no-mpi-bootstrap -d cuda:0 -m model.gguf -p "test" -n 10
+
+# Extract per-kernel summary from a saved report
+/usr/local/cuda/bin/nsys stats --report cuda_gpu_kern_sum /tmp/my_trace.nsys-rep
+```
+
+**When to use nsys**: Identifying which kernels dominate GPU time, checking for CPU-GPU sync stalls, verifying kernel launch counts, and comparing before/after changes at a high level.
+
+### ncu: Per-Kernel Deep Analysis
+
+ncu profiles individual kernel launches with hardware counter detail. It runs each kernel through **multiple replay passes** (typically 4-8), so it's much slower than nsys.
+
+**Targeting specific kernels** is essential to avoid profiling every kernel in the pipeline:
+
+```bash
+# Profile a specific kernel by name, skip warmup launches, capture 1 launch
+sudo -E /usr/local/cuda/bin/ncu \
+  --kernel-name "nativeVnniTC_BK64" \
+  --launch-skip 1 --launch-count 1 \
+  --section SpeedOfLight \
+  --section Occupancy \
+  --section MemoryWorkloadAnalysis \
+  --section ComputeWorkloadAnalysis \
+  --section WarpStateStats \
+  --section LaunchStats \
+  --target-processes all \
+  -o /tmp/my_kernel_ncu -f \
+  ./build_v2_release/llaminar2 --no-mpi-bootstrap -d cuda:0 -m model.gguf -p "test" -n 1
+
+# Read saved report
+sudo /usr/local/cuda/bin/ncu -i /tmp/my_kernel_ncu.ncu-rep --page details
+
+# List all available section names
+/usr/local/cuda/bin/ncu --list-sections
+```
+
+**Key ncu options**:
+
+| Option | Description |
+|--------|-------------|
+| `--kernel-name <regex>` | Filter by kernel function name (substring match) |
+| `--launch-skip N` | Skip the first N matching launches (use to skip warmups) |
+| `--launch-count N` | Only profile N launches after skip |
+| `--section <name>` | Which metric sections to collect (repeat for multiple) |
+| `--target-processes all` | Required when the binary forks child processes |
+| `-o <path>` | Save report to file for later analysis |
+| `-f` | Overwrite existing report file |
+
+**Available sections** (most useful first):
+
+| Section | What It Tells You |
+|---------|-------------------|
+| `SpeedOfLight` | Top-level compute vs memory throughput |
+| `MemoryWorkloadAnalysis` | DRAM/L1/L2 throughput, **local memory spilling**, cache hit rates |
+| `WarpStateStats` | Warp stall breakdown (barrier, L1/TEX, memory, instruction fetch) |
+| `Occupancy` | Theoretical vs achieved occupancy, limiting factors |
+| `LaunchStats` | Grid/block size, **registers per thread**, shared memory usage |
+| `ComputeWorkloadAnalysis` | IPC, issue slot utilization, pipeline breakdown |
+
+### ncu: Interpreting Results
+
+**Key metrics to check first**:
+
+| Metric | Healthy Range | Red Flag |
+|--------|---------------|----------|
+| `Local Memory Spilling Requests` | 0 | >0 means register pressure is spilling to DRAM |
+| `Registers Per Thread` | Matches `__launch_bounds__` expectation | Unexpected value → check launch config |
+| `Compute (SM) Throughput` | >60% for compute-bound kernels | <30% → latency-bound |
+| `DRAM Throughput` | <30% for compute-bound kernels | >60% with low compute → spilling or bad access pattern |
+| `Executed IPC Active` | >2.0 | <1.0 → stalled on memory |
+| `Warp Cycles Per Issued Instruction` | <15 | >30 → severe stalls |
+
+**Common diagnosis patterns**:
+
+| Symptom | Likely Cause | Fix |
+|---------|-------------|-----|
+| High `Local Memory Spilling` + High DRAM | Register pressure, `__launch_bounds__` too aggressive | Relax `MIN_BLOCKS` hint to allow more regs/thread |
+| High `Barrier` warp stalls | `__syncthreads()` with uneven work distribution | Reduce sync points, use warp-level sync |
+| High `L1/TEX` warp stalls + spilling | Spilled registers being reloaded from local memory | Same as register pressure fix above |
+| Low occupancy + high compute throughput | Kernel is well-tuned, occupancy is fine | No action needed |
+| Low occupancy + low compute throughput | Not enough warps to hide latency | Increase occupancy via fewer regs or less smem |
+
+### Profiling Standalone Test Binaries
+
+For isolated kernel benchmarks (no MPI bootstrap), profile the test binary directly:
+
+```bash
+# nsys on a perf test
+sudo /usr/local/cuda/bin/nsys profile -t cuda --stats=true \
+  -o /tmp/perf_trace -f true \
+  ./build_v2_release/tests/v2/v2_perf_cuda_streamk_ab --gtest_filter="*StreamK*"
+
+# ncu on a perf test — env vars require sudo -E
+sudo -E /usr/local/cuda/bin/ncu \
+  --kernel-name "nativeVnniTC_BK64" \
+  --launch-skip 1 --launch-count 1 \
+  --section SpeedOfLight --section MemoryWorkloadAnalysis --section WarpStateStats \
+  --target-processes all \
+  -o /tmp/perf_ncu -f \
+  ./build_v2_release/tests/v2/v2_perf_cuda_streamk_ab --gtest_filter="*StreamK*"
+```
+
+### A/B Comparison with ncu
+
+To compare two kernel variants (e.g., standard vs stream-K), calculate the `--launch-skip` based on how many matching launches occur before the one you want:
+
+```bash
+# Step 1: Use nsys to count total launches and identify ordering
+sudo /usr/local/cuda/bin/nsys profile -t cuda --stats=true -o /tmp/trace -f true ./binary
+/usr/local/cuda/bin/nsys stats --report cuda_gpu_kern_sum /tmp/trace.nsys-rep
+
+# Step 2: Profile variant A (e.g., skip warmup, capture bench launch)
+sudo -E /usr/local/cuda/bin/ncu --kernel-name "myKernel" \
+  --launch-skip 1 --launch-count 1 \
+  --section SpeedOfLight --section MemoryWorkloadAnalysis --section WarpStateStats --section LaunchStats \
+  -o /tmp/variant_a_ncu -f ./binary
+
+# Step 3: Profile variant B (skip warmup + variant A launches)
+sudo -E /usr/local/cuda/bin/ncu --kernel-name "myKernel" \
+  --launch-skip 3 --launch-count 1 \
+  --section SpeedOfLight --section MemoryWorkloadAnalysis --section WarpStateStats --section LaunchStats \
+  -o /tmp/variant_b_ncu -f ./binary
+
+# Step 4: Compare reports side-by-side
+sudo /usr/local/cuda/bin/ncu -i /tmp/variant_a_ncu.ncu-rep --page details
+sudo /usr/local/cuda/bin/ncu -i /tmp/variant_b_ncu.ncu-rep --page details
+```
+
+**Tip**: The `--launch-skip` value depends on the binary's launch pattern (warmup runs, multiple modes). Use nsys first to understand the launch order, then target the exact launch you want.
 
 ---
 

@@ -348,12 +348,9 @@ namespace llaminar2
         // Also reset executor overhead stats so warmup overhead isn't counted
         runner_->resetExecutorStats();
 
-        // Keep GPU stage timeline suppressed during benchmark — per-iteration
-        // tables are too verbose (one 30-line table per decode token).  The
-        // CUDA / ROCm kernel profiling summaries already aggregate the same
-        // information and are printed once at the end.  Users who need
-        // per-step detail can use LLAMINAR_GPU_STAGE_TIMING_DETAIL=1 outside
-        // of benchmark mode.
+        // Re-enable GPU stage timeline for actual benchmark runs.
+        // Timeline is suppressed only during warmup (which includes one-time costs).
+        runner_->setSuppressTimeline(false);
 
         // ========================================================================
         // Benchmark Iterations - Run multiple times and average
@@ -565,10 +562,17 @@ namespace llaminar2
                                          total_prefill_tokens, total_decode_tokens);
 
             KVCacheProfiler::printSummary();
-            CUDAKernelProfiler::printSummary(total_tokens, total_prefill_ms, total_decode_ms,
-                                             total_prefill_tokens, total_decode_tokens);
-            ROCmKernelProfiler::printSummary(total_tokens, total_prefill_ms, total_decode_ms,
-                                             total_prefill_tokens, total_decode_tokens);
+
+            // Skip per-kernel profiling when GPU stage timing is active —
+            // the GPU Stage Timeline provides strictly superior coverage
+            // (all stages, GPU-event precision) vs hand-instrumented subset.
+            if (!debugEnv().gpu_stage_timing)
+            {
+                CUDAKernelProfiler::printSummary(total_tokens, total_prefill_ms, total_decode_ms,
+                                                 total_prefill_tokens, total_decode_tokens);
+                ROCmKernelProfiler::printSummary(total_tokens, total_prefill_ms, total_decode_ms,
+                                                 total_prefill_tokens, total_decode_tokens);
+            }
         }
 
         // Print executor overhead profiling if enabled (LLAMINAR_PROFILING=1)

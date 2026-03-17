@@ -92,6 +92,14 @@ namespace
         asm volatile("cp.async.wait_group %0;\n" ::"n"(N) : "memory");
     }
 
+    // Named barrier: sync a subset of threads within a CTA.
+    // barrier_id: 0-15 (hardware barrier slot), thread_count: participating threads.
+    // Has acquire/release memory ordering (like __syncthreads but scoped to participants).
+    __device__ __forceinline__ void named_bar_sync(int barrier_id, int thread_count)
+    {
+        asm volatile("bar.sync %0, %1;" : : "r"(barrier_id), "r"(thread_count) : "memory");
+    }
+
     __device__ __forceinline__ void load_ldmatrix_a_m16n8k32(
         uint32_t frag[4],
         const int *smem_base,
@@ -584,8 +592,14 @@ namespace
     // STAGES_=2: double-buffered (overlaps decode(next) with compute(current)).
     template <uint8_t CODEBOOK_ID, int BM, int BN, int WARPS_M, int WARPS_N, int SPLIT_K = 1,
               int STAGES_ = 2,
+              bool STREAM_K = false,
               int BLOCK_SIZE_ = WARPS_M * WARPS_N * 32,
-              int MIN_BLOCKS_HINT = (STAGES_ == 1)
+              // Stream-K persistent loop needs more live registers for loop bookkeeping
+              // (kbc, kbc_stop, tile bounds, fixup writes). Using MIN_BLOCKS_HINT=1
+              // gives the compiler 128 regs/thread (vs 64 with hint=2), eliminating
+              // local memory spilling that was causing 4.5x more DRAM traffic.
+              int MIN_BLOCKS_HINT = STREAM_K ? 1
+                                    : (STAGES_ == 1)
                                         ? ((BLOCK_SIZE_ >= 256) ? 3 : 4)
                                         : ((BLOCK_SIZE_ >= 256) ? 2 : 3)>
     __global__ __launch_bounds__(BLOCK_SIZE_, MIN_BLOCKS_HINT) void nativeVnniTC_BK64(
@@ -602,7 +616,8 @@ namespace
         int N,
         int K,
         float alpha,
-        float beta)
+        float beta,
+        float *__restrict__ tmp_fixup)
     {
 #if __CUDA_ARCH__ >= 800
         constexpr int NUM_WARPS = WARPS_M * WARPS_N;
@@ -613,9 +628,19 @@ namespace
         constexpr int WN = WARP_N / 8;
         constexpr int A_VEC_LOADS = BM * BK64 / 16;
 
+        // Named barriers replace __syncthreads() when load/decode are warp-group-affine:
+        // - A loads: row-group-affine when A_VEC_LOADS == BLOCK_SIZE (1 cp.async/thread)
+        // - B decode: col-group-affine when BLOCK_SIZE >= 2*BN (split-thread path)
+        // Each warp hits a row barrier (syncs WARPS_N warps) + col barrier (syncs WARPS_M warps)
+        // instead of one full-CTA barrier, reducing barrier stall from 16→4 warp convergence.
+        // PERF NOTE: benchmarking showed ~1% regression due to 2× barrier instruction overhead
+        // outweighing the smaller sync group benefit. Disabled pending a single-barrier solution.
+        constexpr bool USE_NAMED_BARRIERS = false; // (A_VEC_LOADS == BLOCK_SIZE) && (BLOCK_SIZE >= 2 * BN);
+
         static_assert(BM % WARPS_M == 0 && BN % WARPS_N == 0);
         static_assert(WARP_M % 16 == 0);
         static_assert(WARP_N % 8 == 0);
+        static_assert(!STREAM_K || SPLIT_K == 1, "Stream-K and Split-K are mutually exclusive");
 
         const int warp_id = threadIdx.x >> 5;
         const int lane_id = threadIdx.x & 31;
@@ -623,22 +648,30 @@ namespace
         const int wc = warp_id % WARPS_N;
         const int gid = lane_id >> 2;
 
-        const int block_m = blockIdx.x * BM;
-        const int block_n = blockIdx.y * BN;
+        int block_m = 0, block_n = 0;
+        if constexpr (!STREAM_K)
+        {
+            block_m = blockIdx.x * BM;
+            block_n = blockIdx.y * BN;
+        }
 
         const int num_q40_blocks = K / 32;
         const int num_k_tiles_total = (num_q40_blocks + 1) / 2; // ceil: handles K%64!=0
         int kt_begin = 0;
         int kt_end = num_k_tiles_total;
-        if constexpr (SPLIT_K > 1)
+        int num_k_iters = num_k_tiles_total;
+        if constexpr (!STREAM_K)
         {
-            const int tiles_per_part = (num_k_tiles_total + SPLIT_K - 1) / SPLIT_K;
-            kt_begin = static_cast<int>(blockIdx.z) * tiles_per_part;
-            kt_end = min(kt_begin + tiles_per_part, num_k_tiles_total);
+            if constexpr (SPLIT_K > 1)
+            {
+                const int tiles_per_part = (num_k_tiles_total + SPLIT_K - 1) / SPLIT_K;
+                kt_begin = static_cast<int>(blockIdx.z) * tiles_per_part;
+                kt_end = min(kt_begin + tiles_per_part, num_k_tiles_total);
+            }
+            num_k_iters = kt_end - kt_begin;
+            if (num_k_iters <= 0)
+                return;
         }
-        const int num_k_iters = kt_end - kt_begin;
-        if (num_k_iters <= 0)
-            return;
 
         // Compile-time traits for this codebook
         using Traits = llaminar2::cuda_native_vnni::CodebookTraits<CODEBOOK_ID>;
@@ -670,13 +703,16 @@ namespace
         [[maybe_unused]] __shared__ uint16_t smem_iq1m_qh[STAGES_][IS_IQ1_M ? 2 * BN : 1];
 
         float acc[WM][WN][4];
+        auto zero_acc = [&]() __attribute__((always_inline))
+        {
 #pragma unroll
-        for (int i = 0; i < WM; ++i)
+            for (int i = 0; i < WM; ++i)
 #pragma unroll
-            for (int j = 0; j < WN; ++j)
+                for (int j = 0; j < WN; ++j)
 #pragma unroll
-                for (int e = 0; e < 4; ++e)
-                    acc[i][j][e] = 0.0f;
+                    for (int e = 0; e < 4; ++e)
+                        acc[i][j][e] = 0.0f;
+        };
 
         // Load A tile: BM × BK64 bytes via 16-byte async copies
         auto load_A_tile = [&](int stage, int kt) __attribute__((always_inline))
@@ -1065,7 +1101,9 @@ namespace
             }
         };
 
-        const bool is_interior_tile = (block_m + BM <= M) && (block_n + BN <= N);
+        const bool is_interior_tile = (!STREAM_K) ? ((block_m + BM <= M) && (block_n + BN <= N)) : false;
+        // Mutable copy for stream-K tile loop (modified per-tile; standard path uses const above)
+        bool is_interior_tile_mut = is_interior_tile;
 
         auto compute_k_tile_interior = [&](int stage, int kt) __attribute__((always_inline))
         {
@@ -1560,158 +1598,335 @@ namespace
             }
         };
 
-        if constexpr (STAGES_ == 1)
+        // ── Dispatch: stream-K tile loop or standard single-tile ─────
+        if constexpr (STREAM_K)
         {
-            // ── Single-buffered main loop ────────────────────────────────
-            // Half the smem → higher occupancy (3+ blocks/SM).
-            // Trade-off: no load/compute overlap, 2 syncs per K-tile.
-            // cp.async for A still overlaps with sync B decode.
-            for (int ki = 0; ki < num_k_iters; ++ki)
+            // -- Stream-K lambdas (defined here to avoid capture overhead on standard path) --
+            auto zero_acc = [&]() __attribute__((always_inline))
             {
-                const int kt = kt_begin + ki;
+#pragma unroll
+                for (int i = 0; i < WM; ++i)
+#pragma unroll
+                    for (int j = 0; j < WN; ++j)
+#pragma unroll
+                        for (int e = 0; e < 4; ++e)
+                            acc[i][j][e] = 0.0f;
+            };
 
-                load_A_tile(0, kt);
-                cp_async_commit();
-                decode_B_direct(0, kt); // runs while cp.async for A is in-flight
-                load_scales_A(0, kt);
-                cp_async_wait<0>();
-                __syncthreads(); // A load + B decode both complete
-
-                if (is_interior_tile)
-                    compute_k_tile_interior(0, kt);
+            auto run_pipeline = [&]() __attribute__((always_inline))
+            {
+                if constexpr (STAGES_ == 1)
+                {
+                    for (int ki = 0; ki < num_k_iters; ++ki)
+                    {
+                        const int kt = kt_begin + ki;
+                        load_A_tile(0, kt);
+                        cp_async_commit();
+                        decode_B_direct(0, kt);
+                        load_scales_A(0, kt);
+                        cp_async_wait<0>();
+                        __syncthreads();
+                        if (is_interior_tile_mut)
+                            compute_k_tile_interior(0, kt);
+                        else
+                            compute_k_tile_border(0, kt);
+                        if (ki + 1 < num_k_iters)
+                            __syncthreads();
+                    }
+                }
                 else
-                    compute_k_tile_border(0, kt);
+                {
+                    load_A_tile(0, kt_begin);
+                    cp_async_commit();
+                    decode_B_direct(0, kt_begin);
+                    load_scales_A(0, kt_begin);
+                    cp_async_wait<0>();
+                    __syncthreads();
+                    for (int ki = 0; ki < num_k_iters; ++ki)
+                    {
+                        const int stage = ki & 1;
+                        const int kt = kt_begin + ki;
+                        if (ki + 1 < num_k_iters)
+                        {
+                            load_A_tile(stage ^ 1, kt + 1);
+                            cp_async_commit();
+                            decode_B_direct(stage ^ 1, kt + 1);
+                            load_scales_A(stage ^ 1, kt + 1);
+                        }
+                        if (is_interior_tile_mut)
+                            compute_k_tile_interior(stage, kt);
+                        else
+                            compute_k_tile_border(stage, kt);
+                        if (ki + 1 < num_k_iters)
+                        {
+                            cp_async_wait<0>();
+                            __syncthreads();
+                        }
+                    }
+                }
+            };
 
-                if (ki + 1 < num_k_iters)
-                    __syncthreads(); // ensure all warps done before overwriting smem
+            auto write_epilogue = [&]() __attribute__((always_inline))
+            {
+                const bool simple_epilogue = (beta == 0.0f) && (bias == nullptr);
+#pragma unroll
+                for (int wj = 0; wj < WN; ++wj)
+                {
+                    const int tile_n = block_n + wc * WARP_N + wj * 8;
+                    const int gc0 = tile_n + frag_col(lane_id, 0);
+                    const int gc1 = tile_n + frag_col(lane_id, 1);
+                    const bool gc0_valid = gc0 < N;
+                    const bool gc1_valid = gc1 < N;
+                    const float bias0 = (bias && gc0_valid) ? bias[gc0] : 0.0f;
+                    const float bias1 = (bias && gc1_valid) ? bias[gc1] : 0.0f;
+#pragma unroll
+                    for (int wi = 0; wi < WM; ++wi)
+                    {
+                        const int tile_m = block_m + wr * WARP_M + wi * 16;
+                        const bool interior = (tile_m + 15 < M) && (tile_n + 7 < N);
+                        if (interior && simple_epilogue)
+                        {
+                            const int out_idx0 = (tile_m + frag_row(lane_id, 0)) * N + gc0;
+                            const int out_idx1 = (tile_m + frag_row(lane_id, 1)) * N + gc1;
+                            const int out_idx2 = (tile_m + frag_row(lane_id, 2)) * N + gc0;
+                            const int out_idx3 = (tile_m + frag_row(lane_id, 3)) * N + gc1;
+                            C[out_idx0] = acc[wi][wj][0] * alpha;
+                            C[out_idx1] = acc[wi][wj][1] * alpha;
+                            C[out_idx2] = acc[wi][wj][2] * alpha;
+                            C[out_idx3] = acc[wi][wj][3] * alpha;
+                            continue;
+                        }
+#pragma unroll
+                        for (int e = 0; e < 4; ++e)
+                        {
+                            const int gr = tile_m + frag_row(lane_id, e);
+                            const int gc = (e & 1) ? gc1 : gc0;
+                            if (gr < M && gc < N)
+                            {
+                                const int out_idx = gr * N + gc;
+                                float val = acc[wi][wj][e] * alpha;
+                                if (beta != 0.0f && C_existing)
+                                    val += beta * C_existing[out_idx];
+                                if (bias)
+                                    val += (e & 1) ? bias1 : bias0;
+                                C[out_idx] = val;
+                            }
+                        }
+                    }
+                }
+            };
+
+            auto write_to_fixup = [&]() __attribute__((always_inline))
+            {
+                float *fix = tmp_fixup + blockIdx.x * (BM * BN);
+#pragma unroll
+                for (int wj = 0; wj < WN; ++wj)
+                {
+                    const int fc0 = wc * WARP_N + wj * 8 + frag_col(lane_id, 0);
+                    const int fc1 = wc * WARP_N + wj * 8 + frag_col(lane_id, 1);
+#pragma unroll
+                    for (int wi = 0; wi < WM; ++wi)
+                    {
+                        const int fr_base = wr * WARP_M + wi * 16;
+                        fix[(fr_base + frag_row(lane_id, 0)) * BN + fc0] = acc[wi][wj][0] * alpha;
+                        fix[(fr_base + frag_row(lane_id, 1)) * BN + fc1] = acc[wi][wj][1] * alpha;
+                        fix[(fr_base + frag_row(lane_id, 2)) * BN + fc0] = acc[wi][wj][2] * alpha;
+                        fix[(fr_base + frag_row(lane_id, 3)) * BN + fc1] = acc[wi][wj][3] * alpha;
+                    }
+                }
+            };
+
+            // Stream-K tile loop
+            const int ntx = (N + BN - 1) / BN;
+            const int nty = (M + BM - 1) / BM;
+            const int num_k_tiles = num_k_tiles_total;
+            const long long total_work = (long long)nty * ntx * num_k_tiles;
+            long long kbc = (long long)blockIdx.x * total_work / gridDim.x;
+            long long kbc_stop = (long long)(blockIdx.x + 1) * total_work / gridDim.x;
+
+            while (kbc < kbc_stop)
+            {
+                const int tile_idx = static_cast<int>(kbc / num_k_tiles);
+                const int local_kt_begin = static_cast<int>(kbc % num_k_tiles);
+                const int local_kt_end = min(num_k_tiles,
+                                             local_kt_begin + static_cast<int>(kbc_stop - kbc));
+
+                const int ty = tile_idx / ntx;
+                const int tx = tile_idx % ntx;
+                block_m = ty * BM;
+                block_n = tx * BN;
+                kt_begin = local_kt_begin;
+                kt_end = local_kt_end;
+                num_k_iters = kt_end - kt_begin;
+                is_interior_tile_mut = (block_m + BM <= M) && (block_n + BN <= N);
+
+                const bool completes_tile = (kt_end == num_k_tiles);
+
+                zero_acc();
+                run_pipeline();
+
+                if (completes_tile)
+                    write_epilogue();
+                else
+                    write_to_fixup();
+
+                __syncthreads(); // ensure smem safe before next tile
+
+                kbc += (num_k_tiles - local_kt_begin);
             }
         }
         else
         {
-            // ── Double-buffered pipeline (STAGES_=2) ─────────────────────
-            // Pipeline prolog: overlap A cp.async with B decode (independent)
-            load_A_tile(0, kt_begin);
-            cp_async_commit();
-            decode_B_direct(0, kt_begin); // runs while cp.async for A is in-flight
-            load_scales_A(0, kt_begin);   // cooperative scale load (< 1 KB)
-            cp_async_wait<0>();
-            __syncthreads(); // single barrier: both A load and B decode complete
+            // ── Standard path: inline code matching baseline exactly ─────
+            // No lambda wrapping — keeps variables const and avoids capture overhead.
 
-            // Main loop — decode(next) overlaps with compute(current).
-            // decode_B writes to smem_B[next_stage], compute reads smem_B[current_stage]:
-            // different buffers → no conflict.  Single sync ensures both finish
-            // before the stages flip.
-            for (int ki = 0; ki < num_k_iters; ++ki)
+#pragma unroll
+            for (int i = 0; i < WM; ++i)
+#pragma unroll
+                for (int j = 0; j < WN; ++j)
+#pragma unroll
+                    for (int e = 0; e < 4; ++e)
+                        acc[i][j][e] = 0.0f;
+
+            if constexpr (STAGES_ == 1)
             {
-                const int stage = ki & 1;
-                const int kt = kt_begin + ki;
-
-                if (ki + 1 < num_k_iters)
+                // ── Single-buffered main loop ────────────────────────────────
+                for (int ki = 0; ki < num_k_iters; ++ki)
                 {
-                    // Start async A load for next iteration
-                    load_A_tile(stage ^ 1, kt + 1);
+                    const int kt = kt_begin + ki;
+
+                    load_A_tile(0, kt);
                     cp_async_commit();
-
-                    // Decode B for next iteration into next stage's smem buffers.
-                    // This runs concurrently with compute below: decode writes
-                    // smem_B[stage^1] while compute reads smem_B[stage].
-                    decode_B_direct(stage ^ 1, kt + 1);
-
-                    // Load activation scales for next K-tile into smem (< 1 KB per stage)
-                    load_scales_A(stage ^ 1, kt + 1);
-                }
-
-                if (is_interior_tile)
-                    compute_k_tile_interior(stage, kt);
-                else
-                    compute_k_tile_border(stage, kt);
-
-                if (ki + 1 < num_k_iters)
-                {
+                    decode_B_direct(0, kt); // runs while cp.async for A is in-flight
+                    load_scales_A(0, kt);
                     cp_async_wait<0>();
-                    __syncthreads(); // single barrier: decode writes + A load + compute reads all done
+                    __syncthreads(); // A load + B decode both complete
+
+                    if (is_interior_tile)
+                        compute_k_tile_interior(0, kt);
+                    else
+                        compute_k_tile_border(0, kt);
+
+                    if (ki + 1 < num_k_iters)
+                        __syncthreads(); // ensure all warps done before overwriting smem
                 }
             }
-        }
-
-        // Epilogue: write accumulators to global memory
-        const bool simple_epilogue = (beta == 0.0f) && (bias == nullptr);
-
-#pragma unroll
-        for (int wj = 0; wj < WN; ++wj)
-        {
-            const int tile_n = block_n + wc * WARP_N + wj * 8;
-            const int gc0 = tile_n + frag_col(lane_id, 0);
-            const int gc1 = tile_n + frag_col(lane_id, 1);
-            const bool gc0_valid = gc0 < N;
-            const bool gc1_valid = gc1 < N;
-            const float bias0 = (bias && gc0_valid) ? bias[gc0] : 0.0f;
-            const float bias1 = (bias && gc1_valid) ? bias[gc1] : 0.0f;
-
-#pragma unroll
-            for (int wi = 0; wi < WM; ++wi)
+            else
             {
-                const int tile_m = block_m + wr * WARP_M + wi * 16;
-                const bool interior = (tile_m + 15 < M) && (tile_n + 7 < N);
+                // ── Double-buffered pipeline (STAGES_=2) ─────────────────────
+                load_A_tile(0, kt_begin);
+                cp_async_commit();
+                decode_B_direct(0, kt_begin);
+                load_scales_A(0, kt_begin);
+                cp_async_wait<0>();
+                __syncthreads();
 
-                if (interior && simple_epilogue)
+                for (int ki = 0; ki < num_k_iters; ++ki)
                 {
-                    const int out_idx0 = (tile_m + frag_row(lane_id, 0)) * N + gc0;
-                    const int out_idx1 = (tile_m + frag_row(lane_id, 1)) * N + gc1;
-                    const int out_idx2 = (tile_m + frag_row(lane_id, 2)) * N + gc0;
-                    const int out_idx3 = (tile_m + frag_row(lane_id, 3)) * N + gc1;
+                    const int stage = ki & 1;
+                    const int kt = kt_begin + ki;
 
-                    if constexpr (SPLIT_K > 1)
+                    if (ki + 1 < num_k_iters)
                     {
-                        atomicAdd(&C[out_idx0], acc[wi][wj][0] * alpha);
-                        atomicAdd(&C[out_idx1], acc[wi][wj][1] * alpha);
-                        atomicAdd(&C[out_idx2], acc[wi][wj][2] * alpha);
-                        atomicAdd(&C[out_idx3], acc[wi][wj][3] * alpha);
+                        load_A_tile(stage ^ 1, kt + 1);
+                        cp_async_commit();
+                        decode_B_direct(stage ^ 1, kt + 1);
+                        load_scales_A(stage ^ 1, kt + 1);
                     }
+
+                    if (is_interior_tile)
+                        compute_k_tile_interior(stage, kt);
                     else
+                        compute_k_tile_border(stage, kt);
+
+                    if (ki + 1 < num_k_iters)
                     {
-                        C[out_idx0] = acc[wi][wj][0] * alpha;
-                        C[out_idx1] = acc[wi][wj][1] * alpha;
-                        C[out_idx2] = acc[wi][wj][2] * alpha;
-                        C[out_idx3] = acc[wi][wj][3] * alpha;
+                        cp_async_wait<0>();
+                        __syncthreads();
                     }
-                    continue;
                 }
+            }
+
+            // Epilogue: write accumulators to global memory
+            const bool simple_epilogue = (beta == 0.0f) && (bias == nullptr);
 
 #pragma unroll
-                for (int e = 0; e < 4; ++e)
-                {
-                    const int gr = tile_m + frag_row(lane_id, e);
-                    const int gc = (e & 1) ? gc1 : gc0;
+            for (int wj = 0; wj < WN; ++wj)
+            {
+                const int tile_n = block_n + wc * WARP_N + wj * 8;
+                const int gc0 = tile_n + frag_col(lane_id, 0);
+                const int gc1 = tile_n + frag_col(lane_id, 1);
+                const bool gc0_valid = gc0 < N;
+                const bool gc1_valid = gc1 < N;
+                const float bias0 = (bias && gc0_valid) ? bias[gc0] : 0.0f;
+                const float bias1 = (bias && gc1_valid) ? bias[gc1] : 0.0f;
 
-                    if (gr < M && gc < N)
+#pragma unroll
+                for (int wi = 0; wi < WM; ++wi)
+                {
+                    const int tile_m = block_m + wr * WARP_M + wi * 16;
+                    const bool interior = (tile_m + 15 < M) && (tile_n + 7 < N);
+
+                    if (interior && simple_epilogue)
                     {
-                        const int out_idx = gr * N + gc;
-                        float val = acc[wi][wj][e] * alpha;
+                        const int out_idx0 = (tile_m + frag_row(lane_id, 0)) * N + gc0;
+                        const int out_idx1 = (tile_m + frag_row(lane_id, 1)) * N + gc1;
+                        const int out_idx2 = (tile_m + frag_row(lane_id, 2)) * N + gc0;
+                        const int out_idx3 = (tile_m + frag_row(lane_id, 3)) * N + gc1;
 
                         if constexpr (SPLIT_K > 1)
                         {
-                            if (blockIdx.z == 0)
+                            atomicAdd(&C[out_idx0], acc[wi][wj][0] * alpha);
+                            atomicAdd(&C[out_idx1], acc[wi][wj][1] * alpha);
+                            atomicAdd(&C[out_idx2], acc[wi][wj][2] * alpha);
+                            atomicAdd(&C[out_idx3], acc[wi][wj][3] * alpha);
+                        }
+                        else
+                        {
+                            C[out_idx0] = acc[wi][wj][0] * alpha;
+                            C[out_idx1] = acc[wi][wj][1] * alpha;
+                            C[out_idx2] = acc[wi][wj][2] * alpha;
+                            C[out_idx3] = acc[wi][wj][3] * alpha;
+                        }
+                        continue;
+                    }
+
+#pragma unroll
+                    for (int e = 0; e < 4; ++e)
+                    {
+                        const int gr = tile_m + frag_row(lane_id, e);
+                        const int gc = (e & 1) ? gc1 : gc0;
+
+                        if (gr < M && gc < N)
+                        {
+                            const int out_idx = gr * N + gc;
+                            float val = acc[wi][wj][e] * alpha;
+
+                            if constexpr (SPLIT_K > 1)
+                            {
+                                if (blockIdx.z == 0)
+                                {
+                                    if (beta != 0.0f && C_existing)
+                                        val += beta * C_existing[out_idx];
+                                    if (bias)
+                                        val += (e & 1) ? bias1 : bias0;
+                                }
+                                atomicAdd(&C[out_idx], val);
+                            }
+                            else
                             {
                                 if (beta != 0.0f && C_existing)
                                     val += beta * C_existing[out_idx];
                                 if (bias)
                                     val += (e & 1) ? bias1 : bias0;
+                                C[out_idx] = val;
                             }
-                            atomicAdd(&C[out_idx], val);
-                        }
-                        else
-                        {
-                            if (beta != 0.0f && C_existing)
-                                val += beta * C_existing[out_idx];
-                            if (bias)
-                                val += (e & 1) ? bias1 : bias0;
-                            C[out_idx] = val;
                         }
                     }
                 }
             }
         }
+
 #else
         (void)A;
         (void)payload;
@@ -1725,6 +1940,7 @@ namespace
         (void)K;
         (void)alpha;
         (void)beta;
+        (void)tmp_fixup;
 #endif
     }
 
@@ -2455,7 +2671,8 @@ namespace
             N,
             K,
             alpha,
-            beta);
+            beta,
+            nullptr);
         return cudaGetLastError() == cudaSuccess;
     }
 
@@ -2508,8 +2725,297 @@ namespace
             N,
             K,
             alpha,
-            beta);
+            beta,
+            nullptr);
         return cudaGetLastError() == cudaSuccess;
+    }
+
+    // =========================================================================
+    // Stream-K fixup kernel: accumulates partial sums from the fixup buffer
+    // into the final output matrix C. Each fixup block corresponds to a main
+    // kernel block (same blockIdx.x). If that main kernel block completed a
+    // tile starting from mid-K, we walk backwards to find previous blocks
+    // whose fixup slots contain partial sums for the same tile.
+    //
+    // Key insight: a block's fixup slot always contains data for its LAST
+    // tile (the only tile that can be partial). We identify the fixup tile
+    // using (prev_kbc_stop - 1) / num_k_tiles, not prev_kbc / num_k_tiles.
+    // =========================================================================
+    template <int BM, int BN>
+    __global__ __launch_bounds__(256) void streamK_fixup(
+        float *__restrict__ C,
+        const float *__restrict__ tmp_fixup,
+        int M, int N, int K,
+        int ntx, int nty, int num_k_tiles)
+    {
+        const long long total_work = (long long)nty * ntx * num_k_tiles;
+        const long long kbc0 = (long long)blockIdx.x * total_work / gridDim.x;
+        const long long kbc0_stop = (long long)(blockIdx.x + 1) * total_work / gridDim.x;
+
+        // Early exit: empty block or started at tile boundary
+        if (kbc0 >= kbc0_stop)
+            return;
+        if (kbc0 % num_k_tiles == 0)
+            return; // started at K=0 for a tile — wrote epilogue, no fixup needed
+
+        // Check if we complete our first tile (the one we started mid-K on)
+        const int first_tile_idx = static_cast<int>(kbc0 / num_k_tiles);
+        const int local_kt_begin = static_cast<int>(kbc0 % num_k_tiles);
+        const int local_kt_end = min(num_k_tiles,
+                                     local_kt_begin + static_cast<int>(kbc0_stop - kbc0));
+
+        if (local_kt_end != num_k_tiles)
+            return; // didn't complete the tile — wrote to fixup, not epilogue
+
+        // This block completed a tile starting from mid-K (wrote epilogue to C).
+        // We need to accumulate partial sums from earlier blocks that also
+        // contributed to this tile but wrote to fixup instead of C.
+        const int tile_idx = first_tile_idx;
+        const int ty = tile_idx / ntx;
+        const int tx = tile_idx % ntx;
+        const int block_m = ty * BM;
+        const int block_n = tx * BN;
+
+        constexpr int TILE_SIZE = BM * BN;
+        constexpr int ELEMS_PER_THREAD = (TILE_SIZE + 255) / 256;
+        float local_sum[ELEMS_PER_THREAD];
+#pragma unroll
+        for (int i = 0; i < ELEMS_PER_THREAD; ++i)
+            local_sum[i] = 0.0f;
+
+        // Walk backwards through previous blocks to collect fixup contributions.
+        // A block's fixup slot contains its LAST tile's partial (only the last
+        // tile in a block's range can be partial — see tile loop analysis).
+        int bidx = static_cast<int>(blockIdx.x) - 1;
+        while (bidx >= 0)
+        {
+            const long long prev_kbc = (long long)bidx * total_work / gridDim.x;
+            const long long prev_kbc_stop = (long long)(bidx + 1) * total_work / gridDim.x;
+
+            if (prev_kbc >= prev_kbc_stop)
+            {
+                bidx--;
+                continue;
+            } // empty block
+
+            // The fixup slot contains the block's LAST tile. Determine it from
+            // the block's end position, not its start position.
+            const int fixup_tile = static_cast<int>((prev_kbc_stop - 1) / num_k_tiles);
+
+            if (fixup_tile < tile_idx)
+                break; // this block (and all earlier) are in earlier tiles
+
+            if (fixup_tile == tile_idx)
+            {
+                // Check if this block actually wrote a partial (not completed)
+                const int end_k_pos = static_cast<int>((prev_kbc_stop - 1) % num_k_tiles) + 1;
+                if (end_k_pos < num_k_tiles)
+                {
+                    // This block wrote a partial for our tile — accumulate it
+                    const float *fix = tmp_fixup + bidx * TILE_SIZE;
+#pragma unroll
+                    for (int i = 0; i < ELEMS_PER_THREAD; ++i)
+                    {
+                        const int idx = threadIdx.x + i * 256;
+                        if (idx < TILE_SIZE)
+                            local_sum[i] += fix[idx];
+                    }
+                }
+
+                // Check if this block started at K=0 for our tile — if so,
+                // no earlier blocks contributed (all K-work accounted for)
+                const long long tile_start = (long long)tile_idx * num_k_tiles;
+                if (prev_kbc <= tile_start)
+                    break;
+            }
+            // fixup_tile > tile_idx: this block's fixup is for a later tile, skip
+
+            bidx--;
+        }
+
+        // Write accumulated fixup to C
+#pragma unroll
+        for (int i = 0; i < ELEMS_PER_THREAD; ++i)
+        {
+            const int idx = threadIdx.x + i * 256;
+            if (idx < TILE_SIZE && local_sum[i] != 0.0f)
+            {
+                const int row = idx / BN;
+                const int col = idx % BN;
+                const int gr = block_m + row;
+                const int gc = block_n + col;
+                if (gr < M && gc < N)
+                    C[gr * N + gc] += local_sum[i];
+            }
+        }
+    }
+
+    // =========================================================================
+    // Stream-K force mode: 0 = auto (heuristic), 1 = force ON, -1 = force OFF
+    // Controllable from tests via extern "C" cudaNativeVNNIPrefill_setStreamKMode()
+    // =========================================================================
+    static int g_stream_k_force_mode = 0;
+
+    // =========================================================================
+    // Persistent fixup buffer: pre-allocated once, reused across launches.
+    // Avoids cudaMallocAsync/cudaFreeAsync overhead per GEMM call.
+    // =========================================================================
+    static float *g_stream_k_fixup_buf = nullptr;
+    static size_t g_stream_k_fixup_buf_bytes = 0;
+
+    float *getStreamKFixupBuffer(size_t required_bytes, cudaStream_t stream)
+    {
+        if (g_stream_k_fixup_buf && g_stream_k_fixup_buf_bytes >= required_bytes)
+        {
+            cudaMemsetAsync(g_stream_k_fixup_buf, 0, required_bytes, stream);
+            return g_stream_k_fixup_buf;
+        }
+        // Grow the buffer (free old, allocate new with 2x headroom)
+        if (g_stream_k_fixup_buf)
+        {
+            cudaDeviceSynchronize();
+            cudaFree(g_stream_k_fixup_buf);
+            g_stream_k_fixup_buf = nullptr;
+            g_stream_k_fixup_buf_bytes = 0;
+        }
+        const size_t alloc_bytes = required_bytes * 2; // 2x headroom
+        if (cudaMalloc(&g_stream_k_fixup_buf, alloc_bytes) != cudaSuccess)
+            return nullptr;
+        g_stream_k_fixup_buf_bytes = alloc_bytes;
+        cudaMemsetAsync(g_stream_k_fixup_buf, 0, required_bytes, stream);
+        return g_stream_k_fixup_buf;
+    }
+
+    // =========================================================================
+    // Stream-K launch helper: launches the persistent GEMM kernel with nsm
+    // blocks, then a fixup kernel to accumulate partial sums.
+    // =========================================================================
+    template <uint8_t CODEBOOK_ID, int BM, int BN, int WM, int WN>
+    bool launchNativeVNNITC_BK64_StreamK(
+        const int8_t *d_A_int8,
+        const uint8_t *d_payload,
+        const uint16_t *d_scales,
+        const uint16_t *d_mins,
+        const uint32_t *d_emins,
+        float *d_C_fp32,
+        const float *d_scales_A_block,
+        int M,
+        int N,
+        int K,
+        float alpha,
+        float beta,
+        const float *d_C_existing,
+        const float *d_bias,
+        cudaStream_t cuda_stream)
+    {
+        const int nsm = getSmCount();
+        const int ntx = (N + BN - 1) / BN;
+        const int nty = (M + BM - 1) / BM;
+        const int num_k_tiles = (K / 32 + 1) / 2;
+        const int total_tiles = ntx * nty;
+
+        // Grid size: 1 block/SM for stream-K. The relaxed __launch_bounds__
+        // (MIN_BLOCKS_HINT=1) gives the compiler 128 regs/thread, eliminating
+        // the devastating local memory spilling that occurred with 2 blocks/SM.
+        // With 1 persistent block/SM, each block handles ~total_tiles/82 tiles.
+        const int grid_blocks = nsm;
+
+        // Check if fixup is needed (tiles don't divide evenly among blocks)
+        const bool fixup_needed = ((long long)total_tiles * num_k_tiles) % grid_blocks != 0;
+
+        // Get pre-allocated fixup buffer (reused across launches)
+        float *d_fixup = nullptr;
+        if (fixup_needed)
+        {
+            const size_t fixup_bytes = static_cast<size_t>(grid_blocks) * BM * BN * sizeof(float);
+            d_fixup = getStreamKFixupBuffer(fixup_bytes, cuda_stream);
+            if (!d_fixup)
+                return false;
+        }
+
+        (void)cudaGetLastError();
+
+        // Main kernel: grid_blocks persistent blocks (fills all SM slots)
+        const dim3 grid(grid_blocks, 1, 1);
+        const dim3 block(WM * WN * 32);
+
+        nativeVnniTC_BK64<CODEBOOK_ID, BM, BN, WM, WN, /*SPLIT_K=*/1, /*STAGES_=*/2, /*STREAM_K=*/true><<<grid, block, 0, cuda_stream>>>(
+            d_A_int8,
+            d_payload,
+            d_scales,
+            d_mins,
+            d_emins,
+            d_C_fp32,
+            d_scales_A_block,
+            d_C_existing,
+            d_bias,
+            M, N, K,
+            alpha, beta,
+            d_fixup);
+
+        if (cudaGetLastError() != cudaSuccess)
+            return false;
+
+        // Fixup kernel: accumulate partial sums
+        if (fixup_needed)
+        {
+            streamK_fixup<BM, BN><<<dim3(grid_blocks, 1, 1), dim3(256), 0, cuda_stream>>>(
+                d_C_fp32, d_fixup, M, N, K, ntx, nty, num_k_tiles);
+
+            if (cudaGetLastError() != cudaSuccess)
+                return false;
+        }
+
+        return true;
+    }
+
+    // =========================================================================
+    // Stream-K profitability heuristic: determines whether stream-K is likely
+    // to outperform standard tiling for a given GEMM shape.
+    // Stream-K wins when wave-tail inefficiency is significant (>10%).
+    // =========================================================================
+    bool shouldUseStreamK(int M, int N, int K, int bm, int bn)
+    {
+        // Respect force mode from test harness
+        if (g_stream_k_force_mode < 0)
+            return false;
+        if (g_stream_k_force_mode > 0)
+            return true;
+
+        // Auto mode: data-driven heuristic from A/B profiling (v2_perf_cuda_streamk_ab).
+        // Stream-K wins when the standard tiling's last wave is poorly filled,
+        // wasting SM slots. With 128×128 tiles and 82 SMs (RTX 3090), the sweet
+        // spot is wave efficiency between ~40-70% (significant tail waste).
+        //
+        // Profiled results (Qwen2.5-7B shapes, T128x128_w4x4):
+        //   QKV  M=596: tiles=180, wave_eff=54.9% → SK wins 1.044x
+        //   Down M=512: tiles=112, wave_eff=68.3% → SK wins 1.179x
+        //   Wo   M=596: tiles=140, wave_eff=85.4% → STD wins (already efficient)
+        //   GateUp M=*: tiles=148-740, wave_eff≥60% → STD wins (high occupancy)
+        //
+        // Stream-K also loses when tiles >> nsm (many full waves), because
+        // the standard kernel already has high utilization and stream-K's
+        // lower occupancy (33% vs 67%) hurts.
+        const int nsm = getSmCount();
+        const int total_tiles = ((M + bm - 1) / bm) * ((N + bn - 1) / bn);
+
+        // Stream-K only helps with 128×128 tiles (where it's compiled with
+        // relaxed launch_bounds). Skip for smaller tiles.
+        if (bm < 128 || bn < 128)
+            return false;
+
+        // Need at least 1 wave of tiles (otherwise standard is fine)
+        if (total_tiles < nsm)
+            return false;
+
+        // Compute wave tail efficiency (how full is the last wave)
+        const float waves = static_cast<float>(total_tiles) / static_cast<float>(nsm);
+        const float frac = waves - static_cast<float>(static_cast<int>(waves));
+        const float wave_eff = (frac < 0.001f) ? 1.0f : frac;
+
+        // Stream-K wins when wave_eff < 70% (significant tail waste)
+        // AND total tiles don't exceed ~3 waves (diminishing returns)
+        return wave_eff < 0.70f && waves < 3.0f;
     }
 
     int chooseSplitK_BK64(Q40PrefillShape shape, int M, int N, int K, int bm, int bn)
@@ -2686,32 +3192,37 @@ extern "C"
         const TileChoice tc = chooseQ40PrefillTile(M, N, K);
 
 // Macro to fan out split_k for a given tile config (avoids 24-way copy-paste)
-#define Q40_DISPATCH_SK(CB, BM_, BN_, WM_, WN_)                           \
-    do                                                                    \
-    {                                                                     \
-        switch (tc.split_k)                                               \
-        {                                                                 \
-        case 8:                                                           \
-            return launchNativeVNNITC_BK64<CB, BM_, BN_, WM_, WN_, 8>(    \
-                d_A_int8, d_payload, d_scales, nullptr, nullptr,          \
-                d_C_fp32, d_scales_A_block,                               \
-                M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream); \
-        case 4:                                                           \
-            return launchNativeVNNITC_BK64<CB, BM_, BN_, WM_, WN_, 4>(    \
-                d_A_int8, d_payload, d_scales, nullptr, nullptr,          \
-                d_C_fp32, d_scales_A_block,                               \
-                M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream); \
-        case 2:                                                           \
-            return launchNativeVNNITC_BK64<CB, BM_, BN_, WM_, WN_, 2>(    \
-                d_A_int8, d_payload, d_scales, nullptr, nullptr,          \
-                d_C_fp32, d_scales_A_block,                               \
-                M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream); \
-        default:                                                          \
-            return launchNativeVNNITC_BK64<CB, BM_, BN_, WM_, WN_, 1>(    \
-                d_A_int8, d_payload, d_scales, nullptr, nullptr,          \
-                d_C_fp32, d_scales_A_block,                               \
-                M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream); \
-        }                                                                 \
+#define Q40_DISPATCH_SK(CB, BM_, BN_, WM_, WN_)                             \
+    do                                                                      \
+    {                                                                       \
+        if (tc.split_k == 1 && shouldUseStreamK(M, N, K, BM_, BN_))         \
+            return launchNativeVNNITC_BK64_StreamK<CB, BM_, BN_, WM_, WN_>( \
+                d_A_int8, d_payload, d_scales, nullptr, nullptr,            \
+                d_C_fp32, d_scales_A_block,                                 \
+                M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream);   \
+        switch (tc.split_k)                                                 \
+        {                                                                   \
+        case 8:                                                             \
+            return launchNativeVNNITC_BK64<CB, BM_, BN_, WM_, WN_, 8>(      \
+                d_A_int8, d_payload, d_scales, nullptr, nullptr,            \
+                d_C_fp32, d_scales_A_block,                                 \
+                M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream);   \
+        case 4:                                                             \
+            return launchNativeVNNITC_BK64<CB, BM_, BN_, WM_, WN_, 4>(      \
+                d_A_int8, d_payload, d_scales, nullptr, nullptr,            \
+                d_C_fp32, d_scales_A_block,                                 \
+                M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream);   \
+        case 2:                                                             \
+            return launchNativeVNNITC_BK64<CB, BM_, BN_, WM_, WN_, 2>(      \
+                d_A_int8, d_payload, d_scales, nullptr, nullptr,            \
+                d_C_fp32, d_scales_A_block,                                 \
+                M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream);   \
+        default:                                                            \
+            return launchNativeVNNITC_BK64<CB, BM_, BN_, WM_, WN_, 1>(      \
+                d_A_int8, d_payload, d_scales, nullptr, nullptr,            \
+                d_C_fp32, d_scales_A_block,                                 \
+                M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream);   \
+        }                                                                   \
     } while (0)
 
         switch (tc.tile)
@@ -2750,6 +3261,28 @@ extern "C"
     {
         for (auto &count : g_q40_prefill_shape_counts)
             count.store(0, std::memory_order_relaxed);
+    }
+
+    // Stream-K force mode: 0=auto(heuristic), 1=force ON, -1=force OFF
+    void cudaNativeVNNIPrefill_setStreamKMode(int mode)
+    {
+        g_stream_k_force_mode = mode;
+    }
+
+    int cudaNativeVNNIPrefill_getStreamKMode()
+    {
+        return g_stream_k_force_mode;
+    }
+
+    void cudaNativeVNNIPrefill_freeStreamKFixup()
+    {
+        if (g_stream_k_fixup_buf)
+        {
+            cudaDeviceSynchronize();
+            cudaFree(g_stream_k_fixup_buf);
+            g_stream_k_fixup_buf = nullptr;
+            g_stream_k_fixup_buf_bytes = 0;
+        }
     }
 
     bool cudaNativeVNNIPrefillIQ4NL_fp32(
@@ -3191,6 +3724,61 @@ extern "C"
             return sweepLaunchQ40<128, 128, 2, 2>(split_k, A, payload, scales, C, scales_A, M, N, K, alpha, beta, C_existing, bias, cs);
         case 11:
             return sweepLaunchQ40<128, 128, 4, 4>(split_k, A, payload, scales, C, scales_A, M, N, K, alpha, beta, C_existing, bias, cs);
+        default:
+            return false;
+        }
+    }
+
+    // Stream-K variant of sweep launch: calls launchNativeVNNITC_BK64_StreamK
+    // directly for a given tile config. Used by the A/B perf harness.
+    bool cudaGemmSweepLaunchStreamK(
+        int config_idx,
+        const int8_t *A, const uint8_t *payload, const uint16_t *scales,
+        float *C, const float *scales_A,
+        int M, int N, int K,
+        float alpha, float beta,
+        const float *C_existing, const float *bias,
+        int device_id, void *stream)
+    {
+        if (config_idx < 0 || config_idx >= kNumSweepConfigs)
+            return false;
+        if (!A || !payload || !scales || !C || !scales_A)
+            return false;
+        if (M <= 0 || N <= 0 || K <= 0 || (K % 32) != 0)
+            return false;
+        if (!isAmperePlus(device_id))
+            return false;
+        if (cudaSetDevice(device_id) != cudaSuccess)
+            return false;
+
+        cudaStream_t cs = static_cast<cudaStream_t>(stream);
+
+        switch (config_idx)
+        {
+        case 0:
+            return launchNativeVNNITC_BK64_StreamK<0, 32, 128, 1, 2>(A, payload, scales, nullptr, nullptr, C, scales_A, M, N, K, alpha, beta, C_existing, bias, cs);
+        case 1:
+            return launchNativeVNNITC_BK64_StreamK<0, 32, 128, 1, 4>(A, payload, scales, nullptr, nullptr, C, scales_A, M, N, K, alpha, beta, C_existing, bias, cs);
+        case 2:
+            return launchNativeVNNITC_BK64_StreamK<0, 64, 64, 2, 1>(A, payload, scales, nullptr, nullptr, C, scales_A, M, N, K, alpha, beta, C_existing, bias, cs);
+        case 3:
+            return launchNativeVNNITC_BK64_StreamK<0, 64, 64, 2, 2>(A, payload, scales, nullptr, nullptr, C, scales_A, M, N, K, alpha, beta, C_existing, bias, cs);
+        case 4:
+            return launchNativeVNNITC_BK64_StreamK<0, 64, 128, 2, 2>(A, payload, scales, nullptr, nullptr, C, scales_A, M, N, K, alpha, beta, C_existing, bias, cs);
+        case 5:
+            return launchNativeVNNITC_BK64_StreamK<0, 64, 128, 4, 2>(A, payload, scales, nullptr, nullptr, C, scales_A, M, N, K, alpha, beta, C_existing, bias, cs);
+        case 6:
+            return launchNativeVNNITC_BK64_StreamK<0, 64, 128, 2, 4>(A, payload, scales, nullptr, nullptr, C, scales_A, M, N, K, alpha, beta, C_existing, bias, cs);
+        case 7:
+            return launchNativeVNNITC_BK64_StreamK<0, 128, 64, 4, 1>(A, payload, scales, nullptr, nullptr, C, scales_A, M, N, K, alpha, beta, C_existing, bias, cs);
+        case 8:
+            return launchNativeVNNITC_BK64_StreamK<0, 128, 64, 2, 1>(A, payload, scales, nullptr, nullptr, C, scales_A, M, N, K, alpha, beta, C_existing, bias, cs);
+        case 9:
+            return launchNativeVNNITC_BK64_StreamK<0, 128, 128, 4, 2>(A, payload, scales, nullptr, nullptr, C, scales_A, M, N, K, alpha, beta, C_existing, bias, cs);
+        case 10:
+            return launchNativeVNNITC_BK64_StreamK<0, 128, 128, 2, 2>(A, payload, scales, nullptr, nullptr, C, scales_A, M, N, K, alpha, beta, C_existing, bias, cs);
+        case 11:
+            return launchNativeVNNITC_BK64_StreamK<0, 128, 128, 4, 4>(A, payload, scales, nullptr, nullptr, C, scales_A, M, N, K, alpha, beta, C_existing, bias, cs);
         default:
             return false;
         }
