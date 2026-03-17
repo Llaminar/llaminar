@@ -182,30 +182,49 @@ namespace
         if (env_tkv)
             forced_tile_kv = atoi(env_tkv);
 
-        // tile_kv candidates: prefer larger (fewer iterations), must be multiple of WMMA_N=16.
-        // Skip 48: empirically 32 outperforms 48 on RTX 3090 (55ms vs 95ms for
-        // attention) because 63KB smem leaves 65KB L1 cache vs 86KB smem/42KB L1.
-        // On GPUs with ≥108KB smem, tile_kv=64 fits with full padding and is preferred.
-        const int tile_kv_options[] = {64, 32};
-        const int num_tile_kv_options = forced_tile_kv > 0 ? 1 : 2;
+        // tile_kv candidates: must be multiple of WMMA_N=16.
+        // Occupancy-aware selection: prefer tile_kv that maximizes blocks/SM
+        // (computed via max_smem / smem_per_block), breaking ties by larger
+        // tile_kv (fewer loop iterations). This is critical because shared
+        // memory often limits to 1 block/SM with large tiles; smaller tiles
+        // allow 2+ concurrent blocks and dramatically reduce barrier and
+        // memory-latency stalls via warp-level parallelism.
+        const int tile_kv_options[] = {64, 32, 16};
+        const int num_tile_kv_options = forced_tile_kv > 0 ? 1 : 3;
 
-        // Search: try each tile_kv with full padding first
+        // Evaluate all candidates, pick highest occupancy then largest tile_kv
+        int best_tkv = 0;
+        size_t best_smem = 0;
+        int best_blocks_per_sm = 0;
         bool found = false;
-        for (int ti = 0; ti < num_tile_kv_options && !found; ti++)
+
+        for (int ti = 0; ti < num_tile_kv_options; ti++)
         {
             int tkv = forced_tile_kv > 0 ? forced_tile_kv : tile_kv_options[ti];
             size_t smem = computeFA2SmemSize(target_tile_q, tkv,
                                              head_dim, FA2_QKV_PAD, FA2_SCORES_LD_PAD);
             if ((int)smem <= max_smem)
             {
-                cfg.tile_q = target_tile_q;
-                cfg.tile_kv = tkv;
-                cfg.num_consumer_warps = target_consumer_warps;
-                cfg.qkv_pad = FA2_QKV_PAD;
-                cfg.scores_pad = FA2_SCORES_LD_PAD;
-                cfg.smem_size = smem;
-                found = true;
+                int blocks_per_sm = max_smem / (int)smem;
+                if (blocks_per_sm > best_blocks_per_sm ||
+                    (blocks_per_sm == best_blocks_per_sm && tkv > best_tkv))
+                {
+                    best_tkv = tkv;
+                    best_smem = smem;
+                    best_blocks_per_sm = blocks_per_sm;
+                }
             }
+        }
+
+        if (best_tkv > 0)
+        {
+            cfg.tile_q = target_tile_q;
+            cfg.tile_kv = best_tkv;
+            cfg.num_consumer_warps = target_consumer_warps;
+            cfg.qkv_pad = FA2_QKV_PAD;
+            cfg.scores_pad = FA2_SCORES_LD_PAD;
+            cfg.smem_size = best_smem;
+            found = true;
         }
 
         if (!found)
@@ -715,6 +734,11 @@ namespace
     // Explicit template instantiations for supported configurations
     // KV_FP16=false (legacy FP32 K/V inputs)
     // head_dim=64: 6 consumer warps, tile_q=96
+    template __global__ void flash_attention_2_pipelined_kernel<6, 64, 16, false>(
+        const float *, const void *, const void *, float *,
+        int, int, int, int, int, int, float, bool, int, int,
+        const llaminar2::attention::AttentionDeviceParams *, const float *,
+        int, int, int, int);
     template __global__ void flash_attention_2_pipelined_kernel<6, 64, 32, false>(
         const float *, const void *, const void *, float *,
         int, int, int, int, int, int, float, bool, int, int,
@@ -726,6 +750,11 @@ namespace
         const llaminar2::attention::AttentionDeviceParams *, const float *,
         int, int, int, int);
     // head_dim=128: 4 consumer warps, tile_q=64
+    template __global__ void flash_attention_2_pipelined_kernel<4, 128, 16, false>(
+        const float *, const void *, const void *, float *,
+        int, int, int, int, int, int, float, bool, int, int,
+        const llaminar2::attention::AttentionDeviceParams *, const float *,
+        int, int, int, int);
     template __global__ void flash_attention_2_pipelined_kernel<4, 128, 32, false>(
         const float *, const void *, const void *, float *,
         int, int, int, int, int, int, float, bool, int, int,
@@ -738,12 +767,22 @@ namespace
         int, int, int, int);
 
     // KV_FP16=true (FP16 K/V from KV cache — eliminates FP16→FP32→FP16 round-trip)
+    template __global__ void flash_attention_2_pipelined_kernel<6, 64, 16, true>(
+        const float *, const void *, const void *, float *,
+        int, int, int, int, int, int, float, bool, int, int,
+        const llaminar2::attention::AttentionDeviceParams *, const float *,
+        int, int, int, int);
     template __global__ void flash_attention_2_pipelined_kernel<6, 64, 32, true>(
         const float *, const void *, const void *, float *,
         int, int, int, int, int, int, float, bool, int, int,
         const llaminar2::attention::AttentionDeviceParams *, const float *,
         int, int, int, int);
     template __global__ void flash_attention_2_pipelined_kernel<6, 64, 64, true>(
+        const float *, const void *, const void *, float *,
+        int, int, int, int, int, int, float, bool, int, int,
+        const llaminar2::attention::AttentionDeviceParams *, const float *,
+        int, int, int, int);
+    template __global__ void flash_attention_2_pipelined_kernel<4, 128, 16, true>(
         const float *, const void *, const void *, float *,
         int, int, int, int, int, int, float, bool, int, int,
         const llaminar2::attention::AttentionDeviceParams *, const float *,
@@ -1258,6 +1297,8 @@ static int fa2_prefill_launch(
     {
         if (cfg.tile_kv == 64)
             FA2_LAUNCH(6, 64, 64);
+        else if (cfg.tile_kv == 16)
+            FA2_LAUNCH(6, 64, 16);
         else
             FA2_LAUNCH(6, 64, 32);
     }
@@ -1265,6 +1306,8 @@ static int fa2_prefill_launch(
     {
         if (cfg.tile_kv == 64)
             FA2_LAUNCH(4, 128, 64);
+        else if (cfg.tile_kv == 16)
+            FA2_LAUNCH(4, 128, 16);
         else
             FA2_LAUNCH(4, 128, 32);
     }
