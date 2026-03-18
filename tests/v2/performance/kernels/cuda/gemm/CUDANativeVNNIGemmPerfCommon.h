@@ -34,9 +34,6 @@ namespace llaminar2::test::native_vnni_gemm_perf
 {
     using llaminar::v2::kernels::KernelFactory;
 
-    extern "C" const char *cudaNativeVNNIPrefillQ40_lastSelectedFamily();
-    extern "C" unsigned long long cudaNativeVNNIPrefillQ40_getFamilyCount(int family_index);
-    extern "C" void cudaNativeVNNIPrefillQ40_resetFamilyCounts();
     extern "C" const char *cudaFusedTCGemm_lastSelectedFamily();
     extern "C" const char *cudaFusedTCGemmV2_lastSelectedFamily();
 
@@ -82,6 +79,8 @@ namespace llaminar2::test::native_vnni_gemm_perf
          { return TestTensorFactory::createIQ1_SRandom({n, k}); }},
         {"IQ1_M", 17, [](size_t n, size_t k)
          { return TestTensorFactory::createIQ1_MRandom({n, k}); }},
+        {"Q8_0", 18, [](size_t n, size_t k)
+         { return TestTensorFactory::createQ8_0Random({n, k}); }},
     };
 
     struct Shape
@@ -412,9 +411,6 @@ namespace llaminar2::test::native_vnni_gemm_perf
         if (cudaSetDevice(cuda_device_id) != cudaSuccess)
             throw std::runtime_error("cudaSetDevice failed");
 
-        if (path == RunPath::NativeVNNITensorCore)
-            cudaNativeVNNIPrefillQ40_resetFamilyCounts();
-
         DeviceId device = DeviceId::cuda(cuda_device_id);
         if (!weights->ensureOnDevice(device))
             throw std::runtime_error("Failed to upload weights to CUDA device");
@@ -527,18 +523,15 @@ namespace llaminar2::test::native_vnni_gemm_perf
         result.mean_us = std::accumulate(times_us.begin(), times_us.end(), 0.0) / static_cast<double>(times_us.size());
         if (path == RunPath::NativeVNNITensorCore)
         {
-            const char *native = cudaNativeVNNIPrefillQ40_lastSelectedFamily();
-            // Prefer V2 fused TC → V1 fused TC → native payload family
+            // Prefer V2 fused TC → V1 fused TC
             const char *fused_v2 = cudaFusedTCGemmV2_lastSelectedFamily();
             const char *fused_v1 = cudaFusedTCGemm_lastSelectedFamily();
-            if (native && std::string(native).rfind("native_q40_tc_", 0) == 0)
-                result.native_family = native;
-            else if (fused_v2 && std::string(fused_v2).substr(0, 2) == "v2")
+            if (fused_v2 && std::string(fused_v2).substr(0, 2) == "v2")
                 result.native_family = fused_v2;
             else if (fused_v1 && std::string(fused_v1) != "unknown")
                 result.native_family = fused_v1;
             else
-                result.native_family = native;
+                result.native_family = "native_vnni_tc";
         }
         return result;
     }

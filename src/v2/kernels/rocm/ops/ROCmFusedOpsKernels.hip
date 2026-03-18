@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <cstdio>
 #include "../../../backends/rocm/HipDeviceGuard.h"
+#include "../gemm/ROCmFastpackQuant.h"
 
 namespace {
 
@@ -99,9 +100,18 @@ __global__ void rocm_fused_swiglu_quantize_blockwise_kernel(
         if (lane == 0)
             row_scales[b] = scale;
 
-        float qval = val * inv_scale;
-        row_int8[k_start + lane] = static_cast<int8_t>(
-            rintf(fminf(127.0f, fmaxf(-127.0f, qval))));
+        // GFX906 fastpack: lanes 0,4,8,...,28 gather 4 neighbours via
+        // shuffle, pack with v_cvt_pk_u8_f32, and emit one dword store.
+        const int group_base = lane & ~3;  // 0,4,8,...,28
+        float v0 = __shfl(val, group_base + 0);
+        float v1 = __shfl(val, group_base + 1);
+        float v2 = __shfl(val, group_base + 2);
+        float v3 = __shfl(val, group_base + 3);
+        if ((lane & 3) == 0)
+        {
+            unsigned pack = llaminar2::rocm::fastpack_q8_4x(v0, v1, v2, v3, inv_scale);
+            *reinterpret_cast<uint32_t*>(row_int8 + k_start + lane) = pack;
+        }
     }
 }
 
@@ -172,17 +182,35 @@ __global__ void rocm_fused_residual_rmsnorm_bf16_kernel(
     const int tid = threadIdx.x;
     const int stride = blockDim.x;
 
-    const uint16_t *row_input = input + row * cols;
-    const uint16_t *row_residual = residual + row * cols;
-    uint16_t *row_res_out = residual_output + row * cols;
-    uint16_t *row_norm_out = norm_output + row * cols;
+    const uint32_t *row_in_u32 = reinterpret_cast<const uint32_t*>(input + row * cols);
+    const uint32_t *row_res_u32 = reinterpret_cast<const uint32_t*>(residual + row * cols);
+    uint32_t *row_res_out_u32 = reinterpret_cast<uint32_t*>(residual_output + row * cols);
+    uint32_t *row_norm_out_u32 = reinterpret_cast<uint32_t*>(norm_output + row * cols);
+    const int cols2 = cols >> 1;
 
+    // Pass 1: Vectorized residual add + sum of squares
     float sum_sq = 0.0f;
-    for (int i = tid; i < cols; i += stride)
+    for (int i = tid; i < cols2; i += stride)
     {
-        float sum = bf16_to_float(row_input[i]) + bf16_to_float(row_residual[i]);
-        row_res_out[i] = float_to_bf16(sum);
-        sum_sq += sum * sum;
+        uint32_t in_packed = row_in_u32[i];
+        uint32_t res_packed = row_res_u32[i];
+        float s0 = bf16_to_float(static_cast<uint16_t>(in_packed & 0xFFFF))
+                 + bf16_to_float(static_cast<uint16_t>(res_packed & 0xFFFF));
+        float s1 = bf16_to_float(static_cast<uint16_t>(in_packed >> 16))
+                 + bf16_to_float(static_cast<uint16_t>(res_packed >> 16));
+        uint32_t out_packed = static_cast<uint32_t>(float_to_bf16(s0)) |
+                              (static_cast<uint32_t>(float_to_bf16(s1)) << 16);
+        row_res_out_u32[i] = out_packed;
+        sum_sq += s0 * s0 + s1 * s1;
+    }
+    // Scalar tail
+    if ((cols & 1) && tid == 0)
+    {
+        const uint16_t *row_input = input + row * cols;
+        const uint16_t *row_residual = residual + row * cols;
+        float s = bf16_to_float(row_input[cols - 1]) + bf16_to_float(row_residual[cols - 1]);
+        residual_output[row * cols + cols - 1] = float_to_bf16(s);
+        sum_sq += s * s;
     }
 
     sdata[tid] = sum_sq;
@@ -197,10 +225,20 @@ __global__ void rocm_fused_residual_rmsnorm_bf16_kernel(
 
     float inv_rms = rsqrtf(sdata[0] / cols + epsilon);
 
-    for (int i = tid; i < cols; i += stride)
+    // Pass 2: Vectorized normalize
+    for (int i = tid; i < cols2; i += stride)
     {
-        float sum = bf16_to_float(row_res_out[i]);
-        row_norm_out[i] = float_to_bf16(sum * inv_rms * gamma[i]);
+        uint32_t res_packed = row_res_out_u32[i];
+        int base = i << 1;
+        float v0 = bf16_to_float(static_cast<uint16_t>(res_packed & 0xFFFF)) * inv_rms * gamma[base + 0];
+        float v1 = bf16_to_float(static_cast<uint16_t>(res_packed >> 16)) * inv_rms * gamma[base + 1];
+        row_norm_out_u32[i] = static_cast<uint32_t>(float_to_bf16(v0)) |
+                              (static_cast<uint32_t>(float_to_bf16(v1)) << 16);
+    }
+    if ((cols & 1) && tid == 0)
+    {
+        float v = bf16_to_float(residual_output[row * cols + cols - 1]) * inv_rms * gamma[cols - 1];
+        norm_output[row * cols + cols - 1] = float_to_bf16(v);
     }
 }
 
@@ -219,17 +257,36 @@ __global__ void rocm_fused_residual_rmsnorm_fp16_kernel(
     const int tid = threadIdx.x;
     const int stride = blockDim.x;
 
-    const uint16_t *row_input = input + row * cols;
-    const uint16_t *row_residual = residual + row * cols;
-    uint16_t *row_res_out = residual_output + row * cols;
-    uint16_t *row_norm_out = norm_output + row * cols;
+    const uint32_t *row_in_u32 = reinterpret_cast<const uint32_t*>(input + row * cols);
+    const uint32_t *row_res_u32 = reinterpret_cast<const uint32_t*>(residual + row * cols);
+    uint32_t *row_res_out_u32 = reinterpret_cast<uint32_t*>(residual_output + row * cols);
+    uint32_t *row_norm_out_u32 = reinterpret_cast<uint32_t*>(norm_output + row * cols);
+    const int cols2 = cols >> 1;
 
+    // Pass 1: Vectorized residual add + sum of squares
+    // Output packing uses v_cvt_pkrtz_f16_f32 on GFX906
     float sum_sq = 0.0f;
-    for (int i = tid; i < cols; i += stride)
+    for (int i = tid; i < cols2; i += stride)
     {
-        float sum = fp16_to_float(row_input[i]) + fp16_to_float(row_residual[i]);
-        row_res_out[i] = float_to_fp16(sum);
-        sum_sq += sum * sum;
+        uint32_t in_packed = row_in_u32[i];
+        uint32_t res_packed = row_res_u32[i];
+        float s0 = fp16_to_float(static_cast<uint16_t>(in_packed & 0xFFFF))
+                 + fp16_to_float(static_cast<uint16_t>(res_packed & 0xFFFF));
+        float s1 = fp16_to_float(static_cast<uint16_t>(in_packed >> 16))
+                 + fp16_to_float(static_cast<uint16_t>(res_packed >> 16));
+        float2 pair = make_float2(s0, s1);
+        __half2 h2 = __float22half2_rn(pair);
+        row_res_out_u32[i] = *reinterpret_cast<uint32_t*>(&h2);
+        sum_sq += s0 * s0 + s1 * s1;
+    }
+    // Scalar tail
+    if ((cols & 1) && tid == 0)
+    {
+        const uint16_t *row_input = input + row * cols;
+        const uint16_t *row_residual = residual + row * cols;
+        float s = fp16_to_float(row_input[cols - 1]) + fp16_to_float(row_residual[cols - 1]);
+        residual_output[row * cols + cols - 1] = float_to_fp16(s);
+        sum_sq += s * s;
     }
 
     sdata[tid] = sum_sq;
@@ -244,10 +301,21 @@ __global__ void rocm_fused_residual_rmsnorm_fp16_kernel(
 
     float inv_rms = rsqrtf(sdata[0] / cols + epsilon);
 
-    for (int i = tid; i < cols; i += stride)
+    // Pass 2: Vectorized normalize with packed FP16 output
+    for (int i = tid; i < cols2; i += stride)
     {
-        float sum = fp16_to_float(row_res_out[i]);
-        row_norm_out[i] = float_to_fp16(sum * inv_rms * gamma[i]);
+        uint32_t res_packed = row_res_out_u32[i];
+        int base = i << 1;
+        float v0 = fp16_to_float(static_cast<uint16_t>(res_packed & 0xFFFF)) * inv_rms * gamma[base + 0];
+        float v1 = fp16_to_float(static_cast<uint16_t>(res_packed >> 16)) * inv_rms * gamma[base + 1];
+        float2 pair = make_float2(v0, v1);
+        __half2 h2 = __float22half2_rn(pair);
+        row_norm_out_u32[i] = *reinterpret_cast<uint32_t*>(&h2);
+    }
+    if ((cols & 1) && tid == 0)
+    {
+        float v = fp16_to_float(residual_output[row * cols + cols - 1]) * inv_rms * gamma[cols - 1];
+        norm_output[row * cols + cols - 1] = float_to_fp16(v);
     }
 }
 

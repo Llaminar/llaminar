@@ -60,6 +60,17 @@ __device__ __forceinline__ uint16_t float_to_fp16(float f)
     return result;
 }
 
+/**
+ * Pack 2 FP32 values into a uint32 of 2 packed FP16 values.
+ * Maps to v_cvt_pkrtz_f16_f32 on GFX906 (single VALU instruction).
+ */
+__device__ __forceinline__ uint32_t pack_fp16_pair(float v0, float v1)
+{
+    float2 pair = make_float2(v0, v1);
+    __half2 h2 = __float22half2_rn(pair);
+    return *reinterpret_cast<uint32_t*>(&h2);
+}
+
 // =========================================================================
 // Activation Functions
 // =========================================================================
@@ -143,12 +154,36 @@ __global__ void rocm_swiglu_bf16_kernel(
     uint16_t *__restrict__ output,
     int size)
 {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < size)
+    // Vectorized: each thread processes 2 BF16 elements via uint32 loads/stores
+    const int size2 = size >> 1;
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (idx < size2)
     {
-        float g = bf16_to_float(gate[idx]);
-        float u = bf16_to_float(up[idx]);
-        output[idx] = float_to_bf16(silu_fast(g) * u);
+        const uint32_t* gate_u32 = reinterpret_cast<const uint32_t*>(gate);
+        const uint32_t* up_u32   = reinterpret_cast<const uint32_t*>(up);
+        uint32_t* out_u32        = reinterpret_cast<uint32_t*>(output);
+
+        uint32_t g_packed = gate_u32[idx];
+        uint32_t u_packed = up_u32[idx];
+
+        float g0 = bf16_to_float(static_cast<uint16_t>(g_packed & 0xFFFF));
+        float g1 = bf16_to_float(static_cast<uint16_t>(g_packed >> 16));
+        float u0 = bf16_to_float(static_cast<uint16_t>(u_packed & 0xFFFF));
+        float u1 = bf16_to_float(static_cast<uint16_t>(u_packed >> 16));
+
+        uint32_t out_packed = static_cast<uint32_t>(float_to_bf16(silu_fast(g0) * u0)) |
+                              (static_cast<uint32_t>(float_to_bf16(silu_fast(g1) * u1)) << 16);
+        out_u32[idx] = out_packed;
+    }
+
+    // Scalar tail for odd size
+    if ((size & 1) && idx == 0)
+    {
+        int last = size - 1;
+        float g = bf16_to_float(gate[last]);
+        float u = bf16_to_float(up[last]);
+        output[last] = float_to_bf16(silu_fast(g) * u);
     }
 }
 
@@ -161,12 +196,35 @@ __global__ void rocm_swiglu_fp16_kernel(
     uint16_t *__restrict__ output,
     int size)
 {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < size)
+    // Vectorized: each thread processes 2 FP16 elements via uint32 loads/stores
+    // Output packing uses v_cvt_pkrtz_f16_f32 on GFX906
+    const int size2 = size >> 1;
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (idx < size2)
     {
-        float g = fp16_to_float(gate[idx]);
-        float u = fp16_to_float(up[idx]);
-        output[idx] = float_to_fp16(silu_fast(g) * u);
+        const uint32_t* gate_u32 = reinterpret_cast<const uint32_t*>(gate);
+        const uint32_t* up_u32   = reinterpret_cast<const uint32_t*>(up);
+        uint32_t* out_u32        = reinterpret_cast<uint32_t*>(output);
+
+        uint32_t g_packed = gate_u32[idx];
+        uint32_t u_packed = up_u32[idx];
+
+        float g0 = fp16_to_float(static_cast<uint16_t>(g_packed & 0xFFFF));
+        float g1 = fp16_to_float(static_cast<uint16_t>(g_packed >> 16));
+        float u0 = fp16_to_float(static_cast<uint16_t>(u_packed & 0xFFFF));
+        float u1 = fp16_to_float(static_cast<uint16_t>(u_packed >> 16));
+
+        out_u32[idx] = pack_fp16_pair(silu_fast(g0) * u0, silu_fast(g1) * u1);
+    }
+
+    // Scalar tail for odd size
+    if ((size & 1) && idx == 0)
+    {
+        int last = size - 1;
+        float g = fp16_to_float(gate[last]);
+        float u = fp16_to_float(up[last]);
+        output[last] = float_to_fp16(silu_fast(g) * u);
     }
 }
 
@@ -220,7 +278,9 @@ extern "C"
         llaminar2::HipDeviceGuard::setDevice(device_idx);
 
         int threads_per_block = 256;
-        int num_blocks = (size + threads_per_block - 1) / threads_per_block;
+        int size2 = size >> 1;
+        int num_blocks = (size2 + threads_per_block - 1) / threads_per_block;
+        if (num_blocks == 0 && size > 0) num_blocks = 1;
 
         // Clear any stale error from previous operations
         (void)hipGetLastError();
@@ -248,7 +308,9 @@ extern "C"
         llaminar2::HipDeviceGuard::setDevice(device_idx);
 
         int threads_per_block = 256;
-        int num_blocks = (size + threads_per_block - 1) / threads_per_block;
+        int size2 = size >> 1;
+        int num_blocks = (size2 + threads_per_block - 1) / threads_per_block;
+        if (num_blocks == 0 && size > 0) num_blocks = 1;
 
         // Clear any stale error from previous operations
         (void)hipGetLastError();

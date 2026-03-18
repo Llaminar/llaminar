@@ -24,10 +24,24 @@ static __global__ void fp32_to_fp16_kernel(const float* __restrict__ input,
                                      __half* __restrict__ output,
                                      const size_t count)
 {
+    // Vectorized: each thread converts 2 FP32→FP16 via v_cvt_pkrtz_f16_f32
+    const size_t count2 = count >> 1;
     const size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (idx < count)
+
+    if (idx < count2)
     {
-        output[idx] = __float2half(input[idx]);
+        const float2* in2 = reinterpret_cast<const float2*>(input);
+        uint32_t* out_u32 = reinterpret_cast<uint32_t*>(output);
+
+        float2 v = in2[idx];
+        __half2 h2 = __float22half2_rn(v);  // v_cvt_pkrtz_f16_f32 on GFX906
+        out_u32[idx] = *reinterpret_cast<uint32_t*>(&h2);
+    }
+
+    // Scalar tail for odd count
+    if ((count & 1) && idx == 0)
+    {
+        output[count - 1] = __float2half(input[count - 1]);
     }
 }
 
@@ -39,10 +53,27 @@ static __global__ void fp16_to_fp32_kernel(const __half* __restrict__ input,
                                      float* __restrict__ output,
                                      const size_t count)
 {
+    // Vectorized: each thread converts 2 FP16→FP32 via packed uint32 load
+    const size_t count2 = count >> 1;
     const size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (idx < count)
+
+    if (idx < count2)
     {
-        output[idx] = __half2float(input[idx]);
+        const uint32_t* in_u32 = reinterpret_cast<const uint32_t*>(input);
+        float2* out2 = reinterpret_cast<float2*>(output);
+
+        uint32_t packed = in_u32[idx];
+        __half2 h2 = *reinterpret_cast<__half2*>(&packed);
+        float2 v;
+        v.x = __low2float(h2);
+        v.y = __high2float(h2);
+        out2[idx] = v;
+    }
+
+    // Scalar tail for odd count
+    if ((count & 1) && idx == 0)
+    {
+        output[count - 1] = __half2float(input[count - 1]);
     }
 }
 
@@ -66,10 +97,16 @@ extern "C"
         if (count == 0) return hipSuccess;
 
         constexpr int BLOCK_SIZE = 256;
-        const int grid_size = static_cast<int>((count + BLOCK_SIZE - 1) / BLOCK_SIZE);
-
-        hipLaunchKernelGGL(fp32_to_fp16_kernel, dim3(grid_size), dim3(BLOCK_SIZE), 0, stream,
-                           fp32_input, static_cast<__half *>(fp16_output), count);
+        // Grid sized for vectorized pairs (2 elements per thread)
+        const size_t count2 = count >> 1;
+        const int grid_size = static_cast<int>((count2 + BLOCK_SIZE - 1) / BLOCK_SIZE);
+        if (grid_size == 0 && count > 0) {
+            hipLaunchKernelGGL(fp32_to_fp16_kernel, dim3(1), dim3(BLOCK_SIZE), 0, stream,
+                               fp32_input, static_cast<__half *>(fp16_output), count);
+        } else {
+            hipLaunchKernelGGL(fp32_to_fp16_kernel, dim3(grid_size), dim3(BLOCK_SIZE), 0, stream,
+                               fp32_input, static_cast<__half *>(fp16_output), count);
+        }
 
         return hipGetLastError();
     }
@@ -88,10 +125,16 @@ extern "C"
         if (count == 0) return hipSuccess;
 
         constexpr int BLOCK_SIZE = 256;
-        const int grid_size = static_cast<int>((count + BLOCK_SIZE - 1) / BLOCK_SIZE);
-
-        hipLaunchKernelGGL(fp16_to_fp32_kernel, dim3(grid_size), dim3(BLOCK_SIZE), 0, stream,
-                           static_cast<const __half *>(fp16_input), fp32_output, count);
+        // Grid sized for vectorized pairs (2 elements per thread)
+        const size_t count2 = count >> 1;
+        const int grid_size = static_cast<int>((count2 + BLOCK_SIZE - 1) / BLOCK_SIZE);
+        if (grid_size == 0 && count > 0) {
+            hipLaunchKernelGGL(fp16_to_fp32_kernel, dim3(1), dim3(BLOCK_SIZE), 0, stream,
+                               static_cast<const __half *>(fp16_input), fp32_output, count);
+        } else {
+            hipLaunchKernelGGL(fp16_to_fp32_kernel, dim3(grid_size), dim3(BLOCK_SIZE), 0, stream,
+                               static_cast<const __half *>(fp16_input), fp32_output, count);
+        }
 
         return hipGetLastError();
     }

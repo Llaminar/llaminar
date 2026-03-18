@@ -1,0 +1,14 @@
+{
+    "_comment": "Manual dispatch overrides for GEMM prefill tile selection.",
+    "_usage": "These entries take priority over sweep-derived dispatch in CUDANativeVNNIPrefillDispatchGenerated.inc.",
+    "_fields": {
+        "format": "Quantization format name (must match FORMAT_TO_CODEBOOK in codegen script)",
+        "m_bin": "M bin value (64, 128, 256, or 512)",
+        "n": "Output dimension N",
+        "k": "Input dimension K",
+        "tile_id": "TileId enum: 0=T64x64_w2x2, 1=T64x128_w2x2, 2=T64x128_w4x2, 3=T64x128_w2x4, 4=T128x128_w4x2, 5=T128x128_w4x4",
+        "split_k": "Split-K factor: 1, 2, 4, or 8",
+        "comment": "Reason for the manual override"
+    },
+    "exceptions": []
+}

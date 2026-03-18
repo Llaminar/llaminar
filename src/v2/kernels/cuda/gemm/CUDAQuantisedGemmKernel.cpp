@@ -197,33 +197,7 @@ namespace llaminar2
 
             bool cudaNativeVNNIInitIQGridTables_tuned();
 
-            bool cudaNativeVNNIPrefillQ40_fp32(
-                const int8_t *d_A_int8,
-                const uint8_t *d_payload,
-                const uint16_t *d_scales,
-                float *d_C_fp32,
-                const float *d_scales_A_block,
-                int M, int N, int K,
-                float alpha, float beta,
-                const float *d_C_existing,
-                const float *d_bias,
-                int cuda_device_id,
-                void *stream);
-
-            bool cudaNativeVNNIPrefillIQ4NL_fp32(
-                const int8_t *d_A_int8,
-                const uint8_t *d_payload,
-                const uint16_t *d_scales,
-                float *d_C_fp32,
-                const float *d_scales_A_block,
-                int M, int N, int K,
-                float alpha, float beta,
-                const float *d_C_existing,
-                const float *d_bias,
-                int cuda_device_id,
-                void *stream);
-
-            // Generic prefill dispatch for all formats
+            // Unified prefill dispatch for all formats
             bool cudaNativeVNNIPrefill_fp32(
                 const int8_t *d_A_int8,
                 const uint8_t *d_payload,
@@ -629,64 +603,12 @@ namespace llaminar2
                         stream);
                 }
 
-                if (impl->native_codebook_id == 0)
+                // Unified native VNNI prefill for all supported codebooks
+                if (nativeVNNIPrefillSupportsCodebook(impl->native_codebook_id))
                 {
-                    static std::once_flag native_vnni_prefill_q40_once;
-                    std::call_once(native_vnni_prefill_q40_once, []()
-                                   { LOG_INFO("[CUDAQuantisedGemmKernel] NativeVNNI Q4_0 prefill kernel active"); });
-
-                    if (cudaNativeVNNIPrefillQ40_fp32(
-                            d_A_int8,
-                            impl->d_weights_native_vnni,
-                            impl->d_weights_native_scales,
-                            d_C_fp32,
-                            d_scales_A_blockwise,
-                            m, n, k,
-                            alpha, beta,
-                            d_C_existing,
-                            d_bias,
-                            cuda_device_id,
-                            stream))
-                    {
-                        return true;
-                    }
-
-                    LOG_WARN("[CUDAQuantisedGemmKernel] NativeVNNI Q4_0 prefill kernel failed, falling back to tensor-core expanded path");
-                }
-
-                if (impl->native_codebook_id == 4)
-                {
-                    static std::once_flag native_vnni_prefill_iq4nl_once;
-                    std::call_once(native_vnni_prefill_iq4nl_once, []()
-                                   { LOG_INFO("[CUDAQuantisedGemmKernel] NativeVNNI IQ4_NL prefill kernel active"); });
-
-                    if (cudaNativeVNNIPrefillIQ4NL_fp32(
-                            d_A_int8,
-                            impl->d_weights_native_vnni,
-                            impl->d_weights_native_scales,
-                            d_C_fp32,
-                            d_scales_A_blockwise,
-                            m, n, k,
-                            alpha, beta,
-                            d_C_existing,
-                            d_bias,
-                            cuda_device_id,
-                            stream))
-                    {
-                        return true;
-                    }
-
-                    LOG_WARN("[CUDAQuantisedGemmKernel] NativeVNNI IQ4_NL prefill kernel failed, falling back to tensor-core expanded path");
-                }
-
-                // Generic native VNNI prefill for all other supported codebooks
-                // (Q5_0, Q5_1, Q4_1/Q4_K/Q5_K, IQ3_S, IQ3_XXS, IQ2_XXS, IQ1_S)
-                if (nativeVNNIPrefillSupportsCodebook(impl->native_codebook_id) &&
-                    impl->native_codebook_id != 0 && impl->native_codebook_id != 4)
-                {
-                    static std::once_flag native_vnni_prefill_generic_once;
-                    std::call_once(native_vnni_prefill_generic_once, [&]()
-                                   { LOG_INFO("[CUDAQuantisedGemmKernel] NativeVNNI generic prefill kernel active (codebook " << static_cast<int>(impl->native_codebook_id) << ")"); });
+                    static std::once_flag native_vnni_prefill_once;
+                    std::call_once(native_vnni_prefill_once, [&]()
+                                   { LOG_INFO("[CUDAQuantisedGemmKernel] NativeVNNI prefill kernel active (codebook " << static_cast<int>(impl->native_codebook_id) << ")"); });
 
                     if (cudaNativeVNNIPrefill_fp32(
                             d_A_int8,
@@ -707,7 +629,7 @@ namespace llaminar2
                         return true;
                     }
 
-                    LOG_WARN("[CUDAQuantisedGemmKernel] NativeVNNI generic prefill kernel failed for codebook "
+                    LOG_WARN("[CUDAQuantisedGemmKernel] NativeVNNI prefill kernel failed for codebook "
                              << static_cast<int>(impl->native_codebook_id)
                              << ", falling back to tensor-core expanded path");
                 }

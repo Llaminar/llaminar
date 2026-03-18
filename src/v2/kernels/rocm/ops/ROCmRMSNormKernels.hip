@@ -77,6 +77,17 @@ __device__ __forceinline__ uint16_t float_to_fp16(float f)
     return *reinterpret_cast<uint16_t*>(&h);
 }
 
+/**
+ * Pack 2 FP32 values into a uint32 of 2 packed FP16 values.
+ * Maps to v_cvt_pkrtz_f16_f32 on GFX906 (single VALU instruction).
+ */
+__device__ __forceinline__ uint32_t pack_fp16_pair(float v0, float v1)
+{
+    float2 pair = make_float2(v0, v1);
+    __half2 h2 = __float22half2_rn(pair);
+    return *reinterpret_cast<uint32_t*>(&h2);
+}
+
 // ============================================================================
 // Warp Shuffle Reduction (gfx906 wavefront = 64 lanes)
 // ============================================================================
@@ -346,6 +357,7 @@ __global__ void rocm_rmsnorm_fp16_kernel(
     float inv_rms = rsqrtf(total_sum * inv_cols + epsilon);
 
     // ---- Pass 2: Re-read input, normalize, scale, convert back to FP16 ----
+    // Output packing uses v_cvt_pkrtz_f16_f32 (single VALU op for 2 FP16 values)
     for (int i = tid; i < cols2; i += stride)
     {
         uint32_t packed = row_input_u32[i];
@@ -354,9 +366,7 @@ __global__ void rocm_rmsnorm_fp16_kernel(
         float v1 = fp16_to_float(static_cast<uint16_t>(packed >> 16));
         v0 = v0 * inv_rms * gamma[base + 0];
         v1 = v1 * inv_rms * gamma[base + 1];
-        uint32_t out_packed = static_cast<uint32_t>(float_to_fp16(v0)) |
-                              (static_cast<uint32_t>(float_to_fp16(v1)) << 16);
-        reinterpret_cast<uint32_t*>(row_output)[i] = out_packed;
+        reinterpret_cast<uint32_t*>(row_output)[i] = pack_fp16_pair(v0, v1);
     }
 
     if ((cols & 1) && (tid == 0))

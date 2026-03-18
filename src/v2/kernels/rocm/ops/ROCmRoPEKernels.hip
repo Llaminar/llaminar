@@ -71,6 +71,83 @@ __device__ __forceinline__ uint16_t float_to_fp16(float f)
     return result;
 }
 
+// =========================================================================
+// Vectorized BF16/FP16 rotation helpers (2 elements per thread)
+// Uses packed uint32 loads/stores; FP16 output uses v_cvt_pkrtz_f16_f32
+// =========================================================================
+
+__device__ __forceinline__ void rope_apply_rotation_bf16_vec(
+    uint16_t* data, int base_idx, int half_dim,
+    const float* s_cos, const float* s_sin)
+{
+    const uint32_t* lo_u32 = reinterpret_cast<const uint32_t*>(data + base_idx);
+    const uint32_t* hi_u32 = reinterpret_cast<const uint32_t*>(data + base_idx + half_dim);
+    uint32_t* out_lo = reinterpret_cast<uint32_t*>(data + base_idx);
+    uint32_t* out_hi = reinterpret_cast<uint32_t*>(data + base_idx + half_dim);
+    const int hd2 = half_dim >> 1;
+
+    for (int i = threadIdx.x; i < hd2; i += blockDim.x)
+    {
+        int b = i << 1;
+        uint32_t lo = lo_u32[i], hi = hi_u32[i];
+        float x0a = bf16_to_float(static_cast<uint16_t>(lo & 0xFFFF));
+        float x0b = bf16_to_float(static_cast<uint16_t>(lo >> 16));
+        float x1a = bf16_to_float(static_cast<uint16_t>(hi & 0xFFFF));
+        float x1b = bf16_to_float(static_cast<uint16_t>(hi >> 16));
+        float ca = s_cos[b], cb = s_cos[b + 1];
+        float sa = s_sin[b], sb = s_sin[b + 1];
+        out_lo[i] = static_cast<uint32_t>(float_to_bf16(x0a * ca - x1a * sa)) |
+                    (static_cast<uint32_t>(float_to_bf16(x0b * cb - x1b * sb)) << 16);
+        out_hi[i] = static_cast<uint32_t>(float_to_bf16(x0a * sa + x1a * ca)) |
+                    (static_cast<uint32_t>(float_to_bf16(x0b * sb + x1b * cb)) << 16);
+    }
+    if ((half_dim & 1) && threadIdx.x == 0)
+    {
+        int last = half_dim - 1;
+        int i0 = base_idx + last, i1 = base_idx + half_dim + last;
+        float x0 = bf16_to_float(data[i0]), x1 = bf16_to_float(data[i1]);
+        data[i0] = float_to_bf16(x0 * s_cos[last] - x1 * s_sin[last]);
+        data[i1] = float_to_bf16(x0 * s_sin[last] + x1 * s_cos[last]);
+    }
+}
+
+__device__ __forceinline__ void rope_apply_rotation_fp16_vec(
+    uint16_t* data, int base_idx, int half_dim,
+    const float* s_cos, const float* s_sin)
+{
+    const uint32_t* lo_u32 = reinterpret_cast<const uint32_t*>(data + base_idx);
+    const uint32_t* hi_u32 = reinterpret_cast<const uint32_t*>(data + base_idx + half_dim);
+    uint32_t* out_lo = reinterpret_cast<uint32_t*>(data + base_idx);
+    uint32_t* out_hi = reinterpret_cast<uint32_t*>(data + base_idx + half_dim);
+    const int hd2 = half_dim >> 1;
+
+    for (int i = threadIdx.x; i < hd2; i += blockDim.x)
+    {
+        int b = i << 1;
+        uint32_t lo = lo_u32[i], hi = hi_u32[i];
+        float x0a = fp16_to_float(static_cast<uint16_t>(lo & 0xFFFF));
+        float x0b = fp16_to_float(static_cast<uint16_t>(lo >> 16));
+        float x1a = fp16_to_float(static_cast<uint16_t>(hi & 0xFFFF));
+        float x1b = fp16_to_float(static_cast<uint16_t>(hi >> 16));
+        float ca = s_cos[b], cb = s_cos[b + 1];
+        float sa = s_sin[b], sb = s_sin[b + 1];
+        float2 pair_lo = make_float2(x0a * ca - x1a * sa, x0b * cb - x1b * sb);
+        float2 pair_hi = make_float2(x0a * sa + x1a * ca, x0b * sb + x1b * cb);
+        __half2 h2_lo = __float22half2_rn(pair_lo);
+        __half2 h2_hi = __float22half2_rn(pair_hi);
+        out_lo[i] = *reinterpret_cast<uint32_t*>(&h2_lo);
+        out_hi[i] = *reinterpret_cast<uint32_t*>(&h2_hi);
+    }
+    if ((half_dim & 1) && threadIdx.x == 0)
+    {
+        int last = half_dim - 1;
+        int i0 = base_idx + last, i1 = base_idx + half_dim + last;
+        float x0 = fp16_to_float(data[i0]), x1 = fp16_to_float(data[i1]);
+        data[i0] = float_to_fp16(x0 * s_cos[last] - x1 * s_sin[last]);
+        data[i1] = float_to_fp16(x0 * s_sin[last] + x1 * s_cos[last]);
+    }
+}
+
 } // anonymous namespace
 
 // =========================================================================
@@ -158,17 +235,7 @@ __global__ void rocm_rope_bf16_decode_kernel(
 
     int base_idx = head_idx * head_dim;
 
-    for (int i = threadIdx.x; i < half_dim; i += blockDim.x)
-    {
-        int i0 = base_idx + i;
-        int i1 = base_idx + i + half_dim;
-
-        float x0 = bf16_to_float(data[i0]);
-        float x1 = bf16_to_float(data[i1]);
-
-        data[i0] = float_to_bf16(x0 * s_cos[i] - x1 * s_sin[i]);
-        data[i1] = float_to_bf16(x0 * s_sin[i] + x1 * s_cos[i]);
-    }
+    rope_apply_rotation_bf16_vec(data, base_idx, half_dim, s_cos, s_sin);
 }
 
 /**
@@ -201,17 +268,7 @@ __global__ void rocm_rope_fp16_decode_kernel(
 
     int base_idx = head_idx * head_dim;
 
-    for (int i = threadIdx.x; i < half_dim; i += blockDim.x)
-    {
-        int i0 = base_idx + i;
-        int i1 = base_idx + i + half_dim;
-
-        float x0 = fp16_to_float(data[i0]);
-        float x1 = fp16_to_float(data[i1]);
-
-        data[i0] = float_to_fp16(x0 * s_cos[i] - x1 * s_sin[i]);
-        data[i1] = float_to_fp16(x0 * s_sin[i] + x1 * s_cos[i]);
-    }
+    rope_apply_rotation_fp16_vec(data, base_idx, half_dim, s_cos, s_sin);
 }
 
 // =========================================================================
@@ -387,17 +444,7 @@ __global__ void rocm_rope_bf16_contiguous_kernel(
 
     int base_idx = seq_idx * n_heads * head_dim + head_idx * head_dim;
 
-    for (int i = threadIdx.x; i < half_dim; i += blockDim.x)
-    {
-        int i0 = base_idx + i;
-        int i1 = base_idx + i + half_dim;
-
-        float x0 = bf16_to_float(data[i0]);
-        float x1 = bf16_to_float(data[i1]);
-
-        data[i0] = float_to_bf16(x0 * s_cos[i] - x1 * s_sin[i]);
-        data[i1] = float_to_bf16(x0 * s_sin[i] + x1 * s_cos[i]);
-    }
+    rope_apply_rotation_bf16_vec(data, base_idx, half_dim, s_cos, s_sin);
 }
 
 /**
@@ -461,17 +508,7 @@ __global__ void rocm_rope_bf16_fused_qk_contiguous_kernel(
 
     int base_idx = seq_idx * n_heads * head_dim + head_idx * head_dim;
 
-    for (int i = threadIdx.x; i < half_dim; i += blockDim.x)
-    {
-        int i0 = base_idx + i;
-        int i1 = base_idx + i + half_dim;
-
-        float x0 = bf16_to_float(data[i0]);
-        float x1 = bf16_to_float(data[i1]);
-
-        data[i0] = float_to_bf16(x0 * s_cos[i] - x1 * s_sin[i]);
-        data[i1] = float_to_bf16(x0 * s_sin[i] + x1 * s_cos[i]);
-    }
+    rope_apply_rotation_bf16_vec(data, base_idx, half_dim, s_cos, s_sin);
 }
 
 /**
@@ -512,17 +549,7 @@ __global__ void rocm_rope_fp16_contiguous_kernel(
 
     int base_idx = seq_idx * n_heads * head_dim + head_idx * head_dim;
 
-    for (int i = threadIdx.x; i < half_dim; i += blockDim.x)
-    {
-        int i0 = base_idx + i;
-        int i1 = base_idx + i + half_dim;
-
-        float x0 = fp16_to_float(data[i0]);
-        float x1 = fp16_to_float(data[i1]);
-
-        data[i0] = float_to_fp16(x0 * s_cos[i] - x1 * s_sin[i]);
-        data[i1] = float_to_fp16(x0 * s_sin[i] + x1 * s_cos[i]);
-    }
+    rope_apply_rotation_fp16_vec(data, base_idx, half_dim, s_cos, s_sin);
 }
 
 /**
@@ -586,17 +613,7 @@ __global__ void rocm_rope_fp16_fused_qk_contiguous_kernel(
 
     int base_idx = seq_idx * n_heads * head_dim + head_idx * head_dim;
 
-    for (int i = threadIdx.x; i < half_dim; i += blockDim.x)
-    {
-        int i0 = base_idx + i;
-        int i1 = base_idx + i + half_dim;
-
-        float x0 = fp16_to_float(data[i0]);
-        float x1 = fp16_to_float(data[i1]);
-
-        data[i0] = float_to_fp16(x0 * s_cos[i] - x1 * s_sin[i]);
-        data[i1] = float_to_fp16(x0 * s_sin[i] + x1 * s_cos[i]);
-    }
+    rope_apply_rotation_fp16_vec(data, base_idx, half_dim, s_cos, s_sin);
 }
 
 // =========================================================================
@@ -794,19 +811,7 @@ __global__ void rocm_rope_bf16_kernel_v2(
     // Apply rotation
     int base_idx = seq_idx * n_heads * head_dim + head_idx * head_dim;
 
-    for (int i = threadIdx.x; i < half_dim; i += blockDim.x)
-    {
-        int i0 = base_idx + i;
-        int i1 = base_idx + i + half_dim;
-
-        float x0 = bf16_to_float(data[i0]);
-        float x1 = bf16_to_float(data[i1]);
-        float cos_val = s_cos[i];
-        float sin_val = s_sin[i];
-
-        data[i0] = float_to_bf16(x0 * cos_val - x1 * sin_val);
-        data[i1] = float_to_bf16(x0 * sin_val + x1 * cos_val);
-    }
+    rope_apply_rotation_bf16_vec(data, base_idx, half_dim, s_cos, s_sin);
 }
 
 /**
@@ -870,17 +875,7 @@ __global__ void rocm_rope_bf16_fused_qk_kernel(
 
     int base_idx = seq_idx * n_heads * head_dim + head_idx * head_dim;
 
-    for (int i = threadIdx.x; i < half_dim; i += blockDim.x)
-    {
-        int i0 = base_idx + i;
-        int i1 = base_idx + i + half_dim;
-
-        float x0 = bf16_to_float(data[i0]);
-        float x1 = bf16_to_float(data[i1]);
-
-        data[i0] = float_to_bf16(x0 * s_cos[i] - x1 * s_sin[i]);
-        data[i1] = float_to_bf16(x0 * s_sin[i] + x1 * s_cos[i]);
-    }
+    rope_apply_rotation_bf16_vec(data, base_idx, half_dim, s_cos, s_sin);
 }
 
 /**
@@ -921,19 +916,7 @@ __global__ void rocm_rope_fp16_kernel_v2(
 
     int base_idx = seq_idx * n_heads * head_dim + head_idx * head_dim;
 
-    for (int i = threadIdx.x; i < half_dim; i += blockDim.x)
-    {
-        int i0 = base_idx + i;
-        int i1 = base_idx + i + half_dim;
-
-        float x0 = fp16_to_float(data[i0]);
-        float x1 = fp16_to_float(data[i1]);
-        float cos_val = s_cos[i];
-        float sin_val = s_sin[i];
-
-        data[i0] = float_to_fp16(x0 * cos_val - x1 * sin_val);
-        data[i1] = float_to_fp16(x0 * sin_val + x1 * cos_val);
-    }
+    rope_apply_rotation_fp16_vec(data, base_idx, half_dim, s_cos, s_sin);
 }
 
 /**
@@ -997,17 +980,7 @@ __global__ void rocm_rope_fp16_fused_qk_kernel(
 
     int base_idx = seq_idx * n_heads * head_dim + head_idx * head_dim;
 
-    for (int i = threadIdx.x; i < half_dim; i += blockDim.x)
-    {
-        int i0 = base_idx + i;
-        int i1 = base_idx + i + half_dim;
-
-        float x0 = fp16_to_float(data[i0]);
-        float x1 = fp16_to_float(data[i1]);
-
-        data[i0] = float_to_fp16(x0 * s_cos[i] - x1 * s_sin[i]);
-        data[i1] = float_to_fp16(x0 * s_sin[i] + x1 * s_cos[i]);
-    }
+    rope_apply_rotation_fp16_vec(data, base_idx, half_dim, s_cos, s_sin);
 }
 
 // =========================================================================

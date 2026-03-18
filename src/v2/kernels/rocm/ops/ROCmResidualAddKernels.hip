@@ -50,6 +50,17 @@ __device__ __forceinline__ uint16_t float_to_fp16(float f)
     return *reinterpret_cast<uint16_t*>(&h);
 }
 
+/**
+ * Pack 2 FP32 values into a uint32 of 2 packed FP16 values.
+ * Maps to v_cvt_pkrtz_f16_f32 on GFX906 (single VALU instruction).
+ */
+__device__ __forceinline__ uint32_t pack_fp16_pair(float v0, float v1)
+{
+    float2 pair = make_float2(v0, v1);
+    __half2 h2 = __float22half2_rn(pair);
+    return *reinterpret_cast<uint32_t*>(&h2);
+}
+
 } // anonymous namespace
 
 // ============================================================================
@@ -100,12 +111,34 @@ __global__ void rocm_residual_add_bf16_kernel(
     uint16_t* __restrict__ output,
     int size)
 {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < size)
+    // Vectorized: each thread processes 2 BF16 elements via uint32 loads/stores
+    const int size2 = size >> 1;
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (idx < size2)
     {
-        float in_f = bf16_to_float(input[idx]);
-        float res_f = bf16_to_float(residual[idx]);
-        output[idx] = float_to_bf16(in_f + res_f);
+        const uint32_t* in_u32  = reinterpret_cast<const uint32_t*>(input);
+        const uint32_t* res_u32 = reinterpret_cast<const uint32_t*>(residual);
+        uint32_t* out_u32       = reinterpret_cast<uint32_t*>(output);
+
+        uint32_t in_packed  = in_u32[idx];
+        uint32_t res_packed = res_u32[idx];
+
+        float in0  = bf16_to_float(static_cast<uint16_t>(in_packed & 0xFFFF));
+        float in1  = bf16_to_float(static_cast<uint16_t>(in_packed >> 16));
+        float res0 = bf16_to_float(static_cast<uint16_t>(res_packed & 0xFFFF));
+        float res1 = bf16_to_float(static_cast<uint16_t>(res_packed >> 16));
+
+        uint32_t out_packed = static_cast<uint32_t>(float_to_bf16(in0 + res0)) |
+                              (static_cast<uint32_t>(float_to_bf16(in1 + res1)) << 16);
+        out_u32[idx] = out_packed;
+    }
+
+    // Scalar tail for odd size
+    if ((size & 1) && idx == 0)
+    {
+        int last = size - 1;
+        output[last] = float_to_bf16(bf16_to_float(input[last]) + bf16_to_float(residual[last]));
     }
 }
 
@@ -119,12 +152,33 @@ __global__ void rocm_residual_add_fp16_kernel(
     uint16_t* __restrict__ output,
     int size)
 {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < size)
+    // Vectorized: each thread processes 2 FP16 elements via uint32 loads/stores
+    // Output packing uses v_cvt_pkrtz_f16_f32 on GFX906
+    const int size2 = size >> 1;
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (idx < size2)
     {
-        float in_f = fp16_to_float(input[idx]);
-        float res_f = fp16_to_float(residual[idx]);
-        output[idx] = float_to_fp16(in_f + res_f);
+        const uint32_t* in_u32  = reinterpret_cast<const uint32_t*>(input);
+        const uint32_t* res_u32 = reinterpret_cast<const uint32_t*>(residual);
+        uint32_t* out_u32       = reinterpret_cast<uint32_t*>(output);
+
+        uint32_t in_packed  = in_u32[idx];
+        uint32_t res_packed = res_u32[idx];
+
+        float in0  = fp16_to_float(static_cast<uint16_t>(in_packed & 0xFFFF));
+        float in1  = fp16_to_float(static_cast<uint16_t>(in_packed >> 16));
+        float res0 = fp16_to_float(static_cast<uint16_t>(res_packed & 0xFFFF));
+        float res1 = fp16_to_float(static_cast<uint16_t>(res_packed >> 16));
+
+        out_u32[idx] = pack_fp16_pair(in0 + res0, in1 + res1);
+    }
+
+    // Scalar tail for odd size
+    if ((size & 1) && idx == 0)
+    {
+        int last = size - 1;
+        output[last] = float_to_fp16(fp16_to_float(input[last]) + fp16_to_float(residual[last]));
     }
 }
 
@@ -177,7 +231,9 @@ bool rocmOps_residual_add_bf16(
     llaminar2::HipDeviceGuard::setDevice(device_idx);
 
     int threads_per_block = 256;
-    int num_blocks = (size + threads_per_block - 1) / threads_per_block;
+    int size2 = size >> 1;
+    int num_blocks = (size2 + threads_per_block - 1) / threads_per_block;
+    if (num_blocks == 0 && size > 0) num_blocks = 1;
 
     hipLaunchKernelGGL(
         rocm_residual_add_bf16_kernel,
@@ -205,7 +261,9 @@ bool rocmOps_residual_add_fp16(
     llaminar2::HipDeviceGuard::setDevice(device_idx);
 
     int threads_per_block = 256;
-    int num_blocks = (size + threads_per_block - 1) / threads_per_block;
+    int size2 = size >> 1;
+    int num_blocks = (size2 + threads_per_block - 1) / threads_per_block;
+    if (num_blocks == 0 && size > 0) num_blocks = 1;
 
     hipLaunchKernelGGL(
         rocm_residual_add_fp16_kernel,
