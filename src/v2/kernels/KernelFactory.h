@@ -1312,6 +1312,19 @@ namespace llaminar
                 static void clearCache();
 
                 /**
+                 * @brief Reset input-dependent dynamic state on all cached kernels
+                 *
+                 * Called on session boundaries (e.g., clear_cache between inference
+                 * requests). Unlike clearCache() which destroys kernel objects,
+                 * this preserves all weight-dependent state and GPU handles while
+                 * resetting only cached input data (token IDs, positions, etc.).
+                 *
+                 * In debug/integration builds, also asserts that no kernel retains
+                 * stale dynamic state after the reset.
+                 */
+                static void resetAllDynamicState();
+
+                /**
                  * @brief Get statistics about the kernel cache
                  * @return Pair of (cache_size, total_packed_bytes)
                  */

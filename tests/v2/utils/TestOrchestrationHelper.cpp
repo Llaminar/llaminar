@@ -82,9 +82,9 @@ namespace llaminar2::test
         config.model_path = model_path;
         config.max_seq_len = max_seq_len;
 
-        // Single device configuration
+        // Single device configuration via device map (rank 0 → chosen device)
         config.device_mode = DeviceAssignmentMode::EXPLICIT;
-        config.device_for_this_rank = toGlobalAddress(device);
+        config.device_map.emplace_back(0, toGlobalAddress(device));
 
         // No parallelism
         config.tp_degree = 1;

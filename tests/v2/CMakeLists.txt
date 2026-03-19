@@ -2032,6 +2032,19 @@ add_v2_test(V2_Unit_KernelFactoryCacheInvalidation
     MPI_PROCS 1  # Cache invalidation tests, single rank
 )
 
+# Test: Kernel dynamic state lifecycle (session boundary resets)
+add_executable(v2_test_kernel_dynamic_state_lifecycle unit/kernels/Test__KernelDynamicStateLifecycle.cpp)
+target_link_libraries(v2_test_kernel_dynamic_state_lifecycle
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_KernelDynamicStateLifecycle
+    COMMAND $<TARGET_FILE:v2_test_kernel_dynamic_state_lifecycle>
+    LABELS "V2;Unit;Kernels;KernelFactory;DynamicState;SessionLifecycle"
+    MPI_PROCS 1
+)
+
 # Test: KernelFactory TensorSlice unwrapping in CUDA dispatch path
 # Regression test for: "unsupported tensor type 10 for device CUDA:0"
 # Root cause: dynamic_cast<Q4_0Tensor*>(TensorSlice*) returns nullptr
@@ -7726,6 +7739,29 @@ target_link_libraries(v2_integration_orchestration_wiring
 add_v2_test(V2_Integration_OrchestrationWiring
     COMMAND $<TARGET_FILE:v2_integration_orchestration_wiring>
     LABELS "V2;Integration;Orchestrator;Wiring;TDD;PhaseG1"
+)
+
+# Test: Multi-turn inference session reset
+# Verifies that clear_cache() correctly resets kernel dynamic state so that
+# a second inference request produces correct output (not garbage from stale
+# token IDs cached in embedding kernel GPU buffers).
+# Requires: models/qwen2.5-0.5b-instruct-q4_0.gguf
+add_executable(v2_integration_multi_turn_session_reset
+    integration/pipelines/Test__MultiTurnSessionReset.cpp
+    utils/TestOrchestrationHelper.cpp
+)
+target_include_directories(v2_integration_multi_turn_session_reset PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}  # For tests/v2/utils/ include path
+)
+target_link_libraries(v2_integration_multi_turn_session_reset
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Integration_MultiTurnSessionReset
+    COMMAND $<TARGET_FILE:v2_integration_multi_turn_session_reset>
+    LABELS "V2;Integration;Orchestrator;MultiTurn;SessionReset;Embedding;DynamicState"
+    MPI_PROCS 1
 )
 
 # Test: TPDomain MPI Integration Tests (Phase 3.2b)

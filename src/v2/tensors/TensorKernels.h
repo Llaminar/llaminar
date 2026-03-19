@@ -275,6 +275,32 @@ namespace llaminar2
          * @param stream Opaque stream pointer (hipStream_t or cudaStream_t cast to void*)
          */
         virtual void setGPUStream(void *stream) { (void)stream; }
+
+        // =====================================================================
+        // Session Lifecycle (kernel state that depends on input data, not weights)
+        // =====================================================================
+
+        /**
+         * @brief Reset any input-dependent cached state (session boundary)
+         *
+         * Called by the orchestrator when starting a new inference session
+         * (after clear_cache). Kernels MUST reset any state that depends on
+         * input data (token IDs, sequence lengths, position offsets).
+         * Weight-dependent state (packed weights, GPU handles) is preserved.
+         *
+         * Default is no-op for kernels without dynamic state.
+         */
+        virtual void resetDynamicState() {}
+
+        /**
+         * @brief Check if this kernel has active input-dependent cached state
+         *
+         * Used by debug-mode assertions to verify no kernel retains stale
+         * dynamic state after a session reset.
+         *
+         * @return true if the kernel has cached input-dependent data
+         */
+        virtual bool hasDynamicStateActive() const { return false; }
     };
 
     /**

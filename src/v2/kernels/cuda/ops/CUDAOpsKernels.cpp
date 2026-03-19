@@ -1278,6 +1278,13 @@ namespace llaminar2
         dynamic_params_active_ = true;
     }
 
+    void CUDAEmbeddingKernelT::resetDynamicState()
+    {
+        dynamic_params_active_ = false;
+        dynamic_token_count_ = 0;
+        // h_token_ids_ buffer is preserved — it's reusable for the next session
+    }
+
     bool CUDAEmbeddingKernelT::apply_tensor(
         const TensorBase *embed_table,
         const int *token_ids,

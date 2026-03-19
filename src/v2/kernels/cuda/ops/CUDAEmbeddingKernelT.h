@@ -136,6 +136,25 @@ namespace llaminar2
 
         void setDynamicTokenIds(const int *token_ids, int num_tokens) override;
 
+        // =====================================================================
+        // Session Lifecycle (ITensorKernel overrides)
+        // =====================================================================
+
+        /**
+         * @brief Reset input-dependent cached state
+         *
+         * Clears the dynamic_params_active_ flag and token count so that the
+         * next apply_tensor() call re-uploads token IDs from scratch.
+         * Called by KernelFactory::resetAllDynamicState() on session boundary.
+         */
+        void resetDynamicState() override;
+
+        /**
+         * @brief Check if dynamic token state is cached
+         * @return true if a previous setDynamicTokenIds() preload is active
+         */
+        bool hasDynamicStateActive() const override { return dynamic_params_active_; }
+
         KernelSnapshotInfo getKernelSnapshotInfo() const override
         {
             return KernelSnapshotInfo::embedding()

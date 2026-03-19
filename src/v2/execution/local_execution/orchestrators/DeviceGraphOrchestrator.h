@@ -1362,6 +1362,9 @@ namespace llaminar2
             cache_stats_ = CacheStats{};
             state_.clear();
             arena_.reset();
+            // Reset input-dependent cached state on all kernels (e.g., stale token IDs)
+            resetKernelDynamicState();
+            ++session_epoch_;
         }
 
         /**
@@ -2316,6 +2319,14 @@ namespace llaminar2
 
         /// Whether TP contexts have been initialized
         bool tp_contexts_initialized_ = false;
+
+        /// Session epoch counter — incremented on each clear_cache() call
+        /// Used to detect stale kernel state across inference sessions
+        uint64_t session_epoch_ = 0;
+
+        /// Reset input-dependent dynamic state on all cached kernels
+        /// Implemented in .cpp to avoid including KernelFactory.h in the header
+        void resetKernelDynamicState();
     };
 
 } // namespace llaminar2

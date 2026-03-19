@@ -1745,6 +1745,10 @@ namespace llaminar2
         // Reset stats
         cache_stats_ = CacheStats{};
 
+        // Reset input-dependent cached state on all kernels
+        resetKernelDynamicState();
+        ++session_epoch_;
+
         LOG_DEBUG("[DeviceGraphOrchestrator] All caches cleared");
     }
 
@@ -1765,6 +1769,11 @@ namespace llaminar2
             layer_graph_cache_[layer_idx].invalidate();
             LOG_DEBUG("[DeviceGraphOrchestrator] Layer " << layer_idx << " graph cache invalidated");
         }
+    }
+
+    void DeviceGraphOrchestrator::resetKernelDynamicState()
+    {
+        llaminar::v2::kernels::KernelFactory::resetAllDynamicState();
     }
 
     bool DeviceGraphOrchestrator::hasValidCachedGraph(int layer_idx, bool is_attention) const

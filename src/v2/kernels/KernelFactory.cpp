@@ -17,6 +17,7 @@
 #include "cpu/ops/CPUEmbeddingKernelT.h"
 #include "cpu/attention/CPUAttentionKernelT.h"
 #include "cpu/attention/CPUFlashAttentionKernelT.h"
+#include "../utils/Assertions.h"
 #include <unordered_set>
 
 // KVCache includes
@@ -3359,6 +3360,55 @@ namespace llaminar
                 device_kernel_registry_.clear();
                 prepared_gemm_registry_.clear();
                 device_gemm_engine_registry_.clear();
+            }
+
+            void KernelFactory::resetAllDynamicState()
+            {
+                std::lock_guard<std::mutex> lock(cache_mutex_);
+
+                // Reset embedding kernels (the primary holders of dynamic state)
+                for (auto &[key, kernel] : embedding_cache_)
+                {
+                    if (kernel)
+                    {
+                        kernel->resetDynamicState();
+                    }
+                }
+
+                // Reset attention kernels (may cache position-dependent state)
+                for (auto &[key, kernel] : attention_cache_)
+                {
+                    if (kernel)
+                    {
+                        kernel->resetDynamicState();
+                    }
+                }
+
+                // Reset RoPE kernels (position-dependent)
+                for (auto &[key, kernel] : rope_cache_)
+                {
+                    if (kernel)
+                    {
+                        kernel->resetDynamicState();
+                    }
+                }
+
+#if LLAMINAR_ASSERTIONS_ACTIVE
+                // Post-reset assertion: no kernel should retain stale dynamic state
+                for (const auto &[key, kernel] : embedding_cache_)
+                {
+                    if (kernel)
+                    {
+                        LLAMINAR_ASSERT(!kernel->hasDynamicStateActive(),
+                                        "[KernelFactory] Embedding kernel still has dynamic state active after reset");
+                    }
+                }
+#endif
+
+                LOG_DEBUG("[KernelFactory] Reset dynamic state on "
+                          << embedding_cache_.size() << " embedding, "
+                          << attention_cache_.size() << " attention, "
+                          << rope_cache_.size() << " RoPE kernels");
             }
 
             std::pair<size_t, size_t> KernelFactory::cacheStats()
