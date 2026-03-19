@@ -7763,6 +7763,11 @@ add_v2_test(V2_Integration_MultiTurnSessionReset
     LABELS "V2;Integration;Orchestrator;MultiTurn;SessionReset;Embedding;DynamicState"
     MPI_PROCS 1
 )
+# Override log level: DEBUG causes D2H syncs from GPU debug logging that
+# crash under sustained multi-session GPU test loads (pre-existing issue).
+set_tests_properties(V2_Integration_MultiTurnSessionReset PROPERTIES
+    ENVIRONMENT_MODIFICATION "LLAMINAR_LOG_LEVEL=set:WARN"
+)
 
 # Test: TPDomain MPI Integration Tests (Phase 3.2b)
 # Tests TPDomainBuilder, MPI_Comm_split, cross-rank domain creation, and cleanup

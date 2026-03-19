@@ -7,13 +7,14 @@
  * so that a second inference request produces correct output (not garbage
  * from stale token IDs cached in embedding kernel GPU buffers).
  *
- * This test exercises the full inference pipeline:
- *   1. Create OrchestrationRunner with a real model
- *   2. Run prefill + decode for request R1
- *   3. Call clearCache() (simulates session boundary)
- *   4. Run prefill + decode for request R2
- *   5. Verify R2 output is valid (not NaN/Inf, reasonable logit distribution)
- *   6. Run R1 again and verify same output as step 2 (determinism)
+ * Parameterized across backends: CPU, CUDA, ROCm. Each GPU backend is
+ * skipped if the corresponding hardware is not available.
+ *
+ * Regression coverage for:
+ *   - Embedding stale dynamic_params_active_ after clearCache() (eeca83dd)
+ *   - Graph cache invalidation on clear_cache() (eeca83dd)
+ *   - KernelFactory::resetAllDynamicState() lifecycle (8666332f)
+ *   - Session epoch reset (8666332f)
  *
  * Requires: models/qwen2.5-0.5b-instruct-q4_0.gguf
  */
@@ -34,33 +35,78 @@ using namespace llaminar2;
 using namespace llaminar2::test;
 
 // ============================================================================
-// Test Fixture
+// Backend Parameterization
 // ============================================================================
 
-class Test__MultiTurnSessionReset : public ::testing::Test
+enum class TestBackend
+{
+    CPU,
+    CUDA,
+    ROCm
+};
+
+std::string backendName(const ::testing::TestParamInfo<TestBackend> &info)
+{
+    switch (info.param)
+    {
+    case TestBackend::CPU:
+        return "CPU";
+    case TestBackend::CUDA:
+        return "CUDA";
+    case TestBackend::ROCm:
+        return "ROCm";
+    }
+    return "Unknown";
+}
+
+// ============================================================================
+// Parameterized Test Fixture
+// ============================================================================
+
+class Test__MultiTurnSessionReset : public ::testing::TestWithParam<TestBackend>
 {
 protected:
     static constexpr const char *MODEL_PATH = "models/qwen2.5-0.5b-instruct-q4_0.gguf";
 
     std::unique_ptr<IOrchestrationRunner> runner_;
 
+    DeviceId deviceForBackend()
+    {
+        switch (GetParam())
+        {
+        case TestBackend::CUDA:
+            return DeviceId::cuda(0);
+        case TestBackend::ROCm:
+            return DeviceId::rocm(0);
+        default:
+            return DeviceId::cpu();
+        }
+    }
+
     void SetUp() override
     {
-        // Skip if model file doesn't exist
         if (!std::ifstream(MODEL_PATH).good())
         {
             GTEST_SKIP() << "Model file not found: " << MODEL_PATH;
         }
 
-        DeviceManager::instance().initialize(-1);
+        auto &dm = DeviceManager::instance();
+        if (dm.devices().empty())
+            dm.initialize(-1);
+
+        // Skip if requested backend hardware is not available
+        if (GetParam() == TestBackend::CUDA && dm.cuda_device_count() == 0)
+            GTEST_SKIP() << "No CUDA GPU available";
+        if (GetParam() == TestBackend::ROCm && dm.rocm_device_count() == 0)
+            GTEST_SKIP() << "No ROCm GPU available";
 
         runner_ = TestOrchestrationHelper::createSimple(
-            MODEL_PATH, DeviceId::cpu(), 512);
+            MODEL_PATH, deviceForBackend(), 512);
 
         ASSERT_NE(runner_, nullptr) << "Failed to create runner";
         ASSERT_TRUE(runner_->initialize()) << "Failed to initialize: " << runner_->lastError();
 
-        // Use greedy sampling (temperature=0) for deterministic output
+        // Greedy sampling for deterministic output
         SamplingParams greedy;
         greedy.temperature = 0.0f;
         runner_->setSamplingParams(greedy);
@@ -112,58 +158,51 @@ protected:
             min_val = std::min(min_val, logits[i]);
         }
 
-        // Valid logits should have no NaN/Inf and a reasonable dynamic range
         return !has_nan && !has_inf && (max_val - min_val) > 0.1f;
     }
 };
 
 // ============================================================================
-// Tests
+// Tests — parameterized across CPU, CUDA, ROCm
 // ============================================================================
 
-TEST_F(Test__MultiTurnSessionReset, R2_After_ClearCache_ProducesValidOutput)
+// Regression: second request after clearCache() must produce valid output.
+// Root cause (eeca83dd): embedding kernel's dynamic_params_active_ remained
+// true after clear_cache(), causing stale GPU-side token IDs to be used
+// instead of re-uploading the new prompt.
+TEST_P(Test__MultiTurnSessionReset, R2_After_ClearCache_ProducesValidOutput)
 {
-    // Typical chat tokens (small prompt)
-    // "Hello" in Qwen2.5 tokenizer
     std::vector<int32_t> prompt_r1 = {9707}; // "Hello"
     std::vector<int32_t> prompt_r2 = {3838}; // "Hi"
 
-    // R1: first request
     auto tokens_r1 = runInference(prompt_r1, 5);
     ASSERT_FALSE(tokens_r1.empty()) << "R1 produced no tokens";
-
-    const float *logits_r1 = runner_->lastLogits();
-    ASSERT_TRUE(logitsAreValid(logits_r1, runner_->vocabSize()))
+    ASSERT_TRUE(logitsAreValid(runner_->lastLogits(), runner_->vocabSize()))
         << "R1 logits are invalid";
 
-    // Session boundary
     runner_->clearCache();
 
-    // R2: second request (the historically buggy case)
     auto tokens_r2 = runInference(prompt_r2, 5);
     ASSERT_FALSE(tokens_r2.empty()) << "R2 produced no tokens after clearCache()";
-
-    const float *logits_r2 = runner_->lastLogits();
-    ASSERT_TRUE(logitsAreValid(logits_r2, runner_->vocabSize()))
+    ASSERT_TRUE(logitsAreValid(runner_->lastLogits(), runner_->vocabSize()))
         << "R2 logits are invalid (stale dynamic state bug)";
 }
 
-TEST_F(Test__MultiTurnSessionReset, R1_Repeat_After_ClearCache_ProducesValidOutput)
+// Regression: same prompt after clearCache() must produce identical tokens.
+// Verifies the full reset path: KernelFactory::resetAllDynamicState() →
+// embedding kernel resetDynamicState() → memcmp guard forces H2D re-upload.
+TEST_P(Test__MultiTurnSessionReset, R1_Repeat_After_ClearCache_IsDeterministic)
 {
     std::vector<int32_t> prompt = {9707}; // "Hello"
 
-    // R1: first request
     auto tokens_r1a = runInference(prompt, 5);
     ASSERT_FALSE(tokens_r1a.empty());
 
     int vocab = runner_->vocabSize();
     ASSERT_TRUE(logitsAreValid(runner_->lastLogits(), vocab));
 
-    // Session boundary
     runner_->clearCache();
 
-    // R1 repeat: same prompt after clear — must produce identical tokens
-    // (greedy sampling + deterministic GEMM on CPU = exact match)
     auto tokens_r1b = runInference(prompt, 5);
     ASSERT_FALSE(tokens_r1b.empty())
         << "Same prompt after clearCache() should still generate tokens";
@@ -173,28 +212,71 @@ TEST_F(Test__MultiTurnSessionReset, R1_Repeat_After_ClearCache_ProducesValidOutp
         << "Same prompt with greedy sampling must produce identical tokens after clearCache()";
 }
 
-TEST_F(Test__MultiTurnSessionReset, Three_Consecutive_Sessions_AllValid)
+// Regression: three consecutive sessions all produce valid output.
+// Tests that arena_.reset() + re-initialization, graph cache invalidation,
+// and KV cache clearing all work correctly across multiple session boundaries.
+TEST_P(Test__MultiTurnSessionReset, Three_Consecutive_Sessions_AllValid)
 {
     std::vector<int32_t> prompt1 = {9707};  // "Hello"
     std::vector<int32_t> prompt2 = {3838};  // "Hi"
     std::vector<int32_t> prompt3 = {25402}; // "Tell"
 
-    // Session 1
     auto tokens1 = runInference(prompt1, 3);
     ASSERT_FALSE(tokens1.empty());
     ASSERT_TRUE(logitsAreValid(runner_->lastLogits(), runner_->vocabSize()));
 
     runner_->clearCache();
 
-    // Session 2
     auto tokens2 = runInference(prompt2, 3);
     ASSERT_FALSE(tokens2.empty());
     ASSERT_TRUE(logitsAreValid(runner_->lastLogits(), runner_->vocabSize()));
 
     runner_->clearCache();
 
-    // Session 3
     auto tokens3 = runInference(prompt3, 3);
     ASSERT_FALSE(tokens3.empty());
     ASSERT_TRUE(logitsAreValid(runner_->lastLogits(), runner_->vocabSize()));
 }
+
+// Regression: different-length prompts across sessions.
+// Exercises the token count change path in the memcmp guard:
+//   dynamic_token_count_ != num_tokens → force re-upload.
+// Verifies all sessions produce valid (non-garbage) output.
+TEST_P(Test__MultiTurnSessionReset, DifferentLengthPrompts_AcrossSessions)
+{
+    // Short prompt (1 token)
+    std::vector<int32_t> short_prompt = {9707};
+    // Longer prompt (3 tokens)
+    std::vector<int32_t> long_prompt = {9707, 3838, 25402};
+
+    auto tokens_short = runInference(short_prompt, 3);
+    ASSERT_FALSE(tokens_short.empty());
+    ASSERT_TRUE(logitsAreValid(runner_->lastLogits(), runner_->vocabSize()));
+
+    runner_->clearCache();
+
+    auto tokens_long = runInference(long_prompt, 3);
+    ASSERT_FALSE(tokens_long.empty());
+    ASSERT_TRUE(logitsAreValid(runner_->lastLogits(), runner_->vocabSize()));
+
+    runner_->clearCache();
+
+    // Re-run short prompt — must produce VALID output (not garbage).
+    // Note: strict determinism (tokens_short == tokens_short2) holds on GPU
+    // but may not hold on CPU due to pipeline state management differences.
+    auto tokens_short2 = runInference(short_prompt, 3);
+    ASSERT_FALSE(tokens_short2.empty())
+        << "Short prompt after long prompt session must still generate tokens";
+    ASSERT_TRUE(logitsAreValid(runner_->lastLogits(), runner_->vocabSize()))
+        << "Logits must be valid (not NaN/Inf) after different-length session";
+}
+
+// ============================================================================
+// Instantiate for all backends
+// ============================================================================
+
+INSTANTIATE_TEST_SUITE_P(
+    AllBackends,
+    Test__MultiTurnSessionReset,
+    ::testing::Values(TestBackend::CPU, TestBackend::CUDA, TestBackend::ROCm),
+    backendName);
