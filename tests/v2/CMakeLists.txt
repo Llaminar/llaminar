@@ -2759,6 +2759,19 @@ add_v2_test(V2_Unit_AttentionComputeStage_DynamicKVLen
     MPI_PROCS 1  # Single rank for unit testing
 )
 
+# Test: Decode-mode KV cache override (regression test for stale activation buffer bug)
+add_executable(v2_test_attention_decode_kv_override unit/execution/compute_stages/stages/Test__AttentionStage_DecodeKVOverride.cpp)
+target_link_libraries(v2_test_attention_decode_kv_override
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_AttentionStage_DecodeKVOverride
+    COMMAND $<TARGET_FILE:v2_test_attention_decode_kv_override>
+    LABELS "V2;Unit;Attention;ComputeStage;DecodeKVOverride;Regression;CPU"
+    MPI_PROCS 1
+)
+
 # Test: EmbeddingStage graph capture support
 add_executable(v2_test_embedding_stage_graph_capture unit/execution/compute_stages/stages/Test__EmbeddingStage_GraphCapture.cpp)
 target_link_libraries(v2_test_embedding_stage_graph_capture
