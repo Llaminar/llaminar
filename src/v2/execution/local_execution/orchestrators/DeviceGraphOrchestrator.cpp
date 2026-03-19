@@ -2742,18 +2742,28 @@ namespace llaminar2
     {
         state_.clear();
 
-        // Forward graph cache is NOT cleared here. The cached graphs are
-        // structural — keyed by (seq_len, batch_size, device, decode) — and
-        // remain valid across sequences. On cache hit the token_ids,
-        // position_ids and dynamic params (pos_offset) are updated in-place
-        // before execution. KV cache is accessed through state_.kv_cache
-        // which clear() resets without deallocating, so stage pointers to
-        // the KV cache object remain valid.
-        //
-        // Use clearCache() for full teardown when the graph structure itself
-        // needs to change (e.g., device migration, PP reconfiguration).
+        // Invalidate the forward graph cache. Cached prefill/decode graphs hold
+        // stage objects whose internal state (arena coherence flags, GPU graph
+        // captures, weight-cohered flags on ComputeNodes) assumes continuity
+        // within a single inference sequence. When the sequence is reset (new
+        // prompt), reusing these cached graphs causes the executeFastDecode()
+        // path to skip coherence management that was performed only on the
+        // original cache-miss executeNode() path, leading to stale buffer
+        // state and incorrect inference results on the second forward pass.
+        for (auto &[_, cache] : forward_graph_cache_)
+        {
+            cache.invalidate();
+        }
+        forward_graph_cache_.clear();
 
-        LOG_DEBUG("[DeviceGraphOrchestrator] Inference state cleared (graph cache preserved)");
+        // Clear layer graph caches and device contexts
+        for (auto &cache : layer_graph_cache_)
+        {
+            cache.invalidate();
+        }
+        device_contexts_.clear();
+
+        LOG_DEBUG("[DeviceGraphOrchestrator] Inference state cleared (all caches cleared)");
     }
 
     // =========================================================================

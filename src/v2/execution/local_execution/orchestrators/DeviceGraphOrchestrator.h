@@ -1349,7 +1349,20 @@ namespace llaminar2
         /**
          * @brief Clear KV cache (IInferenceRunner override)
          */
-        void clear_cache() override { clearInferenceState(); }
+        void clear_cache() override {
+            for (auto& [dev, ctx] : device_contexts_) {
+                if (ctx && dev.is_gpu()) ctx->synchronize();
+            }
+            // Invalidate graph caches but preserve device contexts
+            for (auto& entry : layer_graph_cache_) {
+                entry.valid = false;
+            }
+            forward_graph_cache_.clear();
+            last_pos_offset_ = -1;
+            cache_stats_ = CacheStats{};
+            state_.clear();
+            arena_.reset();
+        }
 
         /**
          * @brief Get current position (IInferenceRunner override)

@@ -528,7 +528,14 @@ namespace llaminar2
         // a capturing stream, causing capture to fail.
         hipStream_t stream = static_cast<hipStream_t>(getStream());
         hipError_t err = hipSuccess;
-        const bool token_ids_preloaded = dynamic_params_active_ && dynamic_token_count_ == num_tokens;
+        // Verify preloaded data matches current request to prevent stale tokens
+        // after clear_cache(). The kernel is cached in KernelFactory and
+        // dynamic_params_active_ persists across graph rebuilds.
+        const bool token_ids_preloaded = dynamic_params_active_
+            && dynamic_token_count_ == num_tokens
+            && h_token_ids_
+            && std::memcmp(h_token_ids_, token_ids,
+                          static_cast<size_t>(num_tokens) * sizeof(int)) == 0;
         if (!token_ids_preloaded)
         {
             dynamic_params_active_ = false;

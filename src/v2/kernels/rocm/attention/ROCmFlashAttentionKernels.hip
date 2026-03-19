@@ -1880,23 +1880,33 @@ struct PrefillStreamCtx {
     hipblasHandle_t handle = nullptr;
     float* scores_buf = nullptr;
     size_t scores_cap = 0;
+    hipEvent_t completion_event = nullptr;  // Signals when this stream's work is done
+};
+
+// Per-device input readiness event: recorded on the caller's stream so pool
+// streams can wait for Q/K/V data to be fully written before reading.
+struct PrefillPoolState {
+    std::array<PrefillStreamCtx, NUM_PREFILL_STREAMS> streams;
+    hipEvent_t input_ready = nullptr;  // Recorded on caller's stream before dispatch
 };
 
 static std::mutex s_stream_mtx;
-static std::unordered_map<int, std::array<PrefillStreamCtx, NUM_PREFILL_STREAMS>> s_stream_pools;
+static std::unordered_map<int, PrefillPoolState> s_stream_pools;
 
-static std::array<PrefillStreamCtx, NUM_PREFILL_STREAMS>& get_stream_pool(int device_id) {
+static PrefillPoolState& get_stream_pool(int device_id) {
     std::lock_guard<std::mutex> lock(s_stream_mtx);
     auto it = s_stream_pools.find(device_id);
     if (it != s_stream_pools.end()) return it->second;
 
-    auto& pool = s_stream_pools[device_id];
+    auto& state = s_stream_pools[device_id];
     for (int i = 0; i < NUM_PREFILL_STREAMS; i++) {
-        hipStreamCreateWithFlags(&pool[i].stream, hipStreamNonBlocking);
-        hipblasCreate(&pool[i].handle);
-        hipblasSetStream(pool[i].handle, pool[i].stream);
+        hipStreamCreateWithFlags(&state.streams[i].stream, hipStreamNonBlocking);
+        hipblasCreate(&state.streams[i].handle);
+        hipblasSetStream(state.streams[i].handle, state.streams[i].stream);
+        hipEventCreateWithFlags(&state.streams[i].completion_event, hipEventDisableTiming);
     }
-    return pool;
+    hipEventCreateWithFlags(&state.input_ready, hipEventDisableTiming);
+    return state;
 }
 
 static float* ensure_scores_buffer(PrefillStreamCtx& ctx, size_t required_bytes) {
@@ -1938,7 +1948,18 @@ static int rocblas_prefill_impl(
     int device_id = 0;
     hipGetDevice(&device_id);
 
-    auto& pool = get_stream_pool(device_id);
+    auto& pool_state = get_stream_pool(device_id);
+    auto& pool = pool_state.streams;
+
+    // ─── Input fence: pool streams must wait for caller's stream ───
+    // Q/K/V data is written by upstream stages (QKV projection, RoPE, KV append)
+    // on hip_stream. Pool streams use hipStreamNonBlocking, which does NOT
+    // implicitly sync with the caller's stream. Without this fence, pool
+    // streams can read stale Q/K/V data from prior pipeline iterations.
+    hipEventRecord(pool_state.input_ready, hip_stream);
+    for (int s = 0; s < NUM_PREFILL_STREAMS; s++) {
+        hipStreamWaitEvent(pool[s].stream, pool_state.input_ready, 0);
+    }
 
     const int gqa_ratio = n_heads / n_kv_heads;
 
@@ -2034,7 +2055,17 @@ static int rocblas_prefill_impl(
             }
         }
 
-        // Synchronize all streams before moving to next batch
+        // ─── Output fence: rejoin pool streams to caller's stream ───
+        // Event fence: makes hip_stream aware of pool completion so
+        // subsequent GPU work on hip_stream waits for attention output.
+        for (int s = 0; s < NUM_PREFILL_STREAMS; s++) {
+            hipEventRecord(pool[s].completion_event, pool[s].stream);
+            hipStreamWaitEvent(hip_stream, pool[s].completion_event, 0);
+        }
+        // CPU-side sync: ensures pool work is fully complete before the CPU
+        // returns. This is needed because hipStreamWaitEvent only creates a
+        // GPU-side dependency — CPU-side operations (e.g., hipMemcpy for
+        // coherence transfers) need the data to be globally visible.
         for (int s = 0; s < NUM_PREFILL_STREAMS; s++) {
             hipStreamSynchronize(pool[s].stream);
         }

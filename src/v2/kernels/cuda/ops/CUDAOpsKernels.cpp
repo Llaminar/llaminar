@@ -1334,7 +1334,13 @@ namespace llaminar2
 
         size_t token_bytes = static_cast<size_t>(num_tokens) * sizeof(int);
         cudaError_t err = cudaSuccess;
-        const bool token_ids_preloaded = dynamic_params_active_ && dynamic_token_count_ == num_tokens;
+        // Verify preloaded data matches current request to prevent stale tokens
+        // after clear_cache(). The kernel is cached in KernelFactory and
+        // dynamic_params_active_ persists across graph rebuilds.
+        const bool token_ids_preloaded = dynamic_params_active_
+            && dynamic_token_count_ == num_tokens
+            && h_token_ids_
+            && std::memcmp(h_token_ids_, token_ids, token_bytes) == 0;
         if (!token_ids_preloaded)
         {
             dynamic_params_active_ = false;
