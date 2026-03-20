@@ -9524,4 +9524,22 @@ if(HAVE_CUDA OR HAVE_ROCM)
     message(STATUS "V2 Tests: Added GPU Sampling Kernels integration tests")
 endif()
 
+# =============================================================================
+# E2E Server Integration Tests (REST API)
+# =============================================================================
+# Shell-based tests that spin up llaminar2 --serve and test via curl.
+# Bypasses mpirun wrapper since the script manages its own server processes.
+
+add_test(
+    NAME V2_E2E_Server_MultiTurn
+    COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/e2e/server/test_server_e2e.sh
+        --binary $<TARGET_FILE:llaminar2>
+)
+set_tests_properties(V2_E2E_Server_MultiTurn PROPERTIES
+    LABELS "V2;E2E;Server;REST;MultiTurn;CPU;CUDA;ROCm"
+    TIMEOUT 600
+    ENVIRONMENT "LLAMINAR_LOG_LEVEL=ERROR"
+)
+message(STATUS "V2 Tests: Added E2E Server multi-turn integration tests")
+
 endif()

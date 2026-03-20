@@ -363,6 +363,14 @@ namespace llaminar2
         bool benchmark_mode = false; ///< Run benchmark
 
         // =========================================================================
+        // Server Configuration
+        // =========================================================================
+
+        bool serve_mode = false;              ///< Run HTTP server (--serve)
+        int serve_port = 8080;                ///< Server port (--port)
+        std::string serve_host = "127.0.0.1"; ///< Server bind address (--host)
+
+        // =========================================================================
         // Fused Attention Configuration
         // =========================================================================
 

@@ -11,6 +11,7 @@
 #include "app/modes/InteractiveChatMode.h"
 #include "app/modes/SingleShotChatMode.h"
 #include "app/modes/BenchmarkMode.h"
+#include "app/modes/ServerMode.h"
 #include "app/modes/CompletionMode.h"
 #include <iostream>
 #include <vector>
@@ -57,6 +58,7 @@ namespace llaminar2
         modes.push_back(std::make_unique<InteractiveChatMode>());
         modes.push_back(std::make_unique<SingleShotChatMode>());
         modes.push_back(std::make_unique<BenchmarkMode>());
+        modes.push_back(std::make_unique<ServerMode>());
         modes.push_back(std::make_unique<CompletionMode>());
 
         for (auto &mode : modes)

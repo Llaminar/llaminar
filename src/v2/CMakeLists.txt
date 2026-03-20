@@ -1241,6 +1241,7 @@ add_library(llaminar2_core STATIC
     app/modes/InteractiveChatMode.cpp
     app/modes/SingleShotChatMode.cpp
     app/modes/BenchmarkMode.cpp
+    app/modes/ServerMode.cpp
     app/modes/CompletionMode.cpp
     loaders/ModelLoader.cpp
     loaders/ModelContext.cpp
@@ -1401,6 +1402,12 @@ add_library(llaminar2_core STATIC
 target_include_directories(llaminar2_core PUBLIC 
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/..
+)
+
+# cpp-httplib and nlohmann/json for ServerMode
+target_include_directories(llaminar2_core PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../external/llama.cpp/vendor/cpp-httplib
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../external/llama.cpp/vendor
 )
 
 # Enable pipeline snapshot capture (for parity testing and debugging)

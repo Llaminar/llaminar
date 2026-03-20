@@ -521,6 +521,33 @@ namespace llaminar2
                 config.benchmark_mode = true;
             }
 
+            // ===== Server Configuration =====
+            else if (arg == "--serve")
+            {
+                config.serve_mode = true;
+            }
+            else if (matchesFlag(arg, "", "--port"))
+            {
+                std::string value = getFlagValue(args, i);
+                if (value.empty())
+                    throw std::invalid_argument("--port requires a value");
+                try
+                {
+                    config.serve_port = std::stoi(value);
+                }
+                catch (...)
+                {
+                    throw std::invalid_argument("Invalid port value: " + value);
+                }
+            }
+            else if (matchesFlag(arg, "", "--host"))
+            {
+                std::string value = getFlagValue(args, i);
+                if (value.empty())
+                    throw std::invalid_argument("--host requires a value");
+                config.serve_host = value;
+            }
+
             // ===== Fused Attention Configuration =====
             else if (arg == "--fused-attention")
             {
@@ -1285,6 +1312,11 @@ Chat Configuration:
 
 Benchmark Configuration:
   --benchmark            Run benchmark (warmup + multiple timed runs)
+
+Server Configuration:
+  --serve                Start HTTP server (OpenAI-compatible REST API)
+  --port <n>             Server port (default: 8080)
+  --host <addr>          Server bind address (default: 127.0.0.1)
 
 Fused Attention:
   --fused-attention      Enable fused attention+Wo kernel
