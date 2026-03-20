@@ -135,7 +135,8 @@ namespace llaminar2
                                                             << " position_offset=" << params_.position_offset
                                                             << " mode=" << attention_mode_name(mode)
                                                             << " Q_type=" << (params_.Q ? params_.Q->dtype_name() : "null")
-                                                            << " K_type=" << (params_.K ? params_.K->dtype_name() : "null")
+                                                            << " K_type=" << (effective_K ? effective_K->dtype_name() : "null")
+                                                            << " V_type=" << (effective_V ? effective_V->dtype_name() : "null")
                                                             << " output=" << (void *)params_.output);
 
         // Validate inputs

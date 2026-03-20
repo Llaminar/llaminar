@@ -151,19 +151,17 @@ if(HAVE_CUDA)
     # --prec-sqrt=false: Fast sqrt (slightly less accurate)
     set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --use_fast_math --ftz=true --prec-div=false --prec-sqrt=false")
     
-    # Relocatable device code for separate compilation
-    set(CMAKE_CUDA_SEPARABLE_COMPILATION ON)
-    
-    # CRITICAL: Limit nvlink parallelism to avoid OOM during device linking
-    # nvlink is extremely memory-intensive (~1-2GB per process). With 500+ test targets
-    # that each need device linking, unlimited parallelism causes system OOM.
-    # This creates a Ninja job pool that limits concurrent link jobs to 8.
-    # The pool must be defined BEFORE any targets that use it.
+    # NOTE: CUDA_SEPARABLE_COMPILATION is set per-target (on cuda_backend and
+    # device_benchmarks) rather than globally. Combined with CUDA_RESOLVE_DEVICE_SYMBOLS,
+    # this resolves device symbols at library build time. Without this, every downstream
+    # executable (580+ test binaries) gets its own nvcc device-link step, adding ~19MB
+    # per executable and massive link time. With per-library resolution, only the 3 GPU
+    # libraries need device linking — executables link normally.
+    #
+    # The nvlink_pool job limit is no longer needed (3 library device links vs 580+
+    # executable device links), but we keep a small pool as a safety net.
     if(CMAKE_GENERATOR MATCHES "Ninja")
-        # Define the job pool with depth=8 (max 8 concurrent nvlink processes)
         set_property(GLOBAL APPEND PROPERTY JOB_POOLS nvlink_pool=8)
-        # Apply to all link jobs (includes CUDA device linking)
-        set(CMAKE_JOB_POOL_LINK nvlink_pool)
     endif()
 endif()
 
@@ -274,6 +272,15 @@ if(HAVE_CUDA)
         kernels/cuda/kvcache/CUDARingKVCacheTensorAdapter.cpp
         ${CUDA_KERNEL_SOURCES}
     )
+    # Resolve CUDA device symbols at library build time so downstream executables
+    # (500+ test binaries) don't each need their own nvcc device-link step.
+    set_target_properties(cuda_backend PROPERTIES
+        CUDA_SEPARABLE_COMPILATION ON
+        CUDA_RESOLVE_DEVICE_SYMBOLS ON
+    )
+    if(CMAKE_GENERATOR MATCHES "Ninja")
+        set_property(TARGET cuda_backend PROPERTY JOB_POOL_LINK nvlink_pool)
+    endif()
     target_include_directories(cuda_backend PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
     
     # NCCLBackend.cpp must be compiled with g++ (not nvcc) because it includes MPI headers.
@@ -544,6 +551,10 @@ if(HAVE_ROCM)
         collective/backends/RCCLBackendHIP.cpp               # HIP runtime wrappers for RCCL backend
         collective/coordinators/RCCLCoordinator.cpp          # RCCL collective coordinator
         ${ROCM_KERNEL_SOURCES}
+    )
+    # Resolve HIP device symbols at library build time (same rationale as cuda_backend).
+    set_target_properties(rocm_backend PROPERTIES
+        HIP_RESOLVE_DEVICE_SYMBOLS ON
     )
     target_include_directories(rocm_backend PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
     target_link_libraries(rocm_backend PUBLIC hip::host roc::hipblas)
@@ -867,6 +878,21 @@ if(HAVE_CUDA AND HAVE_ROCM)
 endif()
 
 add_library(device_benchmarks STATIC ${BENCHMARK_SOURCES})
+# Resolve device symbols at library build time (same rationale as cuda_backend/rocm_backend).
+if(HAVE_CUDA)
+    set_target_properties(device_benchmarks PROPERTIES
+        CUDA_SEPARABLE_COMPILATION ON
+        CUDA_RESOLVE_DEVICE_SYMBOLS ON
+    )
+    if(CMAKE_GENERATOR MATCHES "Ninja")
+        set_property(TARGET device_benchmarks PROPERTY JOB_POOL_LINK nvlink_pool)
+    endif()
+endif()
+if(HAVE_ROCM)
+    set_target_properties(device_benchmarks PROPERTIES
+        HIP_RESOLVE_DEVICE_SYMBOLS ON
+    )
+endif()
 target_include_directories(device_benchmarks PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(device_benchmarks PRIVATE OpenMP::OpenMP_CXX)
 
