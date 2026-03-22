@@ -8,7 +8,6 @@
  * - GEMMStage: Matrix multiplication with quantization
  * - RMSNormStage: RMS normalization
  * - RoPEStage: Rotary position encoding
- * - SwiGLUStage: SwiGLU activation
  * - ResidualAddStage: Precision-aware residual addition
  *
  * Each stage is tested for:
@@ -489,109 +488,6 @@ TEST_F(ComputeStagesTest, RoPEStage_PreservesNorm)
         // Norms should be preserved (rotations don't change magnitude)
         EXPECT_NEAR(norm0_before, norm0_after, 1e-4f);
         EXPECT_NEAR(norm1_before, norm1_after, 1e-4f);
-    }
-}
-
-// =============================================================================
-// SwiGLUStage Tests
-// =============================================================================
-
-TEST_F(ComputeStagesTest, SwiGLUStage_TypeAndBackend)
-{
-    const int seq_len = 4, intermediate_dim = 256;
-    auto gate = makeTensor(seq_len, intermediate_dim);
-    auto up = makeTensor(seq_len, intermediate_dim);
-    auto output = makeTensor(seq_len, intermediate_dim);
-
-    SwiGLUStage::Params params{
-        .gate = gate.get(),
-        .up = up.get(),
-        .output = output.get()};
-
-    SwiGLUStage stage(params);
-
-    EXPECT_EQ(stage.type(), ComputeStageType::SWIGLU);
-    EXPECT_TRUE(stage.supportsBackend(ComputeBackendType::CPU));
-}
-
-TEST_F(ComputeStagesTest, SwiGLUStage_EstimatedFlops)
-{
-    const int seq_len = 8, intermediate_dim = 512;
-    auto gate = makeTensor(seq_len, intermediate_dim);
-
-    SwiGLUStage::Params params{
-        .gate = gate.get()};
-
-    SwiGLUStage stage(params);
-
-    // SwiGLU: swish(gate) * up
-    // Per element: sigmoid (exp, add, div) + mul (for swish) + mul (with up)
-    // Approximately 6 ops per element
-    size_t flops = stage.estimatedFlops();
-    EXPECT_GT(flops, 0);
-    EXPECT_GE(flops, static_cast<size_t>(seq_len * intermediate_dim));
-}
-
-TEST_F(ComputeStagesTest, SwiGLUStage_SnapshotInfo)
-{
-    const int seq_len = 4, intermediate_dim = 64;
-    auto gate = makeTensor(seq_len, intermediate_dim);
-    auto up = makeTensor(seq_len, intermediate_dim);
-    auto output = makeTensor(seq_len, intermediate_dim);
-
-    SwiGLUStage::Params params{
-        .gate = gate.get(),
-        .up = up.get(),
-        .output = output.get()};
-
-    SwiGLUStage stage(params);
-
-    auto dump_info = stage.getDumpInfo();
-    ASSERT_EQ(dump_info.outputs.size(), 1);
-    EXPECT_EQ(dump_info.outputs[0].data, output->data());
-    EXPECT_EQ(dump_info.outputs[0].rows, seq_len);
-    EXPECT_EQ(dump_info.outputs[0].cols, intermediate_dim);
-    EXPECT_STREQ(dump_info.outputs[0].name, "output");
-}
-
-TEST_F(ComputeStagesTest, SwiGLUStage_Correctness)
-{
-    // SwiGLU(gate, up) = swish(gate) * up = (gate * sigmoid(gate)) * up
-    const int seq_len = 1, intermediate_dim = 4;
-
-    std::vector<float> gate_data = {0.0f, 1.0f, -1.0f, 2.0f};
-    std::vector<float> up_data = {1.0f, 2.0f, 3.0f, 4.0f};
-
-    auto gate = makeTensor(seq_len, intermediate_dim, gate_data);
-    auto up = makeTensor(seq_len, intermediate_dim, up_data);
-    auto output = makeTensor(seq_len, intermediate_dim);
-
-    // Compute expected
-    std::vector<float> expected(seq_len * intermediate_dim);
-    for (int i = 0; i < intermediate_dim; ++i)
-    {
-        float sigmoid_gate = 1.0f / (1.0f + std::exp(-gate_data[i]));
-        float swish = gate_data[i] * sigmoid_gate;
-        expected[i] = swish * up_data[i];
-    }
-
-    SwiGLUStage::Params params{
-        .gate = gate.get(),
-        .up = up.get(),
-        .output = output.get()};
-
-    SwiGLUStage stage(params);
-    bool success = stage.execute(ctx_.get());
-
-    if (success)
-    {
-        const float *out = output->data();
-        for (int i = 0; i < intermediate_dim; ++i)
-        {
-            EXPECT_NEAR(out[i], expected[i], 1e-5f)
-                << "Mismatch at index " << i
-                << ": expected " << expected[i] << ", got " << out[i];
-        }
     }
 }
 

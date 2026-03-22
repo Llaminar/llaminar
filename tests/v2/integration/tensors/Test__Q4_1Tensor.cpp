@@ -10,7 +10,7 @@
 #include "v2/tensors/BlockStructures.h"
 #include "v2/tensors/FP16Utils.h"
 #include "v2/kernels/cpu/gemm/FloatingPointGemmKernel.h"
-#include "v2/kernels/cpu/gemm/CPUQuantisedGemmKernel.h"
+#include "kernels/cpu/native_vnni/CPUNativeVNNIGemmKernel.h"
 
 using namespace llaminar2;
 
@@ -106,7 +106,7 @@ TEST_F(Test__Q4_1Tensor, GemmCorrectness_SingleBlock)
         expected_sum += val * 1.0f;       // input is 1.0
     }
 
-    // Note: CPUQuantisedGemmKernel quantizes the input (A) to Q8_1 (int8 + fp16 scale) on the fly.
+    // Note: CPUNativeVNNIGemmKernel quantizes the input (A) to Q8_1 (int8 + fp16 scale) on the fly.
     // This introduces a small precision loss due to FP16 scale round-tripping.
     // For 1.0 input, scale is 1/127 stored as FP16. 127 * fp16(1/127) ~= 0.9999...
     // Accumulated over 32 elements, this results in ~0.016 error (255.984 vs 256.0).
@@ -179,7 +179,7 @@ TEST_F(Test__Q4_1Tensor, GemmCorrectness_MultipleBlocks)
 }
 
 /**
- * @brief Compare CPUQuantisedGemmKernel (INT8) vs FloatingPointGemmKernel (FP32) for Q4_1.
+ * @brief Compare CPUNativeVNNIGemmKernel (INT8) vs FloatingPointGemmKernel (FP32) for Q4_1.
  *
  * This test verifies that the quantized GEMM kernel produces results close to
  * the FP32 reference implementation using OneDNN.

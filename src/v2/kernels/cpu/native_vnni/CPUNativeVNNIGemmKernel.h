@@ -30,6 +30,7 @@
 #include "CPUNativeVNNIGemv.h"
 #include "tensors/TensorKernels.h"
 #include "tensors/TensorClasses.h"
+#include "kernels/cpu/primitives/SwiGLUPrimitives.h"
 #include "utils/Logger.h"
 
 namespace llaminar2::cpu::native_vnni
@@ -180,12 +181,21 @@ namespace llaminar2::cpu::native_vnni
             DeviceWorkspaceManager *workspace = nullptr,
             int activation_row_offset = 0) override
         {
-            (void)bias; // TODO: bias support
-
             const float *A_data = A->data() + activation_row_offset * k;
             float *C_data = C->mutable_data();
 
-            return multiply(A_data, C_data, m, n, k, transpose_B, alpha, beta, mpi_ctx, device_idx, workspace);
+            bool success = multiply(A_data, C_data, m, n, k, transpose_B, alpha, beta, mpi_ctx, device_idx, workspace);
+            if (!success)
+                return false;
+
+            // Apply bias epilogue: C[m, j] += bias[j]
+            if (bias)
+            {
+                const float *bias_data = bias->data();
+                apply_bias_epilogue(C_data, bias_data, m, n, n);
+            }
+
+            return true;
         }
 
         /**
@@ -225,11 +235,20 @@ namespace llaminar2::cpu::native_vnni
             const MPIContext *mpi_ctx = nullptr,
             int device_idx = -1) override
         {
-            (void)A; (void)B; (void)C;
-            (void)m; (void)n; (void)k;
-            (void)lda; (void)ldb; (void)ldc;
-            (void)transpose_B; (void)alpha; (void)beta;
-            (void)mpi_ctx; (void)device_idx;
+            (void)A;
+            (void)B;
+            (void)C;
+            (void)m;
+            (void)n;
+            (void)k;
+            (void)lda;
+            (void)ldb;
+            (void)ldc;
+            (void)transpose_B;
+            (void)alpha;
+            (void)beta;
+            (void)mpi_ctx;
+            (void)device_idx;
             return false; // Not applicable for weight GEMM
         }
 
@@ -242,6 +261,212 @@ namespace llaminar2::cpu::native_vnni
         const CPUNativeVNNIPackedWeights &packedWeights() const { return packed_; }
 
         uint8_t codebookId() const { return packed_.codebook_id; }
+
+        int get_n() const override { return packed_.N; }
+        int get_k() const override { return packed_.K; }
+
+        // -------------------------------------------------------------------
+        // Fused SwiGLU + GEMM: output = W @ (silu(gate) * up)
+        // -------------------------------------------------------------------
+
+        /**
+         * @brief Fused SwiGLU activation + GEMM on CPU.
+         *
+         * Computes: output = W_down @ (silu(gate) * up)
+         * SwiGLU is applied to the input BEFORE quantization and GEMM,
+         * which is mathematically correct (gate and up share dimension K,
+         * while output has dimension N ≠ K).
+         */
+        bool multiply_tensor_with_fused_swiglu(
+            const TensorBase *gate,
+            const TensorBase *up,
+            TensorBase *output,
+            int m, int n, int k,
+            float alpha = 1.0f, float beta = 0.0f) override
+        {
+            if (!valid_)
+                return false;
+
+            const float *gate_fp32 = gate->data();
+            const float *up_fp32 = up->data();
+            float *output_fp32 = output->mutable_data();
+
+            // Apply SwiGLU to get the GEMM input: temp = silu(gate) * up  [m, k]
+            const size_t input_size = static_cast<size_t>(m) * k;
+            std::vector<float> swiglu_input(input_size);
+            primitives::compute_swiglu(gate_fp32, up_fp32, swiglu_input.data(),
+                                       static_cast<int>(input_size));
+
+            // GEMM: output = W_down @ swiglu_input
+            return multiply(swiglu_input.data(), output_fp32, m, n, k,
+                            true, alpha, beta, nullptr, -1, nullptr);
+        }
+
+        // -------------------------------------------------------------------
+        // Fused multi-projection with quantize-once + epilogues
+        // -------------------------------------------------------------------
+
+        bool supports_fused_projection() const override
+        {
+            return true;
+        }
+
+        bool multiply_fused(
+            const float *input,
+            const std::vector<FusedProjectionDesc> &projections,
+            int m, int k,
+            const MPIContext *mpi_ctx = nullptr,
+            int device_idx = -1,
+            DeviceWorkspaceManager *workspace = nullptr) override
+        {
+            (void)mpi_ctx;
+            (void)workspace;
+
+            if (!valid_ || device_idx != -1)
+                return false;
+
+            // Pre-quantize input once (shared across all projections)
+            const int K_blocks = (k + 31) / 32;
+            std::vector<Q8_1Block> shared_q8(static_cast<size_t>(m) * K_blocks);
+
+            if (m == 1)
+            {
+                // Single-row: quantize on current thread
+                const bool k_aligned = (k % 32 == 0);
+                int kb = 0;
+#if defined(__AVX512F__)
+                if (k_aligned)
+                {
+                    for (; kb + 1 < K_blocks; kb += 2)
+                        simd::quantize_two_blocks_avx512(input + kb * 32, shared_q8[kb], shared_q8[kb + 1]);
+                }
+#endif
+                for (; kb < K_blocks; ++kb)
+                {
+                    int block_start = kb * 32;
+                    int block_len = std::min(32, k - block_start);
+                    simd::quantize_single_block(input + block_start, shared_q8[kb], block_len);
+                }
+            }
+            else
+            {
+                // Multi-row: parallel quantization
+                quantize_activations_to_q8_1(input, shared_q8.data(), m, k, K_blocks);
+            }
+
+            // Run each projection using the shared Q8_1 buffer + apply epilogues
+            for (const auto &proj : projections)
+            {
+                if (!proj.kernel)
+                    return false;
+
+                // Check if this projection uses OUR packed weights
+                auto *vnni_kernel = dynamic_cast<CPUNativeVNNIGemmKernel *>(proj.kernel);
+                if (vnni_kernel && vnni_kernel->valid_)
+                {
+                    // Fast path: use pre-quantized GEMV/GEMM directly
+                    const auto &proj_packed = vnni_kernel->packed_;
+                    if (m == 1)
+                        gemv_native_vnni_preq(proj_packed, shared_q8.data(), proj.output);
+                    else
+                        gemm_native_vnni_preq(proj_packed, shared_q8.data(), proj.output, m, proj.n);
+                }
+                else
+                {
+                    // Fallback: use generic multiply (re-quantizes internally)
+                    bool success = proj.kernel->multiply(
+                        input, proj.output, m, proj.n, k,
+                        true, 1.0f, 0.0f, mpi_ctx, device_idx, workspace);
+                    if (!success)
+                        return false;
+                }
+
+                // Apply bias epilogue
+                if (proj.bias)
+                {
+                    const float *bias_data = proj.bias->data();
+                    apply_bias_epilogue(proj.output, bias_data, m, proj.n, proj.n);
+                }
+            }
+            return true;
+        }
+
+        bool multiply_fused_tensor(
+            const TensorBase *input,
+            const std::vector<TensorProjectionDesc> &projections,
+            int m, int k,
+            const MPIContext *mpi_ctx = nullptr,
+            DeviceWorkspaceManager *workspace = nullptr) override
+        {
+            if (!valid_)
+                return false;
+
+            const float *input_data = input->data();
+
+            // Pre-quantize input once (shared across all projections)
+            const int K_blocks = (k + 31) / 32;
+            std::vector<Q8_1Block> shared_q8(static_cast<size_t>(m) * K_blocks);
+
+            if (m == 1)
+            {
+                const bool k_aligned = (k % 32 == 0);
+                int kb = 0;
+#if defined(__AVX512F__)
+                if (k_aligned)
+                {
+                    for (; kb + 1 < K_blocks; kb += 2)
+                        simd::quantize_two_blocks_avx512(input_data + kb * 32, shared_q8[kb], shared_q8[kb + 1]);
+                }
+#endif
+                for (; kb < K_blocks; ++kb)
+                {
+                    int block_start = kb * 32;
+                    int block_len = std::min(32, k - block_start);
+                    simd::quantize_single_block(input_data + block_start, shared_q8[kb], block_len);
+                }
+            }
+            else
+            {
+                quantize_activations_to_q8_1(input_data, shared_q8.data(), m, k, K_blocks);
+            }
+
+            // Run each projection using the shared Q8_1 buffer + apply epilogues
+            for (const auto &proj : projections)
+            {
+                if (!proj.kernel || !proj.output)
+                    return false;
+
+                float *out_data = proj.output->mutable_data();
+
+                auto *vnni_kernel = dynamic_cast<CPUNativeVNNIGemmKernel *>(proj.kernel);
+                if (vnni_kernel && vnni_kernel->valid_)
+                {
+                    const auto &proj_packed = vnni_kernel->packed_;
+                    if (m == 1)
+                        gemv_native_vnni_preq(proj_packed, shared_q8.data(), out_data);
+                    else
+                        gemm_native_vnni_preq(proj_packed, shared_q8.data(), out_data, m, proj.n);
+                }
+                else
+                {
+                    bool success = proj.kernel->multiply_tensor(
+                        input, proj.output, m, proj.n, k,
+                        true, 1.0f, 0.0f, proj.bias, mpi_ctx, -1, workspace);
+                    if (!success)
+                        return false;
+                    // multiply_tensor already handled bias for fallback
+                    continue;
+                }
+
+                // Apply bias epilogue
+                if (proj.bias)
+                {
+                    const float *bias_data = proj.bias->data();
+                    apply_bias_epilogue(out_data, bias_data, m, proj.n, proj.n);
+                }
+            }
+            return true;
+        }
 
     private:
         CPUNativeVNNIPackedWeights packed_;

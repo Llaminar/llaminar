@@ -9,8 +9,6 @@
 #include "stages/AllreduceStage.h"
 #include "stages/AttentionComputeStage.h"
 #include "stages/AttentionWithKVCacheStage.h"
-#include "stages/EmbeddingStage.h"
-#include "stages/FusedAttentionWoStage.h"
 #include "stages/FusedGateUpGEMMStage.h"
 #include "stages/FusedQKVGEMMStage.h"
 #include "stages/GEMMStage.h"
@@ -23,10 +21,6 @@
 #include "stages/RMSNormStage.h"\n #include "stages/QKNormStage.h"
 #include "stages/RoPEStage.h"
 #include "stages/SendActivationsStage.h"
-#include "stages/SwiGLUStage.h"
-// Include complete types for unique_ptr deletion
-#include "../../kernels/cpu/attention/q8_1/FusedAttentionWoKernel.h"
-#include "../../kernels/cpu/attention/q16_1/Q16FusedAttentionKernel.h"
 
 namespace llaminar2
 {
@@ -74,13 +68,6 @@ namespace llaminar2
     {
         // Unified: RoPEStage uses KernelFactory at execute-time for device dispatch
         return std::make_unique<RoPEStage>(params);
-    }
-
-    std::unique_ptr<IComputeStage> ComputeStageFactory::createSwiGLU(
-        const SwiGLUStage::Params &params)
-    {
-        // Unified: SwiGLUStage uses KernelFactory at execute-time for device dispatch
-        return std::make_unique<SwiGLUStage>(params);
     }
 
     std::unique_ptr<IComputeStage> ComputeStageFactory::createResidualAdd(
@@ -178,13 +165,6 @@ namespace llaminar2
     {
         // Unified: AttentionComputeStage uses KernelFactory at execute-time
         return std::make_unique<AttentionComputeStage>(params);
-    }
-
-    std::unique_ptr<IComputeStage> ComputeStageFactory::createFusedAttentionWo(
-        const FusedAttentionWoStage::Params &params)
-    {
-        // Fused attention + Wo projection using JIT kernel
-        return std::make_unique<FusedAttentionWoStage>(params);
     }
 
     // =============================================================================

@@ -6,7 +6,6 @@
  */
 
 #include "TensorClasses.h"
-#include "../kernels/cpu/gemm/FusedGEMM.h"
 #include "../utils/Logger.h"
 #include "../utils/DebugEnv.h"
 #include "FP16Utils.h"
@@ -124,7 +123,6 @@ namespace llaminar2
             quantizeFP32ToINT8(fp32_data.data(), host_int8_data_.data(), scale_, total);
         }
     }
-
 
     const float *INT8Tensor::data() const
     {
@@ -622,55 +620,5 @@ namespace llaminar2
     // =============================================================================
     // Phase 2 Fused Kernel Factory Methods
     // =============================================================================
-
-    /**
-     * @brief Create fused dual GEMM kernel for FFN gate/up projections
-     *
-     * Creates kernel that fuses:
-     * 1. Shared input quantization (FP32 → Q8_1)
-     * 2. Gate GEMM (Q8_1×weight → FP32)
-     * 3. Up GEMM (Q8_1×weight → FP32)
-     *
-     * @param gate_weight Quantized gate projection weights [n, k]
-     * @param up_weight Quantized up projection weights [n, k]
-     * @return Unique pointer to FusedGEMM kernel instance
-     */
-    std::unique_ptr<FusedGEMM> INT8Tensor::createFusedDualGemm(
-        TensorBase *gate_weight,
-        TensorBase *up_weight)
-    {
-        if (!gate_weight || !up_weight)
-        {
-            LOG_ERROR("[INT8Tensor] FusedGEMM requires non-null weight tensors");
-            return nullptr;
-        }
-        return std::make_unique<FusedGEMM>(gate_weight, up_weight);
-    }
-
-    /**
-     * @brief Create fused triple GEMM kernel for attention Q/K/V projections
-     *
-     * Creates kernel that fuses:
-     * 1. Q GEMM: FP32 input × weight → FP32 output
-     * 2. K GEMM: FP32 input × weight → FP32 output
-     * 3. V GEMM: FP32 input × weight → FP32 output
-     *
-     * @param q_weight Quantized Q projection weights [n_q, k]
-     * @param k_weight Quantized K projection weights [n_kv, k]
-     * @param v_weight Quantized V projection weights [n_kv, k]
-     * @return Unique pointer to FusedGEMM kernel instance
-     */
-    std::unique_ptr<FusedGEMM> INT8Tensor::createFusedTripleGemm(
-        TensorBase *q_weight,
-        TensorBase *k_weight,
-        TensorBase *v_weight)
-    {
-        if (!q_weight || !k_weight || !v_weight)
-        {
-            LOG_ERROR("[INT8Tensor] FusedGEMM requires non-null weight tensors");
-            return nullptr;
-        }
-        return std::make_unique<FusedGEMM>(q_weight, k_weight, v_weight);
-    }
 
 } // namespace llaminar2

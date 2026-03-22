@@ -7,7 +7,6 @@
 #include "../ComputeStageUtils.h"
 #include "../../../utils/DebugEnv.h"
 #include "../../../tensors/Tensors.h"
-#include "../../../tensors/FP16Utils.h"
 #include "../../../utils/Logger.h"
 #include "../../../kernels/KernelFactory.h"
 #include "../../../utils/GemmContext.h"
@@ -75,246 +74,6 @@ namespace llaminar2
             return false;
         }
 
-        // Check output tensor types for precision detection
-        auto *output_q_q8_1 = dynamic_cast<Q8_1Tensor *>(params_.output_q);
-        auto *output_k_q8_1 = dynamic_cast<Q8_1Tensor *>(params_.output_k);
-        auto *output_k_q16_1 = dynamic_cast<Q16_1Tensor *>(params_.output_k);
-        auto *output_v_q8_1 = dynamic_cast<Q8_1Tensor *>(params_.output_v);
-
-        // Check for mixed-precision QKV: Q=Q8_1, K=Q16_1, V=Q8_1 (HybridQ16 K precision fix)
-        const bool mixed_qkv = (output_q_q8_1 && output_k_q16_1 && output_v_q8_1);
-
-        if (mixed_qkv)
-        {
-            LOG_DEBUG("[FusedQKVGEMMStage] Mixed-precision QKV detected: Q=Q8_1, K=Q16_1, V=Q8_1");
-
-            // Cast weights to TensorBase for KernelFactory
-            auto *wq_base = requireTensorBase(params_.wq, "wq");
-            auto *wk_base = requireTensorBase(params_.wk, "wk");
-            auto *wv_base = requireTensorBase(params_.wv, "wv");
-
-            // Get or cache fused QKV GEMM kernel (avoid KernelFactory mutex per token)
-            if (!cache_resolved_fused_)
-            {
-                cached_fused_kernel_ = llaminar::v2::kernels::KernelFactory::getOrCreateFusedQKVGemm(
-                    wq_base, wk_base, wv_base, params_.device_id);
-                cache_resolved_fused_ = true;
-            }
-            auto *fused_kernel = cached_fused_kernel_;
-            if (!fused_kernel)
-            {
-                LOG_ERROR("[FusedQKVGEMMStage] Failed to get fused QKV kernel");
-                return false;
-            }
-            fused_kernel->setGPUStream(gpuStream());
-
-            // Determine Q16 block size from K output tensor
-            // LIMITATION: JIT kernel only properly supports block_size=64 or 32.
-            // block_size=128 writes only partial data (64 values) per block.
-            // Force block_size=64 for now until JIT kernel supports 128.
-            int k_block_size = 64;
-
-            LOG_DEBUG("[FusedQKVGEMMStage] K Q16_1 block_size=" << k_block_size);
-
-            // Check if input is Q8_1 - use direct path
-            auto *input_q8_1 = dynamic_cast<const Q8_1Tensor *>(params_.input);
-            if (input_q8_1)
-            {
-                LOG_DEBUG("[FusedQKVGEMMStage] Q8_1 input, using direct Q8_1→mixed path");
-                bool success = fused_kernel->execute_q8_1(
-                    input_q8_1->typed_data(),
-                    output_q_q8_1->mutable_typed_data(),
-                    output_k_q16_1->mutable_typed_data(),
-                    output_v_q8_1->mutable_typed_data(),
-                    params_.bias_q, params_.bias_k, params_.bias_v,
-                    params_.m, params_.n_q, params_.n_k,
-                    params_.k,
-                    k_block_size);
-
-                if (!success)
-                {
-                    LOG_ERROR("[FusedQKVGEMMStage] execute_q8_1 failed");
-                    return false;
-                }
-
-                LOG_DEBUG("[FusedQKVGEMMStage] Mixed-precision QKV path complete (Q8_1 input)");
-                return true;
-            }
-
-            // FP32 input - quantize to Q8_1 first, then use mixed path
-            const float *input_fp32 = params_.input->fp32_data();
-            if (!input_fp32)
-            {
-                LOG_ERROR("[FusedQKVGEMMStage] Mixed-precision QKV requires Q8_1 or FP32 input");
-                return false;
-            }
-
-            LOG_DEBUG("[FusedQKVGEMMStage] FP32 input, quantizing to Q8_1 for mixed path");
-
-            // Allocate temporary Q8_1 buffer for quantized activations
-            // Need to get buffer size from params
-            size_t buffer_size = static_cast<size_t>(params_.m) * static_cast<size_t>(params_.k) / 32 * sizeof(Q8_1Block);
-
-            if (buffer_size == 0)
-            {
-                LOG_ERROR("[FusedQKVGEMMStage] Failed to compute Q8_1 buffer size");
-                return false;
-            }
-
-            // Allocate aligned buffer for quantized activations
-            std::vector<Q8_1Block> q8_1_buffer(params_.m * params_.k / 32);
-
-            // Quantize FP32 input to Q8_1
-            // Use scalar quantization for simplicity (GEMM kernel will handle the rest)
-            for (int row = 0; row < params_.m; ++row)
-            {
-                const float *row_data = input_fp32 + row * params_.k;
-                Q8_1Block *row_blocks = q8_1_buffer.data() + row * (params_.k / 32);
-
-                for (int block_idx = 0; block_idx < params_.k / 32; ++block_idx)
-                {
-                    const float *block_data = row_data + block_idx * 32;
-                    Q8_1Block &block = row_blocks[block_idx];
-
-                    // Find max absolute value for scaling
-                    float max_abs = 0.0f;
-                    for (int i = 0; i < 32; ++i)
-                    {
-                        float abs_val = std::abs(block_data[i]);
-                        if (abs_val > max_abs)
-                            max_abs = abs_val;
-                    }
-
-                    // Compute scale (FP16) and sum_qs (INT16)
-                    float scale_fp32 = max_abs / 127.0f;
-                    block.d = fp32_to_fp16(scale_fp32); // FP16 scale
-                    int32_t sum = 0;
-
-                    if (max_abs > 0.0f)
-                    {
-                        float inv_scale = 127.0f / max_abs;
-                        for (int i = 0; i < 32; ++i)
-                        {
-                            int8_t q = static_cast<int8_t>(std::round(block_data[i] * inv_scale));
-                            block.qs[i] = q;
-                            sum += static_cast<int32_t>(q);
-                        }
-                    }
-                    else
-                    {
-                        std::memset(block.qs, 0, 32);
-                    }
-
-                    // Clamp sum to INT16 range (should be within [-127*32, 127*32] = [-4064, 4064])
-                    block.sum_qs = static_cast<int16_t>(std::max(-32768, std::min(32767, sum)));
-                }
-            }
-
-            LOG_DEBUG("[FusedQKVGEMMStage] Quantized FP32 to Q8_1: " << params_.m << "x" << params_.k);
-
-            // Now use the Q8_1 mixed path via the cached kernel
-            bool success = fused_kernel->execute_q8_1(
-                q8_1_buffer.data(),
-                output_q_q8_1->mutable_typed_data(),
-                output_k_q16_1->mutable_typed_data(),
-                output_v_q8_1->mutable_typed_data(),
-                params_.bias_q, params_.bias_k, params_.bias_v,
-                params_.m, params_.n_q, params_.n_k,
-                params_.k,
-                k_block_size);
-
-            if (!success)
-            {
-                LOG_ERROR("[FusedQKVGEMMStage] execute_q8_1 failed (FP32 input)");
-                return false;
-            }
-
-            LOG_DEBUG("[FusedQKVGEMMStage] Mixed-precision QKV path complete (FP32→Q8_1 input)");
-            return true;
-        }
-
-        const bool q8_1_output = (output_q_q8_1 && output_k_q8_1 && output_v_q8_1);
-
-        if (q8_1_output)
-        {
-            LOG_DEBUG("[FusedQKVGEMMStage] Q8_1 output detected, using Q8_1 execution path");
-
-            // Cast weights to TensorBase for KernelFactory
-            auto *wq_base2 = requireTensorBase(params_.wq, "wq");
-            auto *wk_base2 = requireTensorBase(params_.wk, "wk");
-            auto *wv_base2 = requireTensorBase(params_.wv, "wv");
-
-            // Get or cache fused QKV GEMM kernel (avoid KernelFactory mutex per token)
-            if (!cache_resolved_fused_)
-            {
-                cached_fused_kernel_ = llaminar::v2::kernels::KernelFactory::getOrCreateFusedQKVGemm(
-                    wq_base2, wk_base2, wv_base2, params_.device_id);
-                cache_resolved_fused_ = true;
-            }
-            auto *fused_kernel = cached_fused_kernel_;
-            if (!fused_kernel)
-            {
-                LOG_ERROR("[FusedQKVGEMMStage] Failed to get fused QKV kernel for Q8_1 output");
-                return false;
-            }
-            fused_kernel->setGPUStream(gpuStream());
-
-            // Check if input is also Q8_1 - use Q8_1→Q8_1 path to avoid double quantization
-            auto *input_q8_1 = dynamic_cast<const Q8_1Tensor *>(params_.input);
-
-            if (input_q8_1)
-            {
-                LOG_DEBUG("[FusedQKVGEMMStage] Q8_1 input detected, using Q8_1→Q8_1 path");
-
-                // Pure Q8_1 path: Q8_1 input → Q8_1 output
-                bool success = fused_kernel->execute_q8_1_to_q8_1(
-                    input_q8_1->typed_data(),
-                    output_q_q8_1->mutable_typed_data(),
-                    output_k_q8_1->mutable_typed_data(),
-                    output_v_q8_1->mutable_typed_data(),
-                    params_.bias_q, params_.bias_k, params_.bias_v,
-                    params_.m, params_.n_q, params_.n_k,
-                    params_.k);
-
-                if (!success)
-                {
-                    LOG_ERROR("[FusedQKVGEMMStage] execute_q8_1_to_q8_1 failed");
-                    return false;
-                }
-            }
-            else
-            {
-                LOG_DEBUG("[FusedQKVGEMMStage] FP32 input detected, using FP32→Q8_1 path");
-
-                // FP32 input → Q8_1 output path
-                const float *input_fp32 = params_.input->fp32_data();
-                if (!input_fp32)
-                {
-                    LOG_ERROR("[FusedQKVGEMMStage] Failed to get FP32 data from input tensor");
-                    return false;
-                }
-
-                bool success = fused_kernel->execute_fp32(
-                    input_fp32,
-                    output_q_q8_1->mutable_typed_data(),
-                    output_k_q8_1->mutable_typed_data(),
-                    output_v_q8_1->mutable_typed_data(),
-                    params_.bias_q, params_.bias_k, params_.bias_v,
-                    params_.m, params_.n_q, params_.n_k,
-                    params_.k,
-                    64); // default block size
-
-                if (!success)
-                {
-                    LOG_ERROR("[FusedQKVGEMMStage] execute_fp32 failed");
-                    return false;
-                }
-            }
-
-            LOG_DEBUG("[FusedQKVGEMMStage] Q8_1 path complete");
-            return true;
-        }
-
         // Cast weights to TensorBase for KernelFactory
         auto *wq_base = requireTensorBase(params_.wq, "wq");
         auto *wk_base = requireTensorBase(params_.wk, "wk");
@@ -367,9 +126,9 @@ namespace llaminar2
 
             // Build tensor projection descriptors
             std::vector<ITensorGemm::TensorProjectionDesc> projections = {
-                {gemm_q, output_q_base, params_.n_q, params_.bias_q, nullptr, false, "Q"},
-                {gemm_k, output_k_base, params_.n_k, params_.bias_k, nullptr, false, "K"},
-                {gemm_v, output_v_base, params_.n_v, params_.bias_v, nullptr, false, "V"}};
+                {gemm_q, output_q_base, params_.n_q, params_.bias_q, "Q"},
+                {gemm_k, output_k_base, params_.n_k, params_.bias_k, "K"},
+                {gemm_v, output_v_base, params_.n_v, params_.bias_v, "V"}};
 
             // Use tensor-aware fused API - handles all device sync internally
             success = gemm_q->multiply_fused_tensor(
@@ -385,7 +144,7 @@ namespace llaminar2
         }
         else
         {
-            // CPU path: Use raw pointer API
+            // CPU path: Use raw pointer API with FP32 activations
             const float *input_fp32 = params_.input->fp32_data();
             float *output_q_fp32 = params_.output_q->mutable_data();
             float *output_k_fp32 = params_.output_k->mutable_data();
@@ -401,11 +160,10 @@ namespace llaminar2
                                                         << " output_type=" << params_.output_q->dtype_name());
 
             // Build projection descriptors for raw pointer API
-            // FusedProjectionDesc takes TensorBase* for bias directly
             std::vector<ITensorGemm::FusedProjectionDesc> projections = {
-                {gemm_q, output_q_fp32, params_.n_q, params_.bias_q, nullptr, false, "Q"},
-                {gemm_k, output_k_fp32, params_.n_k, params_.bias_k, nullptr, false, "K"},
-                {gemm_v, output_v_fp32, params_.n_v, params_.bias_v, nullptr, false, "V"}};
+                {gemm_q, output_q_fp32, params_.n_q, params_.bias_q, "Q"},
+                {gemm_k, output_k_fp32, params_.n_k, params_.bias_k, "K"},
+                {gemm_v, output_v_fp32, params_.n_v, params_.bias_v, "V"}};
 
             success = gemm_q->multiply_fused(
                 input_fp32,
@@ -415,7 +173,6 @@ namespace llaminar2
 
             if (success)
             {
-                // Debug: Log Q output for comparison
                 LOG_TRACE("[FusedQKVGEMMStage] Q output[0:8]=" << std::setprecision(10)
                                                                << output_q_fp32[0] << "," << output_q_fp32[1] << ","
                                                                << output_q_fp32[2] << "," << output_q_fp32[3] << ","

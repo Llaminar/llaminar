@@ -504,49 +504,6 @@ TEST_F(ComputeStageTest, RoPEExplicitPositionIds_OverridesPosOffset)
 }
 
 // =============================================================================
-// SwiGLUStage Tests
-// =============================================================================
-
-TEST_F(ComputeStageTest, SwiGLUBasic)
-{
-    const int seq_len = 2;
-    const int intermediate_dim = 4;
-
-    // SwiGLU: silu(gate) * up
-    // silu(x) = x * sigmoid(x) = x / (1 + exp(-x))
-    std::vector<float> gate_data = {0.0f, 1.0f, -1.0f, 2.0f,
-                                    0.0f, 1.0f, -1.0f, 2.0f};
-    std::vector<float> up_data = {1.0f, 1.0f, 1.0f, 1.0f,
-                                  2.0f, 2.0f, 2.0f, 2.0f};
-
-    auto gate = makeTensor(seq_len, intermediate_dim, gate_data);
-    auto up = makeTensor(seq_len, intermediate_dim, up_data);
-    auto output = makeTensor(seq_len, intermediate_dim);
-
-    SwiGLUStage::Params params{
-        .gate = gate.get(),
-        .up = up.get(),
-        .output = output.get()};
-
-    SwiGLUStage stage(params);
-
-    EXPECT_EQ(stage.type(), ComputeStageType::SWIGLU);
-    EXPECT_TRUE(stage.execute(ctx_.get()));
-
-    const float *out = output->data();
-    // silu(0) = 0 / (1 + 1) = 0
-    EXPECT_NEAR(out[0], 0.0f, 1e-5f);
-
-    // silu(1) ≈ 0.731
-    float silu_1 = 1.0f / (1.0f + std::exp(-1.0f));
-    EXPECT_NEAR(out[1], silu_1 * 1.0f, 1e-5f);
-
-    // silu(-1) ≈ -0.269
-    float silu_neg1 = -1.0f / (1.0f + std::exp(1.0f));
-    EXPECT_NEAR(out[2], silu_neg1 * 1.0f, 1e-5f);
-}
-
-// =============================================================================
 // ResidualAddStage Tests
 // =============================================================================
 
@@ -757,23 +714,6 @@ TEST_F(ComputeStageTest, FactoryCreateRoPE)
     EXPECT_EQ(stage->type(), ComputeStageType::ROPE);
 }
 
-TEST_F(ComputeStageTest, FactoryCreateSwiGLU)
-{
-    const int seq_len = 1, intermediate_dim = 4864;
-    auto gate = makeTensor(seq_len, intermediate_dim);
-    auto up = makeTensor(seq_len, intermediate_dim);
-    auto output = makeTensor(seq_len, intermediate_dim);
-
-    SwiGLUStage::Params params{
-        .gate = gate.get(),
-        .up = up.get(),
-        .output = output.get()};
-
-    auto stage = ComputeStageFactory::createSwiGLU(params);
-    ASSERT_NE(stage, nullptr);
-    EXPECT_EQ(stage->type(), ComputeStageType::SWIGLU);
-}
-
 // =============================================================================
 // Null Context Handling Tests
 // =============================================================================
@@ -807,16 +747,4 @@ TEST_F(ComputeStageTest, NullContextHandling)
 
     RoPEStage rope_stage(rope_params);
     EXPECT_FALSE(rope_stage.execute(nullptr));
-
-    auto gate = makeTensor(seq_len, hidden_dim);
-    auto up = makeTensor(seq_len, hidden_dim);
-    auto swiglu_out = makeTensor(seq_len, hidden_dim);
-
-    SwiGLUStage::Params swiglu_params{
-        .gate = gate.get(),
-        .up = up.get(),
-        .output = swiglu_out.get()};
-
-    SwiGLUStage swiglu_stage(swiglu_params);
-    EXPECT_FALSE(swiglu_stage.execute(nullptr));
 }

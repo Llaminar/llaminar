@@ -1727,11 +1727,11 @@ TEST_F(Test__CUDAGemmParity, FusedQKV_TensorAPI_vs_Separate)
     // Build projection descriptors
     std::vector<TensorProjectionDesc> projections;
     projections.emplace_back(cuda_kernel_q.get(), output_q_fused.get(), N_q,
-                             nullptr, nullptr, false, "Q");
+                             nullptr, "Q");
     projections.emplace_back(cuda_kernel_k.get(), output_k_fused.get(), N_k,
-                             nullptr, nullptr, false, "K");
+                             nullptr, "K");
     projections.emplace_back(cuda_kernel_v.get(), output_v_fused.get(), N_v,
-                             nullptr, nullptr, false, "V");
+                             nullptr, "V");
 
     // Call fused method with coherence wrapper
     ASSERT_TRUE(with_gpu_coherence(
@@ -1890,11 +1890,11 @@ TEST_F(Test__CUDAGemmParity, FusedQKV_DecodeSize_M1)
     // Run fused with coherence wrapper
     std::vector<TensorProjectionDesc> projections;
     projections.emplace_back(cuda_kernel_q.get(), output_q_fused.get(), N_q,
-                             nullptr, nullptr, false, "Q");
+                             nullptr, "Q");
     projections.emplace_back(cuda_kernel_k.get(), output_k_fused.get(), N_k,
-                             nullptr, nullptr, false, "K");
+                             nullptr, "K");
     projections.emplace_back(cuda_kernel_v.get(), output_v_fused.get(), N_v,
-                             nullptr, nullptr, false, "V");
+                             nullptr, "V");
 
     ASSERT_TRUE(with_gpu_coherence(
         gpu_device_,
@@ -2433,11 +2433,11 @@ TEST_F(Test__CUDAGemmParity, FusedQKV_WithBias)
     // Run fused GEMM with biases
     std::vector<TensorProjectionDesc> projections;
     projections.emplace_back(cuda_kernel_q.get(), output_q.get(), N_q,
-                             bias_q.get(), nullptr, false, "Q");
+                             bias_q.get(), "Q");
     projections.emplace_back(cuda_kernel_k.get(), output_k.get(), N_k,
-                             bias_k.get(), nullptr, false, "K");
+                             bias_k.get(), "K");
     projections.emplace_back(cuda_kernel_v.get(), output_v.get(), N_v,
-                             bias_v.get(), nullptr, false, "V");
+                             bias_v.get(), "V");
 
     ASSERT_TRUE(cuda_kernel_q->multiply_fused_tensor(
         input.get(), projections, M, K, nullptr));
@@ -2624,11 +2624,11 @@ TEST_F(Test__CUDAGemmParity, FusedQKV_CachedKernels_MultipleIterations)
         // Run fused with cached kernels
         std::vector<TensorProjectionDesc> projections;
         projections.emplace_back(kernel_q, out_q.get(), N_q,
-                                 nullptr, nullptr, false, "Q");
+                                 nullptr, "Q");
         projections.emplace_back(kernel_k, out_k.get(), N_k,
-                                 nullptr, nullptr, false, "K");
+                                 nullptr, "K");
         projections.emplace_back(kernel_v, out_v.get(), N_v,
-                                 nullptr, nullptr, false, "V");
+                                 nullptr, "V");
 
         ASSERT_TRUE(kernel_q->multiply_fused_tensor(
             input.get(), projections, M, K, nullptr));

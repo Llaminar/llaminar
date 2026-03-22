@@ -30,16 +30,13 @@
 #include "stages/KVCacheAppendStage.h"
 #include "stages/KVCacheGatherStage.h"
 #include "stages/AttentionComputeStage.h"
-#include "stages/FusedAttentionWoStage.h"
 
 // FFN and residual
-#include "stages/SwiGLUStage.h"
 #include "stages/ResidualAddStage.h"
 
 // Model-level stages
 #include "stages/EmbeddingStage.h"
 #include "stages/LMHeadStage.h"
-#include "stages/QuantizeToQ16_1Stage.h"
 
 // MPI communication stages
 #include "stages/AllreduceStage.h"

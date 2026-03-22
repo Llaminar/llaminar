@@ -534,7 +534,7 @@ TEST_F(Test__KernelFactory, CreateGemm_ConsistentWithTensorCreateGemm)
     ASSERT_NE(factory_kernel, nullptr);
     ASSERT_NE(tensor_kernel, nullptr);
 
-    // Both should be same type (CPUQuantisedGemmKernel for CPU)
+    // Both should be same type (CPUNativeVNNIGemmKernel for CPU)
     // We can't easily compare types, but we can verify they're both valid
 }
 

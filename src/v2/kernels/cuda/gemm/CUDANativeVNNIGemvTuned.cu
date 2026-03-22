@@ -1167,7 +1167,7 @@ extern "C"
         case 15:
         case 16:
         case 17:
-        case 18:
+        case 19:
             return true;
         default:
             return false;
@@ -1235,8 +1235,8 @@ extern "C"
             return dispatchCodebook<16>(d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32, d_scales_A_block, N, K, alpha, beta, d_C_existing, d_bias, cuda_device_id, cuda_stream);
         case 17:
             return dispatchCodebook<17>(d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32, d_scales_A_block, N, K, alpha, beta, d_C_existing, d_bias, cuda_device_id, cuda_stream);
-        case 18:
-            return dispatchCodebook<18>(d_A_int8, d_payload, d_scales, nullptr, nullptr, d_C_fp32, d_scales_A_block, N, K, alpha, beta, d_C_existing, d_bias, cuda_device_id, cuda_stream);
+        case 19:
+            return dispatchCodebook<19>(d_A_int8, d_payload, d_scales, nullptr, nullptr, d_C_fp32, d_scales_A_block, N, K, alpha, beta, d_C_existing, d_bias, cuda_device_id, cuda_stream);
         default:
             return false;
         }

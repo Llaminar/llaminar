@@ -10,12 +10,12 @@
 #include <gtest/gtest.h>
 #include <random>
 #include "kernels/KernelFactory.h"
-#include "kernels/cpu/gemm/CPUQuantisedGemmKernel.h"
+#include "kernels/cpu/native_vnni/CPUNativeVNNIGemmKernel.h"
 #include "tensors/Tensors.h"
 #include "backends/ComputeBackend.h"
 
 using namespace llaminar2;
-using namespace llaminar2::gemm;
+using namespace llaminar2::cpu::native_vnni;
 using namespace llaminar::v2::kernels;
 
 class KernelFactorySlicedTest : public ::testing::Test
@@ -130,8 +130,8 @@ TEST_F(KernelFactorySlicedTest, CreatesSlicedKernel)
     auto *kernel = KernelFactory::getOrCreateGemmSliced(weights.get(), 0, 512);
     ASSERT_NE(kernel, nullptr);
 
-    // Verify kernel dimensions via dynamic_cast to CPUQuantisedGemmKernel
-    auto *qgemm = dynamic_cast<CPUQuantisedGemmKernel *>(kernel);
+    // Verify kernel dimensions via dynamic_cast to CPUNativeVNNIGemmKernel
+    auto *qgemm = dynamic_cast<CPUNativeVNNIGemmKernel *>(kernel);
     ASSERT_NE(qgemm, nullptr);
     EXPECT_EQ(qgemm->get_n(), 512); // Sliced N
     EXPECT_EQ(qgemm->get_k(), 896); // K unchanged
@@ -147,7 +147,7 @@ TEST_F(KernelFactorySlicedTest, SlicedKernelSecondHalf)
     auto *kernel = KernelFactory::getOrCreateGemmSliced(weights.get(), 512, 1024);
     ASSERT_NE(kernel, nullptr);
 
-    auto *qgemm = dynamic_cast<CPUQuantisedGemmKernel *>(kernel);
+    auto *qgemm = dynamic_cast<CPUNativeVNNIGemmKernel *>(kernel);
     ASSERT_NE(qgemm, nullptr);
     EXPECT_EQ(qgemm->get_n(), 512); // Sliced N
     EXPECT_EQ(qgemm->get_k(), 896); // K unchanged
@@ -198,8 +198,8 @@ TEST_F(KernelFactorySlicedTest, FullKernelDifferentFromSliced)
     EXPECT_NE(full, sliced);
 
     // But both should have same dimensions
-    auto *qfull = dynamic_cast<CPUQuantisedGemmKernel *>(full);
-    auto *qsliced = dynamic_cast<CPUQuantisedGemmKernel *>(sliced);
+    auto *qfull = dynamic_cast<CPUNativeVNNIGemmKernel *>(full);
+    auto *qsliced = dynamic_cast<CPUNativeVNNIGemmKernel *>(sliced);
     ASSERT_NE(qfull, nullptr);
     ASSERT_NE(qsliced, nullptr);
     EXPECT_EQ(qfull->get_n(), qsliced->get_n());
@@ -268,7 +268,7 @@ TEST_F(KernelFactorySlicedTest, RangeExceedsTensorThrows)
 TEST_F(KernelFactorySlicedTest, SlicedGemmProducesCorrectOutput)
 {
     // Small dimensions for easy verification
-    // NOTE: CPUQuantisedGemmKernel is optimized for M=1 (single token inference)
+    // NOTE: CPUNativeVNNIGemmKernel is optimized for M=1 (single token inference)
     // For tensor parallelism, row-slicing operates on the output dimension N
     const size_t N = 64; // Output rows (weight rows)
     const size_t K = 32; // Input cols (weight cols)
@@ -352,7 +352,7 @@ TEST_F(KernelFactorySlicedTest, WorksWithQ4_0)
     auto *kernel = KernelFactory::getOrCreateGemmSliced(weights.get(), 0, 512);
     ASSERT_NE(kernel, nullptr);
 
-    auto *qgemm = dynamic_cast<CPUQuantisedGemmKernel *>(kernel);
+    auto *qgemm = dynamic_cast<CPUNativeVNNIGemmKernel *>(kernel);
     ASSERT_NE(qgemm, nullptr);
     EXPECT_EQ(qgemm->get_n(), 512);
 }

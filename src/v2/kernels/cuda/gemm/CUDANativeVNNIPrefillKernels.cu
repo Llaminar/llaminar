@@ -3605,8 +3605,8 @@ extern "C" bool cudaNativeVNNIPrefill_fp32(
             M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream);
 
     // --- 8-bit format (no decode overhead, single-scale) ---
-    case 18: // Q8_0
-        return launchGenericPrefillBK64<18>(
+    case 19: // Q8_0
+        return launchGenericPrefillBK64<19>(
             d_A_int8, d_payload, d_scales, nullptr, nullptr, d_C_fp32, d_scales_A_block,
             M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream);
 

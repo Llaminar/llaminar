@@ -30,7 +30,7 @@
  *
  * **CRITICAL**: Not all activation types work with all weight types!
  *
- * The CPUQuantisedGemmKernel uses INT8 VNNI instructions (vpdpbusd) which require:
+ * The NativeVNNI kernel uses INT8 VNNI instructions (vpdpbusd) which require:
  * - Activations quantized to Q8_1 format (8-bit with scale+sum)
  * - Weights in quantized format (Q8_0, Q4_0, IQ4_NL, etc.)
  *
@@ -386,7 +386,7 @@ namespace llaminar
                  * @brief Check if an activation type is compatible with a weight type for GEMM
                  *
                  * **Design Rationale**:
-                 * The CPUQuantisedGemmKernel uses INT8 VNNI instructions which require:
+                 * The NativeVNNI kernel uses INT8 VNNI instructions which require:
                  * - Activations in Q8_1 format (8-bit with scale+sum per block)
                  * - Weights in quantized format (Q8_0, Q4_0, IQ4_NL, etc.)
                  *

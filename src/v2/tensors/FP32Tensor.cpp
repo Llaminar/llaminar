@@ -971,7 +971,22 @@ namespace llaminar2
                     if (k_aligned)
                     {
                         // Fast path: K is multiple of 32, no partial blocks
-                        for (int k_blk = 0; k_blk < k_blocks; ++k_blk)
+                        // Process blocks in pairs for 2-way ILP on AVX-512
+                        int k_blk = 0;
+#if defined(__AVX512F__)
+                        static const bool has_avx512 = simd::cpu_supports_avx512();
+                        if (has_avx512)
+                        {
+                            for (; k_blk + 1 < k_blocks; k_blk += 2)
+                            {
+                                simd::quantize_two_blocks_avx512(a_row + k_blk * 32,
+                                                                  row_blocks[k_blk],
+                                                                  row_blocks[k_blk + 1]);
+                            }
+                        }
+#endif
+                        // Handle remaining odd block (if any)
+                        for (; k_blk < k_blocks; ++k_blk)
                         {
                             simd::quantize_single_block(a_row + k_blk * 32, row_blocks[k_blk], 32);
                         }

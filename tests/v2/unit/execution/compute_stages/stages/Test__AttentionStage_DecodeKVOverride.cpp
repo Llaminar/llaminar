@@ -21,7 +21,6 @@
 #include "execution/compute_stages/ComputeStages.h"
 #include "tensors/Tensors.h"
 #include "kernels/cpu/CPUKVCache.h"
-#include "kernels/cpu/attention/q8_1/FusedAttentionWoKernel.h"
 #include "backends/DeviceId.h"
 
 namespace llaminar2
@@ -58,37 +57,100 @@ namespace llaminar2
             int get_cached_tokens(int layer, int seq_idx = 0) const override
             {
                 (void)seq_idx;
-                if (layer < 0 || layer >= num_layers_) return 0;
+                if (layer < 0 || layer >= num_layers_)
+                    return 0;
                 return cached_tokens_[layer];
             }
 
             bool get_kv(int layer, int seq_idx, ITensor **out_k, ITensor **out_v, int *out_kv_len = nullptr) override
             {
                 (void)seq_idx;
-                if (layer < 0 || layer >= num_layers_) { if (out_k) *out_k = nullptr; if (out_v) *out_v = nullptr; if (out_kv_len) *out_kv_len = 0; return false; }
-                if (out_k) *out_k = k_tensors_[layer].get();
-                if (out_v) *out_v = v_tensors_[layer].get();
-                if (out_kv_len) *out_kv_len = cached_tokens_[layer];
+                if (layer < 0 || layer >= num_layers_)
+                {
+                    if (out_k)
+                        *out_k = nullptr;
+                    if (out_v)
+                        *out_v = nullptr;
+                    if (out_kv_len)
+                        *out_kv_len = 0;
+                    return false;
+                }
+                if (out_k)
+                    *out_k = k_tensors_[layer].get();
+                if (out_v)
+                    *out_v = v_tensors_[layer].get();
+                if (out_kv_len)
+                    *out_kv_len = cached_tokens_[layer];
                 return true;
             }
             bool get_kv(int layer, int seq_idx, const ITensor **out_k, const ITensor **out_v, int *out_kv_len = nullptr) const override
             {
                 (void)seq_idx;
-                if (layer < 0 || layer >= num_layers_) { if (out_k) *out_k = nullptr; if (out_v) *out_v = nullptr; if (out_kv_len) *out_kv_len = 0; return false; }
-                if (out_k) *out_k = k_tensors_[layer].get();
-                if (out_v) *out_v = v_tensors_[layer].get();
-                if (out_kv_len) *out_kv_len = cached_tokens_[layer];
+                if (layer < 0 || layer >= num_layers_)
+                {
+                    if (out_k)
+                        *out_k = nullptr;
+                    if (out_v)
+                        *out_v = nullptr;
+                    if (out_kv_len)
+                        *out_kv_len = 0;
+                    return false;
+                }
+                if (out_k)
+                    *out_k = k_tensors_[layer].get();
+                if (out_v)
+                    *out_v = v_tensors_[layer].get();
+                if (out_kv_len)
+                    *out_kv_len = cached_tokens_[layer];
                 return true;
             }
 
-            ITensor *get_k(int layer, int seq_idx = 0) override { (void)seq_idx; return (layer >= 0 && layer < num_layers_) ? k_tensors_[layer].get() : nullptr; }
-            const ITensor *get_k(int layer, int seq_idx = 0) const override { (void)seq_idx; return (layer >= 0 && layer < num_layers_) ? k_tensors_[layer].get() : nullptr; }
-            ITensor *get_v(int layer, int seq_idx = 0) override { (void)seq_idx; return (layer >= 0 && layer < num_layers_) ? v_tensors_[layer].get() : nullptr; }
-            const ITensor *get_v(int layer, int seq_idx = 0) const override { (void)seq_idx; return (layer >= 0 && layer < num_layers_) ? v_tensors_[layer].get() : nullptr; }
+            ITensor *get_k(int layer, int seq_idx = 0) override
+            {
+                (void)seq_idx;
+                return (layer >= 0 && layer < num_layers_) ? k_tensors_[layer].get() : nullptr;
+            }
+            const ITensor *get_k(int layer, int seq_idx = 0) const override
+            {
+                (void)seq_idx;
+                return (layer >= 0 && layer < num_layers_) ? k_tensors_[layer].get() : nullptr;
+            }
+            ITensor *get_v(int layer, int seq_idx = 0) override
+            {
+                (void)seq_idx;
+                return (layer >= 0 && layer < num_layers_) ? v_tensors_[layer].get() : nullptr;
+            }
+            const ITensor *get_v(int layer, int seq_idx = 0) const override
+            {
+                (void)seq_idx;
+                return (layer >= 0 && layer < num_layers_) ? v_tensors_[layer].get() : nullptr;
+            }
 
-            bool append_kv(int layer, int seq_idx, const TensorBase *new_k, const TensorBase *new_v) override { (void)seq_idx; (void)new_k; (void)new_v; if (layer < 0 || layer >= num_layers_) return false; cached_tokens_[layer]++; return true; }
-            bool append_kv(int layer, int seq_idx, const TensorBase *new_k, const TensorBase *new_v, int num_tokens) override { (void)seq_idx; (void)new_k; (void)new_v; if (layer < 0 || layer >= num_layers_) return false; cached_tokens_[layer] += num_tokens; return true; }
-            void clear() override { for (auto &c : cached_tokens_) c = 0; }
+            bool append_kv(int layer, int seq_idx, const TensorBase *new_k, const TensorBase *new_v) override
+            {
+                (void)seq_idx;
+                (void)new_k;
+                (void)new_v;
+                if (layer < 0 || layer >= num_layers_)
+                    return false;
+                cached_tokens_[layer]++;
+                return true;
+            }
+            bool append_kv(int layer, int seq_idx, const TensorBase *new_k, const TensorBase *new_v, int num_tokens) override
+            {
+                (void)seq_idx;
+                (void)new_k;
+                (void)new_v;
+                if (layer < 0 || layer >= num_layers_)
+                    return false;
+                cached_tokens_[layer] += num_tokens;
+                return true;
+            }
+            void clear() override
+            {
+                for (auto &c : cached_tokens_)
+                    c = 0;
+            }
             void clear_sequence(int, int) override {}
             void clear_layer(int) override {}
             void evict_oldest(int) override {}
@@ -104,7 +166,11 @@ namespace llaminar2
             int local_kv_dim() const override { return kv_dim_; }
 
             // Test helpers
-            void setCachedTokens(int layer, int count) { if (layer >= 0 && layer < num_layers_) cached_tokens_[layer] = count; }
+            void setCachedTokens(int layer, int count)
+            {
+                if (layer >= 0 && layer < num_layers_)
+                    cached_tokens_[layer] = count;
+            }
             FP32Tensor *k_tensor(int layer) { return k_tensors_[layer].get(); }
             FP32Tensor *v_tensor(int layer) { return v_tensors_[layer].get(); }
 
@@ -214,12 +280,12 @@ namespace llaminar2
             // Build params as the graph builder would — K/V point to stale activation buffers
             AttentionComputeStage::Params params;
             params.Q = Q_.get();
-            params.K = stale_K_.get();          // Stale! (all zeros)
-            params.V = stale_V_.get();          // Stale! (all zeros)
+            params.K = stale_K_.get(); // Stale! (all zeros)
+            params.V = stale_V_.get(); // Stale! (all zeros)
             params.output = output_.get();
             params.batch_size = 1;
-            params.seq_len = 1;                 // Decode: single token
-            params.kv_len = 1;                  // Static hint from graph build (stale)
+            params.seq_len = 1; // Decode: single token
+            params.kv_len = 1;  // Static hint from graph build (stale)
             params.n_heads = kNumHeads;
             params.n_kv_heads = kNumKVHeads;
             params.head_dim = kHeadDim;
@@ -230,7 +296,7 @@ namespace llaminar2
             params.workspace_mask = workspace_mask_.get();
             params.kv_cache = kv_cache_.get();
             params.layer_idx = layer_idx;
-            params.read_kv_from_cache = false;  // NOT explicitly set — the fix must still override
+            params.read_kv_from_cache = false; // NOT explicitly set — the fix must still override
             params.position_offset = cached_tokens - 1;
 
             auto stage = ComputeStageFactory::createAttentionCompute(params);
@@ -277,7 +343,7 @@ namespace llaminar2
             params.workspace_mask = workspace_mask_.get();
             params.kv_cache = kv_cache_.get();
             params.layer_idx = layer_idx;
-            params.read_kv_from_cache = true;   // Explicit flag (GPU path)
+            params.read_kv_from_cache = true; // Explicit flag (GPU path)
             params.position_offset = cached_tokens - 1;
 
             auto stage = ComputeStageFactory::createAttentionCompute(params);
@@ -323,11 +389,11 @@ namespace llaminar2
 
             AttentionComputeStage::Params params;
             params.Q = Q_prefill.get();
-            params.K = K_wired.get();           // These ARE the correct K/V for prefill
+            params.K = K_wired.get(); // These ARE the correct K/V for prefill
             params.V = V_wired.get();
             params.output = output_prefill.get();
             params.batch_size = 1;
-            params.seq_len = seq_len;           // Prefill: seq_len == kv_len
+            params.seq_len = seq_len; // Prefill: seq_len == kv_len
             params.kv_len = seq_len;
             params.n_heads = kNumHeads;
             params.n_kv_heads = kNumKVHeads;
@@ -369,7 +435,8 @@ namespace llaminar2
 
             fillCacheWithGoodData(layer_idx, cached_tokens);
 
-            auto makeParams = [&]() {
+            auto makeParams = [&]()
+            {
                 AttentionComputeStage::Params params;
                 params.Q = Q_.get();
                 params.K = stale_K_.get();
@@ -463,7 +530,7 @@ namespace llaminar2
                 params.output = output_.get();
                 params.batch_size = 1;
                 params.seq_len = 1;
-                params.kv_len = 1;  // Static: attend to just 1 token (the stale zero buffer)
+                params.kv_len = 1; // Static: attend to just 1 token (the stale zero buffer)
                 params.n_heads = kNumHeads;
                 params.n_kv_heads = kNumKVHeads;
                 params.head_dim = kHeadDim;
@@ -472,7 +539,7 @@ namespace llaminar2
                 params.workspace_scores = workspace_scores_.get();
                 params.workspace_context = workspace_context_.get();
                 params.workspace_mask = workspace_mask_.get();
-                params.kv_cache = nullptr;      // No cache → uses stale K/V
+                params.kv_cache = nullptr; // No cache → uses stale K/V
                 params.layer_idx = -1;
                 params.position_offset = 0;
 
@@ -530,7 +597,7 @@ namespace llaminar2
             params.workspace_scores = workspace_scores_.get();
             params.workspace_context = workspace_context_.get();
             params.workspace_mask = workspace_mask_.get();
-            params.kv_cache = nullptr;      // No cache
+            params.kv_cache = nullptr; // No cache
             params.layer_idx = -1;
             params.position_offset = 0;
 
@@ -540,101 +607,6 @@ namespace llaminar2
             ASSERT_TRUE(stage->execute(nullptr));
             EXPECT_GT(outputAbsSum(), 0.0f)
                 << "Without cache, wired K/V should be used directly";
-        }
-
-        // =============================================================================
-        // FusedAttentionWoStage Tests (Q16_INTEGER path — always overrides)
-        // =============================================================================
-
-        /**
-         * @test FusedAttentionWoStage Q16_INTEGER always reads from cache
-         *
-         * The Q16_INTEGER backend already always read K/V from cache (pre-fix).
-         * Verify this behavior is preserved.
-         */
-        TEST_F(Test__AttentionStage_DecodeKVOverride, FusedAttnWo_Q16AlwaysUsesCache)
-        {
-            const int layer_idx = 0;
-            const int cached_tokens = 5;
-
-            // For Q16_INTEGER: cache must provide Q16_1 tensors
-            // Create Q16_1 cache tensors
-            auto q16_cache = std::make_unique<MockKVCache>(kNumLayers, kMaxSeqLen, kKVDim);
-            // Note: MockKVCache creates FP32 tensors, but the Q16_INTEGER path
-            // will dynamic_cast to Q16_1Tensor. Since MockKVCache uses FP32,
-            // the cast will fail and the stage will fall back gracefully.
-            // This test verifies the INTENT to override K/V from cache,
-            // not the Q16 kernel execution itself (which requires properly typed tensors).
-
-            // Just verify the stage can be constructed with cache wired
-            FusedAttentionWoStage::Params params;
-            params.Q = Q_.get();
-            params.K = stale_K_.get();
-            params.V = stale_V_.get();
-            params.output = output_.get();
-            params.batch_size = 1;
-            params.seq_len = 1;
-            params.kv_len = 1;
-            params.n_heads = kNumHeads;
-            params.n_kv_heads = kNumKVHeads;
-            params.head_dim = kHeadDim;
-            params.d_model = kQDim;
-            params.causal = true;
-            params.backend = FusedAttentionBackend::Q16_INTEGER;
-            params.kv_cache = kv_cache_.get();
-            params.layer_idx = layer_idx;
-            params.fuse_residual_add = true; // Required for Q16_INTEGER
-
-            kv_cache_->setCachedTokens(layer_idx, cached_tokens);
-
-            // Construction should work
-            auto stage = std::make_unique<FusedAttentionWoStage>(params);
-            ASSERT_NE(stage, nullptr);
-            EXPECT_EQ(stage->type(), ComputeStageType::FUSED_ATTENTION_WO);
-        }
-
-        /**
-         * @test FusedAttentionWoStage Q8_1 path: decode overrides K/V from cache
-         *
-         * The Q8_1 backend DID NOT override K/V before the fix.
-         * This test locks in the fix: when effective_kv_len > seq_len,
-         * K/V must come from cache.
-         */
-        TEST_F(Test__AttentionStage_DecodeKVOverride, FusedAttnWo_Q8DecodeOverridesStaleKV)
-        {
-            const int layer_idx = 0;
-            const int cached_tokens = 5;
-
-            fillCacheWithGoodData(layer_idx, cached_tokens);
-
-            // Construct with REFERENCE backend (simplest Q8_1 path, no JIT/TILED)
-            FusedAttentionWoStage::Params params;
-            params.Q = Q_.get();
-            params.K = stale_K_.get();          // Stale! (all zeros)
-            params.V = stale_V_.get();          // Stale! (all zeros)
-            params.output = output_.get();
-            params.batch_size = 1;
-            params.seq_len = 1;                 // Decode
-            params.kv_len = 1;                  // Stale static hint
-            params.n_heads = kNumHeads;
-            params.n_kv_heads = kNumKVHeads;
-            params.head_dim = kHeadDim;
-            params.d_model = kQDim;
-            params.causal = true;
-            params.backend = FusedAttentionBackend::REFERENCE;
-            params.kv_cache = kv_cache_.get();
-            params.layer_idx = layer_idx;
-
-            // Construction should work
-            auto stage = std::make_unique<FusedAttentionWoStage>(params);
-            ASSERT_NE(stage, nullptr);
-            EXPECT_EQ(stage->type(), ComputeStageType::FUSED_ATTENTION_WO);
-
-            // NOTE: We can't easily execute the Q8_1 FusedAttentionWo kernel in a unit test
-            // because it requires Q8_1Tensor inputs (not FP32) and a properly packed Wo.
-            // The integration test (DifferentLengthPrompts) covers execution end-to-end.
-            // This test verifies that the stage accepts the cache configuration
-            // and the code path exists (construction + parameter wiring).
         }
 
         // =============================================================================
@@ -682,7 +654,7 @@ namespace llaminar2
             params.workspace_context = workspace_context_.get();
             params.workspace_mask = workspace_mask_.get();
             params.kv_cache = kv_cache_.get();
-            params.layer_idx = 99;  // Out of range → cache returns nullptr for K/V
+            params.layer_idx = 99; // Out of range → cache returns nullptr for K/V
             params.read_kv_from_cache = false;
             params.position_offset = 4;
 

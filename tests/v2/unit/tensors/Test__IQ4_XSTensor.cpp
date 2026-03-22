@@ -294,7 +294,7 @@ TEST_F(IQ4_XSSIMDTest, GEMM_SmallBatch)
 
     auto gemm = tensor->createGemm();
     // NOTE: createGemm() returns nullptr for IQ4_XS since OneDNNGemmKernel was removed.
-    // IQ4_XS participates in GEMM only via activation-tensor-centric paths (CPUQuantisedGemmKernel).
+    // IQ4_XS participates in GEMM only via activation-tensor-centric paths (CPUNativeVNNIGemmKernel).
     if (gemm == nullptr)
     {
         GTEST_SKIP() << "GEMM kernel not available for IQ4_XS format";

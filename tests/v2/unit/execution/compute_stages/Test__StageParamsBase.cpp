@@ -49,8 +49,6 @@ static_assert(StageParamsRequired<AttentionComputeStage::Params>,
               "AttentionComputeStage::Params must satisfy StageParamsRequired");
 static_assert(StageParamsRequired<AttentionWithKVCacheStage::Params>,
               "AttentionWithKVCacheStage::Params must satisfy StageParamsRequired");
-static_assert(StageParamsRequired<FusedAttentionWoStage::Params>,
-              "FusedAttentionWoStage::Params must satisfy StageParamsRequired");
 
 // KV Cache Stages
 static_assert(StageParamsRequired<KVCacheAppendStage::Params>,
@@ -59,18 +57,12 @@ static_assert(StageParamsRequired<KVCacheGatherStage::Params>,
               "KVCacheGatherStage::Params must satisfy StageParamsRequired");
 
 // Activation and Projection Stages
-static_assert(StageParamsRequired<SwiGLUStage::Params>,
-              "SwiGLUStage::Params must satisfy StageParamsRequired");
 static_assert(StageParamsRequired<ResidualAddStage::Params>,
               "ResidualAddStage::Params must satisfy StageParamsRequired");
 static_assert(StageParamsRequired<EmbeddingStage::Params>,
               "EmbeddingStage::Params must satisfy StageParamsRequired");
 static_assert(StageParamsRequired<LMHeadStage::Params>,
               "LMHeadStage::Params must satisfy StageParamsRequired");
-
-// Quantization Stages
-static_assert(StageParamsRequired<QuantizeToQ16_1Stage::Params>,
-              "QuantizeToQ16_1Stage::Params must satisfy StageParamsRequired");
 
 // MPI Collective Stages
 static_assert(StageParamsRequired<AllreduceStage::Params>,
@@ -152,20 +144,6 @@ TEST_F(Test__StageParamsBase, AttentionWithKVCacheStage_DefaultsToDeviceCPU)
     EXPECT_EQ(params.mpi_ctx, nullptr);
 }
 
-TEST_F(Test__StageParamsBase, FusedAttentionWoStage_DefaultsToDeviceCPU)
-{
-    FusedAttentionWoStage::Params params{};
-    EXPECT_EQ(params.device_id.type, DeviceType::CPU);
-    EXPECT_EQ(params.mpi_ctx, nullptr);
-}
-
-TEST_F(Test__StageParamsBase, SwiGLUStage_DefaultsToDeviceCPU)
-{
-    SwiGLUStage::Params params{};
-    EXPECT_EQ(params.device_id.type, DeviceType::CPU);
-    EXPECT_EQ(params.mpi_ctx, nullptr);
-}
-
 TEST_F(Test__StageParamsBase, ResidualAddStage_DefaultsToDeviceCPU)
 {
     ResidualAddStage::Params params{};
@@ -197,13 +175,6 @@ TEST_F(Test__StageParamsBase, KVCacheAppendStage_DefaultsToDeviceCPU)
 TEST_F(Test__StageParamsBase, KVCacheGatherStage_DefaultsToDeviceCPU)
 {
     KVCacheGatherStage::Params params{};
-    EXPECT_EQ(params.device_id.type, DeviceType::CPU);
-    EXPECT_EQ(params.mpi_ctx, nullptr);
-}
-
-TEST_F(Test__StageParamsBase, QuantizeToQ16_1Stage_DefaultsToDeviceCPU)
-{
-    QuantizeToQ16_1Stage::Params params{};
     EXPECT_EQ(params.device_id.type, DeviceType::CPU);
     EXPECT_EQ(params.mpi_ctx, nullptr);
 }
@@ -251,7 +222,7 @@ TEST_F(Test__StageParamsBase, GEMMStage_DeviceIdDesignatedInitializer)
 {
     auto cuda0 = cudaDevice(0);
     GEMMStage::Params params{.device_id = cuda0};
-    
+
     EXPECT_EQ(params.device_id.type, DeviceType::CUDA);
     EXPECT_EQ(params.device_id.ordinal, 0);
 }
@@ -260,7 +231,7 @@ TEST_F(Test__StageParamsBase, FusedQKVGEMMStage_DeviceIdDesignatedInitializer)
 {
     auto cuda1 = cudaDevice(1);
     FusedQKVGEMMStage::Params params{.device_id = cuda1};
-    
+
     EXPECT_EQ(params.device_id.type, DeviceType::CUDA);
     EXPECT_EQ(params.device_id.ordinal, 1);
 }
@@ -269,7 +240,7 @@ TEST_F(Test__StageParamsBase, RMSNormStage_DeviceIdDesignatedInitializer)
 {
     auto rocm0 = rocmDevice(0);
     RMSNormStage::Params params{.device_id = rocm0};
-    
+
     EXPECT_EQ(params.device_id.type, DeviceType::ROCm);
     EXPECT_EQ(params.device_id.ordinal, 0);
 }
@@ -278,18 +249,9 @@ TEST_F(Test__StageParamsBase, AttentionComputeStage_DeviceIdDesignatedInitialize
 {
     auto cuda2 = cudaDevice(2);
     AttentionComputeStage::Params params{.device_id = cuda2};
-    
+
     EXPECT_EQ(params.device_id.type, DeviceType::CUDA);
     EXPECT_EQ(params.device_id.ordinal, 2);
-}
-
-TEST_F(Test__StageParamsBase, SwiGLUStage_DeviceIdDesignatedInitializer)
-{
-    auto rocm1 = rocmDevice(1);
-    SwiGLUStage::Params params{.device_id = rocm1};
-    
-    EXPECT_EQ(params.device_id.type, DeviceType::ROCm);
-    EXPECT_EQ(params.device_id.ordinal, 1);
 }
 
 // =============================================================================
@@ -303,7 +265,7 @@ TEST_F(Test__StageParamsBase, GEMMStage_DeviceMatchesParams)
     auto cuda0 = cudaDevice(0);
     GEMMStage::Params params{.device_id = cuda0};
     GEMMStage stage(params);
-    
+
     EXPECT_EQ(stage.device(), cuda0);
 }
 
@@ -312,7 +274,7 @@ TEST_F(Test__StageParamsBase, RMSNormStage_DeviceMatchesParams)
     auto rocm0 = rocmDevice(0);
     RMSNormStage::Params params{.device_id = rocm0};
     RMSNormStage stage(params);
-    
+
     EXPECT_EQ(stage.device(), rocm0);
 }
 
@@ -321,17 +283,8 @@ TEST_F(Test__StageParamsBase, RoPEStage_DeviceMatchesParams)
     auto cuda1 = cudaDevice(1);
     RoPEStage::Params params{.device_id = cuda1};
     RoPEStage stage(params);
-    
-    EXPECT_EQ(stage.device(), cuda1);
-}
 
-TEST_F(Test__StageParamsBase, SwiGLUStage_DeviceMatchesParams)
-{
-    auto cuda2 = cudaDevice(2);
-    SwiGLUStage::Params params{.device_id = cuda2};
-    SwiGLUStage stage(params);
-    
-    EXPECT_EQ(stage.device(), cuda2);
+    EXPECT_EQ(stage.device(), cuda1);
 }
 
 TEST_F(Test__StageParamsBase, ResidualAddStage_DeviceMatchesParams)
@@ -339,7 +292,7 @@ TEST_F(Test__StageParamsBase, ResidualAddStage_DeviceMatchesParams)
     auto rocm1 = rocmDevice(1);
     ResidualAddStage::Params params{.device_id = rocm1};
     ResidualAddStage stage(params);
-    
+
     EXPECT_EQ(stage.device(), rocm1);
 }
 
@@ -348,7 +301,7 @@ TEST_F(Test__StageParamsBase, AttentionComputeStage_DeviceMatchesParams)
     auto cuda0 = cudaDevice(0);
     AttentionComputeStage::Params params{.device_id = cuda0};
     AttentionComputeStage stage(params);
-    
+
     EXPECT_EQ(stage.device(), cuda0);
 }
 
@@ -357,7 +310,7 @@ TEST_F(Test__StageParamsBase, EmbeddingStage_DeviceMatchesParams)
     auto cuda1 = cudaDevice(1);
     EmbeddingStage::Params params{.device_id = cuda1};
     EmbeddingStage stage(params);
-    
+
     EXPECT_EQ(stage.device(), cuda1);
 }
 
@@ -366,7 +319,7 @@ TEST_F(Test__StageParamsBase, LMHeadStage_DeviceMatchesParams)
     auto cuda0 = cudaDevice(0);
     LMHeadStage::Params params{.device_id = cuda0};
     LMHeadStage stage(params);
-    
+
     EXPECT_EQ(stage.device(), cuda0);
 }
 
@@ -378,7 +331,7 @@ TEST_F(Test__StageParamsBase, AllreduceStage_DeviceMatchesParams)
     auto cuda0 = cudaDevice(0);
     AllreduceStage::Params params{.device_id = cuda0};
     AllreduceStage stage(params);
-    
+
     EXPECT_EQ(stage.device(), cuda0);
 }
 
@@ -387,7 +340,7 @@ TEST_F(Test__StageParamsBase, AllGatherStage_DeviceMatchesParams)
     auto cuda1 = cudaDevice(1);
     AllGatherStage::Params params{.device_id = cuda1};
     AllGatherStage stage(params);
-    
+
     EXPECT_EQ(stage.device(), cuda1);
 }
 
@@ -396,7 +349,7 @@ TEST_F(Test__StageParamsBase, MoERouterStage_DeviceMatchesParams)
     auto rocm0 = rocmDevice(0);
     MoERouterStage::Params params{.device_id = rocm0};
     MoERouterStage stage(params);
-    
+
     EXPECT_EQ(stage.device(), rocm0);
 }
 
@@ -405,7 +358,7 @@ TEST_F(Test__StageParamsBase, MoEExpertStage_DeviceMatchesParams)
     auto cuda2 = cudaDevice(2);
     MoEExpertStage::Params params{.device_id = cuda2};
     MoEExpertStage stage(params);
-    
+
     EXPECT_EQ(stage.device(), cuda2);
 }
 
@@ -414,7 +367,7 @@ TEST_F(Test__StageParamsBase, MoECombineStage_DeviceMatchesParams)
     auto rocm1 = rocmDevice(1);
     MoECombineStage::Params params{.device_id = rocm1};
     MoECombineStage stage(params);
-    
+
     EXPECT_EQ(stage.device(), rocm1);
 }
 
@@ -433,7 +386,7 @@ TEST_F(Test__StageParamsBase, GEMMStage_DefaultDeviceIsCPU)
         .n = 32,
         .k = 32};
     GEMMStage stage(params);
-    
+
     EXPECT_EQ(stage.device().type, DeviceType::CPU);
 }
 
@@ -444,18 +397,7 @@ TEST_F(Test__StageParamsBase, RMSNormStage_DefaultDeviceIsCPU)
         .output = nullptr,
         .gamma = nullptr};
     RMSNormStage stage(params);
-    
-    EXPECT_EQ(stage.device().type, DeviceType::CPU);
-}
 
-TEST_F(Test__StageParamsBase, SwiGLUStage_DefaultDeviceIsCPU)
-{
-    SwiGLUStage::Params params{
-        .gate = nullptr,
-        .up = nullptr,
-        .output = nullptr};
-    SwiGLUStage stage(params);
-    
     EXPECT_EQ(stage.device().type, DeviceType::CPU);
 }
 
@@ -471,7 +413,7 @@ TEST_F(Test__StageParamsBase, GEMMStage_MultiGPUDevicePropagation)
         auto cuda_i = cudaDevice(i);
         GEMMStage::Params params{.device_id = cuda_i};
         GEMMStage stage(params);
-        
+
         EXPECT_EQ(stage.device().type, DeviceType::CUDA);
         EXPECT_EQ(stage.device().ordinal, i);
     }
@@ -484,7 +426,7 @@ TEST_F(Test__StageParamsBase, RMSNormStage_MultiGPUDevicePropagation)
         auto rocm_i = rocmDevice(i);
         RMSNormStage::Params params{.device_id = rocm_i};
         RMSNormStage stage(params);
-        
+
         EXPECT_EQ(stage.device().type, DeviceType::ROCm);
         EXPECT_EQ(stage.device().ordinal, i);
     }
@@ -500,12 +442,11 @@ TEST_F(Test__StageParamsBase, AllParamsHaveDeviceIdField)
     static_assert(std::is_same_v<decltype(GEMMStage::Params::device_id), DeviceId>);
     static_assert(std::is_same_v<decltype(RMSNormStage::Params::device_id), DeviceId>);
     static_assert(std::is_same_v<decltype(RoPEStage::Params::device_id), DeviceId>);
-    static_assert(std::is_same_v<decltype(SwiGLUStage::Params::device_id), DeviceId>);
     static_assert(std::is_same_v<decltype(ResidualAddStage::Params::device_id), DeviceId>);
     static_assert(std::is_same_v<decltype(AttentionComputeStage::Params::device_id), DeviceId>);
     static_assert(std::is_same_v<decltype(AllreduceStage::Params::device_id), DeviceId>);
     static_assert(std::is_same_v<decltype(AllGatherStage::Params::device_id), DeviceId>);
-    
+
     // This test just needs to compile - if it compiles, the static_asserts passed
     SUCCEED();
 }
@@ -513,14 +454,13 @@ TEST_F(Test__StageParamsBase, AllParamsHaveDeviceIdField)
 TEST_F(Test__StageParamsBase, AllParamsHaveMpiCtxField)
 {
     // Test that mpi_ctx field exists and is of correct type
-    static_assert(std::is_same_v<decltype(GEMMStage::Params::mpi_ctx), const MPIContext*>);
-    static_assert(std::is_same_v<decltype(RMSNormStage::Params::mpi_ctx), const MPIContext*>);
-    static_assert(std::is_same_v<decltype(RoPEStage::Params::mpi_ctx), const MPIContext*>);
-    static_assert(std::is_same_v<decltype(SwiGLUStage::Params::mpi_ctx), const MPIContext*>);
-    static_assert(std::is_same_v<decltype(ResidualAddStage::Params::mpi_ctx), const MPIContext*>);
-    static_assert(std::is_same_v<decltype(AttentionComputeStage::Params::mpi_ctx), const MPIContext*>);
-    static_assert(std::is_same_v<decltype(AllreduceStage::Params::mpi_ctx), const MPIContext*>);
-    static_assert(std::is_same_v<decltype(AllGatherStage::Params::mpi_ctx), const MPIContext*>);
-    
+    static_assert(std::is_same_v<decltype(GEMMStage::Params::mpi_ctx), const MPIContext *>);
+    static_assert(std::is_same_v<decltype(RMSNormStage::Params::mpi_ctx), const MPIContext *>);
+    static_assert(std::is_same_v<decltype(RoPEStage::Params::mpi_ctx), const MPIContext *>);
+    static_assert(std::is_same_v<decltype(ResidualAddStage::Params::mpi_ctx), const MPIContext *>);
+    static_assert(std::is_same_v<decltype(AttentionComputeStage::Params::mpi_ctx), const MPIContext *>);
+    static_assert(std::is_same_v<decltype(AllreduceStage::Params::mpi_ctx), const MPIContext *>);
+    static_assert(std::is_same_v<decltype(AllGatherStage::Params::mpi_ctx), const MPIContext *>);
+
     SUCCEED();
 }

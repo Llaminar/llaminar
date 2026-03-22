@@ -215,6 +215,44 @@ protected:
 
         return std::chrono::duration<double, std::milli>(end - start).count();
     }
+
+    /**
+     * @brief Benchmark AVX512 two-block ILP variant
+     */
+    double benchmark_avx512_2block(float *input, Q8_1Block *output, size_t num_blocks)
+    {
+        // Warmup
+        for (size_t w = 0; w < WARMUP_ITERATIONS; ++w)
+        {
+            size_t i = 0;
+            for (; i + 1 < num_blocks; i += 2)
+            {
+                quantize_two_blocks_avx512(&input[i * BLOCK_SIZE], output[i], output[i + 1]);
+            }
+            if (i < num_blocks)
+            {
+                quantize_single_block_avx512(&input[i * BLOCK_SIZE], output[i]);
+            }
+        }
+
+        // Benchmark
+        auto start = std::chrono::high_resolution_clock::now();
+        for (size_t iter = 0; iter < BENCHMARK_ITERATIONS; ++iter)
+        {
+            size_t i = 0;
+            for (; i + 1 < num_blocks; i += 2)
+            {
+                quantize_two_blocks_avx512(&input[i * BLOCK_SIZE], output[i], output[i + 1]);
+            }
+            if (i < num_blocks)
+            {
+                quantize_single_block_avx512(&input[i * BLOCK_SIZE], output[i]);
+            }
+        }
+        auto end = std::chrono::high_resolution_clock::now();
+
+        return std::chrono::duration<double, std::milli>(end - start).count();
+    }
 #endif
 
     /**
@@ -256,6 +294,12 @@ protected:
         {
             double elapsed = benchmark_avx512(input, output.data(), num_blocks);
             print_result("AVX512", input_bytes, output_bytes, elapsed, BENCHMARK_ITERATIONS);
+        }
+
+        // AVX512 2-block ILP benchmark
+        {
+            double elapsed = benchmark_avx512_2block(input, output.data(), num_blocks);
+            print_result("AVX512-2blk", input_bytes, output_bytes, elapsed, BENCHMARK_ITERATIONS);
         }
 #endif
 
@@ -434,6 +478,35 @@ TEST_F(Q8_1_QuantizeSIMD_Perf, PerBlockLatency)
         double elements_per_cycle = (BLOCK_SIZE * 3.0) / ns_per_block;
 
         std::cout << "│ " << std::setw(14) << std::left << "AVX512"
+                  << " │ " << std::setw(20) << std::right << std::fixed << std::setprecision(2) << ns_per_block
+                  << " │ " << std::setw(11) << std::right << std::fixed << std::setprecision(2) << blocks_per_us
+                  << " │ " << std::setw(17) << std::right << std::fixed << std::setprecision(2) << elements_per_cycle
+                  << " │" << std::endl;
+    }
+
+    // AVX512 2-block ILP
+    {
+        auto start = std::chrono::high_resolution_clock::now();
+        for (size_t iter = 0; iter < LATENCY_ITERATIONS; ++iter)
+        {
+            size_t i = 0;
+            for (; i + 1 < NUM_BLOCKS; i += 2)
+            {
+                quantize_two_blocks_avx512(&input[i * BLOCK_SIZE], output[i], output[i + 1]);
+            }
+            if (i < NUM_BLOCKS)
+            {
+                quantize_single_block_avx512(&input[i * BLOCK_SIZE], output[i]);
+            }
+        }
+        auto end = std::chrono::high_resolution_clock::now();
+
+        double total_ns = std::chrono::duration<double, std::nano>(end - start).count();
+        double ns_per_block = total_ns / (NUM_BLOCKS * LATENCY_ITERATIONS);
+        double blocks_per_us = 1000.0 / ns_per_block;
+        double elements_per_cycle = (BLOCK_SIZE * 3.0) / ns_per_block;
+
+        std::cout << "│ " << std::setw(14) << std::left << "AVX512-2blk"
                   << " │ " << std::setw(20) << std::right << std::fixed << std::setprecision(2) << ns_per_block
                   << " │ " << std::setw(11) << std::right << std::fixed << std::setprecision(2) << blocks_per_us
                   << " │ " << std::setw(17) << std::right << std::fixed << std::setprecision(2) << elements_per_cycle

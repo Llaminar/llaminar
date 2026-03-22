@@ -285,17 +285,16 @@ TEST_F(Test__MPI_ColumnParallelFFN, GateProjectionLocalOutput)
                                        DeviceId::cpu());
     ASSERT_NE(output, nullptr);
 
-    // Use KernelFactory for sliced tensor GEMM
+    // Use KernelFactory for sliced tensor GEMM (tensor interface)
     auto *gemm = getPreparedKernel(gate_weight.get(), DeviceId::cpu());
     ASSERT_NE(gemm, nullptr);
 
-    bool success = gemm->multiply(
-        input->data(),
-        output->mutable_data(),
+    bool success = gemm->multiply_tensor(
+        input.get(),
+        output.get(),
         seq_len,    // m
         d_ff_local, // n (local output dimension)
-        D_MODEL,    // k
-        1.0f, 0.0f);
+        D_MODEL);   // k
     EXPECT_TRUE(success) << "Gate GEMM failed";
 
     // Verify output has expected shape

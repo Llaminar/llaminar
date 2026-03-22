@@ -162,7 +162,7 @@ namespace llaminar2::cpu::native_vnni
         const int8_t *lut_data;
         switch (codebook_id)
         {
-        case 4:  // IQ4_NL / IQ4_XS (both use kvalues_iq4nl LUT)
+        case 4: // IQ4_NL / IQ4_XS (both use kvalues_iq4nl LUT)
             lut_data = IQ4_NL_DECODE_LUT;
             break;
         case 5: // Q4_1
@@ -471,16 +471,23 @@ namespace llaminar2::cpu::native_vnni
                              _MM_HINT_T1);
             }
 
-            if (use_nibble_lut)
-                gemv_native_vnni_avx512_chunk_native(packed, A_q8, C + n_start, chunk, 0, K_blocks, decode_lut);
-            else
-                gemv_native_vnni_avx512_chunk_int8(packed, A_q8, C + n_start, chunk, 0, K_blocks);
-
-            // Mask out padding columns in tail chunk
             if (n_cols < 64)
             {
-                for (int i = n_cols; i < 64; ++i)
-                    C[n_start + i] = 0.0f;
+                // Tail chunk: kernel writes 64 floats, but only n_cols are valid.
+                // Use a temp buffer to avoid overflowing the caller's C buffer.
+                alignas(64) float tmp[64];
+                if (use_nibble_lut)
+                    gemv_native_vnni_avx512_chunk_native(packed, A_q8, tmp, chunk, 0, K_blocks, decode_lut);
+                else
+                    gemv_native_vnni_avx512_chunk_int8(packed, A_q8, tmp, chunk, 0, K_blocks);
+                std::memcpy(C + n_start, tmp, n_cols * sizeof(float));
+            }
+            else
+            {
+                if (use_nibble_lut)
+                    gemv_native_vnni_avx512_chunk_native(packed, A_q8, C + n_start, chunk, 0, K_blocks, decode_lut);
+                else
+                    gemv_native_vnni_avx512_chunk_int8(packed, A_q8, C + n_start, chunk, 0, K_blocks);
             }
         }
     }
@@ -488,63 +495,44 @@ namespace llaminar2::cpu::native_vnni
 #endif // __AVX512F__ && __AVX512VNNI__ && __AVX512BW__
 
     // =========================================================================
-    // Full GEMV dispatcher (M=1) with cache-aware tiling
+    // Pre-quantized GEMV (M=1) — compute only, skips quantization
+    // =========================================================================
+    //
+    // Caller is responsible for providing pre-quantized Q8_1 blocks.
+    // Used by multiply_fused() to avoid redundant quantization when
+    // the same input is projected through multiple weight matrices.
     // =========================================================================
 
-    inline void gemv_native_vnni(
+    inline void gemv_native_vnni_preq(
         const CPUNativeVNNIPackedWeights &packed,
-        const float *A_fp32,
+        const Q8_1Block *A_q8,
         float *C)
     {
         const int N = packed.N;
         const int K = packed.K;
         const int K_blocks = packed.blocks_per_row;
         const int N_chunks = (N + 63) / 64;
-        const int N_padded = N_chunks * 64;
 
-        // Step 1: Quantize activations to Q8_1 (thread-local buffer avoids heap alloc per call)
-        thread_local std::vector<Q8_1Block> A_q8_tls;
-        if (static_cast<int>(A_q8_tls.size()) < K_blocks)
-            A_q8_tls.resize(K_blocks);
-        Q8_1Block *A_q8 = A_q8_tls.data();
-        for (int kb = 0; kb < K_blocks; ++kb)
-        {
-            int block_start = kb * 32;
-            int block_len = std::min(32, K - block_start);
-            simd::quantize_single_block(A_fp32 + block_start, A_q8[kb], block_len);
-        }
-
-        // Step 2: Compute tile configuration
+        // Compute tile configuration
         int num_threads = omp_get_max_threads();
         NativeVNNITileConfig cfg = computeTileConfig(N, K, 1, packed.payload_bytes, num_threads);
 
 #if defined(__AVX512F__) && defined(__AVX512VNNI__) && defined(__AVX512BW__)
-        // Build decode LUT once (only used for nibble-LUT formats, but harmless otherwise)
         __m512i decode_lut = packed.is_nibble_lut
                                  ? build_decode_lut(packed.codebook_id)
                                  : _mm512_setzero_si512();
 #endif
 
-        // Step 3: K-parallel GEMV when N-parallelism is insufficient.
-        // Creates a 2D task grid (chunk, k_tile) so more threads participate.
-        // Each thread computes partial sums over a K-block range, then a
-        // vectorized reduction phase combines them.
+        // K-parallel GEMV when N-parallelism is insufficient
         if (cfg.k_tiles > 1)
         {
             int k_tiles = cfg.k_tiles;
             int k_blocks_per_tile = (K_blocks + k_tiles - 1) / k_tiles;
-
-            // Partial sums buffer: [N_chunks][k_tiles][64] layout
-            // Each (chunk, k_tile) writes a contiguous 64-float block.
-            // Reduction reads k_tiles × 64 = contiguous per chunk → cache-friendly.
-            // No zero-init needed: each slot is fully written by Phase 1 before Phase 2 reads it.
             std::vector<float> partial_sums(static_cast<size_t>(N_chunks) * k_tiles * 64);
 
             auto do_gemv_kpar = [&]()
             {
                 int total_2d = N_chunks * k_tiles;
-
-                // Phase 1: parallel over (chunk, k_tile) 2D grid
 #pragma omp for schedule(static)
                 for (int task = 0; task < total_2d; ++task)
                 {
@@ -554,24 +542,19 @@ namespace llaminar2::cpu::native_vnni
                     int kb_end = std::min(kb_start + k_blocks_per_tile, K_blocks);
                     float *dest = partial_sums.data() +
                                   (static_cast<size_t>(chunk_idx) * k_tiles + kt) * 64;
-
 #if defined(__AVX512F__) && defined(__AVX512VNNI__) && defined(__AVX512BW__)
                     if (packed.is_nibble_lut)
                         gemv_native_vnni_avx512_chunk_native(packed, A_q8, dest,
-                                                              chunk_idx, kb_start, kb_end, decode_lut);
+                                                             chunk_idx, kb_start, kb_end, decode_lut);
                     else
                         gemv_native_vnni_avx512_chunk_int8(packed, A_q8, dest,
-                                                            chunk_idx, kb_start, kb_end);
+                                                           chunk_idx, kb_start, kb_end);
 #else
                     int n_cols = std::min(64, N - chunk_idx * 64);
-                    // Scalar fallback: compute partial K-range
                     gemv_native_vnni_scalar(packed, A_q8, dest, n_cols, K_blocks);
-                    // Note: scalar path doesn't support K-range; falls back to full K
 #endif
                 }
-                // implicit barrier
 
-                // Phase 2: vectorized reduction of partial sums into C
 #pragma omp for schedule(static)
                 for (int chunk_idx = 0; chunk_idx < N_chunks; ++chunk_idx)
                 {
@@ -579,9 +562,7 @@ namespace llaminar2::cpu::native_vnni
                     int n_cols = std::min(64, N - n_start);
                     const float *base = partial_sums.data() +
                                         static_cast<size_t>(chunk_idx) * k_tiles * 64;
-
 #if defined(__AVX512F__)
-                    // Sum k_tiles partial vectors using AVX-512 (4 ZMM accumulators × 16 floats = 64)
                     __m512 sum0 = _mm512_loadu_ps(base);
                     __m512 sum1 = _mm512_loadu_ps(base + 16);
                     __m512 sum2 = _mm512_loadu_ps(base + 32);
@@ -594,26 +575,31 @@ namespace llaminar2::cpu::native_vnni
                         sum2 = _mm512_add_ps(sum2, _mm512_loadu_ps(src + 32));
                         sum3 = _mm512_add_ps(sum3, _mm512_loadu_ps(src + 48));
                     }
-                    _mm512_storeu_ps(C + n_start, sum0);
-                    _mm512_storeu_ps(C + n_start + 16, sum1);
-                    _mm512_storeu_ps(C + n_start + 32, sum2);
-                    _mm512_storeu_ps(C + n_start + 48, sum3);
+                    if (n_cols < 64)
+                    {
+                        alignas(64) float tmp[64];
+                        _mm512_store_ps(tmp, sum0);
+                        _mm512_store_ps(tmp + 16, sum1);
+                        _mm512_store_ps(tmp + 32, sum2);
+                        _mm512_store_ps(tmp + 48, sum3);
+                        std::memcpy(C + n_start, tmp, n_cols * sizeof(float));
+                    }
+                    else
+                    {
+                        _mm512_storeu_ps(C + n_start, sum0);
+                        _mm512_storeu_ps(C + n_start + 16, sum1);
+                        _mm512_storeu_ps(C + n_start + 32, sum2);
+                        _mm512_storeu_ps(C + n_start + 48, sum3);
+                    }
 #else
-                    for (int j = 0; j < 64; ++j)
+                    for (int j = 0; j < n_cols; ++j)
                     {
                         float sum = base[j];
                         for (int kt = 1; kt < k_tiles; ++kt)
                             sum += base[kt * 64 + j];
-                        if (j < n_cols)
-                            C[n_start + j] = sum;
+                        C[n_start + j] = sum;
                     }
 #endif
-                    // Zero out padding columns in tail chunk
-                    if (n_cols < 64)
-                    {
-                        for (int i = n_cols; i < 64; ++i)
-                            C[n_start + i] = 0.0f;
-                    }
                 }
             };
 
@@ -621,24 +607,21 @@ namespace llaminar2::cpu::native_vnni
             return;
         }
 
-        // Step 3b: Standard N-parallel GEMV (when N-parallelism is sufficient)
+        // Standard N-parallel GEMV
         auto do_gemv = [&]()
         {
             int n_block_chunks = cfg.n_block_chunks;
             int total_blocks = (N_chunks + n_block_chunks - 1) / n_block_chunks;
-
 #pragma omp for schedule(static)
             for (int block_idx = 0; block_idx < total_blocks; ++block_idx)
             {
                 int chunk_start = block_idx * n_block_chunks;
                 int chunk_count = std::min(n_block_chunks, N_chunks - chunk_start);
-
 #if defined(__AVX512F__) && defined(__AVX512VNNI__) && defined(__AVX512BW__)
                 gemv_native_vnni_avx512_block(packed, A_q8, C,
-                                               chunk_start, chunk_count, K_blocks, N,
-                                               decode_lut);
+                                              chunk_start, chunk_count, K_blocks, N,
+                                              decode_lut);
 #else
-                // Scalar fallback
                 for (int ci = 0; ci < chunk_count; ++ci)
                 {
                     int chunk = chunk_start + ci;
@@ -654,7 +637,659 @@ namespace llaminar2::cpu::native_vnni
     }
 
     // =========================================================================
-    // Full GEMM dispatcher (M>1) with cache-aware tiling
+    // Full GEMV dispatcher (M=1) with cache-aware tiling
+    // =========================================================================
+
+    inline void gemv_native_vnni(
+        const CPUNativeVNNIPackedWeights &packed,
+        const float *A_fp32,
+        float *C)
+    {
+        const int K = packed.K;
+        const int K_blocks = packed.blocks_per_row;
+
+        // Step 1: Quantize activations to Q8_1 (thread-local buffer avoids heap alloc per call)
+        thread_local std::vector<Q8_1Block> A_q8_tls;
+        if (static_cast<int>(A_q8_tls.size()) < K_blocks)
+            A_q8_tls.resize(K_blocks);
+        Q8_1Block *A_q8 = A_q8_tls.data();
+
+        // Process blocks in pairs for 2-way ILP (AVX-512)
+        const bool k_aligned = (K % 32 == 0);
+        int kb = 0;
+#if defined(__AVX512F__)
+        if (k_aligned)
+        {
+            for (; kb + 1 < K_blocks; kb += 2)
+            {
+                simd::quantize_two_blocks_avx512(A_fp32 + kb * 32, A_q8[kb], A_q8[kb + 1]);
+            }
+        }
+#endif
+        for (; kb < K_blocks; ++kb)
+        {
+            int block_start = kb * 32;
+            int block_len = std::min(32, K - block_start);
+            simd::quantize_single_block(A_fp32 + block_start, A_q8[kb], block_len);
+        }
+
+        // Step 2+: Delegate to pre-quantized compute path
+        gemv_native_vnni_preq(packed, A_q8, C);
+    }
+
+    // =========================================================================
+    // 2-Row GEMM Microkernels (share B loads across 2 M rows)
+    // =========================================================================
+    //
+    // The key optimization for M>1 GEMM: load each B weight block once and
+    // compute dot products for 2 rows simultaneously. This doubles the
+    // compute-to-load ratio vs row-by-row GEMV.
+    //
+    // Register layout per 64-col chunk (2 rows):
+    //   Row 0: fp_acc0..fp_acc3 (4 × __m512, 64 FP32 accumulators)
+    //   Row 1: fp_acc4..fp_acc7 (4 × __m512, 64 FP32 accumulators)
+    //   B data: loaded once, used for both rows
+    //   A broadcasts: separate per row (different activation values)
+    // =========================================================================
+
+#if defined(__AVX512F__) && defined(__AVX512VNNI__) && defined(__AVX512BW__)
+
+    /**
+     * @brief 2-row nibble-LUT GEMM microkernel for one 64-col chunk.
+     *
+     * Processes rows m0 and m1 simultaneously, sharing B loads.
+     * Accumulates partial results for a K-block range [kb_start, kb_end).
+     * Caller must add results to existing C values when K-tiling.
+     */
+    inline void gemm_2row_native_chunk(
+        const CPUNativeVNNIPackedWeights &packed,
+        const Q8_1Block *A_q8_row0,
+        const Q8_1Block *A_q8_row1,
+        float *C_row0,
+        float *C_row1,
+        int chunk,
+        int kb_start,
+        int kb_end,
+        const __m512i decode_lut,
+        bool accumulate)
+    {
+        __m512 fp0_0 = accumulate ? _mm512_loadu_ps(C_row0) : _mm512_setzero_ps();
+        __m512 fp0_1 = accumulate ? _mm512_loadu_ps(C_row0 + 16) : _mm512_setzero_ps();
+        __m512 fp0_2 = accumulate ? _mm512_loadu_ps(C_row0 + 32) : _mm512_setzero_ps();
+        __m512 fp0_3 = accumulate ? _mm512_loadu_ps(C_row0 + 48) : _mm512_setzero_ps();
+        __m512 fp1_0 = accumulate ? _mm512_loadu_ps(C_row1) : _mm512_setzero_ps();
+        __m512 fp1_1 = accumulate ? _mm512_loadu_ps(C_row1 + 16) : _mm512_setzero_ps();
+        __m512 fp1_2 = accumulate ? _mm512_loadu_ps(C_row1 + 32) : _mm512_setzero_ps();
+        __m512 fp1_3 = accumulate ? _mm512_loadu_ps(C_row1 + 48) : _mm512_setzero_ps();
+
+        const __m512i bias_128_i32 = _mm512_set1_epi32(128);
+        const __m512i mask_0F = _mm512_set1_epi8(0x0F);
+
+        for (int kb = kb_start; kb < kb_end; ++kb)
+        {
+            const Q8_1Block &a0 = A_q8_row0[kb];
+            const Q8_1Block &a1 = A_q8_row1[kb];
+            float a0_scale = simd::fp16_to_fp32(a0.d);
+            float a1_scale = simd::fp16_to_fp32(a1.d);
+
+            __m512i ia0_0 = _mm512_setzero_si512(), ia0_1 = _mm512_setzero_si512();
+            __m512i ia0_2 = _mm512_setzero_si512(), ia0_3 = _mm512_setzero_si512();
+            __m512i ia1_0 = _mm512_setzero_si512(), ia1_1 = _mm512_setzero_si512();
+            __m512i ia1_2 = _mm512_setzero_si512(), ia1_3 = _mm512_setzero_si512();
+
+            for (int group = 0; group < 4; ++group)
+            {
+                // Load B once — shared across both rows
+                __m512i raw0 = _mm512_load_si512(packed.interleavedB(chunk, kb, group, 0));
+                __m512i raw1 = _mm512_load_si512(packed.interleavedB(chunk, kb, group, 1));
+                __m512i raw2 = _mm512_load_si512(packed.interleavedB(chunk, kb, group, 2));
+                __m512i raw3 = _mm512_load_si512(packed.interleavedB(chunk, kb, group, 3));
+
+                // Decode nibbles — shared across rows
+                __m512i lo0 = _mm512_shuffle_epi8(decode_lut, _mm512_and_si512(raw0, mask_0F));
+                __m512i lo1 = _mm512_shuffle_epi8(decode_lut, _mm512_and_si512(raw1, mask_0F));
+                __m512i lo2 = _mm512_shuffle_epi8(decode_lut, _mm512_and_si512(raw2, mask_0F));
+                __m512i lo3 = _mm512_shuffle_epi8(decode_lut, _mm512_and_si512(raw3, mask_0F));
+
+                __m512i hi0 = _mm512_shuffle_epi8(decode_lut, _mm512_and_si512(_mm512_srli_epi16(raw0, 4), mask_0F));
+                __m512i hi1 = _mm512_shuffle_epi8(decode_lut, _mm512_and_si512(_mm512_srli_epi16(raw1, 4), mask_0F));
+                __m512i hi2 = _mm512_shuffle_epi8(decode_lut, _mm512_and_si512(_mm512_srli_epi16(raw2, 4), mask_0F));
+                __m512i hi3 = _mm512_shuffle_epi8(decode_lut, _mm512_and_si512(_mm512_srli_epi16(raw3, 4), mask_0F));
+
+                // Row 0 A broadcasts + VPDPBUSD
+                {
+                    uint8_t vals[4];
+                    vals[0] = static_cast<uint8_t>(static_cast<int16_t>(a0.qs[group * 4 + 0]) + 128);
+                    vals[1] = static_cast<uint8_t>(static_cast<int16_t>(a0.qs[group * 4 + 1]) + 128);
+                    vals[2] = static_cast<uint8_t>(static_cast<int16_t>(a0.qs[group * 4 + 2]) + 128);
+                    vals[3] = static_cast<uint8_t>(static_cast<int16_t>(a0.qs[group * 4 + 3]) + 128);
+                    int32_t v;
+                    std::memcpy(&v, vals, 4);
+                    __m512i ab = _mm512_set1_epi32(v);
+                    ia0_0 = _mm512_dpbusd_epi32(ia0_0, ab, lo0);
+                    ia0_1 = _mm512_dpbusd_epi32(ia0_1, ab, lo1);
+                    ia0_2 = _mm512_dpbusd_epi32(ia0_2, ab, lo2);
+                    ia0_3 = _mm512_dpbusd_epi32(ia0_3, ab, lo3);
+
+                    vals[0] = static_cast<uint8_t>(static_cast<int16_t>(a0.qs[group * 4 + 16]) + 128);
+                    vals[1] = static_cast<uint8_t>(static_cast<int16_t>(a0.qs[group * 4 + 17]) + 128);
+                    vals[2] = static_cast<uint8_t>(static_cast<int16_t>(a0.qs[group * 4 + 18]) + 128);
+                    vals[3] = static_cast<uint8_t>(static_cast<int16_t>(a0.qs[group * 4 + 19]) + 128);
+                    std::memcpy(&v, vals, 4);
+                    ab = _mm512_set1_epi32(v);
+                    ia0_0 = _mm512_dpbusd_epi32(ia0_0, ab, hi0);
+                    ia0_1 = _mm512_dpbusd_epi32(ia0_1, ab, hi1);
+                    ia0_2 = _mm512_dpbusd_epi32(ia0_2, ab, hi2);
+                    ia0_3 = _mm512_dpbusd_epi32(ia0_3, ab, hi3);
+                }
+
+                // Row 1 A broadcasts + VPDPBUSD (same B data, different A)
+                {
+                    uint8_t vals[4];
+                    vals[0] = static_cast<uint8_t>(static_cast<int16_t>(a1.qs[group * 4 + 0]) + 128);
+                    vals[1] = static_cast<uint8_t>(static_cast<int16_t>(a1.qs[group * 4 + 1]) + 128);
+                    vals[2] = static_cast<uint8_t>(static_cast<int16_t>(a1.qs[group * 4 + 2]) + 128);
+                    vals[3] = static_cast<uint8_t>(static_cast<int16_t>(a1.qs[group * 4 + 3]) + 128);
+                    int32_t v;
+                    std::memcpy(&v, vals, 4);
+                    __m512i ab = _mm512_set1_epi32(v);
+                    ia1_0 = _mm512_dpbusd_epi32(ia1_0, ab, lo0);
+                    ia1_1 = _mm512_dpbusd_epi32(ia1_1, ab, lo1);
+                    ia1_2 = _mm512_dpbusd_epi32(ia1_2, ab, lo2);
+                    ia1_3 = _mm512_dpbusd_epi32(ia1_3, ab, lo3);
+
+                    vals[0] = static_cast<uint8_t>(static_cast<int16_t>(a1.qs[group * 4 + 16]) + 128);
+                    vals[1] = static_cast<uint8_t>(static_cast<int16_t>(a1.qs[group * 4 + 17]) + 128);
+                    vals[2] = static_cast<uint8_t>(static_cast<int16_t>(a1.qs[group * 4 + 18]) + 128);
+                    vals[3] = static_cast<uint8_t>(static_cast<int16_t>(a1.qs[group * 4 + 19]) + 128);
+                    std::memcpy(&v, vals, 4);
+                    ab = _mm512_set1_epi32(v);
+                    ia1_0 = _mm512_dpbusd_epi32(ia1_0, ab, hi0);
+                    ia1_1 = _mm512_dpbusd_epi32(ia1_1, ab, hi1);
+                    ia1_2 = _mm512_dpbusd_epi32(ia1_2, ab, hi2);
+                    ia1_3 = _mm512_dpbusd_epi32(ia1_3, ab, hi3);
+                }
+            }
+
+            // Bias correction + scale (shared comp/scales loads, per-row a_scale)
+            const int16_t *comp_ptr = packed.chunkComp(chunk, kb);
+            __m512i c0 = _mm512_cvtepi16_epi32(_mm256_load_si256(reinterpret_cast<const __m256i *>(comp_ptr)));
+            __m512i c1 = _mm512_cvtepi16_epi32(_mm256_load_si256(reinterpret_cast<const __m256i *>(comp_ptr + 16)));
+            __m512i c2 = _mm512_cvtepi16_epi32(_mm256_load_si256(reinterpret_cast<const __m256i *>(comp_ptr + 32)));
+            __m512i c3 = _mm512_cvtepi16_epi32(_mm256_load_si256(reinterpret_cast<const __m256i *>(comp_ptr + 48)));
+
+            __m512i bias_c0 = _mm512_mullo_epi32(bias_128_i32, c0);
+            __m512i bias_c1 = _mm512_mullo_epi32(bias_128_i32, c1);
+            __m512i bias_c2 = _mm512_mullo_epi32(bias_128_i32, c2);
+            __m512i bias_c3 = _mm512_mullo_epi32(bias_128_i32, c3);
+
+            ia0_0 = _mm512_sub_epi32(ia0_0, bias_c0);
+            ia0_1 = _mm512_sub_epi32(ia0_1, bias_c1);
+            ia0_2 = _mm512_sub_epi32(ia0_2, bias_c2);
+            ia0_3 = _mm512_sub_epi32(ia0_3, bias_c3);
+            ia1_0 = _mm512_sub_epi32(ia1_0, bias_c0);
+            ia1_1 = _mm512_sub_epi32(ia1_1, bias_c1);
+            ia1_2 = _mm512_sub_epi32(ia1_2, bias_c2);
+            ia1_3 = _mm512_sub_epi32(ia1_3, bias_c3);
+
+            const uint16_t *b_scales = packed.chunkScales(chunk, kb);
+            __m512 bs0 = _mm512_cvtph_ps(_mm256_load_si256(reinterpret_cast<const __m256i *>(b_scales)));
+            __m512 bs1 = _mm512_cvtph_ps(_mm256_load_si256(reinterpret_cast<const __m256i *>(b_scales + 16)));
+            __m512 bs2 = _mm512_cvtph_ps(_mm256_load_si256(reinterpret_cast<const __m256i *>(b_scales + 32)));
+            __m512 bs3 = _mm512_cvtph_ps(_mm256_load_si256(reinterpret_cast<const __m256i *>(b_scales + 48)));
+
+            __m512 as0 = _mm512_set1_ps(a0_scale);
+            __m512 cs0_0 = _mm512_mul_ps(as0, bs0), cs0_1 = _mm512_mul_ps(as0, bs1);
+            __m512 cs0_2 = _mm512_mul_ps(as0, bs2), cs0_3 = _mm512_mul_ps(as0, bs3);
+            fp0_0 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(ia0_0), cs0_0, fp0_0);
+            fp0_1 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(ia0_1), cs0_1, fp0_1);
+            fp0_2 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(ia0_2), cs0_2, fp0_2);
+            fp0_3 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(ia0_3), cs0_3, fp0_3);
+
+            __m512 as1 = _mm512_set1_ps(a1_scale);
+            __m512 cs1_0 = _mm512_mul_ps(as1, bs0), cs1_1 = _mm512_mul_ps(as1, bs1);
+            __m512 cs1_2 = _mm512_mul_ps(as1, bs2), cs1_3 = _mm512_mul_ps(as1, bs3);
+            fp1_0 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(ia1_0), cs1_0, fp1_0);
+            fp1_1 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(ia1_1), cs1_1, fp1_1);
+            fp1_2 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(ia1_2), cs1_2, fp1_2);
+            fp1_3 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(ia1_3), cs1_3, fp1_3);
+
+            if (packed.is_asymmetric)
+            {
+                const uint16_t *b_mins = packed.chunkMins(chunk, kb);
+                __m512 bm0 = _mm512_cvtph_ps(_mm256_load_si256(reinterpret_cast<const __m256i *>(b_mins)));
+                __m512 bm1 = _mm512_cvtph_ps(_mm256_load_si256(reinterpret_cast<const __m256i *>(b_mins + 16)));
+                __m512 bm2 = _mm512_cvtph_ps(_mm256_load_si256(reinterpret_cast<const __m256i *>(b_mins + 32)));
+                __m512 bm3 = _mm512_cvtph_ps(_mm256_load_si256(reinterpret_cast<const __m256i *>(b_mins + 48)));
+
+                __m512 corr0 = _mm512_set1_ps(static_cast<float>(a0.sum_qs) * a0_scale);
+                fp0_0 = _mm512_fmadd_ps(corr0, bm0, fp0_0);
+                fp0_1 = _mm512_fmadd_ps(corr0, bm1, fp0_1);
+                fp0_2 = _mm512_fmadd_ps(corr0, bm2, fp0_2);
+                fp0_3 = _mm512_fmadd_ps(corr0, bm3, fp0_3);
+
+                __m512 corr1 = _mm512_set1_ps(static_cast<float>(a1.sum_qs) * a1_scale);
+                fp1_0 = _mm512_fmadd_ps(corr1, bm0, fp1_0);
+                fp1_1 = _mm512_fmadd_ps(corr1, bm1, fp1_1);
+                fp1_2 = _mm512_fmadd_ps(corr1, bm2, fp1_2);
+                fp1_3 = _mm512_fmadd_ps(corr1, bm3, fp1_3);
+            }
+        }
+
+        _mm512_storeu_ps(C_row0, fp0_0);
+        _mm512_storeu_ps(C_row0 + 16, fp0_1);
+        _mm512_storeu_ps(C_row0 + 32, fp0_2);
+        _mm512_storeu_ps(C_row0 + 48, fp0_3);
+        _mm512_storeu_ps(C_row1, fp1_0);
+        _mm512_storeu_ps(C_row1 + 16, fp1_1);
+        _mm512_storeu_ps(C_row1 + 32, fp1_2);
+        _mm512_storeu_ps(C_row1 + 48, fp1_3);
+    }
+
+    /**
+     * @brief 2-row INT8 pre-decoded GEMM microkernel for one 64-col chunk.
+     */
+    inline void gemm_2row_int8_chunk(
+        const CPUNativeVNNIPackedWeights &packed,
+        const Q8_1Block *A_q8_row0,
+        const Q8_1Block *A_q8_row1,
+        float *C_row0,
+        float *C_row1,
+        int chunk,
+        int kb_start,
+        int kb_end,
+        bool accumulate)
+    {
+        __m512 fp0_0 = accumulate ? _mm512_loadu_ps(C_row0) : _mm512_setzero_ps();
+        __m512 fp0_1 = accumulate ? _mm512_loadu_ps(C_row0 + 16) : _mm512_setzero_ps();
+        __m512 fp0_2 = accumulate ? _mm512_loadu_ps(C_row0 + 32) : _mm512_setzero_ps();
+        __m512 fp0_3 = accumulate ? _mm512_loadu_ps(C_row0 + 48) : _mm512_setzero_ps();
+        __m512 fp1_0 = accumulate ? _mm512_loadu_ps(C_row1) : _mm512_setzero_ps();
+        __m512 fp1_1 = accumulate ? _mm512_loadu_ps(C_row1 + 16) : _mm512_setzero_ps();
+        __m512 fp1_2 = accumulate ? _mm512_loadu_ps(C_row1 + 32) : _mm512_setzero_ps();
+        __m512 fp1_3 = accumulate ? _mm512_loadu_ps(C_row1 + 48) : _mm512_setzero_ps();
+
+        const __m512i bias_128_i32 = _mm512_set1_epi32(128);
+
+        for (int kb = kb_start; kb < kb_end; ++kb)
+        {
+            const Q8_1Block &a0 = A_q8_row0[kb];
+            const Q8_1Block &a1 = A_q8_row1[kb];
+            float a0_scale = simd::fp16_to_fp32(a0.d);
+            float a1_scale = simd::fp16_to_fp32(a1.d);
+
+            __m512i ia0_0 = _mm512_setzero_si512(), ia0_1 = _mm512_setzero_si512();
+            __m512i ia0_2 = _mm512_setzero_si512(), ia0_3 = _mm512_setzero_si512();
+            __m512i ia1_0 = _mm512_setzero_si512(), ia1_1 = _mm512_setzero_si512();
+            __m512i ia1_2 = _mm512_setzero_si512(), ia1_3 = _mm512_setzero_si512();
+
+            for (int group = 0; group < 8; ++group)
+            {
+                // Load B once — shared
+                __m512i b0 = _mm512_load_si512(packed.interleavedB(chunk, kb, group, 0));
+                __m512i b1 = _mm512_load_si512(packed.interleavedB(chunk, kb, group, 1));
+                __m512i b2 = _mm512_load_si512(packed.interleavedB(chunk, kb, group, 2));
+                __m512i b3 = _mm512_load_si512(packed.interleavedB(chunk, kb, group, 3));
+
+                // Row 0
+                {
+                    uint8_t vals[4];
+                    vals[0] = static_cast<uint8_t>(static_cast<int16_t>(a0.qs[group * 4 + 0]) + 128);
+                    vals[1] = static_cast<uint8_t>(static_cast<int16_t>(a0.qs[group * 4 + 1]) + 128);
+                    vals[2] = static_cast<uint8_t>(static_cast<int16_t>(a0.qs[group * 4 + 2]) + 128);
+                    vals[3] = static_cast<uint8_t>(static_cast<int16_t>(a0.qs[group * 4 + 3]) + 128);
+                    int32_t v;
+                    std::memcpy(&v, vals, 4);
+                    __m512i ab = _mm512_set1_epi32(v);
+                    ia0_0 = _mm512_dpbusd_epi32(ia0_0, ab, b0);
+                    ia0_1 = _mm512_dpbusd_epi32(ia0_1, ab, b1);
+                    ia0_2 = _mm512_dpbusd_epi32(ia0_2, ab, b2);
+                    ia0_3 = _mm512_dpbusd_epi32(ia0_3, ab, b3);
+                }
+
+                // Row 1
+                {
+                    uint8_t vals[4];
+                    vals[0] = static_cast<uint8_t>(static_cast<int16_t>(a1.qs[group * 4 + 0]) + 128);
+                    vals[1] = static_cast<uint8_t>(static_cast<int16_t>(a1.qs[group * 4 + 1]) + 128);
+                    vals[2] = static_cast<uint8_t>(static_cast<int16_t>(a1.qs[group * 4 + 2]) + 128);
+                    vals[3] = static_cast<uint8_t>(static_cast<int16_t>(a1.qs[group * 4 + 3]) + 128);
+                    int32_t v;
+                    std::memcpy(&v, vals, 4);
+                    __m512i ab = _mm512_set1_epi32(v);
+                    ia1_0 = _mm512_dpbusd_epi32(ia1_0, ab, b0);
+                    ia1_1 = _mm512_dpbusd_epi32(ia1_1, ab, b1);
+                    ia1_2 = _mm512_dpbusd_epi32(ia1_2, ab, b2);
+                    ia1_3 = _mm512_dpbusd_epi32(ia1_3, ab, b3);
+                }
+            }
+
+            // Bias correction (shared comp loads)
+            const int16_t *comp_ptr = packed.chunkComp(chunk, kb);
+            __m512i cc0 = _mm512_cvtepi16_epi32(_mm256_load_si256(reinterpret_cast<const __m256i *>(comp_ptr)));
+            __m512i cc1 = _mm512_cvtepi16_epi32(_mm256_load_si256(reinterpret_cast<const __m256i *>(comp_ptr + 16)));
+            __m512i cc2 = _mm512_cvtepi16_epi32(_mm256_load_si256(reinterpret_cast<const __m256i *>(comp_ptr + 32)));
+            __m512i cc3 = _mm512_cvtepi16_epi32(_mm256_load_si256(reinterpret_cast<const __m256i *>(comp_ptr + 48)));
+
+            __m512i bc0 = _mm512_mullo_epi32(bias_128_i32, cc0);
+            __m512i bc1 = _mm512_mullo_epi32(bias_128_i32, cc1);
+            __m512i bc2 = _mm512_mullo_epi32(bias_128_i32, cc2);
+            __m512i bc3 = _mm512_mullo_epi32(bias_128_i32, cc3);
+
+            ia0_0 = _mm512_sub_epi32(ia0_0, bc0);
+            ia0_1 = _mm512_sub_epi32(ia0_1, bc1);
+            ia0_2 = _mm512_sub_epi32(ia0_2, bc2);
+            ia0_3 = _mm512_sub_epi32(ia0_3, bc3);
+            ia1_0 = _mm512_sub_epi32(ia1_0, bc0);
+            ia1_1 = _mm512_sub_epi32(ia1_1, bc1);
+            ia1_2 = _mm512_sub_epi32(ia1_2, bc2);
+            ia1_3 = _mm512_sub_epi32(ia1_3, bc3);
+
+            // Scale (shared b_scales loads)
+            const uint16_t *b_scales = packed.chunkScales(chunk, kb);
+            __m512 bs0 = _mm512_cvtph_ps(_mm256_load_si256(reinterpret_cast<const __m256i *>(b_scales)));
+            __m512 bs1 = _mm512_cvtph_ps(_mm256_load_si256(reinterpret_cast<const __m256i *>(b_scales + 16)));
+            __m512 bs2 = _mm512_cvtph_ps(_mm256_load_si256(reinterpret_cast<const __m256i *>(b_scales + 32)));
+            __m512 bs3 = _mm512_cvtph_ps(_mm256_load_si256(reinterpret_cast<const __m256i *>(b_scales + 48)));
+
+            __m512 as0 = _mm512_set1_ps(a0_scale);
+            fp0_0 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(ia0_0), _mm512_mul_ps(as0, bs0), fp0_0);
+            fp0_1 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(ia0_1), _mm512_mul_ps(as0, bs1), fp0_1);
+            fp0_2 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(ia0_2), _mm512_mul_ps(as0, bs2), fp0_2);
+            fp0_3 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(ia0_3), _mm512_mul_ps(as0, bs3), fp0_3);
+
+            __m512 as1 = _mm512_set1_ps(a1_scale);
+            fp1_0 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(ia1_0), _mm512_mul_ps(as1, bs0), fp1_0);
+            fp1_1 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(ia1_1), _mm512_mul_ps(as1, bs1), fp1_1);
+            fp1_2 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(ia1_2), _mm512_mul_ps(as1, bs2), fp1_2);
+            fp1_3 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(ia1_3), _mm512_mul_ps(as1, bs3), fp1_3);
+
+            if (packed.is_asymmetric)
+            {
+                const uint16_t *b_mins = packed.chunkMins(chunk, kb);
+                __m512 bm0 = _mm512_cvtph_ps(_mm256_load_si256(reinterpret_cast<const __m256i *>(b_mins)));
+                __m512 bm1 = _mm512_cvtph_ps(_mm256_load_si256(reinterpret_cast<const __m256i *>(b_mins + 16)));
+                __m512 bm2 = _mm512_cvtph_ps(_mm256_load_si256(reinterpret_cast<const __m256i *>(b_mins + 32)));
+                __m512 bm3 = _mm512_cvtph_ps(_mm256_load_si256(reinterpret_cast<const __m256i *>(b_mins + 48)));
+
+                __m512 corr0 = _mm512_set1_ps(static_cast<float>(a0.sum_qs) * a0_scale);
+                fp0_0 = _mm512_fmadd_ps(corr0, bm0, fp0_0);
+                fp0_1 = _mm512_fmadd_ps(corr0, bm1, fp0_1);
+                fp0_2 = _mm512_fmadd_ps(corr0, bm2, fp0_2);
+                fp0_3 = _mm512_fmadd_ps(corr0, bm3, fp0_3);
+
+                __m512 corr1 = _mm512_set1_ps(static_cast<float>(a1.sum_qs) * a1_scale);
+                fp1_0 = _mm512_fmadd_ps(corr1, bm0, fp1_0);
+                fp1_1 = _mm512_fmadd_ps(corr1, bm1, fp1_1);
+                fp1_2 = _mm512_fmadd_ps(corr1, bm2, fp1_2);
+                fp1_3 = _mm512_fmadd_ps(corr1, bm3, fp1_3);
+            }
+        }
+
+        _mm512_storeu_ps(C_row0, fp0_0);
+        _mm512_storeu_ps(C_row0 + 16, fp0_1);
+        _mm512_storeu_ps(C_row0 + 32, fp0_2);
+        _mm512_storeu_ps(C_row0 + 48, fp0_3);
+        _mm512_storeu_ps(C_row1, fp1_0);
+        _mm512_storeu_ps(C_row1 + 16, fp1_1);
+        _mm512_storeu_ps(C_row1 + 32, fp1_2);
+        _mm512_storeu_ps(C_row1 + 48, fp1_3);
+    }
+
+#endif // __AVX512F__ && __AVX512VNNI__ && __AVX512BW__
+
+    // =========================================================================
+    // Full GEMM dispatcher (M>1) — dual-strategy
+    // =========================================================================
+    //
+    // Strategy 1 — Small-N (N-tasks <= threads/4):
+    //   M×N 2D task grid. Tasks ordered (chunk, m-row) so consecutive
+    //   M rows for the same chunk land on the same thread (B stays in L2).
+    //   Each task calls the GEMV chunk kernel directly — no new SIMD code.
+    //   Activates when N-only parallelism fills <25% of threads.
+    //
+    // Strategy 2 — Tiled GEMM (N-tasks > threads/4):
+    //   Outer loop: parallel over N-block chunks
+    //   Middle loop: K-tiles (each fits in L2, reused across all M rows)
+    //   Inner loop: M rows (2 at a time via 2-row microkernel)
+    //   B-tile reuse: each N-chunk × K-tile loaded once, scanned M times.
+    // =========================================================================
+
+    // =========================================================================
+    // Shared activation quantization (for multiply_fused quantize-once)
+    // =========================================================================
+
+    inline void quantize_activations_to_q8_1(
+        const float *A_fp32,
+        Q8_1Block *A_q8,
+        int M,
+        int K,
+        int K_blocks)
+    {
+        const bool k_aligned = (K % 32 == 0);
+
+        auto do_quantize = [&]()
+        {
+#pragma omp for schedule(static)
+            for (int m = 0; m < M; ++m)
+            {
+                const float *row_a = A_fp32 + m * K;
+                Q8_1Block *row_q8 = A_q8 + static_cast<size_t>(m) * K_blocks;
+                int kb = 0;
+#if defined(__AVX512F__)
+                if (k_aligned)
+                {
+                    for (; kb + 1 < K_blocks; kb += 2)
+                    {
+                        simd::quantize_two_blocks_avx512(row_a + kb * 32, row_q8[kb], row_q8[kb + 1]);
+                    }
+                }
+#endif
+                for (; kb < K_blocks; ++kb)
+                {
+                    int block_start = kb * 32;
+                    int block_len = std::min(32, K - block_start);
+                    simd::quantize_single_block(row_a + block_start, row_q8[kb], block_len);
+                }
+            }
+        };
+
+        OMP_WORKSHARE_REGION(do_quantize);
+    }
+
+    // =========================================================================
+    // Pre-quantized GEMM (M>1) — compute only, skips quantization
+    // =========================================================================
+    //
+    // A_q8_all: Pre-quantized Q8_1 blocks, [M * K_blocks] contiguous layout.
+    //           Row m starts at A_q8_all + m * K_blocks.
+    // =========================================================================
+
+    inline void gemm_native_vnni_preq(
+        const CPUNativeVNNIPackedWeights &packed,
+        const Q8_1Block *A_q8_all,
+        float *C,
+        int M,
+        int ldc)
+    {
+        const int N = packed.N;
+        const int K_blocks = packed.blocks_per_row;
+        const int N_chunks = (N + 63) / 64;
+
+        int num_threads = omp_get_max_threads();
+        NativeVNNITileConfig cfg = computeTileConfig(N, packed.K, M, packed.payload_bytes, num_threads);
+        int n_block_chunks = cfg.n_block_chunks;
+        int total_n_blocks = (N_chunks + n_block_chunks - 1) / n_block_chunks;
+
+        int k_tile_blocks = cfg.k_tile_blocks > 0 ? cfg.k_tile_blocks : K_blocks;
+        int num_k_tiles = (K_blocks + k_tile_blocks - 1) / k_tile_blocks;
+
+#if defined(__AVX512F__) && defined(__AVX512VNNI__) && defined(__AVX512BW__)
+        __m512i decode_lut = packed.is_nibble_lut
+                                 ? build_decode_lut(packed.codebook_id)
+                                 : _mm512_setzero_si512();
+#endif
+
+        // Small-N dispatch: M×N 2D parallel grid
+        if (total_n_blocks <= num_threads / 4 && M >= 2)
+        {
+            auto do_compute = [&]()
+            {
+                int total_tasks = N_chunks * M;
+#pragma omp for schedule(static)
+                for (int task = 0; task < total_tasks; ++task)
+                {
+                    int chunk = task / M;
+                    int m = task % M;
+                    const Q8_1Block *aq = A_q8_all + static_cast<size_t>(m) * K_blocks;
+                    float *c_out = C + m * ldc + chunk * 64;
+
+                    int n_cols_actual = std::min(64, N - chunk * 64);
+                    if (n_cols_actual < 64)
+                    {
+                        alignas(64) float tmp[64];
+#if defined(__AVX512F__) && defined(__AVX512VNNI__) && defined(__AVX512BW__)
+                        if (packed.is_nibble_lut)
+                            gemv_native_vnni_avx512_chunk_native(packed, aq, tmp, chunk, 0, K_blocks, decode_lut);
+                        else
+                            gemv_native_vnni_avx512_chunk_int8(packed, aq, tmp, chunk, 0, K_blocks);
+#else
+                        gemv_native_vnni_scalar(packed, aq, tmp, n_cols_actual, K_blocks);
+#endif
+                        std::memcpy(c_out, tmp, n_cols_actual * sizeof(float));
+                    }
+                    else
+                    {
+#if defined(__AVX512F__) && defined(__AVX512VNNI__) && defined(__AVX512BW__)
+                        if (packed.is_nibble_lut)
+                            gemv_native_vnni_avx512_chunk_native(packed, aq, c_out, chunk, 0, K_blocks, decode_lut);
+                        else
+                            gemv_native_vnni_avx512_chunk_int8(packed, aq, c_out, chunk, 0, K_blocks);
+#else
+                        int n_cols = std::min(64, N - chunk * 64);
+                        gemv_native_vnni_scalar(packed, aq, c_out, n_cols, K_blocks);
+#endif
+                    }
+                }
+            };
+            OMP_WORKSHARE_REGION(do_compute);
+            return;
+        }
+
+        // Tiled GEMM path: N-parallel with 2-row microkernels and K-tiling
+        auto do_compute = [&]()
+        {
+#pragma omp for schedule(static)
+            for (int block_idx = 0; block_idx < total_n_blocks; ++block_idx)
+            {
+                int chunk_start = block_idx * n_block_chunks;
+                int chunk_count = std::min(n_block_chunks, N_chunks - chunk_start);
+
+                for (int kt = 0; kt < num_k_tiles; ++kt)
+                {
+                    int kb_start = kt * k_tile_blocks;
+                    int kb_end = std::min(kb_start + k_tile_blocks, K_blocks);
+                    bool accum = (kt > 0);
+
+                    int m = 0;
+                    for (; m + 1 < M; m += 2)
+                    {
+                        const Q8_1Block *aq0 = A_q8_all + static_cast<size_t>(m) * K_blocks;
+                        const Q8_1Block *aq1 = A_q8_all + static_cast<size_t>(m + 1) * K_blocks;
+
+                        for (int ci = 0; ci < chunk_count; ++ci)
+                        {
+                            int chunk = chunk_start + ci;
+                            int n_start = chunk * 64;
+                            float *c0 = C + m * ldc + n_start;
+                            float *c1 = C + (m + 1) * ldc + n_start;
+
+#if defined(__AVX512F__) && defined(__AVX512VNNI__) && defined(__AVX512BW__)
+                            if (packed.is_nibble_lut)
+                                gemm_2row_native_chunk(packed, aq0, aq1, c0, c1,
+                                                       chunk, kb_start, kb_end,
+                                                       decode_lut, accum);
+                            else
+                                gemm_2row_int8_chunk(packed, aq0, aq1, c0, c1,
+                                                     chunk, kb_start, kb_end, accum);
+#else
+                            int n_cols = std::min(64, N - n_start);
+                            if (!accum)
+                            {
+                                std::memset(c0, 0, 64 * sizeof(float));
+                                std::memset(c1, 0, 64 * sizeof(float));
+                            }
+                            if (kt == 0)
+                            {
+                                gemv_native_vnni_scalar(packed, aq0, c0, n_cols, K_blocks);
+                                gemv_native_vnni_scalar(packed, aq1, c1, n_cols, K_blocks);
+                            }
+#endif
+                        }
+                    }
+
+                    if (m < M)
+                    {
+                        const Q8_1Block *aq = A_q8_all + static_cast<size_t>(m) * K_blocks;
+                        for (int ci = 0; ci < chunk_count; ++ci)
+                        {
+                            int chunk = chunk_start + ci;
+                            int n_start = chunk * 64;
+                            float *c_row = C + m * ldc + n_start;
+
+#if defined(__AVX512F__) && defined(__AVX512VNNI__) && defined(__AVX512BW__)
+                            if (accum)
+                            {
+                                alignas(64) float tmp[64] = {};
+                                if (packed.is_nibble_lut)
+                                    gemv_native_vnni_avx512_chunk_native(packed, aq, tmp, chunk, kb_start, kb_end, decode_lut);
+                                else
+                                    gemv_native_vnni_avx512_chunk_int8(packed, aq, tmp, chunk, kb_start, kb_end);
+                                __m512 s0 = _mm512_add_ps(_mm512_loadu_ps(c_row), _mm512_load_ps(tmp));
+                                __m512 s1 = _mm512_add_ps(_mm512_loadu_ps(c_row + 16), _mm512_load_ps(tmp + 16));
+                                __m512 s2 = _mm512_add_ps(_mm512_loadu_ps(c_row + 32), _mm512_load_ps(tmp + 32));
+                                __m512 s3 = _mm512_add_ps(_mm512_loadu_ps(c_row + 48), _mm512_load_ps(tmp + 48));
+                                _mm512_storeu_ps(c_row, s0);
+                                _mm512_storeu_ps(c_row + 16, s1);
+                                _mm512_storeu_ps(c_row + 32, s2);
+                                _mm512_storeu_ps(c_row + 48, s3);
+                            }
+                            else
+                            {
+                                if (packed.is_nibble_lut)
+                                    gemv_native_vnni_avx512_chunk_native(packed, aq, c_row, chunk, kb_start, kb_end, decode_lut);
+                                else
+                                    gemv_native_vnni_avx512_chunk_int8(packed, aq, c_row, chunk, kb_start, kb_end);
+                            }
+#else
+                            int n_cols = std::min(64, N - n_start);
+                            if (!accum && kt == 0)
+                            {
+                                gemv_native_vnni_scalar(packed, aq, c_row, n_cols, K_blocks);
+                            }
+#endif
+                        }
+                    }
+                }
+
+                int last_chunk_start = (chunk_start + chunk_count - 1) * 64;
+                int last_n_cols = std::min(64, N - last_chunk_start);
+                if (last_n_cols < 64)
+                {
+                    for (int m_row = 0; m_row < M; ++m_row)
+                    {
+                        for (int i = last_n_cols; i < 64; ++i)
+                            C[m_row * ldc + last_chunk_start + i] = 0.0f;
+                    }
+                }
+            }
+        };
+
+        OMP_WORKSHARE_REGION(do_compute);
+    }
+
+    // =========================================================================
+    // Full GEMM dispatcher (M>1) — quantizes then delegates to preq path
     // =========================================================================
 
     inline void gemm_native_vnni(
@@ -665,67 +1300,37 @@ namespace llaminar2::cpu::native_vnni
         int ldc)
     {
         const int K = packed.K;
-        const int N = packed.N;
         const int K_blocks = packed.blocks_per_row;
-        const int N_chunks = (N + 63) / 64;
 
-        int num_threads = omp_get_max_threads();
-        NativeVNNITileConfig cfg = computeTileConfig(N, K, M, packed.payload_bytes, num_threads);
-        int n_block_chunks = cfg.n_block_chunks;
-        int total_n_blocks = (N_chunks + n_block_chunks - 1) / n_block_chunks;
-        int m_unroll = cfg.m_unroll;
+        // Pre-quantize all M rows of A
+        std::vector<Q8_1Block> all_A_q8(static_cast<size_t>(M) * K_blocks);
+        quantize_activations_to_q8_1(A_fp32, all_A_q8.data(), M, K, K_blocks);
 
-#if defined(__AVX512F__) && defined(__AVX512VNNI__) && defined(__AVX512BW__)
-        __m512i decode_lut = packed.is_nibble_lut
-                                 ? build_decode_lut(packed.codebook_id)
-                                 : _mm512_setzero_si512();
-#endif
+        // Delegate to pre-quantized compute path
+        gemm_native_vnni_preq(packed, all_A_q8.data(), C, M, ldc);
+    }
 
-        auto do_gemm = [&]()
+    // =========================================================================
+    // Bias epilogue: C[m, j] += bias[j] for all M rows
+    // =========================================================================
+
+    inline void apply_bias_epilogue(float *C, const float *bias, int M, int N, int ldc)
+    {
+        for (int m = 0; m < M; ++m)
         {
-            std::vector<Q8_1Block> A_q8_local(K_blocks);
-
-#pragma omp for collapse(2) schedule(static)
-            for (int m_start = 0; m_start < M; m_start += m_unroll)
+            float *row = C + m * ldc;
+            int j = 0;
+#if defined(__AVX512F__)
+            for (; j + 15 < N; j += 16)
             {
-                for (int block_idx = 0; block_idx < total_n_blocks; ++block_idx)
-                {
-                    int chunk_start = block_idx * n_block_chunks;
-                    int chunk_count = std::min(n_block_chunks, N_chunks - chunk_start);
-                    int m_end = std::min(m_start + m_unroll, M);
-
-                    for (int m = m_start; m < m_end; ++m)
-                    {
-                        // Quantize this row's activations
-                        const float *row_a = A_fp32 + m * K;
-                        for (int kb = 0; kb < K_blocks; ++kb)
-                        {
-                            int block_start = kb * 32;
-                            int block_len = std::min(32, K - block_start);
-                            simd::quantize_single_block(row_a + block_start, A_q8_local[kb], block_len);
-                        }
-
-                        float *row_c = C + m * ldc;
-
-#if defined(__AVX512F__) && defined(__AVX512VNNI__) && defined(__AVX512BW__)
-                        gemv_native_vnni_avx512_block(packed, A_q8_local.data(), row_c,
-                                                       chunk_start, chunk_count, K_blocks, N,
-                                                       decode_lut);
-#else
-                        for (int ci = 0; ci < chunk_count; ++ci)
-                        {
-                            int chunk = chunk_start + ci;
-                            int n_start = chunk * 64;
-                            int n_cols = std::min(64, N - n_start);
-                            gemv_native_vnni_scalar(packed, A_q8_local.data(), row_c + n_start, n_cols, K_blocks);
-                        }
-#endif
-                    }
-                }
+                __m512 c = _mm512_loadu_ps(row + j);
+                __m512 b = _mm512_loadu_ps(bias + j);
+                _mm512_storeu_ps(row + j, _mm512_add_ps(c, b));
             }
-        };
-
-        OMP_WORKSHARE_REGION(do_gemm);
+#endif
+            for (; j < N; ++j)
+                row[j] += bias[j];
+        }
     }
 
 } // namespace llaminar2::cpu::native_vnni

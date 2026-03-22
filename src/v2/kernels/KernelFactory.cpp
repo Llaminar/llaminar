@@ -5,9 +5,8 @@
  */
 
 #include "KernelFactory.h"
-#include "cpu/gemm/CPUQuantisedGemmKernel.h"
+#include "cpu/native_vnni/CPUNativeVNNIGemmKernel.h"
 #include "cpu/gemm/FloatingPointGemmKernel.h"
-#include "cpu/gemm/FusedGEMM.h"
 #include "../tensors/TensorSlice.h"
 #include "cpu/ops/CPURoPEKernelT.h"
 #include "cpu/ops/CPUSwiGLUKernelT.h"
@@ -611,7 +610,7 @@ namespace llaminar
                 const llaminar2::TensorBase *tensor, DeviceType dev_type, int device_ordinal)
             {
                 // Two-way dispatch based on interface:
-                // 1. IINT8Unpackable → CPUQuantisedGemmKernel (quantized weights)
+                // 1. IINT8Unpackable → CPUNativeVNNIGemmKernel (quantized weights)
                 // 2. Otherwise → FloatingPointGemmKernel (FP32/FP16/BF16)
 
                 const auto *quantized = dynamic_cast<const llaminar2::IINT8Unpackable *>(tensor);
@@ -623,9 +622,8 @@ namespace llaminar
                     {
                     case DeviceType::CPU:
                     {
-                        // CPUQuantisedGemmKernel handles M=1 → NativeVNNI routing internally
-                        auto *packed = ensurePackedWeightsInTensorCache(tensor);
-                        return std::make_unique<llaminar2::gemm::CPUQuantisedGemmKernel>(packed, tensor);
+                        // CPUNativeVNNIGemmKernel handles both M=1 and M>1 paths
+                        return std::make_unique<llaminar2::cpu::native_vnni::CPUNativeVNNIGemmKernel>(tensor);
                     }
 #ifdef HAVE_CUDA
                     case DeviceType::CUDA:
@@ -699,8 +697,7 @@ namespace llaminar
                 {
                 case DeviceType::CPU:
                 {
-                    auto *packed = ensurePackedWeightsInTensorCache(tensor);
-                    return std::make_unique<llaminar2::gemm::CPUQuantisedGemmKernel>(packed);
+                    return std::make_unique<llaminar2::cpu::native_vnni::CPUNativeVNNIGemmKernel>(tensor);
                 }
 
 #ifdef HAVE_CUDA
@@ -734,8 +731,7 @@ namespace llaminar
                 {
                 case DeviceType::CPU:
                 {
-                    auto *packed = ensurePackedWeightsInTensorCache(tensor);
-                    return new llaminar2::gemm::CPUQuantisedGemmKernel(packed);
+                    return new llaminar2::cpu::native_vnni::CPUNativeVNNIGemmKernel(tensor);
                 }
 
 #ifdef HAVE_CUDA
@@ -748,9 +744,6 @@ namespace llaminar
                 }
 #endif
 
-                case DeviceType::ROCm:
-                case DeviceType::Vulkan:
-                case DeviceType::Metal:
                 default:
                     throwUnsupportedBackend(dev_type, "IQ4_NL");
                 }
@@ -767,8 +760,7 @@ namespace llaminar
                 {
                 case DeviceType::CPU:
                 {
-                    auto *packed = ensurePackedWeightsInTensorCache(tensor);
-                    return std::make_unique<llaminar2::gemm::CPUQuantisedGemmKernel>(packed);
+                    return std::make_unique<llaminar2::cpu::native_vnni::CPUNativeVNNIGemmKernel>(tensor);
                 }
 
 #ifdef HAVE_CUDA
@@ -812,8 +804,7 @@ namespace llaminar
                 {
                 case DeviceType::CPU:
                 {
-                    auto *packed = ensurePackedWeightsInTensorCache(tensor);
-                    return std::make_unique<llaminar2::gemm::CPUQuantisedGemmKernel>(packed);
+                    return std::make_unique<llaminar2::cpu::native_vnni::CPUNativeVNNIGemmKernel>(tensor);
                 }
 
 #ifdef HAVE_CUDA
@@ -847,8 +838,7 @@ namespace llaminar
                 {
                 case DeviceType::CPU:
                 {
-                    auto *packed = ensurePackedWeightsInTensorCache(tensor);
-                    return std::make_unique<llaminar2::gemm::CPUQuantisedGemmKernel>(packed);
+                    return std::make_unique<llaminar2::cpu::native_vnni::CPUNativeVNNIGemmKernel>(tensor);
                 }
 
 #ifdef HAVE_CUDA
@@ -882,8 +872,7 @@ namespace llaminar
                 {
                 case DeviceType::CPU:
                 {
-                    auto *packed = ensurePackedWeightsInTensorCache(tensor);
-                    return std::make_unique<llaminar2::gemm::CPUQuantisedGemmKernel>(packed);
+                    return std::make_unique<llaminar2::cpu::native_vnni::CPUNativeVNNIGemmKernel>(tensor);
                 }
 
 #ifdef HAVE_CUDA
@@ -917,8 +906,7 @@ namespace llaminar
                 {
                 case DeviceType::CPU:
                 {
-                    auto *packed = ensurePackedWeightsInTensorCache(tensor);
-                    return std::make_unique<llaminar2::gemm::CPUQuantisedGemmKernel>(packed);
+                    return std::make_unique<llaminar2::cpu::native_vnni::CPUNativeVNNIGemmKernel>(tensor);
                 }
 
 #ifdef HAVE_CUDA
@@ -952,8 +940,7 @@ namespace llaminar
                 {
                 case DeviceType::CPU:
                 {
-                    auto *packed = ensurePackedWeightsInTensorCache(tensor);
-                    return std::make_unique<llaminar2::gemm::CPUQuantisedGemmKernel>(packed);
+                    return std::make_unique<llaminar2::cpu::native_vnni::CPUNativeVNNIGemmKernel>(tensor);
                 }
 
 #ifdef HAVE_CUDA
@@ -987,8 +974,7 @@ namespace llaminar
                 {
                 case DeviceType::CPU:
                 {
-                    auto *packed = ensurePackedWeightsInTensorCache(tensor);
-                    return std::make_unique<llaminar2::gemm::CPUQuantisedGemmKernel>(packed);
+                    return std::make_unique<llaminar2::cpu::native_vnni::CPUNativeVNNIGemmKernel>(tensor);
                 }
 
 #ifdef HAVE_CUDA
@@ -1022,8 +1008,7 @@ namespace llaminar
                 {
                 case DeviceType::CPU:
                 {
-                    auto *packed = ensurePackedWeightsInTensorCache(tensor);
-                    return std::make_unique<llaminar2::gemm::CPUQuantisedGemmKernel>(packed);
+                    return std::make_unique<llaminar2::cpu::native_vnni::CPUNativeVNNIGemmKernel>(tensor);
                 }
 
 #ifdef HAVE_CUDA
@@ -1057,8 +1042,7 @@ namespace llaminar
                 {
                 case DeviceType::CPU:
                 {
-                    auto *packed = ensurePackedWeightsInTensorCache(tensor);
-                    return std::make_unique<llaminar2::gemm::CPUQuantisedGemmKernel>(packed);
+                    return std::make_unique<llaminar2::cpu::native_vnni::CPUNativeVNNIGemmKernel>(tensor);
                 }
 
 #ifdef HAVE_CUDA
@@ -1092,8 +1076,7 @@ namespace llaminar
                 {
                 case DeviceType::CPU:
                 {
-                    auto *packed = ensurePackedWeightsInTensorCache(tensor);
-                    return std::make_unique<llaminar2::gemm::CPUQuantisedGemmKernel>(packed);
+                    return std::make_unique<llaminar2::cpu::native_vnni::CPUNativeVNNIGemmKernel>(tensor);
                 }
 
 #ifdef HAVE_CUDA
@@ -1127,8 +1110,7 @@ namespace llaminar
                 {
                 case DeviceType::CPU:
                 {
-                    auto *packed = ensurePackedWeightsInTensorCache(tensor);
-                    return std::make_unique<llaminar2::gemm::CPUQuantisedGemmKernel>(packed);
+                    return std::make_unique<llaminar2::cpu::native_vnni::CPUNativeVNNIGemmKernel>(tensor);
                 }
 
 #ifdef HAVE_CUDA
@@ -1162,8 +1144,7 @@ namespace llaminar
                 {
                 case DeviceType::CPU:
                 {
-                    auto *packed = ensurePackedWeightsInTensorCache(tensor);
-                    return std::make_unique<llaminar2::gemm::CPUQuantisedGemmKernel>(packed);
+                    return std::make_unique<llaminar2::cpu::native_vnni::CPUNativeVNNIGemmKernel>(tensor);
                 }
 
 #ifdef HAVE_CUDA
@@ -1197,8 +1178,7 @@ namespace llaminar
                 {
                 case DeviceType::CPU:
                 {
-                    auto *packed = ensurePackedWeightsInTensorCache(tensor);
-                    return std::make_unique<llaminar2::gemm::CPUQuantisedGemmKernel>(packed);
+                    return std::make_unique<llaminar2::cpu::native_vnni::CPUNativeVNNIGemmKernel>(tensor);
                 }
 
 #ifdef HAVE_CUDA
@@ -1232,8 +1212,7 @@ namespace llaminar
                 {
                 case DeviceType::CPU:
                 {
-                    auto *packed = ensurePackedWeightsInTensorCache(tensor);
-                    return std::make_unique<llaminar2::gemm::CPUQuantisedGemmKernel>(packed);
+                    return std::make_unique<llaminar2::cpu::native_vnni::CPUNativeVNNIGemmKernel>(tensor);
                 }
 
 #ifdef HAVE_CUDA
@@ -1267,8 +1246,7 @@ namespace llaminar
                 {
                 case DeviceType::CPU:
                 {
-                    auto *packed = ensurePackedWeightsInTensorCache(tensor);
-                    return std::make_unique<llaminar2::gemm::CPUQuantisedGemmKernel>(packed);
+                    return std::make_unique<llaminar2::cpu::native_vnni::CPUNativeVNNIGemmKernel>(tensor);
                 }
 
 #ifdef HAVE_CUDA
@@ -1302,8 +1280,7 @@ namespace llaminar
                 {
                 case DeviceType::CPU:
                 {
-                    auto *packed = ensurePackedWeightsInTensorCache(tensor);
-                    return std::make_unique<llaminar2::gemm::CPUQuantisedGemmKernel>(packed);
+                    return std::make_unique<llaminar2::cpu::native_vnni::CPUNativeVNNIGemmKernel>(tensor);
                 }
 
 #ifdef HAVE_CUDA
@@ -1337,8 +1314,7 @@ namespace llaminar
                 {
                 case DeviceType::CPU:
                 {
-                    auto *packed = ensurePackedWeightsInTensorCache(tensor);
-                    return std::make_unique<llaminar2::gemm::CPUQuantisedGemmKernel>(packed);
+                    return std::make_unique<llaminar2::cpu::native_vnni::CPUNativeVNNIGemmKernel>(tensor);
                 }
 
 #ifdef HAVE_CUDA
@@ -1372,8 +1348,7 @@ namespace llaminar
                 {
                 case DeviceType::CPU:
                 {
-                    auto *packed = ensurePackedWeightsInTensorCache(tensor);
-                    return std::make_unique<llaminar2::gemm::CPUQuantisedGemmKernel>(packed);
+                    return std::make_unique<llaminar2::cpu::native_vnni::CPUNativeVNNIGemmKernel>(tensor);
                 }
 
 #ifdef HAVE_CUDA
@@ -1407,8 +1382,7 @@ namespace llaminar
                 {
                 case DeviceType::CPU:
                 {
-                    auto *packed = ensurePackedWeightsInTensorCache(tensor);
-                    return std::make_unique<llaminar2::gemm::CPUQuantisedGemmKernel>(packed);
+                    return std::make_unique<llaminar2::cpu::native_vnni::CPUNativeVNNIGemmKernel>(tensor);
                 }
 
 #ifdef HAVE_CUDA
@@ -1442,8 +1416,7 @@ namespace llaminar
                 {
                 case DeviceType::CPU:
                 {
-                    auto *packed = ensurePackedWeightsInTensorCache(tensor);
-                    return std::make_unique<llaminar2::gemm::CPUQuantisedGemmKernel>(packed);
+                    return std::make_unique<llaminar2::cpu::native_vnni::CPUNativeVNNIGemmKernel>(tensor);
                 }
 
 #ifdef HAVE_CUDA
@@ -2911,69 +2884,21 @@ namespace llaminar
             // ==========================================================================
 
             /**
-             * @brief Wrapper for packed weights stored in tensor's cache_
-             *
-             * This wrapper enables tensor-owned packed weights. The tensor stores
-             * QuantisedPackedWeights in its std::any cache_, and lightweight kernels
-             * reference the packed data via external_packed_.
-             */
-            struct TensorPackedWeightsCache
-            {
-                llaminar2::gemm::QuantisedPackedWeights packed;
-            };
-
-            /**
              * @brief Ensure tensor has packed weights in its cache and return pointer
              *
-             * This is the canonical way to get packed weights for a tensor. The weights
-             * are stored in tensor->cache_ so they outlive any individual kernel.
+             * For CPU NativeVNNI: no-op since kernels pack weights internally on construction.
+             * For legacy JIT path: removed.
              *
              * Thread-safe: acquires cache_mutex_ internally.
              *
              * @param tensor Quantized tensor that implements IINT8Unpackable
-             * @return Pointer to packed weights (stored in tensor's cache_)
-             * @throws std::runtime_error if packing fails
+             * @return nullptr (CPU NativeVNNI kernels manage their own packing)
              */
             const llaminar2::gemm::QuantisedPackedWeights *
             KernelFactory::ensurePackedWeightsInTensorCache(const llaminar2::TensorBase *tensor)
             {
-                std::lock_guard<std::mutex> tensor_lock(tensor->packed_cache_mutex_);
-
-                // Check if tensor already has packed weights cached
-                if (tensor->cache_.has_value())
-                {
-                    try
-                    {
-                        auto cached = std::any_cast<std::shared_ptr<TensorPackedWeightsCache>>(tensor->cache_);
-                        if (cached)
-                        {
-                            return &cached->packed;
-                        }
-                    }
-                    catch (const std::bad_any_cast &)
-                    {
-                        // cache_ contains something else - overwrite
-                    }
-                }
-
-                // Pack weights into tensor's cache_
-                auto new_cache = std::make_shared<TensorPackedWeightsCache>();
-                if (!llaminar2::gemm::CPUQuantisedGemmKernel::packWeightsInto(
-                        tensor, new_cache->packed, 0, -1))
-                {
-                    LOG_ERROR("[KernelFactory] Failed to pack weights for tensor type "
-                              << static_cast<int>(tensor->native_type()));
-                    throw std::runtime_error("KernelFactory: failed to pack weights");
-                }
-
-                // Store as shared_ptr in tensor's cache_ (std::any properly
-                // destroys shared_ptr on overwrite/destruction, preventing leaks)
-                tensor->cache_ = new_cache;
-
-                LOG_TRACE("[KernelFactory] Packed weights for tensor "
-                          << tensor << " (" << new_cache->packed.N << "x" << new_cache->packed.K << ")");
-
-                return &new_cache->packed;
+                // NativeVNNI kernels pack weights on construction — no external packing needed.
+                return nullptr;
             }
 
 #ifdef HAVE_CUDA
@@ -3156,11 +3081,10 @@ namespace llaminar
                 }
 
                 // Create sliced kernel using row-range constructor
-                // CPUQuantisedGemmKernel handles M=1 → NativeVNNI routing internally
                 std::unique_ptr<llaminar2::ITensorGemm> kernel;
 
                 {
-                    kernel = std::make_unique<llaminar2::gemm::CPUQuantisedGemmKernel>(
+                    kernel = std::make_unique<llaminar2::cpu::native_vnni::CPUNativeVNNIGemmKernel>(
                         tensor, static_cast<int>(row_start), static_cast<int>(row_end));
                 }
 
@@ -3421,7 +3345,7 @@ namespace llaminar
             {
                 std::lock_guard<std::mutex> lock(cache_mutex_);
                 size_t total_bytes = 0;
-                // Note: Can't easily compute packed_bytes without RTTI to CPUQuantisedGemmKernel
+                // Note: packed_bytes not tracked per-kernel
                 // For now, just return count (includes all caches)
                 return {sliced_cache_.size() + fused_qkv_cache_.size() + fused_gate_up_cache_.size() + rope_cache_.size() + rmsnorm_cache_.size() + swiglu_cache_.size() + softmax_cache_.size() + residual_add_cache_.size() + attention_cache_.size() + embedding_cache_.size() + device_kernel_registry_.size() + prepared_gemm_registry_.size(), total_bytes};
             }
@@ -3767,106 +3691,19 @@ namespace llaminar
             }
 
             // ==========================================================================
-            // Fused QKV GEMM Adapter and Factory Methods
+            // Fused QKV GEMM Factory Methods (now delegates to individual ITensorGemm)
             // ==========================================================================
-
-            /**
-             * @brief Adapter class that wraps FusedGEMM to implement ITensorFusedQKVGemm
-             *
-             * This adapter bridges the FusedGEMM implementation to the ITensorFusedQKVGemm
-             * interface, enabling KernelFactory to provide cached fused QKV GEMM kernels.
-             */
-            class FusedQKVGemmAdapter : public llaminar2::ITensorFusedQKVGemm
-            {
-            public:
-                FusedQKVGemmAdapter(const llaminar2::TensorBase *wq,
-                                    const llaminar2::TensorBase *wk,
-                                    const llaminar2::TensorBase *wv)
-                    : impl_(std::make_unique<llaminar2::FusedGEMM>(wq, wk, wv))
-                {
-                }
-
-                bool execute_fp32(
-                    const float *input_fp32,
-                    void *output_q,
-                    void *output_k,
-                    void *output_v,
-                    const llaminar2::TensorBase *bias_q,
-                    const llaminar2::TensorBase *bias_k,
-                    const llaminar2::TensorBase *bias_v,
-                    int m, int n_q, int n_k, int k,
-                    int k_block_size) override
-                {
-                    // FusedGEMM.execute_to_q8_1 handles FP32→Q8_1 quantization internally
-                    return impl_->execute_to_q8_1(
-                        input_fp32,
-                        output_q, output_k, output_v,
-                        bias_q, bias_k, bias_v,
-                        m, n_q, n_k, k,
-                        nullptr, -1);
-                }
-
-                bool execute_q8_1(
-                    const llaminar2::Q8_1Block *input_q8_1,
-                    void *output_q,
-                    void *output_k,
-                    void *output_v,
-                    const llaminar2::TensorBase *bias_q,
-                    const llaminar2::TensorBase *bias_k,
-                    const llaminar2::TensorBase *bias_v,
-                    int m, int n_q, int n_k, int k,
-                    int k_block_size) override
-                {
-                    // Use mixed-precision path: Q=Q8_1, K=Q16_1, V=Q8_1
-                    return impl_->execute_q8_1_mixed_qkv(
-                        input_q8_1,
-                        output_q, output_k, output_v,
-                        bias_q, bias_k, bias_v,
-                        m, n_q, n_k, k,
-                        k_block_size,
-                        nullptr, -1);
-                }
-
-                bool execute_q8_1_to_q8_1(
-                    const llaminar2::Q8_1Block *input_q8_1,
-                    void *output_q,
-                    void *output_k,
-                    void *output_v,
-                    const llaminar2::TensorBase *bias_q,
-                    const llaminar2::TensorBase *bias_k,
-                    const llaminar2::TensorBase *bias_v,
-                    int m, int n_q, int n_k, int k) override
-                {
-                    // Uniform Q8_1 output path
-                    return impl_->execute_q8_1_to_q8_1(
-                        input_q8_1,
-                        output_q, output_k, output_v,
-                        bias_q, bias_k, bias_v,
-                        m, n_q, n_k, k,
-                        nullptr, -1);
-                }
-
-                bool supports_device(int device_idx) const override
-                {
-                    // FusedQKVGemm currently only supports CPU (device_idx == -1)
-                    return device_idx == -1;
-                }
-
-            private:
-                std::unique_ptr<llaminar2::FusedGEMM> impl_;
-            };
 
             /**
              * @brief Build fused QKV adapter from already-resolved prepared handles
              *
-             * This helper centralizes fused QKV construction semantics so both
-             * public `createFusedQKVGemm(..., DeviceId)` and cache-miss handling in
-             * `getOrCreateFusedQKVGemm(..., DeviceId)` use exactly the same path.
+             * Since Q8_1/Q16_1 activation paths have been removed, fused QKV on CPU
+             * now uses individual ITensorGemm kernels via FusedQKVGEMMStage directly.
+             * This factory method creates a trivial adapter for backward compatibility
+             * with the cache keying mechanism.
              *
-             * Why this helper exists:
-             * - Keeps a single authority for validation and adapter construction.
-             * - Avoids repeating prepared-handle resolution in cache-miss paths.
-             * - Maintains prepared-handle-first architecture for fused cache identity.
+             * Note: The actual execution now happens in FusedQKVGEMMStage using
+             * individual prepared GEMM handles, not through ITensorFusedQKVGemm.
              */
             static std::unique_ptr<llaminar2::ITensorFusedQKVGemm> createFusedQKVAdapterFromPrepared(
                 const KernelFactory::PreparedGemmHandle *prepared_q,
@@ -3874,35 +3711,11 @@ namespace llaminar
                 const KernelFactory::PreparedGemmHandle *prepared_v,
                 llaminar2::DeviceId target_device)
             {
-                // Prepared-handle-native contract: callers provide already-resolved
-                // handle identities, and this helper performs only construction-time
-                // validation plus adapter creation. This keeps cache miss behavior
-                // and explicit create behavior semantically identical.
-                if (!prepared_q || !prepared_k || !prepared_v)
-                {
-                    LOG_ERROR("[KernelFactory] createFusedQKVAdapterFromPrepared: null prepared handle(s)");
-                    throw std::runtime_error("FusedQKVGemm requires non-null prepared handles");
-                }
-
-                if (!prepared_q->tensor || !prepared_k->tensor || !prepared_v->tensor)
-                {
-                    LOG_ERROR("[KernelFactory] createFusedQKVAdapterFromPrepared: null tensor in prepared handle(s)");
-                    throw std::runtime_error("FusedQKVGemm prepared handles must reference valid tensors");
-                }
-
-                // Current fused QKV adapter implementation is CPU-only.
-                // Keeping this check here ensures both create() and getOrCreate() paths
-                // apply identical device support validation.
-                if (target_device.type != DeviceType::CPU)
-                {
-                    LOG_ERROR("[KernelFactory] FusedQKVGemm currently only supports CPU device");
-                    throw std::runtime_error("FusedQKVGemm only supports CPU device");
-                }
-
-                return std::make_unique<FusedQKVGemmAdapter>(
-                    prepared_q->tensor,
-                    prepared_k->tensor,
-                    prepared_v->tensor);
+                // FusedQKVGemmAdapter has been removed — the FusedQKVGEMMStage now
+                // uses individual ITensorGemm kernels directly (via getOrCreatePreparedGemmWeights
+                // + getOrCreateGemmEngine). Return nullptr to signal callers should use the
+                // individual kernel path.
+                return nullptr;
             }
 
             std::unique_ptr<llaminar2::ITensorFusedQKVGemm> KernelFactory::createFusedQKVGemm(
@@ -4064,8 +3877,8 @@ namespace llaminar
 
                     // Standard per-projection path (shares activation quantization)
                     std::vector<llaminar2::ITensorGemm::TensorProjectionDesc> projections = {
-                        {gemm_gate_, output_gate, n_gate, nullptr, nullptr, false, "gate"},
-                        {gemm_up_, output_up, n_up, nullptr, nullptr, false, "up"}};
+                        {gemm_gate_, output_gate, n_gate, nullptr, "gate"},
+                        {gemm_up_, output_up, n_up, nullptr, "up"}};
 
                     return gemm_gate_->multiply_fused_tensor(input, projections, m, k);
                 }
@@ -4108,8 +3921,8 @@ namespace llaminar
                         // Build projection descriptors for fused multiply
                         // FusedProjectionDesc takes TensorBase* for bias
                         std::vector<llaminar2::ITensorGemm::FusedProjectionDesc> projections = {
-                            {gemm_gate_, output_gate_fp32, n_gate, bias_gate, nullptr, false, "gate"},
-                            {gemm_up_, output_up_fp32, n_up, bias_up, nullptr, false, "up"}};
+                            {gemm_gate_, output_gate_fp32, n_gate, bias_gate, "gate"},
+                            {gemm_up_, output_up_fp32, n_up, bias_up, "up"}};
 
                         return gemm_gate_->multiply_fused(input_fp32, projections, m, k);
                     }
@@ -4706,8 +4519,8 @@ namespace llaminar
                     return true;
                 }
 
-                // Q8_1 activations ONLY work with quantized weights
-                // (CPUQuantisedGemmKernel uses INT8×INT8 dot products)
+                // Q8_1 activations work with quantized weights
+                // (NativeVNNI/CUDA kernels use INT8×INT8 dot products)
                 if (activation_type == llaminar2::TensorType::Q8_1)
                 {
                     // Q8_1 activations can work with any quantized weight type
@@ -4730,7 +4543,7 @@ namespace llaminar
                 if (activation_type == llaminar2::TensorType::Q8_1 && isFloatingPointType(weight_type))
                 {
                     return std::string("Q8_1 activation precision requires quantized weights, but got ") +
-                           wgt_name + " weights. The CPUQuantisedGemmKernel uses INT8×INT8 VNNI " +
+                           wgt_name + " weights. The GEMM kernel uses INT8×INT8 VNNI " +
                            "instructions which cannot process floating-point weights. Either:\n" +
                            "  1. Use FP32 activation precision (slower but compatible with any weights)\n" +
                            "  2. Use a quantized model (Q8_0, Q4_0, IQ4_NL, etc.)";

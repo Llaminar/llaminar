@@ -2,14 +2,14 @@
  * @file Perf__CPUNativeVNNI_Sweep.cpp
  * @brief Comprehensive performance benchmark for CPU NativeVNNI GEMV across
  *        all 16 quantization formats, all Qwen model shapes, with bandwidth
- *        roofline analysis and CPUQuantisedGemmKernel baseline comparison.
+ *        roofline analysis and CPUNativeVNNIGemmKernel baseline comparison.
  *
  * System roofline: 2x Intel Xeon Gold 6238R, 6-channel DDR4-2933 per socket.
  * Measured STREAM read BW: ~117 GB/s (both sockets).
  *
  * For each (format, shape):
  *   1. Pack weights via NativeVNNI (native nibble-LUT or INT8 pre-decoded)
- *   2. Pack weights via CPUQuantisedGemmKernel (INT8 requantize baseline)
+ *   2. Pack weights via CPUNativeVNNIGemmKernel (INT8 requantize baseline)
  *   3. Benchmark M=1 GEMV, report time, effective BW, roofline %, speedup
  *
  * @note Run with Release build: ctest -R V2_Perf_CPUNativeVNNI_Sweep
@@ -21,6 +21,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <csignal>
 #include <cstdio>
 #include <iomanip>
 #include <map>
@@ -28,10 +29,10 @@
 #include <numeric>
 #include <random>
 #include <string>
+#include <unistd.h>
 #include <vector>
 
-#include "kernels/cpu/gemm/CPUNativeVNNIGemmKernel.h"
-#include "kernels/cpu/gemm/CPUQuantisedGemmKernel.h"
+#include "kernels/cpu/native_vnni/CPUNativeVNNIGemmKernel.h"
 #include "tensors/Tensors.h"
 #include "utils/Logger.h"
 #include "fort.hpp"
@@ -44,6 +45,42 @@ using namespace llaminar2::test;
 
 namespace
 {
+
+    // =========================================================================
+    // MPI global environment: init once, finalize on exit, abort on crash
+    // =========================================================================
+    void mpi_abort_signal_handler(int sig)
+    {
+        const char *msg = "\n[FATAL] Signal caught in perf test — calling MPI_Abort\n";
+        [[maybe_unused]] auto _ = write(STDERR_FILENO, msg, strlen(msg));
+        MPI_Abort(MPI_COMM_WORLD, sig);
+        _exit(128 + sig);
+    }
+
+    class MPIEnvironment : public ::testing::Environment
+    {
+    public:
+        void SetUp() override
+        {
+            int initialized = 0;
+            MPI_Initialized(&initialized);
+            if (!initialized)
+                MPI_Init(nullptr, nullptr);
+            std::signal(SIGSEGV, mpi_abort_signal_handler);
+            std::signal(SIGABRT, mpi_abort_signal_handler);
+            std::signal(SIGFPE, mpi_abort_signal_handler);
+        }
+        void TearDown() override
+        {
+            int finalized = 0;
+            MPI_Finalized(&finalized);
+            if (!finalized)
+                MPI_Finalize();
+        }
+    };
+
+    static auto *g_mpi_env [[maybe_unused]] =
+        ::testing::AddGlobalTestEnvironment(new MPIEnvironment);
 
     // =========================================================================
     // System bandwidth roofline (measured via STREAM on this machine)
@@ -98,6 +135,39 @@ namespace
     }
 
     // =========================================================================
+    // Tensor Parallel shape builders
+    // =========================================================================
+    // Megatron-style TP sharding:
+    //   Column-parallel (QKV, FFN Gate/Up): split N (output) dimension
+    //   Row-parallel (Wo, FFN Down):        split K (input) dimension
+
+    static std::vector<GEMVShape> buildTPShapes(const ModelConfig &m, int tp)
+    {
+        std::vector<GEMVShape> shapes;
+        int n_q = m.n_heads * m.head_dim;
+        int n_kv = m.n_kv_heads * m.head_dim;
+        std::string s = "_TP" + std::to_string(tp);
+
+        shapes.push_back({m.name + "_Q_proj" + s, "Attn", n_q / tp, m.d_model});     // ColPar: split N
+        shapes.push_back({m.name + "_K_proj" + s, "Attn", n_kv / tp, m.d_model});    // ColPar: split N
+        shapes.push_back({m.name + "_V_proj" + s, "Attn", n_kv / tp, m.d_model});    // ColPar: split N
+        shapes.push_back({m.name + "_Wo_proj" + s, "Attn", m.d_model, n_q / tp});    // RowPar: split K
+        shapes.push_back({m.name + "_FFN_Gate" + s, "FFN", m.d_ff / tp, m.d_model}); // ColPar: split N
+        shapes.push_back({m.name + "_FFN_Up" + s, "FFN", m.d_ff / tp, m.d_model});   // ColPar: split N
+        shapes.push_back({m.name + "_FFN_Down" + s, "FFN", m.d_model, m.d_ff / tp}); // RowPar: split K
+
+        return shapes;
+    }
+
+    static constexpr const char *TP_SHARD_MODES[] = {
+        "ColPar", "ColPar", "ColPar", "RowPar",
+        "ColPar", "ColPar", "RowPar"};
+
+    static constexpr const char *TP_LAYER_NAMES[] = {
+        "Q_proj", "K_proj", "V_proj", "Wo_proj",
+        "FFN_Gate", "FFN_Up", "FFN_Down"};
+
+    // =========================================================================
     // Format definitions
     // =========================================================================
 
@@ -150,24 +220,42 @@ namespace
 
     std::unique_ptr<TensorBase> createWeights(const std::string &fmt, size_t N, size_t K)
     {
-        if (fmt == "Q4_0") return TestTensorFactory::createQ4_0Random({N, K});
-        if (fmt == "IQ4_NL") return TestTensorFactory::createIQ4_NLRandom({N, K});
-        if (fmt == "Q4_1") return TestTensorFactory::createQ4_1Random({N, K});
-        if (fmt == "IQ4_XS") return TestTensorFactory::createIQ4_XSRandom({N, K});
-        if (fmt == "Q5_0") return TestTensorFactory::createQ5_0Random({N, K});
-        if (fmt == "Q5_1") return TestTensorFactory::createQ5_1Random({N, K});
-        if (fmt == "Q6_K") return TestTensorFactory::createQ6_KRandom({N, K});
-        if (fmt == "Q3_K") return TestTensorFactory::createQ3_KRandom({N, K});
-        if (fmt == "Q2_K") return TestTensorFactory::createQ2_KRandom({N, K});
-        if (fmt == "IQ3_S") return TestTensorFactory::createIQ3_SRandom({N, K});
-        if (fmt == "IQ3_XXS") return TestTensorFactory::createIQ3_XXSRandom({N, K});
-        if (fmt == "IQ2_S") return TestTensorFactory::createIQ2_SRandom({N, K});
-        if (fmt == "IQ2_XS") return TestTensorFactory::createIQ2_XSRandom({N, K});
-        if (fmt == "IQ2_XXS") return TestTensorFactory::createIQ2_XXSRandom({N, K});
-        if (fmt == "IQ1_S") return TestTensorFactory::createIQ1_SRandom({N, K});
-        if (fmt == "IQ1_M") return TestTensorFactory::createIQ1_MRandom({N, K});
-        if (fmt == "Q8_0") return TestTensorFactory::createQ8_0Random({N, K});
-        if (fmt == "Q8_1") return TestTensorFactory::createQ8_1Random({N, K});
+        if (fmt == "Q4_0")
+            return TestTensorFactory::createQ4_0Random({N, K});
+        if (fmt == "IQ4_NL")
+            return TestTensorFactory::createIQ4_NLRandom({N, K});
+        if (fmt == "Q4_1")
+            return TestTensorFactory::createQ4_1Random({N, K});
+        if (fmt == "IQ4_XS")
+            return TestTensorFactory::createIQ4_XSRandom({N, K});
+        if (fmt == "Q5_0")
+            return TestTensorFactory::createQ5_0Random({N, K});
+        if (fmt == "Q5_1")
+            return TestTensorFactory::createQ5_1Random({N, K});
+        if (fmt == "Q6_K")
+            return TestTensorFactory::createQ6_KRandom({N, K});
+        if (fmt == "Q3_K")
+            return TestTensorFactory::createQ3_KRandom({N, K});
+        if (fmt == "Q2_K")
+            return TestTensorFactory::createQ2_KRandom({N, K});
+        if (fmt == "IQ3_S")
+            return TestTensorFactory::createIQ3_SRandom({N, K});
+        if (fmt == "IQ3_XXS")
+            return TestTensorFactory::createIQ3_XXSRandom({N, K});
+        if (fmt == "IQ2_S")
+            return TestTensorFactory::createIQ2_SRandom({N, K});
+        if (fmt == "IQ2_XS")
+            return TestTensorFactory::createIQ2_XSRandom({N, K});
+        if (fmt == "IQ2_XXS")
+            return TestTensorFactory::createIQ2_XXSRandom({N, K});
+        if (fmt == "IQ1_S")
+            return TestTensorFactory::createIQ1_SRandom({N, K});
+        if (fmt == "IQ1_M")
+            return TestTensorFactory::createIQ1_MRandom({N, K});
+        if (fmt == "Q8_0")
+            return TestTensorFactory::createQ8_0Random({N, K});
+        if (fmt == "Q8_1")
+            return TestTensorFactory::createQ8_1Random({N, K});
         return nullptr;
     }
 
@@ -184,13 +272,13 @@ namespace
         std::string shape_name;
         std::string category;
         int N, K;
-        double packed_bytes;      // Total packed weight buffer size
-        double native_us;         // NativeVNNI p10 (us)
-        double baseline_us;       // CPUQuantisedGemmKernel p10 (us)
-        double native_bw_gbs;     // Effective BW for NativeVNNI (GB/s)
-        double baseline_bw_gbs;   // Effective BW for baseline (GB/s)
-        double roofline_pct;      // native BW / measured BW x 100
-        double speedup;           // baseline / native
+        double packed_bytes;    // Total packed weight buffer size
+        double native_us;       // NativeVNNI p10 (us)
+        double baseline_us;     // CPUNativeVNNIGemmKernel p10 (us)
+        double native_bw_gbs;   // Effective BW for NativeVNNI (GB/s)
+        double baseline_bw_gbs; // Effective BW for baseline (GB/s)
+        double roofline_pct;    // native BW / measured BW x 100
+        double speedup;         // baseline / native
         bool is_nibble_lut;
     };
 
@@ -235,13 +323,7 @@ namespace
     class CPUNativeVNNISweepTest : public ::testing::Test
     {
     protected:
-        void SetUp() override
-        {
-            int initialized = 0;
-            MPI_Initialized(&initialized);
-            if (!initialized)
-                MPI_Init(nullptr, nullptr);
-        }
+        void SetUp() override {}
     };
 
     // =========================================================================
@@ -260,8 +342,8 @@ namespace
         if (!native_kernel.isValid())
             return false;
 
-        // Baseline: CPUQuantisedGemmKernel (INT8 requantize path)
-        auto baseline_kernel = std::make_unique<llaminar2::gemm::CPUQuantisedGemmKernel>(
+        // Baseline: CPUNativeVNNIGemmKernel (INT8 requantize path)
+        auto baseline_kernel = std::make_unique<llaminar2::cpu::native_vnni::CPUNativeVNNIGemmKernel>(
             weights.get());
 
         // Random activations
@@ -388,7 +470,8 @@ namespace
               << total_spd_buf
               << fort::endr;
 
-        std::cout << "\n" << title << "\n";
+        std::cout << "\n"
+                  << title << "\n";
         std::cout << "Roofline: " << MEASURED_READ_BW_GBS << " GB/s (STREAM read, 56 cores)\n\n";
         std::cout << table.to_string() << std::endl;
     }
@@ -472,6 +555,188 @@ namespace
 
         std::cout << "\n=== Format Summary ===\n";
         std::cout << table.to_string() << std::endl;
+    }
+
+    // =========================================================================
+    // TP Scaling renderers (GEMV / bandwidth-focused)
+    // =========================================================================
+
+    void renderTPGemvScaling(const std::string &title,
+                             const std::string &fmt_name,
+                             const std::vector<BenchResult> &full,
+                             const std::vector<BenchResult> &tp2,
+                             const std::vector<BenchResult> &tp4)
+    {
+        fort::utf8_table table;
+        table.set_border_style(FT_DOUBLE2_STYLE);
+        table << fort::header
+              << "Layer" << "Shard" << "TP" << "N" << "K"
+              << "Nat \xc2\xb5s" << "BW GB/s" << "Roof%"
+              << "Ideal \xc2\xb5s" << "TP Eff"
+              << fort::endr;
+
+        table.column(0).set_cell_text_align(fort::text_align::left);
+        table.column(1).set_cell_text_align(fort::text_align::left);
+        for (int c = 5; c <= 9; ++c)
+            table.column(c).set_cell_text_align(fort::text_align::right);
+
+        double sum_ideal_tp2 = 0, sum_actual_tp2 = 0;
+        double sum_ideal_tp4 = 0, sum_actual_tp4 = 0;
+
+        size_t n = std::min({full.size(), tp2.size(), tp4.size()});
+        for (size_t i = 0; i < n; ++i)
+        {
+            const auto &f = full[i], &t2 = tp2[i], &t4 = tp4[i];
+
+            // TP=1 row
+            char nu1[16], bw1[16], rf1[16];
+            std::snprintf(nu1, sizeof(nu1), "%.1f", f.native_us);
+            std::snprintf(bw1, sizeof(bw1), "%.1f", f.native_bw_gbs);
+            std::snprintf(rf1, sizeof(rf1), "%.0f%%", f.roofline_pct);
+            table << TP_LAYER_NAMES[i] << TP_SHARD_MODES[i] << 1
+                  << f.N << f.K << nu1 << bw1 << rf1 << "-" << "-" << fort::endr;
+
+            // TP=2 row
+            double ideal2 = f.native_us / 2.0;
+            double eff2 = ideal2 / t2.native_us;
+            sum_ideal_tp2 += ideal2;
+            sum_actual_tp2 += t2.native_us;
+            char nu2[16], bw2[16], rf2[16], i2[16], e2[16];
+            std::snprintf(nu2, sizeof(nu2), "%.1f", t2.native_us);
+            std::snprintf(bw2, sizeof(bw2), "%.1f", t2.native_bw_gbs);
+            std::snprintf(rf2, sizeof(rf2), "%.0f%%", t2.roofline_pct);
+            std::snprintf(i2, sizeof(i2), "%.1f", ideal2);
+            std::snprintf(e2, sizeof(e2), "%.0f%%", eff2 * 100);
+            table << "" << "" << 2
+                  << t2.N << t2.K << nu2 << bw2 << rf2 << i2 << e2 << fort::endr;
+
+            // TP=4 row
+            double ideal4 = f.native_us / 4.0;
+            double eff4 = ideal4 / t4.native_us;
+            sum_ideal_tp4 += ideal4;
+            sum_actual_tp4 += t4.native_us;
+            char nu4[16], bw4[16], rf4[16], i4[16], e4[16];
+            std::snprintf(nu4, sizeof(nu4), "%.1f", t4.native_us);
+            std::snprintf(bw4, sizeof(bw4), "%.1f", t4.native_bw_gbs);
+            std::snprintf(rf4, sizeof(rf4), "%.0f%%", t4.roofline_pct);
+            std::snprintf(i4, sizeof(i4), "%.1f", ideal4);
+            std::snprintf(e4, sizeof(e4), "%.0f%%", eff4 * 100);
+            table << "" << "" << 4
+                  << t4.N << t4.K << nu4 << bw4 << rf4 << i4 << e4 << fort::endr;
+
+            if (i + 1 < n)
+                table << fort::separator;
+        }
+
+        table << fort::separator;
+        char se2[16], se4[16];
+        std::snprintf(se2, sizeof(se2), "%.0f%%",
+                      sum_actual_tp2 > 0 ? (sum_ideal_tp2 / sum_actual_tp2) * 100 : 0);
+        std::snprintf(se4, sizeof(se4), "%.0f%%",
+                      sum_actual_tp4 > 0 ? (sum_ideal_tp4 / sum_actual_tp4) * 100 : 0);
+        table << "AVG" << "" << 2 << "" << "" << "" << "" << "" << "" << se2 << fort::endr;
+        table << "" << "" << 4 << "" << "" << "" << "" << "" << "" << se4 << fort::endr;
+
+        std::cout << "\n"
+                  << title << "\n"
+                  << "Roofline: " << MEASURED_READ_BW_GBS << " GB/s (STREAM read)\n"
+                  << "TP Eff = ideal_time / actual_time (100% = perfect linear scaling)\n\n"
+                  << table.to_string() << std::endl;
+    }
+
+    struct TPGemvFormatSummary
+    {
+        std::string name;
+        std::string path;
+        double avg_eff_tp2 = 0, avg_eff_tp4 = 0;
+        double worst_eff_tp2 = 1e9, worst_eff_tp4 = 1e9;
+        std::string worst_layer_tp2, worst_layer_tp4;
+        double avg_bw_full = 0, avg_bw_tp2 = 0, avg_bw_tp4 = 0;
+    };
+
+    TPGemvFormatSummary computeTPGemvSummary(const std::string &fmt_name, bool is_nibble,
+                                             const std::vector<BenchResult> &full,
+                                             const std::vector<BenchResult> &tp2,
+                                             const std::vector<BenchResult> &tp4)
+    {
+        TPGemvFormatSummary s;
+        s.name = fmt_name;
+        s.path = is_nibble ? "NibbleLUT" : "INT8";
+        size_t n = std::min({full.size(), tp2.size(), tp4.size()});
+        double sum_eff2 = 0, sum_eff4 = 0;
+        double sum_bw_f = 0, sum_bw_2 = 0, sum_bw_4 = 0;
+        for (size_t i = 0; i < n; ++i)
+        {
+            double eff2 = (full[i].native_us / 2.0) / tp2[i].native_us;
+            double eff4 = (full[i].native_us / 4.0) / tp4[i].native_us;
+            sum_eff2 += eff2;
+            sum_eff4 += eff4;
+            sum_bw_f += full[i].native_bw_gbs;
+            sum_bw_2 += tp2[i].native_bw_gbs;
+            sum_bw_4 += tp4[i].native_bw_gbs;
+            if (eff2 < s.worst_eff_tp2)
+            {
+                s.worst_eff_tp2 = eff2;
+                s.worst_layer_tp2 = TP_LAYER_NAMES[i];
+            }
+            if (eff4 < s.worst_eff_tp4)
+            {
+                s.worst_eff_tp4 = eff4;
+                s.worst_layer_tp4 = TP_LAYER_NAMES[i];
+            }
+        }
+        if (n > 0)
+        {
+            s.avg_eff_tp2 = sum_eff2 / n;
+            s.avg_eff_tp4 = sum_eff4 / n;
+            s.avg_bw_full = sum_bw_f / n;
+            s.avg_bw_tp2 = sum_bw_2 / n;
+            s.avg_bw_tp4 = sum_bw_4 / n;
+        }
+        return s;
+    }
+
+    void renderTPGemvFormatSummary(const std::vector<TPGemvFormatSummary> &summaries)
+    {
+        fort::utf8_table table;
+        table.set_border_style(FT_DOUBLE2_STYLE);
+        table << fort::header
+              << "Format" << "Path"
+              << "Avg BW TP1" << "Avg BW TP2" << "Avg BW TP4"
+              << "Avg Eff TP2" << "Worst TP2" << "Worst Layer"
+              << "Avg Eff TP4" << "Worst TP4" << "Worst Layer"
+              << fort::endr;
+
+        table.column(0).set_cell_text_align(fort::text_align::left);
+        table.column(1).set_cell_text_align(fort::text_align::left);
+        table.column(7).set_cell_text_align(fort::text_align::left);
+        table.column(10).set_cell_text_align(fort::text_align::left);
+        for (int c : {2, 3, 4, 5, 6, 8, 9})
+            table.column(c).set_cell_text_align(fort::text_align::right);
+
+        for (const auto &s : summaries)
+        {
+            char bf[16], b2[16], b4[16], ae2[16], we2[16], ae4[16], we4[16];
+            std::snprintf(bf, sizeof(bf), "%.1f", s.avg_bw_full);
+            std::snprintf(b2, sizeof(b2), "%.1f", s.avg_bw_tp2);
+            std::snprintf(b4, sizeof(b4), "%.1f", s.avg_bw_tp4);
+            std::snprintf(ae2, sizeof(ae2), "%.0f%%", s.avg_eff_tp2 * 100);
+            std::snprintf(we2, sizeof(we2), "%.0f%%", s.worst_eff_tp2 * 100);
+            std::snprintf(ae4, sizeof(ae4), "%.0f%%", s.avg_eff_tp4 * 100);
+            std::snprintf(we4, sizeof(we4), "%.0f%%", s.worst_eff_tp4 * 100);
+
+            table << s.name << s.path
+                  << bf << b2 << b4
+                  << ae2 << we2 << s.worst_layer_tp2
+                  << ae4 << we4 << s.worst_layer_tp4
+                  << fort::endr;
+        }
+
+        std::cout << "\n=== TP Scaling Summary (GEMV, M=1) ===\n"
+                  << "TP Eff = (full_time / tp_degree) / split_time\n"
+                  << "  100% = perfect linear scaling\n"
+                  << "  <100% = overhead from smaller shape dimensions\n"
+                  << table.to_string() << std::endl;
     }
 
     // =========================================================================
@@ -741,7 +1006,7 @@ namespace
                 if (!native_kernel.isValid())
                     continue;
 
-                auto baseline = std::make_unique<llaminar2::gemm::CPUQuantisedGemmKernel>(
+                auto baseline = std::make_unique<llaminar2::cpu::native_vnni::CPUNativeVNNIGemmKernel>(
                     weights.get());
 
                 std::vector<float> A(M * shape.K);
@@ -775,6 +1040,87 @@ namespace
                   << "  CPU NativeVNNI Q4_0 Prefill (M=4,16,64) x Qwen 3B\n"
                   << "==============================================================\n\n";
         std::cout << table.to_string() << std::endl;
+    }
+
+    // =========================================================================
+    // TEST 6: TP Scaling — Key Formats × Qwen 7B (M=1 Decode)
+    //
+    // Benchmarks full + TP=2 + TP=4 shapes at M=1 to measure TP scaling.
+    // Bandwidth-focused: shows effective BW and roofline % per TP degree.
+    // =========================================================================
+
+    TEST_F(CPUNativeVNNISweepTest, TP_Scaling_KeyFormats_7B)
+    {
+        const auto &model = kQwen7B;
+        auto shapes_full = buildShapes(model);
+        auto shapes_tp2 = buildTPShapes(model, 2);
+        auto shapes_tp4 = buildTPShapes(model, 4);
+
+        std::vector<TPGemvFormatSummary> format_summaries;
+
+        for (const auto &fmt : KEY_FORMATS)
+        {
+            std::vector<BenchResult> res_full, res_tp2, res_tp4;
+            for (size_t i = 0; i < shapes_full.size(); ++i)
+            {
+                BenchResult r;
+                if (benchmarkPair(fmt, shapes_full[i], r))
+                    res_full.push_back(r);
+                if (benchmarkPair(fmt, shapes_tp2[i], r))
+                    res_tp2.push_back(r);
+                if (benchmarkPair(fmt, shapes_tp4[i], r))
+                    res_tp4.push_back(r);
+            }
+
+            renderTPGemvScaling(
+                "=== TP Scaling (GEMV): " + fmt.name + " \xc3\x97 Qwen 7B ===",
+                fmt.name, res_full, res_tp2, res_tp4);
+
+            format_summaries.push_back(
+                computeTPGemvSummary(fmt.name, fmt.is_nibble_lut, res_full, res_tp2, res_tp4));
+        }
+
+        renderTPGemvFormatSummary(format_summaries);
+    }
+
+    // =========================================================================
+    // TEST 7: TP Scaling — Key Formats × Qwen 0.5B (M=1 Decode)
+    //
+    // Small model stresses TP limits: K_proj TP=4 → N=32 (< 1 chunk!).
+    // =========================================================================
+
+    TEST_F(CPUNativeVNNISweepTest, TP_Scaling_KeyFormats_05B)
+    {
+        const auto &model = kQwen05B;
+        auto shapes_full = buildShapes(model);
+        auto shapes_tp2 = buildTPShapes(model, 2);
+        auto shapes_tp4 = buildTPShapes(model, 4);
+
+        std::vector<TPGemvFormatSummary> format_summaries;
+
+        for (const auto &fmt : KEY_FORMATS)
+        {
+            std::vector<BenchResult> res_full, res_tp2, res_tp4;
+            for (size_t i = 0; i < shapes_full.size(); ++i)
+            {
+                BenchResult r;
+                if (benchmarkPair(fmt, shapes_full[i], r))
+                    res_full.push_back(r);
+                if (benchmarkPair(fmt, shapes_tp2[i], r))
+                    res_tp2.push_back(r);
+                if (benchmarkPair(fmt, shapes_tp4[i], r))
+                    res_tp4.push_back(r);
+            }
+
+            renderTPGemvScaling(
+                "=== TP Scaling (GEMV): " + fmt.name + " \xc3\x97 Qwen 0.5B ===",
+                fmt.name, res_full, res_tp2, res_tp4);
+
+            format_summaries.push_back(
+                computeTPGemvSummary(fmt.name, fmt.is_nibble_lut, res_full, res_tp2, res_tp4));
+        }
+
+        renderTPGemvFormatSummary(format_summaries);
     }
 
 } // anonymous namespace

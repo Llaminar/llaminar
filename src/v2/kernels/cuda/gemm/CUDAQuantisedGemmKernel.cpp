@@ -488,7 +488,7 @@ namespace llaminar2
                 case 15:
                 case 16:
                 case 17:
-                case 18:
+                case 19:
                     return true;
                 default:
                     return false;
@@ -513,7 +513,7 @@ namespace llaminar2
                 case 12: // IQ3_XXS
                 case 15: // IQ2_XXS
                 case 16: // IQ1_S
-                case 18: // Q8_0
+                case 19: // Q8_0
                     return true;
                 default:
                     return false; // dual-scale: 8,9,10,13,14,17

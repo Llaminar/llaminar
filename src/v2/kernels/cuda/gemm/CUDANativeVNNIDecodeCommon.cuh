@@ -64,16 +64,17 @@ namespace llaminar2::cuda_native_vnni
         static constexpr bool is_dual_scale_asym = (CODEBOOK_ID == 10);
         static constexpr bool is_iq1_m = (CODEBOOK_ID == 17);
         static constexpr int payload_bytes =
-            (CODEBOOK_ID == 18)                                       ? 32
-            : (CODEBOOK_ID == 6 || CODEBOOK_ID == 7) ? 20 : (CODEBOOK_ID == 8)                     ? 24
-                                                      : (CODEBOOK_ID == 9)                       ? 12
-                                                      : (CODEBOOK_ID == 10)                      ? 8
-                                                      : (CODEBOOK_ID == 11)                      ? 13
-                                                      : (CODEBOOK_ID == 12)                      ? 12
-                                                      : (CODEBOOK_ID == 13 || CODEBOOK_ID == 14) ? 9
-                                                      : (CODEBOOK_ID == 15)                      ? 8
-                                                      : (CODEBOOK_ID == 16 || CODEBOOK_ID == 17) ? 6
-                                                                                                 : 16;
+            (CODEBOOK_ID == 19)                        ? 32
+            : (CODEBOOK_ID == 6 || CODEBOOK_ID == 7)   ? 20
+            : (CODEBOOK_ID == 8)                       ? 24
+            : (CODEBOOK_ID == 9)                       ? 12
+            : (CODEBOOK_ID == 10)                      ? 8
+            : (CODEBOOK_ID == 11)                      ? 13
+            : (CODEBOOK_ID == 12)                      ? 12
+            : (CODEBOOK_ID == 13 || CODEBOOK_ID == 14) ? 9
+            : (CODEBOOK_ID == 15)                      ? 8
+            : (CODEBOOK_ID == 16 || CODEBOOK_ID == 17) ? 6
+                                                       : 16;
     };
 
     __device__ __forceinline__ float fp16_bits_to_float(uint16_t bits)
@@ -436,7 +437,7 @@ namespace llaminar2::cuda_native_vnni
             packed_groups[6] = static_cast<int32_t>(static_cast<uint32_t>(grid8));
             packed_groups[7] = static_cast<int32_t>(static_cast<uint32_t>(grid8 >> 32));
         }
-        else if constexpr (CODEBOOK_ID == 18) // Q8_0: 32 raw int8 values → direct copy
+        else if constexpr (CODEBOOK_ID == 19) // Q8_0: 32 raw int8 values → direct copy
         {
 #pragma unroll
             for (int g = 0; g < 8; ++g)
@@ -506,7 +507,7 @@ namespace llaminar2::cuda_native_vnni
                 decode_groups<CODEBOOK_ID>(payload, packed_groups);
             }
         }
-        else if constexpr (CODEBOOK_ID == 18) // Q8_0: 32 bytes — two 128-bit loads
+        else if constexpr (CODEBOOK_ID == 19) // Q8_0: 32 bytes — two 128-bit loads
         {
             const int4 v0 = *reinterpret_cast<const int4 *>(payload);
             const int4 v1 = *reinterpret_cast<const int4 *>(payload + 16);

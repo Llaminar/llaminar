@@ -1542,16 +1542,17 @@ namespace llaminar2
         }
 
         // Stage 1: Pre-attention RMSNorm
-        // For HybridQ16: read from Q16_1 residual (auto-dispatches to Q16_1->FP32 kernel)
-        // For other modes: read from FP32 current_hidden
+        // Non-first layers: Fused ResidualAdd + RMSNorm (previous layer's ffn output + this norm)
+        // First layer: standalone RMSNorm (no prior residual to fuse)
         if (env.execution.exec_rmsnorm)
         {
             InferenceMode inference_mode(config_.activation_precision);
 
-            if (device.is_gpu() && !inference_mode.isHybridQ16() && layer_idx > config_.pp_layer_offset)
+            if (!inference_mode.isHybridQ16() && layer_idx > config_.pp_layer_offset)
             {
-                // GPU path for non-first layers: Fused ResidualAdd + RMSNorm
+                // Non-first layers: Fused ResidualAdd + RMSNorm
                 // Combines previous layer's ffn_residual with this layer's attn_norm
+                // On GPU: single fused kernel. On CPU: sequential ResidualAdd + RMSNorm via KernelFactory.
                 FusedResidualNormStage::Params fused_params;
                 fused_params.device_id = device;
                 fused_params.input = buffers.attn_proj;         // Previous layer's down_proj output
@@ -1571,10 +1572,9 @@ namespace llaminar2
             }
             else
             {
+                // First layer: standalone RMSNorm (no prior residual to fuse)
                 RMSNormStage::Params attn_norm_params;
-                attn_norm_params.input = (inference_mode.isHybridQ16() && buffers.residual)
-                                             ? buffers.residual
-                                             : buffers.current_hidden;
+                attn_norm_params.input = buffers.current_hidden;
                 attn_norm_params.output = buffers.normalized;
                 attn_norm_params.gamma = layer.attn_norm;
                 attn_norm_params.eps = config_.rms_norm_eps;
@@ -1660,9 +1660,6 @@ namespace llaminar2
         // Create InferenceMode for centralized mode logic
         InferenceMode inference_mode(config_.activation_precision);
 
-        // Check if we're in Hybrid mode with required buffers available
-        bool use_hybrid_mode = isHybridModeActive(inference_mode, buffers);
-
         // Stage 2.5: Per-head QK RMSNorm (Qwen3)
         // Applied to Q and K projections independently before RoPE.
         // Each head is normalized separately with gamma of shape [head_dim].
@@ -1737,30 +1734,6 @@ namespace llaminar2
             rope_params.q_buffer_id = BufferId::Q_PROJ;
             rope_params.k_buffer_id = BufferId::K_PROJ;
 
-            // Hybrid/HybridQ16 mode: output to separate buffers to avoid requantization
-            // Hybrid: Q8_1 → FP32, HybridQ16: Q8_1 → Q16_1
-            if (use_hybrid_mode)
-            {
-                rope_params.Q_out = buffers.Q_rope;
-                rope_params.K_out = buffers.K_rope;
-                rope_params.q_out_buffer_id = BufferId::Q_ROPE;
-                rope_params.k_out_buffer_id = BufferId::K_ROPE;
-                LOG_DEBUG("[Qwen2Graph] Layer " << layer_idx
-                                                << " using " << (inference_mode.isHybridQ16() ? "HybridQ16" : "Hybrid")
-                                                << " RoPE: Q8_1→" << (inference_mode.isHybridQ16() ? "Q16_1" : "FP32") << " output");
-
-                // HybridQ16 K precision fix: K from GEMM is Q16_1 (not Q8_1)
-                // RoPE will use Q16→Q16 dynamic scale path and output per-head scales
-                // Note: buffers.K is already Q16_1 for HybridQ16 (allocated by DeviceGraphOrchestrator)
-                if (inference_mode.isHybridQ16() && buffers.K_head_scales)
-                {
-                    rope_params.K_head_scales = buffers.K_head_scales;
-                    rope_params.kv_cache_scale = config_.kv_cache_scale;
-                    LOG_DEBUG("[Qwen2Graph] Layer " << layer_idx
-                                                    << " HybridQ16 K precision fix: K_head_scales buffer provided");
-                }
-            }
-
             graph.addNode(prefix + "rope",
                           ComputeStageFactory::createRoPE(rope_params),
                           device);
@@ -1795,22 +1768,8 @@ namespace llaminar2
 
                 KVCacheAppendStage::Params kv_append_params;
                 kv_append_params.device_id = device;
-
-                // Hybrid/HybridQ16 mode: Use K_rope (post-RoPE) instead of K (pre-RoPE Q8_1)
-                // The KV cache stores post-RoPE values (FP32 for Hybrid, Q16_1 for HybridQ16)
-                if (use_hybrid_mode && inference_mode.needsKRope())
-                {
-                    kv_append_params.K = buffers.K_rope;
-                    kv_append_params.k_buffer_id = BufferId::K_ROPE;
-                    LOG_DEBUG("[Qwen2Graph] Layer " << layer_idx
-                                                    << " KVCacheAppend using K_rope (post-RoPE "
-                                                    << (inference_mode.isHybridQ16() ? "Q16_1" : "FP32") << ")");
-                }
-                else
-                {
-                    kv_append_params.K = buffers.K;
-                    kv_append_params.k_buffer_id = BufferId::K_PROJ;
-                }
+                kv_append_params.K = buffers.K;
+                kv_append_params.k_buffer_id = BufferId::K_PROJ;
 
                 kv_append_params.V = buffers.V;
                 kv_append_params.v_buffer_id = BufferId::V_PROJ;
@@ -1825,15 +1784,6 @@ namespace llaminar2
                 // Phase 5.4: VNNI-safe Q16 KV cache quantization parameters
                 kv_append_params.kv_cache_scale = config_.kv_cache_scale;
                 kv_append_params.head_dim = config_.head_dim;
-
-                // Hybrid mode: populate V_dequant during KV cache append (V→FP32 conversion)
-                // This avoids a separate dequantization pass since KVCacheAppend already converts V
-                if (use_hybrid_mode && inference_mode.needsVDequant() && buffers.V_dequant)
-                {
-                    kv_append_params.V_dequant_out = buffers.V_dequant;
-                    LOG_DEBUG("[Qwen2Graph] Layer " << layer_idx
-                                                    << " KVCacheAppend will populate V_dequant for attention");
-                }
 
                 graph.addNode(prefix + "kv_append",
                               ComputeStageFactory::createKVCacheAppend(kv_append_params),
@@ -1853,34 +1803,16 @@ namespace llaminar2
             // - Decomposed attention: Use FP32 K_rope/V_dequant for best precision
             // - Fused attention: Use Q8_1 K/V (kernel only supports Q8_1 K/V currently)
             // KV cache always gets FP32 K_rope (stored separately from attention path)
-            //
-            // For Q8_1 mode: always use Q8_1 K/V
-            // For FP32 mode: always use FP32 K/V (but FP32 doesn't use fused attention)
-            //
-            // Note: Hybrid mode's main accuracy gain is from FP32 Q (via Q_rope) and
-            // FP32 streaming dequant for Wo projection, not from FP32 K/V.
-            ITensor *K_for_attn = buffers.K; // Default to Q8_1
-            ITensor *V_for_attn = buffers.V; // Default to Q8_1
-
-            // For decomposed attention path (FP32 or Hybrid without fused), use FP32 K/V if available
-            // The fused attention path check below will override this for fused attention
-            bool use_decomposed_fp32_kv = use_hybrid_mode && inference_mode.usesDecomposedFP32Attention() && buffers.V_dequant;
-            if (use_decomposed_fp32_kv)
-            {
-                // Only set FP32 K/V here - will be reset to Q8_1 if fused attention is used
-                K_for_attn = buffers.K_rope;
-                V_for_attn = buffers.V_dequant;
-            }
+            ITensor *K_for_attn = buffers.K;
+            ITensor *V_for_attn = buffers.V;
 
             int total_query_tokens = batch_size * seq_len;
             int kv_len = total_query_tokens; // Static hint for mode detection (actual queried at runtime)
             bool use_gather_stage = false;
 
             // For attention K/V source:
-            // - Prefill (cached_tokens == 0): Use projected K/V directly [batch_size * seq_len, kv_dim]
-            //   In Hybrid mode: K_rope (FP32) and V_dequant (FP32) from above
+            // - Prefill (cached_tokens == 0): Use projected K/V directly
             // - Decode (cached_tokens > 0 and batch_size == 1): Use cache (single-sequence only)
-            //   In Hybrid mode: KV cache is FP32
             // - Batched decode (cached_tokens > 0 and batch_size > 1): Gather K/V from multiple cache slots
             // Map global layer index to local KV cache index for PP stages
             int kv_local_layer = layer_idx - config_.pp_layer_offset;
@@ -1944,250 +1876,93 @@ namespace llaminar2
                 graph.addDependency(prefix + "kv_gather", prefix + "kv_append");
             }
 
-            // Determine if we can use Fused Attention + Wo
-            // Requirements:
-            // 1. fused_wo flag enabled (env.attention.fused_wo)
-            // 2. exec_attention and exec_gemm stages enabled
-            // 3. Wo weights available
-            // 4. CPU backend (JIT kernel is CPU-only)
-            // 5. Q8_1 or HybridQ16 activation precision
-            //    - Q8_1: Uses Q8_1 Q directly, outputs to FP32
-            //    - HybridQ16: Uses FP32 Q_rope, fuses Q16_1 residual add
-            // Note: Regular Hybrid mode should use decomposed attention for FP32 attention scoring.
-            // The fused path quantizes Q to Q8_1 and uses Q8_1 K/V, losing the precision benefit.
-            // HybridQ16 enables fused path with Q16_1 residual fusion for better precision.
-            bool use_fused_wo = env.attention.fused_wo &&
-                                env.execution.exec_attention &&
-                                env.execution.exec_gemm &&
-                                layer.wo &&
-                                backend == ComputeBackendType::CPU &&
-                                (config_.activation_precision == ActivationPrecision::Q8_1 ||
-                                 config_.activation_precision == ActivationPrecision::HybridQ16);
-
-            LOG_TRACE("[Qwen2Graph] Layer " << layer_idx << " fused_wo check: env.fused_wo=" << env.attention.fused_wo
-                                            << " exec_attention=" << env.execution.exec_attention
-                                            << " exec_gemm=" << env.execution.exec_gemm
-                                            << " has_wo=" << (layer.wo != nullptr)
-                                            << " cpu_backend=" << (backend == ComputeBackendType::CPU)
-                                            << " activation_precision=" << activationPrecisionToString(config_.activation_precision)
-                                            << " => use_fused_wo=" << use_fused_wo);
-
-            if (use_fused_wo)
+            // Decomposed Path: Attention -> Wo projection
+            if (env.execution.exec_attention)
             {
-                LOG_DEBUG("[Qwen2Graph] Layer " << layer_idx << " using FusedAttentionWoStage");
+                AttentionMode mode = detect_attention_mode(batch_size, seq_len, kv_len);
+                LOG_TRACE("[Qwen2Graph] Layer " << layer_idx
+                                                << " attention mode: " << attention_mode_name(mode)
+                                                << " (batch_size=" << batch_size << ", seq_len=" << seq_len << ", kv_len=" << kv_len << ")");
 
-                // FusedAttentionWoKernel only supports Q8_1 K/V currently
-                // For Hybrid mode, we use Q8_1 K/V for attention but store FP32 to cache
-                // Reset to Q8_1 K/V for fused attention path (overriding FP32 K/V if set above)
-                ITensor *K_for_fused = buffers.K;
-                ITensor *V_for_fused = buffers.V;
+                AttentionComputeStage::Params attn_params;
+                attn_params.Q = buffers.Q;
+                attn_params.K = K_for_attn;
+                attn_params.V = V_for_attn;
+                attn_params.output = buffers.attn_output;
+                attn_params.batch_size = batch_size;
+                attn_params.seq_len = seq_len;
+                attn_params.kv_len = kv_len;
+                attn_params.n_heads = local_n_heads;
+                attn_params.n_kv_heads = local_n_kv_heads;
+                attn_params.head_dim = config_.head_dim;
+                attn_params.causal = true;
+                attn_params.window_size = -1;
+                attn_params.attention_mode = mode;
+                attn_params.auto_detect_mode = true;
+                attn_params.workspace_scores = buffers.workspace_scores;
+                attn_params.workspace_context = buffers.workspace_context;
+                attn_params.workspace_mask = buffers.workspace_mask;
+                attn_params.kv_cache = kv_cache;
+                attn_params.layer_idx = layer_idx - config_.pp_layer_offset;
+                attn_params.read_kv_from_cache = device.is_gpu() &&
+                                                 (!kv_cache || kv_cache->precision() != ActivationPrecision::Q8_1);
+                attn_params.position_offset = position_ids ? position_ids[0] : 0;
+                attn_params.mpi_ctx = mpi_ctx_.get();
+                attn_params.device_id = device;
+                attn_params.q_buffer_id = BufferId::Q_PROJ;
+                attn_params.output_buffer_id = BufferId::ATTN_OUTPUT;
+                attn_params.workspace_scores_buffer_id = BufferId::ATTN_SCORES_WORKSPACE;
+                attn_params.workspace_context_buffer_id = BufferId::ATTN_CONTEXT_WORKSPACE;
 
-                // HybridQ16 K precision fix: Use K_rope (post-RoPE Q16_1 with dynamic scale)
-                // instead of K (pre-RoPE Q16_1 from GEMM) for prefill
-                // The K_head_scales were extracted during RoPE and must match the K data
-                if (inference_mode.isHybridQ16() && inference_mode.needsKRope() && buffers.K_rope)
-                {
-                    K_for_fused = buffers.K_rope;
-                    LOG_DEBUG("[Qwen2Graph] Layer " << layer_idx
-                                                    << " FusedAttention using K_rope (post-RoPE Q16_1)");
-                }
-
-                // Check decode mode - need to get K/V from cache
-                if (kv_cache)
-                {
-                    int cached_tokens = kv_cache->get_cached_tokens(kv_local_layer, 0);
-                    if (cached_tokens > 0 && batch_size == 1)
-                    {
-                        // Decode mode: use cached K/V
-                        // Note: In Hybrid mode, KV cache stores FP32 but fused kernel needs Q8_1
-                        // This is a known limitation - Hybrid decode will fail until we add
-                        // FP32 K/V support to FusedAttentionWoKernel
-                        // Use ITensor* directly (works for both CPU and GPU caches)
-                        K_for_fused = kv_cache->get_k(kv_local_layer, 0);
-                        V_for_fused = kv_cache->get_v(kv_local_layer, 0);
-                    }
-                }
-
-                FusedAttentionWoStage::Params fused_params;
-                // For Hybrid mode: use Q_rope (FP32) instead of Q (Q8_1)
-                // The FusedAttentionWoKernel will detect FP32 Q and quantize on-the-fly
-                fused_params.Q = (use_hybrid_mode && inference_mode.needsQRope()) ? buffers.Q_rope : buffers.Q;
-                fused_params.K = K_for_fused;
-                fused_params.V = V_for_fused;
-                fused_params.Wo = layer.wo;
-                fused_params.output = buffers.attn_proj; // Direct output to projection buffer
-                fused_params.batch_size = batch_size;
-                fused_params.seq_len = seq_len;
-                fused_params.kv_len = kv_len;
-                fused_params.n_heads = local_n_heads;
-                fused_params.n_kv_heads = local_n_kv_heads;
-                fused_params.head_dim = config_.head_dim;
-                fused_params.d_model = config_.d_model;
-                fused_params.causal = true;
-                fused_params.position_offset = position_ids ? position_ids[0] : 0;
-                fused_params.backend = config_.fused_attention_backend; // Use configured backend
-                fused_params.kv_cache = kv_cache;
-                // For PP stages: map global layer index to local KV cache index
-                fused_params.layer_idx = layer_idx - config_.pp_layer_offset;
-                fused_params.mpi_ctx = mpi_ctx_.get();
-                fused_params.device_id = device;
-
-                // Hybrid/HybridQ16 mode: enable streaming dequantization for FP32-equivalent Wo projection
-                // This gives highest numerical precision by dequantizing VNNI-packed weights to FP32
-                // row-by-row during GEMM, avoiding the precision loss of quantizing FP32 context.
-                fused_params.use_hybrid_wo = inference_mode.isAnyHybrid();
-
-                // HybridQ16 mode: enable Q16_1 residual fusion
-                // The JIT kernel will fuse residual addition after Wo projection:
-                // - Wo output stays in registers as FP32
-                // - Q16_1 residual is loaded, dequantized, added
-                // - Result is quantized to Q16_1 and stored directly
-                // This eliminates FP32 intermediate memory traffic (2.8× reduction).
-                if (inference_mode.isHybridQ16())
-                {
-                    fused_params.fuse_residual_add = true;
-                    fused_params.output = buffers.residual; // Output directly to Q16_1 residual
-
-                    // HybridQ16 K precision fix: pass K_head_scales from RoPE to attention kernel
-                    // This enables per-head scale lookup for Q×K^T computation
-                    if (buffers.K_head_scales)
-                    {
-                        fused_params.K_head_scales = buffers.K_head_scales;
-                        LOG_DEBUG("[Qwen2Graph] Layer " << layer_idx
-                                                        << " HybridQ16 K precision fix: K_head_scales passed to attention");
-                    }
-
-                    LOG_DEBUG("[Qwen2Graph] Layer " << layer_idx << " HybridQ16: fused residual add enabled");
-                }
-
-                // Optional context snapshot for debugging (enabled via buffer allocation)
-                fused_params.context_snapshot = buffers.context_snapshot;
-                // Optional attention output/residual snapshots for HybridQ16 debugging
-                fused_params.attention_output_snapshot = buffers.attention_output_snapshot;
-                fused_params.attention_residual_snapshot = buffers.attention_residual_snapshot;
-                LOG_DEBUG("[Qwen2Graph] Layer " << layer_idx << " fused_attn_wo context_snapshot="
-                                                << (buffers.context_snapshot ? "allocated" : "NULL")
-                                                << " attention_output_snapshot="
-                                                << (buffers.attention_output_snapshot ? "allocated" : "NULL")
-                                                << " attention_residual_snapshot="
-                                                << (buffers.attention_residual_snapshot ? "allocated" : "NULL")
-                                                << " use_hybrid_wo=" << fused_params.use_hybrid_wo
-                                                << " fuse_residual_add=" << fused_params.fuse_residual_add);
-
-                wo_producer_node = prefix + "fused_attn_wo";
-                graph.addNode(wo_producer_node,
-                              ComputeStageFactory::createFusedAttentionWo(fused_params),
+                graph.addNode(prefix + "attention",
+                              ComputeStageFactory::createAttentionCompute(attn_params),
                               device);
 
                 if (use_gather_stage)
-                    graph.addDependency(wo_producer_node, prefix + "kv_gather");
+                    graph.addDependency(prefix + "attention", prefix + "kv_gather");
                 else if (kv_cache)
-                    graph.addDependency(wo_producer_node, prefix + "kv_append");
+                    graph.addDependency(prefix + "attention", prefix + "kv_append");
                 else if (env.execution.exec_rope)
-                    graph.addDependency(wo_producer_node, prefix + "rope");
+                    graph.addDependency(prefix + "attention", prefix + "rope");
                 else if (env.execution.exec_gemm)
-                    graph.addDependency(wo_producer_node, prefix + "qkv_proj");
+                    graph.addDependency(prefix + "attention", prefix + "qkv_proj");
+
+                LOG_DEBUG("[Qwen2Graph] Using decomposed attention path");
             }
-            else
+
+            // Stage 5: Output projection (Wo)
+            if (env.execution.exec_gemm && layer.wo)
             {
-                // Standard Decomposed Path: Attention -> Wo
+                int wo_n = static_cast<int>(layer.wo->shape()[0]);
+                int wo_k = static_cast<int>(layer.wo->shape()[1]);
+
+                LOG_DEBUG("[Qwen2Graph] Layer " << layer_idx << " Wo dims: wo_n=" << wo_n
+                                                << " wo_k=" << wo_k
+                                                << " wo_shape=[" << layer.wo->shape()[0] << "," << layer.wo->shape()[1] << "]"
+                                                << " attn_output_shape=" << buffers.attn_output->shape()[0] << "x" << buffers.attn_output->shape()[1]);
+
+                wo_producer_node = prefix + "wo_proj";
+                graph.addNode(wo_producer_node,
+                              ComputeStageFactory::createGEMM(
+                                  GEMMStage::Params{
+                                      .device_id = device,
+                                      .A = buffers.attn_output,
+                                      .B = layer.wo,
+                                      .C = buffers.attn_proj,
+                                      .m = total_tokens,
+                                      .n = wo_n,
+                                      .k = wo_k,
+                                      .alpha = 1.0f,
+                                      .beta = 0.0f,
+                                      .transpose_B = false,
+                                      .gemm_context = GemmContext::ATTN,
+                                      .a_buffer_id = BufferId::ATTN_OUTPUT,
+                                      .c_buffer_id = BufferId::ATTN_PROJ}),
+                              device);
+
                 if (env.execution.exec_attention)
                 {
-                    AttentionMode mode = detect_attention_mode(batch_size, seq_len, kv_len);
-                    LOG_TRACE("[Qwen2Graph] Layer " << layer_idx
-                                                    << " attention mode: " << attention_mode_name(mode)
-                                                    << " (batch_size=" << batch_size << ", seq_len=" << seq_len << ", kv_len=" << kv_len << ")");
-
-                    AttentionComputeStage::Params attn_params;
-                    // For Hybrid mode: use Q_rope (FP32) instead of Q (Q8_1)
-                    attn_params.Q = (use_hybrid_mode && inference_mode.needsQRope()) ? buffers.Q_rope : buffers.Q;
-                    attn_params.K = K_for_attn;
-                    attn_params.V = V_for_attn;
-                    attn_params.output = buffers.attn_output;
-                    attn_params.batch_size = batch_size;
-                    attn_params.seq_len = seq_len;
-                    attn_params.kv_len = kv_len;               // Static hint, actual queried from kv_cache at runtime
-                    attn_params.n_heads = local_n_heads;       // Use local head count for TP
-                    attn_params.n_kv_heads = local_n_kv_heads; // Use local KV head count for TP
-                    attn_params.head_dim = config_.head_dim;
-                    attn_params.causal = true;
-                    attn_params.window_size = -1;
-                    attn_params.attention_mode = mode;
-                    attn_params.auto_detect_mode = true; // Re-detect at runtime with actual kv_len
-                    attn_params.workspace_scores = buffers.workspace_scores;
-                    attn_params.workspace_context = buffers.workspace_context;
-                    attn_params.workspace_mask = buffers.workspace_mask;
-                    attn_params.kv_cache = kv_cache; // Pass for dynamic kv_len query at execution
-                    // For PP stages: map global layer index to local KV cache index
-                    attn_params.layer_idx = layer_idx - config_.pp_layer_offset;
-                    // GPU prefill: read K/V from cache at execution time to get FP16
-                    // tensors directly, avoiding Q8_1→FP32→FP16 triple conversion.
-                    // Exception: Q8_1 KV cache — reading from cache during prefill forces
-                    // an FP32→Q8_1→FP32 round-trip that degrades attention accuracy.
-                    // For Q8_1, use the direct FP32 K/V wired from projections during prefill;
-                    // the decode path handles cache reads via effective_kv_len > seq_len.
-                    attn_params.read_kv_from_cache = device.is_gpu() &&
-                                                     (!kv_cache || kv_cache->precision() != ActivationPrecision::Q8_1);
-                    attn_params.position_offset = position_ids ? position_ids[0] : 0;
-                    attn_params.mpi_ctx = mpi_ctx_.get();
-                    attn_params.device_id = device;
-                    attn_params.q_buffer_id = (use_hybrid_mode && inference_mode.needsQRope())
-                                                  ? BufferId::Q_ROPE
-                                                  : BufferId::Q_PROJ;
-                    attn_params.output_buffer_id = BufferId::ATTN_OUTPUT;
-                    attn_params.workspace_scores_buffer_id = BufferId::ATTN_SCORES_WORKSPACE;
-                    attn_params.workspace_context_buffer_id = BufferId::ATTN_CONTEXT_WORKSPACE;
-
-                    graph.addNode(prefix + "attention",
-                                  ComputeStageFactory::createAttentionCompute(attn_params),
-                                  device);
-
-                    if (use_gather_stage)
-                        graph.addDependency(prefix + "attention", prefix + "kv_gather");
-                    else if (kv_cache)
-                        graph.addDependency(prefix + "attention", prefix + "kv_append");
-                    else if (env.execution.exec_rope)
-                        graph.addDependency(prefix + "attention", prefix + "rope");
-                    else if (env.execution.exec_gemm)
-                        graph.addDependency(prefix + "attention", prefix + "qkv_proj");
-
-                    LOG_DEBUG("[Qwen2Graph] Using decomposed attention path (Phase 9)");
-                }
-
-                // Stage 5: Output projection (Wo)
-                if (env.execution.exec_gemm && layer.wo)
-                {
-                    int wo_n = static_cast<int>(layer.wo->shape()[0]);
-                    int wo_k = static_cast<int>(layer.wo->shape()[1]);
-
-                    LOG_DEBUG("[Qwen2Graph] Layer " << layer_idx << " Wo dims: wo_n=" << wo_n
-                                                    << " wo_k=" << wo_k
-                                                    << " wo_shape=[" << layer.wo->shape()[0] << "," << layer.wo->shape()[1] << "]"
-                                                    << " attn_output_shape=" << buffers.attn_output->shape()[0] << "x" << buffers.attn_output->shape()[1]);
-
-                    wo_producer_node = prefix + "wo_proj";
-                    graph.addNode(wo_producer_node,
-                                  ComputeStageFactory::createGEMM(
-                                      GEMMStage::Params{
-                                          .device_id = device,
-                                          .A = buffers.attn_output,
-                                          .B = layer.wo,
-                                          .C = buffers.attn_proj,
-                                          .m = total_tokens, // Use total_tokens = batch_size * seq_len
-                                          .n = wo_n,
-                                          .k = wo_k,
-                                          .alpha = 1.0f,
-                                          .beta = 0.0f,
-                                          .transpose_B = false,
-                                          .gemm_context = GemmContext::ATTN,
-                                          .a_buffer_id = BufferId::ATTN_OUTPUT,
-                                          .c_buffer_id = BufferId::ATTN_PROJ}),
-                                  device);
-
-                    if (env.execution.exec_attention)
-                    {
-                        graph.addDependency(wo_producer_node, prefix + "attention");
-                    }
+                    graph.addDependency(wo_producer_node, prefix + "attention");
                 }
             }
 
@@ -2198,17 +1973,10 @@ namespace llaminar2
 
                 if (wo_is_sharded && needsTPAllreduce())
                 {
-                    // AllReduce the actual data, not full buffer capacity
                     size_t allreduce_count = static_cast<size_t>(total_tokens) * static_cast<size_t>(config_.d_model);
 
-                    // For HybridQ16 fusion: allreduce the Q16_1 residual buffer
-                    // For standard path: allreduce the FP32 attn_proj buffer
-                    TensorBase *allreduce_buffer = inference_mode.isHybridQ16()
-                                                       ? buffers.residual
-                                                       : buffers.attn_proj;
-                    BufferId wo_allreduce_bid = inference_mode.isHybridQ16()
-                                                    ? BufferId::RESIDUAL
-                                                    : BufferId::ATTN_PROJ;
+                    TensorBase *allreduce_buffer = buffers.attn_proj;
+                    BufferId wo_allreduce_bid = BufferId::ATTN_PROJ;
 
                     std::string stage_name = prefix + "wo_allreduce";
                     auto allreduce_stage = createTPAllreduceStage(
@@ -2222,37 +1990,14 @@ namespace llaminar2
                         wo_producer_node = stage_name;
 
                         LOG_TRACE("[Qwen2Graph] Layer " << layer_idx
-                                                        << " Wo: row-parallel sharded, adding allreduce"
-                                                        << (inference_mode.isHybridQ16() ? " (Q16_1 residual)" : " (FP32 proj)"));
+                                                        << " Wo: row-parallel sharded, adding allreduce");
                     }
                 }
             }
         }
 
-        // Stage 6: Residual connection
-        // Skip when HybridQ16 fusion is enabled - the fused kernel already did residual add
-        // Skip on GPU - fused into FusedResidualNormStage in buildFFNGraph (saves one memory pass)
-        if (env.execution.exec_residual && !inference_mode.isHybridQ16() && !device.is_gpu())
-        {
-            ResidualAddStage::Params res_params;
-            res_params.device_id = device; // Use graph's target device for kernel dispatch
-            res_params.input = buffers.attn_proj;
-            res_params.residual = buffers.current_hidden;
-            res_params.output = buffers.current_hidden;
-            res_params.num_elements = static_cast<size_t>(total_tokens) * static_cast<size_t>(config_.d_model);
-            res_params.input_buffer_id = BufferId::ATTN_PROJ;
-            res_params.residual_buffer_id = BufferId::HIDDEN_STATE;
-            res_params.output_buffer_id = BufferId::HIDDEN_STATE; // In-place with residual
-
-            graph.addNode(prefix + "attn_residual",
-                          ComputeStageFactory::createResidualAdd(res_params),
-                          device);
-
-            if (env.execution.exec_gemm && layer.wo && !wo_producer_node.empty())
-            {
-                graph.addDependency(prefix + "attn_residual", wo_producer_node);
-            }
-        }
+        // Attention residual is now fused into FusedResidualNormStage in buildFFNGraph
+        // (for non-first layers) or handled by the first layer's standalone RMSNorm path.
 
         return graph;
     }
@@ -2283,51 +2028,27 @@ namespace llaminar2
             backend = ComputeBackendType::GPU_ROCM;
         }
 
-        // Stage 1: Pre-FFN RMSNorm
+        // Stage 1: Pre-FFN RMSNorm (fused with attention residual add)
+        // Combines the attention output residual add with FFN normalization.
+        // On GPU: single fused kernel. On CPU: sequential ResidualAdd + RMSNorm via KernelFactory.
         if (env.execution.exec_rmsnorm)
         {
-            // For HybridQ16, read from Q16_1 residual buffer
-            InferenceMode inference_mode(config_.activation_precision);
+            FusedResidualNormStage::Params fused_params;
+            fused_params.device_id = device;
+            fused_params.input = buffers.attn_proj;         // Wo output (to be added)
+            fused_params.residual = buffers.current_hidden; // Hidden state (in-place update)
+            fused_params.gamma = layer.ffn_norm;            // FFN norm gamma
+            fused_params.norm_output = buffers.normalized;
+            fused_params.eps = config_.rms_norm_eps;
+            fused_params.seq_len = total_tokens;
+            fused_params.hidden_dim = config_.d_model;
+            fused_params.input_buffer_id = BufferId::ATTN_PROJ;
+            fused_params.residual_buffer_id = BufferId::HIDDEN_STATE;
+            fused_params.norm_output_buffer_id = BufferId::NORMALIZED;
 
-            if (device.is_gpu() && !inference_mode.isHybridQ16())
-            {
-                // GPU path: Fused ResidualAdd + RMSNorm in a single kernel
-                // Replaces separate attn_residual + ffn_norm with one kernel pass
-                FusedResidualNormStage::Params fused_params;
-                fused_params.device_id = device;
-                fused_params.input = buffers.attn_proj;         // Wo output (to be added)
-                fused_params.residual = buffers.current_hidden; // Hidden state (in-place update)
-                fused_params.gamma = layer.ffn_norm;            // FFN norm gamma
-                fused_params.norm_output = buffers.normalized;
-                fused_params.eps = config_.rms_norm_eps;
-                fused_params.seq_len = total_tokens;
-                fused_params.hidden_dim = config_.d_model;
-                fused_params.input_buffer_id = BufferId::ATTN_PROJ;
-                fused_params.residual_buffer_id = BufferId::HIDDEN_STATE;
-                fused_params.norm_output_buffer_id = BufferId::NORMALIZED;
-
-                graph.addNode(prefix + "ffn_norm",
-                              ComputeStageFactory::createFusedResidualNorm(fused_params),
-                              device);
-            }
-            else
-            {
-                RMSNormStage::Params ffn_norm_params;
-                ffn_norm_params.input = (inference_mode.isHybridQ16() && buffers.residual)
-                                            ? buffers.residual
-                                            : buffers.current_hidden;
-                ffn_norm_params.output = buffers.normalized;
-                ffn_norm_params.gamma = layer.ffn_norm;
-                ffn_norm_params.eps = config_.rms_norm_eps;
-                ffn_norm_params.seq_len = total_tokens;
-                ffn_norm_params.device_id = device;
-                ffn_norm_params.input_buffer_id = BufferId::HIDDEN_STATE;
-                ffn_norm_params.output_buffer_id = BufferId::NORMALIZED;
-
-                graph.addNode(prefix + "ffn_norm",
-                              ComputeStageFactory::createRMSNorm(ffn_norm_params),
-                              device);
-            }
+            graph.addNode(prefix + "ffn_norm",
+                          ComputeStageFactory::createFusedResidualNorm(fused_params),
+                          device);
         }
 
         // Stage 2: Gate and Up projections using FusedGateUpGEMMStage
@@ -2366,32 +2087,10 @@ namespace llaminar2
         }
 
         // Stage 3: SwiGLU activation
-        // On GPU: fused into down_proj GEMM (silu(gate)*up + quantize in single kernel)
-        // On CPU: standalone stage
-        const bool gpu_swiglu_fusion = device.is_gpu();
-        if (env.execution.exec_swiglu && !gpu_swiglu_fusion)
-        {
-            SwiGLUStage::Params swiglu_params;
-            swiglu_params.gate = buffers.gate;
-            swiglu_params.up = buffers.up;
-            swiglu_params.output = buffers.up;    // In-place
-            swiglu_params.seq_len = total_tokens; // Use total_tokens = batch_size * seq_len
-            swiglu_params.device_id = device;     // Use graph's target device for kernel dispatch
-
-            // Phase 2: Set BufferIds for contract-based coherence
-            swiglu_params.gate_buffer_id = BufferId::GATE_PROJ;
-            swiglu_params.up_buffer_id = BufferId::UP_PROJ;
-            swiglu_params.output_buffer_id = BufferId::UP_PROJ; // In-place with up
-
-            graph.addNode(prefix + "swiglu",
-                          ComputeStageFactory::createSwiGLU(swiglu_params),
-                          device);
-
-            if (env.execution.exec_gemm)
-            {
-                graph.addDependency(prefix + "swiglu", prefix + "gate_up_proj");
-            }
-        }
+        // Always fused into down_proj GEMM: silu(gate)*up + GEMM in single dispatch.
+        // On GPU: kernel-level fusion (quantize + SwiGLU + GEMM).
+        // On CPU: multiply_tensor_with_fused_swiglu() applies SwiGLU then GEMM.
+        const bool swiglu_fusion = true;
 
         // Stage 4: Down projection
         if (env.execution.exec_gemm && layer.down_proj)
@@ -2414,8 +2113,8 @@ namespace llaminar2
                 .a_buffer_id = BufferId::UP_PROJ,
                 .c_buffer_id = BufferId::ATTN_PROJ};
 
-            // GPU SwiGLU fusion: pass gate buffer to GEMM for fused silu(gate)*up + quantize
-            if (gpu_swiglu_fusion && env.execution.exec_swiglu)
+            // SwiGLU fusion: pass gate buffer to GEMM for fused silu(gate)*up + GEMM
+            if (swiglu_fusion && env.execution.exec_swiglu)
             {
                 down_params.gate_input = buffers.gate;
                 down_params.do_swiglu = true;
@@ -2425,9 +2124,9 @@ namespace llaminar2
                           ComputeStageFactory::createGEMM(down_params),
                           device);
 
-            if (gpu_swiglu_fusion || !env.execution.exec_swiglu)
+            if (swiglu_fusion || !env.execution.exec_swiglu)
             {
-                // GPU fusion or SwiGLU disabled: down_proj depends directly on gate_up_proj
+                // SwiGLU fused into GEMM or disabled: down_proj depends directly on gate_up_proj
                 if (env.execution.exec_gemm)
                 {
                     graph.addDependency(prefix + "down_proj", prefix + "gate_up_proj");
@@ -2462,23 +2161,16 @@ namespace llaminar2
         }
 
         // Stage 5: Residual connection
-        // On GPU (non-last layers): Skip - fused into next layer's FusedResidualNormStage attn_norm
+        // Non-last layers: Skip - fused into next layer's FusedResidualNormStage attn_norm
         // Last layer must keep ffn_residual since final_norm doesn't include residual add
-        const bool skip_ffn_residual = device.is_gpu() && (layer_idx < config_.pp_layer_offset + config_.n_layers - 1);
+        const bool skip_ffn_residual = (layer_idx < config_.pp_layer_offset + config_.n_layers - 1);
         if (env.execution.exec_residual && !skip_ffn_residual)
         {
-            // For HybridQ16, FFN residual uses Q16_1 residual buffer
-            InferenceMode inference_mode_ffn_res(config_.activation_precision);
-
             ResidualAddStage::Params res_params;
-            res_params.device_id = device; // Use graph's target device for kernel dispatch
+            res_params.device_id = device;
             res_params.input = buffers.attn_proj;
-            res_params.residual = (inference_mode_ffn_res.isHybridQ16() && buffers.residual)
-                                      ? buffers.residual
-                                      : buffers.current_hidden;
-            res_params.output = (inference_mode_ffn_res.isHybridQ16() && buffers.residual)
-                                    ? buffers.residual
-                                    : buffers.current_hidden;
+            res_params.residual = buffers.current_hidden;
+            res_params.output = buffers.current_hidden;
             res_params.num_elements = static_cast<size_t>(total_tokens) * static_cast<size_t>(config_.d_model);
             res_params.input_buffer_id = BufferId::ATTN_PROJ;
             res_params.residual_buffer_id = BufferId::HIDDEN_STATE;

@@ -765,14 +765,11 @@ namespace llaminar2
         }
 
         case StageType::SwiGLU:
-        {
-            SwiGLUStage::Params params;
-            params.gate = stage.inputs.size() > 0 ? stage.inputs[0] : nullptr;
-            params.up = stage.inputs.size() > 1 ? stage.inputs[1] : nullptr;
-            params.output = stage.outputs.size() > 0 ? stage.outputs[0] : nullptr;
-            params.seq_len = seq_len;
-            return ComputeStageFactory::createSwiGLU(params);
-        }
+            // SwiGLU is now fused into GEMM stages (multiply_tensor_with_fused_swiglu)
+            // The standalone SwiGLU stage has been removed.
+            LOG_ERROR("[GraphResolver] Standalone SwiGLU stage is no longer supported. "
+                      "SwiGLU should be fused into the GEMM stage via do_swiglu=true.");
+            return nullptr;
 
         case StageType::ResidualAdd:
         {

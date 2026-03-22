@@ -24,16 +24,6 @@ function(target_link_libraries_with_groups target)
 endfunction()
 
 # =============================================================================
-# HybridQ16 Test Suite Toggle
-# =============================================================================
-# HybridQ16 project is on hold - these tests are disabled by default until
-# we resume Q16_1 typed residual development. Enable with -DENABLE_HYBRIDQ16_TESTS=ON
-option(ENABLE_HYBRIDQ16_TESTS "Enable HybridQ16/Q16_1 pipeline tests (project on hold)" OFF)
-if(NOT ENABLE_HYBRIDQ16_TESTS)
-    message(STATUS "V2: HybridQ16 tests DISABLED (project on hold, use -DENABLE_HYBRIDQ16_TESTS=ON to enable)")
-endif()
-
-# =============================================================================
 # CPU Topology Detection for Test Configuration
 # =============================================================================
 # Detect system topology to configure optimal MPI/OpenMP settings for tests
@@ -1261,67 +1251,6 @@ add_v2_test(V2_Unit_MockWeightPlacementMap
     MPI_PROCS 1
 )
 
-# Test: JIT Register Allocation Framework
-# Compile-time safe register allocation for JIT code generation
-add_executable(v2_test_register_allocation unit/kernels/cpu/jit/Test__RegisterAllocation.cpp)
-target_link_libraries(v2_test_register_allocation 
-    llaminar2_core 
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Unit_RegisterAllocation 
-    COMMAND $<TARGET_FILE:v2_test_register_allocation>
-    LABELS "V2;Unit;JIT;RegisterAllocation;AVX512"
-)
-
-# Test: RegisterGuard - RAII-based register conflict detection
-add_executable(v2_test_register_guard unit/kernels/cpu/jit/Test__RegisterGuard.cpp)
-target_link_libraries(v2_test_register_guard 
-    llaminar2_core 
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Unit_RegisterGuard 
-    COMMAND $<TARGET_FILE:v2_test_register_guard>
-    LABELS "V2;Unit;JIT;RegisterGuard;AVX512"
-)
-
-# Test: RegisterEnforcement - Compile-time register type enforcement
-add_executable(v2_test_register_enforcement unit/kernels/cpu/jit/Test__RegisterEnforcement.cpp)
-target_link_libraries(v2_test_register_enforcement 
-    llaminar2_core 
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Unit_RegisterEnforcement 
-    COMMAND $<TARGET_FILE:v2_test_register_enforcement>
-    LABELS "V2;Unit;JIT;RegisterEnforcement;TypeSafety"
-)
-
-# Test: JitWoProjectionOptimized - BLAS-style Wo projection microkernels
-add_executable(v2_test_jit_wo_projection_optimized unit/kernels/cpu/attention/q8_1/jit/Test__JitWoProjectionOptimized.cpp)
-target_link_libraries(v2_test_jit_wo_projection_optimized 
-    llaminar2_core 
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Unit_JitWoProjectionOptimized 
-    COMMAND $<TARGET_FILE:v2_test_jit_wo_projection_optimized>
-    LABELS "V2;Unit;JIT;GEMM;GEMV;Wo;Attention;AVX512"
-)
-
-# Test: JitQ16MicrokernelParity - JIT vs Reference Q16 microkernel parity tests
-add_executable(v2_test_jit_q16_microkernel_parity unit/kernels/cpu/attention/q16_1/jit/Test__JitQ16MicrokernelParity.cpp)
-target_link_libraries(v2_test_jit_q16_microkernel_parity 
-    llaminar2_core 
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Unit_JitQ16MicrokernelParity 
-    COMMAND $<TARGET_FILE:v2_test_jit_q16_microkernel_parity>
-    LABELS "V2;Unit;JIT;Q16;Attention;Parity;AVX512;VNNI"
-)
-
 # Test: SwiGLU formula correctness (regression test for gate/up swap bug)
 # This test verifies that SwiGLU computes silu(gate) * up, NOT gate * silu(up)
 add_executable(v2_test_swiglu_formula unit/kernels/cpu/ops/Test__SwiGLUFormula.cpp)
@@ -1424,20 +1353,6 @@ add_v2_test(V2_Unit_TensorLayout
     MPI_PROCS 1
 )
 
-# Test: Q16 Fixed-Scale SIMD Quantization (VNNI-safe clipping)
-# Tests SIMD implementations (Scalar, AVX2, AVX512) of fixed-scale quantization
-add_executable(v2_test_q16_fixed_scale_simd unit/tensors/Test__Q16FixedScaleSIMD.cpp)
-target_link_libraries(v2_test_q16_fixed_scale_simd
-    llaminar2_core
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Unit_Q16FixedScaleSIMD
-    COMMAND $<TARGET_FILE:v2_test_q16_fixed_scale_simd>
-    LABELS "V2;Unit;Quantization;Q16_1;SIMD;AVX2;AVX512;VNNI;FixedScale;Safety"
-    MPI_PROCS 1
-)
-
 # Performance: Q16 Fixed-Scale SIMD Quantization
 add_executable(v2_perf_q16_fixed_scale_simd performance/tensors/Perf__Q16_FixedScaleSIMD.cpp)
 target_link_libraries(v2_perf_q16_fixed_scale_simd
@@ -1448,19 +1363,6 @@ target_link_libraries(v2_perf_q16_fixed_scale_simd
 add_v2_test(V2_Perf_Q16_FixedScaleSIMD
     COMMAND $<TARGET_FILE:v2_perf_q16_fixed_scale_simd>
     LABELS "V2;Performance;Quantization;Q16_1;SIMD;AVX2;AVX512;VNNI"
-    MPI_PROCS 1
-)
-
-# Performance: Q16 Dynamic-Scale RoPE (Scalar vs AVX2 vs AVX512)
-add_executable(v2_perf_q16_dynamic_scale_rope performance/kernels/cpu/primitives/Perf__Q16_DynamicScaleRoPE.cpp)
-target_link_libraries(v2_perf_q16_dynamic_scale_rope
-    llaminar2_core
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Perf_Q16_DynamicScaleRoPE
-    COMMAND $<TARGET_FILE:v2_perf_q16_dynamic_scale_rope>
-    LABELS "V2;Performance;RoPE;Q16_1;SIMD;AVX2;AVX512;DynamicScale;IntegerAttention"
     MPI_PROCS 1
 )
 
@@ -1684,41 +1586,6 @@ add_v2_test(V2_Unit_Q16_1RMSNorm
     MPI_PROCS 1
 )
 
-# Test: Q8_1 OnlineSoftmax JIT Kernel Unit Tests (fast, no model loading)
-# Tests the Q8_1 x Q8_1 attention kernel with fused online softmax
-add_executable(v2_test_q8_1_online_softmax_unit unit/kernels/cpu/gemm_v4/Test__Q8_1_OnlineSoftmax_Unit.cpp)
-target_link_libraries(v2_test_q8_1_online_softmax_unit 
-    llaminar2_core 
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Unit_Q8_1_OnlineSoftmax 
-    COMMAND $<TARGET_FILE:v2_test_q8_1_online_softmax_unit>
-    LABELS "V2;Unit;Kernels;GEMM;Q8_1;OnlineSoftmax;Attention;JIT;AVX512"
-    MPI_PROCS 1  # JIT kernel unit tests are CPU-only, single rank
-)
-
-# Test: Q8_1 Fused Attention JIT Kernel Unit Tests
-# Tests the fully fused Q8_1 attention kernel with dynamic head_dim support
-add_executable(v2_test_xbyak_vpmovdb unit/kernels/cpu/jit/Test__Xbyak_VPMOVDB.cpp)
-target_link_libraries(v2_test_xbyak_vpmovdb llaminar2_core GTest::gtest_main)
-add_v2_test(V2_Unit_Xbyak_VPMOVDB
-    COMMAND v2_test_xbyak_vpmovdb
-    LABELS "V2;Unit;Xbyak;VPMOVDB"
-)
-
-add_executable(v2_test_q8_1_fused_attention_unit unit/kernels/cpu/gemm_v4/Test__QuantisedAttentionJit_Q8_1_Fused.cpp)
-target_link_libraries(v2_test_q8_1_fused_attention_unit 
-    llaminar2_core 
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Unit_Q8_1_FusedAttention 
-    COMMAND $<TARGET_FILE:v2_test_q8_1_fused_attention_unit>
-    LABELS "V2;Unit;Kernels;GEMM;Q8_1;FusedAttention;Attention;JIT;AVX512;StackLayout"
-    MPI_PROCS 1  # JIT kernel unit tests are CPU-only, single rank
-)
-
 # Test: Q4_1 SIMD Unpack
 add_executable(v2_test_q4_1_simd_unpack unit/tensors/Test__Q4_1_SIMD_Unpack.cpp)
 target_link_libraries(v2_test_q4_1_simd_unpack 
@@ -1849,19 +1716,6 @@ add_v2_test(V2_Unit_Q6_K_Transcode
     MPI_PROCS 1
 )
 
-# Test: QuantisedGemmKernel Mins Flag Verification
-add_executable(v2_test_gemm_mins_flag unit/kernels/cpu/gemm_v4/Test__QuantisedGemmKernel_MinsFlag.cpp)
-target_link_libraries(v2_test_gemm_mins_flag 
-    llaminar2_core 
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Unit_Gemm_MinsFlag 
-    COMMAND $<TARGET_FILE:v2_test_gemm_mins_flag>
-    LABELS "V2;Unit;Kernels;GEMM;Mins"
-    MPI_PROCS 1
-)
-
 # Test: Q4_1 Integration (GEMM)
 add_executable(v2_test_q4_1_integration integration/tensors/Test__Q4_1Tensor.cpp)
 target_link_libraries(v2_test_q4_1_integration 
@@ -1958,19 +1812,6 @@ add_v2_test(V2_Integration_TensorBase_TransferTo
     COMMAND $<TARGET_FILE:v2_integration_tensor_transfer_to>
     LABELS "V2;Integration;Tensors;Coherence;TransferTo;GPU"
     MPI_PROCS 1
-)
-
-# Test: FusedGEMM kernel (generic N-projection fused GEMM)
-add_executable(v2_test_fused_gemm unit/kernels/cpu/gemm_v4/Test__FusedGEMM.cpp)
-target_link_libraries(v2_test_fused_gemm
-    llaminar2_core
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Unit_FusedGEMM
-    COMMAND $<TARGET_FILE:v2_test_fused_gemm>
-    LABELS "V2;Unit;Kernels;FusedKernels;GEMM;Quantization;OperatorFusion;FFN;Attention;AVX512;AVX2;CPU"
-    MPI_PROCS 1  # CPU-only fused kernel, single rank
 )
 
 # Test: FusedQKVGEMMStage compute stage (regression test for QKV bias bug)
@@ -2215,84 +2056,6 @@ target_link_libraries(v2_test_index_softmax
 add_v2_test(V2_Unit_IndexSoftmax
     COMMAND $<TARGET_FILE:v2_test_index_softmax>
     LABELS "V2;Unit;Primitives;Softmax;IntegerDomain;IndexSoftmax;LUT;Quantization"
-    MPI_PROCS 1
-)
-
-# Test: Quantised JIT GEMM kernel
-add_executable(v2_test_quantised_gemm_kernel unit/kernels/cpu/gemm_v4/Test__QuantisedGemmKernel.cpp)
-target_link_libraries(v2_test_quantised_gemm_kernel
-    llaminar2_core
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Unit_QuantisedGemmKernel
-    COMMAND $<TARGET_FILE:v2_test_quantised_gemm_kernel>
-    LABELS "V2;Unit;Kernels;GEMM;Quantised;JIT;CPU"
-    MPI_PROCS 1
-)
-
-# Test: Quantised GEMM Kernel Reproduction (Asymmetric/Tail bugs)
-add_executable(v2_test_quantised_gemm_kernel_repro unit/kernels/cpu/gemm_v4/Test__QuantisedGemmKernel_Repro.cpp)
-target_link_libraries(v2_test_quantised_gemm_kernel_repro
-    llaminar2_core
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Unit_QuantisedGemmKernel_Repro
-    COMMAND $<TARGET_FILE:v2_test_quantised_gemm_kernel_repro>
-    LABELS "V2;Unit;Kernels;GEMM;Quantised;Repro"
-    MPI_PROCS 1
-)
-
-# Test: Quantised GEMM Kernel Q8_1 Output Epilogue
-add_executable(v2_test_quantised_gemm_q8_1_output unit/kernels/cpu/gemm_v4/Test__QuantisedGemmKernel_Q8_1_Output.cpp)
-target_link_libraries(v2_test_quantised_gemm_q8_1_output
-    llaminar2_core
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Unit_QuantisedGemmKernel_Q8_1_Output
-    COMMAND $<TARGET_FILE:v2_test_quantised_gemm_q8_1_output>
-    LABELS "V2;Unit;Kernels;GEMM;Quantised;Q8_1;Epilogue"
-    MPI_PROCS 1
-)
-
-# Test: Quantised GEMM Kernel Q16_1 Output Epilogue
-add_executable(v2_test_quantised_gemm_q16_1_output unit/kernels/cpu/gemm_v4/Test__QuantisedGemmKernel_Q16_1_Output.cpp)
-target_link_libraries(v2_test_quantised_gemm_q16_1_output
-    llaminar2_core
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Unit_QuantisedGemmKernel_Q16_1_Output
-    COMMAND $<TARGET_FILE:v2_test_quantised_gemm_q16_1_output>
-    LABELS "V2;Unit;Kernels;GEMM;Quantised;Q16_1;Epilogue"
-    MPI_PROCS 1
-)
-
-# Test: Quantised JIT GEMM Fused Operations (Bias, Mask, Softmax)
-add_executable(v2_test_quantised_gemm_fused unit/kernels/cpu/gemm_v4/Test__QuantisedGemmFused.cpp)
-target_link_libraries(v2_test_quantised_gemm_fused
-    llaminar2_core
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Unit_QuantisedGemmFused
-    COMMAND $<TARGET_FILE:v2_test_quantised_gemm_fused>
-    LABELS "V2;Unit;Kernels;GEMM;Quantised;Fused;CPU"
-    MPI_PROCS 1
-)
-
-# Test: FloatingPointGemmKernel (OneDNN-based FP32/BF16/FP16 GEMM)
-add_executable(v2_test_fp_gemm_kernel unit/kernels/cpu/gemm_v4/Test__FloatingPointGemmKernel.cpp)
-target_link_libraries(v2_test_fp_gemm_kernel
-    llaminar2_core
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Unit_FloatingPointGemmKernel
-    COMMAND $<TARGET_FILE:v2_test_fp_gemm_kernel>
-    LABELS "V2;Unit;Kernels;GEMM;FloatingPoint;OneDNN;FP32;Strided;Softmax;CausalMask;CPU"
     MPI_PROCS 1
 )
 
@@ -2562,37 +2325,6 @@ add_v2_test(V2_Unit_Q16_to_Q16_RoPE_FixedScale
     MPI_PROCS 1  # RoPE is CPU-only, single rank
 )
 
-# Test: Dynamic-Scale Q16 to Q16 RoPE (Phase 12 - preserves spiky K projection) [DISABLED - project on hold]
-if(ENABLE_HYBRIDQ16_TESTS)
-    add_executable(v2_test_q16_to_q16_rope_dynamic_scale unit/kernels/cpu/ops/Test__Q16_to_Q16_RoPE_DynamicScale.cpp)
-    target_link_libraries(v2_test_q16_to_q16_rope_dynamic_scale 
-        llaminar2_core 
-        GTest::gtest
-        GTest::gtest_main
-    )
-    add_v2_test(V2_Unit_Q16_to_Q16_RoPE_DynamicScale 
-        COMMAND $<TARGET_FILE:v2_test_q16_to_q16_rope_dynamic_scale>
-        LABELS "V2;Unit;Primitives;RoPE;Q16_1;DynamicScale;IntegerAttention;HybridQ16;Correctness;CPU;Phase12"
-        MPI_PROCS 1  # RoPE is CPU-only, single rank
-    )
-endif()
-
-# Test: HybridQ16 K Precision Fix Regression Tests (Phase 8 bugs) [DISABLED - project on hold]
-# Covers: single-block RoPE, Q8_1 field names, block_size constraints, FP32→Q8 quantization
-if(ENABLE_HYBRIDQ16_TESTS)
-    add_executable(v2_test_hybridq16_k_regression unit/tensors/Test__HybridQ16_K_Precision_Fix_Regressions.cpp)
-    target_link_libraries(v2_test_hybridq16_k_regression 
-        llaminar2_core 
-        GTest::gtest
-        GTest::gtest_main
-    )
-    add_v2_test(V2_Unit_HybridQ16_K_Precision_Fix_Regressions 
-        COMMAND $<TARGET_FILE:v2_test_hybridq16_k_regression>
-        LABELS "V2;Unit;Regression;RoPE;GEMM;Q16_1;Q8_1;IntegerAttention;HybridQ16;Correctness;CPU;Phase8"
-        MPI_PROCS 1  # CPU-only, single rank
-    )
-endif()
-
 # Test: CPURoPEKernelT class interface
 add_executable(v2_test_cpu_rope_kernel unit/kernels/cpu/ops/Test__CPURoPEKernelT.cpp)
 target_link_libraries(v2_test_cpu_rope_kernel 
@@ -2629,19 +2361,6 @@ target_link_libraries(v2_test_cpu_swiglu_kernel_typed
 add_v2_test(V2_Unit_CPUSwiGLUKernelT_Precision
     COMMAND $<TARGET_FILE:v2_test_cpu_swiglu_kernel_typed>
     LABELS "V2;Unit;Kernels;SwiGLU;TypedPrecision;FP32;BF16;FP16;Q8_1;CPU"
-    MPI_PROCS 1
-)
-
-# Test: Native Format Decode (Q4_0→int8 without requantization)
-add_executable(v2_test_native_format_decode unit/kernels/cpu/gemm_v4/Test__NativeFormatDecode.cpp)
-target_link_libraries(v2_test_native_format_decode
-    llaminar2_core
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Unit_NativeFormatDecode
-    COMMAND $<TARGET_FILE:v2_test_native_format_decode>
-    LABELS "V2;Unit;Kernels;Quantization;NativeDecode;Q4_0;INT8;PrecisionPreservation"
     MPI_PROCS 1
 )
 
@@ -3222,7 +2941,6 @@ add_v2_test(V2_Integration_IQ2_XXS_GEMM
     LABELS "V2;Integration;GEMM;IQ2_XXS;Quantization"
 )
 
-
 # Test: IQ2_XS GEMM Integration
 add_executable(v2_test_iq2xs_gemm_integration integration/kernels/cpu/gemm/Test__IQ2_XS_GEMM_Integration.cpp)
 target_link_libraries(v2_test_iq2xs_gemm_integration 
@@ -3475,7 +3193,6 @@ add_v2_test(V2_Integration_Q4_0_SIMD
     MPI_PROCS 1
     LABELS "V2;Integration;TensorOperations;Q4_0;Quantization;SIMD;AVX2;AVX512;Equivalency"
 )
-
 
 # Test: Q4_1 SIMD Equivalency
 add_executable(v2_test_q4_1_simd unit/tensors/Test__Q4_1Tensor.cpp)
@@ -4589,55 +4306,6 @@ add_v2_test(V2_Unit_ExecutionPolicy
     MPI_PROCS 1
 )
 
-# Test: EmbeddingStage Q16_1 Output
-# Tests that EmbeddingStage correctly produces Q16_1 output for HybridQ16 mode [DISABLED - project on hold]
-# Verifies FP32 → Q16_1 quantization preserves embedding values
-# NOTE: This is an Integration test (slow, requires model loading)
-if(ENABLE_HYBRIDQ16_TESTS)
-    add_executable(v2_test_embedding_stage_q16_1 unit/execution/compute_stages/stages/Test__EmbeddingStage_Q16_1Output.cpp)
-    target_link_libraries(v2_test_embedding_stage_q16_1 llaminar2_core GTest::gtest GTest::gtest_main)
-    add_v2_test(V2_Integration_EmbeddingStage_Q16_1Output
-        COMMAND $<TARGET_FILE:v2_test_embedding_stage_q16_1>
-        LABELS "V2;Integration;Execution;ComputeStage;Embedding;Q16_1;HybridQ16;Quantization"
-        MPI_PROCS 1
-    )
-endif()
-
-# Test: HybridQ16 Layer 0 Dataflow Diagnostics [DISABLED - project on hold]
-# Traces data flow from embedding through RMSNorm in HybridQ16 mode
-if(ENABLE_HYBRIDQ16_TESTS)
-    add_executable(v2_test_hybridq16_layer0_dataflow unit/execution/compute_stages/stages/Test__HybridQ16_Layer0_Dataflow.cpp)
-    target_link_libraries(v2_test_hybridq16_layer0_dataflow llaminar2_core GTest::gtest GTest::gtest_main)
-    add_v2_test(V2_Unit_HybridQ16_Layer0_Dataflow
-        COMMAND $<TARGET_FILE:v2_test_hybridq16_layer0_dataflow>
-        LABELS "V2;Unit;Execution;ComputeStage;HybridQ16;Dataflow;Diagnostics"
-        MPI_PROCS 1
-    )
-endif()
-
-# Test: FusedAttentionWoStage with Q16_INTEGER backend
-# Tests stage construction, type, backend support, and dump info with Q16FusedAttentionKernel
-add_executable(v2_test_fused_attention_wo_stage_q16 unit/execution/compute_stages/stages/Test__FusedAttentionWoStage_Q16Backend.cpp)
-target_link_libraries(v2_test_fused_attention_wo_stage_q16 llaminar2_core GTest::gtest GTest::gtest_main)
-add_v2_test(V2_Unit_FusedAttentionWoStage_Q16Backend
-    COMMAND $<TARGET_FILE:v2_test_fused_attention_wo_stage_q16>
-    LABELS "V2;Unit;Execution;ComputeStage;FusedAttentionWo;Q16_INTEGER;Q16FusedAttentionKernel"
-    MPI_PROCS 1
-)
-
-# Test: KVCacheAppendStage kv_cache_scale Propagation [DISABLED - project on hold]
-# Locks in the VNNI-safe quantization contract for Q16_1 KV cache
-# Tests default scale (8.0), custom scale propagation, and VNNI safety limits
-if(ENABLE_HYBRIDQ16_TESTS)
-    add_executable(v2_test_kv_cache_scale_propagation unit/execution/kvcache/Test__KVCacheScalePropagation.cpp)
-    target_link_libraries(v2_test_kv_cache_scale_propagation llaminar2_core GTest::gtest GTest::gtest_main)
-    add_v2_test(V2_Unit_KVCacheScalePropagation
-        COMMAND $<TARGET_FILE:v2_test_kv_cache_scale_propagation>
-        LABELS "V2;Unit;Execution;ComputeStage;KVCache;VNNI;Quantization;Q16_1;Scale"
-        MPI_PROCS 1
-    )
-endif()
-
 # Test: ResidualAddStage Precision Awareness
 # Tests precision-aware residual addition: FP32, BF16, FP16, Q8_1
 # Verifies Q8_1 uses native simd::q8_1_add_q8_1 (no explicit dequant)
@@ -4646,17 +4314,6 @@ target_link_libraries(v2_test_residual_add_precision llaminar2_core GTest::gtest
 add_v2_test(V2_Unit_ResidualAddPrecision
     COMMAND $<TARGET_FILE:v2_test_residual_add_precision>
     LABELS "V2;Unit;Execution;ComputeStage;ResidualAdd;Precision;Q8_1;SIMD"
-    MPI_PROCS 1
-)
-
-# Test: Pure Integer Residual Add (Q16_1 + Q16_1 → Q16_1)
-# Phase 6 of Q16 Integer Attention: Full integer residual stream
-# Tests block sizes 32/64/128, edge cases, error handling
-add_executable(v2_test_residual_add_q16_1 unit/execution/compute_stages/stages/Test__ResidualAddStage_Q16_1.cpp)
-target_link_libraries(v2_test_residual_add_q16_1 llaminar2_core GTest::gtest GTest::gtest_main)
-add_v2_test(V2_Unit_ResidualAddQ16_1
-    COMMAND $<TARGET_FILE:v2_test_residual_add_q16_1>
-    LABELS "V2;Unit;Execution;ComputeStage;ResidualAdd;Q16_1;IntegerAttention;Phase6"
     MPI_PROCS 1
 )
 
@@ -4766,17 +4423,6 @@ target_link_libraries(v2_test_igraph_builder llaminar2_core GTest::gtest GTest::
 add_v2_test(V2_Unit_IGraphBuilder
     COMMAND $<TARGET_FILE:v2_test_igraph_builder>
     LABELS "V2;Unit;Execution;IGraphBuilder;MockGraphBuilder;Interface"
-    MPI_PROCS 1
-)
-
-# Test: HybridPrecisionConfig (per-buffer precision configuration for Hybrid mode)
-# Tests buffer precision resolution, default configuration, and requiresSeparateBuffer
-# Part of Hybrid Activation Precision Mode implementation
-add_executable(v2_test_hybrid_precision_config unit/execution/config/Test__HybridPrecisionConfig.cpp)
-target_link_libraries(v2_test_hybrid_precision_config llaminar2_core GTest::gtest GTest::gtest_main)
-add_v2_test(V2_Unit_HybridPrecisionConfig
-    COMMAND $<TARGET_FILE:v2_test_hybrid_precision_config>
-    LABELS "V2;Unit;Execution;HybridPrecision;BufferPrecision;ActivationPrecision"
     MPI_PROCS 1
 )
 
@@ -5527,19 +5173,6 @@ add_v2_test(V2_Unit_StageDumpInfo
     MPI_PROCS 1
 )
 
-# Test: StageDumperNativeFormat (native tensor format preservation in stage dumps) [DISABLED - project on hold]
-# Validates that addInput(TensorBase*)/addOutput(TensorBase*) preserve native format
-# (Q8_1, Q16_1, FP32) instead of dequantizing to FP32 - critical for replay testing
-if(ENABLE_HYBRIDQ16_TESTS)
-    add_executable(v2_test_stage_dumper_native_format unit/execution/debug/Test__StageDumperNativeFormat.cpp)
-    target_link_libraries(v2_test_stage_dumper_native_format llaminar2_core GTest::gtest GTest::gtest_main)
-    add_v2_test(V2_Unit_StageDumperNativeFormat
-        COMMAND $<TARGET_FILE:v2_test_stage_dumper_native_format>
-        LABELS "V2;Unit;ComputeStage;StageDump;NativeFormat;Q8_1;Q16_1;Debug"
-        MPI_PROCS 1
-    )
-endif()
-
 # Test: KernelSnapshotInfo (getKernelSnapshotInfo() for all kernel implementations)
 # Validates that each kernel correctly reports its I/O buffers via IKernelSnapshotCapable
 add_executable(v2_test_kernel_snapshot_info unit/tensors/Test__KernelSnapshotInfo.cpp)
@@ -6246,19 +5879,6 @@ add_v2_test(V2_Unit_Qwen2Graph_PP
     LABELS "V2;Unit;Models;Qwen2;Qwen2Graph;PipelineParallelism;UnifiedPPGraph"
 )
 
-# Test: KV cache layer index mapping in Pipeline Parallel mode (regression test)
-add_executable(v2_test_qwen2graph_kvcache_pp unit/models/qwen/Test__Qwen2Graph_KVCachePP.cpp)
-target_link_libraries(v2_test_qwen2graph_kvcache_pp 
-    llaminar2_core 
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Unit_Qwen2Graph_KVCachePP 
-    COMMAND $<TARGET_FILE:v2_test_qwen2graph_kvcache_pp>
-    MPI_PROCS 1
-    LABELS "V2;Unit;Models;Qwen2;Qwen2Graph;PipelineParallelism;KVCache;Regression"
-)
-
 # Test: PP absolute layer range validation (regression test for LocalPP crash)
 add_executable(v2_test_qwen2graph_pp_layer_range unit/models/qwen/Test__Qwen2Graph_PPLayerRange.cpp)
 target_link_libraries(v2_test_qwen2graph_pp_layer_range 
@@ -6355,125 +5975,6 @@ add_v2_test(V2_Integration_Q16MPI_Allreduce
     LABELS "V2;Integration;MPI;Q16;Allreduce;VariableBlockSize;TensorParallel"
 )
 
-# Test: QuantisedGemmKernel Fused Operations (Bias, Softmax, SwiGLU)
-# Validates mathematical correctness of fused ops against separate primitives
-add_executable(v2_integration_quantised_gemm_fused integration/kernels/cpu/gemm/Test__QuantisedGemmFused.cpp)
-target_link_libraries(v2_integration_quantised_gemm_fused 
-    llaminar2_core 
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Integration_QuantisedGemmFused 
-    COMMAND $<TARGET_FILE:v2_integration_quantised_gemm_fused>
-    MPI_PROCS 1
-    LABELS "V2;Integration;Kernels;GEMM;FusedOps;Softmax;SwiGLU;Bias;Correctness"
-)
-
-# Test: Q8_1 OnlineSoftmax Kernel Correctness (Q8_1 x Q8_1 attention + fused softmax)
-# Validates correctness across model sizes (Qwen 0.5B/7B/32B) and sequence lengths
-add_executable(v2_integration_q8_1_online_softmax integration/kernels/cpu/attention/q8_1/Test__Q8_1_OnlineSoftmax.cpp)
-target_link_libraries(v2_integration_q8_1_online_softmax 
-    llaminar2_core 
-    GTest::gtest
-)
-add_v2_test(V2_Integration_Q8_1_OnlineSoftmax 
-    COMMAND $<TARGET_FILE:v2_integration_q8_1_online_softmax>
-    MPI_PROCS 1
-    LABELS "V2;Integration;Kernels;GEMM;Attention;Q8_1;OnlineSoftmax;Correctness"
-)
-
-# Test: Q8_1 Fully Fused Attention Kernel Correctness
-# Validates the fused Q8_1 attention kernel (Q@K^T + softmax + @V + requant)
-# against pure FP32 reference implementation (FP32 GEMM + softmax + FP32 GEMM)
-add_executable(v2_integration_q8_1_fused_attention integration/kernels/cpu/attention/q8_1/Test__Q8_1_FusedAttention.cpp)
-target_link_libraries(v2_integration_q8_1_fused_attention 
-    llaminar2_core 
-    GTest::gtest
-)
-add_v2_test(V2_Integration_Q8_1_FusedAttention 
-    COMMAND $<TARGET_FILE:v2_integration_q8_1_fused_attention>
-    MPI_PROCS 1
-    LABELS "V2;Integration;Kernels;Attention;Q8_1;FusedOps;Correctness"
-)
-
-# NOTE: Q8_1 vs FP32 attention parity tests have been moved to e2e/parity/kernels/attention/
-# See: V2_E2E_Parity_SimpleAttentionQ8_1_vs_FP32 and V2_E2E_Parity_JitFusedAttentionWo_vs_FP32
-
-# Test: Q8_1 Isolated Attention Kernel Test
-# Captures attention inputs from pipeline, compares FP32 vs Q8_1 kernel in isolation
-# Used for debugging attention kernel divergence without full pipeline complexity
-
-# Test: Q8_1 Attention JIT Replay Test
-# Saves attention inputs to disk and replays them through the JIT kernel in isolation
-# Used for reproducible debugging of the JIT attention kernel
-
-# Test: Q8_1 Attention Replay from Captured Dump
-# Loads actual Q/K/V blocks captured from E2E pipeline via LLAMINAR_DUMP_ATTENTION_INPUTS
-# Compares JIT kernel output to C++ reference to isolate kernel bugs from precision loss
-add_executable(v2_integration_q8_1_attention_replay_dump integration/kernels/cpu/attention/q8_1/Test__Q8_1_AttentionReplayFromDump.cpp)
-target_link_libraries(v2_integration_q8_1_attention_replay_dump 
-    llaminar2_core 
-    GTest::gtest
-)
-add_v2_test(V2_Integration_Q8_1_AttentionReplayDump
-    COMMAND $<TARGET_FILE:v2_integration_q8_1_attention_replay_dump>
-    MPI_PROCS 1
-    LABELS "V2;Integration;Kernels;Attention;Q8_1;JIT;Debug;Replay;E2E"
-)
-
-# Test: HybridQ16 Attention Replay from StageDump [DISABLED - project on hold]
-# Loads Q/K tensors and attention context captured from FusedAttentionWoStage via StageDumper
-# Analyzes Q16 quantization error and attention output statistics
-# Run V2_Integration_HybridQ16Pipeline_vs_FP32 with LLAMINAR_STAGE_DUMP_ENABLED=1 first
-if(ENABLE_HYBRIDQ16_TESTS)
-    add_executable(v2_integration_hybridq16_attention_replay integration/replay/Test__HybridQ16AttentionReplay.cpp)
-    target_link_libraries(v2_integration_hybridq16_attention_replay 
-        llaminar2_core 
-        GTest::gtest
-    )
-    add_v2_test(V2_Integration_HybridQ16_AttentionReplay
-        COMMAND $<TARGET_FILE:v2_integration_hybridq16_attention_replay>
-        MPI_PROCS 1
-        LABELS "V2;Integration;Kernels;Attention;Q16;HybridQ16;Debug;Replay"
-    )
-endif()
-
-# Test: OnlineSoftmax V2 Replay from StageDump [DISABLED - project on hold]
-# Compares V1 (running-average) vs V2 (deferred-normalization) online softmax
-# using real Q/K/V tensors captured from FusedAttentionWoStage
-# Validates deferred normalization produces equivalent results to running average
-if(ENABLE_HYBRIDQ16_TESTS)
-    add_executable(v2_integration_online_softmax_v2_replay integration/replay/Test__OnlineSoftmaxV2_Replay.cpp)
-    target_link_libraries(v2_integration_online_softmax_v2_replay 
-        llaminar2_core 
-        GTest::gtest
-        GTest::gtest_main
-    )
-    add_v2_test(V2_Integration_OnlineSoftmaxV2_Replay
-        COMMAND $<TARGET_FILE:v2_integration_online_softmax_v2_replay>
-        MPI_PROCS 1
-        LABELS "V2;Integration;Kernels;Attention;OnlineSoftmax;Debug;Replay"
-    )
-endif()
-
-# Test: Q16 Attention Live Kernel Replay [DISABLED - project on hold]
-# Calls the actual flash_decode_process_kv_block() from OnlineSoftmax.cpp
-# using dumped Q16_1/Q8_1 tensors to reproduce V1 divergence issues.
-# Compares V1 online softmax against FP32 reference to demonstrate the problem.
-if(ENABLE_HYBRIDQ16_TESTS)
-    add_executable(v2_integration_q16_attention_live_kernel integration/replay/Test__Q16AttentionLiveKernel.cpp)
-    target_link_libraries(v2_integration_q16_attention_live_kernel 
-        llaminar2_core 
-        GTest::gtest
-        GTest::gtest_main
-    )
-    add_v2_test(V2_Integration_Q16AttentionLiveKernel
-        COMMAND $<TARGET_FILE:v2_integration_q16_attention_live_kernel>
-        MPI_PROCS 1
-        LABELS "V2;Integration;Kernels;Attention;Q16;OnlineSoftmax;Debug;Replay"
-    )
-endif()
-
 # Test: Stage Dump Integrity
 # Integration test that verifies stage dump infrastructure:
 # - Layer filtering works correctly (only requested layers are dumped)
@@ -6490,23 +5991,6 @@ add_v2_test(V2_Integration_StageDumpIntegrity
     COMMAND $<TARGET_FILE:v2_integration_stage_dump_integrity>
     MPI_PROCS 1
     LABELS "V2;Integration;StageDump;Debug;Infrastructure"
-)
-
-# Test: Q8_1 Fused Attention + Wo Projection with Tensor Parallelism (Prefill Mode)
-# Validates the JIT prefill kernel with VNNI packed Wo weights under MPI tensor parallelism
-# Key validations:
-# - Context buffer uses local_dim (not d_model) for query stride
-# - Stack allocation handles TP local dimensions correctly
-# - No memory corruption from buffer overflows
-add_executable(v2_integration_q8_1_fused_attention_wo_prefill_tp integration/kernels/cpu/attention/q8_1/Test__Q8_1_FusedAttentionWo_Prefill_TP.cpp)
-target_link_libraries(v2_integration_q8_1_fused_attention_wo_prefill_tp 
-    llaminar2_core 
-    GTest::gtest
-)
-add_v2_test(V2_Integration_Q8_1_FusedAttentionWo_Prefill_TP
-    COMMAND $<TARGET_FILE:v2_integration_q8_1_fused_attention_wo_prefill_tp>
-    MPI_PROCS 2
-    LABELS "V2;Integration;Kernels;Attention;Q8_1;VNNI;Prefill;TP;MPI"
 )
 
 # Test: Qwen2Pipeline Integration Tests (full pipeline, autoregressive decode, bias validation)
@@ -6538,49 +6022,6 @@ add_v2_test(V2_Integration_GraphBatchedKVCache
 
 # Test: Decomposed Attention (Phase 9 KVCacheAppendStage + AttentionComputeStage)
 # Validates the new decomposed attention path that routes through KernelFactory
-
-# Test: Q8_1 vs FP32 Activation Precision Parity
-# Validates Q8_1 activation precision produces equivalent results to FP32
-# Tests Top-5 token overlap, KL divergence, and greedy sampling equivalence
-# NOTE: Runs with MPI_PROCS 1 since it compares precision modes, not MPI parallelism
-
-# Test: LayerExecutor Q8_1 vs FP32 Activation Precision Parity
-# Validates Qwen2LayerExecutor produces equivalent results with Q8_1 vs FP32 activations
-# Tests single layer execution using mock weights (faster than full pipeline test)
-# Uses decomposed attention path (Phase 9 ComputeStage architecture)
-add_executable(v2_integration_layer_executor_q8_1_vs_fp32_parity integration/pipelines/Test__LayerExecutor_Q8_1_vs_FP32_Parity.cpp)
-target_link_libraries(v2_integration_layer_executor_q8_1_vs_fp32_parity
-    llaminar2_core
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Integration_LayerExecutor_Q8_1_vs_FP32_Parity
-    COMMAND $<TARGET_FILE:v2_integration_layer_executor_q8_1_vs_fp32_parity>
-    LABELS "V2;Integration;LayerExecutor;ActivationPrecision;Q8_1;FP32;Parity;ComputeStage;Phase9"
-    MPI_PROCS 1
-)
-
-# Integration: HybridQ16 Pipeline vs FP32 (Layer-by-Layer) [DISABLED - project on hold]
-# -----------------------------------------------------------------------------
-# Validates that HybridQ16 precision mode (Q16_1 typed residuals) achieves
-# ≥0.995 cosine similarity with FP32 at residual stages, measuring improvement
-# over Hybrid mode (Q8_1 residuals). Tests both prefill and decode phases.
-# Requires ENABLE_PIPELINE_SNAPSHOTS for snapshot capture.
-if(ENABLE_PIPELINE_SNAPSHOTS AND ENABLE_HYBRIDQ16_TESTS)
-    add_executable(v2_integration_hybridq16_vs_fp32_pipeline 
-        integration/pipelines/Test__HybridQ16Pipeline_vs_FP32_LayerByLayer.cpp
-    )
-    target_link_libraries(v2_integration_hybridq16_vs_fp32_pipeline 
-        llaminar2_core 
-        GTest::gtest 
-    )
-    add_v2_test(V2_Integration_HybridQ16Pipeline_vs_FP32
-        COMMAND $<TARGET_FILE:v2_integration_hybridq16_vs_fp32_pipeline>
-        LABELS "V2;Integration;Parity;HybridQ16;Q16_1;FP32;LayerByLayer;Snapshots"
-        MPI_PROCS 1
-    )
-    message(STATUS "V2: Integration HybridQ16 vs FP32 pipeline parity test enabled")
-endif()
 
 # Test: Pipeline vs LayerExecutor FP32 Parity
 # Validates that the new LayerExecutor framework produces equivalent results
@@ -6763,19 +6204,6 @@ add_v2_test(V2_Integration_MPI_E2E_TensorParallelInference
     LABELS "V2;Integration;MPI;E2E;TensorParallelism;DistributedArchitecture;Inference;DeviceGraphOrchestrator"
 )
 
-# Test: FloatingPointGemmKernel Integration Tests (thorough OneDNN FP32/BF16/FP16 GEMM tests)
-# Large matrices, mixed precision, strided layouts, fused softmax, causal masking
-add_executable(v2_integration_fp_gemm integration/kernels/cpu/gemm/Test__FloatingPointGemmKernel.cpp)
-target_link_libraries(v2_integration_fp_gemm
-    llaminar2_core
-    GTest::gtest
-)
-add_v2_test(V2_Integration_FloatingPointGemmKernel
-    COMMAND $<TARGET_FILE:v2_integration_fp_gemm>
-    MPI_PROCS 1
-    LABELS "V2;Integration;Kernels;GEMM;FP32;BF16;FP16;OneDNN;Softmax;Attention;MixedPrecision"
-)
-
 # Test: IQ4_NL Tensor GEMM
 add_executable(v2_test_iq4nl_tensor unit/tensors/Test__IQ4_NLTensor.cpp)
 target_link_libraries(v2_test_iq4nl_tensor 
@@ -6786,78 +6214,6 @@ target_link_libraries(v2_test_iq4nl_tensor
 add_v2_test(V2_Unit_IQ4_NLTensor 
     COMMAND $<TARGET_FILE:v2_test_iq4nl_tensor>
     LABELS "V2;Unit;TensorOperations;Quantization;IQ4_NL;GEMM"
-)
-
-# Performance Test: QuantisedGemmKernel (Q8_1 weights via M1/M2 JIT kernels)
-add_executable(v2_perf_quantised_gemm_kernel performance/kernels/cpu/gemm/gemm_v4/Perf__QuantisedGemmKernel.cpp)
-target_link_libraries(v2_perf_quantised_gemm_kernel 
-    llaminar2_core 
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Perf_QuantisedGemmKernel 
-    COMMAND $<TARGET_FILE:v2_perf_quantised_gemm_kernel>
-    LABELS "V2;Performance;GEMM;Q8_1;JIT;Projection"
-)
-
-# Performance Test: QuantisedGemmKernel with Q8_1 Online Softmax (Attention kernel)
-add_executable(v2_perf_quantised_gemm_kernel_q8_1_online_softmax performance/kernels/cpu/gemm/gemm_v4/Perf__QuantisedGemmKernel__Q8_1_OnlineSoftmax.cpp)
-target_link_libraries(v2_perf_quantised_gemm_kernel_q8_1_online_softmax 
-    llaminar2_core 
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Perf_QuantisedGemmKernel_Q8_1_OnlineSoftmax 
-    COMMAND $<TARGET_FILE:v2_perf_quantised_gemm_kernel_q8_1_online_softmax>
-    LABELS "V2;Performance;GEMM;Q8_1;JIT;OnlineSoftmax;Attention"
-)
-
-# Performance Test: QuantisedGemmKernel parameter sweep
-add_executable(v2_perf_quantised_gemm_kernel_sweep performance/kernels/cpu/gemm/gemm_v4/Perf__QuantisedGemmKernel__Sweep.cpp)
-target_link_libraries(v2_perf_quantised_gemm_kernel_sweep 
-    llaminar2_core 
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Perf_QuantisedGemmKernel_Sweep 
-    COMMAND $<TARGET_FILE:v2_perf_quantised_gemm_kernel_sweep>
-    LABELS "V2;Performance;GEMM;Sweep"
-)
-
-# Performance Test: QuantisedGemmKernel with Q8_0 weights
-add_executable(v2_perf_quantised_gemm_kernel_q8_0 performance/kernels/cpu/gemm/gemm_v4/Perf__QuantisedGemmKernel__Q8_0.cpp)
-target_link_libraries(v2_perf_quantised_gemm_kernel_q8_0 
-    llaminar2_core 
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Perf_QuantisedGemmKernel_Q8_0 
-    COMMAND $<TARGET_FILE:v2_perf_quantised_gemm_kernel_q8_0>
-    LABELS "V2;Performance;GEMM;Q8_0"
-)
-
-# Performance Test: QuantisedGemmKernel with Q4_0 weights
-add_executable(v2_perf_quantised_gemm_kernel_q4_0 performance/kernels/cpu/gemm/gemm_v4/Perf__QuantisedGemmKernel__Q4_0.cpp)
-target_link_libraries(v2_perf_quantised_gemm_kernel_q4_0 
-    llaminar2_core 
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Perf_QuantisedGemmKernel_Q4_0 
-    COMMAND $<TARGET_FILE:v2_perf_quantised_gemm_kernel_q4_0>
-    LABELS "V2;Performance;GEMM;Q4_0"
-)
-
-# Performance Test: CPU GEMV Decode (M=1) and Prefill (M>1) with model-sized shapes
-add_executable(v2_perf_cpu_gemv_decode performance/kernels/cpu/gemm/gemm_v4/Perf__CpuGemvDecode.cpp)
-target_link_libraries(v2_perf_cpu_gemv_decode 
-    llaminar2_core 
-    GTest::gtest
-)
-add_v2_test(V2_Perf_CpuGemvDecode
-    COMMAND $<TARGET_FILE:v2_perf_cpu_gemv_decode>
-    LABELS "V2;Performance;GEMM;GEMV;Q8_1;JIT;Decode;Prefill;CPU"
-    MPI_PROCS 1
 )
 
 # Integration Test: CPU NativeVNNI GEMV/GEMM Correctness (Q4_0, IQ4_NL)
@@ -7057,110 +6413,12 @@ if(ZLIB_FOUND)
     get_filename_component(WORKSPACE_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
     
     if(CMAKE_BUILD_TYPE MATCHES "Debug" OR CMAKE_BUILD_TYPE MATCHES "E2ERelease" OR CMAKE_BUILD_TYPE MATCHES "Integration" OR ENABLE_SNAPSHOTS)
-        # -----------------------------------------------------------------------------
-        # DISABLED: Legacy E2E Parity tests
-        # -----------------------------------------------------------------------------
-        # The following tests are disabled as part of test suite cleanup.
-        # - Q8_1 vs FP32 Pipeline: Superseded by unit tests and integration stage tests
-        # - Hybrid Pipeline: Project on hold (ENABLE_HYBRIDQ16_TESTS)
-        # - Kernel-level attention parity: Covered by integration attention tests
-        # To re-enable, set ENABLE_DEPRECATED_E2E_TESTS=ON
-        if(ENABLE_DEPRECATED_E2E_TESTS)
-            # E2E Parity: Q8_1 Pipeline vs FP32 Pipeline (Layer-by-Layer)
-            add_executable(v2_e2e_parity_q8_1_vs_fp32_pipeline 
-                e2e/parity/internal/q8_1_vs_fp32/Test__Q8_1Pipeline_vs_FP32Pipeline_LayerByLayer.cpp
-            )
-            target_link_libraries(v2_e2e_parity_q8_1_vs_fp32_pipeline 
-                llaminar2_core 
-                GTest::gtest 
-            )
-            add_v2_test(V2_E2E_Parity_Q8_1Pipeline_vs_FP32Pipeline
-                COMMAND $<TARGET_FILE:v2_e2e_parity_q8_1_vs_fp32_pipeline>
-                LABELS "V2;E2E;Parity;Internal;Q8_1;FP32;LayerByLayer"
-                MPI_PROCS 1
-            )
-            message(STATUS "V2: E2E Q8_1 vs FP32 pipeline parity test enabled (deprecated)")
-        endif()
-
-        # E2E Parity: Hybrid Pipeline vs FP32 and Q8_1 (Layer-by-Layer) [DISABLED - project on hold]
-        if(ENABLE_HYBRIDQ16_TESTS)
-            add_executable(v2_e2e_parity_hybrid_vs_fp32_q8_1_pipeline 
-                e2e/parity/internal/hybrid_vs_fp32_q8_1/Test__HybridPipeline_vs_FP32_Q8_1_LayerByLayer.cpp
-            )
-            target_link_libraries(v2_e2e_parity_hybrid_vs_fp32_q8_1_pipeline 
-                llaminar2_core 
-                GTest::gtest 
-            )
-            add_v2_test(V2_E2E_Parity_HybridPipeline_vs_FP32_Q8_1
-                COMMAND $<TARGET_FILE:v2_e2e_parity_hybrid_vs_fp32_q8_1_pipeline>
-                LABELS "V2;E2E;Parity;Internal;Hybrid;FP32;Q8_1;LayerByLayer"
-                MPI_PROCS 1
-            )
-            message(STATUS "V2: E2E Hybrid vs FP32/Q8_1 pipeline parity test enabled")
-        endif()
     else()
         message(STATUS "V2: Integration parity tests disabled (snapshots not available in Release build)")
         message(STATUS "     Use -DCMAKE_BUILD_TYPE=Integration or -DENABLE_SNAPSHOTS=ON to enable")
     endif()
 else()
     message(WARNING "ZLIB not found - PyTorch parity tests disabled (requires cnpy for .npz loading)")
-endif()
-
-# -----------------------------------------------------------------------------
-# DISABLED: E2E Parity Kernel-Level Tests (Attention)
-# -----------------------------------------------------------------------------
-# These tests are disabled as part of test suite cleanup.
-# Kernel-level attention parity is now covered by integration tests:
-# - V2_Integration_Q8_1_FusedAttention
-# - V2_Integration_Q8_1_OnlineSoftmax
-# To re-enable, set ENABLE_DEPRECATED_E2E_TESTS=ON
-
-if(ENABLE_DEPRECATED_E2E_TESTS)
-    # JitFusedAttentionWo (FA2 Q8_1 kernel) vs FP32 Decomposed Attention
-    add_executable(v2_e2e_parity_jit_fused_attention_vs_fp32 
-        e2e/parity/kernels/attention/Test__JitFusedAttentionWo_vs_FP32Attention.cpp
-    )
-    target_link_libraries(v2_e2e_parity_jit_fused_attention_vs_fp32 
-        llaminar2_core 
-        GTest::gtest
-        GTest::gtest_main
-    )
-    add_v2_test(V2_E2E_Parity_JitFusedAttentionWo_vs_FP32
-        COMMAND $<TARGET_FILE:v2_e2e_parity_jit_fused_attention_vs_fp32>
-        LABELS "V2;E2E;Parity;Kernels;Attention;Q8_1;FA2;JIT"
-        MPI_PROCS 1
-    )
-
-    # QuantisedAttentionJit_Q8_1_Fused (Simple Q8_1 kernel) vs FP32 Decomposed Attention  
-    add_executable(v2_e2e_parity_simple_attention_q8_1_vs_fp32 
-        e2e/parity/kernels/attention/Test__SimpleAttentionQ8_1_vs_FP32Attention.cpp
-    )
-    target_link_libraries(v2_e2e_parity_simple_attention_q8_1_vs_fp32 
-        llaminar2_core 
-        GTest::gtest
-    )
-    add_v2_test(V2_E2E_Parity_SimpleAttentionQ8_1_vs_FP32
-        COMMAND $<TARGET_FILE:v2_e2e_parity_simple_attention_q8_1_vs_fp32>
-        LABELS "V2;E2E;Parity;Kernels;Attention;Q8_1;Simple"
-        MPI_PROCS 1
-    )
-endif()
-
-# JitFusedAttentionWo with Q16_1 Fused Residual vs FP32 Reference [DISABLED - project on hold]
-if(ENABLE_HYBRIDQ16_TESTS)
-    add_executable(v2_e2e_parity_jit_fused_attention_q16_1_vs_fp32 
-        e2e/parity/kernels/attention/Test__JitFusedAttentionWo_Q16_1Fused_vs_FP32.cpp
-    )
-    target_link_libraries(v2_e2e_parity_jit_fused_attention_q16_1_vs_fp32 
-        llaminar2_core 
-        GTest::gtest
-        GTest::gtest_main
-    )
-    add_v2_test(V2_E2E_Parity_JitFusedAttentionWo_Q16_1Fused_vs_FP32
-        COMMAND $<TARGET_FILE:v2_e2e_parity_jit_fused_attention_q16_1_vs_fp32>
-        LABELS "V2;E2E;Parity;Kernels;Attention;Q16_1;FusedResidual;JIT"
-        MPI_PROCS 1
-    )
 endif()
 
 # Performance Test: GEMM Tuning Sweep
@@ -7196,18 +6454,6 @@ target_link_libraries(v2_perf_iint8_unpackable
 add_v2_test(V2_Perf_IINT8Unpackable 
     COMMAND $<TARGET_FILE:v2_perf_iint8_unpackable>
     LABELS "V2;Performance;TensorOperations;Quantization;IINT8Unpackable;Unpack"
-)
-
-# Performance Test: QuantisedGemmKernel Packing (constructor time)
-add_executable(v2_perf_quantised_gemm_packing performance/kernels/Perf__QuantisedGemmPacking.cpp)
-target_link_libraries(v2_perf_quantised_gemm_packing 
-    llaminar2_core 
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Perf_QuantisedGemmPacking 
-    COMMAND $<TARGET_FILE:v2_perf_quantised_gemm_packing>
-    LABELS "V2;Performance;Kernels;GEMM;Packing"
 )
 
 # Performance Test: Q3_K Unpack
@@ -7336,7 +6582,6 @@ add_v2_test(V2_Perf_RMSNormThreadSweep
     MPI_PROCS 1
 )
 
-
 # Performance Test: CPURoPEKernel comparison (Legacy vs Typed FP32/BF16/FP16/Q8_1)
 add_executable(v2_perf_rope_kernel performance/kernels/cpu/ops/Perf__CPURoPEKernel.cpp)
 target_link_libraries(v2_perf_rope_kernel 
@@ -7348,243 +6593,6 @@ add_v2_test(V2_Perf_CPURoPEKernel
     COMMAND $<TARGET_FILE:v2_perf_rope_kernel>
     LABELS "V2;Performance;RoPE;TypedResiduals;Kernels;FP32;BF16;FP16;Q8_1"
     MPI_PROCS 1  # CPU-only perf test, single rank for accurate benchmarking
-)
-
-# Performance Test: Q16→Q16 Fixed-Scale RoPE SIMD
-add_executable(v2_perf_q16_to_q16_rope_fixed_scale performance/kernels/cpu/primitives/Perf__Q16_to_Q16_RoPE_FixedScale.cpp)
-target_link_libraries(v2_perf_q16_to_q16_rope_fixed_scale 
-    llaminar2_core 
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Perf_Q16_to_Q16_RoPE_FixedScale 
-    COMMAND $<TARGET_FILE:v2_perf_q16_to_q16_rope_fixed_scale>
-    LABELS "V2;Performance;RoPE;Q16_1;FixedScale;SIMD;AVX2;AVX512;HybridQ16;Primitives"
-    MPI_PROCS 1  # CPU-only perf test, single rank for accurate benchmarking
-)
-
-# =============================================================================
-# Microkernels for Fused Attention + Wo Projection
-# =============================================================================
-# These are composable, independently-testable units for the fused attention kernel.
-# See docs/v2/FUSED_ATTENTION_WO_PROJECT_PLAN.md for design documentation.
-
-# Test: μK1 - Q8_1 Dot Product Microkernel
-add_executable(v2_test_microkernel_q8_dot_product unit/kernels/cpu/attention/q8_1/microkernels/Test__Q8DotProduct.cpp)
-target_link_libraries(v2_test_microkernel_q8_dot_product 
-    llaminar2_core 
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Unit_Microkernel_Q8DotProduct 
-    COMMAND $<TARGET_FILE:v2_test_microkernel_q8_dot_product>
-    LABELS "V2;Unit;Microkernels;Q8_1;DotProduct;VNNI;AVX512;FusedAttention"
-    MPI_PROCS 1
-)
-
-# Test: μK2 - Online Softmax Microkernel
-add_executable(v2_test_microkernel_online_softmax unit/kernels/cpu/attention/q8_1/microkernels/Test__OnlineSoftmax.cpp)
-target_link_libraries(v2_test_microkernel_online_softmax 
-    llaminar2_core 
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Unit_Microkernel_OnlineSoftmax 
-    COMMAND $<TARGET_FILE:v2_test_microkernel_online_softmax>
-    LABELS "V2;Unit;Microkernels;Softmax;Online;StreamingSoftmax;FlashAttention;FusedAttention"
-    MPI_PROCS 1
-)
-
-# Test: μK2-V2 - Online Softmax V2 (Deferred Normalization) Unit Tests
-# Proves mathematical correctness of V2 implementation before integration:
-# - __int128 rescale correctness
-# - Chunked accumulation overflow safety
-# - Deferred normalization equivalence to running average
-# - Weight sum tracking exactness
-add_executable(v2_test_microkernel_online_softmax_v2 unit/kernels/cpu/attention/q8_1/microkernels/Test__OnlineSoftmaxV2_Unit.cpp)
-target_link_libraries(v2_test_microkernel_online_softmax_v2 
-    llaminar2_core 
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Unit_Microkernel_OnlineSoftmaxV2 
-    COMMAND $<TARGET_FILE:v2_test_microkernel_online_softmax_v2>
-    LABELS "V2;Unit;Microkernels;Softmax;Online;DeferredNorm;VNNI;Integer;FusedAttention"
-    MPI_PROCS 1
-)
-
-# Test: μK2b - Q16 Online Softmax K-Scales Microkernel (HybridQ16 K precision fix)
-add_executable(v2_test_microkernel_q16_online_softmax_kscales unit/kernels/cpu/attention/q16_1/Test__Q16OnlineSoftmaxKScales.cpp)
-target_link_libraries(v2_test_microkernel_q16_online_softmax_kscales 
-    llaminar2_core 
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Unit_Microkernel_Q16OnlineSoftmaxKScales 
-    COMMAND $<TARGET_FILE:v2_test_microkernel_q16_online_softmax_kscales>
-    LABELS "V2;Unit;Microkernels;Softmax;Q16;KScales;HybridQ16;FusedAttention"
-    MPI_PROCS 1
-)
-
-# Test: Q16 Attention with Realistic Pipeline Data
-# Tests attention kernel using actual data captured from pipeline stage dumps.
-# Exposes the K precision bug where K values exceed representable range (max_abs ~130 > 128).
-add_executable(v2_test_microkernel_q16_attention_realistic unit/kernels/cpu/attention/q16_1/Test__Q16AttentionRealisticData.cpp)
-target_link_libraries(v2_test_microkernel_q16_attention_realistic 
-    llaminar2_core 
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Unit_Microkernel_Q16AttentionRealistic 
-    COMMAND $<TARGET_FILE:v2_test_microkernel_q16_attention_realistic>
-    LABELS "V2;Unit;Microkernels;Q16;Attention;HybridQ16;Realistic;FusedAttention"
-    MPI_PROCS 1
-)
-
-# Test: OnlineSoftmax Per-Position K Scales Bug Reproduction
-# Unit tests to isolate and reproduce the HybridQ16 OnlineSoftmax per-position K scale bug.
-# The tests demonstrate that mixing different alpha values in the scaled score domain
-# leads to incorrect softmax weights because the domains are incompatible.
-add_executable(v2_test_microkernel_online_softmax_k_scales unit/kernels/cpu/attention/q8_1/microkernels/Test__OnlineSoftmaxPerPositionKScales.cpp)
-target_link_libraries(v2_test_microkernel_online_softmax_k_scales 
-    llaminar2_core 
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Unit_Microkernel_OnlineSoftmaxKScales 
-    COMMAND $<TARGET_FILE:v2_test_microkernel_online_softmax_k_scales>
-    LABELS "V2;Unit;Microkernels;Q16;OnlineSoftmax;HybridQ16;KScales;FusedAttention;BugRepro"
-    MPI_PROCS 1
-)
-
-# Test: μK3 - V Weighted Accumulation Microkernel
-add_executable(v2_test_microkernel_v_weighted_accum unit/kernels/cpu/attention/q8_1/microkernels/Test__VWeightedAccum.cpp)
-target_link_libraries(v2_test_microkernel_v_weighted_accum 
-    llaminar2_core 
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Unit_Microkernel_VWeightedAccum 
-    COMMAND $<TARGET_FILE:v2_test_microkernel_v_weighted_accum>
-    LABELS "V2;Unit;Microkernels;Attention;Accumulation;AVX512;Q8_1;FusedAttention"
-    MPI_PROCS 1
-)
-
-# Test: μK4 - Wo Projection Microkernel
-add_executable(v2_test_microkernel_wo_projection unit/kernels/cpu/attention/q8_1/microkernels/Test__WoProjection.cpp)
-target_link_libraries(v2_test_microkernel_wo_projection 
-    llaminar2_core 
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Unit_Microkernel_WoProjection 
-    COMMAND $<TARGET_FILE:v2_test_microkernel_wo_projection>
-    LABELS "V2;Unit;Microkernels;Projection;GEMV;Wo;FP32;Q8_1;AVX512;FusedAttention"
-    MPI_PROCS 1
-)
-
-# Test: μK5 - Fast Exp Microkernel
-add_executable(v2_test_microkernel_fast_exp unit/kernels/cpu/attention/q8_1/microkernels/Test__FastExp.cpp)
-target_link_libraries(v2_test_microkernel_fast_exp 
-    llaminar2_core 
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Unit_Microkernel_FastExp 
-    COMMAND $<TARGET_FILE:v2_test_microkernel_fast_exp>
-    LABELS "V2;Unit;Microkernels;FastExp;Softmax;Polynomial;AVX512;FusedAttention"
-    MPI_PROCS 1
-)
-
-# =============================================================================
-# Q16_1 Integer Attention Microkernels (TRUE INTEGER PIPELINE v2)
-# =============================================================================
-# These are the integer-only microkernels for the Q16_1 attention path.
-# See docs/v2/PROJECT_Q16_INTEGER_ATTENTION.md for design documentation.
-
-# Test: Q16 μK1 - Q16 Dot Product Microkernel (Q×K^T)
-add_executable(v2_test_microkernel_q16_dot_product unit/kernels/cpu/attention/q16_1/ref/microkernels/Test__Q16DotProduct.cpp)
-target_link_libraries(v2_test_microkernel_q16_dot_product 
-    llaminar2_core 
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Unit_Microkernel_Q16DotProduct 
-    COMMAND $<TARGET_FILE:v2_test_microkernel_q16_dot_product>
-    LABELS "V2;Unit;Microkernels;Q16_1;DotProduct;Integer;VNNI;FusedAttention"
-    MPI_PROCS 1
-)
-
-# Test: Q16 μK2 - P×V Accumulation Microkernel
-add_executable(v2_test_microkernel_pv_accumulate unit/kernels/cpu/attention/q16_1/ref/microkernels/Test__PVAccumulate.cpp)
-target_link_libraries(v2_test_microkernel_pv_accumulate 
-    llaminar2_core 
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Unit_Microkernel_PVAccumulate 
-    COMMAND $<TARGET_FILE:v2_test_microkernel_pv_accumulate>
-    LABELS "V2;Unit;Microkernels;Q16_1;PVAccumulate;Integer;VNNI;FusedAttention"
-    MPI_PROCS 1
-)
-
-# Test: Q16 μK3 - Wo Projection Microkernel (INT32 → Q16_1)
-add_executable(v2_test_microkernel_q16_wo_projection unit/kernels/cpu/attention/q16_1/ref/microkernels/Test__Q16WoProjection.cpp)
-target_link_libraries(v2_test_microkernel_q16_wo_projection 
-    llaminar2_core 
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Unit_Microkernel_Q16WoProjection 
-    COMMAND $<TARGET_FILE:v2_test_microkernel_q16_wo_projection>
-    LABELS "V2;Unit;Microkernels;Q16_1;WoProjection;Integer;VNNI;FusedAttention"
-    MPI_PROCS 1
-)
-
-# =============================================================================
-# Phase 2: Fused Attention + Wo Reference Kernel (Composed from Microkernels)
-# =============================================================================
-
-# Test: FusedAttentionWoRef - Reference implementation using all microkernels
-add_executable(v2_test_fused_attention_wo_ref integration/kernels/cpu/attention/Test__FusedAttentionWoRef.cpp)
-target_link_libraries(v2_test_fused_attention_wo_ref 
-    llaminar2_core
-    GTest::gtest 
-    GTest::gtest_main
-)
-add_v2_test(V2_Integration_FusedAttentionWoRef 
-    COMMAND $<TARGET_FILE:v2_test_fused_attention_wo_ref>
-    LABELS "V2;Integration;FusedAttention;Q8_1;Wo;GEMM;GQA;Causal;KVCache"
-    MPI_PROCS 1
-)
-
-# Test: FusedAttentionWoRef Robustness - Edge cases from real pipeline issues
-# Tests for: softmax saturation, catastrophic cancellation, quantization clipping,
-#            scale disparity, sign flips, residual collapse, extreme outliers
-add_executable(v2_test_fused_attention_wo_robustness integration/kernels/cpu/attention/Test__FusedAttentionWoRef_Robustness.cpp)
-target_link_libraries(v2_test_fused_attention_wo_robustness 
-    llaminar2_core
-    GTest::gtest 
-    GTest::gtest_main
-)
-add_v2_test(V2_Integration_FusedAttentionWo_Robustness 
-    COMMAND $<TARGET_FILE:v2_test_fused_attention_wo_robustness>
-    LABELS "V2;Integration;FusedAttention;Robustness;Saturation;Quantization;EdgeCases"
-    MPI_PROCS 1
-)
-
-# Test: FusedAttentionWoRef Batch - Batched execution modes
-# Tests for: prefill, incremental decode, batched decode uniform/variable KV
-add_executable(v2_test_fused_attention_wo_batch integration/kernels/cpu/attention/Test__FusedAttentionWoRef_Batch.cpp)
-target_link_libraries(v2_test_fused_attention_wo_batch 
-    llaminar2_core
-    GTest::gtest 
-    GTest::gtest_main
-)
-add_v2_test(V2_Integration_FusedAttentionWo_Batch 
-    COMMAND $<TARGET_FILE:v2_test_fused_attention_wo_batch>
-    LABELS "V2;Integration;FusedAttention;Batch;Prefill;Decode;VariableKV"
-    MPI_PROCS 1
 )
 
 # Test: CPUFlashAttentionKernel mixed-precision tensor path (FP32 Q, Q8_1 K/V)
@@ -7600,241 +6608,6 @@ add_v2_test(V2_Integration_CPUFlashAttentionKernel
     MPI_PROCS 1
 )
 
-# Test: FusedAttentionWoTiled - Cache-blocked tiled implementation (Phase 3)
-# Tests for: tile size computation, tiled vs reference parity, various configs
-add_executable(v2_test_fused_attention_wo_tiled unit/kernels/cpu/attention/q8_1/Test__FusedAttentionWoTiled.cpp)
-target_link_libraries(v2_test_fused_attention_wo_tiled 
-    llaminar2_core
-    GTest::gtest 
-    GTest::gtest_main
-)
-add_v2_test(V2_Unit_FusedAttentionWo_Tiled 
-    COMMAND $<TARGET_FILE:v2_test_fused_attention_wo_tiled>
-    LABELS "V2;Unit;FusedAttention;Tiled;CacheBlocking;FlashAttention;Parity"
-    MPI_PROCS 1
-)
-
-
-# Test: JIT Microkernels - Modular JIT attention microkernels (Phase 4)
-# Tests for: JitFastExp, JitQ8DotProduct, JitOnlineSoftmax, JitVWeightedAccum, JitWoProjection
-add_executable(v2_test_jit_microkernels unit/kernels/cpu/attention/q8_1/jit/Test__JitMicrokernels.cpp)
-target_link_libraries(v2_test_jit_microkernels 
-    llaminar2_core
-    GTest::gtest 
-    GTest::gtest_main
-)
-add_v2_test(V2_Unit_JitMicrokernels 
-    COMMAND $<TARGET_FILE:v2_test_jit_microkernels>
-    LABELS "V2;Unit;JIT;Microkernels;FusedAttention;AVX512;Xbyak;FastExp;Q8DotProduct;OnlineSoftmax"
-    MPI_PROCS 1
-)
-
-# Test: JIT Fused Attention + Wo - Composed JIT kernel (Phase 4)
-# Tests the complete fused attention + Wo projection JIT kernel
-add_executable(v2_test_jit_fused_attention_wo unit/kernels/cpu/attention/q8_1/jit/Test__JitFusedAttentionWo.cpp)
-target_link_libraries(v2_test_jit_fused_attention_wo 
-    llaminar2_core
-    GTest::gtest 
-    GTest::gtest_main
-)
-add_v2_test(V2_Unit_JitFusedAttentionWo 
-    COMMAND $<TARGET_FILE:v2_test_jit_fused_attention_wo>
-    LABELS "V2;Unit;JIT;FusedAttention;WoProjection;AVX512;Xbyak;Q8_1"
-    MPI_PROCS 1
-)
-
-# Test: JIT Fused Attention + Wo - Numerical Correctness Tests
-# Comprehensive tests comparing JIT kernel against reference implementation
-# Covers Qwen 0.5B, 7B, 32B model configurations with various sequence lengths
-add_executable(v2_test_jit_fused_attention_wo_correctness unit/kernels/cpu/attention/q8_1/jit/Test__JitFusedAttentionWo_Correctness.cpp)
-target_link_libraries(v2_test_jit_fused_attention_wo_correctness 
-    llaminar2_core
-    GTest::gtest 
-    GTest::gtest_main
-)
-add_v2_test(V2_Unit_JitFusedAttentionWo_Correctness 
-    COMMAND $<TARGET_FILE:v2_test_jit_fused_attention_wo_correctness>
-    LABELS "V2;Unit;JIT;FusedAttention;Correctness;AVX512;Q8_1;NumericalParity"
-    MPI_PROCS 1
-)
-
-# Test: JIT Fused Attention + Wo - Q16_1 Residual Fusion Tests [DISABLED - project on hold]
-# Tests the fused residual addition path for Q16_1 typed residual streams
-if(ENABLE_HYBRIDQ16_TESTS)
-    add_executable(v2_test_jit_fused_attention_wo_q16_1_residual unit/kernels/cpu/attention/q8_1/jit/Test__JitFusedAttentionWo_Q16_1Residual.cpp)
-    target_link_libraries(v2_test_jit_fused_attention_wo_q16_1_residual 
-        llaminar2_core
-        GTest::gtest 
-        GTest::gtest_main
-    )
-    add_v2_test(V2_Unit_JitFusedAttentionWo_Q16_1Residual 
-        COMMAND $<TARGET_FILE:v2_test_jit_fused_attention_wo_q16_1_residual>
-        LABELS "V2;Unit;JIT;FusedAttention;Q16_1;Residual;TypedResiduals"
-        MPI_PROCS 1
-    )
-endif()
-
-# Test: JIT Fused Attention Manual Verification
-# Tests JIT kernel against MANUALLY COMPUTED ground truth (not C++ reference).
-# This catches bugs where both JIT and reference have the same error.
-add_executable(v2_test_jit_fused_attention_manual_verify unit/kernels/cpu/attention/q8_1/jit/Test__JitFusedAttentionWo_ManualVerification.cpp)
-target_link_libraries(v2_test_jit_fused_attention_manual_verify 
-    llaminar2_core
-    GTest::gtest 
-    GTest::gtest_main
-)
-add_v2_test(V2_Unit_JitFusedAttention_ManualVerify
-    COMMAND $<TARGET_FILE:v2_test_jit_fused_attention_manual_verify>
-    LABELS "V2;Unit;JIT;FusedAttention;ManualVerification;Q8_1;GroundTruth"
-    MPI_PROCS 1
-)
-
-# Test: JIT Wo Projection Isolated
-# Tests the Wo projection logic in isolation to debug 1.0 output issue
-add_executable(v2_test_jit_wo_projection_isolated unit/kernels/cpu/attention/q8_1/jit/Test__JitWoProjectionIsolated.cpp)
-target_link_libraries(v2_test_jit_wo_projection_isolated 
-    llaminar2_core
-    GTest::gtest 
-    GTest::gtest_main
-)
-add_v2_test(V2_Unit_JitWoProjectionIsolated
-    COMMAND $<TARGET_FILE:v2_test_jit_wo_projection_isolated>
-    LABELS "V2;Unit;JIT;WoProjection;Isolated"
-    MPI_PROCS 1
-)
-
-# Test: JIT Fused Attention + Wo - Prefill Mode Tests
-# Tests the prefill kernel (H→KV→Q loop order) for K/V cache reuse optimization
-# Validates prefill vs decode parity, tile boundary handling, causal masking
-add_executable(v2_test_jit_fused_attention_wo_prefill unit/kernels/cpu/attention/q8_1/jit/Test__JitFusedAttentionWo_Prefill.cpp)
-target_link_libraries(v2_test_jit_fused_attention_wo_prefill 
-    llaminar2_core
-    GTest::gtest 
-    GTest::gtest_main
-)
-add_v2_test(V2_Unit_JitFusedAttentionWo_Prefill 
-    COMMAND $<TARGET_FILE:v2_test_jit_fused_attention_wo_prefill>
-    LABELS "V2;Unit;JIT;FusedAttention;Prefill;AVX512;Q8_1;KVCacheReuse"
-    MPI_PROCS 1
-)
-
-# Debug test for prefill alternating zeros issue
-add_executable(v2_test_jit_fused_attention_wo_debug unit/kernels/cpu/attention/q8_1/jit/Test__JitFusedAttentionWo_Debug.cpp)
-target_link_libraries(v2_test_jit_fused_attention_wo_debug 
-    llaminar2_core
-    GTest::gtest 
-    GTest::gtest_main
-)
-add_v2_test(V2_Unit_JitFusedAttentionWo_Debug 
-    COMMAND $<TARGET_FILE:v2_test_jit_fused_attention_wo_debug>
-    LABELS "V2;Unit;JIT;FusedAttention;Debug"
-    MPI_PROCS 1
-)
-
-# Test: JIT Fused Attention + Wo - FA2 vs FA1 Parity Tests
-# Tests that FA2 tiling (use_fa2_tiling=true) produces identical output to FA1
-# Validates tile boundary handling, remainder processing, various KV lengths
-add_executable(v2_test_jit_fused_attention_wo_fa2parity unit/kernels/cpu/attention/q8_1/jit/Test__JitFusedAttentionWo_FA2Parity.cpp)
-target_link_libraries(v2_test_jit_fused_attention_wo_fa2parity 
-    llaminar2_core
-    GTest::gtest 
-    GTest::gtest_main
-)
-add_v2_test(V2_Unit_JitFusedAttentionWo_FA2Parity 
-    COMMAND $<TARGET_FILE:v2_test_jit_fused_attention_wo_fa2parity>
-    LABELS "V2;Unit;JIT;FusedAttention;FA2;Parity;AVX512;Q8_1;FlashAttention"
-    MPI_PROCS 1
-)
-
-# Test: JIT Wo Projection - Tests the Wo projection implementation in JIT kernel
-# Validates FP32, FP16, BF16, Q8_1 Wo formats against REFERENCE backend
-add_executable(v2_test_jit_wo_projection unit/kernels/cpu/attention/q8_1/jit/Test__JitWoProjection.cpp)
-target_link_libraries(v2_test_jit_wo_projection 
-    llaminar2_core
-    GTest::gtest 
-    GTest::gtest_main
-)
-add_v2_test(V2_Unit_JitWoProjection 
-    COMMAND $<TARGET_FILE:v2_test_jit_wo_projection>
-    LABELS "V2;Unit;JIT;WoProjection;FusedAttention;AVX512;Q8_1;FP16;BF16;NumericalParity"
-    MPI_PROCS 1
-)
-
-# Q16 INT16 VNNI Wo Projection Unit Tests
-# Tests the Wo projection implementation in Q16IntegerAttentionRef:
-# - wo_projection_vnni_int16() for decode (single token GEMV)
-# - wo_projection_vnni_int16_batched() for prefill (batched GEMM)
-# - FP32 reference comparison for correctness validation
-add_executable(v2_test_q16_wo_projection unit/kernels/cpu/attention/q16_1/ref/microkernels/Test__Q16WoProjection.cpp)
-target_link_libraries(v2_test_q16_wo_projection
-    llaminar2_core
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Unit_Q16WoProjection
-    COMMAND $<TARGET_FILE:v2_test_q16_wo_projection>
-    LABELS "V2;Unit;Q16;WoProjection;VNNI;INT16;NumericalParity"
-    MPI_PROCS 1
-)
-
-# Q16 Attention Output Composition Test (Level 2 Macrokernel)
-# Tests the FULL attention output path: Context → Wo Projection → Residual Add → Q16_1
-# This is the bridge between microkernel unit tests and full pipeline integration tests.
-# See: docs/v2/PLAN_FIXED_SCALE_ROPE_Q16.md "Addendum 2"
-add_executable(v2_test_q16_attention_output_composition unit/kernels/cpu/attention/q16_1/Test__Q16AttentionOutput_Composition.cpp)
-target_link_libraries(v2_test_q16_attention_output_composition
-    llaminar2_core
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Unit_Q16AttentionOutput_Composition
-    COMMAND $<TARGET_FILE:v2_test_q16_attention_output_composition>
-    LABELS "V2;Unit;Q16;WoProjection;ResidualAdd;Composition;Macrokernel;NumericalParity"
-    MPI_PROCS 1
-)
-
-# =============================================================================
-# Phase 5: Pipeline Integration - FusedAttentionWoKernel wrapper
-# =============================================================================
-
-# Test: FusedAttentionWoKernel - Pipeline-compatible wrapper for fused attention
-# Tests all backends (Reference, Tiled, JIT) and verifies cross-backend parity
-add_executable(v2_test_fused_attention_wo_kernel integration/kernels/cpu/attention/Test__FusedAttentionWoKernel.cpp)
-target_link_libraries(v2_test_fused_attention_wo_kernel 
-    llaminar2_core
-    GTest::gtest 
-    GTest::gtest_main
-)
-add_v2_test(V2_Integration_FusedAttentionWoKernel 
-    COMMAND $<TARGET_FILE:v2_test_fused_attention_wo_kernel>
-    LABELS "V2;Integration;FusedAttention;PipelineWrapper;JIT;Tiled;Reference;Q8_1"
-    MPI_PROCS 1
-)
-
-# =============================================================================
-# Phase 8.2: Performance Benchmarking - Fused Attention + Wo
-# =============================================================================
-# Compares fused JIT attention+Wo vs unfused Reference attention+Wo
-# Measures: prefill throughput, decode latency, speedup percentages
-
-add_executable(v2_perf_fused_attention_wo performance/kernels/cpu/attention/Perf__FusedAttentionWo.cpp)
-target_link_libraries(v2_perf_fused_attention_wo 
-    llaminar2_core
-    GTest::gtest 
-    GTest::gtest_main
-)
-add_v2_test(V2_Perf_FusedAttentionWo 
-    COMMAND $<TARGET_FILE:v2_perf_fused_attention_wo>
-    LABELS "V2;Performance;FusedAttention;JIT;Reference;Tiled;Prefill;Decode;Throughput"
-    MPI_PROCS 1
-)
-
-# Standalone microbench (no gtest) - intended for perf stat cache profiling
-add_executable(v2_microbench_fused_attention_wo performance/kernels/cpu/attention/Microbench__FusedAttentionWo.cpp)
-target_link_libraries(v2_microbench_fused_attention_wo
-    llaminar2_core
-)
-
 # Wo transpose benchmark - compares row-major vs column-major GEMV
 add_executable(v2_perf_wo_transpose performance/Microbench__WoTranspose.cpp)
 target_link_libraries(v2_perf_wo_transpose
@@ -7847,35 +6620,6 @@ target_link_libraries(v2_perf_wo_transpose gomp)
 add_v2_test(V2_Perf_WoTranspose
     COMMAND $<TARGET_FILE:v2_perf_wo_transpose>
     LABELS "V2;Performance;Wo;Transpose;GEMV"
-    MPI_PROCS 1
-)
-
-# =============================================================================
-# Phase 8.2b: Performance Benchmarking - JIT Microkernels
-# =============================================================================
-# Benchmarks individual JIT microkernels in isolation
-
-add_executable(v2_perf_jit_microkernels performance/kernels/cpu/attention/Perf__JitMicrokernels.cpp)
-target_link_libraries(v2_perf_jit_microkernels 
-    llaminar2_core
-    GTest::gtest 
-    GTest::gtest_main
-)
-add_v2_test(V2_Perf_JitMicrokernels 
-    COMMAND $<TARGET_FILE:v2_perf_jit_microkernels>
-    LABELS "V2;Performance;JIT;Microkernels;Q8_1"
-    MPI_PROCS 1
-)
-
-add_executable(v2_perf_fused_attention_wo_tuning performance/kernels/cpu/attention/Perf__FusedAttentionWo_Tuning.cpp)
-target_link_libraries(v2_perf_fused_attention_wo_tuning 
-    llaminar2_core
-    GTest::gtest 
-    GTest::gtest_main
-)
-add_v2_test(V2_Perf_FusedAttentionWo_Tuning 
-    COMMAND $<TARGET_FILE:v2_perf_fused_attention_wo_tuning>
-    LABELS "V2;Performance;FusedAttention;Tuning;Qwen"
     MPI_PROCS 1
 )
 
@@ -8084,19 +6828,6 @@ add_v2_test(V2_Integration_TPAllreduceStage_LocalNCCL
     LABELS "V2;Integration;TPAllreduce;LocalTP;NCCL;CUDA;TensorParallel;ComputeStage"
 )
 
-# Test: Qwen2Graph Fused Attention Integration
-# Verifies that the graph builder correctly switches between fused and decomposed paths
-add_executable(v2_test_qwen2_graph_fused_attention integration/models/qwen/Test__Qwen2Graph_FusedAttention.cpp)
-target_link_libraries(v2_test_qwen2_graph_fused_attention 
-    llaminar2_core 
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Integration_Qwen2Graph_FusedAttention 
-    COMMAND $<TARGET_FILE:v2_test_qwen2_graph_fused_attention>
-    LABELS "V2;Integration;Graph;Attention;FusedAttention"
-)
-
 # Test: Graph Snapshot Callback Invocation Integration Tests
 # Verifies that snapshot callbacks are properly invoked for ALL stages during graph execution.
 # Critical for E2E parity testing and debugging - ensures no stages silently skip callbacks.
@@ -8117,112 +6848,15 @@ add_v2_test(V2_Integration_GraphSnapshotCallbackInvocation
     LABELS "V2;Integration;Graph;Snapshot;Callback"
     MPI_PROCS 1
 )
-# =============================================================================
-# Q16 Integer Attention v2 Tests
-# =============================================================================
-
-# Test: Exp2FixedSoftmax microkernel
-# Integer-only softmax using exp2 LUT approximation (2048 entries)
-# Produces INT16 weights in [0, 32767] for VNNI compatibility
-add_executable(v2_test_exp2_fixed_softmax unit/kernels/cpu/attention/q16_1/ref/microkernels/Test__Exp2FixedSoftmax.cpp)
-target_link_libraries(v2_test_exp2_fixed_softmax
-    llaminar2_core
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Unit_Exp2FixedSoftmax
-    COMMAND $<TARGET_FILE:v2_test_exp2_fixed_softmax>
-    LABELS "V2;Unit;Kernels;Attention;Q16;Softmax;Integer"
-)
-
-# Test: Exp2Core primitives
-# Core exp2 LUT primitives shared by Exp2FixedSoftmax and OnlineSoftmax
-# Tests LUT initialization, AdaptiveAlphaConfig, weight/rescale computation
-add_executable(v2_test_exp2_core unit/kernels/cpu/attention/q16_1/ref/microkernels/Test__Exp2Core.cpp)
-target_link_libraries(v2_test_exp2_core
-    llaminar2_core
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Unit_Exp2Core
-    COMMAND $<TARGET_FILE:v2_test_exp2_core>
-    LABELS "V2;Unit;Kernels;Attention;Q16;Exp2;Primitives;Integer"
-)
-
-# Test: Q16 OnlineSoftmax microkernel (FlashDecode)
-# Block-wise online softmax with rescaling for streaming KV processing
-add_executable(v2_test_q16_online_softmax unit/kernels/cpu/attention/q16_1/Test__Q16OnlineSoftmax.cpp)
-target_link_libraries(v2_test_q16_online_softmax
-    llaminar2_core
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Unit_Q16OnlineSoftmax
-    COMMAND $<TARGET_FILE:v2_test_q16_online_softmax>
-    LABELS "V2;Unit;Kernels;Attention;Q16;OnlineSoftmax;FlashDecode;Integer"
-)
 
 # Test: Q16 Integer Attention (Full Kernel) [DISABLED - project on hold]
 # Complete attention kernel including Flash Decode and FA2 Prefill paths
 # Tests parameter validation, snapshot capture, and multi-head/GQA configurations
-if(ENABLE_HYBRIDQ16_TESTS)
-    add_executable(v2_test_q16_integer_attention unit/kernels/cpu/attention/q16_1/ref/Test__Q16IntegerAttention.cpp)
-    target_link_libraries(v2_test_q16_integer_attention
-        llaminar2_core
-        GTest::gtest
-        GTest::gtest_main
-    )
-    add_v2_test(V2_Unit_Q16IntegerAttention
-        COMMAND $<TARGET_FILE:v2_test_q16_integer_attention>
-        LABELS "V2;Unit;Kernels;Attention;Q16;Integer;FlashDecode;FA2;Prefill"
-        MPI_PROCS 1
-    )
-endif()
 
 # Test: Q16 Integer Attention Parity (vs FP32 Reference) [DISABLED - project on hold]
 # Compares Q16 attention output against FP32 reference implementation
 # Validates cosine similarity, RMSE, and softmax weight normalization
 # NOTE: This is an integration test due to long runtime (~270s)
-if(ENABLE_HYBRIDQ16_TESTS)
-    add_executable(v2_test_q16_integer_attention_parity unit/kernels/cpu/attention/q16_1/ref/Test__Q16IntegerAttentionParity.cpp)
-    target_link_libraries(v2_test_q16_integer_attention_parity
-        llaminar2_core
-        GTest::gtest
-        GTest::gtest_main
-    )
-    add_v2_test(V2_Integration_Q16IntegerAttentionParity
-        COMMAND $<TARGET_FILE:v2_test_q16_integer_attention_parity>
-        LABELS "V2;Integration;Kernels;Attention;Q16;Parity;FP32;Cosine;RMSE"
-        MPI_PROCS 1
-    )
-endif()
-# Test: MLA (Multi-head Latent Attention) Microkernels - DeepSeek V3/Kimi K2
-# Split NOPE/ROPE Q×K^T with combined scoring for latent attention architectures
-add_executable(v2_test_mla_attention unit/kernels/cpu/attention/q16_1/ref/microkernels/Test__MLAAttention.cpp)
-target_link_libraries(v2_test_mla_attention
-    llaminar2_core
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Unit_MLAAttention
-    COMMAND $<TARGET_FILE:v2_test_mla_attention>
-    LABELS "V2;Unit;Microkernels;Q16_1;MLA;DeepSeekV3;KimiK2;NOPE;ROPE;Integer"
-    MPI_PROCS 1
-)
-
-# Test: Q16 Fixed-Scale Quantization Accuracy
-# Measures precision impact of VNNI-safe fixed-scale vs adaptive quantization
-add_executable(v2_test_q16_fixed_scale_accuracy unit/kernels/cpu/attention/q16_1/Test__Q16FixedScaleAccuracy.cpp)
-target_link_libraries(v2_test_q16_fixed_scale_accuracy
-    llaminar2_core
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Unit_Q16FixedScaleAccuracy
-    COMMAND $<TARGET_FILE:v2_test_q16_fixed_scale_accuracy>
-    LABELS "V2;Unit;Microkernels;Q16_1;Quantization;Accuracy;VNNI"
-    MPI_PROCS 1
-)
 
 # Test: VNNI Overflow Analysis
 # Comprehensive analysis of INT32 overflow risks in Q×K^T and P×V paths
@@ -8234,20 +6868,6 @@ target_link_libraries(v2_test_vnni_overflow_analysis
 add_v2_test(V2_Unit_VNNIOverflowAnalysis
     COMMAND $<TARGET_FILE:v2_test_vnni_overflow_analysis>
     LABELS "V2;Unit;Microkernels;Q16_1;VNNI;Overflow;Analysis"
-    MPI_PROCS 1
-)
-
-# Test: Q16 Fixed-Scale Quantization with VNNI-safe clipping
-# Tests copyFrom_fp32_fixed_scale() and copyFrom_fp32_rows_fixed_scale()
-add_executable(v2_test_q16_fixed_scale_quantization unit/kernels/cpu/gemm_v4/Test__Q16FixedScaleQuantization.cpp)
-target_link_libraries(v2_test_q16_fixed_scale_quantization
-    llaminar2_core
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Unit_Q16FixedScaleQuantization
-    COMMAND $<TARGET_FILE:v2_test_q16_fixed_scale_quantization>
-    LABELS "V2;Unit;Kernels;Q16_1;Quantization;VNNI;Safety"
     MPI_PROCS 1
 )
 

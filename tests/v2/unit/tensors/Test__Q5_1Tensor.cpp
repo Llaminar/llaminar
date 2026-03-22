@@ -313,7 +313,7 @@ namespace llaminar2
         /**
          * @brief Quantized GEMM vs FP32 GEMM Parity Test for Q5_1
          *
-         * Compares CPUQuantisedGemmKernel (INT8) against FloatingPointGemmKernel (FP32 OneDNN)
+         * Compares CPUNativeVNNIGemmKernel (INT8) against FloatingPointGemmKernel (FP32 OneDNN)
          * using randomly initialized Q5_1 weights. Validates that quantization introduces
          * acceptable error (< 1% relative L2).
          */

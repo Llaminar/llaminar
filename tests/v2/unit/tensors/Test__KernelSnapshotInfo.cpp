@@ -21,9 +21,8 @@
 #include "kernels/cpu/ops/CPUSoftmaxKernelT.h"
 #include "kernels/cpu/ops/CPUEmbeddingKernelT.h"
 #include "kernels/cpu/attention/CPUAttentionKernelT.h"
-#include "kernels/cpu/attention/q16_1/Q16FusedAttentionKernel.h"
 #include "kernels/cpu/gemm/FloatingPointGemmKernel.h"
-#include "kernels/cpu/gemm/CPUQuantisedGemmKernel.h"
+#include "kernels/cpu/native_vnni/CPUNativeVNNIGemmKernel.h"
 
 namespace llaminar2
 {
@@ -223,65 +222,6 @@ namespace llaminar2
             EXPECT_GE(info.inputs.size(), 3);  // Q, K, V
             EXPECT_GE(info.outputs.size(), 1); // output (and potentially scores, context)
             EXPECT_GE(info.scalars.size(), 4); // seq_len, n_heads, n_kv_heads, head_dim, etc.
-        }
-
-        // =============================================================================
-        // Fused Attention + Wo Kernel Tests
-        // =============================================================================
-
-        TEST_F(KernelSnapshotInfoTest, Q16FusedAttentionKernel_SnapshotInfo)
-        {
-            kernels::q16_1::Q16FusedAttentionKernel kernel;
-            auto info = kernel.getKernelSnapshotInfo();
-            verifySnapshotInfo(info, "Q16FusedAttentionKernel");
-
-            // Check kernel name
-            EXPECT_STREQ(info.kernel_name, "FusedAttentionWo");
-
-            // Inputs: Q, K, V, residual_in
-            EXPECT_GE(info.inputs.size(), 4);
-
-            // Weights: Wo
-            EXPECT_GE(info.weights.size(), 1);
-
-            // Outputs: residual_out + intermediate (scores, context, wo_output)
-            EXPECT_GE(info.outputs.size(), 1);
-
-            // Scalars: seq_len_q, kv_len, n_heads, n_kv_heads, head_dim, scale, causal, position_offset
-            EXPECT_GE(info.scalars.size(), 8);
-
-            // Verify Q16_1 input dtype
-            bool found_q16_input = false;
-            for (const auto &input : info.inputs)
-            {
-                if (input.dtype == KernelBufferDtype::Q16_1)
-                {
-                    found_q16_input = true;
-                    break;
-                }
-            }
-            EXPECT_TRUE(found_q16_input) << "Expected Q16_1 input dtype";
-
-            // Verify intermediate outputs for snapshots
-            int intermediate_count = 0;
-            for (const auto &output : info.outputs)
-            {
-                if (output.is_intermediate)
-                    intermediate_count++;
-            }
-            EXPECT_GE(intermediate_count, 3) << "Expected at least 3 intermediate outputs (scores, context, wo_output)";
-        }
-
-        TEST_F(KernelSnapshotInfoTest, Q16FusedAttentionKernel_InterfaceMethods)
-        {
-            kernels::q16_1::Q16FusedAttentionKernel kernel;
-
-            // Check interface methods
-            EXPECT_EQ(kernel.input_format(), ActivationFormat::Q8_1); // Q16_1 extends Q8_1 semantics
-            EXPECT_EQ(kernel.output_format(), ActivationFormat::Q8_1);
-            EXPECT_TRUE(kernel.requires_packed_wo());
-            EXPECT_TRUE(kernel.supports_device(-1)); // CPU only
-            EXPECT_FALSE(kernel.supports_device(0)); // No GPU support
         }
 
         // =============================================================================

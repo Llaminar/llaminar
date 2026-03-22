@@ -11,7 +11,7 @@
 #include <algorithm>
 
 #include "tensors/Tensors.h"
-#include "kernels/cpu/gemm/CPUQuantisedGemmKernel.h"
+#include "kernels/cpu/native_vnni/CPUNativeVNNIGemmKernel.h"
 #include "utils/DebugEnv.h"
 
 using namespace llaminar2;

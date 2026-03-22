@@ -16,18 +16,14 @@ namespace llaminar2
 {
 
     // Forward declarations for cached kernel pointers
-    class ITensorFusedQKVGemm;
     class ITensorGemm;
 
     /**
      * @brief Fused Q/K/V projection stage
      *
      * Efficiently computes multiple linear projections (Q, K, V) from a shared
-     * input by quantizing the input once and reusing the Q8_1 buffer for all
-     * projections. This avoids redundant quantization and improves cache locality.
-     *
-     * This stage delegates to CPUQuantisedGemmKernel::multiply_fused_multi(), which
-     * handles the quantization and multi-projection execution internally.
+     * input. Uses individual ITensorGemm kernels with multiply_fused() for shared
+     * input quantization, aligned with the FusedGateUpGEMM pattern.
      *
      * Implements IWorkspaceConsumerStage to delegate workspace requirements to the
      * underlying GEMM kernels for GPU execution.
@@ -112,11 +108,9 @@ namespace llaminar2
         Params params_;
 
         // === Cached kernel pointers (avoid KernelFactory mutex per execute) ===
-        ITensorFusedQKVGemm *cached_fused_kernel_ = nullptr;
         ITensorGemm *cached_gemm_q_ = nullptr;
         ITensorGemm *cached_gemm_k_ = nullptr;
         ITensorGemm *cached_gemm_v_ = nullptr;
-        bool cache_resolved_fused_ = false;
         bool cache_resolved_individual_ = false;
     };
 

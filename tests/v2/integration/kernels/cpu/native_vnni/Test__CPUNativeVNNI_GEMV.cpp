@@ -15,15 +15,16 @@
 #include <omp.h>
 #include <algorithm>
 #include <cmath>
+#include <csignal>
 #include <cstdio>
 #include <memory>
 #include <numeric>
 #include <random>
 #include <string>
+#include <unistd.h>
 #include <vector>
 
-#include "kernels/cpu/gemm/CPUNativeVNNIGemmKernel.h"
-#include "kernels/cpu/gemm/CPUQuantisedGemmKernel.h"
+#include "kernels/cpu/native_vnni/CPUNativeVNNIGemmKernel.h"
 #include "tensors/Tensors.h"
 #include "utils/Logger.h"
 #include "fort.hpp"
@@ -37,6 +38,42 @@ using namespace llaminar2::test;
 
 namespace
 {
+
+    // =========================================================================
+    // MPI global environment: init once, finalize on exit, abort on crash
+    // =========================================================================
+    void mpi_abort_signal_handler(int sig)
+    {
+        const char *msg = "\n[FATAL] Signal caught in integration test — calling MPI_Abort\n";
+        [[maybe_unused]] auto _ = write(STDERR_FILENO, msg, strlen(msg));
+        MPI_Abort(MPI_COMM_WORLD, sig);
+        _exit(128 + sig);
+    }
+
+    class MPIEnvironment : public ::testing::Environment
+    {
+    public:
+        void SetUp() override
+        {
+            int initialized = 0;
+            MPI_Initialized(&initialized);
+            if (!initialized)
+                MPI_Init(nullptr, nullptr);
+            std::signal(SIGSEGV, mpi_abort_signal_handler);
+            std::signal(SIGABRT, mpi_abort_signal_handler);
+            std::signal(SIGFPE, mpi_abort_signal_handler);
+        }
+        void TearDown() override
+        {
+            int finalized = 0;
+            MPI_Finalized(&finalized);
+            if (!finalized)
+                MPI_Finalize();
+        }
+    };
+
+    static auto *g_mpi_env [[maybe_unused]] =
+        ::testing::AddGlobalTestEnvironment(new MPIEnvironment);
 
     // =========================================================================
     // FP32 CPU reference GEMV (double-precision accumulation)
@@ -73,8 +110,7 @@ namespace
                     if (k_idx >= K)
                         break;
                     // Dequantize: fp_val = scale * int_val + min
-                    double fp_weight = static_cast<double>(scale) * static_cast<double>(vals[i])
-                                       + static_cast<double>(min_val);
+                    double fp_weight = static_cast<double>(scale) * static_cast<double>(vals[i]) + static_cast<double>(min_val);
                     acc += fp_weight * static_cast<double>(A[k_idx]);
                 }
             }
@@ -191,16 +227,6 @@ namespace
     class CPUNativeVNNIGemvTest : public ::testing::Test
     {
     protected:
-        void SetUp() override
-        {
-            // Ensure MPI is initialized (single-process tests)
-            int initialized = 0;
-            MPI_Initialized(&initialized);
-            if (!initialized)
-            {
-                MPI_Init(nullptr, nullptr);
-            }
-        }
     };
 
     // =========================================================================
@@ -479,12 +505,12 @@ namespace
     }
 
     // =========================================================================
-    // Comparison vs existing CPUQuantisedGemmKernel (INT8 requantize path)
+    // Comparison vs existing CPUNativeVNNIGemmKernel (INT8 requantize path)
     // =========================================================================
 
     TEST_F(CPUNativeVNNIGemvTest, CompareVsQuantisedGemmKernel_Q4_0)
     {
-        // Compare NativeVNNI vs existing CPUQuantisedGemmKernel on a medium shape
+        // Compare NativeVNNI vs existing CPUNativeVNNIGemmKernel on a medium shape
         const int N = 896;
         const int K = 896;
 
@@ -495,8 +521,8 @@ namespace
         CPUNativeVNNIGemmKernel native_kernel(weights.get());
         ASSERT_TRUE(native_kernel.isValid());
 
-        // Existing CPUQuantisedGemmKernel (INT8 requantize path)
-        auto existing_kernel = std::make_unique<llaminar2::gemm::CPUQuantisedGemmKernel>(weights.get());
+        // Existing CPUNativeVNNIGemmKernel (INT8 requantize path)
+        auto existing_kernel = std::make_unique<llaminar2::cpu::native_vnni::CPUNativeVNNIGemmKernel>(weights.get());
 
         // Random activations
         std::vector<float> A(K);
@@ -523,7 +549,7 @@ namespace
         float mae_native = maxAbsError(C_native.data(), C_ref.data(), N);
         float mae_existing = maxAbsError(C_existing.data(), C_ref.data(), N);
 
-        std::cout << "\n=== NativeVNNI vs CPUQuantisedGemmKernel (Q4_0 896×896) ===\n"
+        std::cout << "\n=== NativeVNNI vs CPUNativeVNNIGemmKernel (Q4_0 896×896) ===\n"
                   << "  NativeVNNI:      cosine=" << cos_native << " max_err=" << mae_native << "\n"
                   << "  QuantisedGemm:   cosine=" << cos_existing << " max_err=" << mae_existing << "\n";
 
@@ -544,24 +570,42 @@ namespace
     std::unique_ptr<TensorBase> createWeightsForFormat(
         const std::string &fmt_name, size_t N, size_t K)
     {
-        if (fmt_name == "Q4_0") return TestTensorFactory::createQ4_0Random({N, K});
-        if (fmt_name == "IQ4_NL") return TestTensorFactory::createIQ4_NLRandom({N, K});
-        if (fmt_name == "Q4_1") return TestTensorFactory::createQ4_1Random({N, K});
-        if (fmt_name == "IQ4_XS") return TestTensorFactory::createIQ4_XSRandom({N, K});
-        if (fmt_name == "Q5_0") return TestTensorFactory::createQ5_0Random({N, K});
-        if (fmt_name == "Q5_1") return TestTensorFactory::createQ5_1Random({N, K});
-        if (fmt_name == "Q6_K") return TestTensorFactory::createQ6_KRandom({N, K});
-        if (fmt_name == "Q3_K") return TestTensorFactory::createQ3_KRandom({N, K});
-        if (fmt_name == "Q2_K") return TestTensorFactory::createQ2_KRandom({N, K});
-        if (fmt_name == "IQ3_S") return TestTensorFactory::createIQ3_SRandom({N, K});
-        if (fmt_name == "IQ3_XXS") return TestTensorFactory::createIQ3_XXSRandom({N, K});
-        if (fmt_name == "IQ2_S") return TestTensorFactory::createIQ2_SRandom({N, K});
-        if (fmt_name == "IQ2_XS") return TestTensorFactory::createIQ2_XSRandom({N, K});
-        if (fmt_name == "IQ2_XXS") return TestTensorFactory::createIQ2_XXSRandom({N, K});
-        if (fmt_name == "IQ1_S") return TestTensorFactory::createIQ1_SRandom({N, K});
-        if (fmt_name == "IQ1_M") return TestTensorFactory::createIQ1_MRandom({N, K});
-        if (fmt_name == "Q8_0") return TestTensorFactory::createQ8_0Random({N, K});
-        if (fmt_name == "Q8_1") return TestTensorFactory::createQ8_1Random({N, K});
+        if (fmt_name == "Q4_0")
+            return TestTensorFactory::createQ4_0Random({N, K});
+        if (fmt_name == "IQ4_NL")
+            return TestTensorFactory::createIQ4_NLRandom({N, K});
+        if (fmt_name == "Q4_1")
+            return TestTensorFactory::createQ4_1Random({N, K});
+        if (fmt_name == "IQ4_XS")
+            return TestTensorFactory::createIQ4_XSRandom({N, K});
+        if (fmt_name == "Q5_0")
+            return TestTensorFactory::createQ5_0Random({N, K});
+        if (fmt_name == "Q5_1")
+            return TestTensorFactory::createQ5_1Random({N, K});
+        if (fmt_name == "Q6_K")
+            return TestTensorFactory::createQ6_KRandom({N, K});
+        if (fmt_name == "Q3_K")
+            return TestTensorFactory::createQ3_KRandom({N, K});
+        if (fmt_name == "Q2_K")
+            return TestTensorFactory::createQ2_KRandom({N, K});
+        if (fmt_name == "IQ3_S")
+            return TestTensorFactory::createIQ3_SRandom({N, K});
+        if (fmt_name == "IQ3_XXS")
+            return TestTensorFactory::createIQ3_XXSRandom({N, K});
+        if (fmt_name == "IQ2_S")
+            return TestTensorFactory::createIQ2_SRandom({N, K});
+        if (fmt_name == "IQ2_XS")
+            return TestTensorFactory::createIQ2_XSRandom({N, K});
+        if (fmt_name == "IQ2_XXS")
+            return TestTensorFactory::createIQ2_XXSRandom({N, K});
+        if (fmt_name == "IQ1_S")
+            return TestTensorFactory::createIQ1_SRandom({N, K});
+        if (fmt_name == "IQ1_M")
+            return TestTensorFactory::createIQ1_MRandom({N, K});
+        if (fmt_name == "Q8_0")
+            return TestTensorFactory::createQ8_0Random({N, K});
+        if (fmt_name == "Q8_1")
+            return TestTensorFactory::createQ8_1Random({N, K});
         return nullptr;
     }
 
@@ -614,7 +658,8 @@ namespace
         std::vector<float> A(K);
         std::mt19937 rng(42);
         std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
-        for (auto &v : A) v = dist(rng);
+        for (auto &v : A)
+            v = dist(rng);
 
         std::vector<float> C_native(N, 0.0f);
         ASSERT_TRUE(kernel.multiply(A.data(), C_native.data(), 1, N, K));
@@ -712,7 +757,8 @@ namespace
                 std::vector<float> A(shape.K);
                 std::mt19937 rng(42);
                 std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
-                for (auto &v : A) v = dist(rng);
+                for (auto &v : A)
+                    v = dist(rng);
 
                 std::vector<float> C_native(shape.N, 0.0f);
                 kernel.multiply(A.data(), C_native.data(), 1, shape.N, shape.K);
@@ -724,8 +770,10 @@ namespace
                 float max_err = maxAbsError(C_native.data(), C_ref.data(), shape.N);
 
                 bool pass = cos_sim >= fmt.cosine_threshold;
-                if (pass) pass_count++;
-                else fail_count++;
+                if (pass)
+                    pass_count++;
+                else
+                    fail_count++;
 
                 char cos_buf[32], err_buf[32];
                 std::snprintf(cos_buf, sizeof(cos_buf), "%.6f", cos_sim);
@@ -743,8 +791,7 @@ namespace
         }
 
         table << "TOTAL" << "" << "" << "" << ""
-              << "" << "" << std::to_string(pass_count) + "/" +
-                              std::to_string(pass_count + fail_count)
+              << "" << "" << std::to_string(pass_count) + "/" + std::to_string(pass_count + fail_count)
               << fort::endr;
 
         std::cout << "\n=== CPU NativeVNNI ALL FORMATS Accuracy Sweep ===\n";
@@ -770,7 +817,8 @@ namespace
         std::vector<float> A(M * K);
         std::mt19937 rng(42);
         std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
-        for (auto &v : A) v = dist(rng);
+        for (auto &v : A)
+            v = dist(rng);
 
         std::vector<float> C_native(M * N, 0.0f);
         ASSERT_TRUE(kernel.multiply(A.data(), C_native.data(), M, N, K));
@@ -801,7 +849,8 @@ namespace
         std::vector<float> A(M * K);
         std::mt19937 rng(42);
         std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
-        for (auto &v : A) v = dist(rng);
+        for (auto &v : A)
+            v = dist(rng);
 
         std::vector<float> C_native(M * N, 0.0f);
         ASSERT_TRUE(kernel.multiply(A.data(), C_native.data(), M, N, K));
@@ -832,7 +881,8 @@ namespace
         std::vector<float> A(M * K);
         std::mt19937 rng(42);
         std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
-        for (auto &v : A) v = dist(rng);
+        for (auto &v : A)
+            v = dist(rng);
 
         std::vector<float> C_native(M * N, 0.0f);
         ASSERT_TRUE(kernel.multiply(A.data(), C_native.data(), M, N, K));
@@ -863,7 +913,8 @@ namespace
         std::vector<float> A(M * K);
         std::mt19937 rng(42);
         std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
-        for (auto &v : A) v = dist(rng);
+        for (auto &v : A)
+            v = dist(rng);
 
         std::vector<float> C_native(M * N, 0.0f);
         ASSERT_TRUE(kernel.multiply(A.data(), C_native.data(), M, N, K));

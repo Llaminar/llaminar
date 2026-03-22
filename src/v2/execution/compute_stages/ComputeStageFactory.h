@@ -13,16 +13,13 @@
 #include "stages/FusedGateUpGEMMStage.h"
 #include "stages/RMSNormStage.h"
 #include "stages/RoPEStage.h"
-#include "stages/SwiGLUStage.h"
 #include "stages/ResidualAddStage.h"
 #include "stages/AttentionWithKVCacheStage.h"
 #include "stages/KVCacheAppendStage.h"
 #include "stages/KVCacheGatherStage.h"
 #include "stages/AttentionComputeStage.h"
-#include "stages/FusedAttentionWoStage.h"
 #include "stages/EmbeddingStage.h"
 #include "stages/LMHeadStage.h"
-#include "stages/QuantizeToQ16_1Stage.h"
 #include "stages/AllreduceStage.h"
 #include "stages/AllGatherStage.h"
 #include "stages/AllGatherVStage.h"
@@ -103,12 +100,6 @@ namespace llaminar2
         // =====================================================================
 
         /**
-         * @brief Create a SwiGLU stage
-         */
-        static std::unique_ptr<IComputeStage> createSwiGLU(
-            const SwiGLUStage::Params &params);
-
-        /**
          * @brief Create a residual add stage
          */
         static std::unique_ptr<IComputeStage> createResidualAdd(
@@ -174,23 +165,6 @@ namespace llaminar2
          */
         static std::unique_ptr<IComputeStage> createAttentionCompute(
             const AttentionComputeStage::Params &params);
-
-        /**
-         * @brief Create a fused attention + Wo projection stage
-         *
-         * Combines attention computation with output projection (Wo) for:
-         * - Better cache locality (context stays in registers)
-         * - Eliminated context quantization round-trip
-         * - Reduced memory bandwidth
-         *
-         * Replaces separate AttentionComputeStage + GEMMStage (wo_proj) in the DAG.
-         * Output goes directly to attn_proj buffer.
-         *
-         * @param params Fused attention parameters including Q, K, V, Wo, output
-         * @return FusedAttentionWoStage instance
-         */
-        static std::unique_ptr<IComputeStage> createFusedAttentionWo(
-            const FusedAttentionWoStage::Params &params);
 
         // =====================================================================
         // MoE (Mixture of Experts) Stages
@@ -304,17 +278,6 @@ namespace llaminar2
          */
         static std::unique_ptr<IComputeStage> createLMHead(
             const LMHeadStage::Params &params);
-
-        /**
-         * @brief Create a quantize stage for FP32 → Q16_1 conversion
-         *
-         * Used to initialize the Q16_1 residual stream in HybridQ16 mode.
-         *
-         * @param params Quantize parameters including input and output tensors
-         * @return QuantizeToQ16_1Stage instance
-         */
-        static std::unique_ptr<IComputeStage> createQuantizeToQ16_1(
-            const QuantizeToQ16_1Stage::Params &params);
     };
 
 } // namespace llaminar2

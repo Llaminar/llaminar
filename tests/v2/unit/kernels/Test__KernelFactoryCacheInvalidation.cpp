@@ -280,96 +280,71 @@ TEST_F(Test__KernelFactoryCacheInvalidation, RapidCreateDestroy_CacheStaysClean)
 
 TEST_F(Test__KernelFactoryCacheInvalidation, CPUPackedWeights_CleanedUpOnDestruction)
 {
-    // This test verifies that tensor->cache_ (CPU VNNI packed weights)
-    // is properly cleaned up when the tensor is destroyed.
+    // NativeVNNI kernels manage their own weight packing internally.
+    // tensor->cache_ is NOT used for CPU packed weights anymore.
 
     {
         auto tensor = createTestTensor();
 
-        // Initially, cache_ should be empty
+        // cache_ should remain empty since NativeVNNI packs internally
         EXPECT_FALSE(tensor->cache_.has_value()) << "Fresh tensor should have no cache";
 
-        // Create GEMM kernel - this populates tensor->cache_ with packed weights
         auto *kernel = getPreparedKernel(tensor.get());
         ASSERT_NE(kernel, nullptr);
 
-        // Now cache_ should have packed weights
-        EXPECT_TRUE(tensor->cache_.has_value()) << "After GEMM creation, tensor should have packed weights in cache_";
-
-        // tensor goes out of scope here
+        // cache_ stays empty — NativeVNNI packs weights in the kernel itself
+        EXPECT_FALSE(tensor->cache_.has_value())
+            << "NativeVNNI kernels don't use tensor->cache_ for CPU packed weights";
     }
 
-    // After tensor destruction, the KernelFactory cache should be empty
-    // AND the packed weights should have been deleted (no memory leak)
-    // We can't directly verify memory was freed, but we verify cache is clean
     auto [size_after, _] = KernelFactory::cacheStats();
     EXPECT_EQ(size_after, 0u) << "Cache should be empty after tensor destruction";
 }
 
 TEST_F(Test__KernelFactoryCacheInvalidation, CPUPackedWeights_ClearedByExplicitClearCacheFor)
 {
-    // Verify that clearCacheFor explicitly clears cache_
+    // NativeVNNI kernels don't populate tensor->cache_, so clearCacheFor is a no-op for CPU.
     auto tensor = createTestTensor();
 
-    // Populate cache
     getPreparedKernel(tensor.get());
-    EXPECT_TRUE(tensor->cache_.has_value());
+    // cache_ stays empty with NativeVNNI
+    EXPECT_FALSE(tensor->cache_.has_value())
+        << "NativeVNNI kernels don't use tensor->cache_";
 
-    // Explicitly clear
     KernelFactory::clearCacheFor(tensor.get());
-
-    // cache_ should now be empty
-    EXPECT_FALSE(tensor->cache_.has_value()) << "clearCacheFor should reset cache_";
+    EXPECT_FALSE(tensor->cache_.has_value()) << "clearCacheFor should leave cache_ empty";
 }
 
 TEST_F(Test__KernelFactoryCacheInvalidation, CPUPackedWeights_ClearedByClearCache)
 {
-    // Verify that clearCache() clears all tensor caches
+    // NativeVNNI kernels don't populate tensor->cache_
     auto tensor1 = createTestTensor();
     auto tensor2 = createTestTensor();
 
-    // Populate caches
     getPreparedKernel(tensor1.get());
     getPreparedKernel(tensor2.get());
 
-    EXPECT_TRUE(tensor1->cache_.has_value());
-    EXPECT_TRUE(tensor2->cache_.has_value());
+    // cache_ stays empty with NativeVNNI
+    EXPECT_FALSE(tensor1->cache_.has_value());
+    EXPECT_FALSE(tensor2->cache_.has_value());
 
-    // Clear all
     KernelFactory::clearCache();
 
-    // Both should be cleared
-    EXPECT_FALSE(tensor1->cache_.has_value()) << "clearCache should reset all tensor caches";
-    EXPECT_FALSE(tensor2->cache_.has_value()) << "clearCache should reset all tensor caches";
+    EXPECT_FALSE(tensor1->cache_.has_value());
+    EXPECT_FALSE(tensor2->cache_.has_value());
 }
 
 TEST_F(Test__KernelFactoryCacheInvalidation, MultiplePackedWeightsCreation_OnlyPacksOnce)
 {
-    // Verify that calling getOrCreateGemm multiple times doesn't re-pack weights
+    // KernelFactory still caches the kernel object itself
     auto tensor = createTestTensor();
 
-    // First call - should create packed weights
     auto *kernel1 = getPreparedKernel(tensor.get());
     ASSERT_NE(kernel1, nullptr);
-    EXPECT_TRUE(tensor->cache_.has_value());
 
-    // Get pointer to cached data for comparison
-    void *cache_ptr_before = nullptr;
-    try
-    {
-        // We can't directly access the packed data, but we can check the any still has value
-        cache_ptr_before = &tensor->cache_;
-    }
-    catch (...)
-    {
-    }
-
-    // Second call - should reuse existing packed weights
     auto *kernel2 = getPreparedKernel(tensor.get());
     EXPECT_EQ(kernel1, kernel2) << "Should return cached kernel";
-    EXPECT_TRUE(tensor->cache_.has_value());
 
-    // Cache should still have exactly 1 entry
     auto [size, _] = KernelFactory::cacheStats();
     EXPECT_EQ(size, 1u) << "Should only have one cached kernel";
 }
@@ -559,10 +534,10 @@ TEST_F(Test__KernelFactoryCacheInvalidation, BothCaches_CleanedUpTogether)
     {
         auto tensor = createTestTensor();
 
-        // Create CPU GEMM (populates cache_)
+        // Create CPU GEMM (NativeVNNI — does NOT populate cache_)
         auto *cpu_kernel = getPreparedKernel(tensor.get());
         ASSERT_NE(cpu_kernel, nullptr);
-        EXPECT_TRUE(tensor->cache_.has_value()) << "Should have CPU packed weights";
+        EXPECT_FALSE(tensor->cache_.has_value()) << "NativeVNNI doesn't use tensor->cache_";
 
         // Create CUDA GEMM (populates cuda_cache_)
         // Use CUDAOrdinalGuard to set the target device ordinal

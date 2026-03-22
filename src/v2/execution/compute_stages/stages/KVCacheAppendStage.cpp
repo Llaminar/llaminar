@@ -11,7 +11,7 @@
 #include "../../../utils/Logger.h"
 #include "../../../kernels/cpu/CPUKVCache.h"
 #include "../../../utils/OpenMPUtils.h"
-#include "../../../kernels/cpu/attention/q16_1/VNNISafetyConstants.h"
+
 #include "../../../utils/KVCacheProfiler.h"
 #include "../../../tensors/GpuTensorView.h"
 
@@ -657,8 +657,12 @@ namespace llaminar2
             const float kv_cache_scale = params_.kv_cache_scale;
             const int head_dim = params_.head_dim;
 
-            // Get VNNI-safe clipping limit
-            const int16_t max_safe_int16 = vnni_safety::get_max_safe_int16(head_dim);
+            // VNNI-safe clipping limit: floor(sqrt(INT32_MAX / (head_dim/16)))
+            // Prevents INT32 overflow during VPDPWSSD accumulation.
+            const int16_t max_safe_int16 = (head_dim <= 64) ? 23170 : (head_dim <= 96) ? 18918
+                                                                  : (head_dim <= 128)  ? 16383
+                                                                  : (head_dim <= 192)  ? 13377
+                                                                                       : 11585;
 
             LOG_DEBUG("[KVCacheAppendStage] Q16_1 cache with VNNI-safe fixed-scale quantization"
                       << " (scale=" << kv_cache_scale

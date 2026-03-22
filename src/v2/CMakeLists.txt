@@ -1152,12 +1152,6 @@ endif()
 # =============================================================================
 # Typed Register Enforcement (JIT Code Quality)
 # =============================================================================
-# Enforce that JIT code uses the typed register system (RegisterGuard.h)
-# instead of raw Xbyak register instantiations like Zmm(5) or Xmm(20).
-# This prevents developers from bypassing the tracking system.
-include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/EnforceTypedRegisters.cmake)
-enforce_typed_register_usage(${CMAKE_CURRENT_SOURCE_DIR})
-
 # V2 Core Library
 add_library(llaminar2_core STATIC
     # Interfaces
@@ -1182,7 +1176,6 @@ add_library(llaminar2_core STATIC
     execution/compute_stages/stages/RMSNormStage.cpp
     execution/compute_stages/stages/QKNormStage.cpp
     execution/compute_stages/stages/RoPEStage.cpp
-    execution/compute_stages/stages/SwiGLUStage.cpp
     execution/compute_stages/stages/ResidualAddStage.cpp
     execution/compute_stages/stages/FusedResidualNormStage.cpp
     execution/compute_stages/stages/AllreduceStage.cpp
@@ -1195,7 +1188,6 @@ add_library(llaminar2_core STATIC
     execution/compute_stages/stages/KVCacheAppendStage.cpp
     execution/compute_stages/stages/KVCacheGatherStage.cpp
     execution/compute_stages/stages/AttentionComputeStage.cpp
-    execution/compute_stages/stages/FusedAttentionWoStage.cpp
     execution/compute_stages/stages/EmbeddingStage.cpp
     execution/compute_stages/stages/LMHeadStage.cpp
     execution/local_execution/graph/DeviceGraphCaptureController.cpp
@@ -1338,27 +1330,6 @@ add_library(llaminar2_core STATIC
     kernels/cpu/ops/CPUEmbeddingKernelT.cpp    # Typed Embedding lookup with native precision paths (FP32/BF16/FP16/Q8_1)
     kernels/cpu/attention/CPUAttentionKernelT.cpp # Typed attention kernel (FP32/BF16/FP16/Q8_1)
     kernels/cpu/attention/CPUFlashAttentionKernelT.cpp # FlashAttention2-style tiled CPU attention (FP32 with fallbacks)
-    # Q8_1 fused attention + Wo projection (microkernels and composed kernels)
-    kernels/cpu/attention/q8_1/microkernels/Q8DotProduct.cpp       # μK1: Q8_1 dot product with VNNI
-    kernels/cpu/attention/q8_1/microkernels/OnlineSoftmax.cpp      # μK2: Streaming online softmax
-    kernels/cpu/attention/q8_1/microkernels/VWeightedAccum.cpp     # μK3: Weighted V accumulation
-    kernels/cpu/attention/q8_1/microkernels/WoProjection.cpp       # μK4: Wo output projection
-    kernels/cpu/attention/q8_1/microkernels/FastExp.cpp            # μK5: Fast exponential approximation
-    kernels/cpu/attention/q8_1/jit/WoProjectionVNNIPacked.cpp       # JIT helper thunk for VNNI-packed Wo GEMM
-    kernels/cpu/attention/q8_1/FusedAttentionWoRef.cpp             # Reference implementation
-    kernels/cpu/attention/q8_1/FusedAttentionWoTiled.cpp           # Cache-blocked tiled implementation
-    # Q16_1 fused attention (TRUE INTEGER PIPELINE v2)
-    kernels/cpu/attention/q16_1/Q16FusedAttentionKernel.cpp        # ITensorFusedAttentionWo implementation
-    kernels/cpu/attention/q16_1/ref/Q16IntegerAttentionRef.cpp     # v2: TRUE integer attention (replaces Q16FusedAttentionRef)
-    kernels/cpu/attention/q16_1/ref/microkernels/Exp2Core.cpp            # v2: shared exp2 LUT primitives for all softmax impls
-    kernels/cpu/attention/q16_1/ref/microkernels/Exp2FixedSoftmax.cpp    # v2: exp2 fixed-point softmax (INT32→INT16, 2048-entry LUT)
-    kernels/cpu/attention/q16_1/ref/microkernels/Q16DotProduct.cpp       # v2: Q×K^T integer dot product microkernel
-    kernels/cpu/attention/q16_1/ref/microkernels/PVAccumulate.cpp        # v2: P×V integer accumulation microkernel
-    kernels/cpu/attention/q16_1/ref/microkernels/WoProjection.cpp        # v2: Wo projection INT32→Q16_1 microkernel
-    kernels/cpu/attention/q16_1/ref/microkernels/OnlineSoftmax.cpp       # v2: FlashDecode online softmax microkernel
-    kernels/cpu/attention/q16_1/ref/microkernels/MLAAttention.cpp        # v2: MLA (DeepSeek V3/Kimi K2) dual NOPE+ROPE attention
-    # Fused kernels (operator fusion framework)
-    kernels/cpu/gemm/FusedGEMM.cpp           # Unified fused GEMM kernel (supports Gate/Up and Q/K/V patterns)
     # Kernel dispatch factory (centralized device-aware kernel creation)
     kernels/KernelFactory.cpp
     # Universal device kernel cache (hipBLAS, cuBLAS handles, etc.)

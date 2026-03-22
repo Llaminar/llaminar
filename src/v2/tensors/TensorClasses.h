@@ -2815,10 +2815,6 @@ namespace llaminar2
         // TensorBase pure virtual - required implementation
         std::unique_ptr<ITensorGemm> createGemm() override;
 
-        // Phase 2 fused kernel factory methods
-        std::unique_ptr<class FusedGEMM> createFusedDualGemm(TensorBase *gate_weight, TensorBase *up_weight);
-        std::unique_ptr<class FusedGEMM> createFusedTripleGemm(TensorBase *q_weight, TensorBase *k_weight, TensorBase *v_weight);
-
         bool from_int32_with_scales(
             const int32_t *accum,
             int rows,

@@ -61,31 +61,31 @@ extern "C" bool rocmQuantGemm_quantizeActivationsBlockwise(
     int block_size);
 
 extern "C" bool rocmGemv_int8_int8_fp32_vnni_blockwise_scaled(
-    const int8_t* d_A_int8,
-    const int8_t* d_B_int8_vnni,
-    float* d_C_fp32,
-    const float* d_scales_A_blockwise,
-    const float* d_scale_B,
+    const int8_t *d_A_int8,
+    const int8_t *d_B_int8_vnni,
+    float *d_C_fp32,
+    const float *d_scales_A_blockwise,
+    const float *d_scale_B,
     int N, int K,
     float alpha,
     float beta,
-    const float* d_C_existing,
-    const float* d_bias,
-    int device_id, void* stream);
+    const float *d_C_existing,
+    const float *d_bias,
+    int device_id, void *stream);
 
 extern "C" bool rocmGemv_int8_int8_fp32_vnni_blockwise_scaled_pair(
-    const int8_t* d_A_int8,
-    const float* d_scales_A_blockwise,
-    const int8_t* d_B0,
-    const int8_t* d_B1,
-    float* d_C0,
-    float* d_C1,
-    const float* d_scales_B0,
-    const float* d_scales_B1,
+    const int8_t *d_A_int8,
+    const float *d_scales_A_blockwise,
+    const int8_t *d_B0,
+    const int8_t *d_B1,
+    float *d_C0,
+    float *d_C1,
+    const float *d_scales_B0,
+    const float *d_scales_B1,
     int N0, int N1,
     int K,
     float alpha,
-    int device_id, void* stream);
+    int device_id, void *stream);
 
 // Forward declarations for HIP functions used in integration tests
 extern "C"
@@ -2051,7 +2051,8 @@ namespace llaminar2
                     DeviceId::rocm(0),
                     {input.get(), wq.get(), wk.get(), wv.get(), bias_q.get(), bias_k.get(), bias_v.get()},
                     {rocm_q.get(), rocm_k.get(), rocm_v.get()},
-                    [&]() {
+                    [&]()
+                    {
                         return rocm_stage.execute(&rocm_ctx);
                     });
 
@@ -2070,8 +2071,8 @@ namespace llaminar2
                     std::vector<float>(rocm_v->data(), rocm_v->data() + static_cast<size_t>(M * N_V)));
 
                 LOG_INFO("[Integration] ROCm fused QKV parity: Q=" << q_cos
-                                                                    << " K=" << k_cos
-                                                                    << " V=" << v_cos);
+                                                                   << " K=" << k_cos
+                                                                   << " V=" << v_cos);
 
                 EXPECT_GT(q_cos, COSINE_THRESHOLD) << "Q projection cosine too low";
                 EXPECT_GT(k_cos, COSINE_THRESHOLD) << "K projection cosine too low";
@@ -2210,7 +2211,8 @@ namespace llaminar2
                     DeviceId::rocm(0),
                     rocm_inputs,
                     rocm_outputs,
-                    [&]() {
+                    [&]()
+                    {
                         return rocm_stage.execute(&rocm_ctx);
                     });
 
@@ -2229,11 +2231,11 @@ namespace llaminar2
                     std::vector<float>(rocm_v->data(), rocm_v->data() + static_cast<size_t>(M * N_V)));
 
                 LOG_INFO("[Integration] Real Qwen2 layer " << layer_idx << " fused QKV parity: Q=" << q_cos
-                                                            << " K=" << k_cos
-                                                            << " V=" << v_cos
-                                                            << " q_bias_type=" << static_cast<int>(cpu_bias_q->native_type())
-                                                            << " k_bias_type=" << static_cast<int>(cpu_bias_k->native_type())
-                                                            << " v_bias_type=" << static_cast<int>(cpu_bias_v->native_type()));
+                                                           << " K=" << k_cos
+                                                           << " V=" << v_cos
+                                                           << " q_bias_type=" << static_cast<int>(cpu_bias_q->native_type())
+                                                           << " k_bias_type=" << static_cast<int>(cpu_bias_k->native_type())
+                                                           << " v_bias_type=" << static_cast<int>(cpu_bias_v->native_type()));
 
                 EXPECT_GT(q_cos, COSINE_THRESHOLD) << "Q projection cosine too low for real model layer";
                 EXPECT_GT(k_cos, COSINE_THRESHOLD) << "K projection cosine too low for real model layer";
@@ -2388,7 +2390,8 @@ namespace llaminar2
                     DeviceId::rocm(0),
                     rocm_inputs,
                     rocm_outputs,
-                    [&]() {
+                    [&]()
+                    {
                         return rocm_stage.execute(&rocm_ctx);
                     });
 
@@ -2407,8 +2410,8 @@ namespace llaminar2
                     std::vector<float>(rocm_v->data(), rocm_v->data() + static_cast<size_t>(M * N_V)));
 
                 LOG_INFO("[Integration] Real Qwen2 layer 3 fused QKV parity on snapshot ATTENTION_NORM input: Q=" << q_cos
-                                                                                                                    << " K=" << k_cos
-                                                                                                                    << " V=" << v_cos);
+                                                                                                                  << " K=" << k_cos
+                                                                                                                  << " V=" << v_cos);
 
                 EXPECT_GT(q_cos, COSINE_THRESHOLD) << "Q projection cosine too low for layer-3 snapshot input";
                 EXPECT_GT(k_cos, COSINE_THRESHOLD) << "K projection cosine too low for layer-3 snapshot input";
@@ -2554,9 +2557,9 @@ namespace llaminar2
                 const std::initializer_list<TensorBase *> proj_inputs = {
                     input.get(), rocm_wq.get(), rocm_wk.get(), rocm_wv.get(), rocm_bias_q.get(), rocm_bias_k.get(), rocm_bias_v.get()};
                 const std::initializer_list<TensorBase *> proj_outputs = {rocm_q.get(), rocm_k.get(), rocm_v.get()};
-                ASSERT_TRUE(with_gpu_coherence(DeviceId::rocm(0), proj_inputs, proj_outputs, [&]() {
-                    return rocm_proj_stage.execute(&rocm_ctx);
-                })) << "ROCm Q/K projection failed for layer-3 snapshot input";
+                ASSERT_TRUE(with_gpu_coherence(DeviceId::rocm(0), proj_inputs, proj_outputs, [&]()
+                                               { return rocm_proj_stage.execute(&rocm_ctx); }))
+                    << "ROCm Q/K projection failed for layer-3 snapshot input";
                 rocm_proj_stage.unbindWorkspace();
 
                 QKNormStage::Params cpu_q_norm_params{
@@ -2607,15 +2610,15 @@ namespace llaminar2
 
                 const std::initializer_list<TensorBase *> qnorm_inputs = {rocm_q.get(), rocm_q_norm.get()};
                 const std::initializer_list<TensorBase *> qnorm_outputs = {rocm_q.get()};
-                ASSERT_TRUE(with_gpu_coherence(DeviceId::rocm(0), qnorm_inputs, qnorm_outputs, [&]() {
-                    return rocm_q_norm_stage.execute(&rocm_ctx);
-                })) << "ROCm Q norm failed for layer-3 snapshot input";
+                ASSERT_TRUE(with_gpu_coherence(DeviceId::rocm(0), qnorm_inputs, qnorm_outputs, [&]()
+                                               { return rocm_q_norm_stage.execute(&rocm_ctx); }))
+                    << "ROCm Q norm failed for layer-3 snapshot input";
 
                 const std::initializer_list<TensorBase *> knorm_inputs = {rocm_k.get(), rocm_k_norm.get()};
                 const std::initializer_list<TensorBase *> knorm_outputs = {rocm_k.get()};
-                ASSERT_TRUE(with_gpu_coherence(DeviceId::rocm(0), knorm_inputs, knorm_outputs, [&]() {
-                    return rocm_k_norm_stage.execute(&rocm_ctx);
-                })) << "ROCm K norm failed for layer-3 snapshot input";
+                ASSERT_TRUE(with_gpu_coherence(DeviceId::rocm(0), knorm_inputs, knorm_outputs, [&]()
+                                               { return rocm_k_norm_stage.execute(&rocm_ctx); }))
+                    << "ROCm K norm failed for layer-3 snapshot input";
 
                 const float q_cos = cosineSimilarity(
                     std::vector<float>(cpu_q->data(), cpu_q->data() + cpu_q->numel()),
@@ -2625,7 +2628,7 @@ namespace llaminar2
                     std::vector<float>(rocm_k->data(), rocm_k->data() + rocm_k->numel()));
 
                 LOG_INFO("[Integration] Real Qwen2 layer 3 QKNorm parity on snapshot ATTENTION_NORM input: Q=" << q_cos
-                                                                                                                  << " K=" << k_cos);
+                                                                                                               << " K=" << k_cos);
 
                 EXPECT_GT(q_cos, COSINE_THRESHOLD) << "QKNorm Q cosine too low for layer-3 snapshot input";
                 EXPECT_GT(k_cos, COSINE_THRESHOLD) << "QKNorm K cosine too low for layer-3 snapshot input";
@@ -2739,9 +2742,9 @@ namespace llaminar2
                 const std::initializer_list<TensorBase *> proj_inputs = {
                     input.get(), rocm_wq.get(), rocm_wk.get(), rocm_wv.get(), rocm_bias_q.get(), rocm_bias_k.get(), rocm_bias_v.get()};
                 const std::initializer_list<TensorBase *> proj_outputs = {rocm_q.get(), rocm_k.get(), rocm_v.get()};
-                ASSERT_TRUE(with_gpu_coherence(DeviceId::rocm(0), proj_inputs, proj_outputs, [&]() {
-                    return rocm_proj_stage.execute(&rocm_ctx);
-                })) << "ROCm Q/K projection failed";
+                ASSERT_TRUE(with_gpu_coherence(DeviceId::rocm(0), proj_inputs, proj_outputs, [&]()
+                                               { return rocm_proj_stage.execute(&rocm_ctx); }))
+                    << "ROCm Q/K projection failed";
                 rocm_proj_stage.unbindWorkspace();
 
                 QKNormStage::Params cpu_q_norm_params{
@@ -2792,15 +2795,15 @@ namespace llaminar2
 
                 const std::initializer_list<TensorBase *> qnorm_inputs = {rocm_q.get(), rocm_q_norm.get()};
                 const std::initializer_list<TensorBase *> qnorm_outputs = {rocm_q.get()};
-                ASSERT_TRUE(with_gpu_coherence(DeviceId::rocm(0), qnorm_inputs, qnorm_outputs, [&]() {
-                    return rocm_q_norm_stage.execute(&rocm_ctx);
-                })) << "ROCm Q norm failed";
+                ASSERT_TRUE(with_gpu_coherence(DeviceId::rocm(0), qnorm_inputs, qnorm_outputs, [&]()
+                                               { return rocm_q_norm_stage.execute(&rocm_ctx); }))
+                    << "ROCm Q norm failed";
 
                 const std::initializer_list<TensorBase *> knorm_inputs = {rocm_k.get(), rocm_k_norm.get()};
                 const std::initializer_list<TensorBase *> knorm_outputs = {rocm_k.get()};
-                ASSERT_TRUE(with_gpu_coherence(DeviceId::rocm(0), knorm_inputs, knorm_outputs, [&]() {
-                    return rocm_k_norm_stage.execute(&rocm_ctx);
-                })) << "ROCm K norm failed";
+                ASSERT_TRUE(with_gpu_coherence(DeviceId::rocm(0), knorm_inputs, knorm_outputs, [&]()
+                                               { return rocm_k_norm_stage.execute(&rocm_ctx); }))
+                    << "ROCm K norm failed";
 
                 const float q_cos = cosineSimilarity(
                     std::vector<float>(cpu_q->data(), cpu_q->data() + cpu_q->numel()),
@@ -2922,7 +2925,8 @@ namespace llaminar2
                     DeviceId::rocm(0),
                     rocm_inputs,
                     rocm_outputs,
-                    [&]() {
+                    [&]()
+                    {
                         return rocm_stage.execute(&rocm_ctx);
                     });
 
@@ -3049,13 +3053,15 @@ namespace llaminar2
                 const std::initializer_list<TensorBase *> rocm_outputs = {
                     rocm_output.get()};
 
-                const bool rocm_ok = [&]() {
+                const bool rocm_ok = [&]()
+                {
                     ScopedEnvOverride force_ck("LLAMINAR_ROCM_FORCE_CK", "1");
                     return with_gpu_coherence(
                         DeviceId::rocm(0),
                         rocm_inputs,
                         rocm_outputs,
-                        [&]() {
+                        [&]()
+                        {
                             return rocm_stage.execute(&rocm_ctx);
                         });
                 }();
@@ -3253,7 +3259,8 @@ namespace llaminar2
                     DeviceId::rocm(0),
                     rocm_inputs,
                     rocm_outputs,
-                    [&]() {
+                    [&]()
+                    {
                         return rocm_stage.execute(&rocm_ctx);
                     });
                 rocm_stage.unbindWorkspace();
@@ -3799,27 +3806,37 @@ namespace llaminar2
                 if (!has_rocm_device_)
                     GTEST_SKIP() << "No ROCm device available";
 
-                struct KVShape { const char* name; int N; int K; };
+                struct KVShape
+                {
+                    const char *name;
+                    int N;
+                    int K;
+                };
                 const std::vector<KVShape> shapes = {
                     {"0.5B K/V", 128, 896},
-                    {"3B K/V",   256, 2048},
-                    {"7B K/V",   512, 3584},
+                    {"3B K/V", 256, 2048},
+                    {"7B K/V", 512, 3584},
                 };
 
-                struct OverrideGuard {
-                    ~OverrideGuard() {
+                struct OverrideGuard
+                {
+                    ~OverrideGuard()
+                    {
                         rocmGemv_int8_vnni_reset_tuning_overrides();
                         rocmGemv_int8_vnni_reset_qwo_overrides();
                     }
                 } guard;
 
                 // Helper: pack [K×N] row-major INT8 into VNNI [K/4][N][4]
-                auto packVnni = [](const std::vector<int8_t>& B, int N, int K,
-                                   std::vector<int8_t>& out) {
+                auto packVnni = [](const std::vector<int8_t> &B, int N, int K,
+                                   std::vector<int8_t> &out)
+                {
                     const size_t kg = static_cast<size_t>(K) / 4;
                     out.resize(kg * static_cast<size_t>(N) * 4);
-                    for (int n = 0; n < N; ++n) {
-                        for (size_t g = 0; g < kg; ++g) {
+                    for (int n = 0; n < N; ++n)
+                    {
+                        for (size_t g = 0; g < kg; ++g)
+                        {
                             const size_t src = (g * 4) * static_cast<size_t>(N) + static_cast<size_t>(n);
                             const size_t dst = (g * static_cast<size_t>(N) + static_cast<size_t>(n)) * 4;
                             out[dst + 0] = B[src + static_cast<size_t>(0) * N];
@@ -3830,7 +3847,8 @@ namespace llaminar2
                     }
                 };
 
-                for (const auto& shape : shapes) {
+                for (const auto &shape : shapes)
+                {
                     SCOPED_TRACE(shape.name);
                     const int N = shape.N;
                     const int K = shape.K;
@@ -3846,21 +3864,26 @@ namespace llaminar2
                     std::uniform_real_distribution<float> dist_s(0.001f, 0.1f);
 
                     std::vector<float> h_A(K);
-                    for (auto& v : h_A) v = dist_a(rng);
+                    for (auto &v : h_A)
+                        v = dist_a(rng);
 
                     // Create two separate weight matrices (K and V projections)
-                    auto makeWeights = [&](int proj_N) {
-                        struct W {
+                    auto makeWeights = [&](int proj_N)
+                    {
+                        struct W
+                        {
                             std::vector<int8_t> h_B_vnni;
                             std::vector<float> h_scale;
-                            int8_t* d_B = nullptr;
-                            float* d_scale = nullptr;
+                            int8_t *d_B = nullptr;
+                            float *d_scale = nullptr;
                         };
                         W w;
                         std::vector<int8_t> h_B(static_cast<size_t>(K) * proj_N);
                         w.h_scale.resize(proj_N);
-                        for (auto& v : h_B) v = static_cast<int8_t>(dist_b(rng));
-                        for (auto& v : w.h_scale) v = dist_s(rng);
+                        for (auto &v : h_B)
+                            v = static_cast<int8_t>(dist_b(rng));
+                        for (auto &v : w.h_scale)
+                            v = dist_s(rng);
                         packVnni(h_B, proj_N, K, w.h_B_vnni);
                         hipMalloc(&w.d_B, w.h_B_vnni.size());
                         hipMalloc(&w.d_scale, proj_N * sizeof(float));
@@ -3872,9 +3895,9 @@ namespace llaminar2
                     auto wv = makeWeights(N);
 
                     // Allocate activations + blockwise quant buffers on device
-                    float* d_A = nullptr;
-                    int8_t* d_A_int8 = nullptr;
-                    float* d_scale_A_bw = nullptr;
+                    float *d_A = nullptr;
+                    int8_t *d_A_int8 = nullptr;
+                    float *d_scale_A_bw = nullptr;
                     hipMalloc(&d_A, K * sizeof(float));
                     hipMalloc(&d_A_int8, K * sizeof(int8_t));
                     hipMalloc(&d_scale_A_bw, blocks_per_row * sizeof(float));
@@ -3922,8 +3945,8 @@ namespace llaminar2
                     const float v_cos = cosineSimilarity(h_Cv_ref, h_Cv_pair);
 
                     LOG_INFO("[PairCorrectness] " << shape.name
-                             << " K-proj pair-vs-individual cosine=" << k_cos
-                             << " V-proj pair-vs-individual cosine=" << v_cos);
+                                                  << " K-proj pair-vs-individual cosine=" << k_cos
+                                                  << " V-proj pair-vs-individual cosine=" << v_cos);
 
                     // Pair must match individual within numerical noise.
                     // KB selection may differ (pair doubles total_grid_n) so allow slight divergence.
@@ -3933,11 +3956,17 @@ namespace llaminar2
                         << shape.name << " V-proj pair diverged from individual";
 
                     // Cleanup
-                    hipFree(d_A); hipFree(d_A_int8); hipFree(d_scale_A_bw);
-                    hipFree(d_Ck_ref); hipFree(d_Cv_ref);
-                    hipFree(d_Ck_pair); hipFree(d_Cv_pair);
-                    hipFree(wk.d_B); hipFree(wk.d_scale);
-                    hipFree(wv.d_B); hipFree(wv.d_scale);
+                    hipFree(d_A);
+                    hipFree(d_A_int8);
+                    hipFree(d_scale_A_bw);
+                    hipFree(d_Ck_ref);
+                    hipFree(d_Cv_ref);
+                    hipFree(d_Ck_pair);
+                    hipFree(d_Cv_pair);
+                    hipFree(wk.d_B);
+                    hipFree(wk.d_scale);
+                    hipFree(wv.d_B);
+                    hipFree(wv.d_scale);
                 }
             }
 
@@ -4453,7 +4482,7 @@ namespace llaminar2
                 output_separate->mark_device_dirty();
 
                 std::vector<ITensorGemm::TensorProjectionDesc> projections;
-                projections.emplace_back(&kernel, output_fused.get(), N, nullptr, nullptr, false, "q4_0_native_fused");
+                projections.emplace_back(&kernel, output_fused.get(), N, nullptr, "q4_0_native_fused");
 
                 ASSERT_TRUE(kernel.multiply_fused_tensor(input.get(), projections, M, K));
                 (void)hipDeviceSynchronize();
@@ -4530,9 +4559,9 @@ namespace llaminar2
                 separate_v->mark_device_dirty();
 
                 std::vector<ITensorGemm::TensorProjectionDesc> projections;
-                projections.emplace_back(&kernel, fused_q.get(), N, bias_q.get(), nullptr, false, "q_bias");
-                projections.emplace_back(&kernel, fused_k.get(), N, bias_k.get(), nullptr, false, "k_bias");
-                projections.emplace_back(&kernel, fused_v.get(), N, bias_v.get(), nullptr, false, "v_bias");
+                projections.emplace_back(&kernel, fused_q.get(), N, bias_q.get(), "q_bias");
+                projections.emplace_back(&kernel, fused_k.get(), N, bias_k.get(), "k_bias");
+                projections.emplace_back(&kernel, fused_v.get(), N, bias_v.get(), "v_bias");
 
                 ASSERT_TRUE(kernel.multiply_fused_tensor(input.get(), projections, M, K));
                 (void)hipDeviceSynchronize();
@@ -4545,8 +4574,8 @@ namespace llaminar2
                 const float v_cos = cosineSim(fused_v->data(), separate_v->data(), static_cast<size_t>(M) * N);
 
                 LOG_INFO("[Dispatch] Fused packed native-VNNI Q4_0 with bias cosine q=" << q_cos
-                                                                                           << " k=" << k_cos
-                                                                                           << " v=" << v_cos);
+                                                                                        << " k=" << k_cos
+                                                                                        << " v=" << v_cos);
                 EXPECT_GT(q_cos, 0.9999f) << "Fused Q projection diverged from separate biased GEMM";
                 EXPECT_GT(k_cos, 0.9999f) << "Fused K projection diverged from separate biased GEMM";
                 EXPECT_GT(v_cos, 0.9999f) << "Fused V projection diverged from separate biased GEMM";
@@ -4631,9 +4660,9 @@ namespace llaminar2
                 separate_v->mark_device_dirty();
 
                 std::vector<ITensorGemm::TensorProjectionDesc> projections;
-                projections.emplace_back(&q_kernel, fused_q.get(), Nq, bias_q.get(), nullptr, false, "q_q8_blockwise");
-                projections.emplace_back(&k_kernel, fused_k.get(), Nk, bias_k.get(), nullptr, false, "k_q8_blockwise");
-                projections.emplace_back(&v_kernel, fused_v.get(), Nv, bias_v.get(), nullptr, false, "v_q8_blockwise");
+                projections.emplace_back(&q_kernel, fused_q.get(), Nq, bias_q.get(), "q_q8_blockwise");
+                projections.emplace_back(&k_kernel, fused_k.get(), Nk, bias_k.get(), "k_q8_blockwise");
+                projections.emplace_back(&v_kernel, fused_v.get(), Nv, bias_v.get(), "v_q8_blockwise");
 
                 ASSERT_TRUE(q_kernel.multiply_fused_tensor(input.get(), projections, M, K));
                 ASSERT_EQ(hipDeviceSynchronize(), hipSuccess);
@@ -4646,8 +4675,8 @@ namespace llaminar2
                 const float v_cos = cosineSim(fused_v->data(), separate_v->data(), static_cast<size_t>(M) * Nv);
 
                 LOG_INFO("[Dispatch] Fused INT8 blockwise QKV cosine q=" << q_cos
-                                                                          << " k=" << k_cos
-                                                                          << " v=" << v_cos);
+                                                                         << " k=" << k_cos
+                                                                         << " v=" << v_cos);
                 EXPECT_GT(q_cos, 0.9999f);
                 EXPECT_GT(k_cos, 0.9999f);
                 EXPECT_GT(v_cos, 0.9999f);
@@ -4713,8 +4742,8 @@ namespace llaminar2
                 separate_up->mark_device_dirty();
 
                 std::vector<ITensorGemm::TensorProjectionDesc> projections;
-                projections.emplace_back(&gate_kernel, fused_gate.get(), N, bias_gate.get(), nullptr, false, "gate_q8_blockwise");
-                projections.emplace_back(&up_kernel, fused_up.get(), N, bias_up.get(), nullptr, false, "up_q8_blockwise");
+                projections.emplace_back(&gate_kernel, fused_gate.get(), N, bias_gate.get(), "gate_q8_blockwise");
+                projections.emplace_back(&up_kernel, fused_up.get(), N, bias_up.get(), "up_q8_blockwise");
 
                 ASSERT_TRUE(gate_kernel.multiply_fused_tensor(input.get(), projections, M, K));
                 ASSERT_EQ(hipDeviceSynchronize(), hipSuccess);
@@ -4725,7 +4754,7 @@ namespace llaminar2
                 const float up_cos = cosineSim(fused_up->data(), separate_up->data(), static_cast<size_t>(M) * N);
 
                 LOG_INFO("[Dispatch] Fused INT8 blockwise Gate/Up cosine gate=" << gate_cos
-                                                                                  << " up=" << up_cos);
+                                                                                << " up=" << up_cos);
                 EXPECT_GT(gate_cos, 0.9999f);
                 EXPECT_GT(up_cos, 0.9999f);
 
@@ -4789,8 +4818,8 @@ namespace llaminar2
                 separate1->mark_device_dirty();
 
                 std::vector<ITensorGemm::TensorProjectionDesc> projections;
-                projections.emplace_back(&kernel0, fused0.get(), N, bias0.get(), nullptr, false, "proj0_q8_blockwise_gridkpar");
-                projections.emplace_back(&kernel1, fused1.get(), N, bias1.get(), nullptr, false, "proj1_q8_blockwise_gridkpar");
+                projections.emplace_back(&kernel0, fused0.get(), N, bias0.get(), "proj0_q8_blockwise_gridkpar");
+                projections.emplace_back(&kernel1, fused1.get(), N, bias1.get(), "proj1_q8_blockwise_gridkpar");
 
                 ASSERT_TRUE(kernel0.multiply_fused_tensor(input.get(), projections, M, K));
                 ASSERT_EQ(hipDeviceSynchronize(), hipSuccess);
@@ -4801,7 +4830,7 @@ namespace llaminar2
                 const float cos1 = cosineSim(fused1->data(), separate1->data(), static_cast<size_t>(M) * N);
 
                 LOG_INFO("[Dispatch] Fused INT8 blockwise grid_kpar pair cosine proj0=" << cos0
-                                                                                           << " proj1=" << cos1);
+                                                                                        << " proj1=" << cos1);
                 EXPECT_GT(cos0, 0.9999f);
                 EXPECT_GT(cos1, 0.9999f);
 
@@ -4882,7 +4911,7 @@ namespace llaminar2
                     output_separate->mark_device_dirty();
 
                     std::vector<ITensorGemm::TensorProjectionDesc> projections;
-                    projections.emplace_back(&kernel, output_fused.get(), N, nullptr, nullptr, false, test_case.name);
+                    projections.emplace_back(&kernel, output_fused.get(), N, nullptr, test_case.name);
 
                     ASSERT_TRUE(kernel.multiply_fused_tensor(input.get(), projections, M, K)) << test_case.name;
                     (void)hipDeviceSynchronize();

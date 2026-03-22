@@ -4006,47 +4006,23 @@ namespace llaminar2
             float id = 1.0f / d;
             dst.d = fp32_to_fp16(d);
 
-            // Vectorized quantization
+            // Scale (no explicit clamping needed: |v| ≤ max_abs ⇒ |scaled| ≤ 127,
+            // and packs_epi32/packs_epi16 saturate any ±128 from FP rounding)
             __m256 vinv = _mm256_set1_ps(id);
-            __m256 vmin = _mm256_set1_ps(-127.0f);
-            __m256 vmax_q = _mm256_set1_ps(127.0f);
-
-            // Scale and clamp
             __m256 scaled0 = _mm256_mul_ps(v0, vinv);
             __m256 scaled1 = _mm256_mul_ps(v1, vinv);
             __m256 scaled2 = _mm256_mul_ps(v2, vinv);
             __m256 scaled3 = _mm256_mul_ps(v3, vinv);
 
-            scaled0 = _mm256_max_ps(vmin, _mm256_min_ps(vmax_q, scaled0));
-            scaled1 = _mm256_max_ps(vmin, _mm256_min_ps(vmax_q, scaled1));
-            scaled2 = _mm256_max_ps(vmin, _mm256_min_ps(vmax_q, scaled2));
-            scaled3 = _mm256_max_ps(vmin, _mm256_min_ps(vmax_q, scaled3));
+            // Convert float → int32 (rounds to nearest-even per MXCSR)
+            // No separate round_ps needed — cvtps_epi32 applies rounding.
+            __m256i i0 = _mm256_cvtps_epi32(scaled0);
+            __m256i i1 = _mm256_cvtps_epi32(scaled1);
+            __m256i i2 = _mm256_cvtps_epi32(scaled2);
+            __m256i i3 = _mm256_cvtps_epi32(scaled3);
 
-            // Round to nearest integer
-            __m256 rounded0 = _mm256_round_ps(scaled0, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
-            __m256 rounded1 = _mm256_round_ps(scaled1, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
-            __m256 rounded2 = _mm256_round_ps(scaled2, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
-            __m256 rounded3 = _mm256_round_ps(scaled3, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
-
-            // Convert to int32
-            __m256i i0 = _mm256_cvtps_epi32(rounded0);
-            __m256i i1 = _mm256_cvtps_epi32(rounded1);
-            __m256i i2 = _mm256_cvtps_epi32(rounded2);
-            __m256i i3 = _mm256_cvtps_epi32(rounded3);
-
-            // Compute sum (horizontal add of all int32 values)
-            __m256i sum_01 = _mm256_add_epi32(i0, i1);
-            __m256i sum_23 = _mm256_add_epi32(i2, i3);
-            __m256i sum_all = _mm256_add_epi32(sum_01, sum_23);
-            __m128i sum_lo = _mm256_castsi256_si128(sum_all);
-            __m128i sum_hi = _mm256_extracti128_si256(sum_all, 1);
-            __m128i sum128 = _mm_add_epi32(sum_lo, sum_hi);
-            sum128 = _mm_add_epi32(sum128, _mm_shuffle_epi32(sum128, _MM_SHUFFLE(1, 0, 3, 2)));
-            sum128 = _mm_add_epi32(sum128, _mm_shuffle_epi32(sum128, _MM_SHUFFLE(0, 0, 0, 1)));
-            int32_t sum_i32 = _mm_cvtsi128_si32(sum128);
-
-            // Pack int32 → int16 → int8
-            // packs_epi32 interleaves lanes, need permute to fix
+            // Pack int32 → int16 → int8 (saturating at each step)
+            // packs_epi32 interleaves 128-bit lanes, need permute to fix ordering
             __m256i i16_01 = _mm256_packs_epi32(i0, i1);
             __m256i i16_23 = _mm256_packs_epi32(i2, i3);
             i16_01 = _mm256_permute4x64_epi64(i16_01, _MM_SHUFFLE(3, 1, 2, 0));
@@ -4057,7 +4033,21 @@ namespace llaminar2
 
             // Store 32 int8 values
             _mm256_storeu_si256(reinterpret_cast<__m256i *>(dst.qs), i8_all);
-            dst.sum_qs = static_cast<int16_t>(sum_i32);
+
+            // Compute sum from packed bytes using vpmaddubsw + vpmaddwd
+            // (faster than tree-reduce on 32 int32 values — works on the saturated bytes directly)
+            __m256i ones_u8 = _mm256_set1_epi8(1);
+            __m256i paired = _mm256_maddubs_epi16(ones_u8, i8_all);
+            __m256i ones_i16 = _mm256_set1_epi16(1);
+            __m256i sum_i32_vec = _mm256_madd_epi16(paired, ones_i16);
+
+            __m128i sum_lo = _mm256_castsi256_si128(sum_i32_vec);
+            __m128i sum_hi = _mm256_extracti128_si256(sum_i32_vec, 1);
+            __m128i sum128 = _mm_add_epi32(sum_lo, sum_hi);
+            sum128 = _mm_add_epi32(sum128, _mm_shuffle_epi32(sum128, _MM_SHUFFLE(1, 0, 3, 2)));
+            sum128 = _mm_add_epi32(sum128, _mm_shuffle_epi32(sum128, _MM_SHUFFLE(0, 0, 0, 1)));
+
+            dst.sum_qs = static_cast<int16_t>(_mm_cvtsi128_si32(sum128));
         }
 #endif
 
@@ -4097,52 +4087,186 @@ namespace llaminar2
                 return;
             }
 
-            // Compute scale
+            // Compute scale and convert to FP16 using F16C intrinsic
             float d = max_abs / 127.0f;
             float id = 1.0f / d;
-
-            // Convert scale to FP16 using F16C intrinsic (faster than scalar bit manipulation)
-            // AVX512F implies F16C support
             __m128 v_d = _mm_set_ss(d);
             __m128i v_h = _mm_cvtps_ph(v_d, _MM_FROUND_TO_NEAREST_INT);
             dst.d = (uint16_t)_mm_cvtsi128_si32(v_h);
 
-            // Vectorized quantization
+            // Scale: no clamping needed — |v| ≤ max_abs ⇒ |scaled| ≤ 127.0
+            // Rounding might push to ±128, but vpmovdb saturates to [-128,127].
             __m512 vinv = _mm512_set1_ps(id);
-
-            // Scale (no clamping needed: values are naturally in [-127, 127] range)
-            // max_abs is the maximum absolute value in the block.
-            // scaled = v * (127.0 / max_abs).
-            // Since |v| <= max_abs, |scaled| <= 127.0.
-            // Rounding might push 127.000...1 to 128, but vpmovdb saturates to 127.
             __m512 scaled0 = _mm512_mul_ps(v0, vinv);
             __m512 scaled1 = _mm512_mul_ps(v1, vinv);
 
-            // Round and convert to int32
-            // Note: _mm512_cvtps_epi32 rounds to nearest-even (default MXCSR), which is slightly different
-            // from std::round (nearest, ties away from zero). We accept this for performance.
-            // Removing _mm512_roundscale_ps saves significant latency.
+            // Convert float → int32 (rounds to nearest-even per MXCSR default)
             __m512i i0 = _mm512_cvtps_epi32(scaled0);
             __m512i i1 = _mm512_cvtps_epi32(scaled1);
 
-            // Pack 32-bit integers to 8-bit using AVX-512 vpmovdb (direct int32 → int8)
-            // This uses _mm512_cvtsepi32_epi8 which outputs a __m128i (16 bytes from 16 int32s)
-            // Note: This saturates values > 127 to 127 and < -128 to -128
-            __m128i i8_0 = _mm512_cvtsepi32_epi8(i0); // 16 int32 → 16 int8
-            __m128i i8_1 = _mm512_cvtsepi32_epi8(i1); // 16 int32 → 16 int8
+            // Pack int32 → int8 with saturation via vpmovdb
+            __m128i i8_0 = _mm512_cvtsepi32_epi8(i0);
+            __m128i i8_1 = _mm512_cvtsepi32_epi8(i1);
 
-            // Combine into a single 256-bit register and store
+            // Combine and store 32 quantized bytes
             __m256i i8_all = _mm256_set_m128i(i8_1, i8_0);
             _mm256_storeu_si256(reinterpret_cast<__m256i *>(dst.qs), i8_all);
 
-            // Compute sum from saturated values to ensure consistency with stored data
-            // This fixes a bug where rounding to 128 would be summed as 128 but stored as 127
-            __m512i i32_sat_0 = _mm512_cvtepi8_epi32(i8_0);
-            __m512i i32_sat_1 = _mm512_cvtepi8_epi32(i8_1);
-            __m512i sum_vec = _mm512_add_epi32(i32_sat_0, i32_sat_1);
-            int32_t sum_i32 = _mm512_reduce_add_epi32(sum_vec);
+            // Compute sum of saturated bytes using vpmaddubsw + vpmaddwd
+            // (eliminates costly sign-extend-back-to-i32 + 512-bit horizontal reduce)
+            //
+            // vpmaddubsw(ones_u8, signed_bytes): for each pair of bytes,
+            //   result_i16[k] = 1*qs[2k] + 1*qs[2k+1]  (saturating, but |sum| ≤ 254 so no sat)
+            // vpmaddwd(paired_i16, ones_i16): for each pair of int16,
+            //   result_i32[k] = paired[2k]*1 + paired[2k+1]*1  (sum of 4 bytes per lane)
+            // Then 256-bit horizontal reduce of 8 int32 values.
+            __m256i ones_u8_256 = _mm256_set1_epi8(1);
+            __m256i paired_i16 = _mm256_maddubs_epi16(ones_u8_256, i8_all);
+            __m256i ones_i16 = _mm256_set1_epi16(1);
+            __m256i sum_i32_vec = _mm256_madd_epi16(paired_i16, ones_i16);
+
+            // Horizontal reduce 8 int32 → scalar
+            __m128i lo = _mm256_castsi256_si128(sum_i32_vec);
+            __m128i hi = _mm256_extracti128_si256(sum_i32_vec, 1);
+            __m128i sum128 = _mm_add_epi32(lo, hi);
+            sum128 = _mm_add_epi32(sum128, _mm_shuffle_epi32(sum128, _MM_SHUFFLE(1, 0, 3, 2)));
+            sum128 = _mm_add_epi32(sum128, _mm_shuffle_epi32(sum128, _MM_SHUFFLE(0, 0, 0, 1)));
+            int32_t sum_i32 = _mm_cvtsi128_si32(sum128);
 
             dst.sum_qs = static_cast<int16_t>(sum_i32);
+        }
+
+        /**
+         * @brief Quantize two consecutive 32-element blocks with 2-way ILP (AVX-512)
+         *
+         * Processes two Q8_1 blocks simultaneously, interleaving loads and compute
+         * to saturate dual load ports and hide FP→INT conversion latency.
+         * Falls back to two single-block calls if blocks are not contiguous.
+         *
+         * @param src Pointer to 64 contiguous FP32 values (2 × 32)
+         * @param dst0 Output Q8_1 block for first 32 elements
+         * @param dst1 Output Q8_1 block for second 32 elements
+         */
+        inline void quantize_two_blocks_avx512(const float *src,
+                                               Q8_1Block &dst0,
+                                               Q8_1Block &dst1)
+        {
+            // ---- Interleaved loads: 4 loads total, 2 per block ----
+            // Cascade Lake has 2 load ports (port 2, port 3) → 2 loads/cycle
+            __m512 a0 = _mm512_loadu_ps(src);      // block0 low
+            __m512 b0 = _mm512_loadu_ps(src + 32); // block1 low
+            __m512 a1 = _mm512_loadu_ps(src + 16); // block0 high
+            __m512 b1 = _mm512_loadu_ps(src + 48); // block1 high
+
+            // ---- Interleaved abs + max ----
+            __m512 abs_a0 = _mm512_abs_ps(a0);
+            __m512 abs_b0 = _mm512_abs_ps(b0);
+            __m512 abs_a1 = _mm512_abs_ps(a1);
+            __m512 abs_b1 = _mm512_abs_ps(b1);
+
+            __m512 max_a = _mm512_max_ps(abs_a0, abs_a1);
+            __m512 max_b = _mm512_max_ps(abs_b0, abs_b1);
+
+            // Merge the two blocks' max vectors and do ONE horizontal reduce
+            // to amortize the ~10-cycle cross-lane cost
+            __m512 max_ab = _mm512_max_ps(max_a, max_b);
+            float max_combined = _mm512_reduce_max_ps(max_ab);
+
+            // Individual block maxes via masking (costs ~3 cycles each,
+            // but we can still check each block's zero threshold)
+            float max_abs_a = _mm512_reduce_max_ps(max_a);
+            float max_abs_b = _mm512_reduce_max_ps(max_b);
+
+            constexpr float MIN_SCALE_THRESHOLD = 1e-10f;
+
+            // Handle zero blocks (rare — skip expensive compute)
+            bool a_zero = max_abs_a < MIN_SCALE_THRESHOLD;
+            bool b_zero = max_abs_b < MIN_SCALE_THRESHOLD;
+            if (__builtin_expect(a_zero && b_zero, 0))
+            {
+                std::memset(&dst0, 0, sizeof(Q8_1Block));
+                std::memset(&dst1, 0, sizeof(Q8_1Block));
+                return;
+            }
+            if (__builtin_expect(a_zero, 0))
+            {
+                std::memset(&dst0, 0, sizeof(Q8_1Block));
+                quantize_single_block_avx512(src + 32, dst1);
+                return;
+            }
+            if (__builtin_expect(b_zero, 0))
+            {
+                quantize_single_block_avx512(src, dst0);
+                std::memset(&dst1, 0, sizeof(Q8_1Block));
+                return;
+            }
+
+            // ---- Compute scales (interleaved to hide div latency) ----
+            float d_a = max_abs_a / 127.0f;
+            float d_b = max_abs_b / 127.0f;
+            float id_a = 1.0f / d_a;
+            float id_b = 1.0f / d_b;
+
+            // FP16 scale conversion (F16C)
+            __m128 v_d_a = _mm_set_ss(d_a);
+            __m128 v_d_b = _mm_set_ss(d_b);
+            __m128i v_h_a = _mm_cvtps_ph(v_d_a, _MM_FROUND_TO_NEAREST_INT);
+            __m128i v_h_b = _mm_cvtps_ph(v_d_b, _MM_FROUND_TO_NEAREST_INT);
+            dst0.d = (uint16_t)_mm_cvtsi128_si32(v_h_a);
+            dst1.d = (uint16_t)_mm_cvtsi128_si32(v_h_b);
+
+            // ---- Interleaved scale + convert ----
+            __m512 vinv_a = _mm512_set1_ps(id_a);
+            __m512 vinv_b = _mm512_set1_ps(id_b);
+
+            __m512 sa0 = _mm512_mul_ps(a0, vinv_a);
+            __m512 sb0 = _mm512_mul_ps(b0, vinv_b);
+            __m512 sa1 = _mm512_mul_ps(a1, vinv_a);
+            __m512 sb1 = _mm512_mul_ps(b1, vinv_b);
+
+            // Float → int32 (interleaved)
+            __m512i ia0 = _mm512_cvtps_epi32(sa0);
+            __m512i ib0 = _mm512_cvtps_epi32(sb0);
+            __m512i ia1 = _mm512_cvtps_epi32(sa1);
+            __m512i ib1 = _mm512_cvtps_epi32(sb1);
+
+            // ---- Interleaved pack + store ----
+            __m128i i8_a0 = _mm512_cvtsepi32_epi8(ia0);
+            __m128i i8_b0 = _mm512_cvtsepi32_epi8(ib0);
+            __m128i i8_a1 = _mm512_cvtsepi32_epi8(ia1);
+            __m128i i8_b1 = _mm512_cvtsepi32_epi8(ib1);
+
+            __m256i i8_a_all = _mm256_set_m128i(i8_a1, i8_a0);
+            __m256i i8_b_all = _mm256_set_m128i(i8_b1, i8_b0);
+
+            _mm256_storeu_si256(reinterpret_cast<__m256i *>(dst0.qs), i8_a_all);
+            _mm256_storeu_si256(reinterpret_cast<__m256i *>(dst1.qs), i8_b_all);
+
+            // ---- Interleaved sum computation (vpmaddubsw + vpmaddwd) ----
+            __m256i ones_u8 = _mm256_set1_epi8(1);
+            __m256i ones_i16 = _mm256_set1_epi16(1);
+
+            __m256i pa = _mm256_maddubs_epi16(ones_u8, i8_a_all);
+            __m256i pb = _mm256_maddubs_epi16(ones_u8, i8_b_all);
+            __m256i sa_i32 = _mm256_madd_epi16(pa, ones_i16);
+            __m256i sb_i32 = _mm256_madd_epi16(pb, ones_i16);
+
+            // Horizontal reduce block A
+            __m128i a_lo = _mm256_castsi256_si128(sa_i32);
+            __m128i a_hi = _mm256_extracti128_si256(sa_i32, 1);
+            __m128i a128 = _mm_add_epi32(a_lo, a_hi);
+            a128 = _mm_add_epi32(a128, _mm_shuffle_epi32(a128, _MM_SHUFFLE(1, 0, 3, 2)));
+            a128 = _mm_add_epi32(a128, _mm_shuffle_epi32(a128, _MM_SHUFFLE(0, 0, 0, 1)));
+
+            // Horizontal reduce block B
+            __m128i b_lo = _mm256_castsi256_si128(sb_i32);
+            __m128i b_hi = _mm256_extracti128_si256(sb_i32, 1);
+            __m128i b128 = _mm_add_epi32(b_lo, b_hi);
+            b128 = _mm_add_epi32(b128, _mm_shuffle_epi32(b128, _MM_SHUFFLE(1, 0, 3, 2)));
+            b128 = _mm_add_epi32(b128, _mm_shuffle_epi32(b128, _MM_SHUFFLE(0, 0, 0, 1)));
+
+            dst0.sum_qs = static_cast<int16_t>(_mm_cvtsi128_si32(a128));
+            dst1.sum_qs = static_cast<int16_t>(_mm_cvtsi128_si32(b128));
         }
 #endif
 
@@ -4505,10 +4629,11 @@ namespace llaminar2
         {
 #if defined(__AVX512F__)
             // Find max absolute value using AVX-512
-            __m512 vmax0 = _mm512_abs_ps(_mm512_loadu_ps(src));
-            __m512 vmax1 = _mm512_abs_ps(_mm512_loadu_ps(src + 16));
-            __m512 vmax = _mm512_max_ps(vmax0, vmax1);
-            float max_abs = _mm512_reduce_max_ps(vmax);
+            __m512 v0 = _mm512_loadu_ps(src);
+            __m512 v1 = _mm512_loadu_ps(src + 16);
+            __m512 abs0 = _mm512_abs_ps(v0);
+            __m512 abs1 = _mm512_abs_ps(v1);
+            float max_abs = _mm512_reduce_max_ps(_mm512_max_ps(abs0, abs1));
 
             constexpr float MIN_SCALE_THRESHOLD = 1e-6f;
             if (max_abs < MIN_SCALE_THRESHOLD)
@@ -4522,54 +4647,38 @@ namespace llaminar2
             // Calculate scale
             float scale = max_abs / 127.0f;
             if (scale > 65504.0f)
-            {
                 scale = 65504.0f;
-            }
             const float inv_scale = 1.0f / scale;
             const __m512 vinv_scale = _mm512_set1_ps(inv_scale);
 
-            // Load and quantize first 16 elements
-            __m512 v0 = _mm512_loadu_ps(src);
-            __m512 vscaled0 = _mm512_mul_ps(v0, vinv_scale);
+            // Scale and convert float → int32 (rounds to nearest-even per MXCSR)
+            __m512i vi32_0 = _mm512_cvtps_epi32(_mm512_mul_ps(v0, vinv_scale));
+            __m512i vi32_1 = _mm512_cvtps_epi32(_mm512_mul_ps(v1, vinv_scale));
 
-            // Load and quantize second 16 elements
-            __m512 v1 = _mm512_loadu_ps(src + 16);
-            __m512 vscaled1 = _mm512_mul_ps(v1, vinv_scale);
+            // Pack int32 → int8 with saturation via vpmovdb (no explicit clamping needed)
+            __m128i i8_0 = _mm512_cvtsepi32_epi8(vi32_0);
+            __m128i i8_1 = _mm512_cvtsepi32_epi8(vi32_1);
 
-            // Convert to int32 with rounding and clamping
-            __m512i vi32_0 = _mm512_cvtps_epi32(vscaled0);
-            __m512i vi32_1 = _mm512_cvtps_epi32(vscaled1);
+            // Store 32 int8 values
+            _mm_storeu_si128(reinterpret_cast<__m128i *>(dst_qs), i8_0);
+            _mm_storeu_si128(reinterpret_cast<__m128i *>(dst_qs + 16), i8_1);
 
-            // Clamp to [-127, 127]
-            const __m512i vmin = _mm512_set1_epi32(-127);
-            const __m512i vmax_val = _mm512_set1_epi32(127);
-            vi32_0 = _mm512_max_epi32(vi32_0, vmin);
-            vi32_0 = _mm512_min_epi32(vi32_0, vmax_val);
-            vi32_1 = _mm512_max_epi32(vi32_1, vmin);
-            vi32_1 = _mm512_min_epi32(vi32_1, vmax_val);
+            // Compute sum from saturated bytes using vpmaddubsw + vpmaddwd
+            __m256i i8_all = _mm256_set_m128i(i8_1, i8_0);
+            __m256i ones_u8 = _mm256_set1_epi8(1);
+            __m256i paired = _mm256_maddubs_epi16(ones_u8, i8_all);
+            __m256i ones_i16 = _mm256_set1_epi16(1);
+            __m256i sum_i32_vec = _mm256_madd_epi16(paired, ones_i16);
 
-            // Pack int32 → int16 → int8
-            // Note: We need to properly pack 16+16 int32 → 32 int8
-            __m256i vi16_0 = _mm512_cvtepi32_epi16(vi32_0); // 16 int32 → 16 int16 (indices 0-15)
-            __m256i vi16_1 = _mm512_cvtepi32_epi16(vi32_1); // 16 int32 → 16 int16 (indices 16-31)
+            __m128i lo = _mm256_castsi256_si128(sum_i32_vec);
+            __m128i hi = _mm256_extracti128_si256(sum_i32_vec, 1);
+            __m128i sum128 = _mm_add_epi32(lo, hi);
+            sum128 = _mm_add_epi32(sum128, _mm_shuffle_epi32(sum128, _MM_SHUFFLE(1, 0, 3, 2)));
+            sum128 = _mm_add_epi32(sum128, _mm_shuffle_epi32(sum128, _MM_SHUFFLE(0, 0, 0, 1)));
+            int32_t sum_i32 = _mm_cvtsi128_si32(sum128);
 
-            // Pack 16 int16 → 16 int8 for each half
-            // vi16_0: [0-7 (low), 8-15 (high)] → pack together for indices 0-15
-            // vi16_1: [16-23 (low), 24-31 (high)] → pack together for indices 16-31
-            __m128i vi8_first16 = _mm_packs_epi16(_mm256_castsi256_si128(vi16_0), _mm256_extracti128_si256(vi16_0, 1));
-            __m128i vi8_second16 = _mm_packs_epi16(_mm256_castsi256_si128(vi16_1), _mm256_extracti128_si256(vi16_1, 1));
-
-            // Store indices 0-15 and 16-31 sequentially
-            _mm_storeu_si128(reinterpret_cast<__m128i *>(dst_qs), vi8_first16);
-            _mm_storeu_si128(reinterpret_cast<__m128i *>(dst_qs + 16), vi8_second16);
-
-            // Compute sum of QUANTIZED int8 values as INT32 (CRITICAL!)
-            // Horizontal reduction of int32 vectors
-            int32_t sum_i32 = _mm512_reduce_add_epi32(vi32_0) + _mm512_reduce_add_epi32(vi32_1);
-
-            // Store scale and pre-computed INT16 sum
             *dst_scale_fp16 = fp32_to_fp16(scale);
-            *dst_sum_fp16 = static_cast<uint16_t>(static_cast<int16_t>(sum_i32)); // Nov 2024: raw sum, not d × sum!
+            *dst_sum_fp16 = static_cast<uint16_t>(static_cast<int16_t>(sum_i32));
 #else
             quantize_fp32_to_q8_1_scalar(src, count, dst_qs, dst_scale_fp16, dst_sum_fp16);
 #endif
@@ -4582,14 +4691,13 @@ namespace llaminar2
         {
 #ifdef __AVX2__
             // Find max absolute value using AVX2
-            __m256 vmax0 = _mm256_andnot_ps(_mm256_set1_ps(-0.0f), _mm256_loadu_ps(src));
-            __m256 vmax1 = _mm256_andnot_ps(_mm256_set1_ps(-0.0f), _mm256_loadu_ps(src + 8));
-            __m256 vmax2 = _mm256_andnot_ps(_mm256_set1_ps(-0.0f), _mm256_loadu_ps(src + 16));
-            __m256 vmax3 = _mm256_andnot_ps(_mm256_set1_ps(-0.0f), _mm256_loadu_ps(src + 24));
+            __m256 sign_mask = _mm256_set1_ps(-0.0f);
+            __m256 abs0 = _mm256_andnot_ps(sign_mask, _mm256_loadu_ps(src));
+            __m256 abs1 = _mm256_andnot_ps(sign_mask, _mm256_loadu_ps(src + 8));
+            __m256 abs2 = _mm256_andnot_ps(sign_mask, _mm256_loadu_ps(src + 16));
+            __m256 abs3 = _mm256_andnot_ps(sign_mask, _mm256_loadu_ps(src + 24));
 
-            vmax0 = _mm256_max_ps(vmax0, vmax1);
-            vmax2 = _mm256_max_ps(vmax2, vmax3);
-            __m256 vmax = _mm256_max_ps(vmax0, vmax2);
+            __m256 vmax = _mm256_max_ps(_mm256_max_ps(abs0, abs1), _mm256_max_ps(abs2, abs3));
 
             // Horizontal max reduction
             __m128 vmax_hi = _mm256_extractf128_ps(vmax, 1);
@@ -4611,41 +4719,47 @@ namespace llaminar2
             // Calculate scale
             float scale = max_abs / 127.0f;
             if (scale > 65504.0f)
-            {
                 scale = 65504.0f;
-            }
             const float inv_scale = 1.0f / scale;
             const __m256 vinv_scale = _mm256_set1_ps(inv_scale);
 
-            // Quantize AND compute sum (4 iterations for 32 elements)
-            int32_t sum_i32 = 0; // Nov 2024: Store raw integer sum, not scaled FP sum!
-            for (int i = 0; i < 4; ++i)
-            {
-                __m256 vf = _mm256_loadu_ps(src + i * 8);
-                __m256 vscaled = _mm256_mul_ps(vf, vinv_scale);
+            // Load, scale, convert to int32 (no explicit round or clamp needed)
+            __m256 v0 = _mm256_loadu_ps(src);
+            __m256 v1 = _mm256_loadu_ps(src + 8);
+            __m256 v2 = _mm256_loadu_ps(src + 16);
+            __m256 v3 = _mm256_loadu_ps(src + 24);
 
-                // Convert to int32 with rounding
-                __m256i vi32 = _mm256_cvtps_epi32(vscaled);
+            __m256i i0 = _mm256_cvtps_epi32(_mm256_mul_ps(v0, vinv_scale));
+            __m256i i1 = _mm256_cvtps_epi32(_mm256_mul_ps(v1, vinv_scale));
+            __m256i i2 = _mm256_cvtps_epi32(_mm256_mul_ps(v2, vinv_scale));
+            __m256i i3 = _mm256_cvtps_epi32(_mm256_mul_ps(v3, vinv_scale));
 
-                // Clamp to [-127, 127]
-                __m256i vmin = _mm256_set1_epi32(-127);
-                __m256i vmax_val = _mm256_set1_epi32(127);
-                vi32 = _mm256_max_epi32(vi32, vmin);
-                vi32 = _mm256_min_epi32(vi32, vmax_val);
+            // Pack int32 → int16 → int8 (saturating, fixes lane ordering)
+            __m256i i16_01 = _mm256_packs_epi32(i0, i1);
+            __m256i i16_23 = _mm256_packs_epi32(i2, i3);
+            i16_01 = _mm256_permute4x64_epi64(i16_01, _MM_SHUFFLE(3, 1, 2, 0));
+            i16_23 = _mm256_permute4x64_epi64(i16_23, _MM_SHUFFLE(3, 1, 2, 0));
+            __m256i i8_all = _mm256_packs_epi16(i16_01, i16_23);
+            i8_all = _mm256_permute4x64_epi64(i8_all, _MM_SHUFFLE(3, 1, 2, 0));
 
-                // Pack to int8 (manual packing for 8 elements)
-                alignas(32) int32_t temp[8];
-                _mm256_store_si256(reinterpret_cast<__m256i *>(temp), vi32);
-                for (int j = 0; j < 8; ++j)
-                {
-                    dst_qs[i * 8 + j] = static_cast<int8_t>(temp[j]);
-                    sum_i32 += static_cast<int32_t>(dst_qs[i * 8 + j]); // Sum quantized int8 (CRITICAL!)
-                }
-            }
+            // Store 32 int8 values
+            _mm256_storeu_si256(reinterpret_cast<__m256i *>(dst_qs), i8_all);
 
-            // Store scale and pre-computed INT16 sum
+            // Compute sum using vpmaddubsw + vpmaddwd
+            __m256i ones_u8 = _mm256_set1_epi8(1);
+            __m256i paired = _mm256_maddubs_epi16(ones_u8, i8_all);
+            __m256i ones_i16 = _mm256_set1_epi16(1);
+            __m256i sum_i32_vec = _mm256_madd_epi16(paired, ones_i16);
+
+            __m128i lo = _mm256_castsi256_si128(sum_i32_vec);
+            __m128i hi = _mm256_extracti128_si256(sum_i32_vec, 1);
+            __m128i sum128 = _mm_add_epi32(lo, hi);
+            sum128 = _mm_add_epi32(sum128, _mm_shuffle_epi32(sum128, _MM_SHUFFLE(1, 0, 3, 2)));
+            sum128 = _mm_add_epi32(sum128, _mm_shuffle_epi32(sum128, _MM_SHUFFLE(0, 0, 0, 1)));
+            int32_t sum_i32 = _mm_cvtsi128_si32(sum128);
+
             *dst_scale_fp16 = fp32_to_fp16(scale);
-            *dst_sum_fp16 = static_cast<uint16_t>(static_cast<int16_t>(sum_i32)); // Nov 2024: raw sum, not d × sum!
+            *dst_sum_fp16 = static_cast<uint16_t>(static_cast<int16_t>(sum_i32));
 #else
             quantize_fp32_to_q8_1_scalar(src, count, dst_qs, dst_scale_fp16, dst_sum_fp16);
 #endif
@@ -9853,8 +9967,10 @@ namespace llaminar2
             {
                 float s, m;
                 transcode_q3_k_to_int8_scalar(block, i, output + i * 32, &s, &m);
-                if (scales) scales[i] = s;
-                if (mins) mins[i] = m;
+                if (scales)
+                    scales[i] = s;
+                if (mins)
+                    mins[i] = m;
             }
         }
 
@@ -9872,8 +9988,10 @@ namespace llaminar2
             {
                 float s, m;
                 transcode_q3_k_to_int8_avx2(block, i, output + i * 32, &s, &m);
-                if (scales) scales[i] = s;
-                if (mins) mins[i] = m;
+                if (scales)
+                    scales[i] = s;
+                if (mins)
+                    mins[i] = m;
             }
         }
 #endif
@@ -10390,8 +10508,8 @@ namespace llaminar2
             const __m512i data1 = _mm512_loadu_si512(block.qs + 64);
 
             // Extract nibbles — interleaved for 2-port execution
-            const __m512i low0  = _mm512_and_si512(data0, mask512);
-            const __m512i low1  = _mm512_and_si512(data1, mask512);
+            const __m512i low0 = _mm512_and_si512(data0, mask512);
+            const __m512i low1 = _mm512_and_si512(data1, mask512);
             const __m512i high0 = _mm512_and_si512(_mm512_srli_epi16(data0, 4), mask512);
             const __m512i high1 = _mm512_and_si512(_mm512_srli_epi16(data1, 4), mask512);
 
@@ -10413,8 +10531,10 @@ namespace llaminar2
                 {
                     uint8_t sc, m;
                     get_scale_min_k4(i, block.scales, &sc, &m);
-                    if (scales) scales[i] = d * sc;
-                    if (mins)   mins[i] = -dmin * m;
+                    if (scales)
+                        scales[i] = d * sc;
+                    if (mins)
+                        mins[i] = -dmin * m;
                 }
             }
         }
@@ -11501,7 +11621,7 @@ namespace llaminar2
             {
                 const __m256i vql_0 = _mm256_loadu_si256((const __m256i *)(block.ql + half * 64));
                 const __m256i vql_1 = _mm256_loadu_si256((const __m256i *)(block.ql + half * 64 + 32));
-                const __m256i vqh   = _mm256_loadu_si256((const __m256i *)(block.qh + half * 32));
+                const __m256i vqh = _mm256_loadu_si256((const __m256i *)(block.qh + half * 32));
 
                 // --- Subblock 0: low nibbles of vql_0, qh bits [1:0] ---
                 {
@@ -11516,11 +11636,13 @@ namespace llaminar2
                         _mm256_cvtepu8_epi16(_mm256_extracti128_si256(vq, 1)), v32_16);
 
                     lo16 = _mm256_srai_epi16(_mm256_add_epi16(
-                        _mm256_mullo_epi16(lo16, _mm256_set1_epi16(factors_fixed[sb_idx * 2 + 0])),
-                        v128_16), 8);
+                                                 _mm256_mullo_epi16(lo16, _mm256_set1_epi16(factors_fixed[sb_idx * 2 + 0])),
+                                                 v128_16),
+                                             8);
                     hi16 = _mm256_srai_epi16(_mm256_add_epi16(
-                        _mm256_mullo_epi16(hi16, _mm256_set1_epi16(factors_fixed[sb_idx * 2 + 1])),
-                        v128_16), 8);
+                                                 _mm256_mullo_epi16(hi16, _mm256_set1_epi16(factors_fixed[sb_idx * 2 + 1])),
+                                                 v128_16),
+                                             8);
 
                     __m256i packed = _mm256_permute4x64_epi64(
                         _mm256_packs_epi16(lo16, hi16), 0xD8);
@@ -11540,11 +11662,13 @@ namespace llaminar2
                         _mm256_cvtepu8_epi16(_mm256_extracti128_si256(vq, 1)), v32_16);
 
                     lo16 = _mm256_srai_epi16(_mm256_add_epi16(
-                        _mm256_mullo_epi16(lo16, _mm256_set1_epi16(factors_fixed[sb_idx * 2 + 0])),
-                        v128_16), 8);
+                                                 _mm256_mullo_epi16(lo16, _mm256_set1_epi16(factors_fixed[sb_idx * 2 + 0])),
+                                                 v128_16),
+                                             8);
                     hi16 = _mm256_srai_epi16(_mm256_add_epi16(
-                        _mm256_mullo_epi16(hi16, _mm256_set1_epi16(factors_fixed[sb_idx * 2 + 1])),
-                        v128_16), 8);
+                                                 _mm256_mullo_epi16(hi16, _mm256_set1_epi16(factors_fixed[sb_idx * 2 + 1])),
+                                                 v128_16),
+                                             8);
 
                     __m256i packed = _mm256_permute4x64_epi64(
                         _mm256_packs_epi16(lo16, hi16), 0xD8);
@@ -11564,11 +11688,13 @@ namespace llaminar2
                         _mm256_cvtepu8_epi16(_mm256_extracti128_si256(vq, 1)), v32_16);
 
                     lo16 = _mm256_srai_epi16(_mm256_add_epi16(
-                        _mm256_mullo_epi16(lo16, _mm256_set1_epi16(factors_fixed[sb_idx * 2 + 0])),
-                        v128_16), 8);
+                                                 _mm256_mullo_epi16(lo16, _mm256_set1_epi16(factors_fixed[sb_idx * 2 + 0])),
+                                                 v128_16),
+                                             8);
                     hi16 = _mm256_srai_epi16(_mm256_add_epi16(
-                        _mm256_mullo_epi16(hi16, _mm256_set1_epi16(factors_fixed[sb_idx * 2 + 1])),
-                        v128_16), 8);
+                                                 _mm256_mullo_epi16(hi16, _mm256_set1_epi16(factors_fixed[sb_idx * 2 + 1])),
+                                                 v128_16),
+                                             8);
 
                     __m256i packed = _mm256_permute4x64_epi64(
                         _mm256_packs_epi16(lo16, hi16), 0xD8);
@@ -11588,11 +11714,13 @@ namespace llaminar2
                         _mm256_cvtepu8_epi16(_mm256_extracti128_si256(vq, 1)), v32_16);
 
                     lo16 = _mm256_srai_epi16(_mm256_add_epi16(
-                        _mm256_mullo_epi16(lo16, _mm256_set1_epi16(factors_fixed[sb_idx * 2 + 0])),
-                        v128_16), 8);
+                                                 _mm256_mullo_epi16(lo16, _mm256_set1_epi16(factors_fixed[sb_idx * 2 + 0])),
+                                                 v128_16),
+                                             8);
                     hi16 = _mm256_srai_epi16(_mm256_add_epi16(
-                        _mm256_mullo_epi16(hi16, _mm256_set1_epi16(factors_fixed[sb_idx * 2 + 1])),
-                        v128_16), 8);
+                                                 _mm256_mullo_epi16(hi16, _mm256_set1_epi16(factors_fixed[sb_idx * 2 + 1])),
+                                                 v128_16),
+                                             8);
 
                     __m256i packed = _mm256_permute4x64_epi64(
                         _mm256_packs_epi16(lo16, hi16), 0xD8);
@@ -11660,10 +11788,30 @@ namespace llaminar2
                     const uint8_t *ql_ptr;
                     int ql_shift, qh_shift;
 
-                    if (sb == 0)      { ql_ptr = ql;      ql_shift = 0; qh_shift = 0; }
-                    else if (sb == 1) { ql_ptr = ql + 32;  ql_shift = 0; qh_shift = 2; }
-                    else if (sb == 2) { ql_ptr = ql;      ql_shift = 4; qh_shift = 4; }
-                    else              { ql_ptr = ql + 32;  ql_shift = 4; qh_shift = 6; }
+                    if (sb == 0)
+                    {
+                        ql_ptr = ql;
+                        ql_shift = 0;
+                        qh_shift = 0;
+                    }
+                    else if (sb == 1)
+                    {
+                        ql_ptr = ql + 32;
+                        ql_shift = 0;
+                        qh_shift = 2;
+                    }
+                    else if (sb == 2)
+                    {
+                        ql_ptr = ql;
+                        ql_shift = 4;
+                        qh_shift = 4;
+                    }
+                    else
+                    {
+                        ql_ptr = ql + 32;
+                        ql_shift = 4;
+                        qh_shift = 6;
+                    }
 
                     const int idx = half * 4 + sb;
                     int8_t *dst = out + sb * 32;
@@ -11684,8 +11832,10 @@ namespace llaminar2
                             float f = (l < 16) ? f0 : f1;
                             float val = f * q;
                             int32_t qi = static_cast<int32_t>(std::nearbyint(val));
-                            if (qi < -128) qi = -128;
-                            if (qi > 127) qi = 127;
+                            if (qi < -128)
+                                qi = -128;
+                            if (qi > 127)
+                                qi = 127;
                             dst[l] = static_cast<int8_t>(qi);
                         }
                     }
@@ -12434,7 +12584,7 @@ namespace llaminar2
 
             // Combine nibbles + high bit, subtract 16
             __m256i result = _mm256_sub_epi8(_mm256_or_si256(nibbles, add_16),
-                                              _mm256_set1_epi8(16));
+                                             _mm256_set1_epi8(16));
 
             _mm256_storeu_si256(reinterpret_cast<__m256i *>(output), result);
         }
@@ -12453,7 +12603,7 @@ namespace llaminar2
             __m128i qs = _mm_loadu_si128(reinterpret_cast<const __m128i *>(block.qs));
             __m128i low_mask_128 = _mm_set1_epi8(0x0F);
 
-            // Extract low and high nibbles  
+            // Extract low and high nibbles
             __m128i low_nibbles = _mm_and_si128(qs, low_mask_128);
             __m128i high_nibbles = _mm_and_si128(_mm_srli_epi16(qs, 4), low_mask_128);
 
@@ -12497,7 +12647,7 @@ namespace llaminar2
 
             // Combine nibbles + high bit, subtract 16
             __m256i result = _mm256_sub_epi8(_mm256_or_si256(nibbles, add_16),
-                                              _mm256_set1_epi8(16));
+                                             _mm256_set1_epi8(16));
 
             _mm256_storeu_si256(reinterpret_cast<__m256i *>(output), result);
         }
@@ -13116,8 +13266,10 @@ namespace llaminar2
             {
                 float s, m;
                 transcode_q2_k_to_int8_scalar(block, i, output + i * 32, &s, &m);
-                if (scales) scales[i] = s;
-                if (mins) mins[i] = m;
+                if (scales)
+                    scales[i] = s;
+                if (mins)
+                    mins[i] = m;
             }
         }
 
@@ -13135,8 +13287,10 @@ namespace llaminar2
             {
                 float s, m;
                 transcode_q2_k_to_int8_avx2(block, i, output + i * 32, &s, &m);
-                if (scales) scales[i] = s;
-                if (mins) mins[i] = m;
+                if (scales)
+                    scales[i] = s;
+                if (mins)
+                    mins[i] = m;
             }
         }
 #endif
@@ -13643,8 +13797,10 @@ namespace llaminar2
                     {
                         float s, m;
                         get_q5_k_scale_min(block, sb_idx, &s, &m);
-                        if (scales) scales[sb_idx] = s;
-                        if (mins) mins[sb_idx] = -m;
+                        if (scales)
+                            scales[sb_idx] = s;
+                        if (mins)
+                            mins[sb_idx] = -m;
                     }
                 }
 
@@ -13663,8 +13819,10 @@ namespace llaminar2
                     {
                         float s, m;
                         get_q5_k_scale_min(block, sb_idx, &s, &m);
-                        if (scales) scales[sb_idx] = s;
-                        if (mins) mins[sb_idx] = -m;
+                        if (scales)
+                            scales[sb_idx] = s;
+                        if (mins)
+                            mins[sb_idx] = -m;
                     }
                 }
             }
@@ -13696,8 +13854,8 @@ namespace llaminar2
             const __m512i v_qs1 = _mm512_loadu_si512(block.qs + 64);
 
             // Extract low and high nibbles for both halves — interleaved for ILP
-            const __m512i v_low0  = _mm512_and_si512(v_qs0, v_mask_0F);
-            const __m512i v_low1  = _mm512_and_si512(v_qs1, v_mask_0F);
+            const __m512i v_low0 = _mm512_and_si512(v_qs0, v_mask_0F);
+            const __m512i v_low1 = _mm512_and_si512(v_qs1, v_mask_0F);
             const __m512i v_high0 = _mm512_and_si512(_mm512_srli_epi16(v_qs0, 4), v_mask_0F);
             const __m512i v_high1 = _mm512_and_si512(_mm512_srli_epi16(v_qs1, 4), v_mask_0F);
 
@@ -13765,8 +13923,10 @@ namespace llaminar2
                 {
                     uint8_t sc, m;
                     get_scale_min_k4(i, block.scales, &sc, &m);
-                    if (scales) scales[i] = d_val * sc;
-                    if (mins) mins[i] = -(dmin_val * m);
+                    if (scales)
+                        scales[i] = d_val * sc;
+                    if (mins)
+                        mins[i] = -(dmin_val * m);
                 }
             }
         }

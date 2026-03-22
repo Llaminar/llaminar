@@ -343,6 +343,10 @@ namespace llaminar2
          * @note Kernel executes on device corresponding to device_idx.
          *       Weight tensor (B) is accessed via this->tensor which has its own device_idx.
          *       If weight is on different device than activation, kernel handles transfer.
+         *
+         * @deprecated Use multiply_tensor() instead. Raw-pointer interfaces are error-prone
+         *             (parameter ordering ambiguity between transpose_B/alpha/beta) and prevent
+         *             type-safe dispatch, shape validation, and device coherence management.
          */
         virtual bool multiply(
             const float *A, float *C,
@@ -351,7 +355,21 @@ namespace llaminar2
             float alpha = 1.0f, float beta = 0.0f,
             const MPIContext *mpi_ctx = nullptr,
             int device_idx = -1,
-            DeviceWorkspaceManager *workspace = nullptr) = 0;
+            DeviceWorkspaceManager *workspace = nullptr)
+        {
+            (void)A;
+            (void)C;
+            (void)m;
+            (void)n;
+            (void)k;
+            (void)transpose_B;
+            (void)alpha;
+            (void)beta;
+            (void)mpi_ctx;
+            (void)device_idx;
+            (void)workspace;
+            return false;
+        }
 
         /**
          * @brief Tensor-based matrix multiplication: C = alpha * A @ B + beta * C
@@ -395,8 +413,6 @@ namespace llaminar2
             DeviceWorkspaceManager *workspace = nullptr,
             int activation_row_offset = 0)
         {
-            // Default: not supported (TensorBase is only forward-declared here)
-            // Subclasses that include Tensors.h can override with real implementation
             (void)A;
             (void)C;
             (void)transpose_B;
@@ -434,6 +450,13 @@ namespace llaminar2
          *        When non-zero, reads m rows starting at A[activation_row_offset, :].
          *
          * @return true on success, false if format combination not supported
+         *
+         * @note This is the PRIMARY GEMM interface. All implementations must provide this.
+         *       Unlike multiply(const float*, float*, ...), this method:
+         *       - Carries tensor type information for automatic format dispatch
+         *       - Avoids parameter ordering ambiguity (transpose_B vs alpha vs beta)
+         *       - Enables device coherence management
+         *       - Supports shape validation and type checking
          */
         virtual bool multiply_tensor(
             const TensorBase *A, TensorBase *C,
@@ -444,24 +467,7 @@ namespace llaminar2
             const MPIContext *mpi_ctx = nullptr,
             int device_idx = -1,
             DeviceWorkspaceManager *workspace = nullptr,
-            int activation_row_offset = 0)
-        {
-            // Default: not supported
-            (void)A;
-            (void)C;
-            (void)m;
-            (void)n;
-            (void)k;
-            (void)transpose_B;
-            (void)alpha;
-            (void)beta;
-            (void)bias;
-            (void)mpi_ctx;
-            (void)device_idx;
-            (void)workspace;
-            (void)activation_row_offset;
-            return false;
-        }
+            int activation_row_offset = 0) = 0;
 
         /**
          * @brief GEMM with FP32 input, outputting to Q8_1 format
@@ -540,13 +546,11 @@ namespace llaminar2
          */
         struct FusedProjectionDesc
         {
-            ITensorGemm *kernel;               ///< GEMM kernel for this projection (with packed weights)
-            float *output;                     ///< Output buffer [m, n]
-            int n;                             ///< Output dimension (columns)
-            const TensorBase *bias = nullptr;  ///< Optional bias tensor [n]
-            const float *gate_input = nullptr; ///< Optional gate for SwiGLU [m, n]
-            bool do_swiglu = false;            ///< Whether to apply SwiGLU fusion
-            const char *name = nullptr;        ///< Name for debug logging
+            ITensorGemm *kernel;              ///< GEMM kernel for this projection (with packed weights)
+            float *output;                    ///< Output buffer [m, n]
+            int n;                            ///< Output dimension (columns)
+            const TensorBase *bias = nullptr; ///< Optional bias tensor [n]
+            const char *name = nullptr;       ///< Name for debug logging
         };
 
         /**
@@ -603,14 +607,8 @@ namespace llaminar2
                 {
                     return false;
                 }
-                // Note: bias and SwiGLU fusion are NOT handled in default implementation
-                // This fallback is for kernels without optimized fused projection support
-                // Such kernels should override multiply_fused() for bias support
-                if (proj.bias || proj.do_swiglu)
-                {
-                    // Cannot apply bias/SwiGLU in fallback - would need full TensorBase definition
-                    // Real kernels (CPUQuantisedGemmKernel, CUDAQuantisedGemmKernel) override this
-                }
+                // Note: bias is NOT handled in default implementation.
+                // Subclasses should override multiply_fused() for bias support.
             }
             return true;
         }
@@ -649,19 +647,16 @@ namespace llaminar2
          */
         struct TensorProjectionDesc
         {
-            ITensorGemm *kernel;          ///< GEMM kernel for this projection (with packed weights)
-            TensorBase *output;           ///< Output tensor [m, n] - kernel manages device placement
-            int n;                        ///< Output dimension (columns)
-            const TensorBase *bias;       ///< Optional bias tensor [n] (nullptr = no bias)
-            const TensorBase *gate_input; ///< Optional gate tensor for SwiGLU [m, n]
-            bool do_swiglu;               ///< Whether to apply SwiGLU fusion
-            const char *name;             ///< Name for debug logging
+            ITensorGemm *kernel;    ///< GEMM kernel for this projection (with packed weights)
+            TensorBase *output;     ///< Output tensor [m, n] - kernel manages device placement
+            int n;                  ///< Output dimension (columns)
+            const TensorBase *bias; ///< Optional bias tensor [n] (nullptr = no bias)
+            const char *name;       ///< Name for debug logging
 
             TensorProjectionDesc(ITensorGemm *k, TensorBase *out, int n_dim,
-                                 const TensorBase *b = nullptr, const TensorBase *gate = nullptr,
-                                 bool swiglu = false, const char *nm = nullptr)
-                : kernel(k), output(out), n(n_dim), bias(b), gate_input(gate),
-                  do_swiglu(swiglu), name(nm) {}
+                                 const TensorBase *b = nullptr,
+                                 const char *nm = nullptr)
+                : kernel(k), output(out), n(n_dim), bias(b), name(nm) {}
         };
 
         /**
@@ -721,9 +716,6 @@ namespace llaminar2
                 {
                     return false;
                 }
-
-                // Note: SwiGLU fusion not handled in default implementation
-                // Optimized implementations should handle these in fused manner
             }
             return true;
         }
@@ -1633,6 +1625,10 @@ namespace llaminar2
          * @param mpi_ctx MPI context for distributed execution
          * @param device_idx Device index (-1 = CPU)
          * @return true on success
+         *
+         * @deprecated Use compute_tensor() instead. Raw-pointer interfaces prevent
+         *             type-safe dispatch, device coherence management, and tensor parallelism
+         *             parameter validation.
          */
         virtual bool compute(
             const float *Q, const float *K, const float *V, float *output,
@@ -1645,7 +1641,27 @@ namespace llaminar2
             TensorBase *workspace_mask = nullptr,
             bool use_bf16 = false,
             const MPIContext *mpi_ctx = nullptr,
-            int device_idx = -1) = 0;
+            int device_idx = -1)
+        {
+            (void)Q;
+            (void)K;
+            (void)V;
+            (void)output;
+            (void)seq_len;
+            (void)n_heads;
+            (void)n_kv_heads;
+            (void)head_dim;
+            (void)causal;
+            (void)window_size;
+            (void)workspace_scores;
+            (void)workspace_buffer;
+            (void)workspace_context;
+            (void)workspace_mask;
+            (void)use_bf16;
+            (void)mpi_ctx;
+            (void)device_idx;
+            return false;
+        }
 
         /**
          * @brief Compute batched attention
@@ -1669,6 +1685,8 @@ namespace llaminar2
          * @param mpi_ctx MPI context
          * @param device_idx Device index
          * @return true on success
+         *
+         * @deprecated Use compute_tensor() instead.
          */
         virtual bool compute_batch(
             const float *Q, const float *K, const float *V, float *output,
@@ -1681,7 +1699,28 @@ namespace llaminar2
             TensorBase *workspace_mask = nullptr,
             bool use_bf16 = false,
             const MPIContext *mpi_ctx = nullptr,
-            int device_idx = -1) = 0;
+            int device_idx = -1)
+        {
+            (void)Q;
+            (void)K;
+            (void)V;
+            (void)output;
+            (void)batch_size;
+            (void)seq_len;
+            (void)n_heads;
+            (void)n_kv_heads;
+            (void)head_dim;
+            (void)causal;
+            (void)window_size;
+            (void)workspace_scores;
+            (void)workspace_buffer;
+            (void)workspace_context;
+            (void)workspace_mask;
+            (void)use_bf16;
+            (void)mpi_ctx;
+            (void)device_idx;
+            return false;
+        }
 
         /**
          * @brief Compute decode attention with separate seq_len and kv_len
@@ -1839,6 +1878,8 @@ namespace llaminar2
          * Note: Uses ITensor* (not TensorBase*) to support both CPU tensors and GPU
          * tensor wrappers (e.g., GpuTensorView from KV cache). Implementations extract
          * GPU pointers via gpu_data_ptr() or CPU data via dynamic_cast to TensorBase.
+         *
+         * @note This is the PRIMARY attention interface. All implementations must provide this.
          */
         virtual bool compute_tensor(
             const ITensor *Q,
@@ -1860,28 +1901,7 @@ namespace llaminar2
             int head_start = 0,        ///< First query head (TP slice start)
             int local_n_heads = -1,    ///< Number of query heads (-1 = all)
             int local_n_kv_heads = -1) ///< Number of KV heads (-1 = all)
-        {
-            (void)Q;
-            (void)K;
-            (void)V;
-            (void)output;
-            (void)batch_size;
-            (void)seq_len;
-            (void)kv_len;
-            (void)n_heads;
-            (void)n_kv_heads;
-            (void)head_dim;
-            (void)causal;
-            (void)window_size;
-            (void)workspace_scores;
-            (void)workspace_mask;
-            (void)mpi_ctx;
-            (void)device_idx;
-            (void)head_start;
-            (void)local_n_heads;
-            (void)local_n_kv_heads;
-            return false; // Subclasses override with type-aware dispatch
-        }
+            = 0;
 
         /**
          * @brief Update attention device params stored in pinned host memory for graph replay
@@ -2492,13 +2512,33 @@ namespace llaminar2
     class ITensorRoPE : public ITensorKernel
     {
     public:
+        /**
+         * @brief Apply RoPE to FP32 data
+         *
+         * @deprecated Use apply_tensor() instead. Raw-pointer interfaces prevent
+         *             type-safe dispatch and device coherence management.
+         */
         virtual bool apply(
             float *data, float *output,
             const int *pos_ids,
             int batch_size, int seq_len, int head_dim, int num_heads,
             float theta_base, bool interleaved,
             const MPIContext *mpi_ctx = nullptr,
-            int device_idx = -1) = 0;
+            int device_idx = -1)
+        {
+            (void)data;
+            (void)output;
+            (void)pos_ids;
+            (void)batch_size;
+            (void)seq_len;
+            (void)head_dim;
+            (void)num_heads;
+            (void)theta_base;
+            (void)interleaved;
+            (void)mpi_ctx;
+            (void)device_idx;
+            return false;
+        }
 
         virtual bool apply_bf16(
             uint16_t *data, uint16_t *output,
@@ -2859,6 +2899,8 @@ namespace llaminar2
          * @note If position_ids is nullptr, positions are computed as (pos_offset + seq_idx)
          *       on the GPU, eliminating the need for host-to-device memory copy.
          *       This is the PREFERRED path for contiguous positions (decode and most prefill).
+         *
+         * @note This is the PRIMARY RoPE interface. All implementations must provide this.
          */
         virtual bool apply_tensor(
             TensorBase *Q,
@@ -2871,21 +2913,7 @@ namespace llaminar2
             float rope_theta,
             const MPIContext *mpi_ctx = nullptr,
             int device_idx = -1,
-            int pos_offset = 0)
-        {
-            (void)Q;
-            (void)K;
-            (void)position_ids;
-            (void)seq_len;
-            (void)n_heads;
-            (void)n_kv_heads;
-            (void)head_dim;
-            (void)rope_theta;
-            (void)mpi_ctx;
-            (void)device_idx;
-            (void)pos_offset;
-            return false; // Subclasses override with type-aware dispatch
-        }
+            int pos_offset = 0) = 0;
 
         /**
          * @brief Update the pos_offset stored in pinned host memory for graph replay
@@ -2909,12 +2937,29 @@ namespace llaminar2
     class ITensorSwiGLU : public ITensorKernel
     {
     public:
+        /**
+         * @brief Apply SwiGLU to FP32 data
+         *
+         * @deprecated Use apply_tensor() instead. Raw-pointer interfaces prevent
+         *             type-safe dispatch and device coherence management.
+         */
         virtual bool apply(
             const float *gate, const float *up, float *output,
             int rows, int cols,
             bool add_residual,
             const MPIContext *mpi_ctx = nullptr,
-            int device_idx = -1) = 0;
+            int device_idx = -1)
+        {
+            (void)gate;
+            (void)up;
+            (void)output;
+            (void)rows;
+            (void)cols;
+            (void)add_residual;
+            (void)mpi_ctx;
+            (void)device_idx;
+            return false;
+        }
 
         virtual bool apply_bf16(
             const uint16_t *gate, const uint16_t *up, uint16_t *output,
@@ -2954,6 +2999,8 @@ namespace llaminar2
          * @return true on success, false on failure or unsupported type combination
          *
          * @note Default returns false. Subclasses should override with type-aware dispatch.
+         *
+         * @note This is the PRIMARY SwiGLU interface. All implementations must provide this.
          */
         virtual bool apply_tensor(
             const TensorBase *gate,
@@ -2962,7 +3009,7 @@ namespace llaminar2
             int rows, int cols,
             bool add_residual,
             const MPIContext *mpi_ctx = nullptr,
-            int device_idx = -1) { return false; }
+            int device_idx = -1) = 0;
     };
 
     /**
@@ -2984,12 +3031,24 @@ namespace llaminar2
          * @param mpi_ctx MPI context (optional)
          * @param device_idx Device index (-1 for CPU)
          * @return true on success
+         *
+         * @deprecated Use apply_tensor() instead. Raw-pointer interfaces prevent
+         *             type-safe dispatch and device coherence management.
          */
         virtual bool apply(
             const float *input, const float *residual, float *output,
             size_t num_elements,
             const MPIContext *mpi_ctx = nullptr,
-            int device_idx = -1) = 0;
+            int device_idx = -1)
+        {
+            (void)input;
+            (void)residual;
+            (void)output;
+            (void)num_elements;
+            (void)mpi_ctx;
+            (void)device_idx;
+            return false;
+        }
 
         virtual bool apply_bf16(
             const uint16_t *input, const uint16_t *residual, uint16_t *output,
@@ -3016,6 +3075,8 @@ namespace llaminar2
          * @param mpi_ctx MPI context (optional)
          * @param device_idx Device index
          * @return true on success, false on failure or unsupported type
+         *
+         * @note This is the PRIMARY ResidualAdd interface. All implementations must provide this.
          */
         virtual bool apply_tensor(
             const TensorBase *input,
@@ -3023,16 +3084,7 @@ namespace llaminar2
             TensorBase *output,
             size_t num_elements,
             const MPIContext *mpi_ctx = nullptr,
-            int device_idx = -1)
-        {
-            (void)input;
-            (void)residual;
-            (void)output;
-            (void)num_elements;
-            (void)mpi_ctx;
-            (void)device_idx;
-            return false; // Subclasses override with type-aware dispatch
-        }
+            int device_idx = -1) = 0;
     };
 
     /**
@@ -3060,6 +3112,9 @@ namespace llaminar2
          * @param mpi_ctx MPI context (optional)
          * @param device_idx Device index
          * @return true on success
+         *
+         * @deprecated Use apply_tensor() instead. Raw-pointer interfaces prevent
+         *             type-safe dispatch and device coherence management.
          */
         virtual bool apply(
             const float *embed_data,
@@ -3068,7 +3123,17 @@ namespace llaminar2
             int d_model,
             float *output,
             const MPIContext *mpi_ctx = nullptr,
-            int device_idx = -1) = 0;
+            int device_idx = -1)
+        {
+            (void)embed_data;
+            (void)token_ids;
+            (void)num_tokens;
+            (void)d_model;
+            (void)output;
+            (void)mpi_ctx;
+            (void)device_idx;
+            return false;
+        }
 
         /**
          * @brief Execute embedding lookup with BF16 output
@@ -3126,6 +3191,8 @@ namespace llaminar2
          * @param mpi_ctx MPI context (optional)
          * @param device_idx Device index
          * @return true on success, false on failure or unsupported type
+         *
+         * @note This is the PRIMARY Embedding interface. All implementations must provide this.
          */
         virtual bool apply_tensor(
             const TensorBase *embed_table,
@@ -3134,7 +3201,7 @@ namespace llaminar2
             int d_model,
             TensorBase *output,
             const MPIContext *mpi_ctx = nullptr,
-            int device_idx = -1) { return false; }
+            int device_idx = -1) = 0;
 
         /**
          * @brief Update token IDs stored in a graph-safe device-side buffer for replay
@@ -3175,13 +3242,26 @@ namespace llaminar2
          * @param mpi_ctx MPI context (optional)
          * @param device_idx Device index (-1 = CPU)
          * @return true on success
+         *
+         * @deprecated Use apply_tensor() instead. Raw-pointer interfaces prevent
+         *             type-safe dispatch and device coherence management.
          */
         virtual bool apply(
             const float *input, float *output,
             int rows, int cols,
             bool use_causal_mask,
             const MPIContext *mpi_ctx = nullptr,
-            int device_idx = -1) = 0;
+            int device_idx = -1)
+        {
+            (void)input;
+            (void)output;
+            (void)rows;
+            (void)cols;
+            (void)use_causal_mask;
+            (void)mpi_ctx;
+            (void)device_idx;
+            return false;
+        }
 
         virtual bool apply_bf16(
             const uint16_t *input, uint16_t *output,
@@ -3213,7 +3293,7 @@ namespace llaminar2
          * @param device_idx Device index (-1 = CPU)
          * @return true on success, false on failure or unsupported type
          *
-         * @note Default returns false. Subclasses should override with type-aware dispatch.
+         * @note This is the PRIMARY Softmax interface. All implementations must provide this.
          */
         virtual bool apply_tensor(
             const TensorBase *input,
@@ -3222,18 +3302,7 @@ namespace llaminar2
             bool use_causal_mask,
             float scale = 1.0f,
             const MPIContext *mpi_ctx = nullptr,
-            int device_idx = -1)
-        {
-            (void)input;
-            (void)output;
-            (void)rows;
-            (void)cols;
-            (void)use_causal_mask;
-            (void)scale;
-            (void)mpi_ctx;
-            (void)device_idx;
-            return false; // Subclasses override with type-aware dispatch
-        }
+            int device_idx = -1) = 0;
     };
 
     /**
@@ -3242,13 +3311,31 @@ namespace llaminar2
     class ITensorRMSNorm : public ITensorKernel
     {
     public:
+        /**
+         * @brief Apply RMSNorm to FP32 data
+         *
+         * @deprecated Use apply_tensor() instead. Raw-pointer interfaces prevent
+         *             type-safe dispatch and device coherence management.
+         */
         virtual bool apply(
             const float *input, const float *weight, float *output,
             int rows, int cols,
             float epsilon = 1e-6f,
             bool use_bf16 = false,
             const MPIContext *mpi_ctx = nullptr,
-            int device_idx = -1) = 0;
+            int device_idx = -1)
+        {
+            (void)input;
+            (void)weight;
+            (void)output;
+            (void)rows;
+            (void)cols;
+            (void)epsilon;
+            (void)use_bf16;
+            (void)mpi_ctx;
+            (void)device_idx;
+            return false;
+        }
 
         virtual bool apply_bf16(
             const uint16_t *input, const float *weight, uint16_t *output,
@@ -3302,7 +3389,7 @@ namespace llaminar2
          * @param device_idx Device index
          * @return true on success, false on failure or unsupported type combination
          *
-         * @note Default returns false. Subclasses should override with type-aware dispatch.
+         * @note This is the PRIMARY RMSNorm interface. All implementations must provide this.
          */
         virtual bool apply_tensor(
             const TensorBase *input,
@@ -3311,18 +3398,7 @@ namespace llaminar2
             int rows, int cols,
             float epsilon = 1e-6f,
             const MPIContext *mpi_ctx = nullptr,
-            int device_idx = -1)
-        {
-            (void)input;
-            (void)weight;
-            (void)output;
-            (void)rows;
-            (void)cols;
-            (void)epsilon;
-            (void)mpi_ctx;
-            (void)device_idx;
-            return false; // Subclasses override with type-aware dispatch
-        }
+            int device_idx = -1) = 0;
 
         /**
          * @brief Execute fused RMSNorm + INT8 quantization (operator fusion API)

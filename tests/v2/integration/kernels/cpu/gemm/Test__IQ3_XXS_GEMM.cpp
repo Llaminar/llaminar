@@ -10,7 +10,7 @@
 #include "../../../../src/v2/utils/MPIContext.h"
 #include "../../../../src/v2/tensors/FP16Utils.h"
 #include "../../../../src/v2/kernels/cpu/gemm/FloatingPointGemmKernel.h"
-#include "../../../../src/v2/kernels/cpu/gemm/CPUQuantisedGemmKernel.h"
+#include "kernels/cpu/native_vnni/CPUNativeVNNIGemmKernel.h"
 #include <vector>
 #include <cstring>
 #include <cmath>
@@ -114,7 +114,7 @@ TEST_F(IQ3_XXS_GEMM, QuantizedVsFP32Parity)
     // Test dimensions: M=4, N=64, K=256
     // A: FP32 activation (random values)
     // B: IQ3_XXS weight (random data with valid scales)
-    // Compare: CPUQuantisedGemmKernel vs FloatingPointGemmKernel on FP32
+    // Compare: CPUNativeVNNIGemmKernel vs FloatingPointGemmKernel on FP32
 
     int m = 4;
     int n = 64;
@@ -169,11 +169,11 @@ TEST_F(IQ3_XXS_GEMM, QuantizedVsFP32Parity)
     // B is [N, K], so transpose_B=true to compute A @ B^T
     fp_kernel.multiply(A_fp32->data(), C_ref->mutable_data(), m, n, k, true);
 
-    // === Test: CPUQuantisedGemmKernel with IQ3_XXS weights ===
+    // === Test: CPUNativeVNNIGemmKernel with IQ3_XXS weights ===
     auto C_quant = factory.createFP32({static_cast<size_t>(m), static_cast<size_t>(n)});
     std::fill_n(C_quant->mutable_data(), m * n, 0.0f);
 
-    gemm::CPUQuantisedGemmKernel quant_kernel(B_iq3xxs.get());
+    cpu::native_vnni::CPUNativeVNNIGemmKernel quant_kernel(B_iq3xxs.get());
     quant_kernel.multiply(A_fp32->data(), C_quant->mutable_data(), m, n, k, true, 1.0f, 0.0f, nullptr, -1);
 
     // === Compare results ===

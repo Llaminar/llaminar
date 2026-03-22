@@ -10,7 +10,7 @@
 #include "v2/tensors/BlockStructures.h"
 #include "v2/tensors/FP16Utils.h"
 #include "v2/kernels/cpu/gemm/FloatingPointGemmKernel.h"
-#include "v2/kernels/cpu/gemm/CPUQuantisedGemmKernel.h"
+#include "kernels/cpu/native_vnni/CPUNativeVNNIGemmKernel.h"
 
 using namespace llaminar2;
 
@@ -178,7 +178,7 @@ TEST_F(Test__IQ4_NLTensor, GemmCorrectness_Negative)
 TEST_F(Test__IQ4_NLTensor, GemmCorrectness_Random)
 {
     // Dimensions
-    // Note: M > 1 currently fails with large errors in CPUQuantisedGemmKernel.
+    // Note: M > 1 currently fails with large errors in CPUNativeVNNIGemmKernel.
     // Keeping M=1 for now to verify IQ4_NL decoding logic.
     int m = 1;
     int n = 32;
@@ -262,7 +262,7 @@ TEST_F(Test__IQ4_NLTensor, QuantizedVsFP32Parity)
     // Test dimensions: M=4, N=64, K=256
     // A: FP32 activation (random values)
     // B: IQ4_NL weight (random data with valid scales)
-    // Compare: CPUQuantisedGemmKernel vs FloatingPointGemmKernel on FP32
+    // Compare: CPUNativeVNNIGemmKernel vs FloatingPointGemmKernel on FP32
 
     int m = 4;
     int n = 64;
@@ -316,11 +316,11 @@ TEST_F(Test__IQ4_NLTensor, QuantizedVsFP32Parity)
     // B is [N, K], so transpose_B=true to compute A @ B^T
     fp_kernel.multiply(A_fp32->data(), C_ref->mutable_data(), m, n, k, true);
 
-    // === Test: CPUQuantisedGemmKernel with IQ4_NL weights ===
+    // === Test: CPUNativeVNNIGemmKernel with IQ4_NL weights ===
     auto C_quant = factory.createFP32({static_cast<size_t>(m), static_cast<size_t>(n)});
     std::fill_n(C_quant->mutable_data(), m * n, 0.0f);
 
-    gemm::CPUQuantisedGemmKernel quant_kernel(B_iq4nl.get());
+    cpu::native_vnni::CPUNativeVNNIGemmKernel quant_kernel(B_iq4nl.get());
     quant_kernel.multiply(A_fp32->data(), C_quant->mutable_data(), m, n, k, true, 1.0f, 0.0f, nullptr, -1);
 
     // === Compare results ===

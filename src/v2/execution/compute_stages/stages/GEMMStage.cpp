@@ -9,7 +9,6 @@
 #include "../../../tensors/Tensors.h"
 #include "../../../utils/Logger.h"
 #include "../../../kernels/KernelFactory.h"
-#include "../../../kernels/cpu/gemm/CPUQuantisedGemmKernel.h"
 #include "../../../interfaces/IWorkspaceConsumer.h"
 
 namespace llaminar2
@@ -214,9 +213,8 @@ namespace llaminar2
                                                 << " for weight ITensor*=" << static_cast<const void *>(params_.B)
                                                 << " TensorBase*=" << static_cast<const void *>(B_base));
 
-        // GPU fused SwiGLU path: silu(gate)*up quantized in one kernel, then GEMM.
-        // This avoids the separate SwiGLU write + quant read (saves ~4.6ms/iter).
-        // Try BEFORE qgemm cast since CUDA kernels don't inherit from CPUQuantisedGemmKernel.
+        // Fused SwiGLU + GEMM: output = W @ (silu(gate) * up)
+        // Both CPU and GPU kernels implement multiply_tensor_with_fused_swiglu().
         if (params_.gate_input)
         {
             auto *gate_base = requireTensorBase(params_.gate_input, "gate input");
@@ -232,139 +230,33 @@ namespace llaminar2
                 traceOutput("C", params_.C);
                 return true;
             }
-            // Fall through to CPU path below
+            LOG_ERROR("[GEMMStage] multiply_tensor_with_fused_swiglu() failed — "
+                      "kernel does not support fused SwiGLU+GEMM");
+            return false;
         }
 
-        // Cast to CPUQuantisedGemmKernel for full API access
-        auto *qgemm = dynamic_cast<gemm::CPUQuantisedGemmKernel *>(gemm);
-
-        // Dimension validation
-        if (qgemm)
+        // Primary path: use tensor-aware multiply_tensor for type-aware dispatch.
+        // Works for CPU (NativeVNNI, FloatingPointGemm) and GPU (CUDA/ROCm) kernels.
         {
-            int kernel_n = qgemm->get_n();
-            int kernel_k = qgemm->get_k();
-            LOG_DEBUG("[GEMMStage] Kernel dimensions: N=" << kernel_n << " K=" << kernel_k
-                                                          << ", params: n=" << effective_n << " k=" << params_.k);
-            if (kernel_n != effective_n || kernel_k != params_.k)
-            {
-                LOG_ERROR("[GEMMStage] DIMENSION MISMATCH! kernel N=" << kernel_n << " vs params n=" << effective_n
-                                                                      << ", kernel K=" << kernel_k << " vs params k=" << params_.k);
-                return false;
-            }
+            auto *A_base = requireTensorBase(params_.A, "input A");
+            auto *C_base = asTensorBase(params_.C, "output C");
 
-            // Check if we have a gate input for SwiGLU fusion
-            // (GPU fused path already tried above - this is the CPU fallback)
-            const float *gate_fp32 = params_.gate_input ? params_.gate_input->fp32_data() : nullptr;
-
-            // If no SwiGLU fusion, use multiply_tensor for type-aware dispatch.
-            // This handles all input/output type combinations efficiently:
-            // - Q8_1→Q8_1: Direct JIT kernel (zero-copy)
-            // - Q8_1→FP32: multiply_q8_1_direct (JIT kernel, no dequant buffer)
-            // - FP32→Q8_1: multiply_to_q8_1 (quantize once, JIT kernel)
-            // - FP32→FP32: Standard GEMM
-            //
-            // IMPORTANT: Don't use multiply_fused for Q8_1 input without gate fusion!
-            // multiply_fused calls fp32_data() which dequantizes the entire Q8_1 tensor
-            // into a buffer EVERY CALL - this was causing 25x slowdown for down_proj.
-            if (!gate_fp32)
-            {
-                // Cast input/output to TensorBase for multiply_tensor
-                auto *A_base = requireTensorBase(params_.A, "input A");
-                auto *C_base = asTensorBase(params_.C, "output C");
-
-                LOG_DEBUG("[GEMMStage] Using multiply_tensor for type-aware dispatch: "
-                          << "input_type=" << params_.A->dtype_name()
-                          << " output_type=" << params_.C->dtype_name());
-                bool success = qgemm->multiply_tensor(
-                    A_base, C_base,
-                    params_.m, effective_n, params_.k,
-                    params_.transpose_B,
-                    params_.alpha, params_.beta,
-                    nullptr, // bias (not supported in GEMMStage yet)
-                    params_.mpi_ctx, params_.device_id.toKernelDeviceIndex(),
-                    getWorkspace()); // Pass workspace from IWorkspaceConsumerStage
-
-                // === Stage Tracing (Task 3) ===
-                if (success)
-                    traceOutput("C", params_.C);
-                return success;
-            }
-
-            // For SwiGLU fusion, use multiply_fused which requires FP32 pointers.
-            // Note: If gate_input is Q8_1, gate_fp32 calls fp32_data() which dequantizes.
-            // This is acceptable because gate fusion is compute-bound, not memory-bound.
-            float *output_fp32 = params_.C->mutable_data();
-            const float *input_fp32 = params_.A->fp32_data();
-
-            if (!input_fp32 || !output_fp32)
-            {
-                LOG_ERROR("[GEMMStage] Failed to get FP32 data from tensors");
-                return false;
-            }
-
-            // Use getBiasData() for TensorSlice compatibility (TP sharded bias)
-            const float *bias_data = params_.getBiasData();
-
-            bool success = qgemm->multiply_fused(
-                input_fp32,
-                output_fp32,
+            LOG_DEBUG("[GEMMStage] Using multiply_tensor for type-aware dispatch: "
+                      << "input_type=" << params_.A->dtype_name()
+                      << " output_type=" << params_.C->dtype_name());
+            bool success = gemm->multiply_tensor(
+                A_base, C_base,
                 params_.m, effective_n, params_.k,
-                bias_data,              // Fused bias (via unified interface)
-                nullptr,                // No attention mask
-                false,                  // No softmax
-                nullptr, nullptr,       // No softmax buffers
-                (params_.beta != 0.0f), // Accumulate if beta != 0
+                params_.transpose_B,
                 params_.alpha, params_.beta,
+                nullptr, // bias
                 params_.mpi_ctx, params_.device_id.toKernelDeviceIndex(),
-                gate_fp32,
-                params_.do_swiglu); // CPU multiply_fused doesn't have workspace param
+                getWorkspace());
 
-            // === Stage Tracing (Task 3) ===
             if (success)
                 traceOutput("C", params_.C);
             return success;
         }
-
-        // Cast A/C for FP32 GEMM fallback
-        auto *A_base_fallback = requireTensorBase(params_.A, "input A fallback");
-        auto *C_base_fallback = asTensorBase(params_.C, "output C fallback");
-
-        // FP32 GEMM fallback (for non-quantized weights)
-        // Use multiply_tensor if available for type-aware dispatch
-        if (gemm->multiply_tensor(A_base_fallback, C_base_fallback, params_.m, effective_n, params_.k,
-                                  params_.transpose_B, params_.alpha, params_.beta,
-                                  nullptr, // bias (not supported in GEMMStage yet)
-                                  params_.mpi_ctx, params_.device_id.toKernelDeviceIndex(),
-                                  getWorkspace())) // Pass workspace from IWorkspaceConsumerStage
-        {
-            // === Stage Tracing (Task 3) ===
-            traceOutput("C", params_.C);
-            return true;
-        }
-
-        // Final fallback: extract FP32 data manually
-        const float *input_fp32 = params_.A->fp32_data();
-        float *output_fp32 = params_.C->mutable_data();
-
-        if (!input_fp32 || !output_fp32)
-        {
-            LOG_ERROR("[GEMMStage] Failed to get FP32 data from tensors");
-            return false;
-        }
-
-        bool success = gemm->multiply(
-            input_fp32,
-            output_fp32,
-            params_.m, effective_n, params_.k,
-            params_.transpose_B,
-            params_.alpha, params_.beta,
-            params_.mpi_ctx, params_.device_id.toKernelDeviceIndex(),
-            getWorkspace()); // Pass workspace from IWorkspaceConsumerStage
-
-        // === Stage Tracing (Task 3) ===
-        if (success)
-            traceOutput("C", params_.C);
-        return success;
     }
 
     size_t GEMMStage::estimatedFlops() const
