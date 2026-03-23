@@ -51,7 +51,7 @@ namespace llaminar2
             int d_model,
             float *output,
             const MPIContext *mpi_ctx = nullptr,
-            int device_idx = -1) override;
+            int device_idx = -1);
 
         /**
          * @brief Execute embedding lookup with BF16 output
@@ -63,7 +63,7 @@ namespace llaminar2
             int d_model,
             uint16_t *output,
             const MPIContext *mpi_ctx = nullptr,
-            int device_idx = -1) override;
+            int device_idx = -1);
 
         /**
          * @brief Execute embedding lookup with FP16 output
@@ -75,7 +75,7 @@ namespace llaminar2
             int d_model,
             uint16_t *output,
             const MPIContext *mpi_ctx = nullptr,
-            int device_idx = -1) override;
+            int device_idx = -1);
 
         /**
          * @brief Execute embedding lookup with Q8_1 output
@@ -87,7 +87,7 @@ namespace llaminar2
             int d_model,
             void *output,
             const MPIContext *mpi_ctx = nullptr,
-            int device_idx = -1) override;
+            int device_idx = -1);
 
         /**
          * @brief Apply embedding lookup using tensor objects with automatic type dispatch

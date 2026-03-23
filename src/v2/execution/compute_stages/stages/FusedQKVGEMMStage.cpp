@@ -144,40 +144,41 @@ namespace llaminar2
         }
         else
         {
-            // CPU path: Use raw pointer API with FP32 activations
-            const float *input_fp32 = params_.input->fp32_data();
-            float *output_q_fp32 = params_.output_q->mutable_data();
-            float *output_k_fp32 = params_.output_k->mutable_data();
-            float *output_v_fp32 = params_.output_v->mutable_data();
+            // CPU path: Use tensor-aware API (same as GPU path)
+            auto *input_base = dynamic_cast<TensorBase *>(const_cast<ITensor *>(params_.input));
+            auto *output_q_base = dynamic_cast<TensorBase *>(params_.output_q);
+            auto *output_k_base = dynamic_cast<TensorBase *>(params_.output_k);
+            auto *output_v_base = dynamic_cast<TensorBase *>(params_.output_v);
 
-            if (!input_fp32 || !output_q_fp32 || !output_k_fp32 || !output_v_fp32)
+            if (!input_base || !output_q_base || !output_k_base || !output_v_base)
             {
-                LOG_ERROR("[FusedQKVGEMMStage] Failed to get FP32 data from tensors");
+                LOG_ERROR("[FusedQKVGEMMStage] CPU path requires TensorBase-derived types");
                 return false;
             }
 
             LOG_DEBUG("[FusedQKVGEMMStage] input_type=" << params_.input->dtype_name()
                                                         << " output_type=" << params_.output_q->dtype_name());
 
-            // Build projection descriptors for raw pointer API
-            std::vector<ITensorGemm::FusedProjectionDesc> projections = {
-                {gemm_q, output_q_fp32, params_.n_q, params_.bias_q, "Q"},
-                {gemm_k, output_k_fp32, params_.n_k, params_.bias_k, "K"},
-                {gemm_v, output_v_fp32, params_.n_v, params_.bias_v, "V"}};
+            // Build tensor projection descriptors
+            std::vector<ITensorGemm::TensorProjectionDesc> projections = {
+                {gemm_q, output_q_base, params_.n_q, params_.bias_q, "Q"},
+                {gemm_k, output_k_base, params_.n_k, params_.bias_k, "K"},
+                {gemm_v, output_v_base, params_.n_v, params_.bias_v, "V"}};
 
-            success = gemm_q->multiply_fused(
-                input_fp32,
+            success = gemm_q->multiply_fused_tensor(
+                input_base,
                 projections,
                 params_.m,
                 params_.k);
 
             if (success)
             {
+                const float *q_data = output_q_base->data();
                 LOG_TRACE("[FusedQKVGEMMStage] Q output[0:8]=" << std::setprecision(10)
-                                                               << output_q_fp32[0] << "," << output_q_fp32[1] << ","
-                                                               << output_q_fp32[2] << "," << output_q_fp32[3] << ","
-                                                               << output_q_fp32[4] << "," << output_q_fp32[5] << ","
-                                                               << output_q_fp32[6] << "," << output_q_fp32[7]
+                                                               << q_data[0] << "," << q_data[1] << ","
+                                                               << q_data[2] << "," << q_data[3] << ","
+                                                               << q_data[4] << "," << q_data[5] << ","
+                                                               << q_data[6] << "," << q_data[7]
                                                                << " n_q=" << params_.n_q);
             }
         }

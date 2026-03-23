@@ -69,8 +69,8 @@ TEST_F(Q5_0_GEMM, BasicMultiplication)
     auto gemm = B->createGemm();
 
     // Execute
-    // multiply(A, C, m, n, k)
-    gemm->multiply(A->data(), C->mutable_data(), m, n, k);
+    // multiply_tensor(A, C, m, n, k)
+    gemm->multiply_tensor(A.get(), C.get(), m, n, k);
 
     // Verify
     // A = 1.0

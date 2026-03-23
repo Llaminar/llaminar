@@ -254,7 +254,12 @@ namespace llaminar2
         }
 
         bindStageStream(kernel);
-        return kernel->apply_bf16(input, residual, output, n, params_.mpi_ctx, params_.device_id.toKernelDeviceIndex());
+        auto *residual_base = requireTensorBasePtr(params_.residual, "residual");
+        auto *output_base = requireTensorBasePtr(params_.output, "output");
+        if (!residual_base || !output_base)
+            return false;
+        return kernel->apply_tensor(input_base, residual_base, output_base,
+                                    num_elements, params_.mpi_ctx, params_.device_id.toKernelDeviceIndex());
     }
 
     bool ResidualAddStage::executeFP16(IDeviceContext *ctx, size_t num_elements)
@@ -292,7 +297,12 @@ namespace llaminar2
         }
 
         bindStageStream(kernel);
-        return kernel->apply_fp16(input, residual, output, n, params_.mpi_ctx, params_.device_id.toKernelDeviceIndex());
+        auto *residual_base_fp16 = requireTensorBasePtr(params_.residual, "residual");
+        auto *output_base_fp16 = requireTensorBasePtr(params_.output, "output");
+        if (!residual_base_fp16 || !output_base_fp16)
+            return false;
+        return kernel->apply_tensor(input_base, residual_base_fp16, output_base_fp16,
+                                    num_elements, params_.mpi_ctx, params_.device_id.toKernelDeviceIndex());
     }
 
     bool ResidualAddStage::executeQ8_1(IDeviceContext *ctx, size_t num_elements)

@@ -399,7 +399,7 @@ namespace llaminar2
             TensorBase *workspace_mask = nullptr,
             bool use_bf16 = false,
             const MPIContext *mpi_ctx = nullptr,
-            int device_idx = -1) override
+            int device_idx = -1)
         {
             (void)workspace_scores;
             (void)workspace_buffer;
@@ -457,7 +457,7 @@ namespace llaminar2
             TensorBase *workspace_mask = nullptr,
             bool use_bf16 = false,
             const MPIContext *mpi_ctx = nullptr,
-            int device_idx = -1) override
+            int device_idx = -1)
         {
             (void)workspace_buffer;
             (void)workspace_context;
@@ -520,7 +520,7 @@ namespace llaminar2
             const float *Q, const float *K, const float *V, float *output,
             int seq_len, int kv_len, int n_heads, int n_kv_heads, int head_dim,
             bool causal = true,
-            int position_offset = 0) override
+            int position_offset = 0)
         {
             if constexpr (!std::is_same_v<ElementType, float>)
             {

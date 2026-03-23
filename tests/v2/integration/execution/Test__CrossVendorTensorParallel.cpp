@@ -38,6 +38,7 @@
 #include "tensors/Tensors.h"
 #include "tensors/BlockStructures.h"
 #include "kernels/KernelFactory.h"
+#include "execution/local_execution/coherence/GpuCoherence.h"
 #include "utils/Logger.h"
 #include "TestTensorFactory.h"
 
@@ -452,15 +453,9 @@ namespace llaminar2
             ASSERT_TRUE(weight_cuda->ensureOnDevice(cuda_dev_));
             EXPECT_TRUE(weight_cuda->isOnGPU());
 
-            // Allocate activations and output on NVIDIA via IBackend
-            float *d_A_cuda = static_cast<float *>(cuda_backend->allocate(input_bytes, cuda_dev_.ordinal));
-            float *d_C_cuda = static_cast<float *>(cuda_backend->allocate(local_output_bytes, cuda_dev_.ordinal));
-            ASSERT_NE(d_A_cuda, nullptr);
-            ASSERT_NE(d_C_cuda, nullptr);
-
-            // Copy input to NVIDIA GPU
-            ASSERT_TRUE(cuda_backend->hostToDevice(d_A_cuda, input->data(), input_bytes, cuda_dev_.ordinal));
-            ASSERT_TRUE(cuda_backend->memset(d_C_cuda, 0, local_output_bytes, cuda_dev_.ordinal));
+            // Create input copy for CUDA device
+            auto input_cuda = TestTensorFactory::createFP32({M, K});
+            std::memcpy(input_cuda->mutable_data(), input->data(), input_bytes);
 
             // Create ACTUAL CUDA GEMM kernel (uses cuBLAS)
             auto cuda_kernel = llaminar::v2::kernels::KernelFactory::createGemm(
@@ -470,14 +465,17 @@ namespace llaminar2
             // Execute CUDA GEMM: Y_cuda = input @ weight_cuda^T
             LOG_INFO("Executing CUDA GEMM: [" << M << "," << K << "] @ [" << N_LOCAL << "," << K << "]^T");
             auto cuda_start = std::chrono::high_resolution_clock::now();
-            ASSERT_TRUE(cuda_kernel->multiply(d_A_cuda, d_C_cuda, M, N_LOCAL, K));
+            ASSERT_TRUE(with_gpu_coherence(
+                cuda_dev_,
+                {input_cuda.get()},
+                {output_cuda.get()},
+                [&]
+                {
+                    return cuda_kernel->multiply_tensor(input_cuda.get(), output_cuda.get(), M, N_LOCAL, K);
+                }));
             cuda_backend->synchronize(cuda_dev_.ordinal);
             auto cuda_end = std::chrono::high_resolution_clock::now();
             cuda_ms = std::chrono::duration<double, std::milli>(cuda_end - cuda_start).count();
-
-            // Download CUDA result
-            ASSERT_TRUE(cuda_backend->deviceToHost(output_cuda->mutable_data(), d_C_cuda,
-                                                   local_output_bytes, cuda_dev_.ordinal));
 
             // === AMD GPU: ROCmFloatingPointGemmKernel ===
             LOG_INFO("Setting up AMD GPU (ROCm device " << rocm_dev_.ordinal << ")...");
@@ -486,15 +484,9 @@ namespace llaminar2
             ASSERT_TRUE(weight_amd->ensureOnDevice(rocm_dev_));
             EXPECT_TRUE(weight_amd->isOnGPU());
 
-            // Allocate activations and output on AMD via IBackend
-            float *d_A_rocm = static_cast<float *>(rocm_backend->allocate(input_bytes, rocm_dev_.ordinal));
-            float *d_C_rocm = static_cast<float *>(rocm_backend->allocate(local_output_bytes, rocm_dev_.ordinal));
-            ASSERT_NE(d_A_rocm, nullptr);
-            ASSERT_NE(d_C_rocm, nullptr);
-
-            // Copy input to AMD GPU
-            ASSERT_TRUE(rocm_backend->hostToDevice(d_A_rocm, input->data(), input_bytes, rocm_dev_.ordinal));
-            ASSERT_TRUE(rocm_backend->memset(d_C_rocm, 0, local_output_bytes, rocm_dev_.ordinal));
+            // Create input copy for ROCm device
+            auto input_rocm = TestTensorFactory::createFP32({M, K});
+            std::memcpy(input_rocm->mutable_data(), input->data(), input_bytes);
 
             // Create ACTUAL ROCm GEMM kernel (uses hipBLAS)
             auto rocm_kernel = llaminar::v2::kernels::KernelFactory::createGemm(
@@ -504,14 +496,17 @@ namespace llaminar2
             // Execute ROCm GEMM: Y_amd = input @ weight_amd^T
             LOG_INFO("Executing ROCm GEMM: [" << M << "," << K << "] @ [" << N_LOCAL << "," << K << "]^T");
             auto rocm_start = std::chrono::high_resolution_clock::now();
-            ASSERT_TRUE(rocm_kernel->multiply(d_A_rocm, d_C_rocm, M, N_LOCAL, K));
+            ASSERT_TRUE(with_gpu_coherence(
+                rocm_dev_,
+                {input_rocm.get()},
+                {output_amd.get()},
+                [&]
+                {
+                    return rocm_kernel->multiply_tensor(input_rocm.get(), output_amd.get(), M, N_LOCAL, K);
+                }));
             rocm_backend->synchronize(rocm_dev_.ordinal);
             auto rocm_end = std::chrono::high_resolution_clock::now();
             rocm_ms = std::chrono::duration<double, std::milli>(rocm_end - rocm_start).count();
-
-            // Download ROCm result
-            ASSERT_TRUE(rocm_backend->deviceToHost(output_amd->mutable_data(), d_C_rocm,
-                                                   local_output_bytes, rocm_dev_.ordinal));
 
             LOG_INFO("GPU GEMM completed:");
             LOG_INFO("  CUDA time: " << cuda_ms << " ms");
@@ -538,10 +533,6 @@ namespace llaminar2
 
             // Cleanup GPU memory
             cuda_backend->free(cuda_buf, cuda_dev_.ordinal);
-            cuda_backend->free(d_A_cuda, cuda_dev_.ordinal);
-            cuda_backend->free(d_C_cuda, cuda_dev_.ordinal);
-            rocm_backend->free(d_A_rocm, rocm_dev_.ordinal);
-            rocm_backend->free(d_C_rocm, rocm_dev_.ordinal);
 
             double amd_mse = computeMSE(output_amd->data(), gathered_amd.data(), M * N_LOCAL);
             EXPECT_EQ(amd_mse, 0.0) << "AMD output should be bit-exact after P2P";
@@ -662,7 +653,6 @@ namespace llaminar2
             auto partial_cuda = TestTensorFactory::createFP32Zeros({M, N});
             auto partial_amd = TestTensorFactory::createFP32Zeros({M, N});
 
-            const size_t input_local_bytes = M * K_LOCAL * sizeof(float);
             const size_t output_bytes = M * N * sizeof(float);
 
             double cuda_ms = 0.0, rocm_ms = 0.0;
@@ -674,15 +664,6 @@ namespace llaminar2
             ASSERT_TRUE(weight_cuda->ensureOnDevice(cuda_dev_));
             EXPECT_TRUE(weight_cuda->isOnGPU());
 
-            // Allocate activations and output on NVIDIA via IBackend
-            float *d_A_cuda = static_cast<float *>(cuda_backend->allocate(input_local_bytes, cuda_dev_.ordinal));
-            float *d_C_cuda = static_cast<float *>(cuda_backend->allocate(output_bytes, cuda_dev_.ordinal));
-            ASSERT_NE(d_A_cuda, nullptr);
-            ASSERT_NE(d_C_cuda, nullptr);
-
-            ASSERT_TRUE(cuda_backend->hostToDevice(d_A_cuda, input_cuda->data(), input_local_bytes, cuda_dev_.ordinal));
-            ASSERT_TRUE(cuda_backend->memset(d_C_cuda, 0, output_bytes, cuda_dev_.ordinal));
-
             // Create ACTUAL CUDA GEMM kernel
             auto cuda_kernel = llaminar::v2::kernels::KernelFactory::createGemm(
                 weight_cuda.get(), llaminar::v2::kernels::DeviceType::CUDA);
@@ -691,14 +672,17 @@ namespace llaminar2
             // Execute CUDA GEMM
             LOG_INFO("Executing CUDA GEMM: [" << M << "," << K_LOCAL << "] @ [" << N << "," << K_LOCAL << "]^T");
             auto cuda_start = std::chrono::high_resolution_clock::now();
-            ASSERT_TRUE(cuda_kernel->multiply(d_A_cuda, d_C_cuda, M, N, K_LOCAL));
+            ASSERT_TRUE(with_gpu_coherence(
+                cuda_dev_,
+                {input_cuda.get()},
+                {partial_cuda.get()},
+                [&]
+                {
+                    return cuda_kernel->multiply_tensor(input_cuda.get(), partial_cuda.get(), M, N, K_LOCAL);
+                }));
             cuda_backend->synchronize(cuda_dev_.ordinal);
             auto cuda_end = std::chrono::high_resolution_clock::now();
             cuda_ms = std::chrono::duration<double, std::milli>(cuda_end - cuda_start).count();
-
-            // Download CUDA result
-            ASSERT_TRUE(cuda_backend->deviceToHost(partial_cuda->mutable_data(), d_C_cuda,
-                                                   output_bytes, cuda_dev_.ordinal));
 
             // === AMD GPU: ROCmFloatingPointGemmKernel ===
             LOG_INFO("Setting up AMD GPU (ROCm device " << rocm_dev_.ordinal << ")...");
@@ -706,15 +690,6 @@ namespace llaminar2
             // Upload weight to AMD GPU
             ASSERT_TRUE(weight_amd->ensureOnDevice(rocm_dev_));
             EXPECT_TRUE(weight_amd->isOnGPU());
-
-            // Allocate activations and output on AMD via IBackend
-            float *d_A_rocm = static_cast<float *>(rocm_backend->allocate(input_local_bytes, rocm_dev_.ordinal));
-            float *d_C_rocm = static_cast<float *>(rocm_backend->allocate(output_bytes, rocm_dev_.ordinal));
-            ASSERT_NE(d_A_rocm, nullptr);
-            ASSERT_NE(d_C_rocm, nullptr);
-
-            ASSERT_TRUE(rocm_backend->hostToDevice(d_A_rocm, input_amd->data(), input_local_bytes, rocm_dev_.ordinal));
-            ASSERT_TRUE(rocm_backend->memset(d_C_rocm, 0, output_bytes, rocm_dev_.ordinal));
 
             // Create ACTUAL ROCm GEMM kernel
             auto rocm_kernel = llaminar::v2::kernels::KernelFactory::createGemm(
@@ -724,14 +699,17 @@ namespace llaminar2
             // Execute ROCm GEMM
             LOG_INFO("Executing ROCm GEMM: [" << M << "," << K_LOCAL << "] @ [" << N << "," << K_LOCAL << "]^T");
             auto rocm_start = std::chrono::high_resolution_clock::now();
-            ASSERT_TRUE(rocm_kernel->multiply(d_A_rocm, d_C_rocm, M, N, K_LOCAL));
+            ASSERT_TRUE(with_gpu_coherence(
+                rocm_dev_,
+                {input_amd.get()},
+                {partial_amd.get()},
+                [&]
+                {
+                    return rocm_kernel->multiply_tensor(input_amd.get(), partial_amd.get(), M, N, K_LOCAL);
+                }));
             rocm_backend->synchronize(rocm_dev_.ordinal);
             auto rocm_end = std::chrono::high_resolution_clock::now();
             rocm_ms = std::chrono::duration<double, std::milli>(rocm_end - rocm_start).count();
-
-            // Download ROCm result
-            ASSERT_TRUE(rocm_backend->deviceToHost(partial_amd->mutable_data(), d_C_rocm,
-                                                   output_bytes, rocm_dev_.ordinal));
 
             LOG_INFO("GPU GEMM completed:");
             LOG_INFO("  CUDA time: " << cuda_ms << " ms");
@@ -758,10 +736,6 @@ namespace llaminar2
 
             // Cleanup GPU memory
             cuda_backend->free(cuda_buf, cuda_dev_.ordinal);
-            cuda_backend->free(d_A_cuda, cuda_dev_.ordinal);
-            cuda_backend->free(d_C_cuda, cuda_dev_.ordinal);
-            rocm_backend->free(d_A_rocm, rocm_dev_.ordinal);
-            rocm_backend->free(d_C_rocm, rocm_dev_.ordinal);
 
             // Perform AllReduce SUM
             auto output_reduced = TestTensorFactory::createFP32Zeros({M, N});

@@ -185,14 +185,14 @@ namespace llaminar2
             float rope_theta = 10000.0f,
             int device_idx = -1);
 
-        // ITensorRoPE interface - apply() for FP32
+        // Legacy FP32 apply - no longer part of ITensorRoPE interface
         bool apply(
             float *data, float *output,
             const int *pos_ids,
             int batch_size, int seq_len, int head_dim, int num_heads,
             float theta_base, bool interleaved,
             const MPIContext *mpi_ctx = nullptr,
-            int device_idx = -1) override;
+            int device_idx = -1);
 
         // ITensorRoPE interface - apply_tensor() with automatic dispatch
         bool apply_tensor(
@@ -255,35 +255,12 @@ namespace llaminar2
             float rope_theta = 10000.0f,
             int device_idx = -1);
 
-        // ITensorRoPE interface - apply() stub (required pure virtual)
-        bool apply(
-            float *data, float *output,
-            const int *pos_ids,
-            int batch_size, int seq_len, int head_dim, int num_heads,
-            float theta_base, bool interleaved,
-            const MPIContext *mpi_ctx = nullptr,
-            int device_idx = -1) override
-        {
-            (void)data;
-            (void)output;
-            (void)pos_ids;
-            (void)batch_size;
-            (void)seq_len;
-            (void)head_dim;
-            (void)num_heads;
-            (void)theta_base;
-            (void)interleaved;
-            (void)mpi_ctx;
-            (void)device_idx;
-            return false; // BF16 kernel doesn't support FP32 interface
-        }
-
-        // ITensorRoPE interface - apply_bf16() for BF16
+        // Legacy BF16 apply_bf16 - no longer part of ITensorRoPE interface
         bool apply_bf16(
             uint16_t *data, uint16_t *output,
             const int *pos_ids,
             int batch_size, int seq_len, int head_dim, int num_heads,
-            float theta_base, int device_idx) override;
+            float theta_base, int device_idx);
 
         // ITensorRoPE interface - apply_tensor() with automatic dispatch
         bool apply_tensor(
@@ -346,35 +323,12 @@ namespace llaminar2
             float rope_theta = 10000.0f,
             int device_idx = -1);
 
-        // ITensorRoPE interface - apply() stub (required pure virtual)
-        bool apply(
-            float *data, float *output,
-            const int *pos_ids,
-            int batch_size, int seq_len, int head_dim, int num_heads,
-            float theta_base, bool interleaved,
-            const MPIContext *mpi_ctx = nullptr,
-            int device_idx = -1) override
-        {
-            (void)data;
-            (void)output;
-            (void)pos_ids;
-            (void)batch_size;
-            (void)seq_len;
-            (void)head_dim;
-            (void)num_heads;
-            (void)theta_base;
-            (void)interleaved;
-            (void)mpi_ctx;
-            (void)device_idx;
-            return false; // FP16 kernel doesn't support FP32 interface
-        }
-
-        // ITensorRoPE interface - apply_fp16() for FP16
+        // Legacy FP16 apply_fp16 - no longer part of ITensorRoPE interface
         bool apply_fp16(
             uint16_t *data, uint16_t *output,
             const int *pos_ids,
             int batch_size, int seq_len, int head_dim, int num_heads,
-            float theta_base, int device_idx) override;
+            float theta_base, int device_idx);
 
         // ITensorRoPE interface - apply_tensor() with automatic dispatch
         bool apply_tensor(
@@ -447,35 +401,12 @@ namespace llaminar2
             float rope_theta = 10000.0f,
             int device_idx = -1);
 
-        // ITensorRoPE interface - apply() stub (required pure virtual)
-        bool apply(
-            float *data, float *output,
-            const int *pos_ids,
-            int batch_size, int seq_len, int head_dim, int num_heads,
-            float theta_base, bool interleaved,
-            const MPIContext *mpi_ctx = nullptr,
-            int device_idx = -1) override
-        {
-            (void)data;
-            (void)output;
-            (void)pos_ids;
-            (void)batch_size;
-            (void)seq_len;
-            (void)head_dim;
-            (void)num_heads;
-            (void)theta_base;
-            (void)interleaved;
-            (void)mpi_ctx;
-            (void)device_idx;
-            return false; // Q8_1 kernel doesn't support FP32 interface
-        }
-
-        // ITensorRoPE interface - apply_q8_1() for Q8_1
+        // Legacy Q8_1 apply_q8_1 - no longer part of ITensorRoPE interface
         bool apply_q8_1(
             void *data, void *output,
             const int *pos_ids,
             int batch_size, int seq_len, int head_dim, int num_heads,
-            float theta_base, int device_idx) override;
+            float theta_base, int device_idx);
 
         // ITensorRoPE interface - apply_tensor() with automatic dispatch
         bool apply_tensor(
@@ -657,35 +588,12 @@ namespace llaminar2
             float rope_theta = 10000.0f,
             int device_idx = -1);
 
-        // ITensorRoPE interface - apply() stub (required pure virtual)
-        bool apply(
-            float *data, float *output,
-            const int *pos_ids,
-            int batch_size, int seq_len, int head_dim, int num_heads,
-            float theta_base, bool interleaved,
-            const MPIContext *mpi_ctx = nullptr,
-            int device_idx = -1) override
-        {
-            (void)data;
-            (void)output;
-            (void)pos_ids;
-            (void)batch_size;
-            (void)seq_len;
-            (void)head_dim;
-            (void)num_heads;
-            (void)theta_base;
-            (void)interleaved;
-            (void)mpi_ctx;
-            (void)device_idx;
-            return false; // Q16_1 kernel doesn't support FP32 interface
-        }
-
-        // ITensorRoPE interface - apply_q16_1() for Q16_1
+        // Legacy Q16_1 apply_q16_1 - no longer part of ITensorRoPE interface
         bool apply_q16_1(
             void *Q_data, void *K_data,
             const int *pos_ids,
             int seq_len, int n_heads, int n_kv_heads, int head_dim,
-            float theta_base, int device_idx) override;
+            float theta_base, int device_idx);
 
         // ITensorRoPE interface - apply_tensor() with automatic dispatch
         // Dispatches to correct block size based on Q16_1Tensor::q16_block_size()

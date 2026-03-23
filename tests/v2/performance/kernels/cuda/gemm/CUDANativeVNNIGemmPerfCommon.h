@@ -19,6 +19,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <functional>
 #include <limits>
 #include <memory>
@@ -440,35 +441,25 @@ namespace llaminar2::test::native_vnni_gemm_perf
         }
 
         auto h_input = TestTensorFactory::createFP32Random({static_cast<size_t>(m), static_cast<size_t>(k)}, -0.25f, 0.25f, 7);
-        const float *h_input_data = h_input->data();
 
-        const size_t a_bytes = static_cast<size_t>(m) * k * sizeof(float);
-        const size_t c_bytes = static_cast<size_t>(m) * n * sizeof(float);
-        float *d_a = nullptr;
-        float *d_c = nullptr;
-        if (cudaMalloc(&d_a, a_bytes) != cudaSuccess)
-            throw std::runtime_error("cudaMalloc d_a failed");
-        if (cudaMalloc(&d_c, c_bytes) != cudaSuccess)
-        {
-            cudaFree(d_a);
-            throw std::runtime_error("cudaMalloc d_c failed");
-        }
-        if (cudaMemcpy(d_a, h_input_data, a_bytes, cudaMemcpyHostToDevice) != cudaSuccess)
-        {
-            cudaFree(d_a);
-            cudaFree(d_c);
-            throw std::runtime_error("cudaMemcpy d_a failed");
-        }
+        // Create tensor wrappers and upload to GPU
+        auto A_tensor = std::make_unique<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(m), static_cast<size_t>(k)});
+        std::memcpy(A_tensor->mutable_data(), h_input->data(), static_cast<size_t>(m) * k * sizeof(float));
+        auto C_tensor = std::make_unique<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(m), static_cast<size_t>(n)});
+
+        DeviceId gpu_device(DeviceType::CUDA, 0);
+        if (!A_tensor->ensureOnDevice(gpu_device))
+            throw std::runtime_error("ensureOnDevice A failed");
+        if (!C_tensor->ensureOnDevice(gpu_device))
+            throw std::runtime_error("ensureOnDevice C failed");
 
         std::vector<double> times_us;
         times_us.reserve(static_cast<size_t>(bench_runs));
 
         for (int i = 0; i < warmup_runs; ++i)
         {
-            if (!kernel->multiply(d_a, d_c, m, n, k))
+            if (!kernel->multiply_tensor(A_tensor.get(), C_tensor.get(), m, n, k))
             {
-                cudaFree(d_a);
-                cudaFree(d_c);
                 throw std::runtime_error("CUDA native-vnni GEMM warmup failed");
             }
         }
@@ -479,13 +470,11 @@ namespace llaminar2::test::native_vnni_gemm_perf
             cudaEvent_t stop = nullptr;
             if (cudaEventCreate(&start) != cudaSuccess || cudaEventCreate(&stop) != cudaSuccess)
             {
-                cudaFree(d_a);
-                cudaFree(d_c);
                 throw std::runtime_error("cudaEventCreate failed");
             }
 
             cudaEventRecord(start);
-            const bool ok = kernel->multiply(d_a, d_c, m, n, k);
+            const bool ok = kernel->multiply_tensor(A_tensor.get(), C_tensor.get(), m, n, k);
             cudaEventRecord(stop);
             cudaEventSynchronize(stop);
 
@@ -496,8 +485,6 @@ namespace llaminar2::test::native_vnni_gemm_perf
 
             if (!ok)
             {
-                cudaFree(d_a);
-                cudaFree(d_c);
                 throw std::runtime_error("CUDA native-vnni GEMM bench run failed");
             }
 
@@ -506,15 +493,8 @@ namespace llaminar2::test::native_vnni_gemm_perf
 
         RunResult result;
         result.output.resize(static_cast<size_t>(m) * n);
-        if (cudaMemcpy(result.output.data(), d_c, c_bytes, cudaMemcpyDeviceToHost) != cudaSuccess)
-        {
-            cudaFree(d_a);
-            cudaFree(d_c);
-            throw std::runtime_error("cudaMemcpy d_c failed");
-        }
-
-        cudaFree(d_a);
-        cudaFree(d_c);
+        C_tensor->mark_device_dirty();
+        std::memcpy(result.output.data(), C_tensor->data(), static_cast<size_t>(m) * n * sizeof(float));
 
         if (workspace_consumer)
             workspace_consumer->unbindWorkspace();

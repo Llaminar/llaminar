@@ -90,11 +90,11 @@ namespace llaminar2
                 float epsilon = 1e-6f,
                 bool use_bf16 = false,
                 const MPIContext *mpi_ctx = nullptr,
-                int device_idx = -1) override;
+                int device_idx = -1);
 
             bool apply_bf16(
                 const uint16_t *input, const float *weight, uint16_t *output,
-                int rows, int cols, float epsilon = 1e-6f, int device_idx = -1) override
+                int rows, int cols, float epsilon = 1e-6f, int device_idx = -1)
             {
                 (void)input;
                 (void)weight;
@@ -108,7 +108,7 @@ namespace llaminar2
 
             bool apply_fp16(
                 const uint16_t *input, const float *weight, uint16_t *output,
-                int rows, int cols, float epsilon = 1e-6f, int device_idx = -1) override
+                int rows, int cols, float epsilon = 1e-6f, int device_idx = -1)
             {
                 (void)input;
                 (void)weight;
@@ -122,7 +122,7 @@ namespace llaminar2
 
             bool apply_q8_1(
                 const Q8_1Block *input, const float *weight, Q8_1Block *output,
-                int rows, int cols, float epsilon = 1e-6f, int device_idx = -1) override
+                int rows, int cols, float epsilon = 1e-6f, int device_idx = -1)
             {
                 (void)input;
                 (void)weight;
@@ -202,7 +202,7 @@ namespace llaminar2
                 float epsilon = 1e-6f,
                 bool use_bf16 = false,
                 const MPIContext *mpi_ctx = nullptr,
-                int device_idx = -1) override
+                int device_idx = -1)
             {
                 (void)input;
                 (void)weight;
@@ -218,11 +218,11 @@ namespace llaminar2
 
             bool apply_bf16(
                 const uint16_t *input, const float *weight, uint16_t *output,
-                int rows, int cols, float epsilon = 1e-6f, int device_idx = -1) override;
+                int rows, int cols, float epsilon = 1e-6f, int device_idx = -1);
 
             bool apply_fp16(
                 const uint16_t *input, const float *weight, uint16_t *output,
-                int rows, int cols, float epsilon = 1e-6f, int device_idx = -1) override
+                int rows, int cols, float epsilon = 1e-6f, int device_idx = -1)
             {
                 (void)input;
                 (void)weight;
@@ -236,7 +236,7 @@ namespace llaminar2
 
             bool apply_q8_1(
                 const Q8_1Block *input, const float *weight, Q8_1Block *output,
-                int rows, int cols, float epsilon = 1e-6f, int device_idx = -1) override
+                int rows, int cols, float epsilon = 1e-6f, int device_idx = -1)
             {
                 (void)input;
                 (void)weight;
@@ -316,7 +316,7 @@ namespace llaminar2
                 float epsilon = 1e-6f,
                 bool use_bf16 = false,
                 const MPIContext *mpi_ctx = nullptr,
-                int device_idx = -1) override
+                int device_idx = -1)
             {
                 (void)input;
                 (void)weight;
@@ -332,7 +332,7 @@ namespace llaminar2
 
             bool apply_bf16(
                 const uint16_t *input, const float *weight, uint16_t *output,
-                int rows, int cols, float epsilon = 1e-6f, int device_idx = -1) override
+                int rows, int cols, float epsilon = 1e-6f, int device_idx = -1)
             {
                 (void)input;
                 (void)weight;
@@ -346,11 +346,11 @@ namespace llaminar2
 
             bool apply_fp16(
                 const uint16_t *input, const float *weight, uint16_t *output,
-                int rows, int cols, float epsilon = 1e-6f, int device_idx = -1) override;
+                int rows, int cols, float epsilon = 1e-6f, int device_idx = -1);
 
             bool apply_q8_1(
                 const Q8_1Block *input, const float *weight, Q8_1Block *output,
-                int rows, int cols, float epsilon = 1e-6f, int device_idx = -1) override
+                int rows, int cols, float epsilon = 1e-6f, int device_idx = -1)
             {
                 (void)input;
                 (void)weight;

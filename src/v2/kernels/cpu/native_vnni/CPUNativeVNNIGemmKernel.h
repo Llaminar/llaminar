@@ -90,17 +90,20 @@ namespace llaminar2::cpu::native_vnni
         /**
          * @brief C[m×n] = A[m×k] @ B_packed[n×k]^T
          *
+         * Primary tensor-aware GEMM entry point.
          * For M=1: dispatches to optimized GEMV path.
-         * For M>1: dispatches to row-by-row GEMV (phase 1; tiled GEMM is phase 2).
+         * For M>1: dispatches to tiled GEMM path.
          */
-        bool multiply(
-            const float *A, float *C,
+        bool multiply_tensor(
+            const TensorBase *A, TensorBase *C,
             int m, int n, int k,
             bool transpose_B = true,
             float alpha = 1.0f, float beta = 0.0f,
+            const TensorBase *bias = nullptr,
             const MPIContext *mpi_ctx = nullptr,
             int device_idx = -1,
-            DeviceWorkspaceManager *workspace = nullptr) override
+            DeviceWorkspaceManager *workspace = nullptr,
+            int activation_row_offset = 0) override
         {
             (void)transpose_B;
             (void)mpi_ctx;
@@ -117,15 +120,14 @@ namespace llaminar2::cpu::native_vnni
                 return false;
             }
 
+            const float *A_data = A->data() + static_cast<size_t>(activation_row_offset) * k;
+            float *C_data = C->mutable_data();
+
             // Handle beta scaling of existing C
             if (beta != 0.0f && beta != 1.0f)
             {
                 for (int i = 0; i < m * n; ++i)
-                    C[i] *= beta;
-            }
-            else if (beta == 0.0f)
-            {
-                // GEMM will overwrite C completely
+                    C_data[i] *= beta;
             }
 
             if (m == 1)
@@ -133,60 +135,35 @@ namespace llaminar2::cpu::native_vnni
                 // Optimized GEMV path
                 if (beta == 0.0f && alpha == 1.0f)
                 {
-                    gemv_native_vnni(packed_, A, C);
+                    gemv_native_vnni(packed_, A_data, C_data);
                 }
                 else
                 {
                     // General case: C = alpha * A@B + beta * C
-                    // Use temp buffer for raw GEMV result, then blend
                     std::vector<float> temp(n);
-                    gemv_native_vnni(packed_, A, temp.data());
+                    gemv_native_vnni(packed_, A_data, temp.data());
                     for (int j = 0; j < n; ++j)
-                        C[j] += alpha * temp[j];
+                        C_data[j] += alpha * temp[j];
                 }
             }
             else
             {
-                // M>1: row-by-row GEMV for now
+                // M>1: tiled GEMM
                 if (beta == 0.0f && alpha == 1.0f)
                 {
-                    gemm_native_vnni(packed_, A, C, m, n);
+                    gemm_native_vnni(packed_, A_data, C_data, m, n);
                 }
                 else
                 {
                     std::vector<float> temp(n);
                     for (int row = 0; row < m; ++row)
                     {
-                        gemv_native_vnni(packed_, A + row * k, temp.data());
+                        gemv_native_vnni(packed_, A_data + row * k, temp.data());
                         for (int j = 0; j < n; ++j)
-                            C[row * n + j] += alpha * temp[j];
+                            C_data[row * n + j] += alpha * temp[j];
                     }
                 }
             }
-
-            return true;
-        }
-
-        /**
-         * @brief Tensor-aware multiply (delegates to raw multiply)
-         */
-        bool multiply_tensor(
-            const TensorBase *A, TensorBase *C,
-            int m, int n, int k,
-            bool transpose_B = true,
-            float alpha = 1.0f, float beta = 0.0f,
-            const TensorBase *bias = nullptr,
-            const MPIContext *mpi_ctx = nullptr,
-            int device_idx = -1,
-            DeviceWorkspaceManager *workspace = nullptr,
-            int activation_row_offset = 0) override
-        {
-            const float *A_data = A->data() + activation_row_offset * k;
-            float *C_data = C->mutable_data();
-
-            bool success = multiply(A_data, C_data, m, n, k, transpose_B, alpha, beta, mpi_ctx, device_idx, workspace);
-            if (!success)
-                return false;
 
             // Apply bias epilogue: C[m, j] += bias[j]
             if (bias)
@@ -196,60 +173,6 @@ namespace llaminar2::cpu::native_vnni
             }
 
             return true;
-        }
-
-        /**
-         * @brief Activation-activation multiply (not applicable for weight GEMM).
-         */
-        bool multiply_activations(
-            const float *A, const float *B, float *C,
-            int m, int n, int k,
-            bool transpose_B = true,
-            float alpha = 1.0f, float beta = 0.0f,
-            const MPIContext *mpi_ctx = nullptr,
-            int device_idx = -1) override
-        {
-            (void)A;
-            (void)B;
-            (void)C;
-            (void)m;
-            (void)n;
-            (void)k;
-            (void)transpose_B;
-            (void)alpha;
-            (void)beta;
-            (void)mpi_ctx;
-            (void)device_idx;
-            return false; // Not applicable for weight GEMM
-        }
-
-        /**
-         * @brief Strided activation-activation multiply (not applicable for weight GEMM).
-         */
-        bool multiply_activations_strided(
-            const float *A, const float *B, float *C,
-            int m, int n, int k,
-            int lda, int ldb, int ldc,
-            bool transpose_B = true,
-            float alpha = 1.0f, float beta = 0.0f,
-            const MPIContext *mpi_ctx = nullptr,
-            int device_idx = -1) override
-        {
-            (void)A;
-            (void)B;
-            (void)C;
-            (void)m;
-            (void)n;
-            (void)k;
-            (void)lda;
-            (void)ldb;
-            (void)ldc;
-            (void)transpose_B;
-            (void)alpha;
-            (void)beta;
-            (void)mpi_ctx;
-            (void)device_idx;
-            return false; // Not applicable for weight GEMM
         }
 
         // -------------------------------------------------------------------
@@ -293,13 +216,14 @@ namespace llaminar2::cpu::native_vnni
 
             // Apply SwiGLU to get the GEMM input: temp = silu(gate) * up  [m, k]
             const size_t input_size = static_cast<size_t>(m) * k;
-            std::vector<float> swiglu_input(input_size);
-            primitives::compute_swiglu(gate_fp32, up_fp32, swiglu_input.data(),
+            auto swiglu_tensor = std::make_unique<FP32Tensor>(
+                std::vector<size_t>{static_cast<size_t>(m), static_cast<size_t>(k)});
+            primitives::compute_swiglu(gate_fp32, up_fp32, swiglu_tensor->mutable_data(),
                                        static_cast<int>(input_size));
 
             // GEMM: output = W_down @ swiglu_input
-            return multiply(swiglu_input.data(), output_fp32, m, n, k,
-                            true, alpha, beta, nullptr, -1, nullptr);
+            return multiply_tensor(swiglu_tensor.get(), output, m, n, k,
+                                   true, alpha, beta);
         }
 
         // -------------------------------------------------------------------
@@ -308,86 +232,6 @@ namespace llaminar2::cpu::native_vnni
 
         bool supports_fused_projection() const override
         {
-            return true;
-        }
-
-        bool multiply_fused(
-            const float *input,
-            const std::vector<FusedProjectionDesc> &projections,
-            int m, int k,
-            const MPIContext *mpi_ctx = nullptr,
-            int device_idx = -1,
-            DeviceWorkspaceManager *workspace = nullptr) override
-        {
-            (void)mpi_ctx;
-            (void)workspace;
-
-            if (!valid_ || device_idx != -1)
-                return false;
-
-            // Pre-quantize input once (shared across all projections)
-            const int K_blocks = (k + 31) / 32;
-            std::vector<Q8_1Block> shared_q8(static_cast<size_t>(m) * K_blocks);
-
-            if (m == 1)
-            {
-                // Single-row: quantize on current thread
-                const bool k_aligned = (k % 32 == 0);
-                int kb = 0;
-#if defined(__AVX512F__)
-                if (k_aligned)
-                {
-                    for (; kb + 1 < K_blocks; kb += 2)
-                        simd::quantize_two_blocks_avx512(input + kb * 32, shared_q8[kb], shared_q8[kb + 1]);
-                }
-#endif
-                for (; kb < K_blocks; ++kb)
-                {
-                    int block_start = kb * 32;
-                    int block_len = std::min(32, k - block_start);
-                    simd::quantize_single_block(input + block_start, shared_q8[kb], block_len);
-                }
-            }
-            else
-            {
-                // Multi-row: parallel quantization
-                quantize_activations_to_q8_1(input, shared_q8.data(), m, k, K_blocks);
-            }
-
-            // Run each projection using the shared Q8_1 buffer + apply epilogues
-            for (const auto &proj : projections)
-            {
-                if (!proj.kernel)
-                    return false;
-
-                // Check if this projection uses OUR packed weights
-                auto *vnni_kernel = dynamic_cast<CPUNativeVNNIGemmKernel *>(proj.kernel);
-                if (vnni_kernel && vnni_kernel->valid_)
-                {
-                    // Fast path: use pre-quantized GEMV/GEMM directly
-                    const auto &proj_packed = vnni_kernel->packed_;
-                    if (m == 1)
-                        gemv_native_vnni_preq(proj_packed, shared_q8.data(), proj.output);
-                    else
-                        gemm_native_vnni_preq(proj_packed, shared_q8.data(), proj.output, m, proj.n);
-                }
-                else
-                {
-                    // Fallback: use generic multiply (re-quantizes internally)
-                    bool success = proj.kernel->multiply(
-                        input, proj.output, m, proj.n, k,
-                        true, 1.0f, 0.0f, mpi_ctx, device_idx, workspace);
-                    if (!success)
-                        return false;
-                }
-
-                // Apply bias epilogue
-                if (proj.bias)
-                {
-                    const float *bias_data = proj.bias->data();
-                    apply_bias_epilogue(proj.output, bias_data, m, proj.n, proj.n);
-                }
-            }
             return true;
         }
 

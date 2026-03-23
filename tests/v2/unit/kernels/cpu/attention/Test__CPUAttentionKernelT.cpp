@@ -126,23 +126,22 @@ namespace
         auto *activation = dynamic_cast<IActivationTensor *>(Q_tensor.get());
         auto kernel = activation->createAttention();
 
-        // Execute kernel using the correct ITensorAttention interface
-        bool success = kernel->compute(
-            Q,
-            K,
-            V,
-            output,
-            seq_len,
+        // Execute kernel using the ITensorAttention::compute_tensor interface
+        bool success = kernel->compute_tensor(
+            Q_tensor.get(),
+            K_tensor.get(),
+            V_tensor.get(),
+            output_tensor.get(),
+            1,       // batch_size
+            seq_len, // seq_len
+            seq_len, // kv_len (same as seq_len for prefill)
             n_heads,
             n_kv_heads,
             head_dim,
             false,   // causal
             -1,      // window_size
             nullptr, // workspace_scores
-            nullptr, // workspace_buffer
-            nullptr, // workspace_context
             nullptr, // workspace_mask
-            false,   // use_bf16
             &mpi_ctx_,
             -1 // device_idx
         );

@@ -273,9 +273,9 @@ protected:
 };
 
 /**
- * @test FP32Tensor ensureOnDevice with CPU target (should fail, ensureOnDevice is for GPU)
+ * @test FP32Tensor ensureOnDevice with CPU target (no-op, returns true)
  */
-TEST_F(Test__MultiGPU_TensorTransfer, FP32_EnsureOnCPU_Fails)
+TEST_F(Test__MultiGPU_TensorTransfer, FP32_EnsureOnCPU_Succeeds)
 {
     std::vector<size_t> shape = {8, 16};
     auto tensor = std::make_unique<FP32Tensor>(shape, DeviceId::cpu()); // CPU tensor
@@ -287,10 +287,10 @@ TEST_F(Test__MultiGPU_TensorTransfer, FP32_EnsureOnCPU_Fails)
         data[i] = static_cast<float>(i);
     }
 
-    // ensureOnDevice with CPU DeviceId should fail (ensureOnDevice is for GPU targets)
+    // ensureOnDevice with CPU DeviceId is a no-op (data already on host)
     DeviceId cpu_device = DeviceId::cpu();
     bool success = tensor->ensureOnDevice(cpu_device);
-    EXPECT_FALSE(success) << "ensureOnDevice(DeviceId::cpu()) should fail - use ensureOnHost() for CPU";
+    EXPECT_TRUE(success) << "ensureOnDevice(CPU) should succeed as a no-op";
 
     // Data should still be accessible
     EXPECT_FLOAT_EQ(tensor->data()[0], 0.0f);

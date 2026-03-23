@@ -79,7 +79,7 @@ namespace llaminar2
             int d_model,
             float *output,
             const MPIContext *mpi_ctx = nullptr,
-            int device_idx = -1) override;
+            int device_idx = -1);
 
         // ITensorEmbedding interface - BF16 output
         bool apply_bf16(
@@ -89,7 +89,7 @@ namespace llaminar2
             int d_model,
             uint16_t *output,
             const MPIContext *mpi_ctx = nullptr,
-            int device_idx = -1) override;
+            int device_idx = -1);
 
         // ITensorEmbedding interface - FP16 output
         bool apply_fp16(
@@ -99,7 +99,7 @@ namespace llaminar2
             int d_model,
             uint16_t *output,
             const MPIContext *mpi_ctx = nullptr,
-            int device_idx = -1) override;
+            int device_idx = -1);
 
         // ITensorEmbedding interface - Q8_1 output
         bool apply_q8_1(
@@ -109,7 +109,7 @@ namespace llaminar2
             int d_model,
             void *output,
             const MPIContext *mpi_ctx = nullptr,
-            int device_idx = -1) override;
+            int device_idx = -1);
 
         // ITensorEmbedding interface - tensor-based dispatch
         bool apply_tensor(

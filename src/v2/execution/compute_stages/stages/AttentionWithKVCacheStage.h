@@ -7,9 +7,11 @@
 
 #include "../IComputeStage.h"
 #include "../StageParamsBase.h"
+#include <memory>
 
 namespace llaminar2
 {
+    class FP32Tensor; // Forward declaration for decode FP32 buffers
 
     /**
      * @brief Production attention stage with KV cache and MPI support
@@ -105,6 +107,12 @@ namespace llaminar2
         Params params_;
         ITensorAttention *cached_kernel_ = nullptr;
         int cached_kernel_tensor_type_ = -1;
+
+        // Persistent FP32 decode buffers for incremental FP16→FP32 conversion.
+        // Avoids per-call heap allocation + full re-conversion of the entire KV cache.
+        std::unique_ptr<FP32Tensor> decode_k_fp32_;
+        std::unique_ptr<FP32Tensor> decode_v_fp32_;
+        int decode_kv_fp32_rows_ = 0;
 
         ITensorAttention *getOrCreateKernel(const ITensor *tensor);
 

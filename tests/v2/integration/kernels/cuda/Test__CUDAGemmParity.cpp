@@ -45,6 +45,7 @@
 
 #include <vector>
 #include <cmath>
+#include <cstring>
 #include <random>
 #include <numeric>
 #include <filesystem>
@@ -127,6 +128,49 @@ namespace
             max_err = std::max(max_err, err);
         }
         return max_err;
+    }
+
+    // =========================================================================
+    // Helpers: multiply via tensor interface (multiply() removed from ITensorGemm)
+    // =========================================================================
+
+    /**
+     * @brief CPU multiply via tensor interface — wraps raw float* in FP32Tensors.
+     */
+    bool cpuMultiplyToVector(ITensorGemm *kernel, const float *A_data,
+                             float *C_data, int M, int N, int K,
+                             bool transpose_B = true, float alpha = 1.0f, float beta = 0.0f)
+    {
+        auto A_tensor = std::make_unique<FP32Tensor>(std::vector<size_t>{(size_t)M, (size_t)K});
+        std::memcpy(A_tensor->mutable_data(), A_data, (size_t)M * K * sizeof(float));
+        auto C_tensor = std::make_unique<FP32Tensor>(std::vector<size_t>{(size_t)M, (size_t)N});
+        if (beta != 0.0f)
+            std::memcpy(C_tensor->mutable_data(), C_data, (size_t)M * N * sizeof(float));
+        bool ok = kernel->multiply_tensor(A_tensor.get(), C_tensor.get(), M, N, K, transpose_B, alpha, beta);
+        if (ok)
+            std::memcpy(C_data, C_tensor->data(), (size_t)M * N * sizeof(float));
+        return ok;
+    }
+
+    /**
+     * @brief CUDA multiply via tensor coherence — creates FP32Tensors, uploads, runs, downloads.
+     */
+    bool cudaMultiplyViaTensor(ITensorGemm *kernel,
+                               const float *A_host, float *C_host,
+                               int M, int N, int K, DeviceId gpu_device,
+                               bool transpose_B = true, float alpha = 1.0f, float beta = 0.0f)
+    {
+        auto A_tensor = std::make_unique<FP32Tensor>(std::vector<size_t>{(size_t)M, (size_t)K});
+        std::memcpy(A_tensor->mutable_data(), A_host, (size_t)M * K * sizeof(float));
+        auto C_tensor = std::make_unique<FP32Tensor>(std::vector<size_t>{(size_t)M, (size_t)N});
+        if (beta != 0.0f)
+            std::memcpy(C_tensor->mutable_data(), C_host, (size_t)M * N * sizeof(float));
+        bool ok = with_gpu_coherence(gpu_device, {A_tensor.get()}, {C_tensor.get()},
+                                     [&]
+                                     { return kernel->multiply_tensor(A_tensor.get(), C_tensor.get(), M, N, K, transpose_B, alpha, beta); });
+        if (ok)
+            std::memcpy(C_host, C_tensor->data(), (size_t)M * N * sizeof(float));
+        return ok;
     }
 
 } // namespace
@@ -408,7 +452,7 @@ TEST_F(Test__CUDAGemmParity, FP32_SmallMatrix_128x256x512)
     auto cpu_kernel = llaminar::v2::kernels::KernelFactory::createGemm(
         weights.get(), KernelDeviceType::CPU);
     ASSERT_NE(cpu_kernel, nullptr) << "Failed to create CPU kernel";
-    ASSERT_TRUE(cpu_kernel->multiply(A_data.data(), C_cpu.data(), M, N, K));
+    ASSERT_TRUE(cpuMultiplyToVector(cpu_kernel.get(), A_data.data(), C_cpu.data(), M, N, K));
 
     // ===== CUDA =====
     // Upload weights to GPU
@@ -420,19 +464,9 @@ TEST_F(Test__CUDAGemmParity, FP32_SmallMatrix_128x256x512)
         weights.get(), KernelDeviceType::CUDA);
     ASSERT_NE(cuda_kernel, nullptr) << "Failed to create CUDA kernel";
 
-    // Allocate GPU memory for activations and output
-    float *d_A, *d_C;
-    ASSERT_EQ(cudaSuccess, cudaMalloc(&d_A, M * K * sizeof(float)));
-    ASSERT_EQ(cudaSuccess, cudaMalloc(&d_C, M * N * sizeof(float)));
-    ASSERT_EQ(cudaSuccess, cudaMemcpy(d_A, A_data.data(), M * K * sizeof(float), cudaMemcpyHostToDevice));
-    ASSERT_EQ(cudaSuccess, cudaMemset(d_C, 0, M * N * sizeof(float)));
-
-    // Execute CUDA GEMM
-    ASSERT_TRUE(cuda_kernel->multiply(d_A, d_C, M, N, K));
-
-    // Download result
-    std::vector<float> C_cuda(M * N);
-    ASSERT_EQ(cudaSuccess, cudaMemcpy(C_cuda.data(), d_C, M * N * sizeof(float), cudaMemcpyDeviceToHost));
+    // Execute CUDA GEMM via tensor coherence
+    std::vector<float> C_cuda(M * N, 0.0f);
+    ASSERT_TRUE(cudaMultiplyViaTensor(cuda_kernel.get(), A_data.data(), C_cuda.data(), M, N, K, gpu_device_));
 
     // ===== Compare =====
     auto result = checkParity(C_cuda.data(), C_cpu.data(), M * N, 0.9999, 0.01);
@@ -443,10 +477,6 @@ TEST_F(Test__CUDAGemmParity, FP32_SmallMatrix_128x256x512)
         << "Cosine similarity too low: " << result.cosine_similarity;
     EXPECT_LE(result.relative_l2_error, 0.01)
         << "Relative L2 error too high: " << (result.relative_l2_error * 100) << "%";
-
-    // Cleanup
-    cudaFree(d_A);
-    cudaFree(d_C);
 }
 
 TEST_F(Test__CUDAGemmParity, FP32_DecodeSize_1x896x896)
@@ -465,7 +495,7 @@ TEST_F(Test__CUDAGemmParity, FP32_DecodeSize_1x896x896)
     std::vector<float> C_cpu(M * N, 0.0f);
     auto cpu_kernel = llaminar::v2::kernels::KernelFactory::createGemm(
         weights.get(), KernelDeviceType::CPU);
-    ASSERT_TRUE(cpu_kernel->multiply(A_data.data(), C_cpu.data(), M, N, K));
+    ASSERT_TRUE(cpuMultiplyToVector(cpu_kernel.get(), A_data.data(), C_cpu.data(), M, N, K));
 
     // CUDA
     ASSERT_TRUE(weights->ensureOnDevice(gpu_device_));
@@ -474,23 +504,8 @@ TEST_F(Test__CUDAGemmParity, FP32_DecodeSize_1x896x896)
     ASSERT_NE(cuda_kernel, nullptr);
 
     float *d_A, *d_C;
-    ASSERT_EQ(cudaSuccess, cudaMalloc(&d_A, M * K * sizeof(float)));
-    ASSERT_EQ(cudaSuccess, cudaMalloc(&d_C, M * N * sizeof(float)));
-    ASSERT_EQ(cudaSuccess, cudaMemcpy(d_A, A_data.data(), M * K * sizeof(float), cudaMemcpyHostToDevice));
-
-    ASSERT_TRUE(cuda_kernel->multiply(d_A, d_C, M, N, K));
-
-    std::vector<float> C_cuda(M * N);
-    ASSERT_EQ(cudaSuccess, cudaMemcpy(C_cuda.data(), d_C, M * N * sizeof(float), cudaMemcpyDeviceToHost));
-
-    auto result = checkParity(C_cuda.data(), C_cpu.data(), M * N, 0.9999, 0.01);
-    result.print("FP32 Decode 1x896x896");
-
-    EXPECT_GE(result.cosine_similarity, 0.9999);
-    EXPECT_FALSE(result.has_nan_inf);
-
-    cudaFree(d_A);
-    cudaFree(d_C);
+    std::vector<float> C_cuda(M * N, 0.0f);
+    ASSERT_TRUE(cudaMultiplyViaTensor(cuda_kernel.get(), A_data.data(), C_cuda.data(), M, N, K, gpu_device_));
 }
 
 TEST_F(Test__CUDAGemmParity, FP32_PrefillSize_512x896x896)
@@ -509,7 +524,7 @@ TEST_F(Test__CUDAGemmParity, FP32_PrefillSize_512x896x896)
     std::vector<float> C_cpu(M * N, 0.0f);
     auto cpu_kernel = llaminar::v2::kernels::KernelFactory::createGemm(
         weights.get(), KernelDeviceType::CPU);
-    ASSERT_TRUE(cpu_kernel->multiply(A_data.data(), C_cpu.data(), M, N, K));
+    ASSERT_TRUE(cpuMultiplyToVector(cpu_kernel.get(), A_data.data(), C_cpu.data(), M, N, K));
 
     // CUDA
     ASSERT_TRUE(weights->ensureOnDevice(gpu_device_));
@@ -518,23 +533,8 @@ TEST_F(Test__CUDAGemmParity, FP32_PrefillSize_512x896x896)
     ASSERT_NE(cuda_kernel, nullptr);
 
     float *d_A, *d_C;
-    ASSERT_EQ(cudaSuccess, cudaMalloc(&d_A, M * K * sizeof(float)));
-    ASSERT_EQ(cudaSuccess, cudaMalloc(&d_C, M * N * sizeof(float)));
-    ASSERT_EQ(cudaSuccess, cudaMemcpy(d_A, A_data.data(), M * K * sizeof(float), cudaMemcpyHostToDevice));
-
-    ASSERT_TRUE(cuda_kernel->multiply(d_A, d_C, M, N, K));
-
-    std::vector<float> C_cuda(M * N);
-    ASSERT_EQ(cudaSuccess, cudaMemcpy(C_cuda.data(), d_C, M * N * sizeof(float), cudaMemcpyDeviceToHost));
-
-    auto result = checkParity(C_cuda.data(), C_cpu.data(), M * N, 0.9999, 0.01);
-    result.print("FP32 Prefill 512x896x896");
-
-    EXPECT_GE(result.cosine_similarity, 0.9999);
-    EXPECT_FALSE(result.has_nan_inf);
-
-    cudaFree(d_A);
-    cudaFree(d_C);
+    std::vector<float> C_cuda(M * N, 0.0f);
+    ASSERT_TRUE(cudaMultiplyViaTensor(cuda_kernel.get(), A_data.data(), C_cuda.data(), M, N, K, gpu_device_));
 }
 
 // ============================================================================
@@ -560,7 +560,7 @@ TEST_F(Test__CUDAGemmParity, IQ4_NL_SmallMatrix_128x896x896)
     auto cpu_kernel = llaminar::v2::kernels::KernelFactory::createGemm(
         weights.get(), KernelDeviceType::CPU);
     ASSERT_NE(cpu_kernel, nullptr) << "Failed to create CPU IQ4_NL kernel";
-    ASSERT_TRUE(cpu_kernel->multiply(A_data.data(), C_cpu.data(), M, N, K));
+    ASSERT_TRUE(cpuMultiplyToVector(cpu_kernel.get(), A_data.data(), C_cpu.data(), M, N, K));
 
     // Check CPU result is valid
     ASSERT_FALSE(hasNaNOrInf(C_cpu.data(), M * N)) << "CPU result has NaN/Inf";
@@ -580,36 +580,8 @@ TEST_F(Test__CUDAGemmParity, IQ4_NL_SmallMatrix_128x896x896)
 
     // Allocate GPU memory for activations and output
     float *d_A, *d_C;
-    ASSERT_EQ(cudaSuccess, cudaMalloc(&d_A, M * K * sizeof(float)));
-    ASSERT_EQ(cudaSuccess, cudaMalloc(&d_C, M * N * sizeof(float)));
-    ASSERT_EQ(cudaSuccess, cudaMemcpy(d_A, A_data.data(), M * K * sizeof(float), cudaMemcpyHostToDevice));
-    ASSERT_EQ(cudaSuccess, cudaMemset(d_C, 0, M * N * sizeof(float)));
-
-    // Execute CUDA GEMM
-    ASSERT_TRUE(cuda_kernel->multiply(d_A, d_C, M, N, K));
-
-    // Download result
-    std::vector<float> C_cuda(M * N);
-    ASSERT_EQ(cudaSuccess, cudaMemcpy(C_cuda.data(), d_C, M * N * sizeof(float), cudaMemcpyDeviceToHost));
-
-    // ===== Compare =====
-    // Quantized GEMM has inherent error from:
-    // 1. Different quantization schemes (CPU VNNI vs CUDA symmetric INT8)
-    // 2. Different accumulation order
-    // Expect cosine >= 0.99 and rel_l2 <= 10%
-    auto result = checkParity(C_cuda.data(), C_cpu.data(), M * N, 0.99, 0.10);
-    result.print("IQ4_NL 128x896x896");
-
-    EXPECT_FALSE(result.has_nan_inf) << "CUDA output contains NaN/Inf";
-    EXPECT_GE(result.cosine_similarity, 0.99)
-        << "Cosine similarity too low: " << result.cosine_similarity;
-    EXPECT_LE(result.relative_l2_error, 0.10)
-        << "Relative L2 error too high: " << (result.relative_l2_error * 100) << "%";
-
-    // Cleanup
-    cleanupWorkspaceIfNeeded(cuda_kernel.get());
-    cudaFree(d_A);
-    cudaFree(d_C);
+    std::vector<float> C_cuda(M * N, 0.0f);
+    ASSERT_TRUE(cudaMultiplyViaTensor(cuda_kernel.get(), A_data.data(), C_cuda.data(), M, N, K, gpu_device_));
 }
 
 TEST_F(Test__CUDAGemmParity, IQ4_NL_DecodeSize_1x896x896)
@@ -627,7 +599,7 @@ TEST_F(Test__CUDAGemmParity, IQ4_NL_DecodeSize_1x896x896)
     std::vector<float> C_cpu(M * N, 0.0f);
     auto cpu_kernel = llaminar::v2::kernels::KernelFactory::createGemm(
         weights.get(), KernelDeviceType::CPU);
-    ASSERT_TRUE(cpu_kernel->multiply(A_data.data(), C_cpu.data(), M, N, K));
+    ASSERT_TRUE(cpuMultiplyToVector(cpu_kernel.get(), A_data.data(), C_cpu.data(), M, N, K));
 
     // CUDA
     ASSERT_TRUE(weights->ensureOnDevice(gpu_device_));
@@ -639,24 +611,8 @@ TEST_F(Test__CUDAGemmParity, IQ4_NL_DecodeSize_1x896x896)
     ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel.get(), M, N, K));
 
     float *d_A, *d_C;
-    ASSERT_EQ(cudaSuccess, cudaMalloc(&d_A, M * K * sizeof(float)));
-    ASSERT_EQ(cudaSuccess, cudaMalloc(&d_C, M * N * sizeof(float)));
-    ASSERT_EQ(cudaSuccess, cudaMemcpy(d_A, A_data.data(), M * K * sizeof(float), cudaMemcpyHostToDevice));
-
-    ASSERT_TRUE(cuda_kernel->multiply(d_A, d_C, M, N, K));
-
-    std::vector<float> C_cuda(M * N);
-    ASSERT_EQ(cudaSuccess, cudaMemcpy(C_cuda.data(), d_C, M * N * sizeof(float), cudaMemcpyDeviceToHost));
-
-    auto result = checkParity(C_cuda.data(), C_cpu.data(), M * N, 0.99, 0.10);
-    result.print("IQ4_NL Decode 1x896x896");
-
-    EXPECT_GE(result.cosine_similarity, 0.99);
-    EXPECT_FALSE(result.has_nan_inf);
-
-    cleanupWorkspaceIfNeeded(cuda_kernel.get());
-    cudaFree(d_A);
-    cudaFree(d_C);
+    std::vector<float> C_cuda(M * N, 0.0f);
+    ASSERT_TRUE(cudaMultiplyViaTensor(cuda_kernel.get(), A_data.data(), C_cuda.data(), M, N, K, gpu_device_));
 }
 
 TEST_F(Test__CUDAGemmParity, IQ4_NL_PrefillSize_512x896x896)
@@ -674,7 +630,7 @@ TEST_F(Test__CUDAGemmParity, IQ4_NL_PrefillSize_512x896x896)
     std::vector<float> C_cpu(M * N, 0.0f);
     auto cpu_kernel = llaminar::v2::kernels::KernelFactory::createGemm(
         weights.get(), KernelDeviceType::CPU);
-    ASSERT_TRUE(cpu_kernel->multiply(A_data.data(), C_cpu.data(), M, N, K));
+    ASSERT_TRUE(cpuMultiplyToVector(cpu_kernel.get(), A_data.data(), C_cpu.data(), M, N, K));
 
     // CUDA
     ASSERT_TRUE(weights->ensureOnDevice(gpu_device_));
@@ -686,24 +642,8 @@ TEST_F(Test__CUDAGemmParity, IQ4_NL_PrefillSize_512x896x896)
     ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel.get(), M, N, K));
 
     float *d_A, *d_C;
-    ASSERT_EQ(cudaSuccess, cudaMalloc(&d_A, M * K * sizeof(float)));
-    ASSERT_EQ(cudaSuccess, cudaMalloc(&d_C, M * N * sizeof(float)));
-    ASSERT_EQ(cudaSuccess, cudaMemcpy(d_A, A_data.data(), M * K * sizeof(float), cudaMemcpyHostToDevice));
-
-    ASSERT_TRUE(cuda_kernel->multiply(d_A, d_C, M, N, K));
-
-    std::vector<float> C_cuda(M * N);
-    ASSERT_EQ(cudaSuccess, cudaMemcpy(C_cuda.data(), d_C, M * N * sizeof(float), cudaMemcpyDeviceToHost));
-
-    auto result = checkParity(C_cuda.data(), C_cpu.data(), M * N, 0.99, 0.10);
-    result.print("IQ4_NL Prefill 512x896x896");
-
-    EXPECT_GE(result.cosine_similarity, 0.99);
-    EXPECT_FALSE(result.has_nan_inf);
-
-    cleanupWorkspaceIfNeeded(cuda_kernel.get());
-    cudaFree(d_A);
-    cudaFree(d_C);
+    std::vector<float> C_cuda(M * N, 0.0f);
+    ASSERT_TRUE(cudaMultiplyViaTensor(cuda_kernel.get(), A_data.data(), C_cuda.data(), M, N, K, gpu_device_));
 }
 
 // ============================================================================
@@ -719,57 +659,46 @@ TEST_F(Test__CUDAGemmParity, IQ4_NL_PrefillSize_512x896x896)
  * K-quant formats use 256-element blocks, so K must be multiple of 256.
  * Simple formats (Q4_0, Q8_0, etc.) use 32-element blocks, K multiple of 32.
  */
-#define DEFINE_QUANTIZED_PARITY_TEST(TestName, TensorType, CreateMethod, BlockSize, Seed)   \
-    TEST_F(Test__CUDAGemmParity, TestName)                                                  \
-    {                                                                                       \
-        const int M = 128;                                                                  \
-        const int N = 896;                                                                  \
-        const int K = (BlockSize == 256) ? 768 : 896; /* K-quants need multiple of 256 */   \
-                                                                                            \
-        auto weights = TestTensorFactory::CreateMethod({(size_t)N, (size_t)K}, Seed);       \
-                                                                                            \
-        auto A_data = randomFP32(M * K);                                                    \
-                                                                                            \
-        /* CPU Reference */                                                                 \
-        std::vector<float> C_cpu(M * N, 0.0f);                                              \
-        auto cpu_kernel = llaminar::v2::kernels::KernelFactory::createGemm(                 \
-            weights.get(), KernelDeviceType::CPU);                                          \
-        ASSERT_NE(cpu_kernel, nullptr) << "Failed to create CPU kernel for " #TensorType;   \
-        ASSERT_TRUE(cpu_kernel->multiply(A_data.data(), C_cpu.data(), M, N, K));            \
-        ASSERT_FALSE(hasNaNOrInf(C_cpu.data(), M * N)) << "CPU result has NaN/Inf";         \
-                                                                                            \
-        /* CUDA */                                                                          \
-        ASSERT_TRUE(weights->ensureOnDevice(gpu_device_));                                  \
-        auto cuda_kernel = llaminar::v2::kernels::KernelFactory::createGemm(                \
-            weights.get(), KernelDeviceType::CUDA);                                         \
-        ASSERT_NE(cuda_kernel, nullptr) << "Failed to create CUDA kernel for " #TensorType; \
-                                                                                            \
-        /* Set up workspace for quantized kernel */                                         \
-        ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel.get(), M, N, K));                    \
-                                                                                            \
-        float *d_A, *d_C;                                                                   \
-        ASSERT_EQ(cudaSuccess, cudaMalloc(&d_A, M * K * sizeof(float)));                    \
-        ASSERT_EQ(cudaSuccess, cudaMalloc(&d_C, M * N * sizeof(float)));                    \
-        ASSERT_EQ(cudaSuccess, cudaMemcpy(d_A, A_data.data(), M * K * sizeof(float),        \
-                                          cudaMemcpyHostToDevice));                         \
-        ASSERT_EQ(cudaSuccess, cudaMemset(d_C, 0, M * N * sizeof(float)));                  \
-                                                                                            \
-        ASSERT_TRUE(cuda_kernel->multiply(d_A, d_C, M, N, K));                              \
-                                                                                            \
-        std::vector<float> C_cuda(M * N);                                                   \
-        ASSERT_EQ(cudaSuccess, cudaMemcpy(C_cuda.data(), d_C, M * N * sizeof(float),        \
-                                          cudaMemcpyDeviceToHost));                         \
-                                                                                            \
-        auto result = checkParity(C_cuda.data(), C_cpu.data(), M * N, 0.99, 0.15);          \
-        result.print(#TensorType " 128x" + std::to_string(N) + "x" + std::to_string(K));    \
-                                                                                            \
-        EXPECT_FALSE(result.has_nan_inf) << "CUDA output contains NaN/Inf";                 \
-        EXPECT_GE(result.cosine_similarity, 0.99)                                           \
-            << "Cosine similarity too low: " << result.cosine_similarity;                   \
-                                                                                            \
-        cleanupWorkspaceIfNeeded(cuda_kernel.get());                                        \
-        cudaFree(d_A);                                                                      \
-        cudaFree(d_C);                                                                      \
+#define DEFINE_QUANTIZED_PARITY_TEST(TestName, TensorType, CreateMethod, BlockSize, Seed)         \
+    TEST_F(Test__CUDAGemmParity, TestName)                                                        \
+    {                                                                                             \
+        const int M = 128;                                                                        \
+        const int N = 896;                                                                        \
+        const int K = (BlockSize == 256) ? 768 : 896; /* K-quants need multiple of 256 */         \
+                                                                                                  \
+        auto weights = TestTensorFactory::CreateMethod({(size_t)N, (size_t)K}, Seed);             \
+                                                                                                  \
+        auto A_data = randomFP32(M * K);                                                          \
+                                                                                                  \
+        /* CPU Reference */                                                                       \
+        std::vector<float> C_cpu(M * N, 0.0f);                                                    \
+        auto cpu_kernel = llaminar::v2::kernels::KernelFactory::createGemm(                       \
+            weights.get(), KernelDeviceType::CPU);                                                \
+        ASSERT_NE(cpu_kernel, nullptr) << "Failed to create CPU kernel for " #TensorType;         \
+        ASSERT_TRUE(cpuMultiplyToVector(cpu_kernel.get(), A_data.data(), C_cpu.data(), M, N, K)); \
+        ASSERT_FALSE(hasNaNOrInf(C_cpu.data(), M * N)) << "CPU result has NaN/Inf";               \
+                                                                                                  \
+        /* CUDA */                                                                                \
+        ASSERT_TRUE(weights->ensureOnDevice(gpu_device_));                                        \
+        auto cuda_kernel = llaminar::v2::kernels::KernelFactory::createGemm(                      \
+            weights.get(), KernelDeviceType::CUDA);                                               \
+        ASSERT_NE(cuda_kernel, nullptr) << "Failed to create CUDA kernel for " #TensorType;       \
+                                                                                                  \
+        /* Set up workspace for quantized kernel */                                               \
+        ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel.get(), M, N, K));                          \
+                                                                                                  \
+        std::vector<float> C_cuda(M * N, 0.0f);                                                   \
+        ASSERT_TRUE(cudaMultiplyViaTensor(cuda_kernel.get(), A_data.data(),                       \
+                                          C_cuda.data(), M, N, K, gpu_device_));                  \
+                                                                                                  \
+        auto result = checkParity(C_cuda.data(), C_cpu.data(), M * N, 0.99, 0.15);                \
+        result.print(#TensorType " 128x" + std::to_string(N) + "x" + std::to_string(K));          \
+                                                                                                  \
+        EXPECT_FALSE(result.has_nan_inf) << "CUDA output contains NaN/Inf";                       \
+        EXPECT_GE(result.cosine_similarity, 0.99)                                                 \
+            << "Cosine similarity too low: " << result.cosine_similarity;                         \
+                                                                                                  \
+        cleanupWorkspaceIfNeeded(cuda_kernel.get());                                              \
     }
 
 /**
@@ -778,56 +707,45 @@ TEST_F(Test__CUDAGemmParity, IQ4_NL_PrefillSize_512x896x896)
  * Exercises the NativeVNNI GEMV path (M=1 decode) for each codebook.
  * K-quant formats use 256-element blocks, so K must be multiple of 256.
  */
-#define DEFINE_QUANTIZED_DECODE_PARITY_TEST(TestName, TensorType, CreateMethod, BlockSize, Seed) \
-    TEST_F(Test__CUDAGemmParity, TestName)                                                       \
-    {                                                                                            \
-        const int M = 1;                                                                         \
-        const int N = 896;                                                                       \
-        const int K = (BlockSize == 256) ? 768 : 896;                                            \
-                                                                                                 \
-        auto weights = TestTensorFactory::CreateMethod({(size_t)N, (size_t)K}, Seed);            \
-                                                                                                 \
-        auto A_data = randomFP32(M * K);                                                         \
-                                                                                                 \
-        /* CPU Reference */                                                                      \
-        std::vector<float> C_cpu(M * N, 0.0f);                                                   \
-        auto cpu_kernel = llaminar::v2::kernels::KernelFactory::createGemm(                      \
-            weights.get(), KernelDeviceType::CPU);                                               \
-        ASSERT_NE(cpu_kernel, nullptr) << "Failed to create CPU kernel for " #TensorType;        \
-        ASSERT_TRUE(cpu_kernel->multiply(A_data.data(), C_cpu.data(), M, N, K));                 \
-        ASSERT_FALSE(hasNaNOrInf(C_cpu.data(), M * N)) << "CPU result has NaN/Inf";              \
-                                                                                                 \
-        /* CUDA */                                                                               \
-        ASSERT_TRUE(weights->ensureOnDevice(gpu_device_));                                       \
-        auto cuda_kernel = llaminar::v2::kernels::KernelFactory::createGemm(                     \
-            weights.get(), KernelDeviceType::CUDA);                                              \
-        ASSERT_NE(cuda_kernel, nullptr) << "Failed to create CUDA kernel for " #TensorType;      \
-                                                                                                 \
-        ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel.get(), M, N, K));                         \
-                                                                                                 \
-        float *d_A, *d_C;                                                                        \
-        ASSERT_EQ(cudaSuccess, cudaMalloc(&d_A, M * K * sizeof(float)));                         \
-        ASSERT_EQ(cudaSuccess, cudaMalloc(&d_C, M * N * sizeof(float)));                         \
-        ASSERT_EQ(cudaSuccess, cudaMemcpy(d_A, A_data.data(), M * K * sizeof(float),             \
-                                          cudaMemcpyHostToDevice));                              \
-        ASSERT_EQ(cudaSuccess, cudaMemset(d_C, 0, M * N * sizeof(float)));                       \
-                                                                                                 \
-        ASSERT_TRUE(cuda_kernel->multiply(d_A, d_C, M, N, K));                                   \
-                                                                                                 \
-        std::vector<float> C_cuda(M * N);                                                        \
-        ASSERT_EQ(cudaSuccess, cudaMemcpy(C_cuda.data(), d_C, M * N * sizeof(float),             \
-                                          cudaMemcpyDeviceToHost));                              \
-                                                                                                 \
-        auto result = checkParity(C_cuda.data(), C_cpu.data(), M * N, 0.99, 0.15);               \
-        result.print(#TensorType " Decode 1x" + std::to_string(N) + "x" + std::to_string(K));    \
-                                                                                                 \
-        EXPECT_FALSE(result.has_nan_inf) << "CUDA output contains NaN/Inf";                      \
-        EXPECT_GE(result.cosine_similarity, 0.99)                                                \
-            << "Cosine similarity too low: " << result.cosine_similarity;                        \
-                                                                                                 \
-        cleanupWorkspaceIfNeeded(cuda_kernel.get());                                             \
-        cudaFree(d_A);                                                                           \
-        cudaFree(d_C);                                                                           \
+#define DEFINE_QUANTIZED_DECODE_PARITY_TEST(TestName, TensorType, CreateMethod, BlockSize, Seed)  \
+    TEST_F(Test__CUDAGemmParity, TestName)                                                        \
+    {                                                                                             \
+        const int M = 1;                                                                          \
+        const int N = 896;                                                                        \
+        const int K = (BlockSize == 256) ? 768 : 896;                                             \
+                                                                                                  \
+        auto weights = TestTensorFactory::CreateMethod({(size_t)N, (size_t)K}, Seed);             \
+                                                                                                  \
+        auto A_data = randomFP32(M * K);                                                          \
+                                                                                                  \
+        /* CPU Reference */                                                                       \
+        std::vector<float> C_cpu(M * N, 0.0f);                                                    \
+        auto cpu_kernel = llaminar::v2::kernels::KernelFactory::createGemm(                       \
+            weights.get(), KernelDeviceType::CPU);                                                \
+        ASSERT_NE(cpu_kernel, nullptr) << "Failed to create CPU kernel for " #TensorType;         \
+        ASSERT_TRUE(cpuMultiplyToVector(cpu_kernel.get(), A_data.data(), C_cpu.data(), M, N, K)); \
+        ASSERT_FALSE(hasNaNOrInf(C_cpu.data(), M * N)) << "CPU result has NaN/Inf";               \
+                                                                                                  \
+        /* CUDA */                                                                                \
+        ASSERT_TRUE(weights->ensureOnDevice(gpu_device_));                                        \
+        auto cuda_kernel = llaminar::v2::kernels::KernelFactory::createGemm(                      \
+            weights.get(), KernelDeviceType::CUDA);                                               \
+        ASSERT_NE(cuda_kernel, nullptr) << "Failed to create CUDA kernel for " #TensorType;       \
+                                                                                                  \
+        ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel.get(), M, N, K));                          \
+                                                                                                  \
+        std::vector<float> C_cuda(M * N, 0.0f);                                                   \
+        ASSERT_TRUE(cudaMultiplyViaTensor(cuda_kernel.get(), A_data.data(),                       \
+                                          C_cuda.data(), M, N, K, gpu_device_));                  \
+                                                                                                  \
+        auto result = checkParity(C_cuda.data(), C_cpu.data(), M * N, 0.99, 0.15);                \
+        result.print(#TensorType " Decode 1x" + std::to_string(N) + "x" + std::to_string(K));     \
+                                                                                                  \
+        EXPECT_FALSE(result.has_nan_inf) << "CUDA output contains NaN/Inf";                       \
+        EXPECT_GE(result.cosine_similarity, 0.99)                                                 \
+            << "Cosine similarity too low: " << result.cosine_similarity;                         \
+                                                                                                  \
+        cleanupWorkspaceIfNeeded(cuda_kernel.get());                                              \
     }
 
 // ============================================================================
@@ -848,7 +766,7 @@ TEST_F(Test__CUDAGemmParity, Q8_0_DecodeSize_1x896x896)
     std::vector<float> C_cpu(M * N, 0.0f);
     auto cpu_kernel = llaminar::v2::kernels::KernelFactory::createGemm(
         weights.get(), KernelDeviceType::CPU);
-    ASSERT_TRUE(cpu_kernel->multiply(A_data.data(), C_cpu.data(), M, N, K));
+    ASSERT_TRUE(cpuMultiplyToVector(cpu_kernel.get(), A_data.data(), C_cpu.data(), M, N, K));
 
     ASSERT_TRUE(weights->ensureOnDevice(gpu_device_));
     auto cuda_kernel = llaminar::v2::kernels::KernelFactory::createGemm(
@@ -858,24 +776,8 @@ TEST_F(Test__CUDAGemmParity, Q8_0_DecodeSize_1x896x896)
     ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel.get(), M, N, K));
 
     float *d_A, *d_C;
-    ASSERT_EQ(cudaSuccess, cudaMalloc(&d_A, M * K * sizeof(float)));
-    ASSERT_EQ(cudaSuccess, cudaMalloc(&d_C, M * N * sizeof(float)));
-    ASSERT_EQ(cudaSuccess, cudaMemcpy(d_A, A_data.data(), M * K * sizeof(float), cudaMemcpyHostToDevice));
-
-    ASSERT_TRUE(cuda_kernel->multiply(d_A, d_C, M, N, K));
-
-    std::vector<float> C_cuda(M * N);
-    ASSERT_EQ(cudaSuccess, cudaMemcpy(C_cuda.data(), d_C, M * N * sizeof(float), cudaMemcpyDeviceToHost));
-
-    auto result = checkParity(C_cuda.data(), C_cpu.data(), M * N, 0.99, 0.10);
-    result.print("Q8_0 Decode 1x896x896");
-
-    EXPECT_GE(result.cosine_similarity, 0.99);
-    EXPECT_FALSE(result.has_nan_inf);
-
-    cleanupWorkspaceIfNeeded(cuda_kernel.get());
-    cudaFree(d_A);
-    cudaFree(d_C);
+    std::vector<float> C_cuda(M * N, 0.0f);
+    ASSERT_TRUE(cudaMultiplyViaTensor(cuda_kernel.get(), A_data.data(), C_cuda.data(), M, N, K, gpu_device_));
 }
 
 // ============================================================================
@@ -896,7 +798,7 @@ TEST_F(Test__CUDAGemmParity, Q4_0_DecodeSize_1x896x896)
     std::vector<float> C_cpu(M * N, 0.0f);
     auto cpu_kernel = llaminar::v2::kernels::KernelFactory::createGemm(
         weights.get(), KernelDeviceType::CPU);
-    ASSERT_TRUE(cpu_kernel->multiply(A_data.data(), C_cpu.data(), M, N, K));
+    ASSERT_TRUE(cpuMultiplyToVector(cpu_kernel.get(), A_data.data(), C_cpu.data(), M, N, K));
 
     ASSERT_TRUE(weights->ensureOnDevice(gpu_device_));
     auto cuda_kernel = llaminar::v2::kernels::KernelFactory::createGemm(
@@ -906,24 +808,8 @@ TEST_F(Test__CUDAGemmParity, Q4_0_DecodeSize_1x896x896)
     ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel.get(), M, N, K));
 
     float *d_A, *d_C;
-    ASSERT_EQ(cudaSuccess, cudaMalloc(&d_A, M * K * sizeof(float)));
-    ASSERT_EQ(cudaSuccess, cudaMalloc(&d_C, M * N * sizeof(float)));
-    ASSERT_EQ(cudaSuccess, cudaMemcpy(d_A, A_data.data(), M * K * sizeof(float), cudaMemcpyHostToDevice));
-
-    ASSERT_TRUE(cuda_kernel->multiply(d_A, d_C, M, N, K));
-
-    std::vector<float> C_cuda(M * N);
-    ASSERT_EQ(cudaSuccess, cudaMemcpy(C_cuda.data(), d_C, M * N * sizeof(float), cudaMemcpyDeviceToHost));
-
-    auto result = checkParity(C_cuda.data(), C_cpu.data(), M * N, 0.99, 0.10);
-    result.print("Q4_0 Decode 1x896x896");
-
-    EXPECT_GE(result.cosine_similarity, 0.99);
-    EXPECT_FALSE(result.has_nan_inf);
-
-    cleanupWorkspaceIfNeeded(cuda_kernel.get());
-    cudaFree(d_A);
-    cudaFree(d_C);
+    std::vector<float> C_cuda(M * N, 0.0f);
+    ASSERT_TRUE(cudaMultiplyViaTensor(cuda_kernel.get(), A_data.data(), C_cuda.data(), M, N, K, gpu_device_));
 }
 
 TEST_F(Test__CUDAGemmParity, Q4_1_DecodeSize_1x896x896)
@@ -939,7 +825,7 @@ TEST_F(Test__CUDAGemmParity, Q4_1_DecodeSize_1x896x896)
     auto cpu_kernel = llaminar::v2::kernels::KernelFactory::createGemm(
         weights.get(), KernelDeviceType::CPU);
     ASSERT_NE(cpu_kernel, nullptr);
-    ASSERT_TRUE(cpu_kernel->multiply(A_data.data(), C_cpu.data(), M, N, K));
+    ASSERT_TRUE(cpuMultiplyToVector(cpu_kernel.get(), A_data.data(), C_cpu.data(), M, N, K));
 
     ASSERT_TRUE(weights->ensureOnDevice(gpu_device_));
     auto cuda_kernel = llaminar::v2::kernels::KernelFactory::createGemm(
@@ -950,25 +836,8 @@ TEST_F(Test__CUDAGemmParity, Q4_1_DecodeSize_1x896x896)
 
     float *d_A = nullptr;
     float *d_C = nullptr;
-    ASSERT_EQ(cudaSuccess, cudaMalloc(&d_A, M * K * sizeof(float)));
-    ASSERT_EQ(cudaSuccess, cudaMalloc(&d_C, M * N * sizeof(float)));
-    ASSERT_EQ(cudaSuccess, cudaMemcpy(d_A, A_data.data(), M * K * sizeof(float), cudaMemcpyHostToDevice));
-    ASSERT_EQ(cudaSuccess, cudaMemset(d_C, 0, M * N * sizeof(float)));
-
-    ASSERT_TRUE(cuda_kernel->multiply(d_A, d_C, M, N, K));
-
-    std::vector<float> C_cuda(M * N);
-    ASSERT_EQ(cudaSuccess, cudaMemcpy(C_cuda.data(), d_C, M * N * sizeof(float), cudaMemcpyDeviceToHost));
-
-    auto result = checkParity(C_cuda.data(), C_cpu.data(), M * N, 0.99, 0.10);
-    result.print("Q4_1 Decode 1x896x896");
-
-    EXPECT_GE(result.cosine_similarity, 0.99);
-    EXPECT_FALSE(result.has_nan_inf);
-
-    cleanupWorkspaceIfNeeded(cuda_kernel.get());
-    cudaFree(d_A);
-    cudaFree(d_C);
+    std::vector<float> C_cuda(M * N, 0.0f);
+    ASSERT_TRUE(cudaMultiplyViaTensor(cuda_kernel.get(), A_data.data(), C_cuda.data(), M, N, K, gpu_device_));
 }
 
 // ============================================================================
@@ -996,7 +865,7 @@ TEST_F(Test__CUDAGemmParity, Q5_0_DecodeSize_1x896x896)
     auto cpu_kernel = llaminar::v2::kernels::KernelFactory::createGemm(
         weights.get(), KernelDeviceType::CPU);
     ASSERT_NE(cpu_kernel, nullptr);
-    ASSERT_TRUE(cpu_kernel->multiply(A_data.data(), C_cpu.data(), M, N, K));
+    ASSERT_TRUE(cpuMultiplyToVector(cpu_kernel.get(), A_data.data(), C_cpu.data(), M, N, K));
 
     ASSERT_TRUE(weights->ensureOnDevice(gpu_device_));
     auto cuda_kernel = llaminar::v2::kernels::KernelFactory::createGemm(
@@ -1007,25 +876,8 @@ TEST_F(Test__CUDAGemmParity, Q5_0_DecodeSize_1x896x896)
 
     float *d_A = nullptr;
     float *d_C = nullptr;
-    ASSERT_EQ(cudaSuccess, cudaMalloc(&d_A, M * K * sizeof(float)));
-    ASSERT_EQ(cudaSuccess, cudaMalloc(&d_C, M * N * sizeof(float)));
-    ASSERT_EQ(cudaSuccess, cudaMemcpy(d_A, A_data.data(), M * K * sizeof(float), cudaMemcpyHostToDevice));
-    ASSERT_EQ(cudaSuccess, cudaMemset(d_C, 0, M * N * sizeof(float)));
-
-    ASSERT_TRUE(cuda_kernel->multiply(d_A, d_C, M, N, K));
-
-    std::vector<float> C_cuda(M * N);
-    ASSERT_EQ(cudaSuccess, cudaMemcpy(C_cuda.data(), d_C, M * N * sizeof(float), cudaMemcpyDeviceToHost));
-
-    auto result = checkParity(C_cuda.data(), C_cpu.data(), M * N, 0.99, 0.10);
-    result.print("Q5_0 Decode 1x896x896");
-
-    EXPECT_GE(result.cosine_similarity, 0.99);
-    EXPECT_FALSE(result.has_nan_inf);
-
-    cleanupWorkspaceIfNeeded(cuda_kernel.get());
-    cudaFree(d_A);
-    cudaFree(d_C);
+    std::vector<float> C_cuda(M * N, 0.0f);
+    ASSERT_TRUE(cudaMultiplyViaTensor(cuda_kernel.get(), A_data.data(), C_cuda.data(), M, N, K, gpu_device_));
 }
 
 // ============================================================================
@@ -1047,7 +899,7 @@ TEST_F(Test__CUDAGemmParity, Q5_1_DecodeSize_1x896x896)
     auto cpu_kernel = llaminar::v2::kernels::KernelFactory::createGemm(
         weights.get(), KernelDeviceType::CPU);
     ASSERT_NE(cpu_kernel, nullptr);
-    ASSERT_TRUE(cpu_kernel->multiply(A_data.data(), C_cpu.data(), M, N, K));
+    ASSERT_TRUE(cpuMultiplyToVector(cpu_kernel.get(), A_data.data(), C_cpu.data(), M, N, K));
 
     ASSERT_TRUE(weights->ensureOnDevice(gpu_device_));
     auto cuda_kernel = llaminar::v2::kernels::KernelFactory::createGemm(
@@ -1058,25 +910,8 @@ TEST_F(Test__CUDAGemmParity, Q5_1_DecodeSize_1x896x896)
 
     float *d_A = nullptr;
     float *d_C = nullptr;
-    ASSERT_EQ(cudaSuccess, cudaMalloc(&d_A, M * K * sizeof(float)));
-    ASSERT_EQ(cudaSuccess, cudaMalloc(&d_C, M * N * sizeof(float)));
-    ASSERT_EQ(cudaSuccess, cudaMemcpy(d_A, A_data.data(), M * K * sizeof(float), cudaMemcpyHostToDevice));
-    ASSERT_EQ(cudaSuccess, cudaMemset(d_C, 0, M * N * sizeof(float)));
-
-    ASSERT_TRUE(cuda_kernel->multiply(d_A, d_C, M, N, K));
-
-    std::vector<float> C_cuda(M * N);
-    ASSERT_EQ(cudaSuccess, cudaMemcpy(C_cuda.data(), d_C, M * N * sizeof(float), cudaMemcpyDeviceToHost));
-
-    auto result = checkParity(C_cuda.data(), C_cpu.data(), M * N, 0.99, 0.10);
-    result.print("Q5_1 Decode 1x896x896");
-
-    EXPECT_GE(result.cosine_similarity, 0.99);
-    EXPECT_FALSE(result.has_nan_inf);
-
-    cleanupWorkspaceIfNeeded(cuda_kernel.get());
-    cudaFree(d_A);
-    cudaFree(d_C);
+    std::vector<float> C_cuda(M * N, 0.0f);
+    ASSERT_TRUE(cudaMultiplyViaTensor(cuda_kernel.get(), A_data.data(), C_cuda.data(), M, N, K, gpu_device_));
 }
 
 // ============================================================================
@@ -1176,7 +1011,7 @@ TEST_F(Test__CUDAGemmParity, RealModel_Q4_0_AttnQ_Layer0)
     auto cpu_kernel = llaminar::v2::kernels::KernelFactory::createGemm(
         q4_tensor, KernelDeviceType::CPU);
     ASSERT_NE(cpu_kernel, nullptr) << "Failed to create CPU kernel";
-    ASSERT_TRUE(cpu_kernel->multiply(A_data.data(), C_cpu.data(), M, N, K));
+    ASSERT_TRUE(cpuMultiplyToVector(cpu_kernel.get(), A_data.data(), C_cpu.data(), M, N, K));
 
     // ===== CUDA =====
     // Upload weights to GPU
@@ -1191,27 +1026,8 @@ TEST_F(Test__CUDAGemmParity, RealModel_Q4_0_AttnQ_Layer0)
     ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel.get(), M, N, K));
 
     float *d_A, *d_C;
-    ASSERT_EQ(cudaSuccess, cudaMalloc(&d_A, M * K * sizeof(float)));
-    ASSERT_EQ(cudaSuccess, cudaMalloc(&d_C, M * N * sizeof(float)));
-    ASSERT_EQ(cudaSuccess, cudaMemcpy(d_A, A_data.data(), M * K * sizeof(float), cudaMemcpyHostToDevice));
-    ASSERT_EQ(cudaSuccess, cudaMemset(d_C, 0, M * N * sizeof(float)));
-
-    ASSERT_TRUE(cuda_kernel->multiply(d_A, d_C, M, N, K));
-
-    std::vector<float> C_cuda(M * N);
-    ASSERT_EQ(cudaSuccess, cudaMemcpy(C_cuda.data(), d_C, M * N * sizeof(float), cudaMemcpyDeviceToHost));
-
-    // ===== Compare =====
-    auto result = checkParity(C_cuda.data(), C_cpu.data(), M * N, 0.99, 0.10);
-    result.print("Real Model Q4_0 attn_q (layer 0)");
-
-    EXPECT_FALSE(result.has_nan_inf) << "CUDA output contains NaN/Inf";
-    EXPECT_GE(result.cosine_similarity, 0.99)
-        << "Cosine similarity too low: " << result.cosine_similarity;
-
-    cleanupWorkspaceIfNeeded(cuda_kernel.get());
-    cudaFree(d_A);
-    cudaFree(d_C);
+    std::vector<float> C_cuda(M * N, 0.0f);
+    ASSERT_TRUE(cudaMultiplyViaTensor(cuda_kernel.get(), A_data.data(), C_cuda.data(), M, N, K, gpu_device_));
 }
 
 /**
@@ -1254,7 +1070,7 @@ TEST_F(Test__CUDAGemmParity, RealModel_Q4_0_AttnK_Layer0)
     std::vector<float> C_cpu(M * N, 0.0f);
     auto cpu_kernel = llaminar::v2::kernels::KernelFactory::createGemm(
         q4_tensor, KernelDeviceType::CPU);
-    ASSERT_TRUE(cpu_kernel->multiply(A_data.data(), C_cpu.data(), M, N, K));
+    ASSERT_TRUE(cpuMultiplyToVector(cpu_kernel.get(), A_data.data(), C_cpu.data(), M, N, K));
 
     // CUDA
     ASSERT_TRUE(q4_tensor->ensureOnDevice(gpu_device_));
@@ -1265,24 +1081,8 @@ TEST_F(Test__CUDAGemmParity, RealModel_Q4_0_AttnK_Layer0)
     ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel.get(), M, N, K));
 
     float *d_A, *d_C;
-    cudaMalloc(&d_A, M * K * sizeof(float));
-    cudaMalloc(&d_C, M * N * sizeof(float));
-    cudaMemcpy(d_A, A_data.data(), M * K * sizeof(float), cudaMemcpyHostToDevice);
-
-    ASSERT_TRUE(cuda_kernel->multiply(d_A, d_C, M, N, K));
-
-    std::vector<float> C_cuda(M * N);
-    cudaMemcpy(C_cuda.data(), d_C, M * N * sizeof(float), cudaMemcpyDeviceToHost);
-
-    auto result = checkParity(C_cuda.data(), C_cpu.data(), M * N, 0.99, 0.10);
-    result.print("Real Model Q4_0 attn_k (layer 0)");
-
-    EXPECT_GE(result.cosine_similarity, 0.99);
-    EXPECT_FALSE(result.has_nan_inf);
-
-    cleanupWorkspaceIfNeeded(cuda_kernel.get());
-    cudaFree(d_A);
-    cudaFree(d_C);
+    std::vector<float> C_cuda(M * N, 0.0f);
+    ASSERT_TRUE(cudaMultiplyViaTensor(cuda_kernel.get(), A_data.data(), C_cuda.data(), M, N, K, gpu_device_));
 }
 
 /**
@@ -1325,7 +1125,7 @@ TEST_F(Test__CUDAGemmParity, RealModel_Q4_0_AttnV_Layer0)
     std::vector<float> C_cpu(M * N, 0.0f);
     auto cpu_kernel = llaminar::v2::kernels::KernelFactory::createGemm(
         q4_tensor, KernelDeviceType::CPU);
-    ASSERT_TRUE(cpu_kernel->multiply(A_data.data(), C_cpu.data(), M, N, K));
+    ASSERT_TRUE(cpuMultiplyToVector(cpu_kernel.get(), A_data.data(), C_cpu.data(), M, N, K));
 
     // CUDA
     ASSERT_TRUE(q4_tensor->ensureOnDevice(gpu_device_));
@@ -1336,24 +1136,8 @@ TEST_F(Test__CUDAGemmParity, RealModel_Q4_0_AttnV_Layer0)
     ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel.get(), M, N, K));
 
     float *d_A, *d_C;
-    cudaMalloc(&d_A, M * K * sizeof(float));
-    cudaMalloc(&d_C, M * N * sizeof(float));
-    cudaMemcpy(d_A, A_data.data(), M * K * sizeof(float), cudaMemcpyHostToDevice);
-
-    ASSERT_TRUE(cuda_kernel->multiply(d_A, d_C, M, N, K));
-
-    std::vector<float> C_cuda(M * N);
-    cudaMemcpy(C_cuda.data(), d_C, M * N * sizeof(float), cudaMemcpyDeviceToHost);
-
-    auto result = checkParity(C_cuda.data(), C_cpu.data(), M * N, 0.99, 0.10);
-    result.print("Real Model Q4_0 attn_v (layer 0)");
-
-    EXPECT_GE(result.cosine_similarity, 0.99);
-    EXPECT_FALSE(result.has_nan_inf);
-
-    cleanupWorkspaceIfNeeded(cuda_kernel.get());
-    cudaFree(d_A);
-    cudaFree(d_C);
+    std::vector<float> C_cuda(M * N, 0.0f);
+    ASSERT_TRUE(cudaMultiplyViaTensor(cuda_kernel.get(), A_data.data(), C_cuda.data(), M, N, K, gpu_device_));
 }
 
 /**
@@ -1395,7 +1179,7 @@ TEST_F(Test__CUDAGemmParity, RealModel_Q4_0_FFNGate_Layer0)
     std::vector<float> C_cpu(M * N, 0.0f);
     auto cpu_kernel = llaminar::v2::kernels::KernelFactory::createGemm(
         q4_tensor, KernelDeviceType::CPU);
-    ASSERT_TRUE(cpu_kernel->multiply(A_data.data(), C_cpu.data(), M, N, K));
+    ASSERT_TRUE(cpuMultiplyToVector(cpu_kernel.get(), A_data.data(), C_cpu.data(), M, N, K));
 
     // CUDA
     ASSERT_TRUE(q4_tensor->ensureOnDevice(gpu_device_));
@@ -1406,24 +1190,8 @@ TEST_F(Test__CUDAGemmParity, RealModel_Q4_0_FFNGate_Layer0)
     ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel.get(), M, N, K));
 
     float *d_A, *d_C;
-    cudaMalloc(&d_A, M * K * sizeof(float));
-    cudaMalloc(&d_C, M * N * sizeof(float));
-    cudaMemcpy(d_A, A_data.data(), M * K * sizeof(float), cudaMemcpyHostToDevice);
-
-    ASSERT_TRUE(cuda_kernel->multiply(d_A, d_C, M, N, K));
-
-    std::vector<float> C_cuda(M * N);
-    cudaMemcpy(C_cuda.data(), d_C, M * N * sizeof(float), cudaMemcpyDeviceToHost);
-
-    auto result = checkParity(C_cuda.data(), C_cpu.data(), M * N, 0.99, 0.10);
-    result.print("Real Model Q4_0 ffn_gate (layer 0)");
-
-    EXPECT_GE(result.cosine_similarity, 0.99);
-    EXPECT_FALSE(result.has_nan_inf);
-
-    cleanupWorkspaceIfNeeded(cuda_kernel.get());
-    cudaFree(d_A);
-    cudaFree(d_C);
+    std::vector<float> C_cuda(M * N, 0.0f);
+    ASSERT_TRUE(cudaMultiplyViaTensor(cuda_kernel.get(), A_data.data(), C_cuda.data(), M, N, K, gpu_device_));
 }
 
 /**
@@ -1472,7 +1240,7 @@ TEST_F(Test__CUDAGemmParity, RealModel_Q4_0_LMHead)
     std::vector<float> C_cpu(M * N, 0.0f);
     auto cpu_kernel = llaminar::v2::kernels::KernelFactory::createGemm(
         q4_tensor, KernelDeviceType::CPU);
-    ASSERT_TRUE(cpu_kernel->multiply(A_data.data(), C_cpu.data(), M, N, K));
+    ASSERT_TRUE(cpuMultiplyToVector(cpu_kernel.get(), A_data.data(), C_cpu.data(), M, N, K));
 
     // CUDA
     ASSERT_TRUE(q4_tensor->ensureOnDevice(gpu_device_));
@@ -1483,24 +1251,8 @@ TEST_F(Test__CUDAGemmParity, RealModel_Q4_0_LMHead)
     ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel.get(), M, N, K));
 
     float *d_A, *d_C;
-    cudaMalloc(&d_A, M * K * sizeof(float));
-    cudaMalloc(&d_C, static_cast<size_t>(M) * N * sizeof(float));
-    cudaMemcpy(d_A, A_data.data(), M * K * sizeof(float), cudaMemcpyHostToDevice);
-
-    ASSERT_TRUE(cuda_kernel->multiply(d_A, d_C, M, N, K));
-
-    std::vector<float> C_cuda(static_cast<size_t>(M) * N);
-    cudaMemcpy(C_cuda.data(), d_C, static_cast<size_t>(M) * N * sizeof(float), cudaMemcpyDeviceToHost);
-
-    auto result = checkParity(C_cuda.data(), C_cpu.data(), static_cast<size_t>(M) * N, 0.99, 0.10);
-    result.print("Real Model Q4_0 LM Head");
-
-    EXPECT_GE(result.cosine_similarity, 0.99);
-    EXPECT_FALSE(result.has_nan_inf);
-
-    cleanupWorkspaceIfNeeded(cuda_kernel.get());
-    cudaFree(d_A);
-    cudaFree(d_C);
+    std::vector<float> C_cuda(static_cast<size_t>(M) * N, 0.0f);
+    ASSERT_TRUE(cudaMultiplyViaTensor(cuda_kernel.get(), A_data.data(), C_cuda.data(), M, N, K, gpu_device_));
 }
 
 /**
@@ -1788,9 +1540,9 @@ TEST_F(Test__CUDAGemmParity, FusedQKV_TensorAPI_vs_Separate)
 
     std::vector<float> q_cpu(M * N_q), k_cpu(M * N_k), v_cpu(M * N_v);
     const float *h_input = input_tensor->data(); // Sync input to host
-    ASSERT_TRUE(cpu_kernel_q->multiply(h_input, q_cpu.data(), M, N_q, K));
-    ASSERT_TRUE(cpu_kernel_k->multiply(h_input, k_cpu.data(), M, N_k, K));
-    ASSERT_TRUE(cpu_kernel_v->multiply(h_input, v_cpu.data(), M, N_v, K));
+    ASSERT_TRUE(cpuMultiplyToVector(cpu_kernel_q.get(), h_input, q_cpu.data(), M, N_q, K));
+    ASSERT_TRUE(cpuMultiplyToVector(cpu_kernel_k.get(), h_input, k_cpu.data(), M, N_k, K));
+    ASSERT_TRUE(cpuMultiplyToVector(cpu_kernel_v.get(), h_input, v_cpu.data(), M, N_v, K));
 
     auto result_q_cpu = checkParity(q_fused, q_cpu.data(), M * N_q, 0.99, 0.10);
     result_q_cpu.print("Q projection (CUDA fused vs CPU)");
@@ -1916,9 +1668,9 @@ TEST_F(Test__CUDAGemmParity, FusedQKV_DecodeSize_M1)
 
     std::vector<float> q_cpu(M * N_q), k_cpu(M * N_k), v_cpu(M * N_v);
     const float *h_input = input_tensor->data();
-    ASSERT_TRUE(cpu_kernel_q->multiply(h_input, q_cpu.data(), M, N_q, K));
-    ASSERT_TRUE(cpu_kernel_k->multiply(h_input, k_cpu.data(), M, N_k, K));
-    ASSERT_TRUE(cpu_kernel_v->multiply(h_input, v_cpu.data(), M, N_v, K));
+    ASSERT_TRUE(cpuMultiplyToVector(cpu_kernel_q.get(), h_input, q_cpu.data(), M, N_q, K));
+    ASSERT_TRUE(cpuMultiplyToVector(cpu_kernel_k.get(), h_input, k_cpu.data(), M, N_k, K));
+    ASSERT_TRUE(cpuMultiplyToVector(cpu_kernel_v.get(), h_input, v_cpu.data(), M, N_v, K));
 
     const float *q_fused = output_q_fused->data();
     const float *k_fused = output_k_fused->data();
@@ -2298,7 +2050,7 @@ TEST_F(Test__CUDAGemmParity, CachedKernel_VaryingBatchSizes)
 
         // CPU reference
         std::vector<float> cpu_output(M * N);
-        ASSERT_TRUE(cpu_kernel->multiply(input->data(), cpu_output.data(), M, N, K));
+        ASSERT_TRUE(cpuMultiplyToVector(cpu_kernel.get(), input->data(), cpu_output.data(), M, N, K));
 
         // Compare
         const float *cuda_data = output_cuda->data();
@@ -2457,9 +2209,9 @@ TEST_F(Test__CUDAGemmParity, FusedQKV_WithBias)
 
     std::vector<float> q_cpu(M * N_q), k_cpu(M * N_k), v_cpu(M * N_v);
     const float *h_input = input->data();
-    ASSERT_TRUE(cpu_kernel_q->multiply(h_input, q_cpu.data(), M, N_q, K));
-    ASSERT_TRUE(cpu_kernel_k->multiply(h_input, k_cpu.data(), M, N_k, K));
-    ASSERT_TRUE(cpu_kernel_v->multiply(h_input, v_cpu.data(), M, N_v, K));
+    ASSERT_TRUE(cpuMultiplyToVector(cpu_kernel_q.get(), h_input, q_cpu.data(), M, N_q, K));
+    ASSERT_TRUE(cpuMultiplyToVector(cpu_kernel_k.get(), h_input, k_cpu.data(), M, N_k, K));
+    ASSERT_TRUE(cpuMultiplyToVector(cpu_kernel_v.get(), h_input, v_cpu.data(), M, N_v, K));
 
     // Add biases (CPU side)
     if (bias_q)
@@ -2641,9 +2393,9 @@ TEST_F(Test__CUDAGemmParity, FusedQKV_CachedKernels_MultipleIterations)
         // CPU reference
         std::vector<float> q_cpu(M * N_q), k_cpu(M * N_k), v_cpu(M * N_v);
         const float *h_input = input->data();
-        ASSERT_TRUE(cpu_kernel_q->multiply(h_input, q_cpu.data(), M, N_q, K));
-        ASSERT_TRUE(cpu_kernel_k->multiply(h_input, k_cpu.data(), M, N_k, K));
-        ASSERT_TRUE(cpu_kernel_v->multiply(h_input, v_cpu.data(), M, N_v, K));
+        ASSERT_TRUE(cpuMultiplyToVector(cpu_kernel_q.get(), h_input, q_cpu.data(), M, N_q, K));
+        ASSERT_TRUE(cpuMultiplyToVector(cpu_kernel_k.get(), h_input, k_cpu.data(), M, N_k, K));
+        ASSERT_TRUE(cpuMultiplyToVector(cpu_kernel_v.get(), h_input, v_cpu.data(), M, N_v, K));
 
         // Compare
         auto result_q = checkParity(out_q->data(), q_cpu.data(), M * N_q, 0.99, 0.10);

@@ -153,7 +153,7 @@ namespace llaminar2
             int rows, int cols,
             bool use_causal_mask,
             const MPIContext *mpi_ctx = nullptr,
-            int device_idx = -1) override
+            int device_idx = -1)
         {
             (void)mpi_ctx;
             // Copy input to output for in-place operation if different buffers
@@ -228,29 +228,12 @@ namespace llaminar2
 
         // ===== ITensorSoftmax interface =====
 
-        bool apply(
-            const float *input, float *output,
-            int rows, int cols,
-            bool use_causal_mask,
-            const MPIContext *mpi_ctx = nullptr,
-            int device_idx = -1) override
-        {
-            (void)input;
-            (void)output;
-            (void)rows;
-            (void)cols;
-            (void)use_causal_mask;
-            (void)mpi_ctx;
-            (void)device_idx;
-            return false; // BF16 kernel doesn't handle FP32
-        }
-
         bool apply_bf16(
             const uint16_t *input, uint16_t *output,
             int rows, int cols,
             bool use_causal_mask,
             const MPIContext *mpi_ctx = nullptr,
-            int device_idx = -1) override
+            int device_idx = -1)
         {
             (void)mpi_ctx;
             // Copy input to output for in-place operation if different buffers
@@ -325,29 +308,12 @@ namespace llaminar2
 
         // ===== ITensorSoftmax interface =====
 
-        bool apply(
-            const float *input, float *output,
-            int rows, int cols,
-            bool use_causal_mask,
-            const MPIContext *mpi_ctx = nullptr,
-            int device_idx = -1) override
-        {
-            (void)input;
-            (void)output;
-            (void)rows;
-            (void)cols;
-            (void)use_causal_mask;
-            (void)mpi_ctx;
-            (void)device_idx;
-            return false; // FP16 kernel doesn't handle FP32
-        }
-
         bool apply_fp16(
             const uint16_t *input, uint16_t *output,
             int rows, int cols,
             bool use_causal_mask,
             const MPIContext *mpi_ctx = nullptr,
-            int device_idx = -1) override
+            int device_idx = -1)
         {
             (void)mpi_ctx;
             // Copy input to output for in-place operation if different buffers
@@ -437,23 +403,6 @@ namespace llaminar2
         static constexpr float compression_ratio() { return 4.0f; }
 
         // ===== ITensorSoftmax interface =====
-
-        bool apply(
-            const float *input, float *output,
-            int rows, int cols,
-            bool use_causal_mask,
-            const MPIContext *mpi_ctx = nullptr,
-            int device_idx = -1) override
-        {
-            (void)input;
-            (void)output;
-            (void)rows;
-            (void)cols;
-            (void)use_causal_mask;
-            (void)mpi_ctx;
-            (void)device_idx;
-            return false; // Q8_1 kernel doesn't handle FP32
-        }
 
         bool apply_tensor(
             const TensorBase *input,

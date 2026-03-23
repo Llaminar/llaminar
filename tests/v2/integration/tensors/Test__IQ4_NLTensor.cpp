@@ -103,7 +103,7 @@ TEST_F(Test__IQ4_NLTensor, GemmCorrectness_Constant)
     float *output_data = output->mutable_data();
 
     auto gemm = weights->createGemm();
-    ASSERT_TRUE(gemm->multiply(input_data, output_data, m, n, k));
+    ASSERT_TRUE(gemm->multiply_tensor(input.get(), output.get(), m, n, k));
 
     // 6. Compare
     EXPECT_NEAR(output_data[0], expected, 1.0f);
@@ -169,7 +169,7 @@ TEST_F(Test__IQ4_NLTensor, GemmCorrectness_Negative)
     float *output_data = output->mutable_data();
 
     auto gemm = weights->createGemm();
-    ASSERT_TRUE(gemm->multiply(input_data, output_data, m, n, k));
+    ASSERT_TRUE(gemm->multiply_tensor(input.get(), output.get(), m, n, k));
 
     // 6. Compare
     EXPECT_NEAR(output_data[0], expected, 5.0f);
@@ -243,7 +243,7 @@ TEST_F(Test__IQ4_NLTensor, GemmCorrectness_Random)
     float *output_data = output->mutable_data();
 
     auto gemm = weights->createGemm();
-    ASSERT_TRUE(gemm->multiply(input_data, output_data, m, n, k));
+    ASSERT_TRUE(gemm->multiply_tensor(input.get(), output.get(), m, n, k));
 
     // 6. Compare
     double max_diff = 0.0;
@@ -314,14 +314,14 @@ TEST_F(Test__IQ4_NLTensor, QuantizedVsFP32Parity)
 
     gemm::FloatingPointGemmKernel fp_kernel(B_fp32.get());
     // B is [N, K], so transpose_B=true to compute A @ B^T
-    fp_kernel.multiply(A_fp32->data(), C_ref->mutable_data(), m, n, k, true);
+    fp_kernel.multiply_tensor(A_fp32.get(), C_ref.get(), m, n, k, true);
 
     // === Test: CPUNativeVNNIGemmKernel with IQ4_NL weights ===
     auto C_quant = factory.createFP32({static_cast<size_t>(m), static_cast<size_t>(n)});
     std::fill_n(C_quant->mutable_data(), m * n, 0.0f);
 
     cpu::native_vnni::CPUNativeVNNIGemmKernel quant_kernel(B_iq4nl.get());
-    quant_kernel.multiply(A_fp32->data(), C_quant->mutable_data(), m, n, k, true, 1.0f, 0.0f, nullptr, -1);
+    quant_kernel.multiply_tensor(A_fp32.get(), C_quant.get(), m, n, k, true);
 
     // === Compare results ===
     float rel_l2 = compute_relative_l2_error(C_ref->data(), C_quant->data(), m * n);

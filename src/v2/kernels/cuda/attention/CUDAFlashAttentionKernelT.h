@@ -151,7 +151,7 @@ namespace llaminar2
                 TensorBase *workspace_mask = nullptr,
                 bool use_bf16 = false,
                 const MPIContext *mpi_ctx = nullptr,
-                int device_idx = -1) override;
+                int device_idx = -1);
 
             /**
              * @brief Compute batched attention
@@ -180,7 +180,7 @@ namespace llaminar2
                 TensorBase *workspace_mask = nullptr,
                 bool use_bf16 = false,
                 const MPIContext *mpi_ctx = nullptr,
-                int device_idx = -1) override;
+                int device_idx = -1);
 
             /**
              * @brief Compute attention with separate Q and KV lengths (decode mode)
@@ -291,7 +291,7 @@ namespace llaminar2
                 TensorBase *workspace_mask = nullptr,
                 bool use_bf16 = false,
                 const MPIContext *mpi_ctx = nullptr,
-                int device_idx = -1) override;
+                int device_idx = -1);
 
             bool compute_batch(
                 const float *Q, const float *K, const float *V, float *output,
@@ -304,7 +304,7 @@ namespace llaminar2
                 TensorBase *workspace_mask = nullptr,
                 bool use_bf16 = false,
                 const MPIContext *mpi_ctx = nullptr,
-                int device_idx = -1) override;
+                int device_idx = -1);
 
             bool compute_decode(
                 const float *Q, const float *K, const float *V, float *output,
@@ -477,7 +477,7 @@ namespace llaminar2
                 TensorBase *workspace_mask = nullptr,
                 bool use_bf16 = false,
                 const MPIContext *mpi_ctx = nullptr,
-                int device_idx = -1) override;
+                int device_idx = -1);
 
             bool compute_batch(
                 const float *Q, const float *K, const float *V, float *output,
@@ -490,7 +490,7 @@ namespace llaminar2
                 TensorBase *workspace_mask = nullptr,
                 bool use_bf16 = false,
                 const MPIContext *mpi_ctx = nullptr,
-                int device_idx = -1) override;
+                int device_idx = -1);
 
             bool compute_decode(
                 const float *Q, const float *K, const float *V, float *output,
@@ -616,7 +616,7 @@ namespace llaminar2
                 TensorBase *workspace_mask = nullptr,
                 bool use_bf16 = false,
                 const MPIContext *mpi_ctx = nullptr,
-                int device_idx = -1) override;
+                int device_idx = -1);
 
             bool compute_batch(
                 const float *Q, const float *K, const float *V, float *output,
@@ -629,7 +629,7 @@ namespace llaminar2
                 TensorBase *workspace_mask = nullptr,
                 bool use_bf16 = false,
                 const MPIContext *mpi_ctx = nullptr,
-                int device_idx = -1) override;
+                int device_idx = -1);
 
             bool compute_decode(
                 const float *Q, const float *K, const float *V, float *output,

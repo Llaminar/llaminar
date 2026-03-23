@@ -401,7 +401,9 @@ namespace llaminar2
             allgather_params.local_input = buffers_.logits_local;
             allgather_params.full_output = buffers_.logits;
             allgather_params.mpi_ctx = mpi_ctx_.get();
-            allgather_params.actual_seq_len = static_cast<size_t>(total_tokens);
+            // LM head always computes only the last token's logits (lm_m=1),
+            // so the AllGather always transfers 1 row regardless of total_tokens
+            allgather_params.actual_seq_len = 1;
             // LM head is not layer-specific; use nullptr for domain (legacy MPI path)
             // Multi-domain TP typically doesn't route LM head to a specific domain
             allgather_params.domain = nullptr;
@@ -812,7 +814,8 @@ namespace llaminar2
                 allgather_params.local_input = buffers_.logits_local;
                 allgather_params.full_output = buffers_.logits;
                 allgather_params.mpi_ctx = mpi_ctx_.get();
-                allgather_params.actual_seq_len = static_cast<size_t>(total_tokens);
+                // LM head always computes only the last token's logits (lm_m=1)
+                allgather_params.actual_seq_len = 1;
                 allgather_params.domain = nullptr;
                 allgather_params.input_buffer_id = BufferId::LOGITS_LOCAL;
                 allgather_params.output_buffer_id = BufferId::LOGITS;
@@ -1165,7 +1168,8 @@ namespace llaminar2
                     allgather_params.local_input = buffers_.logits_local;
                     allgather_params.full_output = buffers_.logits;
                     allgather_params.mpi_ctx = mpi_ctx_.get();
-                    allgather_params.actual_seq_len = static_cast<size_t>(total_tokens);
+                    // LM head always computes only the last token's logits (lm_m=1)
+                    allgather_params.actual_seq_len = 1;
                     allgather_params.domain = nullptr;
                     allgather_params.input_buffer_id = BufferId::LOGITS_LOCAL;
                     allgather_params.output_buffer_id = BufferId::LOGITS;
@@ -1483,7 +1487,8 @@ namespace llaminar2
             allgather_params.local_input = logits_local;
             allgather_params.full_output = output_logits;
             allgather_params.mpi_ctx = mpi_ctx_.get();
-            allgather_params.actual_seq_len = static_cast<size_t>(total_tokens);
+            // LM head always computes only the last token's logits (lm_m=1)
+            allgather_params.actual_seq_len = 1;
             // LM head is not layer-specific; use nullptr for domain (legacy MPI path)
             allgather_params.domain = nullptr;
             allgather_params.input_buffer_id = BufferId::LOGITS_LOCAL;

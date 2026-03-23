@@ -196,19 +196,21 @@ namespace llaminar2
             int k = 896;
             int n = 2432; // Output is slice rows (2432 for rank 0)
 
-            std::vector<float> input(m * k, 0.1f);
-            std::vector<float> output(m * n, 0.0f);
+            auto input_tensor = std::make_unique<FP32Tensor>(std::vector<size_t>{(size_t)m, (size_t)k});
+            std::fill(input_tensor->mutable_data(), input_tensor->mutable_data() + m * k, 0.1f);
+            auto output_tensor = std::make_unique<FP32Tensor>(std::vector<size_t>{(size_t)m, (size_t)n});
 
             // Execute GEMM: output = input * weight^T
-            bool success = gemm->multiply(input.data(), output.data(), m, n, k);
+            bool success = gemm->multiply_tensor(input_tensor.get(), output_tensor.get(), m, n, k);
             EXPECT_TRUE(success) << "GEMM with pre-sliced weight should succeed";
 
             // Verify output is not all zeros (indicates computation happened)
             bool has_nonzero = false;
-            for (float v : output)
+            const float *output_data = output_tensor->data();
+            for (int i = 0; i < m * n; ++i)
             {
-                EXPECT_FALSE(std::isnan(v)) << "GEMM output contains NaN";
-                if (std::abs(v) > 1e-6f)
+                EXPECT_FALSE(std::isnan(output_data[i])) << "GEMM output contains NaN";
+                if (std::abs(output_data[i]) > 1e-6f)
                     has_nonzero = true;
             }
             EXPECT_TRUE(has_nonzero) << "GEMM output is all zeros - computation may have failed";
@@ -292,10 +294,11 @@ namespace llaminar2
             int n_full = static_cast<int>(total_rows);
             int n_half = static_cast<int>(half_rows);
 
-            std::vector<float> input(m * k, 0.1f);
-            std::vector<float> output_full(m * n_full, 0.0f);
-            std::vector<float> output0(m * n_half, 0.0f);
-            std::vector<float> output1(m * n_half, 0.0f);
+            auto input_tensor = std::make_unique<FP32Tensor>(std::vector<size_t>{(size_t)m, (size_t)k});
+            std::fill(input_tensor->mutable_data(), input_tensor->mutable_data() + m * k, 0.1f);
+            auto output_full_tensor = std::make_unique<FP32Tensor>(std::vector<size_t>{(size_t)m, (size_t)n_full});
+            auto output0_tensor = std::make_unique<FP32Tensor>(std::vector<size_t>{(size_t)m, (size_t)n_half});
+            auto output1_tensor = std::make_unique<FP32Tensor>(std::vector<size_t>{(size_t)m, (size_t)n_half});
 
             auto *gemm_full = getPreparedKernel(full_weight.get(), DeviceId::cpu());
             auto *gemm0 = getPreparedKernel(slice0, DeviceId::cpu());
@@ -306,9 +309,9 @@ namespace llaminar2
             ASSERT_NE(gemm1, nullptr);
 
             // Execute GEMMs
-            EXPECT_TRUE(gemm_full->multiply(input.data(), output_full.data(), m, n_full, k));
-            EXPECT_TRUE(gemm0->multiply(input.data(), output0.data(), m, n_half, k));
-            EXPECT_TRUE(gemm1->multiply(input.data(), output1.data(), m, n_half, k));
+            EXPECT_TRUE(gemm_full->multiply_tensor(input_tensor.get(), output_full_tensor.get(), m, n_full, k));
+            EXPECT_TRUE(gemm0->multiply_tensor(input_tensor.get(), output0_tensor.get(), m, n_half, k));
+            EXPECT_TRUE(gemm1->multiply_tensor(input_tensor.get(), output1_tensor.get(), m, n_half, k));
 
             // Compare GEMM outputs: slice0 should match rows [0, half_rows) of full
             float max_diff = 0.0f;
@@ -316,8 +319,8 @@ namespace llaminar2
             {
                 for (size_t col = 0; col < half_rows; ++col)
                 {
-                    float full_val = output_full[row * n_full + col];
-                    float slice_val = output0[row * n_half + col];
+                    float full_val = output_full_tensor->data()[row * n_full + col];
+                    float slice_val = output0_tensor->data()[row * n_half + col];
                     max_diff = std::max(max_diff, std::abs(full_val - slice_val));
                 }
             }
@@ -330,8 +333,8 @@ namespace llaminar2
             {
                 for (size_t col = 0; col < half_rows; ++col)
                 {
-                    float full_val = output_full[row * n_full + half_rows + col];
-                    float slice_val = output1[row * n_half + col];
+                    float full_val = output_full_tensor->data()[row * n_full + half_rows + col];
+                    float slice_val = output1_tensor->data()[row * n_half + col];
                     max_diff = std::max(max_diff, std::abs(full_val - slice_val));
                 }
             }

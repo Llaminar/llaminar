@@ -9,6 +9,8 @@
 #include <random>
 #include <memory>
 #include <algorithm>
+#include <cstring>
+#include <cstring>
 
 #include "tensors/Tensors.h"
 #include "kernels/cpu/native_vnni/CPUNativeVNNIGemmKernel.h"
@@ -56,6 +58,11 @@ protected:
         // Create output C (M x N)
         std::vector<float> C(M * N);
 
+        // Create tensor wrappers for multiply_tensor
+        auto A_tensor = std::make_unique<FP32Tensor>(std::vector<size_t>{(size_t)M, (size_t)K});
+        std::memcpy(A_tensor->mutable_data(), A.data(), (size_t)M * K * sizeof(float));
+        auto C_tensor = std::make_unique<FP32Tensor>(std::vector<size_t>{(size_t)M, (size_t)N});
+
         // Create kernel
         MPIContext mpi_ctx(rank_, 1, MPI_COMM_WORLD);
         auto kernel = tensor->createGemm();
@@ -63,7 +70,7 @@ protected:
         // Warmup
         for (int i = 0; i < 3; ++i)
         {
-            kernel->multiply(A.data(), C.data(), M, N, K);
+            kernel->multiply_tensor(A_tensor.get(), C_tensor.get(), M, N, K);
         }
 
         // Benchmark
@@ -72,7 +79,7 @@ protected:
         auto start = std::chrono::high_resolution_clock::now();
         for (int i = 0; i < iters; ++i)
         {
-            kernel->multiply(A.data(), C.data(), M, N, K);
+            kernel->multiply_tensor(A_tensor.get(), C_tensor.get(), M, N, K);
         }
         MPI_Barrier(MPI_COMM_WORLD);
         auto end = std::chrono::high_resolution_clock::now();

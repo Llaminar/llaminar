@@ -754,16 +754,16 @@ TEST_F(Test__Q8_0Tensor, QuantizedVsFP32Parity)
 
     // Run quantized GEMM (INT8 path)
     auto quantized_gemm = q8_0_tensor->createGemm();
-    ASSERT_TRUE(quantized_gemm->multiply(
-        input_data,
-        output_quantized->mutable_data(),
+    ASSERT_TRUE(quantized_gemm->multiply_tensor(
+        input.get(),
+        output_quantized.get(),
         m, n, k));
 
     // Run FP32 GEMM (OneDNN reference)
     gemm::FloatingPointGemmKernel fp32_gemm(fp32_weights.get());
-    ASSERT_TRUE(fp32_gemm.multiply(
-        input_data,
-        output_fp32->mutable_data(),
+    ASSERT_TRUE(fp32_gemm.multiply_tensor(
+        input.get(),
+        output_fp32.get(),
         m, n, k));
 
     // Compare results - compute relative L2 error

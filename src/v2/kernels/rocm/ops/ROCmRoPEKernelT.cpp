@@ -222,48 +222,6 @@ namespace llaminar2
             return workspace_;
         }
 
-        bool ROCmRoPEKernelT<ActivationPrecision::FP32>::apply(
-            float *data, float *output,
-            const int *pos_ids,
-            int batch_size, int seq_len, int head_dim, int num_heads,
-            float theta_base, bool interleaved,
-            const MPIContext *mpi_ctx,
-            int device_idx)
-        {
-            (void)output;
-            (void)batch_size;
-            (void)interleaved; // TODO: support interleaved layout
-            (void)mpi_ctx;
-            int dev = (device_idx >= 0) ? device_idx : device_idx_;
-
-            if (!validateROCmWorkspaceBinding(workspace_, dev, "ROCmRoPEKernelT<FP32>"))
-            {
-                return false;
-            }
-
-            float *d_inv_freq = static_cast<float *>(workspace_->getBuffer(RoPEWorkspaceBuffers::INV_FREQ));
-            if (!d_inv_freq)
-            {
-                LOG_ERROR("[ROCmRoPEKernelT<FP32>] INV_FREQ buffer not allocated in workspace");
-                return false;
-            }
-
-            // Initialize inv_freq if needed
-            if (!inv_freq_initialized_ || inv_freq_head_dim_ != head_dim || inv_freq_theta_ != theta_base)
-            {
-                if (!hipOps_rope_populate_inv_freq(d_inv_freq, head_dim, theta_base, dev, gpu_stream_))
-                {
-                    LOG_ERROR("[ROCmRoPEKernelT<FP32>] Failed to populate inv_freq");
-                    return false;
-                }
-                inv_freq_initialized_ = true;
-                inv_freq_head_dim_ = head_dim;
-                inv_freq_theta_ = theta_base;
-            }
-
-            return hipOps_rope_fp32_v2(data, nullptr, d_inv_freq, pos_ids, seq_len, num_heads, num_heads, head_dim, dev, gpu_stream_);
-        }
-
         bool ROCmRoPEKernelT<ActivationPrecision::FP32>::apply_typed(
             float *Q,
             float *K,
@@ -545,44 +503,6 @@ namespace llaminar2
             return workspace_;
         }
 
-        bool ROCmRoPEKernelT<ActivationPrecision::BF16>::apply_bf16(
-            uint16_t *data, uint16_t *output,
-            const int *pos_ids,
-            int batch_size, int seq_len, int head_dim, int num_heads,
-            float theta_base, int device_idx)
-        {
-            (void)output;
-            (void)batch_size;
-            int dev = (device_idx >= 0) ? device_idx : device_idx_;
-
-            if (!validateROCmWorkspaceBinding(workspace_, dev, "ROCmRoPEKernelT<BF16>"))
-            {
-                return false;
-            }
-
-            float *d_inv_freq = static_cast<float *>(workspace_->getBuffer(RoPEWorkspaceBuffers::INV_FREQ));
-            if (!d_inv_freq)
-            {
-                LOG_ERROR("[ROCmRoPEKernelT<BF16>] INV_FREQ buffer not allocated in workspace");
-                return false;
-            }
-
-            // Initialize inv_freq if needed
-            if (!inv_freq_initialized_ || inv_freq_head_dim_ != head_dim || inv_freq_theta_ != theta_base)
-            {
-                if (!hipOps_rope_populate_inv_freq(d_inv_freq, head_dim, theta_base, dev, gpu_stream_))
-                {
-                    LOG_ERROR("[ROCmRoPEKernelT<BF16>] Failed to populate inv_freq");
-                    return false;
-                }
-                inv_freq_initialized_ = true;
-                inv_freq_head_dim_ = head_dim;
-                inv_freq_theta_ = theta_base;
-            }
-
-            return hipOps_rope_bf16_v2(data, nullptr, d_inv_freq, pos_ids, seq_len, num_heads, num_heads, head_dim, dev, gpu_stream_);
-        }
-
         bool ROCmRoPEKernelT<ActivationPrecision::BF16>::apply_typed(
             uint16_t *Q,
             uint16_t *K,
@@ -855,44 +775,6 @@ namespace llaminar2
         DeviceWorkspaceManager *ROCmRoPEKernelT<ActivationPrecision::FP16>::getWorkspace() const
         {
             return workspace_;
-        }
-
-        bool ROCmRoPEKernelT<ActivationPrecision::FP16>::apply_fp16(
-            uint16_t *data, uint16_t *output,
-            const int *pos_ids,
-            int batch_size, int seq_len, int head_dim, int num_heads,
-            float theta_base, int device_idx)
-        {
-            (void)output;
-            (void)batch_size;
-            int dev = (device_idx >= 0) ? device_idx : device_idx_;
-
-            if (!validateROCmWorkspaceBinding(workspace_, dev, "ROCmRoPEKernelT<FP16>"))
-            {
-                return false;
-            }
-
-            float *d_inv_freq = static_cast<float *>(workspace_->getBuffer(RoPEWorkspaceBuffers::INV_FREQ));
-            if (!d_inv_freq)
-            {
-                LOG_ERROR("[ROCmRoPEKernelT<FP16>] INV_FREQ buffer not allocated in workspace");
-                return false;
-            }
-
-            // Initialize inv_freq if needed
-            if (!inv_freq_initialized_ || inv_freq_head_dim_ != head_dim || inv_freq_theta_ != theta_base)
-            {
-                if (!hipOps_rope_populate_inv_freq(d_inv_freq, head_dim, theta_base, dev, gpu_stream_))
-                {
-                    LOG_ERROR("[ROCmRoPEKernelT<FP16>] Failed to populate inv_freq");
-                    return false;
-                }
-                inv_freq_initialized_ = true;
-                inv_freq_head_dim_ = head_dim;
-                inv_freq_theta_ = theta_base;
-            }
-
-            return hipOps_rope_fp16_v2(data, nullptr, d_inv_freq, pos_ids, seq_len, num_heads, num_heads, head_dim, dev, gpu_stream_);
         }
 
         bool ROCmRoPEKernelT<ActivationPrecision::FP16>::apply_typed(

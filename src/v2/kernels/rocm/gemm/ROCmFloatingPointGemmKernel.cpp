@@ -269,11 +269,10 @@ namespace llaminar2
                 d_mapped_output = d_C;
                 d_C = d_mapped_redirect_;
                 static std::once_flag fp32gemm_mapped_once;
-                std::call_once(fp32gemm_mapped_once, [&]() {
-                    LOG_WARN("[ROCmFloatingPointGemmKernel] MAPPED REDIRECT: M=" << m << " N=" << n
-                             << " mapped_ptr=" << d_mapped_output << " -> hbm=" << d_C
-                             << " (" << (needed * 4 / 1024) << " KB)");
-                });
+                std::call_once(fp32gemm_mapped_once, [&]()
+                               { LOG_WARN("[ROCmFloatingPointGemmKernel] MAPPED REDIRECT: M=" << m << " N=" << n
+                                                                                              << " mapped_ptr=" << d_mapped_output << " -> hbm=" << d_C
+                                                                                              << " (" << (needed * 4 / 1024) << " KB)"); });
             }
 
             // Apply activation row offset
@@ -350,41 +349,6 @@ namespace llaminar2
                 }
                 return success;
             }
-        }
-
-        // =====================================================================
-        // ITensorGemm interface - multiply() raw pointers
-        // =====================================================================
-
-        bool ROCmFloatingPointGemmKernel::multiply(
-            const float *A, float *C,
-            int m, int n, int k,
-            bool transpose_B,
-            float alpha, float beta,
-            const MPIContext * /*mpi_ctx*/,
-            int /*device_idx*/,
-            DeviceWorkspaceManager *workspace)
-        {
-            ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::GEMM_ROCBLAS, static_cast<hipStream_t>(gpu_stream_));
-            (void)workspace; // TODO: Use workspace for intermediate allocations
-            if (!hipblas_kernel_)
-            {
-                LOG_ERROR("[ROCmFloatingPointGemmKernel::multiply] hipBLAS kernel not initialized");
-                return false;
-            }
-
-            // A and C are device pointers
-            // Weight (B) is stored in d_weights_
-            // Execute: C = alpha * A @ B^T + beta * C (transpose_B is typically true)
-
-            return hipblas_kernel_->execute(
-                A,                                      // d_A
-                static_cast<const float *>(d_weights_), // d_B
-                C,                                      // d_C
-                m, n, k,
-                false,       // transA = false
-                transpose_B, // transB
-                alpha, beta);
         }
 
         // =====================================================================

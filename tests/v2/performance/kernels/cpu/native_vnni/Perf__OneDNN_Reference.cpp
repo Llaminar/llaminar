@@ -25,6 +25,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstring>
 #include <cstdint>
 #include <cstdio>
 #include <memory>
@@ -262,17 +263,25 @@ namespace
     double benchKernel(ITensorGemm *kernel, const float *A, float *C,
                        int M, int N, int K, int warmup, int iters)
     {
+        // Create tensor wrappers for multiply_tensor
+        auto A_tensor = std::make_unique<FP32Tensor>(std::vector<size_t>{(size_t)M, (size_t)K});
+        std::memcpy(A_tensor->mutable_data(), A, (size_t)M * K * sizeof(float));
+        auto C_tensor = std::make_unique<FP32Tensor>(std::vector<size_t>{(size_t)M, (size_t)N});
+
         for (int i = 0; i < warmup; ++i)
-            kernel->multiply(A, C, M, N, K);
+            kernel->multiply_tensor(A_tensor.get(), C_tensor.get(), M, N, K);
 
         std::vector<double> times(iters);
         for (int i = 0; i < iters; ++i)
         {
             auto t0 = std::chrono::high_resolution_clock::now();
-            kernel->multiply(A, C, M, N, K);
+            kernel->multiply_tensor(A_tensor.get(), C_tensor.get(), M, N, K);
             auto t1 = std::chrono::high_resolution_clock::now();
             times[i] = std::chrono::duration<double, std::micro>(t1 - t0).count();
         }
+
+        // Copy result back to caller's C buffer
+        std::memcpy(C, C_tensor->data(), (size_t)M * N * sizeof(float));
 
         std::sort(times.begin(), times.end());
         return times[std::max(0, (int)(iters * 0.1) - 1)];

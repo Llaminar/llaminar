@@ -124,7 +124,7 @@ namespace llaminar2
             TensorBase *workspace_mask = nullptr,
             bool use_bf16 = false,
             const MPIContext *mpi_ctx = nullptr,
-            int device_idx = -1) override
+            int device_idx = -1)
         {
             // Cast inputs to ElementType
             const ElementType *Q_typed = reinterpret_cast<const ElementType *>(Q);
@@ -253,7 +253,7 @@ namespace llaminar2
             TensorBase *workspace_scores = nullptr,
             TensorBase *workspace_mask = nullptr,
             const MPIContext *mpi_ctx = nullptr,
-            int device_idx = -1) override
+            int device_idx = -1)
         {
             (void)mpi_ctx;
 
@@ -298,7 +298,7 @@ namespace llaminar2
             TensorBase *workspace_scores = nullptr,
             TensorBase *workspace_mask = nullptr,
             const MPIContext *mpi_ctx = nullptr,
-            int device_idx = -1) override
+            int device_idx = -1)
         {
             (void)mpi_ctx;
             (void)device_idx;
@@ -858,7 +858,7 @@ namespace llaminar2
             TensorBase *workspace_mask = nullptr,
             bool use_bf16 = false,
             const MPIContext *mpi_ctx = nullptr,
-            int device_idx = -1) override
+            int device_idx = -1)
         {
             // Allocate workspaces if not provided
             std::shared_ptr<TensorBase> scores_alloc, buffer_alloc, context_alloc;

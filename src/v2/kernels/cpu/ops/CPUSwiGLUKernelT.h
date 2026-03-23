@@ -184,7 +184,7 @@ namespace llaminar2
             int rows, int cols,
             bool add_residual,
             const MPIContext *mpi_ctx = nullptr,
-            int device_idx = -1) override;
+            int device_idx = -1);
 
         /**
          * @brief Apply SwiGLU using tensor objects with automatic type dispatch
@@ -257,7 +257,7 @@ namespace llaminar2
             int rows, int cols,
             bool add_residual,
             const MPIContext *mpi_ctx = nullptr,
-            int device_idx = -1) override;
+            int device_idx = -1);
 
         /**
          * @brief Apply SwiGLU - BF16 path
@@ -267,7 +267,7 @@ namespace llaminar2
             int rows, int cols,
             bool add_residual,
             const MPIContext *mpi_ctx = nullptr,
-            int device_idx = -1) override;
+            int device_idx = -1);
 
         /**
          * @brief Apply SwiGLU using tensor objects with automatic type dispatch
@@ -340,7 +340,7 @@ namespace llaminar2
             int rows, int cols,
             bool add_residual,
             const MPIContext *mpi_ctx = nullptr,
-            int device_idx = -1) override;
+            int device_idx = -1);
 
         /**
          * @brief Apply SwiGLU - FP16 path
@@ -350,7 +350,7 @@ namespace llaminar2
             int rows, int cols,
             bool add_residual,
             const MPIContext *mpi_ctx = nullptr,
-            int device_idx = -1) override;
+            int device_idx = -1);
 
         /**
          * @brief Apply SwiGLU using tensor objects with automatic type dispatch
@@ -433,7 +433,7 @@ namespace llaminar2
             int rows, int cols,
             bool add_residual,
             const MPIContext *mpi_ctx = nullptr,
-            int device_idx = -1) override;
+            int device_idx = -1);
 
         /**
          * @brief Apply SwiGLU - Q8_1 path
@@ -443,7 +443,7 @@ namespace llaminar2
             int rows, int cols,
             bool add_residual,
             const MPIContext *mpi_ctx = nullptr,
-            int device_idx = -1) override;
+            int device_idx = -1);
 
         /**
          * @brief Apply SwiGLU using tensor objects with automatic type dispatch

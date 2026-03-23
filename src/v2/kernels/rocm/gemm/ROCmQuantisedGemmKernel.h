@@ -464,46 +464,6 @@ namespace llaminar2
                 int activation_row_offset = 0) override;
 
             /**
-             * @brief Raw FP32 pointer GEMM (fallback path)
-             *
-             * Quantizes FP32 activations → INT8, runs CK GEMM, outputs FP32.
-             *
-             * @param A FP32 activations [m, k] on device
-             * @param C FP32 output [m, n] on device
-             * @param workspace Pre-allocated device workspace (nullptr = kernel allocates)
-             */
-            bool multiply(
-                const float *A, float *C,
-                int m, int n, int k,
-                bool transpose_B = true,
-                float alpha = 1.0f, float beta = 0.0f,
-                const MPIContext *mpi_ctx = nullptr,
-                int device_idx = -1,
-                DeviceWorkspaceManager *workspace = nullptr) override;
-
-            /**
-             * @brief Fused multi-projection GEMM with automatic host/device transfer
-             *
-             * Handles the host-to-device transfer required for FusedGateUpGEMMStage
-             * and FusedQKVGEMMStage which pass host pointers.
-             *
-             * @param input Host FP32 input [m, k]
-             * @param projections Vector of projections (each with host output pointer)
-             * @param m Number of rows
-             * @param k Input dimension
-             * @param mpi_ctx MPI context (unused for ROCm)
-             * @param device_idx Device index (unused, kernel bound to rocm_device_id_)
-             * @param workspace Pre-allocated device workspace (nullptr = kernel allocates)
-             */
-            bool multiply_fused(
-                const float *input,
-                const std::vector<FusedProjectionDesc> &projections,
-                int m, int k,
-                const MPIContext *mpi_ctx = nullptr,
-                int device_idx = -1,
-                DeviceWorkspaceManager *workspace = nullptr) override;
-
-            /**
              * @brief Tensor-aware fused multi-projection GEMM
              *
              * Optimized implementation that:
@@ -541,7 +501,7 @@ namespace llaminar2
                 bool transpose_B = true,
                 float alpha = 1.0f, float beta = 0.0f,
                 const MPIContext *mpi_ctx = nullptr,
-                int device_idx = -1) override;
+                int device_idx = -1);
 
             /**
              * @brief Strided activation-activation GEMM (not supported)

@@ -240,24 +240,6 @@ namespace llaminar
                         return kernel_.supports_device(device_idx);
                     }
 
-                    // Original raw pointer interface (legacy)
-                    bool apply(
-                        float *data, float *output,
-                        const int *pos_ids,
-                        int batch_size, int seq_len, int head_dim, int num_heads,
-                        float theta_base, bool interleaved,
-                        const llaminar2::MPIContext *mpi_ctx,
-                        int device_idx) override
-                    {
-                        (void)interleaved; // Not used in typed kernel
-                        (void)mpi_ctx;     // Not used in typed kernel
-                        // Legacy interface treats data as Q and output as K
-                        // Treat batch_size * seq_len as total seq_len
-                        return kernel_.apply_typed(data, output, pos_ids,
-                                                   batch_size * seq_len, num_heads, num_heads, head_dim,
-                                                   theta_base, device_idx);
-                    }
-
                     // Tensor-based interface (used by RoPEOpTyped)
                     bool apply_tensor(
                         llaminar2::TensorBase *Q,
@@ -314,30 +296,6 @@ namespace llaminar
                     bool supports_device(int device_idx) const override
                     {
                         return kernel_.supports_device(device_idx);
-                    }
-
-                    // Original raw pointer interface (legacy) - not supported for Q8_1
-                    bool apply(
-                        float *data, float *output,
-                        const int *pos_ids,
-                        int batch_size, int seq_len, int head_dim, int num_heads,
-                        float theta_base, bool interleaved,
-                        const llaminar2::MPIContext *mpi_ctx,
-                        int device_idx) override
-                    {
-                        (void)data;
-                        (void)output;
-                        (void)pos_ids;
-                        (void)batch_size;
-                        (void)seq_len;
-                        (void)head_dim;
-                        (void)num_heads;
-                        (void)theta_base;
-                        (void)interleaved;
-                        (void)mpi_ctx;
-                        (void)device_idx;
-                        LOG_ERROR("[Q8_1RoPEKernelAdapter] Raw float* interface not supported for Q8_1");
-                        return false;
                     }
 
                     // Tensor-based interface (used by RoPEOpTyped)
@@ -419,7 +377,7 @@ namespace llaminar
                         int rows, int cols,
                         bool add_residual,
                         const llaminar2::MPIContext *mpi_ctx,
-                        int device_idx) override
+                        int device_idx)
                     {
                         (void)add_residual; // Not used in typed kernel
                         (void)mpi_ctx;      // Not used in typed kernel
@@ -485,7 +443,7 @@ namespace llaminar
                         int rows, int cols,
                         bool add_residual,
                         const llaminar2::MPIContext *mpi_ctx,
-                        int device_idx) override
+                        int device_idx)
                     {
                         (void)gate;
                         (void)up;
@@ -3895,46 +3853,22 @@ namespace llaminar
                 {
                     (void)ctx;
 
-                    // For bias support, we need to use the optimized fused path
-                    // which is available on FP32 outputs via multiply_fused
+                    // For bias support, use the tensor-aware fused path
                     if (!gemm_gate_ || !gemm_up_)
                     {
                         LOG_ERROR("[FusedGateUpGemmAdapter] Null GEMM kernel(s)");
                         return false;
                     }
 
-                    // Check if output is FP32 - if so, use multiply_fused
-                    if (output_gate->native_type() == llaminar2::TensorType::FP32 &&
-                        output_up->native_type() == llaminar2::TensorType::FP32)
+                    // Use tensor-aware fused API
                     {
-                        // Get FP32 pointers
-                        const float *input_fp32 = input->fp32_data();
-                        float *output_gate_fp32 = output_gate->mutable_data();
-                        float *output_up_fp32 = output_up->mutable_data();
+                        // Build tensor projection descriptors
+                        std::vector<llaminar2::ITensorGemm::TensorProjectionDesc> projections = {
+                            {gemm_gate_, output_gate, n_gate, bias_gate, "gate"},
+                            {gemm_up_, output_up, n_up, bias_up, "up"}};
 
-                        if (!input_fp32 || !output_gate_fp32 || !output_up_fp32)
-                        {
-                            LOG_ERROR("[FusedGateUpGemmAdapter] Failed to get FP32 data");
-                            return false;
-                        }
-
-                        // Build projection descriptors for fused multiply
-                        // FusedProjectionDesc takes TensorBase* for bias
-                        std::vector<llaminar2::ITensorGemm::FusedProjectionDesc> projections = {
-                            {gemm_gate_, output_gate_fp32, n_gate, bias_gate, "gate"},
-                            {gemm_up_, output_up_fp32, n_up, bias_up, "up"}};
-
-                        return gemm_gate_->multiply_fused(input_fp32, projections, m, k);
+                        return gemm_gate_->multiply_fused_tensor(input, projections, m, k);
                     }
-
-                    // For non-FP32 outputs (e.g., Q8_1), bias is not supported
-                    if (bias_gate || bias_up)
-                    {
-                        LOG_WARN("[FusedGateUpGemmAdapter] Bias not supported with non-FP32 output - ignoring");
-                    }
-
-                    // Fall back to regular execute without bias
-                    return execute(input, output_gate, output_up, m, k, n_gate, n_up, ctx, device_idx);
                 }
 
                 bool supports_device(int device_idx) const override

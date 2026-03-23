@@ -889,42 +889,6 @@ namespace llaminar2
                     .withScalar("beta", "accumulate scale factor");
             }
 
-            // ========== Primary Interface: multiply() ==========
-
-            /**
-             * @brief FP32 activation × FP32 weight GEMM
-             *
-             * C = alpha * A @ B^T + beta * C
-             */
-            bool multiply(
-                const float *A, float *C,
-                int m, int n, int k,
-                bool transpose_B = true,
-                float alpha = 1.0f, float beta = 0.0f,
-                const MPIContext *mpi_ctx = nullptr,
-                int device_idx = -1,
-                DeviceWorkspaceManager *workspace = nullptr) override
-            {
-                (void)mpi_ctx;
-                (void)device_idx;
-                (void)workspace; // CPU kernel doesn't need external workspace
-
-                if (!weight_tensor_)
-                {
-                    LOG_ERROR("[FloatingPointGemmKernel] No weight tensor bound");
-                    return false;
-                }
-
-                if (weight_type_ != TensorType::FP32)
-                {
-                    LOG_ERROR("[FloatingPointGemmKernel] multiply() requires FP32 weights, got " << static_cast<int>(weight_type_));
-                    return false;
-                }
-
-                const float *B = weight_tensor_->data();
-                return run_onednn_fp32_matmul(A, B, C, m, n, k, transpose_B, alpha, beta);
-            }
-
             // ========== Tensor-Based Interface: multiply_tensor() ==========
 
             /**
@@ -1161,7 +1125,7 @@ namespace llaminar2
                 float alpha, float beta,
                 const MPIContext *mpi_ctx,
                 int device_idx,
-                ActivationFormat format_A, ActivationFormat format_B) override
+                ActivationFormat format_A, ActivationFormat format_B)
             {
                 (void)mpi_ctx;
                 (void)device_idx;
@@ -1224,7 +1188,7 @@ namespace llaminar2
                 bool is_causal,
                 const MPIContext *mpi_ctx,
                 int device_idx,
-                ActivationFormat format_A, ActivationFormat format_B) override
+                ActivationFormat format_A, ActivationFormat format_B)
             {
                 // 1. GEMM with scale
                 if (!multiply_activations_typed_impl(A, B, C, m, n, k, transpose_B, scale, 0.0f, mpi_ctx, device_idx, format_A, format_B))
@@ -1277,11 +1241,11 @@ namespace llaminar2
                 const float *A, const float *B, float *C,
                 int m, int n, int k,
                 bool transpose_B, float alpha, float beta,
-                const MPIContext *mpi_ctx, int device_idx) override
+                const MPIContext *mpi_ctx, int device_idx)
             {
                 if (!B && weight_tensor_)
                 {
-                    return multiply(A, C, m, n, k, transpose_B, alpha, beta, mpi_ctx, device_idx);
+                    return run_onednn_fp32_matmul(A, nullptr, C, m, n, k, transpose_B, alpha, beta);
                 }
                 return run_onednn_fp32_matmul(A, B, C, m, n, k, transpose_B, alpha, beta);
             }
@@ -1366,11 +1330,11 @@ namespace llaminar2
                 const float *A, const float *B, float *C,
                 int m, int n, int k,
                 bool transpose_B, int softmax_axis, const float *mask,
-                const MPIContext *mpi_ctx, int device_idx) override
+                const MPIContext *mpi_ctx, int device_idx)
             {
                 // 1. GEMM: C = A * B
-                // Note: multiply() takes alpha/beta. We use default 1.0/0.0
-                if (!multiply(A, C, m, n, k, transpose_B, 1.0f, 0.0f, mpi_ctx, device_idx))
+                // Direct weight GEMM via stored weight tensor
+                if (!run_onednn_fp32_matmul(A, nullptr, C, m, n, k, transpose_B, 1.0f, 0.0f))
                 {
                     return false;
                 }

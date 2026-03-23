@@ -648,20 +648,8 @@ namespace llaminar2
         const MPIContext *mpi_ctx,
         int device_idx)
     {
-        auto kernel = createRMSNorm();
-        if (!kernel)
-        {
-            LOG_ERROR("[BF16Tensor::applyRMSNorm] Failed to create RMSNorm kernel");
-            return false;
-        }
-
-        // BF16 path: apply_bf16() with BF16 buffers (in-place)
-        return kernel->apply_bf16(
-            this->typed_data(),
-            gamma,
-            this->mutable_typed_data(),
-            seq_len, d_model, eps,
-            device_idx);
+        LOG_ERROR("[BF16Tensor::applyRMSNorm] Removed — use ITensorRMSNorm::apply_tensor() via stages");
+        return false;
     }
 
     bool BF16Tensor::applyRoPE(
@@ -683,16 +671,10 @@ namespace llaminar2
             return false;
         }
 
-        // BF16 path: apply_bf16() with BF16 buffers
-        // Q is this tensor, K must be BF16 as well
-        // Note: K is passed as float* but should actually be BF16
-        return kernel->apply_bf16(
-            this->mutable_typed_data(),      // Q (BF16)
-            reinterpret_cast<uint16_t *>(K), // K (BF16)
-            position_ids,
-            seq_len, n_heads, n_kv_heads, head_dim,
-            rope_theta,
-            device_idx);
+        // Legacy raw-pointer path removed — use RoPEStage with apply_tensor() instead
+        (void)kernel;
+        LOG_ERROR("[BF16Tensor::applyRoPE] Legacy raw-pointer path removed. Use RoPEStage with apply_tensor() instead.");
+        return false;
     }
 
     bool BF16Tensor::from_int32_with_scales(

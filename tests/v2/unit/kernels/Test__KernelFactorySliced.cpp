@@ -290,10 +290,9 @@ TEST_F(KernelFactorySlicedTest, SlicedGemmProducesCorrectOutput)
     // Compute full GEMM
     auto *full_kernel = getPreparedKernel(weights.get());
     ASSERT_NE(full_kernel, nullptr);
-    bool ok = full_kernel->multiply(
-        input->data(),
-        output_full->mutable_data(),
-        static_cast<int>(M), static_cast<int>(N), static_cast<int>(K), 1.0f, 0.0f);
+    bool ok = full_kernel->multiply_tensor(
+        input.get(), output_full.get(),
+        static_cast<int>(M), static_cast<int>(N), static_cast<int>(K));
     ASSERT_TRUE(ok);
 
     // Compute sliced GEMMs
@@ -302,16 +301,14 @@ TEST_F(KernelFactorySlicedTest, SlicedGemmProducesCorrectOutput)
     ASSERT_NE(sliced1, nullptr);
     ASSERT_NE(sliced2, nullptr);
 
-    ok = sliced1->multiply(
-        input->data(),
-        output_sliced1->mutable_data(),
-        static_cast<int>(M), static_cast<int>(N / 2), static_cast<int>(K), 1.0f, 0.0f);
+    ok = sliced1->multiply_tensor(
+        input.get(), output_sliced1.get(),
+        static_cast<int>(M), static_cast<int>(N / 2), static_cast<int>(K));
     ASSERT_TRUE(ok);
 
-    ok = sliced2->multiply(
-        input->data(),
-        output_sliced2->mutable_data(),
-        static_cast<int>(M), static_cast<int>(N / 2), static_cast<int>(K), 1.0f, 0.0f);
+    ok = sliced2->multiply_tensor(
+        input.get(), output_sliced2.get(),
+        static_cast<int>(M), static_cast<int>(N / 2), static_cast<int>(K));
     ASSERT_TRUE(ok);
 
     // Compare: concatenation of sliced outputs should match full output

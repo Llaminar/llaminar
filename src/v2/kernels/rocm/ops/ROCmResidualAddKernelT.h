@@ -87,7 +87,7 @@ namespace llaminar2
                 const float *input, const float *residual, float *output,
                 size_t num_elements,
                 const MPIContext *mpi_ctx = nullptr,
-                int device_idx = -1) override
+                int device_idx = -1)
             {
                 ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::RESIDUAL_ADD, static_cast<hipStream_t>(gpu_stream_));
                 (void)mpi_ctx;
@@ -167,7 +167,7 @@ namespace llaminar2
                 const float *input, const float *residual, float *output,
                 size_t num_elements,
                 const MPIContext *mpi_ctx = nullptr,
-                int device_idx = -1) override
+                int device_idx = -1)
             {
                 (void)input;
                 (void)residual;
@@ -182,7 +182,7 @@ namespace llaminar2
                 const uint16_t *input, const uint16_t *residual, uint16_t *output,
                 size_t num_elements,
                 const MPIContext *mpi_ctx = nullptr,
-                int device_idx = -1) override
+                int device_idx = -1)
             {
                 ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::RESIDUAL_ADD, static_cast<hipStream_t>(gpu_stream_));
                 (void)mpi_ctx;
@@ -264,7 +264,7 @@ namespace llaminar2
                 const float *input, const float *residual, float *output,
                 size_t num_elements,
                 const MPIContext *mpi_ctx = nullptr,
-                int device_idx = -1) override
+                int device_idx = -1)
             {
                 (void)input;
                 (void)residual;
@@ -279,7 +279,7 @@ namespace llaminar2
                 const uint16_t *input, const uint16_t *residual, uint16_t *output,
                 size_t num_elements,
                 const MPIContext *mpi_ctx = nullptr,
-                int device_idx = -1) override
+                int device_idx = -1)
             {
                 ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::RESIDUAL_ADD, static_cast<hipStream_t>(gpu_stream_));
                 (void)mpi_ctx;

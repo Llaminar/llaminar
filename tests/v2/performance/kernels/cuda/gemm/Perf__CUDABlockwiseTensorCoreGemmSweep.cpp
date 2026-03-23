@@ -20,6 +20,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -579,37 +580,27 @@ namespace
             }
 
             auto h_input = TestTensorFactory::createFP32Random({1u, static_cast<size_t>(k)}, -0.25f, 0.25f, 7);
-            const float *h_input_data = h_input->data();
 
-            const size_t A_bytes = static_cast<size_t>(k) * sizeof(float);
-            const size_t C_bytes = static_cast<size_t>(n) * sizeof(float);
-            float *d_A = nullptr;
-            float *d_C = nullptr;
-            if (cudaMalloc(&d_A, A_bytes) != cudaSuccess)
+            // Create tensor wrappers and upload to GPU
+            auto A_tensor = std::make_unique<FP32Tensor>(std::vector<size_t>{1u, static_cast<size_t>(k)});
+            std::memcpy(A_tensor->mutable_data(), h_input->data(), static_cast<size_t>(k) * sizeof(float));
+            auto C_tensor = std::make_unique<FP32Tensor>(std::vector<size_t>{1u, static_cast<size_t>(n)});
+
+            if (!A_tensor->ensureOnDevice(device_))
             {
                 cudaNativeVNNIGemvSweep_clearConfig();
-                throw std::runtime_error("cudaMalloc d_A failed");
+                throw std::runtime_error("ensureOnDevice A failed");
             }
-            if (cudaMalloc(&d_C, C_bytes) != cudaSuccess)
+            if (!C_tensor->ensureOnDevice(device_))
             {
-                cudaFree(d_A);
                 cudaNativeVNNIGemvSweep_clearConfig();
-                throw std::runtime_error("cudaMalloc d_C failed");
-            }
-            if (cudaMemcpy(d_A, h_input_data, A_bytes, cudaMemcpyHostToDevice) != cudaSuccess)
-            {
-                cudaFree(d_A);
-                cudaFree(d_C);
-                cudaNativeVNNIGemvSweep_clearConfig();
-                throw std::runtime_error("cudaMemcpy d_A failed");
+                throw std::runtime_error("ensureOnDevice C failed");
             }
 
             for (int i = 0; i < cfg.warmup_runs; ++i)
             {
-                if (!kernel->multiply(d_A, d_C, 1, n, k))
+                if (!kernel->multiply_tensor(A_tensor.get(), C_tensor.get(), 1, n, k))
                 {
-                    cudaFree(d_A);
-                    cudaFree(d_C);
                     cudaNativeVNNIGemvSweep_clearConfig();
                     throw std::runtime_error("CUDA native payload GEMV warmup failed");
                 }
@@ -623,14 +614,12 @@ namespace
                 cudaEvent_t stop = nullptr;
                 if (cudaEventCreate(&start) != cudaSuccess || cudaEventCreate(&stop) != cudaSuccess)
                 {
-                    cudaFree(d_A);
-                    cudaFree(d_C);
                     cudaNativeVNNIGemvSweep_clearConfig();
                     throw std::runtime_error("cudaEventCreate failed");
                 }
 
                 cudaEventRecord(start);
-                const bool run_ok = kernel->multiply(d_A, d_C, 1, n, k);
+                const bool run_ok = kernel->multiply_tensor(A_tensor.get(), C_tensor.get(), 1, n, k);
                 cudaEventRecord(stop);
                 cudaEventSynchronize(stop);
 
@@ -641,8 +630,6 @@ namespace
 
                 if (!run_ok)
                 {
-                    cudaFree(d_A);
-                    cudaFree(d_C);
                     cudaNativeVNNIGemvSweep_clearConfig();
                     throw std::runtime_error("CUDA native payload GEMV bench run failed");
                 }
@@ -650,8 +637,6 @@ namespace
                 times_us.push_back(static_cast<double>(elapsed_ms) * 1000.0);
             }
 
-            cudaFree(d_A);
-            cudaFree(d_C);
             if (ws_consumer)
                 ws_consumer->unbindWorkspace();
             cudaNativeVNNIGemvSweep_clearConfig();

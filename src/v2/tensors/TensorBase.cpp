@@ -1172,11 +1172,10 @@ namespace llaminar2
             return false;
         }
 
-        // Validate target device - must be a GPU
+        // CPU devices: data is inherently on-host, nothing to transfer
         if (!target_device.is_gpu())
         {
-            LOG_ERROR("[TensorBase::ensureOnDevice] Invalid device (must be GPU): " << target_device.toString());
-            return false;
+            return true;
         }
 
         const bool trace = debugEnv().rocm.trace_coherence;
@@ -1550,11 +1549,10 @@ namespace llaminar2
     {
         std::lock_guard<std::mutex> lock(coherence_mutex_);
 
-        // Validate target device - must be a GPU
+        // CPU devices: host memory is the device, no allocation needed
         if (!target_device.is_gpu())
         {
-            LOG_ERROR("[TensorBase::allocateOnDevice] Invalid device (must be GPU): " << target_device.toString());
-            return false;
+            return true;
         }
 
         const bool trace = debugEnv().rocm.trace_coherence;

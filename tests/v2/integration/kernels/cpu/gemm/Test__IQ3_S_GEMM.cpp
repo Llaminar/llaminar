@@ -97,7 +97,7 @@ TEST_F(IQ3_S_GEMM, BasicMultiplication)
     auto gemm = B->createGemm();
 
     // Execute
-    gemm->multiply(A->data(), C->mutable_data(), m, n, k);
+    gemm->multiply_tensor(A.get(), C.get(), m, n, k);
 
     // Verify
     // A = 1.0
@@ -188,14 +188,14 @@ TEST_F(IQ3_S_GEMM, QuantizedVsFP32Parity)
 
     gemm::FloatingPointGemmKernel fp_kernel(B_fp32.get());
     // B is [N, K], so transpose_B=true to compute A @ B^T
-    fp_kernel.multiply(A_fp32->data(), C_ref->mutable_data(), m, n, k, true);
+    fp_kernel.multiply_tensor(A_fp32.get(), C_ref.get(), m, n, k, true);
 
     // === Test: CPUNativeVNNIGemmKernel with IQ3_S weights ===
     auto C_quant = factory.createFP32({static_cast<size_t>(m), static_cast<size_t>(n)});
     std::fill_n(C_quant->mutable_data(), m * n, 0.0f);
 
     cpu::native_vnni::CPUNativeVNNIGemmKernel quant_kernel(B_iq3s.get());
-    quant_kernel.multiply(A_fp32->data(), C_quant->mutable_data(), m, n, k, true, 1.0f, 0.0f, nullptr, -1);
+    quant_kernel.multiply_tensor(A_fp32.get(), C_quant.get(), m, n, k, true, 1.0f, 0.0f);
 
     // === Compare results ===
     float rel_l2 = compute_relative_l2_error(C_ref->data(), C_quant->data(), m * n);

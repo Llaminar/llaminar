@@ -179,10 +179,9 @@ TEST_F(Test__SlicedGEMM_MPI_Integration, RowParallelGEMM_SlicesMatchFullOutput)
     ASSERT_NE(sliced_kernel, nullptr) << "Failed to create sliced kernel";
 
     // Execute local GEMM
-    bool success = sliced_kernel->multiply(
-        input->data(), local_output->mutable_data(),
-        M, static_cast<int>(local_n), K,
-        1.0f, 0.0f);
+    bool success = sliced_kernel->multiply_tensor(
+        input.get(), local_output.get(),
+        M, static_cast<int>(local_n), K);
     ASSERT_TRUE(success) << "Sliced GEMM execution failed";
     EXPECT_FALSE(hasNaNOrInf(local_output.get())) << "Local output has NaN/Inf";
 
@@ -224,9 +223,9 @@ TEST_F(Test__SlicedGEMM_MPI_Integration, RowParallelGEMM_SlicesMatchFullOutput)
         auto *full_kernel = getPreparedKernel(weights.get(), DeviceId::cpu());
         ASSERT_NE(full_kernel, nullptr);
 
-        bool ref_success = full_kernel->multiply(
-            input->data(), reference_output->mutable_data(),
-            M, N, K, 1.0f, 0.0f);
+        bool ref_success = full_kernel->multiply_tensor(
+            input.get(), reference_output.get(),
+            M, N, K);
         ASSERT_TRUE(ref_success);
 
         float max_diff = maxAbsDiff(full_output.get(), reference_output.get());
@@ -257,8 +256,8 @@ TEST_F(Test__SlicedGEMM_MPI_Integration, RowParallelGEMM_AllRanksGetSameGathered
         weights.get(), my_range.start, my_range.end);
     ASSERT_NE(sliced_kernel, nullptr);
 
-    sliced_kernel->multiply(input->data(), local_output->mutable_data(),
-                            M, static_cast<int>(local_n), K, 1.0f, 0.0f);
+    sliced_kernel->multiply_tensor(input.get(), local_output.get(),
+                                   M, static_cast<int>(local_n), K);
 
     // Gather local_n values
     std::vector<int> all_local_n(world_size_);
@@ -461,9 +460,9 @@ TEST_F(Test__SlicedGEMM_MPI_Integration, LargeMatrixRowParallel)
         weights.get(), my_range.start, my_range.end);
     ASSERT_NE(sliced_kernel, nullptr);
 
-    bool success = sliced_kernel->multiply(
-        input->data(), local_output->mutable_data(),
-        M, static_cast<int>(local_n), K, 1.0f, 0.0f);
+    bool success = sliced_kernel->multiply_tensor(
+        input.get(), local_output.get(),
+        M, static_cast<int>(local_n), K);
     ASSERT_TRUE(success) << "Large matrix sliced GEMM failed";
     EXPECT_FALSE(hasNaNOrInf(local_output.get())) << "Output has NaN/Inf";
 

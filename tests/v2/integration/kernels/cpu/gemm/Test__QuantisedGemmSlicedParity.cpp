@@ -16,6 +16,7 @@
 #include <gtest/gtest.h>
 #include <mpi.h>
 #include <cmath>
+#include <cstring>
 #include <numeric>
 #include <vector>
 
@@ -23,6 +24,7 @@
 #include "../../src/v2/loaders/WeightManager.h"
 #include "../../src/v2/tensors/TensorSlice.h"
 #include "../../src/v2/tensors/TensorFactory.h"
+#include "../../src/v2/kernels/KernelFactory.h"
 #include "../../src/v2/utils/MPIContext.h"
 #include "../../src/v2/utils/Logger.h"
 #include "../../src/v2/backends/DeviceId.h"
@@ -52,6 +54,21 @@ namespace llaminar2
             void TearDown() override
             {
                 MPI_Barrier(MPI_COMM_WORLD);
+            }
+
+            /**
+             * @brief Helper: run GEMM via multiply_tensor, writing result into a raw float vector.
+             */
+            bool multiplyToVector(ITensorGemm *gemm, const float *A_data, float *C_data,
+                                  int M, int N, int K)
+            {
+                FP32Tensor A_tensor(std::vector<size_t>{(size_t)M, (size_t)K});
+                std::memcpy(A_tensor.mutable_data(), A_data, (size_t)M * K * sizeof(float));
+                FP32Tensor C_tensor(std::vector<size_t>{(size_t)M, (size_t)N});
+                bool ok = gemm->multiply_tensor(&A_tensor, &C_tensor, M, N, K);
+                if (ok)
+                    std::memcpy(C_data, C_tensor.data(), (size_t)M * N * sizeof(float));
+                return ok;
             }
 
             /**
@@ -154,14 +171,13 @@ namespace llaminar2
 
             // Perform GEMM: slice_output = input_A * slice_tensor^T
             // [M, slice_N] = [M, K] * [slice_N, K]^T
-            bool success = slice_gemm->multiply(
+            bool success = multiplyToVector(
+                slice_gemm.get(),
                 input_A.data(),
                 slice_output.data(),
                 M,       // rows of A
                 slice_N, // cols of output (rows of B)
-                K,       // cols of A (cols of B)
-                1.0f,    // alpha
-                0.0f     // beta
+                K        // cols of A (cols of B)
             );
             ASSERT_TRUE(success) << "Sliced GEMM failed on rank " << rank_;
 
@@ -229,14 +245,7 @@ namespace llaminar2
                 auto full_gemm = full_tensor->createGemm();
                 ASSERT_NE(full_gemm, nullptr) << "Failed to create GEMM kernel for full tensor";
 
-                success = full_gemm->multiply(
-                    input_A.data(),
-                    full_output.data(),
-                    M,
-                    N,
-                    K,
-                    1.0f,
-                    0.0f);
+                success = multiplyToVector(full_gemm.get(), input_A.data(), full_output.data(), M, N, K);
                 ASSERT_TRUE(success) << "Full GEMM failed";
 
                 LOG_DEBUG("Full GEMM complete, output size: " << full_output.size());
@@ -328,7 +337,7 @@ namespace llaminar2
 
             // Compute sliced GEMM
             std::vector<float> slice_output(M * slice_N, 0.0f);
-            bool success = slice_gemm->multiply(input_A.data(), slice_output.data(), M, slice_N, K, 1.0f, 0.0f);
+            bool success = multiplyToVector(slice_gemm.get(), input_A.data(), slice_output.data(), M, slice_N, K);
             ASSERT_TRUE(success);
 
             // Gather results
@@ -368,7 +377,7 @@ namespace llaminar2
                 ASSERT_NE(full_tensor, nullptr);
                 auto full_gemm = full_tensor->createGemm();
                 ASSERT_NE(full_gemm, nullptr);
-                success = full_gemm->multiply(input_A.data(), full_output.data(), M, N, K, 1.0f, 0.0f);
+                success = multiplyToVector(full_gemm.get(), input_A.data(), full_output.data(), M, N, K);
                 ASSERT_TRUE(success);
             }
 
@@ -432,7 +441,7 @@ namespace llaminar2
             ASSERT_NE(slice_gemm, nullptr);
 
             std::vector<float> slice_output(M * slice_N, 0.0f);
-            bool success = slice_gemm->multiply(input_A.data(), slice_output.data(), M, slice_N, K, 1.0f, 0.0f);
+            bool success = multiplyToVector(slice_gemm.get(), input_A.data(), slice_output.data(), M, slice_N, K);
             ASSERT_TRUE(success);
 
             std::vector<float> gathered_output(M * N, 0.0f);
@@ -470,7 +479,7 @@ namespace llaminar2
                 ASSERT_NE(full_tensor, nullptr);
                 auto full_gemm = full_tensor->createGemm();
                 ASSERT_NE(full_gemm, nullptr);
-                success = full_gemm->multiply(input_A.data(), full_output.data(), M, N, K, 1.0f, 0.0f);
+                success = multiplyToVector(full_gemm.get(), input_A.data(), full_output.data(), M, N, K);
                 ASSERT_TRUE(success);
             }
 

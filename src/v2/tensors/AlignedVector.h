@@ -22,6 +22,9 @@
 #include <stdexcept>
 #include <algorithm>
 #include <initializer_list>
+#ifdef __linux__
+#include <sys/mman.h> // madvise, MADV_HUGEPAGE
+#endif
 
 namespace llaminar2
 {
@@ -367,6 +370,15 @@ namespace llaminar2
             {
                 throw std::bad_alloc();
             }
+
+#ifdef __linux__
+            // Request transparent huge pages for large allocations (>2MB).
+            // Reduces TLB pressure for multi-GB weight buffers.
+            if (aligned_bytes >= 2 * 1024 * 1024)
+            {
+                madvise(ptr, aligned_bytes, MADV_HUGEPAGE);
+            }
+#endif
 
             return static_cast<T *>(ptr);
         }

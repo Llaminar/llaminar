@@ -498,9 +498,10 @@ TEST(Test__BF16Tensor, DISABLED_ActivationGemmQKT)
     auto gemm = dummy_tensor->createGemm();
 
     // Execute: scores = Q @ K^T (transpose_B=true)
-    bool success = gemm->multiply_activations(
+    bool success = gemm->multiply_activations_strided(
         Q_data.data(), K_data.data(), scores_data.data(),
         4, 4, 8, // m=4, n=4, k=8
+        8, 8, 4, // lda=k, ldb=k, ldc=n
         true,    // transpose_B (K^T)
         1.0f,    // alpha
         0.0f,    // beta

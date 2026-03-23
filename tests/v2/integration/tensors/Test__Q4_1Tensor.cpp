@@ -94,7 +94,7 @@ TEST_F(Test__Q4_1Tensor, GemmCorrectness_SingleBlock)
 
     // Run GEMM
     // multiply(A, C, m, n, k)
-    bool success = gemm->multiply(input_data, output_data, m, n, k);
+    bool success = gemm->multiply_tensor(input.get(), output.get(), m, n, k);
     ASSERT_TRUE(success);
 
     // Calculate expected result
@@ -154,7 +154,7 @@ TEST_F(Test__Q4_1Tensor, GemmCorrectness_MultipleBlocks)
     output_data[0] = 0.0f;
 
     auto gemm = weights->createGemm();
-    ASSERT_TRUE(gemm->multiply(input_data, output_data, m, n, k));
+    ASSERT_TRUE(gemm->multiply_tensor(input.get(), output.get(), m, n, k));
 
     float expected_sum = 0.0f;
     // Block 0
@@ -240,16 +240,16 @@ TEST_F(Test__Q4_1Tensor, QuantizedVsFP32Parity)
 
     // Run quantized GEMM (INT8 path)
     auto quantized_gemm = q4_1_tensor->createGemm();
-    ASSERT_TRUE(quantized_gemm->multiply(
-        input_data,
-        output_quantized->mutable_data(),
+    ASSERT_TRUE(quantized_gemm->multiply_tensor(
+        input.get(),
+        output_quantized.get(),
         m, n, k));
 
     // Run FP32 GEMM (OneDNN reference)
     gemm::FloatingPointGemmKernel fp32_gemm(fp32_weights.get());
-    ASSERT_TRUE(fp32_gemm.multiply(
-        input_data,
-        output_fp32->mutable_data(),
+    ASSERT_TRUE(fp32_gemm.multiply_tensor(
+        input.get(),
+        output_fp32.get(),
         m, n, k));
 
     // Compare results

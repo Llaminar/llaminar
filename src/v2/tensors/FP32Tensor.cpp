@@ -751,22 +751,8 @@ namespace llaminar2
         const MPIContext *mpi_ctx,
         int device_idx)
     {
-        auto kernel = createRMSNorm();
-        if (!kernel)
-        {
-            LOG_ERROR("[FP32Tensor::applyRMSNorm] Failed to create RMSNorm kernel");
-            return false;
-        }
-
-        // FP32 path: apply() with FP32 buffers (in-place)
-        return kernel->apply(
-            this->data(),
-            gamma,
-            this->mutable_data(),
-            seq_len, d_model, eps,
-            false, // normalize_gamma
-            mpi_ctx,
-            device_idx);
+        LOG_ERROR("[FP32Tensor::applyRMSNorm] Removed — use ITensorRMSNorm::apply_tensor() via stages");
+        return false;
     }
 
     bool FP32Tensor::from_int32_with_scales(
@@ -810,35 +796,19 @@ namespace llaminar2
     }
 
     bool FP32Tensor::applyRoPE(
-        float *K,
-        const int *position_ids,
-        int seq_len,
-        int n_heads,
-        int n_kv_heads,
-        int head_dim,
-        float rope_theta,
-        bool use_bf16,
-        const MPIContext *mpi_ctx,
-        int device_idx)
+        float * /*K*/,
+        const int * /*position_ids*/,
+        int /*seq_len*/,
+        int /*n_heads*/,
+        int /*n_kv_heads*/,
+        int /*head_dim*/,
+        float /*rope_theta*/,
+        bool /*use_bf16*/,
+        const MPIContext * /*mpi_ctx*/,
+        int /*device_idx*/)
     {
-        auto kernel = createRoPE();
-        if (!kernel)
-        {
-            LOG_ERROR("[FP32Tensor::applyRoPE] Failed to create RoPE kernel");
-            return false;
-        }
-
-        // FP32 path: apply() with FP32 buffers
-        // Q is this tensor, K is passed as parameter
-        return kernel->apply(
-            this->mutable_data(), // Q
-            K,                    // K
-            position_ids,
-            seq_len, n_heads, n_kv_heads, head_dim,
-            rope_theta,
-            use_bf16,
-            mpi_ctx,
-            device_idx);
+        LOG_ERROR("[FP32Tensor::applyRoPE] Legacy raw-pointer path removed. Use RoPEStage with apply_tensor() instead.");
+        return false;
     }
 
     void FP32Tensor::decode_to_q8_0(size_t row_idx, size_t k_block_offset, Q8_0Block *output) const
@@ -980,8 +950,8 @@ namespace llaminar2
                             for (; k_blk + 1 < k_blocks; k_blk += 2)
                             {
                                 simd::quantize_two_blocks_avx512(a_row + k_blk * 32,
-                                                                  row_blocks[k_blk],
-                                                                  row_blocks[k_blk + 1]);
+                                                                 row_blocks[k_blk],
+                                                                 row_blocks[k_blk + 1]);
                             }
                         }
 #endif

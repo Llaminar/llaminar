@@ -104,16 +104,16 @@ namespace
                 return false;
 
             // Execute with the specified device_idx
-            bool success = kernel->compute(
-                Q, K, V, output,
-                seq_len, n_heads, n_kv_heads, head_dim,
+            bool success = kernel->compute_tensor(
+                Q_tensor.get(), K_tensor.get(), V_tensor.get(), output_tensor.get(),
+                1,       // batch_size
+                seq_len, // seq_len
+                seq_len, // kv_len
+                n_heads, n_kv_heads, head_dim,
                 false,   // causal
                 -1,      // window_size
                 nullptr, // workspace_scores
-                nullptr, // workspace_buffer
-                nullptr, // workspace_context
                 nullptr, // workspace_mask
-                false,   // use_bf16
                 &mpi_ctx_,
                 device_idx // THE KEY PARAMETER UNDER TEST
             );

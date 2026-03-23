@@ -92,16 +92,16 @@ namespace llaminar2::test
     /**
      * @brief Verify allocateOnDevice() rejects CPU device
      *
-     * allocateOnDevice() must be called with a GPU device. CPU targets
-     * should return false since there's no "allocation" to do.
+     * allocateOnDevice() with a CPU target is a no-op that returns true,
+     * since host memory is inherently "on device" for CPU.
      */
-    TEST_F(Test__TensorAllocateOnDevice, RejectsCPUDevice)
+    TEST_F(Test__TensorAllocateOnDevice, AcceptsCPUDeviceAsNoOp)
     {
         DeviceId cpu_device = DeviceId::cpu();
 
         bool result = tensor_->allocateOnDevice(cpu_device);
 
-        EXPECT_FALSE(result) << "allocateOnDevice() should fail for CPU device";
+        EXPECT_TRUE(result) << "allocateOnDevice(CPU) should succeed as a no-op";
     }
 
     // =========================================================================

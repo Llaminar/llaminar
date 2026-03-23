@@ -73,7 +73,7 @@ namespace llaminar2::cuda
             const float *input, const float *residual, float *output,
             size_t num_elements,
             const MPIContext *mpi_ctx = nullptr,
-            int device_idx = -1) override
+            int device_idx = -1)
         {
             (void)mpi_ctx;
             int dev = (device_idx >= 0) ? device_idx : device_idx_;
@@ -151,7 +151,7 @@ namespace llaminar2::cuda
             const float *input, const float *residual, float *output,
             size_t num_elements,
             const MPIContext *mpi_ctx = nullptr,
-            int device_idx = -1) override
+            int device_idx = -1)
         {
             (void)input;
             (void)residual;
@@ -166,7 +166,7 @@ namespace llaminar2::cuda
             const uint16_t *input, const uint16_t *residual, uint16_t *output,
             size_t num_elements,
             const MPIContext *mpi_ctx = nullptr,
-            int device_idx = -1) override
+            int device_idx = -1)
         {
             (void)mpi_ctx;
             int dev = (device_idx >= 0) ? device_idx : device_idx_;
@@ -243,7 +243,7 @@ namespace llaminar2::cuda
             const float *input, const float *residual, float *output,
             size_t num_elements,
             const MPIContext *mpi_ctx = nullptr,
-            int device_idx = -1) override
+            int device_idx = -1)
         {
             (void)input;
             (void)residual;
@@ -258,7 +258,7 @@ namespace llaminar2::cuda
             const uint16_t *input, const uint16_t *residual, uint16_t *output,
             size_t num_elements,
             const MPIContext *mpi_ctx = nullptr,
-            int device_idx = -1) override
+            int device_idx = -1)
         {
             (void)mpi_ctx;
             int dev = (device_idx >= 0) ? device_idx : device_idx_;

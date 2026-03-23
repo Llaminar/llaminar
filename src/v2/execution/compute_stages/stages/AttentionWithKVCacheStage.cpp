@@ -6,10 +6,13 @@
 #include "AttentionWithKVCacheStage.h"
 #include "../../../utils/DebugEnv.h"
 #include "../../../tensors/Tensors.h"
+#include "../../../tensors/SIMDHelpers.h"
 #include "../../../utils/Logger.h"
 #include "../../../kernels/KernelFactory.h"
 #include "../../../kernels/cpu/CPUKVCache.h"
 #include <limits>
+#include <chrono>
+#include <atomic>
 
 namespace llaminar2
 {
@@ -19,8 +22,7 @@ namespace llaminar2
     // =============================================================================
 
     AttentionWithKVCacheStage::AttentionWithKVCacheStage(Params params)
-        : IComputeStage(params.device_id)
-        , params_(std::move(params))
+        : IComputeStage(params.device_id), params_(std::move(params))
     {
     }
 
@@ -79,13 +81,13 @@ namespace llaminar2
             return false;
         }
 
-            if (!ensureRequiredPointers("AttentionWithKVCacheStage", {
-                                                                  {"Q", params_.Q},
-                                                                  {"K", params_.K},
-                                                                  {"V", params_.V},
-                                                                  {"output", params_.output},
-                                                              }))
-            {
+        if (!ensureRequiredPointers("AttentionWithKVCacheStage", {
+                                                                     {"Q", params_.Q},
+                                                                     {"K", params_.K},
+                                                                     {"V", params_.V},
+                                                                     {"output", params_.output},
+                                                                 }))
+        {
             return false;
         }
 
@@ -233,9 +235,23 @@ namespace llaminar2
         return true;
     }
 
+    // Temporary profiling counters for attention decode overhead analysis
+    namespace
+    {
+        std::atomic<uint64_t> g_attn_append_ns{0};
+        std::atomic<uint64_t> g_attn_get_cache_ns{0};
+        std::atomic<uint64_t> g_attn_view_ns{0};
+        std::atomic<uint64_t> g_attn_kernel_get_ns{0};
+        std::atomic<uint64_t> g_attn_fp16_conv_ns{0};
+        std::atomic<uint64_t> g_attn_compute_ns{0};
+        std::atomic<uint64_t> g_attn_total_ns{0};
+        std::atomic<uint64_t> g_attn_call_count{0};
+    }
+
     bool AttentionWithKVCacheStage::executeDecode(IDeviceContext *ctx)
     {
         (void)ctx;
+        auto t_total_start = std::chrono::steady_clock::now();
 
         LOG_DEBUG("[AttentionWithKVCacheStage::executeDecode] layer=" << params_.layer_idx
                                                                       << " position=" << params_.position_offset);
@@ -258,8 +274,11 @@ namespace llaminar2
         }
 
         // Step 1: Append single token K/V to cache
+        auto t0 = std::chrono::steady_clock::now();
         bool append_ok = params_.kv_cache->append(
             params_.layer_idx, 0, K_base, V_base, 1);
+        auto t1 = std::chrono::steady_clock::now();
+        g_attn_append_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
         if (!append_ok)
         {
             LOG_ERROR("[AttentionWithKVCacheStage] Failed to append decode token to cache");
@@ -267,72 +286,124 @@ namespace llaminar2
         }
 
         // Step 2: Get full cached K/V
+        auto t2 = std::chrono::steady_clock::now();
         TensorBase *K_cached = dynamic_cast<TensorBase *>(params_.kv_cache->get_k(params_.layer_idx, 0));
         TensorBase *V_cached = dynamic_cast<TensorBase *>(params_.kv_cache->get_v(params_.layer_idx, 0));
         int kv_len = params_.kv_cache->get_cached_tokens(params_.layer_idx, 0);
+        auto t3 = std::chrono::steady_clock::now();
+        g_attn_get_cache_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(t3 - t2).count();
 
         LOG_DEBUG("[AttentionWithKVCacheStage::executeDecode] Attending to " << kv_len << " cached tokens");
 
-        // Step 3: Create tensor views with actual dimensions
-        // Q is single token (decode), K/V is full cache length
+        // Step 3: Create Q/output views (small, single token)
+        auto t4 = std::chrono::steady_clock::now();
         int q_dim = params_.n_heads * params_.head_dim;
         int kv_dim = params_.n_kv_heads * params_.head_dim;
         const int q_seq_len = 1; // Decode mode: single query token
 
         auto Q_view = Q_base->create_view({static_cast<size_t>(q_seq_len), static_cast<size_t>(q_dim)});
-        auto K_view = K_cached->create_view({static_cast<size_t>(kv_len), static_cast<size_t>(kv_dim)});
-        auto V_view = V_cached->create_view({static_cast<size_t>(kv_len), static_cast<size_t>(kv_dim)});
         auto out_view = output_base->create_view({static_cast<size_t>(q_seq_len), static_cast<size_t>(q_dim)});
 
-        if (!Q_view || !K_view || !V_view || !out_view)
+        if (!Q_view || !out_view)
         {
-            LOG_ERROR("[AttentionWithKVCacheStage::executeDecode] Failed to create tensor views");
+            LOG_ERROR("[AttentionWithKVCacheStage::executeDecode] Failed to create Q/output tensor views");
             return false;
         }
 
-        // Step 4: Get attention kernel via device-scoped KernelFactory cache.
-        // This uses the typed kernel path which properly handles decode mode where Q.seq_len != K.seq_len.
+        // Step 4: Get attention kernel
         auto *attention_kernel = getOrCreateKernel(Q_view.get());
-
         if (!attention_kernel)
         {
             LOG_ERROR("[AttentionWithKVCacheStage::executeDecode] Failed to create attention kernel");
             return false;
         }
         bindStageStream(attention_kernel);
+        auto t5 = std::chrono::steady_clock::now();
+        g_attn_view_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(t5 - t4).count();
 
-        // Step 5: Allocate workspace for attention scores [n_heads, q_seq_len, kv_len]
-        // Use simple allocation - in production, use pre-allocated workspace
-        FP32Tensor scores_workspace({static_cast<size_t>(params_.n_heads * q_seq_len * kv_len)});
+        // Step 5: Prepare K/V for attention — use incremental FP32 conversion for FP16 KV cache
+        // to avoid per-call heap allocation and full re-conversion of the entire cache.
+        auto t6 = std::chrono::steady_clock::now();
+        TensorBase *K_for_attn = nullptr;
+        TensorBase *V_for_attn = nullptr;
+        std::shared_ptr<TensorBase> K_view_fallback, V_view_fallback; // Keep alive for fallback path
 
-        // Step 6: Build causal mask for decode
-        // For decode: Q is at position kv_len-1 (end of sequence), attends to [0, kv_len-1]
-        FP32Tensor mask_tensor({static_cast<size_t>(q_seq_len * kv_len)});
-        float *mask_data = mask_tensor.mutable_data();
+        auto *K_fp16 = dynamic_cast<FP16Tensor *>(K_cached);
+        auto *V_fp16 = dynamic_cast<FP16Tensor *>(V_cached);
 
-        for (int q = 0; q < q_seq_len; ++q)
+        if (K_fp16 && V_fp16)
         {
-            int q_pos = (kv_len - q_seq_len) + q; // Q position in full sequence
-            for (int k = 0; k < kv_len; ++k)
-            {
-                // Causal: Q at position q_pos can attend to K at positions [0, q_pos]
-                mask_data[q * kv_len + k] = (k <= q_pos) ? 0.0f : -std::numeric_limits<float>::infinity();
-            }
-        }
+            // Fast path: Incremental FP16→FP32 conversion into persistent buffers
+            int max_len = params_.kv_cache->max_seq_len();
 
-        // Step 7: Dispatch via compute_tensor which handles decode mode (q_seq_len != kv_len)
+            // Lazy init: allocate persistent FP32 buffers once at max capacity
+            if (!decode_k_fp32_)
+            {
+                decode_k_fp32_ = std::make_unique<FP32Tensor>(
+                    std::vector<size_t>{static_cast<size_t>(max_len) * static_cast<size_t>(kv_dim)});
+                decode_v_fp32_ = std::make_unique<FP32Tensor>(
+                    std::vector<size_t>{static_cast<size_t>(max_len) * static_cast<size_t>(kv_dim)});
+                decode_kv_fp32_rows_ = 0;
+            }
+
+            // Detect KV cache clear (kv_len decreased since last call)
+            if (kv_len < decode_kv_fp32_rows_)
+            {
+                decode_kv_fp32_rows_ = 0;
+            }
+
+            // Convert only newly appended rows
+            if (decode_kv_fp32_rows_ < kv_len)
+            {
+                const size_t from = static_cast<size_t>(decode_kv_fp32_rows_);
+                const size_t n_new_elements = (static_cast<size_t>(kv_len) - from) * static_cast<size_t>(kv_dim);
+                const size_t offset = from * static_cast<size_t>(kv_dim);
+
+                simd::convert_fp16_to_fp32(
+                    K_fp16->typed_data() + offset,
+                    decode_k_fp32_->mutable_data() + offset,
+                    n_new_elements);
+                simd::convert_fp16_to_fp32(
+                    V_fp16->typed_data() + offset,
+                    decode_v_fp32_->mutable_data() + offset,
+                    n_new_elements);
+
+                decode_kv_fp32_rows_ = kv_len;
+            }
+
+            K_for_attn = decode_k_fp32_.get();
+            V_for_attn = decode_v_fp32_.get();
+        }
+        else
+        {
+            // Fallback: non-FP16 cache (FP32, BF16) — use original view path
+            K_view_fallback = K_cached->create_view({static_cast<size_t>(kv_len), static_cast<size_t>(kv_dim)});
+            V_view_fallback = V_cached->create_view({static_cast<size_t>(kv_len), static_cast<size_t>(kv_dim)});
+            if (!K_view_fallback || !V_view_fallback)
+            {
+                LOG_ERROR("[AttentionWithKVCacheStage::executeDecode] Failed to create KV tensor views");
+                return false;
+            }
+            K_for_attn = K_view_fallback.get();
+            V_for_attn = V_view_fallback.get();
+        }
+        auto t7 = std::chrono::steady_clock::now();
+        g_attn_fp16_conv_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(t7 - t6).count();
+
+        // Step 6: Dispatch attention
+        auto t8 = std::chrono::steady_clock::now();
         bool success = attention_kernel->compute_tensor(
-            Q_view.get(), K_view.get(), V_view.get(), out_view.get(),
+            Q_view.get(), K_for_attn, V_for_attn, out_view.get(),
             params_.batch_size,
-            q_seq_len, // Query sequence length (1 for decode)
-            kv_len,    // Key/value sequence length (full cache)
+            q_seq_len,
+            kv_len,
             params_.n_heads,
             params_.n_kv_heads,
             params_.head_dim,
-            true, // causal
-            -1,   // window_size (disabled)
-            &scores_workspace,
-            &mask_tensor,
+            true,    // causal
+            -1,      // window_size (disabled)
+            nullptr, // workspace_scores — not needed for decode path
+            nullptr, // workspace_mask — not needed for decode path
             params_.mpi_ctx_shared.get(),
             params_.device_id.toKernelDeviceIndex());
 
@@ -340,6 +411,26 @@ namespace llaminar2
         {
             LOG_ERROR("[AttentionWithKVCacheStage::executeDecode] Attention kernel compute_tensor failed");
             return false;
+        }
+
+        auto t9 = std::chrono::steady_clock::now();
+        g_attn_compute_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(t9 - t8).count();
+        auto total_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(t9 - t_total_start).count();
+        g_attn_total_ns += total_ns;
+        auto count = g_attn_call_count.fetch_add(1) + 1;
+
+        // Print summary every 100 calls
+        if (count % 100 == 0)
+        {
+            auto to_ms = [](uint64_t ns)
+            { return ns / 1000000.0; };
+            LOG_INFO("[AttnDecode Profile] calls=" << count
+                                                   << " append=" << to_ms(g_attn_append_ns.load()) << "ms"
+                                                   << " get_cache=" << to_ms(g_attn_get_cache_ns.load()) << "ms"
+                                                   << " view+kernel=" << to_ms(g_attn_view_ns.load()) << "ms"
+                                                   << " fp16conv=" << to_ms(g_attn_fp16_conv_ns.load()) << "ms"
+                                                   << " compute=" << to_ms(g_attn_compute_ns.load()) << "ms"
+                                                   << " total=" << to_ms(g_attn_total_ns.load()) << "ms");
         }
 
         LOG_DEBUG("[AttentionWithKVCacheStage::executeDecode] Complete");

@@ -8,6 +8,7 @@
 #include "../../../utils/DebugEnv.h"
 #include "../../../tensors/Tensors.h"
 #include "../../../tensors/TensorKernels.h"
+#include "../../../tensors/SIMDHelpers.h"
 #include "../../../kernels/cpu/CPUKVCache.h"
 #include "../../../utils/Logger.h"
 #include "../../../kernels/KernelFactory.h"
@@ -126,6 +127,68 @@ namespace llaminar2
             mode = detect_attention_mode(params_.batch_size, params_.seq_len, effective_kv_len);
         }
 
+        // =====================================================================
+        // CPU DECODE OPTIMIZATION: Incremental FP16→FP32 KV cache conversion
+        //
+        // When the KV cache stores FP16 tensors, every call to fp32_data()
+        // re-converts the ENTIRE cache because KVCacheAppendStage invalidates
+        // the dequant cache via mutable_typed_data(). This is O(max_seq_len)
+        // per layer per token. Instead, we maintain persistent FP32 buffers
+        // and only convert newly appended rows (typically 1 row per decode step).
+        // =====================================================================
+        const bool is_decode_mode = (mode == AttentionMode::DECODE ||
+                                     (params_.seq_len < effective_kv_len && params_.batch_size == 1));
+
+        if (is_decode_mode && gpuStream() == nullptr)
+        {
+            auto *K_fp16 = dynamic_cast<FP16Tensor *>(effective_K);
+            auto *V_fp16 = dynamic_cast<FP16Tensor *>(effective_V);
+
+            if (K_fp16 && V_fp16)
+            {
+                const int kv_dim = params_.n_kv_heads * params_.head_dim;
+                const int max_len = params_.kv_cache ? params_.kv_cache->max_seq_len() : effective_kv_len;
+
+                // Lazy init: allocate persistent FP32 buffers once at max capacity
+                if (!decode_k_fp32_)
+                {
+                    decode_k_fp32_ = std::make_unique<FP32Tensor>(
+                        std::vector<size_t>{static_cast<size_t>(max_len) * static_cast<size_t>(kv_dim)});
+                    decode_v_fp32_ = std::make_unique<FP32Tensor>(
+                        std::vector<size_t>{static_cast<size_t>(max_len) * static_cast<size_t>(kv_dim)});
+                    decode_kv_fp32_rows_ = 0;
+                }
+
+                // Detect KV cache clear (kv_len decreased since last call)
+                if (effective_kv_len < decode_kv_fp32_rows_)
+                {
+                    decode_kv_fp32_rows_ = 0;
+                }
+
+                // Convert only newly appended rows (typically 1 per decode step)
+                if (decode_kv_fp32_rows_ < effective_kv_len)
+                {
+                    const size_t from = static_cast<size_t>(decode_kv_fp32_rows_);
+                    const size_t n_new = (static_cast<size_t>(effective_kv_len) - from) * static_cast<size_t>(kv_dim);
+                    const size_t offset = from * static_cast<size_t>(kv_dim);
+
+                    simd::convert_fp16_to_fp32(
+                        K_fp16->typed_data() + offset,
+                        decode_k_fp32_->mutable_data() + offset,
+                        n_new);
+                    simd::convert_fp16_to_fp32(
+                        V_fp16->typed_data() + offset,
+                        decode_v_fp32_->mutable_data() + offset,
+                        n_new);
+
+                    decode_kv_fp32_rows_ = effective_kv_len;
+                }
+
+                effective_K = decode_k_fp32_.get();
+                effective_V = decode_v_fp32_.get();
+            }
+        }
+
         LOG_DEBUG("[AttentionComputeStage] Execute: batch=" << params_.batch_size
                                                             << " seq_len=" << params_.seq_len
                                                             << " kv_len=" << effective_kv_len
@@ -177,25 +240,18 @@ namespace llaminar2
         int device_idx = params_.device_id.toKernelDeviceIndex();
 
         // Build proper causal mask for decode mode
-        // In decode mode (seq_len < kv_len), we need to account for position offset
-        // The kernel's internal causal mask assumes m=0 for decode (query position 0),
-        // but decode tokens should be able to attend to all cached positions [0, kv_len-1]
-        //
-        // Key insight: For decode with seq_len=1, the query is at position (kv_len-1),
-        // so it should attend to ALL kv_len positions. The kernel's "n > m" check would
-        // only allow attending to position 0, which is wrong.
+        // Key insight: For single-token decode (seq_len=1), the query at position
+        // (kv_len-1) can attend to ALL positions, so the mask is all-zeros.
+        // Skip mask construction entirely and pass nullptr + causal=false.
+        // Only build an explicit mask for multi-token decode (seq_len > 1 but < kv_len).
         std::unique_ptr<FP32Tensor> decode_mask;
         ITensor *mask_to_use = params_.workspace_mask;
 
-        const bool is_decode_mode = (mode == AttentionMode::DECODE ||
-                                     (params_.seq_len < effective_kv_len && params_.batch_size == 1));
-
         if (params_.causal && is_decode_mode)
         {
-            if (gpuStream() == nullptr)
+            if (gpuStream() == nullptr && params_.seq_len > 1)
             {
-                // Direct execution on default stream: safe to use temporary CPU mask
-                // (will survive until kernel returns synchronously)
+                // Multi-token decode on CPU: some tokens need causal masking
                 const int base_pos = (params_.position_offset > 0)
                                          ? params_.position_offset
                                          : (effective_kv_len - params_.seq_len);
@@ -206,10 +262,9 @@ namespace llaminar2
 
                 for (int q = 0; q < params_.seq_len; ++q)
                 {
-                    const int q_pos = base_pos + q; // Global position of this query
+                    const int q_pos = base_pos + q;
                     for (int k = 0; k < effective_kv_len; ++k)
                     {
-                        // Causal: Query at position q_pos can attend to K positions [0, q_pos]
                         mask_data[q * effective_kv_len + k] = (k <= q_pos)
                                                                   ? 0.0f
                                                                   : -std::numeric_limits<float>::infinity();
@@ -217,19 +272,12 @@ namespace llaminar2
                 }
 
                 mask_to_use = decode_mask.get();
-                LOG_DEBUG("[AttentionComputeStage] Built decode causal mask: base_pos=" << base_pos
-                                                                                        << " seq_len=" << params_.seq_len << " kv_len=" << effective_kv_len);
             }
             else
             {
-                // Non-default stream (graph capture or manual replay on capture stream):
-                // Cannot use temporary CPU mask — it would be destroyed after execute(),
-                // leaving captured graph with a dangling pointer.
-                // For decode (seq_len=1), causal=false + mask=nullptr = attend to all
-                // positions, which is correct since the single query token should
-                // attend to the entire KV cache.
+                // Single-token decode (seq_len=1) or GPU stream: mask is all-zeros,
+                // equivalent to nullptr + causal=false (attend to all positions).
                 mask_to_use = nullptr;
-                LOG_DEBUG("[AttentionComputeStage] Decode on non-default stream: using nullptr mask (attend-to-all)");
             }
         }
 

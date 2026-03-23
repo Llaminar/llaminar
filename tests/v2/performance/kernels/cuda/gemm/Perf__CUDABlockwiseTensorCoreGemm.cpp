@@ -21,6 +21,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstdio>
+#include <cstring>
 #include <functional>
 #include <limits>
 #include <map>
@@ -478,27 +479,17 @@ namespace
                 ws_consumer->bindWorkspace(workspace.get());
             }
 
-            // Allocate device memory for activations and output (same as parity test)
+            // Create tensor wrappers and upload to GPU
             auto h_input = TestTensorFactory::createFP32Random({static_cast<size_t>(m), static_cast<size_t>(k)}, -0.25f, 0.25f, 7);
-            const float *h_input_data = h_input->data();
 
-            const size_t A_bytes = static_cast<size_t>(m) * k * sizeof(float);
-            const size_t C_bytes = static_cast<size_t>(m) * n * sizeof(float);
-            float *d_A = nullptr;
-            float *d_C = nullptr;
-            if (cudaMalloc(&d_A, A_bytes) != cudaSuccess)
-                throw std::runtime_error("cudaMalloc d_A failed");
-            if (cudaMalloc(&d_C, C_bytes) != cudaSuccess)
-            {
-                cudaFree(d_A);
-                throw std::runtime_error("cudaMalloc d_C failed");
-            }
-            if (cudaMemcpy(d_A, h_input_data, A_bytes, cudaMemcpyHostToDevice) != cudaSuccess)
-            {
-                cudaFree(d_A);
-                cudaFree(d_C);
-                throw std::runtime_error("cudaMemcpy d_A failed");
-            }
+            auto A_tensor = std::make_unique<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(m), static_cast<size_t>(k)});
+            std::memcpy(A_tensor->mutable_data(), h_input->data(), static_cast<size_t>(m) * k * sizeof(float));
+            auto C_tensor = std::make_unique<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(m), static_cast<size_t>(n)});
+
+            if (!A_tensor->ensureOnDevice(device_))
+                throw std::runtime_error("ensureOnDevice A failed");
+            if (!C_tensor->ensureOnDevice(device_))
+                throw std::runtime_error("ensureOnDevice C failed");
 
             std::vector<double> times_us;
             times_us.reserve(static_cast<size_t>(cfg.bench_runs));
@@ -506,10 +497,8 @@ namespace
             // Warmup
             for (int i = 0; i < cfg.warmup_runs; ++i)
             {
-                if (!kernel->multiply(d_A, d_C, m, n, k))
+                if (!kernel->multiply_tensor(A_tensor.get(), C_tensor.get(), m, n, k))
                 {
-                    cudaFree(d_A);
-                    cudaFree(d_C);
                     throw std::runtime_error("CUDA blockwise GEMM warmup failed");
                 }
             }
@@ -521,13 +510,11 @@ namespace
                 cudaEvent_t stop = nullptr;
                 if (cudaEventCreate(&start) != cudaSuccess || cudaEventCreate(&stop) != cudaSuccess)
                 {
-                    cudaFree(d_A);
-                    cudaFree(d_C);
                     throw std::runtime_error("cudaEventCreate failed");
                 }
 
                 cudaEventRecord(start);
-                const bool run_ok = kernel->multiply(d_A, d_C, m, n, k);
+                const bool run_ok = kernel->multiply_tensor(A_tensor.get(), C_tensor.get(), m, n, k);
                 cudaEventRecord(stop);
                 cudaEventSynchronize(stop);
 
@@ -538,8 +525,6 @@ namespace
 
                 if (!run_ok)
                 {
-                    cudaFree(d_A);
-                    cudaFree(d_C);
                     throw std::runtime_error("CUDA blockwise GEMM bench run failed");
                 }
 
@@ -549,15 +534,8 @@ namespace
             // Download result
             RunResult result;
             result.output.resize(static_cast<size_t>(m) * n);
-            if (cudaMemcpy(result.output.data(), d_C, C_bytes, cudaMemcpyDeviceToHost) != cudaSuccess)
-            {
-                cudaFree(d_A);
-                cudaFree(d_C);
-                throw std::runtime_error("cudaMemcpy d_C readback failed");
-            }
-
-            cudaFree(d_A);
-            cudaFree(d_C);
+            C_tensor->mark_device_dirty();
+            std::memcpy(result.output.data(), C_tensor->data(), static_cast<size_t>(m) * n * sizeof(float));
 
             if (ws_consumer)
             {

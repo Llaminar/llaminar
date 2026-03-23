@@ -11,12 +11,14 @@
 #include "kernels/IKVCache.h"
 #include "../../../memory/BufferId.h"
 
+#include <memory>
 #include <optional>
 
 namespace llaminar2
 {
-    // Forward declaration
+    // Forward declarations
     class ITensorAttention;
+    class FP32Tensor;
 
     /**
      * @brief Pure attention compute stage (no KV cache management)
@@ -144,6 +146,12 @@ namespace llaminar2
         /// Cached attention kernel for workspace binding
         ITensorAttention *cached_kernel_ = nullptr;
         int cached_kernel_tensor_type_ = -1;
+
+        /// Persistent FP32 decode buffers for incremental FP16→FP32 conversion.
+        /// Avoids re-converting the entire KV cache on every decode step.
+        std::unique_ptr<FP32Tensor> decode_k_fp32_;
+        std::unique_ptr<FP32Tensor> decode_v_fp32_;
+        int decode_kv_fp32_rows_ = 0;
 
         /**
          * @brief Get or create the attention kernel

@@ -102,67 +102,6 @@ namespace llaminar2
             void setDynamicPosOffset(int pos_offset) override;
 
             // ===== ITensorRoPE interface =====
-            bool apply(
-                float *data, float *output,
-                const int *pos_ids,
-                int batch_size, int seq_len, int head_dim, int num_heads,
-                float theta_base, bool interleaved,
-                const MPIContext *mpi_ctx = nullptr,
-                int device_idx = -1) override;
-
-            bool apply_bf16(
-                uint16_t *data, uint16_t *output,
-                const int *pos_ids,
-                int batch_size, int seq_len, int head_dim, int num_heads,
-                float theta_base, int device_idx) override
-            {
-                (void)data;
-                (void)output;
-                (void)pos_ids;
-                (void)batch_size;
-                (void)seq_len;
-                (void)head_dim;
-                (void)num_heads;
-                (void)theta_base;
-                (void)device_idx;
-                return false;
-            }
-
-            bool apply_fp16(
-                uint16_t *data, uint16_t *output,
-                const int *pos_ids,
-                int batch_size, int seq_len, int head_dim, int num_heads,
-                float theta_base, int device_idx) override
-            {
-                (void)data;
-                (void)output;
-                (void)pos_ids;
-                (void)batch_size;
-                (void)seq_len;
-                (void)head_dim;
-                (void)num_heads;
-                (void)theta_base;
-                (void)device_idx;
-                return false;
-            }
-
-            bool apply_q8_1(
-                void *data, void *output,
-                const int *pos_ids,
-                int batch_size, int seq_len, int head_dim, int num_heads,
-                float theta_base, int device_idx) override
-            {
-                (void)data;
-                (void)output;
-                (void)pos_ids;
-                (void)batch_size;
-                (void)seq_len;
-                (void)head_dim;
-                (void)num_heads;
-                (void)theta_base;
-                (void)device_idx;
-                return false;
-            }
 
             // ===== Tensor API (for RoPEStage) =====
             bool apply_tensor(
@@ -288,69 +227,6 @@ namespace llaminar2
             void setDynamicPosOffset(int pos_offset) override;
 
             // ===== ITensorRoPE interface =====
-            bool apply(
-                float *data, float *output,
-                const int *pos_ids,
-                int batch_size, int seq_len, int head_dim, int num_heads,
-                float theta_base, bool interleaved,
-                const MPIContext *mpi_ctx = nullptr,
-                int device_idx = -1) override
-            {
-                (void)data;
-                (void)output;
-                (void)pos_ids;
-                (void)batch_size;
-                (void)seq_len;
-                (void)head_dim;
-                (void)num_heads;
-                (void)theta_base;
-                (void)interleaved;
-                (void)mpi_ctx;
-                (void)device_idx;
-                return false;
-            }
-
-            bool apply_bf16(
-                uint16_t *data, uint16_t *output,
-                const int *pos_ids,
-                int batch_size, int seq_len, int head_dim, int num_heads,
-                float theta_base, int device_idx) override;
-
-            bool apply_fp16(
-                uint16_t *data, uint16_t *output,
-                const int *pos_ids,
-                int batch_size, int seq_len, int head_dim, int num_heads,
-                float theta_base, int device_idx) override
-            {
-                (void)data;
-                (void)output;
-                (void)pos_ids;
-                (void)batch_size;
-                (void)seq_len;
-                (void)head_dim;
-                (void)num_heads;
-                (void)theta_base;
-                (void)device_idx;
-                return false;
-            }
-
-            bool apply_q8_1(
-                void *data, void *output,
-                const int *pos_ids,
-                int batch_size, int seq_len, int head_dim, int num_heads,
-                float theta_base, int device_idx) override
-            {
-                (void)data;
-                (void)output;
-                (void)pos_ids;
-                (void)batch_size;
-                (void)seq_len;
-                (void)head_dim;
-                (void)num_heads;
-                (void)theta_base;
-                (void)device_idx;
-                return false;
-            }
 
             // ===== Tensor API (for RoPEStage) =====
             bool apply_tensor(
@@ -453,69 +329,6 @@ namespace llaminar2
             void setDynamicPosOffset(int pos_offset) override;
 
             // ===== ITensorRoPE interface =====
-            bool apply(
-                float *data, float *output,
-                const int *pos_ids,
-                int batch_size, int seq_len, int head_dim, int num_heads,
-                float theta_base, bool interleaved,
-                const MPIContext *mpi_ctx = nullptr,
-                int device_idx = -1) override
-            {
-                (void)data;
-                (void)output;
-                (void)pos_ids;
-                (void)batch_size;
-                (void)seq_len;
-                (void)head_dim;
-                (void)num_heads;
-                (void)theta_base;
-                (void)interleaved;
-                (void)mpi_ctx;
-                (void)device_idx;
-                return false;
-            }
-
-            bool apply_bf16(
-                uint16_t *data, uint16_t *output,
-                const int *pos_ids,
-                int batch_size, int seq_len, int head_dim, int num_heads,
-                float theta_base, int device_idx) override
-            {
-                (void)data;
-                (void)output;
-                (void)pos_ids;
-                (void)batch_size;
-                (void)seq_len;
-                (void)head_dim;
-                (void)num_heads;
-                (void)theta_base;
-                (void)device_idx;
-                return false;
-            }
-
-            bool apply_fp16(
-                uint16_t *data, uint16_t *output,
-                const int *pos_ids,
-                int batch_size, int seq_len, int head_dim, int num_heads,
-                float theta_base, int device_idx) override;
-
-            bool apply_q8_1(
-                void *data, void *output,
-                const int *pos_ids,
-                int batch_size, int seq_len, int head_dim, int num_heads,
-                float theta_base, int device_idx) override
-            {
-                (void)data;
-                (void)output;
-                (void)pos_ids;
-                (void)batch_size;
-                (void)seq_len;
-                (void)head_dim;
-                (void)num_heads;
-                (void)theta_base;
-                (void)device_idx;
-                return false;
-            }
 
             // ===== Tensor API (for RoPEStage) =====
             bool apply_tensor(

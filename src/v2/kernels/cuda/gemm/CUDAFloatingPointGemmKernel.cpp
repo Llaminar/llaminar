@@ -260,11 +260,10 @@ namespace llaminar2
                 d_mapped_output = d_C;
                 d_C = d_mapped_redirect_;
                 static std::once_flag fp32gemm_mapped_once;
-                std::call_once(fp32gemm_mapped_once, [&]() {
-                    LOG_WARN("[CUDAFloatingPointGemmKernel] MAPPED REDIRECT: M=" << m << " N=" << n
-                             << " mapped_ptr=" << d_mapped_output << " -> hbm=" << d_C
-                             << " (" << (needed * 4 / 1024) << " KB)");
-                });
+                std::call_once(fp32gemm_mapped_once, [&]()
+                               { LOG_WARN("[CUDAFloatingPointGemmKernel] MAPPED REDIRECT: M=" << m << " N=" << n
+                                                                                              << " mapped_ptr=" << d_mapped_output << " -> hbm=" << d_C
+                                                                                              << " (" << (needed * 4 / 1024) << " KB)"); });
             }
 
             // Apply activation row offset
@@ -335,41 +334,6 @@ namespace llaminar2
                 }
                 return success;
             }
-        }
-
-        // =====================================================================
-        // ITensorGemm interface - multiply() raw pointers
-        // =====================================================================
-
-        bool CUDAFloatingPointGemmKernel::multiply(
-            const float *A, float *C,
-            int m, int n, int k,
-            bool transpose_B,
-            float alpha, float beta,
-            const MPIContext * /*mpi_ctx*/,
-            int /*device_idx*/,
-            DeviceWorkspaceManager *workspace)
-        {
-            (void)workspace; // TODO: Use workspace for intermediate allocations
-            if (!cublas_kernel_)
-            {
-                LOG_ERROR("[CUDAFloatingPointGemmKernel::multiply] cuBLAS kernel not initialized");
-                return false;
-            }
-
-            // A and C are device pointers
-            // Weight (B) is stored in d_weights_
-            // Execute: C = alpha * A @ B^T + beta * C (transpose_B is typically true)
-
-            CUDA_KERNEL_PROFILE_SCOPE(CUDAKernelType::GEMM_CUBLAS);
-            return cublas_kernel_->execute(
-                A,                                      // d_A
-                static_cast<const float *>(d_weights_), // d_B
-                C,                                      // d_C
-                m, n, k,
-                false,       // transA = false
-                transpose_B, // transB
-                alpha, beta);
         }
 
         // =====================================================================

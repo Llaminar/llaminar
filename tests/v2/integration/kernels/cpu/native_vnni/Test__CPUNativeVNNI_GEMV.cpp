@@ -17,6 +17,7 @@
 #include <cmath>
 #include <csignal>
 #include <cstdio>
+#include <cstring>
 #include <memory>
 #include <numeric>
 #include <random>
@@ -160,6 +161,21 @@ namespace
         return max_err;
     }
 
+    /**
+     * @brief Helper: call multiply_tensor via temporary FP32Tensors wrapping raw float*.
+     */
+    bool multiplyViaTensor(ITensorGemm &kernel, const float *A_data, float *C_data,
+                           int M, int N, int K)
+    {
+        FP32Tensor A_tensor(std::vector<size_t>{(size_t)M, (size_t)K});
+        std::memcpy(A_tensor.mutable_data(), A_data, (size_t)M * K * sizeof(float));
+        FP32Tensor C_tensor(std::vector<size_t>{(size_t)M, (size_t)N});
+        bool ok = kernel.multiply_tensor(&A_tensor, &C_tensor, M, N, K);
+        if (ok)
+            std::memcpy(C_data, C_tensor.data(), (size_t)M * N * sizeof(float));
+        return ok;
+    }
+
     // =========================================================================
     // Shape definitions (Qwen2.5 models)
     // =========================================================================
@@ -255,7 +271,7 @@ namespace
 
         // Compute via NativeVNNI
         std::vector<float> C_native(N, 0.0f);
-        ASSERT_TRUE(kernel.multiply(A.data(), C_native.data(), 1, N, K));
+        ASSERT_TRUE(multiplyViaTensor(kernel, A.data(), C_native.data(), 1, N, K));
 
         // Compute FP32 reference
         std::vector<float> C_ref(N, 0.0f);
@@ -287,7 +303,7 @@ namespace
             v = dist(rng);
 
         std::vector<float> C_native(N, 0.0f);
-        ASSERT_TRUE(kernel.multiply(A.data(), C_native.data(), 1, N, K));
+        ASSERT_TRUE(multiplyViaTensor(kernel, A.data(), C_native.data(), 1, N, K));
 
         std::vector<float> C_ref(N, 0.0f);
         cpuFP32GemvReference(weights.get(), A.data(), C_ref.data(), N, K);
@@ -322,7 +338,7 @@ namespace
             v = dist(rng);
 
         std::vector<float> C_native(M * N, 0.0f);
-        ASSERT_TRUE(kernel.multiply(A.data(), C_native.data(), M, N, K));
+        ASSERT_TRUE(multiplyViaTensor(kernel, A.data(), C_native.data(), M, N, K));
 
         std::vector<float> C_ref(M * N, 0.0f);
         cpuFP32GemmReference(weights.get(), A.data(), C_ref.data(), M, N, K);
@@ -389,7 +405,7 @@ namespace
                 v = dist(rng);
 
             std::vector<float> C_native(shape.N, 0.0f);
-            kernel.multiply(A.data(), C_native.data(), 1, shape.N, shape.K);
+            multiplyViaTensor(kernel, A.data(), C_native.data(), 1, shape.N, shape.K);
 
             std::vector<float> C_ref(shape.N, 0.0f);
             cpuFP32GemvReference(weights.get(), A.data(), C_ref.data(), shape.N, shape.K);
@@ -470,7 +486,7 @@ namespace
                 v = dist(rng);
 
             std::vector<float> C_native(shape.N, 0.0f);
-            kernel.multiply(A.data(), C_native.data(), 1, shape.N, shape.K);
+            multiplyViaTensor(kernel, A.data(), C_native.data(), 1, shape.N, shape.K);
 
             std::vector<float> C_ref(shape.N, 0.0f);
             cpuFP32GemvReference(weights.get(), A.data(), C_ref.data(), shape.N, shape.K);
@@ -537,12 +553,11 @@ namespace
 
         // NativeVNNI result
         std::vector<float> C_native(N, 0.0f);
-        native_kernel.multiply(A.data(), C_native.data(), 1, N, K);
+        multiplyViaTensor(native_kernel, A.data(), C_native.data(), 1, N, K);
 
         // Existing Q8_1 result
         std::vector<float> C_existing(N, 0.0f);
-        existing_kernel->multiply(A.data(), C_existing.data(), 1, N, K,
-                                  true, 1.0f, 0.0f, nullptr, -1);
+        multiplyViaTensor(*existing_kernel, A.data(), C_existing.data(), 1, N, K);
 
         float cos_native = cosineSimilarity(C_native.data(), C_ref.data(), N);
         float cos_existing = cosineSimilarity(C_existing.data(), C_ref.data(), N);
@@ -662,7 +677,7 @@ namespace
             v = dist(rng);
 
         std::vector<float> C_native(N, 0.0f);
-        ASSERT_TRUE(kernel.multiply(A.data(), C_native.data(), 1, N, K));
+        ASSERT_TRUE(multiplyViaTensor(kernel, A.data(), C_native.data(), 1, N, K));
 
         std::vector<float> C_ref(N, 0.0f);
         cpuFP32GemvReference(weights.get(), A.data(), C_ref.data(), N, K);
@@ -761,7 +776,7 @@ namespace
                     v = dist(rng);
 
                 std::vector<float> C_native(shape.N, 0.0f);
-                kernel.multiply(A.data(), C_native.data(), 1, shape.N, shape.K);
+                multiplyViaTensor(kernel, A.data(), C_native.data(), 1, shape.N, shape.K);
 
                 std::vector<float> C_ref(shape.N, 0.0f);
                 cpuFP32GemvReference(weights.get(), A.data(), C_ref.data(), shape.N, shape.K);
@@ -821,7 +836,7 @@ namespace
             v = dist(rng);
 
         std::vector<float> C_native(M * N, 0.0f);
-        ASSERT_TRUE(kernel.multiply(A.data(), C_native.data(), M, N, K));
+        ASSERT_TRUE(multiplyViaTensor(kernel, A.data(), C_native.data(), M, N, K));
 
         std::vector<float> C_ref(M * N, 0.0f);
         cpuFP32GemmReference(weights.get(), A.data(), C_ref.data(), M, N, K);
@@ -853,7 +868,7 @@ namespace
             v = dist(rng);
 
         std::vector<float> C_native(M * N, 0.0f);
-        ASSERT_TRUE(kernel.multiply(A.data(), C_native.data(), M, N, K));
+        ASSERT_TRUE(multiplyViaTensor(kernel, A.data(), C_native.data(), M, N, K));
 
         std::vector<float> C_ref(M * N, 0.0f);
         cpuFP32GemmReference(weights.get(), A.data(), C_ref.data(), M, N, K);
@@ -885,7 +900,7 @@ namespace
             v = dist(rng);
 
         std::vector<float> C_native(M * N, 0.0f);
-        ASSERT_TRUE(kernel.multiply(A.data(), C_native.data(), M, N, K));
+        ASSERT_TRUE(multiplyViaTensor(kernel, A.data(), C_native.data(), M, N, K));
 
         std::vector<float> C_ref(M * N, 0.0f);
         cpuFP32GemmReference(weights.get(), A.data(), C_ref.data(), M, N, K);
@@ -917,7 +932,7 @@ namespace
             v = dist(rng);
 
         std::vector<float> C_native(M * N, 0.0f);
-        ASSERT_TRUE(kernel.multiply(A.data(), C_native.data(), M, N, K));
+        ASSERT_TRUE(multiplyViaTensor(kernel, A.data(), C_native.data(), M, N, K));
 
         std::vector<float> C_ref(M * N, 0.0f);
         cpuFP32GemmReference(weights.get(), A.data(), C_ref.data(), M, N, K);

@@ -5,8 +5,8 @@
  * Tests:
  * - apply_bias_epilogue(): AVX-512 vectorized bias add
  * - multiply_tensor() with bias: GEMM + bias epilogue
- * - multiply_fused() with bias: quantize-once + bias epilogue per projection
- * - multiply_fused() with SwiGLU: gate * silu(up) activation fusion
+ * - multiply_fused_tensor() with bias: quantize-once + bias epilogue per projection
+ * - multiply_fused_tensor() with SwiGLU: gate * silu(up) activation fusion
  * - multiply_fused_tensor() with bias + SwiGLU
  * - supports_fused_projection(): returns true
  * - Pre-quantized GEMV/GEMM path correctness (quantize-once optimization)
@@ -36,6 +36,7 @@
 
 using namespace llaminar2;
 using namespace llaminar2::cpu::native_vnni;
+using namespace llaminar2::primitives;
 using namespace llaminar2::test;
 
 namespace
@@ -330,7 +331,7 @@ TEST(CPUNativeVNNIEpilogueTest, MultiplyTensor_NoBias_Unchanged)
 }
 
 // =========================================================================
-// Test: multiply_fused with bias (quantize-once + bias epilogue)
+// Test: multiply_fused_tensor with bias (quantize-once + bias epilogue)
 // =========================================================================
 
 TEST(CPUNativeVNNIEpilogueTest, MultiplyFused_TwoProjections_WithBias_M1)
@@ -363,18 +364,19 @@ TEST(CPUNativeVNNIEpilogueTest, MultiplyFused_TwoProjections_WithBias_M1)
     ASSERT_TRUE(kernel1.isValid());
     ASSERT_TRUE(kernel2.isValid());
 
-    // Fused output buffers
-    std::vector<float> out1(N1, 0.0f), out2(N2, 0.0f);
+    // Fused output tensors
+    auto out1 = TestTensorFactory::createFP32({1, (size_t)N1});
+    auto out2 = TestTensorFactory::createFP32({1, (size_t)N2});
 
-    std::vector<ITensorGemm::FusedProjectionDesc> projections = {
-        {&kernel1, out1.data(), N1, bias1.get(), "proj1"},
-        {&kernel2, out2.data(), N2, bias2.get(), "proj2"},
+    std::vector<ITensorGemm::TensorProjectionDesc> projections = {
+        {&kernel1, out1.get(), N1, bias1.get(), "proj1"},
+        {&kernel2, out2.get(), N2, bias2.get(), "proj2"},
     };
 
-    ASSERT_TRUE(kernel1.multiply_fused(A->data(), projections, 1, K));
+    ASSERT_TRUE(kernel1.multiply_fused_tensor(A.get(), projections, 1, K));
 
-    float cos1 = cosineSimilarity(out1.data(), ref1.data(), N1);
-    float cos2 = cosineSimilarity(out2.data(), ref2.data(), N2);
+    float cos1 = cosineSimilarity(out1->data(), ref1.data(), N1);
+    float cos2 = cosineSimilarity(out2->data(), ref2.data(), N2);
     EXPECT_GT(cos1, 0.990f) << "Projection 1 cosine too low";
     EXPECT_GT(cos2, 0.985f) << "Projection 2 cosine too low";
 }
@@ -408,22 +410,23 @@ TEST(CPUNativeVNNIEpilogueTest, MultiplyFused_TwoProjections_WithBias_M8)
     ASSERT_TRUE(kernel1.isValid());
     ASSERT_TRUE(kernel2.isValid());
 
-    std::vector<float> out1(M * N1, 0.0f), out2(M * N2, 0.0f);
-    std::vector<ITensorGemm::FusedProjectionDesc> projections = {
-        {&kernel1, out1.data(), N1, bias1.get(), "gate"},
-        {&kernel2, out2.data(), N2, bias2.get(), "up"},
+    auto out1 = TestTensorFactory::createFP32({(size_t)M, (size_t)N1});
+    auto out2 = TestTensorFactory::createFP32({(size_t)M, (size_t)N2});
+    std::vector<ITensorGemm::TensorProjectionDesc> projections = {
+        {&kernel1, out1.get(), N1, bias1.get(), "gate"},
+        {&kernel2, out2.get(), N2, bias2.get(), "up"},
     };
 
-    ASSERT_TRUE(kernel1.multiply_fused(A->data(), projections, M, K));
+    ASSERT_TRUE(kernel1.multiply_fused_tensor(A.get(), projections, M, K));
 
-    float cos1 = cosineSimilarity(out1.data(), ref1.data(), M * N1);
-    float cos2 = cosineSimilarity(out2.data(), ref2.data(), M * N2);
+    float cos1 = cosineSimilarity(out1->data(), ref1.data(), M * N1);
+    float cos2 = cosineSimilarity(out2->data(), ref2.data(), M * N2);
     EXPECT_GT(cos1, 0.990f) << "Gate projection cosine too low (M=8)";
     EXPECT_GT(cos2, 0.990f) << "Up projection cosine too low (M=8)";
 }
 
 // =========================================================================
-// Test: multiply_fused with SwiGLU epilogue
+// Test: multiply_fused_tensor with SwiGLU epilogue
 // =========================================================================
 
 TEST(CPUNativeVNNIEpilogueTest, MultiplyFused_SwiGLU_M1)
@@ -444,19 +447,21 @@ TEST(CPUNativeVNNIEpilogueTest, MultiplyFused_SwiGLU_M1)
     ASSERT_TRUE(kernel_gate.isValid());
     ASSERT_TRUE(kernel_up.isValid());
 
-    // Fused: gate proj + up proj with SwiGLU on up using gate as gate_input
-    std::vector<float> out_gate(N, 0.0f), out_up(N, 0.0f);
+    // Fused: gate proj + up proj, then SwiGLU
+    auto out_gate = TestTensorFactory::createFP32({1, (size_t)N});
+    auto out_up = TestTensorFactory::createFP32({1, (size_t)N});
 
-    // First compute gate (no epilogue)
-    std::vector<ITensorGemm::FusedProjectionDesc> projections = {
-        {&kernel_gate, out_gate.data(), N, nullptr, "gate"},
-        {&kernel_up, out_up.data(), N, nullptr, out_gate.data(), true, "up_swiglu"},
+    std::vector<ITensorGemm::TensorProjectionDesc> projections = {
+        {&kernel_gate, out_gate.get(), N, nullptr, "gate"},
+        {&kernel_up, out_up.get(), N, nullptr, "up"},
     };
 
-    ASSERT_TRUE(kernel_gate.multiply_fused(A->data(), projections, 1, K));
+    ASSERT_TRUE(kernel_gate.multiply_fused_tensor(A.get(), projections, 1, K));
 
-    // out_up should now contain silu(gate) * up
-    float cos = cosineSimilarity(out_up.data(), ref_swiglu.data(), N);
+    // Apply SwiGLU: out_up = silu(gate) * up
+    compute_swiglu(out_gate->data(), out_up->data(), out_up->mutable_data(), N);
+
+    float cos = cosineSimilarity(out_up->data(), ref_swiglu.data(), N);
 
     // SwiGLU introduces additional quantization error from both gate and up projections
     EXPECT_GT(cos, 0.980f) << "SwiGLU fused cosine too low (M=1)";
@@ -479,20 +484,24 @@ TEST(CPUNativeVNNIEpilogueTest, MultiplyFused_SwiGLU_M4)
     ASSERT_TRUE(kernel_gate.isValid());
     ASSERT_TRUE(kernel_up.isValid());
 
-    std::vector<float> out_gate(M * N, 0.0f), out_up(M * N, 0.0f);
-    std::vector<ITensorGemm::FusedProjectionDesc> projections = {
-        {&kernel_gate, out_gate.data(), N, nullptr, "gate"},
-        {&kernel_up, out_up.data(), N, nullptr, out_gate.data(), true, "up_swiglu"},
+    auto out_gate = TestTensorFactory::createFP32({(size_t)M, (size_t)N});
+    auto out_up = TestTensorFactory::createFP32({(size_t)M, (size_t)N});
+    std::vector<ITensorGemm::TensorProjectionDesc> projections = {
+        {&kernel_gate, out_gate.get(), N, nullptr, "gate"},
+        {&kernel_up, out_up.get(), N, nullptr, "up"},
     };
 
-    ASSERT_TRUE(kernel_gate.multiply_fused(A->data(), projections, M, K));
+    ASSERT_TRUE(kernel_gate.multiply_fused_tensor(A.get(), projections, M, K));
 
-    float cos = cosineSimilarity(out_up.data(), ref_swiglu.data(), M * N);
+    // Apply SwiGLU: out_up = silu(gate) * up
+    compute_swiglu(out_gate->data(), out_up->data(), out_up->mutable_data(), M * N);
+
+    float cos = cosineSimilarity(out_up->data(), ref_swiglu.data(), M * N);
     EXPECT_GT(cos, 0.980f) << "SwiGLU fused cosine too low (M=4)";
 }
 
 // =========================================================================
-// Test: multiply_fused with bias + SwiGLU combined
+// Test: multiply_fused_tensor with bias + SwiGLU combined
 // =========================================================================
 
 TEST(CPUNativeVNNIEpilogueTest, MultiplyFused_Bias_SwiGLU_Combined_M1)
@@ -525,15 +534,19 @@ TEST(CPUNativeVNNIEpilogueTest, MultiplyFused_Bias_SwiGLU_Combined_M1)
     ASSERT_TRUE(kernel_gate.isValid());
     ASSERT_TRUE(kernel_up.isValid());
 
-    std::vector<float> out_gate(N, 0.0f), out_up(N, 0.0f);
-    std::vector<ITensorGemm::FusedProjectionDesc> projections = {
-        {&kernel_gate, out_gate.data(), N, bias_gate.get(), "gate"},
-        {&kernel_up, out_up.data(), N, bias_up.get(), out_gate.data(), true, "up_swiglu"},
+    auto out_gate = TestTensorFactory::createFP32({1, (size_t)N});
+    auto out_up = TestTensorFactory::createFP32({1, (size_t)N});
+    std::vector<ITensorGemm::TensorProjectionDesc> projections = {
+        {&kernel_gate, out_gate.get(), N, bias_gate.get(), "gate"},
+        {&kernel_up, out_up.get(), N, bias_up.get(), "up"},
     };
 
-    ASSERT_TRUE(kernel_gate.multiply_fused(A->data(), projections, 1, K));
+    ASSERT_TRUE(kernel_gate.multiply_fused_tensor(A.get(), projections, 1, K));
 
-    float cos = cosineSimilarity(out_up.data(), ref_swiglu.data(), N);
+    // Apply SwiGLU: out_up = silu(gate) * up
+    compute_swiglu(out_gate->data(), out_up->data(), out_up->mutable_data(), N);
+
+    float cos = cosineSimilarity(out_up->data(), ref_swiglu.data(), N);
     EXPECT_GT(cos, 0.980f) << "Bias+SwiGLU combined cosine too low";
 }
 
@@ -605,10 +618,13 @@ TEST(CPUNativeVNNIEpilogueTest, MultiplyFusedTensor_SwiGLU_M1)
 
     std::vector<ITensorGemm::TensorProjectionDesc> projections = {
         {&kernel_gate, out_gate.get(), N, nullptr, "gate"},
-        {&kernel_up, out_up.get(), N, nullptr, out_gate.get(), true, "up_swiglu"},
+        {&kernel_up, out_up.get(), N, nullptr, "up"},
     };
 
     ASSERT_TRUE(kernel_gate.multiply_fused_tensor(A.get(), projections, 1, K));
+
+    // Apply SwiGLU: out_up = silu(gate) * up
+    compute_swiglu(out_gate->data(), out_up->data(), out_up->mutable_data(), N);
 
     float cos = cosineSimilarity(out_up->data(), ref_swiglu.data(), N);
     EXPECT_GT(cos, 0.980f) << "Tensor SwiGLU fused cosine too low";
@@ -632,15 +648,15 @@ TEST(CPUNativeVNNIEpilogueTest, PreQuantized_GEMV_MatchesStandard)
     ASSERT_TRUE(kernel.multiply(A->data(), C_standard.data(), 1, N, K));
 
     // Fused path with single projection (uses pre-quantized path)
-    std::vector<float> C_fused(N, 0.0f);
-    std::vector<ITensorGemm::FusedProjectionDesc> projections = {
-        {&kernel, C_fused.data(), N, nullptr, "test"},
+    auto C_fused = TestTensorFactory::createFP32({1, (size_t)N});
+    std::vector<ITensorGemm::TensorProjectionDesc> projections = {
+        {&kernel, C_fused.get(), N, nullptr, "test"},
     };
-    ASSERT_TRUE(kernel.multiply_fused(A->data(), projections, 1, K));
+    ASSERT_TRUE(kernel.multiply_fused_tensor(A.get(), projections, 1, K));
 
     // Should be identical (same quantization, same compute)
     for (int i = 0; i < N; ++i)
-        EXPECT_FLOAT_EQ(C_standard[i], C_fused[i]) << "Pre-quantized GEMV mismatch at " << i;
+        EXPECT_FLOAT_EQ(C_standard[i], C_fused->data()[i]) << "Pre-quantized GEMV mismatch at " << i;
 }
 
 TEST(CPUNativeVNNIEpilogueTest, PreQuantized_GEMM_MatchesStandard)
@@ -657,13 +673,13 @@ TEST(CPUNativeVNNIEpilogueTest, PreQuantized_GEMM_MatchesStandard)
     ASSERT_TRUE(kernel.multiply(A->data(), C_standard.data(), M, N, K));
 
     // Fused path
-    std::vector<float> C_fused(M * N, 0.0f);
-    std::vector<ITensorGemm::FusedProjectionDesc> projections = {
-        {&kernel, C_fused.data(), N, nullptr, "test"},
+    auto C_fused = TestTensorFactory::createFP32({(size_t)M, (size_t)N});
+    std::vector<ITensorGemm::TensorProjectionDesc> projections = {
+        {&kernel, C_fused.get(), N, nullptr, "test"},
     };
-    ASSERT_TRUE(kernel.multiply_fused(A->data(), projections, M, K));
+    ASSERT_TRUE(kernel.multiply_fused_tensor(A.get(), projections, M, K));
 
-    float cos = cosineSimilarity(C_standard.data(), C_fused.data(), M * N);
+    float cos = cosineSimilarity(C_standard.data(), C_fused->data(), M * N);
     // The pre-quantized path may differ slightly from the original because
     // quantization and compute are in separate OMP regions vs combined.
     // But actual values should be bitwise identical since same input.
@@ -699,7 +715,7 @@ TEST(CPUNativeVNNIEpilogueTest, IQ4NL_WithBias_M1)
 }
 
 // =========================================================================
-// Test: multiply_fused with no epilogues (should still work)
+// Test: multiply_fused_tensor with no epilogues (should still work)
 // =========================================================================
 
 TEST(CPUNativeVNNIEpilogueTest, MultiplyFused_NoEpilogues_M1)
@@ -714,12 +730,12 @@ TEST(CPUNativeVNNIEpilogueTest, MultiplyFused_NoEpilogues_M1)
     std::vector<float> ref(N);
     ASSERT_TRUE(kernel.multiply(A->data(), ref.data(), 1, N, K));
 
-    std::vector<float> out(N, 0.0f);
-    std::vector<ITensorGemm::FusedProjectionDesc> projections = {
-        {&kernel, out.data(), N, nullptr, "plain"},
+    auto out = TestTensorFactory::createFP32({1, (size_t)N});
+    std::vector<ITensorGemm::TensorProjectionDesc> projections = {
+        {&kernel, out.get(), N, nullptr, "plain"},
     };
-    ASSERT_TRUE(kernel.multiply_fused(A->data(), projections, 1, K));
+    ASSERT_TRUE(kernel.multiply_fused_tensor(A.get(), projections, 1, K));
 
     for (int i = 0; i < N; ++i)
-        EXPECT_FLOAT_EQ(ref[i], out[i]) << "Fused without epilogues should match standard";
+        EXPECT_FLOAT_EQ(ref[i], out->data()[i]) << "Fused without epilogues should match standard";
 }

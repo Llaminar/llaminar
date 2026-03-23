@@ -320,11 +320,10 @@ TEST_F(Test__MPI_ColumnParallelLMHead, FullForwardDataFlow)
     auto gemm = getPreparedKernel(lm_head.get(), DeviceId::cpu());
     ASSERT_NE(gemm, nullptr) << "Failed to create GEMM kernel for LM head";
 
-    bool gemm_success = gemm->multiply(
-        hidden_data,                                                   // A: [seq_len, d_model]
-        static_cast<FP32Tensor *>(local_logits.get())->mutable_data(), // C: [seq_len, vocab_local]
-        seq_len, vocab_local, D_MODEL,
-        1.0f, 0.0f);
+    bool gemm_success = gemm->multiply_tensor(
+        hidden.get(),       // A: [seq_len, d_model]
+        local_logits.get(), // C: [seq_len, vocab_local]
+        seq_len, vocab_local, D_MODEL);
     ASSERT_TRUE(gemm_success) << "GEMM for local LM head failed";
 
     // AllGather to collect full logits

@@ -131,20 +131,6 @@ namespace llaminar2
                 int activation_row_offset = 0) override;
 
             /**
-             * @brief Raw FP32 pointer GEMM
-             *
-             * Direct interface for callers with raw device pointers.
-             */
-            bool multiply(
-                const float *A, float *C,
-                int m, int n, int k,
-                bool transpose_B = true,
-                float alpha = 1.0f, float beta = 0.0f,
-                const MPIContext *mpi_ctx = nullptr,
-                int device_idx = -1,
-                DeviceWorkspaceManager *workspace = nullptr) override;
-
-            /**
              * @brief Activation-activation GEMM (not supported for FP CUDA kernel)
              *
              * CUDAFloatingPointGemmKernel is for weight projections only.
@@ -156,7 +142,7 @@ namespace llaminar2
                 bool transpose_B = true,
                 float alpha = 1.0f, float beta = 0.0f,
                 const MPIContext *mpi_ctx = nullptr,
-                int device_idx = -1) override;
+                int device_idx = -1);
 
             /**
              * @brief Strided activation-activation GEMM (not supported)

@@ -701,15 +701,12 @@ namespace llaminar2
         // Note: K's cache should have been invalidated by the caller via mutable_q16_1_blocks()
         void *K_ptr = (void *)K;
 
-        bool success = kernel->apply_q16_1(
-            Q_ptr, K_ptr,
-            position_ids,
-            seq_len, n_heads, n_kv_heads, head_dim,
-            rope_theta,
-            device_idx);
-
-        // Cache was already cleared by mutable_q16_1_blocks() call above
-        return success;
+        // Legacy raw-pointer path removed — use RoPEStage with apply_tensor() instead
+        (void)kernel;
+        (void)Q_ptr;
+        (void)K_ptr;
+        LOG_ERROR("[Q16_1Tensor::applyRoPE] Legacy raw-pointer path removed. Use RoPEStage with apply_tensor() instead.");
+        return false;
     }
 
     bool Q16_1Tensor::applyRMSNorm(

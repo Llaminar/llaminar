@@ -71,7 +71,7 @@ TEST_F(Test__Q2_KTensor, GemmCorrectness_SingleBlock_Zero)
     output_data[0] = 123.0f; // Garbage
 
     auto gemm = weights->createGemm();
-    ASSERT_TRUE(gemm->multiply(input_data, output_data, m, n, k));
+    ASSERT_TRUE(gemm->multiply_tensor(input.get(), output.get(), m, n, k));
 
     EXPECT_NEAR(output_data[0], 0.0f, 1e-5f);
 }
@@ -112,7 +112,7 @@ TEST_F(Test__Q2_KTensor, GemmCorrectness_SingleBlock_Ones)
     output_data[0] = 0.0f;
 
     auto gemm = weights->createGemm();
-    ASSERT_TRUE(gemm->multiply(input_data, output_data, m, n, k));
+    ASSERT_TRUE(gemm->multiply_tensor(input.get(), output.get(), m, n, k));
 
     // Expected: 256 elements * 1.0 * 1.0 = 256.0
     // Tolerance: Re-quantization to INT8 introduces error.
@@ -195,14 +195,14 @@ TEST_F(Test__Q2_KTensor, QuantizedVsFP32Parity)
 
     gemm::FloatingPointGemmKernel fp_kernel(B_fp32.get());
     // B is [N, K], so transpose_B=true to compute A @ B^T
-    fp_kernel.multiply(A_fp32->data(), C_ref->mutable_data(), m, n, k, true);
+    fp_kernel.multiply_tensor(A_fp32.get(), C_ref.get(), m, n, k, true);
 
     // === Test: CPUNativeVNNIGemmKernel with Q2_K weights ===
     auto C_quant = factory.createFP32({static_cast<size_t>(m), static_cast<size_t>(n)});
     std::fill_n(C_quant->mutable_data(), m * n, 0.0f);
 
     cpu::native_vnni::CPUNativeVNNIGemmKernel quant_kernel(B_q2k.get());
-    quant_kernel.multiply(A_fp32->data(), C_quant->mutable_data(), m, n, k, true, 1.0f, 0.0f, nullptr, -1);
+    quant_kernel.multiply_tensor(A_fp32.get(), C_quant.get(), m, n, k, true);
 
     // === Compare results ===
     float rel_l2 = compute_relative_l2_error(C_ref->data(), C_quant->data(), m * n);

@@ -251,33 +251,35 @@ TEST_F(Test__MultiGPU_RealModel, Q4_0_FFNWeight_TransferAndCompute)
     int k = static_cast<int>(cols);
     int n = static_cast<int>(rows);
 
-    std::vector<float> activations(m * k);
+    auto activations_tensor = std::make_unique<FP32Tensor>(std::vector<size_t>{(size_t)m, (size_t)k});
     for (int i = 0; i < m * k; ++i)
     {
-        activations[i] = 0.01f * static_cast<float>(i % 100);
+        activations_tensor->mutable_data()[i] = 0.01f * static_cast<float>(i % 100);
     }
 
     // Compute GEMM on CPU first (reference)
-    std::vector<float> output_cpu(m * n, 0.0f);
+    auto output_cpu_tensor = std::make_unique<FP32Tensor>(std::vector<size_t>{(size_t)m, (size_t)n});
     auto gemm_kernel = q4_tensor->createGemm();
     ASSERT_NE(gemm_kernel, nullptr);
-    ASSERT_TRUE(gemm_kernel->multiply(activations.data(), output_cpu.data(), m, n, k));
+    ASSERT_TRUE(gemm_kernel->multiply_tensor(activations_tensor.get(), output_cpu_tensor.get(), m, n, k));
 
     // Transfer weight to GPU
     ASSERT_TRUE(q4_tensor->ensureOnDevice(gpu_device));
     EXPECT_TRUE(q4_tensor->isOnGPU());
 
     // Compute GEMM again (should use CPU fallback with GPU-resident data)
-    std::vector<float> output_gpu(m * n, 0.0f);
+    auto output_gpu_tensor = std::make_unique<FP32Tensor>(std::vector<size_t>{(size_t)m, (size_t)n});
     auto gemm_kernel_gpu = q4_tensor->createGemm();
     ASSERT_NE(gemm_kernel_gpu, nullptr);
-    ASSERT_TRUE(gemm_kernel_gpu->multiply(activations.data(), output_gpu.data(), m, n, k));
+    ASSERT_TRUE(gemm_kernel_gpu->multiply_tensor(activations_tensor.get(), output_gpu_tensor.get(), m, n, k));
 
     // Results should match (CPU fallback downloads data as needed)
     double max_diff = 0.0;
+    const float *cpu_data = output_cpu_tensor->data();
+    const float *gpu_data = output_gpu_tensor->data();
     for (int i = 0; i < m * n; ++i)
     {
-        max_diff = std::max(max_diff, static_cast<double>(std::abs(output_cpu[i] - output_gpu[i])));
+        max_diff = std::max(max_diff, static_cast<double>(std::abs(cpu_data[i] - gpu_data[i])));
     }
 
     EXPECT_LT(max_diff, 1e-5)

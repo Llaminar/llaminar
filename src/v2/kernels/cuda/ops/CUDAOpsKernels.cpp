@@ -623,22 +623,6 @@ namespace llaminar2
             }
         }
 
-        bool CUDARoPEKernelT<ActivationPrecision::FP32>::apply(
-            float *data, float *output,
-            const int *pos_ids,
-            int batch_size, int seq_len, int head_dim, int num_heads,
-            float theta_base, bool interleaved,
-            const MPIContext *mpi_ctx,
-            int device_idx)
-        {
-            (void)output;      // In-place operation
-            (void)batch_size;  // Already folded into seq_len
-            (void)interleaved; // TODO: support interleaved layout
-            (void)mpi_ctx;
-            int dev = (device_idx >= 0) ? device_idx : device_idx_;
-            return apply_typed(data, nullptr, pos_ids, seq_len, num_heads, num_heads, head_dim, theta_base, dev);
-        }
-
         bool CUDARoPEKernelT<ActivationPrecision::FP32>::apply_typed(
             float *Q,
             float *K,
@@ -807,18 +791,6 @@ namespace llaminar2
             }
         }
 
-        bool CUDARoPEKernelT<ActivationPrecision::BF16>::apply_bf16(
-            uint16_t *data, uint16_t *output,
-            const int *pos_ids,
-            int batch_size, int seq_len, int head_dim, int num_heads,
-            float theta_base, int device_idx)
-        {
-            (void)output;
-            (void)batch_size;
-            int dev = (device_idx >= 0) ? device_idx : device_idx_;
-            return apply_typed(data, nullptr, pos_ids, seq_len, num_heads, num_heads, head_dim, theta_base, dev);
-        }
-
         bool CUDARoPEKernelT<ActivationPrecision::BF16>::apply_typed(
             uint16_t *Q,
             uint16_t *K,
@@ -979,18 +951,6 @@ namespace llaminar2
                     }
                 }
             }
-        }
-
-        bool CUDARoPEKernelT<ActivationPrecision::FP16>::apply_fp16(
-            uint16_t *data, uint16_t *output,
-            const int *pos_ids,
-            int batch_size, int seq_len, int head_dim, int num_heads,
-            float theta_base, int device_idx)
-        {
-            (void)output;
-            (void)batch_size;
-            int dev = (device_idx >= 0) ? device_idx : device_idx_;
-            return apply_typed(data, nullptr, pos_ids, seq_len, num_heads, num_heads, head_dim, theta_base, dev);
         }
 
         bool CUDARoPEKernelT<ActivationPrecision::FP16>::apply_typed(
@@ -1344,10 +1304,7 @@ namespace llaminar2
         // Verify preloaded data matches current request to prevent stale tokens
         // after clear_cache(). The kernel is cached in KernelFactory and
         // dynamic_params_active_ persists across graph rebuilds.
-        const bool token_ids_preloaded = dynamic_params_active_
-            && dynamic_token_count_ == num_tokens
-            && h_token_ids_
-            && std::memcmp(h_token_ids_, token_ids, token_bytes) == 0;
+        const bool token_ids_preloaded = dynamic_params_active_ && dynamic_token_count_ == num_tokens && h_token_ids_ && std::memcmp(h_token_ids_, token_ids, token_bytes) == 0;
         if (!token_ids_preloaded)
         {
             dynamic_params_active_ = false;

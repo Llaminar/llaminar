@@ -116,6 +116,11 @@ namespace llaminar2
             config.device_map_numa_explicit.clear();
             config.device_map_numa_explicit.emplace_back(mpi_ctx->rank(), true);
 
+            // Clear the original -d flag to avoid validation conflicts
+            // (device_map now owns the per-rank assignment)
+            config.device_for_this_rank = std::nullopt;
+            config.device_for_this_rank_numa_explicit = false;
+
             if (config.tp_scope == TPScope::AUTO)
             {
                 config.tp_scope = TPScope::GLOBAL;

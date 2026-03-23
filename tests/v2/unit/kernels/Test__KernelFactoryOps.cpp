@@ -682,10 +682,10 @@ TEST_F(Test__KernelFactoryOps, CreateResidualAdd_FP32_FunctionalTest)
     auto kernel = KernelFactory::createResidualAdd(input.get(), DeviceType::CPU);
     ASSERT_NE(kernel, nullptr);
 
-    bool success = kernel->apply(
-        input->data(),
-        residual->data(),
-        output->mutable_data(),
+    bool success = kernel->apply_tensor(
+        input.get(),
+        residual.get(),
+        output.get(),
         16,
         nullptr,
         -1);
@@ -751,14 +751,13 @@ TEST_F(Test__KernelFactoryOps, CreateRMSNorm_FP32_FunctionalTest)
     ASSERT_NE(kernel, nullptr);
 
     float eps = 1e-6f;
-    bool success = kernel->apply(
-        input->data(),
-        gamma->data(),
-        output->mutable_data(),
+    bool success = kernel->apply_tensor(
+        input.get(),
+        gamma.get(),
+        output.get(),
         rows,
         hidden_dim,
         eps,
-        false,   // use_bf16
         nullptr, // mpi_ctx
         -1);     // device_idx
     ASSERT_TRUE(success);
@@ -786,10 +785,10 @@ TEST_F(Test__KernelFactoryOps, CreateSwiGLU_FP32_FunctionalTest)
     auto kernel = KernelFactory::createSwiGLU(gate.get(), DeviceType::CPU);
     ASSERT_NE(kernel, nullptr);
 
-    bool success = kernel->apply(
-        gate->data(),
-        up->data(),
-        output->mutable_data(),
+    bool success = kernel->apply_tensor(
+        gate.get(),
+        up.get(),
+        output.get(),
         rows,
         cols,
         false, // add_residual

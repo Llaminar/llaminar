@@ -53,7 +53,7 @@ TEST_F(Test__Q6_KTensor, GemmCorrectness_SingleBlock_Zero)
     output_data[0] = 123.0f; // Garbage
 
     auto gemm = weights->createGemm();
-    ASSERT_TRUE(gemm->multiply(input_data, output_data, m, n, k));
+    ASSERT_TRUE(gemm->multiply_tensor(input.get(), output.get(), m, n, k));
 
     EXPECT_NEAR(output_data[0], 0.0f, 1e-5f);
 }
@@ -124,7 +124,7 @@ TEST_F(Test__Q6_KTensor, GemmCorrectness_SingleBlock_Ones)
     output_data[0] = 0.0f;
 
     auto gemm = weights->createGemm();
-    ASSERT_TRUE(gemm->multiply(input_data, output_data, m, n, k));
+    ASSERT_TRUE(gemm->multiply_tensor(input.get(), output.get(), m, n, k));
 
     // Expected: 256 elements * 1.0 * 1.0 = 256.0
     float expected = 256.0f;

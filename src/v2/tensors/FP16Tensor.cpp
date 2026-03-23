@@ -694,20 +694,8 @@ namespace llaminar2
         const MPIContext *mpi_ctx,
         int device_idx)
     {
-        auto kernel = createRMSNorm();
-        if (!kernel)
-        {
-            LOG_ERROR("[FP16Tensor::applyRMSNorm] Failed to create RMSNorm kernel");
-            return false;
-        }
-
-        // FP16 path: apply_fp16() with FP16 buffers (in-place)
-        return kernel->apply_fp16(
-            this->typed_data(),
-            gamma,
-            this->mutable_typed_data(),
-            seq_len, d_model, eps,
-            device_idx);
+        LOG_ERROR("[FP16Tensor::applyRMSNorm] Removed — use ITensorRMSNorm::apply_tensor() via stages");
+        return false;
     }
 
     bool FP16Tensor::applyRoPE(
@@ -729,16 +717,10 @@ namespace llaminar2
             return false;
         }
 
-        // FP16 path: apply_fp16() with FP16 buffers
-        // Q is this tensor, K must be FP16 as well
-        // Note: K is passed as float* but should actually be FP16
-        return kernel->apply_fp16(
-            this->mutable_typed_data(),      // Q (FP16)
-            reinterpret_cast<uint16_t *>(K), // K (FP16)
-            position_ids,
-            seq_len, n_heads, n_kv_heads, head_dim,
-            rope_theta,
-            device_idx);
+        // Legacy raw-pointer path removed — use RoPEStage with apply_tensor() instead
+        (void)kernel;
+        LOG_ERROR("[FP16Tensor::applyRoPE] Legacy raw-pointer path removed. Use RoPEStage with apply_tensor() instead.");
+        return false;
     }
 
     void FP16Tensor::decode_to_q8_0(size_t row_idx, size_t k_block_offset, Q8_0Block *output) const
