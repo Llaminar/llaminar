@@ -713,11 +713,11 @@ namespace llaminar2::cpu::native_vnni
         const __m512i decode_lut,
         bool accumulate)
     {
-        __m512 fp0_0 = accumulate ? _mm512_loadu_ps(C_row0)      : _mm512_setzero_ps();
+        __m512 fp0_0 = accumulate ? _mm512_loadu_ps(C_row0) : _mm512_setzero_ps();
         __m512 fp0_1 = accumulate ? _mm512_loadu_ps(C_row0 + 16) : _mm512_setzero_ps();
         __m512 fp0_2 = accumulate ? _mm512_loadu_ps(C_row0 + 32) : _mm512_setzero_ps();
         __m512 fp0_3 = accumulate ? _mm512_loadu_ps(C_row0 + 48) : _mm512_setzero_ps();
-        __m512 fp1_0 = accumulate ? _mm512_loadu_ps(C_row1)      : _mm512_setzero_ps();
+        __m512 fp1_0 = accumulate ? _mm512_loadu_ps(C_row1) : _mm512_setzero_ps();
         __m512 fp1_1 = accumulate ? _mm512_loadu_ps(C_row1 + 16) : _mm512_setzero_ps();
         __m512 fp1_2 = accumulate ? _mm512_loadu_ps(C_row1 + 32) : _mm512_setzero_ps();
         __m512 fp1_3 = accumulate ? _mm512_loadu_ps(C_row1 + 48) : _mm512_setzero_ps();
@@ -763,7 +763,8 @@ namespace llaminar2::cpu::native_vnni
                     vals[1] = static_cast<uint8_t>(static_cast<int16_t>(a0.qs[group * 4 + 1]) + 128);
                     vals[2] = static_cast<uint8_t>(static_cast<int16_t>(a0.qs[group * 4 + 2]) + 128);
                     vals[3] = static_cast<uint8_t>(static_cast<int16_t>(a0.qs[group * 4 + 3]) + 128);
-                    int32_t v; std::memcpy(&v, vals, 4);
+                    int32_t v;
+                    std::memcpy(&v, vals, 4);
                     __m512i ab = _mm512_set1_epi32(v);
                     ia0_0 = _mm512_dpbusd_epi32(ia0_0, ab, lo0);
                     ia0_1 = _mm512_dpbusd_epi32(ia0_1, ab, lo1);
@@ -789,7 +790,8 @@ namespace llaminar2::cpu::native_vnni
                     vals[1] = static_cast<uint8_t>(static_cast<int16_t>(a1.qs[group * 4 + 1]) + 128);
                     vals[2] = static_cast<uint8_t>(static_cast<int16_t>(a1.qs[group * 4 + 2]) + 128);
                     vals[3] = static_cast<uint8_t>(static_cast<int16_t>(a1.qs[group * 4 + 3]) + 128);
-                    int32_t v; std::memcpy(&v, vals, 4);
+                    int32_t v;
+                    std::memcpy(&v, vals, 4);
                     __m512i ab = _mm512_set1_epi32(v);
                     ia1_0 = _mm512_dpbusd_epi32(ia1_0, ab, lo0);
                     ia1_1 = _mm512_dpbusd_epi32(ia1_1, ab, lo1);
@@ -821,10 +823,14 @@ namespace llaminar2::cpu::native_vnni
             __m512i bias_c2 = _mm512_mullo_epi32(bias_128_i32, c2);
             __m512i bias_c3 = _mm512_mullo_epi32(bias_128_i32, c3);
 
-            ia0_0 = _mm512_sub_epi32(ia0_0, bias_c0); ia0_1 = _mm512_sub_epi32(ia0_1, bias_c1);
-            ia0_2 = _mm512_sub_epi32(ia0_2, bias_c2); ia0_3 = _mm512_sub_epi32(ia0_3, bias_c3);
-            ia1_0 = _mm512_sub_epi32(ia1_0, bias_c0); ia1_1 = _mm512_sub_epi32(ia1_1, bias_c1);
-            ia1_2 = _mm512_sub_epi32(ia1_2, bias_c2); ia1_3 = _mm512_sub_epi32(ia1_3, bias_c3);
+            ia0_0 = _mm512_sub_epi32(ia0_0, bias_c0);
+            ia0_1 = _mm512_sub_epi32(ia0_1, bias_c1);
+            ia0_2 = _mm512_sub_epi32(ia0_2, bias_c2);
+            ia0_3 = _mm512_sub_epi32(ia0_3, bias_c3);
+            ia1_0 = _mm512_sub_epi32(ia1_0, bias_c0);
+            ia1_1 = _mm512_sub_epi32(ia1_1, bias_c1);
+            ia1_2 = _mm512_sub_epi32(ia1_2, bias_c2);
+            ia1_3 = _mm512_sub_epi32(ia1_3, bias_c3);
 
             const uint16_t *b_scales = packed.chunkScales(chunk, kb);
             __m512 bs0 = _mm512_cvtph_ps(_mm256_load_si256(reinterpret_cast<const __m256i *>(b_scales)));
@@ -857,19 +863,27 @@ namespace llaminar2::cpu::native_vnni
                 __m512 bm3 = _mm512_cvtph_ps(_mm256_load_si256(reinterpret_cast<const __m256i *>(b_mins + 48)));
 
                 __m512 corr0 = _mm512_set1_ps(static_cast<float>(a0.sum_qs) * a0_scale);
-                fp0_0 = _mm512_fmadd_ps(corr0, bm0, fp0_0); fp0_1 = _mm512_fmadd_ps(corr0, bm1, fp0_1);
-                fp0_2 = _mm512_fmadd_ps(corr0, bm2, fp0_2); fp0_3 = _mm512_fmadd_ps(corr0, bm3, fp0_3);
+                fp0_0 = _mm512_fmadd_ps(corr0, bm0, fp0_0);
+                fp0_1 = _mm512_fmadd_ps(corr0, bm1, fp0_1);
+                fp0_2 = _mm512_fmadd_ps(corr0, bm2, fp0_2);
+                fp0_3 = _mm512_fmadd_ps(corr0, bm3, fp0_3);
 
                 __m512 corr1 = _mm512_set1_ps(static_cast<float>(a1.sum_qs) * a1_scale);
-                fp1_0 = _mm512_fmadd_ps(corr1, bm0, fp1_0); fp1_1 = _mm512_fmadd_ps(corr1, bm1, fp1_1);
-                fp1_2 = _mm512_fmadd_ps(corr1, bm2, fp1_2); fp1_3 = _mm512_fmadd_ps(corr1, bm3, fp1_3);
+                fp1_0 = _mm512_fmadd_ps(corr1, bm0, fp1_0);
+                fp1_1 = _mm512_fmadd_ps(corr1, bm1, fp1_1);
+                fp1_2 = _mm512_fmadd_ps(corr1, bm2, fp1_2);
+                fp1_3 = _mm512_fmadd_ps(corr1, bm3, fp1_3);
             }
         }
 
-        _mm512_storeu_ps(C_row0,      fp0_0); _mm512_storeu_ps(C_row0 + 16, fp0_1);
-        _mm512_storeu_ps(C_row0 + 32, fp0_2); _mm512_storeu_ps(C_row0 + 48, fp0_3);
-        _mm512_storeu_ps(C_row1,      fp1_0); _mm512_storeu_ps(C_row1 + 16, fp1_1);
-        _mm512_storeu_ps(C_row1 + 32, fp1_2); _mm512_storeu_ps(C_row1 + 48, fp1_3);
+        _mm512_storeu_ps(C_row0, fp0_0);
+        _mm512_storeu_ps(C_row0 + 16, fp0_1);
+        _mm512_storeu_ps(C_row0 + 32, fp0_2);
+        _mm512_storeu_ps(C_row0 + 48, fp0_3);
+        _mm512_storeu_ps(C_row1, fp1_0);
+        _mm512_storeu_ps(C_row1 + 16, fp1_1);
+        _mm512_storeu_ps(C_row1 + 32, fp1_2);
+        _mm512_storeu_ps(C_row1 + 48, fp1_3);
     }
 
     /**
@@ -886,11 +900,11 @@ namespace llaminar2::cpu::native_vnni
         int kb_end,
         bool accumulate)
     {
-        __m512 fp0_0 = accumulate ? _mm512_loadu_ps(C_row0)      : _mm512_setzero_ps();
+        __m512 fp0_0 = accumulate ? _mm512_loadu_ps(C_row0) : _mm512_setzero_ps();
         __m512 fp0_1 = accumulate ? _mm512_loadu_ps(C_row0 + 16) : _mm512_setzero_ps();
         __m512 fp0_2 = accumulate ? _mm512_loadu_ps(C_row0 + 32) : _mm512_setzero_ps();
         __m512 fp0_3 = accumulate ? _mm512_loadu_ps(C_row0 + 48) : _mm512_setzero_ps();
-        __m512 fp1_0 = accumulate ? _mm512_loadu_ps(C_row1)      : _mm512_setzero_ps();
+        __m512 fp1_0 = accumulate ? _mm512_loadu_ps(C_row1) : _mm512_setzero_ps();
         __m512 fp1_1 = accumulate ? _mm512_loadu_ps(C_row1 + 16) : _mm512_setzero_ps();
         __m512 fp1_2 = accumulate ? _mm512_loadu_ps(C_row1 + 32) : _mm512_setzero_ps();
         __m512 fp1_3 = accumulate ? _mm512_loadu_ps(C_row1 + 48) : _mm512_setzero_ps();
@@ -922,19 +936,19 @@ namespace llaminar2::cpu::native_vnni
                 __m512i a1_bc = _mm512_set1_epi32(static_cast<int32_t>(
                     static_cast<uint32_t>(raw1) ^ 0x80808080u));
 
-                // Load-use-discard: 1 B register live at a time (not 4).
-                // Peak: 8 INT32 + 8 FP32 + 2 A + 1 B + 1 const = 20 ZMMs.
-                #define INT8_SUBCHUNK(Z, IA0, IA1) \
-                { \
-                    __m512i b = _mm512_load_si512(packed.interleavedB(chunk, kb, group, Z)); \
-                    IA0 = _mm512_dpbusd_epi32(IA0, a0_bc, b); \
-                    IA1 = _mm512_dpbusd_epi32(IA1, a1_bc, b); \
-                }
+// Load-use-discard: 1 B register live at a time (not 4).
+// Peak: 8 INT32 + 8 FP32 + 2 A + 1 B + 1 const = 20 ZMMs.
+#define INT8_SUBCHUNK(Z, IA0, IA1)                                               \
+    {                                                                            \
+        __m512i b = _mm512_load_si512(packed.interleavedB(chunk, kb, group, Z)); \
+        IA0 = _mm512_dpbusd_epi32(IA0, a0_bc, b);                                \
+        IA1 = _mm512_dpbusd_epi32(IA1, a1_bc, b);                                \
+    }
                 INT8_SUBCHUNK(0, ia0_0, ia1_0)
                 INT8_SUBCHUNK(1, ia0_1, ia1_1)
                 INT8_SUBCHUNK(2, ia0_2, ia1_2)
                 INT8_SUBCHUNK(3, ia0_3, ia1_3)
-                #undef INT8_SUBCHUNK
+#undef INT8_SUBCHUNK
             }
 
             // Bias correction (shared comp loads)
@@ -949,10 +963,14 @@ namespace llaminar2::cpu::native_vnni
             __m512i bc2 = _mm512_mullo_epi32(bias_128_i32, cc2);
             __m512i bc3 = _mm512_mullo_epi32(bias_128_i32, cc3);
 
-            ia0_0 = _mm512_sub_epi32(ia0_0, bc0); ia0_1 = _mm512_sub_epi32(ia0_1, bc1);
-            ia0_2 = _mm512_sub_epi32(ia0_2, bc2); ia0_3 = _mm512_sub_epi32(ia0_3, bc3);
-            ia1_0 = _mm512_sub_epi32(ia1_0, bc0); ia1_1 = _mm512_sub_epi32(ia1_1, bc1);
-            ia1_2 = _mm512_sub_epi32(ia1_2, bc2); ia1_3 = _mm512_sub_epi32(ia1_3, bc3);
+            ia0_0 = _mm512_sub_epi32(ia0_0, bc0);
+            ia0_1 = _mm512_sub_epi32(ia0_1, bc1);
+            ia0_2 = _mm512_sub_epi32(ia0_2, bc2);
+            ia0_3 = _mm512_sub_epi32(ia0_3, bc3);
+            ia1_0 = _mm512_sub_epi32(ia1_0, bc0);
+            ia1_1 = _mm512_sub_epi32(ia1_1, bc1);
+            ia1_2 = _mm512_sub_epi32(ia1_2, bc2);
+            ia1_3 = _mm512_sub_epi32(ia1_3, bc3);
 
             // Scale (shared b_scales loads)
             const uint16_t *b_scales = packed.chunkScales(chunk, kb);
@@ -982,19 +1000,27 @@ namespace llaminar2::cpu::native_vnni
                 __m512 bm3 = _mm512_cvtph_ps(_mm256_load_si256(reinterpret_cast<const __m256i *>(b_mins + 48)));
 
                 __m512 corr0 = _mm512_set1_ps(static_cast<float>(a0.sum_qs) * a0_scale);
-                fp0_0 = _mm512_fmadd_ps(corr0, bm0, fp0_0); fp0_1 = _mm512_fmadd_ps(corr0, bm1, fp0_1);
-                fp0_2 = _mm512_fmadd_ps(corr0, bm2, fp0_2); fp0_3 = _mm512_fmadd_ps(corr0, bm3, fp0_3);
+                fp0_0 = _mm512_fmadd_ps(corr0, bm0, fp0_0);
+                fp0_1 = _mm512_fmadd_ps(corr0, bm1, fp0_1);
+                fp0_2 = _mm512_fmadd_ps(corr0, bm2, fp0_2);
+                fp0_3 = _mm512_fmadd_ps(corr0, bm3, fp0_3);
 
                 __m512 corr1 = _mm512_set1_ps(static_cast<float>(a1.sum_qs) * a1_scale);
-                fp1_0 = _mm512_fmadd_ps(corr1, bm0, fp1_0); fp1_1 = _mm512_fmadd_ps(corr1, bm1, fp1_1);
-                fp1_2 = _mm512_fmadd_ps(corr1, bm2, fp1_2); fp1_3 = _mm512_fmadd_ps(corr1, bm3, fp1_3);
+                fp1_0 = _mm512_fmadd_ps(corr1, bm0, fp1_0);
+                fp1_1 = _mm512_fmadd_ps(corr1, bm1, fp1_1);
+                fp1_2 = _mm512_fmadd_ps(corr1, bm2, fp1_2);
+                fp1_3 = _mm512_fmadd_ps(corr1, bm3, fp1_3);
             }
         }
 
-        _mm512_storeu_ps(C_row0,      fp0_0); _mm512_storeu_ps(C_row0 + 16, fp0_1);
-        _mm512_storeu_ps(C_row0 + 32, fp0_2); _mm512_storeu_ps(C_row0 + 48, fp0_3);
-        _mm512_storeu_ps(C_row1,      fp1_0); _mm512_storeu_ps(C_row1 + 16, fp1_1);
-        _mm512_storeu_ps(C_row1 + 32, fp1_2); _mm512_storeu_ps(C_row1 + 48, fp1_3);
+        _mm512_storeu_ps(C_row0, fp0_0);
+        _mm512_storeu_ps(C_row0 + 16, fp0_1);
+        _mm512_storeu_ps(C_row0 + 32, fp0_2);
+        _mm512_storeu_ps(C_row0 + 48, fp0_3);
+        _mm512_storeu_ps(C_row1, fp1_0);
+        _mm512_storeu_ps(C_row1 + 16, fp1_1);
+        _mm512_storeu_ps(C_row1 + 32, fp1_2);
+        _mm512_storeu_ps(C_row1 + 48, fp1_3);
     }
 
 #endif // __AVX512F__ && __AVX512VNNI__ && __AVX512BW__
@@ -1206,11 +1232,11 @@ namespace llaminar2::cpu::native_vnni
                                     gemv_native_vnni_avx512_chunk_native(packed, aq, tmp, chunk, kb_start, kb_end, decode_lut);
                                 else
                                     gemv_native_vnni_avx512_chunk_int8(packed, aq, tmp, chunk, kb_start, kb_end);
-                                __m512 s0 = _mm512_add_ps(_mm512_loadu_ps(c_row),      _mm512_load_ps(tmp));
+                                __m512 s0 = _mm512_add_ps(_mm512_loadu_ps(c_row), _mm512_load_ps(tmp));
                                 __m512 s1 = _mm512_add_ps(_mm512_loadu_ps(c_row + 16), _mm512_load_ps(tmp + 16));
                                 __m512 s2 = _mm512_add_ps(_mm512_loadu_ps(c_row + 32), _mm512_load_ps(tmp + 32));
                                 __m512 s3 = _mm512_add_ps(_mm512_loadu_ps(c_row + 48), _mm512_load_ps(tmp + 48));
-                                _mm512_storeu_ps(c_row,      s0);
+                                _mm512_storeu_ps(c_row, s0);
                                 _mm512_storeu_ps(c_row + 16, s1);
                                 _mm512_storeu_ps(c_row + 32, s2);
                                 _mm512_storeu_ps(c_row + 48, s3);
