@@ -3,7 +3,8 @@
  * @brief Parameter space sweep for CPU NativeVNNI tile dispatch heuristics.
  *
  * Sweeps (n_block_chunks, k_tile_blocks, m_unroll) across representative
- * Qwen-7B shapes for both GEMV (M=1, decode) and GEMM (M>1, prefill).
+ * Qwen2.5 shapes (0.5B, 3B, 7B, 14B, 32B) for GEMV (M=1, decode) and
+ * GEMM (M>1, prefill).
  *
  * For each (shape, M, param-combo):
  *   1. Override tile config via LLAMINAR_CPU_VNNI_* env vars + DebugEnv reload
@@ -90,7 +91,7 @@ namespace
     static constexpr double MEASURED_READ_BW_GBS = 117.0;
 
     // =========================================================================
-    // Shape definitions — Qwen 7B (our primary optimization target)
+    // Shape definitions — Qwen2.5 family (0.5B through 32B)
     // =========================================================================
 
     struct GEMMShape
@@ -101,17 +102,62 @@ namespace
         int K;
     };
 
+    /**
+     * @brief Model architecture parameters for deriving GEMM shapes.
+     *
+     * | Size | d_model | n_heads | n_kv_heads | head_dim | d_ff   |
+     * |------|---------|---------|------------|----------|--------|
+     * | 0.5B |     896 |      14 |          2 |       64 |  4,864 |
+     * | 3B   |   2,048 |      16 |          2 |      128 | 11,008 |
+     * | 7B   |   3,584 |      28 |          4 |      128 | 18,944 |
+     * | 14B  |   5,120 |      40 |          8 |      128 | 13,824 |
+     * | 32B  |   5,120 |      40 |          8 |      128 | 27,648 |
+     */
+    struct ModelDims
+    {
+        std::string label;  // e.g. "0.5B", "7B"
+        int d_model;
+        int n_heads;
+        int n_kv_heads;
+        int head_dim;
+        int d_ff;
+    };
+
+    static const std::vector<ModelDims> ALL_MODEL_DIMS = {
+        {"0.5B",  896, 14, 2,  64,  4864},
+        {"3B",   2048, 16, 2, 128, 11008},
+        {"7B",   3584, 28, 4, 128, 18944},
+        {"14B",  5120, 40, 8, 128, 13824},
+        {"32B",  5120, 40, 8, 128, 27648},
+    };
+
+    static std::vector<GEMMShape> shapesForModel(const ModelDims &m)
+    {
+        int q_n = m.n_heads * m.head_dim;      // Q_proj output dim
+        int kv_n = m.n_kv_heads * m.head_dim;  // K/V_proj output dim
+        return {
+            {m.label + "_Q_proj",    "Attn", q_n,      m.d_model},
+            {m.label + "_K_proj",    "Attn", kv_n,     m.d_model},
+            {m.label + "_V_proj",    "Attn", kv_n,     m.d_model},
+            {m.label + "_Wo_proj",   "Attn", m.d_model, q_n},
+            {m.label + "_FFN_Gate",  "FFN",  m.d_ff,    m.d_model},
+            {m.label + "_FFN_Up",    "FFN",  m.d_ff,    m.d_model},
+            {m.label + "_FFN_Down",  "FFN",  m.d_model, m.d_ff},
+        };
+    }
+
+    /// Legacy alias — existing 7B-only tests use this.
     static std::vector<GEMMShape> qwen7BShapes()
     {
         // Qwen2.5-7B: d_model=3584, n_heads=28, n_kv_heads=4, head_dim=128, d_ff=18944
         return {
-            {"Q_proj", "Attn", 3584, 3584},    // n_heads * head_dim × d_model
-            {"K_proj", "Attn", 512, 3584},      // n_kv_heads * head_dim × d_model
-            {"V_proj", "Attn", 512, 3584},      // n_kv_heads * head_dim × d_model
-            {"Wo_proj", "Attn", 3584, 3584},    // d_model × n_heads * head_dim
-            {"FFN_Gate", "FFN", 18944, 3584},   // d_ff × d_model
-            {"FFN_Up", "FFN", 18944, 3584},     // d_ff × d_model
-            {"FFN_Down", "FFN", 3584, 18944},   // d_model × d_ff
+            {"Q_proj", "Attn", 3584, 3584},
+            {"K_proj", "Attn", 512, 3584},
+            {"V_proj", "Attn", 512, 3584},
+            {"Wo_proj", "Attn", 3584, 3584},
+            {"FFN_Gate", "FFN", 18944, 3584},
+            {"FFN_Up", "FFN", 18944, 3584},
+            {"FFN_Down", "FFN", 3584, 18944},
         };
     }
 
@@ -571,6 +617,64 @@ namespace
         }
 
         renderSummaryTable("Q4_0 PREFILL (M>1) DISPATCH SWEEP — Qwen 7B", all);
+    }
+
+    // -----------------------------------------------------------------------
+    // DECODE (M=1): Multi-model sweep — Q8_0 across 0.5B, 3B, 7B, 14B, 32B
+    //
+    // Validates that dispatch heuristics scale across model sizes.
+    // -----------------------------------------------------------------------
+    TEST_F(CPUNativeVNNIDispatchSweepTest, Q8_0_Decode_MultiModel)
+    {
+        std::vector<SweepResult> all;
+        bool header = false;
+
+        for (const auto &model : ALL_MODEL_DIMS)
+        {
+            auto shapes = shapesForModel(model);
+            for (const auto &shape : shapes)
+            {
+                auto results = runDispatchSweep({"Q8_0", false}, shape, 1, header);
+                header = true;
+                all.insert(all.end(), results.begin(), results.end());
+            }
+        }
+
+        renderSummaryTable("Q8_0 DECODE (M=1) MULTI-MODEL SWEEP — Qwen 0.5B/3B/7B/14B/32B", all);
+    }
+
+    // -----------------------------------------------------------------------
+    // PREFILL: Multi-model sweep — Q8_0 at M=256,1024 across all sizes
+    //
+    // Uses representative M values; FFN shapes dominate prefill time.
+    // -----------------------------------------------------------------------
+    TEST_F(CPUNativeVNNIDispatchSweepTest, Q8_0_Prefill_MultiModel)
+    {
+        std::vector<SweepResult> all;
+        bool header = false;
+
+        for (const auto &model : ALL_MODEL_DIMS)
+        {
+            // Focus on the 3 shapes that dominate prefill: FFN_Gate, FFN_Down, Wo
+            int q_n = model.n_heads * model.head_dim;
+            std::vector<GEMMShape> pfill_shapes = {
+                {model.label + "_FFN_Gate", "FFN", model.d_ff,    model.d_model},
+                {model.label + "_FFN_Down", "FFN", model.d_model, model.d_ff},
+                {model.label + "_Wo_proj",  "Attn", model.d_model, q_n},
+            };
+
+            for (int M : {256, 1024})
+            {
+                for (const auto &shape : pfill_shapes)
+                {
+                    auto results = runDispatchSweep({"Q8_0", false}, shape, M, header);
+                    header = true;
+                    all.insert(all.end(), results.begin(), results.end());
+                }
+            }
+        }
+
+        renderSummaryTable("Q8_0 PREFILL (M>1) MULTI-MODEL SWEEP — Qwen 0.5B/3B/7B/14B/32B", all);
     }
 
     // -----------------------------------------------------------------------

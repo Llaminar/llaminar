@@ -120,6 +120,27 @@ namespace llaminar2::cpu::native_vnni
             int target_tasks = num_threads * 4;
             int chunks_per_task = std::max(1, N_chunks / target_tasks);
 
+            // ---------------------------------------------------------------
+            // Compute-bound detection: when the entire weight matrix fits
+            // in L3 cache, the kernel is compute-bound (served from L3 at
+            // ~500-900 GB/s, not DRAM at ~117 GB/s). Different parallelism
+            // tradeoffs apply:
+            //  - Large N, small K: per-task compute is tiny → OMP scheduling
+            //    overhead dominates → use larger nbc to reduce task count
+            //  - Small N, large K: not enough N-parallel work → aggressive
+            //    k-parallel creates more useful tasks
+            //
+            // Sweep-validated across Qwen 0.5B/3B/7B/14B/32B:
+            //  - 3B FFN_Gate (11008×2048): nbc=8 → 1.78× vs nbc=1 default
+            //  - 3B FFN_Down (2048×11008): kt=7  → 1.85× vs no k-parallel
+            //  - 7B/14B/32B FFN (weights > L3): nbc=1 remains optimal
+            // ---------------------------------------------------------------
+            long long weight_bytes = (long long)N_chunks * blocks_per_row * 2560;
+            bool compute_bound = weight_bytes < (long long)cache.l3_size * 3 / 4;
+
+            // Per-task FLOPs at nbc=1: each 64-row chunk does 2*64*K ops
+            long long flops_per_chunk = 2LL * 64 * K;
+
             // For Attention (small N), use 1 chunk per task for maximum parallelism
             // For FFN/LM_Head (large N), use larger blocks up to L2 limit
             switch (cfg.category)
@@ -131,13 +152,20 @@ namespace llaminar2::cpu::native_vnni
                 break;
 
             case ShapeCategory::FFN:
-                // Medium N (4864-18944): 76-296 chunks total
-                // Sweep-validated: nbc=1 beats cache-limited nbc=2 by 11%
-                // across all FFN shapes (FFN_Gate, FFN_Up, FFN_Down).
-                // Finer granularity gives better load balance across threads
-                // and the L2 streaming argument doesn't hold — each chunk is
-                // processed independently with full-K streaming.
-                cfg.n_block_chunks = 1;
+                if (compute_bound && N_chunks > num_threads * 4 && flops_per_chunk < 500000)
+                {
+                    // Compute-bound with many fine-grained tasks: OMP overhead
+                    // dominates. Increase nbc so total tasks ≈ 2× threads.
+                    // Example: 3B FFN_Gate (172 chunks, K=2048, 262K FLOP/chunk)
+                    int target_tasks = num_threads * 2;
+                    cfg.n_block_chunks = std::max(1, N_chunks / target_tasks);
+                }
+                else
+                {
+                    // Memory-bound or sufficient per-task compute: nbc=1
+                    // Sweep-validated: nbc=1 beats nbc=2 by 11% for 7B FFN.
+                    cfg.n_block_chunks = 1;
+                }
                 break;
 
             case ShapeCategory::LM_HEAD:
@@ -154,31 +182,51 @@ namespace llaminar2::cpu::native_vnni
             }
 
             // ---------------------------------------------------------------
-            // K-parallel: when N-parallelism yields fewer tasks than threads,
-            // split the K dimension across multiple threads per N-chunk.
-            // Each thread computes partial sums over a K-block range, then a
-            // reduction phase combines them.
+            // K-parallel: split the K dimension across multiple threads per
+            // N-chunk. Each thread computes partial sums over a K-block range,
+            // then a reduction phase combines them.
             //
-            // Guards:
-            //  1. K dimension must be large (bpr >= 256 ≈ K>=8192) so the
-            //     reduction overhead is amortized by the DRAM bandwidth gain.
-            //     Medium-K shapes (attention projections) are better served by
-            //     N-parallel only — their weights fit in L3 and the reduction
-            //     cost exceeds the extra-thread benefit.
-            //  2. Each K-tile must have >= 4 K-blocks of work so per-task
-            //     overhead doesn't dominate.
+            // Two regimes:
+            //
+            // 1. Memory-bound (weights in DRAM): conservative activation.
+            //    Only when N-tasks < threads AND K is very large (bpr >= 256).
+            //    Medium-K shapes get no benefit — reduction cost > bandwidth.
+            //
+            // 2. Compute-bound (weights in L3): aggressive activation.
+            //    When N-tasks < 2× threads AND K large enough (bpr >= 128).
+            //    K-parallel improves L2 utilization even when N provides
+            //    enough tasks. Target 8 tasks/thread for full throughput.
+            //    Example: 3B FFN_Down (32 chunks, bpr=344) → kt=7, 1.85×.
             // ---------------------------------------------------------------
+            constexpr int MIN_K_BLOCKS_PER_TILE = 4;
             constexpr int DEFAULT_MIN_BPR = 256;
+            constexpr int COMPUTE_BOUND_MIN_BPR = 128;
             const int min_bpr = debugEnv().cpu_vnni.min_bpr_k_parallel > 0
                                     ? debugEnv().cpu_vnni.min_bpr_k_parallel
-                                    : DEFAULT_MIN_BPR;
+                                    : (compute_bound ? COMPUTE_BOUND_MIN_BPR : DEFAULT_MIN_BPR);
             int total_n_tasks = (N_chunks + cfg.n_block_chunks - 1) / cfg.n_block_chunks;
-            if (total_n_tasks < num_threads && blocks_per_row >= min_bpr)
+
+            // Compute-bound: aggressive k-parallel when N-tasks < 2× threads
+            // Memory-bound:  conservative k-parallel when N-tasks < threads
+            //
+            // GUARD: total FLOPs must be large enough to amortize k-parallel
+            // reduction overhead. Small matrices (e.g. 0.5B FFN_Down 896×4864
+            // = 8.7M FLOPs, or 14B K_proj 1024×5120 = 10.5M FLOPs) see
+            // regressions from k-parallel because reduction cost dominates.
+            // 3B FFN_Down (2048×11008 = 45M FLOPs) benefits clearly.
+            constexpr long long MIN_FLOPS_FOR_K_PARALLEL = 16'000'000LL; // 16M
+            long long total_flops = 2LL * N * K;
+
+            int k_parallel_threshold = compute_bound ? num_threads * 2 : num_threads;
+            int target_multiplier = compute_bound ? 8 : 1; // tasks/thread target
+
+            if (total_n_tasks < k_parallel_threshold && blocks_per_row >= min_bpr
+                && total_flops >= MIN_FLOPS_FOR_K_PARALLEL)
             {
-                // Compute k_tiles so that total 2D tasks ≈ num_threads
-                int desired_k_tiles = (num_threads + total_n_tasks - 1) / total_n_tasks;
-                // Each K-tile should have at least 4 K-blocks to amortize overhead
-                constexpr int MIN_K_BLOCKS_PER_TILE = 4;
+                int desired_total = compute_bound
+                                        ? num_threads * target_multiplier
+                                        : num_threads;
+                int desired_k_tiles = std::max(1, (desired_total + total_n_tasks - 1) / total_n_tasks);
                 int max_k_tiles = std::max(1, blocks_per_row / MIN_K_BLOCKS_PER_TILE);
                 cfg.k_tiles = std::clamp(desired_k_tiles, 1, max_k_tiles);
 
