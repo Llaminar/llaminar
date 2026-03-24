@@ -235,14 +235,44 @@ namespace llaminar2::cpu::native_vnni
 
             // Apply SwiGLU to get the GEMM input: temp = silu(gate) * up  [m, k]
             const size_t input_size = static_cast<size_t>(m) * k;
-            auto swiglu_tensor = std::make_unique<FP32Tensor>(
-                std::vector<size_t>{static_cast<size_t>(m), static_cast<size_t>(k)});
-            primitives::compute_swiglu(gate_fp32, up_fp32, swiglu_tensor->mutable_data(),
+
+            // Reuse cached scratch buffer to avoid allocation on every decode token
+            const size_t needed = input_size;
+            if (swiglu_scratch_.size() < needed)
+                swiglu_scratch_.resize(needed);
+
+            primitives::compute_swiglu(gate_fp32, up_fp32, swiglu_scratch_.data(),
                                        static_cast<int>(input_size));
 
-            // GEMM: output = W_down @ swiglu_input
-            return multiply_tensor(swiglu_tensor.get(), output, m, n, k,
-                                   true, alpha, beta);
+            // M=1 fast path: call GEMV directly with raw pointer, skip TensorBase wrapper
+            if (m == 1 && alpha == 1.0f && beta == 0.0f)
+            {
+                gemv_native_vnni(packed_, swiglu_scratch_.data(), output_fp32,
+                                 native_q8_0_blocks_, native_q8_0_bpr_);
+                return true;
+            }
+
+            // M>1 path: call GEMM directly with raw pointer
+            if (beta != 0.0f && beta != 1.0f)
+            {
+                for (int i = 0; i < m * n; ++i)
+                    output_fp32[i] *= beta;
+            }
+            if (beta == 0.0f && alpha == 1.0f)
+            {
+                gemm_native_vnni(packed_, swiglu_scratch_.data(), output_fp32, m, n);
+            }
+            else
+            {
+                std::vector<float> temp(n);
+                for (int row = 0; row < m; ++row)
+                {
+                    gemv_native_vnni(packed_, swiglu_scratch_.data() + row * k, temp.data());
+                    for (int j = 0; j < n; ++j)
+                        output_fp32[row * n + j] += alpha * temp[j];
+                }
+            }
+            return true;
         }
 
         // -------------------------------------------------------------------
@@ -379,6 +409,9 @@ namespace llaminar2::cpu::native_vnni
         // Set for codebook_id==19 (Q8_0) to enable single-stream GEMV at M=1.
         const Q8_0Block *native_q8_0_blocks_ = nullptr;
         int native_q8_0_bpr_ = 0;
+
+        // Cached scratch buffer for fused SwiGLU+GEMM (avoids malloc per decode token)
+        mutable std::vector<float> swiglu_scratch_;
     };
 
 } // namespace llaminar2::cpu::native_vnni

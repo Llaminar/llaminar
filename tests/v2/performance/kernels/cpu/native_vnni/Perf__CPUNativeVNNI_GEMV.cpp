@@ -20,9 +20,8 @@
  *   - Kernel compute time
  *   - Total including overhead
  *
- * System roofline: 2× Intel Xeon Gold 6238R, 6-channel DDR4-2933 per socket.
- * Single-socket (28 cores, numactl node 0): ~60 GB/s STREAM read
- * Dual-socket (56 cores): ~117 GB/s STREAM read
+ * System roofline: Calibrated at startup via STREAM-like DRAM read benchmark.
+ * Cold cache: weight data flushed via clflushopt before each timed iteration.
  *
  * @note Run with Release build:
  *   ctest -R V2_Perf_CPUNativeVNNI_GEMV --verbose
@@ -96,18 +95,94 @@ namespace
         ::testing::AddGlobalTestEnvironment(new MPIEnvironment);
 
     // =========================================================================
-    // System roofline
+    // System roofline — measured via STREAM-like calibration
     // =========================================================================
-    // Single-socket STREAM read (28 cores, DDR4-2933, 6ch): ~60 GB/s
-    // Dual-socket STREAM read (56 cores): ~117 GB/s
-    static constexpr double SINGLE_SOCKET_BW_GBS = 60.0;
-    static constexpr double DUAL_SOCKET_BW_GBS = 117.0;
 
-    // Auto-detect: use thread count to pick roofline
+    // Forward declaration (defined after GEMVResult)
+    static inline void flush_cache_range(const void *ptr, size_t bytes);
+
+    /**
+     * @brief Measure actual DRAM read bandwidth using a STREAM-like benchmark.
+     *
+     * Allocates a large buffer (256 MB, well beyond L3), flushes it from cache,
+     * then performs a multi-threaded sequential read pass. Repeated 5 times;
+     * reports the best (peak sustainable) bandwidth in GB/s.
+     *
+     * This replaces the hardcoded 60 GB/s constant with a machine-calibrated
+     * value, making efficiency percentages meaningful across different hardware.
+     */
+    static double calibrateDramBandwidth()
+    {
+        constexpr size_t BUF_SIZE = 256 * 1024 * 1024; // 256 MB
+        constexpr int CALIB_RUNS = 5;
+
+        // Allocate page-aligned buffer
+        auto *buf = static_cast<char *>(std::aligned_alloc(4096, BUF_SIZE));
+        if (!buf)
+            return 60.0; // fallback
+
+// First-touch: each thread touches its own pages for NUMA locality
+#pragma omp parallel for schedule(static)
+        for (size_t i = 0; i < BUF_SIZE; i += 4096)
+            buf[i] = static_cast<char>(i & 0xFF);
+
+        double best_gbs = 0;
+        for (int run = 0; run < CALIB_RUNS; ++run)
+        {
+            // Flush entire buffer from cache
+            flush_cache_range(buf, BUF_SIZE);
+
+            // Timed parallel read — accumulate to prevent dead-code elimination
+            volatile uint64_t sink = 0;
+            auto t0 = std::chrono::high_resolution_clock::now();
+
+            uint64_t local_sum = 0;
+#pragma omp parallel reduction(+ : local_sum)
+            {
+                int tid = omp_get_thread_num();
+                int nthreads = omp_get_num_threads();
+                size_t chunk = BUF_SIZE / nthreads;
+                size_t start = tid * chunk;
+                size_t end = (tid == nthreads - 1) ? BUF_SIZE : start + chunk;
+                const uint64_t *p = reinterpret_cast<const uint64_t *>(buf + start);
+                const uint64_t *pe = reinterpret_cast<const uint64_t *>(buf + end);
+                uint64_t acc = 0;
+                while (p < pe)
+                {
+                    acc += *p;
+                    p += 8; // stride 64 bytes (one cache line)
+                }
+                local_sum += acc;
+            }
+
+            auto t1 = std::chrono::high_resolution_clock::now();
+            sink = local_sum; // prevent optimization
+            (void)sink;
+
+            double secs = std::chrono::duration<double>(t1 - t0).count();
+            double gbs = (double)BUF_SIZE / secs / 1e9;
+            best_gbs = std::max(best_gbs, gbs);
+        }
+
+        std::free(buf);
+        return best_gbs;
+    }
+
+    // Cached calibrated bandwidth (computed once, shared across all tests)
+    static double s_calibrated_bw_gbs = 0;
+
     static double systemBandwidthGB()
     {
-        int threads = omp_get_max_threads();
-        return (threads > 32) ? DUAL_SOCKET_BW_GBS : SINGLE_SOCKET_BW_GBS;
+        if (s_calibrated_bw_gbs <= 0)
+        {
+            s_calibrated_bw_gbs = calibrateDramBandwidth();
+            std::cout << "\n=== DRAM Bandwidth Calibration ===\n"
+                      << "Measured: " << std::fixed << std::setprecision(1)
+                      << s_calibrated_bw_gbs << " GB/s"
+                      << "  (threads=" << omp_get_max_threads() << ")\n"
+                      << std::endl;
+        }
+        return s_calibrated_bw_gbs;
     }
 
     // =========================================================================
@@ -199,6 +274,26 @@ namespace
         double native_bytes; // Q8_0 native blocks
     };
 
+    // =========================================================================
+    // Cache flush utility — evict a memory range from all cache levels
+    // =========================================================================
+
+    /**
+     * @brief Flush a memory range from all CPU caches using clflushopt.
+     *
+     * Walks through the range in 64-byte (cache line) steps and issues
+     * clflushopt for each line, then an mfence to ensure completion.
+     * This forces the next access to go to DRAM, eliminating cache effects
+     * from benchmarks.
+     */
+    static inline void flush_cache_range(const void *ptr, size_t bytes)
+    {
+        char *p = const_cast<char *>(static_cast<const char *>(ptr));
+        for (size_t off = 0; off < bytes; off += 64)
+            _mm_clflushopt(p + off);
+        _mm_mfence();
+    }
+
     /**
      * @brief Benchmark packed VNNI GEMV directly, return p10 latency (us).
      *
@@ -206,16 +301,24 @@ namespace
      * (FP32→Q8_1 quantization + INT8 packed VNNI compute). This bypasses
      * multiply_tensor's Q8_0 native shortcut, giving a real VNNI-vs-native
      * comparison for Q8_0 weights.
+     *
+     * Flushes the packed weight data from cache before each timed iteration
+     * to measure true DRAM bandwidth efficiency without cache effects.
      */
     double benchPackedVNNI(const CPUNativeVNNIPackedWeights &packed,
                            const float *A, float *C, int N)
     {
+        // Identify the weight data buffer and size for cache flushing
+        const void *weight_data = packed.native_interleaved.data();
+        size_t weight_bytes = packed.native_interleaved.size();
+
         for (int i = 0; i < WARMUP; ++i)
             gemv_native_vnni(packed, A, C);
 
         std::vector<double> times(ITERS);
         for (int i = 0; i < ITERS; ++i)
         {
+            flush_cache_range(weight_data, weight_bytes);
             auto t0 = std::chrono::high_resolution_clock::now();
             gemv_native_vnni(packed, A, C);
             auto t1 = std::chrono::high_resolution_clock::now();
@@ -229,18 +332,25 @@ namespace
      * @brief Benchmark native Q8_0 GEMV via unified dispatch, return p10 latency (us).
      *
      * Calls gemv_native_vnni() with Q8_0 blocks pointer, which dispatches to
-     * the native Q8_0 path (FP32 dequant + FMA) instead of the packed VNNI path.
+     * the native Q8_0 path (direct block access + VNNI vpdpbusd).
+     *
+     * Flushes the Q8_0 weight blocks from cache before each timed iteration
+     * to measure true DRAM bandwidth efficiency without cache effects.
      */
     double benchNativeQ8_0(const CPUNativeVNNIPackedWeights &packed,
                            const Q8_0Block *blocks, const float *A,
-                           float *C, int bpr)
+                           float *C, int N, int bpr)
     {
+        // Weight data: N rows × bpr blocks × 34 bytes/block
+        size_t weight_bytes = static_cast<size_t>(N) * bpr * sizeof(Q8_0Block);
+
         for (int i = 0; i < WARMUP; ++i)
             gemv_native_vnni(packed, A, C, blocks, bpr);
 
         std::vector<double> times(ITERS);
         for (int i = 0; i < ITERS; ++i)
         {
+            flush_cache_range(blocks, weight_bytes);
             auto t0 = std::chrono::high_resolution_clock::now();
             gemv_native_vnni(packed, A, C, blocks, bpr);
             auto t1 = std::chrono::high_resolution_clock::now();
@@ -328,7 +438,7 @@ namespace
             std::vector<float> C(shape.N, 0.0f);
             r.native_us = benchNativeQ8_0(
                 packed_kernel.packedWeights(), q8_tensor->typed_data(),
-                A.data(), C.data(), bpr);
+                A.data(), C.data(), shape.N, bpr);
             r.native_bw_gbs = r.native_bytes / (r.native_us * 1e-6) / 1e9;
             r.native_roof_pct = r.native_bw_gbs / roofline_bw * 100.0;
         }
@@ -420,9 +530,9 @@ namespace
         std::cout << "\n"
                   << title << "\n"
                   << "Threads: " << omp_get_max_threads()
-                  << "  |  Roofline: " << roofline << " GB/s"
-                  << "  |  VNNI = packed INT8 path (FP32\xe2\x86\x92Q8_1 quant + VNNI compute)"
-                  << "  |  Q8_0 = native blocks (FP32 dequant + FMA)\n\n"
+                  << "  |  Roofline: " << std::fixed << std::setprecision(1) << roofline << " GB/s (calibrated)"
+                  << "  |  Cold cache (clflushopt before each iteration)"
+                  << "  |  Q8_0 = native blocks (VNNI vpdpbusd)\n\n"
                   << table.to_string() << std::endl;
     }
 

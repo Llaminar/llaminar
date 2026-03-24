@@ -6280,6 +6280,19 @@ add_v2_test(V2_Perf_CPUNativeVNNI_GEMV
     MPI_PROCS 1
 )
 
+# Performance Test: CPU Flash Attention Sweep (all models, TP degrees, decode + prefill)
+add_executable(v2_perf_cpu_flash_attention_sweep performance/kernels/cpu/attention/Perf__CpuFlashAttentionSweep.cpp)
+target_link_libraries(v2_perf_cpu_flash_attention_sweep
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Perf_CPUFlashAttentionSweep
+    COMMAND $<TARGET_FILE:v2_perf_cpu_flash_attention_sweep>
+    LABELS "V2;Performance;Attention;FlashAttention;CPU;Decode;Prefill;Qwen;Tuning"
+    MPI_PROCS 1
+)
+
 # Performance Test: NativeVNNI vs oneDNN Reference (INT8 matmul baseline comparison)
 if(ONEDNN_LIB)
     add_executable(v2_perf_onednn_reference performance/kernels/cpu/native_vnni/Perf__OneDNN_Reference.cpp)

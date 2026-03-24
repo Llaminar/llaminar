@@ -228,15 +228,22 @@ namespace llaminar2
                 {
                     (void)p[i * page_size];
                 }
+
+                // Request transparent huge pages after first-touch. In "madvise"
+                // mode, khugepaged will collapse 4KB pages into 2MB pages in the
+                // background, reducing TLB misses for the 7+ GB model weights.
+                ::madvise(base, file_size, MADV_HUGEPAGE);
+
                 LOG_DEBUG("[MmapRegion] Mapped " << file_path << " (" << (file_size / (1024 * 1024))
                                                  << " MB) with NUMA first-touch on node " << numa_node
-                                                 << " (" << num_pages << " pages)");
+                                                 << " (" << num_pages << " pages, THP requested)");
             }
             else
             {
                 // Non-NUMA path already pre-faulted via MAP_POPULATE
                 ::madvise(base, file_size, MADV_WILLNEED);
-                LOG_DEBUG("[MmapRegion] Mapped " << file_path << " (" << (file_size / (1024 * 1024)) << " MB)");
+                ::madvise(base, file_size, MADV_HUGEPAGE);
+                LOG_DEBUG("[MmapRegion] Mapped " << file_path << " (" << (file_size / (1024 * 1024)) << " MB, THP requested)");
             }
 
             return std::unique_ptr<MmapRegion>(new MmapRegion(base, file_size, fd, file_path));

@@ -2224,12 +2224,15 @@ namespace llaminar2
             const bool is_decode_phase = (kv_len != seq_len);
             const bool force_full_pool = is_decode_phase && kv_len > 100;
 
+            // Use OMP_WORKSHARE_REGION for decode so the kernel is
+            // compatible with a persistent outer parallel region (the
+            // macro detects omp_in_parallel() and skips creating a new
+            // team, eliminating ~16 µs fork/join overhead per call).
+            int actual_threads;
             if (force_full_pool)
             {
-#pragma omp parallel
-                {
-                    work();
-                }
+                OMP_WORKSHARE_REGION(work);
+                actual_threads = omp_get_max_threads();
             }
             else
             {
@@ -2237,6 +2240,7 @@ namespace llaminar2
                 {
                     work();
                 }
+                actual_threads = attn_threads;
             }
 
             // Report profiling breakdown (QK vs V phase) if enabled.
@@ -2246,8 +2250,8 @@ namespace llaminar2
             // timings in the profiler output.
             if (profiling_enabled)
             {
-                KernelProfiler::recordParallel(KernelType::ATTENTION_QK, qk_duration_ns, attn_threads);
-                KernelProfiler::recordParallel(KernelType::ATTENTION_V, v_duration_ns, attn_threads);
+                KernelProfiler::recordParallel(KernelType::ATTENTION_QK, qk_duration_ns, actual_threads);
+                KernelProfiler::recordParallel(KernelType::ATTENTION_V, v_duration_ns, actual_threads);
             }
             return true;
         }
@@ -2427,12 +2431,11 @@ namespace llaminar2
             // This path is always decode (kv_len != seq_len by construction).
             const bool force_full_pool_fp16 = kv_len > 100;
 
+            int actual_threads_fp16;
             if (force_full_pool_fp16)
             {
-#pragma omp parallel
-                {
-                    work();
-                }
+                OMP_WORKSHARE_REGION(work);
+                actual_threads_fp16 = omp_get_max_threads();
             }
             else
             {
@@ -2440,12 +2443,13 @@ namespace llaminar2
                 {
                     work();
                 }
+                actual_threads_fp16 = attn_threads;
             }
 
             if (profiling_enabled)
             {
-                KernelProfiler::recordParallel(KernelType::ATTENTION_QK, qk_duration_ns, attn_threads);
-                KernelProfiler::recordParallel(KernelType::ATTENTION_V, v_duration_ns, attn_threads);
+                KernelProfiler::recordParallel(KernelType::ATTENTION_QK, qk_duration_ns, actual_threads_fp16);
+                KernelProfiler::recordParallel(KernelType::ATTENTION_V, v_duration_ns, actual_threads_fp16);
             }
             return true;
         }
