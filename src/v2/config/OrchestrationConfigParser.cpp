@@ -978,10 +978,10 @@ namespace llaminar2
                     throw std::invalid_argument("--kv-cache-precision requires a value");
                 }
                 value = toLower(value);
-                static const std::set<std::string> valid_precisions = {"auto", "fp32", "f32", "fp16", "f16", "q8_1", "q8", "q81"};
+                static const std::set<std::string> valid_precisions = {"auto", "fp32", "f32", "fp16", "f16", "q8_1", "q8", "q81", "q16_1", "q16", "q161", "i16", "int16"};
                 if (valid_precisions.find(value) == valid_precisions.end())
                 {
-                    throw std::invalid_argument("Invalid KV cache precision: '" + value + "'. Valid: auto, fp32, fp16, q8_1");
+                    throw std::invalid_argument("Invalid KV cache precision: '" + value + "'. Valid: auto, fp32, fp16, q8_1, q16_1");
                 }
                 config.kv_cache_precision = value;
             }
@@ -1387,7 +1387,7 @@ MoE Configuration:
 Precision:
   --activation-precision <type>  Activation precision: fp32, bf16, fp16, q8_1
   --act-prec <type>      Alias for --activation-precision
-    --kv-cache-precision <type>  KV cache precision: auto (fp16), fp32, fp16, q8_1
+    --kv-cache-precision <type>  KV cache precision: auto (q16_1 on CPU, fp16 on GPU), fp32, fp16, q8_1, q16_1
     --kv-prec <type>       Alias for --kv-cache-precision
 
 Weight Sharding:

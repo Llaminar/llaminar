@@ -99,7 +99,7 @@ namespace llaminar2
         size_t vocab_size = 0;                   ///< Vocabulary size
         size_t n_heads = 0;                      ///< Attention heads
         size_t n_kv_heads = 0;                   ///< KV heads (for GQA)
-        std::string kv_cache_precision = "auto"; ///< KV cache precision for memory estimates: "auto", "fp16", "q8_1"
+        std::string kv_cache_precision = "auto"; ///< KV cache precision for memory estimates: "auto", "fp16", "q8_1", "q16_1"
         std::string quant_type;                  ///< Quantization type (e.g., "Q4_0", "Q8_0")
         size_t estimated_memory_bytes = 0;       ///< Estimated total model memory
 

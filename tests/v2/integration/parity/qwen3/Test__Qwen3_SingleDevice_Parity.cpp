@@ -7,7 +7,7 @@
  * and the absence of QKV biases.
  *
  * Configurations:
- *   - CPU: Full-precision baseline with FP16 and Q8_1 KV cache
+ *   - CPU: Full-precision baseline with FP16, Q8_1, and Q16_1 KV cache
  *   - CUDA: Single NVIDIA GPU
  *   - ROCm: Single AMD GPU
  *
@@ -62,6 +62,23 @@ static const std::vector<TestConfig> kQwen3SingleDeviceConfigs = {
         .snapshot_dir = "pytorch_qwen3_snapshots",
         .activation_precision = ActivationPrecision::FP32,
         .kv_cache_precision = KVCachePrecision::Q8_1,
+    },
+    {
+        .name = "Qwen3_CPU_KV_Q16_1",
+        .devices = {ParityDeviceType::CPU},
+        .parallelism = Parallelism::None,
+        .collective = Collective::None,
+        .thresholds = {
+            .cosine_threshold = 0.94f, // Q8_0 quantized GEMM diverges from FP32 reference
+            .decode_cosine_threshold = 0.90f,
+            .early_layers_count = 6,
+            .min_early_layers_passed = 4,
+            .kl_threshold = 0.01f,
+        },
+        .model_path = "models/Qwen3-0.6B-Q8_0.gguf",
+        .snapshot_dir = "pytorch_qwen3_snapshots",
+        .activation_precision = ActivationPrecision::FP32,
+        .kv_cache_precision = KVCachePrecision::Q16_1,
     },
     {
         .name = "Qwen3_CUDA_KV_FP16",

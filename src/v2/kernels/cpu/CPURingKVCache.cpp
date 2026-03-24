@@ -204,8 +204,12 @@ namespace llaminar2
         }
         else
         {
-            // Default: Q16_1 precision.
-            return tensor_factory_->createQ16_1({rows, cols}, device);
+            // Q16_1 precision with head-dim-aligned block size.
+            // Uses BLOCK_128 for head_dim=128 (Llama-3, Qwen3), BLOCK_64 for
+            // head_dim=64 (Qwen2.5-0.5B), giving 1 block per head with a
+            // single scale factor — optimal for VNNI decode attention.
+            return tensor_factory_->createQ16_1(
+                {rows, cols}, optimal_q16_block_size(head_dim_), device);
         }
     }
 

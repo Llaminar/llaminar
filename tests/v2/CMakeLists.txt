@@ -2163,6 +2163,19 @@ add_v2_test(V2_Unit_CPUFlashAttentionKernelT
     MPI_PROCS 1
 )
 
+# Test: Q16 decode HEAD_MAJOR layout regression (KV cache addressing)
+add_executable(v2_test_q16_decode_head_major unit/kernels/cpu/attention/Test__Q16DecodeHeadMajor.cpp)
+target_link_libraries(v2_test_q16_decode_head_major
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_Q16DecodeHeadMajor
+    COMMAND $<TARGET_FILE:v2_test_q16_decode_head_major>
+    LABELS "V2;Unit;Kernels;Attention;Q16_1;HeadMajor;KVCache;Regression;CPU"
+    MPI_PROCS 1
+)
+
 # Test: AttentionComputeStage (Phase 9 - ComputeStage for attention via KernelFactory)
 add_executable(v2_test_attention_compute_stage unit/execution/compute_stages/stages/Test__AttentionComputeStage.cpp)
 target_link_libraries(v2_test_attention_compute_stage

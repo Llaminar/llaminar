@@ -416,7 +416,7 @@ namespace llaminar2
         // =========================================================================
 
         std::string activation_precision = "fp32"; ///< "fp32", "bf16", "fp16", "q8_1"
-        std::string kv_cache_precision = "auto";   ///< "auto" (fp16), "fp32", "fp16", "q8_1"
+        std::string kv_cache_precision = "auto";   ///< "auto" (q16_1 on CPU, fp16 on GPU), "fp32", "fp16", "q8_1", "q16_1"
 
         // =========================================================================
         // Weight Sharding

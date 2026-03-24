@@ -42,6 +42,7 @@
 
 #include "fort.hpp"
 #include "kernels/cpu/attention/CPUFlashAttentionKernelT.h"
+#include "tensors/TensorClasses.h"
 #include "utils/KernelProfiler.h"
 #include "utils/Logger.h"
 
@@ -923,5 +924,243 @@ TEST_F(Perf__CpuFlashAttentionSweep, Decode_Summary)
     }
 
     std::cout << "\nDECODE SUMMARY: All Models @ kv_len=" << kv_len << " (cold-cache)\n"
+              << table.to_string() << std::endl;
+}
+
+// ============================================================================
+// DECODE: Q16_1 vs FP32 KV cache comparison (7B model, kv-length sweep)
+// ============================================================================
+
+TEST_F(Perf__CpuFlashAttentionSweep, Decode_Q16_1_vs_FP32)
+{
+    const auto &model = ALL_MODELS[3]; // 7B: 28h/4kv d=128
+    const int kv_lengths[] = {64, 128, 256, 512, 1024, 2048, 4096};
+    const int warmup = 200;
+    const int iters = 500;
+    const int n_layers = 28;
+
+    systemBandwidthGB();
+
+    const int n_heads = model.n_heads;
+    const int n_kv_heads = model.n_kv_heads;
+    const int head_dim = model.head_dim;
+    const int kv_stride = n_kv_heads * head_dim;
+    const int q_stride = n_heads * head_dim;
+
+    // Bandwidth model for Q16_1: qs[] is int16 (2B/elem) + 8B overhead/block
+    // For BLOCK_128: 264 bytes per head-position vs 512 bytes FP32
+    auto q16_kv_bytes = [&](int kv_len) -> double
+    {
+        const size_t blocks_per_kv_row = static_cast<size_t>(n_kv_heads); // 1 block per head
+        const size_t block_bytes = 264;                                   // Q16_1Block_128
+        return 2.0 * kv_len * blocks_per_kv_row * block_bytes;            // K + V
+    };
+
+    fort::utf8_table table;
+    table.set_border_style(FT_DOUBLE2_STYLE);
+    table << fort::header << "kv_len" << "FP32 µs" << "Q16_1 µs"
+          << "Speedup" << "FP32 BW" << "Q16 BW" << "Q16 R%"
+          << "28L FP32 ms" << "28L Q16 ms" << fort::endr;
+
+    table.column(0).set_cell_text_align(fort::text_align::right);
+    for (int c = 1; c <= 8; ++c)
+        table.column(c).set_cell_text_align(fort::text_align::right);
+
+    for (int kv : kv_lengths)
+    {
+        // ----- FP32 baseline -----
+        AttnBenchConfig cfg{model, 1, kv, 1, true, warmup, iters};
+        auto r_fp32 = run_attention_bench(cfg);
+
+        // ----- Q16_1 path (via compute_tensor with Q16_1Tensor K/V) -----
+        const size_t kv_size = static_cast<size_t>(kv) * kv_stride;
+        const size_t q_size = static_cast<size_t>(q_stride);
+        const size_t out_size = q_size;
+
+        // Create FP32 source data
+        std::vector<float> Q_raw(q_size), K_raw(kv_size), V_raw(kv_size);
+        fill_random(Q_raw.data(), q_size, 42);
+        fill_random(K_raw.data(), kv_size, 43);
+        fill_random(V_raw.data(), kv_size, 44);
+
+        // Create FP32 tensors for Q and output
+        FP32Tensor Q_tensor({1, static_cast<size_t>(q_stride)});
+        std::memcpy(Q_tensor.mutable_data(), Q_raw.data(), q_size * sizeof(float));
+        FP32Tensor out_tensor({1, static_cast<size_t>(q_stride)});
+
+        // Quantize K/V to Q16_1 with BLOCK_128 (head_dim-aligned)
+        Q16_1Tensor K_q16(
+            {static_cast<size_t>(kv), static_cast<size_t>(kv_stride)},
+            Q16BlockSize::BLOCK_128);
+        K_q16.copyFrom_fp32(K_raw.data());
+
+        Q16_1Tensor V_q16(
+            {static_cast<size_t>(kv), static_cast<size_t>(kv_stride)},
+            Q16BlockSize::BLOCK_128);
+        V_q16.copyFrom_fp32(V_raw.data());
+
+        CPUFlashAttentionKernelT<ActivationPrecision::FP32> q16_kernel;
+
+        auto run_q16 = [&]()
+        {
+            q16_kernel.compute_tensor(
+                &Q_tensor, &K_q16, &V_q16, &out_tensor,
+                1, 1, kv, n_heads, n_kv_heads, head_dim, true);
+        };
+
+        // Warmup Q16_1
+        for (int w = 0; w < warmup; ++w)
+            run_q16();
+
+        // Timed Q16_1 iterations
+        std::vector<double> times_us;
+        times_us.reserve(iters);
+
+        const size_t k_bytes_total = K_q16.blocks_per_row() * static_cast<size_t>(kv) * q16_block_size_bytes(Q16BlockSize::BLOCK_128);
+        const size_t v_bytes_total = k_bytes_total; // Same layout
+
+        for (int i = 0; i < iters; ++i)
+        {
+            // Flush KV from cache for cold-cache measurement
+            if (k_bytes_total > 256 * 1024)
+            {
+                flush_cache_range(K_q16.raw_data(), k_bytes_total);
+                flush_cache_range(V_q16.raw_data(), v_bytes_total);
+            }
+
+            auto start = std::chrono::high_resolution_clock::now();
+            run_q16();
+            auto end = std::chrono::high_resolution_clock::now();
+            times_us.push_back(std::chrono::duration<double, std::micro>(end - start).count());
+        }
+
+        double sum = std::accumulate(times_us.begin(), times_us.end(), 0.0);
+        double mean_q16 = sum / times_us.size();
+        double bytes_q16 = q16_kv_bytes(kv);
+        double bw_q16 = bytes_q16 / (mean_q16 * 1e3);
+        double roofline_q16 = (bw_q16 / systemBandwidthGB()) * 100.0;
+        double speedup = r_fp32.mean_us / mean_q16;
+
+        table << std::to_string(kv)
+              << fmt_us(r_fp32.mean_us) << fmt_us(mean_q16)
+              << fmt_2(speedup) + "x"
+              << fmt_1(r_fp32.bw_gbs) << fmt_1(bw_q16) << fmt_pct(roofline_q16)
+              << fmt_1(r_fp32.mean_us * n_layers / 1000.0)
+              << fmt_1(mean_q16 * n_layers / 1000.0)
+              << fort::endr;
+    }
+
+    std::cout << "\n7B DECODE: Q16_1 vs FP32 KV Cache (BLOCK_128, cold-cache)\n"
+              << table.to_string() << std::endl;
+}
+
+// ============================================================================
+// PREFILL: Q16_1 vs FP32 KV cache comparison
+// ============================================================================
+
+TEST_F(Perf__CpuFlashAttentionSweep, Prefill_Q16_1_vs_FP32)
+{
+    const auto &model = ALL_MODELS[3]; // 7B: 28h/4kv d=128
+    const int seq_lengths[] = {32, 64, 128, 256, 512};
+    const int warmup = 5;
+    const int iters = 20;
+
+    systemBandwidthGB();
+
+    const int n_heads = model.n_heads;
+    const int n_kv_heads = model.n_kv_heads;
+    const int head_dim = model.head_dim;
+    const int kv_stride = n_kv_heads * head_dim;
+    const int q_stride = n_heads * head_dim;
+
+    auto q16_kv_bytes = [&](int seq) -> double
+    {
+        const size_t blocks_per_kv_row = static_cast<size_t>(n_kv_heads);
+        const size_t block_bytes = 264; // Q16_1Block_128
+        return 2.0 * seq * blocks_per_kv_row * block_bytes;
+    };
+
+    fort::utf8_table table;
+    table.set_border_style(FT_DOUBLE2_STYLE);
+    table << fort::header << "seq_len" << "FP32 µs" << "Q16_1 µs"
+          << "Speedup" << "FP32 BW" << "Q16 BW" << "FP32 GF/s"
+          << "Q16 GF/s" << fort::endr;
+
+    table.column(0).set_cell_text_align(fort::text_align::right);
+    for (int c = 1; c <= 7; ++c)
+        table.column(c).set_cell_text_align(fort::text_align::right);
+
+    for (int seq : seq_lengths)
+    {
+        // ----- FP32 baseline via run_attention_bench -----
+        AttnBenchConfig cfg{model, seq, seq, 1, true, warmup, iters};
+        auto r_fp32 = run_attention_bench(cfg);
+
+        // ----- Q16_1 path -----
+        const size_t kv_size = static_cast<size_t>(seq) * kv_stride;
+        const size_t q_size = static_cast<size_t>(seq) * q_stride;
+
+        std::vector<float> Q_raw(q_size), K_raw(kv_size), V_raw(kv_size);
+        fill_random(Q_raw.data(), q_size, 42);
+        fill_random(K_raw.data(), kv_size, 43);
+        fill_random(V_raw.data(), kv_size, 44);
+
+        FP32Tensor Q_tensor({static_cast<size_t>(seq), static_cast<size_t>(q_stride)});
+        std::memcpy(Q_tensor.mutable_data(), Q_raw.data(), q_size * sizeof(float));
+        FP32Tensor out_tensor({static_cast<size_t>(seq), static_cast<size_t>(q_stride)});
+
+        Q16_1Tensor K_q16(
+            {static_cast<size_t>(seq), static_cast<size_t>(kv_stride)},
+            Q16BlockSize::BLOCK_128);
+        K_q16.copyFrom_fp32(K_raw.data());
+
+        Q16_1Tensor V_q16(
+            {static_cast<size_t>(seq), static_cast<size_t>(kv_stride)},
+            Q16BlockSize::BLOCK_128);
+        V_q16.copyFrom_fp32(V_raw.data());
+
+        CPUFlashAttentionKernelT<ActivationPrecision::FP32> q16_kernel;
+
+        auto run_q16 = [&]()
+        {
+            q16_kernel.compute_tensor(
+                &Q_tensor, &K_q16, &V_q16, &out_tensor,
+                1, seq, seq, n_heads, n_kv_heads, head_dim, true);
+        };
+
+        for (int w = 0; w < warmup; ++w)
+            run_q16();
+
+        std::vector<double> times_us;
+        times_us.reserve(iters);
+        for (int i = 0; i < iters; ++i)
+        {
+            auto start = std::chrono::high_resolution_clock::now();
+            run_q16();
+            auto end = std::chrono::high_resolution_clock::now();
+            times_us.push_back(std::chrono::duration<double, std::micro>(end - start).count());
+        }
+
+        double sum = std::accumulate(times_us.begin(), times_us.end(), 0.0);
+        double mean_q16 = sum / times_us.size();
+        double bytes_q16 = q16_kv_bytes(seq);
+        double bw_q16 = bytes_q16 / (mean_q16 * 1e3);
+        double speedup = r_fp32.mean_us / mean_q16;
+
+        // GFLOP/s: 2 * seq * seq/2 * head_dim * n_heads (causal halves work)
+        // QK + V accumulation
+        double flops = 2.0 * seq * (seq / 2.0) * head_dim * n_heads * 2;
+        double gflops_fp32 = flops / (r_fp32.mean_us * 1e3);
+        double gflops_q16 = flops / (mean_q16 * 1e3);
+
+        table << std::to_string(seq)
+              << fmt_us(r_fp32.mean_us) << fmt_us(mean_q16)
+              << fmt_2(speedup) + "x"
+              << fmt_1(r_fp32.bw_gbs) << fmt_1(bw_q16)
+              << fmt_1(gflops_fp32) << fmt_1(gflops_q16)
+              << fort::endr;
+    }
+
+    std::cout << "\n7B PREFILL: Q16_1 vs FP32 KV Cache (BLOCK_128, causal)\n"
               << table.to_string() << std::endl;
 }

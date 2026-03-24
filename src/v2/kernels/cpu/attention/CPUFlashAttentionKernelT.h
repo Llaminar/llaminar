@@ -676,6 +676,46 @@ namespace llaminar2
             }
 #endif
 
+            // ---------------------------------------------------------------
+            // Q16_1 KV decode fast-path: VNNI int16 QK dot product + int16 V.
+            // Halves KV bandwidth (int16 values are 2 bytes vs 4 bytes FP32)
+            // and leverages VPDPWSSD for compute-free QK scoring.
+            // ---------------------------------------------------------------
+#if defined(__AVX512F__) && defined(__AVX512VNNI__)
+            if (K->native_type() == TensorType::Q16_1 &&
+                V->native_type() == TensorType::Q16_1 &&
+                batch_size == 1)
+            {
+                const auto *K_q16 = dynamic_cast<const Q16_1Tensor *>(K);
+                const auto *V_q16 = dynamic_cast<const Q16_1Tensor *>(V);
+                if (K_q16 && V_q16)
+                {
+                    const float *Q_ptr = Q_base->fp32_data();
+                    float *O_ptr = O_base->mutable_data();
+                    if (Q_ptr && O_ptr)
+                    {
+                        const int position_offset = (kv_len > seq_len)
+                                                        ? (kv_len - seq_len)
+                                                        : 0;
+                        if (kv_len != seq_len)
+                        {
+                            return compute_decode_q16kv(
+                                Q_ptr, K_q16, V_q16, O_ptr,
+                                kv_len, n_heads, n_kv_heads, head_dim,
+                                causal, position_offset);
+                        }
+                        else
+                        {
+                            return compute_prefill_q16kv(
+                                Q_ptr, K_q16, V_q16, O_ptr,
+                                seq_len, kv_len, n_heads, n_kv_heads, head_dim,
+                                causal, window_size, position_offset);
+                        }
+                    }
+                }
+            }
+#endif
+
             const float *Q_ptr = Q_base->fp32_data();
             const float *K_ptr = K_base->fp32_data();
             const float *V_ptr = V_base->fp32_data();
@@ -994,6 +1034,63 @@ namespace llaminar2
         }
 
         /**
+         * @brief 4-row batched FP16 V accumulation with 2× unrolled inner loop.
+         *
+         * Like `accum_weighted_v_fp16` but processes 4 KV rows in one pass:
+         *   out[d] += w0*cvt(v0[d]) + w1*cvt(v1[d]) + w2*cvt(v2[d]) + w3*cvt(v3[d])
+         * for each dimension d.  Loads/stores `out` once per 32-element chunk
+         * instead of 4× (once per row), saving ~60% L1 traffic.
+         */
+        static void accum_weighted_v_fp16_4row(
+            float *__restrict out,
+            const uint16_t *v0, float w0,
+            const uint16_t *v1, float w1,
+            const uint16_t *v2, float w2,
+            const uint16_t *v3, float w3,
+            int head_dim)
+        {
+            const __m512 vw0 = _mm512_set1_ps(w0);
+            const __m512 vw1 = _mm512_set1_ps(w1);
+            const __m512 vw2 = _mm512_set1_ps(w2);
+            const __m512 vw3 = _mm512_set1_ps(w3);
+            int d = 0;
+            // 2x unrolled: 32 elements per iteration
+            for (; d + 31 < head_dim; d += 32)
+            {
+                __m512 oA = _mm512_loadu_ps(out + d);
+                __m512 oB = _mm512_loadu_ps(out + d + 16);
+                oA = _mm512_fmadd_ps(_mm512_cvtph_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i *>(v0 + d))), vw0, oA);
+                oB = _mm512_fmadd_ps(_mm512_cvtph_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i *>(v0 + d + 16))), vw0, oB);
+                oA = _mm512_fmadd_ps(_mm512_cvtph_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i *>(v1 + d))), vw1, oA);
+                oB = _mm512_fmadd_ps(_mm512_cvtph_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i *>(v1 + d + 16))), vw1, oB);
+                oA = _mm512_fmadd_ps(_mm512_cvtph_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i *>(v2 + d))), vw2, oA);
+                oB = _mm512_fmadd_ps(_mm512_cvtph_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i *>(v2 + d + 16))), vw2, oB);
+                oA = _mm512_fmadd_ps(_mm512_cvtph_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i *>(v3 + d))), vw3, oA);
+                oB = _mm512_fmadd_ps(_mm512_cvtph_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i *>(v3 + d + 16))), vw3, oB);
+                _mm512_storeu_ps(out + d, oA);
+                _mm512_storeu_ps(out + d + 16, oB);
+            }
+            for (; d + 15 < head_dim; d += 16)
+            {
+                __m512 o = _mm512_loadu_ps(out + d);
+                o = _mm512_fmadd_ps(_mm512_cvtph_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i *>(v0 + d))), vw0, o);
+                o = _mm512_fmadd_ps(_mm512_cvtph_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i *>(v1 + d))), vw1, o);
+                o = _mm512_fmadd_ps(_mm512_cvtph_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i *>(v2 + d))), vw2, o);
+                o = _mm512_fmadd_ps(_mm512_cvtph_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i *>(v3 + d))), vw3, o);
+                _mm512_storeu_ps(out + d, o);
+            }
+            for (; d < head_dim; ++d)
+            {
+                auto cvt = [](uint16_t fp16_val) -> float
+                {
+                    __m128i h = _mm_set1_epi16(static_cast<short>(fp16_val));
+                    return _mm_cvtss_f32(_mm_cvtph_ps(h));
+                };
+                out[d] += w0 * cvt(v0[d]) + w1 * cvt(v1[d]) + w2 * cvt(v2[d]) + w3 * cvt(v3[d]);
+            }
+        }
+
+        /**
          * @brief Scale a vector by a scalar: out[d] *= alpha (FP32, AVX-512).
          * Duplicated from scale_vec to avoid dependency on use_avx512 bool.
          */
@@ -1093,6 +1190,62 @@ namespace llaminar2
         }
 
         /**
+         * @brief Batched 4-row FP32 V accumulation with single output load/store.
+         *
+         * Accumulates 4 weighted V vectors into out in one pass, saving ~60%
+         * of L1 traffic vs calling accum_weighted_v four times.
+         */
+        static void accum_weighted_v_4row(
+            float *__restrict out,
+            const float *v0, float w0,
+            const float *v1, float w1,
+            const float *v2, float w2,
+            const float *v3, float w3,
+            int head_dim)
+        {
+#if defined(__AVX512F__)
+            const __m512 vw0 = _mm512_set1_ps(w0);
+            const __m512 vw1 = _mm512_set1_ps(w1);
+            const __m512 vw2 = _mm512_set1_ps(w2);
+            const __m512 vw3 = _mm512_set1_ps(w3);
+            int d = 0;
+            for (; d + 31 < head_dim; d += 32)
+            {
+                __m512 oA = _mm512_loadu_ps(out + d);
+                __m512 oB = _mm512_loadu_ps(out + d + 16);
+                oA = _mm512_fmadd_ps(_mm512_loadu_ps(v0 + d), vw0, oA);
+                oB = _mm512_fmadd_ps(_mm512_loadu_ps(v0 + d + 16), vw0, oB);
+                oA = _mm512_fmadd_ps(_mm512_loadu_ps(v1 + d), vw1, oA);
+                oB = _mm512_fmadd_ps(_mm512_loadu_ps(v1 + d + 16), vw1, oB);
+                oA = _mm512_fmadd_ps(_mm512_loadu_ps(v2 + d), vw2, oA);
+                oB = _mm512_fmadd_ps(_mm512_loadu_ps(v2 + d + 16), vw2, oB);
+                oA = _mm512_fmadd_ps(_mm512_loadu_ps(v3 + d), vw3, oA);
+                oB = _mm512_fmadd_ps(_mm512_loadu_ps(v3 + d + 16), vw3, oB);
+                _mm512_storeu_ps(out + d, oA);
+                _mm512_storeu_ps(out + d + 16, oB);
+            }
+            for (; d + 15 < head_dim; d += 16)
+            {
+                __m512 o = _mm512_loadu_ps(out + d);
+                o = _mm512_fmadd_ps(_mm512_loadu_ps(v0 + d), vw0, o);
+                o = _mm512_fmadd_ps(_mm512_loadu_ps(v1 + d), vw1, o);
+                o = _mm512_fmadd_ps(_mm512_loadu_ps(v2 + d), vw2, o);
+                o = _mm512_fmadd_ps(_mm512_loadu_ps(v3 + d), vw3, o);
+                _mm512_storeu_ps(out + d, o);
+            }
+            for (; d < head_dim; ++d)
+            {
+                out[d] += w0 * v0[d] + w1 * v1[d] + w2 * v2[d] + w3 * v3[d];
+            }
+#else
+            for (int d = 0; d < head_dim; ++d)
+            {
+                out[d] += w0 * v0[d] + w1 * v1[d] + w2 * v2[d] + w3 * v3[d];
+            }
+#endif
+        }
+
+        /**
          * @brief Multiply every element of `out` by a scalar `alpha`.
          *
          * Used during online softmax to rescale the running accumulator when a
@@ -1181,11 +1334,53 @@ namespace llaminar2
          */
         static float quantize_row_i16_i12(const float *src, int16_t *dst, int n, int qmax)
         {
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+            // Pass 1: vectorized absmax
+            const __m512i abs_mask = _mm512_set1_epi32(0x7FFFFFFF);
+            __m512 vmax = _mm512_setzero_ps();
+            int i = 0;
+            for (; i + 15 < n; i += 16)
+            {
+                const __m512 v = _mm512_loadu_ps(src + i);
+                const __m512 va = _mm512_castsi512_ps(
+                    _mm512_and_epi32(_mm512_castps_si512(v), abs_mask));
+                vmax = _mm512_max_ps(vmax, va);
+            }
+            float max_abs = _mm512_reduce_max_ps(vmax);
+            for (; i < n; ++i)
+                max_abs = std::max(max_abs, std::abs(src[i]));
+
+            if (max_abs <= 1e-12f)
+            {
+                std::memset(dst, 0, static_cast<size_t>(n) * sizeof(int16_t));
+                return 0.0f;
+            }
+
+            // Pass 2: vectorized quantize (cvtps_epi32 uses round-to-nearest-even)
+            const float scale = max_abs / static_cast<float>(qmax);
+            const float inv_scale = 1.0f / scale;
+            const __m512 v_inv = _mm512_set1_ps(inv_scale);
+            const __m512i v_hi = _mm512_set1_epi32(qmax);
+            const __m512i v_lo = _mm512_set1_epi32(-qmax);
+            i = 0;
+            for (; i + 15 < n; i += 16)
+            {
+                const __m512 v = _mm512_loadu_ps(src + i);
+                __m512i i32 = _mm512_cvtps_epi32(_mm512_mul_ps(v, v_inv));
+                i32 = _mm512_max_epi32(v_lo, _mm512_min_epi32(v_hi, i32));
+                _mm256_storeu_si256(reinterpret_cast<__m256i *>(dst + i),
+                                    _mm512_cvtsepi32_epi16(i32));
+            }
+            for (; i < n; ++i)
+            {
+                const int q = static_cast<int>(std::lrint(src[i] * inv_scale));
+                dst[i] = static_cast<int16_t>(std::max(-qmax, std::min(q, qmax)));
+            }
+            return scale;
+#else
             float max_abs = 0.0f;
             for (int i = 0; i < n; ++i)
-            {
                 max_abs = std::max(max_abs, std::abs(src[i]));
-            }
 
             if (max_abs <= 1e-12f)
             {
@@ -1201,6 +1396,7 @@ namespace llaminar2
                 dst[i] = static_cast<int16_t>(std::max(-qmax, std::min(q, qmax)));
             }
             return scale;
+#endif
         }
 
         /**
@@ -1658,6 +1854,236 @@ namespace llaminar2
                 sum += static_cast<int32_t>(q[i]) * static_cast<int32_t>(k_pair[(static_cast<size_t>(i) / 32) * 64 + row_off + (i % 32)]);
             }
             return sum;
+#endif
+        }
+
+        /**
+         * @brief 4-row VNNI dot product against separate (non-packed) K rows.
+         *
+         * Computes four independent int16 dot products in a single pass over
+         * the Q vector, exploiting ILP across four accumulator chains.
+         * Unlike the packed-pair variant, each K row is at a separate address.
+         * Used by the Q16_1 KV cache decode path where K rows are stored as
+         * contiguous Q16_1Block qs[] arrays.
+         *
+         * @param q   Quantised query vector, length `n`.
+         * @param k0  First K row (int16), length `n`.
+         * @param k1  Second K row (int16), length `n`.
+         * @param k2  Third K row (int16), length `n`.
+         * @param k3  Fourth K row (int16), length `n`.
+         * @param n   Number of elements.
+         * @param out0-out3  (out) Int32 dot products.
+         */
+        static void dot_i16_i16_i32_vnni_4row(
+            const int16_t *q,
+            const int16_t *k0,
+            const int16_t *k1,
+            const int16_t *k2,
+            const int16_t *k3,
+            int n,
+            int32_t &out0,
+            int32_t &out1,
+            int32_t &out2,
+            int32_t &out3)
+        {
+#if defined(__AVX512F__) && defined(__AVX512VNNI__)
+            __m512i acc0 = _mm512_setzero_si512();
+            __m512i acc1 = _mm512_setzero_si512();
+            __m512i acc2 = _mm512_setzero_si512();
+            __m512i acc3 = _mm512_setzero_si512();
+
+            int i = 0;
+            // Unrolled 2× (64 elements / iteration) for ILP
+            for (; i + 63 < n; i += 64)
+            {
+                const __m512i q0 = _mm512_loadu_si512(reinterpret_cast<const void *>(q + i));
+                const __m512i q1 = _mm512_loadu_si512(reinterpret_cast<const void *>(q + i + 32));
+
+                acc0 = _mm512_dpwssd_epi32(acc0, q0, _mm512_loadu_si512(reinterpret_cast<const void *>(k0 + i)));
+                acc0 = _mm512_dpwssd_epi32(acc0, q1, _mm512_loadu_si512(reinterpret_cast<const void *>(k0 + i + 32)));
+                acc1 = _mm512_dpwssd_epi32(acc1, q0, _mm512_loadu_si512(reinterpret_cast<const void *>(k1 + i)));
+                acc1 = _mm512_dpwssd_epi32(acc1, q1, _mm512_loadu_si512(reinterpret_cast<const void *>(k1 + i + 32)));
+                acc2 = _mm512_dpwssd_epi32(acc2, q0, _mm512_loadu_si512(reinterpret_cast<const void *>(k2 + i)));
+                acc2 = _mm512_dpwssd_epi32(acc2, q1, _mm512_loadu_si512(reinterpret_cast<const void *>(k2 + i + 32)));
+                acc3 = _mm512_dpwssd_epi32(acc3, q0, _mm512_loadu_si512(reinterpret_cast<const void *>(k3 + i)));
+                acc3 = _mm512_dpwssd_epi32(acc3, q1, _mm512_loadu_si512(reinterpret_cast<const void *>(k3 + i + 32)));
+            }
+
+            for (; i + 31 < n; i += 32)
+            {
+                const __m512i qv = _mm512_loadu_si512(reinterpret_cast<const void *>(q + i));
+                acc0 = _mm512_dpwssd_epi32(acc0, qv, _mm512_loadu_si512(reinterpret_cast<const void *>(k0 + i)));
+                acc1 = _mm512_dpwssd_epi32(acc1, qv, _mm512_loadu_si512(reinterpret_cast<const void *>(k1 + i)));
+                acc2 = _mm512_dpwssd_epi32(acc2, qv, _mm512_loadu_si512(reinterpret_cast<const void *>(k2 + i)));
+                acc3 = _mm512_dpwssd_epi32(acc3, qv, _mm512_loadu_si512(reinterpret_cast<const void *>(k3 + i)));
+            }
+
+            out0 = _mm512_reduce_add_epi32(acc0);
+            out1 = _mm512_reduce_add_epi32(acc1);
+            out2 = _mm512_reduce_add_epi32(acc2);
+            out3 = _mm512_reduce_add_epi32(acc3);
+
+            for (; i < n; ++i)
+            {
+                const int32_t qv = static_cast<int32_t>(q[i]);
+                out0 += qv * static_cast<int32_t>(k0[i]);
+                out1 += qv * static_cast<int32_t>(k1[i]);
+                out2 += qv * static_cast<int32_t>(k2[i]);
+                out3 += qv * static_cast<int32_t>(k3[i]);
+            }
+#else
+            out0 = dot_i16_i16_i32_scalar(q, k0, n);
+            out1 = dot_i16_i16_i32_scalar(q, k1, n);
+            out2 = dot_i16_i16_i32_scalar(q, k2, n);
+            out3 = dot_i16_i16_i32_scalar(q, k3, n);
+#endif
+        }
+
+        /**
+         * @brief Weighted V accumulation from Q16_1 block: out[d] += weight * (scale * qs[d]).
+         *
+         * Loads int16 values from a Q16_1 block's qs[] array, sign-extends to
+         * int32 via _mm512_cvtepi16_epi32, converts to FP32, multiplies by the
+         * combined weight (softmax_weight * block_scale), and FMA-accumulates
+         * into the FP32 output vector.
+         *
+         * @param out       FP32 output vector (accumulated in-place).
+         * @param v_qs      Pointer to int16_t qs[] data from Q16_1 block.
+         * @param combined  Pre-computed (softmax_weight * v_block.d).
+         * @param head_dim  Number of elements.
+         */
+        static void accum_weighted_v_q16(
+            float *out, const int16_t *v_qs, float combined, int head_dim)
+        {
+#if defined(__AVX512F__)
+            const __m512 w = _mm512_set1_ps(combined);
+            int d = 0;
+            // 2× unrolled for ILP (32 elements per iteration)
+            for (; d + 31 < head_dim; d += 32)
+            {
+                __m512 o0 = _mm512_loadu_ps(out + d);
+                __m512 o1 = _mm512_loadu_ps(out + d + 16);
+                const __m512 vf0 = _mm512_cvtepi32_ps(_mm512_cvtepi16_epi32(
+                    _mm256_loadu_si256(reinterpret_cast<const __m256i *>(v_qs + d))));
+                const __m512 vf1 = _mm512_cvtepi32_ps(_mm512_cvtepi16_epi32(
+                    _mm256_loadu_si256(reinterpret_cast<const __m256i *>(v_qs + d + 16))));
+                o0 = _mm512_fmadd_ps(vf0, w, o0);
+                o1 = _mm512_fmadd_ps(vf1, w, o1);
+                _mm512_storeu_ps(out + d, o0);
+                _mm512_storeu_ps(out + d + 16, o1);
+            }
+            for (; d + 15 < head_dim; d += 16)
+            {
+                __m512 o = _mm512_loadu_ps(out + d);
+                const __m512 vf = _mm512_cvtepi32_ps(_mm512_cvtepi16_epi32(
+                    _mm256_loadu_si256(reinterpret_cast<const __m256i *>(v_qs + d))));
+                o = _mm512_fmadd_ps(vf, w, o);
+                _mm512_storeu_ps(out + d, o);
+            }
+            for (; d < head_dim; ++d)
+            {
+                out[d] += combined * static_cast<float>(v_qs[d]);
+            }
+#else
+            for (int d = 0; d < head_dim; ++d)
+            {
+                out[d] += combined * static_cast<float>(v_qs[d]);
+            }
+#endif
+        }
+
+        /**
+         * @brief Batched 4-row V accumulation: out[d] += Σ_i w_i * v_i_qs[d].
+         *
+         * Loads the output vector once, accumulates 4 dequantised V rows with
+         * their softmax weights, then stores once.  Saves ~60% of L1 traffic
+         * vs calling accum_weighted_v_q16 four separate times.
+         */
+        static void accum_weighted_v_q16_4row(
+            float *__restrict out,
+            const int16_t *v0, float w0,
+            const int16_t *v1, float w1,
+            const int16_t *v2, float w2,
+            const int16_t *v3, float w3,
+            int head_dim)
+        {
+#if defined(__AVX512F__)
+            const __m512 vw0 = _mm512_set1_ps(w0);
+            const __m512 vw1 = _mm512_set1_ps(w1);
+            const __m512 vw2 = _mm512_set1_ps(w2);
+            const __m512 vw3 = _mm512_set1_ps(w3);
+            int d = 0;
+            // 2× unrolled: 32 elements/iteration for head_dim=128 (4 iterations)
+            // Keeps both FMA ports fed by interleaving independent chains.
+            for (; d + 31 < head_dim; d += 32)
+            {
+                __m512 oA = _mm512_loadu_ps(out + d);
+                __m512 oB = _mm512_loadu_ps(out + d + 16);
+                oA = _mm512_fmadd_ps(
+                    _mm512_cvtepi32_ps(_mm512_cvtepi16_epi32(
+                        _mm256_loadu_si256(reinterpret_cast<const __m256i *>(v0 + d)))),
+                    vw0, oA);
+                oB = _mm512_fmadd_ps(
+                    _mm512_cvtepi32_ps(_mm512_cvtepi16_epi32(
+                        _mm256_loadu_si256(reinterpret_cast<const __m256i *>(v0 + d + 16)))),
+                    vw0, oB);
+                oA = _mm512_fmadd_ps(
+                    _mm512_cvtepi32_ps(_mm512_cvtepi16_epi32(
+                        _mm256_loadu_si256(reinterpret_cast<const __m256i *>(v1 + d)))),
+                    vw1, oA);
+                oB = _mm512_fmadd_ps(
+                    _mm512_cvtepi32_ps(_mm512_cvtepi16_epi32(
+                        _mm256_loadu_si256(reinterpret_cast<const __m256i *>(v1 + d + 16)))),
+                    vw1, oB);
+                oA = _mm512_fmadd_ps(
+                    _mm512_cvtepi32_ps(_mm512_cvtepi16_epi32(
+                        _mm256_loadu_si256(reinterpret_cast<const __m256i *>(v2 + d)))),
+                    vw2, oA);
+                oB = _mm512_fmadd_ps(
+                    _mm512_cvtepi32_ps(_mm512_cvtepi16_epi32(
+                        _mm256_loadu_si256(reinterpret_cast<const __m256i *>(v2 + d + 16)))),
+                    vw2, oB);
+                oA = _mm512_fmadd_ps(
+                    _mm512_cvtepi32_ps(_mm512_cvtepi16_epi32(
+                        _mm256_loadu_si256(reinterpret_cast<const __m256i *>(v3 + d)))),
+                    vw3, oA);
+                oB = _mm512_fmadd_ps(
+                    _mm512_cvtepi32_ps(_mm512_cvtepi16_epi32(
+                        _mm256_loadu_si256(reinterpret_cast<const __m256i *>(v3 + d + 16)))),
+                    vw3, oB);
+                _mm512_storeu_ps(out + d, oA);
+                _mm512_storeu_ps(out + d + 16, oB);
+            }
+            for (; d + 15 < head_dim; d += 16)
+            {
+                __m512 o = _mm512_loadu_ps(out + d);
+                o = _mm512_fmadd_ps(
+                    _mm512_cvtepi32_ps(_mm512_cvtepi16_epi32(
+                        _mm256_loadu_si256(reinterpret_cast<const __m256i *>(v0 + d)))),
+                    vw0, o);
+                o = _mm512_fmadd_ps(
+                    _mm512_cvtepi32_ps(_mm512_cvtepi16_epi32(
+                        _mm256_loadu_si256(reinterpret_cast<const __m256i *>(v1 + d)))),
+                    vw1, o);
+                o = _mm512_fmadd_ps(
+                    _mm512_cvtepi32_ps(_mm512_cvtepi16_epi32(
+                        _mm256_loadu_si256(reinterpret_cast<const __m256i *>(v2 + d)))),
+                    vw2, o);
+                o = _mm512_fmadd_ps(
+                    _mm512_cvtepi32_ps(_mm512_cvtepi16_epi32(
+                        _mm256_loadu_si256(reinterpret_cast<const __m256i *>(v3 + d)))),
+                    vw3, o);
+                _mm512_storeu_ps(out + d, o);
+            }
+            for (; d < head_dim; ++d)
+            {
+                out[d] += w0 * static_cast<float>(v0[d]) + w1 * static_cast<float>(v1[d]) + w2 * static_cast<float>(v2[d]) + w3 * static_cast<float>(v3[d]);
+            }
+#else
+            accum_weighted_v_q16(out, v0, w0, head_dim);
+            accum_weighted_v_q16(out, v1, w1, head_dim);
+            accum_weighted_v_q16(out, v2, w2, head_dim);
+            accum_weighted_v_q16(out, v3, w3, head_dim);
 #endif
         }
 
@@ -2166,21 +2592,46 @@ namespace llaminar2
                             // --- V Phase: accumulate weighted values ---
                             // For each KV position in this tile, compute the unnormalised
                             // softmax probability p = exp(score - new_m) and add p*V to out.
+                            // Positions in [valid_start, valid_end) are guaranteed finite.
+                            // Positions outside that range are -inf (masked) — skip them.
                             const auto v_start = profiling_enabled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
 
-                            for (int k = k0; k < k1; ++k)
                             {
-                                const float s = block_scores[static_cast<size_t>(k - k0)];
-                                // Skip masked positions (score == -inf → exp = 0).
-                                if (!std::isfinite(s))
+                                const float *v_base = V + static_cast<size_t>(kv_h) * head_dim;
+                                int k = valid_start;
+#if defined(__AVX512F__)
+                                // 4-wide batched: vectorized exp + batched V accumulation
+                                for (; k + 3 < valid_end; k += 4)
                                 {
-                                    continue;
-                                }
+                                    const __m128 scores4 = _mm_set_ps(
+                                        block_scores[static_cast<size_t>(k - k0 + 3)],
+                                        block_scores[static_cast<size_t>(k - k0 + 2)],
+                                        block_scores[static_cast<size_t>(k - k0 + 1)],
+                                        block_scores[static_cast<size_t>(k - k0 + 0)]);
+                                    const __m128 nm4 = _mm_set1_ps(new_m);
+                                    const __m512 exp_in = _mm512_castps128_ps512(_mm_sub_ps(scores4, nm4));
+                                    const __m512 exp_out = fast_exp_avx512(exp_in);
+                                    const __m128 probs = _mm512_castps512_ps128(exp_out);
+                                    alignas(16) float pp[4];
+                                    _mm_store_ps(pp, probs);
+                                    new_l += pp[0] + pp[1] + pp[2] + pp[3];
 
-                                const float p = std::exp(s - new_m); // Unnormalised softmax weight
-                                new_l += p;                          // Accumulate into denominator
-                                const float *v_ptr = V + static_cast<size_t>(k) * kv_stride + static_cast<size_t>(kv_h) * head_dim;
-                                accum_weighted_v(out, v_ptr, p, head_dim, use_avx512); // out += p * V[k]
+                                    accum_weighted_v_4row(
+                                        out,
+                                        v_base + static_cast<size_t>(k + 0) * kv_stride, pp[0],
+                                        v_base + static_cast<size_t>(k + 1) * kv_stride, pp[1],
+                                        v_base + static_cast<size_t>(k + 2) * kv_stride, pp[2],
+                                        v_base + static_cast<size_t>(k + 3) * kv_stride, pp[3],
+                                        head_dim);
+                                }
+#endif
+                                // Scalar tail: remaining valid positions
+                                for (; k < valid_end; ++k)
+                                {
+                                    const float p = std::exp(block_scores[static_cast<size_t>(k - k0)] - new_m);
+                                    new_l += p;
+                                    accum_weighted_v(out, v_base + static_cast<size_t>(k) * kv_stride, p, head_dim, use_avx512);
+                                }
                             }
 
                             if (profiling_enabled)
@@ -2255,6 +2706,801 @@ namespace llaminar2
             }
             return true;
         }
+
+#if defined(__AVX512F__) && defined(__AVX512VNNI__)
+        /**
+         * @brief Prefill flash attention with Q16_1 KV cache (VNNI accelerated).
+         *
+         * Handles seq_len >= 1 (including prefill where seq_len == kv_len).
+         * Uses the same VNNI QK dot products and Q16_1 V accumulation as
+         * the decode path, but loops over multiple query positions.
+         *
+         * QK Phase: Q is quantized per-head to int16, then dotted against
+         * K block qs[] data using VPDPWSSD. For single-block-per-head layouts
+         * (block_size >= head_dim), a 4-row batched VNNI dot is used.
+         *
+         * V Phase: 4-wide vectorized exp via fast_exp_avx512 + batched
+         * accum_weighted_v_q16_4row for maximum throughput.
+         */
+        static bool compute_prefill_q16kv(
+            const float *Q,
+            const Q16_1Tensor *K_q16, const Q16_1Tensor *V_q16,
+            float *output,
+            int seq_len, int kv_len,
+            int n_heads, int n_kv_heads, int head_dim,
+            bool causal, int window_size, int position_offset)
+        {
+            KERNEL_PROFILE_SCOPE(KernelType::ATTENTION);
+
+            if (!Q || !K_q16 || !V_q16 || !output)
+                return false;
+            if (seq_len <= 0 || kv_len <= 0 || n_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0)
+                return false;
+            if (n_heads % n_kv_heads != 0)
+                return false;
+
+            const int heads_per_kv = n_heads / n_kv_heads;
+            const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+
+            // Q16_1 block layout
+            const Q16BlockSize blk_size = K_q16->q16_block_size();
+            const size_t block_bytes = q16_block_size_bytes(blk_size);
+            const size_t block_elems = q16_block_size_elements(blk_size);
+            const size_t blocks_per_kv_row = K_q16->blocks_per_row();
+            constexpr size_t QS_OFFSET = sizeof(float) + sizeof(int32_t); // = 8 bytes
+
+            const uint8_t *k_raw = static_cast<const uint8_t *>(K_q16->raw_data());
+            const uint8_t *v_raw = static_cast<const uint8_t *>(V_q16->raw_data());
+            if (!k_raw || !v_raw)
+                return false;
+
+            const int q_stride = n_heads * head_dim;
+
+            // KV tile size for prefill
+            const bool is_decode = (seq_len == 1 && kv_len >= 1);
+            const int kv_tile = detail::DefaultFlashKVTilePolicy::choose(
+                head_dim, n_kv_heads, kv_len, is_decode);
+
+            const bool profiling_enabled = KernelProfiler::isEnabled();
+            uint64_t qk_duration_ns = 0;
+            uint64_t v_duration_ns = 0;
+
+            const int attn_threads = computeOptimalAttentionThreads(
+                n_heads, seq_len, kv_len, head_dim, causal);
+
+            // For VNNI QK: Q is quantized per-head to int16
+            constexpr int QMAX = 2047;
+
+            auto work = [&]()
+            {
+                thread_local std::vector<int16_t> q_i16_buf;
+                if (static_cast<int>(q_i16_buf.size()) < head_dim)
+                    q_i16_buf.resize(static_cast<size_t>(head_dim));
+
+#pragma omp for schedule(static) reduction(+ : qk_duration_ns, v_duration_ns)
+                for (int h = 0; h < n_heads; ++h)
+                {
+                    const int kv_h = h / heads_per_kv;
+
+                    // Hoist per-head block layout invariants
+                    const size_t blocks_per_head = (static_cast<size_t>(head_dim) + block_elems - 1) / block_elems;
+                    const size_t head_block_start = static_cast<size_t>(kv_h) * blocks_per_head;
+                    const size_t row_stride_bytes = blocks_per_kv_row * block_bytes;
+                    const size_t blk_off_bytes = head_block_start * block_bytes;
+
+                    thread_local std::vector<float> block_scores;
+
+                    for (int q_pos = 0; q_pos < seq_len; ++q_pos)
+                    {
+                        float *out = output + static_cast<size_t>(q_pos) * q_stride + static_cast<size_t>(h) * head_dim;
+                        std::fill(out, out + head_dim, 0.0f);
+
+                        float running_m = -std::numeric_limits<float>::infinity();
+                        float running_l = 0.0f;
+
+                        const float *q_ptr = Q + static_cast<size_t>(q_pos) * q_stride + static_cast<size_t>(h) * head_dim;
+                        const int q_abs = position_offset + q_pos;
+
+                        // Quantize Q to int16 once per (head, q_pos)
+                        const float q_scale = quantize_row_i16_i12(
+                            q_ptr, q_i16_buf.data(), head_dim, QMAX);
+                        const float qk_combined_scale = q_scale * scale;
+
+                        // KV tile loop
+                        for (int k0 = 0; k0 < kv_len; k0 += kv_tile)
+                        {
+                            const int k1 = std::min(k0 + kv_tile, kv_len);
+                            float block_max = -std::numeric_limits<float>::infinity();
+
+                            const int blk = k1 - k0;
+                            if (static_cast<int>(block_scores.size()) < blk)
+                                block_scores.resize(static_cast<size_t>(blk));
+
+                            // Valid window for causal/sliding-window masking
+                            int valid_start = k0;
+                            int valid_end = k1;
+                            if (window_size > 0)
+                                valid_start = std::max(valid_start, q_abs - window_size + 1);
+                            if (causal)
+                                valid_end = std::min(valid_end, q_abs + 1);
+                            valid_start = std::max(k0, std::min(valid_start, k1));
+                            valid_end = std::max(k0, std::min(valid_end, k1));
+
+                            // Fill masked positions
+                            for (int k = k0; k < valid_start; ++k)
+                                block_scores[static_cast<size_t>(k - k0)] = -std::numeric_limits<float>::infinity();
+                            for (int k = valid_end; k < k1; ++k)
+                                block_scores[static_cast<size_t>(k - k0)] = -std::numeric_limits<float>::infinity();
+
+                            const auto qk_start = profiling_enabled
+                                                      ? std::chrono::steady_clock::now()
+                                                      : std::chrono::steady_clock::time_point();
+
+                            // --- QK Phase: VNNI int16 dot products ---
+                            for (int k = valid_start; k < valid_end;)
+                            {
+                                if (blocks_per_head == 1)
+                                {
+                                    // Fast path: 1 block per head
+                                    if (k + 3 < valid_end)
+                                    {
+                                        const uint8_t *b0 = k_raw + static_cast<size_t>(k + 0) * row_stride_bytes + blk_off_bytes;
+                                        const uint8_t *b1 = k_raw + static_cast<size_t>(k + 1) * row_stride_bytes + blk_off_bytes;
+                                        const uint8_t *b2 = k_raw + static_cast<size_t>(k + 2) * row_stride_bytes + blk_off_bytes;
+                                        const uint8_t *b3 = k_raw + static_cast<size_t>(k + 3) * row_stride_bytes + blk_off_bytes;
+
+                                        if (k + 7 < valid_end)
+                                        {
+                                            _mm_prefetch(reinterpret_cast<const char *>(
+                                                             k_raw + static_cast<size_t>(k + 4) * row_stride_bytes + blk_off_bytes),
+                                                         _MM_HINT_T0);
+                                            _mm_prefetch(reinterpret_cast<const char *>(
+                                                             k_raw + static_cast<size_t>(k + 5) * row_stride_bytes + blk_off_bytes),
+                                                         _MM_HINT_T0);
+                                            _mm_prefetch(reinterpret_cast<const char *>(
+                                                             k_raw + static_cast<size_t>(k + 6) * row_stride_bytes + blk_off_bytes),
+                                                         _MM_HINT_T0);
+                                            _mm_prefetch(reinterpret_cast<const char *>(
+                                                             k_raw + static_cast<size_t>(k + 7) * row_stride_bytes + blk_off_bytes),
+                                                         _MM_HINT_T0);
+                                        }
+
+                                        float kd0, kd1, kd2, kd3;
+                                        std::memcpy(&kd0, b0, sizeof(float));
+                                        std::memcpy(&kd1, b1, sizeof(float));
+                                        std::memcpy(&kd2, b2, sizeof(float));
+                                        std::memcpy(&kd3, b3, sizeof(float));
+
+                                        const int16_t *k_qs0 = reinterpret_cast<const int16_t *>(b0 + QS_OFFSET);
+                                        const int16_t *k_qs1 = reinterpret_cast<const int16_t *>(b1 + QS_OFFSET);
+                                        const int16_t *k_qs2 = reinterpret_cast<const int16_t *>(b2 + QS_OFFSET);
+                                        const int16_t *k_qs3 = reinterpret_cast<const int16_t *>(b3 + QS_OFFSET);
+
+                                        int32_t dot0, dot1, dot2, dot3;
+                                        dot_i16_i16_i32_vnni_4row(
+                                            q_i16_buf.data(), k_qs0, k_qs1, k_qs2, k_qs3,
+                                            head_dim, dot0, dot1, dot2, dot3);
+
+                                        float s0 = static_cast<float>(dot0) * qk_combined_scale * kd0;
+                                        float s1 = static_cast<float>(dot1) * qk_combined_scale * kd1;
+                                        float s2 = static_cast<float>(dot2) * qk_combined_scale * kd2;
+                                        float s3 = static_cast<float>(dot3) * qk_combined_scale * kd3;
+
+                                        block_scores[static_cast<size_t>(k - k0 + 0)] = s0;
+                                        block_scores[static_cast<size_t>(k - k0 + 1)] = s1;
+                                        block_scores[static_cast<size_t>(k - k0 + 2)] = s2;
+                                        block_scores[static_cast<size_t>(k - k0 + 3)] = s3;
+                                        block_max = std::max(block_max, std::max(std::max(s0, s1), std::max(s2, s3)));
+                                        k += 4;
+                                        continue;
+                                    }
+
+                                    // Scalar tail
+                                    const uint8_t *blk_s = k_raw + static_cast<size_t>(k) * row_stride_bytes + blk_off_bytes;
+                                    float kd;
+                                    std::memcpy(&kd, blk_s, sizeof(float));
+                                    const int16_t *k_qs = reinterpret_cast<const int16_t *>(blk_s + QS_OFFSET);
+                                    int32_t dot = dot_i16_i16_i32_vnni(q_i16_buf.data(), k_qs, head_dim);
+                                    float s = static_cast<float>(dot) * qk_combined_scale * kd;
+                                    block_scores[static_cast<size_t>(k - k0)] = s;
+                                    block_max = std::max(block_max, s);
+                                    ++k;
+                                }
+                                else
+                                {
+                                    // Multi-block-per-head fallback
+                                    float s = 0.0f;
+                                    for (size_t bi = 0; bi < blocks_per_head; ++bi)
+                                    {
+                                        const size_t blk_idx = static_cast<size_t>(k) * blocks_per_kv_row + head_block_start + bi;
+                                        const uint8_t *blk_ptr = k_raw + blk_idx * block_bytes;
+                                        float kd;
+                                        std::memcpy(&kd, blk_ptr, sizeof(float));
+                                        const int16_t *k_qs = reinterpret_cast<const int16_t *>(blk_ptr + QS_OFFSET);
+                                        const int elem_count = static_cast<int>(
+                                            std::min(block_elems, static_cast<size_t>(head_dim) - bi * block_elems));
+                                        int32_t dot = dot_i16_i16_i32_vnni(
+                                            q_i16_buf.data() + bi * block_elems, k_qs, elem_count);
+                                        s += static_cast<float>(dot) * q_scale * kd;
+                                    }
+                                    s *= scale;
+                                    block_scores[static_cast<size_t>(k - k0)] = s;
+                                    block_max = std::max(block_max, s);
+                                    ++k;
+                                }
+                            }
+
+                            if (profiling_enabled)
+                                qk_duration_ns += static_cast<uint64_t>(
+                                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                        std::chrono::steady_clock::now() - qk_start)
+                                        .count());
+
+                            // --- Online softmax correction ---
+                            const float new_m = std::max(running_m, block_max);
+                            const float alpha = std::isfinite(running_m)
+                                                    ? std::exp(running_m - new_m)
+                                                    : 0.0f;
+                            {
+                                const __m512 va = _mm512_set1_ps(alpha);
+                                int sd = 0;
+                                for (; sd + 15 < head_dim; sd += 16)
+                                    _mm512_storeu_ps(out + sd, _mm512_mul_ps(va, _mm512_loadu_ps(out + sd)));
+                                for (; sd < head_dim; ++sd)
+                                    out[sd] *= alpha;
+                            }
+                            float new_l = running_l * alpha;
+
+                            // --- V Phase: Q16_1 V weighted accumulation ---
+                            const auto v_start = profiling_enabled
+                                                     ? std::chrono::steady_clock::now()
+                                                     : std::chrono::steady_clock::time_point();
+
+                            if (blocks_per_head == 1)
+                            {
+                                int k = valid_start;
+                                for (; k + 3 < valid_end; k += 4)
+                                {
+                                    if (k + 7 < valid_end)
+                                    {
+                                        _mm_prefetch(reinterpret_cast<const char *>(
+                                                         v_raw + static_cast<size_t>(k + 4) * row_stride_bytes + blk_off_bytes),
+                                                     _MM_HINT_T0);
+                                        _mm_prefetch(reinterpret_cast<const char *>(
+                                                         v_raw + static_cast<size_t>(k + 5) * row_stride_bytes + blk_off_bytes),
+                                                     _MM_HINT_T0);
+                                        _mm_prefetch(reinterpret_cast<const char *>(
+                                                         v_raw + static_cast<size_t>(k + 6) * row_stride_bytes + blk_off_bytes),
+                                                     _MM_HINT_T0);
+                                        _mm_prefetch(reinterpret_cast<const char *>(
+                                                         v_raw + static_cast<size_t>(k + 7) * row_stride_bytes + blk_off_bytes),
+                                                     _MM_HINT_T0);
+                                    }
+
+                                    const __m128 scores4 = _mm_set_ps(
+                                        block_scores[static_cast<size_t>(k - k0 + 3)],
+                                        block_scores[static_cast<size_t>(k - k0 + 2)],
+                                        block_scores[static_cast<size_t>(k - k0 + 1)],
+                                        block_scores[static_cast<size_t>(k - k0 + 0)]);
+                                    const __m128 nm4 = _mm_set1_ps(new_m);
+                                    const __m512 exp_in = _mm512_castps128_ps512(_mm_sub_ps(scores4, nm4));
+                                    const __m512 exp_out = fast_exp_avx512(exp_in);
+                                    const __m128 probs = _mm512_castps512_ps128(exp_out);
+                                    alignas(16) float pp[4];
+                                    _mm_store_ps(pp, probs);
+                                    new_l += pp[0] + pp[1] + pp[2] + pp[3];
+
+                                    const uint8_t *vb0 = v_raw + static_cast<size_t>(k + 0) * row_stride_bytes + blk_off_bytes;
+                                    const uint8_t *vb1 = v_raw + static_cast<size_t>(k + 1) * row_stride_bytes + blk_off_bytes;
+                                    const uint8_t *vb2 = v_raw + static_cast<size_t>(k + 2) * row_stride_bytes + blk_off_bytes;
+                                    const uint8_t *vb3 = v_raw + static_cast<size_t>(k + 3) * row_stride_bytes + blk_off_bytes;
+
+                                    float vd0, vd1, vd2, vd3;
+                                    std::memcpy(&vd0, vb0, sizeof(float));
+                                    std::memcpy(&vd1, vb1, sizeof(float));
+                                    std::memcpy(&vd2, vb2, sizeof(float));
+                                    std::memcpy(&vd3, vb3, sizeof(float));
+
+                                    accum_weighted_v_q16_4row(
+                                        out,
+                                        reinterpret_cast<const int16_t *>(vb0 + QS_OFFSET), pp[0] * vd0,
+                                        reinterpret_cast<const int16_t *>(vb1 + QS_OFFSET), pp[1] * vd1,
+                                        reinterpret_cast<const int16_t *>(vb2 + QS_OFFSET), pp[2] * vd2,
+                                        reinterpret_cast<const int16_t *>(vb3 + QS_OFFSET), pp[3] * vd3,
+                                        head_dim);
+                                }
+
+                                // Scalar tail
+                                for (; k < valid_end; ++k)
+                                {
+                                    const float p = std::exp(block_scores[static_cast<size_t>(k - k0)] - new_m);
+                                    new_l += p;
+                                    const uint8_t *blk_ptr = v_raw + static_cast<size_t>(k) * row_stride_bytes + blk_off_bytes;
+                                    float vd;
+                                    std::memcpy(&vd, blk_ptr, sizeof(float));
+                                    accum_weighted_v_q16(out,
+                                                         reinterpret_cast<const int16_t *>(blk_ptr + QS_OFFSET),
+                                                         p * vd, head_dim);
+                                }
+                            }
+                            else
+                            {
+                                // Multi-block fallback
+                                for (int k = valid_start; k < valid_end; ++k)
+                                {
+                                    const float p = std::exp(block_scores[static_cast<size_t>(k - k0)] - new_m);
+                                    new_l += p;
+                                    for (size_t bi = 0; bi < blocks_per_head; ++bi)
+                                    {
+                                        const size_t blk_idx = static_cast<size_t>(k) * blocks_per_kv_row + head_block_start + bi;
+                                        const uint8_t *blk_ptr = v_raw + blk_idx * block_bytes;
+                                        float vd;
+                                        std::memcpy(&vd, blk_ptr, sizeof(float));
+                                        const int16_t *v_qs = reinterpret_cast<const int16_t *>(blk_ptr + QS_OFFSET);
+                                        const int elem_count = static_cast<int>(
+                                            std::min(block_elems, static_cast<size_t>(head_dim) - bi * block_elems));
+                                        accum_weighted_v_q16(
+                                            out + bi * block_elems, v_qs, p * vd, elem_count);
+                                    }
+                                }
+                            }
+
+                            if (profiling_enabled)
+                                v_duration_ns += static_cast<uint64_t>(
+                                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                        std::chrono::steady_clock::now() - v_start)
+                                        .count());
+
+                            running_m = new_m;
+                            running_l = new_l;
+                        } // end KV tile loop
+
+                        // Final normalisation
+                        if (running_l > 0.0f)
+                        {
+                            const float inv_l = 1.0f / running_l;
+                            const __m512 vi = _mm512_set1_ps(inv_l);
+                            int sd = 0;
+                            for (; sd + 15 < head_dim; sd += 16)
+                                _mm512_storeu_ps(out + sd, _mm512_mul_ps(vi, _mm512_loadu_ps(out + sd)));
+                            for (; sd < head_dim; ++sd)
+                                out[sd] *= inv_l;
+                        }
+                    } // end q_pos loop
+                } // end head loop
+            };
+
+            // Threading: prefill has enough work for all threads
+            OMP_WORKSHARE_REGION(work);
+            const int actual_threads = omp_get_max_threads();
+
+            if (profiling_enabled)
+            {
+                KernelProfiler::recordParallel(KernelType::ATTENTION_QK, qk_duration_ns, actual_threads);
+                KernelProfiler::recordParallel(KernelType::ATTENTION_V, v_duration_ns, actual_threads);
+            }
+            return true;
+        }
+#endif // __AVX512F__ && __AVX512VNNI__
+
+#if defined(__AVX512F__) && defined(__AVX512VNNI__)
+        /**
+         * @brief Decode-only flash attention with Q16_1 KV cache (VNNI accelerated).
+         *
+         * Reads K and V directly from Q16_1Tensor block storage. The QK dot
+         * product uses VPDPWSSD (int16×int16→int32) against the block's qs[]
+         * array, with the query quantized on-the-fly to int16. The V phase
+         * loads int16 values, widens to FP32, and FMA-accumulates weighted
+         * by the softmax probability × block scale.
+         *
+         * Bandwidth savings: 2 bytes/element (int16 qs[]) + 8 bytes/block
+         * overhead vs 4 bytes/element for FP32. For head_dim=128 with BLOCK_128:
+         * 264 bytes/head vs 512 bytes FP32 = 48% bandwidth reduction.
+         *
+         * Only supports the decode path (seq_len == 1, kv_len >= 1).
+         */
+        static bool compute_decode_q16kv(
+            const float *Q,
+            const Q16_1Tensor *K_q16, const Q16_1Tensor *V_q16,
+            float *output,
+            int kv_len,
+            int n_heads, int n_kv_heads, int head_dim,
+            bool causal, int position_offset)
+        {
+            KERNEL_PROFILE_SCOPE(KernelType::ATTENTION);
+
+            if (!Q || !K_q16 || !V_q16 || !output)
+                return false;
+            if (kv_len <= 0 || n_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0)
+                return false;
+            if (n_heads % n_kv_heads != 0)
+                return false;
+
+            const int heads_per_kv = n_heads / n_kv_heads;
+            const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+
+            // Q16_1 block layout: all blocks have {float d, int32_t sum_qs, int16_t qs[block_elems]}
+            // The qs offset is always 8 bytes from block start (sizeof(float) + sizeof(int32_t)).
+            const Q16BlockSize blk_size = K_q16->q16_block_size();
+            const size_t block_bytes = q16_block_size_bytes(blk_size);
+            const size_t block_elems = q16_block_size_elements(blk_size);
+            const size_t blocks_per_kv_row = K_q16->blocks_per_row();
+            constexpr size_t QS_OFFSET = sizeof(float) + sizeof(int32_t); // = 8 bytes
+
+            // Detect HEAD_MAJOR layout: Q16_1 KV caches store data as [head][pos][head_dim],
+            // where each row contains one head's data (blocks_per_row == blocks_per_head).
+            // POSITION_MAJOR stores [pos][all_heads] with blocks_per_row == n_kv_heads * blocks_per_head.
+            const size_t blocks_per_head_detect = (static_cast<size_t>(head_dim) + block_elems - 1) / block_elems;
+            const bool is_head_major = (blocks_per_kv_row == blocks_per_head_detect && n_kv_heads > 1);
+            // For HEAD_MAJOR: number of physical rows allocated per head (max_seq_len)
+            const size_t rows_per_head = is_head_major
+                                             ? (K_q16->rows() / static_cast<size_t>(n_kv_heads))
+                                             : 0;
+
+            // Raw byte data for direct block access (avoids block-size-templated dispatch)
+            const uint8_t *k_raw = static_cast<const uint8_t *>(K_q16->raw_data());
+            const uint8_t *v_raw = static_cast<const uint8_t *>(V_q16->raw_data());
+
+            if (!k_raw || !v_raw)
+                return false;
+
+            // KV tile size for decode
+            const int kv_tile = detail::DefaultFlashKVTilePolicy::choose(
+                head_dim, n_kv_heads, kv_len, /*is_decode=*/true);
+
+            const bool profiling_enabled = KernelProfiler::isEnabled();
+            uint64_t qk_duration_ns = 0;
+            uint64_t v_duration_ns = 0;
+
+            const int attn_threads = computeOptimalAttentionThreads(
+                n_heads, 1, kv_len, head_dim, causal);
+
+            // For VNNI QK: Q is quantized once per head to int16 (head_dim elements).
+            // qmax=2047 ≈ 12 effective bits, matching the existing I12 scheme.
+            constexpr int QMAX = 2047;
+
+            auto work = [&]()
+            {
+                // Per-thread Q quantisation buffer
+                thread_local std::vector<int16_t> q_i16_buf;
+                if (static_cast<int>(q_i16_buf.size()) < head_dim)
+                    q_i16_buf.resize(static_cast<size_t>(head_dim));
+
+#pragma omp for schedule(static) reduction(+ : qk_duration_ns, v_duration_ns)
+                for (int h = 0; h < n_heads; ++h)
+                {
+                    const int kv_h = h / heads_per_kv;
+                    float *out = output + static_cast<size_t>(h) * head_dim;
+                    std::fill(out, out + head_dim, 0.0f);
+
+                    float running_m = -std::numeric_limits<float>::infinity();
+                    float running_l = 0.0f;
+
+                    const float *q_ptr = Q + static_cast<size_t>(h) * head_dim;
+                    const int q_abs = position_offset;
+
+                    // Quantize Q to int16 once per head
+                    const float q_scale = quantize_row_i16_i12(
+                        q_ptr, q_i16_buf.data(), head_dim, QMAX);
+
+                    // Precompute combined scale: q_scale * (1/√d)
+                    // This saves one multiply per QK score reconstruction.
+                    const float qk_combined_scale = q_scale * scale;
+
+                    // Hoist per-head block layout invariants outside the tile loop
+                    const size_t blocks_per_head = (static_cast<size_t>(head_dim) + block_elems - 1) / block_elems;
+                    const size_t row_stride_bytes = blocks_per_kv_row * block_bytes;
+                    // HEAD_MAJOR: head data at offset kv_h * rows_per_head * row_stride
+                    // POSITION_MAJOR: head data at offset kv_h * blocks_per_head * block_bytes within each row
+                    const size_t blk_off_bytes = is_head_major
+                                                     ? (static_cast<size_t>(kv_h) * rows_per_head * blocks_per_head * block_bytes)
+                                                     : (static_cast<size_t>(kv_h) * blocks_per_head * block_bytes);
+                    const size_t head_block_start = is_head_major
+                                                        ? (static_cast<size_t>(kv_h) * rows_per_head * blocks_per_head)
+                                                        : (static_cast<size_t>(kv_h) * blocks_per_head);
+
+                    thread_local std::vector<float> block_scores;
+
+                    for (int k0 = 0; k0 < kv_len; k0 += kv_tile)
+                    {
+                        const int k1 = std::min(k0 + kv_tile, kv_len);
+                        float block_max = -std::numeric_limits<float>::infinity();
+
+                        const int blk = k1 - k0;
+                        if (static_cast<int>(block_scores.size()) < blk)
+                            block_scores.resize(static_cast<size_t>(blk));
+
+                        // Valid window for causal masking
+                        int valid_end = causal ? std::min(k1, q_abs + 1) : k1;
+                        valid_end = std::max(k0, std::min(valid_end, k1));
+
+                        // Fill masked positions
+                        for (int k = valid_end; k < k1; ++k)
+                            block_scores[static_cast<size_t>(k - k0)] = -std::numeric_limits<float>::infinity();
+
+                        const auto qk_start = profiling_enabled
+                                                  ? std::chrono::steady_clock::now()
+                                                  : std::chrono::steady_clock::time_point();
+
+                        // --- QK Phase: VNNI int16 dot products ---
+
+                        for (int k = k0; k < valid_end;)
+                        {
+                            if (blocks_per_head == 1)
+                            {
+                                // Fast path: 1 block per head — qs[] is contiguous head_dim int16s
+                                if (k + 3 < valid_end)
+                                {
+                                    const uint8_t *b0 = k_raw + static_cast<size_t>(k + 0) * row_stride_bytes + blk_off_bytes;
+                                    const uint8_t *b1 = k_raw + static_cast<size_t>(k + 1) * row_stride_bytes + blk_off_bytes;
+                                    const uint8_t *b2 = k_raw + static_cast<size_t>(k + 2) * row_stride_bytes + blk_off_bytes;
+                                    const uint8_t *b3 = k_raw + static_cast<size_t>(k + 3) * row_stride_bytes + blk_off_bytes;
+
+                                    // Prefetch next 4 K blocks (stride is too large for HW prefetcher)
+                                    if (k + 7 < valid_end)
+                                    {
+                                        _mm_prefetch(reinterpret_cast<const char *>(
+                                                         k_raw + static_cast<size_t>(k + 4) * row_stride_bytes + blk_off_bytes),
+                                                     _MM_HINT_T0);
+                                        _mm_prefetch(reinterpret_cast<const char *>(
+                                                         k_raw + static_cast<size_t>(k + 5) * row_stride_bytes + blk_off_bytes),
+                                                     _MM_HINT_T0);
+                                        _mm_prefetch(reinterpret_cast<const char *>(
+                                                         k_raw + static_cast<size_t>(k + 6) * row_stride_bytes + blk_off_bytes),
+                                                     _MM_HINT_T0);
+                                        _mm_prefetch(reinterpret_cast<const char *>(
+                                                         k_raw + static_cast<size_t>(k + 7) * row_stride_bytes + blk_off_bytes),
+                                                     _MM_HINT_T0);
+                                    }
+
+                                    // Get K block scales (float d at offset 0 of each block)
+                                    float kd0, kd1, kd2, kd3;
+                                    std::memcpy(&kd0, b0, sizeof(float));
+                                    std::memcpy(&kd1, b1, sizeof(float));
+                                    std::memcpy(&kd2, b2, sizeof(float));
+                                    std::memcpy(&kd3, b3, sizeof(float));
+
+                                    // Get qs[] pointers (at QS_OFFSET into each block)
+                                    const int16_t *k_qs0 = reinterpret_cast<const int16_t *>(b0 + QS_OFFSET);
+                                    const int16_t *k_qs1 = reinterpret_cast<const int16_t *>(b1 + QS_OFFSET);
+                                    const int16_t *k_qs2 = reinterpret_cast<const int16_t *>(b2 + QS_OFFSET);
+                                    const int16_t *k_qs3 = reinterpret_cast<const int16_t *>(b3 + QS_OFFSET);
+
+                                    int32_t dot0, dot1, dot2, dot3;
+                                    dot_i16_i16_i32_vnni_4row(
+                                        q_i16_buf.data(), k_qs0, k_qs1, k_qs2, k_qs3,
+                                        head_dim, dot0, dot1, dot2, dot3);
+
+                                    // Score: int_dot * (q_scale / √d) * k_scale
+                                    float s0 = static_cast<float>(dot0) * qk_combined_scale * kd0;
+                                    float s1 = static_cast<float>(dot1) * qk_combined_scale * kd1;
+                                    float s2 = static_cast<float>(dot2) * qk_combined_scale * kd2;
+                                    float s3 = static_cast<float>(dot3) * qk_combined_scale * kd3;
+
+                                    block_scores[static_cast<size_t>(k - k0 + 0)] = s0;
+                                    block_scores[static_cast<size_t>(k - k0 + 1)] = s1;
+                                    block_scores[static_cast<size_t>(k - k0 + 2)] = s2;
+                                    block_scores[static_cast<size_t>(k - k0 + 3)] = s3;
+                                    block_max = std::max(block_max, std::max(std::max(s0, s1), std::max(s2, s3)));
+                                    k += 4;
+                                    continue;
+                                }
+
+                                // Scalar tail: 1 row at a time
+                                const uint8_t *blk_s = k_raw + static_cast<size_t>(k) * row_stride_bytes + blk_off_bytes;
+                                float kd;
+                                std::memcpy(&kd, blk_s, sizeof(float));
+                                const int16_t *k_qs = reinterpret_cast<const int16_t *>(blk_s + QS_OFFSET);
+                                int32_t dot = dot_i16_i16_i32_vnni(q_i16_buf.data(), k_qs, head_dim);
+                                float s = static_cast<float>(dot) * qk_combined_scale * kd;
+                                block_scores[static_cast<size_t>(k - k0)] = s;
+                                block_max = std::max(block_max, s);
+                                ++k;
+                            }
+                            else
+                            {
+                                // Multi-block-per-head fallback: accumulate across blocks
+                                float s = 0.0f;
+                                for (size_t bi = 0; bi < blocks_per_head; ++bi)
+                                {
+                                    const size_t blk_idx = static_cast<size_t>(k) * blocks_per_kv_row + head_block_start + bi;
+                                    const uint8_t *blk_ptr = k_raw + blk_idx * block_bytes;
+                                    float kd;
+                                    std::memcpy(&kd, blk_ptr, sizeof(float));
+                                    const int16_t *k_qs = reinterpret_cast<const int16_t *>(blk_ptr + QS_OFFSET);
+                                    const int elem_count = static_cast<int>(
+                                        std::min(block_elems, static_cast<size_t>(head_dim) - bi * block_elems));
+                                    int32_t dot = dot_i16_i16_i32_vnni(
+                                        q_i16_buf.data() + bi * block_elems, k_qs, elem_count);
+                                    s += static_cast<float>(dot) * q_scale * kd;
+                                }
+                                s *= scale;
+                                block_scores[static_cast<size_t>(k - k0)] = s;
+                                block_max = std::max(block_max, s);
+                                ++k;
+                            }
+                        }
+
+                        if (profiling_enabled)
+                            qk_duration_ns += static_cast<uint64_t>(
+                                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                    std::chrono::steady_clock::now() - qk_start)
+                                    .count());
+
+                        // --- Online softmax correction ---
+                        const float new_m = std::max(running_m, block_max);
+                        const float alpha = std::isfinite(running_m)
+                                                ? std::exp(running_m - new_m)
+                                                : 0.0f;
+                        {
+                            // Scale output: out[d] *= alpha (inline to avoid F16C guard dep)
+                            const __m512 va = _mm512_set1_ps(alpha);
+                            int sd = 0;
+                            for (; sd + 15 < head_dim; sd += 16)
+                                _mm512_storeu_ps(out + sd, _mm512_mul_ps(va, _mm512_loadu_ps(out + sd)));
+                            for (; sd < head_dim; ++sd)
+                                out[sd] *= alpha;
+                        }
+                        float new_l = running_l * alpha;
+
+                        // --- V Phase: Q16_1 V weighted accumulation ---
+                        const auto v_start = profiling_enabled
+                                                 ? std::chrono::steady_clock::now()
+                                                 : std::chrono::steady_clock::time_point();
+
+                        if (blocks_per_head == 1)
+                        {
+                            // Fast path: 4-wide batched V accumulation
+                            // Positions in [k0, valid_end) are guaranteed finite (computed in QK).
+                            // Positions in [valid_end, k1) are -inf (masked) — skip them.
+                            int k = k0;
+                            for (; k + 3 < valid_end; k += 4)
+                            {
+                                // Prefetch next 4 V blocks
+                                if (k + 7 < valid_end)
+                                {
+                                    _mm_prefetch(reinterpret_cast<const char *>(
+                                                     v_raw + static_cast<size_t>(k + 4) * row_stride_bytes + blk_off_bytes),
+                                                 _MM_HINT_T0);
+                                    _mm_prefetch(reinterpret_cast<const char *>(
+                                                     v_raw + static_cast<size_t>(k + 5) * row_stride_bytes + blk_off_bytes),
+                                                 _MM_HINT_T0);
+                                    _mm_prefetch(reinterpret_cast<const char *>(
+                                                     v_raw + static_cast<size_t>(k + 6) * row_stride_bytes + blk_off_bytes),
+                                                 _MM_HINT_T0);
+                                    _mm_prefetch(reinterpret_cast<const char *>(
+                                                     v_raw + static_cast<size_t>(k + 7) * row_stride_bytes + blk_off_bytes),
+                                                 _MM_HINT_T0);
+                                }
+
+                                // Vectorized exp: compute 4 softmax weights in one shot
+                                // using fast_exp_avx512 (< 1 ULP accuracy, ~5x faster than
+                                // 4× scalar std::exp on Cascade Lake).
+                                const __m128 scores4 = _mm_set_ps(
+                                    block_scores[static_cast<size_t>(k - k0 + 3)],
+                                    block_scores[static_cast<size_t>(k - k0 + 2)],
+                                    block_scores[static_cast<size_t>(k - k0 + 1)],
+                                    block_scores[static_cast<size_t>(k - k0 + 0)]);
+                                const __m128 nm4 = _mm_set1_ps(new_m);
+                                // Broadcast 4 scores to __m512, compute exp, extract lower 4
+                                const __m512 exp_in = _mm512_castps128_ps512(_mm_sub_ps(scores4, nm4));
+                                const __m512 exp_out = fast_exp_avx512(exp_in);
+                                const __m128 probs = _mm512_castps512_ps128(exp_out);
+                                alignas(16) float pp[4];
+                                _mm_store_ps(pp, probs);
+                                const float p0 = pp[0], p1 = pp[1], p2 = pp[2], p3 = pp[3];
+                                new_l += p0 + p1 + p2 + p3;
+
+                                const uint8_t *vb0 = v_raw + static_cast<size_t>(k + 0) * row_stride_bytes + blk_off_bytes;
+                                const uint8_t *vb1 = v_raw + static_cast<size_t>(k + 1) * row_stride_bytes + blk_off_bytes;
+                                const uint8_t *vb2 = v_raw + static_cast<size_t>(k + 2) * row_stride_bytes + blk_off_bytes;
+                                const uint8_t *vb3 = v_raw + static_cast<size_t>(k + 3) * row_stride_bytes + blk_off_bytes;
+
+                                float vd0, vd1, vd2, vd3;
+                                std::memcpy(&vd0, vb0, sizeof(float));
+                                std::memcpy(&vd1, vb1, sizeof(float));
+                                std::memcpy(&vd2, vb2, sizeof(float));
+                                std::memcpy(&vd3, vb3, sizeof(float));
+
+                                accum_weighted_v_q16_4row(
+                                    out,
+                                    reinterpret_cast<const int16_t *>(vb0 + QS_OFFSET), p0 * vd0,
+                                    reinterpret_cast<const int16_t *>(vb1 + QS_OFFSET), p1 * vd1,
+                                    reinterpret_cast<const int16_t *>(vb2 + QS_OFFSET), p2 * vd2,
+                                    reinterpret_cast<const int16_t *>(vb3 + QS_OFFSET), p3 * vd3,
+                                    head_dim);
+                            }
+
+                            // Scalar tail: remaining valid positions
+                            for (; k < valid_end; ++k)
+                            {
+                                const float p = std::exp(block_scores[static_cast<size_t>(k - k0)] - new_m);
+                                new_l += p;
+                                const uint8_t *blk_ptr = v_raw + static_cast<size_t>(k) * row_stride_bytes + blk_off_bytes;
+                                float vd;
+                                std::memcpy(&vd, blk_ptr, sizeof(float));
+                                accum_weighted_v_q16(out,
+                                                     reinterpret_cast<const int16_t *>(blk_ptr + QS_OFFSET),
+                                                     p * vd, head_dim);
+                            }
+                            // Positions [valid_end, k1) are masked — no V accumulation needed
+                        }
+                        else
+                        {
+                            // Multi-block fallback (unchanged)
+                            for (int k = k0; k < k1; ++k)
+                            {
+                                const float s = block_scores[static_cast<size_t>(k - k0)];
+                                if (!std::isfinite(s))
+                                    continue;
+                                const float p = std::exp(s - new_m);
+                                new_l += p;
+
+                                for (size_t bi = 0; bi < blocks_per_head; ++bi)
+                                {
+                                    const size_t blk_idx = static_cast<size_t>(k) * blocks_per_kv_row + head_block_start + bi;
+                                    const uint8_t *blk_ptr = v_raw + blk_idx * block_bytes;
+                                    float vd;
+                                    std::memcpy(&vd, blk_ptr, sizeof(float));
+                                    const int16_t *v_qs = reinterpret_cast<const int16_t *>(blk_ptr + QS_OFFSET);
+                                    const int elem_count = static_cast<int>(
+                                        std::min(block_elems, static_cast<size_t>(head_dim) - bi * block_elems));
+                                    accum_weighted_v_q16(
+                                        out + bi * block_elems, v_qs, p * vd, elem_count);
+                                }
+                            }
+                        }
+
+                        if (profiling_enabled)
+                            v_duration_ns += static_cast<uint64_t>(
+                                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                    std::chrono::steady_clock::now() - v_start)
+                                    .count());
+
+                        running_m = new_m;
+                        running_l = new_l;
+                    } // end KV tile loop
+
+                    // Final normalisation
+                    if (running_l > 0.0f)
+                    {
+                        const float inv_l = 1.0f / running_l;
+                        const __m512 vi = _mm512_set1_ps(inv_l);
+                        int sd = 0;
+                        for (; sd + 15 < head_dim; sd += 16)
+                            _mm512_storeu_ps(out + sd, _mm512_mul_ps(vi, _mm512_loadu_ps(out + sd)));
+                        for (; sd < head_dim; ++sd)
+                            out[sd] *= inv_l;
+                    }
+                } // end head loop
+            };
+
+            // Same decode threading strategy — see detailed comment in compute_flash_fp32.
+            const bool force_full_pool_q16 = kv_len > 100;
+
+            int actual_threads_q16;
+            if (force_full_pool_q16)
+            {
+                OMP_WORKSHARE_REGION(work);
+                actual_threads_q16 = omp_get_max_threads();
+            }
+            else
+            {
+#pragma omp parallel num_threads(attn_threads)
+                {
+                    work();
+                }
+                actual_threads_q16 = attn_threads;
+            }
+
+            if (profiling_enabled)
+            {
+                KernelProfiler::recordParallel(KernelType::ATTENTION_QK, qk_duration_ns, actual_threads_q16);
+                KernelProfiler::recordParallel(KernelType::ATTENTION_V, v_duration_ns, actual_threads_q16);
+            }
+            return true;
+        }
+#endif // __AVX512F__ && __AVX512VNNI__
 
 #if defined(__AVX512F__) && defined(__F16C__)
         /**
@@ -2393,19 +3639,47 @@ namespace llaminar2
                         float new_l = running_l * alpha;
 
                         // --- V Phase: FP16 V weighted accumulation ---
+                        // Iterate [k0, valid_end) — all positions are guaranteed finite.
+                        // Positions [valid_end, k1) are masked to -inf — skip them.
                         const auto v_start = profiling_enabled
                                                  ? std::chrono::steady_clock::now()
                                                  : std::chrono::steady_clock::time_point();
 
-                        for (int k = k0; k < k1; ++k)
                         {
-                            const float s = block_scores[static_cast<size_t>(k - k0)];
-                            if (!std::isfinite(s))
-                                continue;
-                            const float p = std::exp(s - new_m);
-                            new_l += p;
-                            const uint16_t *v_ptr = V_fp16 + static_cast<size_t>(k) * kv_stride + static_cast<size_t>(kv_h) * head_dim;
-                            accum_weighted_v_fp16(out, v_ptr, p, head_dim);
+                            const uint16_t *v_base = V_fp16 + static_cast<size_t>(kv_h) * head_dim;
+                            int k = k0;
+                            // 4-wide batched: vectorized exp + batched FP16 V accumulation
+                            for (; k + 3 < valid_end; k += 4)
+                            {
+                                const __m128 scores4 = _mm_set_ps(
+                                    block_scores[static_cast<size_t>(k - k0 + 3)],
+                                    block_scores[static_cast<size_t>(k - k0 + 2)],
+                                    block_scores[static_cast<size_t>(k - k0 + 1)],
+                                    block_scores[static_cast<size_t>(k - k0 + 0)]);
+                                const __m128 nm4 = _mm_set1_ps(new_m);
+                                const __m512 exp_in = _mm512_castps128_ps512(_mm_sub_ps(scores4, nm4));
+                                const __m512 exp_out = fast_exp_avx512(exp_in);
+                                const __m128 probs = _mm512_castps512_ps128(exp_out);
+                                alignas(16) float pp[4];
+                                _mm_store_ps(pp, probs);
+                                new_l += pp[0] + pp[1] + pp[2] + pp[3];
+
+                                accum_weighted_v_fp16_4row(
+                                    out,
+                                    v_base + static_cast<size_t>(k + 0) * kv_stride, pp[0],
+                                    v_base + static_cast<size_t>(k + 1) * kv_stride, pp[1],
+                                    v_base + static_cast<size_t>(k + 2) * kv_stride, pp[2],
+                                    v_base + static_cast<size_t>(k + 3) * kv_stride, pp[3],
+                                    head_dim);
+                            }
+                            // Scalar tail: remaining valid positions
+                            for (; k < valid_end; ++k)
+                            {
+                                const float p = std::exp(block_scores[static_cast<size_t>(k - k0)] - new_m);
+                                new_l += p;
+                                const uint16_t *v_ptr = v_base + static_cast<size_t>(k) * kv_stride;
+                                accum_weighted_v_fp16(out, v_ptr, p, head_dim);
+                            }
                         }
 
                         if (profiling_enabled)

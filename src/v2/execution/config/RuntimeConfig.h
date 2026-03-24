@@ -192,7 +192,8 @@ namespace llaminar2
         AUTO,
         FP32,
         FP16,
-        Q8_1
+        Q8_1,
+        Q16_1
     };
 
     inline const char *kvCachePrecisionToString(KVCachePrecision precision)
@@ -200,13 +201,15 @@ namespace llaminar2
         switch (precision)
         {
         case KVCachePrecision::AUTO:
-            return "AUTO (FP16)";
+            return "AUTO (Q16_1 on CPU, FP16 on GPU)";
         case KVCachePrecision::FP32:
             return "FP32";
         case KVCachePrecision::FP16:
             return "FP16";
         case KVCachePrecision::Q8_1:
             return "Q8_1";
+        case KVCachePrecision::Q16_1:
+            return "Q16_1";
         default:
             return "UNKNOWN";
         }
@@ -225,11 +228,13 @@ namespace llaminar2
             return KVCachePrecision::FP16;
         if (lower == "q8_1" || lower == "q8" || lower == "q81")
             return KVCachePrecision::Q8_1;
+        if (lower == "q16_1" || lower == "q16" || lower == "q161" || lower == "i16" || lower == "int16")
+            return KVCachePrecision::Q16_1;
         return KVCachePrecision::AUTO;
     }
 
     inline ActivationPrecision resolveKVCacheStoragePrecision(
-        KVCachePrecision mode)
+        KVCachePrecision mode, bool is_cpu = false)
     {
         switch (mode)
         {
@@ -239,10 +244,13 @@ namespace llaminar2
             return ActivationPrecision::FP16;
         case KVCachePrecision::Q8_1:
             return ActivationPrecision::Q8_1;
+        case KVCachePrecision::Q16_1:
+            return ActivationPrecision::Q16_1;
         case KVCachePrecision::AUTO:
         default:
-            // Default to FP16: half the VRAM with <2% decode throughput cost
-            return ActivationPrecision::FP16;
+            // CPU: Q16_1 uses VNNI int16 attention — ~1.4x decode speedup, 50% KV memory
+            // GPU: FP16 — half the VRAM with <2% decode throughput cost
+            return is_cpu ? ActivationPrecision::Q16_1 : ActivationPrecision::FP16;
         }
     }
 

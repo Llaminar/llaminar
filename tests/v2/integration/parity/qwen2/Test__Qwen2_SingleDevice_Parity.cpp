@@ -63,6 +63,23 @@ static const std::vector<TestConfig> kSingleDeviceConfigs = {
         .kv_cache_precision = KVCachePrecision::Q8_1,
     },
     {
+        .name = "CPU_KV_Q16_1",
+        .devices = {ParityDeviceType::CPU},
+        .parallelism = Parallelism::None,
+        .collective = Collective::None,
+        .thresholds = {
+            .cosine_threshold = 0.96f, // Q4_0 quantized GEMM diverges from FP32 reference equally on CPU and GPU
+            .decode_cosine_threshold = 0.95f,
+            .early_layers_count = 6,
+            .min_early_layers_passed = 4,
+            .kl_threshold = 0.005f,
+            .min_top1_accuracy = 90.0f,
+            .min_top5_accuracy = 95.0f,
+        },
+        .activation_precision = ActivationPrecision::FP32,
+        .kv_cache_precision = KVCachePrecision::Q16_1,
+    },
+    {
         .name = "CUDA_KV_FP16",
         .devices = {ParityDeviceType::CUDA},
         .parallelism = Parallelism::None,

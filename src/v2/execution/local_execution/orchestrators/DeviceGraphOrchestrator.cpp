@@ -2114,7 +2114,7 @@ namespace llaminar2
             // V is Q8_1 from GEMM, needs to match KV cache precision (FP32 for Hybrid, Q16_1 for HybridQ16)
             ActivationPrecision kv_cache_prec = resolveBufferPrecision(
                 act_prec, HybridBufferType::KV_Cache, nullptr);
-            kv_cache_prec = resolveKVCacheStoragePrecision(config.kv_cache_precision);
+            kv_cache_prec = resolveKVCacheStoragePrecision(config.kv_cache_precision, device.is_cpu());
             state_.V_dequant = factory.createActivation(
                 {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(buffer_n_kv_heads * head_dim)},
                 kv_cache_prec, head_dim, device);
@@ -2254,7 +2254,7 @@ namespace llaminar2
         // For Hybrid mode: KV cache uses BF16 (better than Q8_1, 2x compression)
         ActivationPrecision kv_cache_prec = resolveBufferPrecision(
             act_prec, HybridBufferType::KV_Cache, nullptr);
-        kv_cache_prec = resolveKVCacheStoragePrecision(config.kv_cache_precision);
+        kv_cache_prec = resolveKVCacheStoragePrecision(config.kv_cache_precision, device.is_cpu());
         LOG_DEBUG("[DeviceGraphOrchestrator] KV cache precision: " << activationPrecisionToString(kv_cache_prec));
         LOG_DEBUG("[DeviceGraphOrchestrator] KV cache precision mode: "
                   << kvCachePrecisionToString(config.kv_cache_precision));

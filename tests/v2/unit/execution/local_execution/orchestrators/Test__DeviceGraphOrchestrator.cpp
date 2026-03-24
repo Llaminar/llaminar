@@ -620,9 +620,9 @@ TEST_F(Test__DeviceGraphOrchestrator, InferenceStateMultipleBatches)
 // KV Cache Layout Mode Tests
 // =============================================================================
 
-TEST_F(Test__DeviceGraphOrchestrator, KVCacheLayoutMode_FP32_UsesPositionMajor)
+TEST_F(Test__DeviceGraphOrchestrator, KVCacheLayoutMode_FP32_AutoDefaultsToQ16HeadMajor)
 {
-    // Create config with FP32 precision
+    // Create config with FP32 precision, AUTO KV cache (default)
     auto fp32_config = config_;
     fp32_config.activation_precision = ActivationPrecision::FP32;
     auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(fp32_config, nullptr);
@@ -634,15 +634,15 @@ TEST_F(Test__DeviceGraphOrchestrator, KVCacheLayoutMode_FP32_UsesPositionMajor)
     ASSERT_TRUE(orchestrator->initializeInferenceState(batch_size, max_seq_len, DeviceId::cpu()));
     ASSERT_TRUE(orchestrator->hasInferenceState());
 
-    // KV cache should exist and use POSITION_MAJOR layout
+    // AUTO KV cache on CPU defaults to Q16_1 which uses HEAD_MAJOR layout
     const auto &state = orchestrator->inferenceState();
     ASSERT_NE(state.kv_cache, nullptr);
     auto *cpu_cache = dynamic_cast<ICPUKVCache *>(state.kv_cache.get());
     ASSERT_NE(cpu_cache, nullptr);
-    EXPECT_EQ(cpu_cache->layout_mode(), KVCacheLayoutMode::POSITION_MAJOR);
+    EXPECT_EQ(cpu_cache->layout_mode(), KVCacheLayoutMode::HEAD_MAJOR);
 }
 
-TEST_F(Test__DeviceGraphOrchestrator, KVCacheImplementation_FP32Activation_DefaultsToFP16RingCPUKVCache)
+TEST_F(Test__DeviceGraphOrchestrator, KVCacheImplementation_FP32Activation_DefaultsToQ16RingCPUKVCache)
 {
     auto fp32_config = config_;
     fp32_config.activation_precision = ActivationPrecision::FP32;
@@ -655,13 +655,13 @@ TEST_F(Test__DeviceGraphOrchestrator, KVCacheImplementation_FP32Activation_Defau
     ASSERT_NE(state.kv_cache, nullptr);
     auto *cpu_cache = dynamic_cast<ICPUKVCache *>(state.kv_cache.get());
     ASSERT_NE(cpu_cache, nullptr);
-    // KV cache precision defaults to AUTO→FP16, independent of activation precision
-    EXPECT_NE(dynamic_cast<CPURingKVCache<ActivationPrecision::FP16> *>(cpu_cache), nullptr);
+    // KV cache precision defaults to AUTO→Q16_1 on CPU, independent of activation precision
+    EXPECT_NE(dynamic_cast<CPURingKVCache<ActivationPrecision::Q16_1> *>(cpu_cache), nullptr);
 }
 
-TEST_F(Test__DeviceGraphOrchestrator, KVCacheLayoutMode_BF16_UsesPositionMajor)
+TEST_F(Test__DeviceGraphOrchestrator, KVCacheLayoutMode_BF16_AutoDefaultsToQ16HeadMajor)
 {
-    // Create config with BF16 precision
+    // Create config with BF16 precision, AUTO KV cache (default)
     auto bf16_config = config_;
     bf16_config.activation_precision = ActivationPrecision::BF16;
     auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(bf16_config, nullptr);
@@ -673,12 +673,12 @@ TEST_F(Test__DeviceGraphOrchestrator, KVCacheLayoutMode_BF16_UsesPositionMajor)
     ASSERT_TRUE(orchestrator->initializeInferenceState(batch_size, max_seq_len, DeviceId::cpu()));
     ASSERT_TRUE(orchestrator->hasInferenceState());
 
-    // KV cache should use POSITION_MAJOR layout for BF16
+    // AUTO KV cache on CPU defaults to Q16_1 which uses HEAD_MAJOR layout
     const auto &state = orchestrator->inferenceState();
     ASSERT_NE(state.kv_cache, nullptr);
     auto *cpu_cache = dynamic_cast<ICPUKVCache *>(state.kv_cache.get());
     ASSERT_NE(cpu_cache, nullptr);
-    EXPECT_EQ(cpu_cache->layout_mode(), KVCacheLayoutMode::POSITION_MAJOR);
+    EXPECT_EQ(cpu_cache->layout_mode(), KVCacheLayoutMode::HEAD_MAJOR);
 }
 
 // HybridQ16 tests disabled - HybridQ16 project on hold (2025-01)

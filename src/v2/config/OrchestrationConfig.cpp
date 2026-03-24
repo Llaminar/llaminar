@@ -612,11 +612,12 @@ namespace llaminar2
         {
             const std::string kv = toLower(kv_cache_precision);
             static const std::unordered_set<std::string> valid_kv = {
-                "auto", "fp32", "f32", "fp16", "f16", "q8_1", "q8", "q81"};
+                "auto", "fp32", "f32", "fp16", "f16", "q8_1", "q8", "q81",
+                "q16_1", "q16", "q161", "i16", "int16"};
             if (!valid_kv.count(kv))
             {
                 errors.push_back("Invalid kv_cache_precision: '" + kv_cache_precision +
-                                 "' (valid: auto, fp32, fp16, q8_1)");
+                                 "' (valid: auto, fp32, fp16, q8_1, q16_1)");
             }
         }
 
