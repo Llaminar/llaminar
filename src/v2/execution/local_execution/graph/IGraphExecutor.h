@@ -133,6 +133,44 @@ namespace llaminar2
     };
 
     /**
+     * @brief Execution phase for phase-split profiling
+     */
+    enum class ExecutionPhase : uint8_t
+    {
+        COMBINED = 0, ///< No phase tracking (legacy)
+        PREFILL = 1,
+        DECODE = 2
+    };
+
+    /**
+     * @brief Per-phase stage execution statistics
+     *
+     * Lightweight struct that tracks stage-type breakdown for a single phase
+     * (prefill or decode). The combined/global stats remain in GraphExecutorStats.
+     */
+    struct PhaseStats
+    {
+        size_t total_stages_executed = 0;
+        double total_execute_ms = 0.0;
+        double total_collective_ms = 0.0;
+        size_t total_collective_calls = 0;
+        std::unordered_map<std::string, double> stage_type_execute_ms;
+        std::unordered_map<std::string, size_t> stage_type_counts;
+        ExecutionOverhead overhead;
+
+        void reset()
+        {
+            total_stages_executed = 0;
+            total_execute_ms = 0.0;
+            total_collective_ms = 0.0;
+            total_collective_calls = 0;
+            stage_type_execute_ms.clear();
+            stage_type_counts.clear();
+            overhead.reset();
+        }
+    };
+
+    /**
      * @brief Graph execution statistics
      */
     struct GraphExecutorStats
@@ -150,6 +188,14 @@ namespace llaminar2
         /// Accumulated overhead breakdown
         ExecutionOverhead overhead;
 
+        /// Phase-split stats (prefill vs decode)
+        PhaseStats prefill;
+        PhaseStats decode;
+
+        /// Thread-local current phase (set by BenchmarkRunner before prefill/decode)
+        static void setCurrentPhase(ExecutionPhase phase) { current_phase_ = phase; }
+        static ExecutionPhase currentPhase() { return current_phase_; }
+
         void reset()
         {
             total_stages_executed = 0;
@@ -162,10 +208,18 @@ namespace llaminar2
             stage_type_execute_ms.clear();
             stage_type_counts.clear();
             overhead.reset();
+            prefill.reset();
+            decode.reset();
         }
 
         /// Print a formatted profiling summary to stdout
-        void printProfilingSummary(size_t decode_tokens = 0) const;
+        void printProfilingSummary(size_t prefill_tokens, size_t decode_tokens) const;
+
+    private:
+        static thread_local ExecutionPhase current_phase_;
+
+        /// Print a single phase table
+        void printPhaseTable(const std::string &title, const PhaseStats &phase, size_t tokens) const;
     };
 
     // Backwards compatibility alias

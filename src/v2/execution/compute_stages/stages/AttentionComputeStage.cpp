@@ -128,24 +128,43 @@ namespace llaminar2
         }
 
         // =====================================================================
-        // CPU DECODE OPTIMIZATION: Incremental FP16→FP32 KV cache conversion
+        // CPU DECODE: FP16 KV handling
         //
-        // When the KV cache stores FP16 tensors, every call to fp32_data()
-        // re-converts the ENTIRE cache because KVCacheAppendStage invalidates
-        // the dequant cache via mutable_typed_data(). This is O(max_seq_len)
-        // per layer per token. Instead, we maintain persistent FP32 buffers
-        // and only convert newly appended rows (typically 1 row per decode step).
+        // The attention kernel has two paths for FP16 KV on CPU decode:
+        //
+        // 1. FP16-native path (AVX-512 + F16C): The kernel reads FP16 K/V
+        //    directly and converts to FP32 on the fly in the dot product and
+        //    V accumulation inner loops. This halves KV memory bandwidth and
+        //    eliminates persistent FP32 buffers that cause DRAM bank
+        //    disturbance degrading subsequent GEMM at long context (>300 tok).
+        //
+        // 2. FP32 buffer path (fallback): Persistent FP32 buffers with
+        //    incremental conversion. Used when AVX-512/F16C not available.
+        //
+        // The kernel's compute_tensor() detects FP16 K/V tensors and routes
+        // to path 1 automatically. We only need to avoid creating the FP32
+        // buffers when the hardware supports the native path.
         // =====================================================================
         const bool is_decode_mode = (mode == AttentionMode::DECODE ||
                                      (params_.seq_len < effective_kv_len && params_.batch_size == 1));
+
+        // Check if FP16-native decode path is available (AVX-512 + F16C)
+        const bool fp16_native_available =
+#if defined(__AVX512F__) && defined(__F16C__)
+            true;
+#else
+            false;
+#endif
 
         if (is_decode_mode && gpuStream() == nullptr)
         {
             auto *K_fp16 = dynamic_cast<FP16Tensor *>(effective_K);
             auto *V_fp16 = dynamic_cast<FP16Tensor *>(effective_V);
 
-            if (K_fp16 && V_fp16)
+            if (K_fp16 && V_fp16 && !fp16_native_available)
             {
+                // Fallback: maintain persistent FP32 buffers for platforms
+                // without AVX-512 F16C support
                 const int kv_dim = params_.n_kv_heads * params_.head_dim;
                 const int max_len = params_.kv_cache ? params_.kv_cache->max_seq_len() : effective_kv_len;
 
@@ -187,6 +206,9 @@ namespace llaminar2
                 effective_K = decode_k_fp32_.get();
                 effective_V = decode_v_fp32_.get();
             }
+            // When fp16_native_available && K/V are FP16: pass FP16 tensors
+            // directly to the kernel. compute_tensor() will detect FP16 K/V
+            // and use compute_decode_fp16kv() for zero-copy FP16 attention.
         }
 
         LOG_DEBUG("[AttentionComputeStage] Execute: batch=" << params_.batch_size

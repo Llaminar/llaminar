@@ -11,6 +11,9 @@
 #include "../../../tensors/Tensors.h"
 #include "../../../utils/Logger.h"
 #include "../../../kernels/KernelFactory.h"
+#include "../../../kernels/cpu/primitives/RMSNormPrimitives.h"
+#include "../../../utils/KernelProfiler.h"
+#include <cmath>
 
 #ifdef HAVE_CUDA
 extern "C"
@@ -128,7 +131,58 @@ namespace llaminar2
         }
 #endif
 
-        // CPU fallback: use KernelFactory for sequential residual add + RMSNorm
+        // CPU path: fused residual add + RMSNorm
+        // For FP32 with small seq_len (decode), use a single fused primitive
+        // that avoids two separate kernel dispatches and their OMP overhead.
+        if (input_base->native_type() == TensorType::FP32 && seq_len <= 4)
+        {
+            KERNEL_PROFILE_SCOPE(KernelType::RMS_NORM);
+
+            const float *in_data = input_base->data();
+            float *res_data = residual_base->mutable_data();
+            const float *gamma_data = gamma_base->data();
+            float *out_data = norm_output_base->mutable_data();
+
+#if defined(__AVX512F__)
+            for (int r = 0; r < seq_len; ++r)
+            {
+                primitives::fused_residual_rmsnorm_row_avx512(
+                    in_data + r * hidden_dim,
+                    res_data + r * hidden_dim,
+                    gamma_data,
+                    out_data + r * hidden_dim,
+                    static_cast<std::size_t>(hidden_dim),
+                    params_.eps);
+            }
+#else
+            // Scalar fallback: separate operations
+            for (int r = 0; r < seq_len; ++r)
+            {
+                float *res_row = res_data + r * hidden_dim;
+                const float *in_row = in_data + r * hidden_dim;
+                float *out_row = out_data + r * hidden_dim;
+
+                // Residual add
+                for (int i = 0; i < hidden_dim; ++i)
+                    res_row[i] += in_row[i];
+
+                // RMSNorm
+                double sum_sq = 0.0;
+                for (int i = 0; i < hidden_dim; ++i)
+                    sum_sq += static_cast<double>(res_row[i]) * static_cast<double>(res_row[i]);
+
+                float inv_rms = 1.0f / std::sqrt(static_cast<float>(sum_sq / hidden_dim) + params_.eps);
+                for (int i = 0; i < hidden_dim; ++i)
+                    out_row[i] = gamma_data[i] * res_row[i] * inv_rms;
+            }
+#endif
+
+            traceOutput("residual", params_.residual);
+            traceOutput("norm_output", params_.norm_output);
+            return true;
+        }
+
+        // CPU general path: use KernelFactory for sequential residual add + RMSNorm
         auto *res_kernel = llaminar::v2::kernels::KernelFactory::getOrCreateResidualAdd(
             input_base, params_.device_id);
         if (!res_kernel)

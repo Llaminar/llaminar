@@ -29,6 +29,15 @@
 #include <unistd.h>
 #endif
 
+#ifdef HAVE_NUMA
+#include <numaif.h>
+#include <numa.h>
+#endif
+
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
 namespace llaminar2
 {
 
@@ -109,13 +118,16 @@ namespace llaminar2
         /**
          * @brief Create an MmapRegion by memory-mapping an entire file
          *
-         * Uses MAP_PRIVATE | MAP_POPULATE for read-only access with pre-faulted pages.
-         * Also calls posix_fadvise(SEQUENTIAL) and madvise(WILLNEED) for optimal readahead.
+         * When numa_node >= 0, uses mbind(MPOL_BIND) to ensure pages are allocated
+         * on the specified NUMA node, then madvise(MADV_WILLNEED) to pre-fault.
+         * When numa_node < 0, uses MAP_POPULATE for immediate pre-faulting (default
+         * NUMA policy applies — pages land on the calling CPU's local node).
          *
          * @param file_path Path to the file to map
+         * @param numa_node Target NUMA node for page placement (-1 = default)
          * @return Unique pointer to MmapRegion, or nullptr on failure
          */
-        static std::unique_ptr<MmapRegion> create(const std::string &file_path)
+        static std::unique_ptr<MmapRegion> create(const std::string &file_path, int numa_node = -1)
         {
 #ifdef __linux__
             // Open file read-only
@@ -143,13 +155,30 @@ namespace llaminar2
                 return nullptr;
             }
 
+            const bool numa_bind = (numa_node >= 0);
+
+            if (numa_bind)
+            {
+                // Evict any stale page-cache pages for this file so that our
+                // first-touch loop below allocates fresh pages on the target
+                // NUMA node. Without this, cached pages from a prior run (or
+                // another process) may reside on the wrong node.
+                ::posix_fadvise(fd, 0, file_size, POSIX_FADV_DONTNEED);
+            }
+
             // Hint for sequential access (improves kernel readahead)
             ::posix_fadvise(fd, 0, file_size, POSIX_FADV_SEQUENTIAL);
 
-            // Memory-map the file
-            // MAP_PRIVATE: Copy-on-write (safe, no file modification)
-            // MAP_POPULATE: Pre-fault all pages (avoid per-page faults during tensor loading)
-            void *base = ::mmap(nullptr, file_size, PROT_READ, MAP_PRIVATE | MAP_POPULATE, fd, 0);
+            // Choose mmap strategy based on NUMA binding requirement:
+            // - With NUMA binding: mmap without MAP_POPULATE, then mbind() to target node
+            // - Without NUMA binding: mmap with MAP_POPULATE for immediate pre-fault
+            int mmap_flags = MAP_PRIVATE;
+            if (!numa_bind)
+            {
+                mmap_flags |= MAP_POPULATE;
+            }
+
+            void *base = ::mmap(nullptr, file_size, PROT_READ, mmap_flags, fd, 0);
             if (base == MAP_FAILED)
             {
                 LOG_ERROR("[MmapRegion] mmap failed for " << file_path
@@ -159,13 +188,60 @@ namespace llaminar2
                 return nullptr;
             }
 
-            // Additional hint: we'll need all of this data
-            ::madvise(base, file_size, MADV_WILLNEED);
+#ifdef HAVE_NUMA
+            // Bind mmap pages to the target NUMA node before pre-faulting.
+            // This ensures all page-cache pages allocated for this mapping
+            // land on the correct NUMA node, avoiding cross-socket bandwidth
+            // penalties for memory-bandwidth-bound GEMV decode.
+            if (numa_bind && numa_available() >= 0)
+            {
+                unsigned long nodemask = 1UL << numa_node;
+                long rc = ::mbind(base, file_size, MPOL_BIND, &nodemask,
+                                  sizeof(nodemask) * 8, 0);
+                if (rc != 0)
+                {
+                    LOG_WARN("[MmapRegion] mbind to NUMA node " << numa_node
+                                                                << " failed (errno=" << errno << "), pages may be on wrong node");
+                }
+                else
+                {
+                    LOG_DEBUG("[MmapRegion] Bound " << (file_size / (1024 * 1024))
+                                                    << " MB to NUMA node " << numa_node);
+                }
+            }
+#endif
 
-            LOG_DEBUG("[MmapRegion] Mapped " << file_path << " (" << (file_size / (1024 * 1024)) << " MB)");
+            if (numa_bind)
+            {
+                // Explicit parallel first-touch: OMP threads inherit the process's
+                // cpu-set binding (e.g. cores 28-55 for cpu:1), so page faults from
+                // these threads allocate on the target NUMA node. This is more
+                // reliable than madvise(MADV_WILLNEED), whose async readahead
+                // completes on kernel worker threads that may be on any node.
+                const size_t page_size = 4096;
+                const size_t num_pages = (file_size + page_size - 1) / page_size;
+                const volatile uint8_t *p = static_cast<const volatile uint8_t *>(base);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+                for (size_t i = 0; i < num_pages; i++)
+                {
+                    (void)p[i * page_size];
+                }
+                LOG_DEBUG("[MmapRegion] Mapped " << file_path << " (" << (file_size / (1024 * 1024))
+                                                 << " MB) with NUMA first-touch on node " << numa_node
+                                                 << " (" << num_pages << " pages)");
+            }
+            else
+            {
+                // Non-NUMA path already pre-faulted via MAP_POPULATE
+                ::madvise(base, file_size, MADV_WILLNEED);
+                LOG_DEBUG("[MmapRegion] Mapped " << file_path << " (" << (file_size / (1024 * 1024)) << " MB)");
+            }
 
             return std::unique_ptr<MmapRegion>(new MmapRegion(base, file_size, fd, file_path));
 #else
+            (void)numa_node;
             LOG_WARN("[MmapRegion] mmap not supported on this platform, falling back to ifstream");
             return nullptr;
 #endif

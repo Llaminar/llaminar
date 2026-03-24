@@ -201,6 +201,31 @@ namespace llaminar2::primitives
         float epsilon);
 
     /**
+     * @brief Fused residual-add + RMSNorm for a single row (AVX-512)
+     *
+     * Computes in two passes over L1-resident data:
+     *   residual[i] += input[i]   (in-place update)
+     *   output[i] = gamma[i] * residual[i] / rms(residual)
+     *
+     * Optimized for M=1 decode where hidden_dim fits in L1 cache.
+     * Eliminates separate kernel dispatch and OMP overhead vs two calls.
+     *
+     * @param input   Input values to add to residual [cols]
+     * @param residual Residual stream, updated in-place [cols]
+     * @param gamma   RMSNorm scale weights [cols]
+     * @param output  Normalized output [cols]
+     * @param cols    Hidden dimension
+     * @param epsilon Numerical stability epsilon
+     */
+    void fused_residual_rmsnorm_row_avx512(
+        const float *input,
+        float *residual,
+        const float *gamma,
+        float *output,
+        std::size_t cols,
+        float epsilon);
+
+    /**
      * @brief RMSNorm per-row BF16 scalar implementation
      *
      * Computes RMSNorm for a single row using scalar arithmetic.

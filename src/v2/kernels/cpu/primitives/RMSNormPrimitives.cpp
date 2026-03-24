@@ -1544,6 +1544,80 @@ namespace llaminar2::primitives
             dst[c] = normalized;
         }
     }
+
+    void fused_residual_rmsnorm_row_avx512(
+        const float *input,
+        float *residual,
+        const float *gamma,
+        float *output,
+        std::size_t cols,
+        float epsilon)
+    {
+        // Pass 1: residual += input, accumulate sum of squares (double precision)
+        double sum_sq = 0.0;
+        std::size_t c = 0;
+
+        __m512d acc0 = _mm512_setzero_pd();
+        __m512d acc1 = _mm512_setzero_pd();
+
+        for (; c + 32 <= cols; c += 32)
+        {
+            // First 16 floats
+            __m512 v_in0 = _mm512_loadu_ps(input + c);
+            __m512 v_res0 = _mm512_loadu_ps(residual + c);
+            v_res0 = _mm512_add_ps(v_res0, v_in0);
+            _mm512_storeu_ps(residual + c, v_res0);
+
+            __m256 lo0 = _mm512_castps512_ps256(v_res0);
+            __m256 hi0 = _mm256_castsi256_ps(
+                _mm512_extracti64x4_epi64(_mm512_castps_si512(v_res0), 1));
+            acc0 = _mm512_fmadd_pd(_mm512_cvtps_pd(lo0), _mm512_cvtps_pd(lo0), acc0);
+            acc0 = _mm512_fmadd_pd(_mm512_cvtps_pd(hi0), _mm512_cvtps_pd(hi0), acc0);
+
+            // Next 16 floats
+            __m512 v_in1 = _mm512_loadu_ps(input + c + 16);
+            __m512 v_res1 = _mm512_loadu_ps(residual + c + 16);
+            v_res1 = _mm512_add_ps(v_res1, v_in1);
+            _mm512_storeu_ps(residual + c + 16, v_res1);
+
+            __m256 lo1 = _mm512_castps512_ps256(v_res1);
+            __m256 hi1 = _mm256_castsi256_ps(
+                _mm512_extracti64x4_epi64(_mm512_castps_si512(v_res1), 1));
+            acc1 = _mm512_fmadd_pd(_mm512_cvtps_pd(lo1), _mm512_cvtps_pd(lo1), acc1);
+            acc1 = _mm512_fmadd_pd(_mm512_cvtps_pd(hi1), _mm512_cvtps_pd(hi1), acc1);
+        }
+
+        sum_sq += _mm512_reduce_add_pd(acc0);
+        sum_sq += _mm512_reduce_add_pd(acc1);
+
+        // Scalar tail for pass 1
+        for (; c < cols; ++c)
+        {
+            residual[c] += input[c];
+            sum_sq += static_cast<double>(residual[c]) * static_cast<double>(residual[c]);
+        }
+
+        // Compute inverse RMS
+        float rms = std::sqrt(static_cast<float>(sum_sq / cols) + epsilon);
+        float inv_rms = 1.0f / rms;
+        __m512 inv_rms_vec = _mm512_set1_ps(inv_rms);
+
+        // Pass 2: output = gamma * residual * inv_rms
+        c = 0;
+        for (; c + 16 <= cols; c += 16)
+        {
+            __m512 v_res = _mm512_loadu_ps(residual + c);
+            __m512 v_gamma = _mm512_loadu_ps(gamma + c);
+            __m512 normalized = _mm512_mul_ps(_mm512_mul_ps(v_res, inv_rms_vec), v_gamma);
+            _mm512_storeu_ps(output + c, normalized);
+        }
+
+        // Scalar tail for pass 2
+        for (; c < cols; ++c)
+        {
+            output[c] = residual[c] * inv_rms * gamma[c];
+        }
+    }
 #endif
 
     // ========================================================================

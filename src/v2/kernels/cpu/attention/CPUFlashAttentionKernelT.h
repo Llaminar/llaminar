@@ -643,6 +643,39 @@ namespace llaminar2
                 return false;
             }
 
+            // ---------------------------------------------------------------
+            // FP16 KV decode fast-path: read FP16 directly, no FP32 buffer.
+            // This halves KV memory bandwidth and eliminates DRAM bank
+            // disturbance that degrades subsequent GEMM at long context.
+            // ---------------------------------------------------------------
+#if defined(__AVX512F__) && defined(__F16C__)
+            if (kv_len != seq_len && batch_size == 1 &&
+                K->native_type() == TensorType::FP16 &&
+                V->native_type() == TensorType::FP16)
+            {
+                const auto *K_fp16 = dynamic_cast<const FP16Tensor *>(K);
+                const auto *V_fp16 = dynamic_cast<const FP16Tensor *>(V);
+                if (K_fp16 && V_fp16)
+                {
+                    const float *Q_ptr = Q_base->fp32_data();
+                    float *O_ptr = O_base->mutable_data();
+                    if (Q_ptr && O_ptr)
+                    {
+                        const int position_offset = (kv_len > seq_len)
+                                                        ? (kv_len - seq_len)
+                                                        : 0;
+                        return compute_decode_fp16kv(
+                            Q_ptr,
+                            K_fp16->typed_data(),
+                            V_fp16->typed_data(),
+                            O_ptr,
+                            kv_len, n_heads, n_kv_heads, head_dim,
+                            causal, position_offset);
+                    }
+                }
+            }
+#endif
+
             const float *Q_ptr = Q_base->fp32_data();
             const float *K_ptr = K_base->fp32_data();
             const float *V_ptr = V_base->fp32_data();
@@ -786,7 +819,7 @@ namespace llaminar2
             // Clamp to avoid NaN from -inf inputs (exp(-88.7) ≈ 0)
             x = _mm512_max_ps(x, _mm512_set1_ps(-88.722839f));
 
-            const __m512 log2e  = _mm512_set1_ps(1.4426950408889634f);
+            const __m512 log2e = _mm512_set1_ps(1.4426950408889634f);
             const __m512 ln2_hi = _mm512_set1_ps(0.693145751953125f);
             const __m512 ln2_lo = _mm512_set1_ps(1.42860682030941723212e-06f);
 
@@ -797,7 +830,7 @@ namespace llaminar2
             f = _mm512_fnmadd_ps(n, ln2_lo, f);
 
             // Horner evaluation of exp(f) ≈ 1 + f + f²/2 + f³/6 + f⁴/24 + f⁵/120
-            __m512 p = _mm512_set1_ps(8.36564774e-03f);              // ≈ 1/120
+            __m512 p = _mm512_set1_ps(8.36564774e-03f);                 // ≈ 1/120
             p = _mm512_fmadd_ps(p, f, _mm512_set1_ps(4.16689515e-02f)); // ≈ 1/24
             p = _mm512_fmadd_ps(p, f, _mm512_set1_ps(1.66666716e-01f)); // ≈ 1/6
             p = _mm512_fmadd_ps(p, f, _mm512_set1_ps(4.99999851e-01f)); // ≈ 1/2
@@ -857,6 +890,126 @@ namespace llaminar2
                 s3 += qd * k3[d];
             }
         }
+
+        // =================================================================
+        // FP16 KV helpers — load FP16, convert to FP32, compute
+        // =================================================================
+
+        /**
+         * @brief Dot product of FP32 query × FP16 key with on-the-fly conversion.
+         *
+         * Reads 16 FP16 values at a time (32 bytes), converts to FP32 via
+         * vcvtph2ps, then FMA-accumulates against the FP32 query vector.
+         * Half the KV memory bandwidth vs the FP32 path.
+         */
+        static float dot_fp16_avx512(const float *q, const uint16_t *k, int head_dim)
+        {
+            __m512 acc = _mm512_setzero_ps();
+            int d = 0;
+            for (; d + 15 < head_dim; d += 16)
+            {
+                __m512 vq = _mm512_loadu_ps(q + d);
+                __m256i k16 = _mm256_loadu_si256(
+                    reinterpret_cast<const __m256i *>(k + d));
+                __m512 vk = _mm512_cvtph_ps(k16);
+                acc = _mm512_fmadd_ps(vq, vk, acc);
+            }
+            float sum = _mm512_reduce_add_ps(acc);
+            for (; d < head_dim; ++d)
+            {
+                // Scalar FP16→FP32 conversion for tail elements
+                __m128i h = _mm_set1_epi16(static_cast<short>(k[d]));
+                float kf = _mm_cvtss_f32(_mm_cvtph_ps(h));
+                sum += q[d] * kf;
+            }
+            return sum;
+        }
+
+        /**
+         * @brief 4-row batched dot product: FP32 Q × FP16 K for ILP.
+         */
+        static void dot_fp16_avx512_4row(
+            const float *q,
+            const uint16_t *k0, const uint16_t *k1,
+            const uint16_t *k2, const uint16_t *k3,
+            int head_dim,
+            float &s0, float &s1, float &s2, float &s3)
+        {
+            __m512 acc0 = _mm512_setzero_ps();
+            __m512 acc1 = _mm512_setzero_ps();
+            __m512 acc2 = _mm512_setzero_ps();
+            __m512 acc3 = _mm512_setzero_ps();
+
+            int d = 0;
+            for (; d + 15 < head_dim; d += 16)
+            {
+                __m512 vq = _mm512_loadu_ps(q + d);
+                acc0 = _mm512_fmadd_ps(vq, _mm512_cvtph_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i *>(k0 + d))), acc0);
+                acc1 = _mm512_fmadd_ps(vq, _mm512_cvtph_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i *>(k1 + d))), acc1);
+                acc2 = _mm512_fmadd_ps(vq, _mm512_cvtph_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i *>(k2 + d))), acc2);
+                acc3 = _mm512_fmadd_ps(vq, _mm512_cvtph_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i *>(k3 + d))), acc3);
+            }
+
+            s0 = _mm512_reduce_add_ps(acc0);
+            s1 = _mm512_reduce_add_ps(acc1);
+            s2 = _mm512_reduce_add_ps(acc2);
+            s3 = _mm512_reduce_add_ps(acc3);
+
+            for (; d < head_dim; ++d)
+            {
+                float qd = q[d];
+                auto cvt = [](uint16_t h)
+                {
+                    return _mm_cvtss_f32(_mm_cvtph_ps(_mm_set1_epi16(static_cast<short>(h))));
+                };
+                s0 += qd * cvt(k0[d]);
+                s1 += qd * cvt(k1[d]);
+                s2 += qd * cvt(k2[d]);
+                s3 += qd * cvt(k3[d]);
+            }
+        }
+
+        /**
+         * @brief Weighted V accumulation: out[d] += weight * FP16_to_FP32(v[d]).
+         */
+        static void accum_weighted_v_fp16(
+            float *out, const uint16_t *v, float weight, int head_dim)
+        {
+            __m512 w = _mm512_set1_ps(weight);
+            int d = 0;
+            for (; d + 15 < head_dim; d += 16)
+            {
+                __m512 o = _mm512_loadu_ps(out + d);
+                __m256i v16 = _mm256_loadu_si256(
+                    reinterpret_cast<const __m256i *>(v + d));
+                __m512 vv = _mm512_cvtph_ps(v16);
+                o = _mm512_fmadd_ps(vv, w, o);
+                _mm512_storeu_ps(out + d, o);
+            }
+            for (; d < head_dim; ++d)
+            {
+                __m128i h = _mm_set1_epi16(static_cast<short>(v[d]));
+                out[d] += weight * _mm_cvtss_f32(_mm_cvtph_ps(h));
+            }
+        }
+
+        /**
+         * @brief Scale a vector by a scalar: out[d] *= alpha (FP32, AVX-512).
+         * Duplicated from scale_vec to avoid dependency on use_avx512 bool.
+         */
+        static void scale_vec_fp16path(float *out, float alpha, int head_dim)
+        {
+            __m512 a = _mm512_set1_ps(alpha);
+            int d = 0;
+            for (; d + 15 < head_dim; d += 16)
+            {
+                _mm512_storeu_ps(out + d, _mm512_mul_ps(a, _mm512_loadu_ps(out + d)));
+            }
+            for (; d < head_dim; ++d)
+            {
+                out[d] *= alpha;
+            }
+        }
 #endif
 
         /**
@@ -879,8 +1032,7 @@ namespace llaminar2
             const int64_t avg_kv = causal ? (static_cast<int64_t>(kv_len) + 1) / 2
                                           : static_cast<int64_t>(kv_len);
             const int64_t flops_per_head =
-                static_cast<int64_t>(seq_len) * avg_kv * static_cast<int64_t>(head_dim) * 4
-                + static_cast<int64_t>(seq_len) * avg_kv * 10; // exp + softmax overhead
+                static_cast<int64_t>(seq_len) * avg_kv * static_cast<int64_t>(head_dim) * 4 + static_cast<int64_t>(seq_len) * avg_kv * 10; // exp + softmax overhead
             const int64_t total_flops = flops_per_head * n_heads;
 
             // Minimum FLOPs per thread to justify OMP overhead
@@ -1953,11 +2105,16 @@ namespace llaminar2
                                         kbase + static_cast<size_t>(k + 2) * kv_stride,
                                         kbase + static_cast<size_t>(k + 3) * kv_stride,
                                         head_dim, s0, s1, s2, s3);
-                                    s0 *= scale; s1 *= scale; s2 *= scale; s3 *= scale;
+                                    s0 *= scale;
+                                    s1 *= scale;
+                                    s2 *= scale;
+                                    s3 *= scale;
                                     if (mask_row)
                                     {
-                                        s0 += mask_row[k + 0]; s1 += mask_row[k + 1];
-                                        s2 += mask_row[k + 2]; s3 += mask_row[k + 3];
+                                        s0 += mask_row[k + 0];
+                                        s1 += mask_row[k + 1];
+                                        s2 += mask_row[k + 2];
+                                        s3 += mask_row[k + 3];
                                     }
                                     block_scores[static_cast<size_t>(k - k0 + 0)] = s0;
                                     block_scores[static_cast<size_t>(k - k0 + 1)] = s1;
@@ -2044,12 +2201,42 @@ namespace llaminar2
                 } // end head loop
             };
 
-            // Execute with adaptive thread count.  For small problems
-            // (decode, short prefill), fewer threads avoids OMP overhead
-            // that otherwise dominates the tiny per-head compute.
-#pragma omp parallel num_threads(attn_threads)
+            // DECODE THREADING STRATEGY: prevent libgomp thread pool sleep.
+            //
+            // When kv_len is large enough that attention takes >~200μs
+            // (roughly kv_len > 100 for this model), the idle gap between the
+            // last OMP region (RoPE) and the next one (Wo GEMV) causes libgomp
+            // to put worker threads to futex-sleep. Waking 27 threads costs
+            // ~5ms via futex(FUTEX_WAKE), which was the root cause of decode
+            // degradation from 10→4 tok/s at long context.
+            //
+            // Fix: for decode at kv_len > 100, use ALL threads in the
+            // attention OMP region. This keeps the thread pool alive between
+            // RoPE and Wo. Each thread handles ~1 head (28 heads / 28 threads).
+            //
+            // For short context (kv_len <= 100) or prefill, use the heuristic
+            // thread count — threads stay within libgomp's spin window and
+            // Wo GEMV fork is fast regardless.
+            //
+            // Note: OMP_WAIT_POLICY=active and GOMP_SPINCOUNT=infinite do NOT
+            // prevent the inter-region sleep; libgomp's team-end idle path has
+            // a fixed spin count independent of these settings.
+            const bool is_decode_phase = (kv_len != seq_len);
+            const bool force_full_pool = is_decode_phase && kv_len > 100;
+
+            if (force_full_pool)
             {
-                work();
+#pragma omp parallel
+                {
+                    work();
+                }
+            }
+            else
+            {
+#pragma omp parallel num_threads(attn_threads)
+                {
+                    work();
+                }
             }
 
             // Report profiling breakdown (QK vs V phase) if enabled.
@@ -2064,6 +2251,205 @@ namespace llaminar2
             }
             return true;
         }
+
+#if defined(__AVX512F__) && defined(__F16C__)
+        /**
+         * @brief Decode-only flash attention with FP16 KV cache (no FP32 copy).
+         *
+         * Reads K and V directly as FP16, converting to FP32 on the fly in the
+         * dot product and V accumulation inner loops. This halves KV memory
+         * bandwidth and eliminates the need for persistent FP32 KV buffers,
+         * reducing DRAM bank disturbance that causes GEMM throughput degradation
+         * at long context (>300 tokens).
+         *
+         * Only supports the decode path (seq_len == 1, kv_len >= 1).
+         */
+        static bool compute_decode_fp16kv(
+            const float *Q,
+            const uint16_t *K_fp16, const uint16_t *V_fp16,
+            float *output,
+            int kv_len,
+            int n_heads, int n_kv_heads, int head_dim,
+            bool causal, int position_offset)
+        {
+            KERNEL_PROFILE_SCOPE(KernelType::ATTENTION);
+
+            if (!Q || !K_fp16 || !V_fp16 || !output)
+                return false;
+            if (kv_len <= 0 || n_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0)
+                return false;
+            if (n_heads % n_kv_heads != 0)
+                return false;
+
+            const int heads_per_kv = n_heads / n_kv_heads;
+            const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+            const int q_stride = n_heads * head_dim;
+            const int kv_stride = n_kv_heads * head_dim;
+
+            // KV tile size for decode
+            const bool is_decode = true;
+            const int kv_tile = detail::DefaultFlashKVTilePolicy::choose(
+                head_dim, n_kv_heads, kv_len, is_decode);
+
+            const bool profiling_enabled = KernelProfiler::isEnabled();
+            uint64_t qk_duration_ns = 0;
+            uint64_t v_duration_ns = 0;
+
+            const int attn_threads = computeOptimalAttentionThreads(
+                n_heads, 1, kv_len, head_dim, causal);
+
+            auto work = [&]()
+            {
+#pragma omp for schedule(static) reduction(+ : qk_duration_ns, v_duration_ns)
+                for (int h = 0; h < n_heads; ++h)
+                {
+                    const int kv_h = h / heads_per_kv;
+                    float *out = output + static_cast<size_t>(h) * head_dim;
+                    std::fill(out, out + head_dim, 0.0f);
+
+                    float running_m = -std::numeric_limits<float>::infinity();
+                    float running_l = 0.0f;
+
+                    const float *q_ptr = Q + static_cast<size_t>(h) * head_dim;
+                    const int q_abs = position_offset;
+
+                    thread_local std::vector<float> block_scores;
+
+                    for (int k0 = 0; k0 < kv_len; k0 += kv_tile)
+                    {
+                        const int k1 = std::min(k0 + kv_tile, kv_len);
+                        float block_max = -std::numeric_limits<float>::infinity();
+
+                        const int blk = k1 - k0;
+                        if (static_cast<int>(block_scores.size()) < blk)
+                            block_scores.resize(blk);
+
+                        // Valid window for causal masking
+                        int valid_end = causal ? std::min(k1, q_abs + 1) : k1;
+                        valid_end = std::max(k0, std::min(valid_end, k1));
+
+                        // Fill masked positions
+                        for (int k = valid_end; k < k1; ++k)
+                            block_scores[static_cast<size_t>(k - k0)] = -std::numeric_limits<float>::infinity();
+
+                        const auto qk_start = profiling_enabled
+                                                  ? std::chrono::steady_clock::now()
+                                                  : std::chrono::steady_clock::time_point();
+
+                        // --- QK Phase: FP16 K dot products ---
+                        for (int k = k0; k < valid_end;)
+                        {
+                            const uint16_t *kbase = K_fp16 + static_cast<size_t>(kv_h) * head_dim;
+
+                            if (k + 3 < valid_end)
+                            {
+                                float s0, s1, s2, s3;
+                                dot_fp16_avx512_4row(
+                                    q_ptr,
+                                    kbase + static_cast<size_t>(k + 0) * kv_stride,
+                                    kbase + static_cast<size_t>(k + 1) * kv_stride,
+                                    kbase + static_cast<size_t>(k + 2) * kv_stride,
+                                    kbase + static_cast<size_t>(k + 3) * kv_stride,
+                                    head_dim, s0, s1, s2, s3);
+                                s0 *= scale;
+                                s1 *= scale;
+                                s2 *= scale;
+                                s3 *= scale;
+                                block_scores[static_cast<size_t>(k - k0 + 0)] = s0;
+                                block_scores[static_cast<size_t>(k - k0 + 1)] = s1;
+                                block_scores[static_cast<size_t>(k - k0 + 2)] = s2;
+                                block_scores[static_cast<size_t>(k - k0 + 3)] = s3;
+                                block_max = std::max(block_max, std::max(std::max(s0, s1), std::max(s2, s3)));
+                                k += 4;
+                                continue;
+                            }
+
+                            float s = dot_fp16_avx512(
+                                q_ptr,
+                                K_fp16 + static_cast<size_t>(k) * kv_stride + static_cast<size_t>(kv_h) * head_dim,
+                                head_dim);
+                            s *= scale;
+                            block_scores[static_cast<size_t>(k - k0)] = s;
+                            block_max = std::max(block_max, s);
+                            ++k;
+                        }
+
+                        if (profiling_enabled)
+                            qk_duration_ns += static_cast<uint64_t>(
+                                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                    std::chrono::steady_clock::now() - qk_start)
+                                    .count());
+
+                        // --- Online softmax correction ---
+                        const float new_m = std::max(running_m, block_max);
+                        const float alpha = std::isfinite(running_m)
+                                                ? std::exp(running_m - new_m)
+                                                : 0.0f;
+                        scale_vec_fp16path(out, alpha, head_dim);
+                        float new_l = running_l * alpha;
+
+                        // --- V Phase: FP16 V weighted accumulation ---
+                        const auto v_start = profiling_enabled
+                                                 ? std::chrono::steady_clock::now()
+                                                 : std::chrono::steady_clock::time_point();
+
+                        for (int k = k0; k < k1; ++k)
+                        {
+                            const float s = block_scores[static_cast<size_t>(k - k0)];
+                            if (!std::isfinite(s))
+                                continue;
+                            const float p = std::exp(s - new_m);
+                            new_l += p;
+                            const uint16_t *v_ptr = V_fp16 + static_cast<size_t>(k) * kv_stride + static_cast<size_t>(kv_h) * head_dim;
+                            accum_weighted_v_fp16(out, v_ptr, p, head_dim);
+                        }
+
+                        if (profiling_enabled)
+                            v_duration_ns += static_cast<uint64_t>(
+                                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                    std::chrono::steady_clock::now() - v_start)
+                                    .count());
+
+                        running_m = new_m;
+                        running_l = new_l;
+                    } // end KV tile loop
+
+                    // Final normalisation
+                    if (running_l > 0.0f)
+                    {
+                        float inv_l = 1.0f / running_l;
+                        scale_vec_fp16path(out, inv_l, head_dim);
+                    }
+                } // end head loop
+            };
+
+            // Same decode threading fix as FP32 path — see detailed comment there.
+            // This path is always decode (kv_len != seq_len by construction).
+            const bool force_full_pool_fp16 = kv_len > 100;
+
+            if (force_full_pool_fp16)
+            {
+#pragma omp parallel
+                {
+                    work();
+                }
+            }
+            else
+            {
+#pragma omp parallel num_threads(attn_threads)
+                {
+                    work();
+                }
+            }
+
+            if (profiling_enabled)
+            {
+                KernelProfiler::recordParallel(KernelType::ATTENTION_QK, qk_duration_ns, attn_threads);
+                KernelProfiler::recordParallel(KernelType::ATTENTION_V, v_duration_ns, attn_threads);
+            }
+            return true;
+        }
+#endif // __AVX512F__ && __F16C__
     };
 
     extern template class CPUFlashAttentionKernelT<ActivationPrecision::FP32>;

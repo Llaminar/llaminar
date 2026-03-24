@@ -446,10 +446,13 @@ namespace llaminar2
             LOG_DEBUG("  Split files: " << model_.split_count);
         }
 
-        // Memory-map the file for zero-syscall tensor loading
+        // Memory-map the file for zero-syscall tensor loading.
+        // Pass NUMA node so mmap pages are bound to the correct socket,
+        // avoiding cross-NUMA bandwidth penalties during GEMV decode.
+        const int mmap_numa_node = factory_ ? factory_->getNumaNode() : -1;
         if (use_mmap_)
         {
-            mmap_region_ = MmapRegion::create(file_path);
+            mmap_region_ = MmapRegion::create(file_path, mmap_numa_node);
             if (mmap_region_)
             {
                 LOG_INFO("[ModelLoader] mmap enabled: " << file_path
@@ -461,7 +464,7 @@ namespace llaminar2
                     split_mmap_regions_.resize(model_.split_count - 1);
                     for (uint16_t idx = 1; idx < model_.split_count; ++idx)
                     {
-                        split_mmap_regions_[idx - 1] = MmapRegion::create(model_.split_paths[idx]);
+                        split_mmap_regions_[idx - 1] = MmapRegion::create(model_.split_paths[idx], mmap_numa_node);
                         if (!split_mmap_regions_[idx - 1])
                         {
                             LOG_WARN("[ModelLoader] Failed to mmap split file " << idx

@@ -375,6 +375,7 @@ namespace llaminar2
             CUDAKernelProfiler::setCurrentPhase(CUDAKernelProfiler::Phase::PREFILL);
             ROCmKernelProfiler::setCurrentPhase(ROCmKernelProfiler::Phase::PREFILL);
             KVCacheProfiler::setCurrentPhase(KVCacheProfiler::Phase::PREFILL);
+            GraphExecutorStats::setCurrentPhase(ExecutionPhase::PREFILL);
             auto [prefill_success, prefill_time] = runPrefill(tokens);
             if (!prefill_success)
             {
@@ -393,6 +394,7 @@ namespace llaminar2
                 CUDAKernelProfiler::setCurrentPhase(CUDAKernelProfiler::Phase::DECODE);
                 ROCmKernelProfiler::setCurrentPhase(ROCmKernelProfiler::Phase::DECODE);
                 KVCacheProfiler::setCurrentPhase(KVCacheProfiler::Phase::DECODE);
+                GraphExecutorStats::setCurrentPhase(ExecutionPhase::DECODE);
                 int eos_token = tokenizer_->eos_token();
                 auto [decode_success, decode_time, tokens_generated, generated_text] =
                     runDecode(n_decode, eos_token);
@@ -581,8 +583,9 @@ namespace llaminar2
             const auto *stats = runner_->executorStats();
             if (stats && stats->total_stages_executed > 0)
             {
-                // Pass decode tokens for per-token calculations
-                stats->printProfilingSummary(result.decode_tokens);
+                uint64_t ep_prefill = result.prefill_tokens * BENCHMARK_ITERATIONS;
+                uint64_t ep_decode = result.decode_tokens * BENCHMARK_ITERATIONS;
+                stats->printProfilingSummary(ep_prefill, ep_decode);
             }
         }
 

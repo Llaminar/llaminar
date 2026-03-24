@@ -6264,6 +6264,22 @@ add_v2_test(V2_Perf_CPUNativeVNNI_DispatchSweep
     MPI_PROCS 1
 )
 
+# Performance Test: CPU NativeVNNI GEMV Decode Sweep (native Q8_0 vs packed VNNI, all models)
+add_executable(v2_perf_cpu_native_vnni_gemv performance/kernels/cpu/native_vnni/Perf__CPUNativeVNNI_GEMV.cpp)
+target_link_libraries(v2_perf_cpu_native_vnni_gemv
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+target_include_directories(v2_perf_cpu_native_vnni_gemv PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}  # For tests/v2/utils/ includes (TestTensorFactory)
+)
+add_v2_test(V2_Perf_CPUNativeVNNI_GEMV
+    COMMAND $<TARGET_FILE:v2_perf_cpu_native_vnni_gemv>
+    LABELS "V2;Performance;GEMV;NativeVNNI;CPU;Q8_0;Decode;Qwen;Tuning"
+    MPI_PROCS 1
+)
+
 # Performance Test: NativeVNNI vs oneDNN Reference (INT8 matmul baseline comparison)
 if(ONEDNN_LIB)
     add_executable(v2_perf_onednn_reference performance/kernels/cpu/native_vnni/Perf__OneDNN_Reference.cpp)

@@ -28,7 +28,6 @@
 
 #include "CPUNativeVNNIWeightPacker.h"
 #include "CPUNativeVNNIGemv.h"
-#include "Q8_0NativeGemv.h"
 #include "tensors/TensorKernels.h"
 #include "tensors/TensorClasses.h"
 #include "kernels/cpu/primitives/SwiGLUPrimitives.h"
@@ -153,25 +152,15 @@ namespace llaminar2::cpu::native_vnni
                 // Optimized GEMV path
                 if (beta == 0.0f && alpha == 1.0f)
                 {
-#if defined(__AVX512F__)
-                    if (native_q8_0_blocks_)
-                        q8_0_native_gemv(native_q8_0_blocks_, A_data, C_data,
-                                         n, k, native_q8_0_bpr_);
-                    else
-#endif
-                        gemv_native_vnni(packed_, A_data, C_data);
+                    gemv_native_vnni(packed_, A_data, C_data,
+                                     native_q8_0_blocks_, native_q8_0_bpr_);
                 }
                 else
                 {
                     // General case: C = alpha * A@B + beta * C
                     std::vector<float> temp(n);
-#if defined(__AVX512F__)
-                    if (native_q8_0_blocks_)
-                        q8_0_native_gemv(native_q8_0_blocks_, A_data, temp.data(),
-                                           n, k, native_q8_0_bpr_);
-                    else
-#endif
-                        gemv_native_vnni(packed_, A_data, temp.data());
+                    gemv_native_vnni(packed_, A_data, temp.data(),
+                                     native_q8_0_blocks_, native_q8_0_bpr_);
                     for (int j = 0; j < n; ++j)
                         C_data[j] += alpha * temp[j];
                 }

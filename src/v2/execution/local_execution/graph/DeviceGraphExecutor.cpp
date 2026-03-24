@@ -218,19 +218,13 @@ namespace llaminar2
     // GraphExecutorStats Implementation
     // =============================================================================
 
-    void GraphExecutorStats::printProfilingSummary(size_t decode_tokens) const
+    thread_local ExecutionPhase GraphExecutorStats::current_phase_ = ExecutionPhase::COMBINED;
+
+    void GraphExecutorStats::printPhaseTable(const std::string &title, const PhaseStats &phase, size_t tokens) const
     {
-        // Calculate totals
-        double total_overhead = overhead.total();
-        double total_all = total_execute_ms + total_overhead;
+        if (phase.total_stages_executed == 0)
+            return;
 
-        // Calculate per-token averages if we have decode tokens
-        double stages_per_token = decode_tokens > 0 ? static_cast<double>(total_stages_executed) / decode_tokens : 0;
-        double execute_per_token = decode_tokens > 0 ? total_execute_ms / decode_tokens : 0;
-        double overhead_per_token = decode_tokens > 0 ? total_overhead / decode_tokens : 0;
-        (void)execute_per_token; // Used in efficiency section
-
-        // Helper to format a double with fixed precision
         auto fmt = [](double val, int prec) -> std::string
         {
             std::ostringstream oss;
@@ -238,105 +232,145 @@ namespace llaminar2
             return oss.str();
         };
 
-        // Helper to format percentage
+        auto per_tok = [&](double val) -> std::string
+        {
+            if (tokens == 0)
+                return "-";
+            return fmt(val / tokens, 3);
+        };
+
+        fort::utf8_table table;
+        table.set_border_style(FT_DOUBLE2_STYLE);
+
+        // Title row
+        {
+            std::ostringstream oss;
+            oss << title << " (" << tokens << " tokens)";
+            table << oss.str() << "" << "" << "" << "" << fort::endr;
+            table[0][0].set_cell_span(5);
+            table[0][0].set_cell_text_align(fort::text_align::center);
+            table.row(0).set_cell_content_fg_color(fort::color::light_cyan);
+        }
+
+        // Header
+        table << fort::header << "STAGE TYPE" << "CALLS" << "TOTAL (ms)" << "PER-TOKEN (ms)" << "%" << fort::endr;
+        table.column(0).set_cell_text_align(fort::text_align::left);
+        table.column(1).set_cell_text_align(fort::text_align::right);
+        table.column(2).set_cell_text_align(fort::text_align::right);
+        table.column(3).set_cell_text_align(fort::text_align::right);
+        table.column(4).set_cell_text_align(fort::text_align::right);
+
+        // Sort by time descending
+        std::vector<std::pair<std::string, double>> rows(
+            phase.stage_type_execute_ms.begin(), phase.stage_type_execute_ms.end());
+        std::sort(rows.begin(), rows.end(),
+                  [](const auto &a, const auto &b)
+                  { return a.second > b.second; });
+
+        for (const auto &[stage_type, ms] : rows)
+        {
+            size_t count = 0;
+            auto it = phase.stage_type_counts.find(stage_type);
+            if (it != phase.stage_type_counts.end())
+                count = it->second;
+            double share = phase.total_execute_ms > 0 ? (ms / phase.total_execute_ms) * 100.0 : 0;
+            table << stage_type << std::to_string(count) << fmt(ms, 2) << per_tok(ms) << (fmt(share, 1) + "%") << fort::endr;
+        }
+
+        // Total + overhead
+        double phase_overhead = phase.overhead.total();
+        double phase_all = phase.total_execute_ms + phase_overhead;
+        table << fort::separator;
+        table << "TOTAL KERNEL" << "" << fmt(phase.total_execute_ms, 2) << per_tok(phase.total_execute_ms) << "" << fort::endr;
+        if (phase_overhead > 0.01)
+        {
+            table << "TOTAL OVERHEAD" << "" << fmt(phase_overhead, 2) << per_tok(phase_overhead) << "" << fort::endr;
+        }
+
+        // Throughput
+        if (tokens > 0 && phase_all > 0)
+        {
+            double toks_per_sec = (tokens / phase_all) * 1000.0;
+            std::ostringstream oss;
+            oss << fmt(toks_per_sec, 2) << " tok/s  |  " << fmt(phase_all / tokens, 3) << " ms/token";
+            if (phase.total_collective_calls > 0)
+                oss << "  |  collective: " << fmt(phase.total_collective_ms, 2) << " ms (" << phase.total_collective_calls << " calls)";
+            table << fort::separator;
+            table << oss.str() << "" << "" << "" << "" << fort::endr;
+            table[table.row_count() - 1][0].set_cell_span(5);
+        }
+
+        std::print("\n{}", table.to_string());
+    }
+
+    void GraphExecutorStats::printProfilingSummary(size_t prefill_tokens, size_t decode_tokens) const
+    {
+        // Print per-phase tables first (the useful ones)
+        printPhaseTable("EXECUTOR STAGE PROFILING — PREFILL", prefill, prefill_tokens);
+        printPhaseTable("EXECUTOR STAGE PROFILING — DECODE", decode, decode_tokens);
+
+        // Calculate totals for overhead summary
+        double total_overhead = overhead.total();
+        double total_all = total_execute_ms + total_overhead;
+        size_t total_tokens = prefill_tokens + decode_tokens;
+
+        auto fmt = [](double val, int prec) -> std::string
+        {
+            std::ostringstream oss;
+            oss << std::fixed << std::setprecision(prec) << val;
+            return oss.str();
+        };
+
         auto pct = [&](double val) -> std::string
         {
             double p = total_all > 0 ? (val / total_all) * 100.0 : 0;
             return fmt(p, 1) + "%";
         };
 
-        // Helper to format per-token value
         auto per_tok = [&](double val) -> std::string
         {
-            if (decode_tokens == 0)
+            if (total_tokens == 0)
                 return "-";
-            return fmt(val / decode_tokens, 3);
+            return fmt(val / total_tokens, 3);
         };
 
-        // Build the table
+        // Combined overhead table
         fort::utf8_table table;
         table.set_border_style(FT_DOUBLE2_STYLE);
 
-        // Title row (spans all columns)
-        table << "EXECUTOR OVERHEAD PROFILING SUMMARY" << "" << "" << "" << fort::endr;
+        table << "EXECUTOR OVERHEAD SUMMARY (COMBINED)" << "" << "" << "" << fort::endr;
         table[0][0].set_cell_span(4);
         table[0][0].set_cell_text_align(fort::text_align::center);
         table.row(0).set_cell_content_fg_color(fort::color::light_cyan);
 
-        // Summary info
         {
             std::ostringstream oss;
-            oss << "Total stages executed: " << total_stages_executed;
-            if (decode_tokens > 0)
-                oss << "  (" << fmt(stages_per_token, 1) << " stages/token)";
+            oss << "Total stages: " << total_stages_executed
+                << "  |  Prefill: " << prefill.total_stages_executed
+                << " (" << prefill_tokens << " tok)"
+                << "  |  Decode: " << decode.total_stages_executed
+                << " (" << decode_tokens << " tok)";
             table << oss.str() << "" << "" << "" << fort::endr;
             table[1][0].set_cell_span(4);
         }
 
-        // Header row
         table << fort::header << "CATEGORY" << "TOTAL (ms)" << "PER-TOKEN (ms)" << "%" << fort::endr;
-
-        // Column alignments
         table.column(0).set_cell_text_align(fort::text_align::left);
         table.column(1).set_cell_text_align(fort::text_align::right);
         table.column(2).set_cell_text_align(fort::text_align::right);
         table.column(3).set_cell_text_align(fort::text_align::right);
 
-        // Kernel execution (total)
         table << "Kernel Execution" << fmt(total_execute_ms, 2) << per_tok(total_execute_ms) << pct(total_execute_ms) << fort::endr;
-
-        // Collective vs Compute breakdown (only when there are collectives)
         if (total_collective_calls > 0)
         {
             double compute_ms = total_execute_ms - total_collective_ms;
-            double avg_collective_us = total_collective_calls > 0
-                                           ? (total_collective_ms / total_collective_calls) * 1000.0
-                                           : 0.0;
-
             table << "  Compute (kernels)" << fmt(compute_ms, 2) << per_tok(compute_ms) << pct(compute_ms) << fort::endr;
-
-            {
-                std::ostringstream label;
-                label << "  Collective (" << total_collective_calls << " calls, "
-                      << fmt(avg_collective_us, 1) << " us avg)";
-                table << label.str() << fmt(total_collective_ms, 2) << per_tok(total_collective_ms) << pct(total_collective_ms) << fort::endr;
-            }
+            std::ostringstream label;
+            label << "  Collective (" << total_collective_calls << " calls)";
+            table << label.str() << fmt(total_collective_ms, 2) << per_tok(total_collective_ms) << pct(total_collective_ms) << fort::endr;
         }
 
-        if (!stage_type_execute_ms.empty())
-        {
-            table << fort::separator;
-            table << "STAGE EXECUTION BY TYPE:" << "" << "" << "" << fort::endr;
-
-            std::vector<std::pair<std::string, double>> stage_type_rows(
-                stage_type_execute_ms.begin(), stage_type_execute_ms.end());
-            std::sort(stage_type_rows.begin(), stage_type_rows.end(),
-                      [](const auto &a, const auto &b)
-                      {
-                          return a.second > b.second;
-                      });
-
-            for (const auto &[stage_type, execute_ms_by_type] : stage_type_rows)
-            {
-                std::ostringstream label;
-                label << "  " << stage_type;
-
-                auto count_it = stage_type_counts.find(stage_type);
-                if (count_it != stage_type_counts.end())
-                    label << " (" << count_it->second << ")";
-
-                const double execute_share = total_execute_ms > 0.0
-                                                 ? (execute_ms_by_type / total_execute_ms) * 100.0
-                                                 : 0.0;
-                table << label.str()
-                      << fmt(execute_ms_by_type, 2)
-                      << per_tok(execute_ms_by_type)
-                      << (fmt(execute_share, 1) + "% of exec")
-                      << fort::endr;
-            }
-        }
-
-        // Separator before coherence
+        // Coherence overhead
         table << fort::separator;
         table << "COHERENCE OVERHEAD:" << "" << "" << "" << fort::endr;
         table << "  Input Coherence" << fmt(overhead.input_cohere_ms, 2) << per_tok(overhead.input_cohere_ms) << pct(overhead.input_cohere_ms) << fort::endr;
@@ -362,19 +396,19 @@ namespace llaminar2
         table << "TOTAL OVERHEAD" << fmt(total_overhead, 2) << per_tok(total_overhead) << pct(total_overhead) << fort::endr;
         table << "TOTAL (kernel + overhead)" << fmt(total_all, 2) << per_tok(total_all) << pct(total_all) << fort::endr;
 
-        // Efficiency row
+        // Efficiency
         table << fort::separator;
         double efficiency = total_all > 0 ? (total_execute_ms / total_all) * 100.0 : 0;
+        double overhead_per_token = total_tokens > 0 ? total_overhead / total_tokens : 0;
         {
             std::ostringstream oss;
             oss << "Kernel Efficiency: " << fmt(efficiency, 1) << "%  (higher = less overhead)";
-            if (decode_tokens > 0)
+            if (total_tokens > 0)
                 oss << "  |  Overhead per token: " << fmt(overhead_per_token, 3) << " ms";
             table << oss.str() << "" << "" << "" << fort::endr;
             table[table.row_count() - 1][0].set_cell_span(4);
         }
 
-        // Compute-only efficiency (excluding collective wait time)
         if (total_collective_calls > 0)
         {
             double compute_ms = total_execute_ms - total_collective_ms;
@@ -382,8 +416,6 @@ namespace llaminar2
             std::ostringstream oss;
             oss << "Compute Efficiency: " << fmt(compute_efficiency, 1)
                 << "%  (excluding " << fmt(total_collective_ms, 1) << " ms collective wait)";
-            if (decode_tokens > 0)
-                oss << "  |  Collective per token: " << fmt(total_collective_ms / decode_tokens, 3) << " ms";
             table << oss.str() << "" << "" << "" << fort::endr;
             table[table.row_count() - 1][0].set_cell_span(4);
         }
@@ -2285,6 +2317,38 @@ namespace llaminar2
             stats_.overhead.verify_ms += verify_ms;
             stats_.overhead.callback_ms += callback_ms;
             stats_.overhead.get_dump_info_ms += get_dump_info_ms;
+
+            // Phase-split accumulation
+            const auto phase = GraphExecutorStats::currentPhase();
+            PhaseStats *phase_stats = nullptr;
+            if (phase == ExecutionPhase::PREFILL)
+                phase_stats = &stats_.prefill;
+            else if (phase == ExecutionPhase::DECODE)
+                phase_stats = &stats_.decode;
+
+            if (phase_stats)
+            {
+                phase_stats->total_execute_ms += execute_ms;
+                phase_stats->total_stages_executed++;
+                phase_stats->stage_type_execute_ms[stage_type_name] += execute_ms;
+                phase_stats->stage_type_counts[stage_type_name]++;
+                if (stype == ComputeStageType::ALLREDUCE ||
+                    stype == ComputeStageType::ALLGATHER ||
+                    stype == ComputeStageType::ALLGATHER_V)
+                {
+                    phase_stats->total_collective_ms += execute_ms;
+                    phase_stats->total_collective_calls++;
+                }
+                phase_stats->overhead.input_cohere_ms += input_cohere_ms;
+                phase_stats->overhead.weight_cohere_ms += weight_cohere_ms;
+                phase_stats->overhead.output_alloc_ms += output_alloc_ms;
+                phase_stats->overhead.mark_dirty_ms += mark_dirty_ms;
+                phase_stats->overhead.dump_input_ms += dump_input_ms;
+                phase_stats->overhead.dump_output_ms += dump_output_ms;
+                phase_stats->overhead.verify_ms += verify_ms;
+                phase_stats->overhead.callback_ms += callback_ms;
+                phase_stats->overhead.get_dump_info_ms += get_dump_info_ms;
+            }
 
             LOG_DEBUG("[DeviceGraphExecutor] Stage '" << node.name << "' took " << total_ms << " ms (execute=" << execute_ms << "ms, overhead=" << total_overhead_ms << "ms)");
         }

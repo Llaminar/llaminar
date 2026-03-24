@@ -339,6 +339,23 @@ namespace llaminar2
         }                                                                                                       \
     } while (0)
 
+// In Release/E2ERelease builds (NDEBUG without LLAMINAR_ENABLE_ASSERTIONS),
+// LOG_DEBUG and LOG_TRACE are compiled out entirely — zero overhead, no runtime
+// shouldLog() check, and no way to accidentally enable verbose output via env vars.
+// In Debug and Integration builds they remain runtime-gated as usual.
+#if defined(NDEBUG) && !defined(LLAMINAR_ENABLE_ASSERTIONS)
+
+#define LOG_DEBUG(msg) \
+    do                 \
+    {                  \
+    } while (0)
+#define LOG_TRACE(msg) \
+    do                 \
+    {                  \
+    } while (0)
+
+#else
+
 #define LOG_DEBUG(msg)                                                                                                     \
     do                                                                                                                     \
     {                                                                                                                      \
@@ -360,6 +377,8 @@ namespace llaminar2
             ::llaminar2::Logger::getInstance().log(::llaminar2::LogLevel::TRACE, oss.str(), __FILE__, __LINE__); \
         }                                                                                                        \
     } while (0)
+
+#endif // NDEBUG && !LLAMINAR_ENABLE_ASSERTIONS
 
 // Simple logging without location info
 #define LOG(level, msg)                                               \
