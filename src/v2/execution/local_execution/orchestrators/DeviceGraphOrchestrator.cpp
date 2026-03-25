@@ -920,13 +920,24 @@ namespace llaminar2
                     double wall_ms = std::chrono::duration<double, std::milli>(
                                          std::chrono::high_resolution_clock::now() - start)
                                          .count();
-                    const char *phase = is_decode ? "DECODE" : "PREFILL";
-                    int tokens = is_decode ? 1 : (input.batch_size * input.seq_len);
                     std::string dev_str = ctx->deviceId().toString();
                     const char *dev_name = dev_str.c_str();
-                    timeline.printSummary(phase, tokens, wall_ms, dev_name);
-                    if (debugEnv().gpu_stage_timing_detail)
-                        timeline.printDetailedTimeline(phase, dev_name);
+
+                    if (is_decode)
+                    {
+                        // Accumulate decode iterations — print once via flushStageTimeline()
+                        timeline.accumulateIteration(wall_ms);
+                    }
+                    else
+                    {
+                        // Flush any pending decode data before printing prefill
+                        timeline.printAccumulatedSummary("DECODE", dev_name);
+
+                        int tokens = input.batch_size * input.seq_len;
+                        timeline.printSummary("PREFILL", tokens, wall_ms, dev_name);
+                        if (debugEnv().gpu_stage_timing_detail)
+                            timeline.printDetailedTimeline("PREFILL", dev_name);
+                    }
                     timeline.resetTimings();
                 }
             }
@@ -1145,12 +1156,23 @@ namespace llaminar2
                     double wall_ms = std::chrono::duration<double, std::milli>(
                                          std::chrono::high_resolution_clock::now() - start)
                                          .count();
-                    const char *phase = is_decode ? "DECODE" : "PREFILL";
-                    int tokens = is_decode ? 1 : (input.batch_size * input.seq_len);
                     std::string dev_str = input.device.toString();
-                    timeline.printSummary(phase, tokens, wall_ms, dev_str.c_str());
-                    if (debugEnv().gpu_stage_timing_detail)
-                        timeline.printDetailedTimeline(phase, dev_str.c_str());
+
+                    if (is_decode)
+                    {
+                        // Accumulate decode iterations — print once via flushStageTimeline()
+                        timeline.accumulateIteration(wall_ms);
+                    }
+                    else
+                    {
+                        // Flush any pending decode data before printing prefill
+                        timeline.printAccumulatedSummary("DECODE", dev_str.c_str());
+
+                        int tokens = input.batch_size * input.seq_len;
+                        timeline.printSummary("PREFILL", tokens, wall_ms, dev_str.c_str());
+                        if (debugEnv().gpu_stage_timing_detail)
+                            timeline.printDetailedTimeline("PREFILL", dev_str.c_str());
+                    }
                     timeline.resetTimings();
                 }
             }

@@ -185,6 +185,9 @@ namespace llaminar2
             }
         }
 
+        // Flush accumulated GPU stage timeline for decode phase
+        runner->flushStageTimeline();
+
         if (mpi_ctx->rank() == 0)
         {
             std::cout << "\n"
@@ -263,9 +266,13 @@ namespace llaminar2
                 break;
         }
 
+        // Flush accumulated GPU stage timeline for round 2 decode phase
+        runner->flushStageTimeline();
+
         if (mpi_ctx->rank() == 0)
         {
-            std::cout << "\n" << std::endl;
+            std::cout << "\n"
+                      << std::endl;
 
             // Compare tokens
             bool match = (round1_tokens.size() == round2_tokens.size());
@@ -286,14 +293,16 @@ namespace llaminar2
             for (size_t i = 0; i < round1_tokens.size(); ++i)
             {
                 std::cout << round1_tokens[i];
-                if (i < round1_tokens.size() - 1) std::cout << ", ";
+                if (i < round1_tokens.size() - 1)
+                    std::cout << ", ";
             }
             std::cout << "]" << std::endl;
             std::cout << "Round 2 tokens: [";
             for (size_t i = 0; i < round2_tokens.size(); ++i)
             {
                 std::cout << round2_tokens[i];
-                if (i < round2_tokens.size() - 1) std::cout << ", ";
+                if (i < round2_tokens.size() - 1)
+                    std::cout << ", ";
             }
             std::cout << "]" << std::endl;
             std::cout << "MATCH: ";
@@ -305,8 +314,7 @@ namespace llaminar2
             {
                 // Compute step-0 RMSE to classify: GPU non-determinism vs real bug
                 double step0_rmse = -1.0;
-                if (!r1_logits_per_step.empty() && !r2_logits_per_step.empty()
-                    && r1_logits_per_step[0].size() == r2_logits_per_step[0].size())
+                if (!r1_logits_per_step.empty() && !r2_logits_per_step.empty() && r1_logits_per_step[0].size() == r2_logits_per_step[0].size())
                 {
                     double sq = 0;
                     int V = static_cast<int>(r1_logits_per_step[0].size());
@@ -331,7 +339,8 @@ namespace llaminar2
                 {
                     const auto &l1 = r1_logits_per_step[step];
                     const auto &l2 = r2_logits_per_step[step];
-                    if (l1.size() != l2.size()) continue;
+                    if (l1.size() != l2.size())
+                        continue;
                     int V = static_cast<int>(l1.size());
 
                     // Find max absolute difference
@@ -343,8 +352,13 @@ namespace llaminar2
                     {
                         float d = std::fabs(l1[v] - l2[v]);
                         sum_sq_diff += static_cast<double>(d) * d;
-                        if (d > 0) n_diff++;
-                        if (d > max_diff) { max_diff = d; max_diff_idx = v; }
+                        if (d > 0)
+                            n_diff++;
+                        if (d > max_diff)
+                        {
+                            max_diff = d;
+                            max_diff_idx = v;
+                        }
                     }
                     double rmse = std::sqrt(sum_sq_diff / V);
 
@@ -353,9 +367,11 @@ namespace llaminar2
                     std::iota(idx1.begin(), idx1.end(), 0);
                     std::iota(idx2.begin(), idx2.end(), 0);
                     std::partial_sort(idx1.begin(), idx1.begin() + 5, idx1.end(),
-                                     [&](int a, int b) { return l1[a] > l1[b]; });
+                                      [&](int a, int b)
+                                      { return l1[a] > l1[b]; });
                     std::partial_sort(idx2.begin(), idx2.begin() + 5, idx2.end(),
-                                     [&](int a, int b) { return l2[a] > l2[b]; });
+                                      [&](int a, int b)
+                                      { return l2[a] > l2[b]; });
 
                     std::cout << "--- Step " << step << " logit comparison ---" << std::endl;
                     std::cout << "  RMSE=" << rmse << " max_diff=" << max_diff
@@ -375,8 +391,7 @@ namespace llaminar2
                     }
 
                     // Show if the step's sampled tokens differ
-                    if (step < round1_tokens.size() && step < round2_tokens.size()
-                        && round1_tokens[step] != round2_tokens[step])
+                    if (step < round1_tokens.size() && step < round2_tokens.size() && round1_tokens[step] != round2_tokens[step])
                     {
                         int t1 = round1_tokens[step], t2 = round2_tokens[step];
                         std::cout << "  DIVERGENT: R1 sampled " << t1 << "(logit=" << l1[t1]

@@ -104,8 +104,59 @@ namespace llaminar2
 {
     namespace cuda
     {
-        // Default number of splits for Flash Decoding
-        constexpr int DEFAULT_NUM_SPLITS = 8;
+        // Maximum number of splits for Flash Decoding
+        constexpr int MAX_NUM_SPLITS = 32;
+
+        // Minimum KV positions per split to avoid excessive overhead
+        constexpr int MIN_KV_PER_SPLIT = 16;
+
+        /**
+         * @brief Compute optimal num_splits for Flash Decoding based on GPU SM count.
+         *
+         * The grid is (n_heads, num_splits, batch). With __launch_bounds__(256, 4) and
+         * 61 regs/thread, max concurrent blocks = num_sms × 4. We pick num_splits such
+         * that total grid fits within this capacity (avoiding an inefficient tail wave).
+         *
+         * For Qwen2.5-7B (28 heads) on RTX 3090 (82 SMs): 328/28 = 11 splits = 308 blocks.
+         */
+        static int computeNumSplitsForDevice(int kv_len, int n_heads, int device_idx)
+        {
+            if (kv_len <= 1)
+                return 1;
+
+            // Get SM count (cached per device via static array)
+            static int sm_count_cache[8] = {0};
+            int num_sms = sm_count_cache[device_idx & 7];
+            if (num_sms == 0)
+            {
+                cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, device_idx);
+                if (num_sms <= 0)
+                    num_sms = 82; // Conservative fallback
+                sm_count_cache[device_idx & 7] = num_sms;
+            }
+
+            // Max concurrent blocks from register pressure (61 regs → 4 blocks/SM)
+            constexpr int MAX_BLOCKS_PER_SM = 4;
+            int max_concurrent = MAX_BLOCKS_PER_SM * num_sms;
+
+            // Floor division: stay at or below capacity to avoid tail-wave inefficiency
+            int desired_splits = max_concurrent / n_heads;
+
+            // Clamp: each split needs enough work (MIN_KV_PER_SPLIT positions)
+            int max_splits_by_kv = kv_len / MIN_KV_PER_SPLIT;
+            if (max_splits_by_kv < 1)
+                max_splits_by_kv = 1;
+
+            int num_splits = desired_splits;
+            if (num_splits > max_splits_by_kv)
+                num_splits = max_splits_by_kv;
+            if (num_splits > MAX_NUM_SPLITS)
+                num_splits = MAX_NUM_SPLITS;
+            if (num_splits < 1)
+                num_splits = 1;
+
+            return num_splits;
+        }
 
         // =====================================================================
         // FP32 Specialization Implementation
@@ -380,14 +431,7 @@ namespace llaminar2
             if (seq_len == 1)
             {
                 // Flash Decoding for single-token decode
-                // Always use this path for seq_len=1, even for short KV
-                int num_splits = DEFAULT_NUM_SPLITS;
-                if (kv_len <= 64)
-                    num_splits = 1; // No splitting for very short KV
-                else if (kv_len < 128)
-                    num_splits = 2;
-                else if (kv_len < 256)
-                    num_splits = 4;
+                int num_splits = computeNumSplitsForDevice(kv_len, n_heads, device_idx);
 
                 allocateWorkspace(n_heads, head_dim, num_splits);
 
@@ -692,13 +736,7 @@ namespace llaminar2
                 if (seq_len == 1)
                 {
                     // DECODE: Flash Decoding with FP16 KV — no conversion needed
-                    int num_splits = DEFAULT_NUM_SPLITS;
-                    if (kv_len <= 64)
-                        num_splits = 1;
-                    else if (kv_len < 128)
-                        num_splits = 2;
-                    else if (kv_len < 256)
-                        num_splits = 4;
+                    int num_splits = computeNumSplitsForDevice(kv_len, n_heads, dev);
 
                     allocateWorkspace(n_heads, head_dim, num_splits);
 
@@ -811,7 +849,7 @@ namespace llaminar2
             const int batch_size = (m > 0) ? m : 1;
             const int n_heads = (n > 0) ? n : 128;     // Max expected heads
             const int head_dim = (k > 0) ? k : 128;    // Max expected head dim
-            const int num_splits = DEFAULT_NUM_SPLITS; // 8 splits
+            const int num_splits = MAX_NUM_SPLITS; // Conservative: allocate for max possible splits
             const int max_kv_len = 4096;               // decode workspace bound
 
             // Conservative conversion buffer sizing for mixed-precision KV

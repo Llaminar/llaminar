@@ -1178,8 +1178,10 @@ namespace
 
         for (int kv_pos = kv_start + warp_id; kv_pos < kv_end; kv_pos += num_warps)
         {
-            const half *K_ptr = K_batch + kv_pos * n_kv_heads * head_dim + kv_head_idx * head_dim;
+            const half *K_ptr =
+                K_batch + kv_pos * n_kv_heads * head_dim + kv_head_idx * head_dim;
 
+            // Cooperative dot product across head_dim
             float partial_dot = 0.0f;
             for (int d = lane_id; d < head_dim; d += WARP_SIZE)
             {
@@ -1194,7 +1196,8 @@ namespace
 
             l_local = l_local * scale_old + p;
 
-            const half *V_ptr = V_batch + kv_pos * n_kv_heads * head_dim + kv_head_idx * head_dim;
+            const half *V_ptr =
+                V_batch + kv_pos * n_kv_heads * head_dim + kv_head_idx * head_dim;
             int o_idx = 0;
             for (int d = lane_id; d < head_dim; d += WARP_SIZE, o_idx++)
             {

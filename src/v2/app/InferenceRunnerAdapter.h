@@ -45,6 +45,7 @@ namespace llaminar2
         void setSkipLogitsGatherDecode(bool skip) override;
         void setSkipLogitsGatherPrefill(bool skip) override;
         void setSuppressTimeline(bool suppress) override;
+        void flushStageTimeline() override;
 
     private:
         IOrchestrationRunner *orch_runner_;

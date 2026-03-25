@@ -86,4 +86,9 @@ namespace llaminar2
         orch_runner_->setSuppressTimeline(suppress);
     }
 
+    void InferenceRunnerAdapter::flushStageTimeline()
+    {
+        orch_runner_->flushStageTimeline();
+    }
+
 } // namespace llaminar2

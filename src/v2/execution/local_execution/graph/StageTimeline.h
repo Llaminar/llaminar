@@ -304,6 +304,53 @@ namespace llaminar2
             }
         }
 
+        /**
+         * @brief Accumulate current iteration's timings into running totals
+         *
+         * Adds per-type totals from the current iteration to accumulated state,
+         * increments the iteration counter, and accumulates wall time.
+         * Call this instead of printSummary() for decode iterations to avoid
+         * printing a table for every single token.
+         */
+        void accumulateIteration(double wall_ms)
+        {
+            auto agg = aggregateByType();
+            for (const auto &entry : agg)
+            {
+                auto &acc = accumulated_[entry.type_name];
+                acc.type_name = entry.type_name;
+                acc.total_ms += entry.total_ms;
+                acc.count += entry.count;
+            }
+            accumulated_wall_ms_ += wall_ms;
+            accumulated_iterations_++;
+        }
+
+        /**
+         * @brief Print accumulated summary across multiple decode iterations
+         *
+         * Prints a single table summarizing all accumulated decode iterations,
+         * then resets the accumulated state.
+         *
+         * @return true if there was data to print
+         */
+        bool printAccumulatedSummary(const char *phase_name, const char *device_name = nullptr);
+
+        /**
+         * @brief Check if there is accumulated data pending
+         */
+        bool hasAccumulatedData() const { return accumulated_iterations_ > 0; }
+
+        /**
+         * @brief Reset accumulated data without printing
+         */
+        void resetAccumulated()
+        {
+            accumulated_.clear();
+            accumulated_wall_ms_ = 0.0;
+            accumulated_iterations_ = 0;
+        }
+
     private:
         void destroy()
         {
@@ -327,6 +374,11 @@ namespace llaminar2
         std::vector<StageRecord> records_;
         IWorkerGPUContext *gpu_ctx_ = nullptr;
         bool initialized_ = false;
+
+        // Accumulated state for multi-iteration decode summaries
+        std::unordered_map<std::string, TypeAggregate> accumulated_;
+        double accumulated_wall_ms_ = 0.0;
+        size_t accumulated_iterations_ = 0;
     };
 
 } // namespace llaminar2

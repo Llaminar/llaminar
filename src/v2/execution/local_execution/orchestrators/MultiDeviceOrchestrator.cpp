@@ -3105,4 +3105,10 @@ namespace llaminar2
             runner->setSuppressTimeline(suppress);
     }
 
+    void MultiDeviceOrchestrator::flushStageTimeline()
+    {
+        for (auto &runner : device_runners_)
+            runner->flushStageTimeline();
+    }
+
 } // namespace llaminar2

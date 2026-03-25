@@ -112,9 +112,16 @@ __global__ void fused_swiglu_quantize_blockwise_kernel(
  *
  * Memory savings: 2 × rows × cols × sizeof(float) per fusion point
  *
+ * Optimized for decode (rows=1): 1024 threads, warp shuffle reduction,
+ * register-cached residual sums eliminate Pass 2 global memory re-read.
+ *
  * Grid:  (rows, 1, 1) — one CUDA block per row
- * Block: (256, 1, 1) — shared memory for reduction
+ * Block: (1024, 1, 1) for cols>256, (256, 1, 1) for small cols
  */
+// Optimized fused residual add + RMS norm kernel.
+// - Uses 1024 threads (better SM utilization for d_model=3584)
+// - Keeps residual sums in registers across passes (no global re-read)
+// - Warp shuffle reduction (no shared memory needed for final warp)
 __global__ void fused_residual_rmsnorm_fp32_kernel(
     const float *__restrict__ input,
     const float *__restrict__ residual,
@@ -124,8 +131,6 @@ __global__ void fused_residual_rmsnorm_fp32_kernel(
     int cols,
     float epsilon)
 {
-    extern __shared__ float sdata[];
-
     const int row = blockIdx.x;
     const int tid = threadIdx.x;
     const int stride = blockDim.x;
@@ -135,37 +140,69 @@ __global__ void fused_residual_rmsnorm_fp32_kernel(
     float *row_res_out = residual_output + row * cols;
     float *row_norm_out = norm_output + row * cols;
 
-    // Pass 1: Add residual, compute sum of squares, and write residual output
+    // Pass 1: Add residual, compute sum of squares, write residual output.
+    // Keep per-thread partial sums in registers for Pass 2.
+    // With 1024 threads and cols=3584, each thread handles ~3.5 elements
+    // (at most 4 iterations).
+    constexpr int kMaxPerThread = 16; // handles up to cols=16384
+    float local_sums[kMaxPerThread];
+    int local_count = 0;
+
     float sum_sq = 0.0f;
     for (int i = tid; i < cols; i += stride)
     {
         float sum = row_input[i] + row_residual[i];
-        row_res_out[i] = sum; // Write updated hidden state
+        row_res_out[i] = sum;
+        local_sums[local_count++] = sum;
         sum_sq += sum * sum;
     }
 
-    // Reduce sum of squares
-    sdata[tid] = sum_sq;
-    __syncthreads();
-
-    for (int s = blockDim.x / 2; s > 0; s >>= 1)
+    // Warp shuffle reduction — no shared memory needed
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1)
     {
-        if (tid < s)
-            sdata[tid] += sdata[tid + s];
-        __syncthreads();
+        sum_sq += __shfl_xor_sync(0xFFFFFFFF, sum_sq, offset);
     }
 
-    float inv_rms = rsqrtf(sdata[0] / cols + epsilon);
+    // Cross-warp reduction via shared memory (only one value per warp)
+    __shared__ float warp_sums[32]; // max 32 warps per block
+    const int lane = tid & 31;
+    const int warp_id = tid >> 5;
 
-    // Pass 2: Read back sum, normalize, and write normalized output
+    if (lane == 0)
+    {
+        warp_sums[warp_id] = sum_sq;
+    }
+    __syncthreads();
+
+    // First warp reduces all warp partial sums
+    if (warp_id == 0)
+    {
+        const int num_warps = blockDim.x >> 5;
+        float val = (lane < num_warps) ? warp_sums[lane] : 0.0f;
+        for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+        {
+            val += __shfl_xor_sync(0xFFFFFFFF, val, offset);
+        }
+        if (lane == 0)
+        {
+            warp_sums[0] = val;
+        }
+    }
+    __syncthreads();
+
+    float inv_rms = rsqrtf(warp_sums[0] / cols + epsilon);
+
+    // Pass 2: Normalize using register-cached residual sums (no global re-read)
+    int idx = 0;
     for (int i = tid; i < cols; i += stride)
     {
-        row_norm_out[i] = row_res_out[i] * inv_rms * gamma[i];
+        row_norm_out[i] = local_sums[idx++] * inv_rms * gamma[i];
     }
 }
 
 /**
  * @brief Fused residual add + RMSNorm with BF16 I/O
+ * Optimized: register-cached sums, warp shuffle reduction.
  */
 __global__ void fused_residual_rmsnorm_bf16_kernel(
     const uint16_t *__restrict__ input,
@@ -176,8 +213,6 @@ __global__ void fused_residual_rmsnorm_bf16_kernel(
     int cols,
     float epsilon)
 {
-    extern __shared__ float sdata[];
-
     const int row = blockIdx.x;
     const int tid = threadIdx.x;
     const int stride = blockDim.x;
@@ -187,35 +222,50 @@ __global__ void fused_residual_rmsnorm_bf16_kernel(
     uint16_t *row_res_out = residual_output + row * cols;
     uint16_t *row_norm_out = norm_output + row * cols;
 
+    constexpr int kMaxPerThread = 16;
+    float local_sums[kMaxPerThread];
+    int local_count = 0;
+
     float sum_sq = 0.0f;
     for (int i = tid; i < cols; i += stride)
     {
         float sum = bf16_to_float(row_input[i]) + bf16_to_float(row_residual[i]);
         row_res_out[i] = float_to_bf16(sum);
+        local_sums[local_count++] = sum;
         sum_sq += sum * sum;
     }
 
-    sdata[tid] = sum_sq;
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+        sum_sq += __shfl_xor_sync(0xFFFFFFFF, sum_sq, offset);
+
+    __shared__ float warp_sums[32];
+    const int lane = tid & 31;
+    const int warp_id = tid >> 5;
+    if (lane == 0) warp_sums[warp_id] = sum_sq;
     __syncthreads();
 
-    for (int s = blockDim.x / 2; s > 0; s >>= 1)
+    if (warp_id == 0)
     {
-        if (tid < s)
-            sdata[tid] += sdata[tid + s];
-        __syncthreads();
+        const int num_warps = blockDim.x >> 5;
+        float val = (lane < num_warps) ? warp_sums[lane] : 0.0f;
+        for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+            val += __shfl_xor_sync(0xFFFFFFFF, val, offset);
+        if (lane == 0) warp_sums[0] = val;
     }
+    __syncthreads();
 
-    float inv_rms = rsqrtf(sdata[0] / cols + epsilon);
+    float inv_rms = rsqrtf(warp_sums[0] / cols + epsilon);
 
+    int idx = 0;
     for (int i = tid; i < cols; i += stride)
     {
-        float sum = bf16_to_float(row_res_out[i]);
-        row_norm_out[i] = float_to_bf16(sum * inv_rms * gamma[i]);
+        row_norm_out[i] = float_to_bf16(local_sums[idx++] * inv_rms * gamma[i]);
     }
 }
 
 /**
  * @brief Fused residual add + RMSNorm with FP16 I/O
+ * Optimized: register-cached sums, warp shuffle reduction.
  */
 __global__ void fused_residual_rmsnorm_fp16_kernel(
     const uint16_t *__restrict__ input,
@@ -226,8 +276,6 @@ __global__ void fused_residual_rmsnorm_fp16_kernel(
     int cols,
     float epsilon)
 {
-    extern __shared__ float sdata[];
-
     const int row = blockIdx.x;
     const int tid = threadIdx.x;
     const int stride = blockDim.x;
@@ -237,30 +285,44 @@ __global__ void fused_residual_rmsnorm_fp16_kernel(
     uint16_t *row_res_out = residual_output + row * cols;
     uint16_t *row_norm_out = norm_output + row * cols;
 
+    constexpr int kMaxPerThread = 16;
+    float local_sums[kMaxPerThread];
+    int local_count = 0;
+
     float sum_sq = 0.0f;
     for (int i = tid; i < cols; i += stride)
     {
         float sum = fp16_to_float(row_input[i]) + fp16_to_float(row_residual[i]);
         row_res_out[i] = float_to_fp16(sum);
+        local_sums[local_count++] = sum;
         sum_sq += sum * sum;
     }
 
-    sdata[tid] = sum_sq;
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+        sum_sq += __shfl_xor_sync(0xFFFFFFFF, sum_sq, offset);
+
+    __shared__ float warp_sums[32];
+    const int lane = tid & 31;
+    const int warp_id = tid >> 5;
+    if (lane == 0) warp_sums[warp_id] = sum_sq;
     __syncthreads();
 
-    for (int s = blockDim.x / 2; s > 0; s >>= 1)
+    if (warp_id == 0)
     {
-        if (tid < s)
-            sdata[tid] += sdata[tid + s];
-        __syncthreads();
+        const int num_warps = blockDim.x >> 5;
+        float val = (lane < num_warps) ? warp_sums[lane] : 0.0f;
+        for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+            val += __shfl_xor_sync(0xFFFFFFFF, val, offset);
+        if (lane == 0) warp_sums[0] = val;
     }
+    __syncthreads();
 
-    float inv_rms = rsqrtf(sdata[0] / cols + epsilon);
+    float inv_rms = rsqrtf(warp_sums[0] / cols + epsilon);
 
+    int idx = 0;
     for (int i = tid; i < cols; i += stride)
     {
-        float sum = fp16_to_float(row_res_out[i]);
-        row_norm_out[i] = float_to_fp16(sum * inv_rms * gamma[i]);
+        row_norm_out[i] = float_to_fp16(local_sums[idx++] * inv_rms * gamma[i]);
     }
 }
 
@@ -329,11 +391,10 @@ extern "C"
     {
         cudaSetDevice(device_idx);
 
-        int threads_per_block = 256;
+        int threads_per_block = (cols <= 256) ? 256 : 1024;
         int num_blocks = rows;
-        size_t shared_mem_size = threads_per_block * sizeof(float);
 
-        fused_residual_rmsnorm_fp32_kernel<<<num_blocks, threads_per_block, shared_mem_size,
+        fused_residual_rmsnorm_fp32_kernel<<<num_blocks, threads_per_block, 0,
                                              static_cast<cudaStream_t>(stream)>>>(
             input, residual, gamma, residual_output, norm_output, cols, epsilon);
 
@@ -360,11 +421,10 @@ extern "C"
     {
         cudaSetDevice(device_idx);
 
-        int threads_per_block = 256;
+        int threads_per_block = (cols <= 256) ? 256 : 1024;
         int num_blocks = rows;
-        size_t shared_mem_size = threads_per_block * sizeof(float);
 
-        fused_residual_rmsnorm_bf16_kernel<<<num_blocks, threads_per_block, shared_mem_size,
+        fused_residual_rmsnorm_bf16_kernel<<<num_blocks, threads_per_block, 0,
                                              static_cast<cudaStream_t>(stream)>>>(
             input, residual, gamma, residual_output, norm_output, cols, epsilon);
 
@@ -391,11 +451,10 @@ extern "C"
     {
         cudaSetDevice(device_idx);
 
-        int threads_per_block = 256;
+        int threads_per_block = (cols <= 256) ? 256 : 1024;
         int num_blocks = rows;
-        size_t shared_mem_size = threads_per_block * sizeof(float);
 
-        fused_residual_rmsnorm_fp16_kernel<<<num_blocks, threads_per_block, shared_mem_size,
+        fused_residual_rmsnorm_fp16_kernel<<<num_blocks, threads_per_block, 0,
                                              static_cast<cudaStream_t>(stream)>>>(
             input, residual, gamma, residual_output, norm_output, cols, epsilon);
 

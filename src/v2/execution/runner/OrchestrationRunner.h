@@ -167,6 +167,7 @@ namespace llaminar2
         void setSkipLogitsGatherDecode(bool skip) override;
         void setSkipLogitsGatherPrefill(bool skip) override;
         void setSuppressTimeline(bool suppress) override;
+        void flushStageTimeline() override;
         void setSamplingParams(const SamplingParams &params) override;
 
     private:

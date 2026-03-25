@@ -4,6 +4,12 @@
  * @author David Sanftenberg
  *
  * Contains FP32, BF16, and FP16 RMSNorm kernels with extern "C" wrapper functions.
+ *
+ * Optimized design:
+ * - Register-cached input values (Pass 2 reads from registers, not global memory)
+ * - Warp shuffle reduction + cross-warp shared memory (2 barriers vs 8+)
+ * - 1024 threads for cols > 256 (better SM utilization)
+ * - No dynamic shared memory allocation
  */
 
 #include "CUDAHelpers.cuh"
@@ -17,9 +23,9 @@
 /**
  * @brief FP32 RMSNorm kernel - one block per row
  *
- * Uses shared memory for parallel reduction to compute RMS.
- * Each block handles one row: loads row → computes sum of squares →
- * reduce → normalize and scale.
+ * Register-cached design: Pass 1 caches input values in registers while
+ * computing sum-of-squares. Pass 2 reads from registers (no global re-read).
+ * Uses warp shuffle + cross-warp shared memory reduction (2 barriers vs 8+).
  */
 __global__ void rmsnorm_fp32_kernel(
     const float *__restrict__ input,
@@ -28,51 +34,63 @@ __global__ void rmsnorm_fp32_kernel(
     int cols,
     float epsilon)
 {
-    extern __shared__ float sdata[];
+    __shared__ float warp_sums[32];
 
     const int row = blockIdx.x;
     const int tid = threadIdx.x;
     const int stride = blockDim.x;
+    const int warp_id = tid / 32;
+    const int lane_id = tid % 32;
+    const int num_warps = blockDim.x / 32;
 
     const float *row_input = input + row * cols;
     float *row_output = output + row * cols;
 
-    // Step 1: Compute sum of squares
+    // Pass 1: Load input values into registers, accumulate sum-of-squares
+    constexpr int kMaxPerThread = 16;
+    float local_vals[kMaxPerThread];
     float sum_sq = 0.0f;
+    int idx = 0;
     for (int i = tid; i < cols; i += stride)
     {
         float val = row_input[i];
+        local_vals[idx++] = val;
         sum_sq += val * val;
     }
 
-    // Store in shared memory
-    sdata[tid] = sum_sq;
+    // Warp-level reduction via shuffle
+    for (int offset = 16; offset > 0; offset >>= 1)
+        sum_sq += __shfl_xor_sync(0xFFFFFFFF, sum_sq, offset);
+
+    // Cross-warp reduction via shared memory
+    if (lane_id == 0)
+        warp_sums[warp_id] = sum_sq;
     __syncthreads();
 
-    // Parallel reduction for sum
-    for (int s = blockDim.x / 2; s > 0; s >>= 1)
+    if (tid < 32)
     {
-        if (tid < s)
-        {
-            sdata[tid] += sdata[tid + s];
-        }
-        __syncthreads();
+        float val = (tid < num_warps) ? warp_sums[tid] : 0.0f;
+        for (int offset = 16; offset > 0; offset >>= 1)
+            val += __shfl_xor_sync(0xFFFFFFFF, val, offset);
+        if (tid == 0)
+            warp_sums[0] = val;
     }
+    __syncthreads();
 
-    // Compute inverse RMS scale factor
-    // rsqrtf() maps to MUFU.RSQ (single instruction) instead of
-    // sqrtf() (MUFU.SQRT) + rcp (MUFU.RCP)
-    float inv_rms = rsqrtf(sdata[0] / cols + epsilon);
+    float inv_rms = rsqrtf(warp_sums[0] / cols + epsilon);
 
-    // Step 2: Normalize and scale by gamma
+    // Pass 2: Normalize from register-cached values (no global re-read)
+    idx = 0;
     for (int i = tid; i < cols; i += stride)
     {
-        row_output[i] = row_input[i] * inv_rms * gamma[i];
+        row_output[i] = local_vals[idx++] * inv_rms * gamma[i];
     }
 }
 
 /**
  * @brief BF16 RMSNorm kernel - FP32 computation with BF16 I/O
+ *
+ * Register-cached design with warp shuffle reduction.
  */
 __global__ void rmsnorm_bf16_kernel(
     const uint16_t *__restrict__ input,
@@ -81,48 +99,63 @@ __global__ void rmsnorm_bf16_kernel(
     int cols,
     float epsilon)
 {
-    extern __shared__ float sdata[];
+    __shared__ float warp_sums[32];
 
     const int row = blockIdx.x;
     const int tid = threadIdx.x;
     const int stride = blockDim.x;
+    const int warp_id = tid / 32;
+    const int lane_id = tid % 32;
+    const int num_warps = blockDim.x / 32;
 
     const uint16_t *row_input = input + row * cols;
     uint16_t *row_output = output + row * cols;
 
-    // Step 1: Compute sum of squares (in FP32)
+    // Pass 1: Load + convert to FP32, cache in registers, accumulate sum-of-squares
+    constexpr int kMaxPerThread = 16;
+    float local_vals[kMaxPerThread];
     float sum_sq = 0.0f;
+    int idx = 0;
     for (int i = tid; i < cols; i += stride)
     {
         float val = bf16_to_float(row_input[i]);
+        local_vals[idx++] = val;
         sum_sq += val * val;
     }
 
-    sdata[tid] = sum_sq;
+    // Warp-level reduction via shuffle
+    for (int offset = 16; offset > 0; offset >>= 1)
+        sum_sq += __shfl_xor_sync(0xFFFFFFFF, sum_sq, offset);
+
+    // Cross-warp reduction via shared memory
+    if (lane_id == 0)
+        warp_sums[warp_id] = sum_sq;
     __syncthreads();
 
-    for (int s = blockDim.x / 2; s > 0; s >>= 1)
+    if (tid < 32)
     {
-        if (tid < s)
-        {
-            sdata[tid] += sdata[tid + s];
-        }
-        __syncthreads();
+        float val = (tid < num_warps) ? warp_sums[tid] : 0.0f;
+        for (int offset = 16; offset > 0; offset >>= 1)
+            val += __shfl_xor_sync(0xFFFFFFFF, val, offset);
+        if (tid == 0)
+            warp_sums[0] = val;
     }
+    __syncthreads();
 
-    float inv_rms = rsqrtf(sdata[0] / cols + epsilon);
+    float inv_rms = rsqrtf(warp_sums[0] / cols + epsilon);
 
-    // Step 2: Normalize, scale, and convert back to BF16
+    // Pass 2: Normalize from register-cached values (no global re-read)
+    idx = 0;
     for (int i = tid; i < cols; i += stride)
     {
-        float val = bf16_to_float(row_input[i]);
-        float result = val * inv_rms * gamma[i];
-        row_output[i] = float_to_bf16(result);
+        row_output[i] = float_to_bf16(local_vals[idx++] * inv_rms * gamma[i]);
     }
 }
 
 /**
  * @brief FP16 RMSNorm kernel - FP32 computation with FP16 I/O
+ *
+ * Register-cached design with warp shuffle reduction.
  */
 __global__ void rmsnorm_fp16_kernel(
     const uint16_t *__restrict__ input,
@@ -131,43 +164,56 @@ __global__ void rmsnorm_fp16_kernel(
     int cols,
     float epsilon)
 {
-    extern __shared__ float sdata[];
+    __shared__ float warp_sums[32];
 
     const int row = blockIdx.x;
     const int tid = threadIdx.x;
     const int stride = blockDim.x;
+    const int warp_id = tid / 32;
+    const int lane_id = tid % 32;
+    const int num_warps = blockDim.x / 32;
 
     const uint16_t *row_input = input + row * cols;
     uint16_t *row_output = output + row * cols;
 
-    // Step 1: Compute sum of squares (in FP32)
+    // Pass 1: Load + convert to FP32, cache in registers, accumulate sum-of-squares
+    constexpr int kMaxPerThread = 16;
+    float local_vals[kMaxPerThread];
     float sum_sq = 0.0f;
+    int idx = 0;
     for (int i = tid; i < cols; i += stride)
     {
         float val = fp16_to_float(row_input[i]);
+        local_vals[idx++] = val;
         sum_sq += val * val;
     }
 
-    sdata[tid] = sum_sq;
+    // Warp-level reduction via shuffle
+    for (int offset = 16; offset > 0; offset >>= 1)
+        sum_sq += __shfl_xor_sync(0xFFFFFFFF, sum_sq, offset);
+
+    // Cross-warp reduction via shared memory
+    if (lane_id == 0)
+        warp_sums[warp_id] = sum_sq;
     __syncthreads();
 
-    for (int s = blockDim.x / 2; s > 0; s >>= 1)
+    if (tid < 32)
     {
-        if (tid < s)
-        {
-            sdata[tid] += sdata[tid + s];
-        }
-        __syncthreads();
+        float val = (tid < num_warps) ? warp_sums[tid] : 0.0f;
+        for (int offset = 16; offset > 0; offset >>= 1)
+            val += __shfl_xor_sync(0xFFFFFFFF, val, offset);
+        if (tid == 0)
+            warp_sums[0] = val;
     }
+    __syncthreads();
 
-    float inv_rms = rsqrtf(sdata[0] / cols + epsilon);
+    float inv_rms = rsqrtf(warp_sums[0] / cols + epsilon);
 
-    // Step 2: Normalize, scale, and convert back to FP16
+    // Pass 2: Normalize from register-cached values (no global re-read)
+    idx = 0;
     for (int i = tid; i < cols; i += stride)
     {
-        float val = fp16_to_float(row_input[i]);
-        float result = val * inv_rms * gamma[i];
-        row_output[i] = float_to_fp16(result);
+        row_output[i] = float_to_fp16(local_vals[idx++] * inv_rms * gamma[i]);
     }
 }
 
@@ -191,11 +237,10 @@ extern "C"
         // uses the runtime's current-device for PTX code lookup.
         cudaSetDevice(device_idx);
 
-        int threads_per_block = 256;
+        int threads_per_block = (cols <= 256) ? 256 : 1024;
         int num_blocks = rows;
-        size_t shared_mem_size = threads_per_block * sizeof(float);
 
-        rmsnorm_fp32_kernel<<<num_blocks, threads_per_block, shared_mem_size, static_cast<cudaStream_t>(stream)>>>(
+        rmsnorm_fp32_kernel<<<num_blocks, threads_per_block, 0, static_cast<cudaStream_t>(stream)>>>(
             input, gamma, output, cols, epsilon);
 
         (void)cudaGetLastError(); // Clear stale errors
@@ -221,11 +266,10 @@ extern "C"
         // uses the runtime's current-device for PTX code lookup.
         cudaSetDevice(device_idx);
 
-        int threads_per_block = 256;
+        int threads_per_block = (cols <= 256) ? 256 : 1024;
         int num_blocks = rows;
-        size_t shared_mem_size = threads_per_block * sizeof(float);
 
-        rmsnorm_bf16_kernel<<<num_blocks, threads_per_block, shared_mem_size, static_cast<cudaStream_t>(stream)>>>(
+        rmsnorm_bf16_kernel<<<num_blocks, threads_per_block, 0, static_cast<cudaStream_t>(stream)>>>(
             input, gamma, output, cols, epsilon);
 
         (void)cudaGetLastError(); // Clear stale errors
@@ -251,11 +295,10 @@ extern "C"
         // uses the runtime's current-device for PTX code lookup.
         cudaSetDevice(device_idx);
 
-        int threads_per_block = 256;
+        int threads_per_block = (cols <= 256) ? 256 : 1024;
         int num_blocks = rows;
-        size_t shared_mem_size = threads_per_block * sizeof(float);
 
-        rmsnorm_fp16_kernel<<<num_blocks, threads_per_block, shared_mem_size, static_cast<cudaStream_t>(stream)>>>(
+        rmsnorm_fp16_kernel<<<num_blocks, threads_per_block, 0, static_cast<cudaStream_t>(stream)>>>(
             input, gamma, output, cols, epsilon);
 
         (void)cudaGetLastError(); // Clear stale errors

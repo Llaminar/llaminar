@@ -434,6 +434,7 @@ namespace llaminar2
         void setSkipLogitsGatherPrefill(bool skip) { skip_logits_gather_prefill_ = skip; }
 
         void setSuppressTimeline(bool suppress) override;
+        void flushStageTimeline() override;
 
         /**
          * @brief Batched forward pass

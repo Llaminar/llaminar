@@ -107,6 +107,115 @@ namespace llaminar2
         std::cout << table.to_string() << std::flush;
     }
 
+    bool StageTimeline::printAccumulatedSummary(const char *phase_name,
+                                                const char *device_name)
+    {
+        if (accumulated_iterations_ == 0 || accumulated_.empty())
+            return false;
+
+        // Build sorted vector from accumulated map
+        std::vector<TypeAggregate> agg;
+        agg.reserve(accumulated_.size());
+        for (const auto &[_, val] : accumulated_)
+            agg.push_back(val);
+        std::sort(agg.begin(), agg.end(),
+                  [](const TypeAggregate &a, const TypeAggregate &b)
+                  { return a.total_ms > b.total_ms; });
+
+        float total_gpu_ms = 0.0f;
+        for (const auto &e : agg)
+            total_gpu_ms += e.total_ms;
+
+        float avg_gpu_ms = total_gpu_ms / accumulated_iterations_;
+        double avg_wall_ms = accumulated_wall_ms_ / accumulated_iterations_;
+
+        fort::utf8_table table;
+        table.set_border_style(FT_DOUBLE2_STYLE);
+
+        // Title row
+        {
+            std::ostringstream title;
+            title << "GPU STAGE TIMELINE: " << phase_name;
+            if (device_name)
+                title << " [" << device_name << "]";
+            title << " (avg of " << accumulated_iterations_ << " iterations)";
+            table << title.str() << "" << "" << "" << "" << fort::endr;
+            table[0][0].set_cell_span(5);
+            table[0][0].set_cell_text_align(fort::text_align::center);
+            table.row(0).set_cell_content_fg_color(fort::color::light_cyan);
+        }
+
+        // Summary info
+        {
+            std::ostringstream info;
+            info << std::fixed << std::setprecision(2);
+            info << "GPU Avg: " << avg_gpu_ms << " ms";
+            info << "  |  Wall Avg: " << avg_wall_ms << " ms";
+            double gap = avg_wall_ms - avg_gpu_ms;
+            info << "  |  Gap: " << gap << " ms";
+            if (avg_wall_ms > 0.0)
+                info << " (" << std::setprecision(1) << (gap / avg_wall_ms * 100.0) << "% overhead)";
+            double tok_per_sec = 1000.0 / avg_gpu_ms;
+            info << "  |  GPU-limited: " << std::setprecision(1) << tok_per_sec << " tok/s";
+            table << info.str() << "" << "" << "" << "" << fort::endr;
+            table[1][0].set_cell_span(5);
+        }
+
+        // Header
+        table << fort::header << "STAGE TYPE" << "COUNT/iter" << "TOTAL (ms)" << "AVG/iter (ms)" << "%" << fort::endr;
+
+        table.column(0).set_cell_text_align(fort::text_align::left);
+        table.column(1).set_cell_text_align(fort::text_align::right);
+        table.column(2).set_cell_text_align(fort::text_align::right);
+        table.column(3).set_cell_text_align(fort::text_align::right);
+        table.column(4).set_cell_text_align(fort::text_align::right);
+
+        auto fmt_ms = [](float ms) -> std::string
+        {
+            std::ostringstream oss;
+            oss << std::fixed << std::setprecision(3) << ms;
+            return oss.str();
+        };
+
+        for (const auto &entry : agg)
+        {
+            float pct = total_gpu_ms > 0.0f ? (entry.total_ms / total_gpu_ms) * 100.0f : 0.0f;
+            std::ostringstream pct_str;
+            pct_str << std::fixed << std::setprecision(1) << pct << "%";
+
+            size_t count_per_iter = entry.count / accumulated_iterations_;
+            float ms_per_iter = entry.total_ms / accumulated_iterations_;
+
+            table << entry.type_name
+                  << std::to_string(count_per_iter)
+                  << fmt_ms(entry.total_ms)
+                  << fmt_ms(ms_per_iter)
+                  << pct_str.str()
+                  << fort::endr;
+        }
+
+        // Separator + total
+        table << fort::separator;
+        {
+            size_t total_count = 0;
+            for (const auto &e : agg)
+                total_count += e.count;
+            size_t count_per_iter = total_count / accumulated_iterations_;
+            table << "TOTAL"
+                  << std::to_string(count_per_iter)
+                  << fmt_ms(total_gpu_ms)
+                  << fmt_ms(avg_gpu_ms)
+                  << "100.0%"
+                  << fort::endr;
+        }
+
+        std::cout << table.to_string() << std::flush;
+
+        // Reset accumulated state
+        resetAccumulated();
+        return true;
+    }
+
     void StageTimeline::printDetailedTimeline(const char *phase_name,
                                               const char *device_name) const
     {

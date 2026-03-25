@@ -190,6 +190,9 @@ namespace llaminar2
                          generated_text += tokenizer->decode_token(next_token);
                      }
 
+                     // Flush accumulated GPU stage timeline for decode phase
+                     runner->flushStageTimeline();
+
                      // Build OpenAI-compatible response
                      json response = {
                          {"id", "chatcmpl-llaminar"},

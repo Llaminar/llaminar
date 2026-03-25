@@ -160,6 +160,9 @@ namespace llaminar2
             }
         }
 
+        // Flush accumulated GPU stage timeline for decode phase
+        runner->flushStageTimeline();
+
         if (mpi_ctx->rank() == 0)
         {
             std::cout << std::endl;

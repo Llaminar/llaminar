@@ -406,6 +406,8 @@ namespace llaminar2
                     }
                     return result;
                 }
+                // Flush accumulated GPU stage timeline for this decode phase
+                runner_->flushStageTimeline();
                 decode_times.push_back(decode_time);
                 decode_token_counts.push_back(tokens_generated);
                 last_generated_text = generated_text;

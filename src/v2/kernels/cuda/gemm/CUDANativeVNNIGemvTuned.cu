@@ -356,22 +356,35 @@ namespace
         int kb_max = std::max(2, k_groups / min_kgroups_per_cta);
         kb = std::min(kb, kb_max);
 
-        // Prefer factor of k_groups to avoid uneven splits
+        // Snap to nearest factor of k_groups for even splits.
+        // Find both nearest factor below and above, then pick the one
+        // whose total block count is closer to the target.
         if (k_groups % kb != 0)
         {
+            int best_lo = -1, best_hi = -1;
             for (int d = 1; d < kb; ++d)
-            {
                 if (kb - d >= 2 && k_groups % (kb - d) == 0)
                 {
-                    kb -= d;
+                    best_lo = kb - d;
                     break;
                 }
-                if (kb + d <= kb_max && k_groups % (kb + d) == 0)
+            for (int d = 1; kb + d <= kb_max; ++d)
+                if (k_groups % (kb + d) == 0)
                 {
-                    kb += d;
+                    best_hi = kb + d;
                     break;
                 }
+
+            if (best_lo > 0 && best_hi > 0)
+            {
+                int lo_dist = std::abs(grid_n * best_lo - target_blocks);
+                int hi_dist = std::abs(grid_n * best_hi - target_blocks);
+                kb = (hi_dist < lo_dist) ? best_hi : best_lo;
             }
+            else if (best_lo > 0)
+                kb = best_lo;
+            else if (best_hi > 0)
+                kb = best_hi;
         }
         return std::max(1, kb);
     }
@@ -572,13 +585,24 @@ namespace
             // k-block iteration, allowing warps to pipeline across iterations
             // independently — critical for low-work-per-CTA shapes (e.g. 3584×3584
             // attn with only 4 k-blocks/CTA where barriers were 78% L1TEX-stalled).
+            //
+            // Use 2 × int4 (128-bit) loads instead of 8 × int32 (32-bit) to
+            // reduce instruction count from 8 LDG.E to 2 LDG.E.128 and let the
+            // compiler allocate into consecutive register quads for ILP.
             int32_t a_vals[8];
             {
-                const int32_t *a_ptr = reinterpret_cast<const int32_t *>(
+                const int4 *a_ptr128 = reinterpret_cast<const int4 *>(
                     d_A_int8 + blk * BLOCK_K);
-#pragma unroll
-                for (int g = 0; g < 8; ++g)
-                    a_vals[g] = a_ptr[g];
+                const int4 a_lo = a_ptr128[0];
+                const int4 a_hi = a_ptr128[1];
+                a_vals[0] = a_lo.x;
+                a_vals[1] = a_lo.y;
+                a_vals[2] = a_lo.z;
+                a_vals[3] = a_lo.w;
+                a_vals[4] = a_hi.x;
+                a_vals[5] = a_hi.y;
+                a_vals[6] = a_hi.z;
+                a_vals[7] = a_hi.w;
             }
 
             const float scale_a = d_scales_A[blk];
@@ -729,10 +753,20 @@ namespace
 
             // Load A data for this K-block from global memory (L2-cached across blocks)
             int32_t a_vals[8];
-#pragma unroll
-            for (int g = 0; g < 8; ++g)
-                a_vals[g] = *reinterpret_cast<const int32_t *>(
-                    d_A_int8 + blk * BLOCK_K + g * 4);
+            {
+                const int4 *a_ptr128 = reinterpret_cast<const int4 *>(
+                    d_A_int8 + blk * BLOCK_K);
+                const int4 a_lo = a_ptr128[0];
+                const int4 a_hi = a_ptr128[1];
+                a_vals[0] = a_lo.x;
+                a_vals[1] = a_lo.y;
+                a_vals[2] = a_lo.z;
+                a_vals[3] = a_lo.w;
+                a_vals[4] = a_hi.x;
+                a_vals[5] = a_hi.y;
+                a_vals[6] = a_hi.z;
+                a_vals[7] = a_hi.w;
+            }
 
             // Row-major indexing: [n, blk]
             const size_t linear = static_cast<size_t>(n) * k_blocks + blk;

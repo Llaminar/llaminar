@@ -577,8 +577,11 @@ __global__ void rope_fp16_fused_qk_kernel(
 // =========================================================================
 
 /**
- * @brief FP32 RoPE decode kernel - single token, scalar position
- * No position_ids array needed - position passed as scalar parameter
+ * @brief FP32 RoPE decode kernel - register-only sin/cos, no shared memory
+ *
+ * One block per head (Q + K). Each thread computes its own sin/cos in registers
+ * and applies the rotation directly. No shared memory or __syncthreads needed
+ * when half_dim <= blockDim.x (each thread handles exactly one dim pair).
  */
 __global__ void rope_fp32_decode_kernel(
     float *__restrict__ Q,
@@ -590,61 +593,38 @@ __global__ void rope_fp32_decode_kernel(
     int head_dim)
 {
     const int half_dim = head_dim / 2;
-
-    extern __shared__ float smem[];
-    float *s_cos = smem;
-    float *s_sin = smem + half_dim;
-
-    // Blocks for Q: 0 .. n_q_heads-1
-    // Blocks for K: n_q_heads .. n_q_heads + n_kv_heads - 1
-    int total_q_blocks = n_q_heads;
     int block_idx = blockIdx.x;
 
     float *data;
-    int n_heads;
     int head_idx;
-
-    if (block_idx < total_q_blocks)
+    if (block_idx < n_q_heads)
     {
         data = Q;
-        n_heads = n_q_heads;
         head_idx = block_idx;
     }
     else
     {
-        if (K == nullptr)
-            return;
         data = K;
-        n_heads = n_kv_heads;
-        head_idx = block_idx - total_q_blocks;
+        head_idx = block_idx - n_q_heads;
     }
 
-    // Compute sin/cos table for this position
+    int base = head_idx * head_dim;
+
     for (int i = threadIdx.x; i < half_dim; i += blockDim.x)
     {
         float angle = pos * inv_freq[i];
-        __sincosf(angle, &s_sin[i], &s_cos[i]);
-    }
-    __syncthreads();
+        float sin_val, cos_val;
+        __sincosf(angle, &sin_val, &cos_val);
 
-    // Apply rotation (seq_idx=0 for decode)
-    int base_idx = head_idx * head_dim;
-
-    for (int i = threadIdx.x; i < half_dim; i += blockDim.x)
-    {
-        int i0 = base_idx + i;
-        int i1 = base_idx + i + half_dim;
-
-        float x0 = data[i0];
-        float x1 = data[i1];
-
-        data[i0] = x0 * s_cos[i] - x1 * s_sin[i];
-        data[i1] = x0 * s_sin[i] + x1 * s_cos[i];
+        float x0 = data[base + i];
+        float x1 = data[base + i + half_dim];
+        data[base + i] = x0 * cos_val - x1 * sin_val;
+        data[base + i + half_dim] = x0 * sin_val + x1 * cos_val;
     }
 }
 
 /**
- * @brief BF16 RoPE decode kernel - single token, scalar position
+ * @brief BF16 RoPE decode kernel - register-only sin/cos, no shared memory
  */
 __global__ void rope_bf16_decode_kernel(
     uint16_t *__restrict__ Q,
@@ -656,54 +636,38 @@ __global__ void rope_bf16_decode_kernel(
     int head_dim)
 {
     const int half_dim = head_dim / 2;
-
-    extern __shared__ float smem[];
-    float *s_cos = smem;
-    float *s_sin = smem + half_dim;
-
-    int total_q_blocks = n_q_heads;
     int block_idx = blockIdx.x;
 
     uint16_t *data;
     int head_idx;
-
-    if (block_idx < total_q_blocks)
+    if (block_idx < n_q_heads)
     {
         data = Q;
         head_idx = block_idx;
     }
     else
     {
-        if (K == nullptr)
-            return;
         data = K;
-        head_idx = block_idx - total_q_blocks;
+        head_idx = block_idx - n_q_heads;
     }
+
+    int base = head_idx * head_dim;
 
     for (int i = threadIdx.x; i < half_dim; i += blockDim.x)
     {
         float angle = pos * inv_freq[i];
-        __sincosf(angle, &s_sin[i], &s_cos[i]);
-    }
-    __syncthreads();
+        float sin_val, cos_val;
+        __sincosf(angle, &sin_val, &cos_val);
 
-    int base_idx = head_idx * head_dim;
-
-    for (int i = threadIdx.x; i < half_dim; i += blockDim.x)
-    {
-        int i0 = base_idx + i;
-        int i1 = base_idx + i + half_dim;
-
-        float x0 = bf16_to_float(data[i0]);
-        float x1 = bf16_to_float(data[i1]);
-
-        data[i0] = float_to_bf16(x0 * s_cos[i] - x1 * s_sin[i]);
-        data[i1] = float_to_bf16(x0 * s_sin[i] + x1 * s_cos[i]);
+        float x0 = bf16_to_float(data[base + i]);
+        float x1 = bf16_to_float(data[base + i + half_dim]);
+        data[base + i] = float_to_bf16(x0 * cos_val - x1 * sin_val);
+        data[base + i + half_dim] = float_to_bf16(x0 * sin_val + x1 * cos_val);
     }
 }
 
 /**
- * @brief FP16 RoPE decode kernel - single token, scalar position
+ * @brief FP16 RoPE decode kernel - register-only sin/cos, no shared memory
  */
 __global__ void rope_fp16_decode_kernel(
     uint16_t *__restrict__ Q,
@@ -715,49 +679,33 @@ __global__ void rope_fp16_decode_kernel(
     int head_dim)
 {
     const int half_dim = head_dim / 2;
-
-    extern __shared__ float smem[];
-    float *s_cos = smem;
-    float *s_sin = smem + half_dim;
-
-    int total_q_blocks = n_q_heads;
     int block_idx = blockIdx.x;
 
     uint16_t *data;
     int head_idx;
-
-    if (block_idx < total_q_blocks)
+    if (block_idx < n_q_heads)
     {
         data = Q;
         head_idx = block_idx;
     }
     else
     {
-        if (K == nullptr)
-            return;
         data = K;
-        head_idx = block_idx - total_q_blocks;
+        head_idx = block_idx - n_q_heads;
     }
+
+    int base = head_idx * head_dim;
 
     for (int i = threadIdx.x; i < half_dim; i += blockDim.x)
     {
         float angle = pos * inv_freq[i];
-        __sincosf(angle, &s_sin[i], &s_cos[i]);
-    }
-    __syncthreads();
+        float sin_val, cos_val;
+        __sincosf(angle, &sin_val, &cos_val);
 
-    int base_idx = head_idx * head_dim;
-
-    for (int i = threadIdx.x; i < half_dim; i += blockDim.x)
-    {
-        int i0 = base_idx + i;
-        int i1 = base_idx + i + half_dim;
-
-        float x0 = fp16_to_float(data[i0]);
-        float x1 = fp16_to_float(data[i1]);
-
-        data[i0] = float_to_fp16(x0 * s_cos[i] - x1 * s_sin[i]);
-        data[i1] = float_to_fp16(x0 * s_sin[i] + x1 * s_cos[i]);
+        float x0 = fp16_to_float(data[base + i]);
+        float x1 = fp16_to_float(data[base + i + half_dim]);
+        data[base + i] = float_to_fp16(x0 * cos_val - x1 * sin_val);
+        data[base + i + half_dim] = float_to_fp16(x0 * sin_val + x1 * cos_val);
     }
 }
 
@@ -1103,12 +1051,11 @@ extern "C"
         cudaSetDevice(device_idx);
 
         const int half_dim = head_dim / 2;
-        const int threads_per_block = min(256, half_dim);
-        const size_t smem_size = 2 * half_dim * sizeof(float);
 
-        // The decode kernel handles both Q and K in one launch
+        // One block per head, register-only sin/cos (no shared memory)
         int total_blocks = n_heads + (K ? n_kv_heads : 0);
-        rope_fp32_decode_kernel<<<total_blocks, threads_per_block, smem_size, stream>>>(
+        int threads_per_block = min(256, half_dim);
+        rope_fp32_decode_kernel<<<total_blocks, threads_per_block, 0, stream>>>(
             Q, K, d_inv_freq, pos, n_heads, n_kv_heads, head_dim);
 
         (void)cudaGetLastError(); // Clear stale errors
@@ -1212,12 +1159,10 @@ extern "C"
         cudaSetDevice(device_idx);
 
         const int half_dim = head_dim / 2;
-        const int threads_per_block = min(256, half_dim);
-        const size_t smem_size = 2 * half_dim * sizeof(float);
 
-        // The decode kernel handles both Q and K in one launch
         int total_blocks = n_heads + (K ? n_kv_heads : 0);
-        rope_bf16_decode_kernel<<<total_blocks, threads_per_block, smem_size, stream>>>(
+        int threads_per_block = min(256, half_dim);
+        rope_bf16_decode_kernel<<<total_blocks, threads_per_block, 0, stream>>>(
             Q, K, d_inv_freq, pos, n_heads, n_kv_heads, head_dim);
 
         (void)cudaGetLastError(); // Clear stale errors
@@ -1321,12 +1266,10 @@ extern "C"
         cudaSetDevice(device_idx);
 
         const int half_dim = head_dim / 2;
-        const int threads_per_block = min(256, half_dim);
-        const size_t smem_size = 2 * half_dim * sizeof(float);
 
-        // The decode kernel handles both Q and K in one launch
         int total_blocks = n_heads + (K ? n_kv_heads : 0);
-        rope_fp16_decode_kernel<<<total_blocks, threads_per_block, smem_size, stream>>>(
+        int threads_per_block = min(256, half_dim);
+        rope_fp16_decode_kernel<<<total_blocks, threads_per_block, 0, stream>>>(
             Q, K, d_inv_freq, pos, n_heads, n_kv_heads, head_dim);
 
         (void)cudaGetLastError(); // Clear stale errors
@@ -1718,12 +1661,11 @@ extern "C"
             return false;
 
         const int half_dim = head_dim / 2;
-        const int threads_per_block = min(256, half_dim);
-        const size_t smem_size = 2 * half_dim * sizeof(float);
 
         int total_blocks = n_heads + (K ? n_kv_heads : 0);
+        int threads_per_block = min(256, half_dim);
 
-        rope_fp32_decode_kernel<<<total_blocks, threads_per_block, smem_size>>>(
+        rope_fp32_decode_kernel<<<total_blocks, threads_per_block, 0>>>(
             Q, K, d_inv_freq, pos, n_heads, n_kv_heads, head_dim);
 
         (void)cudaGetLastError(); // Clear stale errors
@@ -1754,12 +1696,11 @@ extern "C"
             return false;
 
         const int half_dim = head_dim / 2;
-        const int threads_per_block = min(256, half_dim);
-        const size_t smem_size = 2 * half_dim * sizeof(float);
 
         int total_blocks = n_heads + (K ? n_kv_heads : 0);
+        int threads_per_block = min(256, half_dim);
 
-        rope_bf16_decode_kernel<<<total_blocks, threads_per_block, smem_size>>>(
+        rope_bf16_decode_kernel<<<total_blocks, threads_per_block, 0>>>(
             Q, K, d_inv_freq, pos, n_heads, n_kv_heads, head_dim);
 
         (void)cudaGetLastError(); // Clear stale errors
@@ -1790,12 +1731,11 @@ extern "C"
             return false;
 
         const int half_dim = head_dim / 2;
-        const int threads_per_block = min(256, half_dim);
-        const size_t smem_size = 2 * half_dim * sizeof(float);
 
         int total_blocks = n_heads + (K ? n_kv_heads : 0);
+        int threads_per_block = min(256, half_dim);
 
-        rope_fp16_decode_kernel<<<total_blocks, threads_per_block, smem_size>>>(
+        rope_fp16_decode_kernel<<<total_blocks, threads_per_block, 0>>>(
             Q, K, d_inv_freq, pos, n_heads, n_kv_heads, head_dim);
 
         (void)cudaGetLastError(); // Clear stale errors

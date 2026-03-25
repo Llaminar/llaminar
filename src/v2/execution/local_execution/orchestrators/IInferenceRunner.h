@@ -198,6 +198,15 @@ namespace llaminar2
         virtual void setSuppressTimeline(bool) {}
 
         /**
+         * @brief Flush accumulated GPU stage timeline data
+         *
+         * Prints accumulated decode stage timing summary and resets.
+         * Called after decode phase completes (e.g., by BenchmarkRunner).
+         * Default: no-op (not all runners support this).
+         */
+        virtual void flushStageTimeline() {}
+
+        /**
          * @brief Get current position in cache
          */
         virtual int get_position() const = 0;

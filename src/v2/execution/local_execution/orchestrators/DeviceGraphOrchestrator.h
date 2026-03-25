@@ -841,6 +841,19 @@ namespace llaminar2
 
         void setSuppressTimeline(bool suppress) override { suppress_timeline_ = suppress; }
 
+        void flushStageTimeline() override
+        {
+            if (!debugEnv().gpu_stage_timing || !debugEnv().profile.enabled)
+                return;
+
+            auto &timeline = executor_.stageTimeline();
+            if (timeline.hasAccumulatedData())
+            {
+                std::string dev_str = state_.device_id.toString();
+                timeline.printAccumulatedSummary("DECODE", dev_str.c_str());
+            }
+        }
+
         /**
          * @brief Transition to a new inference phase with logging
          *
@@ -1349,12 +1362,16 @@ namespace llaminar2
         /**
          * @brief Clear KV cache (IInferenceRunner override)
          */
-        void clear_cache() override {
-            for (auto& [dev, ctx] : device_contexts_) {
-                if (ctx && dev.is_gpu()) ctx->synchronize();
+        void clear_cache() override
+        {
+            for (auto &[dev, ctx] : device_contexts_)
+            {
+                if (ctx && dev.is_gpu())
+                    ctx->synchronize();
             }
             // Invalidate graph caches but preserve device contexts
-            for (auto& entry : layer_graph_cache_) {
+            for (auto &entry : layer_graph_cache_)
+            {
                 entry.valid = false;
             }
             forward_graph_cache_.clear();

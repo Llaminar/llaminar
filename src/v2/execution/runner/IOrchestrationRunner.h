@@ -357,6 +357,8 @@ namespace llaminar2
 
         virtual void setSuppressTimeline(bool /*suppress*/) {}
 
+        virtual void flushStageTimeline() {}
+
         /**
          * @brief Set active sampling parameters for use in decodeStep()
          *
