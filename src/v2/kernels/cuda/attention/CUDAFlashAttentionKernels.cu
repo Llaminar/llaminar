@@ -1095,6 +1095,174 @@ namespace
         }
     }
 
+    // =========================================================================
+    // Flash Decoding kernel — FP16 KV cache variant
+    //
+    // Identical to flash_decoding_fp32_kernel but reads K/V from FP16 (half)
+    // storage directly, eliminating the FP16→FP32 conversion kernel launches
+    // and halving KV cache bandwidth.
+    // =========================================================================
+
+    __global__ __launch_bounds__(256, 4) void flash_decoding_fp16kv_kernel(
+        const float *__restrict__ Q,
+        const half *__restrict__ K_cache,
+        const half *__restrict__ V_cache,
+        float *__restrict__ O_partial,
+        float *__restrict__ m_partial,
+        float *__restrict__ l_partial,
+        int kv_len,
+        int n_heads,
+        int n_kv_heads,
+        int head_dim,
+        int num_splits,
+        float softmax_scale,
+        const llaminar2::attention::AttentionDeviceParams *__restrict__ device_params)
+    {
+        int kv_stride = kv_len;
+        int kv_len_runtime = kv_len;
+        if (device_params)
+        {
+            kv_len_runtime = device_params->kv_len;
+        }
+
+        const int head_idx = blockIdx.x;
+        const int split_idx = blockIdx.y;
+        const int batch_idx = blockIdx.z;
+
+        const int kv_head_idx = (n_heads == n_kv_heads) ? head_idx : (head_idx / (n_heads / n_kv_heads));
+
+        const int split_size = (kv_len_runtime + num_splits - 1) / num_splits;
+        const int kv_start = split_idx * split_size;
+        const int kv_end = min(kv_start + split_size, kv_len_runtime);
+
+        const int partial_idx = (batch_idx * n_heads + head_idx) * num_splits + split_idx;
+
+        if (kv_start >= kv_len_runtime)
+        {
+            if (threadIdx.x == 0)
+            {
+                m_partial[partial_idx] = -FLT_MAX;
+                l_partial[partial_idx] = 0.0f;
+            }
+            float *O_out = O_partial + partial_idx * head_dim;
+            for (int d = threadIdx.x; d < head_dim; d += blockDim.x)
+            {
+                O_out[d] = 0.0f;
+            }
+            return;
+        }
+
+        const int tid = threadIdx.x;
+        const int num_threads = blockDim.x;
+        const int warp_id = tid / WARP_SIZE;
+        const int lane_id = tid % WARP_SIZE;
+        const int num_warps = num_threads / WARP_SIZE;
+
+        extern __shared__ char smem[];
+        float *Q_shared = reinterpret_cast<float *>(smem);
+
+        const float *Q_ptr = Q + (batch_idx * n_heads + head_idx) * head_dim;
+        for (int d = tid; d < head_dim; d += num_threads)
+        {
+            Q_shared[d] = Q_ptr[d];
+        }
+        __syncthreads();
+
+        constexpr int MAX_DIMS_PER_LANE = 8;
+        float O_lane[MAX_DIMS_PER_LANE] = {0};
+        float m_local = -FLT_MAX;
+        float l_local = 0.0f;
+
+        const half *K_batch = K_cache + batch_idx * kv_stride * n_kv_heads * head_dim;
+        const half *V_batch = V_cache + batch_idx * kv_stride * n_kv_heads * head_dim;
+
+        for (int kv_pos = kv_start + warp_id; kv_pos < kv_end; kv_pos += num_warps)
+        {
+            const half *K_ptr = K_batch + kv_pos * n_kv_heads * head_dim + kv_head_idx * head_dim;
+
+            float partial_dot = 0.0f;
+            for (int d = lane_id; d < head_dim; d += WARP_SIZE)
+            {
+                partial_dot += Q_shared[d] * __half2float(K_ptr[d]);
+            }
+
+            float score = warpReduceSum(partial_dot) * softmax_scale;
+
+            float m_new = fmaxf(m_local, score);
+            float scale_old = __expf(m_local - m_new);
+            float p = __expf(score - m_new);
+
+            l_local = l_local * scale_old + p;
+
+            const half *V_ptr = V_batch + kv_pos * n_kv_heads * head_dim + kv_head_idx * head_dim;
+            int o_idx = 0;
+            for (int d = lane_id; d < head_dim; d += WARP_SIZE, o_idx++)
+            {
+                O_lane[o_idx] = O_lane[o_idx] * scale_old + p * __half2float(V_ptr[d]);
+            }
+
+            m_local = m_new;
+        }
+
+        __shared__ float block_m[8];
+        __shared__ float block_l[8];
+        __shared__ float block_O[8 * 128];
+
+        if (lane_id == 0)
+        {
+            block_m[warp_id] = m_local;
+            block_l[warp_id] = l_local;
+        }
+        {
+            int o_idx = 0;
+            for (int d = lane_id; d < head_dim; d += WARP_SIZE, o_idx++)
+            {
+                block_O[warp_id * head_dim + d] = O_lane[o_idx];
+            }
+        }
+        __syncthreads();
+
+        __shared__ float warp_scales[8];
+        if (tid == 0)
+        {
+            float final_m = block_m[0];
+            float final_l = block_l[0];
+            warp_scales[0] = 1.0f;
+
+            for (int w = 1; w < num_warps; w++)
+            {
+                float other_m = block_m[w];
+                float other_l = block_l[w];
+
+                float m_new = fmaxf(final_m, other_m);
+                float scale_self = __expf(final_m - m_new);
+                float scale_other = __expf(other_m - m_new);
+
+                for (int prev = 0; prev < w; prev++)
+                    warp_scales[prev] *= scale_self;
+                warp_scales[w] = scale_other;
+
+                final_l = scale_self * final_l + scale_other * other_l;
+                final_m = m_new;
+            }
+
+            m_partial[partial_idx] = final_m;
+            l_partial[partial_idx] = final_l;
+        }
+        __syncthreads();
+
+        float *O_out = O_partial + partial_idx * head_dim;
+        for (int d = tid; d < head_dim; d += num_threads)
+        {
+            float sum = 0.0f;
+            for (int w = 0; w < num_warps; w++)
+            {
+                sum += warp_scales[w] * block_O[w * head_dim + d];
+            }
+            O_out[d] = sum;
+        }
+    }
+
 } // anonymous namespace
 
 // =============================================================================
@@ -1425,6 +1593,56 @@ extern "C"
         }
 
         // Phase 2: Reduce partials to final output
+        {
+            dim3 grid(n_heads, batch_size);
+            int block_size = min(head_dim, 256);
+
+            flash_decoding_reduce_fp32_kernel<<<grid, block_size, 0, cuda_stream>>>(
+                O_partial, m_partial, l_partial, O,
+                n_heads, head_dim, num_splits);
+        }
+
+        return cudaGetLastError() == cudaSuccess ? 0 : -1;
+    }
+
+    /**
+     * @brief Launch Flash Decoding kernel with FP16 KV cache (no conversion)
+     *
+     * Same workspace layout as FP32 variant. K/V are read directly as FP16
+     * and converted to FP32 in registers, eliminating the separate conversion
+     * kernels and halving KV cache bandwidth.
+     */
+    int cudaFlashAttn_decode_fp16kv(
+        const float *Q, const void *K_cache_fp16, const void *V_cache_fp16, float *O,
+        float *O_partial, float *m_partial, float *l_partial,
+        int batch_size, int kv_len,
+        int n_heads, int n_kv_heads, int head_dim,
+        int num_splits,
+        const llaminar2::attention::AttentionDeviceParams *device_params,
+        void *stream,
+        int device_idx)
+    {
+        cudaSetDevice(device_idx);
+        cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
+
+        float softmax_scale = 1.0f / sqrtf(static_cast<float>(head_dim));
+
+        // Phase 1: Compute partial attention per split (FP16 KV)
+        {
+            dim3 grid(n_heads, num_splits, batch_size);
+            int block_size = 256;
+            size_t smem_size = head_dim * sizeof(float);
+
+            flash_decoding_fp16kv_kernel<<<grid, block_size, smem_size, cuda_stream>>>(
+                Q,
+                static_cast<const half *>(K_cache_fp16),
+                static_cast<const half *>(V_cache_fp16),
+                O_partial, m_partial, l_partial,
+                kv_len, n_heads, n_kv_heads, head_dim,
+                num_splits, softmax_scale, device_params);
+        }
+
+        // Phase 2: Reduce partials (same as FP32 — operates on FP32 partials)
         {
             dim3 grid(n_heads, batch_size);
             int block_size = min(head_dim, 256);

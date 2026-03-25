@@ -2118,6 +2118,15 @@ namespace llaminar2
                     return true;
                 }
 
+                // NativeVNNI-only mode: no INT8 expanded weights, so blockwise
+                // fallback is impossible.  Return false immediately — the caller
+                // knows this codebook only supports NativeVNNI paths.
+                if (!impl_->d_weights_int8 && !impl_->d_scales_B)
+                {
+                    LOG_DEBUG("[CUDAQuantisedGemmKernel] NativeVNNI GEMV declined and no INT8 fallback (vnni-only mode)");
+                    return false;
+                }
+
                 // Step 2: Blockwise GEMM (produces FP32 directly, includes scaling)
                 {
                     CUDA_KERNEL_PROFILE_SCOPE(CUDAKernelType::GEMM);

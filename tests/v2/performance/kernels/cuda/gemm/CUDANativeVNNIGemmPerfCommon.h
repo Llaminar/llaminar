@@ -80,7 +80,7 @@ namespace llaminar2::test::native_vnni_gemm_perf
          { return TestTensorFactory::createIQ1_SRandom({n, k}); }},
         {"IQ1_M", 17, [](size_t n, size_t k)
          { return TestTensorFactory::createIQ1_MRandom({n, k}); }},
-        {"Q8_0", 18, [](size_t n, size_t k)
+        {"Q8_0", 19, [](size_t n, size_t k)
          { return TestTensorFactory::createQ8_0Random({n, k}); }},
     };
 

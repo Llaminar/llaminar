@@ -1996,6 +1996,151 @@ namespace llaminar2
             }
         }
 
+        /**
+         * @brief Sum N Q16_1 block arrays and produce FP32 output
+         *
+         * Like q16_1_sum_n but writes the accumulated FP32 result directly,
+         * avoiding the requantization step. Used for compressed allreduce where
+         * the final output needs to be FP32 (e.g., MPI allreduce with Q16_1 transfer).
+         *
+         * Algorithm per block:
+         * 1. Dequantize all N blocks to FP32 (accumulated in registers)
+         * 2. Sum all FP32 values
+         * 3. Store FP32 directly to output
+         *
+         * @param inputs Array of N pointers to Q16_1 block arrays
+         * @param n_inputs Number of input arrays (typically world_size)
+         * @param output FP32 output buffer (at least total_elements floats)
+         * @param n_blocks Number of Q16_1 blocks per input array
+         * @param total_elements Total number of FP32 elements (for partial last block)
+         */
+        inline void q16_1_sum_n_to_fp32(
+            const Q16_1Block *const *inputs, size_t n_inputs, float *output,
+            size_t n_blocks, size_t total_elements)
+        {
+            if (n_inputs == 0)
+                return;
+
+            // Single input: just dequantize
+            if (n_inputs == 1)
+            {
+                for (size_t blk = 0; blk < n_blocks; ++blk)
+                {
+                    size_t base = blk * 32;
+                    size_t elems = std::min(size_t(32), total_elements - base);
+                    const Q16_1Block &block = inputs[0][blk];
+                    float scale = block.d;
+                    for (size_t j = 0; j < elems; ++j)
+                        output[base + j] = scale * static_cast<float>(block.qs[j]);
+                }
+                return;
+            }
+
+            for (size_t blk = 0; blk < n_blocks; ++blk)
+            {
+                size_t base = blk * 32;
+                size_t elems = std::min(size_t(32), total_elements - base);
+
+#ifdef __AVX512F__
+                __m512 acc0 = _mm512_setzero_ps();
+                __m512 acc1 = _mm512_setzero_ps();
+
+                for (size_t i = 0; i < n_inputs; ++i)
+                {
+                    const Q16_1Block &block = inputs[i][blk];
+                    const float scale = block.d;
+                    const __m512 vscale = _mm512_set1_ps(scale);
+
+                    __m256i q_lo = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(block.qs));
+                    __m256i q_hi = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(block.qs + 16));
+                    __m512i i32_lo = _mm512_cvtepi16_epi32(q_lo);
+                    __m512i i32_hi = _mm512_cvtepi16_epi32(q_hi);
+                    __m512 f_lo = _mm512_cvtepi32_ps(i32_lo);
+                    __m512 f_hi = _mm512_cvtepi32_ps(i32_hi);
+
+                    acc0 = _mm512_fmadd_ps(f_lo, vscale, acc0);
+                    acc1 = _mm512_fmadd_ps(f_hi, vscale, acc1);
+                }
+
+                if (elems >= 32)
+                {
+                    _mm512_storeu_ps(output + base, acc0);
+                    _mm512_storeu_ps(output + base + 16, acc1);
+                }
+                else
+                {
+                    // Partial block: use masking
+                    if (elems > 16)
+                    {
+                        _mm512_storeu_ps(output + base, acc0);
+                        __mmask16 mask = static_cast<__mmask16>((1u << (elems - 16)) - 1u);
+                        _mm512_mask_storeu_ps(output + base + 16, mask, acc1);
+                    }
+                    else
+                    {
+                        __mmask16 mask = static_cast<__mmask16>((1u << elems) - 1u);
+                        _mm512_mask_storeu_ps(output + base, mask, acc0);
+                    }
+                }
+
+#elif defined(__AVX2__)
+                __m256 acc_0 = _mm256_setzero_ps();
+                __m256 acc_1 = _mm256_setzero_ps();
+                __m256 acc_2 = _mm256_setzero_ps();
+                __m256 acc_3 = _mm256_setzero_ps();
+
+                for (size_t i = 0; i < n_inputs; ++i)
+                {
+                    const Q16_1Block &block = inputs[i][blk];
+                    const float scale = block.d;
+                    __m256 scale_vec = _mm256_set1_ps(scale);
+
+                    for (int chunk = 0; chunk < 4; ++chunk)
+                    {
+                        __m128i q16 = _mm_loadu_si128(
+                            reinterpret_cast<const __m128i *>(block.qs + chunk * 8));
+                        __m256i q32 = _mm256_cvtepi16_epi32(q16);
+                        __m256 f = _mm256_mul_ps(_mm256_cvtepi32_ps(q32), scale_vec);
+
+                        switch (chunk)
+                        {
+                        case 0:
+                            acc_0 = _mm256_add_ps(acc_0, f);
+                            break;
+                        case 1:
+                            acc_1 = _mm256_add_ps(acc_1, f);
+                            break;
+                        case 2:
+                            acc_2 = _mm256_add_ps(acc_2, f);
+                            break;
+                        case 3:
+                            acc_3 = _mm256_add_ps(acc_3, f);
+                            break;
+                        }
+                    }
+                }
+
+                alignas(32) float temp[32];
+                _mm256_store_ps(temp, acc_0);
+                _mm256_store_ps(temp + 8, acc_1);
+                _mm256_store_ps(temp + 16, acc_2);
+                _mm256_store_ps(temp + 24, acc_3);
+                std::memcpy(output + base, temp, elems * sizeof(float));
+#else
+                // Scalar fallback
+                alignas(64) float sum_vals[32] = {0.0f};
+                for (size_t i = 0; i < n_inputs; ++i)
+                {
+                    const Q16_1Block &block = inputs[i][blk];
+                    const float scale = block.d;
+                    for (int j = 0; j < 32; ++j)
+                        sum_vals[j] += scale * static_cast<float>(block.qs[j]);
+                }
+                std::memcpy(output + base, sum_vals, elems * sizeof(float));
+#endif
+            }
+        }
+
         // ==================== Q16_1 Native Operations ====================
 
         /**

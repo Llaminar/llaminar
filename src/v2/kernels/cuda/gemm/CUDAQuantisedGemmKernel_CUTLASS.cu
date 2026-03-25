@@ -156,8 +156,12 @@ namespace
      * quantization block of 32 elements with fully coalesced access.
      * Uses warp shuffle for max reduction (no shared memory needed).
      *
-     * Grid: (M, 1, 1) - one block per row
-     * Block: (256, 1, 1) - 8 warps per block
+     * Uses 2D grid for K-parallel execution:
+     * Grid:  (grid_x, M) — multiple CUDA blocks share K-blocks of each row
+     * Block: (128, 1, 1) — 4 warps per block
+     *
+     * Each 32-element K-block is independently quantized, so K-parallelism is trivial.
+     * Critical for decode (M=1) where a 1D grid wastes 81 of 82 SMs.
      */
     __global__ void quantize_activations_blockwise_kernel(
         const float *__restrict__ A_fp32,       // [M × K]
@@ -165,20 +169,24 @@ namespace
         float *__restrict__ scales_A_blockwise, // [M × num_blocks] output
         int M, int K)
     {
-        const int row = blockIdx.x;
+        const int row = blockIdx.y;
         if (row >= M)
             return;
 
         const int num_blocks = K / BLOCKWISE_BLOCK_SIZE;
         const int lane = threadIdx.x & 31;
         const int warp_id = threadIdx.x >> 5;
-        constexpr int NUM_WARPS = 8;
+        const int num_warps = blockDim.x >> 5;
+
+        // Global warp index across all blocks in this row
+        const int global_warp = blockIdx.x * num_warps + warp_id;
+        const int total_warps = gridDim.x * num_warps;
 
         const float *row_fp32 = A_fp32 + row * K;
         int8_t *row_int8 = A_int8 + row * K;
         float *row_scales = scales_A_blockwise + row * num_blocks;
 
-        for (int b = warp_id; b < num_blocks; b += NUM_WARPS)
+        for (int b = global_warp; b < num_blocks; b += total_warps)
         {
             const int k_start = b * BLOCKWISE_BLOCK_SIZE;
 
@@ -720,9 +728,17 @@ extern "C"
 
         CUDA_CHECK_THROW(cudaSetDevice(cuda_device_id));
 
-        const int num_blocks = K / BLOCKWISE_BLOCK_SIZE;
-        dim3 grid(M);
-        dim3 block(256); // 8 warps, each cooperatively processes one 32-element block
+        // 2D grid: blockIdx.x distributes K-blocks, blockIdx.y distributes rows.
+        // For decode (M=1), this ensures all SMs participate instead of just 1.
+        constexpr int NUM_WARPS = 4;
+        constexpr int BLOCK_SIZE = NUM_WARPS * 32; // 128 threads
+        const int num_k_blocks = K / BLOCKWISE_BLOCK_SIZE;
+        int grid_x = (num_k_blocks + NUM_WARPS - 1) / NUM_WARPS;
+        if (grid_x > 256)
+            grid_x = 256;
+
+        dim3 grid(grid_x, M);
+        dim3 block(BLOCK_SIZE);
 
         cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
         quantize_activations_blockwise_kernel<<<grid, block, 0, cuda_stream>>>(

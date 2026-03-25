@@ -65,6 +65,17 @@ extern "C"
         void *stream,
         int device_idx);
 
+    // Flash Decoding with FP16 KV cache — reads half directly, no conversion
+    int cudaFlashAttn_decode_fp16kv(
+        const float *Q, const void *K_cache_fp16, const void *V_cache_fp16, float *O,
+        float *O_partial, float *m_partial, float *l_partial,
+        int batch_size, int kv_len,
+        int n_heads, int n_kv_heads, int head_dim,
+        int num_splits,
+        const llaminar2::attention::AttentionDeviceParams *device_params,
+        void *stream,
+        int device_idx);
+
     int cudaFlashAttn_allocWorkspace(
         void **partial_output, void **partial_m, void **partial_l,
         int batch_size, int n_heads, int head_dim, int num_splits);
@@ -524,10 +535,9 @@ namespace llaminar2
                 }
             }
 
-            // === Mixed-precision KV conversion (FP16→FP32 or Q8_1→FP32) ===
-            // For FP16 KV + prefill (seq_len > 1), we skip conversion entirely and
-            // pass the FP16 pointers directly to the FA2 FP16KV kernel variant,
-            // eliminating the FP16→FP32→FP16 round-trip through global memory.
+            // === Mixed-precision KV handling (FP16→direct or Q8_1→FP32) ===
+            // For FP16 KV: both prefill (seq_len > 1) and decode (seq_len == 1)
+            // use direct FP16 kernel variants, eliminating FP16→FP32 conversion.
             bool use_fp16kv_direct = false;
             const void *K_fp16_ptr = nullptr;
             const void *V_fp16_ptr = nullptr;
@@ -541,11 +551,10 @@ namespace llaminar2
                     return false;
                 }
 
-                if (K->native_type() == TensorType::FP16 && seq_len > 1)
+                if (K->native_type() == TensorType::FP16)
                 {
-                    // FAST PATH: FP16 KV + prefill → pass FP16 pointers directly to FA2
-                    // The FA2 FP16KV kernel loads half from global memory into shared memory
-                    // without any FP32 intermediate, saving ~2× K/V bandwidth.
+                    // FAST PATH: FP16 KV → pass FP16 pointers directly to kernel
+                    // Works for both prefill (FA2 FP16KV) and decode (flash_decoding_fp16kv)
                     use_fp16kv_direct = true;
                     K_fp16_ptr = K->gpu_data_ptr();
                     V_fp16_ptr = V->gpu_data_ptr();
@@ -670,15 +679,56 @@ namespace llaminar2
 
             int dev = (device_idx >= 0) ? device_idx : device_idx_;
 
-            // Dispatch: FP16 KV direct path (prefill only) or standard apply_typed
+            // Dispatch: FP16 KV direct path (prefill and decode) or standard apply_typed
             if (use_fp16kv_direct)
             {
-                // FP16 KV direct: skip FP32 conversion, pass FP16 pointers to FA2 kernel
+                // FP16 KV direct: skip FP32 conversion, pass FP16 pointers to kernel
                 if (cudaFlashAttn_setDevice(dev) != 0)
                 {
                     LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>] Failed to set device " << dev);
                     return false;
                 }
+
+                if (seq_len == 1)
+                {
+                    // DECODE: Flash Decoding with FP16 KV — no conversion needed
+                    int num_splits = DEFAULT_NUM_SPLITS;
+                    if (kv_len <= 64)
+                        num_splits = 1;
+                    else if (kv_len < 128)
+                        num_splits = 2;
+                    else if (kv_len < 256)
+                        num_splits = 4;
+
+                    allocateWorkspace(n_heads, head_dim, num_splits);
+
+                    if (!partial_output_buf_ || !partial_m_buf_ || !partial_l_buf_)
+                    {
+                        LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>] Workspace allocation failed for FP16KV decode");
+                        return false;
+                    }
+
+                    int result;
+                    {
+                        CUDA_KERNEL_PROFILE_SCOPE(CUDAKernelType::FLASH_ATTN_DECODE);
+                        result = cudaFlashAttn_decode_fp16kv(
+                            Q_ptr, K_fp16_ptr, V_fp16_ptr, output_ptr,
+                            static_cast<float *>(partial_output_buf_),
+                            static_cast<float *>(partial_m_buf_),
+                            static_cast<float *>(partial_l_buf_),
+                            batch_size, kv_len,
+                            n_heads, n_kv_heads, head_dim,
+                            num_splits, d_attn_params, stream_, dev);
+                    }
+                    if (result != 0)
+                    {
+                        LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>] Flash Decoding FP16KV failed");
+                        return false;
+                    }
+                    return true;
+                }
+
+                // PREFILL: FA2 with FP16 KV
 
                 // Check for cuBLAS attention override (env: LLAMINAR_CUBLAS_ATTN=1)
                 static const int use_cublas_attn = []()

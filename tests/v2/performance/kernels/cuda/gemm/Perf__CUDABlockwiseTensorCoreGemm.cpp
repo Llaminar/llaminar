@@ -86,6 +86,8 @@ namespace
          { return TestTensorFactory::createIQ1_SRandom({n, k}); }},
         {"IQ1_M", [](size_t n, size_t k)
          { return TestTensorFactory::createIQ1_MRandom({n, k}); }},
+        {"Q8_0", [](size_t n, size_t k)
+         { return TestTensorFactory::createQ8_0Random({n, k}); }},
     };
 
     struct Shape

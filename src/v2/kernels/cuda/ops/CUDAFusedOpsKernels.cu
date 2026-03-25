@@ -27,8 +27,12 @@
  *
  * Memory savings per call: 2 × M × K × sizeof(float) (write + read eliminated)
  *
- * Grid:  (M, 1, 1) — one CUDA block per row
- * Block: (256, 1, 1) — 8 warps, each processes one 32-element quant block
+ * Uses 2D grid for K-parallel execution:
+ * Grid:  (grid_x, M) — multiple CUDA blocks share the K-blocks of each row
+ * Block: (128, 1, 1) — 4 warps, each processes one 32-element quant block at a time
+ *
+ * Each 32-element K-block is independently quantized, so K-parallelism is trivial.
+ * This is critical for decode (M=1) where a 1D grid of M blocks wastes 81 of 82 SMs.
  */
 __global__ void fused_swiglu_quantize_blockwise_kernel(
     const float *__restrict__ gate,         // [M × K]
@@ -37,7 +41,7 @@ __global__ void fused_swiglu_quantize_blockwise_kernel(
     float *__restrict__ scales_A_blockwise, // [M × num_blocks] output
     int M, int K)
 {
-    const int row = blockIdx.x;
+    const int row = blockIdx.y;
     if (row >= M)
         return;
 
@@ -45,14 +49,18 @@ __global__ void fused_swiglu_quantize_blockwise_kernel(
     const int num_blocks = K / BLOCK_SIZE;
     const int lane = threadIdx.x & 31;
     const int warp_id = threadIdx.x >> 5;
-    constexpr int NUM_WARPS = 8;
+    const int num_warps = blockDim.x >> 5;
+
+    // Global warp index across all blocks in this row
+    const int global_warp = blockIdx.x * num_warps + warp_id;
+    const int total_warps = gridDim.x * num_warps;
 
     const float *row_gate = gate + row * K;
     const float *row_up = up + row * K;
     int8_t *row_int8 = A_int8 + row * K;
     float *row_scales = scales_A_blockwise + row * num_blocks;
 
-    for (int b = warp_id; b < num_blocks; b += NUM_WARPS)
+    for (int b = global_warp; b < num_blocks; b += total_warps)
     {
         const int k_start = b * BLOCK_SIZE;
 
@@ -278,8 +286,18 @@ extern "C"
     {
         cudaSetDevice(device_idx);
 
-        dim3 grid(M);
-        dim3 block(256);
+        // 2D grid: blockIdx.x distributes K-blocks, blockIdx.y distributes rows.
+        // For decode (M=1), this ensures all SMs participate instead of just 1.
+        constexpr int NUM_WARPS = 4;
+        constexpr int BLOCK_SIZE = NUM_WARPS * 32; // 128 threads
+        const int num_k_blocks = K / 32;
+        // Target enough blocks per row to fill the GPU (~2 waves over all SMs)
+        int grid_x = (num_k_blocks + NUM_WARPS - 1) / NUM_WARPS;
+        if (grid_x > 256)
+            grid_x = 256; // Cap to avoid excessive blocks for prefill
+
+        dim3 grid(grid_x, M);
+        dim3 block(BLOCK_SIZE);
 
         fused_swiglu_quantize_blockwise_kernel<<<grid, block, 0, static_cast<cudaStream_t>(stream)>>>(
             gate, up, A_int8, scales_A_blockwise, M, K);

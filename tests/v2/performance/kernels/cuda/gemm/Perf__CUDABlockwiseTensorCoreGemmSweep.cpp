@@ -92,6 +92,8 @@ namespace
          { return TestTensorFactory::createIQ1_SRandom({n, k}); }},
         {"IQ1_M", [](size_t n, size_t k)
          { return TestTensorFactory::createIQ1_MRandom({n, k}); }},
+        {"Q8_0", [](size_t n, size_t k)
+         { return TestTensorFactory::createQ8_0Random({n, k}); }},
     };
 
     struct Shape
@@ -165,6 +167,7 @@ namespace
         Wide = 0,
         KPar = 1,
         Direct = 2,
+        RowPar = 3,
     };
 
     struct TuneCandidate
@@ -324,6 +327,8 @@ namespace
             return "kpar";
         case SweepFamily::Direct:
             return "direct";
+        case SweepFamily::RowPar:
+            return "rowpar";
         }
         return "unknown";
     }
@@ -426,6 +431,14 @@ namespace
             for (const auto &[tile_n, cpt] : cfg.direct_tiles)
             {
                 candidates.push_back({SweepFamily::Direct, tile_n, cpt, 0, 0, 0, 0});
+            }
+        }
+
+        if (allow_family("rowpar"))
+        {
+            for (const int nwarps : {2, 4, 8})
+            {
+                candidates.push_back({SweepFamily::RowPar, nwarps, 1, 0, 0, 0, 0});
             }
         }
 
@@ -601,8 +614,12 @@ namespace
             {
                 if (!kernel->multiply_tensor(A_tensor.get(), C_tensor.get(), 1, n, k))
                 {
+                    // Some candidate/codebook combos are unsupported (e.g. ROWPAR
+                    // for Q8_0).  Return a sentinel so the caller can skip them.
+                    if (ws_consumer)
+                        ws_consumer->unbindWorkspace();
                     cudaNativeVNNIGemvSweep_clearConfig();
-                    throw std::runtime_error("CUDA native payload GEMV warmup failed");
+                    return RunResult{.min_us = std::numeric_limits<double>::infinity()};
                 }
             }
 
@@ -688,6 +705,8 @@ namespace
                 for (const auto &candidate : candidates)
                 {
                     const RunResult run = runTunedGemv(weights.get(), shape.n, shape.k, cfg, candidate);
+                    if (std::isinf(run.min_us))
+                        continue; // Unsupported candidate for this codebook
                     const double eff_bw = static_cast<double>(total_bytes) / (run.min_us * 1e-6) / 1e9;
                     const double pct_peak = (peak_bw_GB_s_ > 0.0) ? (eff_bw / peak_bw_GB_s_ * 100.0) : 0.0;
                     results.push_back({candidate, run.min_us, eff_bw, pct_peak});
