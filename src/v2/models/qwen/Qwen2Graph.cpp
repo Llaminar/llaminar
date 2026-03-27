@@ -1739,6 +1739,9 @@ namespace llaminar2
             rope_params.q_buffer_id = BufferId::Q_PROJ;
             rope_params.k_buffer_id = BufferId::K_PROJ;
 
+            // RoPE-on-read: skip K in RoPE stage; it will be applied during attention
+            rope_params.skip_k = config_.rope_on_read;
+
             graph.addNode(prefix + "rope",
                           ComputeStageFactory::createRoPE(rope_params),
                           device);
@@ -1795,9 +1798,19 @@ namespace llaminar2
                               ComputeStageFactory::createKVCacheAppend(kv_append_params),
                               device);
 
-                if (env.execution.exec_rope)
+                if (env.execution.exec_rope && !config_.rope_on_read)
                 {
+                    // Standard mode: K needs RoPE before caching
                     graph.addDependency(prefix + "kv_append", prefix + "rope");
+                }
+                else if (env.execution.exec_rope && config_.rope_on_read)
+                {
+                    // RoPE-on-read: K stored pre-RoPE, but Q still needs RoPE
+                    // KV append depends on RoPE only because RoPE and QKV share buffers
+                    // (RoPE modifies Q in-place), and we need QKV proj done first.
+                    // Since V comes from qkv_proj and Q is modified by rope, depend on rope
+                    // to ensure Q is RoPE'd before attention can run (attention depends on kv_append).
+                    graph.addDependency(prefix + "kv_append", prefix + "qkv_proj");
                 }
                 else if (env.execution.exec_gemm)
                 {
@@ -1920,6 +1933,14 @@ namespace llaminar2
                 attn_params.workspace_scores_buffer_id = BufferId::ATTN_SCORES_WORKSPACE;
                 attn_params.workspace_context_buffer_id = BufferId::ATTN_CONTEXT_WORKSPACE;
                 attn_params.turboquant_ctx = config_.turboquant_ctx;
+
+                // RoPE-on-read: apply RoPE to K in the attention stage
+                // (fused with TQ4 dequant for decode, in-place for FP32 prefill)
+                if (config_.rope_on_read)
+                {
+                    attn_params.apply_rope_to_k = true;
+                    attn_params.rope_theta = config_.rope_theta;
+                }
 
                 graph.addNode(prefix + "attention",
                               ComputeStageFactory::createAttentionCompute(attn_params),

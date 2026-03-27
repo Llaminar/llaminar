@@ -1,6 +1,7 @@
 #include "CUDAWeightPacker.h"
 
 #include "CUDAQuantisedGemmKernel.h"
+#include "CUDADeviceWorkspace.h"
 #include "tensors/TensorClasses.h"
 #include "tensors/TensorType.h"
 #include "tensors/VnniPackContext.h"
@@ -166,6 +167,13 @@ namespace llaminar2::cuda
 
     CUDAPackedWeights::~CUDAPackedWeights()
     {
+        // Free row-major transpose (per-weight, used by ROWPAR GEMV)
+        if (rowmajor_)
+        {
+            cudaRowMajorWeights_destroy(rowmajor_);
+            rowmajor_ = nullptr;
+        }
+
         for (auto &[device_id, upload] : device_uploads)
         {
             (void)device_id;

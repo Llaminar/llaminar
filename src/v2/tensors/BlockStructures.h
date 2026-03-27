@@ -640,6 +640,54 @@ namespace llaminar2
     static_assert(sizeof(TQ4Block_128) == 72, "TQ4Block_128 must be 72 bytes");
 
     // ========================================================================
+    // TQ8 Block — TurboQuant 8-bit quantization (256-level Lloyd-Max)
+    // ========================================================================
+
+    /**
+     * @brief TurboQuant 8-bit block for KV cache key projection storage.
+     *
+     * Stores per-head key vectors quantized to 8-bit indices using a 256-level
+     * Lloyd-Max codebook. Simpler than TQ4 — no bit packing, direct uint8_t
+     * indices. Provides ~15× better MSE than TQ4 (σ/gap = 1.29 vs 10.9 for
+     * worst-case attention head), making it suitable for K projections where
+     * score accuracy is critical.
+     *
+     * Quantization path:
+     *   FP32 → normalize → rotate (Haar-random Π) → scale (×√D) →
+     *   nearest Lloyd-Max centroid → uint8_t index + norm + residual_norm
+     *
+     * Memory layout:
+     *   [float norm][float residual_norm][uint8_t indices[D]]
+     *
+     * Memory per block:
+     *   D=64:  4 + 4 + 64  = 72 bytes   (vs TQ4: 40 bytes, 1.8× larger)
+     *   D=128: 4 + 4 + 128 = 136 bytes  (vs TQ4: 72 bytes, 1.89× larger)
+     *
+     * Template parameter D = number of elements (head_dim).
+     */
+    template <int D>
+    struct TQ8Block
+    {
+        static_assert(D > 0 && D % 8 == 0, "TQ8Block dimension must be positive and divisible by 8");
+
+        float norm;          ///< Original vector L2 norm
+        float residual_norm; ///< Set to -1.0f as sentinel for scalar-full mode
+        uint8_t indices[D];  ///< 8-bit Lloyd-Max centroid indices (0-255)
+
+        static constexpr int BLOCK_DIM = D;
+        static constexpr int BITS = 8;
+        static constexpr int NUM_CENTROIDS = 256;
+        static constexpr size_t TOTAL_BYTES = 2 * sizeof(float) + D;
+    };
+
+    // Common instantiations
+    using TQ8Block_64 = TQ8Block<64>;
+    using TQ8Block_128 = TQ8Block<128>;
+
+    static_assert(sizeof(TQ8Block_64) == 72, "TQ8Block_64 must be 72 bytes");
+    static_assert(sizeof(TQ8Block_128) == 136, "TQ8Block_128 must be 136 bytes");
+
+    // ========================================================================
     // TQ2 Bit-packing Helpers (used by TQ4 3-bit index packing)
     // ========================================================================
 

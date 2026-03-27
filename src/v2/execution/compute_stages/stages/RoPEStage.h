@@ -61,6 +61,11 @@ namespace llaminar2
             // When K is Q16_1 from GEMM, RoPE outputs per-head scales for attention
             float *K_head_scales = nullptr; ///< Output: per-head K scales [seq_len * n_kv_heads]
 
+            // RoPE-on-read mode: skip applying RoPE to K in this stage.
+            // When true, only Q gets RoPE applied. K will be stored pre-RoPE in the
+            // KV cache and RoPE will be fused into the attention dequant path.
+            bool skip_k = false;
+
             // Optional BufferIds for contract-based coherence
             std::optional<BufferId> q_buffer_id;
             std::optional<BufferId> k_buffer_id;

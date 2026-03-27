@@ -332,9 +332,13 @@ namespace llaminar2
         // synchronous hipMemcpy that would drain the entire GPU pipeline at every
         // layer during prefill. The contiguous path also fuses Q+K into a single
         // kernel launch for better launch efficiency.
+        //
+        // When skip_k is true (RoPE-on-read mode), K is stored pre-RoPE in the
+        // KV cache and RoPE will be fused into the attention dequant path.
+        auto *K_for_rope = (params_.skip_k) ? nullptr : K_base;
         return kernel->apply_tensor(
             Q_base,
-            K_base, // May be nullptr
+            K_for_rope,
             position_ids_ptr,
             seq_len,
             params_.n_heads,

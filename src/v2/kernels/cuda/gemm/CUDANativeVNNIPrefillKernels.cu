@@ -10,12 +10,57 @@
 #include <cuda_runtime.h>
 
 #include "CUDANativeVNNIDecodeCommon.cuh"
+#include "kernels/cuda/gemm/CUDADeviceWorkspace.h"
 
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <new>
+
+// =========================================================================
+// Per-device prefill context — replaces process-global statics for SM count
+// cache and stream-K fixup buffer.  Owned by KernelFactory, one per device.
+// =========================================================================
+struct CUDAPrefillContext_
+{
+    int sm_count = 0;
+    int device_id = -1;
+
+    // Stream-K two-pass fixup buffer
+    float *fixup_buf = nullptr;
+    size_t fixup_buf_size = 0; // in bytes
+};
+
+static int querySmCount(CUDAPrefillContext_ *ctx)
+{
+    if (ctx->sm_count > 0)
+        return ctx->sm_count;
+    cudaDeviceGetAttribute(&ctx->sm_count,
+                           cudaDevAttrMultiProcessorCount,
+                           ctx->device_id);
+    if (ctx->sm_count <= 0)
+        ctx->sm_count = 82;
+    return ctx->sm_count;
+}
+
+static float *getOrAllocFixupBuffer(CUDAPrefillContext_ *ctx, size_t required_bytes, cudaStream_t stream)
+{
+    if (ctx->fixup_buf_size < required_bytes)
+    {
+        if (ctx->fixup_buf)
+            cudaFree(ctx->fixup_buf);
+        ctx->fixup_buf = nullptr;
+        ctx->fixup_buf_size = 0;
+        cudaSetDevice(ctx->device_id);
+        if (cudaMalloc(&ctx->fixup_buf, required_bytes) != cudaSuccess)
+            return nullptr;
+        ctx->fixup_buf_size = required_bytes;
+    }
+    cudaMemsetAsync(ctx->fixup_buf, 0, required_bytes, stream);
+    return ctx->fixup_buf;
+}
 
 namespace
 {
@@ -2352,21 +2397,6 @@ namespace
 #endif
     }
 
-    // SM count query (cached)
-    int getSmCount()
-    {
-        static int count = 0;
-        if (count == 0)
-        {
-            int dev = 0;
-            cudaGetDevice(&dev);
-            cudaDeviceGetAttribute(&count, cudaDevAttrMultiProcessorCount, dev);
-            if (count <= 0)
-                count = 82;
-        }
-        return count;
-    }
-
     // =========================================================================
     // Tile/split-k force: override the heuristic for sweep benchmarks.
     //   g_force_tile_id: -1 = auto (heuristic), 0..5 = TileId enum value
@@ -2432,9 +2462,9 @@ namespace
     //   - Q5_1/IQ1_S have 2 outlier shapes (~20% gap at M=512) where
     //     w2x4 ILP would help, but fixing those regresses Q4_1, so we
     //     optimize for Q4_1 (most commonly used asymmetric format)
-    TileChoice choosePrefillTile_Asymmetric(int M, int N, int K)
+    TileChoice choosePrefillTile_Asymmetric(int M, int N, int K, CUDAPrefillContext_ *prefill_ctx)
     {
-        const int SM = getSmCount();
+        const int SM = querySmCount(prefill_ctx);
         constexpr int HBK = 128;
         const int ki = K / HBK;
         const int t64x128 = ((M + 63) / 64) * ((N + 127) / 128);
@@ -2465,6 +2495,7 @@ namespace
     //   ki ≤ 7      → w4x2 (small K, 4 warps in M-dim)
     //   otherwise   → w2x4 (default, 8 warps for ILP)
     TileChoice choosePrefillTile(int M, int N, int K,
+                                 CUDAPrefillContext_ *prefill_ctx,
                                  FormatComplexity complexity = FormatComplexity::Simple)
     {
         // Force-tile override for sweep benchmarks
@@ -2477,9 +2508,9 @@ namespace
         // Asymmetric/dual-scale formats: specialized heuristic biased
         // toward w2x2 due to higher register pressure from min-correction
         if (complexity != FormatComplexity::Simple)
-            return choosePrefillTile_Asymmetric(M, N, K);
+            return choosePrefillTile_Asymmetric(M, N, K, prefill_ctx);
 
-        const int SM = getSmCount();
+        const int SM = querySmCount(prefill_ctx);
         constexpr int HBK = 128; // heuristic block-K unit (analysis granularity)
         const int ki = K / HBK;
         const int t64 = ((M + 63) / 64) * ((N + 63) / 64);
@@ -2850,9 +2881,10 @@ namespace
         float beta,
         const float *d_C_existing,
         const float *d_bias,
-        cudaStream_t cuda_stream)
+        cudaStream_t cuda_stream,
+        CUDAPrefillContext_ *prefill_ctx)
     {
-        const int nsm = getSmCount();
+        const int nsm = querySmCount(prefill_ctx);
         const int ntx = (N + BN - 1) / BN;
         const int nty = (M + BM - 1) / BM;
         const int num_k_tiles = (K / 32 + 1) / 2;
@@ -2963,46 +2995,6 @@ namespace
     }
 
     // =========================================================================
-    // Cached fixup buffer for two-pass stream-K. Grows as needed, freed
-    // explicitly via cudaNativeVNNIPrefill_freeStreamKFixup().
-    // =========================================================================
-    static float *g_streamk_fixup_buf = nullptr;
-    static size_t g_streamk_fixup_buf_size = 0;
-    static int g_streamk_fixup_device = -1;
-
-    static float *getOrAllocFixupBuffer(size_t required_bytes, cudaStream_t stream)
-    {
-        // Track which device owns the buffer to prevent cross-device access
-        int current_device = -1;
-        cudaGetDevice(&current_device);
-
-        if (g_streamk_fixup_buf && g_streamk_fixup_device != current_device)
-        {
-            // Buffer was allocated on a different device — free and reallocate
-            cudaSetDevice(g_streamk_fixup_device);
-            cudaFree(g_streamk_fixup_buf);
-            cudaSetDevice(current_device);
-            g_streamk_fixup_buf = nullptr;
-            g_streamk_fixup_buf_size = 0;
-            g_streamk_fixup_device = -1;
-        }
-
-        if (g_streamk_fixup_buf_size < required_bytes)
-        {
-            if (g_streamk_fixup_buf)
-                cudaFree(g_streamk_fixup_buf);
-            g_streamk_fixup_buf = nullptr;
-            g_streamk_fixup_buf_size = 0;
-            if (cudaMalloc(&g_streamk_fixup_buf, required_bytes) != cudaSuccess)
-                return nullptr;
-            g_streamk_fixup_buf_size = required_bytes;
-            g_streamk_fixup_device = current_device;
-        }
-        cudaMemsetAsync(g_streamk_fixup_buf, 0, required_bytes, stream);
-        return g_streamk_fixup_buf;
-    }
-
-    // =========================================================================
     // Stream-K two-pass launch helper: main kernel writes partial sums to a
     // flat tile-indexed fixup buffer (atomicAdd, no M/N bounds check), then a
     // lightweight fixup kernel copies fixup→C with bounds checking.
@@ -3028,13 +3020,14 @@ namespace
         float beta,
         const float *d_C_existing,
         const float *d_bias,
-        cudaStream_t cuda_stream)
+        cudaStream_t cuda_stream,
+        CUDAPrefillContext_ *prefill_ctx)
     {
         // Two-pass stream-K only supports beta=0, no bias (same constraint as one-pass)
         if (beta != 0.0f || d_bias != nullptr)
             return false;
 
-        const int nsm = getSmCount();
+        const int nsm = querySmCount(prefill_ctx);
         const int ntx = (N + BN - 1) / BN;
         const int nty = (M + BM - 1) / BM;
         const int total_tiles = ntx * nty;
@@ -3053,7 +3046,7 @@ namespace
 
         // Allocate tile-indexed fixup buffer: total_tiles × BM × BN floats
         const size_t fixup_bytes = static_cast<size_t>(total_tiles) * BM * BN * sizeof(float);
-        float *fixup_buf = getOrAllocFixupBuffer(fixup_bytes, cuda_stream);
+        float *fixup_buf = getOrAllocFixupBuffer(prefill_ctx, fixup_bytes, cuda_stream);
         if (!fixup_buf)
             return false;
 
@@ -3095,7 +3088,7 @@ namespace
     // Stream-K wins when wave-tail inefficiency is significant AND there is
     // enough total work to amortize the memset + atomicAdd overhead.
     // =========================================================================
-    bool shouldUseStreamK(int M, int N, int K, int bm, int bn)
+    bool shouldUseStreamK(int M, int N, int K, int bm, int bn, CUDAPrefillContext_ *prefill_ctx)
     {
         // Respect force mode from test harness
         if (g_stream_k_force_mode < 0)
@@ -3121,7 +3114,7 @@ namespace
         //   QKV  M=256: tiles=72,  k=56,  total_work=4032,  wave_eff=43.9% → 0.884x ✗
         //
         // total_work >= 8000 cleanly separates wins from losses.
-        const int nsm = getSmCount();
+        const int nsm = querySmCount(prefill_ctx);
         const int total_tiles = ((M + bm - 1) / bm) * ((N + bn - 1) / bn);
 
         // Need at least 1 SM-wave of tiles (otherwise standard is fine)
@@ -3215,7 +3208,7 @@ namespace
         return cudaGetLastError() == cudaSuccess;
     }
 
-    int chooseSplitK_BK256(int M, int N, int K, int bm, int bn)
+    int chooseSplitK_BK256(int M, int N, int K, int bm, int bn, CUDAPrefillContext_ *prefill_ctx)
     {
         const int grid_blocks = ((M + bm - 1) / bm) * ((N + bn - 1) / bn);
         const int num_outer_tiles = (K / 32 + 7) / 8;
@@ -3226,7 +3219,7 @@ namespace
         // so use sk=2 when there's enough K-work to split and the grid is underfilled.
         if (num_outer_tiles < 4)
             return 1;
-        const int SM = getSmCount();
+        const int SM = querySmCount(prefill_ctx);
         if (grid_blocks >= SM)
             return 1; // Already enough blocks for good utilization
         return 2;
@@ -3255,7 +3248,8 @@ namespace
         float alpha, float beta,
         const float *d_C_existing,
         const float *d_bias,
-        cudaStream_t cuda_stream)
+        cudaStream_t cuda_stream,
+        CUDAPrefillContext_ *prefill_ctx)
     {
         // ─── BK256 path (CB=0 only) ──────────────────────────────────
         // BK256 processes 256 K-elements per outer tile (4× fewer K-iterations
@@ -3265,12 +3259,12 @@ namespace
         {
             const bool bk256_forced = (g_bk256_force_mode > 0);
             const bool bk256_disabled = (g_bk256_force_mode < 0);
-            const int SM = getSmCount();
+            const int SM = querySmCount(prefill_ctx);
             const int t64x128_check = ((M + 63) / 64) * ((N + 127) / 128);
             const bool bk256_auto = !bk256_disabled && (K > 2 * N) && (t64x128_check < SM);
             if (bk256_forced || bk256_auto)
             {
-                const int sk = chooseSplitK_BK256(M, N, K, 128, 128);
+                const int sk = chooseSplitK_BK256(M, N, K, 128, 128, prefill_ctx);
                 bool ok = false;
                 if (sk >= 2)
                     ok = launchNativeVNNITC_BK256<128, 128, 4, 4, 2>(
@@ -3307,7 +3301,7 @@ namespace
             {
                 // Fallback: format-complexity-aware heuristic
                 constexpr FormatComplexity complexity = getFormatComplexity(CB);
-                tc = choosePrefillTile(M, N, K, complexity);
+                tc = choosePrefillTile(M, N, K, prefill_ctx, complexity);
             }
         }
 
@@ -3323,12 +3317,14 @@ namespace
                 return launchNativeVNNITC_BK64_StreamK_TwoPass<CB, BM_, BN_, WM_, WN_>( \
                     d_A_int8, d_payload, d_scales, d_mins, d_emins,                     \
                     d_C_fp32, d_scales_A_block,                                         \
-                    M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream);           \
-            if (tc.split_k == 1 && shouldUseStreamK(M, N, K, BM_, BN_))                 \
+                    M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream,            \
+                    prefill_ctx);                                                       \
+            if (tc.split_k == 1 && shouldUseStreamK(M, N, K, BM_, BN_, prefill_ctx))    \
                 return launchNativeVNNITC_BK64_StreamK<CB, BM_, BN_, WM_, WN_>(         \
                     d_A_int8, d_payload, d_scales, d_mins, d_emins,                     \
                     d_C_fp32, d_scales_A_block,                                         \
-                    M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream);           \
+                    M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream,            \
+                    prefill_ctx);                                                       \
         }                                                                               \
         switch (tc.split_k)                                                             \
         {                                                                               \
@@ -3402,27 +3398,8 @@ extern "C"
 
     void cudaNativeVNNIPrefill_freeStreamKFixup()
     {
-        if (g_streamk_fixup_buf)
-        {
-            // Free on the device that owns the buffer
-            if (g_streamk_fixup_device >= 0)
-            {
-                int current_device = -1;
-                cudaGetDevice(&current_device);
-                if (current_device != g_streamk_fixup_device)
-                    cudaSetDevice(g_streamk_fixup_device);
-                cudaFree(g_streamk_fixup_buf);
-                if (current_device != g_streamk_fixup_device)
-                    cudaSetDevice(current_device);
-            }
-            else
-            {
-                cudaFree(g_streamk_fixup_buf);
-            }
-            g_streamk_fixup_buf = nullptr;
-            g_streamk_fixup_buf_size = 0;
-            g_streamk_fixup_device = -1;
-        }
+        // Fixup buffer is now owned by CUDAPrefillContext, freed on context destroy.
+        // This function is kept for backward compatibility but is a no-op.
     }
 
     // Force-tile/split-k override for sweep benchmarks.
@@ -3466,6 +3443,29 @@ extern "C"
         }
         return ((M + bm - 1) / bm) * ((N + bn - 1) / bn);
     }
+    // -----------------------------------------------------------------
+    // Prefill context lifetime
+    // -----------------------------------------------------------------
+    CUDAPrefillContext *cudaPrefillContext_create(int device_id)
+    {
+        auto *ctx = new (std::nothrow) CUDAPrefillContext_();
+        if (!ctx)
+            return nullptr;
+        ctx->device_id = device_id;
+        return ctx;
+    }
+
+    void cudaPrefillContext_destroy(CUDAPrefillContext *ctx)
+    {
+        if (!ctx)
+            return;
+        if (ctx->fixup_buf)
+        {
+            cudaSetDevice(ctx->device_id);
+            cudaFree(ctx->fixup_buf);
+        }
+        delete ctx;
+    }
 } // extern "C"
 
 // Profitability gate for dual-scale formats.
@@ -3504,11 +3504,14 @@ extern "C" bool cudaNativeVNNIPrefill_fp32(
     const float *d_bias,
     uint8_t codebook_id,
     int cuda_device_id,
-    void *stream)
+    void *stream,
+    CUDAPrefillContext *prefill_ctx)
 {
     if (!d_A_int8 || !d_payload || !d_scales || !d_C_fp32 || !d_scales_A_block)
         return false;
     if (M <= 0 || N <= 0 || K <= 0 || (K % 32) != 0)
+        return false;
+    if (!prefill_ctx)
         return false;
     if (!isAmperePlus(cuda_device_id))
         return false;
@@ -3523,27 +3526,27 @@ extern "C" bool cudaNativeVNNIPrefill_fp32(
     case 0:
         return launchGenericPrefillBK64<0>(
             d_A_int8, d_payload, d_scales, nullptr, nullptr, d_C_fp32, d_scales_A_block,
-            M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream);
+            M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
     case 4:
         return launchGenericPrefillBK64<4>(
             d_A_int8, d_payload, d_scales, nullptr, nullptr, d_C_fp32, d_scales_A_block,
-            M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream);
+            M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
     case 6: // Q5_0
         return launchGenericPrefillBK64<6>(
             d_A_int8, d_payload, d_scales, nullptr, nullptr, d_C_fp32, d_scales_A_block,
-            M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream);
+            M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
     case 11: // IQ3_S
         return launchGenericPrefillBK64<11>(
             d_A_int8, d_payload, d_scales, nullptr, nullptr, d_C_fp32, d_scales_A_block,
-            M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream);
+            M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
     case 12: // IQ3_XXS
         return launchGenericPrefillBK64<12>(
             d_A_int8, d_payload, d_scales, nullptr, nullptr, d_C_fp32, d_scales_A_block,
-            M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream);
+            M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
     case 15: // IQ2_XXS
         return launchGenericPrefillBK64<15>(
             d_A_int8, d_payload, d_scales, nullptr, nullptr, d_C_fp32, d_scales_A_block,
-            M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream);
+            M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
 
     // --- Asymmetric formats (need min correction, d_mins required) ---
     case 5: // Q4_1 / Q4_K / Q5_K
@@ -3551,19 +3554,19 @@ extern "C" bool cudaNativeVNNIPrefill_fp32(
             return false;
         return launchGenericPrefillBK64<5>(
             d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32, d_scales_A_block,
-            M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream);
+            M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
     case 7: // Q5_1
         if (!d_mins)
             return false;
         return launchGenericPrefillBK64<7>(
             d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32, d_scales_A_block,
-            M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream);
+            M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
     case 16: // IQ1_S
         if (!d_mins)
             return false;
         return launchGenericPrefillBK64<16>(
             d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32, d_scales_A_block,
-            M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream);
+            M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
 
     // --- Dual-scale formats (separate lo/hi scales via split MMA) ---
     // Profitability gate: only launch for shapes where NativeVNNI beats CUTLASS.
@@ -3572,43 +3575,43 @@ extern "C" bool cudaNativeVNNIPrefill_fp32(
             return false;
         return launchGenericPrefillBK64<8>(
             d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32, d_scales_A_block,
-            M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream);
+            M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
     case 9: // Q3_K
         if (!d_mins || !isDualScalePrefillProfitable(M, N, K, 9))
             return false;
         return launchGenericPrefillBK64<9>(
             d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32, d_scales_A_block,
-            M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream);
+            M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
     case 10: // Q2_K (dual-scale + asymmetric via emins)
         if (!d_mins || !isDualScalePrefillProfitable(M, N, K, 10))
             return false;
         return launchGenericPrefillBK64<10>(
             d_A_int8, d_payload, d_scales, d_mins, d_emins, d_C_fp32, d_scales_A_block,
-            M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream);
+            M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
     case 13: // IQ2_S
         if (!d_mins || !isDualScalePrefillProfitable(M, N, K, 13))
             return false;
         return launchGenericPrefillBK64<13>(
             d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32, d_scales_A_block,
-            M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream);
+            M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
     case 14: // IQ2_XS
         if (!d_mins || !isDualScalePrefillProfitable(M, N, K, 14))
             return false;
         return launchGenericPrefillBK64<14>(
             d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32, d_scales_A_block,
-            M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream);
+            M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
     case 17: // IQ1_M (dual-scale + delta correction)
         if (!d_mins || !isDualScalePrefillProfitable(M, N, K, 17))
             return false;
         return launchGenericPrefillBK64<17>(
             d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32, d_scales_A_block,
-            M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream);
+            M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
 
     // --- 8-bit format (no decode overhead, single-scale) ---
     case 19: // Q8_0
         return launchGenericPrefillBK64<19>(
             d_A_int8, d_payload, d_scales, nullptr, nullptr, d_C_fp32, d_scales_A_block,
-            M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream);
+            M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
 
     default:
         return false;
@@ -3775,34 +3778,39 @@ extern "C"
         if (cudaSetDevice(device_id) != cudaSuccess)
             return false;
 
+        // Benchmark helper: use a thread-local context for the sweep
+        static thread_local CUDAPrefillContext_ tl_sweep_ctx{};
+        tl_sweep_ctx.device_id = device_id;
+        CUDAPrefillContext_ *pctx = &tl_sweep_ctx;
+
         cudaStream_t cs = static_cast<cudaStream_t>(stream);
 
         switch (config_idx)
         {
         case 0:
-            return launchNativeVNNITC_BK64_StreamK<0, 32, 128, 1, 2>(A, payload, scales, nullptr, nullptr, C, scales_A, M, N, K, alpha, beta, C_existing, bias, cs);
+            return launchNativeVNNITC_BK64_StreamK<0, 32, 128, 1, 2>(A, payload, scales, nullptr, nullptr, C, scales_A, M, N, K, alpha, beta, C_existing, bias, cs, pctx);
         case 1:
-            return launchNativeVNNITC_BK64_StreamK<0, 32, 128, 1, 4>(A, payload, scales, nullptr, nullptr, C, scales_A, M, N, K, alpha, beta, C_existing, bias, cs);
+            return launchNativeVNNITC_BK64_StreamK<0, 32, 128, 1, 4>(A, payload, scales, nullptr, nullptr, C, scales_A, M, N, K, alpha, beta, C_existing, bias, cs, pctx);
         case 2:
-            return launchNativeVNNITC_BK64_StreamK<0, 64, 64, 2, 1>(A, payload, scales, nullptr, nullptr, C, scales_A, M, N, K, alpha, beta, C_existing, bias, cs);
+            return launchNativeVNNITC_BK64_StreamK<0, 64, 64, 2, 1>(A, payload, scales, nullptr, nullptr, C, scales_A, M, N, K, alpha, beta, C_existing, bias, cs, pctx);
         case 3:
-            return launchNativeVNNITC_BK64_StreamK<0, 64, 64, 2, 2>(A, payload, scales, nullptr, nullptr, C, scales_A, M, N, K, alpha, beta, C_existing, bias, cs);
+            return launchNativeVNNITC_BK64_StreamK<0, 64, 64, 2, 2>(A, payload, scales, nullptr, nullptr, C, scales_A, M, N, K, alpha, beta, C_existing, bias, cs, pctx);
         case 4:
-            return launchNativeVNNITC_BK64_StreamK<0, 64, 128, 2, 2>(A, payload, scales, nullptr, nullptr, C, scales_A, M, N, K, alpha, beta, C_existing, bias, cs);
+            return launchNativeVNNITC_BK64_StreamK<0, 64, 128, 2, 2>(A, payload, scales, nullptr, nullptr, C, scales_A, M, N, K, alpha, beta, C_existing, bias, cs, pctx);
         case 5:
-            return launchNativeVNNITC_BK64_StreamK<0, 64, 128, 4, 2>(A, payload, scales, nullptr, nullptr, C, scales_A, M, N, K, alpha, beta, C_existing, bias, cs);
+            return launchNativeVNNITC_BK64_StreamK<0, 64, 128, 4, 2>(A, payload, scales, nullptr, nullptr, C, scales_A, M, N, K, alpha, beta, C_existing, bias, cs, pctx);
         case 6:
-            return launchNativeVNNITC_BK64_StreamK<0, 64, 128, 2, 4>(A, payload, scales, nullptr, nullptr, C, scales_A, M, N, K, alpha, beta, C_existing, bias, cs);
+            return launchNativeVNNITC_BK64_StreamK<0, 64, 128, 2, 4>(A, payload, scales, nullptr, nullptr, C, scales_A, M, N, K, alpha, beta, C_existing, bias, cs, pctx);
         case 7:
-            return launchNativeVNNITC_BK64_StreamK<0, 128, 64, 4, 1>(A, payload, scales, nullptr, nullptr, C, scales_A, M, N, K, alpha, beta, C_existing, bias, cs);
+            return launchNativeVNNITC_BK64_StreamK<0, 128, 64, 4, 1>(A, payload, scales, nullptr, nullptr, C, scales_A, M, N, K, alpha, beta, C_existing, bias, cs, pctx);
         case 8:
-            return launchNativeVNNITC_BK64_StreamK<0, 128, 64, 2, 1>(A, payload, scales, nullptr, nullptr, C, scales_A, M, N, K, alpha, beta, C_existing, bias, cs);
+            return launchNativeVNNITC_BK64_StreamK<0, 128, 64, 2, 1>(A, payload, scales, nullptr, nullptr, C, scales_A, M, N, K, alpha, beta, C_existing, bias, cs, pctx);
         case 9:
-            return launchNativeVNNITC_BK64_StreamK<0, 128, 128, 4, 2>(A, payload, scales, nullptr, nullptr, C, scales_A, M, N, K, alpha, beta, C_existing, bias, cs);
+            return launchNativeVNNITC_BK64_StreamK<0, 128, 128, 4, 2>(A, payload, scales, nullptr, nullptr, C, scales_A, M, N, K, alpha, beta, C_existing, bias, cs, pctx);
         case 10:
-            return launchNativeVNNITC_BK64_StreamK<0, 128, 128, 2, 2>(A, payload, scales, nullptr, nullptr, C, scales_A, M, N, K, alpha, beta, C_existing, bias, cs);
+            return launchNativeVNNITC_BK64_StreamK<0, 128, 128, 2, 2>(A, payload, scales, nullptr, nullptr, C, scales_A, M, N, K, alpha, beta, C_existing, bias, cs, pctx);
         case 11:
-            return launchNativeVNNITC_BK64_StreamK<0, 128, 128, 4, 4>(A, payload, scales, nullptr, nullptr, C, scales_A, M, N, K, alpha, beta, C_existing, bias, cs);
+            return launchNativeVNNITC_BK64_StreamK<0, 128, 128, 4, 4>(A, payload, scales, nullptr, nullptr, C, scales_A, M, N, K, alpha, beta, C_existing, bias, cs, pctx);
         default:
             return false;
         }

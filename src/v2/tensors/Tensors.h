@@ -14,3 +14,7 @@
 
 // Include the tensor class implementations
 #include "TensorClasses.h"
+
+// TurboQuant KV cache tensor types (separate headers due to TurboQuantContext dependency)
+#include "TQ4Tensor.h"
+#include "TQ8Tensor.h"

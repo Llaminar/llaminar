@@ -7,7 +7,6 @@
 
 #include "../IKVCache.h" // Unified KVCache interface
 #include "../../tensors/Tensors.h"
-#include "../../tensors/TQ4Tensor.h"
 #include "../../tensors/TensorFactory.h"
 #include "../../tensors/TensorLayout.h"
 #include "../../backends/DeviceId.h"
@@ -71,7 +70,7 @@ namespace llaminar2
         // =====================================================================
 
         // Metadata (IKVCache)
-        virtual ActivationPrecision precision() const = 0;
+        virtual ActivationPrecision k_precision() const = 0;
         int n_layers() const override { return num_layers(); }
         virtual int max_seq_len() const = 0;
         virtual TensorLayout kv_layout() const = 0;
@@ -360,6 +359,22 @@ namespace llaminar2
                 return static_cast<size_t>(kv_dim / head_dim) * t->block_bytes();
             }
             static size_t head_bytes(const Type *t, int, int) { return t->block_bytes(); } // 1 block per head
+        };
+
+        // ----- TQ8 (TurboQuant 8-bit for K-projection cache) -----
+        template <>
+        struct CPUKVCacheTensor<ActivationPrecision::TQ8>
+        {
+            using Type = TQ8Tensor;
+            static std::shared_ptr<Type> allocate(TensorFactory & /*factory*/, size_t rows, size_t cols, int head_dim, DeviceId device)
+            {
+                return std::make_shared<TQ8Tensor>(std::vector<size_t>{rows, cols}, head_dim, device);
+            }
+            static size_t row_bytes(const Type *t, int kv_dim, int head_dim)
+            {
+                return static_cast<size_t>(kv_dim / head_dim) * t->block_bytes();
+            }
+            static size_t head_bytes(const Type *t, int, int) { return t->block_bytes(); }
         };
 
     } // namespace detail

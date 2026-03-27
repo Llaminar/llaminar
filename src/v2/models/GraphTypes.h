@@ -123,6 +123,14 @@ namespace llaminar2
         /// Holds rotation matrix. Not owned by GraphConfig.
         const TurboQuantContext *turboquant_ctx = nullptr;
 
+        /// RoPE-on-read mode: store pre-RoPE K in the KV cache and apply
+        /// position embeddings lazily during attention (fused with TQ4 dequant).
+        /// Benefits: (1) fused dequant+RoPE is nearly free (O(D) vs O(D²) dequant),
+        /// (2) position-free cache enables speculative decoding,
+        /// (3) eliminates separate RoPE computation for K.
+        /// Currently supported for TQ4 (fused) and FP32 (in-place) KV precision.
+        bool rope_on_read = false;
+
         // Execution settings
         DeviceId default_device = DeviceId::cpu(); ///< Default device for execution
         bool enable_profiling = false;

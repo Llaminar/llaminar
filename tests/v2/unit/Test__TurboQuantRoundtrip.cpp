@@ -22,8 +22,8 @@
 #include "kernels/cpu/turboquant/TurboQuantCodebook.h"
 #include "kernels/cpu/turboquant/TurboQuantContext.h"
 #include "kernels/cpu/turboquant/TurboQuantRotation.h"
-#include "kernels/cpu/turboquant/TurboQuantQuantize.h"
-#include "kernels/cpu/turboquant/TurboQuantDequantize.h"
+#include "kernels/cpu/turboquant/TurboQuantQuantizeTQ4.h"
+#include "kernels/cpu/turboquant/TurboQuantDequantizeTQ4.h"
 #include <cmath>
 #include <cstdint>
 #include <random>

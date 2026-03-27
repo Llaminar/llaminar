@@ -90,6 +90,12 @@ namespace llaminar2
 
             /// TurboQuant context for TQ4 KV cache dequantization
             const TurboQuantContext *turboquant_ctx = nullptr;
+
+            // RoPE-on-read: apply RoPE to K inside this attention stage.
+            // When enabled, K in the KV cache is stored pre-RoPE, and position
+            // embeddings are fused into the TQ4 dequant / applied in-place for FP32.
+            bool apply_rope_to_k = false;
+            float rope_theta = 10000.0f; ///< RoPE frequency base (only used when apply_rope_to_k=true)
         };
 
         explicit AttentionComputeStage(Params params);
@@ -150,17 +156,6 @@ namespace llaminar2
         /// Cached attention kernel for workspace binding
         ITensorAttention *cached_kernel_ = nullptr;
         int cached_kernel_tensor_type_ = -1;
-
-        /// Persistent FP32 decode buffers for incremental FP16→FP32 conversion.
-        /// Avoids re-converting the entire KV cache on every decode step.
-        std::unique_ptr<FP32Tensor> decode_k_fp32_;
-        std::unique_ptr<FP32Tensor> decode_v_fp32_;
-        int decode_kv_fp32_rows_ = 0;
-
-        /// Persistent FP32 decode buffers for incremental TQ4→FP32 dequantization.
-        std::unique_ptr<FP32Tensor> tq_decode_k_fp32_;
-        std::unique_ptr<FP32Tensor> tq_decode_v_fp32_;
-        int tq_decode_fp32_rows_ = 0;
 
         /**
          * @brief Get or create the attention kernel

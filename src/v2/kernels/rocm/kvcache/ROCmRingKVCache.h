@@ -94,7 +94,7 @@ namespace llaminar2
         // IKVCache Interface (public API)
         // =====================================================================
 
-        virtual ActivationPrecision precision() const = 0;
+        virtual ActivationPrecision k_precision() const = 0;
         int n_layers() const override { return num_layers(); }
         int max_seq_len() const override = 0;
 
@@ -485,7 +485,7 @@ namespace llaminar2
         // IKVCache Interface (public API)
         // =====================================================================
 
-        ActivationPrecision precision() const override { return Precision; }
+        ActivationPrecision k_precision() const override { return Precision; }
         int max_seq_len() const override { return max_seq_len_; }
 
         int get_cached_tokens(int layer, int seq_idx = 0) const override;

@@ -5,6 +5,9 @@
 #include <unordered_map>
 #include <vector>
 
+// Forward-declare opaque handle for row-major weight transpose
+typedef struct CUDARowMajorWeights_ CUDARowMajorWeights;
+
 namespace llaminar2
 {
     class TensorBase;
@@ -64,6 +67,9 @@ namespace llaminar2
 
             TensorBase *source_tensor_ = nullptr;
 
+            // Row-major transpose for ROWPAR GEMV (lazily created, freed in destructor)
+            CUDARowMajorWeights *rowmajor_ = nullptr;
+
             CUDAPackedWeights() = default;
             CUDAPackedWeights(const CUDAPackedWeights &) = delete;
             CUDAPackedWeights &operator=(const CUDAPackedWeights &) = delete;
@@ -101,6 +107,7 @@ namespace llaminar2
                     cuda_device_id = other.cuda_device_id;
                     uploaded = other.uploaded;
                     source_tensor_ = other.source_tensor_;
+                    rowmajor_ = other.rowmajor_;
 
                     other.d_int8_data = nullptr;
                     other.d_scales = nullptr;
@@ -116,6 +123,7 @@ namespace llaminar2
                     other.native_codebook_id = 0;
                     other.native_blocks_per_row = 0;
                     other.source_tensor_ = nullptr;
+                    other.rowmajor_ = nullptr;
                 }
                 return *this;
             }

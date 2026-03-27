@@ -18,47 +18,45 @@
 #include <cstdint>
 #include <cstdio>
 
+#include "kernels/cuda/gemm/CUDADeviceWorkspace.h"
+
+// cuBLAS workspace — per-device, owned by KernelFactory via CUDACuBLASContext.
+struct CUDACuBLASContext_
+{
+    half *d_W_fp16 = nullptr;
+    half *d_A_fp16 = nullptr;
+    size_t W_cap = 0;
+    size_t A_cap = 0;
+    cublasHandle_t handle = nullptr;
+    int device_id = -1;
+
+    void ensure(size_t W_elems, size_t A_elems)
+    {
+        if (W_elems > W_cap)
+        {
+            if (d_W_fp16)
+                cudaFree(d_W_fp16);
+            d_W_fp16 = nullptr;
+            W_cap = 0;
+            cudaSetDevice(device_id);
+            if (cudaMalloc(&d_W_fp16, W_elems * sizeof(half)) == cudaSuccess)
+                W_cap = W_elems;
+        }
+        if (A_elems > A_cap)
+        {
+            if (d_A_fp16)
+                cudaFree(d_A_fp16);
+            d_A_fp16 = nullptr;
+            A_cap = 0;
+            cudaSetDevice(device_id);
+            if (cudaMalloc(&d_A_fp16, A_elems * sizeof(half)) == cudaSuccess)
+                A_cap = A_elems;
+        }
+    }
+};
+
 namespace
 {
-
-    struct CuBLASGemmWorkspace
-    {
-        half *d_W_fp16 = nullptr;
-        half *d_A_fp16 = nullptr;
-        size_t W_cap = 0;
-        size_t A_cap = 0;
-        cublasHandle_t handle = nullptr;
-        int device_id = -1;
-
-        void ensure(size_t W_elems, size_t A_elems, int dev)
-        {
-            if (!handle || device_id != dev)
-            {
-                if (handle)
-                    cublasDestroy(handle);
-                cudaSetDevice(dev);
-                cublasCreate(&handle);
-                cublasSetMathMode(handle, CUBLAS_TENSOR_OP_MATH);
-                device_id = dev;
-            }
-            if (W_elems > W_cap)
-            {
-                if (d_W_fp16)
-                    cudaFree(d_W_fp16);
-                cudaMalloc(&d_W_fp16, W_elems * sizeof(half));
-                W_cap = W_elems;
-            }
-            if (A_elems > A_cap)
-            {
-                if (d_A_fp16)
-                    cudaFree(d_A_fp16);
-                cudaMalloc(&d_A_fp16, A_elems * sizeof(half));
-                A_cap = A_elems;
-            }
-        }
-    };
-
-    static CuBLASGemmWorkspace g_ws;
 
     // Dequant Q4_0 payload → FP16 in column-major [K × N] layout.
     // Each Q4_0 block: 16 bytes (32 nibbles), 1 FP16 scale.
@@ -120,16 +118,19 @@ extern "C"
         float alpha, float beta,
         const float *d_C_existing,
         int cuda_device_id,
-        void *stream)
+        void *stream,
+        CUDACuBLASContext *cublas_ctx)
     {
+        if (!cublas_ctx)
+            return false;
         cudaSetDevice(cuda_device_id);
         cudaStream_t s = static_cast<cudaStream_t>(stream);
 
         const size_t W_elems = static_cast<size_t>(K) * N;
         const size_t A_elems = static_cast<size_t>(M) * K;
 
-        g_ws.ensure(W_elems, A_elems, cuda_device_id);
-        cublasSetStream(g_ws.handle, s);
+        cublas_ctx->ensure(W_elems, A_elems);
+        cublasSetStream(cublas_ctx->handle, s);
 
         // Step 1: Dequant Q4_0 → FP16 col-major [K,N]
         {
@@ -137,7 +138,7 @@ extern "C"
             constexpr int BLK = 256;
             const int grid = (total_blocks + BLK - 1) / BLK;
             dequant_q40_to_fp16_kernel<<<grid, BLK, 0, s>>>(
-                d_payload, d_scales_B, g_ws.d_W_fp16, K, N);
+                d_payload, d_scales_B, cublas_ctx->d_W_fp16, K, N);
         }
 
         // Step 2: FP32 → FP16 activations
@@ -145,7 +146,7 @@ extern "C"
             constexpr int BLK = 256;
             const int grid = (static_cast<int>(A_elems) + BLK - 1) / BLK;
             convert_fp32_to_fp16_flat<<<grid, BLK, 0, s>>>(
-                d_A_fp32, g_ws.d_A_fp16, static_cast<int>(A_elems));
+                d_A_fp32, cublas_ctx->d_A_fp16, static_cast<int>(A_elems));
         }
 
         // Step 3: cuBLAS FP16 GEMM → FP32 output
@@ -161,12 +162,12 @@ extern "C"
         }
 
         cublasStatus_t st = cublasGemmEx(
-            g_ws.handle,
+            cublas_ctx->handle,
             CUBLAS_OP_T, CUBLAS_OP_N,
             N, M, K,
             &alpha,
-            g_ws.d_W_fp16, CUDA_R_16F, K,
-            g_ws.d_A_fp16, CUDA_R_16F, K,
+            cublas_ctx->d_W_fp16, CUDA_R_16F, K,
+            cublas_ctx->d_A_fp16, CUDA_R_16F, K,
             &beta_val,
             d_C_fp32, CUDA_R_32F, N,
             CUBLAS_COMPUTE_32F,
@@ -180,5 +181,31 @@ extern "C"
         }
 
         return true;
+    }
+
+    CUDACuBLASContext *cudaCuBLASContext_create(int device_id)
+    {
+        auto *ctx = new (std::nothrow) CUDACuBLASContext_();
+        if (!ctx)
+            return nullptr;
+        ctx->device_id = device_id;
+        cudaSetDevice(device_id);
+        cublasCreate(&ctx->handle);
+        cublasSetMathMode(ctx->handle, CUBLAS_TENSOR_OP_MATH);
+        return ctx;
+    }
+
+    void cudaCuBLASContext_destroy(CUDACuBLASContext *ctx)
+    {
+        if (!ctx)
+            return;
+        cudaSetDevice(ctx->device_id);
+        if (ctx->d_W_fp16)
+            cudaFree(ctx->d_W_fp16);
+        if (ctx->d_A_fp16)
+            cudaFree(ctx->d_A_fp16);
+        if (ctx->handle)
+            cublasDestroy(ctx->handle);
+        delete ctx;
     }
 }

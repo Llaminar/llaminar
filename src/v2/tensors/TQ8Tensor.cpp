@@ -1,11 +1,11 @@
 /**
- * @file TQ4Tensor.cpp
- * @brief TurboQuant 4-bit tensor implementation
+ * @file TQ8Tensor.cpp
+ * @brief TurboQuant 8-bit tensor implementation
  */
 
-#include "TQ4Tensor.h"
-#include "../kernels/cpu/turboquant/TurboQuantQuantizeTQ4.h"
-#include "../kernels/cpu/turboquant/TurboQuantDequantizeTQ4.h"
+#include "TQ8Tensor.h"
+#include "../kernels/cpu/turboquant/TurboQuantQuantizeTQ8.h"
+#include "../kernels/cpu/turboquant/TurboQuantDequantizeTQ8.h"
 #include "../kernels/cpu/turboquant/TurboQuantContext.h"
 #include "../utils/Logger.h"
 
@@ -20,27 +20,27 @@ namespace llaminar2
     // Constructor
     // =====================================================================
 
-    TQ4Tensor::TQ4Tensor(const std::vector<size_t> &shape, int head_dim, DeviceId device)
+    TQ8Tensor::TQ8Tensor(const std::vector<size_t> &shape, int head_dim, DeviceId device)
         : shape_(shape), head_dim_(head_dim), device_(device)
     {
         if (shape.size() < 2)
         {
-            throw std::invalid_argument("TQ4Tensor: shape must have at least 2 dimensions [rows, kv_dim]");
+            throw std::invalid_argument("TQ8Tensor: shape must have at least 2 dimensions [rows, kv_dim]");
         }
         if (head_dim <= 0 || head_dim % 2 != 0)
         {
-            throw std::invalid_argument("TQ4Tensor: head_dim must be positive and even");
+            throw std::invalid_argument("TQ8Tensor: head_dim must be positive and even");
         }
 
         const size_t kv_dim = shape[shape.size() - 1];
         if (kv_dim % static_cast<size_t>(head_dim) != 0)
         {
-            throw std::invalid_argument("TQ4Tensor: kv_dim must be divisible by head_dim");
+            throw std::invalid_argument("TQ8Tensor: kv_dim must be divisible by head_dim");
         }
 
         block_bytes_ = (head_dim == 128)
-                           ? sizeof(TQ4Block_128)
-                           : sizeof(TQ4Block_64);
+                           ? sizeof(TQ8Block_128)
+                           : sizeof(TQ8Block_64);
         blocks_per_row_ = kv_dim / static_cast<size_t>(head_dim);
 
         // Calculate total rows
@@ -58,7 +58,7 @@ namespace llaminar2
     // TensorBase interface
     // =====================================================================
 
-    const float *TQ4Tensor::data() const
+    const float *TQ8Tensor::data() const
     {
         if (dequant_cache_valid_)
         {
@@ -67,7 +67,7 @@ namespace llaminar2
 
         if (!turboquant_ctx_)
         {
-            LOG_ERROR("[TQ4Tensor::data] No TurboQuant context set — cannot dequantize");
+            LOG_ERROR("[TQ8Tensor::data] No TurboQuant context set — cannot dequantize");
             return nullptr;
         }
 
@@ -79,7 +79,7 @@ namespace llaminar2
         return dequant_cache_.data();
     }
 
-    float *TQ4Tensor::mutable_data()
+    float *TQ8Tensor::mutable_data()
     {
         invalidate_dequant_cache();
 
@@ -89,7 +89,6 @@ namespace llaminar2
 
         if (!turboquant_ctx_)
         {
-            // Return zero buffer — caller will fill and then needs to re-quantize
             std::fill(dequant_cache_.begin(), dequant_cache_.end(), 0.0f);
         }
         else
@@ -99,12 +98,12 @@ namespace llaminar2
         return dequant_cache_.data();
     }
 
-    bool TQ4Tensor::copyFrom(const TensorBase *src)
+    bool TQ8Tensor::copyFrom(const TensorBase *src)
     {
         if (!src)
             return false;
 
-        const auto *other = dynamic_cast<const TQ4Tensor *>(src);
+        const auto *other = dynamic_cast<const TQ8Tensor *>(src);
         if (!other)
             return false;
 
@@ -117,30 +116,29 @@ namespace llaminar2
         return true;
     }
 
-    void TQ4Tensor::release_raw_data()
+    void TQ8Tensor::release_raw_data()
     {
         std::vector<uint8_t>().swap(raw_blocks_);
         raw_data_released_ = true;
     }
 
-    void TQ4Tensor::to_fp32(float *dst) const
+    void TQ8Tensor::to_fp32(float *dst) const
     {
         if (!turboquant_ctx_)
         {
-            LOG_ERROR("[TQ4Tensor::to_fp32] No TurboQuant context set");
+            LOG_ERROR("[TQ8Tensor::to_fp32] No TurboQuant context set");
             return;
         }
         dequantize_to_fp32(dst, *turboquant_ctx_);
     }
 
-    void TQ4Tensor::to_fp32_row(size_t row_idx, float *buffer) const
+    void TQ8Tensor::to_fp32_row(size_t row_idx, float *buffer) const
     {
         if (!turboquant_ctx_)
         {
-            LOG_ERROR("[TQ4Tensor::to_fp32_row] No TurboQuant context set");
+            LOG_ERROR("[TQ8Tensor::to_fp32_row] No TurboQuant context set");
             return;
         }
-        const size_t kv_dim = cols();
         const size_t bpr = blocks_per_row_;
         const size_t bb = block_bytes_;
         const uint8_t *row_src = raw_blocks_.data() + row_idx * bpr * bb;
@@ -154,21 +152,20 @@ namespace llaminar2
             if (head_dim_ == 128)
             {
                 const auto &head_ctx = turboquant_ctx_->for_layer(static_cast<int>(h));
-                const TQ4Block_128 *block = reinterpret_cast<const TQ4Block_128 *>(block_src);
-                turboquant_dequantize_tq4<128>(*block, head_ctx, head_dst, scratch);
+                const TQ8Block_128 *block = reinterpret_cast<const TQ8Block_128 *>(block_src);
+                turboquant_dequantize_tq8<128>(*block, head_ctx, head_dst, scratch);
             }
             else if (head_dim_ == 64)
             {
                 const auto &head_ctx = turboquant_ctx_->for_layer(static_cast<int>(h));
-                const TQ4Block_64 *block = reinterpret_cast<const TQ4Block_64 *>(block_src);
-                turboquant_dequantize_tq4<64>(*block, head_ctx, head_dst, scratch);
+                const TQ8Block_64 *block = reinterpret_cast<const TQ8Block_64 *>(block_src);
+                turboquant_dequantize_tq8<64>(*block, head_ctx, head_dst, scratch);
             }
         }
     }
 
-    void TQ4Tensor::to_fp32_span(size_t offset, size_t count, float *buffer) const
+    void TQ8Tensor::to_fp32_span(size_t offset, size_t count, float *buffer) const
     {
-        // Decompose into row+col, dequant full rows to temp, copy span
         const size_t kv_dim = cols();
         std::vector<float> row_buf(kv_dim);
         size_t written = 0;
@@ -188,7 +185,7 @@ namespace llaminar2
     // Quantization/Dequantization
     // =====================================================================
 
-    std::shared_ptr<TQ4Tensor> TQ4Tensor::quantize_from_fp32(
+    std::shared_ptr<TQ8Tensor> TQ8Tensor::quantize_from_fp32(
         const float *src,
         const std::vector<size_t> &shape,
         int head_dim,
@@ -196,10 +193,10 @@ namespace llaminar2
     {
         if (!src || shape.size() < 2)
         {
-            throw std::invalid_argument("TQ4Tensor::quantize_from_fp32: invalid arguments");
+            throw std::invalid_argument("TQ8Tensor::quantize_from_fp32: invalid arguments");
         }
 
-        auto tensor = std::make_shared<TQ4Tensor>(shape, head_dim);
+        auto tensor = std::make_shared<TQ8Tensor>(shape, head_dim);
         tensor->set_turboquant_context(&turboquant_ctx);
 
         const size_t num_rows = tensor->rows();
@@ -222,15 +219,15 @@ namespace llaminar2
 
                 if (head_dim == 128)
                 {
-                    TQ4Block_128 *block = reinterpret_cast<TQ4Block_128 *>(block_dst);
+                    TQ8Block_128 *block = reinterpret_cast<TQ8Block_128 *>(block_dst);
                     const auto &head_ctx = turboquant_ctx.for_layer(static_cast<int>(h));
-                    turboquant_quantize_tq4<128>(head_src, head_ctx, *block, scratch0, scratch1);
+                    turboquant_quantize_tq8<128>(head_src, head_ctx, *block, scratch0, scratch1);
                 }
                 else if (head_dim == 64)
                 {
-                    TQ4Block_64 *block = reinterpret_cast<TQ4Block_64 *>(block_dst);
+                    TQ8Block_64 *block = reinterpret_cast<TQ8Block_64 *>(block_dst);
                     const auto &head_ctx = turboquant_ctx.for_layer(static_cast<int>(h));
-                    turboquant_quantize_tq4<64>(head_src, head_ctx, *block, scratch0, scratch1);
+                    turboquant_quantize_tq8<64>(head_src, head_ctx, *block, scratch0, scratch1);
                 }
             }
         }
@@ -238,7 +235,7 @@ namespace llaminar2
         return tensor;
     }
 
-    bool TQ4Tensor::copyFrom_fp32_rows(const float *src_data, size_t num_rows, const TurboQuantContext &turboquant_ctx)
+    bool TQ8Tensor::copyFrom_fp32_rows(const float *src_data, size_t num_rows, const TurboQuantContext &turboquant_ctx)
     {
         if (!src_data || num_rows > rows())
             return false;
@@ -262,15 +259,15 @@ namespace llaminar2
 
                 if (head_dim_ == 128)
                 {
-                    TQ4Block_128 *block = reinterpret_cast<TQ4Block_128 *>(block_dst);
+                    TQ8Block_128 *block = reinterpret_cast<TQ8Block_128 *>(block_dst);
                     const auto &head_ctx = turboquant_ctx.for_layer(static_cast<int>(h));
-                    turboquant_quantize_tq4<128>(head_src, head_ctx, *block, scratch0, scratch1);
+                    turboquant_quantize_tq8<128>(head_src, head_ctx, *block, scratch0, scratch1);
                 }
                 else if (head_dim_ == 64)
                 {
-                    TQ4Block_64 *block = reinterpret_cast<TQ4Block_64 *>(block_dst);
+                    TQ8Block_64 *block = reinterpret_cast<TQ8Block_64 *>(block_dst);
                     const auto &head_ctx = turboquant_ctx.for_layer(static_cast<int>(h));
-                    turboquant_quantize_tq4<64>(head_src, head_ctx, *block, scratch0, scratch1);
+                    turboquant_quantize_tq8<64>(head_src, head_ctx, *block, scratch0, scratch1);
                 }
             }
         }
@@ -280,7 +277,7 @@ namespace llaminar2
         return true;
     }
 
-    void TQ4Tensor::dequantize_to_fp32(float *dst, const TurboQuantContext &turboquant_ctx) const
+    void TQ8Tensor::dequantize_to_fp32(float *dst, const TurboQuantContext &turboquant_ctx) const
     {
         const size_t num_rows = rows();
         const size_t kv_dim = cols();
@@ -301,15 +298,15 @@ namespace llaminar2
 
                 if (head_dim_ == 128)
                 {
-                    const TQ4Block_128 *block = reinterpret_cast<const TQ4Block_128 *>(block_src);
+                    const TQ8Block_128 *block = reinterpret_cast<const TQ8Block_128 *>(block_src);
                     const auto &head_ctx = turboquant_ctx.for_layer(static_cast<int>(h));
-                    turboquant_dequantize_tq4<128>(*block, head_ctx, head_dst, scratch);
+                    turboquant_dequantize_tq8<128>(*block, head_ctx, head_dst, scratch);
                 }
                 else if (head_dim_ == 64)
                 {
-                    const TQ4Block_64 *block = reinterpret_cast<const TQ4Block_64 *>(block_src);
+                    const TQ8Block_64 *block = reinterpret_cast<const TQ8Block_64 *>(block_src);
                     const auto &head_ctx = turboquant_ctx.for_layer(static_cast<int>(h));
-                    turboquant_dequantize_tq4<64>(*block, head_ctx, head_dst, scratch);
+                    turboquant_dequantize_tq8<64>(*block, head_ctx, head_dst, scratch);
                 }
             }
         }

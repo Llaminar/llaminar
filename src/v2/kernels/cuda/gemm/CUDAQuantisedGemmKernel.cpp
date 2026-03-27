@@ -23,6 +23,7 @@
  */
 
 #include "CUDAQuantisedGemmKernel.h"
+#include "CUDADeviceWorkspace.h"
 #include "backends/ComputeBackend.h" // DeviceManager
 #include "backends/DeviceId.h"       // DeviceId
 #include "tensors/Tensors.h"         // Q8_1Tensor, FP32Tensor, etc.
@@ -193,7 +194,9 @@ namespace llaminar2
                 const float *d_bias,
                 uint8_t codebook_id,
                 int cuda_device_id,
-                void *stream);
+                void *stream,
+                CUDAGemvContext *gemv_ctx,
+                CUDARowMajorWeights **rm_slot);
 
             bool cudaNativeVNNIInitIQGridTables_tuned();
 
@@ -212,7 +215,8 @@ namespace llaminar2
                 const float *d_bias,
                 uint8_t codebook_id,
                 int cuda_device_id,
-                void *stream);
+                void *stream,
+                CUDAPrefillContext *prefill_ctx);
 
             // -----------------------------------------------------------------
             // V2 Fused tensor-core GEMM (CUDAFusedTCGemm_Ampere.cu)
@@ -282,7 +286,8 @@ namespace llaminar2
                 float alpha, float beta,
                 const float *d_C_existing,
                 int cuda_device_id,
-                void *stream);
+                void *stream,
+                CUDACuBLASContext *cublas_ctx);
         }
 
         // =====================================================================
@@ -301,6 +306,11 @@ namespace llaminar2
             uint32_t *d_weights_native_emins = nullptr;
             uint8_t native_codebook_id = 0;
             uint32_t native_blocks_per_row = 0;
+
+            // Per-device contexts (replaces process-global static state)
+            mutable CUDAGemvContext *gemv_ctx = nullptr;
+            mutable CUDAPrefillContext *prefill_ctx = nullptr;
+            mutable CUDACuBLASContext *cublas_ctx = nullptr;
 
             // Work buffers - ALWAYS from workspace (never owned by kernel)
             // These pointers are set from workspace in validateWorkspace()
@@ -336,6 +346,22 @@ namespace llaminar2
                         cudaQuantGemm_freeDevice(d_weights_native_mins);
                     if (d_weights_native_emins)
                         cudaQuantGemm_freeDevice(d_weights_native_emins);
+                }
+                // Per-device contexts
+                if (gemv_ctx)
+                {
+                    cudaGemvContext_destroy(gemv_ctx);
+                    gemv_ctx = nullptr;
+                }
+                if (prefill_ctx)
+                {
+                    cudaPrefillContext_destroy(prefill_ctx);
+                    prefill_ctx = nullptr;
+                }
+                if (cublas_ctx)
+                {
+                    cudaCuBLASContext_destroy(cublas_ctx);
+                    cublas_ctx = nullptr;
                 }
                 // Work buffers are NEVER owned by kernel - they come from workspace
             }
@@ -549,7 +575,8 @@ namespace llaminar2
                 const float *d_C_existing,
                 const float *d_bias,
                 int cuda_device_id,
-                void *stream)
+                void *stream,
+                CUDARowMajorWeights **rm_slot = nullptr)
             {
                 if (!canUseNativeVNNIBlockwise(impl, m, k))
                 {
@@ -586,6 +613,10 @@ namespace llaminar2
                     std::call_once(native_vnni_decode_once, [&]()
                                    { LOG_INFO("[CUDAQuantisedGemmKernel] NativeVNNI tuned GEMV decode enabled for supported CUDA codebooks"); });
 
+                    // Lazy-create per-device GEMV context (SM count, kpar partials)
+                    if (!impl->gemv_ctx)
+                        impl->gemv_ctx = cudaGemvContext_create(cuda_device_id);
+
                     return cudaNativeVNNIGemvTuned_fp32(
                         d_A_int8,
                         impl->d_weights_native_vnni,
@@ -600,7 +631,9 @@ namespace llaminar2
                         d_bias,
                         impl->native_codebook_id,
                         cuda_device_id,
-                        stream);
+                        stream,
+                        impl->gemv_ctx,
+                        rm_slot);
                 }
 
                 // Unified native VNNI prefill for all supported codebooks
@@ -609,6 +642,10 @@ namespace llaminar2
                     static std::once_flag native_vnni_prefill_once;
                     std::call_once(native_vnni_prefill_once, [&]()
                                    { LOG_INFO("[CUDAQuantisedGemmKernel] NativeVNNI prefill kernel active (codebook " << static_cast<int>(impl->native_codebook_id) << ")"); });
+
+                    // Lazy-create per-device prefill context (stream-K fixup buffer + SM count)
+                    if (!impl->prefill_ctx)
+                        impl->prefill_ctx = cudaPrefillContext_create(cuda_device_id);
 
                     if (cudaNativeVNNIPrefill_fp32(
                             d_A_int8,
@@ -624,7 +661,8 @@ namespace llaminar2
                             d_bias,
                             impl->native_codebook_id,
                             cuda_device_id,
-                            stream))
+                            stream,
+                            impl->prefill_ctx))
                     {
                         return true;
                     }
@@ -1966,7 +2004,8 @@ namespace llaminar2
                         impl_.get(),
                         d_A_int8, nullptr, d_C, d_scales_A_blockwise,
                         m, n, k, alpha, beta, d_C_existing, nullptr,
-                        cuda_device_id_, gpu_stream_))
+                        cuda_device_id_, gpu_stream_,
+                        packed_ ? &packed_->rowmajor_ : nullptr))
                 {
                     LOG_DEBUG("[CUDAQuantisedGemmKernel::multiply_with_fused_swiglu] Complete (native GEMV)");
                     return true;
@@ -2066,6 +2105,10 @@ namespace llaminar2
 
                 const float *d_C_existing = (beta != 0.0f) ? d_C : nullptr;
                 CUDA_KERNEL_PROFILE_SCOPE(CUDAKernelType::GEMM);
+                // Lazy-create per-device cuBLAS context
+                if (!impl_->cublas_ctx)
+                    impl_->cublas_ctx = cudaCuBLASContext_create(cuda_device_id_);
+
                 bool ok = cudaCuBLAS_fp16_gemm_q40(
                     impl_->d_weights_native_vnni,
                     impl_->d_weights_native_scales,
@@ -2073,7 +2116,8 @@ namespace llaminar2
                     m, n, k,
                     alpha, beta,
                     d_C_existing,
-                    cuda_device_id_, gpu_stream_);
+                    cuda_device_id_, gpu_stream_,
+                    impl_->cublas_ctx);
                 if (ok)
                 {
                     LOG_DEBUG("[CUDAQuantisedGemmKernel::multiply_fp32_to_fp32] Complete (cuBLAS FP16 Q4_0)");
@@ -2112,7 +2156,8 @@ namespace llaminar2
                         alpha, beta,
                         d_C_existing,
                         nullptr,
-                        cuda_device_id_, gpu_stream_))
+                        cuda_device_id_, gpu_stream_,
+                        packed_ ? &packed_->rowmajor_ : nullptr))
                 {
                     LOG_DEBUG("[CUDAQuantisedGemmKernel::multiply_fp32_to_fp32] Complete (native payload GEMV)");
                     return true;
@@ -2311,7 +2356,8 @@ namespace llaminar2
                         alpha, beta,
                         d_C_existing,
                         d_bias,
-                        cuda_device_id_, gpu_stream_))
+                        cuda_device_id_, gpu_stream_,
+                        packed_ ? &packed_->rowmajor_ : nullptr))
                 {
                     LOG_DEBUG("[CUDAQuantisedGemmKernel::multiply_fp32_to_fp32_with_bias] Complete (native payload GEMV)");
                     return true;

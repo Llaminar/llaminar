@@ -1,5 +1,5 @@
 /**
- * @file TurboQuantQuantize.h
+ * @file TurboQuantQuantizeTQ4.h
  * @brief FP32 → TQ4 scalar-full quantization for TurboQuant KV cache
  * @author David Sanftenberg
  *
@@ -57,6 +57,8 @@ namespace llaminar2
         (void)scratch1;
 
 #if defined(__AVX512F__)
+        static_assert(D % 16 == 0, "D must be a multiple of 16 for AVX-512");
+
         // --- Norm computation (AVX-512 FMA + reduce) ---
         __m512 vacc = _mm512_setzero_ps();
         for (int i = 0; i < D; i += 16)
@@ -76,31 +78,21 @@ namespace llaminar2
             return;
         }
 
-        // --- Unit vector (AVX-512 mul) ---
-        const float inv_norm = 1.0f / norm;
-        alignas(64) float unit_vec[D];
+        // --- Fused normalize + scale: input × (√D / norm) ---
+        // Combines unit_vec and sqrt(D) scaling into a single pass.
+        const float combined_scale = std::sqrt(static_cast<float>(D)) / norm;
+        alignas(64) float scaled_input[D];
         {
-            const __m512 vinv = _mm512_set1_ps(inv_norm);
+            const __m512 vcombined = _mm512_set1_ps(combined_scale);
             for (int i = 0; i < D; i += 16)
             {
                 __m512 v = _mm512_loadu_ps(input + i);
-                _mm512_store_ps(unit_vec + i, _mm512_mul_ps(v, vinv));
+                _mm512_store_ps(scaled_input + i, _mm512_mul_ps(v, vcombined));
             }
         }
 
         // --- Rotation (already AVX-512 internally) ---
-        apply_rotation(ctx.rotation(), unit_vec, scratch0);
-
-        // --- Scale by sqrt(D) (AVX-512 mul) ---
-        const float scale = std::sqrt(static_cast<float>(D));
-        {
-            const __m512 vscale = _mm512_set1_ps(scale);
-            for (int i = 0; i < D; i += 16)
-            {
-                __m512 v = _mm512_loadu_ps(scratch0 + i);
-                _mm512_storeu_ps(scratch0 + i, _mm512_mul_ps(v, vscale));
-            }
-        }
+        apply_rotation(ctx.rotation(), scaled_input, scratch0);
 
         // --- Nearest centroid (AVX-512 threshold-popcount, 16 elements at a time) ---
         // For each of 16 values, count how many of the 15 thresholds it exceeds.

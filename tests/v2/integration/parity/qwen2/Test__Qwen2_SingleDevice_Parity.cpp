@@ -188,6 +188,23 @@ static const std::vector<TestConfig> kSingleDeviceConfigs = {
         .activation_precision = ActivationPrecision::FP32,
         .kv_cache_precision = KVCachePrecision::TQ4,
     },
+    {
+        .name = "CPU_KV_TQ",
+        .devices = {ParityDeviceType::CPU},
+        .parallelism = Parallelism::None,
+        .collective = Collective::None,
+        .thresholds = {
+            .cosine_threshold = 0.96f,
+            .decode_cosine_threshold = 0.97f,
+            .early_layers_count = 6,
+            .min_early_layers_passed = 4,
+            .kl_threshold = 0.005f,
+            .min_top1_accuracy = 70.0f,
+            .min_top5_accuracy = 95.0f,
+        },
+        .activation_precision = ActivationPrecision::FP32,
+        .kv_cache_precision = KVCachePrecision::TQ,
+    },
     // =========================================================================
     // Q8_0 model configs — exercises the native-VNNI code path (codebook 18)
     // with per-block-of-32 FP16 weight scales preserved.

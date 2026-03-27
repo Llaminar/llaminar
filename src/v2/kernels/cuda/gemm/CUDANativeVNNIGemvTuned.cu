@@ -24,13 +24,87 @@
  */
 
 #include "kernels/cuda/gemm/CUDANativeVNNIDecodeCommon.cuh"
+#include "kernels/cuda/gemm/CUDADeviceWorkspace.h"
 
 #include <cuda_runtime.h>
 #include <cstdint>
 #include <algorithm>
 #include <atomic>
-#include <unordered_map>
 #include <mutex>
+
+// =====================================================================
+// Per-device GEMV context — replaces static getSmCount() and
+// getKparPartials(). Owned by KernelFactory, one per CUDA device.
+// =====================================================================
+struct CUDAGemvContext_
+{
+    int sm_count = 0;
+    int device_id = -1;
+
+    // KPAR two-phase reduction partials buffer
+    float *kpar_partials = nullptr;
+    size_t kpar_capacity = 0; // in floats
+};
+
+static int querySmCount(CUDAGemvContext_ *ctx)
+{
+    if (ctx->sm_count > 0)
+        return ctx->sm_count;
+
+    cudaDeviceGetAttribute(&ctx->sm_count,
+                           cudaDevAttrMultiProcessorCount,
+                           ctx->device_id);
+    if (ctx->sm_count <= 0)
+        ctx->sm_count = 82;
+    return ctx->sm_count;
+}
+
+static float *getKparPartials(CUDAGemvContext_ *ctx, size_t num_floats)
+{
+    if (ctx->kpar_partials && ctx->kpar_capacity >= num_floats)
+        return ctx->kpar_partials;
+
+    if (ctx->kpar_partials)
+    {
+        cudaSetDevice(ctx->device_id);
+        cudaFree(ctx->kpar_partials);
+        ctx->kpar_partials = nullptr;
+        ctx->kpar_capacity = 0;
+    }
+
+    cudaSetDevice(ctx->device_id);
+    if (cudaMalloc(&ctx->kpar_partials, num_floats * sizeof(float)) != cudaSuccess)
+    {
+        ctx->kpar_partials = nullptr;
+        ctx->kpar_capacity = 0;
+        return nullptr;
+    }
+    ctx->kpar_capacity = num_floats;
+    return ctx->kpar_partials;
+}
+
+// =====================================================================
+// Row-major weight layout for row-parallel GEMV
+//
+// Column-major layout (current) is coalesced for column-parallel KPAR,
+// but row-parallel (grid=N, one block per output row) needs row-major
+// for coalesced K-dimension reads.  The data is created lazily on first
+// ROWPAR dispatch and stored on CUDAPackedWeights — freed automatically
+// when the weight tensor is destroyed.
+//
+// Memory cost: ~1× the weight data (about 1.4 GB for 7B Q4_0).
+// Controlled by LLAMINAR_CUDA_GEMV_ROWPAR env variable.
+// =====================================================================
+struct CUDARowMajorWeights_
+{
+    uint8_t *d_payload = nullptr;
+    uint16_t *d_scales = nullptr;
+    uint16_t *d_mins = nullptr;
+    uint32_t *d_emins = nullptr;
+    int N = 0;
+    int K_blocks = 0;
+    int device_id = -1;
+};
 
 namespace
 {
@@ -78,48 +152,7 @@ namespace
     }
 
     // =====================================================================
-    // SM count query (cached)
-    // =====================================================================
-    static int getSmCount()
-    {
-        static int count = 0;
-        if (count == 0)
-        {
-            int dev = 0;
-            cudaGetDevice(&dev);
-            cudaDeviceGetAttribute(&count, cudaDevAttrMultiProcessorCount, dev);
-            if (count <= 0)
-                count = 82;
-        }
-        return count;
-    }
-
-    // =====================================================================
-    // Row-major weight layout cache for row-parallel GEMV
-    //
-    // Column-major layout (current) is coalesced for column-parallel KPAR,
-    // but row-parallel (grid=N, one block per output row) needs row-major
-    // for coalesced K-dimension reads.  This cache lazily transposes weights
-    // on first use and reuses the transposed copy for subsequent GEMV calls.
-    //
-    // Memory cost: ~1× the weight data (about 1.4 GB for 7B Q4_0).
-    // Controlled by LLAMINAR_CUDA_GEMV_ROWPAR env variable.
-    // =====================================================================
-    struct RowMajorEntry
-    {
-        uint8_t *d_payload = nullptr;
-        uint16_t *d_scales = nullptr;
-        uint16_t *d_mins = nullptr;
-        uint32_t *d_emins = nullptr;
-        int N = 0;
-        int K_blocks = 0;
-        int device_id = -1;
-    };
-
-    static std::unordered_map<const void *, RowMajorEntry> g_rm_cache;
-    static std::mutex g_rm_mutex;
-
-    // GPU kernel: transpose blocks from column-major to row-major
+    // Row-major weight layout for row-parallel GEMV
     // col_major[blk * N + n] → row_major[n * K_blocks + blk]
     // Each thread transposes one (n, blk) block by copying PB bytes.
     template <int PB>
@@ -200,147 +233,6 @@ namespace
             enabled = (env && env[0] == '0') ? 0 : 1;
         }
         return enabled == 1;
-    }
-
-    // Get or create row-major weight cache for a given column-major payload.
-    // Returns the cached entry, or nullptr fields if creation fails.
-    // Must be called from the CUDA device context.
-    static const RowMajorEntry *getOrCreateRowMajor(
-        const uint8_t *d_payload_col,
-        const uint16_t *d_scales_col,
-        const uint16_t *d_mins_col,
-        const uint32_t *d_emins_col,
-        int N, int K, int payload_bytes,
-        int device_id, cudaStream_t stream)
-    {
-        std::lock_guard<std::mutex> lock(g_rm_mutex);
-
-        auto it = g_rm_cache.find(d_payload_col);
-        if (it != g_rm_cache.end())
-            return &it->second;
-
-        const int K_blocks = K / BLOCK_K;
-
-        // Check free memory before allocating.  The RM cache for large models
-        // (Q8_0 @ 7B = ~6.7 GB) can exhaust VRAM and leave no headroom for
-        // CUDA graph instantiation.  Keep ≥1.5 GB free.
-        {
-            size_t free_bytes = 0, total_bytes_gpu = 0;
-            if (cudaMemGetInfo(&free_bytes, &total_bytes_gpu) == cudaSuccess)
-            {
-                const size_t need = static_cast<size_t>(N) * K_blocks *
-                                    (payload_bytes + 2 /* scales */);
-                constexpr size_t HEADROOM = size_t{1536} << 20; // 1.5 GB
-                if (free_bytes < need + HEADROOM)
-                    return nullptr;
-            }
-        }
-
-        RowMajorEntry entry;
-        entry.N = N;
-        entry.K_blocks = K_blocks;
-        entry.device_id = device_id;
-
-        // Transpose payload (Q8_0 uses column-major ROWPAR, so no case 32 needed)
-        switch (payload_bytes)
-        {
-        case 16:
-            entry.d_payload = transposeBuffer<uint8_t, 16>(d_payload_col, N, K_blocks, stream);
-            break;
-        case 12:
-            entry.d_payload = transposeBuffer<uint8_t, 12>(d_payload_col, N, K_blocks, stream);
-            break;
-        case 8:
-            entry.d_payload = transposeBuffer<uint8_t, 8>(d_payload_col, N, K_blocks, stream);
-            break;
-        case 6:
-            entry.d_payload = transposeBuffer<uint8_t, 6>(d_payload_col, N, K_blocks, stream);
-            break;
-        case 4:
-            entry.d_payload = transposeBuffer<uint8_t, 4>(d_payload_col, N, K_blocks, stream);
-            break;
-        case 2:
-            entry.d_payload = transposeBuffer<uint8_t, 2>(d_payload_col, N, K_blocks, stream);
-            break;
-        default:
-            return nullptr;
-        }
-        if (!entry.d_payload)
-            return nullptr;
-
-        // Transpose scales (always 2 bytes per block)
-        entry.d_scales = transposeBuffer<uint16_t, 2>(d_scales_col, N, K_blocks, stream);
-        if (!entry.d_scales)
-        {
-            cudaFree(entry.d_payload);
-            return nullptr;
-        }
-
-        // Transpose mins if present
-        if (d_mins_col)
-        {
-            entry.d_mins = transposeBuffer<uint16_t, 2>(d_mins_col, N, K_blocks, stream);
-            if (!entry.d_mins)
-            {
-                cudaFree(entry.d_payload);
-                cudaFree(entry.d_scales);
-                return nullptr;
-            }
-        }
-
-        // Transpose emins if present
-        if (d_emins_col)
-        {
-            entry.d_emins = transposeBuffer<uint32_t, 4>(d_emins_col, N, K_blocks, stream);
-            if (!entry.d_emins)
-            {
-                cudaFree(entry.d_payload);
-                cudaFree(entry.d_scales);
-                if (entry.d_mins)
-                    cudaFree(entry.d_mins);
-                return nullptr;
-            }
-        }
-
-        // Sync to ensure transpose is complete before first use
-        cudaStreamSynchronize(stream);
-
-        auto [ins_it, ok] = g_rm_cache.emplace(d_payload_col, entry);
-        return ok ? &ins_it->second : nullptr;
-    }
-
-    // =====================================================================
-    // Workspace cache for two-phase KPAR reduction
-    //
-    // Lazily allocates a device buffer for partial sums. Grows as needed.
-    // Max size is modest: e.g. 14B_FFN_Down N=5120 × kb=40 = 800KB.
-    // =====================================================================
-    static float *getKparPartials(size_t num_floats, int device_id)
-    {
-        static float *s_ptr = nullptr;
-        static size_t s_capacity = 0;
-        static int s_device = -1;
-
-        if (s_ptr && s_capacity >= num_floats && s_device == device_id)
-            return s_ptr;
-
-        if (s_ptr)
-        {
-            cudaSetDevice(s_device);
-            cudaFree(s_ptr);
-            s_ptr = nullptr;
-        }
-
-        cudaSetDevice(device_id);
-        if (cudaMalloc(&s_ptr, num_floats * sizeof(float)) != cudaSuccess)
-        {
-            s_ptr = nullptr;
-            s_capacity = 0;
-            return nullptr;
-        }
-        s_capacity = num_floats;
-        s_device = device_id;
-        return s_ptr;
     }
 
     // =====================================================================
@@ -965,6 +857,7 @@ namespace
         const float *d_C_existing, const float *d_bias,
         int target_waves, int min_kgroups_per_cta, int max_kb,
         int force_two_phase,
+        CUDAGemvContext_ *gemv_ctx,
         int device_id, cudaStream_t stream);
 
     // Two-phase partials buffer threshold (bytes).
@@ -1091,13 +984,14 @@ namespace
         float alpha, float beta,
         const float *d_C_existing, const float *d_bias,
         int target_waves, int min_kgroups_per_cta, int max_kb,
-        int device_id, cudaStream_t stream)
+        int device_id, cudaStream_t stream,
+        CUDAGemvContext_ *gemv_ctx)
     {
         constexpr int THREADS = TILE_N / CPT;
 
         const int grid_n = (N + TILE_N - 1) / TILE_N;
         const int k_groups = K / BLOCK_K;
-        const int num_sms = getSmCount();
+        const int num_sms = querySmCount(gemv_ctx);
         const int kb = selectKSplit(grid_n, k_groups, num_sms,
                                     target_waves, min_kgroups_per_cta);
         const int kb_capped = (max_kb > 0) ? std::min(kb, max_kb) : kb;
@@ -1112,7 +1006,7 @@ namespace
         {
             // Two-phase: write partials, then reduce
             float *d_partials = getKparPartials(
-                static_cast<size_t>(kb_capped) * N, device_id);
+                gemv_ctx, static_cast<size_t>(kb_capped) * N);
             if (!d_partials)
                 return false;
 
@@ -1163,6 +1057,7 @@ namespace
         const float *d_scales_A, int N, int K,
         float alpha, float beta,
         const float *d_C_existing, const float *d_bias,
+        CUDAGemvContext_ *gemv_ctx,
         int cuda_device_id, cudaStream_t stream)
     {
         const auto t = selectKparTuning<CB>(N, K);
@@ -1176,32 +1071,32 @@ namespace
             return launchKparImpl<32, 1, CB>(
                 d_A_int8, d_payload, d_scales, d_mins, d_emins,
                 d_C, d_scales_A, N, K, alpha, beta,
-                d_C_existing, d_bias, tw, mkg, mkb, cuda_device_id, stream);
+                d_C_existing, d_bias, tw, mkg, mkb, cuda_device_id, stream, gemv_ctx);
         case KparTile::T64_C1:
             return launchKparImpl<64, 1, CB>(
                 d_A_int8, d_payload, d_scales, d_mins, d_emins,
                 d_C, d_scales_A, N, K, alpha, beta,
-                d_C_existing, d_bias, tw, mkg, mkb, cuda_device_id, stream);
+                d_C_existing, d_bias, tw, mkg, mkb, cuda_device_id, stream, gemv_ctx);
         case KparTile::T64_C2:
             return launchKparImpl<64, 2, CB>(
                 d_A_int8, d_payload, d_scales, d_mins, d_emins,
                 d_C, d_scales_A, N, K, alpha, beta,
-                d_C_existing, d_bias, tw, mkg, mkb, cuda_device_id, stream);
+                d_C_existing, d_bias, tw, mkg, mkb, cuda_device_id, stream, gemv_ctx);
         case KparTile::T128_C1:
             return launchKparImpl<128, 1, CB>(
                 d_A_int8, d_payload, d_scales, d_mins, d_emins,
                 d_C, d_scales_A, N, K, alpha, beta,
-                d_C_existing, d_bias, tw, mkg, mkb, cuda_device_id, stream);
+                d_C_existing, d_bias, tw, mkg, mkb, cuda_device_id, stream, gemv_ctx);
         case KparTile::T128_C2:
             return launchKparImpl<128, 2, CB>(
                 d_A_int8, d_payload, d_scales, d_mins, d_emins,
                 d_C, d_scales_A, N, K, alpha, beta,
-                d_C_existing, d_bias, tw, mkg, mkb, cuda_device_id, stream);
+                d_C_existing, d_bias, tw, mkg, mkb, cuda_device_id, stream, gemv_ctx);
         case KparTile::T256_C2:
             return launchKparImpl<256, 2, CB>(
                 d_A_int8, d_payload, d_scales, d_mins, d_emins,
                 d_C, d_scales_A, N, K, alpha, beta,
-                d_C_existing, d_bias, tw, mkg, mkb, cuda_device_id, stream);
+                d_C_existing, d_bias, tw, mkg, mkb, cuda_device_id, stream, gemv_ctx);
         }
         return false;
     }
@@ -1315,6 +1210,8 @@ namespace
         const float *d_scales_A, int N, int K,
         float alpha, float beta,
         const float *d_C_existing, const float *d_bias,
+        CUDAGemvContext_ *gemv_ctx,
+        CUDARowMajorWeights_ *rowmajor,
         int cuda_device_id, cudaStream_t stream)
     {
         const int tile_key = tuning.tile_n * 100 + tuning.cpt;
@@ -1401,43 +1298,43 @@ namespace
                     d_A_int8, d_payload, d_scales, d_mins, d_emins, d_C,
                     d_scales_A, N, K, alpha, beta, d_C_existing, d_bias,
                     tuning.target_waves, tuning.mkg, tuning.max_kb,
-                    tuning.force_two_phase, cuda_device_id, stream);
+                    tuning.force_two_phase, gemv_ctx, cuda_device_id, stream);
             case 64 * 100 + 1:
                 return sweepLaunchKpar<64, 1, CB>(
                     d_A_int8, d_payload, d_scales, d_mins, d_emins, d_C,
                     d_scales_A, N, K, alpha, beta, d_C_existing, d_bias,
                     tuning.target_waves, tuning.mkg, tuning.max_kb,
-                    tuning.force_two_phase, cuda_device_id, stream);
+                    tuning.force_two_phase, gemv_ctx, cuda_device_id, stream);
             case 64 * 100 + 2:
                 return sweepLaunchKpar<64, 2, CB>(
                     d_A_int8, d_payload, d_scales, d_mins, d_emins, d_C,
                     d_scales_A, N, K, alpha, beta, d_C_existing, d_bias,
                     tuning.target_waves, tuning.mkg, tuning.max_kb,
-                    tuning.force_two_phase, cuda_device_id, stream);
+                    tuning.force_two_phase, gemv_ctx, cuda_device_id, stream);
             case 128 * 100 + 1:
                 return sweepLaunchKpar<128, 1, CB>(
                     d_A_int8, d_payload, d_scales, d_mins, d_emins, d_C,
                     d_scales_A, N, K, alpha, beta, d_C_existing, d_bias,
                     tuning.target_waves, tuning.mkg, tuning.max_kb,
-                    tuning.force_two_phase, cuda_device_id, stream);
+                    tuning.force_two_phase, gemv_ctx, cuda_device_id, stream);
             case 128 * 100 + 2:
                 return sweepLaunchKpar<128, 2, CB>(
                     d_A_int8, d_payload, d_scales, d_mins, d_emins, d_C,
                     d_scales_A, N, K, alpha, beta, d_C_existing, d_bias,
                     tuning.target_waves, tuning.mkg, tuning.max_kb,
-                    tuning.force_two_phase, cuda_device_id, stream);
+                    tuning.force_two_phase, gemv_ctx, cuda_device_id, stream);
             case 256 * 100 + 2:
                 return sweepLaunchKpar<256, 2, CB>(
                     d_A_int8, d_payload, d_scales, d_mins, d_emins, d_C,
                     d_scales_A, N, K, alpha, beta, d_C_existing, d_bias,
                     tuning.target_waves, tuning.mkg, tuning.max_kb,
-                    tuning.force_two_phase, cuda_device_id, stream);
+                    tuning.force_two_phase, gemv_ctx, cuda_device_id, stream);
             case 256 * 100 + 4:
                 return sweepLaunchKpar<256, 4, CB>(
                     d_A_int8, d_payload, d_scales, d_mins, d_emins, d_C,
                     d_scales_A, N, K, alpha, beta, d_C_existing, d_bias,
                     tuning.target_waves, tuning.mkg, tuning.max_kb,
-                    tuning.force_two_phase, cuda_device_id, stream);
+                    tuning.force_two_phase, gemv_ctx, cuda_device_id, stream);
             default:
                 return false;
             }
@@ -1445,20 +1342,13 @@ namespace
 
         if (shape == NativeGemvShape::ROWPAR)
         {
-            // Look up the row-major cache using the column-major d_payload as key
-            const RowMajorEntry *rm = nullptr;
-            {
-                std::lock_guard<std::mutex> lock(g_rm_mutex);
-                auto it = g_rm_cache.find(d_payload);
-                if (it != g_rm_cache.end())
-                    rm = &it->second;
-            }
-            if (!rm || !rm->d_payload || !rm->d_scales)
+            if (!rowmajor || !rowmajor->d_payload || !rowmajor->d_scales)
                 return false;
 
             // tile_n encodes NWARPS for ROWPAR (2, 4, 8)
             return launchRowPar<CB>(
-                d_A_int8, rm->d_payload, rm->d_scales, rm->d_mins, rm->d_emins, d_C,
+                d_A_int8, rowmajor->d_payload, rowmajor->d_scales,
+                rowmajor->d_mins, rowmajor->d_emins, d_C,
                 d_scales_A, N, K, alpha, beta, d_C_existing, d_bias,
                 tuning.tile_n, stream);
         }
@@ -1476,6 +1366,7 @@ namespace
         const float *d_C_existing, const float *d_bias,
         int target_waves, int min_kgroups_per_cta, int max_kb,
         int force_two_phase,
+        CUDAGemvContext_ *gemv_ctx,
         int device_id, cudaStream_t stream);
 
     // =====================================================================
@@ -1490,6 +1381,8 @@ namespace
         const float *d_scales_A, int N, int K,
         float alpha, float beta,
         const float *d_C_existing, const float *d_bias,
+        CUDAGemvContext_ *gemv_ctx,
+        CUDARowMajorWeights_ **rm_slot,
         int cuda_device_id, cudaStream_t stream)
     {
         // Sweep override — bypass heuristics, use explicit params
@@ -1523,17 +1416,20 @@ namespace
                 g_sweep.force_two_phase,
             };
 
-            // For ROWPAR sweep: ensure row-major cache exists (skip for Q8_0
+            // For ROWPAR sweep: ensure row-major exists (skip for Q8_0
             // which uses column-major ROWPAR to avoid doubling VRAM)
             if (shape == NativeGemvShape::ROWPAR)
             {
                 if constexpr (CB != 19)
                 {
-                    constexpr int PB = llaminar2::cuda_native_vnni::CodebookTraits<CB>::payload_bytes;
-                    const auto *rm = getOrCreateRowMajor(
-                        d_payload, d_scales, d_mins, d_emins,
-                        N, K, PB, cuda_device_id, stream);
-                    if (!rm || !rm->d_payload)
+                    if (rm_slot && !*rm_slot)
+                    {
+                        constexpr int PB = llaminar2::cuda_native_vnni::CodebookTraits<CB>::payload_bytes;
+                        *rm_slot = cudaRowMajorWeights_create(
+                            d_payload, d_scales, d_mins, d_emins,
+                            N, K, PB, cuda_device_id, stream);
+                    }
+                    if (!rm_slot || !*rm_slot)
                         return false;
                 }
             }
@@ -1542,6 +1438,7 @@ namespace
                 shape, tuning,
                 d_A_int8, d_payload, d_scales, d_mins, d_emins, d_C,
                 d_scales_A, N, K, alpha, beta, d_C_existing, d_bias,
+                gemv_ctx, rm_slot ? *rm_slot : nullptr,
                 cuda_device_id, stream);
         }
 
@@ -1557,11 +1454,15 @@ namespace
         {
             if constexpr (CB != 19)
             {
-                constexpr int PB = llaminar2::cuda_native_vnni::CodebookTraits<CB>::payload_bytes;
-                const auto *rm = getOrCreateRowMajor(
-                    d_payload, d_scales, d_mins, d_emins,
-                    N, K, PB, cuda_device_id, stream);
-                if (rm && rm->d_payload)
+                // Lazy-create row-major transpose on first ROWPAR dispatch
+                if (rm_slot && !*rm_slot)
+                {
+                    constexpr int PB = llaminar2::cuda_native_vnni::CodebookTraits<CB>::payload_bytes;
+                    *rm_slot = cudaRowMajorWeights_create(
+                        d_payload, d_scales, d_mins, d_emins,
+                        N, K, PB, cuda_device_id, stream);
+                }
+                if (rm_slot && *rm_slot && (*rm_slot)->d_payload)
                 {
                     shape = NativeGemvShape::ROWPAR;
                     // NWARPS: 2 for most shapes (well-tested), 4 for large-K shapes
@@ -1577,6 +1478,7 @@ namespace
             shape, tuning,
             d_A_int8, d_payload, d_scales, d_mins, d_emins, d_C,
             d_scales_A, N, K, alpha, beta, d_C_existing, d_bias,
+            gemv_ctx, rm_slot ? *rm_slot : nullptr,
             cuda_device_id, stream);
     }
 
@@ -1593,13 +1495,14 @@ namespace
         const float *d_C_existing, const float *d_bias,
         int target_waves, int min_kgroups_per_cta, int max_kb,
         int force_two_phase,
+        CUDAGemvContext_ *gemv_ctx,
         int device_id, cudaStream_t stream)
     {
         constexpr int THREADS = TILE_N / CPT;
 
         const int grid_n = (N + TILE_N - 1) / TILE_N;
         const int k_groups = K / BLOCK_K;
-        const int num_sms = getSmCount();
+        const int num_sms = querySmCount(gemv_ctx);
         const int kb = selectKSplit(grid_n, k_groups, num_sms,
                                     target_waves, min_kgroups_per_cta);
         const int kb_capped = (max_kb > 0) ? std::min(kb, max_kb) : kb;
@@ -1618,7 +1521,7 @@ namespace
         if (use_two_phase)
         {
             float *d_partials = getKparPartials(
-                static_cast<size_t>(kb_capped) * N, device_id);
+                gemv_ctx, static_cast<size_t>(kb_capped) * N);
             if (!d_partials)
                 return false;
 
@@ -1705,13 +1608,17 @@ extern "C"
         const float *d_bias,
         uint8_t codebook_id,
         int cuda_device_id,
-        void *stream)
+        void *stream,
+        CUDAGemvContext *gemv_ctx,
+        CUDARowMajorWeights **rm_slot)
     {
         if (!d_A_int8 || !d_payload || !d_scales || !d_C_fp32 || !d_scales_A_block)
             return false;
         if (N <= 0 || K <= 0 || (K % BLOCK_K) != 0)
             return false;
         if (!cudaNativeVNNIGemvTuned_supportsCodebook(codebook_id))
+            return false;
+        if (!gemv_ctx)
             return false;
 
         cudaError_t err = cudaSetDevice(cuda_device_id);
@@ -1723,37 +1630,37 @@ extern "C"
         switch (codebook_id)
         {
         case 0:
-            return dispatchCodebook<0>(d_A_int8, d_payload, d_scales, nullptr, nullptr, d_C_fp32, d_scales_A_block, N, K, alpha, beta, d_C_existing, d_bias, cuda_device_id, cuda_stream);
+            return dispatchCodebook<0>(d_A_int8, d_payload, d_scales, nullptr, nullptr, d_C_fp32, d_scales_A_block, N, K, alpha, beta, d_C_existing, d_bias, gemv_ctx, rm_slot, cuda_device_id, cuda_stream);
         case 4:
-            return dispatchCodebook<4>(d_A_int8, d_payload, d_scales, nullptr, nullptr, d_C_fp32, d_scales_A_block, N, K, alpha, beta, d_C_existing, d_bias, cuda_device_id, cuda_stream);
+            return dispatchCodebook<4>(d_A_int8, d_payload, d_scales, nullptr, nullptr, d_C_fp32, d_scales_A_block, N, K, alpha, beta, d_C_existing, d_bias, gemv_ctx, rm_slot, cuda_device_id, cuda_stream);
         case 5:
-            return dispatchCodebook<5>(d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32, d_scales_A_block, N, K, alpha, beta, d_C_existing, d_bias, cuda_device_id, cuda_stream);
+            return dispatchCodebook<5>(d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32, d_scales_A_block, N, K, alpha, beta, d_C_existing, d_bias, gemv_ctx, rm_slot, cuda_device_id, cuda_stream);
         case 6:
-            return dispatchCodebook<6>(d_A_int8, d_payload, d_scales, nullptr, nullptr, d_C_fp32, d_scales_A_block, N, K, alpha, beta, d_C_existing, d_bias, cuda_device_id, cuda_stream);
+            return dispatchCodebook<6>(d_A_int8, d_payload, d_scales, nullptr, nullptr, d_C_fp32, d_scales_A_block, N, K, alpha, beta, d_C_existing, d_bias, gemv_ctx, rm_slot, cuda_device_id, cuda_stream);
         case 7:
-            return dispatchCodebook<7>(d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32, d_scales_A_block, N, K, alpha, beta, d_C_existing, d_bias, cuda_device_id, cuda_stream);
+            return dispatchCodebook<7>(d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32, d_scales_A_block, N, K, alpha, beta, d_C_existing, d_bias, gemv_ctx, rm_slot, cuda_device_id, cuda_stream);
         case 8:
-            return dispatchCodebook<8>(d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32, d_scales_A_block, N, K, alpha, beta, d_C_existing, d_bias, cuda_device_id, cuda_stream);
+            return dispatchCodebook<8>(d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32, d_scales_A_block, N, K, alpha, beta, d_C_existing, d_bias, gemv_ctx, rm_slot, cuda_device_id, cuda_stream);
         case 9:
-            return dispatchCodebook<9>(d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32, d_scales_A_block, N, K, alpha, beta, d_C_existing, d_bias, cuda_device_id, cuda_stream);
+            return dispatchCodebook<9>(d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32, d_scales_A_block, N, K, alpha, beta, d_C_existing, d_bias, gemv_ctx, rm_slot, cuda_device_id, cuda_stream);
         case 10:
-            return dispatchCodebook<10>(d_A_int8, d_payload, d_scales, d_mins, d_emins, d_C_fp32, d_scales_A_block, N, K, alpha, beta, d_C_existing, d_bias, cuda_device_id, cuda_stream);
+            return dispatchCodebook<10>(d_A_int8, d_payload, d_scales, d_mins, d_emins, d_C_fp32, d_scales_A_block, N, K, alpha, beta, d_C_existing, d_bias, gemv_ctx, rm_slot, cuda_device_id, cuda_stream);
         case 11:
-            return dispatchCodebook<11>(d_A_int8, d_payload, d_scales, nullptr, nullptr, d_C_fp32, d_scales_A_block, N, K, alpha, beta, d_C_existing, d_bias, cuda_device_id, cuda_stream);
+            return dispatchCodebook<11>(d_A_int8, d_payload, d_scales, nullptr, nullptr, d_C_fp32, d_scales_A_block, N, K, alpha, beta, d_C_existing, d_bias, gemv_ctx, rm_slot, cuda_device_id, cuda_stream);
         case 12:
-            return dispatchCodebook<12>(d_A_int8, d_payload, d_scales, nullptr, nullptr, d_C_fp32, d_scales_A_block, N, K, alpha, beta, d_C_existing, d_bias, cuda_device_id, cuda_stream);
+            return dispatchCodebook<12>(d_A_int8, d_payload, d_scales, nullptr, nullptr, d_C_fp32, d_scales_A_block, N, K, alpha, beta, d_C_existing, d_bias, gemv_ctx, rm_slot, cuda_device_id, cuda_stream);
         case 13:
-            return dispatchCodebook<13>(d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32, d_scales_A_block, N, K, alpha, beta, d_C_existing, d_bias, cuda_device_id, cuda_stream);
+            return dispatchCodebook<13>(d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32, d_scales_A_block, N, K, alpha, beta, d_C_existing, d_bias, gemv_ctx, rm_slot, cuda_device_id, cuda_stream);
         case 14:
-            return dispatchCodebook<14>(d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32, d_scales_A_block, N, K, alpha, beta, d_C_existing, d_bias, cuda_device_id, cuda_stream);
+            return dispatchCodebook<14>(d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32, d_scales_A_block, N, K, alpha, beta, d_C_existing, d_bias, gemv_ctx, rm_slot, cuda_device_id, cuda_stream);
         case 15:
-            return dispatchCodebook<15>(d_A_int8, d_payload, d_scales, nullptr, nullptr, d_C_fp32, d_scales_A_block, N, K, alpha, beta, d_C_existing, d_bias, cuda_device_id, cuda_stream);
+            return dispatchCodebook<15>(d_A_int8, d_payload, d_scales, nullptr, nullptr, d_C_fp32, d_scales_A_block, N, K, alpha, beta, d_C_existing, d_bias, gemv_ctx, rm_slot, cuda_device_id, cuda_stream);
         case 16:
-            return dispatchCodebook<16>(d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32, d_scales_A_block, N, K, alpha, beta, d_C_existing, d_bias, cuda_device_id, cuda_stream);
+            return dispatchCodebook<16>(d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32, d_scales_A_block, N, K, alpha, beta, d_C_existing, d_bias, gemv_ctx, rm_slot, cuda_device_id, cuda_stream);
         case 17:
-            return dispatchCodebook<17>(d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32, d_scales_A_block, N, K, alpha, beta, d_C_existing, d_bias, cuda_device_id, cuda_stream);
+            return dispatchCodebook<17>(d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32, d_scales_A_block, N, K, alpha, beta, d_C_existing, d_bias, gemv_ctx, rm_slot, cuda_device_id, cuda_stream);
         case 19:
-            return dispatchCodebook<19>(d_A_int8, d_payload, d_scales, nullptr, nullptr, d_C_fp32, d_scales_A_block, N, K, alpha, beta, d_C_existing, d_bias, cuda_device_id, cuda_stream);
+            return dispatchCodebook<19>(d_A_int8, d_payload, d_scales, nullptr, nullptr, d_C_fp32, d_scales_A_block, N, K, alpha, beta, d_C_existing, d_bias, gemv_ctx, rm_slot, cuda_device_id, cuda_stream);
         default:
             return false;
         }
@@ -1789,5 +1696,145 @@ extern "C"
     void cudaNativeVNNIGemvSweep_clearConfig()
     {
         g_sweep.active = false;
+    }
+
+    void cudaNativeVNNIGemvTuned_clearStaticState()
+    {
+        // Row-major weight data is now owned by CUDAPackedWeights (per-weight)
+        // and KPAR partials are owned by CUDAGemvContext (per-device).
+        // Only sweep override needs clearing here.
+        g_sweep.active = false;
+    }
+
+    // =================================================================
+    // Context lifecycle — extern "C" create/destroy
+    // =================================================================
+
+    CUDAGemvContext *cudaGemvContext_create(int device_id)
+    {
+        auto *ctx = new (std::nothrow) CUDAGemvContext_();
+        if (!ctx)
+            return nullptr;
+        ctx->device_id = device_id;
+        return ctx;
+    }
+
+    void cudaGemvContext_destroy(CUDAGemvContext *ctx)
+    {
+        if (!ctx)
+            return;
+        if (ctx->kpar_partials)
+        {
+            cudaSetDevice(ctx->device_id);
+            cudaFree(ctx->kpar_partials);
+        }
+        delete ctx;
+    }
+
+    CUDARowMajorWeights *cudaRowMajorWeights_create(
+        const uint8_t *d_payload_col,
+        const uint16_t *d_scales_col,
+        const uint16_t *d_mins_col,
+        const uint32_t *d_emins_col,
+        int N, int K,
+        int payload_bytes,
+        int device_id,
+        void *stream)
+    {
+        cudaSetDevice(device_id);
+        cudaStream_t s = static_cast<cudaStream_t>(stream);
+        const int K_blocks = K / BLOCK_K;
+
+        auto *rm = new (std::nothrow) CUDARowMajorWeights_();
+        if (!rm)
+            return nullptr;
+        rm->N = N;
+        rm->K_blocks = K_blocks;
+        rm->device_id = device_id;
+
+        // Transpose payload (PB bytes per block)
+        switch (payload_bytes)
+        {
+        case 2:
+            rm->d_payload = reinterpret_cast<uint8_t *>(
+                transposeBuffer<uint8_t, 2>(d_payload_col, N, K_blocks, s));
+            break;
+        case 4:
+            rm->d_payload = reinterpret_cast<uint8_t *>(
+                transposeBuffer<uint8_t, 4>(d_payload_col, N, K_blocks, s));
+            break;
+        case 16:
+            rm->d_payload = reinterpret_cast<uint8_t *>(
+                transposeBuffer<uint8_t, 16>(d_payload_col, N, K_blocks, s));
+            break;
+        case 32:
+            rm->d_payload = reinterpret_cast<uint8_t *>(
+                transposeBuffer<uint8_t, 32>(d_payload_col, N, K_blocks, s));
+            break;
+        default:
+            delete rm;
+            return nullptr;
+        }
+        if (!rm->d_payload)
+        {
+            delete rm;
+            return nullptr;
+        }
+
+        // Transpose scales (2 bytes each)
+        rm->d_scales = transposeBuffer<uint16_t, 2>(d_scales_col, N, K_blocks, s);
+        if (!rm->d_scales)
+        {
+            cudaFree(rm->d_payload);
+            delete rm;
+            return nullptr;
+        }
+
+        // Transpose mins if present
+        if (d_mins_col)
+        {
+            rm->d_mins = transposeBuffer<uint16_t, 2>(d_mins_col, N, K_blocks, s);
+            if (!rm->d_mins)
+            {
+                cudaFree(rm->d_payload);
+                cudaFree(rm->d_scales);
+                delete rm;
+                return nullptr;
+            }
+        }
+
+        // Transpose emins if present
+        if (d_emins_col)
+        {
+            rm->d_emins = transposeBuffer<uint32_t, 4>(d_emins_col, N, K_blocks, s);
+            if (!rm->d_emins)
+            {
+                cudaFree(rm->d_payload);
+                cudaFree(rm->d_scales);
+                if (rm->d_mins)
+                    cudaFree(rm->d_mins);
+                delete rm;
+                return nullptr;
+            }
+        }
+
+        cudaStreamSynchronize(s);
+        return rm;
+    }
+
+    void cudaRowMajorWeights_destroy(CUDARowMajorWeights *rm)
+    {
+        if (!rm)
+            return;
+        cudaSetDevice(rm->device_id);
+        if (rm->d_payload)
+            cudaFree(rm->d_payload);
+        if (rm->d_scales)
+            cudaFree(rm->d_scales);
+        if (rm->d_mins)
+            cudaFree(rm->d_mins);
+        if (rm->d_emins)
+            cudaFree(rm->d_emins);
+        delete rm;
     }
 }

@@ -72,18 +72,21 @@ namespace llaminar2
      * Together, these define the valid range of data within the pre-allocated
      * tensor. Tokens are logically ordered from `head` to `(head + size - 1) % max_seq_len`.
      *
-     * @tparam Precision  Activation storage precision (FP32, BF16, FP16, Q8_1, Q16_1).
+     * @tparam KPrecision  Activation storage precision for K cache.
+     * @tparam VPrecision  Activation storage precision for V cache (defaults to KPrecision).
      */
-    template <ActivationPrecision Precision>
+    template <ActivationPrecision KPrecision, ActivationPrecision VPrecision = KPrecision>
     struct CPURingKVCacheEntry
     {
-        /// @brief The concrete tensor type for this precision (e.g., FP32Tensor, Q8_1Tensor).
-        using TensorT = typename detail::CPUKVCacheTensor<Precision>::Type;
+        /// @brief The concrete tensor type for K storage at this precision.
+        using KTensorT = typename detail::CPUKVCacheTensor<KPrecision>::Type;
+        /// @brief The concrete tensor type for V storage at this precision.
+        using VTensorT = typename detail::CPUKVCacheTensor<VPrecision>::Type;
 
-        std::shared_ptr<TensorT> K; ///< Key tensor, pre-allocated to max_seq_len rows.
-        std::shared_ptr<TensorT> V; ///< Value tensor, pre-allocated to max_seq_len rows.
-        int head = 0;               ///< Ring buffer head: index of the oldest valid token.
-        int size = 0;               ///< Number of valid tokens currently stored in the ring.
+        std::shared_ptr<KTensorT> K; ///< Key tensor, pre-allocated to max_seq_len rows.
+        std::shared_ptr<VTensorT> V; ///< Value tensor, pre-allocated to max_seq_len rows.
+        int head = 0;                ///< Ring buffer head: index of the oldest valid token.
+        int size = 0;                ///< Number of valid tokens currently stored in the ring.
     };
 
     /**
@@ -109,21 +112,26 @@ namespace llaminar2
      * controlled either by a single `DeviceId` (same device for all layers) or by
      * a per-layer `attention_devices` vector passed to the constructor.
      *
-     * @tparam Precision  Activation storage format. Defaults to FP32.
-     *                    Determines the concrete tensor type used for K/V storage.
+     * @tparam KPrecision  Activation storage format for K cache. Defaults to FP32.
+     * @tparam VPrecision  Activation storage format for V cache. Defaults to KPrecision.
+     *                     When KPrecision != VPrecision, enables asymmetric K/V storage
+     *                     (e.g., TQ8 for K, TQ4 for V).
      *
      * @see ICPUKVCache  The polymorphic interface this class implements.
      * @see CPURingKVCacheEntry  The per-sequence ring buffer bookkeeping struct.
      */
-    template <ActivationPrecision Precision = ActivationPrecision::FP32>
+    template <ActivationPrecision KPrecision = ActivationPrecision::FP32, ActivationPrecision VPrecision = KPrecision>
     class CPURingKVCache : public ICPUKVCache
     {
     public:
-        /// @brief Concrete tensor type for K/V storage at this precision.
-        using TensorT = typename detail::CPUKVCacheTensor<Precision>::Type;
+        /// @brief Concrete tensor type for K storage at this precision.
+        using KTensorT = typename detail::CPUKVCacheTensor<KPrecision>::Type;
+
+        /// @brief Concrete tensor type for V storage at this precision.
+        using VTensorT = typename detail::CPUKVCacheTensor<VPrecision>::Type;
 
         /// @brief Ring buffer entry type (K tensor + V tensor + head/size bookkeeping).
-        using EntryT = CPURingKVCacheEntry<Precision>;
+        using EntryT = CPURingKVCacheEntry<KPrecision, VPrecision>;
 
         // =====================================================================
         // Constructors
@@ -217,8 +225,11 @@ namespace llaminar2
         // Metadata Accessors
         // =====================================================================
 
-        /** @brief Returns the compile-time activation precision of this cache. */
-        ActivationPrecision precision() const override { return Precision; }
+        /** @brief Returns the K-cache activation precision. */
+        ActivationPrecision k_precision() const override { return KPrecision; }
+
+        /** @brief Returns the V-cache activation precision. */
+        ActivationPrecision v_precision() const override { return VPrecision; }
 
         /** @brief Returns the maximum sequence length (ring buffer capacity). */
         int max_seq_len() const override { return max_seq_len_; }
@@ -441,6 +452,30 @@ namespace llaminar2
         /** @brief Reset the eviction counter to zero. */
         void reset_eviction_counter() override { total_evicted_ = 0; }
 
+        // =====================================================================
+        // Converted KV Access (dequant-on-read with optional fused RoPE)
+        // =====================================================================
+
+        /**
+         * @brief Get K/V converted to target precision with optional fused RoPE.
+         *
+         * Manages internal FP32 shadow buffers per (layer, seq_idx). Only newly
+         * appended rows are dequantized each call (incremental conversion).
+         * When rope->rope_theta > 0, RoPE is fused into K dequantization.
+         *
+         * Supports all cache precisions: FP32 (passthrough), FP16, BF16, Q8_1,
+         * Q16_1, TQ4, TQ8, and split TQ (TQ8 K + TQ4 V).
+         */
+        bool get_kv_converted(int layer, int seq_idx,
+                              ActivationPrecision target,
+                              ITensor **out_k, ITensor **out_v,
+                              int *out_kv_len = nullptr,
+                              const KVReadParams *rope = nullptr) override;
+
+        // =====================================================================
+        // Ring Buffer Inspection
+        // =====================================================================
+
         /**
          * @brief Get the physical ring head index for a (layer, sequence) entry.
          *
@@ -479,6 +514,36 @@ namespace llaminar2
         /// @brief Per-layer device placement (CPU, CUDA:0, etc.).
         std::vector<DeviceId> layer_devices_;
 
+        // =====================================================================
+        // FP32 Shadow Buffers (for get_kv_converted)
+        // =====================================================================
+
+        /**
+         * @brief Per-(layer, seq_idx) shadow state for incremental FP32 conversion.
+         *
+         * Lazily allocated on first get_kv_converted() call. Tracks how many rows
+         * have been converted so far, enabling O(1) incremental update per decode step.
+         */
+        struct FP32Shadow
+        {
+            std::unique_ptr<FP32Tensor> K; ///< FP32 K shadow [max_seq_len × kv_dim]
+            std::unique_ptr<FP32Tensor> V; ///< FP32 V shadow [max_seq_len × kv_dim]
+            int converted_rows = 0;        ///< How many rows have been converted so far
+            int last_head = -1;            ///< Last seen ring head (-1 = uninitialised)
+        };
+
+        /// @brief 2D array of FP32 shadow entries: fp32_shadows_[layer][seq_idx].
+        /// Lazily allocated (empty until first get_kv_converted call).
+        mutable std::vector<std::vector<FP32Shadow>> fp32_shadows_;
+
+        /// @brief Lazily allocate and return the FP32Shadow for (layer, seq_idx).
+        FP32Shadow &ensureFP32Shadow(int layer, int seq_idx) const;
+
+        /// @brief Convert newly appended rows from native precision to FP32 (+ optional RoPE).
+        void convertNewRows(int layer, int seq_idx,
+                            FP32Shadow &shadow, const EntryT &entry,
+                            const KVReadParams *rope) const;
+
         /// @brief Factory for creating typed tensors with correct device placement.
         std::unique_ptr<TensorFactory> tensor_factory_;
 
@@ -487,17 +552,20 @@ namespace llaminar2
         // =====================================================================
 
         /**
-         * @brief Allocate a single typed tensor with the given shape and device.
+         * @brief Allocate a single K tensor with the given shape and device.
          *
          * Dispatches to the appropriate TensorFactory method based on the
-         * compile-time Precision template parameter.
-         *
-         * @param rows   Number of rows (e.g., max_seq_len for POSITION_MAJOR).
-         * @param cols   Number of columns (e.g., kv_dim for POSITION_MAJOR).
-         * @param device Target device for the allocation.
-         * @return Shared pointer to the newly allocated tensor.
+         * compile-time KPrecision template parameter.
          */
-        std::shared_ptr<TensorT> allocate_tensor(size_t rows, size_t cols, DeviceId device);
+        std::shared_ptr<KTensorT> allocate_k_tensor(size_t rows, size_t cols, DeviceId device);
+
+        /**
+         * @brief Allocate a single V tensor with the given shape and device.
+         *
+         * Dispatches to the appropriate TensorFactory method based on the
+         * compile-time VPrecision template parameter.
+         */
+        std::shared_ptr<VTensorT> allocate_v_tensor(size_t rows, size_t cols, DeviceId device);
 
         /**
          * @brief Initialize all sequence entries for a given layer.
@@ -523,7 +591,7 @@ namespace llaminar2
          * @param num_tokens Number of token rows to write.
          * @return true on success.
          */
-        bool append_kv_impl(int layer, int seq_idx, const TensorT *new_k, const TensorT *new_v, int num_tokens);
+        bool append_kv_impl(int layer, int seq_idx, const KTensorT *new_k, const VTensorT *new_v, int num_tokens);
 
         /**
          * @brief Append tokens from a single source tensor to a single destination
@@ -538,7 +606,7 @@ namespace llaminar2
          * @param num_tokens Number of tokens to copy.
          * @return true on success.
          */
-        bool append_one_tensor(TensorT *dst, const TensorT *src, EntryT &entry, int num_tokens);
+        bool append_one_tensor(TensorBase *dst, const TensorBase *src, EntryT &entry, int num_tokens);
     };
 
     // =========================================================================
@@ -551,6 +619,9 @@ namespace llaminar2
     using CPURingKVCacheQ8_1 = CPURingKVCache<ActivationPrecision::Q8_1>;   ///< 8-bit quantized KV cache.
     using CPURingKVCacheQ16_1 = CPURingKVCache<ActivationPrecision::Q16_1>; ///< 16-bit quantized KV cache.
     using CPURingKVCacheTQ4 = CPURingKVCache<ActivationPrecision::TQ4>;     ///< TurboQuant 4-bit KV cache.
+    using CPURingKVCacheTQ8 = CPURingKVCache<ActivationPrecision::TQ8>;     ///< TurboQuant 8-bit KV cache.
+    /// Asymmetric TQ: TQ8 for K (high-fidelity scores), TQ4 for V (graceful degradation).
+    using CPURingKVCacheTQ = CPURingKVCache<ActivationPrecision::TQ8, ActivationPrecision::TQ4>;
 
     // =========================================================================
     // Factory Functions

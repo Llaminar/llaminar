@@ -117,6 +117,13 @@ namespace llaminar2
         // Device settings
         config.default_device = plan.primary_device.toLocalDeviceId();
 
+        // Enable rope_on_read for CPU: fuses RoPE into KV cache read path
+        // (get_kv_converted applies RoPE during incremental dequant)
+        if (config.default_device.type == DeviceType::CPU)
+        {
+            config.rope_on_read = true;
+        }
+
         // Configure TP for attention
         configureAttentionTP(config, plan, model_config, *placement);
 

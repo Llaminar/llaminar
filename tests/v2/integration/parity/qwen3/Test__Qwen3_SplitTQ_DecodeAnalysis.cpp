@@ -1,20 +1,20 @@
 /**
- * @file Test__Qwen3_TQ4_DecodeAnalysis.cpp
- * @brief Diagnostic test for Qwen3 TQ4 decode step 4 divergence analysis
+ * @file Test__Qwen3_SplitTQ_DecodeAnalysis.cpp
+ * @brief Diagnostic test for Qwen3 SplitTQ decode step 4 divergence analysis
  *
  * This test investigates the root cause of the cosine similarity drop at decode
- * step 4 (cosine 0.824, KL 4.67) when using TQ4 KV cache. It compares per-layer
- * intermediate activations between Llaminar (TQ4 and FP16 KV cache) and PyTorch
+ * step 4 (cosine 0.824, KL 4.67) when using SplitTQ KV cache. It compares per-layer
+ * intermediate activations between Llaminar (SplitTQ and FP16 KV cache) and PyTorch
  * reference snapshots to determine whether the divergence is:
  *
- *   (a) Inherent to TQ4 4-bit quantization error amplified through the residual stream
- *   (b) A bug in our TQ4 quantize/dequantize implementation
+ *   (a) Inherent to SplitTQ 4-bit quantization error amplified through the residual stream
+ *   (b) A bug in our SplitTQ quantize/dequantize implementation
  *   (c) Specific to certain layers or attention heads
  *
  * Key findings from prior analysis:
  *   - Step 4 has entropy 2.619 nats (flat distribution, 44.9% confidence)
  *   - PyTorch top-1: token 374 (44.9%), top-2: token 34208 (26.1%)
- *   - Llaminar TQ4 picks token 34208 (PyTorch's #2)
+ *   - Llaminar SplitTQ picks token 34208 (PyTorch's #2)
  *   - FFN_RESIDUAL norms grow 59× from layer 0 to layer 27
  *   - Prior steps (0-3) all pass with cosine > 0.90
  *
@@ -37,10 +37,10 @@
 
 #include "Qwen3ParityTestBase.h"
 #include "collective/BackendRouter.h"
-#include "tensors/TQ4Tensor.h"
 #include "tensors/Tensors.h"
 #include "kernels/cpu/turboquant/TurboQuantContext.h"
-#include "kernels/cpu/turboquant/TurboQuantDequantize.h"
+#include "kernels/cpu/turboquant/TurboQuantDequantizeTQ4.h"
+#include "kernels/cpu/turboquant/TurboQuantDequantizeTQ8.h"
 
 using namespace llaminar2;
 using namespace llaminar2::test::parity;
@@ -50,7 +50,7 @@ using namespace llaminar2::test::parity::qwen3;
 // Diagnostic Test Fixture
 // =============================================================================
 
-class Qwen3TQ4DecodeAnalysis : public Qwen3ConfigDrivenParityTest<Qwen3TQ4DecodeAnalysis>
+class Qwen3SplitTQDecodeAnalysis : public Qwen3ConfigDrivenParityTest<Qwen3SplitTQDecodeAnalysis>
 {
 public:
     const TestConfig &getTestConfig() const { return test_cfg_; }
@@ -230,7 +230,7 @@ protected:
         int n_layers = static_cast<int>(model_ctx_->model().block_count);
         size_t vocab_size = model_ctx_->model().vocab_size;
 
-        // Stages to analyze (ones that reveal TQ4 impact most)
+        // Stages to analyze (ones that reveal SplitTQ impact most)
         std::vector<std::string> analysis_stages = {
             "ATTENTION_CONTEXT",
             "ATTENTION_OUTPUT",
@@ -376,51 +376,51 @@ protected:
     }
 
     // Print a side-by-side comparison table for two runs
-    void printComparisonTable(const DecodeRunResult &fp16_result, const DecodeRunResult &tq4_result)
+    void printComparisonTable(const DecodeRunResult &fp16_result, const DecodeRunResult &split_result)
     {
         std::cout << "\n"
                   << std::string(120, '=') << "\n";
-        std::cout << "  SIDE-BY-SIDE: FP16 vs TQ4 KV Cache — Per-Layer Cosine vs PyTorch\n";
+        std::cout << "  SIDE-BY-SIDE: FP16 vs SplitTQ KV Cache — Per-Layer Cosine vs PyTorch\n";
         std::cout << std::string(120, '=') << "\n";
 
-        // Build lookup from TQ4 results
-        std::map<std::string, float> tq4_cosines;
-        for (const auto &d : tq4_result.layer_divergences)
-            tq4_cosines["L" + std::to_string(d.layer) + "_" + d.stage] = d.cosine;
+        // Build lookup from SplitTQ results
+        std::map<std::string, float> split_cosines;
+        for (const auto &d : split_result.layer_divergences)
+            split_cosines["L" + std::to_string(d.layer) + "_" + d.stage] = d.cosine;
 
         std::cout << std::left
                   << std::setw(7) << "Layer"
                   << std::setw(22) << "Stage"
                   << std::right
                   << std::setw(12) << "FP16 cos"
-                  << std::setw(12) << "TQ4 cos"
+                  << std::setw(12) << "SplitTQ cos"
                   << std::setw(12) << "Delta"
                   << std::setw(10) << "FP16"
-                  << std::setw(10) << "TQ4"
+                  << std::setw(10) << "SplitTQ"
                   << "\n"
                   << std::string(120, '-') << "\n";
 
         for (const auto &fp16_d : fp16_result.layer_divergences)
         {
             std::string key = "L" + std::to_string(fp16_d.layer) + "_" + fp16_d.stage;
-            float tq4_cos = 0.0f;
-            auto it = tq4_cosines.find(key);
-            if (it != tq4_cosines.end())
-                tq4_cos = it->second;
+            float split_cos = 0.0f;
+            auto it = split_cosines.find(key);
+            if (it != split_cosines.end())
+                split_cos = it->second;
 
-            float delta = tq4_cos - fp16_d.cosine;
+            float delta = split_cos - fp16_d.cosine;
 
             std::cout << std::left
                       << std::setw(7) << ("L" + std::to_string(fp16_d.layer))
                       << std::setw(22) << fp16_d.stage
                       << std::right << std::fixed
                       << std::setw(12) << std::setprecision(6) << fp16_d.cosine
-                      << std::setw(12) << std::setprecision(6) << tq4_cos
+                      << std::setw(12) << std::setprecision(6) << split_cos
                       << std::setw(12) << std::setprecision(6) << delta
                       << std::setw(10) << (fp16_d.cosine >= 0.99f ? "✓" : fp16_d.cosine >= 0.95f ? "~"
                                                                                                  : "✗")
-                      << std::setw(10) << (tq4_cos >= 0.99f ? "✓" : tq4_cos >= 0.95f ? "~"
-                                                                                     : "✗")
+                      << std::setw(10) << (split_cos >= 0.99f ? "✓" : split_cos >= 0.95f ? "~"
+                                                                                         : "✗")
                       << "\n";
         }
 
@@ -428,20 +428,20 @@ protected:
         std::cout << "  FP16 LM_HEAD: cosine=" << std::setprecision(6) << fp16_result.lm_head_cosine
                   << "  KL=" << std::setprecision(4) << fp16_result.lm_head_kl
                   << "  token=" << fp16_result.predicted_token << "\n";
-        std::cout << "  TQ4  LM_HEAD: cosine=" << std::setprecision(6) << tq4_result.lm_head_cosine
-                  << "  KL=" << std::setprecision(4) << tq4_result.lm_head_kl
-                  << "  token=" << tq4_result.predicted_token << "\n";
+        std::cout << "  SplitTQ  LM_HEAD: cosine=" << std::setprecision(6) << split_result.lm_head_cosine
+                  << "  KL=" << std::setprecision(4) << split_result.lm_head_kl
+                  << "  token=" << split_result.predicted_token << "\n";
         std::cout << "  PyTorch token: " << fp16_result.pytorch_token << "\n";
         std::cout << std::string(120, '=') << "\n\n";
     }
 
     // Print summary analysis
-    void printAnalysis(const DecodeRunResult &fp16_result, const DecodeRunResult &tq4_result)
+    void printAnalysis(const DecodeRunResult &fp16_result, const DecodeRunResult &split_result)
     {
-        // Compute where TQ4 diverges more than FP16
-        int tq4_worse_count = 0;
+        // Compute where SplitTQ diverges more than FP16
+        int split_worse_count = 0;
         int fp16_worse_count = 0;
-        float max_tq4_gap = 0.0f;
+        float max_split_gap = 0.0f;
         std::string worst_gap_location;
 
         // Build FP16 lookup
@@ -449,30 +449,30 @@ protected:
         for (const auto &d : fp16_result.layer_divergences)
             fp16_cosines["L" + std::to_string(d.layer) + "_" + d.stage] = d.cosine;
 
-        for (const auto &d : tq4_result.layer_divergences)
+        for (const auto &d : split_result.layer_divergences)
         {
             std::string key = "L" + std::to_string(d.layer) + "_" + d.stage;
             auto it = fp16_cosines.find(key);
             if (it == fp16_cosines.end())
                 continue;
 
-            float gap = it->second - d.cosine; // positive = TQ4 is worse
+            float gap = it->second - d.cosine; // positive = SplitTQ is worse
             if (gap > 0.001f)
-                tq4_worse_count++;
+                split_worse_count++;
             else if (gap < -0.001f)
                 fp16_worse_count++;
 
-            if (gap > max_tq4_gap)
+            if (gap > max_split_gap)
             {
-                max_tq4_gap = gap;
+                max_split_gap = gap;
                 worst_gap_location = key;
             }
         }
 
-        // Find first layer where TQ4 cosine drops below 0.99
+        // Find first layer where SplitTQ cosine drops below 0.99
         int first_drop_layer = -1;
         std::string first_drop_stage;
-        for (const auto &d : tq4_result.layer_divergences)
+        for (const auto &d : split_result.layer_divergences)
         {
             if (d.cosine < 0.99f)
             {
@@ -482,9 +482,9 @@ protected:
             }
         }
 
-        // Find last layer where TQ4 still passes (cosine >= 0.95)
+        // Find last layer where SplitTQ still passes (cosine >= 0.95)
         int last_good_layer = -1;
-        for (const auto &d : tq4_result.layer_divergences)
+        for (const auto &d : split_result.layer_divergences)
         {
             if (d.stage == "FFN_RESIDUAL" && d.cosine >= 0.95f)
                 last_good_layer = d.layer;
@@ -494,56 +494,56 @@ protected:
                   << std::string(80, '=') << "\n";
         std::cout << "  ANALYSIS SUMMARY\n";
         std::cout << std::string(80, '=') << "\n";
-        std::cout << "  Stages where TQ4 is worse than FP16: " << tq4_worse_count << "\n";
-        std::cout << "  Stages where FP16 is worse than TQ4: " << fp16_worse_count << "\n";
-        std::cout << "  Worst TQ4-vs-FP16 gap: " << std::fixed << std::setprecision(6)
-                  << max_tq4_gap << " at " << worst_gap_location << "\n";
+        std::cout << "  Stages where SplitTQ is worse than FP16: " << split_worse_count << "\n";
+        std::cout << "  Stages where FP16 is worse than SplitTQ: " << fp16_worse_count << "\n";
+        std::cout << "  Worst SplitTQ-vs-FP16 gap: " << std::fixed << std::setprecision(6)
+                  << max_split_gap << " at " << worst_gap_location << "\n";
 
         if (first_drop_layer >= 0)
-            std::cout << "  First TQ4 cosine < 0.99: layer " << first_drop_layer
+            std::cout << "  First SplitTQ cosine < 0.99: layer " << first_drop_layer
                       << " " << first_drop_stage << "\n";
 
         if (last_good_layer >= 0)
-            std::cout << "  Last TQ4 FFN_RESIDUAL cosine >= 0.95: layer " << last_good_layer << "\n";
+            std::cout << "  Last SplitTQ FFN_RESIDUAL cosine >= 0.95: layer " << last_good_layer << "\n";
 
         // Determine diagnosis
         std::cout << "\n  DIAGNOSIS:\n";
 
-        if (tq4_worse_count <= 2 && max_tq4_gap < 0.01f)
+        if (split_worse_count <= 2 && max_split_gap < 0.01f)
         {
-            std::cout << "  → TQ4 and FP16 diverge similarly from PyTorch.\n";
-            std::cout << "  → The step 4 divergence is NOT specific to TQ4 KV quantization.\n";
+            std::cout << "  → SplitTQ and FP16 diverge similarly from PyTorch.\n";
+            std::cout << "  → The step 4 divergence is NOT specific to SplitTQ KV quantization.\n";
             std::cout << "  → Root cause: base GEMM quantization error (Q8_0 weights) amplified\n";
             std::cout << "    through 28 layers, reaching a high-entropy decision boundary.\n";
         }
         else if (first_drop_layer >= 0 && first_drop_layer <= 5)
         {
-            std::cout << "  → TQ4 diverges early (layer " << first_drop_layer << ")!\n";
-            std::cout << "  → This suggests a BUG in TQ4 quantize/dequantize.\n";
+            std::cout << "  → SplitTQ diverges early (layer " << first_drop_layer << ")!\n";
+            std::cout << "  → This suggests a BUG in SplitTQ quantize/dequantize.\n";
             std::cout << "  → Investigate K/V quantization at layer " << first_drop_layer << ".\n";
         }
-        else if (max_tq4_gap > 0.05f)
+        else if (max_split_gap > 0.05f)
         {
-            std::cout << "  → TQ4 has significant additional divergence vs FP16.\n";
-            std::cout << "  → The " << std::setprecision(4) << max_tq4_gap
+            std::cout << "  → SplitTQ has significant additional divergence vs FP16.\n";
+            std::cout << "  → The " << std::setprecision(4) << max_split_gap
                       << " gap at " << worst_gap_location << " is substantial.\n";
-            std::cout << "  → TQ4 quantization error is a meaningful contributor.\n";
+            std::cout << "  → SplitTQ quantization error is a meaningful contributor.\n";
         }
         else
         {
-            std::cout << "  → TQ4 adds moderate additional divergence over FP16 baseline.\n";
+            std::cout << "  → SplitTQ adds moderate additional divergence over FP16 baseline.\n";
             std::cout << "  → The divergence is gradual and cumulative (inherent to 4-bit KV).\n";
             std::cout << "  → Token prediction divergence at step 4 results from:\n";
             std::cout << "    1. Base Q8_0 GEMM quantization error (shared with FP16 KV)\n";
-            std::cout << "    2. Additional TQ4 K/V quantization error (4-bit → " << std::setprecision(1)
-                      << (max_tq4_gap * 100.0f) << "% extra cosine loss)\n";
+            std::cout << "    2. Additional SplitTQ K/V quantization error (4-bit → " << std::setprecision(1)
+                      << (max_split_gap * 100.0f) << "% extra cosine loss)\n";
             std::cout << "    3. High-entropy output distribution (44.9% confidence) amplifies both\n";
         }
         std::cout << std::string(80, '=') << "\n\n";
     }
 
     TestConfig test_cfg_ = {
-        .name = "Qwen3_TQ4_Analysis",
+        .name = "Qwen3_SplitTQ_Analysis",
         .devices = {ParityDeviceType::CPU},
         .parallelism = Parallelism::None,
         .collective = Collective::None,
@@ -557,20 +557,20 @@ protected:
         .model_path = "models/Qwen3-0.6B-Q8_0.gguf",
         .snapshot_dir = "pytorch_qwen3_snapshots",
         .activation_precision = ActivationPrecision::FP32,
-        .kv_cache_precision = KVCachePrecision::TQ4, // Will be overridden per-run
+        .kv_cache_precision = KVCachePrecision::TQ, // Will be overridden per-run
     };
 };
 
 // =============================================================================
 // Test: Layer-by-layer analysis of step 4 divergence
 //
-// Runs the full pipeline twice (FP16 KV and TQ4 KV), captures per-layer
+// Runs the full pipeline twice (FP16 KV and SplitTQ KV), captures per-layer
 // snapshots at step 4, and compares both against PyTorch ground truth.
-// If TQ4 diverges significantly more than FP16, the issue is in TQ4.
+// If SplitTQ diverges significantly more than FP16, the issue is in SplitTQ.
 // If both diverge similarly, the issue is in base Q8_0 GEMM error.
 // =============================================================================
 
-TEST_F(Qwen3TQ4DecodeAnalysis, Step4LayerByLayerDivergence)
+TEST_F(Qwen3SplitTQDecodeAnalysis, Step4LayerByLayerDivergence)
 {
     // Read decode tokens from metadata
     std::vector<int> decode_tokens = readDecodeTokensFromMetadata();
@@ -581,7 +581,7 @@ TEST_F(Qwen3TQ4DecodeAnalysis, Step4LayerByLayerDivergence)
 
     std::cout << "\n"
               << std::string(80, '=') << "\n";
-    std::cout << "  Qwen3 TQ4 Decode Step 4 — Layer-by-Layer Divergence Analysis\n";
+    std::cout << "  Qwen3 SplitTQ Decode Step 4 — Layer-by-Layer Divergence Analysis\n";
     std::cout << std::string(80, '=') << "\n";
     std::cout << "  Model: Qwen3-0.6B-Q8_0.gguf (28 layers, d=1024, d_head=128)\n";
     std::cout << "  Target step: " << target_step << " (token " << decode_tokens[target_step] << ")\n";
@@ -598,35 +598,35 @@ TEST_F(Qwen3TQ4DecodeAnalysis, Step4LayerByLayerDivergence)
     ASSERT_TRUE(fp16_result.valid) << "FP16 decode run failed";
     printDivergenceTable(fp16_result);
 
-    // Run 2: TQ4 KV cache (the one that fails step 4)
-    std::cout << ">>> Running TQ4 KV cache...\n";
-    auto tq4_result = runDecodeAndAnalyze("TQ4 KV Cache", KVCachePrecision::TQ4,
-                                          target_step, decode_tokens, snapshot_dir);
-    ASSERT_TRUE(tq4_result.valid) << "TQ4 decode run failed";
-    printDivergenceTable(tq4_result);
+    // Run 2: SplitTQ KV cache (the one that fails step 4)
+    std::cout << ">>> Running SplitTQ KV cache...\n";
+    auto split_result = runDecodeAndAnalyze("SplitTQ KV Cache", KVCachePrecision::TQ,
+                                            target_step, decode_tokens, snapshot_dir);
+    ASSERT_TRUE(split_result.valid) << "SplitTQ decode run failed";
+    printDivergenceTable(split_result);
 
     // Side-by-side comparison
-    printComparisonTable(fp16_result, tq4_result);
+    printComparisonTable(fp16_result, split_result);
 
     // Analysis
-    printAnalysis(fp16_result, tq4_result);
+    printAnalysis(fp16_result, split_result);
 
     // Soft assertions (test should always pass — it's diagnostic)
     // But flag if something is unexpectedly broken
     EXPECT_GT(fp16_result.lm_head_cosine, 0.50f)
         << "FP16 LM_HEAD cosine catastrophically low — possible infrastructure issue";
-    EXPECT_GT(tq4_result.lm_head_cosine, 0.50f)
-        << "TQ4 LM_HEAD cosine catastrophically low — possible infrastructure issue";
+    EXPECT_GT(split_result.lm_head_cosine, 0.50f)
+        << "SplitTQ LM_HEAD cosine catastrophically low — possible infrastructure issue";
 }
 
 // =============================================================================
 // Test: Track divergence progression across all decode steps
 //
-// For each decode step 0-4, compare TQ4 vs FP16 LM_HEAD cosine and token match
+// For each decode step 0-4, compare SplitTQ vs FP16 LM_HEAD cosine and token match
 // to show how divergence accumulates over the sequence.
 // =============================================================================
 
-TEST_F(Qwen3TQ4DecodeAnalysis, DivergenceProgression)
+TEST_F(Qwen3SplitTQDecodeAnalysis, DivergenceProgression)
 {
     std::vector<int> decode_tokens = readDecodeTokensFromMetadata();
     ASSERT_GE(decode_tokens.size(), 5u) << "Need at least 5 decode tokens";
@@ -634,8 +634,8 @@ TEST_F(Qwen3TQ4DecodeAnalysis, DivergenceProgression)
     const std::string snapshot_dir = "pytorch_qwen3_snapshots";
     const int num_steps = std::min(static_cast<int>(decode_tokens.size()), 5);
 
-    // Setup TQ4 pipeline once
-    test_cfg_.kv_cache_precision = KVCachePrecision::TQ4;
+    // Setup SplitTQ pipeline once
+    test_cfg_.kv_cache_precision = KVCachePrecision::TQ;
     ASSERT_TRUE(setupPipeline()) << "Pipeline setup failed";
 
     // Run prefill
@@ -646,7 +646,7 @@ TEST_F(Qwen3TQ4DecodeAnalysis, DivergenceProgression)
 
     std::cout << "\n"
               << std::string(90, '=') << "\n";
-    std::cout << "  TQ4 Divergence Progression Across Decode Steps\n";
+    std::cout << "  SplitTQ Divergence Progression Across Decode Steps\n";
     std::cout << std::string(90, '=') << "\n";
 
     std::cout << std::left
@@ -736,26 +736,26 @@ TEST_F(Qwen3TQ4DecodeAnalysis, DivergenceProgression)
 }
 
 // =============================================================================
-// Test: FP32 vs TQ4 pipeline decode step 0 — ALL stages compared
+// Test: FP32 vs SplitTQ pipeline decode step 0 — ALL stages compared
 //
 // Runs the pipeline TWICE at decode step 0 (first decode after prefill):
 //   1. FP32 KV cache (ground truth for Llaminar)
-//   2. TQ4 KV cache (the suspect)
+//   2. SplitTQ KV cache (the suspect)
 //
 // At decode step 0, the ONLY difference should be cache precision:
 //   - Embedding: identical (same input token)
 //   - Q/K/V projections: identical (depend only on embedding, not cache)
 //   - Q_ROPE, K_ROPE: identical
-//   - ATTENTION_CONTEXT: diverges (reads cached K/V — FP32 vs TQ4)
+//   - ATTENTION_CONTEXT: diverges (reads cached K/V — FP32 vs SplitTQ)
 //   - Everything downstream: propagates from attention divergence
 //
-// If ATTENTION_CONTEXT divergence is ~0.995 (matching TQ4 round-trip quality),
+// If ATTENTION_CONTEXT divergence is ~0.995 (matching SplitTQ round-trip quality),
 // the pipeline is correct and divergence is inherent to 4-bit quantization.
 // If ATTENTION_CONTEXT divergence is much worse (e.g., 0.738), there's a bug
-// in how the pipeline stores/retrieves/dequantizes TQ4 KV cache data.
+// in how the pipeline stores/retrieves/dequantizes SplitTQ KV cache data.
 // =============================================================================
 
-TEST_F(Qwen3TQ4DecodeAnalysis, DecodeStep0_FP32vsTQ4_AllStages)
+TEST_F(Qwen3SplitTQDecodeAnalysis, DecodeStep0_FP32vsSplitTQ_AllStages)
 {
     std::vector<int> decode_tokens = readDecodeTokensFromMetadata();
     ASSERT_GE(decode_tokens.size(), 1u) << "Need at least 1 decode token";
@@ -797,18 +797,18 @@ TEST_F(Qwen3TQ4DecodeAnalysis, DecodeStep0_FP32vsTQ4_AllStages)
     runner_.reset();
     model_ctx_.reset();
 
-    // ---- Run 2: TQ4 KV cache ----
-    std::cout << ">>> Running TQ4 KV cache (decode step 0)...\n";
-    test_cfg_.kv_cache_precision = KVCachePrecision::TQ4;
-    ASSERT_TRUE(setupPipeline()) << "TQ4 pipeline setup failed";
+    // ---- Run 2: SplitTQ KV cache ----
+    std::cout << ">>> Running SplitTQ KV cache (decode step 0)...\n";
+    test_cfg_.kv_cache_precision = KVCachePrecision::TQ;
+    ASSERT_TRUE(setupPipeline()) << "SplitTQ pipeline setup failed";
 
     // Prefill
     ASSERT_TRUE(runner_->forward(config_.token_ids.data(), config_.token_ids.size()))
-        << "TQ4 prefill failed";
+        << "SplitTQ prefill failed";
 
     // Clear snapshots from prefill, run 1 decode step
     runner_->clearSnapshots();
-    ASSERT_TRUE(runner_->forward(&decode_token, 1)) << "TQ4 decode step 0 failed";
+    ASSERT_TRUE(runner_->forward(&decode_token, 1)) << "SplitTQ decode step 0 failed";
 
     // Capture ALL snapshots
     auto tq4_keys = runner_->getSnapshotKeys();
@@ -823,7 +823,7 @@ TEST_F(Qwen3TQ4DecodeAnalysis, DecodeStep0_FP32vsTQ4_AllStages)
         }
     }
 
-    std::cout << "  Captured " << tq4_snapshots.size() << " TQ4 snapshots\n";
+    std::cout << "  Captured " << tq4_snapshots.size() << " SplitTQ snapshots\n";
 
     // ---- Compare all stages ----
     // Ordered stage suffixes (pipeline order within each layer)
@@ -904,8 +904,8 @@ TEST_F(Qwen3TQ4DecodeAnalysis, DecodeStep0_FP32vsTQ4_AllStages)
     // ---- Print results ----
     std::cout << "\n"
               << std::string(100, '=') << "\n";
-    std::cout << "  DECODE STEP 0: FP32 vs TQ4 KV Cache — All Stages Compared\n";
-    std::cout << "  (FP32 = ground truth, TQ4 = test subject)\n";
+    std::cout << "  DECODE STEP 0: FP32 vs SplitTQ KV Cache — All Stages Compared\n";
+    std::cout << "  (FP32 = ground truth, SplitTQ = test subject)\n";
     std::cout << "  Decode token: " << decode_token
               << "  Prefill tokens: " << config_.token_ids.size() << "\n";
     std::cout << std::string(100, '=') << "\n";
@@ -988,11 +988,11 @@ TEST_F(Qwen3TQ4DecodeAnalysis, DecodeStep0_FP32vsTQ4_AllStages)
         if (r.cosine_fp32_vs_tq4 >= 0.9999f)
             verdict = "IDENTICAL";
         else if (r.cosine_fp32_vs_tq4 >= 0.995f)
-            verdict = "EXPECTED (within TQ4 round-trip tolerance)";
+            verdict = "EXPECTED (within SplitTQ round-trip tolerance)";
         else if (r.cosine_fp32_vs_tq4 >= 0.95f)
-            verdict = "SUSPICIOUS (worse than TQ4 round-trip)";
+            verdict = "SUSPICIOUS (worse than SplitTQ round-trip)";
         else
-            verdict = "BUG (much worse than TQ4 round-trip of ~0.995)";
+            verdict = "BUG (much worse than SplitTQ round-trip of ~0.995)";
 
         std::cout << "    " << std::left << std::setw(30) << r.key
                   << std::right << std::fixed << std::setprecision(6)
@@ -1030,11 +1030,11 @@ TEST_F(Qwen3TQ4DecodeAnalysis, DecodeStep0_FP32vsTQ4_AllStages)
         {
             if (r.fp32_available && r.tq4_available)
             {
-                // If this is ~0.995, TQ4 pipeline is correct (error = round-trip loss)
+                // If this is ~0.995, SplitTQ pipeline is correct (error = round-trip loss)
                 // If this is <<0.99, there's a pipeline bug
                 EXPECT_GE(r.cosine_fp32_vs_tq4, 0.98f)
                     << "layer0_ATTENTION_CONTEXT has cosine " << r.cosine_fp32_vs_tq4
-                    << " which is MUCH worse than TQ4 round-trip quality (~0.995). "
+                    << " which is MUCH worse than SplitTQ round-trip quality (~0.995). "
                     << "This indicates a pipeline bug, not just quantization noise.";
             }
         }
@@ -1046,20 +1046,20 @@ TEST_F(Qwen3TQ4DecodeAnalysis, DecodeStep0_FP32vsTQ4_AllStages)
 }
 
 // =============================================================================
-// Test: TQ4 round-trip quality on REAL model K/V projections
+// Test: SplitTQ round-trip quality on REAL model K/V projections
 //
 // Loads the Qwen3-0.6B model, runs prefill with FP32 KV cache to capture
-// real K and V projections from each layer, then measures TQ4 quantize →
+// real K and V projections from each layer, then measures SplitTQ quantize →
 // dequantize round-trip fidelity on those actual tensors.
 //
 // This distinguishes between:
-//   (a) TQ4 works fine on random data but fails on real activations
+//   (a) SplitTQ works fine on random data but fails on real activations
 //       (data distribution problem — e.g., outliers, heavy tails)
-//   (b) TQ4 round-trip is ~0.99 even on real data, so the divergence
+//   (b) SplitTQ round-trip is ~0.99 even on real data, so the divergence
 //       is cumulative amplification through 28 layers, not per-layer quality
 // =============================================================================
 
-TEST_F(Qwen3TQ4DecodeAnalysis, TQ4RoundTripOnRealModelTensors)
+TEST_F(Qwen3SplitTQDecodeAnalysis, SplitTQRoundTripOnRealModelTensors)
 {
     // --- Run prefill with FP32 KV cache to get real K/V projections ---
     test_cfg_.kv_cache_precision = KVCachePrecision::FP32;
@@ -1081,7 +1081,7 @@ TEST_F(Qwen3TQ4DecodeAnalysis, TQ4RoundTripOnRealModelTensors)
 
     std::cout << "\n"
               << std::string(100, '=') << "\n";
-    std::cout << "  TQ4 Round-Trip Quality on Real Qwen3 K/V Projections\n";
+    std::cout << "  SplitTQ Round-Trip Quality on Real Qwen3 K/V Projections\n";
     std::cout << std::string(100, '=') << "\n";
     std::cout << "  Model: " << test_cfg_.model_path
               << " (" << n_layers << " layers, head_dim=" << head_dim
@@ -1140,13 +1140,23 @@ TEST_F(Qwen3TQ4DecodeAnalysis, TQ4RoundTripOnRealModelTensors)
             for (size_t i = 0; i < actual_rows * kv_dim; ++i)
                 data_max_abs = std::max(data_max_abs, std::abs(fp32_data[i]));
 
-            // TQ4 round-trip: quantize then dequantize
+            // SplitTQ round-trip: K uses TQ8, V uses TQ4
             std::vector<size_t> shape = {actual_rows, static_cast<size_t>(kv_dim)};
-            auto tq4_tensor = TQ4Tensor::quantize_from_fp32(
-                fp32_data, shape, head_dim, layer_ctx);
-
             std::vector<float> reconstructed(actual_rows * kv_dim);
-            tq4_tensor->dequantize_to_fp32(reconstructed.data(), layer_ctx);
+
+            bool is_k = (std::string(proj) == "K");
+            if (is_k)
+            {
+                auto tq8_tensor = TQ8Tensor::quantize_from_fp32(
+                    fp32_data, shape, head_dim, layer_ctx);
+                tq8_tensor->dequantize_to_fp32(reconstructed.data(), layer_ctx);
+            }
+            else
+            {
+                auto tq4_tensor = TQ4Tensor::quantize_from_fp32(
+                    fp32_data, shape, head_dim, layer_ctx);
+                tq4_tensor->dequantize_to_fp32(reconstructed.data(), layer_ctx);
+            }
 
             // Overall cosine similarity
             float overall_cos = cosine(fp32_data, reconstructed.data(),
@@ -1247,10 +1257,10 @@ TEST_F(Qwen3TQ4DecodeAnalysis, TQ4RoundTripOnRealModelTensors)
               << " at " << worst_location << "\n";
     std::cout << std::string(100, '=') << "\n\n";
 
-    // Soft assertion: TQ4 round-trip should maintain reasonable quality
-    // If this fails, TQ4 has a data-distribution-dependent quality problem
+    // Soft assertion: SplitTQ round-trip should maintain reasonable quality
+    // If this fails, SplitTQ has a data-distribution-dependent quality problem
     EXPECT_GE(worst_overall, 0.95f)
-        << "TQ4 round-trip quality catastrophically bad at " << worst_location
+        << "SplitTQ round-trip quality catastrophically bad at " << worst_location
         << " — suggests data distribution issue";
 
     // Cleanup for subsequent tests
@@ -1259,14 +1269,14 @@ TEST_F(Qwen3TQ4DecodeAnalysis, TQ4RoundTripOnRealModelTensors)
 }
 
 // =============================================================================
-// Test: Per-position TQ4 round-trip on real L0 K projections
+// Test: Per-position SplitTQ round-trip on real L0 K projections
 //
 // Drills into a single layer's K projection to check per-position (per-token)
 // round-trip quality. This reveals if certain token positions have much worse
-// TQ4 fidelity than others (e.g., BOS token, repeated tokens, etc.)
+// SplitTQ fidelity than others (e.g., BOS token, repeated tokens, etc.)
 // =============================================================================
 
-TEST_F(Qwen3TQ4DecodeAnalysis, TQ4RoundTripPerPosition_Layer0_K)
+TEST_F(Qwen3SplitTQDecodeAnalysis, SplitTQRoundTripPerPosition_Layer0_K)
 {
     test_cfg_.kv_cache_precision = KVCachePrecision::FP32;
     ASSERT_TRUE(setupPipeline()) << "Pipeline setup failed";
@@ -1291,16 +1301,16 @@ TEST_F(Qwen3TQ4DecodeAnalysis, TQ4RoundTripPerPosition_Layer0_K)
     TurboQuantContext tq_ctx(head_dim);
     const auto &layer_ctx = tq_ctx.for_layer(0);
 
-    // Quantize and dequantize the full tensor
+    // Quantize K as TQ8 (production split regime) and dequantize
     std::vector<size_t> shape = {num_tokens, static_cast<size_t>(kv_dim)};
-    auto tq4_tensor = TQ4Tensor::quantize_from_fp32(fp32_data, shape, head_dim, layer_ctx);
+    auto tq8_tensor = TQ8Tensor::quantize_from_fp32(fp32_data, shape, head_dim, layer_ctx);
 
     std::vector<float> reconstructed(num_tokens * kv_dim);
-    tq4_tensor->dequantize_to_fp32(reconstructed.data(), layer_ctx);
+    tq8_tensor->dequantize_to_fp32(reconstructed.data(), layer_ctx);
 
     std::cout << "\n"
               << std::string(90, '=') << "\n";
-    std::cout << "  TQ4 Per-Position Round-Trip: Layer 0 K Projection\n";
+    std::cout << "  SplitTQ Per-Position Round-Trip: Layer 0 K Projection (TQ8)\n";
     std::cout << "  Tokens: " << num_tokens << ", head_dim=" << head_dim
               << ", n_kv_heads=" << n_kv_heads << "\n";
     std::cout << std::string(90, '=') << "\n";
@@ -1369,15 +1379,15 @@ TEST_F(Qwen3TQ4DecodeAnalysis, TQ4RoundTripPerPosition_Layer0_K)
               << " at position " << worst_pos << "\n";
     std::cout << std::string(90, '=') << "\n\n";
 
-    EXPECT_GE(worst_pos_cos, 0.90f) << "TQ4 catastrophically bad at position " << worst_pos;
-    EXPECT_GE(mean_cos, 0.98f) << "TQ4 mean round-trip quality too low";
+    EXPECT_GE(worst_pos_cos, 0.90f) << "SplitTQ catastrophically bad at position " << worst_pos;
+    EXPECT_GE(mean_cos, 0.98f) << "SplitTQ mean round-trip quality too low";
 
     runner_.reset();
     model_ctx_.reset();
 }
 
 // =============================================================================
-// Test: Empirical TQ4 cache flow — simulates exact pipeline data path
+// Test: Empirical SplitTQ cache flow — simulates exact pipeline data path
 //
 // This test captures the REAL K_ROPE data from FP32 prefill, then simulates
 // the EXACT cache flow:
@@ -1385,16 +1395,16 @@ TEST_F(Qwen3TQ4DecodeAnalysis, TQ4RoundTripPerPosition_Layer0_K)
 //   2. memcpy into a cache-sized buffer (CPURingKVCache::append_kv_impl)
 //   3. turboquant_dequantize_kv_rows from cache buffer (AttentionComputeStage)
 // and compares against:
-//   (A) Direct TQ4 round-trip (quantize → dequantize, no cache buffer)
-//   (B) The real TQ4 pipeline's ATTENTION_CONTEXT snapshot from decode step 0
+//   (A) Direct SplitTQ round-trip (quantize → dequantize, no cache buffer)
+//   (B) The real SplitTQ pipeline's ATTENTION_CONTEXT snapshot from decode step 0
 //
 // This isolates whether the bug is in:
-//   - TQ4 quantize/dequant math (measured by A)
+//   - SplitTQ quantize/dequant math (measured by A)
 //   - Cache buffer storage/retrieval (measured by A vs simulated cache)
 //   - Something else in the pipeline (measured by B vs simulated cache)
 // =============================================================================
 
-TEST_F(Qwen3TQ4DecodeAnalysis, TQ4CacheFlowSimulation_Layer0)
+TEST_F(Qwen3SplitTQDecodeAnalysis, SplitTQCacheFlowSimulation_Layer0)
 {
     // ---- Step 1: Run FP32 pipeline, capture K_ROPE and V_PROJECTION from prefill ----
     std::cout << "\n>>> Step 1: Running FP32 prefill to capture reference K/V data...\n";
@@ -1457,26 +1467,26 @@ TEST_F(Qwen3TQ4DecodeAnalysis, TQ4CacheFlowSimulation_Layer0)
     runner_.reset();
     model_ctx_.reset();
 
-    // ---- Step 2: TQ4 round-trip WITHOUT cache buffer (direct quantize → dequant) ----
-    std::cout << ">>> Step 2: Direct TQ4 round-trip (no cache buffer)...\n";
+    // ---- Step 2: SplitTQ round-trip WITHOUT cache buffer (direct quantize → dequant) ----
+    std::cout << ">>> Step 2: Direct SplitTQ round-trip (no cache buffer)...\n";
 
     TurboQuantContext tq_ctx(head_dim); // default seeds (42, 42) — same as pipeline
     const auto &layer0_ctx = tq_ctx.for_layer(0);
 
-    // Quantize K_ROPE to TQ4
+    // Quantize K_ROPE to TQ8 (production split regime: K uses TQ8)
     size_t k_rows = k_rope_size / static_cast<size_t>(kv_dim);
     std::vector<size_t> k_shape = {k_rows, static_cast<size_t>(kv_dim)};
-    auto k_tq4_direct = TQ4Tensor::quantize_from_fp32(ref_k_rope.data(), k_shape, head_dim, layer0_ctx);
-    ASSERT_NE(k_tq4_direct, nullptr) << "TQ4 quantization of K failed";
+    auto k_tq8_direct = TQ8Tensor::quantize_from_fp32(ref_k_rope.data(), k_shape, head_dim, layer0_ctx);
+    ASSERT_NE(k_tq8_direct, nullptr) << "TQ8 quantization of K failed";
 
-    // Dequantize using TQ4Tensor::dequantize_to_fp32 (the method our round-trip tests use)
+    // Dequantize using TQ8Tensor::dequantize_to_fp32
     std::vector<float> k_direct_dequant(k_rows * kv_dim);
-    k_tq4_direct->dequantize_to_fp32(k_direct_dequant.data(), layer0_ctx);
+    k_tq8_direct->dequantize_to_fp32(k_direct_dequant.data(), layer0_ctx);
 
     float direct_cosine = cosine(ref_k_rope.data(), k_direct_dequant.data(), k_rows * kv_dim);
-    std::cout << "  Direct K round-trip cosine: " << std::fixed << std::setprecision(6) << direct_cosine << "\n";
+    std::cout << "  Direct K round-trip cosine (TQ8): " << std::fixed << std::setprecision(6) << direct_cosine << "\n";
 
-    // Same for V
+    // V uses TQ4 (production split regime)
     size_t v_rows = v_proj_size / static_cast<size_t>(kv_dim);
     std::vector<size_t> v_shape = {v_rows, static_cast<size_t>(kv_dim)};
     auto v_tq4_direct = TQ4Tensor::quantize_from_fp32(ref_v_proj.data(), v_shape, head_dim, layer0_ctx);
@@ -1492,24 +1502,24 @@ TEST_F(Qwen3TQ4DecodeAnalysis, TQ4CacheFlowSimulation_Layer0)
     std::cout << ">>> Step 3: Simulated cache buffer flow...\n";
 
     // The pipeline does:
-    //   1. KVCacheAppendStage: quantize_from_fp32 → TQ4Tensor(seq_len, kv_dim)
-    //   2. CPURingKVCache::append_kv: memcpy rows from source TQ4Tensor into
-    //      pre-allocated cache TQ4Tensor(max_seq_len, kv_dim)
-    //   3. AttentionComputeStage: read from cache tensor, use turboquant_dequantize_kv_rows
+    //   1. KVCacheAppendStage: quantize_from_fp32 → TQ8Tensor(K) / TQ4Tensor(V)
+    //   2. CPURingKVCache::append_kv: memcpy rows from source tensors into
+    //      pre-allocated cache TQ8Tensor(K) / TQ4Tensor(V) of (max_seq_len, kv_dim)
+    //   3. AttentionComputeStage: read from cache, separate TQ8 K / TQ4 V dequant
 
     const int max_seq_len = 2048; // typical cache size
 
-    // Create cache-sized TQ4 tensors (matching CPUKVCacheTensor<TQ4>::allocate)
-    auto k_cache = std::make_shared<TQ4Tensor>(
+    // Create cache-sized tensors (K=TQ8, V=TQ4)
+    auto k_cache = std::make_shared<TQ8Tensor>(
         std::vector<size_t>{static_cast<size_t>(max_seq_len), static_cast<size_t>(kv_dim)},
         head_dim);
     auto v_cache = std::make_shared<TQ4Tensor>(
         std::vector<size_t>{static_cast<size_t>(max_seq_len), static_cast<size_t>(kv_dim)},
         head_dim);
 
-    // Simulate append: memcpy each row from source TQ4 to cache TQ4
+    // Simulate append: memcpy each row from source to cache
     // This matches CPURingKVCache::copy_position_major_token
-    size_t k_row_bytes = static_cast<size_t>(kv_dim / head_dim) * k_tq4_direct->block_bytes();
+    size_t k_row_bytes = static_cast<size_t>(kv_dim / head_dim) * k_tq8_direct->block_bytes();
     size_t v_row_bytes = static_cast<size_t>(kv_dim / head_dim) * v_tq4_direct->block_bytes();
 
     // Verify row_bytes matches the cache tensor's layout
@@ -1518,16 +1528,16 @@ TEST_F(Qwen3TQ4DecodeAnalysis, TQ4CacheFlowSimulation_Layer0)
     ASSERT_EQ(k_row_bytes, cache_k_row_bytes) << "K row_bytes mismatch between source and cache";
     ASSERT_EQ(v_row_bytes, cache_v_row_bytes) << "V row_bytes mismatch between source and cache";
 
-    std::cout << "  K: blocks_per_row=" << k_tq4_direct->blocks_per_row()
-              << " block_bytes=" << k_tq4_direct->block_bytes()
+    std::cout << "  K (TQ8): blocks_per_row=" << k_tq8_direct->blocks_per_row()
+              << " block_bytes=" << k_tq8_direct->block_bytes()
               << " row_bytes=" << k_row_bytes << "\n";
-    std::cout << "  V: blocks_per_row=" << v_tq4_direct->blocks_per_row()
+    std::cout << "  V (TQ4): blocks_per_row=" << v_tq4_direct->blocks_per_row()
               << " block_bytes=" << v_tq4_direct->block_bytes()
               << " row_bytes=" << v_row_bytes << "\n";
-    std::cout << "  Cache K: blocks_per_row=" << k_cache->blocks_per_row()
+    std::cout << "  Cache K (TQ8): blocks_per_row=" << k_cache->blocks_per_row()
               << " block_bytes=" << k_cache->block_bytes() << "\n";
 
-    const auto *k_src = reinterpret_cast<const uint8_t *>(k_tq4_direct->raw_data());
+    const auto *k_src = reinterpret_cast<const uint8_t *>(k_tq8_direct->raw_data());
     const auto *v_src = reinterpret_cast<const uint8_t *>(v_tq4_direct->raw_data());
     auto *k_dst = reinterpret_cast<uint8_t *>(k_cache->raw_mutable_data());
     auto *v_dst = reinterpret_cast<uint8_t *>(v_cache->raw_mutable_data());
@@ -1543,21 +1553,26 @@ TEST_F(Qwen3TQ4DecodeAnalysis, TQ4CacheFlowSimulation_Layer0)
     EXPECT_TRUE(byte_match) << "CRITICAL: First row of K cache doesn't match source!";
     std::cout << "  Row 0 byte-for-byte match: " << (byte_match ? "YES" : "NO!!! BUG!!!") << "\n";
 
-    // ---- Step 4: Dequantize from cache using turboquant_dequantize_kv_rows ----
-    // This is EXACTLY what AttentionComputeStage does
-    std::cout << ">>> Step 4: Dequantize from cache buffer (pipeline-exact)...\n";
+    // ---- Step 4: Dequantize from cache using separate TQ8 K / TQ4 V paths ----
+    // This is EXACTLY what AttentionComputeStage does in split regime
+    std::cout << ">>> Step 4: Dequantize from cache buffer (pipeline-exact, split TQ8/TQ4)...\n";
 
     std::vector<float> k_cache_dequant(k_rows * kv_dim, 0.0f);
     std::vector<float> v_cache_dequant(v_rows * kv_dim, 0.0f);
 
-    turboquant_dequantize_kv_rows(
-        k_cache->typed_data(), v_cache->typed_data(),
+    // K dequant via TQ8Tensor
+    k_cache->set_turboquant_context(&tq_ctx);
+    k_cache->dequantize_to_fp32(k_cache_dequant.data(), layer0_ctx);
+
+    // V dequant via turboquant_dequantize_v_rows (TQ4)
+    turboquant_dequantize_v_rows(
+        v_cache->typed_data(),
         layer0_ctx,
-        k_cache_dequant.data(), v_cache_dequant.data(),
-        0, static_cast<int>(k_rows),
+        v_cache_dequant.data(),
+        0, static_cast<int>(v_rows),
         head_dim, n_kv_heads,
-        cache_k_row_bytes, cache_v_row_bytes,
-        k_cache->block_bytes(), v_cache->block_bytes());
+        cache_v_row_bytes,
+        v_cache->block_bytes());
 
     float cache_k_cosine = cosine(ref_k_rope.data(), k_cache_dequant.data(), k_rows * kv_dim);
     float cache_v_cosine = cosine(ref_v_proj.data(), v_cache_dequant.data(), v_rows * kv_dim);
@@ -1593,24 +1608,24 @@ TEST_F(Qwen3TQ4DecodeAnalysis, TQ4CacheFlowSimulation_Layer0)
     std::cout << "  V float diffs: " << v_diff_count << "/" << (v_rows * kv_dim)
               << " max_diff=" << std::scientific << v_max_diff << "\n";
 
-    // ---- Step 5: Now run the REAL TQ4 pipeline and dump effective K/V ----
-    std::cout << "\n>>> Step 5: Running REAL TQ4 pipeline with K/V dumps...\n";
+    // ---- Step 5: Now run the REAL SplitTQ pipeline and dump effective K/V ----
+    std::cout << "\n>>> Step 5: Running REAL SplitTQ pipeline with K/V dumps...\n";
 
     // Set env var to enable dumps — use putenv since setenv may not be thread-safe
     setenv("LLAMINAR_DUMP_EFFECTIVE_KV", "1", 1);
 
-    test_cfg_.kv_cache_precision = KVCachePrecision::TQ4;
-    ASSERT_TRUE(setupPipeline()) << "TQ4 pipeline setup failed";
+    test_cfg_.kv_cache_precision = KVCachePrecision::TQ;
+    ASSERT_TRUE(setupPipeline()) << "SplitTQ pipeline setup failed";
 
     // Prefill
     ASSERT_TRUE(runner_->forward(config_.token_ids.data(), config_.token_ids.size()))
-        << "TQ4 prefill failed";
+        << "SplitTQ prefill failed";
 
     // Decode step 0
     runner_->clearSnapshots();
-    ASSERT_TRUE(runner_->forward(&decode_token, 1)) << "TQ4 decode step 0 failed";
+    ASSERT_TRUE(runner_->forward(&decode_token, 1)) << "SplitTQ decode step 0 failed";
 
-    // Capture TQ4 ATTENTION_CONTEXT
+    // Capture SplitTQ ATTENTION_CONTEXT
     size_t tq4_attn_size = 0;
     const float *tq4_attn_ctx = runner_->getSnapshot("layer0_ATTENTION_CONTEXT", tq4_attn_size);
     std::vector<float> tq4_attn_context;
@@ -1773,10 +1788,10 @@ TEST_F(Qwen3TQ4DecodeAnalysis, TQ4CacheFlowSimulation_Layer0)
     // ---- Step 7: Summary ----
     std::cout << "\n"
               << std::string(100, '=') << "\n";
-    std::cout << "  SUMMARY: TQ4 Cache Flow Simulation vs Real Pipeline (Layer 0)\n";
+    std::cout << "  SUMMARY: SplitTQ Cache Flow Simulation vs Real Pipeline (Layer 0)\n";
     std::cout << std::string(100, '=') << "\n";
-    std::cout << "  Direct TQ4 round-trip K:           " << std::fixed << std::setprecision(6) << direct_cosine << "\n";
-    std::cout << "  Direct TQ4 round-trip V:           " << std::fixed << std::setprecision(6) << v_direct_cosine << "\n";
+    std::cout << "  Direct SplitTQ round-trip K:           " << std::fixed << std::setprecision(6) << direct_cosine << "\n";
+    std::cout << "  Direct SplitTQ round-trip V:           " << std::fixed << std::setprecision(6) << v_direct_cosine << "\n";
     std::cout << "  Simulated cache dequant K:         " << std::fixed << std::setprecision(6) << cache_k_cosine << "\n";
     std::cout << "  Simulated cache dequant V:         " << std::fixed << std::setprecision(6) << cache_v_cosine << "\n";
     std::cout << "  Direct vs Cache K:                 " << std::fixed << std::setprecision(6) << k_direct_vs_cache << "\n";
@@ -1793,14 +1808,14 @@ TEST_F(Qwen3TQ4DecodeAnalysis, TQ4CacheFlowSimulation_Layer0)
     {
         size_t cmp = std::min(ref_attn_context.size(), tq4_attn_context.size());
         float attn_cos = cosine(ref_attn_context.data(), tq4_attn_context.data(), cmp);
-        std::cout << "  Real pipeline ATTN_CONTEXT FP32vsTQ4: " << std::fixed << std::setprecision(6) << attn_cos << "\n";
+        std::cout << "  Real pipeline ATTN_CONTEXT FP32vsSplitTQ: " << std::fixed << std::setprecision(6) << attn_cos << "\n";
     }
     std::cout << std::string(100, '=') << "\n";
 
     // ---- Diagnostic assertions ----
     // Direct round-trip should be excellent
-    EXPECT_GE(direct_cosine, 0.99f) << "Direct TQ4 K round-trip is bad";
-    EXPECT_GE(v_direct_cosine, 0.99f) << "Direct TQ4 V round-trip is bad";
+    EXPECT_GE(direct_cosine, 0.99f) << "Direct SplitTQ K round-trip is bad";
+    EXPECT_GE(v_direct_cosine, 0.99f) << "Direct SplitTQ V round-trip is bad";
 
     // Cache dequant should match direct dequant (byte-for-byte copy + same dequant)
     EXPECT_GE(k_direct_vs_cache, 0.9999f)

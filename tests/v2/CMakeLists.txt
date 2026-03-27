@@ -2650,6 +2650,45 @@ add_v2_test(V2_Unit_CPURingKVCache
     MPI_PROCS 1
 )
 
+# Test: CPURingKVCache get_kv_converted (ring wrap correctness for FP32 shadow buffers)
+add_executable(v2_test_cpu_ring_kv_cache_get_kv_converted unit/kernels/cpu/Test__CPURingKVCache_GetKvConverted.cpp)
+target_link_libraries(v2_test_cpu_ring_kv_cache_get_kv_converted
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_CPURingKVCache_GetKvConverted
+    COMMAND $<TARGET_FILE:v2_test_cpu_ring_kv_cache_get_kv_converted>
+    LABELS "V2;Unit;KVCache;Ring;CPU;FP32;FP16;GetKvConverted"
+    MPI_PROCS 1
+)
+
+# Test: CPURingKVCache comprehensive (shadow invalidation, edge cases, multi-seq, eviction, factory, stress)
+add_executable(v2_test_cpu_ring_kv_cache_comprehensive unit/kernels/cpu/Test__CPURingKVCache_Comprehensive.cpp)
+target_link_libraries(v2_test_cpu_ring_kv_cache_comprehensive
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_CPURingKVCache_Comprehensive
+    COMMAND $<TARGET_FILE:v2_test_cpu_ring_kv_cache_comprehensive>
+    LABELS "V2;Unit;KVCache;Ring;CPU;FP32;FP16;BF16;Shadow;Eviction;Factory;Comprehensive"
+    MPI_PROCS 1
+)
+
+# Test: CPURingKVCache Q16_1 (variable block sizes, HEAD_MAJOR layout, get_kv_converted)
+add_executable(v2_test_cpu_ring_kv_cache_q16_1 unit/kernels/cpu/Test__CPURingKVCache_Q16_1.cpp)
+target_link_libraries(v2_test_cpu_ring_kv_cache_q16_1
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_CPURingKVCache_Q16_1
+    COMMAND $<TARGET_FILE:v2_test_cpu_ring_kv_cache_q16_1>
+    LABELS "V2;Unit;KVCache;Ring;CPU;Q16_1;HeadMajor;BlockSize;Shadow;Quantization"
+    MPI_PROCS 1
+)
+
 # Test: KernelFactory KVCache methods (unified factory interface for KV cache creation)
 add_executable(v2_test_kernelfactory_kvcache unit/kernels/Test__KernelFactory_KVCache.cpp)
 target_link_libraries(v2_test_kernelfactory_kvcache 
@@ -3462,34 +3501,83 @@ add_v2_test(V2_Unit_TurboQuantRoundtrip
     LABELS "V2;Unit;Quantization;TurboQuant;Roundtrip;MSE;Rotation"
 )
 
-# TurboQuant KV Cache Integration (Phase 2: KV Cache round-trip)
-# Tests TQ4/TQ3 quantized data flowing through the CPURingKVCache:
+# Split TQ KV Cache Integration (TQ8-K / TQ4-V)
+# Tests split precision data flowing through the CPURingKVCache:
 # append, gather, ring wrap, incremental decode, multi-layer, clear.
-add_executable(v2_test_turboquant_kvcache unit/kernels/cpu/Test__CPURingKVCache_TurboQuant.cpp)
-target_link_libraries(v2_test_turboquant_kvcache
+add_executable(v2_test_splittq_kvcache unit/kernels/cpu/Test__CPURingKVCache_SplitTQ.cpp)
+target_link_libraries(v2_test_splittq_kvcache
     llaminar2_core
     GTest::gtest
     GTest::gtest_main
 )
-add_v2_test(V2_Unit_TurboQuant_KVCache
-    COMMAND $<TARGET_FILE:v2_test_turboquant_kvcache>
+add_v2_test(V2_Unit_SplitTQ_KVCache
+    COMMAND $<TARGET_FILE:v2_test_splittq_kvcache>
     MPI_PROCS 1
-    LABELS "V2;Unit;KVCache;TurboQuant;TQ4;TQ3;Ring;CPU;Quantization"
+    LABELS "V2;Unit;KVCache;TurboQuant;TQ8;TQ4;SplitTQ;Ring;CPU;Quantization"
 )
 
-# TQ4 Attention with head_dim=128 (Qwen3-like)
-# Tests TQ4 round-trip, cache round-trip, dequant correctness, and full attention pipeline
-# with head_dim=128 — the code path that differs from Qwen2's head_dim=64.
-add_executable(v2_test_tq4_attention_headdim128 unit/kernels/cpu/Test__TQ4_Attention_HeadDim128.cpp)
-target_link_libraries(v2_test_tq4_attention_headdim128
+# Split TQ Attention with head_dim=128 (Qwen3-like)
+# Tests split TQ8-K/TQ4-V round-trip, cache round-trip, dequant correctness, and full
+# attention pipeline with head_dim=128 — the code path that differs from Qwen2's head_dim=64.
+add_executable(v2_test_splittq_attention_headdim128 unit/kernels/cpu/Test__SplitTQ_Attention_HeadDim128.cpp)
+target_link_libraries(v2_test_splittq_attention_headdim128
     llaminar2_core
     GTest::gtest
     GTest::gtest_main
 )
-add_v2_test(V2_Unit_TQ4_Attention_HeadDim128
-    COMMAND $<TARGET_FILE:v2_test_tq4_attention_headdim128>
+add_v2_test(V2_Unit_SplitTQ_Attention_HeadDim128
+    COMMAND $<TARGET_FILE:v2_test_splittq_attention_headdim128>
     MPI_PROCS 1
-    LABELS "V2;Unit;KVCache;TurboQuant;TQ4;Attention;CPU;Quantization"
+    LABELS "V2;Unit;KVCache;TurboQuant;TQ8;TQ4;SplitTQ;Attention;CPU;Quantization"
+)
+
+# Split TQ Regression Tests
+# Targeted regression tests for 4 specific bugs found during split TQ8/TQ4 integration:
+# 1. Per-head context derivation in turboquant_dequantize_row_tq8
+# 2. Row byte-offset calculation with typed_data() pointer arithmetic
+# 3. Buffer overflow from dequantize_to_fp32 on cache-sized tensors
+# 4. Context mismatch between quantize and dequantize layer contexts
+add_executable(v2_test_splittq_regression unit/kernels/cpu/Test__SplitTQ_Regression.cpp)
+target_link_libraries(v2_test_splittq_regression
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_SplitTQ_Regression
+    COMMAND $<TARGET_FILE:v2_test_splittq_regression>
+    MPI_PROCS 1
+    LABELS "V2;Unit;TurboQuant;TQ8;TQ4;SplitTQ;Regression;CPU;Quantization"
+)
+
+# TQ8 Round-trip Quality Tests
+# Tests TQ8 block-level quantize/dequantize quality, TQ8 vs TQ4 comparison,
+# TQ8Tensor high-level API, determinism, extreme norms, inner product preservation.
+add_executable(v2_test_tq8_roundtrip unit/Test__TQ8Roundtrip.cpp)
+target_link_libraries(v2_test_tq8_roundtrip
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_TQ8Roundtrip
+    COMMAND $<TARGET_FILE:v2_test_tq8_roundtrip>
+    MPI_PROCS 1
+    LABELS "V2;Unit;Quantization;TurboQuant;TQ8;Roundtrip;MSE;Tensor"
+)
+
+# TQ8 and TQ8/TQ4 Split-Precision KV Cache Tests
+# Tests CPURingKVCacheTQ8 (symmetric) and CPURingKVCacheTQ (asymmetric TQ8-K / TQ4-V):
+# precision reporting, append/gather round-trip, ring wrap, incremental decode,
+# multi-layer independence, clear, K quality >> V quality validation.
+add_executable(v2_test_tq8_kvcache unit/kernels/cpu/Test__CPURingKVCache_TQ8.cpp)
+target_link_libraries(v2_test_tq8_kvcache
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_TQ8_KVCache
+    COMMAND $<TARGET_FILE:v2_test_tq8_kvcache>
+    MPI_PROCS 1
+    LABELS "V2;Unit;KVCache;TurboQuant;TQ8;TQ4;Ring;CPU;Quantization;SplitPrecision"
 )
 
 # Test: ModelContextConfig
@@ -4256,21 +4344,21 @@ if(ZLIB_FOUND)
         MPI_PROCS 1
     )
 
-    # ---- TQ4 Decode Step 4 Divergence Analysis ----
-    add_executable(v2_integration_parity_qwen3_tq4_analysis
-        integration/parity/qwen3/Test__Qwen3_TQ4_DecodeAnalysis.cpp
+    # ---- SplitTQ Decode Step 4 Divergence Analysis ----
+    add_executable(v2_integration_parity_qwen3_splittq_analysis
+        integration/parity/qwen3/Test__Qwen3_SplitTQ_DecodeAnalysis.cpp
         ${WORKSPACE_ROOT_PARITY}/external/cnpy/cnpy.cpp
     )
-    target_link_libraries(v2_integration_parity_qwen3_tq4_analysis
+    target_link_libraries(v2_integration_parity_qwen3_splittq_analysis
         llaminar2_core v2_test_utils GTest::gtest ZLIB::ZLIB
     )
-    target_include_directories(v2_integration_parity_qwen3_tq4_analysis PRIVATE
+    target_include_directories(v2_integration_parity_qwen3_splittq_analysis PRIVATE
         ${WORKSPACE_ROOT_PARITY}/external/cnpy
         ${CMAKE_CURRENT_SOURCE_DIR}
     )
-    add_v2_test(V2_Integration_Parity_Qwen3_TQ4_Analysis
-        COMMAND $<TARGET_FILE:v2_integration_parity_qwen3_tq4_analysis>
-        LABELS "V2;Integration;Parity;Qwen3;CPU;TQ4;Analysis;PyTorch;GoldenReference;FullModel"
+    add_v2_test(V2_Integration_Parity_Qwen3_SplitTQ_Analysis
+        COMMAND $<TARGET_FILE:v2_integration_parity_qwen3_splittq_analysis>
+        LABELS "V2;Integration;Parity;Qwen3;CPU;TQ8;TQ4;SplitTQ;Analysis;PyTorch;GoldenReference;FullModel"
         MPI_PROCS 1
     )
 
@@ -8549,7 +8637,7 @@ target_include_directories(v2_perf_turboquant PRIVATE
 )
 add_v2_test(V2_Perf_TurboQuant
     COMMAND $<TARGET_FILE:v2_perf_turboquant>
-    LABELS "V2;Performance;TurboQuant;TQ4;Quantize;Dequantize;NativeDot;KVCache;SIMD;AVX512"
+    LABELS "V2;Performance;TurboQuant;TQ4;TQ8;Quantize;Dequantize;NativeDot;KVCache;SIMD;AVX512"
     MPI_PROCS 1
 )
 

@@ -26,6 +26,7 @@ This document presents the empirical methods, mathematical analysis, and conclus
 - [Comparison of Quantization Approaches](#comparison-of-quantization-approaches)
 - [Conclusions](#conclusions)
 - [Potential Mitigations](#potential-mitigations)
+- [Appendix: Split TQ (TQ8 K + TQ4 V) — Implementation & Parity Results](#appendix-split-tq-tq8-k--tq4-v--implementation--parity-results)
 
 ---
 
@@ -313,3 +314,101 @@ Listed in approximate order of complexity and expected effectiveness:
 | **Pre-RoPE quantization** | Quantize K before RoPE, apply RoPE after dequant | Eliminates RoPE-induced range | High (needs RoPE at attention time) |
 
 The most practical near-term fix is **asymmetric K/V precision**: keep TQ4 for V (where errors are linear through the weighted sum, not exponential through softmax) and use higher precision for K.
+
+---
+
+## Appendix: Split TQ (TQ8 K + TQ4 V) — Implementation & Parity Results
+
+### Overview
+
+The "asymmetric precision" mitigation recommended above was implemented as **Split TQ** (`KVCachePrecision::TQ`): TQ8 for K projections, TQ4 for V projections. This section documents the implementation, the pipeline bugs that were found and fixed, and the resulting parity numbers compared to FP16, Q8_1, and pure TQ4.
+
+### TQ8 Design
+
+TQ8 uses the same rotation-based framework as TQ4 but with a 256-level Lloyd-Max codebook for N(0,1):
+
+| Property | TQ4 | TQ8 |
+|----------|-----|-----|
+| Centroids | 16 (4-bit) | 256 (8-bit) |
+| Index storage | 4 bits packed | 8 bits (uint8_t) |
+| Per-block overhead | float32 norm + float32 residual_norm | float32 norm + float32 residual_norm |
+| Block size (head_dim=64) | 40 bytes | 72 bytes |
+| Block size (head_dim=128) | 72 bytes | 136 bytes |
+| Bytes/element (head_dim=64) | 0.625 | 1.125 |
+| Bytes/element (head_dim=128) | 0.5625 | 1.0625 |
+
+### Memory Savings vs Full Q8_1
+
+| Mode | K bytes/elem | V bytes/elem | **Total** | **Savings vs Q8_1** |
+|------|-------------|-------------|-----------|---------------------|
+| Q8_1 (both K+V) | 1.125 | 1.125 | 2.250 | — |
+| Split TQ, head_dim=64 | 1.125 (TQ8) | 0.625 (TQ4) | 1.750 | **22.2%** |
+| Split TQ, head_dim=128 | 1.0625 (TQ8) | 0.5625 (TQ4) | 1.625 | **27.8%** |
+
+All savings come from V (half the cache). K stays at roughly the same cost as Q8_1 (identical at head_dim=64, slightly cheaper at 128).
+
+### Pipeline Bugs Found and Fixed
+
+Three bugs prevented Split TQ from working in the inference pipeline:
+
+1. **InferenceRunnerFactory** (`InferenceRunnerFactory.cpp`): `TurboQuantContext` (which holds the per-layer rotation matrices) was only created when `KVCachePrecision::TQ4` was selected. Added `KVCachePrecision::TQ` to the condition at all 3 factory code paths (single-device, TP-local, TP-global).
+
+2. **KVCacheAppendStage** (`KVCacheAppendStage.cpp`): The append stage had explicit precision-dispatch paths for FP16, FP32, Q8_1, Q16_1, and TQ4, but nothing for split TQ. When the cache's `k_precision()` returned `ActivationPrecision::TQ8`, execution fell through to the "direct append" path, which tried to cast FP32 projection tensors to TQ8 and failed. Added a new path that quantizes K→TQ8 and V→TQ4 before appending, in both single-sequence and batched code paths.
+
+3. **AttentionComputeStage** (`AttentionComputeStage.cpp`): The existing TQ4 dequant block in attention matched only when *both* K and V were `TQ4Tensor*`. For split TQ, K is `TQ8Tensor*` and V is `TQ4Tensor*` — both casts failed, so the cached tensors' `data()` method was called without a TurboQuantContext, producing null pointers. Added a new dequant block with `TurboQuantDequantizeSplitTQ.h` that handles K=TQ8 + V=TQ4 dequantization, including the fused RoPE-on-read path.
+
+### Decode Parity: Qwen2 (head_dim=64, 24 layers)
+
+Model: `qwen2.5-0.5b-instruct-q4_0.gguf` (Q4_0 weights, 2 KV heads, kv_dim=128)
+
+**Summary (5 decode steps):**
+
+| KV Precision | Avg Cosine | Top-1 | Top-5 | Ref-in-Top3 |
+|-------------|-----------|-------|-------|-------------|
+| FP16 | 0.9995 | 100% | 100% | 5/5 |
+| Q8_1 | 0.9967 | 80% | 100% | 5/5 |
+| **Split TQ** | **0.9943** | **80%** | **100%** | **5/5** |
+| TQ4 | 0.9430 | 60% | 100% | 5/5 |
+
+**Per-step cosine similarity:**
+
+| Step | FP16 | Q8_1 | **Split TQ** | TQ4 |
+|------|------|------|-------------|-----|
+| 0 | 0.9993 | 0.9979 | **0.9958** | 0.9770 |
+| 1 | 0.9995 | 0.9948 | **0.9960** | 0.9623 |
+| 2 | 0.9995 | 0.9985 | **0.9973** | 0.9666 |
+| 3 | 0.9995 | 0.9960 | **0.9955** | 0.9651 |
+| 4 | 0.9997 | 0.9961 | **0.9867** | 0.8439 |
+
+### Decode Parity: Qwen3 (head_dim=128, 28 layers)
+
+Model: `Qwen3-0.6B-Q8_0.gguf` (Q8_0 weights, 8 KV heads, kv_dim=1024)
+
+**Summary (5 decode steps):**
+
+| KV Precision | Avg Cosine | Top-1 | Top-5 | Ref-in-Top3 |
+|-------------|-----------|-------|-------|-------------|
+| FP16 | 0.9994 | 100% | 100% | 5/5 |
+| Q8_1 | 0.9993 | 100% | 100% | 5/5 |
+| **Split TQ** | **0.9961** | **100%** | **100%** | **5/5** |
+| TQ4 | 0.9262 | 80% | 100% | 5/5 |
+
+**Per-step cosine similarity:**
+
+| Step | FP16 | Q8_1 | **Split TQ** | TQ4 |
+|------|------|------|-------------|-----|
+| 0 | 0.9989 | 0.9992 | **0.9979** | 0.9796 |
+| 1 | 0.9995 | 0.9993 | **0.9980** | 0.9656 |
+| 2 | 0.9997 | 0.9994 | **0.9944** | 0.9110 |
+| 3 | 0.9996 | 0.9994 | **0.9939** | 0.9502 |
+| 4 | 0.9994 | 0.9993 | **0.9964** | 0.8245 |
+
+### Analysis
+
+1. **Split TQ achieves near-Q8_1 quality.** The average decode cosine is within 0.003 of Q8_1 on both models. The prediction agreement (Top-1, Top-5, Ref-in-Top3) is identical to Q8_1 on Qwen3 and within one step on Qwen2.
+
+2. **The improvement over pure TQ4 is dramatic.** On Qwen3, TQ4's worst step (0.8245) is catastrophically bad — approaching random attention. Split TQ's worst step (0.9939) is well within the quality band. This validates the theoretical analysis: K quantization noise is amplified exponentially through softmax, while V quantization noise is only linear.
+
+3. **The quality gap is larger on Qwen3.** Split TQ vs TQ4 difference is 0.05 on Qwen2 but 0.07 on Qwen3. This matches the prediction from the error analysis — Qwen3's higher K norms (up to 438 for the worst head) amplify the TQ4 score error more.
+
+4. **Memory efficiency is meaningful.** The 22–28% savings vs full Q8_1 is entirely from V, which tolerates 4-bit quantization well. This is the optimal point on the quality–memory Pareto frontier for TurboQuant.

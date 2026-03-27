@@ -153,7 +153,8 @@ namespace llaminar2
         Q16_1,     ///< Block-quantized int16 (72 bytes per 32 elements, 266× better than Q8_1)
         Hybrid,    ///< Mixed precision: FP32 residual, BF16 KV cache, Q8_1 QKV activations
         HybridQ16, ///< Mixed precision: Q16_1 residual, Q8_1 activations (62% memory savings)
-        TQ4        ///< TurboQuant 4-bit KV cache (7.5× compression vs FP32)
+        TQ4,       ///< TurboQuant 4-bit KV cache (7.5× compression vs FP32)
+        TQ8        ///< TurboQuant 8-bit (K-projection cache, SQNR 38.79 dB)
     };
 
     /**
@@ -179,6 +180,8 @@ namespace llaminar2
             return "HybridQ16";
         case ActivationPrecision::TQ4:
             return "TQ4";
+        case ActivationPrecision::TQ8:
+            return "TQ8";
         default:
             return "Unknown";
         }
@@ -197,7 +200,8 @@ namespace llaminar2
         FP16,
         Q8_1,
         Q16_1,
-        TQ4
+        TQ4,
+        TQ ///< TurboQuant asymmetric: TQ8 for K, TQ4 for V
     };
 
     inline const char *kvCachePrecisionToString(KVCachePrecision precision)
@@ -216,6 +220,8 @@ namespace llaminar2
             return "Q16_1";
         case KVCachePrecision::TQ4:
             return "TQ4";
+        case KVCachePrecision::TQ:
+            return "TQ (TQ8 K + TQ4 V)";
         default:
             return "UNKNOWN";
         }
@@ -238,6 +244,8 @@ namespace llaminar2
             return KVCachePrecision::Q16_1;
         if (lower == "tq4")
             return KVCachePrecision::TQ4;
+        if (lower == "tq")
+            return KVCachePrecision::TQ;
         return KVCachePrecision::AUTO;
     }
 
@@ -256,6 +264,8 @@ namespace llaminar2
             return ActivationPrecision::Q16_1;
         case KVCachePrecision::TQ4:
             return ActivationPrecision::TQ4;
+        case KVCachePrecision::TQ:
+            return ActivationPrecision::TQ8; // K precision; V uses TQ4 via asymmetric cache
         case KVCachePrecision::AUTO:
         default:
             // CPU: Q16_1 uses VNNI int16 attention — ~1.4x decode speedup, 50% KV memory
@@ -294,6 +304,8 @@ namespace llaminar2
             return 72.0f / 32.0f; // 2.25 bytes/element
         case ActivationPrecision::TQ4:
             return 68.0f / 128.0f; // ~0.53 bytes/element (head_dim=128)
+        case ActivationPrecision::TQ8:
+            return 136.0f / 128.0f; // ~1.0625 bytes/element (head_dim=128)
         case ActivationPrecision::Hybrid:
         case ActivationPrecision::HybridQ16:
         default:

@@ -16,6 +16,7 @@
 
 namespace llaminar2
 {
+    class TurboQuantContext; // Forward declaration for KVReadParams
 
     /**
      * @brief Unified interface for KV cache implementations
@@ -34,10 +35,33 @@ namespace llaminar2
         // =================================================================
 
         /**
-         * @brief Get the precision/data type of cached K/V tensors
-         * @return ActivationPrecision (FP32, BF16, FP16, Q8_1, etc.)
+         * @brief Get the precision/data type of cached K tensors
+         * @return ActivationPrecision (FP32, BF16, FP16, Q8_1, TQ8, etc.)
          */
-        virtual ActivationPrecision precision() const = 0;
+        virtual ActivationPrecision k_precision() const = 0;
+
+        /**
+         * @brief Get the precision/data type of cached V tensors
+         *
+         * Defaults to k_precision() for symmetric caches. Override for
+         * asymmetric K/V storage (e.g., TQ8 for K, TQ4 for V).
+         *
+         * @return ActivationPrecision (FP32, BF16, FP16, Q8_1, TQ4, etc.)
+         */
+        virtual ActivationPrecision v_precision() const { return k_precision(); }
+
+        /**
+         * @brief Get the precision of cached K/V tensors (deprecated)
+         *
+         * @deprecated Use k_precision() and v_precision() instead.
+         *             This returns k_precision() and is incorrect for asymmetric caches.
+         * @return ActivationPrecision of K cache
+         */
+        [[deprecated("Use k_precision() and v_precision() instead")]]
+        ActivationPrecision precision() const
+        {
+            return k_precision();
+        }
 
         /**
          * @brief Get number of cached tokens for a layer/sequence
@@ -392,6 +416,89 @@ namespace llaminar2
          * @return Starting KV head index (default: 0)
          */
         virtual int kv_head_start() const { return 0; }
+
+        // =================================================================
+        // Converted KV Access (dequant-on-read with optional fused RoPE)
+        // =================================================================
+
+        /**
+         * @brief Parameters for fused RoPE during KV cache read.
+         *
+         * When rope_theta > 0, RoPE is applied to K inline during dequantization.
+         * This is "RoPE-on-read": K is stored WITHOUT position embeddings in the cache,
+         * and the embeddings are applied lazily when K is consumed by attention.
+         *
+         * Benefits:
+         * - Fused dequant+RoPE eliminates a separate RoPE pass over K
+         * - Position-free cache enables future speculative decoding
+         * - For quantized caches, avoids dequant→RoPE→requant roundtrip
+         */
+        struct KVReadParams
+        {
+            float rope_theta = 0.0f;                           ///< RoPE frequency base (<=0 disables RoPE)
+            int position_start = 0;                            ///< RoPE position of the first cached token
+            int n_kv_heads = 0;                                ///< Number of KV heads
+            int head_dim = 0;                                  ///< Dimension per attention head
+            const TurboQuantContext *turboquant_ctx = nullptr; ///< Required for TQ cache dequant (optional otherwise)
+        };
+
+        /**
+         * @brief Get K/V converted to a target precision with optional fused RoPE.
+         *
+         * Returns FP32 (or other target precision) views of the cached K/V data.
+         * The cache manages internal shadow buffers and performs incremental
+         * conversion — only newly appended rows are processed each call.
+         *
+         * When rope.rope_theta > 0, RoPE is fused into K dequantization,
+         * eliminating a separate RoPE computation pass.
+         *
+         * @param layer Layer index
+         * @param seq_idx Sequence index
+         * @param target Target output precision (e.g., FP32)
+         * @param out_k Output: pointer to converted K tensor
+         * @param out_v Output: pointer to converted V tensor
+         * @param out_kv_len Output: number of cached tokens (optional)
+         * @param rope Optional RoPE parameters for fused application on K
+         * @return true on success
+         */
+        virtual bool get_kv_converted(int layer, int seq_idx,
+                                      ActivationPrecision target,
+                                      ITensor **out_k, ITensor **out_v,
+                                      int *out_kv_len = nullptr,
+                                      const KVReadParams *rope = nullptr)
+        {
+            // Default: ignore target precision and RoPE, return raw cache tensors
+            (void)target;
+            (void)rope;
+            return get_kv(layer, seq_idx, out_k, out_v, out_kv_len);
+        }
+
+        /**
+         * @brief Templated convenience for get_kv_converted().
+         *
+         * Usage:
+         *   cache->get_kv<ActivationPrecision::FP32>(layer, seq, &k, &v, &len, &rope);
+         *
+         * @tparam Target Output precision (compile-time ActivationPrecision)
+         */
+        template <ActivationPrecision Target>
+        bool get_kv(int layer, int seq_idx,
+                    ITensor **out_k, ITensor **out_v,
+                    int *out_kv_len = nullptr,
+                    const KVReadParams *rope = nullptr)
+        {
+            return get_kv_converted(layer, seq_idx, Target, out_k, out_v, out_kv_len, rope);
+        }
+
+        /// Convenience: templated get_kv with seq_idx=0
+        template <ActivationPrecision Target>
+        bool get_kv(int layer,
+                    ITensor **out_k, ITensor **out_v,
+                    int *out_kv_len = nullptr,
+                    const KVReadParams *rope = nullptr)
+        {
+            return get_kv_converted(layer, 0, Target, out_k, out_v, out_kv_len, rope);
+        }
     };
 
 } // namespace llaminar2

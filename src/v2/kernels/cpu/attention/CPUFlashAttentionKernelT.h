@@ -54,7 +54,6 @@
 
 #include "../../../tensors/TensorKernels.h"
 #include "../../../tensors/Tensors.h"
-#include "../../../tensors/TQ4Tensor.h"
 #include "../../../utils/CPUFeatures.h"
 #include "../../../utils/DebugEnv.h"
 #include "../../../utils/KernelProfiler.h"

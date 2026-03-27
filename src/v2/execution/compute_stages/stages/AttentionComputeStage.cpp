@@ -8,13 +8,9 @@
 #include "../../../utils/DebugEnv.h"
 #include "../../../tensors/Tensors.h"
 #include "../../../tensors/TensorKernels.h"
-#include "../../../tensors/SIMDHelpers.h"
 #include "../../../kernels/cpu/CPUKVCache.h"
 #include "../../../utils/Logger.h"
 #include "../../../kernels/KernelFactory.h"
-#include "../../../tensors/TQ4Tensor.h"
-#include "../../../kernels/cpu/turboquant/TurboQuantContext.h"
-#include "../../../kernels/cpu/turboquant/TurboQuantDequantize.h"
 #include <limits>
 #include <fstream>
 #include <filesystem>
@@ -29,25 +25,6 @@ namespace llaminar2
     AttentionComputeStage::AttentionComputeStage(Params params)
         : IComputeStage(params.device_id), params_(std::move(params))
     {
-        // Pre-allocate TQ4 dequant buffers at construction time (model load)
-        // to avoid heap allocations during the decode hot path.
-        if (params_.turboquant_ctx && params_.kv_cache)
-        {
-            const int kv_dim = params_.n_kv_heads * params_.head_dim;
-            const int max_len = params_.kv_cache->max_seq_len();
-            const size_t buf_size = static_cast<size_t>(max_len) * static_cast<size_t>(kv_dim);
-
-            // V always needs FP32 dequant buffer
-            tq_decode_v_fp32_ = std::make_unique<FP32Tensor>(
-                std::vector<size_t>{buf_size});
-
-            if (params_.head_dim != 128)
-            {
-                // K and V both need FP32 dequant
-                tq_decode_k_fp32_ = std::make_unique<FP32Tensor>(
-                    std::vector<size_t>{buf_size});
-            }
-        }
     }
 
     // =============================================================================
@@ -126,20 +103,74 @@ namespace llaminar2
             //    scratch buffers. During decode, those buffers only hold the current token's
             //    projection. The full KV history lives in the cache (populated by
             //    KVCacheAppendStage which runs before this stage).
-            if (params_.read_kv_from_cache || effective_kv_len > params_.seq_len)
+            // 3. apply_rope_to_k is set (rope_on_read mode) - K is stored pre-RoPE
+            //    in the cache, so we must read through get_kv_converted() which
+            //    fuses RoPE into the read path. This applies to BOTH prefill and decode.
+            if (params_.read_kv_from_cache || effective_kv_len > params_.seq_len || params_.apply_rope_to_k)
             {
-                ITensor *cache_k = params_.kv_cache->get_k(params_.layer_idx, 0);
-                ITensor *cache_v = params_.kv_cache->get_v(params_.layer_idx, 0);
-                if (cache_k && cache_v)
+                ITensor *cache_k = nullptr;
+                ITensor *cache_v = nullptr;
+
+                // For CPU, use get_kv_converted<FP32>() which handles:
+                // - Incremental dequant for all cache precisions (FP16, BF16, Q8_1, TQ4, split TQ)
+                // - Optional fused RoPE-on-read (when apply_rope_to_k is set)
+                // - Lazy shadow buffer management inside the cache
+                // This covers both decode (full KV history) and prefill with rope_on_read
+                // (K stored pre-RoPE, needs RoPE applied during read).
+                const bool is_cpu_path = (gpuStream() == nullptr);
+                if (is_cpu_path && (effective_kv_len > params_.seq_len || params_.apply_rope_to_k))
                 {
-                    effective_K = cache_k;
-                    effective_V = cache_v;
-                    LOG_TRACE("[AttentionComputeStage] Using cache K/V ("
-                              << cache_k->dtype_name() << ") for layer " << params_.layer_idx);
+                    IKVCache::KVReadParams read_params;
+                    if (params_.apply_rope_to_k)
+                    {
+                        read_params.rope_theta = params_.rope_theta;
+                        read_params.position_start = 0; // Cache rows are stored in position order
+                    }
+                    read_params.n_kv_heads = params_.n_kv_heads;
+                    read_params.head_dim = params_.head_dim;
+                    read_params.turboquant_ctx = params_.turboquant_ctx;
+
+                    int kv_len_out = 0;
+                    if (params_.kv_cache->get_kv_converted(
+                            params_.layer_idx, 0,
+                            ActivationPrecision::FP32,
+                            &cache_k, &cache_v, &kv_len_out,
+                            &read_params))
+                    {
+                        effective_K = cache_k;
+                        effective_V = cache_v;
+                        LOG_TRACE("[AttentionComputeStage] Using cache get_kv<FP32> ("
+                                  << cache_k->dtype_name() << ") for layer " << params_.layer_idx
+                                  << " kv_len=" << kv_len_out);
+                    }
+                    else
+                    {
+                        LOG_WARN("[AttentionComputeStage] get_kv_converted failed, falling back to raw cache");
+                        cache_k = params_.kv_cache->get_k(params_.layer_idx, 0);
+                        cache_v = params_.kv_cache->get_v(params_.layer_idx, 0);
+                        if (cache_k && cache_v)
+                        {
+                            effective_K = cache_k;
+                            effective_V = cache_v;
+                        }
+                    }
                 }
                 else
                 {
-                    LOG_TRACE("[AttentionComputeStage] Cache K/V not available yet, using wired tensors");
+                    // GPU path: use raw cache tensors
+                    cache_k = params_.kv_cache->get_k(params_.layer_idx, 0);
+                    cache_v = params_.kv_cache->get_v(params_.layer_idx, 0);
+                    if (cache_k && cache_v)
+                    {
+                        effective_K = cache_k;
+                        effective_V = cache_v;
+                        LOG_TRACE("[AttentionComputeStage] Using cache K/V ("
+                                  << cache_k->dtype_name() << ") for layer " << params_.layer_idx);
+                    }
+                    else
+                    {
+                        LOG_TRACE("[AttentionComputeStage] Cache K/V not available yet, using wired tensors");
+                    }
                 }
             }
         }
@@ -151,152 +182,8 @@ namespace llaminar2
             mode = detect_attention_mode(params_.batch_size, params_.seq_len, effective_kv_len);
         }
 
-        // =====================================================================
-        // CPU DECODE: FP16 KV handling
-        //
-        // The attention kernel has two paths for FP16 KV on CPU decode:
-        //
-        // 1. FP16-native path (AVX-512 + F16C): The kernel reads FP16 K/V
-        //    directly and converts to FP32 on the fly in the dot product and
-        //    V accumulation inner loops. This halves KV memory bandwidth and
-        //    eliminates persistent FP32 buffers that cause DRAM bank
-        //    disturbance degrading subsequent GEMM at long context (>300 tok).
-        //
-        // 2. FP32 buffer path (fallback): Persistent FP32 buffers with
-        //    incremental conversion. Used when AVX-512/F16C not available.
-        //
-        // The kernel's compute_tensor() detects FP16 K/V tensors and routes
-        // to path 1 automatically. We only need to avoid creating the FP32
-        // buffers when the hardware supports the native path.
-        // =====================================================================
         const bool is_decode_mode = (mode == AttentionMode::DECODE ||
                                      (params_.seq_len < effective_kv_len && params_.batch_size == 1));
-
-        // Check if FP16-native decode path is available (AVX-512 + F16C)
-        const bool fp16_native_available =
-#if defined(__AVX512F__) && defined(__F16C__)
-            true;
-#else
-            false;
-#endif
-
-        if (is_decode_mode && gpuStream() == nullptr)
-        {
-            auto *K_fp16 = dynamic_cast<FP16Tensor *>(effective_K);
-            auto *V_fp16 = dynamic_cast<FP16Tensor *>(effective_V);
-
-            if (K_fp16 && V_fp16 && !fp16_native_available)
-            {
-                // Fallback: maintain persistent FP32 buffers for platforms
-                // without AVX-512 F16C support
-                const int kv_dim = params_.n_kv_heads * params_.head_dim;
-                const int max_len = params_.kv_cache ? params_.kv_cache->max_seq_len() : effective_kv_len;
-
-                // Lazy init: allocate persistent FP32 buffers once at max capacity
-                if (!decode_k_fp32_)
-                {
-                    decode_k_fp32_ = std::make_unique<FP32Tensor>(
-                        std::vector<size_t>{static_cast<size_t>(max_len) * static_cast<size_t>(kv_dim)});
-                    decode_v_fp32_ = std::make_unique<FP32Tensor>(
-                        std::vector<size_t>{static_cast<size_t>(max_len) * static_cast<size_t>(kv_dim)});
-                    decode_kv_fp32_rows_ = 0;
-                }
-
-                // Detect KV cache clear (kv_len decreased since last call)
-                if (effective_kv_len < decode_kv_fp32_rows_)
-                {
-                    decode_kv_fp32_rows_ = 0;
-                }
-
-                // Convert only newly appended rows (typically 1 per decode step)
-                if (decode_kv_fp32_rows_ < effective_kv_len)
-                {
-                    const size_t from = static_cast<size_t>(decode_kv_fp32_rows_);
-                    const size_t n_new = (static_cast<size_t>(effective_kv_len) - from) * static_cast<size_t>(kv_dim);
-                    const size_t offset = from * static_cast<size_t>(kv_dim);
-
-                    simd::convert_fp16_to_fp32(
-                        K_fp16->typed_data() + offset,
-                        decode_k_fp32_->mutable_data() + offset,
-                        n_new);
-                    simd::convert_fp16_to_fp32(
-                        V_fp16->typed_data() + offset,
-                        decode_v_fp32_->mutable_data() + offset,
-                        n_new);
-
-                    decode_kv_fp32_rows_ = effective_kv_len;
-                }
-
-                effective_K = decode_k_fp32_.get();
-                effective_V = decode_v_fp32_.get();
-            }
-            // When fp16_native_available && K/V are FP16: pass FP16 tensors
-            // directly to the kernel. compute_tensor() will detect FP16 K/V
-            // and use compute_decode_fp16kv() for zero-copy FP16 attention.
-        }
-
-        // =====================================================================
-        // CPU DECODE: TQ4 KV dequantization
-        //
-        // TurboQuant KV cache: both K and V are dequantized to FP32.
-        // Scalar-full mode uses 4-bit MSE centroids for reconstruction.
-        // =====================================================================
-        if (is_decode_mode && gpuStream() == nullptr)
-        {
-            auto *K_tq4 = dynamic_cast<TQ4Tensor *>(effective_K);
-            auto *V_tq4 = dynamic_cast<TQ4Tensor *>(effective_V);
-
-            if (K_tq4 && V_tq4)
-            {
-                if (!params_.turboquant_ctx)
-                {
-                    LOG_ERROR("[AttentionComputeStage] TQ4 KV cache requires turboquant_ctx in params");
-                    return false;
-                }
-                const auto &layer_turboquant_ctx = params_.turboquant_ctx->for_layer(params_.layer_idx);
-                const auto *turboquant_ctx = &layer_turboquant_ctx;
-
-                // Set the shared TurboQuant context on cache tensors so dequant is possible
-                K_tq4->set_turboquant_context(turboquant_ctx);
-                V_tq4->set_turboquant_context(turboquant_ctx);
-
-                const int kv_dim = params_.n_kv_heads * params_.head_dim;
-                const int max_len = params_.kv_cache
-                                        ? params_.kv_cache->max_seq_len()
-                                        : effective_kv_len;
-
-                // K+V dequant buffers (pre-allocated in constructor, fallback here for safety)
-                if (!tq_decode_k_fp32_)
-                {
-                    tq_decode_k_fp32_ = std::make_unique<FP32Tensor>(
-                        std::vector<size_t>{static_cast<size_t>(max_len) * static_cast<size_t>(kv_dim)});
-                    tq_decode_v_fp32_ = std::make_unique<FP32Tensor>(
-                        std::vector<size_t>{static_cast<size_t>(max_len) * static_cast<size_t>(kv_dim)});
-                    tq_decode_fp32_rows_ = 0;
-                }
-
-                if (effective_kv_len < tq_decode_fp32_rows_)
-                    tq_decode_fp32_rows_ = 0;
-
-                if (tq_decode_fp32_rows_ < effective_kv_len)
-                {
-                    turboquant_dequantize_kv_rows(
-                        K_tq4->typed_data(), V_tq4->typed_data(),
-                        *turboquant_ctx,
-                        tq_decode_k_fp32_->mutable_data(),
-                        tq_decode_v_fp32_->mutable_data(),
-                        tq_decode_fp32_rows_, effective_kv_len,
-                        params_.head_dim, params_.n_kv_heads,
-                        K_tq4->blocks_per_row() * K_tq4->block_bytes(),
-                        V_tq4->blocks_per_row() * V_tq4->block_bytes(),
-                        K_tq4->block_bytes(), V_tq4->block_bytes());
-                    tq_decode_fp32_rows_ = effective_kv_len;
-                }
-
-                effective_K = tq_decode_k_fp32_.get();
-                effective_V = tq_decode_v_fp32_.get();
-            }
-        }
 
         LOG_DEBUG("[AttentionComputeStage] Execute: batch=" << params_.batch_size
                                                             << " seq_len=" << params_.seq_len
@@ -452,8 +339,8 @@ namespace llaminar2
                          << "Q_type=" << (params_.Q ? params_.Q->dtype_name() : "null") << "\n"
                          << "K_type=" << (effective_K ? effective_K->dtype_name() : "null") << "\n"
                          << "V_type=" << (effective_V ? effective_V->dtype_name() : "null") << "\n"
-                         << "K_is_dequanted=" << (effective_K == tq_decode_k_fp32_.get() ? 1 : 0) << "\n"
-                         << "V_is_dequanted=" << (effective_V == tq_decode_v_fp32_.get() ? 1 : 0) << "\n"
+                         << "K_is_converted=" << (effective_K && dynamic_cast<FP32Tensor *>(effective_K) ? 1 : 0) << "\n"
+                         << "V_is_converted=" << (effective_V && dynamic_cast<FP32Tensor *>(effective_V) ? 1 : 0) << "\n"
                          << "K_ptr=" << (void *)effective_K << "\n"
                          << "V_ptr=" << (void *)effective_V << "\n";
                 }

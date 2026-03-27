@@ -634,12 +634,14 @@ namespace llaminar2
                   << kvCachePrecisionToString(config.kv_cache_precision));
 
         // =====================================================================
-        // TurboQuant Context (TQ4 KV Cache)
+        // TurboQuant Context (TQ4 / TQ KV Cache)
         // =====================================================================
-        // If TQ4 KV cache precision is requested, create the shared
-        // rotation matrix that all layers use for quantize/dequantize.
+        // If TQ4 or TQ (split TQ8/TQ4) KV cache precision is requested,
+        // create the shared rotation matrix that all layers use for
+        // quantize/dequantize.
         std::shared_ptr<TurboQuantContext> turboquant_ctx;
-        if (config.kv_cache_precision == KVCachePrecision::TQ4)
+        if (config.kv_cache_precision == KVCachePrecision::TQ4 ||
+            config.kv_cache_precision == KVCachePrecision::TQ)
         {
             turboquant_ctx = std::make_shared<TurboQuantContext>(graph_config.head_dim);
             graph_config.turboquant_ctx = turboquant_ctx.get();
@@ -1537,9 +1539,10 @@ namespace llaminar2
         graph_config.kv_cache_scale = config.kv_cache_scale;
         graph_config.kv_cache_precision = config.kv_cache_precision;
 
-        // TurboQuant context for TQ4 KV cache
+        // TurboQuant context for TQ4/TQ KV cache
         std::shared_ptr<TurboQuantContext> turboquant_ctx;
-        if (config.kv_cache_precision == KVCachePrecision::TQ4)
+        if (config.kv_cache_precision == KVCachePrecision::TQ4 ||
+            config.kv_cache_precision == KVCachePrecision::TQ)
         {
             turboquant_ctx = std::make_shared<TurboQuantContext>(graph_config.head_dim);
             graph_config.turboquant_ctx = turboquant_ctx.get();
@@ -1688,9 +1691,10 @@ namespace llaminar2
         graph_config.kv_cache_scale = config.kv_cache_scale;
         graph_config.kv_cache_precision = config.kv_cache_precision;
 
-        // TurboQuant context for TQ4 KV cache
+        // TurboQuant context for TQ4/TQ KV cache
         std::shared_ptr<TurboQuantContext> turboquant_ctx;
-        if (config.kv_cache_precision == KVCachePrecision::TQ4)
+        if (config.kv_cache_precision == KVCachePrecision::TQ4 ||
+            config.kv_cache_precision == KVCachePrecision::TQ)
         {
             turboquant_ctx = std::make_shared<TurboQuantContext>(graph_config.head_dim);
             graph_config.turboquant_ctx = turboquant_ctx.get();

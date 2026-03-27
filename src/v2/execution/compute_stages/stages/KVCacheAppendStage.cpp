@@ -11,7 +11,8 @@
 #include "../../../utils/Logger.h"
 #include "../../../kernels/cpu/CPUKVCache.h"
 #include "../../../kernels/cpu/turboquant/TurboQuantContext.h"
-#include "../../../tensors/TQ4Tensor.h"
+#include "../../../kernels/cpu/turboquant/TurboQuantQuantizeTQ8.h"
+#include "../../../kernels/cpu/turboquant/TurboQuantQuantizeTQ4.h"
 #include "../../../utils/OpenMPUtils.h"
 
 #include "../../../utils/KVCacheProfiler.h"
@@ -345,6 +346,27 @@ namespace llaminar2
                     }
 
                     success = append_to_cache(seq_idx, k_tq4.get(), v_tq4.get(), seq_len);
+                }
+                else if (cache_precision == ActivationPrecision::TQ8)
+                {
+                    // Split TQ: TQ8 for K, TQ4 for V
+                    if (!params_.turboquant_ctx)
+                    {
+                        LOG_ERROR("[KVCacheAppendStage] Split TQ cache requires turboquant_ctx in params");
+                        return false;
+                    }
+                    const auto &turboquant_ctx = params_.turboquant_ctx->for_layer(params_.layer_idx);
+                    const std::vector<size_t> tq_shape{static_cast<size_t>(seq_len), kv_dim};
+
+                    auto k_tq8 = TQ8Tensor::quantize_from_fp32(k_slice->data(), tq_shape, params_.head_dim, turboquant_ctx);
+                    auto v_tq4 = TQ4Tensor::quantize_from_fp32(v_slice->data(), tq_shape, params_.head_dim, turboquant_ctx);
+                    if (!k_tq8 || !v_tq4)
+                    {
+                        LOG_ERROR("[KVCacheAppendStage] Failed to quantize batched K/V slices to split TQ");
+                        return false;
+                    }
+
+                    success = append_to_cache(seq_idx, k_tq8.get(), v_tq4.get(), seq_len);
                 }
                 else
                 {
@@ -917,7 +939,6 @@ namespace llaminar2
         // =================================================================
         // TQ4 cache path with TurboQuant rotation-based quantization
         // =================================================================
-        // TQ4 cache path with TurboQuant rotation-based quantization
         bool cache_is_tq4 = (params_.kv_cache->precision() == ActivationPrecision::TQ4);
 
         if (cache_is_tq4)
@@ -933,10 +954,6 @@ namespace llaminar2
             const int head_dim = params_.head_dim;
             const auto &turboquant_ctx = params_.turboquant_ctx->for_layer(params_.layer_idx);
 
-            // Scalar-full quantization for both K and V:
-            // All 4 bits used for MSE centroids, giving ~0.995 per-vector
-            // reconstruction cosine similarity.
-
             const float *k_fp32 = params_.K->fp32_data();
             const float *v_fp32 = params_.V->fp32_data();
             if (!k_fp32 || !v_fp32)
@@ -947,13 +964,67 @@ namespace llaminar2
 
             const std::vector<size_t> tq_shape{static_cast<size_t>(total_tokens), kv_dim};
 
-            tq4_k_scratch_ = TQ4Tensor::quantize_from_fp32(k_fp32, tq_shape, head_dim, turboquant_ctx);
-            tq4_v_scratch_ = TQ4Tensor::quantize_from_fp32(v_fp32, tq_shape, head_dim, turboquant_ctx);
-
-            if (!tq4_k_scratch_ || !tq4_v_scratch_)
+            // --- Pre-allocate scratch tensors (reuse across calls) ---
+            if (!tq4_k_scratch_ || tq4_k_scratch_->shape() != tq_shape)
             {
-                LOG_ERROR("[KVCacheAppendStage] Failed to quantize K/V to TQ4");
-                return false;
+                tq4_k_scratch_ = std::make_shared<TQ4Tensor>(tq_shape, head_dim);
+                tq4_k_scratch_->set_turboquant_context(&turboquant_ctx);
+            }
+            if (!tq4_v_scratch_ || tq4_v_scratch_->shape() != tq_shape)
+            {
+                tq4_v_scratch_ = std::make_shared<TQ4Tensor>(tq_shape, head_dim);
+                tq4_v_scratch_->set_turboquant_context(&turboquant_ctx);
+            }
+
+            const size_t bpr = tq4_k_scratch_->blocks_per_row();
+
+            // --- Decode fast path: fused K+V quantization per head ---
+            if (total_tokens <= 2)
+            {
+                const TurboQuantContext *head_ctx_ptrs[16];
+                for (size_t h = 0; h < bpr && h < 16; ++h)
+                    head_ctx_ptrs[h] = &turboquant_ctx.for_layer(static_cast<int>(h));
+
+                const size_t bb = tq4_k_scratch_->block_bytes();
+                uint8_t *k_raw = static_cast<uint8_t *>(tq4_k_scratch_->raw_mutable_data());
+                uint8_t *v_raw = static_cast<uint8_t *>(tq4_v_scratch_->raw_mutable_data());
+
+                for (size_t r = 0; r < static_cast<size_t>(total_tokens); ++r)
+                {
+                    const float *k_row = k_fp32 + r * kv_dim;
+                    const float *v_row = v_fp32 + r * kv_dim;
+                    uint8_t *k_row_dst = k_raw + r * bpr * bb;
+                    uint8_t *v_row_dst = v_raw + r * bpr * bb;
+                    alignas(64) float scratch0[128];
+                    alignas(64) float scratch1[128];
+
+                    for (size_t h = 0; h < bpr; ++h)
+                    {
+                        const float *k_head = k_row + h * static_cast<size_t>(head_dim);
+                        const float *v_head = v_row + h * static_cast<size_t>(head_dim);
+                        const auto &hctx = *head_ctx_ptrs[h];
+
+                        if (head_dim == 128)
+                        {
+                            auto *k_block = reinterpret_cast<TQ4Block_128 *>(k_row_dst + h * bb);
+                            turboquant_quantize_tq4<128>(k_head, hctx, *k_block, scratch0, scratch1);
+                            auto *v_block = reinterpret_cast<TQ4Block_128 *>(v_row_dst + h * bb);
+                            turboquant_quantize_tq4<128>(v_head, hctx, *v_block, scratch0, scratch1);
+                        }
+                        else
+                        {
+                            auto *k_block = reinterpret_cast<TQ4Block_64 *>(k_row_dst + h * bb);
+                            turboquant_quantize_tq4<64>(k_head, hctx, *k_block, scratch0, scratch1);
+                            auto *v_block = reinterpret_cast<TQ4Block_64 *>(v_row_dst + h * bb);
+                            turboquant_quantize_tq4<64>(v_head, hctx, *v_block, scratch0, scratch1);
+                        }
+                    }
+                }
+            }
+            else
+            {
+                tq4_k_scratch_->copyFrom_fp32_rows(k_fp32, static_cast<size_t>(total_tokens), turboquant_ctx);
+                tq4_v_scratch_->copyFrom_fp32_rows(v_fp32, static_cast<size_t>(total_tokens), turboquant_ctx);
             }
 
             const auto conv_end = std::chrono::high_resolution_clock::now();
@@ -965,6 +1036,120 @@ namespace llaminar2
             if (!success)
             {
                 LOG_ERROR("[KVCacheAppendStage] append failed (TQ4 cache)");
+                return false;
+            }
+
+            return true;
+        }
+
+        // =================================================================
+        // Split TQ cache path: TQ8 for K, TQ4 for V
+        // =================================================================
+        bool cache_is_tq8 = (params_.kv_cache->k_precision() == ActivationPrecision::TQ8);
+
+        if (cache_is_tq8)
+        {
+            if (!params_.turboquant_ctx)
+            {
+                LOG_ERROR("[KVCacheAppendStage] Split TQ cache requires turboquant_ctx in params");
+                return false;
+            }
+
+            const auto conv_start = std::chrono::high_resolution_clock::now();
+            const size_t kv_dim = params_.K->shape().size() > 1 ? params_.K->shape()[1] : 0;
+            const int head_dim = params_.head_dim;
+            const auto &turboquant_ctx = params_.turboquant_ctx->for_layer(params_.layer_idx);
+
+            const float *k_fp32 = params_.K->fp32_data();
+            const float *v_fp32 = params_.V->fp32_data();
+            if (!k_fp32 || !v_fp32)
+            {
+                LOG_ERROR("[KVCacheAppendStage] Cannot get FP32 data for split TQ cache conversion");
+                return false;
+            }
+
+            const std::vector<size_t> tq_shape{static_cast<size_t>(total_tokens), kv_dim};
+
+            // --- Pre-allocate scratch tensors (reuse across calls) ---
+            if (!tq8_k_scratch_ || tq8_k_scratch_->shape() != tq_shape)
+            {
+                tq8_k_scratch_ = std::make_shared<TQ8Tensor>(tq_shape, head_dim);
+                tq8_k_scratch_->set_turboquant_context(&turboquant_ctx);
+            }
+            if (!tq4_v_scratch_ || tq4_v_scratch_->shape() != tq_shape)
+            {
+                tq4_v_scratch_ = std::make_shared<TQ4Tensor>(tq_shape, head_dim);
+                tq4_v_scratch_->set_turboquant_context(&turboquant_ctx);
+            }
+
+            const size_t bpr = tq8_k_scratch_->blocks_per_row();
+
+            // --- Decode fast path: fused K+V quantization per head ---
+            // Interleaves TQ8(K) and TQ4(V) for the same head so the 64KB
+            // rotation matrix stays hot in L1/L2 for both operations.
+            // Also pre-resolves per-head contexts to avoid mutex+hashmap per call.
+            if (total_tokens <= 2)
+            {
+                // Pre-resolve all per-head contexts once (avoids mutex per head)
+                const TurboQuantContext *head_ctx_ptrs[16]; // max 16 KV heads
+                for (size_t h = 0; h < bpr && h < 16; ++h)
+                    head_ctx_ptrs[h] = &turboquant_ctx.for_layer(static_cast<int>(h));
+
+                const size_t k_bb = tq8_k_scratch_->block_bytes();
+                const size_t v_bb = tq4_v_scratch_->block_bytes();
+                uint8_t *k_raw = static_cast<uint8_t *>(tq8_k_scratch_->raw_mutable_data());
+                uint8_t *v_raw = static_cast<uint8_t *>(tq4_v_scratch_->raw_mutable_data());
+
+                for (size_t r = 0; r < static_cast<size_t>(total_tokens); ++r)
+                {
+                    const float *k_row = k_fp32 + r * kv_dim;
+                    const float *v_row = v_fp32 + r * kv_dim;
+                    uint8_t *k_row_dst = k_raw + r * bpr * k_bb;
+                    uint8_t *v_row_dst = v_raw + r * bpr * v_bb;
+                    alignas(64) float scratch0[128];
+                    alignas(64) float scratch1[128];
+
+                    for (size_t h = 0; h < bpr; ++h)
+                    {
+                        const float *k_head = k_row + h * static_cast<size_t>(head_dim);
+                        const float *v_head = v_row + h * static_cast<size_t>(head_dim);
+                        const auto &hctx = *head_ctx_ptrs[h];
+
+                        // K (TQ8) — rotation matrix loaded into cache
+                        if (head_dim == 128)
+                        {
+                            auto *k_block = reinterpret_cast<TQ8Block_128 *>(k_row_dst + h * k_bb);
+                            turboquant_quantize_tq8<128>(k_head, hctx, *k_block, scratch0, scratch1);
+                            // V (TQ4) — same rotation matrix still hot in L1/L2
+                            auto *v_block = reinterpret_cast<TQ4Block_128 *>(v_row_dst + h * v_bb);
+                            turboquant_quantize_tq4<128>(v_head, hctx, *v_block, scratch0, scratch1);
+                        }
+                        else
+                        {
+                            auto *k_block = reinterpret_cast<TQ8Block_64 *>(k_row_dst + h * k_bb);
+                            turboquant_quantize_tq8<64>(k_head, hctx, *k_block, scratch0, scratch1);
+                            auto *v_block = reinterpret_cast<TQ4Block_64 *>(v_row_dst + h * v_bb);
+                            turboquant_quantize_tq4<64>(v_head, hctx, *v_block, scratch0, scratch1);
+                        }
+                    }
+                }
+            }
+            else
+            {
+                // Prefill path: use existing parallel quantization
+                tq8_k_scratch_->copyFrom_fp32_rows(k_fp32, static_cast<size_t>(total_tokens), turboquant_ctx);
+                tq4_v_scratch_->copyFrom_fp32_rows(v_fp32, static_cast<size_t>(total_tokens), turboquant_ctx);
+            }
+
+            const auto conv_end = std::chrono::high_resolution_clock::now();
+            const uint64_t conv_ns = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(conv_end - conv_start).count());
+            KVCacheProfiler::record(KVCacheOpType::CONVERT_TO_TQ, conv_ns, static_cast<uint64_t>(total_tokens), 0);
+
+            bool success = append_to_cache(params_.seq_idx, tq8_k_scratch_.get(), tq4_v_scratch_.get(), total_tokens);
+            if (!success)
+            {
+                LOG_ERROR("[KVCacheAppendStage] append failed (split TQ cache: TQ8 K + TQ4 V)");
                 return false;
             }
 

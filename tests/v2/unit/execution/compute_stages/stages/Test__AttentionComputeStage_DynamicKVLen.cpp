@@ -49,7 +49,7 @@ namespace llaminar2
             }
 
             // ICPUKVCache interface
-            ActivationPrecision precision() const override { return ActivationPrecision::FP32; }
+            ActivationPrecision k_precision() const override { return ActivationPrecision::FP32; }
             int num_layers() const override { return num_layers_; }
             int batch_size() const override { return 1; }
             int max_seq_len() const override { return max_seq_len_; }

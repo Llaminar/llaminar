@@ -44,6 +44,7 @@
 #include "cuda/ops/CUDAEmbeddingKernelT.h"            // Embedding FP32
 #include "cuda/attention/CUDAFlashAttentionKernelT.h" // Flash Attention
 
+extern "C" void cudaNativeVNNIGemvTuned_clearStaticState();
 #endif
 
 // ROCm kernel classes
@@ -3248,6 +3249,12 @@ namespace llaminar
                 device_kernel_registry_.clear();
                 prepared_gemm_registry_.clear();
                 device_gemm_engine_registry_.clear();
+
+#ifdef HAVE_CUDA
+                // Clear CUDA GEMV static caches (row-major weight transpose, sweep
+                // state) to prevent cross-test contamination.
+                cudaNativeVNNIGemvTuned_clearStaticState();
+#endif
             }
 
             void KernelFactory::resetAllDynamicState()
