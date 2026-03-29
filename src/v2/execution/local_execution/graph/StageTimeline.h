@@ -327,6 +327,27 @@ namespace llaminar2
         }
 
         /**
+         * @brief Accumulate current iteration's prefill timings
+         *
+         * Separate accumulation buffer for prefill (vs decode in accumulateIteration).
+         * Used by benchmark mode to avoid per-iteration prefill table printing.
+         */
+        void accumulatePrefillIteration(double wall_ms, size_t token_count)
+        {
+            auto agg = aggregateByType();
+            for (const auto &entry : agg)
+            {
+                auto &acc = prefill_accumulated_[entry.type_name];
+                acc.type_name = entry.type_name;
+                acc.total_ms += entry.total_ms;
+                acc.count += entry.count;
+            }
+            prefill_accumulated_wall_ms_ += wall_ms;
+            prefill_accumulated_tokens_ += token_count;
+            prefill_accumulated_iterations_++;
+        }
+
+        /**
          * @brief Print accumulated summary across multiple decode iterations
          *
          * Prints a single table summarizing all accumulated decode iterations,
@@ -337,9 +358,23 @@ namespace llaminar2
         bool printAccumulatedSummary(const char *phase_name, const char *device_name = nullptr);
 
         /**
+         * @brief Print accumulated prefill summary and reset
+         *
+         * Prints a single table summarizing all accumulated prefill iterations.
+         *
+         * @return true if there was data to print
+         */
+        bool printAccumulatedPrefillSummary(const char *device_name = nullptr);
+
+        /**
          * @brief Check if there is accumulated data pending
          */
         bool hasAccumulatedData() const { return accumulated_iterations_ > 0; }
+
+        /**
+         * @brief Check if there is accumulated prefill data pending
+         */
+        bool hasAccumulatedPrefillData() const { return prefill_accumulated_iterations_ > 0; }
 
         /**
          * @brief Reset accumulated data without printing
@@ -349,6 +384,17 @@ namespace llaminar2
             accumulated_.clear();
             accumulated_wall_ms_ = 0.0;
             accumulated_iterations_ = 0;
+        }
+
+        /**
+         * @brief Reset accumulated prefill data without printing
+         */
+        void resetAccumulatedPrefill()
+        {
+            prefill_accumulated_.clear();
+            prefill_accumulated_wall_ms_ = 0.0;
+            prefill_accumulated_tokens_ = 0;
+            prefill_accumulated_iterations_ = 0;
         }
 
     private:
@@ -379,6 +425,12 @@ namespace llaminar2
         std::unordered_map<std::string, TypeAggregate> accumulated_;
         double accumulated_wall_ms_ = 0.0;
         size_t accumulated_iterations_ = 0;
+
+        // Accumulated state for multi-iteration prefill summaries (benchmark mode)
+        std::unordered_map<std::string, TypeAggregate> prefill_accumulated_;
+        double prefill_accumulated_wall_ms_ = 0.0;
+        size_t prefill_accumulated_tokens_ = 0;
+        size_t prefill_accumulated_iterations_ = 0;
     };
 
 } // namespace llaminar2

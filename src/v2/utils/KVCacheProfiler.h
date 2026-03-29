@@ -286,6 +286,11 @@ namespace llaminar2
                     {
                         const double prefill_ms = static_cast<double>(inst.prefill_stats_[i].total_ns) / 1e6;
                         const double decode_ms = static_cast<double>(inst.decode_stats_[i].total_ns) / 1e6;
+
+                        // Skip operations with no activity in either phase
+                        if (inst.prefill_stats_[i].total_ns == 0 && inst.decode_stats_[i].total_ns == 0)
+                            continue;
+
                         const double decode_pct = (total_ns > 0) ? (decode_ms / (static_cast<double>(total_ns) / 1e6)) * 100.0 : 0.0;
 
                         std::ostringstream prefill_ss, decode_ss, pct_ss;

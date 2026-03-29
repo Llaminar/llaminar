@@ -1056,14 +1056,19 @@ namespace llaminar2
         rccl::ncclComm_t comm = static_cast<rccl::ncclComm_t>(comms_[device_idx]);
         hipStream_t caller_stream = static_cast<hipStream_t>(stream);
 
-        hipError_t err;
-
-        // 1. Set device context
-        err = hipSetDevice(ordinal);
-        if (err != hipSuccess)
+        // Fast path: skip hipSetDevice if this thread already has the right device.
+        // In LOCAL TP decode, each worker thread always targets the same device,
+        // so after the first call the branch is always taken (~1-3μs saved per call).
+        static thread_local int tl_last_hip_device = -1;
+        if (tl_last_hip_device != ordinal)
         {
-            last_error_ = std::string("hipSetDevice failed: ") + hipGetErrorString(err);
-            return false;
+            hipError_t err = hipSetDevice(ordinal);
+            if (err != hipSuccess)
+            {
+                last_error_ = std::string("hipSetDevice failed: ") + hipGetErrorString(err);
+                return false;
+            }
+            tl_last_hip_device = ordinal;
         }
 
         // 2. Launch allreduce directly on the caller's stream.

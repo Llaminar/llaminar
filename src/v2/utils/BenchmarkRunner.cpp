@@ -352,6 +352,10 @@ namespace llaminar2
         // Timeline is suppressed only during warmup (which includes one-time costs).
         runner_->setSuppressTimeline(false);
 
+        // Accumulate prefill timelines instead of printing per-iteration.
+        // flushStageTimeline() after the loop will print averaged tables.
+        runner_->setAccumulatePrefill(true);
+
         // ========================================================================
         // Benchmark Iterations - Run multiple times and average
         // ========================================================================
@@ -406,8 +410,6 @@ namespace llaminar2
                     }
                     return result;
                 }
-                // Flush accumulated GPU stage timeline for this decode phase
-                runner_->flushStageTimeline();
                 decode_times.push_back(decode_time);
                 decode_token_counts.push_back(tokens_generated);
                 last_generated_text = generated_text;
@@ -463,7 +465,7 @@ namespace llaminar2
         return result;
     }
 
-    void BenchmarkRunner::printResults(const BenchmarkResult &result) const
+    void BenchmarkRunner::printResults(const BenchmarkResult &result)
     {
         if (mpi_ctx_->rank() != 0)
         {
@@ -548,6 +550,13 @@ namespace llaminar2
         }
 
         std::print("{}", table.to_string());
+
+        // Flush accumulated GPU stage timeline (prefill + decode + TP orchestrator)
+        // This prints after BENCHMARK RESULTS for cleaner output ordering.
+        if (runner_)
+        {
+            runner_->flushStageTimeline();
+        }
 
         // Print kernel profiling summary if enabled
         if (KernelProfiler::isEnabled())

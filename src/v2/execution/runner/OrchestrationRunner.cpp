@@ -1386,6 +1386,14 @@ namespace llaminar2
         }
     }
 
+    void OrchestrationRunner::setAccumulatePrefill(bool accumulate)
+    {
+        if (runner_)
+        {
+            runner_->setAccumulatePrefill(accumulate);
+        }
+    }
+
     void OrchestrationRunner::flushStageTimeline()
     {
         if (runner_)

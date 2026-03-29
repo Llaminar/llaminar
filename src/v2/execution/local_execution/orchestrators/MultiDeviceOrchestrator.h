@@ -434,6 +434,7 @@ namespace llaminar2
         void setSkipLogitsGatherPrefill(bool skip) { skip_logits_gather_prefill_ = skip; }
 
         void setSuppressTimeline(bool suppress) override;
+        void setAccumulatePrefill(bool accumulate) override;
         void flushStageTimeline() override;
 
         /**
@@ -856,6 +857,44 @@ namespace llaminar2
         /// Eliminates per-decode thread creation/destruction overhead (~100-150µs).
         /// Lazy-initialized on first TP forward call.
         std::unique_ptr<TPWorkerPool> tp_worker_pool_;
+
+        // =====================================================================
+        // TP Decode Profiling
+        //
+        // Lightweight wall-clock accumulation of the orchestrator-level decode
+        // lifecycle. Measured at the forwardTP() level — above all per-device
+        // GPU work — revealing dispatch/collect/gather overhead invisible to
+        // per-device StageTimeline.  Gated on LLAMINAR_PROFILING=1.
+        // Printed by flushStageTimeline() at benchmark end.
+        // =====================================================================
+        struct TPDecodeStats
+        {
+            double total_wall_ms = 0;     ///< Total forwardTP wall time (decode only)
+            double total_dispatch_ms = 0; ///< Time to dispatch workers (condition_variable notify)
+            double total_wait_ms = 0;     ///< Time blocked on collectAll (waiting for slowest device)
+            double total_gather_ms = 0;   ///< Time in gatherLogits
+            size_t iterations = 0;        ///< Number of decode steps
+
+            void record(double wall_ms, double dispatch_ms, double wait_ms, double gather_ms)
+            {
+                total_wall_ms += wall_ms;
+                total_dispatch_ms += dispatch_ms;
+                total_wait_ms += wait_ms;
+                total_gather_ms += gather_ms;
+                iterations++;
+            }
+
+            void reset()
+            {
+                total_wall_ms = 0;
+                total_dispatch_ms = 0;
+                total_wait_ms = 0;
+                total_gather_ms = 0;
+                iterations = 0;
+            }
+        };
+
+        TPDecodeStats tp_decode_stats_;
     };
 
 } // namespace llaminar2

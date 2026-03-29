@@ -481,6 +481,21 @@ namespace llaminar2
         ITensor *get_v(int layer, int seq_idx = 0) override;
         const ITensor *get_v(int layer, int seq_idx = 0) const override;
 
+        // IKVCache get_kv() override using get_k()/get_v()
+        bool get_kv(int layer, int seq_idx,
+                    ITensor **out_k, ITensor **out_v,
+                    int *out_kv_len = nullptr) override;
+        bool get_kv(int layer, int seq_idx,
+                    const ITensor **out_k, const ITensor **out_v,
+                    int *out_kv_len = nullptr) const override;
+
+        // get_kv_converted with FP16 shadow buffers + optional RoPE (IKVCache override)
+        bool get_kv_converted(int layer, int seq_idx,
+                              ActivationPrecision target,
+                              ITensor **out_k, ITensor **out_v,
+                              int *out_kv_len = nullptr,
+                              const KVReadParams *rope = nullptr) override;
+
         // Bring in IROCmRingKVCache overloads to avoid hiding
         using IROCmRingKVCache::append;
         using IROCmRingKVCache::clear_sequence;
@@ -633,6 +648,10 @@ namespace llaminar2
         {
             total_evicted_ += num_evicted;
         }
+        void onClearSequence(int layer, int seq_idx) override
+        {
+            invalidateRoPEShadow(layer, seq_idx);
+        }
         void onAdvanceComplete(int layer, int seq_idx) override
         {
             entries_[layer][seq_idx].scratch_valid = false;
@@ -641,8 +660,8 @@ namespace llaminar2
     private:
         int local_n_kv_heads_; // Local KV heads (this rank), == n_kv_heads_ if not sharded
         int kv_head_start_;    // Starting KV head index (0 if not sharded)
-        int kv_storage_dim_; // per-token storage units (elements for fp/bf16, blocks for Q8_1)
-        bool is_sharded_; // True if using local KV heads (TP enabled)
+        int kv_storage_dim_;   // per-token storage units (elements for fp/bf16, blocks for Q8_1)
+        bool is_sharded_;      // True if using local KV heads (TP enabled)
 
         // Device context for kernel launches (optional)
         // When set, provides default stream for methods that accept optional streams
@@ -670,6 +689,31 @@ namespace llaminar2
         // Statistics
         mutable int total_evicted_ = 0;
         mutable int linearization_count_ = 0;
+
+        // =====================================================================
+        // RoPE-on-read Shadow Buffers (for get_kv_converted)
+        // =====================================================================
+
+        struct RoPEShadow
+        {
+            void *d_K = nullptr;       ///< [max_seq_len, kv_dim] FP16 K with RoPE
+            void *d_V = nullptr;       ///< [max_seq_len, kv_dim] FP16 V
+            int converted_count = 0;   ///< Rows already converted
+            int last_head = -1;        ///< Head position at last conversion
+            bool rope_applied = false; ///< Whether RoPE was applied
+
+            std::unique_ptr<ITensor> k_view; ///< GpuTensorView for K
+            std::unique_ptr<ITensor> v_view; ///< GpuTensorView for V
+        };
+
+        /// [n_layers][batch_size] — lazily initialized
+        mutable std::vector<std::vector<RoPEShadow>> rope_shadows_;
+
+        /// Allocate shadow buffers for a layer/seq if needed
+        void ensureRoPEShadow(int layer, int seq_idx) const;
+
+        /// Invalidate shadow after append/evict
+        void invalidateRoPEShadow(int layer, int seq_idx) const;
 
         // Helper methods
         void allocate_pool(); // Single hipMalloc for all entries

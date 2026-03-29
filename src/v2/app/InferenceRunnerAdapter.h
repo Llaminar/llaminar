@@ -45,6 +45,7 @@ namespace llaminar2
         void setSkipLogitsGatherDecode(bool skip) override;
         void setSkipLogitsGatherPrefill(bool skip) override;
         void setSuppressTimeline(bool suppress) override;
+        void setAccumulatePrefill(bool accumulate) override;
         void flushStageTimeline() override;
 
     private:

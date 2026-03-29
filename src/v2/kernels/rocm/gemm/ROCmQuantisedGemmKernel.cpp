@@ -3653,11 +3653,12 @@ namespace llaminar2
             bool success = false;
             if (needs_padding)
             {
-                // Padded path doesn't have timed version yet, fall back to cached
-                success = rocmQuantGemm_executeTwoKernel_padded(
+                // Use cached padded buffers from workspace (no hot-path allocations)
+                success = rocmQuantGemm_executeTwoKernel_padded_cached(
                     d_A_int8, d_weights_int8, d_C_fp32,
                     d_scales_A, d_scales_B,
                     impl_->d_CK_int32,
+                    impl_->d_A_padded, impl_->d_scale_A_padded, impl_->d_E_padded,
                     m, padded_m, n, k, rocm_device_id_, gpu_stream_, impl_->ck_kernel_context);
                 // Can't get accurate timing for padded path without modifying it
                 if (kernel_time_ms)
@@ -4735,16 +4736,17 @@ namespace llaminar2
                         success = runCKDispatch(
                             [&]()
                             {
-                                return rocmQuantGemm_executeTwoKernel_padded(
+                                return rocmQuantGemm_executeTwoKernel_padded_cached(
                                     impl_->d_A_int8,
                                     d_weights_int8,
                                     d_output,
                                     impl_->d_scales_A,
                                     d_scales_B,
                                     rocm_kernel->impl_->d_CK_int32,
+                                    impl_->d_A_padded, impl_->d_scale_A_padded, impl_->d_E_padded,
                                     m, padded_m, n, k, rocm_device_id_, gpu_stream_, rocm_kernel->impl_->ck_kernel_context);
                             },
-                            "executeTwoKernel_padded");
+                            "executeTwoKernel_padded_cached");
                     }
                     else
                     {

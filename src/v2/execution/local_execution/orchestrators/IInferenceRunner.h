@@ -198,6 +198,16 @@ namespace llaminar2
         virtual void setSuppressTimeline(bool) {}
 
         /**
+         * @brief Set prefill accumulation mode for benchmark
+         *
+         * When enabled, prefill GPU stage timelines are accumulated across
+         * iterations instead of being printed immediately. Used by
+         * BenchmarkRunner to avoid per-iteration prefill table spam.
+         * Default: no-op (not all runners support this).
+         */
+        virtual void setAccumulatePrefill(bool) {}
+
+        /**
          * @brief Flush accumulated GPU stage timeline data
          *
          * Prints accumulated decode stage timing summary and resets.

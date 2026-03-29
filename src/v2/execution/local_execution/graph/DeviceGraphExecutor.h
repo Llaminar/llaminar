@@ -45,6 +45,7 @@
 #include <vector>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <functional>
 
 namespace llaminar2
@@ -197,11 +198,38 @@ namespace llaminar2
          */
         std::vector<std::string> getLeafNodes() const;
 
+        // =====================================================================
+        // Fast Schedule — pre-computed flat array for zero-overhead decode loops
+        // Eliminates string hash lookups, markCompleted calls, and virtual
+        // type() dispatch from the per-token hot path.
+        // =====================================================================
+
+        struct FastScheduleEntry
+        {
+            ComputeNode *node;  ///< Direct pointer (no hash lookup needed)
+            bool is_collective; ///< Pre-computed: ALLREDUCE / ALLGATHER / ALLGATHER_V
+        };
+
+        /**
+         * @brief Build a pre-computed fast schedule from the execution order
+         *
+         * Must be called after the graph is finalized. The collective_nodes set
+         * (if non-null) takes priority for collective classification; otherwise
+         * falls back to stage->type().
+         *
+         * Also marks the last node as is_final_output for event-based dirty marking.
+         */
+        void buildFastSchedule(const std::unordered_set<std::string> *collective_nodes = nullptr);
+
+        const std::vector<FastScheduleEntry> &fastSchedule() const { return fast_schedule_; }
+        bool hasFastSchedule() const { return !fast_schedule_.empty(); }
+
     private:
         std::vector<std::unique_ptr<ComputeNode>> nodes_;
         std::unordered_map<std::string, size_t> node_index_;
         mutable std::vector<std::string> cached_order_; ///< Cached topological order
         mutable bool order_dirty_ = true;               ///< Invalidated on graph mutation
+        std::vector<FastScheduleEntry> fast_schedule_;  ///< Pre-computed decode schedule
     };
 
     /**
@@ -639,6 +667,7 @@ namespace llaminar2
         ICollectiveContext *collective_ctx_ = nullptr;       ///< Optional collective context (not owned)
         BufferArena *arena_ = nullptr;                       ///< Optional arena for contract coherence (not owned)
         StageTimeline stage_timeline_;                       ///< GPU event-based per-stage timeline profiler
+        bool stage_timeline_info_populated_ = false;         ///< True after first setStageInfo pass (names never change)
 
         // Internal execution helpers
         bool executeSequential(ComputeGraph &graph, IDeviceContext *ctx);

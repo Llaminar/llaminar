@@ -86,6 +86,11 @@ namespace llaminar2
         orch_runner_->setSuppressTimeline(suppress);
     }
 
+    void InferenceRunnerAdapter::setAccumulatePrefill(bool accumulate)
+    {
+        orch_runner_->setAccumulatePrefill(accumulate);
+    }
+
     void InferenceRunnerAdapter::flushStageTimeline()
     {
         orch_runner_->flushStageTimeline();

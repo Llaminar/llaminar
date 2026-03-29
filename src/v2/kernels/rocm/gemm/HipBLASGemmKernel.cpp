@@ -197,6 +197,13 @@ namespace llaminar2
 
         HipBLASGemmKernel::~HipBLASGemmKernel()
         {
+            // Free cached workspace
+            if (lt_workspace_)
+            {
+                hipFree(lt_workspace_);
+                lt_workspace_ = nullptr;
+                lt_workspace_size_ = 0;
+            }
             // Only destroy lt_handle_ if we own it
             if (owns_lt_handle_ && lt_handle_)
             {
@@ -219,12 +226,16 @@ namespace llaminar2
               device_id_(other.device_id_),
               precision_(other.precision_),
               owns_handle_(other.owns_handle_),
-              owns_lt_handle_(other.owns_lt_handle_)
+              owns_lt_handle_(other.owns_lt_handle_),
+              lt_workspace_(other.lt_workspace_),
+              lt_workspace_size_(other.lt_workspace_size_)
         {
             other.handle_ = nullptr;
             other.lt_handle_ = nullptr;
             other.owns_handle_ = false;    // Moved-from object shouldn't destroy anything
             other.owns_lt_handle_ = false; // Moved-from object shouldn't destroy anything
+            other.lt_workspace_ = nullptr;
+            other.lt_workspace_size_ = 0;
         }
 
         // Move assignment
@@ -233,6 +244,10 @@ namespace llaminar2
             if (this != &other)
             {
                 // Destroy our resources if we own them
+                if (lt_workspace_)
+                {
+                    hipFree(lt_workspace_);
+                }
                 if (owns_lt_handle_ && lt_handle_)
                 {
                     hipblasLtDestroy(static_cast<hipblasLtHandle_t>(lt_handle_));
@@ -252,11 +267,15 @@ namespace llaminar2
                 precision_ = other.precision_;
                 owns_handle_ = other.owns_handle_;
                 owns_lt_handle_ = other.owns_lt_handle_;
+                lt_workspace_ = other.lt_workspace_;
+                lt_workspace_size_ = other.lt_workspace_size_;
 
                 other.handle_ = nullptr;
                 other.lt_handle_ = nullptr;
                 other.owns_handle_ = false;
                 other.owns_lt_handle_ = false;
+                other.lt_workspace_ = nullptr;
+                other.lt_workspace_size_ = 0;
             }
             return *this;
         }
@@ -434,10 +453,15 @@ namespace llaminar2
 
             HIPBLASLT_CHECK(hipblasLtMatmulPreferenceCreate(&preference));
 
-            // Request workspace
+            // Request workspace (cached to avoid per-call hipMalloc/hipFree)
             size_t workspaceSize = 4 * 1024 * 1024; // 4MB workspace
-            void *workspace = nullptr;
-            HIP_CHECK(hipMalloc(&workspace, workspaceSize));
+            if (!lt_workspace_ || lt_workspace_size_ < workspaceSize)
+            {
+                if (lt_workspace_)
+                    hipFree(lt_workspace_);
+                HIP_CHECK(hipMalloc(&lt_workspace_, workspaceSize));
+                lt_workspace_size_ = workspaceSize;
+            }
 
             HIPBLASLT_CHECK(hipblasLtMatmulPreferenceSetAttribute(preference,
                                                                   HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
@@ -455,7 +479,6 @@ namespace llaminar2
             if (returnedResults == 0)
             {
                 HIP_LOG_ERROR("[HipBLASGemmKernel::execute_with_bias] No suitable algorithm found");
-                hipFree(workspace);
                 hipblasLtMatmulPreferenceDestroy(preference);
                 hipblasLtMatrixLayoutDestroy(Cdesc);
                 hipblasLtMatrixLayoutDestroy(Bdesc);
@@ -477,11 +500,10 @@ namespace llaminar2
                                                      d_C, Cdesc, // C
                                                      d_C, Cdesc, // D (output, same as C)
                                                      &heuristicResult.algo,
-                                                     workspace, workspaceSize,
+                                                     lt_workspace_, lt_workspace_size_,
                                                      0); // stream = 0 (default)
 
-            // Cleanup
-            hipFree(workspace);
+            // Cleanup (workspace is cached, not freed here)
             hipblasLtMatmulPreferenceDestroy(preference);
             hipblasLtMatrixLayoutDestroy(Cdesc);
             hipblasLtMatrixLayoutDestroy(Bdesc);

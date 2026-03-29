@@ -927,14 +927,19 @@ namespace llaminar2
         nccl::ncclComm_t comm = static_cast<nccl::ncclComm_t>(comms_[device_idx]);
         cudaStream_t caller_stream = static_cast<cudaStream_t>(stream);
 
-        cudaError_t err;
-
-        // 1. Set device context
-        err = cudaSetDevice(ordinal);
-        if (err != cudaSuccess)
+        // Fast path: skip cudaSetDevice if this thread already has the right device.
+        // In LOCAL TP decode, each worker thread always targets the same device,
+        // so after the first call the branch is always taken (~1-3μs saved per call).
+        static thread_local int tl_last_cuda_device = -1;
+        if (tl_last_cuda_device != ordinal)
         {
-            last_error_ = std::string("cudaSetDevice failed: ") + cudaGetErrorString(err);
-            return false;
+            cudaError_t err = cudaSetDevice(ordinal);
+            if (err != cudaSuccess)
+            {
+                last_error_ = std::string("cudaSetDevice failed: ") + cudaGetErrorString(err);
+                return false;
+            }
+            tl_last_cuda_device = ordinal;
         }
 
         // 2. Launch allreduce directly on the caller's stream.

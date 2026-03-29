@@ -153,6 +153,16 @@ RUN if [ "$INSTALL_ROCM" = "true" ]; then \
     cd /tmp && tar -I zstd -xf rocblas-arch.pkg.tar.zst && \
     # Copy gfx906 Tensile files to ROCm installation
     cp /tmp/opt/rocm/lib/rocblas/library/*gfx906* /opt/rocm/lib/rocblas/library/ && \
+    # Clone our amdgpu DKMS fork with P2P fix for PCIe switches on mainline kernels.
+    # The upstream DKMS gates CONFIG_HSA_AMD_P2P on CONFIG_DMABUF_MOVENOTIFY which
+    # doesn't exist in mainline kernels >= 5.12, silently breaking P2P.
+    # To rebuild host DKMS with the fix:
+    #   sudo dkms remove amdgpu/6.12.12-2187269.24.04 --all
+    #   sudo cp /opt/amdgpu-dkms/drivers/gpu/drm/amd/dkms/dkms-config.sh \
+    #        /usr/src/amdgpu-*/amd/dkms/dkms-config.sh
+    #   sudo dkms install amdgpu/6.12.12-2187269.24.04
+    git clone --depth 1 --branch fix/pex-pcie-switch-p2p-enable \
+        https://github.com/dbsanfte/amdgpu.git /opt/amdgpu-dkms && \
     # Cleanup
     rm -rf /tmp/amdgpu-install.deb /tmp/rocblas-arch.pkg.tar.zst /tmp/opt /tmp/usr && \
     apt-get autoremove -y && \

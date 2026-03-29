@@ -249,7 +249,6 @@ namespace llaminar2
             table << oss.str() << "" << "" << "" << "" << fort::endr;
             table[0][0].set_cell_span(5);
             table[0][0].set_cell_text_align(fort::text_align::center);
-            table.row(0).set_cell_content_fg_color(fort::color::light_cyan);
         }
 
         // Header
@@ -341,7 +340,6 @@ namespace llaminar2
         table << "EXECUTOR OVERHEAD SUMMARY (COMBINED)" << "" << "" << "" << fort::endr;
         table[0][0].set_cell_span(4);
         table[0][0].set_cell_text_align(fort::text_align::center);
-        table.row(0).set_cell_content_fg_color(fort::color::light_cyan);
 
         {
             std::ostringstream oss;
@@ -624,7 +622,43 @@ namespace llaminar2
     {
         nodes_.clear();
         node_index_.clear();
+        fast_schedule_.clear();
         order_dirty_ = true;
+    }
+
+    void ComputeGraph::buildFastSchedule(const std::unordered_set<std::string> *collective_nodes)
+    {
+        const auto &order = getExecutionOrder();
+        fast_schedule_.clear();
+        fast_schedule_.reserve(order.size());
+
+        for (const auto &name : order)
+        {
+            auto *node = getNode(name);
+            if (!node || !node->stage)
+                continue;
+
+            bool is_coll = false;
+            if (collective_nodes && collective_nodes->count(name) > 0)
+            {
+                is_coll = true;
+            }
+            else
+            {
+                auto t = node->stage->type();
+                is_coll = (t == ComputeStageType::ALLREDUCE ||
+                           t == ComputeStageType::ALLGATHER ||
+                           t == ComputeStageType::ALLGATHER_V);
+            }
+
+            fast_schedule_.push_back({node, is_coll});
+        }
+
+        // Mark the last node as needing event-based dirty marking
+        if (!fast_schedule_.empty())
+        {
+            fast_schedule_.back().node->is_final_output = true;
+        }
     }
 
     ComputeGraph &ComputeGraph::merge(ComputeGraph &&other, const std::string &connect_from)
@@ -924,8 +958,17 @@ namespace llaminar2
         // Set HIP device once for the entire decode pass — eliminates 339+ redundant hipSetDevice calls
         DeviceGraphCaptureController::prepareDeviceForSegmentedCapture(ctx);
 
-        const auto &order = graph.getExecutionOrder();
-        const bool profile_full_node_path = config_.enable_profiling;
+        // =====================================================================
+        // Fast Schedule: pre-computed flat array of {node*, is_collective}
+        // Built once on first call, reused across decode iterations.
+        // Eliminates ~1590 string hash map lookups per token (3 per stage:
+        // getNode, collective_nodes->count, markCompleted).
+        // =====================================================================
+        if (!graph.hasFastSchedule())
+        {
+            graph.buildFastSchedule(collective_nodes);
+        }
+        const auto &schedule = graph.fastSchedule();
 
         // =====================================================================
         // GPU Stage Timing: event-based per-stage profiling on the fast path.
@@ -940,34 +983,27 @@ namespace llaminar2
             if (timeline_gpu_ctx)
             {
                 timeline_stream = timeline_gpu_ctx->defaultStream();
-                stage_timeline_.ensureCapacity(timeline_gpu_ctx, order.size());
+                stage_timeline_.ensureCapacity(timeline_gpu_ctx, schedule.size());
 
-                // Pre-populate stage metadata
-                for (size_t i = 0; i < order.size(); ++i)
+                // Pre-populate stage metadata once — stage names/types never change
+                // between decode iterations. Skipping after first pass eliminates
+                // ~312 std::string copies per token on the hot path.
+                if (!stage_timeline_info_populated_)
                 {
-                    auto *node = graph.getNode(order[i]);
-                    if (node && node->stage)
+                    for (size_t i = 0; i < schedule.size(); ++i)
                     {
-                        stage_timeline_.setStageInfo(i, order[i], node->stage->type());
+                        auto *node = schedule[i].node;
+                        if (node && node->stage)
+                        {
+                            stage_timeline_.setStageInfo(i, node->name, node->stage->type());
+                        }
                     }
+                    stage_timeline_info_populated_ = true;
                 }
             }
         }
-        size_t timeline_idx = 0;
-
-        // =====================================================================
-        // Mark the last stage as needing event-based dirty marking (same
-        // rationale as executeSequential — see comment there).
-        // =====================================================================
-        if (!order.empty())
-        {
-            auto *last_node = graph.getNode(order.back());
-            if (last_node)
-                last_node->is_final_output = true;
-        }
 
         // Multi-GPU stage sync (same rationale as executeSequential)
-        const bool multi_gpu_sync = collective_ctx_ && ctx->isGPU();
         [[maybe_unused]] const int device_ordinal = ctx->isGPU() ? ctx->deviceId().toKernelDeviceIndex() : -1;
         [[maybe_unused]] const bool is_rocm = ctx->deviceId().is_rocm();
 
@@ -985,64 +1021,33 @@ namespace llaminar2
             // No-op: coordinator handles collective→compute sync via host-side stream sync
         };
 
-        for (const auto &name : order)
+        for (size_t i = 0; i < schedule.size(); ++i)
         {
-            auto *node = graph.getNode(name);
-
-            if (!node || !node->stage)
-            {
-                LOG_ERROR("[DeviceGraphExecutor] Fast decode node missing stage: " << name);
-                return false;
-            }
-
-            const auto stage_type = node->stage->type();
-            const bool is_collective_type =
-                (stage_type == ComputeStageType::ALLREDUCE ||
-                 stage_type == ComputeStageType::ALLGATHER ||
-                 stage_type == ComputeStageType::ALLGATHER_V);
-            const bool is_collective_node =
-                (collective_nodes ? collective_nodes->count(name) > 0 : is_collective_type);
+            auto *node = schedule[i].node;
+            const bool is_collective_node = schedule[i].is_collective;
 
             // Timeline: record start event before any execution path
-            const size_t cur_tl_idx = timeline_idx++;
             if (timeline_enabled && timeline_gpu_ctx)
             {
-                stage_timeline_.recordStart(cur_tl_idx, timeline_gpu_ctx, timeline_stream);
-            }
-
-            // Profiling mode: always route through executeNode() so stage timing,
-            // coherence overhead, transfer attribution, and callbacks are captured.
-            // Fast-path bypass remains unchanged when profiling is disabled.
-            if (profile_full_node_path)
-            {
-                pre_stage_sync();
-                if (!executeNode(*node, ctx))
-                {
-                    LOG_ERROR("[DeviceGraphExecutor] Fast decode profiled node failed: " << name);
-                    return false;
-                }
-                post_stage_sync();
-                if (timeline_enabled && timeline_gpu_ctx)
-                    stage_timeline_.recordStop(cur_tl_idx, timeline_gpu_ctx, timeline_stream);
-                graph.markCompleted(name);
-                continue;
+                stage_timeline_.recordStart(i, timeline_gpu_ctx, timeline_stream);
             }
 
             // Collective-aware handling for TP collectives
             if (is_collective_node)
             {
+                const auto stage_type = node->stage->type();
+
                 if (collective_ctx_ && stage_type == ComputeStageType::ALLREDUCE)
                 {
                     pre_stage_sync();
                     if (!executeCollectiveAllreduce(*node, ctx))
                     {
-                        LOG_ERROR("[DeviceGraphExecutor] Fast decode collective ALLREDUCE failed: " << name);
+                        LOG_ERROR("[DeviceGraphExecutor] Fast decode collective ALLREDUCE failed: " << node->name);
                         return false;
                     }
                     post_stage_sync();
                     if (timeline_enabled && timeline_gpu_ctx)
-                        stage_timeline_.recordStop(cur_tl_idx, timeline_gpu_ctx, timeline_stream);
-                    graph.markCompleted(name);
+                        stage_timeline_.recordStop(i, timeline_gpu_ctx, timeline_stream);
                     continue;
                 }
 
@@ -1053,8 +1058,7 @@ namespace llaminar2
                     {
                         post_stage_sync();
                         if (timeline_enabled && timeline_gpu_ctx)
-                            stage_timeline_.recordStop(cur_tl_idx, timeline_gpu_ctx, timeline_stream);
-                        graph.markCompleted(name);
+                            stage_timeline_.recordStop(i, timeline_gpu_ctx, timeline_stream);
                         continue;
                     }
                     post_stage_sync();
@@ -1071,13 +1075,12 @@ namespace llaminar2
                 ensureStageGPUStreamBound(*node, ctx);
                 if (!node->stage->execute(ctx))
                 {
-                    LOG_ERROR("[DeviceGraphExecutor] Fast decode collective stage failed: " << name);
+                    LOG_ERROR("[DeviceGraphExecutor] Fast decode collective stage failed: " << node->name);
                     return false;
                 }
                 post_stage_sync();
                 if (timeline_enabled && timeline_gpu_ctx)
-                    stage_timeline_.recordStop(cur_tl_idx, timeline_gpu_ctx, timeline_stream);
-                graph.markCompleted(name);
+                    stage_timeline_.recordStop(i, timeline_gpu_ctx, timeline_stream);
                 continue;
             }
 
@@ -1090,14 +1093,12 @@ namespace llaminar2
             pre_stage_sync();
             if (!node->stage->execute(ctx))
             {
-                LOG_ERROR("[DeviceGraphExecutor] Fast decode stage failed: " << name);
+                LOG_ERROR("[DeviceGraphExecutor] Fast decode stage failed: " << node->name);
                 return false;
             }
             post_stage_sync();
             if (timeline_enabled && timeline_gpu_ctx)
-                stage_timeline_.recordStop(cur_tl_idx, timeline_gpu_ctx, timeline_stream);
-
-            graph.markCompleted(name);
+                stage_timeline_.recordStop(i, timeline_gpu_ctx, timeline_stream);
         }
 
         return true;
@@ -2297,14 +2298,10 @@ namespace llaminar2
                 stats_.total_collective_ms += execute_ms;
                 stats_.total_collective_calls++;
 
-                if (KernelProfiler::isEnabled())
-                {
-                    auto ktype = (stype == ComputeStageType::ALLREDUCE)
-                                     ? KernelType::ALLREDUCE
-                                     : KernelType::ALLGATHER;
-                    uint64_t ns = static_cast<uint64_t>(execute_ms * 1'000'000.0);
-                    KernelProfiler::record(ktype, ns);
-                }
+                // NOTE: Do NOT record to KernelProfiler here — the stage's
+                // execute() already has KERNEL_PROFILE_SCOPE(KernelType::ALLREDUCE/ALLGATHER)
+                // which records the timing. Recording here too would double-count
+                // both call count and elapsed time.
             }
 
             // Accumulate overhead breakdown
@@ -2848,6 +2845,24 @@ namespace llaminar2
             const std::string stage_type_name = computeStageTypeName(node.stage->type());
             stats_.stage_type_execute_ms[stage_type_name] += ms;
             stats_.stage_type_counts[stage_type_name]++;
+
+            // Phase-split accumulation
+            const auto phase = GraphExecutorStats::currentPhase();
+            PhaseStats *phase_stats = nullptr;
+            if (phase == ExecutionPhase::PREFILL)
+                phase_stats = &stats_.prefill;
+            else if (phase == ExecutionPhase::DECODE)
+                phase_stats = &stats_.decode;
+            if (phase_stats)
+            {
+                phase_stats->total_execute_ms += ms;
+                phase_stats->total_stages_executed++;
+                phase_stats->total_collective_ms += ms;
+                phase_stats->total_collective_calls++;
+                phase_stats->stage_type_execute_ms[stage_type_name] += ms;
+                phase_stats->stage_type_counts[stage_type_name]++;
+            }
+
             LOG_DEBUG("[DeviceGraphExecutor] ALLREDUCE '" << node.name << "' via CollectiveContext took " << ms << " ms");
         }
 
@@ -2955,6 +2970,24 @@ namespace llaminar2
             const std::string stage_type_name = computeStageTypeName(node.stage->type());
             stats_.stage_type_execute_ms[stage_type_name] += ms;
             stats_.stage_type_counts[stage_type_name]++;
+
+            // Phase-split accumulation
+            const auto phase = GraphExecutorStats::currentPhase();
+            PhaseStats *phase_stats = nullptr;
+            if (phase == ExecutionPhase::PREFILL)
+                phase_stats = &stats_.prefill;
+            else if (phase == ExecutionPhase::DECODE)
+                phase_stats = &stats_.decode;
+            if (phase_stats)
+            {
+                phase_stats->total_execute_ms += ms;
+                phase_stats->total_stages_executed++;
+                phase_stats->total_collective_ms += ms;
+                phase_stats->total_collective_calls++;
+                phase_stats->stage_type_execute_ms[stage_type_name] += ms;
+                phase_stats->stage_type_counts[stage_type_name]++;
+            }
+
             LOG_DEBUG("[DeviceGraphExecutor] ALLGATHER '" << node.name << "' via CollectiveContext took " << ms << " ms");
         }
 
@@ -3035,6 +3068,23 @@ namespace llaminar2
                 const std::string stage_type_name = computeStageTypeName(node.stage->type());
                 stats_.stage_type_execute_ms[stage_type_name] += ms;
                 stats_.stage_type_counts[stage_type_name]++;
+
+                // Phase-split accumulation
+                const auto phase = GraphExecutorStats::currentPhase();
+                PhaseStats *phase_stats = nullptr;
+                if (phase == ExecutionPhase::PREFILL)
+                    phase_stats = &stats_.prefill;
+                else if (phase == ExecutionPhase::DECODE)
+                    phase_stats = &stats_.decode;
+                if (phase_stats)
+                {
+                    phase_stats->total_execute_ms += ms;
+                    phase_stats->total_stages_executed++;
+                    phase_stats->total_collective_ms += ms;
+                    phase_stats->total_collective_calls++;
+                    phase_stats->stage_type_execute_ms[stage_type_name] += ms;
+                    phase_stats->stage_type_counts[stage_type_name]++;
+                }
             }
             // Record to KernelProfiler so strided allgather appears in kernel timing summaries
             if (KernelProfiler::isEnabled())

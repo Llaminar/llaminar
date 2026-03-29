@@ -326,6 +326,28 @@ namespace llaminar2
         dst[row * cols + col] = d * static_cast<float>(blk.qs[lane]);
     }
 
+    // Q8_1 → FP16 dequantization kernel (anonymous namespace to avoid ODR conflict with CUDA)
+    namespace
+    {
+        __global__ void hip_dequant_q8_1_to_fp16_kernel(
+            const Q8_1Block *__restrict__ src,
+            half *__restrict__ dst,
+            int count)
+        {
+            const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+            if (idx >= count)
+                return;
+
+            const int block_idx = idx / Q8_1Block::BLOCK_SIZE;
+            const int elem_idx = idx % Q8_1Block::BLOCK_SIZE;
+
+            const Q8_1Block &block = src[block_idx];
+            const float scale = __half2float(__ushort_as_half(block.d));
+            const float val = scale * static_cast<float>(block.qs[elem_idx]);
+            dst[idx] = __float2half_rn(val);
+        }
+    } // anonymous namespace
+
     extern "C" bool hip_convert_tensor_to_fp32(
         const void *d_src,
         TensorType src_type,
@@ -408,7 +430,11 @@ namespace llaminar2
                                count);
             break;
         case TensorType::Q8_1:
-            return false;
+            hipLaunchKernelGGL(hip_dequant_q8_1_to_fp16_kernel, grid, block, 0, stream,
+                               static_cast<const Q8_1Block *>(d_src),
+                               reinterpret_cast<half *>(d_dst),
+                               count);
+            break;
         default:
             return false;
         }

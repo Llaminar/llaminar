@@ -33,7 +33,6 @@ namespace llaminar2
             table << title.str() << "" << "" << "" << "" << fort::endr;
             table[0][0].set_cell_span(5);
             table[0][0].set_cell_text_align(fort::text_align::center);
-            table.row(0).set_cell_content_fg_color(fort::color::light_cyan);
         }
 
         // GPU total + wall comparison
@@ -142,7 +141,6 @@ namespace llaminar2
             table << title.str() << "" << "" << "" << "" << fort::endr;
             table[0][0].set_cell_span(5);
             table[0][0].set_cell_text_align(fort::text_align::center);
-            table.row(0).set_cell_content_fg_color(fort::color::light_cyan);
         }
 
         // Summary info
@@ -216,6 +214,118 @@ namespace llaminar2
         return true;
     }
 
+    bool StageTimeline::printAccumulatedPrefillSummary(const char *device_name)
+    {
+        if (prefill_accumulated_iterations_ == 0 || prefill_accumulated_.empty())
+            return false;
+
+        // Build sorted vector from prefill accumulated map
+        std::vector<TypeAggregate> agg;
+        agg.reserve(prefill_accumulated_.size());
+        for (const auto &[_, val] : prefill_accumulated_)
+            agg.push_back(val);
+        std::sort(agg.begin(), agg.end(),
+                  [](const TypeAggregate &a, const TypeAggregate &b)
+                  { return a.total_ms > b.total_ms; });
+
+        float total_gpu_ms = 0.0f;
+        for (const auto &e : agg)
+            total_gpu_ms += e.total_ms;
+
+        float avg_gpu_ms = total_gpu_ms / prefill_accumulated_iterations_;
+        double avg_wall_ms = prefill_accumulated_wall_ms_ / prefill_accumulated_iterations_;
+        size_t avg_tokens = prefill_accumulated_tokens_ / prefill_accumulated_iterations_;
+
+        fort::utf8_table table;
+        table.set_border_style(FT_DOUBLE2_STYLE);
+
+        // Title row
+        {
+            std::ostringstream title;
+            title << "GPU STAGE TIMELINE: PREFILL";
+            if (device_name)
+                title << " [" << device_name << "]";
+            title << " (avg of " << prefill_accumulated_iterations_ << " iterations, "
+                  << avg_tokens << " tokens)";
+            table << title.str() << "" << "" << "" << "" << fort::endr;
+            table[0][0].set_cell_span(5);
+            table[0][0].set_cell_text_align(fort::text_align::center);
+        }
+
+        // Summary info
+        {
+            std::ostringstream info;
+            info << std::fixed << std::setprecision(2);
+            info << "GPU Avg: " << avg_gpu_ms << " ms";
+            info << "  |  Wall Avg: " << avg_wall_ms << " ms";
+            double gap = avg_wall_ms - avg_gpu_ms;
+            info << "  |  Gap: " << gap << " ms";
+            if (avg_wall_ms > 0.0)
+                info << " (" << std::setprecision(1) << (gap / avg_wall_ms * 100.0) << "% overhead)";
+            if (avg_tokens > 0 && avg_gpu_ms > 0.0f)
+            {
+                double tok_per_sec = avg_tokens / (avg_gpu_ms / 1000.0);
+                info << "  |  GPU-limited: " << std::setprecision(1) << tok_per_sec << " tok/s";
+            }
+            table << info.str() << "" << "" << "" << "" << fort::endr;
+            table[1][0].set_cell_span(5);
+        }
+
+        // Header
+        table << fort::header << "STAGE TYPE" << "COUNT/iter" << "TOTAL (ms)" << "AVG/iter (ms)" << "%" << fort::endr;
+
+        table.column(0).set_cell_text_align(fort::text_align::left);
+        table.column(1).set_cell_text_align(fort::text_align::right);
+        table.column(2).set_cell_text_align(fort::text_align::right);
+        table.column(3).set_cell_text_align(fort::text_align::right);
+        table.column(4).set_cell_text_align(fort::text_align::right);
+
+        auto fmt_ms = [](float ms) -> std::string
+        {
+            std::ostringstream oss;
+            oss << std::fixed << std::setprecision(3) << ms;
+            return oss.str();
+        };
+
+        for (const auto &entry : agg)
+        {
+            float pct = total_gpu_ms > 0.0f ? (entry.total_ms / total_gpu_ms) * 100.0f : 0.0f;
+            std::ostringstream pct_str;
+            pct_str << std::fixed << std::setprecision(1) << pct << "%";
+
+            size_t count_per_iter = entry.count / prefill_accumulated_iterations_;
+            float ms_per_iter = entry.total_ms / prefill_accumulated_iterations_;
+
+            table << entry.type_name
+                  << std::to_string(count_per_iter)
+                  << fmt_ms(entry.total_ms)
+                  << fmt_ms(ms_per_iter)
+                  << pct_str.str()
+                  << fort::endr;
+        }
+
+        // Separator + total
+        table << fort::separator;
+        {
+            size_t total_count = 0;
+            for (const auto &e : agg)
+                total_count += e.count;
+            size_t count_per_iter = total_count / prefill_accumulated_iterations_;
+            table << "TOTAL"
+                  << std::to_string(count_per_iter)
+                  << fmt_ms(total_gpu_ms)
+                  << fmt_ms(avg_gpu_ms)
+                  << "100.0%"
+                  << fort::endr;
+        }
+
+        std::cout << table.to_string() << std::flush;
+
+        // Reset accumulated prefill state
+        resetAccumulatedPrefill();
+        return true;
+    }
+
     void StageTimeline::printDetailedTimeline(const char *phase_name,
                                               const char *device_name) const
     {
@@ -230,7 +340,6 @@ namespace llaminar2
             table << title.str() << "" << "" << "" << fort::endr;
             table[0][0].set_cell_span(4);
             table[0][0].set_cell_text_align(fort::text_align::center);
-            table.row(0).set_cell_content_fg_color(fort::color::light_cyan);
         }
 
         table << fort::header << "#" << "STAGE NAME" << "TYPE" << "GPU (ms)" << fort::endr;

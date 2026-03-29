@@ -234,6 +234,10 @@ namespace llaminar2
             Precision precision_ = Precision::FP32;
             bool owns_handle_ = true;    ///< false when using context's hipBLAS handle
             bool owns_lt_handle_ = true; ///< false when using context's hipBLASLt handle
+
+            // Cached hipBLASLt workspace (avoids per-call hipMalloc/hipFree)
+            void *lt_workspace_ = nullptr;
+            size_t lt_workspace_size_ = 0;
         };
 
         /**

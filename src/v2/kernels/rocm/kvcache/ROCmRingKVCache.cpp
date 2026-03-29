@@ -609,6 +609,19 @@ namespace llaminar2
             return;
         }
 
+        // Free RoPE shadow buffers
+        for (auto &layer_shadows : rope_shadows_)
+        {
+            for (auto &shadow : layer_shadows)
+            {
+                if (shadow.d_K)
+                    hipFree(shadow.d_K);
+                if (shadow.d_V)
+                    hipFree(shadow.d_V);
+            }
+        }
+        rope_shadows_.clear();
+
         if (pool_base_)
         {
             // All entries point into the single pool — free it once
@@ -741,7 +754,7 @@ namespace llaminar2
                   << (n_layers_ * batch_size_ * 4 * max_seq_len_ * kv_dim_ * sizeof(DataT)) / (1024 * 1024)
                   << " MB total (including scratch)");
 
-        allocateDeviceParams();  // Base class method (ROCmRingKVCacheBase)
+        allocateDeviceParams(); // Base class method (ROCmRingKVCacheBase)
     }
 
     template <ActivationPrecision Precision>
@@ -1501,6 +1514,362 @@ namespace llaminar2
     DeviceWorkspaceManager *ROCmRingKVCache<Precision>::getWorkspace() const
     {
         return workspace_;
+    }
+
+    // =========================================================================
+    // get_kv() implementations (IKVCache interface)
+    // =========================================================================
+
+    template <ActivationPrecision Precision>
+    bool ROCmRingKVCache<Precision>::get_kv(int layer, int seq_idx,
+                                            ITensor **out_k, ITensor **out_v,
+                                            int *out_kv_len)
+    {
+        ITensor *k = get_k(layer, seq_idx);
+        ITensor *v = get_v(layer, seq_idx);
+        if (!k || !v)
+        {
+            // Empty cache is valid — not an error
+            if (out_kv_len)
+                *out_kv_len = 0;
+            return (entries_[layer][seq_idx].count == 0); // true if empty, false if error
+        }
+        if (out_k)
+            *out_k = k;
+        if (out_v)
+            *out_v = v;
+        if (out_kv_len)
+            *out_kv_len = entries_[layer][seq_idx].count;
+        return true;
+    }
+
+    template <ActivationPrecision Precision>
+    bool ROCmRingKVCache<Precision>::get_kv(int layer, int seq_idx,
+                                            const ITensor **out_k, const ITensor **out_v,
+                                            int *out_kv_len) const
+    {
+        return const_cast<ROCmRingKVCache<Precision> *>(this)->get_kv(
+            layer, seq_idx,
+            const_cast<ITensor **>(out_k),
+            const_cast<ITensor **>(out_v),
+            out_kv_len);
+    }
+
+    // =========================================================================
+    // RoPE Shadow Buffer Helpers (for get_kv_converted)
+    // =========================================================================
+
+    extern "C" bool hip_rope_apply_fp16(
+        _Float16 *d_K, int count,
+        int n_kv_heads, int head_dim,
+        float rope_theta, int position_start,
+        hipStream_t stream);
+
+    extern "C" bool hip_rope_apply_fp32(
+        float *d_K, int count,
+        int n_kv_heads, int head_dim,
+        float rope_theta, int position_start,
+        hipStream_t stream);
+
+    template <ActivationPrecision Precision>
+    void ROCmRingKVCache<Precision>::ensureRoPEShadow(int layer, int seq_idx) const
+    {
+        if (rope_shadows_.empty())
+        {
+            rope_shadows_.resize(n_layers_);
+            for (auto &layer_shadows : rope_shadows_)
+                layer_shadows.resize(batch_size_);
+        }
+
+        auto &shadow = rope_shadows_[layer][seq_idx];
+        if (!shadow.d_K)
+        {
+            const size_t buf_bytes = static_cast<size_t>(max_seq_len_) * kv_dim_ * sizeof(_Float16);
+            hipSetDevice(device_id_);
+            hipMalloc(&shadow.d_K, buf_bytes);
+            hipMalloc(&shadow.d_V, buf_bytes);
+            shadow.converted_count = 0;
+            shadow.last_head = -1;
+            shadow.rope_applied = false;
+        }
+    }
+
+    template <ActivationPrecision Precision>
+    void ROCmRingKVCache<Precision>::invalidateRoPEShadow(int layer, int seq_idx) const
+    {
+        if (rope_shadows_.empty())
+            return;
+        if (layer < 0 || layer >= n_layers_ || seq_idx < 0 || seq_idx >= batch_size_)
+            return;
+
+        auto &shadow = rope_shadows_[layer][seq_idx];
+        shadow.converted_count = 0;
+        shadow.last_head = -1;
+        shadow.rope_applied = false;
+        shadow.k_view.reset();
+        shadow.v_view.reset();
+    }
+
+    // =========================================================================
+    // get_kv_converted(): FP16 shadow buffers with optional RoPE
+    // =========================================================================
+
+    template <ActivationPrecision Precision>
+    bool ROCmRingKVCache<Precision>::get_kv_converted(
+        int layer, int seq_idx,
+        ActivationPrecision target,
+        ITensor **out_k, ITensor **out_v,
+        int *out_kv_len,
+        const KVReadParams *rope)
+    {
+        (void)target; // We always produce FP16 on GPU
+
+        if (layer < 0 || layer >= n_layers_ || seq_idx < 0 || seq_idx >= batch_size_)
+            return false;
+
+        const auto &entry = entries_[layer][seq_idx];
+        if (entry.count == 0)
+        {
+            if (out_kv_len)
+                *out_kv_len = 0;
+            return true;
+        }
+
+        // If no RoPE requested, fall back to default (raw cache tensors)
+        const bool want_rope = (rope && rope->rope_theta > 0.0f);
+        if (!want_rope)
+        {
+            return get_kv(layer, seq_idx, out_k, out_v, out_kv_len);
+        }
+
+        hipSetDevice(device_id_);
+        const hipStream_t stream = getEffectiveStream(nullptr);
+
+        ensureRoPEShadow(layer, seq_idx);
+        auto &shadow = rope_shadows_[layer][seq_idx];
+
+        // Detect incremental vs full rebuild
+        const int new_tokens = entry.count - shadow.converted_count;
+        const bool need_full_rebuild = (shadow.converted_count == 0 ||
+                                        new_tokens < 0 ||
+                                        shadow.converted_count > entry.count);
+
+        if constexpr (Precision == ActivationPrecision::FP16)
+        {
+            auto *shadow_k = static_cast<_Float16 *>(shadow.d_K);
+            auto *shadow_v = static_cast<_Float16 *>(shadow.d_V);
+
+            if (need_full_rebuild)
+            {
+                int kv_len = 0;
+                if (!linearize_to(layer, seq_idx, shadow_k, shadow_v, &kv_len, stream))
+                    return false;
+
+                hip_rope_apply_fp16(shadow_k, kv_len, local_n_kv_heads_, head_dim_,
+                                    rope->rope_theta, rope->position_start, stream);
+
+                shadow.converted_count = kv_len;
+            }
+            else if (new_tokens > 0)
+            {
+                int kv_len = 0;
+                if (!linearize_to(layer, seq_idx, shadow_k, shadow_v, &kv_len, stream))
+                    return false;
+
+                _Float16 *new_k_start = shadow_k + static_cast<size_t>(shadow.converted_count) * kv_dim_;
+                hip_rope_apply_fp16(new_k_start, new_tokens, local_n_kv_heads_, head_dim_,
+                                    rope->rope_theta,
+                                    rope->position_start + shadow.converted_count, stream);
+
+                shadow.converted_count = kv_len;
+            }
+        }
+        else if constexpr (Precision == ActivationPrecision::FP32)
+        {
+            // FP32 cache → linearize to scratch, apply RoPE, convert to FP16 shadow
+            const size_t row_bytes = static_cast<size_t>(kv_dim_) * sizeof(float);
+            const size_t total_bytes = static_cast<size_t>(entry.count) * row_bytes;
+
+            if (!ensureConvScratch(total_bytes))
+                return false;
+
+            auto *d_temp_k = static_cast<float *>(conv_scratch_k_);
+            auto *d_temp_v = static_cast<float *>(conv_scratch_v_);
+
+            int kv_len = 0;
+            if (!linearize_to(layer, seq_idx, d_temp_k, d_temp_v, &kv_len, stream))
+                return false;
+
+            auto *shadow_k = static_cast<_Float16 *>(shadow.d_K);
+            auto *shadow_v = static_cast<_Float16 *>(shadow.d_V);
+
+            if (need_full_rebuild)
+            {
+                hip_rope_apply_fp32(d_temp_k, kv_len, local_n_kv_heads_, head_dim_,
+                                    rope->rope_theta, rope->position_start, stream);
+
+                hip_convert_tensor_to_fp16(d_temp_k, TensorType::FP32,
+                                           reinterpret_cast<uint16_t *>(shadow_k),
+                                           kv_len * kv_dim_, stream);
+                hip_convert_tensor_to_fp16(d_temp_v, TensorType::FP32,
+                                           reinterpret_cast<uint16_t *>(shadow_v),
+                                           kv_len * kv_dim_, stream);
+            }
+            else if (new_tokens > 0)
+            {
+                const int old_count = shadow.converted_count;
+                float *new_k_start = d_temp_k + static_cast<size_t>(old_count) * kv_dim_;
+                float *new_v_start = d_temp_v + static_cast<size_t>(old_count) * kv_dim_;
+
+                hip_rope_apply_fp32(new_k_start, new_tokens, local_n_kv_heads_, head_dim_,
+                                    rope->rope_theta, rope->position_start + old_count, stream);
+
+                _Float16 *shadow_k_new = shadow_k + static_cast<size_t>(old_count) * kv_dim_;
+                _Float16 *shadow_v_new = shadow_v + static_cast<size_t>(old_count) * kv_dim_;
+
+                hip_convert_tensor_to_fp16(new_k_start, TensorType::FP32,
+                                           reinterpret_cast<uint16_t *>(shadow_k_new),
+                                           new_tokens * kv_dim_, stream);
+                hip_convert_tensor_to_fp16(new_v_start, TensorType::FP32,
+                                           reinterpret_cast<uint16_t *>(shadow_v_new),
+                                           new_tokens * kv_dim_, stream);
+            }
+
+            shadow.converted_count = kv_len;
+        }
+        else if constexpr (Precision == ActivationPrecision::Q8_1)
+        {
+            // Q8_1 cache → linearize to scratch, dequant to FP16 shadow, RoPE
+            const size_t q8_row_bytes = static_cast<size_t>(kv_storage_dim_) * sizeof(Q8_1Block);
+            const size_t q8_total = static_cast<size_t>(entry.count) * q8_row_bytes;
+
+            if (!ensureConvScratch(q8_total))
+                return false;
+
+            auto *d_temp_k = static_cast<Q8_1Block *>(conv_scratch_k_);
+            auto *d_temp_v = static_cast<Q8_1Block *>(conv_scratch_v_);
+
+            int kv_len = 0;
+            if (!linearize_to(layer, seq_idx, d_temp_k, d_temp_v, &kv_len, stream))
+                return false;
+
+            auto *shadow_k = static_cast<_Float16 *>(shadow.d_K);
+            auto *shadow_v = static_cast<_Float16 *>(shadow.d_V);
+
+            if (need_full_rebuild)
+            {
+                hip_convert_tensor_to_fp16(d_temp_k, TensorType::Q8_1,
+                                           reinterpret_cast<uint16_t *>(shadow_k),
+                                           kv_len * kv_dim_, stream);
+                hip_convert_tensor_to_fp16(d_temp_v, TensorType::Q8_1,
+                                           reinterpret_cast<uint16_t *>(shadow_v),
+                                           kv_len * kv_dim_, stream);
+
+                hip_rope_apply_fp16(shadow_k, kv_len, local_n_kv_heads_, head_dim_,
+                                    rope->rope_theta, rope->position_start, stream);
+            }
+            else if (new_tokens > 0)
+            {
+                const int old_count = shadow.converted_count;
+                Q8_1Block *new_k_start = d_temp_k + static_cast<size_t>(old_count) * kv_storage_dim_;
+                Q8_1Block *new_v_start = d_temp_v + static_cast<size_t>(old_count) * kv_storage_dim_;
+
+                _Float16 *shadow_k_new = shadow_k + static_cast<size_t>(old_count) * kv_dim_;
+                _Float16 *shadow_v_new = shadow_v + static_cast<size_t>(old_count) * kv_dim_;
+
+                hip_convert_tensor_to_fp16(new_k_start, TensorType::Q8_1,
+                                           reinterpret_cast<uint16_t *>(shadow_k_new),
+                                           new_tokens * kv_dim_, stream);
+                hip_convert_tensor_to_fp16(new_v_start, TensorType::Q8_1,
+                                           reinterpret_cast<uint16_t *>(shadow_v_new),
+                                           new_tokens * kv_dim_, stream);
+
+                hip_rope_apply_fp16(shadow_k_new, new_tokens, local_n_kv_heads_, head_dim_,
+                                    rope->rope_theta,
+                                    rope->position_start + old_count, stream);
+            }
+
+            shadow.converted_count = kv_len;
+        }
+        else if constexpr (Precision == ActivationPrecision::BF16)
+        {
+            // BF16 → linearize to scratch, convert to FP16 shadow, RoPE
+            const size_t bf16_bytes = static_cast<size_t>(entry.count) * kv_dim_ * sizeof(hip_bfloat16);
+
+            if (!ensureConvScratch(bf16_bytes))
+                return false;
+
+            auto *d_temp_k = static_cast<hip_bfloat16 *>(conv_scratch_k_);
+            auto *d_temp_v = static_cast<hip_bfloat16 *>(conv_scratch_v_);
+
+            int kv_len = 0;
+            if (!linearize_to(layer, seq_idx, d_temp_k, d_temp_v, &kv_len, stream))
+                return false;
+
+            auto *shadow_k = static_cast<_Float16 *>(shadow.d_K);
+            auto *shadow_v = static_cast<_Float16 *>(shadow.d_V);
+
+            if (need_full_rebuild)
+            {
+                hip_convert_tensor_to_fp16(d_temp_k, TensorType::BF16,
+                                           reinterpret_cast<uint16_t *>(shadow_k),
+                                           kv_len * kv_dim_, stream);
+                hip_convert_tensor_to_fp16(d_temp_v, TensorType::BF16,
+                                           reinterpret_cast<uint16_t *>(shadow_v),
+                                           kv_len * kv_dim_, stream);
+
+                hip_rope_apply_fp16(shadow_k, kv_len, local_n_kv_heads_, head_dim_,
+                                    rope->rope_theta, rope->position_start, stream);
+            }
+            else if (new_tokens > 0)
+            {
+                const int old_count = shadow.converted_count;
+                hip_bfloat16 *new_k_start = d_temp_k + static_cast<size_t>(old_count) * kv_dim_;
+                hip_bfloat16 *new_v_start = d_temp_v + static_cast<size_t>(old_count) * kv_dim_;
+
+                _Float16 *shadow_k_new = shadow_k + static_cast<size_t>(old_count) * kv_dim_;
+                _Float16 *shadow_v_new = shadow_v + static_cast<size_t>(old_count) * kv_dim_;
+
+                hip_convert_tensor_to_fp16(new_k_start, TensorType::BF16,
+                                           reinterpret_cast<uint16_t *>(shadow_k_new),
+                                           new_tokens * kv_dim_, stream);
+                hip_convert_tensor_to_fp16(new_v_start, TensorType::BF16,
+                                           reinterpret_cast<uint16_t *>(shadow_v_new),
+                                           new_tokens * kv_dim_, stream);
+
+                hip_rope_apply_fp16(shadow_k_new, new_tokens, local_n_kv_heads_, head_dim_,
+                                    rope->rope_theta,
+                                    rope->position_start + old_count, stream);
+            }
+
+            shadow.converted_count = kv_len;
+        }
+
+        shadow.last_head = entry.head;
+        shadow.rope_applied = true;
+
+        // Create/update GpuTensorViews for the shadow buffers
+        if (!shadow.k_view || shadow.k_view->shape()[0] != static_cast<size_t>(shadow.converted_count))
+        {
+            shadow.k_view = std::make_unique<GpuTensorView>(
+                shadow.d_K, shadow.converted_count, kv_dim_,
+                TensorType::FP16, device_id_);
+        }
+        if (!shadow.v_view || shadow.v_view->shape()[0] != static_cast<size_t>(shadow.converted_count))
+        {
+            shadow.v_view = std::make_unique<GpuTensorView>(
+                shadow.d_V, shadow.converted_count, kv_dim_,
+                TensorType::FP16, device_id_);
+        }
+
+        if (out_k)
+            *out_k = shadow.k_view.get();
+        if (out_v)
+            *out_v = shadow.v_view.get();
+        if (out_kv_len)
+            *out_kv_len = shadow.converted_count;
+
+        return true;
     }
 
     // =========================================================================

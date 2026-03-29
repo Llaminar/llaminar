@@ -5,3 +5,6 @@ cnpy/
 # RCCL - auto-cloned and built by CMake (ROCm collective communications)
 # Ubuntu's packaged RCCL has broken gfx906 (MI50/MI60) support, so we build from source
 rccl/
+# amdgpu DKMS - auto-cloned from our fork with P2P fix for PCIe switches on mainline kernels
+# See: https://github.com/dbsanfte/amdgpu/tree/fix/pex-pcie-switch-p2p-enable
+amdgpu/

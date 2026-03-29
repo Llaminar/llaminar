@@ -910,8 +910,8 @@ namespace llaminar2
                 }
 
                 // Stage timeline: GPU is now synced, collect and print event timings
-                // Gated on LLAMINAR_PROFILING=1 to avoid unconditional output.
-                if (debugEnv().gpu_stage_timing && debugEnv().profile.enabled && !suppress_timeline_ && ctx->deviceId().is_gpu())
+                // Prints when LLAMINAR_GPU_STAGE_TIMING=1 (does not require LLAMINAR_PROFILING).
+                if (debugEnv().gpu_stage_timing && !suppress_timeline_ && ctx->deviceId().is_gpu())
                 {
                     auto &timeline = executor_.stageTimeline();
                     auto &pool = GPUDeviceContextPool::instance();
@@ -927,6 +927,12 @@ namespace llaminar2
                     {
                         // Accumulate decode iterations — print once via flushStageTimeline()
                         timeline.accumulateIteration(wall_ms);
+                    }
+                    else if (accumulate_prefill_)
+                    {
+                        // Accumulate prefill iterations — print once via flushStageTimeline() (benchmark mode)
+                        int tokens = input.batch_size * input.seq_len;
+                        timeline.accumulatePrefillIteration(wall_ms, tokens);
                     }
                     else
                     {
@@ -1144,8 +1150,8 @@ namespace llaminar2
             }
 
             // GPU stage timing for cache-miss path
-            // Gated on LLAMINAR_PROFILING=1 to avoid unconditional output.
-            if (debugEnv().gpu_stage_timing && debugEnv().profile.enabled && !suppress_timeline_ && input.device.is_gpu())
+            // Prints when LLAMINAR_GPU_STAGE_TIMING=1 (does not require LLAMINAR_PROFILING).
+            if (debugEnv().gpu_stage_timing && !suppress_timeline_ && input.device.is_gpu())
             {
                 auto &timeline = executor_.stageTimeline();
                 if (timeline.isInitialized())
@@ -1162,6 +1168,12 @@ namespace llaminar2
                     {
                         // Accumulate decode iterations — print once via flushStageTimeline()
                         timeline.accumulateIteration(wall_ms);
+                    }
+                    else if (accumulate_prefill_)
+                    {
+                        // Accumulate prefill iterations — print once via flushStageTimeline() (benchmark mode)
+                        int tokens = input.batch_size * input.seq_len;
+                        timeline.accumulatePrefillIteration(wall_ms, tokens);
                     }
                     else
                     {
@@ -1288,7 +1300,6 @@ namespace llaminar2
         const auto &env = debugEnv();
         policy.allow_fast_decode =
             env.execution.fast_decode &&
-            !env.execution.executor_profiling &&
             !executor_.config().snapshot_callback;
 
         if (!policy.allow_fast_decode)
@@ -1334,8 +1345,15 @@ namespace llaminar2
             policy.collectives_graph_capturable ||
             policy.collective_segmented_enabled;
 
+        // When profiling is enabled (LLAMINAR_PROFILING=1), disable GPU graph
+        // capture/replay so decode runs through executeFastDecode(). This ensures
+        // StageTimeline GPU events are recorded for every stage on every iteration,
+        // giving accurate per-stage-type GPU timing. Without this, segmented replay
+        // runs hipGraphLaunch() which bypasses per-stage event recording, causing
+        // the accumulated timeline to report ~0 GPU time for Phase 3 iterations.
         policy.allow_segmented_capture =
             env.execution.gpu_graphs &&
+            !env.execution.executor_profiling &&
             ctx && ctx->isGPU() &&
             can_use_segmented_graph &&
             segment_consecutive_failures < DeviceGraphExecutor::GraphSegmentCache::kMaxFailures;

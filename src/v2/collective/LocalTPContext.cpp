@@ -574,6 +574,18 @@ namespace llaminar2
         }
 
         // ================================================================
+        // CPU-Only TP: Barrier-synchronized host-memory allreduce
+        // ================================================================
+        // For LOCAL TP with all-CPU devices (multi-socket NUMA), each worker
+        // thread has its tensor in host memory. Use barrier synchronization
+        // to collect host pointers and reduce in-place.
+        if (backend_ == CollectiveBackendType::HOST && degree() > 1)
+        {
+            lock.unlock();
+            return allreduceCpuBarrier(tensor, stage_name, effective_count);
+        }
+
+        // ================================================================
         // Multi-GPU Backends (NCCL/RCCL): Use barrier-synchronized allreduce
         // ================================================================
         // For LOCAL TP with multiple threads (one per device), each thread calls
@@ -858,7 +870,7 @@ namespace llaminar2
 #endif
                         if (back_ok)
                         {
-                            tensor->mark_device_dirty_flags_only();
+                            tensor->mark_device_dirty_with_event(stream);
                             return true;
                         }
                         LOG_WARN("LocalTPContext: FP16→FP32 cast-back failed, data may be corrupt");
@@ -877,8 +889,9 @@ namespace llaminar2
 
         if (success)
         {
-            // Mark tensor dirty (the allreduce result is on-device)
-            tensor->mark_device_dirty_flags_only();
+            // Mark tensor dirty and record completion event on the allreduce stream.
+            // This ensures ensureOnHost() waits for the allreduce to finish before D2H.
+            tensor->mark_device_dirty_with_event(stream);
             return true;
         }
 
@@ -989,6 +1002,15 @@ namespace llaminar2
         if (!backend_initialized_ || !backend_impl_)
         {
             return true;
+        }
+
+        // CPU-only TP: use host pointer with single-buffer allreduce
+        if (backend_ == CollectiveBackendType::HOST)
+        {
+            float *buffer = tensor->mutable_data();
+            size_t count = tensor->numel();
+            CollectiveDataType dtype = tensorDTypeToCollective(tensor);
+            return backend_impl_->allreduce(buffer, count, dtype, CollectiveOp::ALLREDUCE_SUM);
         }
 
         if (backend_impl_->isMultiGpuSingleProcess())
@@ -1267,6 +1289,215 @@ namespace llaminar2
                   "falling back to barrier path for stage="
                   << stage_name);
         return allreduceWithBarrierMultiGpu(tensor, stage_name, count);
+    }
+
+    // =========================================================================
+    // CPU-Only Barrier-Synchronized Allreduce
+    // =========================================================================
+    //
+    // For LOCAL TP where all devices are CPU (multi-socket NUMA), each worker
+    // thread has its tensor in host memory. We use barrier synchronization to:
+    // 1. Collect host pointers from all threads
+    // 2. Have the last-arriving thread perform element-wise reduction
+    // 3. Broadcast result to all participants
+    // =========================================================================
+
+    bool LocalTPContext::allreduceCpuBarrier(TensorBase *tensor, const std::string &stage_name, size_t count)
+    {
+        const int num_participants = degree();
+
+        std::unique_lock<std::mutex> lock(barrier_mutex_);
+        uint64_t my_generation = barrier_generation_.load();
+        int arrival_order = barrier_count_.fetch_add(1);
+
+        if (arrival_order == 0)
+        {
+            barrier_tensors_.clear();
+            barrier_tensors_.resize(num_participants, nullptr);
+            barrier_element_count_ = count;
+            barrier_stage_name_ = stage_name;
+            LOG_DEBUG("LocalTPContext::allreduceCpuBarrier: First arrival, "
+                      << "stage=" << (stage_name.empty() ? "(none)" : stage_name)
+                      << ", count=" << count
+                      << ", waiting for " << (num_participants - 1) << " more CPU devices");
+        }
+
+        // Use arrival_order for slot assignment (sum is commutative, order doesn't matter)
+        barrier_tensors_[arrival_order] = tensor;
+
+        if (arrival_order + 1 < num_participants)
+        {
+            // Wait for the last arrival to complete the reduction
+            const auto BARRIER_TIMEOUT = first_barrier_completed_.load()
+                                             ? std::chrono::seconds(30)
+                                             : std::chrono::seconds(120);
+
+            bool completed = barrier_cv_.wait_for(lock, BARRIER_TIMEOUT, [this, my_generation]()
+                                                  { return barrier_generation_.load() > my_generation; });
+
+            if (!completed)
+            {
+                int timeout_secs = first_barrier_completed_.load() ? 30 : 120;
+                LOG_ERROR("LocalTPContext::allreduceCpuBarrier: TIMEOUT after " << timeout_secs
+                                                                                << "s waiting for barrier! "
+                                                                                << "arrival_order=" << arrival_order
+                                                                                << ", expected=" << num_participants);
+                barrier_count_.store(0);
+                barrier_generation_.fetch_add(1);
+                barrier_tensors_.clear();
+                barrier_stage_name_.clear();
+                barrier_element_count_ = 0;
+
+                lock.unlock();
+                barrier_cv_.notify_all();
+                return false;
+            }
+
+            return barrier_result_;
+        }
+
+        // =================================================================
+        // LAST ARRIVAL: Perform host-memory allreduce
+        // =================================================================
+        size_t effective_count = barrier_element_count_;
+        if (effective_count == 0 && barrier_tensors_[0])
+            effective_count = barrier_tensors_[0]->numel();
+
+        LOG_DEBUG("LocalTPContext::allreduceCpuBarrier: All " << num_participants
+                                                              << " CPU devices arrived, reducing "
+                                                              << effective_count << " elements");
+
+        // Use tensor[0] as accumulator
+        float *accum = barrier_tensors_[0]->mutable_data();
+
+        // Sum contributions from all other tensors
+        for (int i = 1; i < num_participants; ++i)
+        {
+            const float *src = barrier_tensors_[i]->data();
+            for (size_t j = 0; j < effective_count; ++j)
+            {
+                accum[j] += src[j];
+            }
+        }
+
+        // Copy reduced result to all other tensors
+        for (int i = 1; i < num_participants; ++i)
+        {
+            float *dst = barrier_tensors_[i]->mutable_data();
+            std::memcpy(dst, accum, effective_count * sizeof(float));
+        }
+
+        // Cleanup and release waiters
+        barrier_result_ = true;
+        first_barrier_completed_.store(true);
+        barrier_tensors_.clear();
+        barrier_stage_name_.clear();
+        barrier_element_count_ = 0;
+        barrier_count_.store(0);
+        barrier_generation_.fetch_add(1);
+
+        LOG_DEBUG("LocalTPContext::allreduceCpuBarrier: CPU allreduce completed successfully");
+
+        lock.unlock();
+        barrier_cv_.notify_all();
+        return true;
+    }
+
+    // =========================================================================
+    // CPU-Only Barrier-Synchronized Allgather
+    // =========================================================================
+
+    bool LocalTPContext::allgatherCpuBarrier(const TensorBase *local_shard, TensorBase *global_tensor)
+    {
+        const int num_participants = degree();
+
+        // NOTE: For CPU TP, all tensors have the same generic home_device "CPU"
+        // (no NUMA distinction), so we cannot determine device_index from the tensor.
+        // We use arrival_order for slot assignment. This means shard ordering depends
+        // on thread arrival order, which is non-deterministic.
+        // In practice, this method is currently dead code for LOCAL CPU TP because
+        // MultiDeviceOrchestrator::gatherLogits() handles LM head vocab gathering
+        // directly at the orchestrator level, bypassing LocalTPContext::allgather().
+        // If this method is ever used in a context where shard ordering matters,
+        // a thread-safe device identification mechanism will be needed.
+
+        std::unique_lock<std::mutex> lock(barrier_mutex_);
+        uint64_t my_generation = barrier_generation_.load();
+        int arrival_order = barrier_count_.fetch_add(1);
+
+        if (arrival_order == 0)
+        {
+            barrier_tensors_.clear();
+            barrier_tensors_.resize(num_participants, nullptr);
+            barrier_element_count_ = local_shard->numel(); // elements per shard
+            barrier_stage_name_ = "allgather_cpu";
+            LOG_DEBUG("LocalTPContext::allgatherCpuBarrier: First arrival, "
+                      << "shard_elements=" << local_shard->numel()
+                      << ", waiting for " << (num_participants - 1) << " more CPU devices");
+        }
+
+        // Store the shard using arrival_order (const_cast safe: we only read from it)
+        barrier_tensors_[arrival_order] = const_cast<TensorBase *>(local_shard);
+
+        if (arrival_order + 1 < num_participants)
+        {
+            const auto BARRIER_TIMEOUT = first_barrier_completed_.load()
+                                             ? std::chrono::seconds(30)
+                                             : std::chrono::seconds(120);
+
+            bool completed = barrier_cv_.wait_for(lock, BARRIER_TIMEOUT, [this, my_generation]()
+                                                  { return barrier_generation_.load() > my_generation; });
+
+            if (!completed)
+            {
+                LOG_ERROR("LocalTPContext::allgatherCpuBarrier: TIMEOUT");
+                barrier_count_.store(0);
+                barrier_generation_.fetch_add(1);
+                barrier_tensors_.clear();
+                barrier_stage_name_.clear();
+                barrier_element_count_ = 0;
+                lock.unlock();
+                barrier_cv_.notify_all();
+                return false;
+            }
+
+            // After barrier release, the last arrival has already written
+            // the gathered result to its own global_tensor. In typical LOCAL TP
+            // usage, all threads share the same combined_logits_ buffer through
+            // the orchestrator, so no additional copy is needed.
+            return barrier_result_;
+        }
+
+        // =================================================================
+        // LAST ARRIVAL: Concatenate all shards
+        // =================================================================
+        size_t shard_elements = barrier_element_count_;
+
+        LOG_DEBUG("LocalTPContext::allgatherCpuBarrier: All " << num_participants
+                                                              << " CPU devices arrived, gathering "
+                                                              << shard_elements << " elements each");
+
+        // Concatenate all shards into global_tensor
+        float *output = global_tensor->mutable_data();
+        for (int i = 0; i < num_participants; ++i)
+        {
+            const float *shard_data = barrier_tensors_[i]->data();
+            std::memcpy(output + (i * shard_elements), shard_data, shard_elements * sizeof(float));
+        }
+
+        barrier_result_ = true;
+        first_barrier_completed_.store(true);
+        barrier_tensors_.clear();
+        barrier_stage_name_.clear();
+        barrier_element_count_ = 0;
+        barrier_count_.store(0);
+        barrier_generation_.fetch_add(1);
+
+        LOG_DEBUG("LocalTPContext::allgatherCpuBarrier: CPU allgather completed");
+
+        lock.unlock();
+        barrier_cv_.notify_all();
+        return true;
     }
 
     bool LocalTPContext::allreduceWithBarrierMultiGpu(TensorBase *tensor, const std::string &stage_name, size_t count)
@@ -2570,7 +2801,7 @@ namespace llaminar2
             return false;
         }
 
-        std::lock_guard<std::mutex> lock(mutex_);
+        std::unique_lock<std::mutex> lock(mutex_);
 
         // Single device - just copy
         if (degree() == 1)
@@ -2592,6 +2823,15 @@ namespace llaminar2
             size_t count = std::min(local_shard->numel(), global_tensor->numel());
             std::memcpy(dst, src, count * sizeof(float));
             return true;
+        }
+
+        // CPU-only TP: Use barrier-synchronized host-memory allgather
+        if (backend_ == CollectiveBackendType::HOST && degree() > 1)
+        {
+            // Release the main mutex before entering barrier (barrier has its own mutex)
+            // to avoid deadlock: all threads must arrive at barrier, but mutex_ is exclusive.
+            lock.unlock();
+            return allgatherCpuBarrier(local_shard, global_tensor);
         }
 
         // For LOCAL TP with Multi-GPU:

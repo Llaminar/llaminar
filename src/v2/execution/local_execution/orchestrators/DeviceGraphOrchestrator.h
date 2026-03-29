@@ -856,15 +856,25 @@ namespace llaminar2
 
         void setSuppressTimeline(bool suppress) override { suppress_timeline_ = suppress; }
 
+        void setAccumulatePrefill(bool accumulate) override { accumulate_prefill_ = accumulate; }
+
         void flushStageTimeline() override
         {
-            if (!debugEnv().gpu_stage_timing || !debugEnv().profile.enabled)
+            if (!debugEnv().gpu_stage_timing)
                 return;
 
             auto &timeline = executor_.stageTimeline();
+            std::string dev_str = state_.device_id.toString();
+
+            // Print accumulated prefill summary if any
+            if (timeline.hasAccumulatedPrefillData())
+            {
+                timeline.printAccumulatedPrefillSummary(dev_str.c_str());
+            }
+
+            // Print accumulated decode summary if any
             if (timeline.hasAccumulatedData())
             {
-                std::string dev_str = state_.device_id.toString();
                 timeline.printAccumulatedSummary("DECODE", dev_str.c_str());
             }
         }
@@ -2039,6 +2049,9 @@ namespace llaminar2
 
         /// When true, GPU stage timeline output is suppressed (warmup runs)
         bool suppress_timeline_ = false;
+
+        /// When true, prefill timelines are accumulated instead of printed immediately (benchmark mode)
+        bool accumulate_prefill_ = false;
 
         /// Inference state (Phase 5 - owned buffers)
         InferenceState state_;

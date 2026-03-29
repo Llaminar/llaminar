@@ -454,6 +454,34 @@ namespace llaminar2
         bool allreducePerDeviceOrBarrier(TensorBase *tensor, const std::string &stage_name = "", size_t count = 0);
 
         /**
+         * @brief Barrier-synchronized allreduce for CPU-only TP
+         *
+         * For LOCAL TP where all devices are CPU (e.g., multi-socket NUMA),
+         * each worker thread has its tensor in host memory. This method uses
+         * barrier synchronization to collect host pointers, performs element-wise
+         * reduction on the last-arriving thread, and broadcasts the result to all.
+         *
+         * @param tensor This thread's tensor (in host memory)
+         * @param stage_name Stage identifier for logging (optional)
+         * @param count Number of elements to reduce (0 = use tensor->numel())
+         * @return true on success (same result for all participants)
+         */
+        bool allreduceCpuBarrier(TensorBase *tensor, const std::string &stage_name = "", size_t count = 0);
+
+        /**
+         * @brief Barrier-synchronized allgather for CPU-only TP
+         *
+         * For LOCAL TP where all devices are CPU, each worker thread contributes
+         * its local shard. The last-arriving thread concatenates all shards into
+         * each thread's global output tensor.
+         *
+         * @param local_shard This thread's local shard (in host memory)
+         * @param global_tensor Output tensor to receive all gathered shards
+         * @return true on success (same result for all participants)
+         */
+        bool allgatherCpuBarrier(const TensorBase *local_shard, TensorBase *global_tensor);
+
+        /**
          * @brief Validate barrier-collected tensors before multi-GPU allreduce launch.
          *
          * This method enforces correctness invariants that protect against subtle

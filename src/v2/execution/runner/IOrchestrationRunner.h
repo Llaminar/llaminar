@@ -356,6 +356,7 @@ namespace llaminar2
         virtual void setSkipLogitsGatherPrefill(bool /*skip*/) {}
 
         virtual void setSuppressTimeline(bool /*suppress*/) {}
+        virtual void setAccumulatePrefill(bool /*accumulate*/) {}
 
         virtual void flushStageTimeline() {}
 

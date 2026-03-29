@@ -69,27 +69,27 @@ namespace llaminar2
         // Resolve count: 0 means use tensor->numel()
         const size_t effective_count = (params_.count > 0) ? params_.count : params_.tensor->numel();
 
-        const auto tensor_current_device = params_.tensor->current_device();
-#ifdef HAVE_ROCM
-        int current_hip_device = -1;
-        if (hipGetDevice(&current_hip_device) != hipSuccess)
-        {
-            current_hip_device = -1;
-        }
-#else
-        const int current_hip_device = -1;
-#endif
         LOG_DEBUG("TPAllreduceStage: tensor diagnostics"
-                  << " stage_name=" << (params_.stage_name.empty() ? "(none)" : params_.stage_name)
-                  << " tensor=" << static_cast<void *>(params_.tensor)
-                  << " tensor_name=" << (params_.tensor->debugName().empty() ? "(unnamed)" : params_.tensor->debugName())
-                  << " home_device=" << params_.tensor->home_device().toString()
-                  << " current_device=" << (tensor_current_device.has_value() ? tensor_current_device->toString() : "none")
-                  << " stage_stream=" << gpuStream()
-                  << " hip_current_device=" << current_hip_device
-                  << " gpu_ptr=" << params_.tensor->gpu_data_ptr()
-                  << " count=" << effective_count
-                  << " tensor_numel=" << params_.tensor->numel());
+                      << " stage_name=" << (params_.stage_name.empty() ? "(none)" : params_.stage_name)
+                      << " tensor=" << static_cast<void *>(params_.tensor)
+                      << " tensor_name=" << (params_.tensor->debugName().empty() ? "(unnamed)" : params_.tensor->debugName())
+                      << " home_device=" << params_.tensor->home_device().toString()
+                      << " current_device=" << (params_.tensor->current_device().has_value() ? params_.tensor->current_device()->toString() : "none")
+                      << " stage_stream=" << gpuStream()
+                      << " hip_current_device=" << [&]() -> int
+                                                                {
+#ifdef HAVE_ROCM
+                                                                    int dev = -1;
+                                                                    if (hipGetDevice(&dev) != hipSuccess)
+                                                                        dev = -1;
+                                                                    return dev;
+#else
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        return -1;
+#endif
+                                                                }()
+                                                                << " gpu_ptr=" << params_.tensor->gpu_data_ptr()
+                                                                << " count=" << effective_count
+                                                                << " tensor_numel=" << params_.tensor->numel());
 
         // Log scope-aware message
         const char *scope_str = params_.tp_ctx->isGlobal() ? "GLOBAL" : "LOCAL";
@@ -130,19 +130,9 @@ namespace llaminar2
             LOG_ERROR("TPAllreduceStage (" << scope_str << "): allreduce failed");
         }
 
-        // Record a completion event so that ensureOnHost() waits for the
-        // allreduce to finish before doing D2H.  Without this, the stale
-        // event from the preceding GEMM stage causes ensureOnHost() to
-        // copy pre-allreduce data (the old event fires before the NCCL
-        // kernel completes on this stream).
-        if (success)
-        {
-            auto *tensor_base = dynamic_cast<TensorBase *>(params_.tensor);
-            if (tensor_base)
-            {
-                tensor_base->mark_device_dirty_with_event(stage_stream);
-            }
-        }
+        // Dirty-marking is handled by LocalTPContext::allreduceOnStream() which
+        // calls mark_device_dirty_with_event(stream) to record a completion event.
+        // This ensures ensureOnHost() waits for the allreduce to finish before D2H.
 
         return success;
     }

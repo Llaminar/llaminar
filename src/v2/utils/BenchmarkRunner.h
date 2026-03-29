@@ -102,7 +102,7 @@ namespace llaminar2
          * @brief Print benchmark results in a formatted table
          * @param result Benchmark results to print
          */
-        void printResults(const BenchmarkResult &result) const;
+        void printResults(const BenchmarkResult &result);
 
     private:
         std::shared_ptr<IInferenceRunner> runner_;
@@ -129,7 +129,6 @@ namespace llaminar2
          * @return Tuple of (success, time_ms, tokens_generated, generated_text)
          */
         std::tuple<bool, double, int, std::string> runDecode(int n_tokens, int eos_token_id);
-
     };
 
 } // namespace llaminar2

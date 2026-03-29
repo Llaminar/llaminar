@@ -5596,6 +5596,17 @@ add_v2_test(V2_Integration_LocalTPContextBarrier
     MPI_PROCS 1
 )
 
+# Test: LocalTPContext CPU Barrier (HOST backend regression tests)
+# Regression tests for CPU TP with HOST backend barrier-synchronized collectives.
+# Covers: gpu_data_ptr nullptr crash, device_index slot collision, allgather deadlock.
+add_executable(v2_test_local_tp_context_cpu_barrier unit/collective/Test__LocalTPContext_CpuBarrier.cpp)
+target_link_libraries(v2_test_local_tp_context_cpu_barrier PRIVATE llaminar2_core GTest::gtest_main)
+add_v2_test(V2_Unit_LocalTPContext_CpuBarrier
+    COMMAND $<TARGET_FILE:v2_test_local_tp_context_cpu_barrier>
+    LABELS "V2;Unit;LocalTP;CpuBarrier;HOST;Allreduce;Allgather;Regression;Collective"
+    MPI_PROCS 1
+)
+
 # Test: LocalTPContext BAR-backed Tensor Management
 # Tests registration and lookup of BAR-backed tensors for zero-copy allreduce
 # Phase 2 of PCIeBAR zero-copy allreduce implementation

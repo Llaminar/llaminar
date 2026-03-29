@@ -34,6 +34,7 @@
 #include "../../../utils/CUDAKernelProfiler.h"         // Phase propagation to worker threads
 #include "../../../utils/KVCacheProfiler.h"            // Phase propagation to worker threads
 #include "../../mpi_orchestration/RankExecutionPlan.h" // For Config::fromPlan()
+#include "fort.hpp"                                    // libfort for TP profiling summary table
 #include <algorithm>
 #include <future>
 #include <iomanip>
@@ -1341,6 +1342,21 @@ namespace llaminar2
 
                     // Merge overhead breakdown
                     aggregated_stats_->overhead += stats->overhead;
+
+                    // Merge phase-split stats (prefill / decode)
+                    auto mergePhase = [](PhaseStats &dst, const PhaseStats &src)
+                    {
+                        dst.total_execute_ms += src.total_execute_ms;
+                        dst.total_stages_executed += src.total_stages_executed;
+                        dst.total_collective_ms += src.total_collective_ms;
+                        dst.total_collective_calls += src.total_collective_calls;
+                        for (const auto &[type_name, time_ms] : src.stage_type_execute_ms)
+                            dst.stage_type_execute_ms[type_name] += time_ms;
+                        for (const auto &[type_name, cnt] : src.stage_type_counts)
+                            dst.stage_type_counts[type_name] += cnt;
+                    };
+                    mergePhase(aggregated_stats_->prefill, stats->prefill);
+                    mergePhase(aggregated_stats_->decode, stats->decode);
                 }
             }
         }
@@ -1377,6 +1393,21 @@ namespace llaminar2
             aggregated_stats_->overhead.verify_ms /= dcount;
             aggregated_stats_->overhead.callback_ms /= dcount;
             aggregated_stats_->overhead.get_dump_info_ms /= dcount;
+
+            // Average phase stats (devices run in parallel)
+            auto avgPhase = [dcount, count](PhaseStats &ps)
+            {
+                ps.total_execute_ms /= dcount;
+                ps.total_stages_executed /= count;
+                ps.total_collective_ms /= dcount;
+                ps.total_collective_calls /= count;
+                for (auto &[_, ms] : ps.stage_type_execute_ms)
+                    ms /= dcount;
+                for (auto &[_, cnt] : ps.stage_type_counts)
+                    cnt /= count;
+            };
+            avgPhase(aggregated_stats_->prefill);
+            avgPhase(aggregated_stats_->decode);
         }
 
         stats_dirty_ = false;
@@ -1416,18 +1447,21 @@ namespace llaminar2
             return false;
         }
 
-        // TP timing diagnostic — enabled via LLAMINAR_TP_TIMING=1
+        // TP timing diagnostic — enabled via LLAMINAR_TP_TIMING=1 or LLAMINAR_PROFILING=1
         const bool tp_timing = debugEnv().tp_timing;
-        auto tp_t0 = tp_timing ? std::chrono::high_resolution_clock::now()
-                               : std::chrono::high_resolution_clock::time_point{};
+        const bool tp_profiling = debugEnv().execution.executor_profiling;
+        const bool collect_timing = tp_timing || tp_profiling;
+        auto tp_t0 = collect_timing ? std::chrono::high_resolution_clock::now()
+                                    : std::chrono::high_resolution_clock::time_point{};
 
         LOG_DEBUG("MultiDeviceOrchestrator::forwardTP: seq_len=" << seq_len
                                                                  << ", devices=" << device_runners_.size());
 
         // Decode latency breakdown timing
-        const bool decode_breakdown = tp_timing && seq_len == 1;
+        const bool decode_breakdown = collect_timing && seq_len == 1;
         auto launch_t0 = decode_breakdown ? std::chrono::high_resolution_clock::now()
                                           : std::chrono::high_resolution_clock::time_point{};
+        auto launch_t1 = launch_t0; // Set properly after dispatch in parallel mode
 
         // DIAGNOSTIC: Run forward passes SEQUENTIALLY to test if concurrency causes crash.
         // If sequential execution works but parallel crashes, it's a concurrent HIP issue.
@@ -1505,15 +1539,17 @@ namespace llaminar2
             auto rocm_phase = ROCmKernelProfiler::getCurrentPhase();
             auto cuda_phase = CUDAKernelProfiler::getCurrentPhase();
             auto kv_phase = KVCacheProfiler::getCurrentPhase();
+            auto executor_phase = GraphExecutorStats::currentPhase();
 
             tp_worker_pool_->dispatch(
-                [this, tokens, seq_len, kernel_phase, rocm_phase, cuda_phase, kv_phase](size_t i) -> bool
+                [this, tokens, seq_len, kernel_phase, rocm_phase, cuda_phase, kv_phase, executor_phase](size_t i) -> bool
                 {
                     // Propagate profiler phases from caller thread
                     KernelProfiler::setCurrentPhase(kernel_phase);
                     ROCmKernelProfiler::setCurrentPhase(rocm_phase);
                     CUDAKernelProfiler::setCurrentPhase(cuda_phase);
                     KVCacheProfiler::setCurrentPhase(kv_phase);
+                    GraphExecutorStats::setCurrentPhase(executor_phase);
 
                     // Set per-device profiler context so ROCm/CUDA profilers
                     // can attribute kernel times to specific GPUs
@@ -1525,8 +1561,8 @@ namespace llaminar2
                     return runner_iface->forward(tokens, seq_len);
                 });
 
-            auto launch_t1 = decode_breakdown ? std::chrono::high_resolution_clock::now()
-                                              : std::chrono::high_resolution_clock::time_point{};
+            launch_t1 = decode_breakdown ? std::chrono::high_resolution_clock::now()
+                                         : std::chrono::high_resolution_clock::time_point{};
 
             // Collect results from all workers.
             // Default: wait indefinitely (tp_collect_timeout_ms=0). Workers always
@@ -1630,10 +1666,13 @@ namespace llaminar2
                 double total_us = std::chrono::duration<double, std::micro>(
                                       collect_t1 - launch_t0)
                                       .count();
-                LOG_INFO("[DECODE_BREAKDOWN] launch=" << std::fixed << std::setprecision(1)
-                                                      << launch_us << "us"
-                                                      << " wait=" << wait_us << "us"
-                                                      << " total=" << total_us << "us");
+                if (tp_timing)
+                {
+                    LOG_INFO("[DECODE_BREAKDOWN] launch=" << std::fixed << std::setprecision(1)
+                                                          << launch_us << "us"
+                                                          << " wait=" << wait_us << "us"
+                                                          << " total=" << total_us << "us");
+                }
             }
         }
 
@@ -1645,8 +1684,8 @@ namespace llaminar2
             std::rethrow_exception(first_exception);
         }
 
-        auto tp_t1 = tp_timing ? std::chrono::high_resolution_clock::now()
-                               : std::chrono::high_resolution_clock::time_point{};
+        auto tp_t1 = collect_timing ? std::chrono::high_resolution_clock::now()
+                                    : std::chrono::high_resolution_clock::time_point{};
 
         if (all_success)
         {
@@ -1691,16 +1730,40 @@ namespace llaminar2
             stats_dirty_ = true;
         }
 
-        if (tp_timing)
+        if (collect_timing)
         {
             auto tp_t2 = std::chrono::high_resolution_clock::now();
             double forward_ms = std::chrono::duration<double, std::milli>(tp_t1 - tp_t0).count();
             double gather_ms = std::chrono::duration<double, std::milli>(tp_t2 - tp_t1).count();
             double total_ms = std::chrono::duration<double, std::milli>(tp_t2 - tp_t0).count();
-            LOG_INFO("[TP_TIMING] seq_len=" << seq_len
-                                            << " forward=" << std::fixed << std::setprecision(3) << forward_ms << "ms"
-                                            << " gather=" << std::fixed << std::setprecision(3) << gather_ms << "ms"
-                                            << " total=" << std::fixed << std::setprecision(3) << total_ms << "ms");
+
+            if (tp_timing)
+            {
+                LOG_INFO("[TP_TIMING] seq_len=" << seq_len
+                                                << " forward=" << std::fixed << std::setprecision(3) << forward_ms << "ms"
+                                                << " gather=" << std::fixed << std::setprecision(3) << gather_ms << "ms"
+                                                << " total=" << std::fixed << std::setprecision(3) << total_ms << "ms");
+            }
+
+            // Accumulate TP decode stats for profiling summary at benchmark end.
+            // dispatch_ms = time to wake workers, wait_ms = time blocked on collect.
+            // These are computed from DECODE_BREAKDOWN timestamps which are only
+            // available in parallel (non-serialized) mode for decode (seq_len==1).
+            if (tp_profiling && seq_len == 1)
+            {
+                double dispatch_ms = 0, wait_ms = 0;
+                if (decode_breakdown && !serialize_devices)
+                {
+                    dispatch_ms = std::chrono::duration<double, std::milli>(launch_t1 - launch_t0).count();
+                    wait_ms = std::chrono::duration<double, std::milli>(tp_t1 - launch_t1).count();
+                }
+                else
+                {
+                    // Serial mode or timing unavailable: entire forward time is wait
+                    wait_ms = forward_ms;
+                }
+                tp_decode_stats_.record(total_ms, dispatch_ms, wait_ms, gather_ms);
+            }
         }
 
         return all_success;
@@ -3000,6 +3063,7 @@ namespace llaminar2
         {
             aggregated_stats_->reset();
         }
+        tp_decode_stats_.reset();
         stats_dirty_ = true;
     }
 
@@ -3105,10 +3169,88 @@ namespace llaminar2
             runner->setSuppressTimeline(suppress);
     }
 
-    void MultiDeviceOrchestrator::flushStageTimeline()
+    void MultiDeviceOrchestrator::setAccumulatePrefill(bool accumulate)
     {
         for (auto &runner : device_runners_)
+            runner->setAccumulatePrefill(accumulate);
+    }
+
+    void MultiDeviceOrchestrator::flushStageTimeline()
+    {
+        // Print per-device GPU stage timelines
+        for (auto &runner : device_runners_)
             runner->flushStageTimeline();
+
+        // Print TP orchestrator decode summary if profiling data was collected
+        if (tp_decode_stats_.iterations > 0)
+        {
+            const size_t n = tp_decode_stats_.iterations;
+            const double avg_wall = tp_decode_stats_.total_wall_ms / n;
+            const double avg_dispatch = tp_decode_stats_.total_dispatch_ms / n;
+            const double avg_wait = tp_decode_stats_.total_wait_ms / n;
+            const double avg_gather = tp_decode_stats_.total_gather_ms / n;
+            // "Other" captures orchestrator overhead not attributed to
+            // dispatch/wait/gather: exception checking, position tracking,
+            // condition evaluation, etc.
+            const double avg_other = avg_wall - avg_dispatch - avg_wait - avg_gather;
+
+            fort::utf8_table table;
+            table.set_border_style(FT_DOUBLE2_STYLE);
+
+            // Title row
+            {
+                std::ostringstream title;
+                title << "TP DECODE ORCHESTRATOR PROFILING"
+                      << " (avg of " << n << " decode steps, "
+                      << device_runners_.size() << " devices)";
+                table << title.str() << "" << "" << fort::endr;
+                table[0][0].set_cell_span(3);
+                table[0][0].set_cell_text_align(fort::text_align::center);
+            }
+
+            // Summary
+            {
+                std::ostringstream info;
+                info << std::fixed << std::setprecision(2);
+                info << "Wall Avg: " << avg_wall << " ms/tok";
+                if (avg_wall > 0)
+                    info << "  |  " << std::setprecision(1) << (1000.0 / avg_wall) << " tok/s";
+                table << info.str() << "" << "" << fort::endr;
+                table[1][0].set_cell_span(3);
+            }
+
+            // Header
+            table << fort::header << "PHASE" << "AVG (ms)" << "%" << fort::endr;
+            table.column(0).set_cell_text_align(fort::text_align::left);
+            table.column(1).set_cell_text_align(fort::text_align::right);
+            table.column(2).set_cell_text_align(fort::text_align::right);
+
+            auto fmt_row = [&](const char *name, double ms)
+            {
+                std::ostringstream ms_str, pct_str;
+                ms_str << std::fixed << std::setprecision(3) << ms;
+                double pct = avg_wall > 0 ? (ms / avg_wall) * 100.0 : 0.0;
+                pct_str << std::fixed << std::setprecision(1) << pct << "%";
+                table << name << ms_str.str() << pct_str.str() << fort::endr;
+            };
+
+            fmt_row("Dispatch (wake workers)", avg_dispatch);
+            fmt_row("Wait (device forward)", avg_wait);
+            fmt_row("Gather logits", avg_gather);
+            if (avg_other > 0.001)
+                fmt_row("Other overhead", avg_other);
+
+            // Separator + total
+            table << fort::separator;
+            {
+                std::ostringstream ms_str;
+                ms_str << std::fixed << std::setprecision(3) << avg_wall;
+                table << "TOTAL" << ms_str.str() << "100.0%" << fort::endr;
+            }
+
+            std::cout << table.to_string() << std::flush;
+            tp_decode_stats_.reset();
+        }
     }
 
 } // namespace llaminar2

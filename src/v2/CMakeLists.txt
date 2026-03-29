@@ -498,6 +498,50 @@ if(HAVE_ROCM)
     endif()
 endif()
 
+# amdgpu DKMS Auto-Clone for P2P Fix
+# =============================================================================
+# The upstream amdgpu DKMS (ROCm/amdgpu) gates CONFIG_HSA_AMD_P2P on
+# CONFIG_DMABUF_MOVENOTIFY, an AMD out-of-tree Kconfig that doesn't exist in
+# mainline kernels >= 5.12. This silently disables GPU-to-GPU P2P through
+# PCIe switches (e.g., Broadcom PEX88096). Our fork removes this gate.
+# See: https://github.com/dbsanfte/amdgpu/tree/fix/pex-pcie-switch-p2p-enable
+if(HAVE_ROCM)
+    find_package(Git REQUIRED)
+
+    get_filename_component(REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
+    set(AMDGPU_EXTERNAL_DIR "${REPO_ROOT}/external/amdgpu")
+    set(AMDGPU_GIT_URL "https://github.com/dbsanfte/amdgpu.git")
+    set(AMDGPU_GIT_REF "fix/pex-pcie-switch-p2p-enable")
+
+    if(NOT EXISTS "${REPO_ROOT}/external")
+        file(MAKE_DIRECTORY ${REPO_ROOT}/external)
+    endif()
+
+    if(NOT EXISTS "${AMDGPU_EXTERNAL_DIR}")
+        message(STATUS "V2: amdgpu DKMS not found in external/, cloning ${AMDGPU_GIT_URL} (${AMDGPU_GIT_REF})...")
+        execute_process(
+            COMMAND ${GIT_EXECUTABLE} clone --depth 1 --branch ${AMDGPU_GIT_REF}
+                ${AMDGPU_GIT_URL}
+                amdgpu
+            WORKING_DIRECTORY ${REPO_ROOT}/external
+            RESULT_VARIABLE GIT_CLONE_RESULT
+            OUTPUT_VARIABLE GIT_CLONE_OUTPUT
+            ERROR_VARIABLE GIT_CLONE_ERROR
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+            ERROR_STRIP_TRAILING_WHITESPACE
+        )
+
+        if(NOT GIT_CLONE_RESULT EQUAL 0)
+            message(WARNING "V2: Failed to clone amdgpu DKMS fork: ${GIT_CLONE_ERROR}\n"
+                            "P2P through PCIe switches may not work with the stock amdgpu DKMS on mainline kernels.")
+        else()
+            message(STATUS "V2: amdgpu DKMS fork (${AMDGPU_GIT_REF}) cloned successfully")
+        endif()
+    else()
+        message(STATUS "V2: amdgpu DKMS already present at ${AMDGPU_EXTERNAL_DIR}")
+    endif()
+endif()
+
 # ROCm backend (separate .cpp compilation unit with HIP)
 if(HAVE_ROCM)
     # Find ComposableKernel library (AMD's template-based GPU kernel library)

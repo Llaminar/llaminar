@@ -109,3 +109,4 @@ src/v2/kernels/cuda/*_heuristic_*.h
 *.fatbin
 gpucore.*
 *.lock-*
+run_gemv_timing.sh
