@@ -28,6 +28,7 @@
 #include "../../execution/compute_stages/ComputeStages.h"
 #include "../../execution/local_execution/device/DeviceContext.h"
 #include "../../execution/config/ExecutionPolicy.h"
+#include "../../memory/BufferArena.h"
 #include "../../execution/local_execution/graph/IGraphBuilder.h"
 #include "../../execution/config/RuntimeConfig.h"
 #include "../../execution/local_execution/graph/GraphResolver.h"
@@ -229,13 +230,31 @@ namespace llaminar2
         /**
          * @brief Set activation buffers (called by pipeline)
          *
-         * Use this for manual buffer management (default behavior).
-         * Alternative: Use initializeBuffers() for graph-managed allocation.
+         * Use this for manual buffer management (tests, PP path).
+         * Alternative: Use setArena() for arena-managed allocation.
          */
         void setBuffers(const ModelBuffers &buffers) { buffers_ = buffers; }
 
-        /// Get the current buffers (for cache-replay PP copy)
-        const ModelBuffers &buffers() const { return buffers_; }
+        /**
+         * @brief Set the BufferArena for arena-managed buffer resolution
+         *
+         * When set, populates buffers_ from the arena, allowing all graph-building
+         * methods to use the arena-allocated tensors via the existing buffers_ paths.
+         * This eliminates the bindArenaToManagedBuffers() shim in the orchestrator.
+         *
+         * The arena pointer is non-owning; the caller (DeviceGraphOrchestrator)
+         * owns the arena lifetime.
+         *
+         * @param arena BufferArena pointer (not owned, must outlive graph builder)
+         */
+        void setArena(BufferArena *arena);
+
+        /// Get the arena (nullptr if not set)
+        BufferArena *arena() const { return arena_; }
+
+        /// Get the current buffers (for cache-replay PP copy).
+        /// When arena is set, populates a snapshot from arena on demand.
+        const ModelBuffers &buffers() const;
 
         /**
          * @brief Set TensorFactory for graph-managed buffer allocation
@@ -492,6 +511,9 @@ namespace llaminar2
 
         // TensorFactory for buffer allocation (not owned)
         TensorFactory *tensor_factory_ = nullptr;
+
+        // BufferArena for arena-managed buffer resolution (not owned)
+        BufferArena *arena_ = nullptr;
 
         // Weights and buffers (not owned)
         ModelWeights weights_;

@@ -2267,14 +2267,6 @@ namespace llaminar2
         bool ensureDeviceWorkspaceAllocated(const ComputeGraph &graph);
 
         /**
-         * @brief Populate managed_buffers_ from arena-owned tensors.
-         *
-         * Maps BufferId → TensorBase* from the arena into the legacy
-         * ModelBuffers/ActivationBuffers struct for Qwen2Graph compatibility.
-         */
-        void bindArenaToManagedBuffers();
-
-        /**
          * @brief Initialize the BufferArena from existing managed buffers (legacy path)
          *
          * For paths where managed_buffers_ is populated externally (e.g., PP stages),

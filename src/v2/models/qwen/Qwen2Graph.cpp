@@ -108,6 +108,67 @@ namespace llaminar2
     }
 
     // =============================================================================
+    // Arena-Aware Buffer Resolution
+    // =============================================================================
+
+    void Qwen2Graph::setArena(BufferArena *arena)
+    {
+        arena_ = arena;
+
+        if (!arena_)
+            return;
+
+        // Populate buffers_ from arena so all graph-building code can continue
+        // using buffers_.* paths without change.  This replaces the orchestrator's
+        // bindArenaToManagedBuffers() shim.
+        auto toBase = [](ITensor *t) -> TensorBase *
+        {
+            return t ? dynamic_cast<TensorBase *>(t) : nullptr;
+        };
+
+        // Layer activation buffers
+        auto &lb = buffers_.layer_buffers;
+        lb.residual = toBase(arena_->getTensor(BufferId::RESIDUAL));
+        lb.normalized = toBase(arena_->getTensor(BufferId::NORMALIZED));
+        lb.Q = toBase(arena_->getTensor(BufferId::Q_PROJ));
+        lb.K = toBase(arena_->getTensor(BufferId::K_PROJ));
+        lb.V = toBase(arena_->getTensor(BufferId::V_PROJ));
+        lb.attn_output = toBase(arena_->getTensor(BufferId::ATTN_OUTPUT));
+        lb.attn_proj = toBase(arena_->getTensor(BufferId::ATTN_PROJ));
+        lb.workspace_scores = toBase(arena_->getTensor(BufferId::ATTN_SCORES_WORKSPACE));
+        lb.workspace_context = toBase(arena_->getTensor(BufferId::ATTN_CONTEXT_WORKSPACE));
+        lb.workspace_mask = toBase(arena_->getTensor(BufferId::GEMM_WORKSPACE));
+        lb.gate = toBase(arena_->getTensor(BufferId::GATE_PROJ));
+        lb.up = toBase(arena_->getTensor(BufferId::UP_PROJ));
+        lb.ffn_output = toBase(arena_->getTensor(BufferId::FFN_OUTPUT));
+
+        // Hybrid mode buffers
+        lb.Q_rope = toBase(arena_->getTensor(BufferId::Q_ROPE));
+        lb.K_rope = toBase(arena_->getTensor(BufferId::K_ROPE));
+        lb.V_dequant = toBase(arena_->getTensor(BufferId::V_DEQUANT));
+
+        // Model-level buffers
+        buffers_.current_hidden = toBase(arena_->getTensor(BufferId::HIDDEN_STATE));
+        buffers_.logits = toBase(arena_->getTensor(BufferId::LOGITS));
+        buffers_.logits_local = toBase(arena_->getTensor(BufferId::LOGITS_LOCAL));
+
+        // Ensure current_hidden alias in layer_buffers (expected by some stages)
+        lb.current_hidden = buffers_.current_hidden;
+
+        LOG_DEBUG("[Qwen2Graph] Arena bound: "
+                  << "residual=" << lb.residual
+                  << " Q=" << lb.Q
+                  << " gate=" << lb.gate
+                  << " current_hidden=" << buffers_.current_hidden
+                  << " logits=" << buffers_.logits);
+    }
+
+    const ModelBuffers &Qwen2Graph::buffers() const
+    {
+        return buffers_;
+    }
+
+    // =============================================================================
     // GraphConfig Helper Methods
     // =============================================================================
 

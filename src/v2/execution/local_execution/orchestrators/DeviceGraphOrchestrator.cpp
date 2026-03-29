@@ -410,8 +410,8 @@ namespace llaminar2
             return false;
         }
 
-        // Populate managed_buffers_ from arena for Qwen2Graph compatibility
-        bindArenaToManagedBuffers();
+        // Wire arena directly to graph builder (replaces bindArenaToManagedBuffers + setBuffers shim)
+        graph_builder_->setArena(arena_.get());
 
         // Wire arena to executor for contract-based coherence
         executor_.setArena(arena_.get());
@@ -429,9 +429,6 @@ namespace llaminar2
         LOG_INFO("[DeviceGraphOrchestrator] Theoretical aliasing savings: "
                  << (original / 1024.0) << " KB -> " << (optimized / 1024.0) << " KB"
                  << " (" << savings << "% reduction)");
-
-        // Also update the graph builder's buffers reference
-        graph_builder_->setBuffers(managed_buffers_);
 
         return true;
     }
@@ -472,54 +469,6 @@ namespace llaminar2
             return nullptr;
         }
         return &arena_->stats();
-    }
-
-    void DeviceGraphOrchestrator::bindArenaToManagedBuffers()
-    {
-        if (!arena_)
-        {
-            LOG_ERROR("[DeviceGraphOrchestrator] bindArenaToManagedBuffers: arena_ is null");
-            return;
-        }
-
-        // Helper: arena stores ITensor*, but ActivationBuffers/ModelBuffers use TensorBase*.
-        // TensorBase virtually inherits from ITensor, so dynamic_cast is required.
-        auto asTensorBase = [](ITensor *t) -> TensorBase *
-        {
-            return t ? dynamic_cast<TensorBase *>(t) : nullptr;
-        };
-
-        // Bind layer buffers from arena → managed_buffers_ for Qwen2Graph compatibility
-        auto &lb = managed_buffers_.layer_buffers;
-
-        lb.residual = asTensorBase(arena_->getTensor(BufferId::RESIDUAL));
-        lb.normalized = asTensorBase(arena_->getTensor(BufferId::NORMALIZED));
-
-        // Attention buffers
-        lb.Q = asTensorBase(arena_->getTensor(BufferId::Q_PROJ));
-        lb.K = asTensorBase(arena_->getTensor(BufferId::K_PROJ));
-        lb.V = asTensorBase(arena_->getTensor(BufferId::V_PROJ));
-        lb.attn_output = asTensorBase(arena_->getTensor(BufferId::ATTN_OUTPUT));
-        lb.attn_proj = asTensorBase(arena_->getTensor(BufferId::ATTN_PROJ));
-        lb.workspace_scores = asTensorBase(arena_->getTensor(BufferId::ATTN_SCORES_WORKSPACE));
-        lb.workspace_context = asTensorBase(arena_->getTensor(BufferId::ATTN_CONTEXT_WORKSPACE));
-        lb.workspace_mask = asTensorBase(arena_->getTensor(BufferId::GEMM_WORKSPACE));
-
-        // FFN buffers
-        lb.gate = asTensorBase(arena_->getTensor(BufferId::GATE_PROJ));
-        lb.up = asTensorBase(arena_->getTensor(BufferId::UP_PROJ));
-        lb.ffn_output = asTensorBase(arena_->getTensor(BufferId::FFN_OUTPUT));
-
-        // Model-level buffers
-        managed_buffers_.current_hidden = asTensorBase(arena_->getTensor(BufferId::HIDDEN_STATE));
-        managed_buffers_.logits = asTensorBase(arena_->getTensor(BufferId::LOGITS));
-
-        LOG_DEBUG("[DeviceGraphOrchestrator] Bound arena buffers to managed_buffers_: "
-                  << "residual=" << lb.residual
-                  << " Q=" << lb.Q
-                  << " gate=" << lb.gate
-                  << " current_hidden=" << managed_buffers_.current_hidden
-                  << " logits=" << managed_buffers_.logits);
     }
 
     void DeviceGraphOrchestrator::initializeArena()
