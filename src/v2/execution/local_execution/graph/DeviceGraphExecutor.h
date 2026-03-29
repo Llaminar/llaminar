@@ -32,7 +32,6 @@
 #include "../../compute_stages/ComputeStages.h"
 #include "../device/DeviceContext.h"
 #include "../../mpi_orchestration/WorkDistributor.h"
-#include "DeviceGraphBufferManager.h"
 #include "StageTimeline.h"
 #include "../../../backends/DeviceId.h"
 #include "../../../utils/DebugEnv.h" // For LLAMINAR_ASSERTIONS_ACTIVE
@@ -380,23 +379,7 @@ namespace llaminar2
         // =========================================================================
 
         /**
-         * @brief Set the buffer manager for managed execution
-         *
-         * When a buffer manager is set, executeWithBufferManagement() can be
-         * used to automatically allocate buffers before execution.
-         *
-         * @param manager Buffer manager (not owned, must outlive executor)
-         */
-        void setBufferManager(DeviceGraphBufferManager *manager) { buffer_manager_ = manager; }
-
-        /**
-         * @brief Get the current buffer manager
-         * @return Pointer to buffer manager (nullptr if not set)
-         */
-        DeviceGraphBufferManager *bufferManager() const { return buffer_manager_; }
-
-        /**
-         * @brief Set the BufferArena for contract-based coherence (Phase 2)
+         * @brief Set the BufferArena for contract-based coherence
          *
          * When both the arena is set and a stage returns a non-empty bufferContract(),
          * the executor uses the arena for coherence instead of getDumpInfo().
@@ -410,22 +393,6 @@ namespace llaminar2
          * @return Pointer to arena (nullptr if not set)
          */
         BufferArena *arena() const { return arena_; }
-
-        /**
-         * @brief Execute a graph with automatic buffer management
-         *
-         * This method:
-         * 1. Allocates all buffers via the buffer manager
-         * 2. Executes the graph
-         * 3. Leaves buffers allocated for retrieval
-         *
-         * Requires setBufferManager() to be called first.
-         *
-         * @param graph The compute graph to execute
-         * @param ctx Device context for execution
-         * @return true on success
-         */
-        bool executeWithBufferManagement(ComputeGraph &graph, IDeviceContext *ctx);
 
         /**
          * @brief Execute a cached decode graph with minimal overhead
@@ -663,11 +630,10 @@ namespace llaminar2
     private:
         GraphExecutorConfig config_;
         GraphExecutorStats stats_;
-        DeviceGraphBufferManager *buffer_manager_ = nullptr; ///< Optional buffer manager (not owned)
-        ICollectiveContext *collective_ctx_ = nullptr;       ///< Optional collective context (not owned)
-        BufferArena *arena_ = nullptr;                       ///< Optional arena for contract coherence (not owned)
-        StageTimeline stage_timeline_;                       ///< GPU event-based per-stage timeline profiler
-        bool stage_timeline_info_populated_ = false;         ///< True after first setStageInfo pass (names never change)
+        ICollectiveContext *collective_ctx_ = nullptr; ///< Optional collective context (not owned)
+        BufferArena *arena_ = nullptr;                 ///< Optional arena for contract coherence (not owned)
+        StageTimeline stage_timeline_;                 ///< GPU event-based per-stage timeline profiler
+        bool stage_timeline_info_populated_ = false;   ///< True after first setStageInfo pass (names never change)
 
         // Internal execution helpers
         bool executeSequential(ComputeGraph &graph, IDeviceContext *ctx);

@@ -25,7 +25,6 @@
 
 #include "../GraphTypes.h"
 #include "../../execution/local_execution/graph/DeviceGraphExecutor.h"
-#include "../../execution/local_execution/graph/DeviceGraphBufferManager.h"
 #include "../../execution/compute_stages/ComputeStages.h"
 #include "../../execution/local_execution/device/DeviceContext.h"
 #include "../../execution/config/ExecutionPolicy.h"

@@ -1241,7 +1241,6 @@ add_library(llaminar2_core STATIC
     execution/compute_stages/stages/LMHeadStage.cpp
     execution/local_execution/graph/DeviceGraphCaptureController.cpp
     execution/local_execution/graph/DeviceGraphExecutor.cpp
-    execution/local_execution/graph/DeviceGraphBufferManager.cpp
     execution/local_execution/graph/StageTimeline.cpp
     execution/local_execution/device/DomainAwareBufferManager.cpp
     execution/local_execution/graph/GraphResolver.cpp
@@ -1257,6 +1256,7 @@ add_library(llaminar2_core STATIC
     execution/config/InferenceMode.cpp
     execution/local_execution/coherence/StageCoherence.cpp
     execution/local_execution/device/DeviceWorkspaceManager.cpp
+    execution/local_execution/device/WorkspaceAllocator.cpp
     # Tensor parallelism configuration (proportional sharding for heterogeneous TP)
     config/TensorParallelConfig.cpp
     # Pipeline parallelism configuration (layer range assignment for PP)

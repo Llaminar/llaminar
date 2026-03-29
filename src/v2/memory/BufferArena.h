@@ -27,6 +27,7 @@
 #include "CoherenceTracker.h"
 #include "StageBoundBuffers.h"
 #include "backends/DeviceId.h"
+#include "execution/debug/BufferRole.h"
 
 namespace llaminar2
 {
@@ -34,6 +35,51 @@ namespace llaminar2
     // Forward declarations
     class ITensor;
     class TensorBase;
+    class TensorFactory;
+    class ILocalTPContext;
+    enum class CollectiveBackendType;
+
+    /**
+     * @brief Configuration for BufferArena allocation behavior.
+     *
+     * Controls BAR-backed allocation for PCIeBAR tensor parallelism,
+     * mapped memory for snapshot/debugging, and factory binding.
+     */
+    struct ArenaConfig
+    {
+        /// TensorFactory for NUMA-aware allocation (required for allocate())
+        TensorFactory *factory = nullptr;
+
+        /// Use mapped memory for GPU activation buffers (snapshot/debugging)
+        bool use_mapped_memory = false;
+
+        // ── BAR-backed allocation (LOCAL TP with PCIeBAR) ───────────────
+        int tp_degree = 1;
+        CollectiveBackendType collective_backend{}; // default-initialized
+        DeviceId rocm_device;
+        DeviceId cuda_device;
+        ILocalTPContext *local_tp_ctx = nullptr;
+    };
+
+    /**
+     * @brief Allocation statistics tracked by BufferArena.
+     */
+    struct ArenaAllocationStats
+    {
+        size_t total_buffers = 0;
+        size_t total_bytes = 0;
+        size_t bar_backed_buffers = 0;
+        size_t bar_backed_bytes = 0;
+        size_t mapped_buffers = 0;
+        size_t mapped_bytes = 0;
+
+        void reset()
+        {
+            total_buffers = total_bytes = 0;
+            bar_backed_buffers = bar_backed_bytes = 0;
+            mapped_buffers = mapped_bytes = 0;
+        }
+    };
 
     /**
      * @brief Central manager for all activation / scratch / workspace buffers.
@@ -50,6 +96,7 @@ namespace llaminar2
     {
     public:
         BufferArena() = default;
+        explicit BufferArena(const ArenaConfig &config) : config_(config) {}
         ~BufferArena() = default;
 
         // Non-copyable, movable
@@ -57,6 +104,18 @@ namespace llaminar2
         BufferArena &operator=(const BufferArena &) = delete;
         BufferArena(BufferArena &&) = default;
         BufferArena &operator=(BufferArena &&) = default;
+
+        /**
+         * @brief Set or update arena configuration.
+         *
+         * Must be called before allocate() if not passed via constructor.
+         */
+        void setConfig(const ArenaConfig &config) { config_ = config; }
+
+        /**
+         * @brief Get allocation statistics.
+         */
+        const ArenaAllocationStats &stats() const { return stats_; }
 
         // =====================================================================
         // Registration (called during graph setup, before allocate())
@@ -100,6 +159,29 @@ namespace llaminar2
          * @param b  Second buffer (shares storage with a)
          */
         void registerAlias(BufferId a, BufferId b);
+
+        // =====================================================================
+        // Static helpers for mapping names/types to BufferId
+        // =====================================================================
+
+        /**
+         * @brief Map a buffer name string to its BufferId.
+         *
+         * Used by orchestrators to map resolved buffer descriptors (which use
+         * string names from the schema) to BufferId enum values.
+         *
+         * @param name Buffer name (e.g., "Q", "attn_proj", "current_hidden")
+         * @return Corresponding BufferId, or BufferId::_COUNT if unknown
+         */
+        static BufferId bufferNameToId(const std::string &name);
+
+        /**
+         * @brief Convert BufferTensorType enum to dtype string.
+         *
+         * @param type Tensor type enum
+         * @return Dtype string (e.g., "FP32", "BF16", "Q8_1")
+         */
+        static const char *bufferTensorTypeToStr(BufferTensorType type);
 
         /**
          * @brief Allocate all registered arena-owned buffers.
@@ -294,6 +376,10 @@ namespace llaminar2
         // Aliasing groups: each group is a set of BufferIds that share storage
         int next_alias_group_ = 0;
 
+        // Configuration and stats
+        ArenaConfig config_;
+        ArenaAllocationStats stats_;
+
         /// Get mutable buffer slot (asserts registered)
         ManagedBuffer &buf(BufferId id);
         const ManagedBuffer &buf(BufferId id) const;
@@ -306,6 +392,9 @@ namespace llaminar2
 
         /// Check if any buffer in the same alias group has an active borrow
         bool aliasGroupHasAnyBorrow(int group, BufferId exclude) const;
+
+        /// Create a tensor for a registered buffer using TensorFactory
+        std::shared_ptr<TensorBase> createTensorForBuffer(const ManagedBuffer &b, BufferId id) const;
     };
 
 } // namespace llaminar2

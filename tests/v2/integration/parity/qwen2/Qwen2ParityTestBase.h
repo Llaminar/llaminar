@@ -36,7 +36,6 @@
 #include "execution/factory/FactoryPPStageConfig.h"
 #include "execution/mpi_orchestration/RankExecutionPlan.h"
 #include "execution/local_execution/graph/DeviceGraphExecutor.h"
-#include "execution/local_execution/graph/DeviceGraphBufferManager.h"
 #include "execution/local_execution/device/DeviceContext.h"
 #include "collective/ILocalTPContext.h"
 #include "collective/LocalTPContext.h"

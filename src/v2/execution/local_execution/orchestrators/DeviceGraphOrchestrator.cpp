@@ -302,107 +302,126 @@ namespace llaminar2
             return false;
         }
 
-        // Configure buffer manager with mapped memory for GPU + snapshot scenarios
-        // Mapped memory enables zero-copy host access (avoids slow hipMemcpy/cudaMemcpy syncs)
-        // This benefits both CUDA and ROCm backends equally
-        GraphBufferManagerConfig buffer_config;
+        // =====================================================================
+        // Configure ArenaConfig for BufferArena allocation
+        // =====================================================================
+        ArenaConfig arena_config;
+        arena_config.factory = tensor_factory_;
+
+        // Configure mapped memory for GPU + snapshot scenarios
         bool use_mapped = state_.device_id.is_gpu() && snapshot_enabled_;
         if (use_mapped)
         {
-            buffer_config.use_mapped_memory = true;
+            arena_config.use_mapped_memory = true;
             LOG_INFO("[DeviceGraphOrchestrator] Enabling mapped memory for GPU + snapshot mode (zero-copy host access)");
         }
 
-        // =====================================================================
         // Configure BAR-backed allocation for LOCAL TP with PCIeBAR backend
-        // =====================================================================
-        // When LOCAL TP is active with PCIeBAR backend, row-parallel output
-        // buffers (attn_proj, ffn_output) need to be allocated in BAR memory
-        // for efficient cross-vendor allreduce. Each device needs its own buffer:
-        // - CUDA device: standard FP32 tensor
-        // - ROCm device: BAR-backed FP32 tensor accessible by both devices
-        //
-        // The DeviceGraphBufferManager checks Qwen2BufferSpec::requiresBARBacked() to
-        // identify which buffers need BAR allocation.
-        // =====================================================================
         if (config.local_tp_ctx && config.local_tp_ctx->degree() > 1)
         {
-            buffer_config.tp_degree = config.local_tp_ctx->degree();
-            buffer_config.collective_backend = config.local_tp_ctx->backend();
-            buffer_config.local_tp_ctx = config.local_tp_ctx;
+            arena_config.tp_degree = config.local_tp_ctx->degree();
+            arena_config.collective_backend = config.local_tp_ctx->backend();
+            arena_config.local_tp_ctx = config.local_tp_ctx;
 
-            // For PCIeBAR backend, find CUDA and ROCm devices for BAR allocation
             if (config.local_tp_ctx->backend() == CollectiveBackendType::PCIE_BAR)
             {
                 const auto &devices = config.local_tp_ctx->devices();
                 for (const auto &device_addr : devices)
                 {
                     DeviceId device_id = device_addr.toLocalDeviceId();
-                    if (device_id.is_cuda() && !buffer_config.cuda_device.is_cuda())
+                    if (device_id.is_cuda() && !arena_config.cuda_device.is_cuda())
                     {
-                        buffer_config.cuda_device = device_id;
+                        arena_config.cuda_device = device_id;
                     }
-                    else if (device_id.is_rocm() && !buffer_config.rocm_device.is_rocm())
+                    else if (device_id.is_rocm() && !arena_config.rocm_device.is_rocm())
                     {
-                        buffer_config.rocm_device = device_id;
+                        arena_config.rocm_device = device_id;
                     }
                 }
 
-                if (buffer_config.cuda_device.is_cuda() && buffer_config.rocm_device.is_rocm())
+                if (arena_config.cuda_device.is_cuda() && arena_config.rocm_device.is_rocm())
                 {
                     LOG_INFO("[DeviceGraphOrchestrator] Enabled BAR-backed allocation for LOCAL TP PCIeBAR: "
-                             << "CUDA=" << buffer_config.cuda_device.toString()
-                             << ", ROCm=" << buffer_config.rocm_device.toString());
+                             << "CUDA=" << arena_config.cuda_device.toString()
+                             << ", ROCm=" << arena_config.rocm_device.toString());
                 }
                 else
                 {
                     LOG_WARN("[DeviceGraphOrchestrator] PCIeBAR backend but missing CUDA/ROCm pair: "
-                             << "CUDA=" << (buffer_config.cuda_device.is_cuda() ? buffer_config.cuda_device.toString() : "(none)")
-                             << ", ROCm=" << (buffer_config.rocm_device.is_rocm() ? buffer_config.rocm_device.toString() : "(none)"));
+                             << "CUDA=" << (arena_config.cuda_device.is_cuda() ? arena_config.cuda_device.toString() : "(none)")
+                             << ", ROCm=" << (arena_config.rocm_device.is_rocm() ? arena_config.rocm_device.toString() : "(none)"));
                 }
             }
         }
 
-        // Create buffer manager with TensorFactory
-        buffer_manager_ = std::make_unique<DeviceGraphBufferManager>(
-            tensor_factory_, mpi_ctx_.get(), buffer_config);
+        // Create BufferArena with config
+        arena_ = std::make_unique<BufferArena>(arena_config);
 
-        // Build layer buffer specifications using BufferAllocator
+        // =====================================================================
+        // Register layer buffers from schema
+        // =====================================================================
         auto layer_reqs = BufferAllocator::resolveLayerBuffers(schema, resolver_config);
-
-        // Allocate layer buffers (iterate over vector)
         for (const auto &desc : layer_reqs.buffers)
         {
-            if (!buffer_manager_->allocateBuffer("layer", desc))
+            BufferId id = BufferArena::bufferNameToId(desc.name);
+            if (id == BufferId::_COUNT)
             {
-                LOG_ERROR("[DeviceGraphOrchestrator] Failed to allocate layer buffer: " << desc.name);
+                LOG_WARN("[DeviceGraphOrchestrator] No BufferId mapping for layer buffer '" << desc.name << "', skipping");
+                continue;
+            }
+            size_t rows = desc.shape.size() >= 1 ? desc.shape[0] : 0;
+            size_t cols = desc.shape.size() >= 2 ? desc.shape[1] : 0;
+            const char *dtype = BufferArena::bufferTensorTypeToStr(desc.tensor_type);
+            if (!arena_->registerBuffer(id, rows, cols, dtype, desc.device))
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] Failed to register layer buffer: " << desc.name);
                 return false;
             }
         }
 
-        // Build model-level buffer specifications (current_hidden, logits)
+        // =====================================================================
+        // Register model-level buffers (current_hidden, logits)
+        // =====================================================================
         auto model_reqs = BufferAllocator::resolveModelBuffers(schema, resolver_config);
-
         for (const auto &desc : model_reqs.buffers)
         {
-            if (!buffer_manager_->allocateBuffer("model", desc))
+            BufferId id = BufferArena::bufferNameToId(desc.name);
+            if (id == BufferId::_COUNT)
             {
-                LOG_ERROR("[DeviceGraphOrchestrator] Failed to allocate model buffer: " << desc.name);
+                LOG_WARN("[DeviceGraphOrchestrator] No BufferId mapping for model buffer '" << desc.name << "', skipping");
+                continue;
+            }
+            size_t rows = desc.shape.size() >= 1 ? desc.shape[0] : 0;
+            size_t cols = desc.shape.size() >= 2 ? desc.shape[1] : 0;
+            const char *dtype = BufferArena::bufferTensorTypeToStr(desc.tensor_type);
+            if (!arena_->registerBuffer(id, rows, cols, dtype, desc.device))
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] Failed to register model buffer: " << desc.name);
                 return false;
             }
         }
 
-        // Bind allocated buffers to managed_buffers_ struct
-        bindGraphManagedBuffers(seq_len);
+        // =====================================================================
+        // Allocate all registered buffers
+        // =====================================================================
+        if (!arena_->allocate())
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] BufferArena allocation failed");
+            return false;
+        }
 
-        // Initialize BufferArena with the managed buffers (Phase 2)
-        initializeArena();
+        // Populate managed_buffers_ from arena for Qwen2Graph compatibility
+        bindArenaToManagedBuffers();
 
-        auto &stats = buffer_manager_->stats();
+        // Wire arena to executor for contract-based coherence
+        executor_.setArena(arena_.get());
+
+        const auto &stats = arena_->stats();
         LOG_INFO("[DeviceGraphOrchestrator] Buffer initialization complete: "
-                 << "total=" << (stats.total_bytes / (1024.0 * 1024.0)) << " MB, "
-                 << "scratch=" << (stats.scratch_bytes / (1024.0 * 1024.0)) << " MB, "
-                 << "output=" << (stats.output_bytes / (1024.0 * 1024.0)) << " MB");
+                 << "total=" << (stats.total_bytes / (1024.0 * 1024.0)) << " MB"
+                 << " (" << stats.total_buffers << " buffers"
+                 << ", BAR=" << stats.bar_backed_buffers
+                 << ", mapped=" << stats.mapped_buffers << ")");
 
         // Log theoretical aliasing savings
         auto [original, optimized] = BufferAllocator::estimateMemorySavings(schema, resolver_config);
@@ -419,11 +438,10 @@ namespace llaminar2
 
     void DeviceGraphOrchestrator::releaseBuffers()
     {
-        if (buffer_manager_)
+        if (arena_)
         {
-            buffer_manager_->releaseAll();
-            buffer_manager_.reset();
-            LOG_INFO("[DeviceGraphOrchestrator] Buffers released");
+            arena_.reset();
+            LOG_INFO("[DeviceGraphOrchestrator] BufferArena released");
         }
 
         owned_buffers_.clear();
@@ -447,51 +465,56 @@ namespace llaminar2
         return managed_buffers_;
     }
 
-    const BufferAllocationStats *DeviceGraphOrchestrator::bufferStats() const
+    const ArenaAllocationStats *DeviceGraphOrchestrator::bufferStats() const
     {
-        if (!buffer_manager_)
+        if (!arena_)
         {
             return nullptr;
         }
-        return &buffer_manager_->stats();
+        return &arena_->stats();
     }
 
-    void DeviceGraphOrchestrator::bindGraphManagedBuffers(int seq_len)
+    void DeviceGraphOrchestrator::bindArenaToManagedBuffers()
     {
-        (void)seq_len; // May be used for validation in the future
-
-        if (!buffer_manager_)
+        if (!arena_)
         {
-            LOG_ERROR("[DeviceGraphOrchestrator] bindGraphManagedBuffers: buffer_manager_ is null");
+            LOG_ERROR("[DeviceGraphOrchestrator] bindArenaToManagedBuffers: arena_ is null");
             return;
         }
 
-        // Bind layer buffers
+        // Helper: arena stores ITensor*, but ActivationBuffers/ModelBuffers use TensorBase*.
+        // TensorBase virtually inherits from ITensor, so dynamic_cast is required.
+        auto asTensorBase = [](ITensor *t) -> TensorBase *
+        {
+            return t ? dynamic_cast<TensorBase *>(t) : nullptr;
+        };
+
+        // Bind layer buffers from arena → managed_buffers_ for Qwen2Graph compatibility
         auto &lb = managed_buffers_.layer_buffers;
 
-        lb.residual = buffer_manager_->getBuffer("layer", BufferNames::RESIDUAL);
-        lb.normalized = buffer_manager_->getBuffer("layer", BufferNames::NORMALIZED);
+        lb.residual = asTensorBase(arena_->getTensor(BufferId::RESIDUAL));
+        lb.normalized = asTensorBase(arena_->getTensor(BufferId::NORMALIZED));
 
         // Attention buffers
-        lb.Q = buffer_manager_->getBuffer("layer", BufferNames::Q);
-        lb.K = buffer_manager_->getBuffer("layer", BufferNames::K);
-        lb.V = buffer_manager_->getBuffer("layer", BufferNames::V);
-        lb.attn_output = buffer_manager_->getBuffer("layer", BufferNames::ATTN_OUTPUT);
-        lb.attn_proj = buffer_manager_->getBuffer("layer", BufferNames::ATTN_PROJ);
-        lb.workspace_scores = buffer_manager_->getBuffer("layer", BufferNames::WORKSPACE_SCORES);
-        lb.workspace_context = buffer_manager_->getBuffer("layer", BufferNames::WORKSPACE_CONTEXT);
-        lb.workspace_mask = buffer_manager_->getBuffer("layer", BufferNames::WORKSPACE_MASK);
+        lb.Q = asTensorBase(arena_->getTensor(BufferId::Q_PROJ));
+        lb.K = asTensorBase(arena_->getTensor(BufferId::K_PROJ));
+        lb.V = asTensorBase(arena_->getTensor(BufferId::V_PROJ));
+        lb.attn_output = asTensorBase(arena_->getTensor(BufferId::ATTN_OUTPUT));
+        lb.attn_proj = asTensorBase(arena_->getTensor(BufferId::ATTN_PROJ));
+        lb.workspace_scores = asTensorBase(arena_->getTensor(BufferId::ATTN_SCORES_WORKSPACE));
+        lb.workspace_context = asTensorBase(arena_->getTensor(BufferId::ATTN_CONTEXT_WORKSPACE));
+        lb.workspace_mask = asTensorBase(arena_->getTensor(BufferId::GEMM_WORKSPACE));
 
         // FFN buffers
-        lb.gate = buffer_manager_->getBuffer("layer", BufferNames::GATE);
-        lb.up = buffer_manager_->getBuffer("layer", BufferNames::UP);
-        lb.ffn_output = buffer_manager_->getBuffer("layer", BufferNames::FFN_OUTPUT);
+        lb.gate = asTensorBase(arena_->getTensor(BufferId::GATE_PROJ));
+        lb.up = asTensorBase(arena_->getTensor(BufferId::UP_PROJ));
+        lb.ffn_output = asTensorBase(arena_->getTensor(BufferId::FFN_OUTPUT));
 
         // Model-level buffers
-        managed_buffers_.current_hidden = buffer_manager_->getBuffer("model", BufferNames::CURRENT_HIDDEN);
-        managed_buffers_.logits = buffer_manager_->getBuffer("model", BufferNames::LOGITS);
+        managed_buffers_.current_hidden = asTensorBase(arena_->getTensor(BufferId::HIDDEN_STATE));
+        managed_buffers_.logits = asTensorBase(arena_->getTensor(BufferId::LOGITS));
 
-        LOG_DEBUG("[DeviceGraphOrchestrator] Bound graph-managed buffers: "
+        LOG_DEBUG("[DeviceGraphOrchestrator] Bound arena buffers to managed_buffers_: "
                   << "residual=" << lb.residual
                   << " Q=" << lb.Q
                   << " gate=" << lb.gate
@@ -502,6 +525,9 @@ namespace llaminar2
     void DeviceGraphOrchestrator::initializeArena()
     {
         // Idempotent: skip if already initialized (allows safe re-calls)
+        // In the new flow, arena_ is created in initializeBuffers().
+        // This method is kept for the PP path where initializeBuffers() isn't used
+        // and managed_buffers_ is populated externally.
         if (arena_)
             return;
 
@@ -510,7 +536,6 @@ namespace llaminar2
         auto &lb = managed_buffers_.layer_buffers;
 
         // Register layer activation buffers as external (non-owning).
-        // The arena tracks coherence; buffer_manager_ still owns the tensors.
         auto reg = [&](BufferId id, TensorBase *t)
         {
             if (t)
@@ -1406,10 +1431,9 @@ namespace llaminar2
     bool DeviceGraphOrchestrator::ensureDeviceWorkspaceAllocated(const ComputeGraph &graph)
     {
         const auto &config = graph_builder_->config();
-        if (!buffer_manager_)
+        if (!workspace_allocator_)
         {
-            buffer_manager_ = std::make_unique<DeviceGraphBufferManager>(
-                tensor_factory_, mpi_ctx_.get(), GraphBufferManagerConfig{});
+            workspace_allocator_ = std::make_unique<WorkspaceAllocator>();
         }
 
         WorkspaceSizingHints hints;
@@ -1439,7 +1463,7 @@ namespace llaminar2
         }
 
         WorkspaceBudgetConfig workspace_budget;
-        return buffer_manager_->allocateDeviceWorkspaceForGraph(graph, hints, extras, workspace_budget);
+        return workspace_allocator_->allocateForGraph(graph, hints, extras, workspace_budget);
     }
 
     bool DeviceGraphOrchestrator::executeAttention(
@@ -1907,7 +1931,7 @@ namespace llaminar2
         }
 
         // Create tensor factory and store it as owned member so it
-        // outlives initializeInferenceState() — DeviceGraphBufferManager
+        // outlives initializeInferenceState() — BufferArena
         // and ensureDeviceWorkspaceAllocated() need it later.
         owned_tensor_factory_ = std::make_unique<TensorFactory>(*local_mpi_ctx);
         tensor_factory_ = owned_tensor_factory_.get();

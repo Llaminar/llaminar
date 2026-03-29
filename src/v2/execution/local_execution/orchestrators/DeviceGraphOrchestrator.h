@@ -34,8 +34,8 @@
 #include "../../../backends/IGPUGraphCapture.h"
 #include "IInferenceRunner.h"
 #include "../graph/DeviceGraphExecutor.h"
-#include "../graph/DeviceGraphBufferManager.h"
 #include "../device/DeviceContext.h"
+#include "../device/WorkspaceAllocator.h"
 #include "../../mpi_orchestration/PlacementStrategy.h" // For InferencePhase
 #include "../../compute_stages/ComputeStages.h"        // For StageDumpInfo
 #include "../../factory/InferenceRunnerFactory.h"      // For FactoryPPStageConfig
@@ -965,7 +965,7 @@ namespace llaminar2
         TensorFactory *tensorFactory() const { return tensor_factory_; }
 
         /**
-         * @brief Initialize activation buffers using DeviceGraphBufferManager
+         * @brief Initialize activation buffers using BufferArena
          *
          * Allocates all activation buffers with automatic aliasing optimization
          * for SCRATCH buffers. This is an alternative to manual buffer allocation.
@@ -985,7 +985,7 @@ namespace llaminar2
         /**
          * @brief Check if graph buffer management is active
          */
-        bool hasGraphManagedBuffers() const { return buffer_manager_ != nullptr; }
+        bool hasGraphManagedBuffers() const { return arena_ != nullptr; }
 
         /**
          * @brief Get internal activation buffers (for graph-managed mode)
@@ -1008,11 +1008,11 @@ namespace llaminar2
         const ModelBuffers &getModelBuffers() const;
 
         /**
-         * @brief Get buffer manager statistics
+         * @brief Get buffer arena allocation statistics
          *
-         * @return BufferAllocationStats or nullptr if not using graph buffer management
+         * @return ArenaAllocationStats or nullptr if not using graph buffer management
          */
-        const BufferAllocationStats *bufferStats() const;
+        const ArenaAllocationStats *bufferStats() const;
 
         // =========================================================================
         // Inference State Management (Phase 5)
@@ -2243,12 +2243,10 @@ namespace llaminar2
         /// no external factory is provided via setTensorFactory().
         std::unique_ptr<TensorFactory> owned_tensor_factory_;
 
-        /// Buffer manager for graph-managed allocation (nullptr if using manual buffers)
-        std::unique_ptr<DeviceGraphBufferManager> buffer_manager_;
+        /// Standalone workspace allocator
+        std::unique_ptr<WorkspaceAllocator> workspace_allocator_;
 
-        /// Unified buffer arena (Phase 2) — tracks coherence for all activation buffers
-        /// Registered as external buffers (non-owning) alongside buffer_manager_ during
-        /// the migration. In Phase 5, arena will own buffers directly.
+        /// Unified buffer arena — owns and tracks coherence for all activation buffers
         std::unique_ptr<BufferArena> arena_;
 
         /// Owned tensors when using graph-managed allocation
@@ -2269,16 +2267,20 @@ namespace llaminar2
         bool ensureDeviceWorkspaceAllocated(const ComputeGraph &graph);
 
         /**
-         * @brief Populate managed_buffers_ from graph-managed allocations
-         * @param seq_len Sequence length for buffer sizing
+         * @brief Populate managed_buffers_ from arena-owned tensors.
+         *
+         * Maps BufferId → TensorBase* from the arena into the legacy
+         * ModelBuffers/ActivationBuffers struct for Qwen2Graph compatibility.
          */
-        void bindGraphManagedBuffers(int seq_len);
+        void bindArenaToManagedBuffers();
 
         /**
-         * @brief Initialize the BufferArena with existing managed buffers (Phase 2)
+         * @brief Initialize the BufferArena from existing managed buffers (legacy path)
          *
-         * Registers all managed_buffers_ activation buffers as external (non-owning)
-         * entries in the arena, enabling contract-based coherence for opted-in stages.
+         * For paths where managed_buffers_ is populated externally (e.g., PP stages),
+         * this registers all managed_buffers_ activation buffers as external (non-owning)
+         * entries in the arena. In the primary flow, initializeBuffers() creates the
+         * arena directly and this method is a no-op.
          */
         void initializeArena();
 

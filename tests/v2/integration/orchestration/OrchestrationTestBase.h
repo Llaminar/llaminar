@@ -40,7 +40,6 @@
 #include "mocks/MockMPITopology.h"
 #include "mocks/MockMPIContext.h"
 #include "mocks/MockComputeStage.h"
-#include "mocks/MockDeviceGraphBufferManager.h"
 #include "execution/mpi_orchestration/PlacementStrategy.h"
 #include "execution/mpi_orchestration/PlacementPlan.h"
 #include "execution/mpi_orchestration/DeviceInventory.h"

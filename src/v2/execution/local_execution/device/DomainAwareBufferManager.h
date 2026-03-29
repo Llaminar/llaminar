@@ -18,7 +18,6 @@
 
 #pragma once
 
-#include "../graph/DeviceGraphBufferManager.h"
 #include "../../debug/BufferRole.h" // For BufferTensorType
 #include "../../../config/LayerPlacementConfig.h"
 #include "../../../memory/NUMAAllocator.h"
@@ -32,8 +31,6 @@
 
 namespace llaminar2
 {
-
-    // Note: TensorBase is already defined as a typedef in DeviceGraphBufferManager.h
 
     /**
      * @brief Configuration for DomainAwareBufferManager
@@ -103,7 +100,7 @@ namespace llaminar2
     /**
      * @brief Domain-aware buffer manager for heterogeneous execution
      *
-     * Extends DeviceGraphBufferManager with device-aware allocation based on
+     * Provides device-aware allocation based on
      * layer placement configuration. Automatically routes buffer allocation
      * to the correct device (GPU or CPU) based on which device will
      * execute the layer.

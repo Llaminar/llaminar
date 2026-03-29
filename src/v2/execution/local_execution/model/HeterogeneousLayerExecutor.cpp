@@ -9,7 +9,6 @@
 #include "HeterogeneousLayerExecutor.h"
 #include "../graph/DeviceGraphExecutor.h"
 #include "../device/DeviceContext.h"
-#include "../graph/DeviceGraphBufferManager.h"
 #include "../../../interfaces/ICollectiveContext.h"
 #include "../../../utils/Logger.h"
 

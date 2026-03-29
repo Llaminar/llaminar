@@ -1219,22 +1219,6 @@ add_v2_test(V2_Unit_MockWorkDistributor
     MPI_PROCS 1
 )
 
-# Test: MockGraphBufferManager - Mock graph buffer manager for unit testing without tensor allocation
-add_executable(v2_unit_mock_graph_buffer_manager unit/mocks/Test__MockGraphBufferManager.cpp)
-target_include_directories(v2_unit_mock_graph_buffer_manager PRIVATE 
-    ${CMAKE_CURRENT_SOURCE_DIR}  # For tests/v2/mocks/ include path
-)
-target_link_libraries(v2_unit_mock_graph_buffer_manager 
-    llaminar2_core 
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Unit_MockGraphBufferManager 
-    COMMAND $<TARGET_FILE:v2_unit_mock_graph_buffer_manager>
-    LABELS "V2;Unit;Mock;DeviceGraphBufferManager;Testing"
-    MPI_PROCS 1
-)
-
 # Test: MockWeightPlacementMap - Mock weight placement map for unit testing without real device placement
 add_executable(v2_unit_mock_weight_placement_map unit/mocks/Test__MockWeightPlacementMap.cpp)
 target_include_directories(v2_unit_mock_weight_placement_map PRIVATE 
@@ -4610,28 +4594,6 @@ add_v2_test(V2_Unit_BufferRole
     MPI_PROCS 1
 )
 
-# Test: DeviceGraphBufferManager (centralized buffer allocation and management)
-# Tests buffer allocation, retrieval, statistics, graph allocation, and executor integration
-# Part of Phase 2: DeviceGraphExecutor buffer management infrastructure
-add_executable(v2_test_graph_buffer_manager unit/execution/local_execution/graph/Test__GraphBufferManager.cpp)
-target_link_libraries(v2_test_graph_buffer_manager llaminar2_core GTest::gtest GTest::gtest_main)
-add_v2_test(V2_Unit_GraphBufferManager
-    COMMAND $<TARGET_FILE:v2_test_graph_buffer_manager>
-    LABELS "V2;Unit;Execution;DeviceGraphBufferManager;BufferManagement;TensorAllocation"
-    MPI_PROCS 1
-)
-
-# Test: DeviceGraphBufferManager BAR Allocation (Phase 3: BAR-backed tensor support)
-# Tests integration between DeviceGraphBufferManager and TensorFactory for BAR-backed
-# tensor allocation when using PCIeBAR backend with heterogeneous CUDA/ROCm GPUs.
-add_executable(v2_test_graph_buffer_manager_bar_allocation unit/execution/local_execution/graph/Test__GraphBufferManager_BARAllocation.cpp)
-target_link_libraries(v2_test_graph_buffer_manager_bar_allocation llaminar2_core GTest::gtest GTest::gtest_main)
-add_v2_test(V2_Unit_GraphBufferManager_BARAllocation
-    COMMAND $<TARGET_FILE:v2_test_graph_buffer_manager_bar_allocation>
-    LABELS "V2;Unit;Execution;DeviceGraphBufferManager;BufferManagement;PCIeBAR;Heterogeneous;TensorParallelism"
-    MPI_PROCS 1
-)
-
 # Test: DomainAwareBufferManager (Phase 5.2: Domain-aware buffer allocation)
 # Tests domain-aware buffer allocation based on layer placement configuration.
 # GPU layers get GPU buffers, CPU layers get NUMA-local CPU buffers.
@@ -4640,17 +4602,6 @@ target_link_libraries(v2_test_domain_aware_buffer_manager llaminar2_core GTest::
 add_v2_test(V2_Unit_DomainAwareBufferManager
     COMMAND $<TARGET_FILE:v2_test_domain_aware_buffer_manager>
     LABELS "V2;Unit;Execution;DomainAwareBufferManager;BufferManagement;LayerPlacement;NUMA"
-    MPI_PROCS 1
-)
-
-# Test: CollectiveBufferAllocation (Phase 3 Buffer Registration API)
-# Tests integration of BAR-region allocator with buffer management
-# for collective operations (AllReduce, AllGather)
-add_executable(v2_test_collective_buffer_allocation unit/collective/Test__CollectiveBufferAllocation.cpp)
-target_link_libraries(v2_test_collective_buffer_allocation llaminar2_core GTest::gtest GTest::gtest_main)
-add_v2_test(V2_Unit_CollectiveBufferAllocation
-    COMMAND $<TARGET_FILE:v2_test_collective_buffer_allocation>
-    LABELS "V2;Unit;Execution;Collective;BufferRegistration;PCIeBAR;CrossVendor"
     MPI_PROCS 1
 )
 
@@ -4985,7 +4936,7 @@ add_v2_test(V2_Unit_HeterogeneousLayerExecutor
 
 # Test: StageBufferRequirements (IComputeStage::getBufferRequirements())
 # Tests buffer requirement declarations for all compute stages (SwiGLU, ResidualAdd,
-# RMSNorm, RoPE, GEMM, FusedQKVGEMM, FusedGateUpGEMM) for DeviceGraphBufferManager integration
+# RMSNorm, RoPE, GEMM, FusedQKVGEMM, FusedGateUpGEMM) for BufferArena integration
 # Part of Phase 3: Stage Migration for buffer management infrastructure
 add_executable(v2_test_stage_buffer_requirements unit/execution/compute_stages/Test__StageBufferRequirements.cpp)
 target_link_libraries(v2_test_stage_buffer_requirements llaminar2_core GTest::gtest GTest::gtest_main)
@@ -5247,7 +5198,7 @@ add_v2_test(V2_Unit_CrossBackendCoherence
     MPI_PROCS 1
 )
 
-# Test: Qwen2GraphBufferManagement (DeviceGraphBufferManager integration with DeviceGraphOrchestrator)
+# Test: Qwen2GraphBufferManagement (BufferArena integration with DeviceGraphOrchestrator)
 # Tests setTensorFactory/initializeBuffers workflow, buffer allocation/binding,
 # statistics tracking, and release cleanup.
 # Part of Phase 3: Buffer Management moved to DeviceGraphOrchestrator
@@ -5255,7 +5206,7 @@ add_executable(v2_test_device_graph_orchestrator_buffer_mgmt unit/execution/loca
 target_link_libraries(v2_test_device_graph_orchestrator_buffer_mgmt llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Unit_DeviceGraphOrchestratorBufferManagement
     COMMAND $<TARGET_FILE:v2_test_device_graph_orchestrator_buffer_mgmt>
-    LABELS "V2;Unit;DeviceGraphOrchestrator;BufferManagement;DeviceGraphBufferManager"
+    LABELS "V2;Unit;DeviceGraphOrchestrator;BufferManagement;BufferArena"
     MPI_PROCS 1
 )
 

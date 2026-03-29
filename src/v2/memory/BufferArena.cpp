@@ -5,9 +5,12 @@
 
 #include "BufferArena.h"
 #include "CoherenceTracker.h"
+#include "config/CollectiveBackendType.h"
+#include "execution/debug/BufferRole.h"
 #include "tensors/TensorClasses.h"
 #include "tensors/TensorFactory.h"
 #include "tensors/ITensor.h"
+#include "models/qwen/Qwen2BufferSpec.h"
 #include "utils/Logger.h"
 
 #include <algorithm>
@@ -144,6 +147,180 @@ namespace llaminar2
     }
 
     // =========================================================================
+    // Tensor creation helper
+    // =========================================================================
+
+    /// Map BufferId to BufferNames string for Qwen2BufferSpec BAR detection.
+    static const char *bufferIdToBufferName(BufferId id)
+    {
+        switch (id)
+        {
+        case BufferId::ATTN_PROJ:
+            return "attn_proj";
+        case BufferId::FFN_OUTPUT:
+            return "ffn_output";
+        case BufferId::HIDDEN_STATE:
+            return "current_hidden";
+        case BufferId::LOGITS:
+            return "logits";
+        default:
+            return nullptr;
+        }
+    }
+
+    /// Map buffer name string (from BufferDescriptor/BufferNames) to BufferId.
+    /// Returns BufferId::_COUNT if no mapping exists.
+    BufferId BufferArena::bufferNameToId(const std::string &name)
+    {
+        // Layer-level activation buffers
+        if (name == "residual")
+            return BufferId::RESIDUAL;
+        if (name == "normalized")
+            return BufferId::NORMALIZED;
+        if (name == "Q")
+            return BufferId::Q_PROJ;
+        if (name == "K")
+            return BufferId::K_PROJ;
+        if (name == "V")
+            return BufferId::V_PROJ;
+        if (name == "attn_output")
+            return BufferId::ATTN_OUTPUT;
+        if (name == "attn_proj")
+            return BufferId::ATTN_PROJ;
+        if (name == "workspace_scores")
+            return BufferId::ATTN_SCORES_WORKSPACE;
+        if (name == "workspace_context")
+            return BufferId::ATTN_CONTEXT_WORKSPACE;
+        if (name == "workspace_mask")
+            return BufferId::GEMM_WORKSPACE; // reuse for mask
+        if (name == "gate")
+            return BufferId::GATE_PROJ;
+        if (name == "up")
+            return BufferId::UP_PROJ;
+        if (name == "ffn_output")
+            return BufferId::FFN_OUTPUT;
+
+        // Model-level buffers
+        if (name == "current_hidden" || name == "hidden")
+            return BufferId::HIDDEN_STATE;
+        if (name == "logits")
+            return BufferId::LOGITS;
+
+        return BufferId::_COUNT; // sentinel: no mapping
+    }
+
+    /// Convert BufferTensorType enum to dtype string for registerBuffer().
+    const char *BufferArena::bufferTensorTypeToStr(BufferTensorType type)
+    {
+        switch (type)
+        {
+        case BufferTensorType::FP32:
+            return "FP32";
+        case BufferTensorType::FP16:
+            return "FP16";
+        case BufferTensorType::BF16:
+            return "BF16";
+        case BufferTensorType::Q8_1:
+            return "Q8_1";
+        case BufferTensorType::Q8_0:
+            return "Q8_0";
+        case BufferTensorType::INT32:
+            return "INT32";
+        default:
+            return "FP32"; // safe default
+        }
+    }
+
+    std::shared_ptr<TensorBase> BufferArena::createTensorForBuffer(
+        const ManagedBuffer &b, BufferId id) const
+    {
+        std::vector<size_t> shape{b.rows, b.cols};
+
+        // ── BAR-backed path ─────────────────────────────────────────────
+        if (config_.factory && config_.tp_degree > 1)
+        {
+            const char *buf_name = bufferIdToBufferName(id);
+            if (buf_name &&
+                Qwen2BufferSpec::requiresBARBacked(
+                    buf_name, config_.collective_backend, config_.tp_degree) &&
+                config_.factory->canCreateBARBacked() &&
+                config_.rocm_device.is_rocm() &&
+                config_.cuda_device.is_cuda() &&
+                b.home_device.is_rocm())
+            {
+                try
+                {
+                    auto bar_tensor = config_.factory->createFP32BARBacked(
+                        shape, config_.rocm_device, config_.cuda_device);
+                    if (bar_tensor)
+                    {
+                        LOG_DEBUG("[BufferArena] Created BAR-backed FP32 tensor for '"
+                                  << bufferIdName(id) << "'");
+                        return bar_tensor;
+                    }
+                }
+                catch (const std::exception &e)
+                {
+                    LOG_WARN("[BufferArena] BAR-backed allocation failed for '"
+                             << bufferIdName(id) << "': " << e.what()
+                             << " - falling back to standard allocation");
+                }
+            }
+        }
+
+        // ── Factory-based allocation (NUMA-aware, dtype-aware) ──────────
+        if (config_.factory)
+        {
+            // Mapped memory for GPU FP32 tensors in snapshot/debugging mode
+            if (config_.use_mapped_memory && b.home_device.is_gpu() &&
+                b.dtype && std::string(b.dtype) == "FP32")
+            {
+                auto mapped = FP32Tensor::createMapped(shape, b.home_device);
+                if (mapped && mapped->isMapped())
+                {
+                    LOG_DEBUG("[BufferArena] Created mapped FP32 tensor for '"
+                              << bufferIdName(id) << "' on " << b.home_device.toString());
+                    return mapped;
+                }
+                LOG_WARN("[BufferArena] Mapped allocation failed for '"
+                         << bufferIdName(id) << "', using regular allocation");
+            }
+
+            // Dispatch by dtype string
+            if (!b.dtype || std::string(b.dtype) == "FP32")
+            {
+                return config_.factory->createFP32(shape, b.home_device);
+            }
+            else if (std::string(b.dtype) == "FP16")
+            {
+                return config_.factory->createFP16(shape);
+            }
+            else if (std::string(b.dtype) == "BF16")
+            {
+                return config_.factory->createBF16(shape);
+            }
+            else if (std::string(b.dtype) == "Q8_1")
+            {
+                return config_.factory->createQ8_1(shape, b.home_device);
+            }
+            else if (std::string(b.dtype) == "INT32")
+            {
+                return config_.factory->createINT32(shape);
+            }
+            else
+            {
+                LOG_DEBUG("[BufferArena] Unknown dtype '" << b.dtype
+                                                          << "' for " << bufferIdName(id)
+                                                          << ", defaulting to FP32");
+                return config_.factory->createFP32(shape, b.home_device);
+            }
+        }
+
+        // ── Fallback: direct FP32 construction (no factory, no NUMA) ────
+        return std::make_shared<FP32Tensor>(shape, b.home_device);
+    }
+
+    // =========================================================================
     // Allocation
     // =========================================================================
 
@@ -155,8 +332,8 @@ namespace llaminar2
             return false;
         }
 
-        // For now, we only create FP32 tensors for arena-owned buffers.
-        // Additional dtype support can be added incrementally.
+        stats_.reset();
+
         for (size_t i = 0; i < kBufferCount; ++i)
         {
             auto &b = buffers_[i];
@@ -167,16 +344,27 @@ namespace llaminar2
             if (b.owned_tensor)
                 continue; // Should not happen
 
-            // Create an FP32Tensor for the registered shape
-            // TODO: support more dtypes as stages are migrated
-            auto tensor = std::make_shared<FP32Tensor>(
-                std::vector<size_t>{b.rows, b.cols}, b.home_device);
+            auto bid = static_cast<BufferId>(i);
+            auto tensor = createTensorForBuffer(b, bid);
+            if (!tensor)
+            {
+                LOG_ERROR("[BufferArena] Failed to allocate buffer '"
+                          << bufferIdName(bid) << "'");
+                return false;
+            }
+
+            size_t bytes = tensor->size_bytes();
+            stats_.total_buffers++;
+            stats_.total_bytes += bytes;
 
             b.owned_tensor = tensor;
             b.coherence.authority = CoherenceState::UNINITIALIZED;
         }
 
         allocated_ = true;
+
+        LOG_DEBUG("[BufferArena] Allocated " << stats_.total_buffers << " buffers, "
+                                             << (stats_.total_bytes / 1024.0 / 1024.0) << " MB total");
         return true;
     }
 

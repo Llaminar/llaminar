@@ -19,6 +19,8 @@
 #include "memory/StageBoundBuffers.h"
 #include "memory/CoherenceTracker.h"
 #include "tensors/TensorClasses.h"
+#include "tensors/TensorFactory.h"
+#include "utils/MPIContext.h"
 #include "backends/DeviceId.h"
 
 using namespace llaminar2;
@@ -802,4 +804,123 @@ TEST(Test__ArenaContractCoherence, MarkWrittenFlagsOnlyDoesNotRecordEvent)
 
     auto state = arena.getCoherenceState(BufferId::FFN_OUTPUT);
     EXPECT_EQ(state.authority, CoherenceState::HOST);
+}
+
+// ============================================================================
+// Factory-based Allocation Tests (Phase 2)
+// ============================================================================
+
+TEST(Test__BufferArena, AllocateWithFactoryCreatesFP32)
+{
+    // Create a real TensorFactory for the test
+    MPIContext mpi_ctx(0, 1);
+    TensorFactory factory(mpi_ctx);
+
+    ArenaConfig config;
+    config.factory = &factory;
+
+    BufferArena arena(config);
+    arena.registerBuffer(BufferId::HIDDEN_STATE, 4, 896, "FP32", DeviceId::cpu());
+    arena.registerBuffer(BufferId::Q_PROJ, 4, 128, "FP32", DeviceId::cpu());
+
+    EXPECT_TRUE(arena.allocate());
+
+    auto *t1 = arena.getTensor(BufferId::HIDDEN_STATE);
+    auto *t2 = arena.getTensor(BufferId::Q_PROJ);
+    ASSERT_NE(t1, nullptr);
+    ASSERT_NE(t2, nullptr);
+    EXPECT_EQ(t1->rows(), 4u);
+    EXPECT_EQ(t1->cols(), 896u);
+    EXPECT_EQ(t2->rows(), 4u);
+    EXPECT_EQ(t2->cols(), 128u);
+}
+
+TEST(Test__BufferArena, AllocateWithFactoryCreatesBF16)
+{
+    MPIContext mpi_ctx(0, 1);
+    TensorFactory factory(mpi_ctx);
+
+    ArenaConfig config;
+    config.factory = &factory;
+
+    BufferArena arena(config);
+    arena.registerBuffer(BufferId::NORMALIZED, 4, 896, "BF16", DeviceId::cpu());
+
+    EXPECT_TRUE(arena.allocate());
+
+    auto *t = arena.getTensor(BufferId::NORMALIZED);
+    ASSERT_NE(t, nullptr);
+    EXPECT_EQ(t->rows(), 4u);
+    EXPECT_EQ(t->cols(), 896u);
+}
+
+TEST(Test__BufferArena, AllocateWithFactoryCreatesQ8_1)
+{
+    MPIContext mpi_ctx(0, 1);
+    TensorFactory factory(mpi_ctx);
+
+    ArenaConfig config;
+    config.factory = &factory;
+
+    BufferArena arena(config);
+    arena.registerBuffer(BufferId::Q_QUANTIZED, 4, 128, "Q8_1", DeviceId::cpu());
+
+    EXPECT_TRUE(arena.allocate());
+
+    auto *t = arena.getTensor(BufferId::Q_QUANTIZED);
+    ASSERT_NE(t, nullptr);
+    EXPECT_EQ(t->rows(), 4u);
+}
+
+TEST(Test__BufferArena, AllocationStatsTracked)
+{
+    MPIContext mpi_ctx(0, 1);
+    TensorFactory factory(mpi_ctx);
+
+    ArenaConfig config;
+    config.factory = &factory;
+
+    BufferArena arena(config);
+    arena.registerBuffer(BufferId::HIDDEN_STATE, 4, 896, "FP32", DeviceId::cpu());
+    arena.registerBuffer(BufferId::Q_PROJ, 4, 128, "FP32", DeviceId::cpu());
+
+    EXPECT_TRUE(arena.allocate());
+
+    const auto &stats = arena.stats();
+    EXPECT_EQ(stats.total_buffers, 2u);
+    EXPECT_GT(stats.total_bytes, 0u);
+    // FP32: 4*896*4 + 4*128*4 = 14336 + 2048 = 16384 bytes
+    EXPECT_EQ(stats.total_bytes, 4u * 896u * 4u + 4u * 128u * 4u);
+}
+
+TEST(Test__BufferArena, SetConfigAfterConstruction)
+{
+    MPIContext mpi_ctx(0, 1);
+    TensorFactory factory(mpi_ctx);
+
+    BufferArena arena; // No config initially
+    arena.registerBuffer(BufferId::HIDDEN_STATE, 4, 896, "FP32", DeviceId::cpu());
+
+    // Set config before allocate
+    ArenaConfig config;
+    config.factory = &factory;
+    arena.setConfig(config);
+
+    EXPECT_TRUE(arena.allocate());
+    EXPECT_NE(arena.getTensor(BufferId::HIDDEN_STATE), nullptr);
+    EXPECT_EQ(arena.stats().total_buffers, 1u);
+}
+
+TEST(Test__BufferArena, FallbackWithoutFactory)
+{
+    // Without factory, should still work (fallback to direct FP32 construction)
+    BufferArena arena;
+    arena.registerBuffer(BufferId::HIDDEN_STATE, 4, 896, "FP32", DeviceId::cpu());
+
+    EXPECT_TRUE(arena.allocate());
+    auto *t = arena.getTensor(BufferId::HIDDEN_STATE);
+    ASSERT_NE(t, nullptr);
+    EXPECT_EQ(t->rows(), 4u);
+    EXPECT_EQ(t->cols(), 896u);
+    EXPECT_EQ(arena.stats().total_buffers, 1u);
 }
