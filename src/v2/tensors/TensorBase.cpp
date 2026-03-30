@@ -1906,9 +1906,11 @@ namespace llaminar2
         }
 
         // ===== BAR-BACKED BUFFER PATH =====
-        // BAR-backed tensors are host-readable through the BAR mmap address.
-        // For ROCm execution, gpu_data_ptr_ usually points at the HIP staging buffer,
-        // so we must flush staging -> BAR before host reads.
+        // BAR-backed tensors have ROCm VRAM staging + BAR mmap.
+        // For ensureOnHost(), we do DIRECT D2H from staging VRAM to host memory.
+        // We do NOT go through the BAR intermediate (staging→BAR→host) because
+        // hipMemcpy(D2D) to BAR-registered pointers is unreliable in multi-device
+        // concurrent scenarios (similar to cudaMemcpy D2D with IOMEMORY BAR sources).
         if (is_bar_backed_ && gpu_data_ptr_ && gpu_device_.has_value())
         {
             size_t bytes = byte_size();
@@ -1919,8 +1921,7 @@ namespace llaminar2
                 return false;
             }
 
-            // Synchronize with GPU before reading BAR region
-            // (need to ensure any pending writes are complete)
+            // Synchronize with GPU before reading
             if (device_completion_event_)
             {
                 IBackend *backend = resolveBackend(*gpu_device_);
@@ -1931,11 +1932,10 @@ namespace llaminar2
                 }
             }
 
-            const void *host_visible_src = bar_rocm_ptr_ ? bar_rocm_ptr_ : gpu_data_ptr_;
-
 #if defined(HAVE_ROCM)
-            if (gpu_device_->is_rocm() && hip_staging_ptr_ && bar_rocm_ptr_ && gpu_data_ptr_ == hip_staging_ptr_)
+            if (gpu_device_->is_rocm() && hip_staging_ptr_ && gpu_data_ptr_ == hip_staging_ptr_)
             {
+                // Direct D2H from ROCm staging VRAM to host — bypasses BAR entirely
                 hipError_t hip_err = hipSetDevice(gpu_device_->rocm_ordinal());
                 if (hip_err != hipSuccess)
                 {
@@ -1944,25 +1944,26 @@ namespace llaminar2
                     return false;
                 }
 
-                hip_err = hipMemcpy(bar_rocm_ptr_, hip_staging_ptr_, bytes, hipMemcpyDeviceToDevice);
+                hip_err = hipMemcpy(dst, hip_staging_ptr_, bytes, hipMemcpyDeviceToHost);
                 if (hip_err != hipSuccess)
                 {
-                    LOG_ERROR("[TensorBase::ensureOnHost] hipMemcpy staging->BAR failed: "
+                    LOG_ERROR("[TensorBase::ensureOnHost] hipMemcpy D2H from staging failed: "
                               << hipGetErrorString(hip_err));
                     return false;
                 }
 
-                hip_err = hipDeviceSynchronize();
-                if (hip_err != hipSuccess)
-                {
-                    LOG_ERROR("[TensorBase::ensureOnHost] hipDeviceSynchronize failed after staging->BAR copy: "
-                              << hipGetErrorString(hip_err));
-                    return false;
-                }
+                host_valid_ = true;
+                authoritative_device_ = std::nullopt;
 
-                host_visible_src = bar_rocm_ptr_;
+                LOG_DEBUG("[TensorBase::ensureOnHost] BAR-BACKED: Direct D2H from staging "
+                          << hip_staging_ptr_ << " -> " << dst
+                          << " (" << bytes << " bytes)");
+                return true;
             }
 #endif
+
+            // Non-ROCm BAR or no staging: fall through to standard BAR memcpy
+            const void *host_visible_src = bar_rocm_ptr_ ? bar_rocm_ptr_ : gpu_data_ptr_;
 
             LOG_DEBUG("[TensorBase::ensureOnHost] BAR-BACKED: Direct memcpy from BAR region "
                       << host_visible_src << " -> " << dst

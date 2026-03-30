@@ -714,28 +714,41 @@ namespace llaminar2
                 const auto &dev = forward_cache.pp_device;
                 if (dev.is_gpu())
                 {
-                    const void *src_ptr = forward_cache.pp_external_hidden_state->gpu_data_ptr();
-                    void *dst_ptr = forward_cache.pp_working_buffer->gpu_data_ptr();
-                    if (src_ptr && dst_ptr)
+                    // BAR-backed tensors (cuMemHostRegister IOMEMORY) don't support
+                    // cudaMemcpy D2D — only D2H works. Use host bounce.
+                    if (forward_cache.pp_external_hidden_state->isBARBacked())
                     {
-                        auto *router = GlobalBackendRouter::get();
-                        if (router)
+                        const float *src_host = forward_cache.pp_external_hidden_state->data();
+                        float *dst_host = forward_cache.pp_working_buffer->mutable_data();
+                        std::memcpy(dst_host, src_host, forward_cache.pp_copy_bytes);
+                        forward_cache.pp_working_buffer->ensureOnDevice(dev);
+                        forward_cache.pp_working_buffer->mark_device_dirty();
+                    }
+                    else
+                    {
+                        const void *src_ptr = forward_cache.pp_external_hidden_state->gpu_data_ptr();
+                        void *dst_ptr = forward_cache.pp_working_buffer->gpu_data_ptr();
+                        if (src_ptr && dst_ptr)
                         {
-                            auto *backend = router->getBackendForCopy(dev, dev);
-                            if (backend)
+                            auto *router = GlobalBackendRouter::get();
+                            if (router)
                             {
-                                backend->copy(dst_ptr, dev, src_ptr, dev,
-                                              forward_cache.pp_copy_bytes);
-                                forward_cache.pp_working_buffer->mark_device_dirty();
+                                auto *backend = router->getBackendForCopy(dev, dev);
+                                if (backend)
+                                {
+                                    backend->copy(dst_ptr, dev, src_ptr, dev,
+                                                  forward_cache.pp_copy_bytes);
+                                    forward_cache.pp_working_buffer->mark_device_dirty();
+                                }
                             }
                         }
                     }
                 }
                 else
                 {
-                    std::memcpy(forward_cache.pp_working_buffer->mutable_data(),
-                                forward_cache.pp_external_hidden_state->data(),
-                                forward_cache.pp_copy_bytes);
+                    const float *src_data = forward_cache.pp_external_hidden_state->data();
+                    float *dst_data = forward_cache.pp_working_buffer->mutable_data();
+                    std::memcpy(dst_data, src_data, forward_cache.pp_copy_bytes);
                 }
             }
 

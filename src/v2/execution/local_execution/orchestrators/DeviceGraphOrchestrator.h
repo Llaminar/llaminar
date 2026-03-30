@@ -1760,6 +1760,7 @@ namespace llaminar2
                     if (!dump.outputs.empty() && dump.outputs[0].data)
                     {
                         const auto &out = dump.outputs[0];
+
                         auto data = extractFp32FromOutput(out);
 
                         // Convert graph stage name to pipeline-style key

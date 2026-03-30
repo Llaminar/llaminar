@@ -1857,6 +1857,7 @@ namespace llaminar2
             // Only transfer the active region (seq_len tokens), not the full buffer
             const size_t active_bytes =
                 static_cast<size_t>(seq_len) * model_ctx_->embeddingLength() * sizeof(float);
+
             LOG_DEBUG("MultiDeviceOrchestrator::forwardPP: Transferring hidden state from stage "
                       << (stage_idx - 1) << " to stage " << stage_idx
                       << " (" << active_bytes << " bytes for " << seq_len << " tokens)");
@@ -1870,7 +1871,6 @@ namespace llaminar2
             }
 
             // Set the hidden state as input for current stage
-            // This makes the stage runner skip embedding and use the transferred hidden state
             curr_runner->setHiddenState(hidden_state);
 
             LOG_DEBUG("MultiDeviceOrchestrator::forwardPP: Executing stage " << stage_idx);

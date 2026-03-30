@@ -2001,10 +2001,23 @@ namespace llaminar2
         int src_idx = src_device.toKernelDeviceIndex();
         int dst_idx = dst_device.toKernelDeviceIndex();
 
-        // Require coordinator for all copies (including same-device for consistency)
+        // Same-device copy: use cudaMemcpy directly (no coordinator needed)
+        if (src_device == dst_device && !coordinator_)
+        {
+            if (!nccl_backend_detail::cudaMemcpySameDevice(dst_ptr, src_ptr, bytes, src_idx))
+            {
+                last_error_ = "NCCLBackend::copy: cudaMemcpySameDevice failed: " +
+                              nccl_backend_detail::cudaGetLastErrorString();
+                LOG_ERROR(last_error_);
+                return false;
+            }
+            return true;
+        }
+
+        // Cross-device or coordinator-available: require coordinator
         if (!coordinator_)
         {
-            last_error_ = "NCCLBackend::copy: coordinator not initialized";
+            last_error_ = "NCCLBackend::copy: coordinator not initialized for cross-device copy";
             LOG_ERROR(last_error_);
             return false;
         }

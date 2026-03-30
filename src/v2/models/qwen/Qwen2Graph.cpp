@@ -618,36 +618,24 @@ namespace llaminar2
                 // The external_hidden_state may be GPU-authoritative from previous PP stage
                 if (config_.default_device.is_gpu())
                 {
-                    // GPU execution path: handle coherence properly
-                    // For PP transfers, the external_hidden_state may be:
-                    // 1. BAR-backed (transferred via PCIe BAR) - already accessible from target
-                    // 2. Regular GPU tensor - need ensureOnDevice()
-
                     DeviceId target_device = config_.default_device;
-                    const void *src_ptr = nullptr;
 
-                    // Check if source is BAR-backed (from PCIe BAR transfer)
+                    // BAR-backed tensors use cuMemHostRegister(IOMEMORY) pointers.
+                    // cudaMemcpy(D2D) with IOMEMORY source produces garbage — only
+                    // D2H works correctly.  Use host bounce for BAR-backed sources.
                     if (input.external_hidden_state->isBARBacked())
                     {
-                        // BAR-backed tensor: get the appropriate pointer for the target device
-                        if (target_device.is_rocm())
+                        const float *src_host = input.external_hidden_state->data();
+                        float *dst_host = working_buffer->mutable_data();
+                        std::memcpy(dst_host, src_host, copy_bytes);
+                        if (!working_buffer->ensureOnDevice(target_device))
                         {
-                            // For ROCm target, use the BAR address directly (for D2D copy)
-                            // The rocm_data_ptr() might not be available (HIP staging not allocated)
-                            // but bar_address() gives us the BAR mmap address usable with hipMemcpy
-                            src_ptr = input.external_hidden_state->bar_address();
-                            if (!src_ptr)
-                            {
-                                // Fallback to gpu_data_ptr() which might be the CUDA-accessible pointer
-                                src_ptr = input.external_hidden_state->gpu_data_ptr();
-                            }
+                            LOG_ERROR("[Qwen2Graph] Failed to upload working buffer after BAR host bounce");
+                            throw std::runtime_error("Failed to upload working buffer");
                         }
-                        else
-                        {
-                            // For CUDA target, use the regular gpu_data_ptr()
-                            src_ptr = input.external_hidden_state->gpu_data_ptr();
-                        }
-                        LOG_DEBUG("[Qwen2Graph] PP copy: source is BAR-backed, src_ptr=" << src_ptr);
+                        working_buffer->mark_device_dirty();
+                        LOG_DEBUG("[Qwen2Graph] PP BAR host-bounce copy: " << copy_bytes
+                                                                           << " bytes to " << target_device.toString());
                     }
                     else
                     {
@@ -658,67 +646,59 @@ namespace llaminar2
                                       << target_device.toString());
                             throw std::runtime_error("Failed to upload external_hidden_state to device");
                         }
-                        src_ptr = input.external_hidden_state->gpu_data_ptr();
+                        const void *src_ptr = input.external_hidden_state->gpu_data_ptr();
+                        if (!src_ptr)
+                        {
+                            LOG_ERROR("[Qwen2Graph] Source pointer null for PP copy");
+                            throw std::runtime_error("Source pointer not available for PP copy");
+                        }
+
+                        // Allocate destination on device (don't upload stale host data)
+                        if (!working_buffer->allocateOnDevice(target_device))
+                        {
+                            LOG_ERROR("[Qwen2Graph] Failed to allocate working_buffer on "
+                                      << target_device.toString());
+                            throw std::runtime_error("Failed to allocate working_buffer on device");
+                        }
+
+                        void *dst_ptr = working_buffer->gpu_data_ptr();
+                        if (!dst_ptr)
+                        {
+                            LOG_ERROR("[Qwen2Graph] Destination pointer null for PP copy");
+                            throw std::runtime_error("Destination pointer not available for PP copy");
+                        }
+
+                        auto *router = GlobalBackendRouter::get();
+                        if (!router)
+                        {
+                            LOG_ERROR("[Qwen2Graph] GlobalBackendRouter not initialized");
+                            throw std::runtime_error("Backend router not available for PP copy");
+                        }
+
+                        ICollectiveBackend *backend = router->getBackendForCopy(target_device, target_device);
+                        if (!backend)
+                        {
+                            LOG_ERROR("[Qwen2Graph] No backend for " << target_device.toString());
+                            throw std::runtime_error("No backend available for PP copy");
+                        }
+
+                        if (!backend->copy(dst_ptr, target_device, src_ptr, target_device, copy_bytes))
+                        {
+                            LOG_ERROR("[Qwen2Graph] Backend copy failed for PP hidden state");
+                            throw std::runtime_error("Backend copy failed for PP hidden state");
+                        }
+
+                        working_buffer->mark_device_dirty();
+                        LOG_DEBUG("[Qwen2Graph] PP GPU D2D copy: " << copy_bytes << " bytes on "
+                                                                   << target_device.toString());
                     }
-
-                    if (!src_ptr)
-                    {
-                        LOG_ERROR("[Qwen2Graph] Source pointer null for PP copy");
-                        throw std::runtime_error("Source pointer not available for PP copy");
-                    }
-
-                    // Allocate destination on device (don't upload stale host data)
-                    if (!working_buffer->allocateOnDevice(target_device))
-                    {
-                        LOG_ERROR("[Qwen2Graph] Failed to allocate working_buffer on "
-                                  << target_device.toString());
-                        throw std::runtime_error("Failed to allocate working_buffer on device");
-                    }
-
-                    void *dst_ptr = working_buffer->gpu_data_ptr();
-                    if (!dst_ptr)
-                    {
-                        LOG_ERROR("[Qwen2Graph] Destination pointer null for PP copy");
-                        throw std::runtime_error("Destination pointer not available for PP copy");
-                    }
-
-                    // Use GlobalBackendRouter for device-agnostic copy
-                    auto *router = GlobalBackendRouter::get();
-                    if (!router)
-                    {
-                        LOG_ERROR("[Qwen2Graph] GlobalBackendRouter not initialized");
-                        throw std::runtime_error("Backend router not available for PP copy");
-                    }
-
-                    // For BAR-backed source, we need to use the PCIeBAR backend or same-device copy
-                    // The source device is effectively the target device since BAR provides cross-device access
-                    ICollectiveBackend *backend = router->getBackendForCopy(target_device, target_device);
-                    if (!backend)
-                    {
-                        LOG_ERROR("[Qwen2Graph] No backend for " << target_device.toString());
-                        throw std::runtime_error("No backend available for PP copy");
-                    }
-
-                    // Perform device copy using backend API
-                    if (!backend->copy(dst_ptr, target_device, src_ptr, target_device, copy_bytes))
-                    {
-                        LOG_ERROR("[Qwen2Graph] Backend copy failed for PP hidden state");
-                        throw std::runtime_error("Backend copy failed for PP hidden state");
-                    }
-
-                    // Mark destination as device-authoritative (GPU has latest data)
-                    working_buffer->mark_device_dirty();
-
-                    LOG_DEBUG("[Qwen2Graph] PP GPU copy: " << copy_bytes << " bytes on "
-                                                           << target_device.toString());
                 }
                 else
                 {
                     // CPU execution path: direct memcpy between host buffers
-                    std::memcpy(working_buffer->mutable_data(),
-                                input.external_hidden_state->data(),
-                                copy_bytes);
-                    LOG_DEBUG("[Qwen2Graph] PP CPU copy: " << copy_bytes << " bytes");
+                    const float *src = input.external_hidden_state->data();
+                    float *dst = working_buffer->mutable_data();
+                    std::memcpy(dst, src, copy_bytes);
                 }
             }
             else

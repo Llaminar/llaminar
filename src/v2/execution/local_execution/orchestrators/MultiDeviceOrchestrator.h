@@ -204,7 +204,7 @@ namespace llaminar2
             ActivationPrecision activation_precision = ActivationPrecision::FP32;
 
             /// KV cache scale factor
-            float kv_cache_scale = 1.0f;
+            float kv_cache_scale = 256.0f;
 
             /// Explicit KV cache precision mode (AUTO preserves legacy behavior)
             KVCachePrecision kv_cache_precision = KVCachePrecision::AUTO;

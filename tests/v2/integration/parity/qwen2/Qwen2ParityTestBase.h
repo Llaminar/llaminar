@@ -664,102 +664,53 @@ namespace llaminar2::test::parity::qwen2
                     }
                 }
 
-                if (has_tp_stages)
+                // =========================================================
+                // Both pure PP and hybrid PP+TP use MDO's production path.
+                // MDO::detectMode() auto-selects PP vs TP_PP based on
+                // whether any stage has multiple devices (isTPDomain()).
+                // =========================================================
+                (void)has_tp_stages; // Used only for logging below
+                (void)child_runners; // MDO creates its own runners internally
+
+                MultiDeviceOrchestrator::Config mdo_config;
+                mdo_config.max_seq_len = 4096;
+                mdo_config.batch_size = 1;
+
+                for (const auto &child : node.children)
                 {
-                    // =========================================================
-                    // Hybrid PP+TP: Use LocalPPTestRunner with pre-compiled
-                    // child runners. The tree compiler already created:
-                    //   - MDO(TP) for TP stages (from full model_ctx)
-                    //   - DGO for single-device stages (from createPPStageRunner)
-                    // We just need to sequence them with PP semantics.
-                    // =========================================================
+                    MultiDeviceOrchestrator::PPStageConfig stage_cfg;
+                    stage_cfg.first_layer = child.first_layer;
+                    stage_cfg.last_layer = child.last_layer + 1;
+                    stage_cfg.has_embedding = child.has_embedding;
+                    stage_cfg.has_lm_head = child.has_lm_head;
 
-                    if (child_runners.size() != node.children.size())
+                    auto leaves = child.leafDevices();
+                    for (const auto *leaf : leaves)
                     {
-                        LOG_ERROR("[TreeFactory] Hybrid PP+TP: expected " << node.children.size()
-                                                                          << " child runners, got " << child_runners.size());
-                        return nullptr;
+                        stage_cfg.stage_devices.push_back(leaf->device);
                     }
 
-                    // Build LocalPPConfig for activation transfers
-                    LocalPPConfig pp_config;
-                    pp_config.layer_boundaries.push_back(node.children[0].first_layer);
-
-                    for (const auto &child : node.children)
+                    // Propagate TP config from tree node
+                    if (child.type == ParallelismNodeType::TENSOR_PARALLEL)
                     {
-                        // Use first leaf device as representative for each stage
-                        auto leaves = child.leafDevices();
-                        if (leaves.empty())
-                        {
-                            LOG_ERROR("[TreeFactory] PP child has no leaf devices");
-                            return nullptr;
-                        }
-                        pp_config.stage_devices.push_back(leaves[0]->device);
-                        // Tree uses inclusive last_layer, boundaries are exclusive
-                        pp_config.layer_boundaries.push_back(child.last_layer + 1);
+                        stage_cfg.tp_weights = child.tp_weights;
+                        stage_cfg.tp_backend = child.backend;
                     }
 
-                    if (!pp_config.isValid())
-                    {
-                        LOG_ERROR("[TreeFactory] Invalid LocalPPConfig for hybrid PP+TP");
-                        return nullptr;
-                    }
-
-                    // Create PP context for inter-stage hidden state transfers
-                    std::unique_ptr<ILocalPPContext> pp_ctx;
-                    try
-                    {
-                        pp_ctx = createLocalPPContext(pp_config);
-                    }
-                    catch (const std::exception &e)
-                    {
-                        LOG_WARN("[TreeFactory] Failed to create LocalPPContext: " << e.what()
-                                                                                   << " — will attempt transfers without PP context");
-                    }
-
-                    return std::make_unique<LocalPPTestRunner>(
-                        std::move(child_runners), std::move(pp_ctx));
+                    mdo_config.pp_stages.push_back(std::move(stage_cfg));
                 }
-                else
+
+                // AUTO mode: MDO detects PP vs TP_PP based on stage device counts
+                mdo_config.mode = MultiDeviceOrchestrator::ParallelismMode::AUTO;
+
+                if (!mdo_config.validate())
                 {
-                    // =========================================================
-                    // Pure PP: Create MDO(PP) from scratch.
-                    // This works correctly because MDO(PP) uses
-                    // createPPStageRunner for each stage, which handles
-                    // partial weights properly.
-                    // =========================================================
-                    MultiDeviceOrchestrator::Config mdo_config;
-                    mdo_config.max_seq_len = 4096;
-                    mdo_config.batch_size = 1;
-
-                    for (const auto &child : node.children)
-                    {
-                        MultiDeviceOrchestrator::PPStageConfig stage_cfg;
-                        stage_cfg.first_layer = child.first_layer;
-                        stage_cfg.last_layer = child.last_layer + 1;
-                        stage_cfg.has_embedding = child.has_embedding;
-                        stage_cfg.has_lm_head = child.has_lm_head;
-
-                        auto leaves = child.leafDevices();
-                        for (const auto *leaf : leaves)
-                        {
-                            stage_cfg.stage_devices.push_back(leaf->device);
-                        }
-
-                        mdo_config.pp_stages.push_back(std::move(stage_cfg));
-                    }
-
-                    mdo_config.mode = MultiDeviceOrchestrator::ParallelismMode::PP;
-
-                    if (!mdo_config.validate())
-                    {
-                        LOG_ERROR("[TreeFactory] Invalid PP config from tree");
-                        return nullptr;
-                    }
-
-                    auto orch = std::make_unique<MultiDeviceOrchestrator>(model_ctx, mdo_config);
-                    return orch;
+                    LOG_ERROR("[TreeFactory] Invalid PP config from tree");
+                    return nullptr;
                 }
+
+                auto orch = std::make_unique<MultiDeviceOrchestrator>(model_ctx, mdo_config);
+                return orch;
             };
         }
 
