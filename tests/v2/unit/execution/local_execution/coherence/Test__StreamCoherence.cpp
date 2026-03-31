@@ -93,8 +93,8 @@ public:
     // ---- Expose protected state ----
 
     void *getCompletionEvent() const { return device_completion_event_; }
-    bool getHostValid() const { return host_valid_; }
-    bool getDeviceValid() const { return device_valid_; }
+    bool getHostValid() const { return ::llaminar2::isHostValid(coherence_state_); }
+    bool getDeviceValid() const { return ::llaminar2::isDeviceValid(coherence_state_); }
     std::optional<DeviceId> getGpuDevice() const { return gpu_device_; }
     std::optional<DeviceId> getAuthoritativeDevice() const { return authoritative_device_; }
 
@@ -112,12 +112,22 @@ public:
 
     void injectDeviceValid(bool valid)
     {
-        device_valid_ = valid;
+        if (valid && !::llaminar2::isHostValid(coherence_state_))
+            setCoherenceState_(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+        else if (valid && ::llaminar2::isHostValid(coherence_state_))
+            setCoherenceState_(TensorCoherenceState::SYNCED);
+        else if (!valid && ::llaminar2::isHostValid(coherence_state_))
+            setCoherenceState_(TensorCoherenceState::HOST_AUTHORITATIVE);
     }
 
     void injectHostValid(bool valid)
     {
-        host_valid_ = valid;
+        if (::llaminar2::isDeviceValid(coherence_state_) && !valid)
+            setCoherenceState_(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+        else if (::llaminar2::isDeviceValid(coherence_state_) && valid)
+            setCoherenceState_(TensorCoherenceState::SYNCED);
+        else if (!::llaminar2::isDeviceValid(coherence_state_) && valid)
+            setCoherenceState_(TensorCoherenceState::HOST_AUTHORITATIVE);
     }
 
     void injectGpuDataPtr(void *ptr)
@@ -353,8 +363,8 @@ TEST_F(Test__StreamCoherence, WithEvent_CalledMultipleTimes_TracksCorrectStream)
 
 TEST_F(Test__StreamCoherence, MarkOutputsDirty_CallsWithEvent)
 {
-    // markOutputsDirty (the event-based version) should call
-    // mark_device_dirty_with_event() on each output tensor.
+    // markOutputsDirty (the event-based version) should transition each output
+    // tensor to DEVICE_AUTHORITATIVE via transitionToWithEvent().
     // This is what happens for final-output stages (e.g., lm_head).
 
     auto tensor = std::make_unique<MockCoherenceTensor>(
@@ -366,9 +376,10 @@ TEST_F(Test__StreamCoherence, MarkOutputsDirty_CallsWithEvent)
     void *fake_stream = reinterpret_cast<void *>(0xABCD);
     markOutputsDirty(outputs, fake_stream);
 
-    // Should have called the virtual mark_device_dirty_with_event
-    EXPECT_EQ(tensor->mark_dirty_with_event_call_count, 1);
-    EXPECT_EQ(tensor->last_event_stream, fake_stream);
+    // Tensor should be in DEVICE_AUTHORITATIVE state
+    EXPECT_TRUE(tensor->getDeviceValid());
+    EXPECT_FALSE(tensor->getHostValid());
+    EXPECT_EQ(tensor->coherenceState(), TensorCoherenceState::DEVICE_AUTHORITATIVE);
 }
 
 TEST_F(Test__StreamCoherence, MarkOutputsDirtyFlagsOnly_DoesNotCallWithEvent)
@@ -396,7 +407,7 @@ TEST_F(Test__StreamCoherence, MarkOutputsDirtyFlagsOnly_DoesNotCallWithEvent)
 
 TEST_F(Test__StreamCoherence, MarkOutputsDirty_MultipleOutputs)
 {
-    // Verify all outputs get event-based marking
+    // Verify all outputs transition to DEVICE_AUTHORITATIVE
     auto tensor1 = std::make_unique<MockCoherenceTensor>(
         std::vector<size_t>{4, 64}, DeviceId::cpu());
     auto tensor2 = std::make_unique<MockCoherenceTensor>(
@@ -409,10 +420,13 @@ TEST_F(Test__StreamCoherence, MarkOutputsDirty_MultipleOutputs)
     void *stream = reinterpret_cast<void *>(0x5678);
     markOutputsDirty(outputs, stream);
 
-    EXPECT_EQ(tensor1->mark_dirty_with_event_call_count, 1);
-    EXPECT_EQ(tensor2->mark_dirty_with_event_call_count, 1);
-    EXPECT_EQ(tensor1->last_event_stream, stream);
-    EXPECT_EQ(tensor2->last_event_stream, stream);
+    EXPECT_TRUE(tensor1->getDeviceValid());
+    EXPECT_FALSE(tensor1->getHostValid());
+    EXPECT_EQ(tensor1->coherenceState(), TensorCoherenceState::DEVICE_AUTHORITATIVE);
+
+    EXPECT_TRUE(tensor2->getDeviceValid());
+    EXPECT_FALSE(tensor2->getHostValid());
+    EXPECT_EQ(tensor2->coherenceState(), TensorCoherenceState::DEVICE_AUTHORITATIVE);
 }
 
 TEST_F(Test__StreamCoherence, MarkOutputsDirtyFlagsOnly_PreservesExistingEvent)
@@ -446,8 +460,9 @@ TEST_F(Test__StreamCoherence, MarkOutputsDirtyFlagsOnly_PreservesExistingEvent)
 
 TEST_F(Test__StreamCoherence, MarkOutputsDirty_ReplacesStaleEvent)
 {
-    // After the fix: markOutputsDirty (event-based) REPLACES the stale event.
-    // This is what happens when stage itself or executor calls with-event variant.
+    // After the fix: markOutputsDirty (event-based) transitions to DEVICE_AUTHORITATIVE
+    // via transitionToWithEvent(), which replaces the stale event with a new one
+    // (when a real backend is available).
 
     auto tensor = std::make_unique<MockCoherenceTensor>(
         std::vector<size_t>{4, 64}, DeviceId::cpu());
@@ -461,13 +476,14 @@ TEST_F(Test__StreamCoherence, MarkOutputsDirty_ReplacesStaleEvent)
     void *correct_stream = reinterpret_cast<void *>(0xA11EDECE);
     markOutputsDirty(outputs, correct_stream);
 
-    // Virtual method MUST have been called with the correct stream
-    EXPECT_EQ(tensor->mark_dirty_with_event_call_count, 1);
-    EXPECT_EQ(tensor->last_event_stream, correct_stream);
+    // Tensor should be in DEVICE_AUTHORITATIVE state
+    EXPECT_TRUE(tensor->getDeviceValid());
+    EXPECT_FALSE(tensor->getHostValid());
+    EXPECT_EQ(tensor->coherenceState(), TensorCoherenceState::DEVICE_AUTHORITATIVE);
 
     // Note: Without a real backend, the event itself isn't actually replaced
     // in the base class (getBackendForDevice returns nullptr for CPU tensors).
-    // But the call IS made, which is what matters for correctness.
+    // But the state transition IS made, which is what matters for correctness.
 }
 
 // =============================================================================
@@ -580,8 +596,10 @@ TEST_F(Test__StreamCoherence, MarkOutputsDirty_NullStream_Accepted)
 
     markOutputsDirty(outputs, nullptr);
 
-    EXPECT_EQ(tensor->mark_dirty_with_event_call_count, 1);
-    EXPECT_EQ(tensor->last_event_stream, nullptr);
+    // Tensor should be in DEVICE_AUTHORITATIVE state
+    EXPECT_TRUE(tensor->getDeviceValid());
+    EXPECT_FALSE(tensor->getHostValid());
+    EXPECT_EQ(tensor->coherenceState(), TensorCoherenceState::DEVICE_AUTHORITATIVE);
 }
 
 TEST_F(Test__StreamCoherence, ClearCompletionEvent_RemovesEvent)

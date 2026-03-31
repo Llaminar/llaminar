@@ -2238,7 +2238,7 @@ namespace llaminar2
             // kernel-managed device data (GEMM packed weights). GEMM kernels
             // upload pre-packed representations to their own device buffers and
             // never read the raw TensorBase data, so the host copy can be freed.
-            if (!ptr->isDeviceValid())
+            if (!ptr->deviceValid())
             {
                 // Check if kernel has its own device copy (CUDA/ROCm packed weights)
                 bool has_kernel_device_data =

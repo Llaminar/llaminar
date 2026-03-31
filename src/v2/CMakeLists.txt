@@ -1257,6 +1257,8 @@ add_library(llaminar2_core STATIC
     execution/local_execution/coherence/StageCoherence.cpp
     execution/local_execution/device/DeviceWorkspaceManager.cpp
     execution/local_execution/device/WorkspaceAllocator.cpp
+    # Unified transfer engine (explicit coherence state machine + centralized data movement)
+    transfer/TransferEngine.cpp
     # Tensor parallelism configuration (proportional sharding for heterogeneous TP)
     config/TensorParallelConfig.cpp
     # Pipeline parallelism configuration (layer range assignment for PP)

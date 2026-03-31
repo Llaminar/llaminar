@@ -140,7 +140,7 @@ namespace llaminar2
             hostToDevice(gpu_ptr, host_buffer.data(), numel, device_id);
             synchronizeDevice(device_id);
             // Mark device data as authoritative after H2D transfer (with event for fine-grained sync)
-            tensor->mark_device_dirty_with_event();
+            tensor->transitionToWithEvent(TensorCoherenceState::DEVICE_AUTHORITATIVE);
         }
     }
 

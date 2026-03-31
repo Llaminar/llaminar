@@ -20,6 +20,7 @@
 #include "../collective/backends/PCIeBARBackend.h"
 #include "../collective/BackendRouter.h"
 #include "../execution/local_execution/graph/GraphCaptureGuard.h"
+#include "../transfer/TransferEngine.h"
 #include <stdexcept>
 #include <cmath>
 #include <algorithm>
@@ -91,9 +92,6 @@ namespace llaminar2
             return injected_backend_;
         return getBackendForDevice(device);
     }
-
-    static bool waitForEventWithProxy(IBackend *backend, void *event, int device_id,
-                                      const DeviceId &gpu_device);
 
     // ===== Legacy helper functions for global device index mapping =====
 
@@ -209,7 +207,7 @@ namespace llaminar2
                 backend->free(gpu_data_ptr_, backend_device_id);
             }
             gpu_data_ptr_ = nullptr;
-            device_valid_ = false;
+            setCoherenceState_(TensorCoherenceState::HOST_ONLY); // GPU memory freed
         }
 
         // Unpin host memory if pinned (after freeing GPU memory)
@@ -260,8 +258,8 @@ namespace llaminar2
         gpu_device_ = target_device;
 
         // Both host and device are always valid for mapped memory
-        host_valid_ = true;
-        device_valid_ = true;
+        memory_residency_ = MemoryResidency::MAPPED;
+        setCoherenceState_(TensorCoherenceState::MAPPED);
 
         LOG_TRACE("[TensorBase::initMappedMemory] Allocated " << bytes << " bytes mapped memory"
                                                               << " host_ptr=" << host_ptr << " device_ptr=" << device_ptr
@@ -368,8 +366,8 @@ namespace llaminar2
 
         // Both host and device are always "valid" for BAR-backed tensors
         // since they share the same physical memory
-        host_valid_ = true;
-        device_valid_ = true;
+        memory_residency_ = MemoryResidency::BAR_BACKED;
+        setCoherenceState_(TensorCoherenceState::SYNCED);
 
         LOG_DEBUG("[TensorBase::initBARBackedMemory] Allocated " << bytes << " bytes in BAR region"
                                                                  << " rocm_ptr=" << rocm_ptr
@@ -518,8 +516,8 @@ namespace llaminar2
 
         // Both host and device are always "valid" for BAR-backed tensors
         // since they share the same physical memory
-        host_valid_ = true;
-        device_valid_ = true;
+        memory_residency_ = MemoryResidency::BAR_BACKED;
+        setCoherenceState_(TensorCoherenceState::SYNCED);
 
         LOG_DEBUG("[TensorBase::initBARBackedDirect] Configured BAR-backed tensor: "
                   << bytes << " bytes"
@@ -1075,7 +1073,7 @@ namespace llaminar2
                                                                   << " name=" << (debug_name_.empty() ? "(unnamed)" : debug_name_)
                                                                   << " ptr=" << gpu_data_ptr_
                                                                   << " device=" << (gpu_device_.has_value() ? gpu_device_->toString() : "none")
-                                                                  << " device_valid=" << device_valid_);
+                                                                  << " device_valid=" << ::llaminar2::isDeviceValid(coherence_state_));
         }
         return gpu_data_ptr_;
     }
@@ -1089,7 +1087,7 @@ namespace llaminar2
                                                                         << " name=" << (debug_name_.empty() ? "(unnamed)" : debug_name_)
                                                                         << " ptr=" << gpu_data_ptr_
                                                                         << " device=" << (gpu_device_.has_value() ? gpu_device_->toString() : "none")
-                                                                        << " device_valid=" << device_valid_);
+                                                                        << " device_valid=" << ::llaminar2::isDeviceValid(coherence_state_));
         }
         return gpu_data_ptr_;
     }
@@ -1128,7 +1126,7 @@ namespace llaminar2
         // The GPU memory is kept allocated; next ensureOnDevice() will just re-upload.
         if (gpu_data_ptr_)
         {
-            device_valid_ = false;
+            setCoherenceState_(TensorCoherenceState::HOST_AUTHORITATIVE); // Host now the only valid copy
             // CRITICAL WARNING: Repeated invalidation causes re-uploads!
             if (debugEnv().rocm.trace_coherence)
             {
@@ -1145,20 +1143,15 @@ namespace llaminar2
         std::lock_guard<std::mutex> lock(coherence_mutex_);
 
         // ===== GRAPH CAPTURE FAST PATH =====
-        // During HIP/CUDA graph capture, synchronization operations
-        // (hipDeviceSynchronize, hipMemcpy, event waits) are illegal and
-        // poison the capture state. When the thread-local capture flag is
-        // set, we ONLY check that data is already on the target device.
-        // This is safe because Phase 1 (warmup) already executed all stages
-        // normally, ensuring all tensors are uploaded before capture begins.
+        // During HIP/CUDA graph capture, synchronization operations are illegal.
+        // Only check that data is already on device — warmup must have uploaded first.
         if (isGraphCaptureActive())
         {
             if (gpu_data_ptr_ && gpu_device_.has_value() &&
-                *gpu_device_ == target_device && device_valid_)
+                *gpu_device_ == target_device && ::llaminar2::isDeviceValid(coherence_state_))
             {
                 return true;
             }
-            // BAR-backed and mapped tensors also work during capture
             if (is_bar_backed_ || (is_mapped_ && mapped_device_ptr_ != nullptr))
             {
                 return true;
@@ -1168,7 +1161,7 @@ namespace llaminar2
                       << target_device.toString()
                       << " — data must be uploaded during warmup phase first."
                       << " gpu_data_ptr=" << gpu_data_ptr_
-                      << " device_valid=" << device_valid_);
+                      << " device_valid=" << ::llaminar2::isDeviceValid(coherence_state_));
             return false;
         }
 
@@ -1178,384 +1171,13 @@ namespace llaminar2
             return true;
         }
 
-        const bool trace = debugEnv().rocm.trace_coherence;
-        auto overall_start = std::chrono::high_resolution_clock::now();
-
-        // ===== BAR-BACKED TENSOR FAST PATH =====
-        // BAR-backed tensors have memory allocated EXTERNALLY via PCIeBAR and are visible
-        // to both CUDA and ROCm devices via different pointers. They must NEVER go through
-        // the regular allocation path (which would try to allocate new memory).
-        if (is_bar_backed_)
+        // Delegate to TransferEngine for all data movement
+        auto result = TransferEngine::instance().uploadFull(this, target_device);
+        if (!result.success)
         {
-            // Set up the correct pointer based on target device type
-            if (target_device.is_cuda())
-            {
-                if (!bar_cuda_device_ptr_)
-                {
-                    LOG_ERROR("[TensorBase::ensureOnDevice] BAR-backed tensor has no CUDA pointer");
-                    return false;
-                }
-                gpu_data_ptr_ = bar_cuda_device_ptr_;
-                if (trace)
-                {
-                    LOG_INFO("[TensorBase::ensureOnDevice] BAR-BACKED CUDA: Using BAR pointer " << bar_cuda_device_ptr_);
-                }
-            }
-            else if (target_device.is_rocm())
-            {
-                // CRITICAL: For ROCm, use HIP staging buffer, NOT the BAR mmap address!
-                // HIP kernels cannot dereference BAR mmap addresses (causes memory fault).
-                if (hip_staging_ptr_)
-                {
-                    gpu_data_ptr_ = hip_staging_ptr_;
-                    if (trace)
-                    {
-                        LOG_INFO("[TensorBase::ensureOnDevice] BAR-BACKED ROCm: Using HIP staging buffer "
-                                 << hip_staging_ptr_ << " (BAR mmap=" << bar_rocm_ptr_ << ")");
-                    }
-                }
-                else
-                {
-                    LOG_ERROR("[TensorBase::ensureOnDevice] BAR-backed ROCm tensor has no HIP staging buffer!");
-                    return false;
-                }
-            }
-            else
-            {
-                LOG_ERROR("[TensorBase::ensureOnDevice] BAR-backed tensor cannot target device type: "
-                          << target_device.toString());
-                return false;
-            }
-
-            gpu_device_ = target_device;
-            // For BAR-backed tensors, device is always "valid" in the sense that the pointer is set up
-            // The actual data validity depends on when kernels wrote to the buffer
-            device_valid_ = true;
-            return true;
+            LOG_ERROR("[TensorBase::ensureOnDevice] TransferEngine::uploadFull failed: " << result.error);
         }
-
-        // ===== ZERO-COPY MAPPED MEMORY FAST PATH =====
-        // If tensor uses mapped memory, GPU can access host memory directly.
-        // No memcpy needed - just return the device-visible pointer.
-        if (is_mapped_ && mapped_device_ptr_ != nullptr)
-        {
-            // For mapped tensors, both host and device pointers are always valid
-            // Just ensure we're tracking the target device
-            if (!gpu_device_.has_value() || *gpu_device_ != target_device)
-            {
-                gpu_device_ = target_device;
-            }
-            // gpu_data_ptr_ points to mapped_device_ptr_ for mapped tensors
-            if (gpu_data_ptr_ != mapped_device_ptr_)
-            {
-                gpu_data_ptr_ = mapped_device_ptr_;
-            }
-            // Both host and device are always valid for mapped memory
-            host_valid_ = true;
-            device_valid_ = true;
-
-            if (trace)
-            {
-                LOG_INFO("[TensorBase::ensureOnDevice] ZERO-COPY: Tensor is mapped, no memcpy needed");
-            }
-            return true;
-        }
-
-        // Check if already on target device with valid data.
-        // Even when device_valid_ is true, the last writer may still be in-flight
-        // on an async stream. If we have a completion event, wait for readiness
-        // before returning to the consumer stage.
-        if (gpu_data_ptr_ && gpu_device_.has_value() && *gpu_device_ == target_device && device_valid_)
-        {
-            if (device_completion_event_)
-            {
-                IBackend *backend = resolveBackend(target_device);
-                if (backend)
-                {
-                    const int backend_device_id = target_device.gpu_ordinal();
-                    if (!waitForEventWithProxy(backend, device_completion_event_, backend_device_id, target_device))
-                    {
-                        LOG_WARN("[TensorBase::ensureOnDevice] Event wait failed for tensor "
-                                 << (debug_name_.empty() ? "(unnamed)" : debug_name_)
-                                 << " on " << target_device.toString()
-                                 << ", falling back to backend synchronize");
-                        if (!backend->synchronize(backend_device_id))
-                        {
-                            LOG_ERROR("[TensorBase::ensureOnDevice] backend synchronize failed for tensor "
-                                      << (debug_name_.empty() ? "(unnamed)" : debug_name_)
-                                      << " on " << target_device.toString());
-                            return false;
-                        }
-                    }
-                }
-            }
-
-            // Already on correct device with valid GPU data
-            return true;
-        }
-
-        // Get backend for target device directly from DeviceId type
-        IBackend *target_backend = resolveBackend(target_device);
-        if (!target_backend)
-        {
-            LOG_ERROR("[TensorBase::ensureOnDevice] No backend available for device " << target_device.toString());
-            return false;
-        }
-
-        // Get backend-specific device ordinal (e.g., CUDA:0 -> 0, ROCm:1 -> 1)
-        int backend_device_id = target_device.gpu_ordinal();
-
-        // If currently on a different device, first try to promote an existing
-        // secondary buffer for target_device. If none exists, park current primary
-        // in secondary storage (do not free) so the other device can keep using it.
-        LOG_DEBUG("[TensorBase::ensureOnDevice] tensor=" << static_cast<void *>(this)
-                                                         << " target_device=" << target_device.toString()
-                                                         << " gpu_data_ptr_=" << gpu_data_ptr_
-                                                         << " gpu_device_=" << (gpu_device_.has_value() ? gpu_device_->toString() : "none")
-                                                         << " device_completion_event_=" << device_completion_event_);
-        if (gpu_data_ptr_ && gpu_device_.has_value() && *gpu_device_ != target_device)
-        {
-            DeviceId old_device = *gpu_device_;
-            LOG_DEBUG("[TensorBase::ensureOnDevice] Device migration: " << gpu_device_->toString()
-                                                                        << " -> " << target_device.toString());
-
-            const int target_key = packDeviceId(target_device);
-            auto sec_it = secondary_device_buffers_.find(target_key);
-            if (sec_it != secondary_device_buffers_.end() && sec_it->second != nullptr)
-            {
-                // Preserve current primary in secondary map (if not already tracked)
-                int old_key = packDeviceId(*gpu_device_);
-                if (secondary_device_buffers_.find(old_key) == secondary_device_buffers_.end())
-                {
-                    secondary_device_buffers_[old_key] = gpu_data_ptr_;
-                    if (is_bar_backed_)
-                    {
-                        secondary_bar_allocated_keys_.insert(old_key);
-                    }
-                }
-
-                // Promote target secondary buffer to primary
-                void *promoted_ptr = sec_it->second;
-                secondary_device_buffers_.erase(sec_it);
-
-                gpu_data_ptr_ = promoted_ptr;
-                gpu_device_ = target_device;
-                device_valid_ = false;
-
-                bool was_bar = (secondary_bar_allocated_keys_.count(target_key) > 0);
-                if (was_bar)
-                {
-                    secondary_bar_allocated_keys_.erase(target_key);
-                }
-                is_bar_backed_ = was_bar;
-
-                if (device_completion_event_)
-                {
-                    IBackend *old_backend = resolveBackend(old_device);
-                    int old_backend_device_id = old_device.gpu_ordinal();
-                    if (old_backend)
-                    {
-                        old_backend->destroyEvent(device_completion_event_, old_backend_device_id);
-                    }
-                    device_completion_event_ = nullptr;
-                    event_device_.reset();
-                }
-
-                LOG_DEBUG("[TensorBase::ensureOnDevice] Promoted secondary buffer to primary for "
-                          << target_device.toString() << " ptr=" << promoted_ptr);
-            }
-            else
-            {
-                // No existing target secondary buffer. Park current primary so
-                // other device threads can continue using it safely.
-                int old_key = packDeviceId(*gpu_device_);
-                if (secondary_device_buffers_.find(old_key) == secondary_device_buffers_.end())
-                {
-                    secondary_device_buffers_[old_key] = gpu_data_ptr_;
-                    if (is_bar_backed_)
-                    {
-                        secondary_bar_allocated_keys_.insert(old_key);
-                    }
-                }
-
-                if (device_completion_event_)
-                {
-                    IBackend *old_backend = resolveBackend(*gpu_device_);
-                    int old_backend_device_id = gpu_device_->gpu_ordinal();
-                    if (old_backend)
-                    {
-                        LOG_DEBUG("[TensorBase::ensureOnDevice] Destroying old completion event on device "
-                                  << gpu_device_->toString() << " before migrating to " << target_device.toString());
-                        old_backend->destroyEvent(device_completion_event_, old_backend_device_id);
-                    }
-                    device_completion_event_ = nullptr;
-                    event_device_.reset();
-                }
-
-                gpu_data_ptr_ = nullptr;
-                gpu_device_.reset();
-                device_valid_ = false;
-                is_bar_backed_ = false;
-
-                LOG_DEBUG("[TensorBase::ensureOnDevice] Parked previous primary buffer for "
-                          << old_device.toString() << " and allocating fresh buffer for "
-                          << target_device.toString());
-            }
-        }
-        else
-        {
-            LOG_DEBUG("[TensorBase::ensureOnDevice] No device migration needed (conditions not met)");
-        }
-
-        // Skip raw upload for tensors with kernel-managed device data.
-        // GEMM kernels upload pre-packed VNNI/INT8 representations to their own
-        // device buffers (packed_->d_int8_data_vnni). The raw TensorBase data is
-        // never read by the kernel, so uploading it wastes VRAM.
-        if (!gpu_data_ptr_ && !device_valid_ && target_device.is_gpu() &&
-            hasCachedDeviceData(target_device.type))
-        {
-            LOG_DEBUG("[TensorBase::ensureOnDevice] Skipping raw upload for tensor "
-                      << (debug_name_.empty() ? "(unnamed)" : debug_name_)
-                      << " — kernel manages its own device representation");
-            return true;
-        }
-
-        // Allocate on target device if needed
-        size_t bytes = byte_size();
-        if (!gpu_data_ptr_)
-        {
-            auto alloc_start = std::chrono::high_resolution_clock::now();
-            gpu_data_ptr_ = target_backend->allocate(bytes, backend_device_id);
-            auto alloc_end = std::chrono::high_resolution_clock::now();
-            auto alloc_us = std::chrono::duration_cast<std::chrono::microseconds>(alloc_end - alloc_start).count();
-
-            if (trace)
-            {
-                LOG_INFO("[TensorBase::ensureOnDevice] backend->allocate(" << bytes << " bytes) took " << alloc_us << " us");
-            }
-
-            // Log tensor GPU allocation with identity for debugging multi-GPU memory issues
-            LOG_DEBUG("[GPU_ALLOC] tensor=" << static_cast<void *>(this)
-                                            << " name=" << (debug_name_.empty() ? "(unnamed)" : debug_name_)
-                                            << " gpu_ptr=" << gpu_data_ptr_ << " bytes=" << bytes
-                                            << " device=" << target_device.toString()
-                                            << " ordinal=" << backend_device_id);
-
-            if (!gpu_data_ptr_)
-            {
-                LOG_ERROR("[TensorBase::ensureOnDevice] Failed to allocate " << bytes
-                                                                             << " bytes on device " << target_device.toString()
-                                                                             << " (backend device ID: " << backend_device_id << ")");
-                return false;
-            }
-            gpu_device_ = target_device; // Store the actual DeviceId
-            device_valid_ = false;       // Newly allocated - not yet populated
-
-            // Pin host memory for fast DMA transfers (optional - continues if pinning fails)
-            auto pin_start = std::chrono::high_resolution_clock::now();
-            ensureHostPinned();
-            auto pin_end = std::chrono::high_resolution_clock::now();
-            auto pin_us = std::chrono::duration_cast<std::chrono::microseconds>(pin_end - pin_start).count();
-
-            if (trace && pin_us > 100)
-            {
-                LOG_INFO("[TensorBase::ensureOnDevice] ensureHostPinned() took " << pin_us << " us");
-            }
-        }
-
-        // Upload data from host if device data is stale
-        if (!device_valid_)
-        {
-            // Sanity check: host must have valid data if device is stale
-            if (!host_valid_)
-            {
-                LOG_ERROR("[TensorBase::ensureOnDevice] COHERENCE ERROR: Both host and device are invalid!");
-                return false;
-            }
-
-            const void *src = raw_host_data_ptr();
-            if (!src)
-            {
-                LOG_ERROR("[TensorBase::ensureOnDevice] Host data pointer is null");
-                target_backend->free(gpu_data_ptr_, backend_device_id);
-                gpu_data_ptr_ = nullptr;
-                gpu_device_.reset();
-                return false;
-            }
-
-            // Transfer tracing for H2D debugging
-            const auto &trace_cfg = debugEnv().transfer_tracing;
-            if (trace_cfg.enabled && !trace_cfg.only_d2h && bytes >= trace_cfg.min_bytes)
-            {
-                std::ostringstream msg;
-                msg << "[TRANSFER TRACE] H2D transfer: " << bytes << " bytes"
-                    << ", tensor=" << (debug_name_.empty() ? "(unnamed)" : debug_name_)
-                    << ", shape=[" << rows() << "x" << cols() << "]"
-                    << ", device=" << target_device.toString();
-
-                if (trace_cfg.include_stacktrace)
-                {
-                    msg << "\n"
-                        << captureStackTrace(2, 16); // Skip 2 frames
-                }
-
-                if (trace_cfg.throw_on_transfer)
-                {
-                    throw TransferViolationException(msg.str(), captureStackTrace(2, 32));
-                }
-                else
-                {
-                    LOG_WARN(msg.str());
-                }
-            }
-
-            auto h2d_start = std::chrono::high_resolution_clock::now();
-            bool h2d_ok = target_backend->hostToDevice(gpu_data_ptr_, src, bytes, backend_device_id);
-            auto h2d_end = std::chrono::high_resolution_clock::now();
-            auto h2d_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(h2d_end - h2d_start).count();
-            auto h2d_us = h2d_ns / 1000;
-            double bandwidth_gbps = (bytes / 1e9) / (h2d_us / 1e6);
-
-            // Record transfer for profiling (when LLAMINAR_PROFILING=1)
-            TransferProfiler::recordH2D(bytes, static_cast<uint64_t>(h2d_ns));
-
-            // Record transfer for testing
-            if (trace_cfg.enabled)
-            {
-                trace_cfg.recordH2D(bytes);
-            }
-
-            if (trace)
-            {
-                LOG_INFO("[TensorBase::ensureOnDevice] hostToDevice(" << bytes << " bytes) took "
-                                                                      << h2d_us << " us (" << bandwidth_gbps << " GB/s)");
-            }
-
-            if (!h2d_ok)
-            {
-                LOG_ERROR("[TensorBase::ensureOnDevice] hostToDevice failed");
-                target_backend->free(gpu_data_ptr_, backend_device_id);
-                gpu_data_ptr_ = nullptr;
-                gpu_device_.reset();
-                return false;
-            }
-
-            device_valid_ = true; // Device now has current data
-            // host_valid_ stays true - we uploaded FROM host, so both are now in sync
-
-            LOG_DEBUG("[TensorBase::ensureOnDevice] Uploaded " << bytes
-                                                               << " bytes to device " << target_device.toString()
-                                                               << " (backend device ID: " << backend_device_id << ")");
-        }
-
-        auto overall_end = std::chrono::high_resolution_clock::now();
-        auto overall_us = std::chrono::duration_cast<std::chrono::microseconds>(overall_end - overall_start).count();
-        if (trace && overall_us > 1000)
-        {
-            LOG_INFO("[TensorBase::ensureOnDevice] TOTAL took " << overall_us << " us for " << bytes << " bytes");
-        }
-
-        return true;
+        return result.success;
     }
 
     bool TensorBase::allocateOnDevice(DeviceId target_device)
@@ -1646,7 +1268,7 @@ namespace llaminar2
 
             gpu_device_ = target_device;
             // Mark device as invalid - kernel will write to this buffer
-            device_valid_ = false;
+            setCoherenceState_(TensorCoherenceState::HOST_AUTHORITATIVE);
             if (trace)
             {
                 LOG_INFO("[TensorBase::allocateOnDevice] BAR-BACKED: Switching to "
@@ -1671,8 +1293,7 @@ namespace llaminar2
                 gpu_data_ptr_ = mapped_device_ptr_;
             }
             // Mapped memory: both host and device are always valid
-            host_valid_ = true;
-            device_valid_ = true;
+            setCoherenceState_(TensorCoherenceState::MAPPED);
 
             if (trace)
             {
@@ -1685,7 +1306,7 @@ namespace llaminar2
         if (gpu_data_ptr_ && gpu_device_.has_value() && *gpu_device_ == target_device)
         {
             // Already allocated on correct device - mark as invalid (kernel will overwrite)
-            device_valid_ = false;
+            setCoherenceState_(TensorCoherenceState::HOST_AUTHORITATIVE);
             if (trace)
             {
                 LOG_INFO("[TensorBase::allocateOnDevice] Reusing existing allocation on " << target_device.toString());
@@ -1733,7 +1354,7 @@ namespace llaminar2
 
                 gpu_data_ptr_ = promoted_ptr;
                 gpu_device_ = target_device;
-                device_valid_ = false;
+                setCoherenceState_(TensorCoherenceState::HOST_AUTHORITATIVE); // Promoted but data stale
 
                 // Check if promoted buffer was BAR-backed in secondary
                 bool was_bar = (secondary_bar_allocated_keys_.count(target_key) > 0);
@@ -1767,7 +1388,7 @@ namespace llaminar2
             }
             gpu_data_ptr_ = nullptr;
             gpu_device_.reset();
-            device_valid_ = false;
+            setCoherenceState_(TensorCoherenceState::HOST_ONLY); // GPU memory freed
         }
 
         // Allocate on target device
@@ -1793,9 +1414,8 @@ namespace llaminar2
             }
 
             gpu_device_ = target_device;
-            // device_valid_ = false: kernel will write to this buffer
-            device_valid_ = false;
-            // host_valid_ unchanged: we didn't touch host data
+            // Kernel will write to this buffer — host still valid
+            setCoherenceState_(TensorCoherenceState::HOST_AUTHORITATIVE);
 
             LOG_DEBUG("[TensorBase::allocateOnDevice] Allocated " << bytes
                                                                   << " bytes on device " << target_device.toString()
@@ -1807,329 +1427,37 @@ namespace llaminar2
 
     // =========================================================================
     // Helper: Wait for CUDA event with cross-thread proxy support
-    // =========================================================================
-    // When running in heterogeneous LOCAL TP (CUDA + ROCm), the ROCm executor
-    // thread may need to wait for CUDA events. Direct cudaEventSynchronize()
-    // fails with "context is destroyed" from a HIP-contaminated thread.
-    // This helper routes CUDA event waits through PCIeBARBackend's worker thread.
-
-    static bool waitForEventWithProxy(IBackend *backend, void *event, int device_id,
-                                      const DeviceId &gpu_device)
-    {
-        // If this is a CUDA event and we have a PCIeBAR backend with worker thread,
-        // use the proxy to avoid cross-thread context issues
-        if (gpu_device.is_cuda())
-        {
-            auto *pcie_backend = PCIeBARBackend::getInstance();
-            if (pcie_backend && pcie_backend->isPCIeBarActive() && pcie_backend->hasCUDAWorkerFor(device_id))
-            {
-                LOG_TRACE("[waitForEventWithProxy] Routing CUDA event wait through PCIeBAR worker");
-                return pcie_backend->waitForCUDAEvent(event, device_id);
-            }
-        }
-
-        // Default: use backend directly
-        return backend->waitForEvent(event, device_id);
-    }
-
     bool TensorBase::ensureOnHost()
     {
         std::lock_guard<std::mutex> lock(coherence_mutex_);
 
-        // ===== ZERO-COPY MAPPED MEMORY PATH =====
-        // If tensor uses mapped memory, host and device share the same memory.
-        // No memcpy needed, BUT we still need to synchronize if GPU wrote to buffer.
-        // The GPU writes through PCIe; host can only read after kernel completes.
-        //
-        // We use EVENT-BASED sync instead of hipDeviceSynchronize() because
-        // hipDeviceSynchronize is extremely slow on ROCm (~1-10 seconds!).
-        // Event waiting is much faster as it only waits for the specific kernel.
-        if (is_mapped_)
+        // Delegate to TransferEngine for all data movement
+        auto result = TransferEngine::instance().downloadFull(this);
+        if (!result.success)
         {
-            // Only synchronize if GPU has written since last sync
-            if (mapped_needs_sync_ && gpu_device_.has_value())
-            {
-                IBackend *backend = resolveBackend(*gpu_device_);
-                if (backend)
-                {
-                    int backend_device_id = gpu_device_->gpu_ordinal();
-
-                    auto t0 = std::chrono::high_resolution_clock::now();
-
-                    // Use event-based sync if we have a completion event (much faster than device sync)
-                    if (device_completion_event_)
-                    {
-                        LOG_TRACE("[TensorBase::ensureOnHost] ZERO-COPY: Waiting on completion event");
-                        if (!waitForEventWithProxy(backend, device_completion_event_, backend_device_id, *gpu_device_))
-                        {
-                            LOG_WARN("[TensorBase::ensureOnHost] Event wait failed for mapped tensor");
-                            // Don't fall back to device sync - it's too slow on ROCm
-                        }
-                    }
-                    else
-                    {
-                        // No event recorded - this shouldn't happen if mark_device_dirty_with_event was called
-                        LOG_WARN("[TensorBase::ensureOnHost] ZERO-COPY: No completion event, using stream sync");
-                        backend->synchronize(backend_device_id);
-                    }
-
-                    auto t1 = std::chrono::high_resolution_clock::now();
-                    auto elapsed_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
-                    if (elapsed_ms > 1.0)
-                    {
-                        LOG_WARN("[TensorBase::ensureOnHost] MAPPED SYNC took " << elapsed_ms << " ms"
-                                                                                << " (event=" << (device_completion_event_ ? "yes" : "NO") << ")");
-                    }
-                }
-                mapped_needs_sync_ = false; // Sync complete, won't sync again until next GPU write
-            }
-
-            // Both host and device are always valid for mapped memory
-            host_valid_ = true;
-            device_valid_ = true;
-            authoritative_device_ = std::nullopt; // Host is now authoritative
-            return true;
+            LOG_ERROR("[TensorBase::ensureOnHost] TransferEngine::downloadFull failed: " << result.error);
         }
-
-        // If host is already valid, nothing to do
-        if (host_valid_)
-        {
-            LOG_TRACE("[TensorBase::ensureOnHost] Host already valid, skipping sync");
-            return true;
-        }
-
-        // Sanity check: device must be valid if host is invalid
-        if (!device_valid_)
-        {
-            LOG_ERROR("[TensorBase::ensureOnHost] COHERENCE ERROR: Both host and device are invalid!");
-            return false;
-        }
-
-        // ===== BAR-BACKED BUFFER PATH =====
-        // BAR-backed tensors have ROCm VRAM staging + BAR mmap.
-        // For ensureOnHost(), we do DIRECT D2H from staging VRAM to host memory.
-        // We do NOT go through the BAR intermediate (staging→BAR→host) because
-        // hipMemcpy(D2D) to BAR-registered pointers is unreliable in multi-device
-        // concurrent scenarios (similar to cudaMemcpy D2D with IOMEMORY BAR sources).
-        if (is_bar_backed_ && gpu_data_ptr_ && gpu_device_.has_value())
-        {
-            size_t bytes = byte_size();
-            void *dst = raw_host_data_ptr();
-            if (!dst)
-            {
-                LOG_ERROR("[TensorBase::ensureOnHost] Host data pointer is null");
-                return false;
-            }
-
-            // Synchronize with GPU before reading
-            if (device_completion_event_)
-            {
-                IBackend *backend = resolveBackend(*gpu_device_);
-                int backend_device_id = gpu_device_->gpu_ordinal();
-                if (backend && !waitForEventWithProxy(backend, device_completion_event_, backend_device_id, *gpu_device_))
-                {
-                    LOG_WARN("[TensorBase::ensureOnHost] Event wait failed for BAR-backed tensor, continuing anyway");
-                }
-            }
-
-#if defined(HAVE_ROCM)
-            if (gpu_device_->is_rocm() && hip_staging_ptr_ && gpu_data_ptr_ == hip_staging_ptr_)
-            {
-                // Direct D2H from ROCm staging VRAM to host — bypasses BAR entirely
-                hipError_t hip_err = hipSetDevice(gpu_device_->rocm_ordinal());
-                if (hip_err != hipSuccess)
-                {
-                    LOG_ERROR("[TensorBase::ensureOnHost] hipSetDevice failed for BAR-backed ROCm tensor: "
-                              << hipGetErrorString(hip_err));
-                    return false;
-                }
-
-                hip_err = hipMemcpy(dst, hip_staging_ptr_, bytes, hipMemcpyDeviceToHost);
-                if (hip_err != hipSuccess)
-                {
-                    LOG_ERROR("[TensorBase::ensureOnHost] hipMemcpy D2H from staging failed: "
-                              << hipGetErrorString(hip_err));
-                    return false;
-                }
-
-                host_valid_ = true;
-                authoritative_device_ = std::nullopt;
-
-                LOG_DEBUG("[TensorBase::ensureOnHost] BAR-BACKED: Direct D2H from staging "
-                          << hip_staging_ptr_ << " -> " << dst
-                          << " (" << bytes << " bytes)");
-                return true;
-            }
-#endif
-
-            // Non-ROCm BAR or no staging: fall through to standard BAR memcpy
-            const void *host_visible_src = bar_rocm_ptr_ ? bar_rocm_ptr_ : gpu_data_ptr_;
-
-            LOG_DEBUG("[TensorBase::ensureOnHost] BAR-BACKED: Direct memcpy from BAR region "
-                      << host_visible_src << " -> " << dst
-                      << " (" << bytes << " bytes)");
-
-            // Direct memcpy since BAR region is host-accessible
-            std::memcpy(dst, host_visible_src, bytes);
-
-            host_valid_ = true;
-            authoritative_device_ = std::nullopt; // Host is now authoritative
-
-            LOG_DEBUG("[TensorBase::ensureOnHost] BAR-BACKED: Copied " << bytes << " bytes from BAR region");
-            return true;
-        }
-
-        // If GPU has data, download it
-        if (gpu_data_ptr_ && gpu_device_.has_value())
-        {
-            IBackend *backend = resolveBackend(*gpu_device_);
-            if (!backend)
-            {
-                LOG_ERROR("[TensorBase::ensureOnHost] No backend available for device " << gpu_device_->toString());
-                return false;
-            }
-
-            int backend_device_id = gpu_device_->gpu_ordinal();
-
-            size_t bytes = byte_size();
-            void *dst = raw_host_data_ptr();
-            if (!dst)
-            {
-                LOG_ERROR("[TensorBase::ensureOnHost] Host data pointer is null");
-                return false;
-            }
-
-            // Fine-grained sync: wait only for this tensor's completion event
-            // instead of a full device synchronization
-            if (device_completion_event_)
-            {
-                LOG_TRACE("[TensorBase::ensureOnHost] Using event-based sync (waiting for specific kernel)");
-                if (!waitForEventWithProxy(backend, device_completion_event_, backend_device_id, *gpu_device_))
-                {
-                    LOG_WARN("[TensorBase::ensureOnHost] Event wait failed, falling back to full sync");
-                    backend->synchronize(backend_device_id);
-                }
-            }
-            else
-            {
-                // No completion event recorded (e.g., markOutputsDirtyFlagsOnly was used).
-                // We MUST do an explicit device sync because the worker stream is created
-                // with cudaStreamNonBlocking, which means cudaMemcpy on the legacy default
-                // stream (stream 0) does NOT implicitly synchronize with it. Without this
-                // sync, the D2H copy can race with the kernel, reading stale/zero data.
-                LOG_TRACE("[TensorBase::ensureOnHost] No completion event, using full device sync");
-                backend->synchronize(backend_device_id);
-            }
-
-            // Transfer tracing for D2H debugging
-            const auto &trace_cfg = debugEnv().transfer_tracing;
-            if (trace_cfg.enabled && bytes >= trace_cfg.min_bytes)
-            {
-                std::ostringstream msg;
-                msg << "[TRANSFER TRACE] D2H transfer: " << bytes << " bytes"
-                    << ", tensor=" << (debug_name_.empty() ? "(unnamed)" : debug_name_)
-                    << ", shape=[" << rows() << "x" << cols() << "]"
-                    << ", device=" << gpu_device_->toString();
-
-                if (trace_cfg.include_stacktrace)
-                {
-                    msg << "\n"
-                        << captureStackTrace(2, 16); // Skip 2 frames (this + ensureOnHost)
-                }
-
-                if (trace_cfg.throw_on_transfer)
-                {
-                    throw TransferViolationException(msg.str(), captureStackTrace(2, 32));
-                }
-                else
-                {
-                    LOG_WARN(msg.str());
-                }
-            }
-
-            // Log full D2H details for debugging multi-GPU memory access faults
-            LOG_DEBUG("[TensorBase::ensureOnHost] ATTEMPTING D2H: "
-                      << "tensor=" << (debug_name_.empty() ? "(unnamed)" : debug_name_)
-                      << " gpu_data_ptr=" << static_cast<const void *>(gpu_data_ptr_)
-                      << " dst=" << static_cast<const void *>(dst)
-                      << " bytes=" << bytes
-                      << " device=" << gpu_device_->toString()
-                      << " backend_device_id=" << backend_device_id);
-
-            auto d2h_start = std::chrono::high_resolution_clock::now();
-            bool d2h_ok = backend->deviceToHost(dst, gpu_data_ptr_, bytes, backend_device_id);
-            auto d2h_end = std::chrono::high_resolution_clock::now();
-            auto d2h_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(d2h_end - d2h_start).count();
-
-            if (!d2h_ok)
-            {
-                LOG_ERROR("[TensorBase::ensureOnHost] deviceToHost failed");
-                return false;
-            }
-
-            // DEBUG DIAGNOSTIC: Check if D2H produced all zeros (possible race)
-            {
-                const float *fp = static_cast<const float *>(dst);
-                size_t check_count = std::min(bytes / sizeof(float), static_cast<size_t>(8));
-                bool all_zero = true;
-                for (size_t i = 0; i < check_count; ++i)
-                {
-                    if (fp[i] != 0.0f)
-                    {
-                        all_zero = false;
-                        break;
-                    }
-                }
-                if (all_zero && check_count > 0 && bytes >= 1024)
-                {
-                    LOG_WARN("[TensorBase::ensureOnHost] D2H ALL ZEROS: tensor="
-                             << (debug_name_.empty() ? "(unnamed)" : debug_name_)
-                             << " bytes=" << bytes
-                             << " device=" << gpu_device_->toString()
-                             << " gpu_ptr=" << static_cast<const void *>(gpu_data_ptr_)
-                             << " dst=" << static_cast<const void *>(dst)
-                             << " d2h_ns=" << d2h_ns
-                             << " had_event=" << (device_completion_event_ ? "yes" : "no"));
-                }
-            }
-
-            // Record transfer for profiling (when LLAMINAR_PROFILING=1)
-            TransferProfiler::recordD2H(bytes, static_cast<uint64_t>(d2h_ns));
-
-            // Record transfer for testing
-            if (trace_cfg.enabled)
-            {
-                trace_cfg.recordD2H(bytes);
-            }
-
-            host_valid_ = true; // Host now has current data
-            // device_valid_ stays true - we downloaded FROM device, so both are now in sync
-            authoritative_device_ = std::nullopt; // Host is now authoritative
-
-            LOG_DEBUG("[TensorBase::ensureOnHost] Downloaded " << bytes
-                                                               << " bytes from device " << gpu_device_->toString()
-                                                               << " (backend device ID: " << backend_device_id << ")");
-        }
-
-        return true;
+        return result.success;
     }
 
-    void TensorBase::mark_device_dirty_with_event(void *stream)
+    void TensorBase::transitionToWithEvent(TensorCoherenceState new_state,
+                                           std::optional<DeviceId> authoritative_dev,
+                                           void *stream)
     {
         std::lock_guard<std::mutex> lock(coherence_mutex_);
 
-        LOG_DEBUG("[TensorBase::mark_device_dirty_with_event] ENTRY: tensor=" << static_cast<void *>(this)
-                                                                              << " name=" << (debug_name_.empty() ? "(unnamed)" : debug_name_)
-                                                                              << " gpu_device_=" << (gpu_device_.has_value() ? gpu_device_->toString() : "none")
-                                                                              << " stream=" << stream);
-
-        // Mark as device dirty (standard behavior)
-        // For mapped memory, both host and device stay valid
-        device_valid_ = true;
-        host_valid_ = is_mapped_; // Mapped memory: host is also valid
-
-        // Track which device is now authoritative (for multi-device coherence)
-        authoritative_device_ = gpu_device_; // GPU now has authoritative data
+        // --- State transition (same as transitionTo) ---
+        setCoherenceState_(new_state);
+        if (new_state == TensorCoherenceState::DEVICE_AUTHORITATIVE ||
+            new_state == TensorCoherenceState::MAPPED)
+        {
+            authoritative_device_ = authoritative_dev.value_or(gpu_device_.value_or(DeviceId::cpu()));
+        }
+        else if (new_state == TensorCoherenceState::HOST_ONLY ||
+                 new_state == TensorCoherenceState::HOST_AUTHORITATIVE)
+        {
+            authoritative_device_.reset();
+        }
 
         // For mapped memory: signal that sync is needed before CPU reads
         if (is_mapped_)
@@ -2137,89 +1465,66 @@ namespace llaminar2
             mapped_needs_sync_ = true;
         }
 
-        // If we have a device, record an event for fine-grained sync
-        if (gpu_device_.has_value())
+        // --- GPU event recording ---
+        if (!gpu_device_.has_value())
+            return;
+
+        IBackend *backend = resolveBackend(*gpu_device_);
+        if (!backend)
+            return;
+
+        // Defensive check: verify resolved backend type matches tensor's device.
+        // In PP mode a tensor may migrate CUDA→ROCm; recording a CUDA stream event
+        // on a ROCm backend would segfault.
+        if (stream && backend->backendDeviceType() != gpu_device_->type)
         {
-            LOG_DEBUG("[TensorBase::mark_device_dirty_with_event] Getting backend for device " << gpu_device_->toString());
-            IBackend *backend = resolveBackend(*gpu_device_);
-            if (backend)
+            LOG_ERROR("[TensorBase::transitionToWithEvent] CROSS-BACKEND MISMATCH: "
+                      << "tensor gpu_device_=" << gpu_device_->toString()
+                      << " but resolved backend type=" << static_cast<int>(backend->backendDeviceType())
+                      << " — skipping event recording to avoid crash");
+            return;
+        }
+
+        int backend_device_id = gpu_device_->gpu_ordinal();
+
+        // Existing event on a different device — must recreate
+        if (device_completion_event_ && event_device_.has_value() && *event_device_ != *gpu_device_)
+        {
+            // Don't destroy — it was created on a different backend. Leak is safer than crash.
+            device_completion_event_ = nullptr;
+            event_device_.reset();
+        }
+
+        // Create event if needed
+        if (!device_completion_event_)
+        {
+            device_completion_event_ = backend->createEvent(backend_device_id);
+            if (device_completion_event_)
             {
-                // Defensive check: verify the resolved backend type matches the tensor's
-                // gpu_device_ type. In Pipeline Parallel mode, a tensor may be migrated
-                // to a different device type (e.g., CUDA→ROCm) by a downstream stage.
-                // If the caller's stream is from a different backend, recording the event
-                // would pass a CUDA stream to hipEventRecord (or vice versa), causing a
-                // segfault. Skip event recording and log an error instead of crashing.
-                if (stream && backend->backendDeviceType() != gpu_device_->type)
-                {
-                    LOG_ERROR("[TensorBase::mark_device_dirty_with_event] CROSS-BACKEND MISMATCH: "
-                              << "tensor gpu_device_=" << gpu_device_->toString()
-                              << " but resolved backend type=" << static_cast<int>(backend->backendDeviceType())
-                              << " — skipping event recording to avoid crash");
-                    return;
-                }
-                int backend_device_id = gpu_device_->gpu_ordinal();
-                LOG_DEBUG("[TensorBase::mark_device_dirty_with_event] Got backend, device_id=" << backend_device_id);
-
-                // Check if existing event is on a different device - must recreate
-                if (device_completion_event_ && event_device_.has_value() && *event_device_ != *gpu_device_)
-                {
-                    LOG_DEBUG("[TensorBase::mark_device_dirty_with_event] Event device mismatch: "
-                              << "event on " << event_device_->toString()
-                              << " but tensor now on " << gpu_device_->toString() << ", clearing old event");
-                    // Note: We don't destroy the old event here since it was created on a different
-                    // device/backend. The old event will be leaked but this is safer than calling
-                    // destroyEvent with the wrong backend. In practice this should be rare.
-                    device_completion_event_ = nullptr;
-                    event_device_.reset();
-                }
-
-                // Create event if we don't have one
-                if (!device_completion_event_)
-                {
-                    LOG_DEBUG("[TensorBase::mark_device_dirty_with_event] Creating event...");
-                    device_completion_event_ = backend->createEvent(backend_device_id);
-                    LOG_DEBUG("[TensorBase::mark_device_dirty_with_event] createEvent returned: "
-                              << (device_completion_event_ ? "valid" : "nullptr"));
-                    if (device_completion_event_)
-                    {
-                        event_device_ = *gpu_device_; // Track which device the event was created on
-                        LOG_DEBUG("[TensorBase::mark_device_dirty_with_event] Created completion event for tensor on device "
-                                  << gpu_device_->toString());
-                    }
-                    else
-                    {
-                        LOG_WARN("[TensorBase::mark_device_dirty_with_event] Failed to create event on device "
-                                 << gpu_device_->toString());
-                    }
-                }
-
-                // Record the event (marks this point in the stream)
-                if (device_completion_event_)
-                {
-                    LOG_DEBUG("[TensorBase::mark_device_dirty_with_event] Recording event...");
-                    if (!backend->recordEvent(device_completion_event_, backend_device_id, stream))
-                    {
-                        LOG_WARN("[TensorBase::mark_device_dirty_with_event] Failed to record event");
-                    }
-                    else
-                    {
-                        LOG_TRACE("[TensorBase::mark_device_dirty_with_event] Recorded completion event");
-                    }
-                    LOG_DEBUG("[TensorBase::mark_device_dirty_with_event] Event recording complete");
-                }
+                event_device_ = *gpu_device_;
             }
             else
             {
-                LOG_TRACE("[TensorBase::mark_device_dirty_with_event] No backend available for device "
-                          << gpu_device_->toString());
+                LOG_WARN("[TensorBase::transitionToWithEvent] Failed to create event on device "
+                         << gpu_device_->toString());
+                return;
             }
         }
-        else
+
+        // Record the event on the stream
+        if (!backend->recordEvent(device_completion_event_, backend_device_id, stream))
         {
-            LOG_TRACE("[TensorBase::mark_device_dirty_with_event] Tensor not on GPU (no gpu_device_)");
+            LOG_WARN("[TensorBase::transitionToWithEvent] Failed to record event");
         }
-        LOG_DEBUG("[TensorBase::mark_device_dirty_with_event] EXIT");
+    }
+
+    void TensorBase::mark_device_dirty_with_event(void *stream)
+    {
+        // Delegate to the state-machine-aware implementation
+        transitionToWithEvent(
+            is_mapped_ ? TensorCoherenceState::MAPPED : TensorCoherenceState::DEVICE_AUTHORITATIVE,
+            gpu_device_,
+            stream);
     }
 
     bool TensorBase::releaseDeviceMemory()
@@ -2250,7 +1555,7 @@ namespace llaminar2
             LOG_DEBUG("[TensorBase::releaseDeviceMemory] Released device memory on device "
                       << gpu_device_->toString());
             gpu_data_ptr_ = nullptr;
-            device_valid_ = false;
+            setCoherenceState_(TensorCoherenceState::HOST_ONLY); // GPU memory freed
 
             // Unpin host memory since we no longer need fast GPU transfers
             unpinHostMemory();
@@ -2822,9 +2127,8 @@ namespace llaminar2
         gpu_data_ptr_ = dst_ptr;
         gpu_device_ = dst_device;
         authoritative_device_ = dst_device;
-        device_valid_ = true;
-        host_valid_ = false;                // Host is now stale
-        is_bar_backed_ = dst_is_bar_backed; // Track if new primary is BAR-backed
+        setCoherenceState_(TensorCoherenceState::DEVICE_AUTHORITATIVE); // Device now authoritative, host stale
+        is_bar_backed_ = dst_is_bar_backed;                             // Track if new primary is BAR-backed
 
         // 8. Clear completion event - events are tied to the device/context where created
         // Must clear for ANY cross-device transfer (not just cross-vendor), because CUDA

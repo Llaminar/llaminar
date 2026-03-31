@@ -21,6 +21,7 @@
 #include "backends/HostBackend.h"
 #include "../backends/BackendManager.h"
 #include "../tensors/TensorClasses.h"
+#include "../transfer/TransferEngine.h"
 #include "../utils/Logger.h"
 #include <algorithm>
 #include <cstring>
@@ -304,7 +305,7 @@ namespace llaminar2
                               << dst_device.toString());
                     return false;
                 }
-                activations->mark_device_dirty();
+                activations->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, dst_device);
                 LOG_DEBUG("LocalPPContext::transfer: CPU → GPU transfer to "
                           << dst_device.toString() << " (" << activations->numel() << " elements)");
             }
@@ -335,7 +336,7 @@ namespace llaminar2
                           << src_device.toString());
                 return false;
             }
-            activations->mark_device_dirty();
+            activations->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, src_device);
         }
 
         // Cross-vendor GPU transfer (CUDA↔ROCm): use host bounce if tensor
@@ -347,31 +348,20 @@ namespace llaminar2
 
         if (is_cross_vendor && !activations->isBARBacked())
         {
-            // GPU → host: use ensureOnHost() for proper D2H coherence sync.
-            // NOTE: Do NOT use data() here — for quantized tensors (Q4_0, Q8_0, etc.),
-            // data() returns a dequantized float view without touching coherence flags,
-            // leaving host_valid_ = false and causing a COHERENCE ERROR downstream.
-            if (!activations->ensureOnHost())
+            // Cross-vendor GPU transfer: delegate to TransferEngine which
+            // handles the host-bounce pattern (D2H → H2D) correctly for all
+            // memory residency types including BAR-backed tensors.
+            auto result = TransferEngine::instance().transferActivation(activations, dst_device);
+            if (!result.success)
             {
-                LOG_ERROR("LocalPPContext::transfer: Failed to sync to host from "
-                          << src_device.toString() << " for cross-vendor bounce");
+                LOG_ERROR("LocalPPContext::transfer: TransferEngine failed: " << result.error
+                                                                              << " (" << src_device.toString() << " → " << dst_device.toString() << ")");
                 return false;
             }
 
-            // Invalidate old GPU data — host is now authoritative
-            activations->invalidateGpuData();
-
-            // Host → destination GPU
-            if (!activations->ensureOnDevice(dst_device))
-            {
-                LOG_ERROR("LocalPPContext::transfer: Failed to upload to "
-                          << dst_device.toString() << " after cross-vendor host bounce");
-                return false;
-            }
-            activations->mark_device_dirty();
-
-            LOG_DEBUG("LocalPPContext::transfer: Cross-vendor host bounce "
-                      << src_device.toString() << " → CPU → " << dst_device.toString()
+            LOG_DEBUG("LocalPPContext::transfer: Cross-vendor transfer via TransferEngine "
+                      << src_device.toString() << " → " << dst_device.toString()
+                      << " method=" << to_string(result.method_used)
                       << " (" << activations->numel() << " elements)");
             return true;
         }
@@ -884,7 +874,7 @@ namespace llaminar2
                 return false;
             }
 
-            activations->mark_device_dirty();
+            activations->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, dst_device);
             LOG_DEBUG("HierarchicalPPContext::transferFromTPDomain: BAR-backed zero-copy complete");
             return true;
         }
@@ -998,7 +988,7 @@ namespace llaminar2
 
             // Clear any ROCm completion event before marking dirty
             activations->clearCompletionEvent();
-            activations->mark_device_dirty();
+            activations->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, dst_device);
 
             LOG_DEBUG("HierarchicalPPContext::transferFromTPDomain: "
                       "PCIe BAR staging complete: "
@@ -1070,7 +1060,7 @@ namespace llaminar2
 
             // Clear any CUDA completion event before marking dirty
             activations->clearCompletionEvent();
-            activations->mark_device_dirty();
+            activations->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, dst_device);
 
             LOG_DEBUG("HierarchicalPPContext::transferFromTPDomain: "
                       "PCIe BAR staging complete (CUDA→ROCm): "
@@ -1346,7 +1336,7 @@ namespace llaminar2
                               << src_device.toString());
                     return false;
                 }
-                activations->mark_device_dirty();
+                activations->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, src_device);
 
                 // Force sync to host via data() - this sets authoritative_device_ = nullopt
                 (void)activations->data();
@@ -1367,7 +1357,7 @@ namespace llaminar2
                               << dst_device.toString());
                     return false;
                 }
-                activations->mark_device_dirty();
+                activations->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, dst_device);
 
                 LOG_DEBUG("HierarchicalPPContext::transferSingleToSingle: "
                           << "CPU → " << dst_device.toString() << " complete");
@@ -1385,7 +1375,7 @@ namespace llaminar2
                           << src_device.toString());
                 return false;
             }
-            activations->mark_device_dirty();
+            activations->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, src_device);
         }
 
         // Cross-vendor GPU transfer (CUDA↔ROCm): use host bounce if tensor
@@ -1420,7 +1410,7 @@ namespace llaminar2
                           << " after cross-vendor host bounce");
                 return false;
             }
-            activations->mark_device_dirty();
+            activations->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, dst_device);
 
             LOG_DEBUG("HierarchicalPPContext::transferSingleToSingle: "
                       "Cross-vendor host bounce "

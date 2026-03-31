@@ -1753,6 +1753,31 @@ namespace llaminar2
                         return;
                     }
 
+                    // Handle FusedResidualNormStage - has two outputs:
+                    //   outputs[0] = "residual_out" (pre-norm residual = old_hidden + input)
+                    //   outputs[1] = "norm_output"  (RMSNorm output after gamma scaling)
+                    // Parity tests compare ATTENTION_NORM/FFN_NORM against PyTorch's normalized
+                    // output (post-RMSNorm), so we must store outputs[1] for the NORM key.
+                    // Note: The residual (outputs[0]) is NOT stored here — dedicated
+                    // attn_residual/ffn_residual stages in the graph capture those separately.
+                    if ((name.find("_attn_norm") != std::string::npos ||
+                         name.find("_ffn_norm") != std::string::npos) &&
+                        dump.outputs.size() >= 2)
+                    {
+                        std::string key = convertStageNameToSnapshotKey(name);
+
+                        // Store norm_output (outputs[1]) as the NORM snapshot
+                        if (dump.outputs[1].data)
+                        {
+                            auto data = extractFp32FromOutput(dump.outputs[1]);
+                            LOG_DEBUG("[Snapshot] FusedResidualNorm: storing norm_output as key="
+                                      << key << " count=" << data.size());
+                            if (!data.empty())
+                                snapshots_[key] = {std::move(data), dump.outputs[1].rows, dump.outputs[1].cols};
+                        }
+                        return;
+                    }
+
                     // Standard single-output stages
                     LOG_DEBUG("[Snapshot] Standard path: stage=" << name
                                                                  << " outputs.size=" << dump.outputs.size()

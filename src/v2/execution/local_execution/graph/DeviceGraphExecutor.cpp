@@ -2582,7 +2582,7 @@ namespace llaminar2
             if (output.tensor)
             {
                 auto *base_tensor = dynamic_cast<TensorBase *>(output.tensor);
-                if (base_tensor && base_tensor->isDeviceValid())
+                if (base_tensor && base_tensor->deviceValid())
                 {
                     // Skip GPU validation for BAR-backed tensors - they're shared between
                     // CUDA and ROCm devices. Using current_device() returns CUDA device,

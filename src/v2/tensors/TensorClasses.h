@@ -94,6 +94,7 @@
 #include "VnniPackContext.h"      // Packing context for IINT8Unpackable::packVnniBlock()
 #include "SIMDHelpers.h"
 #include "AlignedVector.h"
+#include "CoherenceState.h"       // Explicit coherence state machine
 #include "../backends/DeviceId.h" // DeviceId for ensureOnDevice
 #include <vector>
 #include <memory>
@@ -643,11 +644,14 @@ namespace llaminar2
      * This allows concrete tensors to inherit type-safe typed_data() from TypedTensorBase
      * while still getting the full TensorBase infrastructure.
      */
-    class TensorSlice; // Forward declaration for friend
+    class TensorSlice;       // Forward declaration for friend
+    struct MemoryDescriptor; // Forward declaration for friend
 
     class TensorBase : public virtual ITensor, public std::enable_shared_from_this<TensorBase>
     {
-        friend class TensorSlice; // Allow TensorSlice to access protected byte_size()/raw_host_data_ptr()
+        friend class TensorSlice;                                         // Allow TensorSlice to access protected byte_size()/raw_host_data_ptr()
+        friend class TransferEngine;                                      // Allow TransferEngine to access coherence state and pointers
+        friend MemoryDescriptor makeMemoryDescriptor(const TensorBase *); // Allow descriptor factory
 
     public:
         virtual ~TensorBase(); // Implemented in TensorBase.cpp - clears KernelFactory cache
@@ -880,11 +884,10 @@ namespace llaminar2
         {
             if (device.is_cpu())
             {
-                // Asking about CPU/host - return true if host data is valid
-                return host_valid_;
+                return ::llaminar2::isHostValid(coherence_state_);
             }
             // Asking about a specific GPU - must be on that device AND have valid data
-            return gpu_device_.has_value() && *gpu_device_ == device && device_valid_;
+            return gpu_device_.has_value() && *gpu_device_ == device && ::llaminar2::isDeviceValid(coherence_state_);
         }
 
         // ===== Lazy Transfer API (Phase 1 GPU Device-Aware Slicing) =====
@@ -1002,8 +1005,7 @@ namespace llaminar2
         void mark_device_dirty_flags_only()
         {
             std::lock_guard<std::mutex> lock(coherence_mutex_);
-            device_valid_ = true;
-            host_valid_ = is_mapped_;
+            setCoherenceState_(is_mapped_ ? TensorCoherenceState::MAPPED : TensorCoherenceState::DEVICE_AUTHORITATIVE);
             authoritative_device_ = gpu_device_;
             if (is_mapped_)
                 mapped_needs_sync_ = true;
@@ -1041,17 +1043,102 @@ namespace llaminar2
             event_device_.reset();
         }
 
-        /**
-         * @brief Check if tensor data is currently resident on host (CPU)
-         * @return true if host buffer contains valid data
-         */
-        bool isOnCPU() const { return host_valid_; }
+        /// @deprecated Use hostValid() or coherenceState() instead. Will be removed.
+        bool isOnCPU() const { return ::llaminar2::isHostValid(coherence_state_); }
+
+        /// @deprecated Use deviceValid() or coherenceState() instead. Will be removed.
+        bool isDeviceValid() const { return ::llaminar2::isDeviceValid(coherence_state_) && gpu_data_ptr_ != nullptr; }
+
+        // ================================================================
+        // New state-based coherence query API
+        // ================================================================
 
         /**
-         * @brief Check if tensor data is currently valid on GPU
-         * @return true if GPU buffer is allocated AND contains valid data
+         * @brief Get the explicit coherence state of this tensor
+         * @return Current TensorCoherenceState enum value
          */
-        bool isDeviceValid() const { return device_valid_ && gpu_data_ptr_ != nullptr; }
+        TensorCoherenceState coherenceState() const { return coherence_state_; }
+
+        /**
+         * @brief Get the memory residency type of this tensor
+         * @return Current MemoryResidency enum value
+         */
+        MemoryResidency memoryResidency() const { return memory_residency_; }
+
+        /// True if host buffer contains valid data (safe for CPU read).
+        bool hostValid() const { return ::llaminar2::isHostValid(coherence_state_); }
+
+        /// True if device buffer is allocated AND contains valid data (safe for GPU kernel).
+        bool deviceValid() const { return ::llaminar2::isDeviceValid(coherence_state_) && gpu_data_ptr_ != nullptr; }
+
+        /// True if both host and device are in sync (no transfer needed).
+        bool isSynced() const { return coherence_state_ == TensorCoherenceState::SYNCED || coherence_state_ == TensorCoherenceState::MAPPED; }
+
+        /// True if host was modified more recently and device needs upload.
+        bool needsUpload() const { return ::llaminar2::needsHostToDeviceUpload(coherence_state_); }
+
+        /// True if device was modified more recently and host needs download.
+        bool needsDownload() const { return ::llaminar2::needsDeviceToHostSync(coherence_state_); }
+
+        // ================================================================
+        // Public coherence transition API
+        // ================================================================
+
+        /**
+         * @brief Explicitly transition this tensor's coherence state.
+         *
+         * This is the preferred public API for coherence mutations that don't
+         * involve data movement (those go through TransferEngine or ensureOnDevice).
+         * Use this when you know the correct target state after an external operation
+         * (e.g., after a collective backend writes to the GPU buffer).
+         *
+         * Thread-safe: acquires coherence_mutex_.
+         *
+         * @param new_state The target coherence state
+         * @param authoritative_dev Optional device that now has authoritative data.
+         *                          Required when transitioning to DEVICE_AUTHORITATIVE.
+         *                          Ignored for HOST_ONLY, HOST_AUTHORITATIVE, SYNCED.
+         *
+         * Valid transitions (enforced in debug builds):
+         *   Any → HOST_ONLY       (host has data, no device buffer)
+         *   Any → HOST_AUTHORITATIVE (host modified, device stale)
+         *   Any → DEVICE_AUTHORITATIVE (GPU modified, host stale)
+         *   Any → SYNCED           (both host and device valid)
+         *   Any → MAPPED           (shared memory, always in sync)
+         */
+        void transitionTo(TensorCoherenceState new_state,
+                          std::optional<DeviceId> authoritative_dev = std::nullopt)
+        {
+            std::lock_guard<std::mutex> lock(coherence_mutex_);
+            setCoherenceState_(new_state);
+            if (new_state == TensorCoherenceState::DEVICE_AUTHORITATIVE)
+            {
+                authoritative_device_ = authoritative_dev.value_or(gpu_device_.value_or(DeviceId::cpu()));
+            }
+            else if (new_state == TensorCoherenceState::HOST_ONLY ||
+                     new_state == TensorCoherenceState::HOST_AUTHORITATIVE)
+            {
+                authoritative_device_.reset();
+            }
+        }
+
+        /**
+         * @brief Transition coherence state AND record a GPU completion event.
+         *
+         * This combines transitionTo() state management with GPU event recording.
+         * Use this after GPU kernel writes when you need fine-grained sync
+         * (so ensureOnHost/ensureOnDevice can wait on the specific kernel rather
+         * than doing a full device synchronize).
+         *
+         * Thread-safe: acquires coherence_mutex_.
+         *
+         * @param new_state The target coherence state (typically DEVICE_AUTHORITATIVE or MAPPED)
+         * @param authoritative_dev Device that now has authoritative data
+         * @param stream GPU stream to record the event on (nullptr = default stream)
+         */
+        void transitionToWithEvent(TensorCoherenceState new_state,
+                                   std::optional<DeviceId> authoritative_dev = std::nullopt,
+                                   void *stream = nullptr);
 
         /**
          * @brief Check if tensor has cached device data via internal packing mechanisms
@@ -1728,8 +1815,20 @@ namespace llaminar2
         // See docs/v2/TENSOR_MEMORY_COHERENCE_DESIGN.md for full design.
 
         void *gpu_data_ptr_ = nullptr; // GPU buffer pointer (nullptr = not on GPU)
-        bool host_valid_ = true;       // Host data is current (starts true - data created on host)
-        bool device_valid_ = false;    // Device data is current (starts false - no GPU alloc)
+
+        // ===== Explicit Coherence State Machine (V2) =====
+        // coherence_state_ is the SOLE source of truth for host/device validity.
+        // All mutations MUST go through setCoherenceState_() for consistency.
+        // Public accessors hostValid()/deviceValid()/isDeviceValid() derive from this.
+        TensorCoherenceState coherence_state_ = TensorCoherenceState::HOST_ONLY;
+        MemoryResidency memory_residency_ = MemoryResidency::STANDARD;
+
+        /// Set coherence_state_. This is the ONLY way to mutate coherence state.
+        /// Does NOT acquire coherence_mutex_ — caller must hold it if needed.
+        void setCoherenceState_(TensorCoherenceState new_state)
+        {
+            coherence_state_ = new_state;
+        }
 
         // Injected backend for testing (non-owning). When non-null, resolveBackend()
         // returns this instead of looking up the global CUDA/ROCm backend.

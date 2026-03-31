@@ -2,8 +2,10 @@
  * @file CoherenceTracker.h
  * @brief Per-buffer coherence state tracking for BufferArena
  *
- * Tracks which copy of a buffer (host or device) is authoritative
- * and performs the necessary transfers when the other side is requested.
+ * Delegates coherence decisions to TensorBase::coherenceState()
+ * (the canonical TensorCoherenceState state machine). The local
+ * CoherenceState struct tracks only arena-level concerns
+ * (e.g., "has this buffer ever been written?").
  *
  * This is internal to BufferArena — stages never interact with it directly.
  */
@@ -11,6 +13,7 @@
 #pragma once
 
 #include "backends/DeviceId.h"
+#include "tensors/CoherenceState.h"
 #include <cstddef>
 #include <string>
 
@@ -22,7 +25,10 @@ namespace llaminar2
     class TensorBase;
 
     /**
-     * @brief Per-buffer coherence state.
+     * @brief Per-buffer coherence state for BufferArena.
+     *
+     * Tracks arena-level write history. Transfer decisions delegate
+     * to the tensor's TensorCoherenceState via CoherenceTracker methods.
      */
     struct CoherenceState
     {
@@ -36,20 +42,39 @@ namespace llaminar2
         Authority authority = UNINITIALIZED;
         DeviceId authoritative_device; ///< Valid when authority == DEVICE (which GPU)
 
-        /// Check if a transfer is needed to make data available on target
-        bool needsTransferTo(DeviceId target) const
+        /// Check if a transfer is needed to make data available on target.
+        /// Uses arena-level UNINITIALIZED check first, then delegates
+        /// to the tensor's coherence state for HOST/DEVICE decisions.
+        bool needsTransferTo(DeviceId target, TensorCoherenceState tensor_state) const
         {
             if (authority == UNINITIALIZED)
                 return false; // Write-only, no data to transfer
 
+            // Delegate to the canonical coherence state machine
+            if (target.is_gpu())
+                return ::llaminar2::needsHostToDeviceUpload(tensor_state);
+
+            if (target.is_cpu())
+                return ::llaminar2::needsDeviceToHostSync(tensor_state);
+
+            return false;
+        }
+
+        /// Legacy overload — kept for callers that don't have tensor state handy.
+        /// @deprecated Prefer needsTransferTo(target, tensor_state).
+        bool needsTransferTo(DeviceId target) const
+        {
+            if (authority == UNINITIALIZED)
+                return false;
+
             if (authority == HOST && target.is_gpu())
-                return true; // Host→Device needed
+                return true;
 
             if (authority == DEVICE && target.is_cpu())
-                return true; // Device→Host needed
+                return true;
 
             if (authority == DEVICE && target.is_gpu() && target != authoritative_device)
-                return true; // Device→Device (different GPU)
+                return true;
 
             return false;
         }

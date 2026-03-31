@@ -188,7 +188,7 @@ namespace llaminar2
         }
 
         // Mark destination as having valid GPU data (with event for fine-grained sync)
-        dst_cpu->mark_device_dirty_with_event();
+        dst_cpu->transitionToWithEvent(TensorCoherenceState::DEVICE_AUTHORITATIVE);
 
         auto end = std::chrono::high_resolution_clock::now();
         double elapsed_ms = std::chrono::duration<double, std::milli>(end - start).count();

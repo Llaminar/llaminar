@@ -614,92 +614,27 @@ namespace llaminar2
                     copy_bytes *= sizeof(float);
                 }
 
-                // Device-aware copy: handle GPU coherence for PP decode
-                // The external_hidden_state may be GPU-authoritative from previous PP stage
+                // Unified PP copy: data() handles all device/BAR coherence sync
+                // automatically (including BAR-backed D2H via staging buffer).
+                // This eliminates the previous 3-way BAR/D2D/CPU branch.
+                const void *src = input.external_hidden_state->data();
+                void *dst = working_buffer->mutable_data();
+                std::memcpy(dst, src, copy_bytes);
+
                 if (config_.default_device.is_gpu())
                 {
                     DeviceId target_device = config_.default_device;
-
-                    // BAR-backed tensors use cuMemHostRegister(IOMEMORY) pointers.
-                    // cudaMemcpy(D2D) with IOMEMORY source produces garbage — only
-                    // D2H works correctly.  Use host bounce for BAR-backed sources.
-                    if (input.external_hidden_state->isBARBacked())
+                    if (!working_buffer->ensureOnDevice(target_device))
                     {
-                        const float *src_host = input.external_hidden_state->data();
-                        float *dst_host = working_buffer->mutable_data();
-                        std::memcpy(dst_host, src_host, copy_bytes);
-                        if (!working_buffer->ensureOnDevice(target_device))
-                        {
-                            LOG_ERROR("[Qwen2Graph] Failed to upload working buffer after BAR host bounce");
-                            throw std::runtime_error("Failed to upload working buffer");
-                        }
-                        working_buffer->mark_device_dirty();
-                        LOG_DEBUG("[Qwen2Graph] PP BAR host-bounce copy: " << copy_bytes
-                                                                           << " bytes to " << target_device.toString());
+                        LOG_ERROR("[Qwen2Graph] Failed to upload working buffer to "
+                                  << target_device.toString());
+                        throw std::runtime_error("Failed to upload working buffer");
                     }
-                    else
-                    {
-                        // Regular GPU tensor: ensure it's on the target device
-                        if (!input.external_hidden_state->ensureOnDevice(target_device))
-                        {
-                            LOG_ERROR("[Qwen2Graph] Failed to ensure external_hidden_state on "
-                                      << target_device.toString());
-                            throw std::runtime_error("Failed to upload external_hidden_state to device");
-                        }
-                        const void *src_ptr = input.external_hidden_state->gpu_data_ptr();
-                        if (!src_ptr)
-                        {
-                            LOG_ERROR("[Qwen2Graph] Source pointer null for PP copy");
-                            throw std::runtime_error("Source pointer not available for PP copy");
-                        }
-
-                        // Allocate destination on device (don't upload stale host data)
-                        if (!working_buffer->allocateOnDevice(target_device))
-                        {
-                            LOG_ERROR("[Qwen2Graph] Failed to allocate working_buffer on "
-                                      << target_device.toString());
-                            throw std::runtime_error("Failed to allocate working_buffer on device");
-                        }
-
-                        void *dst_ptr = working_buffer->gpu_data_ptr();
-                        if (!dst_ptr)
-                        {
-                            LOG_ERROR("[Qwen2Graph] Destination pointer null for PP copy");
-                            throw std::runtime_error("Destination pointer not available for PP copy");
-                        }
-
-                        auto *router = GlobalBackendRouter::get();
-                        if (!router)
-                        {
-                            LOG_ERROR("[Qwen2Graph] GlobalBackendRouter not initialized");
-                            throw std::runtime_error("Backend router not available for PP copy");
-                        }
-
-                        ICollectiveBackend *backend = router->getBackendForCopy(target_device, target_device);
-                        if (!backend)
-                        {
-                            LOG_ERROR("[Qwen2Graph] No backend for " << target_device.toString());
-                            throw std::runtime_error("No backend available for PP copy");
-                        }
-
-                        if (!backend->copy(dst_ptr, target_device, src_ptr, target_device, copy_bytes))
-                        {
-                            LOG_ERROR("[Qwen2Graph] Backend copy failed for PP hidden state");
-                            throw std::runtime_error("Backend copy failed for PP hidden state");
-                        }
-
-                        working_buffer->mark_device_dirty();
-                        LOG_DEBUG("[Qwen2Graph] PP GPU D2D copy: " << copy_bytes << " bytes on "
-                                                                   << target_device.toString());
-                    }
+                    working_buffer->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, target_device);
                 }
-                else
-                {
-                    // CPU execution path: direct memcpy between host buffers
-                    const float *src = input.external_hidden_state->data();
-                    float *dst = working_buffer->mutable_data();
-                    std::memcpy(dst, src, copy_bytes);
-                }
+
+                LOG_DEBUG("[Qwen2Graph] PP copy: " << copy_bytes << " bytes to "
+                                                   << config_.default_device.toString());
             }
             else
             {

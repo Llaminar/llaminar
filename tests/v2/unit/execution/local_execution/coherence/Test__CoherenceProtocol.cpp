@@ -40,8 +40,8 @@ public:
     // ---- Expose protected state for assertions ----
 
     void *getCompletionEvent() const { return device_completion_event_; }
-    bool getHostValid() const { return host_valid_; }
-    bool getDeviceValid() const { return device_valid_; }
+    bool getHostValid() const { return ::llaminar2::isHostValid(coherence_state_); }
+    bool getDeviceValid() const { return ::llaminar2::isDeviceValid(coherence_state_); }
     std::optional<DeviceId> getGpuDevice() const { return gpu_device_; }
     std::optional<DeviceId> getAuthoritativeDevice() const { return authoritative_device_; }
     void *getGpuDataPtr() const { return gpu_data_ptr_; }
@@ -50,8 +50,40 @@ public:
 
     void injectCompletionEvent(void *event) { device_completion_event_ = event; }
     void injectGpuDevice(DeviceId device) { gpu_device_ = device; }
-    void injectDeviceValid(bool valid) { device_valid_ = valid; }
-    void injectHostValid(bool valid) { host_valid_ = valid; }
+    void injectDeviceValid(bool valid)
+    {
+        if (valid)
+        {
+            if (::llaminar2::isHostValid(coherence_state_))
+                setCoherenceState_(TensorCoherenceState::SYNCED);
+            else
+                setCoherenceState_(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+        }
+        else
+        {
+            if (::llaminar2::isHostValid(coherence_state_))
+                setCoherenceState_(TensorCoherenceState::HOST_AUTHORITATIVE);
+            else
+                setCoherenceState_(TensorCoherenceState::INVALID);
+        }
+    }
+    void injectHostValid(bool valid)
+    {
+        if (valid)
+        {
+            if (::llaminar2::isDeviceValid(coherence_state_))
+                setCoherenceState_(TensorCoherenceState::SYNCED);
+            else
+                setCoherenceState_(TensorCoherenceState::HOST_AUTHORITATIVE);
+        }
+        else
+        {
+            if (::llaminar2::isDeviceValid(coherence_state_))
+                setCoherenceState_(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+            else
+                setCoherenceState_(TensorCoherenceState::INVALID);
+        }
+    }
 
     void injectGpuDataPtr(void *ptr) { gpu_data_ptr_ = ptr; }
 };

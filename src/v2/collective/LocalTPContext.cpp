@@ -657,7 +657,7 @@ namespace llaminar2
 
             if (result)
             {
-                tensor->mark_device_dirty_with_event();
+                tensor->transitionToWithEvent(TensorCoherenceState::DEVICE_AUTHORITATIVE);
             }
             else
             {
@@ -870,7 +870,7 @@ namespace llaminar2
 #endif
                         if (back_ok)
                         {
-                            tensor->mark_device_dirty_with_event(stream);
+                            tensor->transitionToWithEvent(TensorCoherenceState::DEVICE_AUTHORITATIVE, std::nullopt, stream);
                             return true;
                         }
                         LOG_WARN("LocalTPContext: FP16→FP32 cast-back failed, data may be corrupt");
@@ -891,7 +891,7 @@ namespace llaminar2
         {
             // Mark tensor dirty and record completion event on the allreduce stream.
             // This ensures ensureOnHost() waits for the allreduce to finish before D2H.
-            tensor->mark_device_dirty_with_event(stream);
+            tensor->transitionToWithEvent(TensorCoherenceState::DEVICE_AUTHORITATIVE, std::nullopt, stream);
             return true;
         }
 
@@ -1082,7 +1082,7 @@ namespace llaminar2
 
                 if (result)
                 {
-                    tensor->mark_device_dirty_with_event();
+                    tensor->transitionToWithEvent(TensorCoherenceState::DEVICE_AUTHORITATIVE);
                 }
                 return result;
             }
@@ -1093,7 +1093,7 @@ namespace llaminar2
 
             if (result)
             {
-                tensor->mark_device_dirty_with_event();
+                tensor->transitionToWithEvent(TensorCoherenceState::DEVICE_AUTHORITATIVE);
             }
             return result;
         }
@@ -1106,6 +1106,21 @@ namespace llaminar2
     bool LocalTPContext::allreduceWithBarrier(TensorBase *tensor, const std::string &stage_name, size_t count)
     {
         const int num_participants = degree();
+
+        // ===========================================================================
+        // CRITICAL: Synchronize GPU compute stream BEFORE entering the barrier.
+        // GPU kernels (e.g. GEMM) are launched asynchronously on NonBlocking streams.
+        // Without this sync, the allreduce would read from gpu_data_ptr() before the
+        // preceding kernel has finished writing — producing NaN/garbage.
+        // ===========================================================================
+        if (auto device = tensor->current_device(); device.has_value() && !device->is_cpu())
+        {
+            auto *backend = getBackendForDevice(*device);
+            if (backend)
+            {
+                backend->synchronize(device->toKernelDeviceIndex());
+            }
+        }
 
         std::unique_lock<std::mutex> lock(barrier_mutex_);
 
@@ -1280,7 +1295,7 @@ namespace llaminar2
         {
             // Mark tensor dirty (flags only — RCCL may not have completed yet,
             // but compute stream has a WaitEvent dep on RCCL completion)
-            tensor->mark_device_dirty_flags_only();
+            tensor->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, expected_device);
             return true;
         }
 
@@ -1527,6 +1542,21 @@ namespace llaminar2
                       << (tensor_device.has_value() ? tensor_device->toString() : "none")
                       << " not found in LocalTPContext devices list (degree=" << num_participants << ")");
             return false;
+        }
+
+        // ===========================================================================
+        // CRITICAL: Synchronize GPU compute stream BEFORE entering the barrier.
+        // GPU kernels (e.g. GEMM) are launched asynchronously on NonBlocking streams.
+        // Without this sync, the allreduce would read from gpu_data_ptr() before the
+        // preceding kernel has finished writing — producing NaN/garbage.
+        // ===========================================================================
+        if (tensor_device.has_value() && !tensor_device->is_cpu())
+        {
+            auto *backend = getBackendForDevice(*tensor_device);
+            if (backend)
+            {
+                backend->synchronize(tensor_device->toKernelDeviceIndex());
+            }
         }
 
         std::unique_lock<std::mutex> lock(barrier_mutex_);
@@ -2161,7 +2191,8 @@ namespace llaminar2
             {
                 if (barrier_tensors_[i])
                 {
-                    barrier_tensors_[i]->mark_device_dirty_flags_only();
+                    barrier_tensors_[i]->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE,
+                                                      devices_[i].toLocalDeviceId());
                 }
             }
 
@@ -2378,7 +2409,7 @@ namespace llaminar2
                 // Synchronize HIP to ensure copy is complete before CUDA reads
                 rocm_backend->synchronize(rocm_device.toKernelDeviceIndex());
 
-                // Get PCIeBAR backend for reduction kernel
+                // Get PCIeBAR backend for reduction kernel and P2P transfers
                 auto *pcie_backend = dynamic_cast<PCIeBARBackend *>(backend_impl_.get());
                 if (!pcie_backend)
                 {
@@ -2386,13 +2417,6 @@ namespace llaminar2
                     return false;
                 }
 
-                // Step 2: Copy BAR data → CUDA temp buffer via cudaMemcpy (cuMemcpyDtoD)
-                // CRITICAL: Do NOT pass BAR pointers directly to CUDA kernels!
-                // CUDA kernels reading from IOMEMORY-registered BAR via GPU TLB is unreliable
-                // and causes non-deterministic "illegal memory access" errors.
-                // Instead, use cudaMemcpy (which uses the DMA engine internally) to stage
-                // BAR data into regular CUDA device memory first, matching the proven
-                // PCIeBARBackend::allreduce() code path.
                 cudaError_t set_err = cudaSetDevice(cuda_device.ordinal);
                 if (set_err != cudaSuccess)
                 {
@@ -2401,77 +2425,57 @@ namespace llaminar2
                     return false;
                 }
 
-                // Allocate a temp buffer on CUDA for staging BAR data
-                float *cuda_bar_staging = nullptr;
-                cudaError_t alloc_err = cudaMalloc(&cuda_bar_staging, bytes);
-                if (alloc_err != cudaSuccess || !cuda_bar_staging)
-                {
-                    LOG_ERROR("LocalTPContext::executePCIeBarAllreduce: Failed to allocate CUDA staging buffer ("
-                              << bytes << " bytes): " << cudaGetErrorString(alloc_err));
-                    return false;
-                }
-
-                // Copy from BAR (using CUDA device pointer) to CUDA temp buffer
-                cudaError_t cpy_err = cudaMemcpy(cuda_bar_staging, bar_cuda_ptr,
-                                                 bytes, cudaMemcpyDeviceToDevice);
-                if (cpy_err != cudaSuccess)
-                {
-                    LOG_ERROR("LocalTPContext::executePCIeBarAllreduce: Failed to copy BAR → CUDA staging: "
-                              << cudaGetErrorString(cpy_err));
-                    cudaFree(cuda_bar_staging);
-                    return false;
-                }
-
                 LOG_DEBUG("LocalTPContext::executePCIeBarAllreduce: Reducing " << count << " elements "
                                                                                << "(cuda_ptr=" << cuda_output
                                                                                << ", bar_cuda_ptr=" << bar_cuda_ptr
-                                                                               << ", staging=" << cuda_bar_staging
                                                                                << ", ROCm BAR-backed=" << rocm_tensor->isBARBacked() << ")");
 
-                // Step 3: Perform reduction: cuda_output += cuda_bar_staging
-                // Both pointers are regular CUDA device memory — safe for kernel access
+                // Step 2: Reduce on CUDA: cuda_output += ROCm partial (read directly from BAR)
+                // bar_cuda_ptr is registered via cuMemHostGetDevicePointer — CUDA kernels
+                // can read it directly without any staging buffer or host bounce.
                 CollectiveDataType dtype = tensorDTypeToCollective(cuda_tensor);
-                if (!pcie_backend->reduceOnCUDA(cuda_output, cuda_output, cuda_bar_staging,
+                if (!pcie_backend->reduceOnCUDA(cuda_output, cuda_output, bar_cuda_ptr,
                                                 count, dtype, CollectiveOp::ALLREDUCE_SUM))
                 {
                     LOG_ERROR("LocalTPContext::executePCIeBarAllreduce: CUDA reduction kernel failed");
-                    cudaFree(cuda_bar_staging);
                     return false;
                 }
 
-                // Synchronize CUDA
+                // Synchronize CUDA before writing result back
                 if (!pcie_backend->synchronize())
                 {
                     LOG_ERROR("LocalTPContext::executePCIeBarAllreduce: CUDA synchronization failed");
-                    cudaFree(cuda_bar_staging);
                     return false;
                 }
 
-                // DIAGNOSTIC: Read values after reduction
+                // Step 3: Write reduced result from CUDA VRAM → BAR via CUDA driver API
+                // Uses cuMemcpyDtoD with the registered IOMEMORY pointer, which is reliable
+                // for CUDA-initiated writes (the NaN issue only affects CUDA *reads* via DMA).
+                auto bar_offset = pcie_backend->findBarOffset(bar_rocm_ptr, bytes);
+                if (!bar_offset.has_value())
                 {
-                    constexpr int DIAG_N = 4;
-                    float result_vals[DIAG_N] = {};
-                    size_t diag_count = std::min(count, static_cast<size_t>(DIAG_N));
-                    cudaMemcpy(result_vals, cuda_output, diag_count * sizeof(float), cudaMemcpyDeviceToHost);
-                    LOG_DEBUG("LocalTPContext::executePCIeBarAllreduce AFTER reduce"
-                              << " stage='" << barrier_stage_name_ << "'"
-                              << " RESULT[0..3]=" << result_vals[0] << "," << result_vals[1] << "," << result_vals[2] << "," << result_vals[3]);
-                }
-
-                // Free the staging buffer
-                cudaFree(cuda_bar_staging);
-
-                // Step 4: Write result back to ROCm via BAR (using CUDA device pointer)
-                cudaError_t err = cudaMemcpy(bar_cuda_ptr, cuda_output,
-                                             bytes, cudaMemcpyDeviceToDevice);
-                if (err != cudaSuccess)
-                {
-                    LOG_ERROR("LocalTPContext::executePCIeBarAllreduce: Failed to write result to BAR: "
-                              << cudaGetErrorString(err));
+                    LOG_ERROR("LocalTPContext::executePCIeBarAllreduce: Cannot find BAR offset for "
+                              << bar_rocm_ptr << " (size=" << bytes << ")");
                     return false;
                 }
 
-                // Step 5: Copy result from BAR back to HIP staging buffer
+                auto *p2p_engine = pcie_backend->getDirectP2PEngine();
+                if (!p2p_engine || !p2p_engine->isPCIeBarActive())
+                {
+                    LOG_ERROR("LocalTPContext::executePCIeBarAllreduce: DirectP2P engine not available");
+                    return false;
+                }
+
+                auto transfer_result = p2p_engine->transferViaPCIeBar(
+                    cuda_output, bar_offset.value(), bytes, DirectP2PEngine::Direction::ToAMD);
+                if (!transfer_result.success)
+                {
+                    LOG_ERROR("LocalTPContext::executePCIeBarAllreduce: CUDA → BAR transfer failed: "
+                              << transfer_result.error_message);
+                    return false;
+                }
+
+                // Step 4: Copy result from BAR back to HIP staging buffer
                 // so ROCm tensor has the final reduced value
                 if (!rocm_backend->deviceToDevice(const_cast<float *>(hip_staging_ptr), bar_rocm_ptr,
                                                   bytes, rocm_device.toKernelDeviceIndex()))
@@ -2482,8 +2486,8 @@ namespace llaminar2
                 rocm_backend->synchronize(rocm_device.toKernelDeviceIndex());
 
                 // Mark both tensors as having valid device data (with events for fine-grained sync)
-                cuda_tensor->mark_device_dirty_with_event();
-                rocm_tensor->mark_device_dirty_with_event();
+                cuda_tensor->transitionToWithEvent(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+                rocm_tensor->transitionToWithEvent(TensorCoherenceState::DEVICE_AUTHORITATIVE);
 
                 LOG_DEBUG("LocalTPContext::executePCIeBarAllreduce: Zero-copy allreduce completed successfully "
                           << "for stage '" << barrier_stage_name_ << "'");
@@ -2691,7 +2695,9 @@ namespace llaminar2
             }
             rocm_backend->synchronize(rocm_device.toKernelDeviceIndex());
 
-            // Step 2: Copy BAR → CUDA temp via cudaMemcpy (safe DMA, not kernel access)
+            // Step 2: Reduce on CUDA: cuda_output += ROCm partial (read directly from BAR)
+            // bar_cuda_ptr is registered via cuMemHostGetDevicePointer — CUDA kernels
+            // can read it directly without any staging buffer or host bounce.
             cudaError_t set_err = cudaSetDevice(cuda_device.ordinal);
             if (set_err != cudaSuccess)
             {
@@ -2700,56 +2706,47 @@ namespace llaminar2
                 return false;
             }
 
-            float *cuda_bar_staging = nullptr;
-            cudaError_t alloc_err = cudaMalloc(&cuda_bar_staging, bytes);
-            if (alloc_err != cudaSuccess || !cuda_bar_staging)
-            {
-                LOG_ERROR("LocalTPContext::executePCIeBarAllreduce: Failed to allocate CUDA staging: "
-                          << cudaGetErrorString(alloc_err));
-                return false;
-            }
-
-            cudaError_t cpy_err = cudaMemcpy(cuda_bar_staging, bar_cuda_ptr,
-                                             bytes, cudaMemcpyDeviceToDevice);
-            if (cpy_err != cudaSuccess)
-            {
-                LOG_ERROR("LocalTPContext::executePCIeBarAllreduce: Failed to copy BAR → CUDA staging: "
-                          << cudaGetErrorString(cpy_err));
-                cudaFree(cuda_bar_staging);
-                return false;
-            }
-
-            // Step 3: Reduce: cuda_output += cuda_bar_staging (both regular CUDA memory)
             CollectiveDataType dtype = tensorDTypeToCollective(cuda_tensor);
-            if (!pcie_backend->reduceOnCUDA(cuda_output, cuda_output, cuda_bar_staging,
+            if (!pcie_backend->reduceOnCUDA(cuda_output, cuda_output, bar_cuda_ptr,
                                             count, dtype, CollectiveOp::ALLREDUCE_SUM))
             {
                 LOG_ERROR("LocalTPContext::executePCIeBarAllreduce: CUDA reduction kernel failed");
-                cudaFree(cuda_bar_staging);
                 return false;
             }
 
-            // Synchronize CUDA
+            // Synchronize CUDA before writing result back
             if (!pcie_backend->synchronize())
             {
                 LOG_ERROR("LocalTPContext::executePCIeBarAllreduce: CUDA synchronization failed");
-                cudaFree(cuda_bar_staging);
                 return false;
             }
 
-            cudaFree(cuda_bar_staging);
-
-            // Step 4: Write result back to ROCm via BAR (using CUDA device pointer)
-            cudaError_t err = cudaMemcpy(bar_cuda_ptr, cuda_output,
-                                         bytes, cudaMemcpyDeviceToDevice);
-            if (err != cudaSuccess)
+            // Step 3: Write reduced result from CUDA VRAM → BAR via CUDA driver API
+            auto bar_offset = pcie_backend->findBarOffset(bar_rocm_ptr, bytes);
+            if (!bar_offset.has_value())
             {
-                LOG_ERROR("LocalTPContext::executePCIeBarAllreduce: Failed to write result to BAR: "
-                          << cudaGetErrorString(err));
+                LOG_ERROR("LocalTPContext::executePCIeBarAllreduce: Cannot find BAR offset for "
+                          << bar_rocm_ptr << " (size=" << bytes << ")");
                 return false;
             }
 
-            // Step 5: Copy result from BAR back to HIP staging
+            auto *p2p_engine = pcie_backend->getDirectP2PEngine();
+            if (!p2p_engine || !p2p_engine->isPCIeBarActive())
+            {
+                LOG_ERROR("LocalTPContext::executePCIeBarAllreduce: DirectP2P engine not available");
+                return false;
+            }
+
+            auto transfer_result = p2p_engine->transferViaPCIeBar(
+                cuda_output, bar_offset.value(), bytes, DirectP2PEngine::Direction::ToAMD);
+            if (!transfer_result.success)
+            {
+                LOG_ERROR("LocalTPContext::executePCIeBarAllreduce: CUDA → BAR transfer failed: "
+                          << transfer_result.error_message);
+                return false;
+            }
+
+            // Step 4: Copy result from BAR back to HIP staging
             if (!rocm_backend->deviceToDevice(const_cast<float *>(hip_staging_ptr), bar_rocm_ptr,
                                               bytes, rocm_device.toKernelDeviceIndex()))
             {
@@ -2759,8 +2756,8 @@ namespace llaminar2
             rocm_backend->synchronize(rocm_device.toKernelDeviceIndex());
 
             // Mark both tensors as having valid device data (with events for fine-grained sync)
-            cuda_tensor->mark_device_dirty_with_event();
-            rocm_tensor->mark_device_dirty_with_event();
+            cuda_tensor->transitionToWithEvent(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+            rocm_tensor->transitionToWithEvent(TensorCoherenceState::DEVICE_AUTHORITATIVE);
 
             LOG_DEBUG("LocalTPContext::executePCIeBarAllreduce: Fallback zero-copy allreduce completed successfully");
             return true;
@@ -2882,7 +2879,7 @@ namespace llaminar2
 
             if (result)
             {
-                global_tensor->mark_device_dirty_with_event();
+                global_tensor->transitionToWithEvent(TensorCoherenceState::DEVICE_AUTHORITATIVE);
             }
             else
             {
@@ -2926,7 +2923,7 @@ namespace llaminar2
 
             if (result)
             {
-                global_tensor->mark_device_dirty_with_event();
+                global_tensor->transitionToWithEvent(TensorCoherenceState::DEVICE_AUTHORITATIVE);
             }
             else
             {
@@ -3078,7 +3075,7 @@ namespace llaminar2
 
         if (result)
         {
-            output_shard->mark_device_dirty_with_event();
+            output_shard->transitionToWithEvent(TensorCoherenceState::DEVICE_AUTHORITATIVE);
         }
         else
         {
@@ -3133,7 +3130,7 @@ namespace llaminar2
                       << src_device_id.toString());
             return false;
         }
-        tensor->mark_device_dirty();
+        tensor->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, src_device_id);
 
         // For homogeneous backends (NCCL/RCCL), use native broadcast if available
         // For now, we implement broadcast as point-to-point transfers from source to all others

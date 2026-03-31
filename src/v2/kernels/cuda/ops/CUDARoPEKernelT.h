@@ -199,10 +199,10 @@ namespace llaminar2
                 // Mark tensors as modified on GPU
                 if (success)
                 {
-                    q_fp32->mark_device_dirty();
+                    q_fp32->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
                     if (k_fp32)
                     {
-                        k_fp32->mark_device_dirty();
+                        k_fp32->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
                     }
                 }
 
@@ -399,10 +399,10 @@ namespace llaminar2
                 // Mark tensors as modified on GPU
                 if (success)
                 {
-                    q_bf16->mark_device_dirty();
+                    q_bf16->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
                     if (k_bf16)
                     {
-                        k_bf16->mark_device_dirty();
+                        k_bf16->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
                     }
                 }
 
@@ -603,10 +603,10 @@ namespace llaminar2
                 // Mark tensors as modified on GPU
                 if (success)
                 {
-                    q_fp16->mark_device_dirty();
+                    q_fp16->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
                     if (k_fp16)
                     {
-                        k_fp16->mark_device_dirty();
+                        k_fp16->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
                     }
                 }
 

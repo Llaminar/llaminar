@@ -1843,7 +1843,7 @@ namespace llaminar2
                                                                                                                           << " | fp32_bias=" << fp32_bias
                                                                                                                           << " | numel=" << fp32_bias->numel()
                                                                                                                           << " | host_data=" << fp32_bias->data()
-                                                                                                                          << " | device_valid=" << fp32_bias->isDeviceValid()
+                                                                                                                          << " | device_valid=" << fp32_bias->deviceValid()
                                                                                                                           << " | device=" << (fp32_bias->current_device().has_value() ? fp32_bias->current_device()->to_string() : "none"));
                         all_success = false;
                         break;

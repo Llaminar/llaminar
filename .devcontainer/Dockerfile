@@ -91,6 +91,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libjson-c-dev \
     libxml2-dev \
     libeigen3-dev \
+    # JSON / math utilities for benchmark scripts
+    jq \
+    bc \
     # Node.js for MCP servers (will be installed via features)
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 

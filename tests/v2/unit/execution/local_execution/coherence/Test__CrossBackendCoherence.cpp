@@ -42,16 +42,32 @@ public:
 
     // ---- Expose protected state for assertions ----
     void *getCompletionEvent() const { return device_completion_event_; }
-    bool getHostValid() const { return host_valid_; }
-    bool getDeviceValid() const { return device_valid_; }
+    bool getHostValid() const { return ::llaminar2::isHostValid(coherence_state_); }
+    bool getDeviceValid() const { return ::llaminar2::isDeviceValid(coherence_state_); }
     std::optional<DeviceId> getGpuDevice() const { return gpu_device_; }
     void *getGpuDataPtr() const { return gpu_data_ptr_; }
     std::optional<DeviceId> getEventDevice() const { return event_device_; }
 
     // ---- Inject fake state for testing ----
     void injectGpuDevice(DeviceId device) { gpu_device_ = device; }
-    void injectDeviceValid(bool valid) { device_valid_ = valid; }
-    void injectHostValid(bool valid) { host_valid_ = valid; }
+    void injectDeviceValid(bool valid)
+    {
+        if (valid && ::llaminar2::isHostValid(coherence_state_))
+            setCoherenceState_(TensorCoherenceState::SYNCED);
+        else if (valid)
+            setCoherenceState_(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+        else if (::llaminar2::isHostValid(coherence_state_))
+            setCoherenceState_(TensorCoherenceState::HOST_AUTHORITATIVE);
+    }
+    void injectHostValid(bool valid)
+    {
+        if (valid && ::llaminar2::isDeviceValid(coherence_state_))
+            setCoherenceState_(TensorCoherenceState::SYNCED);
+        else if (valid)
+            setCoherenceState_(TensorCoherenceState::HOST_AUTHORITATIVE);
+        else if (::llaminar2::isDeviceValid(coherence_state_))
+            setCoherenceState_(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+    }
     void injectGpuDataPtr(void *ptr) { gpu_data_ptr_ = ptr; }
     void injectCompletionEvent(void *event) { device_completion_event_ = event; }
     void injectEventDevice(DeviceId device) { event_device_ = device; }

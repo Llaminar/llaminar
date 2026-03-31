@@ -714,10 +714,10 @@ namespace llaminar2
             if (device.is_cpu())
             {
                 // Asking about CPU/host - return true if host data is valid
-                return host_valid_;
+                return ::llaminar2::isHostValid(coherence_state_);
             }
             // Asking about a specific GPU - must be on that device AND have valid data
-            return gpu_device_.has_value() && *gpu_device_ == device && device_valid_;
+            return gpu_device_.has_value() && *gpu_device_ == device && ::llaminar2::isDeviceValid(coherence_state_);
         }
 
         // ===== Lazy Transfer API (Phase 1 GPU Device-Aware Slicing) =====
@@ -813,14 +813,16 @@ namespace llaminar2
          */
         virtual void mark_device_dirty()
         {
-            device_valid_ = true; // Device just got written to
-            // For mapped memory, host is ALSO valid since they share the same memory
-            // For non-mapped memory, host is now stale
-            host_valid_ = is_mapped_;
-            // For mapped memory: signal that sync is needed before CPU reads
+            // Delegate to the state-machine-based implementation
+            // For mapped tensors, this transitions to MAPPED state;
+            // for non-mapped, to DEVICE_AUTHORITATIVE.
             if (is_mapped_)
             {
-                mapped_needs_sync_ = true;
+                transitionTo(TensorCoherenceState::MAPPED);
+            }
+            else
+            {
+                transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
             }
         }
 
@@ -837,17 +839,11 @@ namespace llaminar2
          */
         virtual void mark_device_dirty_with_event();
 
-        /**
-         * @brief Check if tensor data is currently resident on host (CPU)
-         * @return true if host buffer contains valid data
-         */
-        bool isOnCPU() const { return host_valid_; }
+        /// @deprecated Use hostValid() or coherenceState() instead. Will be removed.
+        bool isOnCPU() const { return ::llaminar2::isHostValid(coherence_state_); }
 
-        /**
-         * @brief Check if tensor data is currently valid on GPU
-         * @return true if GPU buffer is allocated AND contains valid data
-         */
-        bool isDeviceValid() const { return device_valid_ && gpu_data_ptr_ != nullptr; }
+        /// @deprecated Use deviceValid() or coherenceState() instead. Will be removed.
+        bool isDeviceValid() const { return ::llaminar2::isDeviceValid(coherence_state_) && gpu_data_ptr_ != nullptr; }
 
         /**
          * @brief Check if tensor uses zero-copy mapped memory

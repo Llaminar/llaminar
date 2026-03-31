@@ -80,7 +80,8 @@ namespace llaminar2
                 if (trace_coherence)
                 {
                     LOG_INFO("[StageCoherence] Input '" << (buf.name ? buf.name : "unknown")
-                                                        << "' already on " << target_device.to_string());
+                                                        << "' already on " << target_device.to_string()
+                                                        << " (state=" << to_string(tensor_base->coherenceState()) << ")");
                 }
                 continue;
             }
@@ -271,7 +272,7 @@ namespace llaminar2
             // Pass the compute stream so the event is recorded on the correct stream.
             LOG_DEBUG("[StageCoherence] Marking output '" << (buf.name ? buf.name : "unknown")
                                                           << "' as device-dirty (with event)");
-            tensor_base->mark_device_dirty_with_event(stream);
+            tensor_base->transitionToWithEvent(TensorCoherenceState::DEVICE_AUTHORITATIVE, std::nullopt, stream);
         }
     }
 
@@ -293,7 +294,7 @@ namespace llaminar2
             if (!tensor_base)
                 continue;
 
-            tensor_base->mark_device_dirty_flags_only();
+            tensor_base->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
         }
     }
 

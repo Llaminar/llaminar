@@ -26,6 +26,8 @@
 #include <cmath>
 #include <cfloat>
 #include <cstdio>
+#include <atomic>
+#include <atomic>
 
 #include "../../attention/AttentionDeviceParams.h"
 
@@ -1492,11 +1494,11 @@ namespace
     // TQ codebooks (compile-time Lloyd-Max centroids for N(0,1))
     __constant__ float d_tq8_attn_cents[256];
     __constant__ float d_tq4_attn_cents[16];
-    static bool s_tq_attn_codebooks_uploaded = false;
+    static std::atomic<bool> s_tq_attn_codebooks_uploaded{false};
 
     void upload_tq_attn_codebooks()
     {
-        if (s_tq_attn_codebooks_uploaded)
+        if (s_tq_attn_codebooks_uploaded.load(std::memory_order_acquire))
             return;
         // TQ4: 16-level Lloyd-Max centroids for N(0,1)
         static constexpr float TQ4_C[16] = {
@@ -1540,7 +1542,10 @@ namespace
             2.23243070f, 2.34583116f, 2.47412658f, 2.62253070f, 2.79892921f, 3.01957417f, 3.30903292f, 3.74206471f};
         cudaMemcpyToSymbol(d_tq8_attn_cents, TQ8_C, sizeof(TQ8_C));
         cudaMemcpyToSymbol(d_tq4_attn_cents, TQ4_C, sizeof(TQ4_C));
-        s_tq_attn_codebooks_uploaded = true;
+        if (cudaGetLastError() == cudaSuccess)
+        {
+            s_tq_attn_codebooks_uploaded.store(true, std::memory_order_release);
+        }
     }
 } // anonymous namespace
 

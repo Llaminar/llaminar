@@ -5198,6 +5198,26 @@ add_v2_test(V2_Unit_CrossBackendCoherence
     MPI_PROCS 1
 )
 
+# Test: CoherenceState (explicit coherence state machine)
+# Tests all state transitions, invalid transitions, helper functions, and full lifecycle sequences.
+add_executable(v2_test_coherence_state unit/tensors/Test__CoherenceState.cpp)
+target_link_libraries(v2_test_coherence_state llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_CoherenceState
+    COMMAND $<TARGET_FILE:v2_test_coherence_state>
+    LABELS "V2;Unit;Coherence;CoherenceState;StateMachine;Transitions"
+    MPI_PROCS 1
+)
+
+# Test: TransferEngine (unified data movement planning and execution)
+# Tests plan logic (pure, no GPU), mock execution via MockBackend, and error handling.
+add_executable(v2_test_transfer_engine unit/transfer/Test__TransferEngine.cpp)
+target_link_libraries(v2_test_transfer_engine llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_TransferEngine
+    COMMAND $<TARGET_FILE:v2_test_transfer_engine>
+    LABELS "V2;Unit;Transfer;TransferEngine;Plan;Execute;BAR;HostBounce;Coherence"
+    MPI_PROCS 1
+)
+
 # Test: Qwen2GraphBufferManagement (BufferArena integration with DeviceGraphOrchestrator)
 # Tests setTensorFactory/initializeBuffers workflow, buffer allocation/binding,
 # statistics tracking, and release cleanup.

@@ -199,7 +199,7 @@ namespace llaminar2
     {
         assertValid("FP32Tensor::data");
 
-        LOG_TRACE("[FP32Tensor::data] Called for tensor, host_valid_=" << host_valid_ << " device_valid_=" << device_valid_ << " gpu_data_ptr_=" << (gpu_data_ptr_ ? "set" : "null") << " is_mapped_=" << is_mapped_);
+        LOG_TRACE("[FP32Tensor::data] Called for tensor, host_valid=" << ::llaminar2::isHostValid(coherence_state_) << " device_valid=" << ::llaminar2::isDeviceValid(coherence_state_) << " gpu_data_ptr_=" << (gpu_data_ptr_ ? "set" : "null") << " is_mapped_=" << is_mapped_);
 
         // Use base class to ensure host has current data
         // For mapped tensors, ensureOnHost() is a no-op (data is always available)

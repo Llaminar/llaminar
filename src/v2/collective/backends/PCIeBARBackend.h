@@ -545,6 +545,18 @@ namespace llaminar2
         /// Whether a CUDA worker exists and is running for a specific device ordinal.
         bool hasCUDAWorkerFor(int cuda_ordinal) const;
 
+        /**
+         * @brief Find BAR offset for a pointer in the BAR region
+         *
+         * Returns the BAR offset if the pointer was allocated via allocateInBarRegion(),
+         * or std::nullopt if the pointer is not in the BAR region.
+         *
+         * @param ptr Pointer to look up (BAR mmap address)
+         * @param size Expected size (for bounds checking)
+         * @return BAR offset or nullopt
+         */
+        std::optional<size_t> findBarOffset(const void *ptr, size_t size) const;
+
     private:
         // Use shared_ptr to leverage the process-wide singleton
         // This prevents BAR resource cleanup/re-init issues between tests
@@ -610,12 +622,12 @@ namespace llaminar2
             /// Opaque function: returns bool, takes (event, device_id, worker_stream)
             using Fn = bool (*)(void *event, int device_id, void *worker_stream);
 
-            std::atomic<bool> ready{false};   ///< Producer sets after filling
-            std::atomic<bool> done{false};    ///< Worker sets after executing
-            bool result = false;              ///< Execution result
-            Fn fn = nullptr;                  ///< Function to execute
-            void *event = nullptr;            ///< CUDA event argument
-            int device_id = -1;               ///< Device ordinal argument
+            std::atomic<bool> ready{false}; ///< Producer sets after filling
+            std::atomic<bool> done{false};  ///< Worker sets after executing
+            bool result = false;            ///< Execution result
+            Fn fn = nullptr;                ///< Function to execute
+            void *event = nullptr;          ///< CUDA event argument
+            int device_id = -1;             ///< Device ordinal argument
 
             void reset()
             {
@@ -633,7 +645,7 @@ namespace llaminar2
         {
             int cuda_ordinal = -1;
             std::thread thread;
-            void *stream = nullptr;    ///< Non-blocking CUDA stream
+            void *stream = nullptr; ///< Non-blocking CUDA stream
 
             // Allocation-free fast-path slot (single producer, single consumer)
             WorkSlot slot;
@@ -751,18 +763,6 @@ namespace llaminar2
          * @brief Transfer data from ROCm to CUDA via BAR
          */
         bool transferROCmtoCUDA(size_t offset, void *cuda_dst, size_t bytes);
-
-        /**
-         * @brief Find BAR offset for an ROCm pointer
-         *
-         * Returns the BAR offset if the pointer was allocated via allocateInBarRegion(),
-         * or std::nullopt if the pointer is not in the BAR region.
-         *
-         * @param ptr Pointer to look up
-         * @param size Expected size (for bounds checking)
-         * @return BAR offset or nullopt
-         */
-        std::optional<size_t> findBarOffset(const void *ptr, size_t size) const;
 
         /**
          * @brief Pipelined allreduce for large buffers

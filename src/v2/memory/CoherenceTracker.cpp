@@ -15,7 +15,9 @@ namespace llaminar2
         if (!tensor)
             return true; // External or null — nothing to do
 
-        if (!state.needsTransferTo(target))
+        // Use tensor's canonical coherence state for transfer decisions,
+        // with arena-level UNINITIALIZED check from CoherenceState
+        if (!state.needsTransferTo(target, tensor->coherenceState()))
             return true; // Already in the right place
 
         if (target.is_gpu())
@@ -78,10 +80,15 @@ namespace llaminar2
     {
         markWritten(state, device);
 
-        // Also tell the tensor for backward-compat with code reading via tensor->data()
+        // Also update the tensor's canonical coherence state and record a GPU event
+        // for fine-grained D2H sync when tensor->data() is later called.
         if (device.is_gpu() && tensor)
         {
-            tensor->mark_device_dirty_with_event(stream);
+            tensor->transitionToWithEvent(TensorCoherenceState::DEVICE_AUTHORITATIVE, device, stream);
+        }
+        else if (device.is_cpu() && tensor)
+        {
+            tensor->transitionTo(TensorCoherenceState::HOST_AUTHORITATIVE);
         }
     }
 
@@ -90,10 +97,16 @@ namespace llaminar2
     {
         markWritten(state, device);
 
-        // Lightweight: skip event recording, just update flags
+        // Lightweight: update tensor coherence state without event recording.
+        // The executor synchronizes streams at step boundaries, so per-tensor
+        // events are unnecessary overhead during graph replay.
         if (device.is_gpu() && tensor)
         {
-            tensor->mark_device_dirty_flags_only();
+            tensor->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, device);
+        }
+        else if (device.is_cpu() && tensor)
+        {
+            tensor->transitionTo(TensorCoherenceState::HOST_AUTHORITATIVE);
         }
     }
 

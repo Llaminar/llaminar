@@ -11,7 +11,7 @@
  * However, when calling kernels directly (in tests, utilities, or custom pipelines),
  * you must manually:
  * 1. Call `ensureOnDevice()` on inputs before the kernel runs
- * 2. Call `mark_device_dirty()` on outputs after the kernel completes
+ * 2. Call `transitionTo(DEVICE_AUTHORITATIVE)` on outputs after the kernel completes
  *
  * These utilities make that pattern RAII-based and self-documenting.
  *
@@ -68,7 +68,7 @@ namespace llaminar2
     template <typename T>
     concept CoherableTensor = requires(T *t, DeviceId d) {
         { t->ensureOnDevice(d) } -> std::same_as<bool>;
-        { t->mark_device_dirty() } -> std::same_as<void>;
+        { t->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE) };
     };
 
     // =========================================================================
@@ -80,7 +80,7 @@ namespace llaminar2
      *
      * Use this for simple single-output cases. The wrapper:
      * 1. Calls ensureOnDevice() on construction
-     * 2. Calls mark_device_dirty() on destruction
+     * 2. Calls transitionTo(DEVICE_AUTHORITATIVE) on destruction
      *
      * The implicit conversion to T* allows passing directly to kernel functions.
      *
@@ -126,7 +126,7 @@ namespace llaminar2
         {
             if (tensor_ && valid_)
             {
-                tensor_->mark_device_dirty();
+                tensor_->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
             }
         }
 
@@ -148,7 +148,7 @@ namespace llaminar2
                 // Mark current dirty before taking over
                 if (tensor_ && valid_)
                 {
-                    tensor_->mark_device_dirty();
+                    tensor_->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
                 }
                 tensor_ = other.tensor_;
                 valid_ = other.valid_;
@@ -266,7 +266,7 @@ namespace llaminar2
      * 1. Calls ensureOnDevice() on all inputs
      * 2. Calls ensureOnDevice() on all outputs (to allocate GPU memory)
      * 3. Executes the kernel function
-     * 4. If successful, calls mark_device_dirty() on all outputs
+     * 4. If successful, calls transitionTo(DEVICE_AUTHORITATIVE) on all outputs
      *
      * @param device Target GPU device
      * @param inputs List of input tensors to cohere (read-only)
@@ -326,7 +326,7 @@ namespace llaminar2
             {
                 if (tensor)
                 {
-                    tensor->mark_device_dirty();
+                    tensor->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
                 }
             }
         }
@@ -377,7 +377,7 @@ namespace llaminar2
         {
             if (tensor)
             {
-                tensor->mark_device_dirty();
+                tensor->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
             }
         }
 
@@ -430,7 +430,7 @@ namespace llaminar2
                 {
                     if (tensor)
                     {
-                        tensor->mark_device_dirty();
+                        tensor->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
                     }
                 }
             }

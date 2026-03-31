@@ -711,44 +711,17 @@ namespace llaminar2
                 forward_cache.pp_external_hidden_state &&
                 forward_cache.pp_working_buffer)
             {
+                // Unified PP copy: data() handles all device/BAR coherence sync
+                // automatically (including BAR-backed D2H via staging buffer).
+                const void *src = forward_cache.pp_external_hidden_state->data();
+                void *dst = forward_cache.pp_working_buffer->mutable_data();
+                std::memcpy(dst, src, forward_cache.pp_copy_bytes);
+
                 const auto &dev = forward_cache.pp_device;
                 if (dev.is_gpu())
                 {
-                    // BAR-backed tensors (cuMemHostRegister IOMEMORY) don't support
-                    // cudaMemcpy D2D — only D2H works. Use host bounce.
-                    if (forward_cache.pp_external_hidden_state->isBARBacked())
-                    {
-                        const float *src_host = forward_cache.pp_external_hidden_state->data();
-                        float *dst_host = forward_cache.pp_working_buffer->mutable_data();
-                        std::memcpy(dst_host, src_host, forward_cache.pp_copy_bytes);
-                        forward_cache.pp_working_buffer->ensureOnDevice(dev);
-                        forward_cache.pp_working_buffer->mark_device_dirty();
-                    }
-                    else
-                    {
-                        const void *src_ptr = forward_cache.pp_external_hidden_state->gpu_data_ptr();
-                        void *dst_ptr = forward_cache.pp_working_buffer->gpu_data_ptr();
-                        if (src_ptr && dst_ptr)
-                        {
-                            auto *router = GlobalBackendRouter::get();
-                            if (router)
-                            {
-                                auto *backend = router->getBackendForCopy(dev, dev);
-                                if (backend)
-                                {
-                                    backend->copy(dst_ptr, dev, src_ptr, dev,
-                                                  forward_cache.pp_copy_bytes);
-                                    forward_cache.pp_working_buffer->mark_device_dirty();
-                                }
-                            }
-                        }
-                    }
-                }
-                else
-                {
-                    const float *src_data = forward_cache.pp_external_hidden_state->data();
-                    float *dst_data = forward_cache.pp_working_buffer->mutable_data();
-                    std::memcpy(dst_data, src_data, forward_cache.pp_copy_bytes);
+                    forward_cache.pp_working_buffer->ensureOnDevice(dev);
+                    forward_cache.pp_working_buffer->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, dev);
                 }
             }
 
