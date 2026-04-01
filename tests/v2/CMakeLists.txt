@@ -5417,6 +5417,19 @@ add_v2_test(V2_Unit_SchemaFactoryRegistry
     MPI_PROCS 1
 )
 
+# ChatCompletionHandler: testable request handler for /v1/chat/completions
+add_executable(v2_test_chat_completion_handler unit/app/modes/Test__ChatCompletionHandler.cpp)
+target_include_directories(v2_test_chat_completion_handler PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}  # For tests/v2/mocks/ include path
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../external/llama.cpp/vendor  # For nlohmann/json.hpp
+)
+target_link_libraries(v2_test_chat_completion_handler llaminar2_core GTest::gtest GTest::gtest_main GTest::gmock)
+add_v2_test(V2_Unit_ChatCompletionHandler
+    COMMAND $<TARGET_FILE:v2_test_chat_completion_handler>
+    LABELS "V2;Unit;Server;ChatCompletion;SamplingParams"
+    MPI_PROCS 1
+)
+
 # Test: Qwen2GraphSchema (schema-based Qwen2Graph building - Phase 4d)
 # Tests the new buildForwardGraphFromSchema() method that uses
 # Qwen2Schema + GraphResolver + GraphBuilder architecture.

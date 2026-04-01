@@ -7,6 +7,7 @@
 #include "app/AppContext.h"
 #include "utils/Logger.h"
 #include "utils/ChatTemplate.h"
+#include "utils/Sampler.h"
 #include <mpi.h>
 #include <iostream>
 #include <vector>
@@ -120,6 +121,14 @@ namespace llaminar2
         {
             LOG_INFO("Generating response (max " << max_tokens << " tokens)...\n");
         }
+
+        // Configure sampling params from CLI config
+        SamplingParams sampling_params;
+        sampling_params.temperature = config.temperature;
+        sampling_params.top_k = config.top_k;
+        sampling_params.top_p = config.top_p;
+        sampling_params.seed = config.seed;
+        runner->setSamplingParams(sampling_params);
 
         // Decode loop
         for (int i = 0; i < max_tokens; ++i)

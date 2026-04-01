@@ -8,9 +8,9 @@
  */
 
 #include "app/modes/ServerMode.h"
+#include "app/modes/ChatCompletionHandler.h"
 #include "app/AppContext.h"
 #include "utils/Logger.h"
-#include "utils/ChatTemplate.h"
 
 // cpp-httplib (header-only)
 #include "httplib.h"
@@ -87,122 +87,16 @@ namespace llaminar2
             res.set_content(response.dump(), "application/json"); });
 
         // ─── POST /v1/chat/completions ───────────────────────────────
+        ChatCompletionHandler handler(*runner, *tokenizer);
+
         svr.Post("/v1/chat/completions",
                  [&](const httplib::Request &req, httplib::Response &res)
                  {
                      std::lock_guard<std::mutex> lock(inference_mutex);
 
-                     // Parse request body
-                     json body;
-                     try
-                     {
-                         body = json::parse(req.body);
-                     }
-                     catch (const json::parse_error &e)
-                     {
-                         res.status = 400;
-                         json err = {{"error", {{"message", std::string("Invalid JSON: ") + e.what()}, {"type", "invalid_request_error"}}}};
-                         res.set_content(err.dump(), "application/json");
-                         return;
-                     }
-
-                     // Validate required fields
-                     if (!body.contains("messages") || !body["messages"].is_array() || body["messages"].empty())
-                     {
-                         res.status = 400;
-                         json err = {{"error", {{"message", "\"messages\" field is required and must be a non-empty array"}, {"type", "invalid_request_error"}}}};
-                         res.set_content(err.dump(), "application/json");
-                         return;
-                     }
-
-                     // Extract parameters
-                     int max_tokens = body.value("max_tokens", 128);
-                     float temperature = body.value("temperature", 0.0f);
-
-                     // Build conversation from messages
-                     std::vector<ChatMessage> conversation;
-                     for (const auto &msg : body["messages"])
-                     {
-                         if (!msg.contains("role") || !msg.contains("content"))
-                         {
-                             res.status = 400;
-                             json err = {{"error", {{"message", "Each message must have \"role\" and \"content\" fields"}, {"type", "invalid_request_error"}}}};
-                             res.set_content(err.dump(), "application/json");
-                             return;
-                         }
-                         conversation.emplace_back(
-                             msg["role"].get<std::string>(),
-                             msg["content"].get<std::string>());
-                     }
-
-                     // Clear KV cache for fresh conversation
-                     runner->clearCache();
-
-                     // Encode with chat template
-                     auto token_ids = tokenizer->encodeChat(conversation, /*add_generation_prompt=*/true);
-                     if (token_ids.empty())
-                     {
-                         res.status = 500;
-                         json err = {{"error", {{"message", "Failed to encode conversation with chat template"}, {"type", "server_error"}}}};
-                         res.set_content(err.dump(), "application/json");
-                         return;
-                     }
-
-                     int prompt_tokens = static_cast<int>(token_ids.size());
-
-                     // Convert to int32_t
-                     std::vector<int32_t> input_ids(token_ids.begin(), token_ids.end());
-
-                     // Prefill
-                     if (!runner->prefill(input_ids))
-                     {
-                         res.status = 500;
-                         json err = {{"error", {{"message", std::string("Prefill failed: ") + runner->lastError()}, {"type", "server_error"}}}};
-                         res.set_content(err.dump(), "application/json");
-                         return;
-                     }
-
-                     // Decode loop
-                     std::string generated_text;
-                     int completion_tokens = 0;
-
-                     for (int i = 0; i < max_tokens; ++i)
-                     {
-                         GenerationResult result = runner->decodeStep();
-
-                         if (!result.success())
-                         {
-                             res.status = 500;
-                             json err = {{"error", {{"message", std::string("Decode failed: ") + result.error}, {"type", "server_error"}}}};
-                             res.set_content(err.dump(), "application/json");
-                             return;
-                         }
-
-                         if (result.tokens.empty())
-                             break;
-
-                         int32_t next_token = result.tokens[0];
-                         completion_tokens++;
-
-                         if (result.is_complete || tokenizer->is_stop_token(next_token))
-                             break;
-
-                         generated_text += tokenizer->decode_token(next_token);
-                     }
-
-                     // Flush accumulated GPU stage timeline for decode phase
-                     runner->flushStageTimeline();
-
-                     // Build OpenAI-compatible response
-                     json response = {
-                         {"id", "chatcmpl-llaminar"},
-                         {"object", "chat.completion"},
-                         {"choices", json::array({json{{"index", 0},
-                                                       {"message", {{"role", "assistant"}, {"content", generated_text}}},
-                                                       {"finish_reason", "stop"}}})},
-                         {"usage", {{"prompt_tokens", prompt_tokens}, {"completion_tokens", completion_tokens}, {"total_tokens", prompt_tokens + completion_tokens}}}};
-
-                     res.set_content(response.dump(), "application/json");
+                     auto response = handler.handleRawRequest(req.body);
+                     res.status = response.http_status;
+                     res.set_content(response.json_body, "application/json");
                  });
 
         // Start listening

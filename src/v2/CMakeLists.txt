@@ -1317,6 +1317,7 @@ add_library(llaminar2_core STATIC
     app/modes/SingleShotChatMode.cpp
     app/modes/BenchmarkMode.cpp
     app/modes/ServerMode.cpp
+    app/modes/ChatCompletionHandler.cpp
     app/modes/CompletionMode.cpp
     loaders/ModelLoader.cpp
     loaders/ModelContext.cpp

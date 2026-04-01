@@ -9,6 +9,7 @@
 #pragma once
 
 #include "execution/runner/IOrchestrationRunner.h"
+#include "execution/runner/IOrchestrationRunnerFactory.h"
 #include <gmock/gmock.h>
 
 namespace llaminar2::test
@@ -73,6 +74,20 @@ namespace llaminar2::test
         // Advanced
         MOCK_METHOD(const float *, lastLogits, (), (const, override));
         MOCK_METHOD(void, setStopTokens, (const std::vector<int32_t> &stop_tokens), (override));
+        MOCK_METHOD(std::shared_ptr<ITokenizer>, tokenizer, (), (const, override));
+
+        // Snapshot
+        MOCK_METHOD(void, enableSnapshotCapture, (const std::string &output_dir), (override));
+        MOCK_METHOD(void, disableSnapshotCapture, (), (override));
+        MOCK_METHOD(void, clearSnapshots, (), (override));
+        MOCK_METHOD(const float *, getSnapshot, (const std::string &key, size_t &out_size), (const, override));
+        MOCK_METHOD(std::vector<std::string>, getSnapshotKeys, (), (const, override));
+
+        // Sampling and profiling
+        MOCK_METHOD(void, setSamplingParams, (const SamplingParams &params), (override));
+        MOCK_METHOD(void, flushStageTimeline, (), (override));
+        MOCK_METHOD(void, setSkipLogitsGatherDecode, (bool skip), (override));
+        MOCK_METHOD(void, setSkipLogitsGatherPrefill, (bool skip), (override));
 
         // =====================================================================
         // Test Helpers
@@ -147,7 +162,7 @@ namespace llaminar2::test
         MOCK_METHOD(std::unique_ptr<IOrchestrationRunner>, createFromConfig,
                     (const std::string &config_path), (override));
         MOCK_METHOD(std::unique_ptr<IOrchestrationRunner>, createFromOrchestrationConfig,
-                    (const OrchestrationConfig &config), (override));
+                    (OrchestrationConfig config), (override));
         MOCK_METHOD(std::unique_ptr<IOrchestrationRunner>, createSimple,
                     (const std::string &model_path, const std::string &device_spec), (override));
     };
