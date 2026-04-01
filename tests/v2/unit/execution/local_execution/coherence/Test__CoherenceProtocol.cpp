@@ -248,7 +248,7 @@ TEST_F(Test__CoherenceProtocol, DataAccessor_TriggersD2HWhenDeviceDirty)
     }
 
     // Mark as device-dirty (flags only, to test the no-event sync path)
-    tensor->mark_device_dirty_flags_only();
+    tensor->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
 
     EXPECT_TRUE(tensor->getDeviceValid());
     EXPECT_FALSE(tensor->getHostValid());
@@ -402,7 +402,7 @@ TEST_F(Test__CoherenceProtocol, MarkDirtyWithEvent_CreatesAndRecordsEvent)
     tensor->injectCompletionEvent(nullptr);
 
     void *fake_stream = reinterpret_cast<void *>(0xBEEF);
-    tensor->mark_device_dirty_with_event(fake_stream);
+    tensor->transitionToWithEvent(TensorCoherenceState::DEVICE_AUTHORITATIVE, std::nullopt, fake_stream);
 
     // Verify event was created
     EXPECT_GE(mock_backend_.getEventCreateCount(), 1u);
@@ -427,7 +427,7 @@ TEST_F(Test__CoherenceProtocol, MarkDirtyWithEvent_ReusesExistingEvent)
     mock_backend_.resetAll();
 
     // First call: creates event + records
-    tensor->mark_device_dirty_with_event(nullptr);
+    tensor->transitionToWithEvent(TensorCoherenceState::DEVICE_AUTHORITATIVE, std::nullopt, nullptr);
     size_t creates_after_first = mock_backend_.getEventCreateCount();
     size_t records_after_first = mock_backend_.getEventRecordCount();
     void *event_after_first = tensor->getCompletionEvent();
@@ -436,7 +436,7 @@ TEST_F(Test__CoherenceProtocol, MarkDirtyWithEvent_ReusesExistingEvent)
     EXPECT_GE(records_after_first, 1u);
 
     // Second call: should reuse existing event, only record again
-    tensor->mark_device_dirty_with_event(nullptr);
+    tensor->transitionToWithEvent(TensorCoherenceState::DEVICE_AUTHORITATIVE, std::nullopt, nullptr);
     EXPECT_EQ(mock_backend_.getEventCreateCount(), creates_after_first); // No new create
     EXPECT_GT(mock_backend_.getEventRecordCount(), records_after_first); // New record
     EXPECT_EQ(tensor->getCompletionEvent(), event_after_first);         // Same event
@@ -457,7 +457,7 @@ TEST_F(Test__CoherenceProtocol, MarkDirtyWithEvent_EventUsedForSyncOnReadback)
     }
 
     // Mark dirty with event
-    tensor->mark_device_dirty_with_event(nullptr);
+    tensor->transitionToWithEvent(TensorCoherenceState::DEVICE_AUTHORITATIVE, std::nullopt, nullptr);
 
     mock_backend_.resetAll();
 
@@ -511,7 +511,7 @@ TEST_F(Test__CoherenceProtocol, FullStateMachineCycle_HostDeviceDirtyReadback)
     {
         gpu_mem[i] = 77.0f;
     }
-    tensor->mark_device_dirty_flags_only();
+    tensor->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
 
     EXPECT_TRUE(tensor->getDeviceValid());
     EXPECT_FALSE(tensor->getHostValid());
@@ -574,7 +574,7 @@ TEST_F(Test__CoherenceProtocol, FullCycle_WithEventSync)
     }
 
     // Mark dirty WITH event (full path)
-    tensor->mark_device_dirty_with_event(reinterpret_cast<void *>(0xCAFE));
+    tensor->transitionToWithEvent(TensorCoherenceState::DEVICE_AUTHORITATIVE, std::nullopt, reinterpret_cast<void *>(0xCAFE));
 
     EXPECT_TRUE(tensor->getDeviceValid());
     EXPECT_FALSE(tensor->getHostValid());
@@ -706,7 +706,7 @@ TEST_F(Test__CoherenceProtocolFailure, D2HFailure_EnsureOnHostReturnsFalse)
     gpu_mem[0] = 999.0f;
 
     // Mark dirty so ensureOnHost will attempt D2H
-    tensor->mark_device_dirty_flags_only();
+    tensor->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
 
     // Now make D2H fail
     mock_backend_.fail_d2h = true;

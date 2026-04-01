@@ -105,7 +105,7 @@ namespace llaminar2::test
         // Create and upload source to GPU
         auto src = TestTensorFactory::createFP32Random({32, 64}, -1.0f, 1.0f, 42);
         src->ensureOnDevice(gpu_device_);
-        src->mark_device_dirty(); // Mark GPU as having the data
+        src->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE); // Mark GPU as having the data
 
         // Create destination
         auto dst = TestTensorFactory::createFP32({32, 64});
@@ -278,7 +278,7 @@ namespace llaminar2::test
         // Create tensor and upload to GPU
         auto gpu_src = TestTensorFactory::createFP32Random({32, 64});
         gpu_src->ensureOnDevice(gpu_device_);
-        gpu_src->mark_device_dirty();
+        gpu_src->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
 
         // Transfer from GPU to CPU with automatic allocation
         auto result = transfer.transfer(gpu_src.get(), DeviceType::CPU);

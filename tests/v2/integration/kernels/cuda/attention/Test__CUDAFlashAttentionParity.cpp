@@ -1472,7 +1472,7 @@ TEST_F(Test__CUDAFlashAttentionParity, FlashDecode_FusedQ81_Parity)
     ASSERT_TRUE(success) << "Fused Q8_1 CUDA decode kernel failed";
 
     // Sync GPU→host
-    output_tensor->mark_device_dirty();
+    output_tensor->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
     const float *cuda_output = output_tensor->data();
     ASSERT_NE(cuda_output, nullptr);
 
@@ -1568,7 +1568,7 @@ TEST_F(Test__CUDAFlashAttentionParity, FlashDecode_FusedQ81_HeadDim128_Parity)
         nullptr, nullptr, nullptr, 0);
     ASSERT_TRUE(success) << "Fused Q8_1 CUDA decode (hd=128) failed";
 
-    output_tensor->mark_device_dirty();
+    output_tensor->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
     const float *cuda_output = output_tensor->data();
     ASSERT_FALSE(hasNaNOrInf(cuda_output, out_size));
 

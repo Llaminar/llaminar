@@ -17,7 +17,7 @@
  * - GPU→CPU→GPU round trips without unnecessary re-uploads
  * - Debug logging doesn't corrupt GPU pipeline (data() is safe)
  * - mutable_data() marks device stale but doesn't free memory
- * - mark_device_dirty() correctly invalidates host
+ * - transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE) correctly invalidates host
  * - releaseDeviceMemory() properly syncs before freeing
  *
  * @see docs/v2/TENSOR_MEMORY_COHERENCE_DESIGN.md
@@ -195,9 +195,9 @@ TEST_F(Test__TensorCoherence, Transition_SyncedToDeviceAuth_ViaMarkDirty)
     ASSERT_TRUE(tensor->ensureOnDevice(gpu_device_));
     ASSERT_TRUE(tensor->isOnCPU() && tensor->isDeviceValid());
 
-    // Transition: mark_device_dirty() → DEVICE_AUTHORITATIVE
+    // Transition: transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE) → DEVICE_AUTHORITATIVE
     // Simulates GPU kernel writing to the tensor
-    tensor->mark_device_dirty();
+    tensor->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
 
     EXPECT_FALSE(tensor->isOnCPU()) << "Host should be marked stale";
     EXPECT_TRUE(tensor->isOnGPU()) << "GPU memory should still exist";
@@ -219,7 +219,7 @@ TEST_F(Test__TensorCoherence, Transition_DeviceAuthToSynced_ViaData)
 
     // Get to DEVICE_AUTHORITATIVE state
     ASSERT_TRUE(tensor->ensureOnDevice(gpu_device_));
-    tensor->mark_device_dirty(); // Simulates GPU write
+    tensor->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE); // Simulates GPU write
     ASSERT_FALSE(tensor->isOnCPU());
     ASSERT_TRUE(tensor->isDeviceValid());
 
@@ -241,7 +241,7 @@ TEST_F(Test__TensorCoherence, Transition_DeviceAuthToSynced_ViaEnsureOnHost)
 
     // Get to DEVICE_AUTHORITATIVE
     ASSERT_TRUE(tensor->ensureOnDevice(gpu_device_));
-    tensor->mark_device_dirty();
+    tensor->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
 
     // Transition: ensureOnHost() → SYNCED
     ASSERT_TRUE(tensor->ensureOnHost());
@@ -274,7 +274,7 @@ TEST_F(Test__TensorCoherence, Cycle_UploadModifyReupload)
     EXPECT_TRUE(tensor->isOnCPU() && tensor->isDeviceValid());
 
     // Verify: download and check modified value persists
-    tensor->mark_device_dirty();
+    tensor->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
     const float *result = tensor->data();
     EXPECT_EQ(result[0], 999.0f) << "Modified value should survive upload cycle";
 }
@@ -322,7 +322,7 @@ TEST_F(Test__TensorCoherence, GpuToGpu_NoHostTransfer)
 
     // Kernel 1: write
     ASSERT_TRUE(tensor->ensureOnDevice(gpu_device_));
-    tensor->mark_device_dirty(); // GPU wrote to it
+    tensor->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE); // GPU wrote to it
 
     // Device is authoritative, host is stale
     EXPECT_FALSE(tensor->isOnCPU());
@@ -348,7 +348,7 @@ TEST_F(Test__TensorCoherence, DebugLogging_SafeAfterGpuWrite)
 
     // GPU writes
     ASSERT_TRUE(tensor->ensureOnDevice(gpu_device_));
-    tensor->mark_device_dirty();
+    tensor->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
 
     // Debug log reads (should download but NOT invalidate GPU)
     const float *debug_data = tensor->data();
@@ -378,7 +378,7 @@ TEST_F(Test__TensorCoherence, ReleaseDeviceMemory_SyncsFirst)
 
     // GPU writes (device is authoritative)
     ASSERT_TRUE(tensor->ensureOnDevice(gpu_device_));
-    tensor->mark_device_dirty();
+    tensor->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
 
     // Release device memory - should download first
     ASSERT_TRUE(tensor->releaseDeviceMemory());
@@ -433,7 +433,7 @@ TEST_F(Test__TensorCoherence, BF16_FullStateTransitions)
     EXPECT_TRUE(tensor->isOnCPU() && tensor->isDeviceValid());
 
     // Mark dirty: → DEVICE_AUTHORITATIVE
-    tensor->mark_device_dirty();
+    tensor->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
     EXPECT_FALSE(tensor->isOnCPU());
     EXPECT_TRUE(tensor->isDeviceValid());
 
@@ -468,7 +468,7 @@ TEST_F(Test__TensorCoherence, FP16_FullStateTransitions)
     // Full state transition cycle
     EXPECT_TRUE(tensor->isOnCPU());
     ASSERT_TRUE(tensor->ensureOnDevice(gpu_device_));
-    tensor->mark_device_dirty();
+    tensor->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
     ASSERT_TRUE(tensor->ensureOnHost());
 
     const uint16_t *result = tensor->fp16_data();
@@ -488,7 +488,7 @@ TEST_F(Test__TensorCoherence, EdgeCase_1x1Tensor)
     tensor->mutable_data()[0] = 42.0f;
 
     ASSERT_TRUE(tensor->ensureOnDevice(gpu_device_));
-    tensor->mark_device_dirty();
+    tensor->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
     const float *data = tensor->data();
 
     EXPECT_EQ(data[0], 42.0f);
@@ -511,7 +511,7 @@ TEST_F(Test__TensorCoherence, EdgeCase_LargeTensor_16MB)
 
     // Full round trip
     ASSERT_TRUE(tensor->ensureOnDevice(gpu_device_));
-    tensor->mark_device_dirty();
+    tensor->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
     ASSERT_TRUE(tensor->ensureOnHost());
 
     // Sample verification
@@ -536,7 +536,7 @@ TEST_F(Test__TensorCoherence, EdgeCase_TallSkinnyMatrix)
     std::memcpy(original.data(), tensor->data(), original.size() * sizeof(float));
 
     ASSERT_TRUE(tensor->ensureOnDevice(gpu_device_));
-    tensor->mark_device_dirty();
+    tensor->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
     ASSERT_TRUE(tensor->ensureOnHost());
 
     EXPECT_TRUE(verifyData(tensor.get(), original));
@@ -555,7 +555,7 @@ TEST_F(Test__TensorCoherence, EdgeCase_WideShortMatrix)
     std::memcpy(original.data(), tensor->data(), original.size() * sizeof(float));
 
     ASSERT_TRUE(tensor->ensureOnDevice(gpu_device_));
-    tensor->mark_device_dirty();
+    tensor->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
     ASSERT_TRUE(tensor->ensureOnHost());
 
     EXPECT_TRUE(verifyData(tensor.get(), original));
@@ -575,7 +575,7 @@ TEST_F(Test__TensorCoherence, MultipleCycles_NoMemoryLeak)
         fillSequential(tensor.get(), static_cast<float>(cycle), 0.001f);
 
         ASSERT_TRUE(tensor->ensureOnDevice(gpu_device_));
-        tensor->mark_device_dirty();
+        tensor->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
         ASSERT_TRUE(tensor->ensureOnHost());
 
         // Verify first element
@@ -596,7 +596,7 @@ TEST_F(Test__TensorCoherence, AlternatingHostGpuModifications)
         ASSERT_TRUE(tensor->ensureOnDevice(gpu_device_));
 
         // GPU "writes" (mark dirty)
-        tensor->mark_device_dirty();
+        tensor->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
 
         // Host reads (download)
         float val = tensor->data()[0];
@@ -663,7 +663,7 @@ TEST_F(Test__TensorCoherence, RawData_DoesNotTriggerDownload)
     fillSequential(tensor.get());
 
     ASSERT_TRUE(tensor->ensureOnDevice(gpu_device_));
-    tensor->mark_device_dirty();
+    tensor->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
 
     // raw_data() is low-level - it does NOT auto-sync
     const void *raw_ptr = tensor->raw_data();
@@ -771,7 +771,7 @@ TEST_F(Test__TensorCoherence, TransferCounting_DataCallAfterGpuWrite_SingleD2H)
     ASSERT_TRUE(tensor->ensureOnDevice(gpu_device_));
 
     // Simulate GPU write
-    tensor->mark_device_dirty();
+    tensor->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
 
     // data() should trigger download
     const float *data = tensor->data();
@@ -789,7 +789,7 @@ TEST_F(Test__TensorCoherence, TransferCounting_DataCallAfterGpuWrite_NoRedundant
     fillSequential(tensor.get());
 
     ASSERT_TRUE(tensor->ensureOnDevice(gpu_device_));
-    tensor->mark_device_dirty();
+    tensor->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
 
     // Multiple data() calls should NOT re-download
     const float *data1 = tensor->data();
@@ -850,7 +850,7 @@ TEST_F(Test__TensorCoherence, TransferCounting_RoundTrip)
 
     // Full round trip: host → device → host → device
     ASSERT_TRUE(tensor->ensureOnDevice(gpu_device_)); // H2D #1
-    tensor->mark_device_dirty();
+    tensor->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
     tensor->ensureOnHost();                           // D2H #1
     tensor->mutable_data()[0] = 42.0f;                // Mark device stale
     ASSERT_TRUE(tensor->ensureOnDevice(gpu_device_)); // H2D #2
@@ -872,7 +872,7 @@ TEST_F(Test__TensorCoherence, TransferCounting_LargeTensor_CorrectBytes)
     fillSequential(tensor.get());
 
     ASSERT_TRUE(tensor->ensureOnDevice(gpu_device_));
-    tensor->mark_device_dirty();
+    tensor->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
     tensor->data(); // Trigger D2H
 
     EXPECT_EQ(guard.h2d_bytes(), expected_bytes) << "H2D bytes should match tensor size";
@@ -888,7 +888,7 @@ TEST_F(Test__TensorCoherence, TransferCounting_CachedGpuDataSkipsUpload)
 
     // Upload and mark dirty (simulates GPU kernel writing to it)
     ASSERT_TRUE(tensor->ensureOnDevice(gpu_device_));
-    tensor->mark_device_dirty();
+    tensor->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
 
     // Now device has valid data. Another ensureOnDevice should NOT re-upload
     // because device is already valid (even if host is stale).

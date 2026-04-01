@@ -355,7 +355,7 @@ namespace
         // =========================================================================
         // Helper: Create forward input
         // =========================================================================
-        Qwen2ForwardInput createForwardInput(int batch_size = 1, int seq_len = 4)
+        ForwardInput createForwardInput(int batch_size = 1, int seq_len = 4)
         {
             // Token IDs
             token_ids_.resize(batch_size * seq_len);
@@ -364,7 +364,7 @@ namespace
                 token_ids_[i] = i % config_.vocab_size;
             }
 
-            Qwen2ForwardInput input;
+            ForwardInput input;
             input.token_ids = token_ids_.data();
             input.batch_size = batch_size;
             input.seq_len = seq_len;
@@ -464,7 +464,7 @@ namespace
         graph.setBuffers(buffers_);
 
         auto input = createForwardInput();
-        Qwen2ForwardOutput output;
+        ForwardOutput output;
 
         EXPECT_THROW(
             graph.buildUnifiedPipelineGraph(input, output),
@@ -488,7 +488,7 @@ namespace
         graph.setBuffers(buffers_);
 
         auto input = createForwardInput();
-        Qwen2ForwardOutput output;
+        ForwardOutput output;
 
         EXPECT_THROW(
             graph.buildUnifiedPipelineGraph(input, output),
@@ -517,7 +517,7 @@ namespace
         graph.setBuffers(buffers_);
 
         auto input = createForwardInput();
-        Qwen2ForwardOutput output;
+        ForwardOutput output;
 
         EXPECT_THROW(
             graph.buildUnifiedPipelineGraph(input, output),
@@ -712,7 +712,7 @@ namespace
         graph.setBuffers(buffers_);
 
         auto input = createForwardInput();
-        Qwen2ForwardOutput output;
+        ForwardOutput output;
 
         ComputeGraph compute_graph = graph.buildUnifiedPipelineGraph(input, output);
 
@@ -740,7 +740,7 @@ namespace
         graph.setBuffers(buffers_);
 
         auto input = createForwardInput();
-        Qwen2ForwardOutput output;
+        ForwardOutput output;
 
         ComputeGraph compute_graph = graph.buildUnifiedPipelineGraph(input, output);
 
@@ -770,7 +770,7 @@ namespace
         graph.setBuffers(buffers_);
 
         auto input = createForwardInput();
-        Qwen2ForwardOutput output;
+        ForwardOutput output;
 
         ComputeGraph compute_graph = graph.buildUnifiedPipelineGraph(input, output);
 
@@ -800,7 +800,7 @@ namespace
         graph.setBuffers(buffers_);
 
         auto input = createForwardInput();
-        Qwen2ForwardOutput output;
+        ForwardOutput output;
 
         ComputeGraph compute_graph = graph.buildUnifiedPipelineGraph(input, output);
 
@@ -831,7 +831,7 @@ namespace
         graph.setBuffers(buffers_);
 
         auto input = createForwardInput();
-        Qwen2ForwardOutput output;
+        ForwardOutput output;
 
         ComputeGraph compute_graph = graph.buildUnifiedPipelineGraph(input, output);
 
@@ -928,7 +928,7 @@ namespace
         graph.setBuffers(buffers_);
 
         auto input = createForwardInput();
-        Qwen2ForwardOutput output;
+        ForwardOutput output;
 
         ComputeGraph compute_graph = graph.buildUnifiedPipelineGraph(input, output);
 
@@ -995,7 +995,7 @@ namespace
         graph.setBuffers(buffers_);
 
         auto input = createForwardInput();
-        Qwen2ForwardOutput output;
+        ForwardOutput output;
 
         ComputeGraph compute_graph = graph.buildUnifiedPipelineGraph(input, output);
 
@@ -1043,7 +1043,7 @@ namespace
         graph.setBuffers(buffers_);
 
         auto input = createForwardInput();
-        Qwen2ForwardOutput output;
+        ForwardOutput output;
 
         ComputeGraph compute_graph = graph.buildUnifiedPipelineGraph(input, output);
 
@@ -1074,7 +1074,7 @@ namespace
         graph.setBuffers(buffers_);
 
         auto input = createForwardInput();
-        Qwen2ForwardOutput output;
+        ForwardOutput output;
 
         ComputeGraph compute_graph = graph.buildUnifiedPipelineGraph(input, output);
 
@@ -1137,7 +1137,7 @@ namespace
         graph.setBuffers(buffers_);
 
         auto input = createForwardInput();
-        Qwen2ForwardOutput output;
+        ForwardOutput output;
 
         ComputeGraph compute_graph = graph.buildUnifiedPipelineGraph(input, output);
 
@@ -1199,7 +1199,7 @@ namespace
         graph.setBuffers(buffers_);
 
         auto input = createForwardInput();
-        Qwen2ForwardOutput output;
+        ForwardOutput output;
 
         // Building the graph should not throw (PP context is available)
         EXPECT_NO_THROW(graph.buildUnifiedPipelineGraph(input, output));
@@ -1219,7 +1219,7 @@ namespace
         graph.setBuffers(buffers_);
 
         auto input = createForwardInput();
-        Qwen2ForwardOutput output;
+        ForwardOutput output;
 
         // Should throw because PP context for transfer 0->1 is missing
         EXPECT_THROW(graph.buildUnifiedPipelineGraph(input, output), std::runtime_error);
@@ -1243,7 +1243,7 @@ namespace
         graph.setBuffers(buffers_);
 
         auto input = createForwardInput();
-        Qwen2ForwardOutput output;
+        ForwardOutput output;
         output.logits = nullptr; // Start with null
 
         graph.buildUnifiedPipelineGraph(input, output);

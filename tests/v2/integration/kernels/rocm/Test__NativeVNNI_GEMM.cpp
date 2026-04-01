@@ -270,7 +270,7 @@ namespace
         (void)hipDeviceSynchronize();
 
         // 6b. Mark output device-dirty so data() triggers D2H sync
-        output_gpu->mark_device_dirty();
+        output_gpu->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
 
         // 7. CPU reference (use host copy of input before device upload)
         const float *input_host = input->data(); // triggers D2H if needed

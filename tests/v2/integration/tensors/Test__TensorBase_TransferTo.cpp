@@ -127,7 +127,7 @@ TEST_F(Test__TensorBase_TransferTo, SameDevice_NoOp) {
     
     // Setup: upload and mark dirty
     ASSERT_TRUE(tensor_->ensureOnDevice(cuda_device_));
-    tensor_->mark_device_dirty();
+    tensor_->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
     EXPECT_TRUE(tensor_->isDeviceAuthoritative(cuda_device_));
     
     // Transfer to same device should succeed (no-op)
@@ -142,7 +142,7 @@ TEST_F(Test__TensorBase_TransferTo, CPUTarget_Fails) {
     
     // Setup: upload and mark dirty
     ASSERT_TRUE(tensor_->ensureOnDevice(cuda_device_));
-    tensor_->mark_device_dirty();
+    tensor_->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
     
     // Transfer to CPU should fail (use ensureOnHost instead)
     EXPECT_FALSE(tensor_->transferTo(DeviceId::cpu()));
@@ -159,7 +159,7 @@ TEST_F(Test__TensorBase_TransferTo, CUDA_to_CUDA) {
     
     // Setup: upload and mark dirty on source
     ASSERT_TRUE(tensor_->ensureOnDevice(cuda_device_));
-    tensor_->mark_device_dirty();
+    tensor_->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
     ASSERT_TRUE(tensor_->isDeviceAuthoritative(cuda_device_));
     
     // Check if GlobalBackendRouter is initialized
@@ -191,7 +191,7 @@ TEST_F(Test__TensorBase_TransferTo, ROCm_to_ROCm) {
     
     // Setup: upload and mark dirty on source
     ASSERT_TRUE(tensor_->ensureOnDevice(rocm_device_));
-    tensor_->mark_device_dirty();
+    tensor_->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
     
     // Check if GlobalBackendRouter is initialized
     auto* router = GlobalBackendRouter::get();
@@ -230,7 +230,7 @@ TEST_F(Test__TensorBase_TransferTo, CUDA_to_ROCm) {
     
     // Setup: upload and mark dirty on CUDA
     ASSERT_TRUE(tensor_->ensureOnDevice(cuda_device_));
-    tensor_->mark_device_dirty();
+    tensor_->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
     
     // Transfer CUDA -> ROCm
     ASSERT_TRUE(tensor_->transferTo(rocm_device_));
@@ -259,7 +259,7 @@ TEST_F(Test__TensorBase_TransferTo, ROCm_to_CUDA) {
     
     // Setup: upload and mark dirty on ROCm
     ASSERT_TRUE(tensor_->ensureOnDevice(rocm_device_));
-    tensor_->mark_device_dirty();
+    tensor_->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
     
     // Transfer ROCm -> CUDA
     ASSERT_TRUE(tensor_->transferTo(cuda_device_));
@@ -295,7 +295,7 @@ TEST_F(Test__TensorBase_TransferTo, MultiHop_CUDA_ROCm_CUDA) {
     
     // CUDA -> ROCm
     ASSERT_TRUE(tensor_->ensureOnDevice(cuda_device_));
-    tensor_->mark_device_dirty();
+    tensor_->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
     ASSERT_TRUE(tensor_->transferTo(rocm_device_));
     EXPECT_TRUE(tensor_->isDeviceAuthoritative(rocm_device_));
     
@@ -324,7 +324,7 @@ TEST_F(Test__TensorBase_TransferTo, CopyTo_KeepsSourceAuthoritative) {
     
     // Setup: upload and mark dirty on source
     ASSERT_TRUE(tensor_->ensureOnDevice(cuda_device_));
-    tensor_->mark_device_dirty();
+    tensor_->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
     ASSERT_TRUE(tensor_->isDeviceAuthoritative(cuda_device_));
     
     // Copy to second device

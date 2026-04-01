@@ -12,7 +12,7 @@
  * **Key scenarios tested**:
  * 1. mark_device_dirty_with_event() records an event on the correct stream,
  *    and ensureOnHost() + data() returns post-kernel data
- * 2. mark_device_dirty_flags_only() does NOT record an event, and
+ * 2. transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE) does NOT record an event, and
  *    ensureOnHost() falls back to full device synchronization
  * 3. The stale event scenario: event from operation A persists after
  *    flags-only dirty marking from operation B
@@ -134,7 +134,7 @@ TEST_F(Test__StreamCoherenceIntegration, RoundTrip_HostToDeviceToHost)
 
     // Mark device dirty (the GPU hasn't actually modified data, but this
     // exercises the coherence path: host becomes stale)
-    tensor->mark_device_dirty();
+    tensor->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
 
     // Read back — should trigger D2H transfer
     const float *result = tensor->data();
@@ -171,7 +171,7 @@ TEST_F(Test__StreamCoherenceIntegration, WithEvent_RecordsAndWaitsCorrectly)
     ASSERT_TRUE(tensor->ensureOnDevice(gpu_device_));
 
     // Mark dirty WITH event (using default stream / nullptr)
-    tensor->mark_device_dirty_with_event(nullptr);
+    tensor->transitionToWithEvent(TensorCoherenceState::DEVICE_AUTHORITATIVE, std::nullopt, nullptr);
 
     // Host should be stale now
     EXPECT_FALSE(tensor->isOnCPU());
@@ -197,7 +197,7 @@ TEST_F(Test__StreamCoherenceIntegration, WithEvent_RecordsAndWaitsCorrectly)
 
 TEST_F(Test__StreamCoherenceIntegration, FlagsOnly_FallsBackToFullSync)
 {
-    // mark_device_dirty_flags_only() does NOT record an event.
+    // transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE) does NOT record an event.
     // When ensureOnHost() is called, it should fall back to full device sync.
     // This is slower but still correct.
 
@@ -213,7 +213,7 @@ TEST_F(Test__StreamCoherenceIntegration, FlagsOnly_FallsBackToFullSync)
     ASSERT_TRUE(tensor->ensureOnDevice(gpu_device_));
 
     // Flags-only dirty marking (no event)
-    tensor->mark_device_dirty_flags_only();
+    tensor->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
 
     // Host should be stale
     EXPECT_FALSE(tensor->isOnCPU());
@@ -260,11 +260,11 @@ TEST_F(Test__StreamCoherenceIntegration, StaleEvent_PersistsThroughFlagsOnlyMark
     ASSERT_TRUE(tensor->ensureOnDevice(gpu_device_));
 
     // Step 2: Mark dirty with event (simulates GEMM completing)
-    tensor->mark_device_dirty_with_event(nullptr);
+    tensor->transitionToWithEvent(TensorCoherenceState::DEVICE_AUTHORITATIVE, std::nullopt, nullptr);
 
     // Step 3: Mark dirty flags-only (simulates executor after "allreduce")
     // The stale event from step 2 persists
-    tensor->mark_device_dirty_flags_only();
+    tensor->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
 
     // Step 4: Read back — ensureOnHost() will wait on the stale event from step 2
     const float *result = tensor->data();
@@ -307,13 +307,13 @@ TEST_F(Test__StreamCoherenceIntegration, FixScenario_StageCallsEventAfterAllredu
     ASSERT_TRUE(tensor->ensureOnDevice(gpu_device_));
 
     // Step 2: GEMM event
-    tensor->mark_device_dirty_with_event(nullptr);
+    tensor->transitionToWithEvent(TensorCoherenceState::DEVICE_AUTHORITATIVE, std::nullopt, nullptr);
 
     // Step 3: Executor flags-only (intermediate stage)
-    tensor->mark_device_dirty_flags_only();
+    tensor->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
 
     // Step 4: FIX — Stage records new event after allreduce
-    tensor->mark_device_dirty_with_event(nullptr);
+    tensor->transitionToWithEvent(TensorCoherenceState::DEVICE_AUTHORITATIVE, std::nullopt, nullptr);
 
     // Step 5: Read back — waits on the new event from step 4
     const float *result = tensor->data();
@@ -462,8 +462,8 @@ TEST_F(Test__StreamCoherenceIntegration, MultipleTensors_CoherenceConsistency)
     ASSERT_TRUE(tensor_b->ensureOnDevice(gpu_device_));
 
     // Mark A with event, B with flags-only
-    tensor_a->mark_device_dirty_with_event(nullptr);
-    tensor_b->mark_device_dirty_flags_only();
+    tensor_a->transitionToWithEvent(TensorCoherenceState::DEVICE_AUTHORITATIVE, std::nullopt, nullptr);
+    tensor_b->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
 
     // Both should be device-authoritative
     EXPECT_FALSE(tensor_a->isOnCPU());

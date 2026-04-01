@@ -532,7 +532,7 @@ namespace
         cudaDeviceSynchronize();
 
         // Mark output dirty and sync back to host
-        cuda_output->mark_device_dirty();
+        cuda_output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
         const float *result = cuda_output->data(); // This syncs GPU→host
 
         EXPECT_FALSE(hasNanOrInf(result, num_elements)) << "CUDA output contains NaN/Inf";
@@ -574,7 +574,7 @@ namespace
             num_elements, nullptr, 0));
 
         cudaDeviceSynchronize();
-        cuda_output->mark_device_dirty();
+        cuda_output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
         const float *result = cuda_output->data();
 
         EXPECT_FALSE(hasNanOrInf(result, num_elements)) << "CUDA output contains NaN/Inf";

@@ -2195,9 +2195,9 @@ TEST_F(Test__CUDAGemmParity, FusedQKV_WithBias)
         input.get(), projections, M, K, nullptr));
 
     // Mark outputs as device-dirty (tests bypass DeviceGraphExecutor auto-coherence)
-    output_q->mark_device_dirty();
-    output_k->mark_device_dirty();
-    output_v->mark_device_dirty();
+    output_q->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+    output_k->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+    output_v->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
 
     // ===== CPU reference (GEMM + manual bias add) =====
     auto cpu_kernel_q = llaminar::v2::kernels::KernelFactory::createGemm(
@@ -2386,9 +2386,9 @@ TEST_F(Test__CUDAGemmParity, FusedQKV_CachedKernels_MultipleIterations)
             input.get(), projections, M, K, nullptr));
 
         // Mark outputs as device-dirty (tests bypass DeviceGraphExecutor auto-coherence)
-        out_q->mark_device_dirty();
-        out_k->mark_device_dirty();
-        out_v->mark_device_dirty();
+        out_q->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+        out_k->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+        out_v->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
 
         // CPU reference
         std::vector<float> q_cpu(M * N_q), k_cpu(M * N_k), v_cpu(M * N_v);

@@ -576,7 +576,7 @@ TEST_F(Test__MultiGPU_RealModel, EntireLayer_GPUTransfer)
 //   2. ROCm → ROCm (same backend, different ordinal)
 //   3. CUDA → ROCm (cross-vendor)
 //   4. ROCm → CUDA (cross-vendor, reverse)
-//   5. Repeated migrations with mark_device_dirty() between each
+//   5. Repeated migrations with transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE) between each
 //
 // Background: A bug was discovered where tensors transferring from CUDA to ROCm
 // retained their CUDA completion event, causing hipEventRecord() to hang when
@@ -909,7 +909,7 @@ TEST_F(Test__GPU_to_GPU_Transfer, Q4_0_Weight_CrossVendor)
 
     // Now upload to CUDA again and mark it dirty
     ASSERT_TRUE(q4_tensor->ensureOnDevice(cuda));
-    q4_tensor->mark_device_dirty();
+    q4_tensor->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
 
     // Step 4: To transfer to ROCm, we need to go through host
     // (This is the current limitation that copy() API will address in LocalPPContext)
@@ -918,7 +918,7 @@ TEST_F(Test__GPU_to_GPU_Transfer, Q4_0_Weight_CrossVendor)
 
     // Then upload to ROCm
     ASSERT_TRUE(q4_tensor->ensureOnDevice(rocm));
-    q4_tensor->mark_device_dirty();
+    q4_tensor->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
 
     // Step 5: Sync back to host for verification
     ASSERT_TRUE(q4_tensor->ensureOnHost());
@@ -1050,13 +1050,13 @@ TEST_F(Test__GPU_to_GPU_Transfer, ClearCompletionEvent_API)
 
     // Transfer to CUDA and create completion event
     ASSERT_TRUE(tensor->ensureOnDevice(cuda));
-    tensor->mark_device_dirty(); // Creates event
+    tensor->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE); // Creates event
 
     // Clear the event explicitly
     tensor->clearCompletionEvent();
 
     // Mark dirty again (should create new event without issues)
-    tensor->mark_device_dirty();
+    tensor->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
 
     // Verify data still intact
     ASSERT_TRUE(tensor->ensureOnHost());
@@ -1099,7 +1099,7 @@ TEST_F(Test__GPU_to_GPU_Transfer, TransferTo_DirectGPUTransfer)
 
     // Step 1: Upload to CUDA and mark dirty
     ASSERT_TRUE(tensor->ensureOnDevice(cuda));
-    tensor->mark_device_dirty();
+    tensor->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
     EXPECT_TRUE(tensor->isDeviceAuthoritative(cuda));
     std::cout << "  [1] Uploaded to CUDA, marked authoritative\n";
 
@@ -1158,12 +1158,12 @@ TEST_F(Test__GPU_to_GPU_Transfer, TransferTo_vs_EnsureOnDevice_Comparison)
         std::vector<float> original(tensor->data(), tensor->data() + tensor->numel());
 
         ASSERT_TRUE(tensor->ensureOnDevice(cuda));
-        tensor->mark_device_dirty();
+        tensor->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
 
         // Old way: must sync to host first, then upload to new device
         ASSERT_TRUE(tensor->ensureOnHost());       // D2H: ~3.9 GB/s
         ASSERT_TRUE(tensor->ensureOnDevice(rocm)); // H2D: ~6.2 GB/s
-        tensor->mark_device_dirty();
+        tensor->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
 
         ASSERT_TRUE(tensor->ensureOnHost());
         EXPECT_TRUE(verifyDataIntegrity(tensor.get(), original));
@@ -1176,7 +1176,7 @@ TEST_F(Test__GPU_to_GPU_Transfer, TransferTo_vs_EnsureOnDevice_Comparison)
         std::vector<float> original(tensor->data(), tensor->data() + tensor->numel());
 
         ASSERT_TRUE(tensor->ensureOnDevice(cuda));
-        tensor->mark_device_dirty();
+        tensor->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
 
         // New way: direct GPU→GPU, no host involvement
         ASSERT_TRUE(tensor->transferTo(rocm)); // Direct BAR: ~2.65 GB/s
@@ -1269,7 +1269,7 @@ TEST_F(Test__GPU_to_GPU_Transfer, LocalPP_CrossVendor_UsesTransferTo)
 
     // Step 1: Upload to CUDA:0 (Stage 0's device) and mark authoritative
     ASSERT_TRUE(tensor->ensureOnDevice(cuda));
-    tensor->mark_device_dirty();
+    tensor->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
     EXPECT_TRUE(tensor->isDeviceAuthoritative(cuda));
     std::cout << "  [1] Tensor uploaded to Stage 0 device (" << bytes << " bytes)\n";
 
@@ -1353,7 +1353,7 @@ TEST_F(Test__GPU_to_GPU_Transfer, LocalPP_RoundTrip_CUDA_ROCm_CUDA)
 
     // Stage 0: Upload to CUDA:0
     ASSERT_TRUE(tensor->ensureOnDevice(cuda));
-    tensor->mark_device_dirty();
+    tensor->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
     std::cout << "  [Stage 0] Tensor on CUDA:0, authoritative\n";
 
     // Transfer 0 → 1 (CUDA → ROCm)
@@ -1427,7 +1427,7 @@ TEST_F(Test__GPU_to_GPU_Transfer, LocalPP_NoHostStagingVerification)
 
     // Upload to CUDA and mark dirty (host copy is now stale)
     ASSERT_TRUE(tensor->ensureOnDevice(cuda));
-    tensor->mark_device_dirty();
+    tensor->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
     EXPECT_TRUE(tensor->isDeviceAuthoritative(cuda));
     EXPECT_FALSE(tensor->isHostAuthoritative());
     std::cout << "  [1] Tensor on CUDA:0, host copy is stale\n";
@@ -1514,7 +1514,7 @@ TEST_F(Test__GPU_to_GPU_Transfer, LocalPP_Q4_0_Weight_Transfer)
 
     // Upload to CUDA:0
     ASSERT_TRUE(q4_tensor->ensureOnDevice(cuda));
-    q4_tensor->mark_device_dirty();
+    q4_tensor->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
     std::cout << "  [1] Q4_0 weight uploaded to CUDA:0\n";
 
     // PP transfer to ROCm:0

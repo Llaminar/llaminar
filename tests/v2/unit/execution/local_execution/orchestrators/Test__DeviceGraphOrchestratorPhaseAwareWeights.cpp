@@ -51,7 +51,7 @@ protected:
         config_.default_device = DeviceId::cpu();
 
         // Create orchestrator
-        orchestrator_ = std::make_unique<DeviceGraphOrchestrator>(config_, nullptr);
+        orchestrator_ = std::make_unique<DeviceGraphOrchestrator>(std::make_shared<Qwen2Graph>(config_, nullptr), nullptr);
     }
 
     GraphConfig config_;
@@ -160,7 +160,7 @@ protected:
         config_.rope_theta = 1000000.0f;
         config_.default_device = DeviceId::cpu();
 
-        orchestrator_ = std::make_unique<DeviceGraphOrchestrator>(config_, nullptr);
+        orchestrator_ = std::make_unique<DeviceGraphOrchestrator>(std::make_shared<Qwen2Graph>(config_, nullptr), nullptr);
     }
 
     /**
@@ -313,7 +313,7 @@ protected:
         config_.rope_theta = 1000000.0f;
         config_.default_device = DeviceId::cpu();
 
-        orchestrator_ = std::make_unique<DeviceGraphOrchestrator>(config_, nullptr);
+        orchestrator_ = std::make_unique<DeviceGraphOrchestrator>(std::make_shared<Qwen2Graph>(config_, nullptr), nullptr);
 
         // Save original env value
         const char *orig = std::getenv("LLAMINAR_CPU_PREFILL_PARTICIPATE");

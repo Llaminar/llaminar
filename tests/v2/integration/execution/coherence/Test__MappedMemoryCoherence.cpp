@@ -136,7 +136,8 @@ TEST_F(Test__MappedMemoryCoherence, MappedTensor_NoMemcpyOnEnsureOnHost)
     // For our test, we verify that ensureOnHost returns quickly
 
     // Mark as device dirty to simulate a kernel write
-    tensor->mark_device_dirty();
+    // For mapped tensors, use MAPPED state since host and device share memory
+    tensor->transitionTo(TensorCoherenceState::MAPPED);
 
     // This should NOT trigger a D2H memcpy for mapped tensors
     // The data is already accessible via mapped_host_ptr_
@@ -184,7 +185,8 @@ TEST_F(Test__MappedMemoryCoherence, MappedTensor_KernelWriteVisibleOnHost)
     }
 
     // Mark as device dirty (simulating what DeviceGraphExecutor does after kernel)
-    tensor->mark_device_dirty();
+    // For mapped tensors, use MAPPED state since host and device share memory
+    tensor->transitionTo(TensorCoherenceState::MAPPED);
 
     // Host should see the writes WITHOUT explicit memcpy
     const float *host_data = tensor->data();
@@ -223,9 +225,10 @@ TEST_F(Test__MappedMemoryCoherence, MappedTensor_BothFlagsStayTrue)
     EXPECT_TRUE(tensor->isDeviceValid())
         << "Mapped tensor should be device-valid initially";
 
-    // After mark_device_dirty(), both should STILL be valid
-    // (unlike non-mapped tensors where host becomes invalid)
-    tensor->mark_device_dirty();
+    // After marking mapped tensor as device-modified, both should STILL be valid
+    // (unlike non-mapped tensors where host becomes invalid).
+    // For mapped tensors, use MAPPED state since host and device share memory.
+    tensor->transitionTo(TensorCoherenceState::MAPPED);
 
     EXPECT_TRUE(tensor->isOnCPU())
         << "Mapped tensor should remain host-valid after mark_device_dirty";

@@ -33,6 +33,7 @@
 
 #include "GraphSchema.h"
 #include "../../debug/BufferRole.h"
+#include "../../config/RuntimeConfig.h"
 #include "../../../backends/DeviceId.h"
 #include "../../../utils/MPIContext.h"
 #include <memory>
@@ -159,6 +160,15 @@ namespace llaminar2
         int local_n_kv_heads = 0; ///< KV heads on this rank
         int local_d_ff = 0;       ///< FFN dim on this rank
         int local_vocab = 0;      ///< Vocab size on this rank
+
+        // =================================================================
+        // Activation Precision (affects buffer dtype resolution)
+        // =================================================================
+
+        /// Activation precision mode. BufferSpec entries with dtype_overrides
+        /// matching this precision will use the overridden dtype instead of
+        /// the default. See BufferSpec::dtype_overrides.
+        ActivationPrecision activation_precision = ActivationPrecision::FP32;
     };
 
     /**

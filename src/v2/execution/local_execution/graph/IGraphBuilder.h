@@ -17,6 +17,9 @@
 #pragma once
 
 #include "DeviceGraphExecutor.h"
+#include "GraphSchema.h"
+#include "GraphResolver.h"
+#include "../../../models/GraphTypes.h"
 #include "../../../backends/DeviceId.h"
 
 namespace llaminar2
@@ -28,6 +31,11 @@ namespace llaminar2
     struct LayerWeights;
     struct ActivationBuffers;
 
+    // Forward declarations for IGraphBuilder interface
+    struct PipelineConfig;
+    class ILocalPPContext;
+    class ILocalTPContext;
+
     // =========================================================================
     // Generic Input/Output Structures
     // =========================================================================
@@ -35,8 +43,8 @@ namespace llaminar2
     /**
      * @brief Generic forward pass input
      *
-     * Base structure for forward pass inputs. Model-specific implementations
-     * may extend this with additional fields.
+     * Contains all fields needed for forward pass execution including
+     * pipeline parallelism and variable-length batching support.
      */
     struct ForwardInput
     {
@@ -47,6 +55,48 @@ namespace llaminar2
         int position_offset = 0;           ///< KV cache position offset (legacy fallback)
         DeviceId device = DeviceId::cpu(); ///< Target device
         IKVCache *kv_cache = nullptr;      ///< KV cache (optional)
+
+        // ----- Pipeline Parallelism -----
+
+        /// Per-device KV caches for Pipeline Parallelism (PP).
+        /// When set (non-empty), each PP stage uses the KV cache for its device.
+        /// Takes precedence over kv_cache when device is found in this map.
+        const std::unordered_map<DeviceId, IKVCache *> *pp_kv_caches = nullptr;
+
+        /// External hidden state input (for PP middle stages that don't have embedding).
+        /// When set, embedding is skipped and this tensor is used as initial hidden state.
+        TensorBase *external_hidden_state = nullptr;
+
+        // ----- Variable-Length Batching -----
+
+        /// Sequence lengths for variable-length batching (nullptr = all equal to seq_len).
+        /// When set, enables proper batch-separating attention masks that
+        /// prevent cross-sequence attention in batched execution.
+        const std::vector<int> *sequence_lengths = nullptr;
+
+        /// Batched input (alternative to token_ids)
+        struct Batch
+        {
+            const int *tokens;
+            int len;
+            int offset;
+        };
+        const Batch *batches = nullptr;
+        int num_batches = 0;
+
+        // ----- Helpers -----
+
+        /// Get the KV cache for a specific device (PP) or the default (non-PP)
+        IKVCache *getKVCacheForDevice(const DeviceId &dev) const
+        {
+            if (pp_kv_caches && !pp_kv_caches->empty())
+            {
+                auto it = pp_kv_caches->find(dev);
+                if (it != pp_kv_caches->end())
+                    return it->second;
+            }
+            return kv_cache;
+        }
 
         virtual ~ForwardInput() = default;
     };
@@ -158,6 +208,169 @@ namespace llaminar2
         virtual bool isInitialized() const { return false; }
 
         // =====================================================================
+        // Configuration Access
+        // =====================================================================
+
+        /// Get model configuration (dimensions, layer count, etc.)
+        virtual const GraphConfig &config() const = 0;
+
+        /// Get the architecture name (e.g. "qwen2", "qwen3", "llama")
+        virtual std::string architectureName() const { return "unknown"; }
+
+        // =====================================================================
+        // Weight / Buffer Management
+        // =====================================================================
+
+        /// Set model weights
+        virtual void setWeights(const ModelWeights &weights) = 0;
+
+        /// Set activation buffers (for manual buffer management)
+        virtual void setBuffers(const ModelBuffers &buffers) = 0;
+
+        /// Set buffer arena for arena-managed allocation
+        virtual void setArena(BufferArena *arena) { (void)arena; }
+
+        /// Get current activation buffers
+        virtual const ModelBuffers &buffers() const = 0;
+
+        // =====================================================================
+        // Schema / Resolver
+        // =====================================================================
+
+        /// Get the declarative schema for this architecture
+        virtual GraphSchema getSchema() const { return {}; }
+
+        /// Get resolver config for buffer allocation
+        virtual GraphResolverConfig getResolverConfig(int seq_len) const
+        {
+            (void)seq_len;
+            return {};
+        }
+
+        // =====================================================================
+        // Pipeline / Parallelism Configuration
+        // =====================================================================
+
+        /// Set pipeline configuration for PP graph building
+        virtual void setPipelineConfig(std::shared_ptr<PipelineConfig> config)
+        {
+            (void)config;
+        }
+
+        /// Register a PP context for inter-stage transfers
+        virtual void setPPContext(int from_stage, int to_stage, ILocalPPContext *pp_ctx)
+        {
+            (void)from_stage;
+            (void)to_stage;
+            (void)pp_ctx;
+        }
+
+        /// Register a TP context for a named domain
+        virtual void setTPContext(const std::string &domain_name, ILocalTPContext *tp_ctx)
+        {
+            (void)domain_name;
+            (void)tp_ctx;
+        }
+
+        // =====================================================================
+        // Snapshot
+        // =====================================================================
+
+        /// Set snapshot callback for debugging
+        virtual void setSnapshotCallback(StageSnapshotCallback callback)
+        {
+            (void)callback;
+        }
+
+        // =====================================================================
+        // PP Graph Building Variants
+        // =====================================================================
+
+        /// Build forward graph for a PP subset of layers
+        virtual ComputeGraph buildPartialForwardGraph(
+            const ForwardInput &input,
+            ForwardOutput &output,
+            int first_layer,
+            int last_layer,
+            bool has_embedding,
+            bool has_lm_head)
+        {
+            (void)input;
+            (void)output;
+            (void)first_layer;
+            (void)last_layer;
+            (void)has_embedding;
+            (void)has_lm_head;
+            return {};
+        }
+
+        /// Build unified PP+TP pipeline graph
+        virtual ComputeGraph buildUnifiedPipelineGraph(
+            const ForwardInput &input,
+            ForwardOutput &output)
+        {
+            (void)input;
+            (void)output;
+            return {};
+        }
+
+        // =====================================================================
+        // Full Forward & Layer-Level Graph Building
+        // =====================================================================
+
+        /// Build the complete forward graph (embedding → all layers → LM head)
+        virtual ComputeGraph buildFullForwardGraph(
+            const ForwardInput &input,
+            ForwardOutput &output)
+        {
+            (void)input;
+            (void)output;
+            return {};
+        }
+
+        /// Build attention block sub-graph for a single layer
+        virtual ComputeGraph buildAttentionGraph(
+            const LayerWeights &layer,
+            ActivationBuffers &buffers,
+            int layer_idx,
+            int seq_len,
+            int batch_size,
+            IKVCache *kv_cache,
+            const int *position_ids,
+            DeviceId device,
+            const std::vector<int> *sequence_lengths = nullptr)
+        {
+            (void)layer;
+            (void)buffers;
+            (void)layer_idx;
+            (void)seq_len;
+            (void)batch_size;
+            (void)kv_cache;
+            (void)position_ids;
+            (void)device;
+            (void)sequence_lengths;
+            return {};
+        }
+
+        /// Build FFN block sub-graph for a single layer
+        virtual ComputeGraph buildFFNGraph(
+            const LayerWeights &layer,
+            ActivationBuffers &buffers,
+            int layer_idx,
+            int seq_len,
+            int batch_size,
+            DeviceId device)
+        {
+            (void)layer;
+            (void)buffers;
+            (void)layer_idx;
+            (void)seq_len;
+            (void)batch_size;
+            (void)device;
+            return {};
+        }
+
+        // =====================================================================
         // Utility Methods
         // =====================================================================
 
@@ -260,6 +473,12 @@ namespace llaminar2
         int hiddenDim() const override { return hidden_dim_; }
         bool isInitialized() const override { return initialized_; }
 
+        // New IGraphBuilder overrides
+        const GraphConfig &config() const override { return config_; }
+        void setWeights(const ModelWeights &weights) override { weights_ = weights; }
+        void setBuffers(const ModelBuffers &buffers) override { buffers_ = buffers; }
+        const ModelBuffers &buffers() const override { return buffers_; }
+
         // =====================================================================
         // Mock Configuration
         // =====================================================================
@@ -305,9 +524,10 @@ namespace llaminar2
         }
 
         /// Configure mock model properties
-        void setNumLayers(int n) { num_layers_ = n; }
-        void setHiddenDim(int d) { hidden_dim_ = d; }
+        void setNumLayers(int n) { num_layers_ = n; config_.n_layers = n; }
+        void setHiddenDim(int d) { hidden_dim_ = d; config_.d_model = d; }
         void setInitialized(bool init) { initialized_ = init; }
+        void setConfig(const GraphConfig &cfg) { config_ = cfg; num_layers_ = cfg.n_layers; hidden_dim_ = cfg.d_model; }
 
         // =====================================================================
         // Call Tracking (for test assertions)
@@ -345,6 +565,9 @@ namespace llaminar2
         std::vector<LayerGraphFactory> layer_graph_factories_;
 
         // Model properties
+        GraphConfig config_{};
+        ModelWeights weights_{};
+        ModelBuffers buffers_{};
         int num_layers_ = 24;
         int hidden_dim_ = 896;
         bool initialized_ = true;

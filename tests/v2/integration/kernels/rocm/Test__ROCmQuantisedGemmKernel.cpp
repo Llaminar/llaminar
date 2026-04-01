@@ -3667,7 +3667,7 @@ namespace llaminar2
 
                 ASSERT_TRUE(kernel.multiply_tensor(input.get(), output.get(), M, N, K));
                 (void)hipDeviceSynchronize();
-                output->mark_device_dirty();
+                output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
 
                 // CPU reference
                 const float *in_host = input->data();
@@ -3725,7 +3725,7 @@ namespace llaminar2
                 }
 
                 ASSERT_EQ(hipDeviceSynchronize(), hipSuccess);
-                output->mark_device_dirty();
+                output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
 
                 const float *in_host = input->data();
                 std::vector<float> ref(static_cast<size_t>(M) * N);
@@ -3781,7 +3781,7 @@ namespace llaminar2
                 }
 
                 ASSERT_EQ(hipDeviceSynchronize(), hipSuccess);
-                output->mark_device_dirty();
+                output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
 
                 const float *in_host = input->data();
                 std::vector<float> ref(static_cast<size_t>(M) * N);
@@ -4000,7 +4000,7 @@ namespace llaminar2
 
                 ASSERT_TRUE(kernel.multiply_tensor(input.get(), output.get(), M, N, K));
                 (void)hipDeviceSynchronize();
-                output->mark_device_dirty();
+                output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
 
                 const float *in_host = input->data();
                 std::vector<float> ref(static_cast<size_t>(M) * N);
@@ -4054,8 +4054,8 @@ namespace llaminar2
                 ASSERT_TRUE(kernel.multiply_tensor(input.get(), output_with_bias.get(), M, N, K,
                                                    true, 1.0f, 0.0f, bias.get()));
                 (void)hipDeviceSynchronize();
-                output_no_bias->mark_device_dirty();
-                output_with_bias->mark_device_dirty();
+                output_no_bias->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+                output_with_bias->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
 
                 const float *no_bias = output_no_bias->data();
                 const float *with_bias = output_with_bias->data();
@@ -4105,7 +4105,7 @@ namespace llaminar2
 
                 ASSERT_TRUE(kernel.multiply_tensor(input.get(), output.get(), M, N, K));
                 (void)hipDeviceSynchronize();
-                output->mark_device_dirty();
+                output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
 
                 const float *in_host = input->data();
                 std::vector<float> ref(static_cast<size_t>(M) * N);
@@ -4153,7 +4153,7 @@ namespace llaminar2
 
                 ASSERT_TRUE(kernel.multiply_tensor(input.get(), output.get(), M, N, K));
                 (void)hipDeviceSynchronize();
-                output->mark_device_dirty();
+                output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
 
                 const float *in_host = input->data();
                 std::vector<float> ref(static_cast<size_t>(M) * N);
@@ -4196,7 +4196,7 @@ namespace llaminar2
 
                 ASSERT_TRUE(kernel.multiply_tensor(input.get(), output.get(), M, N, K));
                 (void)hipDeviceSynchronize();
-                output->mark_device_dirty();
+                output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
 
                 const float *in_host = input->data();
                 std::vector<float> ref(static_cast<size_t>(M) * N);
@@ -4250,8 +4250,8 @@ namespace llaminar2
                 ASSERT_TRUE(kernel.multiply_tensor(input.get(), output_with_bias.get(), M, N, K,
                                                    true, 1.0f, 0.0f, bias.get()));
                 (void)hipDeviceSynchronize();
-                output_no_bias->mark_device_dirty();
-                output_with_bias->mark_device_dirty();
+                output_no_bias->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+                output_with_bias->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
 
                 const float *no_bias = output_no_bias->data();
                 const float *with_bias = output_with_bias->data();
@@ -4301,7 +4301,7 @@ namespace llaminar2
 
                 ASSERT_TRUE(kernel.multiply_tensor(input.get(), output.get(), M, N, K));
                 (void)hipDeviceSynchronize();
-                output->mark_device_dirty();
+                output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
 
                 const float *in_host = input->data();
                 std::vector<float> ref(static_cast<size_t>(M) * N);
@@ -4366,7 +4366,7 @@ namespace llaminar2
                     ASSERT_TRUE(output->allocateOnDevice(DeviceId::rocm(0)));
                     ASSERT_TRUE(kernel.multiply_tensor(input.get(), output.get(), M, N, K));
                     (void)hipDeviceSynchronize();
-                    output->mark_device_dirty();
+                    output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
 
                     std::vector<float> ref(static_cast<size_t>(M) * N);
                     cpuFP32GemmRef(in_host, W_q8_fp32.data(), ref.data(), M, N, K);
@@ -4387,7 +4387,7 @@ namespace llaminar2
                     ASSERT_TRUE(output->allocateOnDevice(DeviceId::rocm(0)));
                     ASSERT_TRUE(kernel.multiply_tensor(input.get(), output.get(), M, N, K));
                     (void)hipDeviceSynchronize();
-                    output->mark_device_dirty();
+                    output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
 
                     std::vector<float> ref(static_cast<size_t>(M) * N);
                     cpuFP32GemmRef(in_host, W_q4_fp32.data(), ref.data(), M, N, K);
@@ -4433,7 +4433,7 @@ namespace llaminar2
 
                 ASSERT_TRUE(kernel.multiply_tensor(input.get(), output.get(), M, N, K));
                 (void)hipDeviceSynchronize();
-                output->mark_device_dirty();
+                output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
 
                 const float *in_host = input->data();
                 std::vector<float> ref(static_cast<size_t>(M) * N);
@@ -4479,14 +4479,14 @@ namespace llaminar2
 
                 ASSERT_TRUE(kernel.multiply_tensor(input.get(), output_separate.get(), M, N, K));
                 (void)hipDeviceSynchronize();
-                output_separate->mark_device_dirty();
+                output_separate->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
 
                 std::vector<ITensorGemm::TensorProjectionDesc> projections;
                 projections.emplace_back(&kernel, output_fused.get(), N, nullptr, "q4_0_native_fused");
 
                 ASSERT_TRUE(kernel.multiply_fused_tensor(input.get(), projections, M, K));
                 (void)hipDeviceSynchronize();
-                output_fused->mark_device_dirty();
+                output_fused->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
 
                 const float *separate = output_separate->data();
                 const float *fused = output_fused->data();
@@ -4554,9 +4554,9 @@ namespace llaminar2
                 ASSERT_TRUE(kernel.multiply_tensor(input.get(), separate_v.get(), M, N, K,
                                                    true, 1.0f, 0.0f, bias_v.get()));
                 (void)hipDeviceSynchronize();
-                separate_q->mark_device_dirty();
-                separate_k->mark_device_dirty();
-                separate_v->mark_device_dirty();
+                separate_q->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+                separate_k->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+                separate_v->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
 
                 std::vector<ITensorGemm::TensorProjectionDesc> projections;
                 projections.emplace_back(&kernel, fused_q.get(), N, bias_q.get(), "q_bias");
@@ -4565,9 +4565,9 @@ namespace llaminar2
 
                 ASSERT_TRUE(kernel.multiply_fused_tensor(input.get(), projections, M, K));
                 (void)hipDeviceSynchronize();
-                fused_q->mark_device_dirty();
-                fused_k->mark_device_dirty();
-                fused_v->mark_device_dirty();
+                fused_q->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+                fused_k->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+                fused_v->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
 
                 const float q_cos = cosineSim(fused_q->data(), separate_q->data(), static_cast<size_t>(M) * N);
                 const float k_cos = cosineSim(fused_k->data(), separate_k->data(), static_cast<size_t>(M) * N);
@@ -4655,9 +4655,9 @@ namespace llaminar2
                 ASSERT_TRUE(v_kernel.multiply_tensor(input.get(), separate_v.get(), M, Nv, K,
                                                      true, 1.0f, 0.0f, bias_v.get()));
                 ASSERT_EQ(hipDeviceSynchronize(), hipSuccess);
-                separate_q->mark_device_dirty();
-                separate_k->mark_device_dirty();
-                separate_v->mark_device_dirty();
+                separate_q->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+                separate_k->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+                separate_v->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
 
                 std::vector<ITensorGemm::TensorProjectionDesc> projections;
                 projections.emplace_back(&q_kernel, fused_q.get(), Nq, bias_q.get(), "q_q8_blockwise");
@@ -4666,9 +4666,9 @@ namespace llaminar2
 
                 ASSERT_TRUE(q_kernel.multiply_fused_tensor(input.get(), projections, M, K));
                 ASSERT_EQ(hipDeviceSynchronize(), hipSuccess);
-                fused_q->mark_device_dirty();
-                fused_k->mark_device_dirty();
-                fused_v->mark_device_dirty();
+                fused_q->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+                fused_k->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+                fused_v->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
 
                 const float q_cos = cosineSim(fused_q->data(), separate_q->data(), static_cast<size_t>(M) * Nq);
                 const float k_cos = cosineSim(fused_k->data(), separate_k->data(), static_cast<size_t>(M) * Nk);
@@ -4738,8 +4738,8 @@ namespace llaminar2
                 ASSERT_TRUE(up_kernel.multiply_tensor(input.get(), separate_up.get(), M, N, K,
                                                       true, 1.0f, 0.0f, bias_up.get()));
                 ASSERT_EQ(hipDeviceSynchronize(), hipSuccess);
-                separate_gate->mark_device_dirty();
-                separate_up->mark_device_dirty();
+                separate_gate->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+                separate_up->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
 
                 std::vector<ITensorGemm::TensorProjectionDesc> projections;
                 projections.emplace_back(&gate_kernel, fused_gate.get(), N, bias_gate.get(), "gate_q8_blockwise");
@@ -4747,8 +4747,8 @@ namespace llaminar2
 
                 ASSERT_TRUE(gate_kernel.multiply_fused_tensor(input.get(), projections, M, K));
                 ASSERT_EQ(hipDeviceSynchronize(), hipSuccess);
-                fused_gate->mark_device_dirty();
-                fused_up->mark_device_dirty();
+                fused_gate->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+                fused_up->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
 
                 const float gate_cos = cosineSim(fused_gate->data(), separate_gate->data(), static_cast<size_t>(M) * N);
                 const float up_cos = cosineSim(fused_up->data(), separate_up->data(), static_cast<size_t>(M) * N);
@@ -4814,8 +4814,8 @@ namespace llaminar2
                 ASSERT_TRUE(kernel1.multiply_tensor(input.get(), separate1.get(), M, N, K,
                                                     true, 1.0f, 0.0f, bias1.get()));
                 ASSERT_EQ(hipDeviceSynchronize(), hipSuccess);
-                separate0->mark_device_dirty();
-                separate1->mark_device_dirty();
+                separate0->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+                separate1->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
 
                 std::vector<ITensorGemm::TensorProjectionDesc> projections;
                 projections.emplace_back(&kernel0, fused0.get(), N, bias0.get(), "proj0_q8_blockwise_gridkpar");
@@ -4823,8 +4823,8 @@ namespace llaminar2
 
                 ASSERT_TRUE(kernel0.multiply_fused_tensor(input.get(), projections, M, K));
                 ASSERT_EQ(hipDeviceSynchronize(), hipSuccess);
-                fused0->mark_device_dirty();
-                fused1->mark_device_dirty();
+                fused0->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+                fused1->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
 
                 const float cos0 = cosineSim(fused0->data(), separate0->data(), static_cast<size_t>(M) * N);
                 const float cos1 = cosineSim(fused1->data(), separate1->data(), static_cast<size_t>(M) * N);
@@ -4908,14 +4908,14 @@ namespace llaminar2
 
                     ASSERT_TRUE(kernel.multiply_tensor(input.get(), output_separate.get(), M, N, K)) << test_case.name;
                     (void)hipDeviceSynchronize();
-                    output_separate->mark_device_dirty();
+                    output_separate->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
 
                     std::vector<ITensorGemm::TensorProjectionDesc> projections;
                     projections.emplace_back(&kernel, output_fused.get(), N, nullptr, test_case.name);
 
                     ASSERT_TRUE(kernel.multiply_fused_tensor(input.get(), projections, M, K)) << test_case.name;
                     (void)hipDeviceSynchronize();
-                    output_fused->mark_device_dirty();
+                    output_fused->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
 
                     const float *separate = output_separate->data();
                     const float *fused = output_fused->data();

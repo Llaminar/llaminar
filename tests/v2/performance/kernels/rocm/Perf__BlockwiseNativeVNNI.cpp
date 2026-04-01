@@ -299,7 +299,7 @@ namespace
         {
             kernel.multiply_tensor(input, output, M, N, K);
             (void)hipDeviceSynchronize();
-            output->mark_device_dirty();
+            output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
 
             if (!gpu_weights.d_weights)
                 return 0.0f;

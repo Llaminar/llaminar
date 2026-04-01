@@ -217,7 +217,7 @@ TEST_F(Test__PCIeBAR_CUDA_EventLifecycle, SimulateHeterogeneousScenario)
     ASSERT_TRUE(tensor->ensureOnDevice(cuda_device)) << "Failed to allocate tensor on CUDA";
 
     // Mark device dirty with event - this is what mark_device_dirty_with_event does
-    tensor->mark_device_dirty();
+    tensor->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
 
     // Now simulate what happens when ROCm executor needs this tensor's data:
     // It calls ensureOnHost() which waits for the CUDA event

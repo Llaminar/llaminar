@@ -5,7 +5,7 @@
  * @date January 2026
  *
  * Provides infrastructure for automatic tensor coherence at stage entry/exit.
- * This eliminates manual ensureOnDevice()/mark_device_dirty() calls in stages.
+ * This eliminates manual ensureOnDevice()/transitionTo() calls in stages.
  *
  * The coherence system operates at stage boundaries:
  * - ENTRY: Ensures all input tensors are on the target device before execution
@@ -101,7 +101,7 @@ namespace llaminar2
     /**
      * @brief Mark all output tensors as device-dirty
      *
-     * Calls mark_device_dirty() on each output tensor that supports coherence.
+     * Calls transitionTo(DEVICE_AUTHORITATIVE) on each output tensor that supports coherence.
      * This indicates that the GPU copy is now authoritative and host is stale.
      *
      * @param outputs Vector of output buffers with tensor pointers

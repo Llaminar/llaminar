@@ -351,7 +351,7 @@ namespace
         // =========================================================================
         // Helper: Create forward input
         // =========================================================================
-        Qwen2ForwardInput createForwardInput(int batch_size = 1, int seq_len = 4)
+        ForwardInput createForwardInput(int batch_size = 1, int seq_len = 4)
         {
             // Token IDs (valid tokens from model vocabulary)
             token_ids_.resize(batch_size * seq_len);
@@ -370,7 +370,7 @@ namespace
                 }
             }
 
-            Qwen2ForwardInput input;
+            ForwardInput input;
             input.token_ids = token_ids_.data();
             input.position_ids = position_ids_.data();
             input.batch_size = batch_size;
@@ -513,7 +513,7 @@ namespace
         auto input = createForwardInput(1, seq_len);
 
         // Build unified PP graph
-        Qwen2ForwardOutput output;
+        ForwardOutput output;
         ComputeGraph compute_graph = graph_builder.buildUnifiedPipelineGraph(input, output);
 
         // Verify graph was built
@@ -565,7 +565,7 @@ namespace
         auto input = createForwardInput(1, seq_len);
 
         // Build and execute
-        Qwen2ForwardOutput output;
+        ForwardOutput output;
         ComputeGraph compute_graph = graph_builder.buildUnifiedPipelineGraph(input, output);
 
         std::unordered_map<DeviceId, IDeviceContext *> contexts;
@@ -611,7 +611,7 @@ namespace
         auto input = createForwardInput(1, seq_len);
 
         // Build and execute
-        Qwen2ForwardOutput output;
+        ForwardOutput output;
         ComputeGraph compute_graph = graph_builder.buildUnifiedPipelineGraph(input, output);
 
         std::unordered_map<DeviceId, IDeviceContext *> contexts;
@@ -666,7 +666,7 @@ namespace
         auto input = createForwardInput(1, seq_len);
 
         // Build and execute
-        Qwen2ForwardOutput output;
+        ForwardOutput output;
         ComputeGraph compute_graph = graph_builder.buildUnifiedPipelineGraph(input, output);
 
         std::unordered_map<DeviceId, IDeviceContext *> contexts;
@@ -716,7 +716,7 @@ namespace
         auto input = createForwardInput(1, seq_len);
 
         // Build and execute
-        Qwen2ForwardOutput output;
+        ForwardOutput output;
         ComputeGraph compute_graph = graph_builder.buildUnifiedPipelineGraph(input, output);
 
         std::unordered_map<DeviceId, IDeviceContext *> contexts;
@@ -767,7 +767,7 @@ namespace
         auto input = createForwardInput(1, seq_len);
 
         // Build and execute
-        Qwen2ForwardOutput output;
+        ForwardOutput output;
         ComputeGraph compute_graph = graph_builder.buildUnifiedPipelineGraph(input, output);
 
         std::unordered_map<DeviceId, IDeviceContext *> contexts;
@@ -819,7 +819,7 @@ namespace
         auto input = createForwardInput(1, seq_len);
 
         // Build graph
-        Qwen2ForwardOutput output;
+        ForwardOutput output;
         ComputeGraph compute_graph = graph_builder.buildUnifiedPipelineGraph(input, output);
 
         // Count stages before execution
@@ -870,7 +870,7 @@ namespace
         auto input = createForwardInput(1, seq_len);
 
         // Build graph
-        Qwen2ForwardOutput output;
+        ForwardOutput output;
         ComputeGraph compute_graph = graph_builder.buildUnifiedPipelineGraph(input, output);
 
         // Verify embedding stage exists
@@ -917,7 +917,7 @@ namespace
         auto input = createForwardInput(1, seq_len);
 
         // Build graph
-        Qwen2ForwardOutput output;
+        ForwardOutput output;
         ComputeGraph compute_graph = graph_builder.buildUnifiedPipelineGraph(input, output);
 
         // Get execution order

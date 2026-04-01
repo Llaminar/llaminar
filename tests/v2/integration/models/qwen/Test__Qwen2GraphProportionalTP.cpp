@@ -289,7 +289,7 @@ TEST_F(Test__Qwen2GraphProportionalTP, OrchestratorAcceptsTPConfig)
     config.local_rank = 0;
 
     // Create orchestrator with config
-    DeviceGraphOrchestrator orchestrator(config, nullptr);
+    DeviceGraphOrchestrator orchestrator(std::make_shared<Qwen2Graph>(config, nullptr), nullptr);
 
     // Set TensorParallelConfig on orchestrator
     orchestrator.setTensorParallelConfig(tp_config);

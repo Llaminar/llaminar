@@ -838,7 +838,7 @@ namespace llaminar2
         // =========================================================================
         // If any stage needs BAR-backed hidden state, we must initialize the
         // DirectP2PEngine's BAR mapping NOW, before creating device runners.
-        // Otherwise, when DeviceGraphOrchestrator calls initializeInferenceState(),
+        // Otherwise, when DeviceGraphOrchestrator calls initializeInferenceStateFromArena(),
         // isPCIeBarActive() will return false and it will fall back to standard
         // allocation (which will fail during cross-vendor transfer).
         // =========================================================================
@@ -1804,7 +1804,7 @@ namespace llaminar2
         // PP device coherence: After PP transfer in the previous iteration, the
         // hidden state tensor's gpu_device_ may point to the *destination* device
         // (e.g., ROCm:1) instead of this stage's device (ROCm:0). Promote the
-        // secondary buffer back to primary so kernels and mark_device_dirty_with_event
+        // secondary buffer back to primary so kernels and transitionToWithEvent
         // operate on the correct device.
         if (pp_ctx_ && num_stages > 1)
         {

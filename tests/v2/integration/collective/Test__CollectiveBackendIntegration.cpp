@@ -577,7 +577,7 @@ TEST_F(Test__CollectiveNVIDIA, AllReduceSumViaNCCL)
     // Upload to GPU
     ASSERT_TRUE(tensor->ensureOnDevice(cuda_dev_))
         << "Failed to upload tensor to CUDA device";
-    tensor->mark_device_dirty();
+    tensor->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
 
     // Execute AllReduce
     bool success = ctx->executeAllreduce(
@@ -589,7 +589,7 @@ TEST_F(Test__CollectiveNVIDIA, AllReduceSumViaNCCL)
     ASSERT_TRUE(success) << "NCCL AllReduce failed";
 
     // Mark device dirty after GPU collective
-    tensor->mark_device_dirty();
+    tensor->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
 
     // Download result
     ASSERT_TRUE(tensor->ensureOnHost()) << "Failed to download result";
@@ -693,7 +693,7 @@ TEST_F(Test__CollectiveAMD, AllReduceSumViaRCCL)
     // Upload to GPU
     ASSERT_TRUE(tensor->ensureOnDevice(rocm_dev_))
         << "Failed to upload tensor to ROCm device";
-    tensor->mark_device_dirty();
+    tensor->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
 
     // Execute AllReduce
     bool success = ctx->executeAllreduce(
@@ -705,7 +705,7 @@ TEST_F(Test__CollectiveAMD, AllReduceSumViaRCCL)
     ASSERT_TRUE(success) << "RCCL AllReduce failed";
 
     // Mark device dirty after GPU collective
-    tensor->mark_device_dirty();
+    tensor->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
 
     // Download result
     ASSERT_TRUE(tensor->ensureOnHost()) << "Failed to download result";

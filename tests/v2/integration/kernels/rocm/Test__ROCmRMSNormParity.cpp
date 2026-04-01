@@ -660,7 +660,7 @@ TEST_F(Test__ROCmRMSNormParity, RMSNorm_FP32_ApplyTensor)
         rows, cols, epsilon, nullptr, 0));
 
     hipDeviceSynchronize();
-    rocm_output->mark_device_dirty();
+    rocm_output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
     const float *result = rocm_output->data();
 
     ASSERT_FALSE(hasNaNOrInf(result, total)) << "ROCm output contains NaN/Inf";
@@ -742,7 +742,7 @@ TEST_F(Test__ROCmRMSNormParity, RMSNorm_FP32_RealQwen2Layer21InputParity)
         rows, cols, epsilon, nullptr, 0));
 
     hipDeviceSynchronize();
-    rocm_output->mark_device_dirty();
+    rocm_output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
     const float *result = rocm_output->data();
 
     ASSERT_FALSE(hasNaNOrInf(result, total)) << "ROCm output contains NaN/Inf";
@@ -826,7 +826,7 @@ TEST_F(Test__ROCmRMSNormParity, RMSNorm_FP32_RealQwen2Layer3InputParity)
         rows, cols, epsilon, nullptr, 0));
 
     hipDeviceSynchronize();
-    rocm_output->mark_device_dirty();
+    rocm_output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
     const float *result = rocm_output->data();
 
     ASSERT_FALSE(hasNaNOrInf(result, total)) << "ROCm output contains NaN/Inf";

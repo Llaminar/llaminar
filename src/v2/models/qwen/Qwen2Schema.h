@@ -47,6 +47,9 @@ namespace llaminar2
         constexpr const char *Q = "Q";
         constexpr const char *K = "K";
         constexpr const char *V = "V";
+        constexpr const char *Q_ROPE = "Q_rope";
+        constexpr const char *K_ROPE = "K_rope";
+        constexpr const char *V_DEQUANT = "V_dequant";
         constexpr const char *ATTN_OUTPUT = "attn_output";
         constexpr const char *ATTN_PROJ = "attn_proj";
         constexpr const char *WORKSPACE_SCORES = "workspace_scores";
@@ -324,21 +327,60 @@ namespace llaminar2
             // - "ffn_scratch": gate, up (same size, either can be primary)
             //
             schema.layer_buffers = {
-                // Normalized output (reused each layer)
+                // Normalized output (reused each layer, always FP32 as RMSNorm→GEMM input)
                 {"normalized", {"seq_len", "d_model"}, "fp32", BufferSemantic::Scratch, "", 0, "RMSNorm output, consumed by projections"},
 
-                // Attention scratch buffers (can alias with FFN scratch)
-                {"Q", {"seq_len", "local_qkv_dim"}, "fp32", BufferSemantic::Scratch, "attn_scratch", 10, "Query projection output"},
-                {"K", {"seq_len", "local_kv_dim"}, "fp32", BufferSemantic::Scratch, "attn_scratch", 5, "Key projection output (GQA: smaller than Q)"},
-                {"V", {"seq_len", "local_kv_dim"}, "fp32", BufferSemantic::Scratch, "attn_scratch", 5, "Value projection output (GQA: smaller than Q)"},
+                // Residual stream (accumulates across layers)
+                BufferSpec{"residual", {"seq_len", "d_model"}, "fp32", BufferSemantic::InOut, "", 0, "Residual stream buffer"}
+                    .withDtypeOverride("HybridQ16", "q16_1"),
+
+                // ── Attention scratch buffers ──
+                BufferSpec{"Q", {"seq_len", "local_qkv_dim"}, "fp32", BufferSemantic::Scratch, "attn_scratch", 10, "Query projection output"}
+                    .withDtypeOverride("Hybrid", "q8_1")
+                    .withDtypeOverride("HybridQ16", "q8_1"),
+                BufferSpec{"K", {"seq_len", "local_kv_dim"}, "fp32", BufferSemantic::Scratch, "attn_scratch", 5, "Key projection output (GQA: smaller than Q)"}
+                    .withDtypeOverride("Hybrid", "q8_1")
+                    .withDtypeOverride("HybridQ16", "q16_1"),
+                BufferSpec{"V", {"seq_len", "local_kv_dim"}, "fp32", BufferSemantic::Scratch, "attn_scratch", 5, "Value projection output (GQA: smaller than Q)"}
+                    .withDtypeOverride("Hybrid", "q8_1")
+                    .withDtypeOverride("HybridQ16", "q8_1"),
                 {"attn_output", {"seq_len", "local_qkv_dim"}, "fp32", BufferSemantic::Scratch, "attn_scratch", 10, "Attention context output"},
 
                 // Attention projection (d_model sized, persists to residual)
-                {"attn_proj", {"seq_len", "d_model"}, "fp32", BufferSemantic::Scratch, "", 0, "Wo projection output, fed to residual"},
+                BufferSpec{"attn_proj", {"seq_len", "d_model"}, "fp32", BufferSemantic::Scratch, "", 0, "Wo projection output, fed to residual"}
+                    .withDtypeOverride("HybridQ16", "q8_1"),
 
-                // FFN scratch buffers (can alias with attention scratch)
-                {"gate", {"seq_len", "local_d_ff"}, "fp32", BufferSemantic::Scratch, "ffn_scratch", 10, "Gate projection for SwiGLU"},
-                {"up", {"seq_len", "local_d_ff"}, "fp32", BufferSemantic::Scratch, "ffn_scratch", 10, "Up projection for SwiGLU"},
+                // ── Hybrid/HybridQ16 conditional buffers ──
+                // These only exist when activation precision uses quantized intermediates
+                BufferSpec{"Q_rope", {"seq_len", "local_qkv_dim"}, "fp32", BufferSemantic::Scratch, "", 0, "Q after RoPE (avoids requantization)"}
+                    .whenPrecision("Hybrid")
+                    .whenPrecision("HybridQ16")
+                    .withDtypeOverride("HybridQ16", "q16_1"),
+                BufferSpec{"K_rope", {"seq_len", "local_kv_dim"}, "fp32", BufferSemantic::Scratch, "", 0, "K after RoPE (avoids requantization)"}
+                    .whenPrecision("Hybrid")
+                    .whenPrecision("HybridQ16")
+                    .withDtypeOverride("HybridQ16", "q16_1"),
+                BufferSpec{"V_dequant", {"seq_len", "local_kv_dim"}, "fp32", BufferSemantic::Scratch, "", 0, "V converted to KV cache precision before append"}
+                    .whenPrecision("Hybrid")
+                    .whenPrecision("HybridQ16")
+                    .withDtypeOverride("HybridQ16", "q16_1"),
+
+                // ── FFN scratch buffers ──
+                BufferSpec{"gate", {"seq_len", "local_d_ff"}, "fp32", BufferSemantic::Scratch, "ffn_scratch", 10, "Gate projection for SwiGLU"}
+                    .withDtypeOverride("Hybrid", "q8_1")
+                    .withDtypeOverride("HybridQ16", "q8_1"),
+                BufferSpec{"up", {"seq_len", "local_d_ff"}, "fp32", BufferSemantic::Scratch, "ffn_scratch", 10, "Up projection for SwiGLU"}
+                    .withDtypeOverride("Hybrid", "q8_1")
+                    .withDtypeOverride("HybridQ16", "q8_1"),
+
+                // FFN output (Down projection result, fed to residual)
+                BufferSpec{"ffn_output", {"seq_len", "d_model"}, "fp32", BufferSemantic::Scratch, "", 0, "FFN Down projection output"}
+                    .withDtypeOverride("HybridQ16", "q8_1"),
+
+                // ── Workspace buffers for attention computation (always FP32) ──
+                {"workspace_scores", {"batch_size * local_n_heads * seq_len", "seq_len"}, "fp32", BufferSemantic::Scratch, "attn_workspace", 10, "Attention scores [B*Nh*S, S]"},
+                {"workspace_context", {"batch_size * local_n_heads * seq_len", "head_dim"}, "fp32", BufferSemantic::Scratch, "attn_workspace", 5, "Attention context [B*Nh*S, Hd]"},
+                {"workspace_mask", {"batch_size * seq_len", "seq_len"}, "fp32", BufferSemantic::Scratch, "attn_workspace", 5, "Attention mask [B*S, S]"},
             };
 
             schema.model_buffers = {
@@ -365,7 +407,12 @@ namespace llaminar2
                     .name = "ffn_scratch",
                     .buffer_names = {"gate", "up"},
                     .description = "FFN scratch buffers - consumed within FFN phase",
-                    .estimated_savings_percent = 15.0f}};
+                    .estimated_savings_percent = 15.0f},
+                AliasGroupSpec{
+                    .name = "attn_workspace",
+                    .buffer_names = {"workspace_scores", "workspace_context", "workspace_mask"},
+                    .description = "Attention workspace buffers - only live during attention computation",
+                    .estimated_savings_percent = 5.0f}};
 
             return schema;
         }

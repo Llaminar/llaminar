@@ -630,7 +630,7 @@ TEST_F(Test__ROCmSwiGLUParity, SwiGLU_FP32_ApplyTensor)
         rows, cols, false, nullptr, 0));
 
     hipDeviceSynchronize();
-    rocm_output->mark_device_dirty();
+    rocm_output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
     const float *result = rocm_output->data();
 
     ASSERT_FALSE(hasNaNOrInf(result, total));

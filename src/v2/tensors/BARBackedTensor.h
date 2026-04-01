@@ -111,11 +111,11 @@
  * |-----------|----------|
  * | `ensureOnDevice(cuda)` | No-op (CUDA pointer always valid) |
  * | `ensureOnDevice(rocm)` | No-op (ROCm pointer is local VRAM access) |
- * | `mark_device_dirty()` | Sets dirty flag, NO copy needed |
+ * | `transitionTo(MAPPED)` | Sets coherence state, NO copy needed |
  * | `ensureOnHost()` | Synchronize (event or full sync), then access via mmap |
  * | `data()` | Returns mmap'd host pointer (slow, uncached access) |
  *
- * **Key insight:** Unlike normal tensors, `mark_device_dirty()` does NOT
+ * **Key insight:** Unlike normal tensors, `transitionTo(MAPPED)` does NOT
  * invalidate other views. Both CUDA and ROCm see the same physical memory.
  *
  * ### 3.3 When to Use BAR-Backed Tensors

@@ -69,7 +69,7 @@ TEST_F(Test__TensorBase_AuthoritativeDevice, InitialState_NotDeviceAuthoritative
 }
 
 // =============================================================================
-// mark_device_dirty() Tests
+// transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE) Tests
 // =============================================================================
 
 TEST_F(Test__TensorBase_AuthoritativeDevice, MarkDeviceDirty_SetsAuthoritative_CUDA) {
@@ -84,7 +84,7 @@ TEST_F(Test__TensorBase_AuthoritativeDevice, MarkDeviceDirty_SetsAuthoritative_C
     EXPECT_TRUE(tensor_->isHostAuthoritative());
     
     // Mark device dirty
-    tensor_->mark_device_dirty();
+    tensor_->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
     
     // Now device should be authoritative
     EXPECT_FALSE(tensor_->isHostAuthoritative());
@@ -104,7 +104,7 @@ TEST_F(Test__TensorBase_AuthoritativeDevice, MarkDeviceDirty_SetsAuthoritative_R
     EXPECT_TRUE(tensor_->isHostAuthoritative());
     
     // Mark device dirty
-    tensor_->mark_device_dirty();
+    tensor_->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
     
     // Now device should be authoritative
     EXPECT_FALSE(tensor_->isHostAuthoritative());
@@ -123,7 +123,7 @@ TEST_F(Test__TensorBase_AuthoritativeDevice, EnsureOnHost_ClearsAuthoritative_CU
     
     // Upload and mark dirty
     ASSERT_TRUE(tensor_->ensureOnDevice(cuda_device_));
-    tensor_->mark_device_dirty();
+    tensor_->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
     ASSERT_TRUE(tensor_->isDeviceAuthoritative(cuda_device_));
     
     // Sync back to host
@@ -141,7 +141,7 @@ TEST_F(Test__TensorBase_AuthoritativeDevice, EnsureOnHost_ClearsAuthoritative_RO
     
     // Upload and mark dirty
     ASSERT_TRUE(tensor_->ensureOnDevice(rocm_device_));
-    tensor_->mark_device_dirty();
+    tensor_->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
     ASSERT_TRUE(tensor_->isDeviceAuthoritative(rocm_device_));
     
     // Sync back to host
@@ -189,7 +189,7 @@ TEST_F(Test__TensorBase_AuthoritativeDevice, CrossVendor_AuthoritativeTracking) 
     EXPECT_TRUE(tensor_->isHostAuthoritative());  // Still host
     
     // Mark CUDA dirty
-    tensor_->mark_device_dirty();
+    tensor_->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
     EXPECT_TRUE(tensor_->isDeviceAuthoritative(cuda_device_));
     EXPECT_FALSE(tensor_->isDeviceAuthoritative(rocm_device_));
     
@@ -202,7 +202,7 @@ TEST_F(Test__TensorBase_AuthoritativeDevice, CrossVendor_AuthoritativeTracking) 
     EXPECT_TRUE(tensor_->isHostAuthoritative());  // Still host
     
     // Mark ROCm dirty
-    tensor_->mark_device_dirty();
+    tensor_->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
     EXPECT_TRUE(tensor_->isDeviceAuthoritative(rocm_device_));
     EXPECT_FALSE(tensor_->isDeviceAuthoritative(cuda_device_));
 }
@@ -218,7 +218,7 @@ TEST_F(Test__TensorBase_AuthoritativeDevice, IsDeviceAuthoritative_WrongDevice_R
     
     // Upload and mark dirty on CUDA:0
     ASSERT_TRUE(tensor_->ensureOnDevice(cuda_device_));
-    tensor_->mark_device_dirty();
+    tensor_->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
     
     // Check for different device
     DeviceId other_cuda = DeviceId::cuda(99);  // Non-existent
@@ -233,11 +233,11 @@ TEST_F(Test__TensorBase_AuthoritativeDevice, MultipleMarkDirty_LastWins) {
     
     // Upload to CUDA
     ASSERT_TRUE(tensor_->ensureOnDevice(cuda_device_));
-    tensor_->mark_device_dirty();
+    tensor_->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
     EXPECT_TRUE(tensor_->isDeviceAuthoritative(cuda_device_));
     
     // Mark dirty again (should still be same device)
-    tensor_->mark_device_dirty();
+    tensor_->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
     EXPECT_TRUE(tensor_->isDeviceAuthoritative(cuda_device_));
 }
 

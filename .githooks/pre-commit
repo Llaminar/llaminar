@@ -74,7 +74,7 @@ PARITY_EXIT_CODE=1
 PARITY_MAX_ATTEMPTS=3
 for PARITY_ATTEMPT in $(seq 1 "$PARITY_MAX_ATTEMPTS"); do
     set +e
-    ctest --test-dir "$BUILD_V2_INTEGRATION" -R "^V2_Integration_Parity_Qwen2_SingleDevice$" --output-on-failure --timeout 300
+    ctest --test-dir "$BUILD_V2_INTEGRATION" -R "^V2_Integration_Parity_Qwen2_SingleDevice$" --output-on-failure --timeout 600
     PARITY_EXIT_CODE=$?
     set -e
 

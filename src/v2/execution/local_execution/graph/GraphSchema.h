@@ -226,6 +226,15 @@ namespace llaminar2
      *
      * Dimensions can reference config values via string formulas.
      * Examples: "seq_len", "d_model", "n_heads * head_dim"
+     *
+     * Supports precision-conditional dtype resolution via `dtype_overrides`:
+     * when the resolver's activation_precision matches a key in the map,
+     * that dtype is used instead of the default. Builder methods provide
+     * a fluent API for specifying overrides and conditions.
+     *
+     * Supports conditional buffer inclusion via `conditions`: if non-empty,
+     * the buffer is only resolved when activation_precision matches one of
+     * the listed values. Empty conditions = always included.
      */
     struct BufferSpec
     {
@@ -249,6 +258,22 @@ namespace llaminar2
         /// Human-readable description (for documentation/debugging)
         std::string description;
 
+        // =================================================================
+        // Precision-Conditional Type Resolution
+        // =================================================================
+
+        /// Map: activation precision name → dtype string.
+        /// When the resolver's activation_precision matches a key here,
+        /// the overridden dtype is used instead of the default.
+        /// Example: {{"HybridQ16", "q16_1"}} means use Q16_1 in HybridQ16 mode.
+        std::unordered_map<std::string, std::string> dtype_overrides;
+
+        /// Conditions for buffer inclusion (activation precision names).
+        /// If non-empty, this buffer is only resolved when the activation
+        /// precision matches one of the listed values.
+        /// Empty = always included.
+        std::vector<std::string> conditions;
+
         // Convenience constructors
         BufferSpec() = default;
         BufferSpec(std::string n, std::vector<std::string> s, std::string dt, BufferSemantic sem)
@@ -257,6 +282,24 @@ namespace llaminar2
                    std::string alias, int priority = 0, std::string desc = "")
             : name(std::move(n)), shape(std::move(s)), dtype(std::move(dt)), semantic(sem),
               alias_group(std::move(alias)), alias_priority(priority), description(std::move(desc)) {}
+
+        // =================================================================
+        // Builder Methods (fluent API for precision-conditional specs)
+        // =================================================================
+
+        /// Add a dtype override for a specific activation precision mode.
+        BufferSpec &withDtypeOverride(const std::string &precision, const std::string &override_dtype)
+        {
+            dtype_overrides[precision] = override_dtype;
+            return *this;
+        }
+
+        /// Add a condition — buffer only included when precision matches.
+        BufferSpec &whenPrecision(const std::string &precision)
+        {
+            conditions.push_back(precision);
+            return *this;
+        }
     };
 
     /**

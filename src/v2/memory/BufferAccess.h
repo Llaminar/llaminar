@@ -4,7 +4,7 @@
  *
  * BufferView provides typed, access-controlled views into device-ready memory.
  * Stages receive BufferView handles from StageBoundBuffers — they cannot
- * call data(), ensureOnDevice(), or mark_device_dirty() because BufferView
+ * call data(), ensureOnDevice(), or transitionTo() because BufferView
  * simply doesn't expose those methods.
  */
 

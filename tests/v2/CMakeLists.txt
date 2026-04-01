@@ -5298,6 +5298,17 @@ add_v2_test(V2_Unit_DeviceGraphOrchestratorPPTPInit
     MPI_PROCS 1
 )
 
+# Test: DeviceGraphOrchestrator Dependencies struct construction
+# Validates the Phase 5 preferred constructor path using MockGraphBuilder
+# (polymorphic IGraphBuilder, not Qwen2Graph) and all Dependencies fields.
+add_executable(v2_test_device_graph_orchestrator_deps_construction unit/execution/local_execution/orchestrators/Test__DeviceGraphOrchestratorDepsConstruction.cpp)
+target_link_libraries(v2_test_device_graph_orchestrator_deps_construction llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_DeviceGraphOrchestratorDepsConstruction
+    COMMAND $<TARGET_FILE:v2_test_device_graph_orchestrator_deps_construction>
+    LABELS "V2;Unit;DeviceGraphOrchestrator;Dependencies;IGraphBuilder;DecouplingPhase5"
+    MPI_PROCS 1
+)
+
 # Test: GraphResolver (declarative schema resolution for multi-model support)
 # Tests the three-layer architecture: GraphSchema -> GraphResolver -> ComputeGraph
 # Part of Phase 4: Schema-based graph building for model scalability
@@ -8571,6 +8582,53 @@ add_v2_test(V2_Unit_GPUGraphCapture
     MPI_PROCS 1
 )
 message(STATUS "V2 Tests: Added GPUGraphCapture unit tests")
+
+# =============================================================================
+# Unit: SnapshotCapture (Phase 2 DGO refactor extraction)
+# =============================================================================
+
+add_executable(v2_test_snapshot_capture unit/snapshots/Test__SnapshotCapture.cpp)
+target_link_libraries(v2_test_snapshot_capture llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_SnapshotCapture
+    COMMAND $<TARGET_FILE:v2_test_snapshot_capture>
+    LABELS "V2;Unit;Snapshot;SnapshotCapture;DGORefactor"
+    MPI_PROCS 1
+)
+
+# =============================================================================
+# Unit: ForwardGraphTypes (Phase 3 DGO refactor extraction)
+# =============================================================================
+
+add_executable(v2_test_forward_graph_types unit/execution/local_execution/engine/Test__ForwardGraphTypes.cpp)
+target_link_libraries(v2_test_forward_graph_types llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_ForwardGraphTypes
+    COMMAND $<TARGET_FILE:v2_test_forward_graph_types>
+    LABELS "V2;Unit;Execution;ForwardGraph;DGORefactor"
+    MPI_PROCS 1
+)
+
+# =============================================================================
+# Unit: ForwardExecutionEngine (Phase 3 DGO refactor extraction)
+# =============================================================================
+
+add_executable(v2_test_forward_execution_engine unit/execution/local_execution/engine/Test__ForwardExecutionEngine.cpp)
+target_link_libraries(v2_test_forward_execution_engine llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_ForwardExecutionEngine
+    COMMAND $<TARGET_FILE:v2_test_forward_execution_engine>
+    LABELS "V2;Unit;Execution;ForwardExecutionEngine;DGORefactor"
+    MPI_PROCS 1
+)
+
+# Unit: ForwardExecutionEngine Advanced (host callbacks, phase transitions, PP/TP handoff)
+# =============================================================================
+
+add_executable(v2_test_forward_execution_engine_advanced unit/execution/local_execution/engine/Test__ForwardExecutionEngineAdvanced.cpp)
+target_link_libraries(v2_test_forward_execution_engine_advanced llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_ForwardExecutionEngineAdvanced
+    COMMAND $<TARGET_FILE:v2_test_forward_execution_engine_advanced>
+    LABELS "V2;Unit;Execution;ForwardExecutionEngine;HostCallbacks;PhaseTransitions;PPHandoff"
+    MPI_PROCS 1
+)
 
 # Test: GPUGraphCaptureExecution - Integration test for GPU graph capture in DeviceGraphExecutor
 add_executable(v2_test_gpu_graph_capture_execution integration/execution/graph/Test__GPUGraphCaptureExecution.cpp)

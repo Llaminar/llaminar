@@ -28,12 +28,10 @@
 
 #pragma once
 
+#include "ComputeGraph.h"
 #include "IGraphExecutor.h"
-#include "../../compute_stages/ComputeStages.h"
 #include "../device/DeviceContext.h"
-#include "../../mpi_orchestration/WorkDistributor.h"
 #include "StageTimeline.h"
-#include "../../../backends/DeviceId.h"
 #include "../../../utils/DebugEnv.h" // For LLAMINAR_ASSERTIONS_ACTIVE
 #include "../../../interfaces/ICollectiveContext.h"
 #include "../../../backends/IGPUGraphCapture.h"
@@ -52,184 +50,6 @@ namespace llaminar2
 
     // Forward declarations
     class TensorBase;
-
-    /**
-     * @brief Represents a node in the compute graph
-     */
-    struct ComputeNode
-    {
-        std::string name;                      ///< Node identifier
-        std::unique_ptr<IComputeStage> stage;  ///< The compute stage
-        std::vector<std::string> dependencies; ///< Names of nodes this depends on
-        DeviceId device;                       ///< Target device for execution
-        bool completed;                        ///< Execution complete flag
-
-        // =====================================================================
-        // Coherence fast-path flags (mutable for use in const execution context)
-        // Once weights are on-device and outputs are allocated, subsequent
-        // iterations can skip the entire coherence check + vector extraction.
-        // =====================================================================
-        mutable bool weights_cohered = false; ///< Weights confirmed on device
-        mutable bool is_final_output = false; ///< Outputs will be read by CPU (needs event sync)
-
-        ComputeNode() : device(DeviceId::cpu()), completed(false) {}
-        ComputeNode(std::string n, std::unique_ptr<IComputeStage> s, DeviceId dev = DeviceId::cpu())
-            : name(std::move(n)), stage(std::move(s)), device(dev), completed(false) {}
-    };
-
-    /**
-     * @brief Compute graph for execution
-     *
-     * A directed acyclic graph (DAG) of ComputeNodes with dependency tracking.
-     * Enables parallel execution of independent nodes and proper ordering of
-     * dependent operations.
-     */
-    class ComputeGraph
-    {
-    public:
-        ComputeGraph() = default;
-        ~ComputeGraph() = default;
-
-        // Non-copyable
-        ComputeGraph(const ComputeGraph &) = delete;
-        ComputeGraph &operator=(const ComputeGraph &) = delete;
-
-        // Movable
-        ComputeGraph(ComputeGraph &&) = default;
-        ComputeGraph &operator=(ComputeGraph &&) = default;
-
-        /**
-         * @brief Add a node to the graph
-         * @param name Unique node identifier
-         * @param stage The compute stage to execute
-         * @param device Target device (DeviceId::cpu() for auto/CPU)
-         * @return Reference to this graph for chaining
-         */
-        ComputeGraph &addNode(const std::string &name,
-                              std::unique_ptr<IComputeStage> stage,
-                              DeviceId device = DeviceId::cpu());
-
-        /**
-         * @brief Add a dependency between nodes
-         * @param node_name The dependent node
-         * @param depends_on The node that must complete first
-         * @return Reference to this graph for chaining
-         */
-        ComputeGraph &addDependency(const std::string &node_name,
-                                    const std::string &depends_on);
-
-        /**
-         * @brief Get execution order respecting dependencies
-         * @return Reference to cached vector of node names in valid execution order
-         *
-         * The execution order is computed via topological sort on the first call
-         * and cached until the graph is modified (addNode, addDependency, merge, clear).
-         */
-        const std::vector<std::string> &getExecutionOrder() const;
-
-        /**
-         * @brief Get nodes that can execute in parallel (no unmet dependencies)
-         * @return Vector of names of ready nodes
-         */
-        std::vector<std::string> getReadyNodes() const;
-
-        /**
-         * @brief Get a node by name
-         * @param name Node identifier
-         * @return Pointer to node (nullptr if not found)
-         */
-        ComputeNode *getNode(const std::string &name);
-        const ComputeNode *getNode(const std::string &name) const;
-
-        /**
-         * @brief Mark a node as completed
-         * @param name Node identifier
-         */
-        void markCompleted(const std::string &name);
-
-        /**
-         * @brief Reset all completion flags
-         */
-        void reset();
-
-        /**
-         * @brief Check if all nodes are completed
-         */
-        bool allCompleted() const;
-
-        /**
-         * @brief Get number of nodes
-         */
-        size_t size() const { return nodes_.size(); }
-
-        /**
-         * @brief Get total estimated FLOPs for all stages
-         */
-        size_t totalEstimatedFlops() const;
-
-        /**
-         * @brief Clear the graph
-         */
-        void clear();
-
-        /**
-         * @brief Merge another graph into this one
-         *
-         * Moves all nodes from the source graph into this graph.
-         * If connect_from is specified, adds dependencies from nodes in the source
-         * graph that have no dependencies to the connect_from node in this graph.
-         *
-         * @param other The graph to merge (will be emptied)
-         * @param connect_from Optional node name to connect source graph roots to
-         * @return Reference to this graph for chaining
-         */
-        ComputeGraph &merge(ComputeGraph &&other, const std::string &connect_from = "");
-
-        /**
-         * @brief Get the names of all root nodes (nodes with no dependencies)
-         * @return Vector of root node names
-         */
-        std::vector<std::string> getRootNodes() const;
-
-        /**
-         * @brief Get the names of all leaf nodes (nodes with no dependents)
-         * @return Vector of leaf node names
-         */
-        std::vector<std::string> getLeafNodes() const;
-
-        // =====================================================================
-        // Fast Schedule — pre-computed flat array for zero-overhead decode loops
-        // Eliminates string hash lookups, markCompleted calls, and virtual
-        // type() dispatch from the per-token hot path.
-        // =====================================================================
-
-        struct FastScheduleEntry
-        {
-            ComputeNode *node;  ///< Direct pointer (no hash lookup needed)
-            bool is_collective; ///< Pre-computed: ALLREDUCE / ALLGATHER / ALLGATHER_V
-        };
-
-        /**
-         * @brief Build a pre-computed fast schedule from the execution order
-         *
-         * Must be called after the graph is finalized. The collective_nodes set
-         * (if non-null) takes priority for collective classification; otherwise
-         * falls back to stage->type().
-         *
-         * Also marks the last node as is_final_output for event-based dirty marking.
-         */
-        void buildFastSchedule(const std::unordered_set<std::string> *collective_nodes = nullptr);
-
-        const std::vector<FastScheduleEntry> &fastSchedule() const { return fast_schedule_; }
-        bool hasFastSchedule() const { return !fast_schedule_.empty(); }
-
-    private:
-        std::vector<std::unique_ptr<ComputeNode>> nodes_;
-        std::unordered_map<std::string, size_t> node_index_;
-        mutable std::vector<std::string> cached_order_; ///< Cached topological order
-        mutable bool order_dirty_ = true;               ///< Invalidated on graph mutation
-        std::vector<FastScheduleEntry> fast_schedule_;  ///< Pre-computed decode schedule
-    };
 
     /**
      * @brief Orchestrates execution of compute stages within a graph
@@ -637,7 +457,7 @@ namespace llaminar2
 
         // Internal execution helpers
         bool executeSequential(ComputeGraph &graph, IDeviceContext *ctx);
-        bool executeParallel(ComputeGraph &graph, IDeviceContext *ctx);
+        // executeParallel removed — PARALLEL mode falls through to executeSequential
         bool executeNode(ComputeNode &node, IDeviceContext *ctx);
 
         // Collective stage intercept helpers (GPU-native collectives)
@@ -658,52 +478,7 @@ namespace llaminar2
 
         // Buffer validation (Debug/Integration builds only)
 #if LLAMINAR_ASSERTIONS_ACTIVE
-        /**
-         * @brief Verify stage inputs before execution (ENTRY validation)
-         *
-         * Called automatically BEFORE stage execution when assertions are active.
-         * Checks all INPUT buffers for null, NaN, or Inf data.
-         *
-         * Can be disabled at runtime with LLAMINAR_VALIDATE_INPUTS=0.
-         * Throws VerificationFailure on validation failure with full context.
-         *
-         * @param node The node whose inputs should be validated
-         * @param layer_idx Current layer index for error reporting
-         * @throws verification::VerificationFailure if validation fails
-         */
-        void verifyStageEntry(const ComputeNode &node, int layer_idx);
-
-        /**
-         * @brief Verify stage outputs after execution (EXIT validation)
-         *
-         * Called automatically AFTER stage execution when assertions are active.
-         * Checks all OUTPUT buffers for null, NaN, Inf, or all-zero data.
-         *
-         * Can be disabled at runtime with LLAMINAR_VALIDATE_BUFFERS=0.
-         * Throws VerificationFailure on validation failure with full context.
-         *
-         * @param node The node whose outputs should be validated
-         * @param layer_idx Current layer index for error reporting
-         * @throws verification::VerificationFailure if validation fails
-         */
-        void verifyStageExit(const ComputeNode &node, int layer_idx);
-
-        /**
-         * @brief Validate stage outputs for zero/NaN tensors (legacy)
-         *
-         * Called automatically after stage execution when assertions are active.
-         * Checks all OUTPUT buffers for uninitialized (zero) or corrupted (NaN/Inf) data.
-         *
-         * Can be disabled at runtime with LLAMINAR_VALIDATE_BUFFERS=0.
-         * NaN/Inf failure is enabled by default; zero-tensor warnings are not failures
-         * unless LLAMINAR_FAIL_ON_ZERO=1 is set.
-         *
-         * @param node The node whose outputs should be validated
-         * @return true if validation passes, false if errors detected
-         *
-         * @deprecated Use verifyStageExit() instead for exception-based validation
-         */
-        bool validateStageOutputs(const ComputeNode &node);
+        // Stage verification delegated to free functions in StageVerifier.h
 #endif
 
         // Workspace management

@@ -194,8 +194,8 @@ namespace llaminar2
         const ForwardInput &input,
         ForwardOutput &output)
     {
-        // Adapt generic ForwardInput to Qwen2ForwardInput
-        Qwen2ForwardInput qwen_input;
+        // Adapt generic ForwardInput to ForwardInput
+        ForwardInput qwen_input;
         qwen_input.token_ids = input.token_ids;
         qwen_input.position_ids = input.position_ids;
         qwen_input.batch_size = input.batch_size;
@@ -204,8 +204,8 @@ namespace llaminar2
         qwen_input.device = input.device;
         qwen_input.kv_cache = input.kv_cache;
 
-        // Adapt generic ForwardOutput to Qwen2ForwardOutput
-        Qwen2ForwardOutput qwen_output;
+        // Adapt generic ForwardOutput to ForwardOutput
+        ForwardOutput qwen_output;
         qwen_output.logits = output.logits;
         qwen_output.hidden = output.hidden;
 
@@ -261,8 +261,8 @@ namespace llaminar2
     // =============================================================================
 
     ComputeGraph Qwen2Graph::buildFullForwardGraph(
-        const Qwen2ForwardInput &input,
-        Qwen2ForwardOutput &output)
+        const ForwardInput &input,
+        ForwardOutput &output)
     {
         LOG_DEBUG("[Qwen2Graph] Building full forward graph: "
                   << "batch_size=" << input.batch_size
@@ -491,8 +491,8 @@ namespace llaminar2
     // =========================================================================
 
     ComputeGraph Qwen2Graph::buildPartialForwardGraph(
-        const Qwen2ForwardInput &input,
-        Qwen2ForwardOutput &output,
+        const ForwardInput &input,
+        ForwardOutput &output,
         int first_layer,
         int last_layer,
         bool has_embedding,
@@ -827,8 +827,8 @@ namespace llaminar2
     // =========================================================================
 
     ComputeGraph Qwen2Graph::buildUnifiedPipelineGraph(
-        const Qwen2ForwardInput &input,
-        Qwen2ForwardOutput &output)
+        const ForwardInput &input,
+        ForwardOutput &output)
     {
         // =====================================================================
         // 1. Validate prerequisites
@@ -1173,8 +1173,8 @@ namespace llaminar2
     // =========================================================================
 
     ComputeGraph Qwen2Graph::buildForwardGraphFromSchema(
-        const Qwen2ForwardInput &input,
-        Qwen2ForwardOutput &output)
+        const ForwardInput &input,
+        ForwardOutput &output)
     {
         LOG_DEBUG("[Qwen2Graph] Building forward graph from schema: "
                   << "batch_size=" << input.batch_size
@@ -1320,7 +1320,7 @@ namespace llaminar2
     }
 
     ComputeGraph Qwen2Graph::buildEmbeddingGraph(
-        const Qwen2ForwardInput &input,
+        const ForwardInput &input,
         TensorBase *output_hidden)
     {
         LOG_DEBUG("[Qwen2Graph] Building embedding graph for "

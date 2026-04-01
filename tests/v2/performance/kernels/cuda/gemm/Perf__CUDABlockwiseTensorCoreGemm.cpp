@@ -536,7 +536,7 @@ namespace
             // Download result
             RunResult result;
             result.output.resize(static_cast<size_t>(m) * n);
-            C_tensor->mark_device_dirty();
+            C_tensor->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
             std::memcpy(result.output.data(), C_tensor->data(), static_cast<size_t>(m) * n * sizeof(float));
 
             if (ws_consumer)

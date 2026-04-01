@@ -170,7 +170,7 @@ TEST_F(Test__HostReleaseAfterGpuUpload, GpuPointerSurvives_EnsureOnHostFailsGrac
 
     // Upload to GPU, then mark device authoritative (host stale)
     ASSERT_TRUE(tensor->ensureOnDevice(gpu_device_));
-    tensor->mark_device_dirty();
+    tensor->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
     ASSERT_FALSE(tensor->isOnCPU()) << "Host should be stale after mark_device_dirty";
     ASSERT_TRUE(tensor->isDeviceValid());
 

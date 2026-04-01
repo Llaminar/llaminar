@@ -243,7 +243,7 @@ namespace
                 return false;
             bool ok = kernel.multiply_tensor(input, output, M, N, K);
             if (ok)
-                output->mark_device_dirty();
+                output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
             return ok;
         }
 #endif

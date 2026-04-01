@@ -199,12 +199,20 @@ namespace llaminar2
             return BufferId::UP_PROJ;
         if (name == "ffn_output")
             return BufferId::FFN_OUTPUT;
+        if (name == "Q_rope")
+            return BufferId::Q_ROPE;
+        if (name == "K_rope")
+            return BufferId::K_ROPE;
+        if (name == "V_dequant")
+            return BufferId::V_DEQUANT;
 
         // Model-level buffers
         if (name == "current_hidden" || name == "hidden")
             return BufferId::HIDDEN_STATE;
         if (name == "logits")
             return BufferId::LOGITS;
+        if (name == "logits_local")
+            return BufferId::LOGITS_LOCAL;
 
         return BufferId::_COUNT; // sentinel: no mapping
     }
@@ -224,6 +232,8 @@ namespace llaminar2
             return "Q8_1";
         case BufferTensorType::Q8_0:
             return "Q8_0";
+        case BufferTensorType::Q16_1:
+            return "Q16_1";
         case BufferTensorType::INT32:
             return "INT32";
         default:
@@ -302,6 +312,10 @@ namespace llaminar2
             else if (std::string(b.dtype) == "Q8_1")
             {
                 return config_.factory->createQ8_1(shape, b.home_device);
+            }
+            else if (std::string(b.dtype) == "Q16_1")
+            {
+                return config_.factory->createQ16_1(shape, b.home_device);
             }
             else if (std::string(b.dtype) == "INT32")
             {
@@ -532,6 +546,13 @@ namespace llaminar2
         if (!isRegistered(id))
             return nullptr;
         return buf(id).tensor();
+    }
+
+    std::shared_ptr<TensorBase> BufferArena::getSharedTensor(BufferId id) const
+    {
+        if (!isRegistered(id))
+            return nullptr;
+        return buf(id).owned_tensor; // nullptr for external buffers
     }
 
     void *BufferArena::getDevicePtr(BufferId id, DeviceId target) const

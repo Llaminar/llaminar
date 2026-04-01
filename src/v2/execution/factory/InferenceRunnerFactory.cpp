@@ -696,10 +696,6 @@ namespace llaminar2
                   << ", d_ff=" << graph_config.d_ff);
 
         // Create DeviceGraphOrchestrator with config
-        GraphCacheConfig cache_config;
-        cache_config.enabled = true;
-        cache_config.decode_seq_len = 1;
-
         LOG_DEBUG("[InferenceRunner] About to create DeviceGraphOrchestrator with mpi_ctx="
                   << (mpi_ctx ? "valid" : "nullptr")
                   << " world_size=" << (mpi_ctx ? mpi_ctx->world_size() : -1));
@@ -707,8 +703,9 @@ namespace llaminar2
         std::unique_ptr<DeviceGraphOrchestrator> orchestrator;
         {
             ScopedWeightLoadDetailTimer timer("graph.build.create_orchestrator");
+            auto graph_builder = std::make_shared<Qwen2Graph>(graph_config, mpi_ctx);
             orchestrator = std::make_unique<DeviceGraphOrchestrator>(
-                graph_config, mpi_ctx, cache_config);
+                std::move(graph_builder), mpi_ctx);
         }
 
         // Transfer TurboQuant context ownership to orchestrator
@@ -723,17 +720,16 @@ namespace llaminar2
             orchestrator->initializeGraphCache(graph_config.n_layers);
         }
 
-        // Initialize inference state (allocates activation buffers + KV cache)
-        // Pass mapped memory config for GPU zero-copy access
+        // Initialize inference state via schema-driven BufferArena path
         InferenceStateInitConfig init_config;
         init_config.use_mapped_memory = config.use_mapped_memory;
 
         {
             ScopedWeightLoadDetailTimer timer("graph.build.initialize_inference_state");
-            if (!orchestrator->initializeInferenceState(
+            if (!orchestrator->initializeInferenceStateFromArena(
                     config.batch_size, config.max_seq_len, device, init_config))
             {
-                LOG_ERROR("[InferenceRunner] Failed to initialize inference state");
+                LOG_ERROR("[InferenceRunner] Failed to initialize inference state (arena path)");
                 return nullptr;
             }
         }
@@ -1424,14 +1420,11 @@ namespace llaminar2
         // =====================================================================
         DeviceGraphOrchestrator::Dependencies deps;
         deps.model_ctx = model_ctx;
+        deps.graph_builder = std::make_shared<Qwen2Graph>(graph_config, nullptr);
+        deps.pipeline_config = pipeline_config;
 
         auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(
-            std::move(deps), graph_config);
-
-        // =====================================================================
-        // Set pipeline configuration (enables PP mode)
-        // =====================================================================
-        orchestrator->setPipelineConfig(pipeline_config);
+            std::move(deps));
 
         // =====================================================================
         // Initialize inference state
@@ -1439,10 +1432,10 @@ namespace llaminar2
         InferenceStateInitConfig init_config;
         init_config.use_mapped_memory = config.use_mapped_memory;
 
-        if (!orchestrator->initializeInferenceState(
+        if (!orchestrator->initializeInferenceStateFromArena(
                 config.batch_size, config.max_seq_len, primary_device, init_config))
         {
-            LOG_ERROR("[UnifiedPipeline] Failed to initialize inference state");
+            LOG_ERROR("[UnifiedPipeline] Failed to initialize inference state (arena path)");
             return nullptr;
         }
 
@@ -1577,12 +1570,9 @@ namespace llaminar2
         // Create DeviceGraphOrchestrator
         // Note: No MPI context for PP stages - inter-stage comm handled externally
         // =====================================================================
-        GraphCacheConfig cache_config;
-        cache_config.enabled = true;
-        cache_config.decode_seq_len = 1;
-
+        auto graph_builder = std::make_shared<Qwen2Graph>(graph_config, nullptr);
         auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(
-            graph_config, nullptr /* no mpi_ctx */, cache_config);
+            std::move(graph_builder), nullptr /* no mpi_ctx */);
 
         if (turboquant_ctx)
             orchestrator->setTurboQuantContext(std::move(turboquant_ctx));
@@ -1608,10 +1598,10 @@ namespace llaminar2
         init_config.use_mapped_memory = config.use_mapped_memory;
         init_config.use_bar_backed_hidden = pp_config.use_bar_backed_hidden;
 
-        if (!orchestrator->initializeInferenceState(
+        if (!orchestrator->initializeInferenceStateFromArena(
                 config.batch_size, config.max_seq_len, device, init_config))
         {
-            LOG_ERROR("[PPStageRunner] Failed to initialize inference state");
+            LOG_ERROR("[PPStageRunner] Failed to initialize inference state (arena path)");
             return nullptr;
         }
 
@@ -1734,32 +1724,28 @@ namespace llaminar2
         // Create Dependencies struct
         DeviceGraphOrchestrator::Dependencies deps;
         deps.model_ctx = model_ctx;
+        deps.graph_builder = std::make_shared<Qwen2Graph>(graph_config, nullptr);
+        deps.turboquant_ctx = std::move(turboquant_ctx);
+        if (config.pp_stage_config.has_value())
+            deps.pp_stage_config = config.pp_stage_config.value();
         // topology and collective_ctx left as nullptr for single-rank testing
 
         // Create DeviceGraphOrchestrator with injected dependencies
-        GraphCacheConfig cache_config;
-        cache_config.enabled = true;
-        cache_config.decode_seq_len = 1;
-
         auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(
-            std::move(deps), graph_config, cache_config);
-
-        if (turboquant_ctx)
-            orchestrator->setTurboQuantContext(std::move(turboquant_ctx));
+            std::move(deps));
 
         // Initialize graph cache
         orchestrator->initializeGraphCache(graph_config.n_layers);
 
-        // Initialize inference state (allocates buffers)
-        // Pass mapped memory config for GPU zero-copy access
+        // Initialize inference state via schema-driven BufferArena path
         InferenceStateInitConfig init_config;
         init_config.use_mapped_memory = config.use_mapped_memory;
         init_config.use_bar_backed_hidden = config.use_bar_backed_hidden;
 
-        if (!orchestrator->initializeInferenceState(
+        if (!orchestrator->initializeInferenceStateFromArena(
                 config.batch_size, config.max_seq_len, device, init_config))
         {
-            LOG_ERROR("[InferenceRunner] Failed to initialize inference state");
+            LOG_ERROR("[InferenceRunner] Failed to initialize inference state (arena path)");
             return nullptr;
         }
 
@@ -1769,7 +1755,6 @@ namespace llaminar2
             // Nested TP-in-PP: use standard TP-sharded weight loading but with
             // partial global weight requirements
             const auto &pp_cfg = config.pp_stage_config.value();
-            orchestrator->setPPStageConfig(pp_cfg);
 
             auto weights = config_builder->buildWeights(
                 [model_ctx, device](const std::string &name)

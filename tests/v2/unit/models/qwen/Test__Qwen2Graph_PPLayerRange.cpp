@@ -161,13 +161,13 @@ namespace
             buffers_.layer_buffers.ffn_output = ffn_output_.get();
         }
 
-        Qwen2ForwardInput createForwardInput(int batch_size = 1, int seq_len = 4)
+        ForwardInput createForwardInput(int batch_size = 1, int seq_len = 4)
         {
             token_ids_.resize(batch_size * seq_len);
             for (int i = 0; i < batch_size * seq_len; ++i)
                 token_ids_[i] = i % VOCAB_SIZE;
 
-            Qwen2ForwardInput input;
+            ForwardInput input;
             input.token_ids = token_ids_.data();
             input.batch_size = batch_size;
             input.seq_len = seq_len;
@@ -219,7 +219,7 @@ namespace
         auto input = createForwardInput();
         // PP stage without embedding needs external_hidden_state
         input.external_hidden_state = current_hidden_.get();
-        Qwen2ForwardOutput output;
+        ForwardOutput output;
         output.hidden = current_hidden_.get();
 
         // This should NOT throw — absolute indices [4, 8) are valid for 8-layer model
@@ -241,7 +241,7 @@ namespace
         graph.setBuffers(buffers_);
 
         auto input = createForwardInput();
-        Qwen2ForwardOutput output;
+        ForwardOutput output;
         output.hidden = current_hidden_.get();
 
         // First PP stage: layers [0, 4) with embedding
@@ -264,7 +264,7 @@ namespace
         graph.setBuffers(buffers_);
 
         auto input = createForwardInput();
-        Qwen2ForwardOutput output;
+        ForwardOutput output;
         output.hidden = current_hidden_.get();
 
         // [0, 4) should work
@@ -291,7 +291,7 @@ namespace
         graph.setBuffers(buffers_);
 
         auto input = createForwardInput();
-        Qwen2ForwardOutput output;
+        ForwardOutput output;
         output.hidden = current_hidden_.get();
 
         // Negative first_layer
@@ -332,7 +332,7 @@ namespace
         auto input = createForwardInput();
         // PP stage without embedding needs external_hidden_state
         input.external_hidden_state = current_hidden_.get();
-        Qwen2ForwardOutput output;
+        ForwardOutput output;
         output.hidden = current_hidden_.get();
 
         // Last of 3 stages: layers [6, 9)
@@ -422,7 +422,7 @@ namespace
 
         auto input = createForwardInput();
         input.external_hidden_state = current_hidden_.get();
-        Qwen2ForwardOutput output;
+        ForwardOutput output;
         output.hidden = current_hidden_.get();
 
         auto compute_graph = graph.buildPartialForwardGraph(input, output, 4, 8, false, true);
@@ -467,7 +467,7 @@ namespace
 
         auto input = createForwardInput();
         input.external_hidden_state = current_hidden_.get();
-        Qwen2ForwardOutput output;
+        ForwardOutput output;
         output.hidden = current_hidden_.get();
 
         auto compute_graph = graph.buildPartialForwardGraph(input, output, 4, 8, false, true);
@@ -507,7 +507,7 @@ namespace
         graph.setBuffers(buffers_);
 
         auto input = createForwardInput();
-        Qwen2ForwardOutput output;
+        ForwardOutput output;
         output.hidden = current_hidden_.get();
 
         auto compute_graph = graph.buildPartialForwardGraph(input, output, 0, 8, true, true);
@@ -548,7 +548,7 @@ namespace
 
         auto input = createForwardInput();
         input.external_hidden_state = current_hidden_.get();
-        Qwen2ForwardOutput output;
+        ForwardOutput output;
         output.hidden = current_hidden_.get();
 
         auto compute_graph = graph.buildPartialForwardGraph(input, output, 3, 6, false, false);
@@ -591,7 +591,7 @@ namespace
         graph.setBuffers(buffers_);
 
         auto input = createForwardInput();
-        Qwen2ForwardOutput output;
+        ForwardOutput output;
         output.hidden = current_hidden_.get();
 
         // Full range should work

@@ -842,7 +842,7 @@ namespace llaminar2
          * @param dst_device Target GPU device
          * @return true on success, false if no backend supports this transfer
          *
-         * @pre Tensor must have authoritative data on a GPU (call mark_device_dirty() first)
+         * @pre Tensor must have authoritative data on a GPU (call transitionTo(DEVICE_AUTHORITATIVE) first)
          * @post getAuthoritativeDevice() == dst_device
          * @post Source device buffer becomes stale
          * @post Host buffer becomes stale (if it exists)
@@ -852,7 +852,7 @@ namespace llaminar2
          *
          * @example
          *   tensor->ensureOnDevice(cuda0);
-         *   tensor->mark_device_dirty();  // GPU computed new values
+         *   tensor->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);  // GPU computed new values
          *   tensor->transferTo(rocm0);    // Direct transfer, no host staging
          */
         bool transferTo(DeviceId dst_device, size_t bytes_override = 0);
@@ -970,61 +970,7 @@ namespace llaminar2
         virtual void *gpu_data_ptr();
         virtual const void *gpu_data_ptr() const;
 
-        /**
-         * @brief Mark tensor as modified on device (requires sync to host before host access)
-         * @note Call this after GPU kernels write to the tensor via gpu_data_ptr()
-         * @note This forwards to mark_device_dirty_with_event() for event-based sync
-         *
-         * After calling this:
-         *   - device_valid_ = true (device just got written to)
-         *   - host_valid_ = false (host is now stale) -- UNLESS tensor is mapped
-         *   - A completion event is recorded for fine-grained synchronization
-         *
-         * For mapped tensors, both host and device stay valid since they share memory,
-         * but we set mapped_needs_sync_ so ensureOnHost() knows to synchronize.
-         */
-        virtual void mark_device_dirty()
-        {
-            // Forward to event-based implementation for fine-grained sync
-            mark_device_dirty_with_event();
-        }
 
-        /**
-         * @brief Mark tensor as modified on device WITHOUT recording a completion event
-         *
-         * Lightweight version for intermediate tensors that only flow GPU→GPU on the
-         * same compute stream. Skips hipEventRecord/cudaEventRecord overhead (~100-300μs
-         * per call on ROCm). If data() is later called, ensureOnHost() will fall back to
-         * a full device synchronize since no event is available.
-         *
-         * Use this for intermediate pipeline tensors. Use mark_device_dirty_with_event()
-         * for tensors that will be read back to CPU (e.g., logits for sampling).
-         *
-         * @note Thread-safe (acquires coherence_mutex_)
-         */
-        void mark_device_dirty_flags_only()
-        {
-            std::lock_guard<std::mutex> lock(coherence_mutex_);
-            setCoherenceState_(is_mapped_ ? TensorCoherenceState::MAPPED : TensorCoherenceState::DEVICE_AUTHORITATIVE);
-            authoritative_device_ = gpu_device_;
-            if (is_mapped_)
-                mapped_needs_sync_ = true;
-        }
-
-        /**
-         * @brief Mark tensor as modified on device and record a completion event
-         *
-         * This is the preferred method when fine-grained synchronization is desired.
-         * Records an event after kernel execution so ensureOnHost() can wait on
-         * just this kernel rather than doing a full device synchronization.
-         *
-         * @param stream Opaque GPU stream handle where the kernel ran.
-         *               Pass the compute stream so the event is recorded on the
-         *               correct stream. nullptr = default stream (stream 0).
-         * @note Call this after GPU kernels write to the tensor via gpu_data_ptr()
-         * @note If event recording fails, falls back to eventless behavior
-         */
-        virtual void mark_device_dirty_with_event(void *stream = nullptr);
 
         /**
          * @brief Clear the device completion event without destroying it through the backend
@@ -1914,7 +1860,7 @@ namespace llaminar2
         void *mapped_host_ptr_ = nullptr;   // Host-visible pointer for mapped memory
 
         // For mapped memory: tracks whether GPU has written since last sync.
-        // Set to true by mark_device_dirty(), cleared by ensureOnHost() after sync.
+        // Set to true by transitionTo(MAPPED/DEVICE_AUTHORITATIVE), cleared by ensureOnHost() after sync.
         // This avoids redundant hipDeviceSynchronize() calls.
         bool mapped_needs_sync_ = false;
 
@@ -2206,7 +2152,7 @@ namespace llaminar2
          *
          * **Coherence model**:
          * - Both CUDA and ROCm see the same physical memory
-         * - mark_device_dirty() sets flag, no copy needed
+         * - transitionTo(MAPPED) sets coherence state, no copy needed
          * - ensureOnDevice() is no-op for both CUDA and ROCm
          *
          * **Use for**: allreduce output buffers, small communication buffers

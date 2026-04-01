@@ -61,7 +61,6 @@ public:
     // Track calls
     mutable int ensureOnDevice_calls = 0;
     mutable int ensureOnHost_calls = 0;
-    mutable int mark_device_dirty_calls = 0;
     mutable DeviceId last_ensureOnDevice_target = DeviceId::cpu();
 
     // Override coherence methods to track calls
@@ -79,18 +78,11 @@ public:
         return true;
     }
 
-    void mark_device_dirty() override
-    {
-        mark_device_dirty_calls++;
-        // Don't call parent - we're just tracking
-    }
-
     // Reset call counters
     void resetCallCounters()
     {
         ensureOnDevice_calls = 0;
         ensureOnHost_calls = 0;
-        mark_device_dirty_calls = 0;
     }
 };
 
@@ -275,20 +267,19 @@ TEST_F(Test__TensorSliceCoherence, EnsureOnHostCallsInner)
         << "ensureOnHost should be called on inner tensor";
 }
 
-TEST_F(Test__TensorSliceCoherence, MarkDeviceDirtyCallsInner)
+TEST_F(Test__TensorSliceCoherence, TransitionToDeviceAuthoritativeOnInner)
 {
     auto mock = std::make_unique<MockCoherenceTensor>(512, 256);
-    MockCoherenceTensor *mock_ptr = mock.get();
 
     auto slice = createSlice(std::move(mock));
 
-    // Get inner and call mark_device_dirty
+    // Get inner and call transitionTo
     auto *inner_cpu = dynamic_cast<TensorBase *>(slice->inner());
     ASSERT_NE(inner_cpu, nullptr);
-    inner_cpu->mark_device_dirty();
+    inner_cpu->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
 
-    EXPECT_EQ(mock_ptr->mark_device_dirty_calls, 1)
-        << "mark_device_dirty should be called on inner tensor";
+    EXPECT_EQ(inner_cpu->coherenceState(), TensorCoherenceState::DEVICE_AUTHORITATIVE)
+        << "transitionTo should set inner tensor to DEVICE_AUTHORITATIVE";
 }
 
 // =============================================================================
@@ -392,11 +383,10 @@ TEST_F(Test__TensorSliceCoherence, MixedCoherenceCalls)
 
     // Simulate typical usage pattern
     inner_cpu->ensureOnDevice(DeviceId::rocm(0)); // Upload to GPU
-    inner_cpu->mark_device_dirty();               // GPU kernel modified it
+    inner_cpu->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);               // GPU kernel modified it
     inner_cpu->ensureOnHost();                    // Download back
 
     EXPECT_EQ(mock_ptr->ensureOnDevice_calls, 1);
-    EXPECT_EQ(mock_ptr->mark_device_dirty_calls, 1);
     EXPECT_EQ(mock_ptr->ensureOnHost_calls, 1);
 }
 

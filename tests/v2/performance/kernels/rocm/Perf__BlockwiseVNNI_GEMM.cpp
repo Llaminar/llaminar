@@ -297,7 +297,7 @@ namespace
             {
                 kernel.multiply_tensor(input.get(), output.get(), M, shape.N, shape.K);
                 (void)hipDeviceSynchronize();
-                output->mark_device_dirty();
+                output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
 
                 if (gpu_weights.d_weights)
                 {
@@ -422,7 +422,7 @@ namespace
             {
                 kernel.multiply_tensor(input.get(), output.get(), M, shape.N, shape.K);
                 (void)hipDeviceSynchronize();
-                output->mark_device_dirty();
+                output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
 
                 if (gpu_weights.d_weights)
                 {

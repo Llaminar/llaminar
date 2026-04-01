@@ -76,7 +76,7 @@ TEST_F(Test__DeviceGraphOrchestrator, ConstructWithGraphBuilder)
 TEST_F(Test__DeviceGraphOrchestrator, ConstructWithConfig)
 {
     // Test construction with config (creates internal graph builder)
-    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(config_, nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(std::make_shared<Qwen2Graph>(config_, nullptr), nullptr);
 
     EXPECT_NE(orchestrator, nullptr);
     EXPECT_NE(std::as_const(*orchestrator).graphBuilder(), nullptr);
@@ -297,12 +297,12 @@ TEST_F(Test__DeviceGraphOrchestrator, GraphBuilderAccess)
     auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(graph_builder_, nullptr);
 
     // Const access (non-const graphBuilder() is now protected to enforce fluent API)
-    const Qwen2Graph *const_builder = std::as_const(*orchestrator).graphBuilder();
+    const IGraphBuilder *const_builder = std::as_const(*orchestrator).graphBuilder();
     EXPECT_EQ(const_builder, graph_builder_.get());
 
     // Explicit const cast also works
     const DeviceGraphOrchestrator *const_orch = orchestrator.get();
-    const Qwen2Graph *builder = const_orch->graphBuilder();
+    const IGraphBuilder *builder = const_orch->graphBuilder();
     EXPECT_EQ(builder, graph_builder_.get());
 }
 
@@ -348,7 +348,7 @@ TEST_F(Test__DeviceGraphOrchestrator, MoveAssignment)
     auto orchestrator1 = std::make_unique<DeviceGraphOrchestrator>(graph_builder_, nullptr);
     orchestrator1->initializeGraphCache(24);
 
-    auto orchestrator2 = std::make_unique<DeviceGraphOrchestrator>(config_, nullptr);
+    auto orchestrator2 = std::make_unique<DeviceGraphOrchestrator>(std::make_shared<Qwen2Graph>(config_, nullptr), nullptr);
 
     // Move assign
     *orchestrator2 = std::move(*orchestrator1);
@@ -519,7 +519,7 @@ TEST_F(Test__DeviceGraphOrchestrator, InitializeInferenceStateSuccess)
     int batch_size = 2;
     int max_seq_len = 64;
 
-    bool success = orchestrator->initializeInferenceState(batch_size, max_seq_len, DeviceId::cpu());
+    bool success = orchestrator->initializeInferenceStateFromArena(batch_size, max_seq_len, DeviceId::cpu());
 
     EXPECT_TRUE(success);
     EXPECT_TRUE(orchestrator->hasInferenceState());
@@ -532,7 +532,7 @@ TEST_F(Test__DeviceGraphOrchestrator, InitializeInferenceStateAllocatesBuffers)
     int batch_size = 2;
     int max_seq_len = 64;
 
-    bool success = orchestrator->initializeInferenceState(batch_size, max_seq_len, DeviceId::cpu());
+    bool success = orchestrator->initializeInferenceStateFromArena(batch_size, max_seq_len, DeviceId::cpu());
     ASSERT_TRUE(success);
 
     // Should be able to access logits (nullptr check, not actual data yet)
@@ -547,7 +547,7 @@ TEST_F(Test__DeviceGraphOrchestrator, ClearInferenceStateResetsPositions)
     int batch_size = 2;
     int max_seq_len = 64;
 
-    ASSERT_TRUE(orchestrator->initializeInferenceState(batch_size, max_seq_len, DeviceId::cpu()));
+    ASSERT_TRUE(orchestrator->initializeInferenceStateFromArena(batch_size, max_seq_len, DeviceId::cpu()));
     ASSERT_TRUE(orchestrator->hasInferenceState());
 
     // Clear state
@@ -591,7 +591,7 @@ TEST_F(Test__DeviceGraphOrchestrator, ForwardFailsWithoutWeights)
     auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(graph_builder_, nullptr);
 
     // Initialize state but not weights
-    ASSERT_TRUE(orchestrator->initializeInferenceState(1, 64, DeviceId::cpu()));
+    ASSERT_TRUE(orchestrator->initializeInferenceStateFromArena(1, 64, DeviceId::cpu()));
 
     // forward() should fail without weights
     std::vector<int> tokens = {1, 2, 3};
@@ -607,7 +607,7 @@ TEST_F(Test__DeviceGraphOrchestrator, InferenceStateMultipleBatches)
     int batch_size = 4;
     int max_seq_len = 128;
 
-    ASSERT_TRUE(orchestrator->initializeInferenceState(batch_size, max_seq_len, DeviceId::cpu()));
+    ASSERT_TRUE(orchestrator->initializeInferenceStateFromArena(batch_size, max_seq_len, DeviceId::cpu()));
 
     // All batch positions should start at 0
     for (int b = 0; b < batch_size; ++b)
@@ -625,13 +625,13 @@ TEST_F(Test__DeviceGraphOrchestrator, KVCacheLayoutMode_FP32_AutoDefaultsToQ16He
     // Create config with FP32 precision, AUTO KV cache (default)
     auto fp32_config = config_;
     fp32_config.activation_precision = ActivationPrecision::FP32;
-    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(fp32_config, nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(std::make_shared<Qwen2Graph>(fp32_config, nullptr), nullptr);
 
     // Initialize state
     int batch_size = 1;
     int max_seq_len = 64;
 
-    ASSERT_TRUE(orchestrator->initializeInferenceState(batch_size, max_seq_len, DeviceId::cpu()));
+    ASSERT_TRUE(orchestrator->initializeInferenceStateFromArena(batch_size, max_seq_len, DeviceId::cpu()));
     ASSERT_TRUE(orchestrator->hasInferenceState());
 
     // AUTO KV cache on CPU defaults to Q16_1 which uses HEAD_MAJOR layout
@@ -646,9 +646,9 @@ TEST_F(Test__DeviceGraphOrchestrator, KVCacheImplementation_FP32Activation_Defau
 {
     auto fp32_config = config_;
     fp32_config.activation_precision = ActivationPrecision::FP32;
-    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(fp32_config, nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(std::make_shared<Qwen2Graph>(fp32_config, nullptr), nullptr);
 
-    ASSERT_TRUE(orchestrator->initializeInferenceState(1, 64, DeviceId::cpu()));
+    ASSERT_TRUE(orchestrator->initializeInferenceStateFromArena(1, 64, DeviceId::cpu()));
     ASSERT_TRUE(orchestrator->hasInferenceState());
 
     const auto &state = orchestrator->inferenceState();
@@ -664,13 +664,13 @@ TEST_F(Test__DeviceGraphOrchestrator, KVCacheLayoutMode_BF16_AutoDefaultsToQ16He
     // Create config with BF16 precision, AUTO KV cache (default)
     auto bf16_config = config_;
     bf16_config.activation_precision = ActivationPrecision::BF16;
-    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(bf16_config, nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(std::make_shared<Qwen2Graph>(bf16_config, nullptr), nullptr);
 
     // Initialize state
     int batch_size = 1;
     int max_seq_len = 64;
 
-    ASSERT_TRUE(orchestrator->initializeInferenceState(batch_size, max_seq_len, DeviceId::cpu()));
+    ASSERT_TRUE(orchestrator->initializeInferenceStateFromArena(batch_size, max_seq_len, DeviceId::cpu()));
     ASSERT_TRUE(orchestrator->hasInferenceState());
 
     // AUTO KV cache on CPU defaults to Q16_1 which uses HEAD_MAJOR layout
@@ -687,13 +687,13 @@ TEST_F(Test__DeviceGraphOrchestrator, DISABLED_KVCacheLayoutMode_HybridQ16_UsesH
     // Create config with HybridQ16 precision - this resolves KV cache to Q16_1
     auto hybrid_config = config_;
     hybrid_config.activation_precision = ActivationPrecision::HybridQ16;
-    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(hybrid_config, nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(std::make_shared<Qwen2Graph>(hybrid_config, nullptr), nullptr);
 
     // Initialize state
     int batch_size = 1;
     int max_seq_len = 64;
 
-    ASSERT_TRUE(orchestrator->initializeInferenceState(batch_size, max_seq_len, DeviceId::cpu()));
+    ASSERT_TRUE(orchestrator->initializeInferenceStateFromArena(batch_size, max_seq_len, DeviceId::cpu()));
     ASSERT_TRUE(orchestrator->hasInferenceState());
 
     // KV cache should use HEAD_MAJOR layout for Q16_1 (required by Q16IntegerAttention)
@@ -710,13 +710,13 @@ TEST_F(Test__DeviceGraphOrchestrator, DISABLED_KVCacheLayoutMode_Hybrid_UsesPosi
     // Create config with Hybrid precision - KV cache should be BF16
     auto hybrid_config = config_;
     hybrid_config.activation_precision = ActivationPrecision::Hybrid;
-    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(hybrid_config, nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(std::make_shared<Qwen2Graph>(hybrid_config, nullptr), nullptr);
 
     // Initialize state
     int batch_size = 1;
     int max_seq_len = 64;
 
-    ASSERT_TRUE(orchestrator->initializeInferenceState(batch_size, max_seq_len, DeviceId::cpu()));
+    ASSERT_TRUE(orchestrator->initializeInferenceStateFromArena(batch_size, max_seq_len, DeviceId::cpu()));
     ASSERT_TRUE(orchestrator->hasInferenceState());
 
     // KV cache should use POSITION_MAJOR layout for Hybrid (BF16 KV cache)
@@ -1213,7 +1213,7 @@ TEST_F(Test__DeviceGraphOrchestrator, WorkspaceSizing_UsesActualMaxSeqLen)
     auto custom_config = config_;
     custom_config.max_seq_len = 2048; // Non-default value
 
-    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(custom_config, nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(std::make_shared<Qwen2Graph>(custom_config, nullptr), nullptr);
 
     ComputeGraph graph;
     auto gpu_stage = std::make_unique<MockWorkspaceConsumerStage>("gpu_gemm", DeviceId::cuda(0), 4096);
@@ -1247,7 +1247,7 @@ TEST_F(Test__DeviceGraphOrchestrator, DISABLED_WorkspaceSizing_UsesActualNHeads)
     auto custom_config = config_;
     custom_config.n_heads = 32; // Non-default value
 
-    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(custom_config, nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(std::make_shared<Qwen2Graph>(custom_config, nullptr), nullptr);
 
     ComputeGraph graph;
     auto gpu_stage = std::make_unique<MockWorkspaceConsumerStage>("gpu_attn", DeviceId::cuda(0), 4096);
@@ -1274,7 +1274,7 @@ TEST_F(Test__DeviceGraphOrchestrator, DISABLED_WorkspaceSizing_CalculatesHeadDim
     custom_config.n_heads = 32;
     // Expected head_dim = 4096 / 32 = 128
 
-    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(custom_config, nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(std::make_shared<Qwen2Graph>(custom_config, nullptr), nullptr);
 
     ComputeGraph graph;
     auto gpu_stage = std::make_unique<MockWorkspaceConsumerStage>("gpu_attn", DeviceId::cuda(0), 4096);
@@ -1308,7 +1308,7 @@ TEST_F(Test__DeviceGraphOrchestrator, DISABLED_WorkspaceSizing_AllDimensionsFrom
     qwen_config.max_seq_len = 32768;
     qwen_config.default_device = DeviceId::cpu();
 
-    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(qwen_config, nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(std::make_shared<Qwen2Graph>(qwen_config, nullptr), nullptr);
 
     ComputeGraph graph;
     auto gpu_stage = std::make_unique<MockWorkspaceConsumerStage>("qwen_gemm", DeviceId::cuda(0), 4096);
@@ -1344,7 +1344,7 @@ TEST_F(Test__DeviceGraphOrchestrator, DISABLED_WorkspaceSizing_LlamaStyleConfig)
     llama_config.max_seq_len = 8192;
     llama_config.default_device = DeviceId::cpu();
 
-    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(llama_config, nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(std::make_shared<Qwen2Graph>(llama_config, nullptr), nullptr);
 
     ComputeGraph graph;
     auto gpu_stage = std::make_unique<MockWorkspaceConsumerStage>("llama_gemm", DeviceId::cuda(0), 4096);
@@ -1377,7 +1377,7 @@ TEST_F(Test__DeviceGraphOrchestrator, WorkspaceSizing_FallbackWhenMaxSeqLenZero)
     auto custom_config = config_;
     custom_config.max_seq_len = 0; // Should fallback to 4096
 
-    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(custom_config, nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(std::make_shared<Qwen2Graph>(custom_config, nullptr), nullptr);
 
     ComputeGraph graph;
     auto gpu_stage = std::make_unique<MockWorkspaceConsumerStage>("gpu_gemm", DeviceId::cuda(0), 4096);
@@ -1404,7 +1404,7 @@ TEST_F(Test__DeviceGraphOrchestrator, DISABLED_WorkspaceSizing_FallbackWhenNHead
     auto custom_config = config_;
     custom_config.n_heads = 0; // Should fallback to 128
 
-    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(custom_config, nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(std::make_shared<Qwen2Graph>(custom_config, nullptr), nullptr);
 
     ComputeGraph graph;
     auto gpu_stage = std::make_unique<MockWorkspaceConsumerStage>("gpu_gemm", DeviceId::cuda(0), 4096);
@@ -1432,7 +1432,7 @@ TEST_F(Test__DeviceGraphOrchestrator, DISABLED_WorkspaceSizing_FallbackWhenDMode
     custom_config.d_model = 0;
     custom_config.n_heads = 32;
 
-    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(custom_config, nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(std::make_shared<Qwen2Graph>(custom_config, nullptr), nullptr);
 
     ComputeGraph graph;
     auto gpu_stage = std::make_unique<MockWorkspaceConsumerStage>("gpu_gemm", DeviceId::cuda(0), 4096);
@@ -1460,7 +1460,7 @@ TEST_F(Test__DeviceGraphOrchestrator, WorkspaceSizing_NoCrashOnNegativeValues)
     custom_config.n_heads = -1;
     custom_config.d_model = -1;
 
-    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(custom_config, nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(std::make_shared<Qwen2Graph>(custom_config, nullptr), nullptr);
 
     ComputeGraph graph;
     auto gpu_stage = std::make_unique<MockWorkspaceConsumerStage>("gpu_gemm", DeviceId::cuda(0), 4096);
@@ -1488,7 +1488,7 @@ TEST_F(Test__DeviceGraphOrchestrator, WorkspaceSizing_NoCrashOnNegativeValues)
 
 TEST_F(Test__DeviceGraphOrchestrator, WorkspaceSizing_CUDAStage_GetsDimensions)
 {
-    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(config_, nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(std::make_shared<Qwen2Graph>(config_, nullptr), nullptr);
 
     ComputeGraph graph;
     auto cuda_stage = std::make_unique<MockWorkspaceConsumerStage>("cuda_gemm", DeviceId::cuda(0), 4096);
@@ -1511,7 +1511,7 @@ TEST_F(Test__DeviceGraphOrchestrator, WorkspaceSizing_CUDAStage_GetsDimensions)
 
 TEST_F(Test__DeviceGraphOrchestrator, WorkspaceSizing_ROCmStage_GetsDimensions)
 {
-    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(config_, nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(std::make_shared<Qwen2Graph>(config_, nullptr), nullptr);
 
     ComputeGraph graph;
     auto rocm_stage = std::make_unique<MockWorkspaceConsumerStage>("rocm_gemm", DeviceId::rocm(0), 4096);
@@ -1534,7 +1534,7 @@ TEST_F(Test__DeviceGraphOrchestrator, WorkspaceSizing_ROCmStage_GetsDimensions)
 
 TEST_F(Test__DeviceGraphOrchestrator, WorkspaceSizing_CPUStage_SkipsWorkspace)
 {
-    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(config_, nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(std::make_shared<Qwen2Graph>(config_, nullptr), nullptr);
 
     ComputeGraph graph;
     auto cpu_stage = std::make_unique<MockWorkspaceConsumerStage>("cpu_gemm", DeviceId::cpu(), 4096);
@@ -1565,7 +1565,7 @@ TEST_F(Test__DeviceGraphOrchestrator, WorkspaceSizing_MixedDevices_OnlyGPUGetWor
         GTEST_SKIP() << "Neither CUDA nor ROCm backend available";
     }
 
-    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(config_, nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(std::make_shared<Qwen2Graph>(config_, nullptr), nullptr);
 
     ComputeGraph graph;
 
@@ -1620,13 +1620,13 @@ TEST_F(Test__DeviceGraphOrchestrator, WorkspaceSizing_MixedDevices_OnlyGPUGetWor
 
 TEST_F(Test__DeviceGraphOrchestrator, WorkspaceSizing_UsesActualBatchSizeFromInferenceState)
 {
-    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(config_, nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(std::make_shared<Qwen2Graph>(config_, nullptr), nullptr);
 
     // Initialize inference state with specific batch size
     const int batch_size = 8;
     const int max_seq_len = 64;
 
-    bool init_success = orchestrator->initializeInferenceState(batch_size, max_seq_len, DeviceId::cpu());
+    bool init_success = orchestrator->initializeInferenceStateFromArena(batch_size, max_seq_len, DeviceId::cpu());
     if (!init_success)
     {
         GTEST_SKIP() << "Could not initialize inference state";
@@ -1658,7 +1658,7 @@ TEST_F(Test__DeviceGraphOrchestrator, DISABLED_WorkspaceSizing_LargeModelConfig_
     large_config.max_seq_len = 131072; // 128K context
     large_config.default_device = DeviceId::cpu();
 
-    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(large_config, nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(std::make_shared<Qwen2Graph>(large_config, nullptr), nullptr);
 
     ComputeGraph graph;
     auto gpu_stage = std::make_unique<MockWorkspaceConsumerStage>("large_gemm", DeviceId::cuda(0), 4096);
@@ -1693,7 +1693,7 @@ TEST_F(Test__DeviceGraphOrchestrator, ActivationPrecision_FP32_WorkspaceAllocati
     auto custom_config = config_;
     custom_config.activation_precision = ActivationPrecision::FP32;
 
-    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(custom_config, nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(std::make_shared<Qwen2Graph>(custom_config, nullptr), nullptr);
 
     ComputeGraph graph;
     auto gpu_stage = std::make_unique<MockWorkspaceConsumerStage>("fp32_gemm", DeviceId::cuda(0), 4096);
@@ -1715,7 +1715,7 @@ TEST_F(Test__DeviceGraphOrchestrator, ActivationPrecision_BF16_WorkspaceAllocati
     auto custom_config = config_;
     custom_config.activation_precision = ActivationPrecision::BF16;
 
-    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(custom_config, nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(std::make_shared<Qwen2Graph>(custom_config, nullptr), nullptr);
 
     ComputeGraph graph;
     auto gpu_stage = std::make_unique<MockWorkspaceConsumerStage>("bf16_gemm", DeviceId::cuda(0), 4096);
@@ -1737,7 +1737,7 @@ TEST_F(Test__DeviceGraphOrchestrator, ActivationPrecision_Hybrid_WorkspaceAlloca
     auto custom_config = config_;
     custom_config.activation_precision = ActivationPrecision::Hybrid;
 
-    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(custom_config, nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(std::make_shared<Qwen2Graph>(custom_config, nullptr), nullptr);
 
     ComputeGraph graph;
     auto gpu_stage = std::make_unique<MockWorkspaceConsumerStage>("hybrid_gemm", DeviceId::cuda(0), 4096);
@@ -1763,7 +1763,7 @@ TEST_F(Test__DeviceGraphOrchestrator, ActivationPrecision_Hybrid_WorkspaceAlloca
 TEST_F(Test__DeviceGraphOrchestrator, DISABLED_WorkspaceConsistency_SameDimensionsAcrossExecutions)
 {
     // DISABLED: Tests unimplemented feature (passing n_heads/head_dim to workspace consumers)
-    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(config_, nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(std::make_shared<Qwen2Graph>(config_, nullptr), nullptr);
 
     // First graph with workspace consumer
     ComputeGraph graph1;

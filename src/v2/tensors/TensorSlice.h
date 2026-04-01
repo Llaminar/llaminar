@@ -302,11 +302,6 @@ namespace llaminar2
             return inner()->ensureOnHost();
         }
 
-        void mark_device_dirty() override
-        {
-            inner()->mark_device_dirty();
-        }
-
         void mark_host_dirty() override
         {
             inner()->mark_host_dirty();

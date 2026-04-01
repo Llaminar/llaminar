@@ -84,7 +84,7 @@ namespace llaminar2
      * @brief Coherence operations for the BufferArena.
      *
      * Wraps the calls to TensorBase::ensureOnDevice / ensureOnHost /
-     * mark_device_dirty so that BufferArena doesn't need to know about
+     * transitionTo(DEVICE_AUTHORITATIVE) so that BufferArena doesn't need to know about
      * tensor internals.
      */
     class CoherenceTracker
@@ -132,7 +132,7 @@ namespace llaminar2
          * @brief Mark buffer as written on device with stream event recording.
          *
          * Like markWritten() but also records a GPU completion event on the
-         * tensor via mark_device_dirty_with_event(stream). This enables
+         * tensor via transitionToWithEvent(DEVICE_AUTHORITATIVE, ..., stream). This enables
          * fine-grained sync: ensureOnHost() can wait on just this event
          * instead of doing a full device synchronize.
          *

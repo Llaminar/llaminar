@@ -36,38 +36,15 @@ namespace llaminar2
 {
 
     // =========================================================================
-    // Constructors
+    // Shared Executor Configuration
     // =========================================================================
 
-    DeviceGraphOrchestrator::DeviceGraphOrchestrator(
-        Dependencies deps,
-        const GraphConfig &graph_config,
-        const GraphCacheConfig &cache_config)
-        : graph_builder_(std::make_shared<Qwen2Graph>(graph_config, nullptr)), // Create graph without MPI (uses topology)
-          mpi_ctx_(nullptr),                                                   // No direct MPI context - use injected topology
-          cache_config_(cache_config),
-          injected_model_ctx_(std::move(deps.model_ctx)),
-          injected_topology_(std::move(deps.topology)),
-          injected_collective_ctx_(std::move(deps.collective_ctx))
+    void DeviceGraphOrchestrator::configureExecutor()
     {
-        if (!injected_model_ctx_)
-        {
-            throw std::invalid_argument("DeviceGraphOrchestrator Dependencies requires a valid model_ctx");
-        }
-
-        if (!graph_builder_)
-        {
-            throw std::invalid_argument("DeviceGraphOrchestrator failed to create graph builder");
-        }
-
-        // Configure executor from graph builder's config
         GraphExecutorConfig exec_config;
         exec_config.default_device = graph_builder_->config().default_device;
 
-        // Parse execution mode and profiling from environment
         const auto &env = debugEnv();
-
-        // Enable profiling from either graph config or env variable
         exec_config.enable_profiling = graph_builder_->config().enable_profiling || env.execution.executor_profiling;
         exec_config.enable_validation = graph_builder_->config().enable_validation;
 
@@ -85,6 +62,80 @@ namespace llaminar2
         }
 
         executor_ = DeviceGraphExecutor(exec_config);
+    }
+
+    bool DeviceGraphOrchestrator::validateConfigurationForForward() const
+    {
+        bool valid = true;
+
+        if (!graph_builder_)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] graph_builder_ is null");
+            valid = false;
+        }
+
+        // Arena can be null here — it will be lazily created in executeForward()
+        // when managed_buffers_.current_hidden exists (e.g., after clear_cache()
+        // which resets arena_ and relies on lazy re-initialization).
+        if (!arena_ && !managed_buffers_.current_hidden)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] BufferArena not initialized "
+                      "(call initializeInferenceStateFromArena() first)");
+            valid = false;
+        }
+
+        if (!managed_buffers_.current_hidden)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] No current_hidden buffer "
+                      "(call initializeInferenceStateFromArena() first)");
+            valid = false;
+        }
+
+        // Weight check: either graph builder has weights or weight_manager is set
+        bool has_weights = (graph_builder_ && graph_builder_->isInitialized()) ||
+                           weight_manager_ != nullptr;
+        if (!has_weights)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] No weights loaded "
+                      "(call setWeights() or setWeightManager())");
+            valid = false;
+        }
+
+        return valid;
+    }
+
+    // =========================================================================
+    // Constructors
+    // =========================================================================
+
+    DeviceGraphOrchestrator::DeviceGraphOrchestrator(
+        Dependencies deps)
+        : graph_builder_(std::move(deps.graph_builder)),
+          mpi_ctx_(nullptr), // No direct MPI context - use injected topology
+          cache_config_(deps.cache_config),
+          injected_model_ctx_(std::move(deps.model_ctx)),
+          injected_topology_(std::move(deps.topology)),
+          injected_collective_ctx_(std::move(deps.collective_ctx)),
+          turboquant_ctx_(std::move(deps.turboquant_ctx)),
+          pp_stage_config_(std::move(deps.pp_stage_config)),
+          pipeline_config_(std::move(deps.pipeline_config)),
+          weight_streamer_(std::move(deps.weight_streamer)),
+          weight_manager_(std::move(deps.weight_manager)),
+          weight_placement_map_(std::move(deps.weight_placement_map)),
+          tp_config_(std::move(deps.tp_config)),
+          domain_config_(std::move(deps.domain_config))
+    {
+        if (!injected_model_ctx_)
+        {
+            throw std::invalid_argument("DeviceGraphOrchestrator Dependencies requires a valid model_ctx");
+        }
+
+        if (!graph_builder_)
+        {
+            throw std::invalid_argument("DeviceGraphOrchestrator Dependencies requires a valid graph_builder");
+        }
+
+        configureExecutor();
 
         // Propagate MPI rank to executor for stage dumping (from injected topology)
         if (injected_topology_)
@@ -99,14 +150,25 @@ namespace llaminar2
             LOG_INFO("[DeviceGraphOrchestrator] Wired CollectiveContext to DeviceGraphExecutor");
         }
 
-        LOG_INFO("[DeviceGraphOrchestrator] Initialized with injected dependencies, caching="
+        // Validate PP stage config if provided
+        if (pp_stage_config_.has_value() && !pp_stage_config_->isValid())
+        {
+            throw std::invalid_argument("Invalid FactoryPPStageConfig in Dependencies: "
+                                        "first_layer=" + std::to_string(pp_stage_config_->first_layer) +
+                                        ", last_layer=" + std::to_string(pp_stage_config_->last_layer));
+        }
+
+        LOG_INFO("[DeviceGraphOrchestrator] Initialized with dependencies, caching="
                  << (cache_config_.enabled ? "enabled" : "disabled")
                  << ", topology=" << (injected_topology_ ? "provided" : "none")
-                 << ", collective=" << (injected_collective_ctx_ ? "provided" : "none"));
+                 << ", collective=" << (injected_collective_ctx_ ? "provided" : "none")
+                 << ", turboquant=" << (turboquant_ctx_ ? "provided" : "none")
+                 << ", pp_stage=" << (pp_stage_config_.has_value() ? "configured" : "none")
+                 << ", pipeline=" << (pipeline_config_ ? "provided" : "none"));
     }
 
     DeviceGraphOrchestrator::DeviceGraphOrchestrator(
-        std::shared_ptr<Qwen2Graph> graph_builder,
+        std::shared_ptr<IGraphBuilder> graph_builder,
         std::shared_ptr<MPIContext> mpi_ctx,
         const GraphCacheConfig &cache_config)
         : graph_builder_(std::move(graph_builder)),
@@ -118,81 +180,7 @@ namespace llaminar2
             throw std::invalid_argument("DeviceGraphOrchestrator requires a valid graph builder");
         }
 
-        // Configure executor from graph builder's config
-        GraphExecutorConfig exec_config;
-        exec_config.default_device = graph_builder_->config().default_device;
-
-        // Parse execution mode and profiling from environment
-        const auto &env = debugEnv();
-
-        // Enable profiling from either graph config or env variable
-        exec_config.enable_profiling = graph_builder_->config().enable_profiling || env.execution.executor_profiling;
-        exec_config.enable_validation = graph_builder_->config().enable_validation;
-
-        if (env.execution.execution_mode == "parallel")
-        {
-            exec_config.mode = ExecutionMode::PARALLEL;
-        }
-        else if (env.execution.execution_mode == "pipelined")
-        {
-            exec_config.mode = ExecutionMode::PIPELINED;
-        }
-        else
-        {
-            exec_config.mode = ExecutionMode::SEQUENTIAL;
-        }
-
-        executor_ = DeviceGraphExecutor(exec_config);
-
-        // Propagate MPI rank to executor for stage dumping
-        if (mpi_ctx_)
-        {
-            executor_.setMPIRank(mpi_ctx_->rank());
-        }
-
-        LOG_INFO("[DeviceGraphOrchestrator] Initialized with graph builder, caching="
-                 << (cache_config_.enabled ? "enabled" : "disabled"));
-    }
-
-    DeviceGraphOrchestrator::DeviceGraphOrchestrator(
-        const GraphConfig &graph_config,
-        std::shared_ptr<MPIContext> mpi_ctx,
-        const GraphCacheConfig &cache_config)
-        // Create Qwen2Graph with MPI context FIRST (before any move)
-        : graph_builder_(std::make_shared<Qwen2Graph>(graph_config, mpi_ctx)),
-          mpi_ctx_(std::move(mpi_ctx)),
-          cache_config_(cache_config)
-    {
-        // Duplicate initialization logic from the other constructor
-        if (!graph_builder_)
-        {
-            throw std::invalid_argument("DeviceGraphOrchestrator requires a valid graph builder");
-        }
-
-        // Configure executor from graph builder's config
-        GraphExecutorConfig exec_config;
-        exec_config.default_device = graph_builder_->config().default_device;
-
-        // Parse execution mode and profiling from environment
-        const auto &env = debugEnv();
-
-        // Enable profiling from either graph config or env variable
-        exec_config.enable_profiling = graph_builder_->config().enable_profiling || env.execution.executor_profiling;
-        exec_config.enable_validation = graph_builder_->config().enable_validation;
-        if (env.execution.execution_mode == "parallel")
-        {
-            exec_config.mode = ExecutionMode::PARALLEL;
-        }
-        else if (env.execution.execution_mode == "pipelined")
-        {
-            exec_config.mode = ExecutionMode::PIPELINED;
-        }
-        else
-        {
-            exec_config.mode = ExecutionMode::SEQUENTIAL;
-        }
-
-        executor_ = DeviceGraphExecutor(exec_config);
+        configureExecutor();
 
         // Propagate MPI rank to executor for stage dumping
         if (mpi_ctx_)
@@ -526,14 +514,17 @@ namespace llaminar2
     // =========================================================================
 
     bool DeviceGraphOrchestrator::executeForward(
-        const Qwen2ForwardInput &input,
-        Qwen2ForwardOutput &output)
+        const ForwardInput &input,
+        ForwardOutput &output)
     {
         // Enable device-scoped logging if not already set by caller (e.g., from forward())
-        // This ensures executeForward() can be called directly with proper log attribution
         ScopedDeviceLog device_log(input.device);
 
-        auto start = std::chrono::high_resolution_clock::now();
+        // Validate that all required configuration has been set
+        if (!validateConfigurationForForward())
+        {
+            return false;
+        }
 
         // Token input OR activation input is required
         bool has_token_input = input.token_ids || input.batches;
@@ -563,10 +554,7 @@ namespace llaminar2
         }
 
         // Lazy arena initialization: ensures contract-based coherence works
-        // for both single-device and PP paths. In the graph-managed buffer path,
-        // initializeArena() is called from initializeBuffers(). In the PP path
-        // (where initializeBuffers() is not used), managed_buffers_ is populated
-        // by forward() → setBuffers() before reaching this point.
+        // for both single-device and PP paths.
         if (!arena_ && managed_buffers_.current_hidden)
         {
             initializeArena();
@@ -578,11 +566,11 @@ namespace llaminar2
 
         // Build position IDs if not provided externally
         std::vector<int> position_ids_storage;
-        Qwen2ForwardInput effective_input = input;
+        ForwardInput effective_input = input;
 
         if (!input.position_ids)
         {
-            position_ids_storage = Qwen2Graph::buildPositionIds(
+            position_ids_storage = IGraphBuilder::buildPositionIds(
                 input.seq_len, input.batch_size, input.position_offset);
             effective_input.position_ids = position_ids_storage.data();
         }
@@ -593,641 +581,155 @@ namespace llaminar2
             effective_input.external_hidden_state = external_hidden_state_input_;
             LOG_DEBUG("[DeviceGraphOrchestrator] Using external hidden state input: "
                       << external_hidden_state_input_->numel() << " elements");
-
-            // Clear for next invocation (single-use semantics)
-            external_hidden_state_input_ = nullptr;
+            external_hidden_state_input_ = nullptr; // single-use semantics
         }
 
-        // =====================================================================
-        // Decode Graph Cache: Reuse cached graph for decode mode (seq_len=1)
-        // =====================================================================
-        // During decode, the graph structure is identical between steps —
-        // only token_ids, position_ids, and position_offset change.
-        // Instead of rebuilding hundreds of stage objects every forward() call,
-        // we cache the graph after the first decode step and reuse it.
-        //
-        // Benefits:
-        // - Eliminates stage object construction/destruction (~100s of allocs)
-        // - Preserves kernel caches in stages (JIT attention, RoPE inv_freq)
-        // - Avoids workspace re-binding (bindWorkspace → inv_freq reset)
-        // - Skips graph traversal in ensureDeviceWorkspaceAllocated()
-        // =====================================================================
+        // Ensure engine is initialized with current config
+        ensureForwardEngine();
 
-        bool is_decode = (effective_input.seq_len == 1 && effective_input.batch_size <= 1);
-        bool has_unified_pp_path = (pipeline_config_ && pipeline_config_->hasPP());
-        bool is_standard_path = !pipeline_config_ && !pp_stage_config_.has_value();
-        bool is_partial_pp_path = !pipeline_config_ && pp_stage_config_.has_value();
+        // Delegate to ForwardExecutionEngine
+        return forward_engine_->execute(effective_input, output, *this);
+    }
 
-        ForwardGraphSignature forward_signature;
-        ForwardGraphCache *active_forward_cache = nullptr;
-        // PP non-embedding stages receive hidden state instead of tokens,
-        // so token_ids is legitimately nullptr. They still have stable inputs
-        // (position_ids for RoPE, hidden state via setHiddenState).
-        const bool is_pp_non_embedding_stage =
-            pp_stage_config_.has_value() && !pp_stage_config_->has_embedding;
-        const bool has_stable_forward_inputs =
-            ((effective_input.token_ids != nullptr) && (effective_input.position_ids != nullptr)) ||
-            (is_pp_non_embedding_stage && (effective_input.position_ids != nullptr));
-        const bool forward_cache_eligible =
-            cache_config_.enabled &&
-            !has_unified_pp_path &&
-            has_stable_forward_inputs &&
-            (is_standard_path || is_partial_pp_path);
-        if (forward_cache_eligible)
-        {
-            int pp_first_layer = -1;
-            int pp_last_layer = -1;
-            bool pp_has_embedding = false;
-            bool pp_has_lm_head = false;
-            if (pp_stage_config_.has_value())
-            {
-                const auto &pp = pp_stage_config_.value();
-                pp_first_layer = pp.first_layer;
-                pp_last_layer = pp.last_layer;
-                pp_has_embedding = pp.has_embedding;
-                pp_has_lm_head = pp.has_lm_head;
-            }
+    // =====================================================================
+    // IForwardExecutionHost interface implementations
+    // =====================================================================
 
-            forward_signature = ForwardGraphSignature{
-                effective_input.seq_len,
-                effective_input.batch_size,
-                input.device,
-                is_decode,
-                is_standard_path,
-                pp_stage_config_.has_value(),
-                pp_first_layer,
-                pp_last_layer,
-                pp_has_embedding,
-                pp_has_lm_head};
+    void DeviceGraphOrchestrator::ensureForwardEngine()
+    {
+        if (forward_engine_)
+            return;
 
-            auto cache_it = forward_graph_cache_.find(forward_signature);
-            if (cache_it != forward_graph_cache_.end())
-            {
-                active_forward_cache = &cache_it->second;
-            }
-        }
+        ForwardExecutionEngine::Config engine_config;
+        engine_config.cache_config = cache_config_;
+        engine_config.pp_stage_config = pp_stage_config_;
+        engine_config.has_unified_pp =
+            pipeline_config_ && pipeline_config_->hasPP();
 
-        bool use_cached_forward = forward_cache_eligible && active_forward_cache && active_forward_cache->valid;
+        forward_engine_ = std::make_unique<ForwardExecutionEngine>(
+            std::move(engine_config), executor_);
 
-        if (use_cached_forward)
-        {
-            auto &forward_cache = *active_forward_cache;
-            // ===== CACHE HIT: Reuse cached decode graph =====
+        // Forward current timeline flags
+        forward_engine_->setSuppressTimeline(suppress_timeline_);
+        forward_engine_->setAccumulatePrefill(accumulate_prefill_);
+    }
 
-            // Update stable buffers — stages hold pointers to these, so the
-            // pointed-to values change but the pointers remain valid
-            int total_tokens = effective_input.batch_size * effective_input.seq_len;
-            if (effective_input.token_ids)
-            {
-                if (static_cast<int>(forward_cache.token_ids.size()) == total_tokens)
-                {
-                    std::memcpy(forward_cache.token_ids.data(), effective_input.token_ids,
-                                static_cast<size_t>(total_tokens) * sizeof(int));
-                }
-                else
-                {
-                    forward_cache.token_ids.assign(effective_input.token_ids,
-                                                   effective_input.token_ids + total_tokens);
-                }
-            }
-            if (effective_input.position_ids)
-            {
-                if (static_cast<int>(forward_cache.position_ids.size()) == total_tokens)
-                {
-                    std::memcpy(forward_cache.position_ids.data(), effective_input.position_ids,
-                                static_cast<size_t>(total_tokens) * sizeof(int));
-                }
-                else
-                {
-                    forward_cache.position_ids.assign(effective_input.position_ids,
-                                                      effective_input.position_ids + total_tokens);
-                }
-            }
+    GraphBuildResult DeviceGraphOrchestrator::buildForwardGraph(
+        const ForwardInput &input)
+    {
+        auto session = buildGraph().forInput(input);
 
-            // PP hidden state copy: for non-embedding PP stages, copy the
-            // external hidden state (from previous PP stage) to the working
-            // buffer before executing the cached graph.
-            if (forward_cache.pp_needs_copy &&
-                forward_cache.pp_external_hidden_state &&
-                forward_cache.pp_working_buffer)
-            {
-                // Unified PP copy: data() handles all device/BAR coherence sync
-                // automatically (including BAR-backed D2H via staging buffer).
-                const void *src = forward_cache.pp_external_hidden_state->data();
-                void *dst = forward_cache.pp_working_buffer->mutable_data();
-                std::memcpy(dst, src, forward_cache.pp_copy_bytes);
-
-                const auto &dev = forward_cache.pp_device;
-                if (dev.is_gpu())
-                {
-                    forward_cache.pp_working_buffer->ensureOnDevice(dev);
-                    forward_cache.pp_working_buffer->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, dev);
-                }
-            }
-
-            // For GPU graph replay: set the capture stream on all stages ONCE.
-            // The capture_stream never changes between decode steps, so after the
-            // first pass we skip this 339-stage loop entirely.
-            void *replay_stream = forward_cache.segment_cache.capture_stream;
-            if (replay_stream && !forward_cache.gpu_stream_applied)
-            {
-                const auto &order = forward_cache.graph->getExecutionOrder();
-                for (const auto &node_name : order)
-                {
-                    ComputeNode *node = forward_cache.graph->getNode(node_name);
-                    if (node && node->stage)
-                        node->stage->setGPUStream(replay_stream);
-                }
-                forward_cache.gpu_stream_applied = true;
-            }
-
-            // Update position-dependent params using cached stage pointers.
-            // Only ~4 stages override updateDynamicParams() — avoids iterating
-            // all ~339 stages with hash lookups on every decode step.
-            if (!forward_cache.dynamic_param_stages_cached)
-            {
-                forward_cache.dynamic_param_stages.clear();
-                const auto &order = forward_cache.graph->getExecutionOrder();
-                for (const auto &node_name : order)
-                {
-                    ComputeNode *node = forward_cache.graph->getNode(node_name);
-                    if (node && node->stage && node->stage->hasDynamicParams())
-                        forward_cache.dynamic_param_stages.push_back(node->stage.get());
-                }
-                forward_cache.dynamic_param_stages_cached = true;
-            }
-            for (auto *stage : forward_cache.dynamic_param_stages)
-            {
-                stage->updateDynamicParams(effective_input.position_offset,
-                                           effective_input.seq_len);
-            }
-
-            // Skip graph reset when Phase 3 replay is active — Phase 3 doesn't
-            // call markCompleted(), so all flags are already false from last reset.
-            if (!forward_cache.phase3_active)
-            {
-                forward_cache.graph->reset();
-            }
-
-            output = forward_cache.output;
-
-            // Execute with single device context (standard path, no PP)
-            IDeviceContext *ctx = getDeviceContext(input.device);
-            if (!ctx)
-            {
-                LOG_ERROR("[DeviceGraphOrchestrator] Failed to get device context");
-                return false;
-            }
-
-            bool success;
-            const bool has_collective_nodes = !forward_cache.collective_nodes.empty();
-
-            // Graph capture (segmented/monolithic) is only beneficial for decode
-            // graphs (seq_len=1) where the same fixed-shape graph replays thousands
-            // of times. For prefill (seq_len>1), graph capture adds ~550ms one-shot
-            // overhead (HIP graph capture + instantiation) that is never amortized
-            // because prefill shapes change per prompt. Use executeFastDecode directly.
-            bool used_segmented_capture = false;
-
-            auto exec_t0 = std::chrono::high_resolution_clock::now();
-
-            if (!is_decode)
-            {
-                // Prefill: fast path without graph capture overhead
-                success = executor_.executeFastDecode(
-                    *forward_cache.graph, ctx, &forward_cache.collective_nodes);
-            }
-            else
-            {
-                const auto capture_policy = buildDecodeCapturePolicy(
-                    has_collective_nodes,
-                    ctx,
-                    forward_cache.segment_cache.consecutive_failures);
-                if (capture_policy.collective_segmented_enabled)
-                {
-                    LOG_INFO("[DeviceGraphOrchestrator] Experimental collective segmented GPU-graph replay enabled");
-                }
-
-                if (capture_policy.allow_segmented_capture && !forward_cache.gpu_stream)
-                {
-                    DeviceId dev_id = ctx->deviceId();
-                    if (dev_id.is_gpu())
-                    {
-                        auto &pool = GPUDeviceContextPool::instance();
-                        IWorkerGPUContext &gpu_ctx = pool.getContext(dev_id);
-                        forward_cache.gpu_stream = gpu_ctx.defaultStream();
-                        forward_cache.gpu_ctx = &gpu_ctx;
-                    }
-                }
-
-                success = executor_.executeDecodeWithCapturePolicy(
-                    *forward_cache.graph,
-                    ctx,
-                    &forward_cache.segment_cache,
-                    forward_cache.gpu_stream,
-                    forward_cache.gpu_ctx,
-                    &forward_cache.collective_nodes,
-                    capture_policy,
-                    &used_segmented_capture);
-            }
-
-            auto exec_t1 = std::chrono::high_resolution_clock::now();
-
-            if (success && used_segmented_capture &&
-                forward_cache.segment_cache.initialized &&
-                !forward_cache.segment_cache.needs_capture)
-            {
-                // Phase 3 replay doesn't call markCompleted(), so we can
-                // skip graph.reset() on subsequent steps.
-                forward_cache.phase3_active = true;
-            }
-            else
-            {
-                forward_cache.phase3_active = false;
-            }
-
-            // Sync the stream at the forward pass boundary so logits are
-            // immediately available to the caller without per-access event waits.
-            // This moves the synchronization point from the lazy data() call
-            // (inside ensureOnHost) to here, eliminating coherence overhead
-            // when the sampler reads logits.
-            if (success)
-            {
-                if (forward_cache.phase3_active)
-                {
-                    // Phase 3 replay already synchronized both capture_stream
-                    // and defaultStream at the end of executeReplayPhase().
-                    // Skip the redundant device-wide hipDeviceSynchronize and
-                    // just mark the mapped logits as host-visible.
-                    if (state_.logits && state_.logits->isMapped())
-                    {
-                        state_.logits->markMappedSynced();
-                    }
-                }
-                else
-                {
-                    syncLogitsAtBoundary(ctx);
-                }
-
-                // Stage timeline: GPU is now synced, collect and print event timings
-                // Prints when LLAMINAR_GPU_STAGE_TIMING=1 (does not require LLAMINAR_PROFILING).
-                if (debugEnv().gpu_stage_timing && !suppress_timeline_ && ctx->deviceId().is_gpu())
-                {
-                    auto &timeline = executor_.stageTimeline();
-                    auto &pool = GPUDeviceContextPool::instance();
-                    IWorkerGPUContext &gpu_ctx = pool.getContext(ctx->deviceId());
-                    timeline.collect(&gpu_ctx);
-                    double wall_ms = std::chrono::duration<double, std::milli>(
-                                         std::chrono::high_resolution_clock::now() - start)
-                                         .count();
-                    std::string dev_str = ctx->deviceId().toString();
-                    const char *dev_name = dev_str.c_str();
-
-                    if (is_decode)
-                    {
-                        // Accumulate decode iterations — print once via flushStageTimeline()
-                        timeline.accumulateIteration(wall_ms);
-                    }
-                    else if (accumulate_prefill_)
-                    {
-                        // Accumulate prefill iterations — print once via flushStageTimeline() (benchmark mode)
-                        int tokens = input.batch_size * input.seq_len;
-                        timeline.accumulatePrefillIteration(wall_ms, tokens);
-                    }
-                    else
-                    {
-                        // Flush any pending decode data before printing prefill
-                        timeline.printAccumulatedSummary("DECODE", dev_name);
-
-                        int tokens = input.batch_size * input.seq_len;
-                        timeline.printSummary("PREFILL", tokens, wall_ms, dev_name);
-                        if (debugEnv().gpu_stage_timing_detail)
-                            timeline.printDetailedTimeline("PREFILL", dev_name);
-                    }
-                    timeline.resetTimings();
-                }
-            }
-
-            auto end = std::chrono::high_resolution_clock::now();
-            double ms = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count() / 1000.0;
-
-            // Decode step timing breakdown (enabled via TP_TIMING)
-            if (is_decode && debugEnv().tp_timing)
-            {
-                double setup_us = std::chrono::duration<double, std::micro>(exec_t0 - start).count();
-                double exec_us = std::chrono::duration<double, std::micro>(exec_t1 - exec_t0).count();
-                double sync_us = std::chrono::duration<double, std::micro>(end - exec_t1).count();
-                LOG_INFO("[DEVICE_DECODE] dev=" << input.device
-                                                << " setup=" << std::fixed << std::setprecision(1) << setup_us << "us"
-                                                << " exec=" << exec_us << "us"
-                                                << " sync=" << sync_us << "us"
-                                                << " total=" << (ms * 1000.0) << "us"
-                                                << " phase3=" << forward_cache.phase3_active);
-            }
-
-            LOG_DEBUG("[DeviceGraphOrchestrator] Forward (cached decode) completed in "
-                      << ms << "ms, success=" << success);
-
-            return success;
-        }
-
-        // ===== CACHE MISS: Build new graph =====
-
-        // Unified PP path currently executes multi-device graphs and does not use
-        // this forward cache; clear entries to avoid stale memory growth.
-        if (has_unified_pp_path && !forward_graph_cache_.empty())
-        {
-            for (auto &[_, cache] : forward_graph_cache_)
-            {
-                cache.invalidate();
-            }
-            forward_graph_cache_.clear();
-            LOG_DEBUG("[DeviceGraphOrchestrator] Cleared forward graph cache for unified PP execution path");
-        }
-
-        // For cache misses on standard path: redirect token_ids and
-        // position_ids to stable buffers so that cached stages' pointers survive.
-        ForwardGraphCache *build_cache = nullptr;
-        bool should_cache_after_build = false;
-        if (forward_cache_eligible)
-        {
-            auto [it, _inserted] = forward_graph_cache_.try_emplace(forward_signature);
-            build_cache = &it->second;
-            should_cache_after_build = !build_cache->valid;
-        }
-
-        if (should_cache_after_build)
-        {
-            int total_tokens = effective_input.batch_size * effective_input.seq_len;
-            if (effective_input.token_ids)
-            {
-                build_cache->token_ids.assign(
-                    effective_input.token_ids,
-                    effective_input.token_ids + total_tokens);
-                effective_input.token_ids = build_cache->token_ids.data();
-            }
-            if (effective_input.position_ids)
-            {
-                build_cache->position_ids.assign(
-                    effective_input.position_ids,
-                    effective_input.position_ids + total_tokens);
-                effective_input.position_ids = build_cache->position_ids.data();
-            }
-        }
-
-        // Build forward graph via fluent builder API
-        // Priority is auto-selected: unified PP > partial PP stage > full forward
-        GraphBuildResult build_result = [&]() -> GraphBuildResult
-        {
-            // Start building the graph with input
-            auto session = buildGraph()
-                               .forInput(effective_input);
-
-            // Add external hidden state for PP middle/final stages (if set above)
-            // Note: external_hidden_state is already in effective_input.external_hidden_state
-            // but the fluent API uses it via prepareInput()
-
-            if (pipeline_config_ && pipeline_config_->hasPP())
-            {
-                // Unified PP+TP path: single graph spanning all PP stages
-                LOG_DEBUG("[DeviceGraphOrchestrator] Building UNIFIED PIPELINE graph: "
-                          << pipeline_config_->numStages() << " PP stages, "
-                          << pipeline_config_->total_layers << " layers");
-
-                // Initialize PP and TP contexts if needed
-                if (!pp_contexts_initialized_ && !initializePPContexts())
-                {
-                    return GraphBuildResult("Failed to initialize PP contexts");
-                }
-                if (!tp_contexts_initialized_ && !initializeTPContexts())
-                {
-                    return GraphBuildResult("Failed to initialize TP contexts");
-                }
-
-                // Wire PP contexts to the session
-                for (const auto &[key, ctx] : pp_contexts_)
-                {
-                    session.withPPContext(key.first, key.second, ctx.get());
-                }
-
-                // Wire TP contexts to the session
-                for (const auto &[name, ctx] : domain_tp_contexts_)
-                {
-                    session.withTPContext(name, ctx.get());
-                }
-
-                return session
-                    .withPipelineConfig(pipeline_config_)
-                    .buildUnified();
-            }
-            else if (pp_stage_config_.has_value())
-            {
-                // Legacy single-stage PP path
-                const auto &pp = pp_stage_config_.value();
-                LOG_DEBUG("[DeviceGraphOrchestrator] Building PARTIAL forward graph: "
-                          << "layers=[" << pp.first_layer << ", " << pp.last_layer << ") "
-                          << "has_embedding=" << pp.has_embedding
-                          << " has_lm_head=" << pp.has_lm_head);
-
-                return session
-                    .forPPStage(pp.first_layer, pp.last_layer, pp.has_embedding, pp.has_lm_head)
-                    .buildPartial();
-            }
-            else
-            {
-                LOG_DEBUG("[DeviceGraphOrchestrator] Building FULL forward graph...");
-                return session.buildForward();
-            }
-        }();
-
-        if (!build_result)
-        {
-            LOG_ERROR("[DeviceGraphOrchestrator] Graph build failed: " << build_result.error());
-            return false;
-        }
-
-        output = build_result.output();
-        ComputeGraph graph = build_result.takeGraph();
-
-        LOG_DEBUG("[DeviceGraphOrchestrator] Forward graph built with " << graph.size() << " stages");
-
-        if (graph.size() == 0)
-        {
-            LOG_ERROR("[DeviceGraphOrchestrator] Empty forward graph");
-            return false;
-        }
-
-        // Ensure GPU workspace is allocated for GEMM kernels (lazy initialization)
-        ensureDeviceWorkspaceAllocated(graph);
-
-        bool success = false;
-
-        // Execution path depends on configuration:
-        // - Unified PP: multi-device execution with all PP stage devices
-        // - Single-device: standard single-context execution
         if (pipeline_config_ && pipeline_config_->hasPP())
         {
-            // Build device contexts map for all devices in the pipeline
-            std::unordered_map<DeviceId, IDeviceContext *> contexts;
-            for (const auto &device : pipeline_config_->getAllDevices())
-            {
-                IDeviceContext *ctx = getDeviceContext(device);
-                if (!ctx)
-                {
-                    LOG_ERROR("[DeviceGraphOrchestrator] Failed to get device context for " << device);
-                    return false;
-                }
-                contexts[device] = ctx;
-            }
+            LOG_DEBUG("[DeviceGraphOrchestrator] Building UNIFIED PIPELINE graph: "
+                      << pipeline_config_->numStages() << " PP stages, "
+                      << pipeline_config_->total_layers << " layers");
 
-            LOG_DEBUG("[DeviceGraphOrchestrator] Executing unified PP graph with "
-                      << contexts.size() << " device contexts...");
+            if (!pp_contexts_initialized_ && !initializePPContexts())
+                return GraphBuildResult("Failed to initialize PP contexts");
 
-            success = executor_.executeMultiDevice(graph, contexts);
+            if (!tp_contexts_initialized_ && !initializeTPContexts())
+                return GraphBuildResult("Failed to initialize TP contexts");
+
+            for (const auto &[key, ctx] : pp_contexts_)
+                session.withPPContext(key.first, key.second, ctx.get());
+
+            for (const auto &[name, ctx] : domain_tp_contexts_)
+                session.withTPContext(name, ctx.get());
+
+            return session
+                .withPipelineConfig(pipeline_config_)
+                .buildUnified();
+        }
+        else if (pp_stage_config_.has_value())
+        {
+            const auto &pp = pp_stage_config_.value();
+            LOG_DEBUG("[DeviceGraphOrchestrator] Building PARTIAL forward graph: "
+                      << "layers=[" << pp.first_layer << ", " << pp.last_layer << ") "
+                      << "has_embedding=" << pp.has_embedding
+                      << " has_lm_head=" << pp.has_lm_head);
+
+            return session
+                .forPPStage(pp.first_layer, pp.last_layer,
+                            pp.has_embedding, pp.has_lm_head)
+                .buildPartial();
         }
         else
         {
-            // Get single device context
-            LOG_DEBUG("[DeviceGraphOrchestrator] Getting device context for " << input.device << "...");
-            IDeviceContext *ctx = getDeviceContext(input.device);
+            LOG_DEBUG("[DeviceGraphOrchestrator] Building FULL forward graph...");
+            return session.buildForward();
+        }
+    }
+
+    std::unordered_map<DeviceId, IDeviceContext *>
+    DeviceGraphOrchestrator::getPipelineDeviceContexts()
+    {
+        std::unordered_map<DeviceId, IDeviceContext *> contexts;
+        if (!pipeline_config_)
+            return contexts;
+
+        for (const auto &device : pipeline_config_->getAllDevices())
+        {
+            IDeviceContext *ctx = getDeviceContext(device);
             if (!ctx)
             {
-                LOG_ERROR("[DeviceGraphOrchestrator] Failed to get device context");
-                return false;
+                LOG_ERROR("[DeviceGraphOrchestrator] Failed to get device context for "
+                          << device);
+                return {};
             }
-            LOG_DEBUG("[DeviceGraphOrchestrator] Got device context, starting execution...");
-
-            success = executor_.execute(graph, ctx);
+            contexts[device] = ctx;
         }
+        return contexts;
+    }
 
-        // Sync the stream at the forward pass boundary (same as cached path above)
-        if (success)
+    TensorBase *DeviceGraphOrchestrator::logitsTensor()
+    {
+        return state_.logits.get();
+    }
+
+    IForwardExecutionHost::PPCopyInfo
+    DeviceGraphOrchestrator::resolvePPCopyInfo(
+        const ForwardInput &input) const
+    {
+        PPCopyInfo info;
+        if (!input.external_hidden_state || !graph_builder_)
+            return info;
+
+        const auto &cfg = graph_builder_->config();
+        const auto &bufs = graph_builder_->buffers();
+        InferenceMode mode(cfg.activation_precision);
+
+        TensorBase *working_buffer =
+            bufs.layer_buffers.residual && mode.isHybridQ16()
+                ? bufs.layer_buffers.residual
+                : bufs.current_hidden;
+
+        if (!working_buffer ||
+            input.external_hidden_state == working_buffer)
+            return info;
+
+        size_t copy_elems = static_cast<size_t>(
+            input.batch_size * input.seq_len * cfg.d_model);
+
+        if (mode.isHybridQ16())
         {
-            IDeviceContext *sync_ctx = getDeviceContext(input.device);
-            if (sync_ctx)
-            {
-                syncLogitsAtBoundary(sync_ctx);
-            }
-
-            // GPU stage timing for cache-miss path
-            // Prints when LLAMINAR_GPU_STAGE_TIMING=1 (does not require LLAMINAR_PROFILING).
-            if (debugEnv().gpu_stage_timing && !suppress_timeline_ && input.device.is_gpu())
-            {
-                auto &timeline = executor_.stageTimeline();
-                if (timeline.isInitialized())
-                {
-                    auto &pool = GPUDeviceContextPool::instance();
-                    IWorkerGPUContext &gpu_ctx = pool.getContext(input.device);
-                    timeline.collect(&gpu_ctx);
-                    double wall_ms = std::chrono::duration<double, std::milli>(
-                                         std::chrono::high_resolution_clock::now() - start)
-                                         .count();
-                    std::string dev_str = input.device.toString();
-
-                    if (is_decode)
-                    {
-                        // Accumulate decode iterations — print once via flushStageTimeline()
-                        timeline.accumulateIteration(wall_ms);
-                    }
-                    else if (accumulate_prefill_)
-                    {
-                        // Accumulate prefill iterations — print once via flushStageTimeline() (benchmark mode)
-                        int tokens = input.batch_size * input.seq_len;
-                        timeline.accumulatePrefillIteration(wall_ms, tokens);
-                    }
-                    else
-                    {
-                        // Flush any pending decode data before printing prefill
-                        timeline.printAccumulatedSummary("DECODE", dev_str.c_str());
-
-                        int tokens = input.batch_size * input.seq_len;
-                        timeline.printSummary("PREFILL", tokens, wall_ms, dev_str.c_str());
-                        if (debugEnv().gpu_stage_timing_detail)
-                            timeline.printDetailedTimeline("PREFILL", dev_str.c_str());
-                    }
-                    timeline.resetTimings();
-                }
-            }
+            size_t num_blocks = (copy_elems + 31) / 32;
+            info.copy_bytes = num_blocks * sizeof(Q16_1Block);
         }
-
-        // Cache the graph for future matching forward signatures
-        if (should_cache_after_build && success)
+        else
         {
-            build_cache->graph = std::make_unique<ComputeGraph>(std::move(graph));
-            build_cache->output = output;
-            // Pre-compute collective node set for fast decode intercept
-            build_cache->collective_nodes.clear();
-            for (const auto &n : build_cache->graph->getExecutionOrder())
-            {
-                auto *nd = build_cache->graph->getNode(n);
-                if (nd && nd->stage)
-                {
-                    auto t = nd->stage->type();
-                    if (t == ComputeStageType::ALLREDUCE ||
-                        t == ComputeStageType::ALLGATHER ||
-                        t == ComputeStageType::ALLGATHER_V)
-                    {
-                        build_cache->collective_nodes.insert(n);
-                    }
-                }
-            }
-
-            build_cache->valid = true;
-
-            // Store PP hidden state copy info for cache HIT replay.
-            // On cache MISS the copy was done inline by buildPartialForwardGraph().
-            // On cache HIT we must redo it since graph build code is not re-executed.
-            if (effective_input.external_hidden_state && graph_builder_)
-            {
-                const auto &cfg = graph_builder_->config();
-                const auto &bufs = graph_builder_->buffers();
-                InferenceMode mode(cfg.activation_precision);
-                TensorBase *working_buffer =
-                    bufs.layer_buffers.residual && mode.isHybridQ16()
-                        ? bufs.layer_buffers.residual
-                        : bufs.current_hidden;
-
-                if (working_buffer &&
-                    effective_input.external_hidden_state != working_buffer)
-                {
-                    size_t copy_elems = static_cast<size_t>(
-                        effective_input.batch_size * effective_input.seq_len * cfg.d_model);
-                    size_t copy_bytes;
-                    if (mode.isHybridQ16())
-                    {
-                        size_t num_blocks = (copy_elems + 31) / 32;
-                        copy_bytes = num_blocks * sizeof(Q16_1Block);
-                    }
-                    else
-                    {
-                        copy_bytes = copy_elems * sizeof(float);
-                    }
-
-                    build_cache->pp_external_hidden_state = effective_input.external_hidden_state;
-                    build_cache->pp_working_buffer = working_buffer;
-                    build_cache->pp_copy_bytes = copy_bytes;
-                    build_cache->pp_device = cfg.default_device;
-                    build_cache->pp_needs_copy = true;
-
-                    LOG_DEBUG("[DeviceGraphOrchestrator] Stored PP copy info: "
-                              << copy_bytes << " bytes on " << cfg.default_device.toString());
-                }
-            }
-
-            LOG_INFO("[DeviceGraphOrchestrator] Cached forward graph for signature "
-                     << "[seq_len=" << forward_signature.seq_len
-                     << ", batch_size=" << forward_signature.batch_size
-                     << ", device=" << forward_signature.device.to_string()
-                     << ", decode=" << forward_signature.decode
-                     << "] (" << build_cache->graph->size() << " stages)");
+            info.copy_bytes = copy_elems * sizeof(float);
         }
 
-        auto end = std::chrono::high_resolution_clock::now();
-        double ms = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count() / 1000.0;
+        info.external_hidden = input.external_hidden_state;
+        info.working_buffer = working_buffer;
+        info.device = cfg.default_device;
+        info.needs_copy = true;
 
-        LOG_DEBUG("[DeviceGraphOrchestrator] Forward completed in " << ms << "ms, success=" << success);
-
-        return success;
+        LOG_DEBUG("[DeviceGraphOrchestrator] Resolved PP copy info: "
+                  << info.copy_bytes << " bytes on "
+                  << cfg.default_device.toString());
+        return info;
     }
 
     void DeviceGraphOrchestrator::syncLogitsAtBoundary(IDeviceContext *ctx)
@@ -1729,11 +1231,8 @@ namespace llaminar2
         }
 
         // Clear forward graph caches
-        for (auto &[_, cache] : forward_graph_cache_)
-        {
-            cache.invalidate();
-        }
-        forward_graph_cache_.clear();
+        if (forward_engine_)
+            forward_engine_->clearCache();
 
         // Clear device contexts
         device_contexts_.clear();
@@ -1811,10 +1310,10 @@ namespace llaminar2
     }
 
     // =========================================================================
-    // Inference State Management (Phase 5)
+    // Inference State Management
     // =========================================================================
 
-    bool DeviceGraphOrchestrator::initializeInferenceState(
+    bool DeviceGraphOrchestrator::initializeInferenceStateFromArena(
         int batch_size,
         int max_seq_len,
         DeviceId device,
@@ -1827,430 +1326,220 @@ namespace llaminar2
         }
 
         const auto &config = graph_builder_->config();
-        int d_model = config.d_model;
-        int vocab_size = config.vocab_size;
-        // For PP stages, use the stage's layer count (not full model) for KV cache allocation
-        int n_layers = pp_stage_config_.has_value()
-                           ? pp_stage_config_.value().layerCount()
-                           : config.n_layers;
-        int n_heads = config.n_heads;
-        int n_kv_heads = config.n_kv_heads;
-        int head_dim = config.head_dim;
-        int d_ff = config.d_ff;
-
-        // For tensor parallelism, use local head counts for buffer allocation
-        // When qkv_column_parallel is enabled, each rank processes only its subset of heads
-        int buffer_n_heads = config.qkv_column_parallel ? config.local_n_heads : n_heads;
-        int buffer_n_kv_heads = config.qkv_column_parallel ? config.local_n_kv_heads : n_kv_heads;
-        int buffer_d_ff = config.ffn_column_parallel ? config.d_ff_local : d_ff;
-
-        LOG_DEBUG("[DeviceGraphOrchestrator] Initializing inference state: batch_size=" << batch_size
-                                                                                        << " max_seq_len=" << max_seq_len
-                                                                                        << " d_model=" << d_model
-                                                                                        << " vocab_size=" << vocab_size);
-
-        if (config.qkv_column_parallel)
-        {
-            LOG_DEBUG("[DeviceGraphOrchestrator] Using local buffer sizes for TP: n_heads=" << buffer_n_heads
-                                                                                            << "/" << n_heads << " n_kv_heads=" << buffer_n_kv_heads << "/" << n_kv_heads
-                                                                                            << " d_ff=" << buffer_d_ff << "/" << d_ff);
-        }
-
-        // Create a default MPI context if none was provided
-        std::shared_ptr<MPIContext> local_mpi_ctx = mpi_ctx_;
-        if (!local_mpi_ctx)
-        {
-            // Create a single-rank MPI context for non-MPI usage
-            local_mpi_ctx = std::make_shared<MPIContext>(0, 1, MPI_COMM_NULL);
-            LOG_DEBUG("[DeviceGraphOrchestrator] Created default single-rank MPI context");
-        }
-
-        // Create tensor factory and store it as owned member so it
-        // outlives initializeInferenceState() — BufferArena
-        // and ensureDeviceWorkspaceAllocated() need it later.
-        owned_tensor_factory_ = std::make_unique<TensorFactory>(*local_mpi_ctx);
-        tensor_factory_ = owned_tensor_factory_.get();
-        auto &factory = *owned_tensor_factory_;
-
-        // Enable mapped memory allocation for GPU tensors when requested
-        // This enables zero-copy host access for all FP32 GPU tensors, avoiding slow memcpy syncs
-        // Works for both CUDA and ROCm backends (cudaHostAllocMapped / hipHostMallocMapped)
-        if (init_config.use_mapped_memory && device.is_gpu())
-        {
-            factory.setUseMappedMemoryForGPU(true);
-            LOG_DEBUG("[DeviceGraphOrchestrator] Enabling mapped memory for ALL GPU tensors (zero-copy host access)");
-        }
 
         // =====================================================================
-        // BAR-Backed Allocation for LOCAL TP with PCIeBAR Backend
+        // Ensure TensorFactory exists (needed for arena allocation + snapshots)
         // =====================================================================
-        // When using LOCAL TP with PCIeBAR backend, ROCm devices need BAR-backed
-        // tensors for row-parallel outputs (attn_proj, ffn_output). This enables
-        // zero-copy allreduce where CUDA reads directly from ROCm's BAR region.
-        //
-        // Conditions for BAR-backed allocation:
-        // 1. LOCAL TP is active (local_tp_ctx != nullptr && degree > 1)
-        // 2. Backend is PCIeBAR
-        // 3. Current device is ROCm
-        // 4. DirectP2PEngine is available from LocalTPContext
-        // =====================================================================
-        bool use_bar_allocation = false;
-        DeviceId cuda_device_for_bar; // CUDA device that will read from BAR
-        DeviceId rocm_device_for_bar; // ROCm device that will own BAR memory
-
-        if (config.local_tp_ctx &&
-            config.local_tp_ctx->degree() > 1 &&
-            config.local_tp_ctx->backend() == CollectiveBackendType::PCIE_BAR &&
-            device.is_rocm())
+        if (!tensor_factory_)
         {
-            // Get DirectP2PEngine from LocalTPContext
-            auto p2p_engine = config.local_tp_ctx->getDirectP2PEngine();
-            if (p2p_engine)
+            std::shared_ptr<MPIContext> local_mpi_ctx = mpi_ctx_;
+            if (!local_mpi_ctx)
             {
-                factory.setDirectP2P(p2p_engine);
-
-                // Find the CUDA device in the LOCAL TP group
-                for (const auto &dev : config.local_tp_ctx->devices())
-                {
-                    if (dev.toLocalDeviceId().is_cuda())
-                    {
-                        cuda_device_for_bar = dev.toLocalDeviceId();
-                        break;
-                    }
-                }
-
-                rocm_device_for_bar = device; // Current device is ROCm
-                use_bar_allocation = cuda_device_for_bar.is_cuda();
-
-                if (use_bar_allocation)
-                {
-                    LOG_INFO("[DeviceGraphOrchestrator] Enabled BAR-backed allocation for LOCAL TP PCIeBAR: "
-                             << "ROCm=" << rocm_device_for_bar.toString()
-                             << ", CUDA=" << cuda_device_for_bar.toString());
-                }
-                else
-                {
-                    LOG_WARN("[DeviceGraphOrchestrator] Cannot enable BAR allocation: no CUDA device in LOCAL TP group");
-                }
+                local_mpi_ctx = std::make_shared<MPIContext>(0, 1, MPI_COMM_NULL);
             }
-            else
+            owned_tensor_factory_ = std::make_unique<TensorFactory>(*local_mpi_ctx);
+            tensor_factory_ = owned_tensor_factory_.get();
+
+            // Enable mapped memory for GPU + zero-copy scenarios
+            if (init_config.use_mapped_memory && device.is_gpu())
             {
-                LOG_WARN("[DeviceGraphOrchestrator] PCIeBAR backend but DirectP2PEngine not available - "
-                         << "allreduce will fall back to staged transfers");
+                owned_tensor_factory_->setUseMappedMemoryForGPU(true);
+                LOG_DEBUG("[DeviceGraphOrchestrator] Arena path: enabling mapped memory for GPU tensors");
+            }
+
+            // Configure BAR-backed allocation for LOCAL TP with PCIeBAR backend
+            if (config.local_tp_ctx &&
+                config.local_tp_ctx->degree() > 1 &&
+                config.local_tp_ctx->backend() == CollectiveBackendType::PCIE_BAR &&
+                device.is_rocm())
+            {
+                auto p2p_engine = config.local_tp_ctx->getDirectP2PEngine();
+                if (p2p_engine)
+                {
+                    owned_tensor_factory_->setDirectP2P(p2p_engine);
+                }
             }
         }
 
-        // Get activation precision from config
-        ActivationPrecision act_prec = config.activation_precision;
-        LOG_DEBUG("[DeviceGraphOrchestrator] Activation buffer precision: " << activationPrecisionToString(act_prec));
+        // =====================================================================
+        // Create arena if not already set up via initializeBuffers()
+        // =====================================================================
+        if (!arena_)
+        {
+            // Set device_id early (initializeBuffers reads it for mapped memory)
+            state_.device_id = device;
 
-        // Allocate core buffers (always FP32 - interface with embeddings/softmax)
-        // =========================================================================
-        // Hidden State: BAR-backed allocation for cross-vendor PP transfers
-        // =========================================================================
-        // When use_bar_backed_hidden is true and the device is ROCm, allocate hidden
-        // state in PCIe BAR memory. This enables zero-copy reads from CUDA devices
-        // during PP activation transfer (ROCm stage → CUDA stage).
-        // =========================================================================
+            // Temporarily set snapshot_enabled_ if mapped memory requested
+            // (initializeBuffers checks snapshot_enabled_ for mapped memory decision)
+            bool prev_snapshot = snapshot_enabled_;
+            if (init_config.use_mapped_memory)
+            {
+                snapshot_enabled_ = true;
+            }
+
+            if (!initializeBuffers(max_seq_len))
+            {
+                snapshot_enabled_ = prev_snapshot;
+                LOG_ERROR("[DeviceGraphOrchestrator] Failed to initialize buffers via arena");
+                return false;
+            }
+            snapshot_enabled_ = prev_snapshot;
+        }
+
+        // =====================================================================
+        // Pull activation buffers from arena (schema-driven allocation)
+        // =====================================================================
+        state_.hidden = arena_->getSharedTensor(BufferId::HIDDEN_STATE);
+        state_.logits = arena_->getSharedTensor(BufferId::LOGITS);
+        state_.logits_local = arena_->getSharedTensor(BufferId::LOGITS_LOCAL); // nullptr if not TP
+        state_.normalized = arena_->getSharedTensor(BufferId::NORMALIZED);
+        state_.residual = arena_->getSharedTensor(BufferId::RESIDUAL);
+        state_.Q = arena_->getSharedTensor(BufferId::Q_PROJ);
+        state_.K = arena_->getSharedTensor(BufferId::K_PROJ);
+        state_.V = arena_->getSharedTensor(BufferId::V_PROJ);
+        state_.attn_output = arena_->getSharedTensor(BufferId::ATTN_OUTPUT);
+        state_.attn_proj = arena_->getSharedTensor(BufferId::ATTN_PROJ);
+        state_.gate = arena_->getSharedTensor(BufferId::GATE_PROJ);
+        state_.up = arena_->getSharedTensor(BufferId::UP_PROJ);
+        state_.ffn_output = arena_->getSharedTensor(BufferId::FFN_OUTPUT);
+        state_.workspace_scores = arena_->getSharedTensor(BufferId::ATTN_SCORES_WORKSPACE);
+        state_.workspace_context = arena_->getSharedTensor(BufferId::ATTN_CONTEXT_WORKSPACE);
+        state_.workspace_mask = arena_->getSharedTensor(BufferId::GEMM_WORKSPACE);
+
+        // Conditional buffers (Hybrid/HybridQ16 mode only — nullptr if not in schema)
+        state_.Q_rope = arena_->getSharedTensor(BufferId::Q_ROPE);
+        state_.K_rope = arena_->getSharedTensor(BufferId::K_ROPE);
+        state_.V_dequant = arena_->getSharedTensor(BufferId::V_DEQUANT);
+
+        // Validate required buffers
+        if (!state_.hidden || !state_.logits || !state_.normalized ||
+            !state_.Q || !state_.K || !state_.V ||
+            !state_.attn_output || !state_.attn_proj ||
+            !state_.gate || !state_.up || !state_.ffn_output)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Missing required buffers from arena. "
+                      "Ensure Qwen2Schema provides all layer_buffers and model_buffers.");
+            return false;
+        }
+
+        // =====================================================================
+        // BAR-backed hidden state override for cross-vendor PP transfers
+        // =====================================================================
         if (init_config.use_bar_backed_hidden && device.is_rocm())
         {
-            // Get DirectP2PEngine for BAR allocation (may be shared singleton)
             auto p2p = DirectP2PEngine::getSharedInstance();
-            if (p2p && p2p->isPCIeBarActive())
+            if (p2p && p2p->isPCIeBarActive() && tensor_factory_)
             {
-                // Set P2P on factory so it can create BAR-backed tensors
-                factory.setDirectP2P(p2p);
-
-                // Use cuda:0 as the default CUDA device for BAR allocation
-                // In typical cross-vendor PP setups, there's usually one CUDA device
+                tensor_factory_->setDirectP2P(p2p);
                 DeviceId cuda_device_for_bar = DeviceId::cuda(0);
-
                 try
                 {
-                    auto bar_backed_hidden = factory.createFP32BARBacked(
-                        {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(d_model)},
-                        device, // ROCm device owns the BAR memory
-                        cuda_device_for_bar);
-
+                    auto bar_backed_hidden = tensor_factory_->createFP32BARBacked(
+                        state_.hidden->shape(), device, cuda_device_for_bar);
                     if (bar_backed_hidden)
                     {
                         state_.hidden = std::move(bar_backed_hidden);
-                        LOG_INFO("[DeviceGraphOrchestrator] Allocated BAR-backed hidden state for cross-vendor PP: "
-                                 << "ROCm=" << device.toString() << ", CUDA=" << cuda_device_for_bar.toString());
-                    }
-                    else
-                    {
-                        LOG_WARN("[DeviceGraphOrchestrator] BAR-backed hidden allocation returned nullptr, "
-                                 << "falling back to standard allocation");
+                        LOG_INFO("[DeviceGraphOrchestrator] Arena path: overrode hidden with BAR-backed tensor "
+                                 << "for cross-vendor PP: ROCm=" << device.toString()
+                                 << ", CUDA=" << cuda_device_for_bar.toString());
                     }
                 }
                 catch (const std::exception &e)
                 {
-                    LOG_WARN("[DeviceGraphOrchestrator] BAR-backed hidden allocation failed: " << e.what()
-                                                                                               << " - falling back to standard allocation");
+                    LOG_WARN("[DeviceGraphOrchestrator] BAR-backed hidden override failed: " << e.what()
+                                                                                             << " - keeping arena-allocated hidden");
                 }
             }
-            else
+            else if (!p2p || !p2p->isPCIeBarActive())
             {
-                LOG_WARN("[DeviceGraphOrchestrator] use_bar_backed_hidden requested but PCIe BAR not active, "
-                         << "falling back to standard allocation");
+                LOG_WARN("[DeviceGraphOrchestrator] use_bar_backed_hidden requested but PCIe BAR not active");
             }
         }
 
-        // Standard allocation if BAR-backed not used or failed
-        if (!state_.hidden)
-        {
-            state_.hidden = factory.createFP32(
-                {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(d_model)},
-                device);
-        }
-
-        // Logits ALWAYS use mapped memory on GPU devices (regardless of init_config)
-        // because logits are returned to the caller for sampling - they must be host-accessible.
-        // Mapped memory avoids the slow synchronous hipMemcpy/cudaMemcpy in ensureOnHost().
-        // LM head always computes M=1 (last token only), so logits is [batch_size, vocab_size].
-        // This reduces allocation from [max_seq×vocab] (>1 GB) to [batch×vocab] (<1 MB).
-        if (device.is_gpu())
-        {
-            state_.logits = FP32Tensor::createMapped(
-                {static_cast<size_t>(batch_size), static_cast<size_t>(vocab_size)},
-                device);
-            LOG_INFO("[DeviceGraphOrchestrator] Allocated logits with mapped memory (zero-copy for sampling)"
-                     << " [" << batch_size << " × " << vocab_size << "] = "
-                     << (batch_size * vocab_size * sizeof(float) / (1024 * 1024)) << " MB");
-        }
-        else
-        {
-            state_.logits = factory.createFP32(
-                {static_cast<size_t>(batch_size), static_cast<size_t>(vocab_size)},
-                device);
-        }
-
-        // Phase 5: Allocate local logits buffer for column-parallel LM head
-        if (config.lm_head_column_parallel && config.vocab_local > 0)
-        {
-            state_.logits_local = factory.createFP32(
-                std::vector<size_t>{static_cast<size_t>(batch_size), static_cast<size_t>(config.vocab_local)},
-                device);
-            LOG_DEBUG("[DeviceGraphOrchestrator] Allocated logits_local buffer: ["
-                      << batch_size << ", " << config.vocab_local << "]");
-        }
-
-        // Allocate norm buffer (FP32 - output of RMSNorm for GEMM input)
-        state_.normalized = factory.createFP32(
-            {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(d_model)},
-            device);
-
-        // Allocate residual buffer based on activation precision mode
-        // HybridQ16 uses Q16_1 for 266× better precision than Q8_1 in the residual stream
+        // =====================================================================
+        // Non-arena state: K_head_scales (HybridQ16 only)
+        // =====================================================================
+        ActivationPrecision act_prec = config.activation_precision;
         if (act_prec == ActivationPrecision::HybridQ16)
         {
-            LOG_INFO("[DeviceGraphOrchestrator] Using Q16_1 residual stream for HybridQ16 mode");
-            state_.residual = factory.createQ16_1(
-                {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(d_model)},
-                device);
-        }
-        else
-        {
-            state_.residual = factory.createFP32(
-                {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(d_model)},
-                device);
+            int buffer_n_kv_heads = config.qkv_column_parallel ? config.local_n_kv_heads : config.n_kv_heads;
+            const size_t k_head_scales_size = static_cast<size_t>(batch_size * max_seq_len * buffer_n_kv_heads);
+            state_.K_head_scales.resize(k_head_scales_size, 1.0f);
+            LOG_DEBUG("[DeviceGraphOrchestrator] HybridQ16 K precision fix: allocated K_head_scales ("
+                      << k_head_scales_size << " floats)");
         }
 
-        // QKV buffers - use per-projection precision for HybridQ16 mode
-        // HybridQ16: K is Q16_1 (256× better precision), Q and V are Q8_1
-        // This fixes the K precision loss where Q8_1 zeros out small values
-        ActivationPrecision q_prec = resolveBufferPrecision(
-            act_prec, HybridBufferType::Q_GEMM_Output, nullptr);
-        ActivationPrecision k_prec = resolveBufferPrecision(
-            act_prec, HybridBufferType::K_GEMM_Output, nullptr);
-        ActivationPrecision v_prec = resolveBufferPrecision(
-            act_prec, HybridBufferType::V_GEMM_Output, nullptr);
-
-        LOG_DEBUG("[DeviceGraphOrchestrator] QKV GEMM output precision: Q=" << activationPrecisionToString(q_prec)
-                                                                            << " K=" << activationPrecisionToString(k_prec)
-                                                                            << " V=" << activationPrecisionToString(v_prec));
-
-        state_.Q = factory.createActivation(
-            {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(buffer_n_heads * head_dim)},
-            q_prec, device);
-        // K buffer: Q16_1 for HybridQ16 mode to preserve small values
-        // Pass head_dim for optimal Q16 block size (1 block per head)
-        state_.K = factory.createActivation(
-            {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(buffer_n_kv_heads * head_dim)},
-            k_prec, head_dim, device);
-        state_.V = factory.createActivation(
-            {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(buffer_n_kv_heads * head_dim)},
-            v_prec, device);
-
-        // Hybrid/HybridQ16 mode: Allocate separate FP32 buffers for Q/K after RoPE
-        // This eliminates the requantization step in RoPE
-        // Also allocate V_dequant buffer for KV cache append (V doesn't go through RoPE
-        // but needs to be converted to KV cache precision for storage)
-        if (act_prec == ActivationPrecision::Hybrid || act_prec == ActivationPrecision::HybridQ16)
-        {
-            // Use resolveBufferPrecision to get the correct precision for Q/K after RoPE
-            // Hybrid: FP32, HybridQ16: Q16_1
-            ActivationPrecision q_rope_prec = resolveBufferPrecision(
-                act_prec, HybridBufferType::Q_After_RoPE, nullptr);
-            ActivationPrecision k_rope_prec = resolveBufferPrecision(
-                act_prec, HybridBufferType::K_After_RoPE, nullptr);
-            LOG_DEBUG("[DeviceGraphOrchestrator] " << activationPrecisionToString(act_prec)
-                                                   << " mode: allocating Q_rope buffer ("
-                                                   << activationPrecisionToString(q_rope_prec) << ")");
-            // Pass head_dim for Q16 block size selection (must match KV cache block size)
-            state_.Q_rope = factory.createActivation(
-                {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(buffer_n_heads * head_dim)},
-                q_rope_prec, head_dim, device);
-            LOG_DEBUG("[DeviceGraphOrchestrator] " << activationPrecisionToString(act_prec)
-                                                   << " mode: allocating K_rope buffer ("
-                                                   << activationPrecisionToString(k_rope_prec) << ")");
-            state_.K_rope = factory.createActivation(
-                {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(buffer_n_kv_heads * head_dim)},
-                k_rope_prec, head_dim, device);
-
-            // V_dequant: buffer for V before KV cache append
-            // V is Q8_1 from GEMM, needs to match KV cache precision (FP32 for Hybrid, Q16_1 for HybridQ16)
-            ActivationPrecision kv_cache_prec = resolveBufferPrecision(
-                act_prec, HybridBufferType::KV_Cache, nullptr);
-            kv_cache_prec = resolveKVCacheStoragePrecision(config.kv_cache_precision, device.is_cpu());
-            state_.V_dequant = factory.createActivation(
-                {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(buffer_n_kv_heads * head_dim)},
-                kv_cache_prec, head_dim, device);
-            LOG_DEBUG("[DeviceGraphOrchestrator] " << activationPrecisionToString(act_prec)
-                                                   << " mode: allocating V_dequant buffer ("
-                                                   << activationPrecisionToString(kv_cache_prec) << ")");
-
-            // HybridQ16 K precision fix: allocate per-head K scales buffer
-            // This stores dynamic scales from RoPE Q16→Q16 path for attention kernel
-            if (act_prec == ActivationPrecision::HybridQ16)
-            {
-                const size_t k_head_scales_size = static_cast<size_t>(batch_size * max_seq_len * buffer_n_kv_heads);
-                state_.K_head_scales.resize(k_head_scales_size, 1.0f);
-                LOG_DEBUG("[DeviceGraphOrchestrator] HybridQ16 K precision fix: allocating K_head_scales buffer ("
-                          << k_head_scales_size << " floats, "
-                          << k_head_scales_size * sizeof(float) / 1024 << " KB)");
-            }
-        }
-
-        // Attention output buffer
-        // For Hybrid mode: attention context is FP32 (from softmax × V)
-        ActivationPrecision attn_ctx_prec = resolveBufferPrecision(
-            act_prec, HybridBufferType::Attention_Context, nullptr);
-        state_.attn_output = factory.createActivation(
-            {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(buffer_n_heads * head_dim)},
-            attn_ctx_prec, device);
-
-        // attn_proj is the output of Wo projection which feeds into the residual stream
-        // HybridQ16 mode: Q8_1 (native add to Q16_1 residual via q16_1_add_q8_1)
-        // Other modes: FP32 for numerical stability in residual connections
-        //
-        // For LOCAL TP with PCIeBAR backend: ROCm device uses BAR-backed FP32 tensor
-        // to enable zero-copy allreduce (CUDA reads directly from ROCm BAR region)
-        if (act_prec == ActivationPrecision::HybridQ16)
-        {
-            // Q8_1 cannot be BAR-backed (BAR allocation is FP32 only)
-            state_.attn_proj = factory.createQ8_1(
-                {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(d_model)},
-                device);
-        }
-        else if (use_bar_allocation)
-        {
-            // BAR-backed FP32 for PCIeBAR zero-copy allreduce
-            state_.attn_proj = factory.createFP32BARBacked(
-                {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(d_model)},
-                rocm_device_for_bar, cuda_device_for_bar);
-            LOG_INFO("[DeviceGraphOrchestrator] Allocated attn_proj as BAR-backed FP32 for PCIeBAR allreduce");
-        }
-        else
-        {
-            state_.attn_proj = factory.createFP32(
-                {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(d_model)},
-                device);
-        }
-
-        // FFN buffers - gate and up are kept FP32 to avoid triple quantization in SwiGLU
-        ActivationPrecision gate_prec = resolveBufferPrecision(
-            act_prec, HybridBufferType::FFN_Gate, nullptr);
-        state_.gate = factory.createActivation(
-            {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(buffer_d_ff)},
-            gate_prec, device);
-        ActivationPrecision up_prec = resolveBufferPrecision(
-            act_prec, HybridBufferType::FFN_Up, nullptr);
-        state_.up = factory.createActivation(
-            {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(buffer_d_ff)},
-            up_prec, device);
-        // ffn_output is the output of FFN Down projection which feeds into the residual stream
-        // HybridQ16 mode: Q8_1 (native add to Q16_1 residual via q16_1_add_q8_1)
-        // Other modes: FP32 for numerical stability in residual connections
-        //
-        // For LOCAL TP with PCIeBAR backend: ROCm device uses BAR-backed FP32 tensor
-        // to enable zero-copy allreduce (CUDA reads directly from ROCm BAR region)
-        if (act_prec == ActivationPrecision::HybridQ16)
-        {
-            // Q8_1 cannot be BAR-backed (BAR allocation is FP32 only)
-            state_.ffn_output = factory.createQ8_1(
-                {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(d_model)},
-                device);
-        }
-        else if (use_bar_allocation)
-        {
-            // BAR-backed FP32 for PCIeBAR zero-copy allreduce
-            state_.ffn_output = factory.createFP32BARBacked(
-                {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(d_model)},
-                rocm_device_for_bar, cuda_device_for_bar);
-            LOG_INFO("[DeviceGraphOrchestrator] Allocated ffn_output as BAR-backed FP32 for PCIeBAR allreduce");
-        }
-        else
-        {
-            state_.ffn_output = factory.createFP32(
-                {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(d_model)},
-                device);
-        }
-
-        // Attention workspace - use local head counts for tensor parallelism
-        // scores: [batch_size * buffer_n_heads, max_seq_len, max_seq_len]
-        state_.workspace_scores = factory.createFP32(
-            {static_cast<size_t>(batch_size * buffer_n_heads * max_seq_len), static_cast<size_t>(max_seq_len)},
-            device);
-        // context: [batch_size * buffer_n_heads, max_seq_len, head_dim]
-        state_.workspace_context = factory.createFP32(
-            {static_cast<size_t>(batch_size * buffer_n_heads * max_seq_len), static_cast<size_t>(head_dim)},
-            device);
-        // mask: [batch_size, max_seq_len, max_seq_len]
-        state_.workspace_mask = factory.createFP32(
-            {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(max_seq_len)},
-            device);
-
+        // =====================================================================
+        // Snapshot buffers (allocated directly, not in schema yet — Phase 2)
+        // =====================================================================
 #ifdef ENABLE_PIPELINE_SNAPSHOTS
-        // Allocate context snapshot buffer for debugging attention
-        // Shape: [batch_size * max_seq_len, buffer_n_heads * head_dim]
-        state_.context_snapshot = factory.createFP32(
-            {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(buffer_n_heads * head_dim)},
-            device);
-        LOG_DEBUG("[DeviceGraphOrchestrator] Allocated context_snapshot buffer: ["
-                  << batch_size * max_seq_len << ", " << buffer_n_heads * head_dim << "]");
+        if (tensor_factory_)
+        {
+            int buffer_n_heads = config.qkv_column_parallel ? config.local_n_heads : config.n_heads;
+            int head_dim = config.head_dim;
+            int d_model = config.d_model;
 
-        // Allocate attention output snapshot buffer (Wo projection result, before residual)
-        // Shape: [batch_size * max_seq_len, d_model]
-        state_.attention_output_snapshot = factory.createFP32(
-            {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(d_model)},
-            device);
-        LOG_DEBUG("[DeviceGraphOrchestrator] Allocated attention_output_snapshot buffer: ["
-                  << batch_size * max_seq_len << ", " << d_model << "]");
-
-        // Allocate attention residual snapshot buffer (after residual add)
-        // Shape: [batch_size * max_seq_len, d_model]
-        state_.attention_residual_snapshot = factory.createFP32(
-            {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(d_model)},
-            device);
-        LOG_DEBUG("[DeviceGraphOrchestrator] Allocated attention_residual_snapshot buffer: ["
-                  << batch_size * max_seq_len << ", " << d_model << "]");
+            state_.context_snapshot = tensor_factory_->createFP32(
+                {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(buffer_n_heads * head_dim)},
+                device);
+            state_.attention_output_snapshot = tensor_factory_->createFP32(
+                {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(d_model)},
+                device);
+            state_.attention_residual_snapshot = tensor_factory_->createFP32(
+                {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(d_model)},
+                device);
+            LOG_DEBUG("[DeviceGraphOrchestrator] Allocated snapshot buffers from arena path");
+        }
 #endif
 
-        // Create KV cache - use sharded cache for tensor parallelism
-        // Check if tensor parallelism is enabled (indicated by local_n_kv_heads set)
-        // For Hybrid mode: KV cache uses BF16 (better than Q8_1, 2x compression)
+        // =====================================================================
+        // KV cache creation (not arena-managed)
+        // =====================================================================
+        int n_layers = pp_stage_config_.has_value()
+                           ? pp_stage_config_.value().layerCount()
+                           : config.n_layers;
+
+        std::shared_ptr<MPIContext> local_mpi_ctx = mpi_ctx_;
+        if (!local_mpi_ctx)
+        {
+            local_mpi_ctx = std::make_shared<MPIContext>(0, 1, MPI_COMM_NULL);
+        }
+
+        if (!initializeKVCaches(batch_size, max_seq_len, n_layers, device, local_mpi_ctx))
+        {
+            return false;
+        }
+
+        // =====================================================================
+        // Initialize position tracking and config
+        // =====================================================================
+        state_.positions.assign(batch_size, 0);
+        state_.sequence_lengths.assign(batch_size, 0);
+        state_.batch_size = batch_size;
+        state_.max_seq_len = max_seq_len;
+        state_.d_model = config.d_model;
+        state_.vocab_size = config.vocab_size;
+        state_.device_id = device;
+
+        LOG_INFO("[DeviceGraphOrchestrator] Inference state initialized from arena: "
+                 << "batch_size=" << batch_size
+                 << " max_seq_len=" << max_seq_len
+                 << " device=" << device.toString());
+        return true;
+    }
+
+    bool DeviceGraphOrchestrator::initializeKVCaches(
+        int batch_size, int max_seq_len, int n_layers,
+        DeviceId device, const std::shared_ptr<MPIContext> &local_mpi_ctx)
+    {
+        const auto &config = graph_builder_->config();
+        const int n_kv_heads = config.n_kv_heads;
+        const int head_dim = config.head_dim;
+
+        // Resolve activation precision from config
+        ActivationPrecision act_prec = config.activation_precision;
+
+        // Resolve KV cache precision and layout
         ActivationPrecision kv_cache_prec = resolveBufferPrecision(
             act_prec, HybridBufferType::KV_Cache, nullptr);
         kv_cache_prec = resolveKVCacheStoragePrecision(config.kv_cache_precision, device.is_cpu());
@@ -2414,60 +1703,6 @@ namespace llaminar2
             state_.kv_cache = llaminar::v2::kernels::KernelFactory::createKVCache(kv_config);
         }
 
-        // Initialize position tracking
-        state_.positions.assign(batch_size, 0);
-        state_.sequence_lengths.assign(batch_size, 0);
-
-        // Store config
-        state_.batch_size = batch_size;
-        state_.max_seq_len = max_seq_len;
-        state_.d_model = d_model;
-        state_.vocab_size = vocab_size;
-        state_.device_id = device;
-
-        // =====================================================================
-        // POINTER DUMP: Log all allocated inference state buffer addresses
-        // for multi-GPU debugging (correlate crash addresses with known buffers)
-        // =====================================================================
-        auto logBuf = [&](const char *name, TensorBase *t)
-        {
-            if (!t)
-            {
-                LOG_DEBUG("[STATE_ALLOC] " << name << " = nullptr");
-                return;
-            }
-            LOG_DEBUG("[STATE_ALLOC] " << name
-                                       << " tensor_obj=" << static_cast<void *>(t)
-                                       << " host_ptr=" << t->raw_data()
-                                       << " gpu_ptr=" << t->gpu_data_ptr()
-                                       << " size_bytes=" << t->size_bytes()
-                                       << " device=" << device.toString());
-        };
-        logBuf("hidden", state_.hidden.get());
-        logBuf("logits", state_.logits.get());
-        if (state_.logits_local)
-            logBuf("logits_local", state_.logits_local.get());
-        logBuf("normalized", state_.normalized.get());
-        logBuf("residual", state_.residual.get());
-        logBuf("Q", state_.Q.get());
-        logBuf("K", state_.K.get());
-        logBuf("V", state_.V.get());
-        if (state_.Q_rope)
-            logBuf("Q_rope", state_.Q_rope.get());
-        if (state_.K_rope)
-            logBuf("K_rope", state_.K_rope.get());
-        if (state_.V_dequant)
-            logBuf("V_dequant", state_.V_dequant.get());
-        logBuf("attn_output", state_.attn_output.get());
-        logBuf("attn_proj", state_.attn_proj.get());
-        logBuf("gate", state_.gate.get());
-        logBuf("up", state_.up.get());
-        logBuf("ffn_output", state_.ffn_output.get());
-        logBuf("workspace_scores", state_.workspace_scores.get());
-        logBuf("workspace_context", state_.workspace_context.get());
-        logBuf("workspace_mask", state_.workspace_mask.get());
-
-        LOG_DEBUG("[DeviceGraphOrchestrator] Inference state initialized successfully");
         return true;
     }
 
@@ -2521,7 +1756,7 @@ namespace llaminar2
         InferencePhase new_phase = (seq_len > 1) ? InferencePhase::PREFILL : InferencePhase::DECODE;
         transitionToPhase(new_phase);
 
-        // Build position IDs
+        // Build position IDs (per-batch offsets for variable-length sequences)
         std::vector<int> position_ids;
         position_ids.reserve(total_tokens);
         for (int b = 0; b < batch_size; ++b)
@@ -2534,57 +1769,12 @@ namespace llaminar2
         }
 
         // Prepare model buffers from state
-        ModelBuffers model_buffers;
-        model_buffers.current_hidden = state_.hidden.get();
-        model_buffers.logits = state_.logits.get();
-
-        // Phase 5: Set local logits buffer for column-parallel LM head
-        if (state_.logits_local)
-        {
-            model_buffers.logits_local = state_.logits_local.get();
-        }
-
-        // Populate layer buffers
-        model_buffers.layer_buffers.current_hidden = state_.hidden.get();
-        model_buffers.layer_buffers.normalized = state_.normalized.get();
-        model_buffers.layer_buffers.residual = state_.residual.get();
-        model_buffers.layer_buffers.Q = state_.Q.get();
-        model_buffers.layer_buffers.K = state_.K.get();
-        model_buffers.layer_buffers.V = state_.V.get();
-        model_buffers.layer_buffers.attn_output = state_.attn_output.get();
-        model_buffers.layer_buffers.attn_proj = state_.attn_proj.get();
-        model_buffers.layer_buffers.gate = state_.gate.get();
-        model_buffers.layer_buffers.up = state_.up.get();
-        model_buffers.layer_buffers.ffn_output = state_.ffn_output.get();
-        model_buffers.layer_buffers.workspace_scores = state_.workspace_scores.get();
-        model_buffers.layer_buffers.workspace_context = state_.workspace_context.get();
-        model_buffers.layer_buffers.workspace_mask = state_.workspace_mask.get();
-
-        // Hybrid mode buffers: FP32 Q/K after RoPE, V_dequant for KV cache
-        model_buffers.layer_buffers.Q_rope = state_.Q_rope.get();
-        model_buffers.layer_buffers.K_rope = state_.K_rope.get();
-        model_buffers.layer_buffers.V_dequant = state_.V_dequant.get();
-
-        // HybridQ16 K precision fix: per-head K scales from RoPE Q16→Q16
-        if (!state_.K_head_scales.empty())
-        {
-            model_buffers.layer_buffers.K_head_scales = state_.K_head_scales.data();
-            model_buffers.layer_buffers.K_head_scales_capacity = state_.K_head_scales.size();
-        }
-
-#ifdef ENABLE_PIPELINE_SNAPSHOTS
-        // Pass context snapshot buffer for attention debugging
-        model_buffers.layer_buffers.context_snapshot = state_.context_snapshot.get();
-        // Pass attention output snapshot buffer (Wo projection, before residual)
-        model_buffers.layer_buffers.attention_output_snapshot = state_.attention_output_snapshot.get();
-        // Pass attention residual snapshot buffer (after residual add)
-        model_buffers.layer_buffers.attention_residual_snapshot = state_.attention_residual_snapshot.get();
-#endif
+        ModelBuffers model_buffers = state_.toModelBuffers();
 
         setBuffers(model_buffers);
 
         // Build forward input
-        Qwen2ForwardInput input;
+        ForwardInput input;
         input.token_ids = tokens;
         input.position_ids = position_ids.data();
         input.batch_size = batch_size;
@@ -2613,7 +1803,7 @@ namespace llaminar2
                                      : nullptr;
 
         // Build forward output
-        Qwen2ForwardOutput output;
+        ForwardOutput output;
         output.logits = state_.logits.get();
         output.hidden = state_.hidden.get();
 
@@ -2632,6 +1822,12 @@ namespace llaminar2
             state_.positions[b] += seq_len;
             state_.sequence_lengths[b] += seq_len;
         }
+
+        // TEMPORARY DEBUG: trace forward inputs for server regression debugging
+        LOG_ERROR("[FORWARD_TRACE] seq_len=" << seq_len
+                  << " pos_offset=" << input.position_offset
+                  << " token_ids[0]=" << (tokens ? tokens[0] : -1)
+                  << " positions_after=" << state_.positions[0]);
 
         // Return logits pointer
         return state_.logits->fp32_data();
@@ -2760,11 +1956,8 @@ namespace llaminar2
         // path to skip coherence management that was performed only on the
         // original cache-miss executeNode() path, leading to stale buffer
         // state and incorrect inference results on the second forward pass.
-        for (auto &[_, cache] : forward_graph_cache_)
-        {
-            cache.invalidate();
-        }
-        forward_graph_cache_.clear();
+        if (forward_engine_)
+            forward_engine_->clearCache();
 
         // Clear layer graph caches and device contexts
         for (auto &cache : layer_graph_cache_)
@@ -3419,7 +2612,7 @@ namespace llaminar2
     // =========================================================================
 
     DeviceGraphOrchestrator::GraphBuildSession &
-    DeviceGraphOrchestrator::GraphBuildSession::forInput(const Qwen2ForwardInput &input)
+    DeviceGraphOrchestrator::GraphBuildSession::forInput(const ForwardInput &input)
     {
         input_ = input;
         return *this;
@@ -3506,7 +2699,7 @@ namespace llaminar2
             return GraphBuildResult("No graph builder available");
         }
 
-        Qwen2ForwardOutput output;
+        ForwardOutput output;
         ComputeGraph graph = graph_builder->buildFullForwardGraph(prepared_input, output);
 
         if (graph.size() == 0)
@@ -3541,7 +2734,7 @@ namespace llaminar2
         }
 
         const auto &stage = pp_stage_.value();
-        Qwen2ForwardOutput output;
+        ForwardOutput output;
         ComputeGraph graph = graph_builder->buildPartialForwardGraph(
             prepared_input, output,
             stage.first_layer, stage.last_layer,
@@ -3595,7 +2788,7 @@ namespace llaminar2
             graph_builder->setTPContext(name, ctx);
         }
 
-        Qwen2ForwardOutput output;
+        ForwardOutput output;
         ComputeGraph graph = graph_builder->buildUnifiedPipelineGraph(prepared_input, output);
 
         if (graph.size() == 0)
@@ -3693,9 +2886,9 @@ namespace llaminar2
         return "";
     }
 
-    Qwen2ForwardInput DeviceGraphOrchestrator::GraphBuildSession::prepareInput() const
+    ForwardInput DeviceGraphOrchestrator::GraphBuildSession::prepareInput() const
     {
-        Qwen2ForwardInput prepared = input_.value();
+        ForwardInput prepared = input_.value();
 
         // Override position IDs if explicitly set
         if (explicit_position_ids_)

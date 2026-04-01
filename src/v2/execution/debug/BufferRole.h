@@ -171,6 +171,7 @@ namespace llaminar2
         Q8_0,    ///< 8-bit quantized
         Q4_0,    ///< 4-bit quantized
         IQ4_NL,  ///< 4-bit importance quantized
+        Q16_1,   ///< 16-bit quantized with scales (72 bytes per 32 elements)
         INT32,   ///< 32-bit integer (position IDs, etc.)
         UNKNOWN, ///< Unspecified (infer from context)
     };
@@ -200,6 +201,8 @@ namespace llaminar2
             return 18; // 16 bytes data + 2 bytes scale (per 32 elements)
         case BufferTensorType::IQ4_NL:
             return 18; // Similar to Q4_0
+        case BufferTensorType::Q16_1:
+            return 72; // 64 bytes data + 4 bytes scale + 4 bytes sum (per 32 elements)
         default:
             return 4; // Default to FP32 size
         }
@@ -226,6 +229,8 @@ namespace llaminar2
             return "Q4_0";
         case BufferTensorType::IQ4_NL:
             return "IQ4_NL";
+        case BufferTensorType::Q16_1:
+            return "Q16_1";
         case BufferTensorType::INT32:
             return "INT32";
         default:

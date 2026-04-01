@@ -58,76 +58,6 @@ namespace llaminar2
     // etc.) are provided by models/GraphTypes.h, included above.
 
     // =========================================================================
-    // Forward Input/Output
-    // =========================================================================
-
-    /**
-     * @brief Input for forward pass
-     */
-    struct Qwen2ForwardInput
-    {
-        const int *token_ids = nullptr;    ///< Token IDs [batch_size * seq_len]
-        const int *position_ids = nullptr; ///< Position IDs [batch_size * seq_len] (required)
-        int batch_size = 1;                ///< Number of sequences
-        int seq_len = 0;                   ///< Sequence length
-        int position_offset = 0;           ///< KV cache position offset (legacy, used if position_ids == nullptr)
-        DeviceId device = DeviceId::cpu(); ///< Target device
-        IKVCache *kv_cache = nullptr;      ///< KV cache for attention (optional)
-
-        /// Per-device KV caches for Pipeline Parallelism (PP).
-        /// When set (non-empty), each PP stage uses the KV cache for its device.
-        /// Key: DeviceId (e.g., cuda:0, cuda:1), Value: IKVCache* for that device.
-        /// Takes precedence over kv_cache when device is found in this map.
-        const std::unordered_map<DeviceId, IKVCache *> *pp_kv_caches = nullptr;
-
-        /// External hidden state input (for PP middle stages that don't have embedding)
-        /// When set, embedding is skipped and this tensor is used as initial hidden state.
-        /// For HybridQ16 mode: expected to be Q16_1 tensor
-        /// For FP32 mode: expected to be FP32 tensor
-        TensorBase *external_hidden_state = nullptr;
-
-        /// Sequence lengths for variable-length batching (nullptr = all equal to seq_len)
-        /// When set, this enables proper batch-separating attention masks that
-        /// prevent cross-sequence attention in batched execution.
-        const std::vector<int> *sequence_lengths = nullptr;
-
-        /// For batched input (alternative to token_ids)
-        struct Batch
-        {
-            const int *tokens;
-            int len;
-            int offset;
-        };
-        const Batch *batches = nullptr;
-        int num_batches = 0;
-
-        /// Get the KV cache for a specific device (PP) or the default (non-PP)
-        IKVCache *getKVCacheForDevice(const DeviceId &device) const
-        {
-            // For PP mode: look up per-device KV cache
-            if (pp_kv_caches && !pp_kv_caches->empty())
-            {
-                auto it = pp_kv_caches->find(device);
-                if (it != pp_kv_caches->end())
-                {
-                    return it->second;
-                }
-                // Fallback to default kv_cache if device not found
-            }
-            return kv_cache;
-        }
-    };
-
-    /**
-     * @brief Output from forward pass
-     */
-    struct Qwen2ForwardOutput
-    {
-        TensorBase *logits = nullptr; ///< Output logits [batch_size * seq_len, vocab_size]
-        TensorBase *hidden = nullptr; ///< Optional: final hidden states
-    };
-
-    // =========================================================================
     // Qwen2Graph Class
     // =========================================================================
 
@@ -177,7 +107,9 @@ namespace llaminar2
         // Configuration
         // =====================================================================
 
-        const GraphConfig &config() const { return config_; }
+        const GraphConfig &config() const override { return config_; }
+
+        std::string architectureName() const override { return "qwen2"; }
 
         // =====================================================================
         // Unified PP Configuration Mutators (Phase 6)
@@ -190,7 +122,7 @@ namespace llaminar2
          *
          * @param pipeline_config Shared ownership of pipeline configuration
          */
-        void setPipelineConfig(std::shared_ptr<PipelineConfig> pipeline_config)
+        void setPipelineConfig(std::shared_ptr<PipelineConfig> pipeline_config) override
         {
             config_.pipeline_config = std::move(pipeline_config);
         }
@@ -204,7 +136,7 @@ namespace llaminar2
          * @param to_stage Destination PP stage ID
          * @param pp_ctx Pointer to ILocalPPContext (must remain valid during graph execution)
          */
-        void setPPContext(int from_stage, int to_stage, ILocalPPContext *pp_ctx)
+        void setPPContext(int from_stage, int to_stage, ILocalPPContext *pp_ctx) override
         {
             config_.pp_contexts[{from_stage, to_stage}] = pp_ctx;
         }
@@ -217,7 +149,7 @@ namespace llaminar2
          * @param domain_name Name of the TP domain
          * @param tp_ctx Pointer to ILocalTPContext (must remain valid during graph execution)
          */
-        void setTPContext(const std::string &domain_name, ILocalTPContext *tp_ctx)
+        void setTPContext(const std::string &domain_name, ILocalTPContext *tp_ctx) override
         {
             config_.domain_tp_contexts[domain_name] = tp_ctx;
         }
@@ -225,7 +157,7 @@ namespace llaminar2
         /**
          * @brief Set weight accessors (called by pipeline)
          */
-        void setWeights(const ModelWeights &weights) { weights_ = weights; }
+        void setWeights(const ModelWeights &weights) override { weights_ = weights; }
 
         /**
          * @brief Set activation buffers (called by pipeline)
@@ -233,7 +165,7 @@ namespace llaminar2
          * Use this for manual buffer management (tests, PP path).
          * Alternative: Use setArena() for arena-managed allocation.
          */
-        void setBuffers(const ModelBuffers &buffers) { buffers_ = buffers; }
+        void setBuffers(const ModelBuffers &buffers) override { buffers_ = buffers; }
 
         /**
          * @brief Set the BufferArena for arena-managed buffer resolution
@@ -247,14 +179,14 @@ namespace llaminar2
          *
          * @param arena BufferArena pointer (not owned, must outlive graph builder)
          */
-        void setArena(BufferArena *arena);
+        void setArena(BufferArena *arena) override;
 
         /// Get the arena (nullptr if not set)
         BufferArena *arena() const { return arena_; }
 
         /// Get the current buffers (for cache-replay PP copy).
         /// When arena is set, populates a snapshot from arena on demand.
-        const ModelBuffers &buffers() const;
+        const ModelBuffers &buffers() const override;
 
         /**
          * @brief Set TensorFactory for graph-managed buffer allocation
@@ -270,7 +202,7 @@ namespace llaminar2
          *
          * @return GraphSchema for Qwen2 architecture
          */
-        GraphSchema getSchema() const;
+        GraphSchema getSchema() const override;
 
         /**
          * @brief Get resolver config for buffer allocation
@@ -282,7 +214,7 @@ namespace llaminar2
          * @param seq_len Sequence length for buffer sizing
          * @return GraphResolverConfig with model dimensions
          */
-        GraphResolverConfig getResolverConfig(int seq_len) const;
+        GraphResolverConfig getResolverConfig(int seq_len) const override;
 
         // =====================================================================
         // Buffer Management
@@ -298,7 +230,7 @@ namespace llaminar2
          * Note: The callback is stored for use by DeviceGraphOrchestrator when it executes
          * graphs built by this Qwen2Graph.
          */
-        void setSnapshotCallback(StageSnapshotCallback callback)
+        void setSnapshotCallback(StageSnapshotCallback callback) override
         {
             snapshot_callback_ = std::move(callback);
             // Note: DeviceGraphOrchestrator will call its own executor_.setSnapshotCallback()
@@ -315,8 +247,6 @@ namespace llaminar2
 
         /**
          * @brief Build complete forward graph (IGraphBuilder interface)
-         *
-         * Adapts Qwen2ForwardInput/Output to generic ForwardInput/Output.
          */
         ComputeGraph buildForwardGraph(
             const ForwardInput &input,
@@ -358,8 +288,8 @@ namespace llaminar2
          * For new code, prefer buildForwardGraphFromSchema().
          */
         ComputeGraph buildFullForwardGraph(
-            const Qwen2ForwardInput &input,
-            Qwen2ForwardOutput &output);
+            const ForwardInput &input,
+            ForwardOutput &output) override;
 
         /**
          * @brief Build partial forward graph for Pipeline Parallelism
@@ -379,12 +309,12 @@ namespace llaminar2
          * @return ComputeGraph for partial forward pass
          */
         ComputeGraph buildPartialForwardGraph(
-            const Qwen2ForwardInput &input,
-            Qwen2ForwardOutput &output,
+            const ForwardInput &input,
+            ForwardOutput &output,
             int first_layer,
             int last_layer,
             bool has_embedding,
-            bool has_lm_head);
+            bool has_lm_head) override;
 
         /**
          * @brief Build unified forward graph with PP + TP composition
@@ -401,8 +331,8 @@ namespace llaminar2
          * @return ComputeGraph spanning all PP stages
          */
         ComputeGraph buildUnifiedPipelineGraph(
-            const Qwen2ForwardInput &input,
-            Qwen2ForwardOutput &output);
+            const ForwardInput &input,
+            ForwardOutput &output) override;
 
         /**
          * @brief Build forward graph using declarative schema
@@ -422,14 +352,14 @@ namespace llaminar2
          * @return Constructed ComputeGraph
          */
         ComputeGraph buildForwardGraphFromSchema(
-            const Qwen2ForwardInput &input,
-            Qwen2ForwardOutput &output);
+            const ForwardInput &input,
+            ForwardOutput &output);
 
         /**
          * @brief Build embedding lookup graph
          */
         ComputeGraph buildEmbeddingGraph(
-            const Qwen2ForwardInput &input,
+            const ForwardInput &input,
             TensorBase *output_hidden);
 
         /**
@@ -488,7 +418,7 @@ namespace llaminar2
             IKVCache *kv_cache,
             const int *position_ids,
             DeviceId device,
-            const std::vector<int> *sequence_lengths = nullptr);
+            const std::vector<int> *sequence_lengths = nullptr) override;
 
         /**
          * @brief Build FFN block graph
@@ -499,7 +429,7 @@ namespace llaminar2
             int layer_idx,
             int seq_len,
             int batch_size,
-            DeviceId device);
+            DeviceId device) override;
 
     private:
         // =====================================================================

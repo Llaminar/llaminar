@@ -290,6 +290,18 @@ namespace llaminar2
         ITensor *getTensor(BufferId id) const;
 
         /**
+         * @brief Get shared ownership of an arena-owned tensor.
+         *
+         * Returns the shared_ptr for arena-owned buffers, enabling callers
+         * (e.g., InferenceState) to hold a reference beyond the arena's
+         * lifetime. Returns nullptr for external (non-owned) buffers.
+         *
+         * @param id Buffer to query
+         * @return shared_ptr<TensorBase>, or nullptr if not arena-owned
+         */
+        std::shared_ptr<TensorBase> getSharedTensor(BufferId id) const;
+
+        /**
          * @brief Get the device pointer for a buffer (GPU or host).
          *
          * For GPU buffers, returns the GPU data pointer.

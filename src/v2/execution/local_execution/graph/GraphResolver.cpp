@@ -890,6 +890,37 @@ namespace llaminar2
         const std::string &formula,
         const GraphResolverConfig &config)
     {
+        // ── Multiplication expressions (e.g., "batch_size * local_n_heads * seq_len") ──
+        if (formula.find('*') != std::string::npos)
+        {
+            size_t result = 1;
+            size_t start = 0;
+            size_t pos;
+            while ((pos = formula.find('*', start)) != std::string::npos)
+            {
+                std::string operand = formula.substr(start, pos - start);
+                // Trim whitespace
+                auto ltrim = operand.find_first_not_of(" \t");
+                auto rtrim = operand.find_last_not_of(" \t");
+                if (ltrim != std::string::npos)
+                    operand = operand.substr(ltrim, rtrim - ltrim + 1);
+                result *= evaluateFormula(operand, config);
+                start = pos + 1;
+            }
+            // Last operand
+            std::string operand = formula.substr(start);
+            auto ltrim = operand.find_first_not_of(" \t");
+            auto rtrim = operand.find_last_not_of(" \t");
+            if (ltrim != std::string::npos)
+                operand = operand.substr(ltrim, rtrim - ltrim + 1);
+            result *= evaluateFormula(operand, config);
+            return result;
+        }
+
+        // ── Batch configuration ──
+        if (formula == "batch_size")
+            return static_cast<size_t>(config.batch_size);
+
         // Direct dimension lookups
         if (formula == "d_model" || formula == "hidden_size")
             return static_cast<size_t>(config.d_model);
@@ -946,12 +977,24 @@ namespace llaminar2
     {
         ResolvedBufferSpec resolved;
         resolved.name = spec.name;
-        resolved.dtype = spec.dtype;
         resolved.semantic = spec.semantic;
         resolved.alias_group = spec.alias_group;
         resolved.alias_priority = spec.alias_priority;
         resolved.description = spec.description;
         resolved.device = config.default_device; // Use config's device for proper allocation
+
+        // Resolve dtype: check for precision-conditional overrides
+        resolved.dtype = spec.dtype; // default
+        if (!spec.dtype_overrides.empty() &&
+            config.activation_precision != ActivationPrecision::FP32)
+        {
+            const char *prec_name = activationPrecisionToString(config.activation_precision);
+            auto it = spec.dtype_overrides.find(prec_name);
+            if (it != spec.dtype_overrides.end())
+            {
+                resolved.dtype = it->second;
+            }
+        }
 
         // Resolve each shape dimension
         resolved.shape.reserve(spec.shape.size());
@@ -1052,6 +1095,10 @@ namespace llaminar2
                 tensor_type = BufferTensorType::BF16;
             else if (buf.dtype == "fp16" || buf.dtype == "float16")
                 tensor_type = BufferTensorType::FP16;
+            else if (buf.dtype == "q8_1")
+                tensor_type = BufferTensorType::Q8_1;
+            else if (buf.dtype == "q16_1")
+                tensor_type = BufferTensorType::Q16_1;
             else if (buf.dtype == "q8_0")
                 tensor_type = BufferTensorType::Q8_0;
 
@@ -1096,13 +1143,32 @@ namespace llaminar2
         std::vector<ResolvedBufferSpec> resolved;
         resolved.reserve(schema.layer_buffers.size());
 
+        const char *prec_name = activationPrecisionToString(config.activation_precision);
+
         for (const auto &spec : schema.layer_buffers)
         {
+            // Conditional inclusion: skip buffers whose conditions don't match
+            if (!spec.conditions.empty())
+            {
+                bool matches = false;
+                for (const auto &cond : spec.conditions)
+                {
+                    if (cond == prec_name)
+                    {
+                        matches = true;
+                        break;
+                    }
+                }
+                if (!matches)
+                    continue;
+            }
+
             resolved.push_back(resolve(spec, config));
         }
 
         LOG_DEBUG("[BufferAllocator] Resolved " << resolved.size()
-                                                << " layer buffers from schema '" << schema.name << "'");
+                                                << " layer buffers from schema '" << schema.name << "'"
+                                                << " (precision=" << prec_name << ")");
 
         return toBufferRequirements(resolved);
     }

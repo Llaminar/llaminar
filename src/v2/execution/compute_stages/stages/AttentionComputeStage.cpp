@@ -627,7 +627,7 @@ namespace llaminar2
             params_.mpi_ctx,
             device_idx);
 
-        // Device coherence (mark_device_dirty) is now handled automatically by DeviceGraphExecutor
+        // Device coherence is now handled automatically by DeviceGraphExecutor
         // at stage boundaries based on the stage's coherencePolicy() (FULL by default)
 
         if (!success)

@@ -242,7 +242,7 @@ TEST_F(Test__ROCmEventSynchronization, MappedTensorCoherenceUsesEvents)
 
     // Simulate a GPU write by marking device dirty
     // In real usage, this would be done after a kernel writes to the tensor
-    tensor->mark_device_dirty();
+    tensor->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
 
     // Queue some slow work AFTER the tensor was marked dirty
     // If ensureOnHost uses stream sync, it will wait for this slow work

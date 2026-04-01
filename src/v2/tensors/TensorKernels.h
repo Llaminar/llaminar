@@ -499,7 +499,7 @@ namespace llaminar2
          *
          * **Device Handling**:
          * - Input tensor: ensureOnDevice() called if needed
-         * - Output tensors: ensureOnDevice() called, mark_device_dirty() after write
+         * - Output tensors: ensureOnDevice() called, transitionTo(DEVICE_AUTHORITATIVE) after write
          * - Weight tensors: managed by the kernel (already packed/uploaded)
          *
          * **For CPU execution**: Falls back to host pointers transparently

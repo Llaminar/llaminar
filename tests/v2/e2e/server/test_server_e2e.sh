@@ -146,7 +146,7 @@ for BACKEND in "${BACKEND_LIST[@]}"; do
 
     # Start server
     LLAMINAR_LOG_LEVEL="$LOG_LEVEL" "$BINARY" --no-mpi-bootstrap --serve --port "$PORT" \
-        $DEVICE_FLAG -m "$MODEL" >/dev/null 2>&1 &
+        $DEVICE_FLAG -m "$MODEL" >/tmp/server_e2e_trace.log 2>&1 &
     SERVER_PID=$!
 
     # Wait for health

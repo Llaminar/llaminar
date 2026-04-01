@@ -10,6 +10,7 @@
 
 #include <gtest/gtest.h>
 #include "execution/local_execution/orchestrators/DeviceGraphOrchestrator.h"
+#include "models/qwen/Qwen2Graph.h"
 #include <vector>
 #include <string>
 #include <algorithm>
@@ -115,7 +116,7 @@ TEST(Test__DeviceGraphOrchestratorSnapshots, SnapshotState_InitiallyDisabled)
     config.vocab_size = 151936;
     config.max_seq_len = 2048;
 
-    DeviceGraphOrchestrator orchestrator(config);
+    DeviceGraphOrchestrator orchestrator(std::make_shared<Qwen2Graph>(config, nullptr));
 
     // Should be disabled by default
     EXPECT_FALSE(orchestrator.isSnapshotCaptureEnabled());
@@ -133,7 +134,7 @@ TEST(Test__DeviceGraphOrchestratorSnapshots, SnapshotState_EnableDisable)
     config.vocab_size = 151936;
     config.max_seq_len = 2048;
 
-    DeviceGraphOrchestrator orchestrator(config);
+    DeviceGraphOrchestrator orchestrator(std::make_shared<Qwen2Graph>(config, nullptr));
 
     // Enable
     orchestrator.enableSnapshotCapture();
@@ -155,7 +156,7 @@ TEST(Test__DeviceGraphOrchestratorSnapshots, GetSnapshot_ReturnsNullForMissingKe
     config.vocab_size = 151936;
     config.max_seq_len = 2048;
 
-    DeviceGraphOrchestrator orchestrator(config);
+    DeviceGraphOrchestrator orchestrator(std::make_shared<Qwen2Graph>(config, nullptr));
     orchestrator.enableSnapshotCapture();
 
     size_t size = 0;

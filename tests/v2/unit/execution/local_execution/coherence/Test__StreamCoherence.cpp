@@ -20,7 +20,7 @@
  *   When ensureOnHost() was called, it waited on the stale event (from the
  *   WRONG operation) and proceeded with D2H transfer before the allreduce
  *   had actually completed. Fix: TPAllreduceStage::execute() now calls
- *   mark_device_dirty_with_event(stage_stream) after the collective operation.
+ *   transitionToWithEvent(TensorCoherenceState::DEVICE_AUTHORITATIVE, std::nullopt, stage_stream) after the collective operation.
  *
  * **Test Strategy**:
  *   Unit tests use MockCoherenceTensor (exposing protected coherence state)
@@ -65,30 +65,13 @@ using namespace llaminar2;
 /**
  * @brief FP32Tensor subclass that exposes protected coherence state for testing
  *
- * Provides read access to device_completion_event_, device_valid_, host_valid_
- * and tracks mark_device_dirty_with_event() calls through the virtual override.
- *
- * This enables unit testing of coherence state transitions without requiring
- * a real GPU backend.
+ * Provides read access to device_completion_event_ and coherence_state_
+ * for verifying coherence transitions without requiring a real GPU backend.
  */
 class MockCoherenceTensor : public FP32Tensor
 {
 public:
     using FP32Tensor::FP32Tensor;
-
-    // ---- Virtual override for tracking ----
-
-    int mark_dirty_with_event_call_count = 0;
-    void *last_event_stream = reinterpret_cast<void *>(0xDEAD); // sentinel
-
-    void mark_device_dirty_with_event(void *stream = nullptr) override
-    {
-        mark_dirty_with_event_call_count++;
-        last_event_stream = stream;
-        // Call base class — will try to get backend (which returns nullptr for CPU tensors)
-        // so it just sets the dirty flags without actually recording an event
-        FP32Tensor::mark_device_dirty_with_event(stream);
-    }
 
     // ---- Expose protected state ----
 
@@ -262,14 +245,14 @@ TEST_F(Test__StreamCoherence, GEMMStage_CoherencePolicy_IsFull)
 // Test Suite: DirtyMarkingBehavior
 // =============================================================================
 //
-// Tests for Bug 2: mark_device_dirty_flags_only() does NOT update the
+// Tests for Bug 2: transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE) does NOT update the
 // completion event, while mark_device_dirty_with_event() DOES.
 // This distinction is critical for correct GPU→CPU synchronization.
 // =============================================================================
 
 TEST_F(Test__StreamCoherence, FlagsOnly_PreservesStaleCompletionEvent)
 {
-    // CRITICAL: mark_device_dirty_flags_only() must NOT clear
+    // CRITICAL: transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE) must NOT clear
     // device_completion_event_. If it did, subsequent ensureOnHost()
     // would fall back to full device sync (slow but correct).
     // The real bug is that it PRESERVES a stale event from a PREVIOUS
@@ -283,11 +266,11 @@ TEST_F(Test__StreamCoherence, FlagsOnly_PreservesStaleCompletionEvent)
     tensor->injectCompletionEvent(stale_event);
 
     // Call flags-only dirty marking (what the executor does for intermediate stages)
-    tensor->mark_device_dirty_flags_only();
+    tensor->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
 
     // The stale event MUST still be there — this is the root cause of Bug 2
     EXPECT_EQ(tensor->getCompletionEvent(), stale_event)
-        << "mark_device_dirty_flags_only() must not modify device_completion_event_";
+        << "transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE) must not modify device_completion_event_";
 
     // Verify the dirty flags were set correctly
     EXPECT_TRUE(tensor->getDeviceValid());
@@ -303,7 +286,7 @@ TEST_F(Test__StreamCoherence, FlagsOnly_SetsDeviceDirtyState)
     EXPECT_TRUE(tensor->getHostValid());
     EXPECT_FALSE(tensor->getDeviceValid());
 
-    tensor->mark_device_dirty_flags_only();
+    tensor->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
 
     // Device should now be valid, host stale (non-mapped)
     EXPECT_TRUE(tensor->getDeviceValid());
@@ -325,10 +308,8 @@ TEST_F(Test__StreamCoherence, WithEvent_ClearsStaleEventAndRecordsNew)
         std::vector<size_t>{4, 64}, DeviceId::cpu());
 
     void *fake_stream = reinterpret_cast<void *>(0x1234);
-    tensor->mark_device_dirty_with_event(fake_stream);
+    tensor->transitionToWithEvent(TensorCoherenceState::DEVICE_AUTHORITATIVE, std::nullopt, fake_stream);
 
-    EXPECT_EQ(tensor->mark_dirty_with_event_call_count, 1);
-    EXPECT_EQ(tensor->last_event_stream, fake_stream);
 
     // Dirty flags must be set
     EXPECT_TRUE(tensor->getDeviceValid());
@@ -343,13 +324,9 @@ TEST_F(Test__StreamCoherence, WithEvent_CalledMultipleTimes_TracksCorrectStream)
     void *stream1 = reinterpret_cast<void *>(0x1111);
     void *stream2 = reinterpret_cast<void *>(0x2222);
 
-    tensor->mark_device_dirty_with_event(stream1);
-    EXPECT_EQ(tensor->mark_dirty_with_event_call_count, 1);
-    EXPECT_EQ(tensor->last_event_stream, stream1);
+    tensor->transitionToWithEvent(TensorCoherenceState::DEVICE_AUTHORITATIVE, std::nullopt, stream1);
 
-    tensor->mark_device_dirty_with_event(stream2);
-    EXPECT_EQ(tensor->mark_dirty_with_event_call_count, 2);
-    EXPECT_EQ(tensor->last_event_stream, stream2);
+    tensor->transitionToWithEvent(TensorCoherenceState::DEVICE_AUTHORITATIVE, std::nullopt, stream2);
 }
 
 // =============================================================================
@@ -385,7 +362,7 @@ TEST_F(Test__StreamCoherence, MarkOutputsDirty_CallsWithEvent)
 TEST_F(Test__StreamCoherence, MarkOutputsDirtyFlagsOnly_DoesNotCallWithEvent)
 {
     // markOutputsDirtyFlagsOnly (the lightweight version) should NOT call
-    // mark_device_dirty_with_event(). It calls mark_device_dirty_flags_only()
+    // mark_device_dirty_with_event(). It calls transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE)
     // which is non-virtual and only sets flags.
 
     auto tensor = std::make_unique<MockCoherenceTensor>(
@@ -396,13 +373,12 @@ TEST_F(Test__StreamCoherence, MarkOutputsDirtyFlagsOnly_DoesNotCallWithEvent)
 
     markOutputsDirtyFlagsOnly(outputs);
 
-    // The virtual mark_device_dirty_with_event must NOT have been called
-    EXPECT_EQ(tensor->mark_dirty_with_event_call_count, 0)
-        << "markOutputsDirtyFlagsOnly() must NOT call mark_device_dirty_with_event()";
-
-    // But the tensor should still be marked device-dirty
+    // Tensor should be marked device-dirty but no event should be recorded
+    // (markOutputsDirtyFlagsOnly uses transitionTo, not transitionToWithEvent)
     EXPECT_TRUE(tensor->getDeviceValid());
     EXPECT_FALSE(tensor->getHostValid());
+    EXPECT_EQ(tensor->getCompletionEvent(), nullptr)
+        << "markOutputsDirtyFlagsOnly() must not record a completion event";
 }
 
 TEST_F(Test__StreamCoherence, MarkOutputsDirty_MultipleOutputs)
@@ -455,7 +431,6 @@ TEST_F(Test__StreamCoherence, MarkOutputsDirtyFlagsOnly_PreservesExistingEvent)
     EXPECT_EQ(tensor->getCompletionEvent(), stale_event);
 
     // Virtual method must NOT have been called
-    EXPECT_EQ(tensor->mark_dirty_with_event_call_count, 0);
 }
 
 TEST_F(Test__StreamCoherence, MarkOutputsDirty_ReplacesStaleEvent)
@@ -510,7 +485,7 @@ TEST_F(Test__StreamCoherence, FlagsOnly_TransitionsToDeviceAuthoritative)
     auto tensor = std::make_unique<MockCoherenceTensor>(
         std::vector<size_t>{4, 64}, DeviceId::cpu());
 
-    tensor->mark_device_dirty_flags_only();
+    tensor->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
 
     EXPECT_TRUE(tensor->getDeviceValid());
     EXPECT_FALSE(tensor->getHostValid());
@@ -522,11 +497,10 @@ TEST_F(Test__StreamCoherence, WithEvent_TransitionsToDeviceAuthoritative)
     auto tensor = std::make_unique<MockCoherenceTensor>(
         std::vector<size_t>{4, 64}, DeviceId::cpu());
 
-    tensor->mark_device_dirty_with_event(nullptr);
+    tensor->transitionToWithEvent(TensorCoherenceState::DEVICE_AUTHORITATIVE, std::nullopt, nullptr);
 
     EXPECT_TRUE(tensor->getDeviceValid());
     EXPECT_FALSE(tensor->getHostValid());
-    EXPECT_EQ(tensor->mark_dirty_with_event_call_count, 1);
 }
 
 TEST_F(Test__StreamCoherence, SequentialDirtyMarking_EventOverwriteSequence)
@@ -542,15 +516,12 @@ TEST_F(Test__StreamCoherence, SequentialDirtyMarking_EventOverwriteSequence)
         std::vector<size_t>{4, 64}, DeviceId::cpu());
 
     // Step 1: GEMM output marked flags-only (intermediate stage)
-    tensor->mark_device_dirty_flags_only();
-    EXPECT_EQ(tensor->mark_dirty_with_event_call_count, 0);
+    tensor->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
     EXPECT_TRUE(tensor->getDeviceValid());
 
     // Step 2: Allreduce calls mark_device_dirty_with_event
     void *allreduce_stream = reinterpret_cast<void *>(0xBCC10001);
-    tensor->mark_device_dirty_with_event(allreduce_stream);
-    EXPECT_EQ(tensor->mark_dirty_with_event_call_count, 1);
-    EXPECT_EQ(tensor->last_event_stream, allreduce_stream);
+    tensor->transitionToWithEvent(TensorCoherenceState::DEVICE_AUTHORITATIVE, std::nullopt, allreduce_stream);
     EXPECT_TRUE(tensor->getDeviceValid());
 }
 
@@ -653,17 +624,15 @@ TEST_F(Test__StreamCoherence, Bug2Scenario_StaleEventLifecycle)
     // Verify: stale event persists (this is expected, and the source of the bug)
     EXPECT_EQ(tensor->getCompletionEvent(), prior_event)
         << "After flags-only marking, stale event should persist";
-    EXPECT_EQ(tensor->mark_dirty_with_event_call_count, 0)
-        << "flags-only should not invoke event-based marking";
 
     // Step 2: TPAllreduce stage — the FIX is that the stage itself calls
-    // mark_device_dirty_with_event() after the allreduce completes
+    // transitionToWithEvent() after the allreduce completes
     void *allreduce_stream = reinterpret_cast<void *>(0xBCC10002);
-    tensor->mark_device_dirty_with_event(allreduce_stream);
+    tensor->transitionToWithEvent(TensorCoherenceState::DEVICE_AUTHORITATIVE, std::nullopt, allreduce_stream);
 
-    // Verify: event-based marking was called
-    EXPECT_EQ(tensor->mark_dirty_with_event_call_count, 1);
-    EXPECT_EQ(tensor->last_event_stream, allreduce_stream);
+    // Verify: state transition was made
+    EXPECT_EQ(tensor->coherenceState(), TensorCoherenceState::DEVICE_AUTHORITATIVE);
+    EXPECT_TRUE(tensor->getDeviceValid());
 
     // Step 3: In a real scenario with a GPU backend, ensureOnHost() would now
     // wait on the NEW event (from allreduce) rather than the stale one.
@@ -694,8 +663,6 @@ TEST_F(Test__StreamCoherence, Bug2Scenario_WithoutFix_StaleEventPersists)
     // Stale event STILL there — this is the bug!
     EXPECT_EQ(tensor->getCompletionEvent(), stale_event)
         << "Without the fix: flags-only marking never replaces the stale event";
-    EXPECT_EQ(tensor->mark_dirty_with_event_call_count, 0)
-        << "Without the fix: event-based marking is never called";
 }
 
 // =============================================================================
@@ -754,7 +721,7 @@ TEST_F(Test__StreamCoherence, Bug6_EnsureOnHost_NoEvent_UsesFullSync)
     tensor->injectGpuDataPtr(device_ptr);
 
     // 4. Mark tensor as device-dirty with NO event (the Bug 6 scenario)
-    tensor->mark_device_dirty_flags_only();
+    tensor->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
 
     // Verify preconditions
     EXPECT_TRUE(tensor->getDeviceValid());

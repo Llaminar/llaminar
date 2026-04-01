@@ -11,6 +11,7 @@
 
 #include <gtest/gtest.h>
 #include "execution/local_execution/orchestrators/DeviceGraphOrchestrator.h"
+#include "models/qwen/Qwen2Graph.h"
 #include "config/TPDomain.h"
 #include "backends/DeviceId.h"
 #include "utils/MPIContext.h"
@@ -87,7 +88,7 @@ protected:
  */
 TEST_F(Test__DeviceGraphOrchestratorDomainWiring, SetDomainConfigWorks)
 {
-    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(config_, nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(std::make_shared<Qwen2Graph>(config_, nullptr), nullptr);
 
     // Initially no domain config
     EXPECT_EQ(orchestrator->domainConfig(), nullptr);
@@ -108,7 +109,7 @@ TEST_F(Test__DeviceGraphOrchestratorDomainWiring, SetDomainConfigWorks)
  */
 TEST_F(Test__DeviceGraphOrchestratorDomainWiring, SetDomainConfigToNullClears)
 {
-    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(config_, nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(std::make_shared<Qwen2Graph>(config_, nullptr), nullptr);
 
     // Set domain config
     auto domain_config = std::make_shared<MultiDomainTPConfig>(
@@ -126,7 +127,7 @@ TEST_F(Test__DeviceGraphOrchestratorDomainWiring, SetDomainConfigToNullClears)
  */
 TEST_F(Test__DeviceGraphOrchestratorDomainWiring, SetDomainConfigWithMultipleDomains)
 {
-    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(config_, nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(std::make_shared<Qwen2Graph>(config_, nullptr), nullptr);
 
     // Create config with GPU and CPU domains
     auto domain_config = std::make_shared<MultiDomainTPConfig>(
@@ -149,7 +150,7 @@ TEST_F(Test__DeviceGraphOrchestratorDomainWiring, SetDomainConfigWithMultipleDom
  */
 TEST_F(Test__DeviceGraphOrchestratorDomainWiring, GetDomainForLayerReturnsNullWithoutConfig)
 {
-    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(config_, nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(std::make_shared<Qwen2Graph>(config_, nullptr), nullptr);
 
     // No domain config set
     EXPECT_EQ(orchestrator->domainConfig(), nullptr);
@@ -165,7 +166,7 @@ TEST_F(Test__DeviceGraphOrchestratorDomainWiring, GetDomainForLayerReturnsNullWi
  */
 TEST_F(Test__DeviceGraphOrchestratorDomainWiring, GetDomainForLayerReturnsGPUDomainForAttention)
 {
-    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(config_, nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(std::make_shared<Qwen2Graph>(config_, nullptr), nullptr);
 
     auto domain_config = std::make_shared<MultiDomainTPConfig>(
         MultiDomainTPConfig::createForTest({createGPUDomain(), createCPUDomain()}));
@@ -183,7 +184,7 @@ TEST_F(Test__DeviceGraphOrchestratorDomainWiring, GetDomainForLayerReturnsGPUDom
  */
 TEST_F(Test__DeviceGraphOrchestratorDomainWiring, GetDomainForLayerReturnsCPUDomainForFFN)
 {
-    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(config_, nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(std::make_shared<Qwen2Graph>(config_, nullptr), nullptr);
 
     auto domain_config = std::make_shared<MultiDomainTPConfig>(
         MultiDomainTPConfig::createForTest({createGPUDomain(), createCPUDomain()}));
@@ -201,7 +202,7 @@ TEST_F(Test__DeviceGraphOrchestratorDomainWiring, GetDomainForLayerReturnsCPUDom
  */
 TEST_F(Test__DeviceGraphOrchestratorDomainWiring, GetDomainForLayerConsistentAcrossLayers)
 {
-    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(config_, nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(std::make_shared<Qwen2Graph>(config_, nullptr), nullptr);
 
     auto domain_config = std::make_shared<MultiDomainTPConfig>(
         MultiDomainTPConfig::createForTest({createGPUDomain(), createCPUDomain()}));
@@ -231,7 +232,7 @@ TEST_F(Test__DeviceGraphOrchestratorDomainWiring, GetDomainForLayerConsistentAcr
  */
 TEST_F(Test__DeviceGraphOrchestratorDomainWiring, GetDomainForLayerFFNFallbackToGPU)
 {
-    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(config_, nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(std::make_shared<Qwen2Graph>(config_, nullptr), nullptr);
 
     // Only GPU domain, no CPU
     auto domain_config = std::make_shared<MultiDomainTPConfig>(
@@ -253,7 +254,7 @@ TEST_F(Test__DeviceGraphOrchestratorDomainWiring, GetDomainForLayerFFNFallbackTo
  */
 TEST_F(Test__DeviceGraphOrchestratorDomainWiring, DomainConfigPersistsAcrossOperations)
 {
-    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(config_, nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(std::make_shared<Qwen2Graph>(config_, nullptr), nullptr);
 
     auto domain_config = std::make_shared<MultiDomainTPConfig>(
         MultiDomainTPConfig::createForTest({createGPUDomain()}));
@@ -278,7 +279,7 @@ TEST_F(Test__DeviceGraphOrchestratorDomainWiring, DomainConfigPersistsAcrossOper
  */
 TEST_F(Test__DeviceGraphOrchestratorDomainWiring, DomainConfigCanBeUpdated)
 {
-    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(config_, nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(std::make_shared<Qwen2Graph>(config_, nullptr), nullptr);
 
     // Set first config (GPU only)
     auto config1 = std::make_shared<MultiDomainTPConfig>(

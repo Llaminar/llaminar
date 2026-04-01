@@ -29,7 +29,7 @@
 
 #pragma once
 
-#include "../../../models/qwen/Qwen2Graph.h"
+#include "../graph/IGraphBuilder.h"
 #include "../../../backends/DeviceId.h"
 #include "../../../backends/IGPUGraphCapture.h"
 #include "IInferenceRunner.h"
@@ -39,8 +39,8 @@
 #include "../../mpi_orchestration/PlacementStrategy.h" // For InferencePhase
 #include "../../compute_stages/ComputeStages.h"        // For StageDumpInfo
 #include "../../factory/InferenceRunnerFactory.h"      // For FactoryPPStageConfig
-#include "../../../tensors/FP16Utils.h"                // For fp16_to_fp32, bf16_to_fp32
-#include "../../../tensors/BlockStructures.h"          // For Q8_1Block, Q16_1Block
+#include "../../../snapshots/SnapshotCapture.h"        // Snapshot capture (extracted Phase 2)
+#include "../engine/ForwardExecutionEngine.h"          // Forward execution engine (extracted Phase 3)
 #include "../../../loaders/IWeightStreamer.h"          // For weight streaming (Option B)
 #include "../../../interfaces/IModelContext.h"         // For interface-based construction
 #include "../../../memory/BufferArena.h"               // Phase 2: unified buffer management
@@ -73,13 +73,8 @@ namespace llaminar2
     /**
      * @brief Configuration for graph caching behavior
      */
-    struct GraphCacheConfig
-    {
-        bool enabled = true;         ///< Enable graph caching (Phase 10)
-        int decode_seq_len = 1;      ///< Sequence length that triggers decode caching
-        bool cache_attention = true; ///< Cache attention graphs
-        bool cache_ffn = true;       ///< Cache FFN graphs
-    };
+    // GraphCacheConfig moved to ForwardGraphTypes.h (Phase 3 extraction)
+    // Alias retained for backward compatibility with existing code.
 
     /**
      * @brief Cached graphs for a single transformer layer
@@ -261,6 +256,55 @@ namespace llaminar2
             std::fill(positions.begin(), positions.end(), 0);
             std::fill(sequence_lengths.begin(), sequence_lengths.end(), 0);
         }
+
+        /**
+         * @brief Build ModelBuffers from this state (mechanical mapping)
+         *
+         * Populates a ModelBuffers struct with raw pointers from owned shared_ptrs.
+         * This replaces the ~30 lines of manual field-by-field assignment that
+         * previously lived in forward().
+         */
+        ModelBuffers toModelBuffers() const
+        {
+            ModelBuffers mb;
+            mb.current_hidden = hidden.get();
+            mb.logits = logits.get();
+            mb.logits_local = logits_local.get();
+
+            auto &lb = mb.layer_buffers;
+            lb.current_hidden = hidden.get();
+            lb.normalized = normalized.get();
+            lb.residual = residual.get();
+            lb.Q = Q.get();
+            lb.K = K.get();
+            lb.V = V.get();
+            lb.attn_output = attn_output.get();
+            lb.attn_proj = attn_proj.get();
+            lb.gate = gate.get();
+            lb.up = up.get();
+            lb.ffn_output = ffn_output.get();
+            lb.workspace_scores = workspace_scores.get();
+            lb.workspace_context = workspace_context.get();
+            lb.workspace_mask = workspace_mask.get();
+
+            lb.Q_rope = Q_rope.get();
+            lb.K_rope = K_rope.get();
+            lb.V_dequant = V_dequant.get();
+
+            if (!K_head_scales.empty())
+            {
+                lb.K_head_scales = const_cast<float *>(K_head_scales.data());
+                lb.K_head_scales_capacity = K_head_scales.size();
+            }
+
+#ifdef ENABLE_PIPELINE_SNAPSHOTS
+            lb.context_snapshot = context_snapshot.get();
+            lb.attention_output_snapshot = attention_output_snapshot.get();
+            lb.attention_residual_snapshot = attention_residual_snapshot.get();
+#endif
+
+            return mb;
+        }
     };
 
     /**
@@ -277,7 +321,7 @@ namespace llaminar2
      *
      * Implements IInferenceRunner for unified inference API.
      */
-    class DeviceGraphOrchestrator : public IInferenceRunner
+    class DeviceGraphOrchestrator : public IInferenceRunner, public IForwardExecutionHost
     {
     public:
         // =========================================================================
@@ -285,32 +329,72 @@ namespace llaminar2
         // =========================================================================
 
         /**
-         * @brief Dependency injection container for testable construction
+         * @brief Dependency injection container for construction
          *
-         * Allows injection of interface implementations for unit testing:
-         * - IModelContext: Provides model metadata and weights
-         * - IMPITopology: Provides MPI topology information (optional)
-         * - ICollectiveContext: Provides collective operations (optional)
+         * Consolidates all configuration-time dependencies into a single struct.
+         * Required fields must be set before construction; optional fields have
+         * sensible defaults (nullptr / empty).
          *
          * Usage:
          * @code
-         * // In tests with mock dependencies
          * DeviceGraphOrchestrator::Dependencies deps;
-         * deps.model_ctx = std::make_shared<MockModelContext>(config);
-         * deps.topology = std::make_shared<MockMPITopology>(rank, world_size);
-         * auto orchestrator = DeviceGraphOrchestrator(std::move(deps), graph_config);
+         * deps.model_ctx = model_ctx;
+         * deps.graph_builder = std::make_shared<Qwen2Graph>(config, nullptr);
+         * deps.turboquant_ctx = turboquant_ctx;              // optional
+         * deps.pp_stage_config = pp_config;                  // optional
+         * auto orchestrator = DeviceGraphOrchestrator(std::move(deps));
          * @endcode
          */
         struct Dependencies
         {
+            // ---- Required ----
+
             /// Model context providing weights and metadata (required)
             std::shared_ptr<IModelContext> model_ctx;
 
-            /// MPI topology for work distribution (optional - nullptr for single-rank)
+            /// Graph builder for constructing compute graphs (required)
+            std::shared_ptr<IGraphBuilder> graph_builder;
+
+            // ---- Optional: distributed execution ----
+
+            /// MPI topology for work distribution (nullptr for single-rank)
             std::shared_ptr<IMPITopology> topology = nullptr;
 
-            /// Collective context for MPI operations (optional - nullptr for single-rank)
+            /// Collective context for GPU-native collectives (nullptr for single-rank)
             std::shared_ptr<ICollectiveContext> collective_ctx = nullptr;
+
+            // ---- Optional: pipeline parallelism ----
+
+            /// PP stage bounds (empty = full model)
+            std::optional<FactoryPPStageConfig> pp_stage_config;
+
+            /// Unified pipeline config for multi-stage PP+TP
+            std::shared_ptr<PipelineConfig> pipeline_config = nullptr;
+
+            // ---- Optional: additional config ----
+
+            /// TurboQuant context for TQ KV cache (owns rotation matrix lifetime)
+            std::shared_ptr<TurboQuantContext> turboquant_ctx = nullptr;
+
+            /// Weight streamer for on-demand layer transfer (nullptr = disabled)
+            std::shared_ptr<IWeightStreamer> weight_streamer = nullptr;
+
+            /// Weight manager for full weights and decode shards
+            std::shared_ptr<WeightManager> weight_manager = nullptr;
+
+            /// Weight placement map for decode device selection
+            std::shared_ptr<WeightPlacementMap> weight_placement_map = nullptr;
+
+            /// Tensor parallelism configuration (proportional TP splits)
+            std::shared_ptr<TensorParallelConfig> tp_config = nullptr;
+
+            /// Multi-domain TP configuration (heterogeneous TP domains)
+            std::shared_ptr<MultiDomainTPConfig> domain_config = nullptr;
+
+            // ---- Optional: graph caching ----
+
+            /// Graph caching configuration
+            GraphCacheConfig cache_config;
         };
 
         // =========================================================================
@@ -318,43 +402,26 @@ namespace llaminar2
         // =========================================================================
 
         /**
-         * @brief Construct orchestrator with injected dependencies (preferred for testing)
+         * @brief Construct orchestrator with injected dependencies (preferred)
          *
-         * This constructor allows full dependency injection for unit testing:
-         * - Mock model context provides weights and metadata without GGUF files
-         * - Mock topology enables testing distributed logic without MPI
-         * - Mock collective context enables testing sync stages in isolation
+         * Accepts all configuration-time dependencies in a single struct.
+         * Required fields: model_ctx, graph_builder.
+         * Optional: topology, collective_ctx, pp_stage_config, pipeline_config,
+         *           turboquant_ctx, weight_streamer, weight_manager, etc.
          *
          * @param deps Dependency injection container
-         * @param graph_config Configuration for Qwen2Graph
-         * @param cache_config Graph caching configuration
          */
-        DeviceGraphOrchestrator(
-            Dependencies deps,
-            const GraphConfig &graph_config,
-            const GraphCacheConfig &cache_config = {});
+        DeviceGraphOrchestrator(Dependencies deps);
 
         /**
          * @brief Construct orchestrator with graph builder
          *
-         * @param graph_builder Shared pointer to Qwen2Graph (graph definition)
+         * @param graph_builder Shared pointer to IGraphBuilder (graph definition)
          * @param mpi_ctx MPI context for distributed execution
          * @param cache_config Graph caching configuration
          */
         DeviceGraphOrchestrator(
-            std::shared_ptr<Qwen2Graph> graph_builder,
-            std::shared_ptr<MPIContext> mpi_ctx = nullptr,
-            const GraphCacheConfig &cache_config = {});
-
-        /**
-         * @brief Construct orchestrator with graph config (creates internal graph builder)
-         *
-         * @param graph_config Configuration for Qwen2Graph
-         * @param mpi_ctx MPI context for distributed execution
-         * @param cache_config Graph caching configuration
-         */
-        DeviceGraphOrchestrator(
-            const GraphConfig &graph_config,
+            std::shared_ptr<IGraphBuilder> graph_builder,
             std::shared_ptr<MPIContext> mpi_ctx = nullptr,
             const GraphCacheConfig &cache_config = {});
 
@@ -384,8 +451,8 @@ namespace llaminar2
          * @return true if execution succeeded
          */
         bool executeForward(
-            const Qwen2ForwardInput &input,
-            Qwen2ForwardOutput &output);
+            const ForwardInput &input,
+            ForwardOutput &output);
 
         /**
          * @brief Execute attention block for a single layer
@@ -854,9 +921,19 @@ namespace llaminar2
          */
         void setPhase(InferencePhase phase) { current_phase_ = phase; }
 
-        void setSuppressTimeline(bool suppress) override { suppress_timeline_ = suppress; }
+        void setSuppressTimeline(bool suppress) override
+        {
+            suppress_timeline_ = suppress;
+            if (forward_engine_)
+                forward_engine_->setSuppressTimeline(suppress);
+        }
 
-        void setAccumulatePrefill(bool accumulate) override { accumulate_prefill_ = accumulate; }
+        void setAccumulatePrefill(bool accumulate) override
+        {
+            accumulate_prefill_ = accumulate;
+            if (forward_engine_)
+                forward_engine_->setAccumulatePrefill(accumulate);
+        }
 
         void flushStageTimeline() override
         {
@@ -1015,25 +1092,32 @@ namespace llaminar2
         const ArenaAllocationStats *bufferStats() const;
 
         // =========================================================================
-        // Inference State Management (Phase 5)
+        // Inference State Management
         // =========================================================================
 
         /**
-         * @brief Initialize inference state owned by orchestrator
+         * @brief Initialize inference state from BufferArena (schema-driven path)
          *
-         * Allocates all buffers needed for inference. After calling this,
-         * the simplified forward() API can be used without passing buffers.
+         * Populates InferenceState by pulling shared_ptrs from the arena allocated
+         * by initializeBuffers(). This replaces the manual buffer allocation in
+         * initializeInferenceState() with a schema-driven approach.
+         *
+         * If initializeBuffers() has not yet been called, this method will:
+         * 1. Create a TensorFactory (if not externally set)
+         * 2. Call initializeBuffers(max_seq_len) to create the arena
+         * 3. Pull tensors from the arena into InferenceState
+         * 4. Initialize KV caches (not arena-managed)
          *
          * @param batch_size Maximum batch size
          * @param max_seq_len Maximum sequence length
-         * @param device_id Device for buffer allocation (default: CPU)
-         * @param init_config Configuration for buffer allocation (mapped memory, etc.)
-         * @return true if initialization succeeded
+         * @param device Target device for KV cache allocation
+         * @param init_config Configuration for special allocation modes
+         * @return true if all required buffers were found and state initialized
          */
-        bool initializeInferenceState(
+        bool initializeInferenceStateFromArena(
             int batch_size,
             int max_seq_len,
-            DeviceId device_id = DeviceId::cpu(),
+            DeviceId device,
             const InferenceStateInitConfig &init_config = InferenceStateInitConfig{});
 
         /**
@@ -1087,32 +1171,12 @@ namespace llaminar2
         // =========================================================================
 
         /**
-         * @brief Result of a graph build operation (nested class)
+         * @brief Result of a graph build operation
+         *
+         * Type alias to the standalone GraphBuildResult (extracted to ForwardGraphTypes.h).
+         * Kept as a nested type alias for backward compatibility with existing code.
          */
-        class GraphBuildResult
-        {
-        public:
-            GraphBuildResult() = default;
-            GraphBuildResult(ComputeGraph graph, Qwen2ForwardOutput output)
-                : graph_(std::move(graph)), output_(output), success_(true) {}
-            explicit GraphBuildResult(std::string error)
-                : error_(std::move(error)), success_(false) {}
-
-            [[nodiscard]] bool success() const { return success_; }
-            [[nodiscard]] bool failed() const { return !success_; }
-            [[nodiscard]] const std::string &error() const { return error_; }
-            [[nodiscard]] ComputeGraph &graph() { return graph_; }
-            [[nodiscard]] const ComputeGraph &graph() const { return graph_; }
-            [[nodiscard]] const Qwen2ForwardOutput &output() const { return output_; }
-            [[nodiscard]] ComputeGraph takeGraph() { return std::move(graph_); }
-            explicit operator bool() const { return success_; }
-
-        private:
-            ComputeGraph graph_;
-            Qwen2ForwardOutput output_{};
-            std::string error_;
-            bool success_ = false;
-        };
+        using GraphBuildResult = llaminar2::GraphBuildResult;
 
         /**
          * @brief Fluent builder for compute graph composition (nested class)
@@ -1124,7 +1188,7 @@ namespace llaminar2
                 : orchestrator_(orchestrator) {}
 
             // Input configuration
-            GraphBuildSession &forInput(const Qwen2ForwardInput &input);
+            GraphBuildSession &forInput(const ForwardInput &input);
             GraphBuildSession &withPositionIds(const int *position_ids);
             GraphBuildSession &withExternalHiddenState(TensorBase *hidden_state);
 
@@ -1152,7 +1216,7 @@ namespace llaminar2
 
         private:
             DeviceGraphOrchestrator &orchestrator_;
-            std::optional<Qwen2ForwardInput> input_;
+            std::optional<ForwardInput> input_;
             const int *explicit_position_ids_ = nullptr;
             TensorBase *external_hidden_state_ = nullptr;
             std::shared_ptr<PipelineConfig> pipeline_config_;
@@ -1170,7 +1234,7 @@ namespace llaminar2
             std::optional<ModelBuffers> buffers_;
             IKVCache *kv_cache_ = nullptr;
 
-            Qwen2ForwardInput prepareInput() const;
+            ForwardInput prepareInput() const;
             void applyConfiguration();
         };
 
@@ -1345,8 +1409,8 @@ namespace llaminar2
         /**
          * @brief Get the underlying graph builder
          */
-        Qwen2Graph *graphBuilder() { return graph_builder_.get(); }
-        const Qwen2Graph *graphBuilder() const { return graph_builder_.get(); }
+        IGraphBuilder *graphBuilder() { return graph_builder_.get(); }
+        const IGraphBuilder *graphBuilder() const { return graph_builder_.get(); }
 
         /**
          * @brief Get the underlying executor
@@ -1360,7 +1424,7 @@ namespace llaminar2
          * @param device Device identifier
          * @return Device context pointer (owned by orchestrator)
          */
-        IDeviceContext *getDeviceContext(DeviceId device);
+        IDeviceContext *getDeviceContext(DeviceId device) override;
 
         // =========================================================================
         // IInferenceRunner Interface Implementation
@@ -1399,7 +1463,8 @@ namespace llaminar2
             {
                 entry.valid = false;
             }
-            forward_graph_cache_.clear();
+            if (forward_engine_)
+                forward_engine_->clearCache();
             last_pos_offset_ = -1;
             cache_stats_ = CacheStats{};
             state_.clear();
@@ -1422,7 +1487,12 @@ namespace llaminar2
         /**
          * @brief Get architecture name
          */
-        const char *architecture() const override { return "qwen2"; }
+        const char *architecture() const override
+        {
+            static thread_local std::string arch_name;
+            arch_name = graph_builder_ ? graph_builder_->architectureName() : "unknown";
+            return arch_name.c_str();
+        }
 
         /**
          * @brief Get executor statistics for profiling
@@ -1470,484 +1540,69 @@ namespace llaminar2
         const std::vector<int> &sequence_lengths() const override { return state_.sequence_lengths; }
 
         // =========================================================================
-        // Snapshot Capture API (Pipeline-compatible for E2E testing)
+        // Snapshot Capture API (delegated to SnapshotCapture — Phase 2 extract)
         // =========================================================================
 
-        /**
-         * @brief Extract FP32 data from a StageDumpInfo output buffer
-         *
-         * Handles dequantization for Q8_1, Q16_1, and other quantized formats.
-         * For FP32 outputs, performs a simple copy.
-         *
-         * @param out Output buffer from StageDumpInfo
-         * @return Vector of FP32 values, or empty if extraction fails
-         */
-        static std::vector<float> extractFp32FromOutput(const StageDumpInfo::OutputBuffer &out)
-        {
-            if (!out.data)
-                return {};
-
-            size_t count = out.rows * out.cols;
-            if (count == 0)
-                return {};
-
-            std::vector<float> data(count);
-            std::string dtype_str = out.dtype ? out.dtype : "FP32";
-
-            LOG_TRACE("[extractFp32FromOutput] name=" << (out.name ? out.name : "?")
-                                                      << " dtype=" << dtype_str << " rows=" << out.rows << " cols=" << out.cols);
-
-            // FP32: direct copy
-            if (dtype_str == "FP32")
-            {
-                std::memcpy(data.data(), out.data, count * sizeof(float));
-                return data;
-            }
-
-            // Q8_1: dequantize blocks
-            if (dtype_str == "Q8_1")
-            {
-                const Q8_1Block *blocks = static_cast<const Q8_1Block *>(out.data);
-                constexpr int BLOCK_SIZE = 32;
-                size_t num_blocks = (count + BLOCK_SIZE - 1) / BLOCK_SIZE;
-
-                for (size_t b = 0; b < num_blocks; ++b)
-                {
-                    const Q8_1Block &block = blocks[b];
-                    float scale = fp16_to_fp32(block.d);
-                    for (int i = 0; i < BLOCK_SIZE && b * BLOCK_SIZE + i < count; ++i)
-                    {
-                        data[b * BLOCK_SIZE + i] = static_cast<float>(block.qs[i]) * scale;
-                    }
-                }
-                return data;
-            }
-
-            // Q16_1 variants: dequantize blocks (block sizes 32, 64, 128)
-            if (dtype_str.find("Q16_1") == 0)
-            {
-                // Determine block size from dtype string (Q16_1_32, Q16_1_64, Q16_1_128)
-                int block_size = 32; // Default
-                if (dtype_str.find("_64") != std::string::npos)
-                    block_size = 64;
-                else if (dtype_str.find("_128") != std::string::npos)
-                    block_size = 128;
-
-                const Q16_1Block *blocks = static_cast<const Q16_1Block *>(out.data);
-                size_t num_blocks = (count + block_size - 1) / block_size;
-
-                for (size_t b = 0; b < num_blocks; ++b)
-                {
-                    const Q16_1Block &block = blocks[b];
-                    float scale = fp16_to_fp32(block.d);
-                    for (int i = 0; i < block_size && b * block_size + i < count; ++i)
-                    {
-                        data[b * block_size + i] = static_cast<float>(block.qs[i]) * scale;
-                    }
-                }
-                return data;
-            }
-
-            // BF16 or FP16: convert to FP32
-            if (dtype_str == "BF16" || dtype_str == "FP16")
-            {
-                const uint16_t *half_data = static_cast<const uint16_t *>(out.data);
-                for (size_t i = 0; i < count; ++i)
-                {
-                    if (dtype_str == "BF16")
-                    {
-                        data[i] = simd::bf16_to_fp32(half_data[i]);
-                    }
-                    else
-                    {
-                        data[i] = simd::fp16_to_fp32(half_data[i]);
-                    }
-                }
-                return data;
-            }
-
-            // Unknown dtype - warn and try FP32 (may be garbage)
-            LOG_WARN("[extractFp32FromOutput] Unknown dtype '" << dtype_str << "', assuming FP32");
-            std::memcpy(data.data(), out.data, count * sizeof(float));
-            return data;
-        }
-
-        /**
-         * @brief Enable snapshot capture of intermediate activations
-         *
-         * When enabled, orchestrator stores copies of intermediate tensors from
-         * each stage execution. Used for parity testing against reference implementations.
-         *
-         * @param output_dir Optional directory to save snapshots (currently unused)
-         */
         void enableSnapshotCapture(const std::string &output_dir = "") override
         {
-            (void)output_dir; // Reserved for future disk output
-            snapshots_.clear();
+            (void)output_dir;
+            snapshot_capture_.clear();
             snapshot_enabled_ = true;
 
             LOG_INFO("[DeviceGraphOrchestrator::enableSnapshotCapture] Setting callback on executor_");
             executor_.setSnapshotCallback(
                 [this](const std::string &name, const StageDumpInfo &dump)
                 {
-                    LOG_TRACE("[Snapshot] Callback invoked for stage: " << name << " outputs.size=" << dump.outputs.size());
-                    // Handle fused QKV stage specially - split into separate Q, K, V snapshots
-                    // The fused stage outputs are ordered: Q (output_q), K (output_k), V (output_v)
-                    if (name.find("_qkv_proj") != std::string::npos)
-                    {
-                        // Extract layer prefix (e.g., "layer0" from "layer0_qkv_proj")
-                        size_t qkv_pos = name.find("_qkv_proj");
-                        std::string prefix = name.substr(0, qkv_pos);
-
-                        // Store Q, K, V separately with pipeline-compatible keys
-                        if (dump.outputs.size() >= 3)
-                        {
-                            // Output 0 = Q
-                            if (dump.outputs[0].data)
-                            {
-                                auto data = extractFp32FromOutput(dump.outputs[0]);
-                                if (!data.empty())
-                                    snapshots_[prefix + "_Q_PROJECTION"] = {std::move(data), dump.outputs[0].rows, dump.outputs[0].cols};
-                            }
-                            // Output 1 = K
-                            if (dump.outputs[1].data)
-                            {
-                                auto data = extractFp32FromOutput(dump.outputs[1]);
-                                if (!data.empty())
-                                    snapshots_[prefix + "_K_PROJECTION"] = {std::move(data), dump.outputs[1].rows, dump.outputs[1].cols};
-                            }
-                            // Output 2 = V
-                            if (dump.outputs[2].data)
-                            {
-                                auto data = extractFp32FromOutput(dump.outputs[2]);
-                                if (!data.empty())
-                                    snapshots_[prefix + "_V_PROJECTION"] = {std::move(data), dump.outputs[2].rows, dump.outputs[2].cols};
-                            }
-                        }
-                        return;
-                    }
-
-                    // Handle fused Gate/Up stage specially - split into separate GATE and UP snapshots
-                    if (name.find("_gate_up") != std::string::npos)
-                    {
-                        size_t pos = name.find("_gate_up");
-                        std::string prefix = name.substr(0, pos);
-
-                        if (dump.outputs.size() >= 2)
-                        {
-                            // Output 0 = gate
-                            if (dump.outputs[0].data)
-                            {
-                                auto data = extractFp32FromOutput(dump.outputs[0]);
-                                if (!data.empty())
-                                    snapshots_[prefix + "_FFN_GATE"] = {std::move(data), dump.outputs[0].rows, dump.outputs[0].cols};
-                            }
-                            // Output 1 = up
-                            if (dump.outputs[1].data)
-                            {
-                                auto data = extractFp32FromOutput(dump.outputs[1]);
-                                if (!data.empty())
-                                    snapshots_[prefix + "_FFN_UP"] = {std::move(data), dump.outputs[1].rows, dump.outputs[1].cols};
-                            }
-                        }
-                        return;
-                    }
-
-                    // Handle RoPE stage - captures Q_ROPE and K_ROPE
-                    if (name.find("_rope") != std::string::npos && name.find("_q_rope") == std::string::npos && name.find("_k_rope") == std::string::npos)
-                    {
-                        // Generic "_rope" stage (fused Q/K RoPE)
-                        size_t pos = name.find("_rope");
-                        std::string prefix = name.substr(0, pos);
-
-                        // RoPE stage outputs are Q and K after RoPE application
-                        if (dump.outputs.size() >= 2)
-                        {
-                            if (dump.outputs[0].data)
-                            {
-                                auto data = extractFp32FromOutput(dump.outputs[0]);
-                                if (!data.empty())
-                                    snapshots_[prefix + "_Q_ROPE"] = {std::move(data), dump.outputs[0].rows, dump.outputs[0].cols};
-                            }
-                            if (dump.outputs[1].data)
-                            {
-                                auto data = extractFp32FromOutput(dump.outputs[1]);
-                                if (!data.empty())
-                                    snapshots_[prefix + "_K_ROPE"] = {std::move(data), dump.outputs[1].rows, dump.outputs[1].cols};
-                            }
-                        }
-                        return;
-                    }
-
-                    // Handle fused attention+Wo stage - captures ATTENTION_CONTEXT, ATTENTION_OUTPUT, and ATTENTION_RESIDUAL
-                    // FusedAttentionWoStage::getDumpInfo() outputs are named (in order):
-                    //   "context" (ATTENTION_CONTEXT) - pre-Wo attention output
-                    //   "attention_output" (ATTENTION_OUTPUT) - post-Wo projection, before residual add
-                    //   "attention_residual" (ATTENTION_RESIDUAL) - after residual add
-                    //   "output" - primary output tensor (may be Q16_1 for HybridQ16)
-                    // The outputs vector preserves this order for non-null snapshots.
-                    if (name.find("_fused_attn_wo") != std::string::npos)
-                    {
-                        size_t pos = name.find("_fused_attn_wo");
-                        std::string prefix = name.substr(0, pos);
-
-                        LOG_TRACE("[Snapshot] fused_attn_wo handler: prefix=" << prefix
-                                                                              << " dump.outputs.size()=" << dump.outputs.size());
-
-                        // Iterate through outputs and map by name to snapshot keys
-                        for (size_t i = 0; i < dump.outputs.size(); ++i)
-                        {
-                            const auto &out = dump.outputs[i];
-                            if (!out.data || !out.name)
-                                continue;
-
-                            std::string key;
-                            std::string out_name(out.name);
-
-                            // Match by name from StageDumpInfo::OutputBuffer
-                            if (out_name == "context")
-                            {
-                                key = prefix + "_ATTENTION_CONTEXT";
-                            }
-                            else if (out_name == "attention_output")
-                            {
-                                key = prefix + "_ATTENTION_OUTPUT";
-                            }
-                            else if (out_name == "attention_residual")
-                            {
-                                key = prefix + "_ATTENTION_RESIDUAL";
-                            }
-                            else if (out_name == "output")
-                            {
-                                // Skip primary output - it's handled by residual stage or is Q16_1
-                                continue;
-                            }
-                            else
-                            {
-                                LOG_WARN("[Snapshot] fused_attn_wo unknown output name: " << out_name);
-                                continue;
-                            }
-
-                            LOG_TRACE("[Snapshot] Storing " << key << ": rows=" << out.rows
-                                                            << " cols=" << out.cols);
-                            auto data = extractFp32FromOutput(out);
-                            if (!data.empty())
-                                snapshots_[key] = {std::move(data), out.rows, out.cols};
-                        }
-                        return;
-                    }
-
-                    // Handle lm_head_allgather - store as LM_HEAD (overwrites partial output)
-                    // In TP mode, lm_head produces partial vocab logits, but parity tests expect
-                    // full vocab. The allgather output is the correct comparison point.
-                    if (name == "lm_head_allgather")
-                    {
-                        if (!dump.outputs.empty() && dump.outputs[0].data)
-                        {
-                            const auto &out = dump.outputs[0];
-                            auto data = extractFp32FromOutput(out);
-                            LOG_DEBUG("[Snapshot] lm_head_allgather handler: storing as LM_HEAD (overwriting partial), count=" << data.size());
-                            if (!data.empty())
-                                snapshots_["LM_HEAD"] = {std::move(data), out.rows, out.cols}; // Overwrite partial with full
-                        }
-                        return;
-                    }
-
-                    // Handle FusedResidualNormStage - has two outputs:
-                    //   outputs[0] = "residual_out" (pre-norm residual = old_hidden + input)
-                    //   outputs[1] = "norm_output"  (RMSNorm output after gamma scaling)
-                    // Parity tests compare ATTENTION_NORM/FFN_NORM against PyTorch's normalized
-                    // output (post-RMSNorm), so we must store outputs[1] for the NORM key.
-                    // Note: The residual (outputs[0]) is NOT stored here — dedicated
-                    // attn_residual/ffn_residual stages in the graph capture those separately.
-                    if ((name.find("_attn_norm") != std::string::npos ||
-                         name.find("_ffn_norm") != std::string::npos) &&
-                        dump.outputs.size() >= 2)
-                    {
-                        std::string key = convertStageNameToSnapshotKey(name);
-
-                        // Store norm_output (outputs[1]) as the NORM snapshot
-                        if (dump.outputs[1].data)
-                        {
-                            auto data = extractFp32FromOutput(dump.outputs[1]);
-                            LOG_DEBUG("[Snapshot] FusedResidualNorm: storing norm_output as key="
-                                      << key << " count=" << data.size());
-                            if (!data.empty())
-                                snapshots_[key] = {std::move(data), dump.outputs[1].rows, dump.outputs[1].cols};
-                        }
-                        return;
-                    }
-
-                    // Standard single-output stages
-                    LOG_DEBUG("[Snapshot] Standard path: stage=" << name
-                                                                 << " outputs.size=" << dump.outputs.size()
-                                                                 << " out[0].data=" << (dump.outputs.empty() ? nullptr : dump.outputs[0].data));
-                    if (!dump.outputs.empty() && dump.outputs[0].data)
-                    {
-                        const auto &out = dump.outputs[0];
-
-                        auto data = extractFp32FromOutput(out);
-
-                        // Convert graph stage name to pipeline-style key
-                        std::string key = convertStageNameToSnapshotKey(name);
-                        LOG_DEBUG("[Snapshot] Storing key=" << key << " count=" << data.size());
-
-                        // Debug: Log first few values of extracted data
-                        if (data.size() >= 8 && key == "EMBEDDING")
-                        {
-                            LOG_DEBUG("[Snapshot] " << key << " first 8 values: "
-                                                    << data[0] << "," << data[1] << "," << data[2] << "," << data[3] << ","
-                                                    << data[4] << "," << data[5] << "," << data[6] << "," << data[7]);
-                        }
-
-                        if (!data.empty())
-                            snapshots_[key] = {std::move(data), out.rows, out.cols};
-                    }
+                    snapshot_capture_.captureStage(name, dump);
                 });
         }
 
-        /**
-         * @brief Disable snapshot capture and clear stored snapshots
-         */
         void disableSnapshotCapture() override
         {
             snapshot_enabled_ = false;
-            snapshots_.clear();
+            snapshot_capture_.clear();
             executor_.setSnapshotCallback(nullptr);
         }
 
-        /**
-         * @brief Clear stored snapshots but keep capture enabled
-         */
         void clearSnapshots() override
         {
-            snapshots_.clear();
+            snapshot_capture_.clear();
         }
 
-        /**
-         * @brief Retrieve a captured snapshot by key
-         *
-         * @param key Snapshot identifier (e.g., "layer0_Q_PROJECTION", "EMBEDDING")
-         * @param out_size Output parameter for tensor size (number of float elements)
-         * @return Pointer to snapshot data, or nullptr if key doesn't exist
-         */
         const float *getSnapshot(const std::string &key, size_t &out_size) const override
         {
-            auto it = snapshots_.find(key);
-            if (it == snapshots_.end())
+            const auto *snap = snapshot_capture_.get(key);
+            if (!snap)
             {
                 LOG_DEBUG("[DeviceGraphOrchestrator::getSnapshot] Key NOT FOUND: " << key
-                                                                                   << " (have " << snapshots_.size() << " snapshots)");
+                                                                                   << " (have " << snapshot_capture_.all().size() << " snapshots)");
                 out_size = 0;
                 return nullptr;
             }
-            out_size = it->second.data.size();
+            out_size = snap->data.size();
             LOG_TRACE("[DeviceGraphOrchestrator::getSnapshot] Key found: " << key << " size=" << out_size);
-            return it->second.data.data();
+            return snap->data.data();
         }
 
-        /**
-         * @brief Retrieve a captured snapshot with 2D shape metadata
-         *
-         * Returns the snapshot data along with the rows/cols that the stage
-         * reported via getDumpInfo() at capture time.
-         */
         SnapshotInfo getSnapshotWithShape(const std::string &key) const override
         {
-            auto it = snapshots_.find(key);
-            if (it == snapshots_.end())
+            const auto *snap = snapshot_capture_.get(key);
+            if (!snap)
                 return {};
-            const auto &snap = it->second;
-            return {snap.data.data(), snap.data.size(), snap.rows, snap.cols};
+            return {snap->data.data(), snap->data.size(), snap->rows, snap->cols};
         }
 
-        /**
-         * @brief Get list of all captured snapshot keys
-         *
-         * @return Vector of snapshot identifiers
-         */
         std::vector<std::string> getSnapshotKeys() const override
         {
-            std::vector<std::string> keys;
-            keys.reserve(snapshots_.size());
-            for (const auto &p : snapshots_)
-            {
-                keys.push_back(p.first);
-            }
-            return keys;
+            return snapshot_capture_.keys();
         }
 
-        /**
-         * @brief Check if snapshot capture is enabled
-         */
         bool isSnapshotCaptureEnabled() const { return snapshot_enabled_; }
 
-        /**
-         * @brief Convert graph stage name to pipeline-style snapshot key
-         *
-         * Graph stages use snake_case (e.g., "layer0_q_proj")
-         * Pipeline snapshots use SCREAMING_CASE (e.g., "layer0_Q_PROJECTION")
-         *
-         * This is public to allow unit testing of the conversion logic.
-         *
-         * @param stage_name Graph stage name
-         * @return Pipeline-compatible snapshot key
-         */
+        /// @brief Convert graph stage name to pipeline-style snapshot key (delegates to SnapshotCapture)
         static std::string convertStageNameToSnapshotKey(const std::string &stage_name)
         {
-            // Stage name mappings (graph → pipeline)
-            static const std::unordered_map<std::string, std::string> suffix_map = {
-                {"_attn_norm", "_ATTENTION_NORM"},
-                {"_q_norm", "_Q_NORM"}, // Qwen3 per-head QK RMSNorm
-                {"_k_norm", "_K_NORM"}, // Qwen3 per-head QK RMSNorm
-                {"_q_proj", "_Q_PROJECTION"},
-                {"_k_proj", "_K_PROJECTION"},
-                {"_v_proj", "_V_PROJECTION"},
-                {"_q_rope", "_Q_ROPE"},
-                {"_k_rope", "_K_ROPE"},
-                {"_attention", "_ATTENTION_CONTEXT"},   // Graph uses "attention" not "attn_compute"
-                {"_wo_proj", "_ATTENTION_OUTPUT"},      // Graph uses "wo_proj" not "attn_proj"
-                {"_wo_allreduce", "_ATTENTION_OUTPUT"}, // LOCAL TP: allreduce overwrites partial Wo result
-                {"_attn_residual", "_ATTENTION_RESIDUAL"},
-                {"_ffn_norm", "_FFN_NORM"},
-                {"_ffn_gate", "_FFN_GATE"},
-                {"_ffn_up", "_FFN_UP"},
-                {"_swiglu", "_FFN_SWIGLU"},
-                {"_down_proj", "_FFN_DOWN"},      // Graph uses "down_proj" not "ffn_down"
-                {"_down_allreduce", "_FFN_DOWN"}, // LOCAL TP: allreduce overwrites partial down_proj result
-                {"_ffn_residual", "_FFN_RESIDUAL"},
-            };
-
-            // Global stages
-            if (stage_name == "embedding")
-                return "EMBEDDING";
-            if (stage_name == "final_norm")
-                return "FINAL_NORM";
-            if (stage_name == "lm_head")
-                return "LM_HEAD";
-
-            // Layer-specific stages: extract layer prefix and convert suffix
-            for (const auto &[suffix, replacement] : suffix_map)
-            {
-                size_t pos = stage_name.find(suffix);
-                if (pos != std::string::npos)
-                {
-                    // Extract "layerN" prefix
-                    std::string prefix = stage_name.substr(0, pos);
-                    return prefix + replacement;
-                }
-            }
-
-            // Fallback: return original name (uppercase)
-            std::string result = stage_name;
-            for (char &c : result)
-            {
-                if (c >= 'a' && c <= 'z')
-                    c = c - 'a' + 'A';
-                if (c == '_')
-                    c = '_'; // Keep underscores
-            }
-            return result;
+            return SnapshotCapture::convertStageNameToSnapshotKey(stage_name);
         }
 
         // =========================================================================
@@ -2011,6 +1666,40 @@ namespace llaminar2
         void updateCachedGraphParams(ComputeGraph &graph, int pos_offset, int seq_len);
 
         /**
+         * @brief Configure executor from graph builder config and environment.
+         *
+         * Shared setup extracted from all constructors to eliminate duplication.
+         */
+        void configureExecutor();
+
+        /**
+         * @brief Validate that the orchestrator has all required configuration
+         *        for executing forward passes.
+         *
+         * Checks that inference state, weights, and graph builder are properly
+         * initialized. Logs specific errors for each missing requirement.
+         *
+         * @return true if configuration is complete and forward() can proceed
+         */
+        bool validateConfigurationForForward() const;
+
+        /**
+         * @brief Initialize KV caches for the current configuration.
+         *
+         * Creates single KV cache (non-PP) or per-device KV caches (PP mode).
+         * Handles sharding for tensor parallelism (LOCAL and GLOBAL TP).
+         *
+         * @param batch_size Batch size for KV cache allocation
+         * @param max_seq_len Maximum sequence length
+         * @param n_layers Number of layers (already adjusted for PP stage)
+         * @param device Target device
+         * @param local_mpi_ctx MPI context (may be single-rank default)
+         * @return true if KV caches initialized successfully
+         */
+        bool initializeKVCaches(int batch_size, int max_seq_len, int n_layers,
+                                DeviceId device, const std::shared_ptr<MPIContext> &local_mpi_ctx);
+
+        /**
          * @brief Synchronize the GPU stream and mark logits as synced at forward
          *        pass boundary.
          *
@@ -2021,7 +1710,7 @@ namespace llaminar2
          *
          * @param ctx Device context whose stream to synchronize
          */
-        void syncLogitsAtBoundary(IDeviceContext *ctx);
+        void syncLogitsAtBoundary(IDeviceContext *ctx) override;
 
         /**
          * @brief Build decode-time capture policy from runtime and graph context
@@ -2029,7 +1718,7 @@ namespace llaminar2
         DeviceGraphExecutor::DecodeCapturePolicy buildDecodeCapturePolicy(
             bool has_collective_nodes,
             IDeviceContext *ctx,
-            int segment_consecutive_failures) const;
+            int segment_consecutive_failures) const override;
 
         /**
          * @brief Check whether collective segmented replay is backend-supported
@@ -2046,11 +1735,30 @@ namespace llaminar2
         bool canUseCachedGraph(int layer_idx, int seq_len) const;
 
         // =========================================================================
+        // IForwardExecutionHost Overrides (Phase 3)
+        // =========================================================================
+
+        /** Build forward graph via fluent builder API. */
+        GraphBuildResult buildForwardGraph(const ForwardInput &input) override;
+
+        /** Get device contexts for all PP pipeline devices. */
+        std::unordered_map<DeviceId, IDeviceContext *> getPipelineDeviceContexts() override;
+
+        /** Access the logits tensor for mapped-memory sync checks. */
+        TensorBase *logitsTensor() override;
+
+        /** Resolve PP copy info for cache-miss builds. */
+        PPCopyInfo resolvePPCopyInfo(const ForwardInput &input) const override;
+
+        /** Create and return the ForwardExecutionEngine with current config. */
+        void ensureForwardEngine();
+
+        // =========================================================================
         // Members
         // =========================================================================
 
         /// Graph builder (declarative layer)
-        std::shared_ptr<Qwen2Graph> graph_builder_;
+        std::shared_ptr<IGraphBuilder> graph_builder_;
 
         /// Graph executor
         DeviceGraphExecutor executor_;
@@ -2092,150 +1800,13 @@ namespace llaminar2
          * Phase 1 goal: avoid rebuilding stage/kernel objects on repeated forwards
          * with the same execution shape/path.
          */
-        struct ForwardGraphSignature
-        {
-            int seq_len = 0;
-            int batch_size = 0;
-            DeviceId device = DeviceId::cpu();
-            bool decode = false;
-            bool standard_path = true;
-            bool pp_stage_enabled = false;
-            int pp_first_layer = -1;
-            int pp_last_layer = -1;
-            bool pp_has_embedding = false;
-            bool pp_has_lm_head = false;
+        // =========================================================================
+        // Forward Execution Engine (Phase 3: extracted from executeForward)
+        // =========================================================================
 
-            bool operator==(const ForwardGraphSignature &other) const
-            {
-                return seq_len == other.seq_len &&
-                       batch_size == other.batch_size &&
-                       device == other.device &&
-                       decode == other.decode &&
-                       standard_path == other.standard_path &&
-                       pp_stage_enabled == other.pp_stage_enabled &&
-                       pp_first_layer == other.pp_first_layer &&
-                       pp_last_layer == other.pp_last_layer &&
-                       pp_has_embedding == other.pp_has_embedding &&
-                       pp_has_lm_head == other.pp_has_lm_head;
-            }
-        };
-
-        struct ForwardGraphSignatureHash
-        {
-            size_t operator()(const ForwardGraphSignature &sig) const
-            {
-                size_t h = std::hash<int>{}(sig.seq_len);
-                h ^= (std::hash<int>{}(sig.batch_size) + 0x9e3779b9 + (h << 6) + (h >> 2));
-                h ^= (std::hash<DeviceId>{}(sig.device) + 0x9e3779b9 + (h << 6) + (h >> 2));
-                h ^= (std::hash<bool>{}(sig.decode) + 0x9e3779b9 + (h << 6) + (h >> 2));
-                h ^= (std::hash<bool>{}(sig.standard_path) + 0x9e3779b9 + (h << 6) + (h >> 2));
-                h ^= (std::hash<bool>{}(sig.pp_stage_enabled) + 0x9e3779b9 + (h << 6) + (h >> 2));
-                h ^= (std::hash<int>{}(sig.pp_first_layer) + 0x9e3779b9 + (h << 6) + (h >> 2));
-                h ^= (std::hash<int>{}(sig.pp_last_layer) + 0x9e3779b9 + (h << 6) + (h >> 2));
-                h ^= (std::hash<bool>{}(sig.pp_has_embedding) + 0x9e3779b9 + (h << 6) + (h >> 2));
-                h ^= (std::hash<bool>{}(sig.pp_has_lm_head) + 0x9e3779b9 + (h << 6) + (h >> 2));
-                return h;
-            }
-        };
-
-        /**
-         * @brief Cached full forward graph for decode mode
-         *
-         * During decode (seq_len=1), the graph structure is identical between
-         * steps — only token_ids, position_ids, and position_offset change.
-         * Instead of rebuilding hundreds of stage objects every forward() call,
-         * we cache the graph and its stages after the first decode step.
-         *
-         * Stable buffers (token_ids, position_ids) are owned here so that
-         * cached stages' pointers remain valid across calls.
-         */
-        struct ForwardGraphCache
-        {
-            std::unique_ptr<ComputeGraph> graph; ///< Cached compute graph
-            Qwen2ForwardOutput output;           ///< Cached output (logits pointer)
-            bool valid = false;                  ///< Whether cache is usable
-
-            // Stable buffers — stages point to these, contents updated each step
-            std::vector<int> token_ids;    ///< Persistent decode token storage
-            std::vector<int> position_ids; ///< Persistent decode position IDs
-
-            // PP hidden state copy — for non-embedding PP stages, the external
-            // hidden state must be copied to the working buffer on every forward.
-            // During graph build (cache MISS) this copy happens inline in
-            // Qwen2Graph::buildPartialForwardGraph(). On cache HIT we must redo
-            // the copy here because the graph build code is not re-executed.
-            TensorBase *pp_external_hidden_state = nullptr; ///< Source (stage N-1 output)
-            TensorBase *pp_working_buffer = nullptr;        ///< Destination (local residual/hidden)
-            size_t pp_copy_bytes = 0;
-            DeviceId pp_device;
-            bool pp_needs_copy = false;
-
-            // Pre-computed collective stage names for fast decode intercept
-            std::unordered_set<std::string> collective_nodes;
-
-            // Pre-cached pointers to stages that override updateDynamicParams().
-            // Only ~4 stages (RoPE, Attention, FusedAttention, KVCacheAppend) need
-            // updating — avoids iterating all ~339 stages with hash lookups each step.
-            std::vector<IComputeStage *> dynamic_param_stages;
-            bool dynamic_param_stages_cached = false;
-
-            // Tracks whether setGPUStream has been applied to all stages.
-            // The capture_stream never changes once set, so we skip the
-            // 339-stage loop on subsequent decode steps.
-            bool gpu_stream_applied = false;
-
-            // Tracks whether Phase 3 graph replay is active (no markCompleted calls),
-            // allowing us to skip the 339-node graph.reset() since flags are already clear.
-            bool phase3_active = false;
-
-            /// GPU graph capture/replay for eliminating per-kernel launch overhead
-            std::unique_ptr<IGPUGraphCapture> gpu_graph;
-
-            /// Segmented GPU graph cache — excludes non-capturable stages (attention, KV cache)
-            /// and captures contiguous runs of capturable stages into separate graphs
-            DeviceGraphExecutor::GraphSegmentCache segment_cache;
-
-            /// GPU stream (from IWorkerGPUContext::defaultStream()) for kernel dispatch
-            /// Set when gpu_graph is created; used by stages to dispatch on correct stream
-            void *gpu_stream = nullptr;
-
-            /// GPU context for creating new graph captures (not owned)
-            IWorkerGPUContext *gpu_ctx = nullptr;
-
-            /// Number of consecutive graph update failures (fallback heuristic)
-            int gpu_graph_update_failures = 0;
-
-            /// Maximum consecutive update failures before disabling graph capture
-            static constexpr int kMaxGraphUpdateFailures = 4;
-
-            void invalidate()
-            {
-                if (gpu_graph)
-                {
-                    gpu_graph->reset();
-                    gpu_graph.reset();
-                }
-                segment_cache.reset();
-                gpu_stream = nullptr;
-                gpu_ctx = nullptr;
-                gpu_graph_update_failures = 0;
-                graph.reset();
-                valid = false;
-                token_ids.clear();
-                position_ids.clear();
-                collective_nodes.clear();
-                dynamic_param_stages.clear();
-                dynamic_param_stages_cached = false;
-                gpu_stream_applied = false;
-                phase3_active = false;
-                pp_external_hidden_state = nullptr;
-                pp_working_buffer = nullptr;
-                pp_copy_bytes = 0;
-                pp_needs_copy = false;
-            }
-        };
-
-        std::unordered_map<ForwardGraphSignature, ForwardGraphCache, ForwardGraphSignatureHash> forward_graph_cache_;
+        /// Forward graph execution engine — owns the forward graph cache
+        /// and handles cache HIT/MISS dispatch, GPU graph replay, timeline collection.
+        std::unique_ptr<ForwardExecutionEngine> forward_engine_;
 
         /// Padded sequence length from last forward_batch() call
         int padded_seq_len_ = 0;
@@ -2247,16 +1818,8 @@ namespace llaminar2
         /// Whether snapshot capture is enabled
         bool snapshot_enabled_ = false;
 
-        /// Internal storage for a captured snapshot with shape metadata
-        struct StoredSnapshot
-        {
-            std::vector<float> data;
-            size_t rows = 0;
-            size_t cols = 0;
-        };
-
-        /// Captured snapshots (key -> FP32 data with shape)
-        std::unordered_map<std::string, StoredSnapshot> snapshots_;
+        /// Snapshot capture engine (owns storage + routing logic)
+        SnapshotCapture snapshot_capture_;
 
         // =========================================================================
         // Graph Buffer Management Members (Phase 3 - moved from Qwen2Graph)
@@ -2290,7 +1853,7 @@ namespace llaminar2
          * @param graph The compute graph whose stages need workspace
          * @return true if allocation succeeded (or was already done)
          */
-        bool ensureDeviceWorkspaceAllocated(const ComputeGraph &graph);
+        bool ensureDeviceWorkspaceAllocated(const ComputeGraph &graph) override;
 
         /**
          * @brief Initialize the BufferArena from existing managed buffers (legacy path)

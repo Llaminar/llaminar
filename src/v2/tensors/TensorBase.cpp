@@ -1518,15 +1518,6 @@ namespace llaminar2
         }
     }
 
-    void TensorBase::mark_device_dirty_with_event(void *stream)
-    {
-        // Delegate to the state-machine-aware implementation
-        transitionToWithEvent(
-            is_mapped_ ? TensorCoherenceState::MAPPED : TensorCoherenceState::DEVICE_AUTHORITATIVE,
-            gpu_device_,
-            stream);
-    }
-
     bool TensorBase::releaseDeviceMemory()
     {
         // Ensure host has current data
@@ -1964,7 +1955,7 @@ namespace llaminar2
         if (!authoritative_device_.has_value())
         {
             LOG_ERROR("[TensorBase::transferTo] Tensor has no authoritative GPU device. "
-                      "Call ensureOnDevice() + mark_device_dirty() first.");
+                      "Call ensureOnDevice() + transitionTo(DEVICE_AUTHORITATIVE) first.");
             return false;
         }
 

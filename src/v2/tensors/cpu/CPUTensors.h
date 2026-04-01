@@ -800,44 +800,7 @@ namespace llaminar2
         virtual void *gpu_data_ptr() { return gpu_data_ptr_; }
         virtual const void *gpu_data_ptr() const { return gpu_data_ptr_; }
 
-        /**
-         * @brief Mark tensor as modified on device (requires sync to host before host access)
-         * @note Call this after GPU kernels write to the tensor via gpu_data_ptr()
-         *
-         * After calling this:
-         *   - device_valid_ = true (device just got written to)
-         *   - host_valid_ = false (host is now stale) -- UNLESS tensor is mapped
-         *
-         * For mapped tensors, both host and device stay valid since they share memory,
-         * but we set mapped_needs_sync_ so ensureOnHost() knows to synchronize.
-         */
-        virtual void mark_device_dirty()
-        {
-            // Delegate to the state-machine-based implementation
-            // For mapped tensors, this transitions to MAPPED state;
-            // for non-mapped, to DEVICE_AUTHORITATIVE.
-            if (is_mapped_)
-            {
-                transitionTo(TensorCoherenceState::MAPPED);
-            }
-            else
-            {
-                transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
-            }
-        }
 
-        /**
-         * @brief Mark tensor as modified on device and record a completion event
-         *
-         * This is the preferred method when fine-grained synchronization is desired.
-         * Records an event after kernel execution so ensureOnHost() can wait on
-         * just this kernel rather than doing a full device synchronization.
-         *
-         * @note Call this after GPU kernels write to the tensor via gpu_data_ptr()
-         * @note The event is recorded on the default stream (stream 0)
-         * @note If event recording fails, falls back to eventless behavior
-         */
-        virtual void mark_device_dirty_with_event();
 
         /// @deprecated Use hostValid() or coherenceState() instead. Will be removed.
         bool isOnCPU() const { return ::llaminar2::isHostValid(coherence_state_); }
@@ -1376,7 +1339,7 @@ namespace llaminar2
         void *mapped_host_ptr_ = nullptr;   // Host-visible pointer for mapped memory
 
         // For mapped memory: tracks whether GPU has written since last sync.
-        // Set to true by mark_device_dirty(), cleared by ensureOnHost() after sync.
+        // Set to true by transitionTo(MAPPED/DEVICE_AUTHORITATIVE), cleared by ensureOnHost() after sync.
         // This avoids redundant hipDeviceSynchronize() calls.
         bool mapped_needs_sync_ = false;
 

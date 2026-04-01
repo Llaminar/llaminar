@@ -131,7 +131,7 @@ namespace llaminar2
         }
 
         // Dirty-marking is handled by LocalTPContext::allreduceOnStream() which
-        // calls mark_device_dirty_with_event(stream) to record a completion event.
+        // calls transitionToWithEvent(DEVICE_AUTHORITATIVE, ..., stream) to record a completion event.
         // This ensures ensureOnHost() waits for the allreduce to finish before D2H.
 
         return success;

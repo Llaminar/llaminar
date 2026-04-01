@@ -1240,7 +1240,10 @@ add_library(llaminar2_core STATIC
     execution/compute_stages/stages/EmbeddingStage.cpp
     execution/compute_stages/stages/LMHeadStage.cpp
     execution/local_execution/graph/DeviceGraphCaptureController.cpp
+    execution/local_execution/graph/ComputeGraph.cpp
+    execution/local_execution/graph/StageVerifier.cpp
     execution/local_execution/graph/DeviceGraphExecutor.cpp
+    execution/local_execution/graph/DeviceGraphExecutor_GraphCapture.cpp
     execution/local_execution/graph/StageTimeline.cpp
     execution/local_execution/device/DomainAwareBufferManager.cpp
     execution/local_execution/graph/GraphResolver.cpp
@@ -1446,6 +1449,10 @@ add_library(llaminar2_core STATIC
     # Orchestration runner (Phase 5: end-to-end integration)
     execution/runner/OrchestrationRunner.cpp
     execution/runner/OrchestrationRunnerFactory.cpp
+    # Snapshot capture (Phase 2: extracted from DeviceGraphOrchestrator)
+    snapshots/SnapshotCapture.cpp
+    # Forward execution engine (Phase 3: extracted from DeviceGraphOrchestrator)
+    execution/local_execution/engine/ForwardExecutionEngine.cpp
     # NOTE: Legacy GEMM microkernel and instantiation systems removed (gemm v1/v2/v3)
     # GemmMicroKernelInit.cpp, Q8_1/VNNI instantiation sources - REMOVED
 )

@@ -532,7 +532,7 @@ namespace
         hipDeviceSynchronize();
 
         // Mark output dirty and sync back to host
-        rocm_output->mark_device_dirty();
+        rocm_output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
         const float *result = rocm_output->data(); // This syncs GPU→host
 
         EXPECT_FALSE(hasNanOrInf(result, num_elements)) << "ROCm output contains NaN/Inf";
@@ -574,7 +574,7 @@ namespace
             num_elements, nullptr, 0));
 
         hipDeviceSynchronize();
-        rocm_output->mark_device_dirty();
+        rocm_output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
         const float *result = rocm_output->data();
 
         EXPECT_FALSE(hasNanOrInf(result, num_elements)) << "ROCm output contains NaN/Inf";
@@ -617,7 +617,7 @@ namespace
             num_elements, nullptr, 0));
 
         hipDeviceSynchronize();
-        residual->mark_device_dirty();
+        residual->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
         const float *result = residual->data();
         ASSERT_NE(result, nullptr);
 

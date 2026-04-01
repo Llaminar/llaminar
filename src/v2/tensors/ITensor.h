@@ -292,16 +292,7 @@ namespace llaminar2
         // Device Coherence API
         // =========================================================================
 
-        /**
-         * @brief Mark tensor as modified on device (GPU data is current, host is stale)
-         * @note Call this after GPU kernels write to the tensor via gpu_data_ptr()
-         *
-         * After calling this:
-         *   - GPU data is considered current
-         *   - Host data is considered stale
-         *   - Next data() call will sync from device
-         */
-        virtual void mark_device_dirty() {}
+
 
         /**
          * @brief Mark tensor as modified on host (host data is current, GPU is stale)

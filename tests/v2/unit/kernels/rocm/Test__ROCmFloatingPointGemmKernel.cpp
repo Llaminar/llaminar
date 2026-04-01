@@ -347,7 +347,7 @@ TEST_F(Test__ROCmFloatingPointGemmKernel, TensorInterface_Basic)
     ASSERT_TRUE(kernel.multiply_tensor(input.get(), output.get()));
 
     // Verify output is not all zeros (sanity check)
-    output->mark_device_dirty(); // Ensure sync back from GPU
+    output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE); // Ensure sync back from GPU
     const float *out_data = output->data();
 
     float sum = 0.0f;

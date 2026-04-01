@@ -761,14 +761,17 @@ namespace llaminar2::test::orchestration
          *
          * This covers empirically-measured costs not captured by buffer specs:
          * - GEMM workspace: ~M×K int8 + M×N int32 accumulator
-         * - Attention workspace: score matrices during computation
          * - Memory allocator fragmentation and alignment overhead
          * - Framework overhead (CUDA contexts, MPI buffers, etc.)
+         *
+         * Note: Attention workspace (score matrices, context, mask) is now
+         * captured in the schema layer_buffers with correct compound shapes,
+         * so the overhead percentage no longer needs to cover those.
          *
          * Derived from profiling of actual inference runs.
          * See docs/v2/MEMORY_PROFILING.md for methodology.
          */
-        static constexpr int MEMORY_OVERHEAD_PERCENT = 15;
+        static constexpr int MEMORY_OVERHEAD_PERCENT = 5;
 
         /**
          * @brief VRAM utilization threshold for "model fits" check (90%)
@@ -798,7 +801,8 @@ namespace llaminar2::test::orchestration
          * @brief Estimate runtime memory using actual schema buffer specifications
          *
          * Uses Qwen2Schema + GraphResolver to calculate EXACT buffer requirements:
-         * - Layer buffers: Q, K, V, attn_output, attn_proj, gate, up, normalized
+         * - Layer buffers: Q, K, V, attn_output, attn_proj, gate, up, normalized,
+         *   workspace_scores, workspace_context, workspace_mask
          * - Model buffers: hidden, logits
          * - KV cache: calculated from actual dimensions using Q16_1 format
          * - Weights: from model config (Q4_0 estimate)

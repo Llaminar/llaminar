@@ -10,7 +10,7 @@
  *   4. cohereOutputs() re-homes output tensors that were migrated by downstream stages
  *
  * These tests prevent regressions for the HybridPPTP crash where EmbeddingStage
- * called mark_device_dirty_with_event(CUDA_stream) on a tensor whose gpu_device_
+ * called transitionToWithEvent(TensorCoherenceState::DEVICE_AUTHORITATIVE, std::nullopt, CUDA_stream) on a tensor whose gpu_device_
  * was stale (ROCm:0 from a prior PP stage), causing hipEventRecord to receive
  * a CUDA stream pointer and segfault.
  *
@@ -155,7 +155,7 @@ TEST_F(Test__CrossBackendCoherence, MarkDirtyWithEvent_SameBackend_RecordsEvent)
     tensor->injectCompletionEvent(nullptr);
 
     void *fake_stream = reinterpret_cast<void *>(0xBEEF);
-    tensor->mark_device_dirty_with_event(fake_stream);
+    tensor->transitionToWithEvent(TensorCoherenceState::DEVICE_AUTHORITATIVE, std::nullopt, fake_stream);
 
     // MockBackend's backendDeviceType() returns CPU, but gpu_device_ is ROCm.
     // The defensive check compares backend->backendDeviceType() vs gpu_device_->type.
@@ -182,7 +182,7 @@ TEST_F(Test__CrossBackendCoherence, MarkDirtyWithEvent_NullStream_SkipsBackendCh
 
     // Null stream: the defensive check is skipped (stream==nullptr is allowed
     // for the default overload that uses the device's default stream)
-    tensor->mark_device_dirty_with_event(nullptr);
+    tensor->transitionToWithEvent(TensorCoherenceState::DEVICE_AUTHORITATIVE, std::nullopt, nullptr);
 
     // With null stream, the check `if (stream && ...)` is false, so we proceed
     // to event creation and recording normally through the mock backend
@@ -300,7 +300,7 @@ TEST_F(Test__CrossBackendCoherence, PPMigration_StaleGpuDevice_EventSkipped)
 
     // Pass a non-null "CUDA stream" — triggers the defensive check
     void *cuda_stream = reinterpret_cast<void *>(0xC0DA);
-    tensor->mark_device_dirty_with_event(cuda_stream);
+    tensor->transitionToWithEvent(TensorCoherenceState::DEVICE_AUTHORITATIVE, std::nullopt, cuda_stream);
 
     // The defensive check fires: backend type (CPU) != gpu_device_ type (ROCm)
     // Event recording should be skipped
