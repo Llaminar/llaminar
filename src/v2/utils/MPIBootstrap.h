@@ -114,7 +114,7 @@ namespace llaminar2
          * - OMP_NUM_THREADS: Based on cores per socket (or forced value)
          * - OMP_PLACES: sockets
          * - OMP_PROC_BIND: close
-         * - OPENBLAS_NUM_THREADS, MKL_NUM_THREADS: Match OMP
+         * - MKL_NUM_THREADS: Match OMP
          *
          * @param topology CPU topology info
          * @param config Launch configuration

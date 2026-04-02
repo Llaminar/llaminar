@@ -2,7 +2,7 @@
 GGUF to HuggingFace Tensor Name Mapping
 
 Maps GGUF tensor names to HuggingFace transformers naming conventions.
-Supports Qwen2 and LLaMA model families.
+Supports Qwen2, LLaMA, and Qwen 3.5 (Gated Delta Net) model families.
 
 GGUF Naming (llama.cpp):
 - token_embd.weight
@@ -29,6 +29,12 @@ HuggingFace Naming (transformers):
 - model.layers.{i}.mlp.up_proj.weight
 - model.layers.{i}.mlp.down_proj.weight
 - model.layers.{i}.post_attention_layernorm.weight
+
+Qwen 3.5 GDN Specifics:
+- Linear attention layers use blk.{i}.attn_qkv + attn_gate (fused) → in_proj_qkvz
+- blk.{i}.ssm_alpha + ssm_beta → in_proj_ba (interleaved per head group)
+- ssm_a → A_log (apply log(-x) transform)
+- Norm weights use pre_rmsnorm_1p convention (+1 in GGUF, subtract 1 on load)
 
 Author: David Sanftenberg
 """
@@ -90,6 +96,46 @@ LLAMA_TENSOR_MAP = {
 }
 
 
+# Qwen 3.5 GDN: Full attention layers (every full_attention_interval-th layer)
+# These use the same structure as Qwen2/3 full attention
+QWEN35_FULL_ATTN_MAP = {
+    'blk.{}.attn_q.weight': 'model.layers.{}.self_attn.q_proj.weight',
+    'blk.{}.attn_k.weight': 'model.layers.{}.self_attn.k_proj.weight',
+    'blk.{}.attn_v.weight': 'model.layers.{}.self_attn.v_proj.weight',
+    'blk.{}.attn_output.weight': 'model.layers.{}.self_attn.o_proj.weight',
+    'blk.{}.attn_q_norm.weight': 'model.layers.{}.self_attn.q_norm.weight',
+    'blk.{}.attn_k_norm.weight': 'model.layers.{}.self_attn.k_norm.weight',
+}
+
+# Qwen 3.5 GDN: Linear attention layers (Gated DeltaNet)
+# Qwen3_5ForCausalLM uses separate projections (no fusion needed)
+QWEN35_LINEAR_ATTN_MAP = {
+    'blk.{}.attn_qkv.weight': 'model.layers.{}.linear_attn.in_proj_qkv.weight',
+    'blk.{}.attn_gate.weight': 'model.layers.{}.linear_attn.in_proj_z.weight',
+    'blk.{}.ssm_alpha.weight': 'model.layers.{}.linear_attn.in_proj_a.weight',
+    'blk.{}.ssm_beta.weight': 'model.layers.{}.linear_attn.in_proj_b.weight',
+    'blk.{}.ssm_conv1d.weight': 'model.layers.{}.linear_attn.conv1d.weight',
+    'blk.{}.ssm_dt.bias': 'model.layers.{}.linear_attn.dt_bias',
+    'blk.{}.ssm_a': 'model.layers.{}.linear_attn.A_log',
+    'blk.{}.ssm_norm.weight': 'model.layers.{}.linear_attn.norm.weight',
+    'blk.{}.ssm_out.weight': 'model.layers.{}.linear_attn.out_proj.weight',
+}
+
+# Qwen 3.5 GDN: Shared mappings for both layer types
+QWEN35_SHARED_MAP = {
+    # Embedding and output
+    'token_embd.weight': 'model.embed_tokens.weight',
+    'output.weight': 'lm_head.weight',
+    'output_norm.weight': 'model.norm.weight',
+
+    # Per-layer (shared by both linear and full attention layers)
+    'blk.{}.attn_norm.weight': 'model.layers.{}.input_layernorm.weight',
+    'blk.{}.post_attention_norm.weight': 'model.layers.{}.post_attention_layernorm.weight',
+    'blk.{}.ffn_gate.weight': 'model.layers.{}.mlp.gate_proj.weight',
+    'blk.{}.ffn_up.weight': 'model.layers.{}.mlp.up_proj.weight',
+    'blk.{}.ffn_down.weight': 'model.layers.{}.mlp.down_proj.weight',
+}
+
 class TensorNameMapper:
     """
     Maps GGUF tensor names to HuggingFace naming conventions.
@@ -97,23 +143,32 @@ class TensorNameMapper:
     Supports automatic model type detection and flexible name mapping.
     """
     
-    def __init__(self, model_type: str = 'qwen2'):
+    def __init__(self, model_type: str = 'qwen2', full_attention_interval: int = 4):
         """
         Initialize tensor name mapper.
         
         Args:
-            model_type: Model architecture ('qwen2', 'llama', etc.)
+            model_type: Model architecture ('qwen2', 'llama', 'qwen35', etc.)
+            full_attention_interval: For qwen35, layers where (idx % interval == interval-1)
+                                    are full attention layers. Default 4.
         """
         self.model_type = model_type.lower()
+        self.full_attention_interval = full_attention_interval
         
         # Select appropriate mapping table
         if self.model_type in ('qwen', 'qwen2'):
             self.mapping = QWEN2_TENSOR_MAP
         elif self.model_type in ('llama', 'llama2', 'llama3'):
             self.mapping = LLAMA_TENSOR_MAP
+        elif self.model_type == 'qwen35':
+            # Qwen 3.5 uses heterogeneous layers — mapping depends on layer type.
+            # Build a unified mapping from shared + both layer types.
+            # The fused tensors (attn_qkv, attn_gate, ssm_alpha, ssm_beta) are
+            # handled separately in gguf_loader.py, not by simple name mapping.
+            self.mapping = {**QWEN35_SHARED_MAP, **QWEN35_FULL_ATTN_MAP, **QWEN35_LINEAR_ATTN_MAP}
         else:
             raise ValueError(f"Unsupported model type: {model_type}. "
-                           f"Supported: qwen2, llama")
+                           f"Supported: qwen2, llama, qwen35")
     
     def map_name(self, gguf_name: str) -> str:
         """
@@ -200,13 +255,17 @@ def detect_model_type_from_metadata(metadata: dict) -> str:
     # Check general.architecture key
     if 'general.architecture' in metadata:
         arch = metadata['general.architecture'].lower()
-        if 'qwen' in arch:
+        if arch == 'qwen35':
+            return 'qwen35'
+        elif 'qwen' in arch:
             return 'qwen2'
         elif 'llama' in arch:
             return 'llama'
     
     # Fallback: check for model-specific keys
-    if any(k.startswith('qwen') for k in metadata):
+    if any(k.startswith('qwen35') for k in metadata):
+        return 'qwen35'
+    elif any(k.startswith('qwen') for k in metadata):
         return 'qwen2'
     elif any(k.startswith('llama') for k in metadata):
         return 'llama'
@@ -226,7 +285,15 @@ def create_mapper_from_metadata(metadata: dict) -> TensorNameMapper:
         Configured TensorNameMapper instance
     """
     model_type = detect_model_type_from_metadata(metadata)
-    return TensorNameMapper(model_type)
+    
+    kwargs = {}
+    if model_type == 'qwen35':
+        # Extract full_attention_interval for heterogeneous layer type detection
+        interval_key = 'qwen35.full_attention_interval'
+        if interval_key in metadata:
+            kwargs['full_attention_interval'] = metadata[interval_key]
+    
+    return TensorNameMapper(model_type, **kwargs)
 
 
 def verify_mapping_coverage(gguf_names: list, model_type: str = 'qwen2') -> Tuple[int, int, list]:

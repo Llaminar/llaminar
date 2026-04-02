@@ -45,6 +45,7 @@ try:
     # Register available models (done in respective modules)
     from . import qwen
     from . import llama  # Stub implementation for demonstration
+    from . import qwen35
     
     _torch_available = True
 except ImportError as e:

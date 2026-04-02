@@ -17,7 +17,7 @@ namespace llaminar2
      */
     enum class DeviceType
     {
-        CPU,    ///< CPU execution (OpenBLAS, MKL, etc.)
+        CPU,    ///< CPU execution (OneDNN, MKL, etc.)
         CUDA,   ///< NVIDIA CUDA GPU
         ROCm,   ///< AMD ROCm/HIP GPU
         Vulkan, ///< Vulkan compute shaders

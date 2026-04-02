@@ -25,14 +25,6 @@
 #include <cmath>
 #include <omp.h>
 
-#ifdef HAVE_OPENBLAS
-extern "C"
-{
-    void openblas_set_num_threads(int num_threads);
-    int openblas_get_num_threads(void);
-}
-#endif
-
 #include "kernels/cpu/gemm/GemmKernelTemplate.h"
 #include "kernels/cpu/SimdTraits.h"
 #include "tensors/Tensors.h"
@@ -105,19 +97,11 @@ namespace
             int num_threads = omp_threads_env ? std::atoi(omp_threads_env) : omp_get_max_threads();
             omp_set_num_threads(num_threads);
 
-#ifdef HAVE_OPENBLAS
-            // Initialize OpenBLAS threading
-            openblas_set_num_threads(num_threads);
-#endif
-
             if (rank_ == 0)
             {
                 std::cout << "Performance test setup:" << std::endl;
                 std::cout << "  MPI ranks: " << world_size_ << std::endl;
                 std::cout << "  OMP threads: " << omp_get_max_threads() << std::endl;
-#ifdef HAVE_OPENBLAS
-                std::cout << "  OpenBLAS threads: " << openblas_get_num_threads() << std::endl;
-#endif
                 std::cout << std::endl;
             }
         }

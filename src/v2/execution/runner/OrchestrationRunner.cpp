@@ -1189,7 +1189,7 @@ namespace llaminar2
         LOG_INFO("[OrchestrationRunner]   Device source: " << device_source);
         if (device.is_cpu())
         {
-            LOG_INFO("[OrchestrationRunner]   Backend: CPU (OpenBLAS/AVX-512)");
+            LOG_INFO("[OrchestrationRunner]   Backend: CPU (OneDNN/AVX-512)");
         }
         else if (device.is_cuda())
         {

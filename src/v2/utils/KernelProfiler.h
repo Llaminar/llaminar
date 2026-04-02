@@ -51,7 +51,7 @@ namespace llaminar2
     enum class KernelType : uint8_t
     {
         // GEMM variants
-        GEMM_FP32 = 0, ///< FP32 GEMM (OpenBLAS fallback)
+        GEMM_FP32 = 0, ///< FP32 GEMM (OneDNN)
         GEMV_FP32,     ///< FP32 GEMV / M=1 matvec path
         GEMM_Q8,       ///< Q8_1 quantized GEMM (JIT microkernel)
         GEMV_Q8,       ///< Q8_1 quantized GEMV / M=1 decode matvec path

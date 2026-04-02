@@ -225,8 +225,6 @@ function(add_v2_test TEST_NAME)
         "OMP_DYNAMIC=false"
         "KMP_AFFINITY=granularity=fine,compact,1,0"
         "KMP_BLOCKTIME=0"
-        "OPENBLAS_NUM_THREADS=${CORES_PER_SOCKET}"
-        "GOTO_NUM_THREADS=${CORES_PER_SOCKET}"
         "MKL_NUM_THREADS=${CORES_PER_SOCKET}"
         "MKL_DYNAMIC=false"
         "OMPI_MCA_mpi_leave_pinned=1"
@@ -2341,7 +2339,7 @@ add_v2_test(V2_Unit_Q8_1_to_Q16_RoPE_FixedScale
     MPI_PROCS 1  # RoPE is CPU-only, single rank
 )
 
-# Test: Fixed-Scale Q16 to Q16 RoPE (for HybridQ16 K precision fix)
+# Test: Fixed-Scale Q16 to Q16 RoPE
 add_executable(v2_test_q16_to_q16_rope_fixed_scale unit/kernels/cpu/ops/Test__Q16_to_Q16_RoPE_FixedScale.cpp)
 target_link_libraries(v2_test_q16_to_q16_rope_fixed_scale 
     llaminar2_core 
@@ -2350,7 +2348,7 @@ target_link_libraries(v2_test_q16_to_q16_rope_fixed_scale
 )
 add_v2_test(V2_Unit_Q16_to_Q16_RoPE_FixedScale 
     COMMAND $<TARGET_FILE:v2_test_q16_to_q16_rope_fixed_scale>
-    LABELS "V2;Unit;Primitives;RoPE;Q16_1;FixedScale;IntegerAttention;HybridQ16;Correctness;CPU"
+    LABELS "V2;Unit;Primitives;RoPE;Q16_1;FixedScale;IntegerAttention;Correctness;CPU"
     MPI_PROCS 1  # RoPE is CPU-only, single rank
 )
 
@@ -5437,7 +5435,7 @@ add_v2_test(V2_Unit_SchemaFactoryRegistry
 add_executable(v2_test_chat_completion_handler unit/app/modes/Test__ChatCompletionHandler.cpp)
 target_include_directories(v2_test_chat_completion_handler PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}  # For tests/v2/mocks/ include path
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../external/llama.cpp/vendor  # For nlohmann/json.hpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../external/vendor  # For nlohmann/json.hpp
 )
 target_link_libraries(v2_test_chat_completion_handler llaminar2_core GTest::gtest GTest::gtest_main GTest::gmock)
 add_v2_test(V2_Unit_ChatCompletionHandler
@@ -7262,15 +7260,6 @@ add_v2_test(V2_Integration_GraphSnapshotCallbackInvocation
     MPI_PROCS 1
 )
 
-# Test: Q16 Integer Attention (Full Kernel) [DISABLED - project on hold]
-# Complete attention kernel including Flash Decode and FA2 Prefill paths
-# Tests parameter validation, snapshot capture, and multi-head/GQA configurations
-
-# Test: Q16 Integer Attention Parity (vs FP32 Reference) [DISABLED - project on hold]
-# Compares Q16 attention output against FP32 reference implementation
-# Validates cosine similarity, RMSE, and softmax weight normalization
-# NOTE: This is an integration test due to long runtime (~270s)
-
 # Test: VNNI Overflow Analysis
 # Comprehensive analysis of INT32 overflow risks in Q×K^T and P×V paths
 add_executable(v2_test_vnni_overflow_analysis unit/kernels/cpu/attention/Test__VNNIOverflowAnalysis.cpp)
@@ -9008,5 +8997,54 @@ set_tests_properties(V2_Integration_Python_GGUFInference PROPERTIES
 )
 
 message(STATUS "V2 Tests: Added Python reference module tests (2 unit + 4 integration)")
+
+# --- Qwen 3.5 (Gated Delta Net) Python Tests ---
+
+# Qwen 3.5 unit tests: tensor name mapping, fused tensor reconstruction,
+# transforms, config extraction, model registry (no model files required)
+add_test(
+    NAME V2_Unit_Python_Qwen35
+    COMMAND ${Python3_EXECUTABLE} -m pytest
+        ${PYTHON_REFERENCE_TEST_DIR}/test_qwen35.py
+        -v --tb=short -q
+        -k "not (GGUFLoading or Inference)"
+)
+set_tests_properties(V2_Unit_Python_Qwen35 PROPERTIES
+    LABELS "V2;Unit;Python;Qwen35;GatedDeltaNet;TensorMapping;FusedTensors"
+    WORKING_DIRECTORY "${PYTHON_REFERENCE_ROOT}"
+    TIMEOUT 30
+)
+
+# Qwen 3.5 GGUF loading integration tests: fused tensor reconstruction,
+# state dict completeness, transforms (requires Qwen3.5-0.8B-Q4_0.gguf)
+add_test(
+    NAME V2_Integration_Python_Qwen35Loading
+    COMMAND ${Python3_EXECUTABLE} -m pytest
+        ${PYTHON_REFERENCE_TEST_DIR}/test_qwen35.py
+        -v --tb=short -q
+        -k "GGUFLoading"
+)
+set_tests_properties(V2_Integration_Python_Qwen35Loading PROPERTIES
+    LABELS "V2;Integration;Python;Qwen35;GatedDeltaNet;GGUFLoading;FusedTensors"
+    FIXTURES_REQUIRED V2_Models
+    WORKING_DIRECTORY "${PYTHON_REFERENCE_ROOT}"
+    TIMEOUT 300
+)
+
+# Qwen 3.5 inference integration tests: forward pass, snapshots, NaN checks
+# (requires Qwen3.5-0.8B-Q4_0.gguf + network for tokenizer)
+add_test(
+    NAME V2_Integration_Python_Qwen35Inference
+    COMMAND ${Python3_EXECUTABLE} -m pytest
+        ${PYTHON_REFERENCE_TEST_DIR}/test_qwen35.py
+        -v --tb=short -q
+        -k "Inference"
+)
+set_tests_properties(V2_Integration_Python_Qwen35Inference PROPERTIES
+    LABELS "V2;Integration;Python;Qwen35;GatedDeltaNet;Inference;Parity"
+    FIXTURES_REQUIRED V2_Models
+    WORKING_DIRECTORY "${PYTHON_REFERENCE_ROOT}"
+    TIMEOUT 600
+)
 
 endif()

@@ -974,8 +974,8 @@ message(STATUS "V2: Device benchmarks library configured")
 # =============================================================================
 # OneDNN provides optimized matmul primitives for:
 #   - INT8: s8s8s32 with post-ops (used by INT8PackedGemm)
-#   - BF16: bf16bf16f32 (used by BF16GemmKernel, replaces MKL)
-#   - FP32: Baseline handled by OpenBLAS
+#   - BF16: bf16bf16f32 (used by BF16GemmKernel)
+#   - FP32: f32 matmul baseline
 if(USE_ONEDNN)
     find_package(Git REQUIRED)
 
@@ -1122,7 +1122,7 @@ if(USE_ONEDNN)
     if(NOT ONEDNN_FOUND)
         message(WARNING "V2: OneDNN build failed or library not found - INT8/BF16 GEMM will use fallback paths")
         message(WARNING "V2: INT8: Falls back to AVX512-VNNI or scalar")
-        message(WARNING "V2: BF16: Falls back to FP32 expansion + OpenBLAS")
+        message(WARNING "V2: BF16: Falls back to FP32 expansion")
         set(USE_ONEDNN OFF)
     endif()
 endif()
@@ -1131,9 +1131,8 @@ endif()
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
 message(STATUS "V2: Found Python3: ${Python3_EXECUTABLE}")
 
-# CPU BLAS backend: OpenBLAS for FP32 GEMM
-# Note: OneDNN handles INT8/BF16 optimizations, OpenBLAS for FP32 baseline
-message(STATUS "V2: BLAS backend: OpenBLAS (FP32 only)")
+# CPU BLAS backend: OneDNN for all GEMM (FP32, BF16, INT8)
+message(STATUS "V2: BLAS backend: OneDNN")
 
 # Define GEMM script path for microkernel generation
 # =============================================================================
@@ -1142,14 +1141,9 @@ message(STATUS "V2: BLAS backend: OpenBLAS (FP32 only)")
 # =============================================================================
 
 # =============================================================================
-# llama.cpp Integration (REMOVED)
+# Vendored header-only libraries (cpp-httplib, nlohmann/json)
 # =============================================================================
-# llama.cpp submodule is kept in the repo for reference but not linked in V2.
-# V2 uses native implementations for all operations (tokenization, dequantization, etc.)
-# The submodule remains available at external/llama.cpp for:
-#   - Reference implementations
-#   - GGUF format documentation
-#   - Quantization algorithm reference
+# These are header-only libraries vendored in external/vendor/.
 # =============================================================================
 
 # =============================================================================
@@ -1469,8 +1463,8 @@ target_include_directories(llaminar2_core PUBLIC
 
 # cpp-httplib and nlohmann/json for ServerMode
 target_include_directories(llaminar2_core PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../external/llama.cpp/vendor/cpp-httplib
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../external/llama.cpp/vendor
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../external/vendor/cpp-httplib
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../external/vendor
 )
 
 # Enable pipeline snapshot capture (for parity testing and debugging)
@@ -1532,7 +1526,6 @@ endif()
 find_package(MPI REQUIRED)
 find_package(OpenMP REQUIRED COMPONENTS CXX)
 message(STATUS "V2: MPI enabled (required dependency)")
-message(STATUS "V2: OpenBLAS configured for FP32 GEMM baseline")
 
 # Generate microkernel instantiations (auto-run Python script at configure time)
 find_library(NUMA_LIBRARY NAMES numa)
@@ -1668,25 +1661,6 @@ if(HAVE_VULKAN)
 endif()
 
 # =============================================================================
-# OpenBLAS Configuration (FP32 GEMM baseline)
-# =============================================================================
-if(NOT DEFINED OPENBLAS_LIBRARIES)
-    find_package(BLAS REQUIRED)
-    find_path(CBLAS_INCLUDE_DIR cblas.h PATHS /usr/include /usr/include/openblas /usr/local/include /usr/include/x86_64-linux-gnu)
-    if(CBLAS_INCLUDE_DIR)
-        message(STATUS "V2: Found CBLAS include: ${CBLAS_INCLUDE_DIR}")
-        target_include_directories(llaminar2_core PUBLIC ${CBLAS_INCLUDE_DIR})
-    else()
-        message(WARNING "V2: CBLAS header not found - using fallback")
-    endif()
-    set(OPENBLAS_LIBRARIES ${BLAS_LIBRARIES})
-    message(STATUS "V2: Using OpenBLAS: ${BLAS_LIBRARIES}")
-endif()
-target_compile_definitions(llaminar2_core PUBLIC HAVE_OPENBLAS)
-target_link_libraries(llaminar2_core PUBLIC ${OPENBLAS_LIBRARIES})
-message(STATUS "V2: OpenBLAS configured for FP32 GEMM baseline")
-
-# =============================================================================
 # libmvec (GCC Vector Math Library for vectorized exp/log/sin/cos)
 # =============================================================================
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
@@ -1704,20 +1678,6 @@ if(USE_ONEDNN AND ONEDNN_FOUND)
     target_link_libraries(llaminar2_core PUBLIC ${ONEDNN_LIB})
     message(STATUS "V2: Linked OneDNN for INT8/BF16 GEMM acceleration")
 endif()
-
-# =============================================================================
-# llama.cpp Library (REMOVED - using native BPE tokenizer)
-# =============================================================================
-# NOTE: Previously linked llama.cpp for tokenization, but now we have
-# native BPETokenizer that reads vocabulary directly from GGUF metadata.
-# This eliminates duplicate file loading and external dependency.
-
-# If llama.cpp is needed in future for other purposes, re-enable:
-# target_link_libraries(llaminar2_core PUBLIC llama)
-# target_include_directories(llaminar2_core PUBLIC
-#     ${CMAKE_CURRENT_SOURCE_DIR}/../../external/llama.cpp/include
-# )
-# message(STATUS "V2: Linked llama.cpp library for tokenization")
 
 # Main executable
 add_executable(llaminar2 Main.cpp)

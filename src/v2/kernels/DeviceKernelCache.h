@@ -51,42 +51,42 @@ namespace llaminar2
      *
      * This enum identifies the "kind" of kernel, not its implementation.
      * A BLAS_GEMM kernel might be hipBLAS on ROCm, cuBLAS on CUDA, or
-     * OpenBLAS on CPU - the cache stores one per device.
+     * OneDNN on CPU - the cache stores one per device.
      */
     enum class KernelType
     {
         // BLAS operations (hold expensive handles)
-        BLAS_GEMM,          ///< General matrix multiply (cuBLAS/hipBLAS/OpenBLAS)
-        BLAS_GEMV,          ///< Matrix-vector multiply
+        BLAS_GEMM, ///< General matrix multiply (cuBLAS/hipBLAS/OneDNN)
+        BLAS_GEMV, ///< Matrix-vector multiply
 
         // Attention kernels (may have JIT compilation)
-        FLASH_ATTENTION,    ///< Flash attention (prefill + decode)
-        PAGED_ATTENTION,    ///< Paged attention for decode
+        FLASH_ATTENTION, ///< Flash attention (prefill + decode)
+        PAGED_ATTENTION, ///< Paged attention for decode
 
         // Normalization
-        RMS_NORM,           ///< RMS normalization kernel
-        LAYER_NORM,         ///< Layer normalization kernel
+        RMS_NORM,   ///< RMS normalization kernel
+        LAYER_NORM, ///< Layer normalization kernel
 
         // Element-wise operations
-        SWIGLU,             ///< SwiGLU activation
-        ROPE,               ///< Rotary position embeddings
-        RESIDUAL_ADD,       ///< Residual addition
-        SOFTMAX,            ///< Softmax
+        SWIGLU,       ///< SwiGLU activation
+        ROPE,         ///< Rotary position embeddings
+        RESIDUAL_ADD, ///< Residual addition
+        SOFTMAX,      ///< Softmax
 
         // Embedding / output
-        EMBEDDING_LOOKUP,   ///< Token embedding lookup
-        LM_HEAD,            ///< Language model head projection
+        EMBEDDING_LOOKUP, ///< Token embedding lookup
+        LM_HEAD,          ///< Language model head projection
 
         // Quantization
-        QUANTIZE,           ///< Quantization kernel
-        DEQUANTIZE,         ///< Dequantization kernel
+        QUANTIZE,   ///< Quantization kernel
+        DEQUANTIZE, ///< Dequantization kernel
 
         // Memory operations
-        KV_CACHE,           ///< KV cache management kernel
+        KV_CACHE, ///< KV cache management kernel
 
         // Collective operations
-        ALLREDUCE,          ///< MPI/NCCL allreduce
-        ALLGATHER,          ///< MPI/NCCL allgather
+        ALLREDUCE, ///< MPI/NCCL allreduce
+        ALLGATHER, ///< MPI/NCCL allgather
 
         // Count for array sizing
         _COUNT
@@ -95,28 +95,46 @@ namespace llaminar2
     /**
      * @brief Convert KernelType to string for logging
      */
-    inline const char* kernelTypeName(KernelType type)
+    inline const char *kernelTypeName(KernelType type)
     {
         switch (type)
         {
-        case KernelType::BLAS_GEMM:         return "BLAS_GEMM";
-        case KernelType::BLAS_GEMV:         return "BLAS_GEMV";
-        case KernelType::FLASH_ATTENTION:   return "FLASH_ATTENTION";
-        case KernelType::PAGED_ATTENTION:   return "PAGED_ATTENTION";
-        case KernelType::RMS_NORM:          return "RMS_NORM";
-        case KernelType::LAYER_NORM:        return "LAYER_NORM";
-        case KernelType::SWIGLU:            return "SWIGLU";
-        case KernelType::ROPE:              return "ROPE";
-        case KernelType::RESIDUAL_ADD:      return "RESIDUAL_ADD";
-        case KernelType::SOFTMAX:           return "SOFTMAX";
-        case KernelType::EMBEDDING_LOOKUP:  return "EMBEDDING_LOOKUP";
-        case KernelType::LM_HEAD:           return "LM_HEAD";
-        case KernelType::QUANTIZE:          return "QUANTIZE";
-        case KernelType::DEQUANTIZE:        return "DEQUANTIZE";
-        case KernelType::KV_CACHE:          return "KV_CACHE";
-        case KernelType::ALLREDUCE:         return "ALLREDUCE";
-        case KernelType::ALLGATHER:         return "ALLGATHER";
-        default:                            return "UNKNOWN";
+        case KernelType::BLAS_GEMM:
+            return "BLAS_GEMM";
+        case KernelType::BLAS_GEMV:
+            return "BLAS_GEMV";
+        case KernelType::FLASH_ATTENTION:
+            return "FLASH_ATTENTION";
+        case KernelType::PAGED_ATTENTION:
+            return "PAGED_ATTENTION";
+        case KernelType::RMS_NORM:
+            return "RMS_NORM";
+        case KernelType::LAYER_NORM:
+            return "LAYER_NORM";
+        case KernelType::SWIGLU:
+            return "SWIGLU";
+        case KernelType::ROPE:
+            return "ROPE";
+        case KernelType::RESIDUAL_ADD:
+            return "RESIDUAL_ADD";
+        case KernelType::SOFTMAX:
+            return "SOFTMAX";
+        case KernelType::EMBEDDING_LOOKUP:
+            return "EMBEDDING_LOOKUP";
+        case KernelType::LM_HEAD:
+            return "LM_HEAD";
+        case KernelType::QUANTIZE:
+            return "QUANTIZE";
+        case KernelType::DEQUANTIZE:
+            return "DEQUANTIZE";
+        case KernelType::KV_CACHE:
+            return "KV_CACHE";
+        case KernelType::ALLREDUCE:
+            return "ALLREDUCE";
+        case KernelType::ALLGATHER:
+            return "ALLGATHER";
+        default:
+            return "UNKNOWN";
         }
     }
 
@@ -174,7 +192,7 @@ namespace llaminar2
         DeviceId device;
         KernelType kernel_type;
 
-        bool operator==(const DeviceKernelKey& other) const
+        bool operator==(const DeviceKernelKey &other) const
         {
             return device == other.device && kernel_type == other.kernel_type;
         }
@@ -185,7 +203,7 @@ namespace llaminar2
      */
     struct DeviceKernelKeyHash
     {
-        size_t operator()(const DeviceKernelKey& key) const
+        size_t operator()(const DeviceKernelKey &key) const
         {
             // Combine device hash with kernel type
             size_t h1 = std::hash<DeviceId>{}(key.device);
@@ -220,7 +238,7 @@ namespace llaminar2
          * Registered factories are called lazily on first getKernel() for
          * a (device, type) combination.
          */
-        using KernelFactory = std::function<std::unique_ptr<IDeviceKernel>(const DeviceId&)>;
+        using KernelFactory = std::function<std::unique_ptr<IDeviceKernel>(const DeviceId &)>;
 
         // =====================================================================
         // Kernel Access
@@ -239,10 +257,10 @@ namespace llaminar2
          * @throws std::runtime_error if no factory registered or type mismatch
          */
         template <typename T>
-        static T* getKernel(const DeviceId& device, KernelType type)
+        static T *getKernel(const DeviceId &device, KernelType type)
         {
-            IDeviceKernel* kernel = getOrCreate(device, type);
-            T* typed = dynamic_cast<T*>(kernel);
+            IDeviceKernel *kernel = getOrCreate(device, type);
+            T *typed = dynamic_cast<T *>(kernel);
             if (!typed)
             {
                 throw std::runtime_error(
@@ -255,7 +273,7 @@ namespace llaminar2
         /**
          * @brief Get kernel without type checking (returns base pointer)
          */
-        static IDeviceKernel* getKernel(const DeviceId& device, KernelType type)
+        static IDeviceKernel *getKernel(const DeviceId &device, KernelType type)
         {
             return getOrCreate(device, type);
         }
@@ -263,7 +281,7 @@ namespace llaminar2
         /**
          * @brief Check if a kernel exists in the cache
          */
-        static bool hasKernel(const DeviceId& device, KernelType type);
+        static bool hasKernel(const DeviceId &device, KernelType type);
 
         // =====================================================================
         // Factory Registration
@@ -301,7 +319,7 @@ namespace llaminar2
          *
          * Useful when a device is being removed or reset.
          */
-        static void clearDevice(const DeviceId& device);
+        static void clearDevice(const DeviceId &device);
 
         /**
          * @brief Get number of cached kernels
@@ -316,7 +334,7 @@ namespace llaminar2
 
     private:
         // Get or create kernel (internal implementation)
-        static IDeviceKernel* getOrCreate(const DeviceId& device, KernelType type);
+        static IDeviceKernel *getOrCreate(const DeviceId &device, KernelType type);
 
         // Factory key combines device type with kernel type
         struct FactoryKey
@@ -324,7 +342,7 @@ namespace llaminar2
             DeviceType device_type;
             KernelType kernel_type;
 
-            bool operator==(const FactoryKey& other) const
+            bool operator==(const FactoryKey &other) const
             {
                 return device_type == other.device_type && kernel_type == other.kernel_type;
             }
@@ -332,7 +350,7 @@ namespace llaminar2
 
         struct FactoryKeyHash
         {
-            size_t operator()(const FactoryKey& key) const
+            size_t operator()(const FactoryKey &key) const
             {
                 return std::hash<int>{}(static_cast<int>(key.device_type)) ^
                        (std::hash<int>{}(static_cast<int>(key.kernel_type)) << 1);

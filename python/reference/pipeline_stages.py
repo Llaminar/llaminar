@@ -49,6 +49,11 @@ class PipelineStage(Enum):
     FINAL_NORM = auto()             # Final RMSNorm/LayerNorm (after all layers)
     LM_HEAD = auto()                # Language model head output (logits)
     
+    # === Gated Delta Net (Linear Attention) ===
+    GDN_CONV1D_OUTPUT = auto()      # Output of causal conv1d (after SiLU activation)
+    GDN_DELTA_RULE_OUTPUT = auto()  # Output of chunk/recurrent gated delta rule kernel
+    GDN_NORM_GATE_OUTPUT = auto()   # Output of RMSNormGated (norm + SiLU gate with z)
+
     # === Extensibility ===
     CUSTOM = auto()                 # Custom stage for architecture-specific extensions
 
@@ -75,6 +80,9 @@ _STAGE_TO_STRING: Dict[PipelineStage, str] = {
     PipelineStage.FFN_RESIDUAL: "FFN_RESIDUAL",
     PipelineStage.FINAL_NORM: "FINAL_NORM",
     PipelineStage.LM_HEAD: "LM_HEAD",
+    PipelineStage.GDN_CONV1D_OUTPUT: "GDN_CONV1D_OUTPUT",
+    PipelineStage.GDN_DELTA_RULE_OUTPUT: "GDN_DELTA_RULE_OUTPUT",
+    PipelineStage.GDN_NORM_GATE_OUTPUT: "GDN_NORM_GATE_OUTPUT",
     PipelineStage.CUSTOM: "CUSTOM",
 }
 

@@ -71,7 +71,7 @@ TEST_F(Test__KernelFactory, GetDeviceType_NegativeIndex_ReturnsCPU)
 
 TEST_F(Test__KernelFactory, GetDeviceType_ZeroIndex_ReturnsCPU)
 {
-    // In our test environment, device 0 is always CPU (OpenBLAS or MKL)
+    // In our test environment, device 0 is always CPU (OneDNN or MKL)
     auto &dm = DeviceManager::instance();
     if (dm.devices().empty())
     {

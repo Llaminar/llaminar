@@ -221,136 +221,56 @@ def dequantize_q8_0(data: bytes, n_elements: int) -> np.ndarray:
 
 def dequantize_q6_k(data: bytes, n_elements: int) -> np.ndarray:
     """
-    Dequantize Q6_K (6-bit K-quant) to FP32 (FULLY VECTORIZED).
-    
-    Q6_K uses:
-    - Main scale (FP16, 2 bytes)
-    - Sub-scales (128 x 4-bit, packed in 64 bytes)
-    - Quantized values (256 x 6-bit, packed in 192 bytes)
-    - Block size: 256 elements
-    - Total block size: 2 + 64 + 192 = 258 bytes (actually 210 based on observation)
-    
-    This implementation uses NumPy vectorization for ~60x speedup.
-    
-    Args:
-        data: Raw Q6_K data
-        n_elements: Total number of elements
-        
-    Returns:
-        NumPy array of FP32 values
+    Dequantize Q6_K (6-bit K-quant) to FP32 (VECTORIZED).
+
+    block_q6_K layout (210 bytes per 256 elements):
+      - ql[128] (128 bytes, offset 0): lower 4 bits of each quant
+      - qh[64] (64 bytes, offset 128): upper 2 bits of each quant (4 per byte)
+      - scales[16] (16 bytes, offset 192, int8): per-sub-block scales
+      - d (FP16, 2 bytes, offset 208): super-block scale
+
+    Dequant formula: value = d * scales[sub_block] * (6bit_quant - 32)
     """
     QK_K = 256
-    BLOCK_BYTES = 210  # Empirically determined
-    
+    BLOCK_BYTES = 210
+
     full_blocks = n_elements // QK_K
-    remainder = n_elements % QK_K
-    
-    if full_blocks == 0 and remainder > 0:
-        # Single partial block - use fallback
-        return _dequantize_q6_k_fallback(data, n_elements)
-    
-    # Pre-allocate result
     result = np.zeros(n_elements, dtype=np.float32)
-    
+
     if full_blocks == 0:
         return result
-    
-    # Convert to numpy for vectorized operations
+
     data_array = np.frombuffer(data[:full_blocks * BLOCK_BYTES], dtype=np.uint8)
     data_blocks = data_array.reshape(full_blocks, BLOCK_BYTES)
-    
-    # Extract main scales (FP16, first 2 bytes) - VECTORIZED
-    scales_bytes = data_blocks[:, :2].tobytes()
-    main_scales = np.frombuffer(scales_bytes, dtype=np.float16).astype(np.float32)
-    
-    # Extract sub-scales (4-bit, bytes 2:66) - VECTORIZED
-    scales_packed = data_blocks[:, 2:66]  # Shape: (num_blocks, 64)
-    
-    # Unpack 4-bit sub-scales using vectorized operations
-    subscales = np.empty((full_blocks, 128), dtype=np.float32)
-    subscales[:, 0::2] = (scales_packed & 0x0F).astype(np.float32) / 16.0
-    subscales[:, 1::2] = ((scales_packed >> 4) & 0x0F).astype(np.float32) / 16.0
-    
-    # Extract quantized data (bytes 66:210)
-    quants_packed = data_blocks[:, 66:210]  # Shape: (num_blocks, 144)
-    
-    # CRITICAL OPTIMIZATION: Vectorized 6-bit unpacking
-    # Process all blocks in parallel using NumPy broadcasting
-    
-    # Reshape quants to process 3-byte groups (4 values per 3 bytes)
-    # 144 bytes = 48 groups of 3 bytes = 192 values (but we need 256)
-    # This suggests the actual format is different. Let's process what we have.
-    
-    num_groups_per_block = 64  # 256 / 4 = 64 groups
-    bytes_per_block = num_groups_per_block * 3  # 192 bytes
-    
-    # Truncate or pad to expected size
-    if quants_packed.shape[1] < bytes_per_block:
-        # Pad with zeros
-        padding = np.zeros((full_blocks, bytes_per_block - quants_packed.shape[1]), dtype=np.uint8)
-        quants_packed = np.concatenate([quants_packed, padding], axis=1)
-    
-    # Reshape to (num_blocks, num_groups, 3)
-    quants_reshaped = quants_packed[:, :bytes_per_block].reshape(full_blocks, num_groups_per_block, 3)
-    
-    # Extract bytes - VECTORIZED
-    byte0 = quants_reshaped[:, :, 0].astype(np.uint32)
-    byte1 = quants_reshaped[:, :, 1].astype(np.uint32)
-    byte2 = quants_reshaped[:, :, 2].astype(np.uint32)
-    
-    # Unpack 4 x 6-bit values per group - FULLY VECTORIZED
-    q0 = (byte0 & 0x3F).astype(np.int8)
-    q1 = (((byte0 >> 6) & 0x03) | ((byte1 & 0x0F) << 2)).astype(np.int8)
-    q2 = (((byte1 >> 4) & 0x0F) | ((byte2 & 0x03) << 4)).astype(np.int8)
-    q3 = ((byte2 >> 2) & 0x3F).astype(np.int8)
-    
-    # Convert unsigned 6-bit to signed (-32 to 31) - VECTORIZED
-    q0 = np.where(q0 >= 32, q0 - 64, q0)
-    q1 = np.where(q1 >= 32, q1 - 64, q1)
-    q2 = np.where(q2 >= 32, q2 - 64, q2)
-    q3 = np.where(q3 >= 32, q3 - 64, q3)
-    
-    # Interleave into final quantized array - VECTORIZED
-    # Shape: (num_blocks, 256)
-    quants = np.empty((full_blocks, QK_K), dtype=np.int8)
-    quants[:, 0::4] = q0
-    quants[:, 1::4] = q1
-    quants[:, 2::4] = q2
-    quants[:, 3::4] = q3
-    
-    # Apply scales - FULLY VECTORIZED
-    # Each pair of elements shares a sub-scale
-    # main_scale * sub_scale[i//2] * quant[i]
-    
-    # Expand main scales to match shape
-    main_scales_expanded = main_scales[:, np.newaxis]  # Shape: (num_blocks, 1)
-    
-    # Create sub-scale indices (0, 0, 1, 1, 2, 2, ...)
-    subscale_indices = np.arange(QK_K) // 2
-    subscales_expanded = subscales[:, subscale_indices]  # Shape: (num_blocks, 256)
-    
-    # Combine all scales - VECTORIZED
-    # Handle NaN/Inf in scales gracefully
-    with np.errstate(invalid='ignore'):
-        combined_scales = main_scales_expanded * subscales_expanded
-        # Replace NaN/Inf with 0 (safeguard for malformed data)
-        combined_scales = np.nan_to_num(combined_scales, nan=0.0, posinf=0.0, neginf=0.0)
-    
-    # Final dequantization - VECTORIZED
-    with np.errstate(invalid='ignore'):
-        result_blocks = combined_scales * quants.astype(np.float32)
-        result_blocks = np.nan_to_num(result_blocks, nan=0.0, posinf=0.0, neginf=0.0)
-    
-    # Flatten back into result array
-    result[:full_blocks * QK_K] = result_blocks.reshape(-1)
-    
-    # Handle remainder
-    if remainder > 0:
-        offset = full_blocks * BLOCK_BYTES
-        remainder_data = data[offset:]
-        remainder_result = _dequantize_q6_k_fallback(remainder_data, remainder)
-        result[full_blocks * QK_K:] = remainder_result
-    
+
+    # Extract fields per block_q6_K struct layout
+    ql = data_blocks[:, 0:128]       # (num_blocks, 128) lower 4 bits
+    qh = data_blocks[:, 128:192]     # (num_blocks, 64) upper 2 bits
+    sc = data_blocks[:, 192:208].copy().view(np.int8)  # (num_blocks, 16) signed
+    d = np.frombuffer(data_blocks[:, 208:210].copy().tobytes(), dtype=np.float16).astype(np.float32)
+
+    # Build 6-bit quants as uint8 (N, 256) in the llama.cpp Q6_K element order:
+    #   Each half (128 elems) uses ql[64] for low 4 bits, qh[32] for upper 2 bits.
+    #   Output element order per half: (ql_lo & 0xF), (ql_hi & 0xF), (ql_lo >> 4), (ql_hi >> 4)
+    quants = np.empty((full_blocks, QK_K), dtype=np.uint8)
+    for half in range(2):
+        ql_lo = ql[:, half * 64:half * 64 + 32]
+        ql_hi = ql[:, half * 64 + 32:(half + 1) * 64]
+        qh_h  = qh[:, half * 32:(half + 1) * 32]
+        off = half * 128
+        quants[:, off:off+32]       = (ql_lo & 0xF) | (((qh_h >> 0) & 3) << 4)
+        quants[:, off+32:off+64]    = (ql_hi & 0xF) | (((qh_h >> 2) & 3) << 4)
+        quants[:, off+64:off+96]    = (ql_lo >> 4)  | (((qh_h >> 4) & 3) << 4)
+        quants[:, off+96:off+128]   = (ql_hi >> 4)  | (((qh_h >> 6) & 3) << 4)
+
+    # 3D reshape: 16 groups of 16 elements, each group has one scale value.
+    # Broadcasting (N,16,1) scale × (N,16,16) quants avoids materializing (N,256) scale array.
+    q_3d = quants.reshape(full_blocks, 16, 16).astype(np.float32)
+    q_3d -= 32
+    sc_3d = sc.astype(np.float32).reshape(full_blocks, 16, 1)
+    q_3d *= d[:, np.newaxis, np.newaxis] * sc_3d
+
+    result[:full_blocks * QK_K] = q_3d.reshape(-1)
     return result
 
 
@@ -385,15 +305,14 @@ def dequantize_q4_1(data: bytes, n_elements: int) -> np.ndarray:
     
     if full_blocks == 0:
         if remainder > 0:
-            # Handle partial block
+            # Handle partial block - low nibbles for first 16, high nibbles for next 16
             scale = fp16_to_fp32(data[0:2])
             minimum = fp16_to_fp32(data[2:4])
             for i in range(remainder):
-                byte_idx = i // 2
-                if i % 2 == 0:
-                    q = data[4 + byte_idx] & 0x0F
+                if i < 16:
+                    q = data[4 + i] & 0x0F
                 else:
-                    q = (data[4 + byte_idx] >> 4) & 0x0F
+                    q = (data[4 + i - 16] >> 4) & 0x0F
                 result[i] = scale * q + minimum
         return result
     
@@ -411,9 +330,11 @@ def dequantize_q4_1(data: bytes, n_elements: int) -> np.ndarray:
     quants_packed = data_blocks[:, 4:]  # Shape: (num_blocks, 16)
     
     # Unpack 4-bit values - VECTORIZED
+    # Layout matches llama.cpp: low nibbles in first half, high nibbles in second half
+    # byte[j] -> element j (low nibble) and element j+16 (high nibble)
     quants = np.empty((full_blocks, QK), dtype=np.uint8)
-    quants[:, 0::2] = quants_packed & 0x0F
-    quants[:, 1::2] = (quants_packed >> 4) & 0x0F
+    quants[:, :16] = quants_packed & 0x0F
+    quants[:, 16:] = (quants_packed >> 4) & 0x0F
     
     # Dequantize: scale * quant + minimum - FULLY VECTORIZED
     scales_expanded = scales[:, np.newaxis]
@@ -429,11 +350,10 @@ def dequantize_q4_1(data: bytes, n_elements: int) -> np.ndarray:
         scale = fp16_to_fp32(data[offset:offset+2])
         minimum = fp16_to_fp32(data[offset+2:offset+4])
         for i in range(remainder):
-            byte_idx = i // 2
-            if i % 2 == 0:
-                q = data[offset + 4 + byte_idx] & 0x0F
+            if i < 16:
+                q = data[offset + 4 + i] & 0x0F
             else:
-                q = (data[offset + 4 + byte_idx] >> 4) & 0x0F
+                q = (data[offset + 4 + i - 16] >> 4) & 0x0F
             result[full_blocks * QK + i] = scale * q + minimum
     
     return result
@@ -540,61 +460,139 @@ def dequantize_q5_0(data: bytes, n_elements: int) -> np.ndarray:
 
 
 def _dequantize_q6_k_fallback(data: bytes, n_elements: int) -> np.ndarray:
-    """Fallback for Q6_K partial blocks (slower but handles edge cases)."""
+    """Scalar fallback for Q6_K (matches llama.cpp dequantize_row_q6_K exactly)."""
     QK_K = 256
     BLOCK_BYTES = 210
-    
+
     result = np.zeros(n_elements, dtype=np.float32)
     num_blocks = (n_elements + QK_K - 1) // QK_K
-    
+
     for block_idx in range(num_blocks):
         block_offset = block_idx * BLOCK_BYTES
-        
-        if block_offset + 2 > len(data):
+        if block_offset + BLOCK_BYTES > len(data):
             break
-        
-        # Read main scale
-        scale_bytes = data[block_offset:block_offset + 2]
-        d = fp16_to_fp32(scale_bytes)
-        
-        # Read sub-scales (simplified - use direct indexing)
-        scales_offset = block_offset + 2
-        scales = []
-        for i in range(min(64, (len(data) - scales_offset) // 1)):
-            if scales_offset + i >= len(data):
-                break
-            packed_byte = data[scales_offset + i]
-            scales.append((packed_byte & 0x0F) / 16.0)
-            scales.append(((packed_byte >> 4) & 0x0F) / 16.0)
-        
-        # Read and unpack quantized values
-        quants_offset = block_offset + 66
-        quants = []
-        for group_idx in range(64):  # 256 / 4 = 64 groups
-            if quants_offset + group_idx * 3 + 2 >= len(data):
-                break
-                
-            byte0 = data[quants_offset + group_idx * 3 + 0]
-            byte1 = data[quants_offset + group_idx * 3 + 1]
-            byte2 = data[quants_offset + group_idx * 3 + 2]
-            
-            q0 = byte0 & 0x3F
-            q1 = ((byte0 >> 6) & 0x03) | ((byte1 & 0x0F) << 2)
-            q2 = ((byte1 >> 4) & 0x0F) | ((byte2 & 0x03) << 4)
-            q3 = (byte2 >> 2) & 0x3F
-            
-            for q in [q0, q1, q2, q3]:
-                quants.append(q - 64 if q >= 32 else q)
-        
-        # Dequantize
-        for i in range(min(QK_K, n_elements - block_idx * QK_K)):
-            element_idx = block_idx * QK_K + i
-            if element_idx >= n_elements or i >= len(quants):
-                break
-            
-            scale_idx = min(i // 2, len(scales) - 1)
-            result[element_idx] = d * scales[scale_idx] * quants[i]
-    
+
+        d = fp16_to_fp32(data[block_offset + 208:block_offset + 210])
+        ql = data[block_offset + 0:block_offset + 128]
+        qh = data[block_offset + 128:block_offset + 192]
+        sc_raw = data[block_offset + 192:block_offset + 208]
+        sc = np.frombuffer(sc_raw, dtype=np.int8)
+
+        ql_off = 0
+        qh_off = 0
+        sc_off = 0
+        y_off = block_idx * QK_K
+
+        for _half in range(2):
+            for l in range(32):
+                is_idx = l // 16
+                q1 = ((ql[ql_off + l] & 0xF) | (((qh[qh_off + l] >> 0) & 3) << 4)) - 32
+                q2 = ((ql[ql_off + l + 32] & 0xF) | (((qh[qh_off + l] >> 2) & 3) << 4)) - 32
+                q3 = ((ql[ql_off + l] >> 4) | (((qh[qh_off + l] >> 4) & 3) << 4)) - 32
+                q4 = ((ql[ql_off + l + 32] >> 4) | (((qh[qh_off + l] >> 6) & 3) << 4)) - 32
+
+                idx = y_off + l
+                if idx < n_elements:
+                    result[idx] = d * sc[sc_off + is_idx + 0] * q1
+                if idx + 32 < n_elements:
+                    result[idx + 32] = d * sc[sc_off + is_idx + 2] * q2
+                if idx + 64 < n_elements:
+                    result[idx + 64] = d * sc[sc_off + is_idx + 4] * q3
+                if idx + 96 < n_elements:
+                    result[idx + 96] = d * sc[sc_off + is_idx + 6] * q4
+
+            ql_off += 64
+            qh_off += 32
+            sc_off += 8
+            y_off += 128
+
+    return result
+
+
+def dequantize_q5_k(data: bytes, n_elements: int) -> np.ndarray:
+    """
+    Dequantize Q5_K (5-bit K-quantization) to FP32 (VECTORIZED).
+
+    Q5_K format (super-block of 256 elements, 176 bytes):
+      - d (FP16, 2 bytes): super-block scale
+      - dmin (FP16, 2 bytes): super-block min offset
+      - scales (12 bytes): packed 6-bit scale/min for 8 sub-blocks
+      - qh (32 bytes): high bits
+      - qs (128 bytes): low 4-bit quants
+
+    Args:
+        data: Raw Q5_K data
+        n_elements: Total elements
+
+    Returns:
+        FP32 numpy array
+    """
+    QK_K = 256
+    BLOCK_BYTES = 176  # 2+2+12+32+128
+    n_blocks = (n_elements + QK_K - 1) // QK_K
+
+    data_arr = np.frombuffer(data, dtype=np.uint8)
+    full_blocks = min(n_blocks, len(data) // BLOCK_BYTES)
+    if full_blocks == 0:
+        return np.zeros(n_elements, dtype=np.float32)
+
+    blocks = data_arr[:full_blocks * BLOCK_BYTES].reshape(full_blocks, BLOCK_BYTES)
+
+    # --- Extract d and dmin (FP16) ---
+    d = np.frombuffer(blocks[:, 0:2].copy().tobytes(), dtype=np.float16).astype(np.float32)
+    dmin = np.frombuffer(blocks[:, 2:4].copy().tobytes(), dtype=np.float16).astype(np.float32)
+
+    # --- Unpack 6-bit scales and mins from 12 bytes → 8 pairs each ---
+    sr = blocks[:, 4:16]  # (n_blocks, 12)
+
+    sc = np.empty((full_blocks, 8), dtype=np.float32)
+    m_arr = np.empty((full_blocks, 8), dtype=np.float32)
+
+    # First 4 sub-blocks
+    sc[:, 0:4] = (sr[:, 0:4] & 0x3F).astype(np.float32)
+    m_arr[:, 0:4] = (sr[:, 4:8] & 0x3F).astype(np.float32)
+
+    # Next 4 sub-blocks
+    sc[:, 4:8] = ((sr[:, 8:12] & 0x0F) | ((sr[:, 0:4] >> 6) << 4)).astype(np.float32)
+    m_arr[:, 4:8] = ((sr[:, 8:12] >> 4) | ((sr[:, 4:8] >> 6) << 4)).astype(np.float32)
+
+    # --- Extract qh (32 bytes) and qs (128 bytes) ---
+    qh = blocks[:, 16:48]   # (n_blocks, 32)
+    qs = blocks[:, 48:176]  # (n_blocks, 128)
+
+    # --- Unpack all 256 elements per block ---
+    # Process 4 iterations of 64 elements: each uses 32 qs bytes
+    # Iteration j: elements [j*64 .. j*64+63]
+    #   First 32:  low nibble of qs[j*32+l] + high bit from qh[l] bit (2*j)
+    #   Next 32:   high nibble of qs[j*32+l] + high bit from qh[l] bit (2*j+1)
+    result_blocks = np.empty((full_blocks, QK_K), dtype=np.float32)
+
+    for j in range(4):
+        qs_chunk = qs[:, j*32:(j+1)*32]  # (n_blocks, 32)
+
+        # Low nibbles → first 32 elements
+        low_nibs = (qs_chunk & 0x0F).astype(np.uint8)       # (n_blocks, 32)
+        # High nibbles → next 32 elements
+        high_nibs = ((qs_chunk >> 4) & 0x0F).astype(np.uint8)  # (n_blocks, 32)
+
+        # High bits from qh: bit (2*j) for low half, bit (2*j+1) for high half
+        hb_low = ((qh >> (2 * j)) & 1).astype(np.uint8)         # (n_blocks, 32)
+        hb_high = ((qh >> (2 * j + 1)) & 1).astype(np.uint8)    # (n_blocks, 32)
+
+        # Combine: 5-bit quant = low_nib + 16*high_bit
+        q_low = low_nibs.astype(np.float32) + 16.0 * hb_low.astype(np.float32)
+        q_high = high_nibs.astype(np.float32) + 16.0 * hb_high.astype(np.float32)
+
+        # Scale indices: sub-block 2*j and 2*j+1
+        d1 = (d * sc[:, 2*j])[:, np.newaxis]       # (n_blocks, 1)
+        m1 = (dmin * m_arr[:, 2*j])[:, np.newaxis]
+        d2 = (d * sc[:, 2*j+1])[:, np.newaxis]
+        m2 = (dmin * m_arr[:, 2*j+1])[:, np.newaxis]
+
+        result_blocks[:, j*64:j*64+32] = d1 * q_low - m1
+        result_blocks[:, j*64+32:j*64+64] = d2 * q_high - m2
+
+    result = result_blocks.reshape(-1)[:n_elements]
     return result
 
 
@@ -666,6 +664,8 @@ def dequantize(data: bytes, tensor_type: GGUFTensorType, shape: Tuple[int, ...])
         result = dequantize_q8_0(data, n_elements)
     elif tensor_type == GGUFTensorType.Q6_K:
         result = dequantize_q6_k(data, n_elements)
+    elif tensor_type == GGUFTensorType.Q5_K:
+        result = dequantize_q5_k(data, n_elements)
     else:
         raise ValueError(f"Unsupported tensor type for dequantization: {tensor_type.name}")
     

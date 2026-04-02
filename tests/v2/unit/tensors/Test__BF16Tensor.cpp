@@ -7,7 +7,7 @@
  * - Basic tensor creation and properties
  * - BF16 ↔ FP32 conversion accuracy
  * - GEMM correctness with BF16 weights
- * - Backend selection (MKL vs OpenBLAS)
+ * - Backend selection (MKL vs OneDNN)
  *
  * Naming convention: Test file and test suite are named after the class under test.
  * File: Test__BF16Tensor.cpp → Testing: BF16Tensor class

@@ -567,7 +567,7 @@ TEST_F(ComputeStageTest, ResidualAddInPlace)
 
 TEST_F(ComputeStageTest, BackendSupport)
 {
-    // All CPU stages should support OpenBLAS and MKL
+    // All CPU stages should support OneDNN and MKL
     const int seq_len = 1;
     const int hidden_dim = 4;
 

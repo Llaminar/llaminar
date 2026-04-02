@@ -430,10 +430,6 @@ namespace llaminar2
         setenv("MKL_NUM_THREADS", std::to_string(omp_threads).c_str(), 1);
         setenv("MKL_DYNAMIC", "false", 1);
 
-        // OpenBLAS/GOTO settings
-        setenv("OPENBLAS_NUM_THREADS", std::to_string(omp_threads).c_str(), 1);
-        setenv("GOTO_NUM_THREADS", std::to_string(omp_threads).c_str(), 1);
-
         // Llaminar-specific threading policy flags
         if (config.use_physical_cores)
         {

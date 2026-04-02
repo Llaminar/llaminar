@@ -14,7 +14,7 @@ import pytest
 
 # Ensure the workspace root is on sys.path so `from python.reference import ...` works
 # regardless of the working directory pytest is invoked from.
-_workspace_root = Path(__file__).resolve().parent.parent.parent
+_workspace_root = Path(__file__).resolve().parent.parent.parent.parent
 if str(_workspace_root) not in sys.path:
     sys.path.insert(0, str(_workspace_root))
 
@@ -23,13 +23,13 @@ if str(_workspace_root) not in sys.path:
 # Shared fixtures
 # ---------------------------------------------------------------------------
 
-@pytest.fixture
+@pytest.fixture(scope='session')
 def models_dir() -> Path:
     """Path to the models/ directory at the workspace root."""
     return _workspace_root / "models"
 
 
-@pytest.fixture
+@pytest.fixture(scope='session')
 def qwen2_q4_model(models_dir) -> Path:
     """Path to the Qwen2.5-0.5B Q4_0 GGUF model, skipping if unavailable."""
     p = models_dir / "qwen2.5-0.5b-instruct-q4_0.gguf"
@@ -38,7 +38,7 @@ def qwen2_q4_model(models_dir) -> Path:
     return p
 
 
-@pytest.fixture
+@pytest.fixture(scope='session')
 def qwen2_q8_model(models_dir) -> Path:
     """Path to the Qwen2.5-0.5B Q8_0 GGUF model, skipping if unavailable."""
     p = models_dir / "qwen2.5-0.5b-instruct-q8_0.gguf"
@@ -47,7 +47,7 @@ def qwen2_q8_model(models_dir) -> Path:
     return p
 
 
-@pytest.fixture
+@pytest.fixture(scope='session')
 def llama_q4_model(models_dir) -> Path:
     """Path to the Llama-3.2-1B Q4_0 GGUF model, skipping if unavailable."""
     p = models_dir / "Llama-3.2-1B-Instruct-Q4_0.gguf"
@@ -56,10 +56,19 @@ def llama_q4_model(models_dir) -> Path:
     return p
 
 
-@pytest.fixture
+@pytest.fixture(scope='session')
 def qwen3_q8_model(models_dir) -> Path:
     """Path to the Qwen3-0.6B Q8_0 GGUF model, skipping if unavailable."""
     p = models_dir / "Qwen3-0.6B-Q8_0.gguf"
+    if not p.exists():
+        pytest.skip(f"Model not found: {p}")
+    return p
+
+
+@pytest.fixture(scope='session')
+def qwen35_q4_model(models_dir) -> Path:
+    """Path to the Qwen3.5-0.8B Q4_0 GGUF model, skipping if unavailable."""
+    p = models_dir / "Qwen3.5-0.8B-Q4_0.gguf"
     if not p.exists():
         pytest.skip(f"Model not found: {p}")
     return p

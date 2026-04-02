@@ -13,7 +13,6 @@
 
 #include <gtest/gtest.h>
 #include <mpi.h>
-#include <cblas.h>
 #include <chrono>
 #include <vector>
 #include <numeric>
@@ -23,6 +22,7 @@
 #include "tensors/SIMDHelpers.h"
 #include "tensors/Tensors.h"
 #include "backends/ComputeBackend.h"
+#include "kernels/cpu/gemm/FloatingPointGemmKernel.h"
 
 using namespace llaminar2;
 
@@ -134,11 +134,9 @@ namespace
         // Warmup
         for (int i = 0; i < warmup; ++i)
         {
-            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
-                        M, N, K, 1.0f,
-                        A_fp32.data(), K,
-                        B_fp32.data(), N,
-                        0.0f, C_fp32.data(), N);
+            llaminar2::gemm::run_onednn_fp32_matmul(
+                A_fp32.data(), B_fp32.data(), C_fp32.data(),
+                M, N, K, false);
         }
 
         // Profile: FP32 GEMM
@@ -147,11 +145,9 @@ namespace
 
         for (int iter = 0; iter < iterations; ++iter)
         {
-            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
-                        M, N, K, 1.0f,
-                        A_fp32.data(), K,
-                        B_fp32.data(), N,
-                        0.0f, C_fp32.data(), N);
+            llaminar2::gemm::run_onednn_fp32_matmul(
+                A_fp32.data(), B_fp32.data(), C_fp32.data(),
+                M, N, K, false);
         }
 
         MPI_Barrier(MPI_COMM_WORLD);
@@ -168,11 +164,9 @@ namespace
         {
             simd::convert_bf16_to_fp32(A_bf16.data(), A_fp32.data(), A_size);
             simd::convert_bf16_to_fp32(B_bf16.data(), B_fp32.data(), B_size);
-            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
-                        M, N, K, 1.0f,
-                        A_fp32.data(), K,
-                        B_fp32.data(), N,
-                        0.0f, C_fp32.data(), N);
+            llaminar2::gemm::run_onednn_fp32_matmul(
+                A_fp32.data(), B_fp32.data(), C_fp32.data(),
+                M, N, K, false);
         }
 
         // Profile: Full BF16 GEMM
@@ -186,11 +180,9 @@ namespace
             simd::convert_bf16_to_fp32(B_bf16.data(), B_fp32.data(), B_size);
 
             // GEMM
-            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
-                        M, N, K, 1.0f,
-                        A_fp32.data(), K,
-                        B_fp32.data(), N,
-                        0.0f, C_fp32.data(), N);
+            llaminar2::gemm::run_onednn_fp32_matmul(
+                A_fp32.data(), B_fp32.data(), C_fp32.data(),
+                M, N, K, false);
         }
 
         MPI_Barrier(MPI_COMM_WORLD);

@@ -376,6 +376,21 @@ class GGUFParser:
             block_size = 256
             n_blocks = (n_elements + block_size - 1) // block_size
             return n_blocks * 210
+        elif tensor_type == GGUFTensorType.Q5_K:
+            # Q5_K: 256 elements per block, 176 bytes per block
+            block_size = 256
+            n_blocks = (n_elements + block_size - 1) // block_size
+            return n_blocks * 176
+        elif tensor_type == GGUFTensorType.Q4_1:
+            # Q4_1: 32 elements per block, 20 bytes per block (2 scale + 2 min + 16 data)
+            block_size = 32
+            n_blocks = (n_elements + block_size - 1) // block_size
+            return n_blocks * 20
+        elif tensor_type == GGUFTensorType.Q5_0:
+            # Q5_0: 32 elements per block, 22 bytes per block
+            block_size = 32
+            n_blocks = (n_elements + block_size - 1) // block_size
+            return n_blocks * 22
         else:
             # For other types, estimate conservatively
             # Most quantized types use 2-8 bits per value
@@ -440,6 +455,30 @@ class GGUFParser:
                 else:
                     config['vocab_size'] = value
                 break
+        
+        # Qwen 3.5 Gated Delta Net specific metadata
+        if model_type == 'qwen35':
+            qwen35_keys = {
+                'attention.head_count_kv': 'num_key_value_heads',
+                'attention.key_length': 'head_dim',
+                'attention.layer_norm_rms_epsilon': 'rms_norm_eps',
+                'rope.freq_base': 'rope_theta',
+                'full_attention_interval': 'full_attention_interval',
+                'ssm.conv_kernel': 'linear_conv_kernel_dim',
+                'ssm.group_count': 'linear_num_key_heads',
+                'ssm.inner_size': 'ssm_inner_size',
+                'ssm.state_size': 'linear_value_head_dim',
+                'ssm.time_step_rank': 'ssm_time_step_rank',
+            }
+            for gguf_key, hf_key in qwen35_keys.items():
+                full_key = prefix + gguf_key
+                if full_key in self.metadata:
+                    config[hf_key] = self.metadata[full_key]
+
+            # Rope dimension sections (array)
+            dim_sections_key = prefix + 'rope.dimension_sections'
+            if dim_sections_key in self.metadata:
+                config['rope_dimension_sections'] = self.metadata[dim_sections_key]
         
         return config
     
