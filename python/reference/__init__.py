@@ -39,7 +39,7 @@ def _import_registry():
 
 # Try to import torch-dependent modules, but don't fail if unavailable
 try:
-    from .base import AbstractReferenceModel
+    from .base import AbstractReferenceModel, HuggingFaceReferenceModel
     from .registry import ModelRegistry, create_reference_model
     
     # Register available models (done in respective modules)
@@ -51,12 +51,14 @@ except ImportError as e:
     _torch_available = False
     # These will be None if torch not available
     AbstractReferenceModel = None
+    HuggingFaceReferenceModel = None
     ModelRegistry = None
     create_reference_model = None
 
 __all__ = [
     "PipelineStage",
-    "AbstractReferenceModel", 
+    "AbstractReferenceModel",
+    "HuggingFaceReferenceModel",
     "ModelRegistry",
     "create_reference_model",
 ]

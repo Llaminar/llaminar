@@ -122,5 +122,135 @@ class TestAbstractReferenceModel:
         assert len(model.get_snapshots()) == 0
 
 
+class TestHuggingFaceReferenceModel:
+    """Test HuggingFaceReferenceModel shared infrastructure."""
+
+    def test_subclass_only_needs_create_and_fallbacks(self):
+        """New model implementations only need two small methods."""
+        from python.reference.base import HuggingFaceReferenceModel
+
+        class MinimalModel(HuggingFaceReferenceModel):
+            def _create_model_from_gguf_config(self, config_dict, torch_dtype):
+                return None, None  # placeholder
+
+            def _tokenizer_fallbacks(self):
+                return ["some/model"]
+
+        model = MinimalModel("minimal", "some/path")
+        assert model.model_name == "minimal"
+        # Should NOT raise - it's a fully concrete class
+        assert model._tokenizer_fallbacks() == ["some/model"]
+
+    def test_default_tokenizer_fallbacks_empty(self):
+        """Default fallback list is empty (must be overridden per-model)."""
+        from python.reference.base import HuggingFaceReferenceModel
+
+        class NoFallbackModel(HuggingFaceReferenceModel):
+            def _create_model_from_gguf_config(self, config_dict, torch_dtype):
+                return None, None
+
+        model = NoFallbackModel("nofb", "some/path")
+        assert model._tokenizer_fallbacks() == []
+
+    def test_forward_raises_without_load(self):
+        """forward() raises RuntimeError when model not loaded."""
+        from python.reference.base import HuggingFaceReferenceModel
+
+        class StubModel(HuggingFaceReferenceModel):
+            def _create_model_from_gguf_config(self, config_dict, torch_dtype):
+                return None, None
+
+        model = StubModel("stub", "some/path")
+        with pytest.raises(RuntimeError, match="not loaded"):
+            model.forward([1, 2, 3])
+
+    def test_should_capture_all_when_none(self):
+        """_should_capture returns True for every stage when capture_stages is None."""
+        from python.reference.base import HuggingFaceReferenceModel
+
+        class StubModel(HuggingFaceReferenceModel):
+            def _create_model_from_gguf_config(self, config_dict, torch_dtype):
+                return None, None
+
+        model = StubModel("stub", "some/path")
+        model._capture_stages = None
+        for stage in PipelineStage:
+            assert model._should_capture(stage) is True
+
+    def test_should_capture_filters_correctly(self):
+        """_should_capture filters by the provided list."""
+        from python.reference.base import HuggingFaceReferenceModel
+
+        class StubModel(HuggingFaceReferenceModel):
+            def _create_model_from_gguf_config(self, config_dict, torch_dtype):
+                return None, None
+
+        model = StubModel("stub", "some/path")
+        model._capture_stages = [PipelineStage.EMBEDDING, PipelineStage.LM_HEAD]
+        assert model._should_capture(PipelineStage.EMBEDDING) is True
+        assert model._should_capture(PipelineStage.LM_HEAD) is True
+        assert model._should_capture(PipelineStage.ATTENTION_OUTPUT) is False
+        assert model._should_capture(PipelineStage.FFN_DOWN) is False
+
+    def test_qwen_inherits_from_hf_base(self):
+        """QwenReferenceModel inherits from HuggingFaceReferenceModel."""
+        from python.reference.base import HuggingFaceReferenceModel
+        from python.reference.qwen import QwenReferenceModel
+
+        assert issubclass(QwenReferenceModel, HuggingFaceReferenceModel)
+        model = QwenReferenceModel("qwen", "some/path")
+        assert isinstance(model, HuggingFaceReferenceModel)
+        assert isinstance(model, AbstractReferenceModel)
+
+    def test_llama_inherits_from_hf_base(self):
+        """LlamaReferenceModel inherits from HuggingFaceReferenceModel."""
+        from python.reference.base import HuggingFaceReferenceModel
+        from python.reference.llama import LlamaReferenceModel
+
+        assert issubclass(LlamaReferenceModel, HuggingFaceReferenceModel)
+        model = LlamaReferenceModel("llama", "some/path")
+        assert isinstance(model, HuggingFaceReferenceModel)
+
+    def test_qwen_tokenizer_fallbacks(self):
+        """Qwen model provides Qwen-specific tokenizer fallbacks."""
+        from python.reference.qwen import QwenReferenceModel
+
+        model = QwenReferenceModel("qwen", "some/path")
+        fallbacks = model._tokenizer_fallbacks()
+        assert len(fallbacks) >= 1
+        assert any("Qwen" in fb for fb in fallbacks)
+
+    def test_llama_tokenizer_fallbacks(self):
+        """LLaMA model provides LLaMA-specific tokenizer fallbacks."""
+        from python.reference.llama import LlamaReferenceModel
+
+        model = LlamaReferenceModel("llama", "some/path")
+        fallbacks = model._tokenizer_fallbacks()
+        assert len(fallbacks) >= 1
+        assert any("llama" in fb.lower() or "TinyLlama" in fb for fb in fallbacks)
+
+    def test_register_custom_model(self):
+        """Demonstrate how easy it is to register a new model implementation."""
+        from python.reference.base import HuggingFaceReferenceModel
+
+        class CustomModel(HuggingFaceReferenceModel):
+            def _create_model_from_gguf_config(self, config_dict, torch_dtype):
+                return None, None
+
+            def _tokenizer_fallbacks(self):
+                return ["custom/model-v1"]
+
+        ModelRegistry.register("custom_test", CustomModel)
+        assert ModelRegistry.is_registered("custom_test")
+
+        model = ModelRegistry.create("custom_test", "some/path", auto_load=False)
+        assert isinstance(model, CustomModel)
+        assert isinstance(model, HuggingFaceReferenceModel)
+        assert model._tokenizer_fallbacks() == ["custom/model-v1"]
+
+        # Cleanup — remove from registry to avoid polluting other tests
+        del ModelRegistry._registry["custom_test"]
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

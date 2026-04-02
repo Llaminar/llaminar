@@ -8903,4 +8903,110 @@ add_v2_test(V2_Perf_TurboQuant
     MPI_PROCS 1
 )
 
+# =============================================================================
+# Python Reference Module Tests (PyTorch parity infrastructure)
+# =============================================================================
+# The python/reference/ package provides the PyTorch reference implementation
+# used by C++ parity tests. These Python unit tests validate the reference
+# module itself: dequantization, GGUF parsing, pipeline stages, model registry.
+#
+# Test tiers:
+#   Unit   — Fast, no model files needed (~4s total)
+#   Integration — Require GGUF model files on disk (~90s total)
+#
+# Python3 is already found by the parent CMakeLists.txt (src/v2/CMakeLists.txt).
+
+set(PYTHON_REFERENCE_TEST_DIR "${CMAKE_SOURCE_DIR}/../../python/reference/tests")
+set(PYTHON_REFERENCE_ROOT "${CMAKE_SOURCE_DIR}/../..")
+
+# --- Python Unit Tests (fast, no model dependencies) ---
+
+# PipelineStage enum, ModelRegistry factory, AbstractReferenceModel base class
+add_test(
+    NAME V2_Unit_Python_Reference
+    COMMAND ${Python3_EXECUTABLE} -m pytest
+        ${PYTHON_REFERENCE_TEST_DIR}/test_reference.py
+        -v --tb=short -q
+)
+set_tests_properties(V2_Unit_Python_Reference PROPERTIES
+    LABELS "V2;Unit;Python;Reference;PipelineStage;ModelRegistry"
+    WORKING_DIRECTORY "${PYTHON_REFERENCE_ROOT}"
+    TIMEOUT 30
+)
+
+# Dequantization format tests (Q4_0, Q4_1, Q5_0, Q6_K, Q8_0, F16, F32)
+add_test(
+    NAME V2_Unit_Python_Dequantize
+    COMMAND ${Python3_EXECUTABLE} -m pytest
+        ${PYTHON_REFERENCE_TEST_DIR}/test_dequantize.py
+        -v --tb=short -q
+)
+set_tests_properties(V2_Unit_Python_Dequantize PROPERTIES
+    LABELS "V2;Unit;Python;Dequantize;Quantization;Q4_0;Q8_0;F16"
+    WORKING_DIRECTORY "${PYTHON_REFERENCE_ROOT}"
+    TIMEOUT 30
+)
+
+# --- Python Integration Tests (require GGUF model files) ---
+
+# Dequantization validation against real GGUF tensors
+add_test(
+    NAME V2_Integration_Python_DequantValidation
+    COMMAND ${Python3_EXECUTABLE} -m pytest
+        ${PYTHON_REFERENCE_TEST_DIR}/test_dequantization_validation.py
+        -v --tb=short -q
+)
+set_tests_properties(V2_Integration_Python_DequantValidation PROPERTIES
+    LABELS "V2;Integration;Python;Dequantize;Validation"
+    FIXTURES_REQUIRED V2_Models
+    WORKING_DIRECTORY "${PYTHON_REFERENCE_ROOT}"
+    TIMEOUT 120
+)
+
+# GGUF parser: header, metadata, tensor info from real model files
+add_test(
+    NAME V2_Integration_Python_GGUFParser
+    COMMAND ${Python3_EXECUTABLE} -m pytest
+        ${PYTHON_REFERENCE_TEST_DIR}/test_gguf_parser.py
+        -v --tb=short -q
+)
+set_tests_properties(V2_Integration_Python_GGUFParser PROPERTIES
+    LABELS "V2;Integration;Python;GGUFParser;ModelLoading"
+    FIXTURES_REQUIRED V2_Models
+    WORKING_DIRECTORY "${PYTHON_REFERENCE_ROOT}"
+    TIMEOUT 60
+)
+
+# GGUF dimension order: reversal correctness, PyTorch compatibility
+add_test(
+    NAME V2_Integration_Python_GGUFDimensionOrder
+    COMMAND ${Python3_EXECUTABLE} -m pytest
+        ${PYTHON_REFERENCE_TEST_DIR}/test_gguf_dimension_order.py
+        -v --tb=short -q
+)
+set_tests_properties(V2_Integration_Python_GGUFDimensionOrder PROPERTIES
+    LABELS "V2;Integration;Python;GGUFParser;DimensionOrder"
+    FIXTURES_REQUIRED V2_Models
+    WORKING_DIRECTORY "${PYTHON_REFERENCE_ROOT}"
+    TIMEOUT 180
+)
+
+# GGUF inference parity: end-to-end Llaminar vs PyTorch
+# Exclude tests that require the Llaminar C++ binary (llaminar_runner fixture)
+add_test(
+    NAME V2_Integration_Python_GGUFInference
+    COMMAND ${Python3_EXECUTABLE} -m pytest
+        ${PYTHON_REFERENCE_TEST_DIR}/test_gguf_inference.py
+        -v --tb=short -q
+        -k "not (llaminar_runner or llaminar_runs or logits_parity or generation_parity)"
+)
+set_tests_properties(V2_Integration_Python_GGUFInference PROPERTIES
+    LABELS "V2;Integration;Python;GGUFInference;Parity"
+    FIXTURES_REQUIRED V2_Models
+    WORKING_DIRECTORY "${PYTHON_REFERENCE_ROOT}"
+    TIMEOUT 300
+)
+
+message(STATUS "V2 Tests: Added Python reference module tests (2 unit + 4 integration)")
+
 endif()

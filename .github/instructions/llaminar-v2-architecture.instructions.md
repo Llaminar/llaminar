@@ -17,7 +17,7 @@ Phase 0: CLI/YAML → OrchestrationConfig (raw user-facing config, strings)
 Phase 1: ExecutionPlanBuilder → RankExecutionPlan (per-rank contract, parsed RuntimeConfig)
 Phase 2: IGraphConfigBuilder → GraphConfig (model-specific execution config)
 Phase 3: InferenceRunnerFactory → DeviceGraphOrchestrator / MultiDeviceOrchestrator
-Phase 4: Qwen2Graph + GraphResolver → ComputeGraph (declarative DAG of stages)
+Phase 4: IGraphBuilder (via GraphBuilderRegistry) + GraphResolver → ComputeGraph (declarative DAG of stages)
 ```
 
 ### 1.1 Phase 0: OrchestrationConfig
@@ -232,8 +232,8 @@ Location: `src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrato
 
 **Three Constructors:**
 1. `DeviceGraphOrchestrator(Dependencies deps, const GraphConfig&, const GraphCacheConfig&)` — DI (preferred for testing)
-2. `DeviceGraphOrchestrator(shared_ptr<Qwen2Graph>, shared_ptr<MPIContext>, ...)` — pre-built graph
-3. `DeviceGraphOrchestrator(const GraphConfig&, shared_ptr<MPIContext>, ...)` — creates internal builder
+2. `DeviceGraphOrchestrator(shared_ptr<IGraphBuilder>, shared_ptr<MPIContext>, ...)` — pre-built graph builder
+3. `DeviceGraphOrchestrator(const GraphConfig&, shared_ptr<MPIContext>, ...)` — creates internal builder via `GraphBuilderRegistry`
 
 **InferenceState** (all mutable per-inference state):
 ```cpp
@@ -459,7 +459,39 @@ class StageBoundBuffers {
 };
 ```
 
-### 4.5 BufferArena Integration with DeviceGraphExecutor
+### 4.5 StageBufferContract
+
+Location: `src/v2/memory/StageBufferContract.h`
+
+**Declarative I/O specification** for compute stages — describes what buffers a stage reads, writes, and needs as workspace. Returned by `IComputeStage::bufferContract()`.
+
+```cpp
+struct BufferBinding {
+    BufferId id;
+    BufferAccess access;       // READ, WRITE, READWRITE
+    const char* dtype;         // "FP32", "Q8_1", etc.
+};
+
+struct WorkspaceDesc {
+    const char* name;
+    size_t size_bytes;
+    size_t alignment;
+};
+
+struct StageBufferContract {
+    vector<BufferBinding> inputs;
+    vector<BufferBinding> outputs;
+    vector<BufferBinding> weight_tensors;
+    vector<BufferBinding> inouts;
+    vector<WorkspaceDesc> workspaces;
+};
+```
+
+Fluent builder pattern: `StageBufferContract::build().addInput(...).addOutput(...).addWeight(...)`
+
+The executor uses the contract to drive BufferArena borrows and coherence transitions automatically.
+
+### 4.6 BufferArena Integration with DeviceGraphExecutor
 
 ```
 DeviceGraphExecutor::executeStage(node):
@@ -585,8 +617,26 @@ class ComputeGraph {
 };
 ```
 
-**DeviceGraphExecutor** — executes ComputeGraph nodes with coherence, verification, and profiling:
+**DeviceGraphExecutor** — executes ComputeGraph nodes via a **single `runStages()` loop** parameterized by `StageRunPolicy`, eliminating divergent code path bugs:
+
 ```cpp
+struct StageRunPolicy {
+    bool coherence = true;            // Arena contract-based input/output coherence
+    bool weight_coherence = true;     // Upload weights to device
+    bool mark_dirty = true;           // Mark outputs device-authoritative (ALWAYS ON)
+    bool validation = true;           // NaN/Inf output validation
+    bool profiling = true;            // Per-stage timing breakdown
+    bool collective_intercept = true; // Use CollectiveContext for allreduce/allgather
+    bool timeline = false;            // GPU event-based per-stage profiling
+    bool stage_dump = true;           // Stage dump framework
+    bool snapshot_callback = true;    // Invoke snapshot callback
+    bool pointer_validation = false;  // GPU pointer device validation
+    
+    static StageRunPolicy full();       // Prefill, cache miss: everything on
+    static StageRunPolicy fastDecode(); // Cached decode (M=1): minimal overhead
+    static StageRunPolicy debug();      // Full + timeline + pointer validation
+};
+
 class DeviceGraphExecutor : public IGraphExecutor {
     bool execute(ComputeGraph& graph, IDeviceContext* ctx);
     bool executeMultiDevice(ComputeGraph& graph, const unordered_map<DeviceId, IDeviceContext*>&);
@@ -599,34 +649,112 @@ class DeviceGraphExecutor : public IGraphExecutor {
 };
 ```
 
-**Execution Loop:**
-1. `StageCoherence::ensureInputsOnDevice()` — upload inputs to GPU if needed
-2. `verifyStageEntry()` — NaN/zero check on inputs (Debug/Integration builds)
-3. `node.stage->execute()` — run compute stage
-4. `StageCoherence::markOutputsDirty()` — mark outputs as GPU-authoritative
-5. `verifyStageExit()` — NaN/zero check on outputs (Debug/Integration builds)
-6. Snapshot callback (if enabled)
+**Execution Loop** (driven by StageRunPolicy):
+1. If `policy.coherence`: Compute `StageBufferContract` from stage, drive BufferArena borrows and H2D transfers
+2. If `policy.weight_coherence`: Upload weight tensors to device
+3. If `policy.validation`: `verifyStageEntry()` — NaN/zero check on inputs
+4. `node.stage->execute()` — run compute stage
+5. If `policy.mark_dirty`: Mark outputs as GPU-authoritative via BufferArena
+6. If `policy.validation`: `verifyStageExit()` — NaN/zero check on outputs
+7. If `policy.snapshot_callback`: Invoke snapshot callback (parity testing)
 
-### 5.4 Qwen2Graph (Model-Specific Graph Builder)
+### 5.4 Model-Agnostic Graph Building
+
+The graph system is fully decoupled from any specific model architecture via registries and a single registration file.
+
+#### GraphBuilderRegistry
+
+Location: `src/v2/execution/local_execution/graph/GraphBuilderRegistry.h`
+
+Factory registry mapping architecture strings (e.g., `"qwen2"`, `"qwen3"`) to `IGraphBuilder` implementations:
+
+```cpp
+class GraphBuilderRegistry {
+    static void registerFactory(const string& arch, FactoryFn fn);
+    static unique_ptr<IGraphBuilder> create(const string& arch, const GraphConfig& config,
+                                            shared_ptr<MPIContext> mpi_ctx);
+    static bool isSupported(const string& arch);
+    static vector<string> supportedArchitectures();
+};
+```
+
+Uses `std::call_once` via `ensureBuiltins()` for lazy initialization.
+
+#### SchemaFactoryRegistry
+
+Location: `src/v2/execution/local_execution/graph/SchemaFactoryRegistry.h`
+
+Parallel registry for `ISchemaFactory` implementations providing weight sharding and stage sharding configs per architecture:
+
+```cpp
+class SchemaFactoryRegistry {
+    static ISchemaFactory* getFactory(const string& arch);
+    static WeightShardingConfig getWeightShardingConfig(const string& arch);
+    static StageShardingConfig getStageShardingConfig(const string& arch);
+    static bool isSupported(const string& arch);
+    static void registerFactory(const string& arch, FactoryFn fn);
+};
+```
+
+#### ModelRegistrations
+
+Location: `src/v2/models/ModelRegistrations.cpp`
+
+**Single ~56-line file** that registers all built-in model architectures:
+
+```cpp
+void registerBuiltinModels() {
+    // Graph builders
+    GraphBuilderRegistry::registerFactory("qwen2", ...Qwen2Graph...);
+    GraphBuilderRegistry::registerFactory("qwen3", ...Qwen2Graph...);  // Reuses Qwen2Graph
+    
+    // Schema factories
+    SchemaFactoryRegistry::registerFactory("qwen2", ...Qwen2SchemaFactory...);
+    SchemaFactoryRegistry::registerFactory("qwen3", ...Qwen3SchemaFactory...);
+}
+```
+
+**Key insight**: Qwen2 and Qwen3 share the same `Qwen2Graph` builder but differ in `ISchemaFactory` (Qwen3 adds QK-norm stages). To add a new model architecture, add entries to `ModelRegistrations.cpp` and implement an `ISchemaFactory`.
+
+#### IGraphBuilder
+
+Location: `src/v2/execution/local_execution/graph/IGraphBuilder.h`
+
+Interface for **stateless, declarative** compute graph builders:
+
+```cpp
+class IGraphBuilder {
+    virtual ComputeGraph buildFullForwardGraph(const ForwardInput&, ForwardOutput&) = 0;
+    virtual ComputeGraph buildEmbeddingGraph(...) = 0;
+    virtual ComputeGraph buildTransformerLayersGraph(...) = 0;
+    virtual ComputeGraph buildLayerGraph(int layer_idx, ...) = 0;
+    virtual ComputeGraph buildLMHeadGraph(...) = 0;
+    virtual GraphSchema getSchema() const = 0;
+    virtual GraphResolverConfig getResolverConfig(int seq_len) const = 0;
+};
+```
+
+#### Qwen2Graph (Concrete Builder)
 
 Location: `src/v2/models/qwen/Qwen2Graph.h`
 
-**Stateless** declarative graph builder. Creates `ComputeGraph` DAGs from model configuration.
+Implements `IGraphBuilder` for Qwen2/Qwen3 architectures. Stateless — creates `ComputeGraph` DAGs from model configuration. Configuration methods register parallelism contexts (`setPipelineConfig()`, `setTPContext()`), model state (`setWeights()`, `setBuffers()`), and allocators (`setTensorFactory()`).
 
-**Graph Building:**
-- `buildFullForwardGraph(ForwardInput, ForwardOutput)` → complete embedding → layers → LM head
-- `buildLayerGraph(LayerContext)` → single transformer layer
-- `buildUnifiedPipelineGraph()` → multi-stage PP graph
-- `buildPartialForwardGraph()` → PP stage subset
+#### Model Directory Layout
 
-**Schema/Resolver:**
-- `getSchema()` → `GraphSchema` (declarative stage definitions)
-- `getResolverConfig(seq_len)` → `GraphResolverConfig` (buffer allocation config)
-
-**Configuration Methods:**
-- `setPipelineConfig()`, `setPPContext()`, `setTPContext()` — register parallelism contexts
-- `setWeights()`, `setBuffers()` — register model state
-- `setTensorFactory()` — for graph-managed buffer allocation
+```
+src/v2/models/
+├── ModelRegistrations.cpp/.h       # Central model registration (add new models here)
+├── GraphTypes.h                    # GraphConfig struct
+├── IGraphConfigBuilder.h           # Interface for graph config building
+├── qwen/
+│   ├── Qwen2Graph.h/.cpp          # IGraphBuilder for Qwen2/Qwen3
+│   ├── Qwen2Schema.h              # ISchemaFactory for Qwen2
+│   ├── Qwen2GraphConfigBuilder.h  # IGraphConfigBuilder
+│   └── Qwen2BufferSpec.h/.cpp     # Buffer specifications
+└── qwen3/
+    └── Qwen3Schema.h              # ISchemaFactory for Qwen3 (QK-norm, no QKV bias)
+```
 
 ---
 
@@ -643,6 +771,7 @@ class IComputeStage {
     virtual const char* name() const = 0;
     virtual StageDumpInfo getDumpInfo() const = 0;       // REQUIRED: introspection
     virtual StageBufferRequirements getBufferRequirements() const;
+    virtual StageBufferContract bufferContract() const;  // Declarative I/O specification
     virtual CoherencePolicy coherencePolicy() const;     // Default: FULL
 };
 ```
@@ -802,7 +931,70 @@ Location: `src/v2/tensors/TensorLayout.h`
 
 ### 8.3 Device Coherence Protocol
 
-Every `TensorBase` tracks dual-validity flags: `host_valid_` and `device_valid_`.
+Llaminar has two coherence layers: a **new explicit state machine** (`TensorCoherenceState`) and the **legacy per-tensor methods** still on `TensorBase`.
+
+#### TensorCoherenceState (New)
+
+Location: `src/v2/tensors/CoherenceState.h`
+
+Explicit compile-time-verifiable state machine replacing the implicit boolean combinations:
+
+```cpp
+enum class TensorCoherenceState : uint8_t {
+    HOST_ONLY,              // Data only on host. No GPU buffer allocated.
+    HOST_AUTHORITATIVE,     // Both exist, host modified more recently.
+    DEVICE_AUTHORITATIVE,   // Both exist, device modified more recently.
+    SYNCED,                 // Both exist and are identical.
+    MAPPED,                 // Zero-copy mapped memory. Both always valid.
+    INVALID,                // Error state — should never be reached.
+};
+
+enum class CoherenceOp : uint8_t {
+    UPLOAD, DOWNLOAD, MARK_DEVICE_DIRTY, MUTABLE_HOST_ACCESS, RELEASE_DEVICE
+};
+
+enum class MemoryResidency : uint8_t {
+    STANDARD, BAR_BACKED, MAPPED
+};
+```
+
+**Transition table**: `COHERENCE_TRANSITIONS[state][op] → {new_state, valid}` — constexpr, compile-time verified. Invalid transitions (e.g., `MARK_DEVICE_DIRTY` on `HOST_ONLY`) produce `INVALID` with `valid = false`.
+
+**CoherenceAuditLog** (`src/v2/tensors/CoherenceAuditLog.h`): Per-tensor ring buffer (32 entries) recording state transitions for debugging. Dumped automatically on verification failure.
+
+#### TransferEngine
+
+Location: `src/v2/transfer/TransferEngine.h`
+
+Unified, stateless data movement with **plan/execute separation**:
+
+```cpp
+class TransferEngine {
+    static TransferMethod planTransfer(DeviceId src, DeviceId dst, MemoryResidency residency);
+    static bool execute(const TransferRequest& request);
+    static bool upload(TensorBase* tensor, DeviceId device);
+    static bool download(TensorBase* tensor);
+    static bool transferActivation(TensorBase* tensor, DeviceId device);
+};
+```
+
+**TransferMethod enum** (`src/v2/transfer/TransferMethod.h`):
+
+| Method | When Used |
+|--------|-----------|
+| `NOOP` | Same device — no transfer needed |
+| `HOST_TO_DEVICE` | Standard H2D via `IBackend::hostToDevice()` |
+| `DEVICE_TO_HOST` | Standard D2H via `IBackend::deviceToHost()` |
+| `DEVICE_TO_DEVICE_SAME_BACKEND` | P2P within same vendor (CUDA↔CUDA or ROCm↔ROCm) |
+| `BAR_HOST_BOUNCE` | BAR-backed cross-vendor: staging D2H → memcpy → H2D |
+| `HOST_STAGED` | Generic cross-vendor: D2H → memcpy → H2D (no BAR) |
+| `MAPPED_NOOP` | Zero-copy mapped memory — no transfer needed |
+
+**MemoryDescriptor** — snapshot of where a tensor's data physically lives (host_ptr, device_ptr, BAR pointers, mapped pointers, residency). Created via `MemoryDescriptor::fromTensor()` to decouple transfer logic from `TensorBase` internals.
+
+#### Legacy Per-Tensor Methods (TensorBase)
+
+The original per-tensor methods still exist on `TensorBase` and are used by the `BufferArena::CoherenceTracker` internally:
 
 | State | Meaning | `data()` Returns |
 |-------|---------|------------------|
@@ -819,7 +1011,7 @@ Every `TensorBase` tracks dual-validity flags: `host_valid_` and `device_valid_`
 - `mutable_data()` — host pointer + marks host as authoritative
 - `gpu_data_ptr()` — raw GPU buffer pointer
 
-**Automatic Coherence** is handled by `StageCoherence` / `DeviceGraphExecutor`. Manual coherence for tests uses `with_gpu_coherence()` or `GpuOutput<T>` RAII wrappers from `src/v2/execution/local_execution/coherence/GpuCoherence.h`.
+**Automatic Coherence** is handled by `BufferArena` + `CoherenceTracker` in the `DeviceGraphExecutor` via `StageBufferContract`. Legacy `StageCoherence` (`src/v2/execution/local_execution/coherence/StageCoherence.h`) still exists for stages not yet migrated to the contract system. Manual coherence for tests uses `with_gpu_coherence()` or `GpuOutput<T>` RAII wrappers from `src/v2/execution/local_execution/coherence/GpuCoherence.h`.
 
 ### 8.4 UnifiedKVCache
 
@@ -869,7 +1061,8 @@ Automatic stage boundary validation in Debug/Integration builds:
 
 Location: `src/v2/kernels/KernelFactory.h`
 
-Centralized kernel dispatch with caching:
+Centralized kernel dispatch with caching. Used primarily during weight loading and preparation; graph builders configure stages with their kernels during graph construction.
+
 ```cpp
 class KernelFactory {
     static DeviceType getDeviceType(int device_idx);
@@ -1172,8 +1365,15 @@ class BackendManager {
 | BufferId | `src/v2/memory/BufferId.h` |
 | CoherenceTracker | `src/v2/memory/CoherenceTracker.h` |
 | StageBoundBuffers | `src/v2/memory/StageBoundBuffers.h` |
+| StageBufferContract | `src/v2/memory/StageBufferContract.h` |
 | BufferAccess | `src/v2/memory/BufferAccess.h` |
 | NUMAAllocator | `src/v2/memory/NUMAAllocator.h` |
+| **Transfer** | |
+| TransferEngine | `src/v2/transfer/TransferEngine.h` |
+| TransferMethod | `src/v2/transfer/TransferMethod.h` |
+| **Coherence (Tensor)** | |
+| CoherenceState | `src/v2/tensors/CoherenceState.h` |
+| CoherenceAuditLog | `src/v2/tensors/CoherenceAuditLog.h` |
 | **Graph System** | |
 | GraphSchema | `src/v2/execution/local_execution/graph/GraphSchema.h` |
 | GraphResolver | `src/v2/execution/local_execution/graph/GraphResolver.h` |
@@ -1186,7 +1386,13 @@ class BackendManager {
 | ModelExecutor | `src/v2/execution/local_execution/model/ModelExecutor.h` |
 | ILayerExecutor | `src/v2/execution/local_execution/model/ILayerExecutor.h` |
 | **Graph Building** | |
+| GraphBuilderRegistry | `src/v2/execution/local_execution/graph/GraphBuilderRegistry.h` |
+| SchemaFactoryRegistry | `src/v2/execution/local_execution/graph/SchemaFactoryRegistry.h` |
+| IGraphBuilder | `src/v2/execution/local_execution/graph/IGraphBuilder.h` |
+| ModelRegistrations | `src/v2/models/ModelRegistrations.cpp` |
 | Qwen2Graph | `src/v2/models/qwen/Qwen2Graph.h` |
+| Qwen2Schema | `src/v2/models/qwen/Qwen2Schema.h` |
+| Qwen3Schema | `src/v2/models/qwen3/Qwen3Schema.h` |
 | Qwen2GraphConfigBuilder | `src/v2/models/qwen/Qwen2GraphConfigBuilder.h` |
 | Qwen2BufferSpec | `src/v2/models/qwen/Qwen2BufferSpec.h` |
 | ISchemaFactory | `src/v2/execution/local_execution/graph/GraphSchema.h` |
@@ -1200,7 +1406,7 @@ class BackendManager {
 | LocalTPContext | `src/v2/collective/LocalTPContext.h` |
 | ICollectiveBackend | `src/v2/collective/ICollectiveBackend.h` |
 | PCIeBARBackend | `src/v2/collective/backends/PCIeBARBackend.h` |
-| **Coherence** | |
+| **Coherence (Execution)** | |
 | StageCoherence | `src/v2/execution/local_execution/coherence/StageCoherence.h` |
 | GpuCoherence | `src/v2/execution/local_execution/coherence/GpuCoherence.h` |
 | **Kernel Layer** | |
@@ -1235,15 +1441,16 @@ class BackendManager {
 2. **Use `IInferenceRunner`** for simple single-device inference
 3. **Parse once, copy always** — RuntimeConfig is pre-parsed in ExecutionPlanBuilder, carried through the chain
 4. **Keep MPI out of kernels** — MPI sync lives in `AllreduceStage` and `AllGatherStage`
-5. **Use KernelFactory** — `getOrCreateGemm()` for cached kernel access
+5. **Model-agnostic graph building** — Register new models in `ModelRegistrations.cpp`; use `GraphBuilderRegistry` and `SchemaFactoryRegistry`
 6. **Declarative graphs** — Build computation as DAGs via GraphSchema + GraphResolver
 7. **Graph caching** — Reuse cached graphs in decode mode for performance
 8. **Use BufferArena** — Centralized buffer management with coherence tracking
-9. **DeviceId not int** — Use typed `DeviceId` for device identification
-10. **Collective via BackendRouter** — Let the router select optimal backend
-11. **Implement getDumpInfo()** — All stages must support introspection
-12. **Use PCIeBAR for heterogeneous TP** — 8× faster than host staging
-13. **Use OMP_WORKSHARE_REGION** — Nested-safe OpenMP parallelism in all kernels
+9. **Use StageBufferContract** — Stages declare I/O via `bufferContract()` for automatic coherence
+10. **DeviceId not int** — Use typed `DeviceId` for device identification
+11. **Collective via BackendRouter** — Let the router select optimal backend
+12. **Implement getDumpInfo()** — All stages must support introspection
+13. **Use PCIeBAR for heterogeneous TP** — 8× faster than host staging
+14. **Use OMP_WORKSHARE_REGION** — Nested-safe OpenMP parallelism in all kernels
 
 ### 14.3 Execution Path Summary
 
@@ -1255,16 +1462,16 @@ main()
       → ExecutionPlanBuilder → RankExecutionPlan (RuntimeConfig parsed once)
       → loadWeights()
       → buildComputeGraph()
-        ├── Single: DeviceGraphOrchestrator (Qwen2Graph → ComputeGraph → DeviceGraphExecutor)
+        ├── Single: DeviceGraphOrchestrator (IGraphBuilder via registry → ComputeGraph → DeviceGraphExecutor)
         ├── TP: MultiDeviceOrchestrator (N DeviceGraphOrchestrators, TPWorkerPool)
         └── PP: TreeToRunnerCompiler (N DeviceGraphOrchestrators, PPContext)
   → runner.prefill(tokens)
     → forward(tokens, seq_len)
       → GraphSchema → GraphResolver → ResolvedGraphSpec → ComputeGraph
-      → DeviceGraphExecutor::execute(graph)
-        → For each node: cohere → verify → execute → mark dirty → verify → snapshot
+      → DeviceGraphExecutor::execute(graph)  [StageRunPolicy::full()]
+        → For each node: contract → cohere → verify → execute → mark dirty → verify → snapshot
   → runner.decodeStep()
-    → forward(tokens, 1)  [cached graphs reused]
+    → forward(tokens, 1)  [cached graphs reused, StageRunPolicy::fastDecode()]
 ```
 
 ### 14.4 Directory Structure
@@ -1279,15 +1486,20 @@ src/v2/
 │   ├── local_execution/
 │   │   ├── orchestrators/           # Tier 3: DeviceGraphOrchestrator, MultiDeviceOrchestrator
 │   │   ├── model/                   # IModelExecutor, ModelExecutor, ILayerExecutor
-│   │   ├── graph/                   # GraphSchema, GraphResolver, DeviceGraphExecutor, ComputeGraph
-│   │   ├── coherence/               # StageCoherence, GpuCoherence
+│   │   ├── graph/                   # GraphSchema, GraphResolver, DeviceGraphExecutor, ComputeGraph,
+│   │   │                            #   GraphBuilderRegistry, SchemaFactoryRegistry, IGraphBuilder
+│   │   ├── coherence/               # StageCoherence, GpuCoherence (legacy + test helpers)
 │   │   ├── collective/              # CollectiveContext
 │   │   └── device/                  # DeviceContext, DeviceWorkspaceManager
 │   ├── factory/                     # InferenceRunnerFactory (internal)
 │   └── compute_stages/              # IComputeStage, all stage implementations
-├── memory/                          # BufferArena, BufferId, CoherenceTracker, StageBoundBuffers
+├── memory/                          # BufferArena, BufferId, CoherenceTracker, StageBoundBuffers,
+│                                    #   StageBufferContract, NUMAAllocator
+├── transfer/                        # TransferEngine, TransferMethod
 ├── models/
-│   ├── qwen/                        # Qwen2Graph, Qwen2GraphConfigBuilder, Qwen2BufferSpec
+│   ├── ModelRegistrations.cpp/.h    # Central model registration (add new models here)
+│   ├── qwen/                        # Qwen2Graph, Qwen2Schema, Qwen2GraphConfigBuilder, Qwen2BufferSpec
+│   ├── qwen3/                       # Qwen3Schema (QK-norm variant of Qwen2)
 │   ├── GraphTypes.h                 # GraphConfig
 │   └── IGraphConfigBuilder.h        # Interface
 ├── kernels/
@@ -1295,9 +1507,11 @@ src/v2/
 │   ├── cuda/                        # CUDA kernels
 │   ├── rocm/                        # ROCm kernels
 │   └── KernelFactory.h              # Centralized dispatch
-├── tensors/                         # ITensor, TensorBase, all typed tensors, KV cache
+├── tensors/                         # ITensor, TensorBase, all typed tensors, KV cache,
+│                                    #   CoherenceState, CoherenceAuditLog
 ├── backends/                        # IBackend, BackendManager, DeviceRegistry, DeviceId
 ├── collective/                      # ILocalTPContext, BackendRouter, PCIeBAR, NCCL, RCCL
 ├── loaders/                         # GGUF loading, WeightManager
+├── app/                             # Application modes (ChatCompletionHandler, etc.)
 └── utils/                           # MPIContext, MPITopology, Tokenizer, Sampler, logging
 ```

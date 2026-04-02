@@ -50,39 +50,40 @@ class TestQ40Dequantization(unittest.TestCase):
         self.assertTrue(np.allclose(result, 0.0))
     
     def test_single_block_ones(self):
-        """Test dequantization with scale and positive values."""
-        # Scale = 1.0, values = 1 (in 4-bit unsigned: 1)
+        """Test dequantization with scale and known nibble values."""
+        # Scale = 1.0, nibbles = 0x1
         scale_bytes = struct.pack('<e', 1.0)
-        # Pack 32 values of 1 into 16 bytes (2 values per byte)
-        # 4-bit value 1 = 0x1, packed as 0x11 (low nibble, high nibble)
+        # Pack nibble value 1 into each half-byte: 0x11 = low=1, high=1
         data_bytes = bytes([0x11] * 16)
         block = scale_bytes + data_bytes
         
         result = dequantize_q4_0(block, 32)
         
-        # Expected: scale * value = 1.0 * 1 = 1.0
-        # Q4_0: unsigned 0x1 stays 1 (only values > 7 become negative)
+        # Q4_0 subtracts 8 from all nibble values: 1 - 8 = -7
+        # Expected: scale * (nibble - 8) = 1.0 * -7 = -7.0
         self.assertEqual(result.shape, (32,))
-        expected_value = 1.0 * 1.0
+        expected_value = 1.0 * (1 - 8)
         self.assertTrue(np.allclose(result, expected_value))
     
     def test_multiple_blocks(self):
         """Test dequantization with multiple blocks."""
         # 2 blocks = 64 elements
+        # Block 1: scale=1.0, nibbles=8 (neutral value: 8-8=0)
         block1_scale = struct.pack('<e', 1.0)
-        block1_data = bytes([0x00] * 16)  # All zeros
+        block1_data = bytes([0x88] * 16)  # Nibble 8 → signed 0
         
+        # Block 2: scale=2.0, nibbles=10 (signed: 10-8=+2)
         block2_scale = struct.pack('<e', 2.0)
-        block2_data = bytes([0x11] * 16)  # All ones (nibble 0x1 = 1)
+        block2_data = bytes([0xAA] * 16)  # Nibble 0xA=10 → signed +2
         
         data = block1_scale + block1_data + block2_scale + block2_data
         result = dequantize_q4_0(data, 64)
         
         self.assertEqual(result.shape, (64,))
-        # First block: all zeros
+        # First block: scale * (8 - 8) = 0.0
         self.assertTrue(np.allclose(result[:32], 0.0))
-        # Second block: scale 2.0, unsigned nibble 1 stays as 1
-        self.assertTrue(np.allclose(result[32:], 2.0 * 1.0))
+        # Second block: scale * (10 - 8) = 2.0 * 2 = 4.0
+        self.assertTrue(np.allclose(result[32:], 2.0 * 2.0))
     
     def test_block_alignment(self):
         """Test that n_elements is properly aligned to block size."""
@@ -471,19 +472,19 @@ class TestRealWorldPatterns(unittest.TestCase):
     
     def test_mixed_scales_q4_0(self):
         """Test Q4_0 with varying scales across blocks."""
-        # 3 blocks with different scales
+        # 3 blocks with different scales, nibble=0xA (10 → signed +2)
         blocks = []
         scales = [0.1, 1.0, 10.0]
         
         for scale in scales:
             scale_bytes = struct.pack('<e', scale)
-            data_bytes = bytes([0x88] * 16)  # Middle value
+            data_bytes = bytes([0xAA] * 16)  # Nibble 0xA=10, signed=+2
             blocks.append(scale_bytes + data_bytes)
         
         data = b''.join(blocks)
         result = dequantize_q4_0(data, 96)
         
-        # Each block should have different magnitude
+        # Each block should have different magnitude: scale * 2
         self.assertLess(np.abs(result[0:32].mean()), np.abs(result[32:64].mean()))
         self.assertLess(np.abs(result[32:64].mean()), np.abs(result[64:96].mean()))
     

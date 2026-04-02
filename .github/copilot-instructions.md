@@ -2,7 +2,7 @@
 
 This document provides practical guidelines for working with the **Llaminar V2** LLM inference engine, including build processes, testing, debugging, and kernel / MPI / attention development best practices.
 
-**Architecture Note (V2)**: The active architecture is **Llaminar V2** in `src/v2/`, an operator-free, kernel-centric design with **GraphOrchestrator** as the sole execution path.
+**Architecture Note (V2)**: The active architecture is **Llaminar V2** in `src/v2/`, an operator-free, kernel-centric design with **DeviceGraphOrchestrator** (single-device) and **MultiDeviceOrchestrator** (multi-device TP/PP) as execution paths.
 
 - For a **high-level architecture map** of tensors, kernels, attention, MPI orchestration, and graph execution, see:
     - `.github/instructions/llaminar-architecture-v2.instructions.md`
@@ -21,7 +21,7 @@ This document provides practical guidelines for working with the **Llaminar V2**
 - [Stage Output Print Facility](#stage-output-print-facility)
 - [Parity Testing (PyTorch Reference)](#parity-testing-pytorch-reference)
 - [Kernel Development](#kernel-development)
-- [GPU Tensor Coherence](#gpu-tensor-coherence)
+- [Memory Management and Coherence](#memory-management-and-coherence)
 - [Weight Sharding and Tensor Parallelism](#weight-sharding-and-tensor-parallelism)
 - [MPI Development Best Practices](#mpi-development-best-practices)
 - [Performance Optimization](#performance-optimization)
@@ -36,15 +36,18 @@ This document provides practical guidelines for working with the **Llaminar V2**
 **Design Philosophy**: Operator-free, tensor-centric, kernel-oriented design with declarative graph execution.
 
 **Key Characteristics**:
-- **GraphOrchestrator**: Single execution path via declarative compute DAGs
+- **DeviceGraphOrchestrator / MultiDeviceOrchestrator**: Execution via declarative compute DAGs
 - **No Operator Layer**: Graph stages orchestrate kernels directly
+- **Model-Agnostic Graph System**: `GraphBuilderRegistry` and `SchemaFactoryRegistry` enable adding models without touching core infrastructure
+- **BufferArena + TransferEngine**: Central activation memory management with explicit coherence state tracking
 - **Per-Tensor Device Affinity**: Each tensor knows its device placement
 - **Heterogeneous Execution**: Designed to mix CPU, CUDA, ROCm via device backends
-- **Centralized Kernel Dispatch**: `KernelFactory` provides unified kernel creation with caching
 - **Automatic Weight Sharding**: Megatron-style tensor parallelism across MPI ranks
 
 **Execution Flow**:
-> **GraphOrchestrator** → builds **ComputeGraph** → **DeviceGraphExecutor** runs **ComputeStages** → stages use **KernelFactory** to get kernels → kernels operate on local buffers. MPI synchronization via **AllreduceStage** / **AllGatherStage**.
+> **DeviceGraphOrchestrator** → **IGraphBuilder** (e.g. `Qwen2Graph`) builds **ComputeGraph** → **DeviceGraphExecutor** runs **ComputeStages** via **StageRunPolicy** → **BufferArena** provides typed buffer views (**StageBoundBuffers**) → **TransferEngine** handles H2D/D2H movement → stages operate on local buffers. MPI synchronization via **AllreduceStage** / **AllGatherStage**.
+
+**Adding a New Model**: Create a graph builder + schema factory under `src/v2/models/<model>/`, register in `ModelRegistrations.cpp`. No core changes needed.
 
 See `.github/instructions/llaminar-architecture-v2.instructions.md` for a full-stack walkthrough.
 
@@ -1135,16 +1138,24 @@ class IQ4_NLTensor : public TensorBase, public ITensorGemmTileDataProvider {
 
 ### KernelFactory
 
-Centralized kernel creation with caching:
+`KernelFactory` (`src/v2/kernels/KernelFactory.h`) provides device-aware kernel dispatch and lifecycle management:
 
 ```cpp
-// Preferred: cached kernel (pack once, use many)
-ITensorGemm* gemm = KernelFactory::getOrCreateGemm(weight_tensor.get());
-gemm->multiply(activations, output, m, n, k);
+// Device type detection
+DeviceType dev = KernelFactory::getDeviceType(device_id);
 
-// Alternative: uncached (for one-off use)
-auto gemm = KernelFactory::createGemm(dynamic_cast<IQ4_NLTensor*>(tensor), DeviceType::CPU);
+// Prepared GEMM weights (pack once, use many)
+auto* prepared = KernelFactory::getOrCreatePreparedGemmWeights(tensor, device_id);
+auto* engine = KernelFactory::getOrCreateGemmEngine(prepared);
+
+// Multi-GPU: use ordinal guard for targeted device
+{
+    KernelFactory::CUDAOrdinalGuard guard(1); // Target CUDA device 1
+    auto* prepared = KernelFactory::getOrCreatePreparedGemmWeights(tensor, DeviceId::cuda(1));
+}
 ```
+
+**Note**: Graph builders (e.g., `Qwen2Graph`) configure stages with their kernels during graph construction. `KernelFactory` is primarily used during weight loading and preparation, not at stage execution time.
 
 ### SIMD Guidelines
 
@@ -1326,85 +1337,153 @@ If you attempt to borrow a register that's already borrowed, you get a detailed 
 
 ---
 
-## GPU Tensor Coherence
+## Memory Management and Coherence
 
 ### Overview
 
-Llaminar uses a **coherence protocol** to manage tensor data movement between host (CPU) and device (GPU) memory. This system:
-- Tracks whether tensor data is "dirty" on CPU or GPU
-- Automatically synchronizes data when needed
-- Provides both automatic (DeviceGraphExecutor) and manual (test/utility) patterns
+Llaminar V2 uses a layered memory management and coherence system for tensor data movement between host (CPU) and device (GPU) memory:
+
+1. **BufferArena** — Central activation/scratch buffer owner (single source of truth)
+2. **TransferEngine** — Stateless data movement dispatcher (H2D, D2H, P2P, BAR)
+3. **TensorCoherenceState** — Explicit state machine for per-tensor coherence tracking
+4. **StageBufferContract + StageBoundBuffers** — Declarative I/O with compile-time access control
+5. **StageRunPolicy** — Per-stage execution behavior (coherence, validation, profiling)
+
+Legacy utilities (`StageCoherence`, `GpuCoherence`) remain available for tests and direct kernel calls.
 
 **Key Files:**
-- `src/v2/tensors/TensorClasses.h` - `TensorBase` coherence methods (`ensureOnDevice()`, `mark_device_dirty()`, `ensureOnHost()`, `data()`)
-- `src/v2/execution/StageCoherence.h` - `StageCoherence` helper for DeviceGraphExecutor
-- `src/v2/execution/GpuCoherence.h` - RAII utilities for tests and direct kernel calls
+- `src/v2/memory/BufferArena.h` — Central arena that owns all activation/scratch buffers
+- `src/v2/memory/BufferId.h` — Typed buffer identifiers (enum, not strings)
+- `src/v2/memory/CoherenceTracker.h` — Per-buffer coherence state tracking
+- `src/v2/memory/StageBoundBuffers.h` — Immutable buffer view collection for stages
+- `src/v2/memory/StageBufferContract.h` — Declarative I/O specification for stages
+- `src/v2/memory/BufferAccess.h` — Template-based READ/WRITE/READWRITE access modes
+- `src/v2/transfer/TransferEngine.h` — Unified data movement (replaces per-tensor `ensureOnDevice` logic)
+- `src/v2/transfer/TransferMethod.h` — Transfer strategy enum (HOST_TO_DEVICE, BAR_HOST_BOUNCE, MAPPED_NOOP, etc.)
+- `src/v2/tensors/CoherenceState.h` — `TensorCoherenceState` enum and transition table
+- `src/v2/execution/local_execution/coherence/StageCoherence.h` — Automatic stage boundary coherence
+- `src/v2/execution/local_execution/coherence/GpuCoherence.h` — RAII utilities for tests
 
-### Coherence Protocol
+### TensorCoherenceState (State Machine)
 
-Every `TensorBase` tracks its coherence state:
+Every tensor tracks its coherence via `TensorCoherenceState` (in `src/v2/tensors/CoherenceState.h`):
 
-| State | Meaning | `data()` Returns |
-|-------|---------|------------------|
-| CPU is authoritative | Data was last modified on host | Host data directly |
-| GPU is authoritative | `mark_device_dirty()` was called | Syncs GPU→host first |
-| Never uploaded | No GPU buffer allocated | Host data directly |
+| State | Meaning |
+|-------|---------|
+| `HOST_ONLY` | Data exists only on host. No GPU buffer allocated. |
+| `HOST_AUTHORITATIVE` | Both exist, host was modified more recently. |
+| `DEVICE_AUTHORITATIVE` | Both exist, device was modified more recently. |
+| `SYNCED` | Both exist and are identical. |
+| `MAPPED` | Zero-copy mapped memory. Both always valid. |
 
-**Core Methods on TensorBase:**
+**Transition Table** (operations × current state):
+
+| Operation | HOST_ONLY | HOST_AUTH | DEVICE_AUTH | SYNCED | MAPPED |
+|-----------|-----------|-----------|-------------|--------|--------|
+| UPLOAD | SYNCED | SYNCED | SYNCED | SYNCED | MAPPED |
+| DOWNLOAD | HOST_ONLY | HOST_AUTH | HOST_AUTH | SYNCED | MAPPED |
+| MARK_DEVICE_DIRTY | ❌ | DEVICE_AUTH | DEVICE_AUTH | DEVICE_AUTH | MAPPED |
+| MUTABLE_HOST_ACCESS | HOST_ONLY | HOST_AUTH | HOST_AUTH | HOST_AUTH | MAPPED |
+| RELEASE_DEVICE | HOST_ONLY | HOST_AUTH | DEVICE_AUTH | SYNCED | MAPPED |
+
+This compile-time-verifiable transition table replaces the previous implicit boolean combination of flags.
+
+### BufferArena and Typed Buffers
+
+`BufferArena` owns all activation and scratch buffers. Stages access buffers through typed `BufferView<T, Access>` wrappers that enforce access control at compile time:
 
 ```cpp
-// Upload to GPU if needed (allocates buffer on first call)
-bool ensureOnDevice(DeviceId device);
+// BufferId — typed enum for buffer identification
+enum class BufferId : uint16_t {
+    HIDDEN_STATE, LOGITS, ATTN_OUTPUT, ATTN_Q, ATTN_K, ATTN_V,
+    FFN_GATE, FFN_UP, FFN_DOWN, RESIDUAL, /* ... */
+};
 
-// Mark GPU as having authoritative data (after GPU kernel writes)
-void mark_device_dirty();
-
-// Get host data pointer (syncs from GPU if device-dirty)
-const float* data();
-float* mutable_data();  // Also marks CPU as authoritative
+// Inside a stage — access via StageBoundBuffers (compile-time enforced)
+auto inp = buffers.input<float>(BufferId::HIDDEN_STATE);    // READ only
+auto out = buffers.output<Q8_1Block>(BufferId::ATTN_Q);     // WRITE only
+auto w = buffers.weight<Q8_1Block>(BufferId::WEIGHT_Q);     // READ only
 ```
+
+**Key design constraint**: Stages cannot call coherence APIs directly because `BufferView` doesn't expose them — data is already device-ready when the stage receives it.
+
+### StageBufferContract
+
+Each stage declares a `StageBufferContract` that specifies its I/O requirements:
+
+```cpp
+StageBufferContract contract;
+contract.addInput(BufferId::HIDDEN_STATE);
+contract.addOutput(BufferId::ATTN_Q, /*mark_dirty=*/true);
+contract.addWeight(BufferId::WEIGHT_Q);
+```
+
+The contract drives automatic coherence: the executor ensures inputs are on-device before execution and marks dirty outputs as device-authoritative after.
+
+### StageRunPolicy (Execution Behavior)
+
+`StageRunPolicy` (in `DeviceGraphExecutor.h`) controls per-stage execution behavior through a single parameterized loop:
+
+```cpp
+struct StageRunPolicy {
+    bool coherence = true;            // Arena contract-based input/output coherence
+    bool weight_coherence = true;     // Upload weights to device
+    bool mark_dirty = true;           // Mark outputs device-authoritative (ALWAYS ON)
+    bool validation = true;           // NaN/Inf output validation (Debug/Integration)
+    bool profiling = true;            // Per-stage timing breakdown
+    bool timeline = false;            // GPU event-based per-stage profiling
+
+    static StageRunPolicy full();       // Prefill, first execution
+    static StageRunPolicy fastDecode(); // Cached decode (minimal overhead)
+    static StageRunPolicy debug();      // Full + timeline + pointer validation
+};
+```
+
+All execution paths (full, fastDecode, debug) use the same `runStages()` loop parameterized by policy — no divergent code paths.
+
+### TransferEngine
+
+`TransferEngine` (`src/v2/transfer/TransferEngine.h`) is a stateless dispatcher that replaces per-tensor `ensureOnDevice()` logic:
+
+```cpp
+// Plan a transfer (pure function — fully testable)
+TransferMethod method = TransferEngine::planTransfer(src_descriptor, dst_device);
+
+// Execute the transfer
+TransferEngine::execute(method, tensor, device);
+```
+
+**Transfer Methods** (in `TransferMethod.h`):
+
+| Method | Description |
+|--------|-------------|
+| `NOOP` | Already on target device |
+| `HOST_TO_DEVICE` | Standard H2D upload |
+| `DEVICE_TO_HOST` | Standard D2H download |
+| `DEVICE_TO_DEVICE_SAME_BACKEND` | Same-vendor GPU transfer (peer DMA) |
+| `BAR_HOST_BOUNCE` | Cross-vendor via PCIe BAR with host staging |
+| `HOST_STAGED` | Via pinned host memory |
+| `MAPPED_NOOP` | Zero-copy mapped memory (no transfer needed) |
 
 ### Automatic Coherence (DeviceGraphExecutor)
 
-When using `DeviceGraphExecutor` (the standard inference path), **coherence is automatic**:
+When using `DeviceGraphExecutor` (the standard inference path), coherence is **automatic** and driven by `StageRunPolicy` + `StageBufferContract`:
 
-1. **Stage Entry**: `StageCoherence::ensureInputsOnDevice()` uploads all stage inputs
-2. **Stage Execution**: Kernel runs on GPU
-3. **Stage Exit**: `StageCoherence::markOutputsDirty()` marks outputs as device-authoritative
+1. **Stage Entry**: Contract inputs are ensured on-device (via `StageCoherence::ensureInputsOnDevice()`)
+2. **Stage Execution**: Kernel runs on GPU with `StageBoundBuffers` providing typed access
+3. **Stage Exit**: Contract outputs with `mark_dirty=true` are marked device-authoritative
 
-```cpp
-// DeviceGraphExecutor automatically handles this:
-void DeviceGraphExecutor::executeStage(const ComputeNode& node) {
-    // 1. Auto-cohere inputs to GPU
-    StageCoherence::ensureInputsOnDevice(node.stage, device_);
-    
-    // 2. Run the stage
-    node.stage->execute();
-    
-    // 3. Auto-mark outputs as GPU-authoritative
-    StageCoherence::markOutputsDirty(node.stage);
-}
-```
-
-**Stages declare their coherence policy** via `coherencePolicy()`:
-
-| Policy | Behavior |
-|--------|----------|
-| `FULL` (default) | Cohere inputs on entry, mark outputs dirty on exit |
-| `INPUT` | Only cohere inputs (outputs managed manually) |
-| `OUTPUT` | Only mark outputs dirty (inputs already on device) |
-| `NONE` | No automatic coherence (MPI stages, custom management) |
+The policy determines whether each step actually runs (e.g., `fastDecode()` skips coherence since buffers are already on-device from the previous iteration).
 
 ### Manual Coherence (Tests and Direct Kernel Calls)
 
-When calling kernels **directly** (bypassing DeviceGraphExecutor), you must handle coherence manually. Use the utilities in `execution/local_execution/coherence/GpuCoherence.h`:
+When calling kernels **directly** (bypassing DeviceGraphExecutor), use the RAII utilities in `execution/local_execution/coherence/GpuCoherence.h`:
 
 #### Preferred Pattern: `with_gpu_coherence()`
 
 ```cpp
 #include "execution/local_execution/coherence/GpuCoherence.h"
 
-// Clean, self-documenting pattern for kernel calls
 ASSERT_TRUE(with_gpu_coherence(
     gpu_device,
     {input.get()},                              // inputs to upload
@@ -1421,7 +1500,7 @@ ASSERT_TRUE(with_gpu_coherence(
 #### Alternative: RAII Wrappers
 
 ```cpp
-// For single outputs - wraps ensureOnDevice + mark_device_dirty
+// For single outputs
 {
     auto output = GpuOutput<FP32Tensor>(output_tensor.get(), gpu_device);
     kernel->multiply_tensor(input.get(), output.get(), M, N, K, ...);
@@ -1434,21 +1513,7 @@ ASSERT_TRUE(with_gpu_coherence(
 } // ← weights NOT marked dirty (read-only)
 ```
 
-#### C++20 Concept
-
-The utilities use a concept to ensure type safety:
-
-```cpp
-template <typename T>
-concept CoherableTensor = requires(T *t, DeviceId d) {
-    { t->ensureOnDevice(d) } -> std::same_as<bool>;
-    { t->mark_device_dirty() } -> std::same_as<void>;
-};
-```
-
 ### Anti-Pattern: Manual Coherence Without RAII
-
-Avoid manual `ensureOnDevice()` and `mark_device_dirty()` calls in tests:
 
 ```cpp
 // ❌ BAD - Easy to forget mark_device_dirty, leads to stale data
@@ -1469,7 +1534,7 @@ const float* result = output->data();  // Correctly syncs GPU→host
 
 | Context | Pattern |
 |---------|--------|
-| Pipeline stages (via DeviceGraphExecutor) | Automatic - do nothing special |
+| Pipeline stages (via DeviceGraphExecutor) | Automatic — driven by StageRunPolicy + StageBufferContract |
 | Integration tests calling kernels directly | `with_gpu_coherence()` lambda wrapper |
 | Simple single-output tests | `GpuOutput<T>` RAII wrapper |
 | Custom pipelines bypassing DeviceGraphExecutor | `GpuCoherenceScope` for fine-grained control |
@@ -1927,13 +1992,21 @@ LLAMINAR_TRACE_TRANSFERS_MIN_BYTES=1000000 \
 |-----------|---------|
 | `src/v2/inference/` | IInferenceRunner interface and factory |
 | `src/v2/execution/` | ComputeGraph, DeviceGraphExecutor, ComputeStages |
-| `src/v2/pipelines/qwen/` | GraphOrchestrator, Qwen2Graph, buffer specs |
+| `src/v2/execution/local_execution/graph/` | GraphBuilderRegistry, SchemaFactoryRegistry, IGraphBuilder, GraphSchema, ComputeGraph |
+| `src/v2/execution/local_execution/orchestrators/` | DeviceGraphOrchestrator, MultiDeviceOrchestrator |
+| `src/v2/execution/local_execution/coherence/` | StageCoherence, GpuCoherence, CrossDomainTransfer |
+| `src/v2/models/` | Model-specific graph builders, schema factories, ModelRegistrations |
+| `src/v2/models/qwen/` | Qwen2Graph, Qwen2Schema, Qwen2BufferSpec, Qwen2GraphConfigBuilder |
+| `src/v2/models/qwen3/` | Qwen3Schema (extends Qwen2 with per-head norm) |
+| `src/v2/memory/` | BufferArena, BufferId, CoherenceTracker, StageBoundBuffers, StageBufferContract |
+| `src/v2/transfer/` | TransferEngine, TransferMethod |
 | `src/v2/config/` | OrchestrationConfig, OrchestrationConfigParser (CLI/YAML parsing) |
 | `src/v2/kernels/cpu/` | CPU kernels (GEMM, attention, primitives) |
 | `src/v2/kernels/cpu/jit/` | JIT infrastructure (RegisterGuard, RegisterAllocation, JitMicrokernelBase) |
 | `src/v2/kernels/cpu/attention/q8_1/jit/` | JIT attention microkernels (Q8DotProduct, OnlineSoftmax, etc.) |
-| `src/v2/tensors/` | Tensor types (FP32, BF16, quantized) |
+| `src/v2/tensors/` | Tensor types (FP32, BF16, quantized), CoherenceState |
 | `src/v2/loaders/` | GGUF loading, WeightManager |
+| `src/v2/app/modes/` | ChatCompletionHandler, ServerMode, BenchmarkMode, InteractiveChatMode |
 | `src/v2/utils/` | MPIContext, MPITopology, Tokenizer, Sampler, logging |
 | `src/v2/cmake/` | CMake modules (EnforceTypedRegisters, etc.) |
 
