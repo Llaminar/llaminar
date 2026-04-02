@@ -165,6 +165,33 @@ namespace llaminar2
          */
         std::vector<std::string> getLeafNodes() const;
 
+        /**
+         * @brief Set the terminal node name for this graph
+         *
+         * Sub-graph builders (buildAttentionGraph, buildFFNGraph) set this to
+         * indicate which node is the logical output of the sub-graph. Callers
+         * use this instead of getLeafNodes() + name search.
+         *
+         * @param name Node name that represents the sub-graph's terminal output
+         */
+        void setTerminalNode(const std::string &name) { terminal_node_ = name; }
+
+        /**
+         * @brief Get the terminal node name
+         *
+         * Returns the terminal node set by setTerminalNode(), or falls back to
+         * getLeafNodes().front() if not explicitly set.
+         *
+         * @return Terminal node name, or empty string if graph is empty
+         */
+        std::string terminalNode() const
+        {
+            if (!terminal_node_.empty())
+                return terminal_node_;
+            auto leaves = getLeafNodes();
+            return leaves.empty() ? std::string{} : leaves.front();
+        }
+
         // =====================================================================
         // Fast Schedule — pre-computed flat array for zero-overhead decode loops
         // Eliminates string hash lookups, markCompleted calls, and virtual
@@ -197,6 +224,7 @@ namespace llaminar2
         mutable std::vector<std::string> cached_order_; ///< Cached topological order
         mutable bool order_dirty_ = true;               ///< Invalidated on graph mutation
         std::vector<FastScheduleEntry> fast_schedule_;   ///< Pre-computed decode schedule
+        std::string terminal_node_;                      ///< Explicit terminal node (set by sub-graph builders)
     };
 
 } // namespace llaminar2

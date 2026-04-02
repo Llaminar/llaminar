@@ -276,6 +276,13 @@ namespace llaminar2
                 tp_allreduce_precision[i] = (i < fp32_count) ? "fp32" : schema_default;
             }
         }
+
+        /// Returns true when activation precision is HybridQ16.
+        /// Replaces repeated InferenceMode(activation_precision).isHybridQ16() calls.
+        bool isHybridQ16() const
+        {
+            return activation_precision == ActivationPrecision::HybridQ16;
+        }
     };
 
     // =========================================================================

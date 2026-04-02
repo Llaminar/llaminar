@@ -453,6 +453,18 @@ namespace llaminar2
         StageSnapshotCallback snapshot_callback_;
 
         // =====================================================================
+        // Helpers: Schema-based graph building
+        // =====================================================================
+
+        /**
+         * @brief Build TensorContext for schema-based graph resolution
+         *
+         * Maps activation buffers, model weights, and layer weight accessors
+         * into a TensorContext for use by GraphResolver.
+         */
+        TensorContext buildTensorContext() const;
+
+        // =====================================================================
         // Helper: TP Allreduce Stage Creation
         // =====================================================================
         /**

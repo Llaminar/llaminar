@@ -12,8 +12,6 @@
 #include "Qwen2Graph.h"
 #include "../../utils/Logger.h"
 #include "../../utils/DebugEnv.h"
-#include "../../backends/ComputeBackend.h"
-#include "../../execution/config/InferenceMode.h"
 #include "../../tensors/TensorSlice.h"
 #include "../../tensors/Tensors.h"
 #include "../../utils/MPIContext.h"
@@ -30,7 +28,7 @@
 #include "../../execution/compute_stages/stages/FusedResidualNormStage.h"
 #include "../../config/PipelineConfig.h"
 #include "../../memory/BufferId.h" // Phase 2: contract BufferIds
-#include <algorithm>
+#include <chrono>
 #include <chrono>
 #include <cstring>
 #include <stdexcept>
@@ -250,7 +248,7 @@ namespace llaminar2
             ctx.batch_size, ctx.device);
 
         // Merge: attention -> FFN
-        std::string attn_last = "layer" + std::to_string(ctx.layer_idx) + "_attn_residual";
+        std::string attn_last = attn_graph.terminalNode();
         attn_graph.merge(std::move(ffn_graph), attn_last);
 
         return attn_graph;
@@ -290,9 +288,7 @@ namespace llaminar2
         // -------------------------------------------------------------------------
         // For HybridQ16 mode: output to Q16_1 residual buffer (the residual stream)
         // For other modes: output to FP32 current_hidden
-        InferenceMode full_pass_inference_mode(config_.activation_precision);
-        TensorBase *embed_output = buffers_.layer_buffers.residual &&
-                                           full_pass_inference_mode.isHybridQ16()
+        TensorBase *embed_output = (buffers_.layer_buffers.residual && config_.isHybridQ16())
                                        ? buffers_.layer_buffers.residual
                                        : buffers_.current_hidden;
 
@@ -346,23 +342,10 @@ namespace llaminar2
                 input.batch_size, input.kv_cache, position_ids, device,
                 input.sequence_lengths);
 
-            // Get the leaf node(s) of attention graph before merging
-            auto attn_leaves = attn_graph.getLeafNodes();
-            std::string attn_last;
-            if (!attn_leaves.empty())
-            {
-                std::string prefix = "layer" + std::to_string(layer) + "_";
-                attn_last = prefix + "attn_residual";
-                if (std::find(attn_leaves.begin(), attn_leaves.end(), attn_last) == attn_leaves.end())
-                {
-                    attn_last = attn_leaves.front();
-                }
-            }
-            else
-            {
-                // Fallback: use previous node if attention graph is empty
+            // Get the terminal node of attention sub-graph
+            std::string attn_last = attn_graph.terminalNode();
+            if (attn_last.empty())
                 attn_last = prev_node;
-            }
 
             // Merge attention graph, connecting to previous node
             graph.merge(std::move(attn_graph), prev_node);
@@ -372,29 +355,15 @@ namespace llaminar2
                 layer_weights, buffers_.layer_buffers, layer, input.seq_len,
                 input.batch_size, device);
 
-            // Get the leaf node(s) of FFN graph before merging (we need the last node)
-            auto ffn_leaves = ffn_graph.getLeafNodes();
-            std::string ffn_last;
-            if (!ffn_leaves.empty())
-            {
-                // Prefer ffn_residual if it exists, otherwise use first leaf
-                std::string prefix = "layer" + std::to_string(layer) + "_";
-                ffn_last = prefix + "ffn_residual";
-                if (std::find(ffn_leaves.begin(), ffn_leaves.end(), ffn_last) == ffn_leaves.end())
-                {
-                    ffn_last = ffn_leaves.front(); // Fall back to first leaf
-                }
-            }
-            else
-            {
-                // Fallback: use attention residual if FFN graph is empty
+            // Get the terminal node of FFN sub-graph
+            std::string ffn_last = ffn_graph.terminalNode();
+            if (ffn_last.empty())
                 ffn_last = attn_last;
-            }
 
-            // Merge FFN graph, connecting to attention residual
+            // Merge FFN graph, connecting to attention terminal
             graph.merge(std::move(ffn_graph), attn_last);
 
-            // Use the determined FFN leaf as the prev node for next layer
+            // Use the determined FFN terminal as the prev node for next layer
             prev_node = ffn_last;
         }
 
@@ -407,8 +376,7 @@ namespace llaminar2
         // Therefore final_norm must:
         //   1) read from the correct activation stream (residual for HybridQ16)
         //   2) write out-of-place into the FP32 normalized buffer
-        InferenceMode final_norm_mode(config_.activation_precision);
-        TensorBase *final_norm_input = (final_norm_mode.isHybridQ16() && buffers_.layer_buffers.residual)
+        TensorBase *final_norm_input = (config_.isHybridQ16() && buffers_.layer_buffers.residual)
                                            ? buffers_.layer_buffers.residual
                                            : buffers_.current_hidden;
 
@@ -556,9 +524,7 @@ namespace llaminar2
         {
             // For HybridQ16 mode: output to Q16_1 residual buffer (the residual stream)
             // For other modes: output to FP32 current_hidden
-            InferenceMode full_pass_inference_mode(config_.activation_precision);
-            TensorBase *embed_output = buffers_.layer_buffers.residual &&
-                                               full_pass_inference_mode.isHybridQ16()
+            TensorBase *embed_output = (buffers_.layer_buffers.residual && config_.isHybridQ16())
                                            ? buffers_.layer_buffers.residual
                                            : buffers_.current_hidden;
 
@@ -585,9 +551,7 @@ namespace llaminar2
             // previous PP stage. We need to copy it to our working buffer if
             // they're different.
             // -----------------------------------------------------------------
-            InferenceMode full_pass_inference_mode(config_.activation_precision);
-            TensorBase *working_buffer = buffers_.layer_buffers.residual &&
-                                                 full_pass_inference_mode.isHybridQ16()
+            TensorBase *working_buffer = (buffers_.layer_buffers.residual && config_.isHybridQ16())
                                              ? buffers_.layer_buffers.residual
                                              : buffers_.current_hidden;
 
@@ -601,7 +565,7 @@ namespace llaminar2
                 // proper graph-based memory transfer with device awareness.
 
                 size_t copy_bytes = static_cast<size_t>(total_tokens * config_.d_model);
-                if (full_pass_inference_mode.isHybridQ16())
+                if (config_.isHybridQ16())
                 {
                     // Q16_1: copy the raw Q16_1 blocks
                     // Block size = 32 elements, so num_blocks = copy_elements / 32
@@ -674,23 +638,10 @@ namespace llaminar2
                 input.batch_size, input.kv_cache, position_ids, device,
                 input.sequence_lengths);
 
-            // Get the leaf node(s) of attention graph before merging
-            auto attn_leaves = attn_graph.getLeafNodes();
-            std::string attn_last;
-            if (!attn_leaves.empty())
-            {
-                std::string prefix = "layer" + std::to_string(layer) + "_";
-                attn_last = prefix + "attn_residual";
-                if (std::find(attn_leaves.begin(), attn_leaves.end(), attn_last) == attn_leaves.end())
-                {
-                    attn_last = attn_leaves.front();
-                }
-            }
-            else
-            {
-                // Fallback: use previous node if attention graph is empty
+            // Get the terminal node of attention sub-graph
+            std::string attn_last = attn_graph.terminalNode();
+            if (attn_last.empty())
                 attn_last = prev_node;
-            }
 
             // Merge attention graph, connecting to previous node
             if (!prev_node.empty())
@@ -713,28 +664,15 @@ namespace llaminar2
                 layer_weights, buffers_.layer_buffers, layer, input.seq_len,
                 input.batch_size, device);
 
-            // Get the leaf node(s) of FFN graph before merging
-            auto ffn_leaves = ffn_graph.getLeafNodes();
-            std::string ffn_last;
-            if (!ffn_leaves.empty())
-            {
-                std::string prefix = "layer" + std::to_string(layer) + "_";
-                ffn_last = prefix + "ffn_residual";
-                if (std::find(ffn_leaves.begin(), ffn_leaves.end(), ffn_last) == ffn_leaves.end())
-                {
-                    ffn_last = ffn_leaves.front();
-                }
-            }
-            else
-            {
-                // Fallback: use attention residual if FFN graph is empty
+            // Get the terminal node of FFN sub-graph
+            std::string ffn_last = ffn_graph.terminalNode();
+            if (ffn_last.empty())
                 ffn_last = attn_last;
-            }
 
-            // Merge FFN graph, connecting to attention residual
+            // Merge FFN graph, connecting to attention terminal
             graph.merge(std::move(ffn_graph), attn_last);
 
-            // Use the determined FFN leaf as the prev node for next layer
+            // Use the determined FFN terminal as the prev node for next layer
             prev_node = ffn_last;
         }
 
@@ -744,8 +682,7 @@ namespace llaminar2
         if (has_lm_head)
         {
             // Final RMSNorm
-            InferenceMode final_norm_mode(config_.activation_precision);
-            TensorBase *final_norm_input = (final_norm_mode.isHybridQ16() && buffers_.layer_buffers.residual)
+            TensorBase *final_norm_input = (config_.isHybridQ16() && buffers_.layer_buffers.residual)
                                                ? buffers_.layer_buffers.residual
                                                : buffers_.current_hidden;
 
@@ -809,8 +746,7 @@ namespace llaminar2
         {
             // Non-final PP stage: output hidden states directly
             // The residual buffer contains the hidden states after the last layer
-            InferenceMode mode(config_.activation_precision);
-            output.hidden = (mode.isHybridQ16() && buffers_.layer_buffers.residual)
+            output.hidden = (config_.isHybridQ16() && buffers_.layer_buffers.residual)
                                 ? buffers_.layer_buffers.residual
                                 : buffers_.current_hidden;
             output.logits = nullptr;
@@ -875,9 +811,6 @@ namespace llaminar2
             LOG_DEBUG("[Qwen2Graph] Position IDs built internally for unified PP graph");
         }
 
-        // Inference mode for buffer selection
-        InferenceMode inference_mode(config_.activation_precision);
-
         // =====================================================================
         // 3. Iterate over PP stages
         // =====================================================================
@@ -928,7 +861,7 @@ namespace llaminar2
                 // For HybridQ16 mode: output to Q16_1 residual buffer
                 // For other modes: output to FP32 current_hidden
                 TensorBase *embed_output = buffers_.layer_buffers.residual &&
-                                                   inference_mode.isHybridQ16()
+                                                   config_.isHybridQ16()
                                                ? buffers_.layer_buffers.residual
                                                : buffers_.current_hidden;
 
@@ -952,16 +885,25 @@ namespace llaminar2
             // -----------------------------------------------------------------
             // 3c. Build layers for this PP stage
             // -----------------------------------------------------------------
-            // Temporarily override config_.default_device for layer building
-            // This ensures all stages in the layer use the correct device
-            DeviceId original_device = config_.default_device;
-            ILocalTPContext *original_tp_ctx = config_.local_tp_ctx;
-
-            config_.default_device = stage_device;
-            if (stage_tp_ctx)
+            // RAII guard for config overrides — ensures exception-safe restoration
+            struct ConfigGuard
             {
-                config_.local_tp_ctx = stage_tp_ctx;
-            }
+                GraphConfig &cfg;
+                DeviceId original_device;
+                ILocalTPContext *original_tp_ctx;
+                ConfigGuard(GraphConfig &c, DeviceId dev, ILocalTPContext *tp)
+                    : cfg(c), original_device(c.default_device), original_tp_ctx(c.local_tp_ctx)
+                {
+                    cfg.default_device = dev;
+                    if (tp)
+                        cfg.local_tp_ctx = tp;
+                }
+                ~ConfigGuard()
+                {
+                    cfg.default_device = original_device;
+                    cfg.local_tp_ctx = original_tp_ctx;
+                }
+            } config_guard(config_, stage_device, stage_tp_ctx);
 
             for (int layer = pp_stage.first_layer; layer < pp_stage.last_layer; ++layer)
             {
@@ -977,22 +919,10 @@ namespace llaminar2
                     input.batch_size, layer_kv_cache, position_ids, stage_device,
                     input.sequence_lengths);
 
-                // Get the leaf node of attention graph
-                auto attn_leaves = attn_graph.getLeafNodes();
-                std::string attn_last;
-                if (!attn_leaves.empty())
-                {
-                    std::string prefix = "layer" + std::to_string(layer) + "_";
-                    attn_last = prefix + "attn_residual";
-                    if (std::find(attn_leaves.begin(), attn_leaves.end(), attn_last) == attn_leaves.end())
-                    {
-                        attn_last = attn_leaves.front();
-                    }
-                }
-                else
-                {
+                // Get the terminal node of attention sub-graph
+                std::string attn_last = attn_graph.terminalNode();
+                if (attn_last.empty())
                     attn_last = prev_node;
-                }
 
                 // Merge attention graph
                 if (!prev_node.empty())
@@ -1009,22 +939,10 @@ namespace llaminar2
                     layer_weights, buffers_.layer_buffers, layer, input.seq_len,
                     input.batch_size, stage_device);
 
-                // Get the leaf node of FFN graph
-                auto ffn_leaves = ffn_graph.getLeafNodes();
-                std::string ffn_last;
-                if (!ffn_leaves.empty())
-                {
-                    std::string prefix = "layer" + std::to_string(layer) + "_";
-                    ffn_last = prefix + "ffn_residual";
-                    if (std::find(ffn_leaves.begin(), ffn_leaves.end(), ffn_last) == ffn_leaves.end())
-                    {
-                        ffn_last = ffn_leaves.front();
-                    }
-                }
-                else
-                {
+                // Get the terminal node of FFN sub-graph
+                std::string ffn_last = ffn_graph.terminalNode();
+                if (ffn_last.empty())
                     ffn_last = attn_last;
-                }
 
                 // Merge FFN graph
                 graph.merge(std::move(ffn_graph), attn_last);
@@ -1032,9 +950,7 @@ namespace llaminar2
                 prev_node = ffn_last;
             }
 
-            // Restore original config
-            config_.default_device = original_device;
-            config_.local_tp_ctx = original_tp_ctx;
+            // ConfigGuard restores config_ automatically at scope exit
 
             // -----------------------------------------------------------------
             // 3d. Insert PP transfer stage if not the last PP stage
@@ -1061,7 +977,7 @@ namespace llaminar2
                 }
 
                 // Get the hidden state buffer for transfer
-                TensorBase *hidden_state = (inference_mode.isHybridQ16() && buffers_.layer_buffers.residual)
+                TensorBase *hidden_state = (config_.isHybridQ16() && buffers_.layer_buffers.residual)
                                                ? buffers_.layer_buffers.residual
                                                : buffers_.current_hidden;
 
@@ -1102,7 +1018,7 @@ namespace llaminar2
                 }
 
                 // Final RMSNorm
-                TensorBase *final_norm_input = (inference_mode.isHybridQ16() && buffers_.layer_buffers.residual)
+                TensorBase *final_norm_input = (config_.isHybridQ16() && buffers_.layer_buffers.residual)
                                                    ? buffers_.layer_buffers.residual
                                                    : buffers_.current_hidden;
 
@@ -1189,39 +1105,8 @@ namespace llaminar2
         // =====================================================================
         // Step 2: Build runtime configuration
         // =====================================================================
-        GraphResolverConfig config;
-
-        // MPI / Tensor Parallelism
-        config.world_size = mpi_ctx_ ? mpi_ctx_->world_size() : 1;
-        config.rank = mpi_ctx_ ? mpi_ctx_->rank() : 0;
-        config.mpi_ctx = mpi_ctx_.get();
-
-        // Execution dimensions
+        GraphResolverConfig config = getResolverConfig(input.seq_len);
         config.batch_size = input.batch_size;
-        config.seq_len = input.seq_len;
-        config.default_device = config_.default_device;
-
-        // Model dimensions
-        config.n_layers = config_.n_layers;
-        config.d_model = config_.d_model;
-        config.n_heads = config_.n_heads;
-        config.n_kv_heads = config_.n_kv_heads;
-        config.head_dim = config_.head_dim;
-        config.d_ff = config_.d_ff;
-        config.vocab_size = config_.vocab_size;
-
-        // TP-adjusted dimensions
-        config.local_n_heads = config_.qkv_column_parallel ? config_.local_n_heads : config_.n_heads;
-        config.local_n_kv_heads = config_.qkv_column_parallel ? config_.local_n_kv_heads : config_.n_kv_heads;
-        config.local_d_ff = config_.ffn_column_parallel ? config_.d_ff_local : config_.d_ff;
-        config.local_vocab = config_.lm_head_column_parallel ? config_.vocab_local : config_.vocab_size;
-
-        // Model parameters
-        config.rms_norm_eps = config_.rms_norm_eps;
-        config.rope_theta = config_.rope_theta;
-
-        // Phase 5.4: VNNI-safe Q16 KV cache scale
-        config.kv_cache_scale = config_.kv_cache_scale;
 
         // KV cache state
         config.has_kv_cache = (input.kv_cache != nullptr);
@@ -1236,62 +1121,7 @@ namespace llaminar2
         // =====================================================================
         // Step 3: Build TensorContext for name → tensor resolution
         // =====================================================================
-        TensorContext tensors;
-
-        // Activation buffers
-        tensors.buffers["hidden"] = buffers_.current_hidden;
-        tensors.buffers["normalized"] = buffers_.layer_buffers.normalized;
-        tensors.buffers["Q"] = buffers_.layer_buffers.Q;
-        tensors.buffers["K"] = buffers_.layer_buffers.K;
-        tensors.buffers["V"] = buffers_.layer_buffers.V;
-        tensors.buffers["attn_output"] = buffers_.layer_buffers.attn_output;
-        tensors.buffers["attn_proj"] = buffers_.layer_buffers.attn_proj;
-        tensors.buffers["gate"] = buffers_.layer_buffers.gate;
-        tensors.buffers["up"] = buffers_.layer_buffers.up;
-        tensors.buffers["logits"] = buffers_.logits;
-        tensors.buffers["logits_local"] = buffers_.logits_local;
-
-        // Model-level weights
-        tensors.model_weights["embedding_table"] = weights_.embedding_table;
-        tensors.model_weights["final_norm"] = weights_.final_norm;
-        tensors.model_weights["lm_head"] = weights_.lm_head;
-
-        // Layer weight accessor
-        tensors.get_layer_weight = [this](int layer_idx, const std::string &name) -> TensorBase *
-        {
-            if (!weights_.get_layer_weights)
-                return nullptr;
-
-            LayerWeights layer = weights_.get_layer_weights(layer_idx);
-
-            if (name == "wq")
-                return layer.wq;
-            if (name == "wk")
-                return layer.wk;
-            if (name == "wv")
-                return layer.wv;
-            if (name == "wo")
-                return layer.wo;
-            if (name == "attn_norm")
-                return layer.attn_norm;
-            if (name == "q_bias")
-                return layer.q_bias;
-            if (name == "k_bias")
-                return layer.k_bias;
-            if (name == "v_bias")
-                return layer.v_bias;
-            if (name == "gate_proj")
-                return layer.gate_proj;
-            if (name == "up_proj")
-                return layer.up_proj;
-            if (name == "down_proj")
-                return layer.down_proj;
-            if (name == "ffn_norm")
-                return layer.ffn_norm;
-
-            LOG_WARN("[TensorContext] Unknown layer weight: " << name);
-            return nullptr;
-        };
+        TensorContext tensors = buildTensorContext();
 
         // =====================================================================
         // Step 4: Resolve schema to concrete graph spec
@@ -1495,7 +1325,6 @@ namespace llaminar2
         const std::vector<int> *sequence_lengths)
     {
         ComputeGraph graph;
-        const auto &env = debugEnv();
         std::string prefix = "layer" + std::to_string(layer_idx) + "_";
 
         // Total tokens for GEMM m dimension = batch_size * seq_len
@@ -1511,25 +1340,11 @@ namespace llaminar2
                                                      << " sequence_lengths=" << (sequence_lengths ? "valid" : "nullptr")
                                                      << (sequence_lengths ? " size=" + std::to_string(sequence_lengths->size()) : ""));
 
-        // Determine backend type for stage creation from DeviceId
-        ComputeBackendType backend = ComputeBackendType::CPU;
-        if (device.is_cuda())
-        {
-            backend = ComputeBackendType::GPU_CUDA;
-        }
-        else if (device.is_rocm())
-        {
-            backend = ComputeBackendType::GPU_ROCM;
-        }
-
         // Stage 1: Pre-attention RMSNorm
         // Non-first layers: Fused ResidualAdd + RMSNorm (previous layer's ffn output + this norm)
         // First layer: standalone RMSNorm (no prior residual to fuse)
-        if (env.execution.exec_rmsnorm)
         {
-            InferenceMode inference_mode(config_.activation_precision);
-
-            if (!inference_mode.isHybridQ16() && layer_idx > config_.pp_layer_offset)
+            if (!config_.isHybridQ16() && layer_idx > config_.pp_layer_offset)
             {
                 // Non-first layers: Fused ResidualAdd + RMSNorm
                 // Combines previous layer's ffn_residual with this layer's attn_norm
@@ -1571,7 +1386,8 @@ namespace llaminar2
         }
 
         // Stage 2: Q/K/V projections using FusedQKVGEMMStage
-        if (env.execution.exec_gemm && layer.wq && layer.wk && layer.wv)
+        const bool has_qkv_proj = (layer.wq && layer.wk && layer.wv);
+        if (has_qkv_proj)
         {
             LOG_DEBUG("[Qwen2Graph] Using FusedQKVGEMMStage");
 
@@ -1612,10 +1428,7 @@ namespace llaminar2
                           ComputeStageFactory::createFusedQKVGEMM(qkv_params),
                           device);
 
-            if (env.execution.exec_rmsnorm)
-            {
-                graph.addDependency(prefix + "qkv_proj", prefix + "attn_norm");
-            }
+            graph.addDependency(prefix + "qkv_proj", prefix + "attn_norm");
         }
 
         // =================================================================
@@ -1637,9 +1450,6 @@ namespace llaminar2
             local_n_heads = config_.n_heads;
         if (local_n_kv_heads <= 0)
             local_n_kv_heads = config_.n_kv_heads;
-
-        // Create InferenceMode for centralized mode logic
-        InferenceMode inference_mode(config_.activation_precision);
 
         // Stage 2.5: Per-head QK RMSNorm (Qwen3)
         // Applied to Q and K projections independently before RoPE.
@@ -1665,7 +1475,7 @@ namespace llaminar2
                           ComputeStageFactory::createQKNorm(q_norm_params),
                           device);
 
-            if (env.execution.exec_gemm && layer.wq)
+            if (has_qkv_proj)
             {
                 graph.addDependency(prefix + "q_norm", prefix + "qkv_proj");
             }
@@ -1687,14 +1497,13 @@ namespace llaminar2
                           ComputeStageFactory::createQKNorm(k_norm_params),
                           device);
 
-            if (env.execution.exec_gemm && layer.wk)
+            if (has_qkv_proj)
             {
                 graph.addDependency(prefix + "k_norm", prefix + "qkv_proj");
             }
         }
 
         // Stage 3: RoPE on Q and K
-        if (env.execution.exec_rope)
         {
             // For batched execution, pass the full position_ids array
             // This enables correct per-token position encoding for variable-length sequences
@@ -1722,18 +1531,15 @@ namespace llaminar2
                           ComputeStageFactory::createRoPE(rope_params),
                           device);
 
-            if (env.execution.exec_gemm)
+            // If QK norms are present, RoPE depends on norms (which depend on qkv_proj)
+            if (layer.q_norm && layer.k_norm)
             {
-                // If QK norms are present, RoPE depends on norms (which depend on qkv_proj)
-                if (layer.q_norm && layer.k_norm)
-                {
-                    graph.addDependency(prefix + "rope", prefix + "q_norm");
-                    graph.addDependency(prefix + "rope", prefix + "k_norm");
-                }
-                else
-                {
-                    graph.addDependency(prefix + "rope", prefix + "qkv_proj");
-                }
+                graph.addDependency(prefix + "rope", prefix + "q_norm");
+                graph.addDependency(prefix + "rope", prefix + "k_norm");
+            }
+            else if (has_qkv_proj)
+            {
+                graph.addDependency(prefix + "rope", prefix + "qkv_proj");
             }
         }
 
@@ -1741,11 +1547,10 @@ namespace llaminar2
         // NOTE: Decomposed attention (Phase 9) is now the ONLY supported path.
         // Legacy AttentionWithKVCacheStage has been removed (Phase 7 cleanup).
         std::string wo_producer_node;
-        if (env.execution.exec_attention)
+
+        // Phase 9 Decomposed Path: KVCacheAppendStage + AttentionComputeStage
+        if (kv_cache)
         {
-            // Phase 9 Decomposed Path: KVCacheAppendStage + AttentionComputeStage
-            if (kv_cache)
-            {
                 // For batched execution, K/V are [batch_size * seq_len, kv_dim]
                 // Each sequence's K/V is appended to its own seq_idx in the cache
                 int total_tokens = batch_size * seq_len;
@@ -1774,23 +1579,16 @@ namespace llaminar2
                               ComputeStageFactory::createKVCacheAppend(kv_append_params),
                               device);
 
-                if (env.execution.exec_rope && !config_.rope_on_read)
+                if (!config_.rope_on_read)
                 {
                     // Standard mode: K needs RoPE before caching
                     graph.addDependency(prefix + "kv_append", prefix + "rope");
                 }
-                else if (env.execution.exec_rope && config_.rope_on_read)
+                else
                 {
-                    // RoPE-on-read: K stored pre-RoPE, but Q still needs RoPE
-                    // KV append depends on RoPE only because RoPE and QKV share buffers
-                    // (RoPE modifies Q in-place), and we need QKV proj done first.
-                    // Since V comes from qkv_proj and Q is modified by rope, depend on rope
-                    // to ensure Q is RoPE'd before attention can run (attention depends on kv_append).
-                    graph.addDependency(prefix + "kv_append", prefix + "qkv_proj");
-                }
-                else if (env.execution.exec_gemm)
-                {
-                    graph.addDependency(prefix + "kv_append", prefix + "qkv_proj");
+                    // RoPE-on-read: K stored pre-RoPE, depend on QKV projection
+                    if (has_qkv_proj)
+                        graph.addDependency(prefix + "kv_append", prefix + "qkv_proj");
                 }
             }
 
@@ -1872,7 +1670,6 @@ namespace llaminar2
             }
 
             // Decomposed Path: Attention -> Wo projection
-            if (env.execution.exec_attention)
             {
                 AttentionMode mode = detect_attention_mode(batch_size, seq_len, kv_len);
                 LOG_TRACE("[Qwen2Graph] Layer " << layer_idx
@@ -1928,16 +1725,14 @@ namespace llaminar2
                     graph.addDependency(prefix + "attention", prefix + "kv_gather");
                 else if (kv_cache)
                     graph.addDependency(prefix + "attention", prefix + "kv_append");
-                else if (env.execution.exec_rope)
+                else
                     graph.addDependency(prefix + "attention", prefix + "rope");
-                else if (env.execution.exec_gemm)
-                    graph.addDependency(prefix + "attention", prefix + "qkv_proj");
 
                 LOG_DEBUG("[Qwen2Graph] Using decomposed attention path");
             }
 
             // Stage 5: Output projection (Wo)
-            if (env.execution.exec_gemm && layer.wo)
+            if (layer.wo)
             {
                 int wo_n = static_cast<int>(layer.wo->shape()[0]);
                 int wo_k = static_cast<int>(layer.wo->shape()[1]);
@@ -1966,14 +1761,11 @@ namespace llaminar2
                                       .c_buffer_id = BufferId::ATTN_PROJ}),
                               device);
 
-                if (env.execution.exec_attention)
-                {
-                    graph.addDependency(wo_producer_node, prefix + "attention");
-                }
+                graph.addDependency(wo_producer_node, prefix + "attention");
             }
 
             // Common AllReduce for Wo
-            if (env.execution.exec_gemm && layer.wo && !wo_producer_node.empty())
+            if (layer.wo && !wo_producer_node.empty())
             {
                 bool wo_is_sharded = isRowParallelSharded(layer.wo);
 
@@ -2000,11 +1792,11 @@ namespace llaminar2
                     }
                 }
             }
-        }
 
         // Attention residual is now fused into FusedResidualNormStage in buildFFNGraph
         // (for non-first layers) or handled by the first layer's standalone RMSNorm path.
 
+        graph.setTerminalNode(wo_producer_node);
         return graph;
     }
 
@@ -2017,27 +1809,15 @@ namespace llaminar2
         DeviceId device)
     {
         ComputeGraph graph;
-        const auto &env = debugEnv();
         std::string prefix = "layer" + std::to_string(layer_idx) + "_";
+        std::string ffn_terminal; // Track the last node for terminalNode()
 
         // Compute total tokens for GEMM m parameter
         int total_tokens = batch_size * seq_len;
 
-        // Determine backend type from DeviceId
-        ComputeBackendType backend = ComputeBackendType::CPU;
-        if (device.is_cuda())
-        {
-            backend = ComputeBackendType::GPU_CUDA;
-        }
-        else if (device.is_rocm())
-        {
-            backend = ComputeBackendType::GPU_ROCM;
-        }
-
         // Stage 1: Pre-FFN RMSNorm (fused with attention residual add)
         // Combines the attention output residual add with FFN normalization.
         // On GPU: single fused kernel. On CPU: sequential ResidualAdd + RMSNorm via KernelFactory.
-        if (env.execution.exec_rmsnorm)
         {
             FusedResidualNormStage::Params fused_params;
             fused_params.device_id = device;
@@ -2055,10 +1835,12 @@ namespace llaminar2
             graph.addNode(prefix + "ffn_norm",
                           ComputeStageFactory::createFusedResidualNorm(fused_params),
                           device);
+            ffn_terminal = prefix + "ffn_norm";
         }
 
         // Stage 2: Gate and Up projections using FusedGateUpGEMMStage
-        if (env.execution.exec_gemm && layer.gate_proj && layer.up_proj)
+        const bool has_gate_up = (layer.gate_proj && layer.up_proj);
+        if (has_gate_up)
         {
             LOG_DEBUG("[Qwen2Graph] FFN using FusedGateUpGEMMStage");
 
@@ -2086,10 +1868,7 @@ namespace llaminar2
                           ComputeStageFactory::createFusedGateUpGEMM(gate_up_params),
                           device);
 
-            if (env.execution.exec_rmsnorm)
-            {
-                graph.addDependency(prefix + "gate_up_proj", prefix + "ffn_norm");
-            }
+            graph.addDependency(prefix + "gate_up_proj", prefix + "ffn_norm");
         }
 
         // Stage 3: SwiGLU activation
@@ -2099,7 +1878,8 @@ namespace llaminar2
         const bool swiglu_fusion = true;
 
         // Stage 4: Down projection
-        if (env.execution.exec_gemm && layer.down_proj)
+        const bool has_down_proj = (layer.down_proj != nullptr);
+        if (has_down_proj)
         {
             int down_n = static_cast<int>(layer.down_proj->shape()[0]);
             int down_k = static_cast<int>(layer.down_proj->shape()[1]);
@@ -2120,7 +1900,7 @@ namespace llaminar2
                 .c_buffer_id = BufferId::ATTN_PROJ};
 
             // SwiGLU fusion: pass gate buffer to GEMM for fused silu(gate)*up + GEMM
-            if (swiglu_fusion && env.execution.exec_swiglu)
+            if (swiglu_fusion)
             {
                 down_params.gate_input = buffers.gate;
                 down_params.do_swiglu = true;
@@ -2129,18 +1909,12 @@ namespace llaminar2
             graph.addNode(prefix + "down_proj",
                           ComputeStageFactory::createGEMM(down_params),
                           device);
+            ffn_terminal = prefix + "down_proj";
 
-            if (swiglu_fusion || !env.execution.exec_swiglu)
+            // SwiGLU is always fused into GEMM: down_proj depends directly on gate_up_proj
+            if (has_gate_up)
             {
-                // SwiGLU fused into GEMM or disabled: down_proj depends directly on gate_up_proj
-                if (env.execution.exec_gemm)
-                {
-                    graph.addDependency(prefix + "down_proj", prefix + "gate_up_proj");
-                }
-            }
-            else if (env.execution.exec_swiglu)
-            {
-                graph.addDependency(prefix + "down_proj", prefix + "swiglu");
+                graph.addDependency(prefix + "down_proj", prefix + "gate_up_proj");
             }
 
             bool down_is_row_sharded = isRowParallelSharded(layer.down_proj);
@@ -2162,6 +1936,7 @@ namespace llaminar2
                 {
                     graph.addNode(stage_name, std::move(allreduce_stage), device);
                     graph.addDependency(stage_name, prefix + "down_proj");
+                    ffn_terminal = stage_name;
                 }
             }
         }
@@ -2170,7 +1945,7 @@ namespace llaminar2
         // Non-last layers: Skip - fused into next layer's FusedResidualNormStage attn_norm
         // Last layer must keep ffn_residual since final_norm doesn't include residual add
         const bool skip_ffn_residual = (layer_idx < config_.pp_layer_offset + config_.n_layers - 1);
-        if (env.execution.exec_residual && !skip_ffn_residual)
+        if (!skip_ffn_residual)
         {
             ResidualAddStage::Params res_params;
             res_params.device_id = device;
@@ -2185,8 +1960,9 @@ namespace llaminar2
             graph.addNode(prefix + "ffn_residual",
                           ComputeStageFactory::createResidualAdd(res_params),
                           device);
+            ffn_terminal = prefix + "ffn_residual";
 
-            if (env.execution.exec_gemm && layer.down_proj)
+            if (has_down_proj)
             {
                 bool down_is_row_sharded = isRowParallelSharded(layer.down_proj);
                 bool needs_allreduce = (down_is_row_sharded || config_.ffn_column_parallel);
@@ -2202,6 +1978,7 @@ namespace llaminar2
             }
         }
 
+        graph.setTerminalNode(ffn_terminal);
         return graph;
     }
 
@@ -2228,6 +2005,68 @@ namespace llaminar2
     {
         Qwen2SchemaFactory factory;
         return factory.createSchema();
+    }
+
+    TensorContext Qwen2Graph::buildTensorContext() const
+    {
+        TensorContext tensors;
+
+        // Activation buffers
+        tensors.buffers["hidden"] = buffers_.current_hidden;
+        tensors.buffers["normalized"] = buffers_.layer_buffers.normalized;
+        tensors.buffers["Q"] = buffers_.layer_buffers.Q;
+        tensors.buffers["K"] = buffers_.layer_buffers.K;
+        tensors.buffers["V"] = buffers_.layer_buffers.V;
+        tensors.buffers["attn_output"] = buffers_.layer_buffers.attn_output;
+        tensors.buffers["attn_proj"] = buffers_.layer_buffers.attn_proj;
+        tensors.buffers["gate"] = buffers_.layer_buffers.gate;
+        tensors.buffers["up"] = buffers_.layer_buffers.up;
+        tensors.buffers["logits"] = buffers_.logits;
+        tensors.buffers["logits_local"] = buffers_.logits_local;
+
+        // Model-level weights
+        tensors.model_weights["embedding_table"] = weights_.embedding_table;
+        tensors.model_weights["final_norm"] = weights_.final_norm;
+        tensors.model_weights["lm_head"] = weights_.lm_head;
+
+        // Layer weight accessor
+        tensors.get_layer_weight = [this](int layer_idx, const std::string &name) -> TensorBase *
+        {
+            if (!weights_.get_layer_weights)
+                return nullptr;
+
+            LayerWeights layer = weights_.get_layer_weights(layer_idx);
+
+            if (name == "wq")
+                return layer.wq;
+            if (name == "wk")
+                return layer.wk;
+            if (name == "wv")
+                return layer.wv;
+            if (name == "wo")
+                return layer.wo;
+            if (name == "attn_norm")
+                return layer.attn_norm;
+            if (name == "q_bias")
+                return layer.q_bias;
+            if (name == "k_bias")
+                return layer.k_bias;
+            if (name == "v_bias")
+                return layer.v_bias;
+            if (name == "gate_proj")
+                return layer.gate_proj;
+            if (name == "up_proj")
+                return layer.up_proj;
+            if (name == "down_proj")
+                return layer.down_proj;
+            if (name == "ffn_norm")
+                return layer.ffn_norm;
+
+            LOG_WARN("[TensorContext] Unknown layer weight: " << name);
+            return nullptr;
+        };
+
+        return tensors;
     }
 
     GraphResolverConfig Qwen2Graph::getResolverConfig(int seq_len) const
