@@ -112,8 +112,12 @@ class AttentionSnapshotCapture:
             cos, sin = self.model.model.rotary_emb(dummy_hidden, position_ids)
             
             # Apply rotary embeddings
+            # NOTE: transformers 5.x changed apply_rotary_pos_emb signature:
+            #   Old (4.x): apply_rotary_pos_emb(q, k, cos, sin, position_ids)
+            #   New (5.x): apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1)
+            # In 5.x, cos/sin are already position-indexed by rotary_emb().
             from transformers.models.qwen2.modeling_qwen2 import apply_rotary_pos_emb
-            q_rope, k_rope = apply_rotary_pos_emb(q, k, cos, sin, position_ids)
+            q_rope, k_rope = apply_rotary_pos_emb(q, k, cos, sin)
             
             return q_rope, k_rope
         else:

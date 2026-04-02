@@ -164,8 +164,12 @@ class PipelineStageCapture:
                     value_states = value_states.view(bsz, q_len, num_kv_heads, head_dim).transpose(1, 2)
                     
                     # Apply RoPE
+                    # NOTE: transformers 5.x changed apply_rotary_pos_emb signature:
+                    #   Old (4.x): apply_rotary_pos_emb(q, k, cos, sin, position_ids)
+                    #   New (5.x): apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1)
+                    # In 5.x, cos/sin are already position-indexed by rotary_emb().
                     cos, sin = position_embeddings
-                    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+                    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
                     
                     # Capture post-RoPE Q and K combined as ROPE_APPLICATION
                     # Flatten Q and K: shape (bsz, q_len, hidden_size)
