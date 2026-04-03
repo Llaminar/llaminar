@@ -16,6 +16,11 @@
 #include "GraphResolver.h"
 #include "DeviceGraphExecutor.h" // For ComputeGraph
 #include "../../compute_stages/ComputeStages.h"
+#include "../../compute_stages/stages/GDNProjectionStage.h"
+#include "../../compute_stages/stages/ShortConv1dStage.h"
+#include "../../compute_stages/stages/GDNRecurrenceStage.h"
+#include "../../compute_stages/stages/GatedRMSNormStage.h"
+#include "../../compute_stages/stages/AttentionOutputGateStage.h"
 #include "../../../backends/DeviceId.h"
 #include "../../../utils/DebugEnv.h"
 #include "../../../utils/Logger.h"
@@ -834,6 +839,102 @@ namespace llaminar2
                                         ? static_cast<size_t>(stage.int_params.at("actual_seq_len"))
                                         : static_cast<size_t>(seq_len);
             return ComputeStageFactory::createAllGather(params);
+        }
+
+        // =====================================================================
+        // GDN (Gated Delta Net) Stages
+        // =====================================================================
+
+        case StageType::GDNProjection:
+        {
+            GDNProjectionStage::Params params;
+            params.input = stage.inputs.size() > 0 ? stage.inputs[0] : nullptr;
+            params.m = seq_len;
+            params.k = d_model;
+            // QKV
+            params.w_qkv = stage.inputs.size() > 1 ? stage.inputs[1] : nullptr;
+            params.output_qkv = stage.outputs.size() > 0 ? stage.outputs[0] : nullptr;
+            if (params.w_qkv)
+                params.n_qkv = static_cast<int>(params.w_qkv->shape()[0]);
+            // Z
+            params.w_z = stage.inputs.size() > 2 ? stage.inputs[2] : nullptr;
+            params.output_z = stage.outputs.size() > 1 ? stage.outputs[1] : nullptr;
+            if (params.w_z)
+                params.n_z = static_cast<int>(params.w_z->shape()[0]);
+            // A
+            params.w_a = stage.inputs.size() > 3 ? stage.inputs[3] : nullptr;
+            params.output_a = stage.outputs.size() > 2 ? stage.outputs[2] : nullptr;
+            if (params.w_a)
+                params.n_a = static_cast<int>(params.w_a->shape()[0]);
+            // B
+            params.w_b = stage.inputs.size() > 4 ? stage.inputs[4] : nullptr;
+            params.output_b = stage.outputs.size() > 3 ? stage.outputs[3] : nullptr;
+            if (params.w_b)
+                params.n_b = static_cast<int>(params.w_b->shape()[0]);
+            params.device_id = stage.device;
+            return std::make_unique<GDNProjectionStage>(params);
+        }
+
+        case StageType::ShortConv1d:
+        {
+            ShortConv1dStage::Params params;
+            params.input = stage.inputs.size() > 0 ? stage.inputs[0] : nullptr;
+            params.output = stage.outputs.size() > 0 ? stage.outputs[0] : nullptr;
+            params.weight = stage.inputs.size() > 1 ? stage.inputs[1] : nullptr;
+            params.bias = stage.inputs.size() > 2 ? stage.inputs[2] : nullptr;
+            params.seq_len = seq_len;
+            params.channels = stage.int_params.count("channels") ? stage.int_params.at("channels") : 0;
+            params.kernel_size = stage.int_params.count("kernel_size") ? stage.int_params.at("kernel_size") : 4;
+            // conv_state and kernel are set at runtime by the graph builder
+            params.device_id = stage.device;
+            return std::make_unique<ShortConv1dStage>(params);
+        }
+
+        case StageType::GDNRecurrence:
+        {
+            GDNRecurrenceStage::Params params;
+            params.Q = stage.inputs.size() > 0 ? stage.inputs[0] : nullptr;
+            params.K = stage.inputs.size() > 1 ? stage.inputs[1] : nullptr;
+            params.V = stage.inputs.size() > 2 ? stage.inputs[2] : nullptr;
+            params.alpha = stage.inputs.size() > 3 ? stage.inputs[3] : nullptr;
+            params.beta = stage.inputs.size() > 4 ? stage.inputs[4] : nullptr;
+            params.A_log = stage.inputs.size() > 5 ? stage.inputs[5] : nullptr;
+            params.dt_bias = stage.inputs.size() > 6 ? stage.inputs[6] : nullptr;
+            params.output = stage.outputs.size() > 0 ? stage.outputs[0] : nullptr;
+            params.seq_len = seq_len;
+            params.n_heads = stage.int_params.count("n_heads") ? stage.int_params.at("n_heads") : 0;
+            params.d_k = stage.int_params.count("d_k") ? stage.int_params.at("d_k") : 0;
+            params.d_v = stage.int_params.count("d_v") ? stage.int_params.at("d_v") : 0;
+            params.chunk_size = stage.int_params.count("chunk_size") ? stage.int_params.at("chunk_size") : 64;
+            params.use_qk_l2norm = stage.bool_params.count("use_qk_l2norm") ? stage.bool_params.at("use_qk_l2norm") : true;
+            // recurrence_state and kernel are set at runtime by the graph builder
+            params.device_id = stage.device;
+            return std::make_unique<GDNRecurrenceStage>(params);
+        }
+
+        case StageType::GatedRMSNorm:
+        {
+            GatedRMSNormStage::Params params;
+            params.input = stage.inputs.size() > 0 ? stage.inputs[0] : nullptr;
+            params.gate = stage.inputs.size() > 1 ? stage.inputs[1] : nullptr;
+            params.output = stage.outputs.size() > 0 ? stage.outputs[0] : nullptr;
+            params.gamma = stage.inputs.size() > 2 ? stage.inputs[2] : nullptr;
+            params.eps = stage.float_params.count("eps") ? stage.float_params.at("eps") : 1e-6f;
+            params.subtract_one = stage.bool_params.count("subtract_one") ? stage.bool_params.at("subtract_one") : false;
+            params.seq_len = seq_len;
+            params.device_id = stage.device;
+            return std::make_unique<GatedRMSNormStage>(params);
+        }
+
+        case StageType::AttentionOutputGate:
+        {
+            AttentionOutputGateStage::Params params;
+            params.input = stage.inputs.size() > 0 ? stage.inputs[0] : nullptr;
+            params.gate = stage.inputs.size() > 1 ? stage.inputs[1] : nullptr;
+            params.output = stage.outputs.size() > 0 ? stage.outputs[0] : nullptr;
+            params.seq_len = seq_len;
+            params.device_id = stage.device;
+            return std::make_unique<AttentionOutputGateStage>(params);
         }
 
         default:

@@ -42,6 +42,12 @@ QWEN3_MODELS=(
   "https://huggingface.co/Qwen/Qwen3-8B-GGUF/resolve/main/Qwen3-8B-Q4_K_M.gguf"
 )
 
+# Qwen3.5 models for hybrid GDN + full attention architecture testing.
+# Always fetched when available – essential for Qwen3.5 parity tests.
+QWEN35_MODELS=(
+  "https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/resolve/main/Qwen3.5-4B-Q8_0.gguf"
+)
+
 # Experimental / legacy variants that produced 404s during CI runs.
 # Enable by setting LLAMINAR_FETCH_EXPERIMENTAL=1 to probe for them.
 EXPERIMENTAL_MODELS=(
@@ -141,6 +147,39 @@ for url in "${QWEN3_MODELS[@]}"; do
     have_any=1
   else
     echo "[fetch_test_models][ERROR] Failed to download Qwen3 model $fname" >&2
+    rm -f "$MODEL_DIR/$fname.part"
+    missing+=("$fname")
+  fi
+done
+
+# Qwen3.5 models (always attempted - essential for hybrid GDN+FA parity tests)
+echo "[fetch_test_models] Checking Qwen3.5 models" >&2
+for url in "${QWEN35_MODELS[@]}"; do
+  fname=$(basename "$url")
+  if [[ -s "$MODEL_DIR/$fname" ]]; then
+    echo "[fetch_test_models] Found existing Qwen3.5 model $fname (skip)"
+    skipped_existing+=("$fname")
+    continue
+  fi
+  if [[ -n "${LLAMINAR_SKIP_MODEL_DOWNLOAD:-}" ]]; then
+    echo "[fetch_test_models] Skipping Qwen3.5 download for $fname due to LLAMINAR_SKIP_MODEL_DOWNLOAD"
+    continue
+  fi
+  attempted+=("$fname")
+  if ! preflight_check "$url"; then
+    echo "[fetch_test_models][WARN] Qwen3.5 preflight failed (404?) $fname" >&2
+    missing+=("$fname")
+    continue
+  fi
+  echo "[fetch_test_models] Downloading Qwen3.5 model $fname from $url" >&2
+  if curl -L --fail --retry 3 --retry-delay 3 -o "$MODEL_DIR/$fname.part" "$url" 2>&1; then
+    mv "$MODEL_DIR/$fname.part" "$MODEL_DIR/$fname"
+    size=$(du -h "$MODEL_DIR/$fname" | cut -f1)
+    echo "[fetch_test_models] Downloaded Qwen3.5 model $fname ($size)" >&2
+    downloaded+=("$fname:$size")
+    have_any=1
+  else
+    echo "[fetch_test_models][ERROR] Failed to download Qwen3.5 model $fname" >&2
     rm -f "$MODEL_DIR/$fname.part"
     missing+=("$fname")
   fi

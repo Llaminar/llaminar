@@ -14,6 +14,8 @@
 #include "qwen/Qwen2Graph.h"
 #include "qwen/Qwen2Schema.h"
 #include "qwen3/Qwen3Schema.h"
+#include "qwen35/Qwen35Graph.h"
+#include "qwen35/Qwen35Schema.h"
 #include "../execution/local_execution/graph/GraphBuilderRegistry.h"
 #include "../execution/local_execution/graph/SchemaFactoryRegistry.h"
 
@@ -44,6 +46,19 @@ namespace llaminar2
         SchemaFactoryRegistry::registerFactory("qwen3",
                                                []()
                                                { return std::make_unique<Qwen3SchemaFactory>(); });
+
+        // =================================================================
+        // Qwen3.5 Dense (hybrid GDN + Full Attention)
+        // =================================================================
+        GraphBuilderRegistry::registerFactory("qwen35",
+                                              [](const GraphConfig &cfg, std::shared_ptr<MPIContext> mpi)
+                                              {
+                                                  return std::make_shared<Qwen35Graph>(cfg, std::move(mpi));
+                                              });
+
+        SchemaFactoryRegistry::registerFactory("qwen35",
+                                               []()
+                                               { return std::make_unique<Qwen35SchemaFactory>(); });
 
         // =================================================================
         // Future models: add registration calls here

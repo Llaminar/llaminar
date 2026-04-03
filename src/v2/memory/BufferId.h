@@ -72,6 +72,10 @@ namespace llaminar2
         GDN_CONV_STATE,     ///< Short convolution causal state [n_heads, conv_kernel-1, head_dim]
         GDN_RECURRENCE_IN,  ///< GDN recurrence input (after conv+silu)
         GDN_RECURRENCE_OUT, ///< GDN recurrence output
+        GDN_QKV,            ///< GDN QKV projection output [seq_len, qkv_dim]
+        GDN_Z,              ///< GDN gate Z projection [seq_len, n_heads * d_v]
+        GDN_ALPHA,          ///< GDN alpha (dt) projection [seq_len, n_heads]
+        GDN_BETA,           ///< GDN beta projection [seq_len, n_heads]
 
         _COUNT ///< Sentinel – must be last
     };
@@ -151,6 +155,14 @@ namespace llaminar2
             return "GDN_RECURRENCE_IN";
         case BufferId::GDN_RECURRENCE_OUT:
             return "GDN_RECURRENCE_OUT";
+        case BufferId::GDN_QKV:
+            return "GDN_QKV";
+        case BufferId::GDN_Z:
+            return "GDN_Z";
+        case BufferId::GDN_ALPHA:
+            return "GDN_ALPHA";
+        case BufferId::GDN_BETA:
+            return "GDN_BETA";
         case BufferId::_COUNT:
             return "_COUNT";
         }

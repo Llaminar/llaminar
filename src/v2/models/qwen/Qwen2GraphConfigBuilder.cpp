@@ -9,6 +9,7 @@
 #include "Qwen2Graph.h" // For GraphConfig definition (via GraphTypes.h)
 #include "../../interfaces/IModelContext.h"
 #include "../../loaders/WeightManager.h"
+#include "../qwen35/Qwen35GraphConfigBuilder.h"
 #include <algorithm>
 #include <cmath>
 #include <numeric>
@@ -32,6 +33,10 @@ namespace llaminar2
             model_type == "qwen3" || model_type == "Qwen3")
         {
             return createQwen2GraphConfigBuilder();
+        }
+        if (model_type == "qwen35" || model_type == "Qwen35")
+        {
+            return std::make_unique<Qwen35GraphConfigBuilder>();
         }
         return nullptr;
     }

@@ -337,6 +337,24 @@ namespace llaminar2
         /// GDN recurrence state dimension (== head_dim for delta-rule models)
         int gdn_state_size = 0;
 
+        /// GDN inner projection size (ssm.inner_size in GGUF, e.g. 4096)
+        int gdn_inner_size = 0;
+
+        /// GDN group count (ssm.group_count in GGUF, e.g. 16)
+        int gdn_group_count = 0;
+
+        /// GDN time-step rank (ssm.time_step_rank in GGUF, e.g. 32)
+        int gdn_time_step_rank = 0;
+
+        /// Full attention layer interval (e.g. 4 = every 4th layer is FA)
+        /// 0 means all layers use the default template (no hybrid)
+        int full_attention_interval = 0;
+
+        /// Per-layer head dimensions (for variable head_dim across layer types).
+        /// When non-empty, size must equal n_layers.
+        /// Empty = all layers use `head_dim`.
+        std::vector<int> layer_head_dim;
+
         /// Whether attention output gating (sigmoid) is used
         bool has_attention_output_gate = false;
 
@@ -368,6 +386,22 @@ namespace llaminar2
             return n_heads;
         }
 
+        /// Get head dimension for a specific layer (falls back to head_dim)
+        int getLayerHeadDim(int layer_idx) const
+        {
+            if (!layer_head_dim.empty() && layer_idx < static_cast<int>(layer_head_dim.size()))
+                return layer_head_dim[layer_idx];
+            return head_dim;
+        }
+
+        /// Returns true if layer at idx is a full-attention layer (vs GDN)
+        bool isFullAttentionLayer(int layer_idx) const
+        {
+            if (!layer_types.empty() && layer_idx < static_cast<int>(layer_types.size()))
+                return layer_types[layer_idx] == "full_attention";
+            return true; // no heterogeneous config = all FA
+        }
+
         /// Returns true if this model has GDN (gated delta network) layers
         bool hasGDN() const { return gdn_conv_kernel_size > 0 && gdn_state_size > 0; }
 
@@ -386,11 +420,12 @@ namespace llaminar2
      * Supports all standard transformer architectures:
      * - Qwen2: uses q_bias, k_bias, v_bias
      * - Qwen3: uses q_norm, k_norm (QK normalization)
+     * - Qwen3.5: uses GDN weights (attn_qkv, attn_gate, ssm_*, gdn_norm)
      * - Llama: uses subset (no biases, no QK norms)
      */
     struct LayerWeights
     {
-        // Attention weights
+        // Attention weights (Full Attention layers)
         TensorBase *wq = nullptr;        ///< Query projection
         TensorBase *wk = nullptr;        ///< Key projection
         TensorBase *wv = nullptr;        ///< Value projection
@@ -405,6 +440,17 @@ namespace llaminar2
         // QK norm weights (optional, e.g., Qwen3 per-head RMSNorm before RoPE)
         TensorBase *q_norm = nullptr; ///< Q norm gamma [head_dim]
         TensorBase *k_norm = nullptr; ///< K norm gamma [head_dim]
+
+        // GDN (Gated Delta Network) weights — used by Qwen3.5 GDN layers
+        TensorBase *attn_qkv = nullptr;     ///< Fused QKV projection [d_model, 2*inner_size]
+        TensorBase *attn_gate = nullptr;    ///< Output gate Z [d_model, inner_size]
+        TensorBase *ssm_alpha = nullptr;    ///< Alpha projection (decay) [d_model, time_step_rank]
+        TensorBase *ssm_beta = nullptr;     ///< Beta projection (input gate) [d_model, time_step_rank]
+        TensorBase *ssm_conv1d = nullptr;   ///< Short conv1d weights [kernel, inner_size*2]
+        TensorBase *ssm_dt_bias = nullptr;  ///< Time-step bias [time_step_rank]
+        TensorBase *ssm_a = nullptr;        ///< Decay parameter A [time_step_rank]
+        TensorBase *ssm_norm = nullptr;     ///< GDN output norm gamma [state_size]
+        TensorBase *ssm_out = nullptr;      ///< GDN output projection [inner_size, d_model]
 
         // FFN weights
         TensorBase *gate_proj = nullptr; ///< FFN gate projection
@@ -509,6 +555,12 @@ namespace llaminar2
         /// Optional buffer to capture attention residual (after residual add)
         /// Shape: [batch_size * seq_len, d_model] - corresponds to ATTENTION_RESIDUAL
         TensorBase *attention_residual_snapshot = nullptr;
+
+        // === GDN (Gated Delta Net) Buffers ===
+        TensorBase *gdn_qkv = nullptr;   ///< GDN QKV projection output [seq_len, qkv_dim]
+        TensorBase *gdn_z = nullptr;     ///< GDN gate Z projection [seq_len, n_heads * d_v]
+        TensorBase *gdn_alpha = nullptr; ///< GDN alpha (dt) projection [seq_len, n_heads]
+        TensorBase *gdn_beta = nullptr;  ///< GDN beta projection [seq_len, n_heads]
     };
 
     /**

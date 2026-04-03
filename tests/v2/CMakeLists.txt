@@ -9188,4 +9188,18 @@ add_v2_test(V2_Unit_GDNKernels
     MPI_PROCS 1
 )
 
+# Test: Qwen35Schema — Phase D: Qwen 3.5 Dense schema, config builder,
+# graph builder, and architecture registration
+add_executable(v2_test_qwen35_schema unit/models/qwen35/Test__Qwen35Schema.cpp)
+target_link_libraries(v2_test_qwen35_schema
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_Qwen35Schema
+    COMMAND $<TARGET_FILE:v2_test_qwen35_schema>
+    LABELS "V2;Unit;Qwen35;GraphSchema;GDN;PhaseD"
+    MPI_PROCS 1
+)
+
 endif()

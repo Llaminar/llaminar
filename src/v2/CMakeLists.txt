@@ -1345,6 +1345,9 @@ add_library(llaminar2_core STATIC
     models/qwen/Qwen2Graph.cpp
     models/qwen/Qwen2GraphConfigBuilder.cpp
     models/qwen/Qwen2BufferSpec.cpp
+    # Qwen3.5 Dense (hybrid GDN + Full Attention)
+    models/qwen35/Qwen35Graph.cpp
+    models/qwen35/Qwen35GraphConfigBuilder.cpp
     tensors/TensorBase.cpp
     tensors/FP32Tensor.cpp
     tensors/FP16Tensor.cpp

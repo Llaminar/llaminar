@@ -431,9 +431,9 @@ namespace llaminar2
             int batch_size,
             DeviceId device) override;
 
-    private:
+    protected:
         // =====================================================================
-        // Configuration
+        // Configuration (protected for subclass access, e.g. Qwen35Graph)
         // =====================================================================
         GraphConfig config_;
         std::shared_ptr<ModelContext> model_ctx_;
