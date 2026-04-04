@@ -1067,6 +1067,13 @@ namespace llaminar2
         if (formula == "local_kv_dim" || formula == "local_n_kv_heads*head_dim")
             return static_cast<size_t>(config.local_n_kv_heads * config.head_dim);
 
+        // Model-provided custom formulas (e.g., GDN dimensions)
+        {
+            auto it = config.custom_formulas.find(formula);
+            if (it != config.custom_formulas.end())
+                return it->second;
+        }
+
         // Try to parse as a literal number
         try
         {

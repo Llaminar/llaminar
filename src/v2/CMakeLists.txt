@@ -1232,6 +1232,7 @@ add_library(llaminar2_core STATIC
     execution/compute_stages/stages/GDNProjectionStage.cpp
     execution/compute_stages/stages/ShortConv1dStage.cpp
     execution/compute_stages/stages/GDNRecurrenceStage.cpp
+    execution/compute_stages/stages/QGateSplitStage.cpp
     execution/moe/IMoERouter.cpp
     execution/moe/IMoEDispatcher.cpp
     execution/moe/IMoEExpertExecutor.cpp

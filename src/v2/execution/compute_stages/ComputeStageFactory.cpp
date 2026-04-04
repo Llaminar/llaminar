@@ -26,6 +26,7 @@
 #include "stages/GDNRecurrenceStage.h"
 #include "stages/GatedRMSNormStage.h"
 #include "stages/AttentionOutputGateStage.h"
+#include "stages/QGateSplitStage.h"
 
 namespace llaminar2
 {
@@ -204,6 +205,12 @@ namespace llaminar2
         const AttentionOutputGateStage::Params &params)
     {
         return std::make_unique<AttentionOutputGateStage>(params);
+    }
+
+    std::unique_ptr<IComputeStage> ComputeStageFactory::createQGateSplit(
+        const QGateSplitStage::Params &params)
+    {
+        return std::make_unique<QGateSplitStage>(params);
     }
 
     // =============================================================================

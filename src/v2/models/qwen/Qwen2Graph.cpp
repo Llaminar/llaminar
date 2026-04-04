@@ -1524,6 +1524,9 @@ namespace llaminar2
             rope_params.q_buffer_id = BufferId::Q_PROJ;
             rope_params.k_buffer_id = BufferId::K_PROJ;
 
+            // Partial rotary: some models (Qwen3.5) only rotate a fraction of head_dim
+            rope_params.partial_rotary_factor = config_.partial_rotary_factor;
+
             // RoPE-on-read: skip K in RoPE stage; it will be applied during attention
             rope_params.skip_k = config_.rope_on_read;
 
@@ -1551,247 +1554,247 @@ namespace llaminar2
         // Phase 9 Decomposed Path: KVCacheAppendStage + AttentionComputeStage
         if (kv_cache)
         {
-                // For batched execution, K/V are [batch_size * seq_len, kv_dim]
-                // Each sequence's K/V is appended to its own seq_idx in the cache
-                int total_tokens = batch_size * seq_len;
+            // For batched execution, K/V are [batch_size * seq_len, kv_dim]
+            // Each sequence's K/V is appended to its own seq_idx in the cache
+            int total_tokens = batch_size * seq_len;
 
-                KVCacheAppendStage::Params kv_append_params;
-                kv_append_params.device_id = device;
-                kv_append_params.K = buffers.K;
-                kv_append_params.k_buffer_id = BufferId::K_PROJ;
+            KVCacheAppendStage::Params kv_append_params;
+            kv_append_params.device_id = device;
+            kv_append_params.K = buffers.K;
+            kv_append_params.k_buffer_id = BufferId::K_PROJ;
 
-                kv_append_params.V = buffers.V;
-                kv_append_params.v_buffer_id = BufferId::V_PROJ;
-                kv_append_params.kv_cache = kv_cache;
-                // For PP stages: map global layer index to local KV cache index
-                kv_append_params.layer_idx = layer_idx - config_.pp_layer_offset;
-                kv_append_params.seq_idx = 0; // Starting seq_idx
-                kv_append_params.num_tokens = total_tokens;
-                kv_append_params.batch_size = batch_size; // Phase 3: Per-sequence append
-                kv_append_params.seq_len = seq_len;       // Phase 3: Tokens per sequence
+            kv_append_params.V = buffers.V;
+            kv_append_params.v_buffer_id = BufferId::V_PROJ;
+            kv_append_params.kv_cache = kv_cache;
+            // For PP stages: map global layer index to local KV cache index
+            kv_append_params.layer_idx = layer_idx - config_.pp_layer_offset;
+            kv_append_params.seq_idx = 0; // Starting seq_idx
+            kv_append_params.num_tokens = total_tokens;
+            kv_append_params.batch_size = batch_size; // Phase 3: Per-sequence append
+            kv_append_params.seq_len = seq_len;       // Phase 3: Tokens per sequence
 
-                // Phase 5.4: VNNI-safe Q16 KV cache quantization parameters
-                kv_append_params.kv_cache_scale = config_.kv_cache_scale;
-                kv_append_params.head_dim = config_.head_dim;
-                kv_append_params.turboquant_ctx = config_.turboquant_ctx;
+            // Phase 5.4: VNNI-safe Q16 KV cache quantization parameters
+            kv_append_params.kv_cache_scale = config_.kv_cache_scale;
+            kv_append_params.head_dim = config_.head_dim;
+            kv_append_params.turboquant_ctx = config_.turboquant_ctx;
 
-                graph.addNode(prefix + "kv_append",
-                              ComputeStageFactory::createKVCacheAppend(kv_append_params),
-                              device);
+            graph.addNode(prefix + "kv_append",
+                          ComputeStageFactory::createKVCacheAppend(kv_append_params),
+                          device);
 
-                if (!config_.rope_on_read)
-                {
-                    // Standard mode: K needs RoPE before caching
-                    graph.addDependency(prefix + "kv_append", prefix + "rope");
-                }
-                else
-                {
-                    // RoPE-on-read: K stored pre-RoPE, depend on QKV projection
-                    if (has_qkv_proj)
-                        graph.addDependency(prefix + "kv_append", prefix + "qkv_proj");
-                }
-            }
-
-            // For Hybrid mode attention path selection:
-            // - Decomposed attention: Use FP32 K_rope/V_dequant for best precision
-            // - Fused attention: Use Q8_1 K/V (kernel only supports Q8_1 K/V currently)
-            // KV cache always gets FP32 K_rope (stored separately from attention path)
-            ITensor *K_for_attn = buffers.K;
-            ITensor *V_for_attn = buffers.V;
-
-            int total_query_tokens = batch_size * seq_len;
-            int kv_len = total_query_tokens; // Static hint for mode detection (actual queried at runtime)
-            bool use_gather_stage = false;
-
-            // For attention K/V source:
-            // - Prefill (cached_tokens == 0): Use projected K/V directly
-            // - Decode (cached_tokens > 0 and batch_size == 1): Use cache (single-sequence only)
-            // - Batched decode (cached_tokens > 0 and batch_size > 1): Gather K/V from multiple cache slots
-            // Map global layer index to local KV cache index for PP stages
-            int kv_local_layer = layer_idx - config_.pp_layer_offset;
-
-            if (kv_cache)
+            if (!config_.rope_on_read)
             {
-                int cached_tokens = kv_cache->get_cached_tokens(kv_local_layer, 0);
-                if (cached_tokens > 0 && batch_size == 1)
+                // Standard mode: K needs RoPE before caching
+                graph.addDependency(prefix + "kv_append", prefix + "rope");
+            }
+            else
+            {
+                // RoPE-on-read: K stored pre-RoPE, depend on QKV projection
+                if (has_qkv_proj)
+                    graph.addDependency(prefix + "kv_append", prefix + "qkv_proj");
+            }
+        }
+
+        // For Hybrid mode attention path selection:
+        // - Decomposed attention: Use FP32 K_rope/V_dequant for best precision
+        // - Fused attention: Use Q8_1 K/V (kernel only supports Q8_1 K/V currently)
+        // KV cache always gets FP32 K_rope (stored separately from attention path)
+        ITensor *K_for_attn = buffers.K;
+        ITensor *V_for_attn = buffers.V;
+
+        int total_query_tokens = batch_size * seq_len;
+        int kv_len = total_query_tokens; // Static hint for mode detection (actual queried at runtime)
+        bool use_gather_stage = false;
+
+        // For attention K/V source:
+        // - Prefill (cached_tokens == 0): Use projected K/V directly
+        // - Decode (cached_tokens > 0 and batch_size == 1): Use cache (single-sequence only)
+        // - Batched decode (cached_tokens > 0 and batch_size > 1): Gather K/V from multiple cache slots
+        // Map global layer index to local KV cache index for PP stages
+        int kv_local_layer = layer_idx - config_.pp_layer_offset;
+
+        if (kv_cache)
+        {
+            int cached_tokens = kv_cache->get_cached_tokens(kv_local_layer, 0);
+            if (cached_tokens > 0 && batch_size == 1)
+            {
+                // Single-sequence decode: read K/V from cache
+                // Use ITensor* directly (works for both CPU and GPU caches)
+                K_for_attn = kv_cache->get_k(kv_local_layer, 0);
+                V_for_attn = kv_cache->get_v(kv_local_layer, 0);
+                kv_len = cached_tokens;
+                LOG_TRACE("[Qwen2Graph] Layer " << layer_idx << " (local=" << kv_local_layer << ") using cached K/V (decode mode)");
+            }
+            else if (cached_tokens > 0 && batch_size > 1)
+            {
+                // Batched decode: gather K/V from multiple cache slots
+                if (buffers.gathered_K && buffers.gathered_V)
                 {
-                    // Single-sequence decode: read K/V from cache
-                    // Use ITensor* directly (works for both CPU and GPU caches)
-                    K_for_attn = kv_cache->get_k(kv_local_layer, 0);
-                    V_for_attn = kv_cache->get_v(kv_local_layer, 0);
-                    kv_len = cached_tokens;
-                    LOG_TRACE("[Qwen2Graph] Layer " << layer_idx << " (local=" << kv_local_layer << ") using cached K/V (decode mode)");
-                }
-                else if (cached_tokens > 0 && batch_size > 1)
-                {
-                    // Batched decode: gather K/V from multiple cache slots
-                    if (buffers.gathered_K && buffers.gathered_V)
-                    {
-                        use_gather_stage = true;
-                        K_for_attn = buffers.gathered_K;
-                        V_for_attn = buffers.gathered_V;
-                        // kv_len will be updated by gather stage; use cache max for now
-                        kv_len = cached_tokens; // Approximate - actual max determined at gather
-                        LOG_TRACE("[Qwen2Graph] Layer " << layer_idx << " using gathered K/V (batched decode mode)");
-                    }
-                    else
-                    {
-                        // Fallback: use projected K/V if gather buffers not provided
-                        LOG_WARN("[Qwen2Graph] Layer " << layer_idx
-                                                       << " batched decode but no gather buffers - using projected K/V");
-                    }
+                    use_gather_stage = true;
+                    K_for_attn = buffers.gathered_K;
+                    V_for_attn = buffers.gathered_V;
+                    // kv_len will be updated by gather stage; use cache max for now
+                    kv_len = cached_tokens; // Approximate - actual max determined at gather
+                    LOG_TRACE("[Qwen2Graph] Layer " << layer_idx << " using gathered K/V (batched decode mode)");
                 }
                 else
                 {
-                    // Prefill or batched prefill: use projected K/V directly
-                    // KV cache will be populated but attention uses fresh projections
-                    LOG_TRACE("[Qwen2Graph] Layer " << layer_idx << " using projected K/V (prefill/batch mode)");
+                    // Fallback: use projected K/V if gather buffers not provided
+                    LOG_WARN("[Qwen2Graph] Layer " << layer_idx
+                                                   << " batched decode but no gather buffers - using projected K/V");
                 }
             }
+            else
+            {
+                // Prefill or batched prefill: use projected K/V directly
+                // KV cache will be populated but attention uses fresh projections
+                LOG_TRACE("[Qwen2Graph] Layer " << layer_idx << " using projected K/V (prefill/batch mode)");
+            }
+        }
 
-            // Add KVCacheGatherStage if batched decode
+        // Add KVCacheGatherStage if batched decode
+        if (use_gather_stage)
+        {
+            KVCacheGatherStage::Params gather_params;
+            gather_params.kv_cache = kv_cache;
+            // For PP stages: map global layer index to local KV cache index
+            gather_params.layer_idx = layer_idx - config_.pp_layer_offset;
+            gather_params.batch_size = batch_size;
+            gather_params.out_K = buffers.gathered_K;
+            gather_params.out_V = buffers.gathered_V;
+            // Note: out_max_kv_len and out_per_seq_kv_lens can be retrieved from stage after execute
+
+            graph.addNode(prefix + "kv_gather",
+                          ComputeStageFactory::createKVCacheGather(gather_params),
+                          device);
+
+            // Gather depends on append (must append new tokens before gathering full history)
+            graph.addDependency(prefix + "kv_gather", prefix + "kv_append");
+        }
+
+        // Decomposed Path: Attention -> Wo projection
+        {
+            AttentionMode mode = detect_attention_mode(batch_size, seq_len, kv_len);
+            LOG_TRACE("[Qwen2Graph] Layer " << layer_idx
+                                            << " attention mode: " << attention_mode_name(mode)
+                                            << " (batch_size=" << batch_size << ", seq_len=" << seq_len << ", kv_len=" << kv_len << ")");
+
+            AttentionComputeStage::Params attn_params;
+            attn_params.Q = buffers.Q;
+            attn_params.K = K_for_attn;
+            attn_params.V = V_for_attn;
+            attn_params.output = buffers.attn_output;
+            attn_params.batch_size = batch_size;
+            attn_params.seq_len = seq_len;
+            attn_params.kv_len = kv_len;
+            attn_params.n_heads = local_n_heads;
+            attn_params.n_kv_heads = local_n_kv_heads;
+            attn_params.head_dim = config_.head_dim;
+            attn_params.causal = true;
+            attn_params.window_size = -1;
+            attn_params.attention_mode = mode;
+            attn_params.auto_detect_mode = true;
+            attn_params.workspace_scores = buffers.workspace_scores;
+            attn_params.workspace_context = buffers.workspace_context;
+            attn_params.workspace_mask = buffers.workspace_mask;
+            attn_params.kv_cache = kv_cache;
+            attn_params.layer_idx = layer_idx - config_.pp_layer_offset;
+            attn_params.read_kv_from_cache = device.is_gpu() &&
+                                             (!kv_cache || kv_cache->precision() != ActivationPrecision::Q8_1) &&
+                                             (!kv_cache || (kv_cache->precision() != ActivationPrecision::TQ8 &&
+                                                            kv_cache->precision() != ActivationPrecision::TQ4));
+            attn_params.position_offset = position_ids ? position_ids[0] : 0;
+            attn_params.mpi_ctx = mpi_ctx_.get();
+            attn_params.device_id = device;
+            attn_params.q_buffer_id = BufferId::Q_PROJ;
+            attn_params.output_buffer_id = BufferId::ATTN_OUTPUT;
+            attn_params.workspace_scores_buffer_id = BufferId::ATTN_SCORES_WORKSPACE;
+            attn_params.workspace_context_buffer_id = BufferId::ATTN_CONTEXT_WORKSPACE;
+            attn_params.turboquant_ctx = config_.turboquant_ctx;
+
+            // RoPE-on-read: apply RoPE to K in the attention stage
+            // (fused with TQ4 dequant for decode, in-place for FP32 prefill)
+            if (config_.rope_on_read)
+            {
+                attn_params.apply_rope_to_k = true;
+                attn_params.rope_theta = config_.rope_theta;
+            }
+
+            graph.addNode(prefix + "attention",
+                          ComputeStageFactory::createAttentionCompute(attn_params),
+                          device);
+
             if (use_gather_stage)
+                graph.addDependency(prefix + "attention", prefix + "kv_gather");
+            else if (kv_cache)
+                graph.addDependency(prefix + "attention", prefix + "kv_append");
+            else
+                graph.addDependency(prefix + "attention", prefix + "rope");
+
+            LOG_DEBUG("[Qwen2Graph] Using decomposed attention path");
+        }
+
+        // Stage 5: Output projection (Wo)
+        if (layer.wo)
+        {
+            int wo_n = static_cast<int>(layer.wo->shape()[0]);
+            int wo_k = static_cast<int>(layer.wo->shape()[1]);
+
+            LOG_DEBUG("[Qwen2Graph] Layer " << layer_idx << " Wo dims: wo_n=" << wo_n
+                                            << " wo_k=" << wo_k
+                                            << " wo_shape=[" << layer.wo->shape()[0] << "," << layer.wo->shape()[1] << "]"
+                                            << " attn_output_shape=" << buffers.attn_output->shape()[0] << "x" << buffers.attn_output->shape()[1]);
+
+            wo_producer_node = prefix + "wo_proj";
+            graph.addNode(wo_producer_node,
+                          ComputeStageFactory::createGEMM(
+                              GEMMStage::Params{
+                                  .device_id = device,
+                                  .A = buffers.attn_output,
+                                  .B = layer.wo,
+                                  .C = buffers.attn_proj,
+                                  .m = total_tokens,
+                                  .n = wo_n,
+                                  .k = wo_k,
+                                  .alpha = 1.0f,
+                                  .beta = 0.0f,
+                                  .transpose_B = false,
+                                  .gemm_context = GemmContext::ATTN,
+                                  .a_buffer_id = BufferId::ATTN_OUTPUT,
+                                  .c_buffer_id = BufferId::ATTN_PROJ}),
+                          device);
+
+            graph.addDependency(wo_producer_node, prefix + "attention");
+        }
+
+        // Common AllReduce for Wo
+        if (layer.wo && !wo_producer_node.empty())
+        {
+            bool wo_is_sharded = isRowParallelSharded(layer.wo);
+
+            if (wo_is_sharded && needsTPAllreduce())
             {
-                KVCacheGatherStage::Params gather_params;
-                gather_params.kv_cache = kv_cache;
-                // For PP stages: map global layer index to local KV cache index
-                gather_params.layer_idx = layer_idx - config_.pp_layer_offset;
-                gather_params.batch_size = batch_size;
-                gather_params.out_K = buffers.gathered_K;
-                gather_params.out_V = buffers.gathered_V;
-                // Note: out_max_kv_len and out_per_seq_kv_lens can be retrieved from stage after execute
+                size_t allreduce_count = static_cast<size_t>(total_tokens) * static_cast<size_t>(config_.d_model);
 
-                graph.addNode(prefix + "kv_gather",
-                              ComputeStageFactory::createKVCacheGather(gather_params),
-                              device);
+                TensorBase *allreduce_buffer = buffers.attn_proj;
+                BufferId wo_allreduce_bid = BufferId::ATTN_PROJ;
 
-                // Gather depends on append (must append new tokens before gathering full history)
-                graph.addDependency(prefix + "kv_gather", prefix + "kv_append");
-            }
+                std::string stage_name = prefix + "wo_allreduce";
+                auto allreduce_stage = createTPAllreduceStage(
+                    allreduce_buffer, allreduce_count, device, layer_idx, /*is_attention=*/true, stage_name,
+                    wo_allreduce_bid);
 
-            // Decomposed Path: Attention -> Wo projection
-            {
-                AttentionMode mode = detect_attention_mode(batch_size, seq_len, kv_len);
-                LOG_TRACE("[Qwen2Graph] Layer " << layer_idx
-                                                << " attention mode: " << attention_mode_name(mode)
-                                                << " (batch_size=" << batch_size << ", seq_len=" << seq_len << ", kv_len=" << kv_len << ")");
-
-                AttentionComputeStage::Params attn_params;
-                attn_params.Q = buffers.Q;
-                attn_params.K = K_for_attn;
-                attn_params.V = V_for_attn;
-                attn_params.output = buffers.attn_output;
-                attn_params.batch_size = batch_size;
-                attn_params.seq_len = seq_len;
-                attn_params.kv_len = kv_len;
-                attn_params.n_heads = local_n_heads;
-                attn_params.n_kv_heads = local_n_kv_heads;
-                attn_params.head_dim = config_.head_dim;
-                attn_params.causal = true;
-                attn_params.window_size = -1;
-                attn_params.attention_mode = mode;
-                attn_params.auto_detect_mode = true;
-                attn_params.workspace_scores = buffers.workspace_scores;
-                attn_params.workspace_context = buffers.workspace_context;
-                attn_params.workspace_mask = buffers.workspace_mask;
-                attn_params.kv_cache = kv_cache;
-                attn_params.layer_idx = layer_idx - config_.pp_layer_offset;
-                attn_params.read_kv_from_cache = device.is_gpu() &&
-                                                 (!kv_cache || kv_cache->precision() != ActivationPrecision::Q8_1) &&
-                                                 (!kv_cache || (kv_cache->precision() != ActivationPrecision::TQ8 &&
-                                                                kv_cache->precision() != ActivationPrecision::TQ4));
-                attn_params.position_offset = position_ids ? position_ids[0] : 0;
-                attn_params.mpi_ctx = mpi_ctx_.get();
-                attn_params.device_id = device;
-                attn_params.q_buffer_id = BufferId::Q_PROJ;
-                attn_params.output_buffer_id = BufferId::ATTN_OUTPUT;
-                attn_params.workspace_scores_buffer_id = BufferId::ATTN_SCORES_WORKSPACE;
-                attn_params.workspace_context_buffer_id = BufferId::ATTN_CONTEXT_WORKSPACE;
-                attn_params.turboquant_ctx = config_.turboquant_ctx;
-
-                // RoPE-on-read: apply RoPE to K in the attention stage
-                // (fused with TQ4 dequant for decode, in-place for FP32 prefill)
-                if (config_.rope_on_read)
+                if (allreduce_stage)
                 {
-                    attn_params.apply_rope_to_k = true;
-                    attn_params.rope_theta = config_.rope_theta;
-                }
+                    graph.addNode(stage_name, std::move(allreduce_stage), device);
+                    graph.addDependency(stage_name, wo_producer_node);
+                    wo_producer_node = stage_name;
 
-                graph.addNode(prefix + "attention",
-                              ComputeStageFactory::createAttentionCompute(attn_params),
-                              device);
-
-                if (use_gather_stage)
-                    graph.addDependency(prefix + "attention", prefix + "kv_gather");
-                else if (kv_cache)
-                    graph.addDependency(prefix + "attention", prefix + "kv_append");
-                else
-                    graph.addDependency(prefix + "attention", prefix + "rope");
-
-                LOG_DEBUG("[Qwen2Graph] Using decomposed attention path");
-            }
-
-            // Stage 5: Output projection (Wo)
-            if (layer.wo)
-            {
-                int wo_n = static_cast<int>(layer.wo->shape()[0]);
-                int wo_k = static_cast<int>(layer.wo->shape()[1]);
-
-                LOG_DEBUG("[Qwen2Graph] Layer " << layer_idx << " Wo dims: wo_n=" << wo_n
-                                                << " wo_k=" << wo_k
-                                                << " wo_shape=[" << layer.wo->shape()[0] << "," << layer.wo->shape()[1] << "]"
-                                                << " attn_output_shape=" << buffers.attn_output->shape()[0] << "x" << buffers.attn_output->shape()[1]);
-
-                wo_producer_node = prefix + "wo_proj";
-                graph.addNode(wo_producer_node,
-                              ComputeStageFactory::createGEMM(
-                                  GEMMStage::Params{
-                                      .device_id = device,
-                                      .A = buffers.attn_output,
-                                      .B = layer.wo,
-                                      .C = buffers.attn_proj,
-                                      .m = total_tokens,
-                                      .n = wo_n,
-                                      .k = wo_k,
-                                      .alpha = 1.0f,
-                                      .beta = 0.0f,
-                                      .transpose_B = false,
-                                      .gemm_context = GemmContext::ATTN,
-                                      .a_buffer_id = BufferId::ATTN_OUTPUT,
-                                      .c_buffer_id = BufferId::ATTN_PROJ}),
-                              device);
-
-                graph.addDependency(wo_producer_node, prefix + "attention");
-            }
-
-            // Common AllReduce for Wo
-            if (layer.wo && !wo_producer_node.empty())
-            {
-                bool wo_is_sharded = isRowParallelSharded(layer.wo);
-
-                if (wo_is_sharded && needsTPAllreduce())
-                {
-                    size_t allreduce_count = static_cast<size_t>(total_tokens) * static_cast<size_t>(config_.d_model);
-
-                    TensorBase *allreduce_buffer = buffers.attn_proj;
-                    BufferId wo_allreduce_bid = BufferId::ATTN_PROJ;
-
-                    std::string stage_name = prefix + "wo_allreduce";
-                    auto allreduce_stage = createTPAllreduceStage(
-                        allreduce_buffer, allreduce_count, device, layer_idx, /*is_attention=*/true, stage_name,
-                        wo_allreduce_bid);
-
-                    if (allreduce_stage)
-                    {
-                        graph.addNode(stage_name, std::move(allreduce_stage), device);
-                        graph.addDependency(stage_name, wo_producer_node);
-                        wo_producer_node = stage_name;
-
-                        LOG_TRACE("[Qwen2Graph] Layer " << layer_idx
-                                                        << " Wo: row-parallel sharded, adding allreduce");
-                    }
+                    LOG_TRACE("[Qwen2Graph] Layer " << layer_idx
+                                                    << " Wo: row-parallel sharded, adding allreduce");
                 }
             }
+        }
 
         // Attention residual is now fused into FusedResidualNormStage in buildFFNGraph
         // (for non-first layers) or handled by the first layer's standalone RMSNorm path.

@@ -516,6 +516,12 @@ namespace llaminar2
             // Embeddings are used directly
             if (name.find("token_embd") != std::string::npos)
                 return true;
+            // SSM/GDN convolution kernels are not GEMM weights
+            if (name.find("ssm_conv1d") != std::string::npos)
+                return true;
+            // SSM/GDN per-head scalar parameters (e.g. ssm_a, ssm_dt) without .weight suffix
+            if (name.find(".ssm_a") != std::string::npos && name.find(".weight") == std::string::npos)
+                return true;
             return false;
         }
     };

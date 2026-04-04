@@ -274,6 +274,11 @@ namespace llaminar2
             {"_down_proj", "_FFN_DOWN"},
             {"_down_allreduce", "_FFN_DOWN"},
             {"_ffn_residual", "_FFN_RESIDUAL"},
+            // GDN (Gated Delta Net) linear attention stages
+            {"_gdn_proj", "_QKV_PROJECTION"},
+            {"_gdn_recurrence", "_GDN_DELTA_RULE_OUTPUT"},
+            {"_gated_norm", "_GDN_NORM_GATE_OUTPUT"},
+            {"_gdn_out_proj", "_ATTENTION_OUTPUT"},
         };
 
         // Global stages

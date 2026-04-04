@@ -76,6 +76,13 @@ namespace llaminar2
 
         GraphSchema getSchema() const override;
 
+        /// Wire GDN-specific arena buffers after base Qwen2 wiring
+        void setArena(BufferArena *arena) override;
+
+        /// Extends Qwen2Graph's resolver config with GDN-specific formulas
+        /// and buffer name→id mappings, keeping core infrastructure agnostic.
+        GraphResolverConfig getResolverConfig(int seq_len) const override;
+
         /// Layer dispatch delegates to GDN or FA based on layer type.
         /// buildFullForwardGraph() inherited from Qwen2Graph calls
         /// buildAttentionGraph() virtually, so GDN dispatch is automatic.
@@ -94,6 +101,32 @@ namespace llaminar2
             const std::vector<int> *sequence_lengths = nullptr) override;
 
     private:
+        // =====================================================================
+        // FA (Full Attention) Sub-Graph Building
+        // =====================================================================
+
+        /**
+         * @brief Build FA attention sub-graph with Q gate split + sigmoid output gate
+         *
+         * Qwen3.5 FA layers differ from standard Qwen2 attention:
+         *   1. Q projection outputs 2× (query + sigmoid gate interleaved per head)
+         *   2. Partial RoPE (only first 64/256 dims rotated)
+         *   3. sigmoid(gate) applied to attention output before Wo
+         *
+         * Stages: norm → fused_qkv (Q→fa_q_raw, K, V) → q_gate_split → qk_norm
+         *         → rope → kv_append → attention → output_gate → wo_proj
+         */
+        ComputeGraph buildFAAttentionGraph(
+            const LayerWeights &layer,
+            ActivationBuffers &buffers,
+            int layer_idx,
+            int seq_len,
+            int batch_size,
+            IKVCache *kv_cache,
+            const int *position_ids,
+            DeviceId device,
+            const std::vector<int> *sequence_lengths);
+
         // =====================================================================
         // GDN Attention Sub-Graph Building
         // =====================================================================

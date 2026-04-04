@@ -122,6 +122,8 @@ namespace llaminar2
             return "SHORT_CONV1D";
         case ComputeStageType::GDN_RECURRENCE:
             return "GDN_RECURRENCE";
+        case ComputeStageType::Q_GATE_SPLIT:
+            return "Q_GATE_SPLIT";
         default:
             return "UNKNOWN";
         }

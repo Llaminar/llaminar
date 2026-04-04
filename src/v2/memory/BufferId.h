@@ -76,6 +76,8 @@ namespace llaminar2
         GDN_Z,              ///< GDN gate Z projection [seq_len, n_heads * d_v]
         GDN_ALPHA,          ///< GDN alpha (dt) projection [seq_len, n_heads]
         GDN_BETA,           ///< GDN beta projection [seq_len, n_heads]
+        FA_GATE,            ///< FA sigmoid gate (extracted from Q projection) [seq_len, n_heads * d_head]
+        FA_Q_RAW,           ///< FA raw Q GEMM output (query+gate interleaved) [seq_len, n_heads * d_head * 2]
 
         _COUNT ///< Sentinel – must be last
     };
@@ -163,6 +165,10 @@ namespace llaminar2
             return "GDN_ALPHA";
         case BufferId::GDN_BETA:
             return "GDN_BETA";
+        case BufferId::FA_GATE:
+            return "FA_GATE";
+        case BufferId::FA_Q_RAW:
+            return "FA_Q_RAW";
         case BufferId::_COUNT:
             return "_COUNT";
         }

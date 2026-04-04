@@ -565,6 +565,196 @@ namespace llaminar2::primitives
     }
 
     // ============================================================================
+    // Partial RoPE Implementation (partial_rotary_factor < 1.0)
+    // ============================================================================
+
+    void apply_rope_partial(
+        float *q, float *k,
+        int seq_len, int head_dim, int rotary_dim,
+        int q_heads, int k_heads,
+        int n_past, float freq_base)
+    {
+        if (rotary_dim <= 0 || rotary_dim % 2 != 0)
+            return;
+
+        // Frequencies computed using rotary_dim (NOT head_dim)
+        const auto &inv_freq = get_inv_freq_cached(rotary_dim, freq_base);
+        const int half_rotary = rotary_dim / 2;
+
+        // Pre-compute sin/cos tables using angle recurrence
+        std::vector<float> cos_table(seq_len * half_rotary);
+        std::vector<float> sin_table(seq_len * half_rotary);
+
+        // Compute deltas (rotation per position step)
+        std::vector<float> cos_delta(half_rotary);
+        std::vector<float> sin_delta(half_rotary);
+        for (int i = 0; i < half_rotary; ++i)
+        {
+            cos_delta[i] = std::cos(inv_freq[i]);
+            sin_delta[i] = std::sin(inv_freq[i]);
+        }
+
+        // Initialize first position (n_past)
+        for (int i = 0; i < half_rotary; ++i)
+        {
+            float ang = n_past * inv_freq[i];
+            cos_table[i] = std::cos(ang);
+            sin_table[i] = std::sin(ang);
+        }
+
+        // Recurrence for t > 0
+        for (int t = 1; t < seq_len; ++t)
+        {
+            int prev = (t - 1) * half_rotary;
+            int curr = t * half_rotary;
+            for (int i = 0; i < half_rotary; ++i)
+            {
+                float c = cos_table[prev + i], s = sin_table[prev + i];
+                float cd = cos_delta[i], sd = sin_delta[i];
+                cos_table[curr + i] = c * cd - s * sd;
+                sin_table[curr + i] = s * cd + c * sd;
+            }
+        }
+
+        // Apply rotation (head_dim for stride, rotary_dim for loop)
+        auto do_partial_rope = [&]()
+        {
+        // Q heads
+#pragma omp for collapse(2) schedule(static)
+            for (int t = 0; t < seq_len; ++t)
+            {
+                for (int h = 0; h < q_heads; ++h)
+                {
+                    // Stride uses full head_dim
+                    float *head_ptr = q + (t * q_heads + h) * head_dim;
+                    const float *cos_ptr = cos_table.data() + t * half_rotary;
+                    const float *sin_ptr = sin_table.data() + t * half_rotary;
+
+                    // Rotate only the first rotary_dim elements
+#if defined(__AVX512F__)
+                    {
+                        int i = 0;
+                        for (; i + 16 <= half_rotary; i += 16)
+                        {
+                            __m512 x0 = _mm512_loadu_ps(head_ptr + i);
+                            __m512 x1 = _mm512_loadu_ps(head_ptr + i + half_rotary);
+                            __m512 cv = _mm512_loadu_ps(cos_ptr + i);
+                            __m512 sv = _mm512_loadu_ps(sin_ptr + i);
+                            _mm512_storeu_ps(head_ptr + i,
+                                             _mm512_sub_ps(_mm512_mul_ps(x0, cv), _mm512_mul_ps(x1, sv)));
+                            _mm512_storeu_ps(head_ptr + i + half_rotary,
+                                             _mm512_add_ps(_mm512_mul_ps(x0, sv), _mm512_mul_ps(x1, cv)));
+                        }
+                        for (; i < half_rotary; ++i)
+                        {
+                            float x0 = head_ptr[i], x1 = head_ptr[i + half_rotary];
+                            head_ptr[i] = x0 * cos_ptr[i] - x1 * sin_ptr[i];
+                            head_ptr[i + half_rotary] = x0 * sin_ptr[i] + x1 * cos_ptr[i];
+                        }
+                    }
+#elif defined(__AVX2__)
+                    {
+                        int i = 0;
+                        for (; i + 8 <= half_rotary; i += 8)
+                        {
+                            __m256 x0 = _mm256_loadu_ps(head_ptr + i);
+                            __m256 x1 = _mm256_loadu_ps(head_ptr + i + half_rotary);
+                            __m256 cv = _mm256_loadu_ps(cos_ptr + i);
+                            __m256 sv = _mm256_loadu_ps(sin_ptr + i);
+                            _mm256_storeu_ps(head_ptr + i,
+                                             _mm256_sub_ps(_mm256_mul_ps(x0, cv), _mm256_mul_ps(x1, sv)));
+                            _mm256_storeu_ps(head_ptr + i + half_rotary,
+                                             _mm256_add_ps(_mm256_mul_ps(x0, sv), _mm256_mul_ps(x1, cv)));
+                        }
+                        for (; i < half_rotary; ++i)
+                        {
+                            float x0 = head_ptr[i], x1 = head_ptr[i + half_rotary];
+                            head_ptr[i] = x0 * cos_ptr[i] - x1 * sin_ptr[i];
+                            head_ptr[i + half_rotary] = x0 * sin_ptr[i] + x1 * cos_ptr[i];
+                        }
+                    }
+#else
+                    for (int i = 0; i < half_rotary; ++i)
+                    {
+                        float x0 = head_ptr[i], x1 = head_ptr[i + half_rotary];
+                        head_ptr[i] = x0 * cos_ptr[i] - x1 * sin_ptr[i];
+                        head_ptr[i + half_rotary] = x0 * sin_ptr[i] + x1 * cos_ptr[i];
+                    }
+#endif
+                    // Elements [rotary_dim, head_dim) are untouched (pass-through)
+                }
+            }
+
+            // K heads (same logic, different head count)
+            if (k)
+            {
+#pragma omp for collapse(2) schedule(static)
+                for (int t = 0; t < seq_len; ++t)
+                {
+                    for (int h = 0; h < k_heads; ++h)
+                    {
+                        float *head_ptr = k + (t * k_heads + h) * head_dim;
+                        const float *cos_ptr = cos_table.data() + t * half_rotary;
+                        const float *sin_ptr = sin_table.data() + t * half_rotary;
+
+#if defined(__AVX512F__)
+                        {
+                            int i = 0;
+                            for (; i + 16 <= half_rotary; i += 16)
+                            {
+                                __m512 x0 = _mm512_loadu_ps(head_ptr + i);
+                                __m512 x1 = _mm512_loadu_ps(head_ptr + i + half_rotary);
+                                __m512 cv = _mm512_loadu_ps(cos_ptr + i);
+                                __m512 sv = _mm512_loadu_ps(sin_ptr + i);
+                                _mm512_storeu_ps(head_ptr + i,
+                                                 _mm512_sub_ps(_mm512_mul_ps(x0, cv), _mm512_mul_ps(x1, sv)));
+                                _mm512_storeu_ps(head_ptr + i + half_rotary,
+                                                 _mm512_add_ps(_mm512_mul_ps(x0, sv), _mm512_mul_ps(x1, cv)));
+                            }
+                            for (; i < half_rotary; ++i)
+                            {
+                                float x0 = head_ptr[i], x1 = head_ptr[i + half_rotary];
+                                head_ptr[i] = x0 * cos_ptr[i] - x1 * sin_ptr[i];
+                                head_ptr[i + half_rotary] = x0 * sin_ptr[i] + x1 * cos_ptr[i];
+                            }
+                        }
+#elif defined(__AVX2__)
+                        {
+                            int i = 0;
+                            for (; i + 8 <= half_rotary; i += 8)
+                            {
+                                __m256 x0 = _mm256_loadu_ps(head_ptr + i);
+                                __m256 x1 = _mm256_loadu_ps(head_ptr + i + half_rotary);
+                                __m256 cv = _mm256_loadu_ps(cos_ptr + i);
+                                __m256 sv = _mm256_loadu_ps(sin_ptr + i);
+                                _mm256_storeu_ps(head_ptr + i,
+                                                 _mm256_sub_ps(_mm256_mul_ps(x0, cv), _mm256_mul_ps(x1, sv)));
+                                _mm256_storeu_ps(head_ptr + i + half_rotary,
+                                                 _mm256_add_ps(_mm256_mul_ps(x0, sv), _mm256_mul_ps(x1, cv)));
+                            }
+                            for (; i < half_rotary; ++i)
+                            {
+                                float x0 = head_ptr[i], x1 = head_ptr[i + half_rotary];
+                                head_ptr[i] = x0 * cos_ptr[i] - x1 * sin_ptr[i];
+                                head_ptr[i + half_rotary] = x0 * sin_ptr[i] + x1 * cos_ptr[i];
+                            }
+                        }
+#else
+                        for (int i = 0; i < half_rotary; ++i)
+                        {
+                            float x0 = head_ptr[i], x1 = head_ptr[i + half_rotary];
+                            head_ptr[i] = x0 * cos_ptr[i] - x1 * sin_ptr[i];
+                            head_ptr[i + half_rotary] = x0 * sin_ptr[i] + x1 * cos_ptr[i];
+                        }
+#endif
+                    }
+                }
+            }
+        };
+        OMP_WORKSHARE_REGION(do_partial_rope);
+    }
+
+    // ============================================================================
     // BF16 Native Precision Implementations
     // ============================================================================
 

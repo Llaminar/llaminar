@@ -73,6 +73,32 @@ namespace llaminar2::primitives
         RoPEPersistentState *persistent_state = nullptr);
 
     /**
+     * @brief Apply partial RoPE to Q and K tensors
+     *
+     * For models with partial_rotary_factor < 1.0 (e.g. Qwen3.5 FA layers).
+     * Rotates only the first `rotary_dim` elements of each head while leaving
+     * the remaining (head_dim - rotary_dim) elements untouched.
+     *
+     * Uses `head_dim` for stride (memory layout) and `rotary_dim` for rotation
+     * loop bounds and frequency computation.
+     *
+     * @param q Query tensor [seq_len, q_heads * head_dim] (modified in-place)
+     * @param k Key tensor [seq_len, k_heads * head_dim] (modified in-place, nullable)
+     * @param seq_len Sequence length
+     * @param head_dim Full dimension per head (for stride)
+     * @param rotary_dim Number of dims to rotate (must be even, <= head_dim)
+     * @param q_heads Number of query heads
+     * @param k_heads Number of key heads
+     * @param n_past Number of tokens already processed
+     * @param freq_base Base frequency for RoPE
+     */
+    void apply_rope_partial(
+        float *q, float *k,
+        int seq_len, int head_dim, int rotary_dim,
+        int q_heads, int k_heads,
+        int n_past, float freq_base);
+
+    /**
      * @brief Update persistent state cache for a specific position
      *
      * Ensures that the sin/cos cache in the persistent state is valid for the target position.

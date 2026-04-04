@@ -122,11 +122,40 @@
         "**/build/**": true,
         "**/.git": false,
         "**/.DS_Store": true,
-        "**/node_modules": true
+        "**/node_modules": true,
+        "gpucore.*": true,
+        "build_*/**": true,
+        "external/**": true,
+        "tmp/**": true,
+        "pytorch_*/**": true,
+        ".rocprofv3/**": true,
+        ".venv/**": true,
+        "**/__pycache__/**": true
     },
     "search.exclude": {
         "**/build/**": true,
-        "**/node_modules": true
+        "**/node_modules": true,
+        "gpucore.*": true,
+        "build_*/**": true,
+        "external/**": true,
+        "tmp/**": true,
+        "pytorch_*/**": true,
+        ".rocprofv3/**": true,
+        ".venv/**": true,
+        "**/__pycache__/**": true
+    },
+    "files.watcherExclude": {
+        "gpucore.*": true,
+        "**/build/**": true,
+        "build_*/**": true,
+        "external/**": true,
+        "tmp/**": true,
+        "pytorch_*/**": true,
+        ".git/**": true,
+        ".rocprofv3/**": true,
+        ".venv/**": true,
+        "**/__pycache__/**": true,
+        "**/node_modules/**": true
     },
     "editor.formatOnSave": true,
     "editor.formatOnPaste": true,

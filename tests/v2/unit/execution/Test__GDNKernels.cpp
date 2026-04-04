@@ -204,7 +204,7 @@ TEST(Test__GDNKernels, Projection_DumpInfo)
     GDNProjectionStage stage(p);
     auto info = stage.buildDumpInfoImpl();
 
-    EXPECT_EQ(info.inputs.size(), 5u); // input + 4 weights
+    EXPECT_EQ(info.inputs.size(), 5u);  // input + 4 weights
     EXPECT_EQ(info.outputs.size(), 4u); // 4 outputs
 }
 
@@ -642,7 +642,8 @@ TEST(Test__GDNKernels, Recurrence_Decode_StateDecay)
     auto V = makeFP32Const({1, static_cast<size_t>(n_heads * d_v)}, 1.0f);
     auto alpha = makeFP32Const({1, 1}, 0.0f);
     auto beta = makeFP32Const({1, 1}, -100.0f); // sigmoid(-100) ≈ 0, no update
-    auto A_log = makeFP32Const({1}, 0.0f);       // -exp(0) = -1
+    // GGUF stores -exp(A_log_raw), so for raw_param=0: stored = -exp(0) = -1.0
+    auto A_log = makeFP32Const({1}, -1.0f); // GGUF pre-exponentiated: -exp(0) = -1
     auto dt_bias = makeFP32Const({1}, 0.0f);
     auto output = makeFP32({1, static_cast<size_t>(n_heads * d_v)});
 
@@ -671,7 +672,7 @@ TEST(Test__GDNKernels, Recurrence_Decode_StateDecay)
     GDNRecurrenceStage stage(p);
     ASSERT_TRUE(stage.execute(ctx.get()));
 
-    // g = -exp(0) * softplus(0) = -ln(2) ≈ -0.6931
+    // g = A_log * softplus(0) = -1.0 * ln(2) ≈ -0.6931
     // decay = exp(g) ≈ 0.5
     // beta_sig ≈ 0, so delta ≈ 0 and state is only decayed
     // State should be approximately 0.5 (decayed from 1.0)
@@ -702,12 +703,13 @@ TEST(Test__GDNKernels, Recurrence_Decode_SingleHeadReference)
     auto V = makeFP32({1, 3}, v_data.data());
 
     // Set gates to produce known values
-    // alpha=100 → softplus(100+0) ≈ 100, g = -exp(0)*100 = -100 → decay ≈ 0
+    // alpha=100 → softplus(100+0) ≈ 100, g = A_log*softplus = -1.0*100 = -100 → decay ≈ 0
     // This effectively zeroes the old state before update
     auto alpha = makeFP32Const({1, 1}, 100.0f);
     // beta=100 → sigmoid(100) ≈ 1.0
     auto beta = makeFP32Const({1, 1}, 100.0f);
-    auto A_log = makeFP32Const({1}, 0.0f);
+    // GGUF stores -exp(A_log_raw), so for raw_param=0: stored = -exp(0) = -1.0
+    auto A_log = makeFP32Const({1}, -1.0f);
     auto dt_bias = makeFP32Const({1}, 0.0f);
     auto output = makeFP32({1, 3});
 
@@ -736,7 +738,7 @@ TEST(Test__GDNKernels, Recurrence_Decode_SingleHeadReference)
     ASSERT_TRUE(stage.execute(ctx.get()));
 
     // Manual computation:
-    // g = -exp(0) * softplus(100) ≈ -100
+    // g = A_log * softplus(alpha + dt_bias) = -1.0 * softplus(100) ≈ -100
     // decay = exp(-100) ≈ 0
     // S decayed ≈ 0 (state effectively zeroed)
     // kv_mem = S * k = 0 (S is zeroed, k=[0,1,0])
@@ -840,7 +842,7 @@ TEST(Test__GDNKernels, Recurrence_Prefill_MatchesSequentialDecode)
 
         // Copy output for timestep t
         std::memcpy(output_decode->mutable_data() + t * n_heads * d_v,
-                     out_t->data(), n_heads * d_v * sizeof(float));
+                    out_t->data(), n_heads * d_v * sizeof(float));
     }
 
     // Compare: prefill output should match sequential decode output
@@ -1162,18 +1164,26 @@ TEST(Test__GDNKernels, StateIntegration_ResetClearsState)
     ASSERT_NE(state0, nullptr);
     ASSERT_NE(state1, nullptr);
 
-    for (auto &v : state0->recurrence_state) v = 1.0f;
-    for (auto &v : state0->conv_state) v = 1.0f;
-    for (auto &v : state1->recurrence_state) v = 2.0f;
-    for (auto &v : state1->conv_state) v = 2.0f;
+    for (auto &v : state0->recurrence_state)
+        v = 1.0f;
+    for (auto &v : state0->conv_state)
+        v = 1.0f;
+    for (auto &v : state1->recurrence_state)
+        v = 2.0f;
+    for (auto &v : state1->conv_state)
+        v = 2.0f;
 
     // Reset should zero everything
     manager.reset();
 
-    for (float v : state0->recurrence_state) EXPECT_EQ(v, 0.0f);
-    for (float v : state0->conv_state) EXPECT_EQ(v, 0.0f);
-    for (float v : state1->recurrence_state) EXPECT_EQ(v, 0.0f);
-    for (float v : state1->conv_state) EXPECT_EQ(v, 0.0f);
+    for (float v : state0->recurrence_state)
+        EXPECT_EQ(v, 0.0f);
+    for (float v : state0->conv_state)
+        EXPECT_EQ(v, 0.0f);
+    for (float v : state1->recurrence_state)
+        EXPECT_EQ(v, 0.0f);
+    for (float v : state1->conv_state)
+        EXPECT_EQ(v, 0.0f);
 }
 
 // ============================================================================

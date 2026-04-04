@@ -505,7 +505,7 @@ namespace
 
             // GDN config matching Qwen3.5-4B pattern
             config_.gdn_conv_kernel_size = 4;
-            config_.gdn_state_size = 16; // d_v per head
+            config_.gdn_state_size = 16;  // d_v per head
             config_.gdn_inner_size = 128; // 4 * n_heads * d_v
             config_.gdn_group_count = 4;
             config_.gdn_time_step_rank = 8;
@@ -558,10 +558,10 @@ namespace
             // Populate activation buffers
             buffers_.current_hidden = hidden_.get();
             buffers_.normalized = normalized_.get();
-            buffers_.gdn_qkv = gdn_qkv_.get();
-            buffers_.gdn_z = gdn_z_.get();
-            buffers_.gdn_alpha = gdn_alpha_.get();
-            buffers_.gdn_beta = gdn_beta_.get();
+            buffers_.extensions[BufferId::GDN_QKV] = gdn_qkv_.get();
+            buffers_.extensions[BufferId::GDN_Z] = gdn_z_.get();
+            buffers_.extensions[BufferId::GDN_ALPHA] = gdn_alpha_.get();
+            buffers_.extensions[BufferId::GDN_BETA] = gdn_beta_.get();
             buffers_.attn_output = attn_output_.get();
             buffers_.attn_proj = attn_proj_.get();
             buffers_.gate = gate_.get();
@@ -607,9 +607,10 @@ TEST_F(Qwen35GraphBuildTest, GDNAttentionGraph_HasExpectedNodeCount)
         DeviceId::cpu());
 
     // Expected nodes: attn_norm, gdn_proj, short_conv, gdn_recurrence,
-    //                 gated_norm, gdn_out_proj, attn_output_gate, attn_residual
-    EXPECT_EQ(attn_graph.size(), 8u)
-        << "GDN attention graph should have 8 stages";
+    //                 gated_norm, gdn_out_proj
+    // (No output_gate or residual — FFN FusedResidualNorm handles residual)
+    EXPECT_EQ(attn_graph.size(), 6u)
+        << "GDN attention graph should have 6 stages";
 }
 
 TEST_F(Qwen35GraphBuildTest, GDNAttentionGraph_NodesExist)
@@ -625,8 +626,9 @@ TEST_F(Qwen35GraphBuildTest, GDNAttentionGraph_NodesExist)
     EXPECT_NE(attn_graph.getNode("layer0_gdn_recurrence"), nullptr);
     EXPECT_NE(attn_graph.getNode("layer0_gated_norm"), nullptr);
     EXPECT_NE(attn_graph.getNode("layer0_gdn_out_proj"), nullptr);
-    EXPECT_NE(attn_graph.getNode("layer0_attn_output_gate"), nullptr);
-    EXPECT_NE(attn_graph.getNode("layer0_attn_residual"), nullptr);
+    // No output_gate or residual — FFN FusedResidualNorm handles residual
+    EXPECT_EQ(attn_graph.getNode("layer0_attn_output_gate"), nullptr);
+    EXPECT_EQ(attn_graph.getNode("layer0_attn_residual"), nullptr);
 }
 
 TEST_F(Qwen35GraphBuildTest, GDNAttentionGraph_StageTypes)
@@ -652,9 +654,8 @@ TEST_F(Qwen35GraphBuildTest, GDNAttentionGraph_StageTypes)
     ASSERT_NE(gnorm, nullptr);
     EXPECT_EQ(gnorm->stage->type(), ComputeStageType::GATED_RMS_NORM);
 
-    auto *gate = attn_graph.getNode("layer0_attn_output_gate");
-    ASSERT_NE(gate, nullptr);
-    EXPECT_EQ(gate->stage->type(), ComputeStageType::ATTENTION_OUTPUT_GATE);
+    // Output gate removed from GDN — only used in FA layers
+    EXPECT_EQ(attn_graph.getNode("layer0_attn_output_gate"), nullptr);
 }
 
 TEST_F(Qwen35GraphBuildTest, GDNAttentionGraph_DependencyChain)
@@ -679,8 +680,7 @@ TEST_F(Qwen35GraphBuildTest, GDNAttentionGraph_DependencyChain)
     verifyDep("layer0_gdn_recurrence", "layer0_short_conv");
     verifyDep("layer0_gated_norm", "layer0_gdn_recurrence");
     verifyDep("layer0_gdn_out_proj", "layer0_gated_norm");
-    verifyDep("layer0_attn_output_gate", "layer0_gdn_out_proj");
-    verifyDep("layer0_attn_residual", "layer0_attn_output_gate");
+    // No output_gate or residual — chain ends at gdn_out_proj
 }
 
 TEST_F(Qwen35GraphBuildTest, GDNProjection_ZWeightIsAttnGate)
@@ -724,24 +724,18 @@ TEST_F(Qwen35GraphBuildTest, GDNProjection_AllWeightsWired)
     EXPECT_EQ(params.w_b, layer_.ssm_beta);
 }
 
-TEST_F(Qwen35GraphBuildTest, OutputGate_UsesGDNZBuffer)
+TEST_F(Qwen35GraphBuildTest, OutputGate_NotUsedInGDNLayers)
 {
-    // Output gate should use the pre-computed gdn_z buffer directly,
-    // not a separate GEMM projection
+    // GDN layers do NOT use an attention output gate — only FA layers do.
+    // The gated RMSNorm stage handles the equivalent gating in GDN.
     Qwen35Graph graph(config_, nullptr);
 
     ComputeGraph attn_graph = graph.buildAttentionGraph(
         layer_, buffers_, 0, 2, 1, nullptr, nullptr, DeviceId::cpu());
 
-    auto *gate_stage = dynamic_cast<AttentionOutputGateStage *>(
-        attn_graph.getNode("layer0_attn_output_gate")->stage.get());
-    ASSERT_NE(gate_stage, nullptr);
-
-    const auto &params = gate_stage->getParams();
-
-    // Gate input should be the GDN Z buffer (already computed in GDN projection)
-    EXPECT_EQ(params.gate, buffers_.gdn_z)
-        << "Output gate should use gdn_z buffer (pre-computed Z projection)";
+    // Should NOT have an output gate node in GDN layers
+    EXPECT_EQ(attn_graph.getNode("layer0_attn_output_gate"), nullptr)
+        << "GDN layers should NOT have an AttentionOutputGateStage";
 
     // Should NOT have a separate gate projection GEMM node
     EXPECT_EQ(attn_graph.getNode("layer0_attn_gate_proj"), nullptr)
@@ -794,9 +788,9 @@ TEST_F(Qwen35GraphBuildTest, GDNRecurrence_DKConsistentWithState)
 
     const auto &params = rec_stage->getParams();
 
-    // Verify d_k formula: (inner_size / n_heads - d_v) / 2
-    // inner=128, n_heads=4, d_v=16 → per_head = 32, d_k = (32-16)/2 = 8
-    EXPECT_EQ(params.d_k, 8) << "d_k should be (inner_size/n_heads - d_v) / 2";
+    // d_k = d_v = gdn_state_size, n_heads = gdn_group_count
+    // inner=128, n_heads=4, d_v=16, d_k=16
+    EXPECT_EQ(params.d_k, 16) << "d_k should equal d_v (gdn_state_size)";
     EXPECT_EQ(params.d_v, 16) << "d_v should be gdn_state_size";
     EXPECT_EQ(params.n_heads, 4);
 }
@@ -851,6 +845,6 @@ TEST_F(Qwen35GraphBuildTest, GatedNorm_UsesCorrectWeightAndBuffers)
         << "Gated RMSNorm gamma should be ssm_norm weight";
 
     // Gate should be the Z buffer (gdn_z)
-    EXPECT_EQ(params.gate, buffers_.gdn_z)
+    EXPECT_EQ(params.gate, buffers_.get(BufferId::GDN_Z))
         << "Gated RMSNorm gate should be gdn_z buffer";
 }

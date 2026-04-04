@@ -5,7 +5,7 @@
 #   cp .githooks/pre-commit .git/hooks/pre-commit
 #   chmod +x .git/hooks/pre-commit
 #
-# This hook builds, runs unit tests, Qwen2 parity tests, and E2E server tests
+# This hook builds, runs unit tests, Qwen2 + Qwen35 parity tests, and E2E server tests
 # before allowing a commit to catch accuracy and API regressions early.
 # Override with: git commit --no-verify
 
@@ -19,7 +19,7 @@ BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
 echo -e "${BLUE}==============================================================${NC}"
-echo -e "${BLUE}Pre-commit Hook: Build, Unit Test, Parity, E2E & Benchmarks${NC}"
+echo -e "${BLUE}Pre-commit Hook: Build, Unit Test, Parity (Qwen2+Qwen35), E2E & Benchmarks${NC}"
 echo -e "${BLUE}==============================================================${NC}"
 echo ""
 
@@ -27,7 +27,7 @@ echo ""
 BUILD_V2_INTEGRATION="build_v2_integration"
 
 # Step 1: Build Integration (Release optimizations + debug symbols + assertions)
-echo -e "${YELLOW}[1/5] Building V2 Integration...${NC}"
+echo -e "${YELLOW}[1/6] Building V2 Integration...${NC}"
 if ! cmake -B "$BUILD_V2_INTEGRATION" -S src/v2 -G Ninja -DCMAKE_BUILD_TYPE=Integration > /dev/null 2>&1; then
     echo -e "${RED}❌ CMake configuration failed (Integration)${NC}"
     exit 1
@@ -42,7 +42,7 @@ echo -e "${GREEN}✓ Integration build successful${NC}"
 echo ""
 
 # Step 2: Run Unit Tests (Integration build — fast, isolated component tests only)
-echo -e "${YELLOW}[2/5] Running V2 unit tests (Integration build)...${NC}"
+echo -e "${YELLOW}[2/6] Running V2 unit tests (Integration build)...${NC}"
 echo ""
 
 # Filter: ^V2_Unit_ matches all unit tests (excludes Integration, E2E, Performance)
@@ -67,7 +67,7 @@ echo ""
 # Step 3: Run Qwen2 SingleDevice Parity Tests (prefill + decode, ~2 min)
 # Validates inference accuracy across CPU/CUDA/ROCm with multiple KV cache configs.
 # Catches accuracy regressions in attention, GEMM, and graph wiring.
-echo -e "${YELLOW}[3/5] Running Qwen2 SingleDevice parity tests (prefill + decode)...${NC}"
+echo -e "${YELLOW}[3/6] Running Qwen2 SingleDevice parity tests (prefill + decode)...${NC}"
 echo ""
 
 PARITY_EXIT_CODE=1
@@ -104,10 +104,51 @@ fi
 echo -e "${GREEN}✓ Qwen2 parity tests passed${NC}"
 echo ""
 
-# Step 4: E2E Server Integration Tests (~2 min)
+# Step 4: Run Qwen35 SingleDevice Parity Tests (prefill + decode)
+# Validates Qwen3.5 hybrid GDN/FA architecture: GatedDeltaNet recurrence,
+# short convolution, Q-gate split, partial RoPE, and sigmoid output gate.
+# GPU configs are automatically skipped (CPU-only kernels).
+echo -e "${YELLOW}[4/6] Running Qwen35 SingleDevice parity tests (prefill + decode)...${NC}"
+echo ""
+
+QWEN35_PARITY_EXIT_CODE=1
+QWEN35_PARITY_MAX_ATTEMPTS=3
+for QWEN35_PARITY_ATTEMPT in $(seq 1 "$QWEN35_PARITY_MAX_ATTEMPTS"); do
+    set +e
+    ctest --test-dir "$BUILD_V2_INTEGRATION" -R "^V2_Integration_Parity_Qwen35_SingleDevice$" --output-on-failure --timeout 600
+    QWEN35_PARITY_EXIT_CODE=$?
+    set -e
+
+    if [ $QWEN35_PARITY_EXIT_CODE -eq 0 ]; then
+        break
+    fi
+
+    if [ "$QWEN35_PARITY_ATTEMPT" -lt "$QWEN35_PARITY_MAX_ATTEMPTS" ]; then
+        echo ""
+        echo -e "${YELLOW}Qwen35 parity run was flaky on attempt ${QWEN35_PARITY_ATTEMPT}/${QWEN35_PARITY_MAX_ATTEMPTS}; retrying...${NC}"
+        echo ""
+    fi
+done
+
+echo ""
+if [ $QWEN35_PARITY_EXIT_CODE -ne 0 ]; then
+    echo -e "${RED}❌ Qwen35 parity tests failed — possible accuracy regression in GDN/FA layers.${NC}"
+    echo ""
+    echo -e "${YELLOW}Run manually for details:${NC}"
+    echo -e "${YELLOW}  ctest --test-dir $BUILD_V2_INTEGRATION -R V2_Integration_Parity_Qwen35_SingleDevice -V${NC}"
+    echo ""
+    echo -e "${YELLOW}Commit blocked. Fix failing tests or use:${NC}"
+    echo -e "${YELLOW}  git commit --no-verify${NC}"
+    echo -e "${YELLOW}to skip this check.${NC}"
+    exit 1
+fi
+echo -e "${GREEN}✓ Qwen35 parity tests passed${NC}"
+echo ""
+
+# Step 5: E2E Server Integration Tests (~2 min)
 # Spins up llaminar2 --serve on CPU, CUDA, and ROCm, validates multi-turn
 # inference via the REST API with curl.
-echo -e "${YELLOW}[4/5] Running E2E Server integration tests (cpu, cuda:0, rocm:0)...${NC}"
+echo -e "${YELLOW}[5/6] Running E2E Server integration tests (cpu, cuda:0, rocm:0)...${NC}"
 echo ""
 
 set +e
@@ -132,11 +173,11 @@ fi
 echo -e "${GREEN}✓ E2E server tests passed${NC}"
 echo ""
 
-# Step 5: Performance Regression Benchmarks
+# Step 6: Performance Regression Benchmarks
 # Runs --benchmark on CPU, CUDA, and ROCm against Qwen 2.5 7B Q8_0 and
 # compares prefill/decode throughput against canonical baselines.
 # Devices that are unavailable are skipped gracefully.
-echo -e "${YELLOW}[5/5] Running performance regression benchmarks...${NC}"
+echo -e "${YELLOW}[6/6] Running performance regression benchmarks...${NC}"
 echo ""
 
 REPO_ROOT="$(git rev-parse --show-toplevel)"
@@ -165,6 +206,7 @@ echo -e "${GREEN}✅ SUCCESS: All checks passed!${NC}"
 echo -e "${GREEN}  • Integration build: OK${NC}"
 echo -e "${GREEN}  • Unit tests: OK${NC}"
 echo -e "${GREEN}  • Qwen2 parity: OK${NC}"
+echo -e "${GREEN}  • Qwen35 parity: OK${NC}"
 echo -e "${GREEN}  • E2E server tests: OK${NC}"
 echo -e "${GREEN}  • Performance benchmarks: OK${NC}"
 echo ""

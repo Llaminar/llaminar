@@ -45,5 +45,8 @@
 // MoE stages
 #include "stages/MoEStages.h"
 
+// Qwen 3.5 FA stages
+#include "stages/QGateSplitStage.h"
+
 // Factory
 #include "ComputeStageFactory.h"

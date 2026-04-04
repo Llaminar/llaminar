@@ -5,6 +5,10 @@
  * Pure glue: extracts raw pointers from tensors, validates them, and
  * delegates all computation to the ITensorGatedDeltaNet kernel.
  *
+ * When Q, K, V all point to the same merged QKV buffer (interleaved layout
+ * [seq_len, q_dim + k_dim + v_dim]), this stage deinterleaves them into
+ * separate contiguous arrays before passing to the kernel.
+ *
  * All preprocessing (L2 normalization, query scaling, gate computation)
  * is handled by the kernel, keeping this stage device-agnostic.
  */
@@ -13,6 +17,9 @@
 #include "../../../tensors/Tensors.h"
 #include "../../../tensors/TensorKernels.h"
 #include "../../../utils/Logger.h"
+
+#include <cstring>
+#include <vector>
 
 namespace llaminar2
 {
@@ -76,6 +83,45 @@ namespace llaminar2
         const float *alog_data = alog_base->data();
         const float *dtbias_data = dtbias_base->data();
         float *output_data = out_base->mutable_data();
+
+        // When Q, K, V all point to the same merged QKV buffer, deinterleave them.
+        // Merged layout: [seq_len, q_dim + k_dim + v_dim] per row.
+        // The kernel expects separate contiguous [seq_len, dim] arrays.
+        const bool merged_qkv = (q_data == k_data && k_data == v_data);
+        std::vector<float> q_scratch, k_scratch, v_scratch;
+
+        if (merged_qkv)
+        {
+            const int q_dim = params_.n_heads * params_.d_k;
+            const int k_dim = params_.n_heads * params_.d_k;
+            const int v_dim = params_.n_heads * params_.d_v;
+            const int qkv_stride = q_dim + k_dim + v_dim;
+            const int T = params_.seq_len;
+
+            q_scratch.resize(static_cast<size_t>(T) * q_dim);
+            k_scratch.resize(static_cast<size_t>(T) * k_dim);
+            v_scratch.resize(static_cast<size_t>(T) * v_dim);
+
+            const float *qkv = q_data; // merged buffer
+            for (int t = 0; t < T; ++t)
+            {
+                const float *row = qkv + static_cast<size_t>(t) * qkv_stride;
+                std::memcpy(q_scratch.data() + static_cast<size_t>(t) * q_dim,
+                            row, q_dim * sizeof(float));
+                std::memcpy(k_scratch.data() + static_cast<size_t>(t) * k_dim,
+                            row + q_dim, k_dim * sizeof(float));
+                std::memcpy(v_scratch.data() + static_cast<size_t>(t) * v_dim,
+                            row + q_dim + k_dim, v_dim * sizeof(float));
+            }
+
+            q_data = q_scratch.data();
+            k_data = k_scratch.data();
+            v_data = v_scratch.data();
+
+            LOG_DEBUG("[GDNRecurrenceStage] Deinterleaved merged QKV: "
+                      << T << "x" << qkv_stride << " -> Q(" << T << "x" << q_dim
+                      << "), K(" << T << "x" << k_dim << "), V(" << T << "x" << v_dim << ")");
+        }
 
         bool ok;
         if (params_.seq_len == 1)
@@ -147,21 +193,12 @@ namespace llaminar2
     StageDumpInfo GDNRecurrenceStage::buildDumpInfoImpl() const
     {
         StageDumpInfo info;
-        auto add = [](auto &vec, const char *name, const ITensor *t)
-        {
-            auto *base = dynamic_cast<const TensorBase *>(t);
-            if (base)
-                vec.push_back({name, const_cast<TensorBase *>(base)});
-        };
 
-        add(info.inputs, "Q", params_.Q);
-        add(info.inputs, "K", params_.K);
-        add(info.inputs, "V", params_.V);
-        add(info.inputs, "alpha", params_.alpha);
-        add(info.inputs, "beta", params_.beta);
-        add(info.inputs, "A_log", params_.A_log);
-        add(info.inputs, "dt_bias", params_.dt_bias);
-        add(info.outputs, "output", params_.output);
+        // Use actual seq_len dimensions, not the buffer capacity
+        const size_t rows = static_cast<size_t>(params_.seq_len);
+        const size_t cols = static_cast<size_t>(params_.n_heads) * params_.d_v;
+        if (params_.output)
+            info.addOutput("output", params_.output, rows, cols);
 
         return info;
     }

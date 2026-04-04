@@ -208,6 +208,11 @@ namespace llaminar2
         /// Only used when GEMM outputs K as Q16_1 (K precision fix mode)
         std::vector<float> K_head_scales;
 
+        // === Dynamic Extension Buffers ===
+        /// Model-specific buffers keyed by BufferId (GDN, MoE, etc.)
+        /// Auto-populated from BufferArena for non-core BufferIds.
+        std::unordered_map<BufferId, std::shared_ptr<TensorBase>> extension_buffers;
+
         // === Attention Workspace ===
         std::shared_ptr<TensorBase> workspace_scores;
         std::shared_ptr<TensorBase> workspace_context;
@@ -295,6 +300,13 @@ namespace llaminar2
             {
                 lb.K_head_scales = const_cast<float *>(K_head_scales.data());
                 lb.K_head_scales_capacity = K_head_scales.size();
+            }
+
+            // Dynamic extensions (model-specific buffers flow through automatically)
+            for (const auto &[id, tensor] : extension_buffers)
+            {
+                if (tensor)
+                    lb.extensions[id] = tensor.get();
             }
 
 #ifdef ENABLE_PIPELINE_SNAPSHOTS

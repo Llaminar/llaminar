@@ -33,6 +33,7 @@
 
 #include "GraphSchema.h"
 #include "../../debug/BufferRole.h"
+#include "../../../memory/BufferId.h"
 #include "../../config/RuntimeConfig.h"
 #include "../../../backends/DeviceId.h"
 #include "../../../utils/MPIContext.h"
@@ -176,6 +177,22 @@ namespace llaminar2
 
         /// Partial RoPE factor (fraction of head_dim rotated). Default 1.0 = full.
         float partial_rotary_factor = 1.0f;
+
+        // =================================================================
+        // Model-Specific Extensions (keeps core infrastructure agnostic)
+        // =================================================================
+
+        /// Model-provided formula overrides for BufferAllocator.
+        /// Checked after built-in formulas. Keys are formula strings from
+        /// the schema (e.g. "gdn_inner_size"), values are resolved sizes.
+        /// Populated by model-specific getResolverConfig() overrides.
+        std::unordered_map<std::string, size_t> custom_formulas;
+
+        /// Model-provided buffer name → BufferId mappings.
+        /// Checked when BufferArena::bufferNameToId() returns _COUNT.
+        /// Allows models to register architecture-specific buffers without
+        /// modifying the core buffer mapping table.
+        std::unordered_map<std::string, BufferId> buffer_name_to_id;
     };
 
     /**

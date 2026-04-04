@@ -329,6 +329,9 @@ namespace llaminar2
         GDN_PROJECTION,        ///< 4 separate GEMMs: in_proj_qkv, in_proj_z, in_proj_a, in_proj_b
         SHORT_CONV1D,          ///< Causal depthwise conv1d (kernel=4) + SiLU
         GDN_RECURRENCE,        ///< Delta rule recurrence (chunk prefill, single-step decode)
+
+        // Qwen 3.5 FA-specific
+        Q_GATE_SPLIT, ///< Split interleaved Q+gate GEMM output into separate buffers
     };
 
     /**

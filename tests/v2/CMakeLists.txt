@@ -4439,6 +4439,33 @@ if(ZLIB_FOUND)
     )
 
     # =========================================================================
+    # Qwen3.5 Parity Test Matrix (integration/parity/qwen35/)
+    # =========================================================================
+    # Qwen3.5 architecture: hybrid GDN (Gated Delta Network) + full attention.
+    # 75% GDN layers (conv1d + delta-rule recurrence) + 25% full attention (GQA).
+    # Both layer types share: attention output gating, SwiGLU FFN, residuals.
+    # Uses Qwen3.5-0.8B-Q4_0.gguf model.
+    # =========================================================================
+
+    # ---- Single-Device Parity (CPU, CUDA, ROCm) ----
+    add_executable(v2_integration_parity_qwen35_single_device
+        integration/parity/qwen35/Test__Qwen35_SingleDevice_Parity.cpp
+        ${WORKSPACE_ROOT_PARITY}/external/cnpy/cnpy.cpp
+    )
+    target_link_libraries(v2_integration_parity_qwen35_single_device
+        llaminar2_core v2_test_utils GTest::gtest ZLIB::ZLIB
+    )
+    target_include_directories(v2_integration_parity_qwen35_single_device PRIVATE
+        ${WORKSPACE_ROOT_PARITY}/external/cnpy
+        ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    add_v2_test(V2_Integration_Parity_Qwen35_SingleDevice
+        COMMAND $<TARGET_FILE:v2_integration_parity_qwen35_single_device>
+        LABELS "V2;Integration;Parity;Qwen35;GatedDeltaNet;CPU;CUDA;ROCm;SingleDevice;PyTorch;GoldenReference;FullModel"
+        MPI_PROCS 1
+    )
+
+    # =========================================================================
     # Test: LocalPP Layer-Partitioned Weights
     # Verifies PP stages only load their assigned layer weights (memory efficiency)
     # =========================================================================
@@ -9199,6 +9226,18 @@ target_link_libraries(v2_test_qwen35_schema
 add_v2_test(V2_Unit_Qwen35Schema
     COMMAND $<TARGET_FILE:v2_test_qwen35_schema>
     LABELS "V2;Unit;Qwen35;GraphSchema;GDN;PhaseD"
+    MPI_PROCS 1
+)
+
+# Test: DynamicBufferExtensions — Dynamic extension buffer wiring chain
+# Tests BufferArena::forEachRegistered(), ActivationBuffers::extensions/get(),
+# InferenceState::extension_buffers, toModelBuffers() propagation, and
+# end-to-end auto-discovery with mock model fictitious BufferIds.
+add_executable(v2_test_dynamic_buffer_extensions unit/execution/local_execution/orchestrators/Test__DynamicBufferExtensions.cpp)
+target_link_libraries(v2_test_dynamic_buffer_extensions llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_DynamicBufferExtensions
+    COMMAND $<TARGET_FILE:v2_test_dynamic_buffer_extensions>
+    LABELS "V2;Unit;BufferArena;DynamicExtensions;BufferWiring;InferenceState"
     MPI_PROCS 1
 )
 

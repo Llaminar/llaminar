@@ -23,6 +23,7 @@
 #include "../execution/config/ExecutionPolicy.h"
 #include "../execution/config/RuntimeConfig.h"
 #include "../backends/DeviceId.h"
+#include "../memory/BufferId.h"
 #include "../config/TensorParallelConfig.h"
 #include "../config/TPDomain.h"
 #include <functional>
@@ -442,15 +443,15 @@ namespace llaminar2
         TensorBase *k_norm = nullptr; ///< K norm gamma [head_dim]
 
         // GDN (Gated Delta Network) weights — used by Qwen3.5 GDN layers
-        TensorBase *attn_qkv = nullptr;     ///< Fused QKV projection [d_model, 2*inner_size]
-        TensorBase *attn_gate = nullptr;    ///< Output gate Z [d_model, inner_size]
-        TensorBase *ssm_alpha = nullptr;    ///< Alpha projection (decay) [d_model, time_step_rank]
-        TensorBase *ssm_beta = nullptr;     ///< Beta projection (input gate) [d_model, time_step_rank]
-        TensorBase *ssm_conv1d = nullptr;   ///< Short conv1d weights [kernel, inner_size*2]
-        TensorBase *ssm_dt_bias = nullptr;  ///< Time-step bias [time_step_rank]
-        TensorBase *ssm_a = nullptr;        ///< Decay parameter A [time_step_rank]
-        TensorBase *ssm_norm = nullptr;     ///< GDN output norm gamma [state_size]
-        TensorBase *ssm_out = nullptr;      ///< GDN output projection [inner_size, d_model]
+        TensorBase *attn_qkv = nullptr;    ///< Fused QKV projection [d_model, 2*inner_size]
+        TensorBase *attn_gate = nullptr;   ///< Output gate Z [d_model, inner_size]
+        TensorBase *ssm_alpha = nullptr;   ///< Alpha projection (decay) [d_model, time_step_rank]
+        TensorBase *ssm_beta = nullptr;    ///< Beta projection (input gate) [d_model, time_step_rank]
+        TensorBase *ssm_conv1d = nullptr;  ///< Short conv1d weights [kernel, inner_size*2]
+        TensorBase *ssm_dt_bias = nullptr; ///< Time-step bias [time_step_rank]
+        TensorBase *ssm_a = nullptr;       ///< Decay parameter A [time_step_rank]
+        TensorBase *ssm_norm = nullptr;    ///< GDN output norm gamma [state_size]
+        TensorBase *ssm_out = nullptr;     ///< GDN output projection [inner_size, d_model]
 
         // FFN weights
         TensorBase *gate_proj = nullptr; ///< FFN gate projection
@@ -556,11 +557,19 @@ namespace llaminar2
         /// Shape: [batch_size * seq_len, d_model] - corresponds to ATTENTION_RESIDUAL
         TensorBase *attention_residual_snapshot = nullptr;
 
-        // === GDN (Gated Delta Net) Buffers ===
-        TensorBase *gdn_qkv = nullptr;   ///< GDN QKV projection output [seq_len, qkv_dim]
-        TensorBase *gdn_z = nullptr;     ///< GDN gate Z projection [seq_len, n_heads * d_v]
-        TensorBase *gdn_alpha = nullptr; ///< GDN alpha (dt) projection [seq_len, n_heads]
-        TensorBase *gdn_beta = nullptr;  ///< GDN beta projection [seq_len, n_heads]
+        // === Dynamic Extension Buffers ==========================================
+        /// Model-specific buffers keyed by BufferId (GDN, MoE, etc.)
+        /// Populated automatically from BufferArena — new models add
+        /// BufferId entries and schema buffer specs; no infrastructure changes.
+        std::unordered_map<BufferId, TensorBase *> extensions;
+
+        /// Look up a buffer by BufferId in the extensions map.
+        /// Returns nullptr if the BufferId is not present.
+        TensorBase *get(BufferId id) const
+        {
+            auto it = extensions.find(id);
+            return it != extensions.end() ? it->second : nullptr;
+        }
     };
 
     /**

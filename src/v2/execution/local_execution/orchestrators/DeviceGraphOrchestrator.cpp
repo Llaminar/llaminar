@@ -154,7 +154,8 @@ namespace llaminar2
         if (pp_stage_config_.has_value() && !pp_stage_config_->isValid())
         {
             throw std::invalid_argument("Invalid FactoryPPStageConfig in Dependencies: "
-                                        "first_layer=" + std::to_string(pp_stage_config_->first_layer) +
+                                        "first_layer=" +
+                                        std::to_string(pp_stage_config_->first_layer) +
                                         ", last_layer=" + std::to_string(pp_stage_config_->last_layer));
         }
 
@@ -354,8 +355,17 @@ namespace llaminar2
             BufferId id = BufferArena::bufferNameToId(desc.name);
             if (id == BufferId::_COUNT)
             {
-                LOG_WARN("[DeviceGraphOrchestrator] No BufferId mapping for layer buffer '" << desc.name << "', skipping");
-                continue;
+                // Check model-provided buffer mappings
+                auto it = resolver_config.buffer_name_to_id.find(desc.name);
+                if (it != resolver_config.buffer_name_to_id.end())
+                {
+                    id = it->second;
+                }
+                else
+                {
+                    LOG_WARN("[DeviceGraphOrchestrator] No BufferId mapping for layer buffer '" << desc.name << "', skipping");
+                    continue;
+                }
             }
             size_t rows = desc.shape.size() >= 1 ? desc.shape[0] : 0;
             size_t cols = desc.shape.size() >= 2 ? desc.shape[1] : 0;
@@ -376,8 +386,17 @@ namespace llaminar2
             BufferId id = BufferArena::bufferNameToId(desc.name);
             if (id == BufferId::_COUNT)
             {
-                LOG_WARN("[DeviceGraphOrchestrator] No BufferId mapping for model buffer '" << desc.name << "', skipping");
-                continue;
+                // Check model-provided buffer mappings
+                auto it = resolver_config.buffer_name_to_id.find(desc.name);
+                if (it != resolver_config.buffer_name_to_id.end())
+                {
+                    id = it->second;
+                }
+                else
+                {
+                    LOG_WARN("[DeviceGraphOrchestrator] No BufferId mapping for model buffer '" << desc.name << "', skipping");
+                    continue;
+                }
             }
             size_t rows = desc.shape.size() >= 1 ? desc.shape[0] : 0;
             size_t cols = desc.shape.size() >= 2 ? desc.shape[1] : 0;
@@ -1411,6 +1430,43 @@ namespace llaminar2
         state_.K_rope = arena_->getSharedTensor(BufferId::K_ROPE);
         state_.V_dequant = arena_->getSharedTensor(BufferId::V_DEQUANT);
 
+        // Auto-discover extension buffers (model-specific BufferIds registered
+        // by the schema, e.g. GDN, MoE). Any BufferId that doesn't map to a
+        // named InferenceState field is stored in extension_buffers and flows
+        // through toModelBuffers() → ActivationBuffers::extensions automatically.
+        static const std::unordered_set<BufferId> core_ids = {
+            BufferId::HIDDEN_STATE,
+            BufferId::LOGITS,
+            BufferId::LOGITS_LOCAL,
+            BufferId::NORMALIZED,
+            BufferId::RESIDUAL,
+            BufferId::Q_PROJ,
+            BufferId::K_PROJ,
+            BufferId::V_PROJ,
+            BufferId::ATTN_OUTPUT,
+            BufferId::ATTN_PROJ,
+            BufferId::GATE_PROJ,
+            BufferId::UP_PROJ,
+            BufferId::FFN_OUTPUT,
+            BufferId::ATTN_SCORES_WORKSPACE,
+            BufferId::ATTN_CONTEXT_WORKSPACE,
+            BufferId::GEMM_WORKSPACE,
+            BufferId::Q_ROPE,
+            BufferId::K_ROPE,
+            BufferId::V_DEQUANT,
+        };
+        state_.extension_buffers.clear();
+        arena_->forEachRegistered([&](BufferId id)
+                                  {
+            if (core_ids.count(id) == 0)
+            {
+                auto tensor = arena_->getSharedTensor(id);
+                if (tensor)
+                {
+                    state_.extension_buffers[id] = std::move(tensor);
+                }
+            } });
+
         // Validate required buffers
         if (!state_.hidden || !state_.logits || !state_.normalized ||
             !state_.Q || !state_.K || !state_.V ||
@@ -1825,9 +1881,9 @@ namespace llaminar2
 
         // TEMPORARY DEBUG: trace forward inputs for server regression debugging
         LOG_ERROR("[FORWARD_TRACE] seq_len=" << seq_len
-                  << " pos_offset=" << input.position_offset
-                  << " token_ids[0]=" << (tokens ? tokens[0] : -1)
-                  << " positions_after=" << state_.positions[0]);
+                                             << " pos_offset=" << input.position_offset
+                                             << " token_ids[0]=" << (tokens ? tokens[0] : -1)
+                                             << " positions_after=" << state_.positions[0]);
 
         // Return logits pointer
         return state_.logits->fp32_data();

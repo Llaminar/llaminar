@@ -33,6 +33,7 @@
 #include "stages/GDNRecurrenceStage.h"
 #include "stages/GatedRMSNormStage.h"
 #include "stages/AttentionOutputGateStage.h"
+#include "stages/QGateSplitStage.h"
 
 namespace llaminar2
 {
@@ -226,6 +227,12 @@ namespace llaminar2
          */
         static std::unique_ptr<IComputeStage> createAttentionOutputGate(
             const AttentionOutputGateStage::Params &params);
+
+        /**
+         * @brief Create a Q/gate split stage for FA layers with interleaved Q+gate projection
+         */
+        static std::unique_ptr<IComputeStage> createQGateSplit(
+            const QGateSplitStage::Params &params);
 
         // =====================================================================
         // MPI Communication Stages

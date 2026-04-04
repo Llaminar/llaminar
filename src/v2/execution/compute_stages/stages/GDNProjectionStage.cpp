@@ -4,16 +4,40 @@
  */
 
 #include "GDNProjectionStage.h"
+#include "../../../kernels/KernelFactory.h"
 #include "../../../tensors/Tensors.h"
 #include "../../../tensors/TensorKernels.h"
 #include "../../../utils/Logger.h"
 
 namespace llaminar2
 {
+    using KernelFactory = llaminar::v2::kernels::KernelFactory;
 
     GDNProjectionStage::GDNProjectionStage(Params params)
         : IComputeStage(params.device_id), params_(std::move(params))
     {
+    }
+
+    ITensorGemm *GDNProjectionStage::resolveGemm(
+        const ITensor *weight, ITensorGemm *&cached, const char *name)
+    {
+        if (cached)
+            return cached;
+
+        auto *B_base = requireTensorBase(weight, name);
+        if (!B_base)
+            return nullptr;
+
+        auto *prepared = KernelFactory::getOrCreatePreparedGemmWeights(
+            B_base, params_.device_id);
+        auto *gemm = KernelFactory::getOrCreateGemmEngine(prepared);
+        if (!gemm)
+        {
+            LOG_ERROR("[GDNProjectionStage] Failed to resolve GEMM kernel for " << name);
+            return nullptr;
+        }
+        cached = gemm;
+        return gemm;
     }
 
     bool GDNProjectionStage::execute(IDeviceContext *ctx)
@@ -39,73 +63,57 @@ namespace llaminar2
         if (!A_base)
             return false;
 
-        // Execute each projection via its GEMM kernel
+        // Execute each projection via its GEMM kernel (lazy resolution from weight tensors)
         // QKV projection
-        if (params_.gemm_qkv)
         {
+            auto *gemm = resolveGemm(params_.w_qkv, params_.gemm_qkv, "w_qkv");
+            if (!gemm)
+                return false;
             auto *C_base = asTensorBase(params_.output_qkv, "output_qkv");
-            if (!params_.gemm_qkv->multiply_tensor(
-                    A_base, C_base, M, params_.n_qkv, K))
+            if (!gemm->multiply_tensor(A_base, C_base, M, params_.n_qkv, K))
             {
                 LOG_ERROR("[GDNProjectionStage] QKV GEMM failed");
                 return false;
             }
         }
-        else
-        {
-            LOG_ERROR("[GDNProjectionStage] gemm_qkv kernel not set");
-            return false;
-        }
 
         // Z projection
-        if (params_.gemm_z)
         {
+            auto *gemm = resolveGemm(params_.w_z, params_.gemm_z, "w_z");
+            if (!gemm)
+                return false;
             auto *C_base = asTensorBase(params_.output_z, "output_z");
-            if (!params_.gemm_z->multiply_tensor(
-                    A_base, C_base, M, params_.n_z, K))
+            if (!gemm->multiply_tensor(A_base, C_base, M, params_.n_z, K))
             {
                 LOG_ERROR("[GDNProjectionStage] Z GEMM failed");
                 return false;
             }
         }
-        else
-        {
-            LOG_ERROR("[GDNProjectionStage] gemm_z kernel not set");
-            return false;
-        }
 
         // A projection
-        if (params_.gemm_a)
         {
+            auto *gemm = resolveGemm(params_.w_a, params_.gemm_a, "w_a");
+            if (!gemm)
+                return false;
             auto *C_base = asTensorBase(params_.output_a, "output_a");
-            if (!params_.gemm_a->multiply_tensor(
-                    A_base, C_base, M, params_.n_a, K))
+            if (!gemm->multiply_tensor(A_base, C_base, M, params_.n_a, K))
             {
                 LOG_ERROR("[GDNProjectionStage] A GEMM failed");
                 return false;
             }
         }
-        else
-        {
-            LOG_ERROR("[GDNProjectionStage] gemm_a kernel not set");
-            return false;
-        }
 
         // B projection
-        if (params_.gemm_b)
         {
+            auto *gemm = resolveGemm(params_.w_b, params_.gemm_b, "w_b");
+            if (!gemm)
+                return false;
             auto *C_base = asTensorBase(params_.output_b, "output_b");
-            if (!params_.gemm_b->multiply_tensor(
-                    A_base, C_base, M, params_.n_b, K))
+            if (!gemm->multiply_tensor(A_base, C_base, M, params_.n_b, K))
             {
                 LOG_ERROR("[GDNProjectionStage] B GEMM failed");
                 return false;
             }
-        }
-        else
-        {
-            LOG_ERROR("[GDNProjectionStage] gemm_b kernel not set");
-            return false;
         }
 
         LOG_DEBUG("[GDNProjectionStage] Executed: M=" << M << " K=" << K
@@ -141,22 +149,40 @@ namespace llaminar2
     StageDumpInfo GDNProjectionStage::buildDumpInfoImpl() const
     {
         StageDumpInfo info;
-        auto add_tensor = [](auto &vec, const char *name, const ITensor *t)
-        {
-            auto *base = dynamic_cast<const TensorBase *>(t);
-            if (base)
-                vec.push_back({name, const_cast<TensorBase *>(base)});
-        };
 
-        add_tensor(info.inputs, "input", params_.input);
-        add_tensor(info.inputs, "w_qkv", params_.w_qkv);
-        add_tensor(info.inputs, "w_z", params_.w_z);
-        add_tensor(info.inputs, "w_a", params_.w_a);
-        add_tensor(info.inputs, "w_b", params_.w_b);
-        add_tensor(info.outputs, "output_qkv", params_.output_qkv);
-        add_tensor(info.outputs, "output_z", params_.output_z);
-        add_tensor(info.outputs, "output_a", params_.output_a);
-        add_tensor(info.outputs, "output_b", params_.output_b);
+        // Use actual dimensions (params_.m = total_tokens), not buffer capacity
+        const size_t rows = static_cast<size_t>(params_.m);
+        const size_t k = static_cast<size_t>(params_.k);
+
+        // Inputs: normalized hidden state + 4 weight matrices
+        if (params_.input)
+            info.addInput("input", params_.input, rows, k);
+        if (params_.w_qkv)
+            info.addInput("w_qkv", params_.w_qkv,
+                          params_.w_qkv->shape()[0], params_.w_qkv->shape()[1]);
+        if (params_.w_z)
+            info.addInput("w_z", params_.w_z,
+                          params_.w_z->shape()[0], params_.w_z->shape()[1]);
+        if (params_.w_a)
+            info.addInput("w_a", params_.w_a,
+                          params_.w_a->shape()[0], params_.w_a->shape()[1]);
+        if (params_.w_b)
+            info.addInput("w_b", params_.w_b,
+                          params_.w_b->shape()[0], params_.w_b->shape()[1]);
+
+        // Outputs: 4 projection results
+        if (params_.output_qkv)
+            info.addOutput("output_qkv", params_.output_qkv, rows,
+                           static_cast<size_t>(params_.n_qkv));
+        if (params_.output_z)
+            info.addOutput("output_z", params_.output_z, rows,
+                           static_cast<size_t>(params_.n_z));
+        if (params_.output_a)
+            info.addOutput("output_a", params_.output_a, rows,
+                           static_cast<size_t>(params_.n_a));
+        if (params_.output_b)
+            info.addOutput("output_b", params_.output_b, rows,
+                           static_cast<size_t>(params_.n_b));
 
         return info;
     }

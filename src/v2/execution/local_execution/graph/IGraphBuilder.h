@@ -524,10 +524,23 @@ namespace llaminar2
         }
 
         /// Configure mock model properties
-        void setNumLayers(int n) { num_layers_ = n; config_.n_layers = n; }
-        void setHiddenDim(int d) { hidden_dim_ = d; config_.d_model = d; }
+        void setNumLayers(int n)
+        {
+            num_layers_ = n;
+            config_.n_layers = n;
+        }
+        void setHiddenDim(int d)
+        {
+            hidden_dim_ = d;
+            config_.d_model = d;
+        }
         void setInitialized(bool init) { initialized_ = init; }
-        void setConfig(const GraphConfig &cfg) { config_ = cfg; num_layers_ = cfg.n_layers; hidden_dim_ = cfg.d_model; }
+        void setConfig(const GraphConfig &cfg)
+        {
+            config_ = cfg;
+            num_layers_ = cfg.n_layers;
+            hidden_dim_ = cfg.d_model;
+        }
 
         // =====================================================================
         // Call Tracking (for test assertions)
@@ -558,11 +571,48 @@ namespace llaminar2
             last_layer_ctx_ = {};
         }
 
+        // =====================================================================
+        // Schema / Resolver Support (for buffer management testing)
+        // =====================================================================
+
+        /// Override getSchema() to return a custom schema
+        GraphSchema getSchema() const override
+        {
+            if (schema_)
+                return *schema_;
+            return {};
+        }
+
+        /// Override getResolverConfig() to return a custom resolver config
+        GraphResolverConfig getResolverConfig(int seq_len) const override
+        {
+            if (resolver_config_factory_)
+                return resolver_config_factory_(seq_len);
+            return {};
+        }
+
+        /// Set the schema returned by getSchema()
+        void setSchema(GraphSchema schema)
+        {
+            schema_ = std::make_unique<GraphSchema>(std::move(schema));
+        }
+
+        /// Set a factory for resolver config (receives seq_len)
+        using ResolverConfigFactory = std::function<GraphResolverConfig(int)>;
+        void setResolverConfigFactory(ResolverConfigFactory factory)
+        {
+            resolver_config_factory_ = std::move(factory);
+        }
+
     private:
         // Factory functions for dynamic graph creation
         ForwardGraphFactory forward_graph_factory_;
         LayerGraphFactory layer_graph_factory_;
         std::vector<LayerGraphFactory> layer_graph_factories_;
+
+        // Schema / Resolver support
+        std::unique_ptr<GraphSchema> schema_;
+        ResolverConfigFactory resolver_config_factory_;
 
         // Model properties
         GraphConfig config_{};

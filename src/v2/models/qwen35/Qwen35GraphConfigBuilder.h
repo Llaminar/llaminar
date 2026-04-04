@@ -55,7 +55,7 @@ namespace llaminar2
          *                  ssm_conv1d, ssm_dt.bias, ssm_a, ssm_norm, ssm_out
          * FA layers load:  attn_q, attn_k, attn_v, attn_output,
          *                  attn_q_norm, attn_k_norm, attn_gate
-         * Both load:       attn_norm, post_attention_norm, ffn_gate/up/down, ffn_norm
+         * Both load:       attn_norm, post_attention_norm (as ffn_norm), ffn_gate/up/down
          */
         ModelWeights buildWeights(WeightAccessor get_weight) override;
     };

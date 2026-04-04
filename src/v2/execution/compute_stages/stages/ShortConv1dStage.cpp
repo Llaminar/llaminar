@@ -105,18 +105,11 @@ namespace llaminar2
     StageDumpInfo ShortConv1dStage::buildDumpInfoImpl() const
     {
         StageDumpInfo info;
-        auto add_tensor = [](auto &vec, const char *name, const ITensor *t)
-        {
-            auto *base = dynamic_cast<const TensorBase *>(t);
-            if (base)
-                vec.push_back({name, const_cast<TensorBase *>(base)});
-        };
 
-        add_tensor(info.inputs, "input", params_.input);
-        add_tensor(info.inputs, "weight", params_.weight);
-        if (params_.bias)
-            add_tensor(info.inputs, "bias", params_.bias);
-        add_tensor(info.outputs, "output", params_.output);
+        // Use addOutput with proper rows/cols so snapshot capture works
+        auto *out_base = dynamic_cast<const TensorBase *>(params_.output);
+        if (out_base)
+            info.addOutput("output", params_.output, out_base->rows(), out_base->cols());
 
         return info;
     }

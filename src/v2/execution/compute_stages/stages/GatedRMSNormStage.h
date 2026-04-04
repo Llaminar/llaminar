@@ -41,11 +41,20 @@ namespace llaminar2
             ITensor *input = nullptr;       ///< Input activation [seq_len, d_model]
             ITensor *gate = nullptr;        ///< Gating tensor [seq_len, d_model]
             ITensor *output = nullptr;      ///< Output [seq_len, d_model]
-            const ITensor *gamma = nullptr; ///< RMSNorm gamma weights [d_model]
+            const ITensor *gamma = nullptr; ///< RMSNorm gamma weights [norm_dim]
 
             float eps = 1e-6f;         ///< Epsilon for numerical stability
             bool subtract_one = false; ///< gamma_effective = 1.0 + gamma_stored
             int seq_len = 0;           ///< Explicit sequence length
+
+            /// Per-head normalization size. When > 0, normalizes over chunks of
+            /// norm_dim elements (e.g., d_v=128 for head-level norm). When 0,
+            /// normalizes over the full model dimension (d_model).
+            int norm_dim = 0;
+
+            /// Apply SiLU activation to gate before multiplying.
+            /// Required for GDN layers: output = RMSNorm(input) * SiLU(gate).
+            bool gate_silu = false;
 
             // Optional BufferIds for contract-based coherence
             std::optional<BufferId> input_buffer_id;

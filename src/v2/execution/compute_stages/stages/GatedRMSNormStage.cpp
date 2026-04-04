@@ -57,34 +57,52 @@ namespace llaminar2
             return false;
         }
 
-        // For each token: RMSNorm(input) * gate
+        // Determine normalization dimension. When norm_dim > 0, normalize
+        // over chunks of norm_dim (per-head normalization). Otherwise, full d_model.
+        const size_t norm_dim = (params_.norm_dim > 0)
+                                    ? static_cast<size_t>(params_.norm_dim)
+                                    : d_model;
+        const size_t n_groups = d_model / norm_dim; // Number of heads (or 1 for full-dim)
+
         for (int t = 0; t < seq_len; ++t)
         {
-            const size_t offset = static_cast<size_t>(t) * d_model;
+            const size_t row_offset = static_cast<size_t>(t) * d_model;
 
-            // Compute RMS
-            float sum_sq = 0.0f;
-            for (size_t j = 0; j < d_model; ++j)
+            for (size_t g = 0; g < n_groups; ++g)
             {
-                const float v = input_data[offset + j];
-                sum_sq += v * v;
-            }
-            const float rms = std::sqrt(sum_sq / static_cast<float>(d_model) + params_.eps);
-            const float inv_rms = 1.0f / rms;
+                const size_t offset = row_offset + g * norm_dim;
 
-            // Normalize, apply gamma (with optional subtract_one), multiply by gate
-            for (size_t j = 0; j < d_model; ++j)
-            {
-                const float normalized = input_data[offset + j] * inv_rms;
-                const float gamma_eff = params_.subtract_one
-                                            ? (1.0f + gamma_data[j])
-                                            : gamma_data[j];
-                output_data[offset + j] = normalized * gamma_eff * gate_data[offset + j];
+                // Compute RMS over norm_dim elements
+                float sum_sq = 0.0f;
+                for (size_t j = 0; j < norm_dim; ++j)
+                {
+                    const float v = input_data[offset + j];
+                    sum_sq += v * v;
+                }
+                const float rms = std::sqrt(sum_sq / static_cast<float>(norm_dim) + params_.eps);
+                const float inv_rms = 1.0f / rms;
+
+                // Normalize, apply gamma (with optional subtract_one), multiply by gate
+                for (size_t j = 0; j < norm_dim; ++j)
+                {
+                    const float normalized = input_data[offset + j] * inv_rms;
+                    const float gamma_eff = params_.subtract_one
+                                                ? (1.0f + gamma_data[j])
+                                                : gamma_data[j];
+                    const float gate_val = gate_data[offset + j];
+                    const float gate_act = params_.gate_silu
+                                               ? gate_val / (1.0f + std::exp(-gate_val))
+                                               : gate_val;
+                    output_data[offset + j] = normalized * gamma_eff * gate_act;
+                }
             }
         }
 
         LOG_DEBUG("[GatedRMSNormStage] Executed: seq_len=" << seq_len
                                                            << " d_model=" << d_model
+                                                           << " norm_dim=" << norm_dim
+                                                           << " n_groups=" << n_groups
+                                                           << " gate_silu=" << params_.gate_silu
                                                            << " subtract_one=" << params_.subtract_one);
         return true;
     }
@@ -115,19 +133,17 @@ namespace llaminar2
     StageDumpInfo GatedRMSNormStage::buildDumpInfoImpl() const
     {
         StageDumpInfo info;
-        auto *input_base = dynamic_cast<TensorBase *>(params_.input);
-        auto *gate_base = dynamic_cast<TensorBase *>(params_.gate);
-        auto *output_base = dynamic_cast<TensorBase *>(params_.output);
-        auto *gamma_base = dynamic_cast<const TensorBase *>(params_.gamma);
 
-        if (input_base)
-            info.inputs.push_back({"input", input_base});
-        if (gate_base)
-            info.inputs.push_back({"gate", gate_base});
-        if (gamma_base)
-            info.weights.push_back({"gamma", const_cast<TensorBase *>(gamma_base)});
-        if (output_base)
-            info.outputs.push_back({"output", output_base});
+        // Use actual seq_len dimensions, not the buffer capacity.
+        // Output cols = same as input cols (norm doesn't change dimension).
+        auto *out_base = dynamic_cast<const TensorBase *>(params_.output);
+        if (out_base)
+        {
+            const size_t rows = params_.seq_len > 0
+                                    ? static_cast<size_t>(params_.seq_len)
+                                    : out_base->rows();
+            info.addOutput("output", params_.output, rows, out_base->cols());
+        }
 
         return info;
     }

@@ -51,7 +51,9 @@ namespace llaminar2
 
                 const float x = alpha[idx] + dt_bias[h];
                 const float sp = (x > 20.0f) ? x : std::log1p(std::exp(x));
-                g_out[idx] = -std::exp(A_log[h]) * sp;
+                // GGUF stores -exp(A_log), so use it directly as the decay coefficient.
+                // g = -exp(A_log) * softplus(alpha + dt_bias) = stored_value * softplus(...)
+                g_out[idx] = A_log[h] * sp;
 
                 beta_sig_out[idx] = 1.0f / (1.0f + std::exp(-beta_raw[idx]));
             }

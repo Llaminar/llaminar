@@ -10,6 +10,7 @@
 #include "../../../tensors/BlockStructures.h"
 #include "../../../tensors/TensorKernels.h"
 #include "../../../utils/Logger.h"
+#include "../../../kernels/cpu/primitives/RoPEPrimitives.h"
 #include "../../../kernels/KernelFactory.h"
 #include "../../../interfaces/IWorkspaceConsumer.h"
 #include <cstring>
@@ -347,6 +348,30 @@ namespace llaminar2
         // When skip_k is true (RoPE-on-read mode), K is stored pre-RoPE in the
         // KV cache and RoPE will be fused into the attention dequant path.
         auto *K_for_rope = (params_.skip_k) ? nullptr : K_base;
+
+        // Partial RoPE: when partial_rotary_factor < 1.0, use dedicated primitive
+        // that separates stride (head_dim) from rotation (rotary_dim).
+        // The standard kernel interface conflates both into a single head_dim parameter.
+        if (params_.partial_rotary_factor < 1.0f &&
+            Q_base->native_type() == TensorType::FP32)
+        {
+            // Build position_ids for the primitives (they require explicit n_past)
+            int n_past = params_.pos_offset;
+            if (position_ids_ptr)
+                n_past = position_ids_ptr[0];
+
+            float *q_data = Q_base->mutable_data();
+            float *k_data = (K_for_rope) ? K_for_rope->mutable_data() : nullptr;
+
+            primitives::apply_rope_partial(
+                q_data, k_data,
+                seq_len, params_.head_dim, rotary_dim,
+                params_.n_heads, n_kv_heads,
+                n_past, params_.theta_base);
+
+            return true;
+        }
+
         return kernel->apply_tensor(
             Q_base,
             K_for_rope,

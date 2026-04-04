@@ -347,6 +347,27 @@ namespace llaminar2
          */
         bool isAllocated() const { return allocated_; }
 
+        /**
+         * @brief Iterate over all registered BufferIds.
+         *
+         * Calls fn(BufferId) for every buffer that has been registered
+         * (arena-owned or external). Enables auto-discovery of model-specific
+         * buffers without hardcoding in orchestrator infrastructure.
+         *
+         * @param fn  Callable accepting a single BufferId argument
+         */
+        template <typename Fn>
+        void forEachRegistered(Fn &&fn) const
+        {
+            for (size_t i = 0; i < kBufferCount; ++i)
+            {
+                if (buffers_[i].registered)
+                {
+                    fn(static_cast<BufferId>(i));
+                }
+            }
+        }
+
     private:
         /// Internal state for each managed buffer slot
         struct ManagedBuffer

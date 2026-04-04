@@ -155,7 +155,7 @@ namespace llaminar2
             // Shared weights (present on ALL layers)
             // ==============================================================
             layer.attn_norm = get_weight(prefix + "attn_norm.weight").get();
-            layer.ffn_norm = get_weight(prefix + "ffn_norm.weight").get();
+            layer.ffn_norm = get_weight(prefix + "post_attention_norm.weight").get();
             layer.gate_proj = get_weight(prefix + "ffn_gate.weight").get();
             layer.up_proj = get_weight(prefix + "ffn_up.weight").get();
             layer.down_proj = get_weight(prefix + "ffn_down.weight").get();

@@ -1,0 +1,263 @@
+#!/usr/bin/env python3
+"""
+Generate PyTorch Qwen 3.5 pipeline reference snapshots for V2 parity testing.
+
+Uses the Qwen35ReferenceModel (registry-based) which handles heterogeneous
+GDN + full attention layers via HuggingFace forward hooks.
+
+Captures all intermediate activations as individual .npy files, compatible
+with the C++ parity test infrastructure (cnpy::npy_load).
+
+Usage:
+    python3 generate_qwen35_pipeline_snapshots.py \
+        --model models/Qwen3.5-0.8B-Q4_0.gguf \
+        --output pytorch_qwen35_snapshots
+
+    python3 generate_qwen35_pipeline_snapshots.py \
+        --model models/Qwen3.5-0.8B-Q4_0.gguf \
+        --prompt "The quick brown fox" \
+        --decode-steps 3
+
+@author David Sanftenberg
+"""
+
+import os
+import sys
+import argparse
+from pathlib import Path
+from typing import Optional, Set
+
+import numpy as np
+import torch
+
+# Add parent directories to path
+script_dir = Path(__file__).parent.absolute()
+python_dir = script_dir.parent.absolute()
+workspace_dir = python_dir.parent.absolute()
+
+for path_to_add in [str(python_dir), str(workspace_dir)]:
+    if path_to_add not in sys.path:
+        sys.path.insert(0, path_to_add)
+
+from python.reference import create_reference_model, PipelineStage
+from python.reference.pipeline_stages import stage_to_string
+
+
+def save_snapshots_as_npy(
+    snapshots: dict,
+    output_dir: Path,
+    prefix: str = "",
+    verbose: bool = False,
+):
+    """
+    Save captured snapshots as individual .npy files.
+
+    File naming matches the existing Qwen2/3 convention:
+      - Global stages: EMBEDDING.npy, FINAL_NORM.npy, LM_HEAD.npy
+      - Per-layer stages: layer{N}_{STAGE_NAME}.npy
+      - Decode steps: decode_step{S}_{key}.npy
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+    count = 0
+    for (stage, layer_idx), data in snapshots.items():
+        stage_name = stage_to_string(stage)
+        if layer_idx >= 0:
+            key = f"layer{layer_idx}_{stage_name}"
+        else:
+            key = stage_name
+
+        if prefix:
+            key = f"{prefix}_{key}"
+
+        npy_path = output_dir / f"{key}.npy"
+        np.save(npy_path, data)
+        count += 1
+        if verbose:
+            print(f"  Saved {key}: shape={list(data.shape)}")
+
+    return count
+
+
+def write_metadata(
+    output_dir: Path,
+    model_path: str,
+    model,
+    prompt: str,
+    token_ids: list,
+    decode_steps: int,
+    decode_tokens: Optional[list] = None,
+):
+    """Write metadata.txt compatible with parity test loader."""
+    config = model.hf_model.config
+    metadata_path = output_dir / "metadata.txt"
+    with open(metadata_path, "w") as f:
+        f.write(f"Model: {model_path}\n")
+        arch = getattr(config, "architectures", [config.__class__.__name__])
+        f.write(f"Architecture: {arch[0] if arch else config.__class__.__name__}\n")
+        f.write(f"n_layers: {config.num_hidden_layers}\n")
+        f.write(f"n_heads: {config.num_attention_heads}\n")
+        n_kv_heads = getattr(config, "num_key_value_heads", config.num_attention_heads)
+        f.write(f"n_kv_heads: {n_kv_heads}\n")
+        f.write(f"d_model: {config.hidden_size}\n")
+        head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+        f.write(f"d_head: {head_dim}\n")
+        f.write(f"d_ff: {config.intermediate_size}\n")
+        f.write(f"vocab_size: {config.vocab_size}\n")
+        f.write(f"prompt: {prompt}\n")
+        f.write(f"token_ids: {','.join(map(str, token_ids))}\n")
+        f.write(f"decode_steps: {decode_steps}\n")
+        if decode_tokens:
+            f.write(f"decode_tokens: {','.join(map(str, decode_tokens))}\n")
+
+
+def run_prefill_and_decode(
+    model,
+    prompt: str,
+    decode_steps: int,
+    output_dir: Path,
+    verbose: bool = False,
+):
+    """
+    Run prefill + optional decode steps with snapshot capture.
+
+    Returns (total_snapshot_count, token_ids, decode_tokens).
+    """
+    # Tokenize
+    tokenizer = model.tokenizer
+    if tokenizer is None:
+        raise RuntimeError("Tokenizer not loaded. model.load_model() should initialize it.")
+    encoding = tokenizer(prompt, return_tensors="pt")
+    token_ids = encoding["input_ids"][0].tolist()
+    print(f"  Token IDs ({len(token_ids)}): {token_ids[:20]}{'...' if len(token_ids) > 20 else ''}")
+
+    # ---- Prefill ----
+    print("\n[Prefill] Running forward pass...")
+    result = model.forward(token_ids, clear_snapshots=True)
+    prefill_snaps = model.get_snapshots()
+    total = save_snapshots_as_npy(prefill_snaps, output_dir, prefix="", verbose=verbose)
+    print(f"  Captured {total} prefill snapshots")
+
+    # Get next token (greedy)
+    logits = result["logits"]
+    next_token = int(np.argmax(logits[0, -1, :]))
+    print(f"  Next token (greedy): {next_token}")
+
+    decode_tokens = []
+    if decode_steps <= 0:
+        return total, token_ids, decode_tokens
+
+    # ---- Decode steps ----
+    # Build the full input so far
+    all_tokens = list(token_ids) + [next_token]
+    decode_tokens.append(next_token)
+
+    for step in range(decode_steps):
+        prefix = f"decode_step{step}"
+        print(f"\n[Decode step {step}] token={all_tokens[-1]}")
+
+        # Run full forward on all tokens so far (no KV cache — matches C++ test)
+        result = model.forward(all_tokens, clear_snapshots=True)
+        step_snaps = model.get_snapshots()
+        n = save_snapshots_as_npy(step_snaps, output_dir, prefix=prefix, verbose=verbose)
+        total += n
+        print(f"  Captured {n} decode snapshots for step {step}")
+
+        # Pick next token
+        logits = result["logits"]
+        next_token = int(np.argmax(logits[0, -1, :]))
+        all_tokens.append(next_token)
+        decode_tokens.append(next_token)
+        print(f"  Next token (greedy): {next_token}")
+
+    return total, token_ids, decode_tokens
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Generate PyTorch Qwen 3.5 pipeline reference snapshots",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+    python3 generate_qwen35_pipeline_snapshots.py \\
+        --model models/Qwen3.5-0.8B-Q4_0.gguf
+
+    python3 generate_qwen35_pipeline_snapshots.py \\
+        --model models/Qwen3.5-0.8B-Q4_0.gguf \\
+        --prompt "The quick brown fox" \\
+        --decode-steps 3 \\
+        --output pytorch_qwen35_snapshots
+""",
+    )
+
+    parser.add_argument(
+        "--model",
+        type=str,
+        required=True,
+        help="Path to Qwen3.5 GGUF model file",
+    )
+    parser.add_argument(
+        "--prompt",
+        type=str,
+        default="The quick brown fox jumps over the lazy dog",
+        help='Input prompt (default: "The quick brown fox jumps over the lazy dog")',
+    )
+    parser.add_argument(
+        "--decode-steps",
+        type=int,
+        default=0,
+        help="Number of decode steps after prefill (default: 0)",
+    )
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=None,
+        help="Output directory (default: pytorch_qwen35_snapshots)",
+    )
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="Verbose logging",
+    )
+
+    args = parser.parse_args()
+
+    if args.output is None:
+        args.output = Path("pytorch_qwen35_snapshots")
+
+    print(f"Generating Qwen 3.5 pipeline snapshots...")
+    print(f"  Model: {args.model}")
+    print(f"  Prompt: '{args.prompt}'")
+    print(f"  Output: {args.output}")
+    print(f"  Decode steps: {args.decode_steps}")
+
+    # Create and load model via registry
+    print("\nLoading model...")
+    model = create_reference_model("qwen35", args.model)
+    print("Model loaded successfully")
+
+    # Run inference and save snapshots
+    total, token_ids, decode_tokens = run_prefill_and_decode(
+        model,
+        args.prompt,
+        args.decode_steps,
+        args.output,
+        verbose=args.verbose,
+    )
+
+    # Write metadata
+    write_metadata(
+        args.output,
+        args.model,
+        model,
+        args.prompt,
+        token_ids,
+        args.decode_steps,
+        decode_tokens,
+    )
+
+    print(f"\n✓ Done! {total} snapshots saved to: {args.output}")
+
+
+if __name__ == "__main__":
+    main()

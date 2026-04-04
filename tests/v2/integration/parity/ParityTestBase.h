@@ -1526,8 +1526,11 @@ namespace llaminar2::test::parity
 
         /**
          * @brief Regenerate PyTorch snapshots from the GGUF model
+         *
+         * Override in derived classes to use architecture-specific generators
+         * (e.g., Qwen3.5 requires a dedicated generator for GDN layers).
          */
-        bool regeneratePyTorchSnapshots()
+        virtual bool regeneratePyTorchSnapshots()
         {
             LOG_INFO("[" << getBackendName() << " Parity] Regenerating PyTorch snapshots from GGUF: " << config_.model_path);
 
@@ -2413,6 +2416,65 @@ namespace llaminar2::test::parity
         }
 
         /**
+         * @brief Read prefill token IDs from metadata file
+         *
+         * Models with different tokenizers (e.g., Qwen3.5 vocab_size=248320 vs
+         * Qwen2/3 vocab_size=151936) produce different token IDs for the same prompt.
+         * This reads the actual token_ids used by the PyTorch reference generator
+         * so the C++ test uses matching input.
+         */
+        std::vector<int> readPrefillTokensFromMetadata()
+        {
+            std::string metadata_path = config_.snapshot_dir + "/metadata.txt";
+            std::ifstream file(metadata_path);
+            if (!file.is_open())
+            {
+                LOG_WARN("[Parity] Could not open metadata file: " << metadata_path);
+                return {};
+            }
+
+            std::vector<int> tokens;
+            std::string line;
+            while (std::getline(file, line))
+            {
+                if (line.find("token_ids:") == 0)
+                {
+                    size_t colon_pos = line.find(':');
+                    if (colon_pos != std::string::npos)
+                    {
+                        std::string tokens_str = line.substr(colon_pos + 1);
+                        size_t start = tokens_str.find_first_not_of(" \t");
+                        if (start != std::string::npos)
+                            tokens_str = tokens_str.substr(start);
+
+                        std::stringstream ss(tokens_str);
+                        std::string token_str;
+                        while (std::getline(ss, token_str, ','))
+                        {
+                            size_t tok_start = token_str.find_first_not_of(" \t");
+                            size_t tok_end = token_str.find_last_not_of(" \t");
+                            if (tok_start != std::string::npos && tok_end != std::string::npos)
+                                token_str = token_str.substr(tok_start, tok_end - tok_start + 1);
+                            if (!token_str.empty())
+                            {
+                                try
+                                {
+                                    tokens.push_back(std::stoi(token_str));
+                                }
+                                catch (const std::exception &)
+                                {
+                                    LOG_WARN("[Parity] Failed to parse prefill token: " << token_str);
+                                }
+                            }
+                        }
+                    }
+                    break;
+                }
+            }
+            return tokens;
+        }
+
+        /**
          * @brief Run single-device prefill parity test and return summary
          *
          * This is the main test driver for SINGLE-DEVICE tests - compares
@@ -2468,8 +2530,6 @@ namespace llaminar2::test::parity
                 "Q_ROPE", "K_ROPE",
                 "ATTENTION_CONTEXT", "ATTENTION_OUTPUT", "ATTENTION_RESIDUAL",
                 "FFN_NORM", "FFN_GATE", "FFN_UP", "FFN_SWIGLU", "FFN_DOWN", "FFN_RESIDUAL"};
-
-            // Get snapshot keys
             auto snapshot_keys = runner_->getSnapshotKeys();
             std::set<std::string> available_snapshots(snapshot_keys.begin(), snapshot_keys.end());
 
@@ -3162,31 +3222,44 @@ namespace llaminar2::test::parity
                     continue;
                 }
 
+                // Python decode snapshots may contain the full sequence
+                // (shape [1, seq_len, vocab]) when generated via full-sequence
+                // forward. Extract the LAST position's logits for comparison.
+                const float *pytorch_logits = pytorch_lm_head.data();
+                size_t pytorch_logits_count = pytorch_lm_head.size();
+                if (pytorch_logits_count > vocab_size)
+                {
+                    size_t pytorch_seq_len = pytorch_logits_count / vocab_size;
+                    size_t last_offset = (pytorch_seq_len - 1) * vocab_size;
+                    pytorch_logits = pytorch_lm_head.data() + last_offset;
+                    pytorch_logits_count = vocab_size;
+                }
+
                 // Compare with PyTorch
                 DecodeStepStats step_stats;
                 step_stats.step_idx = static_cast<int>(step);
 
                 step_stats.cosine_similarity = computeCosineSimilarity(
-                    llaminar_logits, pytorch_lm_head.data(),
-                    std::min(vocab_size, pytorch_lm_head.size()));
+                    llaminar_logits, pytorch_logits,
+                    std::min(vocab_size, pytorch_logits_count));
 
                 step_stats.kl_divergence = computeKLDivergence(
-                    llaminar_logits, pytorch_lm_head.data(),
+                    llaminar_logits, pytorch_logits,
                     vocab_size, vocab_size);
 
                 step_stats.top1_overlap = computeTopKOverlap(
-                    llaminar_logits, pytorch_lm_head.data(),
+                    llaminar_logits, pytorch_logits,
                     vocab_size, vocab_size, 1);
 
                 step_stats.top5_overlap = computeTopKOverlap(
-                    llaminar_logits, pytorch_lm_head.data(),
+                    llaminar_logits, pytorch_logits,
                     vocab_size, vocab_size, 5);
 
                 // Find argmax tokens
                 step_stats.llaminar_token = 0;
                 step_stats.pytorch_token = 0;
                 float max_l = llaminar_logits[0];
-                float max_p = pytorch_lm_head[0];
+                float max_p = pytorch_logits[0];
 
                 for (size_t i = 1; i < vocab_size; ++i)
                 {
@@ -3195,9 +3268,9 @@ namespace llaminar2::test::parity
                         max_l = llaminar_logits[i];
                         step_stats.llaminar_token = static_cast<int>(i);
                     }
-                    if (pytorch_lm_head[i] > max_p)
+                    if (pytorch_logits[i] > max_p)
                     {
-                        max_p = pytorch_lm_head[i];
+                        max_p = pytorch_logits[i];
                         step_stats.pytorch_token = static_cast<int>(i);
                     }
                 }
@@ -3215,7 +3288,7 @@ namespace llaminar2::test::parity
                 if (config_.pytorch_top1_in_topk > 0)
                 {
                     float topk_recall = pytorchTop1InLlaminarTopK(
-                        llaminar_logits, pytorch_lm_head.data(),
+                        llaminar_logits, pytorch_logits,
                         vocab_size, vocab_size, config_.pytorch_top1_in_topk);
                     step_stats.top3_match = (topk_recall >= 1.0f - 1e-6f);
                 }
@@ -3454,31 +3527,44 @@ namespace llaminar2::test::parity
                     continue;
                 }
 
+                // Python decode snapshots may contain the full sequence
+                // (shape [1, seq_len, vocab]) when generated via full-sequence
+                // forward. Extract the LAST position's logits for comparison.
+                const float *pytorch_logits = pytorch_lm_head.data();
+                size_t pytorch_logits_count = pytorch_lm_head.size();
+                if (pytorch_logits_count > vocab_size)
+                {
+                    size_t pytorch_seq_len = pytorch_logits_count / vocab_size;
+                    size_t last_offset = (pytorch_seq_len - 1) * vocab_size;
+                    pytorch_logits = pytorch_lm_head.data() + last_offset;
+                    pytorch_logits_count = vocab_size;
+                }
+
                 // Compare with PyTorch
                 DecodeStepStats step_stats;
                 step_stats.step_idx = static_cast<int>(step);
 
                 step_stats.cosine_similarity = computeCosineSimilarity(
-                    llaminar_logits, pytorch_lm_head.data(),
-                    std::min(decode_logits_size, pytorch_lm_head.size()));
+                    llaminar_logits, pytorch_logits,
+                    std::min(decode_logits_size, pytorch_logits_count));
 
                 step_stats.kl_divergence = computeKLDivergence(
-                    llaminar_logits, pytorch_lm_head.data(),
+                    llaminar_logits, pytorch_logits,
                     decode_logits_size, vocab_size);
 
                 step_stats.top1_overlap = computeTopKOverlap(
-                    llaminar_logits, pytorch_lm_head.data(),
+                    llaminar_logits, pytorch_logits,
                     decode_logits_size, vocab_size, 1);
 
                 step_stats.top5_overlap = computeTopKOverlap(
-                    llaminar_logits, pytorch_lm_head.data(),
+                    llaminar_logits, pytorch_logits,
                     decode_logits_size, vocab_size, 5);
 
                 // Find argmax tokens
                 step_stats.llaminar_token = 0;
                 step_stats.pytorch_token = 0;
                 float max_l = llaminar_logits[0];
-                float max_p = pytorch_lm_head[0];
+                float max_p = pytorch_logits[0];
 
                 for (size_t i = 1; i < vocab_size; ++i)
                 {
@@ -3487,9 +3573,9 @@ namespace llaminar2::test::parity
                         max_l = llaminar_logits[i];
                         step_stats.llaminar_token = static_cast<int>(i);
                     }
-                    if (pytorch_lm_head[i] > max_p)
+                    if (pytorch_logits[i] > max_p)
                     {
-                        max_p = pytorch_lm_head[i];
+                        max_p = pytorch_logits[i];
                         step_stats.pytorch_token = static_cast<int>(i);
                     }
                 }
@@ -3511,7 +3597,7 @@ namespace llaminar2::test::parity
                 if (config_.pytorch_top1_in_topk > 0)
                 {
                     float topk_recall = pytorchTop1InLlaminarTopK(
-                        llaminar_logits, pytorch_lm_head.data(),
+                        llaminar_logits, pytorch_logits,
                         vocab_size, vocab_size, config_.pytorch_top1_in_topk);
                     step_stats.top3_match = (topk_recall >= 1.0f - 1e-6f);
                 }

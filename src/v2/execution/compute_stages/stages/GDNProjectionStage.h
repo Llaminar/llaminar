@@ -43,24 +43,24 @@ namespace llaminar2
             int k = 0;                      ///< d_model (cols of input)
 
             // QKV projection
-            const ITensor *w_qkv = nullptr;    ///< Weight [d_model, qkv_dim]
-            ITensor *output_qkv = nullptr;     ///< Output [seq_len, qkv_dim]
-            int n_qkv = 0;                     ///< qkv_dim = 2*n_heads*d_k + n_heads*d_v
+            const ITensor *w_qkv = nullptr; ///< Weight [d_model, qkv_dim]
+            ITensor *output_qkv = nullptr;  ///< Output [seq_len, qkv_dim]
+            int n_qkv = 0;                  ///< qkv_dim = 2*n_heads*d_k + n_heads*d_v
 
             // Z (gate) projection
-            const ITensor *w_z = nullptr;      ///< Weight [d_model, n_heads * d_v]
-            ITensor *output_z = nullptr;       ///< Output [seq_len, n_heads * d_v]
-            int n_z = 0;                       ///< n_heads * d_v
+            const ITensor *w_z = nullptr; ///< Weight [d_model, n_heads * d_v]
+            ITensor *output_z = nullptr;  ///< Output [seq_len, n_heads * d_v]
+            int n_z = 0;                  ///< n_heads * d_v
 
             // A (alpha / dt) projection
-            const ITensor *w_a = nullptr;      ///< Weight [d_model, n_heads]
-            ITensor *output_a = nullptr;       ///< Output [seq_len, n_heads]
-            int n_a = 0;                       ///< n_heads
+            const ITensor *w_a = nullptr; ///< Weight [d_model, n_heads]
+            ITensor *output_a = nullptr;  ///< Output [seq_len, n_heads]
+            int n_a = 0;                  ///< n_heads
 
             // B (beta) projection
-            const ITensor *w_b = nullptr;      ///< Weight [d_model, n_heads]
-            ITensor *output_b = nullptr;       ///< Output [seq_len, n_heads]
-            int n_b = 0;                       ///< n_heads
+            const ITensor *w_b = nullptr; ///< Weight [d_model, n_heads]
+            ITensor *output_b = nullptr;  ///< Output [seq_len, n_heads]
+            int n_b = 0;                  ///< n_heads
 
             // Cached GEMM kernels (set during graph construction)
             ITensorGemm *gemm_qkv = nullptr;
@@ -92,6 +92,11 @@ namespace llaminar2
         const Params &getParams() const { return params_; }
 
     private:
+        /// Lazily resolve a GEMM kernel from a weight tensor via KernelFactory.
+        /// Caches the result in @p cached for subsequent calls (like GEMMStage).
+        ITensorGemm *resolveGemm(
+            const ITensor *weight, ITensorGemm *&cached, const char *name);
+
         Params params_;
     };
 
