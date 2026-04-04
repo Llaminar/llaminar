@@ -88,7 +88,6 @@ namespace llaminar2
         // Merged layout: [seq_len, q_dim + k_dim + v_dim] per row.
         // The kernel expects separate contiguous [seq_len, dim] arrays.
         const bool merged_qkv = (q_data == k_data && k_data == v_data);
-        std::vector<float> q_scratch, k_scratch, v_scratch;
 
         if (merged_qkv)
         {
@@ -98,25 +97,29 @@ namespace llaminar2
             const int qkv_stride = q_dim + k_dim + v_dim;
             const int T = params_.seq_len;
 
-            q_scratch.resize(static_cast<size_t>(T) * q_dim);
-            k_scratch.resize(static_cast<size_t>(T) * k_dim);
-            v_scratch.resize(static_cast<size_t>(T) * v_dim);
+            // Grow-only reusable scratch (no allocation after first call at max seq_len)
+            const size_t q_size = static_cast<size_t>(T) * q_dim;
+            const size_t k_size = static_cast<size_t>(T) * k_dim;
+            const size_t v_size = static_cast<size_t>(T) * v_dim;
+            if (q_deinterleave_.size() < q_size) q_deinterleave_.resize(q_size);
+            if (k_deinterleave_.size() < k_size) k_deinterleave_.resize(k_size);
+            if (v_deinterleave_.size() < v_size) v_deinterleave_.resize(v_size);
 
             const float *qkv = q_data; // merged buffer
             for (int t = 0; t < T; ++t)
             {
                 const float *row = qkv + static_cast<size_t>(t) * qkv_stride;
-                std::memcpy(q_scratch.data() + static_cast<size_t>(t) * q_dim,
+                std::memcpy(q_deinterleave_.data() + static_cast<size_t>(t) * q_dim,
                             row, q_dim * sizeof(float));
-                std::memcpy(k_scratch.data() + static_cast<size_t>(t) * k_dim,
+                std::memcpy(k_deinterleave_.data() + static_cast<size_t>(t) * k_dim,
                             row + q_dim, k_dim * sizeof(float));
-                std::memcpy(v_scratch.data() + static_cast<size_t>(t) * v_dim,
+                std::memcpy(v_deinterleave_.data() + static_cast<size_t>(t) * v_dim,
                             row + q_dim + k_dim, v_dim * sizeof(float));
             }
 
-            q_data = q_scratch.data();
-            k_data = k_scratch.data();
-            v_data = v_scratch.data();
+            q_data = q_deinterleave_.data();
+            k_data = k_deinterleave_.data();
+            v_data = v_deinterleave_.data();
 
             LOG_DEBUG("[GDNRecurrenceStage] Deinterleaved merged QKV: "
                       << T << "x" << qkv_stride << " -> Q(" << T << "x" << q_dim

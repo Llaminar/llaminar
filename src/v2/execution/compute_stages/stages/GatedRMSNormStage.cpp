@@ -6,8 +6,13 @@
 #include "GatedRMSNormStage.h"
 #include "../../../tensors/Tensors.h"
 #include "../../../utils/Logger.h"
+#include "../../../utils/OpenMPUtils.h"
 
 #include <cmath>
+
+#if defined(__AVX512F__)
+#include <immintrin.h>
+#endif
 
 namespace llaminar2
 {
@@ -63,40 +68,116 @@ namespace llaminar2
                                     ? static_cast<size_t>(params_.norm_dim)
                                     : d_model;
         const size_t n_groups = d_model / norm_dim; // Number of heads (or 1 for full-dim)
+        const float eps = params_.eps;
+        const bool subtract_one = params_.subtract_one;
+        const bool gate_silu = params_.gate_silu;
 
-        for (int t = 0; t < seq_len; ++t)
+        auto do_work = [&]()
         {
-            const size_t row_offset = static_cast<size_t>(t) * d_model;
-
-            for (size_t g = 0; g < n_groups; ++g)
+            // Parallelize over rows (timesteps) for prefill, or groups for single token
+            const int total_work = seq_len * static_cast<int>(n_groups);
+#pragma omp for schedule(static)
+            for (int work_idx = 0; work_idx < total_work; ++work_idx)
             {
-                const size_t offset = row_offset + g * norm_dim;
+                const int t = work_idx / static_cast<int>(n_groups);
+                const size_t g = work_idx % n_groups;
+                const size_t offset = static_cast<size_t>(t) * d_model + g * norm_dim;
 
                 // Compute RMS over norm_dim elements
+#if defined(__AVX512F__)
+                {
+                    __m512 vsum_sq = _mm512_setzero_ps();
+                    const size_t nd_vec = norm_dim & ~static_cast<size_t>(15);
+                    size_t j = 0;
+                    for (; j < nd_vec; j += 16)
+                    {
+                        __m512 vv = _mm512_loadu_ps(input_data + offset + j);
+                        vsum_sq = _mm512_fmadd_ps(vv, vv, vsum_sq);
+                    }
+                    float sum_sq = _mm512_reduce_add_ps(vsum_sq);
+                    for (; j < norm_dim; ++j)
+                    {
+                        const float v = input_data[offset + j];
+                        sum_sq += v * v;
+                    }
+                    const float inv_rms = 1.0f / std::sqrt(sum_sq / static_cast<float>(norm_dim) + eps);
+
+                    // Normalize, apply gamma, multiply by gate
+                    const __m512 vinv_rms = _mm512_set1_ps(inv_rms);
+                    const __m512 vone = _mm512_set1_ps(1.0f);
+                    const __m512 vneg1 = _mm512_set1_ps(-1.0f);
+                    j = 0;
+                    for (; j < nd_vec; j += 16)
+                    {
+                        __m512 vnorm = _mm512_mul_ps(_mm512_loadu_ps(input_data + offset + j), vinv_rms);
+                        __m512 vgamma = _mm512_loadu_ps(gamma_data + j);
+                        if (subtract_one)
+                            vgamma = _mm512_add_ps(vone, vgamma);
+                        __m512 vgate = _mm512_loadu_ps(gate_data + offset + j);
+                        __m512 vgate_act;
+                        if (gate_silu)
+                        {
+                            // SiLU(x) = x * sigmoid(x) = x / (1 + exp(-x))
+                            // Use fast sigmoid via polynomial exp
+                            __m512 neg_g = _mm512_mul_ps(vgate, vneg1);
+                            neg_g = _mm512_max_ps(_mm512_set1_ps(-88.0f), _mm512_min_ps(_mm512_set1_ps(88.0f), neg_g));
+                            const __m512 vlog2e = _mm512_set1_ps(1.4426950408889634f);
+                            const __m512 vln2 = _mm512_set1_ps(0.6931471805599453f);
+                            __m512 vn = _mm512_roundscale_ps(_mm512_mul_ps(neg_g, vlog2e), _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+                            __m512 vf = _mm512_fnmadd_ps(vn, vln2, neg_g);
+                            __m512 vp = _mm512_fmadd_ps(_mm512_set1_ps(0.0013333558146428f), vf, _mm512_set1_ps(0.0096181291076285f));
+                            vp = _mm512_fmadd_ps(vp, vf, _mm512_set1_ps(0.0555041086648216f));
+                            vp = _mm512_fmadd_ps(vp, vf, _mm512_set1_ps(0.2402265069591007f));
+                            vp = _mm512_fmadd_ps(vp, vf, vln2);
+                            vp = _mm512_fmadd_ps(vp, vf, vone);
+                            __m512i vi_n = _mm512_add_epi32(_mm512_cvtps_epi32(vn), _mm512_set1_epi32(127));
+                            __m512 v2n = _mm512_castsi512_ps(_mm512_slli_epi32(vi_n, 23));
+                            __m512 vexp = _mm512_mul_ps(vp, v2n);
+                            __m512 vsig = _mm512_div_ps(vone, _mm512_add_ps(vone, vexp));
+                            vgate_act = _mm512_mul_ps(vgate, vsig);
+                        }
+                        else
+                        {
+                            vgate_act = vgate;
+                        }
+                        _mm512_storeu_ps(output_data + offset + j, _mm512_mul_ps(_mm512_mul_ps(vnorm, vgamma), vgate_act));
+                    }
+                    for (; j < norm_dim; ++j)
+                    {
+                        const float normalized = input_data[offset + j] * inv_rms;
+                        const float gamma_eff = subtract_one ? (1.0f + gamma_data[j]) : gamma_data[j];
+                        const float gate_val = gate_data[offset + j];
+                        const float gate_act = gate_silu ? gate_val / (1.0f + std::exp(-gate_val)) : gate_val;
+                        output_data[offset + j] = normalized * gamma_eff * gate_act;
+                    }
+                }
+#else
                 float sum_sq = 0.0f;
                 for (size_t j = 0; j < norm_dim; ++j)
                 {
                     const float v = input_data[offset + j];
                     sum_sq += v * v;
                 }
-                const float rms = std::sqrt(sum_sq / static_cast<float>(norm_dim) + params_.eps);
+                const float rms = std::sqrt(sum_sq / static_cast<float>(norm_dim) + eps);
                 const float inv_rms = 1.0f / rms;
 
                 // Normalize, apply gamma (with optional subtract_one), multiply by gate
                 for (size_t j = 0; j < norm_dim; ++j)
                 {
                     const float normalized = input_data[offset + j] * inv_rms;
-                    const float gamma_eff = params_.subtract_one
+                    const float gamma_eff = subtract_one
                                                 ? (1.0f + gamma_data[j])
                                                 : gamma_data[j];
                     const float gate_val = gate_data[offset + j];
-                    const float gate_act = params_.gate_silu
+                    const float gate_act = gate_silu
                                                ? gate_val / (1.0f + std::exp(-gate_val))
                                                : gate_val;
                     output_data[offset + j] = normalized * gamma_eff * gate_act;
                 }
+#endif
             }
-        }
+        };
+        OMP_WORKSHARE_REGION(do_work);
 
         LOG_DEBUG("[GatedRMSNormStage] Executed: seq_len=" << seq_len
                                                            << " d_model=" << d_model

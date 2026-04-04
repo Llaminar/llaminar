@@ -18,6 +18,8 @@
 
 #include "../../../tensors/TensorKernels.h"
 
+#include <vector>
+
 namespace llaminar2
 {
 
@@ -41,7 +43,7 @@ namespace llaminar2
             bool use_qk_l2norm) override;
 
     private:
-        /// Compute gate values: g = -exp(A_log) * softplus(alpha + dt_bias), beta_sig = sigmoid(beta_raw)
+        /// Compute gate values: g = A_log * softplus(alpha + dt_bias), beta_sig = sigmoid(beta_raw)
         static void computeGates(
             const float *alpha, const float *beta_raw,
             const float *A_log, const float *dt_bias,
@@ -50,6 +52,15 @@ namespace llaminar2
 
         /// L2 normalize vectors per head
         static void l2normalize(float *data, int seq_len, int n_heads, int head_dim);
+
+        /// Ensure scratch buffers are large enough, reallocating only when needed
+        void ensureScratch(int seq_len, int n_heads, int d_k, int d_v);
+
+        // Reusable scratch buffers (grow-only, never shrink during lifetime)
+        std::vector<float> q_scratch_;       ///< Preprocessed Q buffer
+        std::vector<float> k_scratch_;       ///< Preprocessed K buffer
+        std::vector<float> gate_scratch_;    ///< Gate values
+        std::vector<float> beta_sig_scratch_; ///< Sigmoid of beta
     };
 
 } // namespace llaminar2

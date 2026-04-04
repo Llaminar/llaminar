@@ -30,6 +30,7 @@
 #include "../../../memory/BufferId.h"
 
 #include <optional>
+#include <vector>
 
 namespace llaminar2
 {
@@ -107,6 +108,11 @@ namespace llaminar2
 
     private:
         Params params_;
+
+        // Reusable scratch for QKV deinterleaving (grow-only)
+        mutable std::vector<float> q_deinterleave_;
+        mutable std::vector<float> k_deinterleave_;
+        mutable std::vector<float> v_deinterleave_;
     };
 
 } // namespace llaminar2

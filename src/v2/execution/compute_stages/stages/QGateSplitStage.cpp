@@ -6,6 +6,7 @@
 #include "QGateSplitStage.h"
 #include "../../../tensors/Tensors.h"
 #include "../../../utils/Logger.h"
+#include "../../../utils/OpenMPUtils.h"
 
 #include <cstring>
 
@@ -59,19 +60,24 @@ namespace llaminar2
         // Per-head interleaved layout: each head has [query_head_dim, gate_head_dim]
         // contiguous in the Q projection output. For n_heads=8, head_dim=256:
         //   [q0_256, g0_256, q1_256, g1_256, ..., q7_256, g7_256]
-        for (int t = 0; t < seq_len; ++t)
+        auto do_work = [&]()
         {
-            const float *row = src + static_cast<size_t>(t) * input_dim;
-            float *q_row = dst_q + static_cast<size_t>(t) * q_dim;
-            float *g_row = dst_gate + static_cast<size_t>(t) * q_dim;
-
-            for (int h = 0; h < n_heads; ++h)
+#pragma omp for schedule(static)
+            for (int t = 0; t < seq_len; ++t)
             {
-                const float *head_block = row + h * (head_dim * 2);
-                std::memcpy(q_row + h * head_dim, head_block, head_dim * sizeof(float));
-                std::memcpy(g_row + h * head_dim, head_block + head_dim, head_dim * sizeof(float));
+                const float *row = src + static_cast<size_t>(t) * input_dim;
+                float *q_row = dst_q + static_cast<size_t>(t) * q_dim;
+                float *g_row = dst_gate + static_cast<size_t>(t) * q_dim;
+
+                for (int h = 0; h < n_heads; ++h)
+                {
+                    const float *head_block = row + h * (head_dim * 2);
+                    std::memcpy(q_row + h * head_dim, head_block, head_dim * sizeof(float));
+                    std::memcpy(g_row + h * head_dim, head_block + head_dim, head_dim * sizeof(float));
+                }
             }
-        }
+        };
+        OMP_WORKSHARE_REGION(do_work);
 
         LOG_DEBUG("[QGateSplitStage] Executed: seq_len=" << seq_len
                                                          << " n_heads=" << n_heads
