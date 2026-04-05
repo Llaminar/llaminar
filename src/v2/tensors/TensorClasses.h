@@ -113,6 +113,9 @@ namespace llaminar2
     // Forward declaration for backend dependency injection
     class IBackend;
 
+    // Forward declaration for activation rotation (kurtosis reduction)
+    class ActivationRotation;
+
     // All block structures are now defined in BlockStructures.h
     // This eliminates circular dependencies between Tensors.h and SIMDHelpers.h
 
@@ -1669,6 +1672,32 @@ namespace llaminar2
         virtual void setLayout(TensorLayout layout) { layout_ = layout; }
 
         // =========================================================================
+        // Activation Rotation (kurtosis reduction before Q8_1 quantization)
+        // =========================================================================
+
+        /**
+         * @brief Set the block-diagonal rotation for this tensor.
+         *
+         * On weight tensors: signals that this weight was pre-rotated, and
+         * GEMM kernels should apply the same rotation to activations before
+         * quantizing.
+         *
+         * On activation tensors: signals that this tensor should be rotated
+         * before quantization.
+         *
+         * The rotation is NOT owned — caller must ensure it outlives the tensor.
+         *
+         * @param rot Rotation to apply, or nullptr to clear
+         */
+        void setActivationRotation(const ActivationRotation *rot) { activation_rotation_ = rot; }
+
+        /**
+         * @brief Get the activation rotation for this tensor, if any.
+         * @return Rotation pointer, or nullptr if none set
+         */
+        const ActivationRotation *activationRotation() const { return activation_rotation_; }
+
+        // =========================================================================
         // Backend Dependency Injection (for testing)
         // =========================================================================
 
@@ -1712,6 +1741,9 @@ namespace llaminar2
 
         // Tensor layout contract (Phase 3)
         TensorLayout layout_ = TensorLayout::UNKNOWN;
+
+        // Block-diagonal rotation for kurtosis reduction (non-owning)
+        const ActivationRotation *activation_rotation_ = nullptr;
 
         // ===== Debug Validity Assertion Helper =====
 #ifndef NDEBUG

@@ -27,6 +27,7 @@
 #include "../../utils/Logger.h"
 #include "../../utils/WeightLoadingProfiler.h"
 #include "../../kernels/cpu/turboquant/TurboQuantContext.h"
+#include "../../kernels/cpu/rotation/ModelWeightRotation.h"
 #include <atomic>
 #include <future>
 #include <thread>
@@ -1012,6 +1013,35 @@ namespace llaminar2
         {
             LOG_ERROR("[InferenceRunner] Missing global weights");
             return false;
+        }
+
+        // =====================================================================
+        // Apply block-diagonal activation rotation for Q8_1 kurtosis reduction
+        // =====================================================================
+        // Pre-rotates all GEMM weight rows with an orthogonal rotation R.
+        // At runtime, activations are rotated with the same R before Q8_1
+        // quantization: X'@W'^T = X@R@(W@R)^T = X@R@R^T@W^T = X@W^T.
+        // This spreads outlier energy across quantization blocks, reducing
+        // kurtosis and improving int8 fidelity (e.g., 1191→28 for 4B models).
+        const auto &env = debugEnv();
+        if (env.activation_rotation)
+        {
+            const int hidden_dim = model_ctx->embeddingLength();
+            const int ffn_dim = model_ctx->feedForwardLength();
+            const int block_dim = env.rotation_block_dim;
+
+            if (hidden_dim % block_dim == 0 && ffn_dim % block_dim == 0)
+            {
+                auto rotator = ModelWeightRotation::create(
+                    hidden_dim, ffn_dim, block_dim);
+                rotator->rotateAllWeights(weights, model_ctx->blockCount(), rotator);
+            }
+            else
+            {
+                LOG_WARN("[InferenceRunner] Activation rotation disabled: block_dim="
+                         << block_dim << " does not divide hidden_dim=" << hidden_dim
+                         << " or ffn_dim=" << ffn_dim);
+            }
         }
 
         orchestrator->setWeights(weights);

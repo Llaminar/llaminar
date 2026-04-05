@@ -40,8 +40,11 @@ using namespace llaminar2::test::parity::qwen35;
 // conservatively and should be tightened once baseline numbers are established.
 
 static const std::vector<TestConfig> kQwen35SingleDeviceConfigs = {
+    // =========================================================================
+    // Qwen3.5-0.8B (Q4_0) — n_k_heads == n_v_heads == 16
+    // =========================================================================
     {
-        .name = "Qwen35_CPU_KV_FP16",
+        .name = "Qwen35_08B_CPU_KV_FP16",
         .devices = {ParityDeviceType::CPU},
         .parallelism = Parallelism::None,
         .collective = Collective::None,
@@ -58,7 +61,7 @@ static const std::vector<TestConfig> kQwen35SingleDeviceConfigs = {
         .kv_cache_precision = KVCachePrecision::FP16,
     },
     {
-        .name = "Qwen35_CPU_KV_Q8_1",
+        .name = "Qwen35_08B_CPU_KV_Q8_1",
         .devices = {ParityDeviceType::CPU},
         .parallelism = Parallelism::None,
         .collective = Collective::None,
@@ -75,7 +78,7 @@ static const std::vector<TestConfig> kQwen35SingleDeviceConfigs = {
         .kv_cache_precision = KVCachePrecision::Q8_1,
     },
     {
-        .name = "Qwen35_CPU_KV_Q16_1",
+        .name = "Qwen35_08B_CPU_KV_Q16_1",
         .devices = {ParityDeviceType::CPU},
         .parallelism = Parallelism::None,
         .collective = Collective::None,
@@ -92,7 +95,7 @@ static const std::vector<TestConfig> kQwen35SingleDeviceConfigs = {
         .kv_cache_precision = KVCachePrecision::Q16_1,
     },
     {
-        .name = "Qwen35_CUDA_KV_FP16",
+        .name = "Qwen35_08B_CUDA_KV_FP16",
         .devices = {ParityDeviceType::CUDA},
         .parallelism = Parallelism::None,
         .collective = Collective::None,
@@ -109,7 +112,7 @@ static const std::vector<TestConfig> kQwen35SingleDeviceConfigs = {
         .kv_cache_precision = KVCachePrecision::FP16,
     },
     {
-        .name = "Qwen35_CUDA_KV_Q8_1",
+        .name = "Qwen35_08B_CUDA_KV_Q8_1",
         .devices = {ParityDeviceType::CUDA},
         .parallelism = Parallelism::None,
         .collective = Collective::None,
@@ -126,7 +129,7 @@ static const std::vector<TestConfig> kQwen35SingleDeviceConfigs = {
         .kv_cache_precision = KVCachePrecision::Q8_1,
     },
     {
-        .name = "Qwen35_ROCm_KV_FP16",
+        .name = "Qwen35_08B_ROCm_KV_FP16",
         .devices = {ParityDeviceType::ROCm},
         .parallelism = Parallelism::None,
         .collective = Collective::None,
@@ -145,7 +148,7 @@ static const std::vector<TestConfig> kQwen35SingleDeviceConfigs = {
         .kv_cache_precision = KVCachePrecision::FP16,
     },
     {
-        .name = "Qwen35_ROCm_KV_Q8_1",
+        .name = "Qwen35_08B_ROCm_KV_Q8_1",
         .devices = {ParityDeviceType::ROCm},
         .parallelism = Parallelism::None,
         .collective = Collective::None,
@@ -162,6 +165,76 @@ static const std::vector<TestConfig> kQwen35SingleDeviceConfigs = {
         .snapshot_dir = "pytorch_qwen35_snapshots",
         .activation_precision = ActivationPrecision::FP32,
         .kv_cache_precision = KVCachePrecision::Q8_1,
+    },
+
+    // =========================================================================
+    // Qwen3.5-4B (Q8_0) — n_k_heads=16, n_v_heads=32 (tests repeat_interleave)
+    //
+    // ACTIVATION ROTATION mitigates the 4B model's massive activation outliers
+    // (kurtosis up to 1191 at layer 11). Block-diagonal orthogonal rotation
+    // (block_dim=128) spreads outlier energy across dimensions before Q8_1
+    // quantization, improving worst-layer cosine from ~0.85 to ~0.93+.
+    // Remaining gap vs FP32 is due to Q8_0 weight quantization, not outliers.
+    // =========================================================================
+    {
+        .name = "Qwen35_4B_CPU_KV_FP16",
+        .devices = {ParityDeviceType::CPU},
+        .parallelism = Parallelism::None,
+        .collective = Collective::None,
+        .thresholds = {
+            .cosine_threshold = 0.91f,           // Observed: ~0.93 worst min cosine (with rotation)
+            .decode_cosine_threshold = 0.88f,    // Observed: ~0.93 worst decode step
+            .early_layers_count = 8,
+            .min_early_layers_passed = 8,         // All 8 early layers pass with rotation
+            .kl_threshold = 1.0f,                 // Observed: 0.68 prefill, 0.71 decode
+            .min_top1_accuracy = 0.0f,            // Outliers still affect top-1 marginally
+            .min_top5_accuracy = 50.0f,           // Observed: 60% prefill, 100% decode
+            .pytorch_top1_in_topk = 0,            // Disabled: outlier sensitivity
+        },
+        .model_path = "models/Qwen3.5-4B-Q8_0.gguf",
+        .snapshot_dir = "pytorch_qwen35_4b_snapshots",
+        .activation_precision = ActivationPrecision::FP32,
+        .kv_cache_precision = KVCachePrecision::FP16,
+    },
+    {
+        .name = "Qwen35_4B_CUDA_KV_FP16",
+        .devices = {ParityDeviceType::CUDA},
+        .parallelism = Parallelism::None,
+        .collective = Collective::None,
+        .thresholds = {
+            .cosine_threshold = 0.91f,
+            .decode_cosine_threshold = 0.88f,
+            .early_layers_count = 8,
+            .min_early_layers_passed = 8,
+            .kl_threshold = 1.0f,
+            .min_top1_accuracy = 0.0f,
+            .min_top5_accuracy = 50.0f,
+            .pytorch_top1_in_topk = 0,
+        },
+        .model_path = "models/Qwen3.5-4B-Q8_0.gguf",
+        .snapshot_dir = "pytorch_qwen35_4b_snapshots",
+        .activation_precision = ActivationPrecision::FP32,
+        .kv_cache_precision = KVCachePrecision::FP16,
+    },
+    {
+        .name = "Qwen35_4B_ROCm_KV_FP16",
+        .devices = {ParityDeviceType::ROCm},
+        .parallelism = Parallelism::None,
+        .collective = Collective::None,
+        .thresholds = {
+            .cosine_threshold = 0.91f,
+            .decode_cosine_threshold = 0.88f,
+            .early_layers_count = 8,
+            .min_early_layers_passed = 8,
+            .kl_threshold = 1.0f,
+            .min_top1_accuracy = 0.0f,
+            .min_top5_accuracy = 50.0f,
+            .pytorch_top1_in_topk = 0,
+        },
+        .model_path = "models/Qwen3.5-4B-Q8_0.gguf",
+        .snapshot_dir = "pytorch_qwen35_4b_snapshots",
+        .activation_precision = ActivationPrecision::FP32,
+        .kv_cache_precision = KVCachePrecision::FP16,
     },
 };
 

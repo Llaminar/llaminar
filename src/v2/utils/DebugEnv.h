@@ -2728,6 +2728,16 @@ namespace llaminar2
         bool gpu_stage_timing_detail = false; ///< Print per-stage detail (env: LLAMINAR_GPU_STAGE_TIMING_DETAIL)
         bool coherence_audit = false;         ///< Per-tensor coherence audit log (env: LLAMINAR_COHERENCE_AUDIT)
 
+        /// Block-diagonal activation rotation for Q8_1 kurtosis reduction.
+        /// Reduces outlier sensitivity in int8 quantization by spreading energy across blocks.
+        /// (env: LLAMINAR_ACTIVATION_ROTATION, default: "1" = enabled)
+        /// Set to "0" to disable. Adds one-time cost at model load (~2s for 4B model).
+        bool activation_rotation = true;
+
+        /// Block dimension for activation rotation (env: LLAMINAR_ROTATION_BLOCK_DIM, default: 128)
+        /// Must divide hidden_dim and ffn_dim evenly. Smaller = less beneficial, larger = more expensive.
+        int rotation_block_dim = 128;
+
         /// Global allreduce precision fallback: "fp16", "bf16", or "fp32"
         /// (env: LLAMINAR_ALLREDUCE_PRECISION, default: "fp32")
         /// This is the ULTIMATE FALLBACK — per-layer precision from the model schema
@@ -2760,6 +2770,12 @@ namespace llaminar2
                 tp_collect_timeout_ms = std::atoi(collect_timeout);
             const char *coh_audit = std::getenv("LLAMINAR_COHERENCE_AUDIT");
             coherence_audit = coh_audit && std::string(coh_audit) == "1";
+            const char *act_rot = std::getenv("LLAMINAR_ACTIVATION_ROTATION");
+            if (act_rot && std::string(act_rot) == "0")
+                activation_rotation = false;
+            const char *rot_bdim = std::getenv("LLAMINAR_ROTATION_BLOCK_DIM");
+            if (rot_bdim)
+                rotation_block_dim = std::atoi(rot_bdim);
         }
 
         void reload()
@@ -2784,6 +2800,13 @@ namespace llaminar2
                 tp_collect_timeout_ms = std::atoi(collect_timeout);
             const char *coh_audit = std::getenv("LLAMINAR_COHERENCE_AUDIT");
             coherence_audit = coh_audit && std::string(coh_audit) == "1";
+            activation_rotation = true; // default on
+            const char *act_rot = std::getenv("LLAMINAR_ACTIVATION_ROTATION");
+            if (act_rot && std::string(act_rot) == "0")
+                activation_rotation = false;
+            const char *rot_bdim = std::getenv("LLAMINAR_ROTATION_BLOCK_DIM");
+            if (rot_bdim)
+                rotation_block_dim = std::atoi(rot_bdim);
             gemm.reload();
             profile.reload();
             rmsnorm.reload();

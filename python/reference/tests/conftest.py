@@ -72,3 +72,12 @@ def qwen35_q4_model(models_dir) -> Path:
     if not p.exists():
         pytest.skip(f"Model not found: {p}")
     return p
+
+
+@pytest.fixture(scope='session')
+def qwen35_4b_q8_model(models_dir) -> Path:
+    """Path to the Qwen3.5-4B Q8_0 GGUF model, skipping if unavailable."""
+    p = models_dir / "Qwen3.5-4B-Q8_0.gguf"
+    if not p.exists():
+        pytest.skip(f"Model not found: {p}")
+    return p

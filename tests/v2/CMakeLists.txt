@@ -9229,6 +9229,22 @@ add_v2_test(V2_Unit_Qwen35Schema
     MPI_PROCS 1
 )
 
+# Test: ActivationRotation — Block-diagonal rotation for kurtosis reduction
+# Tests orthogonality (norm preservation), identity (rotate+inverse), kurtosis
+# reduction, GEMM invariance (X@W^T == X@R@(W@R)^T), ModelWeightRotation
+# weight replacement and metadata wiring.
+add_executable(v2_test_activation_rotation unit/kernels/rotation/Test__ActivationRotation.cpp)
+target_link_libraries(v2_test_activation_rotation
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_ActivationRotation
+    COMMAND $<TARGET_FILE:v2_test_activation_rotation>
+    LABELS "V2;Unit;Kernels;Rotation;ActivationRotation"
+    MPI_PROCS 1
+)
+
 # Test: DynamicBufferExtensions — Dynamic extension buffer wiring chain
 # Tests BufferArena::forEachRegistered(), ActivationBuffers::extensions/get(),
 # InferenceState::extension_buffers, toModelBuffers() propagation, and

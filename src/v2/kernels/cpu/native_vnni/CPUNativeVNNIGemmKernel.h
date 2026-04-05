@@ -31,6 +31,7 @@
 #include "tensors/TensorKernels.h"
 #include "tensors/TensorClasses.h"
 #include "kernels/cpu/primitives/SwiGLUPrimitives.h"
+#include "kernels/cpu/rotation/ActivationRotation.h"
 #include "utils/Logger.h"
 
 namespace llaminar2::cpu::native_vnni
@@ -81,6 +82,11 @@ namespace llaminar2::cpu::native_vnni
                       << ", payload=" << packed_.payload_bytes << " B/block"
                       << ", asymmetric=" << packed_.is_asymmetric
                       << ", native_q8_0=" << (native_q8_0_blocks_ != nullptr) << ")");
+
+            // Pick up activation rotation from the weight tensor (if set).
+            // When present, activations will be rotated before Q8_1 quantization
+            // to reduce kurtosis and improve int8 fidelity.
+            activation_rotation_ = weights->activationRotation();
         }
 
         /**
@@ -139,6 +145,9 @@ namespace llaminar2::cpu::native_vnni
 
             const float *A_data = A->data() + static_cast<size_t>(activation_row_offset) * k;
             float *C_data = C->mutable_data();
+
+            // Apply activation rotation for kurtosis reduction (if configured)
+            A_data = maybe_rotate_activation(A_data, m, k);
 
             // Handle beta scaling of existing C
             if (beta != 0.0f && beta != 1.0f)
@@ -244,10 +253,13 @@ namespace llaminar2::cpu::native_vnni
             primitives::compute_swiglu(gate_fp32, up_fp32, swiglu_scratch_.data(),
                                        static_cast<int>(input_size));
 
+            // Apply activation rotation for kurtosis reduction (if configured)
+            const float *gemm_input = maybe_rotate_activation(swiglu_scratch_.data(), m, k);
+
             // M=1 fast path: call GEMV directly with raw pointer, skip TensorBase wrapper
             if (m == 1 && alpha == 1.0f && beta == 0.0f)
             {
-                gemv_native_vnni(packed_, swiglu_scratch_.data(), output_fp32,
+                gemv_native_vnni(packed_, gemm_input, output_fp32,
                                  native_q8_0_blocks_, native_q8_0_bpr_);
                 return true;
             }
@@ -260,14 +272,14 @@ namespace llaminar2::cpu::native_vnni
             }
             if (beta == 0.0f && alpha == 1.0f)
             {
-                gemm_native_vnni(packed_, swiglu_scratch_.data(), output_fp32, m, n);
+                gemm_native_vnni(packed_, gemm_input, output_fp32, m, n);
             }
             else
             {
                 std::vector<float> temp(n);
                 for (int row = 0; row < m; ++row)
                 {
-                    gemv_native_vnni(packed_, swiglu_scratch_.data() + row * k, temp.data());
+                    gemv_native_vnni(packed_, gemm_input + row * k, temp.data());
                     for (int j = 0; j < n; ++j)
                         output_fp32[row * n + j] += alpha * temp[j];
                 }
@@ -295,6 +307,9 @@ namespace llaminar2::cpu::native_vnni
                 return false;
 
             const float *input_data = input->data();
+
+            // Apply activation rotation for kurtosis reduction (if configured)
+            input_data = maybe_rotate_activation(input_data, m, k);
 
             // Check if all projections support native Q8_0 GEMV (M=1 only).
             [[maybe_unused]] bool all_native_q8_0 = false;
@@ -412,6 +427,30 @@ namespace llaminar2::cpu::native_vnni
 
         // Cached scratch buffer for fused SwiGLU+GEMM (avoids malloc per decode token)
         mutable std::vector<float> swiglu_scratch_;
+
+        // Block-diagonal rotation for activation kurtosis reduction.
+        // When set, activations are rotated before Q8_1 quantization for GEMM.
+        // The weight must have been pre-rotated with the same rotation.
+        const ActivationRotation *activation_rotation_ = nullptr;
+
+        // Cached scratch buffer for rotated activation (avoids malloc per call)
+        mutable std::vector<float> rotation_scratch_;
+
+        /// Apply rotation to FP32 activation data, returns pointer to rotated data.
+        /// If no rotation is configured, returns the original pointer unchanged.
+        const float *maybe_rotate_activation(const float *input, int m, int k) const
+        {
+            if (!activation_rotation_)
+                return input;
+
+            const size_t len = static_cast<size_t>(m) * k;
+            if (rotation_scratch_.size() < len)
+                rotation_scratch_.resize(len);
+
+            std::memcpy(rotation_scratch_.data(), input, len * sizeof(float));
+            activation_rotation_->rotate_rows_inplace(rotation_scratch_.data(), m, k);
+            return rotation_scratch_.data();
+        }
     };
 
 } // namespace llaminar2::cpu::native_vnni
