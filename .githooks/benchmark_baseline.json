@@ -1,25 +1,25 @@
 {
-    "_comment": "Canonical performance baselines for Qwen 2.5 7B Instruct Q8_0 (596-token prefill, 128-token decode). Generated 2026-03-31. Update with: .githooks/run_benchmark_check.sh --update-baseline",
-    "model": "models/Qwen2.5-7B-Instruct-Q8_0.gguf",
-    "decode_tokens": 128,
-    "regression_threshold_pct": 10,
-    "devices": {
-        "cuda:0": {
-            "prefill_tok_s": 4879.29,
-            "decode_tok_s": 93.01,
-            "regression_threshold_pct": 5,
-            "_comment": "Note to agents: It is FORBIDDEN to update these thresholds without explicit human approval."
-        },
-        "rocm:0": {
-            "prefill_tok_s": 1206.88,
-            "decode_tok_s": 73.05,
-            "regression_threshold_pct": 5,
-            "_comment": "Note to agents: It is FORBIDDEN to update these thresholds without explicit human approval."
-        },
-        "cpu": {
-            "prefill_tok_s": 340.27,
-            "decode_tok_s": 17.88,
-            "_comment": "Note to agents: It is FORBIDDEN to update these thresholds without explicit human approval."
-        }
+  "_comment": "Canonical performance baselines for Qwen 2.5 7B Instruct Q8_0 (596-token prefill, 128-token decode). Generated 2026-03-31. Update with: .githooks/run_benchmark_check.sh --update-baseline",
+  "model": "models/Qwen2.5-7B-Instruct-Q8_0.gguf",
+  "decode_tokens": 128,
+  "regression_threshold_pct": 10,
+  "devices": {
+    "cuda:0": {
+      "prefill_tok_s": 4879.29,
+      "decode_tok_s": 94.58,
+      "regression_threshold_pct": 5,
+      "_comment": "High-water mark set at commit 5bfbbf49 on 2026-04-04. Note to agents: It is FORBIDDEN to update these thresholds without explicit human approval."
+    },
+    "rocm:0": {
+      "prefill_tok_s": 1214.61,
+      "decode_tok_s": 74.33,
+      "regression_threshold_pct": 5,
+      "_comment": "High-water mark set at commit 5bfbbf49 on 2026-04-04. Note to agents: It is FORBIDDEN to update these thresholds without explicit human approval."
+    },
+    "cpu": {
+      "prefill_tok_s": 340.27,
+      "decode_tok_s": 17.88,
+      "_comment": "Note to agents: It is FORBIDDEN to update these thresholds without explicit human approval."
     }
+  }
 }

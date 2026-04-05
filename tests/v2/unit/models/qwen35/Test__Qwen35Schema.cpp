@@ -788,11 +788,13 @@ TEST_F(Qwen35GraphBuildTest, GDNRecurrence_DKConsistentWithState)
 
     const auto &params = rec_stage->getParams();
 
-    // d_k = d_v = gdn_state_size, n_heads = gdn_group_count
-    // inner=128, n_heads=4, d_v=16, d_k=16
+    // d_k = d_v = gdn_state_size
+    // n_heads = n_v_heads (gdn_time_step_rank), n_k_heads = gdn_group_count
+    // inner=128, n_v_heads=8, n_k_heads=4, d_v=16, d_k=16
     EXPECT_EQ(params.d_k, 16) << "d_k should equal d_v (gdn_state_size)";
     EXPECT_EQ(params.d_v, 16) << "d_v should be gdn_state_size";
-    EXPECT_EQ(params.n_heads, 4);
+    EXPECT_EQ(params.n_heads, 8) << "n_heads should be n_v_heads (gdn_time_step_rank)";
+    EXPECT_EQ(params.n_k_heads, 4) << "n_k_heads should be gdn_group_count";
 }
 
 TEST_F(Qwen35GraphBuildTest, IsGDNLayer_DispatchesCorrectly)

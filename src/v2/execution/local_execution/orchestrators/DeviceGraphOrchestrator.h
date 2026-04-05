@@ -1471,6 +1471,17 @@ namespace llaminar2
         }
 
         /**
+         * @brief GPU-side greedy argmax for single-device inference
+         *
+         * Uses IBackend::argmaxF32() on the logits tensor's GPU buffer,
+         * transferring only 8 bytes (float value + int index) instead of
+         * the full vocab row (~600 KB for 152K vocab).
+         *
+         * @return Token ID (>= 0) on success, -1 if not GPU or backend unavailable
+         */
+        int sampleGreedyOnDevice() override;
+
+        /**
          * @brief Get logits (IInferenceRunner override - already declared above)
          */
         // const float *logits() const; - declared above

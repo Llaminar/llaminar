@@ -46,17 +46,25 @@ namespace llaminar2
             return;
 
         const int n_layers = config_.n_layers;
-        const int n_heads = config_.gdn_group_count > 0
-                                ? config_.gdn_group_count
-                                : config_.n_heads;
         const int conv_kernel = config_.gdn_conv_kernel_size;
 
-        // GDN dimensions: d_k == d_v == state_size, inner_size == n_heads * d_v
-        // QKV merged dim = 3 * inner_size (Q + K + V each = inner_size)
+        // GDN dimensions: Qwen 3.5 can have different key and value head counts.
+        // n_k_heads: number of key/query heads (gdn_group_count)
+        // n_v_heads: number of value heads (gdn_time_step_rank)
+        // When n_v_heads > n_k_heads, Q and K are repeat_interleaved before recurrence.
+        const int n_k_heads = config_.gdn_group_count > 0
+                                  ? config_.gdn_group_count
+                                  : config_.n_heads;
+        const int n_v_heads = config_.gdn_time_step_rank > 0
+                                  ? config_.gdn_time_step_rank
+                                  : n_k_heads;
         const int d_v = config_.gdn_state_size;
         const int d_k = d_v;
-        const int inner_size = n_heads * d_v;
-        const int qkv_dim = 3 * inner_size;
+        const int key_dim = n_k_heads * d_k;
+        const int value_dim = config_.gdn_inner_size > 0
+                                  ? config_.gdn_inner_size
+                                  : n_v_heads * d_v;
+        const int qkv_dim = 2 * key_dim + value_dim; // Q(key_dim) + K(key_dim) + V(value_dim)
 
         conv_states_.resize(n_layers);
         recurrence_states_.resize(n_layers);
@@ -72,8 +80,8 @@ namespace llaminar2
             const int conv_state_size = qkv_dim * (conv_kernel - 1);
             conv_states_[i].resize(conv_state_size, 0.0f);
 
-            // Recurrence state: [n_heads, d_k, d_v]
-            const int recurrence_state_size = n_heads * d_k * d_v;
+            // Recurrence state: [n_v_heads, d_k, d_v] — recurrence runs with value head count
+            const int recurrence_state_size = n_v_heads * d_k * d_v;
             recurrence_states_[i].resize(recurrence_state_size, 0.0f);
 
             // Create kernel instances via KernelFactory (lifetime tied to Qwen35Graph)
@@ -137,14 +145,21 @@ namespace llaminar2
         GraphResolverConfig config = Qwen2Graph::getResolverConfig(seq_len);
 
         // Add GDN-specific shape formulas (used by Qwen35Schema buffer specs)
-        const int gdn_n_heads = config_.gdn_group_count > 0
-                                    ? config_.gdn_group_count
-                                    : config_.n_heads;
-        const int gdn_inner = gdn_n_heads * config_.gdn_state_size;
+        // n_k_heads: key/query head count, n_v_heads: value head count
+        // key_dim = n_k_heads * d_k, value_dim = n_v_heads * d_v = gdn_inner_size
+        // qkv_dim = 2 * key_dim + value_dim (Q + K + V)
+        const int n_k_heads = config_.gdn_group_count > 0
+                                  ? config_.gdn_group_count
+                                  : config_.n_heads;
+        const int d_k = config_.gdn_state_size;
+        const int key_dim = n_k_heads * d_k;
+        const int gdn_inner = config_.gdn_inner_size > 0
+                                  ? config_.gdn_inner_size
+                                  : n_k_heads * config_.gdn_state_size;
         config.custom_formulas["gdn_inner_size"] =
             static_cast<size_t>(gdn_inner);
         config.custom_formulas["gdn_qkv_dim"] =
-            static_cast<size_t>(3 * gdn_inner);
+            static_cast<size_t>(2 * key_dim + gdn_inner);
         config.custom_formulas["gdn_time_step_rank"] =
             static_cast<size_t>(config_.gdn_time_step_rank);
 
@@ -162,7 +177,7 @@ namespace llaminar2
 
         LOG_DEBUG("[Qwen35Graph::getResolverConfig] GDN formulas: "
                   << "gdn_inner_size=" << gdn_inner
-                  << ", gdn_qkv_dim=" << (3 * gdn_inner)
+                  << ", gdn_qkv_dim=" << (2 * key_dim + gdn_inner)
                   << ", gdn_time_step_rank=" << config_.gdn_time_step_rank);
 
         return config;
@@ -256,18 +271,26 @@ namespace llaminar2
         std::string prefix = "layer" + std::to_string(layer_idx) + "_";
         int total_tokens = batch_size * seq_len;
 
-        const int n_heads = config_.gdn_group_count > 0
-                                ? config_.gdn_group_count
-                                : config_.n_heads;
+        const int n_k_heads = config_.gdn_group_count > 0
+                                  ? config_.gdn_group_count
+                                  : config_.n_heads;
+        const int n_v_heads = config_.gdn_time_step_rank > 0
+                                  ? config_.gdn_time_step_rank
+                                  : n_k_heads;
         const int d_model = config_.d_model;
         const int d_v = config_.gdn_state_size;
-        const int d_k = d_v;                  // Qwen3.5 GDN: d_k == d_v == state_size
-        const int inner_size = n_heads * d_v; // value_dim = key_dim = n_heads * d_v
-        const int qkv_dim = 3 * inner_size;   // Q + K + V = 3 * n_heads * d_k
+        const int d_k = d_v;                 // Qwen3.5 GDN: d_k == d_v == state_size
+        const int key_dim = n_k_heads * d_k; // Q/K projection width
+        const int value_dim = config_.gdn_inner_size > 0
+                                  ? config_.gdn_inner_size
+                                  : n_v_heads * d_v; // V projection width
+        const int qkv_dim = 2 * key_dim + value_dim; // Q + K + V merged
 
         LOG_DEBUG("[Qwen35Graph] Building GDN attention for layer " << layer_idx
                                                                     << ": total_tokens=" << total_tokens
-                                                                    << " n_heads=" << n_heads << " d_k=" << d_k << " d_v=" << d_v
+                                                                    << " n_k_heads=" << n_k_heads << " n_v_heads=" << n_v_heads
+                                                                    << " d_k=" << d_k << " d_v=" << d_v
+                                                                    << " key_dim=" << key_dim << " value_dim=" << value_dim
                                                                     << " qkv_dim=" << qkv_dim);
 
         // =====================================================================
@@ -324,15 +347,15 @@ namespace llaminar2
 
         proj_params.w_z = layer.attn_gate; // Z projection = attn_gate.weight (in_proj_z in HF)
         proj_params.output_z = buffers.get(BufferId::GDN_Z);
-        proj_params.n_z = n_heads * d_v;
+        proj_params.n_z = value_dim; // Z gate operates on value_dim (n_v_heads * d_v)
 
         proj_params.w_a = layer.ssm_alpha;
         proj_params.output_a = buffers.get(BufferId::GDN_ALPHA);
-        proj_params.n_a = n_heads;
+        proj_params.n_a = n_v_heads; // Alpha is per-value-head
 
         proj_params.w_b = layer.ssm_beta;
         proj_params.output_b = buffers.get(BufferId::GDN_BETA);
-        proj_params.n_b = n_heads;
+        proj_params.n_b = n_v_heads; // Beta is per-value-head
 
         proj_params.input_buffer_id = BufferId::NORMALIZED;
         proj_params.output_qkv_buffer_id = BufferId::GDN_QKV;
@@ -374,8 +397,9 @@ namespace llaminar2
         // Stage 4: GDN Recurrence (delta rule linear attention)
         // =====================================================================
         // Q, K, V are interleaved in gdn_qkv after conv:
-        // [seq_len, 2*n_heads*d_k + n_heads*d_v]
-        // The recurrence stage splits Q, K, V internally
+        // [seq_len, 2*n_k_heads*d_k + n_v_heads*d_v]
+        // The recurrence stage splits Q, K, V internally and repeat_interleaves
+        // Q/K from n_k_heads to n_v_heads when they differ.
         GDNRecurrenceStage::Params rec_params;
         rec_params.device_id = device;
         rec_params.layer_idx = layer_idx;
@@ -389,7 +413,8 @@ namespace llaminar2
         rec_params.output = buffers.attn_output;
         rec_params.recurrence_state = recurrence_states_[layer_idx].data();
         rec_params.seq_len = total_tokens;
-        rec_params.n_heads = n_heads;
+        rec_params.n_heads = n_v_heads;   // Recurrence runs with value head count
+        rec_params.n_k_heads = n_k_heads; // Key head count for QKV split
         rec_params.d_k = d_k;
         rec_params.d_v = d_v;
         rec_params.chunk_size = 64;

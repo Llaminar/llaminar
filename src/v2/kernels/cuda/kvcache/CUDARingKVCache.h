@@ -103,6 +103,8 @@ namespace llaminar2
          *
          * NOTE: For CUDA caches, this creates temporary GpuTensorView wrappers
          * around device buffers. Prefer get_kv_for_attention() for performance.
+         * Concrete CUDARingKVCache<Precision> overrides this with a single-pass
+         * implementation using get_kv_for_attention internally.
          */
         bool get_kv(int layer, int seq_idx,
                     ITensor **out_k, ITensor **out_v,
@@ -113,7 +115,7 @@ namespace llaminar2
             (void)out_k;
             (void)out_v;
             (void)out_kv_len;
-            return false; // Implemented by concrete class
+            return false; // Overridden by CUDARingKVCache<Precision>
         }
 
         bool get_kv(int layer, int seq_idx,
@@ -125,7 +127,7 @@ namespace llaminar2
             (void)out_k;
             (void)out_v;
             (void)out_kv_len;
-            return false; // Implemented by concrete class
+            return false; // Overridden by CUDARingKVCache<Precision>
         }
 
         /**
@@ -445,6 +447,14 @@ namespace llaminar2
         const ITensor *get_k(int layer, int seq_idx = 0) const override;
         ITensor *get_v(int layer, int seq_idx = 0) override;
         const ITensor *get_v(int layer, int seq_idx = 0) const override;
+
+        // Single-pass K+V access (single get_kv_for_attention call)
+        bool get_kv(int layer, int seq_idx,
+                    ITensor **out_k, ITensor **out_v,
+                    int *out_kv_len = nullptr) override;
+        bool get_kv(int layer, int seq_idx,
+                    const ITensor **out_k, const ITensor **out_v,
+                    int *out_kv_len = nullptr) const override;
 
         // Bring in IKVCache overloads to avoid hiding
         using ICUDARingKVCache::append;

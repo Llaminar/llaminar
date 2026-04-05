@@ -179,6 +179,8 @@ namespace llaminar2::test::parity
         std::string worst_stage;
         int stages_compared = 0;
         bool passed = false;
+        float max_kurtosis = 0.0f;      ///< Highest excess kurtosis across stages
+        std::string max_kurtosis_stage; ///< Stage with highest kurtosis
     };
 
     /**
@@ -657,6 +659,42 @@ namespace llaminar2::test::parity
      *
      * @return Value in [-1, 1], where 1 = identical direction
      */
+    /**
+     * @brief Compute excess kurtosis of a float array.
+     *
+     * Excess kurtosis = E[(x-μ)^4] / σ^4 - 3.
+     * Normal distribution has excess kurtosis = 0.
+     * High kurtosis (>10) indicates heavy-tailed outliers that destroy
+     * int8 quantization accuracy.
+     */
+    inline float computeKurtosis(const float *data, size_t size)
+    {
+        if (size < 4)
+            return 0.0f;
+
+        double sum = 0.0, sum2 = 0.0;
+        for (size_t i = 0; i < size; ++i)
+        {
+            double v = static_cast<double>(data[i]);
+            sum += v;
+            sum2 += v * v;
+        }
+        double mean = sum / static_cast<double>(size);
+        double var = sum2 / static_cast<double>(size) - mean * mean;
+        if (var < 1e-30)
+            return 0.0f;
+
+        double sum4 = 0.0;
+        for (size_t i = 0; i < size; ++i)
+        {
+            double d = static_cast<double>(data[i]) - mean;
+            double d2 = d * d;
+            sum4 += d2 * d2;
+        }
+        double m4 = sum4 / static_cast<double>(size);
+        return static_cast<float>(m4 / (var * var) - 3.0);
+    }
+
     inline float computeCosineSimilarity(const float *a, const float *b, size_t size)
     {
         double dot_product = 0.0;
@@ -953,7 +991,7 @@ namespace llaminar2::test::parity
 
         // Header row
         table << fort::header
-              << "Layer" << "Avg Cosine" << "Min Cosine" << "Worst Stage" << "OK"
+              << "Layer" << "Avg Cosine" << "Min Cosine" << "Worst Stage" << "Kurtosis" << "OK"
               << fort::endr;
 
         // Set column alignments
@@ -961,12 +999,14 @@ namespace llaminar2::test::parity
         table.column(1).set_cell_text_align(fort::text_align::right);
         table.column(2).set_cell_text_align(fort::text_align::right);
         table.column(3).set_cell_text_align(fort::text_align::left);
-        table.column(4).set_cell_text_align(fort::text_align::center);
+        table.column(4).set_cell_text_align(fort::text_align::right);
+        table.column(5).set_cell_text_align(fort::text_align::center);
 
         // Embedding row
         table << "EMBEDDING"
               << fmt_f6(summary.embedding_cosine)
               << fmt_f6(summary.embedding_cosine)
+              << "-"
               << "-"
               << status_str(summary.embedding_passed)
               << fort::endr;
@@ -977,10 +1017,23 @@ namespace llaminar2::test::parity
             std::ostringstream layer_ss;
             layer_ss << "Layer " << stats.layer_idx;
 
+            std::string kurtosis_str;
+            if (stats.max_kurtosis > 0.0f)
+            {
+                std::ostringstream ks;
+                ks << std::fixed << std::setprecision(0) << stats.max_kurtosis;
+                kurtosis_str = ks.str();
+            }
+            else
+            {
+                kurtosis_str = "-";
+            }
+
             table << layer_ss.str()
                   << fmt_f6(stats.avg_cosine_sim)
                   << fmt_f6(stats.min_cosine_sim)
                   << stats.worst_stage
+                  << kurtosis_str
                   << status_str(stats.passed)
                   << fort::endr;
         }
@@ -997,6 +1050,7 @@ namespace llaminar2::test::parity
               << fmt_f6(summary.lm_head_cosine)
               << fmt_f6(summary.lm_head_cosine)
               << lm_info.str()
+              << "-"
               << status_str(summary.lm_head_passed)
               << fort::endr;
 
@@ -2525,7 +2579,11 @@ namespace llaminar2::test::parity
 
             // Stages to compare per layer
             std::vector<std::string> per_layer_stages = {
-                "ATTENTION_NORM", "Q_PROJECTION", "K_PROJECTION", "V_PROJECTION",
+                "ATTENTION_NORM",
+                // GDN sub-stages (skipped for FA layers where they don't exist)
+                "QKV_PROJECTION", "GDN_DELTA_RULE_OUTPUT", "GDN_NORM_GATE_OUTPUT",
+                // Standard attention sub-stages (skipped for GDN layers)
+                "Q_PROJECTION", "K_PROJECTION", "V_PROJECTION",
                 "Q_NORM", "K_NORM", // Qwen3 per-head QK RMSNorm (skipped if not available)
                 "Q_ROPE", "K_ROPE",
                 "ATTENTION_CONTEXT", "ATTENTION_OUTPUT", "ATTENTION_RESIDUAL",
@@ -2651,6 +2709,14 @@ namespace llaminar2::test::parity
                                                      << " col=" << max_diff_idx % n_cols << ")"
                                                      << " llaminar=" << llaminar_data[max_diff_idx]
                                                      << " pytorch=" << pytorch_data[max_diff_idx]);
+                    }
+
+                    // Track kurtosis for activation outlier monitoring
+                    float kurt = computeKurtosis(llaminar_data, llaminar_size);
+                    if (kurt > stats.max_kurtosis)
+                    {
+                        stats.max_kurtosis = kurt;
+                        stats.max_kurtosis_stage = stage;
                     }
 
                     if (result.cosine_similarity < stats.min_cosine_sim)

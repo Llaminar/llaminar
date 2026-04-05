@@ -45,16 +45,19 @@ if [[ ! -f "$BASELINE_FILE" ]]; then
     exit 1
 fi
 
-if [[ ! -x "$RELEASE_BIN" ]]; then
-    echo -e "${YELLOW}Release binary not found. Building...${NC}"
-    cmake -B "$ROOT_DIR/build_v2_release" -S "$ROOT_DIR/src/v2" -G Ninja -DCMAKE_BUILD_TYPE=Release > /dev/null 2>&1
-    cmake --build "$ROOT_DIR/build_v2_release" --parallel > /dev/null 2>&1
-    if [[ ! -x "$RELEASE_BIN" ]]; then
-        echo -e "${RED}Error: Failed to build release binary${NC}" >&2
-        exit 1
-    fi
-    echo -e "${GREEN}✓ Release build complete${NC}"
+# Always rebuild Release to benchmark against the current source
+echo -e "${YELLOW}Building Release binary...${NC}"
+cmake -B "$ROOT_DIR/build_v2_release" -S "$ROOT_DIR/src/v2" -G Ninja -DCMAKE_BUILD_TYPE=Release > /dev/null 2>&1
+if ! cmake --build "$ROOT_DIR/build_v2_release" --parallel > /dev/null 2>&1; then
+    echo -e "${RED}Error: Release build failed${NC}" >&2
+    echo -e "${YELLOW}Run manually to see errors: cmake --build build_v2_release --parallel${NC}" >&2
+    exit 1
 fi
+if [[ ! -x "$RELEASE_BIN" ]]; then
+    echo -e "${RED}Error: Release binary not found after build${NC}" >&2
+    exit 1
+fi
+echo -e "${GREEN}✓ Release build complete${NC}"
 
 # ---------------------------------------------------------------------------
 # Read baseline
@@ -209,6 +212,77 @@ echo ""
 
 if $OVERALL_PASS; then
     echo -e "${GREEN}✓ No performance regressions detected${NC}"
+
+    # ---------------------------------------------------------------------------
+    # Ratchet: auto-raise baselines when a new high-water mark is reached
+    # ---------------------------------------------------------------------------
+    RATCHETED=false
+    for DEVICE in $DEVICES; do
+        if [[ -z "${RESULTS_PREFILL[$DEVICE]:-}" ]]; then
+            continue
+        fi
+
+        BASELINE_PREFILL=$(jq -r ".devices[\"$DEVICE\"].prefill_tok_s" "$BASELINE_FILE")
+        BASELINE_DECODE=$(jq -r ".devices[\"$DEVICE\"].decode_tok_s" "$BASELINE_FILE")
+        CUR_PREFILL="${RESULTS_PREFILL[$DEVICE]}"
+        CUR_DECODE="${RESULTS_DECODE[$DEVICE]}"
+
+        RAISE_PREFILL=false
+        RAISE_DECODE=false
+        if (( $(echo "$CUR_PREFILL > $BASELINE_PREFILL" | bc -l) )); then
+            RAISE_PREFILL=true
+        fi
+        if (( $(echo "$CUR_DECODE > $BASELINE_DECODE" | bc -l) )); then
+            RAISE_DECODE=true
+        fi
+
+        if $RAISE_PREFILL || $RAISE_DECODE; then
+            NEW_PREFILL=$( $RAISE_PREFILL && echo "$CUR_PREFILL" || echo "$BASELINE_PREFILL" )
+            NEW_DECODE=$( $RAISE_DECODE && echo "$CUR_DECODE" || echo "$BASELINE_DECODE" )
+            COMMIT_HASH=$(git -C "$ROOT_DIR" rev-parse --short HEAD 2>/dev/null || echo "unknown")
+            COMMENT="High-water mark set at commit ${COMMIT_HASH} on $(date +%Y-%m-%d). Note to agents: It is FORBIDDEN to update these thresholds without explicit human approval."
+
+            # Preserve per-device threshold if it exists
+            DEVICE_THRESHOLD=$(jq -r ".devices[\"$DEVICE\"].regression_threshold_pct // empty" "$BASELINE_FILE")
+
+            if [[ -n "$DEVICE_THRESHOLD" ]]; then
+                jq --arg dev "$DEVICE" \
+                   --argjson pf "$NEW_PREFILL" \
+                   --argjson dc "$NEW_DECODE" \
+                   --argjson thr "$DEVICE_THRESHOLD" \
+                   --arg cmt "$COMMENT" \
+                   '.devices[$dev].prefill_tok_s = $pf |
+                    .devices[$dev].decode_tok_s = $dc |
+                    .devices[$dev].regression_threshold_pct = $thr |
+                    .devices[$dev]._comment = $cmt' \
+                   "$BASELINE_FILE" > "${BASELINE_FILE}.tmp" && mv "${BASELINE_FILE}.tmp" "$BASELINE_FILE"
+            else
+                jq --arg dev "$DEVICE" \
+                   --argjson pf "$NEW_PREFILL" \
+                   --argjson dc "$NEW_DECODE" \
+                   --arg cmt "$COMMENT" \
+                   '.devices[$dev].prefill_tok_s = $pf |
+                    .devices[$dev].decode_tok_s = $dc |
+                    .devices[$dev]._comment = $cmt' \
+                   "$BASELINE_FILE" > "${BASELINE_FILE}.tmp" && mv "${BASELINE_FILE}.tmp" "$BASELINE_FILE"
+            fi
+
+            RATCHETED=true
+            DETAILS=""
+            $RAISE_PREFILL && DETAILS+="prefill ${BASELINE_PREFILL}→${CUR_PREFILL}"
+            $RAISE_PREFILL && $RAISE_DECODE && DETAILS+=", "
+            $RAISE_DECODE && DETAILS+="decode ${BASELINE_DECODE}→${CUR_DECODE}"
+            echo -e "  ${GREEN}▲ ${DEVICE}: ratcheted baseline (${DETAILS})${NC}"
+        fi
+    done
+
+    if $RATCHETED; then
+        # Stage the updated baseline so it becomes part of this commit
+        git -C "$ROOT_DIR" add "$BASELINE_FILE"
+        echo ""
+        echo -e "${GREEN}✓ Baseline ratcheted and staged for commit${NC}"
+    fi
+
     exit 0
 else
     echo -e "${RED}✗ Performance regression detected!${NC}"

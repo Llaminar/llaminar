@@ -28,6 +28,7 @@
 #include "../../../tensors/TensorClasses.h" // For FP32Tensor::createMapped()
 #include "../../../kernels/cpu/CPUKVCache.h"
 #include "../../../kernels/KernelFactory.h"
+#include "../../../backends/BackendManager.h"
 #include "../../../interfaces/IWorkspaceConsumer.h"
 #include <chrono>
 #include <algorithm>
@@ -1879,13 +1880,17 @@ namespace llaminar2
             state_.sequence_lengths[b] += seq_len;
         }
 
-        // TEMPORARY DEBUG: trace forward inputs for server regression debugging
-        LOG_ERROR("[FORWARD_TRACE] seq_len=" << seq_len
+        LOG_TRACE("[FORWARD_TRACE] seq_len=" << seq_len
                                              << " pos_offset=" << input.position_offset
                                              << " token_ids[0]=" << (tokens ? tokens[0] : -1)
                                              << " positions_after=" << state_.positions[0]);
 
         // Return logits pointer
+        // GPU: logits remain on device (DEVICE_AUTHORITATIVE) — avoid massive D2H transfer.
+        // Callers that need host data should call logits() explicitly.
+        // CPU: logits are already on host, fp32_data() is essentially free.
+        if (state_.device_id.is_gpu())
+            return reinterpret_cast<const float *>(state_.logits.get());
         return state_.logits->fp32_data();
     }
 
@@ -1896,6 +1901,38 @@ namespace llaminar2
             return nullptr;
         }
         return state_.logits->fp32_data();
+    }
+
+    int DeviceGraphOrchestrator::sampleGreedyOnDevice()
+    {
+        if (!state_.device_id.is_gpu() || !state_.logits)
+            return -1;
+
+        IBackend *backend = getBackendFor(state_.device_id);
+        if (!backend)
+            return -1;
+
+        const void *gpu_ptr = state_.logits->gpu_data_ptr();
+        if (!gpu_ptr)
+            return -1;
+
+        const auto &shape = state_.logits->shape();
+        const size_t vocab = (shape.size() >= 2) ? shape[1] : shape[0];
+        const size_t rows = (shape.size() >= 2) ? shape[0] : 1;
+
+        // Offset to last row (prefill: last token's logits; decode: only row)
+        const void *last_row = static_cast<const char *>(gpu_ptr) +
+                               (rows - 1) * vocab * sizeof(float);
+
+        float max_val = 0.0f;
+        int max_idx = 0;
+
+        if (!backend->argmaxF32(last_row, static_cast<int>(vocab),
+                                state_.device_id.gpu_ordinal(),
+                                &max_val, &max_idx))
+            return -1;
+
+        return max_idx;
     }
 
     // =========================================================================

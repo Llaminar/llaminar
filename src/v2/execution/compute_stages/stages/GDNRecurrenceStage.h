@@ -57,27 +57,28 @@ namespace llaminar2
             STAGE_PARAMS_COMMON_FIELDS;
 
             // Input tensors (all FP32, already projected + conv'd + RoPE'd)
-            const ITensor *Q = nullptr;     ///< Query  [seq_len, n_heads * d_k]
-            const ITensor *K = nullptr;     ///< Key    [seq_len, n_heads * d_k]
-            const ITensor *V = nullptr;     ///< Value  [seq_len, n_heads * d_v]
+            const ITensor *Q = nullptr; ///< Query  [seq_len, n_heads * d_k]
+            const ITensor *K = nullptr; ///< Key    [seq_len, n_heads * d_k]
+            const ITensor *V = nullptr; ///< Value  [seq_len, n_heads * d_v]
 
             // Gate inputs (raw projections, gate computation done internally)
             const ITensor *alpha = nullptr; ///< A projection [seq_len, n_heads]
             const ITensor *beta = nullptr;  ///< B projection [seq_len, n_heads]
 
             // Weight parameters for gate computation: g = -exp(A_log) * softplus(alpha + dt_bias)
-            const ITensor *A_log = nullptr; ///< Learnable log-space gate [n_heads]
+            const ITensor *A_log = nullptr;   ///< Learnable log-space gate [n_heads]
             const ITensor *dt_bias = nullptr; ///< Learnable dt bias [n_heads]
 
-            ITensor *output = nullptr;      ///< Output [seq_len, n_heads * d_v]
+            ITensor *output = nullptr; ///< Output [seq_len, n_heads * d_v]
 
             // Recurrence state [n_heads, d_k, d_v] — persistent across decode steps
             float *recurrence_state = nullptr;
 
             int seq_len = 0;
-            int n_heads = 0;
-            int d_k = 0;       ///< Key head dimension
-            int d_v = 0;       ///< Value head dimension
+            int n_heads = 0;     ///< Value head count (recurrence operates with this)
+            int n_k_heads = 0;   ///< Key head count (for QKV split; 0 = same as n_heads)
+            int d_k = 0;         ///< Key head dimension
+            int d_v = 0;         ///< Value head dimension
             int chunk_size = 64; ///< Chunk size for prefill
 
             bool use_qk_l2norm = true; ///< Apply L2 normalization to Q and K

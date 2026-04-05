@@ -175,6 +175,9 @@ static const std::vector<TestConfig> kQwen35SingleDeviceConfigs = {
     // (block_dim=128) spreads outlier energy across dimensions before Q8_1
     // quantization, improving worst-layer cosine from ~0.85 to ~0.93+.
     // Remaining gap vs FP32 is due to Q8_0 weight quantization, not outliers.
+    //
+    // Post exp() polynomial fix: LM_HEAD cosine 0.963→0.989, KL 0.68→0.04,
+    // Top-1 0%→100%. Thresholds tightened accordingly.
     // =========================================================================
     {
         .name = "Qwen35_4B_CPU_KV_FP16",
@@ -182,14 +185,14 @@ static const std::vector<TestConfig> kQwen35SingleDeviceConfigs = {
         .parallelism = Parallelism::None,
         .collective = Collective::None,
         .thresholds = {
-            .cosine_threshold = 0.91f,           // Observed: ~0.93 worst min cosine (with rotation)
-            .decode_cosine_threshold = 0.88f,    // Observed: ~0.93 worst decode step
+            .cosine_threshold = 0.96f,           // Observed: ~0.98+ post exp() fix
+            .decode_cosine_threshold = 0.93f,    // Observed: ~0.97+ post exp() fix
             .early_layers_count = 8,
             .min_early_layers_passed = 8,         // All 8 early layers pass with rotation
-            .kl_threshold = 1.0f,                 // Observed: 0.68 prefill, 0.71 decode
-            .min_top1_accuracy = 0.0f,            // Outliers still affect top-1 marginally
-            .min_top5_accuracy = 50.0f,           // Observed: 60% prefill, 100% decode
-            .pytorch_top1_in_topk = 0,            // Disabled: outlier sensitivity
+            .kl_threshold = 0.10f,                // Observed: 0.04 prefill post exp() fix
+            .min_top1_accuracy = 80.0f,           // Observed: 100% post exp() fix
+            .min_top5_accuracy = 80.0f,           // Observed: 100% post exp() fix
+            .pytorch_top1_in_topk = 3,            // Re-enabled: exp() fix restored accuracy
         },
         .model_path = "models/Qwen3.5-4B-Q8_0.gguf",
         .snapshot_dir = "pytorch_qwen35_4b_snapshots",
@@ -202,14 +205,14 @@ static const std::vector<TestConfig> kQwen35SingleDeviceConfigs = {
         .parallelism = Parallelism::None,
         .collective = Collective::None,
         .thresholds = {
-            .cosine_threshold = 0.91f,
-            .decode_cosine_threshold = 0.88f,
+            .cosine_threshold = 0.96f,
+            .decode_cosine_threshold = 0.93f,
             .early_layers_count = 8,
             .min_early_layers_passed = 8,
-            .kl_threshold = 1.0f,
-            .min_top1_accuracy = 0.0f,
-            .min_top5_accuracy = 50.0f,
-            .pytorch_top1_in_topk = 0,
+            .kl_threshold = 0.10f,
+            .min_top1_accuracy = 80.0f,
+            .min_top5_accuracy = 80.0f,
+            .pytorch_top1_in_topk = 3,
         },
         .model_path = "models/Qwen3.5-4B-Q8_0.gguf",
         .snapshot_dir = "pytorch_qwen35_4b_snapshots",
@@ -222,14 +225,14 @@ static const std::vector<TestConfig> kQwen35SingleDeviceConfigs = {
         .parallelism = Parallelism::None,
         .collective = Collective::None,
         .thresholds = {
-            .cosine_threshold = 0.91f,
-            .decode_cosine_threshold = 0.88f,
+            .cosine_threshold = 0.96f,
+            .decode_cosine_threshold = 0.93f,
             .early_layers_count = 8,
             .min_early_layers_passed = 8,
-            .kl_threshold = 1.0f,
-            .min_top1_accuracy = 0.0f,
-            .min_top5_accuracy = 50.0f,
-            .pytorch_top1_in_topk = 0,
+            .kl_threshold = 0.10f,
+            .min_top1_accuracy = 80.0f,
+            .min_top5_accuracy = 80.0f,
+            .pytorch_top1_in_topk = 3,
         },
         .model_path = "models/Qwen3.5-4B-Q8_0.gguf",
         .snapshot_dir = "pytorch_qwen35_4b_snapshots",

@@ -86,35 +86,85 @@ namespace llaminar2
 
         // When Q, K, V all point to the same merged QKV buffer, deinterleave them.
         // Merged layout: [seq_len, q_dim + k_dim + v_dim] per row.
+        // q_dim = k_dim = n_k_heads * d_k, v_dim = n_heads * d_v (n_heads = n_v_heads)
+        // When n_k_heads < n_heads, Q and K are repeat_interleaved to n_heads.
         // The kernel expects separate contiguous [seq_len, dim] arrays.
         const bool merged_qkv = (q_data == k_data && k_data == v_data);
 
+        // Effective key head count for QKV split
+        const int nkh = (params_.n_k_heads > 0) ? params_.n_k_heads : params_.n_heads;
+        const int repeat_factor = params_.n_heads / nkh;
+
         if (merged_qkv)
         {
-            const int q_dim = params_.n_heads * params_.d_k;
-            const int k_dim = params_.n_heads * params_.d_k;
+            // Dimensions in the merged QKV buffer (before repeat_interleave)
+            const int q_src_dim = nkh * params_.d_k;
+            const int k_src_dim = nkh * params_.d_k;
             const int v_dim = params_.n_heads * params_.d_v;
-            const int qkv_stride = q_dim + k_dim + v_dim;
+            const int qkv_stride = q_src_dim + k_src_dim + v_dim;
+
+            // Dimensions after repeat_interleave (what the kernel expects)
+            const int q_dst_dim = params_.n_heads * params_.d_k;
+            const int k_dst_dim = params_.n_heads * params_.d_k;
             const int T = params_.seq_len;
 
             // Grow-only reusable scratch (no allocation after first call at max seq_len)
-            const size_t q_size = static_cast<size_t>(T) * q_dim;
-            const size_t k_size = static_cast<size_t>(T) * k_dim;
+            const size_t q_size = static_cast<size_t>(T) * q_dst_dim;
+            const size_t k_size = static_cast<size_t>(T) * k_dst_dim;
             const size_t v_size = static_cast<size_t>(T) * v_dim;
-            if (q_deinterleave_.size() < q_size) q_deinterleave_.resize(q_size);
-            if (k_deinterleave_.size() < k_size) k_deinterleave_.resize(k_size);
-            if (v_deinterleave_.size() < v_size) v_deinterleave_.resize(v_size);
+            if (q_deinterleave_.size() < q_size)
+                q_deinterleave_.resize(q_size);
+            if (k_deinterleave_.size() < k_size)
+                k_deinterleave_.resize(k_size);
+            if (v_deinterleave_.size() < v_size)
+                v_deinterleave_.resize(v_size);
 
             const float *qkv = q_data; // merged buffer
-            for (int t = 0; t < T; ++t)
+
+            if (repeat_factor <= 1)
             {
-                const float *row = qkv + static_cast<size_t>(t) * qkv_stride;
-                std::memcpy(q_deinterleave_.data() + static_cast<size_t>(t) * q_dim,
-                            row, q_dim * sizeof(float));
-                std::memcpy(k_deinterleave_.data() + static_cast<size_t>(t) * k_dim,
-                            row + q_dim, k_dim * sizeof(float));
-                std::memcpy(v_deinterleave_.data() + static_cast<size_t>(t) * v_dim,
-                            row + q_dim + k_dim, v_dim * sizeof(float));
+                // No repeat needed: n_k_heads == n_v_heads, simple deinterleave
+                for (int t = 0; t < T; ++t)
+                {
+                    const float *row = qkv + static_cast<size_t>(t) * qkv_stride;
+                    std::memcpy(q_deinterleave_.data() + static_cast<size_t>(t) * q_dst_dim,
+                                row, q_dst_dim * sizeof(float));
+                    std::memcpy(k_deinterleave_.data() + static_cast<size_t>(t) * k_dst_dim,
+                                row + q_src_dim, k_dst_dim * sizeof(float));
+                    std::memcpy(v_deinterleave_.data() + static_cast<size_t>(t) * v_dim,
+                                row + q_src_dim + k_src_dim, v_dim * sizeof(float));
+                }
+            }
+            else
+            {
+                // Deinterleave + repeat_interleave Q/K from n_k_heads to n_v_heads
+                // repeat_interleave(Q, repeat_factor, dim=head):
+                //   Q[t, h, d_k] -> Q[t, h*R+0, d_k], Q[t, h*R+1, d_k], ...
+                for (int t = 0; t < T; ++t)
+                {
+                    const float *row = qkv + static_cast<size_t>(t) * qkv_stride;
+                    float *q_dst = q_deinterleave_.data() + static_cast<size_t>(t) * q_dst_dim;
+                    float *k_dst = k_deinterleave_.data() + static_cast<size_t>(t) * k_dst_dim;
+                    const float *q_src = row;
+                    const float *k_src = row + q_src_dim;
+
+                    for (int h = 0; h < nkh; ++h)
+                    {
+                        for (int r = 0; r < repeat_factor; ++r)
+                        {
+                            std::memcpy(q_dst + (h * repeat_factor + r) * params_.d_k,
+                                        q_src + h * params_.d_k,
+                                        params_.d_k * sizeof(float));
+                            std::memcpy(k_dst + (h * repeat_factor + r) * params_.d_k,
+                                        k_src + h * params_.d_k,
+                                        params_.d_k * sizeof(float));
+                        }
+                    }
+
+                    // V: straight copy (already n_v_heads wide)
+                    std::memcpy(v_deinterleave_.data() + static_cast<size_t>(t) * v_dim,
+                                row + q_src_dim + k_src_dim, v_dim * sizeof(float));
+                }
             }
 
             q_data = q_deinterleave_.data();
@@ -122,8 +172,9 @@ namespace llaminar2
             v_data = v_deinterleave_.data();
 
             LOG_DEBUG("[GDNRecurrenceStage] Deinterleaved merged QKV: "
-                      << T << "x" << qkv_stride << " -> Q(" << T << "x" << q_dim
-                      << "), K(" << T << "x" << k_dim << "), V(" << T << "x" << v_dim << ")");
+                      << T << "x" << qkv_stride << " -> Q(" << T << "x" << q_dst_dim
+                      << "), K(" << T << "x" << k_dst_dim << "), V(" << T << "x" << v_dim << ")"
+                      << (repeat_factor > 1 ? " [repeat_interleave x" + std::to_string(repeat_factor) + "]" : ""));
         }
 
         bool ok;

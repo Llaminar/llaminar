@@ -97,9 +97,11 @@ namespace llaminar2
                     __m512 neg_g = _mm512_max_ps(vmin, _mm512_min_ps(vmax, _mm512_mul_ps(vg, vneg)));
 
                     // exp(neg_g) via range reduction + polynomial
-                    // n = round(neg_g * log2e), f = neg_g - n * ln2
-                    __m512 vn = _mm512_roundscale_ps(_mm512_mul_ps(neg_g, vlog2e), _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
-                    __m512 vf = _mm512_fnmadd_ps(vn, vc1, neg_g); // f = neg_g - n*ln2
+                    // exp(x) = 2^(x*log2e) = 2^n * 2^f where n=round(x*log2e),
+                    // f = x*log2e - n ∈ [-0.5, 0.5]. Polynomial approximates 2^f.
+                    __m512 neg_g_scaled = _mm512_mul_ps(neg_g, vlog2e);
+                    __m512 vn = _mm512_roundscale_ps(neg_g_scaled, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+                    __m512 vf = _mm512_sub_ps(neg_g_scaled, vn);
 
                     // Polynomial: p = c0 + f*(c1 + f*(c2 + f*(c3 + f*(c4 + f*c5))))
                     __m512 vp = _mm512_fmadd_ps(vc5, vf, vc4);

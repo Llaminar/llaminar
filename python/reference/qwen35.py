@@ -73,15 +73,21 @@ class Qwen35ReferenceModel(HuggingFaceReferenceModel):
             else:
                 layer_types.append("linear_attention")
 
-        # linear_num_value_heads defaults to same as linear_num_key_heads
+        # linear_num_value_heads: derive from ssm_inner_size / value_head_dim
+        # (GGUF doesn't store this directly; for 0.8B n_k==n_v==16, for 4B n_k=16, n_v=32)
         linear_num_key_heads = config_dict.get('linear_num_key_heads', 16)
-        linear_num_value_heads = config_dict.get('linear_num_value_heads', linear_num_key_heads)
-
-        # linear_key_head_dim: derived from ssm_inner_size / linear_num_key_heads
+        linear_value_head_dim = config_dict.get('linear_value_head_dim', 128)
         ssm_inner_size = config_dict.get('ssm_inner_size', None)
-        linear_key_head_dim = config_dict.get('linear_key_head_dim', None)
-        if linear_key_head_dim is None and ssm_inner_size is not None:
-            linear_key_head_dim = ssm_inner_size // linear_num_key_heads
+
+        if ssm_inner_size is not None and linear_value_head_dim > 0:
+            linear_num_value_heads = ssm_inner_size // linear_value_head_dim
+        else:
+            linear_num_value_heads = linear_num_key_heads
+
+        # linear_key_head_dim: for Qwen3.5, d_k == d_v == state_size (128)
+        # Don't derive from ssm_inner_size/n_k_heads — ssm_inner_size is value-total,
+        # not key-total (they differ when n_k_heads != n_v_heads)
+        linear_key_head_dim = config_dict.get('linear_key_head_dim', linear_value_head_dim)
 
         cfg = Qwen3_5TextConfig(
             hidden_size=config_dict.get('hidden_size', 1024),

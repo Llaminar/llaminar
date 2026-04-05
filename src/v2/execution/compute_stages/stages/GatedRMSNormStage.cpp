@@ -118,13 +118,16 @@ namespace llaminar2
                         if (gate_silu)
                         {
                             // SiLU(x) = x * sigmoid(x) = x / (1 + exp(-x))
-                            // Use fast sigmoid via polynomial exp
+                            // Fast exp via range reduction: exp(x) = 2^(x*log2e) = 2^n * 2^f
+                            // where n = round(x*log2e) and f = x*log2e - n ∈ [-0.5, 0.5].
+                            // Polynomial approximates 2^f (Taylor of exp(f*ln2)).
                             __m512 neg_g = _mm512_mul_ps(vgate, vneg1);
                             neg_g = _mm512_max_ps(_mm512_set1_ps(-88.0f), _mm512_min_ps(_mm512_set1_ps(88.0f), neg_g));
                             const __m512 vlog2e = _mm512_set1_ps(1.4426950408889634f);
                             const __m512 vln2 = _mm512_set1_ps(0.6931471805599453f);
-                            __m512 vn = _mm512_roundscale_ps(_mm512_mul_ps(neg_g, vlog2e), _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
-                            __m512 vf = _mm512_fnmadd_ps(vn, vln2, neg_g);
+                            __m512 neg_g_scaled = _mm512_mul_ps(neg_g, vlog2e);
+                            __m512 vn = _mm512_roundscale_ps(neg_g_scaled, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+                            __m512 vf = _mm512_sub_ps(neg_g_scaled, vn);
                             __m512 vp = _mm512_fmadd_ps(_mm512_set1_ps(0.0013333558146428f), vf, _mm512_set1_ps(0.0096181291076285f));
                             vp = _mm512_fmadd_ps(vp, vf, _mm512_set1_ps(0.0555041086648216f));
                             vp = _mm512_fmadd_ps(vp, vf, _mm512_set1_ps(0.2402265069591007f));

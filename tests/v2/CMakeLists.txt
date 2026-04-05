@@ -9200,6 +9200,34 @@ add_v2_test(V2_Unit_HeterogeneousLayers
     MPI_PROCS 1
 )
 
+# Regression: AVX512 exp() polynomial bug in GatedRMSNormStage and AttentionOutputGateStage
+# The polynomial used 2^f Taylor coefficients but was fed f=x-n*ln2 instead of f=x*log2e-n,
+# causing 3-11% SiLU/sigmoid error that compounded across 24 GDN layers.
+add_executable(v2_test_exp_polynomial_regression unit/execution/Test__ExpPolynomialRegression.cpp)
+target_link_libraries(v2_test_exp_polynomial_regression
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_ExpPolynomialRegression
+    COMMAND $<TARGET_FILE:v2_test_exp_polynomial_regression>
+    LABELS "V2;Unit;Regression;GDN;SiLU;Sigmoid;AVX512"
+    MPI_PROCS 1
+)
+
+# Regression: GDNRecurrenceStage QKV deinterleave repeat_interleave for n_k_heads < n_v_heads
+add_executable(v2_test_gdn_repeat_interleave_regression unit/execution/Test__GDNRepeatInterleaveRegression.cpp)
+target_link_libraries(v2_test_gdn_repeat_interleave_regression
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_GDNRepeatInterleaveRegression
+    COMMAND $<TARGET_FILE:v2_test_gdn_repeat_interleave_regression>
+    LABELS "V2;Unit;Regression;GDN;RepeatInterleave"
+    MPI_PROCS 1
+)
+
 # Test: GDN Kernels — Phase C: GDNProjectionStage, ShortConv1dStage,
 # GDNRecurrenceStage (recurrent step + chunk-parallel prefill)
 add_executable(v2_test_gdn_kernels unit/execution/Test__GDNKernels.cpp)
