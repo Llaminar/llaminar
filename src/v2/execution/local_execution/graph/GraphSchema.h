@@ -25,6 +25,7 @@
 
 #include "../../../backends/DeviceId.h"
 #include "../../StageShardingMode.h"
+#include "../../../utils/Sampler.h"
 #include <string>
 #include <vector>
 #include <unordered_map>
@@ -761,6 +762,23 @@ namespace llaminar2
          * @return Vector of weight suffixes (e.g., "attn_q.weight", "attn_q.bias")
          */
         virtual std::vector<std::string> layerWeightSuffixes() const = 0;
+
+        /**
+         * @brief Get recommended sampling parameters for this model architecture
+         *
+         * Returns model-specific recommended defaults for sampling parameters.
+         * These serve as fallback values when the user doesn't specify parameters.
+         * For example, Qwen3.5 thinking models need presence_penalty=1.5.
+         *
+         * Default implementation returns standard defaults (no penalties).
+         * Override in model-specific factories to provide architecture-tuned values.
+         *
+         * @return SamplingParams with recommended defaults for this architecture
+         */
+        virtual SamplingParams getRecommendedSamplingParams() const
+        {
+            return SamplingParams{}; // Standard defaults
+        }
     };
 
 } // namespace llaminar2

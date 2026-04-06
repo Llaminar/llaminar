@@ -326,7 +326,7 @@ namespace llaminar2
         // =========================================================================
 
         std::string model_path; ///< Path to GGUF model file
-        int max_seq_len = 2048; ///< Maximum sequence length
+        int max_seq_len = 4096; ///< Maximum sequence length
         bool use_mmap = true;   ///< Use memory-mapped file loading
 
         // =========================================================================

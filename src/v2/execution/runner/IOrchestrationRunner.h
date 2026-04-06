@@ -367,6 +367,15 @@ namespace llaminar2
          * GPU-side greedy (argmax) or GPU-side top-k/top-p sampling.
          */
         virtual void setSamplingParams(const SamplingParams & /*params*/) {}
+
+        /**
+         * @brief Get model-recommended sampling parameters
+         *
+         * Returns the model-specific defaults (e.g., Qwen3.5 recommends
+         * temp=0.6, presence_penalty=1.5). Callers should merge these
+         * as defaults when the user hasn't specified explicit values.
+         */
+        virtual SamplingParams getRecommendedSamplingParams() const { return {}; }
     };
 
 } // namespace llaminar2

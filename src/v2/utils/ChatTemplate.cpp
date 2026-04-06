@@ -6,15 +6,32 @@
  *
  * Implements chat template detection from GGUF metadata strings and
  * format-specific prompt construction for various LLM families.
+ * Primary rendering uses the vendored Jinja2 engine with fallback
+ * to hardcoded format implementations.
  */
 
 #include "ChatTemplate.h"
 #include "Logger.h"
+#include "vendor/jinja/lexer.h"
+#include "vendor/jinja/parser.h"
+#include "vendor/jinja/runtime.h"
+#include "vendor/jinja/value.h"
 #include <sstream>
 #include <algorithm>
+#include <nlohmann/json.hpp>
 
 namespace llaminar2
 {
+
+    // ============================================================================
+    // Jinja State (opaque, keeps jinja headers out of public API)
+    // ============================================================================
+
+    struct ChatTemplate::JinjaState
+    {
+        jinja::program prog;
+        std::string source; // Preserved source for error tracing
+    };
 
     // ============================================================================
     // Utility Functions
@@ -79,21 +96,337 @@ namespace llaminar2
     // ChatTemplate Implementation
     // ============================================================================
 
-    ChatTemplate::ChatTemplate(ChatTemplateType type, const std::string &raw_template)
-        : type_(type), raw_template_(raw_template)
+    ChatTemplate::ChatTemplate(ChatTemplateType type, const std::string &raw_template,
+                               const std::string &bos_token, const std::string &eos_token)
+        : type_(type), raw_template_(raw_template),
+          bos_token_(bos_token), eos_token_(eos_token)
     {
+        // Try to compile the Jinja2 template
+        if (!raw_template_.empty())
+        {
+            jinja_available_ = compileJinja();
+        }
+
+        // Auto-detect thinking tags via differential Jinja rendering
+        if (jinja_available_)
+        {
+            detectThinkingTags();
+        }
+        else
+        {
+            // Fallback: simple heuristic
+            is_thinking_model_ = (raw_template_.find("enable_thinking") != std::string::npos);
+            if (is_thinking_model_)
+            {
+                thinking_start_tag_ = "<think>\n";
+                thinking_end_tag_ = "</think>";
+            }
+        }
     }
 
-    std::unique_ptr<ChatTemplate> ChatTemplate::create(const std::string &template_str)
+    ChatTemplate::~ChatTemplate() = default;
+
+    std::unique_ptr<ChatTemplate> ChatTemplate::create(const std::string &template_str,
+                                                       const std::string &bos_token,
+                                                       const std::string &eos_token)
     {
         ChatTemplateType type = detectType(template_str);
-        LOG_DEBUG("[ChatTemplate] Detected template type: " << chatTemplateTypeName(type));
-        return std::unique_ptr<ChatTemplate>(new ChatTemplate(type, template_str));
+        LOG_DEBUG("[ChatTemplate] Detected template type: " << chatTemplateTypeName(type)
+                                                            << " (jinja will be attempted)");
+        return std::unique_ptr<ChatTemplate>(
+            new ChatTemplate(type, template_str, bos_token, eos_token));
     }
 
     std::unique_ptr<ChatTemplate> ChatTemplate::create(ChatTemplateType type)
     {
-        return std::unique_ptr<ChatTemplate>(new ChatTemplate(type, ""));
+        return std::unique_ptr<ChatTemplate>(
+            new ChatTemplate(type, "", "", ""));
+    }
+
+    // ============================================================================
+    // Jinja2 Engine Integration
+    // ============================================================================
+
+    bool ChatTemplate::compileJinja()
+    {
+        try
+        {
+            jinja_state_ = std::make_unique<JinjaState>();
+            jinja::lexer lexer;
+            auto lexer_res = lexer.tokenize(raw_template_);
+            jinja_state_->prog = jinja::parse_from_tokens(lexer_res);
+            jinja_state_->source = lexer_res.source;
+            LOG_DEBUG("[ChatTemplate] Jinja2 template compiled successfully");
+            return true;
+        }
+        catch (const std::exception &e)
+        {
+            LOG_WARN("[ChatTemplate] Jinja2 compilation failed: " << e.what()
+                                                                  << " — will use fallback renderer");
+            jinja_state_.reset();
+            return false;
+        }
+    }
+
+    std::string ChatTemplate::renderJinja(const std::vector<ChatMessage> &messages,
+                                          bool add_generation_prompt,
+                                          bool enable_thinking) const
+    {
+        if (!jinja_state_)
+            return {};
+
+        try
+        {
+            // Re-parse the template fresh each call to avoid AST mutation bugs
+            // in the vendored Jinja engine (execute_impl methods can modify shared
+            // AST nodes, causing non-deterministic rendering on subsequent calls).
+            jinja::lexer lexer;
+            auto lexer_res = lexer.tokenize(raw_template_);
+            jinja::program prog = jinja::parse_from_tokens(lexer_res);
+
+            jinja::context ctx(jinja_state_->source);
+
+            // Build the messages array as ordered JSON
+            nlohmann::ordered_json msg_array = nlohmann::ordered_json::array();
+            for (const auto &msg : messages)
+            {
+                nlohmann::ordered_json jmsg;
+                jmsg["role"] = msg.role;
+                jmsg["content"] = msg.content;
+                msg_array.push_back(jmsg);
+            }
+
+            // Build the context object with all standard template variables
+            nlohmann::ordered_json inp;
+            inp["messages"] = msg_array;
+            inp["bos_token"] = bos_token_;
+            inp["eos_token"] = eos_token_;
+            if (add_generation_prompt)
+            {
+                inp["add_generation_prompt"] = true;
+            }
+            inp["enable_thinking"] = enable_thinking;
+
+            // Load context into jinja runtime
+            jinja::global_from_json(ctx, inp, false);
+
+            // Execute template
+            jinja::runtime runtime(ctx);
+            const jinja::value results = runtime.execute(prog);
+            auto parts = jinja::runtime::gather_string_parts(results);
+
+            return parts->as_string().str();
+        }
+        catch (const std::exception &e)
+        {
+            LOG_WARN("[ChatTemplate] Jinja2 render failed: " << e.what());
+            return {};
+        }
+    }
+
+    /**
+     * @brief Render without passing enable_thinking at all (for differential detection)
+     *
+     * This makes `enable_thinking is defined` evaluate to false.
+     */
+    std::string ChatTemplate::renderJinjaWithoutThinkingVar(
+        const std::vector<ChatMessage> &messages,
+        bool add_generation_prompt) const
+    {
+        if (!jinja_state_)
+            return {};
+
+        try
+        {
+            // Re-parse template fresh (same rationale as renderJinja)
+            jinja::lexer lexer;
+            auto lexer_res = lexer.tokenize(raw_template_);
+            jinja::program prog = jinja::parse_from_tokens(lexer_res);
+
+            jinja::context ctx(jinja_state_->source);
+
+            nlohmann::ordered_json msg_array = nlohmann::ordered_json::array();
+            for (const auto &msg : messages)
+            {
+                nlohmann::ordered_json jmsg;
+                jmsg["role"] = msg.role;
+                jmsg["content"] = msg.content;
+                msg_array.push_back(jmsg);
+            }
+
+            nlohmann::ordered_json inp;
+            inp["messages"] = msg_array;
+            inp["bos_token"] = bos_token_;
+            inp["eos_token"] = eos_token_;
+            if (add_generation_prompt)
+            {
+                inp["add_generation_prompt"] = true;
+            }
+            // Deliberately NOT setting enable_thinking
+
+            jinja::global_from_json(ctx, inp, false);
+            jinja::runtime runtime(ctx);
+            const jinja::value results = runtime.execute(prog);
+            auto parts = jinja::runtime::gather_string_parts(results);
+            return parts->as_string().str();
+        }
+        catch (const std::exception &)
+        {
+            return {};
+        }
+    }
+
+    void ChatTemplate::detectThinkingTags()
+    {
+        // Differential rendering approach (like llama.cpp):
+        // Compare enable_thinking=true vs NOT passing enable_thinking at all
+        // This makes `enable_thinking is defined` differ between the two.
+        std::vector<ChatMessage> test_messages = {
+            {"user", "Hello"}};
+
+        std::string with_thinking = renderJinja(test_messages, true, true);
+        std::string without_thinking = renderJinjaWithoutThinkingVar(test_messages, true);
+
+        LOG_DEBUG("[ChatTemplate] detectThinkingTags: with_thinking (" << with_thinking.size()
+                                                                        << " chars), without_thinking ("
+                                                                        << without_thinking.size() << " chars)");
+
+        if (with_thinking.empty() || without_thinking.empty())
+        {
+            return;
+        }
+
+        // Find the suffix difference: what's appended when thinking is enabled
+        // Both should share the same prefix up to the generation prompt
+        if (with_thinking == without_thinking)
+        {
+            // No difference — not a thinking model
+            is_thinking_model_ = false;
+            return;
+        }
+
+        // Find the common prefix
+        size_t common = 0;
+        size_t min_len = std::min(with_thinking.size(), without_thinking.size());
+        while (common < min_len && with_thinking[common] == without_thinking[common])
+        {
+            common++;
+        }
+
+        // The difference at the end tells us the thinking tags
+        std::string thinking_suffix = with_thinking.substr(common);
+        std::string non_thinking_suffix = without_thinking.substr(common);
+
+        // Helper: find a closing tag like </think> in a string
+        auto find_close_tag = [](const std::string &s) -> std::string
+        {
+            auto close_pos = s.find("</");
+            if (close_pos != std::string::npos)
+            {
+                auto end_pos = s.find('>', close_pos);
+                if (end_pos != std::string::npos)
+                {
+                    return s.substr(close_pos, end_pos - close_pos + 1);
+                }
+            }
+            return {};
+        };
+
+        // Helper: find last opening tag at end of string (e.g., "...<think>" → "<think>")
+        auto find_trailing_open_tag = [](const std::string &s) -> std::string
+        {
+            // Look backward for '<' that isn't a closing tag
+            for (size_t i = s.size(); i > 0; --i)
+            {
+                if (s[i - 1] == '>')
+                {
+                    // Found end of a tag, find its start
+                    auto open = s.rfind('<', i - 1);
+                    if (open != std::string::npos)
+                    {
+                        std::string tag = s.substr(open, i - open);
+                        // Skip closing tags
+                        if (tag.size() > 2 && tag[1] != '/')
+                        {
+                            return tag;
+                        }
+                    }
+                    break;
+                }
+                // Allow trailing whitespace/newlines after the tag
+                if (s[i - 1] != '\n' && s[i - 1] != ' ' && s[i - 1] != '\t')
+                {
+                    break;
+                }
+            }
+            return {};
+        };
+
+        // Case 1: thinking_suffix is not empty — start tag is directly in the suffix
+        if (!thinking_suffix.empty())
+        {
+            is_thinking_model_ = true;
+            // Strip trailing whitespace to get clean start tag
+            std::string stripped = thinking_suffix;
+            while (!stripped.empty() && (stripped.back() == '\n' || stripped.back() == ' '))
+                stripped.pop_back();
+            thinking_start_tag_ = stripped;
+
+            // Try to find end tag in non-thinking suffix
+            std::string end_candidate = find_close_tag(non_thinking_suffix);
+            if (!end_candidate.empty())
+            {
+                thinking_end_tag_ = end_candidate;
+            }
+        }
+        // Case 2: thinking_suffix is empty but non_thinking_suffix has content
+        // This happens when with_thinking is a prefix of without_thinking
+        // e.g., with="...assistant<think>", without="...assistant<think>\n\n</think>"
+        // The start tag is at the end of the common prefix, end tag is in the suffix
+        else if (!non_thinking_suffix.empty())
+        {
+            // Look for end tag in the non-thinking suffix
+            std::string end_candidate = find_close_tag(non_thinking_suffix);
+            if (!end_candidate.empty())
+            {
+                thinking_end_tag_ = end_candidate;
+
+                // Look for matching start tag at end of common prefix
+                std::string common_prefix = with_thinking.substr(0, common);
+                std::string start_candidate = find_trailing_open_tag(common_prefix);
+                if (!start_candidate.empty())
+                {
+                    thinking_start_tag_ = start_candidate;
+                    is_thinking_model_ = true;
+                }
+                else
+                {
+                    // Derive start tag from end tag: </think> → <think>
+                    thinking_start_tag_ = "<" + end_candidate.substr(2);
+                    is_thinking_model_ = true;
+                }
+            }
+        }
+
+        // If we have start but no end, derive end from start
+        if (is_thinking_model_ && thinking_end_tag_.empty() && !thinking_start_tag_.empty())
+        {
+            std::string stripped = thinking_start_tag_;
+            while (!stripped.empty() && (stripped.back() == '\n' || stripped.back() == ' '))
+                stripped.pop_back();
+            if (stripped.size() > 2 && stripped.front() == '<' && stripped.back() == '>')
+            {
+                thinking_end_tag_ = "</" + stripped.substr(1);
+            }
+        }
+
+        if (is_thinking_model_)
+        {
+
+            LOG_INFO("[ChatTemplate] Thinking model detected via Jinja differential rendering"
+                     << "\n  start_tag: \"" << thinking_start_tag_ << "\""
+                     << "\n  end_tag: \"" << thinking_end_tag_ << "\"");
+        }
     }
 
     ChatTemplateType ChatTemplate::detectType(const std::string &tmpl)
@@ -193,7 +526,26 @@ namespace llaminar2
     }
 
     std::string ChatTemplate::apply(const std::vector<ChatMessage> &messages,
-                                    bool add_generation_prompt) const
+                                    bool add_generation_prompt,
+                                    bool enable_thinking) const
+    {
+        // Primary path: Jinja2 rendering
+        if (jinja_available_)
+        {
+            std::string result = renderJinja(messages, add_generation_prompt, enable_thinking);
+            if (!result.empty())
+            {
+                return result;
+            }
+            LOG_WARN("[ChatTemplate] Jinja2 render returned empty, falling back to hardcoded format");
+        }
+
+        // Fallback path: hardcoded format implementations
+        return applyFallback(messages, add_generation_prompt);
+    }
+
+    std::string ChatTemplate::applyFallback(const std::vector<ChatMessage> &messages,
+                                            bool add_generation_prompt) const
     {
         switch (type_)
         {
@@ -253,6 +605,14 @@ namespace llaminar2
         if (add_ass)
         {
             ss << "<|im_start|>assistant\n";
+            // Thinking models (Qwen3.5, etc.) require a <think> tag in the
+            // generation prompt to trigger reasoning. Following llama.cpp,
+            // we default to thinking-enabled mode. The response handler
+            // strips <think>...</think> from content into reasoning_content.
+            if (is_thinking_model_)
+            {
+                ss << "<think>\n";
+            }
         }
 
         return ss.str();
@@ -706,6 +1066,56 @@ namespace llaminar2
         }
 
         return ss.str();
+    }
+
+    // ============================================================================
+    // ChatParser Implementation
+    // ============================================================================
+
+    ChatParser::ChatParser(const ChatTemplate &chat_template)
+        : thinking_start_tag_(chat_template.thinkingStartTag()),
+          thinking_end_tag_(chat_template.thinkingEndTag())
+    {
+    }
+
+    ChatParser::ParseResult ChatParser::parse(const std::string &text) const
+    {
+        ParseResult result;
+
+        if (thinking_end_tag_.empty() || text.empty())
+        {
+            result.content = text;
+            return result;
+        }
+
+        // The generation prompt ends with the thinking start tag, so the
+        // model output begins immediately inside the thinking block.
+        // We search for the end tag to split reasoning from content.
+        auto end_pos = text.find(thinking_end_tag_);
+        if (end_pos != std::string::npos)
+        {
+            result.has_reasoning = true;
+            result.reasoning_content = text.substr(0, end_pos);
+
+            // Content starts after the end tag
+            std::string remainder = text.substr(end_pos + thinking_end_tag_.size());
+
+            // Trim leading whitespace from content
+            auto first_non_ws = remainder.find_first_not_of(" \t\n\r");
+            if (first_non_ws != std::string::npos)
+            {
+                result.content = remainder.substr(first_non_ws);
+            }
+            // If all whitespace after end tag, content is empty
+        }
+        else
+        {
+            // No end tag found — entire output is reasoning (model still thinking)
+            // or non-thinking model output. Treat as content.
+            result.content = text;
+        }
+
+        return result;
     }
 
 } // namespace llaminar2

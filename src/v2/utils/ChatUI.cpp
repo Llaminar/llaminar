@@ -454,6 +454,7 @@ namespace llaminar2
                 {
                     next_token = sampler.sample(logits_ptr, vocab_size, sampling_params);
                 }
+                sampler.record_token(next_token);
                 token_count++;
 
                 // Check for EOS
@@ -624,6 +625,7 @@ namespace llaminar2
             {
                 next_token = sampler.sample(logits_vec, sampling_params);
             }
+            sampler.record_token(next_token);
 
             if (next_token == eos_token_id)
             {

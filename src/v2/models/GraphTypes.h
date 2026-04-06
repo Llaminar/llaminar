@@ -144,7 +144,7 @@ namespace llaminar2
         bool use_graph_buffer_management = true;
 
         /// Maximum sequence length for buffer allocation (when use_graph_buffer_management=true)
-        int max_seq_len = 2048;
+        int max_seq_len = 4096;
 
         /// Execution policy controlling which operations run
         ExecutionPolicy execution_policy = ExecutionPolicy::allEnabled();

@@ -20,6 +20,7 @@
 #include <cmath>
 #include <algorithm>
 #include <numeric>
+#include <unordered_map>
 
 namespace llaminar2
 {
@@ -34,12 +35,24 @@ namespace llaminar2
         float top_p = 1.0f;       ///< Top-p (nucleus) filtering (1.0 = disabled, <1.0 = cumulative prob threshold)
         unsigned int seed = 0;    ///< Random seed (0 = random, >0 = deterministic)
 
+        // Repetition penalty parameters (applied before softmax)
+        float presence_penalty = 0.0f;  ///< Penalize tokens that appeared at all (OpenAI-style, additive)
+        float frequency_penalty = 0.0f; ///< Penalize tokens proportional to frequency (OpenAI-style, additive)
+
         /**
          * @brief Check if sampling is greedy (deterministic argmax)
          */
         bool is_greedy() const
         {
             return temperature == 0.0f || (top_k == 1 && top_p >= 1.0f);
+        }
+
+        /**
+         * @brief Check if any repetition penalties are active
+         */
+        bool has_penalties() const
+        {
+            return presence_penalty != 0.0f || frequency_penalty != 0.0f;
         }
     };
 
@@ -166,8 +179,35 @@ namespace llaminar2
          */
         void set_seed(unsigned int seed);
 
+        /**
+         * @brief Record a token as having been generated (for penalty tracking)
+         *
+         * Must be called after each token is sampled so that presence/frequency
+         * penalties can be applied in subsequent samples.
+         *
+         * @param token_id The generated token ID
+         */
+        void record_token(int token_id);
+
+        /**
+         * @brief Reset token generation history (e.g., new conversation)
+         */
+        void reset_history();
+
     private:
         std::mt19937 rng_; ///< Random number generator
+        std::unordered_map<int, int> token_counts_; ///< Token ID → generation count
+
+        /**
+         * @brief Apply presence and frequency penalties to logits (in-place)
+         *
+         * OpenAI-style penalties applied before temperature scaling:
+         * logit[token] -= presence_penalty * (1 if token appeared) + frequency_penalty * count
+         *
+         * @param logits Logits to modify in-place
+         * @param params Sampling parameters with penalty values
+         */
+        void apply_penalties(std::vector<float> &logits, const SamplingParams &params);
 
         /**
          * @brief Apply temperature scaling to logits

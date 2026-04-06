@@ -43,13 +43,26 @@ namespace llaminar2
         }
 
         // Greedy sampling (deterministic) - zero-copy path
-        if (params.is_greedy())
+        // Note: penalties still apply even for greedy (they shift the argmax)
+        if (params.is_greedy() && !params.has_penalties())
         {
             return sample_greedy(logits, vocab_size);
         }
 
-        // Non-greedy paths need a vector (only allocate when truly needed)
+        // Non-greedy paths (or greedy with penalties) need a mutable vector
         std::vector<float> logits_vec(logits, logits + vocab_size);
+
+        // Apply presence/frequency penalties before temperature and filtering
+        if (params.has_penalties())
+        {
+            apply_penalties(logits_vec, params);
+        }
+
+        // Greedy with penalties: argmax on penalized logits
+        if (params.is_greedy())
+        {
+            return sample_greedy(logits_vec);
+        }
 
         // Apply top-k if specified
         if (params.top_k > 0 && params.top_k < static_cast<int>(vocab_size))
@@ -296,6 +309,42 @@ namespace llaminar2
 
         // Fallback to last token (handles floating point rounding)
         return probs.size() - 1;
+    }
+
+    void Sampler::record_token(int token_id)
+    {
+        token_counts_[token_id]++;
+    }
+
+    void Sampler::reset_history()
+    {
+        token_counts_.clear();
+    }
+
+    void Sampler::apply_penalties(std::vector<float> &logits, const SamplingParams &params)
+    {
+        if (token_counts_.empty())
+        {
+            return; // No history, nothing to penalize
+        }
+
+        // OpenAI-style penalties (applied additively to logits):
+        //   logit[t] -= presence_penalty * (1 if t in history else 0)
+        //   logit[t] -= frequency_penalty * count(t)
+        for (const auto &[token_id, count] : token_counts_)
+        {
+            if (token_id >= 0 && token_id < static_cast<int>(logits.size()))
+            {
+                if (params.presence_penalty != 0.0f)
+                {
+                    logits[token_id] -= params.presence_penalty;
+                }
+                if (params.frequency_penalty != 0.0f)
+                {
+                    logits[token_id] -= params.frequency_penalty * static_cast<float>(count);
+                }
+            }
+        }
     }
 
 } // namespace llaminar2

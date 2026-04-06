@@ -1530,6 +1530,9 @@ namespace llaminar2
             arena_.reset();
             // Reset input-dependent cached state on all kernels (e.g., stale token IDs)
             resetKernelDynamicState();
+            // Reset model-internal recurrence state (e.g., GDN conv/recurrence in Qwen3.5)
+            if (graph_builder_)
+                graph_builder_->resetState();
             ++session_epoch_;
         }
 

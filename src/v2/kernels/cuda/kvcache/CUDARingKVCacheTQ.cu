@@ -53,8 +53,8 @@ namespace llaminar2
         v_pos_bytes_ = static_cast<size_t>(n_kv_heads) * v_block_size_;
 
         LOG_INFO("CUDARingKVCacheTQ: K block=" << k_block_size_ << "B, V block=" << v_block_size_
-                 << "B, per-position: K=" << k_pos_bytes_ << "B V=" << v_pos_bytes_ << "B"
-                 << " (vs FP16: " << (n_kv_heads * head_dim * 2 * 2) << "B)");
+                                               << "B, per-position: K=" << k_pos_bytes_ << "B V=" << v_pos_bytes_ << "B"
+                                               << " (vs FP16: " << (n_kv_heads * head_dim * 2 * 2) << "B)");
 
         // Upload codebooks to constant memory
         cuda_tq_upload_codebooks(0);
@@ -75,9 +75,9 @@ namespace llaminar2
                 cudaMemcpy(&gpu_rot_val, rotations_.d_rotations,
                            sizeof(float), cudaMemcpyDeviceToHost);
                 LOG_INFO("[CUDARingKVCacheTQ] Rotation check: CPU[0,0]=" << cpu_rot.matrix[0]
-                        << " GPU[0,0]=" << gpu_rot_val
-                        << " match=" << (std::abs(cpu_rot.matrix[0] - gpu_rot_val) < 1e-6f)
-                        << " seed=" << tq_ctx->rotation().seed);
+                                                                         << " GPU[0,0]=" << gpu_rot_val
+                                                                         << " match=" << (std::abs(cpu_rot.matrix[0] - gpu_rot_val) < 1e-6f)
+                                                                         << " seed=" << tq_ctx->rotation().seed);
             }
         }
         else
@@ -109,7 +109,7 @@ namespace llaminar2
             }
 
             const size_t total_tq_bytes = static_cast<size_t>(n_layers) * batch_size *
-                max_seq_len * (k_pos_bytes_ + v_pos_bytes_);
+                                          max_seq_len * (k_pos_bytes_ + v_pos_bytes_);
             const size_t total_scratch_bytes = static_cast<size_t>(n_layers) * 2 * scratch_bytes;
             LOG_INFO("CUDARingKVCacheTQ VRAM: TQ caches="
                      << (total_tq_bytes / 1024) << "KB, per-layer FP16 scratch="
@@ -123,7 +123,7 @@ namespace llaminar2
             cudaMalloc(&d_quantize_k_temp_, k_temp_bytes);
             cudaMalloc(&d_quantize_v_temp_, v_temp_bytes);
             LOG_DEBUG("CUDARingKVCacheTQ: pre-allocated quantize temp buffers: K="
-                     << (k_temp_bytes / 1024) << "KB, V=" << (v_temp_bytes / 1024) << "KB");
+                      << (k_temp_bytes / 1024) << "KB, V=" << (v_temp_bytes / 1024) << "KB");
         }
 
         // Allocate device-side dynamic params for CUDA graph capture
@@ -137,8 +137,8 @@ namespace llaminar2
         }
 
         LOG_INFO("CUDARingKVCacheTQ created: " << n_layers << " layers, "
-                 << max_seq_len << " max_seq_len, " << n_kv_heads << " KV heads, "
-                 << head_dim << " head_dim on cuda:" << device_id);
+                                               << max_seq_len << " max_seq_len, " << n_kv_heads << " KV heads, "
+                                               << head_dim << " head_dim on cuda:" << device_id);
     }
 
     CUDARingKVCacheTQ::~CUDARingKVCacheTQ()
@@ -257,8 +257,8 @@ namespace llaminar2
     }
 
     bool CUDARingKVCacheTQ::appendWithStream(int layer, int seq_idx,
-                                              const ITensor *K, const ITensor *V,
-                                              int num_tokens, void *gpu_stream)
+                                             const ITensor *K, const ITensor *V,
+                                             int num_tokens, void *gpu_stream)
     {
         if (layer < 0 || layer >= n_layers_ || seq_idx < 0 || seq_idx >= batch_size_)
             return false;
@@ -268,17 +268,27 @@ namespace llaminar2
         cudaSetDevice(device_id_);
         cudaStream_t stream = static_cast<cudaStream_t>(gpu_stream);
         cached_stream_ = stream; // Cache for get_kv_converted()
-        auto &entry = entries_[layer][seq_idx];
+
+        TQEntry &entry = entries_[layer][seq_idx];
+
+        // One-time warning when ring buffer starts wrapping
+        if (entry.count + num_tokens > max_seq_len_ && !wrap_warned_)
+        {
+            LOG_WARN("Context window full (" << max_seq_len_
+                                             << " tokens). Sliding window is now overwriting oldest tokens. "
+                                             << "Use -c <size> to increase context length.");
+            wrap_warned_ = true;
+        }
 
         const bool k_is_tq = (K->native_type() == TensorType::TQ8 || K->native_type() == TensorType::TQ4);
         const bool v_is_tq = (V->native_type() == TensorType::TQ4);
 
         LOG_DEBUG("[CUDARingKVCacheTQ::append] layer=" << layer
-                 << " seq=" << seq_idx << " tokens=" << num_tokens
-                 << " K.is_gpu=" << K->is_on_gpu()
-                 << " K.dtype=" << K->dtype_name()
-                 << " V.dtype=" << V->dtype_name()
-                 << " pre_quantized=" << (k_is_tq && v_is_tq));
+                                                       << " seq=" << seq_idx << " tokens=" << num_tokens
+                                                       << " K.is_gpu=" << K->is_on_gpu()
+                                                       << " K.dtype=" << K->dtype_name()
+                                                       << " V.dtype=" << V->dtype_name()
+                                                       << " pre_quantized=" << (k_is_tq && v_is_tq));
 
         // ================================================================
         // Fast path: K and V are already TQ-quantized blocks
@@ -401,7 +411,8 @@ namespace llaminar2
             const float *h_V = V->data();
             if (!h_V)
             {
-                if (d_K_uploaded) cudaFree(d_K_uploaded);
+                if (d_K_uploaded)
+                    cudaFree(d_K_uploaded);
                 return false;
             }
             size_t v_bytes = static_cast<size_t>(num_tokens) * kv_dim_ * sizeof(float);
@@ -417,11 +428,11 @@ namespace llaminar2
 
         // Quantize into pre-allocated temp buffers (no per-call cudaMalloc!)
         bool ok = cuda_tq8_quantize(d_K_new, d_K_rot, d_quantize_k_temp_,
-                                     num_tokens, n_kv_heads_, head_dim_, stream);
+                                    num_tokens, n_kv_heads_, head_dim_, stream);
         if (ok)
         {
             ok = cuda_tq4_quantize(d_V_new, d_K_rot, d_quantize_v_temp_,
-                                    num_tokens, n_kv_heads_, head_dim_, stream);
+                                   num_tokens, n_kv_heads_, head_dim_, stream);
         }
 
         if (ok)
@@ -483,7 +494,7 @@ namespace llaminar2
 
         // Check if scratch already holds the right data
         if (scratch.is_current_for(layer, seq_idx, entry.count, entry.head,
-                                    rope_theta, position_start))
+                                   rope_theta, position_start))
         {
             return true; // Already up-to-date
         }
@@ -502,7 +513,7 @@ namespace llaminar2
         //
         // Uses fused K+V kernel: 1 launch per layer instead of 2.
         if (scratch.can_incremental(layer, seq_idx, entry.count, tail,
-                                     rope_theta, position_start))
+                                    rope_theta, position_start))
         {
             bool ok;
             if (d_dequant_params_ && h_dequant_params_ && stream)
@@ -607,8 +618,7 @@ namespace llaminar2
         }
         else
         {
-            static_cast<GpuTensorView *>(scratch.k_view.get())->update_view(
-                scratch.d_K, entry.count);
+            static_cast<GpuTensorView *>(scratch.k_view.get())->update_view(scratch.d_K, entry.count);
         }
 
         return scratch.k_view.get();
@@ -639,8 +649,7 @@ namespace llaminar2
         }
         else
         {
-            static_cast<GpuTensorView *>(scratch.v_view.get())->update_view(
-                scratch.d_V, entry.count);
+            static_cast<GpuTensorView *>(scratch.v_view.get())->update_view(scratch.d_V, entry.count);
         }
 
         return scratch.v_view.get();
@@ -656,8 +665,8 @@ namespace llaminar2
     // =========================================================================
 
     bool CUDARingKVCacheTQ::get_kv(int layer, int seq_idx,
-                                    ITensor **out_k, ITensor **out_v,
-                                    int *out_kv_len)
+                                   ITensor **out_k, ITensor **out_v,
+                                   int *out_kv_len)
     {
         auto *k = get_k(layer, seq_idx);
         auto *v = get_v(layer, seq_idx);
@@ -673,8 +682,8 @@ namespace llaminar2
     }
 
     bool CUDARingKVCacheTQ::get_kv(int layer, int seq_idx,
-                                    const ITensor **out_k, const ITensor **out_v,
-                                    int *out_kv_len) const
+                                   const ITensor **out_k, const ITensor **out_v,
+                                   int *out_kv_len) const
     {
         auto *k = get_k(layer, seq_idx);
         auto *v = get_v(layer, seq_idx);
@@ -739,8 +748,7 @@ namespace llaminar2
         }
         else
         {
-            static_cast<GpuTensorView *>(scratch.k_view.get())->update_view(
-                scratch.d_K, entry.count);
+            static_cast<GpuTensorView *>(scratch.k_view.get())->update_view(scratch.d_K, entry.count);
         }
         if (!scratch.v_view)
         {
@@ -750,8 +758,7 @@ namespace llaminar2
         }
         else
         {
-            static_cast<GpuTensorView *>(scratch.v_view.get())->update_view(
-                scratch.d_V, entry.count);
+            static_cast<GpuTensorView *>(scratch.v_view.get())->update_view(scratch.d_V, entry.count);
         }
 
         if (out_k)

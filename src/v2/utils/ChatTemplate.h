@@ -5,7 +5,9 @@
  * @date 2025
  *
  * Provides chat template support for formatting multi-turn conversations
- * according to model-specific formats (ChatML, LLaMA, Mistral, etc.).
+ * according to model-specific formats. Primary rendering uses the vendored
+ * Jinja2 template engine (from llama.cpp) for proper template execution.
+ * Falls back to hardcoded format implementations if Jinja rendering fails.
  */
 
 #pragma once
@@ -65,11 +67,13 @@ namespace llaminar2
      * @brief Chat template processor
      *
      * Handles detection of chat template format from GGUF metadata and
-     * application of templates to message sequences.
+     * application of templates to message sequences. Uses the vendored
+     * Jinja2 template engine as the primary rendering path, with hardcoded
+     * fallback implementations for robustness.
      *
      * Usage:
      * @code
-     *   auto tmpl = ChatTemplate::create(gguf_template_string);
+     *   auto tmpl = ChatTemplate::create(gguf_template_string, "<|endoftext|>", "<|endoftext|>");
      *   std::vector<ChatMessage> messages = {
      *       {"system", "You are helpful."},
      *       {"user", "Hello!"}
@@ -82,15 +86,20 @@ namespace llaminar2
     {
     public:
         /**
-         * @brief Create a ChatTemplate from a template string
+         * @brief Create a ChatTemplate from a template string with BOS/EOS tokens
          *
          * The template string is typically the `tokenizer.chat_template`
-         * metadata value from a GGUF file (Jinja2 format).
+         * metadata value from a GGUF file (Jinja2 format). BOS/EOS tokens
+         * are needed by the Jinja2 engine for template variables.
          *
          * @param template_str The raw template string from GGUF metadata
+         * @param bos_token BOS token string (e.g., "<|endoftext|>")
+         * @param eos_token EOS token string (e.g., "<|im_end|>")
          * @return Unique pointer to ChatTemplate, never null
          */
-        static std::unique_ptr<ChatTemplate> create(const std::string &template_str);
+        static std::unique_ptr<ChatTemplate> create(const std::string &template_str,
+                                                    const std::string &bos_token = "",
+                                                    const std::string &eos_token = "");
 
         /**
          * @brief Create a ChatTemplate with explicit type override
@@ -103,18 +112,22 @@ namespace llaminar2
         /**
          * @brief Destructor
          */
-        ~ChatTemplate() = default;
+        ~ChatTemplate();
 
         /**
          * @brief Apply template to a sequence of messages
          *
+         * Tries Jinja2 rendering first, falls back to hardcoded implementation.
+         *
          * @param messages Vector of chat messages in conversation order
          * @param add_generation_prompt If true, adds the assistant prompt prefix
          *                              for the model to complete
+         * @param enable_thinking If true, enable thinking mode for thinking models
          * @return Formatted prompt string ready for tokenization
          */
         std::string apply(const std::vector<ChatMessage> &messages,
-                          bool add_generation_prompt = true) const;
+                          bool add_generation_prompt = true,
+                          bool enable_thinking = true) const;
 
         /**
          * @brief Get the detected template type
@@ -131,20 +144,79 @@ namespace llaminar2
          */
         bool isUnknown() const { return type_ == ChatTemplateType::UNKNOWN; }
 
+        /**
+         * @brief Check if this is a thinking model (Qwen3.5, etc.)
+         *
+         * Detected automatically by rendering the template with and without
+         * enable_thinking = true and checking if the output differs.
+         */
+        bool isThinkingModel() const { return is_thinking_model_; }
+
+        /**
+         * @brief Check if Jinja2 rendering is available for this template
+         */
+        bool hasJinjaSupport() const { return jinja_available_; }
+
+        /**
+         * @brief Get the detected thinking start tag (e.g., "<think>\n")
+         *
+         * Empty string if not a thinking model.
+         */
+        const std::string &thinkingStartTag() const { return thinking_start_tag_; }
+
+        /**
+         * @brief Get the detected thinking end tag (e.g., "</think>")
+         *
+         * Empty string if not a thinking model.
+         */
+        const std::string &thinkingEndTag() const { return thinking_end_tag_; }
+
     private:
         /**
          * @brief Private constructor - use create() factory methods
          */
-        ChatTemplate(ChatTemplateType type, const std::string &raw_template);
+        ChatTemplate(ChatTemplateType type, const std::string &raw_template,
+                     const std::string &bos_token, const std::string &eos_token);
+
+        /**
+         * @brief Try to compile the Jinja2 template
+         * @return true if compilation succeeded
+         */
+        bool compileJinja();
+
+        /**
+         * @brief Render using the Jinja2 engine
+         * @return Rendered string, or empty on failure
+         */
+        std::string renderJinja(const std::vector<ChatMessage> &messages,
+                                bool add_generation_prompt,
+                                bool enable_thinking) const;
+
+        /**
+         * @brief Render without the enable_thinking variable in context
+         *
+         * Used for differential detection: makes `enable_thinking is defined`
+         * evaluate to false, allowing us to detect thinking-model templates.
+         */
+        std::string renderJinjaWithoutThinkingVar(
+            const std::vector<ChatMessage> &messages,
+            bool add_generation_prompt) const;
+
+        /**
+         * @brief Auto-detect thinking tags by differential Jinja rendering
+         *
+         * Renders the template with enable_thinking=true and enable_thinking=false,
+         * then diffs to find what changed — that's the thinking tags.
+         */
+        void detectThinkingTags();
 
         /**
          * @brief Detect template type from Jinja2 template string
-         *
-         * Uses heuristic matching on template content to determine format.
          */
         static ChatTemplateType detectType(const std::string &template_str);
 
-        // Template application methods for each format
+        // Template application methods for each format (fallback path)
+        std::string applyFallback(const std::vector<ChatMessage> &messages, bool add_ass) const;
         std::string applyChatML(const std::vector<ChatMessage> &messages, bool add_ass) const;
         std::string applyLlama3(const std::vector<ChatMessage> &messages, bool add_ass) const;
         std::string applyLlama2(const std::vector<ChatMessage> &messages, bool add_ass) const;
@@ -164,6 +236,77 @@ namespace llaminar2
 
         ChatTemplateType type_;
         std::string raw_template_;
+        std::string bos_token_;
+        std::string eos_token_;
+        bool is_thinking_model_ = false;
+        bool jinja_available_ = false;
+        std::string thinking_start_tag_;
+        std::string thinking_end_tag_;
+
+        // Opaque pointer to compiled Jinja program (avoids jinja headers in public API)
+        struct JinjaState;
+        std::unique_ptr<JinjaState> jinja_state_;
+    };
+
+    /**
+     * @brief Chat output parser for extracting structured content from model output
+     *
+     * Handles extraction of thinking/reasoning content from model-generated text.
+     * Uses tag information from ChatTemplate (auto-detected via Jinja differential
+     * rendering) to split output into reasoning and content parts.
+     *
+     * This is model-agnostic — the tags are detected from the actual template,
+     * not hardcoded per model.
+     *
+     * Usage:
+     * @code
+     *   ChatParser parser(chat_template);
+     *   auto result = parser.parse("reasoning here</think>\n\nactual answer");
+     *   // result.reasoning_content == "reasoning here"
+     *   // result.content == "actual answer"
+     * @endcode
+     */
+    class ChatParser
+    {
+    public:
+        /**
+         * @brief Result of parsing model output
+         */
+        struct ParseResult
+        {
+            std::string content;            ///< Main response content
+            std::string reasoning_content;  ///< Thinking/reasoning content (empty if none)
+            bool has_reasoning = false;     ///< Whether reasoning was found
+        };
+
+        /**
+         * @brief Construct parser from a ChatTemplate
+         *
+         * Extracts thinking tag information from the template's auto-detection.
+         *
+         * @param chat_template The chat template (must outlive the parser)
+         */
+        explicit ChatParser(const ChatTemplate &chat_template);
+
+        /**
+         * @brief Parse model output text into structured parts
+         *
+         * Extracts reasoning content delimited by thinking tags and returns
+         * the remaining content separately.
+         *
+         * @param text Raw model output text
+         * @return ParseResult with separated content and reasoning
+         */
+        ParseResult parse(const std::string &text) const;
+
+        /**
+         * @brief Check if this parser expects thinking content
+         */
+        bool expectsThinking() const { return !thinking_end_tag_.empty(); }
+
+    private:
+        std::string thinking_start_tag_;
+        std::string thinking_end_tag_;
     };
 
 } // namespace llaminar2

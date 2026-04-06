@@ -144,7 +144,7 @@ namespace llaminar2
                                                         << ", PAD=" << pad_token_);
 
         // Initialize special tokens for proper encoding
-        initializeSpecialTokens();
+        initializeSpecialTokens(metadata);
 
         // Load chat template from metadata if available
         auto chat_template_it = metadata.find("tokenizer.chat_template");
@@ -153,7 +153,15 @@ namespace llaminar2
             chat_template_string_ = chat_template_it->second.asString();
             if (!chat_template_string_.empty())
             {
-                chat_template_ = ChatTemplate::create(chat_template_string_);
+                // Pass BOS/EOS as strings for Jinja2 template variables
+                std::string bos_str = (bos_token_ >= 0 && bos_token_ < static_cast<int>(vocab_.size()))
+                                          ? vocab_[bos_token_]
+                                          : "";
+                std::string eos_str = (eos_token_ >= 0 && eos_token_ < static_cast<int>(vocab_.size()))
+                                          ? vocab_[eos_token_]
+                                          : "";
+                chat_template_ = ChatTemplate::create(chat_template_string_,
+                                                       bos_str, eos_str);
                 if (chat_template_)
                 {
                     LOG_DEBUG("[BPETokenizer] Loaded chat template: "
@@ -230,27 +238,56 @@ namespace llaminar2
         }
     }
 
-    void BPETokenizer::initializeSpecialTokens()
+    void BPETokenizer::initializeSpecialTokens(const std::map<std::string, GGUFValue> &metadata)
     {
-        // Scan vocabulary for special tokens matching <|...|> pattern
-        // These need to be matched literally during encoding, not broken up by BPE
-        //
-        // Common patterns:
-        // - ChatML: <|im_start|>, <|im_end|>, <|endoftext|>
-        // - Phi: <|im_sep|>
-        // - Vision: <|vision_start|>, <|image_pad|>, etc.
+        // GGUF token type constants
+        constexpr uint32_t TOKEN_TYPE_CONTROL = 3;
+        constexpr uint32_t TOKEN_TYPE_USER_DEFINED = 4;
 
-        for (size_t i = 0; i < vocab_.size(); ++i)
+        // Try to use GGUF token_type metadata for accurate special token detection.
+        // This correctly identifies all control/added tokens including those that
+        // don't follow the <|...|> pattern (e.g., <think>, </think>, <tts_pad>).
+        const uint32_t *token_types = nullptr;
+        size_t token_type_count = 0;
+        auto type_it = metadata.find("tokenizer.ggml.token_type");
+        if (type_it != metadata.end() && !type_it->second.data.empty())
         {
-            const std::string &token = vocab_[i];
+            token_types = reinterpret_cast<const uint32_t *>(type_it->second.data.data());
+            token_type_count = type_it->second.data.size() / sizeof(uint32_t);
+        }
 
-            // Match <|...|> pattern (at least 5 chars: <|x|>)
-            if (token.size() >= 5 &&
-                token[0] == '<' && token[1] == '|' &&
-                token[token.size() - 1] == '>' && token[token.size() - 2] == '|')
+        if (token_types && token_type_count >= vocab_.size())
+        {
+            // Use GGUF token types: mark CONTROL and USER_DEFINED tokens as special
+            for (size_t i = 0; i < vocab_.size(); ++i)
             {
-                special_tokens_.emplace_back(token, static_cast<int>(i));
+                uint32_t ttype = token_types[i];
+                if (ttype == TOKEN_TYPE_CONTROL || ttype == TOKEN_TYPE_USER_DEFINED)
+                {
+                    const std::string &token = vocab_[i];
+                    // Skip empty tokens and single-char tokens (byte-level fallbacks)
+                    if (token.size() >= 2)
+                    {
+                        special_tokens_.emplace_back(token, static_cast<int>(i));
+                    }
+                }
             }
+            LOG_DEBUG("[BPETokenizer] Using GGUF token types for special token detection");
+        }
+        else
+        {
+            // Fallback: pattern-match <|...|> tokens (original heuristic)
+            for (size_t i = 0; i < vocab_.size(); ++i)
+            {
+                const std::string &token = vocab_[i];
+                if (token.size() >= 5 &&
+                    token[0] == '<' && token[1] == '|' &&
+                    token[token.size() - 1] == '>' && token[token.size() - 2] == '|')
+                {
+                    special_tokens_.emplace_back(token, static_cast<int>(i));
+                }
+            }
+            LOG_DEBUG("[BPETokenizer] Using pattern-based special token detection (no GGUF token types)");
         }
 
         // Sort by length descending (longest first) for greedy matching

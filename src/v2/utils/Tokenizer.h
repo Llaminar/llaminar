@@ -20,8 +20,9 @@
 
 namespace llaminar2
 {
-    // Forward declaration
+    // Forward declarations
     class ModelContext;
+    struct GGUFValue;
 
     /**
      * @brief Abstract tokenizer interface
@@ -128,6 +129,11 @@ namespace llaminar2
         virtual bool hasChatTemplate() const = 0;
 
         /**
+         * @brief Get the chat template (must call hasChatTemplate() first)
+         */
+        virtual const ChatTemplate &getChatTemplate() const = 0;
+
+        /**
          * @brief Set/override the chat template
          *
          * Allows overriding the model's chat template with a custom one.
@@ -212,6 +218,7 @@ namespace llaminar2
         std::string getChatTemplateString() const override { return chat_template_string_; }
         ChatTemplateType getChatTemplateType() const override;
         bool hasChatTemplate() const override { return chat_template_ != nullptr; }
+        const ChatTemplate &getChatTemplate() const override { return *chat_template_; }
         void setChatTemplate(std::unique_ptr<ChatTemplate> tmpl) override;
         std::vector<int> encodeChat(
             const std::vector<ChatMessage> &messages,
@@ -277,7 +284,7 @@ namespace llaminar2
          * Scans vocab for tokens matching <|...|> pattern and stores them
          * sorted by length (longest first) for greedy matching.
          */
-        void initializeSpecialTokens();
+        void initializeSpecialTokens(const std::map<std::string, GGUFValue> &metadata);
 
         /**
          * @brief Initialize stop tokens based on detected chat template

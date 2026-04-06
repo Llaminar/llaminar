@@ -20,6 +20,7 @@
 #include "../../loaders/ModelContext.h"
 #include "../../loaders/ModelContextConfig.h"
 #include "../../loaders/ModelLoader.h"
+#include "../local_execution/graph/SchemaFactoryRegistry.h"
 #include "../../backends/ComputeBackend.h"
 #include "../../tensors/TensorFactory.h"
 #include "../../utils/Logger.h"
@@ -160,6 +161,17 @@ namespace llaminar2
                 return false;
             }
 
+            // Step 5b: Validate context length against model max
+            if (!validateContextLength())
+            {
+                syncInitStep(false, "validateContextLength");
+                return false;
+            }
+            if (!syncInitStep(true, "validateContextLength"))
+            {
+                return false;
+            }
+
             // Step 6: Build compute graph
             if (!buildComputeGraph())
             {
@@ -172,6 +184,30 @@ namespace llaminar2
             }
 
             initialized_ = true;
+
+            // Cache model-recommended sampling params (for API consumers)
+            if (model_ctx_)
+            {
+                const std::string arch = model_ctx_->architecture();
+                if (SchemaFactoryRegistry::isSupported(arch))
+                {
+                    auto factory = SchemaFactoryRegistry::getFactory(arch);
+                    if (factory)
+                    {
+                        recommended_sampling_params_ = factory->getRecommendedSamplingParams();
+                        if (recommended_sampling_params_.has_penalties() || recommended_sampling_params_.temperature != 1.0f)
+                        {
+                            LOG_INFO("[OrchestrationRunner] Model-recommended sampling: "
+                                     << "temp=" << recommended_sampling_params_.temperature
+                                     << " top_p=" << recommended_sampling_params_.top_p
+                                     << " top_k=" << recommended_sampling_params_.top_k
+                                     << " presence_penalty=" << recommended_sampling_params_.presence_penalty
+                                     << " frequency_penalty=" << recommended_sampling_params_.frequency_penalty);
+                        }
+                    }
+                }
+            }
+
             LOG_INFO("OrchestrationRunner initialized successfully");
             return true;
         }
@@ -282,9 +318,16 @@ namespace llaminar2
         }
 
         // Tail stage: try GPU-side sampling first, fall back to CPU
+        // Note: GPU sampling cannot apply presence/frequency penalties
+        // (penalty history is only on CPU), so force CPU path when penalties are active.
         int token = -1;
 
-        if (active_sampling_params_.is_greedy())
+        if (active_sampling_params_.has_penalties())
+        {
+            // Penalties require CPU-side sampling with token history
+            token = -1; // Force CPU fallback below
+        }
+        else if (active_sampling_params_.is_greedy())
         {
             // Try GPU-side greedy (argmax)
             token = runner_->sampleGreedyOnDevice();
@@ -312,6 +355,9 @@ namespace llaminar2
             int vocab = vocabSize();
             token = sampler_.sample(logits, static_cast<size_t>(vocab), active_sampling_params_);
         }
+
+        // Record token for presence/frequency penalty tracking
+        sampler_.record_token(token);
 
         result.tokens.push_back(token);
         last_token_ = token; // Store for next decode step
@@ -992,6 +1038,32 @@ namespace llaminar2
         return true;
     }
 
+    bool OrchestrationRunner::validateContextLength()
+    {
+        if (!model_ctx_)
+            return true;
+
+        const int model_max = model_ctx_->contextLength();
+        if (model_max <= 0)
+        {
+            LOG_DEBUG("Model does not report max context length, skipping validation");
+            return true;
+        }
+
+        if (config_.max_seq_len > model_max)
+        {
+            LOG_ERROR("Requested context length " << config_.max_seq_len
+                                                  << " exceeds model maximum of " << model_max
+                                                  << ". Use -c " << model_max << " or smaller.");
+            return setError("Context length " + std::to_string(config_.max_seq_len) +
+                            " exceeds model maximum of " + std::to_string(model_max));
+        }
+
+        LOG_INFO("Context length: " << config_.max_seq_len
+                                    << " / " << model_max << " (model max)");
+        return true;
+    }
+
     bool OrchestrationRunner::buildComputeGraph()
     {
         ScopedWeightLoadTimer timer(WeightLoadPhase::GRAPH_BUILD);
@@ -1405,6 +1477,13 @@ namespace llaminar2
     void OrchestrationRunner::setSamplingParams(const SamplingParams &params)
     {
         active_sampling_params_ = params;
+        // Reset token history for new conversation/request so penalties start fresh
+        sampler_.reset_history();
+    }
+
+    SamplingParams OrchestrationRunner::getRecommendedSamplingParams() const
+    {
+        return recommended_sampling_params_;
     }
 
 } // namespace llaminar2

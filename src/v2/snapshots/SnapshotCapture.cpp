@@ -103,6 +103,21 @@ namespace llaminar2
             return;
         }
 
+        // Handle GDN 4-way projection — split into QKV, Z, alpha, beta snapshots
+        if (name.find("_gdn_proj") != std::string::npos)
+        {
+            size_t pos = name.find("_gdn_proj");
+            std::string prefix = name.substr(0, pos);
+
+            // outputs: [0]=output_qkv, [1]=output_z, [2]=output_a, [3]=output_b
+            if (dump.outputs.size() >= 1 && dump.outputs[0].data)
+                storeOutput(prefix + "_QKV_PROJECTION", dump.outputs[0]);
+            if (dump.outputs.size() >= 2 && dump.outputs[1].data)
+                storeOutput(prefix + "_GDN_Z_PROJECTION", dump.outputs[1]);
+            // alpha and beta are small per-head tensors, skip for now
+            return;
+        }
+
         // Handle lm_head_allgather — overwrites partial LM_HEAD with full vocab
         if (name == "lm_head_allgather")
         {

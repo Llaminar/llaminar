@@ -568,6 +568,9 @@ namespace llaminar2::test::parity
         ActivationPrecision activation_precision = ActivationPrecision::FP32;
         KVCachePrecision kv_cache_precision = KVCachePrecision::AUTO;
 
+        /// Decode steps override. 0 means use ParityConfig default (5).
+        int decode_steps = 0;
+
         // Derived accessors
         size_t device_count() const { return devices.size(); }
         ParityDeviceType primary_device() const { return devices.empty() ? ParityDeviceType::CPU : devices[0]; }
@@ -2587,7 +2590,7 @@ namespace llaminar2::test::parity
             std::vector<std::string> per_layer_stages = {
                 "ATTENTION_NORM",
                 // GDN sub-stages (skipped for FA layers where they don't exist)
-                "QKV_PROJECTION", "GDN_DELTA_RULE_OUTPUT", "GDN_NORM_GATE_OUTPUT",
+                "QKV_PROJECTION", "GDN_Z_PROJECTION", "GDN_DELTA_RULE_OUTPUT", "GDN_NORM_GATE_OUTPUT",
                 // Standard attention sub-stages (skipped for GDN layers)
                 "Q_PROJECTION", "K_PROJECTION", "V_PROJECTION",
                 "Q_NORM", "K_NORM", // Qwen3 per-head QK RMSNorm (skipped if not available)

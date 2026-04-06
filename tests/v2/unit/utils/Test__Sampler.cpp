@@ -905,4 +905,366 @@ namespace
         }
     }
 
+    // =============================================================================
+    // SamplingParams Penalty Helpers
+    // =============================================================================
+
+    TEST_F(SamplerTest, HasPenalties_DefaultFalse)
+    {
+        SamplingParams params;
+        EXPECT_FALSE(params.has_penalties());
+    }
+
+    TEST_F(SamplerTest, HasPenalties_PresenceOnly)
+    {
+        SamplingParams params;
+        params.presence_penalty = 1.0f;
+        EXPECT_TRUE(params.has_penalties());
+    }
+
+    TEST_F(SamplerTest, HasPenalties_FrequencyOnly)
+    {
+        SamplingParams params;
+        params.frequency_penalty = 0.5f;
+        EXPECT_TRUE(params.has_penalties());
+    }
+
+    TEST_F(SamplerTest, HasPenalties_BothSet)
+    {
+        SamplingParams params;
+        params.presence_penalty = 1.0f;
+        params.frequency_penalty = 0.5f;
+        EXPECT_TRUE(params.has_penalties());
+    }
+
+    TEST_F(SamplerTest, HasPenalties_NegativeValues)
+    {
+        SamplingParams params;
+        params.presence_penalty = -1.0f;
+        EXPECT_TRUE(params.has_penalties())
+            << "Negative penalties (reward) should still be 'has_penalties'";
+    }
+
+    // =============================================================================
+    // Record Token and Reset History
+    // =============================================================================
+
+    TEST_F(SamplerTest, RecordToken_TracksTokenCounts)
+    {
+        // Recording tokens changes future sampling with penalties
+        sampler_->record_token(2); // token 2 once
+        sampler_->record_token(2); // token 2 twice
+        sampler_->record_token(3); // token 3 once
+
+        // Verify via frequency penalty: token 2 (count=2) should be penalized
+        // more than token 3 (count=1)
+        // Logits: {1.0, 2.0, 3.0, 0.5, 1.5} → token 2 has highest (3.0)
+        SamplingParams params;
+        params.temperature = 0.0f; // greedy
+        params.frequency_penalty = 5.0f; // large enough to shift argmax
+
+        // Without penalty, greedy picks token 2 (logit 3.0)
+        // With freq penalty: logit[2] -= 5.0 * 2 = -7.0, logit[3] -= 5.0 * 1 = -4.5
+        // Adjusted: {1.0, 2.0, -7.0, -4.0, 1.5}
+        // Token 1 (logit 2.0) becomes the highest
+        int token = sampler_->sample(standard_logits_, params);
+        EXPECT_EQ(token, 1) << "Frequency penalty should shift greedy argmax away from repeated token";
+    }
+
+    TEST_F(SamplerTest, ResetHistory_ClearsTokenCounts)
+    {
+        sampler_->record_token(2);
+        sampler_->record_token(2);
+
+        SamplingParams params;
+        params.temperature = 0.0f;
+        params.presence_penalty = 100.0f; // huge penalty
+
+        // With penalty and history, token 2 is penalized
+        int token_with_penalty = sampler_->sample(standard_logits_, params);
+        EXPECT_NE(token_with_penalty, 2) << "Token 2 should be penalized away";
+
+        // Reset history
+        sampler_->reset_history();
+
+        // After reset, no history → no penalty applied → back to normal greedy
+        int token_after_reset = sampler_->sample(standard_logits_, params);
+        EXPECT_EQ(token_after_reset, 2) << "After reset, greedy should pick token 2 again";
+    }
+
+    TEST_F(SamplerTest, ResetHistory_CanBeCalledWhenEmpty)
+    {
+        // Should not throw or crash
+        sampler_->reset_history();
+        sampler_->reset_history(); // twice is fine
+    }
+
+    // =============================================================================
+    // Presence Penalty
+    // =============================================================================
+
+    TEST_F(SamplerTest, PresencePenalty_PenalizesSeenTokens)
+    {
+        // Record token 2 (the default greedy pick)
+        sampler_->record_token(2);
+
+        SamplingParams params;
+        params.temperature = 0.0f;
+        params.presence_penalty = 5.0f; // subtract 5.0 from any seen token
+
+        // Logits: {1.0, 2.0, 3.0, 0.5, 1.5}
+        // After presence penalty: token 2 goes from 3.0 to 3.0 - 5.0 = -2.0
+        // New argmax is token 1 (logit 2.0)
+        int token = sampler_->sample(standard_logits_, params);
+        EXPECT_EQ(token, 1);
+    }
+
+    TEST_F(SamplerTest, PresencePenalty_SamePenaltyRegardlessOfFrequency)
+    {
+        // Record token 2 multiple times
+        sampler_->record_token(2);
+        sampler_->record_token(2);
+        sampler_->record_token(2);
+
+        SamplingParams params;
+        params.temperature = 0.0f;
+        params.presence_penalty = 2.5f; // subtract 2.5 regardless of count
+
+        // Logits: {1.0, 2.0, 3.0, 0.5, 1.5}
+        // Token 2 with presence penalty: 3.0 - 2.5 = 0.5
+        // Token 1 still has 2.0 → should be argmax
+        int token = sampler_->sample(standard_logits_, params);
+        EXPECT_EQ(token, 1)
+            << "Presence penalty should be the same whether token appeared 1 or 3 times";
+    }
+
+    TEST_F(SamplerTest, PresencePenalty_NoEffectOnUnseenTokens)
+    {
+        // Record token 0 only
+        sampler_->record_token(0);
+
+        SamplingParams params;
+        params.temperature = 0.0f;
+        params.presence_penalty = 100.0f;
+
+        // Logits: {1.0, 2.0, 3.0, 0.5, 1.5}
+        // Token 0 becomes 1.0 - 100 = -99.0, rest unchanged
+        // Token 2 (logit 3.0) should still win
+        int token = sampler_->sample(standard_logits_, params);
+        EXPECT_EQ(token, 2);
+    }
+
+    // =============================================================================
+    // Frequency Penalty
+    // =============================================================================
+
+    TEST_F(SamplerTest, FrequencyPenalty_ScalesWithCount)
+    {
+        // Record token 2 three times, token 1 once
+        sampler_->record_token(2);
+        sampler_->record_token(2);
+        sampler_->record_token(2);
+        sampler_->record_token(1);
+
+        SamplingParams params;
+        params.temperature = 0.0f;
+        params.frequency_penalty = 1.0f;
+
+        // Logits: {1.0, 2.0, 3.0, 0.5, 1.5}
+        // After freq penalty:
+        //   token 1: 2.0 - 1.0*1 = 1.0
+        //   token 2: 3.0 - 1.0*3 = 0.0
+        //   others unchanged: {1.0, 1.0, 0.0, 0.5, 1.5}
+        // Token 4 (logit 1.5) should be argmax
+        int token = sampler_->sample(standard_logits_, params);
+        EXPECT_EQ(token, 4);
+    }
+
+    TEST_F(SamplerTest, FrequencyPenalty_NoEffectWithoutHistory)
+    {
+        // No tokens recorded
+        SamplingParams params;
+        params.temperature = 0.0f;
+        params.frequency_penalty = 100.0f;
+
+        // Should pick token 2 as normal (no history to penalize)
+        int token = sampler_->sample(standard_logits_, params);
+        EXPECT_EQ(token, 2);
+    }
+
+    // =============================================================================
+    // Combined Penalties
+    // =============================================================================
+
+    TEST_F(SamplerTest, CombinedPenalties_BothApply)
+    {
+        // Record token 2 twice
+        sampler_->record_token(2);
+        sampler_->record_token(2);
+
+        SamplingParams params;
+        params.temperature = 0.0f;
+        params.presence_penalty = 1.0f;
+        params.frequency_penalty = 1.0f;
+
+        // Logits: {1.0, 2.0, 3.0, 0.5, 1.5}
+        // Token 2 penalty: presence(1.0) + frequency(1.0 * 2) = 3.0
+        // Token 2 adjusted: 3.0 - 3.0 = 0.0
+        // Argmax should be token 1 (2.0)
+        int token = sampler_->sample(standard_logits_, params);
+        EXPECT_EQ(token, 1);
+    }
+
+    TEST_F(SamplerTest, Penalty_NegativePresence_BoostsSeenTokens)
+    {
+        // Negative presence penalty acts as a reward for repeated tokens
+        std::vector<float> logits = {5.0f, 1.0f, 1.0f, 1.0f, 1.0f};
+        sampler_->record_token(1);
+
+        SamplingParams params;
+        params.temperature = 0.0f;
+        params.presence_penalty = -10.0f; // boost seen tokens by 10
+
+        // Token 1 adjusted: 1.0 - (-10.0) = 11.0, which beats token 0 (5.0)
+        int token = sampler_->sample(logits, params);
+        EXPECT_EQ(token, 1);
+    }
+
+    TEST_F(SamplerTest, Penalty_OutOfBoundsTokenId_Ignored)
+    {
+        // Record token IDs that are out of bounds for the logits array
+        sampler_->record_token(100); // way beyond vocab size of 5
+        sampler_->record_token(-1);  // negative
+
+        SamplingParams params;
+        params.temperature = 0.0f;
+        params.presence_penalty = 100.0f;
+        params.frequency_penalty = 100.0f;
+
+        // Should still pick token 2 normally (out-of-bound tokens ignored)
+        int token = sampler_->sample(standard_logits_, params);
+        EXPECT_EQ(token, 2);
+    }
+
+    TEST_F(SamplerTest, Penalty_WithTemperatureSampling)
+    {
+        // Penalties are applied before temperature scaling
+        sampler_->record_token(2); // penalize the dominant token
+
+        SamplingParams params;
+        params.temperature = 0.5f; // low temperature (more peaked)
+        params.presence_penalty = 5.0f;
+        params.seed = 42;
+
+        sampler_->set_seed(42);
+
+        // Token 2 adjusted: 3.0 - 5.0 = -2.0
+        // After penalty, token 1 (2.0) is highest
+        // With low temp, should strongly favor token 1
+        std::unordered_map<int, int> counts;
+        for (int i = 0; i < 100; ++i)
+        {
+            sampler_->set_seed(42 + i);
+            int token = sampler_->sample(standard_logits_, params);
+            counts[token]++;
+        }
+        // Token 1 should be heavily favored
+        EXPECT_GT(counts[1], 50) << "Token 1 should be most likely after penalty + low temp";
+        EXPECT_EQ(counts.count(2) > 0 ? counts[2] : 0, counts.count(2) > 0 ? counts[2] : 0);
+    }
+
+    TEST_F(SamplerTest, Penalty_GreedyWithPenalties_MakesCopy)
+    {
+        // Greedy + penalties should work (uses vector copy path)
+        sampler_->record_token(2);
+
+        SamplingParams params;
+        params.temperature = 0.0f;
+        params.presence_penalty = 5.0f;
+
+        // Should not modify the original logits
+        std::vector<float> logits_copy = standard_logits_;
+        int token = sampler_->sample(standard_logits_, params);
+        EXPECT_NE(token, 2);
+
+        // Original logits should be unchanged
+        EXPECT_EQ(standard_logits_, logits_copy);
+    }
+
+    TEST_F(SamplerTest, Penalty_RawPointerApi_Works)
+    {
+        sampler_->record_token(2);
+
+        SamplingParams params;
+        params.temperature = 0.0f;
+        params.presence_penalty = 5.0f;
+
+        // Using the raw pointer API
+        int token = sampler_->sample(standard_logits_.data(), standard_logits_.size(), params);
+        EXPECT_NE(token, 2) << "Raw pointer API should also apply penalties";
+    }
+
+    TEST_F(SamplerTest, Penalty_MultipleTokenPenalized)
+    {
+        // Record multiple different tokens
+        sampler_->record_token(1);
+        sampler_->record_token(2);
+        sampler_->record_token(4);
+
+        SamplingParams params;
+        params.temperature = 0.0f;
+        params.presence_penalty = 10.0f;
+
+        // Logits: {1.0, 2.0, 3.0, 0.5, 1.5}
+        // After penalty: {1.0, -8.0, -7.0, 0.5, -8.5}
+        // Token 0 (1.0) should be argmax
+        int token = sampler_->sample(standard_logits_, params);
+        EXPECT_EQ(token, 0);
+    }
+
+    TEST_F(SamplerTest, Penalty_SimulateDecodeLoop)
+    {
+        // Simulate repeated sampling with penalty to avoid repetition
+        std::vector<float> logits = {1.0f, 2.0f, 3.0f, 2.5f, 1.0f};
+        SamplingParams params;
+        params.temperature = 0.0f;
+        params.presence_penalty = 5.0f;
+
+        std::vector<int> generated;
+        for (int i = 0; i < 5; ++i)
+        {
+            int token = sampler_->sample(logits, params);
+            sampler_->record_token(token);
+            generated.push_back(token);
+        }
+
+        // Each token should be different (with strong enough penalty on 5-token vocab)
+        std::set<int> unique_tokens(generated.begin(), generated.end());
+        EXPECT_EQ(unique_tokens.size(), 5u)
+            << "With strong presence penalty, all 5 tokens should be selected once each";
+    }
+
+    TEST_F(SamplerTest, Penalty_LargeVocab_Efficient)
+    {
+        // Verify penalties work efficiently with large vocab
+        const size_t vocab_size = 151936;
+        std::vector<float> logits(vocab_size, 0.0f);
+        logits[0] = 10.0f;
+        logits[42] = 9.0f;
+        logits[1000] = 8.0f;
+
+        // Record a few tokens
+        sampler_->record_token(0);
+        sampler_->record_token(0);
+
+        SamplingParams params;
+        params.temperature = 0.0f;
+        params.frequency_penalty = 5.5f;
+
+        // Token 0: 10.0 - 5.5*2 = -1.0
+        // Token 42 (9.0) should now be argmax
+        int token = sampler_->sample(logits, params);
+        EXPECT_EQ(token, 42);
+    }
+
 } // anonymous namespace

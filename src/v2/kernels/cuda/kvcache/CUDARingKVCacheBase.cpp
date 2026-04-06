@@ -129,6 +129,7 @@ namespace llaminar2
     {
         for (int layer = 0; layer < n_layers_; ++layer)
             clear_layer(layer);
+        wrap_warned_ = false;
     }
 
     void CUDARingKVCacheBase::clear_sequence(int layer, int seq_idx)

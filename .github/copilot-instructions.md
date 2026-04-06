@@ -263,15 +263,35 @@ For complex heterogeneous setups, define named TP domains and PP stage mappings.
 ### Running Benchmarks
 
 ```bash
-# Standard benchmark with auto-generated prompt
-./build_v2_release/llaminar2 --benchmark -m model.gguf
+# Benchmark on first CUDA GPU
+./build_v2_release/llaminar2 --benchmark -m model.gguf -d cuda:0
 
-# Custom prompt and decode length
-./build_v2_release/llaminar2 --benchmark -m model.gguf -p "Your prompt here" -n 100
+# Benchmark on second ROCm GPU
+./build_v2_release/llaminar2 --benchmark -m model.gguf -d rocm:1
+
+# Benchmark on CPU (all sockets — auto tensor parallel across sockets)
+./build_v2_release/llaminar2 --benchmark -m model.gguf -d cpu
+
+# Benchmark on a specific CPU socket only
+./build_v2_release/llaminar2 --benchmark -m model.gguf -d cpu:0
 
 # With full profiling (kernel + executor overhead)
-LLAMINAR_PROFILING=1 ./build_v2_release/llaminar2 --benchmark -m model.gguf -n 50
+LLAMINAR_PROFILING=1 ./build_v2_release/llaminar2 --benchmark -m model.gguf -d cuda:0
 ```
+
+**Device Selection** (`-d <device>:<ordinal>`):
+
+| Device Spec | Behavior |
+|-------------|----------|
+| `-d cuda:0` | First CUDA GPU |
+| `-d cuda:1` | Second CUDA GPU |
+| `-d rocm:0` | First ROCm GPU |
+| `-d rocm:1` | Second ROCm GPU |
+| `-d cpu` | All CPU sockets in tensor parallel (e.g., 2 sockets = 2-degree TP) |
+| `-d cpu:0` | CPU socket 0 only |
+| `-d cpu:1` | CPU socket 1 only |
+
+**Note**: No `-p`, `-n`, or `-t` flags are needed — benchmark mode auto-configures prompt, decode length, and sampling.
 
 **Features**:
 - 1 warmup run + 3 benchmark runs averaged
@@ -300,7 +320,7 @@ LLAMINAR_PROFILING=1 ./build_v2_release/llaminar2 --benchmark -m model.gguf -n 5
 Enable per-kernel timing breakdown:
 
 ```bash
-LLAMINAR_PROFILING=1 ./build_v2_release/llaminar2 --benchmark -m model.gguf -n 50
+LLAMINAR_PROFILING=1 ./build_v2_release/llaminar2 --benchmark -m model.gguf -d cuda:0
 ```
 
 **Profiled Operations**: `GEMM_Q8`, `ATTENTION`, `FFN_DOWN`, `FFN_GATE`, `FFN_UP`, `LM_HEAD`, `QUANTIZE_Q8`, `RMS_NORM`, `SWIGLU`, `ROPE`, `RESIDUAL_ADD`, `EMBEDDING`

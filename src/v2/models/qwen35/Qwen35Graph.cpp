@@ -114,6 +114,15 @@ namespace llaminar2
         return config_.layer_types[layer_idx] == "gdn";
     }
 
+    void Qwen35Graph::resetState()
+    {
+        for (auto &state : conv_states_)
+            std::fill(state.begin(), state.end(), 0.0f);
+        for (auto &state : recurrence_states_)
+            std::fill(state.begin(), state.end(), 0.0f);
+        LOG_DEBUG("[Qwen35Graph] GDN conv/recurrence state reset");
+    }
+
     // =========================================================================
     // Schema
     // =========================================================================

@@ -3,7 +3,11 @@
 # E2E Server Integration Test — Multi-Turn Inference via REST API
 #
 # Tests the Llaminar HTTP server (--serve) with curl against the
-# /v1/chat/completions endpoint for CPU, CUDA, and ROCm backends.
+# /v1/chat/completions endpoint for multiple model × backend combinations.
+#
+# Default test suites:
+#   Suite 1: Qwen2.5 1.5B Q8_0 on cpu, cuda:0, rocm:0
+#   Suite 2: Qwen3.5 4B   Q8_0 on cpu
 #
 # Each backend test:
 #   1. Starts llaminar2 --serve on a unique port
@@ -11,15 +15,18 @@
 #   3. Sends a single-turn greedy chat request, validates response
 #   4. Sends a multi-turn conversation, validates response
 #   5. Sends a second independent request (tests KV cache clearing)
-#   6. Kills server, moves to next backend
+#   6. Validates response format (usage, finish_reason)
+#   7. Tests error handling (invalid JSON, missing messages)
+#   8. Kills server, moves to next backend
 #
 # Usage:
 #   ./test_server_e2e.sh [--binary <path>] [--model <path>] [--backends <list>]
+#   ./test_server_e2e.sh [--binary <path>] [--suite "model_path|backend1,backend2[|max_tokens]"] ...
 #
 # Environment:
 #   LLAMINAR_BINARY     Override binary path
-#   LLAMINAR_MODEL      Override model path
-#   LLAMINAR_BACKENDS   Comma-separated backends (default: cpu,cuda:0,rocm:0)
+#   LLAMINAR_MODEL      Override model path (overrides default suite 1)
+#   LLAMINAR_BACKENDS   Override backends for suite 1
 #   LLAMINAR_LOG_LEVEL  Log level for server (default: ERROR)
 # =============================================================================
 
@@ -30,23 +37,48 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../../../.." && pwd)"
 
 BINARY="${LLAMINAR_BINARY:-${REPO_ROOT}/build_v2_integration/llaminar2}"
-MODEL="${LLAMINAR_MODEL:-${REPO_ROOT}/models/qwen2.5-1.5b-instruct-q8_0.gguf}"
-BACKENDS="${LLAMINAR_BACKENDS:-cpu,cuda:0,rocm:0}"
 LOG_LEVEL="${LLAMINAR_LOG_LEVEL:-ERROR}"
 BASE_PORT=19080
 
-# Parse CLI flags (override env vars)
+# Model suites: "model_path|backend1,backend2,...[|max_tokens]"
+# Uses '|' as delimiter (not ':') because device names contain colons (cuda:0).
+# Each --suite flag appends to the list. If none given, defaults are used.
+declare -a SUITES=()
+OVERRIDE_MODEL=""
+OVERRIDE_BACKENDS=""
+
+# Parse CLI flags
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --binary)  BINARY="$2";   shift 2 ;;
-        --model)   MODEL="$2";    shift 2 ;;
-        --backends) BACKENDS="$2"; shift 2 ;;
-        --port)    BASE_PORT="$2"; shift 2 ;;
+        --binary)   BINARY="$2";            shift 2 ;;
+        --model)    OVERRIDE_MODEL="$2";    shift 2 ;;
+        --backends) OVERRIDE_BACKENDS="$2"; shift 2 ;;
+        --suite)    SUITES+=("$2");         shift 2 ;;
+        --port)     BASE_PORT="$2";         shift 2 ;;
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
 done
-STARTUP_TIMEOUT=30    # seconds to wait for server startup
-REQUEST_TIMEOUT=120   # seconds per curl request
+
+# Build suite list — if no explicit --suite flags, use defaults
+if [ ${#SUITES[@]} -eq 0 ]; then
+    # Suite 1: Qwen2.5 (small, fast — all backends)
+    S1_MODEL="${OVERRIDE_MODEL:-${LLAMINAR_MODEL:-${REPO_ROOT}/models/qwen2.5-1.5b-instruct-q8_0.gguf}}"
+    S1_BACKENDS="${OVERRIDE_BACKENDS:-${LLAMINAR_BACKENDS:-cpu,cuda:0,rocm:0}}"
+    SUITES+=("${S1_MODEL}|${S1_BACKENDS}")
+
+    # Suite 2: Qwen3.5 4B (hybrid GDN/FA architecture — CPU only for speed)
+    # Uses max_tokens=200 because Qwen3.5 is a thinking model that emits
+    # <think>...</think> tags before the actual answer.
+    # xfail_inference=1: GDN architecture is WIP — inference produces degenerate output.
+    # Server/health/error tests still validate normally.
+    S2_MODEL="${REPO_ROOT}/models/Qwen3.5-4B-Q8_0.gguf"
+    if [ -f "$S2_MODEL" ] && [ -z "$OVERRIDE_MODEL" ]; then
+        SUITES+=("${S2_MODEL}|cpu|200|xfail_inference")
+    fi
+fi
+
+STARTUP_TIMEOUT=60    # seconds to wait for server startup (larger models need more)
+REQUEST_TIMEOUT=180   # seconds per curl request
 
 # Colors
 RED='\033[0;31m'
@@ -59,6 +91,7 @@ NC='\033[0m'
 TOTAL_TESTS=0
 PASSED_TESTS=0
 FAILED_TESTS=0
+XFAIL_TESTS=0
 FAILED_DETAILS=""
 
 pass() {
@@ -72,6 +105,13 @@ fail() {
     FAILED_TESTS=$((FAILED_TESTS + 1))
     FAILED_DETAILS="${FAILED_DETAILS}\n  - $1"
     echo -e "  ${RED}✗${NC} $1"
+}
+
+# Expected failure — counts as a pass (known issue, not a regression)
+xfail() {
+    TOTAL_TESTS=$((TOTAL_TESTS + 1))
+    XFAIL_TESTS=$((XFAIL_TESTS + 1))
+    echo -e "  ${YELLOW}⊘${NC} [XFAIL] $1"
 }
 
 cleanup_server() {
@@ -114,117 +154,123 @@ if [ ! -x "$BINARY" ]; then
     exit 1
 fi
 
-if [ ! -f "$MODEL" ]; then
-    echo -e "${RED}Error: Model not found: ${MODEL}${NC}"
-    exit 1
-fi
+# ─── Test Runner Function ─────────────────────────────────────────────────────
+# Runs the full test suite against a single model+backend combination.
+# Arguments: $1=model_path $2=backend $3=port $4=model_label $5=max_tokens $6=xfail_inference
+run_backend_tests() {
+    local model="$1"
+    local backend="$2"
+    local port="$3"
+    local label="$4"
+    local max_tokens="${5:-10}"
+    local xfail_inference="${6:-0}"
+    local tag="${label}/${backend}"
 
-# ─── Run Tests ────────────────────────────────────────────────────────────────
-echo -e "${BLUE}════════════════════════════════════════════════════════════${NC}"
-echo -e "${BLUE}  E2E Server Integration Test — Multi-Turn REST API${NC}"
-echo -e "${BLUE}════════════════════════════════════════════════════════════${NC}"
-echo ""
-echo -e "  Binary:   ${BINARY}"
-echo -e "  Model:    $(basename "$MODEL")"
-echo -e "  Backends: ${BACKENDS}"
-echo ""
-
-IFS=',' read -ra BACKEND_LIST <<< "$BACKENDS"
-PORT=$BASE_PORT
-
-for BACKEND in "${BACKEND_LIST[@]}"; do
-    BACKEND=$(echo "$BACKEND" | xargs)  # trim whitespace
-    PORT=$((PORT + 1))
-
-    echo -e "${YELLOW}─── Backend: ${BACKEND} (port ${PORT}) ───${NC}"
+    echo -e "${YELLOW}─── ${tag} (port ${port}) ───${NC}"
 
     # Build device flag — always explicit to prevent auto-detection
-    DEVICE_FLAG="-d ${BACKEND}"
+    local device_flag="-d ${backend}"
 
     # Start server
-    LLAMINAR_LOG_LEVEL="$LOG_LEVEL" "$BINARY" --no-mpi-bootstrap --serve --port "$PORT" \
-        $DEVICE_FLAG -m "$MODEL" >/tmp/server_e2e_trace.log 2>&1 &
-    SERVER_PID=$!
+    LLAMINAR_LOG_LEVEL="$LOG_LEVEL" "$BINARY" --no-mpi-bootstrap --serve --port "$port" \
+        $device_flag -m "$model" >/tmp/server_e2e_trace.log 2>&1 &
+    local server_pid=$!
 
     # Wait for health
-    if ! wait_for_health "$PORT"; then
-        fail "[${BACKEND}] Server failed to start within ${STARTUP_TIMEOUT}s"
-        cleanup_server "$SERVER_PID"
-        continue
+    if ! wait_for_health "$port"; then
+        fail "[${tag}] Server failed to start within ${STARTUP_TIMEOUT}s"
+        cleanup_server "$server_pid"
+        return
     fi
-    pass "[${BACKEND}] Server started"
+    pass "[${tag}] Server started"
 
     # ─── Test 1: Health endpoint ──────────────────────────────────────
-    HEALTH_RESPONSE=$(curl -s --max-time 5 "http://127.0.0.1:${PORT}/health" 2>/dev/null || echo "CURL_FAILED")
-    if echo "$HEALTH_RESPONSE" | python3 -c "import json,sys; d=json.load(sys.stdin); assert d['status']=='ok'" 2>/dev/null; then
-        pass "[${BACKEND}] GET /health returns ok"
+    local health_response
+    health_response=$(curl -s --max-time 5 "http://127.0.0.1:${port}/health" 2>/dev/null || echo "CURL_FAILED")
+    if echo "$health_response" | python3 -c "import json,sys; d=json.load(sys.stdin); assert d['status']=='ok'" 2>/dev/null; then
+        pass "[${tag}] GET /health returns ok"
     else
-        fail "[${BACKEND}] GET /health unexpected: ${HEALTH_RESPONSE}"
+        fail "[${tag}] GET /health unexpected: ${health_response}"
     fi
 
     # ─── Test 2: Single-turn greedy inference ─────────────────────────
     # Simple arithmetic that works reliably across model sizes and backends.
-    RESPONSE=$(curl -s --max-time "$REQUEST_TIMEOUT" \
-        -H "Content-Type: application/json" \
-        -d '{
-            "messages": [{"role": "user", "content": "What is 2+2? Reply with just the number."}],
-            "max_tokens": 10,
-            "temperature": 0.0
-        }' \
-        "http://127.0.0.1:${PORT}/v1/chat/completions" 2>/dev/null || echo '{"error":"curl_failed"}')
-
-    CONTENT=$(echo "$RESPONSE" | extract_content 2>/dev/null || echo "PARSE_ERROR")
-
-    if echo "$CONTENT" | grep -q "4"; then
-        pass "[${BACKEND}] Single-turn: got '${CONTENT}' (contains 4)"
-    else
-        fail "[${BACKEND}] Single-turn: expected 4, got '${CONTENT}'"
-    fi
-
-    # ─── Test 3: Multi-turn conversation ──────────────────────────────
-    # Tests multi-turn context with simple recall: model must remember
-    # the number from the previous turn and repeat it.
-    RESPONSE=$(curl -s --max-time "$REQUEST_TIMEOUT" \
+    # System prompt steers thinking models (e.g. Qwen3.5) toward brief answers.
+    local response content
+    response=$(curl -s --max-time "$REQUEST_TIMEOUT" \
         -H "Content-Type: application/json" \
         -d '{
             "messages": [
+                {"role": "system", "content": "You are a calculator. Reply with only the numeric answer, no explanation."},
+                {"role": "user", "content": "What is 2+2?"}
+            ],
+            "max_tokens": '"$max_tokens"',
+            "temperature": 0.0
+        }' \
+        "http://127.0.0.1:${port}/v1/chat/completions" 2>/dev/null || echo '{"error":"curl_failed"}')
+
+    content=$(echo "$response" | extract_content 2>/dev/null || echo "PARSE_ERROR")
+
+    if echo "$content" | grep -q "4"; then
+        pass "[${tag}] Single-turn: got '${content}' (contains 4)"
+    elif [ "$xfail_inference" = "1" ]; then
+        xfail "[${tag}] Single-turn: expected 4, got '${content}' (GDN WIP)"
+    else
+        fail "[${tag}] Single-turn: expected 4, got '${content}'"
+    fi
+
+    # ─── Test 3: Multi-turn conversation ──────────────────────────────
+    # Tests multi-turn context with simple recall.
+    response=$(curl -s --max-time "$REQUEST_TIMEOUT" \
+        -H "Content-Type: application/json" \
+        -d '{
+            "messages": [
+                {"role": "system", "content": "You are a helpful assistant. Reply briefly."},
                 {"role": "user", "content": "Remember this number: 42"},
                 {"role": "assistant", "content": "Got it, the number is 42."},
                 {"role": "user", "content": "What number did I tell you to remember? Reply with just the number."}
             ],
-            "max_tokens": 10,
+            "max_tokens": '"$max_tokens"',
             "temperature": 0.0
         }' \
-        "http://127.0.0.1:${PORT}/v1/chat/completions" 2>/dev/null || echo '{"error":"curl_failed"}')
+        "http://127.0.0.1:${port}/v1/chat/completions" 2>/dev/null || echo '{"error":"curl_failed"}')
 
-    CONTENT=$(echo "$RESPONSE" | extract_content 2>/dev/null || echo "PARSE_ERROR")
+    content=$(echo "$response" | extract_content 2>/dev/null || echo "PARSE_ERROR")
 
-    if echo "$CONTENT" | grep -q "42"; then
-        pass "[${BACKEND}] Multi-turn: got '${CONTENT}' (contains 42)"
+    if echo "$content" | grep -q "42"; then
+        pass "[${tag}] Multi-turn: got '${content}' (contains 42)"
+    elif [ "$xfail_inference" = "1" ]; then
+        xfail "[${tag}] Multi-turn: expected 42, got '${content}' (GDN WIP)"
     else
-        fail "[${BACKEND}] Multi-turn: expected 42, got '${CONTENT}'"
+        fail "[${tag}] Multi-turn: expected 42, got '${content}'"
     fi
 
     # ─── Test 4: Second independent request (tests cache clear) ──────
-    RESPONSE=$(curl -s --max-time "$REQUEST_TIMEOUT" \
+    response=$(curl -s --max-time "$REQUEST_TIMEOUT" \
         -H "Content-Type: application/json" \
         -d '{
-            "messages": [{"role": "user", "content": "What is 3+5? Reply with just the number."}],
-            "max_tokens": 10,
+            "messages": [
+                {"role": "system", "content": "You are a calculator. Reply with only the numeric answer, no explanation."},
+                {"role": "user", "content": "What is 3+5?"}
+            ],
+            "max_tokens": '"$max_tokens"',
             "temperature": 0.0
         }' \
-        "http://127.0.0.1:${PORT}/v1/chat/completions" 2>/dev/null || echo '{"error":"curl_failed"}')
+        "http://127.0.0.1:${port}/v1/chat/completions" 2>/dev/null || echo '{"error":"curl_failed"}')
 
-    CONTENT=$(echo "$RESPONSE" | extract_content 2>/dev/null || echo "PARSE_ERROR")
+    content=$(echo "$response" | extract_content 2>/dev/null || echo "PARSE_ERROR")
 
-    if echo "$CONTENT" | grep -q "8"; then
-        pass "[${BACKEND}] Cache-clear: got '${CONTENT}' (contains 8)"
+    if echo "$content" | grep -q "8"; then
+        pass "[${tag}] Cache-clear: got '${content}' (contains 8)"
+    elif [ "$xfail_inference" = "1" ]; then
+        xfail "[${tag}] Cache-clear: expected 8, got '${content}' (GDN WIP)"
     else
-        fail "[${BACKEND}] Cache-clear: expected 8, got '${CONTENT}'"
+        fail "[${tag}] Cache-clear: expected 8, got '${content}'"
     fi
 
     # ─── Test 5: Response format validation ───────────────────────────
-    HAS_USAGE=$(echo "$RESPONSE" | python3 -c "
+    local has_usage
+    has_usage=$(echo "$response" | python3 -c "
 import json, sys
 d = json.load(sys.stdin)
 u = d.get('usage', {})
@@ -235,57 +281,111 @@ assert d.get('choices', [{}])[0].get('finish_reason') == 'stop'
 print('ok')
 " 2>/dev/null || echo "FAIL")
 
-    if [ "$HAS_USAGE" = "ok" ]; then
-        pass "[${BACKEND}] Response format: valid usage + finish_reason"
+    if [ "$has_usage" = "ok" ]; then
+        pass "[${tag}] Response format: valid usage + finish_reason"
+    elif [ "$xfail_inference" = "1" ]; then
+        xfail "[${tag}] Response format: missing/invalid usage or finish_reason (GDN WIP)"
     else
-        fail "[${BACKEND}] Response format: missing/invalid usage or finish_reason"
+        fail "[${tag}] Response format: missing/invalid usage or finish_reason"
     fi
 
     # ─── Test 6: Error handling — invalid JSON ────────────────────────
-    ERROR_RESPONSE=$(curl -s --max-time 5 -X POST \
+    local error_response error_msg
+    error_response=$(curl -s --max-time 5 -X POST \
         -H "Content-Type: application/json" \
         -d 'not valid json' \
-        "http://127.0.0.1:${PORT}/v1/chat/completions" 2>/dev/null || echo '{}')
+        "http://127.0.0.1:${port}/v1/chat/completions" 2>/dev/null || echo '{}')
 
-    ERROR_MSG=$(echo "$ERROR_RESPONSE" | python3 -c "
+    error_msg=$(echo "$error_response" | python3 -c "
 import json, sys
 d = json.load(sys.stdin)
 print(d.get('error', {}).get('type', ''))
 " 2>/dev/null || echo "PARSE_ERROR")
 
-    if [ "$ERROR_MSG" = "invalid_request_error" ]; then
-        pass "[${BACKEND}] Error handling: invalid JSON returns 400"
+    if [ "$error_msg" = "invalid_request_error" ]; then
+        pass "[${tag}] Error handling: invalid JSON returns 400"
     else
-        fail "[${BACKEND}] Error handling: expected invalid_request_error, got '${ERROR_MSG}'"
+        fail "[${tag}] Error handling: expected invalid_request_error, got '${error_msg}'"
     fi
 
     # ─── Test 7: Error handling — missing messages ────────────────────
-    ERROR_RESPONSE=$(curl -s --max-time 5 -X POST \
+    error_response=$(curl -s --max-time 5 -X POST \
         -H "Content-Type: application/json" \
         -d '{"max_tokens": 10}' \
-        "http://127.0.0.1:${PORT}/v1/chat/completions" 2>/dev/null || echo '{}')
+        "http://127.0.0.1:${port}/v1/chat/completions" 2>/dev/null || echo '{}')
 
-    ERROR_MSG=$(echo "$ERROR_RESPONSE" | python3 -c "
+    error_msg=$(echo "$error_response" | python3 -c "
 import json, sys
 d = json.load(sys.stdin)
 print(d.get('error', {}).get('type', ''))
 " 2>/dev/null || echo "PARSE_ERROR")
 
-    if [ "$ERROR_MSG" = "invalid_request_error" ]; then
-        pass "[${BACKEND}] Error handling: missing messages returns 400"
+    if [ "$error_msg" = "invalid_request_error" ]; then
+        pass "[${tag}] Error handling: missing messages returns 400"
     else
-        fail "[${BACKEND}] Error handling: expected invalid_request_error, got '${ERROR_MSG}'"
+        fail "[${tag}] Error handling: expected invalid_request_error, got '${error_msg}'"
     fi
 
     # Cleanup
-    cleanup_server "$SERVER_PID"
+    cleanup_server "$server_pid"
     echo ""
+}
+
+# ─── Run Test Suites ──────────────────────────────────────────────────────────
+echo -e "${BLUE}════════════════════════════════════════════════════════════${NC}"
+echo -e "${BLUE}  E2E Server Integration Test — Multi-Turn REST API${NC}"
+echo -e "${BLUE}════════════════════════════════════════════════════════════${NC}"
+echo ""
+echo -e "  Binary: ${BINARY}"
+echo -e "  Suites: ${#SUITES[@]}"
+for suite in "${SUITES[@]}"; do
+    IFS='|' read -r local_model local_backends _ local_flags <<< "$suite"
+    suffix=""
+    if [[ "$local_flags" == *"xfail_inference"* ]]; then suffix=" (xfail: GDN WIP)"; fi
+    echo -e "    $(basename "$local_model")  →  ${local_backends}${suffix}"
+done
+echo ""
+
+PORT=$BASE_PORT
+
+for suite in "${SUITES[@]}"; do
+    # Parse suite: "model_path|backends[|max_tokens[|flags]]"
+    IFS='|' read -r SUITE_MODEL SUITE_BACKENDS SUITE_MAX_TOKENS SUITE_FLAGS <<< "$suite"
+    SUITE_MAX_TOKENS="${SUITE_MAX_TOKENS:-10}"  # Default: 10 tokens
+    SUITE_LABEL="$(basename "$SUITE_MODEL" .gguf)"
+
+    # Check for xfail_inference flag
+    SUITE_XFAIL=0
+    if [[ "$SUITE_FLAGS" == *"xfail_inference"* ]]; then
+        SUITE_XFAIL=1
+    fi
+
+    # Validate model exists
+    if [ ! -f "$SUITE_MODEL" ]; then
+        echo -e "${RED}Warning: Model not found: ${SUITE_MODEL} — skipping suite${NC}"
+        continue
+    fi
+
+    echo -e "${BLUE}══ Model: ${SUITE_LABEL} ══${NC}"
+    echo ""
+
+    IFS=',' read -ra BACKEND_LIST <<< "$SUITE_BACKENDS"
+
+    for BACKEND in "${BACKEND_LIST[@]}"; do
+        BACKEND=$(echo "$BACKEND" | xargs)  # trim whitespace
+        PORT=$((PORT + 1))
+        run_backend_tests "$SUITE_MODEL" "$BACKEND" "$PORT" "$SUITE_LABEL" "$SUITE_MAX_TOKENS" "$SUITE_XFAIL"
+    done
 done
 
 # ─── Summary ──────────────────────────────────────────────────────────────────
 echo -e "${BLUE}════════════════════════════════════════════════════════════${NC}"
 if [ $FAILED_TESTS -eq 0 ]; then
-    echo -e "${GREEN}  ✅ ALL PASSED: ${PASSED_TESTS}/${TOTAL_TESTS} tests passed${NC}"
+    if [ $XFAIL_TESTS -gt 0 ]; then
+        echo -e "${GREEN}  ✅ ALL PASSED: ${PASSED_TESTS}/${TOTAL_TESTS} tests passed (${XFAIL_TESTS} expected failures)${NC}"
+    else
+        echo -e "${GREEN}  ✅ ALL PASSED: ${PASSED_TESTS}/${TOTAL_TESTS} tests passed${NC}"
+    fi
     echo -e "${BLUE}════════════════════════════════════════════════════════════${NC}"
     exit 0
 else

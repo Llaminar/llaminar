@@ -199,6 +199,38 @@ static const std::vector<TestConfig> kQwen35SingleDeviceConfigs = {
         .activation_precision = ActivationPrecision::FP32,
         .kv_cache_precision = KVCachePrecision::FP16,
     },
+
+    // =========================================================================
+    // Qwen3.5-4B Extended Decode (20 steps)
+    //
+    // Tests decode parity over 20 tokens to detect GDN state drift that may
+    // not manifest in the standard 5-step test. Uses separate snapshot dir with
+    // 20 decode steps from PyTorch reference. Thresholds are intentionally loose
+    // to characterize divergence rather than gate— the primary goal is to see
+    // the cosine-over-steps trend and token match rate over a longer horizon.
+    // =========================================================================
+    {
+        .name = "Qwen35_4B_CPU_ExtendedDecode20",
+        .devices = {ParityDeviceType::CPU},
+        .parallelism = Parallelism::None,
+        .collective = Collective::None,
+        .thresholds = {
+            .cosine_threshold = 0.96f,
+            .decode_cosine_threshold = 0.90f,    // Looser: expect drift over 20 steps
+            .early_layers_count = 8,
+            .min_early_layers_passed = 8,
+            .kl_threshold = 0.50f,                // Looser: characterize, not gate
+            .min_top1_accuracy = 50.0f,           // Looser: expect some divergence
+            .min_top5_accuracy = 60.0f,
+            .min_decode_pass_rate = 0.60f,        // At least 60% of steps pass
+            .pytorch_top1_in_topk = 0,            // Disabled: focus on trend, not gating
+        },
+        .model_path = "models/Qwen3.5-4B-Q8_0.gguf",
+        .snapshot_dir = "pytorch_qwen35_4b_decode20_snapshots",
+        .activation_precision = ActivationPrecision::FP32,
+        .kv_cache_precision = KVCachePrecision::FP16,
+        .decode_steps = 20,
+    },
     {
         .name = "Qwen35_4B_CUDA_KV_FP16",
         .devices = {ParityDeviceType::CUDA},

@@ -1476,6 +1476,13 @@ add_library(llaminar2_core STATIC
     execution/local_execution/engine/ForwardExecutionEngine.cpp
     # NOTE: Legacy GEMM microkernel and instantiation systems removed (gemm v1/v2/v3)
     # GemmMicroKernelInit.cpp, Q8_1/VNNI instantiation sources - REMOVED
+    # Vendored jinja template engine (from llama.cpp, MIT license)
+    vendor/jinja/caps.cpp
+    vendor/jinja/lexer.cpp
+    vendor/jinja/parser.cpp
+    vendor/jinja/runtime.cpp
+    vendor/jinja/string.cpp
+    vendor/jinja/value.cpp
 )
 
 target_include_directories(llaminar2_core PUBLIC 

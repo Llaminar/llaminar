@@ -9333,6 +9333,19 @@ add_v2_test(V2_Unit_GDNRepeatInterleaveRegression
     MPI_PROCS 1
 )
 
+# Regression: GDNRecurrenceStage + ShortConv1dStage updateDynamicParams override
+add_executable(v2_test_gdn_dynamic_params_regression unit/execution/Test__GDNDynamicParamsRegression.cpp)
+target_link_libraries(v2_test_gdn_dynamic_params_regression
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_GDNDynamicParamsRegression
+    COMMAND $<TARGET_FILE:v2_test_gdn_dynamic_params_regression>
+    LABELS "V2;Unit;Regression;GDN;DynamicParams"
+    MPI_PROCS 1
+)
+
 # Test: GDN Kernels — Phase C: GDNProjectionStage, ShortConv1dStage,
 # GDNRecurrenceStage (recurrent step + chunk-parallel prefill)
 add_executable(v2_test_gdn_kernels unit/execution/Test__GDNKernels.cpp)

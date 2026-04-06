@@ -506,6 +506,7 @@ namespace llaminar2
         int kv_dim_;                    ///< local_n_kv_heads_ * head_dim_ (columns per row in POSITION_MAJOR).
         bool is_sharded_;               ///< True if local_n_kv_heads_ != n_kv_heads_.
         int total_evicted_ = 0;         ///< Running count of evicted tokens (for diagnostics).
+        bool wrap_warned_ = false;      ///< One-time warning when ring buffer wraps (context full).
         KVCacheLayoutMode layout_mode_; ///< POSITION_MAJOR or HEAD_MAJOR.
 
         /// @brief 2D array of ring entries: entries_[layer][seq_idx].

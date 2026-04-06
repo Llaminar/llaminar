@@ -395,7 +395,7 @@ namespace llaminar2
     struct RuntimeConfig
     {
         /// Maximum sequence length (buffer allocation sizing)
-        int max_seq_len = 2048;
+        int max_seq_len = 4096;
 
         /// Batch size (currently must be 1)
         int batch_size = 1;

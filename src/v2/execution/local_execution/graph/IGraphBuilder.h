@@ -371,6 +371,19 @@ namespace llaminar2
         }
 
         // =====================================================================
+        // State Management
+        // =====================================================================
+
+        /**
+         * @brief Reset model-internal recurrence state
+         *
+         * Called by clear_cache() to reset any persistent state that lives
+         * across decode steps (e.g., GDN conv/recurrence state in Qwen3.5).
+         * Standard attention-only models need not override this.
+         */
+        virtual void resetState() {}
+
+        // =====================================================================
         // Utility Methods
         // =====================================================================
 

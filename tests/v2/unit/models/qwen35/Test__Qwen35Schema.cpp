@@ -972,3 +972,66 @@ TEST_F(Qwen35GraphBuildTest, GDNOutProj_KDimMatchesGDNInner)
     EXPECT_EQ(params.n, config_.d_model)
         << "gdn_out_proj N dimension must be d_model";
 }
+
+// ============================================================================
+// GDN State Reset Tests
+// ============================================================================
+
+TEST_F(Qwen35GraphBuildTest, ResetState_DoesNotCrash)
+{
+    Qwen35Graph graph(config_, nullptr);
+
+    // Should be safe to call immediately after construction
+    EXPECT_NO_THROW(graph.resetState());
+}
+
+TEST_F(Qwen35GraphBuildTest, ResetState_Idempotent)
+{
+    Qwen35Graph graph(config_, nullptr);
+
+    // Calling multiple times should be safe
+    EXPECT_NO_THROW(graph.resetState());
+    EXPECT_NO_THROW(graph.resetState());
+    EXPECT_NO_THROW(graph.resetState());
+}
+
+TEST_F(Qwen35GraphBuildTest, ResetState_SafeAfterGraphBuild)
+{
+    Qwen35Graph graph(config_, nullptr);
+
+    // Build a GDN attention graph (this internally uses conv/recurrence state)
+    ComputeGraph attn_graph = graph.buildAttentionGraph(
+        layer_, buffers_, /*layer_idx=*/0, /*seq_len=*/2,
+        /*batch_size=*/1, /*kv_cache=*/nullptr, /*position_ids=*/nullptr,
+        DeviceId::cpu());
+    ASSERT_GT(attn_graph.size(), 0u);
+
+    // Reset state after building — should be safe
+    EXPECT_NO_THROW(graph.resetState());
+
+    // Should be able to build another graph after reset
+    ComputeGraph attn_graph2 = graph.buildAttentionGraph(
+        layer_, buffers_, /*layer_idx=*/0, /*seq_len=*/2,
+        /*batch_size=*/1, /*kv_cache=*/nullptr, /*position_ids=*/nullptr,
+        DeviceId::cpu());
+    EXPECT_GT(attn_graph2.size(), 0u);
+}
+
+TEST(Test__IGraphBuilder_ResetState, DefaultImplementation_IsNoOp)
+{
+    // IGraphBuilder::resetState() has a default no-op implementation.
+    // Non-GDN models (like Qwen2) should just call the base version without issue.
+    GraphConfig config;
+    config.n_layers = 2;
+    config.d_model = 64;
+    config.n_heads = 4;
+    config.n_kv_heads = 2;
+    config.head_dim = 16;
+    config.d_ff = 128;
+    config.vocab_size = 1000;
+
+    // Qwen35Graph with NO GDN config → hasGDN() returns false,
+    // ensureGDNStates() is a no-op, states are empty
+    Qwen35Graph graph(config, nullptr);
+    EXPECT_NO_THROW(graph.resetState());
+}

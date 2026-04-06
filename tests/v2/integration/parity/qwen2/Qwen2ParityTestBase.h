@@ -815,6 +815,8 @@ namespace llaminar2::test::parity::qwen2
                 config_.model_path = cfg().model_path;
             if (!cfg().snapshot_dir.empty())
                 config_.snapshot_dir = cfg().snapshot_dir;
+            if (cfg().decode_steps > 0)
+                config_.decode_steps = cfg().decode_steps;
         }
 
         std::string getBackendName() override
@@ -1185,7 +1187,7 @@ namespace llaminar2::test::parity::qwen2
             }
 
             LOG_INFO("[Parity] GlobalTP setup complete: degree=" << global_tp_ctx_->degree()
-                                                                  << ", myIndex=" << global_tp_ctx_->myIndex());
+                                                                 << ", myIndex=" << global_tp_ctx_->myIndex());
             return true;
         }
 

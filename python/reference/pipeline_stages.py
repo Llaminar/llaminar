@@ -51,6 +51,7 @@ class PipelineStage(Enum):
     
     # === Gated Delta Net (Linear Attention) ===
     GDN_CONV1D_OUTPUT = auto()      # Output of causal conv1d (after SiLU activation)
+    GDN_Z_PROJECTION = auto()       # Output of Z gate projection (in_proj_z)
     GDN_DELTA_RULE_OUTPUT = auto()  # Output of chunk/recurrent gated delta rule kernel
     GDN_NORM_GATE_OUTPUT = auto()   # Output of RMSNormGated (norm + SiLU gate with z)
 
@@ -81,6 +82,7 @@ _STAGE_TO_STRING: Dict[PipelineStage, str] = {
     PipelineStage.FINAL_NORM: "FINAL_NORM",
     PipelineStage.LM_HEAD: "LM_HEAD",
     PipelineStage.GDN_CONV1D_OUTPUT: "GDN_CONV1D_OUTPUT",
+    PipelineStage.GDN_Z_PROJECTION: "GDN_Z_PROJECTION",
     PipelineStage.GDN_DELTA_RULE_OUTPUT: "GDN_DELTA_RULE_OUTPUT",
     PipelineStage.GDN_NORM_GATE_OUTPUT: "GDN_NORM_GATE_OUTPUT",
     PipelineStage.CUSTOM: "CUSTOM",

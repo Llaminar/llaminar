@@ -170,6 +170,7 @@ namespace llaminar2
         void setAccumulatePrefill(bool accumulate) override;
         void flushStageTimeline() override;
         void setSamplingParams(const SamplingParams &params) override;
+        SamplingParams getRecommendedSamplingParams() const override;
 
     private:
         // =====================================================================
@@ -212,6 +213,17 @@ namespace llaminar2
          * @return true if configuration is valid, false with error message if not
          */
         bool validateTPPPConfiguration();
+
+        /**
+         * @brief Validate and clamp context length against model capabilities
+         *
+         * Must be called AFTER loadWeights() (requires model_ctx_).
+         * Logs a warning if the user-specified context length exceeds the
+         * model's max_position_embeddings and clamps to the model max.
+         *
+         * @return true always (warnings only, never fails)
+         */
+        bool validateContextLength();
 
         /**
          * @brief Build compute graphs
@@ -312,8 +324,9 @@ namespace llaminar2
         // Inference state
         std::vector<int32_t> stop_tokens_;
         Sampler sampler_;
-        SamplingParams active_sampling_params_; // Current sampling params for decodeStep()
-        int32_t last_token_{0};                 // Last token for decode step
+        SamplingParams active_sampling_params_;      // Current sampling params for decodeStep()
+        SamplingParams recommended_sampling_params_; // Model-specific defaults
+        int32_t last_token_{0};                      // Last token for decode step
         std::shared_ptr<ITokenizer> tokenizer_;
     };
 

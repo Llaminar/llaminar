@@ -96,6 +96,7 @@ namespace llaminar2
         // Layout: [n_layers_ * batch_size_] ints
         int *d_head_params_ = nullptr; ///< Device-side head position buffer
         int *h_head_params_ = nullptr; ///< Pinned host-side head position buffer
+        bool wrap_warned_ = false;     ///< One-time warning when ring buffer wraps
 
         void allocateDeviceParams();
         void freeDeviceParams();

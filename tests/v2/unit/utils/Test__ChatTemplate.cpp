@@ -7,6 +7,7 @@
 
 #include <gtest/gtest.h>
 #include "utils/ChatTemplate.h"
+#include "utils/Sampler.h"
 
 using namespace llaminar2;
 
@@ -422,4 +423,406 @@ TEST(Test__ChatTemplate, CreateFromStringPreservesRawTemplate)
     auto tmpl = ChatTemplate::create(template_str);
 
     EXPECT_EQ(tmpl->rawTemplate(), template_str);
+}
+
+// ============================================================================
+// Jinja2 Engine Tests
+// ============================================================================
+
+TEST(Test__ChatTemplate, JinjaRendersChatMLTemplate)
+{
+    // A real ChatML Jinja2 template (simplified from Qwen2.5)
+    std::string jinja_template = R"(
+{%- for message in messages %}
+<|im_start|>{{ message['role'] }}
+{{ message['content'] }}<|im_end|>
+{% endfor %}
+{%- if add_generation_prompt %}
+<|im_start|>assistant
+{%- endif %})";
+
+    auto tmpl = ChatTemplate::create(jinja_template, "<|endoftext|>", "<|im_end|>");
+    ASSERT_TRUE(tmpl->hasJinjaSupport()) << "Jinja compilation should succeed for ChatML template";
+
+    std::vector<ChatMessage> messages = {
+        {"system", "You are a helpful assistant."},
+        {"user", "Hello!"}};
+
+    std::string result = tmpl->apply(messages, true);
+
+    EXPECT_NE(result.find("<|im_start|>system"), std::string::npos)
+        << "Result: " << result;
+    EXPECT_NE(result.find("You are a helpful assistant."), std::string::npos)
+        << "Result: " << result;
+    EXPECT_NE(result.find("<|im_start|>user"), std::string::npos)
+        << "Result: " << result;
+    EXPECT_NE(result.find("Hello!"), std::string::npos)
+        << "Result: " << result;
+    EXPECT_NE(result.find("<|im_start|>assistant"), std::string::npos)
+        << "Result: " << result;
+}
+
+TEST(Test__ChatTemplate, JinjaRendersLlama3Template)
+{
+    // Simplified LLaMA 3 Jinja template
+    std::string jinja_template = R"(
+{%- for message in messages %}
+<|start_header_id|>{{ message['role'] }}<|end_header_id|>
+
+{{ message['content'] }}<|eot_id|>
+{%- endfor %}
+{%- if add_generation_prompt %}
+<|start_header_id|>assistant<|end_header_id|>
+
+{%- endif %})";
+
+    auto tmpl = ChatTemplate::create(jinja_template, "<|begin_of_text|>", "<|eot_id|>");
+    ASSERT_TRUE(tmpl->hasJinjaSupport());
+
+    std::vector<ChatMessage> messages = {
+        {"user", "What is the capital of France?"}};
+
+    std::string result = tmpl->apply(messages, true);
+
+    EXPECT_NE(result.find("<|start_header_id|>user<|end_header_id|>"), std::string::npos)
+        << "Result: " << result;
+    EXPECT_NE(result.find("capital of France"), std::string::npos)
+        << "Result: " << result;
+    EXPECT_NE(result.find("<|start_header_id|>assistant<|end_header_id|>"), std::string::npos)
+        << "Result: " << result;
+}
+
+TEST(Test__ChatTemplate, JinjaFallsBackToHardcodedOnBadTemplate)
+{
+    // Intentionally broken Jinja template (unclosed block)
+    std::string bad_template = "<|im_start|>{% for message in messages %}broken";
+
+    auto tmpl = ChatTemplate::create(bad_template);
+    // Should still work via fallback (detected as ChatML from <|im_start|>)
+    EXPECT_EQ(tmpl->type(), ChatTemplateType::CHATML);
+
+    std::vector<ChatMessage> messages = {{"user", "Hello"}};
+    std::string result = tmpl->apply(messages, true);
+
+    // Should get the hardcoded ChatML output
+    EXPECT_NE(result.find("<|im_start|>user"), std::string::npos)
+        << "Fallback should produce ChatML output. Got: " << result;
+}
+
+TEST(Test__ChatTemplate, JinjaHandlesMultiTurnConversation)
+{
+    std::string jinja_template = R"(
+{%- for message in messages %}
+<|im_start|>{{ message['role'] }}
+{{ message['content'] }}<|im_end|>
+{% endfor %}
+{%- if add_generation_prompt %}
+<|im_start|>assistant
+{%- endif %})";
+
+    auto tmpl = ChatTemplate::create(jinja_template, "", "");
+
+    std::vector<ChatMessage> messages = {
+        {"system", "Be concise."},
+        {"user", "Hi"},
+        {"assistant", "Hello!"},
+        {"user", "How are you?"}};
+
+    std::string result = tmpl->apply(messages, true);
+
+    // Verify all 4 messages + generation prompt
+    size_t count = 0;
+    size_t pos = 0;
+    while ((pos = result.find("<|im_start|>", pos)) != std::string::npos)
+    {
+        count++;
+        pos++;
+    }
+    EXPECT_EQ(count, 5) << "4 messages + 1 generation prompt = 5. Result: " << result;
+}
+
+TEST(Test__ChatTemplate, JinjaExposesBoSEoSTokens)
+{
+    // Template that uses bos_token and eos_token
+    std::string jinja_template = R"({{ bos_token }}
+{%- for message in messages %}
+{{ message['role'] }}: {{ message['content'] }}{{ eos_token }}
+{%- endfor %})";
+
+    auto tmpl = ChatTemplate::create(jinja_template, "<BOS>", "<EOS>");
+    ASSERT_TRUE(tmpl->hasJinjaSupport());
+
+    std::vector<ChatMessage> messages = {{"user", "Hello"}};
+    std::string result = tmpl->apply(messages, false);
+
+    EXPECT_NE(result.find("<BOS>"), std::string::npos) << "Result: " << result;
+    EXPECT_NE(result.find("<EOS>"), std::string::npos) << "Result: " << result;
+}
+
+// ============================================================================
+// Thinking Model Detection Tests (Jinja Differential)
+// ============================================================================
+
+TEST(Test__ChatTemplate, DetectsThinkingModelFromJinja)
+{
+    // Simplified thinking model template (like Qwen3.5)
+    std::string jinja_template = R"(
+{%- for message in messages %}
+<|im_start|>{{ message['role'] }}
+{{ message['content'] }}<|im_end|>
+{% endfor %}
+{%- if add_generation_prompt %}
+<|im_start|>assistant
+{%- if enable_thinking is defined and enable_thinking is true %}
+<think>
+{%- else %}
+<think>
+
+</think>
+
+{%- endif %}
+{%- endif %})";
+
+    auto tmpl = ChatTemplate::create(jinja_template, "", "<|im_end|>");
+    ASSERT_TRUE(tmpl->hasJinjaSupport());
+    EXPECT_TRUE(tmpl->isThinkingModel())
+        << "Should detect as thinking model via Jinja differential rendering";
+
+    // Check detected tags
+    EXPECT_FALSE(tmpl->thinkingStartTag().empty())
+        << "Should have a thinking start tag";
+    EXPECT_FALSE(tmpl->thinkingEndTag().empty())
+        << "Should have a thinking end tag";
+    EXPECT_NE(tmpl->thinkingEndTag().find("</think>"), std::string::npos)
+        << "End tag should contain </think>, got: " << tmpl->thinkingEndTag();
+}
+
+TEST(Test__ChatTemplate, NonThinkingModelNotDetectedAsThinking)
+{
+    // Standard ChatML template (no enable_thinking support)
+    std::string jinja_template = R"(
+{%- for message in messages %}
+<|im_start|>{{ message['role'] }}
+{{ message['content'] }}<|im_end|>
+{% endfor %}
+{%- if add_generation_prompt %}
+<|im_start|>assistant
+{%- endif %})";
+
+    auto tmpl = ChatTemplate::create(jinja_template, "", "");
+    ASSERT_TRUE(tmpl->hasJinjaSupport());
+    EXPECT_FALSE(tmpl->isThinkingModel())
+        << "Standard template should NOT be detected as thinking model";
+    EXPECT_TRUE(tmpl->thinkingStartTag().empty());
+    EXPECT_TRUE(tmpl->thinkingEndTag().empty());
+}
+
+TEST(Test__ChatTemplate, ThinkingModeAppendsStartTag)
+{
+    std::string jinja_template = R"(
+{%- for message in messages %}
+<|im_start|>{{ message['role'] }}
+{{ message['content'] }}<|im_end|>
+{% endfor %}
+{%- if add_generation_prompt %}
+<|im_start|>assistant
+{%- if enable_thinking is defined and enable_thinking is true %}
+<think>
+{%- else %}
+<think>
+
+</think>
+
+{%- endif %}
+{%- endif %})";
+
+    auto tmpl = ChatTemplate::create(jinja_template, "", "");
+
+    std::vector<ChatMessage> messages = {{"user", "Hello"}};
+
+    // With thinking enabled (default)
+    std::string with_think = tmpl->apply(messages, true, true);
+    EXPECT_NE(with_think.find("<think>"), std::string::npos)
+        << "Thinking mode should include <think> tag. Result: " << with_think;
+
+    // With thinking disabled
+    std::string without_think = tmpl->apply(messages, true, false);
+    // Non-thinking mode may also have tags (model-dependent) but outputs differently
+    EXPECT_NE(with_think, without_think)
+        << "Thinking enabled vs disabled should produce different output";
+}
+
+// ============================================================================
+// ChatParser Tests
+// ============================================================================
+
+TEST(Test__ChatParser, ParsesThinkingContent)
+{
+    // Create a thinking model template
+    std::string jinja_template = R"(
+{%- for message in messages %}
+<|im_start|>{{ message['role'] }}
+{{ message['content'] }}<|im_end|>
+{% endfor %}
+{%- if add_generation_prompt %}
+<|im_start|>assistant
+{%- if enable_thinking is defined and enable_thinking is true %}
+<think>
+{%- else %}
+<think>
+
+</think>
+
+{%- endif %}
+{%- endif %})";
+
+    auto tmpl = ChatTemplate::create(jinja_template, "", "");
+    ASSERT_TRUE(tmpl->isThinkingModel());
+
+    ChatParser parser(*tmpl);
+    EXPECT_TRUE(parser.expectsThinking());
+
+    // Simulate model output: thinking + content
+    auto result = parser.parse("I need to figure this out...\nLet me think.\n</think>\n\nThe answer is 42.");
+    EXPECT_TRUE(result.has_reasoning);
+    EXPECT_EQ(result.reasoning_content, "I need to figure this out...\nLet me think.\n");
+    EXPECT_EQ(result.content, "The answer is 42.");
+}
+
+TEST(Test__ChatParser, ParsesOutputWithNoThinking)
+{
+    auto tmpl = ChatTemplate::create(ChatTemplateType::CHATML);
+    // Non-thinking model
+    ChatParser parser(*tmpl);
+    EXPECT_FALSE(parser.expectsThinking());
+
+    auto result = parser.parse("Hello, I'm an assistant!");
+    EXPECT_FALSE(result.has_reasoning);
+    EXPECT_EQ(result.content, "Hello, I'm an assistant!");
+    EXPECT_TRUE(result.reasoning_content.empty());
+}
+
+TEST(Test__ChatParser, ParsesOutputWithOnlyThinking)
+{
+    // Create thinking template
+    std::string jinja_template = R"(
+{%- for message in messages %}
+<|im_start|>{{ message['role'] }}
+{{ message['content'] }}<|im_end|>
+{% endfor %}
+{%- if add_generation_prompt %}
+<|im_start|>assistant
+{%- if enable_thinking is defined and enable_thinking is true %}
+<think>
+{%- endif %}
+{%- endif %})";
+
+    auto tmpl = ChatTemplate::create(jinja_template, "", "");
+    // May or may not be detected as thinking depending on the diff
+    // If start tag is detected but no end tag, use heuristic
+    ChatParser parser(*tmpl);
+
+    // If the thinking end tag was derived from start tag:
+    if (parser.expectsThinking())
+    {
+        // Model is still thinking (no end tag in output)
+        auto result = parser.parse("I'm still thinking about this...");
+        // Without end tag in output, everything is treated as content
+        EXPECT_EQ(result.content, "I'm still thinking about this...");
+    }
+}
+
+TEST(Test__ChatParser, ParsesEmptyContent)
+{
+    std::string jinja_template = R"(
+{%- for message in messages %}
+<|im_start|>{{ message['role'] }}
+{{ message['content'] }}<|im_end|>
+{% endfor %}
+{%- if add_generation_prompt %}
+<|im_start|>assistant
+{%- if enable_thinking is defined and enable_thinking is true %}
+<think>
+{%- else %}
+<think>
+
+</think>
+
+{%- endif %}
+{%- endif %})";
+
+    auto tmpl = ChatTemplate::create(jinja_template, "", "");
+    ChatParser parser(*tmpl);
+
+    if (parser.expectsThinking())
+    {
+        // Thinking content followed by end tag and nothing else
+        auto result = parser.parse("Just thinking\n</think>");
+        EXPECT_TRUE(result.has_reasoning);
+        EXPECT_EQ(result.reasoning_content, "Just thinking\n");
+        EXPECT_TRUE(result.content.empty());
+    }
+}
+
+TEST(Test__ChatParser, ParsesEmptyInput)
+{
+    auto tmpl = ChatTemplate::create(ChatTemplateType::CHATML);
+    ChatParser parser(*tmpl);
+
+    auto result = parser.parse("");
+    EXPECT_FALSE(result.has_reasoning);
+    EXPECT_TRUE(result.content.empty());
+}
+
+TEST(Test__ChatParser, TrimsWhitespaceAfterEndTag)
+{
+    std::string jinja_template = R"(
+{%- for message in messages %}
+<|im_start|>{{ message['role'] }}
+{{ message['content'] }}<|im_end|>
+{% endfor %}
+{%- if add_generation_prompt %}
+<|im_start|>assistant
+{%- if enable_thinking is defined and enable_thinking is true %}
+<think>
+{%- else %}
+<think>
+
+</think>
+
+{%- endif %}
+{%- endif %})";
+
+    auto tmpl = ChatTemplate::create(jinja_template, "", "");
+    ChatParser parser(*tmpl);
+
+    if (parser.expectsThinking())
+    {
+        // Lots of whitespace between end tag and content
+        auto result = parser.parse("thinking\n</think>\n\n\n   Answer here");
+        EXPECT_TRUE(result.has_reasoning);
+        EXPECT_EQ(result.content, "Answer here");
+    }
+}
+
+// ============================================================================
+// Sampling Defaults Tests
+// ============================================================================
+
+TEST(Test__ChatTemplate, SamplingParamsHasPenaltyFields)
+{
+    SamplingParams params;
+    EXPECT_FLOAT_EQ(params.presence_penalty, 0.0f);
+    EXPECT_FLOAT_EQ(params.frequency_penalty, 0.0f);
+    EXPECT_FALSE(params.has_penalties());
+
+    params.presence_penalty = 1.5f;
+    EXPECT_TRUE(params.has_penalties());
+}
+
+TEST(Test__ChatTemplate, SamplingParamsFrequencyPenaltyTriggers)
+{
+    SamplingParams params;
+    params.frequency_penalty = 0.5f;
+    EXPECT_TRUE(params.has_penalties());
 }

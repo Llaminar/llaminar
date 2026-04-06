@@ -283,3 +283,84 @@ TEST_F(Test__CPURingKVCache, HeadMajor_GatherLogicalOrder_WithWrap)
         EXPECT_FLOAT_EQ(ov[row * 4 + 3], 140.0f + t);
     }
 }
+
+// =============================================================================
+// Ring buffer wrap + clear cycle tests
+// =============================================================================
+
+TEST_F(Test__CPURingKVCache, WrapThenClear_ResetsFullState)
+{
+    // Cache with small capacity (4 tokens)
+    CPURingKVCacheFP32 cache(getTestMPIContext(), 1, 1, 4, 1, 2, DeviceId::cpu());
+
+    auto in_k = std::make_shared<FP32Tensor>(std::vector<size_t>{3, 2});
+    auto in_v = std::make_shared<FP32Tensor>(std::vector<size_t>{3, 2});
+    std::fill(in_k->mutable_data(), in_k->mutable_data() + 6, 1.0f);
+    std::fill(in_v->mutable_data(), in_v->mutable_data() + 6, 2.0f);
+
+    // Fill to capacity (3 tokens) then overflow (3 more → wraps with 2 overwritten)
+    ASSERT_TRUE(cache.append_kv(0, 0, in_k.get(), in_v.get(), 3));
+    ASSERT_TRUE(cache.append_kv(0, 0, in_k.get(), in_v.get(), 3));
+    EXPECT_EQ(cache.ring_size(0, 0), 4); // Full, wrapped
+
+    // Clear resets everything including wrap warning state
+    cache.clear();
+
+    EXPECT_EQ(cache.ring_size(0, 0), 0);
+    EXPECT_EQ(cache.ring_head(0, 0), 0);
+
+    // Should be able to fill again from scratch
+    auto in2_k = std::make_shared<FP32Tensor>(std::vector<size_t>{2, 2});
+    auto in2_v = std::make_shared<FP32Tensor>(std::vector<size_t>{2, 2});
+    float *k = in2_k->mutable_data();
+    float *v = in2_v->mutable_data();
+    k[0] = 10.0f; k[1] = 20.0f; k[2] = 30.0f; k[3] = 40.0f;
+    v[0] = 50.0f; v[1] = 60.0f; v[2] = 70.0f; v[3] = 80.0f;
+
+    ASSERT_TRUE(cache.append_kv(0, 0, in2_k.get(), in2_v.get(), 2));
+    EXPECT_EQ(cache.ring_size(0, 0), 2);
+    EXPECT_EQ(cache.ring_head(0, 0), 0);
+
+    // Verify data integrity after clear+refill
+    auto *k_cache = dynamic_cast<FP32Tensor *>(cache.get_k(0, 0));
+    ASSERT_NE(k_cache, nullptr);
+    const float *kc = k_cache->data();
+    EXPECT_FLOAT_EQ(kc[0], 10.0f);
+    EXPECT_FLOAT_EQ(kc[1], 20.0f);
+    EXPECT_FLOAT_EQ(kc[2], 30.0f);
+    EXPECT_FLOAT_EQ(kc[3], 40.0f);
+}
+
+TEST_F(Test__CPURingKVCache, MultipleWrapCycles_DataIntegrity)
+{
+    // Small cache: 3 token capacity
+    CPURingKVCacheFP32 cache(getTestMPIContext(), 1, 1, 3, 1, 2, DeviceId::cpu());
+
+    for (int cycle = 0; cycle < 3; ++cycle)
+    {
+        auto in_k = std::make_shared<FP32Tensor>(std::vector<size_t>{2, 2});
+        auto in_v = std::make_shared<FP32Tensor>(std::vector<size_t>{2, 2});
+        float base = static_cast<float>(cycle * 100);
+        float *k = in_k->mutable_data();
+        float *v = in_v->mutable_data();
+        k[0] = base + 1; k[1] = base + 2; k[2] = base + 3; k[3] = base + 4;
+        v[0] = base + 5; v[1] = base + 6; v[2] = base + 7; v[3] = base + 8;
+
+        ASSERT_TRUE(cache.append_kv(0, 0, in_k.get(), in_v.get(), 2));
+        EXPECT_EQ(cache.ring_size(0, 0), 2);
+
+        // Overflow: add 2 more tokens to a 3-capacity cache that already has 2
+        auto in2_k = std::make_shared<FP32Tensor>(std::vector<size_t>{2, 2});
+        auto in2_v = std::make_shared<FP32Tensor>(std::vector<size_t>{2, 2});
+        std::fill(in2_k->mutable_data(), in2_k->mutable_data() + 4, base + 10);
+        std::fill(in2_v->mutable_data(), in2_v->mutable_data() + 4, base + 20);
+
+        ASSERT_TRUE(cache.append_kv(0, 0, in2_k.get(), in2_v.get(), 2));
+        EXPECT_EQ(cache.ring_size(0, 0), 3); // Capped at capacity
+
+        // Clear for next cycle
+        cache.clear();
+        EXPECT_EQ(cache.ring_size(0, 0), 0);
+        EXPECT_EQ(cache.ring_head(0, 0), 0);
+    }
+}

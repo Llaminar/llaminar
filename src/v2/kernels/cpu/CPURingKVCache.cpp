@@ -808,6 +808,7 @@ namespace llaminar2
                 entries_[layer][seq_idx].size = 0;
             }
         }
+        wrap_warned_ = false;
     }
 
     template <ActivationPrecision KPrecision, ActivationPrecision VPrecision>
@@ -1024,6 +1025,13 @@ namespace llaminar2
             {
                 // Ring buffer is full: overwrite the oldest token at `head`,
                 // then advance head to the next oldest.
+                if (!wrap_warned_)
+                {
+                    LOG_WARN("Context window full (" << max_seq_len_
+                                                     << " tokens). Sliding window is now overwriting oldest tokens. "
+                                                     << "Use -c <size> to increase context length.");
+                    wrap_warned_ = true;
+                }
                 dst_pos = entry.head;
                 entry.head = (entry.head + 1) % max_seq_len_;
             }

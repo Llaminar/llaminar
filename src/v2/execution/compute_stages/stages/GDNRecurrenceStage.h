@@ -105,6 +105,13 @@ namespace llaminar2
         StageBufferRequirements getBufferRequirements() const override;
         StageBufferContract bufferContract() const override;
 
+        void updateDynamicParams(int pos_offset, int seq_len) override
+        {
+            (void)pos_offset; // GDN layers don't use position offsets
+            params_.seq_len = seq_len;
+        }
+        bool hasDynamicParams() const override { return true; }
+
         const Params &getParams() const { return params_; }
 
     private:

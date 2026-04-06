@@ -35,6 +35,7 @@ namespace llaminar2::test
         MOCK_METHOD(std::string, getChatTemplateString, (), (const, override));
         MOCK_METHOD(ChatTemplateType, getChatTemplateType, (), (const, override));
         MOCK_METHOD(bool, hasChatTemplate, (), (const, override));
+        MOCK_METHOD(const ChatTemplate &, getChatTemplate, (), (const, override));
         MOCK_METHOD(void, setChatTemplate, (std::unique_ptr<ChatTemplate> tmpl), (override));
 
         MOCK_METHOD(std::vector<int>, encodeChat,
