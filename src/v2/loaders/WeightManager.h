@@ -201,6 +201,24 @@ namespace llaminar2
         }
 
         /**
+         * @brief Set model head dimensions for FusedQKV sub-block computation
+         *
+         * Required for correct FusedQKVHeads sharding under GQA (n_kv_heads < n_heads).
+         * Without this, FusedQKV weights fall back to simple equal row splitting.
+         *
+         * @param n_heads Number of query attention heads
+         * @param n_kv_heads Number of key/value attention heads (GQA)
+         * @param head_dim Dimension per attention head
+         */
+        void setModelDimensions(int n_heads, int n_kv_heads, int head_dim)
+        {
+            model_n_heads_ = n_heads;
+            model_n_kv_heads_ = n_kv_heads;
+            model_head_dim_ = head_dim;
+            has_model_dimensions_ = true;
+        }
+
+        /**
          * @brief Set layer range for LAYER_PARTITIONED strategy
          *
          * For Pipeline Parallelism, restricts which layer weights are loaded.
@@ -492,6 +510,14 @@ namespace llaminar2
         mutable std::unordered_map<std::string, ShardingMode> sharding_mode_cache_; ///< Cached sharding modes
         WeightShardingConfig sharding_config_;                                      ///< Model-specific sharding patterns
         bool has_sharding_config_ = false;                                          ///< True if config was set explicitly
+
+        // =========================================================================
+        // Model head dimensions for FusedQKV sub-block computation
+        // =========================================================================
+        int model_n_heads_ = 0;           ///< Number of query attention heads
+        int model_n_kv_heads_ = 0;        ///< Number of KV attention heads (GQA)
+        int model_head_dim_ = 0;          ///< Dimension per attention head
+        bool has_model_dimensions_ = false; ///< True if setModelDimensions() was called
 
         // Decode weight shard cache (separate from prefill cache)
         std::unordered_map<std::string, std::shared_ptr<TensorBase>> decode_cache_; ///< Decode shard cache

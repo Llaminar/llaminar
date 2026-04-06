@@ -500,3 +500,209 @@ TEST(Qwen35SchemaRegressionTest, SSMNormIsReplicated)
               WeightShardingMode::Replicate)
         << "ssm_norm.weight must be Replicate (per-state-dimension, not per-head)";
 }
+
+// =============================================================================
+// GQA-Aware FusedQKV Tests (n_kv_heads < n_heads)
+// =============================================================================
+
+/**
+ * @brief Test fixture for GQA-aware FusedQKV sharding
+ *
+ * Simulates Qwen3.5 FA layers with GQA where Q has more heads than K/V:
+ *   n_heads=4, n_kv_heads=2, head_dim=8
+ *   Q = 4*8 = 32 rows, K = 2*8 = 16 rows, V = 2*8 = 16 rows
+ *   Total = 64 rows (NOT divisible by 3 into equal blocks)
+ */
+class GQAFusedQKVShardingTest : public ::testing::Test
+{
+protected:
+    static constexpr int N_HEADS = 4;
+    static constexpr int N_KV_HEADS = 2;
+    static constexpr int HEAD_DIM = 8;
+    static constexpr size_t HIDDEN_DIM = 16;
+    static constexpr size_t Q_ROWS = N_HEADS * HEAD_DIM;      // 32
+    static constexpr size_t KV_ROWS = N_KV_HEADS * HEAD_DIM;  // 16
+    static constexpr size_t TOTAL_ROWS = Q_ROWS + 2 * KV_ROWS; // 64
+    static constexpr size_t COLS = HIDDEN_DIM;
+
+    void SetUp() override
+    {
+        mock_loader_ = std::make_shared<MockModelLoader>();
+        mock_loader_->setLoaded(true);
+        mock_loader_->setArchitecture("qwen3.5");
+        mock_loader_->setBlockCount(1);
+        mock_loader_->setEmbeddingLength(HIDDEN_DIM);
+        mock_loader_->setHeadCount(N_HEADS);
+        mock_loader_->setHeadCountKV(N_KV_HEADS);
+        mock_loader_->setVocabSize(100);
+        mock_loader_->setFeedForwardLength(64);
+
+        // Create fused QKV tensor: [Q(32) | K(16) | V(16)] = 64 rows
+        // Value at (row, col) = row * 1000 + col
+        auto qkv_tensor = std::make_shared<FP32Tensor>(std::vector<size_t>{TOTAL_ROWS, COLS});
+        float *data = qkv_tensor->mutable_data();
+        for (size_t r = 0; r < TOTAL_ROWS; ++r)
+            for (size_t c = 0; c < COLS; ++c)
+                data[r * COLS + c] = static_cast<float>(r * 1000 + c);
+        mock_loader_->addTensor("blk.0.attn_qkv.weight", qkv_tensor);
+
+        mock_loader_->addFP32RandomTensor("token_embd.weight", {100, HIDDEN_DIM});
+        mock_loader_->addFP32RandomTensor("output.weight", {100, HIDDEN_DIM});
+        mock_loader_->addFP32RandomTensor("output_norm.weight", {HIDDEN_DIM});
+        mock_loader_->addFP32RandomTensor("blk.0.attn_norm.weight", {HIDDEN_DIM});
+        mock_loader_->addFP32RandomTensor("blk.0.ffn_norm.weight", {HIDDEN_DIM});
+
+        Qwen35SchemaFactory schema_factory;
+        sharding_config_ = schema_factory.getWeightShardingConfig();
+    }
+
+    std::unique_ptr<WeightManager> createShardedManager(int rank, int world_size)
+    {
+        auto mpi = MPIContextFactory::create_mock(rank, world_size);
+        auto wm = std::make_unique<WeightManager>(
+            *mock_loader_, mpi, nullptr,
+            WeightDistributionStrategy::SHARDED,
+            WeightPrecision::NATIVE);
+        wm->setWeightShardingConfig(sharding_config_);
+        wm->setModelDimensions(N_HEADS, N_KV_HEADS, HEAD_DIM);
+        return wm;
+    }
+
+    std::shared_ptr<MockModelLoader> mock_loader_;
+    WeightShardingConfig sharding_config_;
+};
+
+/**
+ * @brief GQA rank 0: gets first half of each unequal sub-block
+ *
+ * With TP=2, n_heads=4, n_kv_heads=2, head_dim=8:
+ *   Q sub-block: 32 rows → rank 0 gets [0, 16)
+ *   K sub-block: 16 rows → rank 0 gets [32, 40)
+ *   V sub-block: 16 rows → rank 0 gets [48, 56)
+ *   Total: 16 + 8 + 8 = 32 rows
+ */
+TEST_F(GQAFusedQKVShardingTest, Rank0GetsUnequalSubBlocks)
+{
+    auto wm = createShardedManager(0, 2);
+    auto tensor = wm->getWeightForDevice("blk.0.attn_qkv.weight", DeviceId::cpu());
+    ASSERT_NE(tensor, nullptr);
+
+    const size_t q_half = Q_ROWS / 2;   // 16
+    const size_t kv_half = KV_ROWS / 2; // 8
+    EXPECT_EQ(tensor->shape()[0], q_half + 2 * kv_half); // 32
+    EXPECT_EQ(tensor->shape()[1], COLS);
+
+    // Verify data: Q rows [0..15], K rows [32..39], V rows [48..55]
+    const float *data = tensor->data();
+    ASSERT_NE(data, nullptr);
+
+    // Q sub-block first half
+    for (size_t r = 0; r < q_half; ++r)
+        EXPECT_FLOAT_EQ(data[r * COLS], static_cast<float>(r * 1000))
+            << "Q row " << r;
+
+    // K sub-block first half (starts at local row q_half)
+    for (size_t r = 0; r < kv_half; ++r)
+        EXPECT_FLOAT_EQ(data[(q_half + r) * COLS],
+                         static_cast<float>((Q_ROWS + r) * 1000))
+            << "K row " << r;
+
+    // V sub-block first half (starts at local row q_half + kv_half)
+    for (size_t r = 0; r < kv_half; ++r)
+        EXPECT_FLOAT_EQ(data[(q_half + kv_half + r) * COLS],
+                         static_cast<float>((Q_ROWS + KV_ROWS + r) * 1000))
+            << "V row " << r;
+}
+
+/**
+ * @brief GQA rank 1: gets second half of each unequal sub-block
+ */
+TEST_F(GQAFusedQKVShardingTest, Rank1GetsUnequalSubBlocks)
+{
+    auto wm = createShardedManager(1, 2);
+    auto tensor = wm->getWeightForDevice("blk.0.attn_qkv.weight", DeviceId::cpu());
+    ASSERT_NE(tensor, nullptr);
+
+    const size_t q_half = Q_ROWS / 2;   // 16
+    const size_t kv_half = KV_ROWS / 2; // 8
+    EXPECT_EQ(tensor->shape()[0], q_half + 2 * kv_half); // 32
+    EXPECT_EQ(tensor->shape()[1], COLS);
+
+    const float *data = tensor->data();
+    ASSERT_NE(data, nullptr);
+
+    // Q rows [16..31]
+    for (size_t r = 0; r < q_half; ++r)
+        EXPECT_FLOAT_EQ(data[r * COLS], static_cast<float>((q_half + r) * 1000))
+            << "Q row " << r;
+
+    // K rows [40..47]
+    for (size_t r = 0; r < kv_half; ++r)
+        EXPECT_FLOAT_EQ(data[(q_half + r) * COLS],
+                         static_cast<float>((Q_ROWS + kv_half + r) * 1000))
+            << "K row " << r;
+
+    // V rows [56..63]
+    for (size_t r = 0; r < kv_half; ++r)
+        EXPECT_FLOAT_EQ(data[(q_half + kv_half + r) * COLS],
+                         static_cast<float>((Q_ROWS + KV_ROWS + kv_half + r) * 1000))
+            << "V row " << r;
+}
+
+/**
+ * @brief GQA: both ranks together cover all rows
+ */
+TEST_F(GQAFusedQKVShardingTest, BothRanksCoverAllRows)
+{
+    auto wm0 = createShardedManager(0, 2);
+    auto wm1 = createShardedManager(1, 2);
+    auto t0 = wm0->getWeightForDevice("blk.0.attn_qkv.weight", DeviceId::cpu());
+    auto t1 = wm1->getWeightForDevice("blk.0.attn_qkv.weight", DeviceId::cpu());
+
+    ASSERT_NE(t0, nullptr);
+    ASSERT_NE(t1, nullptr);
+    EXPECT_EQ(t0->shape()[0] + t1->shape()[0], TOTAL_ROWS);
+}
+
+// =============================================================================
+// GDN Non-QKV Fallback Tests
+// =============================================================================
+
+/**
+ * @brief When model dimensions are set and total_rows doesn't match Q+K+V,
+ * FusedQKVHeads falls back to simple equal row splitting (GDN SSM weights).
+ *
+ * Qwen3.5 GDN layers have attn_qkv.weight with rows = 2 * inner_size,
+ * which is NOT n_heads*head_dim + 2*n_kv_heads*head_dim.
+ */
+TEST_F(GQAFusedQKVShardingTest, GDNWeightFallsBackToSimpleRowSplit)
+{
+    // Create a GDN-like weight: 128 rows (doesn't match 32+16+16=64)
+    const size_t gdn_rows = 128;
+    auto gdn_tensor = std::make_shared<FP32Tensor>(std::vector<size_t>{gdn_rows, COLS});
+    float *data = gdn_tensor->mutable_data();
+    for (size_t r = 0; r < gdn_rows; ++r)
+        for (size_t c = 0; c < COLS; ++c)
+            data[r * COLS + c] = static_cast<float>(r * 1000 + c);
+    mock_loader_->addTensor("blk.0.gdn_qkv.weight", gdn_tensor);
+
+    // Register as FusedQKVHeads in sharding config
+    sharding_config_.patterns.push_back(
+        {"gdn_qkv.weight", WeightShardingMode::ColumnParallel,
+         WeightDimensionType::FusedQKVHeads, "GDN QKV projection"});
+
+    auto wm = createShardedManager(0, 2);
+    auto tensor = wm->getWeightForDevice("blk.0.gdn_qkv.weight", DeviceId::cpu());
+    ASSERT_NE(tensor, nullptr);
+
+    // Should get simple equal row split: 128/2 = 64 rows
+    EXPECT_EQ(tensor->shape()[0], gdn_rows / 2);
+    EXPECT_EQ(tensor->shape()[1], COLS);
+
+    // Row 0 should be global row 0 (contiguous slice [0, 64))
+    const float *d = tensor->data();
+    EXPECT_FLOAT_EQ(d[0], 0.0f);
+    // Last row should be global row 63
+    EXPECT_FLOAT_EQ(d[(gdn_rows / 2 - 1) * COLS],
+                     static_cast<float>((gdn_rows / 2 - 1) * 1000));
+}

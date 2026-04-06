@@ -608,6 +608,14 @@ namespace llaminar2
         GraphConfig graph_config;
         config_builder->populateFromModelContext(*model_ctx, graph_config);
 
+        // Pass model head dimensions to WeightManager for FusedQKV sub-block slicing
+        // (must be after populateFromModelContext which sets n_heads/n_kv_heads/head_dim)
+        if (weight_mgr && graph_config.n_heads > 0 && graph_config.head_dim > 0)
+        {
+            weight_mgr->setModelDimensions(
+                graph_config.n_heads, graph_config.n_kv_heads, graph_config.head_dim);
+        }
+
         // Execution-specific settings
         graph_config.max_seq_len = config.max_seq_len;
 

@@ -721,92 +721,173 @@ namespace llaminar2
             size_t total_rows = dims[0]; // N = output features
             size_t cols = dims[1];       // K = input features
 
-            // FusedQKVHeads requires special 3-sub-block slicing: the weight is
+            // FusedQKVHeads requires special sub-block slicing: the weight is
             // [Q_all | K_all | V_all] vertically. A simple contiguous row slice
             // crosses sub-block boundaries. Instead, split each sub-block independently.
+            //
+            // GQA support: Q, K, V sub-blocks may have DIFFERENT sizes when
+            // n_kv_heads < n_heads. We compute actual sub-block sizes from
+            // model dimensions when available.
+            //
+            // GDN (non-QKV) weights tagged FusedQKVHeads may have total_rows
+            // that doesn't match the expected Q+K+V size. These fall back to
+            // simple equal row splitting.
             if (has_sharding_config_ &&
                 sharding_config_.getDimensionType(name) == WeightDimensionType::FusedQKVHeads)
             {
-                constexpr size_t N_SUB_BLOCKS = 3;
-                if (total_rows % N_SUB_BLOCKS != 0)
+                // Compute expected Q, K, V row counts from model dimensions
+                bool use_sub_block_slicing = false;
+                size_t q_rows = 0, kv_rows = 0;
+
+                if (has_model_dimensions_ && model_n_heads_ > 0 && model_head_dim_ > 0)
                 {
-                    LOG_ERROR("[WeightManager] FusedQKVHeads: total_rows " << total_rows
-                                                                           << " not divisible by 3 for: " << name);
-                    return nullptr;
-                }
-                const size_t sub_block_rows = total_rows / N_SUB_BLOCKS;
+                    q_rows = static_cast<size_t>(model_n_heads_) * model_head_dim_;
+                    kv_rows = static_cast<size_t>(model_n_kv_heads_) * model_head_dim_;
+                    const size_t expected_qkv = q_rows + 2 * kv_rows;
 
-                // Equal split per rank within each sub-block
-                size_t rows_per_rank = sub_block_rows / world_size;
-                size_t local_start = rows_per_rank * rank;
-                size_t local_count = (rank == world_size - 1)
-                                         ? (sub_block_rows - local_start)
-                                         : rows_per_rank;
-
-                // Load 3 row slices from GGUF in native quantized format
-                std::shared_ptr<TensorBase> slices[N_SUB_BLOCKS];
-                for (size_t s = 0; s < N_SUB_BLOCKS; s++)
-                {
-                    const size_t abs_row_start = s * sub_block_rows + local_start;
-                    const size_t abs_row_end = abs_row_start + local_count;
-
-                    slices[s] = loader_.loadTensorRowSlice(
-                        load_name, abs_row_start, abs_row_end, device, WeightPrecision::NATIVE);
-
-                    if (!slices[s])
+                    if (total_rows == expected_qkv)
                     {
-                        LOG_ERROR("[WeightManager] Rank " << rank
-                                                          << " failed to load fused-QKV sub-block " << s
-                                                          << " rows [" << abs_row_start << ", " << abs_row_end << ")"
-                                                          << " for: " << name);
-                        return nullptr;
+                        // True GQA layout: [Q(n_heads*hd) | K(n_kv_heads*hd) | V(n_kv_heads*hd)]
+                        use_sub_block_slicing = true;
+                        LOG_TRACE("[WeightManager] FusedQKV " << name
+                                                              << " Q=" << q_rows << " K=" << kv_rows << " V=" << kv_rows
+                                                              << " (GQA: n_heads=" << model_n_heads_
+                                                              << " n_kv_heads=" << model_n_kv_heads_ << ")");
+                    }
+                    else if (total_rows % 3 == 0)
+                    {
+                        // Some models (e.g. Qwen3.5) store K/V at full n_heads size in the
+                        // fused weight, applying GQA only at attention time. Fall back to
+                        // 3 equal sub-blocks.
+                        q_rows = total_rows / 3;
+                        kv_rows = total_rows / 3;
+                        use_sub_block_slicing = true;
+                        LOG_TRACE("[WeightManager] FusedQKV " << name
+                                                              << " total_rows=" << total_rows
+                                                              << " != expected GQA=" << expected_qkv
+                                                              << " but divisible by 3 — using 3 equal sub-blocks"
+                                                              << " (" << q_rows << " each)");
+                    }
+                    else
+                    {
+                        LOG_DEBUG("[WeightManager] FusedQKV " << name
+                                                              << " total_rows=" << total_rows
+                                                              << " != expected Q+K+V=" << expected_qkv
+                                                              << " and not divisible by 3"
+                                                              << " — using simple equal row split (non-standard fused weight)");
+                    }
+                }
+                else
+                {
+                    // No model dimensions: try 3 equal sub-blocks (non-GQA fallback)
+                    if (total_rows % 3 == 0)
+                    {
+                        q_rows = total_rows / 3;
+                        kv_rows = total_rows / 3;
+                        use_sub_block_slicing = true;
+                    }
+                    else
+                    {
+                        LOG_DEBUG("[WeightManager] FusedQKV " << name
+                                                              << " total_rows=" << total_rows
+                                                              << " not divisible by 3 and no model dimensions"
+                                                              << " — using simple equal row split");
                     }
                 }
 
-                // Concatenate raw bytes from the 3 sub-block slices into a single native tensor
-                const size_t bytes_per_slice = slices[0]->size_bytes();
-                const size_t total_bytes = bytes_per_slice * N_SUB_BLOCKS;
-                std::vector<uint8_t> combined_raw(total_bytes);
-
-                for (size_t s = 0; s < N_SUB_BLOCKS; s++)
+                if (use_sub_block_slicing)
                 {
-                    const void *src = slices[s]->raw_data();
-                    if (!src)
+                    // Sub-block sizes: [Q_rows, K_rows, V_rows]
+                    const size_t sub_block_sizes[3] = {q_rows, kv_rows, kv_rows};
+
+                    // Compute per-rank slice within each sub-block
+                    // Q sliced by n_heads, K and V sliced by n_kv_heads
+                    auto compute_slice = [rank, world_size](size_t block_rows) -> std::pair<size_t, size_t>
                     {
-                        LOG_ERROR("[WeightManager] Null raw_data for fused-QKV sub-block " << s << ": " << name);
+                        size_t rows_per_rank = block_rows / world_size;
+                        size_t start = rows_per_rank * rank;
+                        size_t count = (rank == world_size - 1)
+                                           ? (block_rows - start)
+                                           : rows_per_rank;
+                        return {start, count};
+                    };
+
+                    // Load each sub-block's slice from GGUF
+                    std::shared_ptr<TensorBase> slices[3];
+                    size_t total_out_rows = 0;
+                    size_t abs_offset = 0; // Running offset into the weight
+
+                    for (size_t s = 0; s < 3; s++)
+                    {
+                        auto [local_start, local_count] = compute_slice(sub_block_sizes[s]);
+                        const size_t abs_row_start = abs_offset + local_start;
+                        const size_t abs_row_end = abs_row_start + local_count;
+
+                        slices[s] = loader_.loadTensorRowSlice(
+                            load_name, abs_row_start, abs_row_end, device, WeightPrecision::NATIVE);
+
+                        if (!slices[s])
+                        {
+                            LOG_ERROR("[WeightManager] Rank " << rank
+                                                              << " failed to load fused-QKV sub-block " << s
+                                                              << " rows [" << abs_row_start << ", " << abs_row_end << ")"
+                                                              << " for: " << name);
+                            return nullptr;
+                        }
+
+                        total_out_rows += local_count;
+                        abs_offset += sub_block_sizes[s];
+                    }
+
+                    // Concatenate raw bytes from the 3 sub-block slices
+                    size_t total_bytes = 0;
+                    for (size_t s = 0; s < 3; s++)
+                        total_bytes += slices[s]->size_bytes();
+
+                    std::vector<uint8_t> combined_raw(total_bytes);
+                    size_t byte_offset = 0;
+                    for (size_t s = 0; s < 3; s++)
+                    {
+                        const void *src = slices[s]->raw_data();
+                        if (!src)
+                        {
+                            LOG_ERROR("[WeightManager] Null raw_data for fused-QKV sub-block " << s << ": " << name);
+                            return nullptr;
+                        }
+                        std::memcpy(combined_raw.data() + byte_offset, src, slices[s]->size_bytes());
+                        byte_offset += slices[s]->size_bytes();
+                    }
+
+                    std::vector<size_t> out_shape = {total_out_rows, cols};
+                    TensorType native_type = slices[0]->native_type();
+
+                    auto result_tensor = createTensorFromRawData(
+                        native_type, out_shape, std::move(combined_raw));
+
+                    if (!result_tensor)
+                    {
+                        LOG_ERROR("[WeightManager] Failed to create fused-QKV tensor for: " << name);
                         return nullptr;
                     }
-                    std::memcpy(combined_raw.data() + s * bytes_per_slice, src, bytes_per_slice);
+
+                    auto meta = SliceMetadata::forColumnParallel(
+                        total_rows, cols, rank, world_size,
+                        true /* inner_is_presliced */);
+
+                    auto result = std::make_shared<TensorSlice>(
+                        std::shared_ptr<TensorBase>(std::move(result_tensor)), meta);
+
+                    LOG_DEBUG("[WeightManager] Rank " << rank
+                                                      << " fused-QKV column-parallel " << name
+                                                      << " [" << total_rows << ", " << cols << "]"
+                                                      << " -> [" << total_out_rows << ", " << cols << "]"
+                                                      << " (Q=" << sub_block_sizes[0]
+                                                      << " K=" << sub_block_sizes[1]
+                                                      << " V=" << sub_block_sizes[2] << ")");
+
+                    return result;
                 }
-
-                const size_t out_rows = local_count * N_SUB_BLOCKS;
-                std::vector<size_t> out_shape = {out_rows, cols};
-                TensorType native_type = slices[0]->native_type();
-
-                auto result_tensor = createTensorFromRawData(
-                    native_type, out_shape, std::move(combined_raw));
-
-                if (!result_tensor)
-                {
-                    LOG_ERROR("[WeightManager] Failed to create fused-QKV tensor for: " << name);
-                    return nullptr;
-                }
-
-                auto meta = SliceMetadata::forColumnParallel(
-                    total_rows, cols, rank, world_size,
-                    true /* inner_is_presliced */);
-
-                auto result = std::make_shared<TensorSlice>(
-                    std::shared_ptr<TensorBase>(std::move(result_tensor)), meta);
-
-                LOG_DEBUG("[WeightManager] Rank " << rank
-                                                  << " fused-QKV column-parallel " << name
-                                                  << " [" << total_rows << ", " << cols << "]"
-                                                  << " -> [" << out_rows << ", " << cols << "]"
-                                                  << " (3 sub-blocks x rows [" << local_start << ", "
-                                                  << (local_start + local_count) << ") each)");
-
-                return result;
+                // Fall through to simple equal row split below
             }
 
             // Calculate this rank's ROW range (splitting output dimension)
