@@ -85,8 +85,8 @@ namespace llaminar2
 
                 // ===== GDN Weights =====
                 // GDN fused QKV and gate are column-parallel (split output dim)
-                {"attn_qkv.weight", WeightShardingMode::ColumnParallel, WeightDimensionType::Heads,
-                 "GDN fused QKV projection - split output dim"},
+                {"attn_qkv.weight", WeightShardingMode::ColumnParallel, WeightDimensionType::FusedQKVHeads,
+                 "GDN fused QKV projection - 3 sub-blocks [Q|K|V] each split by heads"},
                 {"attn_gate.weight", WeightShardingMode::ColumnParallel, WeightDimensionType::Heads,
                  "GDN output gate Z - split output dim"},
                 // SSM output projection is row-parallel (split input dim)
@@ -98,16 +98,16 @@ namespace llaminar2
                 {"ssm_beta.weight", WeightShardingMode::ColumnParallel, WeightDimensionType::Heads,
                  "GDN beta (input gate) - split by heads for TP"},
                 // SSM conv1d: column-parallel (channels == QKV dim, must match sharded QKV)
-                {"ssm_conv1d.weight", WeightShardingMode::ColumnParallel, WeightDimensionType::Heads,
-                 "GDN conv1d kernel - split channels to match sharded QKV"},
+                {"ssm_conv1d.weight", WeightShardingMode::ColumnParallel, WeightDimensionType::FusedQKVHeads,
+                 "GDN conv1d kernel - channels match fused QKV [Q|K|V] structure"},
                 // SSM per-head scalars: column-parallel for correct head assignment per rank
                 {"ssm_dt.bias", WeightShardingMode::ColumnParallel, WeightDimensionType::Heads,
                  "GDN dt bias - split by heads for TP"},
                 {"ssm_a", WeightShardingMode::ColumnParallel, WeightDimensionType::Heads,
                  "GDN decay A - split by heads for TP"},
-                // SSM norm: column-parallel (gamma size = inner_size = n_v_heads * d_v)
-                {"ssm_norm.weight", WeightShardingMode::ColumnParallel, WeightDimensionType::Heads,
-                 "GDN output norm - split to match local inner_size for TP"},
+                // SSM norm: replicated (gamma size = d_v = state_size, shared across all heads)
+                {"ssm_norm.weight", WeightShardingMode::Replicate, WeightDimensionType::Heads,
+                 "GDN output norm gamma (size=d_v) - replicated, shared across all heads"},
 
                 // ===== FFN Weights =====
                 {"ffn_gate.weight", WeightShardingMode::ColumnParallel, WeightDimensionType::FFNHidden,

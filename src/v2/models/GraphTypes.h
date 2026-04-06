@@ -39,6 +39,7 @@ namespace llaminar2
 
     // Forward declarations
     class TensorBase;
+    class ITPContext;
     class ILocalTPContext;
     class ILocalPPContext;
     class TurboQuantContext;
@@ -179,24 +180,26 @@ namespace llaminar2
         MultiDomainTPConfig *multi_domain_tp_config = nullptr;
 
         // =================================================================
-        // LOCAL Tensor Parallelism (Intra-Rank Multi-Device)
+        // Tensor Parallelism Context (Polymorphic — LOCAL or GLOBAL)
         // =================================================================
-        /// Optional ILocalTPContext for LOCAL tensor parallelism.
-        /// When set, collective operations use TPAllreduceStage with the local
-        /// TP context. LOCAL TP runs on a single MPI rank with multiple devices,
-        /// using high-bandwidth backends like NCCL, RCCL, or PCIeBAR for collectives.
+        /// Polymorphic ITPContext for tensor parallelism collective operations.
+        /// Set to either an ILocalTPContext* (intra-rank multi-device: NCCL/RCCL/PCIeBAR)
+        /// or an IGlobalTPContext* (cross-rank: MPI/UPI).
         ///
-        /// Distinction from GLOBAL TP:
-        /// - GLOBAL TP: Multiple MPI ranks (world_size > 1), MPI collectives
-        /// - LOCAL TP: Single MPI rank (world_size = 1), ILocalTPContext collectives
+        /// Graph builders use this via TPAllreduceStage for all TP modes.
+        /// Code needing LOCAL TP-specific features (BAR registration, device lists)
+        /// should check tp_ctx->isLocal() and static_cast<ILocalTPContext*>.
         ///
-        /// Note: Either mpi_ctx (for GLOBAL TP) OR local_tp_ctx (for LOCAL TP) should
-        /// be active, not both. If both are set, LOCAL TP takes precedence for collectives.
-        ILocalTPContext *local_tp_ctx = nullptr;
+        /// In a nested PP+TP topology like:
+        ///   PipelineParallel(LocalTP(cuda:0..3), GlobalTP(cpu:0, cpu:1))
+        /// each PP stage's GraphConfig has its own tp_ctx for that stage's TP domain.
+        ITPContext *tp_ctx = nullptr;
 
-        /// Device index within the LOCAL TP context (0 to degree-1).
+        /// Device index within the TP context (0 to degree-1).
+        /// For LOCAL TP: which device within the local TP group.
+        /// For GLOBAL TP: which MPI rank within the TP domain.
         /// Each device runs a separate graph instance with sharded weights.
-        int local_tp_device_idx = 0;
+        int tp_device_idx = 0;
 
         // =================================================================
         // Unified Pipeline Parallel Configuration (Phase 2)

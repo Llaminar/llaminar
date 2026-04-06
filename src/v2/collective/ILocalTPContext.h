@@ -52,9 +52,9 @@ namespace llaminar2
 
         /**
          * @brief LOCAL TP is always intra-rank
-         * @return Always true for LOCAL TP contexts
+         * @return Always TPScope::LOCAL for LOCAL TP contexts
          */
-        bool isLocal() const override { return true; }
+        TPScope scope() const override { return TPScope::LOCAL; }
 
         // =====================================================================
         // Configuration

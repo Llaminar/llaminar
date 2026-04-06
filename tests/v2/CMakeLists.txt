@@ -3680,6 +3680,21 @@ add_v2_test(V2_Unit_WeightManagerInputParallelSlicing
     MPI_PROCS 1
 )
 
+# Test: WeightManager FusedQKV Sharding + Tied Embeddings
+# Regression tests for two critical TP bugs:
+# 1. FusedQKV: getShardedWeight() must slice 3 sub-blocks independently, not contiguously
+# 2. Tied Embeddings: output.weight falls back to column-parallel token_embd.weight
+add_executable(v2_test_weight_manager_fusedqkv_tied_embeddings unit/loaders/Test__WeightManager_FusedQKV_TiedEmbeddings.cpp)
+target_include_directories(v2_test_weight_manager_fusedqkv_tied_embeddings PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}  # For tests/v2/mocks/ includes
+)
+target_link_libraries(v2_test_weight_manager_fusedqkv_tied_embeddings llaminar2_core GTest::gtest_main)
+add_v2_test(V2_Unit_WeightManagerFusedQKVTiedEmbeddings
+    COMMAND $<TARGET_FILE:v2_test_weight_manager_fusedqkv_tied_embeddings>
+    LABELS "V2;Unit;TensorParallelism;WeightSharding;FusedQKV;TiedEmbeddings;GatedDeltaNet;Qwen35"
+    MPI_PROCS 1
+)
+
 # Test: WeightManager Device-Aware Features
 # Tests features folded from WeightPreloader: getWeightForDevice, preloadForDevices,
 # cloneTensorForDevice, packGemmWeights, uploadNonGemmWeights, preloadStats,
@@ -4465,6 +4480,56 @@ if(ZLIB_FOUND)
         MPI_PROCS 1
     )
 
+    # ---- Local Tensor Parallelism (HOST, NCCL, RCCL, PCIeBAR) ----
+    add_executable(v2_integration_parity_qwen35_local_tp
+        integration/parity/qwen35/Test__Qwen35_LocalTP_Parity.cpp
+        ${WORKSPACE_ROOT_PARITY}/external/cnpy/cnpy.cpp
+    )
+    target_link_libraries(v2_integration_parity_qwen35_local_tp
+        llaminar2_core v2_test_utils GTest::gtest ZLIB::ZLIB
+    )
+    target_include_directories(v2_integration_parity_qwen35_local_tp PRIVATE
+        ${WORKSPACE_ROOT_PARITY}/external/cnpy
+        ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    if(HAVE_CUDA AND HAVE_ROCM)
+        add_custom_command(TARGET v2_integration_parity_qwen35_local_tp POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E echo "Setting CAP_SYS_ADMIN on v2_integration_parity_qwen35_local_tp for PCIe BAR P2P"
+            COMMAND sudo setcap cap_sys_admin+ep $<TARGET_FILE:v2_integration_parity_qwen35_local_tp> || true
+        )
+    endif()
+    add_v2_test(V2_Integration_Parity_Qwen35_LocalTP
+        COMMAND $<TARGET_FILE:v2_integration_parity_qwen35_local_tp>
+        LABELS "V2;Integration;Parity;Qwen35;GatedDeltaNet;CUDA;ROCm;NCCL;RCCL;PCIeBAR;LOCAL;TensorParallel;PyTorch;GoldenReference;MultiDevice"
+        MPI_PROCS 1
+        RESOURCE_LOCK "PCIeBAR_P2P"
+    )
+
+    # ---- Local Pipeline Parallelism (HOST, NCCL, RCCL, PCIeBAR) ----
+    add_executable(v2_integration_parity_qwen35_local_pp
+        integration/parity/qwen35/Test__Qwen35_LocalPP_Parity.cpp
+        ${WORKSPACE_ROOT_PARITY}/external/cnpy/cnpy.cpp
+    )
+    target_link_libraries(v2_integration_parity_qwen35_local_pp
+        llaminar2_core v2_test_utils GTest::gtest ZLIB::ZLIB
+    )
+    target_include_directories(v2_integration_parity_qwen35_local_pp PRIVATE
+        ${WORKSPACE_ROOT_PARITY}/external/cnpy
+        ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    if(HAVE_CUDA AND HAVE_ROCM)
+        add_custom_command(TARGET v2_integration_parity_qwen35_local_pp POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E echo "Setting CAP_SYS_ADMIN on v2_integration_parity_qwen35_local_pp for PCIe BAR P2P"
+            COMMAND sudo setcap cap_sys_admin+ep $<TARGET_FILE:v2_integration_parity_qwen35_local_pp> || true
+        )
+    endif()
+    add_v2_test(V2_Integration_Parity_Qwen35_LocalPP
+        COMMAND $<TARGET_FILE:v2_integration_parity_qwen35_local_pp>
+        LABELS "V2;Integration;Parity;Qwen35;GatedDeltaNet;CPU;CUDA;ROCm;NCCL;RCCL;PCIeBAR;HOST;LOCAL;PipelineParallel;PyTorch;GoldenReference;MultiDevice"
+        MPI_PROCS 1
+        RESOURCE_LOCK "PCIeBAR_P2P"
+    )
+
     # =========================================================================
     # Test: LocalPP Layer-Partitioned Weights
     # Verifies PP stages only load their assigned layer weights (memory efficiency)
@@ -4520,47 +4585,87 @@ if(ZLIB_FOUND)
     message(STATUS "V2: LocalPP layer-partitioned weights test enabled")
 
     # =========================================================================
-    # Test: Qwen2 GlobalTP Parity (Phase 6 Global TP Unified Interface)
+    # Test: Qwen3.5 NodeLocalTP Parity (Multi-Socket CPU TP)
     #
-    # GlobalTP parity tests using MPI for cross-rank tensor parallelism.
-    # Unlike LocalTP (NCCL/RCCL/PCIeBAR), GlobalTP uses MPI collectives.
+    # NodeLocalTP parity tests for Qwen3.5 GDN+FA hybrid architecture using MPI
+    # for cross-rank tensor parallelism on the same physical node. CPU TP MUST
+    # use NodeLocalTP because DeviceId::cpu() is a singleton — LocalTP cannot
+    # distinguish CPU sockets.
     #
     # REQUIRES: mpirun -np 2 (or more) to run these tests
     #
     # Test configurations:
-    #   - GlobalTP_2xMPI_CPU: 2 MPI ranks, CPU devices, UPI/MPI backend
-    #   - GlobalTP_4xMPI_CPU: 4 MPI ranks, CPU devices, UPI/MPI backend
+    #   - NodeLocalTP_2xMPI_CPU_08B: 2 MPI ranks, CPU, Qwen3.5-0.8B Q4_0
+    #   - NodeLocalTP_2xMPI_CPU_4B:  2 MPI ranks, CPU, Qwen3.5-4B Q8_0
+    # =========================================================================
+    add_executable(v2_integration_parity_qwen35_node_local_tp
+        integration/parity/qwen35/Test__Qwen35_NodeLocalTP_Parity.cpp
+        ${WORKSPACE_ROOT_PARITY}/external/cnpy/cnpy.cpp
+    )
+    # Note: No gtest_main - test provides custom main() with MPI_Init
+    target_link_libraries(v2_integration_parity_qwen35_node_local_tp
+        llaminar2_core
+        v2_test_utils
+        GTest::gtest
+        ZLIB::ZLIB
+    )
+    target_include_directories(v2_integration_parity_qwen35_node_local_tp PRIVATE
+        ${WORKSPACE_ROOT_PARITY}/external/cnpy
+        ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+
+    add_v2_test(V2_Integration_Parity_Qwen35_NodeLocalTP
+        COMMAND $<TARGET_FILE:v2_integration_parity_qwen35_node_local_tp>
+        LABELS "V2;Integration;Parity;Qwen35;GatedDeltaNet;NodeLocalTP;MPI;TensorParallel;UPI;CrossRank;CPU"
+        MPI_PROCS 2
+        TIMEOUT 300
+    )
+
+    message(STATUS "V2: Qwen3.5 NodeLocalTP parity tests enabled (requires mpirun -np 2+)")
+
+    # =========================================================================
+    # Test: Qwen2 NodeLocalTP Parity (Multi-Socket CPU TP)
+    #
+    # NodeLocalTP parity tests using MPI for cross-rank tensor parallelism
+    # on the same physical node. Unlike LocalTP (NCCL/RCCL/PCIeBAR),
+    # NodeLocalTP uses MPI collectives for CPU sockets connected via UPI.
+    #
+    # REQUIRES: mpirun -np 2 (or more) to run these tests
+    #
+    # Test configurations:
+    #   - NodeLocalTP_2xMPI_CPU: 2 MPI ranks, CPU devices, UPI/MPI backend
+    #   - NodeLocalTP_4xMPI_CPU: 4 MPI ranks, CPU devices, UPI/MPI backend
     #
     # Validates:
     #   - GlobalTPContext initialization and collective operations
     #   - Cross-rank allreduce, broadcast, barrier
     #   - Prefill and decode parity with sharded weights
     # =========================================================================
-    add_executable(v2_integration_globaltp_parity
-        integration/parity/qwen2/Test__Qwen2_GlobalTP_Parity.cpp
+    add_executable(v2_integration_node_local_tp_parity
+        integration/parity/qwen2/Test__Qwen2_NodeLocalTP_Parity.cpp
         ${WORKSPACE_ROOT_PARITY}/external/cnpy/cnpy.cpp
     )
     # Note: No gtest_main - test provides custom main() with MPI_Init
-    target_link_libraries(v2_integration_globaltp_parity
+    target_link_libraries(v2_integration_node_local_tp_parity
         llaminar2_core
         v2_test_utils
         GTest::gtest
         ZLIB::ZLIB
     )
-    target_include_directories(v2_integration_globaltp_parity PRIVATE
+    target_include_directories(v2_integration_node_local_tp_parity PRIVATE
         ${WORKSPACE_ROOT_PARITY}/external/cnpy
         ${CMAKE_CURRENT_SOURCE_DIR}  # For tests/v2/utils/ includes
     )
 
-    # GlobalTP tests require 2+ MPI ranks
-    add_v2_test(V2_Integration_Parity_GlobalTP
-        COMMAND $<TARGET_FILE:v2_integration_globaltp_parity>
-        LABELS "V2;Integration;Parity;Qwen2;GlobalTP;MPI;TensorParallel;UPI;CrossRank"
-        MPI_PROCS 2  # Minimum 2 ranks for GlobalTP
+    # NodeLocalTP tests require 2+ MPI ranks
+    add_v2_test(V2_Integration_Parity_NodeLocalTP
+        COMMAND $<TARGET_FILE:v2_integration_node_local_tp_parity>
+        LABELS "V2;Integration;Parity;Qwen2;NodeLocalTP;MPI;TensorParallel;UPI;CrossRank"
+        MPI_PROCS 2  # Minimum 2 ranks for NodeLocalTP
         TIMEOUT 300  # 5 minute timeout for MPI tests
     )
 
-    message(STATUS "V2: GlobalTP parity tests enabled (requires mpirun -np 2+)")
+    message(STATUS "V2: NodeLocalTP parity tests enabled (requires mpirun -np 2+)")
 
 else()
     message(STATUS "V2: Parity tests disabled (ZLIB not found)")

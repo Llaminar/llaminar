@@ -363,12 +363,13 @@ namespace llaminar2
      */
     enum class WeightDimensionType
     {
-        None,      ///< Not sharded (replicated weights)
-        Heads,     ///< Attention heads (Q projection) - uses head_start/head_count
-        KVHeads,   ///< KV attention heads (K/V projections) - uses kv_head_start/kv_head_count
-        FFNHidden, ///< FFN hidden dimension (Gate/Up/Down) - uses d_ff_start/d_ff_count
-        Vocab,     ///< Vocabulary dimension (LM head) - uses vocab_start/vocab_count
-        Bias1D     ///< 1D bias that follows its weight's dimension type
+        None,          ///< Not sharded (replicated weights)
+        Heads,         ///< Attention heads (Q projection) - uses head_start/head_count
+        KVHeads,       ///< KV attention heads (K/V projections) - uses kv_head_start/kv_head_count
+        FFNHidden,     ///< FFN hidden dimension (Gate/Up/Down) - uses d_ff_start/d_ff_count
+        Vocab,         ///< Vocabulary dimension (LM head) - uses vocab_start/vocab_count
+        Bias1D,        ///< 1D bias that follows its weight's dimension type
+        FusedQKVHeads  ///< Fused QKV: 3 equal sub-blocks [Q|K|V] each split by heads
     };
 
     /**

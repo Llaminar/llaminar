@@ -686,6 +686,26 @@ namespace llaminar2
             const std::vector<size_t> &dimensions);
 
         /**
+         * @brief Load a fused QKV weight with per-sub-block head slicing
+         *
+         * Handles weights stored as [Q_all | K_all | V_all] concatenated rows.
+         * Splits each sub-block independently by heads, then reassembles as
+         * [Q_local | K_local | V_local] so downstream code sees the correct
+         * per-head Q/K/V ordering.
+         *
+         * @param name Tensor name (e.g., "blk.0.attn_qkv.weight")
+         * @param device Target device
+         * @param assignment Device's sharding assignment
+         * @param dimensions Tensor dimensions [total_rows, cols]
+         * @return FP32 tensor with correctly ordered local Q/K/V rows
+         */
+        std::shared_ptr<TensorBase> loadFusedQKVColumnParallel(
+            const std::string &name,
+            DeviceId device,
+            const DeviceShardingAssignment &assignment,
+            const std::vector<size_t> &dimensions);
+
+        /**
          * @brief Load a row-parallel weight tensor (unused - Wo uses INPUT_PARALLEL)
          *
          * Slices rows based on head assignment for weights where output is reduced.

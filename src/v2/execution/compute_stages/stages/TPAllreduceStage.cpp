@@ -92,7 +92,7 @@ namespace llaminar2
                                                                 << " tensor_numel=" << params_.tensor->numel());
 
         // Log scope-aware message
-        const char *scope_str = params_.tp_ctx->isGlobal() ? "GLOBAL" : "LOCAL";
+        const char *scope_str = params_.tp_ctx->isLocal() ? "LOCAL" : (params_.tp_ctx->isNodeLocal() ? "NODE_LOCAL" : "GLOBAL");
         LOG_DEBUG("TPAllreduceStage (" << scope_str << "): all-reduce across " << params_.tp_ctx->degree()
                                        << " devices using " << collectiveBackendTypeToString(params_.tp_ctx->backend())
                                        << " stage_name=" << (params_.stage_name.empty() ? "(none)" : params_.stage_name)
@@ -179,7 +179,7 @@ namespace llaminar2
         {
             info.addScalarInt("tp_degree", params_.tp_ctx->degree());
             info.addScalarInt("backend", static_cast<int>(params_.tp_ctx->backend()));
-            info.addScalarInt("is_global", params_.tp_ctx->isGlobal() ? 1 : 0);
+            info.addScalarInt("tp_scope", static_cast<int>(params_.tp_ctx->scope()));
         }
 
         return info;

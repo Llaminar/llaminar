@@ -323,6 +323,8 @@ Both tools are located at `/usr/local/cuda/bin/` and require `sudo` for hardware
 
 Llaminar auto-bootstraps MPI via `mpirun` when launched directly. Profiling tools like `ncu` and `nsys` will attach to the **mpirun wrapper process** instead of the actual `llaminar2` GPU process unless you disable this.
 
+> **⚠️ WARNING**: `--no-mpi-bootstrap` is **ONLY for debugging and profiling** (ncu, nsys, perf, GDB). **NEVER** use it for benchmarks, real inference, or performance measurements. MPI bootstrapping configures critical thread pinning, socket binding, and NUMA-aware placement (`OMP_PLACES`, `OMP_PROC_BIND`, `OMPI_MCA` settings). Without it, threads may migrate across NUMA nodes causing severe performance degradation and misleading results.
+
 **Always pass `--no-mpi-bootstrap`** when profiling `llaminar2` directly:
 
 ```bash
@@ -509,6 +511,8 @@ Without this, `perf stat -a` (system-wide mode) will fail with permission errors
 ### CRITICAL: Use `--no-mpi-bootstrap` and System-Wide Mode
 
 Llaminar auto-bootstraps MPI via `mpirun` when launched directly. `perf` will attach to the **mpirun wrapper** instead of the actual compute process. Additionally, per-process mode (`perf stat ./binary`) only tracks the main thread — OpenMP worker threads are invisible.
+
+> **⚠️ WARNING**: `--no-mpi-bootstrap` disables thread pinning and NUMA-aware placement. Use it **only** for `perf` profiling and direct debugging — never for benchmarks or production inference. The wrapper script below manually sets `OMP_*` variables to partially compensate, but this does not replicate full MPI bootstrap behavior.
 
 **Solution**: Use `--no-mpi-bootstrap` + system-wide mode (`-a --cpu <cores>`) + `taskset` to pin:
 

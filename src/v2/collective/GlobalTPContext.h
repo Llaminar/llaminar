@@ -99,7 +99,7 @@ namespace llaminar2
 
         int degree() const override;
         int myIndex() const override;
-        bool isLocal() const override { return false; } // GLOBAL TP is never local
+        // scope() is provided by IGlobalTPContext (returns TPScope::GLOBAL)
         CollectiveBackendType backend() const override { return backend_type_; }
         bool allreduce(TensorBase *tensor) override;
         bool allreduce(TensorBase *tensor, const std::string &stage_name, size_t count = 0) override;

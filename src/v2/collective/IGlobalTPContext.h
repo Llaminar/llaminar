@@ -54,10 +54,10 @@ namespace llaminar2
         // =========================================================================
 
         /**
-         * @brief GLOBAL TP is always cross-rank
-         * @return Always false for GLOBAL TP contexts
+         * @brief GLOBAL TP is always cross-node
+         * @return Always TPScope::GLOBAL for GLOBAL TP contexts
          */
-        bool isLocal() const override { return false; }
+        TPScope scope() const override { return TPScope::GLOBAL; }
 
         // =========================================================================
         // Global-Specific Configuration

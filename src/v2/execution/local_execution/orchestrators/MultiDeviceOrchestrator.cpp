@@ -631,9 +631,9 @@ namespace llaminar2
                                                  runner_config.use_mapped_memory = config_.use_mapped_memory;
                                                  runner_config.use_bar_backed_hidden = config_.use_bar_backed_hidden;
 
-                                                 // Set LOCAL TP parameters
-                                                 runner_config.local_tp_ctx = tp_ctx_.get();
-                                                 runner_config.local_tp_device_index = device_idx;
+                                                 // Set TP parameters (LOCAL TP context here)
+                                                 runner_config.tp_ctx = tp_ctx_.get();
+                                                 runner_config.tp_device_index = device_idx;
 
                                                  // Pass PP stage config for nested TP-in-PP
                                                  if (config_.nested_pp_stage_config.has_value())

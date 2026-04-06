@@ -839,19 +839,17 @@ namespace llaminar2::test::parity::qwen2
             // but MDO creates per-stage ModelContexts internally via createForPPStage(),
             // so top-level strategy is actually irrelevant for PP.
             // GlobalTP shards weights across MPI ranks
-            if (cfg().is_local_tp())
+            if (cfg().is_local_tp() || cfg().is_cross_rank_tp())
                 return WeightDistributionStrategy::SHARDED;
             else if (cfg().is_local_pp())
                 return WeightDistributionStrategy::LAYER_PARTITIONED;
-            else if (cfg().is_global_tp())
-                return WeightDistributionStrategy::SHARDED;
             else
                 return WeightDistributionStrategy::REPLICATED;
         }
 
         void configureModel(std::shared_ptr<ModelContext> model_ctx) override
         {
-            if (cfg().is_local_tp() || cfg().is_global_tp())
+            if (cfg().is_local_tp() || cfg().is_cross_rank_tp())
             {
                 Qwen2SchemaFactory schema_factory;
                 model_ctx->weightManager()->setWeightShardingConfig(
@@ -885,8 +883,8 @@ namespace llaminar2::test::parity::qwen2
 
                 mpi_ctx_ = std::make_shared<MPIContext>(rank, world_size, MPI_COMM_WORLD);
             }
-            // MPI setup for GLOBAL TP (requires multiple ranks)
-            else if (cfg().is_global_tp())
+            // MPI setup for cross-rank TP (NodeLocal or Global, requires multiple ranks)
+            else if (cfg().is_cross_rank_tp())
             {
                 int rank = 0, world_size = 1;
                 MPI_Comm_rank(MPI_COMM_WORLD, &rank);
@@ -894,7 +892,7 @@ namespace llaminar2::test::parity::qwen2
 
                 if (world_size < cfg().mpi_ranks)
                 {
-                    GTEST_SKIP() << "GLOBAL TP test requires " << cfg().mpi_ranks
+                    GTEST_SKIP() << "Cross-rank TP test requires " << cfg().mpi_ranks
                                  << " MPI ranks (got " << world_size << ")";
                 }
 
@@ -944,8 +942,8 @@ namespace llaminar2::test::parity::qwen2
          */
         bool setupPipeline()
         {
-            // GlobalTP still uses the old path (requires multi-rank MPI wiring)
-            if (cfg().is_global_tp())
+            // Cross-rank TP (NodeLocal/Global) uses the MPI-based path
+            if (cfg().is_cross_rank_tp())
                 return setupGlobalTPPipeline();
 
             // Single device also uses old path (no tree needed)
@@ -1157,39 +1155,24 @@ namespace llaminar2::test::parity::qwen2
          */
         bool setupGlobalTPPipeline()
         {
-            DeviceManager::instance().initialize(-1);
-
-            // For GlobalTP, weights are sharded across MPI ranks
-            model_ctx_ = ModelContext::create(
-                config_.model_path,
-                mpi_ctx_,
-                nullptr,
-                nullptr,
-                WeightDistributionStrategy::SHARDED);
-
-            if (!model_ctx_)
-            {
-                LOG_ERROR("[Parity] Failed to load model");
+            // Production GlobalTP uses:
+            //   1. SHARDED weight loading (getWeightStrategy() already returns SHARDED)
+            //   2. createInferenceRunner() with mpi_ctx_ → applyProportionalGlobalTPAssignment()
+            //   3. AllreduceStage → MPI_Allreduce directly (no CollectiveContext needed)
+            //
+            // ParityTestBase::setupPipeline() does exactly this when mpi_ctx_ is set
+            // and getWeightStrategy() returns SHARDED, so delegate to it.
+            if (!ParityTestBase::setupPipeline())
                 return false;
-            }
 
-            configureModel(model_ctx_);
-
-            // Get MPI info
-            int rank = mpi_ctx_->rank();
+            // Also create GlobalTPContext for infrastructure tests
+            // (allreduce, broadcast, barrier verification).
+            // Production doesn't use GlobalTPContext — stages call MPI directly.
             int world_size = mpi_ctx_->world_size();
-
-            LOG_INFO("[Parity] GlobalTP setup: rank " << rank << "/" << world_size);
-
-            // Build world_ranks vector (all ranks participate)
             std::vector<int> world_ranks;
             for (int r = 0; r < world_size; ++r)
-            {
                 world_ranks.push_back(r);
-            }
 
-            // Create GlobalTPContext using MPI_COMM_WORLD
-            // Domain ID 0, all ranks participate
             global_tp_ctx_ = GlobalTPContext::createForTest(
                 MPI_COMM_WORLD,
                 0, // domain_id
@@ -1201,18 +1184,9 @@ namespace llaminar2::test::parity::qwen2
                 return false;
             }
 
-            LOG_INFO("[Parity] GlobalTPContext created: degree=" << global_tp_ctx_->degree()
-                                                                 << ", myIndex=" << global_tp_ctx_->myIndex());
-
-            // For GlobalTP parity test, we need to use the graph execution path
-            // similar to LocalTP, but with GlobalTPContext for collectives
-            // TODO: Implement GlobalTP graph runner when ready
-            // For now, GlobalTP parity tests will use a simplified approach
-            // where we verify the GlobalTPContext operations work correctly
-
-            // Placeholder: Use single-device execution on each rank for now
-            // The parity comparison happens per-rank
-            return ParityTestBase::setupPipeline();
+            LOG_INFO("[Parity] GlobalTP setup complete: degree=" << global_tp_ctx_->degree()
+                                                                  << ", myIndex=" << global_tp_ctx_->myIndex());
+            return true;
         }
 
     protected:

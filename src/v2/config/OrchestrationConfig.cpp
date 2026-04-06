@@ -33,6 +33,8 @@ namespace llaminar2
             return "auto";
         case TPScope::LOCAL:
             return "local";
+        case TPScope::NODE_LOCAL:
+            return "node_local";
         case TPScope::GLOBAL:
             return "global";
         case TPScope::HYBRID:
@@ -130,6 +132,8 @@ namespace llaminar2
             return TPScope::AUTO;
         if (lower == "local")
             return TPScope::LOCAL;
+        if (lower == "node_local" || lower == "nodelocal")
+            return TPScope::NODE_LOCAL;
         if (lower == "global")
             return TPScope::GLOBAL;
         if (lower == "hybrid")

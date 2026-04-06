@@ -50,6 +50,7 @@
 #include "../../../config/PipelineConfig.h"            // For unified PP+TP configuration (Phase 6)
 #include "../../../collective/ILocalPPContext.h"       // For unique_ptr<ILocalPPContext> in maps
 #include "../../../collective/ILocalTPContext.h"       // For unique_ptr<ILocalTPContext> in maps
+#include "../../../collective/IGlobalTPContext.h"      // For shared_ptr<IGlobalTPContext> ownership
 #include <memory>
 #include <optional>
 #include <unordered_map>
@@ -705,6 +706,21 @@ namespace llaminar2
         void setTurboQuantContext(std::shared_ptr<TurboQuantContext> ctx)
         {
             turboquant_ctx_ = std::move(ctx);
+        }
+
+        /**
+         * @brief Set GlobalTPContext for cross-MPI-rank tensor parallelism
+         *
+         * The orchestrator takes shared ownership to keep the context alive
+         * for the entire inference session. The context is passed through
+         * GraphConfig to graph builders, enabling TPAllreduceStage usage
+         * for global TP (same polymorphic path as local TP via ITPContext).
+         *
+         * @param ctx Shared pointer to GlobalTPContext
+         */
+        void setGlobalTPContext(std::shared_ptr<IGlobalTPContext> ctx)
+        {
+            global_tp_ctx_ = std::move(ctx);
         }
 
         // =========================================================================
@@ -1959,6 +1975,9 @@ namespace llaminar2
 
         /// TurboQuant context for TQ4 KV cache (owns rotation matrix lifetime)
         std::shared_ptr<TurboQuantContext> turboquant_ctx_;
+
+        /// Global TP context for cross-MPI-rank tensor parallelism (owns communicator lifetime)
+        std::shared_ptr<IGlobalTPContext> global_tp_ctx_;
 
         // =========================================================================
         // Pipeline Parallelism Configuration (Legacy - Single Stage)

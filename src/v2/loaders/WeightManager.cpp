@@ -427,6 +427,89 @@ namespace llaminar2
         return sliced;
     }
 
+    namespace
+    {
+        /**
+         * @brief Create a typed tensor from raw bytes (generic for all tensor types)
+         *
+         * Handles FP32, FP16, BF16, and all quantized tensor types.
+         * Raw bytes are interpreted according to the tensor type's native storage format.
+         */
+        std::unique_ptr<TensorBase> createTensorFromRawData(
+            TensorType type,
+            const std::vector<size_t> &shape,
+            std::vector<uint8_t> raw_data)
+        {
+            switch (type)
+            {
+            case TensorType::FP32:
+            {
+                auto tensor = std::make_unique<FP32Tensor>(shape);
+                std::memcpy(tensor->mutable_data(), raw_data.data(), raw_data.size());
+                return tensor;
+            }
+            case TensorType::Q4_0:
+                return std::make_unique<Q4_0Tensor>(shape, raw_data);
+            case TensorType::Q8_0:
+                return std::make_unique<Q8_0Tensor>(shape, raw_data);
+            case TensorType::Q8_1:
+                return std::make_unique<Q8_1Tensor>(shape, raw_data);
+            case TensorType::Q4_1:
+                return std::make_unique<Q4_1Tensor>(shape, raw_data);
+            case TensorType::Q5_0:
+                return std::make_unique<Q5_0Tensor>(shape, raw_data);
+            case TensorType::Q5_1:
+                return std::make_unique<Q5_1Tensor>(shape, raw_data);
+            case TensorType::Q6_K:
+                return std::make_unique<Q6_KTensor>(shape, raw_data);
+            case TensorType::Q2_K:
+                return std::make_unique<Q2_KTensor>(shape, raw_data);
+            case TensorType::Q5_K:
+                return std::make_unique<Q5_KTensor>(shape, raw_data);
+            case TensorType::Q3_K:
+                return std::make_unique<Q3_KTensor>(shape, raw_data);
+            case TensorType::Q4_K:
+                return std::make_unique<Q4_KTensor>(shape, raw_data);
+            case TensorType::Q8_K:
+                return std::make_unique<Q8_KTensor>(shape, raw_data);
+            case TensorType::IQ4_NL:
+                return std::make_unique<IQ4_NLTensor>(shape, raw_data);
+            case TensorType::IQ4_XS:
+                return std::make_unique<IQ4_XSTensor>(shape, raw_data);
+            case TensorType::IQ2_XXS:
+                return std::make_unique<IQ2_XXSTensor>(shape, raw_data);
+            case TensorType::IQ2_XS:
+                return std::make_unique<IQ2_XSTensor>(shape, raw_data);
+            case TensorType::IQ3_XXS:
+                return std::make_unique<IQ3_XXSTensor>(shape, raw_data);
+            case TensorType::IQ2_S:
+                return std::make_unique<IQ2_STensor>(shape, raw_data);
+            case TensorType::IQ3_S:
+                return std::make_unique<IQ3_STensor>(shape, raw_data);
+            case TensorType::IQ1_S:
+                return std::make_unique<IQ1_STensor>(shape, raw_data);
+            case TensorType::IQ1_M:
+                return std::make_unique<IQ1_MTensor>(shape, raw_data);
+            case TensorType::BF16:
+            {
+                std::vector<uint16_t> bf16_data(raw_data.size() / 2);
+                std::memcpy(bf16_data.data(), raw_data.data(), raw_data.size());
+                return std::make_unique<BF16Tensor>(shape, bf16_data);
+            }
+            case TensorType::FP16:
+            {
+                std::vector<uint16_t> fp16_data(raw_data.size() / 2);
+                std::memcpy(fp16_data.data(), raw_data.data(), raw_data.size());
+                return std::make_unique<FP16Tensor>(shape, fp16_data);
+            }
+            default:
+                LOG_ERROR("[WeightManager] Unsupported tensor type for createTensorFromRawData: "
+                          << static_cast<int>(type));
+                return nullptr;
+            }
+        }
+    } // anonymous namespace
+
     std::shared_ptr<TensorBase> WeightManager::getShardedWeight(const std::string &name, DeviceId device)
     {
         // For SHARDED strategy:
@@ -542,7 +625,21 @@ namespace llaminar2
             int world_size = mpi_ctx_->world_size();
 
             // Get tensor dimensions
+            // For tied embeddings: if output.weight is missing, substitute token_embd.weight
+            std::string load_name = name;
             auto dims_opt = loader_.getTensorShape(name);
+            if ((!dims_opt || dims_opt->empty()) && name == "output.weight")
+            {
+                auto embd_dims = loader_.getTensorShape("token_embd.weight");
+                if (embd_dims && embd_dims->size() == 2)
+                {
+                    LOG_INFO("[WeightManager] Rank " << rank
+                                                     << " output.weight not in GGUF — using tied embedding "
+                                                     << "token_embd.weight as column-parallel LM head");
+                    dims_opt = embd_dims;
+                    load_name = "token_embd.weight";
+                }
+            }
             if (!dims_opt || dims_opt->empty())
             {
                 // Tensor doesn't exist in GGUF — return nullptr so the caller
@@ -624,6 +721,94 @@ namespace llaminar2
             size_t total_rows = dims[0]; // N = output features
             size_t cols = dims[1];       // K = input features
 
+            // FusedQKVHeads requires special 3-sub-block slicing: the weight is
+            // [Q_all | K_all | V_all] vertically. A simple contiguous row slice
+            // crosses sub-block boundaries. Instead, split each sub-block independently.
+            if (has_sharding_config_ &&
+                sharding_config_.getDimensionType(name) == WeightDimensionType::FusedQKVHeads)
+            {
+                constexpr size_t N_SUB_BLOCKS = 3;
+                if (total_rows % N_SUB_BLOCKS != 0)
+                {
+                    LOG_ERROR("[WeightManager] FusedQKVHeads: total_rows " << total_rows
+                                                                           << " not divisible by 3 for: " << name);
+                    return nullptr;
+                }
+                const size_t sub_block_rows = total_rows / N_SUB_BLOCKS;
+
+                // Equal split per rank within each sub-block
+                size_t rows_per_rank = sub_block_rows / world_size;
+                size_t local_start = rows_per_rank * rank;
+                size_t local_count = (rank == world_size - 1)
+                                         ? (sub_block_rows - local_start)
+                                         : rows_per_rank;
+
+                // Load 3 row slices from GGUF in native quantized format
+                std::shared_ptr<TensorBase> slices[N_SUB_BLOCKS];
+                for (size_t s = 0; s < N_SUB_BLOCKS; s++)
+                {
+                    const size_t abs_row_start = s * sub_block_rows + local_start;
+                    const size_t abs_row_end = abs_row_start + local_count;
+
+                    slices[s] = loader_.loadTensorRowSlice(
+                        load_name, abs_row_start, abs_row_end, device, WeightPrecision::NATIVE);
+
+                    if (!slices[s])
+                    {
+                        LOG_ERROR("[WeightManager] Rank " << rank
+                                                          << " failed to load fused-QKV sub-block " << s
+                                                          << " rows [" << abs_row_start << ", " << abs_row_end << ")"
+                                                          << " for: " << name);
+                        return nullptr;
+                    }
+                }
+
+                // Concatenate raw bytes from the 3 sub-block slices into a single native tensor
+                const size_t bytes_per_slice = slices[0]->size_bytes();
+                const size_t total_bytes = bytes_per_slice * N_SUB_BLOCKS;
+                std::vector<uint8_t> combined_raw(total_bytes);
+
+                for (size_t s = 0; s < N_SUB_BLOCKS; s++)
+                {
+                    const void *src = slices[s]->raw_data();
+                    if (!src)
+                    {
+                        LOG_ERROR("[WeightManager] Null raw_data for fused-QKV sub-block " << s << ": " << name);
+                        return nullptr;
+                    }
+                    std::memcpy(combined_raw.data() + s * bytes_per_slice, src, bytes_per_slice);
+                }
+
+                const size_t out_rows = local_count * N_SUB_BLOCKS;
+                std::vector<size_t> out_shape = {out_rows, cols};
+                TensorType native_type = slices[0]->native_type();
+
+                auto result_tensor = createTensorFromRawData(
+                    native_type, out_shape, std::move(combined_raw));
+
+                if (!result_tensor)
+                {
+                    LOG_ERROR("[WeightManager] Failed to create fused-QKV tensor for: " << name);
+                    return nullptr;
+                }
+
+                auto meta = SliceMetadata::forColumnParallel(
+                    total_rows, cols, rank, world_size,
+                    true /* inner_is_presliced */);
+
+                auto result = std::make_shared<TensorSlice>(
+                    std::shared_ptr<TensorBase>(std::move(result_tensor)), meta);
+
+                LOG_DEBUG("[WeightManager] Rank " << rank
+                                                  << " fused-QKV column-parallel " << name
+                                                  << " [" << total_rows << ", " << cols << "]"
+                                                  << " -> [" << out_rows << ", " << cols << "]"
+                                                  << " (3 sub-blocks x rows [" << local_start << ", "
+                                                  << (local_start + local_count) << ") each)");
+
+                return result;
+            }
+
             // Calculate this rank's ROW range (splitting output dimension)
             // Use proportional slicing if TensorParallelConfig is set, otherwise equal split
             size_t row_start, row_count;
@@ -643,7 +828,7 @@ namespace llaminar2
 
             // Load only this rank's row slice (preserves quantized format)
             auto slice_tensor = loader_.loadTensorRowSlice(
-                name, row_start, row_end, device, WeightPrecision::NATIVE);
+                load_name, row_start, row_end, device, WeightPrecision::NATIVE);
 
             if (!slice_tensor)
             {
@@ -1163,6 +1348,7 @@ namespace llaminar2
             LOG_WARN("[WeightManager] calculateProportionalColumnSlice called for non-column weight: " << name);
             return {0, total_rows};
         }
+        return {0, total_rows}; // unreachable but silences -Wreturn-type
     }
 
     std::pair<size_t, size_t> WeightManager::calculateProportionalRowSlice(
@@ -1221,6 +1407,7 @@ namespace llaminar2
             LOG_WARN("[WeightManager] calculateProportionalRowSlice called for non-row weight: " << name);
             return {0, total_cols};
         }
+        return {0, total_cols}; // unreachable but silences -Wreturn-type
     }
 
     // =========================================================================
@@ -1266,88 +1453,6 @@ namespace llaminar2
     // Device-aware weight access (for multi-device LOCAL TP)
     // =========================================================================
 
-    namespace
-    {
-        /**
-         * @brief Create a quantized tensor from raw bytes (generic for all tensor types)
-         *
-         * This mirrors TensorFactory::createQuantized() but doesn't require an instance.
-         * Handles all 27+ quantized tensor types in a single function.
-         *
-         * @param type Tensor type enum
-         * @param shape Tensor dimensions
-         * @param raw_data Raw bytes (moved into tensor)
-         * @return New tensor of the specified type, or nullptr on failure
-         */
-        std::unique_ptr<TensorBase> createQuantizedTensorFromRawData(
-            TensorType type,
-            const std::vector<size_t> &shape,
-            std::vector<uint8_t> raw_data)
-        {
-            switch (type)
-            {
-            case TensorType::Q4_0:
-                return std::make_unique<Q4_0Tensor>(shape, raw_data);
-            case TensorType::Q8_0:
-                return std::make_unique<Q8_0Tensor>(shape, raw_data);
-            case TensorType::Q8_1:
-                return std::make_unique<Q8_1Tensor>(shape, raw_data);
-            case TensorType::Q4_1:
-                return std::make_unique<Q4_1Tensor>(shape, raw_data);
-            case TensorType::Q5_0:
-                return std::make_unique<Q5_0Tensor>(shape, raw_data);
-            case TensorType::Q5_1:
-                return std::make_unique<Q5_1Tensor>(shape, raw_data);
-            case TensorType::Q6_K:
-                return std::make_unique<Q6_KTensor>(shape, raw_data);
-            case TensorType::Q2_K:
-                return std::make_unique<Q2_KTensor>(shape, raw_data);
-            case TensorType::Q5_K:
-                return std::make_unique<Q5_KTensor>(shape, raw_data);
-            case TensorType::Q3_K:
-                return std::make_unique<Q3_KTensor>(shape, raw_data);
-            case TensorType::Q4_K:
-                return std::make_unique<Q4_KTensor>(shape, raw_data);
-            case TensorType::Q8_K:
-                return std::make_unique<Q8_KTensor>(shape, raw_data);
-            case TensorType::IQ4_NL:
-                return std::make_unique<IQ4_NLTensor>(shape, raw_data);
-            case TensorType::IQ4_XS:
-                return std::make_unique<IQ4_XSTensor>(shape, raw_data);
-            case TensorType::IQ2_XXS:
-                return std::make_unique<IQ2_XXSTensor>(shape, raw_data);
-            case TensorType::IQ2_XS:
-                return std::make_unique<IQ2_XSTensor>(shape, raw_data);
-            case TensorType::IQ3_XXS:
-                return std::make_unique<IQ3_XXSTensor>(shape, raw_data);
-            case TensorType::IQ2_S:
-                return std::make_unique<IQ2_STensor>(shape, raw_data);
-            case TensorType::IQ3_S:
-                return std::make_unique<IQ3_STensor>(shape, raw_data);
-            case TensorType::IQ1_S:
-                return std::make_unique<IQ1_STensor>(shape, raw_data);
-            case TensorType::IQ1_M:
-                return std::make_unique<IQ1_MTensor>(shape, raw_data);
-            case TensorType::BF16:
-            {
-                std::vector<uint16_t> bf16_data(raw_data.size() / 2);
-                std::memcpy(bf16_data.data(), raw_data.data(), raw_data.size());
-                return std::make_unique<BF16Tensor>(shape, bf16_data);
-            }
-            case TensorType::FP16:
-            {
-                std::vector<uint16_t> fp16_data(raw_data.size() / 2);
-                std::memcpy(fp16_data.data(), raw_data.data(), raw_data.size());
-                return std::make_unique<FP16Tensor>(shape, fp16_data);
-            }
-            default:
-                LOG_ERROR("[WeightManager] Unsupported tensor type for cloning: "
-                          << static_cast<int>(type));
-                return nullptr;
-            }
-        }
-    } // anonymous namespace
-
     std::shared_ptr<TensorBase> WeightManager::cloneTensorForDevice(
         const std::string &name,
         const std::shared_ptr<TensorBase> &original,
@@ -1372,28 +1477,15 @@ namespace llaminar2
         std::vector<uint8_t> raw_copy(byte_count);
         std::memcpy(raw_copy.data(), raw_ptr, byte_count);
 
-        std::shared_ptr<TensorBase> clone;
-
-        // Special case for FP32 (most common for norms/biases) - uses different constructor
-        if (tensor_type == TensorType::FP32)
+        auto unique_clone = createTensorFromRawData(
+            tensor_type, original->shape(), std::move(raw_copy));
+        if (!unique_clone)
         {
-            auto fp32_clone = std::make_shared<FP32Tensor>(original->shape());
-            std::memcpy(fp32_clone->mutable_data(), raw_ptr, byte_count);
-            clone = std::move(fp32_clone);
+            LOG_WARN("[WeightManager] Failed to create clone for tensor type "
+                     << static_cast<int>(tensor_type));
+            return nullptr;
         }
-        else
-        {
-            // All quantized types: use the common (shape, raw_data) constructor pattern
-            auto unique_clone = createQuantizedTensorFromRawData(
-                tensor_type, original->shape(), std::move(raw_copy));
-            if (!unique_clone)
-            {
-                LOG_WARN("[WeightManager] Failed to create clone for tensor type "
-                         << static_cast<int>(tensor_type));
-                return nullptr;
-            }
-            clone = std::shared_ptr<TensorBase>(std::move(unique_clone));
-        }
+        std::shared_ptr<TensorBase> clone = std::shared_ptr<TensorBase>(std::move(unique_clone));
 
         clone->setDebugName(name + "@" + target_device.to_string());
 
@@ -2548,7 +2640,8 @@ namespace llaminar2
             LOG_ERROR("[WeightManager] Cannot compute slice boundaries for dimension type "
                       << static_cast<int>(dim_type) << " on weight: " << name);
             return false;
-        }
+        } // switch
+        return false; // unreachable but silences -Wreturn-type
     }
 
     std::shared_ptr<TensorBase> WeightManager::loadColumnParallel1DBias(
@@ -2609,6 +2702,15 @@ namespace llaminar2
     {
         size_t total_rows = dimensions[0];
         size_t cols = dimensions[1];
+
+        // Fused QKV weights need special handling: 3 concatenated sub-blocks
+        // each split independently by heads
+        if (has_sharding_config_ &&
+            sharding_config_.getDimensionType(name) == WeightDimensionType::FusedQKVHeads)
+        {
+            return loadFusedQKVColumnParallel(name, device, assignment, dimensions);
+        }
+
         size_t row_start = 0;
         size_t row_count = 0;
 
@@ -2642,6 +2744,113 @@ namespace llaminar2
                                             << " [" << total_rows << ", " << cols << "]"
                                             << " -> rows [" << row_start << ", " << (row_start + row_count) << ")"
                                             << " = " << row_count << " rows");
+
+        return result;
+    }
+
+    std::shared_ptr<TensorBase> WeightManager::loadFusedQKVColumnParallel(
+        const std::string &name,
+        DeviceId device,
+        const DeviceShardingAssignment &assignment,
+        const std::vector<size_t> &dimensions)
+    {
+        const size_t total_rows = dimensions[0];
+        const size_t cols = dimensions[1];
+
+        // Fused QKV weights have 3 equal concatenated sub-blocks: [Q_all | K_all | V_all]
+        // A simple contiguous row slice would cross Q/K/V boundaries.
+        // Instead, load each sub-block's local rows directly from GGUF in native
+        // quantized format, then concatenate the raw bytes into a single tensor.
+        constexpr size_t N_SUB_BLOCKS = 3;
+
+        if (total_rows % N_SUB_BLOCKS != 0)
+        {
+            LOG_ERROR("[WeightManager] FusedQKVHeads: total_rows " << total_rows
+                                                                   << " not divisible by " << N_SUB_BLOCKS
+                                                                   << " for weight: " << name);
+            return nullptr;
+        }
+
+        const size_t sub_block_rows = total_rows / N_SUB_BLOCKS;
+
+        // Compute per-sub-block head slice
+        const int total_heads = tp_config_->totalHeads();
+        if (total_heads <= 0)
+        {
+            LOG_ERROR("[WeightManager] Invalid total_heads for FusedQKVHeads: " << name);
+            return nullptr;
+        }
+
+        const size_t head_dim = sub_block_rows / static_cast<size_t>(total_heads);
+        const size_t local_start = assignment.head_start * head_dim;
+        const size_t local_count = assignment.head_count * head_dim;
+
+        // Load 3 row slices from GGUF in native quantized format (no dequantization)
+        std::shared_ptr<TensorBase> slices[N_SUB_BLOCKS];
+        for (size_t s = 0; s < N_SUB_BLOCKS; s++)
+        {
+            const size_t abs_row_start = s * sub_block_rows + local_start;
+            const size_t abs_row_end = abs_row_start + local_count;
+
+            slices[s] = loader_.loadTensorRowSlice(
+                name, abs_row_start, abs_row_end, device, WeightPrecision::NATIVE);
+
+            if (!slices[s])
+            {
+                LOG_ERROR("[WeightManager] Failed to load fused-QKV sub-block " << s
+                                                                                << " rows [" << abs_row_start << ", " << abs_row_end << ")"
+                                                                                << " for: " << name);
+                return nullptr;
+            }
+        }
+
+        // Concatenate raw bytes from the 3 slices into a single native tensor
+        const size_t bytes_per_slice = slices[0]->size_bytes();
+        const size_t total_bytes = bytes_per_slice * N_SUB_BLOCKS;
+        std::vector<uint8_t> combined_raw(total_bytes);
+
+        for (size_t s = 0; s < N_SUB_BLOCKS; s++)
+        {
+            const void *src = slices[s]->raw_data();
+            if (!src)
+            {
+                LOG_ERROR("[WeightManager] Null raw_data for fused-QKV sub-block " << s << ": " << name);
+                return nullptr;
+            }
+            std::memcpy(combined_raw.data() + s * bytes_per_slice, src, bytes_per_slice);
+        }
+
+        // Create a new tensor from the concatenated raw bytes
+        const size_t out_rows = local_count * N_SUB_BLOCKS;
+        std::vector<size_t> out_shape = {out_rows, cols};
+        TensorType native_type = slices[0]->native_type();
+
+        auto result_tensor = createTensorFromRawData(
+            native_type, out_shape, std::move(combined_raw));
+
+        if (!result_tensor)
+        {
+            LOG_ERROR("[WeightManager] Failed to create fused-QKV tensor of type "
+                      << static_cast<int>(native_type) << " for: " << name);
+            return nullptr;
+        }
+
+        // Wrap in TensorSlice with column-parallel metadata so downstream TP
+        // logic (allreduce detection, etc.) works correctly
+        auto meta = SliceMetadata::forColumnParallel(
+            total_rows, cols, assignment.local_rank, tp_config_->worldSize(),
+            true /* inner_is_presliced */);
+
+        auto result = std::make_shared<TensorSlice>(
+            std::shared_ptr<TensorBase>(std::move(result_tensor)), meta);
+
+        LOG_DEBUG("[WeightManager] Device " << device.to_string()
+                                            << " (rank " << assignment.local_rank << "/" << tp_config_->worldSize() << ")"
+                                            << " fused-QKV column-parallel " << name
+                                            << " [" << total_rows << ", " << cols << "]"
+                                            << " -> [" << out_rows << ", " << cols << "]"
+                                            << " (" << static_cast<int>(native_type) << " native)"
+                                            << " (3 sub-blocks x rows [" << local_start << ", " << (local_start + local_count) << ") each)");
 
         return result;
     }
@@ -2744,7 +2953,9 @@ namespace llaminar2
         const DeviceShardingAssignment &assignment,
         int layer_idx)
     {
-        // Check per-device cache first
+        // Check per-device cache first.
+        // WeightManager is rank-local, so device string uniquely identifies the
+        // cache entry. LOCAL TP devices have distinct DeviceIds (e.g. cuda:0, cuda:1).
         std::string cache_key = device.to_string() + ":" + name;
         auto it = per_device_cache_.find(cache_key);
         if (it != per_device_cache_.end())

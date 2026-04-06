@@ -20,6 +20,8 @@
 #include "../../loaders/WeightManager.h"
 #include "../../loaders/WeightStreamerFactory.h"
 #include "../../collective/ILocalTPContext.h"
+#include "../../collective/ITPContext.h"
+#include "../../collective/GlobalTPContext.h"
 #include "../local_execution/orchestrators/IMultiDeviceOrchestrator.h"
 #include "../local_execution/orchestrators/MultiDeviceOrchestrator.h"
 #include "../../config/PipelineConfig.h"
@@ -196,6 +198,7 @@ namespace llaminar2
         const int tp_degree = local_tp_ctx->degree();
         const auto &weights = local_tp_ctx->weights();
 
+
         if (device_idx < 0 || device_idx >= tp_degree)
         {
             LOG_ERROR("[InferenceRunner] Invalid local_tp_device_index: " << device_idx
@@ -247,9 +250,9 @@ namespace llaminar2
         graph_config.vocab_local = vocab_local;
         graph_config.lm_head_column_parallel = true;
 
-        // Store LOCAL TP context for collective operations
-        graph_config.local_tp_ctx = local_tp_ctx;
-        graph_config.local_tp_device_idx = device_idx;
+        // Store TP context for collective operations (polymorphic via ITPContext)
+        graph_config.tp_ctx = local_tp_ctx;
+        graph_config.tp_device_idx = device_idx;
 
         const auto &devices = local_tp_ctx->devices();
         LOG_INFO("[InferenceRunner] LOCAL TP enabled: degree=" << tp_degree
@@ -404,7 +407,7 @@ namespace llaminar2
     static bool applyTPAssignment(
         GraphConfig &graph_config,
         ILocalTPContext *local_tp_ctx,
-        int local_tp_device_idx,
+        int tp_device_idx,
         const TensorParallelConfig *tp_config,
         const std::shared_ptr<MPIContext> &mpi_ctx,
         bool weights_sharded)
@@ -415,7 +418,7 @@ namespace llaminar2
 
         if (local_tp_ctx && local_tp_ctx->degree() > 1 && (weights_sharded || local_tp_weights_configured))
         {
-            return applyLocalTPAssignment(graph_config, local_tp_ctx, local_tp_device_idx);
+            return applyLocalTPAssignment(graph_config, local_tp_ctx, tp_device_idx);
         }
 
         if (tp_config && weights_sharded)
@@ -656,8 +659,8 @@ namespace llaminar2
         // =====================================================================
         // Three modes are supported (in order of precedence):
         //
-        // A) LOCAL TP (config.local_tp_ctx): Single MPI rank, multiple devices
-        //    - Configured via ILocalTPContext in InferenceRunnerConfig
+        // A) LOCAL TP (config.tp_ctx->isLocal()): Single MPI rank, multiple devices
+        //    - Configured via ITPContext (polymorphic) in InferenceRunnerConfig
         //    - Collectives via NCCL/RCCL/PCIeBAR (high bandwidth, no host staging)
         //    - Uses ILocalTPContext for proportional head/FFN/vocab assignment
         //
@@ -675,17 +678,60 @@ namespace llaminar2
         const bool weights_sharded = weight_mgr &&
                                      (weight_mgr->strategy() == WeightDistributionStrategy::SHARDED);
 
-        // Check if LOCAL TP context is provided (takes precedence over GLOBAL TP)
-        ILocalTPContext *local_tp_ctx = config.local_tp_ctx;
-        const int local_tp_device_idx = config.local_tp_device_index;
+        // Check if TP context is provided (LOCAL or GLOBAL)
+        ITPContext *tp_ctx = config.tp_ctx;
+        ILocalTPContext *local_tp_ctx = tp_ctx && tp_ctx->isLocal()
+            ? static_cast<ILocalTPContext *>(tp_ctx) : nullptr;
+        const int tp_device_idx = config.tp_device_index;
 
         // Check if TensorParallelConfig is available from WeightManager (for GLOBAL TP)
         const TensorParallelConfig *tp_config = weight_mgr ? weight_mgr->tensorParallelConfig() : nullptr;
 
-        if (!applyTPAssignment(graph_config, local_tp_ctx, local_tp_device_idx,
+        if (!applyTPAssignment(graph_config, local_tp_ctx, tp_device_idx,
                                tp_config, mpi_ctx, weights_sharded))
         {
             return nullptr;
+        }
+
+        // =====================================================================
+        // Create GlobalTPContext for cross-MPI-rank tensor parallelism
+        // =====================================================================
+        // When GLOBAL TP is active (multi-rank with sharded weights, no LOCAL TP),
+        // create a GlobalTPContext so graph builders use TPAllreduceStage
+        // (same polymorphic ITPContext path as LOCAL TP) instead of the legacy
+        // direct-MPI AllreduceStage path.
+        // =====================================================================
+        // =====================================================================
+        // Create GlobalTPContext for cross-MPI-rank tensor parallelism
+        // =====================================================================
+        // When GLOBAL TP is active (multi-rank with sharded weights, no LOCAL TP),
+        // create a GlobalTPContext so graph builders use TPAllreduceStage
+        // (same polymorphic ITPContext path as LOCAL TP) instead of the legacy
+        // direct-MPI AllreduceStage path.
+        // =====================================================================
+        std::shared_ptr<IGlobalTPContext> global_tp_ctx;
+        if (mpi_ctx && mpi_ctx->world_size() > 1 && weights_sharded && !local_tp_ctx)
+        {
+            auto ctx = GlobalTPContext::createWithSplit(
+                MPI_COMM_WORLD,
+                /*domain_id=*/0,
+                /*color=*/0,       // All ranks in same domain
+                /*key=*/mpi_ctx->rank());
+            if (ctx && ctx->isValid())
+            {
+                graph_config.tp_ctx = ctx.get();
+                graph_config.tp_device_idx = ctx->myIndex();
+                global_tp_ctx = std::move(ctx);
+                LOG_INFO("[InferenceRunner] GlobalTPContext created: degree="
+                         << global_tp_ctx->degree()
+                         << " myIndex=" << global_tp_ctx->myIndex()
+                         << " backend=" << static_cast<int>(global_tp_ctx->backend()));
+            }
+            else
+            {
+                LOG_WARN("[InferenceRunner] Failed to create GlobalTPContext - "
+                         "falling back to direct MPI AllreduceStage path");
+            }
         }
 
         LOG_DEBUG("[InferenceRunner] GraphConfig: "
@@ -713,6 +759,12 @@ namespace llaminar2
         if (turboquant_ctx)
         {
             orchestrator->setTurboQuantContext(std::move(turboquant_ctx));
+        }
+
+        // Transfer GlobalTPContext ownership to orchestrator
+        if (global_tp_ctx)
+        {
+            orchestrator->setGlobalTPContext(std::move(global_tp_ctx));
         }
 
         // Initialize graph cache
@@ -773,7 +825,7 @@ namespace llaminar2
         // =====================================================================
         const auto &env = debugEnv();
         const bool local_tp_collectives_enabled =
-            (config.local_tp_ctx != nullptr && config.local_tp_ctx->degree() > 1);
+            (local_tp_ctx != nullptr && local_tp_ctx->degree() > 1);
 
         {
             ScopedWeightLoadDetailTimer timer("graph.build.collective_setup");
@@ -1739,13 +1791,15 @@ namespace llaminar2
             graph_config.pp_layer_offset = config.pp_stage_config->first_layer;
         }
 
-        // Check for LOCAL TP configuration
-        ILocalTPContext *local_tp_ctx = config.local_tp_ctx;
-        const int local_tp_device_idx = config.local_tp_device_index;
+        // Check for TP configuration (LOCAL or GLOBAL)
+        ITPContext *tp_ctx = config.tp_ctx;
+        ILocalTPContext *local_tp_ctx = tp_ctx && tp_ctx->isLocal()
+            ? static_cast<ILocalTPContext *>(tp_ctx) : nullptr;
+        const int tp_device_idx = config.tp_device_index;
 
         if (local_tp_ctx && local_tp_ctx->degree() > 1)
         {
-            if (!applyLocalTPAssignment(graph_config, local_tp_ctx, local_tp_device_idx))
+            if (!applyLocalTPAssignment(graph_config, local_tp_ctx, tp_device_idx))
             {
                 return nullptr;
             }

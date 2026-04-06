@@ -1,130 +1,126 @@
 /**
- * @file Test__Qwen2_GlobalTP_Parity.cpp
- * @brief GlobalTP parity tests using MPI (multi-rank execution)
+ * @file Test__Qwen35_NodeLocalTP_Parity.cpp
+ * @brief Node-Local TP parity tests for Qwen3.5 using MPI (multi-rank, same node)
  *
- * These tests validate Global Tensor Parallelism (GlobalTP) infrastructure
- * where tensor parallelism spans multiple MPI ranks. Unlike LocalTP which
- * uses NCCL/RCCL/PCIeBAR for intra-node GPU communication, GlobalTP uses
- * MPI collectives for cross-rank communication.
+ * These tests validate Node-Local Tensor Parallelism (NodeLocalTP) infrastructure
+ * for Qwen3.5 GDN+FA hybrid architecture, where tensor parallelism spans
+ * multiple MPI ranks on the same physical node. Unlike LocalTP which uses
+ * NCCL/RCCL/PCIeBAR for intra-process multi-device communication, NodeLocalTP
+ * uses MPI collectives for cross-rank communication — the correct approach
+ * for multi-socket CPU TP.
+ *
+ * NOTE: CPU TP MUST use NodeLocalTP (MPI), not LocalTP, because
+ * DeviceId::cpu() is a singleton — LocalTP cannot distinguish multiple
+ * CPU sockets. Each MPI rank gets its own process with distinct
+ * WeightManager, so weight sharding works correctly.
  *
  * REQUIREMENTS:
  *   - Must run via ctest for proper MPI rank settings and initialization
  *   - Each rank participates in GlobalTPContext collective operations
  *
  * Test configurations:
- *   - GlobalTP_2xMPI_CPU: 2 MPI ranks, each using CPU (UPI backend)
- *   - GlobalTP_2xMPI_CUDA: 2 MPI ranks, each with 1 CUDA device (future)
+ *   - NodeLocalTP_2xMPI_CPU_08B: 2 MPI ranks, CPU, Qwen3.5-0.8B Q4_0
+ *   - NodeLocalTP_2xMPI_CPU_4B:  2 MPI ranks, CPU, Qwen3.5-4B Q8_0
  *
  * @author David Sanftenberg
- * @date February 2026
+ * @date 2026
  */
 
 #include <gtest/gtest.h>
 #include <mpi.h>
-#include "Qwen2ParityTestBase.h"
+#include "Qwen35ParityTestBase.h"
 #include "collective/BackendRouter.h"
 
 using namespace llaminar2;
 using namespace llaminar2::test::parity;
-using namespace llaminar2::test::parity::qwen2;
+using namespace llaminar2::test::parity::qwen35;
+
+// =============================================================================
+// Common Excluded Stages for GlobalTP
+// =============================================================================
+
+// For NodeLocalTP, intermediate activations are SHARDED across ranks. Only the final
+// LM_HEAD output (after allgather) can be compared against PyTorch reference.
+// ROW_PARALLEL outputs (ATTENTION_OUTPUT, FFN_DOWN) contain partial sums before allreduce.
+// COLUMN_PARALLEL outputs are local slices that need to be gathered.
+// Includes GDN-specific stages that are also sharded under TP.
+static const std::vector<std::string> kNodeLocalTPExcludedStages = {
+    // Standard attention projections (FA layers) — column-parallel slices
+    "Q_PROJECTION", "K_PROJECTION", "V_PROJECTION",
+    "Q_ROPE", "K_ROPE",
+    "ATTENTION_CONTEXT",
+    // FFN sharded intermediates
+    "FFN_GATE", "FFN_UP", "FFN_SWIGLU",
+    // Row-parallel: outputs are partial sums before allreduce
+    "ATTENTION_OUTPUT", "FFN_DOWN",
+    // These also have sharded intermediate states
+    "ATTN_RESIDUAL", "FFN_RESIDUAL",
+    // GDN-specific: QKV projection covers gdn_proj (same snapshot key)
+    "QKV_PROJECTION",
+    // GDN-specific: recurrence output is per-local-heads under TP
+    "GDN_DELTA_RULE_OUTPUT",
+    // GDN-specific: gated norm output is per-local-heads under TP
+    "GDN_NORM_GATE_OUTPUT",
+};
 
 // =============================================================================
 // Test Configuration Definitions
 // =============================================================================
 
-// Common excluded stages for GlobalTP (sharded outputs can't be compared directly)
-// For GlobalTP, intermediate activations are SHARDED across ranks. Only the final
-// LM_HEAD output (after allgather) can be compared against PyTorch reference.
-// ROW_PARALLEL outputs (ATTENTION_OUTPUT, FFN_DOWN) contain partial sums before allreduce.
-// COLUMN_PARALLEL outputs are local slices that need to be gathered.
-static const std::vector<std::string> kGlobalTPExcludedStages = {
-    // Column-parallel: outputs are sharded slices
-    "Q_PROJECTION", "K_PROJECTION", "V_PROJECTION",
-    "Q_ROPE", "K_ROPE",
-    "ATTENTION_CONTEXT",
-    "FFN_GATE", "FFN_UP", "FFN_SWIGLU",
-    // Row-parallel: outputs are partial sums before allreduce
-    "ATTENTION_OUTPUT", "FFN_DOWN",
-    // These also have sharded intermediate states
-    "ATTN_RESIDUAL", "FFN_RESIDUAL"};
-
-/**
- * @brief GlobalTP test configurations
- *
- * Each config specifies:
- * - devices: What device type each rank uses (typically CPU for GlobalTP)
- * - parallelism: Parallelism::GlobalTP
- * - collective: Collective::MPI
- * - mpi_ranks: Required number of MPI ranks
- */
-static const std::vector<TestConfig> kGlobalTPTestConfigs = {
+static const std::vector<TestConfig> kNodeLocalTPTestConfigs = {
     // =========================================================================
-    // GlobalTP with CPU (UPI interconnect)
+    // Qwen3.5-0.8B (Q4_0) — 2-way Node-Local TP with CPU (UPI interconnect)
     // =========================================================================
-    // 2-way Global TP with CPU devices using MPI collectives
-    // This is the primary use case for GlobalTP: CPU-only tensor parallelism
-    // across multiple sockets connected via UPI (~50 GB/s)
     {
-        .name = "GlobalTP_2xMPI_CPU",
+        .name = "NodeLocalTP_2xMPI_CPU_08B",
         .devices = {ParityDeviceType::CPU, ParityDeviceType::CPU},
-        .parallelism = Parallelism::GlobalTP,
+        .parallelism = Parallelism::NodeLocalTP,
         .collective = Collective::MPI,
         .thresholds = {
-            .cosine_threshold = 0.99f,
-            .decode_cosine_threshold = 0.98f,
-            .early_layers_count = 4,
-            .min_early_layers_passed = 3,
-            .kl_threshold = 0.20f,
-            .excluded_stages = kGlobalTPExcludedStages,
+            .cosine_threshold = 0.90f,
+            .decode_cosine_threshold = 0.90f,
+            .early_layers_count = 6,
+            .min_early_layers_passed = 4,
+            .kl_threshold = 0.35f,
+            .excluded_stages = kNodeLocalTPExcludedStages,
         },
         .mpi_ranks = 2,
+        .model_path = "models/Qwen3.5-0.8B-Q4_0.gguf",
+        .snapshot_dir = "pytorch_qwen35_snapshots",
+        .activation_precision = ActivationPrecision::FP32,
+        .kv_cache_precision = KVCachePrecision::FP16,
     },
 
-    // 4-way Global TP with CPU (for larger models, if 4 ranks available)
+    // =========================================================================
+    // Qwen3.5-4B (Q8_0) — 2-way Node-Local TP with CPU (UPI interconnect)
+    // =========================================================================
     {
-        .name = "GlobalTP_4xMPI_CPU",
-        .devices = {ParityDeviceType::CPU, ParityDeviceType::CPU,
-                    ParityDeviceType::CPU, ParityDeviceType::CPU},
-        .parallelism = Parallelism::GlobalTP,
+        .name = "NodeLocalTP_2xMPI_CPU_4B",
+        .devices = {ParityDeviceType::CPU, ParityDeviceType::CPU},
+        .parallelism = Parallelism::NodeLocalTP,
         .collective = Collective::MPI,
         .thresholds = {
-            .cosine_threshold = 0.98f,
-            .decode_cosine_threshold = 0.95f,
-            .early_layers_count = 4,
-            .min_early_layers_passed = 3,
-            .kl_threshold = 0.30f,  // More variance with 4-way sharding
-            .excluded_stages = kGlobalTPExcludedStages,
+            .cosine_threshold = 0.90f,
+            .decode_cosine_threshold = 0.90f,
+            .early_layers_count = 6,
+            .min_early_layers_passed = 4,
+            .kl_threshold = 0.35f,
+            .excluded_stages = kNodeLocalTPExcludedStages,
         },
-        .mpi_ranks = 4,
+        .mpi_ranks = 2,
+        .model_path = "models/Qwen3.5-4B-Q8_0.gguf",
+        .snapshot_dir = "pytorch_qwen35_4b_snapshots",
+        .activation_precision = ActivationPrecision::FP32,
+        .kv_cache_precision = KVCachePrecision::FP16,
     },
-
-    // =========================================================================
-    // Future: GlobalTP with CUDA (one GPU per rank)
-    // =========================================================================
-    // This would use CUDA devices on each rank with MPI for cross-rank
-    // communication. Uncomment when GPU-per-rank GlobalTP is implemented.
-    // {
-    //     .name = "GlobalTP_2xMPI_CUDA",
-    //     .devices = {ParityDeviceType::CUDA, ParityDeviceType::CUDA},
-    //     .parallelism = Parallelism::GlobalTP,
-    //     .collective = Collective::MPI,
-    //     .thresholds = { ... },
-    //     .mpi_ranks = 2,
-    // },
 };
 
 // =============================================================================
 // Parameterized Test Fixture
 // =============================================================================
 
-/**
- * @brief Parameterized test fixture for GlobalTP parity tests
- *
- * Inherits from ConfigDrivenParityTest which handles all setup/teardown
- * including MPI context creation and GlobalTPContext initialization.
- */
-class Qwen2GlobalTPParityTest : public ConfigDrivenParityTest<Qwen2GlobalTPParityTest>,
-                                 public ::testing::WithParamInterface<TestConfig>
+class Qwen35NodeLocalTPParityTest : public Qwen35ConfigDrivenParityTest<Qwen35NodeLocalTPParityTest>,
+                                     public ::testing::WithParamInterface<TestConfig>
 {
 public:
     const TestConfig &getTestConfig() const { return GetParam(); }
@@ -135,14 +131,14 @@ public:
 // =============================================================================
 
 /**
- * @brief Verify GlobalTP infrastructure initialization
+ * @brief Verify NodeLocalTP infrastructure initialization
  *
  * Tests that:
  * - GlobalTPContext is created successfully on each rank
  * - MPI communicator is valid
  * - Rank indices are correct
  */
-TEST_P(Qwen2GlobalTPParityTest, GlobalTPContextInitialization)
+TEST_P(Qwen35NodeLocalTPParityTest, NodeLocalTPContextInitialization)
 {
     ASSERT_TRUE(setupPipeline()) << "Pipeline setup failed";
 
@@ -151,18 +147,18 @@ TEST_P(Qwen2GlobalTPParityTest, GlobalTPContextInitialization)
     EXPECT_GE(mpi_ctx_->world_size(), cfg().mpi_ranks)
         << "World size should be at least " << cfg().mpi_ranks;
 
-    // Verify GlobalTPContext
+    // Verify GlobalTPContext (implements cross-rank TP communication)
     ASSERT_NE(global_tp_ctx_, nullptr) << "GlobalTPContext should be created";
     EXPECT_EQ(global_tp_ctx_->degree(), mpi_ctx_->world_size())
-        << "GlobalTP degree should match world size";
+        << "TP degree should match world size";
     EXPECT_EQ(global_tp_ctx_->myIndex(), mpi_ctx_->rank())
-        << "GlobalTP index should match MPI rank";
+        << "TP index should match MPI rank";
     EXPECT_FALSE(global_tp_ctx_->isLocal())
         << "GlobalTPContext should not be local";
     EXPECT_EQ(global_tp_ctx_->backend(), CollectiveBackendType::UPI)
-        << "GlobalTPContext should use UPI backend";
+        << "NodeLocalTP should use UPI backend";
 
-    LOG_INFO("[GlobalTP] Rank " << mpi_ctx_->rank() << " verified GlobalTPContext");
+    LOG_INFO("[NodeLocalTP Qwen3.5] Rank " << mpi_ctx_->rank() << " verified TPContext");
 }
 
 /**
@@ -171,7 +167,7 @@ TEST_P(Qwen2GlobalTPParityTest, GlobalTPContextInitialization)
  * Each rank creates a tensor with its rank value, performs allreduce,
  * and verifies the result is the sum of all ranks.
  */
-TEST_P(Qwen2GlobalTPParityTest, GlobalTPAllreduce)
+TEST_P(Qwen35NodeLocalTPParityTest, NodeLocalTPAllreduce)
 {
     ASSERT_TRUE(setupPipeline()) << "Pipeline setup failed";
     ASSERT_NE(global_tp_ctx_, nullptr) << "GlobalTPContext required";
@@ -184,7 +180,7 @@ TEST_P(Qwen2GlobalTPParityTest, GlobalTPAllreduce)
     float rank_value = static_cast<float>(mpi_ctx_->rank() + 1);
     std::fill(tensor->mutable_data(), tensor->mutable_data() + tensor->numel(), rank_value);
 
-    LOG_INFO("[GlobalTP] Rank " << mpi_ctx_->rank() << " input value: " << rank_value);
+    LOG_INFO("[NodeLocalTP Qwen3.5] Rank " << mpi_ctx_->rank() << " input value: " << rank_value);
 
     // Perform allreduce
     ASSERT_TRUE(global_tp_ctx_->allreduce(tensor.get())) << "Allreduce failed";
@@ -197,7 +193,7 @@ TEST_P(Qwen2GlobalTPParityTest, GlobalTPAllreduce)
     EXPECT_NEAR(actual_value, expected_sum, 1e-5f)
         << "Allreduce result should be sum of ranks";
 
-    LOG_INFO("[GlobalTP] Rank " << mpi_ctx_->rank() << " allreduce result: "
+    LOG_INFO("[NodeLocalTP Qwen3.5] Rank " << mpi_ctx_->rank() << " allreduce result: "
              << actual_value << " (expected: " << expected_sum << ")");
 }
 
@@ -206,7 +202,7 @@ TEST_P(Qwen2GlobalTPParityTest, GlobalTPAllreduce)
  *
  * Rank 0 broadcasts a tensor with specific values, all ranks verify receipt.
  */
-TEST_P(Qwen2GlobalTPParityTest, GlobalTPBroadcast)
+TEST_P(Qwen35NodeLocalTPParityTest, NodeLocalTPBroadcast)
 {
     ASSERT_TRUE(setupPipeline()) << "Pipeline setup failed";
     ASSERT_NE(global_tp_ctx_, nullptr) << "GlobalTPContext required";
@@ -221,7 +217,7 @@ TEST_P(Qwen2GlobalTPParityTest, GlobalTPBroadcast)
     {
         // Source rank initializes tensor
         std::fill(tensor->mutable_data(), tensor->mutable_data() + tensor->numel(), broadcast_value);
-        LOG_INFO("[GlobalTP] Rank " << mpi_ctx_->rank() << " broadcasting value: " << broadcast_value);
+        LOG_INFO("[NodeLocalTP Qwen3.5] Rank " << mpi_ctx_->rank() << " broadcasting value: " << broadcast_value);
     }
     else
     {
@@ -237,50 +233,51 @@ TEST_P(Qwen2GlobalTPParityTest, GlobalTPBroadcast)
     EXPECT_NEAR(received_value, broadcast_value, 1e-5f)
         << "Broadcast should deliver source rank's value";
 
-    LOG_INFO("[GlobalTP] Rank " << mpi_ctx_->rank() << " received: " << received_value);
+    LOG_INFO("[NodeLocalTP Qwen3.5] Rank " << mpi_ctx_->rank() << " received: " << received_value);
 }
 
 /**
  * @brief Test GlobalTP barrier synchronization
  */
-TEST_P(Qwen2GlobalTPParityTest, GlobalTPBarrier)
+TEST_P(Qwen35NodeLocalTPParityTest, NodeLocalTPBarrier)
 {
     ASSERT_TRUE(setupPipeline()) << "Pipeline setup failed";
     ASSERT_NE(global_tp_ctx_, nullptr) << "GlobalTPContext required";
 
-    LOG_INFO("[GlobalTP] Rank " << mpi_ctx_->rank() << " entering barrier");
+    LOG_INFO("[NodeLocalTP Qwen3.5] Rank " << mpi_ctx_->rank() << " entering barrier");
 
     // This should not deadlock or hang
     global_tp_ctx_->barrier();
 
-    LOG_INFO("[GlobalTP] Rank " << mpi_ctx_->rank() << " exited barrier");
+    LOG_INFO("[NodeLocalTP Qwen3.5] Rank " << mpi_ctx_->rank() << " exited barrier");
 }
 
 /**
- * @brief Prefill parity test with GlobalTP
+ * @brief Prefill parity test with NodeLocalTP
  *
- * Runs prefill inference with GlobalTP sharding and compares against
- * PyTorch reference. Each rank contributes to the sharded computation.
+ * Runs prefill inference with cross-rank TP sharding and compares against
+ * PyTorch reference. Each rank runs its own sharded pipeline; post-allreduce
+ * activations (norms, residuals) and post-allgather logits match PyTorch.
+ * Sharded intermediate stages are excluded from comparison.
  */
-TEST_P(Qwen2GlobalTPParityTest, PrefillParity)
+TEST_P(Qwen35NodeLocalTPParityTest, PrefillParity)
 {
-    // TODO: GlobalTP execution path not yet implemented.
-    // The setupGlobalTPPipeline() creates GlobalTPContext but then falls back
-    // to single-device execution. When two MPI ranks both create InferenceRunners
-    // with NCCL initialization, they get into a race condition deadlock.
-    // Skip until proper GlobalTP graph execution is implemented.
-    GTEST_SKIP() << "GlobalTP full inference not yet implemented - "
-                 << "setupGlobalTPPipeline() falls back to single-device execution "
-                 << "which causes collective initialization deadlock";
+    ASSERT_TRUE(setupPipeline()) << "Pipeline setup failed";
+    auto summary = runPrefillParity();
+    assertParity(summary);
 }
 
 /**
- * @brief Decode parity test with GlobalTP
+ * @brief Decode parity test with NodeLocalTP
+ *
+ * Runs prefill + incremental decode and compares logit distributions
+ * against PyTorch reference at each decode step.
  */
-TEST_P(Qwen2GlobalTPParityTest, DecodeParity)
+TEST_P(Qwen35NodeLocalTPParityTest, DecodeParity)
 {
-    // TODO: GlobalTP execution path not yet implemented (see PrefillParity comment)
-    GTEST_SKIP() << "GlobalTP full inference not yet implemented";
+    ASSERT_TRUE(setupPipeline()) << "Pipeline setup failed";
+    auto summary = runDecodeParity();
+    assertDecodeParity(summary);
 }
 
 // =============================================================================
@@ -288,9 +285,9 @@ TEST_P(Qwen2GlobalTPParityTest, DecodeParity)
 // =============================================================================
 
 INSTANTIATE_TEST_SUITE_P(
-    Qwen2GlobalTP,
-    Qwen2GlobalTPParityTest,
-    ::testing::ValuesIn(kGlobalTPTestConfigs),
+    Qwen35NodeLocalTP,
+    Qwen35NodeLocalTPParityTest,
+    ::testing::ValuesIn(kNodeLocalTPTestConfigs),
     [](const ::testing::TestParamInfo<TestConfig> &info)
     {
         return info.param.name;
@@ -300,12 +297,6 @@ INSTANTIATE_TEST_SUITE_P(
 // Custom Main with MPI Initialization
 // =============================================================================
 
-/**
- * @brief Custom main() with MPI initialization for GlobalTP tests
- *
- * GlobalTP tests REQUIRE MPI to be initialized with multiple ranks.
- * Run with: mpirun -np 2 ./v2_integration_globaltp_parity
- */
 int main(int argc, char **argv)
 {
     // Initialize MPI with thread support
@@ -319,7 +310,7 @@ int main(int argc, char **argv)
     if (rank == 0)
     {
         std::cout << "╔══════════════════════════════════════════════════════════════════╗\n";
-        std::cout << "║           GLOBAL TP PARITY TEST SUITE                            ║\n";
+        std::cout << "║       QWEN3.5 NODE-LOCAL TP PARITY TEST SUITE                    ║\n";
         std::cout << "╠══════════════════════════════════════════════════════════════════╣\n";
         std::cout << "║  MPI world size: " << world_size << " ranks" << std::string(42 - std::to_string(world_size).length(), ' ') << "║\n";
         std::cout << "║  Thread support: " << (provided >= MPI_THREAD_MULTIPLE ? "MPI_THREAD_MULTIPLE" : "limited") << std::string(26, ' ') << "║\n";

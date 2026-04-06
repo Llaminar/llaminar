@@ -20,6 +20,7 @@
 #include "../../execution/local_execution/graph/GraphBuildUtils.h"
 #include "../../execution/config/RuntimeConfig.h"
 #include "../../collective/ILocalTPContext.h"
+#include "../../collective/ITPContext.h"
 #include "../../collective/ILocalPPContext.h"
 #include "../../collective/ITPContext.h"
 #include "../../collective/BackendRouter.h"
@@ -866,18 +867,18 @@ namespace llaminar2
             {
                 GraphConfig &cfg;
                 DeviceId original_device;
-                ILocalTPContext *original_tp_ctx;
+                ITPContext *original_tp_ctx;
                 ConfigGuard(GraphConfig &c, DeviceId dev, ILocalTPContext *tp)
-                    : cfg(c), original_device(c.default_device), original_tp_ctx(c.local_tp_ctx)
+                    : cfg(c), original_device(c.default_device), original_tp_ctx(c.tp_ctx)
                 {
                     cfg.default_device = dev;
                     if (tp)
-                        cfg.local_tp_ctx = tp;
+                        cfg.tp_ctx = tp;
                 }
                 ~ConfigGuard()
                 {
                     cfg.default_device = original_device;
-                    cfg.local_tp_ctx = original_tp_ctx;
+                    cfg.tp_ctx = original_tp_ctx;
                 }
             } config_guard(config_, stage_device, stage_tp_ctx);
 
@@ -1668,12 +1669,12 @@ namespace llaminar2
 
     bool QwenGraphBase::needsTPAllreduce() const
     {
-        // Check LOCAL TP first (takes precedence)
-        if (config_.local_tp_ctx && config_.local_tp_ctx->degree() > 1)
+        // Unified check: any TP context with degree > 1 (LOCAL or GLOBAL)
+        if (config_.tp_ctx && config_.tp_ctx->degree() > 1)
         {
             return true;
         }
-        // Check GLOBAL TP
+        // Legacy fallback: GLOBAL TP without tp_ctx (direct MPI path)
         if (mpi_ctx_ && mpi_ctx_->world_size() > 1)
         {
             return true;
@@ -1690,42 +1691,36 @@ namespace llaminar2
         const std::string &stage_name,
         std::optional<BufferId> tensor_buffer_id) const
     {
-        // LOCAL TP takes precedence if configured
-        if (config_.local_tp_ctx && config_.local_tp_ctx->degree() > 1)
+        // Unified path: use polymorphic ITPContext for both LOCAL and GLOBAL TP
+        if (config_.tp_ctx && config_.tp_ctx->degree() > 1)
         {
-            LOG_DEBUG("[QwenGraphBase] Creating TPAllreduceStage (LOCAL): degree="
-                      << config_.local_tp_ctx->degree()
-                      << " device_idx=" << config_.local_tp_device_idx
+            LOG_DEBUG("[QwenGraphBase] Creating TPAllreduceStage: degree="
+                      << config_.tp_ctx->degree()
+                      << " device_idx=" << config_.tp_device_idx
                       << " count=" << count
-                      << " backend=" << static_cast<int>(config_.local_tp_ctx->backend())
+                      << " backend=" << static_cast<int>(config_.tp_ctx->backend())
+                      << " local=" << config_.tp_ctx->isLocal()
                       << " stage_name=" << stage_name);
 
             // =========================================================
-            // Register BAR-backed tensor for PCIeBAR allreduce
+            // LOCAL TP only: Register BAR-backed tensor for PCIeBAR allreduce
             // =========================================================
-            // For PCIeBAR backend, row-parallel output tensors need to be
-            // registered with LocalTPContext so executePCIeBarAllreduce()
-            // can find them by stage name. The tensor was allocated as
-            // BAR-backed by DeviceGraphBufferManager if conditions were met.
-            //
-            // This registration is called for EACH device orchestrator,
-            // so each device registers its own tensor for this stage.
-            // =========================================================
-            if (config_.local_tp_ctx->backend() == CollectiveBackendType::PCIE_BAR &&
-                config_.local_tp_device_idx >= 0 &&
-                static_cast<size_t>(config_.local_tp_device_idx) < config_.local_tp_ctx->devices().size())
+            if (config_.tp_ctx->isLocal())
             {
-                const GlobalDeviceAddress &device_addr =
-                    config_.local_tp_ctx->devices()[config_.local_tp_device_idx];
-
-                // Register the tensor with the stage name
-                // registerBARBackedOutput checks if tensor is BAR-backed and handles accordingly
-                config_.local_tp_ctx->registerBARBackedOutput(stage_name, device_addr, buffer);
+                auto *local_ctx = static_cast<ILocalTPContext *>(config_.tp_ctx);
+                if (local_ctx->backend() == CollectiveBackendType::PCIE_BAR &&
+                    config_.tp_device_idx >= 0 &&
+                    static_cast<size_t>(config_.tp_device_idx) < local_ctx->devices().size())
+                {
+                    const GlobalDeviceAddress &device_addr =
+                        local_ctx->devices()[config_.tp_device_idx];
+                    local_ctx->registerBARBackedOutput(stage_name, device_addr, buffer);
+                }
             }
 
             TPAllreduceStage::Params params;
             params.device_id = device;
-            params.tp_ctx = config_.local_tp_ctx; // ILocalTPContext* -> ITPContext* (inheritance)
+            params.tp_ctx = config_.tp_ctx; // ITPContext* — polymorphic for LOCAL and GLOBAL
             params.tensor = buffer;
             params.count = count;
             params.stage_name = stage_name;
@@ -1735,10 +1730,10 @@ namespace llaminar2
             return std::make_unique<TPAllreduceStage>(params);
         }
 
-        // Fall back to GLOBAL TP (MPI-based)
+        // Legacy fallback: GLOBAL TP without tp_ctx wired (direct MPI path)
         if (mpi_ctx_ && mpi_ctx_->world_size() > 1)
         {
-            LOG_DEBUG("[QwenGraphBase] Creating AllreduceStage (MPI): world_size="
+            LOG_DEBUG("[QwenGraphBase] Creating AllreduceStage (legacy MPI): world_size="
                       << mpi_ctx_->world_size()
                       << " rank=" << mpi_ctx_->rank()
                       << " count=" << count);

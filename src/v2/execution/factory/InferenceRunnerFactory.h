@@ -51,7 +51,7 @@
  * // LOCAL TP: via ILocalTPContext
  * auto tp_ctx = createLocalTPContext({DeviceId::cuda(0), DeviceId::rocm(0)}, ...);
  * InferenceRunnerConfig config;
- * config.local_tp_ctx = tp_ctx.get();
+ * config.tp_ctx = tp_ctx.get();
  * auto runner = createInferenceRunner(model_ctx, nullptr, DeviceId::cuda(0), config);
  * @endcode
  */
@@ -76,6 +76,7 @@ namespace llaminar2
 {
     // Forward declarations to avoid pulling in full headers
     class DeviceGraphOrchestrator;
+    class ITPContext;
     class ILocalTPContext;
     class IMultiDeviceOrchestrator;
 
@@ -124,25 +125,25 @@ namespace llaminar2
         std::optional<PlacementPlan> placement_plan;
 
         // =====================================================================
-        // LOCAL Tensor Parallelism (single MPI rank, multiple devices)
+        // Tensor Parallelism (Polymorphic — LOCAL or GLOBAL)
         // =====================================================================
-        // When local_tp_ctx is set, the factory configures LOCAL TP mode:
-        //   - Weight sharding based on local_tp_ctx->devices() and weights()
-        //   - Collectives via local_tp_ctx (NCCL/RCCL/PCIeBAR, not MPI)
-        //   - The 'device' parameter becomes the "primary" device for this runner
+        // When tp_ctx is set, the factory configures TP mode:
+        //   - LOCAL TP (isLocal()=true): Weight sharding via device list + weights
+        //   - GLOBAL TP (isLocal()=false): Weight sharding via MPI rank assignment
+        //   - Collectives via ITPContext polymorphism (TPAllreduceStage)
         //
-        // This is mutually exclusive with GLOBAL TP (mpi_ctx->world_size() > 1).
-        // If both are set, LOCAL TP takes precedence.
+        // In a nested PP+TP topology, each PP stage runner gets its own tp_ctx.
         //
-        // Lifetime: Caller owns the ILocalTPContext and must keep it alive
+        // Lifetime: Caller owns the ITPContext and must keep it alive
         // for the duration of the IInferenceRunner's lifetime.
         // =====================================================================
-        ILocalTPContext *local_tp_ctx = nullptr;
+        ITPContext *tp_ctx = nullptr;
 
-        /// Device index within the LOCAL TP context (0 to degree-1).
+        /// Device index within the TP context (0 to degree-1).
         /// Determines which portion of sharded weights this runner loads.
-        /// Only used when local_tp_ctx is set.
-        int local_tp_device_index = 0;
+        /// For LOCAL TP: index into ILocalTPContext::devices().
+        /// For GLOBAL TP: rank within the global TP domain.
+        int tp_device_index = 0;
 
         /// Allocate hidden state in PCIe BAR region for cross-vendor PP transfers.
         /// When true and device is ROCm, the final hidden state buffer is allocated

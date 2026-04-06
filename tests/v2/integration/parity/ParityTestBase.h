@@ -350,10 +350,11 @@ namespace llaminar2::test::parity
      */
     enum class Parallelism
     {
-        None,     ///< Single device, no parallelism
-        LocalTP,  ///< Local Tensor Parallelism (multi-device, single process)
-        LocalPP,  ///< Local Pipeline Parallelism (multi-device, single process)
-        GlobalTP, ///< Global Tensor Parallelism (multi-rank MPI)
+        None,        ///< Single device, no parallelism
+        LocalTP,     ///< Local Tensor Parallelism (multi-device, single process)
+        LocalPP,     ///< Local Pipeline Parallelism (multi-device, single process)
+        NodeLocalTP, ///< Node-Local Tensor Parallelism (multi-rank MPI, same node)
+        GlobalTP,    ///< Global Tensor Parallelism (multi-rank MPI, cross-node)
     };
 
     /**
@@ -445,6 +446,8 @@ namespace llaminar2::test::parity
             return "LocalTP";
         case Parallelism::LocalPP:
             return "LocalPP";
+        case Parallelism::NodeLocalTP:
+            return "NodeLocalTP";
         case Parallelism::GlobalTP:
             return "GlobalTP";
         }
@@ -570,7 +573,10 @@ namespace llaminar2::test::parity
         ParityDeviceType primary_device() const { return devices.empty() ? ParityDeviceType::CPU : devices[0]; }
         bool is_local_tp() const { return parallelism == Parallelism::LocalTP; }
         bool is_local_pp() const { return parallelism == Parallelism::LocalPP; }
+        bool is_node_local_tp() const { return parallelism == Parallelism::NodeLocalTP; }
         bool is_global_tp() const { return parallelism == Parallelism::GlobalTP; }
+        /// Returns true for any cross-rank TP (NodeLocal or Global)
+        bool is_cross_rank_tp() const { return is_node_local_tp() || is_global_tp(); }
         bool is_single_device() const { return parallelism == Parallelism::None && devices.size() == 1; }
         bool should_skip() const { return !skip_reason.empty(); }
 
@@ -607,21 +613,21 @@ namespace llaminar2::test::parity
         if (cfg.should_skip())
             return cfg.skip_reason;
 
-        // Check MPI initialization for LocalTP/LocalPP/GlobalTP tests
-        if (cfg.is_local_tp() || cfg.is_local_pp() || cfg.is_global_tp())
+        // Check MPI initialization for LocalTP/LocalPP/NodeLocalTP/GlobalTP tests
+        if (cfg.is_local_tp() || cfg.is_local_pp() || cfg.is_cross_rank_tp())
         {
             if (!isMpiInitialized())
                 return "Test requires MPI (run with mpirun)";
         }
 
-        // Check MPI world size for GlobalTP tests
-        if (cfg.is_global_tp())
+        // Check MPI world size for cross-rank TP tests
+        if (cfg.is_cross_rank_tp())
         {
             int world_size = 1;
             MPI_Comm_size(MPI_COMM_WORLD, &world_size);
             if (world_size < cfg.mpi_ranks)
             {
-                return "GlobalTP test requires " + std::to_string(cfg.mpi_ranks) +
+                return "Cross-rank TP test requires " + std::to_string(cfg.mpi_ranks) +
                        " MPI ranks (got " + std::to_string(world_size) + ")";
             }
         }

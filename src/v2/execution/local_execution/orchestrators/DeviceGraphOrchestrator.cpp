@@ -306,16 +306,24 @@ namespace llaminar2
             LOG_INFO("[DeviceGraphOrchestrator] Enabling mapped memory for GPU + snapshot mode (zero-copy host access)");
         }
 
-        // Configure BAR-backed allocation for LOCAL TP with PCIeBAR backend
-        if (config.local_tp_ctx && config.local_tp_ctx->degree() > 1)
+        // Configure TP arena settings and BAR-backed allocation for LOCAL TP
+        if (config.tp_ctx && config.tp_ctx->degree() > 1)
         {
-            arena_config.tp_degree = config.local_tp_ctx->degree();
-            arena_config.collective_backend = config.local_tp_ctx->backend();
-            arena_config.local_tp_ctx = config.local_tp_ctx;
+            arena_config.tp_degree = config.tp_ctx->degree();
+            arena_config.collective_backend = config.tp_ctx->backend();
 
-            if (config.local_tp_ctx->backend() == CollectiveBackendType::PCIE_BAR)
+            // Arena needs ILocalTPContext* specifically for BAR-backed allocation
+            if (config.tp_ctx->isLocal())
             {
-                const auto &devices = config.local_tp_ctx->devices();
+                auto *local_tp = static_cast<ILocalTPContext *>(config.tp_ctx);
+                arena_config.local_tp_ctx = local_tp;
+            }
+
+            if (config.tp_ctx->isLocal() &&
+                config.tp_ctx->backend() == CollectiveBackendType::PCIE_BAR)
+            {
+                auto *local_tp = static_cast<ILocalTPContext *>(config.tp_ctx);
+                const auto &devices = local_tp->devices();
                 for (const auto &device_addr : devices)
                 {
                     DeviceId device_id = device_addr.toLocalDeviceId();
@@ -847,7 +855,7 @@ namespace llaminar2
     bool DeviceGraphOrchestrator::collectivesSupportSegmentedReplay() const
     {
         const auto &graph_cfg = graph_builder_->config();
-        const bool has_local_tp = graph_cfg.local_tp_ctx && graph_cfg.local_tp_ctx->degree() > 1;
+        const bool has_local_tp = graph_cfg.tp_ctx && graph_cfg.tp_ctx->isLocal() && graph_cfg.tp_ctx->degree() > 1;
 
         // For Local TP (multi-GPU, single MPI rank), the per-device
         // DeviceGraphOrchestrator may not have an injected_collective_ctx_
@@ -865,7 +873,7 @@ namespace llaminar2
             return false;
         }
 
-        const auto backend = graph_cfg.local_tp_ctx->backend();
+        const auto backend = graph_cfg.tp_ctx->backend();
         const bool supported =
             (backend == CollectiveBackendType::NCCL ||
              backend == CollectiveBackendType::RCCL);
@@ -1368,12 +1376,14 @@ namespace llaminar2
             }
 
             // Configure BAR-backed allocation for LOCAL TP with PCIeBAR backend
-            if (config.local_tp_ctx &&
-                config.local_tp_ctx->degree() > 1 &&
-                config.local_tp_ctx->backend() == CollectiveBackendType::PCIE_BAR &&
+            if (config.tp_ctx &&
+                config.tp_ctx->isLocal() &&
+                config.tp_ctx->degree() > 1 &&
+                config.tp_ctx->backend() == CollectiveBackendType::PCIE_BAR &&
                 device.is_rocm())
             {
-                auto p2p_engine = config.local_tp_ctx->getDirectP2PEngine();
+                auto *local_tp = static_cast<ILocalTPContext *>(config.tp_ctx);
+                auto p2p_engine = local_tp->getDirectP2PEngine();
                 if (p2p_engine)
                 {
                     owned_tensor_factory_->setDirectP2P(p2p_engine);
@@ -1617,10 +1627,12 @@ namespace llaminar2
         // Sharding is needed when local_n_kv_heads < n_kv_heads, AND tensor parallelism is active.
         // TP can be:
         // - GLOBAL TP: Multiple MPI ranks (mpi_ctx_->world_size() > 1)
-        // - LOCAL TP: Multiple devices within single rank (local_tp_ctx->degree() > 1)
+        // - LOCAL TP: Multiple devices within single rank (tp_ctx->isLocal() && degree() > 1)
+        // - NODE_LOCAL TP: Cross-rank same node (tp_ctx->isNodeLocal())
+        // - GLOBAL TP: Cross-rank (tp_ctx->isGlobal()) or MPI world_size > 1
         bool use_sharded_cache = (config.local_n_kv_heads > 0 && config.local_n_kv_heads < n_kv_heads);
-        bool is_global_tp = mpi_ctx_ && mpi_ctx_->world_size() > 1;
-        bool is_local_tp = config.local_tp_ctx && config.local_tp_ctx->degree() > 1;
+        bool has_tp = config.tp_ctx && config.tp_ctx->degree() > 1;
+        bool is_global_tp = !has_tp && mpi_ctx_ && mpi_ctx_->world_size() > 1;
 
         // =====================================================================
         // KV Cache Creation: Per-stage for PP, single for non-PP
@@ -1681,12 +1693,12 @@ namespace llaminar2
                 kv_config.mpi_ctx = local_mpi_ctx.get();
                 kv_config.turboquant_ctx = config.turboquant_ctx;
 
-                if (use_sharded_cache && (is_global_tp || is_local_tp))
+                if (use_sharded_cache && (has_tp || is_global_tp))
                 {
                     kv_config.local_n_kv_heads = config.local_n_kv_heads;
-                    if (is_local_tp)
+                    if (has_tp)
                     {
-                        kv_config.kv_head_start = config.local_tp_device_idx * config.local_n_kv_heads;
+                        kv_config.kv_head_start = config.tp_device_idx * config.local_n_kv_heads;
                     }
                     else
                     {
@@ -1729,20 +1741,21 @@ namespace llaminar2
             kv_config.mpi_ctx = local_mpi_ctx.get();
             kv_config.turboquant_ctx = config.turboquant_ctx;
 
-            if (use_sharded_cache && (is_global_tp || is_local_tp))
+            if (use_sharded_cache && (has_tp || is_global_tp))
             {
                 kv_config.local_n_kv_heads = config.local_n_kv_heads;
 
                 // Calculate kv_head_start based on TP mode:
-                // - LOCAL TP: Use device index within the LOCAL TP context
-                // - GLOBAL TP: Use MPI rank
-                if (is_local_tp)
+                // - Any TP context: Use tp_device_idx (works for LOCAL, NODE_LOCAL, GLOBAL)
+                // - Legacy GLOBAL TP (no tp_ctx): Use MPI rank
+                if (has_tp)
                 {
-                    kv_config.kv_head_start = config.local_tp_device_idx * config.local_n_kv_heads;
-                    LOG_DEBUG("[DeviceGraphOrchestrator] Creating sharded KV cache (LOCAL TP): "
+                    kv_config.kv_head_start = config.tp_device_idx * config.local_n_kv_heads;
+                    LOG_DEBUG("[DeviceGraphOrchestrator] Creating sharded KV cache (TP scope="
+                              << static_cast<int>(config.tp_ctx->scope()) << "): "
                               << n_kv_heads << " total KV heads, "
-                              << config.local_n_kv_heads << " local KV heads (device_idx="
-                              << config.local_tp_device_idx << ", start=" << kv_config.kv_head_start << ")"
+                              << config.local_n_kv_heads << " local KV heads (tp_idx="
+                              << config.tp_device_idx << ", start=" << kv_config.kv_head_start << ")"
                               << " precision=" << activationPrecisionToString(kv_cache_prec));
                 }
                 else

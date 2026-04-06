@@ -42,7 +42,7 @@ namespace llaminar2::test::parity::qwen3
 
         void configureModel(std::shared_ptr<ModelContext> model_ctx) override
         {
-            if (Base::cfg().is_local_tp() || Base::cfg().is_global_tp())
+            if (Base::cfg().is_local_tp() || Base::cfg().is_cross_rank_tp())
             {
                 // Use Qwen3 schema factory for proper weight sharding
                 // (no QKV biases, adds QK norm weights as replicated)

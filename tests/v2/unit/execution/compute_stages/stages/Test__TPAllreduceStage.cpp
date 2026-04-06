@@ -373,20 +373,20 @@ TEST_F(Test__TPAllreduceStage, DumpInfoIncludesScalarsLocalTP)
 
     auto dump_info = stage->buildDumpInfoImpl();
 
-    // Should have tp_degree, backend, and is_global scalars
+    // Should have tp_degree, backend, and tp_scope scalars
     EXPECT_GE(dump_info.scalars.size(), 3);
 
-    // Find is_global scalar and verify it's 0 (false)
-    bool found_is_global = false;
+    // Find tp_scope scalar and verify it's LOCAL (0)
+    bool found_tp_scope = false;
     for (const auto &scalar : dump_info.scalars)
     {
-        if (scalar.name == std::string_view("is_global"))
+        if (scalar.name == std::string_view("tp_scope"))
         {
-            found_is_global = true;
-            EXPECT_EQ(static_cast<int>(scalar.value), 0);
+            found_tp_scope = true;
+            EXPECT_EQ(static_cast<int>(scalar.value), static_cast<int>(TPScope::LOCAL));
         }
     }
-    EXPECT_TRUE(found_is_global);
+    EXPECT_TRUE(found_tp_scope);
 }
 
 // =============================================================================

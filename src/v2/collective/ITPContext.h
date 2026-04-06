@@ -1,17 +1,32 @@
 /**
  * @file ITPContext.h
- * @brief Base interface for tensor parallelism contexts (local and global)
+ * @brief Base interface for tensor parallelism contexts
  *
- * ITPContext provides a common interface for both LOCAL TP (multiple devices within
- * a single MPI rank, using NCCL/RCCL/PCIeBAR) and GLOBAL TP (cross-MPI-rank, using
- * UPI/MPI collectives).
+ * ITPContext provides a common interface for all TP scopes:
  *
- * The key difference:
- * - LOCAL TP: isLocal() returns true, uses high-bandwidth intra-node backends
- * - GLOBAL TP: isLocal() returns false, uses MPI-based cross-rank communication
+ * - **LOCAL**:      Intra-rank, multi-device. All participants are devices owned
+ *                   by a single MPI rank. Uses NVLink, PCIeBAR, or intra-process
+ *                   NCCL/RCCL. Lowest latency, highest bandwidth.
  *
- * This interface enables stages like TPAllreduceStage to work with either TP type
- * without code changes.
+ * - **NODE_LOCAL**: Cross-rank, same physical machine. Participants are MPI ranks
+ *                   on the same node, communicating via UPI, shared memory, or
+ *                   cross-process NCCL. Medium latency, high bandwidth.
+ *
+ * - **GLOBAL**:     Cross-node, cross-rank. Participants span physical machines,
+ *                   communicating via MPI over InfiniBand or Ethernet.
+ *                   Highest latency, lowest bandwidth.
+ *
+ * A nested PP+TP topology might combine all three:
+ *
+ *   NodeLocalPipelineParallel(
+ *       LocalTP(0:cuda:0, 0:cuda:1, 0:cuda:2, 0:cuda:3),
+ *       LocalTP(1:cuda:0, 1:cuda:1, 1:cuda:2, 1:cuda:3),
+ *       NodeLocalTP(0:cpu, 1:cpu)
+ *   )
+ *
+ * This interface enables stages like TPAllreduceStage to work with any scope
+ * without code changes — the scope only matters for backend selection and
+ * scope-specific setup (e.g., BAR registration for LOCAL TP).
  *
  * @author David Sanftenberg
  * @date February 2026
@@ -28,12 +43,16 @@ namespace llaminar2
     // Forward declarations
     class TensorBase;
 
+    // TPScope is defined in config/OrchestrationConfig.h (included above):
+    //   LOCAL, NODE_LOCAL, GLOBAL, AUTO, HYBRID
+
     /**
      * @brief Base interface for tensor parallelism contexts
      *
-     * Provides the minimal common interface shared by both LOCAL and GLOBAL TP contexts.
-     * Local TP (ILocalTPContext) and Global TP (IGlobalTPContext) extend this interface
-     * with their specific capabilities.
+     * Provides the minimal common interface shared by all TP context scopes:
+     * - ILocalTPContext (LOCAL scope)
+     * - INodeLocalTPContext (NODE_LOCAL scope)
+     * - IGlobalTPContext (GLOBAL scope)
      *
      * Thread safety: All implementations must be thread-safe for collective operations.
      */
@@ -47,9 +66,40 @@ namespace llaminar2
         // =========================================================================
 
         /**
+         * @brief Get the scope of this TP context
+         *
+         * @return TPScope indicating LOCAL, NODE_LOCAL, or GLOBAL
+         */
+        virtual TPScope scope() const = 0;
+
+        /**
+         * @brief Check if this is a LOCAL TP context (intra-rank)
+         *
+         * Convenience method. Equivalent to scope() == TPScope::LOCAL.
+         * Code needing LOCAL TP-specific features (BAR registration, device lists)
+         * should check this before static_cast<ILocalTPContext*>.
+         */
+        bool isLocal() const { return scope() == TPScope::LOCAL; }
+
+        /**
+         * @brief Check if this is a NODE_LOCAL TP context (cross-rank, same node)
+         *
+         * Convenience method. Equivalent to scope() == TPScope::NODE_LOCAL.
+         */
+        bool isNodeLocal() const { return scope() == TPScope::NODE_LOCAL; }
+
+        /**
+         * @brief Check if this is a GLOBAL TP context (cross-node)
+         *
+         * Convenience method. Equivalent to scope() == TPScope::GLOBAL.
+         */
+        bool isGlobal() const { return scope() == TPScope::GLOBAL; }
+
+        /**
          * @brief Get number of participants in this TP domain
          *
          * For LOCAL TP: number of devices within the rank
+         * For NODE_LOCAL TP: number of MPI ranks on the same node
          * For GLOBAL TP: number of MPI ranks in the domain
          *
          * @return TP degree (>= 1)
@@ -60,6 +110,7 @@ namespace llaminar2
          * @brief Get this participant's index within the domain
          *
          * For LOCAL TP: device index (0 to degree-1)
+         * For NODE_LOCAL TP: rank-in-domain on the node (0 to degree-1)
          * For GLOBAL TP: rank-in-domain (0 to degree-1)
          *
          * Used for sharding calculations and collective operations.
@@ -69,27 +120,10 @@ namespace llaminar2
         virtual int myIndex() const = 0;
 
         /**
-         * @brief Check if this is a LOCAL TP context
-         *
-         * @return true if all participants are within the same MPI rank (intra-rank)
-         * @return false if participants span multiple MPI ranks (cross-rank, global)
-         */
-        virtual bool isLocal() const = 0;
-
-        /**
-         * @brief Check if this is a GLOBAL TP context
-         *
-         * Convenience method, equivalent to !isLocal().
-         *
-         * @return true if participants span multiple MPI ranks
-         * @return false if all participants are within the same MPI rank
-         */
-        bool isGlobal() const { return !isLocal(); }
-
-        /**
          * @brief Get the collective backend type used by this context
          *
          * For LOCAL TP: Returns NCCL, RCCL, PCIE_BAR, etc.
+         * For NODE_LOCAL TP: Returns NCCL, MPI, HOST, etc.
          * For GLOBAL TP: Returns MPI, UPI, etc.
          *
          * @return CollectiveBackendType enum value
