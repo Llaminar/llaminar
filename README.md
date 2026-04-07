@@ -10,7 +10,10 @@ Llaminar is a from-scratch LLM inference engine with an **operator-free, kernel-
 - **Tensor Parallelism** — Automatic Megatron-style weight sharding across devices with NCCL, RCCL, PCIe BAR, UPI, MPI, and host-staging collective backends
 - **Pipeline Parallelism** — Layer distribution across devices/ranks with named TP domains for heterogeneous PP+TP setups (e.g., CUDA + ROCm in one pipeline)
 - **22+ Quantization Formats** — All GGUF formats: Q4_0/1, Q5_0/1, Q8_0/1, K-quants (Q2_K–Q8_K), importance quants (IQ1–IQ4), FP16, BF16, FP32
-- **Qwen2/Qwen3 Model Family** — Qwen2.5 (0.5B–72B), Qwen3 schema support
+- **Qwen Model Family** — Qwen2.5 (0.5B–72B), Qwen3, and Qwen3.5 with hybrid GDN (Gated Delta Network) + full attention layers
+- **Execution Modes** — Completion, interactive chat, single-shot chat, OpenAI-compatible HTTP server, and benchmark modes
+- **KV Cache Quantization** — Configurable precision: FP32, FP16, Q8_1, Q16_1, TurboQuant TQ4 (rotation-based 4-bit), and heterogeneous TQ (TQ8 K + TQ4 V)
+- **Weight Streaming** — VRAM-constrained inference with configurable memory budget, layer prefetching, and LRU/FIFO eviction
 - **GPU-Side Sampling** — Greedy and top-k/top-p sampling on device, avoiding full logit D2H transfers
 - **Built-in Profiling** — Benchmark mode (warmup + averaged runs), per-kernel timing, GPU event-based stage timing, Nsight ncu/nsys compatible
 - **Parity Testing** — Layer-by-layer PyTorch ground truth comparison with cosine similarity, KL divergence, and top-K overlap metrics
@@ -29,6 +32,15 @@ cmake --build build_v2_release --parallel
 # Explicit GPU device
 ./build_v2_release/llaminar2 -d cuda:0 -m model.gguf -p "Hello" -n 50
 
+# Chat mode (applies chat template automatically)
+./build_v2_release/llaminar2 --chat-single -m model.gguf -p "What is the capital of France?" -n 100
+
+# Interactive chat (multi-turn)
+./build_v2_release/llaminar2 --chat -m model.gguf
+
+# OpenAI-compatible HTTP server
+./build_v2_release/llaminar2 --serve -m model.gguf
+
 # 2-way tensor parallelism
 ./build_v2_release/llaminar2 --tp-devices "cuda:0,cuda:1" -m model.gguf -p "Hello" -n 50
 
@@ -39,6 +51,9 @@ cmake --build build_v2_release --parallel
   --pp-stage "0=gpu_fast:0-13" \
   --pp-stage "1=gpu_slow:14-27" \
   -m model.gguf -p "Hello" -n 50
+
+# KV cache quantization (TurboQuant 4-bit)
+./build_v2_release/llaminar2 --kv-cache-precision tq4 -m model.gguf -p "Hello" -n 50
 
 # Benchmark mode (1 warmup + 3 averaged runs)
 ./build_v2_release/llaminar2 --benchmark -m model.gguf -n 128
@@ -74,9 +89,11 @@ cmake --build build_v2_release --parallel
                                  ▼
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │  Compute Stages                                                             │
-│  RMSNorm │ GEMM │ FusedQKV │ FusedGateUp │ SwiGLU │ RoPE │ Attention      │
+│  RMSNorm │ FusedResidualNorm │ GatedRMSNorm │ QKNorm │ GEMM │ FusedQKV    │
+│  FusedGateUp │ SwiGLU │ AttentionOutputGate │ RoPE │ Attention              │
+│  GDNProjection │ GDNRecurrence │ ShortConv1d │ QGateSplit                   │
 │  ResidualAdd │ Embedding │ LMHead │ QuantizeQ16_1 │ KVCacheAppend          │
-│  Allreduce │ AllGather │ AllGatherV │ Send/ReceiveActivations (PP)          │
+│  Allreduce │ AllGather │ AllGatherV │ LocalPP/GlobalPP │ Send/Receive (PP)  │
 └────────────────────────────────┬────────────────────────────────────────────┘
                                  ▼
 ┌─────────────────────────────────────────────────────────────────────────────┐
@@ -127,6 +144,8 @@ Megatron-style automatic weight sharding with proportional split support for het
 | `ffn_gate`, `ffn_up` | COLUMN_PARALLEL | Split output dim (d_ff) |
 | `ffn_down` | INPUT_PARALLEL | Split input dim, allreduce after |
 | `output` (LM head) | COLUMN_PARALLEL | Split vocab, allgather logits |
+| GDN `attn_q`, `attn_k` | REPLICATE | Full copy (not head-divisible for GDN) |
+| GDN `attn_v` | COLUMN_PARALLEL | Split V heads across devices |
 | Norms, embeddings | REPLICATE | Full copy on each device |
 
 ```bash
@@ -215,6 +234,7 @@ cmake --build build_v2_release --parallel
 | Debug | Off | Yes | Yes | Yes | Development, debugging |
 | Release | Full (-O3) | No | No | No | Production, benchmarks |
 | Integration | Full (-O3) | Yes | Yes | Yes | Unit/integration/parity tests |
+| E2ERelease | Full (-O3) | No | Yes | No | End-to-end tests with snapshots |
 
 ### CMake Options
 
@@ -235,6 +255,9 @@ ctest --test-dir build_v2_integration -R "^V2_Integration_" --output-on-failure 
 
 # Parity tests (Llaminar vs PyTorch reference)
 ctest --test-dir build_v2_integration -R "^V2_Integration_Parity_" --output-on-failure
+
+# End-to-end tests (server, full pipeline parity)
+ctest --test-dir build_v2_e2e_release -R "^V2_E2E_" --output-on-failure
 
 # Performance benchmarks (Release build)
 ctest --test-dir build_v2_release -R "^V2_Perf_" --verbose
@@ -262,8 +285,11 @@ sudo /usr/local/cuda/bin/ncu --kernel-name "myKernel" --launch-skip 1 --launch-c
 ```
 src/v2/
 ├── config/                    # OrchestrationConfig, TP/PP/Placement configs, ConfigValidator
+├── inference/                 # IInferenceRunner interface and factory
+├── interfaces/                # ICollectiveContext, IMultiDeviceOrchestrator, IMPIContext
 ├── execution/
 │   ├── runner/                # IOrchestrationRunner, OrchestrationRunner
+│   ├── factory/               # InferenceRunnerFactory
 │   ├── mpi_orchestration/     # RankExecutionPlan, ExecutionPlanBuilder
 │   ├── config/                # RuntimeConfig, ExecutionPolicy
 │   ├── local_execution/
@@ -276,22 +302,32 @@ src/v2/
 ├── memory/                    # BufferArena, BufferId, CoherenceTracker, StageBoundBuffers
 ├── models/
 │   ├── qwen/                  # Qwen2Graph, Qwen2GraphConfigBuilder, Qwen2BufferSpec
-│   └── qwen3/                 # Qwen3Schema
+│   ├── qwen3/                 # Qwen3Schema (extends Qwen2 with per-head norm)
+│   └── qwen35/                # Qwen35Graph, Qwen35Schema (hybrid GDN + full attention)
+├── app/
+│   └── modes/                 # ServerMode, InteractiveChatMode, SingleShotChatMode, BenchmarkMode
 ├── kernels/
 │   ├── cpu/                   # AVX-512 VNNI GEMM, JIT attention (Xbyak), OpenBLAS, primitives
+│   │   ├── jit/               # JIT infrastructure (RegisterGuard, RegisterAllocation, Xbyak)
+│   │   ├── turboquant/        # TurboQuant rotation-based quantization (TQ3/TQ4/TQ8)
+│   │   └── gdn/               # Gated Delta Network CPU kernels
 │   ├── cuda/                  # TensorCore GEMM, FlashAttention-2, stream-K, ops
 │   ├── rocm/                  # MatrixCore GEMM, FlashAttention, INT8 VNNI, ops
 │   └── KernelFactory.h        # Centralized dispatch with caching
 ├── tensors/                   # ITensor, TensorBase, 27 typed tensor classes, UnifiedKVCache
+├── transfer/                  # TransferEngine, TransferMethod (H2D/D2H/P2P/BAR dispatch)
 ├── collective/                # ILocalTPContext, BackendRouter, NCCL/RCCL/PCIeBAR/UPI/MPI/Host
 ├── backends/                  # IBackend, BackendManager, DeviceRegistry, DeviceId
-├── loaders/                   # GGUF loading, WeightManager
+├── loaders/                   # GGUF loading, WeightManager, WeightStreamer
 └── utils/                     # MPIContext, MPITopology, Tokenizer, Sampler, logging
 
 tests/v2/
 ├── unit/                      # Fast isolated tests (no model loading)
 ├── integration/               # Full pipeline tests with models
 │   └── parity/                # PyTorch ground truth parity tests
+├── e2e/
+│   ├── parity/                # End-to-end parity tests
+│   └── server/                # HTTP server end-to-end tests
 ├── performance/               # Benchmark and kernel perf tests
 └── utils/                     # TestTensorFactory, test utilities
 ```
@@ -307,6 +343,8 @@ tests/v2/
 | `LLAMINAR_STAGE_DUMP_ENABLED` | Dump stage input/output tensors to disk for debugging |
 | `LLAMINAR_STAGE_OUTPUT_PRINT` | Print stage tensor samples to log output |
 | `LLAMINAR_TRACE_TRANSFERS` | Trace host↔device memory transfers |
+| `LLAMINAR_WEIGHT_STREAMING` | Enable weight streaming for VRAM-constrained inference |
+| `LLAMINAR_STREAM_MEMORY_MB` | GPU memory budget for weight streaming cache (0 = auto) |
 
 See `src/v2/utils/DebugEnv.h` for the full list.
 
