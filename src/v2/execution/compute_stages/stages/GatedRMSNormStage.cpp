@@ -72,6 +72,11 @@ namespace llaminar2
         const bool subtract_one = params_.subtract_one;
         const bool gate_silu = params_.gate_silu;
 
+        // Gamma weight may be smaller than norm_dim (e.g., [d_v=128] with full-row
+        // norm over value_dim=2048). In this case, gamma cycles every gamma_period elements.
+        const size_t gamma_numel = gamma_base->numel();
+        const size_t gamma_period = (gamma_numel < norm_dim) ? gamma_numel : norm_dim;
+
         auto do_work = [&]()
         {
             // Parallelize over rows (timesteps) for prefill, or groups for single token
@@ -110,7 +115,7 @@ namespace llaminar2
                     for (; j < nd_vec; j += 16)
                     {
                         __m512 vnorm = _mm512_mul_ps(_mm512_loadu_ps(input_data + offset + j), vinv_rms);
-                        __m512 vgamma = _mm512_loadu_ps(gamma_data + j);
+                        __m512 vgamma = _mm512_loadu_ps(gamma_data + (j % gamma_period));
                         if (subtract_one)
                             vgamma = _mm512_add_ps(vone, vgamma);
                         __m512 vgate = _mm512_loadu_ps(gate_data + offset + j);
@@ -148,7 +153,7 @@ namespace llaminar2
                     for (; j < norm_dim; ++j)
                     {
                         const float normalized = input_data[offset + j] * inv_rms;
-                        const float gamma_eff = subtract_one ? (1.0f + gamma_data[j]) : gamma_data[j];
+                        const float gamma_eff = subtract_one ? (1.0f + gamma_data[j % gamma_period]) : gamma_data[j % gamma_period];
                         const float gate_val = gate_data[offset + j];
                         const float gate_act = gate_silu ? gate_val / (1.0f + std::exp(-gate_val)) : gate_val;
                         output_data[offset + j] = normalized * gamma_eff * gate_act;
@@ -169,8 +174,8 @@ namespace llaminar2
                 {
                     const float normalized = input_data[offset + j] * inv_rms;
                     const float gamma_eff = subtract_one
-                                                ? (1.0f + gamma_data[j])
-                                                : gamma_data[j];
+                                                ? (1.0f + gamma_data[j % gamma_period])
+                                                : gamma_data[j % gamma_period];
                     const float gate_val = gate_data[offset + j];
                     const float gate_act = gate_silu
                                                ? gate_val / (1.0f + std::exp(-gate_val))

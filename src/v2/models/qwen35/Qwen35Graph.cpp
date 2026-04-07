@@ -485,6 +485,7 @@ namespace llaminar2
         gnorm_params.subtract_one = config_.rms_norm_subtract_one;
         gnorm_params.seq_len = total_tokens;
         gnorm_params.norm_dim = d_v;   // Per-head normalization over d_v (128)
+                                       // PyTorch reshapes to [B*T, n_heads, d_v] before norm
         gnorm_params.gate_silu = true; // GDN uses SiLU(Z) as gate
         gnorm_params.input_buffer_id = BufferId::ATTN_OUTPUT;
         gnorm_params.gate_buffer_id = BufferId::GDN_Z;

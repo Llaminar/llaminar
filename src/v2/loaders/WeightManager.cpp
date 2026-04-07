@@ -737,7 +737,7 @@ namespace llaminar2
             {
                 // Compute expected Q, K, V row counts from model dimensions
                 bool use_sub_block_slicing = false;
-                size_t q_rows = 0, kv_rows = 0;
+                size_t q_rows = 0, kv_rows = 0, v_rows = 0;
 
                 if (has_model_dimensions_ && model_n_heads_ > 0 && model_head_dim_ > 0)
                 {
@@ -748,9 +748,10 @@ namespace llaminar2
                     if (total_rows == expected_qkv)
                     {
                         // True GQA layout: [Q(n_heads*hd) | K(n_kv_heads*hd) | V(n_kv_heads*hd)]
+                        v_rows = kv_rows;
                         use_sub_block_slicing = true;
                         LOG_TRACE("[WeightManager] FusedQKV " << name
-                                                              << " Q=" << q_rows << " K=" << kv_rows << " V=" << kv_rows
+                                                              << " Q=" << q_rows << " K=" << kv_rows << " V=" << v_rows
                                                               << " (GQA: n_heads=" << model_n_heads_
                                                               << " n_kv_heads=" << model_n_kv_heads_ << ")");
                     }
@@ -761,6 +762,7 @@ namespace llaminar2
                         // 3 equal sub-blocks.
                         q_rows = total_rows / 3;
                         kv_rows = total_rows / 3;
+                        v_rows = total_rows / 3;
                         use_sub_block_slicing = true;
                         LOG_TRACE("[WeightManager] FusedQKV " << name
                                                               << " total_rows=" << total_rows
@@ -770,11 +772,46 @@ namespace llaminar2
                     }
                     else
                     {
-                        LOG_DEBUG("[WeightManager] FusedQKV " << name
-                                                              << " total_rows=" << total_rows
-                                                              << " != expected Q+K+V=" << expected_qkv
-                                                              << " and not divisible by 3"
-                                                              << " — using simple equal row split (non-standard fused weight)");
+                        // Try GDN layout: [Q(n_k*d) | K(n_k*d) | V(n_v*d)]
+                        // GDN has asymmetric Q/K/V when n_k_heads != n_v_heads
+                        if (has_gdn_dimensions_ && gdn_n_k_heads_ > 0 && gdn_d_state_ > 0)
+                        {
+                            const size_t gdn_key_dim = static_cast<size_t>(gdn_n_k_heads_) * gdn_d_state_;
+                            const size_t gdn_value_dim = static_cast<size_t>(gdn_n_v_heads_) * gdn_d_state_;
+                            const size_t expected_gdn_qkv = 2 * gdn_key_dim + gdn_value_dim;
+
+                            if (total_rows == expected_gdn_qkv)
+                            {
+                                q_rows = gdn_key_dim;   // Q = n_k_heads * d_state
+                                kv_rows = gdn_key_dim;  // K = n_k_heads * d_state (same as Q)
+                                v_rows = gdn_value_dim; // V = n_v_heads * d_state (may differ from K)
+                                use_sub_block_slicing = true;
+
+                                LOG_TRACE("[WeightManager] FusedQKV " << name
+                                                                      << " matched GDN layout: Q=" << q_rows
+                                                                      << " K=" << kv_rows << " V=" << gdn_value_dim
+                                                                      << " (n_k=" << gdn_n_k_heads_
+                                                                      << " n_v=" << gdn_n_v_heads_
+                                                                      << " d=" << gdn_d_state_ << ")");
+                            }
+                            else
+                            {
+                                LOG_DEBUG("[WeightManager] FusedQKV " << name
+                                                                      << " total_rows=" << total_rows
+                                                                      << " != expected Q+K+V=" << expected_qkv
+                                                                      << " and not GDN=" << expected_gdn_qkv
+                                                                      << " and not divisible by 3"
+                                                                      << " — using simple equal row split");
+                            }
+                        }
+                        else
+                        {
+                            LOG_DEBUG("[WeightManager] FusedQKV " << name
+                                                                  << " total_rows=" << total_rows
+                                                                  << " != expected Q+K+V=" << expected_qkv
+                                                                  << " and not divisible by 3"
+                                                                  << " — using simple equal row split (non-standard fused weight)");
+                        }
                     }
                 }
                 else
@@ -784,6 +821,7 @@ namespace llaminar2
                     {
                         q_rows = total_rows / 3;
                         kv_rows = total_rows / 3;
+                        v_rows = total_rows / 3;
                         use_sub_block_slicing = true;
                     }
                     else
@@ -798,7 +836,8 @@ namespace llaminar2
                 if (use_sub_block_slicing)
                 {
                     // Sub-block sizes: [Q_rows, K_rows, V_rows]
-                    const size_t sub_block_sizes[3] = {q_rows, kv_rows, kv_rows};
+                    // For GDN layers, V may differ from K (n_v_heads != n_k_heads)
+                    const size_t sub_block_sizes[3] = {q_rows, kv_rows, v_rows > 0 ? v_rows : kv_rows};
 
                     // Compute per-rank slice within each sub-block
                     // Q sliced by n_heads, K and V sliced by n_kv_heads

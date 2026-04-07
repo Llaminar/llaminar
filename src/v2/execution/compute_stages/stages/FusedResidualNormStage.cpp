@@ -179,6 +179,19 @@ namespace llaminar2
 
             traceOutput("residual", params_.residual);
             traceOutput("norm_output", params_.norm_output);
+
+            // Temporary layer trace: print post-residual hidden state (last row, first 6 elms)
+            {
+                static bool do_trace = std::getenv("LLAMINAR_LAYER_TRACE") != nullptr;
+                if (do_trace)
+                {
+                    const int last = (seq_len - 1) * hidden_dim;
+                    LOG_INFO("[LayerTrace] " << name() << " post-residual [" << seq_len << "x" << hidden_dim
+                                             << "] last_row[:6]=" << res_data[last] << "," << res_data[last + 1] << "," << res_data[last + 2]
+                                             << "," << res_data[last + 3] << "," << res_data[last + 4] << "," << res_data[last + 5]);
+                }
+            }
+
             return true;
         }
 
@@ -202,6 +215,19 @@ namespace llaminar2
         {
             LOG_ERROR("[FusedResidualNormStage] ResidualAdd failed");
             return false;
+        }
+
+        // Temporary layer trace: print post-residual hidden state (last row, first 6 elms)
+        {
+            static bool do_trace = std::getenv("LLAMINAR_LAYER_TRACE") != nullptr;
+            if (do_trace)
+            {
+                const float *r = residual_base->data();
+                const int last = (seq_len - 1) * hidden_dim;
+                LOG_INFO("[LayerTrace] " << name() << " post-residual [" << seq_len << "x" << hidden_dim
+                                         << "] last_row[:6]=" << r[last] << "," << r[last + 1] << "," << r[last + 2]
+                                         << "," << r[last + 3] << "," << r[last + 4] << "," << r[last + 5]);
+            }
         }
 
         auto *norm_kernel = llaminar::v2::kernels::KernelFactory::getOrCreateRMSNorm(

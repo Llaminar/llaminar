@@ -219,6 +219,26 @@ namespace llaminar2
         }
 
         /**
+         * @brief Set GDN (Gated Delta Net) dimensions for FusedQKV sub-block slicing
+         *
+         * GDN layers have asymmetric QKV: [Q(n_k*d) | K(n_k*d) | V(n_v*d)]
+         * where n_k_heads != n_v_heads. The standard FA-based slicing doesn't
+         * handle this layout. This provides the dimensions needed for correct
+         * sub-block aware TP sharding.
+         *
+         * @param n_k_heads Number of key heads (ssm.group_count)
+         * @param n_v_heads Number of value heads (ssm.time_step_rank)
+         * @param d_state State dimension per head (ssm.state_size, used as d_k = d_v)
+         */
+        void setGDNDimensions(int n_k_heads, int n_v_heads, int d_state)
+        {
+            gdn_n_k_heads_ = n_k_heads;
+            gdn_n_v_heads_ = n_v_heads;
+            gdn_d_state_ = d_state;
+            has_gdn_dimensions_ = true;
+        }
+
+        /**
          * @brief Set layer range for LAYER_PARTITIONED strategy
          *
          * For Pipeline Parallelism, restricts which layer weights are loaded.
@@ -518,6 +538,12 @@ namespace llaminar2
         int model_n_kv_heads_ = 0;        ///< Number of KV attention heads (GQA)
         int model_head_dim_ = 0;          ///< Dimension per attention head
         bool has_model_dimensions_ = false; ///< True if setModelDimensions() was called
+
+        // GDN (Gated Delta Net) head dimensions for FusedQKV sharding
+        int gdn_n_k_heads_ = 0;           ///< Number of GDN key heads (ssm.group_count)
+        int gdn_n_v_heads_ = 0;           ///< Number of GDN value heads (ssm.time_step_rank)
+        int gdn_d_state_ = 0;             ///< GDN state dimension per head (ssm.state_size)
+        bool has_gdn_dimensions_ = false;  ///< True if setGDNDimensions() was called
 
         // Decode weight shard cache (separate from prefill cache)
         std::unordered_map<std::string, std::shared_ptr<TensorBase>> decode_cache_; ///< Decode shard cache

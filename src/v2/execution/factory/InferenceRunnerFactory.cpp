@@ -198,7 +198,6 @@ namespace llaminar2
         const int tp_degree = local_tp_ctx->degree();
         const auto &weights = local_tp_ctx->weights();
 
-
         if (device_idx < 0 || device_idx >= tp_degree)
         {
             LOG_ERROR("[InferenceRunner] Invalid local_tp_device_index: " << device_idx
@@ -616,6 +615,16 @@ namespace llaminar2
                 graph_config.n_heads, graph_config.n_kv_heads, graph_config.head_dim);
         }
 
+        // Pass GDN dimensions for asymmetric FusedQKV sub-block slicing
+        // GDN layers have [Q:n_k*d | K:n_k*d | V:n_v*d] where n_k (group_count) != n_v (time_step_rank)
+        if (weight_mgr && graph_config.gdn.enabled())
+        {
+            weight_mgr->setGDNDimensions(
+                graph_config.gdn.group_count,
+                graph_config.gdn.time_step_rank,
+                graph_config.gdn.state_size);
+        }
+
         // Execution-specific settings
         graph_config.max_seq_len = config.max_seq_len;
 
@@ -689,7 +698,8 @@ namespace llaminar2
         // Check if TP context is provided (LOCAL or GLOBAL)
         ITPContext *tp_ctx = config.tp_ctx;
         ILocalTPContext *local_tp_ctx = tp_ctx && tp_ctx->isLocal()
-            ? static_cast<ILocalTPContext *>(tp_ctx) : nullptr;
+                                            ? static_cast<ILocalTPContext *>(tp_ctx)
+                                            : nullptr;
         const int tp_device_idx = config.tp_device_index;
 
         // Check if TensorParallelConfig is available from WeightManager (for GLOBAL TP)
@@ -723,7 +733,7 @@ namespace llaminar2
             auto ctx = GlobalTPContext::createWithSplit(
                 MPI_COMM_WORLD,
                 /*domain_id=*/0,
-                /*color=*/0,       // All ranks in same domain
+                /*color=*/0, // All ranks in same domain
                 /*key=*/mpi_ctx->rank());
             if (ctx && ctx->isValid())
             {
@@ -1802,7 +1812,8 @@ namespace llaminar2
         // Check for TP configuration (LOCAL or GLOBAL)
         ITPContext *tp_ctx = config.tp_ctx;
         ILocalTPContext *local_tp_ctx = tp_ctx && tp_ctx->isLocal()
-            ? static_cast<ILocalTPContext *>(tp_ctx) : nullptr;
+                                            ? static_cast<ILocalTPContext *>(tp_ctx)
+                                            : nullptr;
         const int tp_device_idx = config.tp_device_index;
 
         if (local_tp_ctx && local_tp_ctx->degree() > 1)

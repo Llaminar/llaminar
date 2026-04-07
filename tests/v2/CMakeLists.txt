@@ -3695,6 +3695,21 @@ add_v2_test(V2_Unit_WeightManagerFusedQKVTiedEmbeddings
     MPI_PROCS 1
 )
 
+# Test: GDN FusedQKV TP Sharding
+# Regression tests for GDN (Gated DeltaNet) asymmetric QKV weight sharding.
+# GDN layers have Q=K≠V layout that doesn't match FA-based detection.
+# setGDNDimensions() enables correct sub-block slicing under TP.
+add_executable(v2_test_weight_manager_gdn_fusedqkv unit/loaders/Test__WeightManager_GDNFusedQKV.cpp)
+target_include_directories(v2_test_weight_manager_gdn_fusedqkv PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}  # For tests/v2/mocks/ includes
+)
+target_link_libraries(v2_test_weight_manager_gdn_fusedqkv llaminar2_core GTest::gtest_main)
+add_v2_test(V2_Unit_WeightManagerGDNFusedQKV
+    COMMAND $<TARGET_FILE:v2_test_weight_manager_gdn_fusedqkv>
+    LABELS "V2;Unit;TensorParallelism;WeightSharding;FusedQKV;GatedDeltaNet;Qwen35"
+    MPI_PROCS 1
+)
+
 # Test: WeightManager Device-Aware Features
 # Tests features folded from WeightPreloader: getWeightForDevice, preloadForDevices,
 # cloneTensorForDevice, packGemmWeights, uploadNonGemmWeights, preloadStats,
