@@ -8,7 +8,9 @@ torchvision  # Will auto-match torch version
 torchaudio   # Will auto-match torch version
 
 # HuggingFace ecosystem
-transformers>=4.45.0
+# Use our fork with Qwen 3.5 GGUF loading fixes + GQA repeat pattern fix
+# https://github.com/dbsanfte/transformers/tree/qwen35-gguf-fixes
+transformers @ git+https://github.com/dbsanfte/transformers.git@qwen35-gguf-fixes
 safetensors>=0.4.0
 accelerate>=0.34.0
 
