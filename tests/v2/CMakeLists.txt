@@ -9216,6 +9216,39 @@ set_tests_properties(V2_Integration_Python_Qwen35Inference PROPERTIES
     TIMEOUT 600
 )
 
+# --- HuggingFace GGUF Compatibility Shim Tests (gguf_compat.py) ---
+
+# Unit tests: patch/unpatch lifecycle, config mapping, layer types,
+# postprocess config, tensor processor transforms (no model files required)
+add_test(
+    NAME V2_Unit_Python_GGUFCompat
+    COMMAND ${Python3_EXECUTABLE} -m pytest
+        ${PYTHON_REFERENCE_TEST_DIR}/test_gguf_compat.py
+        -v --tb=short -q
+        -k "not GGUFCompatLoading"
+)
+set_tests_properties(V2_Unit_Python_GGUFCompat PROPERTIES
+    LABELS "V2;Unit;Python;GGUFCompat;Qwen35;GatedDeltaNet"
+    WORKING_DIRECTORY "${PYTHON_REFERENCE_ROOT}"
+    TIMEOUT 30
+)
+
+# Integration: full AutoModel loading via patched HF path
+# (requires models/Qwen3.5-4B-Q8_0.gguf)
+add_test(
+    NAME V2_Integration_Python_GGUFCompat
+    COMMAND ${Python3_EXECUTABLE} -m pytest
+        ${PYTHON_REFERENCE_TEST_DIR}/test_gguf_compat.py
+        -v --tb=short -q
+        -k "GGUFCompatLoading"
+)
+set_tests_properties(V2_Integration_Python_GGUFCompat PROPERTIES
+    LABELS "V2;Integration;Python;GGUFCompat;Qwen35;GatedDeltaNet;GGUFLoading"
+    FIXTURES_REQUIRED V2_Models
+    WORKING_DIRECTORY "${PYTHON_REFERENCE_ROOT}"
+    TIMEOUT 600
+)
+
 # =============================================================================
 # MoE Infrastructure Unit Tests
 # =============================================================================

@@ -137,9 +137,11 @@ namespace llaminar2
             }
             else
             {
-                // Deinterleave + repeat_interleave Q/K from n_k_heads to n_v_heads
-                // repeat_interleave(Q, repeat_factor, dim=head):
-                //   Q[t, h, d_k] -> Q[t, h*R+0, d_k], Q[t, h*R+1, d_k], ...
+                // Deinterleave + modular GQA expansion of Q/K from n_k_heads to n_v_heads
+                // Modular pattern: V-head h maps to K-head (h % n_k_heads)
+                //   Q[t, h, d_k] -> Q[t, r*nkh+h, d_k] for r in [0, repeat_factor)
+                // This produces: V-heads [0..nkh-1] use K-heads [0..nkh-1],
+                //                 V-heads [nkh..2*nkh-1] also use K-heads [0..nkh-1], etc.
                 for (int t = 0; t < T; ++t)
                 {
                     const float *row = qkv + static_cast<size_t>(t) * qkv_stride;
@@ -152,10 +154,10 @@ namespace llaminar2
                     {
                         for (int r = 0; r < repeat_factor; ++r)
                         {
-                            std::memcpy(q_dst + (h * repeat_factor + r) * params_.d_k,
+                            std::memcpy(q_dst + (r * nkh + h) * params_.d_k,
                                         q_src + h * params_.d_k,
                                         params_.d_k * sizeof(float));
-                            std::memcpy(k_dst + (h * repeat_factor + r) * params_.d_k,
+                            std::memcpy(k_dst + (r * nkh + h) * params_.d_k,
                                         k_src + h * params_.d_k,
                                         params_.d_k * sizeof(float));
                         }
@@ -211,31 +213,6 @@ namespace llaminar2
                                                 << " d_k=" << params_.d_k
                                                 << " d_v=" << params_.d_v
                                                 << (params_.seq_len == 1 ? " (decode)" : " (prefill)"));
-
-        // Temporary decode diagnostic: print output/state norms
-        if (params_.seq_len == 1)
-        {
-            const size_t out_size = static_cast<size_t>(params_.n_heads) * params_.d_v;
-            float out_norm_sq = 0.0f;
-            for (size_t i = 0; i < out_size; ++i)
-                out_norm_sq += output_data[i] * output_data[i];
-
-            const size_t state_size = static_cast<size_t>(params_.n_heads) * params_.d_k * params_.d_v;
-            float state_norm_sq = 0.0f;
-            for (size_t i = 0; i < state_size; ++i)
-                state_norm_sq += params_.recurrence_state[i] * params_.recurrence_state[i];
-
-            float q_norm_sq = 0.0f;
-            const size_t qk_total = static_cast<size_t>(params_.n_heads) * params_.d_k;
-            for (size_t i = 0; i < qk_total; ++i)
-                q_norm_sq += q_data[i] * q_data[i];
-
-            LOG_INFO("[GDN_DECODE_DIAG] layer=" << params_.layer_idx
-                                                << " out_norm=" << std::sqrt(out_norm_sq)
-                                                << " state_norm=" << std::sqrt(state_norm_sq)
-                                                << " q_norm=" << std::sqrt(q_norm_sq)
-                                                << " out[0:4]=" << output_data[0] << "," << output_data[1] << "," << output_data[2] << "," << output_data[3]);
-        }
 
         return ok;
     }
