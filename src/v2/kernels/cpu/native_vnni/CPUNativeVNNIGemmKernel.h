@@ -432,9 +432,8 @@ namespace llaminar2::cpu::native_vnni
                     }
 
                     // 2. Quantize activations → Q8_1 once (shared across all projections).
-                    static std::vector<Q8_1Block> shared_q8;
-                    if (static_cast<int>(shared_q8.size()) < K_blocks)
-                        shared_q8.resize(K_blocks);
+                    if (static_cast<int>(q8_scratch_.size()) < K_blocks)
+                        q8_scratch_.resize(K_blocks);
                     {
                         int kb = 0;
 #if defined(__AVX512F__)
@@ -443,14 +442,14 @@ namespace llaminar2::cpu::native_vnni
                         {
                             for (; kb + 1 < K_blocks; kb += 2)
                                 simd::quantize_two_blocks_avx512(
-                                    input_data + kb * 32, shared_q8[kb], shared_q8[kb + 1]);
+                                    input_data + kb * 32, q8_scratch_[kb], q8_scratch_[kb + 1]);
                         }
 #endif
                         for (; kb < K_blocks; ++kb)
                         {
                             int block_start = kb * 32;
                             int block_len = std::min(32, k - block_start);
-                            simd::quantize_single_block(input_data + block_start, shared_q8[kb], block_len);
+                            simd::quantize_single_block(input_data + block_start, q8_scratch_[kb], block_len);
                         }
                     }
 
@@ -472,7 +471,7 @@ namespace llaminar2::cpu::native_vnni
                         descs[p].bpr = vnni->packed_.blocks_per_row;
                     }
 
-                    gemv_native_vnni_fused_preq(shared_q8.data(), descs, num_proj);
+                    gemv_native_vnni_fused_preq(q8_scratch_.data(), descs, num_proj);
 
                     // 4. Clear workspace pointers.
                     for (const auto &proj : projections)
@@ -563,6 +562,9 @@ namespace llaminar2::cpu::native_vnni
 
         // Cached scratch buffer for fused SwiGLU+GEMM (avoids malloc per decode token)
         mutable std::vector<float> swiglu_scratch_;
+
+        // Cached Q8_1 quantization buffer for fused projections (avoids malloc per decode token)
+        mutable std::vector<Q8_1Block> q8_scratch_;
 
         // Block-diagonal rotation for activation kurtosis reduction.
         // When set, activations are rotated before Q8_1 quantization for GEMM.
