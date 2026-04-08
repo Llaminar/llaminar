@@ -61,6 +61,7 @@
 #include <unordered_map>
 #include <iomanip>
 #include <algorithm>
+#include <array>
 #include <set>
 #include <string>
 #include <cctype>
@@ -106,6 +107,10 @@
 
 // For snapshot cache mutex
 #include <mutex>
+
+// For CSV results directory creation
+#include <filesystem>
+#include <cstdlib>
 
 namespace llaminar2::test::parity
 {
@@ -156,6 +161,28 @@ namespace llaminar2::test::parity
     // =============================================================================
 
     /**
+     * @brief Distribution statistics for a single tensor
+     */
+    struct TensorDistributionStats
+    {
+        float min = 0.0f;
+        float max = 0.0f;
+        float mean = 0.0f;
+        float stddev = 0.0f;
+        float kurtosis = 0.0f;
+        float skewness = 0.0f;           ///< Asymmetry; symmetric quant schemes assume ~0
+        float p95 = 0.0f;
+        float p99 = 0.0f;
+        float outlier_fraction = 0.0f;   ///< Fraction of |x| > 6σ (SmoothQuant indicator)
+        float dynamic_range = 0.0f;     ///< log2(max|x| / median|x|) — bits needed
+        float sparsity = 0.0f;          ///< Fraction of |x| < 1e-6
+        float zero_fraction = 0.0f;     ///< Fraction of x == 0 exactly
+        size_t nan_count = 0;            ///< Number of NaN values
+        size_t inf_count = 0;            ///< Number of ±Inf values
+        size_t element_count = 0;
+    };
+
+    /**
      * @brief Result of comparing a single tensor/stage
      */
     struct StageComparisonResult
@@ -166,7 +193,12 @@ namespace llaminar2::test::parity
         float rel_l2_norm = 0.0f;
         float max_abs_diff = 0.0f;
         float kl_divergence = 0.0f;
+        float snr_db = 0.0f;              ///< Signal-to-noise ratio in dB: 10·log10(‖signal‖²/‖error‖²)
+        float rmse = 0.0f;                ///< Root mean squared error
+        float error_entropy = 0.0f;       ///< Shannon entropy of error histogram (bits)
         size_t total_elements = 0;
+        TensorDistributionStats llaminar_stats;
+        TensorDistributionStats pytorch_stats;
     };
 
     /**
@@ -182,6 +214,7 @@ namespace llaminar2::test::parity
         bool passed = false;
         float max_kurtosis = 0.0f;      ///< Highest excess kurtosis across stages
         std::string max_kurtosis_stage; ///< Stage with highest kurtosis
+        std::vector<StageComparisonResult> stage_results; ///< Per-stage detailed results
     };
 
     /**
@@ -226,6 +259,7 @@ namespace llaminar2::test::parity
         bool top5_match = false; ///< True if PyTorch top-1 appears in Llaminar top-5
         bool top3_match = false; ///< True if PyTorch top-1 appears in Llaminar top-3
         bool passed = false;
+        std::vector<LayerStats> layer_stats; ///< Per-layer cosine similarity for this decode step
     };
 
     /**
@@ -703,6 +737,113 @@ namespace llaminar2::test::parity
         }
         double m4 = sum4 / static_cast<double>(size);
         return static_cast<float>(m4 / (var * var) - 3.0);
+    }
+
+    /**
+     * @brief Compute distribution statistics for a float tensor
+     *
+     * Computes min, max, mean, stddev, kurtosis, and percentiles (p95, p99).
+     * Percentiles use a partial-sort approach for efficiency.
+     */
+    inline TensorDistributionStats computeDistributionStats(const float *data, size_t size)
+    {
+        TensorDistributionStats stats;
+        stats.element_count = size;
+        if (size == 0)
+            return stats;
+
+        // Single pass: min, max, sum, sum2, nan/inf/zero/sparsity counts
+        double sum = 0.0, sum2 = 0.0;
+        float vmin = std::numeric_limits<float>::max();
+        float vmax = std::numeric_limits<float>::lowest();
+        size_t nan_count = 0, inf_count = 0, zero_count = 0, sparse_count = 0;
+        constexpr float sparsity_eps = 1e-6f;
+
+        for (size_t i = 0; i < size; ++i)
+        {
+            float v = data[i];
+            if (std::isnan(v)) { nan_count++; continue; }
+            if (std::isinf(v)) { inf_count++; continue; }
+            if (v < vmin) vmin = v;
+            if (v > vmax) vmax = v;
+            if (v == 0.0f) zero_count++;
+            if (std::abs(v) < sparsity_eps) sparse_count++;
+            double d = static_cast<double>(v);
+            sum += d;
+            sum2 += d * d;
+        }
+        stats.nan_count = nan_count;
+        stats.inf_count = inf_count;
+        stats.zero_fraction = static_cast<float>(zero_count) / static_cast<float>(size);
+        stats.sparsity = static_cast<float>(sparse_count) / static_cast<float>(size);
+
+        size_t finite_count = size - nan_count - inf_count;
+        if (finite_count == 0)
+            return stats;
+
+        stats.min = vmin;
+        stats.max = vmax;
+        double mean = sum / static_cast<double>(finite_count);
+        stats.mean = static_cast<float>(mean);
+        double var = sum2 / static_cast<double>(finite_count) - mean * mean;
+        double sd = std::sqrt(std::max(var, 0.0));
+        stats.stddev = static_cast<float>(sd);
+
+        // Kurtosis and skewness (second pass for higher moments)
+        if (var > 1e-30)
+        {
+            double sum3 = 0.0, sum4 = 0.0;
+            size_t outlier_count = 0;
+            double outlier_threshold = 6.0 * sd;
+            for (size_t i = 0; i < size; ++i)
+            {
+                float v = data[i];
+                if (std::isnan(v) || std::isinf(v)) continue;
+                double d = static_cast<double>(v) - mean;
+                double d2 = d * d;
+                sum3 += d2 * d;
+                sum4 += d2 * d2;
+                if (std::abs(d) > outlier_threshold) outlier_count++;
+            }
+            double n = static_cast<double>(finite_count);
+            stats.kurtosis = static_cast<float>(sum4 / (n * var * var) - 3.0);
+            stats.skewness = static_cast<float>(sum3 / (n * sd * sd * sd));
+            stats.outlier_fraction = static_cast<float>(outlier_count) / static_cast<float>(finite_count);
+        }
+
+        // Percentiles and dynamic range via partial sort on absolute values
+        if (finite_count >= 4)
+        {
+            std::vector<float> abs_vals;
+            abs_vals.reserve(finite_count);
+            for (size_t i = 0; i < size; ++i)
+            {
+                float v = data[i];
+                if (!std::isnan(v) && !std::isinf(v))
+                    abs_vals.push_back(std::abs(v));
+            }
+
+            size_t n = abs_vals.size();
+            size_t p50_idx = n / 2;
+            size_t p95_idx = static_cast<size_t>(0.95 * (n - 1));
+            size_t p99_idx = static_cast<size_t>(0.99 * (n - 1));
+
+            std::nth_element(abs_vals.begin(), abs_vals.begin() + p99_idx, abs_vals.end());
+            stats.p99 = abs_vals[p99_idx];
+
+            std::nth_element(abs_vals.begin(), abs_vals.begin() + p95_idx, abs_vals.begin() + p99_idx);
+            stats.p95 = abs_vals[p95_idx];
+
+            std::nth_element(abs_vals.begin(), abs_vals.begin() + p50_idx, abs_vals.begin() + p95_idx);
+            float median_abs = abs_vals[p50_idx];
+
+            // Dynamic range: log2(max|x| / median|x|)
+            float max_abs = std::max(std::abs(vmin), std::abs(vmax));
+            if (median_abs > 1e-10f && max_abs > 1e-10f)
+                stats.dynamic_range = std::log2(max_abs / median_abs);
+        }
+
+        return stats;
     }
 
     inline float computeCosineSimilarity(const float *a, const float *b, size_t size)
@@ -1736,6 +1877,49 @@ namespace llaminar2::test::parity
                 result.cosine_similarity = static_cast<float>(dot_product / norm_product);
             }
 
+            // RMSE
+            result.rmse = static_cast<float>(std::sqrt(sum_sq_diff / static_cast<double>(size)));
+
+            // SNR in dB: 10·log10(‖signal‖² / ‖error‖²)
+            if (sum_sq_diff > 1e-30)
+            {
+                result.snr_db = static_cast<float>(10.0 * std::log10(sum_sq_expected / sum_sq_diff));
+            }
+            else if (sum_sq_expected > 1e-30)
+            {
+                result.snr_db = 100.0f; // Perfect match, cap at 100 dB
+            }
+
+            // Error histogram entropy (Shannon entropy in bits)
+            // Bin errors into 64 buckets by relative magnitude to detect structured vs random noise
+            {
+                constexpr int N_BINS = 64;
+                std::array<size_t, N_BINS> bins = {};
+                float max_err = result.max_abs_diff;
+                if (max_err > 1e-10f)
+                {
+                    for (size_t i = 0; i < size; ++i)
+                    {
+                        float abs_err = std::abs(actual[i] - expected[i]);
+                        int bin = std::min(static_cast<int>((abs_err / max_err) * (N_BINS - 1)), N_BINS - 1);
+                        bins[bin]++;
+                    }
+                    double entropy = 0.0;
+                    double n = static_cast<double>(size);
+                    for (int b = 0; b < N_BINS; ++b)
+                    {
+                        if (bins[b] == 0) continue;
+                        double p = static_cast<double>(bins[b]) / n;
+                        entropy -= p * std::log2(p);
+                    }
+                    result.error_entropy = static_cast<float>(entropy);
+                }
+            }
+
+            // Distribution stats for both tensors
+            result.llaminar_stats = computeDistributionStats(actual, size);
+            result.pytorch_stats = computeDistributionStats(expected.data(), size);
+
             result.passed = (result.cosine_similarity >= config_.cosine_threshold);
             return result;
         }
@@ -2681,6 +2865,7 @@ namespace llaminar2::test::parity
                     auto result = compareTensors(llaminar_data, pytorch_data, llaminar_size, stage);
                     stats.stages_compared++;
                     sum_cosine += result.cosine_similarity;
+                    stats.stage_results.push_back(result);
 
                     // Per-stage cosine logging for diagnostics
                     LOG_INFO("[Parity] Layer " << layer_idx << " " << stage
@@ -2725,7 +2910,7 @@ namespace llaminar2::test::parity
                     }
 
                     // Track kurtosis for activation outlier monitoring
-                    float kurt = computeKurtosis(llaminar_data, llaminar_size);
+                    float kurt = result.llaminar_stats.kurtosis;
                     if (kurt > stats.max_kurtosis)
                     {
                         stats.max_kurtosis = kurt;
@@ -3465,6 +3650,9 @@ namespace llaminar2::test::parity
                 renderParityTable(summary, config_, getBackendName());
             }
 
+            // Export CSV results
+            exportPrefillCSV(summary);
+
             // Assertions (all ranks - GTest will aggregate failures)
             EXPECT_GE(summary.early_layers_passed, config_.min_early_layers_passed)
                 << "At least " << config_.min_early_layers_passed << " of the first "
@@ -3531,6 +3719,16 @@ namespace llaminar2::test::parity
         DecodeParitySummary runDecodeParity()
         {
             DecodeParitySummary summary;
+
+            // Stages to compare per layer during decode (same as prefill)
+            const std::vector<std::string> decode_per_layer_stages = {
+                "ATTENTION_NORM",
+                "QKV_PROJECTION", "GDN_Z_PROJECTION", "GDN_DELTA_RULE_OUTPUT", "GDN_NORM_GATE_OUTPUT",
+                "Q_PROJECTION", "K_PROJECTION", "V_PROJECTION",
+                "Q_NORM", "K_NORM",
+                "Q_ROPE", "K_ROPE",
+                "ATTENTION_CONTEXT", "ATTENTION_OUTPUT", "ATTENTION_RESIDUAL",
+                "FFN_NORM", "FFN_GATE", "FFN_UP", "FFN_SWIGLU", "FFN_DOWN", "FFN_RESIDUAL"};
 
             // Check if decode snapshots exist
             auto decode_step0 = loadPyTorchSnapshot("decode_step0_LM_HEAD");
@@ -3622,6 +3820,71 @@ namespace llaminar2::test::parity
                 // Compare with PyTorch
                 DecodeStepStats step_stats;
                 step_stats.step_idx = static_cast<int>(step);
+
+                // ---------------------------------------------------------------
+                // Per-layer cosine similarity comparison for this decode step
+                // ---------------------------------------------------------------
+                {
+                    int n_layers = static_cast<int>(model_ctx_->model().block_count);
+                    auto snapshot_keys = runner_->getSnapshotKeys();
+                    std::set<std::string> available_snapshots(snapshot_keys.begin(), snapshot_keys.end());
+
+                    for (int layer_idx = 0; layer_idx < n_layers; ++layer_idx)
+                    {
+                        LayerStats stats;
+                        stats.layer_idx = layer_idx;
+                        float sum_cosine = 0.0f;
+
+                        for (const auto &stage : decode_per_layer_stages)
+                        {
+                            // Skip excluded stages
+                            if (!config_.excluded_stages.empty())
+                            {
+                                bool is_excluded = std::find(
+                                                       config_.excluded_stages.begin(),
+                                                       config_.excluded_stages.end(),
+                                                       stage) != config_.excluded_stages.end();
+                                if (is_excluded)
+                                    continue;
+                            }
+
+                            // Llaminar snapshot key: layer{N}_{STAGE}
+                            std::string llaminar_key = "layer" + std::to_string(layer_idx) + "_" + stage;
+                            if (!available_snapshots.count(llaminar_key))
+                                continue;
+
+                            // PyTorch snapshot key: decode_step{N}_layer{L}_{STAGE}
+                            std::string pytorch_key = step_prefix + "_layer" + std::to_string(layer_idx) + "_" + stage;
+                            auto pytorch_data = loadPyTorchSnapshot(pytorch_key);
+                            if (pytorch_data.empty())
+                                continue;
+
+                            size_t llaminar_size;
+                            const float *llaminar_data = runner_->getSnapshot(llaminar_key, llaminar_size);
+                            if (!llaminar_data)
+                                continue;
+
+                            auto result = compareTensors(llaminar_data, pytorch_data, llaminar_size, stage);
+                            stats.stages_compared++;
+                            sum_cosine += result.cosine_similarity;
+                            stats.stage_results.push_back(result);
+
+                            if (result.cosine_similarity < stats.min_cosine_sim)
+                            {
+                                stats.min_cosine_sim = result.cosine_similarity;
+                                stats.worst_stage = stage;
+                            }
+                        }
+
+                        if (stats.stages_compared > 0)
+                        {
+                            stats.avg_cosine_sim = sum_cosine / stats.stages_compared;
+                        }
+                        stats.passed = (stats.avg_cosine_sim >= config_.decode_cosine_threshold);
+
+                        step_stats.layer_stats.push_back(stats);
+                    }
+                }
 
                 step_stats.cosine_similarity = computeCosineSimilarity(
                     llaminar_logits, pytorch_logits,
@@ -3858,6 +4121,84 @@ namespace llaminar2::test::parity
         }
 
         /**
+         * @brief Render per-layer cosine similarity for a specific decode step
+         *
+         * Shows the layer-by-layer breakdown to identify where divergence starts.
+         * Typically rendered for step 0 (first decode step) since that's most diagnostic.
+         */
+        void renderDecodeLayerParityTable(
+            const DecodeStepStats &step,
+            const std::string &backend_name)
+        {
+            if (step.layer_stats.empty())
+                return;
+
+            auto fmt_f6 = [](float v) -> std::string
+            {
+                std::ostringstream ss;
+                ss << std::fixed << std::setprecision(6) << v;
+                return ss.str();
+            };
+
+            auto status_str = [](bool passed) -> std::string
+            {
+                return passed ? "✓" : "✗";
+            };
+
+            std::cout << "\n";
+
+            // Title
+            {
+                fort::utf8_table title_table;
+                title_table.set_border_style(FT_DOUBLE2_STYLE);
+
+                std::ostringstream title_ss;
+                title_ss << backend_name << " DECODE STEP " << step.step_idx
+                         << " LAYER-BY-LAYER PARITY";
+
+                title_table << title_ss.str() << fort::endr;
+                title_table[0][0].set_cell_text_align(fort::text_align::center);
+                title_table.row(0).set_cell_row_type(fort::row_type::header);
+
+                std::cout << title_table.to_string();
+            }
+
+            // Layer table
+            fort::utf8_table table;
+            table.set_border_style(FT_DOUBLE2_STYLE);
+
+            table << fort::header
+                  << "Layer" << "Avg Cosine" << "Min Cosine" << "Worst Stage" << "Stages" << "OK"
+                  << fort::endr;
+
+            table.column(0).set_cell_text_align(fort::text_align::center);
+            table.column(1).set_cell_text_align(fort::text_align::right);
+            table.column(2).set_cell_text_align(fort::text_align::right);
+            table.column(3).set_cell_text_align(fort::text_align::left);
+            table.column(4).set_cell_text_align(fort::text_align::right);
+            table.column(5).set_cell_text_align(fort::text_align::center);
+
+            for (const auto &stats : step.layer_stats)
+            {
+                if (stats.stages_compared == 0)
+                    continue;
+
+                std::ostringstream layer_ss;
+                layer_ss << "Layer " << stats.layer_idx;
+
+                table << layer_ss.str()
+                      << fmt_f6(stats.avg_cosine_sim)
+                      << fmt_f6(stats.min_cosine_sim)
+                      << stats.worst_stage
+                      << stats.stages_compared
+                      << status_str(stats.passed)
+                      << fort::endr;
+            }
+
+            std::cout << table.to_string();
+        }
+
+        /**
          * @brief Assert decode parity criteria
          *
          * Call this after runSingleDeviceDecodeParity() or runTPDecodeParity()
@@ -3875,7 +4216,18 @@ namespace llaminar2::test::parity
             if (isRank0())
             {
                 renderDecodeParityTable(summary, getBackendName());
+
+                // Render layer-by-layer breakdown for the first decode step
+                // (most diagnostic for identifying where divergence originates)
+                if (!summary.step_stats.empty() &&
+                    !summary.step_stats[0].layer_stats.empty())
+                {
+                    renderDecodeLayerParityTable(summary.step_stats[0], getBackendName());
+                }
             }
+
+            // Export CSV results
+            exportDecodeCSV(summary);
 
             // Assertions (all ranks - GTest will aggregate failures)
             int min_steps_required = static_cast<int>(summary.steps_total * config_.min_decode_pass_rate);
@@ -3897,6 +4249,421 @@ namespace llaminar2::test::parity
                     << "PyTorch's top-1 token must appear in llaminar's top-" << config_.pytorch_top1_in_topk << " for every decode step. "
                     << "Failed: " << summary.top3_matches << "/" << summary.steps_total;
             }
+        }
+
+        // =========================================================================
+        // CSV Results Export
+        // =========================================================================
+
+        /**
+         * @brief Get abbreviated git hash of current HEAD
+         */
+        static std::string getGitHash()
+        {
+            std::string hash = "unknown";
+            FILE *pipe = popen("git rev-parse --short HEAD 2>/dev/null", "r");
+            if (pipe)
+            {
+                char buf[64];
+                if (fgets(buf, sizeof(buf), pipe))
+                {
+                    hash = buf;
+                    // Trim trailing newline
+                    while (!hash.empty() && (hash.back() == '\n' || hash.back() == '\r'))
+                        hash.pop_back();
+                }
+                pclose(pipe);
+            }
+            return hash;
+        }
+
+        /**
+         * @brief Get current GTest test name as "TestSuite/TestName"
+         */
+        static std::string getTestName()
+        {
+            const auto *info = ::testing::UnitTest::GetInstance()->current_test_info();
+            if (!info)
+                return "unknown";
+            std::string suite = info->test_suite_name() ? info->test_suite_name() : "";
+            std::string name = info->name() ? info->name() : "";
+            // For parameterized tests, name includes the parameter
+            return suite + "/" + name;
+        }
+
+        /**
+         * @brief Derive the parity results directory from __FILE__ path
+         *
+         * ParityTestBase.h lives at tests/v2/integration/parity/ParityTestBase.h
+         * Results go to tests/v2/integration/parity/results/<git_hash>/<test_name>/
+         */
+        static std::filesystem::path getResultsDir()
+        {
+            // Use __FILE__ to find the parity directory
+            std::filesystem::path this_file(__FILE__);
+            std::filesystem::path parity_dir = this_file.parent_path(); // .../tests/v2/integration/parity
+
+            std::string git_hash = getGitHash();
+            std::string test_name = getTestName();
+
+            // Sanitize test_name for filesystem (replace / with _)
+            std::string safe_name;
+            for (char c : test_name)
+            {
+                if (c == '/' || c == '\\' || c == ':' || c == '*' || c == '?' || c == '"' || c == '<' || c == '>' || c == '|')
+                    safe_name += '_';
+                else
+                    safe_name += c;
+            }
+
+            return parity_dir / "results" / git_hash / safe_name;
+        }
+
+        /**
+         * @brief Ensure results directory exists
+         */
+        static std::filesystem::path ensureResultsDir()
+        {
+            auto dir = getResultsDir();
+            std::error_code ec;
+            std::filesystem::create_directories(dir, ec);
+            if (ec)
+            {
+                LOG_WARN("Failed to create results directory: " << dir << " (" << ec.message() << ")");
+            }
+            return dir;
+        }
+
+        /**
+         * @brief Export prefill parity results to CSV
+         *
+         * Writes two CSV files:
+         *   - prefill_layers.csv: Per-layer metrics
+         *   - prefill_summary.csv: LM_HEAD and overall metrics
+         */
+        void exportPrefillCSV(const ParityTestSummary &summary)
+        {
+            if (!isRank0())
+                return;
+
+            auto dir = ensureResultsDir();
+            std::string backend = getBackendName();
+
+            // --- prefill_layers.csv ---
+            {
+                auto path = dir / "prefill_layers.csv";
+                std::ofstream f(path);
+                if (!f.is_open())
+                {
+                    LOG_WARN("Cannot write " << path);
+                    return;
+                }
+
+                f << "backend,layer,avg_cosine,min_cosine,worst_stage,stages_compared,max_kurtosis,max_kurtosis_stage,passed\n";
+
+                // Embedding row
+                f << backend << ",EMBEDDING,"
+                  << summary.embedding_cosine << ",,"
+                  << ",,,,,"
+                  << (summary.embedding_passed ? "true" : "false") << "\n";
+
+                for (const auto &ls : summary.layer_stats)
+                {
+                    f << backend << ","
+                      << ls.layer_idx << ","
+                      << ls.avg_cosine_sim << ","
+                      << ls.min_cosine_sim << ","
+                      << ls.worst_stage << ","
+                      << ls.stages_compared << ","
+                      << ls.max_kurtosis << ","
+                      << ls.max_kurtosis_stage << ","
+                      << (ls.passed ? "true" : "false") << "\n";
+                }
+
+                LOG_INFO("[CSV] Wrote " << path);
+            }
+
+            // --- prefill_summary.csv ---
+            {
+                auto path = dir / "prefill_summary.csv";
+                std::ofstream f(path);
+                if (!f.is_open())
+                {
+                    LOG_WARN("Cannot write " << path);
+                    return;
+                }
+
+                f << "backend,lm_head_cosine,lm_head_kl,lm_head_top1,lm_head_top5,"
+                  << "lm_head_pytorch_top1_in_topk,early_layers_passed,total_layers_passed,overall_passed\n";
+
+                f << backend << ","
+                  << summary.lm_head_cosine << ","
+                  << summary.lm_head_kl << ","
+                  << summary.lm_head_top1 << ","
+                  << summary.lm_head_top5 << ","
+                  << (summary.lm_head_pytorch_top1_in_top3 ? "true" : "false") << ","
+                  << summary.early_layers_passed << ","
+                  << summary.total_layers_passed << ","
+                  << (summary.overall_passed ? "true" : "false") << "\n";
+
+                LOG_INFO("[CSV] Wrote " << path);
+            }
+
+            // --- prefill_stages.csv (detailed per-stage distribution stats) ---
+            exportPrefillStagesCSV(summary);
+        }
+
+        /**
+         * @brief Export decode parity results to CSV
+         *
+         * Writes two CSV files:
+         *   - decode_steps.csv: Per-step LM_HEAD metrics
+         *   - decode_layers.csv: Per-step per-layer metrics (if layer stats captured)
+         */
+        void exportDecodeCSV(const DecodeParitySummary &summary)
+        {
+            if (!isRank0())
+                return;
+
+            auto dir = ensureResultsDir();
+            std::string backend = getBackendName();
+
+            // --- decode_steps.csv ---
+            {
+                auto path = dir / "decode_steps.csv";
+                std::ofstream f(path);
+                if (!f.is_open())
+                {
+                    LOG_WARN("Cannot write " << path);
+                    return;
+                }
+
+                f << "backend,step,cosine,kl_divergence,top1_overlap,top5_overlap,"
+                  << "llaminar_token,pytorch_token,token_match,top3_match,top5_match,passed\n";
+
+                for (const auto &ss : summary.step_stats)
+                {
+                    f << backend << ","
+                      << ss.step_idx << ","
+                      << ss.cosine_similarity << ","
+                      << ss.kl_divergence << ","
+                      << ss.top1_overlap << ","
+                      << ss.top5_overlap << ","
+                      << ss.llaminar_token << ","
+                      << ss.pytorch_token << ","
+                      << (ss.token_match ? "true" : "false") << ","
+                      << (ss.top3_match ? "true" : "false") << ","
+                      << (ss.top5_match ? "true" : "false") << ","
+                      << (ss.passed ? "true" : "false") << "\n";
+                }
+
+                LOG_INFO("[CSV] Wrote " << path);
+            }
+
+            // --- decode_layers.csv ---
+            {
+                bool has_layer_data = false;
+                for (const auto &ss : summary.step_stats)
+                {
+                    if (!ss.layer_stats.empty())
+                    {
+                        has_layer_data = true;
+                        break;
+                    }
+                }
+
+                if (!has_layer_data)
+                    return;
+
+                auto path = dir / "decode_layers.csv";
+                std::ofstream f(path);
+                if (!f.is_open())
+                {
+                    LOG_WARN("Cannot write " << path);
+                    return;
+                }
+
+                f << "backend,step,layer,avg_cosine,min_cosine,worst_stage,stages_compared,passed\n";
+
+                for (const auto &ss : summary.step_stats)
+                {
+                    for (const auto &ls : ss.layer_stats)
+                    {
+                        if (ls.stages_compared == 0)
+                            continue;
+
+                        f << backend << ","
+                          << ss.step_idx << ","
+                          << ls.layer_idx << ","
+                          << ls.avg_cosine_sim << ","
+                          << ls.min_cosine_sim << ","
+                          << ls.worst_stage << ","
+                          << ls.stages_compared << ","
+                          << (ls.passed ? "true" : "false") << "\n";
+                    }
+                }
+
+                LOG_INFO("[CSV] Wrote " << path);
+            }
+
+            // --- decode_stages.csv (detailed per-stage distribution stats) ---
+            exportDecodeStagesCSV(summary);
+        }
+
+        /**
+         * @brief Write the CSV header columns for TensorDistributionStats
+         *
+         * Used by both prefill and decode stage CSV writers.
+         * @param prefix "llaminar_" or "pytorch_"
+         */
+        static void writeDistributionStatsHeader(std::ofstream &f, const std::string &prefix)
+        {
+            f << prefix << "min," << prefix << "max,"
+              << prefix << "mean," << prefix << "stddev,"
+              << prefix << "kurtosis," << prefix << "skewness,"
+              << prefix << "p95," << prefix << "p99,"
+              << prefix << "outlier_frac," << prefix << "dynamic_range,"
+              << prefix << "sparsity," << prefix << "zero_frac,"
+              << prefix << "nan_count," << prefix << "inf_count,"
+              << prefix << "elements";
+        }
+
+        /**
+         * @brief Write the CSV data columns for TensorDistributionStats
+         */
+        static void writeDistributionStatsData(std::ofstream &f, const TensorDistributionStats &s)
+        {
+            f << s.min << "," << s.max << ","
+              << s.mean << "," << s.stddev << ","
+              << s.kurtosis << "," << s.skewness << ","
+              << s.p95 << "," << s.p99 << ","
+              << s.outlier_fraction << "," << s.dynamic_range << ","
+              << s.sparsity << "," << s.zero_fraction << ","
+              << s.nan_count << "," << s.inf_count << ","
+              << s.element_count;
+        }
+
+        /**
+         * @brief Export per-stage detailed distribution stats for prefill
+         *
+         * Called from exportPrefillCSV. Writes prefill_stages.csv with
+         * per-tensor (per-stage) numerical analysis of both llaminar and pytorch tensors.
+         */
+        void exportPrefillStagesCSV(const ParityTestSummary &summary)
+        {
+            if (!isRank0())
+                return;
+
+            auto dir = ensureResultsDir();
+            std::string backend = getBackendName();
+
+            auto path = dir / "prefill_stages.csv";
+            std::ofstream f(path);
+            if (!f.is_open())
+            {
+                LOG_WARN("Cannot write " << path);
+                return;
+            }
+
+            f << "backend,layer,stage,cosine,rel_l2,max_abs_diff,snr_db,rmse,error_entropy,";
+            writeDistributionStatsHeader(f, "llaminar_");
+            f << ",";
+            writeDistributionStatsHeader(f, "pytorch_");
+            f << "\n";
+
+            for (const auto &ls : summary.layer_stats)
+            {
+                for (const auto &sr : ls.stage_results)
+                {
+                    f << backend << ","
+                      << ls.layer_idx << ","
+                      << sr.stage_name << ","
+                      << sr.cosine_similarity << ","
+                      << sr.rel_l2_norm << ","
+                      << sr.max_abs_diff << ","
+                      << sr.snr_db << ","
+                      << sr.rmse << ","
+                      << sr.error_entropy << ",";
+                    writeDistributionStatsData(f, sr.llaminar_stats);
+                    f << ",";
+                    writeDistributionStatsData(f, sr.pytorch_stats);
+                    f << "\n";
+                }
+            }
+
+            LOG_INFO("[CSV] Wrote " << path);
+        }
+
+        /**
+         * @brief Export per-stage detailed distribution stats for decode
+         *
+         * Called from exportDecodeCSV. Writes decode_stages.csv with
+         * per-tensor (per-stage) numerical analysis of both llaminar and pytorch tensors.
+         */
+        void exportDecodeStagesCSV(const DecodeParitySummary &summary)
+        {
+            if (!isRank0())
+                return;
+
+            bool has_stage_data = false;
+            for (const auto &ss : summary.step_stats)
+            {
+                for (const auto &ls : ss.layer_stats)
+                {
+                    if (!ls.stage_results.empty())
+                    {
+                        has_stage_data = true;
+                        break;
+                    }
+                }
+                if (has_stage_data)
+                    break;
+            }
+            if (!has_stage_data)
+                return;
+
+            auto dir = ensureResultsDir();
+            std::string backend = getBackendName();
+
+            auto path = dir / "decode_stages.csv";
+            std::ofstream f(path);
+            if (!f.is_open())
+            {
+                LOG_WARN("Cannot write " << path);
+                return;
+            }
+
+            f << "backend,step,layer,stage,cosine,rel_l2,max_abs_diff,snr_db,rmse,error_entropy,";
+            writeDistributionStatsHeader(f, "llaminar_");
+            f << ",";
+            writeDistributionStatsHeader(f, "pytorch_");
+            f << "\n";
+
+            for (const auto &ss : summary.step_stats)
+            {
+                for (const auto &ls : ss.layer_stats)
+                {
+                    for (const auto &sr : ls.stage_results)
+                    {
+                        f << backend << ","
+                          << ss.step_idx << ","
+                          << ls.layer_idx << ","
+                          << sr.stage_name << ","
+                          << sr.cosine_similarity << ","
+                          << sr.rel_l2_norm << ","
+                          << sr.max_abs_diff << ","
+                          << sr.snr_db << ","
+                          << sr.rmse << ","
+                          << sr.error_entropy << ",";
+                        writeDistributionStatsData(f, sr.llaminar_stats);
+                        f << ",";
+                        writeDistributionStatsData(f, sr.pytorch_stats);
+                        f << "\n";
+                    }
+                }
+            }
+
+            LOG_INFO("[CSV] Wrote " << path);
         }
     };
 

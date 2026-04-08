@@ -367,121 +367,24 @@ namespace llaminar2::cpu::native_vnni
             const int K_blocks = (k + 31) / 32;
 
             // -----------------------------------------------------------
-            // Fused GEMV path (M == 1): all projections in a single OMP
-            // parallel region.  Pre-quantize A→Q8_1 once, prepare all
-            // workspaces, then run the GEMV calls inside one team — each
-            // inner gemv_native_vnni_preq detects omp_in_parallel() and
-            // emits only #pragma omp for (no fork/join per projection).
+            // M==1 decode path: delegate to multiply_tensor per projection.
+            // multiply_tensor handles ensureWorkspace + gemv + clearWorkspace
+            // correctly for all weight formats and configurations.
             // -----------------------------------------------------------
             if (m == 1)
             {
-                // Check that every projection is a VNNI kernel we can fuse.
-                bool all_vnni = true;
                 for (const auto &proj : projections)
                 {
                     if (!proj.kernel || !proj.output)
                         return false;
-                    auto *vnni = dynamic_cast<CPUNativeVNNIGemmKernel *>(proj.kernel);
-                    if (!vnni || !vnni->valid_)
-                    {
-                        all_vnni = false;
-                        break;
-                    }
+                    
+                    bool success = proj.kernel->multiply_tensor(
+                        input, proj.output, m, proj.n, k,
+                        true, 1.0f, 0.0f, proj.bias, mpi_ctx, -1, workspace);
+                    if (!success)
+                        return false;
                 }
-
-                if (all_vnni)
-                {
-                    const int num_proj = static_cast<int>(projections.size());
-
-                    // 1. Prepare workspaces: size the shared buffer for ALL
-                    //    projections at once so their interleaved data coexists.
-                    //    Q8_0 deferred projections use zero-copy (no repack needed).
-                    auto &ws = sharedWorkspace();
-                    size_t total_ws = 0;
-                    for (const auto &proj : projections)
-                    {
-                        auto *vnni = static_cast<CPUNativeVNNIGemmKernel *>(proj.kernel);
-                        if (vnni->deferred_packing_ && vnni->packed_.codebook_id != 19)
-                            total_ws += interleavedWorkspaceSize(vnni->packed_);
-                    }
-                    if (total_ws > 0 && ws.size() < total_ws)
-                        ws.resize_uninitialized(total_ws);
-
-                    // Repack each deferred projection at its own offset.
-                    // Q8_0 deferred: zero-copy (point workspace at native blocks).
-                    size_t ws_offset = 0;
-                    for (const auto &proj : projections)
-                    {
-                        auto *vnni = static_cast<CPUNativeVNNIGemmKernel *>(proj.kernel);
-                        if (vnni->deferred_packing_)
-                        {
-                            if (vnni->packed_.codebook_id == 19)
-                            {
-                                vnni->packed_.setWorkspace(vnni->native_blocks_ptr_);
-                            }
-                            else
-                            {
-                                const size_t sz = interleavedWorkspaceSize(vnni->packed_);
-                                repackNativeBlocksToInterleaved(
-                                    vnni->native_blocks_ptr_, vnni->native_block_size_,
-                                    vnni->packed_, ws.data() + ws_offset);
-                                vnni->packed_.setWorkspace(ws.data() + ws_offset);
-                                ws_offset += sz;
-                            }
-                        }
-                    }
-
-                    // 2. Quantize activations → Q8_1 once (shared across all projections).
-                    if (static_cast<int>(q8_scratch_.size()) < K_blocks)
-                        q8_scratch_.resize(K_blocks);
-                    {
-                        int kb = 0;
-#if defined(__AVX512F__)
-                        const bool k_aligned = (k % 32 == 0);
-                        if (k_aligned)
-                        {
-                            for (; kb + 1 < K_blocks; kb += 2)
-                                simd::quantize_two_blocks_avx512(
-                                    input_data + kb * 32, q8_scratch_[kb], q8_scratch_[kb + 1]);
-                        }
-#endif
-                        for (; kb < K_blocks; ++kb)
-                        {
-                            int block_start = kb * 32;
-                            int block_len = std::min(32, k - block_start);
-                            simd::quantize_single_block(input_data + block_start, q8_scratch_[kb], block_len);
-                        }
-                    }
-
-                    // 3. Build fused descriptors and dispatch.
-                    //    Uses nowait between projections so threads finishing
-                    //    a small projection (K/V = 512 rows) immediately start
-                    //    the next without waiting at a barrier.
-                    FusedGemvDesc descs[8]; // max 8 projections (QKV=3, GateUp=2)
-                    for (int p = 0; p < num_proj; ++p)
-                    {
-                        auto *vnni = static_cast<CPUNativeVNNIGemmKernel *>(projections[p].kernel);
-                        descs[p].packed = &vnni->packed_;
-                        descs[p].q8_0_raw = (vnni->deferred_packing_ && vnni->packed_.codebook_id == 19)
-                                                ? reinterpret_cast<const Q8_0Block *>(vnni->native_blocks_ptr_)
-                                                : nullptr;
-                        descs[p].output = projections[p].output->mutable_data();
-                        descs[p].bias = projections[p].bias ? projections[p].bias->data() : nullptr;
-                        descs[p].N = projections[p].n;
-                        descs[p].bpr = vnni->packed_.blocks_per_row;
-                    }
-
-                    gemv_native_vnni_fused_preq(q8_scratch_.data(), descs, num_proj);
-
-                    // 4. Clear workspace pointers.
-                    for (const auto &proj : projections)
-                    {
-                        auto *vnni = static_cast<CPUNativeVNNIGemmKernel *>(proj.kernel);
-                        if (vnni->deferred_packing_)
-                            vnni->packed_.clearWorkspace();
-                    }
-                    return true;
-                }
+                return true;
             }
 
             // -----------------------------------------------------------

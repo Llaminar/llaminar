@@ -605,8 +605,18 @@ if(HAVE_ROCM)
     set_target_properties(rocm_backend PROPERTIES
         HIP_RESOLVE_DEVICE_SYMBOLS ON
     )
-    target_include_directories(rocm_backend PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-    target_link_libraries(rocm_backend PUBLIC hip::host roc::hipblas)
+    target_include_directories(rocm_backend PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${ROCM_PATH}/include
+        ${ROCM_PATH}/hip/include
+        ${ROCM_PATH}/hipblas/include
+        ${ROCM_PATH}/hipblaslt/include
+    )
+    target_link_libraries(rocm_backend PUBLIC
+        hip::host                                # HIP runtime
+        roc::hipblas                             # hipBLAS
+        ${ROCM_PATH}/lib/libhipblaslt.so         # hipBLASLt for fused GEMM+bias
+    )
     
     # RCCLBackend.cpp needs MPI for MPIContext
     target_link_libraries(rocm_backend PUBLIC MPI::MPI_CXX)
@@ -1659,18 +1669,11 @@ endif()
 # =============================================================================
 if(HAVE_ROCM)
     target_compile_definitions(llaminar2_core PUBLIC HAVE_ROCM)
-    target_include_directories(llaminar2_core PUBLIC 
-        ${ROCM_PATH}/include
-        ${ROCM_PATH}/hip/include
-        ${ROCM_PATH}/hipblas/include
-        ${ROCM_PATH}/hipblaslt/include
-    )
-    target_link_libraries(llaminar2_core PUBLIC 
-        hip::host      # HIP runtime
-        roc::hipblas   # hipBLAS
-        ${ROCM_PATH}/lib/libhipblaslt.so  # hipBLASLt for fused GEMM+bias
-    )
-    message(STATUS "V2: Linked HIP runtime, hipBLAS, and hipBLASLt")
+    # NOTE: HIP runtime, hipBLAS, hipBLASLt, and ROCm include directories are
+    # linked to rocm_backend (not llaminar2_core) to consolidate all HIP
+    # dependencies in one place. They flow transitively via the PUBLIC link
+    # from rocm_backend → llaminar2_core → executables.
+    message(STATUS "V2: ROCm libraries available via rocm_backend (hip::host, hipBLAS, hipBLASLt)")
     
     # NOTE: RCCL is linked to rocm_backend (not llaminar2_core) to isolate symbols
     # from NCCL. Both libraries export the same symbols (ncclCommInitRank, etc.)

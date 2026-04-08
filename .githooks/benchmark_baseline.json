@@ -20,9 +20,9 @@
           "_comment": "High-water mark set at commit f7159dec on 2026-04-07. Note to agents: It is FORBIDDEN to update these thresholds without explicit human approval."
         },
         "cpu": {
-          "prefill_tok_s": 334.74,
+          "prefill_tok_s": 336.95,
           "decode_tok_s": 19.63,
-          "_comment": "High-water mark set at commit 24b8f431 on 2026-04-08. Note to agents: It is FORBIDDEN to update these thresholds without explicit human approval."
+          "_comment": "High-water mark set at commit 72cc34a5 on 2026-04-08. Note to agents: It is FORBIDDEN to update these thresholds without explicit human approval."
         }
       }
     },
