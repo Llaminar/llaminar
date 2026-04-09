@@ -89,9 +89,10 @@ __global__ void rocm_rope_fp32_decode_kernel(
     const float *__restrict__ inv_freq,
     int pos,        // Single position value (not array)
     int n_heads,
-    int head_dim)
+    int head_dim,
+    int rotary_dim)
 {
-    const int half_dim = head_dim / 2;
+    const int half_rotary = rotary_dim / 2;
 
     // Each block handles one head
     int head_idx = blockIdx.x;
@@ -101,10 +102,10 @@ __global__ void rocm_rope_fp32_decode_kernel(
     // Shared memory for sin/cos cache
     extern __shared__ float smem[];
     float *s_cos = smem;
-    float *s_sin = smem + half_dim;
+    float *s_sin = smem + half_rotary;
 
     // Step 1: Cooperatively compute sin/cos table
-    for (int i = threadIdx.x; i < half_dim; i += blockDim.x)
+    for (int i = threadIdx.x; i < half_rotary; i += blockDim.x)
     {
         float angle = pos * inv_freq[i];
         s_cos[i] = __cosf(angle);
@@ -115,10 +116,10 @@ __global__ void rocm_rope_fp32_decode_kernel(
     // Step 2: Apply rotation (seq_idx=0 for decode)
     int base_idx = head_idx * head_dim;
 
-    for (int i = threadIdx.x; i < half_dim; i += blockDim.x)
+    for (int i = threadIdx.x; i < half_rotary; i += blockDim.x)
     {
         int i0 = base_idx + i;
-        int i1 = base_idx + i + half_dim;
+        int i1 = base_idx + i + half_rotary;
 
         float x0 = data[i0];
         float x1 = data[i1];
@@ -136,9 +137,10 @@ __global__ void rocm_rope_bf16_decode_kernel(
     const float *__restrict__ inv_freq,
     int pos,
     int n_heads,
-    int head_dim)
+    int head_dim,
+    int rotary_dim)
 {
-    const int half_dim = head_dim / 2;
+    const int half_rotary = rotary_dim / 2;
 
     int head_idx = blockIdx.x;
     if (head_idx >= n_heads)
@@ -146,9 +148,9 @@ __global__ void rocm_rope_bf16_decode_kernel(
 
     extern __shared__ float smem[];
     float *s_cos = smem;
-    float *s_sin = smem + half_dim;
+    float *s_sin = smem + half_rotary;
 
-    for (int i = threadIdx.x; i < half_dim; i += blockDim.x)
+    for (int i = threadIdx.x; i < half_rotary; i += blockDim.x)
     {
         float angle = pos * inv_freq[i];
         s_cos[i] = __cosf(angle);
@@ -158,10 +160,10 @@ __global__ void rocm_rope_bf16_decode_kernel(
 
     int base_idx = head_idx * head_dim;
 
-    for (int i = threadIdx.x; i < half_dim; i += blockDim.x)
+    for (int i = threadIdx.x; i < half_rotary; i += blockDim.x)
     {
         int i0 = base_idx + i;
-        int i1 = base_idx + i + half_dim;
+        int i1 = base_idx + i + half_rotary;
 
         float x0 = bf16_to_float(data[i0]);
         float x1 = bf16_to_float(data[i1]);
@@ -179,9 +181,10 @@ __global__ void rocm_rope_fp16_decode_kernel(
     const float *__restrict__ inv_freq,
     int pos,
     int n_heads,
-    int head_dim)
+    int head_dim,
+    int rotary_dim)
 {
-    const int half_dim = head_dim / 2;
+    const int half_rotary = rotary_dim / 2;
 
     int head_idx = blockIdx.x;
     if (head_idx >= n_heads)
@@ -189,9 +192,9 @@ __global__ void rocm_rope_fp16_decode_kernel(
 
     extern __shared__ float smem[];
     float *s_cos = smem;
-    float *s_sin = smem + half_dim;
+    float *s_sin = smem + half_rotary;
 
-    for (int i = threadIdx.x; i < half_dim; i += blockDim.x)
+    for (int i = threadIdx.x; i < half_rotary; i += blockDim.x)
     {
         float angle = pos * inv_freq[i];
         s_cos[i] = __cosf(angle);
@@ -201,10 +204,10 @@ __global__ void rocm_rope_fp16_decode_kernel(
 
     int base_idx = head_idx * head_dim;
 
-    for (int i = threadIdx.x; i < half_dim; i += blockDim.x)
+    for (int i = threadIdx.x; i < half_rotary; i += blockDim.x)
     {
         int i0 = base_idx + i;
-        int i1 = base_idx + i + half_dim;
+        int i1 = base_idx + i + half_rotary;
 
         float x0 = fp16_to_float(data[i0]);
         float x1 = fp16_to_float(data[i1]);
@@ -231,14 +234,15 @@ __global__ void rocm_rope_fp32_contiguous_kernel(
     int seq_len,
     int n_heads,
     int head_dim,
+    int rotary_dim,
     const llaminar2::rope::RoPEDeviceParams* __restrict__ device_params)
 {
     const int effective_pos_offset = (device_params) ? device_params->pos_offset : pos_offset;
-    const int half_dim = head_dim / 2;
+    const int half_rotary = rotary_dim / 2;
 
     extern __shared__ float smem[];
     float *s_cos = smem;
-    float *s_sin = smem + half_dim;
+    float *s_sin = smem + half_rotary;
 
     int block_idx = blockIdx.x;
     int head_idx = block_idx % n_heads;
@@ -251,7 +255,7 @@ __global__ void rocm_rope_fp32_contiguous_kernel(
     int pos = effective_pos_offset + seq_idx;
 
     // Compute sin/cos table
-    for (int i = threadIdx.x; i < half_dim; i += blockDim.x)
+    for (int i = threadIdx.x; i < half_rotary; i += blockDim.x)
     {
         float angle = pos * inv_freq[i];
         s_cos[i] = __cosf(angle);
@@ -262,10 +266,10 @@ __global__ void rocm_rope_fp32_contiguous_kernel(
     // Apply rotation
     int base_idx = seq_idx * n_heads * head_dim + head_idx * head_dim;
 
-    for (int i = threadIdx.x; i < half_dim; i += blockDim.x)
+    for (int i = threadIdx.x; i < half_rotary; i += blockDim.x)
     {
         int i0 = base_idx + i;
-        int i1 = base_idx + i + half_dim;
+        int i1 = base_idx + i + half_rotary;
 
         float x0 = data[i0];
         float x1 = data[i1];
@@ -287,14 +291,15 @@ __global__ void rocm_rope_fp32_fused_qk_contiguous_kernel(
     int n_q_heads,
     int n_kv_heads,
     int head_dim,
+    int rotary_dim,
     const llaminar2::rope::RoPEDeviceParams* __restrict__ device_params)
 {
     const int effective_pos_offset = (device_params) ? device_params->pos_offset : pos_offset;
-    const int half_dim = head_dim / 2;
+    const int half_rotary = rotary_dim / 2;
 
     extern __shared__ float smem[];
     float *s_cos = smem;
-    float *s_sin = smem + half_dim;
+    float *s_sin = smem + half_rotary;
 
     int total_q_blocks = seq_len * n_q_heads;
     int block_idx = blockIdx.x;
@@ -326,7 +331,7 @@ __global__ void rocm_rope_fp32_fused_qk_contiguous_kernel(
 
     int pos = effective_pos_offset + seq_idx;
 
-    for (int i = threadIdx.x; i < half_dim; i += blockDim.x)
+    for (int i = threadIdx.x; i < half_rotary; i += blockDim.x)
     {
         float angle = pos * inv_freq[i];
         s_cos[i] = __cosf(angle);
@@ -336,10 +341,10 @@ __global__ void rocm_rope_fp32_fused_qk_contiguous_kernel(
 
     int base_idx = seq_idx * n_heads * head_dim + head_idx * head_dim;
 
-    for (int i = threadIdx.x; i < half_dim; i += blockDim.x)
+    for (int i = threadIdx.x; i < half_rotary; i += blockDim.x)
     {
         int i0 = base_idx + i;
-        int i1 = base_idx + i + half_dim;
+        int i1 = base_idx + i + half_rotary;
 
         float x0 = data[i0];
         float x1 = data[i1];
@@ -359,14 +364,15 @@ __global__ void rocm_rope_bf16_contiguous_kernel(
     int seq_len,
     int n_heads,
     int head_dim,
+    int rotary_dim,
     const llaminar2::rope::RoPEDeviceParams* __restrict__ device_params)
 {
     const int effective_pos_offset = (device_params) ? device_params->pos_offset : pos_offset;
-    const int half_dim = head_dim / 2;
+    const int half_rotary = rotary_dim / 2;
 
     extern __shared__ float smem[];
     float *s_cos = smem;
-    float *s_sin = smem + half_dim;
+    float *s_sin = smem + half_rotary;
 
     int block_idx = blockIdx.x;
     int head_idx = block_idx % n_heads;
@@ -377,7 +383,7 @@ __global__ void rocm_rope_bf16_contiguous_kernel(
 
     int pos = effective_pos_offset + seq_idx;
 
-    for (int i = threadIdx.x; i < half_dim; i += blockDim.x)
+    for (int i = threadIdx.x; i < half_rotary; i += blockDim.x)
     {
         float angle = pos * inv_freq[i];
         s_cos[i] = __cosf(angle);
@@ -387,10 +393,10 @@ __global__ void rocm_rope_bf16_contiguous_kernel(
 
     int base_idx = seq_idx * n_heads * head_dim + head_idx * head_dim;
 
-    for (int i = threadIdx.x; i < half_dim; i += blockDim.x)
+    for (int i = threadIdx.x; i < half_rotary; i += blockDim.x)
     {
         int i0 = base_idx + i;
-        int i1 = base_idx + i + half_dim;
+        int i1 = base_idx + i + half_rotary;
 
         float x0 = bf16_to_float(data[i0]);
         float x1 = bf16_to_float(data[i1]);
@@ -412,14 +418,15 @@ __global__ void rocm_rope_bf16_fused_qk_contiguous_kernel(
     int n_q_heads,
     int n_kv_heads,
     int head_dim,
+    int rotary_dim,
     const llaminar2::rope::RoPEDeviceParams* __restrict__ device_params)
 {
     const int effective_pos_offset = (device_params) ? device_params->pos_offset : pos_offset;
-    const int half_dim = head_dim / 2;
+    const int half_rotary = rotary_dim / 2;
 
     extern __shared__ float smem[];
     float *s_cos = smem;
-    float *s_sin = smem + half_dim;
+    float *s_sin = smem + half_rotary;
 
     int total_q_blocks = seq_len * n_q_heads;
     int block_idx = blockIdx.x;
@@ -451,7 +458,7 @@ __global__ void rocm_rope_bf16_fused_qk_contiguous_kernel(
 
     int pos = effective_pos_offset + seq_idx;
 
-    for (int i = threadIdx.x; i < half_dim; i += blockDim.x)
+    for (int i = threadIdx.x; i < half_rotary; i += blockDim.x)
     {
         float angle = pos * inv_freq[i];
         s_cos[i] = __cosf(angle);
@@ -461,10 +468,10 @@ __global__ void rocm_rope_bf16_fused_qk_contiguous_kernel(
 
     int base_idx = seq_idx * n_heads * head_dim + head_idx * head_dim;
 
-    for (int i = threadIdx.x; i < half_dim; i += blockDim.x)
+    for (int i = threadIdx.x; i < half_rotary; i += blockDim.x)
     {
         int i0 = base_idx + i;
-        int i1 = base_idx + i + half_dim;
+        int i1 = base_idx + i + half_rotary;
 
         float x0 = bf16_to_float(data[i0]);
         float x1 = bf16_to_float(data[i1]);
@@ -484,14 +491,15 @@ __global__ void rocm_rope_fp16_contiguous_kernel(
     int seq_len,
     int n_heads,
     int head_dim,
+    int rotary_dim,
     const llaminar2::rope::RoPEDeviceParams* __restrict__ device_params)
 {
     const int effective_pos_offset = (device_params) ? device_params->pos_offset : pos_offset;
-    const int half_dim = head_dim / 2;
+    const int half_rotary = rotary_dim / 2;
 
     extern __shared__ float smem[];
     float *s_cos = smem;
-    float *s_sin = smem + half_dim;
+    float *s_sin = smem + half_rotary;
 
     int block_idx = blockIdx.x;
     int head_idx = block_idx % n_heads;
@@ -502,7 +510,7 @@ __global__ void rocm_rope_fp16_contiguous_kernel(
 
     int pos = effective_pos_offset + seq_idx;
 
-    for (int i = threadIdx.x; i < half_dim; i += blockDim.x)
+    for (int i = threadIdx.x; i < half_rotary; i += blockDim.x)
     {
         float angle = pos * inv_freq[i];
         s_cos[i] = __cosf(angle);
@@ -512,10 +520,10 @@ __global__ void rocm_rope_fp16_contiguous_kernel(
 
     int base_idx = seq_idx * n_heads * head_dim + head_idx * head_dim;
 
-    for (int i = threadIdx.x; i < half_dim; i += blockDim.x)
+    for (int i = threadIdx.x; i < half_rotary; i += blockDim.x)
     {
         int i0 = base_idx + i;
-        int i1 = base_idx + i + half_dim;
+        int i1 = base_idx + i + half_rotary;
 
         float x0 = fp16_to_float(data[i0]);
         float x1 = fp16_to_float(data[i1]);
@@ -537,14 +545,15 @@ __global__ void rocm_rope_fp16_fused_qk_contiguous_kernel(
     int n_q_heads,
     int n_kv_heads,
     int head_dim,
+    int rotary_dim,
     const llaminar2::rope::RoPEDeviceParams* __restrict__ device_params)
 {
     const int effective_pos_offset = (device_params) ? device_params->pos_offset : pos_offset;
-    const int half_dim = head_dim / 2;
+    const int half_rotary = rotary_dim / 2;
 
     extern __shared__ float smem[];
     float *s_cos = smem;
-    float *s_sin = smem + half_dim;
+    float *s_sin = smem + half_rotary;
 
     int total_q_blocks = seq_len * n_q_heads;
     int block_idx = blockIdx.x;
@@ -576,7 +585,7 @@ __global__ void rocm_rope_fp16_fused_qk_contiguous_kernel(
 
     int pos = effective_pos_offset + seq_idx;
 
-    for (int i = threadIdx.x; i < half_dim; i += blockDim.x)
+    for (int i = threadIdx.x; i < half_rotary; i += blockDim.x)
     {
         float angle = pos * inv_freq[i];
         s_cos[i] = __cosf(angle);
@@ -586,10 +595,10 @@ __global__ void rocm_rope_fp16_fused_qk_contiguous_kernel(
 
     int base_idx = seq_idx * n_heads * head_dim + head_idx * head_dim;
 
-    for (int i = threadIdx.x; i < half_dim; i += blockDim.x)
+    for (int i = threadIdx.x; i < half_rotary; i += blockDim.x)
     {
         int i0 = base_idx + i;
-        int i1 = base_idx + i + half_dim;
+        int i1 = base_idx + i + half_rotary;
 
         float x0 = fp16_to_float(data[i0]);
         float x1 = fp16_to_float(data[i1]);
@@ -612,7 +621,7 @@ __global__ void rocm_rope_fp16_fused_qk_contiguous_kernel(
  * 3. Apply rotation using cached sin/cos (pure FMA, no transcendentals per element)
  *
  * @param data Input/output tensor [seq_len, n_heads, head_dim]
- * @param inv_freq Pre-computed inverse frequencies [half_dim]
+ * @param inv_freq Pre-computed inverse frequencies [half_rotary]
  * @param position_ids Position IDs [seq_len] (device pointer)
  * @param seq_len Sequence length
  * @param n_heads Number of heads
@@ -624,14 +633,15 @@ __global__ void rocm_rope_fp32_kernel_v2(
     const int *__restrict__ position_ids,
     int seq_len,
     int n_heads,
-    int head_dim)
+    int head_dim,
+    int rotary_dim)
 {
-    const int half_dim = head_dim / 2;
+    const int half_rotary = rotary_dim / 2;
 
     // Shared memory for sin/cos cache
     extern __shared__ float smem[];
     float *s_cos = smem;
-    float *s_sin = smem + half_dim;
+    float *s_sin = smem + half_rotary;
 
     // Each block handles one (seq_idx, head_idx) pair
     int block_idx = blockIdx.x;
@@ -647,7 +657,7 @@ __global__ void rocm_rope_fp32_kernel_v2(
         return;
 
     // Step 1: Cooperatively compute sin/cos table into shared memory
-    for (int i = threadIdx.x; i < half_dim; i += blockDim.x)
+    for (int i = threadIdx.x; i < half_rotary; i += blockDim.x)
     {
         float angle = pos * inv_freq[i];
         s_cos[i] = __cosf(angle);
@@ -658,10 +668,10 @@ __global__ void rocm_rope_fp32_kernel_v2(
     // Step 2: Apply rotation using cached sin/cos (pure FMA)
     int base_idx = seq_idx * n_heads * head_dim + head_idx * head_dim;
 
-    for (int i = threadIdx.x; i < half_dim; i += blockDim.x)
+    for (int i = threadIdx.x; i < half_rotary; i += blockDim.x)
     {
         int i0 = base_idx + i;
-        int i1 = base_idx + i + half_dim;
+        int i1 = base_idx + i + half_rotary;
 
         float x0 = data[i0];
         float x1 = data[i1];
@@ -687,13 +697,14 @@ __global__ void rocm_rope_fp32_fused_qk_kernel(
     int seq_len,
     int n_q_heads,
     int n_kv_heads,
-    int head_dim)
+    int head_dim,
+    int rotary_dim)
 {
-    const int half_dim = head_dim / 2;
+    const int half_rotary = rotary_dim / 2;
 
     extern __shared__ float smem[];
     float *s_cos = smem;
-    float *s_sin = smem + half_dim;
+    float *s_sin = smem + half_rotary;
 
     int total_q_blocks = seq_len * n_q_heads;
     int block_idx = blockIdx.x;
@@ -730,7 +741,7 @@ __global__ void rocm_rope_fp32_fused_qk_kernel(
         return;
 
     // Compute sin/cos table
-    for (int i = threadIdx.x; i < half_dim; i += blockDim.x)
+    for (int i = threadIdx.x; i < half_rotary; i += blockDim.x)
     {
         float angle = pos * inv_freq[i];
         s_cos[i] = __cosf(angle);
@@ -741,10 +752,10 @@ __global__ void rocm_rope_fp32_fused_qk_kernel(
     // Apply rotation
     int base_idx = seq_idx * n_heads * head_dim + head_idx * head_dim;
 
-    for (int i = threadIdx.x; i < half_dim; i += blockDim.x)
+    for (int i = threadIdx.x; i < half_rotary; i += blockDim.x)
     {
         int i0 = base_idx + i;
-        int i1 = base_idx + i + half_dim;
+        int i1 = base_idx + i + half_rotary;
 
         float x0 = data[i0];
         float x1 = data[i1];
@@ -763,13 +774,14 @@ __global__ void rocm_rope_bf16_kernel_v2(
     const int *__restrict__ position_ids,
     int seq_len,
     int n_heads,
-    int head_dim)
+    int head_dim,
+    int rotary_dim)
 {
-    const int half_dim = head_dim / 2;
+    const int half_rotary = rotary_dim / 2;
 
     extern __shared__ float smem[];
     float *s_cos = smem;
-    float *s_sin = smem + half_dim;
+    float *s_sin = smem + half_rotary;
 
     int block_idx = blockIdx.x;
     int head_idx = block_idx % n_heads;
@@ -783,7 +795,7 @@ __global__ void rocm_rope_bf16_kernel_v2(
         return;
 
     // Compute sin/cos table
-    for (int i = threadIdx.x; i < half_dim; i += blockDim.x)
+    for (int i = threadIdx.x; i < half_rotary; i += blockDim.x)
     {
         float angle = pos * inv_freq[i];
         s_cos[i] = __cosf(angle);
@@ -794,10 +806,10 @@ __global__ void rocm_rope_bf16_kernel_v2(
     // Apply rotation
     int base_idx = seq_idx * n_heads * head_dim + head_idx * head_dim;
 
-    for (int i = threadIdx.x; i < half_dim; i += blockDim.x)
+    for (int i = threadIdx.x; i < half_rotary; i += blockDim.x)
     {
         int i0 = base_idx + i;
-        int i1 = base_idx + i + half_dim;
+        int i1 = base_idx + i + half_rotary;
 
         float x0 = bf16_to_float(data[i0]);
         float x1 = bf16_to_float(data[i1]);
@@ -820,13 +832,14 @@ __global__ void rocm_rope_bf16_fused_qk_kernel(
     int seq_len,
     int n_q_heads,
     int n_kv_heads,
-    int head_dim)
+    int head_dim,
+    int rotary_dim)
 {
-    const int half_dim = head_dim / 2;
+    const int half_rotary = rotary_dim / 2;
 
     extern __shared__ float smem[];
     float *s_cos = smem;
-    float *s_sin = smem + half_dim;
+    float *s_sin = smem + half_rotary;
 
     int total_q_blocks = seq_len * n_q_heads;
     int block_idx = blockIdx.x;
@@ -860,7 +873,7 @@ __global__ void rocm_rope_bf16_fused_qk_kernel(
     if (pos < 0)
         return;
 
-    for (int i = threadIdx.x; i < half_dim; i += blockDim.x)
+    for (int i = threadIdx.x; i < half_rotary; i += blockDim.x)
     {
         float angle = pos * inv_freq[i];
         s_cos[i] = __cosf(angle);
@@ -870,10 +883,10 @@ __global__ void rocm_rope_bf16_fused_qk_kernel(
 
     int base_idx = seq_idx * n_heads * head_dim + head_idx * head_dim;
 
-    for (int i = threadIdx.x; i < half_dim; i += blockDim.x)
+    for (int i = threadIdx.x; i < half_rotary; i += blockDim.x)
     {
         int i0 = base_idx + i;
-        int i1 = base_idx + i + half_dim;
+        int i1 = base_idx + i + half_rotary;
 
         float x0 = bf16_to_float(data[i0]);
         float x1 = bf16_to_float(data[i1]);
@@ -892,13 +905,14 @@ __global__ void rocm_rope_fp16_kernel_v2(
     const int *__restrict__ position_ids,
     int seq_len,
     int n_heads,
-    int head_dim)
+    int head_dim,
+    int rotary_dim)
 {
-    const int half_dim = head_dim / 2;
+    const int half_rotary = rotary_dim / 2;
 
     extern __shared__ float smem[];
     float *s_cos = smem;
-    float *s_sin = smem + half_dim;
+    float *s_sin = smem + half_rotary;
 
     int block_idx = blockIdx.x;
     int head_idx = block_idx % n_heads;
@@ -911,7 +925,7 @@ __global__ void rocm_rope_fp16_kernel_v2(
     if (pos < 0)
         return;
 
-    for (int i = threadIdx.x; i < half_dim; i += blockDim.x)
+    for (int i = threadIdx.x; i < half_rotary; i += blockDim.x)
     {
         float angle = pos * inv_freq[i];
         s_cos[i] = __cosf(angle);
@@ -921,10 +935,10 @@ __global__ void rocm_rope_fp16_kernel_v2(
 
     int base_idx = seq_idx * n_heads * head_dim + head_idx * head_dim;
 
-    for (int i = threadIdx.x; i < half_dim; i += blockDim.x)
+    for (int i = threadIdx.x; i < half_rotary; i += blockDim.x)
     {
         int i0 = base_idx + i;
-        int i1 = base_idx + i + half_dim;
+        int i1 = base_idx + i + half_rotary;
 
         float x0 = fp16_to_float(data[i0]);
         float x1 = fp16_to_float(data[i1]);
@@ -947,13 +961,14 @@ __global__ void rocm_rope_fp16_fused_qk_kernel(
     int seq_len,
     int n_q_heads,
     int n_kv_heads,
-    int head_dim)
+    int head_dim,
+    int rotary_dim)
 {
-    const int half_dim = head_dim / 2;
+    const int half_rotary = rotary_dim / 2;
 
     extern __shared__ float smem[];
     float *s_cos = smem;
-    float *s_sin = smem + half_dim;
+    float *s_sin = smem + half_rotary;
 
     int total_q_blocks = seq_len * n_q_heads;
     int block_idx = blockIdx.x;
@@ -987,7 +1002,7 @@ __global__ void rocm_rope_fp16_fused_qk_kernel(
     if (pos < 0)
         return;
 
-    for (int i = threadIdx.x; i < half_dim; i += blockDim.x)
+    for (int i = threadIdx.x; i < half_rotary; i += blockDim.x)
     {
         float angle = pos * inv_freq[i];
         s_cos[i] = __cosf(angle);
@@ -997,10 +1012,10 @@ __global__ void rocm_rope_fp16_fused_qk_kernel(
 
     int base_idx = seq_idx * n_heads * head_dim + head_idx * head_dim;
 
-    for (int i = threadIdx.x; i < half_dim; i += blockDim.x)
+    for (int i = threadIdx.x; i < half_rotary; i += blockDim.x)
     {
         int i0 = base_idx + i;
-        int i1 = base_idx + i + half_dim;
+        int i1 = base_idx + i + half_rotary;
 
         float x0 = fp16_to_float(data[i0]);
         float x1 = fp16_to_float(data[i1]);
@@ -1039,14 +1054,15 @@ extern "C"
         int n_heads,
         int n_kv_heads,
         int head_dim,
+        int rotary_dim,
         int device_idx, void* stream)
     {
         llaminar2::HipDeviceGuard::setDevice(device_idx);
 
         hipStream_t hip_stream = static_cast<hipStream_t>(stream);
-        const int half_dim = head_dim / 2;
-        const int threads_per_block = min(256, half_dim);
-        const size_t smem_size = 2 * half_dim * sizeof(float); // sin + cos tables
+        const int half_rotary = head_dim / 2;
+        const int threads_per_block = min(256, half_rotary);
+        const size_t smem_size = 2 * half_rotary * sizeof(float); // sin + cos tables
 
         if (K != nullptr)
         {
@@ -1054,7 +1070,7 @@ extern "C"
             int total_blocks = seq_len * (n_heads + n_kv_heads);
             hipLaunchKernelGGL(rocm_rope_fp32_fused_qk_kernel, 
                                dim3(total_blocks), dim3(threads_per_block), smem_size, hip_stream,
-                               Q, K, inv_freq, position_ids, seq_len, n_heads, n_kv_heads, head_dim);
+                               Q, K, inv_freq, position_ids, seq_len, n_heads, n_kv_heads, head_dim, rotary_dim);
         }
         else
         {
@@ -1062,7 +1078,7 @@ extern "C"
             int num_blocks = seq_len * n_heads;
             hipLaunchKernelGGL(rocm_rope_fp32_kernel_v2, 
                                dim3(num_blocks), dim3(threads_per_block), smem_size, hip_stream,
-                               Q, inv_freq, position_ids, seq_len, n_heads, head_dim);
+                               Q, inv_freq, position_ids, seq_len, n_heads, head_dim, rotary_dim);
         }
 
         hipError_t err = hipGetLastError();
@@ -1083,28 +1099,29 @@ extern "C"
         int n_heads,
         int n_kv_heads,
         int head_dim,
+        int rotary_dim,
         int device_idx, void* stream)
     {
         llaminar2::HipDeviceGuard::setDevice(device_idx);
 
         hipStream_t hip_stream = static_cast<hipStream_t>(stream);
-        const int half_dim = head_dim / 2;
-        const int threads_per_block = min(256, half_dim);
-        const size_t smem_size = 2 * half_dim * sizeof(float);
+        const int half_rotary = head_dim / 2;
+        const int threads_per_block = min(256, half_rotary);
+        const size_t smem_size = 2 * half_rotary * sizeof(float);
 
         if (K != nullptr)
         {
             int total_blocks = seq_len * (n_heads + n_kv_heads);
             hipLaunchKernelGGL(rocm_rope_bf16_fused_qk_kernel, 
                                dim3(total_blocks), dim3(threads_per_block), smem_size, hip_stream,
-                               Q, K, inv_freq, position_ids, seq_len, n_heads, n_kv_heads, head_dim);
+                               Q, K, inv_freq, position_ids, seq_len, n_heads, n_kv_heads, head_dim, rotary_dim);
         }
         else
         {
             int num_blocks = seq_len * n_heads;
             hipLaunchKernelGGL(rocm_rope_bf16_kernel_v2, 
                                dim3(num_blocks), dim3(threads_per_block), smem_size, hip_stream,
-                               Q, inv_freq, position_ids, seq_len, n_heads, head_dim);
+                               Q, inv_freq, position_ids, seq_len, n_heads, head_dim, rotary_dim);
         }
 
         hipError_t err = hipGetLastError();
@@ -1125,28 +1142,29 @@ extern "C"
         int n_heads,
         int n_kv_heads,
         int head_dim,
+        int rotary_dim,
         int device_idx, void* stream)
     {
         llaminar2::HipDeviceGuard::setDevice(device_idx);
 
         hipStream_t hip_stream = static_cast<hipStream_t>(stream);
-        const int half_dim = head_dim / 2;
-        const int threads_per_block = min(256, half_dim);
-        const size_t smem_size = 2 * half_dim * sizeof(float);
+        const int half_rotary = head_dim / 2;
+        const int threads_per_block = min(256, half_rotary);
+        const size_t smem_size = 2 * half_rotary * sizeof(float);
 
         if (K != nullptr)
         {
             int total_blocks = seq_len * (n_heads + n_kv_heads);
             hipLaunchKernelGGL(rocm_rope_fp16_fused_qk_kernel, 
                                dim3(total_blocks), dim3(threads_per_block), smem_size, hip_stream,
-                               Q, K, inv_freq, position_ids, seq_len, n_heads, n_kv_heads, head_dim);
+                               Q, K, inv_freq, position_ids, seq_len, n_heads, n_kv_heads, head_dim, rotary_dim);
         }
         else
         {
             int num_blocks = seq_len * n_heads;
             hipLaunchKernelGGL(rocm_rope_fp16_kernel_v2, 
                                dim3(num_blocks), dim3(threads_per_block), smem_size, hip_stream,
-                               Q, inv_freq, position_ids, seq_len, n_heads, head_dim);
+                               Q, inv_freq, position_ids, seq_len, n_heads, head_dim, rotary_dim);
         }
 
         hipError_t err = hipGetLastError();
@@ -1176,26 +1194,27 @@ extern "C"
         int n_q_heads,
         int n_kv_heads,
         int head_dim,
+        int rotary_dim,
         int device_idx, void* stream)
     {
         llaminar2::HipDeviceGuard::setDevice(device_idx);
 
         hipStream_t hip_stream = static_cast<hipStream_t>(stream);
-        const int half_dim = head_dim / 2;
-        const int threads_per_block = min(256, half_dim);
-        const size_t smem_size = 2 * half_dim * sizeof(float);
+        const int half_rotary = head_dim / 2;
+        const int threads_per_block = min(256, half_rotary);
+        const size_t smem_size = 2 * half_rotary * sizeof(float);
 
         // Launch decode kernel for Q
         hipLaunchKernelGGL(rocm_rope_fp32_decode_kernel, 
                            dim3(n_q_heads), dim3(threads_per_block), smem_size, hip_stream,
-                           Q, inv_freq, pos, n_q_heads, head_dim);
+                           Q, inv_freq, pos, n_q_heads, head_dim, rotary_dim);
 
         // Launch decode kernel for K if provided
         if (K != nullptr)
         {
             hipLaunchKernelGGL(rocm_rope_fp32_decode_kernel, 
                                dim3(n_kv_heads), dim3(threads_per_block), smem_size, hip_stream,
-                               K, inv_freq, pos, n_kv_heads, head_dim);
+                               K, inv_freq, pos, n_kv_heads, head_dim, rotary_dim);
         }
 
         hipError_t err = hipGetLastError();
@@ -1215,24 +1234,25 @@ extern "C"
         int n_q_heads,
         int n_kv_heads,
         int head_dim,
+        int rotary_dim,
         int device_idx, void* stream)
     {
         llaminar2::HipDeviceGuard::setDevice(device_idx);
 
         hipStream_t hip_stream = static_cast<hipStream_t>(stream);
-        const int half_dim = head_dim / 2;
-        const int threads_per_block = min(256, half_dim);
-        const size_t smem_size = 2 * half_dim * sizeof(float);
+        const int half_rotary = head_dim / 2;
+        const int threads_per_block = min(256, half_rotary);
+        const size_t smem_size = 2 * half_rotary * sizeof(float);
 
         hipLaunchKernelGGL(rocm_rope_bf16_decode_kernel, 
                            dim3(n_q_heads), dim3(threads_per_block), smem_size, hip_stream,
-                           Q, inv_freq, pos, n_q_heads, head_dim);
+                           Q, inv_freq, pos, n_q_heads, head_dim, rotary_dim);
 
         if (K != nullptr)
         {
             hipLaunchKernelGGL(rocm_rope_bf16_decode_kernel, 
                                dim3(n_kv_heads), dim3(threads_per_block), smem_size, hip_stream,
-                               K, inv_freq, pos, n_kv_heads, head_dim);
+                               K, inv_freq, pos, n_kv_heads, head_dim, rotary_dim);
         }
 
         hipError_t err = hipGetLastError();
@@ -1252,24 +1272,25 @@ extern "C"
         int n_q_heads,
         int n_kv_heads,
         int head_dim,
+        int rotary_dim,
         int device_idx, void* stream)
     {
         llaminar2::HipDeviceGuard::setDevice(device_idx);
 
         hipStream_t hip_stream = static_cast<hipStream_t>(stream);
-        const int half_dim = head_dim / 2;
-        const int threads_per_block = min(256, half_dim);
-        const size_t smem_size = 2 * half_dim * sizeof(float);
+        const int half_rotary = head_dim / 2;
+        const int threads_per_block = min(256, half_rotary);
+        const size_t smem_size = 2 * half_rotary * sizeof(float);
 
         hipLaunchKernelGGL(rocm_rope_fp16_decode_kernel, 
                            dim3(n_q_heads), dim3(threads_per_block), smem_size, hip_stream,
-                           Q, inv_freq, pos, n_q_heads, head_dim);
+                           Q, inv_freq, pos, n_q_heads, head_dim, rotary_dim);
 
         if (K != nullptr)
         {
             hipLaunchKernelGGL(rocm_rope_fp16_decode_kernel, 
                                dim3(n_kv_heads), dim3(threads_per_block), smem_size, hip_stream,
-                               K, inv_freq, pos, n_kv_heads, head_dim);
+                               K, inv_freq, pos, n_kv_heads, head_dim, rotary_dim);
         }
 
         hipError_t err = hipGetLastError();
@@ -1300,29 +1321,30 @@ extern "C"
         int n_q_heads,
         int n_kv_heads,
         int head_dim,
+        int rotary_dim,
         int device_idx, void* stream,
         const llaminar2::rope::RoPEDeviceParams* device_params = nullptr)
     {
         llaminar2::HipDeviceGuard::setDevice(device_idx);
 
         hipStream_t hip_stream = static_cast<hipStream_t>(stream);
-        const int half_dim = head_dim / 2;
-        const int threads_per_block = min(256, half_dim);
-        const size_t smem_size = 2 * half_dim * sizeof(float);
+        const int half_rotary = head_dim / 2;
+        const int threads_per_block = min(256, half_rotary);
+        const size_t smem_size = 2 * half_rotary * sizeof(float);
 
         if (K != nullptr)
         {
             int total_blocks = seq_len * (n_q_heads + n_kv_heads);
             hipLaunchKernelGGL(rocm_rope_fp32_fused_qk_contiguous_kernel, 
                                dim3(total_blocks), dim3(threads_per_block), smem_size, hip_stream,
-                               Q, K, inv_freq, pos_offset, seq_len, n_q_heads, n_kv_heads, head_dim, device_params);
+                               Q, K, inv_freq, pos_offset, seq_len, n_q_heads, n_kv_heads, head_dim, rotary_dim, device_params);
         }
         else
         {
             int num_blocks = seq_len * n_q_heads;
             hipLaunchKernelGGL(rocm_rope_fp32_contiguous_kernel, 
                                dim3(num_blocks), dim3(threads_per_block), smem_size, hip_stream,
-                               Q, inv_freq, pos_offset, seq_len, n_q_heads, head_dim, device_params);
+                               Q, inv_freq, pos_offset, seq_len, n_q_heads, head_dim, rotary_dim, device_params);
         }
 
         hipError_t err = hipGetLastError();
@@ -1343,29 +1365,30 @@ extern "C"
         int n_q_heads,
         int n_kv_heads,
         int head_dim,
+        int rotary_dim,
         int device_idx, void* stream,
         const llaminar2::rope::RoPEDeviceParams* device_params = nullptr)
     {
         llaminar2::HipDeviceGuard::setDevice(device_idx);
 
         hipStream_t hip_stream = static_cast<hipStream_t>(stream);
-        const int half_dim = head_dim / 2;
-        const int threads_per_block = min(256, half_dim);
-        const size_t smem_size = 2 * half_dim * sizeof(float);
+        const int half_rotary = head_dim / 2;
+        const int threads_per_block = min(256, half_rotary);
+        const size_t smem_size = 2 * half_rotary * sizeof(float);
 
         if (K != nullptr)
         {
             int total_blocks = seq_len * (n_q_heads + n_kv_heads);
             hipLaunchKernelGGL(rocm_rope_bf16_fused_qk_contiguous_kernel, 
                                dim3(total_blocks), dim3(threads_per_block), smem_size, hip_stream,
-                               Q, K, inv_freq, pos_offset, seq_len, n_q_heads, n_kv_heads, head_dim, device_params);
+                               Q, K, inv_freq, pos_offset, seq_len, n_q_heads, n_kv_heads, head_dim, rotary_dim, device_params);
         }
         else
         {
             int num_blocks = seq_len * n_q_heads;
             hipLaunchKernelGGL(rocm_rope_bf16_contiguous_kernel, 
                                dim3(num_blocks), dim3(threads_per_block), smem_size, hip_stream,
-                               Q, inv_freq, pos_offset, seq_len, n_q_heads, head_dim, device_params);
+                               Q, inv_freq, pos_offset, seq_len, n_q_heads, head_dim, rotary_dim, device_params);
         }
 
         hipError_t err = hipGetLastError();
@@ -1386,29 +1409,30 @@ extern "C"
         int n_q_heads,
         int n_kv_heads,
         int head_dim,
+        int rotary_dim,
         int device_idx, void* stream,
         const llaminar2::rope::RoPEDeviceParams* device_params = nullptr)
     {
         llaminar2::HipDeviceGuard::setDevice(device_idx);
 
         hipStream_t hip_stream = static_cast<hipStream_t>(stream);
-        const int half_dim = head_dim / 2;
-        const int threads_per_block = min(256, half_dim);
-        const size_t smem_size = 2 * half_dim * sizeof(float);
+        const int half_rotary = head_dim / 2;
+        const int threads_per_block = min(256, half_rotary);
+        const size_t smem_size = 2 * half_rotary * sizeof(float);
 
         if (K != nullptr)
         {
             int total_blocks = seq_len * (n_q_heads + n_kv_heads);
             hipLaunchKernelGGL(rocm_rope_fp16_fused_qk_contiguous_kernel, 
                                dim3(total_blocks), dim3(threads_per_block), smem_size, hip_stream,
-                               Q, K, inv_freq, pos_offset, seq_len, n_q_heads, n_kv_heads, head_dim, device_params);
+                               Q, K, inv_freq, pos_offset, seq_len, n_q_heads, n_kv_heads, head_dim, rotary_dim, device_params);
         }
         else
         {
             int num_blocks = seq_len * n_q_heads;
             hipLaunchKernelGGL(rocm_rope_fp16_contiguous_kernel, 
                                dim3(num_blocks), dim3(threads_per_block), smem_size, hip_stream,
-                               Q, inv_freq, pos_offset, seq_len, n_q_heads, head_dim, device_params);
+                               Q, inv_freq, pos_offset, seq_len, n_q_heads, head_dim, rotary_dim, device_params);
         }
 
         hipError_t err = hipGetLastError();
@@ -1448,12 +1472,12 @@ extern "C"
      */
     __global__ void rope_populate_inv_freq_kernel(
         float *d_inv_freq,
-        int half_dim,
+        int half_rotary,
         float neg_log_base,
         int head_dim)
     {
         int i = hipBlockIdx_x * hipBlockDim_x + hipThreadIdx_x;
-        if (i < half_dim)
+        if (i < half_rotary)
         {
             float exponent = (2.0f * i) / head_dim;
             d_inv_freq[i] = expf(neg_log_base * exponent);
@@ -1469,7 +1493,7 @@ extern "C"
         if (!d_inv_freq)
             return false;
 
-        const int half_dim = head_dim / 2;
+        const int half_rotary = head_dim / 2;
         const float neg_log_base = -std::log(freq_base);
 
         llaminar2::HipDeviceGuard::setDevice(device_idx);
@@ -1479,10 +1503,10 @@ extern "C"
         // The kernel runs on the same default stream as subsequent RoPE kernels,
         // so ordering is guaranteed without explicit synchronization.
         constexpr int kBlockSize = 64;
-        int grid_size = (half_dim + kBlockSize - 1) / kBlockSize;
+        int grid_size = (half_rotary + kBlockSize - 1) / kBlockSize;
         hipLaunchKernelGGL(rope_populate_inv_freq_kernel,
                            dim3(grid_size), dim3(kBlockSize), 0, hip_stream,
-                           d_inv_freq, half_dim, neg_log_base, head_dim);
+                           d_inv_freq, half_rotary, neg_log_base, head_dim);
 
         hipError_t err = hipGetLastError();
         if (err != hipSuccess)

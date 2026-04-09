@@ -108,33 +108,33 @@ extern "C"
         float *d_inv_freq, int head_dim, float freq_base, int device_idx, cudaStream_t stream);
     bool cudaOps_rope_fp32_v3(
         float *Q, float *K, const float *d_inv_freq, const int *position_ids,
-        int seq_len, int n_heads, int n_kv_heads, int head_dim, int device_idx, cudaStream_t stream);
+        int seq_len, int n_heads, int n_kv_heads, int head_dim, int rotary_dim, int device_idx, cudaStream_t stream);
     bool cudaOps_rope_fp32_decode_v3(
         float *Q, float *K, const float *d_inv_freq, int pos,
-        int n_heads, int n_kv_heads, int head_dim, int device_idx, cudaStream_t stream);
+        int n_heads, int n_kv_heads, int head_dim, int rotary_dim, int device_idx, cudaStream_t stream);
     bool cudaOps_rope_fp32_contiguous_v3(
         float *Q, float *K, const float *d_inv_freq, int pos_offset, int seq_len,
-        int n_heads, int n_kv_heads, int head_dim, int device_idx, cudaStream_t stream,
+        int n_heads, int n_kv_heads, int head_dim, int rotary_dim, int device_idx, cudaStream_t stream,
         const llaminar2::rope::RoPEDeviceParams *device_params = nullptr);
     bool cudaOps_rope_bf16_v3(
         uint16_t *Q, uint16_t *K, const float *d_inv_freq, const int *position_ids,
-        int seq_len, int n_heads, int n_kv_heads, int head_dim, int device_idx, cudaStream_t stream);
+        int seq_len, int n_heads, int n_kv_heads, int head_dim, int rotary_dim, int device_idx, cudaStream_t stream);
     bool cudaOps_rope_bf16_decode_v3(
         uint16_t *Q, uint16_t *K, const float *d_inv_freq, int pos,
-        int n_heads, int n_kv_heads, int head_dim, int device_idx, cudaStream_t stream);
+        int n_heads, int n_kv_heads, int head_dim, int rotary_dim, int device_idx, cudaStream_t stream);
     bool cudaOps_rope_bf16_contiguous_v3(
         uint16_t *Q, uint16_t *K, const float *d_inv_freq, int pos_offset, int seq_len,
-        int n_heads, int n_kv_heads, int head_dim, int device_idx, cudaStream_t stream,
+        int n_heads, int n_kv_heads, int head_dim, int rotary_dim, int device_idx, cudaStream_t stream,
         const llaminar2::rope::RoPEDeviceParams *device_params = nullptr);
     bool cudaOps_rope_fp16_v3(
         uint16_t *Q, uint16_t *K, const float *d_inv_freq, const int *position_ids,
-        int seq_len, int n_heads, int n_kv_heads, int head_dim, int device_idx, cudaStream_t stream);
+        int seq_len, int n_heads, int n_kv_heads, int head_dim, int rotary_dim, int device_idx, cudaStream_t stream);
     bool cudaOps_rope_fp16_decode_v3(
         uint16_t *Q, uint16_t *K, const float *d_inv_freq, int pos,
-        int n_heads, int n_kv_heads, int head_dim, int device_idx, cudaStream_t stream);
+        int n_heads, int n_kv_heads, int head_dim, int rotary_dim, int device_idx, cudaStream_t stream);
     bool cudaOps_rope_fp16_contiguous_v3(
         uint16_t *Q, uint16_t *K, const float *d_inv_freq, int pos_offset, int seq_len,
-        int n_heads, int n_kv_heads, int head_dim, int device_idx, cudaStream_t stream,
+        int n_heads, int n_kv_heads, int head_dim, int rotary_dim, int device_idx, cudaStream_t stream,
         const llaminar2::rope::RoPEDeviceParams *device_params = nullptr);
 
     // Embedding lookup - FP32
@@ -633,12 +633,16 @@ namespace llaminar2
             int head_dim,
             float rope_theta,
             int device_idx,
-            int pos_offset)
+            int pos_offset,
+            int rotary_dim)
         {
             int dev = (device_idx >= 0) ? device_idx : device_idx_;
             CUDA_KERNEL_PROFILE_SCOPE(CUDAKernelType::ROPE);
             cudaStream_t stream = static_cast<cudaStream_t>(gpu_stream_);
             const bool sync_after = (stream == nullptr);
+
+            // Effective rotary dimension: 0 means full rotation (=head_dim)
+            const int eff_rotary = (rotary_dim > 0 && rotary_dim < head_dim) ? rotary_dim : head_dim;
 
             // Require workspace to be bound
             if (!workspace_)
@@ -655,15 +659,16 @@ namespace llaminar2
             }
 
             // Initialize inv_freq if needed (lazy initialization)
-            if (!inv_freq_initialized_ || inv_freq_head_dim_ != head_dim || inv_freq_theta_ != rope_theta)
+            // Use eff_rotary for frequency computation: inv_freq[i] = 1/(theta^(2i/eff_rotary))
+            if (!inv_freq_initialized_ || inv_freq_head_dim_ != eff_rotary || inv_freq_theta_ != rope_theta)
             {
-                if (!cudaOps_rope_populate_inv_freq(d_inv_freq, head_dim, rope_theta, dev, stream))
+                if (!cudaOps_rope_populate_inv_freq(d_inv_freq, eff_rotary, rope_theta, dev, stream))
                 {
                     LOG_ERROR("[CUDARoPEKernelT<FP32>] Failed to populate inv_freq");
                     return false;
                 }
                 inv_freq_initialized_ = true;
-                inv_freq_head_dim_ = head_dim;
+                inv_freq_head_dim_ = eff_rotary;
                 inv_freq_theta_ = rope_theta;
             }
 
@@ -677,7 +682,7 @@ namespace llaminar2
             {
                 int pos = position_ids ? position_ids[0] : pos_offset;
                 bool ok = cudaOps_rope_fp32_decode_v3(Q, K, d_inv_freq, pos,
-                                                      n_heads, n_kv_heads, head_dim, dev, stream);
+                                                      n_heads, n_kv_heads, head_dim, eff_rotary, dev, stream);
                 if (ok && sync_after)
                     cudaDeviceSynchronize();
                 return ok;
@@ -723,7 +728,7 @@ namespace llaminar2
                         }
                     }
                     bool ok = cudaOps_rope_fp32_contiguous_v3(Q, K, d_inv_freq, pos_offset, seq_len,
-                                                              n_heads, n_kv_heads, head_dim, dev, stream, d_params);
+                                                              n_heads, n_kv_heads, head_dim, eff_rotary, dev, stream, d_params);
                     if (ok && sync_after)
                         cudaDeviceSynchronize();
                     return ok;
@@ -748,7 +753,7 @@ namespace llaminar2
             }
 
             bool ok = cudaOps_rope_fp32_v3(Q, K, d_inv_freq, d_position_ids, seq_len,
-                                           n_heads, n_kv_heads, head_dim, dev, stream);
+                                           n_heads, n_kv_heads, head_dim, eff_rotary, dev, stream);
             if (ok && sync_after)
                 cudaDeviceSynchronize();
             return ok;
@@ -801,11 +806,15 @@ namespace llaminar2
             int head_dim,
             float rope_theta,
             int device_idx,
-            int pos_offset)
+            int pos_offset,
+            int rotary_dim)
         {
             int dev = (device_idx >= 0) ? device_idx : device_idx_;
             cudaStream_t stream = static_cast<cudaStream_t>(gpu_stream_);
             const bool sync_after = (stream == nullptr);
+
+            // Effective rotary dimension: 0 means full rotation (=head_dim)
+            const int eff_rotary = (rotary_dim > 0 && rotary_dim < head_dim) ? rotary_dim : head_dim;
 
             // Require workspace to be bound
             if (!workspace_)
@@ -822,15 +831,15 @@ namespace llaminar2
             }
 
             // Initialize inv_freq if needed (lazy initialization)
-            if (!inv_freq_initialized_ || inv_freq_head_dim_ != head_dim || inv_freq_theta_ != rope_theta)
+            if (!inv_freq_initialized_ || inv_freq_head_dim_ != eff_rotary || inv_freq_theta_ != rope_theta)
             {
-                if (!cudaOps_rope_populate_inv_freq(d_inv_freq, head_dim, rope_theta, dev, stream))
+                if (!cudaOps_rope_populate_inv_freq(d_inv_freq, eff_rotary, rope_theta, dev, stream))
                 {
                     LOG_ERROR("[CUDARoPEKernelT<BF16>] Failed to populate inv_freq");
                     return false;
                 }
                 inv_freq_initialized_ = true;
-                inv_freq_head_dim_ = head_dim;
+                inv_freq_head_dim_ = eff_rotary;
                 inv_freq_theta_ = rope_theta;
             }
 
@@ -841,7 +850,7 @@ namespace llaminar2
             {
                 int pos = position_ids ? position_ids[0] : pos_offset;
                 bool ok = cudaOps_rope_bf16_decode_v3(Q, K, d_inv_freq, pos,
-                                                      n_heads, n_kv_heads, head_dim, dev, stream);
+                                                      n_heads, n_kv_heads, head_dim, eff_rotary, dev, stream);
                 if (ok && sync_after)
                     cudaDeviceSynchronize();
                 return ok;
@@ -863,7 +872,6 @@ namespace llaminar2
                 }
                 if (is_contiguous)
                 {
-                    // For graph capture: use device params buffer so pos_offset can change between replays.
                     const rope::RoPEDeviceParams *d_params = nullptr;
                     if (gpu_stream_ && workspace_)
                     {
@@ -885,7 +893,7 @@ namespace llaminar2
                         }
                     }
                     bool ok = cudaOps_rope_bf16_contiguous_v3(Q, K, d_inv_freq, pos_offset, seq_len,
-                                                              n_heads, n_kv_heads, head_dim, dev, stream, d_params);
+                                                              n_heads, n_kv_heads, head_dim, eff_rotary, dev, stream, d_params);
                     if (ok && sync_after)
                         cudaDeviceSynchronize();
                     return ok;
@@ -910,7 +918,7 @@ namespace llaminar2
             }
 
             bool ok = cudaOps_rope_bf16_v3(Q, K, d_inv_freq, d_position_ids, seq_len,
-                                           n_heads, n_kv_heads, head_dim, dev, stream);
+                                           n_heads, n_kv_heads, head_dim, eff_rotary, dev, stream);
             if (ok && sync_after)
                 cudaDeviceSynchronize();
             return ok;
@@ -963,11 +971,15 @@ namespace llaminar2
             int head_dim,
             float rope_theta,
             int device_idx,
-            int pos_offset)
+            int pos_offset,
+            int rotary_dim)
         {
             int dev = (device_idx >= 0) ? device_idx : device_idx_;
             cudaStream_t stream = static_cast<cudaStream_t>(gpu_stream_);
             const bool sync_after = (stream == nullptr);
+
+            // Effective rotary dimension: 0 means full rotation (=head_dim)
+            const int eff_rotary = (rotary_dim > 0 && rotary_dim < head_dim) ? rotary_dim : head_dim;
 
             // Require workspace to be bound
             if (!workspace_)
@@ -984,15 +996,15 @@ namespace llaminar2
             }
 
             // Initialize inv_freq if needed (lazy initialization)
-            if (!inv_freq_initialized_ || inv_freq_head_dim_ != head_dim || inv_freq_theta_ != rope_theta)
+            if (!inv_freq_initialized_ || inv_freq_head_dim_ != eff_rotary || inv_freq_theta_ != rope_theta)
             {
-                if (!cudaOps_rope_populate_inv_freq(d_inv_freq, head_dim, rope_theta, dev, stream))
+                if (!cudaOps_rope_populate_inv_freq(d_inv_freq, eff_rotary, rope_theta, dev, stream))
                 {
                     LOG_ERROR("[CUDARoPEKernelT<FP16>] Failed to populate inv_freq");
                     return false;
                 }
                 inv_freq_initialized_ = true;
-                inv_freq_head_dim_ = head_dim;
+                inv_freq_head_dim_ = eff_rotary;
                 inv_freq_theta_ = rope_theta;
             }
 
@@ -1003,7 +1015,7 @@ namespace llaminar2
             {
                 int pos = position_ids ? position_ids[0] : pos_offset;
                 bool ok = cudaOps_rope_fp16_decode_v3(Q, K, d_inv_freq, pos,
-                                                      n_heads, n_kv_heads, head_dim, dev, stream);
+                                                      n_heads, n_kv_heads, head_dim, eff_rotary, dev, stream);
                 if (ok && sync_after)
                     cudaDeviceSynchronize();
                 return ok;
@@ -1025,7 +1037,6 @@ namespace llaminar2
                 }
                 if (is_contiguous)
                 {
-                    // For graph capture: use device params buffer so pos_offset can change between replays.
                     const rope::RoPEDeviceParams *d_params = nullptr;
                     if (gpu_stream_ && workspace_)
                     {
@@ -1047,7 +1058,7 @@ namespace llaminar2
                         }
                     }
                     bool ok = cudaOps_rope_fp16_contiguous_v3(Q, K, d_inv_freq, pos_offset, seq_len,
-                                                              n_heads, n_kv_heads, head_dim, dev, stream, d_params);
+                                                              n_heads, n_kv_heads, head_dim, eff_rotary, dev, stream, d_params);
                     if (ok && sync_after)
                         cudaDeviceSynchronize();
                     return ok;
@@ -1072,7 +1083,7 @@ namespace llaminar2
             }
 
             bool ok = cudaOps_rope_fp16_v3(Q, K, d_inv_freq, d_position_ids, seq_len,
-                                           n_heads, n_kv_heads, head_dim, dev, stream);
+                                           n_heads, n_kv_heads, head_dim, eff_rotary, dev, stream);
             if (ok && sync_after)
                 cudaDeviceSynchronize();
             return ok;

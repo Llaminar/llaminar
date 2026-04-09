@@ -729,7 +729,8 @@ namespace
         const int row_lane = tid % THREADS_PER_ROW;
         const bool thread_has_row = (local_q_row < q_tile_rows);
 
-        // head_dim <= 128 and THREADS_PER_ROW=4 => max 32 dims per thread.
+        // This tiled kernel runs only for head_dim < 64 (rocBLAS handles >= 64).
+        // THREADS_PER_ROW=4 => max ceil(head_dim/4) = 16 dims per thread.
         float O_acc[32];
         float m_i = -FLT_MAX;
         float l_i = 0.0f;
@@ -1248,12 +1249,13 @@ namespace
         // =====================================================================
         // Thread-local O accumulators — only this lane's output dimensions
         //
-        // For head_dim=128, WAVEFRONT_SIZE=64: each lane owns 2 dims
-        // Lane i owns dims: i, i+64 (i.e., strided by WAVEFRONT_SIZE)
+        // head_dim / WAVEFRONT_SIZE dims per lane (strided by WAVEFRONT_SIZE).
+        // head_dim=128 => 2 dims/lane, head_dim=256 => 4 dims/lane.
+        // Lane i owns dims: i, i+64, i+128, i+192 (up to head_dim).
         //
-        // This reduces VGPR usage from 128 to 2-4 floats per lane.
+        // This reduces VGPR usage to ceil(head_dim/64) floats per lane.
         // =====================================================================
-        float O_lane[4] = {0, 0, 0, 0}; // Supports head_dim up to 256
+        float O_lane[4] = {0, 0, 0, 0}; // Supports head_dim up to 256 (256/64=4)
         float m_local = -FLT_MAX;
         float l_local = 0.0f;
 
@@ -1373,7 +1375,7 @@ namespace
             l_local = l_local * scale_old + p;
 
             // Type-dispatched V load + O accumulation
-            // Each lane updates only its own output dims (2 for head_dim=128)
+            // Each lane updates only its own output dims (head_dim/64 per lane)
             const char *V_pos = V_base + kv_pos * row_byte_stride;
             int o_idx = 0;
             if constexpr (KV_TYPE == KVTypeTag::FP16)
@@ -1412,13 +1414,13 @@ namespace
         //
         // Each wavefront has:
         //   - (m_local, l_local) — uniform across its lanes
-        //   - O distributed across lanes (each lane owns 2 dims)
+        //   - O distributed across lanes (each lane owns head_dim/64 dims)
         //
         // We merge 4 wavefronts' results, then write the final partial output.
         // =====================================================================
         __shared__ float block_m[4];
         __shared__ float block_l[4];
-        __shared__ float block_O[4 * 128]; // 4 wavefronts × max head_dim
+        __shared__ float block_O[4 * 256]; // 4 wavefronts × max head_dim
 
         // Write this wavefront's results to LDS
         if (lane_id == 0)
@@ -1623,9 +1625,9 @@ static int launch_decode(
     const llaminar2::attention::AttentionDeviceParams *device_params,
     hipStream_t hip_stream)
 {
-    if (head_dim <= 0 || head_dim > 128)
+    if (head_dim <= 0 || head_dim > 256)
     {
-        printf("[launch_decode] Error: head_dim=%d must be in [1, 128]\n", head_dim);
+        printf("[launch_decode] Error: head_dim=%d must be in [1, 256]\n", head_dim);
         return -1;
     }
 
@@ -2291,9 +2293,9 @@ extern "C"
         hipStream_t hip_stream = static_cast<hipStream_t>(stream);
 
         // Input validation
-        if (head_dim <= 0 || head_dim > 128)
+        if (head_dim <= 0 || head_dim > 256)
         {
-            printf("[hipFlashAttn_prefill_fa2] Error: head_dim=%d must be in [1, 128]\n", head_dim);
+            printf("[hipFlashAttn_prefill_fa2] Error: head_dim=%d must be in [1, 256]\n", head_dim);
             return -1;
         }
         if (n_heads % n_kv_heads != 0)
@@ -2424,9 +2426,9 @@ extern "C"
     {
         hipStream_t hip_stream = static_cast<hipStream_t>(stream);
 
-        if (head_dim <= 0 || head_dim > 128)
+        if (head_dim <= 0 || head_dim > 256)
         {
-            printf("[hipFlashAttn_prefill_fa2_fp16] Error: head_dim=%d must be in [1, 128]\n", head_dim);
+            printf("[hipFlashAttn_prefill_fa2_fp16] Error: head_dim=%d must be in [1, 256]\n", head_dim);
             return -1;
         }
         if (n_heads % n_kv_heads != 0)
@@ -2471,9 +2473,9 @@ extern "C"
     {
         hipStream_t hip_stream = static_cast<hipStream_t>(stream);
 
-        if (head_dim <= 0 || head_dim > 128)
+        if (head_dim <= 0 || head_dim > 256)
         {
-            printf("[hipFlashAttn_prefill_fa2_q8_1] Error: head_dim=%d must be in [1, 128]\n", head_dim);
+            printf("[hipFlashAttn_prefill_fa2_q8_1] Error: head_dim=%d must be in [1, 256]\n", head_dim);
             return -1;
         }
         if (n_heads % n_kv_heads != 0)

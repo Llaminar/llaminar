@@ -52,10 +52,30 @@
 #include "CPUNativeVNNITileConfig.h"
 #include "tensors/BlockStructures.h"
 #include "tensors/SIMDHelpers.h"
+#include "utils/CPUFeatures.h"
 #include "utils/OpenMPUtils.h"
+
+// AVX2 GEMV/GEMM kernels (same packed weight format, uses emulated VNNI)
+#include "CPUNativeAVX2Gemv.h"
 
 namespace llaminar2::cpu::native_vnni
 {
+
+    // =========================================================================
+    // ISA dispatch enum for runtime-selectable GEMV/GEMM paths
+    // =========================================================================
+    //
+    // Both AVX512 and AVX2 paths are always compiled (no #ifdef gates around
+    // the dispatch logic). Tests can force either path on AVX512 hardware for
+    // parity comparison. AUTO selects the best available at runtime.
+    // =========================================================================
+
+    enum class ISAPath
+    {
+        AUTO,  // Runtime detection: AVX512-VNNI if available, else AVX2
+        AVX512, // Force AVX512-VNNI path (only valid on AVX512 hardware)
+        AVX2   // Force AVX2 emulated-VNNI path
+    };
 
     // =========================================================================
     // Scalar reference GEMV (any format, for correctness verification)

@@ -429,11 +429,6 @@ namespace llaminar2
         // and Wo projection is executed via gemm (AVX-512 VNNI) with on-the-fly activation quantization.
         bool wo_vnni_packed = false;
 
-        // Fused Attention + Wo (JIT backend only)
-        // When enabled, attention output is directly projected by Wo without intermediate memory write.
-        // Requires JIT backend and Q8_1 quantization.
-        bool fused_wo = true;
-
         // CPU flash attention KV tile overrides (0 or negative = disabled)
         int flash_kv_tile_decode = -1;  ///< Override decode kv tile (LLAMINAR_FLASH_ATTN_KV_TILE_DECODE)
         int flash_kv_tile_prefill = -1; ///< Override prefill kv tile (LLAMINAR_FLASH_ATTN_KV_TILE_PREFILL)
@@ -463,12 +458,6 @@ namespace llaminar2
             if (wo_vnni_env)
             {
                 wo_vnni_packed = (std::atoi(wo_vnni_env) != 0);
-            }
-
-            const char *fused_wo_env = std::getenv("LLAMINAR_FUSED_ATTENTION_WO");
-            if (fused_wo_env)
-            {
-                fused_wo = (std::atoi(fused_wo_env) != 0);
             }
 
             const char *flash_decode_tile_env = std::getenv("LLAMINAR_FLASH_ATTN_KV_TILE_DECODE");
@@ -1455,9 +1444,9 @@ namespace llaminar2
          * @brief Check if a specific stage name should be dumped
          *
          * Uses **substring matching** for flexibility:
-         * - "fused_attn_wo" matches "layer0_fused_attn_wo", "layer5_fused_attn_wo", etc.
+         * - "attn_norm" matches "layer0_attn_norm", "layer5_attn_norm", etc.
          * - "layer0" matches all layer0 stages
-         * - Exact match also works: "layer0_fused_attn_wo" matches "layer0_fused_attn_wo"
+         * - Exact match also works: "layer0_attn_norm" matches "layer0_attn_norm"
          *
          * @param stage_name Stage node name (e.g., "layer0_attention", "prefill_attention")
          * @return true if this stage name should be dumped

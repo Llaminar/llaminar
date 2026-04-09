@@ -64,45 +64,6 @@ namespace llaminar2
             return;
         }
 
-        // Handle fused attention+Wo stage — captures CONTEXT, OUTPUT, RESIDUAL
-        if (name.find("_fused_attn_wo") != std::string::npos)
-        {
-            size_t pos = name.find("_fused_attn_wo");
-            std::string prefix = name.substr(0, pos);
-
-            LOG_TRACE("[Snapshot] fused_attn_wo handler: prefix=" << prefix
-                                                                  << " dump.outputs.size()=" << dump.outputs.size());
-
-            for (size_t i = 0; i < dump.outputs.size(); ++i)
-            {
-                const auto &out = dump.outputs[i];
-                if (!out.data || !out.name)
-                    continue;
-
-                std::string out_name(out.name);
-                std::string key;
-
-                if (out_name == "context")
-                    key = prefix + "_ATTENTION_CONTEXT";
-                else if (out_name == "attention_output")
-                    key = prefix + "_ATTENTION_OUTPUT";
-                else if (out_name == "attention_residual")
-                    key = prefix + "_ATTENTION_RESIDUAL";
-                else if (out_name == "output")
-                    continue; // Skip primary output (handled by residual stage or is Q16_1)
-                else
-                {
-                    LOG_WARN("[Snapshot] fused_attn_wo unknown output name: " << out_name);
-                    continue;
-                }
-
-                LOG_TRACE("[Snapshot] Storing " << key << ": rows=" << out.rows
-                                                << " cols=" << out.cols);
-                storeOutput(key, out);
-            }
-            return;
-        }
-
         // Handle GDN 4-way projection — split into QKV, Z, alpha, beta snapshots
         if (name.find("_gdn_proj") != std::string::npos)
         {

@@ -822,7 +822,6 @@ struct StageDumpInfo {
 | `SwiGLUStage` | SWIGLU | SwiGLU activation | No |
 | `RoPEStage` | ROPE | Rotary position embeddings | No |
 | `ResidualAddStage` | ADD_RESIDUAL | Residual connections | No |
-| `FusedAttentionWoStage` | FUSED_ATTENTION_WO | Attention + Wo | No |
 | `AttentionComputeStage` | ATTENTION_COMPUTE | Pure attention | No |
 | `KVCacheAppendStage` | KV_CACHE_APPEND | KV cache management | No |
 | `EmbeddingStage` | EMBEDDING | Token embedding | No |

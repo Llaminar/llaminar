@@ -501,7 +501,7 @@ namespace llaminar2
                                                      d_C, Cdesc, // D (output, same as C)
                                                      &heuristicResult.algo,
                                                      lt_workspace_, lt_workspace_size_,
-                                                     0); // stream = 0 (default)
+                                                     static_cast<hipStream_t>(gpu_stream_));
 
             // Cleanup (workspace is cached, not freed here)
             hipblasLtMatmulPreferenceDestroy(preference);
@@ -581,6 +581,7 @@ namespace llaminar2
 
         void HipBLASGemmKernel::setStream(void *stream)
         {
+            gpu_stream_ = stream;
             if (handle_)
             {
                 hipblasSetStream(static_cast<hipblasHandle_t>(handle_),

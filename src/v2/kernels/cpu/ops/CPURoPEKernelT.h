@@ -136,7 +136,8 @@ namespace llaminar2
             int n_kv_heads,
             int head_dim,
             float rope_theta = 10000.0f,
-            int device_idx = -1);
+            int device_idx = -1,
+            int rotary_dim = 0);
     };
 
     // =========================================================================
@@ -183,7 +184,8 @@ namespace llaminar2
             int n_kv_heads,
             int head_dim,
             float rope_theta = 10000.0f,
-            int device_idx = -1);
+            int device_idx = -1,
+            int rotary_dim = 0);
 
         // Legacy FP32 apply - no longer part of ITensorRoPE interface
         bool apply(
@@ -206,7 +208,8 @@ namespace llaminar2
             float rope_theta,
             const IMPIContext *mpi_ctx = nullptr,
             int device_idx = -1,
-            int pos_offset = 0) override;
+            int pos_offset = 0,
+            int rotary_dim = 0) override;
     };
 
     // =========================================================================
@@ -253,7 +256,8 @@ namespace llaminar2
             int n_kv_heads,
             int head_dim,
             float rope_theta = 10000.0f,
-            int device_idx = -1);
+            int device_idx = -1,
+            int rotary_dim = 0);
 
         // Legacy BF16 apply_bf16 - no longer part of ITensorRoPE interface
         bool apply_bf16(
@@ -274,7 +278,8 @@ namespace llaminar2
             float rope_theta,
             const IMPIContext *mpi_ctx = nullptr,
             int device_idx = -1,
-            int pos_offset = 0) override;
+            int pos_offset = 0,
+            int rotary_dim = 0) override;
     };
 
     // =========================================================================
@@ -321,7 +326,8 @@ namespace llaminar2
             int n_kv_heads,
             int head_dim,
             float rope_theta = 10000.0f,
-            int device_idx = -1);
+            int device_idx = -1,
+            int rotary_dim = 0);
 
         // Legacy FP16 apply_fp16 - no longer part of ITensorRoPE interface
         bool apply_fp16(
@@ -342,7 +348,8 @@ namespace llaminar2
             float rope_theta,
             const IMPIContext *mpi_ctx = nullptr,
             int device_idx = -1,
-            int pos_offset = 0) override;
+            int pos_offset = 0,
+            int rotary_dim = 0) override;
     };
 
     // =========================================================================
@@ -399,7 +406,8 @@ namespace llaminar2
             int n_kv_heads,
             int head_dim,
             float rope_theta = 10000.0f,
-            int device_idx = -1);
+            int device_idx = -1,
+            int rotary_dim = 0);
 
         // Legacy Q8_1 apply_q8_1 - no longer part of ITensorRoPE interface
         bool apply_q8_1(
@@ -420,7 +428,8 @@ namespace llaminar2
             float rope_theta,
             const IMPIContext *mpi_ctx = nullptr,
             int device_idx = -1,
-            int pos_offset = 0) override;
+            int pos_offset = 0,
+            int rotary_dim = 0) override;
 
         // Hybrid mode: Q8_1 input → FP32 output (no requantization)
         bool apply_q8_1_to_fp32(
@@ -566,7 +575,8 @@ namespace llaminar2
             int n_kv_heads,
             int head_dim,
             float rope_theta = 10000.0f,
-            int device_idx = -1);
+            int device_idx = -1,
+            int rotary_dim = 0);
 
         /**
          * @brief Templated apply for variable Q16 block sizes
@@ -586,7 +596,8 @@ namespace llaminar2
             int n_kv_heads,
             int head_dim,
             float rope_theta = 10000.0f,
-            int device_idx = -1);
+            int device_idx = -1,
+            int rotary_dim = 0);
 
         // Legacy Q16_1 apply_q16_1 - no longer part of ITensorRoPE interface
         bool apply_q16_1(
@@ -608,7 +619,8 @@ namespace llaminar2
             float rope_theta,
             const IMPIContext *mpi_ctx = nullptr,
             int device_idx = -1,
-            int pos_offset = 0) override;
+            int pos_offset = 0,
+            int rotary_dim = 0) override;
 
     private:
         primitives::RoPEPersistentState tls_state_;

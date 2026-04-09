@@ -62,8 +62,6 @@ namespace llaminar2
             return "ATTENTION_SOFTMAX";
         case ComputeStageType::ATTENTION_V:
             return "ATTENTION_V";
-        case ComputeStageType::FUSED_ATTENTION_WO:
-            return "FUSED_ATTENTION_WO";
         case ComputeStageType::ADD_RESIDUAL:
             return "ADD_RESIDUAL";
         case ComputeStageType::SCALE:

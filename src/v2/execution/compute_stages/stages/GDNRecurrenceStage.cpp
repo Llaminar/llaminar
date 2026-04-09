@@ -9,6 +9,12 @@
  * [seq_len, q_dim + k_dim + v_dim]), this stage deinterleaves them into
  * separate contiguous arrays before passing to the kernel.
  *
+ * GPU path: Uses ensureOnDevice() / allocateOnDevice() / gpu_data_ptr() to
+ * keep data on-device. Merged QKV deinterleave is done on-device via the
+ * kernel's deinterleave_qkv_device() method. No H2D/D2H copies in the hot path.
+ *
+ * CPU path: Uses data() / mutable_data() host pointers with CPU-side deinterleave.
+ *
  * All preprocessing (L2 normalization, query scaling, gate computation)
  * is handled by the kernel, keeping this stage device-agnostic.
  */
@@ -55,6 +61,9 @@ namespace llaminar2
             return false;
         }
 
+        // Bind stage stream to kernel before execution
+        params_.kernel->setGPUStream(gpuStream());
+
         auto *q_base = requireTensorBasePtr(params_.Q, "Q");
         auto *k_base = requireTensorBasePtr(params_.K, "K");
         auto *v_base = requireTensorBasePtr(params_.V, "V");
@@ -74,7 +83,133 @@ namespace llaminar2
             return false;
         }
 
-        // Extract raw pointers — all computation delegated to kernel
+        // =====================================================================
+        // GPU path: keep data on-device, pass device pointers to kernel
+        // =====================================================================
+        if (device().is_gpu())
+        {
+            // Ensure all inputs are on device (const_cast is safe: ensureOnDevice
+            // is logically const — it changes physical placement, not tensor values)
+            const_cast<TensorBase *>(q_base)->ensureOnDevice(device());
+            const_cast<TensorBase *>(alpha_base)->ensureOnDevice(device());
+            const_cast<TensorBase *>(beta_base)->ensureOnDevice(device());
+            const_cast<TensorBase *>(alog_base)->ensureOnDevice(device());
+            const_cast<TensorBase *>(dtbias_base)->ensureOnDevice(device());
+
+            // Allocate output on device (kernel will overwrite)
+            const_cast<TensorBase *>(out_base)->allocateOnDevice(device());
+
+            // Get device pointers
+            const float *d_alpha = static_cast<const float *>(alpha_base->gpu_data_ptr());
+            const float *d_beta = static_cast<const float *>(beta_base->gpu_data_ptr());
+            const float *d_alog = static_cast<const float *>(alog_base->gpu_data_ptr());
+            const float *d_dtbias = static_cast<const float *>(dtbias_base->gpu_data_ptr());
+            float *d_output = static_cast<float *>(const_cast<TensorBase *>(out_base)->gpu_data_ptr());
+
+            // Resolve Q, K, V device pointers — handle merged QKV case
+            const float *d_q = nullptr;
+            const float *d_k = nullptr;
+            const float *d_v = nullptr;
+
+            // Check if merged: when Q, K, V all point to the same tensor
+            const bool merged_qkv = (params_.Q == params_.K && params_.K == params_.V);
+            const int nkh = (params_.n_k_heads > 0) ? params_.n_k_heads : params_.n_heads;
+
+            if (merged_qkv)
+            {
+                // Merged QKV buffer on device
+                const float *d_merged = static_cast<const float *>(q_base->gpu_data_ptr());
+
+                const int q_src_dim = nkh * params_.d_k;
+                const int k_src_dim = nkh * params_.d_k;
+                const int v_dim = params_.n_heads * params_.d_v;
+
+                if (params_.seq_len == 1 && nkh == params_.n_heads && params_.global_v_head_offset == 0)
+                {
+                    // Decode + identity + offset=0: Q, K, V are contiguous sub-regions
+                    // in a single row — just use offset pointers (zero-copy)
+                    d_q = d_merged;
+                    d_k = d_merged + q_src_dim;
+                    d_v = d_merged + q_src_dim + k_src_dim;
+                }
+                else
+                {
+                    // Use GPU deinterleave kernel for all other cases
+                    float *dq_mut = nullptr, *dk_mut = nullptr, *dv_mut = nullptr;
+                    if (!params_.kernel->deinterleave_qkv_device(
+                            d_merged, dq_mut, dk_mut, dv_mut,
+                            params_.seq_len, nkh, params_.n_heads,
+                            params_.d_k, params_.d_v, params_.global_v_head_offset))
+                    {
+                        LOG_ERROR("[GDNRecurrenceStage] GPU deinterleave_qkv_device failed");
+                        return false;
+                    }
+                    d_q = dq_mut;
+                    d_k = dk_mut;
+                    d_v = dv_mut;
+                }
+
+                LOG_DEBUG("[GDNRecurrenceStage] GPU merged QKV: "
+                          << params_.seq_len << "x" << (q_src_dim + k_src_dim + v_dim)
+                          << " nkh=" << nkh << " n_heads=" << params_.n_heads
+                          << " offset=" << params_.global_v_head_offset
+                          << (params_.seq_len == 1 ? " (decode offset)" : " (kernel deinterleave)"));
+            }
+            else
+            {
+                // Separate Q, K, V tensors — ensure each on device
+                const_cast<TensorBase *>(k_base)->ensureOnDevice(device());
+                const_cast<TensorBase *>(v_base)->ensureOnDevice(device());
+
+                d_q = static_cast<const float *>(q_base->gpu_data_ptr());
+                d_k = static_cast<const float *>(k_base->gpu_data_ptr());
+                d_v = static_cast<const float *>(v_base->gpu_data_ptr());
+            }
+
+            bool ok;
+            if (params_.seq_len == 1)
+            {
+                ok = params_.kernel->recurrent_step(
+                    d_q, d_k, d_v,
+                    d_alpha, d_beta,
+                    d_alog, d_dtbias,
+                    d_output, params_.recurrence_state,
+                    params_.n_heads, params_.d_k, params_.d_v,
+                    params_.use_qk_l2norm);
+            }
+            else
+            {
+                ok = params_.kernel->chunk_forward(
+                    d_q, d_k, d_v,
+                    d_alpha, d_beta,
+                    d_alog, d_dtbias,
+                    d_output, params_.recurrence_state,
+                    params_.seq_len, params_.n_heads, params_.d_k, params_.d_v,
+                    params_.chunk_size, params_.use_qk_l2norm);
+            }
+
+            if (!ok)
+            {
+                LOG_ERROR("[GDNRecurrenceStage] GPU kernel failed");
+                return false;
+            }
+
+            // Mark output as device-authoritative (kernel wrote to GPU buffer)
+            const_cast<TensorBase *>(out_base)->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, device());
+
+            LOG_DEBUG("[GDNRecurrenceStage] GPU layer=" << params_.layer_idx
+                                                        << " seq_len=" << params_.seq_len
+                                                        << " n_heads=" << params_.n_heads
+                                                        << " d_k=" << params_.d_k
+                                                        << " d_v=" << params_.d_v
+                                                        << (params_.seq_len == 1 ? " (decode)" : " (prefill)"));
+
+            return true;
+        }
+
+        // =====================================================================
+        // CPU path: use host pointers, CPU-side deinterleave
+        // =====================================================================
         const float *q_data = q_base->data();
         const float *k_data = k_base->data();
         const float *v_data = v_base->data();
@@ -311,7 +446,21 @@ namespace llaminar2
 
     bool GDNRecurrenceStage::supportsBackend(ComputeBackendType backend) const
     {
-        return backend == ComputeBackendType::CPU;
+        switch (backend)
+        {
+        case ComputeBackendType::CPU:
+            return true;
+#ifdef HAVE_CUDA
+        case ComputeBackendType::GPU_CUDA:
+            return true;
+#endif
+#ifdef HAVE_ROCM
+        case ComputeBackendType::GPU_ROCM:
+            return true;
+#endif
+        default:
+            return false;
+        }
     }
 
     StageDumpInfo GDNRecurrenceStage::buildDumpInfoImpl() const

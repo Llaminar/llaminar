@@ -11,7 +11,7 @@
  *   - Double-buffered shared memory for K/V tiles
  *   - Producer/consumer warp specialization
  *   - WMMA (Tensor Core) acceleration for Q @ K^T matmul
- *   - Adaptive tile sizing for head_dim=64 and head_dim=128
+ *   - Adaptive tile sizing for head_dim=64, head_dim=128, and head_dim=256
  * - Flash Decoding: Split-K parallelism for single-token decode
  *
  *
@@ -161,6 +161,7 @@ namespace
      * Configurations:
      *   - head_dim <= 64:  tile_q=96, 6 consumers, 256 threads
      *   - head_dim <= 128: tile_q=64, 4 consumers, 192 threads
+     *   - head_dim <= 256: tile_q=32, 2 consumers, 128 threads
      */
     struct FA2KernelConfig
     {
@@ -185,10 +186,15 @@ namespace
             target_tile_q = 96; // 6 * 16
             target_consumer_warps = 6;
         }
-        else
+        else if (head_dim <= 128)
         {
             target_tile_q = 64; // 4 * 16
             target_consumer_warps = 4;
+        }
+        else
+        {
+            target_tile_q = 32; // 2 * 16
+            target_consumer_warps = 2;
         }
 
         // Check for env-var tile_kv override (for parameter sweeps)
@@ -297,8 +303,8 @@ namespace
      * Producer/consumer warp specialization with WMMA Tensor Core acceleration.
      *
      * Template parameters:
-     *   NUM_CONSUMER_WARPS: Number of consumer warps (4 for head_dim=128, 6 for head_dim=64)
-     *   HEAD_DIM: Compile-time head dimension (64 or 128). Critical for enabling
+     *   NUM_CONSUMER_WARPS: Number of consumer warps (6 for head_dim=64, 4 for head_dim=128, 2 for head_dim=256)
+     *   HEAD_DIM: Compile-time head dimension (64, 128, or 256). Critical for enabling
      *             full unrolling of the P@V accumulation loop and keeping O_acc in
      *             registers. Without this, dims_per_lane is runtime → O_acc spills
      *             to local memory → 10-20x performance loss.
@@ -780,6 +786,22 @@ namespace
         int, int, int, int, int, int, float, bool, int, int,
         const llaminar2::attention::AttentionDeviceParams *, const float *,
         int, int, int, int);
+    // head_dim=256: 2 consumer warps, tile_q=32
+    template __global__ void flash_attention_2_pipelined_kernel<2, 256, 16, false>(
+        const float *, const void *, const void *, float *,
+        int, int, int, int, int, int, float, bool, int, int,
+        const llaminar2::attention::AttentionDeviceParams *, const float *,
+        int, int, int, int);
+    template __global__ void flash_attention_2_pipelined_kernel<2, 256, 32, false>(
+        const float *, const void *, const void *, float *,
+        int, int, int, int, int, int, float, bool, int, int,
+        const llaminar2::attention::AttentionDeviceParams *, const float *,
+        int, int, int, int);
+    template __global__ void flash_attention_2_pipelined_kernel<2, 256, 64, false>(
+        const float *, const void *, const void *, float *,
+        int, int, int, int, int, int, float, bool, int, int,
+        const llaminar2::attention::AttentionDeviceParams *, const float *,
+        int, int, int, int);
 
     // KV_FP16=true (FP16 K/V from KV cache — eliminates FP16→FP32→FP16 round-trip)
     template __global__ void flash_attention_2_pipelined_kernel<6, 64, 16, true>(
@@ -808,6 +830,22 @@ namespace
         const llaminar2::attention::AttentionDeviceParams *, const float *,
         int, int, int, int);
     template __global__ void flash_attention_2_pipelined_kernel<4, 128, 64, true>(
+        const float *, const void *, const void *, float *,
+        int, int, int, int, int, int, float, bool, int, int,
+        const llaminar2::attention::AttentionDeviceParams *, const float *,
+        int, int, int, int);
+    // head_dim=256: 2 consumer warps, tile_q=32
+    template __global__ void flash_attention_2_pipelined_kernel<2, 256, 16, true>(
+        const float *, const void *, const void *, float *,
+        int, int, int, int, int, int, float, bool, int, int,
+        const llaminar2::attention::AttentionDeviceParams *, const float *,
+        int, int, int, int);
+    template __global__ void flash_attention_2_pipelined_kernel<2, 256, 32, true>(
+        const float *, const void *, const void *, float *,
+        int, int, int, int, int, int, float, bool, int, int,
+        const llaminar2::attention::AttentionDeviceParams *, const float *,
+        int, int, int, int);
+    template __global__ void flash_attention_2_pipelined_kernel<2, 256, 64, true>(
         const float *, const void *, const void *, float *,
         int, int, int, int, int, int, float, bool, int, int,
         const llaminar2::attention::AttentionDeviceParams *, const float *,
@@ -978,7 +1016,7 @@ namespace
         // =================================================================
         __shared__ float block_m[8];
         __shared__ float block_l[8];
-        __shared__ float block_O[8 * 128]; // 8 warps × max head_dim=128
+        __shared__ float block_O[8 * 256]; // 8 warps × max head_dim=256
 
         if (lane_id == 0)
         {
@@ -1211,7 +1249,7 @@ namespace
 
         __shared__ float block_m[8];
         __shared__ float block_l[8];
-        __shared__ float block_O[8 * 128];
+        __shared__ float block_O[8 * 256];
 
         if (lane_id == 0)
         {
@@ -1419,7 +1457,7 @@ namespace
         // Inter-warp reduction (identical to FP32/FP16 variants)
         __shared__ float block_m[8];
         __shared__ float block_l[8];
-        __shared__ float block_O[8 * 128];
+        __shared__ float block_O[8 * 256];
 
         if (lane_id == 0)
         {
@@ -1643,7 +1681,7 @@ namespace
         __syncthreads();
 
         // Online softmax + KV loop
-        constexpr int MAX_DIMS_PER_LANE = 8; // head_dim/WARP_SIZE = 128/32 = 4, pad for safety
+        constexpr int MAX_DIMS_PER_LANE = 8; // head_dim/WARP_SIZE = 256/32 = 8
         float O_lane[MAX_DIMS_PER_LANE] = {0};
         float m_local = -FLT_MAX;
         float l_local = 0.0f;
@@ -1959,6 +1997,7 @@ __global__ void dequant_q8_1_to_fp32_dynamic_kernel(
  * @brief Internal templated FA2 launcher — dispatches based on head_dim + KV_FP16 flag.
  *   - head_dim <= 64:  6 consumer warps, tile_q=96, 256 threads
  *   - head_dim <= 128: 4 consumer warps, tile_q=64, 192 threads
+ *   - head_dim <= 256: 2 consumer warps, tile_q=32, 128 threads
  * Returns -1 on invalid input, -2 if GPU doesn't support SM 8.0.
  */
 template <bool KV_FP16>
@@ -2024,6 +2063,15 @@ static int fa2_prefill_launch(
             FA2_LAUNCH(6, 64, 16);
         else
             FA2_LAUNCH(6, 64, 32);
+    }
+    else if (cfg.num_consumer_warps == 2)
+    {
+        if (cfg.tile_kv == 64)
+            FA2_LAUNCH(2, 256, 64);
+        else if (cfg.tile_kv == 16)
+            FA2_LAUNCH(2, 256, 16);
+        else
+            FA2_LAUNCH(2, 256, 32);
     }
     else
     {

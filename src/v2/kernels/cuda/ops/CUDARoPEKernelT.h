@@ -126,7 +126,8 @@ namespace llaminar2
                 int head_dim,
                 float rope_theta,
                 int device_idx = -1,
-                int pos_offset = 0);
+                int pos_offset = 0,
+                int rotary_dim = 0);
 
             // ===== Tensor-aware API (uses GPU memory, marks outputs dirty) =====
             bool apply_tensor(
@@ -140,13 +141,15 @@ namespace llaminar2
                 float rope_theta,
                 const IMPIContext *mpi_ctx = nullptr,
                 int device_idx = -1,
-                int pos_offset = 0) override
+                int pos_offset = 0,
+                int rotary_dim = 0) override
             {
                 (void)mpi_ctx;
 
                 LOG_DEBUG("[CUDARoPEKernelT<FP32>] apply_tensor called: seq_len=" << seq_len
                                                                                   << " n_heads=" << n_heads << " device_idx=" << device_idx
-                                                                                  << " pos_offset=" << pos_offset);
+                                                                                  << " pos_offset=" << pos_offset
+                                                                                  << " rotary_dim=" << rotary_dim);
 
                 if (!Q || Q->native_type() != TensorType::FP32)
                 {
@@ -194,7 +197,7 @@ namespace llaminar2
                 }
 
                 // Execute on GPU
-                bool success = apply_typed(q_gpu, k_gpu, position_ids, seq_len, n_heads, n_kv_heads, head_dim, rope_theta, device_idx, pos_offset);
+                bool success = apply_typed(q_gpu, k_gpu, position_ids, seq_len, n_heads, n_kv_heads, head_dim, rope_theta, device_idx, pos_offset, rotary_dim);
 
                 // Mark tensors as modified on GPU
                 if (success)
@@ -330,7 +333,8 @@ namespace llaminar2
                 int head_dim,
                 float rope_theta,
                 int device_idx = -1,
-                int pos_offset = 0);
+                int pos_offset = 0,
+                int rotary_dim = 0);
 
             // ===== Tensor-aware API (uses GPU memory, marks outputs dirty) =====
             bool apply_tensor(
@@ -344,7 +348,8 @@ namespace llaminar2
                 float rope_theta,
                 const IMPIContext *mpi_ctx = nullptr,
                 int device_idx = -1,
-                int pos_offset = 0) override
+                int pos_offset = 0,
+                int rotary_dim = 0) override
             {
                 (void)mpi_ctx;
 
@@ -394,7 +399,7 @@ namespace llaminar2
                 }
 
                 // Execute on GPU
-                bool success = apply_typed(q_gpu, k_gpu, position_ids, seq_len, n_heads, n_kv_heads, head_dim, rope_theta, device_idx, pos_offset);
+                bool success = apply_typed(q_gpu, k_gpu, position_ids, seq_len, n_heads, n_kv_heads, head_dim, rope_theta, device_idx, pos_offset, rotary_dim);
 
                 // Mark tensors as modified on GPU
                 if (success)
@@ -534,7 +539,8 @@ namespace llaminar2
                 int head_dim,
                 float rope_theta,
                 int device_idx = -1,
-                int pos_offset = 0);
+                int pos_offset = 0,
+                int rotary_dim = 0);
 
             // ===== Tensor-aware API (uses GPU memory, marks outputs dirty) =====
             bool apply_tensor(
@@ -548,7 +554,8 @@ namespace llaminar2
                 float rope_theta,
                 const IMPIContext *mpi_ctx = nullptr,
                 int device_idx = -1,
-                int pos_offset = 0) override
+                int pos_offset = 0,
+                int rotary_dim = 0) override
             {
                 (void)mpi_ctx;
 
@@ -598,7 +605,7 @@ namespace llaminar2
                 }
 
                 // Execute on GPU
-                bool success = apply_typed(q_gpu, k_gpu, position_ids, seq_len, n_heads, n_kv_heads, head_dim, rope_theta, device_idx, pos_offset);
+                bool success = apply_typed(q_gpu, k_gpu, position_ids, seq_len, n_heads, n_kv_heads, head_dim, rope_theta, device_idx, pos_offset, rotary_dim);
 
                 // Mark tensors as modified on GPU
                 if (success)

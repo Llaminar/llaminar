@@ -197,14 +197,12 @@ namespace llaminar2
               device_id_(other.device_id_),
               precision_(other.precision_),
               owns_handle_(other.owns_handle_),
-              owns_lt_handle_(other.owns_lt_handle_),
-              gpu_stream_(other.gpu_stream_)
+              owns_lt_handle_(other.owns_lt_handle_)
         {
             other.handle_ = nullptr;
             other.lt_handle_ = nullptr;
             other.owns_handle_ = false;    // Moved-from object shouldn't destroy anything
             other.owns_lt_handle_ = false; // Moved-from object shouldn't destroy anything
-            other.gpu_stream_ = nullptr;
         }
 
         // Move assignment
@@ -232,13 +230,11 @@ namespace llaminar2
                 precision_ = other.precision_;
                 owns_handle_ = other.owns_handle_;
                 owns_lt_handle_ = other.owns_lt_handle_;
-                gpu_stream_ = other.gpu_stream_;
 
                 other.handle_ = nullptr;
                 other.lt_handle_ = nullptr;
                 other.owns_handle_ = false;
                 other.owns_lt_handle_ = false;
-                other.gpu_stream_ = nullptr;
             }
             return *this;
         }

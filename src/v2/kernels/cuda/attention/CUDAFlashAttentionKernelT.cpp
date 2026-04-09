@@ -23,7 +23,7 @@
 extern "C"
 {
     // FA2-style pipelined prefill with WMMA (Ampere SM >= 8.0)
-    // Supports head_dim=64 (6 consumer warps) and head_dim=128 (4 consumer warps)
+    // Supports head_dim=64 (6 consumer warps), head_dim=128 (4 consumer warps), and head_dim=256 (2 consumer warps)
     int cudaFlashAttn_prefill_fa2(
         const float *Q, const float *K, const float *V, float *O,
         int batch_size, int seq_len, int kv_len,

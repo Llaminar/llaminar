@@ -37,6 +37,7 @@ extern "C"
         int n_heads,
         int n_kv_heads,
         int head_dim,
+        int rotary_dim,
         int device_idx, void *stream);
 
     bool hipOps_rope_bf16_v2(
@@ -48,6 +49,7 @@ extern "C"
         int n_heads,
         int n_kv_heads,
         int head_dim,
+        int rotary_dim,
         int device_idx, void *stream);
 
     bool hipOps_rope_fp16_v2(
@@ -59,6 +61,7 @@ extern "C"
         int n_heads,
         int n_kv_heads,
         int head_dim,
+        int rotary_dim,
         int device_idx, void *stream);
 
     // Decode-optimized versions (scalar position, no H2D copy)
@@ -69,8 +72,7 @@ extern "C"
         int pos,
         int n_q_heads,
         int n_kv_heads,
-        int head_dim,
-        int device_idx, void *stream);
+        int head_dim, int rotary_dim, int device_idx, void *stream);
 
     bool hipOps_rope_bf16_decode(
         uint16_t *Q,
@@ -79,8 +81,7 @@ extern "C"
         int pos,
         int n_q_heads,
         int n_kv_heads,
-        int head_dim,
-        int device_idx, void *stream);
+        int head_dim, int rotary_dim, int device_idx, void *stream);
 
     bool hipOps_rope_fp16_decode(
         uint16_t *Q,
@@ -89,8 +90,7 @@ extern "C"
         int pos,
         int n_q_heads,
         int n_kv_heads,
-        int head_dim,
-        int device_idx, void *stream);
+        int head_dim, int rotary_dim, int device_idx, void *stream);
 
     // Contiguous position versions (zero-copy: positions computed on GPU)
     bool hipOps_rope_fp32_contiguous(
@@ -102,6 +102,7 @@ extern "C"
         int n_q_heads,
         int n_kv_heads,
         int head_dim,
+        int rotary_dim,
         int device_idx, void *stream,
         const llaminar2::rope::RoPEDeviceParams *device_params = nullptr);
 
@@ -114,6 +115,7 @@ extern "C"
         int n_q_heads,
         int n_kv_heads,
         int head_dim,
+        int rotary_dim,
         int device_idx, void *stream,
         const llaminar2::rope::RoPEDeviceParams *device_params = nullptr);
 
@@ -126,6 +128,7 @@ extern "C"
         int n_q_heads,
         int n_kv_heads,
         int head_dim,
+        int rotary_dim,
         int device_idx, void *stream,
         const llaminar2::rope::RoPEDeviceParams *device_params = nullptr);
 
@@ -231,9 +234,11 @@ namespace llaminar2
             int n_kv_heads,
             int head_dim,
             float rope_theta,
-            int device_idx)
+            int device_idx,
+            int rotary_dim)
         {
             int dev = (device_idx >= 0) ? device_idx : device_idx_;
+            const int eff_rotary = (rotary_dim > 0 && rotary_dim < head_dim) ? rotary_dim : head_dim;
 
             if (!validateROCmWorkspaceBinding(workspace_, dev, "ROCmRoPEKernelT<FP32>"))
             {
@@ -256,7 +261,7 @@ namespace llaminar2
                     return false;
                 }
                 inv_freq_initialized_ = true;
-                inv_freq_head_dim_ = head_dim;
+                inv_freq_head_dim_ = eff_rotary;
                 inv_freq_theta_ = rope_theta;
             }
 
@@ -277,7 +282,7 @@ namespace llaminar2
                 return false;
             }
 
-            return hipOps_rope_fp32_v2(Q, K, d_inv_freq, d_position_ids, seq_len, n_heads, n_kv_heads, head_dim, dev, gpu_stream_);
+            return hipOps_rope_fp32_v2(Q, K, d_inv_freq, d_position_ids, seq_len, n_heads, n_kv_heads, head_dim, eff_rotary, dev, gpu_stream_);
         }
 
         bool ROCmRoPEKernelT<ActivationPrecision::FP32>::apply_tensor(
@@ -291,7 +296,8 @@ namespace llaminar2
             float rope_theta,
             const IMPIContext *mpi_ctx,
             int device_idx,
-            int pos_offset)
+            int pos_offset,
+            int rotary_dim)
         {
             ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::ROPE, static_cast<hipStream_t>(gpu_stream_));
             (void)mpi_ctx;
@@ -332,6 +338,9 @@ namespace llaminar2
                 return false;
             }
 
+            // Effective rotary dimension: 0 means full rotation (=head_dim)
+            const int eff_rotary = (rotary_dim > 0 && rotary_dim < head_dim) ? rotary_dim : head_dim;
+
             float *d_inv_freq = static_cast<float *>(workspace_->getBuffer(RoPEWorkspaceBuffers::INV_FREQ));
             if (!d_inv_freq)
             {
@@ -340,15 +349,15 @@ namespace llaminar2
             }
 
             // Initialize inv_freq if needed (GPU-compute, fully async — no pipeline drain)
-            if (!inv_freq_initialized_ || inv_freq_head_dim_ != head_dim || inv_freq_theta_ != rope_theta)
+            if (!inv_freq_initialized_ || inv_freq_head_dim_ != eff_rotary || inv_freq_theta_ != rope_theta)
             {
-                if (!hipOps_rope_populate_inv_freq(d_inv_freq, head_dim, rope_theta, dev, gpu_stream_))
+                if (!hipOps_rope_populate_inv_freq(d_inv_freq, eff_rotary, rope_theta, dev, gpu_stream_))
                 {
                     LOG_ERROR("[ROCmRoPEKernelT<FP32>] Failed to populate inv_freq");
                     return false;
                 }
                 inv_freq_initialized_ = true;
-                inv_freq_head_dim_ = head_dim;
+                inv_freq_head_dim_ = eff_rotary;
                 inv_freq_theta_ = rope_theta;
             }
 
@@ -361,7 +370,7 @@ namespace llaminar2
             if (seq_len == 1 && !force_device_positions && !gpu_stream_)
             {
                 int pos = position_ids ? position_ids[0] : pos_offset;
-                return hipOps_rope_fp32_decode(d_Q, d_K, d_inv_freq, pos, n_heads, n_kv_heads, head_dim, dev, gpu_stream_);
+                return hipOps_rope_fp32_decode(d_Q, d_K, d_inv_freq, pos, n_heads, n_kv_heads, head_dim, eff_rotary, dev, gpu_stream_);
             }
 
             // CONTIGUOUS DETECTION: Check if positions are sequential (pos_offset, pos_offset+1, ...)
@@ -406,7 +415,7 @@ namespace llaminar2
                         }
                     }
                     return hipOps_rope_fp32_contiguous(d_Q, d_K, d_inv_freq, pos_offset, seq_len,
-                                                       n_heads, n_kv_heads, head_dim, dev, gpu_stream_, d_params);
+                                                       n_heads, n_kv_heads, head_dim, eff_rotary, dev, gpu_stream_, d_params);
                 }
             }
 
@@ -428,7 +437,7 @@ namespace llaminar2
             }
 
             // Call the optimized kernel
-            return hipOps_rope_fp32_v2(d_Q, d_K, d_inv_freq, d_position_ids, seq_len, n_heads, n_kv_heads, head_dim, dev, gpu_stream_);
+            return hipOps_rope_fp32_v2(d_Q, d_K, d_inv_freq, d_position_ids, seq_len, n_heads, n_kv_heads, head_dim, eff_rotary, dev, gpu_stream_);
         }
 
         // =========================================================================
@@ -512,9 +521,11 @@ namespace llaminar2
             int n_kv_heads,
             int head_dim,
             float rope_theta,
-            int device_idx)
+            int device_idx,
+            int rotary_dim)
         {
             int dev = (device_idx >= 0) ? device_idx : device_idx_;
+            const int eff_rotary = (rotary_dim > 0 && rotary_dim < head_dim) ? rotary_dim : head_dim;
 
             if (!validateROCmWorkspaceBinding(workspace_, dev, "ROCmRoPEKernelT<BF16>"))
             {
@@ -537,7 +548,7 @@ namespace llaminar2
                     return false;
                 }
                 inv_freq_initialized_ = true;
-                inv_freq_head_dim_ = head_dim;
+                inv_freq_head_dim_ = eff_rotary;
                 inv_freq_theta_ = rope_theta;
             }
 
@@ -558,7 +569,7 @@ namespace llaminar2
                 return false;
             }
 
-            return hipOps_rope_bf16_v2(Q, K, d_inv_freq, d_position_ids, seq_len, n_heads, n_kv_heads, head_dim, dev, gpu_stream_);
+            return hipOps_rope_bf16_v2(Q, K, d_inv_freq, d_position_ids, seq_len, n_heads, n_kv_heads, head_dim, eff_rotary, dev, gpu_stream_);
         }
 
         bool ROCmRoPEKernelT<ActivationPrecision::BF16>::apply_tensor(
@@ -572,7 +583,8 @@ namespace llaminar2
             float rope_theta,
             const IMPIContext *mpi_ctx,
             int device_idx,
-            int pos_offset)
+            int pos_offset,
+            int rotary_dim)
         {
             ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::ROPE, static_cast<hipStream_t>(gpu_stream_));
             (void)mpi_ctx;
@@ -612,6 +624,9 @@ namespace llaminar2
                 return false;
             }
 
+            // Effective rotary dimension: 0 means full rotation (=head_dim)
+            const int eff_rotary = (rotary_dim > 0 && rotary_dim < head_dim) ? rotary_dim : head_dim;
+
             float *d_inv_freq = static_cast<float *>(workspace_->getBuffer(RoPEWorkspaceBuffers::INV_FREQ));
             if (!d_inv_freq)
             {
@@ -620,15 +635,15 @@ namespace llaminar2
             }
 
             // Initialize inv_freq if needed
-            if (!inv_freq_initialized_ || inv_freq_head_dim_ != head_dim || inv_freq_theta_ != rope_theta)
+            if (!inv_freq_initialized_ || inv_freq_head_dim_ != eff_rotary || inv_freq_theta_ != rope_theta)
             {
-                if (!hipOps_rope_populate_inv_freq(d_inv_freq, head_dim, rope_theta, dev, gpu_stream_))
+                if (!hipOps_rope_populate_inv_freq(d_inv_freq, eff_rotary, rope_theta, dev, gpu_stream_))
                 {
                     LOG_ERROR("[ROCmRoPEKernelT<BF16>] Failed to populate inv_freq");
                     return false;
                 }
                 inv_freq_initialized_ = true;
-                inv_freq_head_dim_ = head_dim;
+                inv_freq_head_dim_ = eff_rotary;
                 inv_freq_theta_ = rope_theta;
             }
 
@@ -639,7 +654,7 @@ namespace llaminar2
             if (seq_len == 1 && !force_device_positions && !gpu_stream_)
             {
                 int pos = position_ids ? position_ids[0] : pos_offset;
-                return hipOps_rope_bf16_decode(d_Q, d_K, d_inv_freq, pos, n_heads, n_kv_heads, head_dim, dev, gpu_stream_);
+                return hipOps_rope_bf16_decode(d_Q, d_K, d_inv_freq, pos, n_heads, n_kv_heads, head_dim, eff_rotary, dev, gpu_stream_);
             }
 
             // CONTIGUOUS DETECTION: Avoid synchronous hipMemcpy pipeline drain
@@ -681,7 +696,7 @@ namespace llaminar2
                         }
                     }
                     return hipOps_rope_bf16_contiguous(d_Q, d_K, d_inv_freq, pos_offset, seq_len,
-                                                       n_heads, n_kv_heads, head_dim, dev, gpu_stream_, d_params);
+                                                       n_heads, n_kv_heads, head_dim, eff_rotary, dev, gpu_stream_, d_params);
                 }
             }
 
@@ -702,7 +717,7 @@ namespace llaminar2
                 return false;
             }
 
-            return hipOps_rope_bf16_v2(d_Q, d_K, d_inv_freq, d_position_ids, seq_len, n_heads, n_kv_heads, head_dim, dev, gpu_stream_);
+            return hipOps_rope_bf16_v2(d_Q, d_K, d_inv_freq, d_position_ids, seq_len, n_heads, n_kv_heads, head_dim, eff_rotary, dev, gpu_stream_);
         }
 
         // =========================================================================
@@ -786,9 +801,11 @@ namespace llaminar2
             int n_kv_heads,
             int head_dim,
             float rope_theta,
-            int device_idx)
+            int device_idx,
+            int rotary_dim)
         {
             int dev = (device_idx >= 0) ? device_idx : device_idx_;
+            const int eff_rotary = (rotary_dim > 0 && rotary_dim < head_dim) ? rotary_dim : head_dim;
 
             if (!validateROCmWorkspaceBinding(workspace_, dev, "ROCmRoPEKernelT<FP16>"))
             {
@@ -811,7 +828,7 @@ namespace llaminar2
                     return false;
                 }
                 inv_freq_initialized_ = true;
-                inv_freq_head_dim_ = head_dim;
+                inv_freq_head_dim_ = eff_rotary;
                 inv_freq_theta_ = rope_theta;
             }
 
@@ -832,7 +849,7 @@ namespace llaminar2
                 return false;
             }
 
-            return hipOps_rope_fp16_v2(Q, K, d_inv_freq, d_position_ids, seq_len, n_heads, n_kv_heads, head_dim, dev, gpu_stream_);
+            return hipOps_rope_fp16_v2(Q, K, d_inv_freq, d_position_ids, seq_len, n_heads, n_kv_heads, head_dim, eff_rotary, dev, gpu_stream_);
         }
 
         bool ROCmRoPEKernelT<ActivationPrecision::FP16>::apply_tensor(
@@ -846,7 +863,8 @@ namespace llaminar2
             float rope_theta,
             const IMPIContext *mpi_ctx,
             int device_idx,
-            int pos_offset)
+            int pos_offset,
+            int rotary_dim)
         {
             ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::ROPE, static_cast<hipStream_t>(gpu_stream_));
             (void)mpi_ctx;
@@ -886,6 +904,9 @@ namespace llaminar2
                 return false;
             }
 
+            // Effective rotary dimension: 0 means full rotation (=head_dim)
+            const int eff_rotary = (rotary_dim > 0 && rotary_dim < head_dim) ? rotary_dim : head_dim;
+
             float *d_inv_freq = static_cast<float *>(workspace_->getBuffer(RoPEWorkspaceBuffers::INV_FREQ));
             if (!d_inv_freq)
             {
@@ -894,15 +915,15 @@ namespace llaminar2
             }
 
             // Initialize inv_freq if needed
-            if (!inv_freq_initialized_ || inv_freq_head_dim_ != head_dim || inv_freq_theta_ != rope_theta)
+            if (!inv_freq_initialized_ || inv_freq_head_dim_ != eff_rotary || inv_freq_theta_ != rope_theta)
             {
-                if (!hipOps_rope_populate_inv_freq(d_inv_freq, head_dim, rope_theta, dev, gpu_stream_))
+                if (!hipOps_rope_populate_inv_freq(d_inv_freq, eff_rotary, rope_theta, dev, gpu_stream_))
                 {
                     LOG_ERROR("[ROCmRoPEKernelT<FP16>] Failed to populate inv_freq");
                     return false;
                 }
                 inv_freq_initialized_ = true;
-                inv_freq_head_dim_ = head_dim;
+                inv_freq_head_dim_ = eff_rotary;
                 inv_freq_theta_ = rope_theta;
             }
 
@@ -913,7 +934,7 @@ namespace llaminar2
             if (seq_len == 1 && !force_device_positions && !gpu_stream_)
             {
                 int pos = position_ids ? position_ids[0] : pos_offset;
-                return hipOps_rope_fp16_decode(d_Q, d_K, d_inv_freq, pos, n_heads, n_kv_heads, head_dim, dev, gpu_stream_);
+                return hipOps_rope_fp16_decode(d_Q, d_K, d_inv_freq, pos, n_heads, n_kv_heads, head_dim, eff_rotary, dev, gpu_stream_);
             }
 
             // CONTIGUOUS DETECTION: Avoid synchronous hipMemcpy pipeline drain
@@ -955,7 +976,7 @@ namespace llaminar2
                         }
                     }
                     return hipOps_rope_fp16_contiguous(d_Q, d_K, d_inv_freq, pos_offset, seq_len,
-                                                       n_heads, n_kv_heads, head_dim, dev, gpu_stream_, d_params);
+                                                       n_heads, n_kv_heads, head_dim, eff_rotary, dev, gpu_stream_, d_params);
                 }
             }
 
@@ -976,7 +997,7 @@ namespace llaminar2
                 return false;
             }
 
-            return hipOps_rope_fp16_v2(d_Q, d_K, d_inv_freq, d_position_ids, seq_len, n_heads, n_kv_heads, head_dim, dev, gpu_stream_);
+            return hipOps_rope_fp16_v2(d_Q, d_K, d_inv_freq, d_position_ids, seq_len, n_heads, n_kv_heads, head_dim, eff_rotary, dev, gpu_stream_);
         }
 
     } // namespace rocm

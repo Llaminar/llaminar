@@ -169,7 +169,7 @@ namespace llaminar2
         /**
          * @brief Extract layer index from stage name
          *
-         * Parses names like "layer0_fused_attn_wo" → 0, "layer23_ffn_norm" → 23
+         * Parses names like "layer0_attn_norm" → 0, "layer23_ffn_norm" → 23
          * Returns -1 if no layer prefix found.
          */
         static int extractLayerFromName(const std::string &stage_name)

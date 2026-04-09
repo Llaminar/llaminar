@@ -4,6 +4,11 @@
  *
  * Delegates to ITensorShortConvolution kernel for the actual computation.
  * Stage handles tensor extraction, null checks, and buffer contract management.
+ *
+ * GPU path: Uses ensureOnDevice() / allocateOnDevice() / gpu_data_ptr() to
+ * keep data on-device. No H2D/D2H copies in the hot path.
+ *
+ * CPU path: Uses data() / mutable_data() host pointers.
  */
 
 #include "ShortConv1dStage.h"
@@ -36,6 +41,9 @@ namespace llaminar2
             return false;
         }
 
+        // Bind stage stream to kernel before execution
+        params_.kernel->setGPUStream(gpuStream());
+
         auto *input_base = requireTensorBasePtr(params_.input, "input");
         auto *output_base = requireTensorBasePtr(params_.output, "output");
         auto *weight_base = requireTensorBasePtr(params_.weight, "weight");
@@ -43,6 +51,61 @@ namespace llaminar2
         if (!input_base || !output_base || !weight_base)
             return false;
 
+        // =================================================================
+        // GPU path: keep data on-device, pass device pointers to kernel
+        // =================================================================
+        if (device().is_gpu())
+        {
+            // Ensure inputs on device (const_cast is safe: ensureOnDevice
+            // is logically const — changes placement, not tensor values)
+            const_cast<TensorBase *>(input_base)->ensureOnDevice(device());
+            const_cast<TensorBase *>(weight_base)->ensureOnDevice(device());
+
+            // For in-place operation (input == output), allocateOnDevice is skipped
+            // since input is already on device. For separate output, allocate.
+            if (params_.input != params_.output)
+                const_cast<TensorBase *>(output_base)->allocateOnDevice(device());
+
+            const float *d_input = static_cast<const float *>(input_base->gpu_data_ptr());
+            const float *d_weight = static_cast<const float *>(weight_base->gpu_data_ptr());
+            float *d_output = static_cast<float *>(const_cast<TensorBase *>(output_base)->gpu_data_ptr());
+
+            const float *d_bias = nullptr;
+            if (params_.bias)
+            {
+                auto *bias_base = dynamic_cast<const TensorBase *>(params_.bias);
+                if (bias_base)
+                {
+                    const_cast<TensorBase *>(bias_base)->ensureOnDevice(device());
+                    d_bias = static_cast<const float *>(bias_base->gpu_data_ptr());
+                }
+            }
+
+            bool ok = params_.kernel->forward(
+                d_input, d_weight, d_bias,
+                d_output, params_.conv_state,
+                params_.seq_len, params_.channels, params_.kernel_size,
+                /*apply_silu=*/true);
+
+            if (!ok)
+            {
+                LOG_ERROR("[ShortConv1dStage] GPU kernel forward() failed");
+                return false;
+            }
+
+            // Mark output as device-authoritative (kernel wrote to GPU buffer)
+            const_cast<TensorBase *>(output_base)->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, device());
+
+            LOG_DEBUG("[ShortConv1dStage] GPU: seq_len=" << params_.seq_len
+                                                         << " channels=" << params_.channels
+                                                         << " kernel=" << params_.kernel_size
+                                                         << (params_.seq_len == 1 ? " (decode)" : " (prefill)"));
+            return true;
+        }
+
+        // =================================================================
+        // CPU path: use host pointers
+        // =================================================================
         const float *input_data = input_base->data();
         float *output_data = output_base->mutable_data();
         const float *weight_data = weight_base->data();
@@ -99,7 +162,21 @@ namespace llaminar2
 
     bool ShortConv1dStage::supportsBackend(ComputeBackendType backend) const
     {
-        return backend == ComputeBackendType::CPU;
+        switch (backend)
+        {
+        case ComputeBackendType::CPU:
+            return true;
+#ifdef HAVE_CUDA
+        case ComputeBackendType::GPU_CUDA:
+            return true;
+#endif
+#ifdef HAVE_ROCM
+        case ComputeBackendType::GPU_ROCM:
+            return true;
+#endif
+        default:
+            return false;
+        }
     }
 
     StageDumpInfo ShortConv1dStage::buildDumpInfoImpl() const

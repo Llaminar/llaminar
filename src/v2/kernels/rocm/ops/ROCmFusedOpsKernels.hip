@@ -109,6 +109,10 @@ __global__ void rocm_fused_swiglu_quantize_blockwise_kernel(
 // 2. Fused Residual Add + RMSNorm
 // =========================================================================
 
+// Optimized fused residual add + RMS norm kernel for ROCm.
+// - Uses up to 1024 threads (better CU utilization for large hidden dims)
+// - Keeps residual sums in registers across passes (no global re-read in Pass 2)
+// - Warp shuffle reduction using 64-wide wavefronts (no shared memory for wavefront)
 __global__ void rocm_fused_residual_rmsnorm_fp32_kernel(
     const float *__restrict__ input,
     const float *__restrict__ residual,
@@ -118,8 +122,6 @@ __global__ void rocm_fused_residual_rmsnorm_fp32_kernel(
     int cols,
     float epsilon)
 {
-    extern __shared__ float sdata[];
-
     const int row = blockIdx.x;
     const int tid = threadIdx.x;
     const int stride = blockDim.x;
@@ -129,31 +131,50 @@ __global__ void rocm_fused_residual_rmsnorm_fp32_kernel(
     float *row_res_out = residual_output + row * cols;
     float *row_norm_out = norm_output + row * cols;
 
-    // Pass 1: Add residual, compute sum of squares, write residual output
+    // Pass 1: Add residual, compute sum of squares, write residual output.
+    // Cache values in registers to avoid re-reading from global memory in Pass 2.
+    constexpr int kMaxPerThread = 16; // handles up to cols=16384
+    float local_sums[kMaxPerThread];
+    int local_count = 0;
+
     float sum_sq = 0.0f;
     for (int i = tid; i < cols; i += stride)
     {
         float sum = row_input[i] + row_residual[i];
         row_res_out[i] = sum;
+        local_sums[local_count++] = sum;
         sum_sq += sum * sum;
     }
 
-    sdata[tid] = sum_sq;
+    // Warp shuffle reduction (64-wide wavefronts on GCN/CDNA)
+    for (int offset = 32; offset > 0; offset >>= 1)
+        sum_sq += __shfl_xor(sum_sq, offset);
+
+    // Cross-wavefront reduction via shared memory (one value per wavefront)
+    __shared__ float warp_sums[16]; // max 1024 threads / 64 = 16 wavefronts
+    const int lane = tid & 63;
+    const int warp_id = tid >> 6;
+    const int num_warps = (blockDim.x + 63) >> 6;
+
+    if (lane == 0) warp_sums[warp_id] = sum_sq;
     __syncthreads();
 
-    for (int s = blockDim.x / 2; s > 0; s >>= 1)
+    if (warp_id == 0)
     {
-        if (tid < s)
-            sdata[tid] += sdata[tid + s];
-        __syncthreads();
+        float val = (lane < num_warps) ? warp_sums[lane] : 0.0f;
+        for (int offset = 32; offset > 0; offset >>= 1)
+            val += __shfl_xor(val, offset);
+        if (lane == 0) warp_sums[0] = val;
     }
+    __syncthreads();
 
-    float inv_rms = rsqrtf(sdata[0] / cols + epsilon);
+    float inv_rms = rsqrtf(warp_sums[0] / cols + epsilon);
 
-    // Pass 2: Normalize and write output
+    // Pass 2: Normalize using register-cached residual sums (no global re-read)
+    int idx = 0;
     for (int i = tid; i < cols; i += stride)
     {
-        row_norm_out[i] = row_res_out[i] * inv_rms * gamma[i];
+        row_norm_out[i] = local_sums[idx++] * inv_rms * gamma[i];
     }
 }
 
@@ -166,8 +187,6 @@ __global__ void rocm_fused_residual_rmsnorm_bf16_kernel(
     int cols,
     float epsilon)
 {
-    extern __shared__ float sdata[];
-
     const int row = blockIdx.x;
     const int tid = threadIdx.x;
     const int stride = blockDim.x;
@@ -177,30 +196,45 @@ __global__ void rocm_fused_residual_rmsnorm_bf16_kernel(
     uint16_t *row_res_out = residual_output + row * cols;
     uint16_t *row_norm_out = norm_output + row * cols;
 
+    constexpr int kMaxPerThread = 16;
+    float local_sums[kMaxPerThread];
+    int local_count = 0;
+
     float sum_sq = 0.0f;
     for (int i = tid; i < cols; i += stride)
     {
         float sum = bf16_to_float(row_input[i]) + bf16_to_float(row_residual[i]);
         row_res_out[i] = float_to_bf16(sum);
+        local_sums[local_count++] = sum;
         sum_sq += sum * sum;
     }
 
-    sdata[tid] = sum_sq;
+    for (int offset = 32; offset > 0; offset >>= 1)
+        sum_sq += __shfl_xor(sum_sq, offset);
+
+    __shared__ float warp_sums[16];
+    const int lane = tid & 63;
+    const int warp_id = tid >> 6;
+    const int num_warps = (blockDim.x + 63) >> 6;
+
+    if (lane == 0) warp_sums[warp_id] = sum_sq;
     __syncthreads();
 
-    for (int s = blockDim.x / 2; s > 0; s >>= 1)
+    if (warp_id == 0)
     {
-        if (tid < s)
-            sdata[tid] += sdata[tid + s];
-        __syncthreads();
+        float val = (lane < num_warps) ? warp_sums[lane] : 0.0f;
+        for (int offset = 32; offset > 0; offset >>= 1)
+            val += __shfl_xor(val, offset);
+        if (lane == 0) warp_sums[0] = val;
     }
+    __syncthreads();
 
-    float inv_rms = rsqrtf(sdata[0] / cols + epsilon);
+    float inv_rms = rsqrtf(warp_sums[0] / cols + epsilon);
 
+    int idx = 0;
     for (int i = tid; i < cols; i += stride)
     {
-        float sum = bf16_to_float(row_res_out[i]);
-        row_norm_out[i] = float_to_bf16(sum * inv_rms * gamma[i]);
+        row_norm_out[i] = float_to_bf16(local_sums[idx++] * inv_rms * gamma[i]);
     }
 }
 
@@ -213,8 +247,6 @@ __global__ void rocm_fused_residual_rmsnorm_fp16_kernel(
     int cols,
     float epsilon)
 {
-    extern __shared__ float sdata[];
-
     const int row = blockIdx.x;
     const int tid = threadIdx.x;
     const int stride = blockDim.x;
@@ -224,30 +256,45 @@ __global__ void rocm_fused_residual_rmsnorm_fp16_kernel(
     uint16_t *row_res_out = residual_output + row * cols;
     uint16_t *row_norm_out = norm_output + row * cols;
 
+    constexpr int kMaxPerThread = 16;
+    float local_sums[kMaxPerThread];
+    int local_count = 0;
+
     float sum_sq = 0.0f;
     for (int i = tid; i < cols; i += stride)
     {
         float sum = fp16_to_float(row_input[i]) + fp16_to_float(row_residual[i]);
         row_res_out[i] = float_to_fp16(sum);
+        local_sums[local_count++] = sum;
         sum_sq += sum * sum;
     }
 
-    sdata[tid] = sum_sq;
+    for (int offset = 32; offset > 0; offset >>= 1)
+        sum_sq += __shfl_xor(sum_sq, offset);
+
+    __shared__ float warp_sums[16];
+    const int lane = tid & 63;
+    const int warp_id = tid >> 6;
+    const int num_warps = (blockDim.x + 63) >> 6;
+
+    if (lane == 0) warp_sums[warp_id] = sum_sq;
     __syncthreads();
 
-    for (int s = blockDim.x / 2; s > 0; s >>= 1)
+    if (warp_id == 0)
     {
-        if (tid < s)
-            sdata[tid] += sdata[tid + s];
-        __syncthreads();
+        float val = (lane < num_warps) ? warp_sums[lane] : 0.0f;
+        for (int offset = 32; offset > 0; offset >>= 1)
+            val += __shfl_xor(val, offset);
+        if (lane == 0) warp_sums[0] = val;
     }
+    __syncthreads();
 
-    float inv_rms = rsqrtf(sdata[0] / cols + epsilon);
+    float inv_rms = rsqrtf(warp_sums[0] / cols + epsilon);
 
+    int idx = 0;
     for (int i = tid; i < cols; i += stride)
     {
-        float sum = fp16_to_float(row_res_out[i]);
-        row_norm_out[i] = float_to_fp16(sum * inv_rms * gamma[i]);
+        row_norm_out[i] = float_to_fp16(local_sums[idx++] * inv_rms * gamma[i]);
     }
 }
 
@@ -309,12 +356,11 @@ extern "C"
         llaminar2::HipDeviceGuard::setDevice(device_idx);
         (void)hipGetLastError();
 
-        int threads_per_block = 256;
+        int threads_per_block = (cols <= 256) ? 256 : 1024;
         int num_blocks = rows;
-        size_t shared_mem_size = threads_per_block * sizeof(float);
 
         hipLaunchKernelGGL(rocm_fused_residual_rmsnorm_fp32_kernel,
-                           dim3(num_blocks), dim3(threads_per_block), shared_mem_size,
+                           dim3(num_blocks), dim3(threads_per_block), 0,
                            static_cast<hipStream_t>(stream),
                            input, residual, gamma, residual_output, norm_output, cols, epsilon);
 
@@ -342,12 +388,11 @@ extern "C"
         llaminar2::HipDeviceGuard::setDevice(device_idx);
         (void)hipGetLastError();
 
-        int threads_per_block = 256;
+        int threads_per_block = (cols <= 256) ? 256 : 1024;
         int num_blocks = rows;
-        size_t shared_mem_size = threads_per_block * sizeof(float);
 
         hipLaunchKernelGGL(rocm_fused_residual_rmsnorm_bf16_kernel,
-                           dim3(num_blocks), dim3(threads_per_block), shared_mem_size,
+                           dim3(num_blocks), dim3(threads_per_block), 0,
                            static_cast<hipStream_t>(stream),
                            input, residual, gamma, residual_output, norm_output, cols, epsilon);
 
@@ -375,12 +420,11 @@ extern "C"
         llaminar2::HipDeviceGuard::setDevice(device_idx);
         (void)hipGetLastError();
 
-        int threads_per_block = 256;
+        int threads_per_block = (cols <= 256) ? 256 : 1024;
         int num_blocks = rows;
-        size_t shared_mem_size = threads_per_block * sizeof(float);
 
         hipLaunchKernelGGL(rocm_fused_residual_rmsnorm_fp16_kernel,
-                           dim3(num_blocks), dim3(threads_per_block), shared_mem_size,
+                           dim3(num_blocks), dim3(threads_per_block), 0,
                            static_cast<hipStream_t>(stream),
                            input, residual, gamma, residual_output, norm_output, cols, epsilon);
 

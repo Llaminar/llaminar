@@ -816,22 +816,22 @@ LLAMINAR_STAGE_DUMP_ENABLED=1 LLAMINAR_STAGE_DUMP_ASYNC_THREADS=4 ./llaminar2 -m
 The `LLAMINAR_STAGE_DUMP_NAMES` filter uses **substring matching** for flexibility:
 
 ```bash
-# Dump all fused attention stages (matches layer0_fused_attn_wo, layer5_fused_attn_wo, etc.)
-LLAMINAR_STAGE_DUMP_NAMES=fused_attn_wo
+# Dump all attention stages (matches layer0_attention, layer5_attention, etc.)
+LLAMINAR_STAGE_DUMP_NAMES=attention
 
-# Dump all layer 0 stages (matches layer0_attn_norm, layer0_qkv_proj, layer0_fused_attn_wo, etc.)
+# Dump all layer 0 stages (matches layer0_attn_norm, layer0_qkv_proj, layer0_attention, etc.)
 LLAMINAR_STAGE_DUMP_NAMES=layer0_
 
 # Dump multiple patterns (attention and FFN norms)
-LLAMINAR_STAGE_DUMP_NAMES=fused_attn_wo,ffn_norm
+LLAMINAR_STAGE_DUMP_NAMES=attention,ffn_norm
 ```
 
 ### Example Usage
 
 ```bash
-# Dump fused attention stages for layers 0-2
+# Dump attention stages for layers 0-2
 LLAMINAR_STAGE_DUMP_ENABLED=1 \
-LLAMINAR_STAGE_DUMP_NAMES=fused_attn_wo \
+LLAMINAR_STAGE_DUMP_NAMES=attention \
 LLAMINAR_STAGE_DUMP_LAYERS=0,1,2 \
 ./build_v2_integration/tests/v2/v2_integration_hybridq16_vs_fp32_pipeline
 
@@ -843,7 +843,7 @@ LLAMINAR_STAGE_DUMP_ITERATION=0 \
 
 # Dump only attention type stages (by type, not name)
 LLAMINAR_STAGE_DUMP_ENABLED=1 \
-LLAMINAR_STAGE_DUMP_TYPES=FUSED_ATTENTION_WO,ATTENTION \
+LLAMINAR_STAGE_DUMP_TYPES=ATTENTION,GEMM \
 ./build_v2_release/llaminar2 -m model.gguf -p "test"
 ```
 
@@ -853,7 +853,7 @@ Dumps are written to `LLAMINAR_STAGE_DUMP_DIR` (default: `/tmp/llaminar_stage_du
 
 ```
 /tmp/llaminar_stage_dumps/
-├── stage_0000_FUSED_ATTENTION_WO_layer0_fused_attn_wo_rank0/
+├── stage_0000_ATTENTION_COMPUTE_layer0_attention_rank0/
 │   ├── inputs/
 │   │   ├── Q_q16_1_64.bin    # Q tensor in native Q16_1_64 format
 │   │   ├── Q_meta.txt        # Metadata for Q tensor
@@ -925,7 +925,7 @@ Use captured dumps to create isolated replay tests:
 
 // Load dumped tensor with metadata
 auto [data, meta] = loadTensorDequantizedFP32(
-    "/tmp/llaminar_stage_dumps/stage_0000_FUSED_ATTENTION_WO_layer0_fused_attn_wo_rank0",
+    "/tmp/llaminar_stage_dumps/stage_0000_ATTENTION_COMPUTE_layer0_attention_rank0",
     "Q",       // tensor name
     "inputs"); // subdir
 
@@ -1055,16 +1055,23 @@ ctest --test-dir build_v2_integration -R "V2_Integration_Parity_Qwen2_CUDA" -V
 
 **Test Output Example**:
 ```
-╔══════════════════════════════════════════════════════════════════════════════════════════╗
-║                    CUDA vs PyTorch LAYER-BY-LAYER PARITY                                 ║
-╠═══════════╦═══════════════╦═══════════════╦════════════════════════════════════════╦══════╣
-║   Layer   ║   Avg Cosine  ║   Min Cosine  ║            Worst Stage                 ║Status║
-╠═══════════╬═══════════════╬═══════════════╬════════════════════════════════════════╬══════╣
-║ EMBEDDING ║      0.999912 ║      0.999912 ║                      -                 ║  ✓  ║
-║   Layer 0 ║      0.998234 ║      0.995123 ║              FFN_RESIDUAL              ║  ✓  ║
+╔══════════════════════════════════════════════════════════════════════════════════════════════════════════╗
+║                    CUDA vs PyTorch LAYER-BY-LAYER PARITY                                                ║
+╠═══════════╦═══════════════╦═══════════════╦══════════════════╦══════════╦══════════════════╦══════╦══════╣
+║   Layer   ║   Avg Cosine  ║   Min Cosine  ║   Worst Stage    ║ Max Drop ║   Drop Stage     ║ Kurt ║  OK  ║
+╠═══════════╬═══════════════╬═══════════════╬══════════════════╬══════════╬══════════════════╬══════╬══════╣
+║ EMBEDDING ║      0.999912 ║      0.999912 ║        -         ║     -    ║        -         ║   -  ║  ✓   ║
+║   Layer 0 ║      0.998234 ║      0.995123 ║  FFN_RESIDUAL    ║ 0.003755 ║  GDN_NORM_GATE   ║  21  ║  ✓   ║
 ...
-╚═══════════╩═══════════════╩═══════════════╩════════════════════════════════════════╩══════╝
+╚═══════════╩═══════════════╩═══════════════╩══════════════════╩══════════╩══════════════════╩══════╩══════╝
 ```
+
+**Reading the Table — Max Drop vs Worst Stage**:
+
+- **Min Cosine / Worst Stage**: The stage with the *lowest absolute* cosine similarity. This reflects cumulative error up to that point — not necessarily the stage that caused the problem.
+- **Max Drop / Drop Stage**: The stage that *introduced the most new error* relative to its predecessor (computed as `prev_stage_cosine - current_stage_cosine`). This is the actionable diagnostic — it tells you which specific stage to investigate. Drops below 0.001 are suppressed to "-".
+
+For example, if Layer 8 shows `Min Cosine=0.47` at `FFN_RESIDUAL` but `Max Drop=0.018` at `GDN_NORM_GATE_OUTPUT`, the low cosine is *cumulative drift* from earlier layers — not FFN_RESIDUAL's fault. The actual culprit introducing the most error within that layer is `GDN_NORM_GATE_OUTPUT`.
 
 ### Debugging Inference Issues
 
@@ -1103,17 +1110,17 @@ The `<git-hash>` prefix (first 8 chars of HEAD) enables A/B comparison across co
 
 | File | Description |
 |------|-------------|
-| `prefill_layers.csv` | Per-layer aggregate metrics: avg/min cosine, worst stage, kurtosis |
+| `prefill_layers.csv` | Per-layer aggregate metrics: avg/min cosine, worst stage, max cosine drop, drop stage, kurtosis |
 | `prefill_summary.csv` | LM_HEAD logit metrics: cosine, KL divergence, Top-1/5 overlap |
-| `prefill_stages.csv` | Per-stage detailed distribution stats (39+ columns, see below) |
+| `prefill_stages.csv` | Per-stage detailed distribution stats with `cosine_drop` (40+ columns, see below) |
 
 **Decode CSV Files**:
 
 | File | Description |
 |------|-------------|
 | `decode_steps.csv` | Per-decode-step LM_HEAD metrics: cosine, KL, token predictions, match status |
-| `decode_layers.csv` | Per-step per-layer aggregate metrics: avg/min cosine, worst stage |
-| `decode_stages.csv` | Per-step per-stage detailed distribution stats (39+ columns) |
+| `decode_layers.csv` | Per-step per-layer aggregate metrics: avg/min cosine, worst stage, max cosine drop, drop stage |
+| `decode_stages.csv` | Per-step per-stage detailed distribution stats with `cosine_drop` (40+ columns) |
 
 **Stage CSV Column Layout** (`prefill_stages.csv` and `decode_stages.csv`):
 
@@ -1122,6 +1129,7 @@ Core columns: `backend`, `layer`, `stage` (plus `step` for decode), followed by 
 | Column | Description |
 |--------|-------------|
 | `cosine` | Cosine similarity between Llaminar and PyTorch stage output |
+| `cosine_drop` | Error introduced by this stage: `prev_stage_cosine - cosine` (0 for first stage in a layer) |
 | `rel_l2` | Relative L2 norm of error |
 | `max_abs_diff` | Maximum absolute element-wise difference |
 | `snr_db` | Signal-to-noise ratio in dB |
@@ -1151,6 +1159,10 @@ df = pd.read_csv("tests/v2/integration/parity/results/30dd5714/Qwen2_.../decode_
 # Find stages with worst cosine per decode step
 worst = df.loc[df.groupby("step")["cosine"].idxmin()]
 print(worst[["step", "layer", "stage", "cosine", "max_abs_diff"]])
+
+# Find the stage introducing the most error per layer (most actionable)
+top_drops = df.loc[df.groupby(["step", "layer"])["cosine_drop"].idxmax()]
+print(top_drops[top_drops.cosine_drop > 0.001][["step", "layer", "stage", "cosine_drop", "cosine"]])
 
 # Compare distribution shape between backends
 print(df[df.stage == "Q_PROJ"][["layer", "cosine", "llaminar_kurtosis", "pytorch_kurtosis"]])
@@ -1840,12 +1852,12 @@ The exception includes full context and a formatted error message:
 ║               TENSOR VERIFICATION FAILED                          ║
 ╠══════════════════════════════════════════════════════════════════╣
 ║ Layer:  3
-║ Stage:  FusedAttentionWoStage
+║ Stage:  AttentionComputeStage
 ║ Phase:  EXIT
 ║ Tensor: attention_output
 ║ Reason: Contains 5 NaN values in first 8 rows
 ║
-║ Dump:   /tmp/llaminar_verification_dump/20260101_143022_456_layer3_FusedAttentionWoStage_EXIT
+║ Dump:   /tmp/llaminar_verification_dump/20260101_143022_456_layer3_AttentionComputeStage_EXIT
 ╚══════════════════════════════════════════════════════════════════╝
 ```
 
@@ -1858,7 +1870,7 @@ When verification fails, buffers are dumped to `/tmp/llaminar_verification_dump/
 ls -lt /tmp/llaminar_verification_dump/ | head
 
 # Examine dump contents
-cd /tmp/llaminar_verification_dump/20260101_143022_456_layer3_FusedAttentionWoStage_EXIT/
+cd /tmp/llaminar_verification_dump/20260101_143022_456_layer3_AttentionComputeStage_EXIT/
 cat manifest.json          # Lists all dumped tensors with shapes/types
 cat input_Q_metadata.txt   # Metadata for specific tensor
 xxd input_Q.bin | head     # Raw binary data
@@ -2001,7 +2013,7 @@ std::cout << "║" << std::setw(10) << "Name" << " ║"
 | `LLAMINAR_DUMP_ON_FAILURE` | Dump stage buffers to disk when verification fails | Enabled |
 | `LLAMINAR_STAGE_DUMP_ENABLED` | Master enable for stage dumping (0/1) | Disabled |
 | `LLAMINAR_STAGE_DUMP_DIR` | Output directory for stage dumps | `/tmp/llaminar_stage_dumps` |
-| `LLAMINAR_STAGE_DUMP_TYPES` | Stage types to dump (e.g., `FUSED_ATTENTION_WO,GEMM`) | `all` |
+| `LLAMINAR_STAGE_DUMP_TYPES` | Stage types to dump (e.g., `ATTENTION,GEMM`) | `all` |
 | `LLAMINAR_STAGE_DUMP_NAMES` | Stage names to dump (substring match) | `all` |
 | `LLAMINAR_STAGE_DUMP_LAYERS` | Comma-separated layer indices to dump | `all` |
 | `LLAMINAR_STAGE_DUMP_ITERATION` | Decode iterations to dump | `all` |

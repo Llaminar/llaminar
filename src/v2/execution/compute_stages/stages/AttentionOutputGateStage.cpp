@@ -14,6 +14,18 @@
 #include <immintrin.h>
 #endif
 
+// GPU kernel declarations
+#ifdef HAVE_CUDA
+extern "C" bool cudaGDN_attention_output_gate(
+    const float *input, const float *gate, float *output,
+    int size, int device_idx, void *stream);
+#endif
+#ifdef HAVE_ROCM
+extern "C" bool rocmGDN_attention_output_gate(
+    const float *input, const float *gate, float *output,
+    int size, int device_idx, void *stream);
+#endif
+
 namespace llaminar2
 {
 
@@ -49,6 +61,50 @@ namespace llaminar2
 
         const size_t cols = input_base->shape().size() > 1 ? input_base->shape()[1] : input_base->numel();
         const size_t total = static_cast<size_t>(seq_len) * cols;
+
+        // GPU dispatch path
+        if (params_.device_id.is_gpu())
+        {
+            // Ensure all tensors are on device
+            const_cast<TensorBase *>(input_base)->ensureOnDevice(params_.device_id);
+            const_cast<TensorBase *>(gate_base)->ensureOnDevice(params_.device_id);
+            output_base->allocateOnDevice(params_.device_id);
+
+            const float *inp_gpu = static_cast<const float *>(input_base->active_data_ptr());
+            const float *gate_gpu = static_cast<const float *>(gate_base->active_data_ptr());
+            float *out_gpu = static_cast<float *>(output_base->active_mutable_data_ptr());
+            int dev_idx = params_.device_id.toKernelDeviceIndex();
+            void *stream = gpuStream();
+
+#ifdef HAVE_CUDA
+            if (params_.device_id.is_cuda())
+            {
+                bool ok = cudaGDN_attention_output_gate(
+                    inp_gpu, gate_gpu, out_gpu,
+                    static_cast<int>(total), dev_idx, stream);
+                if (!ok)
+                {
+                    LOG_ERROR("[AttentionOutputGateStage] CUDA kernel failed");
+                    return false;
+                }
+                return true;
+            }
+#endif
+#ifdef HAVE_ROCM
+            if (params_.device_id.is_rocm())
+            {
+                bool ok = rocmGDN_attention_output_gate(
+                    inp_gpu, gate_gpu, out_gpu,
+                    static_cast<int>(total), dev_idx, stream);
+                if (!ok)
+                {
+                    LOG_ERROR("[AttentionOutputGateStage] ROCm kernel failed");
+                    return false;
+                }
+                return true;
+            }
+#endif
+        }
 
         const float *input_data = input_base->data();
         const float *gate_data = gate_base->data();
@@ -164,7 +220,21 @@ namespace llaminar2
 
     bool AttentionOutputGateStage::supportsBackend(ComputeBackendType backend) const
     {
-        return backend == ComputeBackendType::CPU;
+        switch (backend)
+        {
+        case ComputeBackendType::CPU:
+            return true;
+#ifdef HAVE_CUDA
+        case ComputeBackendType::GPU_CUDA:
+            return true;
+#endif
+#ifdef HAVE_ROCM
+        case ComputeBackendType::GPU_ROCM:
+            return true;
+#endif
+        default:
+            return false;
+        }
     }
 
     StageDumpInfo AttentionOutputGateStage::buildDumpInfoImpl() const

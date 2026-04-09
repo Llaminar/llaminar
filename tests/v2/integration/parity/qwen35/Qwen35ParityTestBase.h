@@ -45,19 +45,6 @@ namespace llaminar2::test::parity::qwen35
 
         void SetUp() override
         {
-            // Qwen3.5 GDN stages (ShortConv1d, GDNRecurrence, GatedRMSNorm,
-            // GDNProjection) and FA-specific stages (QGateSplit,
-            // AttentionOutputGate) are currently CPU-only.
-            // Skip GPU configs until GPU kernels are implemented.
-            const auto &cfg = static_cast<const Derived *>(this)->getTestConfig();
-            for (auto dt : cfg.devices)
-            {
-                if (dt == ParityDeviceType::CUDA || dt == ParityDeviceType::ROCm)
-                {
-                    GTEST_SKIP() << "Qwen3.5 GDN/FA stages are CPU-only "
-                                    "(GPU kernels not yet implemented)";
-                }
-            }
             Base::SetUp();
         }
 

@@ -371,69 +371,6 @@ TEST_F(Test__SnapshotCapture_Routing, RoPEDoesNotMatchQRopeOrKRope)
     EXPECT_FLOAT_EQ(snap->data[0], 1.0f);
 }
 
-TEST_F(Test__SnapshotCapture_Routing, FusedAttentionWoNamedOutputs)
-{
-    StageDumpInfo dump;
-
-    // Named outputs: context, attention_output, attention_residual
-    StageDumpInfo::OutputBuffer ctx_out;
-    ctx_out.name = "context";
-    ctx_out.data = data_a.data();
-    ctx_out.rows = 2;
-    ctx_out.cols = 4;
-    ctx_out.dtype = "FP32";
-    dump.outputs.push_back(ctx_out);
-
-    StageDumpInfo::OutputBuffer attn_out;
-    attn_out.name = "attention_output";
-    attn_out.data = data_b.data();
-    attn_out.rows = 2;
-    attn_out.cols = 4;
-    attn_out.dtype = "FP32";
-    dump.outputs.push_back(attn_out);
-
-    StageDumpInfo::OutputBuffer res_out;
-    res_out.name = "attention_residual";
-    res_out.data = data_c.data();
-    res_out.rows = 2;
-    res_out.cols = 4;
-    res_out.dtype = "FP32";
-    dump.outputs.push_back(res_out);
-
-    capture.captureStage("layer0_fused_attn_wo", dump);
-
-    auto *context = capture.get("layer0_ATTENTION_CONTEXT");
-    auto *output = capture.get("layer0_ATTENTION_OUTPUT");
-    auto *residual = capture.get("layer0_ATTENTION_RESIDUAL");
-
-    ASSERT_NE(context, nullptr);
-    ASSERT_NE(output, nullptr);
-    ASSERT_NE(residual, nullptr);
-
-    EXPECT_FLOAT_EQ(context->data[0], 1.0f);
-    EXPECT_FLOAT_EQ(output->data[0], 10.0f);
-    EXPECT_FLOAT_EQ(residual->data[0], 20.0f);
-}
-
-TEST_F(Test__SnapshotCapture_Routing, FusedAttentionWoSkipsOutputName)
-{
-    // "output" name should be skipped
-    StageDumpInfo dump;
-
-    StageDumpInfo::OutputBuffer out;
-    out.name = "output";
-    out.data = data_a.data();
-    out.rows = 2;
-    out.cols = 4;
-    out.dtype = "FP32";
-    dump.outputs.push_back(out);
-
-    capture.captureStage("layer0_fused_attn_wo", dump);
-
-    // Should NOT have captured anything (output is skipped)
-    EXPECT_TRUE(capture.all().empty());
-}
-
 TEST_F(Test__SnapshotCapture_Routing, FusedResidualNormStoresSecondOutput)
 {
     // For attn_norm and ffn_norm with 2 outputs: store outputs[1] (norm_output)

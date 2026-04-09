@@ -109,8 +109,15 @@ namespace llaminar2
             recurrence_states_[i].resize(recurrence_state_size, 0.0f);
 
             // Create kernel instances via KernelFactory (lifetime tied to Qwen35Graph)
-            conv_kernels_[i] = KernelFactory::createShortConvolution(DeviceType::CPU);
-            rec_kernels_[i] = KernelFactory::createGatedDeltaNet(DeviceType::CPU);
+            auto dev_type = KernelFactory::getDeviceType(config_.default_device);
+            int dev_ordinal = config_.default_device.toKernelDeviceIndex();
+            conv_kernels_[i] = KernelFactory::createShortConvolution(dev_type, dev_ordinal);
+            rec_kernels_[i] = KernelFactory::createGatedDeltaNet(dev_type, dev_ordinal);
+
+            // For GPU kernels, allocate device-resident state buffers
+            // (no-op for CPU implementations via virtual dispatch)
+            conv_kernels_[i]->allocateGPUState(conv_state_size);
+            rec_kernels_[i]->allocateGPUState(recurrence_state_size);
 
             LOG_DEBUG("[Qwen35Graph] Layer " << i << " GDN state: conv_state="
                                              << conv_state_size << " recurrence_state=" << recurrence_state_size);
@@ -130,6 +137,15 @@ namespace llaminar2
             std::fill(state.begin(), state.end(), 0.0f);
         for (auto &state : recurrence_states_)
             std::fill(state.begin(), state.end(), 0.0f);
+
+        // Also reset GPU-resident state via virtual dispatch (no-op for CPU kernels)
+        for (auto &kernel : conv_kernels_)
+            if (kernel)
+                kernel->resetGPUState();
+        for (auto &kernel : rec_kernels_)
+            if (kernel)
+                kernel->resetGPUState();
+
         LOG_DEBUG("[Qwen35Graph] GDN conv/recurrence state reset");
     }
 

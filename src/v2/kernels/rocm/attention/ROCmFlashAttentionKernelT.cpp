@@ -363,10 +363,10 @@ namespace llaminar2
             }
 
             // Head dim validation for MI50
-            if (head_dim > 128)
+            if (head_dim > 256)
             {
                 LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>] head_dim=" << head_dim
-                                                                        << " exceeds MI50 kernel limit (128)");
+                                                                        << " exceeds MI50 kernel limit (256)");
                 return false;
             }
 

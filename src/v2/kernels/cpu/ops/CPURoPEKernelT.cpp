@@ -39,7 +39,8 @@ namespace llaminar2
         int n_kv_heads,
         int head_dim,
         float rope_theta,
-        int device_idx)
+        int device_idx,
+        int rotary_dim)
     {
         (void)device_idx; // Unused for CPU kernel
 
@@ -83,15 +84,30 @@ namespace llaminar2
             }
         }
 
+        // Effective rotary dimension: 0 means full rotation (=head_dim)
+        const int eff_rotary = (rotary_dim > 0 && rotary_dim < head_dim) ? rotary_dim : head_dim;
+
         // If positions are contiguous, use optimized block processing
         if (contiguous && start_pos >= 0)
         {
-            primitives::apply_rope_vectorized(
-                Q, K,
-                seq_len, head_dim,
-                n_heads, n_kv_heads,
-                start_pos, rope_theta,
-                (seq_len == 1) ? &tls_state_ : nullptr);
+            if (eff_rotary < head_dim)
+            {
+                // Partial RoPE: only rotate first eff_rotary dims, leave rest untouched
+                primitives::apply_rope_partial(
+                    Q, K,
+                    seq_len, head_dim, eff_rotary,
+                    n_heads, n_kv_heads,
+                    start_pos, rope_theta);
+            }
+            else
+            {
+                primitives::apply_rope_vectorized(
+                    Q, K,
+                    seq_len, head_dim,
+                    n_heads, n_kv_heads,
+                    start_pos, rope_theta,
+                    (seq_len == 1) ? &tls_state_ : nullptr);
+            }
             return true;
         }
 
@@ -134,7 +150,8 @@ namespace llaminar2
         int n_kv_heads,
         int head_dim,
         float rope_theta,
-        int device_idx)
+        int device_idx,
+        int rotary_dim)
     {
         (void)device_idx; // Unused for CPU kernel
 
@@ -229,7 +246,8 @@ namespace llaminar2
         int n_kv_heads,
         int head_dim,
         float rope_theta,
-        int device_idx)
+        int device_idx,
+        int rotary_dim)
     {
         (void)device_idx; // Unused for CPU kernel
 
@@ -324,7 +342,8 @@ namespace llaminar2
         int n_kv_heads,
         int head_dim,
         float rope_theta,
-        int device_idx)
+        int device_idx,
+        int rotary_dim)
     {
         (void)device_idx; // Unused for CPU kernel
 
@@ -390,7 +409,8 @@ namespace llaminar2
         float rope_theta,
         const IMPIContext *mpi_ctx,
         int device_idx,
-        int pos_offset)
+        int pos_offset,
+        int rotary_dim)
     {
         KERNEL_PROFILE_SCOPE(KernelType::ROPE);
         (void)mpi_ctx;
@@ -417,7 +437,7 @@ namespace llaminar2
         return apply_typed(
             q_fp32->mutable_data(),
             k_fp32 ? k_fp32->mutable_data() : nullptr,
-            position_ids, seq_len, n_heads, n_kv_heads, head_dim, rope_theta, device_idx);
+            position_ids, seq_len, n_heads, n_kv_heads, head_dim, rope_theta, device_idx, rotary_dim);
     }
 
     // --- BF16 apply_bf16() ---
@@ -444,7 +464,8 @@ namespace llaminar2
         float rope_theta,
         const IMPIContext *mpi_ctx,
         int device_idx,
-        int pos_offset)
+        int pos_offset,
+        int rotary_dim)
     {
         KERNEL_PROFILE_SCOPE(KernelType::ROPE);
         (void)mpi_ctx;
@@ -471,7 +492,7 @@ namespace llaminar2
         return apply_typed(
             q_bf16->mutable_typed_data(),
             k_bf16 ? k_bf16->mutable_typed_data() : nullptr,
-            position_ids, seq_len, n_heads, n_kv_heads, head_dim, rope_theta, device_idx);
+            position_ids, seq_len, n_heads, n_kv_heads, head_dim, rope_theta, device_idx, rotary_dim);
     }
 
     // --- FP16 apply_fp16() ---
@@ -498,7 +519,8 @@ namespace llaminar2
         float rope_theta,
         const IMPIContext *mpi_ctx,
         int device_idx,
-        int pos_offset)
+        int pos_offset,
+        int rotary_dim)
     {
         KERNEL_PROFILE_SCOPE(KernelType::ROPE);
         (void)mpi_ctx;
@@ -525,7 +547,7 @@ namespace llaminar2
         return apply_typed(
             q_fp16->mutable_typed_data(),
             k_fp16 ? k_fp16->mutable_typed_data() : nullptr,
-            position_ids, seq_len, n_heads, n_kv_heads, head_dim, rope_theta, device_idx);
+            position_ids, seq_len, n_heads, n_kv_heads, head_dim, rope_theta, device_idx, rotary_dim);
     }
 
     // --- Q8_1 apply_q8_1() ---
@@ -555,7 +577,8 @@ namespace llaminar2
         float rope_theta,
         const IMPIContext *mpi_ctx,
         int device_idx,
-        int pos_offset)
+        int pos_offset,
+        int rotary_dim)
     {
         KERNEL_PROFILE_SCOPE(KernelType::ROPE);
         (void)mpi_ctx;
@@ -582,7 +605,7 @@ namespace llaminar2
         return apply_typed(
             q_q8->mutable_typed_data(),
             k_q8 ? k_q8->mutable_typed_data() : nullptr,
-            position_ids, seq_len, n_heads, n_kv_heads, head_dim, rope_theta, device_idx);
+            position_ids, seq_len, n_heads, n_kv_heads, head_dim, rope_theta, device_idx, rotary_dim);
     }
 
     // --- Q8_1 apply_q8_1_to_fp32() (Hybrid mode) ---
@@ -988,7 +1011,8 @@ namespace llaminar2
         int n_kv_heads,
         int head_dim,
         float rope_theta,
-        int device_idx)
+        int device_idx,
+        int rotary_dim)
     {
         (void)device_idx; // Unused for CPU kernel
 
@@ -1030,7 +1054,8 @@ namespace llaminar2
         int n_kv_heads,
         int head_dim,
         float rope_theta,
-        int device_idx)
+        int device_idx,
+        int rotary_dim)
     {
         (void)device_idx; // Unused for CPU kernel
 
@@ -1065,11 +1090,11 @@ namespace llaminar2
 
     // Explicit template instantiations for all block sizes
     template bool CPURoPEKernelT<ActivationPrecision::Q16_1>::apply_typed_block<Q16_1Block>(
-        Q16_1Block *, Q16_1Block *, const int *, int, int, int, int, float, int);
+        Q16_1Block *, Q16_1Block *, const int *, int, int, int, int, float, int, int);
     template bool CPURoPEKernelT<ActivationPrecision::Q16_1>::apply_typed_block<Q16_1Block_64>(
-        Q16_1Block_64 *, Q16_1Block_64 *, const int *, int, int, int, int, float, int);
+        Q16_1Block_64 *, Q16_1Block_64 *, const int *, int, int, int, int, float, int, int);
     template bool CPURoPEKernelT<ActivationPrecision::Q16_1>::apply_typed_block<Q16_1Block_128>(
-        Q16_1Block_128 *, Q16_1Block_128 *, const int *, int, int, int, int, float, int);
+        Q16_1Block_128 *, Q16_1Block_128 *, const int *, int, int, int, int, float, int, int);
 
     // --- Q16_1 apply_q16_1() ---
     bool CPURoPEKernelT<ActivationPrecision::Q16_1>::apply_q16_1(
@@ -1096,7 +1121,8 @@ namespace llaminar2
         float rope_theta,
         const IMPIContext *mpi_ctx,
         int device_idx,
-        int pos_offset)
+        int pos_offset,
+        int rotary_dim)
     {
         KERNEL_PROFILE_SCOPE(KernelType::ROPE);
         (void)mpi_ctx;
@@ -1138,19 +1164,19 @@ namespace llaminar2
             return apply_typed_block<Q16_1Block>(
                 static_cast<Q16_1Block *>(q_raw),
                 static_cast<Q16_1Block *>(k_raw),
-                position_ids, seq_len, n_heads, n_kv_heads, head_dim, rope_theta, device_idx);
+                position_ids, seq_len, n_heads, n_kv_heads, head_dim, rope_theta, device_idx, rotary_dim);
 
         case Q16BlockSize::BLOCK_64:
             return apply_typed_block<Q16_1Block_64>(
                 static_cast<Q16_1Block_64 *>(q_raw),
                 static_cast<Q16_1Block_64 *>(k_raw),
-                position_ids, seq_len, n_heads, n_kv_heads, head_dim, rope_theta, device_idx);
+                position_ids, seq_len, n_heads, n_kv_heads, head_dim, rope_theta, device_idx, rotary_dim);
 
         case Q16BlockSize::BLOCK_128:
             return apply_typed_block<Q16_1Block_128>(
                 static_cast<Q16_1Block_128 *>(q_raw),
                 static_cast<Q16_1Block_128 *>(k_raw),
-                position_ids, seq_len, n_heads, n_kv_heads, head_dim, rope_theta, device_idx);
+                position_ids, seq_len, n_heads, n_kv_heads, head_dim, rope_theta, device_idx, rotary_dim);
 
         default:
             LOG_ERROR("CPURoPEKernelT<Q16_1>::apply_tensor: Unknown block size");

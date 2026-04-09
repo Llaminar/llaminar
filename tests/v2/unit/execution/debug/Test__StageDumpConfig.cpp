@@ -128,14 +128,14 @@ namespace llaminar2
         TEST_F(StageDumpConfigTest, ShouldDumpNameWithSubstringMatch)
         {
             // Filter by partial name - should match any stage containing the substring
-            setenv("LLAMINAR_STAGE_DUMP_NAMES", "fused_attn_wo", 1);
+            setenv("LLAMINAR_STAGE_DUMP_NAMES", "attn_norm", 1);
             auto cfg = freshConfig();
 
-            // Substring "fused_attn_wo" should match these node names
-            EXPECT_TRUE(cfg.shouldDumpName("layer0_fused_attn_wo"));
-            EXPECT_TRUE(cfg.shouldDumpName("layer5_fused_attn_wo"));
-            EXPECT_TRUE(cfg.shouldDumpName("layer23_fused_attn_wo"));
-            EXPECT_TRUE(cfg.shouldDumpName("prefill_fused_attn_wo"));
+            // Substring "attn_norm" should match these node names
+            EXPECT_TRUE(cfg.shouldDumpName("layer0_attn_norm"));
+            EXPECT_TRUE(cfg.shouldDumpName("layer5_attn_norm"));
+            EXPECT_TRUE(cfg.shouldDumpName("layer23_attn_norm"));
+            EXPECT_TRUE(cfg.shouldDumpName("prefill_attn_norm"));
 
             // Should NOT match these
             EXPECT_FALSE(cfg.shouldDumpName("layer0_attention"));
@@ -149,7 +149,7 @@ namespace llaminar2
             setenv("LLAMINAR_STAGE_DUMP_NAMES", "layer0_", 1);
             auto cfg = freshConfig();
 
-            EXPECT_TRUE(cfg.shouldDumpName("layer0_fused_attn_wo"));
+            EXPECT_TRUE(cfg.shouldDumpName("layer0_attn_norm"));
             EXPECT_TRUE(cfg.shouldDumpName("layer0_attention"));
             EXPECT_TRUE(cfg.shouldDumpName("layer0_qkv_proj"));
             EXPECT_TRUE(cfg.shouldDumpName("layer0_ffn_norm"));
@@ -162,10 +162,10 @@ namespace llaminar2
         TEST_F(StageDumpConfigTest, ShouldDumpNameWithMultipleSubstrings)
         {
             // Multiple substring filters
-            setenv("LLAMINAR_STAGE_DUMP_NAMES", "fused_attn_wo,ffn_norm", 1);
+            setenv("LLAMINAR_STAGE_DUMP_NAMES", "attn_norm,ffn_norm", 1);
             auto cfg = freshConfig();
 
-            EXPECT_TRUE(cfg.shouldDumpName("layer0_fused_attn_wo"));
+            EXPECT_TRUE(cfg.shouldDumpName("layer0_attn_norm"));
             EXPECT_TRUE(cfg.shouldDumpName("layer5_ffn_norm"));
 
             EXPECT_FALSE(cfg.shouldDumpName("layer0_qkv_proj"));

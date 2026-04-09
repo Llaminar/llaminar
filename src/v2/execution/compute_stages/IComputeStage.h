@@ -277,7 +277,6 @@ namespace llaminar2
         ATTENTION_QK,
         ATTENTION_SOFTMAX,
         ATTENTION_V,
-        FUSED_ATTENTION_WO,
 
         // Element-wise
         ADD_RESIDUAL,

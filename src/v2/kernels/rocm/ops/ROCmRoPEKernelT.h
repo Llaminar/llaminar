@@ -115,7 +115,8 @@ namespace llaminar2
                 float rope_theta,
                 const IMPIContext *mpi_ctx = nullptr,
                 int device_idx = -1,
-                int pos_offset = 0) override;
+                int pos_offset = 0,
+                int rotary_dim = 0) override;
 
             // ===== Typed API =====
             bool apply_typed(
@@ -127,7 +128,8 @@ namespace llaminar2
                 int n_kv_heads,
                 int head_dim,
                 float rope_theta,
-                int device_idx = -1);
+                int device_idx = -1,
+                int rotary_dim = 0);
 
             static constexpr ActivationPrecision precision() { return ActivationPrecision::FP32; }
             static const char *precision_name() { return "FP32"; }
@@ -240,7 +242,8 @@ namespace llaminar2
                 float rope_theta,
                 const IMPIContext *mpi_ctx = nullptr,
                 int device_idx = -1,
-                int pos_offset = 0) override;
+                int pos_offset = 0,
+                int rotary_dim = 0) override;
 
             // ===== Typed API =====
             bool apply_typed(
@@ -252,7 +255,8 @@ namespace llaminar2
                 int n_kv_heads,
                 int head_dim,
                 float rope_theta,
-                int device_idx = -1);
+                int device_idx = -1,
+                int rotary_dim = 0);
 
             static constexpr ActivationPrecision precision() { return ActivationPrecision::BF16; }
             static const char *precision_name() { return "BF16"; }
@@ -342,7 +346,8 @@ namespace llaminar2
                 float rope_theta,
                 const IMPIContext *mpi_ctx = nullptr,
                 int device_idx = -1,
-                int pos_offset = 0) override;
+                int pos_offset = 0,
+                int rotary_dim = 0) override;
 
             // ===== Typed API =====
             bool apply_typed(
@@ -354,7 +359,8 @@ namespace llaminar2
                 int n_kv_heads,
                 int head_dim,
                 float rope_theta,
-                int device_idx = -1);
+                int device_idx = -1,
+                int rotary_dim = 0);
 
             static constexpr ActivationPrecision precision() { return ActivationPrecision::FP16; }
             static const char *precision_name() { return "FP16"; }

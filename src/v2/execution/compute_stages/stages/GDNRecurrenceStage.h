@@ -120,6 +120,9 @@ namespace llaminar2
         }
         bool hasDynamicParams() const override { return true; }
 
+        // GDN recurrence operates fully on-device when GPU is active — graph-capturable
+        bool isGraphCapturable() const override { return true; }
+
         const Params &getParams() const { return params_; }
 
     private:

@@ -126,11 +126,11 @@ namespace llaminar2
             return SnapshotShardingMode::COLUMN_PARALLEL;
 
         // Attention context - column-parallel (split on num_heads)
-        if (stage_type == "ATTENTION_CONTEXT" || stage_type == "FUSED_ATTENTION_WO_CONTEXT")
+        if (stage_type == "ATTENTION_CONTEXT")
             return SnapshotShardingMode::COLUMN_PARALLEL;
 
         // Attention output (Wo) - row-parallel (AllReduce combines partial results)
-        if (stage_type == "ATTENTION_OUTPUT" || stage_type == "FUSED_ATTENTION_WO")
+        if (stage_type == "ATTENTION_OUTPUT")
             return SnapshotShardingMode::ROW_PARALLEL;
 
         // Attention norms - replicated

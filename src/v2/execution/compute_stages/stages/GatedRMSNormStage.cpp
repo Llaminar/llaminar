@@ -14,6 +14,24 @@
 #include <immintrin.h>
 #endif
 
+// GPU kernel declarations
+#ifdef HAVE_CUDA
+extern "C" bool cudaGDN_gated_rmsnorm(
+    const float *input, const float *gate, const float *gamma,
+    float *output,
+    int seq_len, int d_model, int norm_dim, int gamma_period,
+    float eps, bool subtract_one, bool gate_silu,
+    int device_idx, void *stream);
+#endif
+#ifdef HAVE_ROCM
+extern "C" bool rocmGDN_gated_rmsnorm(
+    const float *input, const float *gate, const float *gamma,
+    float *output,
+    int seq_len, int d_model, int norm_dim, int gamma_period,
+    float eps, bool subtract_one, bool gate_silu,
+    int device_idx, void *stream);
+#endif
+
 namespace llaminar2
 {
 
@@ -51,6 +69,78 @@ namespace llaminar2
 
         const size_t d_model = input_base->shape().size() > 1 ? input_base->shape()[1] : input_base->numel();
 
+        // Determine normalization dimension. When norm_dim > 0, normalize
+        // over chunks of norm_dim (per-head normalization). Otherwise, full d_model.
+        const size_t norm_dim = (params_.norm_dim > 0)
+                                    ? static_cast<size_t>(params_.norm_dim)
+                                    : d_model;
+        const float eps = params_.eps;
+        const bool subtract_one = params_.subtract_one;
+        const bool gate_silu = params_.gate_silu;
+
+        // Gamma weight may be smaller than norm_dim (e.g., [d_v=128] with full-row
+        // norm over value_dim=2048). In this case, gamma cycles every gamma_period elements.
+        const size_t gamma_numel = gamma_base->numel();
+        const size_t gamma_period = (gamma_numel < norm_dim) ? gamma_numel : norm_dim;
+
+        // GPU dispatch path — do NOT call data()/mutable_data() before this check!
+        // Those calls trigger D2H transfers when tensors are GPU-authoritative,
+        // then the GPU path re-uploads them (wasteful round-trip).
+        if (params_.device_id.is_gpu())
+        {
+            // Ensure all tensors are on device (gamma is a weight, not arena-managed)
+            auto *input_mut = const_cast<TensorBase *>(input_base);
+            auto *gate_mut = const_cast<TensorBase *>(gate_base);
+            auto *gamma_mut = const_cast<TensorBase *>(gamma_base);
+            input_mut->ensureOnDevice(params_.device_id);
+            gate_mut->ensureOnDevice(params_.device_id);
+            gamma_mut->ensureOnDevice(params_.device_id);
+            output_base->allocateOnDevice(params_.device_id);
+
+            const float *inp_gpu = static_cast<const float *>(input_base->active_data_ptr());
+            const float *gate_gpu = static_cast<const float *>(gate_base->active_data_ptr());
+            const float *gamma_gpu = static_cast<const float *>(gamma_base->active_data_ptr());
+            float *out_gpu = static_cast<float *>(output_base->active_mutable_data_ptr());
+            int dev_idx = params_.device_id.toKernelDeviceIndex();
+            void *stream = gpuStream();
+
+#ifdef HAVE_CUDA
+            if (params_.device_id.is_cuda())
+            {
+                bool ok = cudaGDN_gated_rmsnorm(
+                    inp_gpu, gate_gpu, gamma_gpu, out_gpu,
+                    seq_len, static_cast<int>(d_model),
+                    static_cast<int>(norm_dim), static_cast<int>(gamma_period),
+                    eps, subtract_one, gate_silu,
+                    dev_idx, stream);
+                if (!ok)
+                {
+                    LOG_ERROR("[GatedRMSNormStage] CUDA kernel failed");
+                    return false;
+                }
+                return true;
+            }
+#endif
+#ifdef HAVE_ROCM
+            if (params_.device_id.is_rocm())
+            {
+                bool ok = rocmGDN_gated_rmsnorm(
+                    inp_gpu, gate_gpu, gamma_gpu, out_gpu,
+                    seq_len, static_cast<int>(d_model),
+                    static_cast<int>(norm_dim), static_cast<int>(gamma_period),
+                    eps, subtract_one, gate_silu,
+                    dev_idx, stream);
+                if (!ok)
+                {
+                    LOG_ERROR("[GatedRMSNormStage] ROCm kernel failed");
+                    return false;
+                }
+                return true;
+            }
+#endif
+        }
+
+        // CPU path: extract host pointers (only reached when NOT on GPU)
         const float *input_data = input_base->data();
         const float *gate_data = gate_base->data();
         const float *gamma_data = gamma_base->data();
@@ -62,20 +152,7 @@ namespace llaminar2
             return false;
         }
 
-        // Determine normalization dimension. When norm_dim > 0, normalize
-        // over chunks of norm_dim (per-head normalization). Otherwise, full d_model.
-        const size_t norm_dim = (params_.norm_dim > 0)
-                                    ? static_cast<size_t>(params_.norm_dim)
-                                    : d_model;
-        const size_t n_groups = d_model / norm_dim; // Number of heads (or 1 for full-dim)
-        const float eps = params_.eps;
-        const bool subtract_one = params_.subtract_one;
-        const bool gate_silu = params_.gate_silu;
-
-        // Gamma weight may be smaller than norm_dim (e.g., [d_v=128] with full-row
-        // norm over value_dim=2048). In this case, gamma cycles every gamma_period elements.
-        const size_t gamma_numel = gamma_base->numel();
-        const size_t gamma_period = (gamma_numel < norm_dim) ? gamma_numel : norm_dim;
+        const size_t n_groups = d_model / norm_dim;
 
         auto do_work = [&]()
         {
@@ -216,7 +293,21 @@ namespace llaminar2
 
     bool GatedRMSNormStage::supportsBackend(ComputeBackendType backend) const
     {
-        return backend == ComputeBackendType::CPU;
+        switch (backend)
+        {
+        case ComputeBackendType::CPU:
+            return true;
+#ifdef HAVE_CUDA
+        case ComputeBackendType::GPU_CUDA:
+            return true;
+#endif
+#ifdef HAVE_ROCM
+        case ComputeBackendType::GPU_ROCM:
+            return true;
+#endif
+        default:
+            return false;
+        }
     }
 
     StageDumpInfo GatedRMSNormStage::buildDumpInfoImpl() const

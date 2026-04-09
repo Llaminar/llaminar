@@ -43,15 +43,15 @@ namespace llaminar2
         {
             STAGE_PARAMS_COMMON_FIELDS;
 
-            ITensor *input = nullptr;          ///< Input [seq_len, channels] (modified in-place for decode)
-            ITensor *output = nullptr;         ///< Output [seq_len, channels]
-            const ITensor *weight = nullptr;   ///< Conv weight [channels, kernel_size] (squeezed from [channels, 1, kernel_size])
-            const ITensor *bias = nullptr;     ///< Optional conv bias [channels]
+            ITensor *input = nullptr;        ///< Input [seq_len, channels] (modified in-place for decode)
+            ITensor *output = nullptr;       ///< Output [seq_len, channels]
+            const ITensor *weight = nullptr; ///< Conv weight [channels, kernel_size] (squeezed from [channels, 1, kernel_size])
+            const ITensor *bias = nullptr;   ///< Optional conv bias [channels]
 
-            float *conv_state = nullptr;       ///< Conv state buffer [channels, kernel_size-1] (from GDNLayerState)
-            int seq_len = 0;                   ///< Sequence length
-            int channels = 0;                  ///< Number of channels (= QKV dim)
-            int kernel_size = 4;               ///< Convolution kernel width
+            float *conv_state = nullptr; ///< Conv state buffer [channels, kernel_size-1] (from GDNLayerState)
+            int seq_len = 0;             ///< Sequence length
+            int channels = 0;            ///< Number of channels (= QKV dim)
+            int kernel_size = 4;         ///< Convolution kernel width
 
             /// Kernel implementation (set during graph construction)
             ITensorShortConvolution *kernel = nullptr;
@@ -81,10 +81,12 @@ namespace llaminar2
         }
         bool hasDynamicParams() const override { return true; }
 
+        // Short conv1d operates fully on-device when GPU is active — graph-capturable
+        bool isGraphCapturable() const override { return true; }
+
         const Params &getParams() const { return params_; }
 
     private:
-
         Params params_;
     };
 

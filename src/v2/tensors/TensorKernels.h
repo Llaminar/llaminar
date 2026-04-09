@@ -2236,6 +2236,12 @@ namespace llaminar2
          *       This is the PREFERRED path for contiguous positions (decode and most prefill).
          *
          * @note This is the PRIMARY RoPE interface. All implementations must provide this.
+         *
+         * @param rotary_dim Number of dimensions to rotate per head. When 0 (default),
+         *        rotates all head_dim dimensions (full RoPE). When < head_dim, only the
+         *        first rotary_dim dimensions are rotated (partial RoPE); the remaining
+         *        dimensions are left untouched. The stride between heads remains head_dim.
+         *        Used by models like Qwen 3.5 where partial_rotary_factor < 1.0.
          */
         virtual bool apply_tensor(
             TensorBase *Q,
@@ -2248,7 +2254,8 @@ namespace llaminar2
             float rope_theta,
             const IMPIContext *mpi_ctx = nullptr,
             int device_idx = -1,
-            int pos_offset = 0) = 0;
+            int pos_offset = 0,
+            int rotary_dim = 0) = 0;
 
         /**
          * @brief Update the pos_offset stored in pinned host memory for graph replay
@@ -2537,6 +2544,15 @@ namespace llaminar2
     public:
         virtual ~ITensorShortConvolution() = default;
 
+        /// Set the GPU stream for kernel dispatch (no-op for CPU implementations)
+        virtual void setGPUStream(void *stream) { (void)stream; }
+
+        /// Allocate GPU state buffer (no-op for CPU implementations)
+        virtual void allocateGPUState(int state_size) { (void)state_size; }
+
+        /// Reset GPU state to zero (no-op for CPU implementations)
+        virtual void resetGPUState() {}
+
         /**
          * @brief Apply causal depthwise conv1d + optional SiLU activation
          *
@@ -2584,6 +2600,57 @@ namespace llaminar2
     {
     public:
         virtual ~ITensorGatedDeltaNet() = default;
+
+        /// Set the GPU stream for kernel dispatch (no-op for CPU implementations)
+        virtual void setGPUStream(void *stream) { (void)stream; }
+
+        /// Allocate GPU state buffer (no-op for CPU implementations)
+        virtual void allocateGPUState(int state_size) { (void)state_size; }
+
+        /// Reset GPU state to zero (no-op for CPU implementations)
+        virtual void resetGPUState() {}
+
+        /**
+         * @brief Deinterleave merged QKV buffer on device (GPU-only)
+         *
+         * Splits a merged [seq_len, q_dim + k_dim + v_dim] device buffer into
+         * separate contiguous Q, K, V device arrays. Handles GQA expansion,
+         * identity deinterleave, and TP head selection via the modular formula:
+         *   k_head_for_v_head_j = (j + global_v_head_offset) % n_k_heads
+         *
+         * GPU implementations allocate persistent grow-only scratch internally.
+         * CPU implementations return false (deinterleave done on host by stage).
+         *
+         * @param d_merged_qkv  Device pointer to merged QKV buffer
+         * @param d_q           [out] Device pointer to deinterleaved Q [seq_len, n_v_heads * d_k]
+         * @param d_k           [out] Device pointer to deinterleaved K [seq_len, n_v_heads * d_k]
+         * @param d_v           [out] Device pointer to deinterleaved V [seq_len, n_v_heads * d_v]
+         * @param seq_len       Sequence length
+         * @param n_k_heads     Key head count in merged buffer
+         * @param n_v_heads     Value head count (output head count)
+         * @param d_k           Key/query head dimension
+         * @param d_v           Value head dimension
+         * @param global_v_head_offset  TP modular repeat offset
+         * @return true if device deinterleave succeeded, false for CPU fallback
+         */
+        virtual bool deinterleave_qkv_device(
+            const float *d_merged_qkv,
+            float *&d_q, float *&d_k, float *&d_v,
+            int seq_len, int n_k_heads, int n_v_heads,
+            int head_dim_k, int head_dim_v, int global_v_head_offset)
+        {
+            (void)d_merged_qkv;
+            (void)d_q;
+            (void)d_k;
+            (void)d_v;
+            (void)seq_len;
+            (void)n_k_heads;
+            (void)n_v_heads;
+            (void)head_dim_k;
+            (void)head_dim_v;
+            (void)global_v_head_offset;
+            return false;
+        }
 
         /**
          * @brief Chunk-parallel prefill: process full sequence

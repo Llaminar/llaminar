@@ -15,6 +15,7 @@
 #pragma once
 
 #include "../IComputeStage.h"
+#include "../IWorkspaceConsumerStage.h"
 #include "../StageParamsBase.h"
 #include "../../../memory/BufferId.h"
 
@@ -31,7 +32,7 @@ namespace llaminar2
      * Performs: QKV = input × W_qkv, Z = input × W_z,
      *          A = input × W_a, B = input × W_b
      */
-    class GDNProjectionStage : public IComputeStage
+    class GDNProjectionStage : public IComputeStage, public IWorkspaceConsumerStage
     {
     public:
         struct Params
@@ -90,6 +91,14 @@ namespace llaminar2
         StageBufferContract bufferContract() const override;
 
         const Params &getParams() const { return params_; }
+
+        // IWorkspaceConsumerStage - multi-kernel pattern (4 GEMM kernels)
+        IWorkspaceConsumer *getKernelAsWorkspaceConsumer() override;
+        void bindWorkspace(DeviceWorkspaceManager *workspace) override;
+        void unbindWorkspace() override;
+
+        // GDN projection uses standard GEMM path — graph-capturable
+        bool isGraphCapturable() const override { return true; }
 
     private:
         /// Lazily resolve a GEMM kernel from a weight tensor via KernelFactory.

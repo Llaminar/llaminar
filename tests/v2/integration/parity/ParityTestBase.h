@@ -170,15 +170,15 @@ namespace llaminar2::test::parity
         float mean = 0.0f;
         float stddev = 0.0f;
         float kurtosis = 0.0f;
-        float skewness = 0.0f;           ///< Asymmetry; symmetric quant schemes assume ~0
+        float skewness = 0.0f; ///< Asymmetry; symmetric quant schemes assume ~0
         float p95 = 0.0f;
         float p99 = 0.0f;
-        float outlier_fraction = 0.0f;   ///< Fraction of |x| > 6σ (SmoothQuant indicator)
-        float dynamic_range = 0.0f;     ///< log2(max|x| / median|x|) — bits needed
-        float sparsity = 0.0f;          ///< Fraction of |x| < 1e-6
-        float zero_fraction = 0.0f;     ///< Fraction of x == 0 exactly
-        size_t nan_count = 0;            ///< Number of NaN values
-        size_t inf_count = 0;            ///< Number of ±Inf values
+        float outlier_fraction = 0.0f; ///< Fraction of |x| > 6σ (SmoothQuant indicator)
+        float dynamic_range = 0.0f;    ///< log2(max|x| / median|x|) — bits needed
+        float sparsity = 0.0f;         ///< Fraction of |x| < 1e-6
+        float zero_fraction = 0.0f;    ///< Fraction of x == 0 exactly
+        size_t nan_count = 0;          ///< Number of NaN values
+        size_t inf_count = 0;          ///< Number of ±Inf values
         size_t element_count = 0;
     };
 
@@ -190,12 +190,13 @@ namespace llaminar2::test::parity
         std::string stage_name;
         bool passed = false;
         float cosine_similarity = 0.0f;
+        float cosine_drop = 0.0f; ///< Drop from previous stage (positive = error introduced)
         float rel_l2_norm = 0.0f;
         float max_abs_diff = 0.0f;
         float kl_divergence = 0.0f;
-        float snr_db = 0.0f;              ///< Signal-to-noise ratio in dB: 10·log10(‖signal‖²/‖error‖²)
-        float rmse = 0.0f;                ///< Root mean squared error
-        float error_entropy = 0.0f;       ///< Shannon entropy of error histogram (bits)
+        float snr_db = 0.0f;        ///< Signal-to-noise ratio in dB: 10·log10(‖signal‖²/‖error‖²)
+        float rmse = 0.0f;          ///< Root mean squared error
+        float error_entropy = 0.0f; ///< Shannon entropy of error histogram (bits)
         size_t total_elements = 0;
         TensorDistributionStats llaminar_stats;
         TensorDistributionStats pytorch_stats;
@@ -210,10 +211,12 @@ namespace llaminar2::test::parity
         float avg_cosine_sim = 0.0f;
         float min_cosine_sim = 1.0f;
         std::string worst_stage;
+        float max_cosine_drop = 0.0f; ///< Largest single-stage cosine drop (error introduced)
+        std::string max_drop_stage;   ///< Stage that introduced the most error
         int stages_compared = 0;
         bool passed = false;
-        float max_kurtosis = 0.0f;      ///< Highest excess kurtosis across stages
-        std::string max_kurtosis_stage; ///< Stage with highest kurtosis
+        float max_kurtosis = 0.0f;                        ///< Highest excess kurtosis across stages
+        std::string max_kurtosis_stage;                   ///< Stage with highest kurtosis
         std::vector<StageComparisonResult> stage_results; ///< Per-stage detailed results
     };
 
@@ -743,7 +746,7 @@ namespace llaminar2::test::parity
      * @brief Compute distribution statistics for a float tensor
      *
      * Computes min, max, mean, stddev, kurtosis, and percentiles (p95, p99).
-     * Percentiles use a partial-sort approach for efficiency.
+     * Uses OpenMP for large tensors.
      */
     inline TensorDistributionStats computeDistributionStats(const float *data, size_t size)
     {
@@ -752,22 +755,36 @@ namespace llaminar2::test::parity
         if (size == 0)
             return stats;
 
-        // Single pass: min, max, sum, sum2, nan/inf/zero/sparsity counts
+        // Pass 1: min, max, sum, sum2, nan/inf/zero/sparsity counts
         double sum = 0.0, sum2 = 0.0;
         float vmin = std::numeric_limits<float>::max();
         float vmax = std::numeric_limits<float>::lowest();
         size_t nan_count = 0, inf_count = 0, zero_count = 0, sparse_count = 0;
         constexpr float sparsity_eps = 1e-6f;
 
+#pragma omp parallel for reduction(+ : sum, sum2, nan_count, inf_count, zero_count, sparse_count) \
+    reduction(min : vmin) reduction(max : vmax) schedule(static) if (size > 8192)
         for (size_t i = 0; i < size; ++i)
         {
             float v = data[i];
-            if (std::isnan(v)) { nan_count++; continue; }
-            if (std::isinf(v)) { inf_count++; continue; }
-            if (v < vmin) vmin = v;
-            if (v > vmax) vmax = v;
-            if (v == 0.0f) zero_count++;
-            if (std::abs(v) < sparsity_eps) sparse_count++;
+            if (std::isnan(v))
+            {
+                nan_count++;
+                continue;
+            }
+            if (std::isinf(v))
+            {
+                inf_count++;
+                continue;
+            }
+            if (v < vmin)
+                vmin = v;
+            if (v > vmax)
+                vmax = v;
+            if (v == 0.0f)
+                zero_count++;
+            if (std::abs(v) < sparsity_eps)
+                sparse_count++;
             double d = static_cast<double>(v);
             sum += d;
             sum2 += d * d;
@@ -789,21 +806,24 @@ namespace llaminar2::test::parity
         double sd = std::sqrt(std::max(var, 0.0));
         stats.stddev = static_cast<float>(sd);
 
-        // Kurtosis and skewness (second pass for higher moments)
+        // Pass 2: kurtosis, skewness, outliers
         if (var > 1e-30)
         {
             double sum3 = 0.0, sum4 = 0.0;
             size_t outlier_count = 0;
             double outlier_threshold = 6.0 * sd;
+#pragma omp parallel for reduction(+ : sum3, sum4, outlier_count) schedule(static) if (size > 8192)
             for (size_t i = 0; i < size; ++i)
             {
                 float v = data[i];
-                if (std::isnan(v) || std::isinf(v)) continue;
+                if (std::isnan(v) || std::isinf(v))
+                    continue;
                 double d = static_cast<double>(v) - mean;
                 double d2 = d * d;
                 sum3 += d2 * d;
                 sum4 += d2 * d2;
-                if (std::abs(d) > outlier_threshold) outlier_count++;
+                if (std::abs(d) > outlier_threshold)
+                    outlier_count++;
             }
             double n = static_cast<double>(finite_count);
             stats.kurtosis = static_cast<float>(sum4 / (n * var * var) - 3.0);
@@ -811,36 +831,55 @@ namespace llaminar2::test::parity
             stats.outlier_fraction = static_cast<float>(outlier_count) / static_cast<float>(finite_count);
         }
 
-        // Percentiles and dynamic range via partial sort on absolute values
+        // Percentiles via approximate approach: sample if very large
         if (finite_count >= 4)
         {
+            // For large tensors, subsample to cap percentile cost
+            constexpr size_t MAX_PERCENTILE_SAMPLES = 100000;
             std::vector<float> abs_vals;
-            abs_vals.reserve(finite_count);
-            for (size_t i = 0; i < size; ++i)
+            if (finite_count <= MAX_PERCENTILE_SAMPLES)
             {
-                float v = data[i];
-                if (!std::isnan(v) && !std::isinf(v))
-                    abs_vals.push_back(std::abs(v));
+                abs_vals.reserve(finite_count);
+                for (size_t i = 0; i < size; ++i)
+                {
+                    float v = data[i];
+                    if (!std::isnan(v) && !std::isinf(v))
+                        abs_vals.push_back(std::abs(v));
+                }
+            }
+            else
+            {
+                // Deterministic stride-based sampling
+                abs_vals.reserve(MAX_PERCENTILE_SAMPLES);
+                size_t stride = size / MAX_PERCENTILE_SAMPLES;
+                for (size_t i = 0; i < size && abs_vals.size() < MAX_PERCENTILE_SAMPLES; i += stride)
+                {
+                    float v = data[i];
+                    if (!std::isnan(v) && !std::isinf(v))
+                        abs_vals.push_back(std::abs(v));
+                }
             }
 
             size_t n = abs_vals.size();
-            size_t p50_idx = n / 2;
-            size_t p95_idx = static_cast<size_t>(0.95 * (n - 1));
-            size_t p99_idx = static_cast<size_t>(0.99 * (n - 1));
+            if (n >= 4)
+            {
+                size_t p50_idx = n / 2;
+                size_t p95_idx = static_cast<size_t>(0.95 * (n - 1));
+                size_t p99_idx = static_cast<size_t>(0.99 * (n - 1));
 
-            std::nth_element(abs_vals.begin(), abs_vals.begin() + p99_idx, abs_vals.end());
-            stats.p99 = abs_vals[p99_idx];
+                std::nth_element(abs_vals.begin(), abs_vals.begin() + p99_idx, abs_vals.end());
+                stats.p99 = abs_vals[p99_idx];
 
-            std::nth_element(abs_vals.begin(), abs_vals.begin() + p95_idx, abs_vals.begin() + p99_idx);
-            stats.p95 = abs_vals[p95_idx];
+                std::nth_element(abs_vals.begin(), abs_vals.begin() + p95_idx, abs_vals.begin() + p99_idx);
+                stats.p95 = abs_vals[p95_idx];
 
-            std::nth_element(abs_vals.begin(), abs_vals.begin() + p50_idx, abs_vals.begin() + p95_idx);
-            float median_abs = abs_vals[p50_idx];
+                std::nth_element(abs_vals.begin(), abs_vals.begin() + p50_idx, abs_vals.begin() + p95_idx);
+                float median_abs = abs_vals[p50_idx];
 
-            // Dynamic range: log2(max|x| / median|x|)
-            float max_abs = std::max(std::abs(vmin), std::abs(vmax));
-            if (median_abs > 1e-10f && max_abs > 1e-10f)
-                stats.dynamic_range = std::log2(max_abs / median_abs);
+                float max_abs = std::max(std::abs(vmin), std::abs(vmax));
+                if (median_abs > 1e-10f && max_abs > 1e-10f)
+                    stats.dynamic_range = std::log2(max_abs / median_abs);
+            }
         }
 
         return stats;
@@ -852,6 +891,7 @@ namespace llaminar2::test::parity
         double norm_a = 0.0;
         double norm_b = 0.0;
 
+#pragma omp parallel for reduction(+ : dot_product, norm_a, norm_b) schedule(static) if (size > 8192)
         for (size_t i = 0; i < size; ++i)
         {
             dot_product += static_cast<double>(a[i]) * static_cast<double>(b[i]);
@@ -889,6 +929,7 @@ namespace llaminar2::test::parity
         size_t seq_len = size / vocab_size;
         double total_kl = 0.0;
 
+#pragma omp parallel for reduction(+ : total_kl) schedule(static) if (seq_len > 1)
         for (size_t pos = 0; pos < seq_len; ++pos)
         {
             const float *actual_row = actual_logits + pos * vocab_size;
@@ -908,8 +949,8 @@ namespace llaminar2::test::parity
             double sum_exp_expected = 0.0;
             for (size_t i = 0; i < vocab_size; ++i)
             {
-                sum_exp_actual += std::exp(actual_row[i] - max_actual);
-                sum_exp_expected += std::exp(expected_row[i] - max_expected);
+                sum_exp_actual += std::exp(static_cast<double>(actual_row[i] - max_actual));
+                sum_exp_expected += std::exp(static_cast<double>(expected_row[i] - max_expected));
             }
             double log_sum_actual = max_actual + std::log(sum_exp_actual);
             double log_sum_expected = max_expected + std::log(sum_exp_expected);
@@ -951,25 +992,42 @@ namespace llaminar2::test::parity
         size_t seq_len = size / vocab_size;
         double total_overlap = 0.0;
 
+#pragma omp parallel for reduction(+ : total_overlap) schedule(static) if (seq_len > 1)
         for (size_t pos = 0; pos < seq_len; ++pos)
         {
             const float *actual_row = actual_logits + pos * vocab_size;
             const float *expected_row = expected_logits + pos * vocab_size;
 
+            // Use a min-heap of size K instead of allocating vocab_size pairs
             auto get_top_k = [&](const float *logits)
             {
-                std::vector<std::pair<float, int>> scores(vocab_size);
+                // Min-heap: smallest of top-K on top, so we can eject it when we find larger
+                std::vector<std::pair<float, int>> heap;
+                heap.reserve(k + 1);
                 for (size_t i = 0; i < vocab_size; ++i)
                 {
-                    scores[i] = {logits[i], static_cast<int>(i)};
+                    if (static_cast<int>(heap.size()) < k)
+                    {
+                        heap.push_back({logits[i], static_cast<int>(i)});
+                        if (static_cast<int>(heap.size()) == k)
+                            std::make_heap(heap.begin(), heap.end(),
+                                           [](const auto &a, const auto &b)
+                                           { return a.first > b.first; });
+                    }
+                    else if (logits[i] > heap.front().first)
+                    {
+                        std::pop_heap(heap.begin(), heap.end(),
+                                      [](const auto &a, const auto &b)
+                                      { return a.first > b.first; });
+                        heap.back() = {logits[i], static_cast<int>(i)};
+                        std::push_heap(heap.begin(), heap.end(),
+                                       [](const auto &a, const auto &b)
+                                       { return a.first > b.first; });
+                    }
                 }
-                std::partial_sort(scores.begin(), scores.begin() + k, scores.end(),
-                                  [](const auto &a, const auto &b)
-                                  { return a.first > b.first; });
-
-                std::vector<int> indices(k);
-                for (int i = 0; i < k; ++i)
-                    indices[i] = scores[i].second;
+                std::vector<int> indices(heap.size());
+                for (size_t i = 0; i < heap.size(); ++i)
+                    indices[i] = heap[i].second;
                 std::sort(indices.begin(), indices.end());
                 return indices;
             };
@@ -1020,6 +1078,7 @@ namespace llaminar2::test::parity
             return 0.0f;
 
         int hits = 0;
+#pragma omp parallel for reduction(+ : hits) schedule(static) if (seq_len > 1)
         for (size_t pos = 0; pos < seq_len; ++pos)
         {
             const float *actual_row = actual_logits + pos * vocab_size;
@@ -1037,18 +1096,35 @@ namespace llaminar2::test::parity
                 }
             }
 
-            // Find llaminar's top-K tokens
-            std::vector<std::pair<float, int>> scores(vocab_size);
+            // Find llaminar's top-K tokens using a min-heap of size K
+            std::vector<std::pair<float, int>> heap;
+            heap.reserve(k + 1);
             for (size_t i = 0; i < vocab_size; ++i)
-                scores[i] = {actual_row[i], static_cast<int>(i)};
-            std::partial_sort(scores.begin(), scores.begin() + k, scores.end(),
-                              [](const auto &a, const auto &b)
-                              { return a.first > b.first; });
+            {
+                if (static_cast<int>(heap.size()) < k)
+                {
+                    heap.push_back({actual_row[i], static_cast<int>(i)});
+                    if (static_cast<int>(heap.size()) == k)
+                        std::make_heap(heap.begin(), heap.end(),
+                                       [](const auto &a, const auto &b)
+                                       { return a.first > b.first; });
+                }
+                else if (actual_row[i] > heap.front().first)
+                {
+                    std::pop_heap(heap.begin(), heap.end(),
+                                  [](const auto &a, const auto &b)
+                                  { return a.first > b.first; });
+                    heap.back() = {actual_row[i], static_cast<int>(i)};
+                    std::push_heap(heap.begin(), heap.end(),
+                                   [](const auto &a, const auto &b)
+                                   { return a.first > b.first; });
+                }
+            }
 
             // Check if PyTorch's argmax is in llaminar's top-K
-            for (int i = 0; i < k; ++i)
+            for (size_t i = 0; i < heap.size(); ++i)
             {
-                if (scores[i].second == pytorch_argmax)
+                if (heap[i].second == pytorch_argmax)
                 {
                     hits++;
                     break;
@@ -1142,7 +1218,8 @@ namespace llaminar2::test::parity
 
         // Header row
         table << fort::header
-              << "Layer" << "Avg Cosine" << "Min Cosine" << "Worst Stage" << "Kurtosis" << "OK"
+              << "Layer" << "Avg Cosine" << "Min Cosine" << "Worst Stage"
+              << "Max Drop" << "Drop Stage" << "Kurtosis" << "OK"
               << fort::endr;
 
         // Set column alignments
@@ -1151,12 +1228,16 @@ namespace llaminar2::test::parity
         table.column(2).set_cell_text_align(fort::text_align::right);
         table.column(3).set_cell_text_align(fort::text_align::left);
         table.column(4).set_cell_text_align(fort::text_align::right);
-        table.column(5).set_cell_text_align(fort::text_align::center);
+        table.column(5).set_cell_text_align(fort::text_align::left);
+        table.column(6).set_cell_text_align(fort::text_align::right);
+        table.column(7).set_cell_text_align(fort::text_align::center);
 
         // Embedding row
         table << "EMBEDDING"
               << fmt_f6(summary.embedding_cosine)
               << fmt_f6(summary.embedding_cosine)
+              << "-"
+              << "-"
               << "-"
               << "-"
               << status_str(summary.embedding_passed)
@@ -1180,10 +1261,17 @@ namespace llaminar2::test::parity
                 kurtosis_str = "-";
             }
 
+            std::string drop_str = (stats.max_cosine_drop > 0.001f)
+                                       ? fmt_f6(stats.max_cosine_drop)
+                                       : "-";
+            std::string drop_stage = stats.max_drop_stage.empty() ? "-" : stats.max_drop_stage;
+
             table << layer_ss.str()
                   << fmt_f6(stats.avg_cosine_sim)
                   << fmt_f6(stats.min_cosine_sim)
                   << stats.worst_stage
+                  << drop_str
+                  << drop_stage
                   << kurtosis_str
                   << status_str(stats.passed)
                   << fort::endr;
@@ -1201,6 +1289,8 @@ namespace llaminar2::test::parity
               << fmt_f6(summary.lm_head_cosine)
               << fmt_f6(summary.lm_head_cosine)
               << lm_info.str()
+              << "-"
+              << "-"
               << "-"
               << status_str(summary.lm_head_passed)
               << fort::endr;
@@ -1653,6 +1743,15 @@ namespace llaminar2::test::parity
 
         void SetUp() override
         {
+            // CRITICAL: Clear kernel caches at test start for clean state.
+            // TearDown() also clears, but this guards against incomplete teardown
+            // from a prior test (crash, skip, or assertion failure) leaving stale
+            // GEMM engines, embedding caches, or prepared-weight handles.
+            llaminar::v2::kernels::KernelFactory::clearCache();
+#ifdef HAVE_CUDA
+            llaminar2::CUDAEmbeddingKernelT::clearGlobalEmbeddingCache();
+#endif
+
             // Device-specific setup first (may skip)
             setupDeviceSpecific();
 
@@ -1842,27 +1941,32 @@ namespace llaminar2::test::parity
                 return result;
             }
 
+            // Fused pass: compute cosine/L2/max_abs_diff and error histogram in one traversal
             double sum_sq_diff = 0.0;
             double sum_sq_expected = 0.0;
             double dot_product = 0.0;
             double norm_actual_sq = 0.0;
             double norm_expected_sq = 0.0;
+            float max_abs_diff = 0.0f;
 
+#pragma omp parallel for reduction(+ : sum_sq_diff, sum_sq_expected, dot_product, norm_actual_sq, norm_expected_sq) \
+    reduction(max : max_abs_diff) schedule(static) if (size > 8192)
             for (size_t i = 0; i < size; ++i)
             {
-                float diff = actual[i] - expected[i];
+                double a = static_cast<double>(actual[i]);
+                double e = static_cast<double>(expected[i]);
+                double diff = a - e;
                 sum_sq_diff += diff * diff;
-                sum_sq_expected += expected[i] * expected[i];
-                dot_product += actual[i] * expected[i];
-                norm_actual_sq += actual[i] * actual[i];
-                norm_expected_sq += expected[i] * expected[i];
+                sum_sq_expected += e * e;
+                dot_product += a * e;
+                norm_actual_sq += a * a;
+                norm_expected_sq += e * e;
 
-                float abs_diff = std::abs(diff);
-                if (abs_diff > result.max_abs_diff)
-                {
-                    result.max_abs_diff = abs_diff;
-                }
+                float abs_diff = std::abs(actual[i] - expected[i]);
+                if (abs_diff > max_abs_diff)
+                    max_abs_diff = abs_diff;
             }
+            result.max_abs_diff = max_abs_diff;
 
             // Relative L2
             if (sum_sq_expected > 1e-10)
@@ -1890,25 +1994,29 @@ namespace llaminar2::test::parity
                 result.snr_db = 100.0f; // Perfect match, cap at 100 dB
             }
 
-            // Error histogram entropy (Shannon entropy in bits)
-            // Bin errors into 64 buckets by relative magnitude to detect structured vs random noise
+            // Error histogram entropy — separate pass needed because max_abs_diff
+            // must be known first for binning
             {
                 constexpr int N_BINS = 64;
                 std::array<size_t, N_BINS> bins = {};
                 float max_err = result.max_abs_diff;
                 if (max_err > 1e-10f)
                 {
+                    float inv_max = static_cast<float>(N_BINS - 1) / max_err;
+                    // Can't trivially OMP-reduce an array, but this loop is
+                    // cheap compared to distribution stats, so keep it serial
                     for (size_t i = 0; i < size; ++i)
                     {
                         float abs_err = std::abs(actual[i] - expected[i]);
-                        int bin = std::min(static_cast<int>((abs_err / max_err) * (N_BINS - 1)), N_BINS - 1);
+                        int bin = std::min(static_cast<int>(abs_err * inv_max), N_BINS - 1);
                         bins[bin]++;
                     }
                     double entropy = 0.0;
                     double n = static_cast<double>(size);
                     for (int b = 0; b < N_BINS; ++b)
                     {
-                        if (bins[b] == 0) continue;
+                        if (bins[b] == 0)
+                            continue;
                         double p = static_cast<double>(bins[b]) / n;
                         entropy -= p * std::log2(p);
                     }
@@ -2924,6 +3032,23 @@ namespace llaminar2::test::parity
                     }
                 }
 
+                // Compute per-stage cosine drops (error introduced by each stage)
+                if (stats.stage_results.size() >= 2)
+                {
+                    for (size_t s = 1; s < stats.stage_results.size(); ++s)
+                    {
+                        float drop = stats.stage_results[s - 1].cosine_similarity -
+                                     stats.stage_results[s].cosine_similarity;
+                        stats.stage_results[s].cosine_drop = drop;
+
+                        if (drop > stats.max_cosine_drop)
+                        {
+                            stats.max_cosine_drop = drop;
+                            stats.max_drop_stage = stats.stage_results[s].stage_name;
+                        }
+                    }
+                }
+
                 if (stats.stages_compared > 0)
                 {
                     stats.avg_cosine_sim = sum_cosine / stats.stages_compared;
@@ -3864,6 +3989,23 @@ namespace llaminar2::test::parity
                             if (!llaminar_data)
                                 continue;
 
+                            // PyTorch decode snapshots contain full-sequence output
+                            // (all positions including prompt), while Llaminar only
+                            // captures the last position during incremental decode.
+                            // Extract last position from PyTorch data to match sizes.
+                            if (pytorch_data.size() > llaminar_size && llaminar_size > 0 &&
+                                pytorch_data.size() % llaminar_size == 0)
+                            {
+                                size_t last_offset = pytorch_data.size() - llaminar_size;
+                                pytorch_data = std::vector<float>(
+                                    pytorch_data.begin() + static_cast<ptrdiff_t>(last_offset),
+                                    pytorch_data.end());
+                            }
+                            else if (pytorch_data.size() != llaminar_size)
+                            {
+                                continue; // Size mismatch, skip
+                            }
+
                             auto result = compareTensors(llaminar_data, pytorch_data, llaminar_size, stage);
                             stats.stages_compared++;
                             sum_cosine += result.cosine_similarity;
@@ -3873,6 +4015,23 @@ namespace llaminar2::test::parity
                             {
                                 stats.min_cosine_sim = result.cosine_similarity;
                                 stats.worst_stage = stage;
+                            }
+                        }
+
+                        // Compute per-stage cosine drops (error introduced by each stage)
+                        if (stats.stage_results.size() >= 2)
+                        {
+                            for (size_t s = 1; s < stats.stage_results.size(); ++s)
+                            {
+                                float drop = stats.stage_results[s - 1].cosine_similarity -
+                                             stats.stage_results[s].cosine_similarity;
+                                stats.stage_results[s].cosine_drop = drop;
+
+                                if (drop > stats.max_cosine_drop)
+                                {
+                                    stats.max_cosine_drop = drop;
+                                    stats.max_drop_stage = stats.stage_results[s].stage_name;
+                                }
                             }
                         }
 
@@ -4168,7 +4327,8 @@ namespace llaminar2::test::parity
             table.set_border_style(FT_DOUBLE2_STYLE);
 
             table << fort::header
-                  << "Layer" << "Avg Cosine" << "Min Cosine" << "Worst Stage" << "Stages" << "OK"
+                  << "Layer" << "Avg Cosine" << "Min Cosine" << "Worst Stage"
+                  << "Max Drop" << "Drop Stage" << "Stages"
                   << fort::endr;
 
             table.column(0).set_cell_text_align(fort::text_align::center);
@@ -4176,7 +4336,8 @@ namespace llaminar2::test::parity
             table.column(2).set_cell_text_align(fort::text_align::right);
             table.column(3).set_cell_text_align(fort::text_align::left);
             table.column(4).set_cell_text_align(fort::text_align::right);
-            table.column(5).set_cell_text_align(fort::text_align::center);
+            table.column(5).set_cell_text_align(fort::text_align::left);
+            table.column(6).set_cell_text_align(fort::text_align::right);
 
             for (const auto &stats : step.layer_stats)
             {
@@ -4186,12 +4347,18 @@ namespace llaminar2::test::parity
                 std::ostringstream layer_ss;
                 layer_ss << "Layer " << stats.layer_idx;
 
+                std::string drop_str = (stats.max_cosine_drop > 0.001f)
+                                           ? fmt_f6(stats.max_cosine_drop)
+                                           : "-";
+                std::string drop_stage = stats.max_drop_stage.empty() ? "-" : stats.max_drop_stage;
+
                 table << layer_ss.str()
                       << fmt_f6(stats.avg_cosine_sim)
                       << fmt_f6(stats.min_cosine_sim)
                       << stats.worst_stage
+                      << drop_str
+                      << drop_stage
                       << stats.stages_compared
-                      << status_str(stats.passed)
                       << fort::endr;
             }
 
@@ -4359,12 +4526,12 @@ namespace llaminar2::test::parity
                     return;
                 }
 
-                f << "backend,layer,avg_cosine,min_cosine,worst_stage,stages_compared,max_kurtosis,max_kurtosis_stage,passed\n";
+                f << "backend,layer,avg_cosine,min_cosine,worst_stage,max_cosine_drop,max_drop_stage,stages_compared,max_kurtosis,max_kurtosis_stage,passed\n";
 
                 // Embedding row
                 f << backend << ",EMBEDDING,"
                   << summary.embedding_cosine << ",,"
-                  << ",,,,,"
+                  << ",,,,,,"
                   << (summary.embedding_passed ? "true" : "false") << "\n";
 
                 for (const auto &ls : summary.layer_stats)
@@ -4374,6 +4541,8 @@ namespace llaminar2::test::parity
                       << ls.avg_cosine_sim << ","
                       << ls.min_cosine_sim << ","
                       << ls.worst_stage << ","
+                      << ls.max_cosine_drop << ","
+                      << ls.max_drop_stage << ","
                       << ls.stages_compared << ","
                       << ls.max_kurtosis << ","
                       << ls.max_kurtosis_stage << ","
@@ -4483,7 +4652,7 @@ namespace llaminar2::test::parity
                     return;
                 }
 
-                f << "backend,step,layer,avg_cosine,min_cosine,worst_stage,stages_compared,passed\n";
+                f << "backend,step,layer,avg_cosine,min_cosine,worst_stage,max_cosine_drop,max_drop_stage,stages_compared,passed\n";
 
                 for (const auto &ss : summary.step_stats)
                 {
@@ -4498,6 +4667,8 @@ namespace llaminar2::test::parity
                           << ls.avg_cosine_sim << ","
                           << ls.min_cosine_sim << ","
                           << ls.worst_stage << ","
+                          << ls.max_cosine_drop << ","
+                          << ls.max_drop_stage << ","
                           << ls.stages_compared << ","
                           << (ls.passed ? "true" : "false") << "\n";
                     }
@@ -4565,7 +4736,7 @@ namespace llaminar2::test::parity
                 return;
             }
 
-            f << "backend,layer,stage,cosine,rel_l2,max_abs_diff,snr_db,rmse,error_entropy,";
+            f << "backend,layer,stage,cosine,cosine_drop,rel_l2,max_abs_diff,snr_db,rmse,error_entropy,";
             writeDistributionStatsHeader(f, "llaminar_");
             f << ",";
             writeDistributionStatsHeader(f, "pytorch_");
@@ -4579,6 +4750,7 @@ namespace llaminar2::test::parity
                       << ls.layer_idx << ","
                       << sr.stage_name << ","
                       << sr.cosine_similarity << ","
+                      << sr.cosine_drop << ","
                       << sr.rel_l2_norm << ","
                       << sr.max_abs_diff << ","
                       << sr.snr_db << ","
@@ -4633,7 +4805,7 @@ namespace llaminar2::test::parity
                 return;
             }
 
-            f << "backend,step,layer,stage,cosine,rel_l2,max_abs_diff,snr_db,rmse,error_entropy,";
+            f << "backend,step,layer,stage,cosine,cosine_drop,rel_l2,max_abs_diff,snr_db,rmse,error_entropy,";
             writeDistributionStatsHeader(f, "llaminar_");
             f << ",";
             writeDistributionStatsHeader(f, "pytorch_");
@@ -4650,6 +4822,7 @@ namespace llaminar2::test::parity
                           << ls.layer_idx << ","
                           << sr.stage_name << ","
                           << sr.cosine_similarity << ","
+                          << sr.cosine_drop << ","
                           << sr.rel_l2_norm << ","
                           << sr.max_abs_diff << ","
                           << sr.snr_db << ","

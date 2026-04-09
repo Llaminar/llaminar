@@ -211,7 +211,6 @@ namespace llaminar2
             Precision precision_ = Precision::FP32;
             bool owns_handle_ = true;    ///< false when using context's cuBLAS handle
             bool owns_lt_handle_ = true; ///< false when using context's cuBLASLt handle
-            void *gpu_stream_ = nullptr; ///< GPU stream for graph capture (nullptr = default stream)
         };
 
         /**

@@ -496,11 +496,9 @@ namespace llaminar2
 
                 // Attention context - column-parallel (split by heads)
                 {"ATTENTION_CONTEXT", SnapshotShardingMode::COLUMN_PARALLEL},
-                {"FUSED_ATTENTION_WO_CONTEXT", SnapshotShardingMode::COLUMN_PARALLEL},
 
                 // Attention output (Wo) - row-parallel (AllReduce combines)
                 {"ATTENTION_OUTPUT", SnapshotShardingMode::ROW_PARALLEL},
-                {"FUSED_ATTENTION_WO", SnapshotShardingMode::ROW_PARALLEL},
 
                 // Norms - replicated
                 {"ATTENTION_NORM", SnapshotShardingMode::REPLICATED},

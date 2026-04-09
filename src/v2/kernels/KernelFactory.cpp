@@ -46,6 +46,8 @@
 #include "cuda/ops/CUDAResidualAddKernelT.h"          // ResidualAdd FP32/FP16/BF16
 #include "cuda/ops/CUDAEmbeddingKernelT.h"            // Embedding FP32
 #include "cuda/attention/CUDAFlashAttentionKernelT.h" // Flash Attention
+#include "cuda/gdn/CUDAGatedDeltaNet.h"               // GDN recurrence
+#include "cuda/gdn/CUDAShortConvolution.h"            // GDN short conv1d
 
 extern "C" void cudaNativeVNNIGemvTuned_clearStaticState();
 #endif
@@ -62,6 +64,8 @@ extern "C" void cudaNativeVNNIGemvTuned_clearStaticState();
 #include "rocm/ops/ROCmSwiGLUKernelT.h"               // SwiGLU FP32
 #include "rocm/ops/ROCmResidualAddKernelT.h"          // ResidualAdd FP32
 #include "rocm/attention/ROCmFlashAttentionKernelT.h" // Flash Attention
+#include "rocm/gdn/ROCmGatedDeltaNet.h"               // GDN recurrence
+#include "rocm/gdn/ROCmShortConvolution.h"            // GDN short conv1d
 #endif
 
 namespace llaminar
@@ -257,7 +261,8 @@ namespace llaminar
                         float rope_theta,
                         const llaminar2::IMPIContext *mpi_ctx,
                         int device_idx,
-                        int pos_offset = 0) override
+                        int pos_offset = 0,
+                        int rotary_dim = 0) override
                     {
                         (void)mpi_ctx;    // Not used in typed kernel
                         (void)pos_offset; // CPU kernel doesn't need this optimization
@@ -285,7 +290,7 @@ namespace llaminar
 
                         return kernel_.apply_typed(Q_data, K_data, position_ids,
                                                    seq_len, n_heads, n_kv_heads, head_dim,
-                                                   rope_theta, device_idx);
+                                                   rope_theta, device_idx, rotary_dim);
                     }
 
                 private:
@@ -315,7 +320,8 @@ namespace llaminar
                         float rope_theta,
                         const llaminar2::IMPIContext *mpi_ctx,
                         int device_idx,
-                        int pos_offset = 0) override
+                        int pos_offset = 0,
+                        int rotary_dim = 0) override
                     {
                         (void)mpi_ctx;    // Not used in typed kernel
                         (void)pos_offset; // CPU kernel doesn't need this optimization
@@ -358,7 +364,7 @@ namespace llaminar
 
                         return kernel_.apply_typed(Q_blocks, K_blocks, position_ids,
                                                    seq_len, n_heads, n_kv_heads, head_dim,
-                                                   rope_theta, device_idx);
+                                                   rope_theta, device_idx, rotary_dim);
                     }
 
                 private:
@@ -1916,7 +1922,6 @@ namespace llaminar
             std::unique_ptr<llaminar2::ITensorShortConvolution> KernelFactory::createShortConvolution(
                 DeviceType dev_type, int device_ordinal)
             {
-                (void)device_ordinal;
                 switch (dev_type)
                 {
                 case DeviceType::CPU:
@@ -1924,12 +1929,12 @@ namespace llaminar
 
 #ifdef HAVE_CUDA
                 case DeviceType::CUDA:
-                    throwUnsupportedKernel(dev_type, "ShortConvolution", "FP32");
+                    return std::make_unique<llaminar2::CUDAShortConvolution>(device_ordinal);
 #endif
 
 #ifdef HAVE_ROCM
                 case DeviceType::ROCm:
-                    throwUnsupportedKernel(dev_type, "ShortConvolution", "FP32");
+                    return std::make_unique<llaminar2::ROCmShortConvolution>(device_ordinal);
 #endif
 
                 default:
@@ -1940,7 +1945,6 @@ namespace llaminar
             std::unique_ptr<llaminar2::ITensorGatedDeltaNet> KernelFactory::createGatedDeltaNet(
                 DeviceType dev_type, int device_ordinal)
             {
-                (void)device_ordinal;
                 switch (dev_type)
                 {
                 case DeviceType::CPU:
@@ -1948,12 +1952,12 @@ namespace llaminar
 
 #ifdef HAVE_CUDA
                 case DeviceType::CUDA:
-                    throwUnsupportedKernel(dev_type, "GatedDeltaNet", "FP32");
+                    return std::make_unique<llaminar2::CUDAGatedDeltaNet>(device_ordinal);
 #endif
 
 #ifdef HAVE_ROCM
                 case DeviceType::ROCm:
-                    throwUnsupportedKernel(dev_type, "GatedDeltaNet", "FP32");
+                    return std::make_unique<llaminar2::ROCmGatedDeltaNet>(device_ordinal);
 #endif
 
                 default:

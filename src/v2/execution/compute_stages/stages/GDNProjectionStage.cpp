@@ -69,6 +69,7 @@ namespace llaminar2
             auto *gemm = resolveGemm(params_.w_qkv, params_.gemm_qkv, "w_qkv");
             if (!gemm)
                 return false;
+            gemm->setGPUStream(gpuStream());
             auto *C_base = asTensorBase(params_.output_qkv, "output_qkv");
             if (!gemm->multiply_tensor(A_base, C_base, M, params_.n_qkv, K))
             {
@@ -82,6 +83,7 @@ namespace llaminar2
             auto *gemm = resolveGemm(params_.w_z, params_.gemm_z, "w_z");
             if (!gemm)
                 return false;
+            gemm->setGPUStream(gpuStream());
             auto *C_base = asTensorBase(params_.output_z, "output_z");
             if (!gemm->multiply_tensor(A_base, C_base, M, params_.n_z, K))
             {
@@ -95,6 +97,7 @@ namespace llaminar2
             auto *gemm = resolveGemm(params_.w_a, params_.gemm_a, "w_a");
             if (!gemm)
                 return false;
+            gemm->setGPUStream(gpuStream());
             auto *C_base = asTensorBase(params_.output_a, "output_a");
             if (!gemm->multiply_tensor(A_base, C_base, M, params_.n_a, K))
             {
@@ -108,6 +111,7 @@ namespace llaminar2
             auto *gemm = resolveGemm(params_.w_b, params_.gemm_b, "w_b");
             if (!gemm)
                 return false;
+            gemm->setGPUStream(gpuStream());
             auto *C_base = asTensorBase(params_.output_b, "output_b");
             if (!gemm->multiply_tensor(A_base, C_base, M, params_.n_b, K))
             {
@@ -144,7 +148,21 @@ namespace llaminar2
 
     bool GDNProjectionStage::supportsBackend(ComputeBackendType backend) const
     {
-        return backend == ComputeBackendType::CPU;
+        switch (backend)
+        {
+        case ComputeBackendType::CPU:
+            return true;
+#ifdef HAVE_CUDA
+        case ComputeBackendType::GPU_CUDA:
+            return true;
+#endif
+#ifdef HAVE_ROCM
+        case ComputeBackendType::GPU_ROCM:
+            return true;
+#endif
+        default:
+            return false;
+        }
     }
 
     StageDumpInfo GDNProjectionStage::buildDumpInfoImpl() const
@@ -207,6 +225,54 @@ namespace llaminar2
         if (params_.output_b_buffer_id)
             contract.addOutput(*params_.output_b_buffer_id);
         return contract;
+    }
+
+    // =========================================================================
+    // IWorkspaceConsumerStage — Multi-kernel workspace binding (4 GEMM kernels)
+    // =========================================================================
+
+    IWorkspaceConsumer *GDNProjectionStage::getKernelAsWorkspaceConsumer()
+    {
+        // Return QKV kernel (largest) for workspace requirements sizing
+        auto *gemm = resolveGemm(params_.w_qkv, params_.gemm_qkv, "w_qkv");
+        return dynamic_cast<IWorkspaceConsumer *>(gemm);
+    }
+
+    void GDNProjectionStage::bindWorkspace(DeviceWorkspaceManager *workspace)
+    {
+        // Resolve all 4 GEMM kernels and bind workspace to each
+        auto bindOne = [&](const ITensor *weight, ITensorGemm *&cached, const char *name)
+        {
+            auto *gemm = resolveGemm(weight, cached, name);
+            if (auto *consumer = dynamic_cast<IWorkspaceConsumer *>(gemm))
+            {
+                consumer->bindWorkspace(workspace);
+                LOG_DEBUG("[GDNProjectionStage] Bound workspace to " << name << " kernel");
+            }
+        };
+
+        bindOne(params_.w_qkv, params_.gemm_qkv, "w_qkv");
+        bindOne(params_.w_z, params_.gemm_z, "w_z");
+        bindOne(params_.w_a, params_.gemm_a, "w_a");
+        bindOne(params_.w_b, params_.gemm_b, "w_b");
+
+        bound_workspace_ = workspace;
+    }
+
+    void GDNProjectionStage::unbindWorkspace()
+    {
+        auto unbindOne = [](ITensorGemm *gemm)
+        {
+            if (auto *consumer = dynamic_cast<IWorkspaceConsumer *>(gemm))
+                consumer->unbindWorkspace();
+        };
+
+        unbindOne(params_.gemm_qkv);
+        unbindOne(params_.gemm_z);
+        unbindOne(params_.gemm_a);
+        unbindOne(params_.gemm_b);
+
+        bound_workspace_ = nullptr;
     }
 
 } // namespace llaminar2

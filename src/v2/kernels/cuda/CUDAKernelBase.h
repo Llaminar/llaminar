@@ -1,5 +1,7 @@
 #pragma once
 
+#include <stdexcept>
+
 #include "backends/IWorkerGPUContext.h"
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "execution/local_execution/device/WorkspaceDescriptor.h"
@@ -76,17 +78,59 @@ namespace llaminar2
          */
         bool hasDeviceContext() const { return device_ctx_ != nullptr; }
 
+        // =========================================================================
+        // GPU Stream Management (Canonical Location)
+        // =========================================================================
+
         /**
-         * @brief Get the CUDA stream from the device context
+         * @brief Set the GPU stream for kernel dispatch
          *
-         * Returns the default stream from the device context if one is bound,
-         * otherwise returns nullptr (which typically maps to the default CUDA stream).
+         * All GPU kernel work MUST be dispatched on an explicit stream.
+         * The default CUDA stream (stream 0) causes race conditions with
+         * the executor's event-based coherence tracking.
          *
-         * @return cudaStream_t cast to void*, or nullptr
+         * @param stream Opaque CUDA stream pointer (cudaStream_t cast to void*)
+         */
+        void setGPUStream(void *stream) { gpu_stream_ = stream; }
+
+        /**
+         * @brief Get the GPU stream for kernel dispatch
+         *
+         * Returns the explicitly-set GPU stream, falling back to the device
+         * context's default stream if available.
+         *
+         * @return cudaStream_t cast to void*, or nullptr if no stream is set
          */
         void *getStream() const
         {
+            if (gpu_stream_)
+                return gpu_stream_;
             return device_ctx_ ? device_ctx_->defaultStream() : nullptr;
+        }
+
+        /**
+         * @brief Get the GPU stream, throwing if none is set
+         *
+         * Use this at the top of GPU kernel execution methods to enforce
+         * that a stream has been explicitly bound. Running on the default
+         * stream (nullptr) causes race conditions with event-based coherence.
+         *
+         * @param kernel_name Name for error messages
+         * @return Non-null stream pointer
+         * @throws std::runtime_error if no stream is available
+         */
+        void *requireStream(const char *kernel_name = "CUDAKernel") const
+        {
+            void *s = getStream();
+            if (!s)
+            {
+                throw std::runtime_error(
+                    std::string("[") + kernel_name +
+                    "] No GPU stream set. All CUDA kernels must have an explicit stream "
+                    "bound via setGPUStream() before execution. Running on the default "
+                    "stream causes race conditions with event-based coherence tracking.");
+            }
+            return s;
         }
 
         /**
@@ -117,6 +161,7 @@ namespace llaminar2
 
         DeviceWorkspaceManager *workspace_ = nullptr;
         IWorkerGPUContext *device_ctx_ = nullptr;
+        void *gpu_stream_ = nullptr; ///< Explicit GPU stream for kernel dispatch (nullptr = NOT SET)
     };
 
 } // namespace llaminar2

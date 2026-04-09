@@ -151,7 +151,11 @@ TEST(Test__GDNKernels, Projection_TypeAndBackend)
     GDNProjectionStage stage(p);
     EXPECT_EQ(stage.type(), ComputeStageType::GDN_PROJECTION);
     EXPECT_TRUE(stage.supportsBackend(ComputeBackendType::CPU));
+#ifdef HAVE_CUDA
+    EXPECT_TRUE(stage.supportsBackend(ComputeBackendType::GPU_CUDA));
+#else
     EXPECT_FALSE(stage.supportsBackend(ComputeBackendType::GPU_CUDA));
+#endif
 }
 
 TEST(Test__GDNKernels, Projection_NullPointers_Fails)

@@ -10,6 +10,20 @@
 
 #include <cstring>
 
+// GPU kernel declarations
+#ifdef HAVE_CUDA
+extern "C" bool cudaGDN_q_gate_split(
+    const float *input, float *output_q, float *output_gate,
+    int seq_len, int n_heads, int head_dim,
+    int device_idx, void *stream);
+#endif
+#ifdef HAVE_ROCM
+extern "C" bool rocmGDN_q_gate_split(
+    const float *input, float *output_q, float *output_gate,
+    int seq_len, int n_heads, int head_dim,
+    int device_idx, void *stream);
+#endif
+
 namespace llaminar2
 {
 
@@ -46,6 +60,52 @@ namespace llaminar2
         const int head_dim = params_.head_dim;
         const int q_dim = n_heads * head_dim;         // Output width per row
         const int input_dim = n_heads * head_dim * 2; // Input width per row
+
+        // GPU dispatch path
+        if (params_.device_id.is_gpu())
+        {
+            // Ensure all tensors are on device
+            const_cast<TensorBase *>(input_base)->ensureOnDevice(params_.device_id);
+            q_base->allocateOnDevice(params_.device_id);
+            gate_base->allocateOnDevice(params_.device_id);
+
+            const float *src_gpu = static_cast<const float *>(input_base->active_data_ptr());
+            float *dst_q_gpu = static_cast<float *>(q_base->active_mutable_data_ptr());
+            float *dst_gate_gpu = static_cast<float *>(gate_base->active_mutable_data_ptr());
+            int dev_idx = params_.device_id.toKernelDeviceIndex();
+            void *stream = gpuStream();
+
+#ifdef HAVE_CUDA
+            if (params_.device_id.is_cuda())
+            {
+                bool ok = cudaGDN_q_gate_split(
+                    src_gpu, dst_q_gpu, dst_gate_gpu,
+                    seq_len, n_heads, head_dim,
+                    dev_idx, stream);
+                if (!ok)
+                {
+                    LOG_ERROR("[QGateSplitStage] CUDA kernel failed");
+                    return false;
+                }
+                return true;
+            }
+#endif
+#ifdef HAVE_ROCM
+            if (params_.device_id.is_rocm())
+            {
+                bool ok = rocmGDN_q_gate_split(
+                    src_gpu, dst_q_gpu, dst_gate_gpu,
+                    seq_len, n_heads, head_dim,
+                    dev_idx, stream);
+                if (!ok)
+                {
+                    LOG_ERROR("[QGateSplitStage] ROCm kernel failed");
+                    return false;
+                }
+                return true;
+            }
+#endif
+        }
 
         const float *src = input_base->data();
         float *dst_q = q_base->mutable_data();
@@ -102,7 +162,21 @@ namespace llaminar2
 
     bool QGateSplitStage::supportsBackend(ComputeBackendType backend) const
     {
-        return backend == ComputeBackendType::CPU;
+        switch (backend)
+        {
+        case ComputeBackendType::CPU:
+            return true;
+#ifdef HAVE_CUDA
+        case ComputeBackendType::GPU_CUDA:
+            return true;
+#endif
+#ifdef HAVE_ROCM
+        case ComputeBackendType::GPU_ROCM:
+            return true;
+#endif
+        default:
+            return false;
+        }
     }
 
     StageDumpInfo QGateSplitStage::buildDumpInfoImpl() const
