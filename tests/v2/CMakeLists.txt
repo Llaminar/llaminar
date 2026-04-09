@@ -6824,6 +6824,22 @@ add_v2_test(V2_Perf_CPUNativeVNNI_Sweep
     MPI_PROCS 1
 )
 
+# Performance Test: AVX2 vs AVX512 VNNI throughput comparison
+add_executable(v2_perf_avx2_vs_avx512 performance/kernels/cpu/native_vnni/Perf__AVX2vsAVX512.cpp)
+target_link_libraries(v2_perf_avx2_vs_avx512
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+target_include_directories(v2_perf_avx2_vs_avx512 PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+add_v2_test(V2_Perf_AVX2vsAVX512
+    COMMAND $<TARGET_FILE:v2_perf_avx2_vs_avx512>
+    LABELS "V2;Performance;GEMM;GEMV;NativeVNNI;CPU;AVX2;AVX512;Parity"
+    MPI_PROCS 1
+)
+
 # Performance Test: CPU NativeVNNI Dispatch Parameter Sweep (tile heuristic tuning)
 add_executable(v2_perf_cpu_native_vnni_dispatch_sweep performance/kernels/cpu/native_vnni/Perf__CPUNativeVNNI_DispatchSweep.cpp)
 target_link_libraries(v2_perf_cpu_native_vnni_dispatch_sweep

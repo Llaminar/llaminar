@@ -1106,6 +1106,8 @@ tests/v2/integration/parity/results/<git-hash>/<TestSuite_TestName_Backend>/
 
 The `<git-hash>` prefix (first 8 chars of HEAD) enables A/B comparison across commits. Results are `.gitignore`d and not committed.
 
+Each test run also writes a `test_log.txt` file in the same directory containing the full Logger output (device setup, model loading, per-layer parity comparisons, errors, and CSV export confirmations).
+
 **Prefill CSV Files**:
 
 | File | Description |
