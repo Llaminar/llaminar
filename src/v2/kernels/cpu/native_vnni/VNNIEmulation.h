@@ -3,17 +3,22 @@
  * @brief AVX2 emulation of AVX512-VNNI operations for GEMM/GEMV kernels.
  *
  * Provides inline functions that emulate the VNNI vpdpbusd instruction using
- * the AVX2 maddubs+madd pattern. Both AVX512 and AVX2 paths are always
- * compiled and available for runtime dispatch and testability.
+ * AVX2. Both AVX512 and AVX2 paths are always compiled and available for
+ * runtime dispatch and testability.
  *
- * Core pattern:
+ * Core emulation strategy (saturation-safe even/odd byte split):
  *   AVX512-VNNI: acc = _mm512_dpbusd_epi32(acc, a_u8, b_i8)
- *     → acc[i] += dot(a_u8[4i..4i+3], b_i8[4i..4i+3]) for 16 i32 lanes
+ *     → acc[i] += sum(a_u8[4i+j] * b_i8[4i+j], j=0..3)  (all in i32, no saturation)
  *
  *   AVX2 emulation (8 i32 lanes):
- *     prod16 = _mm256_maddubs_epi16(a_u8, b_i8)   // u8×i8 → i16 pairs
- *     prod32 = _mm256_madd_epi16(prod16, ones)     // i16 pairs → i32
- *     acc    = _mm256_add_epi32(acc, prod32)        // accumulate
+ *     Split a/b into even-indexed and odd-indexed bytes within each i16 slot,
+ *     widen to i16, then use _mm256_madd_epi16 (i16×i16→i32, no saturation).
+ *     Two madd calls cover all 4 bytes per i32 lane.
+ *
+ * Why not maddubs+madd?
+ *   _mm256_maddubs_epi16 saturates to INT16 (±32767). For value ranges like
+ *   IQ4_NL (-127..113), pair sums can reach 255*113+255*113=57630 > 32767,
+ *   causing incorrect saturation. The even/odd split avoids this entirely.
  */
 
 #pragma once
@@ -29,35 +34,40 @@ namespace llaminar2::cpu::native_vnni::isa
     // =========================================================================
 
     /**
-     * @brief AVX2 emulation of the VNNI vpdpbusd instruction.
+     * @brief Saturation-safe AVX2 emulation of the VNNI vpdpbusd instruction.
      *
      * Computes acc[i] += dot(a_u8[4i..4i+3], b_i8[4i..4i+3]) for i=0..7.
-     * Uses the proven maddubs+madd two-instruction pattern (same as llama.cpp/GGML).
      *
-     * @note _mm256_maddubs_epi16 treats first operand as unsigned, second as signed.
-     *       This matches vpdpbusd semantics exactly.
+     * Strategy: split even/odd bytes, widen to i16, use madd_epi16 (i16×i16→i32).
+     *   - Even bytes (0,2,4,...): zero-extend a, sign-extend b → madd → i32 products
+     *   - Odd bytes (1,3,5,...): shift right → same treatment → i32 products
+     *   - Sum even + odd → full 4-byte dot product per i32 lane
      *
-     * @warning _mm256_maddubs_epi16 can saturate to INT16_MAX/MIN if the pairwise
-     *          products are large. For typical quantized inference values (u8 in
-     *          [0,255], i8 in [-127,127]) this is safe. The worst case is
-     *          255*127 + 255*127 = 64770, well within INT16 range (32767).
-     *          HOWEVER: if a_u8 = 255 and b_i8 = {127, 127, ...}, each pair
-     *          produces 255*127 = 32385, and two pairs sum to 64770 which
-     *          OVERFLOWS INT16 (max 32767). This is the same saturation behavior
-     *          as the VNNI instruction, so results are mathematically equivalent.
+     * This avoids the INT16 saturation of _mm256_maddubs_epi16 entirely.
+     * Correct for ALL input ranges including IQ4_NL codebook values.
      */
     inline __m256i avx2_dpbusd_epi32(__m256i acc, __m256i a_u8, __m256i b_i8)
     {
-        // Step 1: u8 × i8 → i16 pairwise products with saturation
-        //   For each group of 4 bytes: pairs (a0*b0 + a1*b1), (a2*b2 + a3*b3)
-        __m256i prod16 = _mm256_maddubs_epi16(a_u8, b_i8);
+        const __m256i mask_lo = _mm256_set1_epi16(0x00FF);
 
-        // Step 2: horizontal i16 pair add → i32
-        //   Adds adjacent i16 pairs: (p0+p1) → i32, completing the 4-element dot product
-        __m256i prod32 = _mm256_madd_epi16(prod16, _mm256_set1_epi16(1));
+        // Even-indexed bytes (positions 0,2,4,...): low byte of each i16 slot
+        __m256i a_even = _mm256_and_si256(a_u8, mask_lo);               // zero-extend u8→i16
+        __m256i b_even = _mm256_srai_epi16(_mm256_slli_epi16(b_i8, 8), 8); // sign-extend i8→i16
 
-        // Step 3: accumulate
-        return _mm256_add_epi32(acc, prod32);
+        // Odd-indexed bytes (positions 1,3,5,...): high byte of each i16 slot
+        __m256i a_odd = _mm256_srli_epi16(a_u8, 8);  // zero-extend u8→i16
+        __m256i b_odd = _mm256_srai_epi16(b_i8, 8);  // sign-extend i8→i16
+
+        // madd_epi16: multiply i16 pairs and sum adjacent to i32 (no saturation)
+        // prod_even[i] = a_even[2i]*b_even[2i] + a_even[2i+1]*b_even[2i+1]
+        //              = a[4i]*b[4i] + a[4i+2]*b[4i+2]
+        __m256i prod_even = _mm256_madd_epi16(a_even, b_even);
+
+        // prod_odd[i]  = a[4i+1]*b[4i+1] + a[4i+3]*b[4i+3]
+        __m256i prod_odd = _mm256_madd_epi16(a_odd, b_odd);
+
+        // Sum = a[4i]*b[4i] + a[4i+1]*b[4i+1] + a[4i+2]*b[4i+2] + a[4i+3]*b[4i+3]
+        return _mm256_add_epi32(acc, _mm256_add_epi32(prod_even, prod_odd));
     }
 
     // =========================================================================

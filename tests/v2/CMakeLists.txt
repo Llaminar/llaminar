@@ -1893,6 +1893,19 @@ add_v2_test(V2_Unit_CPUQuantizedGemmParity
     MPI_PROCS 1
 )
 
+# Test: AVX2 vs AVX512-VNNI parity (emulated dpbusd, chunk GEMV, full GEMV/GEMM)
+add_executable(v2_test_avx2_vnni_parity unit/kernels/Test__AVX2VNNIParity.cpp)
+target_link_libraries(v2_test_avx2_vnni_parity
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_AVX2VNNIParity
+    COMMAND $<TARGET_FILE:v2_test_avx2_vnni_parity>
+    LABELS "V2;Unit;Kernels;GEMM;GEMV;AVX2;Parity;VNNI"
+    MPI_PROCS 1
+)
+
 # Test: Fused Projection Parity (multiply_fused_tensor vs multiply_tensor)
 # Regression test for Q4_0 M=1 decode bug where fused path produced wrong output
 add_executable(v2_test_fused_projection_parity unit/kernels/Test__FusedProjectionParity.cpp)
