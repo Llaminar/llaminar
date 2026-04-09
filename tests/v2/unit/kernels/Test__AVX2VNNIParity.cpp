@@ -317,10 +317,30 @@ CHUNK_PARITY_TEST(Q4_0, createQ4_0Random, 64, 512)
 CHUNK_PARITY_TEST(IQ4_NL, createIQ4_NLRandom, 64, 256)
 CHUNK_PARITY_TEST(IQ4_NL, createIQ4_NLRandom, 64, 512)
 
-// INT8 pre-decoded formats
+// Additional nibble-LUT formats
+CHUNK_PARITY_TEST(Q4_1, createQ4_1Random, 64, 256)
+CHUNK_PARITY_TEST(IQ4_XS, createIQ4_XSRandom, 64, 256)
+
+// INT8 pre-decoded formats (per-block)
 CHUNK_PARITY_TEST(Q5_0, createQ5_0Random, 64, 256)
 CHUNK_PARITY_TEST(Q5_0, createQ5_0Random, 64, 512)
 CHUNK_PARITY_TEST(Q5_1, createQ5_1Random, 64, 256)
+
+// K-quant formats (INT8 pre-decoded, 256-element superblocks)
+CHUNK_PARITY_TEST(Q6_K, createQ6_KRandom, 64, 256)
+CHUNK_PARITY_TEST(Q5_K, createQ5_KRandom, 64, 256)
+CHUNK_PARITY_TEST(Q4_K, createQ4_KRandom, 64, 256)
+CHUNK_PARITY_TEST(Q3_K, createQ3_KRandom, 64, 256)
+CHUNK_PARITY_TEST(Q2_K, createQ2_KRandom, 64, 256)
+
+// IQ formats (INT8 pre-decoded, 256-element superblocks)
+CHUNK_PARITY_TEST(IQ3_S, createIQ3_SRandom, 64, 256)
+CHUNK_PARITY_TEST(IQ3_XXS, createIQ3_XXSRandom, 64, 256)
+CHUNK_PARITY_TEST(IQ2_S, createIQ2_SRandom, 64, 256)
+CHUNK_PARITY_TEST(IQ2_XS, createIQ2_XSRandom, 64, 256)
+CHUNK_PARITY_TEST(IQ2_XXS, createIQ2_XXSRandom, 64, 256)
+CHUNK_PARITY_TEST(IQ1_S, createIQ1_SRandom, 64, 256)
+CHUNK_PARITY_TEST(IQ1_M, createIQ1_MRandom, 64, 256)
 
 #undef CHUNK_PARITY_TEST
 
@@ -366,6 +386,31 @@ FULL_GEMV_PARITY_TEST(Q5_0, createQ5_0Random, 4096, 896, 50)
 FULL_GEMV_PARITY_TEST(Q4_0, createQ4_0Random, 100, 256, 51)
 FULL_GEMV_PARITY_TEST(Q4_0, createQ4_0Random, 200, 512, 52)
 FULL_GEMV_PARITY_TEST(IQ4_NL, createIQ4_NLRandom, 200, 512, 53)
+
+// Additional nibble-LUT formats
+FULL_GEMV_PARITY_TEST(Q4_1, createQ4_1Random, 512, 512, 80)
+FULL_GEMV_PARITY_TEST(IQ4_XS, createIQ4_XSRandom, 512, 512, 81)
+
+// K-quant formats (256-element superblocks, INT8 pre-decoded)
+FULL_GEMV_PARITY_TEST(Q6_K, createQ6_KRandom, 512, 512, 82)
+FULL_GEMV_PARITY_TEST(Q5_K, createQ5_KRandom, 512, 512, 83)
+FULL_GEMV_PARITY_TEST(Q4_K, createQ4_KRandom, 512, 512, 84)
+FULL_GEMV_PARITY_TEST(Q3_K, createQ3_KRandom, 512, 512, 85)
+FULL_GEMV_PARITY_TEST(Q2_K, createQ2_KRandom, 512, 512, 86)
+
+// IQ formats (256-element superblocks, INT8 pre-decoded)
+FULL_GEMV_PARITY_TEST(IQ3_S, createIQ3_SRandom, 512, 512, 87)
+FULL_GEMV_PARITY_TEST(IQ3_XXS, createIQ3_XXSRandom, 512, 512, 88)
+FULL_GEMV_PARITY_TEST(IQ2_S, createIQ2_SRandom, 512, 512, 89)
+FULL_GEMV_PARITY_TEST(IQ2_XS, createIQ2_XSRandom, 512, 512, 90)
+FULL_GEMV_PARITY_TEST(IQ2_XXS, createIQ2_XXSRandom, 512, 512, 91)
+FULL_GEMV_PARITY_TEST(IQ1_S, createIQ1_SRandom, 512, 512, 92)
+FULL_GEMV_PARITY_TEST(IQ1_M, createIQ1_MRandom, 512, 512, 93)
+
+// Large K-quant and IQ tests (non-aligned N, larger dimensions)
+FULL_GEMV_PARITY_TEST(Q6_K, createQ6_KRandom, 4096, 1024, 94)
+FULL_GEMV_PARITY_TEST(Q3_K, createQ3_KRandom, 200, 512, 95)
+FULL_GEMV_PARITY_TEST(IQ3_S, createIQ3_SRandom, 200, 512, 96)
 
 #undef FULL_GEMV_PARITY_TEST
 
@@ -441,6 +486,38 @@ FULL_GEMM_PARITY_TEST(IQ4_NL, createIQ4_NLRandom, 4, 200, 256, 73)
 
 // M=1 via GEMM path (should match GEMV)
 FULL_GEMM_PARITY_TEST(Q4_0, createQ4_0Random, 1, 512, 512, 74)
+
+// Additional nibble-LUT formats
+FULL_GEMM_PARITY_TEST(Q4_1, createQ4_1Random, 2, 512, 512, 100)
+FULL_GEMM_PARITY_TEST(IQ4_XS, createIQ4_XSRandom, 2, 512, 512, 101)
+
+// K-quant formats (M=2 exercises 2-row microkernel)
+FULL_GEMM_PARITY_TEST(Q6_K, createQ6_KRandom, 2, 512, 512, 102)
+FULL_GEMM_PARITY_TEST(Q5_K, createQ5_KRandom, 2, 512, 512, 103)
+FULL_GEMM_PARITY_TEST(Q4_K, createQ4_KRandom, 2, 512, 512, 104)
+FULL_GEMM_PARITY_TEST(Q3_K, createQ3_KRandom, 2, 512, 512, 105)
+FULL_GEMM_PARITY_TEST(Q2_K, createQ2_KRandom, 2, 512, 512, 106)
+
+// IQ formats (M=2)
+FULL_GEMM_PARITY_TEST(IQ3_S, createIQ3_SRandom, 2, 512, 512, 107)
+FULL_GEMM_PARITY_TEST(IQ3_XXS, createIQ3_XXSRandom, 2, 512, 512, 108)
+FULL_GEMM_PARITY_TEST(IQ2_S, createIQ2_SRandom, 2, 512, 512, 109)
+FULL_GEMM_PARITY_TEST(IQ2_XS, createIQ2_XSRandom, 2, 512, 512, 110)
+FULL_GEMM_PARITY_TEST(IQ2_XXS, createIQ2_XXSRandom, 2, 512, 512, 111)
+FULL_GEMM_PARITY_TEST(IQ1_S, createIQ1_SRandom, 2, 512, 512, 112)
+FULL_GEMM_PARITY_TEST(IQ1_M, createIQ1_MRandom, 2, 512, 512, 113)
+
+// M=3 (2-row + 1-row tail) for representative K-quants and IQ formats
+FULL_GEMM_PARITY_TEST(Q6_K, createQ6_KRandom, 3, 512, 512, 114)
+FULL_GEMM_PARITY_TEST(Q3_K, createQ3_KRandom, 3, 512, 512, 115)
+FULL_GEMM_PARITY_TEST(IQ3_S, createIQ3_SRandom, 3, 512, 512, 116)
+
+// M=8 (multiple 2-row pairs) for representative formats
+FULL_GEMM_PARITY_TEST(Q6_K, createQ6_KRandom, 8, 512, 512, 117)
+FULL_GEMM_PARITY_TEST(Q4_1, createQ4_1Random, 8, 512, 512, 118)
+FULL_GEMM_PARITY_TEST(IQ4_XS, createIQ4_XSRandom, 8, 512, 512, 119)
+FULL_GEMM_PARITY_TEST(Q2_K, createQ2_KRandom, 8, 512, 512, 120)
+FULL_GEMM_PARITY_TEST(IQ1_S, createIQ1_SRandom, 8, 512, 512, 121)
 
 #undef FULL_GEMM_PARITY_TEST
 

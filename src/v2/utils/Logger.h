@@ -9,6 +9,7 @@
 #include "LogLevel.h"
 #include "DebugEnv.h"
 #include <iostream>
+#include <fstream>
 #include <sstream>
 #include <string>
 #include <chrono>
@@ -101,6 +102,37 @@ namespace llaminar2
             return thread_device_prefix();
         }
 
+        /**
+         * @brief Set a log file path to tee all log output to a file
+         *
+         * When set, every log message is written to both stdout and the file.
+         * The file is opened in truncate mode. Call closeLogFile() to flush and close.
+         *
+         * @param path Filesystem path for the log file
+         * @return true if the file was opened successfully
+         */
+        bool setLogFile(const std::string &path)
+        {
+            std::lock_guard<std::mutex> lk(buffer_mutex_);
+            if (log_file_.is_open())
+                log_file_.close();
+            log_file_.open(path, std::ios::out | std::ios::trunc);
+            return log_file_.is_open();
+        }
+
+        /**
+         * @brief Close the log file if open
+         */
+        void closeLogFile()
+        {
+            std::lock_guard<std::mutex> lk(buffer_mutex_);
+            if (log_file_.is_open())
+            {
+                log_file_.flush();
+                log_file_.close();
+            }
+        }
+
         bool shouldLog(LogLevel level) const
         {
             return static_cast<int>(level) <= static_cast<int>(current_level_);
@@ -150,6 +182,12 @@ namespace llaminar2
             }
 
             std::cout << full_line << std::endl;
+
+            // Tee to log file if open
+            if (log_file_.is_open())
+            {
+                log_file_ << full_line << '\n';
+            }
         }
 
         std::string logLevelToString(LogLevel level) const
@@ -246,6 +284,7 @@ namespace llaminar2
         mutable std::deque<std::string> recent_;
         mutable size_t max_buffer_ = 2048; // keep last N lines
         mutable std::mutex buffer_mutex_;
+        std::ofstream log_file_;
     };
 
     /**

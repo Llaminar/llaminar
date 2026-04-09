@@ -1743,6 +1743,17 @@ namespace llaminar2::test::parity
 
         void SetUp() override
         {
+            // Start log file capture for this test run (rank 0 only)
+            if (isRank0())
+            {
+                auto dir = ensureResultsDir();
+                auto log_path = dir / "test_log.txt";
+                if (Logger::getInstance().setLogFile(log_path.string()))
+                {
+                    LOG_INFO("[Parity] Log file: " << log_path.string());
+                }
+            }
+
             // CRITICAL: Clear kernel caches at test start for clean state.
             // TearDown() also clears, but this guards against incomplete teardown
             // from a prior test (crash, skip, or assertion failure) leaving stale
@@ -1829,6 +1840,9 @@ namespace llaminar2::test::parity
                 rocm_backend->synchronize(0);
             }
 #endif
+
+            // Close log file at end of test
+            Logger::getInstance().closeLogFile();
         }
 
         /**
