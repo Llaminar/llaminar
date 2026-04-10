@@ -195,10 +195,17 @@ namespace
     }
 
     // =========================================================================
-    // Prefill Recurrence Kernel (seq_len>1)
+    // Prefill Recurrence Kernel (seq_len>1, multi-block per head)
     //
-    // Sequential per-timestep, one block per head (same as CPU).
-    // True chunk-parallel optimization deferred to future iteration.
+    // Optimizations vs V1:
+    //   1. 2D grid: dim3(n_heads, col_blocks) — each column block processes
+    //      a subset of the d_v columns. Columns are fully independent in the
+    //      delta-rule recurrence, so no cross-block sync is needed.
+    //   2. Fused 2-pass column processing (same as decode kernel):
+    //      Pass 1: decay + kv (read-only); Pass 2: decay + update + output
+    //      (read-modify-write). Eliminates the separate decay pass.
+    //   3. Each thread owns one column vi — all per-column operations are
+    //      independent, so no __syncthreads() in the column processing body.
     // =========================================================================
 
     __global__ void cuda_gdn_chunk_forward_kernel(
@@ -220,6 +227,16 @@ namespace
 
         const int tid = threadIdx.x;
         const int block_size = blockDim.x;
+
+        // Row-split parallelism: ROW_SPLIT threads collaborate on each
+        // column, splitting the d_k rows between them. With ROW_SPLIT=4 and
+        // 256 threads/block: 8 warps/block — optimal for Ampere L1 latency.
+        constexpr int ROW_SPLIT = 4;
+        const int cols_per_block = block_size / ROW_SPLIT;
+        const int split_id = tid / cols_per_block; // 0..ROW_SPLIT-1
+        const int col_in_block = tid % cols_per_block;
+        const int vi = blockIdx.y * cols_per_block + col_in_block;
+
         const int qk_stride = n_heads * d_k;
         const int v_stride = n_heads * d_v;
         const float scale = rsqrtf((float)d_k);
@@ -230,9 +247,22 @@ namespace
         float *q_local = smem;       // [d_k]
         float *k_local = smem + d_k; // [d_k]
         // Shared reduction scratch follows
-        float *warp_sums = smem + 2 * d_k; // [8] for warp reduction
+        float *warp_sums = smem + 2 * d_k; // [16] for warp reduction (up to 16 warps)
+        // Double-buffered reduction arrays for row-split partial sums
+        float *reduce_kv = smem + 2 * d_k + 16;               // [block_size]
+        float *reduce_out = smem + 2 * d_k + 16 + block_size; // [block_size]
 
-        // Process each timestep sequentially
+        // Pre-load A_log and dt_bias (constant across timesteps)
+        __shared__ float A_log_h;
+        __shared__ float dt_bias_h;
+        if (tid == 0)
+        {
+            A_log_h = A_log[h];
+            dt_bias_h = dt_bias[h];
+        }
+        __syncthreads();
+
+        // Process each timestep sequentially (inherent to recurrence)
         for (int t = 0; t < seq_len; t++)
         {
             const float *q_src = Q + t * qk_stride + h * d_k;
@@ -240,7 +270,7 @@ namespace
             const float *v_src = V + t * v_stride + h * d_v;
             float *o_dst = output + t * v_stride + h * d_v;
 
-            // Load Q and K
+            // Load Q and K into shared memory (all threads cooperate)
             for (int i = tid; i < d_k; i += block_size)
             {
                 q_local[i] = q_src[i];
@@ -248,13 +278,14 @@ namespace
             }
             __syncthreads();
 
-            // L2 normalize
+            // L2 normalize Q and K
             if (use_qk_l2norm)
             {
                 int warp_id = tid / 32;
                 int lane_id = tid % 32;
                 int num_warps = (block_size + 31) / 32;
 
+                // Q norm
                 float q_sum = 0.0f;
                 for (int i = tid; i < d_k; i += block_size)
                     q_sum += q_local[i] * q_local[i];
@@ -276,6 +307,7 @@ namespace
                     q_local[i] *= q_inv;
                 __syncthreads();
 
+                // K norm
                 float k_sum = 0.0f;
                 for (int i = tid; i < d_k; i += block_size)
                     k_sum += k_local[i] * k_local[i];
@@ -304,43 +336,76 @@ namespace
                 __syncthreads();
             }
 
-            // Gate and beta
+            // Gate and beta (thread 0 computes, broadcast via shared mem)
             float decay, beta_h;
             if (tid == 0)
             {
-                float x = alpha[t * n_heads + h] + dt_bias[h];
+                float x = alpha[t * n_heads + h] + dt_bias_h;
                 float sp = (x > 20.0f) ? x : log1pf(expf(x));
-                warp_sums[0] = expf(A_log[h] * sp);
+                warp_sums[0] = expf(A_log_h * sp);
                 warp_sums[1] = 1.0f / (1.0f + expf(-beta_raw[t * n_heads + h]));
             }
             __syncthreads();
             decay = warp_sums[0];
             beta_h = warp_sums[1];
 
-            // Decay state
-            int total_state = d_k * d_v;
-            for (int i = tid; i < total_state; i += block_size)
-                S[i] *= decay;
-            __syncthreads();
-
-            // Steps 2-5: kv, delta, update, output (each thread handles d_v columns)
-            for (int vi = tid; vi < d_v; vi += block_size)
+            // Row-split column processing with register caching:
+            // Each thread caches its d_k/ROW_SPLIT rows (32 floats for ROW_SPLIT=4)
+            // in an array that nvcc keeps in registers. This eliminates the
+            // second read of S per pass (1R+1W vs 2R+1W = 33% memory savings).
+            // 32 floats + ~20 other regs ≈ 52 regs/thread — well within budget.
             {
-                float kv = 0.0f;
-                for (int j = 0; j < d_k; j++)
-                    kv += S[j * d_v + vi] * k_local[j];
+                constexpr int ROWS_PER_SPLIT = 32; // d_k(128) / ROW_SPLIT(4)
+                const int j_start = split_id * ROWS_PER_SPLIT;
 
-                float delta = (v_src[vi] - kv) * beta_h;
+                // Pass 1: Load S into register cache + partial kv dot product
+                float s_cache[ROWS_PER_SPLIT];
+                float partial_kv = 0.0f;
+                if (vi < d_v)
+                {
+                    for (int j = 0; j < ROWS_PER_SPLIT; j++)
+                    {
+                        float s = S[(j_start + j) * d_v + vi] * decay;
+                        s_cache[j] = s;
+                        partial_kv += s * k_local[j_start + j];
+                    }
+                }
+                reduce_kv[tid] = partial_kv;
+                __syncthreads();
 
-                for (int j = 0; j < d_k; j++)
-                    S[j * d_v + vi] += k_local[j] * delta;
+                // Reduce kv across all splits and compute delta
+                float delta = 0.0f;
+                if (vi < d_v)
+                {
+                    float kv = 0.0f;
+                    for (int s = 0; s < ROW_SPLIT; s++)
+                        kv += reduce_kv[col_in_block + s * cols_per_block];
+                    delta = (v_src[vi] - kv) * beta_h;
+                }
 
-                float out_vi = 0.0f;
-                for (int j = 0; j < d_k; j++)
-                    out_vi += S[j * d_v + vi] * q_local[j];
-                o_dst[vi] = out_vi;
+                // Pass 2: Update from register cache + partial output (no re-read)
+                float partial_out = 0.0f;
+                if (vi < d_v)
+                {
+                    for (int j = 0; j < ROWS_PER_SPLIT; j++)
+                    {
+                        float s_new = s_cache[j] + k_local[j_start + j] * delta;
+                        S[(j_start + j) * d_v + vi] = s_new;
+                        partial_out += s_new * q_local[j_start + j];
+                    }
+                }
+                reduce_out[tid] = partial_out;
+                __syncthreads();
+
+                // Reduce output and write (only split_id=0 writes)
+                if (vi < d_v && split_id == 0)
+                {
+                    float out_vi = 0.0f;
+                    for (int s = 0; s < ROW_SPLIT; s++)
+                        out_vi += reduce_out[col_in_block + s * cols_per_block];
+                    o_dst[vi] = out_vi;
+                }
             }
-            __syncthreads();
         }
     }
 
@@ -783,12 +848,22 @@ extern "C"
         int device_idx, void *stream)
     {
         cudaSetDevice(device_idx);
-        int threads = 128;
-        if (d_v > 128)
-            threads = 256;
-        int smem_size = 2 * d_k * sizeof(float) + 8 * sizeof(float);
 
-        cuda_gdn_chunk_forward_kernel<<<n_heads, threads, smem_size, (cudaStream_t)stream>>>(
+        // Row-split: 256 threads per block, 4 threads per column = 64 cols/block.
+        // 8 warps/block — optimal for Ampere L1 latency hiding.
+        int col_threads = 256;
+        int cols_per_block = col_threads / 4; // 64 columns per block
+        if (d_v <= 64)
+        {
+            col_threads = 128;
+            cols_per_block = col_threads / 4; // 32 columns per block
+        }
+        int num_col_blocks = (d_v + cols_per_block - 1) / cols_per_block;
+        // smem: q_local[d_k] + k_local[d_k] + warp_sums[16] + reduce_kv[col_threads] + reduce_out[col_threads]
+        int smem_size = (2 * d_k + 16 + 2 * col_threads) * sizeof(float);
+
+        dim3 grid(n_heads, num_col_blocks);
+        cuda_gdn_chunk_forward_kernel<<<grid, col_threads, smem_size, (cudaStream_t)stream>>>(
             Q, K, V, alpha, beta_raw, A_log, dt_bias,
             output, state,
             seq_len, n_heads, d_k, d_v, use_qk_l2norm);

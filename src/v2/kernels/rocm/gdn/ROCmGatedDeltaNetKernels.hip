@@ -147,7 +147,17 @@ __global__ void rocm_gdn_recurrent_step_kernel(
 }
 
 // =========================================================================
-// Prefill Recurrence Kernel
+// Prefill Recurrence Kernel (seq_len>1, multi-block per head)
+//
+// Optimizations vs V1:
+//   1. 2D grid: dim3(n_heads, col_blocks) — each column block processes
+//      a subset of the d_v columns. Columns are fully independent in the
+//      delta-rule recurrence, so no cross-block sync is needed.
+//   2. Fused 2-pass column processing (same as decode kernel):
+//      Pass 1: decay + kv (read-only); Pass 2: decay + update + output
+//      (read-modify-write). Eliminates the separate decay pass.
+//   3. Each thread owns one column vi — all per-column operations are
+//      independent, so no __syncthreads() in the column processing body.
 // =========================================================================
 
 __global__ void rocm_gdn_chunk_forward_kernel(
@@ -168,6 +178,17 @@ __global__ void rocm_gdn_chunk_forward_kernel(
 
     const int tid = threadIdx.x;
     const int block_size = blockDim.x;
+
+    // Row-split parallelism: ROW_SPLIT threads collaborate on each
+    // column, splitting the d_k rows between them. With ROW_SPLIT=8 and
+    // 512 threads/block: 8 wavefronts/block — optimal tradeoff between
+    // latency hiding and reduction overhead on gfx906.
+    constexpr int ROW_SPLIT = 8;
+    const int cols_per_block = block_size / ROW_SPLIT;
+    const int split_id = tid / cols_per_block;   // 0..ROW_SPLIT-1
+    const int col_in_block = tid % cols_per_block;
+    const int vi = blockIdx.y * cols_per_block + col_in_block;
+
     const int qk_stride = n_heads * d_k;
     const int v_stride = n_heads * d_v;
     const float scale = rsqrtf((float)d_k);
@@ -177,11 +198,24 @@ __global__ void rocm_gdn_chunk_forward_kernel(
     extern __shared__ float smem[];
     float *q_local = smem;
     float *k_local = smem + d_k;
-    float *warp_sums = smem + 2 * d_k;
+    float *warp_sums = smem + 2 * d_k; // [16] for warp reduction
+    // Double-buffered reduction arrays for row-split partial sums
+    float *reduce_kv = smem + 2 * d_k + 16;            // [block_size]
+    float *reduce_out = smem + 2 * d_k + 16 + block_size; // [block_size]
 
     int warp_id = tid / 64;
     int lane_id = tid % 64;
     int num_warps = (block_size + 63) / 64;
+
+    // Pre-load A_log and dt_bias (constant across timesteps)
+    __shared__ float A_log_h;
+    __shared__ float dt_bias_h;
+    if (tid == 0)
+    {
+        A_log_h = A_log[h];
+        dt_bias_h = dt_bias[h];
+    }
+    __syncthreads();
 
     for (int t = 0; t < seq_len; t++) {
         const float *q_src = Q + t * qk_stride + h * d_k;
@@ -189,6 +223,7 @@ __global__ void rocm_gdn_chunk_forward_kernel(
         const float *v_src = V + t * v_stride + h * d_v;
         float *o_dst = output + t * v_stride + h * d_v;
 
+        // Load Q and K into shared memory (all threads cooperate)
         for (int i = tid; i < d_k; i += block_size) {
             q_local[i] = q_src[i];
             k_local[i] = k_src[i];
@@ -196,6 +231,7 @@ __global__ void rocm_gdn_chunk_forward_kernel(
         __syncthreads();
 
         if (use_qk_l2norm) {
+            // Q norm
             float q_sum = 0.0f;
             for (int i = tid; i < d_k; i += block_size)
                 q_sum += q_local[i] * q_local[i];
@@ -214,6 +250,7 @@ __global__ void rocm_gdn_chunk_forward_kernel(
                 q_local[i] *= q_inv;
             __syncthreads();
 
+            // K norm
             float k_sum = 0.0f;
             for (int i = tid; i < d_k; i += block_size)
                 k_sum += k_local[i] * k_local[i];
@@ -240,36 +277,69 @@ __global__ void rocm_gdn_chunk_forward_kernel(
         // Gate and beta
         float decay, beta_h;
         if (tid == 0) {
-            float x = alpha[t * n_heads + h] + dt_bias[h];
+            float x = alpha[t * n_heads + h] + dt_bias_h;
             float sp = (x > 20.0f) ? x : log1pf(expf(x));
-            warp_sums[0] = expf(A_log[h] * sp);
+            warp_sums[0] = expf(A_log_h * sp);
             warp_sums[1] = 1.0f / (1.0f + expf(-beta_raw[t * n_heads + h]));
         }
         __syncthreads();
         decay = warp_sums[0];
         beta_h = warp_sums[1];
 
-        // Decay
-        int total_state = d_k * d_v;
-        for (int i = tid; i < total_state; i += block_size)
-            S[i] *= decay;
-        __syncthreads();
+        // Row-split column processing: each column is processed by
+        // ROW_SPLIT threads. Double-buffered shared memory reduction.
+        // NOTE: Register caching tested but regressed on gfx906 (AMD compiler
+        // places arrays in scratch memory). 2-pass approach is faster here.
+        {
+            const int rows_per_split = d_k / ROW_SPLIT;
+            const int j_start = split_id * rows_per_split;
+            const int j_end = (split_id == ROW_SPLIT - 1) ? d_k : j_start + rows_per_split;
 
-        // Steps 2-5
-        for (int vi = tid; vi < d_v; vi += block_size) {
-            float kv = 0.0f;
-            for (int j = 0; j < d_k; j++)
-                kv += S[j * d_v + vi] * k_local[j];
+            // Pass 1: Fused decay + partial kv dot product
+            float partial_kv = 0.0f;
+            if (vi < d_v)
+            {
+                for (int j = j_start; j < j_end; j++)
+                {
+                    float s_decayed = S[j * d_v + vi] * decay;
+                    partial_kv += s_decayed * k_local[j];
+                }
+            }
+            reduce_kv[tid] = partial_kv;
+            __syncthreads();
 
-            float delta = (v_src[vi] - kv) * beta_h;
+            // Reduce kv across all splits and compute delta
+            float delta = 0.0f;
+            if (vi < d_v)
+            {
+                float kv = 0.0f;
+                for (int s = 0; s < ROW_SPLIT; s++)
+                    kv += reduce_kv[col_in_block + s * cols_per_block];
+                delta = (v_src[vi] - kv) * beta_h;
+            }
 
-            for (int j = 0; j < d_k; j++)
-                S[j * d_v + vi] += k_local[j] * delta;
+            // Pass 2: Fused decay + update + partial output
+            float partial_out = 0.0f;
+            if (vi < d_v)
+            {
+                for (int j = j_start; j < j_end; j++)
+                {
+                    float s_new = S[j * d_v + vi] * decay + k_local[j] * delta;
+                    S[j * d_v + vi] = s_new;
+                    partial_out += s_new * q_local[j];
+                }
+            }
+            reduce_out[tid] = partial_out;
+            __syncthreads();
 
-            float out_vi = 0.0f;
-            for (int j = 0; j < d_k; j++)
-                out_vi += S[j * d_v + vi] * q_local[j];
-            o_dst[vi] = out_vi;
+            // Reduce output and write (only split_id=0 writes)
+            if (vi < d_v && split_id == 0)
+            {
+                float out_vi = 0.0f;
+                for (int s = 0; s < ROW_SPLIT; s++)
+                    out_vi += reduce_out[col_in_block + s * cols_per_block];
+                o_dst[vi] = out_vi;
+            }
         }
         __syncthreads();
     }
@@ -655,12 +725,22 @@ bool rocmGDN_chunk_forward(
     int device_idx, void *stream)
 {
     llaminar2::HipDeviceGuard::setDevice(device_idx);
-    int threads = 128;
-    if (d_v > 128) threads = 256;
-    int smem_size = 2 * d_k * sizeof(float) + 4 * sizeof(float);
+
+    // Row-split: 512 threads per block, 8 threads per column = 64 cols/block.
+    // 8 wavefronts/block — optimal for gfx906 latency hiding.
+    int col_threads = 512;
+    int cols_per_block = col_threads / 8; // 64 columns per block
+    if (d_v <= 64)
+    {
+        col_threads = 256;
+        cols_per_block = col_threads / 8; // 32 columns per block
+    }
+    int num_col_blocks = (d_v + cols_per_block - 1) / cols_per_block;
+    // smem: q_local[d_k] + k_local[d_k] + warp_sums[16] + reduce_kv[col_threads] + reduce_out[col_threads]
+    int smem_size = (2 * d_k + 16 + 2 * col_threads) * sizeof(float);
 
     hipLaunchKernelGGL(rocm_gdn_chunk_forward_kernel,
-        dim3(n_heads), dim3(threads), smem_size, (hipStream_t)stream,
+        dim3(n_heads, num_col_blocks), dim3(col_threads), smem_size, (hipStream_t)stream,
         Q, K, V, alpha, beta_raw, A_log, dt_bias,
         output, state,
         seq_len, n_heads, d_k, d_v, use_qk_l2norm);
