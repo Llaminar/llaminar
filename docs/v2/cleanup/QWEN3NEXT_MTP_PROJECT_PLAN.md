@@ -1,9 +1,17 @@
-# Qwen3-Next Multi-Token Prediction (MTP) Project Plan
+# Qwen 3.5 Multi-Token Prediction (MTP) Project Plan
 
-**Date**: 2025-07-27  
-**Status**: Research Complete — Implementation Planned  
+**Date**: 2025-07-27 (initial) / 2026-04-10 (updated with confirmed Qwen 3.5 architecture)  
+**Status**: Research Complete — Architecture Confirmed — Implementation Planned  
 **Companion Document**: `docs/v2/cleanup/QWEN3NEXT_GDN_PROJECT_PLAN.md` (GDN attention)  
-**Motivation**: Multi-Token Prediction enables self-speculative decoding, where the model's own auxiliary MTP heads draft future tokens that the main model verifies. DeepSeek-V3 achieves **1.8× TPS** with an 85-90% acceptance rate using this technique. Qwen3-Next is expected to adopt MTP for similar gains. Llaminar V2 currently has zero MTP infrastructure.
+**Motivation**: Multi-Token Prediction enables self-speculative decoding, where the model's own auxiliary MTP heads draft future tokens that the main model verifies. DeepSeek-V3 achieves **1.8× TPS** with an 85-90% acceptance rate using this technique. Qwen 3.5 confirms MTP adoption with `mtp_num_hidden_layers: 1` across all dense model sizes. Llaminar V2 currently has zero MTP infrastructure.
+
+**Confirmed Qwen 3.5 MTP Config** (from [HuggingFace config.json](https://huggingface.co/Qwen/Qwen3.5-0.8B/blob/main/config.json)):
+| Key | Value | Notes |
+|-----|-------|-------|
+| `mtp_num_hidden_layers` | 1 | D=1, predicts 1 extra token |
+| `mtp_use_dedicated_embeddings` | false | Shares main model embedding |
+| `tie_word_embeddings` | true | LM head = embedding.T (no separate lm_head weight) |
+| Model sizes with MTP | 0.8B, 4B, 8B, 14B, 32B | All dense Qwen 3.5 models |
 
 ---
 
@@ -22,6 +30,7 @@
 - [Phase 14: Verification and Acceptance](#phase-14-verification-and-acceptance)
 - [Phase 15: End-to-End MTP Validation](#phase-15-end-to-end-mtp-validation)
 - [Integration with GDN (Hybrid Model)](#integration-with-gdn-hybrid-model)
+- [FastMTP Optimization (Vocabulary Trimming)](#fastmtp-optimization-vocabulary-trimming)
 - [Risk Assessment](#risk-assessment)
 - [External References](#external-references)
 
@@ -107,50 +116,118 @@ The shared output head (same as main model's LM head) maps each representation t
 | MTP loss weight λ | 0.3 (first 10T tokens) → 0.1 (remaining) | Training only |
 | Embedding sharing | Yes — Emb and OutHead shared with main model | Physical parameter sharing |
 
+### Confirmed Qwen 3.5 Hyperparameters
+
+| Parameter | 0.8B | 4B | Notes |
+|-----------|------|-----|-------|
+| MTP depth D | 1 | 1 | All Qwen 3.5 dense models |
+| d_model | 1024 | 2048 | Hidden dimension |
+| n_heads | 16 | 16 | Attention heads |
+| n_kv_heads | 4 | 4 | GQA key/value heads |
+| head_dim | 64 | 128 | Per-head dimension |
+| intermediate_size | 2816 | 8192 | FFN intermediate |
+| **MTP block type** | **Full Attention** | **Full Attention** | NOT GDN — always softmax attention with gated Q, QK norm, partial RoPE |
+| Gated Q | Yes (2× Q width) | Yes (2× Q width) | Same as main model FA layers |
+| QK norm | Per-head RMSNorm | Per-head RMSNorm | q_norm + k_norm weights present |
+| Projection M_k | (d, 2d) | (d, 2d) | Named `mtp.fc.weight` |
+| Extra norm | `mtp.norm.weight` | `mtp.norm.weight` | Final RMSNorm after transformer block, before LM head |
+| Embedding sharing | Yes | Yes | `mtp_use_dedicated_embeddings: false` |
+| LM head sharing | Yes | Yes | `tie_word_embeddings: true` |
+
+> **Key finding**: The MTP transformer block is always a **Full Attention** layer, architecturally identical to the main model's FA layers (gated Q, QK norm, partial RoPE). It is NOT a GDN layer. This means the existing FA stage infrastructure can be directly reused for MTP, and the MTP block has its own small KV cache (1 layer).
+
 ### Weight Inventory for MTP Module (D=1)
 
-| Weight | Shape | Size (for DeepSeek-V3 d=7168) | Notes |
-|--------|-------|-------------------------------|-------|
-| `mtp_proj` (M_1) | (d, 2d) | d × 2d × bytes_per_param | RMSNorm of both inputs, then project |
-| `mtp_norm_main` | (d,) | d × 4 bytes | RMSNorm for main model hidden states |
-| `mtp_norm_emb` | (d,) | d × 4 bytes | RMSNorm for embedding lookup |
-| `mtp_trm_attn_*` | Standard attention weights | Same as one main model layer | Self-attention in TRM block |
-| `mtp_trm_ffn_*` | Standard FFN weights | Same as one main model layer | FFN in TRM block |
-| `mtp_trm_norms` | RMSNorm weights | Same as one main model layer | Pre-attention and pre-FFN norms |
+#### Confirmed HuggingFace Safetensor Names (Qwen 3.5)
 
-**Memory overhead**: Approximately 1 transformer layer + 1 projection matrix. For a Qwen2.5-0.5B-class model (d=896, 24 layers), this is ~4% additional parameters. For a 7B-class model, even less proportionally.
+The following weight names are **confirmed** from the [Qwen3.5-0.8B safetensors index](https://huggingface.co/Qwen/Qwen3.5-0.8B/raw/main/model.safetensors.index.json):
+
+| HF Safetensor Name | Shape (0.8B, d=1024) | Purpose |
+|----|-------|--------|
+| `mtp.fc.weight` | (d, 2d) = (1024, 2048) | Projection: concat[norm(h_main); norm(emb)] → d |
+| `mtp.pre_fc_norm_hidden.weight` | (d,) = (1024,) | RMSNorm on main model hidden state |
+| `mtp.pre_fc_norm_embedding.weight` | (d,) = (1024,) | RMSNorm on token embedding |
+| `mtp.norm.weight` | (d,) = (1024,) | Final RMSNorm after transformer block |
+| `mtp.layers.0.input_layernorm.weight` | (d,) = (1024,) | Pre-attention layer norm |
+| `mtp.layers.0.self_attn.q_proj.weight` | (n_heads×hd×2, d) = (2048, 1024) | Q projection (2× for gated Q) |
+| `mtp.layers.0.self_attn.k_proj.weight` | (n_kv×hd, d) = (256, 1024) | K projection |
+| `mtp.layers.0.self_attn.v_proj.weight` | (n_kv×hd, d) = (256, 1024) | V projection |
+| `mtp.layers.0.self_attn.o_proj.weight` | (d, n_heads×hd) = (1024, 1024) | Output projection |
+| `mtp.layers.0.self_attn.q_norm.weight` | (hd,) = (64,) | Per-head Q RMSNorm |
+| `mtp.layers.0.self_attn.k_norm.weight` | (hd,) = (64,) | Per-head K RMSNorm |
+| `mtp.layers.0.post_attention_layernorm.weight` | (d,) = (1024,) | Pre-FFN layer norm |
+| `mtp.layers.0.mlp.gate_proj.weight` | (inter, d) = (2816, 1024) | FFN gate |
+| `mtp.layers.0.mlp.up_proj.weight` | (inter, d) = (2816, 1024) | FFN up |
+| `mtp.layers.0.mlp.down_proj.weight` | (d, inter) = (1024, 2816) | FFN down |
+
+**Shared weights** (no MTP-specific copies):
+| Shared Weight | Main Model Name | Notes |
+|---------------|----------------|-------|
+| Embedding | `model.language_model.embed_tokens.weight` | `mtp_use_dedicated_embeddings: false` |
+| LM Head | (tied to embedding) | `tie_word_embeddings: true` — no separate `lm_head.weight` |
+
+**Total MTP-specific parameters** (0.8B model): ~7.7M params (≈1 FA layer + projection + 3 norms) = ~4% model overhead.
+
+> **Note on GGUF naming**: The exact GGUF tensor names will depend on how ik_llama.cpp/llama.cpp standardizes the conversion. The llama.cpp PR #20700 uses names like `mtp.fc.weight`, `mtp.layers.0.self_attn.q_proj.weight` etc., closely mirroring the HF naming. The mapping layer should handle both conventions.
+
+#### Previous Speculative Names (Superseded)
+
+The following names were previously estimated from the DeepSeek-V3 architecture and are now **superseded** by the confirmed names above:
+
+| Previously Estimated | Actual HF Name |
+|---------------------|---------|
+| `mtp.0.proj.weight` | `mtp.fc.weight` |
+| `mtp.0.norm_main.weight` | `mtp.pre_fc_norm_hidden.weight` |
+| `mtp.0.norm_emb.weight` | `mtp.pre_fc_norm_embedding.weight` |
+| `mtp.0.block.attn_norm.weight` | `mtp.layers.0.input_layernorm.weight` |
+| `mtp.0.block.attn.q_proj.weight` | `mtp.layers.0.self_attn.q_proj.weight` |
+| `mtp.0.block.ffn_norm.weight` | `mtp.layers.0.post_attention_layernorm.weight` |
+| `mtp.0.block.ffn.gate_proj.weight` | `mtp.layers.0.mlp.gate_proj.weight` |
+| (not anticipated) | `mtp.norm.weight` (final norm before LM head) |
+| (not anticipated) | `mtp.layers.0.self_attn.q_norm.weight` (per-head QK norm) |
+| (not anticipated) | `mtp.layers.0.self_attn.k_norm.weight` (per-head QK norm) |
 
 ### Data Flow Diagram
 
 ```
-Main Model Forward Pass
-────────────────────────
-tokens → Embedding → [TransformerBlock × N] → FinalNorm → h_main
-                                                            │
-                                                            │ (last hidden state)
+Main Model Forward Pass (Qwen 3.5 hybrid GDN + FA)
+────────────────────────────────────────────────────
+tokens → Embedding → [GDN/FA Block × N] → FinalNorm → h_main
+    (GDN layers 0,1,2,4,5,6,8,9,10,...)                  │
+    (FA  layers 3,7,11,15,19,23)                          │ (last hidden state)
                                                             ▼
                                                       ┌──────────┐
                                                       │ LM Head  │ → logits_0 → sample → token_1
                                                       │ (shared) │
                                                       └──────────┘
                                                             │
-MTP Module (Depth 1)                                        │
-─────────────────────                                       ▼
-                                                    RMSNorm(h_main)
+MTP Module (Depth 1) — Confirmed Qwen 3.5 architecture     │
+───────────────────────────────────────────────────────     ▼
+                                                 pre_fc_norm_hidden(h_main)
                                                             │
-token_1 → Embedding(token_1) → RMSNorm ─────────────┐      │
-                                                     ▼      ▼
+token_1 → Embedding(token_1) → pre_fc_norm_embedding ┐     │
+                                                      ▼     ▼
                                               ┌──────────────────┐
                                               │  Concatenate     │
                                               │  [norm_h ; norm_e]│
                                               └────────┬─────────┘
                                                        ▼
                                               ┌──────────────────┐
-                                              │  M_1 Projection  │ (2d → d)
+                                              │  mtp.fc          │ (2d → d)
+                                              │  Projection      │
                                               └────────┬─────────┘
                                                        ▼
                                               ┌──────────────────┐
-                                              │  TRM_1 Block     │ (attn + FFN)
+                                              │  FA Block        │ Full Attention layer:
+                                              │  (mtp.layers.0)  │  • Gated Q (2× width)
+                                              │                  │  • Per-head QK RMSNorm
+                                              │                  │  • Partial RoPE
+                                              │                  │  • SwiGLU FFN
+                                              │                  │  • Own KV cache (1 layer)
+                                              └────────┬─────────┘
+                                                       ▼
+                                              ┌──────────────────┐
+                                              │  mtp.norm        │ Final RMSNorm
                                               └────────┬─────────┘
                                                        ▼
                                               ┌──────────────────┐
@@ -158,7 +235,9 @@ token_1 → Embedding(token_1) → RMSNorm ────────────�
                                               └──────────────────┘
 ```
 
-For D > 1, additional depths chain: depth 2 takes h^1 from depth 1, combines with Emb(token_2), projects through M_2, runs TRM_2, and produces token_3 via the shared LM head.
+For D > 1, additional depths chain: depth 2 takes h^1 from depth 1, combines with Emb(token_2), projects through M_2, runs TRM_2, mtp.norm_2, and produces token_3 via the shared LM head. (All current Qwen 3.5 models use D=1.)
+
+> **Note**: HuggingFace transformers ignores MTP weights by default (`_keys_to_ignore_on_load_unexpected = [r"^mtp.*"]`). The MTP module is only used for self-speculative decoding, not standard greedy/sampling generation.
 
 ---
 
@@ -274,13 +353,16 @@ A comprehensive search for `speculative|multi.?token|MTP|draft` across the codeb
 | **Attention kernels** | Support seq_len > 1 decode (tested) | ✅ Yes | None |
 | **Forward pass** (`IInferenceRunner::forward`) | Accepts arbitrary seq_len | ✅ Yes | None |
 | **Graph cache** | Keyed by (seq_len, batch_size, device) | ✅ Yes | Different graphs for draft vs verify automatically |
+| **FA layer stages** | Qwen 3.5 FA stages fully implemented in Qwen35Graph | ✅ Yes | MTP block reuses FA stage infrastructure directly |
 | **Position tracking** | `positions[b] += seq_len` in forward | ⚠️ Partial | Needs rollback on rejection |
 | **LM Head** | Only last-token logits when seq_len > 1 | ❌ No | Must compute ALL positions' logits for verification |
-| **KV Cache** | No truncate/rollback method | ❌ No | Critical gap — needs `truncate()` |
+| **KV Cache** | No truncate/rollback method | ❌ No | Critical gap — needs `truncate()` for FA layers |
+| **GDN Recurrent State** | No checkpoint/restore | ❌ No | Critical gap — state irreversibly mutated by rejected tokens |
+| **Conv1d State** | No checkpoint/restore | ❌ No | Short conv state also needs rollback for GDN layers |
 | **Sampler** | Returns single token | ⚠️ Partial | Needs multi-call or batch mode |
 | **Decode loop** | Strictly 1 token per step | ❌ No | Needs draft-verify-accept cycle |
-| **MTP head stages** | Don't exist | ❌ No | Greenfield implementation |
-| **Weight loading** | No MTP weight names in GGUF mapping | ❌ No | Needs extension |
+| **MTP head stages** | Don't exist | ❌ No | But FA stages can be reused (MTP block = FA block) |
+| **Weight loading** | No MTP weight names in GGUF mapping | ❌ No | HF names confirmed; GGUF naming pending standardization |
 
 ---
 
@@ -382,23 +464,26 @@ These can potentially be simplified into fewer stages for performance.
 
 **Current**: `WeightManager` maps GGUF tensor names to schema buffer names.
 
-**New weight mappings needed** (for D=1):
-| GGUF Tensor Name (expected) | Schema Name | Shape |
-|-----------------------------|-------------|-------|
-| `mtp.0.proj.weight` | `mtp_depth0_proj` | (d, 2d) |
-| `mtp.0.norm_main.weight` | `mtp_depth0_norm_main` | (d,) |
-| `mtp.0.norm_emb.weight` | `mtp_depth0_norm_emb` | (d,) |
-| `mtp.0.block.attn_norm.weight` | `mtp_depth0_attn_norm` | (d,) |
-| `mtp.0.block.attn.q_proj.weight` | `mtp_depth0_attn_q` | (n_heads×d_k, d) |
-| `mtp.0.block.attn.k_proj.weight` | `mtp_depth0_attn_k` | (n_kv_heads×d_k, d) |
-| `mtp.0.block.attn.v_proj.weight` | `mtp_depth0_attn_v` | (n_kv_heads×d_k, d) |
-| `mtp.0.block.attn.o_proj.weight` | `mtp_depth0_attn_o` | (d, n_heads×d_k) |
-| `mtp.0.block.ffn_norm.weight` | `mtp_depth0_ffn_norm` | (d,) |
-| `mtp.0.block.ffn.gate_proj.weight` | `mtp_depth0_ffn_gate` | (inter_dim, d) |
-| `mtp.0.block.ffn.up_proj.weight` | `mtp_depth0_ffn_up` | (inter_dim, d) |
-| `mtp.0.block.ffn.down_proj.weight` | `mtp_depth0_ffn_down` | (d, inter_dim) |
+**New weight mappings needed** (for D=1, confirmed HF names):
+| HF Safetensor Name | Schema Name | Shape |
+|----|-------------|-------|
+| `mtp.fc.weight` | `mtp_depth0_proj` | (d, 2d) |
+| `mtp.pre_fc_norm_hidden.weight` | `mtp_depth0_norm_main` | (d,) |
+| `mtp.pre_fc_norm_embedding.weight` | `mtp_depth0_norm_emb` | (d,) |
+| `mtp.norm.weight` | `mtp_depth0_final_norm` | (d,) |
+| `mtp.layers.0.input_layernorm.weight` | `mtp_depth0_attn_norm` | (d,) |
+| `mtp.layers.0.self_attn.q_proj.weight` | `mtp_depth0_attn_q` | (n_heads×hd×2, d) — gated Q |
+| `mtp.layers.0.self_attn.k_proj.weight` | `mtp_depth0_attn_k` | (n_kv_heads×hd, d) |
+| `mtp.layers.0.self_attn.v_proj.weight` | `mtp_depth0_attn_v` | (n_kv_heads×hd, d) |
+| `mtp.layers.0.self_attn.o_proj.weight` | `mtp_depth0_attn_o` | (d, n_heads×hd) |
+| `mtp.layers.0.self_attn.q_norm.weight` | `mtp_depth0_q_norm` | (hd,) |
+| `mtp.layers.0.self_attn.k_norm.weight` | `mtp_depth0_k_norm` | (hd,) |
+| `mtp.layers.0.post_attention_layernorm.weight` | `mtp_depth0_ffn_norm` | (d,) |
+| `mtp.layers.0.mlp.gate_proj.weight` | `mtp_depth0_ffn_gate` | (inter_dim, d) |
+| `mtp.layers.0.mlp.up_proj.weight` | `mtp_depth0_ffn_up` | (inter_dim, d) |
+| `mtp.layers.0.mlp.down_proj.weight` | `mtp_depth0_ffn_down` | (d, inter_dim) |
 
-**Note**: The exact GGUF tensor names will depend on how the community (llama.cpp, etc.) standardizes the naming. The names above are extrapolated from the DeepSeek-V3 architecture.
+**Note**: The MTP block is architecturally identical to the main model's **Full Attention** layers (gated Q with 2× width, per-head QK RMSNorm, partial RoPE, SwiGLU FFN). The Q projection width is doubled to accommodate the gate.
 
 ---
 
@@ -467,48 +552,61 @@ For `CUDARingKVCache`:
 
 ### 10.1 GGUF Weight Name Mapping
 
-Until the community standardizes MTP weight names in GGUF, implement a flexible mapping layer:
+The HuggingFace safetensor names are now **confirmed** (see Weight Inventory above). The GGUF conversion naming depends on how ik_llama.cpp/llama.cpp standardizes the conversion from the `mtp.*` namespace. Implement a flexible mapping layer that handles both:
 
 ```cpp
 // In WeightNameMapper or similar
 struct MTPWeightMapping {
     int depth;              // MTP depth index (0 for D=1)
-    std::string component;  // "proj", "norm_main", "norm_emb", "block.attn.*", "block.ffn.*"
-    std::string gguf_name;  // Actual name in the GGUF file
+    std::string component;  // "fc", "pre_fc_norm_hidden", "pre_fc_norm_embedding", "norm",
+                            // "layers.0.self_attn.*", "layers.0.mlp.*"
+    std::string hf_name;    // Confirmed HF name: "mtp.fc.weight", etc.
+    std::string gguf_name;  // GGUF name (TBD, likely mirrors HF naming)
 };
+
+// Known HF → GGUF mapping patterns from llama.cpp PR #20700:
+//   mtp.fc.weight                     → blk.mtp.0.eh_proj.weight (or similar)
+//   mtp.pre_fc_norm_hidden.weight     → blk.mtp.0.enorm.weight
+//   mtp.pre_fc_norm_embedding.weight  → blk.mtp.0.hnorm.weight
+//   mtp.norm.weight                   → blk.mtp.0.norm.weight
+//   mtp.layers.0.self_attn.q_proj     → blk.mtp.0.attn_q.weight
+//   etc.
 ```
 
 ### 10.2 Model Config Extension
 
-Add MTP-related fields to the model configuration:
+Add MTP-related fields to the model configuration (values from confirmed HF config):
 
 ```cpp
-struct Qwen3NextGraphConfig {
-    // ... existing fields from Qwen2GraphConfig ...
+struct Qwen35GraphConfig {
+    // ... existing fields from Qwen35GraphConfig ...
     
-    // MTP configuration
-    int mtp_depth = 0;      // 0 = no MTP, 1 = predict one extra token, etc.
-    bool mtp_enabled = true; // Can disable MTP heads even if weights are present
+    // MTP configuration (from HF config.json)
+    int mtp_num_hidden_layers = 0; // 0 = no MTP, 1 = predict one extra token
+    bool mtp_enabled = true;        // Can disable MTP heads even if weights are present
+    bool mtp_use_dedicated_embeddings = false; // Qwen 3.5: always false (shared)
     
-    // MTP depth shares the same d_model, n_heads, etc. as the main model
-    // (the TRM block in MTP has identical architecture to a main model layer)
+    // MTP depth shares the same d_model, n_heads, n_kv_heads, head_dim,
+    // intermediate_size as the main model's FA layers.
+    // The MTP TRM block matches the FA layer architecture exactly:
+    //   gated Q, per-head QK RMSNorm, partial RoPE, SwiGLU FFN
 };
 ```
 
 ### 10.3 Weight Sharing
 
-The embedding table and LM head are **shared** between the main model and MTP heads. No duplication needed — the graph stages reference the same weight tensors:
+The embedding table and LM head are **shared** between the main model and MTP heads (`mtp_use_dedicated_embeddings: false`, `tie_word_embeddings: true`). No duplication needed — the graph stages reference the same weight tensors:
 
 | Shared Weight | Main Model Reference | MTP Reference |
 |---------------|---------------------|---------------|
-| `token_emb_weight` | Embedding stage | `MTPEmbedLookupStage` |
-| `lm_head_weight` | `LMHeadStage` | `MTPLMHeadStage` |
+| `embed_tokens.weight` | Embedding stage | MTP embed lookup (for draft token) |
+| `embed_tokens.weight` (as LM head) | `LMHeadStage` | MTP LM head (tied weights) |
 
 ### Deliverables
 
 | Item | File/Location |
 |------|--------------|
-| Config extension | `src/v2/models/qwen3next/Qwen3NextGraphConfig.h` |
+| Config extension | `src/v2/models/qwen35/Qwen35GraphConfigBuilder.h` (extend existing) |
 | Weight mapping | `src/v2/loaders/MTPWeightMapper.h` |
 | GGUF loader extension | `src/v2/loaders/GGUFLoader.cpp` (extend existing) |
 | Unit test | `tests/v2/unit/Test__MTPWeightLoading.cpp` |
@@ -521,7 +619,31 @@ The embedding table and LM head are **shared** between the main model and MTP he
 
 ### 11.1 Simplified Stage Design
 
-Rather than 7 individual stages per MTP depth, use a **fused MTP forward stage** for efficiency:
+Since the MTP transformer block is architecturally **identical to the main model's Full Attention layers** (gated Q, QK norm, partial RoPE, SwiGLU FFN), the implementation can heavily reuse existing FA stage infrastructure from `Qwen35Graph`. The MTP-specific stages are only the projection preamble and the final norm:
+
+**MTP-specific stages** (new):
+| Stage | Description | Inputs | Outputs |
+|-------|-------------|--------|---------|
+| `MTPEmbedLookupStage` | Lookup embedding for draft token | draft_token, embedding_table | emb_vector |
+| `MTPNormMainStage` | RMSNorm on main hidden states (`pre_fc_norm_hidden`) | h_main | norm_h_main |
+| `MTPNormEmbStage` | RMSNorm on embedding (`pre_fc_norm_embedding`) | emb_vector | norm_emb |
+| `MTPConcatProjectStage` | Concatenate [norm_h; norm_emb] + project via `mtp.fc` (2d → d) | norm_h_main, norm_emb | h_projected |
+| `MTPFinalNormStage` | RMSNorm via `mtp.norm` (after transformer block, before LM head) | h_depth_k | h_normed |
+
+**Reused FA stages** (from existing `Qwen35Graph::buildFAAttentionGraph`):
+| Stage | Notes |
+|-------|-------|
+| Pre-attention RMSNorm (`input_layernorm`) | Standard, already implemented |
+| Fused QKV projection (gated Q, 2× width) | Identical to FA layers |
+| Q-gate split | Identical to FA layers |
+| Per-head QK RMSNorm | Identical to FA layers |
+| Partial RoPE | Identical to FA layers |
+| KV Cache (own 1-layer cache) | Separate cache instance for MTP |
+| Attention compute | Standard scaled dot-product attention |
+| Output gate + Wo projection | Identical to FA layers |
+| Pre-FFN RMSNorm + SwiGLU FFN | Identical to FA layers |
+
+Rather than 7+ individual MTP-specific stages, the fused approach below combines the preamble:
 
 ```cpp
 class MTPForwardStage : public ComputeStage {
@@ -529,21 +651,25 @@ class MTPForwardStage : public ComputeStage {
         STAGE_PARAMS_COMMON_FIELDS;
         
         // Inputs
-        const ITensor* main_hidden_states;  // h^{k-1} from main model or previous depth
+        const ITensor* main_hidden_states;  // h^{k-1} from main model
         int draft_token_id;                  // Token to embed and combine
         
-        // MTP module weights
-        const ITensor* proj_weight;          // M_k: (d, 2d)
-        const ITensor* norm_main_weight;     // RMSNorm for h^{k-1}
-        const ITensor* norm_emb_weight;      // RMSNorm for embedding
+        // MTP preamble weights
+        const ITensor* proj_weight;          // mtp.fc: (d, 2d)
+        const ITensor* norm_main_weight;     // mtp.pre_fc_norm_hidden
+        const ITensor* norm_emb_weight;      // mtp.pre_fc_norm_embedding
         const ITensor* embedding_table;      // Shared embedding
         
-        // Transformer block weights (same shape as main model layer)
-        const ITensor* attn_norm_weight;
-        // ... QKV, Wo, FFN weights ...
+        // Transformer block weights — same shape as main model FA layer
+        // (reuse buildFAAttentionGraph infrastructure)
+        const ITensor* attn_norm_weight;     // mtp.layers.0.input_layernorm
+        // ... QKV, q_norm, k_norm, Wo, FFN weights ...
+        
+        // Post-block weights
+        const ITensor* final_norm_weight;    // mtp.norm
         
         // Outputs
-        ITensor* depth_hidden_states;        // h^k
+        ITensor* depth_hidden_states;        // h^k (before final norm)
         ITensor* depth_logits;               // Optional: logits for this depth
         
         // Config
@@ -552,30 +678,46 @@ class MTPForwardStage : public ComputeStage {
     };
     
     bool execute() override {
-        // 1. Embed draft token
-        // 2. RMSNorm both h^{k-1} and embedding
-        // 3. Concatenate [norm_h; norm_emb]
-        // 4. Project through M_k (GEMM: 1×2d × 2d×d → 1×d)
-        // 5. Run transformer block (attn_norm → attn → residual → ffn_norm → ffn → residual)
-        // 6. Output hidden states (and optionally logits via shared LM head)
+        // 1. Embed draft token (lookup from shared embedding table)
+        // 2. pre_fc_norm_hidden(h_main), pre_fc_norm_embedding(emb)
+        // 3. Concatenate [norm_h; norm_emb] → (1, 2d)
+        // 4. Project through mtp.fc (GEMM: 1×2d × 2d×d → 1×d)
+        // ** 5-8 are standard FA layer stages (can delegate to buildFAAttentionGraph) **
+        // 5. input_layernorm → FusedQKV → Q-gate split → QK norm → RoPE
+        // 6. KV cache append → Attention compute → Output gate → Wo projection
+        // 7. Residual add + post_attention_layernorm → SwiGLU FFN → Residual add
+        // 8. mtp.norm (final RMSNorm)
+        // 9. LM head (shared) → logits
     }
 };
 ```
 
 ### 11.2 MTP Graph Building
 
+Since the MTP block is a Qwen 3.5 FA layer, the graph builder can reuse `buildFAAttentionGraph()` directly:
+
 ```cpp
-class Qwen3NextGraph {
+class Qwen35Graph {
     // ... existing graph building methods ...
     
     void buildMTPGraph(int depth) {
-        // For each MTP depth:
-        // 1. MTPForwardStage takes main h + draft token → produces h^k
-        // 2. LMHeadStage (shared) takes h^k → produces logits
-        // 3. Graph returns both h^k (for next depth) and logits (for sampling)
+        // MTP preamble (new stages):
+        // 1. Embed draft token → emb
+        // 2. pre_fc_norm_hidden(h_main) + pre_fc_norm_embedding(emb)
+        // 3. Concat [norm_h; norm_emb] → project through mtp.fc → h'
+        
+        // Transformer block (reuse existing FA infrastructure):
+        // 4. buildFAAttentionGraph() with MTP-specific weights and separate KV cache
+        //    (input_layernorm, gated Q, QK norm, partial RoPE, attention, output gate, Wo, FFN)
+        
+        // MTP postamble (new stages):
+        // 5. mtp.norm (final RMSNorm before LM head)
+        // 6. LMHeadStage (shared weight) → draft logits
     }
 };
 ```
+
+**Key implementation detail**: The MTP block's attention uses a **separate 1-layer KV cache** independent from the main model's KV cache. During speculation, the MTP KV cache only ever holds the draft sequence context. It must be truncated along with the main model's cache on rejection.
 
 ### 11.3 Key Design Decision: Separate Graph vs Integrated
 
@@ -590,8 +732,10 @@ class Qwen3NextGraph {
 
 | Item | File/Location |
 |------|--------------|
-| MTP forward stage | `src/v2/execution/compute_stages/stages/MTPForwardStage.h/.cpp` |
-| MTP graph builder | `src/v2/models/qwen3next/MTPGraph.h/.cpp` |
+| MTP preamble stages | `src/v2/execution/compute_stages/stages/MTPConcatProjectStage.h/.cpp` |
+| MTP final norm stage | `src/v2/execution/compute_stages/stages/MTPFinalNormStage.h/.cpp` |
+| MTP graph builder | `src/v2/models/qwen35/MTPGraph.h/.cpp` (reuses FA stage infra) |
+| MTP KV cache (1-layer) | Separate `IKVCache` instance for MTP block |
 | Unit test | `tests/v2/unit/Test__MTPForwardStage.cpp` |
 
 ---
@@ -886,26 +1030,28 @@ AcceptResult SpeculativeAcceptor::verifyGreedy(
 |-----------|--------|-----------------|
 | Tokens per second (greedy) | tok/s | 1.5-1.8× baseline |
 | Tokens per second (sampling, t=0.7) | tok/s | 1.3-1.5× baseline |
-| Acceptance rate (greedy) | % | 85-90% |
-| Acceptance rate (sampling) | % | 75-85% |
+| Acceptance rate (greedy) | % | 80-90% (see note below) |
+| Acceptance rate (sampling) | % | 70-85% |
 | Memory overhead for MTP heads | MB | < 5% model size |
 | Latency per draft step | ms | < 1 main model decode step |
+
+> **Acceptance rate note**: DeepSeek-V3 reports 85-90% acceptance. Real-world Qwen 3.5 data from llama.cpp PR #20700 shows 40-95% depending on quantization, prompt type, and implementation. The key factors: (1) MTP block using full attention (vs FFN-only) achieves 82% vs 60%, (2) F16 MTP weights vs Q4_K_M quantized MTP weights significantly affect accuracy, (3) code/math prompts have lower acceptance than natural language.
 
 ### 15.3 CLI Integration
 
 ```bash
 # Enable MTP (auto-detects from model weights)
-./llaminar2 -m qwen3next.gguf -p "Hello" -n 50
+./llaminar2 -m qwen35.gguf -p "Hello" -n 50
 
 # Explicitly disable MTP (useful for benchmarking)
-./llaminar2 -m qwen3next.gguf -p "Hello" -n 50 --no-mtp
+./llaminar2 -m qwen35.gguf -p "Hello" -n 50 --no-mtp
 
 # Benchmark with and without MTP
-./llaminar2 --benchmark -m qwen3next.gguf -n 128
-./llaminar2 --benchmark -m qwen3next.gguf -n 128 --no-mtp
+./llaminar2 --benchmark -m qwen35.gguf -n 128
+./llaminar2 --benchmark -m qwen35.gguf -n 128 --no-mtp
 
 # Show MTP statistics during generation
-LLAMINAR_MTP_STATS=1 ./llaminar2 -m qwen3next.gguf -p "Hello" -n 50
+LLAMINAR_MTP_STATS=1 ./llaminar2 -m qwen35.gguf -p "Hello" -n 50
 ```
 
 **MTP statistics output**:
@@ -930,75 +1076,175 @@ LLAMINAR_MTP_STATS=1 ./llaminar2 -m qwen3next.gguf -p "Hello" -n 50
 
 ## Integration with GDN (Hybrid Model)
 
-### How MTP Interacts with GDN
+### MTP Block Type: Confirmed as Full Attention
 
-For Qwen3-Next, the MTP module's transformer block (`TRM_k`) may itself be a hybrid block containing either GDN or softmax attention, depending on how the model is configured. The key interactions:
+The MTP transformer block is **always Full Attention** (confirmed from HuggingFace source code and llama.cpp PR #20700). It does NOT use GDN/linear attention, even though the main model is a GDN+FA hybrid. This means:
 
 | Aspect | Details |
 |--------|---------|
-| **MTP block attention type** | Likely matches the main model's last layer type, or is always standard attention (simpler) |
-| **GDN state in MTP** | If TRM_k uses GDN, it needs its own GDN state (separate from the D main model GDN states) |
-| **KV cache in MTP** | If TRM_k uses softmax attention, it needs its own small KV cache (only 1 layer) |
+| **MTP block attention type** | **Full Attention** (gated Q, QK norm, partial RoPE) — same as main model's FA layers |
+| **GDN state in MTP** | None needed — MTP block has no GDN state |
+| **KV cache in MTP** | MTP block has its own small 1-layer KV cache |
 | **Draft token embedding** | Same as main model — no GDN-specific change |
-| **Verification pass** | Runs through main model (GDN + softmax hybrid) — no MTP-specific change |
-| **KV cache rollback** | Only applies to softmax attention layers — GDN layers use recurrent state instead |
-| **GDN state rollback** | If draft tokens are rejected, GDN layers need state rollback too |
 
-### GDN State Rollback
+### The Critical Challenge: Main Model GDN State During Verification
 
-This is a special consideration for the hybrid GDN + MTP combination:
+While the MTP block itself is simple (just an FA layer), the **verification pass** runs through the entire main model (all GDN + FA layers). This creates the fundamental challenge:
 
-**For softmax attention layers**: Use `IKVCache::truncate()` to remove rejected entries.
+**Problem**: During the verification pass, draft tokens `[token_1, token_2]` flow through ALL main model layers as a seq_len=2 forward pass. The GDN layers irreversibly update their recurrent state `S_t` for both tokens. If `token_2` is rejected, the GDN state has been corrupted — it now incorporates information from a token that shouldn't exist.
 
-**For GDN layers**: The recurrent state `S_t` is a matrix that was updated by each draft token. Rolling back requires one of:
+**This is the hardest unsolved problem for MTP on hybrid GDN+FA models.**
 
-| Strategy | Complexity | Memory | Accuracy |
-|----------|-----------|--------|----------|
-| **A: Checkpoint and restore** | Low | +1 state copy per GDN layer | Exact |
-| **B: Recompute from last accepted** | High | None extra | Exact |
-| **C: Accept all GDN-layer state updates** | None | None | Approximate |
+### GDN State Rollback Strategies
 
-**Recommendation**: Strategy A (checkpoint). Before the draft phase, snapshot each GDN layer's state matrix. After rejection, restore from the snapshot. The state is small (d_k × d_v per head per layer), making this very cheap.
+| Strategy | Complexity | Memory | Accuracy | Throughput Impact |
+|----------|-----------|--------|----------|-------------------|
+| **A: Checkpoint and restore** | Low | +1 state copy per GDN layer | Exact | Near-zero overhead |
+| **B: Two-phase decode** | Medium | None extra | Exact | Halves MTP benefit (~1.3× vs 1.8×) |
+| **C: Recompute from last accepted** | High | None extra | Exact | High recompute cost |
+| **D: Accept all GDN state updates** | None | None | Approximate | No overhead but quality risk |
+
+#### Strategy A: Checkpoint and Restore (Recommended)
+
+Before the draft phase, snapshot each GDN layer's recurrent state. After rejection, restore and replay only accepted tokens:
 
 ```cpp
-// Before draft phase:
+// Before draft phase — save GDN state
 for (auto& gdn_layer : gdn_layers) {
-    gdn_layer->checkpointState();  // Copy S → S_checkpoint
+    gdn_layer->checkpointState();  // Copy S → S_checkpoint (+ conv1d state)
 }
 
-// After rejection:
-if (rollback_needed) {
+// Run verification pass through main model (ALL layers process draft tokens)
+runner_->setComputeAllPositionLogits(true);
+runner_->forward(draft_tokens.data(), draft_tokens.size());
+
+// After verification — determine accepted count
+int accepted = verifyDraftTokens(verify_logits, draft_tokens, draft_logits_list);
+
+// Rollback GDN state if any tokens rejected
+if (accepted < draft_tokens.size()) {
+    // Restore GDN state to pre-draft checkpoint
     for (auto& gdn_layer : gdn_layers) {
         gdn_layer->restoreState();  // Copy S_checkpoint → S
     }
-    // Then re-apply only the accepted tokens' state updates
-    for (int i = 0; i < accepted_count; ++i) {
-        gdn_layer->updateState(accepted_tokens[i]);
+    // Re-apply only accepted tokens through GDN layers
+    // (FA layers are handled by KV cache truncation)
+    for (int i = 0; i < accepted; ++i) {
+        runner_->forwardGDNOnly(&accepted_tokens[i], 1);
     }
+    // Truncate FA KV cache
+    runner_->truncateKVCache(current_position_ + accepted);
 }
 ```
+
+**Memory cost**: For Qwen 3.5 0.8B with 18 GDN layers, d_k=64, d_v=128, n_kv_heads=4:
+- State per layer: 4 × 64 × 128 × 4 bytes = 128 KB
+- Total checkpoint: 18 × 128 KB = **2.25 MB** (negligible)
+- Plus conv1d state: 18 × (QKV_dim × conv_kernel) ≈ 1 MB
+
+For Qwen 3.5 4B: ~16 MB total (still negligible vs model size).
+
+#### Strategy B: Two-Phase Decode (Simpler but Slower)
+
+From llama.cpp PR #20700: Only run accepted tokens through the main model, never speculative tokens:
+
+```
+Phase 1 (Draft): Use MTP head only (no main model GDN involvement)
+  - h_main is from the PREVIOUS verified decode step
+  - MTP head processes draft token → draft logits
+  
+Phase 2 (Verify): Run ONLY the first draft token through main model
+  - If accepted, run next draft token, etc.
+  - Stop at first rejection
+  - GDN state is never exposed to rejected tokens
+```
+
+**Downside**: This is essentially serial — you lose the parallel verification benefit. Net speedup drops to ~1.3× vs 1.8× theoretical. The llama.cpp PR reports ~15 tok/s with full MTP setup.
+
+### Conv1d State Rollback
+
+GDN layers also have a short conv1d (kernel size 4) that maintains state across tokens. This must be checkpointed alongside the recurrent state `S`:
+
+```cpp
+struct GDNLayerCheckpoint {
+    std::vector<float> recurrence_state;  // S matrix: [n_heads, d_k, d_v]
+    std::vector<float> conv1d_state;      // Conv buffer: [d_qkv, kernel_size-1]
+};
+```
+
+### Recommendation
+
+**Start with Strategy A (checkpoint/restore)**. The memory overhead is trivial (2-16 MB), the implementation is straightforward (memcpy before draft, memcpy back on rejection), and it preserves the full MTP speedup. Strategy B should be a fallback if Strategy A proves too complex to integrate with the current GDN pipeline.
 
 ### Dependency Between Phases
 
 ```
-GDN Project Plan                    MTP Project Plan
-────────────────                    ────────────────
-Phase 1: Python reference     ───→  Phase 10: MTP weight loading
-Phase 2: GGUF loading         ───→  Phase 10: MTP weight loading
-Phase 3: New tensor types            (independent)
-Phase 4: Graph schema + stages ───→  Phase 11: MTP graph stages
-Phase 5: CPU reference kernels       (independent)
-Phase 6: Optimized kernels           (independent)
-Phase 7: MoE integration            (independent)
-Phase 8: E2E validation       ───→  Phase 15: E2E MTP validation
+GDN Project Plan (Complete)         MTP Project Plan
+───────────────────────────         ────────────────
+GDN stages + kernels          ───→  Phase 11: MTP graph stages (reuses FA infra)
+GGUF loading                  ───→  Phase 10: MTP weight loading (new mtp.* tensors)
+GDN state management          ───→  Phase 9.5: GDN State Checkpointing (new)
 
                                Phase 9: KV cache rollback      (can start immediately)
-                               Phase 12: Speculative decode     (needs Phase 9, 11, 13)
+                               Phase 9.5: GDN state checkpoint  (after GDN is stable)
+                               Phase 12: Speculative decode     (needs Phase 9, 9.5, 11, 13)
                                Phase 13: LM head multi-pos      (can start immediately)
                                Phase 14: Verification           (can start immediately)
 ```
 
-**Critical path**: Phase 9 (KV rollback) and Phase 13 (LM head multi-position) can start **immediately** as they don't depend on GDN. Phase 12 (the decode loop) integrates everything and is the final piece.
+**Critical path**: Phase 9 (KV rollback) and Phase 13 (LM head multi-position) can start **immediately** as they don't depend on GDN. Phase 9.5 (GDN state checkpointing) is the new critical dependency. Phase 12 (the decode loop) integrates everything and is the final piece.
+
+---
+
+## FastMTP Optimization (Vocabulary Trimming)
+
+### Overview
+
+The LM head projection (d → vocab_size) is the most expensive part of the MTP draft step because Qwen 3.5's vocabulary is **151,936 tokens**. The LM head GEMM (`1 × d × vocab_size`) takes ~10ms on CPU, dominating the draft generation overhead that should ideally be < 1ms.
+
+### The FastMTP Technique
+
+From llama.cpp PR #20700: Instead of computing full logits over the entire vocabulary, restrict the LM head to only the **top-K most likely tokens** based on the main model's logits:
+
+```
+1. Main model forward → full logits (151,936 tokens)
+2. Sort to find top 32,768 tokens (by logit value)
+3. Create a trimmed LM head view: only compute logits for these 32K tokens
+4. MTP head forward → trimmed logits (32K tokens, not 152K)
+5. Sample draft token from trimmed distribution
+```
+
+### Expected Performance
+
+| Configuration | LM Head Size | Draft Time | Notes |
+|---------------|-------------|------------|-------|
+| Full vocabulary | 151,936 | ~10ms | Baseline |
+| Top 32K (FastMTP) | 32,768 | ~2.1ms | 4.8× faster draft |
+| Top 16K | 16,384 | ~1.1ms | 9× faster, may lose accuracy |
+
+**Accuracy impact**: Negligible. llama.cpp testing showed no measurable accuracy loss with top 32K trimming — the draft only needs to predict the *most likely* next token, and rare tokens are never in the draft anyway.
+
+### Implementation
+
+```cpp
+// In MTP draft step:
+// 1. Get main model's top-K token indices
+auto top_k_indices = getTopKIndices(main_logits, vocab_size, 32768);
+
+// 2. Create a view of the embedding/LM-head matrix for only these tokens
+auto trimmed_lm_head = createTrimmedView(embedding_weight, top_k_indices);
+
+// 3. MTP forward produces logits over trimmed vocabulary
+auto draft_logits = mtpForward(h', trimmed_lm_head);  // (1, 32K) instead of (1, 152K)
+
+// 4. Sample from trimmed distribution
+int draft_token_idx = sample(draft_logits, 32768);
+int draft_token = top_k_indices[draft_token_idx];
+```
+
+### Priority
+
+FastMTP is an **optimization**, not a correctness requirement. Implement after the basic MTP pipeline is working (Phase 15+). With D=1, the draft only requires one LM head call, so the baseline without FastMTP is still viable.
 
 ---
 
@@ -1006,14 +1252,16 @@ Phase 8: E2E validation       ───→  Phase 15: E2E MTP validation
 
 | Risk | Impact | Likelihood | Mitigation |
 |------|--------|------------|------------|
-| Qwen3-Next doesn't actually use MTP | Wasted MTP work | Low | MTP infrastructure benefits any model; DeepSeek-V3 uses it |
-| GGUF format for MTP weights not standardized | Blocks weight loading | Medium | Start with DeepSeek-V3 GGUF format; adapt later |
-| GDN state rollback is expensive | Reduces MTP speedup for GDN layers | Low | Checkpoint/restore is cheap (small state) |
+| ~~Qwen3-Next doesn't use MTP~~ | ~~Wasted work~~ | ~~N/A~~ | **Resolved**: Qwen 3.5 confirmed with `mtp_num_hidden_layers: 1` across all dense models |
+| GGUF format for MTP weights not standardized | Blocks weight loading | Medium | HF names confirmed; llama.cpp PR #20700 converging on naming; implement flexible mapper |
+| **GDN recurrent state cannot be partially rolled back** | **Fundamental challenge for MTP on hybrid models** | **Confirmed** | Checkpoint/restore (2-16 MB memory cost) or two-phase decode (1.3× vs 1.8× speedup) |
+| Conv1d state rollback adds complexity | Implementation effort | Low | Checkpoint conv buffer alongside recurrence state |
 | Stochastic speculative sampling is tricky | Incorrect token distribution | Medium | Start with greedy-only; add stochastic later |
-| MTP head accuracy degrades with quantization | Low acceptance rate | Medium | Test with various quantization levels |
-| Multi-token LM head computation in verification is expensive | Reduces net MTP benefit | Low | Only D+1 tokens max; GEMM is efficient for small M |
-| MTP adds complexity to the decode loop | Maintenance burden | Medium | Clean abstraction with `SpeculativeAcceptor` |
-| D > 1 (multiple MTP depths) adds cascading complexity | Harder to test/debug | Low | Start with D=1 only; design for extensibility |
+| MTP head accuracy degrades with quantization | Low acceptance rate (40-60% vs 80-90%) | High | Keep MTP weights at higher precision (F16/Q8); FastMTP helps by reducing vocab |
+| Multi-token LM head computation in verification | Reduces net MTP benefit | Low | Only D+1 tokens max; FastMTP (top-32K vocab) for draft step |
+| MTP adds complexity to the decode loop | Maintenance burden | Medium | Clean abstraction with `SpeculativeAcceptor`; `--no-mtp` flag for fallback |
+| D > 1 (multiple MTP depths) adds complexity | Harder to test/debug | Low | All Qwen 3.5 models use D=1; design for extensibility but don't over-engineer |
+| Partial RoPE position tracking in MTP block | MTP attention sees different position offsets than main model | Medium | MTP position = main model position + 1 (offset for the draft token) |
 
 ---
 
@@ -1021,15 +1269,17 @@ Phase 8: E2E validation       ───→  Phase 15: E2E MTP validation
 
 | Priority | Phase | Rationale | Dependencies |
 |----------|-------|-----------|--------------|
-| 1 | **Phase 9**: KV Cache Rollback | Prerequisite for everything; no external dependencies | None |
+| 1 | **Phase 9**: KV Cache Rollback | Prerequisite for FA layer rollback; no external dependencies | None |
 | 2 | **Phase 13**: LM Head Multi-Position | Prerequisite for verification; simple change | None |
 | 3 | **Phase 14**: Verification/Acceptance | Core algorithm; can be unit tested independently | None |
-| 4 | **Phase 10**: MTP Weight Loading | Needed once GGUF models exist | GDN Phase 2 (GGUF) |
-| 5 | **Phase 11**: MTP Graph Stages | MTP forward pass | Phase 10, GDN Phase 4 |
-| 6 | **Phase 12**: Speculative Decode Loop | Integrates all pieces | Phase 9, 11, 13, 14 |
-| 7 | **Phase 15**: E2E Validation | Confirms correctness + measures speedup | Phase 12 |
+| 4 | **Phase 9.5**: GDN State Checkpointing | Prerequisite for GDN rollback on rejection | GDN support stable |
+| 5 | **Phase 10**: MTP Weight Loading | Needed once GGUF models exist | GGUF naming standardized |
+| 6 | **Phase 11**: MTP Graph Stages | MTP forward pass (reuses FA infra heavily) | Phase 10 |
+| 7 | **Phase 12**: Speculative Decode Loop | Integrates all pieces | Phase 9, 9.5, 11, 13, 14 |
+| 8 | **Phase 15**: E2E Validation | Confirms correctness + measures speedup | Phase 12 |
+| 9 | **FastMTP**: Vocabulary Trimming | Optimization: 5× faster draft via top-32K vocab | Phase 12 working |
 
-**Parallelism**: Phases 9, 13, and 14 can all be developed **in parallel** and **immediately**, before any GDN work completes.
+**Parallelism**: Phases 9, 13, and 14 can all be developed **in parallel** and **immediately**, before any MTP-specific work. Phase 9.5 (GDN state checkpoint) depends on GDN support being stable but is independent of Phases 10-14.
 
 ---
 
@@ -1037,9 +1287,15 @@ Phase 8: E2E validation       ───→  Phase 15: E2E MTP validation
 
 | Resource | URL | Notes |
 |----------|-----|-------|
+| **Qwen 3.5 Model Card** | https://huggingface.co/Qwen/Qwen3.5-0.8B | Confirmed MTP config, weight names |
+| **Qwen 3.5 config.json** | https://huggingface.co/Qwen/Qwen3.5-0.8B/blob/main/config.json | `mtp_num_hidden_layers: 1`, `mtp_use_dedicated_embeddings: false` |
+| **Qwen 3.5 safetensors index** | https://huggingface.co/Qwen/Qwen3.5-0.8B/raw/main/model.safetensors.index.json | Confirmed all `mtp.*` weight names |
+| **HF modular_qwen3_5.py** | https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen3_5/modular_qwen3_5.py | Reference Python implementation (ignores MTP by default) |
+| **HF modular_qwen3_next.py** | https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen3_next/modular_qwen3_next.py | Base model with MTP class definitions |
+| **llama.cpp MTP PR #20700** | https://github.com/ggml-org/llama.cpp/pull/20700 | Dense Qwen 3.5 MTP: full attention, FastMTP vocab trimming, DeltaNet challenges |
+| **vLLM Qwen3NextMTP** | https://github.com/vllm-project/vllm/issues/35031 | vLLM MTP implementation, `eh_proj` weight mapping issues |
 | Meta MTP Paper | https://arxiv.org/abs/2404.19737 | "Better & faster LLMs via multi-token prediction" |
 | DeepSeek-V3 Technical Report | https://arxiv.org/abs/2412.19437 | Section 2.2: MTP architecture; Section 5.4.3: inference results |
-| DeepSeek-V3 Inference Code | https://github.com/deepseek-ai/DeepSeek-V3/blob/main/inference/model.py | Reference Transformer (no MTP module in inference code — heads are discarded) |
 | Speculative Decoding | Leviathan et al., ICML 2023 | Original speculative decoding algorithm |
 | EAGLE Speculative Decoding | Li et al., ICML 2024 | Similar causal chain approach to DeepSeek-V3 MTP |
-| Qwen3-Next GDN Plan | `docs/v2/cleanup/QWEN3NEXT_GDN_PROJECT_PLAN.md` | Companion document for GDN attention support |
+| Qwen 3.5 GDN Plan | `docs/v2/cleanup/QWEN3NEXT_GDN_PROJECT_PLAN.md` | Companion document for GDN attention support |

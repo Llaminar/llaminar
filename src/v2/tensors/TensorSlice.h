@@ -313,6 +313,16 @@ namespace llaminar2
         }
 
         // =======================================================================
+        // GPU Data Pointer (delegate to inner)
+        // =======================================================================
+        // CRITICAL: ensureOnDevice() delegates to inner, which sets inner's
+        // gpu_data_ptr_. Without this override, TensorSlice's own gpu_data_ptr_
+        // remains null, causing GPU stages to receive null device pointers.
+
+        void *gpu_data_ptr() override { return inner()->gpu_data_ptr(); }
+        const void *gpu_data_ptr() const override { return inner()->gpu_data_ptr(); }
+
+        // =======================================================================
         // Type Conversion (delegate to inner)
         // =======================================================================
 

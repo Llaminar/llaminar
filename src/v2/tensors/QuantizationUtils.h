@@ -274,6 +274,95 @@ namespace llaminar2::quantization
      * @param K Number of input features (columns in original weight matrix)
      * @param N Number of output features (rows in original weight matrix)
      */
+    inline void dequantize_vnni_packed_block_scalar(
+        const int8_t *packed_data, float *output_fp32,
+        float scale, float min_val, int k_start, int k_end, int row_idx, int N)
+    {
+        for (int k = k_start; k < k_end; ++k)
+        {
+            int group = k / 4;
+            int offset = k % 4;
+            int8_t q = packed_data[group * (N * 4) + row_idx * 4 + offset];
+            output_fp32[k] = static_cast<float>(q) * scale + min_val;
+        }
+    }
+
+#if defined(__AVX2__)
+    inline void dequantize_vnni_packed_block_avx2(
+        const int8_t *packed_data, float *output_fp32,
+        float scale, float min_val, int k_start, int k_end, int row_idx, int N)
+    {
+        const __m256 scale_vec = _mm256_set1_ps(scale);
+        const __m256 min_vec = _mm256_set1_ps(min_val);
+
+        int k = k_start;
+        for (; k + 8 <= k_end; k += 8)
+        {
+            alignas(32) int8_t temp[8];
+            for (int i = 0; i < 8; ++i)
+            {
+                int kk = k + i;
+                int group = kk / 4;
+                int offset = kk % 4;
+                temp[i] = packed_data[group * (N * 4) + row_idx * 4 + offset];
+            }
+
+            __m128i q8 = _mm_loadl_epi64(reinterpret_cast<const __m128i *>(temp));
+            __m256i i32 = _mm256_cvtepi8_epi32(q8);
+            __m256 f32 = _mm256_cvtepi32_ps(i32);
+
+            __m256 result = _mm256_fmadd_ps(f32, scale_vec, min_vec);
+            _mm256_storeu_ps(output_fp32 + k, result);
+        }
+        // Scalar tail
+        for (; k < k_end; ++k)
+        {
+            int group = k / 4;
+            int offset = k % 4;
+            int8_t q = packed_data[group * (N * 4) + row_idx * 4 + offset];
+            output_fp32[k] = static_cast<float>(q) * scale + min_val;
+        }
+    }
+#endif
+
+#if defined(__AVX512F__)
+    inline void dequantize_vnni_packed_block_avx512(
+        const int8_t *packed_data, float *output_fp32,
+        float scale, float min_val, int k_start, int k_end, int row_idx, int N)
+    {
+        const __m512 scale_vec = _mm512_set1_ps(scale);
+        const __m512 min_vec = _mm512_set1_ps(min_val);
+
+        int k = k_start;
+        for (; k + 16 <= k_end; k += 16)
+        {
+            alignas(64) int8_t temp[16];
+            for (int i = 0; i < 16; ++i)
+            {
+                int kk = k + i;
+                int group = kk / 4;
+                int offset = kk % 4;
+                temp[i] = packed_data[group * (N * 4) + row_idx * 4 + offset];
+            }
+
+            __m128i q8 = _mm_loadu_si128(reinterpret_cast<const __m128i *>(temp));
+            __m512i i32 = _mm512_cvtepi8_epi32(q8);
+            __m512 f32 = _mm512_cvtepi32_ps(i32);
+
+            __m512 result = _mm512_fmadd_ps(f32, scale_vec, min_vec);
+            _mm512_storeu_ps(output_fp32 + k, result);
+        }
+        // Scalar tail
+        for (; k < k_end; ++k)
+        {
+            int group = k / 4;
+            int offset = k % 4;
+            int8_t q = packed_data[group * (N * 4) + row_idx * 4 + offset];
+            output_fp32[k] = static_cast<float>(q) * scale + min_val;
+        }
+    }
+#endif
+
     inline void dequantize_vnni_packed_row_to_fp32(
         const int8_t *packed_data,
         const float *scales,
@@ -285,116 +374,19 @@ namespace llaminar2::quantization
     {
         const int k_blocks = (K + 31) / 32;
 
-        // Process each block of 32 K elements
         for (int k_blk = 0; k_blk < k_blocks; ++k_blk)
         {
-            // Get scale and min for this block
-            // scales/mins layout: [K/32][N], so index is k_blk * N + row_idx
             const float scale = scales[k_blk * N + row_idx];
             const float min_val = mins ? mins[k_blk * N + row_idx] : 0.0f;
-
-            // Dequantize 32 elements from packed format
-            // packed_data layout: [K/4][N][4]
-            // For a given k in [0, K), the packed index is:
-            //   group = k / 4
-            //   offset_in_group = k % 4
-            //   packed_idx = group * (N * 4) + row_idx * 4 + offset_in_group
             const int k_start = k_blk * 32;
             const int k_end = std::min(k_start + 32, K);
 
-#ifdef __AVX512F__
-            // AVX-512 optimized path: process 16 elements at a time
-            const __m512 scale_vec = _mm512_set1_ps(scale);
-            const __m512 min_vec = _mm512_set1_ps(min_val);
-
-            for (int k = k_start; k < k_end; k += 16)
-            {
-                int elements_left = k_end - k;
-                if (elements_left >= 16)
-                {
-                    // Load 16 INT8 values from packed format (scattered)
-                    alignas(64) int8_t temp[16];
-                    for (int i = 0; i < 16; ++i)
-                    {
-                        int kk = k + i;
-                        int group = kk / 4;
-                        int offset = kk % 4;
-                        temp[i] = packed_data[group * (N * 4) + row_idx * 4 + offset];
-                    }
-
-                    // Convert INT8 -> INT32 -> FP32
-                    __m128i q8 = _mm_loadu_si128(reinterpret_cast<const __m128i *>(temp));
-                    __m512i i32 = _mm512_cvtepi8_epi32(q8);
-                    __m512 f32 = _mm512_cvtepi32_ps(i32);
-
-                    // Dequantize: fp32 = q8 * scale + min
-                    __m512 result = _mm512_fmadd_ps(f32, scale_vec, min_vec);
-                    _mm512_storeu_ps(output_fp32 + k, result);
-                }
-                else
-                {
-                    // Handle remaining elements scalar
-                    for (int i = 0; i < elements_left; ++i)
-                    {
-                        int kk = k + i;
-                        int group = kk / 4;
-                        int offset = kk % 4;
-                        int8_t q = packed_data[group * (N * 4) + row_idx * 4 + offset];
-                        output_fp32[kk] = static_cast<float>(q) * scale + min_val;
-                    }
-                }
-            }
+#if defined(__AVX512F__)
+            dequantize_vnni_packed_block_avx512(packed_data, output_fp32, scale, min_val, k_start, k_end, row_idx, N);
 #elif defined(__AVX2__)
-            // AVX2 optimized path: process 8 elements at a time
-            const __m256 scale_vec = _mm256_set1_ps(scale);
-            const __m256 min_vec = _mm256_set1_ps(min_val);
-
-            for (int k = k_start; k < k_end; k += 8)
-            {
-                int elements_left = k_end - k;
-                if (elements_left >= 8)
-                {
-                    // Load 8 INT8 values from packed format
-                    alignas(32) int8_t temp[8];
-                    for (int i = 0; i < 8; ++i)
-                    {
-                        int kk = k + i;
-                        int group = kk / 4;
-                        int offset = kk % 4;
-                        temp[i] = packed_data[group * (N * 4) + row_idx * 4 + offset];
-                    }
-
-                    // Convert INT8 -> INT32 -> FP32
-                    __m128i q8 = _mm_loadl_epi64(reinterpret_cast<const __m128i *>(temp));
-                    __m256i i32 = _mm256_cvtepi8_epi32(q8);
-                    __m256 f32 = _mm256_cvtepi32_ps(i32);
-
-                    // Dequantize: fp32 = q8 * scale + min
-                    __m256 result = _mm256_fmadd_ps(f32, scale_vec, min_vec);
-                    _mm256_storeu_ps(output_fp32 + k, result);
-                }
-                else
-                {
-                    // Handle remaining elements scalar
-                    for (int i = 0; i < elements_left; ++i)
-                    {
-                        int kk = k + i;
-                        int group = kk / 4;
-                        int offset = kk % 4;
-                        int8_t q = packed_data[group * (N * 4) + row_idx * 4 + offset];
-                        output_fp32[kk] = static_cast<float>(q) * scale + min_val;
-                    }
-                }
-            }
+            dequantize_vnni_packed_block_avx2(packed_data, output_fp32, scale, min_val, k_start, k_end, row_idx, N);
 #else
-            // Scalar fallback
-            for (int k = k_start; k < k_end; ++k)
-            {
-                int group = k / 4;
-                int offset = k % 4;
-                int8_t q = packed_data[group * (N * 4) + row_idx * 4 + offset];
-                output_fp32[k] = static_cast<float>(q) * scale + min_val;
-            }
+            dequantize_vnni_packed_block_scalar(packed_data, output_fp32, scale, min_val, k_start, k_end, row_idx, N);
 #endif
         }
     }

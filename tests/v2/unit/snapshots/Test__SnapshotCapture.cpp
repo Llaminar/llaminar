@@ -471,3 +471,75 @@ TEST_F(Test__SnapshotCapture_Routing, ShapeMetadataPreserved)
     EXPECT_EQ(snap->cols, 8u);
     EXPECT_EQ(snap->data.size(), 32u);
 }
+
+// =========================================================================
+// Regression: GDN suffix matching order (Bug #2)
+//
+// Bug: SnapshotCapture used an unordered_map for suffix→key mapping.
+// The stage name "layer0_gdn_wo_allreduce" matched the shorter suffix
+// "_wo_allreduce" first (hash order), extracting prefix "layer0_gdn"
+// → key "layer0_gdn_ATTENTION_OUTPUT" instead of the correct
+// "layer0_ATTENTION_OUTPUT".
+//
+// Fix: Changed to ordered vector with longest-suffix-first matching,
+// so "_gdn_wo_allreduce" matches before "_wo_allreduce".
+// =========================================================================
+
+TEST(Test__SnapshotCapture_KeyConversion, GDNStages)
+{
+    // GDN-specific stage names
+    EXPECT_EQ(SnapshotCapture::convertStageNameToSnapshotKey("layer0_gdn_proj"),
+              "layer0_QKV_PROJECTION");
+    EXPECT_EQ(SnapshotCapture::convertStageNameToSnapshotKey("layer0_gdn_recurrence"),
+              "layer0_GDN_DELTA_RULE_OUTPUT");
+    EXPECT_EQ(SnapshotCapture::convertStageNameToSnapshotKey("layer0_gated_norm"),
+              "layer0_GDN_NORM_GATE_OUTPUT");
+    EXPECT_EQ(SnapshotCapture::convertStageNameToSnapshotKey("layer0_gdn_out_proj"),
+              "layer0_ATTENTION_OUTPUT");
+}
+
+TEST(Test__SnapshotCapture_KeyConversion, GDNWoAllreduceSuffixMatchesBeforeWoAllreduce)
+{
+    // THE regression test: "_gdn_wo_allreduce" must match BEFORE "_wo_allreduce"
+    // so the prefix is "layer0" (not "layer0_gdn")
+    auto key = SnapshotCapture::convertStageNameToSnapshotKey("layer0_gdn_wo_allreduce");
+    EXPECT_EQ(key, "layer0_ATTENTION_OUTPUT")
+        << "Bug: '_gdn_wo_allreduce' matched '_wo_allreduce' suffix, "
+           "producing 'layer0_gdn_ATTENTION_OUTPUT' instead of 'layer0_ATTENTION_OUTPUT'";
+
+    // Also verify the shorter suffix still works for non-GDN stages
+    auto key2 = SnapshotCapture::convertStageNameToSnapshotKey("layer0_wo_allreduce");
+    EXPECT_EQ(key2, "layer0_ATTENTION_OUTPUT")
+        << "'_wo_allreduce' should still map to ATTENTION_OUTPUT for FA layers";
+}
+
+TEST(Test__SnapshotCapture_KeyConversion, GDNSuffixMatchingAcrossLayers)
+{
+    // Verify suffix ordering works for all layer indices, not just layer0
+    EXPECT_EQ(SnapshotCapture::convertStageNameToSnapshotKey("layer5_gdn_wo_allreduce"),
+              "layer5_ATTENTION_OUTPUT");
+    EXPECT_EQ(SnapshotCapture::convertStageNameToSnapshotKey("layer23_gdn_wo_allreduce"),
+              "layer23_ATTENTION_OUTPUT");
+
+    // The bug was visible across ALL GDN layers, not just layer 0
+    EXPECT_EQ(SnapshotCapture::convertStageNameToSnapshotKey("layer17_gdn_proj"),
+              "layer17_QKV_PROJECTION");
+    EXPECT_EQ(SnapshotCapture::convertStageNameToSnapshotKey("layer17_gdn_recurrence"),
+              "layer17_GDN_DELTA_RULE_OUTPUT");
+}
+
+TEST(Test__SnapshotCapture_KeyConversion, LongestSuffixMatchesFirst)
+{
+    // Verify that the longest/most-specific suffix always wins.
+    // "_down_allreduce" must match before "_allreduce" (if such shorter suffix existed)
+    EXPECT_EQ(SnapshotCapture::convertStageNameToSnapshotKey("layer0_down_allreduce"),
+              "layer0_FFN_DOWN");
+
+    // "_gdn_out_proj" must match before "_out_proj" or "_proj"
+    EXPECT_EQ(SnapshotCapture::convertStageNameToSnapshotKey("layer0_gdn_out_proj"),
+              "layer0_ATTENTION_OUTPUT");
+
+    // "_wo_proj" must not be confused with "_q_proj"
+    EXPECT_EQ(SnapshotCapture::convertStageNameToSnapshotKey("layer0_wo_proj"),
+              "layer0_ATTENTION_OUTPUT");
+}

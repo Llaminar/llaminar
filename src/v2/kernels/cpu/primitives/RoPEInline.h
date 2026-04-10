@@ -35,7 +35,24 @@ namespace llaminar2
      * @param sin_cache Precomputed sin values for this position [head_dim/2]
      * @param head_dim  Head dimension (must be even)
      */
-    inline void apply_rope_to_head_inline(
+    inline void apply_rope_to_head_inline_scalar(
+        float *head_ptr,
+        const float *cos_cache,
+        const float *sin_cache,
+        int head_dim)
+    {
+        const int half_dim = head_dim / 2;
+        for (int i = 0; i < half_dim; ++i)
+        {
+            float x0 = head_ptr[i];
+            float x1 = head_ptr[i + half_dim];
+            head_ptr[i] = x0 * cos_cache[i] - x1 * sin_cache[i];
+            head_ptr[i + half_dim] = x0 * sin_cache[i] + x1 * cos_cache[i];
+        }
+    }
+
+#if defined(__AVX2__)
+    inline void apply_rope_to_head_inline_avx2(
         float *head_ptr,
         const float *cos_cache,
         const float *sin_cache,
@@ -43,23 +60,6 @@ namespace llaminar2
     {
         const int half_dim = head_dim / 2;
         int i = 0;
-
-#if defined(__AVX512F__)
-        for (; i + 16 <= half_dim; i += 16)
-        {
-            __m512 x_first = _mm512_loadu_ps(head_ptr + i);
-            __m512 x_second = _mm512_loadu_ps(head_ptr + i + half_dim);
-            __m512 cos_vec = _mm512_loadu_ps(cos_cache + i);
-            __m512 sin_vec = _mm512_loadu_ps(sin_cache + i);
-
-            _mm512_storeu_ps(head_ptr + i,
-                             _mm512_sub_ps(_mm512_mul_ps(x_first, cos_vec),
-                                           _mm512_mul_ps(x_second, sin_vec)));
-            _mm512_storeu_ps(head_ptr + i + half_dim,
-                             _mm512_add_ps(_mm512_mul_ps(x_first, sin_vec),
-                                           _mm512_mul_ps(x_second, cos_vec)));
-        }
-#elif defined(__AVX2__)
         for (; i + 8 <= half_dim; i += 8)
         {
             __m256 x_first = _mm256_loadu_ps(head_ptr + i);
@@ -74,7 +74,6 @@ namespace llaminar2
                              _mm256_add_ps(_mm256_mul_ps(x_first, sin_vec),
                                            _mm256_mul_ps(x_second, cos_vec)));
         }
-#endif
         for (; i < half_dim; ++i)
         {
             float x0 = head_ptr[i];
@@ -82,6 +81,55 @@ namespace llaminar2
             head_ptr[i] = x0 * cos_cache[i] - x1 * sin_cache[i];
             head_ptr[i + half_dim] = x0 * sin_cache[i] + x1 * cos_cache[i];
         }
+    }
+#endif
+
+#if defined(__AVX512F__)
+    inline void apply_rope_to_head_inline_avx512(
+        float *head_ptr,
+        const float *cos_cache,
+        const float *sin_cache,
+        int head_dim)
+    {
+        const int half_dim = head_dim / 2;
+        int i = 0;
+        for (; i + 16 <= half_dim; i += 16)
+        {
+            __m512 x_first = _mm512_loadu_ps(head_ptr + i);
+            __m512 x_second = _mm512_loadu_ps(head_ptr + i + half_dim);
+            __m512 cos_vec = _mm512_loadu_ps(cos_cache + i);
+            __m512 sin_vec = _mm512_loadu_ps(sin_cache + i);
+
+            _mm512_storeu_ps(head_ptr + i,
+                             _mm512_sub_ps(_mm512_mul_ps(x_first, cos_vec),
+                                           _mm512_mul_ps(x_second, sin_vec)));
+            _mm512_storeu_ps(head_ptr + i + half_dim,
+                             _mm512_add_ps(_mm512_mul_ps(x_first, sin_vec),
+                                           _mm512_mul_ps(x_second, cos_vec)));
+        }
+        for (; i < half_dim; ++i)
+        {
+            float x0 = head_ptr[i];
+            float x1 = head_ptr[i + half_dim];
+            head_ptr[i] = x0 * cos_cache[i] - x1 * sin_cache[i];
+            head_ptr[i + half_dim] = x0 * sin_cache[i] + x1 * cos_cache[i];
+        }
+    }
+#endif
+
+    inline void apply_rope_to_head_inline(
+        float *head_ptr,
+        const float *cos_cache,
+        const float *sin_cache,
+        int head_dim)
+    {
+#if defined(__AVX512F__)
+        apply_rope_to_head_inline_avx512(head_ptr, cos_cache, sin_cache, head_dim);
+#elif defined(__AVX2__)
+        apply_rope_to_head_inline_avx2(head_ptr, cos_cache, sin_cache, head_dim);
+#else
+        apply_rope_to_head_inline_scalar(head_ptr, cos_cache, sin_cache, head_dim);
+#endif
     }
 
     /**

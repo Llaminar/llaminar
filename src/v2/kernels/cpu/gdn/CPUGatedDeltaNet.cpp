@@ -30,9 +30,11 @@
 #include <cmath>
 #include <cstring>
 
-#if defined(__AVX512F__)
+#if defined(__AVX512F__) || defined(__AVX2__)
 #include <immintrin.h>
+#endif
 
+#if defined(__AVX512F__)
 // =========================================================================
 // Fast AVX-512 exp/sigmoid approximations
 //
@@ -75,9 +77,53 @@ static inline __m512 avx512_fast_sigmoid(__m512 vx)
     __m512 vone = _mm512_set1_ps(1.0f);
     return _mm512_div_ps(vone, _mm512_add_ps(vone, vexp_neg));
 }
-
 #endif
+
+#if defined(__AVX2__)
+// =========================================================================
+// Fast AVX2 exp/sigmoid approximations (8-wide YMM)
+// Same polynomial as AVX-512 version but processes 8 floats instead of 16.
+// =========================================================================
+
+static inline __m256 avx2_fast_exp(__m256 vx)
+{
+    const __m256 vlog2e = _mm256_set1_ps(1.4426950408889634f);
+    const __m256 vc0 = _mm256_set1_ps(1.0f);
+    const __m256 vc1 = _mm256_set1_ps(0.693147180559945f);
+    const __m256 vc2 = _mm256_set1_ps(0.240226506959101f);
+    const __m256 vc3 = _mm256_set1_ps(0.055504108664822f);
+    const __m256 vc4 = _mm256_set1_ps(0.009618129107629f);
+    const __m256 vc5 = _mm256_set1_ps(0.001333355814642f);
+
+    __m256 vt = _mm256_mul_ps(vx, vlog2e);
+    __m256 vn = _mm256_round_ps(vt, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+    __m256 vf = _mm256_sub_ps(vt, vn);
+
+    __m256 vpoly = _mm256_fmadd_ps(vc5, vf, vc4);
+    vpoly = _mm256_fmadd_ps(vpoly, vf, vc3);
+    vpoly = _mm256_fmadd_ps(vpoly, vf, vc2);
+    vpoly = _mm256_fmadd_ps(vpoly, vf, vc1);
+    vpoly = _mm256_fmadd_ps(vpoly, vf, vc0);
+
+    // Reconstruct 2^n via IEEE754 exponent field
+    __m256i vi_n = _mm256_cvtps_epi32(vn);
+    vi_n = _mm256_add_epi32(vi_n, _mm256_set1_epi32(127));
+    __m256 v2n = _mm256_castsi256_ps(_mm256_slli_epi32(vi_n, 23));
+    return _mm256_mul_ps(vpoly, v2n);
+}
+
+static inline __m256 avx2_fast_sigmoid(__m256 vx)
+{
+    __m256 vneg = _mm256_sub_ps(_mm256_setzero_ps(), vx);
+    __m256 vexp_neg = avx2_fast_exp(vneg);
+    __m256 vone = _mm256_set1_ps(1.0f);
+    return _mm256_div_ps(vone, _mm256_add_ps(vone, vexp_neg));
+}
+#endif
+
 #include <vector>
+
+#include "../simd/AVX2Helpers.h"
 
 namespace llaminar2
 {
@@ -128,6 +174,91 @@ namespace llaminar2
         }
     }
 
+    // Named ISA implementations: l2normalize_vec (single vector)
+    static void l2normalize_vec_scalar(float *vec, int head_dim, float eps)
+    {
+        float norm_sq = 0.0f;
+        for (int d = 0; d < head_dim; ++d)
+            norm_sq += vec[d] * vec[d];
+        const float inv_norm = 1.0f / std::max(std::sqrt(norm_sq), eps);
+        for (int d = 0; d < head_dim; ++d)
+            vec[d] *= inv_norm;
+    }
+
+#if defined(__AVX2__)
+    static void l2normalize_vec_avx2(float *vec, int head_dim, float eps)
+    {
+        const int hd_vec = head_dim & ~7;
+        __m256 vsum = _mm256_setzero_ps();
+        int d = 0;
+        for (; d < hd_vec; d += 8)
+        {
+            __m256 vv = _mm256_loadu_ps(vec + d);
+            vsum = _mm256_fmadd_ps(vv, vv, vsum);
+        }
+        __m128 hi = _mm256_extractf128_ps(vsum, 1);
+        __m128 lo = _mm256_castps256_ps128(vsum);
+        lo = _mm_add_ps(lo, hi);
+        lo = _mm_hadd_ps(lo, lo);
+        lo = _mm_hadd_ps(lo, lo);
+        float norm_sq = _mm_cvtss_f32(lo);
+        for (; d < head_dim; ++d)
+            norm_sq += vec[d] * vec[d];
+
+        const float inv_norm = 1.0f / std::max(std::sqrt(norm_sq), eps);
+        const __m256 vinv = _mm256_set1_ps(inv_norm);
+        d = 0;
+        for (; d < hd_vec; d += 8)
+            _mm256_storeu_ps(vec + d, _mm256_mul_ps(_mm256_loadu_ps(vec + d), vinv));
+        for (; d < head_dim; ++d)
+            vec[d] *= inv_norm;
+    }
+#endif
+
+#if defined(__AVX512F__)
+    static void l2normalize_vec_avx512(float *vec, int head_dim, float eps)
+    {
+        const int hd_vec = head_dim & ~15;
+        __m512 vsum = _mm512_setzero_ps();
+        int d = 0;
+        for (; d < hd_vec; d += 16)
+        {
+            __m512 vv = _mm512_loadu_ps(vec + d);
+            vsum = _mm512_fmadd_ps(vv, vv, vsum);
+        }
+        float norm_sq = _mm512_reduce_add_ps(vsum);
+        for (; d < head_dim; ++d)
+            norm_sq += vec[d] * vec[d];
+
+        const float inv_norm = 1.0f / std::max(std::sqrt(norm_sq), eps);
+        const __m512 vinv = _mm512_set1_ps(inv_norm);
+        d = 0;
+        for (; d < hd_vec; d += 16)
+            _mm512_storeu_ps(vec + d, _mm512_mul_ps(_mm512_loadu_ps(vec + d), vinv));
+        for (; d < head_dim; ++d)
+            vec[d] *= inv_norm;
+    }
+#endif
+
+// Stubs for when ISA is unavailable at compile time
+#if !defined(__AVX2__)
+    static void l2normalize_vec_avx2(float *vec, int head_dim, float eps)
+    {
+        l2normalize_vec_scalar(vec, head_dim, eps);
+    }
+#endif
+#if !defined(__AVX512F__)
+    static void l2normalize_vec_avx512(float *vec, int head_dim, float eps)
+    {
+        l2normalize_vec_avx2(vec, head_dim, eps);
+    }
+#endif
+
+    static inline void l2normalize_vec(float *vec, int head_dim, float eps)
+    {
+        ISA_DISPATCH_VOID(l2normalize_vec, vec, head_dim, eps);
+    }
+
     void CPUGatedDeltaNet::l2normalize(float *data, int seq_len, int n_heads, int head_dim)
     {
         constexpr float eps = 1e-6f;
@@ -137,37 +268,490 @@ namespace llaminar2
             for (int h = 0; h < n_heads; ++h)
             {
                 float *vec = data + t * n_heads * head_dim + h * head_dim;
-
-#if defined(__AVX512F__)
-                const int hd_vec = head_dim & ~15;
-                __m512 vsum = _mm512_setzero_ps();
-                int d = 0;
-                for (; d < hd_vec; d += 16)
-                {
-                    __m512 vv = _mm512_loadu_ps(vec + d);
-                    vsum = _mm512_fmadd_ps(vv, vv, vsum);
-                }
-                float norm_sq = _mm512_reduce_add_ps(vsum);
-                for (; d < head_dim; ++d)
-                    norm_sq += vec[d] * vec[d];
-
-                const float inv_norm = 1.0f / std::max(std::sqrt(norm_sq), eps);
-                const __m512 vinv = _mm512_set1_ps(inv_norm);
-                d = 0;
-                for (; d < hd_vec; d += 16)
-                    _mm512_storeu_ps(vec + d, _mm512_mul_ps(_mm512_loadu_ps(vec + d), vinv));
-                for (; d < head_dim; ++d)
-                    vec[d] *= inv_norm;
-#else
-                float norm_sq = 0.0f;
-                for (int d = 0; d < head_dim; ++d)
-                    norm_sq += vec[d] * vec[d];
-                const float inv_norm = 1.0f / std::max(std::sqrt(norm_sq), eps);
-                for (int d = 0; d < head_dim; ++d)
-                    vec[d] *= inv_norm;
-#endif
+                l2normalize_vec(vec, head_dim, eps);
             }
         }
+    }
+
+    // =========================================================================
+    // Named ISA implementations: QK preprocessing helpers
+    // (shared between recurrent_step and chunk_forward)
+    // =========================================================================
+
+    // L2-normalize Q with fused scale, L2-normalize K (no scale)
+    static void gdn_preprocess_qk_l2norm_scalar(
+        const float *q_src, const float *k_src,
+        float *q_dst, float *k_dst,
+        int dim, float scale, float eps)
+    {
+        float nq = 0.0f;
+        for (int d = 0; d < dim; ++d)
+            nq += q_src[d] * q_src[d];
+        const float inv_q = scale / std::max(std::sqrt(nq), eps);
+        for (int d = 0; d < dim; ++d)
+            q_dst[d] = q_src[d] * inv_q;
+
+        float nk = 0.0f;
+        for (int d = 0; d < dim; ++d)
+            nk += k_src[d] * k_src[d];
+        const float inv_k = 1.0f / std::max(std::sqrt(nk), eps);
+        for (int d = 0; d < dim; ++d)
+            k_dst[d] = k_src[d] * inv_k;
+    }
+
+#if defined(__AVX2__)
+    static void gdn_preprocess_qk_l2norm_avx2(
+        const float *q_src, const float *k_src,
+        float *q_dst, float *k_dst,
+        int dim, float scale, float eps)
+    {
+        avx2::l2norm_scale(q_src, q_dst, dim, scale, eps);
+        avx2::l2norm_scale(k_src, k_dst, dim, 1.0f, eps);
+    }
+#endif
+
+#if defined(__AVX512F__)
+    static void gdn_preprocess_qk_l2norm_avx512(
+        const float *q_src, const float *k_src,
+        float *q_dst, float *k_dst,
+        int dim, float scale, float eps)
+    {
+        const int hd_vec = dim & ~15;
+        // Q: fused L2-normalize + scale
+        {
+            __m512 vsum = _mm512_setzero_ps();
+            int d = 0;
+            for (; d < hd_vec; d += 16)
+            {
+                __m512 vv = _mm512_loadu_ps(q_src + d);
+                vsum = _mm512_fmadd_ps(vv, vv, vsum);
+            }
+            float norm_sq = _mm512_reduce_add_ps(vsum);
+            for (; d < dim; ++d)
+                norm_sq += q_src[d] * q_src[d];
+            const float inv = scale / std::max(std::sqrt(norm_sq), eps);
+            const __m512 vinv = _mm512_set1_ps(inv);
+            d = 0;
+            for (; d < hd_vec; d += 16)
+                _mm512_storeu_ps(q_dst + d,
+                                 _mm512_mul_ps(_mm512_loadu_ps(q_src + d), vinv));
+            for (; d < dim; ++d)
+                q_dst[d] = q_src[d] * inv;
+        }
+        // K: L2-normalize only
+        {
+            __m512 vsum = _mm512_setzero_ps();
+            int d = 0;
+            for (; d < hd_vec; d += 16)
+            {
+                __m512 vv = _mm512_loadu_ps(k_src + d);
+                vsum = _mm512_fmadd_ps(vv, vv, vsum);
+            }
+            float norm_sq = _mm512_reduce_add_ps(vsum);
+            for (; d < dim; ++d)
+                norm_sq += k_src[d] * k_src[d];
+            const float inv = 1.0f / std::max(std::sqrt(norm_sq), eps);
+            const __m512 vinv = _mm512_set1_ps(inv);
+            d = 0;
+            for (; d < hd_vec; d += 16)
+                _mm512_storeu_ps(k_dst + d,
+                                 _mm512_mul_ps(_mm512_loadu_ps(k_src + d), vinv));
+            for (; d < dim; ++d)
+                k_dst[d] = k_src[d] * inv;
+        }
+    }
+#endif
+
+// Stubs for when ISA is unavailable at compile time
+#if !defined(__AVX2__)
+    static void gdn_preprocess_qk_l2norm_avx2(
+        const float *q_src, const float *k_src,
+        float *q_dst, float *k_dst,
+        int dim, float scale, float eps)
+    {
+        gdn_preprocess_qk_l2norm_scalar(q_src, k_src, q_dst, k_dst, dim, scale, eps);
+    }
+#endif
+#if !defined(__AVX512F__)
+    static void gdn_preprocess_qk_l2norm_avx512(
+        const float *q_src, const float *k_src,
+        float *q_dst, float *k_dst,
+        int dim, float scale, float eps)
+    {
+        gdn_preprocess_qk_l2norm_avx2(q_src, k_src, q_dst, k_dst, dim, scale, eps);
+    }
+#endif
+
+    static inline void gdn_preprocess_qk_l2norm(
+        const float *q_src, const float *k_src,
+        float *q_dst, float *k_dst,
+        int dim, float scale, float eps)
+    {
+        ISA_DISPATCH_VOID(gdn_preprocess_qk_l2norm, q_src, k_src, q_dst, k_dst, dim, scale, eps);
+    }
+
+    // Scale Q, copy K unchanged
+    static void gdn_preprocess_qk_scale_scalar(
+        const float *q_src, const float *k_src,
+        float *q_dst, float *k_dst,
+        int dim, float scale)
+    {
+        for (int d = 0; d < dim; ++d)
+            q_dst[d] = q_src[d] * scale;
+        std::memcpy(k_dst, k_src, dim * sizeof(float));
+    }
+
+#if defined(__AVX2__)
+    static void gdn_preprocess_qk_scale_avx2(
+        const float *q_src, const float * /*k_src*/,
+        float *q_dst, float *k_dst,
+        int dim, float scale)
+    {
+        avx2::copy_scale(q_dst, q_src, scale, dim);
+        // k_dst filled by caller via memcpy (passed through)
+        (void)k_dst;
+    }
+#endif
+
+#if defined(__AVX512F__)
+    static void gdn_preprocess_qk_scale_avx512(
+        const float *q_src, const float * /*k_src*/,
+        float *q_dst, float * /*k_dst*/,
+        int dim, float scale)
+    {
+        const int hd_vec = dim & ~15;
+        const __m512 vscale = _mm512_set1_ps(scale);
+        int d = 0;
+        for (; d < hd_vec; d += 16)
+            _mm512_storeu_ps(q_dst + d,
+                             _mm512_mul_ps(_mm512_loadu_ps(q_src + d), vscale));
+        for (; d < dim; ++d)
+            q_dst[d] = q_src[d] * scale;
+    }
+#endif
+
+// Stubs for when ISA is unavailable at compile time
+#if !defined(__AVX2__)
+    static void gdn_preprocess_qk_scale_avx2(
+        const float *q_src, const float * /*k_src*/,
+        float *q_dst, float *k_dst,
+        int dim, float scale)
+    {
+        (void)k_dst;
+        gdn_preprocess_qk_scale_scalar(q_src, nullptr, q_dst, k_dst, dim, scale);
+    }
+#endif
+#if !defined(__AVX512F__)
+    static void gdn_preprocess_qk_scale_avx512(
+        const float *q_src, const float * /*k_src*/,
+        float *q_dst, float * /*k_dst*/,
+        int dim, float scale)
+    {
+        gdn_preprocess_qk_scale_avx2(q_src, nullptr, q_dst, nullptr, dim, scale);
+    }
+#endif
+
+    static inline void gdn_preprocess_qk_scale(
+        const float *q_src, const float *k_src,
+        float *q_dst, float *k_dst,
+        int dim, float scale)
+    {
+        switch (activeISALevel())
+        {
+        case ISALevel::AVX512:
+            gdn_preprocess_qk_scale_avx512(q_src, k_src, q_dst, k_dst, dim, scale);
+            std::memcpy(k_dst, k_src, dim * sizeof(float));
+            break;
+        case ISALevel::AVX2:
+            gdn_preprocess_qk_scale_avx2(q_src, k_src, q_dst, k_dst, dim, scale);
+            std::memcpy(k_dst, k_src, dim * sizeof(float));
+            break;
+        default:
+            gdn_preprocess_qk_scale_scalar(q_src, k_src, q_dst, k_dst, dim, scale);
+            break;
+        }
+    }
+
+    // =========================================================================
+    // Named ISA implementations: core delta recurrence (5-step)
+    // =========================================================================
+
+    static void gdn_delta_recurrence_scalar(
+        float *S, const float *q, const float *k, const float *v,
+        float *o, float decay, float beta, int d_k, int d_v)
+    {
+        // Step 1: Decay state
+        for (int ij = 0; ij < d_k * d_v; ++ij)
+            S[ij] *= decay;
+
+        // Step 2: kv_mem = S^T * k
+        alignas(64) float kv_mem[512];
+        std::memset(kv_mem, 0, d_v * sizeof(float));
+        for (int j = 0; j < d_k; ++j)
+        {
+            const float k_j = k[j];
+            for (int vi = 0; vi < d_v; ++vi)
+                kv_mem[vi] += S[j * d_v + vi] * k_j;
+        }
+
+        // Step 3: delta = (v - kv_mem) * beta
+        alignas(64) float delta[512];
+        for (int vi = 0; vi < d_v; ++vi)
+            delta[vi] = (v[vi] - kv_mem[vi]) * beta;
+
+        // Step 4: S += outer(k, delta)
+        for (int j = 0; j < d_k; ++j)
+        {
+            const float k_j = k[j];
+            for (int vi = 0; vi < d_v; ++vi)
+                S[j * d_v + vi] += k_j * delta[vi];
+        }
+
+        // Step 5: output = S^T * q
+        std::memset(o, 0, d_v * sizeof(float));
+        for (int j = 0; j < d_k; ++j)
+        {
+            const float q_j = q[j];
+            for (int vi = 0; vi < d_v; ++vi)
+                o[vi] += S[j * d_v + vi] * q_j;
+        }
+    }
+
+#if defined(__AVX2__)
+    static void gdn_delta_recurrence_avx2(
+        float *S, const float *q, const float *k, const float *v,
+        float *o, float decay, float beta, int d_k, int d_v)
+    {
+        avx2::scale(S, d_k * d_v, decay);
+
+        alignas(64) float kv_mem[512];
+        avx2::zero(kv_mem, d_v);
+        for (int j = 0; j < d_k; ++j)
+            avx2::axpy(kv_mem, S + j * d_v, k[j], d_v);
+
+        alignas(64) float delta[512];
+        avx2::sub_mul(delta, v, kv_mem, beta, d_v);
+
+        for (int j = 0; j < d_k; ++j)
+            avx2::axpy(S + j * d_v, delta, k[j], d_v);
+
+        avx2::zero(o, d_v);
+        for (int j = 0; j < d_k; ++j)
+            avx2::axpy(o, S + j * d_v, q[j], d_v);
+    }
+#endif
+
+#if defined(__AVX512F__)
+    static void gdn_delta_recurrence_avx512(
+        float *S, const float *q, const float *k, const float *v,
+        float *o, float decay, float beta, int d_k, int d_v)
+    {
+        const int d_v_vec = d_v & ~15;
+
+        // Step 1: Decay state
+        {
+            const __m512 vdecay = _mm512_set1_ps(decay);
+            const int total = d_k * d_v;
+            const int total_vec = total & ~15;
+            int ij = 0;
+            for (; ij < total_vec; ij += 16)
+            {
+                __m512 s = _mm512_loadu_ps(S + ij);
+                _mm512_storeu_ps(S + ij, _mm512_mul_ps(s, vdecay));
+            }
+            for (; ij < total; ++ij)
+                S[ij] *= decay;
+        }
+
+        // Step 2: kv_mem = S^T * k
+        alignas(64) float kv_mem[512];
+        {
+            int vi = 0;
+            for (; vi < d_v_vec; vi += 16)
+                _mm512_store_ps(kv_mem + vi, _mm512_setzero_ps());
+            for (; vi < d_v; ++vi)
+                kv_mem[vi] = 0.0f;
+
+            for (int j = 0; j < d_k; ++j)
+            {
+                const __m512 vk = _mm512_set1_ps(k[j]);
+                const float *S_row = S + j * d_v;
+                vi = 0;
+                for (; vi < d_v_vec; vi += 16)
+                {
+                    __m512 acc = _mm512_load_ps(kv_mem + vi);
+                    __m512 sv = _mm512_loadu_ps(S_row + vi);
+                    _mm512_store_ps(kv_mem + vi, _mm512_fmadd_ps(sv, vk, acc));
+                }
+                for (; vi < d_v; ++vi)
+                    kv_mem[vi] += S_row[vi] * k[j];
+            }
+        }
+
+        // Step 3: delta = (v - kv_mem) * beta
+        alignas(64) float delta[512];
+        {
+            const __m512 vbeta = _mm512_set1_ps(beta);
+            int vi = 0;
+            for (; vi < d_v_vec; vi += 16)
+            {
+                __m512 vv = _mm512_loadu_ps(v + vi);
+                __m512 vkv = _mm512_load_ps(kv_mem + vi);
+                _mm512_store_ps(delta + vi, _mm512_mul_ps(_mm512_sub_ps(vv, vkv), vbeta));
+            }
+            for (; vi < d_v; ++vi)
+                delta[vi] = (v[vi] - kv_mem[vi]) * beta;
+        }
+
+        // Step 4: S += outer(k, delta)
+        for (int j = 0; j < d_k; ++j)
+        {
+            const __m512 vk = _mm512_set1_ps(k[j]);
+            float *S_row = S + j * d_v;
+            int vi = 0;
+            for (; vi < d_v_vec; vi += 16)
+            {
+                __m512 sv = _mm512_loadu_ps(S_row + vi);
+                __m512 vd = _mm512_load_ps(delta + vi);
+                _mm512_storeu_ps(S_row + vi, _mm512_fmadd_ps(vk, vd, sv));
+            }
+            for (; vi < d_v; ++vi)
+                S_row[vi] += k[j] * delta[vi];
+        }
+
+        // Step 5: output = S^T * q
+        {
+            int vi = 0;
+            for (; vi < d_v_vec; vi += 16)
+                _mm512_storeu_ps(o + vi, _mm512_setzero_ps());
+            for (; vi < d_v; ++vi)
+                o[vi] = 0.0f;
+
+            for (int j = 0; j < d_k; ++j)
+            {
+                const __m512 vq = _mm512_set1_ps(q[j]);
+                const float *S_row = S + j * d_v;
+                vi = 0;
+                for (; vi < d_v_vec; vi += 16)
+                {
+                    __m512 acc = _mm512_loadu_ps(o + vi);
+                    __m512 sv = _mm512_loadu_ps(S_row + vi);
+                    _mm512_storeu_ps(o + vi, _mm512_fmadd_ps(sv, vq, acc));
+                }
+                for (; vi < d_v; ++vi)
+                    o[vi] += S_row[vi] * q[j];
+            }
+        }
+    }
+#endif
+
+// Stubs for when ISA is unavailable at compile time
+#if !defined(__AVX2__)
+    static void gdn_delta_recurrence_avx2(
+        float *S, const float *q, const float *k, const float *v,
+        float *o, float decay, float beta, int d_k, int d_v)
+    {
+        gdn_delta_recurrence_scalar(S, q, k, v, o, decay, beta, d_k, d_v);
+    }
+#endif
+#if !defined(__AVX512F__)
+    static void gdn_delta_recurrence_avx512(
+        float *S, const float *q, const float *k, const float *v,
+        float *o, float decay, float beta, int d_k, int d_v)
+    {
+        gdn_delta_recurrence_avx2(S, q, k, v, o, decay, beta, d_k, d_v);
+    }
+#endif
+
+    static inline void gdn_delta_recurrence(
+        float *S, const float *q, const float *k, const float *v,
+        float *o, float decay, float beta, int d_k, int d_v)
+    {
+        ISA_DISPATCH_VOID(gdn_delta_recurrence, S, q, k, v, o, decay, beta, d_k, d_v);
+    }
+
+    // =========================================================================
+    // Named ISA implementations: batch exp + sigmoid
+    // =========================================================================
+
+    static void gdn_batch_exp_sigmoid_scalar(
+        float *gate, const float *beta_raw, float *beta_sig,
+        int base, int n_heads)
+    {
+        for (int hh = 0; hh < n_heads; ++hh)
+        {
+            gate[base + hh] = std::exp(gate[base + hh]);
+            beta_sig[base + hh] = 1.0f / (1.0f + std::exp(-beta_raw[base + hh]));
+        }
+    }
+
+#if defined(__AVX2__)
+    static void gdn_batch_exp_sigmoid_avx2(
+        float *gate, const float *beta_raw, float *beta_sig,
+        int base, int n_heads)
+    {
+        int hh = 0;
+        const int hh_vec = n_heads & ~7;
+        for (; hh < hh_vec; hh += 8)
+        {
+            __m256 vg = _mm256_loadu_ps(gate + base + hh);
+            _mm256_storeu_ps(gate + base + hh, avx2::fast_exp(vg));
+            __m256 vb = _mm256_loadu_ps(beta_raw + base + hh);
+            _mm256_storeu_ps(beta_sig + base + hh, avx2::fast_sigmoid(vb));
+        }
+        for (; hh < n_heads; ++hh)
+        {
+            gate[base + hh] = std::exp(gate[base + hh]);
+            beta_sig[base + hh] = 1.0f / (1.0f + std::exp(-beta_raw[base + hh]));
+        }
+    }
+#endif
+
+#if defined(__AVX512F__)
+    static void gdn_batch_exp_sigmoid_avx512(
+        float *gate, const float *beta_raw, float *beta_sig,
+        int base, int n_heads)
+    {
+        int hh = 0;
+        const int hh_vec = n_heads & ~15;
+        for (; hh < hh_vec; hh += 16)
+        {
+            __m512 vg = _mm512_loadu_ps(gate + base + hh);
+            _mm512_storeu_ps(gate + base + hh, avx512_fast_exp(vg));
+            __m512 vb = _mm512_loadu_ps(beta_raw + base + hh);
+            _mm512_storeu_ps(beta_sig + base + hh, avx512_fast_sigmoid(vb));
+        }
+        for (; hh < n_heads; ++hh)
+        {
+            gate[base + hh] = std::exp(gate[base + hh]);
+            beta_sig[base + hh] = 1.0f / (1.0f + std::exp(-beta_raw[base + hh]));
+        }
+    }
+#endif
+
+// Stubs for when ISA is unavailable at compile time
+#if !defined(__AVX2__)
+    static void gdn_batch_exp_sigmoid_avx2(
+        float *gate, const float *beta_raw, float *beta_sig,
+        int base, int n_heads)
+    {
+        gdn_batch_exp_sigmoid_scalar(gate, beta_raw, beta_sig, base, n_heads);
+    }
+#endif
+#if !defined(__AVX512F__)
+    static void gdn_batch_exp_sigmoid_avx512(
+        float *gate, const float *beta_raw, float *beta_sig,
+        int base, int n_heads)
+    {
+        gdn_batch_exp_sigmoid_avx2(gate, beta_raw, beta_sig, base, n_heads);
+    }
+#endif
+
+    static inline void gdn_batch_exp_sigmoid(
+        float *gate, const float *beta_raw, float *beta_sig,
+        int base, int n_heads)
+    {
+        ISA_DISPATCH_VOID(gdn_batch_exp_sigmoid, gate, beta_raw, beta_sig, base, n_heads);
     }
 
     // =========================================================================
@@ -202,85 +786,11 @@ namespace llaminar2
 
                 if (use_qk_l2norm)
                 {
-#if defined(__AVX512F__)
-                    const int hd_vec = d_k & ~15;
-                    // Q: fused L2-normalize + scale
-                    {
-                        __m512 vsum = _mm512_setzero_ps();
-                        int d = 0;
-                        for (; d < hd_vec; d += 16)
-                        {
-                            __m512 vv = _mm512_loadu_ps(q_src + d);
-                            vsum = _mm512_fmadd_ps(vv, vv, vsum);
-                        }
-                        float norm_sq = _mm512_reduce_add_ps(vsum);
-                        for (; d < d_k; ++d)
-                            norm_sq += q_src[d] * q_src[d];
-                        const float inv = scale_val / std::max(std::sqrt(norm_sq), l2_eps);
-                        const __m512 vinv = _mm512_set1_ps(inv);
-                        d = 0;
-                        for (; d < hd_vec; d += 16)
-                            _mm512_store_ps(q_local + d,
-                                            _mm512_mul_ps(_mm512_loadu_ps(q_src + d), vinv));
-                        for (; d < d_k; ++d)
-                            q_local[d] = q_src[d] * inv;
-                    }
-                    // K: L2-normalize only
-                    {
-                        __m512 vsum = _mm512_setzero_ps();
-                        int d = 0;
-                        for (; d < hd_vec; d += 16)
-                        {
-                            __m512 vv = _mm512_loadu_ps(k_src + d);
-                            vsum = _mm512_fmadd_ps(vv, vv, vsum);
-                        }
-                        float norm_sq = _mm512_reduce_add_ps(vsum);
-                        for (; d < d_k; ++d)
-                            norm_sq += k_src[d] * k_src[d];
-                        const float inv = 1.0f / std::max(std::sqrt(norm_sq), l2_eps);
-                        const __m512 vinv = _mm512_set1_ps(inv);
-                        d = 0;
-                        for (; d < hd_vec; d += 16)
-                            _mm512_store_ps(k_local + d,
-                                            _mm512_mul_ps(_mm512_loadu_ps(k_src + d), vinv));
-                        for (; d < d_k; ++d)
-                            k_local[d] = k_src[d] * inv;
-                    }
-#else
-                    {
-                        float nq = 0.0f;
-                        for (int d = 0; d < d_k; ++d)
-                            nq += q_src[d] * q_src[d];
-                        const float inv_q = scale_val / std::max(std::sqrt(nq), l2_eps);
-                        for (int d = 0; d < d_k; ++d)
-                            q_local[d] = q_src[d] * inv_q;
-                    }
-                    {
-                        float nk = 0.0f;
-                        for (int d = 0; d < d_k; ++d)
-                            nk += k_src[d] * k_src[d];
-                        const float inv_k = 1.0f / std::max(std::sqrt(nk), l2_eps);
-                        for (int d = 0; d < d_k; ++d)
-                            k_local[d] = k_src[d] * inv_k;
-                    }
-#endif
+                    gdn_preprocess_qk_l2norm(q_src, k_src, q_local, k_local, d_k, scale_val, l2_eps);
                 }
                 else
                 {
-#if defined(__AVX512F__)
-                    const int hd_vec = d_k & ~15;
-                    const __m512 vscale = _mm512_set1_ps(scale_val);
-                    int d = 0;
-                    for (; d < hd_vec; d += 16)
-                        _mm512_store_ps(q_local + d,
-                                        _mm512_mul_ps(_mm512_loadu_ps(q_src + d), vscale));
-                    for (; d < d_k; ++d)
-                        q_local[d] = q_src[d] * scale_val;
-#else
-                    for (int d = 0; d < d_k; ++d)
-                        q_local[d] = q_src[d] * scale_val;
-#endif
-                    std::memcpy(k_local, k_src, d_k * sizeof(float));
+                    gdn_preprocess_qk_scale(q_src, k_src, q_local, k_local, d_k, scale_val);
                 }
 
                 // ── Gate + beta (combined, saves one exp() call) ──
@@ -296,146 +806,7 @@ namespace llaminar2
                 const float *v_h = v + h * d_v;
                 float *o_h = output + h * d_v;
 
-#if defined(__AVX512F__)
-                // AVX-512 vectorized path — inner loops stride d_v,
-                // process 16 floats per iteration
-                const int d_v_vec = d_v & ~15; // d_v rounded down to multiple of 16
-
-                // Step 1: Decay state — S[ij] *= decay
-                {
-                    const __m512 vdecay = _mm512_set1_ps(decay);
-                    const int total = d_k * d_v;
-                    const int total_vec = total & ~15;
-                    int ij = 0;
-                    for (; ij < total_vec; ij += 16)
-                    {
-                        __m512 s = _mm512_loadu_ps(S + ij);
-                        _mm512_storeu_ps(S + ij, _mm512_mul_ps(s, vdecay));
-                    }
-                    for (; ij < total; ++ij)
-                        S[ij] *= decay;
-                }
-
-                // Step 2: kv_mem = S^T * k  (contract over d_k)
-                alignas(64) float kv_mem[512];
-                {
-                    // Zero kv_mem accumulators
-                    int vi = 0;
-                    for (; vi < d_v_vec; vi += 16)
-                        _mm512_store_ps(kv_mem + vi, _mm512_setzero_ps());
-                    for (; vi < d_v; ++vi)
-                        kv_mem[vi] = 0.0f;
-
-                    for (int j = 0; j < d_k; ++j)
-                    {
-                        const __m512 vk = _mm512_set1_ps(k_h[j]);
-                        const float *S_row = S + j * d_v;
-                        vi = 0;
-                        for (; vi < d_v_vec; vi += 16)
-                        {
-                            __m512 acc = _mm512_load_ps(kv_mem + vi);
-                            __m512 sv = _mm512_loadu_ps(S_row + vi);
-                            _mm512_store_ps(kv_mem + vi, _mm512_fmadd_ps(sv, vk, acc));
-                        }
-                        for (; vi < d_v; ++vi)
-                            kv_mem[vi] += S_row[vi] * k_h[j];
-                    }
-                }
-
-                // Step 3: delta = (v - kv_mem) * beta
-                alignas(64) float delta[512];
-                {
-                    const __m512 vbeta = _mm512_set1_ps(beta_h);
-                    int vi = 0;
-                    for (; vi < d_v_vec; vi += 16)
-                    {
-                        __m512 vv = _mm512_loadu_ps(v_h + vi);
-                        __m512 vkv = _mm512_load_ps(kv_mem + vi);
-                        _mm512_store_ps(delta + vi, _mm512_mul_ps(_mm512_sub_ps(vv, vkv), vbeta));
-                    }
-                    for (; vi < d_v; ++vi)
-                        delta[vi] = (v_h[vi] - kv_mem[vi]) * beta_h;
-                }
-
-                // Step 4: S += outer(k, delta)
-                for (int j = 0; j < d_k; ++j)
-                {
-                    const __m512 vk = _mm512_set1_ps(k_h[j]);
-                    float *S_row = S + j * d_v;
-                    int vi = 0;
-                    for (; vi < d_v_vec; vi += 16)
-                    {
-                        __m512 sv = _mm512_loadu_ps(S_row + vi);
-                        __m512 vd = _mm512_load_ps(delta + vi);
-                        _mm512_storeu_ps(S_row + vi, _mm512_fmadd_ps(vk, vd, sv));
-                    }
-                    for (; vi < d_v; ++vi)
-                        S_row[vi] += k_h[j] * delta[vi];
-                }
-
-                // Step 5: output = S^T * q  (contract over d_k)
-                {
-                    int vi = 0;
-                    for (; vi < d_v_vec; vi += 16)
-                        _mm512_storeu_ps(o_h + vi, _mm512_setzero_ps());
-                    for (; vi < d_v; ++vi)
-                        o_h[vi] = 0.0f;
-
-                    for (int j = 0; j < d_k; ++j)
-                    {
-                        const __m512 vq = _mm512_set1_ps(q_h[j]);
-                        const float *S_row = S + j * d_v;
-                        vi = 0;
-                        for (; vi < d_v_vec; vi += 16)
-                        {
-                            __m512 acc = _mm512_loadu_ps(o_h + vi);
-                            __m512 sv = _mm512_loadu_ps(S_row + vi);
-                            _mm512_storeu_ps(o_h + vi, _mm512_fmadd_ps(sv, vq, acc));
-                        }
-                        for (; vi < d_v; ++vi)
-                            o_h[vi] += S_row[vi] * q_h[j];
-                    }
-                }
-
-#else
-                // Scalar fallback
-
-                // Step 1: Decay state
-                for (int ij = 0; ij < d_k * d_v; ++ij)
-                    S[ij] *= decay;
-
-                // Step 2: kv_mem = S^T * k
-                alignas(64) float kv_mem[512];
-                std::memset(kv_mem, 0, d_v * sizeof(float));
-                for (int j = 0; j < d_k; ++j)
-                {
-                    const float k_j = k_h[j];
-                    for (int vi = 0; vi < d_v; ++vi)
-                        kv_mem[vi] += S[j * d_v + vi] * k_j;
-                }
-
-                // Step 3: delta = (v - kv_mem) * beta
-                alignas(64) float delta[512];
-                for (int vi = 0; vi < d_v; ++vi)
-                    delta[vi] = (v_h[vi] - kv_mem[vi]) * beta_h;
-
-                // Step 4: S += outer(k, delta)
-                for (int j = 0; j < d_k; ++j)
-                {
-                    const float k_j = k_h[j];
-                    for (int vi = 0; vi < d_v; ++vi)
-                        S[j * d_v + vi] += k_j * delta[vi];
-                }
-
-                // Step 5: output = S^T * q
-                std::memset(o_h, 0, d_v * sizeof(float));
-                for (int j = 0; j < d_k; ++j)
-                {
-                    const float q_j = q_h[j];
-                    for (int vi = 0; vi < d_v; ++vi)
-                        o_h[vi] += S[j * d_v + vi] * q_j;
-                }
-#endif
+                gdn_delta_recurrence(S, q_h, k_h, v_h, o_h, decay, beta_h, d_k, d_v);
             }
         };
         OMP_WORKSHARE_REGION(do_work);
@@ -466,7 +837,7 @@ namespace llaminar2
 
 // Prefetch to L1 or L2 depending on runtime bool (GCC 14 requires
 // compile-time constant for _mm_prefetch hint parameter).
-#if defined(__AVX512F__)
+#if defined(__AVX512F__) || defined(__AVX2__)
 #define GDN_PREFETCH_S(addr, to_l1)                          \
     do                                                       \
     {                                                        \
@@ -522,85 +893,11 @@ namespace llaminar2
 
                     if (use_qk_l2norm)
                     {
-#if defined(__AVX512F__)
-                        const int hd_vec = d_k & ~15;
-                        // Q: fused L2-normalize + scale
-                        {
-                            __m512 vsum = _mm512_setzero_ps();
-                            int d = 0;
-                            for (; d < hd_vec; d += 16)
-                            {
-                                __m512 vv = _mm512_loadu_ps(q_src + d);
-                                vsum = _mm512_fmadd_ps(vv, vv, vsum);
-                            }
-                            float norm_sq = _mm512_reduce_add_ps(vsum);
-                            for (; d < d_k; ++d)
-                                norm_sq += q_src[d] * q_src[d];
-                            const float inv = scale_val / std::max(std::sqrt(norm_sq), l2_eps);
-                            const __m512 vinv = _mm512_set1_ps(inv);
-                            d = 0;
-                            for (; d < hd_vec; d += 16)
-                                _mm512_storeu_ps(q_dst + d,
-                                                 _mm512_mul_ps(_mm512_loadu_ps(q_src + d), vinv));
-                            for (; d < d_k; ++d)
-                                q_dst[d] = q_src[d] * inv;
-                        }
-                        // K: L2-normalize only
-                        {
-                            __m512 vsum = _mm512_setzero_ps();
-                            int d = 0;
-                            for (; d < hd_vec; d += 16)
-                            {
-                                __m512 vv = _mm512_loadu_ps(k_src + d);
-                                vsum = _mm512_fmadd_ps(vv, vv, vsum);
-                            }
-                            float norm_sq = _mm512_reduce_add_ps(vsum);
-                            for (; d < d_k; ++d)
-                                norm_sq += k_src[d] * k_src[d];
-                            const float inv = 1.0f / std::max(std::sqrt(norm_sq), l2_eps);
-                            const __m512 vinv = _mm512_set1_ps(inv);
-                            d = 0;
-                            for (; d < hd_vec; d += 16)
-                                _mm512_storeu_ps(k_dst + d,
-                                                 _mm512_mul_ps(_mm512_loadu_ps(k_src + d), vinv));
-                            for (; d < d_k; ++d)
-                                k_dst[d] = k_src[d] * inv;
-                        }
-#else
-                        {
-                            float nq = 0.0f;
-                            for (int d = 0; d < d_k; ++d)
-                                nq += q_src[d] * q_src[d];
-                            const float inv_q = scale_val / std::max(std::sqrt(nq), l2_eps);
-                            for (int d = 0; d < d_k; ++d)
-                                q_dst[d] = q_src[d] * inv_q;
-                        }
-                        {
-                            float nk = 0.0f;
-                            for (int d = 0; d < d_k; ++d)
-                                nk += k_src[d] * k_src[d];
-                            const float inv_k = 1.0f / std::max(std::sqrt(nk), l2_eps);
-                            for (int d = 0; d < d_k; ++d)
-                                k_dst[d] = k_src[d] * inv_k;
-                        }
-#endif
+                        gdn_preprocess_qk_l2norm(q_src, k_src, q_dst, k_dst, d_k, scale_val, l2_eps);
                     }
                     else
                     {
-#if defined(__AVX512F__)
-                        const int hd_vec = d_k & ~15;
-                        const __m512 vscale = _mm512_set1_ps(scale_val);
-                        int d = 0;
-                        for (; d < hd_vec; d += 16)
-                            _mm512_storeu_ps(q_dst + d,
-                                             _mm512_mul_ps(_mm512_loadu_ps(q_src + d), vscale));
-                        for (; d < d_k; ++d)
-                            q_dst[d] = q_src[d] * scale_val;
-#else
-                        for (int d = 0; d < d_k; ++d)
-                            q_dst[d] = q_src[d] * scale_val;
-#endif
-                        std::memcpy(k_dst, k_src, d_k * sizeof(float));
+                        gdn_preprocess_qk_scale(q_src, k_src, q_dst, k_dst, d_k, scale_val);
                     }
 
                     // Gates — precompute decay = exp(g) here in the parallel
@@ -615,35 +912,8 @@ namespace llaminar2
                 }
 
                 // Batch exp(g) and sigmoid across all heads for this token.
-                // Replaces 2×n_heads scalar exp() with 2 AVX-512 fast_exp calls.
-#if defined(__AVX512F__)
-                {
-                    const int gi_base = t * n_heads;
-                    int hh = 0;
-                    const int hh_vec = n_heads & ~15;
-                    for (; hh < hh_vec; hh += 16)
-                    {
-                        __m512 vg = _mm512_loadu_ps(gate_scratch_.data() + gi_base + hh);
-                        _mm512_storeu_ps(gate_scratch_.data() + gi_base + hh, avx512_fast_exp(vg));
-                        __m512 vb = _mm512_loadu_ps(beta_raw + gi_base + hh);
-                        _mm512_storeu_ps(beta_sig_scratch_.data() + gi_base + hh, avx512_fast_sigmoid(vb));
-                    }
-                    for (; hh < n_heads; ++hh)
-                    {
-                        gate_scratch_[gi_base + hh] = std::exp(gate_scratch_[gi_base + hh]);
-                        beta_sig_scratch_[gi_base + hh] = 1.0f / (1.0f + std::exp(-beta_raw[gi_base + hh]));
-                    }
-                }
-#else
-                {
-                    const int gi_base = t * n_heads;
-                    for (int hh = 0; hh < n_heads; ++hh)
-                    {
-                        gate_scratch_[gi_base + hh] = std::exp(gate_scratch_[gi_base + hh]);
-                        beta_sig_scratch_[gi_base + hh] = 1.0f / (1.0f + std::exp(-beta_raw[gi_base + hh]));
-                    }
-                }
-#endif
+                gdn_batch_exp_sigmoid(gate_scratch_.data(), beta_raw, beta_sig_scratch_.data(),
+                                      t * n_heads, n_heads);
             }
             // implicit barrier between omp-for regions
 
@@ -820,6 +1090,36 @@ namespace llaminar2
                         const float beta_t = beta_sig_scratch_[t * n_heads + h];
                         float *o_t = output + t * v_stride + h * d_v;
 
+#if defined(__AVX2__)
+                        // Fused step 1+2: Decay S + kv_mem = S^T * k
+                        avx2::zero(kv_mem, d_v);
+                        for (int j = 0; j < d_k; ++j)
+                        {
+#if defined(__AVX512F__) || defined(__AVX2__)
+                            if (j + pf_rows_ahead < d_k)
+                                GDN_PREFETCH_S(S + (j + pf_rows_ahead) * d_v, pf_to_l1);
+#endif
+                            float *S_row = S + j * d_v;
+                            avx2::scale(S_row, d_v, decay_val);
+                            avx2::axpy(kv_mem, S_row, k_t[j], d_v);
+                        }
+
+                        // Step 3: delta = (v - kv_mem) * beta
+                        avx2::sub_mul(delta, v_t, kv_mem, beta_t, d_v);
+
+                        // Fused step 4+5: S += k⊗δ, output += S^T * q
+                        avx2::zero(o_t, d_v);
+                        for (int j = 0; j < d_k; ++j)
+                        {
+#if defined(__AVX512F__) || defined(__AVX2__)
+                            if (j + pf_rows_ahead < d_k)
+                                GDN_PREFETCH_S(S + (j + pf_rows_ahead) * d_v, pf_to_l1);
+#endif
+                            float *S_row = S + j * d_v;
+                            avx2::axpy(S_row, delta, k_t[j], d_v);
+                            avx2::axpy(o_t, S_row, q_t[j], d_v);
+                        }
+#else
                         // Fused step 1+2: Decay S + kv_mem = S^T * k
                         std::memset(kv_mem, 0, d_v * sizeof(float));
                         for (int j = 0; j < d_k; ++j)
@@ -850,6 +1150,7 @@ namespace llaminar2
                                 o_t[vi] += S_row[vi] * q_j;
                             }
                         }
+#endif
                     } // timesteps
                 }
             } // heads

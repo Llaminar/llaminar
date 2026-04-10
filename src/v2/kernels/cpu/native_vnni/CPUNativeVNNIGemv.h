@@ -72,9 +72,9 @@ namespace llaminar2::cpu::native_vnni
 
     enum class ISAPath
     {
-        AUTO,  // Runtime detection: AVX512-VNNI if available, else AVX2
+        AUTO,   // Runtime detection: AVX512-VNNI if available, else AVX2
         AVX512, // Force AVX512-VNNI path (only valid on AVX512 hardware)
-        AVX2   // Force AVX2 emulated-VNNI path
+        AVX2    // Force AVX2 emulated-VNNI path
     };
 
     // =========================================================================
@@ -545,7 +545,7 @@ namespace llaminar2::cpu::native_vnni
         // Runtime ISA selection
         bool use_avx512 = false;
 #if defined(__AVX512F__) && defined(__AVX512VNNI__) && defined(__AVX512BW__)
-        use_avx512 = (isa_path == ISAPath::AUTO) ? cpu_supports_avx512_vnni()
+        use_avx512 = (isa_path == ISAPath::AUTO) ? (activeISALevel() >= ISALevel::AVX512)
                                                  : (isa_path == ISAPath::AVX512);
 #endif
 
@@ -1223,7 +1223,7 @@ namespace llaminar2::cpu::native_vnni
         // Runtime ISA selection
         bool use_avx512 = false;
 #if defined(__AVX512F__) && defined(__AVX512VNNI__) && defined(__AVX512BW__)
-        use_avx512 = (isa_path == ISAPath::AUTO) ? cpu_supports_avx512_vnni()
+        use_avx512 = (isa_path == ISAPath::AUTO) ? (activeISALevel() >= ISALevel::AVX512)
                                                  : (isa_path == ISAPath::AVX512);
 #endif
 

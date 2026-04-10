@@ -1906,6 +1906,32 @@ add_v2_test(V2_Unit_AVX2VNNIParity
     MPI_PROCS 1
 )
 
+# Test: AVX2 Fallback Parity (all non-GEMM AVX2 fallback functions)
+add_executable(v2_test_avx2_fallback_parity unit/kernels/Test__AVX2FallbackParity.cpp)
+target_link_libraries(v2_test_avx2_fallback_parity
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_AVX2FallbackParity
+    COMMAND $<TARGET_FILE:v2_test_avx2_fallback_parity>
+    LABELS "V2;Unit;Kernels;AVX2;Parity;GDN;TurboQuant;FWHT;Attention"
+    MPI_PROCS 1
+)
+
+# Test: SIMDHelpers ISA Parity (scalar vs AVX2 vs AVX512 for residual add, quantize, etc.)
+add_executable(v2_test_simd_helpers_isa_parity unit/Test__SIMDHelpersISAParity.cpp)
+target_link_libraries(v2_test_simd_helpers_isa_parity
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_SIMDHelpersISAParity
+    COMMAND $<TARGET_FILE:v2_test_simd_helpers_isa_parity>
+    LABELS "V2;Unit;Kernels;AVX2;AVX512;Parity;SIMD;Quantization"
+    MPI_PROCS 1
+)
+
 # Test: Fused Projection Parity (multiply_fused_tensor vs multiply_tensor)
 # Regression test for Q4_0 M=1 decode bug where fused path produced wrong output
 add_executable(v2_test_fused_projection_parity unit/kernels/Test__FusedProjectionParity.cpp)

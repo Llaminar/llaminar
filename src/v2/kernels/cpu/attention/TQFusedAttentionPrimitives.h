@@ -35,9 +35,15 @@
 #include <cmath>
 #include <cstring>
 
-#if defined(__AVX512F__)
+#if defined(__AVX512F__) || defined(__AVX2__)
 #include <immintrin.h>
 #endif
+
+#if defined(__AVX2__)
+#include "../simd/AVX2Helpers.h"
+#endif
+
+#include "../../../utils/CPUFeatures.h"
 
 namespace llaminar2
 {
@@ -77,7 +83,12 @@ namespace llaminar2
      * @param head_dim   Head dimension (64 or 128)
      * @return dot(Q_rot, centroids) × norm, or 0.0f for zero-norm blocks
      */
-    inline float tq8_dot_rotated_q(
+    // ========================================================================
+    // Named ISA implementations: tq8_dot_rotated_q
+    // ========================================================================
+
+    /// Scalar: dot(Q_rot, centroids(TQ8)) × norm
+    inline float tq8_dot_rotated_q_scalar(
         const float *__restrict__ Q_rot,
         const uint8_t *__restrict__ tq8_block,
         int head_dim)
@@ -86,39 +97,104 @@ namespace llaminar2
         std::memcpy(&norm, tq8_block, sizeof(float));
         if (norm < 1e-30f)
             return 0.0f;
+        const uint8_t *indices = tq8_block + 8;
+        float dot = 0.0f;
+        for (int i = 0; i < head_dim; ++i)
+            dot += Q_rot[i] * TQ8_CENTROIDS[indices[i]];
+        return dot * norm;
+    }
 
-        // TQ8 layout: [norm:4B][residual_norm:4B][indices:D bytes]
+#if defined(__AVX2__)
+    /// AVX2: dot(Q_rot, centroids(TQ8)) × norm (8-wide gather+FMA)
+    inline float tq8_dot_rotated_q_avx2(
+        const float *__restrict__ Q_rot,
+        const uint8_t *__restrict__ tq8_block,
+        int head_dim)
+    {
+        float norm;
+        std::memcpy(&norm, tq8_block, sizeof(float));
+        if (norm < 1e-30f)
+            return 0.0f;
         const uint8_t *indices = tq8_block + 8;
 
+        __m256 acc = _mm256_setzero_ps();
+        int i = 0;
+        for (; i + 8 <= head_dim; i += 8)
+        {
+            const __m128i vidx_u8 = _mm_loadl_epi64(
+                reinterpret_cast<const __m128i *>(indices + i));
+            const __m256i vidx_i32 = _mm256_cvtepu8_epi32(vidx_u8);
+            const __m256 vcentroids = _mm256_i32gather_ps(
+                TQ8_CENTROIDS.data(), vidx_i32, sizeof(float));
+            const __m256 vq = _mm256_loadu_ps(Q_rot + i);
+            acc = _mm256_fmadd_ps(vcentroids, vq, acc);
+        }
+        float dot = avx2::hsum_ps(acc);
+        for (; i < head_dim; ++i)
+            dot += Q_rot[i] * TQ8_CENTROIDS[indices[i]];
+        return dot * norm;
+    }
+#endif
+
 #if defined(__AVX512F__)
+    /// AVX-512: dot(Q_rot, centroids(TQ8)) × norm (16-wide gather+FMA)
+    inline float tq8_dot_rotated_q_avx512(
+        const float *__restrict__ Q_rot,
+        const uint8_t *__restrict__ tq8_block,
+        int head_dim)
+    {
+        float norm;
+        std::memcpy(&norm, tq8_block, sizeof(float));
+        if (norm < 1e-30f)
+            return 0.0f;
+        const uint8_t *indices = tq8_block + 8;
+
         __m512 acc = _mm512_setzero_ps();
         int i = 0;
         for (; i + 16 <= head_dim; i += 16)
         {
-            // Load 16 uint8 indices → 16 int32 for gather
             const __m128i vidx_u8 = _mm_loadu_si128(
                 reinterpret_cast<const __m128i *>(indices + i));
             const __m512i vidx_i32 = _mm512_cvtepu8_epi32(vidx_u8);
-
-            // Gather 16 centroids from TQ8 codebook
             const __m512 vcentroids = _mm512_i32gather_ps(
                 vidx_i32, TQ8_CENTROIDS.data(), sizeof(float));
-
-            // FMA: acc += centroids * Q_rot
             const __m512 vq = _mm512_loadu_ps(Q_rot + i);
             acc = _mm512_fmadd_ps(vcentroids, vq, acc);
         }
         float dot = _mm512_reduce_add_ps(acc);
-        // Scalar tail
         for (; i < head_dim; ++i)
             dot += Q_rot[i] * TQ8_CENTROIDS[indices[i]];
-#else
-        float dot = 0.0f;
-        for (int i = 0; i < head_dim; ++i)
-            dot += Q_rot[i] * TQ8_CENTROIDS[indices[i]];
+        return dot * norm;
+    }
 #endif
 
-        return dot * norm;
+// Stubs for portability when ISA unavailable at compile time
+#if !defined(__AVX2__)
+    inline float tq8_dot_rotated_q_avx2(
+        const float *__restrict__ Q_rot,
+        const uint8_t *__restrict__ tq8_block,
+        int head_dim)
+    {
+        return tq8_dot_rotated_q_scalar(Q_rot, tq8_block, head_dim);
+    }
+#endif
+#if !defined(__AVX512F__)
+    inline float tq8_dot_rotated_q_avx512(
+        const float *__restrict__ Q_rot,
+        const uint8_t *__restrict__ tq8_block,
+        int head_dim)
+    {
+        return tq8_dot_rotated_q_avx2(Q_rot, tq8_block, head_dim);
+    }
+#endif
+
+    /// Dispatch: picks best available ISA at runtime
+    inline float tq8_dot_rotated_q(
+        const float *__restrict__ Q_rot,
+        const uint8_t *__restrict__ tq8_block,
+        int head_dim)
+    {
+        return ISA_DISPATCH_RETVAL(tq8_dot_rotated_q, Q_rot, tq8_block, head_dim);
     }
 
     // ========================================================================
@@ -144,7 +220,12 @@ namespace llaminar2
      * @param weight     Softmax attention weight for this position
      * @param head_dim   Head dimension (64 or 128)
      */
-    inline void tq4_accum_weighted(
+    // ========================================================================
+    // Named ISA implementations: tq4_accum_weighted
+    // ========================================================================
+
+    /// Scalar: accum += weight × norm × centroids(TQ4)
+    inline void tq4_accum_weighted_scalar(
         float *__restrict__ accum,
         const uint8_t *__restrict__ tq4_block,
         float weight,
@@ -154,43 +235,10 @@ namespace llaminar2
         std::memcpy(&norm, tq4_block, sizeof(float));
         if (norm < 1e-30f || std::abs(weight) < 1e-30f)
             return;
-
         const float combined_weight = weight * norm;
-
-        // TQ4 layout: [norm:4B][residual_norm:4B][mse_indices:D*3/8 B][high_bits:D/8 B]
         const uint8_t *mse_indices = tq4_block + 8;
         const uint8_t *high_bits = tq4_block + 8 + head_dim * 3 / 8;
 
-#if defined(__AVX512F__)
-        const __m512 vw = _mm512_set1_ps(combined_weight);
-
-        for (int i = 0; i < head_dim; i += 16)
-        {
-            // Unpack 2 groups of 8 × 4-bit indices from 3+1 packed format
-            alignas(64) int32_t idx32[16];
-            for (int g = 0; g < 2; ++g)
-            {
-                const int base = i + g * 8;
-                const int group = base / 8;
-                uint8_t idx8[8];
-                uint8_t hb[8];
-                tq3_unpack_8(mse_indices + group * 3, idx8);
-                tq_attn_detail::unpack_bitplane_8_local(high_bits + group, hb);
-                for (int j = 0; j < 8; ++j)
-                    idx32[g * 8 + j] = idx8[j] | (hb[j] << 3);
-            }
-
-            // Gather 16 centroids from TQ4 codebook
-            const __m512i vidx = _mm512_load_si512(idx32);
-            const __m512 vcentroids = _mm512_i32gather_ps(
-                vidx, TQ4_CENTROIDS.data(), sizeof(float));
-
-            // FMA: accum += weight * norm * centroids
-            __m512 vacc = _mm512_loadu_ps(accum + i);
-            vacc = _mm512_fmadd_ps(vcentroids, vw, vacc);
-            _mm512_storeu_ps(accum + i, vacc);
-        }
-#else
         for (int i = 0; i < head_dim; i += 8)
         {
             const int group = i / 8;
@@ -204,7 +252,118 @@ namespace llaminar2
                 accum[i + j] += combined_weight * TQ4_CENTROIDS[idx4];
             }
         }
+    }
+
+#if defined(__AVX2__)
+    /// AVX2: accum += weight × norm × centroids(TQ4) (8-wide gather+FMA)
+    inline void tq4_accum_weighted_avx2(
+        float *__restrict__ accum,
+        const uint8_t *__restrict__ tq4_block,
+        float weight,
+        int head_dim)
+    {
+        float norm;
+        std::memcpy(&norm, tq4_block, sizeof(float));
+        if (norm < 1e-30f || std::abs(weight) < 1e-30f)
+            return;
+        const float combined_weight = weight * norm;
+        const uint8_t *mse_indices = tq4_block + 8;
+        const uint8_t *high_bits = tq4_block + 8 + head_dim * 3 / 8;
+
+        const __m256 vw = _mm256_set1_ps(combined_weight);
+        for (int i = 0; i < head_dim; i += 8)
+        {
+            const int group = i / 8;
+            uint8_t idx8[8];
+            uint8_t hb[8];
+            tq3_unpack_8(mse_indices + group * 3, idx8);
+            tq_attn_detail::unpack_bitplane_8_local(high_bits + group, hb);
+
+            alignas(32) int32_t idx32[8];
+            for (int j = 0; j < 8; ++j)
+                idx32[j] = idx8[j] | (hb[j] << 3);
+
+            const __m256i vidx = _mm256_load_si256(reinterpret_cast<const __m256i *>(idx32));
+            const __m256 vcentroids = _mm256_i32gather_ps(
+                TQ4_CENTROIDS.data(), vidx, sizeof(float));
+            __m256 vacc = _mm256_loadu_ps(accum + i);
+            vacc = _mm256_fmadd_ps(vcentroids, vw, vacc);
+            _mm256_storeu_ps(accum + i, vacc);
+        }
+    }
 #endif
+
+#if defined(__AVX512F__)
+    /// AVX-512: accum += weight × norm × centroids(TQ4) (16-wide gather+FMA)
+    inline void tq4_accum_weighted_avx512(
+        float *__restrict__ accum,
+        const uint8_t *__restrict__ tq4_block,
+        float weight,
+        int head_dim)
+    {
+        float norm;
+        std::memcpy(&norm, tq4_block, sizeof(float));
+        if (norm < 1e-30f || std::abs(weight) < 1e-30f)
+            return;
+        const float combined_weight = weight * norm;
+        const uint8_t *mse_indices = tq4_block + 8;
+        const uint8_t *high_bits = tq4_block + 8 + head_dim * 3 / 8;
+
+        const __m512 vw = _mm512_set1_ps(combined_weight);
+        for (int i = 0; i < head_dim; i += 16)
+        {
+            alignas(64) int32_t idx32[16];
+            for (int g = 0; g < 2; ++g)
+            {
+                const int base = i + g * 8;
+                const int group = base / 8;
+                uint8_t idx8[8];
+                uint8_t hb[8];
+                tq3_unpack_8(mse_indices + group * 3, idx8);
+                tq_attn_detail::unpack_bitplane_8_local(high_bits + group, hb);
+                for (int j = 0; j < 8; ++j)
+                    idx32[g * 8 + j] = idx8[j] | (hb[j] << 3);
+            }
+            const __m512i vidx = _mm512_load_si512(idx32);
+            const __m512 vcentroids = _mm512_i32gather_ps(
+                vidx, TQ4_CENTROIDS.data(), sizeof(float));
+            __m512 vacc = _mm512_loadu_ps(accum + i);
+            vacc = _mm512_fmadd_ps(vcentroids, vw, vacc);
+            _mm512_storeu_ps(accum + i, vacc);
+        }
+    }
+#endif
+
+// Stubs for portability when ISA unavailable at compile time
+#if !defined(__AVX2__)
+    inline void tq4_accum_weighted_avx2(
+        float *__restrict__ accum,
+        const uint8_t *__restrict__ tq4_block,
+        float weight,
+        int head_dim)
+    {
+        tq4_accum_weighted_scalar(accum, tq4_block, weight, head_dim);
+    }
+#endif
+#if !defined(__AVX512F__)
+    inline void tq4_accum_weighted_avx512(
+        float *__restrict__ accum,
+        const uint8_t *__restrict__ tq4_block,
+        float weight,
+        int head_dim)
+    {
+        tq4_accum_weighted_avx2(accum, tq4_block, weight, head_dim);
+    }
+#endif
+
+    /// Dispatch: picks best available ISA at runtime
+    inline void tq4_accum_weighted(
+        float *__restrict__ accum,
+        const uint8_t *__restrict__ tq4_block,
+        float weight,
+        int head_dim)
+    {
+        ISA_DISPATCH_VOID(tq4_accum_weighted, accum, tq4_block, weight, head_dim);
     }
 
 } // namespace llaminar2

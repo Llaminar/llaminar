@@ -230,8 +230,21 @@ namespace llaminar2
 
     std::string SnapshotCapture::convertStageNameToSnapshotKey(const std::string &stage_name)
     {
-        static const std::unordered_map<std::string, std::string> suffix_map = {
+        // Ordered vector: longest/most-specific suffixes FIRST to ensure correct
+        // prefix extraction. E.g. "_gdn_wo_allreduce" must match before "_wo_allreduce"
+        // so the prefix is "layerN" (not "layerN_gdn").
+        static const std::vector<std::pair<std::string, std::string>> suffix_map = {
+            // GDN (Gated Delta Net) linear attention stages — longest suffixes first
+            {"_gdn_wo_allreduce", "_ATTENTION_OUTPUT"},
+            {"_gdn_out_proj", "_ATTENTION_OUTPUT"},
+            {"_gdn_proj", "_QKV_PROJECTION"},
+            {"_gdn_recurrence", "_GDN_DELTA_RULE_OUTPUT"},
+            {"_gated_norm", "_GDN_NORM_GATE_OUTPUT"},
+            // Standard attention stages
             {"_attn_norm", "_ATTENTION_NORM"},
+            {"_attn_residual", "_ATTENTION_RESIDUAL"},
+            {"_wo_allreduce", "_ATTENTION_OUTPUT"},
+            {"_wo_proj", "_ATTENTION_OUTPUT"},
             {"_q_norm", "_Q_NORM"},
             {"_k_norm", "_K_NORM"},
             {"_q_proj", "_Q_PROJECTION"},
@@ -240,21 +253,14 @@ namespace llaminar2
             {"_q_rope", "_Q_ROPE"},
             {"_k_rope", "_K_ROPE"},
             {"_attention", "_ATTENTION_CONTEXT"},
-            {"_wo_proj", "_ATTENTION_OUTPUT"},
-            {"_wo_allreduce", "_ATTENTION_OUTPUT"},
-            {"_attn_residual", "_ATTENTION_RESIDUAL"},
+            // FFN stages
+            {"_down_allreduce", "_FFN_DOWN"},
             {"_ffn_norm", "_FFN_NORM"},
             {"_ffn_gate", "_FFN_GATE"},
             {"_ffn_up", "_FFN_UP"},
             {"_swiglu", "_FFN_SWIGLU"},
             {"_down_proj", "_FFN_DOWN"},
-            {"_down_allreduce", "_FFN_DOWN"},
             {"_ffn_residual", "_FFN_RESIDUAL"},
-            // GDN (Gated Delta Net) linear attention stages
-            {"_gdn_proj", "_QKV_PROJECTION"},
-            {"_gdn_recurrence", "_GDN_DELTA_RULE_OUTPUT"},
-            {"_gated_norm", "_GDN_NORM_GATE_OUTPUT"},
-            {"_gdn_out_proj", "_ATTENTION_OUTPUT"},
         };
 
         // Global stages
@@ -265,7 +271,8 @@ namespace llaminar2
         if (stage_name == "lm_head")
             return "LM_HEAD";
 
-        // Layer-specific stages: extract layer prefix and convert suffix
+        // Layer-specific stages: extract layer prefix and convert suffix.
+        // Uses ordered iteration so longer/more-specific suffixes match first.
         for (const auto &[suffix, replacement] : suffix_map)
         {
             size_t pos = stage_name.find(suffix);

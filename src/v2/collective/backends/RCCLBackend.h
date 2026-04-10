@@ -29,6 +29,7 @@
 
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace llaminar2
@@ -315,7 +316,7 @@ namespace llaminar2
         std::string last_error_;
         int num_ranks_ = 0;
         int local_rank_ = 0;
-        std::shared_ptr<IMPIContext> mpi_ctx_;      // Optional MPI context for multi-process
+        std::shared_ptr<IMPIContext> mpi_ctx_;     // Optional MPI context for multi-process
         bool is_multi_gpu_single_process_ = false; // True if multi-GPU without MPI
         bool p2p_available_ = false;               // True if P2P available between all devices
 
@@ -330,12 +331,29 @@ namespace llaminar2
         std::vector<int> device_ordinals_; // Device ordinals for each GPU
 
         // Coordinator for multi-GPU single-process mode (owns all RCCL comms/streams)
-        std::unique_ptr<RCCLCoordinator> coordinator_;
+        // Uses shared_ptr to enable coordinator pooling across RCCLBackend lifetimes.
+        // This avoids repeated ncclCommInit/ncclCommDestroy cycles which trigger
+        // ROCm CLR state accumulation (a known ROCm bug that causes GPU memory
+        // access faults after multiple init/destroy cycles).
+        std::shared_ptr<RCCLCoordinator> coordinator_;
 
         // Helper to convert our types to integer values for wrapper functions
         static int toRcclDataTypeInt(CollectiveDataType dtype);
         static int toRcclRedOpInt(CollectiveOp op);
+
+        // Static coordinator pool: avoids repeated ncclCommDestroy/ncclCommInit
+        // cycles that trigger ROCm CLR state accumulation bugs.
+        // Key: sorted device ordinals string (e.g., "0,1")
+        static std::mutex coordinator_pool_mutex_;
+        static std::unordered_map<std::string, std::shared_ptr<RCCLCoordinator>> coordinator_pool_;
+        static std::string makePoolKey(const std::vector<int> &device_ordinals);
 #endif
+
+    public:
+        /// Drain the static coordinator pool, destroying all pooled coordinators.
+        /// Call this at process shutdown (e.g., from GlobalBackendRouter::shutdown())
+        /// to ensure RCCL resources are properly released.
+        static void drainCoordinatorPool();
     };
 
 } // namespace llaminar2

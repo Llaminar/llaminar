@@ -9,15 +9,15 @@
       "devices": {
         "cuda:0": {
           "prefill_tok_s": 4879.29,
-          "decode_tok_s": 94.98,
+          "decode_tok_s": 95.16,
           "regression_threshold_pct": 5,
-          "_comment": "High-water mark set at commit 24b8f431 on 2026-04-08. Note to agents: It is FORBIDDEN to update these thresholds without explicit human approval."
+          "_comment": "High-water mark set at commit f902826e on 2026-04-10. Note to agents: It is FORBIDDEN to update these thresholds without explicit human approval."
         },
         "rocm:0": {
           "prefill_tok_s": 1214.71,
-          "decode_tok_s": 74.73,
+          "decode_tok_s": 78.08,
           "regression_threshold_pct": 5,
-          "_comment": "High-water mark set at commit f7159dec on 2026-04-07. Note to agents: It is FORBIDDEN to update these thresholds without explicit human approval."
+          "_comment": "High-water mark set at commit f902826e on 2026-04-10. Note to agents: It is FORBIDDEN to update these thresholds without explicit human approval."
         },
         "cpu": {
           "prefill_tok_s": 337.99,

@@ -20,6 +20,7 @@
 #include <limits>
 #include <algorithm>
 #include <numeric>
+#include <random>
 
 #include "v2/kernels/cpu/primitives/SoftmaxPrimitives_New.h"
 
@@ -812,4 +813,102 @@ TEST_F(SoftmaxPrimitives_MultiRow, FP16_BatchCorrectness)
         expect_valid_probabilities(row_fp32.data(), COLS);
         expect_sums_to_one(row_fp32.data(), COLS, FP16_TOLERANCE);
     }
+}
+
+// ============================================================================
+// ISA Parity Tests — detail:: softmax_row variants (scalar vs avx2 vs avx512)
+// ============================================================================
+
+#include "kernels/cpu/primitives/SoftmaxPrimitives_detail.h"
+
+using namespace llaminar2::primitives::detail;
+
+TEST(SoftmaxPrimitives_ISAParity, SoftmaxRow_ScalarVsAVX512)
+{
+    constexpr int COLS = 256;
+    std::mt19937 rng(12345);
+    std::uniform_real_distribution<float> dist(-5.0f, 5.0f);
+
+    // aligned buffers
+    alignas(64) float scalar_buf[COLS];
+    alignas(64) float simd_buf[COLS];
+
+    for (int i = 0; i < COLS; ++i)
+    {
+        float v = dist(rng);
+        scalar_buf[i] = v;
+        simd_buf[i] = v;
+    }
+
+    // use_fast_exp=false for exact scalar exp() parity
+    softmax_row_scalar(scalar_buf, COLS, /*r=*/0, /*causal=*/false,
+                       /*scale=*/1.0f, /*use_fast_exp=*/false);
+
+#if defined(__AVX512F__)
+    softmax_row_avx512(simd_buf, COLS, /*r=*/0, /*causal=*/false,
+                       /*scale=*/1.0f, /*use_fast_exp=*/false);
+
+    float max_diff = 0.0f;
+    for (int i = 0; i < COLS; ++i)
+    {
+        max_diff = std::max(max_diff, std::abs(scalar_buf[i] - simd_buf[i]));
+    }
+    EXPECT_LE(max_diff, 1e-5f) << "Scalar vs AVX512 softmax_row mismatch";
+#elif defined(__AVX2__)
+    softmax_row_avx2(simd_buf, COLS, /*r=*/0, /*causal=*/false,
+                     /*scale=*/1.0f, /*use_fast_exp=*/false);
+
+    float max_diff = 0.0f;
+    for (int i = 0; i < COLS; ++i)
+    {
+        max_diff = std::max(max_diff, std::abs(scalar_buf[i] - simd_buf[i]));
+    }
+    EXPECT_LE(max_diff, 1e-5f) << "Scalar vs AVX2 softmax_row mismatch";
+#else
+    // Scalar-only — nothing extra to compare
+#endif
+}
+
+TEST(SoftmaxPrimitives_ISAParity, SoftmaxRow_CausalAndScale)
+{
+    constexpr int COLS = 128;
+    std::mt19937 rng(99);
+    std::uniform_real_distribution<float> dist(-3.0f, 3.0f);
+
+    alignas(64) float scalar_buf[COLS];
+    alignas(64) float simd_buf[COLS];
+
+    for (int i = 0; i < COLS; ++i)
+    {
+        float v = dist(rng);
+        scalar_buf[i] = v;
+        simd_buf[i] = v;
+    }
+
+    // Row 64 with causal — positions 0..64 active, 65..127 masked
+    const float scale = 0.125f;
+    softmax_row_scalar(scalar_buf, COLS, /*r=*/64, /*causal=*/true,
+                       scale, /*use_fast_exp=*/false);
+
+#if defined(__AVX512F__)
+    softmax_row_avx512(simd_buf, COLS, /*r=*/64, /*causal=*/true,
+                       scale, /*use_fast_exp=*/false);
+
+    float max_diff = 0.0f;
+    for (int i = 0; i < COLS; ++i)
+    {
+        max_diff = std::max(max_diff, std::abs(scalar_buf[i] - simd_buf[i]));
+    }
+    EXPECT_LE(max_diff, 1e-5f) << "Scalar vs AVX512 causal softmax mismatch";
+#elif defined(__AVX2__)
+    softmax_row_avx2(simd_buf, COLS, /*r=*/64, /*causal=*/true,
+                     scale, /*use_fast_exp=*/false);
+
+    float max_diff = 0.0f;
+    for (int i = 0; i < COLS; ++i)
+    {
+        max_diff = std::max(max_diff, std::abs(scalar_buf[i] - simd_buf[i]));
+    }
+    EXPECT_LE(max_diff, 1e-5f) << "Scalar vs AVX2 causal softmax mismatch";
+#endif
 }

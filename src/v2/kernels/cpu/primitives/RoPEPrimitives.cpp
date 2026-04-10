@@ -21,6 +21,7 @@
 #endif
 
 #include "../../../utils/OpenMPUtils.h"
+#include "../../../utils/CPUFeatures.h"
 
 #if defined(__AVX512F__)
 #include <immintrin.h>
@@ -568,6 +569,93 @@ namespace llaminar2::primitives
     // Partial RoPE Implementation (partial_rotary_factor < 1.0)
     // ============================================================================
 
+    namespace detail
+    {
+        void rope_rotate_head_scalar(float *head_ptr, const float *cos_ptr,
+                                     const float *sin_ptr, int half_rotary)
+        {
+            for (int i = 0; i < half_rotary; ++i)
+            {
+                float x0 = head_ptr[i], x1 = head_ptr[i + half_rotary];
+                head_ptr[i] = x0 * cos_ptr[i] - x1 * sin_ptr[i];
+                head_ptr[i + half_rotary] = x0 * sin_ptr[i] + x1 * cos_ptr[i];
+            }
+        }
+
+#if defined(__AVX2__)
+        void rope_rotate_head_avx2(float *head_ptr, const float *cos_ptr,
+                                   const float *sin_ptr, int half_rotary)
+        {
+            int i = 0;
+            for (; i + 8 <= half_rotary; i += 8)
+            {
+                __m256 x0 = _mm256_loadu_ps(head_ptr + i);
+                __m256 x1 = _mm256_loadu_ps(head_ptr + i + half_rotary);
+                __m256 cv = _mm256_loadu_ps(cos_ptr + i);
+                __m256 sv = _mm256_loadu_ps(sin_ptr + i);
+                _mm256_storeu_ps(head_ptr + i,
+                                 _mm256_sub_ps(_mm256_mul_ps(x0, cv), _mm256_mul_ps(x1, sv)));
+                _mm256_storeu_ps(head_ptr + i + half_rotary,
+                                 _mm256_add_ps(_mm256_mul_ps(x0, sv), _mm256_mul_ps(x1, cv)));
+            }
+            for (; i < half_rotary; ++i)
+            {
+                float x0 = head_ptr[i], x1 = head_ptr[i + half_rotary];
+                head_ptr[i] = x0 * cos_ptr[i] - x1 * sin_ptr[i];
+                head_ptr[i + half_rotary] = x0 * sin_ptr[i] + x1 * cos_ptr[i];
+            }
+        }
+#endif
+
+#if defined(__AVX512F__)
+        void rope_rotate_head_avx512(float *head_ptr, const float *cos_ptr,
+                                     const float *sin_ptr, int half_rotary)
+        {
+            int i = 0;
+            for (; i + 16 <= half_rotary; i += 16)
+            {
+                __m512 x0 = _mm512_loadu_ps(head_ptr + i);
+                __m512 x1 = _mm512_loadu_ps(head_ptr + i + half_rotary);
+                __m512 cv = _mm512_loadu_ps(cos_ptr + i);
+                __m512 sv = _mm512_loadu_ps(sin_ptr + i);
+                _mm512_storeu_ps(head_ptr + i,
+                                 _mm512_sub_ps(_mm512_mul_ps(x0, cv), _mm512_mul_ps(x1, sv)));
+                _mm512_storeu_ps(head_ptr + i + half_rotary,
+                                 _mm512_add_ps(_mm512_mul_ps(x0, sv), _mm512_mul_ps(x1, cv)));
+            }
+            for (; i < half_rotary; ++i)
+            {
+                float x0 = head_ptr[i], x1 = head_ptr[i + half_rotary];
+                head_ptr[i] = x0 * cos_ptr[i] - x1 * sin_ptr[i];
+                head_ptr[i + half_rotary] = x0 * sin_ptr[i] + x1 * cos_ptr[i];
+            }
+        }
+#endif
+
+// --- ISA stubs for runtime dispatch ---
+#if !defined(__AVX2__)
+        void rope_rotate_head_avx2(float *head_ptr, const float *cos_ptr,
+                                   const float *sin_ptr, int half_rotary)
+        {
+            rope_rotate_head_scalar(head_ptr, cos_ptr, sin_ptr, half_rotary);
+        }
+#endif
+#if !defined(__AVX512F__)
+        void rope_rotate_head_avx512(float *head_ptr, const float *cos_ptr,
+                                     const float *sin_ptr, int half_rotary)
+        {
+            rope_rotate_head_avx2(head_ptr, cos_ptr, sin_ptr, half_rotary);
+        }
+#endif
+
+        inline void rope_rotate_head_dispatch(float *head_ptr, const float *cos_ptr,
+                                              const float *sin_ptr, int half_rotary)
+        {
+            ISA_DISPATCH_VOID(rope_rotate_head, head_ptr, cos_ptr, sin_ptr, half_rotary);
+        }
+    } // namespace detail
+    using namespace detail;
+
     void apply_rope_partial(
         float *q, float *k,
         int seq_len, int head_dim, int rotary_dim,
@@ -625,63 +713,10 @@ namespace llaminar2::primitives
             {
                 for (int h = 0; h < q_heads; ++h)
                 {
-                    // Stride uses full head_dim
                     float *head_ptr = q + (t * q_heads + h) * head_dim;
                     const float *cos_ptr = cos_table.data() + t * half_rotary;
                     const float *sin_ptr = sin_table.data() + t * half_rotary;
-
-                    // Rotate only the first rotary_dim elements
-#if defined(__AVX512F__)
-                    {
-                        int i = 0;
-                        for (; i + 16 <= half_rotary; i += 16)
-                        {
-                            __m512 x0 = _mm512_loadu_ps(head_ptr + i);
-                            __m512 x1 = _mm512_loadu_ps(head_ptr + i + half_rotary);
-                            __m512 cv = _mm512_loadu_ps(cos_ptr + i);
-                            __m512 sv = _mm512_loadu_ps(sin_ptr + i);
-                            _mm512_storeu_ps(head_ptr + i,
-                                             _mm512_sub_ps(_mm512_mul_ps(x0, cv), _mm512_mul_ps(x1, sv)));
-                            _mm512_storeu_ps(head_ptr + i + half_rotary,
-                                             _mm512_add_ps(_mm512_mul_ps(x0, sv), _mm512_mul_ps(x1, cv)));
-                        }
-                        for (; i < half_rotary; ++i)
-                        {
-                            float x0 = head_ptr[i], x1 = head_ptr[i + half_rotary];
-                            head_ptr[i] = x0 * cos_ptr[i] - x1 * sin_ptr[i];
-                            head_ptr[i + half_rotary] = x0 * sin_ptr[i] + x1 * cos_ptr[i];
-                        }
-                    }
-#elif defined(__AVX2__)
-                    {
-                        int i = 0;
-                        for (; i + 8 <= half_rotary; i += 8)
-                        {
-                            __m256 x0 = _mm256_loadu_ps(head_ptr + i);
-                            __m256 x1 = _mm256_loadu_ps(head_ptr + i + half_rotary);
-                            __m256 cv = _mm256_loadu_ps(cos_ptr + i);
-                            __m256 sv = _mm256_loadu_ps(sin_ptr + i);
-                            _mm256_storeu_ps(head_ptr + i,
-                                             _mm256_sub_ps(_mm256_mul_ps(x0, cv), _mm256_mul_ps(x1, sv)));
-                            _mm256_storeu_ps(head_ptr + i + half_rotary,
-                                             _mm256_add_ps(_mm256_mul_ps(x0, sv), _mm256_mul_ps(x1, cv)));
-                        }
-                        for (; i < half_rotary; ++i)
-                        {
-                            float x0 = head_ptr[i], x1 = head_ptr[i + half_rotary];
-                            head_ptr[i] = x0 * cos_ptr[i] - x1 * sin_ptr[i];
-                            head_ptr[i + half_rotary] = x0 * sin_ptr[i] + x1 * cos_ptr[i];
-                        }
-                    }
-#else
-                    for (int i = 0; i < half_rotary; ++i)
-                    {
-                        float x0 = head_ptr[i], x1 = head_ptr[i + half_rotary];
-                        head_ptr[i] = x0 * cos_ptr[i] - x1 * sin_ptr[i];
-                        head_ptr[i + half_rotary] = x0 * sin_ptr[i] + x1 * cos_ptr[i];
-                    }
-#endif
-                    // Elements [rotary_dim, head_dim) are untouched (pass-through)
+                    rope_rotate_head_dispatch(head_ptr, cos_ptr, sin_ptr, half_rotary);
                 }
             }
 
@@ -696,57 +731,7 @@ namespace llaminar2::primitives
                         float *head_ptr = k + (t * k_heads + h) * head_dim;
                         const float *cos_ptr = cos_table.data() + t * half_rotary;
                         const float *sin_ptr = sin_table.data() + t * half_rotary;
-
-#if defined(__AVX512F__)
-                        {
-                            int i = 0;
-                            for (; i + 16 <= half_rotary; i += 16)
-                            {
-                                __m512 x0 = _mm512_loadu_ps(head_ptr + i);
-                                __m512 x1 = _mm512_loadu_ps(head_ptr + i + half_rotary);
-                                __m512 cv = _mm512_loadu_ps(cos_ptr + i);
-                                __m512 sv = _mm512_loadu_ps(sin_ptr + i);
-                                _mm512_storeu_ps(head_ptr + i,
-                                                 _mm512_sub_ps(_mm512_mul_ps(x0, cv), _mm512_mul_ps(x1, sv)));
-                                _mm512_storeu_ps(head_ptr + i + half_rotary,
-                                                 _mm512_add_ps(_mm512_mul_ps(x0, sv), _mm512_mul_ps(x1, cv)));
-                            }
-                            for (; i < half_rotary; ++i)
-                            {
-                                float x0 = head_ptr[i], x1 = head_ptr[i + half_rotary];
-                                head_ptr[i] = x0 * cos_ptr[i] - x1 * sin_ptr[i];
-                                head_ptr[i + half_rotary] = x0 * sin_ptr[i] + x1 * cos_ptr[i];
-                            }
-                        }
-#elif defined(__AVX2__)
-                        {
-                            int i = 0;
-                            for (; i + 8 <= half_rotary; i += 8)
-                            {
-                                __m256 x0 = _mm256_loadu_ps(head_ptr + i);
-                                __m256 x1 = _mm256_loadu_ps(head_ptr + i + half_rotary);
-                                __m256 cv = _mm256_loadu_ps(cos_ptr + i);
-                                __m256 sv = _mm256_loadu_ps(sin_ptr + i);
-                                _mm256_storeu_ps(head_ptr + i,
-                                                 _mm256_sub_ps(_mm256_mul_ps(x0, cv), _mm256_mul_ps(x1, sv)));
-                                _mm256_storeu_ps(head_ptr + i + half_rotary,
-                                                 _mm256_add_ps(_mm256_mul_ps(x0, sv), _mm256_mul_ps(x1, cv)));
-                            }
-                            for (; i < half_rotary; ++i)
-                            {
-                                float x0 = head_ptr[i], x1 = head_ptr[i + half_rotary];
-                                head_ptr[i] = x0 * cos_ptr[i] - x1 * sin_ptr[i];
-                                head_ptr[i + half_rotary] = x0 * sin_ptr[i] + x1 * cos_ptr[i];
-                            }
-                        }
-#else
-                        for (int i = 0; i < half_rotary; ++i)
-                        {
-                            float x0 = head_ptr[i], x1 = head_ptr[i + half_rotary];
-                            head_ptr[i] = x0 * cos_ptr[i] - x1 * sin_ptr[i];
-                            head_ptr[i + half_rotary] = x0 * sin_ptr[i] + x1 * cos_ptr[i];
-                        }
-#endif
+                        rope_rotate_head_dispatch(head_ptr, cos_ptr, sin_ptr, half_rotary);
                     }
                 }
             }
@@ -3335,7 +3320,7 @@ namespace llaminar2::primitives
     // - Vectorized with AVX512/AVX2
     // =========================================================================
 
-    namespace
+    namespace detail
     {
         // Helper: Compute max|dequantized value| across a Q8_1 head (for common scale)
         inline float compute_q8_1_head_max_abs(const Q8_1Block *blocks, int blocks_per_head)
@@ -3419,7 +3404,7 @@ namespace llaminar2::primitives
         // Helper: Rotate one Q8_1 block pair to Q16_1 using integer arithmetic
         // BlockA is at position b, BlockB is at position b+half_blocks
         // They form rotation pairs: (A[i], B[i]) for i in 0..31
-        inline void rotate_q8_1_block_pair_to_q16_1_avx512(
+        void rotate_q8_1_block_pair_to_q16_1_avx512(
             const Q8_1Block &blockA,
             const Q8_1Block &blockB,
             Q16_1Block &outA,
@@ -3597,7 +3582,7 @@ namespace llaminar2::primitives
         }
 
         // AVX2 version
-        inline void rotate_q8_1_block_pair_to_q16_1_avx2(
+        void rotate_q8_1_block_pair_to_q16_1_avx2(
             const Q8_1Block &blockA,
             const Q8_1Block &blockB,
             Q16_1Block &outA,
@@ -3711,7 +3696,7 @@ namespace llaminar2::primitives
         }
 
         // Scalar fallback
-        inline void rotate_q8_1_block_pair_to_q16_1_scalar(
+        void rotate_q8_1_block_pair_to_q16_1_scalar(
             const Q8_1Block &blockA,
             const Q8_1Block &blockB,
             Q16_1Block &outA,
@@ -3821,7 +3806,8 @@ namespace llaminar2::primitives
             return common_scale;
         }
 
-    } // anonymous namespace
+    } // namespace detail
+    using namespace detail;
 
     void apply_rope_q8_1_to_q16_1(
         const Q8_1Block *Q_in,

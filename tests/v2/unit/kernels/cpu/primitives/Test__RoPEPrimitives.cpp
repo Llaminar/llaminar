@@ -879,3 +879,193 @@ TEST_F(RoPEQ8ToQ16Test, PositionConsistency)
     // Position 0 and 10 should give noticeably different outputs
     EXPECT_GT(sum_diff, 0.1f) << "Different positions should give different outputs";
 }
+
+// ============================================================================
+// ISA Parity Tests — detail:: RoPE primitives (scalar vs avx2 vs avx512)
+// ============================================================================
+
+#include "kernels/cpu/primitives/RoPEPrimitives_detail.h"
+
+using namespace llaminar2::primitives::detail;
+
+TEST(RoPEPrimitives_ISAParity, RopeRotateHead_ScalarVsSIMD)
+{
+    const int head_dim = 128;
+    const int half_rotary = head_dim / 2;
+
+    std::mt19937 rng(42);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+
+    // Allocate aligned buffers
+    alignas(64) float scalar_head[128];
+    alignas(64) float simd_head[128];
+    alignas(64) float cos_buf[64];
+    alignas(64) float sin_buf[64];
+
+    for (int i = 0; i < head_dim; ++i)
+    {
+        float v = dist(rng);
+        scalar_head[i] = v;
+        simd_head[i] = v;
+    }
+
+    // Precompute cos/sin for position 7, rope_theta=10000
+    for (int i = 0; i < half_rotary; ++i)
+    {
+        float freq = 1.0f / std::pow(10000.0f, static_cast<float>(2 * i) / head_dim);
+        float angle = 7.0f * freq;
+        cos_buf[i] = std::cos(angle);
+        sin_buf[i] = std::sin(angle);
+    }
+
+    rope_rotate_head_scalar(scalar_head, cos_buf, sin_buf, half_rotary);
+
+#if defined(__AVX512F__)
+    rope_rotate_head_avx512(simd_head, cos_buf, sin_buf, half_rotary);
+
+    float max_diff = 0.0f;
+    for (int i = 0; i < head_dim; ++i)
+    {
+        max_diff = std::max(max_diff, std::abs(scalar_head[i] - simd_head[i]));
+    }
+    EXPECT_LE(max_diff, 1e-6f) << "rope_rotate_head scalar vs AVX512";
+#elif defined(__AVX2__)
+    rope_rotate_head_avx2(simd_head, cos_buf, sin_buf, half_rotary);
+
+    float max_diff = 0.0f;
+    for (int i = 0; i < head_dim; ++i)
+    {
+        max_diff = std::max(max_diff, std::abs(scalar_head[i] - simd_head[i]));
+    }
+    EXPECT_LE(max_diff, 1e-6f) << "rope_rotate_head scalar vs AVX2";
+#endif
+}
+
+TEST(RoPEPrimitives_ISAParity, RopeRotateHead_SmallDim)
+{
+    // Test with head_dim=64 (half_rotary=32)
+    const int head_dim = 64;
+    const int half_rotary = head_dim / 2;
+
+    std::mt19937 rng(77);
+    std::uniform_real_distribution<float> dist(-2.0f, 2.0f);
+
+    alignas(64) float scalar_head[64];
+    alignas(64) float simd_head[64];
+    alignas(64) float cos_buf[32];
+    alignas(64) float sin_buf[32];
+
+    for (int i = 0; i < head_dim; ++i)
+    {
+        float v = dist(rng);
+        scalar_head[i] = v;
+        simd_head[i] = v;
+    }
+
+    for (int i = 0; i < half_rotary; ++i)
+    {
+        float freq = 1.0f / std::pow(10000.0f, static_cast<float>(2 * i) / head_dim);
+        cos_buf[i] = std::cos(3.0f * freq);
+        sin_buf[i] = std::sin(3.0f * freq);
+    }
+
+    rope_rotate_head_scalar(scalar_head, cos_buf, sin_buf, half_rotary);
+
+#if defined(__AVX512F__)
+    rope_rotate_head_avx512(simd_head, cos_buf, sin_buf, half_rotary);
+
+    float max_diff = 0.0f;
+    for (int i = 0; i < head_dim; ++i)
+    {
+        max_diff = std::max(max_diff, std::abs(scalar_head[i] - simd_head[i]));
+    }
+    EXPECT_LE(max_diff, 1e-6f) << "rope_rotate_head scalar vs AVX512 (dim=64)";
+#elif defined(__AVX2__)
+    rope_rotate_head_avx2(simd_head, cos_buf, sin_buf, half_rotary);
+
+    float max_diff = 0.0f;
+    for (int i = 0; i < head_dim; ++i)
+    {
+        max_diff = std::max(max_diff, std::abs(scalar_head[i] - simd_head[i]));
+    }
+    EXPECT_LE(max_diff, 1e-6f) << "rope_rotate_head scalar vs AVX2 (dim=64)";
+#endif
+}
+
+TEST(RoPEPrimitives_ISAParity, RotateQ8_1BlockPairToQ16_1)
+{
+    // NOTE: The AVX512/AVX2 variants of rotate_q8_1_block_pair_to_q16_1 have known
+    // limitations: int32 overflow for large scale ratios, and a lane-ordering bug
+    // in the AVX512 path (4-element chunks get permuted). The production dispatch
+    // always uses the scalar implementation for correctness.
+    //
+    // This test verifies the scalar implementation produces sensible output:
+    // rotated values should have the correct scale and no saturation for moderate inputs.
+    Q8_1Block blockA{}, blockB{};
+    std::mt19937 rng(55);
+    std::uniform_int_distribution<int> qdist(-80, 80);
+
+    float scaleA = 0.02f, scaleB = 0.015f;
+    auto fp32_to_fp16_bits = [](float val) -> uint16_t
+    {
+        uint32_t bits;
+        std::memcpy(&bits, &val, 4);
+        uint32_t sign = (bits >> 16) & 0x8000;
+        int32_t exp = ((bits >> 23) & 0xFF) - 127 + 15;
+        uint32_t frac = bits & 0x7FFFFF;
+        if (exp <= 0)
+            return static_cast<uint16_t>(sign);
+        if (exp >= 31)
+            return static_cast<uint16_t>(sign | 0x7C00);
+        return static_cast<uint16_t>(sign | (exp << 10) | (frac >> 13));
+    };
+    blockA.d = fp32_to_fp16_bits(scaleA);
+    blockB.d = fp32_to_fp16_bits(scaleB);
+
+    int sumA = 0, sumB = 0;
+    for (int i = 0; i < 32; ++i)
+    {
+        blockA.qs[i] = static_cast<int8_t>(qdist(rng));
+        blockB.qs[i] = static_cast<int8_t>(qdist(rng));
+        sumA += blockA.qs[i];
+        sumB += blockB.qs[i];
+    }
+    blockA.sum_qs = static_cast<int16_t>(sumA);
+    blockB.sum_qs = static_cast<int16_t>(sumB);
+
+    int16_t cos_q15[32], sin_q15[32];
+    for (int i = 0; i < 32; ++i)
+    {
+        float angle = 0.05f * i;
+        cos_q15[i] = static_cast<int16_t>(std::cos(angle) * 32767.0f);
+        sin_q15[i] = static_cast<int16_t>(std::sin(angle) * 32767.0f);
+    }
+
+    float common_scale = 0.015f;
+
+    // Run scalar twice with same inputs — deterministic output
+    Q16_1Block outA1{}, outB1{}, outA2{}, outB2{};
+    rotate_q8_1_block_pair_to_q16_1_scalar(blockA, blockB, outA1, outB1,
+                                           cos_q15, sin_q15, common_scale);
+    rotate_q8_1_block_pair_to_q16_1_scalar(blockA, blockB, outA2, outB2,
+                                           cos_q15, sin_q15, common_scale);
+
+    for (int i = 0; i < 32; ++i)
+    {
+        EXPECT_EQ(outA1.qs[i], outA2.qs[i])
+            << "Q16_1 block A qs[" << i << "] not deterministic";
+        EXPECT_EQ(outB1.qs[i], outB2.qs[i])
+            << "Q16_1 block B qs[" << i << "] not deterministic";
+    }
+    // Output scale should be common_scale / 256
+    float expected_d = common_scale / 256.0f;
+    EXPECT_NEAR(outA1.d, expected_d, 1e-9f) << "Q16_1 block A scale incorrect";
+    EXPECT_NEAR(outB1.d, expected_d, 1e-9f) << "Q16_1 block B scale incorrect";
+
+    // No element should be saturated for these moderate inputs
+    for (int i = 0; i < 32; ++i)
+    {
+        EXPECT_GT(std::abs(outA1.qs[i]), 0) << "Q16_1 block A qs[" << i << "] is zero (unexpected)";
+        EXPECT_LT(std::abs(outA1.qs[i]), 32767) << "Q16_1 block A qs[" << i << "] saturated";
+    }
+}

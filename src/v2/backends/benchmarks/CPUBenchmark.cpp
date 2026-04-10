@@ -13,6 +13,7 @@
  */
 
 #include "CPUBenchmark.h"
+#include "../../utils/CPUFeatures.h"
 #include "utils/Logger.h"
 
 #include <chrono>
@@ -22,18 +23,7 @@
 #include <sys/mman.h> // mmap for NUMA-aware allocation
 #include <omp.h>
 
-// Check for AVX/AVX2/AVX-512 at compile time
-#if defined(__AVX512F__)
-#define HAVE_AVX512 1
-#define SIMD_WIDTH 16 // 16 floats per vector
-#elif defined(__AVX2__) || defined(__AVX__)
-#define HAVE_AVX 1
-#define SIMD_WIDTH 8 // 8 floats per vector
-#else
-#define SIMD_WIDTH 4 // SSE fallback
-#endif
-
-#if defined(__AVX512F__)
+#if defined(__AVX512F__) || defined(__AVX512VNNI__)
 #include <immintrin.h>
 #endif
 
@@ -250,6 +240,8 @@ namespace llaminar2
         int num_threads = getNumThreads();
         size_t fma_per_thread = num_fma / static_cast<size_t>(num_threads);
 
+        const bool use_avx512 = (activeISALevel() >= ISALevel::AVX512);
+
         // Warmup
         for (int w = 0; w < config_.warmup_iterations; ++w)
         {
@@ -258,30 +250,35 @@ namespace llaminar2
                 float a = 1.0001f;
                 float b = 0.9999f;
                 float c = 1.0f;
-#if defined(HAVE_AVX512)
-                __m512 va = _mm512_set1_ps(a);
-                __m512 vb = _mm512_set1_ps(b);
-                __m512 vc = _mm512_set1_ps(c);
-                for (size_t i = 0; i < fma_per_thread / SIMD_WIDTH; ++i)
+                if (use_avx512)
                 {
-                    vc = _mm512_fmadd_ps(va, vb, vc);
-                    va = _mm512_fmadd_ps(vb, vc, va);
-                    vb = _mm512_fmadd_ps(vc, va, vb);
-                    vc = _mm512_fmadd_ps(va, vb, vc);
-                }
-                float result[16];
-                _mm512_storeu_ps(result, vc);
-                doNotOptimize(result[0]);
-#else
-                for (size_t i = 0; i < fma_per_thread; ++i)
-                {
-                    c = a * b + c;
-                    a = b * c + a;
-                    b = c * a + b;
-                    c = a * b + c;
-                }
-                doNotOptimize(c);
+#if defined(__AVX512F__)
+                    __m512 va = _mm512_set1_ps(a);
+                    __m512 vb = _mm512_set1_ps(b);
+                    __m512 vc = _mm512_set1_ps(c);
+                    for (size_t i = 0; i < fma_per_thread / 16; ++i)
+                    {
+                        vc = _mm512_fmadd_ps(va, vb, vc);
+                        va = _mm512_fmadd_ps(vb, vc, va);
+                        vb = _mm512_fmadd_ps(vc, va, vb);
+                        vc = _mm512_fmadd_ps(va, vb, vc);
+                    }
+                    float result[16];
+                    _mm512_storeu_ps(result, vc);
+                    doNotOptimize(result[0]);
 #endif
+                }
+                else
+                {
+                    for (size_t i = 0; i < fma_per_thread; ++i)
+                    {
+                        c = a * b + c;
+                        a = b * c + a;
+                        b = c * a + b;
+                        c = a * b + c;
+                    }
+                    doNotOptimize(c);
+                }
             }
         }
 
@@ -296,31 +293,36 @@ namespace llaminar2
                 float a = 1.0001f;
                 float b = 0.9999f;
                 float c = 1.0f;
-#if defined(HAVE_AVX512)
-                __m512 va = _mm512_set1_ps(a);
-                __m512 vb = _mm512_set1_ps(b);
-                __m512 vc = _mm512_set1_ps(c);
-                // Each iteration: 4 FMAs * 16 elements = 128 FLOPS
-                for (size_t i = 0; i < fma_per_thread / SIMD_WIDTH; ++i)
+                if (use_avx512)
                 {
-                    vc = _mm512_fmadd_ps(va, vb, vc);
-                    va = _mm512_fmadd_ps(vb, vc, va);
-                    vb = _mm512_fmadd_ps(vc, va, vb);
-                    vc = _mm512_fmadd_ps(va, vb, vc);
-                }
-                float result[16];
-                _mm512_storeu_ps(result, vc);
-                doNotOptimize(result[0]);
-#else
-                for (size_t i = 0; i < fma_per_thread; ++i)
-                {
-                    c = a * b + c;
-                    a = b * c + a;
-                    b = c * a + b;
-                    c = a * b + c;
-                }
-                doNotOptimize(c);
+#if defined(__AVX512F__)
+                    __m512 va = _mm512_set1_ps(a);
+                    __m512 vb = _mm512_set1_ps(b);
+                    __m512 vc = _mm512_set1_ps(c);
+                    // Each iteration: 4 FMAs * 16 elements = 128 FLOPS
+                    for (size_t i = 0; i < fma_per_thread / 16; ++i)
+                    {
+                        vc = _mm512_fmadd_ps(va, vb, vc);
+                        va = _mm512_fmadd_ps(vb, vc, va);
+                        vb = _mm512_fmadd_ps(vc, va, vb);
+                        vc = _mm512_fmadd_ps(va, vb, vc);
+                    }
+                    float result[16];
+                    _mm512_storeu_ps(result, vc);
+                    doNotOptimize(result[0]);
 #endif
+                }
+                else
+                {
+                    for (size_t i = 0; i < fma_per_thread; ++i)
+                    {
+                        c = a * b + c;
+                        a = b * c + a;
+                        b = c * a + b;
+                        c = a * b + c;
+                    }
+                    doNotOptimize(c);
+                }
             }
         }
 
@@ -343,6 +345,8 @@ namespace llaminar2
         int num_threads = getNumThreads();
         size_t elements_per_thread = num_elements / static_cast<size_t>(num_threads);
 
+        const bool use_vnni = (activeISALevel() >= ISALevel::AVX512);
+
         // Warmup
         for (int w = 0; w < config_.warmup_iterations; ++w)
         {
@@ -351,28 +355,33 @@ namespace llaminar2
                 int32_t acc = 0;
                 int8_t a = 1;
                 int8_t b = 2;
+                if (use_vnni)
+                {
 #if defined(__AVX512VNNI__)
-                // Use VNNI for true INT8 throughput measurement
-                __m512i va = _mm512_set1_epi8(a);
-                __m512i vb = _mm512_set1_epi8(b);
-                __m512i vacc = _mm512_setzero_si512();
-                for (size_t i = 0; i < elements_per_thread / 64; ++i)
-                {
-                    vacc = _mm512_dpbusd_epi32(vacc, va, vb);
-                }
-                int32_t result[16];
-                _mm512_storeu_si512(result, vacc);
-                doNotOptimize(result[0]);
-#else
-                // Scalar fallback
-                for (size_t i = 0; i < elements_per_thread; ++i)
-                {
-                    acc += static_cast<int32_t>(a) * static_cast<int32_t>(b);
-                    a = static_cast<int8_t>(acc & 0x7F);
-                    b = static_cast<int8_t>((acc >> 7) & 0x7F);
-                }
-                doNotOptimize(acc);
+                    // Use VNNI for true INT8 throughput measurement
+                    __m512i va = _mm512_set1_epi8(a);
+                    __m512i vb = _mm512_set1_epi8(b);
+                    __m512i vacc = _mm512_setzero_si512();
+                    for (size_t i = 0; i < elements_per_thread / 64; ++i)
+                    {
+                        vacc = _mm512_dpbusd_epi32(vacc, va, vb);
+                    }
+                    int32_t result[16];
+                    _mm512_storeu_si512(result, vacc);
+                    doNotOptimize(result[0]);
 #endif
+                }
+                else
+                {
+                    // Scalar fallback
+                    for (size_t i = 0; i < elements_per_thread; ++i)
+                    {
+                        acc += static_cast<int32_t>(a) * static_cast<int32_t>(b);
+                        a = static_cast<int8_t>(acc & 0x7F);
+                        b = static_cast<int8_t>((acc >> 7) & 0x7F);
+                    }
+                    doNotOptimize(acc);
+                }
             }
         }
 
@@ -387,26 +396,31 @@ namespace llaminar2
                 int32_t acc = 0;
                 int8_t a = 1;
                 int8_t b = 2;
+                if (use_vnni)
+                {
 #if defined(__AVX512VNNI__)
-                __m512i va = _mm512_set1_epi8(a);
-                __m512i vb = _mm512_set1_epi8(b);
-                __m512i vacc = _mm512_setzero_si512();
-                for (size_t i = 0; i < elements_per_thread / 64; ++i)
-                {
-                    vacc = _mm512_dpbusd_epi32(vacc, va, vb);
-                }
-                int32_t result[16];
-                _mm512_storeu_si512(result, vacc);
-                doNotOptimize(result[0]);
-#else
-                for (size_t i = 0; i < elements_per_thread; ++i)
-                {
-                    acc += static_cast<int32_t>(a) * static_cast<int32_t>(b);
-                    a = static_cast<int8_t>(acc & 0x7F);
-                    b = static_cast<int8_t>((acc >> 7) & 0x7F);
-                }
-                doNotOptimize(acc);
+                    __m512i va = _mm512_set1_epi8(a);
+                    __m512i vb = _mm512_set1_epi8(b);
+                    __m512i vacc = _mm512_setzero_si512();
+                    for (size_t i = 0; i < elements_per_thread / 64; ++i)
+                    {
+                        vacc = _mm512_dpbusd_epi32(vacc, va, vb);
+                    }
+                    int32_t result[16];
+                    _mm512_storeu_si512(result, vacc);
+                    doNotOptimize(result[0]);
 #endif
+                }
+                else
+                {
+                    for (size_t i = 0; i < elements_per_thread; ++i)
+                    {
+                        acc += static_cast<int32_t>(a) * static_cast<int32_t>(b);
+                        a = static_cast<int8_t>(acc & 0x7F);
+                        b = static_cast<int8_t>((acc >> 7) & 0x7F);
+                    }
+                    doNotOptimize(acc);
+                }
             }
         }
 

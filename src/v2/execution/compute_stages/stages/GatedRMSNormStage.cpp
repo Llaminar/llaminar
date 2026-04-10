@@ -10,8 +10,12 @@
 
 #include <cmath>
 
-#if defined(__AVX512F__)
+#if defined(__AVX512F__) || defined(__AVX2__)
 #include <immintrin.h>
+#endif
+
+#if defined(__AVX2__)
+#include "../../../kernels/cpu/simd/AVX2Helpers.h"
 #endif
 
 // GPU kernel declarations
@@ -34,6 +38,177 @@ extern "C" bool rocmGDN_gated_rmsnorm(
 
 namespace llaminar2
 {
+
+    // ========================================================================
+    // Named ISA implementations: gated_rmsnorm_group
+    // Per-group: RMS normalize, apply gamma (with optional +1), gate (with optional SiLU)
+    // ========================================================================
+
+    void gated_rmsnorm_group_scalar(const float *input_data, const float *gate_data,
+                                    const float *gamma_data, float *output_data,
+                                    size_t offset, size_t norm_dim, size_t gamma_period,
+                                    float eps, bool subtract_one, bool gate_silu)
+    {
+        float sum_sq = 0.0f;
+        for (size_t j = 0; j < norm_dim; ++j)
+        {
+            const float v = input_data[offset + j];
+            sum_sq += v * v;
+        }
+        const float rms = std::sqrt(sum_sq / static_cast<float>(norm_dim) + eps);
+        const float inv_rms = 1.0f / rms;
+
+        for (size_t j = 0; j < norm_dim; ++j)
+        {
+            const float normalized = input_data[offset + j] * inv_rms;
+            const float gamma_eff = subtract_one
+                                        ? (1.0f + gamma_data[j % gamma_period])
+                                        : gamma_data[j % gamma_period];
+            const float gate_val = gate_data[offset + j];
+            const float gate_act = gate_silu
+                                       ? gate_val / (1.0f + std::exp(-gate_val))
+                                       : gate_val;
+            output_data[offset + j] = normalized * gamma_eff * gate_act;
+        }
+    }
+
+#if defined(__AVX2__)
+    void gated_rmsnorm_group_avx2(const float *input_data, const float *gate_data,
+                                  const float *gamma_data, float *output_data,
+                                  size_t offset, size_t norm_dim, size_t gamma_period,
+                                  float eps, bool subtract_one, bool gate_silu)
+    {
+        __m256 vsum_sq = _mm256_setzero_ps();
+        const size_t nd_vec = norm_dim & ~static_cast<size_t>(7);
+        size_t j = 0;
+        for (; j < nd_vec; j += 8)
+        {
+            __m256 vv = _mm256_loadu_ps(input_data + offset + j);
+            vsum_sq = _mm256_fmadd_ps(vv, vv, vsum_sq);
+        }
+        float sum_sq = avx2::hsum_ps(vsum_sq);
+        for (; j < norm_dim; ++j)
+        {
+            const float v = input_data[offset + j];
+            sum_sq += v * v;
+        }
+        const float inv_rms = 1.0f / std::sqrt(sum_sq / static_cast<float>(norm_dim) + eps);
+
+        const __m256 vinv_rms = _mm256_set1_ps(inv_rms);
+        const __m256 vone = _mm256_set1_ps(1.0f);
+        j = 0;
+        for (; j < nd_vec; j += 8)
+        {
+            __m256 vnorm = _mm256_mul_ps(_mm256_loadu_ps(input_data + offset + j), vinv_rms);
+            __m256 vgamma = _mm256_loadu_ps(gamma_data + (j % gamma_period));
+            if (subtract_one)
+                vgamma = _mm256_add_ps(vone, vgamma);
+            __m256 vgate = _mm256_loadu_ps(gate_data + offset + j);
+            __m256 vgate_act;
+            if (gate_silu)
+                vgate_act = avx2::fast_silu(vgate);
+            else
+                vgate_act = vgate;
+            _mm256_storeu_ps(output_data + offset + j, _mm256_mul_ps(_mm256_mul_ps(vnorm, vgamma), vgate_act));
+        }
+        for (; j < norm_dim; ++j)
+        {
+            const float normalized = input_data[offset + j] * inv_rms;
+            const float gamma_eff = subtract_one ? (1.0f + gamma_data[j % gamma_period]) : gamma_data[j % gamma_period];
+            const float gate_val = gate_data[offset + j];
+            const float gate_act = gate_silu ? gate_val / (1.0f + std::exp(-gate_val)) : gate_val;
+            output_data[offset + j] = normalized * gamma_eff * gate_act;
+        }
+    }
+#endif
+
+#if defined(__AVX512F__)
+    void gated_rmsnorm_group_avx512(const float *input_data, const float *gate_data,
+                                    const float *gamma_data, float *output_data,
+                                    size_t offset, size_t norm_dim, size_t gamma_period,
+                                    float eps, bool subtract_one, bool gate_silu)
+    {
+        __m512 vsum_sq = _mm512_setzero_ps();
+        const size_t nd_vec = norm_dim & ~static_cast<size_t>(15);
+        size_t j = 0;
+        for (; j < nd_vec; j += 16)
+        {
+            __m512 vv = _mm512_loadu_ps(input_data + offset + j);
+            vsum_sq = _mm512_fmadd_ps(vv, vv, vsum_sq);
+        }
+        float sum_sq = _mm512_reduce_add_ps(vsum_sq);
+        for (; j < norm_dim; ++j)
+        {
+            const float v = input_data[offset + j];
+            sum_sq += v * v;
+        }
+        const float inv_rms = 1.0f / std::sqrt(sum_sq / static_cast<float>(norm_dim) + eps);
+
+        const __m512 vinv_rms = _mm512_set1_ps(inv_rms);
+        const __m512 vone = _mm512_set1_ps(1.0f);
+        const __m512 vneg1 = _mm512_set1_ps(-1.0f);
+        j = 0;
+        for (; j < nd_vec; j += 16)
+        {
+            __m512 vnorm = _mm512_mul_ps(_mm512_loadu_ps(input_data + offset + j), vinv_rms);
+            __m512 vgamma = _mm512_loadu_ps(gamma_data + (j % gamma_period));
+            if (subtract_one)
+                vgamma = _mm512_add_ps(vone, vgamma);
+            __m512 vgate = _mm512_loadu_ps(gate_data + offset + j);
+            __m512 vgate_act;
+            if (gate_silu)
+            {
+                __m512 neg_g = _mm512_mul_ps(vgate, vneg1);
+                neg_g = _mm512_max_ps(_mm512_set1_ps(-88.0f), _mm512_min_ps(_mm512_set1_ps(88.0f), neg_g));
+                const __m512 vlog2e = _mm512_set1_ps(1.4426950408889634f);
+                const __m512 vln2 = _mm512_set1_ps(0.6931471805599453f);
+                __m512 neg_g_scaled = _mm512_mul_ps(neg_g, vlog2e);
+                __m512 vn = _mm512_roundscale_ps(neg_g_scaled, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+                __m512 vf = _mm512_sub_ps(neg_g_scaled, vn);
+                __m512 vp = _mm512_fmadd_ps(_mm512_set1_ps(0.0013333558146428f), vf, _mm512_set1_ps(0.0096181291076285f));
+                vp = _mm512_fmadd_ps(vp, vf, _mm512_set1_ps(0.0555041086648216f));
+                vp = _mm512_fmadd_ps(vp, vf, _mm512_set1_ps(0.2402265069591007f));
+                vp = _mm512_fmadd_ps(vp, vf, vln2);
+                vp = _mm512_fmadd_ps(vp, vf, vone);
+                __m512i vi_n = _mm512_add_epi32(_mm512_cvtps_epi32(vn), _mm512_set1_epi32(127));
+                __m512 v2n = _mm512_castsi512_ps(_mm512_slli_epi32(vi_n, 23));
+                __m512 vexp = _mm512_mul_ps(vp, v2n);
+                __m512 vsig = _mm512_div_ps(vone, _mm512_add_ps(vone, vexp));
+                vgate_act = _mm512_mul_ps(vgate, vsig);
+            }
+            else
+            {
+                vgate_act = vgate;
+            }
+            _mm512_storeu_ps(output_data + offset + j, _mm512_mul_ps(_mm512_mul_ps(vnorm, vgamma), vgate_act));
+        }
+        for (; j < norm_dim; ++j)
+        {
+            const float normalized = input_data[offset + j] * inv_rms;
+            const float gamma_eff = subtract_one ? (1.0f + gamma_data[j % gamma_period]) : gamma_data[j % gamma_period];
+            const float gate_val = gate_data[offset + j];
+            const float gate_act = gate_silu ? gate_val / (1.0f + std::exp(-gate_val)) : gate_val;
+            output_data[offset + j] = normalized * gamma_eff * gate_act;
+        }
+    }
+#endif
+
+    inline void gated_rmsnorm_group(const float *input_data, const float *gate_data,
+                                    const float *gamma_data, float *output_data,
+                                    size_t offset, size_t norm_dim, size_t gamma_period,
+                                    float eps, bool subtract_one, bool gate_silu)
+    {
+#if defined(__AVX512F__)
+        gated_rmsnorm_group_avx512(input_data, gate_data, gamma_data, output_data,
+                                   offset, norm_dim, gamma_period, eps, subtract_one, gate_silu);
+#elif defined(__AVX2__)
+        gated_rmsnorm_group_avx2(input_data, gate_data, gamma_data, output_data,
+                                 offset, norm_dim, gamma_period, eps, subtract_one, gate_silu);
+#else
+        gated_rmsnorm_group_scalar(input_data, gate_data, gamma_data, output_data,
+                                   offset, norm_dim, gamma_period, eps, subtract_one, gate_silu);
+#endif
+    }
 
     GatedRMSNormStage::GatedRMSNormStage(Params params)
         : IComputeStage(params.device_id), params_(std::move(params))
@@ -160,101 +335,8 @@ namespace llaminar2
                 const size_t g = work_idx % n_groups;
                 const size_t offset = static_cast<size_t>(t) * d_model + g * norm_dim;
 
-                // Compute RMS over norm_dim elements
-#if defined(__AVX512F__)
-                {
-                    __m512 vsum_sq = _mm512_setzero_ps();
-                    const size_t nd_vec = norm_dim & ~static_cast<size_t>(15);
-                    size_t j = 0;
-                    for (; j < nd_vec; j += 16)
-                    {
-                        __m512 vv = _mm512_loadu_ps(input_data + offset + j);
-                        vsum_sq = _mm512_fmadd_ps(vv, vv, vsum_sq);
-                    }
-                    float sum_sq = _mm512_reduce_add_ps(vsum_sq);
-                    for (; j < norm_dim; ++j)
-                    {
-                        const float v = input_data[offset + j];
-                        sum_sq += v * v;
-                    }
-                    const float inv_rms = 1.0f / std::sqrt(sum_sq / static_cast<float>(norm_dim) + eps);
-
-                    // Normalize, apply gamma, multiply by gate
-                    const __m512 vinv_rms = _mm512_set1_ps(inv_rms);
-                    const __m512 vone = _mm512_set1_ps(1.0f);
-                    const __m512 vneg1 = _mm512_set1_ps(-1.0f);
-                    j = 0;
-                    for (; j < nd_vec; j += 16)
-                    {
-                        __m512 vnorm = _mm512_mul_ps(_mm512_loadu_ps(input_data + offset + j), vinv_rms);
-                        __m512 vgamma = _mm512_loadu_ps(gamma_data + (j % gamma_period));
-                        if (subtract_one)
-                            vgamma = _mm512_add_ps(vone, vgamma);
-                        __m512 vgate = _mm512_loadu_ps(gate_data + offset + j);
-                        __m512 vgate_act;
-                        if (gate_silu)
-                        {
-                            // SiLU(x) = x * sigmoid(x) = x / (1 + exp(-x))
-                            // Fast exp via range reduction: exp(x) = 2^(x*log2e) = 2^n * 2^f
-                            // where n = round(x*log2e) and f = x*log2e - n ∈ [-0.5, 0.5].
-                            // Polynomial approximates 2^f (Taylor of exp(f*ln2)).
-                            __m512 neg_g = _mm512_mul_ps(vgate, vneg1);
-                            neg_g = _mm512_max_ps(_mm512_set1_ps(-88.0f), _mm512_min_ps(_mm512_set1_ps(88.0f), neg_g));
-                            const __m512 vlog2e = _mm512_set1_ps(1.4426950408889634f);
-                            const __m512 vln2 = _mm512_set1_ps(0.6931471805599453f);
-                            __m512 neg_g_scaled = _mm512_mul_ps(neg_g, vlog2e);
-                            __m512 vn = _mm512_roundscale_ps(neg_g_scaled, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
-                            __m512 vf = _mm512_sub_ps(neg_g_scaled, vn);
-                            __m512 vp = _mm512_fmadd_ps(_mm512_set1_ps(0.0013333558146428f), vf, _mm512_set1_ps(0.0096181291076285f));
-                            vp = _mm512_fmadd_ps(vp, vf, _mm512_set1_ps(0.0555041086648216f));
-                            vp = _mm512_fmadd_ps(vp, vf, _mm512_set1_ps(0.2402265069591007f));
-                            vp = _mm512_fmadd_ps(vp, vf, vln2);
-                            vp = _mm512_fmadd_ps(vp, vf, vone);
-                            __m512i vi_n = _mm512_add_epi32(_mm512_cvtps_epi32(vn), _mm512_set1_epi32(127));
-                            __m512 v2n = _mm512_castsi512_ps(_mm512_slli_epi32(vi_n, 23));
-                            __m512 vexp = _mm512_mul_ps(vp, v2n);
-                            __m512 vsig = _mm512_div_ps(vone, _mm512_add_ps(vone, vexp));
-                            vgate_act = _mm512_mul_ps(vgate, vsig);
-                        }
-                        else
-                        {
-                            vgate_act = vgate;
-                        }
-                        _mm512_storeu_ps(output_data + offset + j, _mm512_mul_ps(_mm512_mul_ps(vnorm, vgamma), vgate_act));
-                    }
-                    for (; j < norm_dim; ++j)
-                    {
-                        const float normalized = input_data[offset + j] * inv_rms;
-                        const float gamma_eff = subtract_one ? (1.0f + gamma_data[j % gamma_period]) : gamma_data[j % gamma_period];
-                        const float gate_val = gate_data[offset + j];
-                        const float gate_act = gate_silu ? gate_val / (1.0f + std::exp(-gate_val)) : gate_val;
-                        output_data[offset + j] = normalized * gamma_eff * gate_act;
-                    }
-                }
-#else
-                float sum_sq = 0.0f;
-                for (size_t j = 0; j < norm_dim; ++j)
-                {
-                    const float v = input_data[offset + j];
-                    sum_sq += v * v;
-                }
-                const float rms = std::sqrt(sum_sq / static_cast<float>(norm_dim) + eps);
-                const float inv_rms = 1.0f / rms;
-
-                // Normalize, apply gamma (with optional subtract_one), multiply by gate
-                for (size_t j = 0; j < norm_dim; ++j)
-                {
-                    const float normalized = input_data[offset + j] * inv_rms;
-                    const float gamma_eff = subtract_one
-                                                ? (1.0f + gamma_data[j % gamma_period])
-                                                : gamma_data[j % gamma_period];
-                    const float gate_val = gate_data[offset + j];
-                    const float gate_act = gate_silu
-                                               ? gate_val / (1.0f + std::exp(-gate_val))
-                                               : gate_val;
-                    output_data[offset + j] = normalized * gamma_eff * gate_act;
-                }
-#endif
+                gated_rmsnorm_group(input_data, gate_data, gamma_data, output_data,
+                                    offset, norm_dim, gamma_period, eps, subtract_one, gate_silu);
             }
         };
         OMP_WORKSHARE_REGION(do_work);

@@ -993,6 +993,10 @@ namespace llaminar2
     void GlobalBackendRouter::shutdown()
     {
         instance_.reset();
+        // Drain the RCCL coordinator pool after all backends are destroyed.
+        // This ensures ncclCommDestroy only happens once at process shutdown,
+        // avoiding the ROCm CLR state accumulation bug from repeated cycles.
+        RCCLBackend::drainCoordinatorPool();
     }
 
     // =========================================================================

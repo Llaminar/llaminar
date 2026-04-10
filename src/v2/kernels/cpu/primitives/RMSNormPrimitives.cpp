@@ -17,6 +17,7 @@
 #endif
 
 #include "../../../utils/OpenMPUtils.h"
+#include "../../../utils/CPUFeatures.h"
 
 #if defined(__AVX512F__)
 #include <immintrin.h>
@@ -201,7 +202,7 @@ namespace llaminar2::primitives
 #endif
 #endif
 
-    namespace
+    namespace detail
     {
         inline bool want_parallel(std::size_t rows, std::size_t cols, const RMSNormExecOptions &opts)
         {
@@ -227,7 +228,7 @@ namespace llaminar2::primitives
         }
 
 #if defined(__AVX512F__)
-        __attribute__((always_inline)) inline double compute_sumsq_avx512(const float *row, std::size_t cols)
+        double compute_sumsq_avx512(const float *row, std::size_t cols)
         {
             double acc = 0.0;
             long long c = 0;
@@ -309,8 +310,9 @@ namespace llaminar2::primitives
             }
             return acc;
         }
-#elif defined(__AVX2__)
-        __attribute__((always_inline)) inline double compute_sumsq_avx2(const float *row, std::size_t cols)
+#endif
+#if defined(__AVX2__)
+        double compute_sumsq_avx2(const float *row, std::size_t cols)
         {
             double acc = 0.0;
             long long c = 0;
@@ -414,7 +416,7 @@ namespace llaminar2::primitives
         }
 #endif
 
-        __attribute__((always_inline)) inline double compute_sumsq_scalar(const float *row, std::size_t cols)
+        double compute_sumsq_scalar(const float *row, std::size_t cols)
         {
             double s_scalar = 0.0;
 #pragma omp simd reduction(+ : s_scalar)
@@ -426,18 +428,27 @@ namespace llaminar2::primitives
             return s_scalar;
         }
 
+// --- ISA stubs for runtime dispatch ---
+#if !defined(__AVX2__)
+        double compute_sumsq_avx2(const float *row, std::size_t cols)
+        {
+            return compute_sumsq_scalar(row, cols);
+        }
+#endif
+#if !defined(__AVX512F__)
+        double compute_sumsq_avx512(const float *row, std::size_t cols)
+        {
+            return compute_sumsq_avx2(row, cols);
+        }
+#endif
+
         __attribute__((always_inline)) inline double compute_sumsq_dispatch(const float *row, std::size_t cols)
         {
-#if defined(__AVX512F__)
-            return compute_sumsq_avx512(row, cols);
-#elif defined(__AVX2__)
-            return compute_sumsq_avx2(row, cols);
-#else
-            return compute_sumsq_scalar(row, cols);
-#endif
+            return ISA_DISPATCH_RETVAL(compute_sumsq, row, cols);
         }
 
-    } // anonymous namespace
+    } // namespace detail
+    using namespace detail;
 
     void rmsnorm_compute_row_sumsq_vectorized(
         const float *src,
@@ -729,6 +740,131 @@ namespace llaminar2::primitives
     // INT32 RMSNorm Implementation (for full INT8 pipelines)
     // ========================================================================
 
+    namespace detail
+    {
+        double compute_rms_sq_int32_scalar(const int32_t *row, std::size_t cols)
+        {
+            double acc = 0.0;
+            for (std::size_t c = 0; c < cols; ++c)
+            {
+                double v = (double)row[c];
+                acc += v * v;
+            }
+            return acc;
+        }
+
+#if defined(__AVX2__)
+        double compute_rms_sq_int32_avx2(const int32_t *row, std::size_t cols)
+        {
+            double acc = 0.0;
+            long long c = 0;
+            __m256 acc0 = _mm256_setzero_ps();
+            __m256 acc1 = _mm256_setzero_ps();
+
+            for (; c + 16 <= (long long)cols; c += 16)
+            {
+                __m256i i32_0 = _mm256_loadu_si256((__m256i *)(row + c));
+                __m256i i32_1 = _mm256_loadu_si256((__m256i *)(row + c + 8));
+                __m256 f0 = _mm256_cvtepi32_ps(i32_0);
+                __m256 f1 = _mm256_cvtepi32_ps(i32_1);
+                acc0 = _mm256_fmadd_ps(f0, f0, acc0);
+                acc1 = _mm256_fmadd_ps(f1, f1, acc1);
+            }
+
+            __m256 acc_all = _mm256_add_ps(acc0, acc1);
+            __m128 lo = _mm256_castps256_ps128(acc_all);
+            __m128 hi = _mm256_extractf128_ps(acc_all, 1);
+            __m128 sum2 = _mm_add_ps(lo, hi);
+            __m128 shuf = _mm_movehdup_ps(sum2);
+            __m128 sums = _mm_add_ps(sum2, shuf);
+            shuf = _mm_movehl_ps(shuf, sums);
+            sums = _mm_add_ss(sums, shuf);
+            float partial;
+            _mm_store_ss(&partial, sums);
+            acc += partial;
+
+            for (; c + 8 <= (long long)cols; c += 8)
+            {
+                __m256i i32 = _mm256_loadu_si256((__m256i *)(row + c));
+                __m256 f = _mm256_cvtepi32_ps(i32);
+                __m256 sq = _mm256_mul_ps(f, f);
+                __m128 lo2 = _mm256_castps256_ps128(sq);
+                __m128 hi2 = _mm256_extractf128_ps(sq, 1);
+                __m128 sumv = _mm_add_ps(lo2, hi2);
+                __m128 sh2 = _mm_movehdup_ps(sumv);
+                __m128 sumv2 = _mm_add_ps(sumv, sh2);
+                sh2 = _mm_movehl_ps(sh2, sumv2);
+                sumv2 = _mm_add_ss(sumv2, sh2);
+                float p;
+                _mm_store_ss(&p, sumv2);
+                acc += p;
+            }
+
+            for (; c < (long long)cols; ++c)
+            {
+                double v = (double)row[c];
+                acc += v * v;
+            }
+            return acc;
+        }
+#endif
+
+#if defined(__AVX512F__)
+        double compute_rms_sq_int32_avx512(const int32_t *row, std::size_t cols)
+        {
+            double acc = 0.0;
+            long long c = 0;
+            __m512d dacc0 = _mm512_setzero_pd();
+            __m512d dacc1 = _mm512_setzero_pd();
+
+            for (; c + 16 <= (long long)cols; c += 16)
+            {
+                __m512i i32_lo = _mm512_loadu_si512((__m512i *)(row + c));
+                __m256i i32_lo_256 = _mm512_castsi512_si256(i32_lo);
+                __m256i i32_hi_256 = _mm512_extracti64x4_epi64(i32_lo, 1);
+                __m512d d0 = _mm512_cvtepi32_pd(i32_lo_256);
+                __m512d d1 = _mm512_cvtepi32_pd(i32_hi_256);
+                dacc0 = _mm512_fmadd_pd(d0, d0, dacc0);
+                dacc1 = _mm512_fmadd_pd(d1, d1, dacc1);
+            }
+
+            acc += _mm512_reduce_add_pd(dacc0);
+            acc += _mm512_reduce_add_pd(dacc1);
+
+            for (; c + 8 <= (long long)cols; c += 8)
+            {
+                __m256i i32 = _mm256_loadu_si256((__m256i *)(row + c));
+                __m512d d = _mm512_cvtepi32_pd(i32);
+                __m512d sq = _mm512_mul_pd(d, d);
+                acc += _mm512_reduce_add_pd(sq);
+            }
+
+            for (; c < (long long)cols; ++c)
+            {
+                double v = (double)row[c];
+                acc += v * v;
+            }
+            return acc;
+        }
+#endif
+
+// --- ISA stubs for runtime dispatch ---
+#if !defined(__AVX2__)
+        double compute_rms_sq_int32_avx2(const int32_t *row, std::size_t cols)
+        {
+            return compute_rms_sq_int32_scalar(row, cols);
+        }
+#endif
+#if !defined(__AVX512F__)
+        double compute_rms_sq_int32_avx512(const int32_t *row, std::size_t cols)
+        {
+            return compute_rms_sq_int32_avx2(row, cols);
+        }
+#endif
+
+    } // namespace detail
+    using namespace detail;
+
     void rmsnorm_compute_row_sumsq_int32_vectorized(
         const int32_t *src,
         std::size_t rows,
@@ -746,124 +882,7 @@ namespace llaminar2::primitives
             const int32_t *row = src + (std::size_t)r * cols;
             double acc = 0.0;
 
-#if defined(__AVX512F__)
-            // AVX512: Process 16 INT32 values per iteration (double accumulation)
-            long long c = 0;
-            __m512d dacc0 = _mm512_setzero_pd();
-            __m512d dacc1 = _mm512_setzero_pd();
-
-            for (; c + 16 <= (long long)cols; c += 16)
-            {
-                // Load 16 INT32 values
-                __m512i i32_lo = _mm512_loadu_si512((__m512i *)(row + c)); // 0-15
-
-                // Convert INT32 to double (8 at a time)
-                __m256i i32_lo_256 = _mm512_castsi512_si256(i32_lo);
-                __m256i i32_hi_256 = _mm512_extracti64x4_epi64(i32_lo, 1);
-
-                __m512d d0 = _mm512_cvtepi32_pd(i32_lo_256); // 0-7
-                __m512d d1 = _mm512_cvtepi32_pd(i32_hi_256); // 8-15
-
-                // FMA: acc += d * d
-                dacc0 = _mm512_fmadd_pd(d0, d0, dacc0);
-                dacc1 = _mm512_fmadd_pd(d1, d1, dacc1);
-            }
-
-            // Horizontal reduction
-            acc += _mm512_reduce_add_pd(dacc0);
-            acc += _mm512_reduce_add_pd(dacc1);
-
-            // Tail: 8-int32 blocks
-            for (; c + 8 <= (long long)cols; c += 8)
-            {
-                __m256i i32 = _mm256_loadu_si256((__m256i *)(row + c));
-                __m512d d = _mm512_cvtepi32_pd(i32);
-                __m512d sq = _mm512_mul_pd(d, d);
-                acc += _mm512_reduce_add_pd(sq);
-            }
-
-            // Scalar tail
-            for (; c < (long long)cols; ++c)
-            {
-                double v = (double)row[c];
-                acc += v * v;
-            }
-
-#elif defined(__AVX2__)
-            // AVX2: Process 16 INT32 values per iteration (FP32 accumulation, then convert to double)
-            long long c = 0;
-            __m256 acc0 = _mm256_setzero_ps();
-            __m256 acc1 = _mm256_setzero_ps();
-
-            for (; c + 16 <= (long long)cols; c += 16)
-            {
-                // Load 16 INT32 values
-                __m256i i32_0 = _mm256_loadu_si256((__m256i *)(row + c));
-                __m256i i32_1 = _mm256_loadu_si256((__m256i *)(row + c + 8));
-
-                // Convert INT32 to FP32
-                __m256 f0 = _mm256_cvtepi32_ps(i32_0);
-                __m256 f1 = _mm256_cvtepi32_ps(i32_1);
-
-                // FMA: acc += f * f
-                acc0 = _mm256_fmadd_ps(f0, f0, acc0);
-                acc1 = _mm256_fmadd_ps(f1, f1, acc1);
-            }
-
-            // Combine accumulators and reduce to scalar
-            __m256 acc_all = _mm256_add_ps(acc0, acc1);
-
-            // Horizontal reduction
-            __m128 lo = _mm256_castps256_ps128(acc_all);
-            __m128 hi = _mm256_extractf128_ps(acc_all, 1);
-            __m128 sum2 = _mm_add_ps(lo, hi);
-            __m128 shuf = _mm_movehdup_ps(sum2);
-            __m128 sums = _mm_add_ps(sum2, shuf);
-            shuf = _mm_movehl_ps(shuf, sums);
-            sums = _mm_add_ss(sums, shuf);
-
-            float partial;
-            _mm_store_ss(&partial, sums);
-            acc += partial;
-
-            // Tail: 8-element blocks
-            for (; c + 8 <= (long long)cols; c += 8)
-            {
-                __m256i i32 = _mm256_loadu_si256((__m256i *)(row + c));
-                __m256 f = _mm256_cvtepi32_ps(i32);
-                __m256 sq = _mm256_mul_ps(f, f);
-
-                __m128 lo2 = _mm256_castps256_ps128(sq);
-                __m128 hi2 = _mm256_extractf128_ps(sq, 1);
-                __m128 sumv = _mm_add_ps(lo2, hi2);
-                __m128 sh2 = _mm_movehdup_ps(sumv);
-                __m128 sumv2 = _mm_add_ps(sumv, sh2);
-                sh2 = _mm_movehl_ps(sh2, sumv2);
-                sumv2 = _mm_add_ss(sumv2, sh2);
-
-                float p;
-                _mm_store_ss(&p, sumv2);
-                acc += p;
-            }
-
-            // Scalar tail
-            for (; c < (long long)cols; ++c)
-            {
-                double v = (double)row[c];
-                acc += v * v;
-            }
-
-#else
-            // Scalar fallback
-            double s_scalar = 0.0;
-#pragma omp simd reduction(+ : s_scalar)
-            for (long long c = 0; c < (long long)cols; ++c)
-            {
-                double v = (double)row[c];
-                s_scalar += v * v;
-            }
-            acc = s_scalar;
-#endif
+            ISA_DISPATCH_RET(acc, compute_rms_sq_int32, row, cols);
 
             row_sumsq[r] = acc;
         };
@@ -890,12 +909,12 @@ namespace llaminar2::primitives
         }
     }
 
-    namespace
+    namespace detail
     {
         // ========== INT32→INT8 Helper Kernels ==========
 
         /// INT32→FP32 normalization - Scalar path
-        __attribute__((always_inline)) inline void int32_to_fp32_normalize_scalar(
+        void int32_to_fp32_normalize_scalar(
             const int32_t *src,
             float *dst,
             float rms_inv,
@@ -920,7 +939,7 @@ namespace llaminar2::primitives
 
 #if defined(__AVX512F__)
         /// INT32→FP32 normalization - AVX512 path
-        __attribute__((always_inline)) inline void int32_to_fp32_normalize_avx512(
+        void int32_to_fp32_normalize_avx512(
             const int32_t *src,
             float *dst,
             float rms_inv,
@@ -1022,7 +1041,7 @@ namespace llaminar2::primitives
 
 #elif defined(__AVX2__)
         /// INT32→FP32 normalization - AVX2 path
-        __attribute__((always_inline)) inline void int32_to_fp32_normalize_avx2(
+        void int32_to_fp32_normalize_avx2(
             const int32_t *src,
             float *dst,
             float rms_inv,
@@ -1138,7 +1157,8 @@ namespace llaminar2::primitives
         }
 #endif
 
-    } // anonymous namespace
+    } // namespace detail
+    using namespace detail;
 
     void rmsnorm_apply_int32_to_int8_vectorized(
         const int32_t *src,
@@ -1628,13 +1648,13 @@ namespace llaminar2::primitives
 
     // (Moved to top)
 
-    namespace
+    namespace detail
     {
 
         // ========== BF16 RMSNorm Kernels ==========
 
         /// BF16 RMSNorm row kernel - Scalar path
-        __attribute__((always_inline)) inline void bf16_rmsnorm_row_scalar(
+        void bf16_rmsnorm_row_scalar(
             const uint16_t *src_row,
             const float *gamma,
             uint16_t *dst_row,
@@ -1664,7 +1684,7 @@ namespace llaminar2::primitives
 
 #if defined(__AVX512F__)
         /// BF16 RMSNorm row kernel - AVX512 path
-        __attribute__((always_inline)) inline void bf16_rmsnorm_row_avx512(
+        void bf16_rmsnorm_row_avx512(
             const uint16_t *src_row,
             const float *gamma,
             uint16_t *dst_row,
@@ -1739,7 +1759,7 @@ namespace llaminar2::primitives
         // ========== FP16 RMSNorm Kernels ==========
 
         /// FP16 RMSNorm row kernel - Scalar path
-        __attribute__((always_inline)) inline void fp16_rmsnorm_row_scalar(
+        void fp16_rmsnorm_row_scalar(
             const uint16_t *src_row,
             const float *gamma,
             uint16_t *dst_row,
@@ -1769,7 +1789,7 @@ namespace llaminar2::primitives
 
 #if defined(__AVX512F__)
         /// FP16 RMSNorm row kernel - AVX512 path
-        __attribute__((always_inline)) inline void fp16_rmsnorm_row_avx512(
+        void fp16_rmsnorm_row_avx512(
             const uint16_t *src_row,
             const float *gamma,
             uint16_t *dst_row,
@@ -1843,7 +1863,7 @@ namespace llaminar2::primitives
 
 #if defined(__AVX2__) && defined(__F16C__)
         /// FP16 RMSNorm row kernel - AVX2+F16C path
-        __attribute__((always_inline)) inline void fp16_rmsnorm_row_avx2(
+        void fp16_rmsnorm_row_avx2(
             const uint16_t *src_row,
             const float *gamma,
             uint16_t *dst_row,
@@ -1909,7 +1929,40 @@ namespace llaminar2::primitives
         }
 #endif
 
-    } // anonymous namespace
+        // --- ISA stubs for runtime dispatch (bf16/fp16 rmsnorm) ---
+        void bf16_rmsnorm_row_avx2(
+            const uint16_t *src_row, const float *gamma,
+            uint16_t *dst_row, std::size_t cols, float epsilon)
+        {
+            bf16_rmsnorm_row_scalar(src_row, gamma, dst_row, cols, epsilon);
+        }
+#if !defined(__AVX512F__)
+        void bf16_rmsnorm_row_avx512(
+            const uint16_t *src_row, const float *gamma,
+            uint16_t *dst_row, std::size_t cols, float epsilon)
+        {
+            bf16_rmsnorm_row_scalar(src_row, gamma, dst_row, cols, epsilon);
+        }
+#endif
+#if !(defined(__AVX2__) && defined(__F16C__))
+        void fp16_rmsnorm_row_avx2(
+            const uint16_t *src_row, const float *gamma,
+            uint16_t *dst_row, std::size_t cols, float epsilon)
+        {
+            fp16_rmsnorm_row_scalar(src_row, gamma, dst_row, cols, epsilon);
+        }
+#endif
+#if !defined(__AVX512F__)
+        void fp16_rmsnorm_row_avx512(
+            const uint16_t *src_row, const float *gamma,
+            uint16_t *dst_row, std::size_t cols, float epsilon)
+        {
+            fp16_rmsnorm_row_avx2(src_row, gamma, dst_row, cols, epsilon);
+        }
+#endif
+
+    } // namespace detail
+    using namespace detail;
 
     // ========================================================================
     // Public Implementations
@@ -1931,15 +1984,13 @@ namespace llaminar2::primitives
             const uint16_t *src_row = src + r * cols;
             uint16_t *dst_row = dst + r * cols;
 
-#if defined(__AVX512F__)
-            if (!opts.force_scalar)
-            {
-                bf16_rmsnorm_row_avx512(src_row, gamma, dst_row, cols, epsilon);
-            }
-            else
-#endif
+            if (opts.force_scalar)
             {
                 bf16_rmsnorm_row_scalar(src_row, gamma, dst_row, cols, epsilon);
+            }
+            else
+            {
+                ISA_DISPATCH_VOID(bf16_rmsnorm_row, src_row, gamma, dst_row, cols, epsilon);
             }
         };
 
@@ -1980,21 +2031,13 @@ namespace llaminar2::primitives
             const uint16_t *src_row = src + r * cols;
             uint16_t *dst_row = dst + r * cols;
 
-#if defined(__AVX512F__)
-            if (!opts.force_scalar)
-            {
-                fp16_rmsnorm_row_avx512(src_row, gamma, dst_row, cols, epsilon);
-            }
-            else
-#elif defined(__AVX2__) && defined(__F16C__)
-            if (!opts.force_scalar)
-            {
-                fp16_rmsnorm_row_avx2(src_row, gamma, dst_row, cols, epsilon);
-            }
-            else
-#endif
+            if (opts.force_scalar)
             {
                 fp16_rmsnorm_row_scalar(src_row, gamma, dst_row, cols, epsilon);
+            }
+            else
+            {
+                ISA_DISPATCH_VOID(fp16_rmsnorm_row, src_row, gamma, dst_row, cols, epsilon);
             }
         };
 
@@ -2350,7 +2393,7 @@ namespace llaminar2::primitives
     // Q8_1 Integer-Space RMSNorm Implementation
     // ========================================================================
 
-    namespace
+    namespace detail
     {
         /**
          * @brief FP16 to FP32 conversion (for Q8_1 scale factors)
@@ -2435,7 +2478,7 @@ namespace llaminar2::primitives
          * Uses VPMADDUBSW + VPMADDWD for efficient int8*int8 -> int32 accumulation.
          * Note: We treat qs as signed int8, so we use a different approach than VNNI.
          */
-        __attribute__((always_inline)) inline int32_t compute_int8_sumsq_avx512(const int8_t *qs)
+        int32_t compute_int8_sumsq_avx512(const int8_t *qs)
         {
             // Load 32 int8 values
             __m256i v8 = _mm256_loadu_si256((const __m256i *)qs);
@@ -2456,7 +2499,7 @@ namespace llaminar2::primitives
         /**
          * @brief Compute sum of squares for 32 int8 values using AVX2
          */
-        __attribute__((always_inline)) inline int32_t compute_int8_sumsq_avx2(const int8_t *qs)
+        int32_t compute_int8_sumsq_avx2(const int8_t *qs)
         {
             // Load 32 int8 values as two 128-bit chunks
             __m128i v8_lo = _mm_loadu_si128((const __m128i *)qs);
@@ -2485,7 +2528,7 @@ namespace llaminar2::primitives
         /**
          * @brief Compute sum of squares for 32 int8 values (scalar fallback)
          */
-        __attribute__((always_inline)) inline int32_t compute_int8_sumsq_scalar(const int8_t *qs)
+        int32_t compute_int8_sumsq_scalar(const int8_t *qs)
         {
             int32_t sum = 0;
             for (int i = 0; i < 32; ++i)
@@ -2510,7 +2553,8 @@ namespace llaminar2::primitives
 #endif
         }
 
-    } // anonymous namespace
+    } // namespace detail
+    using namespace detail;
 
     // =========================================================================
     // PURE INTEGER RMSNorm Implementation

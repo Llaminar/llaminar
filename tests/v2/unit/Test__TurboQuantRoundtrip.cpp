@@ -641,3 +641,162 @@ TEST(Test__TurboQuantRoundtrip, TQ4_DequantVRows_MatchesPerBlock_128)
             << " (row=" << i / KV_DIM << " col=" << i % KV_DIM << ")";
     }
 }
+
+// ============================================================================
+// ISA Parity: apply_rotation (scalar vs AVX2 vs AVX512)
+// ============================================================================
+
+TEST(Test__TurboQuantRoundtrip, Rotation_ISA_Parity_Forward_64)
+{
+    auto rot = generate_rotation_matrix(64, 42);
+    std::mt19937 rng(123);
+    alignas(64) float input[64], out_scalar[64], out_avx2[64], out_avx512[64];
+    std::normal_distribution<float> dist(0.0f, 1.0f);
+    for (int i = 0; i < 64; ++i)
+        input[i] = dist(rng);
+
+    apply_rotation_scalar(rot, input, out_scalar);
+
+#if defined(__AVX2__)
+    apply_rotation_avx2(rot, input, out_avx2);
+    for (int i = 0; i < 64; ++i)
+        EXPECT_NEAR(out_scalar[i], out_avx2[i], 1e-5f)
+            << "AVX2 vs scalar mismatch at index " << i;
+#else
+    GTEST_SKIP() << "AVX2 not available";
+#endif
+
+#if defined(__AVX512F__)
+    apply_rotation_avx512(rot, input, out_avx512);
+    for (int i = 0; i < 64; ++i)
+        EXPECT_NEAR(out_scalar[i], out_avx512[i], 1e-5f)
+            << "AVX512 vs scalar mismatch at index " << i;
+#else
+    GTEST_SKIP() << "AVX512 not available";
+#endif
+}
+
+TEST(Test__TurboQuantRoundtrip, Rotation_ISA_Parity_Forward_128)
+{
+    auto rot = generate_rotation_matrix(128, 77);
+    std::mt19937 rng(456);
+    alignas(64) float input[128], out_scalar[128], out_avx2[128], out_avx512[128];
+    std::normal_distribution<float> dist(0.0f, 1.0f);
+    for (int i = 0; i < 128; ++i)
+        input[i] = dist(rng);
+
+    apply_rotation_scalar(rot, input, out_scalar);
+
+#if defined(__AVX2__)
+    apply_rotation_avx2(rot, input, out_avx2);
+    for (int i = 0; i < 128; ++i)
+        EXPECT_NEAR(out_scalar[i], out_avx2[i], 1e-5f)
+            << "AVX2 vs scalar mismatch at index " << i;
+#else
+    GTEST_SKIP() << "AVX2 not available";
+#endif
+
+#if defined(__AVX512F__)
+    apply_rotation_avx512(rot, input, out_avx512);
+    for (int i = 0; i < 128; ++i)
+        EXPECT_NEAR(out_scalar[i], out_avx512[i], 1e-5f)
+            << "AVX512 vs scalar mismatch at index " << i;
+#else
+    GTEST_SKIP() << "AVX512 not available";
+#endif
+}
+
+// ============================================================================
+// ISA Parity: apply_rotation_transpose (scalar vs AVX2 vs AVX512)
+// ============================================================================
+
+TEST(Test__TurboQuantRoundtrip, Rotation_ISA_Parity_Transpose_64)
+{
+    auto rot = generate_rotation_matrix(64, 42);
+    std::mt19937 rng(789);
+    alignas(64) float input[64], out_scalar[64], out_avx2[64], out_avx512[64];
+    std::normal_distribution<float> dist(0.0f, 1.0f);
+    for (int i = 0; i < 64; ++i)
+        input[i] = dist(rng);
+
+    apply_rotation_transpose_scalar(rot, input, out_scalar);
+
+#if defined(__AVX2__)
+    apply_rotation_transpose_avx2(rot, input, out_avx2);
+    for (int i = 0; i < 64; ++i)
+        EXPECT_NEAR(out_scalar[i], out_avx2[i], 1e-5f)
+            << "AVX2 vs scalar mismatch at index " << i;
+#else
+    GTEST_SKIP() << "AVX2 not available";
+#endif
+
+#if defined(__AVX512F__)
+    apply_rotation_transpose_avx512(rot, input, out_avx512);
+    for (int i = 0; i < 64; ++i)
+        EXPECT_NEAR(out_scalar[i], out_avx512[i], 1e-5f)
+            << "AVX512 vs scalar mismatch at index " << i;
+#else
+    GTEST_SKIP() << "AVX512 not available";
+#endif
+}
+
+TEST(Test__TurboQuantRoundtrip, Rotation_ISA_Parity_Transpose_128)
+{
+    auto rot = generate_rotation_matrix(128, 77);
+    std::mt19937 rng(321);
+    alignas(64) float input[128], out_scalar[128], out_avx2[128], out_avx512[128];
+    std::normal_distribution<float> dist(0.0f, 1.0f);
+    for (int i = 0; i < 128; ++i)
+        input[i] = dist(rng);
+
+    apply_rotation_transpose_scalar(rot, input, out_scalar);
+
+#if defined(__AVX2__)
+    apply_rotation_transpose_avx2(rot, input, out_avx2);
+    for (int i = 0; i < 128; ++i)
+        EXPECT_NEAR(out_scalar[i], out_avx2[i], 1e-5f)
+            << "AVX2 vs scalar mismatch at index " << i;
+#else
+    GTEST_SKIP() << "AVX2 not available";
+#endif
+
+#if defined(__AVX512F__)
+    apply_rotation_transpose_avx512(rot, input, out_avx512);
+    for (int i = 0; i < 128; ++i)
+        EXPECT_NEAR(out_scalar[i], out_avx512[i], 1e-5f)
+            << "AVX512 vs scalar mismatch at index " << i;
+#else
+    GTEST_SKIP() << "AVX512 not available";
+#endif
+}
+
+// ============================================================================
+// ISA Parity: Rotation round-trip (forward + transpose) across ISA variants
+// ============================================================================
+
+TEST(Test__TurboQuantRoundtrip, Rotation_ISA_Parity_RoundTrip)
+{
+    for (int dim : {64, 128})
+    {
+        auto rot = generate_rotation_matrix(dim, 55);
+        std::mt19937 rng(654);
+        std::vector<float> input(dim), rotated(dim), recovered(dim);
+        std::normal_distribution<float> dist(0.0f, 1.0f);
+        for (int i = 0; i < dim; ++i)
+            input[i] = dist(rng);
+
+        // Forward with AVX512 (or best available), transpose with scalar
+#if defined(__AVX512F__)
+        apply_rotation_avx512(rot, input.data(), rotated.data());
+#elif defined(__AVX2__)
+        apply_rotation_avx2(rot, input.data(), rotated.data());
+#else
+        apply_rotation_scalar(rot, input.data(), rotated.data());
+#endif
+        apply_rotation_transpose_scalar(rot, rotated.data(), recovered.data());
+
+        float mse = compute_mse(input.data(), recovered.data(), dim);
+        EXPECT_LT(mse, 1e-5f)
+            << "Cross-ISA round-trip failed for dim=" << dim << " MSE=" << mse;
+    }
+}

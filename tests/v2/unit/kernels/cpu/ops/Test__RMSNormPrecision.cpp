@@ -14,6 +14,7 @@
 
 #include <gtest/gtest.h>
 #include "kernels/cpu/primitives/RMSNormPrimitives.h"
+#include "kernels/cpu/primitives/RMSNormPrimitives_detail.h"
 #include "utils/Logger.h"
 #include <vector>
 #include <random>
@@ -1136,6 +1137,153 @@ namespace
         double rel_l2 = computeRelativeL2(output_avx2_fp32, output_avx512_fp32);
         LOG_INFO("FP16 PerRow AVX2 vs AVX512: rel_l2=" << rel_l2);
         EXPECT_LT(rel_l2, 1e-3);
+    }
+
+    // ========================================================================
+    // ISA Parity Tests — detail:: RMSNorm primitives
+    // ========================================================================
+
+    using namespace llaminar2::primitives::detail;
+
+    TEST_F(Test__RMSNormPrecision, ISAParity_ComputeSumsq)
+    {
+        const size_t cols = 896;
+        auto data = generateRandomFP32(1, cols, -2.0f, 2.0f);
+
+        double ref = compute_sumsq_scalar(data.data(), cols);
+
+#if defined(__AVX2__) && !defined(__AVX512F__)
+        double avx2_val = compute_sumsq_avx2(data.data(), cols);
+        EXPECT_NEAR(ref, avx2_val, 1e-4) << "compute_sumsq scalar vs AVX2";
+#endif
+
+#if defined(__AVX512F__)
+        double avx512_val = compute_sumsq_avx512(data.data(), cols);
+        EXPECT_NEAR(ref, avx512_val, 1e-4) << "compute_sumsq scalar vs AVX512";
+#endif
+    }
+
+    TEST_F(Test__RMSNormPrecision, ISAParity_ComputeRmsSqInt32)
+    {
+        const size_t cols = 256;
+        std::uniform_int_distribution<int32_t> dist(-10000, 10000);
+        std::vector<int32_t> data(cols);
+        for (auto &v : data)
+            v = dist(rng_);
+
+        double ref = compute_rms_sq_int32_scalar(data.data(), cols);
+
+#if defined(__AVX2__)
+        double avx2_val = compute_rms_sq_int32_avx2(data.data(), cols);
+        // Large int32 values produce sums ~1e9; allow small relative error
+        EXPECT_NEAR(ref, avx2_val, std::max(1.0, std::abs(ref) * 1e-8))
+            << "compute_rms_sq_int32 scalar vs AVX2";
+#endif
+
+#if defined(__AVX512F__)
+        double avx512_val = compute_rms_sq_int32_avx512(data.data(), cols);
+        EXPECT_NEAR(ref, avx512_val, std::max(1.0, std::abs(ref) * 1e-8))
+            << "compute_rms_sq_int32 scalar vs AVX512";
+#endif
+    }
+
+    TEST_F(Test__RMSNormPrecision, ISAParity_Int32ToFP32Normalize)
+    {
+        const size_t cols = 256;
+        std::uniform_int_distribution<int32_t> src_dist(-10000, 10000);
+        std::vector<int32_t> src(cols);
+        for (auto &v : src)
+            v = src_dist(rng_);
+
+        auto gamma = generateGamma(cols);
+        float rms_inv = 0.01f;
+
+        std::vector<float> ref(cols), avx2_out(cols), avx512_out(cols);
+        int32_to_fp32_normalize_scalar(src.data(), ref.data(), rms_inv, gamma.data(), cols);
+
+#if defined(__AVX512F__)
+        // On AVX512 machines, the avx2 variant is guarded by !defined(__AVX512F__), so test avx512 only
+        int32_to_fp32_normalize_avx512(src.data(), avx512_out.data(), rms_inv, gamma.data(), cols);
+        float max_diff = computeMaxAbsError(ref, avx512_out);
+        EXPECT_LE(max_diff, 1e-6f) << "int32_to_fp32_normalize scalar vs AVX512";
+#elif defined(__AVX2__)
+        int32_to_fp32_normalize_avx2(src.data(), avx2_out.data(), rms_inv, gamma.data(), cols);
+        float max_diff = computeMaxAbsError(ref, avx2_out);
+        EXPECT_LE(max_diff, 1e-6f) << "int32_to_fp32_normalize scalar vs AVX2";
+#endif
+    }
+
+    TEST_F(Test__RMSNormPrecision, ISAParity_BF16RmsnormRow)
+    {
+        const size_t cols = 896;
+        auto data_fp32 = generateRandomFP32(1, cols, -1.0f, 1.0f);
+        auto data_bf16 = fp32ToBF16(data_fp32);
+        auto gamma = generateGamma(cols);
+        float epsilon = 1e-5f;
+
+        std::vector<uint16_t> ref(cols), avx512_out(cols);
+        bf16_rmsnorm_row_scalar(data_bf16.data(), gamma.data(), ref.data(), cols, epsilon);
+
+#if defined(__AVX512F__)
+        bf16_rmsnorm_row_avx512(data_bf16.data(), gamma.data(), avx512_out.data(), cols, epsilon);
+
+        auto ref_fp32 = bf16ToFP32(ref);
+        auto avx512_fp32 = bf16ToFP32(avx512_out);
+        double rel_l2 = computeRelativeL2(ref_fp32, avx512_fp32);
+        EXPECT_LT(rel_l2, 5e-3) << "bf16_rmsnorm_row scalar vs AVX512";
+#endif
+    }
+
+    TEST_F(Test__RMSNormPrecision, ISAParity_FP16RmsnormRow)
+    {
+        const size_t cols = 896;
+        auto data_fp32 = generateRandomFP32(1, cols, -0.5f, 0.5f);
+        auto data_fp16 = fp32ToFP16(data_fp32);
+        auto gamma = generateGamma(cols);
+        float epsilon = 1e-5f;
+
+        std::vector<uint16_t> ref(cols);
+        fp16_rmsnorm_row_scalar(data_fp16.data(), gamma.data(), ref.data(), cols, epsilon);
+
+#if defined(__AVX512F__)
+        std::vector<uint16_t> avx512_out(cols);
+        fp16_rmsnorm_row_avx512(data_fp16.data(), gamma.data(), avx512_out.data(), cols, epsilon);
+
+        auto ref_fp32 = fp16ToFP32(ref);
+        auto avx512_fp32 = fp16ToFP32(avx512_out);
+        double rel_l2 = computeRelativeL2(ref_fp32, avx512_fp32);
+        EXPECT_LT(rel_l2, 1e-3) << "fp16_rmsnorm_row scalar vs AVX512";
+#endif
+
+#if defined(__AVX2__) && defined(__F16C__) && !defined(__AVX512F__)
+        std::vector<uint16_t> avx2_out(cols);
+        fp16_rmsnorm_row_avx2(data_fp16.data(), gamma.data(), avx2_out.data(), cols, epsilon);
+
+        auto ref_fp32b = fp16ToFP32(ref);
+        auto avx2_fp32 = fp16ToFP32(avx2_out);
+        double rel_l2b = computeRelativeL2(ref_fp32b, avx2_fp32);
+        EXPECT_LT(rel_l2b, 1e-3) << "fp16_rmsnorm_row scalar vs AVX2";
+#endif
+    }
+
+    TEST_F(Test__RMSNormPrecision, ISAParity_ComputeInt8Sumsq)
+    {
+        int8_t qs[32];
+        std::uniform_int_distribution<int> qdist(-127, 127);
+        for (auto &v : qs)
+            v = static_cast<int8_t>(qdist(rng_));
+
+        int32_t ref = compute_int8_sumsq_scalar(qs);
+
+#if defined(__AVX2__)
+        int32_t avx2_val = compute_int8_sumsq_avx2(qs);
+        EXPECT_EQ(ref, avx2_val) << "compute_int8_sumsq scalar vs AVX2";
+#endif
+
+#if defined(__AVX512F__)
+        int32_t avx512_val = compute_int8_sumsq_avx512(qs);
+        EXPECT_EQ(ref, avx512_val) << "compute_int8_sumsq scalar vs AVX512";
+#endif
     }
 
 } // anonymous namespace

@@ -481,6 +481,40 @@ namespace llaminar2
                 weight_mgr->setTensorParallelConfig(tp_config);
 
                 // =====================================================================
+                // SET MODEL DIMENSIONS FOR FUSEDQKV SUB-BLOCK SLICING
+                // =====================================================================
+                // WeightManager needs head dimensions to correctly split fused QKV weights.
+                // For GDN models (Qwen3.5), also set asymmetric QKV dimensions.
+                {
+                    const int embed_len = model_ctx_->embeddingLength();
+                    const int head_dim = (n_heads > 0) ? (embed_len / n_heads) : 0;
+                    if (n_heads > 0 && head_dim > 0)
+                    {
+                        weight_mgr->setModelDimensions(n_heads, n_kv_heads, head_dim);
+                    }
+
+                    // GDN dimensions from GGUF metadata for asymmetric FusedQKV
+                    auto *concrete_ctx = dynamic_cast<ModelContext *>(model_ctx_.get());
+                    if (concrete_ctx)
+                    {
+                        const std::string arch_prefix = model_ctx_->architecture();
+                        ModelLoader &loader = concrete_ctx->concreteLoader();
+                        const int gdn_group_count = loader.getInt(arch_prefix + ".ssm.group_count", 0);
+                        const int gdn_time_step_rank = loader.getInt(arch_prefix + ".ssm.time_step_rank", 0);
+                        const int gdn_state_size = loader.getInt(arch_prefix + ".ssm.state_size", 0);
+
+                        if (gdn_group_count > 0 && gdn_time_step_rank > 0 && gdn_state_size > 0)
+                        {
+                            weight_mgr->setGDNDimensions(gdn_group_count, gdn_time_step_rank, gdn_state_size);
+                            LOG_INFO("MultiDeviceOrchestrator: Set GDN dimensions for FusedQKV slicing"
+                                     << " (group_count=" << gdn_group_count
+                                     << " time_step_rank=" << gdn_time_step_rank
+                                     << " state_size=" << gdn_state_size << ")");
+                        }
+                    }
+                }
+
+                // =====================================================================
                 // SET WEIGHT SHARDING CONFIG FOR TP SLICING MODE DETECTION
                 // =====================================================================
                 // WeightManager needs the sharding config to determine which weights

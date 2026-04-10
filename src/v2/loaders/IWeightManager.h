@@ -261,6 +261,33 @@ namespace llaminar2
         virtual void setTensorParallelConfig(std::shared_ptr<TensorParallelConfig> config) = 0;
 
         /**
+         * @brief Set model head dimensions for FusedQKV sub-block slicing
+         * @param n_heads Total attention heads
+         * @param n_kv_heads Total KV heads (for GQA)
+         * @param head_dim Per-head dimension
+         */
+        virtual void setModelDimensions(int n_heads, int n_kv_heads, int head_dim)
+        {
+            (void)n_heads;
+            (void)n_kv_heads;
+            (void)head_dim;
+        }
+
+        /**
+         * @brief Set GDN dimensions for asymmetric FusedQKV sub-block slicing
+         * GDN layers have [Q:n_k*d | K:n_k*d | V:n_v*d] where n_k != n_v
+         * @param n_k_heads Number of key heads (ssm.group_count)
+         * @param n_v_heads Number of value heads (ssm.time_step_rank)
+         * @param d_state State dimension per head (ssm.state_size)
+         */
+        virtual void setGDNDimensions(int n_k_heads, int n_v_heads, int d_state)
+        {
+            (void)n_k_heads;
+            (void)n_v_heads;
+            (void)d_state;
+        }
+
+        /**
          * @brief Register a preprocessor applied to each GEMM weight before packing.
          *
          * Must be called before packGemmWeights(). The preprocessor runs once

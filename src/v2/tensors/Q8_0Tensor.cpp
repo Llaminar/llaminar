@@ -9,6 +9,7 @@
 #include "TensorClasses.h"
 #include "VnniPackContext.h"
 #include "../utils/Logger.h"
+#include "../utils/CPUFeatures.h"
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -557,61 +558,109 @@ namespace llaminar2
     }
 
     // ===== Efficient requantizeRowToInt8 for Q8_0 =====
-    // Reads blocks directly via typed_data() to avoid per-block virtual dispatch.
-    // Parallelism is provided by the caller (ROCmWeightPacker) which distributes
-    // rows across threads via #pragma omp parallel for.
-    float Q8_0Tensor::requantizeRowToInt8(size_t row_idx, size_t K, int8_t *output) const
-    {
-        const size_t blocks_per_row = K / Q8_0Block::BLOCK_SIZE;
-        const Q8_0Block *all_blocks = typed_data();
-        const Q8_0Block *row_blocks = all_blocks + row_idx * blocks_per_row;
 
-        // Phase 1: Find max absolute dequantized value across all blocks
-        float max_abs = 0.0f;
-#if defined(__AVX2__)
-        for (size_t b = 0; b < blocks_per_row; ++b)
+    namespace detail
+    {
+        float q8_0_find_max_abs_scalar(const Q8_0Block *row_blocks, size_t blocks_per_row)
         {
-            // Vectorized horizontal max of 32 absolute int8 values
-            const __m256i v = _mm256_loadu_si256(
-                reinterpret_cast<const __m256i *>(row_blocks[b].qs));
-            const __m256i abs_v = _mm256_abs_epi8(v);
-            const __m128i lo = _mm256_castsi256_si128(abs_v);
-            const __m128i hi = _mm256_extracti128_si256(abs_v, 1);
-            __m128i mx = _mm_max_epu8(lo, hi);
-            mx = _mm_max_epu8(mx, _mm_srli_si128(mx, 8));
-            mx = _mm_max_epu8(mx, _mm_srli_si128(mx, 4));
-            mx = _mm_max_epu8(mx, _mm_srli_si128(mx, 2));
-            mx = _mm_max_epu8(mx, _mm_srli_si128(mx, 1));
-            const float val = fp16_to_fp32(row_blocks[b].d) *
-                              static_cast<float>(_mm_extract_epi8(mx, 0));
-            if (val > max_abs)
-                max_abs = val;
-        }
-#else
-        for (size_t b = 0; b < blocks_per_row; ++b)
-        {
-            const float block_scale = fp16_to_fp32(row_blocks[b].d);
-            int max_qs = 0;
-            for (int i = 0; i < 32; ++i)
+            float max_abs = 0.0f;
+            for (size_t b = 0; b < blocks_per_row; ++b)
             {
-                const int abs_qs = row_blocks[b].qs[i] < 0
-                                       ? -row_blocks[b].qs[i]
-                                       : row_blocks[b].qs[i];
-                if (abs_qs > max_qs)
-                    max_qs = abs_qs;
+                const float block_scale = fp16_to_fp32(row_blocks[b].d);
+                int max_qs = 0;
+                for (int i = 0; i < 32; ++i)
+                {
+                    const int abs_qs = row_blocks[b].qs[i] < 0
+                                           ? -row_blocks[b].qs[i]
+                                           : row_blocks[b].qs[i];
+                    if (abs_qs > max_qs)
+                        max_qs = abs_qs;
+                }
+                const float val = block_scale * static_cast<float>(max_qs);
+                if (val > max_abs)
+                    max_abs = val;
             }
-            const float val = block_scale * static_cast<float>(max_qs);
-            if (val > max_abs)
-                max_abs = val;
+            return max_abs;
+        }
+
+#if defined(__AVX2__)
+        float q8_0_find_max_abs_avx2(const Q8_0Block *row_blocks, size_t blocks_per_row)
+        {
+            float max_abs = 0.0f;
+            for (size_t b = 0; b < blocks_per_row; ++b)
+            {
+                const __m256i v = _mm256_loadu_si256(
+                    reinterpret_cast<const __m256i *>(row_blocks[b].qs));
+                const __m256i abs_v = _mm256_abs_epi8(v);
+                const __m128i lo = _mm256_castsi256_si128(abs_v);
+                const __m128i hi = _mm256_extracti128_si256(abs_v, 1);
+                __m128i mx = _mm_max_epu8(lo, hi);
+                mx = _mm_max_epu8(mx, _mm_srli_si128(mx, 8));
+                mx = _mm_max_epu8(mx, _mm_srli_si128(mx, 4));
+                mx = _mm_max_epu8(mx, _mm_srli_si128(mx, 2));
+                mx = _mm_max_epu8(mx, _mm_srli_si128(mx, 1));
+                const float val = fp16_to_fp32(row_blocks[b].d) *
+                                  static_cast<float>(_mm_extract_epi8(mx, 0));
+                if (val > max_abs)
+                    max_abs = val;
+            }
+            return max_abs;
         }
 #endif
 
-        const float row_scale = (max_abs > 0.0f) ? (max_abs / 127.0f) : 1.0f;
-        const float inv_row_scale = 1.0f / row_scale;
+        void q8_0_requantize_scalar(const Q8_0Block *row_blocks, size_t blocks_per_row,
+                                    float inv_row_scale, int8_t *output)
+        {
+            for (size_t b = 0; b < blocks_per_row; ++b)
+            {
+                const float rescale = fp16_to_fp32(row_blocks[b].d) * inv_row_scale;
+                int8_t *dst = output + b * 32;
+                for (int i = 0; i < 32; ++i)
+                {
+                    const float val = static_cast<float>(row_blocks[b].qs[i]) * rescale;
+                    int32_t q = static_cast<int32_t>(val + (val >= 0.0f ? 0.5f : -0.5f));
+                    q = q < -127 ? -127 : (q > 127 ? 127 : q);
+                    dst[i] = static_cast<int8_t>(q);
+                }
+            }
+        }
 
-        // Phase 2: Requantize each block — multiply qs[i] by (block_scale / row_scale),
-        // round to nearest integer, clamp to [-127, 127].
+#if defined(__AVX2__)
+        void q8_0_requantize_avx2(const Q8_0Block *row_blocks, size_t blocks_per_row,
+                                  float inv_row_scale, int8_t *output)
+        {
+            const __m256i clamp_lo = _mm256_set1_epi32(-127);
+            const __m256i clamp_hi = _mm256_set1_epi32(127);
+            const __m256i pack_perm = _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7);
+            for (size_t b = 0; b < blocks_per_row; ++b)
+            {
+                const __m256 vrescale = _mm256_set1_ps(
+                    fp16_to_fp32(row_blocks[b].d) * inv_row_scale);
+                int8_t *dst = output + b * 32;
+                __m256i groups[4];
+                for (int q = 0; q < 4; ++q)
+                {
+                    const __m128i v8 = _mm_loadl_epi64(
+                        reinterpret_cast<const __m128i *>(
+                            row_blocks[b].qs + q * 8));
+                    __m256 vf = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(v8));
+                    vf = _mm256_mul_ps(vf, vrescale);
+                    __m256i r = _mm256_cvtps_epi32(vf);
+                    r = _mm256_max_epi32(r, clamp_lo);
+                    groups[q] = _mm256_min_epi32(r, clamp_hi);
+                }
+                const __m256i p01 = _mm256_packs_epi32(groups[0], groups[1]);
+                const __m256i p23 = _mm256_packs_epi32(groups[2], groups[3]);
+                __m256i packed = _mm256_packs_epi16(p01, p23);
+                packed = _mm256_permutevar8x32_epi32(packed, pack_perm);
+                _mm256_storeu_si256(reinterpret_cast<__m256i *>(dst), packed);
+            }
+        }
+#endif
+
 #if defined(__AVX512F__)
+        void q8_0_requantize_avx512(const Q8_0Block *row_blocks, size_t blocks_per_row,
+                                    float inv_row_scale, int8_t *output)
         {
             const __m512i clamp_lo = _mm512_set1_epi32(-127);
             const __m512i clamp_hi = _mm512_set1_epi32(127);
@@ -620,7 +669,6 @@ namespace llaminar2
                 const __m512 vrescale = _mm512_set1_ps(
                     fp16_to_fp32(row_blocks[b].d) * inv_row_scale);
                 int8_t *dst = output + b * 32;
-                // Process 32 values as 2 x 16 with AVX-512
                 for (int half = 0; half < 2; ++half)
                 {
                     const __m128i v8 = _mm_loadu_si128(
@@ -637,51 +685,48 @@ namespace llaminar2
                 }
             }
         }
-#elif defined(__AVX2__)
+#endif
+
+// --- ISA stubs for runtime dispatch ---
+#if !defined(__AVX2__)
+        float q8_0_find_max_abs_avx2(const Q8_0Block *row_blocks, size_t blocks_per_row)
         {
-            const __m256i clamp_lo = _mm256_set1_epi32(-127);
-            const __m256i clamp_hi = _mm256_set1_epi32(127);
-            const __m256i pack_perm = _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7);
-            for (size_t b = 0; b < blocks_per_row; ++b)
-            {
-                const __m256 vrescale = _mm256_set1_ps(
-                    fp16_to_fp32(row_blocks[b].d) * inv_row_scale);
-                int8_t *dst = output + b * 32;
-                // Process 32 values as 4 x 8, then pack all 32 at once
-                __m256i groups[4];
-                for (int q = 0; q < 4; ++q)
-                {
-                    const __m128i v8 = _mm_loadl_epi64(
-                        reinterpret_cast<const __m128i *>(
-                            row_blocks[b].qs + q * 8));
-                    __m256 vf = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(v8));
-                    vf = _mm256_mul_ps(vf, vrescale);
-                    __m256i r = _mm256_cvtps_epi32(vf);
-                    r = _mm256_max_epi32(r, clamp_lo);
-                    groups[q] = _mm256_min_epi32(r, clamp_hi);
-                }
-                // Pack 4x8 int32 -> 32 int8 and fix AVX2 lane-crossing order
-                const __m256i p01 = _mm256_packs_epi32(groups[0], groups[1]);
-                const __m256i p23 = _mm256_packs_epi32(groups[2], groups[3]);
-                __m256i packed = _mm256_packs_epi16(p01, p23);
-                packed = _mm256_permutevar8x32_epi32(packed, pack_perm);
-                _mm256_storeu_si256(reinterpret_cast<__m256i *>(dst), packed);
-            }
+            return q8_0_find_max_abs_scalar(row_blocks, blocks_per_row);
         }
-#else
-        for (size_t b = 0; b < blocks_per_row; ++b)
+        void q8_0_requantize_avx2(const Q8_0Block *row_blocks, size_t blocks_per_row,
+                                  float inv_row_scale, int8_t *output)
         {
-            const float rescale = fp16_to_fp32(row_blocks[b].d) * inv_row_scale;
-            int8_t *dst = output + b * 32;
-            for (int i = 0; i < 32; ++i)
-            {
-                const float val = static_cast<float>(row_blocks[b].qs[i]) * rescale;
-                int32_t q = static_cast<int32_t>(val + (val >= 0.0f ? 0.5f : -0.5f));
-                q = q < -127 ? -127 : (q > 127 ? 127 : q);
-                dst[i] = static_cast<int8_t>(q);
-            }
+            q8_0_requantize_scalar(row_blocks, blocks_per_row, inv_row_scale, output);
         }
 #endif
+        float q8_0_find_max_abs_avx512(const Q8_0Block *row_blocks, size_t blocks_per_row)
+        {
+            return q8_0_find_max_abs_avx2(row_blocks, blocks_per_row);
+        }
+#if !defined(__AVX512F__)
+        void q8_0_requantize_avx512(const Q8_0Block *row_blocks, size_t blocks_per_row,
+                                    float inv_row_scale, int8_t *output)
+        {
+            q8_0_requantize_avx2(row_blocks, blocks_per_row, inv_row_scale, output);
+        }
+#endif
+    } // namespace detail
+    using namespace detail;
+
+    float Q8_0Tensor::requantizeRowToInt8(size_t row_idx, size_t K, int8_t *output) const
+    {
+        const size_t blocks_per_row = K / Q8_0Block::BLOCK_SIZE;
+        const Q8_0Block *all_blocks = typed_data();
+        const Q8_0Block *row_blocks = all_blocks + row_idx * blocks_per_row;
+
+        // Phase 1: Find max absolute dequantized value across all blocks
+        float max_abs = ISA_DISPATCH_RETVAL(q8_0_find_max_abs, row_blocks, blocks_per_row);
+
+        const float row_scale = (max_abs > 0.0f) ? (max_abs / 127.0f) : 1.0f;
+        const float inv_row_scale = 1.0f / row_scale;
+
+        // Phase 2: Requantize each block
+        ISA_DISPATCH_VOID(q8_0_requantize, row_blocks, blocks_per_row, inv_row_scale, output);
 
         return row_scale;
     }

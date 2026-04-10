@@ -942,3 +942,103 @@ TEST_F(Q8_1_QuantizeSIMD_Test, LargeMatrixQuantization_StressTest)
             << "Check " << check << " (row=" << row << ", blk=" << blk << "): " << cmp.to_string();
     }
 }
+
+// ============================================================================
+// ISA Parity Tests — detail:: Q8_1 find_max_abs / requantize
+// ============================================================================
+
+#include "tensors/Q8_1Tensor_detail.h"
+#include "tensors/FP16Utils.h"
+
+using namespace llaminar2::detail;
+
+TEST_F(Q8_1_QuantizeSIMD_Test, ISAParity_FindMaxAbs)
+{
+    const size_t blocks_per_row = 8;
+    std::vector<Q8_1Block> blocks(blocks_per_row);
+    std::uniform_real_distribution<float> dist(-3.0f, 3.0f);
+
+    for (auto &blk : blocks)
+    {
+        float max_val = 0.0f;
+        std::array<float, 32> vals;
+        for (int i = 0; i < 32; ++i)
+        {
+            vals[i] = dist(rng_);
+            max_val = std::max(max_val, std::abs(vals[i]));
+        }
+        float scale = max_val / 127.0f;
+        if (scale < 1e-10f)
+            scale = 1e-10f;
+        blk.d = llaminar2::fp32_to_fp16(scale);
+        int sum = 0;
+        for (int i = 0; i < 32; ++i)
+        {
+            blk.qs[i] = static_cast<int8_t>(std::round(vals[i] / scale));
+            sum += blk.qs[i];
+        }
+        blk.sum_qs = static_cast<int16_t>(sum);
+    }
+
+    float ref = q8_1_find_max_abs_scalar(blocks.data(), blocks_per_row);
+
+#if defined(__AVX2__)
+    float avx2_val = q8_1_find_max_abs_avx2(blocks.data(), blocks_per_row);
+    EXPECT_NEAR(ref, avx2_val, 1e-4f) << "q8_1_find_max_abs scalar vs AVX2";
+#endif
+}
+
+TEST_F(Q8_1_QuantizeSIMD_Test, ISAParity_Requantize)
+{
+    const size_t blocks_per_row = 8;
+    std::vector<Q8_1Block> blocks(blocks_per_row);
+    std::uniform_real_distribution<float> dist(-2.0f, 2.0f);
+
+    for (auto &blk : blocks)
+    {
+        float max_val = 0.0f;
+        std::array<float, 32> vals;
+        for (int i = 0; i < 32; ++i)
+        {
+            vals[i] = dist(rng_);
+            max_val = std::max(max_val, std::abs(vals[i]));
+        }
+        float scale = max_val / 127.0f;
+        if (scale < 1e-10f)
+            scale = 1e-10f;
+        blk.d = llaminar2::fp32_to_fp16(scale);
+        int sum = 0;
+        for (int i = 0; i < 32; ++i)
+        {
+            blk.qs[i] = static_cast<int8_t>(std::round(vals[i] / scale));
+            sum += blk.qs[i];
+        }
+        blk.sum_qs = static_cast<int16_t>(sum);
+    }
+
+    float inv_scale = 0.5f;
+    const size_t total = blocks_per_row * 32;
+    std::vector<int8_t> ref(total), avx2_out(total), avx512_out(total);
+
+    q8_1_requantize_scalar(blocks.data(), blocks_per_row, inv_scale, ref.data());
+
+#if defined(__AVX2__)
+    q8_1_requantize_avx2(blocks.data(), blocks_per_row, inv_scale, avx2_out.data());
+    int max_diff = 0;
+    for (size_t i = 0; i < total; ++i)
+    {
+        max_diff = std::max(max_diff, std::abs(static_cast<int>(ref[i]) - static_cast<int>(avx2_out[i])));
+    }
+    EXPECT_LE(max_diff, 1) << "q8_1_requantize scalar vs AVX2";
+#endif
+
+#if defined(__AVX512F__)
+    q8_1_requantize_avx512(blocks.data(), blocks_per_row, inv_scale, avx512_out.data());
+    int max_diff512 = 0;
+    for (size_t i = 0; i < total; ++i)
+    {
+        max_diff512 = std::max(max_diff512, std::abs(static_cast<int>(ref[i]) - static_cast<int>(avx512_out[i])));
+    }
+    EXPECT_LE(max_diff512, 1) << "q8_1_requantize scalar vs AVX512";
+#endif
+}

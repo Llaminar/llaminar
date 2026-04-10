@@ -1,8 +1,9 @@
 #pragma once
 
 #include <cstdint>
+#include <cstdlib> // std::getenv for LLAMINAR_ISA_LEVEL
 #include <cstdio>
-#include <algorithm>  // For std::min, std::max in AttentionCacheConfig
+#include <algorithm> // For std::min, std::max in AttentionCacheConfig
 
 /**
  * @file CPUFeatures.h
@@ -133,6 +134,131 @@ namespace llaminar2
         static const bool result = detail::detect_avx512();
         return result;
     }
+
+    // =========================================================================
+    // ISA Level: runtime dispatch for refactored _scalar/_avx2/_avx512 variants
+    // =========================================================================
+
+    /**
+     * @brief ISA level for runtime SIMD dispatch
+     *
+     * Resolved once at startup from hardware detection, overridable via
+     * LLAMINAR_ISA_LEVEL=scalar|avx2|avx512 for testing.
+     */
+    enum class ISALevel : uint8_t
+    {
+        Scalar = 0,
+        AVX2 = 1,
+        AVX512 = 2
+    };
+
+    // Forward declarations for activeISALevel()
+    inline bool cpu_supports_avx2();
+    inline bool cpu_supports_avx512();
+
+    /**
+     * @brief Get the active ISA level (cached singleton)
+     *
+     * Resolution order:
+     *   1. LLAMINAR_ISA_LEVEL env var (scalar / avx2 / avx512)
+     *   2. Hardware detection via CPUID
+     *
+     * @note Result is cached on first call — zero overhead on subsequent calls.
+     *       The env var is read with std::getenv to avoid a circular dependency
+     *       on DebugEnv.h (which includes CPUFeatures.h).
+     */
+    inline ISALevel activeISALevel()
+    {
+        static const ISALevel level = []
+        {
+            const char *env = std::getenv("LLAMINAR_ISA_LEVEL");
+            if (env)
+            {
+                // Case-insensitive compare without <strings.h>
+                auto eq = [](const char *a, const char *b) -> bool
+                {
+                    for (; *a && *b; ++a, ++b)
+                        if ((*a | 0x20) != (*b | 0x20))
+                            return false;
+                    return *a == *b;
+                };
+                if (eq(env, "scalar"))
+                    return ISALevel::Scalar;
+                if (eq(env, "avx2"))
+                    return ISALevel::AVX2;
+                if (eq(env, "avx512"))
+                    return ISALevel::AVX512;
+            }
+            if (cpu_supports_avx512())
+                return ISALevel::AVX512;
+            if (cpu_supports_avx2())
+                return ISALevel::AVX2;
+            return ISALevel::Scalar;
+        }();
+        return level;
+    }
+
+// ---------------------------------------------------------------------------
+// ISA_DISPATCH macros — runtime dispatch to _scalar / _avx2 / _avx512 variants
+//
+// Usage:
+//   ISA_DISPATCH_VOID(fused_fp32_residual_add, out, a, b, n);
+//   float result; ISA_DISPATCH_RET(result, activation_row_max_abs, row, len);
+//   double val = ISA_DISPATCH_RETVAL(compute_sumsq, data, count);
+//
+// The _avx2 and _avx512 variants MUST be compiled (possibly as unreachable
+// stubs) regardless of the host ISA so the switch is always complete.
+// ---------------------------------------------------------------------------
+
+/// Dispatch a void-returning function: name##_scalar / _avx2 / _avx512
+#define ISA_DISPATCH_VOID(name, ...)           \
+    do                                         \
+    {                                          \
+        switch (::llaminar2::activeISALevel()) \
+        {                                      \
+        case ::llaminar2::ISALevel::AVX512:    \
+            name##_avx512(__VA_ARGS__);        \
+            break;                             \
+        case ::llaminar2::ISALevel::AVX2:      \
+            name##_avx2(__VA_ARGS__);          \
+            break;                             \
+        default:                               \
+            name##_scalar(__VA_ARGS__);        \
+            break;                             \
+        }                                      \
+    } while (0)
+
+/// Dispatch and assign: lhs = name##_{scalar|avx2|avx512}(...)
+#define ISA_DISPATCH_RET(lhs, name, ...)       \
+    do                                         \
+    {                                          \
+        switch (::llaminar2::activeISALevel()) \
+        {                                      \
+        case ::llaminar2::ISALevel::AVX512:    \
+            lhs = name##_avx512(__VA_ARGS__);  \
+            break;                             \
+        case ::llaminar2::ISALevel::AVX2:      \
+            lhs = name##_avx2(__VA_ARGS__);    \
+            break;                             \
+        default:                               \
+            lhs = name##_scalar(__VA_ARGS__);  \
+            break;                             \
+        }                                      \
+    } while (0)
+
+/// Dispatch and return the value directly (for use inside a return statement
+/// context or initializer).  Expands to an immediately-invoked lambda.
+#define ISA_DISPATCH_RETVAL(name, ...) \
+    [&]() -> decltype(name##_scalar(__VA_ARGS__)) {              \
+        switch (::llaminar2::activeISALevel())                   \
+        {                                                        \
+        case ::llaminar2::ISALevel::AVX512:                      \
+            return name##_avx512(__VA_ARGS__);                   \
+        case ::llaminar2::ISALevel::AVX2:                        \
+            return name##_avx2(__VA_ARGS__);                     \
+        default:                                                 \
+            return name##_scalar(__VA_ARGS__);                   \
+        } }()
 
     /**
      * @brief Check if CPU supports AVX2
@@ -485,21 +611,17 @@ namespace llaminar2
      */
     struct CacheInfo
     {
-        uint32_t l1_size;       ///< L1 data cache size in bytes (per core)
-        uint32_t l2_size;       ///< L2 cache size in bytes (per core)
-        uint32_t l3_size;       ///< L3 cache size in bytes (shared)
-        uint32_t l2_total;      ///< Total L2 across all cores
-        uint32_t cache_line;    ///< Cache line size in bytes (typically 64)
+        uint32_t l1_size;    ///< L1 data cache size in bytes (per core)
+        uint32_t l2_size;    ///< L2 cache size in bytes (per core)
+        uint32_t l3_size;    ///< L3 cache size in bytes (shared)
+        uint32_t l2_total;   ///< Total L2 across all cores
+        uint32_t cache_line; ///< Cache line size in bytes (typically 64)
 
         /**
          * @brief Construct CacheInfo with detected values
          */
         CacheInfo()
-            : l1_size(cpu_l1_cache_size())
-            , l2_size(cpu_l2_cache_size())
-            , l3_size(cpu_l3_cache_size())
-            , l2_total(cpu_l2_cache_total())
-            , cache_line(64)  // Standard x86 cache line
+            : l1_size(cpu_l1_cache_size()), l2_size(cpu_l2_cache_size()), l3_size(cpu_l3_cache_size()), l2_total(cpu_l2_cache_total()), cache_line(64) // Standard x86 cache line
         {
         }
 
@@ -546,14 +668,20 @@ namespace llaminar2
             int batch = static_cast<int>(budget / context_per_query);
 
             // Round down to power of 2 for cleaner loop bounds
-            if (batch >= 16) batch = 16;
-            else if (batch >= 8) batch = 8;
-            else if (batch >= 4) batch = 4;
-            else if (batch >= 2) batch = 2;
+            if (batch >= 16)
+                batch = 16;
+            else if (batch >= 8)
+                batch = 8;
+            else if (batch >= 4)
+                batch = 4;
+            else if (batch >= 2)
+                batch = 2;
 
             // Clamp to [min_batch, max_batch]
-            if (batch < min_batch) batch = min_batch;
-            if (batch > max_batch) batch = max_batch;
+            if (batch < min_batch)
+                batch = min_batch;
+            if (batch > max_batch)
+                batch = max_batch;
 
             return batch;
         }
@@ -579,12 +707,16 @@ namespace llaminar2
             int tile = static_cast<int>(available / kv_per_pos);
 
             // Clamp to reasonable range [4, 16]
-            if (tile < 4) tile = 4;
-            if (tile > 16) tile = 16;
+            if (tile < 4)
+                tile = 4;
+            if (tile > 16)
+                tile = 16;
 
             // Round down to power of 2 for simpler loop bounds
-            if (tile >= 16) return 16;
-            if (tile >= 8) return 8;
+            if (tile >= 16)
+                return 16;
+            if (tile >= 8)
+                return 8;
             return 4;
         }
 
@@ -606,15 +738,15 @@ namespace llaminar2
         /**
          * @brief Get human-readable cache info string
          */
-        const char* summary() const
+        const char *summary() const
         {
             static char buf[256];
             snprintf(buf, sizeof(buf),
-                "L1=%uKB L2=%uKB L3=%uMB (L2_total=%uMB)",
-                l1_size / 1024,
-                l2_size / 1024,
-                l3_size / (1024 * 1024),
-                l2_total / (1024 * 1024));
+                     "L1=%uKB L2=%uKB L3=%uMB (L2_total=%uMB)",
+                     l1_size / 1024,
+                     l2_size / 1024,
+                     l3_size / (1024 * 1024),
+                     l2_total / (1024 * 1024));
             return buf;
         }
 
@@ -624,12 +756,12 @@ namespace llaminar2
          * @param head_dim Attention head dimension
          * @param ostream Output stream (default: stdout)
          */
-        void print_analysis(int d_model, int head_dim, FILE* out = stdout) const
+        void print_analysis(int d_model, int head_dim, FILE *out = stdout) const
         {
             size_t context_bytes = static_cast<size_t>(d_model) * 4;
             int wo_batch = optimal_wo_batch_size(d_model);
             int kv_tile = optimal_kv_tile_size(head_dim);
-            
+
             size_t batch_buffer = context_bytes * wo_batch;
             float l2_usage_pct = 100.0f * batch_buffer / l2_size;
 
@@ -639,7 +771,7 @@ namespace llaminar2
             fprintf(out, "║ Cache Hierarchy:                                           ║\n");
             fprintf(out, "║   L1 Data:  %6u KB                                       ║\n", l1_size / 1024);
             fprintf(out, "║   L2:       %6u KB                                       ║\n", l2_size / 1024);
-            fprintf(out, "║   L3:       %6u MB                                       ║\n", l3_size / (1024*1024));
+            fprintf(out, "║   L3:       %6u MB                                       ║\n", l3_size / (1024 * 1024));
             fprintf(out, "╠════════════════════════════════════════════════════════════╣\n");
             fprintf(out, "║ Model Config:                                              ║\n");
             fprintf(out, "║   d_model:  %6d                                          ║\n", d_model);
@@ -652,7 +784,7 @@ namespace llaminar2
             fprintf(out, "║ Memory Footprints:                                         ║\n");
             fprintf(out, "║   Context/query: %6zu KB                                  ║\n", context_bytes / 1024);
             fprintf(out, "║   Batch buffer:  %6zu KB (%d queries)                     ║\n", batch_buffer / 1024, wo_batch);
-            fprintf(out, "║   Wo matrix:     ~%4zu MB (streaming)                      ║\n", (size_t)d_model * d_model * 4 / (1024*1024));
+            fprintf(out, "║   Wo matrix:     ~%4zu MB (streaming)                      ║\n", (size_t)d_model * d_model * 4 / (1024 * 1024));
             fprintf(out, "╚════════════════════════════════════════════════════════════╝\n");
         }
     };
@@ -661,7 +793,7 @@ namespace llaminar2
      * @brief Get cached CacheInfo singleton
      * @return Reference to CacheInfo with detected cache sizes
      */
-    inline const CacheInfo& cache_info()
+    inline const CacheInfo &cache_info()
     {
         static const CacheInfo info;
         return info;
@@ -690,7 +822,7 @@ namespace llaminar2
 
     /**
      * @brief Work size classification for attention kernels
-     * 
+     *
      * Maps cache behavior to compile-time kernel specialization:
      *   SMALL - KV fits comfortably in L2, optimize for low latency
      *   LARGE - KV spills to L3, optimize for bandwidth
@@ -708,10 +840,11 @@ namespace llaminar2
      */
     struct PrefetchConfig
     {
-        int distance;          ///< Number of KV positions to prefetch ahead
-        int cache_level;       ///< Target cache level (0=L1/prefetcht0, 1=L2/prefetcht1, 2=L3/prefetcht2)
-        
-        bool operator==(const PrefetchConfig& o) const {
+        int distance;    ///< Number of KV positions to prefetch ahead
+        int cache_level; ///< Target cache level (0=L1/prefetcht0, 1=L2/prefetcht1, 2=L3/prefetcht2)
+
+        bool operator==(const PrefetchConfig &o) const
+        {
             return distance == o.distance && cache_level == o.cache_level;
         }
     };
@@ -747,11 +880,9 @@ namespace llaminar2
          * @param kv_seq_len_ Current KV cache sequence length
          */
         AttentionCacheConfig(int head_dim_, int num_kv_heads_, int kv_seq_len_)
-            : head_dim(head_dim_)
-            , num_kv_heads(num_kv_heads_)
-            , kv_seq_len(kv_seq_len_)
+            : head_dim(head_dim_), num_kv_heads(num_kv_heads_), kv_seq_len(kv_seq_len_)
         {
-            const auto& ci = cache_info();
+            const auto &ci = cache_info();
             l1_size = ci.l1_size;
             l2_size = ci.l2_size;
             l3_size = ci.l3_size;
@@ -837,8 +968,8 @@ namespace llaminar2
                 // L1 prefetch: short distance, keep data close
                 // Target: prefetch 2-4 cache lines worth
                 cfg.cache_level = 0; // prefetcht0
-                cfg.distance = std::max(2, std::min(8, 
-                    static_cast<int>((4 * 64) / bytes_per_kv_pos)));
+                cfg.distance = std::max(2, std::min(8,
+                                                    static_cast<int>((4 * 64) / bytes_per_kv_pos)));
                 break;
 
             case AttentionWorkSize::LARGE:
@@ -846,7 +977,7 @@ namespace llaminar2
                 // Target: prefetch enough to hide L2 latency (~12 cycles)
                 cfg.cache_level = 1; // prefetcht1
                 cfg.distance = std::max(8, std::min(32,
-                    static_cast<int>((16 * 64) / bytes_per_kv_pos)));
+                                                    static_cast<int>((16 * 64) / bytes_per_kv_pos)));
                 break;
 
             case AttentionWorkSize::XL:
@@ -854,7 +985,7 @@ namespace llaminar2
                 // Target: prefetch enough to hide DRAM latency (~100+ cycles)
                 cfg.cache_level = 2; // prefetcht2
                 cfg.distance = std::max(32, std::min(128,
-                    static_cast<int>((64 * 64) / bytes_per_kv_pos)));
+                                                     static_cast<int>((64 * 64) / bytes_per_kv_pos)));
                 break;
             }
 
@@ -886,13 +1017,13 @@ namespace llaminar2
         /**
          * @brief Get human-readable configuration summary
          */
-        void print_config(FILE* out = stdout) const
+        void print_config(FILE *out = stdout) const
         {
             auto ws = work_size();
             auto pf = prefetch_config();
-            
-            const char* ws_names[] = {"SMALL", "LARGE", "XL"};
-            const char* pf_names[] = {"L1 (prefetcht0)", "L2 (prefetcht1)", "L3 (prefetcht2)"};
+
+            const char *ws_names[] = {"SMALL", "LARGE", "XL"};
+            const char *pf_names[] = {"L1 (prefetcht0)", "L2 (prefetcht1)", "L3 (prefetcht2)"};
 
             fprintf(out, "╔════════════════════════════════════════════════════════════╗\n");
             fprintf(out, "║      Cache-Aware Attention Configuration                   ║\n");
@@ -908,14 +1039,14 @@ namespace llaminar2
             fprintf(out, "╠════════════════════════════════════════════════════════════╣\n");
             fprintf(out, "║ Cache Hierarchy:                                           ║\n");
             fprintf(out, "║   L1: %4u KB  L2: %4u KB  L3: %4u MB                     ║\n",
-                l1_size / 1024, l2_size / 1024, l3_size / (1024*1024));
+                    l1_size / 1024, l2_size / 1024, l3_size / (1024 * 1024));
             fprintf(out, "╠════════════════════════════════════════════════════════════╣\n");
             fprintf(out, "║ Derived Configuration:                                     ║\n");
             fprintf(out, "║   WorkSize:   %-6s (per-head vs L2/L3)                   ║\n", ws_names[static_cast<int>(ws)]);
             fprintf(out, "║   Prefetch:   %3d positions → %-20s  ║\n", pf.distance, pf_names[pf.cache_level]);
             fprintf(out, "║   FA2 Tile:   KV%d (KV8 %s)                             ║\n",
-                prefer_kv8_tile() ? 8 : 4,
-                prefer_kv8_tile() ? "fits L2" : "spills L2");
+                    prefer_kv8_tile() ? 8 : 4,
+                    prefer_kv8_tile() ? "fits L2" : "spills L2");
             fprintf(out, "╚════════════════════════════════════════════════════════════╝\n");
         }
     };

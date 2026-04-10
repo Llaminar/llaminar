@@ -1282,3 +1282,104 @@ TEST(GDNTPRealModelLimits, Qwen35_08B_SupportsTP8)
             << "TP=8 rank " << rank;
     }
 }
+
+// =============================================================================
+// IWeightManager Default Interface Methods (Regression for Bug #5)
+//
+// Bug: MultiDeviceOrchestrator (Local TP path) never called
+// setModelDimensions() or setGDNDimensions() on the WeightManager.
+// These methods were only called in InferenceRunnerFactory (Global TP path).
+// Without them, loadFusedQKVColumnParallel() couldn't detect the GDN
+// asymmetric layout, falling through to simple equal row splitting.
+//
+// Fix part 1: Added setModelDimensions/setGDNDimensions to IWeightManager
+// with default no-op implementations so that existing MockWeightManager
+// and other IWeightManager implementations don't break.
+//
+// Fix part 2: MultiDeviceOrchestrator::initializeWeightSharding() now calls
+// both methods after configuring TP.
+// =============================================================================
+
+/**
+ * @brief setModelDimensions/setGDNDimensions are callable via IWeightManager*
+ *
+ * Tests that the default virtual implementations exist and don't crash.
+ * Uses a real WeightManager behind an IWeightManager pointer to verify
+ * the methods are polymorphically callable.
+ */
+TEST(IWeightManagerDefaults, SetModelDimensionsCallableViaInterface)
+{
+    auto mock = std::make_shared<MockModelLoader>();
+    mock->setLoaded(true);
+    mock->setArchitecture("qwen3.5");
+    mock->setBlockCount(0);
+    mock->setEmbeddingLength(16);
+    mock->setHeadCount(4);
+    mock->setHeadCountKV(2);
+    mock->setVocabSize(100);
+    mock->setFeedForwardLength(64);
+    mock->addFP32RandomTensor("token_embd.weight", {100, 16});
+    mock->addFP32RandomTensor("output.weight", {100, 16});
+    mock->addFP32RandomTensor("output_norm.weight", {16});
+
+    auto mpi = MPIContextFactory::create_mock(0, 1);
+    auto wm = std::make_unique<WeightManager>(
+        *mock, mpi, nullptr,
+        WeightDistributionStrategy::SHARDED,
+        WeightPrecision::NATIVE);
+
+    // Call via IWeightManager pointer (the actual dispatch path in MultiDeviceOrchestrator)
+    IWeightManager *iface = wm.get();
+    EXPECT_NO_THROW(iface->setModelDimensions(16, 4, 128));
+    EXPECT_NO_THROW(iface->setGDNDimensions(16, 32, 128));
+}
+
+/**
+ * @brief setGDNDimensions enables GDN slicing path even when called late
+ *
+ * Verify that setGDNDimensions can be called after construction and
+ * before weight loading, which is the exact calling pattern used by
+ * MultiDeviceOrchestrator::initializeWeightSharding().
+ */
+TEST(IWeightManagerDefaults, SetGDNDimensionsBeforeWeightLoad)
+{
+    auto mock = std::make_shared<MockModelLoader>();
+    mock->setLoaded(true);
+    mock->setArchitecture("qwen3.5");
+    mock->setBlockCount(1);
+    mock->setEmbeddingLength(16);
+    mock->setHeadCount(8);
+    mock->setHeadCountKV(2);
+    mock->setVocabSize(100);
+    mock->setFeedForwardLength(64);
+    mock->addFP32RandomTensor("token_embd.weight", {100, 16});
+    mock->addFP32RandomTensor("output.weight", {100, 16});
+    mock->addFP32RandomTensor("output_norm.weight", {16});
+    mock->addFP32RandomTensor("blk.0.attn_norm.weight", {16});
+    mock->addFP32RandomTensor("blk.0.ffn_norm.weight", {16});
+
+    // GDN layout: Q=16 + K=16 + V=32 = 64 rows
+    auto qkv = std::make_shared<FP32Tensor>(std::vector<size_t>{64u, 16u});
+    mock->addTensor("blk.0.attn_qkv.weight", qkv);
+
+    Qwen35SchemaFactory factory;
+    auto config = factory.getWeightShardingConfig();
+
+    auto mpi = MPIContextFactory::create_mock(0, 2);
+    auto wm = std::make_unique<WeightManager>(
+        *mock, mpi, nullptr,
+        WeightDistributionStrategy::SHARDED,
+        WeightPrecision::NATIVE);
+    wm->setWeightShardingConfig(config);
+
+    // This is the calling order from MultiDeviceOrchestrator
+    wm->setModelDimensions(8, 2, 8); // FA: 8*8 + 2*2*8 = 96 ≠ 64
+    wm->setGDNDimensions(4, 8, 4);   // GDN: 2*4*4 + 8*4 = 64 ✓
+
+    auto tensor = wm->getWeightForDevice("blk.0.attn_qkv.weight", DeviceId::cpu());
+    ASSERT_NE(tensor, nullptr);
+
+    // GDN replicate Q/K: Q(16) + K(16) + V(16) = 48 (NOT 32 from simple split)
+    EXPECT_EQ(tensor->shape()[0], 48u)
+        << "setGDNDimensions must enable GDN sub-block slicing with Q/K replication";
+}

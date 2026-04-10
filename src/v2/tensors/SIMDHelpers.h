@@ -1132,19 +1132,20 @@ namespace llaminar2
          * @param output FP32 output buffer
          * @param count Number of elements
          */
-        inline void fused_fp32_residual_add(
+        inline void fused_fp32_residual_add_scalar(
+            const float *residual, const float *input, float *output, size_t count)
+        {
+            for (size_t i = 0; i < count; ++i)
+            {
+                output[i] = residual[i] + input[i];
+            }
+        }
+
+#if defined(__AVX2__)
+        inline void fused_fp32_residual_add_avx2(
             const float *residual, const float *input, float *output, size_t count)
         {
             size_t i = 0;
-#ifdef __AVX512F__
-            for (; i + 16 <= count; i += 16)
-            {
-                __m512 r = _mm512_loadu_ps(residual + i);
-                __m512 x = _mm512_loadu_ps(input + i);
-                __m512 sum = _mm512_add_ps(r, x);
-                _mm512_storeu_ps(output + i, sum);
-            }
-#elif defined(__AVX2__)
             for (; i + 8 <= count; i += 8)
             {
                 __m256 r = _mm256_loadu_ps(residual + i);
@@ -1152,11 +1153,42 @@ namespace llaminar2
                 __m256 sum = _mm256_add_ps(r, x);
                 _mm256_storeu_ps(output + i, sum);
             }
-#endif
             for (; i < count; ++i)
             {
                 output[i] = residual[i] + input[i];
             }
+        }
+#else
+        inline void fused_fp32_residual_add_avx2(
+            const float *, const float *, float *, size_t) { /* stub — unreachable at runtime */ }
+#endif
+
+#if defined(__AVX512F__)
+        inline void fused_fp32_residual_add_avx512(
+            const float *residual, const float *input, float *output, size_t count)
+        {
+            size_t i = 0;
+            for (; i + 16 <= count; i += 16)
+            {
+                __m512 r = _mm512_loadu_ps(residual + i);
+                __m512 x = _mm512_loadu_ps(input + i);
+                __m512 sum = _mm512_add_ps(r, x);
+                _mm512_storeu_ps(output + i, sum);
+            }
+            for (; i < count; ++i)
+            {
+                output[i] = residual[i] + input[i];
+            }
+        }
+#else
+        inline void fused_fp32_residual_add_avx512(
+            const float *, const float *, float *, size_t) { /* stub — unreachable at runtime */ }
+#endif
+
+        inline void fused_fp32_residual_add(
+            const float *residual, const float *input, float *output, size_t count)
+        {
+            ISA_DISPATCH_VOID(fused_fp32_residual_add, residual, input, output, count);
         }
 
         /**
@@ -1170,25 +1202,20 @@ namespace llaminar2
          * @param output FP32 output buffer
          * @param count Number of elements
          */
-        inline void fused_bf16_residual_add(
+        inline void fused_bf16_residual_add_scalar(
+            const uint16_t *residual, const float *input, float *output, size_t count)
+        {
+            for (size_t i = 0; i < count; ++i)
+            {
+                output[i] = bf16_to_fp32(residual[i]) + input[i];
+            }
+        }
+
+#if defined(__AVX2__)
+        inline void fused_bf16_residual_add_avx2(
             const uint16_t *residual, const float *input, float *output, size_t count)
         {
             size_t i = 0;
-#ifdef __AVX512F__
-            for (; i + 16 <= count; i += 16)
-            {
-                // Dequantize BF16 → FP32
-                __m256i bf16_vals = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(residual + i));
-                __m512i unpacked = _mm512_cvtepu16_epi32(bf16_vals);
-                __m512i shifted = _mm512_slli_epi32(unpacked, 16);
-                __m512 r = _mm512_castsi512_ps(shifted);
-
-                // Load input and add
-                __m512 x = _mm512_loadu_ps(input + i);
-                __m512 sum = _mm512_add_ps(r, x);
-                _mm512_storeu_ps(output + i, sum);
-            }
-#elif defined(__AVX2__)
             for (; i + 8 <= count; i += 8)
             {
                 // Dequantize BF16 → FP32
@@ -1202,12 +1229,50 @@ namespace llaminar2
                 __m256 sum = _mm256_add_ps(r, x);
                 _mm256_storeu_ps(output + i, sum);
             }
-#endif
             // Scalar tail
             for (; i < count; ++i)
             {
                 output[i] = bf16_to_fp32(residual[i]) + input[i];
             }
+        }
+#else
+        inline void fused_bf16_residual_add_avx2(
+            const uint16_t *, const float *, float *, size_t) { /* stub — unreachable at runtime */ }
+#endif
+
+#if defined(__AVX512F__)
+        inline void fused_bf16_residual_add_avx512(
+            const uint16_t *residual, const float *input, float *output, size_t count)
+        {
+            size_t i = 0;
+            for (; i + 16 <= count; i += 16)
+            {
+                // Dequantize BF16 → FP32
+                __m256i bf16_vals = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(residual + i));
+                __m512i unpacked = _mm512_cvtepu16_epi32(bf16_vals);
+                __m512i shifted = _mm512_slli_epi32(unpacked, 16);
+                __m512 r = _mm512_castsi512_ps(shifted);
+
+                // Load input and add
+                __m512 x = _mm512_loadu_ps(input + i);
+                __m512 sum = _mm512_add_ps(r, x);
+                _mm512_storeu_ps(output + i, sum);
+            }
+            // Scalar tail
+            for (; i < count; ++i)
+            {
+                output[i] = bf16_to_fp32(residual[i]) + input[i];
+            }
+        }
+#else
+        inline void fused_bf16_residual_add_avx512(
+            const uint16_t *, const float *, float *, size_t) { /* stub — unreachable at runtime */ }
+#endif
+
+        inline void fused_bf16_residual_add(
+            const uint16_t *residual, const float *input, float *output, size_t count)
+        {
+            ISA_DISPATCH_VOID(fused_bf16_residual_add, residual, input, output, count);
         }
 
         /**
@@ -1221,23 +1286,20 @@ namespace llaminar2
          * @param output FP32 output buffer
          * @param count Number of elements
          */
-        inline void fused_fp16_residual_add(
+        inline void fused_fp16_residual_add_scalar(
+            const uint16_t *residual, const float *input, float *output, size_t count)
+        {
+            for (size_t i = 0; i < count; ++i)
+            {
+                output[i] = fp16_to_fp32(residual[i]) + input[i];
+            }
+        }
+
+#if defined(__AVX2__) && defined(__F16C__)
+        inline void fused_fp16_residual_add_avx2(
             const uint16_t *residual, const float *input, float *output, size_t count)
         {
             size_t i = 0;
-#if defined(__AVX512F__)
-            for (; i + 16 <= count; i += 16)
-            {
-                // Dequantize FP16 → FP32
-                __m256i h = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(residual + i));
-                __m512 r = _mm512_cvtph_ps(h);
-
-                // Load input and add
-                __m512 x = _mm512_loadu_ps(input + i);
-                __m512 sum = _mm512_add_ps(r, x);
-                _mm512_storeu_ps(output + i, sum);
-            }
-#elif defined(__AVX2__) && defined(__F16C__)
             for (; i + 8 <= count; i += 8)
             {
                 // Dequantize FP16 → FP32
@@ -1249,12 +1311,48 @@ namespace llaminar2
                 __m256 sum = _mm256_add_ps(r, x);
                 _mm256_storeu_ps(output + i, sum);
             }
-#endif
             // Scalar tail
             for (; i < count; ++i)
             {
                 output[i] = fp16_to_fp32(residual[i]) + input[i];
             }
+        }
+#else
+        inline void fused_fp16_residual_add_avx2(
+            const uint16_t *, const float *, float *, size_t) { /* stub — unreachable at runtime */ }
+#endif
+
+#if defined(__AVX512F__)
+        inline void fused_fp16_residual_add_avx512(
+            const uint16_t *residual, const float *input, float *output, size_t count)
+        {
+            size_t i = 0;
+            for (; i + 16 <= count; i += 16)
+            {
+                // Dequantize FP16 → FP32
+                __m256i h = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(residual + i));
+                __m512 r = _mm512_cvtph_ps(h);
+
+                // Load input and add
+                __m512 x = _mm512_loadu_ps(input + i);
+                __m512 sum = _mm512_add_ps(r, x);
+                _mm512_storeu_ps(output + i, sum);
+            }
+            // Scalar tail
+            for (; i < count; ++i)
+            {
+                output[i] = fp16_to_fp32(residual[i]) + input[i];
+            }
+        }
+#else
+        inline void fused_fp16_residual_add_avx512(
+            const uint16_t *, const float *, float *, size_t) { /* stub — unreachable at runtime */ }
+#endif
+
+        inline void fused_fp16_residual_add(
+            const uint16_t *residual, const float *input, float *output, size_t count)
+        {
+            ISA_DISPATCH_VOID(fused_fp16_residual_add, residual, input, output, count);
         }
 
         /**
@@ -1268,7 +1366,7 @@ namespace llaminar2
          * @param output FP32 output buffer
          * @param count Number of elements (must be multiple of 32)
          */
-        inline void fused_q8_1_residual_add(
+        inline void fused_q8_1_residual_add_scalar(
             const Q8_1Block *residual, const float *input, float *output, size_t count)
         {
             const size_t n_blocks = count / 32;
@@ -1279,10 +1377,65 @@ namespace llaminar2
                 const float *block_input = input + b * 32;
                 float *block_output = output + b * 32;
 
-                // Get scale
                 const float scale = fp16_to_fp32(block.d);
 
-#ifdef __AVX512F__
+                for (int i = 0; i < 32; ++i)
+                {
+                    float r = scale * static_cast<float>(block.qs[i]);
+                    block_output[i] = r + block_input[i];
+                }
+            }
+        }
+
+#if defined(__AVX2__)
+        inline void fused_q8_1_residual_add_avx2(
+            const Q8_1Block *residual, const float *input, float *output, size_t count)
+        {
+            const size_t n_blocks = count / 32;
+
+            for (size_t b = 0; b < n_blocks; ++b)
+            {
+                const Q8_1Block &block = residual[b];
+                const float *block_input = input + b * 32;
+                float *block_output = output + b * 32;
+
+                const float scale = fp16_to_fp32(block.d);
+                __m256 scale_vec = _mm256_set1_ps(scale);
+
+                for (int i = 0; i < 4; ++i)
+                {
+                    // Load 8 int8 values
+                    __m128i q8 = _mm_loadl_epi64(reinterpret_cast<const __m128i *>(block.qs + i * 8));
+                    // Sign-extend to int32
+                    __m256i i32 = _mm256_cvtepi8_epi32(q8);
+                    // Convert to float and scale
+                    __m256 r = _mm256_mul_ps(_mm256_cvtepi32_ps(i32), scale_vec);
+                    // Load input and add
+                    __m256 x = _mm256_loadu_ps(block_input + i * 8);
+                    __m256 sum = _mm256_add_ps(r, x);
+                    // Store
+                    _mm256_storeu_ps(block_output + i * 8, sum);
+                }
+            }
+        }
+#else
+        inline void fused_q8_1_residual_add_avx2(
+            const Q8_1Block *, const float *, float *, size_t) { /* stub — unreachable at runtime */ }
+#endif
+
+#if defined(__AVX512F__)
+        inline void fused_q8_1_residual_add_avx512(
+            const Q8_1Block *residual, const float *input, float *output, size_t count)
+        {
+            const size_t n_blocks = count / 32;
+
+            for (size_t b = 0; b < n_blocks; ++b)
+            {
+                const Q8_1Block &block = residual[b];
+                const float *block_input = input + b * 32;
+                float *block_output = output + b * 32;
+
+                const float scale = fp16_to_fp32(block.d);
                 __m512 scale_vec = _mm512_set1_ps(scale);
 
                 // Load 32 int8 values
@@ -1305,32 +1458,17 @@ namespace llaminar2
 
                 _mm512_storeu_ps(block_output, sum0);
                 _mm512_storeu_ps(block_output + 16, sum1);
-#elif defined(__AVX2__)
-                __m256 scale_vec = _mm256_set1_ps(scale);
-
-                for (int i = 0; i < 4; ++i)
-                {
-                    // Load 8 int8 values
-                    __m128i q8 = _mm_loadl_epi64(reinterpret_cast<const __m128i *>(block.qs + i * 8));
-                    // Sign-extend to int32
-                    __m256i i32 = _mm256_cvtepi8_epi32(q8);
-                    // Convert to float and scale
-                    __m256 r = _mm256_mul_ps(_mm256_cvtepi32_ps(i32), scale_vec);
-                    // Load input and add
-                    __m256 x = _mm256_loadu_ps(block_input + i * 8);
-                    __m256 sum = _mm256_add_ps(r, x);
-                    // Store
-                    _mm256_storeu_ps(block_output + i * 8, sum);
-                }
-#else
-                // Scalar fallback
-                for (int i = 0; i < 32; ++i)
-                {
-                    float r = scale * static_cast<float>(block.qs[i]);
-                    block_output[i] = r + block_input[i];
-                }
-#endif
             }
+        }
+#else
+        inline void fused_q8_1_residual_add_avx512(
+            const Q8_1Block *, const float *, float *, size_t) { /* stub — unreachable at runtime */ }
+#endif
+
+        inline void fused_q8_1_residual_add(
+            const Q8_1Block *residual, const float *input, float *output, size_t count)
+        {
+            ISA_DISPATCH_VOID(fused_q8_1_residual_add, residual, input, output, count);
         }
 
         /**
@@ -1350,7 +1488,7 @@ namespace llaminar2
          * @param output Output Q8_1 block buffer
          * @param count Number of elements (must be multiple of 32)
          */
-        inline void q8_1_add_q8_1(
+        inline void q8_1_add_q8_1_scalar(
             const Q8_1Block *a, const Q8_1Block *b, Q8_1Block *output, size_t count)
         {
             const size_t n_blocks = count / 32;
@@ -1364,7 +1502,139 @@ namespace llaminar2
                 const float scale_a = fp16_to_fp32(block_a.d);
                 const float scale_b = fp16_to_fp32(block_b.d);
 
-#ifdef __AVX512F__
+                // Scalar fallback
+                alignas(32) float temp[32];
+
+                // Dequant and add
+                for (int i = 0; i < 32; ++i)
+                {
+                    float va = scale_a * static_cast<float>(block_a.qs[i]);
+                    float vb = scale_b * static_cast<float>(block_b.qs[i]);
+                    temp[i] = va + vb;
+                }
+
+                // Find max_abs
+                float max_abs = 0.0f;
+                for (int i = 0; i < 32; ++i)
+                {
+                    max_abs = std::max(max_abs, std::abs(temp[i]));
+                }
+
+                if (max_abs < 1e-6f)
+                {
+                    block_out.d = 0;
+                    block_out.sum_qs = 0;
+                    std::memset(block_out.qs, 0, 32);
+                    continue;
+                }
+
+                float out_scale = max_abs / 127.0f;
+                float inv_scale = 127.0f / max_abs;
+                block_out.d = fp32_to_fp16(out_scale);
+
+                int32_t sum_qs = 0;
+                for (int i = 0; i < 32; ++i)
+                {
+                    int32_t q = static_cast<int32_t>(std::round(temp[i] * inv_scale));
+                    q = std::max(-127, std::min(127, q));
+                    block_out.qs[i] = static_cast<int8_t>(q);
+                    sum_qs += q;
+                }
+                block_out.sum_qs = static_cast<int16_t>(sum_qs);
+            }
+        }
+
+#if defined(__AVX2__)
+        inline void q8_1_add_q8_1_avx2(
+            const Q8_1Block *a, const Q8_1Block *b, Q8_1Block *output, size_t count)
+        {
+            const size_t n_blocks = count / 32;
+
+            for (size_t blk = 0; blk < n_blocks; ++blk)
+            {
+                const Q8_1Block &block_a = a[blk];
+                const Q8_1Block &block_b = b[blk];
+                Q8_1Block &block_out = output[blk];
+
+                const float scale_a = fp16_to_fp32(block_a.d);
+                const float scale_b = fp16_to_fp32(block_b.d);
+
+                // Dequant A and B, add, and store to temp buffer
+                alignas(32) float temp[32];
+                __m256 scale_a_vec = _mm256_set1_ps(scale_a);
+                __m256 scale_b_vec = _mm256_set1_ps(scale_b);
+
+                for (int i = 0; i < 4; ++i)
+                {
+                    __m128i qa8 = _mm_loadl_epi64(reinterpret_cast<const __m128i *>(block_a.qs + i * 8));
+                    __m128i qb8 = _mm_loadl_epi64(reinterpret_cast<const __m128i *>(block_b.qs + i * 8));
+                    __m256i ia32 = _mm256_cvtepi8_epi32(qa8);
+                    __m256i ib32 = _mm256_cvtepi8_epi32(qb8);
+                    __m256 fa = _mm256_mul_ps(_mm256_cvtepi32_ps(ia32), scale_a_vec);
+                    __m256 fb = _mm256_mul_ps(_mm256_cvtepi32_ps(ib32), scale_b_vec);
+                    __m256 sum = _mm256_add_ps(fa, fb);
+                    _mm256_store_ps(temp + i * 8, sum);
+                }
+
+                // Find max_abs
+                __m256 vmax0 = _mm256_andnot_ps(_mm256_set1_ps(-0.0f), _mm256_load_ps(temp));
+                __m256 vmax1 = _mm256_andnot_ps(_mm256_set1_ps(-0.0f), _mm256_load_ps(temp + 8));
+                __m256 vmax2 = _mm256_andnot_ps(_mm256_set1_ps(-0.0f), _mm256_load_ps(temp + 16));
+                __m256 vmax3 = _mm256_andnot_ps(_mm256_set1_ps(-0.0f), _mm256_load_ps(temp + 24));
+                __m256 vmax_01 = _mm256_max_ps(vmax0, vmax1);
+                __m256 vmax_23 = _mm256_max_ps(vmax2, vmax3);
+                __m256 vmax_all = _mm256_max_ps(vmax_01, vmax_23);
+                __m128 lo = _mm256_castps256_ps128(vmax_all);
+                __m128 hi = _mm256_extractf128_ps(vmax_all, 1);
+                __m128 vmax128 = _mm_max_ps(lo, hi);
+                vmax128 = _mm_max_ps(vmax128, _mm_shuffle_ps(vmax128, vmax128, _MM_SHUFFLE(1, 0, 3, 2)));
+                vmax128 = _mm_max_ps(vmax128, _mm_shuffle_ps(vmax128, vmax128, _MM_SHUFFLE(0, 0, 0, 1)));
+                float max_abs = _mm_cvtss_f32(vmax128);
+
+                if (max_abs < 1e-6f)
+                {
+                    block_out.d = 0;
+                    block_out.sum_qs = 0;
+                    std::memset(block_out.qs, 0, 32);
+                    continue;
+                }
+
+                float out_scale = max_abs / 127.0f;
+                float inv_scale = 127.0f / max_abs;
+                block_out.d = fp32_to_fp16(out_scale);
+
+                // Quantize
+                int32_t sum_qs = 0;
+                for (int i = 0; i < 32; ++i)
+                {
+                    int32_t q = static_cast<int32_t>(std::round(temp[i] * inv_scale));
+                    q = std::max(-127, std::min(127, q));
+                    block_out.qs[i] = static_cast<int8_t>(q);
+                    sum_qs += q;
+                }
+                block_out.sum_qs = static_cast<int16_t>(sum_qs);
+            }
+        }
+#else
+        inline void q8_1_add_q8_1_avx2(
+            const Q8_1Block *, const Q8_1Block *, Q8_1Block *, size_t) { /* stub — unreachable at runtime */ }
+#endif // defined(__AVX2__)
+
+#if defined(__AVX512F__)
+        inline void q8_1_add_q8_1_avx512(
+            const Q8_1Block *a, const Q8_1Block *b, Q8_1Block *output, size_t count)
+        {
+            const size_t n_blocks = count / 32;
+
+            for (size_t blk = 0; blk < n_blocks; ++blk)
+            {
+                const Q8_1Block &block_a = a[blk];
+                const Q8_1Block &block_b = b[blk];
+                Q8_1Block &block_out = output[blk];
+
+                const float scale_a = fp16_to_fp32(block_a.d);
+                const float scale_b = fp16_to_fp32(block_b.d);
+
                 // Load and dequant A
                 __m128i qa_lo = _mm_loadu_si128(reinterpret_cast<const __m128i *>(block_a.qs));
                 __m128i qa_hi = _mm_loadu_si128(reinterpret_cast<const __m128i *>(block_a.qs + 16));
@@ -1426,105 +1696,17 @@ namespace llaminar2
                     sum_qs += block_out.qs[i];
                 }
                 block_out.sum_qs = static_cast<int16_t>(sum_qs);
-
-#elif defined(__AVX2__)
-                // Dequant A and B, add, and store to temp buffer
-                alignas(32) float temp[32];
-                __m256 scale_a_vec = _mm256_set1_ps(scale_a);
-                __m256 scale_b_vec = _mm256_set1_ps(scale_b);
-
-                for (int i = 0; i < 4; ++i)
-                {
-                    __m128i qa8 = _mm_loadl_epi64(reinterpret_cast<const __m128i *>(block_a.qs + i * 8));
-                    __m128i qb8 = _mm_loadl_epi64(reinterpret_cast<const __m128i *>(block_b.qs + i * 8));
-                    __m256i ia32 = _mm256_cvtepi8_epi32(qa8);
-                    __m256i ib32 = _mm256_cvtepi8_epi32(qb8);
-                    __m256 fa = _mm256_mul_ps(_mm256_cvtepi32_ps(ia32), scale_a_vec);
-                    __m256 fb = _mm256_mul_ps(_mm256_cvtepi32_ps(ib32), scale_b_vec);
-                    __m256 sum = _mm256_add_ps(fa, fb);
-                    _mm256_store_ps(temp + i * 8, sum);
-                }
-
-                // Find max_abs
-                __m256 vmax0 = _mm256_andnot_ps(_mm256_set1_ps(-0.0f), _mm256_load_ps(temp));
-                __m256 vmax1 = _mm256_andnot_ps(_mm256_set1_ps(-0.0f), _mm256_load_ps(temp + 8));
-                __m256 vmax2 = _mm256_andnot_ps(_mm256_set1_ps(-0.0f), _mm256_load_ps(temp + 16));
-                __m256 vmax3 = _mm256_andnot_ps(_mm256_set1_ps(-0.0f), _mm256_load_ps(temp + 24));
-                __m256 vmax_01 = _mm256_max_ps(vmax0, vmax1);
-                __m256 vmax_23 = _mm256_max_ps(vmax2, vmax3);
-                __m256 vmax_all = _mm256_max_ps(vmax_01, vmax_23);
-                __m128 lo = _mm256_castps256_ps128(vmax_all);
-                __m128 hi = _mm256_extractf128_ps(vmax_all, 1);
-                __m128 vmax128 = _mm_max_ps(lo, hi);
-                vmax128 = _mm_max_ps(vmax128, _mm_shuffle_ps(vmax128, vmax128, _MM_SHUFFLE(1, 0, 3, 2)));
-                vmax128 = _mm_max_ps(vmax128, _mm_shuffle_ps(vmax128, vmax128, _MM_SHUFFLE(0, 0, 0, 1)));
-                float max_abs = _mm_cvtss_f32(vmax128);
-
-                if (max_abs < 1e-6f)
-                {
-                    block_out.d = 0;
-                    block_out.sum_qs = 0;
-                    std::memset(block_out.qs, 0, 32);
-                    continue;
-                }
-
-                float out_scale = max_abs / 127.0f;
-                float inv_scale = 127.0f / max_abs;
-                block_out.d = fp32_to_fp16(out_scale);
-
-                // Quantize
-                int32_t sum_qs = 0;
-                for (int i = 0; i < 32; ++i)
-                {
-                    int32_t q = static_cast<int32_t>(std::round(temp[i] * inv_scale));
-                    q = std::max(-127, std::min(127, q));
-                    block_out.qs[i] = static_cast<int8_t>(q);
-                    sum_qs += q;
-                }
-                block_out.sum_qs = static_cast<int16_t>(sum_qs);
-
-#else
-                // Scalar fallback
-                alignas(32) float temp[32];
-
-                // Dequant and add
-                for (int i = 0; i < 32; ++i)
-                {
-                    float va = scale_a * static_cast<float>(block_a.qs[i]);
-                    float vb = scale_b * static_cast<float>(block_b.qs[i]);
-                    temp[i] = va + vb;
-                }
-
-                // Find max_abs
-                float max_abs = 0.0f;
-                for (int i = 0; i < 32; ++i)
-                {
-                    max_abs = std::max(max_abs, std::abs(temp[i]));
-                }
-
-                if (max_abs < 1e-6f)
-                {
-                    block_out.d = 0;
-                    block_out.sum_qs = 0;
-                    std::memset(block_out.qs, 0, 32);
-                    continue;
-                }
-
-                float out_scale = max_abs / 127.0f;
-                float inv_scale = 127.0f / max_abs;
-                block_out.d = fp32_to_fp16(out_scale);
-
-                int32_t sum_qs = 0;
-                for (int i = 0; i < 32; ++i)
-                {
-                    int32_t q = static_cast<int32_t>(std::round(temp[i] * inv_scale));
-                    q = std::max(-127, std::min(127, q));
-                    block_out.qs[i] = static_cast<int8_t>(q);
-                    sum_qs += q;
-                }
-                block_out.sum_qs = static_cast<int16_t>(sum_qs);
-#endif
             }
+        }
+#else
+        inline void q8_1_add_q8_1_avx512(
+            const Q8_1Block *, const Q8_1Block *, Q8_1Block *, size_t) { /* stub — unreachable at runtime */ }
+#endif // defined(__AVX512F__)
+
+        inline void q8_1_add_q8_1(
+            const Q8_1Block *a, const Q8_1Block *b, Q8_1Block *output, size_t count)
+        {
+            ISA_DISPATCH_VOID(q8_1_add_q8_1, a, b, output, count);
         }
 
         /**
@@ -2165,7 +2347,7 @@ namespace llaminar2
          * @param output Output Q16_1 block buffer
          * @param count Number of elements (must be multiple of 32)
          */
-        inline void q16_1_add_q16_1(
+        inline void q16_1_add_q16_1_scalar(
             const Q16_1Block *a, const Q16_1Block *b, Q16_1Block *output, size_t count)
         {
             const size_t n_blocks = count / 32;
@@ -2180,7 +2362,142 @@ namespace llaminar2
                 const float scale_a = block_a.d;
                 const float scale_b = block_b.d;
 
-#ifdef __AVX512F__
+                // Scalar fallback
+                alignas(32) float temp[32];
+
+                // Dequant and add
+                for (int i = 0; i < 32; ++i)
+                {
+                    float va = scale_a * static_cast<float>(block_a.qs[i]);
+                    float vb = scale_b * static_cast<float>(block_b.qs[i]);
+                    temp[i] = va + vb;
+                }
+
+                // Find max_abs
+                float max_abs = 0.0f;
+                for (int i = 0; i < 32; ++i)
+                {
+                    max_abs = std::max(max_abs, std::abs(temp[i]));
+                }
+
+                if (max_abs < 1e-10f)
+                {
+                    block_out.d = 0.0f;
+                    block_out.sum_qs = 0;
+                    std::memset(block_out.qs, 0, 64);
+                    continue;
+                }
+
+                float out_scale = max_abs / 32767.0f;
+                block_out.d = out_scale;
+                float inv_scale = 32767.0f / max_abs;
+
+                int64_t sum_qs = 0;
+                for (int i = 0; i < 32; ++i)
+                {
+                    int32_t q = static_cast<int32_t>(std::round(temp[i] * inv_scale));
+                    q = std::max(-32767, std::min(32767, q));
+                    block_out.qs[i] = static_cast<int16_t>(q);
+                    sum_qs += static_cast<int64_t>(q);
+                }
+                block_out.sum_qs = static_cast<int32_t>(sum_qs);
+            }
+        }
+
+#if defined(__AVX2__)
+        inline void q16_1_add_q16_1_avx2(
+            const Q16_1Block *a, const Q16_1Block *b, Q16_1Block *output, size_t count)
+        {
+            const size_t n_blocks = count / 32;
+
+            for (size_t blk = 0; blk < n_blocks; ++blk)
+            {
+                const Q16_1Block &block_a = a[blk];
+                const Q16_1Block &block_b = b[blk];
+                Q16_1Block &block_out = output[blk];
+
+                // Q16_1 uses FP32 scale directly - no conversion needed!
+                const float scale_a = block_a.d;
+                const float scale_b = block_b.d;
+
+                // Dequant A and B, add, and store to temp buffer
+                alignas(32) float temp[32];
+                __m256 scale_a_vec = _mm256_set1_ps(scale_a);
+                __m256 scale_b_vec = _mm256_set1_ps(scale_b);
+
+                // Process 8 int16 values at a time (4 iterations for 32 elements)
+                for (int i = 0; i < 4; ++i)
+                {
+                    __m128i qa16 = _mm_loadu_si128(reinterpret_cast<const __m128i *>(block_a.qs + i * 8));
+                    __m128i qb16 = _mm_loadu_si128(reinterpret_cast<const __m128i *>(block_b.qs + i * 8));
+                    __m256i ia32 = _mm256_cvtepi16_epi32(qa16);
+                    __m256i ib32 = _mm256_cvtepi16_epi32(qb16);
+                    __m256 fa = _mm256_mul_ps(_mm256_cvtepi32_ps(ia32), scale_a_vec);
+                    __m256 fb = _mm256_mul_ps(_mm256_cvtepi32_ps(ib32), scale_b_vec);
+                    __m256 sum = _mm256_add_ps(fa, fb);
+                    _mm256_store_ps(temp + i * 8, sum);
+                }
+
+                // Find max_abs
+                __m256 vmax0 = _mm256_andnot_ps(_mm256_set1_ps(-0.0f), _mm256_load_ps(temp));
+                __m256 vmax1 = _mm256_andnot_ps(_mm256_set1_ps(-0.0f), _mm256_load_ps(temp + 8));
+                __m256 vmax2 = _mm256_andnot_ps(_mm256_set1_ps(-0.0f), _mm256_load_ps(temp + 16));
+                __m256 vmax3 = _mm256_andnot_ps(_mm256_set1_ps(-0.0f), _mm256_load_ps(temp + 24));
+                __m256 vmax_01 = _mm256_max_ps(vmax0, vmax1);
+                __m256 vmax_23 = _mm256_max_ps(vmax2, vmax3);
+                __m256 vmax_all = _mm256_max_ps(vmax_01, vmax_23);
+                __m128 lo = _mm256_castps256_ps128(vmax_all);
+                __m128 hi = _mm256_extractf128_ps(vmax_all, 1);
+                __m128 vmax128 = _mm_max_ps(lo, hi);
+                vmax128 = _mm_max_ps(vmax128, _mm_shuffle_ps(vmax128, vmax128, _MM_SHUFFLE(1, 0, 3, 2)));
+                vmax128 = _mm_max_ps(vmax128, _mm_shuffle_ps(vmax128, vmax128, _MM_SHUFFLE(0, 0, 0, 1)));
+                float max_abs = _mm_cvtss_f32(vmax128);
+
+                if (max_abs < 1e-10f)
+                {
+                    block_out.d = 0.0f;
+                    block_out.sum_qs = 0;
+                    std::memset(block_out.qs, 0, 64);
+                    continue;
+                }
+
+                float out_scale = max_abs / 32767.0f;
+                block_out.d = out_scale;
+                float inv_scale = 32767.0f / max_abs;
+
+                // Quantize to int16
+                int64_t sum_qs = 0;
+                for (int i = 0; i < 32; ++i)
+                {
+                    int32_t q = static_cast<int32_t>(std::round(temp[i] * inv_scale));
+                    q = std::max(-32767, std::min(32767, q));
+                    block_out.qs[i] = static_cast<int16_t>(q);
+                    sum_qs += static_cast<int64_t>(q);
+                }
+                block_out.sum_qs = static_cast<int32_t>(sum_qs);
+            }
+        }
+#else
+        inline void q16_1_add_q16_1_avx2(
+            const Q16_1Block *, const Q16_1Block *, Q16_1Block *, size_t) { /* stub — unreachable at runtime */ }
+#endif // defined(__AVX2__)
+
+#if defined(__AVX512F__)
+        inline void q16_1_add_q16_1_avx512(
+            const Q16_1Block *a, const Q16_1Block *b, Q16_1Block *output, size_t count)
+        {
+            const size_t n_blocks = count / 32;
+
+            for (size_t blk = 0; blk < n_blocks; ++blk)
+            {
+                const Q16_1Block &block_a = a[blk];
+                const Q16_1Block &block_b = b[blk];
+                Q16_1Block &block_out = output[blk];
+
+                // Q16_1 uses FP32 scale directly - no conversion needed!
+                const float scale_a = block_a.d;
+                const float scale_b = block_b.d;
+
                 // Load and dequant A (16 int16 values → 16 floats, 2 iterations for 32 elements)
                 __m256i qa_lo = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(block_a.qs));
                 __m256i qa_hi = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(block_a.qs + 16));
@@ -2240,23 +2557,103 @@ namespace llaminar2
                     sum_qs += static_cast<int64_t>(block_out.qs[i]);
                 }
                 block_out.sum_qs = static_cast<int32_t>(sum_qs);
+            }
+        }
+#else
+        inline void q16_1_add_q16_1_avx512(
+            const Q16_1Block *, const Q16_1Block *, Q16_1Block *, size_t) { /* stub — unreachable at runtime */ }
+#endif // defined(__AVX512F__)
 
-#elif defined(__AVX2__)
-                // Dequant A and B, add, and store to temp buffer
+        inline void q16_1_add_q16_1(
+            const Q16_1Block *a, const Q16_1Block *b, Q16_1Block *output, size_t count)
+        {
+            ISA_DISPATCH_VOID(q16_1_add_q16_1, a, b, output, count);
+        }
+
+        /**
+         * @brief Q16_1 + FP32 addition (add FP32 delta to Q16_1 residual)
+         *
+         * Common pattern: residual (Q16_1) += attention_output (FP32)
+         * This is slightly faster than converting FP32 to Q16_1 first.
+         *
+         * @param residual Q16_1 block buffer (input and output)
+         * @param delta FP32 values to add
+         * @param count Number of elements (must be multiple of 32)
+         */
+        inline void q16_1_add_fp32_scalar(
+            Q16_1Block *residual, const float *delta, size_t count)
+        {
+            const size_t n_blocks = count / 32;
+
+            for (size_t blk = 0; blk < n_blocks; ++blk)
+            {
+                Q16_1Block &block = residual[blk];
+                const float *delta_ptr = delta + blk * 32;
+
+                const float scale = block.d;
+
+                // Scalar fallback
                 alignas(32) float temp[32];
-                __m256 scale_a_vec = _mm256_set1_ps(scale_a);
-                __m256 scale_b_vec = _mm256_set1_ps(scale_b);
 
-                // Process 8 int16 values at a time (4 iterations for 32 elements)
+                for (int i = 0; i < 32; ++i)
+                {
+                    float vr = scale * static_cast<float>(block.qs[i]);
+                    temp[i] = vr + delta_ptr[i];
+                }
+
+                float max_abs = 0.0f;
+                for (int i = 0; i < 32; ++i)
+                {
+                    max_abs = std::max(max_abs, std::abs(temp[i]));
+                }
+
+                if (max_abs < 1e-10f)
+                {
+                    block.d = 0.0f;
+                    block.sum_qs = 0;
+                    std::memset(block.qs, 0, 64);
+                    continue;
+                }
+
+                float out_scale = max_abs / 32767.0f;
+                block.d = out_scale;
+                float inv_scale = 32767.0f / max_abs;
+
+                int64_t sum_qs = 0;
+                for (int i = 0; i < 32; ++i)
+                {
+                    int32_t q = static_cast<int32_t>(std::round(temp[i] * inv_scale));
+                    q = std::max(-32767, std::min(32767, q));
+                    block.qs[i] = static_cast<int16_t>(q);
+                    sum_qs += static_cast<int64_t>(q);
+                }
+                block.sum_qs = static_cast<int32_t>(sum_qs);
+            }
+        }
+
+#if defined(__AVX2__)
+        inline void q16_1_add_fp32_avx2(
+            Q16_1Block *residual, const float *delta, size_t count)
+        {
+            const size_t n_blocks = count / 32;
+
+            for (size_t blk = 0; blk < n_blocks; ++blk)
+            {
+                Q16_1Block &block = residual[blk];
+                const float *delta_ptr = delta + blk * 32;
+
+                const float scale = block.d;
+
+                alignas(32) float temp[32];
+                __m256 scale_vec = _mm256_set1_ps(scale);
+
                 for (int i = 0; i < 4; ++i)
                 {
-                    __m128i qa16 = _mm_loadu_si128(reinterpret_cast<const __m128i *>(block_a.qs + i * 8));
-                    __m128i qb16 = _mm_loadu_si128(reinterpret_cast<const __m128i *>(block_b.qs + i * 8));
-                    __m256i ia32 = _mm256_cvtepi16_epi32(qa16);
-                    __m256i ib32 = _mm256_cvtepi16_epi32(qb16);
-                    __m256 fa = _mm256_mul_ps(_mm256_cvtepi32_ps(ia32), scale_a_vec);
-                    __m256 fb = _mm256_mul_ps(_mm256_cvtepi32_ps(ib32), scale_b_vec);
-                    __m256 sum = _mm256_add_ps(fa, fb);
+                    __m128i qr16 = _mm_loadu_si128(reinterpret_cast<const __m128i *>(block.qs + i * 8));
+                    __m256i qr32 = _mm256_cvtepi16_epi32(qr16);
+                    __m256 fr = _mm256_mul_ps(_mm256_cvtepi32_ps(qr32), scale_vec);
+                    __m256 fd = _mm256_loadu_ps(delta_ptr + i * 8);
+                    __m256 sum = _mm256_add_ps(fr, fd);
                     _mm256_store_ps(temp + i * 8, sum);
                 }
 
@@ -2277,56 +2674,14 @@ namespace llaminar2
 
                 if (max_abs < 1e-10f)
                 {
-                    block_out.d = 0.0f;
-                    block_out.sum_qs = 0;
-                    std::memset(block_out.qs, 0, 64);
+                    block.d = 0.0f;
+                    block.sum_qs = 0;
+                    std::memset(block.qs, 0, 64);
                     continue;
                 }
 
                 float out_scale = max_abs / 32767.0f;
-                block_out.d = out_scale;
-                float inv_scale = 32767.0f / max_abs;
-
-                // Quantize to int16
-                int64_t sum_qs = 0;
-                for (int i = 0; i < 32; ++i)
-                {
-                    int32_t q = static_cast<int32_t>(std::round(temp[i] * inv_scale));
-                    q = std::max(-32767, std::min(32767, q));
-                    block_out.qs[i] = static_cast<int16_t>(q);
-                    sum_qs += static_cast<int64_t>(q);
-                }
-                block_out.sum_qs = static_cast<int32_t>(sum_qs);
-
-#else
-                // Scalar fallback
-                alignas(32) float temp[32];
-
-                // Dequant and add
-                for (int i = 0; i < 32; ++i)
-                {
-                    float va = scale_a * static_cast<float>(block_a.qs[i]);
-                    float vb = scale_b * static_cast<float>(block_b.qs[i]);
-                    temp[i] = va + vb;
-                }
-
-                // Find max_abs
-                float max_abs = 0.0f;
-                for (int i = 0; i < 32; ++i)
-                {
-                    max_abs = std::max(max_abs, std::abs(temp[i]));
-                }
-
-                if (max_abs < 1e-10f)
-                {
-                    block_out.d = 0.0f;
-                    block_out.sum_qs = 0;
-                    std::memset(block_out.qs, 0, 64);
-                    continue;
-                }
-
-                float out_scale = max_abs / 32767.0f;
-                block_out.d = out_scale;
+                block.d = out_scale;
                 float inv_scale = 32767.0f / max_abs;
 
                 int64_t sum_qs = 0;
@@ -2334,25 +2689,19 @@ namespace llaminar2
                 {
                     int32_t q = static_cast<int32_t>(std::round(temp[i] * inv_scale));
                     q = std::max(-32767, std::min(32767, q));
-                    block_out.qs[i] = static_cast<int16_t>(q);
+                    block.qs[i] = static_cast<int16_t>(q);
                     sum_qs += static_cast<int64_t>(q);
                 }
-                block_out.sum_qs = static_cast<int32_t>(sum_qs);
-#endif
+                block.sum_qs = static_cast<int32_t>(sum_qs);
             }
         }
+#else
+        inline void q16_1_add_fp32_avx2(
+            Q16_1Block *, const float *, size_t) { /* stub — unreachable at runtime */ }
+#endif // defined(__AVX2__)
 
-        /**
-         * @brief Q16_1 + FP32 addition (add FP32 delta to Q16_1 residual)
-         *
-         * Common pattern: residual (Q16_1) += attention_output (FP32)
-         * This is slightly faster than converting FP32 to Q16_1 first.
-         *
-         * @param residual Q16_1 block buffer (input and output)
-         * @param delta FP32 values to add
-         * @param count Number of elements (must be multiple of 32)
-         */
-        inline void q16_1_add_fp32(
+#if defined(__AVX512F__)
+        inline void q16_1_add_fp32_avx512(
             Q16_1Block *residual, const float *delta, size_t count)
         {
             const size_t n_blocks = count / 32;
@@ -2364,7 +2713,6 @@ namespace llaminar2
 
                 const float scale = block.d;
 
-#ifdef __AVX512F__
                 // Load and dequant residual
                 __m256i qr_lo = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(block.qs));
                 __m256i qr_hi = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(block.qs + 16));
@@ -2416,97 +2764,17 @@ namespace llaminar2
                     sum_qs += static_cast<int64_t>(block.qs[i]);
                 }
                 block.sum_qs = static_cast<int32_t>(sum_qs);
-
-#elif defined(__AVX2__)
-                alignas(32) float temp[32];
-                __m256 scale_vec = _mm256_set1_ps(scale);
-
-                for (int i = 0; i < 4; ++i)
-                {
-                    __m128i qr16 = _mm_loadu_si128(reinterpret_cast<const __m128i *>(block.qs + i * 8));
-                    __m256i qr32 = _mm256_cvtepi16_epi32(qr16);
-                    __m256 fr = _mm256_mul_ps(_mm256_cvtepi32_ps(qr32), scale_vec);
-                    __m256 fd = _mm256_loadu_ps(delta_ptr + i * 8);
-                    __m256 sum = _mm256_add_ps(fr, fd);
-                    _mm256_store_ps(temp + i * 8, sum);
-                }
-
-                // Find max_abs
-                __m256 vmax0 = _mm256_andnot_ps(_mm256_set1_ps(-0.0f), _mm256_load_ps(temp));
-                __m256 vmax1 = _mm256_andnot_ps(_mm256_set1_ps(-0.0f), _mm256_load_ps(temp + 8));
-                __m256 vmax2 = _mm256_andnot_ps(_mm256_set1_ps(-0.0f), _mm256_load_ps(temp + 16));
-                __m256 vmax3 = _mm256_andnot_ps(_mm256_set1_ps(-0.0f), _mm256_load_ps(temp + 24));
-                __m256 vmax_01 = _mm256_max_ps(vmax0, vmax1);
-                __m256 vmax_23 = _mm256_max_ps(vmax2, vmax3);
-                __m256 vmax_all = _mm256_max_ps(vmax_01, vmax_23);
-                __m128 lo = _mm256_castps256_ps128(vmax_all);
-                __m128 hi = _mm256_extractf128_ps(vmax_all, 1);
-                __m128 vmax128 = _mm_max_ps(lo, hi);
-                vmax128 = _mm_max_ps(vmax128, _mm_shuffle_ps(vmax128, vmax128, _MM_SHUFFLE(1, 0, 3, 2)));
-                vmax128 = _mm_max_ps(vmax128, _mm_shuffle_ps(vmax128, vmax128, _MM_SHUFFLE(0, 0, 0, 1)));
-                float max_abs = _mm_cvtss_f32(vmax128);
-
-                if (max_abs < 1e-10f)
-                {
-                    block.d = 0.0f;
-                    block.sum_qs = 0;
-                    std::memset(block.qs, 0, 64);
-                    continue;
-                }
-
-                float out_scale = max_abs / 32767.0f;
-                block.d = out_scale;
-                float inv_scale = 32767.0f / max_abs;
-
-                int64_t sum_qs = 0;
-                for (int i = 0; i < 32; ++i)
-                {
-                    int32_t q = static_cast<int32_t>(std::round(temp[i] * inv_scale));
-                    q = std::max(-32767, std::min(32767, q));
-                    block.qs[i] = static_cast<int16_t>(q);
-                    sum_qs += static_cast<int64_t>(q);
-                }
-                block.sum_qs = static_cast<int32_t>(sum_qs);
-
-#else
-                // Scalar fallback
-                alignas(32) float temp[32];
-
-                for (int i = 0; i < 32; ++i)
-                {
-                    float vr = scale * static_cast<float>(block.qs[i]);
-                    temp[i] = vr + delta_ptr[i];
-                }
-
-                float max_abs = 0.0f;
-                for (int i = 0; i < 32; ++i)
-                {
-                    max_abs = std::max(max_abs, std::abs(temp[i]));
-                }
-
-                if (max_abs < 1e-10f)
-                {
-                    block.d = 0.0f;
-                    block.sum_qs = 0;
-                    std::memset(block.qs, 0, 64);
-                    continue;
-                }
-
-                float out_scale = max_abs / 32767.0f;
-                block.d = out_scale;
-                float inv_scale = 32767.0f / max_abs;
-
-                int64_t sum_qs = 0;
-                for (int i = 0; i < 32; ++i)
-                {
-                    int32_t q = static_cast<int32_t>(std::round(temp[i] * inv_scale));
-                    q = std::max(-32767, std::min(32767, q));
-                    block.qs[i] = static_cast<int16_t>(q);
-                    sum_qs += static_cast<int64_t>(q);
-                }
-                block.sum_qs = static_cast<int32_t>(sum_qs);
-#endif
             }
+        }
+#else
+        inline void q16_1_add_fp32_avx512(
+            Q16_1Block *, const float *, size_t) { /* stub — unreachable at runtime */ }
+#endif // defined(__AVX512F__)
+
+        inline void q16_1_add_fp32(
+            Q16_1Block *residual, const float *delta, size_t count)
+        {
+            ISA_DISPATCH_VOID(q16_1_add_fp32, residual, delta, count);
         }
 
         /**
@@ -2588,7 +2856,7 @@ namespace llaminar2
          * @param dst Q8_1 destination blocks
          * @param n_blocks Number of blocks to convert
          */
-        inline void q16_1_to_q8_1_packed(
+        inline void q16_1_to_q8_1_packed_scalar(
             const Q16_1Block *src, Q8_1Block *dst, size_t n_blocks)
         {
             for (size_t blk = 0; blk < n_blocks; ++blk)
@@ -2598,18 +2866,19 @@ namespace llaminar2
 
                 const float scale = src_block.d;
 
-#ifdef __AVX512F__
-                // Dequant Q16_1 to FP32
-                __m256i q16_lo = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(src_block.qs));
-                __m256i q16_hi = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(src_block.qs + 16));
-                __m512 f0 = _mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_cvtepi16_epi32(q16_lo)), _mm512_set1_ps(scale));
-                __m512 f1 = _mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_cvtepi16_epi32(q16_hi)), _mm512_set1_ps(scale));
+                // Scalar fallback
+                alignas(32) float temp[32];
 
-                // Find max_abs for Q8_1 requantization
-                __m512 abs0 = _mm512_abs_ps(f0);
-                __m512 abs1 = _mm512_abs_ps(f1);
-                __m512 vmax = _mm512_max_ps(abs0, abs1);
-                float max_abs = _mm512_reduce_max_ps(vmax);
+                for (int i = 0; i < 32; ++i)
+                {
+                    temp[i] = scale * static_cast<float>(src_block.qs[i]);
+                }
+
+                float max_abs = 0.0f;
+                for (int i = 0; i < 32; ++i)
+                {
+                    max_abs = std::max(max_abs, std::abs(temp[i]));
+                }
 
                 if (max_abs < 1e-6f)
                 {
@@ -2619,35 +2888,33 @@ namespace llaminar2
                     continue;
                 }
 
-                // Q8_1 uses FP16 scale, int8 range
                 float out_scale = max_abs / 127.0f;
                 dst_block.d = fp32_to_fp16(out_scale);
                 float inv_scale = 127.0f / max_abs;
 
-                __m512 inv_scale_vec = _mm512_set1_ps(inv_scale);
-                __m512i q0 = _mm512_cvtps_epi32(_mm512_roundscale_ps(_mm512_mul_ps(f0, inv_scale_vec), _MM_FROUND_TO_NEAREST_INT));
-                __m512i q1 = _mm512_cvtps_epi32(_mm512_roundscale_ps(_mm512_mul_ps(f1, inv_scale_vec), _MM_FROUND_TO_NEAREST_INT));
-
-                __m512i clamped0 = _mm512_max_epi32(_mm512_min_epi32(q0, _mm512_set1_epi32(127)), _mm512_set1_epi32(-127));
-                __m512i clamped1 = _mm512_max_epi32(_mm512_min_epi32(q1, _mm512_set1_epi32(127)), _mm512_set1_epi32(-127));
-
-                // Pack 32-bit → 16-bit → 8-bit
-                __m256i packed0 = _mm512_cvtepi32_epi16(clamped0);
-                __m256i packed1 = _mm512_cvtepi32_epi16(clamped1);
-                __m128i bytes0 = _mm256_cvtepi16_epi8(packed0);
-                __m128i bytes1 = _mm256_cvtepi16_epi8(packed1);
-
-                _mm_storeu_si128(reinterpret_cast<__m128i *>(dst_block.qs), bytes0);
-                _mm_storeu_si128(reinterpret_cast<__m128i *>(dst_block.qs + 16), bytes1);
-
                 int32_t sum_qs = 0;
                 for (int i = 0; i < 32; ++i)
                 {
-                    sum_qs += dst_block.qs[i];
+                    int32_t q = static_cast<int32_t>(std::round(temp[i] * inv_scale));
+                    q = std::max(-127, std::min(127, q));
+                    dst_block.qs[i] = static_cast<int8_t>(q);
+                    sum_qs += q;
                 }
                 dst_block.sum_qs = static_cast<int16_t>(sum_qs);
+            }
+        }
 
-#elif defined(__AVX2__)
+#if defined(__AVX2__)
+        inline void q16_1_to_q8_1_packed_avx2(
+            const Q16_1Block *src, Q8_1Block *dst, size_t n_blocks)
+        {
+            for (size_t blk = 0; blk < n_blocks; ++blk)
+            {
+                const Q16_1Block &src_block = src[blk];
+                Q8_1Block &dst_block = dst[blk];
+
+                const float scale = src_block.d;
+
                 alignas(32) float temp[32];
                 __m256 scale_vec = _mm256_set1_ps(scale);
 
@@ -2695,21 +2962,35 @@ namespace llaminar2
                     sum_qs += q;
                 }
                 dst_block.sum_qs = static_cast<int16_t>(sum_qs);
-
+            }
+        }
 #else
-                // Scalar fallback
-                alignas(32) float temp[32];
+        inline void q16_1_to_q8_1_packed_avx2(
+            const Q16_1Block *, Q8_1Block *, size_t) { /* stub — unreachable at runtime */ }
+#endif // defined(__AVX2__)
 
-                for (int i = 0; i < 32; ++i)
-                {
-                    temp[i] = scale * static_cast<float>(src_block.qs[i]);
-                }
+#if defined(__AVX512F__)
+        inline void q16_1_to_q8_1_packed_avx512(
+            const Q16_1Block *src, Q8_1Block *dst, size_t n_blocks)
+        {
+            for (size_t blk = 0; blk < n_blocks; ++blk)
+            {
+                const Q16_1Block &src_block = src[blk];
+                Q8_1Block &dst_block = dst[blk];
 
-                float max_abs = 0.0f;
-                for (int i = 0; i < 32; ++i)
-                {
-                    max_abs = std::max(max_abs, std::abs(temp[i]));
-                }
+                const float scale = src_block.d;
+
+                // Dequant Q16_1 to FP32
+                __m256i q16_lo = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(src_block.qs));
+                __m256i q16_hi = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(src_block.qs + 16));
+                __m512 f0 = _mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_cvtepi16_epi32(q16_lo)), _mm512_set1_ps(scale));
+                __m512 f1 = _mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_cvtepi16_epi32(q16_hi)), _mm512_set1_ps(scale));
+
+                // Find max_abs for Q8_1 requantization
+                __m512 abs0 = _mm512_abs_ps(f0);
+                __m512 abs1 = _mm512_abs_ps(f1);
+                __m512 vmax = _mm512_max_ps(abs0, abs1);
+                float max_abs = _mm512_reduce_max_ps(vmax);
 
                 if (max_abs < 1e-6f)
                 {
@@ -2719,21 +3000,44 @@ namespace llaminar2
                     continue;
                 }
 
+                // Q8_1 uses FP16 scale, int8 range
                 float out_scale = max_abs / 127.0f;
                 dst_block.d = fp32_to_fp16(out_scale);
                 float inv_scale = 127.0f / max_abs;
 
+                __m512 inv_scale_vec = _mm512_set1_ps(inv_scale);
+                __m512i q0 = _mm512_cvtps_epi32(_mm512_roundscale_ps(_mm512_mul_ps(f0, inv_scale_vec), _MM_FROUND_TO_NEAREST_INT));
+                __m512i q1 = _mm512_cvtps_epi32(_mm512_roundscale_ps(_mm512_mul_ps(f1, inv_scale_vec), _MM_FROUND_TO_NEAREST_INT));
+
+                __m512i clamped0 = _mm512_max_epi32(_mm512_min_epi32(q0, _mm512_set1_epi32(127)), _mm512_set1_epi32(-127));
+                __m512i clamped1 = _mm512_max_epi32(_mm512_min_epi32(q1, _mm512_set1_epi32(127)), _mm512_set1_epi32(-127));
+
+                // Pack 32-bit → 16-bit → 8-bit
+                __m256i packed0 = _mm512_cvtepi32_epi16(clamped0);
+                __m256i packed1 = _mm512_cvtepi32_epi16(clamped1);
+                __m128i bytes0 = _mm256_cvtepi16_epi8(packed0);
+                __m128i bytes1 = _mm256_cvtepi16_epi8(packed1);
+
+                _mm_storeu_si128(reinterpret_cast<__m128i *>(dst_block.qs), bytes0);
+                _mm_storeu_si128(reinterpret_cast<__m128i *>(dst_block.qs + 16), bytes1);
+
                 int32_t sum_qs = 0;
                 for (int i = 0; i < 32; ++i)
                 {
-                    int32_t q = static_cast<int32_t>(std::round(temp[i] * inv_scale));
-                    q = std::max(-127, std::min(127, q));
-                    dst_block.qs[i] = static_cast<int8_t>(q);
-                    sum_qs += q;
+                    sum_qs += dst_block.qs[i];
                 }
                 dst_block.sum_qs = static_cast<int16_t>(sum_qs);
-#endif
             }
+        }
+#else
+        inline void q16_1_to_q8_1_packed_avx512(
+            const Q16_1Block *, Q8_1Block *, size_t) { /* stub — unreachable at runtime */ }
+#endif // defined(__AVX512F__)
+
+        inline void q16_1_to_q8_1_packed(
+            const Q16_1Block *src, Q8_1Block *dst, size_t n_blocks)
+        {
+            ISA_DISPATCH_VOID(q16_1_to_q8_1_packed, src, dst, n_blocks);
         }
 
         /**
@@ -2755,7 +3059,7 @@ namespace llaminar2
          * @param delta Q8_1 block buffer to add
          * @param count Number of elements (must be multiple of 32)
          */
-        inline void q16_1_add_q8_1(
+        inline void q16_1_add_q8_1_scalar(
             Q16_1Block *residual, const Q8_1Block *delta, size_t count)
         {
             const size_t n_blocks = count / 32;
@@ -2770,30 +3074,23 @@ namespace llaminar2
                 // Q8_1 uses FP16 scale - convert to FP32
                 const float scale_d = fp16_to_fp32(block_d.d);
 
-#ifdef __AVX512F__
-                // Load and dequant residual (Q16_1: int16 → FP32)
-                __m256i qr_lo = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(block_r.qs));
-                __m256i qr_hi = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(block_r.qs + 16));
-                __m512 fr0 = _mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_cvtepi16_epi32(qr_lo)), _mm512_set1_ps(scale_r));
-                __m512 fr1 = _mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_cvtepi16_epi32(qr_hi)), _mm512_set1_ps(scale_r));
+                // Scalar fallback
+                alignas(32) float temp[32];
 
-                // Load and dequant delta (Q8_1: int8 → FP32)
-                __m128i qd_bytes = _mm_loadu_si128(reinterpret_cast<const __m128i *>(block_d.qs));
-                __m128i qd_bytes_hi = _mm_loadu_si128(reinterpret_cast<const __m128i *>(block_d.qs + 16));
-                __m512i qd_lo = _mm512_cvtepi8_epi32(qd_bytes);
-                __m512i qd_hi = _mm512_cvtepi8_epi32(qd_bytes_hi);
-                __m512 fd0 = _mm512_mul_ps(_mm512_cvtepi32_ps(qd_lo), _mm512_set1_ps(scale_d));
-                __m512 fd1 = _mm512_mul_ps(_mm512_cvtepi32_ps(qd_hi), _mm512_set1_ps(scale_d));
+                // Dequant and add
+                for (int i = 0; i < 32; ++i)
+                {
+                    float vr = scale_r * static_cast<float>(block_r.qs[i]);
+                    float vd = scale_d * static_cast<float>(block_d.qs[i]);
+                    temp[i] = vr + vd;
+                }
 
-                // Add
-                __m512 sum0 = _mm512_add_ps(fr0, fd0);
-                __m512 sum1 = _mm512_add_ps(fr1, fd1);
-
-                // Find max_abs for requantization
-                __m512 abs0 = _mm512_abs_ps(sum0);
-                __m512 abs1 = _mm512_abs_ps(sum1);
-                __m512 vmax = _mm512_max_ps(abs0, abs1);
-                float max_abs = _mm512_reduce_max_ps(vmax);
+                // Find max_abs
+                float max_abs = 0.0f;
+                for (int i = 0; i < 32; ++i)
+                {
+                    max_abs = std::max(max_abs, std::abs(temp[i]));
+                }
 
                 if (max_abs < 1e-10f)
                 {
@@ -2807,27 +3104,34 @@ namespace llaminar2
                 block_r.d = out_scale;
                 float inv_scale = 32767.0f / max_abs;
 
-                __m512 inv_scale_vec = _mm512_set1_ps(inv_scale);
-                __m512i q0 = _mm512_cvtps_epi32(_mm512_roundscale_ps(_mm512_mul_ps(sum0, inv_scale_vec), _MM_FROUND_TO_NEAREST_INT));
-                __m512i q1 = _mm512_cvtps_epi32(_mm512_roundscale_ps(_mm512_mul_ps(sum1, inv_scale_vec), _MM_FROUND_TO_NEAREST_INT));
-
-                __m512i clamped0 = _mm512_max_epi32(_mm512_min_epi32(q0, _mm512_set1_epi32(32767)), _mm512_set1_epi32(-32767));
-                __m512i clamped1 = _mm512_max_epi32(_mm512_min_epi32(q1, _mm512_set1_epi32(32767)), _mm512_set1_epi32(-32767));
-
-                __m256i packed0 = _mm512_cvtepi32_epi16(clamped0);
-                __m256i packed1 = _mm512_cvtepi32_epi16(clamped1);
-
-                _mm256_storeu_si256(reinterpret_cast<__m256i *>(block_r.qs), packed0);
-                _mm256_storeu_si256(reinterpret_cast<__m256i *>(block_r.qs + 16), packed1);
-
                 int64_t sum_qs = 0;
                 for (int i = 0; i < 32; ++i)
                 {
-                    sum_qs += static_cast<int64_t>(block_r.qs[i]);
+                    int32_t q = static_cast<int32_t>(std::round(temp[i] * inv_scale));
+                    q = std::max(-32767, std::min(32767, q));
+                    block_r.qs[i] = static_cast<int16_t>(q);
+                    sum_qs += static_cast<int64_t>(q);
                 }
                 block_r.sum_qs = static_cast<int32_t>(sum_qs);
+            }
+        }
 
-#elif defined(__AVX2__)
+#if defined(__AVX2__)
+        inline void q16_1_add_q8_1_avx2(
+            Q16_1Block *residual, const Q8_1Block *delta, size_t count)
+        {
+            const size_t n_blocks = count / 32;
+
+            for (size_t blk = 0; blk < n_blocks; ++blk)
+            {
+                Q16_1Block &block_r = residual[blk];
+                const Q8_1Block &block_d = delta[blk];
+
+                // Q16_1 uses FP32 scale directly
+                const float scale_r = block_r.d;
+                // Q8_1 uses FP16 scale - convert to FP32
+                const float scale_d = fp16_to_fp32(block_d.d);
+
                 alignas(32) float temp[32];
                 __m256 scale_r_vec = _mm256_set1_ps(scale_r);
                 __m256 scale_d_vec = _mm256_set1_ps(scale_d);
@@ -2885,25 +3189,52 @@ namespace llaminar2
                     sum_qs += static_cast<int64_t>(q);
                 }
                 block_r.sum_qs = static_cast<int32_t>(sum_qs);
-
+            }
+        }
 #else
-                // Scalar fallback
-                alignas(32) float temp[32];
+        inline void q16_1_add_q8_1_avx2(
+            Q16_1Block *, const Q8_1Block *, size_t) { /* stub — unreachable at runtime */ }
+#endif // defined(__AVX2__)
 
-                // Dequant and add
-                for (int i = 0; i < 32; ++i)
-                {
-                    float vr = scale_r * static_cast<float>(block_r.qs[i]);
-                    float vd = scale_d * static_cast<float>(block_d.qs[i]);
-                    temp[i] = vr + vd;
-                }
+#if defined(__AVX512F__)
+        inline void q16_1_add_q8_1_avx512(
+            Q16_1Block *residual, const Q8_1Block *delta, size_t count)
+        {
+            const size_t n_blocks = count / 32;
 
-                // Find max_abs
-                float max_abs = 0.0f;
-                for (int i = 0; i < 32; ++i)
-                {
-                    max_abs = std::max(max_abs, std::abs(temp[i]));
-                }
+            for (size_t blk = 0; blk < n_blocks; ++blk)
+            {
+                Q16_1Block &block_r = residual[blk];
+                const Q8_1Block &block_d = delta[blk];
+
+                // Q16_1 uses FP32 scale directly
+                const float scale_r = block_r.d;
+                // Q8_1 uses FP16 scale - convert to FP32
+                const float scale_d = fp16_to_fp32(block_d.d);
+
+                // Load and dequant residual (Q16_1: int16 → FP32)
+                __m256i qr_lo = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(block_r.qs));
+                __m256i qr_hi = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(block_r.qs + 16));
+                __m512 fr0 = _mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_cvtepi16_epi32(qr_lo)), _mm512_set1_ps(scale_r));
+                __m512 fr1 = _mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_cvtepi16_epi32(qr_hi)), _mm512_set1_ps(scale_r));
+
+                // Load and dequant delta (Q8_1: int8 → FP32)
+                __m128i qd_bytes = _mm_loadu_si128(reinterpret_cast<const __m128i *>(block_d.qs));
+                __m128i qd_bytes_hi = _mm_loadu_si128(reinterpret_cast<const __m128i *>(block_d.qs + 16));
+                __m512i qd_lo = _mm512_cvtepi8_epi32(qd_bytes);
+                __m512i qd_hi = _mm512_cvtepi8_epi32(qd_bytes_hi);
+                __m512 fd0 = _mm512_mul_ps(_mm512_cvtepi32_ps(qd_lo), _mm512_set1_ps(scale_d));
+                __m512 fd1 = _mm512_mul_ps(_mm512_cvtepi32_ps(qd_hi), _mm512_set1_ps(scale_d));
+
+                // Add
+                __m512 sum0 = _mm512_add_ps(fr0, fd0);
+                __m512 sum1 = _mm512_add_ps(fr1, fd1);
+
+                // Find max_abs for requantization
+                __m512 abs0 = _mm512_abs_ps(sum0);
+                __m512 abs1 = _mm512_abs_ps(sum1);
+                __m512 vmax = _mm512_max_ps(abs0, abs1);
+                float max_abs = _mm512_reduce_max_ps(vmax);
 
                 if (max_abs < 1e-10f)
                 {
@@ -2917,17 +3248,36 @@ namespace llaminar2
                 block_r.d = out_scale;
                 float inv_scale = 32767.0f / max_abs;
 
+                __m512 inv_scale_vec = _mm512_set1_ps(inv_scale);
+                __m512i q0 = _mm512_cvtps_epi32(_mm512_roundscale_ps(_mm512_mul_ps(sum0, inv_scale_vec), _MM_FROUND_TO_NEAREST_INT));
+                __m512i q1 = _mm512_cvtps_epi32(_mm512_roundscale_ps(_mm512_mul_ps(sum1, inv_scale_vec), _MM_FROUND_TO_NEAREST_INT));
+
+                __m512i clamped0 = _mm512_max_epi32(_mm512_min_epi32(q0, _mm512_set1_epi32(32767)), _mm512_set1_epi32(-32767));
+                __m512i clamped1 = _mm512_max_epi32(_mm512_min_epi32(q1, _mm512_set1_epi32(32767)), _mm512_set1_epi32(-32767));
+
+                __m256i packed0 = _mm512_cvtepi32_epi16(clamped0);
+                __m256i packed1 = _mm512_cvtepi32_epi16(clamped1);
+
+                _mm256_storeu_si256(reinterpret_cast<__m256i *>(block_r.qs), packed0);
+                _mm256_storeu_si256(reinterpret_cast<__m256i *>(block_r.qs + 16), packed1);
+
                 int64_t sum_qs = 0;
                 for (int i = 0; i < 32; ++i)
                 {
-                    int32_t q = static_cast<int32_t>(std::round(temp[i] * inv_scale));
-                    q = std::max(-32767, std::min(32767, q));
-                    block_r.qs[i] = static_cast<int16_t>(q);
-                    sum_qs += static_cast<int64_t>(q);
+                    sum_qs += static_cast<int64_t>(block_r.qs[i]);
                 }
                 block_r.sum_qs = static_cast<int32_t>(sum_qs);
-#endif
             }
+        }
+#else
+        inline void q16_1_add_q8_1_avx512(
+            Q16_1Block *, const Q8_1Block *, size_t) { /* stub — unreachable at runtime */ }
+#endif // defined(__AVX512F__)
+
+        inline void q16_1_add_q8_1(
+            Q16_1Block *residual, const Q8_1Block *delta, size_t count)
+        {
+            ISA_DISPATCH_VOID(q16_1_add_q8_1, residual, delta, count);
         }
 
         // ==================== End Q16_1 Native Operations ====================
@@ -3870,25 +4220,69 @@ namespace llaminar2
             std::memcpy(dst, src, n_blocks * sizeof(Q8_1Block));
         }
 
+        // ----- dequantize_q8_1_to_fp32: named ISA variants -----
+
         /**
-         * @brief Dequantize Q8_1 block to FP32
-         *
-         * @param src Q8_1 block buffer
-         * @param dst FP32 output buffer
-         * @param count Number of elements (must be multiple of 32)
+         * @brief Dequantize Q8_1 block to FP32 (scalar)
          */
-        inline void dequantize_q8_1_to_fp32(
+        inline void dequantize_q8_1_to_fp32_scalar(
             const Q8_1Block *src, float *dst, size_t count)
         {
             const size_t n_blocks = count / 32;
-
             for (size_t b = 0; b < n_blocks; ++b)
             {
                 const Q8_1Block &block = src[b];
                 float *block_dst = dst + b * 32;
                 const float scale = fp16_to_fp32(block.d);
+                for (int i = 0; i < 32; ++i)
+                {
+                    block_dst[i] = scale * static_cast<float>(block.qs[i]);
+                }
+            }
+        }
 
-#ifdef __AVX512F__
+#if defined(__AVX2__)
+        /**
+         * @brief Dequantize Q8_1 block to FP32 (AVX2)
+         */
+        inline void dequantize_q8_1_to_fp32_avx2(
+            const Q8_1Block *src, float *dst, size_t count)
+        {
+            const size_t n_blocks = count / 32;
+            for (size_t b = 0; b < n_blocks; ++b)
+            {
+                const Q8_1Block &block = src[b];
+                float *block_dst = dst + b * 32;
+                const float scale = fp16_to_fp32(block.d);
+                __m256 scale_vec = _mm256_set1_ps(scale);
+
+                for (int i = 0; i < 4; ++i)
+                {
+                    __m128i q8 = _mm_loadl_epi64(reinterpret_cast<const __m128i *>(block.qs + i * 8));
+                    __m256i i32 = _mm256_cvtepi8_epi32(q8);
+                    __m256 f = _mm256_mul_ps(_mm256_cvtepi32_ps(i32), scale_vec);
+                    _mm256_storeu_ps(block_dst + i * 8, f);
+                }
+            }
+        }
+#else
+        inline void dequantize_q8_1_to_fp32_avx2(
+            const Q8_1Block *, float *, size_t) { /* stub — unreachable at runtime */ }
+#endif // __AVX2__
+
+#if defined(__AVX512F__)
+        /**
+         * @brief Dequantize Q8_1 block to FP32 (AVX-512)
+         */
+        inline void dequantize_q8_1_to_fp32_avx512(
+            const Q8_1Block *src, float *dst, size_t count)
+        {
+            const size_t n_blocks = count / 32;
+            for (size_t b = 0; b < n_blocks; ++b)
+            {
+                const Q8_1Block &block = src[b];
+                float *block_dst = dst + b * 32;
+                const float scale = fp16_to_fp32(block.d);
                 __m512 scale_vec = _mm512_set1_ps(scale);
 
                 __m128i q_lo = _mm_loadu_si128(reinterpret_cast<const __m128i *>(block.qs));
@@ -3902,36 +4296,32 @@ namespace llaminar2
 
                 _mm512_storeu_ps(block_dst, f0);
                 _mm512_storeu_ps(block_dst + 16, f1);
-#elif defined(__AVX2__)
-                __m256 scale_vec = _mm256_set1_ps(scale);
-
-                for (int i = 0; i < 4; ++i)
-                {
-                    __m128i q8 = _mm_loadl_epi64(reinterpret_cast<const __m128i *>(block.qs + i * 8));
-                    __m256i i32 = _mm256_cvtepi8_epi32(q8);
-                    __m256 f = _mm256_mul_ps(_mm256_cvtepi32_ps(i32), scale_vec);
-                    _mm256_storeu_ps(block_dst + i * 8, f);
-                }
-#else
-                for (int i = 0; i < 32; ++i)
-                {
-                    block_dst[i] = scale * static_cast<float>(block.qs[i]);
-                }
-#endif
             }
         }
+#else
+        inline void dequantize_q8_1_to_fp32_avx512(
+            const Q8_1Block *, float *, size_t) { /* stub — unreachable at runtime */ }
+#endif // __AVX512F__
 
         /**
-         * @brief Quantize FP32 to Q8_1 blocks
+         * @brief Dequantize Q8_1 block to FP32 (dispatch wrapper)
          *
-         * Self-contained implementation that doesn't depend on other functions
-         * declared later in this file.
-         *
-         * @param src FP32 input buffer
-         * @param dst Q8_1 block output buffer
+         * @param src Q8_1 block buffer
+         * @param dst FP32 output buffer
          * @param count Number of elements (must be multiple of 32)
          */
-        inline void quantize_fp32_to_q8_1_blocks(
+        inline void dequantize_q8_1_to_fp32(
+            const Q8_1Block *src, float *dst, size_t count)
+        {
+            ISA_DISPATCH_VOID(dequantize_q8_1_to_fp32, src, dst, count);
+        }
+
+        // ----- quantize_fp32_to_q8_1_blocks: named ISA variants -----
+
+        /**
+         * @brief Quantize FP32 to Q8_1 blocks (scalar)
+         */
+        inline void quantize_fp32_to_q8_1_blocks_scalar(
             const float *src, Q8_1Block *dst, size_t count)
         {
             const size_t n_blocks = count / 32;
@@ -3943,32 +4333,10 @@ namespace llaminar2
 
                 // Find max absolute value
                 float max_abs = 0.0f;
-#if defined(__AVX512F__)
-                __m512 vmax0 = _mm512_abs_ps(_mm512_loadu_ps(block_src));
-                __m512 vmax1 = _mm512_abs_ps(_mm512_loadu_ps(block_src + 16));
-                __m512 vmax = _mm512_max_ps(vmax0, vmax1);
-                max_abs = _mm512_reduce_max_ps(vmax);
-#elif defined(__AVX2__)
-                __m256 vmax0 = _mm256_andnot_ps(_mm256_set1_ps(-0.0f), _mm256_loadu_ps(block_src));
-                __m256 vmax1 = _mm256_andnot_ps(_mm256_set1_ps(-0.0f), _mm256_loadu_ps(block_src + 8));
-                __m256 vmax2 = _mm256_andnot_ps(_mm256_set1_ps(-0.0f), _mm256_loadu_ps(block_src + 16));
-                __m256 vmax3 = _mm256_andnot_ps(_mm256_set1_ps(-0.0f), _mm256_loadu_ps(block_src + 24));
-                __m256 vmax_01 = _mm256_max_ps(vmax0, vmax1);
-                __m256 vmax_23 = _mm256_max_ps(vmax2, vmax3);
-                __m256 vmax_all = _mm256_max_ps(vmax_01, vmax_23);
-                // Horizontal max in AVX2
-                __m128 lo = _mm256_castps256_ps128(vmax_all);
-                __m128 hi = _mm256_extractf128_ps(vmax_all, 1);
-                __m128 vmax128 = _mm_max_ps(lo, hi);
-                vmax128 = _mm_max_ps(vmax128, _mm_shuffle_ps(vmax128, vmax128, _MM_SHUFFLE(1, 0, 3, 2)));
-                vmax128 = _mm_max_ps(vmax128, _mm_shuffle_ps(vmax128, vmax128, _MM_SHUFFLE(0, 0, 0, 1)));
-                max_abs = _mm_cvtss_f32(vmax128);
-#else
                 for (int i = 0; i < 32; ++i)
                 {
                     max_abs = std::max(max_abs, std::abs(block_src[i]));
                 }
-#endif
 
                 constexpr float MIN_SCALE_THRESHOLD = 1e-6f;
                 if (max_abs < MIN_SCALE_THRESHOLD)
@@ -3989,7 +4357,130 @@ namespace llaminar2
 
                 // Quantize and sum
                 int32_t sum_i32 = 0;
+                for (int i = 0; i < 32; ++i)
+                {
+                    float scaled = block_src[i] * inv_scale;
+                    block.qs[i] = static_cast<int8_t>(std::round(std::max(-127.0f, std::min(127.0f, scaled))));
+                    sum_i32 += static_cast<int32_t>(block.qs[i]);
+                }
+
+                // Store scale as FP16 and sum as int16
+                block.d = fp32_to_fp16(scale);
+                block.sum_qs = static_cast<int16_t>(sum_i32);
+            }
+        }
+
+#if defined(__AVX2__)
+        /**
+         * @brief Quantize FP32 to Q8_1 blocks (AVX2)
+         *
+         * Uses AVX2 for max-abs reduction; scalar quantize+pack.
+         */
+        inline void quantize_fp32_to_q8_1_blocks_avx2(
+            const float *src, Q8_1Block *dst, size_t count)
+        {
+            const size_t n_blocks = count / 32;
+
+            for (size_t b = 0; b < n_blocks; ++b)
+            {
+                const float *block_src = src + b * 32;
+                Q8_1Block &block = dst[b];
+
+                // Find max absolute value (AVX2)
+                float max_abs = 0.0f;
+                __m256 vmax0 = _mm256_andnot_ps(_mm256_set1_ps(-0.0f), _mm256_loadu_ps(block_src));
+                __m256 vmax1 = _mm256_andnot_ps(_mm256_set1_ps(-0.0f), _mm256_loadu_ps(block_src + 8));
+                __m256 vmax2 = _mm256_andnot_ps(_mm256_set1_ps(-0.0f), _mm256_loadu_ps(block_src + 16));
+                __m256 vmax3 = _mm256_andnot_ps(_mm256_set1_ps(-0.0f), _mm256_loadu_ps(block_src + 24));
+                __m256 vmax_01 = _mm256_max_ps(vmax0, vmax1);
+                __m256 vmax_23 = _mm256_max_ps(vmax2, vmax3);
+                __m256 vmax_all = _mm256_max_ps(vmax_01, vmax_23);
+                // Horizontal max in AVX2
+                __m128 lo = _mm256_castps256_ps128(vmax_all);
+                __m128 hi = _mm256_extractf128_ps(vmax_all, 1);
+                __m128 vmax128 = _mm_max_ps(lo, hi);
+                vmax128 = _mm_max_ps(vmax128, _mm_shuffle_ps(vmax128, vmax128, _MM_SHUFFLE(1, 0, 3, 2)));
+                vmax128 = _mm_max_ps(vmax128, _mm_shuffle_ps(vmax128, vmax128, _MM_SHUFFLE(0, 0, 0, 1)));
+                max_abs = _mm_cvtss_f32(vmax128);
+
+                constexpr float MIN_SCALE_THRESHOLD = 1e-6f;
+                if (max_abs < MIN_SCALE_THRESHOLD)
+                {
+                    block.d = 0;
+                    block.sum_qs = 0;
+                    std::memset(block.qs, 0, 32);
+                    continue;
+                }
+
+                // Calculate scale
+                float scale = max_abs / 127.0f;
+                if (scale > 65504.0f)
+                {
+                    scale = 65504.0f;
+                }
+                float inv_scale = 1.0f / scale;
+
+                // Quantize and sum (scalar — no AVX2 quantize path)
+                int32_t sum_i32 = 0;
+                for (int i = 0; i < 32; ++i)
+                {
+                    float scaled = block_src[i] * inv_scale;
+                    block.qs[i] = static_cast<int8_t>(std::round(std::max(-127.0f, std::min(127.0f, scaled))));
+                    sum_i32 += static_cast<int32_t>(block.qs[i]);
+                }
+
+                // Store scale as FP16 and sum as int16
+                block.d = fp32_to_fp16(scale);
+                block.sum_qs = static_cast<int16_t>(sum_i32);
+            }
+        }
+#else
+        inline void quantize_fp32_to_q8_1_blocks_avx2(
+            const float *, Q8_1Block *, size_t) { /* stub — unreachable at runtime */ }
+#endif // __AVX2__
+
 #if defined(__AVX512F__)
+        /**
+         * @brief Quantize FP32 to Q8_1 blocks (AVX-512)
+         *
+         * Uses AVX-512 for both max-abs reduction and vectorized quantize+pack.
+         */
+        inline void quantize_fp32_to_q8_1_blocks_avx512(
+            const float *src, Q8_1Block *dst, size_t count)
+        {
+            const size_t n_blocks = count / 32;
+
+            for (size_t b = 0; b < n_blocks; ++b)
+            {
+                const float *block_src = src + b * 32;
+                Q8_1Block &block = dst[b];
+
+                // Find max absolute value (AVX-512)
+                float max_abs = 0.0f;
+                __m512 vmax0 = _mm512_abs_ps(_mm512_loadu_ps(block_src));
+                __m512 vmax1 = _mm512_abs_ps(_mm512_loadu_ps(block_src + 16));
+                __m512 vmax = _mm512_max_ps(vmax0, vmax1);
+                max_abs = _mm512_reduce_max_ps(vmax);
+
+                constexpr float MIN_SCALE_THRESHOLD = 1e-6f;
+                if (max_abs < MIN_SCALE_THRESHOLD)
+                {
+                    block.d = 0;
+                    block.sum_qs = 0;
+                    std::memset(block.qs, 0, 32);
+                    continue;
+                }
+
+                // Calculate scale
+                float scale = max_abs / 127.0f;
+                if (scale > 65504.0f)
+                {
+                    scale = 65504.0f;
+                }
+                float inv_scale = 1.0f / scale;
+
+                // Quantize and sum (AVX-512)
+                int32_t sum_i32 = 0;
                 __m512 vinv = _mm512_set1_ps(inv_scale);
                 __m512 vmin = _mm512_set1_ps(-127.0f);
                 __m512 vmax_q = _mm512_set1_ps(127.0f);
@@ -4017,19 +4508,31 @@ namespace llaminar2
 
                 // Compute sum
                 sum_i32 = _mm512_reduce_add_epi32(i0) + _mm512_reduce_add_epi32(i1);
-#else
-                for (int i = 0; i < 32; ++i)
-                {
-                    float scaled = block_src[i] * inv_scale;
-                    block.qs[i] = static_cast<int8_t>(std::round(std::max(-127.0f, std::min(127.0f, scaled))));
-                    sum_i32 += static_cast<int32_t>(block.qs[i]);
-                }
-#endif
 
                 // Store scale as FP16 and sum as int16
                 block.d = fp32_to_fp16(scale);
                 block.sum_qs = static_cast<int16_t>(sum_i32);
             }
+        }
+#else
+        inline void quantize_fp32_to_q8_1_blocks_avx512(
+            const float *, Q8_1Block *, size_t) { /* stub — unreachable at runtime */ }
+#endif // __AVX512F__
+
+        /**
+         * @brief Quantize FP32 to Q8_1 blocks (dispatch wrapper)
+         *
+         * Self-contained implementation that doesn't depend on other functions
+         * declared later in this file.
+         *
+         * @param src FP32 input buffer
+         * @param dst Q8_1 block output buffer
+         * @param count Number of elements (must be multiple of 32)
+         */
+        inline void quantize_fp32_to_q8_1_blocks(
+            const float *src, Q8_1Block *dst, size_t count)
+        {
+            ISA_DISPATCH_VOID(quantize_fp32_to_q8_1_blocks, src, dst, count);
         }
 
         // ==========================================

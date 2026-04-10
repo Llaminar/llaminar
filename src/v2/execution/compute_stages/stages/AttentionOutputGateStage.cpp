@@ -10,8 +10,12 @@
 
 #include <cmath>
 
-#if defined(__AVX512F__)
+#if defined(__AVX512F__) || defined(__AVX2__)
 #include <immintrin.h>
+#endif
+
+#if defined(__AVX2__)
+#include "../../../kernels/cpu/simd/AVX2Helpers.h"
 #endif
 
 // GPU kernel declarations
@@ -28,6 +32,105 @@ extern "C" bool rocmGDN_attention_output_gate(
 
 namespace llaminar2
 {
+
+    // ========================================================================
+    // Named ISA implementations: attention_gate_row
+    // out[i] = sigmoid(gate[i]) * input[i]
+    // ========================================================================
+
+    void attention_gate_row_scalar(const float *gate_row, const float *inp_row,
+                                   float *out_row, size_t cols)
+    {
+        for (size_t j = 0; j < cols; ++j)
+        {
+            const float sig = 1.0f / (1.0f + std::exp(-gate_row[j]));
+            out_row[j] = sig * inp_row[j];
+        }
+    }
+
+#if defined(__AVX2__)
+    void attention_gate_row_avx2(const float *gate_row, const float *inp_row,
+                                 float *out_row, size_t cols)
+    {
+        size_t j = 0;
+        const size_t vec_end = cols & ~static_cast<size_t>(7);
+        for (; j < vec_end; j += 8)
+        {
+            __m256 vg = _mm256_loadu_ps(gate_row + j);
+            __m256 vsig = avx2::fast_sigmoid(vg);
+            __m256 vinp = _mm256_loadu_ps(inp_row + j);
+            _mm256_storeu_ps(out_row + j, _mm256_mul_ps(vsig, vinp));
+        }
+        for (; j < cols; ++j)
+        {
+            const float sig = 1.0f / (1.0f + std::exp(-gate_row[j]));
+            out_row[j] = sig * inp_row[j];
+        }
+    }
+#endif
+
+#if defined(__AVX512F__)
+    void attention_gate_row_avx512(const float *gate_row, const float *inp_row,
+                                   float *out_row, size_t cols)
+    {
+        const __m512 vone = _mm512_set1_ps(1.0f);
+        const __m512 vneg = _mm512_set1_ps(-1.0f);
+        const __m512 vmin = _mm512_set1_ps(-88.0f);
+        const __m512 vmax = _mm512_set1_ps(88.0f);
+        const __m512 vlog2e = _mm512_set1_ps(1.4426950408889634f);
+        const __m512 vc0 = _mm512_set1_ps(1.0f);
+        const __m512 vc1 = _mm512_set1_ps(0.6931471805599453f);
+        const __m512 vc2 = _mm512_set1_ps(0.2402265069591007f);
+        const __m512 vc3 = _mm512_set1_ps(0.0555041086648216f);
+        const __m512 vc4 = _mm512_set1_ps(0.0096181291076285f);
+        const __m512 vc5 = _mm512_set1_ps(0.0013333558146428f);
+
+        size_t j = 0;
+        const size_t vec_end = cols & ~static_cast<size_t>(15);
+        for (; j < vec_end; j += 16)
+        {
+            __m512 vg = _mm512_loadu_ps(gate_row + j);
+            __m512 neg_g = _mm512_max_ps(vmin, _mm512_min_ps(vmax, _mm512_mul_ps(vg, vneg)));
+            __m512 neg_g_scaled = _mm512_mul_ps(neg_g, vlog2e);
+            __m512 vn = _mm512_roundscale_ps(neg_g_scaled, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+            __m512 vf = _mm512_sub_ps(neg_g_scaled, vn);
+            __m512 vp = _mm512_fmadd_ps(vc5, vf, vc4);
+            vp = _mm512_fmadd_ps(vp, vf, vc3);
+            vp = _mm512_fmadd_ps(vp, vf, vc2);
+            vp = _mm512_fmadd_ps(vp, vf, vc1);
+            vp = _mm512_fmadd_ps(vp, vf, vc0);
+            __m512i vi_n = _mm512_cvtps_epi32(vn);
+            vi_n = _mm512_add_epi32(vi_n, _mm512_set1_epi32(127));
+            vi_n = _mm512_slli_epi32(vi_n, 23);
+            __m512 v2n = _mm512_castsi512_ps(vi_n);
+            __m512 vexp = _mm512_mul_ps(vp, v2n);
+            __m512 vsig = _mm512_div_ps(vone, _mm512_add_ps(vone, vexp));
+            __m512 vinp = _mm512_loadu_ps(inp_row + j);
+            _mm512_storeu_ps(out_row + j, _mm512_mul_ps(vsig, vinp));
+        }
+        for (; j < cols; ++j)
+        {
+            const float sig = 1.0f / (1.0f + std::exp(-gate_row[j]));
+            out_row[j] = sig * inp_row[j];
+        }
+    }
+#endif
+
+    inline void attention_gate_row(const float *gate_row, const float *inp_row,
+                                   float *out_row, size_t cols)
+    {
+#if defined(__AVX512F__)
+        attention_gate_row_avx512(gate_row, inp_row, out_row, cols);
+#elif defined(__AVX2__)
+        attention_gate_row_avx2(gate_row, inp_row, out_row, cols);
+#else
+        attention_gate_row_scalar(gate_row, inp_row, out_row, cols);
+#endif
+    }
+
+    // ========================================================================
+    // End named ISA implementations
+    // ========================================================================
 
     AttentionOutputGateStage::AttentionOutputGateStage(Params params)
         : IComputeStage(params.device_id), params_(std::move(params))
@@ -123,73 +226,8 @@ namespace llaminar2
             for (int t = 0; t < seq_len; ++t)
             {
                 const size_t row_off = static_cast<size_t>(t) * cols;
-                const float *gate_row = gate_data + row_off;
-                const float *inp_row = input_data + row_off;
-                float *out_row = output_data + row_off;
-
-#if defined(__AVX512F__)
-                // AVX-512 fast sigmoid: sig(x) = 1/(1+exp(-x))
-                // Using rational polynomial approximation for exp(-x)
-                const __m512 vone = _mm512_set1_ps(1.0f);
-                const __m512 vneg = _mm512_set1_ps(-1.0f);
-                // Clamp range for exp stability
-                const __m512 vmin = _mm512_set1_ps(-88.0f);
-                const __m512 vmax = _mm512_set1_ps(88.0f);
-                // exp coefficients (degree-6 minimax on [-88,0])
-                const __m512 vlog2e = _mm512_set1_ps(1.4426950408889634f);
-                const __m512 vc0 = _mm512_set1_ps(1.0f);
-                const __m512 vc1 = _mm512_set1_ps(0.6931471805599453f);
-                const __m512 vc2 = _mm512_set1_ps(0.2402265069591007f);
-                const __m512 vc3 = _mm512_set1_ps(0.0555041086648216f);
-                const __m512 vc4 = _mm512_set1_ps(0.0096181291076285f);
-                const __m512 vc5 = _mm512_set1_ps(0.0013333558146428f);
-
-                size_t j = 0;
-                const size_t vec_end = cols & ~static_cast<size_t>(15);
-                for (; j < vec_end; j += 16)
-                {
-                    // neg_gate = clamp(-gate, -88, 88)
-                    __m512 vg = _mm512_loadu_ps(gate_row + j);
-                    __m512 neg_g = _mm512_max_ps(vmin, _mm512_min_ps(vmax, _mm512_mul_ps(vg, vneg)));
-
-                    // exp(neg_g) via range reduction + polynomial
-                    // exp(x) = 2^(x*log2e) = 2^n * 2^f where n=round(x*log2e),
-                    // f = x*log2e - n ∈ [-0.5, 0.5]. Polynomial approximates 2^f.
-                    __m512 neg_g_scaled = _mm512_mul_ps(neg_g, vlog2e);
-                    __m512 vn = _mm512_roundscale_ps(neg_g_scaled, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
-                    __m512 vf = _mm512_sub_ps(neg_g_scaled, vn);
-
-                    // Polynomial: p = c0 + f*(c1 + f*(c2 + f*(c3 + f*(c4 + f*c5))))
-                    __m512 vp = _mm512_fmadd_ps(vc5, vf, vc4);
-                    vp = _mm512_fmadd_ps(vp, vf, vc3);
-                    vp = _mm512_fmadd_ps(vp, vf, vc2);
-                    vp = _mm512_fmadd_ps(vp, vf, vc1);
-                    vp = _mm512_fmadd_ps(vp, vf, vc0);
-
-                    // Scale by 2^n
-                    __m512i vi_n = _mm512_cvtps_epi32(vn);
-                    vi_n = _mm512_add_epi32(vi_n, _mm512_set1_epi32(127));
-                    vi_n = _mm512_slli_epi32(vi_n, 23);
-                    __m512 v2n = _mm512_castsi512_ps(vi_n);
-                    __m512 vexp = _mm512_mul_ps(vp, v2n);
-
-                    // sigmoid = 1 / (1 + exp(-x))
-                    __m512 vsig = _mm512_div_ps(vone, _mm512_add_ps(vone, vexp));
-                    __m512 vinp = _mm512_loadu_ps(inp_row + j);
-                    _mm512_storeu_ps(out_row + j, _mm512_mul_ps(vsig, vinp));
-                }
-                for (; j < cols; ++j)
-                {
-                    const float sig = 1.0f / (1.0f + std::exp(-gate_row[j]));
-                    out_row[j] = sig * inp_row[j];
-                }
-#else
-                for (size_t j = 0; j < cols; ++j)
-                {
-                    const float sig = 1.0f / (1.0f + std::exp(-gate_row[j]));
-                    out_row[j] = sig * inp_row[j];
-                }
-#endif
+                attention_gate_row(gate_data + row_off, input_data + row_off,
+                                   output_data + row_off, cols);
             }
         };
         OMP_WORKSHARE_REGION(do_work);

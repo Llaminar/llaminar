@@ -382,9 +382,9 @@ TEST_F(Test__TensorSliceCoherence, MixedCoherenceCalls)
     mock_ptr->resetCallCounters();
 
     // Simulate typical usage pattern
-    inner_cpu->ensureOnDevice(DeviceId::rocm(0)); // Upload to GPU
-    inner_cpu->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);               // GPU kernel modified it
-    inner_cpu->ensureOnHost();                    // Download back
+    inner_cpu->ensureOnDevice(DeviceId::rocm(0));                        // Upload to GPU
+    inner_cpu->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE); // GPU kernel modified it
+    inner_cpu->ensureOnHost();                                           // Download back
 
     EXPECT_EQ(mock_ptr->ensureOnDevice_calls, 1);
     EXPECT_EQ(mock_ptr->ensureOnHost_calls, 1);
@@ -529,4 +529,131 @@ TEST_F(Test__TensorSliceCoherence, FullSlice_InnerAccessible)
 
     auto *inner_cpu = dynamic_cast<TensorBase *>(slice->inner());
     EXPECT_NE(inner_cpu, nullptr);
+}
+
+// =============================================================================
+// Test Category 9: gpu_data_ptr() Delegation (Regression for Bug #1)
+//
+// Bug: TensorSlice::ensureOnDevice() delegated to inner tensor, which sets
+// inner's gpu_data_ptr_. But TensorSlice::gpu_data_ptr() (inherited from
+// CPUTensorBase) returned TensorSlice's OWN gpu_data_ptr_ member, which was
+// always null. GPU stages then received null device pointers for sharded weights
+// on device 1 (device 0 worked by coincidence since ensureOnDevice wasn't
+// needed for the first device assigned to a pre-placed weight).
+//
+// Fix: Override gpu_data_ptr() in TensorSlice to return inner()->gpu_data_ptr().
+// =============================================================================
+
+/**
+ * @brief Mock tensor that exposes gpu_data_ptr_ injection for testing
+ *
+ * Subclass FP32Tensor to provide access to the protected gpu_data_ptr_ member
+ * so we can simulate what happens after ensureOnDevice() sets it.
+ */
+class MockGpuPtrTensor : public FP32Tensor
+{
+public:
+    MockGpuPtrTensor(size_t rows, size_t cols) : FP32Tensor({rows, cols})
+    {
+        float *ptr = mutable_fp32_data();
+        for (size_t i = 0; i < rows * cols; ++i)
+            ptr[i] = static_cast<float>(i) * 0.1f;
+    }
+
+    /// Inject a fake GPU pointer (simulates what ensureOnDevice does)
+    void injectGpuDataPtr(void *ptr) { gpu_data_ptr_ = ptr; }
+
+    /// Get the raw gpu_data_ptr_ member directly (not through virtual method)
+    void *getRawGpuDataPtr() const { return gpu_data_ptr_; }
+};
+
+TEST_F(Test__TensorSliceCoherence, GpuDataPtrDelegatesToInner)
+{
+    // Create inner tensor with a fake GPU pointer
+    auto inner = std::make_unique<MockGpuPtrTensor>(256, 128);
+    auto *inner_ptr = inner.get();
+
+    // Initially, no GPU pointer
+    ASSERT_EQ(inner_ptr->getRawGpuDataPtr(), nullptr);
+
+    auto slice = createSlice(std::move(inner));
+
+    // TensorSlice should also show null initially
+    EXPECT_EQ(slice->gpu_data_ptr(), nullptr)
+        << "TensorSlice::gpu_data_ptr() should be null when inner has no GPU pointer";
+
+    // Simulate ensureOnDevice() setting inner's gpu_data_ptr_
+    int fake_gpu_buffer = 42;
+    inner_ptr->injectGpuDataPtr(&fake_gpu_buffer);
+
+    // Now TensorSlice::gpu_data_ptr() MUST return inner's pointer, not its own null
+    EXPECT_EQ(slice->gpu_data_ptr(), &fake_gpu_buffer)
+        << "TensorSlice::gpu_data_ptr() must delegate to inner()->gpu_data_ptr()";
+
+    // Also verify const version
+    const TensorSlice *const_slice = slice.get();
+    EXPECT_EQ(const_slice->gpu_data_ptr(), &fake_gpu_buffer)
+        << "const TensorSlice::gpu_data_ptr() must also delegate to inner";
+
+    // Clean up: reset to null to prevent dangling pointer issues
+    inner_ptr->injectGpuDataPtr(nullptr);
+}
+
+TEST_F(Test__TensorSliceCoherence, GpuDataPtrNotFromSliceOwnMember)
+{
+    // This test verifies the specific bug scenario: TensorSlice's OWN
+    // gpu_data_ptr_ member (inherited from CPUTensorBase) must NOT be used.
+    // Even if someone accidentally sets TensorSlice's member directly,
+    // gpu_data_ptr() should still return inner's pointer.
+
+    auto inner = std::make_unique<MockGpuPtrTensor>(256, 128);
+    auto *inner_ptr = inner.get();
+
+    auto slice = createSlice(std::move(inner));
+
+    // Set inner's GPU pointer
+    int fake_inner_gpu = 99;
+    inner_ptr->injectGpuDataPtr(&fake_inner_gpu);
+
+    // TensorSlice::gpu_data_ptr() should return inner's pointer
+    void *result = slice->gpu_data_ptr();
+    EXPECT_EQ(result, &fake_inner_gpu)
+        << "gpu_data_ptr() must come from inner tensor, not TensorSlice's own member";
+
+    inner_ptr->injectGpuDataPtr(nullptr);
+}
+
+TEST_F(Test__TensorSliceCoherence, GpuDataPtrConsistentWithEnsureOnDevice)
+{
+    // Test the full coherence flow: ensureOnDevice on slice → inner's
+    // gpu_data_ptr_ gets set → slice.gpu_data_ptr() returns it.
+    // Uses MockCoherenceTensor which overrides ensureOnDevice.
+
+    auto inner = std::make_unique<MockGpuPtrTensor>(256, 128);
+    auto *inner_ptr = inner.get();
+
+    auto slice = createSlice(std::move(inner));
+
+    // Before ensureOnDevice: both null
+    EXPECT_EQ(slice->gpu_data_ptr(), nullptr);
+    EXPECT_EQ(inner_ptr->getRawGpuDataPtr(), nullptr);
+
+    // Simulate the real sequence:
+    // 1. TensorSlice::ensureOnDevice delegates to inner->ensureOnDevice
+    // 2. Inner's ensureOnDevice allocates GPU memory and sets gpu_data_ptr_
+    // We can't call real ensureOnDevice without a GPU, so simulate step 2
+    float fake_device_mem[128];
+    inner_ptr->injectGpuDataPtr(fake_device_mem);
+
+    // Now verify TensorSlice sees the pointer
+    EXPECT_EQ(slice->gpu_data_ptr(), fake_device_mem)
+        << "After ensureOnDevice sets inner's gpu_data_ptr_, "
+           "TensorSlice::gpu_data_ptr() must reflect it";
+
+    // Verify through TensorBase pointer (which is what GPU stages use)
+    TensorBase *as_base = slice.get();
+    EXPECT_EQ(as_base->gpu_data_ptr(), fake_device_mem)
+        << "gpu_data_ptr() must work through TensorBase interface too";
+
+    inner_ptr->injectGpuDataPtr(nullptr);
 }

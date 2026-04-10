@@ -77,9 +77,16 @@
 #include <type_traits>
 #include <vector>
 
-#if defined(__AVX512F__)
+#if defined(__AVX512F__) || defined(__AVX2__)
 #include <immintrin.h>
 #endif
+
+#if defined(__AVX2__)
+#include "../simd/AVX2Helpers.h"
+#endif
+
+// Forward declaration for friend access from parity tests
+class AVX2Q16DotParityTest;
 
 namespace llaminar2
 {
@@ -734,7 +741,7 @@ namespace llaminar2
             // Pre-rotates Q once per head [O(D²)], then O(D) per KV position.
             // V accumulated in rotated centroid space, one final Πᵀ at end.
             // ---------------------------------------------------------------
-#if defined(__AVX512F__)
+#if defined(__AVX512F__) || defined(__AVX2__)
             if (K->native_type() == TensorType::TQ8 &&
                 V->native_type() == TensorType::TQ4 &&
                 batch_size == 1 && kv_len != seq_len) // decode only
@@ -854,6 +861,9 @@ namespace llaminar2
                 .withScalar("causal", "apply causal masking", KernelBufferDtype::INT32);
         }
 
+        // Allow parity tests to call private static helpers directly
+        friend class ::AVX2Q16DotParityTest;
+
     private:
         /**
          * @brief Non-flash fallback kernel.
@@ -921,6 +931,49 @@ namespace llaminar2
 #endif
         }
 
+        /** @brief Runtime dispatch: FP32 dot product. */
+        static float dot_fp32(const float *a, const float *b, int n)
+        {
+            switch (activeISALevel())
+            {
+            case ISALevel::AVX512:
+                return dot_fp32_avx512(a, b, n);
+            case ISALevel::AVX2:
+                return dot_fp32_avx2(a, b, n);
+            default:
+                return dot_fp32_scalar(a, b, n);
+            }
+        }
+
+        /**
+         * @brief AVX2 vectorised dot product of two FP32 vectors.
+         *
+         * Processes 8 floats per iteration using `_mm256_fmadd_ps`.
+         */
+        static float dot_fp32_avx2(const float *a, const float *b, int n)
+        {
+            __m256 acc = _mm256_setzero_ps();
+            int i = 0;
+            for (; i + 7 < n; i += 8)
+            {
+                __m256 va = _mm256_loadu_ps(a + i);
+                __m256 vb = _mm256_loadu_ps(b + i);
+                acc = _mm256_fmadd_ps(va, vb, acc);
+            }
+            // Horizontal sum: 8 → 4 → 2 → 1
+            __m128 hi = _mm256_extractf128_ps(acc, 1);
+            __m128 lo = _mm256_castps256_ps128(acc);
+            __m128 sum4 = _mm_add_ps(lo, hi);
+            __m128 shuf = _mm_movehdup_ps(sum4);
+            sum4 = _mm_add_ps(sum4, shuf);
+            shuf = _mm_movehl_ps(shuf, sum4);
+            sum4 = _mm_add_ss(sum4, shuf);
+            float sum = _mm_cvtss_f32(sum4);
+            for (; i < n; ++i)
+                sum += a[i] * b[i];
+            return sum;
+        }
+
 #if defined(__AVX512F__)
         /**
          * @brief Fast vectorised exp() for 16 FP32 values using AVX-512.
@@ -962,6 +1015,46 @@ namespace llaminar2
             ni = _mm512_slli_epi32(ni, 23);
             return _mm512_mul_ps(p, _mm512_castsi512_ps(ni));
         }
+#endif
+
+#if defined(__AVX2__)
+        /**
+         * @brief Fast vectorised exp() for 8 FP32 values using AVX2.
+         *
+         * Same polynomial and range reduction as fast_exp_avx512 but
+         * processes 8 floats (YMM) instead of 16 (ZMM).
+         */
+        static inline __m256 fast_exp_avx2(__m256 x)
+        {
+            // Clamp to avoid NaN from -inf inputs
+            x = _mm256_max_ps(x, _mm256_set1_ps(-88.722839f));
+
+            const __m256 log2e = _mm256_set1_ps(1.4426950408889634f);
+            const __m256 ln2_hi = _mm256_set1_ps(0.693145751953125f);
+            const __m256 ln2_lo = _mm256_set1_ps(1.42860682030941723212e-06f);
+
+            // Range reduction: n = round(x / ln2), f = x - n*ln2
+            __m256 t = _mm256_mul_ps(x, log2e);
+            __m256 n = _mm256_round_ps(t, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+            __m256 f = _mm256_fnmadd_ps(n, ln2_hi, x);
+            f = _mm256_fnmadd_ps(n, ln2_lo, f);
+
+            // Horner polynomial for exp(f)
+            __m256 p = _mm256_set1_ps(8.36564774e-03f);
+            p = _mm256_fmadd_ps(p, f, _mm256_set1_ps(4.16689515e-02f));
+            p = _mm256_fmadd_ps(p, f, _mm256_set1_ps(1.66666716e-01f));
+            p = _mm256_fmadd_ps(p, f, _mm256_set1_ps(4.99999851e-01f));
+            p = _mm256_fmadd_ps(p, f, _mm256_set1_ps(1.00000000e+00f));
+            p = _mm256_fmadd_ps(p, f, _mm256_set1_ps(1.00000000e+00f));
+
+            // Construct 2^n via IEEE754 exponent field
+            __m256i ni = _mm256_cvtps_epi32(n);
+            ni = _mm256_add_epi32(ni, _mm256_set1_epi32(127));
+            ni = _mm256_max_epi32(ni, _mm256_setzero_si256());
+            ni = _mm256_slli_epi32(ni, 23);
+            return _mm256_mul_ps(p, _mm256_castsi256_ps(ni));
+        }
+#endif
 
         /**
          * @brief Compute 4 dot products Q·K[0..3] simultaneously for ILP.
@@ -971,6 +1064,7 @@ namespace llaminar2
          * Throughput: ~13 cycles per K-row vs ~32 for the single-accumulator
          * dot_fp32_avx512 path (limited by FMA latency).
          */
+#if defined(__AVX512F__)
         static void dot_fp32_avx512_4row(
             const float *q,
             const float *k0, const float *k1, const float *k2, const float *k3,
@@ -1185,6 +1279,156 @@ namespace llaminar2
         }
 #endif
 
+#if defined(__AVX2__)
+        /**
+         * @brief AVX2 4-row dot product: Q·K[0..3] with 4 FMA accumulators.
+         */
+        static void dot_fp32_avx2_4row(
+            const float *q,
+            const float *k0, const float *k1, const float *k2, const float *k3,
+            int head_dim,
+            float &s0, float &s1, float &s2, float &s3)
+        {
+            __m256 acc0 = _mm256_setzero_ps();
+            __m256 acc1 = _mm256_setzero_ps();
+            __m256 acc2 = _mm256_setzero_ps();
+            __m256 acc3 = _mm256_setzero_ps();
+
+            int d = 0;
+            for (; d + 7 < head_dim; d += 8)
+            {
+                __m256 vq = _mm256_loadu_ps(q + d);
+                acc0 = _mm256_fmadd_ps(vq, _mm256_loadu_ps(k0 + d), acc0);
+                acc1 = _mm256_fmadd_ps(vq, _mm256_loadu_ps(k1 + d), acc1);
+                acc2 = _mm256_fmadd_ps(vq, _mm256_loadu_ps(k2 + d), acc2);
+                acc3 = _mm256_fmadd_ps(vq, _mm256_loadu_ps(k3 + d), acc3);
+            }
+
+            s0 = avx2::hsum_ps(acc0);
+            s1 = avx2::hsum_ps(acc1);
+            s2 = avx2::hsum_ps(acc2);
+            s3 = avx2::hsum_ps(acc3);
+
+            for (; d < head_dim; ++d)
+            {
+                float qd = q[d];
+                s0 += qd * k0[d];
+                s1 += qd * k1[d];
+                s2 += qd * k2[d];
+                s3 += qd * k3[d];
+            }
+        }
+#endif
+
+        static inline void dot_fp32_4row_scalar(
+            const float *q,
+            const float *k0, const float *k1, const float *k2, const float *k3,
+            int head_dim,
+            float &s0, float &s1, float &s2, float &s3)
+        {
+            s0 = 0.0f;
+            s1 = 0.0f;
+            s2 = 0.0f;
+            s3 = 0.0f;
+            for (int d = 0; d < head_dim; ++d)
+            {
+                float qd = q[d];
+                s0 += qd * k0[d];
+                s1 += qd * k1[d];
+                s2 += qd * k2[d];
+                s3 += qd * k3[d];
+            }
+        }
+
+        /** @brief Dispatch: 4-row FP32 dot product. */
+        static void dot_fp32_4row(
+            const float *q,
+            const float *k0, const float *k1, const float *k2, const float *k3,
+            int head_dim,
+            float &s0, float &s1, float &s2, float &s3)
+        {
+            switch (activeISALevel())
+            {
+            case ISALevel::AVX512:
+                dot_fp32_avx512_4row(q, k0, k1, k2, k3, head_dim, s0, s1, s2, s3);
+                break;
+            case ISALevel::AVX2:
+                dot_fp32_avx2_4row(q, k0, k1, k2, k3, head_dim, s0, s1, s2, s3);
+                break;
+            default:
+                dot_fp32_4row_scalar(q, k0, k1, k2, k3, head_dim, s0, s1, s2, s3);
+                break;
+            }
+        }
+
+        // ---- Batched exp(score - max) for 4 values: named implementations ----
+
+        static inline void batch_exp_4_scalar(
+            float s0, float s1, float s2, float s3, float max_val,
+            float &p0, float &p1, float &p2, float &p3)
+        {
+            p0 = std::exp(s0 - max_val);
+            p1 = std::exp(s1 - max_val);
+            p2 = std::exp(s2 - max_val);
+            p3 = std::exp(s3 - max_val);
+        }
+
+#if defined(__AVX2__)
+        static inline void batch_exp_4_avx2(
+            float s0, float s1, float s2, float s3, float max_val,
+            float &p0, float &p1, float &p2, float &p3)
+        {
+            alignas(32) float scores8[8] = {s0, s1, s2, s3, 0.0f, 0.0f, 0.0f, 0.0f};
+            __m256 exp_in = _mm256_sub_ps(
+                _mm256_load_ps(scores8), _mm256_set1_ps(max_val));
+            __m256 exp_out = fast_exp_avx2(exp_in);
+            alignas(32) float pp[8];
+            _mm256_store_ps(pp, exp_out);
+            p0 = pp[0];
+            p1 = pp[1];
+            p2 = pp[2];
+            p3 = pp[3];
+        }
+#endif
+
+#if defined(__AVX512F__)
+        static inline void batch_exp_4_avx512(
+            float s0, float s1, float s2, float s3, float max_val,
+            float &p0, float &p1, float &p2, float &p3)
+        {
+            const __m128 scores4 = _mm_set_ps(s3, s2, s1, s0);
+            const __m128 nm4 = _mm_set1_ps(max_val);
+            const __m512 exp_in = _mm512_castps128_ps512(_mm_sub_ps(scores4, nm4));
+            const __m512 exp_out = fast_exp_avx512(exp_in);
+            const __m128 probs = _mm512_castps512_ps128(exp_out);
+            alignas(16) float pp[4];
+            _mm_store_ps(pp, probs);
+            p0 = pp[0];
+            p1 = pp[1];
+            p2 = pp[2];
+            p3 = pp[3];
+        }
+#endif
+
+        /** @brief Dispatch: compute 4 × exp(score - max). */
+        static void batch_exp_4(
+            float s0, float s1, float s2, float s3, float max_val,
+            float &p0, float &p1, float &p2, float &p3)
+        {
+            switch (activeISALevel())
+            {
+            case ISALevel::AVX512:
+                batch_exp_4_avx512(s0, s1, s2, s3, max_val, p0, p1, p2, p3);
+                break;
+            case ISALevel::AVX2:
+                batch_exp_4_avx2(s0, s1, s2, s3, max_val, p0, p1, p2, p3);
+                break;
+            default:
+                batch_exp_4_scalar(s0, s1, s2, s3, max_val, p0, p1, p2, p3);
+                break;
+            }
+        }
+
         /**
          * @brief Compute optimal thread count for attention based on work size.
          *
@@ -1238,30 +1482,64 @@ namespace llaminar2
          * @param head_dim  Number of dimensions per head.
          * @param use_avx512 True if AVX-512 is available at runtime.
          */
-        static void accum_weighted_v(float *out, const float *v, float weight, int head_dim, bool use_avx512)
+        static void accum_weighted_v_scalar(float *out, const float *v, float weight, int head_dim)
         {
-#if defined(__AVX512F__)
-            if (use_avx512)
-            {
-                __m512 w = _mm512_set1_ps(weight);
-                int d = 0;
-                for (; d + 15 < head_dim; d += 16)
-                {
-                    __m512 o = _mm512_loadu_ps(out + d);
-                    __m512 vv = _mm512_loadu_ps(v + d);
-                    o = _mm512_fmadd_ps(vv, w, o);
-                    _mm512_storeu_ps(out + d, o);
-                }
-                for (; d < head_dim; ++d)
-                {
-                    out[d] += weight * v[d];
-                }
-                return;
-            }
-#endif
             for (int d = 0; d < head_dim; ++d)
             {
                 out[d] += weight * v[d];
+            }
+        }
+
+#if defined(__AVX2__)
+        static void accum_weighted_v_avx2(float *out, const float *v, float weight, int head_dim)
+        {
+            __m256 w = _mm256_set1_ps(weight);
+            int d = 0;
+            for (; d + 7 < head_dim; d += 8)
+            {
+                __m256 o = _mm256_loadu_ps(out + d);
+                __m256 vv = _mm256_loadu_ps(v + d);
+                o = _mm256_fmadd_ps(vv, w, o);
+                _mm256_storeu_ps(out + d, o);
+            }
+            for (; d < head_dim; ++d)
+                out[d] += weight * v[d];
+        }
+#endif
+
+#if defined(__AVX512F__)
+        static void accum_weighted_v_avx512(float *out, const float *v, float weight, int head_dim)
+        {
+            __m512 w = _mm512_set1_ps(weight);
+            int d = 0;
+            for (; d + 15 < head_dim; d += 16)
+            {
+                __m512 o = _mm512_loadu_ps(out + d);
+                __m512 vv = _mm512_loadu_ps(v + d);
+                o = _mm512_fmadd_ps(vv, w, o);
+                _mm512_storeu_ps(out + d, o);
+            }
+            for (; d < head_dim; ++d)
+            {
+                out[d] += weight * v[d];
+            }
+        }
+#endif
+
+        static void accum_weighted_v(float *out, const float *v, float weight, int head_dim, bool use_avx512)
+        {
+            (void)use_avx512;
+            switch (activeISALevel())
+            {
+            case ISALevel::AVX512:
+                accum_weighted_v_avx512(out, v, weight, head_dim);
+                break;
+            case ISALevel::AVX2:
+                accum_weighted_v_avx2(out, v, weight, head_dim);
+                break;
+            default:
+                accum_weighted_v_scalar(out, v, weight, head_dim);
+                break;
             }
         }
 
@@ -1271,7 +1549,9 @@ namespace llaminar2
          * Accumulates 4 weighted V vectors into out in one pass, saving ~60%
          * of L1 traffic vs calling accum_weighted_v four times.
          */
-        static void accum_weighted_v_4row(
+        // ---- FP32 4-row V-accumulation: named implementations ----
+
+        static inline void accum_weighted_v_4row_scalar(
             float *__restrict out,
             const float *v0, float w0,
             const float *v1, float w1,
@@ -1279,7 +1559,64 @@ namespace llaminar2
             const float *v3, float w3,
             int head_dim)
         {
+            for (int d = 0; d < head_dim; ++d)
+            {
+                out[d] += w0 * v0[d] + w1 * v1[d] + w2 * v2[d] + w3 * v3[d];
+            }
+        }
+
+#if defined(__AVX2__)
+        static inline void accum_weighted_v_4row_avx2(
+            float *__restrict out,
+            const float *v0, float w0,
+            const float *v1, float w1,
+            const float *v2, float w2,
+            const float *v3, float w3,
+            int head_dim)
+        {
+            const __m256 vw0 = _mm256_set1_ps(w0);
+            const __m256 vw1 = _mm256_set1_ps(w1);
+            const __m256 vw2 = _mm256_set1_ps(w2);
+            const __m256 vw3 = _mm256_set1_ps(w3);
+            int d = 0;
+            for (; d + 15 < head_dim; d += 16)
+            {
+                __m256 oA = _mm256_loadu_ps(out + d);
+                __m256 oB = _mm256_loadu_ps(out + d + 8);
+                oA = _mm256_fmadd_ps(_mm256_loadu_ps(v0 + d), vw0, oA);
+                oB = _mm256_fmadd_ps(_mm256_loadu_ps(v0 + d + 8), vw0, oB);
+                oA = _mm256_fmadd_ps(_mm256_loadu_ps(v1 + d), vw1, oA);
+                oB = _mm256_fmadd_ps(_mm256_loadu_ps(v1 + d + 8), vw1, oB);
+                oA = _mm256_fmadd_ps(_mm256_loadu_ps(v2 + d), vw2, oA);
+                oB = _mm256_fmadd_ps(_mm256_loadu_ps(v2 + d + 8), vw2, oB);
+                oA = _mm256_fmadd_ps(_mm256_loadu_ps(v3 + d), vw3, oA);
+                oB = _mm256_fmadd_ps(_mm256_loadu_ps(v3 + d + 8), vw3, oB);
+                _mm256_storeu_ps(out + d, oA);
+                _mm256_storeu_ps(out + d + 8, oB);
+            }
+            for (; d + 7 < head_dim; d += 8)
+            {
+                __m256 o = _mm256_loadu_ps(out + d);
+                o = _mm256_fmadd_ps(_mm256_loadu_ps(v0 + d), vw0, o);
+                o = _mm256_fmadd_ps(_mm256_loadu_ps(v1 + d), vw1, o);
+                o = _mm256_fmadd_ps(_mm256_loadu_ps(v2 + d), vw2, o);
+                o = _mm256_fmadd_ps(_mm256_loadu_ps(v3 + d), vw3, o);
+                _mm256_storeu_ps(out + d, o);
+            }
+            for (; d < head_dim; ++d)
+                out[d] += w0 * v0[d] + w1 * v1[d] + w2 * v2[d] + w3 * v3[d];
+        }
+#endif
+
 #if defined(__AVX512F__)
+        static inline void accum_weighted_v_4row_avx512(
+            float *__restrict out,
+            const float *v0, float w0,
+            const float *v1, float w1,
+            const float *v2, float w2,
+            const float *v3, float w3,
+            int head_dim)
+        {
             const __m512 vw0 = _mm512_set1_ps(w0);
             const __m512 vw1 = _mm512_set1_ps(w1);
             const __m512 vw2 = _mm512_set1_ps(w2);
@@ -1313,12 +1650,29 @@ namespace llaminar2
             {
                 out[d] += w0 * v0[d] + w1 * v1[d] + w2 * v2[d] + w3 * v3[d];
             }
-#else
-            for (int d = 0; d < head_dim; ++d)
-            {
-                out[d] += w0 * v0[d] + w1 * v1[d] + w2 * v2[d] + w3 * v3[d];
-            }
+        }
 #endif
+
+        static void accum_weighted_v_4row(
+            float *__restrict out,
+            const float *v0, float w0,
+            const float *v1, float w1,
+            const float *v2, float w2,
+            const float *v3, float w3,
+            int head_dim)
+        {
+            switch (activeISALevel())
+            {
+            case ISALevel::AVX512:
+                accum_weighted_v_4row_avx512(out, v0, w0, v1, w1, v2, w2, v3, w3, head_dim);
+                break;
+            case ISALevel::AVX2:
+                accum_weighted_v_4row_avx2(out, v0, w0, v1, w1, v2, w2, v3, w3, head_dim);
+                break;
+            default:
+                accum_weighted_v_4row_scalar(out, v0, w0, v1, w1, v2, w2, v3, w3, head_dim);
+                break;
+            }
         }
 
         /**
@@ -1333,29 +1687,62 @@ namespace llaminar2
          * @param head_dim   Vector length.
          * @param use_avx512 True if AVX-512 is available at runtime.
          */
-        static void scale_vec(float *out, float alpha, int head_dim, bool use_avx512)
+        static void scale_vec_scalar(float *out, float alpha, int head_dim)
         {
-#if defined(__AVX512F__)
-            if (use_avx512)
-            {
-                __m512 a = _mm512_set1_ps(alpha);
-                int d = 0;
-                for (; d + 15 < head_dim; d += 16)
-                {
-                    __m512 o = _mm512_loadu_ps(out + d);
-                    o = _mm512_mul_ps(o, a);
-                    _mm512_storeu_ps(out + d, o);
-                }
-                for (; d < head_dim; ++d)
-                {
-                    out[d] *= alpha;
-                }
-                return;
-            }
-#endif
             for (int d = 0; d < head_dim; ++d)
             {
                 out[d] *= alpha;
+            }
+        }
+
+#if defined(__AVX2__)
+        static void scale_vec_avx2(float *out, float alpha, int head_dim)
+        {
+            __m256 a = _mm256_set1_ps(alpha);
+            int d = 0;
+            for (; d + 7 < head_dim; d += 8)
+            {
+                __m256 o = _mm256_loadu_ps(out + d);
+                o = _mm256_mul_ps(o, a);
+                _mm256_storeu_ps(out + d, o);
+            }
+            for (; d < head_dim; ++d)
+                out[d] *= alpha;
+        }
+#endif
+
+#if defined(__AVX512F__)
+        static void scale_vec_avx512(float *out, float alpha, int head_dim)
+        {
+            __m512 a = _mm512_set1_ps(alpha);
+            int d = 0;
+            for (; d + 15 < head_dim; d += 16)
+            {
+                __m512 o = _mm512_loadu_ps(out + d);
+                o = _mm512_mul_ps(o, a);
+                _mm512_storeu_ps(out + d, o);
+            }
+            for (; d < head_dim; ++d)
+            {
+                out[d] *= alpha;
+            }
+        }
+#endif
+
+        static void scale_vec(float *out, float alpha, int head_dim, bool use_avx512)
+        {
+            (void)use_avx512;
+            switch (activeISALevel())
+            {
+            case ISALevel::AVX512:
+                scale_vec_avx512(out, alpha, head_dim);
+                break;
+            case ISALevel::AVX2:
+                scale_vec_avx2(out, alpha, head_dim);
+                break;
+            default:
+                scale_vec_scalar(out, alpha, head_dim);
+                break;
             }
         }
 
@@ -1408,9 +1795,90 @@ namespace llaminar2
          * @return The absmax scale factor.  Multiply `(int_dot * scale_q * scale_k)`
          *         to recover the approximate FP32 dot product.
          */
-        static float quantize_row_i16_i12(const float *src, int16_t *dst, int n, int qmax)
+        static float quantize_row_i16_i12_scalar(const float *src, int16_t *dst, int n, int qmax)
         {
+            float max_abs = 0.0f;
+            for (int i = 0; i < n; ++i)
+                max_abs = std::max(max_abs, std::abs(src[i]));
+
+            if (max_abs <= 1e-12f)
+            {
+                std::memset(dst, 0, static_cast<size_t>(n) * sizeof(int16_t));
+                return 0.0f;
+            }
+
+            const float scale = max_abs / static_cast<float>(qmax);
+            const float inv_scale = 1.0f / scale;
+            for (int i = 0; i < n; ++i)
+            {
+                const int q = static_cast<int>(std::lrint(src[i] * inv_scale));
+                dst[i] = static_cast<int16_t>(std::max(-qmax, std::min(q, qmax)));
+            }
+            return scale;
+        }
+
+#if defined(__AVX2__)
+        static float quantize_row_i16_i12_avx2(const float *src, int16_t *dst, int n, int qmax)
+        {
+            // AVX2 Pass 1: absmax using 8-wide vectors
+            const __m256 abs_mask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7FFFFFFF));
+            __m256 vmax = _mm256_setzero_ps();
+            int i = 0;
+            for (; i + 7 < n; i += 8)
+            {
+                const __m256 v = _mm256_loadu_ps(src + i);
+                vmax = _mm256_max_ps(vmax, _mm256_and_ps(v, abs_mask));
+            }
+            // Horizontal max: 8 → 4 → 2 → 1
+            __m128 hi4 = _mm256_extractf128_ps(vmax, 1);
+            __m128 lo4 = _mm256_castps256_ps128(vmax);
+            lo4 = _mm_max_ps(lo4, hi4);
+            __m128 shuf = _mm_movehdup_ps(lo4);
+            lo4 = _mm_max_ps(lo4, shuf);
+            shuf = _mm_movehl_ps(shuf, lo4);
+            lo4 = _mm_max_ss(lo4, shuf);
+            float max_abs = _mm_cvtss_f32(lo4);
+            for (; i < n; ++i)
+                max_abs = std::max(max_abs, std::abs(src[i]));
+
+            if (max_abs <= 1e-12f)
+            {
+                std::memset(dst, 0, static_cast<size_t>(n) * sizeof(int16_t));
+                return 0.0f;
+            }
+
+            // AVX2 Pass 2: quantize 8 at a time, pack i32→i16
+            const float scale = max_abs / static_cast<float>(qmax);
+            const float inv_scale = 1.0f / scale;
+            const __m256 v_inv = _mm256_set1_ps(inv_scale);
+            const __m256i v_hi = _mm256_set1_epi32(qmax);
+            const __m256i v_lo = _mm256_set1_epi32(-qmax);
+            i = 0;
+            for (; i + 7 < n; i += 8)
+            {
+                const __m256 v = _mm256_loadu_ps(src + i);
+                __m256i i32 = _mm256_cvtps_epi32(_mm256_mul_ps(v, v_inv));
+                i32 = _mm256_max_epi32(v_lo, _mm256_min_epi32(v_hi, i32));
+                // Pack 8 × i32 → 8 × i16 via _mm256_packs_epi32
+                // packs_epi32 interleaves lanes: [0-3,4-7]→[0-3,0-3,4-7,4-7]
+                // So we pack with itself and use permute to fix lane order
+                __m256i packed = _mm256_packs_epi32(i32, i32);
+                packed = _mm256_permute4x64_epi64(packed, 0b11011000); // fix cross-lane
+                _mm_storeu_si128(reinterpret_cast<__m128i *>(dst + i),
+                                 _mm256_castsi256_si128(packed));
+            }
+            for (; i < n; ++i)
+            {
+                const int q = static_cast<int>(std::lrint(src[i] * inv_scale));
+                dst[i] = static_cast<int16_t>(std::max(-qmax, std::min(q, qmax)));
+            }
+            return scale;
+        }
+#endif
+
 #if defined(__AVX512F__) && defined(__AVX512BW__)
+        static float quantize_row_i16_i12_avx512(const float *src, int16_t *dst, int n, int qmax)
+        {
             // Pass 1: vectorized absmax
             const __m512i abs_mask = _mm512_set1_epi32(0x7FFFFFFF);
             __m512 vmax = _mm512_setzero_ps();
@@ -1453,26 +1921,20 @@ namespace llaminar2
                 dst[i] = static_cast<int16_t>(std::max(-qmax, std::min(q, qmax)));
             }
             return scale;
-#else
-            float max_abs = 0.0f;
-            for (int i = 0; i < n; ++i)
-                max_abs = std::max(max_abs, std::abs(src[i]));
-
-            if (max_abs <= 1e-12f)
-            {
-                std::memset(dst, 0, static_cast<size_t>(n) * sizeof(int16_t));
-                return 0.0f;
-            }
-
-            const float scale = max_abs / static_cast<float>(qmax);
-            const float inv_scale = 1.0f / scale;
-            for (int i = 0; i < n; ++i)
-            {
-                const int q = static_cast<int>(std::lrint(src[i] * inv_scale));
-                dst[i] = static_cast<int16_t>(std::max(-qmax, std::min(q, qmax)));
-            }
-            return scale;
+        }
 #endif
+
+        static float quantize_row_i16_i12(const float *src, int16_t *dst, int n, int qmax)
+        {
+            switch (activeISALevel())
+            {
+            case ISALevel::AVX512:
+                return quantize_row_i16_i12_avx512(src, dst, n, qmax);
+            case ISALevel::AVX2:
+                return quantize_row_i16_i12_avx2(src, dst, n, qmax);
+            default:
+                return quantize_row_i16_i12_scalar(src, dst, n, qmax);
+            }
         }
 
         /**
@@ -1622,6 +2084,48 @@ namespace llaminar2
 #endif
         }
 
+        /** @brief Runtime dispatch: i16 dot product. */
+        static int32_t dot_i16_i16_i32(const int16_t *a, const int16_t *b, int n)
+        {
+            switch (activeISALevel())
+            {
+            case ISALevel::AVX512:
+                return dot_i16_i16_i32_vnni(a, b, n);
+            case ISALevel::AVX2:
+                return dot_i16_i16_i32_avx2(a, b, n);
+            default:
+                return dot_i16_i16_i32_scalar(a, b, n);
+            }
+        }
+
+        /**
+         * @brief AVX2 int16 dot product using madd (i16×i16→i32 pairs).
+         *
+         * Uses `_mm256_madd_epi16` which computes adjacent pairs:
+         * acc[k] += a[2k]*b[2k] + a[2k+1]*b[2k+1] for 8 output i32s.
+         */
+        static int32_t dot_i16_i16_i32_avx2(const int16_t *a, const int16_t *b, int n)
+        {
+            __m256i acc = _mm256_setzero_si256();
+            int i = 0;
+            for (; i + 15 < n; i += 16)
+            {
+                const __m256i va = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(a + i));
+                const __m256i vb = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(b + i));
+                acc = _mm256_add_epi32(acc, _mm256_madd_epi16(va, vb));
+            }
+            // Horizontal sum
+            __m128i lo = _mm256_castsi256_si128(acc);
+            __m128i hi = _mm256_extracti128_si256(acc, 1);
+            lo = _mm_add_epi32(lo, hi);
+            lo = _mm_hadd_epi32(lo, lo);
+            lo = _mm_hadd_epi32(lo, lo);
+            int32_t sum = _mm_extract_epi32(lo, 0);
+            for (; i < n; ++i)
+                sum += static_cast<int32_t>(a[i]) * static_cast<int32_t>(b[i]);
+            return sum;
+        }
+
         /**
          * @brief Dual-row VNNI dot product:  `out0 = q·k0` and `out1 = q·k1`.
          *
@@ -1629,7 +2133,7 @@ namespace llaminar2
          * pass over the Q vector, exploiting instruction-level parallelism.
          * The inner loop is unrolled 2× (64 elements / iteration) for ILP.
          */
-        static void dot_i16_i16_i32_vnni_2row(
+        static void dot_i16_i16_i32_vnni_2row_scalar(
             const int16_t *q,
             const int16_t *k0,
             const int16_t *k1,
@@ -1637,7 +2141,62 @@ namespace llaminar2
             int32_t &out0,
             int32_t &out1)
         {
+            out0 = dot_i16_i16_i32_scalar(q, k0, n);
+            out1 = dot_i16_i16_i32_scalar(q, k1, n);
+        }
+
+#if defined(__AVX2__)
+        static void dot_i16_i16_i32_vnni_2row_avx2(
+            const int16_t *q,
+            const int16_t *k0,
+            const int16_t *k1,
+            int n,
+            int32_t &out0,
+            int32_t &out1)
+        {
+            __m256i a0 = _mm256_setzero_si256();
+            __m256i a1 = _mm256_setzero_si256();
+            int i = 0;
+            for (; i + 15 < n; i += 16)
+            {
+                const __m256i qv = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(q + i));
+                const __m256i k0v = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(k0 + i));
+                const __m256i k1v = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(k1 + i));
+                a0 = _mm256_add_epi32(a0, _mm256_madd_epi16(qv, k0v));
+                a1 = _mm256_add_epi32(a1, _mm256_madd_epi16(qv, k1v));
+            }
+            // Horizontal sums
+            auto hsum = [](const __m256i &v) -> int32_t
+            {
+                __m128i lo = _mm256_castsi256_si128(v);
+                __m128i hi = _mm256_extracti128_si256(v, 1);
+                lo = _mm_add_epi32(lo, hi);
+                lo = _mm_hadd_epi32(lo, lo);
+                lo = _mm_hadd_epi32(lo, lo);
+                return _mm_extract_epi32(lo, 0);
+            };
+            int32_t sum0 = hsum(a0);
+            int32_t sum1 = hsum(a1);
+            for (; i < n; ++i)
+            {
+                const int32_t qv = static_cast<int32_t>(q[i]);
+                sum0 += qv * static_cast<int32_t>(k0[i]);
+                sum1 += qv * static_cast<int32_t>(k1[i]);
+            }
+            out0 = sum0;
+            out1 = sum1;
+        }
+#endif
+
 #if defined(__AVX512F__) && defined(__AVX512VNNI__)
+        static void dot_i16_i16_i32_vnni_2row_avx512(
+            const int16_t *q,
+            const int16_t *k0,
+            const int16_t *k1,
+            int n,
+            int32_t &out0,
+            int32_t &out1)
+        {
             __m512i acc0 = _mm512_setzero_si512();
             __m512i acc1 = _mm512_setzero_si512();
 
@@ -1689,33 +2248,100 @@ namespace llaminar2
 
             out0 = sum0;
             out1 = sum1;
-#else
-            out0 = dot_i16_i16_i32_scalar(q, k0, n);
-            out1 = dot_i16_i16_i32_scalar(q, k1, n);
-#endif
         }
+#endif
 
-        /**
-         * @brief Dual-row VNNI dot product from a *packed pair* K buffer.
-         *
-         * Like `dot_i16_i16_i32_vnni_2row()` but reads both K rows from a
-         * single interleaved buffer (see `quantize_row_i16_i12_to_packedpair`).
-         * Each 64-element chunk contains [row0_block, row1_block].
-         *
-         * @param q       Quantised query vector, length `n` (padded to 32).
-         * @param k_pair  Packed pair buffer holding two K rows interleaved.
-         * @param n       Padded row length.
-         * @param out0    (out) Dot product with the first K row.
-         * @param out1    (out) Dot product with the second K row.
-         */
-        static void dot_i16_i16_i32_vnni_2row_packedpair(
+        static void dot_i16_i16_i32_vnni_2row(
             const int16_t *q,
-            const int16_t *k_pair,
+            const int16_t *k0,
+            const int16_t *k1,
             int n,
             int32_t &out0,
             int32_t &out1)
         {
+            switch (activeISALevel())
+            {
+            case ISALevel::AVX512:
+                dot_i16_i16_i32_vnni_2row_avx512(q, k0, k1, n, out0, out1);
+                break;
+            case ISALevel::AVX2:
+                dot_i16_i16_i32_vnni_2row_avx2(q, k0, k1, n, out0, out1);
+                break;
+            default:
+                dot_i16_i16_i32_vnni_2row_scalar(q, k0, k1, n, out0, out1);
+                break;
+            }
+        }
+
+    public:
+        // Named implementations are public for direct parity testing.
+        // Use the dispatch functions (dot_i16_i16_i32_vnni_*) for production code.
+
+        // ---- 2-row packed-pair: named implementations ----
+
+        static inline void dot_2row_packedpair_scalar(
+            const int16_t *q, const int16_t *k_pair, int n,
+            int32_t &out0, int32_t &out1)
+        {
+            out0 = 0;
+            out1 = 0;
+            for (int i = 0; i < n; ++i)
+            {
+                const int pair_block = i / 32;
+                const int lane = i % 32;
+                const int32_t qv = static_cast<int32_t>(q[i]);
+                out0 += qv * static_cast<int32_t>(k_pair[static_cast<size_t>(pair_block) * 64 + lane]);
+                out1 += qv * static_cast<int32_t>(k_pair[static_cast<size_t>(pair_block) * 64 + 32 + lane]);
+            }
+        }
+
+#if defined(__AVX2__)
+        static inline void dot_2row_packedpair_avx2(
+            const int16_t *q, const int16_t *k_pair, int n,
+            int32_t &out0, int32_t &out1)
+        {
+            // Process 32 elements per iteration to match packed-pair block alignment.
+            // Layout: [row0_32, row1_32, row0_32, row1_32, ...] — each 64 int16 chunk.
+            __m256i a0 = _mm256_setzero_si256();
+            __m256i a1 = _mm256_setzero_si256();
+            int i = 0;
+            const int16_t *pp = k_pair;
+            for (; i + 31 < n; i += 32)
+            {
+                const __m256i q_lo = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(q + i));
+                const __m256i q_hi = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(q + i + 16));
+                a0 = _mm256_add_epi32(a0, _mm256_madd_epi16(q_lo, _mm256_loadu_si256(reinterpret_cast<const __m256i *>(pp))));
+                a0 = _mm256_add_epi32(a0, _mm256_madd_epi16(q_hi, _mm256_loadu_si256(reinterpret_cast<const __m256i *>(pp + 16))));
+                a1 = _mm256_add_epi32(a1, _mm256_madd_epi16(q_lo, _mm256_loadu_si256(reinterpret_cast<const __m256i *>(pp + 32))));
+                a1 = _mm256_add_epi32(a1, _mm256_madd_epi16(q_hi, _mm256_loadu_si256(reinterpret_cast<const __m256i *>(pp + 48))));
+                pp += 64;
+            }
+            auto hsum = [](const __m256i &v) -> int32_t
+            {
+                __m128i lo = _mm256_castsi256_si128(v);
+                __m128i hi = _mm256_extracti128_si256(v, 1);
+                lo = _mm_add_epi32(lo, hi);
+                lo = _mm_hadd_epi32(lo, lo);
+                lo = _mm_hadd_epi32(lo, lo);
+                return _mm_extract_epi32(lo, 0);
+            };
+            int32_t sum0 = hsum(a0);
+            int32_t sum1 = hsum(a1);
+            for (; i < n; ++i)
+            {
+                sum0 += static_cast<int32_t>(q[i]) * static_cast<int32_t>(k_pair[(static_cast<size_t>(i) / 32) * 64 + (i % 32)]);
+                sum1 += static_cast<int32_t>(q[i]) * static_cast<int32_t>(k_pair[(static_cast<size_t>(i) / 32) * 64 + 32 + (i % 32)]);
+            }
+            out0 = sum0;
+            out1 = sum1;
+        }
+#endif
+
 #if defined(__AVX512F__) && defined(__AVX512VNNI__)
+        static inline void dot_2row_packedpair_avx512(
+            const int16_t *q, const int16_t *k_pair, int n,
+            int32_t &out0, int32_t &out1)
+        {
             __m512i acc0 = _mm512_setzero_si512();
             __m512i acc1 = _mm512_setzero_si512();
 
@@ -1752,53 +2378,108 @@ namespace llaminar2
 
             out0 = sum0;
             out1 = sum1;
-#else
-            out0 = 0;
-            out1 = 0;
-            for (int i = 0; i < n; ++i)
-            {
-                const int pair_block = i / 32;
-                const int lane = i % 32;
-                const int32_t qv = static_cast<int32_t>(q[i]);
-                out0 += qv * static_cast<int32_t>(k_pair[static_cast<size_t>(pair_block) * 64 + lane]);
-                out1 += qv * static_cast<int32_t>(k_pair[static_cast<size_t>(pair_block) * 64 + 32 + lane]);
-            }
+        }
 #endif
+
+        /** @brief Dispatch: dual-row dot from packed pair. */
+        static void dot_i16_i16_i32_vnni_2row_packedpair(
+            const int16_t *q, const int16_t *k_pair, int n,
+            int32_t &out0, int32_t &out1)
+        {
+            switch (activeISALevel())
+            {
+            case ISALevel::AVX512:
+                dot_2row_packedpair_avx512(q, k_pair, n, out0, out1);
+                break;
+            case ISALevel::AVX2:
+                dot_2row_packedpair_avx2(q, k_pair, n, out0, out1);
+                break;
+            default:
+                dot_2row_packedpair_scalar(q, k_pair, n, out0, out1);
+                break;
+            }
         }
 
-        /**
-         * @brief Quad-row VNNI dot product from two packed-pair K buffers.
-         *
-         * Computes *four* dot-products in a single pass over Q:
-         *   - out0 = Q · K_pair0[row0]
-         *   - out1 = Q · K_pair0[row1]
-         *   - out2 = Q · K_pair1[row0]
-         *   - out3 = Q · K_pair1[row1]
-         *
-         * This is the widest variant and is used when ≥4 consecutive KV
-         * positions remain in the tile, achieving maximum ILP by keeping
-         * four independent accumulator chains active.
-         *
-         * @param q        Quantised query vector, length `n` (padded to 32).
-         * @param k_pair0  First packed-pair buffer (rows 0 and 1).
-         * @param k_pair1  Second packed-pair buffer (rows 2 and 3).
-         * @param n        Padded row length.
-         * @param out0     (out) Dot product with k_pair0, row 0.
-         * @param out1     (out) Dot product with k_pair0, row 1.
-         * @param out2     (out) Dot product with k_pair1, row 0.
-         * @param out3     (out) Dot product with k_pair1, row 1.
-         */
-        static void dot_i16_i16_i32_vnni_4row_packedpair(
-            const int16_t *q,
-            const int16_t *k_pair0,
-            const int16_t *k_pair1,
-            int n,
-            int32_t &out0,
-            int32_t &out1,
-            int32_t &out2,
-            int32_t &out3)
+        // ---- 4-row packed-pair: named implementations ----
+
+        static inline void dot_4row_packedpair_scalar(
+            const int16_t *q, const int16_t *k_pair0, const int16_t *k_pair1,
+            int n, int32_t &out0, int32_t &out1, int32_t &out2, int32_t &out3)
         {
+            out0 = 0;
+            out1 = 0;
+            out2 = 0;
+            out3 = 0;
+            for (int i = 0; i < n; ++i)
+            {
+                const size_t block = static_cast<size_t>(i / 32) * 64ULL;
+                const size_t lane = static_cast<size_t>(i % 32);
+                const int32_t qv = static_cast<int32_t>(q[i]);
+                out0 += qv * static_cast<int32_t>(k_pair0[block + lane]);
+                out1 += qv * static_cast<int32_t>(k_pair0[block + 32ULL + lane]);
+                out2 += qv * static_cast<int32_t>(k_pair1[block + lane]);
+                out3 += qv * static_cast<int32_t>(k_pair1[block + 32ULL + lane]);
+            }
+        }
+
+#if defined(__AVX2__)
+        static inline void dot_4row_packedpair_avx2(
+            const int16_t *q, const int16_t *k_pair0, const int16_t *k_pair1,
+            int n, int32_t &out0, int32_t &out1, int32_t &out2, int32_t &out3)
+        {
+            __m256i a0 = _mm256_setzero_si256(), a1 = _mm256_setzero_si256();
+            __m256i a2 = _mm256_setzero_si256(), a3 = _mm256_setzero_si256();
+            int i = 0;
+            const int16_t *pp0 = k_pair0;
+            const int16_t *pp1 = k_pair1;
+            for (; i + 31 < n; i += 32)
+            {
+                const __m256i q_lo = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(q + i));
+                const __m256i q_hi = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(q + i + 16));
+                a0 = _mm256_add_epi32(a0, _mm256_madd_epi16(q_lo, _mm256_loadu_si256(reinterpret_cast<const __m256i *>(pp0))));
+                a0 = _mm256_add_epi32(a0, _mm256_madd_epi16(q_hi, _mm256_loadu_si256(reinterpret_cast<const __m256i *>(pp0 + 16))));
+                a1 = _mm256_add_epi32(a1, _mm256_madd_epi16(q_lo, _mm256_loadu_si256(reinterpret_cast<const __m256i *>(pp0 + 32))));
+                a1 = _mm256_add_epi32(a1, _mm256_madd_epi16(q_hi, _mm256_loadu_si256(reinterpret_cast<const __m256i *>(pp0 + 48))));
+                a2 = _mm256_add_epi32(a2, _mm256_madd_epi16(q_lo, _mm256_loadu_si256(reinterpret_cast<const __m256i *>(pp1))));
+                a2 = _mm256_add_epi32(a2, _mm256_madd_epi16(q_hi, _mm256_loadu_si256(reinterpret_cast<const __m256i *>(pp1 + 16))));
+                a3 = _mm256_add_epi32(a3, _mm256_madd_epi16(q_lo, _mm256_loadu_si256(reinterpret_cast<const __m256i *>(pp1 + 32))));
+                a3 = _mm256_add_epi32(a3, _mm256_madd_epi16(q_hi, _mm256_loadu_si256(reinterpret_cast<const __m256i *>(pp1 + 48))));
+                pp0 += 64;
+                pp1 += 64;
+            }
+            auto hsum = [](const __m256i &v) -> int32_t
+            {
+                __m128i lo = _mm256_castsi256_si128(v);
+                __m128i hi = _mm256_extracti128_si256(v, 1);
+                lo = _mm_add_epi32(lo, hi);
+                lo = _mm_hadd_epi32(lo, lo);
+                lo = _mm_hadd_epi32(lo, lo);
+                return _mm_extract_epi32(lo, 0);
+            };
+            int32_t sum0 = hsum(a0), sum1 = hsum(a1);
+            int32_t sum2 = hsum(a2), sum3 = hsum(a3);
+            for (; i < n; ++i)
+            {
+                const size_t block = static_cast<size_t>(i / 32) * 64ULL;
+                const size_t lane = static_cast<size_t>(i % 32);
+                const int32_t qv = static_cast<int32_t>(q[i]);
+                sum0 += qv * static_cast<int32_t>(k_pair0[block + lane]);
+                sum1 += qv * static_cast<int32_t>(k_pair0[block + 32ULL + lane]);
+                sum2 += qv * static_cast<int32_t>(k_pair1[block + lane]);
+                sum3 += qv * static_cast<int32_t>(k_pair1[block + 32ULL + lane]);
+            }
+            out0 = sum0;
+            out1 = sum1;
+            out2 = sum2;
+            out3 = sum3;
+        }
+#endif
+
 #if defined(__AVX512F__) && defined(__AVX512VNNI__)
+        static inline void dot_4row_packedpair_avx512(
+            const int16_t *q, const int16_t *k_pair0, const int16_t *k_pair1,
+            int n, int32_t &out0, int32_t &out1, int32_t &out2, int32_t &out3)
+        {
             __m512i acc0 = _mm512_setzero_si512();
             __m512i acc1 = _mm512_setzero_si512();
             __m512i acc2 = _mm512_setzero_si512();
@@ -1822,19 +2503,13 @@ namespace llaminar2
                 p1 += 64;
             }
 
-            alignas(64) int32_t lanes0[16];
-            alignas(64) int32_t lanes1[16];
-            alignas(64) int32_t lanes2[16];
-            alignas(64) int32_t lanes3[16];
+            alignas(64) int32_t lanes0[16], lanes1[16], lanes2[16], lanes3[16];
             _mm512_store_si512(reinterpret_cast<void *>(lanes0), acc0);
             _mm512_store_si512(reinterpret_cast<void *>(lanes1), acc1);
             _mm512_store_si512(reinterpret_cast<void *>(lanes2), acc2);
             _mm512_store_si512(reinterpret_cast<void *>(lanes3), acc3);
 
-            int32_t sum0 = 0;
-            int32_t sum1 = 0;
-            int32_t sum2 = 0;
-            int32_t sum3 = 0;
+            int32_t sum0 = 0, sum1 = 0, sum2 = 0, sum3 = 0;
             for (int lane = 0; lane < 16; ++lane)
             {
                 sum0 += lanes0[lane];
@@ -1858,22 +2533,26 @@ namespace llaminar2
             out1 = sum1;
             out2 = sum2;
             out3 = sum3;
-#else
-            out0 = 0;
-            out1 = 0;
-            out2 = 0;
-            out3 = 0;
-            for (int i = 0; i < n; ++i)
-            {
-                const size_t block = static_cast<size_t>(i / 32) * 64ULL;
-                const size_t lane = static_cast<size_t>(i % 32);
-                const int32_t qv = static_cast<int32_t>(q[i]);
-                out0 += qv * static_cast<int32_t>(k_pair0[block + lane]);
-                out1 += qv * static_cast<int32_t>(k_pair0[block + 32ULL + lane]);
-                out2 += qv * static_cast<int32_t>(k_pair1[block + lane]);
-                out3 += qv * static_cast<int32_t>(k_pair1[block + 32ULL + lane]);
-            }
+        }
 #endif
+
+        /** @brief Dispatch: quad-row dot from two packed pairs. */
+        static void dot_i16_i16_i32_vnni_4row_packedpair(
+            const int16_t *q, const int16_t *k_pair0, const int16_t *k_pair1,
+            int n, int32_t &out0, int32_t &out1, int32_t &out2, int32_t &out3)
+        {
+            switch (activeISALevel())
+            {
+            case ISALevel::AVX512:
+                dot_4row_packedpair_avx512(q, k_pair0, k_pair1, n, out0, out1, out2, out3);
+                break;
+            case ISALevel::AVX2:
+                dot_4row_packedpair_avx2(q, k_pair0, k_pair1, n, out0, out1, out2, out3);
+                break;
+            default:
+                dot_4row_packedpair_scalar(q, k_pair0, k_pair1, n, out0, out1, out2, out3);
+                break;
+            }
         }
 
         /**
@@ -1890,13 +2569,50 @@ namespace llaminar2
          * @param row_sel  Which row to read: 0 = first row, 1 = second row.
          * @return The int32 dot product `Σ q[i] * k_pair[row_sel][i]`.
          */
-        static int32_t dot_i16_i16_i32_vnni_single_from_packedpair(
-            const int16_t *q,
-            const int16_t *k_pair,
-            int n,
-            int row_sel)
+        // ---- single-from-packed-pair: named implementations ----
+
+        static inline int32_t dot_single_from_packedpair_scalar(
+            const int16_t *q, const int16_t *k_pair, int n, int row_sel)
         {
+            int32_t sum = 0;
+            const int row_off = (row_sel != 0) ? 32 : 0;
+            for (int i = 0; i < n; ++i)
+                sum += static_cast<int32_t>(q[i]) * static_cast<int32_t>(k_pair[(static_cast<size_t>(i) / 32) * 64 + row_off + (i % 32)]);
+            return sum;
+        }
+
+#if defined(__AVX2__)
+        static inline int32_t dot_single_from_packedpair_avx2(
+            const int16_t *q, const int16_t *k_pair, int n, int row_sel)
+        {
+            __m256i acc = _mm256_setzero_si256();
+            int i = 0;
+            const int16_t *pair_ptr = k_pair;
+            const int row_off = (row_sel != 0) ? 32 : 0;
+            for (; i + 31 < n; i += 32)
+            {
+                const __m256i q_lo = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(q + i));
+                const __m256i q_hi = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(q + i + 16));
+                acc = _mm256_add_epi32(acc, _mm256_madd_epi16(q_lo, _mm256_loadu_si256(reinterpret_cast<const __m256i *>(pair_ptr + row_off))));
+                acc = _mm256_add_epi32(acc, _mm256_madd_epi16(q_hi, _mm256_loadu_si256(reinterpret_cast<const __m256i *>(pair_ptr + row_off + 16))));
+                pair_ptr += 64;
+            }
+            __m128i lo = _mm256_castsi256_si128(acc);
+            __m128i hi = _mm256_extracti128_si256(acc, 1);
+            lo = _mm_add_epi32(lo, hi);
+            lo = _mm_hadd_epi32(lo, lo);
+            lo = _mm_hadd_epi32(lo, lo);
+            int32_t sum = _mm_extract_epi32(lo, 0);
+            for (; i < n; ++i)
+                sum += static_cast<int32_t>(q[i]) * static_cast<int32_t>(k_pair[(static_cast<size_t>(i) / 32) * 64 + row_off + (i % 32)]);
+            return sum;
+        }
+#endif
+
 #if defined(__AVX512F__) && defined(__AVX512VNNI__)
+        static inline int32_t dot_single_from_packedpair_avx512(
+            const int16_t *q, const int16_t *k_pair, int n, int row_sel)
+        {
             __m512i acc = _mm512_setzero_si512();
             int i = 0;
             const int16_t *pair_ptr = k_pair;
@@ -1913,24 +2629,27 @@ namespace llaminar2
             _mm512_store_si512(reinterpret_cast<void *>(lanes), acc);
             int32_t sum = 0;
             for (int lane = 0; lane < 16; ++lane)
-            {
                 sum += lanes[lane];
-            }
 
             for (; i < n; ++i)
-            {
                 sum += static_cast<int32_t>(q[i]) * static_cast<int32_t>(k_pair[(static_cast<size_t>(i) / 32) * 64 + row_off + (i % 32)]);
-            }
             return sum;
-#else
-            int32_t sum = 0;
-            const int row_off = (row_sel != 0) ? 32 : 0;
-            for (int i = 0; i < n; ++i)
-            {
-                sum += static_cast<int32_t>(q[i]) * static_cast<int32_t>(k_pair[(static_cast<size_t>(i) / 32) * 64 + row_off + (i % 32)]);
-            }
-            return sum;
+        }
 #endif
+
+        /** @brief Dispatch: single-row dot from one slot of a packed pair. */
+        static int32_t dot_i16_i16_i32_vnni_single_from_packedpair(
+            const int16_t *q, const int16_t *k_pair, int n, int row_sel)
+        {
+            switch (activeISALevel())
+            {
+            case ISALevel::AVX512:
+                return dot_single_from_packedpair_avx512(q, k_pair, n, row_sel);
+            case ISALevel::AVX2:
+                return dot_single_from_packedpair_avx2(q, k_pair, n, row_sel);
+            default:
+                return dot_single_from_packedpair_scalar(q, k_pair, n, row_sel);
+            }
         }
 
         /**
@@ -1950,31 +2669,76 @@ namespace llaminar2
          * @param n   Number of elements.
          * @param out0-out3  (out) Int32 dot products.
          */
-        static void dot_i16_i16_i32_vnni_4row(
-            const int16_t *q,
-            const int16_t *k0,
-            const int16_t *k1,
-            const int16_t *k2,
-            const int16_t *k3,
-            int n,
-            int32_t &out0,
-            int32_t &out1,
-            int32_t &out2,
-            int32_t &out3)
+        // ---- 4-row separate: named implementations ----
+
+        static inline void dot_4row_separate_scalar(
+            const int16_t *q, const int16_t *k0, const int16_t *k1,
+            const int16_t *k2, const int16_t *k3, int n,
+            int32_t &out0, int32_t &out1, int32_t &out2, int32_t &out3)
         {
+            out0 = dot_i16_i16_i32_scalar(q, k0, n);
+            out1 = dot_i16_i16_i32_scalar(q, k1, n);
+            out2 = dot_i16_i16_i32_scalar(q, k2, n);
+            out3 = dot_i16_i16_i32_scalar(q, k3, n);
+        }
+
+#if defined(__AVX2__)
+        static inline void dot_4row_separate_avx2(
+            const int16_t *q, const int16_t *k0, const int16_t *k1,
+            const int16_t *k2, const int16_t *k3, int n,
+            int32_t &out0, int32_t &out1, int32_t &out2, int32_t &out3)
+        {
+            __m256i a0 = _mm256_setzero_si256(), a1 = _mm256_setzero_si256();
+            __m256i a2 = _mm256_setzero_si256(), a3 = _mm256_setzero_si256();
+            int i = 0;
+            for (; i + 15 < n; i += 16)
+            {
+                const __m256i qv = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(q + i));
+                a0 = _mm256_add_epi32(a0, _mm256_madd_epi16(qv, _mm256_loadu_si256(reinterpret_cast<const __m256i *>(k0 + i))));
+                a1 = _mm256_add_epi32(a1, _mm256_madd_epi16(qv, _mm256_loadu_si256(reinterpret_cast<const __m256i *>(k1 + i))));
+                a2 = _mm256_add_epi32(a2, _mm256_madd_epi16(qv, _mm256_loadu_si256(reinterpret_cast<const __m256i *>(k2 + i))));
+                a3 = _mm256_add_epi32(a3, _mm256_madd_epi16(qv, _mm256_loadu_si256(reinterpret_cast<const __m256i *>(k3 + i))));
+            }
+            auto hsum = [](const __m256i &v) -> int32_t
+            {
+                __m128i lo = _mm256_castsi256_si128(v);
+                __m128i hi = _mm256_extracti128_si256(v, 1);
+                lo = _mm_add_epi32(lo, hi);
+                lo = _mm_hadd_epi32(lo, lo);
+                lo = _mm_hadd_epi32(lo, lo);
+                return _mm_extract_epi32(lo, 0);
+            };
+            out0 = hsum(a0);
+            out1 = hsum(a1);
+            out2 = hsum(a2);
+            out3 = hsum(a3);
+            for (; i < n; ++i)
+            {
+                const int32_t qv = static_cast<int32_t>(q[i]);
+                out0 += qv * static_cast<int32_t>(k0[i]);
+                out1 += qv * static_cast<int32_t>(k1[i]);
+                out2 += qv * static_cast<int32_t>(k2[i]);
+                out3 += qv * static_cast<int32_t>(k3[i]);
+            }
+        }
+#endif
+
 #if defined(__AVX512F__) && defined(__AVX512VNNI__)
+        static inline void dot_4row_separate_avx512(
+            const int16_t *q, const int16_t *k0, const int16_t *k1,
+            const int16_t *k2, const int16_t *k3, int n,
+            int32_t &out0, int32_t &out1, int32_t &out2, int32_t &out3)
+        {
             __m512i acc0 = _mm512_setzero_si512();
             __m512i acc1 = _mm512_setzero_si512();
             __m512i acc2 = _mm512_setzero_si512();
             __m512i acc3 = _mm512_setzero_si512();
 
             int i = 0;
-            // Unrolled 2× (64 elements / iteration) for ILP
             for (; i + 63 < n; i += 64)
             {
                 const __m512i q0 = _mm512_loadu_si512(reinterpret_cast<const void *>(q + i));
                 const __m512i q1 = _mm512_loadu_si512(reinterpret_cast<const void *>(q + i + 32));
-
                 acc0 = _mm512_dpwssd_epi32(acc0, q0, _mm512_loadu_si512(reinterpret_cast<const void *>(k0 + i)));
                 acc0 = _mm512_dpwssd_epi32(acc0, q1, _mm512_loadu_si512(reinterpret_cast<const void *>(k0 + i + 32)));
                 acc1 = _mm512_dpwssd_epi32(acc1, q0, _mm512_loadu_si512(reinterpret_cast<const void *>(k1 + i)));
@@ -2007,14 +2771,30 @@ namespace llaminar2
                 out2 += qv * static_cast<int32_t>(k2[i]);
                 out3 += qv * static_cast<int32_t>(k3[i]);
             }
-#else
-            out0 = dot_i16_i16_i32_scalar(q, k0, n);
-            out1 = dot_i16_i16_i32_scalar(q, k1, n);
-            out2 = dot_i16_i16_i32_scalar(q, k2, n);
-            out3 = dot_i16_i16_i32_scalar(q, k3, n);
+        }
 #endif
+
+        /** @brief Dispatch: 4-row dot against separate K rows. */
+        static void dot_i16_i16_i32_vnni_4row(
+            const int16_t *q, const int16_t *k0, const int16_t *k1,
+            const int16_t *k2, const int16_t *k3, int n,
+            int32_t &out0, int32_t &out1, int32_t &out2, int32_t &out3)
+        {
+            switch (activeISALevel())
+            {
+            case ISALevel::AVX512:
+                dot_4row_separate_avx512(q, k0, k1, k2, k3, n, out0, out1, out2, out3);
+                break;
+            case ISALevel::AVX2:
+                dot_4row_separate_avx2(q, k0, k1, k2, k3, n, out0, out1, out2, out3);
+                break;
+            default:
+                dot_4row_separate_scalar(q, k0, k1, k2, k3, n, out0, out1, out2, out3);
+                break;
+            }
         }
 
+    private:
         /**
          * @brief Weighted V accumulation from Q16_1 block: out[d] += weight * (scale * qs[d]).
          *
@@ -2028,13 +2808,43 @@ namespace llaminar2
          * @param combined  Pre-computed (softmax_weight * v_block.d).
          * @param head_dim  Number of elements.
          */
-        static void accum_weighted_v_q16(
+        // ---- Q16 single-row V-accumulation: named implementations ----
+
+        static inline void accum_weighted_v_q16_scalar(
             float *out, const int16_t *v_qs, float combined, int head_dim)
         {
+            for (int d = 0; d < head_dim; ++d)
+            {
+                out[d] += combined * static_cast<float>(v_qs[d]);
+            }
+        }
+
+#if defined(__AVX2__)
+        static inline void accum_weighted_v_q16_avx2(
+            float *out, const int16_t *v_qs, float combined, int head_dim)
+        {
+            const __m256 w = _mm256_set1_ps(combined);
+            int d = 0;
+            for (; d + 7 < head_dim; d += 8)
+            {
+                __m256 o = _mm256_loadu_ps(out + d);
+                const __m128i vi16 = _mm_loadu_si128(reinterpret_cast<const __m128i *>(v_qs + d));
+                const __m256i vi32 = _mm256_cvtepi16_epi32(vi16);
+                const __m256 vf = _mm256_cvtepi32_ps(vi32);
+                o = _mm256_fmadd_ps(vf, w, o);
+                _mm256_storeu_ps(out + d, o);
+            }
+            for (; d < head_dim; ++d)
+                out[d] += combined * static_cast<float>(v_qs[d]);
+        }
+#endif
+
 #if defined(__AVX512F__)
+        static inline void accum_weighted_v_q16_avx512(
+            float *out, const int16_t *v_qs, float combined, int head_dim)
+        {
             const __m512 w = _mm512_set1_ps(combined);
             int d = 0;
-            // 2× unrolled for ILP (32 elements per iteration)
             for (; d + 31 < head_dim; d += 32)
             {
                 __m512 o0 = _mm512_loadu_ps(out + d);
@@ -2060,12 +2870,24 @@ namespace llaminar2
             {
                 out[d] += combined * static_cast<float>(v_qs[d]);
             }
-#else
-            for (int d = 0; d < head_dim; ++d)
-            {
-                out[d] += combined * static_cast<float>(v_qs[d]);
-            }
+        }
 #endif
+
+        static void accum_weighted_v_q16(
+            float *out, const int16_t *v_qs, float combined, int head_dim)
+        {
+            switch (activeISALevel())
+            {
+            case ISALevel::AVX512:
+                accum_weighted_v_q16_avx512(out, v_qs, combined, head_dim);
+                break;
+            case ISALevel::AVX2:
+                accum_weighted_v_q16_avx2(out, v_qs, combined, head_dim);
+                break;
+            default:
+                accum_weighted_v_q16_scalar(out, v_qs, combined, head_dim);
+                break;
+            }
         }
 
         /**
@@ -2075,7 +2897,9 @@ namespace llaminar2
          * their softmax weights, then stores once.  Saves ~60% of L1 traffic
          * vs calling accum_weighted_v_q16 four separate times.
          */
-        static void accum_weighted_v_q16_4row(
+        // ---- Q16 4-row V-accumulation: named implementations ----
+
+        static inline void accum_weighted_v_q16_4row_scalar(
             float *__restrict out,
             const int16_t *v0, float w0,
             const int16_t *v1, float w1,
@@ -2083,14 +2907,59 @@ namespace llaminar2
             const int16_t *v3, float w3,
             int head_dim)
         {
+            for (int d = 0; d < head_dim; ++d)
+            {
+                out[d] += w0 * static_cast<float>(v0[d]) + w1 * static_cast<float>(v1[d]) + w2 * static_cast<float>(v2[d]) + w3 * static_cast<float>(v3[d]);
+            }
+        }
+
+#if defined(__AVX2__)
+        static inline void accum_weighted_v_q16_4row_avx2(
+            float *__restrict out,
+            const int16_t *v0, float w0,
+            const int16_t *v1, float w1,
+            const int16_t *v2, float w2,
+            const int16_t *v3, float w3,
+            int head_dim)
+        {
+            const __m256 vw0 = _mm256_set1_ps(w0);
+            const __m256 vw1 = _mm256_set1_ps(w1);
+            const __m256 vw2 = _mm256_set1_ps(w2);
+            const __m256 vw3 = _mm256_set1_ps(w3);
+            int d = 0;
+            for (; d + 7 < head_dim; d += 8)
+            {
+                __m256 o = _mm256_loadu_ps(out + d);
+                auto cvt8 = [](const int16_t *p) -> __m256
+                {
+                    return _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(
+                        _mm_loadu_si128(reinterpret_cast<const __m128i *>(p))));
+                };
+                o = _mm256_fmadd_ps(cvt8(v0 + d), vw0, o);
+                o = _mm256_fmadd_ps(cvt8(v1 + d), vw1, o);
+                o = _mm256_fmadd_ps(cvt8(v2 + d), vw2, o);
+                o = _mm256_fmadd_ps(cvt8(v3 + d), vw3, o);
+                _mm256_storeu_ps(out + d, o);
+            }
+            for (; d < head_dim; ++d)
+                out[d] += w0 * static_cast<float>(v0[d]) + w1 * static_cast<float>(v1[d]) + w2 * static_cast<float>(v2[d]) + w3 * static_cast<float>(v3[d]);
+        }
+#endif
+
 #if defined(__AVX512F__)
+        static inline void accum_weighted_v_q16_4row_avx512(
+            float *__restrict out,
+            const int16_t *v0, float w0,
+            const int16_t *v1, float w1,
+            const int16_t *v2, float w2,
+            const int16_t *v3, float w3,
+            int head_dim)
+        {
             const __m512 vw0 = _mm512_set1_ps(w0);
             const __m512 vw1 = _mm512_set1_ps(w1);
             const __m512 vw2 = _mm512_set1_ps(w2);
             const __m512 vw3 = _mm512_set1_ps(w3);
             int d = 0;
-            // 2× unrolled: 32 elements/iteration for head_dim=128 (4 iterations)
-            // Keeps both FMA ports fed by interleaving independent chains.
             for (; d + 31 < head_dim; d += 32)
             {
                 __m512 oA = _mm512_loadu_ps(out + d);
@@ -2155,12 +3024,29 @@ namespace llaminar2
             {
                 out[d] += w0 * static_cast<float>(v0[d]) + w1 * static_cast<float>(v1[d]) + w2 * static_cast<float>(v2[d]) + w3 * static_cast<float>(v3[d]);
             }
-#else
-            accum_weighted_v_q16(out, v0, w0, head_dim);
-            accum_weighted_v_q16(out, v1, w1, head_dim);
-            accum_weighted_v_q16(out, v2, w2, head_dim);
-            accum_weighted_v_q16(out, v3, w3, head_dim);
+        }
 #endif
+
+        static void accum_weighted_v_q16_4row(
+            float *__restrict out,
+            const int16_t *v0, float w0,
+            const int16_t *v1, float w1,
+            const int16_t *v2, float w2,
+            const int16_t *v3, float w3,
+            int head_dim)
+        {
+            switch (activeISALevel())
+            {
+            case ISALevel::AVX512:
+                accum_weighted_v_q16_4row_avx512(out, v0, w0, v1, w1, v2, w2, v3, w3, head_dim);
+                break;
+            case ISALevel::AVX2:
+                accum_weighted_v_q16_4row_avx2(out, v0, w0, v1, w1, v2, w2, v3, w3, head_dim);
+                break;
+            default:
+                accum_weighted_v_q16_4row_scalar(out, v0, w0, v1, w1, v2, w2, v3, w3, head_dim);
+                break;
+            }
         }
 
         // =================================================================
@@ -2587,12 +3473,11 @@ namespace llaminar2
                                 }
 
                                 // --- FP32 path: batched 4-row dot products for ILP ---
-#if defined(__AVX512F__)
                                 if (k + 3 < valid_end)
                                 {
                                     const float *kbase = K + static_cast<size_t>(kv_h) * head_dim;
                                     float s0, s1, s2, s3;
-                                    dot_fp32_avx512_4row(
+                                    dot_fp32_4row(
                                         q_ptr,
                                         kbase + static_cast<size_t>(k + 0) * kv_stride,
                                         kbase + static_cast<size_t>(k + 1) * kv_stride,
@@ -2618,9 +3503,8 @@ namespace llaminar2
                                     k += 4;
                                     continue;
                                 }
-#endif
                                 // Scalar / tail path
-                                float s = dot_fp32_avx512(
+                                float s = dot_fp32(
                                     q_ptr,
                                     K + static_cast<size_t>(k) * kv_stride + static_cast<size_t>(kv_h) * head_dim,
                                     head_dim);
@@ -2667,21 +3551,16 @@ namespace llaminar2
                             {
                                 const float *v_base = V + static_cast<size_t>(kv_h) * head_dim;
                                 int k = valid_start;
-#if defined(__AVX512F__)
                                 // 4-wide batched: vectorized exp + batched V accumulation
                                 for (; k + 3 < valid_end; k += 4)
                                 {
-                                    const __m128 scores4 = _mm_set_ps(
-                                        block_scores[static_cast<size_t>(k - k0 + 3)],
-                                        block_scores[static_cast<size_t>(k - k0 + 2)],
+                                    float pp[4];
+                                    batch_exp_4(
+                                        block_scores[static_cast<size_t>(k - k0 + 0)],
                                         block_scores[static_cast<size_t>(k - k0 + 1)],
-                                        block_scores[static_cast<size_t>(k - k0 + 0)]);
-                                    const __m128 nm4 = _mm_set1_ps(new_m);
-                                    const __m512 exp_in = _mm512_castps128_ps512(_mm_sub_ps(scores4, nm4));
-                                    const __m512 exp_out = fast_exp_avx512(exp_in);
-                                    const __m128 probs = _mm512_castps512_ps128(exp_out);
-                                    alignas(16) float pp[4];
-                                    _mm_store_ps(pp, probs);
+                                        block_scores[static_cast<size_t>(k - k0 + 2)],
+                                        block_scores[static_cast<size_t>(k - k0 + 3)],
+                                        new_m, pp[0], pp[1], pp[2], pp[3]);
                                     new_l += pp[0] + pp[1] + pp[2] + pp[3];
 
                                     accum_weighted_v_4row(
@@ -2692,7 +3571,6 @@ namespace llaminar2
                                         v_base + static_cast<size_t>(k + 3) * kv_stride, pp[3],
                                         head_dim);
                                 }
-#endif
                                 // Scalar tail: remaining valid positions
                                 for (; k < valid_end; ++k)
                                 {
@@ -2775,7 +3653,7 @@ namespace llaminar2
             return true;
         }
 
-#if defined(__AVX512F__) && defined(__AVX512VNNI__)
+#if (defined(__AVX512F__) && defined(__AVX512VNNI__)) || defined(__AVX2__)
         /**
          * @brief Prefill flash attention with Q16_1 KV cache (VNNI accelerated).
          *
@@ -2964,7 +3842,7 @@ namespace llaminar2
                                     float kd;
                                     std::memcpy(&kd, blk_s, sizeof(float));
                                     const int16_t *k_qs = reinterpret_cast<const int16_t *>(blk_s + QS_OFFSET);
-                                    int32_t dot = dot_i16_i16_i32_vnni(q_i16_buf, k_qs, head_dim);
+                                    int32_t dot = dot_i16_i16_i32(q_i16_buf, k_qs, head_dim);
                                     float s = static_cast<float>(dot) * qk_combined_scale * kd;
                                     block_scores[static_cast<size_t>(k - k0)] = s;
                                     block_max = std::max(block_max, s);
@@ -2983,7 +3861,7 @@ namespace llaminar2
                                         const int16_t *k_qs = reinterpret_cast<const int16_t *>(blk_ptr + QS_OFFSET);
                                         const int elem_count = static_cast<int>(
                                             std::min(block_elems, static_cast<size_t>(head_dim) - bi * block_elems));
-                                        int32_t dot = dot_i16_i16_i32_vnni(
+                                        int32_t dot = dot_i16_i16_i32(
                                             q_i16_buf + bi * block_elems, k_qs, elem_count);
                                         s += static_cast<float>(dot) * q_scale * kd;
                                     }
@@ -3006,12 +3884,21 @@ namespace llaminar2
                                                     ? std::exp(running_m - new_m)
                                                     : 0.0f;
                             {
+#if defined(__AVX512F__)
                                 const __m512 va = _mm512_set1_ps(alpha);
                                 int sd = 0;
                                 for (; sd + 15 < head_dim; sd += 16)
                                     _mm512_storeu_ps(out + sd, _mm512_mul_ps(va, _mm512_loadu_ps(out + sd)));
                                 for (; sd < head_dim; ++sd)
                                     out[sd] *= alpha;
+#else
+                                const __m256 va = _mm256_set1_ps(alpha);
+                                int sd = 0;
+                                for (; sd + 7 < head_dim; sd += 8)
+                                    _mm256_storeu_ps(out + sd, _mm256_mul_ps(va, _mm256_loadu_ps(out + sd)));
+                                for (; sd < head_dim; ++sd)
+                                    out[sd] *= alpha;
+#endif
                             }
                             float new_l = running_l * alpha;
 
@@ -3047,9 +3934,15 @@ namespace llaminar2
                                         block_scores[static_cast<size_t>(k - k0 + 1)],
                                         block_scores[static_cast<size_t>(k - k0 + 0)]);
                                     const __m128 nm4 = _mm_set1_ps(new_m);
+#if defined(__AVX512F__)
                                     const __m512 exp_in = _mm512_castps128_ps512(_mm_sub_ps(scores4, nm4));
                                     const __m512 exp_out = fast_exp_avx512(exp_in);
                                     const __m128 probs = _mm512_castps512_ps128(exp_out);
+#else
+                                    const __m256 exp_in = _mm256_castps128_ps256(_mm_sub_ps(scores4, nm4));
+                                    const __m256 exp_out = llaminar2::avx2::fast_exp(exp_in);
+                                    const __m128 probs = _mm256_castps256_ps128(exp_out);
+#endif
                                     alignas(16) float pp[4];
                                     _mm_store_ps(pp, probs);
                                     new_l += pp[0] + pp[1] + pp[2] + pp[3];
@@ -3123,12 +4016,21 @@ namespace llaminar2
                         if (running_l > 0.0f)
                         {
                             const float inv_l = 1.0f / running_l;
+#if defined(__AVX512F__)
                             const __m512 vi = _mm512_set1_ps(inv_l);
                             int sd = 0;
                             for (; sd + 15 < head_dim; sd += 16)
                                 _mm512_storeu_ps(out + sd, _mm512_mul_ps(vi, _mm512_loadu_ps(out + sd)));
                             for (; sd < head_dim; ++sd)
                                 out[sd] *= inv_l;
+#else
+                            const __m256 vi = _mm256_set1_ps(inv_l);
+                            int sd = 0;
+                            for (; sd + 7 < head_dim; sd += 8)
+                                _mm256_storeu_ps(out + sd, _mm256_mul_ps(vi, _mm256_loadu_ps(out + sd)));
+                            for (; sd < head_dim; ++sd)
+                                out[sd] *= inv_l;
+#endif
                         }
                     } // end q_pos loop
                 } // end head loop
@@ -3145,9 +4047,9 @@ namespace llaminar2
             }
             return true;
         }
-#endif // __AVX512F__ && __AVX512VNNI__
+#endif // (__AVX512F__ && __AVX512VNNI__) || __AVX2__
 
-#if defined(__AVX512F__) && defined(__AVX512VNNI__)
+#if (defined(__AVX512F__) && defined(__AVX512VNNI__)) || defined(__AVX2__)
         /**
          * @brief Decode-only flash attention with Q16_1 KV cache (VNNI accelerated).
          *
@@ -3351,7 +4253,7 @@ namespace llaminar2
                                 float kd;
                                 std::memcpy(&kd, blk_s, sizeof(float));
                                 const int16_t *k_qs = reinterpret_cast<const int16_t *>(blk_s + QS_OFFSET);
-                                int32_t dot = dot_i16_i16_i32_vnni(q_i16_buf, k_qs, head_dim);
+                                int32_t dot = dot_i16_i16_i32(q_i16_buf, k_qs, head_dim);
                                 float s = static_cast<float>(dot) * qk_combined_scale * kd;
                                 block_scores[static_cast<size_t>(k - k0)] = s;
                                 block_max = std::max(block_max, s);
@@ -3370,7 +4272,7 @@ namespace llaminar2
                                     const int16_t *k_qs = reinterpret_cast<const int16_t *>(blk_ptr + QS_OFFSET);
                                     const int elem_count = static_cast<int>(
                                         std::min(block_elems, static_cast<size_t>(head_dim) - bi * block_elems));
-                                    int32_t dot = dot_i16_i16_i32_vnni(
+                                    int32_t dot = dot_i16_i16_i32(
                                         q_i16_buf + bi * block_elems, k_qs, elem_count);
                                     s += static_cast<float>(dot) * q_scale * kd;
                                 }
@@ -3394,12 +4296,21 @@ namespace llaminar2
                                                 : 0.0f;
                         {
                             // Scale output: out[d] *= alpha (inline to avoid F16C guard dep)
+#if defined(__AVX512F__)
                             const __m512 va = _mm512_set1_ps(alpha);
                             int sd = 0;
                             for (; sd + 15 < head_dim; sd += 16)
                                 _mm512_storeu_ps(out + sd, _mm512_mul_ps(va, _mm512_loadu_ps(out + sd)));
                             for (; sd < head_dim; ++sd)
                                 out[sd] *= alpha;
+#else
+                            const __m256 va = _mm256_set1_ps(alpha);
+                            int sd = 0;
+                            for (; sd + 7 < head_dim; sd += 8)
+                                _mm256_storeu_ps(out + sd, _mm256_mul_ps(va, _mm256_loadu_ps(out + sd)));
+                            for (; sd < head_dim; ++sd)
+                                out[sd] *= alpha;
+#endif
                         }
                         float new_l = running_l * alpha;
 
@@ -3434,8 +4345,7 @@ namespace llaminar2
                                 }
 
                                 // Vectorized exp: compute 4 softmax weights in one shot
-                                // using fast_exp_avx512 (< 1 ULP accuracy, ~5x faster than
-                                // 4× scalar std::exp on Cascade Lake).
+#if defined(__AVX512F__)
                                 const __m128 scores4 = _mm_set_ps(
                                     block_scores[static_cast<size_t>(k - k0 + 3)],
                                     block_scores[static_cast<size_t>(k - k0 + 2)],
@@ -3448,6 +4358,20 @@ namespace llaminar2
                                 const __m128 probs = _mm512_castps512_ps128(exp_out);
                                 alignas(16) float pp[4];
                                 _mm_store_ps(pp, probs);
+#else
+                                // AVX2: pad 4 scores to __m256, compute exp, extract lower 4
+                                const __m128 scores4 = _mm_set_ps(
+                                    block_scores[static_cast<size_t>(k - k0 + 3)],
+                                    block_scores[static_cast<size_t>(k - k0 + 2)],
+                                    block_scores[static_cast<size_t>(k - k0 + 1)],
+                                    block_scores[static_cast<size_t>(k - k0 + 0)]);
+                                const __m128 nm4 = _mm_set1_ps(new_m);
+                                const __m256 exp_in = _mm256_castps128_ps256(_mm_sub_ps(scores4, nm4));
+                                const __m256 exp_out = llaminar2::avx2::fast_exp(exp_in);
+                                const __m128 probs = _mm256_castps256_ps128(exp_out);
+                                alignas(16) float pp[4];
+                                _mm_store_ps(pp, probs);
+#endif
                                 const float p0 = pp[0], p1 = pp[1], p2 = pp[2], p3 = pp[3];
                                 new_l += p0 + p1 + p2 + p3;
 
@@ -3525,12 +4449,21 @@ namespace llaminar2
                     if (running_l > 0.0f)
                     {
                         const float inv_l = 1.0f / running_l;
+#if defined(__AVX512F__)
                         const __m512 vi = _mm512_set1_ps(inv_l);
                         int sd = 0;
                         for (; sd + 15 < head_dim; sd += 16)
                             _mm512_storeu_ps(out + sd, _mm512_mul_ps(vi, _mm512_loadu_ps(out + sd)));
                         for (; sd < head_dim; ++sd)
                             out[sd] *= inv_l;
+#else
+                        const __m256 vi = _mm256_set1_ps(inv_l);
+                        int sd = 0;
+                        for (; sd + 7 < head_dim; sd += 8)
+                            _mm256_storeu_ps(out + sd, _mm256_mul_ps(vi, _mm256_loadu_ps(out + sd)));
+                        for (; sd < head_dim; ++sd)
+                            out[sd] *= inv_l;
+#endif
                     }
                 } // end head loop
             };
@@ -3560,7 +4493,7 @@ namespace llaminar2
             }
             return true;
         }
-#endif // __AVX512F__ && __AVX512VNNI__
+#endif // (__AVX512F__ && __AVX512VNNI__) || __AVX2__
 
         // =================================================================
         // Q8_1 inline-dequant helpers for fused attention
@@ -4113,7 +5046,7 @@ namespace llaminar2
         // V accumulation in rotated centroid space, one final Πᵀ at end.
         // Total: O(D² + kv_len·D) instead of O(kv_len·D²).
         // =================================================================
-#if defined(__AVX512F__)
+#if defined(__AVX512F__) || defined(__AVX2__)
         /**
          * @brief Fused TQ8-K / TQ4-V decode attention with zero shadow buffers.
          *
@@ -4209,8 +5142,7 @@ namespace llaminar2
                     apply_rotation(head_rotation, q_ptr, q_rot);
 
                     // Zero rotated V accumulator
-                    for (int d = 0; d < head_dim; d += 16)
-                        _mm512_storeu_ps(rotated_accum + d, _mm512_setzero_ps());
+                    std::memset(rotated_accum, 0, static_cast<size_t>(head_dim) * sizeof(float));
 
                     float running_m = -std::numeric_limits<float>::infinity();
                     float running_l = 0.0f;
@@ -4272,14 +5204,7 @@ namespace llaminar2
                                                 : 0.0f;
 
                         // Scale rotated V accumulator by alpha (same as Q16 path scales output)
-                        {
-                            const __m512 va = _mm512_set1_ps(alpha);
-                            for (int d = 0; d < head_dim; d += 16)
-                            {
-                                __m512 v = _mm512_loadu_ps(rotated_accum + d);
-                                _mm512_storeu_ps(rotated_accum + d, _mm512_mul_ps(va, v));
-                            }
-                        }
+                        scale_vec(rotated_accum, alpha, head_dim, false);
                         float new_l = running_l * alpha;
 
                         // --- V Phase: TQ4 fused accumulation in rotated space ---
@@ -4324,17 +5249,11 @@ namespace llaminar2
                     if (running_l > 0.0f)
                     {
                         const float final_scale = inv_sqrt_d / running_l;
-                        const __m512 vs = _mm512_set1_ps(final_scale);
-                        for (int d = 0; d < head_dim; d += 16)
-                        {
-                            __m512 v = _mm512_loadu_ps(rotated_accum + d);
-                            _mm512_storeu_ps(rotated_accum + d, _mm512_mul_ps(v, vs));
-                        }
+                        scale_vec(rotated_accum, final_scale, head_dim, false);
                     }
                     else
                     {
-                        for (int d = 0; d < head_dim; d += 16)
-                            _mm512_storeu_ps(rotated_accum + d, _mm512_setzero_ps());
+                        std::memset(rotated_accum, 0, static_cast<size_t>(head_dim) * sizeof(float));
                     }
 
                     // Inverse rotation: output = Πᵀ_kv_h × rotated_accum (O(D²), once per head)
@@ -4368,7 +5287,7 @@ namespace llaminar2
             }
             return true;
         }
-#endif // __AVX512F__ (TQ fused)
+#endif // __AVX512F__ || __AVX2__ (TQ fused)
     };
 
     extern template class CPUFlashAttentionKernelT<ActivationPrecision::FP32>;

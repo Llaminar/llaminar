@@ -22,9 +22,15 @@
 #include <cstddef>
 #include <cstring>
 
-#if defined(__AVX512F__)
+#if defined(__AVX512F__) || defined(__AVX2__)
 #include <immintrin.h>
 #endif
+
+#if defined(__AVX2__)
+#include "../simd/AVX2Helpers.h"
+#endif
+
+#include "../../../utils/CPUFeatures.h"
 
 namespace llaminar2
 {
@@ -41,21 +47,13 @@ namespace llaminar2
     // Single-vector dequantize: TQ4 → FP32
     // ========================================================================
 
-    /**
-     * @brief Dequantize one TQ4 block to FP32 vector.
-     *
-     * Unpacks 4-bit centroid indices (3 low bits from mse_indices +
-     * 1 high bit from high_bits), looks up TQ4_CENTROIDS, applies
-     * inverse rotation, and scales by the stored norm.
-     *
-     * @tparam D Dimension of the vector (head_dim)
-     * @param block Input TQ4 block
-     * @param ctx Pre-generated TurboQuant context
-     * @param output FP32 output vector of length D
-     * @param scratch Scratch buffer of at least D floats (for centroid vector)
-     */
+    // ========================================================================
+    // Named ISA implementations: turboquant_dequantize_tq4
+    // ========================================================================
+
+    /// Scalar dequantize: TQ4 → FP32 (always compiles)
     template <int D>
-    inline void turboquant_dequantize_tq4(
+    inline void turboquant_dequantize_tq4_scalar(
         const TQ4Block<D> &block,
         const TurboQuantContext &ctx,
         float *output,
@@ -67,17 +65,85 @@ namespace llaminar2
                 output[i] = 0.0f;
             return;
         }
-
         const float inv_scale = 1.0f / std::sqrt(static_cast<float>(D));
+        for (int i = 0; i < D; i += 8)
+        {
+            uint8_t idx8[8];
+            uint8_t high_bits[8];
+            tq3_unpack_8(block.mse_indices + (i / 8) * 3, idx8);
+            unpack_bitplane_8(block.high_bits + (i / 8), high_bits);
+            for (int j = 0; j < 8; ++j)
+                scratch[i + j] = TQ4_CENTROIDS[idx8[j] | static_cast<uint8_t>(high_bits[j] << 3)] * inv_scale;
+        }
+        apply_rotation_transpose(ctx.rotation(), scratch, output);
+        for (int i = 0; i < D; ++i)
+            output[i] *= block.norm;
+    }
+
+#if defined(__AVX2__)
+    /// AVX2 dequantize: TQ4 → FP32 (8-wide gather + scale)
+    template <int D>
+    inline void turboquant_dequantize_tq4_avx2(
+        const TQ4Block<D> &block,
+        const TurboQuantContext &ctx,
+        float *output,
+        float *scratch)
+    {
+        static_assert(D % 8 == 0, "D must be a multiple of 8 for AVX2");
+        if (block.norm < 1e-30f)
+        {
+            for (int i = 0; i < D; ++i)
+                output[i] = 0.0f;
+            return;
+        }
+        const float inv_scale = 1.0f / std::sqrt(static_cast<float>(D));
+        const __m256 vinv_scale = _mm256_set1_ps(inv_scale);
+        for (int i = 0; i < D; i += 8)
+        {
+            const int group = i / 8;
+            uint8_t idx8[8];
+            uint8_t high_bits[8];
+            tq3_unpack_8(block.mse_indices + group * 3, idx8);
+            unpack_bitplane_8(block.high_bits + group, high_bits);
+
+            alignas(32) int32_t idx32[8];
+            for (int j = 0; j < 8; ++j)
+                idx32[j] = idx8[j] | (high_bits[j] << 3);
+
+            __m256i vidx = _mm256_load_si256(reinterpret_cast<const __m256i *>(idx32));
+            __m256 vcentroids = _mm256_i32gather_ps(TQ4_CENTROIDS.data(), vidx, sizeof(float));
+            _mm256_storeu_ps(scratch + i, _mm256_mul_ps(vcentroids, vinv_scale));
+        }
+        apply_rotation_transpose(ctx.rotation(), scratch, output);
+        const __m256 vnorm = _mm256_set1_ps(block.norm);
+        for (int i = 0; i < D; i += 8)
+        {
+            __m256 v = _mm256_loadu_ps(output + i);
+            _mm256_storeu_ps(output + i, _mm256_mul_ps(v, vnorm));
+        }
+    }
+#endif
 
 #if defined(__AVX512F__)
+    /// AVX-512 dequantize: TQ4 → FP32 (16-wide gather + scale)
+    template <int D>
+    inline void turboquant_dequantize_tq4_avx512(
+        const TQ4Block<D> &block,
+        const TurboQuantContext &ctx,
+        float *output,
+        float *scratch)
+    {
         static_assert(D % 16 == 0, "D must be a multiple of 16 for AVX-512");
-
-        // Unpack 3+1 bit indices → centroid gather (16 elements per iteration)
+        if (block.norm < 1e-30f)
+        {
+            for (int i = 0; i < D; ++i)
+                output[i] = 0.0f;
+            return;
+        }
+        const float inv_scale = 1.0f / std::sqrt(static_cast<float>(D));
         const __m512 vinv_scale = _mm512_set1_ps(inv_scale);
         for (int i = 0; i < D; i += 16)
         {
-            // Unpack 2 groups of 8 indices from packed 3-bit + 1 high-bit format
             alignas(64) int32_t idx32[16];
             for (int g = 0; g < 2; ++g)
             {
@@ -90,37 +156,53 @@ namespace llaminar2
                 for (int j = 0; j < 8; ++j)
                     idx32[g * 8 + j] = idx8[j] | (high_bits[j] << 3);
             }
-
-            // Vectorized centroid gather + descale
             __m512i vidx = _mm512_load_si512(idx32);
             __m512 vcentroids = _mm512_i32gather_ps(vidx, TQ4_CENTROIDS.data(), sizeof(float));
             _mm512_storeu_ps(scratch + i, _mm512_mul_ps(vcentroids, vinv_scale));
         }
-#else
-        for (int i = 0; i < D; i += 8)
-        {
-            uint8_t idx8[8];
-            uint8_t high_bits[8];
-            tq3_unpack_8(block.mse_indices + (i / 8) * 3, idx8);
-            unpack_bitplane_8(block.high_bits + (i / 8), high_bits);
-            for (int j = 0; j < 8; ++j)
-                scratch[i + j] = TQ4_CENTROIDS[idx8[j] | static_cast<uint8_t>(high_bits[j] << 3)] * inv_scale;
-        }
-#endif
-
         apply_rotation_transpose(ctx.rotation(), scratch, output);
-
-#if defined(__AVX512F__)
         const __m512 vnorm = _mm512_set1_ps(block.norm);
         for (int i = 0; i < D; i += 16)
         {
             __m512 v = _mm512_loadu_ps(output + i);
             _mm512_storeu_ps(output + i, _mm512_mul_ps(v, vnorm));
         }
-#else
-        for (int i = 0; i < D; ++i)
-            output[i] *= block.norm;
+    }
 #endif
+
+// Stubs for portability when ISA unavailable at compile time
+#if !defined(__AVX2__)
+    template <int D>
+    inline void turboquant_dequantize_tq4_avx2(
+        const TQ4Block<D> &block,
+        const TurboQuantContext &ctx,
+        float *output,
+        float *scratch)
+    {
+        turboquant_dequantize_tq4_scalar(block, ctx, output, scratch);
+    }
+#endif
+#if !defined(__AVX512F__)
+    template <int D>
+    inline void turboquant_dequantize_tq4_avx512(
+        const TQ4Block<D> &block,
+        const TurboQuantContext &ctx,
+        float *output,
+        float *scratch)
+    {
+        turboquant_dequantize_tq4_avx2(block, ctx, output, scratch);
+    }
+#endif
+
+    /// Dispatch: picks best available ISA at runtime
+    template <int D>
+    inline void turboquant_dequantize_tq4(
+        const TQ4Block<D> &block,
+        const TurboQuantContext &ctx,
+        float *output,
+        float *scratch)
+    {
+        ISA_DISPATCH_VOID(turboquant_dequantize_tq4, block, ctx, output, scratch);
     }
 
     // ========================================================================

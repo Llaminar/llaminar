@@ -30,6 +30,8 @@
 #include <random>
 #include <vector>
 
+#include "../../../utils/CPUFeatures.h"
+
 #if defined(__AVX512F__)
 #include <immintrin.h>
 #elif defined(__AVX2__)
@@ -177,15 +179,58 @@ namespace llaminar2
      * @param x Input vector (length = rot.dim)
      * @param y Output vector (length = rot.dim)
      */
-    inline void apply_rotation(const TurboQuantRotation &rot,
-                               const float *x, float *y)
+    inline void apply_rotation_scalar(const TurboQuantRotation &rot,
+                                      const float *x, float *y)
     {
         const int d = rot.dim;
+        for (int i = 0; i < d; ++i)
+        {
+            const float *row = rot.row_ptr(i);
+            float sum = 0.0f;
+            for (int j = 0; j < d; ++j)
+                sum += row[j] * x[j];
+            y[i] = sum;
+        }
+    }
+
+#if defined(__AVX2__)
+    inline void apply_rotation_avx2(const TurboQuantRotation &rot,
+                                    const float *x, float *y)
+    {
+        const int d = rot.dim;
+        for (int i = 0; i < d; ++i)
+        {
+            const float *row = rot.row_ptr(i);
+            __m256 acc = _mm256_setzero_ps();
+
+            int j = 0;
+            for (; j + 8 <= d; j += 8)
+            {
+                __m256 r = _mm256_loadu_ps(row + j);
+                __m256 v = _mm256_loadu_ps(x + j);
+                acc = _mm256_fmadd_ps(r, v, acc);
+            }
+
+            __m128 hi = _mm256_extractf128_ps(acc, 1);
+            __m128 lo = _mm256_castps256_ps128(acc);
+            __m128 sum128 = _mm_add_ps(lo, hi);
+            sum128 = _mm_hadd_ps(sum128, sum128);
+            sum128 = _mm_hadd_ps(sum128, sum128);
+            float sum = _mm_cvtss_f32(sum128);
+
+            for (; j < d; ++j)
+                sum += row[j] * x[j];
+
+            y[i] = sum;
+        }
+    }
+#endif
 
 #if defined(__AVX512F__)
-        // AVX-512: 4-way row unroll — computes 4 dot products per outer iteration,
-        // loading x once per 4 rows instead of per row. Improves ILP and cache reuse.
-        // d must be a multiple of 4 (always true for 64, 128).
+    inline void apply_rotation_avx512(const TurboQuantRotation &rot,
+                                      const float *x, float *y)
+    {
+        const int d = rot.dim;
         int i = 0;
         for (; i + 4 <= d; i += 4)
         {
@@ -212,7 +257,6 @@ namespace llaminar2
             y[i + 2] = _mm512_reduce_add_ps(acc2);
             y[i + 3] = _mm512_reduce_add_ps(acc3);
         }
-        // Tail: remaining rows (if d is not a multiple of 4)
         for (; i < d; ++i)
         {
             const float *row = rot.row_ptr(i);
@@ -225,77 +269,82 @@ namespace llaminar2
             }
             y[i] = _mm512_reduce_add_ps(acc);
         }
-#elif defined(__AVX2__)
-        // AVX2: process 8 floats per iteration
+    }
+#endif
+
+// --- ISA stubs for runtime dispatch ---
+#if !defined(__AVX2__)
+    inline void apply_rotation_avx2(const TurboQuantRotation &rot,
+                                    const float *x, float *y)
+    {
+        apply_rotation_scalar(rot, x, y);
+    }
+#endif
+#if !defined(__AVX512F__)
+    inline void apply_rotation_avx512(const TurboQuantRotation &rot,
+                                      const float *x, float *y)
+    {
+        apply_rotation_avx2(rot, x, y);
+    }
+#endif
+
+    inline void apply_rotation(const TurboQuantRotation &rot,
+                               const float *x, float *y)
+    {
+        ISA_DISPATCH_VOID(apply_rotation, rot, x, y);
+    }
+
+    inline void apply_rotation_transpose_scalar(const TurboQuantRotation &rot,
+                                                const float *y, float *x)
+    {
+        const int d = rot.dim;
+        for (int j = 0; j < d; ++j)
+            x[j] = 0.0f;
         for (int i = 0; i < d; ++i)
         {
             const float *row = rot.row_ptr(i);
-            __m256 acc = _mm256_setzero_ps();
+            float yi = y[i];
+            for (int j = 0; j < d; ++j)
+                x[j] += yi * row[j];
+        }
+    }
+
+#if defined(__AVX2__)
+    inline void apply_rotation_transpose_avx2(const TurboQuantRotation &rot,
+                                              const float *y, float *x)
+    {
+        const int d = rot.dim;
+        for (int j = 0; j < d; j += 8)
+            _mm256_storeu_ps(x + j, _mm256_setzero_ps());
+
+        for (int i = 0; i < d; ++i)
+        {
+            const float *row = rot.row_ptr(i);
+            __m256 yi = _mm256_set1_ps(y[i]);
 
             int j = 0;
             for (; j + 8 <= d; j += 8)
             {
                 __m256 r = _mm256_loadu_ps(row + j);
-                __m256 v = _mm256_loadu_ps(x + j);
-                acc = _mm256_fmadd_ps(r, v, acc);
+                __m256 xv = _mm256_loadu_ps(x + j);
+                xv = _mm256_fmadd_ps(yi, r, xv);
+                _mm256_storeu_ps(x + j, xv);
             }
 
-            // Horizontal sum
-            __m128 hi = _mm256_extractf128_ps(acc, 1);
-            __m128 lo = _mm256_castps256_ps128(acc);
-            __m128 sum128 = _mm_add_ps(lo, hi);
-            sum128 = _mm_hadd_ps(sum128, sum128);
-            sum128 = _mm_hadd_ps(sum128, sum128);
-            float sum = _mm_cvtss_f32(sum128);
-
             for (; j < d; ++j)
-                sum += row[j] * x[j];
-
-            y[i] = sum;
+                x[j] += y[i] * row[j];
         }
-#else
-        // Scalar fallback
-        for (int i = 0; i < d; ++i)
-        {
-            const float *row = rot.row_ptr(i);
-            float sum = 0.0f;
-            for (int j = 0; j < d; ++j)
-                sum += row[j] * x[j];
-            y[i] = sum;
-        }
-#endif
     }
+#endif
 
-    /**
-     * @brief Apply inverse rotation: x = Π^T · y
-     *
-     * Since Π is orthogonal, Π^(-1) = Π^T. This computes x[j] = Σ_i Π[i][j] · y[i],
-     * which is the same as transposing Π and doing a regular matvec.
-     *
-     * For efficiency with row-major Π, we accumulate: x += y[i] * row_i(Π)
-     * which is a series of scaled vector additions (saxpy-like).
-     *
-     * @param rot Rotation matrix
-     * @param y Input vector (length = rot.dim)
-     * @param x Output vector (length = rot.dim), will be overwritten
-     */
-    inline void apply_rotation_transpose(const TurboQuantRotation &rot,
-                                         const float *y, float *x)
+#if defined(__AVX512F__)
+    inline void apply_rotation_transpose_avx512(const TurboQuantRotation &rot,
+                                                const float *y, float *x)
     {
         const int d = rot.dim;
-
-        // Zero output with AVX-512
-#if defined(__AVX512F__)
         for (int j = 0; j < d; j += 16)
             _mm512_storeu_ps(x + j, _mm512_setzero_ps());
-#else
-        for (int j = 0; j < d; ++j)
-            x[j] = 0.0f;
-#endif
 
-#if defined(__AVX512F__)
-        // 4-way row unroll: accumulate 4 scaled rows per outer iteration.
-        // Inner loop does 4 FMAs per x load/store → 4x fewer memory ops.
         int i = 0;
         for (; i + 4 <= d; i += 4)
         {
@@ -318,7 +367,6 @@ namespace llaminar2
                 _mm512_storeu_ps(x + j, xv);
             }
         }
-        // Tail: remaining rows
         for (; i < d; ++i)
         {
             const float *row = rot.row_ptr(i);
@@ -331,34 +379,29 @@ namespace llaminar2
                 _mm512_storeu_ps(x + j, xv);
             }
         }
-#elif defined(__AVX2__)
-        for (int i = 0; i < d; ++i)
-        {
-            const float *row = rot.row_ptr(i);
-            __m256 yi = _mm256_set1_ps(y[i]);
-
-            int j = 0;
-            for (; j + 8 <= d; j += 8)
-            {
-                __m256 r = _mm256_loadu_ps(row + j);
-                __m256 xv = _mm256_loadu_ps(x + j);
-                xv = _mm256_fmadd_ps(yi, r, xv);
-                _mm256_storeu_ps(x + j, xv);
-            }
-
-            for (; j < d; ++j)
-                x[j] += y[i] * row[j];
-        }
-#else
-        // Scalar fallback
-        for (int i = 0; i < d; ++i)
-        {
-            const float *row = rot.row_ptr(i);
-            float yi = y[i];
-            for (int j = 0; j < d; ++j)
-                x[j] += yi * row[j];
-        }
+    }
 #endif
+
+// --- ISA stubs for runtime dispatch ---
+#if !defined(__AVX2__)
+    inline void apply_rotation_transpose_avx2(const TurboQuantRotation &rot,
+                                              const float *y, float *x)
+    {
+        apply_rotation_transpose_scalar(rot, y, x);
+    }
+#endif
+#if !defined(__AVX512F__)
+    inline void apply_rotation_transpose_avx512(const TurboQuantRotation &rot,
+                                                const float *y, float *x)
+    {
+        apply_rotation_transpose_avx2(rot, y, x);
+    }
+#endif
+
+    inline void apply_rotation_transpose(const TurboQuantRotation &rot,
+                                         const float *y, float *x)
+    {
+        ISA_DISPATCH_VOID(apply_rotation_transpose, rot, y, x);
     }
 
     // ========================================================================

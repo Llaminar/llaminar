@@ -11,11 +11,11 @@
 #include "../../../tensors/SIMDHelpers.h"
 #include "../../../utils/OpenMPUtils.h"
 
-#if defined(__AVX512F__)
-#include <immintrin.h>
-#elif defined(__AVX2__)
+#if defined(__AVX512F__) || defined(__AVX2__)
 #include <immintrin.h>
 #endif
+
+#include "../../../utils/CPUFeatures.h"
 
 // Libmvec declarations for vectorized exp
 #if defined(__GLIBC__)
@@ -40,6 +40,14 @@ namespace llaminar2::primitives
     inline float silu_scalar(float x)
     {
         return x / (1.0f + std::exp(-x));
+    }
+
+    static void compute_swiglu_scalar(const float *gate, const float *up, float *output, int size)
+    {
+        for (int i = 0; i < size; ++i)
+        {
+            output[i] = silu_scalar(gate[i]) * up[i];
+        }
     }
 
 #if defined(__AVX2__)
@@ -200,6 +208,20 @@ namespace llaminar2::primitives
     }
 #endif
 
+// Stubs for portability when ISA unavailable at compile time
+#if !defined(__AVX2__)
+    static void compute_swiglu_avx2(const float *gate, const float *up, float *output, int size)
+    {
+        compute_swiglu_scalar(gate, up, output, size);
+    }
+#endif
+#if !defined(__AVX512F__)
+    static void compute_swiglu_avx512(const float *gate, const float *up, float *output, int size)
+    {
+        compute_swiglu_avx2(gate, up, output, size);
+    }
+#endif
+
     void compute_swiglu(const float *gate, const float *up, float *output, int size)
     {
         // OpenMP parallelization
@@ -214,16 +236,7 @@ namespace llaminar2::primitives
             const float *u_ptr = up + i;
             float *o_ptr = output + i;
 
-#if defined(__AVX512F__)
-            compute_swiglu_avx512(g_ptr, u_ptr, o_ptr, current_chunk);
-#elif defined(__AVX2__)
-            compute_swiglu_avx2(g_ptr, u_ptr, o_ptr, current_chunk);
-#else
-            for (int j = 0; j < current_chunk; ++j)
-            {
-                o_ptr[j] = silu_scalar(g_ptr[j]) * u_ptr[j];
-            }
-#endif
+            ISA_DISPATCH_VOID(compute_swiglu, g_ptr, u_ptr, o_ptr, current_chunk);
         };
 
         // Layer-fusion support: avoid nested parallel region if already parallel

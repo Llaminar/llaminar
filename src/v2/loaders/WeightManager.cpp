@@ -2962,40 +2962,104 @@ namespace llaminar2
     {
         const size_t total_rows = dimensions[0];
         const size_t cols = dimensions[1];
+        const int world_size = tp_config_->worldSize();
+        const int rank = assignment.local_rank;
 
-        // Fused QKV weights have 3 equal concatenated sub-blocks: [Q_all | K_all | V_all]
-        // A simple contiguous row slice would cross Q/K/V boundaries.
-        // Instead, load each sub-block's local rows directly from GGUF in native
+        // Fused QKV weights have 3 concatenated sub-blocks: [Q | K | V]
+        // Sub-blocks may be equal (standard FA) or asymmetric (GDN with n_v != n_k).
+        // We load each sub-block's local rows directly from GGUF in native
         // quantized format, then concatenate the raw bytes into a single tensor.
-        constexpr size_t N_SUB_BLOCKS = 3;
 
-        if (total_rows % N_SUB_BLOCKS != 0)
+        size_t sub_block_sizes[3] = {0, 0, 0};
+        bool gdn_replicate_qk = false;
+
+        // Try GDN asymmetric layout: [Q(n_k*d) | K(n_k*d) | V(n_v*d)]
+        if (has_gdn_dimensions_ && gdn_n_k_heads_ > 0 && gdn_d_state_ > 0)
         {
-            LOG_ERROR("[WeightManager] FusedQKVHeads: total_rows " << total_rows
-                                                                   << " not divisible by " << N_SUB_BLOCKS
-                                                                   << " for weight: " << name);
-            return nullptr;
+            const size_t gdn_key_dim = static_cast<size_t>(gdn_n_k_heads_) * gdn_d_state_;
+            const size_t gdn_value_dim = static_cast<size_t>(gdn_n_v_heads_) * gdn_d_state_;
+            const size_t expected_gdn_qkv = 2 * gdn_key_dim + gdn_value_dim;
+
+            if (total_rows == expected_gdn_qkv)
+            {
+                sub_block_sizes[0] = gdn_key_dim;   // Q
+                sub_block_sizes[1] = gdn_key_dim;   // K
+                sub_block_sizes[2] = gdn_value_dim; // V (may differ)
+
+                // GDN modular repeat: v_head j uses k_head j%n_k.
+                // Replicate Q and K on every rank, only shard V.
+                gdn_replicate_qk = (gdn_n_v_heads_ > gdn_n_k_heads_);
+
+                LOG_TRACE("[WeightManager] FusedQKV " << name
+                                                      << " matched GDN layout: Q=" << gdn_key_dim
+                                                      << " K=" << gdn_key_dim << " V=" << gdn_value_dim
+                                                      << " (n_k=" << gdn_n_k_heads_
+                                                      << " n_v=" << gdn_n_v_heads_
+                                                      << " d=" << gdn_d_state_
+                                                      << " replicate_qk=" << gdn_replicate_qk << ")");
+            }
         }
 
-        const size_t sub_block_rows = total_rows / N_SUB_BLOCKS;
-
-        // Compute per-sub-block head slice
-        const int total_heads = tp_config_->totalHeads();
-        if (total_heads <= 0)
+        // Fall back to 3 equal sub-blocks (standard FA)
+        if (sub_block_sizes[0] == 0)
         {
-            LOG_ERROR("[WeightManager] Invalid total_heads for FusedQKVHeads: " << name);
-            return nullptr;
+            if (total_rows % 3 != 0)
+            {
+                LOG_ERROR("[WeightManager] FusedQKVHeads: total_rows " << total_rows
+                                                                       << " not divisible by 3"
+                                                                       << " and no GDN layout match"
+                                                                       << " for weight: " << name);
+                return nullptr;
+            }
+            const size_t equal_rows = total_rows / 3;
+            sub_block_sizes[0] = equal_rows;
+            sub_block_sizes[1] = equal_rows;
+            sub_block_sizes[2] = equal_rows;
         }
 
-        const size_t head_dim = sub_block_rows / static_cast<size_t>(total_heads);
-        const size_t local_start = assignment.head_start * head_dim;
-        const size_t local_count = assignment.head_count * head_dim;
-
-        // Load 3 row slices from GGUF in native quantized format (no dequantization)
-        std::shared_ptr<TensorBase> slices[N_SUB_BLOCKS];
-        for (size_t s = 0; s < N_SUB_BLOCKS; s++)
+        // Compute per-sub-block slice for this rank
+        auto compute_slice = [rank, world_size, gdn_replicate_qk](
+                                 size_t block_rows, int sub_block_idx) -> std::pair<size_t, size_t>
         {
-            const size_t abs_row_start = s * sub_block_rows + local_start;
+            // Sub-blocks 0 (Q) and 1 (K): replicate for GDN, shard otherwise
+            if (gdn_replicate_qk && sub_block_idx < 2)
+                return {0, block_rows}; // Full sub-block (replicated)
+
+            size_t rows_per_rank = block_rows / static_cast<size_t>(world_size);
+            size_t start = rows_per_rank * static_cast<size_t>(rank);
+            size_t count = (rank == world_size - 1)
+                               ? (block_rows - start)
+                               : rows_per_rank;
+            return {start, count};
+        };
+
+        // Validate sub-block divisibility
+        {
+            static constexpr const char *sub_names[3] = {"Q", "K", "V"};
+            for (size_t s = 0; s < 3; s++)
+            {
+                if (gdn_replicate_qk && s < 2)
+                    continue; // Replicated sub-blocks are always valid
+                if (sub_block_sizes[s] % static_cast<size_t>(world_size) != 0)
+                {
+                    LOG_ERROR("[WeightManager] Cannot shard FusedQKV weight '" << name
+                                                                               << "': sub-block " << sub_names[s]
+                                                                               << " has " << sub_block_sizes[s]
+                                                                               << " rows, not divisible by TP degree " << world_size);
+                    return nullptr;
+                }
+            }
+        }
+
+        // Load each sub-block's slice from GGUF
+        std::shared_ptr<TensorBase> slices[3];
+        size_t total_out_rows = 0;
+        size_t abs_offset = 0;
+
+        for (size_t s = 0; s < 3; s++)
+        {
+            auto [local_start, local_count] = compute_slice(sub_block_sizes[s], static_cast<int>(s));
+            const size_t abs_row_start = abs_offset + local_start;
             const size_t abs_row_end = abs_row_start + local_count;
 
             slices[s] = loader_.loadTensorRowSlice(
@@ -3008,14 +3072,20 @@ namespace llaminar2
                                                                                 << " for: " << name);
                 return nullptr;
             }
+
+            total_out_rows += local_count;
+            abs_offset += sub_block_sizes[s];
         }
 
         // Concatenate raw bytes from the 3 slices into a single native tensor
-        const size_t bytes_per_slice = slices[0]->size_bytes();
-        const size_t total_bytes = bytes_per_slice * N_SUB_BLOCKS;
-        std::vector<uint8_t> combined_raw(total_bytes);
+        size_t total_bytes = 0;
+        for (size_t s = 0; s < 3; s++)
+            total_bytes += slices[s]->size_bytes();
 
-        for (size_t s = 0; s < N_SUB_BLOCKS; s++)
+        std::vector<uint8_t> combined_raw(total_bytes);
+        size_t byte_offset = 0;
+
+        for (size_t s = 0; s < 3; s++)
         {
             const void *src = slices[s]->raw_data();
             if (!src)
@@ -3023,12 +3093,12 @@ namespace llaminar2
                 LOG_ERROR("[WeightManager] Null raw_data for fused-QKV sub-block " << s << ": " << name);
                 return nullptr;
             }
-            std::memcpy(combined_raw.data() + s * bytes_per_slice, src, bytes_per_slice);
+            std::memcpy(combined_raw.data() + byte_offset, src, slices[s]->size_bytes());
+            byte_offset += slices[s]->size_bytes();
         }
 
         // Create a new tensor from the concatenated raw bytes
-        const size_t out_rows = local_count * N_SUB_BLOCKS;
-        std::vector<size_t> out_shape = {out_rows, cols};
+        std::vector<size_t> out_shape = {total_out_rows, cols};
         TensorType native_type = slices[0]->native_type();
 
         auto result_tensor = createTensorFromRawData(
@@ -3051,12 +3121,13 @@ namespace llaminar2
             std::shared_ptr<TensorBase>(std::move(result_tensor)), meta);
 
         LOG_DEBUG("[WeightManager] Device " << device.to_string()
-                                            << " (rank " << assignment.local_rank << "/" << tp_config_->worldSize() << ")"
+                                            << " (rank " << rank << "/" << world_size << ")"
                                             << " fused-QKV column-parallel " << name
                                             << " [" << total_rows << ", " << cols << "]"
-                                            << " -> [" << out_rows << ", " << cols << "]"
+                                            << " -> [" << total_out_rows << ", " << cols << "]"
                                             << " (" << static_cast<int>(native_type) << " native)"
-                                            << " (3 sub-blocks x rows [" << local_start << ", " << (local_start + local_count) << ") each)");
+                                            << " sub-blocks [" << sub_block_sizes[0] << "," << sub_block_sizes[1] << "," << sub_block_sizes[2] << "]"
+                                            << (gdn_replicate_qk ? " (GDN: Q/K replicated, V sharded)" : ""));
 
         return result;
     }
@@ -3192,7 +3263,44 @@ namespace llaminar2
 
         case ShardingMode::COLUMN_PARALLEL:
         {
+            // For tied embeddings: if output.weight is missing, substitute token_embd.weight
             auto dims_opt = loader_.getTensorShape(name);
+            if ((!dims_opt || dims_opt->empty()) && name == "output.weight")
+            {
+                auto embd_dims = loader_.getTensorShape("token_embd.weight");
+                if (embd_dims && embd_dims->size() == 2)
+                {
+                    LOG_INFO("[WeightManager] Device " << device.to_string()
+                                                       << " output.weight not in GGUF — using tied embedding "
+                                                       << "token_embd.weight as column-parallel LM head");
+
+                    // Vocab-dimension slicing: use assignment's vocab_start/vocab_count
+                    size_t total_rows = (*embd_dims)[0];
+                    size_t cols = (*embd_dims)[1];
+                    size_t row_start = assignment.vocab_start;
+                    size_t row_count = assignment.vocab_count;
+
+                    auto slice_tensor = loader_.loadTensorRowSlice(
+                        "token_embd.weight", row_start, row_start + row_count, device, WeightPrecision::NATIVE);
+                    if (!slice_tensor)
+                    {
+                        LOG_ERROR("[WeightManager] Failed to load tied embedding row slice");
+                        return nullptr;
+                    }
+
+                    auto meta = SliceMetadata::forColumnParallel(
+                        total_rows, cols, assignment.local_rank, tp_config_->worldSize(),
+                        true /* inner_is_presliced */);
+                    result = std::make_shared<TensorSlice>(std::move(slice_tensor), meta);
+
+                    LOG_DEBUG("[WeightManager] Device " << device.to_string()
+                                                        << " tied embedding LM head"
+                                                        << " [" << total_rows << ", " << cols << "]"
+                                                        << " -> rows [" << row_start << ", " << (row_start + row_count) << ")"
+                                                        << " = " << row_count << " rows");
+                    break;
+                }
+            }
             if (!dims_opt || dims_opt->empty())
             {
                 // Tensor doesn't exist in GGUF — return nullptr so the caller

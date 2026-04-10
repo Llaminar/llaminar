@@ -14,6 +14,8 @@
 #include "../coordinators/RCCLCoordinator.h"
 #include "../../utils/Logger.h"
 
+#include <algorithm>
+
 #ifdef HAVE_RCCL
 #include <mpi.h>
 #include <atomic>
@@ -120,6 +122,37 @@ namespace llaminar2
 
 namespace llaminar2
 {
+
+    // =========================================================================
+    // Static coordinator pool
+    // =========================================================================
+
+    std::mutex RCCLBackend::coordinator_pool_mutex_;
+    std::unordered_map<std::string, std::shared_ptr<RCCLCoordinator>> RCCLBackend::coordinator_pool_;
+
+    std::string RCCLBackend::makePoolKey(const std::vector<int> &device_ordinals)
+    {
+        auto sorted = device_ordinals;
+        std::sort(sorted.begin(), sorted.end());
+        std::string key;
+        for (size_t i = 0; i < sorted.size(); ++i)
+        {
+            if (i > 0)
+                key += ",";
+            key += std::to_string(sorted[i]);
+        }
+        return key;
+    }
+
+    void RCCLBackend::drainCoordinatorPool()
+    {
+        std::lock_guard<std::mutex> lock(coordinator_pool_mutex_);
+        if (!coordinator_pool_.empty())
+        {
+            LOG_INFO("[RCCLBackend] Draining coordinator pool (" << coordinator_pool_.size() << " entries)");
+            coordinator_pool_.clear(); // shared_ptr release → RCCLCoordinator dtor → ncclCommDestroy
+        }
+    }
 
     // =========================================================================
     // Constructor / Destructor
@@ -336,14 +369,28 @@ namespace llaminar2
                 device_ordinals_.push_back(device.ordinal);
             }
 
-            // Create and initialize the coordinator
-            coordinator_ = std::make_unique<RCCLCoordinator>();
-            if (!coordinator_->initialize(device_ordinals_))
+            // Create and initialize the coordinator (or reuse from pool)
             {
-                last_error_ = "RCCLCoordinator initialization failed: " + coordinator_->lastError();
-                LOG_ERROR(last_error_);
-                coordinator_.reset();
-                return false;
+                std::lock_guard<std::mutex> pool_lock(coordinator_pool_mutex_);
+                std::string pool_key = makePoolKey(device_ordinals_);
+                auto it = coordinator_pool_.find(pool_key);
+                if (it != coordinator_pool_.end() && it->second)
+                {
+                    coordinator_ = it->second;
+                    coordinator_pool_.erase(it);
+                    LOG_INFO("RCCLBackend: Reused pooled RCCLCoordinator for devices [" << pool_key << "]");
+                }
+            }
+            if (!coordinator_)
+            {
+                coordinator_ = std::make_shared<RCCLCoordinator>();
+                if (!coordinator_->initialize(device_ordinals_))
+                {
+                    last_error_ = "RCCLCoordinator initialization failed: " + coordinator_->lastError();
+                    LOG_ERROR(last_error_);
+                    coordinator_.reset();
+                    return false;
+                }
             }
 
             LOG_INFO("RCCLBackend: Initialized multi-GPU single-process (via RCCLCoordinator) with "
@@ -379,12 +426,19 @@ namespace llaminar2
         // Clean up multi-GPU single-process resources
         if (is_multi_gpu_single_process_)
         {
-            // Coordinator owns all RCCL comms/streams - just shut it down
+            // Park coordinator in pool instead of destroying it.
+            // Repeated ncclCommDestroy/ncclCommInit cycles trigger ROCm CLR
+            // state accumulation (a known ROCm bug) that causes GPU memory access
+            // faults. Pooling keeps the coordinator alive so subsequent RCCLBackend
+            // instances reuse it without an init/destroy cycle.
             if (coordinator_)
             {
-                coordinator_->shutdown();
-                coordinator_.reset();
+                std::lock_guard<std::mutex> pool_lock(coordinator_pool_mutex_);
+                std::string pool_key = makePoolKey(device_ordinals_);
+                coordinator_pool_[pool_key] = std::move(coordinator_);
+                LOG_DEBUG("RCCLBackend: Parked RCCLCoordinator in pool for devices [" << pool_key << "]");
             }
+            coordinator_.reset();
             device_ordinals_.clear();
             is_multi_gpu_single_process_ = false;
         }
@@ -424,6 +478,9 @@ namespace llaminar2
         if (coordinator_)
         {
             coordinator_->abortCommunicators();
+            // After abort, the coordinator is non-functional and must not be pooled.
+            coordinator_->shutdown();
+            coordinator_.reset();
         }
 
         initialized_ = false;

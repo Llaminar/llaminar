@@ -19,10 +19,14 @@
 #if defined(__AVX512F__)
 #include <immintrin.h>
 #define LLAMINAR_HAS_AVX512
-#elif defined(__AVX2__)
+#endif
+
+#if defined(__AVX2__)
 #include <immintrin.h>
 #define LLAMINAR_HAS_AVX2
 #endif
+
+#include "../../../utils/CPUFeatures.h"
 
 #if defined(__F16C__)
 #define LLAMINAR_HAS_F16C
@@ -701,13 +705,7 @@ namespace llaminar2::primitives
         float scale,
         int row_idx)
     {
-#if defined(LLAMINAR_HAS_AVX512)
-        softmax_row_fp32_avx512(row, cols, causal, scale, row_idx);
-#elif defined(LLAMINAR_HAS_AVX2)
-        softmax_row_fp32_avx2(row, cols, causal, scale, row_idx);
-#else
-        softmax_row_fp32_scalar(row, cols, causal, scale, row_idx);
-#endif
+        ISA_DISPATCH_VOID(softmax_row_fp32, row, cols, causal, scale, row_idx);
     }
 
     // ============================================================================
@@ -812,13 +810,7 @@ namespace llaminar2::primitives
         float scale,
         int row_idx)
     {
-#if defined(LLAMINAR_HAS_AVX512) && defined(LLAMINAR_HAS_AVX512BF16)
-        softmax_row_bf16_avx512(row, cols, causal, scale, row_idx);
-#elif defined(LLAMINAR_HAS_AVX2)
-        softmax_row_bf16_avx2(row, cols, causal, scale, row_idx);
-#else
-        softmax_row_bf16_scalar(row, cols, causal, scale, row_idx);
-#endif
+        ISA_DISPATCH_VOID(softmax_row_bf16, row, cols, causal, scale, row_idx);
     }
 
     // ============================================================================
@@ -1039,13 +1031,7 @@ namespace llaminar2::primitives
         float scale,
         int row_idx)
     {
-#if defined(LLAMINAR_HAS_AVX512)
-        softmax_row_fp16_avx512(row, cols, causal, scale, row_idx);
-#elif defined(LLAMINAR_HAS_AVX2) && defined(LLAMINAR_HAS_F16C)
-        softmax_row_fp16_avx2(row, cols, causal, scale, row_idx);
-#else
-        softmax_row_fp16_scalar(row, cols, causal, scale, row_idx);
-#endif
+        ISA_DISPATCH_VOID(softmax_row_fp16, row, cols, causal, scale, row_idx);
     }
 
     // ============================================================================
@@ -1714,13 +1700,7 @@ namespace llaminar2::primitives
         float scale,
         int row_idx)
     {
-#if defined(LLAMINAR_HAS_AVX512)
-        softmax_row_q8_1_avx512(row, n_blocks, causal, scale, row_idx);
-#elif defined(LLAMINAR_HAS_AVX2)
-        softmax_row_q8_1_avx2(row, n_blocks, causal, scale, row_idx);
-#else
-        softmax_row_q8_1_scalar(row, n_blocks, causal, scale, row_idx);
-#endif
+        ISA_DISPATCH_VOID(softmax_row_q8_1, row, n_blocks, causal, scale, row_idx);
     }
 
 } // namespace llaminar2::primitives

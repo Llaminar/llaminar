@@ -14,6 +14,7 @@
 #endif
 
 #include "../../../utils/OpenMPUtils.h"
+#include "../../../utils/CPUFeatures.h"
 
 #if defined(__AVX512F__)
 #include <immintrin.h>
@@ -24,9 +25,10 @@
 namespace llaminar2::primitives
 {
 
-    namespace
+    namespace detail
     {
-#if defined(__AVX2__) && !defined(__AVX512F__)
+
+#if defined(__AVX2__)
         // Horizontal max reduction for AVX2
         static inline float hmax256(__m256 v)
         {
@@ -55,7 +57,6 @@ namespace llaminar2::primitives
             __m512 fx = _mm512_floor_ps(xf);
             __m512 fpart = _mm512_sub_ps(xf, fx);
 
-            // Polynomial coefficients
             const __m512 c1 = _mm512_set1_ps(0.99999994f);
             const __m512 c2 = _mm512_set1_ps(0.69314718f);
             const __m512 c3 = _mm512_set1_ps(0.24022651f);
@@ -68,7 +69,6 @@ namespace llaminar2::primitives
             p = _mm512_fmadd_ps(p, fpart, c2);
             p = _mm512_fmadd_ps(p, fpart, c1);
 
-            // 2^floor(x/ln2)
             __m512i ipart = _mm512_cvttps_epi32(fx);
             ipart = _mm512_add_epi32(ipart, _mm512_set1_epi32(127));
             ipart = _mm512_slli_epi32(ipart, 23);
@@ -115,7 +115,366 @@ namespace llaminar2::primitives
 #endif
         }
 #endif
-    } // anonymous namespace
+
+        // ======== Per-row softmax helpers: scalar, AVX2, AVX512 ========
+
+        void softmax_row_scalar(float *row, int cols, long long r,
+                                bool causal, float scale, bool use_fast_exp)
+        {
+            float row_max = -std::numeric_limits<float>::infinity();
+#pragma omp simd reduction(max : row_max)
+            for (long long c = 0; c < (long long)cols; ++c)
+            {
+                bool masked = causal && c > r;
+                float v = row[c];
+                if (scale != 1.0f)
+                    v *= scale;
+                if (masked)
+                    v = -std::numeric_limits<float>::infinity();
+                row_max = v > row_max ? v : row_max;
+            }
+
+            if (!std::isfinite(row_max))
+                row_max = 0.0f;
+
+            double sum = 0.0;
+#pragma omp simd reduction(+ : sum)
+            for (long long c = 0; c < (long long)cols; ++c)
+            {
+                bool masked = causal && c > r;
+                float v = row[c];
+                if (scale != 1.0f)
+                    v *= scale;
+                if (masked)
+                    continue;
+                sum += std::exp(v - row_max);
+            }
+
+            if (sum <= 0.0)
+                sum = 1.0;
+            float inv = (float)(1.0 / sum);
+
+#pragma omp simd
+            for (long long c = 0; c < (long long)cols; ++c)
+            {
+                bool masked = causal && c > r;
+                float v = row[c];
+                if (scale != 1.0f)
+                    v *= scale;
+                if (masked)
+                {
+                    row[c] = 0.0f;
+                    continue;
+                }
+                row[c] = (float)(std::exp(v - row_max) * inv);
+            }
+        }
+
+#if defined(__AVX2__)
+        void softmax_row_avx2(float *row, int cols, long long r,
+                              bool causal, float scale, bool use_fast_exp)
+        {
+            float row_max = -std::numeric_limits<float>::infinity();
+
+            // Pass 1: Find max
+            int c = 0;
+            __m256 vmax = _mm256_set1_ps(-std::numeric_limits<float>::infinity());
+
+            for (; c + 8 <= cols; c += 8)
+            {
+                __m256 v = _mm256_loadu_ps(row + c);
+                if (scale != 1.0f)
+                    v = _mm256_mul_ps(v, _mm256_set1_ps(scale));
+
+                if (causal)
+                {
+                    float tmp[8];
+                    _mm256_storeu_ps(tmp, v);
+                    for (int lane = 0; lane < 8; ++lane)
+                    {
+                        if (c + lane > r)
+                            tmp[lane] = -std::numeric_limits<float>::infinity();
+                    }
+                    v = _mm256_loadu_ps(tmp);
+                }
+
+                vmax = _mm256_max_ps(vmax, v);
+            }
+
+            row_max = std::max(row_max, hmax256(vmax));
+
+            for (; c < cols; ++c)
+            {
+                bool masked = causal && c > r;
+                float v = row[c];
+                if (scale != 1.0f)
+                    v *= scale;
+                if (masked)
+                    v = -std::numeric_limits<float>::infinity();
+                row_max = v > row_max ? v : row_max;
+            }
+
+            if (!std::isfinite(row_max))
+                row_max = 0.0f;
+
+            // Pass 2: Compute sum of exp(x - max)
+            double sum = 0.0;
+            int c2 = 0;
+            for (; c2 + 8 <= cols; c2 += 8)
+            {
+                __m256 v = _mm256_loadu_ps(row + c2);
+                if (scale != 1.0f)
+                    v = _mm256_mul_ps(v, _mm256_set1_ps(scale));
+
+                float tmp[8];
+                _mm256_storeu_ps(tmp, v);
+
+                for (int lane = 0; lane < 8; ++lane)
+                {
+                    if (causal && c2 + lane > r)
+                        continue;
+                    sum += std::exp(tmp[lane] - row_max);
+                }
+            }
+
+            for (; c2 < cols; ++c2)
+            {
+                if (causal && c2 > r)
+                    continue;
+                float v = row[c2];
+                if (scale != 1.0f)
+                    v *= scale;
+                sum += std::exp(v - row_max);
+            }
+
+            if (sum <= 0.0)
+                sum = 1.0;
+            float inv = (float)(1.0 / sum);
+
+            // Pass 3: Normalize
+            int c3 = 0;
+            for (; c3 + 8 <= cols; c3 += 8)
+            {
+                __m256 v = _mm256_loadu_ps(row + c3);
+                if (scale != 1.0f)
+                    v = _mm256_mul_ps(v, _mm256_set1_ps(scale));
+
+                float tmp[8];
+                _mm256_storeu_ps(tmp, v);
+
+                float out[8];
+                for (int lane = 0; lane < 8; ++lane)
+                {
+                    if (causal && c3 + lane > r)
+                    {
+                        out[lane] = 0.0f;
+                    }
+                    else
+                    {
+                        float dv = tmp[lane] - row_max;
+                        if (use_fast_exp)
+                        {
+                            __m256 x = _mm256_set1_ps(dv);
+                            __m256 e = fast_exp_approx256(x);
+                            _mm256_storeu_ps(tmp, e);
+                            out[lane] = tmp[0] * inv;
+                        }
+                        else
+                        {
+                            out[lane] = std::exp(dv) * inv;
+                        }
+                    }
+                }
+
+                _mm256_storeu_ps(row + c3, _mm256_loadu_ps(out));
+            }
+
+            for (; c3 < cols; ++c3)
+            {
+                if (causal && c3 > r)
+                {
+                    row[c3] = 0.0f;
+                    continue;
+                }
+                float v = row[c3];
+                if (scale != 1.0f)
+                    v *= scale;
+                row[c3] = std::exp(v - row_max) * inv;
+            }
+        }
+#endif
+
+#if defined(__AVX512F__)
+        void softmax_row_avx512(float *row, int cols, long long r,
+                                bool causal, float scale, bool use_fast_exp)
+        {
+            float row_max = -std::numeric_limits<float>::infinity();
+
+            // Pass 1: Find max
+            int c = 0;
+            const __m512 neg_inf = _mm512_set1_ps(-std::numeric_limits<float>::infinity());
+            const __m512 scale_ps = _mm512_set1_ps(scale);
+            __m512 vmax = neg_inf;
+
+            for (; c + 16 <= cols; c += 16)
+            {
+                __m512 v = _mm512_loadu_ps(row + c);
+                if (scale != 1.0f)
+                    v = _mm512_mul_ps(v, scale_ps);
+
+                if (causal)
+                {
+                    for (int lane = 0; lane < 16; ++lane)
+                    {
+                        if (c + lane > r)
+                        {
+                            alignas(64) float tmp[16];
+                            _mm512_store_ps(tmp, v);
+                            tmp[lane] = -std::numeric_limits<float>::infinity();
+                            v = _mm512_load_ps(tmp);
+                        }
+                    }
+                }
+
+                vmax = _mm512_max_ps(vmax, v);
+            }
+
+            row_max = std::max(row_max, _mm512_reduce_max_ps(vmax));
+
+            for (; c < cols; ++c)
+            {
+                bool masked = causal && c > r;
+                float v = row[c];
+                if (scale != 1.0f)
+                    v *= scale;
+                if (masked)
+                    v = -std::numeric_limits<float>::infinity();
+                if (v > row_max)
+                    row_max = v;
+            }
+
+            if (!std::isfinite(row_max))
+                row_max = 0.0f;
+
+            // Pass 2: Compute sum of exp(x - max)
+            double sum = 0.0;
+            int c2 = 0;
+            for (; c2 + 16 <= cols; c2 += 16)
+            {
+                __m512 v = _mm512_loadu_ps(row + c2);
+                if (scale != 1.0f)
+                    v = _mm512_mul_ps(v, scale_ps);
+
+                int n_valid = causal ? ((int)r - c2 + 1) : 16;
+                if (n_valid <= 0)
+                    continue;
+
+                alignas(64) float tmp[16];
+                _mm512_store_ps(tmp, v);
+
+                for (int lane = 0; lane < 16; ++lane)
+                {
+                    if (causal && c2 + lane > r)
+                        continue;
+                    sum += std::exp(tmp[lane] - row_max);
+                }
+            }
+
+            for (; c2 < cols; ++c2)
+            {
+                if (causal && c2 > r)
+                    continue;
+                float v = row[c2];
+                if (scale != 1.0f)
+                    v *= scale;
+                sum += std::exp(v - row_max);
+            }
+
+            if (sum <= 0.0)
+                sum = 1.0;
+            float inv = (float)(1.0 / sum);
+
+            // Pass 3: Normalize
+            int c3 = 0;
+            const __m512 inv_ps = _mm512_set1_ps(inv);
+            const __m512 zero_ps = _mm512_setzero_ps();
+
+            for (; c3 + 16 <= cols; c3 += 16)
+            {
+                __m512 v = _mm512_loadu_ps(row + c3);
+                if (scale != 1.0f)
+                    v = _mm512_mul_ps(v, scale_ps);
+
+                int n_valid = causal ? ((int)r - c3 + 1) : 16;
+                if (n_valid <= 0)
+                {
+                    _mm512_storeu_ps(row + c3, zero_ps);
+                    continue;
+                }
+
+                alignas(64) float tmp[16];
+                _mm512_store_ps(tmp, v);
+
+                float out[16];
+                for (int lane = 0; lane < 16; ++lane)
+                {
+                    if (causal && c3 + lane > r)
+                    {
+                        out[lane] = 0.0f;
+                    }
+                    else
+                    {
+                        float dv = tmp[lane] - row_max;
+                        if (use_fast_exp)
+                        {
+                            __m512 x = _mm512_set1_ps(dv);
+                            __m512 e = fast_exp_approx512(x);
+                            _mm512_store_ps(tmp, e);
+                            out[lane] = tmp[0] * inv;
+                        }
+                        else
+                        {
+                            out[lane] = std::exp(dv) * inv;
+                        }
+                    }
+                }
+
+                _mm512_storeu_ps(row + c3, _mm512_loadu_ps(out));
+            }
+
+            for (; c3 < cols; ++c3)
+            {
+                if (causal && c3 > r)
+                {
+                    row[c3] = 0.0f;
+                    continue;
+                }
+                float v = row[c3];
+                if (scale != 1.0f)
+                    v *= scale;
+                row[c3] = std::exp(v - row_max) * inv;
+            }
+        }
+#endif
+
+// --- ISA stubs for runtime dispatch ---
+#if !defined(__AVX2__)
+        void softmax_row_avx2(float *row, int cols, long long r,
+                              bool causal, float scale, bool use_fast_exp)
+        {
+            softmax_row_scalar(row, cols, r, causal, scale, use_fast_exp);
+        }
+#endif
+#if !defined(__AVX512F__)
+        void softmax_row_avx512(float *row, int cols, long long r,
+                                bool causal, float scale, bool use_fast_exp)
+        {
+            softmax_row_avx2(row, cols, r, causal, scale, use_fast_exp);
+        }
+#endif
+
+    } // namespace detail
+    using namespace detail;
 
     void softmax_row_major_vectorized(
         const SoftmaxRowArgs &args,
@@ -145,330 +504,11 @@ namespace llaminar2::primitives
             for (long long r = 0; r < (long long)rows; ++r)
             {
                 float *row = scores + (std::size_t)r * cols;
-                float row_max = -std::numeric_limits<float>::infinity();
-
-                // Pass 1: Find max (with causal masking)
-#if defined(__AVX512F__)
-                int c = 0;
-                const __m512 neg_inf = _mm512_set1_ps(-std::numeric_limits<float>::infinity());
-                const __m512 scale_ps = _mm512_set1_ps(scale);
-                __m512 vmax = neg_inf;
-
-                for (; c + 16 <= cols; c += 16)
-                {
-                    __m512 v = _mm512_loadu_ps(row + c);
-                    if (scale != 1.0f)
-                        v = _mm512_mul_ps(v, scale_ps);
-
-                    if (causal)
-                    {
-                        // Mask positions where c+lane > r
-                        for (int lane = 0; lane < 16; ++lane)
-                        {
-                            if (c + lane > r)
-                            {
-                                alignas(64) float tmp[16];
-                                _mm512_store_ps(tmp, v);
-                                tmp[lane] = -std::numeric_limits<float>::infinity();
-                                v = _mm512_load_ps(tmp);
-                            }
-                        }
-                    }
-
-                    vmax = _mm512_max_ps(vmax, v);
-                }
-
-                row_max = std::max(row_max, _mm512_reduce_max_ps(vmax));
-
-                for (; c < cols; ++c)
-                {
-                    bool masked = causal && c > r;
-                    float v = row[c];
-                    if (scale != 1.0f)
-                        v *= scale;
-                    if (masked)
-                        v = -std::numeric_limits<float>::infinity();
-                    if (v > row_max)
-                        row_max = v;
-                }
-
-#elif defined(__AVX2__)
-                int c = 0;
-                __m256 vmax = _mm256_set1_ps(-std::numeric_limits<float>::infinity());
-
-                for (; c + 8 <= cols; c += 8)
-                {
-                    __m256 v = _mm256_loadu_ps(row + c);
-                    if (scale != 1.0f)
-                        v = _mm256_mul_ps(v, _mm256_set1_ps(scale));
-
-                    if (causal)
-                    {
-                        float tmp[8];
-                        _mm256_storeu_ps(tmp, v);
-                        for (int lane = 0; lane < 8; ++lane)
-                        {
-                            if (c + lane > r)
-                                tmp[lane] = -std::numeric_limits<float>::infinity();
-                        }
-                        v = _mm256_loadu_ps(tmp);
-                    }
-
-                    vmax = _mm256_max_ps(vmax, v);
-                }
-
-                row_max = std::max(row_max, hmax256(vmax));
-
-                for (; c < cols; ++c)
-                {
-                    bool masked = causal && c > r;
-                    float v = row[c];
-                    if (scale != 1.0f)
-                        v *= scale;
-                    if (masked)
-                        v = -std::numeric_limits<float>::infinity();
-                    row_max = v > row_max ? v : row_max;
-                }
-
-#else
-                // Scalar max pass
-#pragma omp simd reduction(max : row_max)
-                for (long long c = 0; c < (long long)cols; ++c)
-                {
-                    bool masked = causal && c > r;
-                    float v = row[c];
-                    if (scale != 1.0f)
-                        v *= scale;
-                    if (masked)
-                        v = -std::numeric_limits<float>::infinity();
-                    row_max = v > row_max ? v : row_max;
-                }
-#endif
-
-                if (!std::isfinite(row_max))
-                    row_max = 0.0f;
-
-                // Pass 2: Compute sum of exp(x - max)
-                double sum = 0.0;
-
-#if defined(__AVX512F__)
-                int c2 = 0;
-                for (; c2 + 16 <= cols; c2 += 16)
-                {
-                    __m512 v = _mm512_loadu_ps(row + c2);
-                    if (scale != 1.0f)
-                        v = _mm512_mul_ps(v, scale_ps);
-
-                    int n_valid = causal ? ((int)r - c2 + 1) : 16;
-                    if (n_valid <= 0)
-                        continue;
-
-                    alignas(64) float tmp[16];
-                    _mm512_store_ps(tmp, v);
-
-                    for (int lane = 0; lane < 16; ++lane)
-                    {
-                        if (causal && c2 + lane > r)
-                            continue;
-                        sum += std::exp(tmp[lane] - row_max);
-                    }
-                }
-
-                for (; c2 < cols; ++c2)
-                {
-                    if (causal && c2 > r)
-                        continue;
-                    float v = row[c2];
-                    if (scale != 1.0f)
-                        v *= scale;
-                    sum += std::exp(v - row_max);
-                }
-
-#elif defined(__AVX2__)
-                int c2 = 0;
-                for (; c2 + 8 <= cols; c2 += 8)
-                {
-                    __m256 v = _mm256_loadu_ps(row + c2);
-                    if (scale != 1.0f)
-                        v = _mm256_mul_ps(v, _mm256_set1_ps(scale));
-
-                    float tmp[8];
-                    _mm256_storeu_ps(tmp, v);
-
-                    for (int lane = 0; lane < 8; ++lane)
-                    {
-                        if (causal && c2 + lane > r)
-                            continue;
-                        sum += std::exp(tmp[lane] - row_max);
-                    }
-                }
-
-                for (; c2 < cols; ++c2)
-                {
-                    if (causal && c2 > r)
-                        continue;
-                    float v = row[c2];
-                    if (scale != 1.0f)
-                        v *= scale;
-                    sum += std::exp(v - row_max);
-                }
-
-#else
-                // Scalar sum
-#pragma omp simd reduction(+ : sum)
-                for (long long c = 0; c < (long long)cols; ++c)
-                {
-                    bool masked = causal && c > r;
-                    float v = row[c];
-                    if (scale != 1.0f)
-                        v *= scale;
-                    if (masked)
-                        continue;
-                    sum += std::exp(v - row_max);
-                }
-#endif
-
-                if (sum <= 0.0)
-                    sum = 1.0;
-
-                float inv = (float)(1.0 / sum);
-
-                // Pass 3: Normalize (write final probabilities)
-#if defined(__AVX512F__)
-                int c3 = 0;
-                const __m512 inv_ps = _mm512_set1_ps(inv);
-                const __m512 zero_ps = _mm512_setzero_ps();
-
-                for (; c3 + 16 <= cols; c3 += 16)
-                {
-                    __m512 v = _mm512_loadu_ps(row + c3);
-                    if (scale != 1.0f)
-                        v = _mm512_mul_ps(v, scale_ps);
-
-                    int n_valid = causal ? ((int)r - c3 + 1) : 16;
-                    if (n_valid <= 0)
-                    {
-                        _mm512_storeu_ps(row + c3, zero_ps);
-                        continue;
-                    }
-
-                    alignas(64) float tmp[16];
-                    _mm512_store_ps(tmp, v);
-
-                    float out[16];
-                    for (int lane = 0; lane < 16; ++lane)
-                    {
-                        if (causal && c3 + lane > r)
-                        {
-                            out[lane] = 0.0f;
-                        }
-                        else
-                        {
-                            float dv = tmp[lane] - row_max;
-                            if (use_fast_exp)
-                            {
-                                __m512 x = _mm512_set1_ps(dv);
-                                __m512 e = fast_exp_approx512(x);
-                                _mm512_store_ps(tmp, e);
-                                out[lane] = tmp[0] * inv;
-                            }
-                            else
-                            {
-                                out[lane] = std::exp(dv) * inv;
-                            }
-                        }
-                    }
-
-                    _mm512_storeu_ps(row + c3, _mm512_loadu_ps(out));
-                }
-
-                for (; c3 < cols; ++c3)
-                {
-                    if (causal && c3 > r)
-                    {
-                        row[c3] = 0.0f;
-                        continue;
-                    }
-                    float v = row[c3];
-                    if (scale != 1.0f)
-                        v *= scale;
-                    row[c3] = std::exp(v - row_max) * inv;
-                }
-
-#elif defined(__AVX2__)
-                int c3 = 0;
-                for (; c3 + 8 <= cols; c3 += 8)
-                {
-                    __m256 v = _mm256_loadu_ps(row + c3);
-                    if (scale != 1.0f)
-                        v = _mm256_mul_ps(v, _mm256_set1_ps(scale));
-
-                    float tmp[8];
-                    _mm256_storeu_ps(tmp, v);
-
-                    float out[8];
-                    for (int lane = 0; lane < 8; ++lane)
-                    {
-                        if (causal && c3 + lane > r)
-                        {
-                            out[lane] = 0.0f;
-                        }
-                        else
-                        {
-                            float dv = tmp[lane] - row_max;
-                            if (use_fast_exp)
-                            {
-                                __m256 x = _mm256_set1_ps(dv);
-                                __m256 e = fast_exp_approx256(x);
-                                _mm256_storeu_ps(tmp, e);
-                                out[lane] = tmp[0] * inv;
-                            }
-                            else
-                            {
-                                out[lane] = std::exp(dv) * inv;
-                            }
-                        }
-                    }
-
-                    _mm256_storeu_ps(row + c3, _mm256_loadu_ps(out));
-                }
-
-                for (; c3 < cols; ++c3)
-                {
-                    if (causal && c3 > r)
-                    {
-                        row[c3] = 0.0f;
-                        continue;
-                    }
-                    float v = row[c3];
-                    if (scale != 1.0f)
-                        v *= scale;
-                    row[c3] = std::exp(v - row_max) * inv;
-                }
-
-#else
-                // Scalar normalize
-#pragma omp simd
-                for (long long c = 0; c < (long long)cols; ++c)
-                {
-                    bool masked = causal && c > r;
-                    float v = row[c];
-                    if (scale != 1.0f)
-                        v *= scale;
-                    if (masked)
-                    {
-                        row[c] = 0.0f;
-                        continue;
-                    }
-                    row[c] = (float)(std::exp(v - row_max) * inv);
-                }
-#endif
+                ISA_DISPATCH_VOID(softmax_row, row, cols, r, causal, scale, use_fast_exp);
             }
         }; // end do_softmax lambda
 
         // Execute with OpenMP worksharing (nested-safe)
-        // If parallel=true: use OMP_WORKSHARE_REGION (handles nested case properly)
-        // If parallel=false: execute serially
         if (parallel)
         {
             OMP_WORKSHARE_REGION(do_softmax);
@@ -479,53 +519,7 @@ namespace llaminar2::primitives
             for (long long r = 0; r < (long long)rows; ++r)
             {
                 float *row = scores + (std::size_t)r * cols;
-                float row_max = -std::numeric_limits<float>::infinity();
-
-                // Pass 1: Find max
-                for (int c = 0; c < cols; ++c)
-                {
-                    bool masked = causal && c > r;
-                    float v = row[c];
-                    if (scale != 1.0f)
-                        v *= scale;
-                    if (masked)
-                        v = -std::numeric_limits<float>::infinity();
-                    if (v > row_max)
-                        row_max = v;
-                }
-
-                if (!std::isfinite(row_max))
-                    row_max = 0.0f;
-
-                // Pass 2: Compute sum of exp(x - max)
-                double sum = 0.0;
-                for (int c = 0; c < cols; ++c)
-                {
-                    if (causal && c > r)
-                        continue;
-                    float v = row[c];
-                    if (scale != 1.0f)
-                        v *= scale;
-                    sum += std::exp(v - row_max);
-                }
-
-                if (sum <= 0.0)
-                    sum = 1.0;
-                float inv = (float)(1.0 / sum);
-
-                // Pass 3: Normalize
-                for (int c = 0; c < cols; ++c)
-                {
-                    if (causal && c > r)
-                    {
-                        row[c] = 0.0f;
-                        continue;
-                    }
-                    float v = row[c];
-                    if (scale != 1.0f)
-                        v *= scale;
-                    row[c] = (float)(std::exp(v - row_max) * inv);
-                }
+                ISA_DISPATCH_VOID(softmax_row, row, cols, r, causal, scale, use_fast_exp);
             }
         }
     }
