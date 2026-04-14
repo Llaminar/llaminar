@@ -226,17 +226,18 @@ namespace llaminar2
         // =====================================================================
 
         /**
-         * @brief Copy data between devices (CPU↔CPU only)
+         * @brief Copy data between any device pair via host staging
          *
-         * HostBackend ONLY supports CPU to CPU copies using memcpy.
-         * Returns false for any GPU-involved transfers (fail-fast, no silent staging).
+         * Supports CPU\u2194CPU, CPU\u2194GPU, and GPU\u2194GPU transfers.
+         * GPU\u2194GPU copies stage through a pre-allocated pinned host buffer
+         * that is dual-registered with both CUDA and ROCm runtimes.
          *
-         * @param dst_ptr Destination pointer
-         * @param dst_device Destination device (must be CPU)
-         * @param src_ptr Source pointer
-         * @param src_device Source device (must be CPU)
+         * @param dst_ptr Destination pointer (device or host memory)
+         * @param dst_device Destination device
+         * @param src_ptr Source pointer (device or host memory)
+         * @param src_device Source device
          * @param bytes Number of bytes to copy
-         * @return true on success, false if either device is not CPU
+         * @return true on success
          */
         bool copy(
             void *dst_ptr, DeviceId dst_device,
@@ -244,18 +245,18 @@ namespace llaminar2
             size_t bytes) override;
 
         /**
-         * @brief Async copy (delegates to synchronous copy for CPU)
+         * @brief Async copy (delegates to synchronous copy)
          *
-         * Since CPU operations are inherently synchronous, this just
-         * calls copy() and ignores the stream parameter.
+         * All HostBackend copies are synchronous. The stream parameter
+         * is accepted for interface compatibility but ignored.
          *
          * @param dst_ptr Destination pointer
-         * @param dst_device Destination device (must be CPU)
+         * @param dst_device Destination device
          * @param src_ptr Source pointer
-         * @param src_device Source device (must be CPU)
+         * @param src_device Source device
          * @param bytes Number of bytes to copy
-         * @param stream Ignored (no streams on CPU)
-         * @return true on success, false if either device is not CPU
+         * @param stream Ignored
+         * @return true on success
          */
         bool copyAsync(
             void *dst_ptr, DeviceId dst_device,
@@ -265,11 +266,11 @@ namespace llaminar2
         /**
          * @brief Check if this backend supports copy between given device pair
          *
-         * HostBackend only supports CPU↔CPU copies.
+         * HostBackend supports any device pair via host staging.
          *
          * @param src_device Source device
          * @param dst_device Destination device
-         * @return true only if both devices are CPU
+         * @return Always true
          */
         bool supportsCopy(DeviceId src_device, DeviceId dst_device) const override;
 
@@ -292,6 +293,11 @@ namespace llaminar2
         /// Host staging buffer for reductions (dual-registered with both runtimes)
         void *staging_buffer_ = nullptr;
         size_t staging_buffer_size_ = 0;
+
+        /// Track whether staging buffer is registered with each runtime
+        /// (independent of has_cuda_/has_rocm_ which are cleared by shutdown())
+        bool staging_registered_cuda_ = false;
+        bool staging_registered_rocm_ = false;
 
         /// Track CUDA and ROCm device presence in group
         bool has_cuda_ = false;

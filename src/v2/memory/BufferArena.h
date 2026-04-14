@@ -4,7 +4,7 @@
  *
  * BufferArena owns all activation/scratch/workspace buffers and provides:
  *   - Typed registration with BufferId keys
- *   - External buffer registration (for weights, BAR buffers)
+ *   - External buffer registration (for weights)
  *   - Coherence tracking (host vs. device authoritative)
  *   - Borrow tracking with aliasing validation (debug builds)
  *   - Typed BufferView handles for safe, access-controlled access
@@ -36,14 +36,11 @@ namespace llaminar2
     class ITensor;
     class TensorBase;
     class TensorFactory;
-    class ILocalTPContext;
-    enum class CollectiveBackendType;
 
     /**
      * @brief Configuration for BufferArena allocation behavior.
      *
-     * Controls BAR-backed allocation for PCIeBAR tensor parallelism,
-     * mapped memory for snapshot/debugging, and factory binding.
+     * Controls mapped memory for snapshot/debugging and factory binding.
      */
     struct ArenaConfig
     {
@@ -52,13 +49,6 @@ namespace llaminar2
 
         /// Use mapped memory for GPU activation buffers (snapshot/debugging)
         bool use_mapped_memory = false;
-
-        // ── BAR-backed allocation (LOCAL TP with PCIeBAR) ───────────────
-        int tp_degree = 1;
-        CollectiveBackendType collective_backend{}; // default-initialized
-        DeviceId rocm_device;
-        DeviceId cuda_device;
-        ILocalTPContext *local_tp_ctx = nullptr;
     };
 
     /**
@@ -68,15 +58,12 @@ namespace llaminar2
     {
         size_t total_buffers = 0;
         size_t total_bytes = 0;
-        size_t bar_backed_buffers = 0;
-        size_t bar_backed_bytes = 0;
         size_t mapped_buffers = 0;
         size_t mapped_bytes = 0;
 
         void reset()
         {
             total_buffers = total_bytes = 0;
-            bar_backed_buffers = bar_backed_bytes = 0;
             mapped_buffers = mapped_bytes = 0;
         }
     };
@@ -138,7 +125,7 @@ namespace llaminar2
                             const char *dtype, DeviceId device);
 
         /**
-         * @brief Register an externally-owned buffer (weights, BAR buffers).
+         * @brief Register an externally-owned buffer (weights).
          *
          * The arena does NOT own this tensor — it just tracks its coherence
          * and provides borrow tracking.

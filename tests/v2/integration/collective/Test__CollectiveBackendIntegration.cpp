@@ -11,7 +11,7 @@
  * 1. **CPU+CPU (MPI)**: Pure MPI backend for CPU-only tensor parallelism
  * 2. **NVIDIA+NVIDIA (NCCL)**: Homogeneous CUDA tensor parallelism
  * 3. **AMD+AMD (RCCL)**: Homogeneous ROCm tensor parallelism
- * 4. **NVIDIA+AMD (PCIeBAR)**: Cross-vendor GPU tensor parallelism
+ * 4. **NVIDIA+AMD (HETEROGENEOUS)**: Cross-vendor GPU tensor parallelism
  * 5. **Single-rank Optimization**: Trivial domain skip
  *
  * @note All tests use a properly distributed ClusterInventory built via MPI
@@ -717,7 +717,7 @@ TEST_F(Test__CollectiveAMD, AllReduceSumViaRCCL)
 #endif // HAVE_ROCM
 
 // =============================================================================
-// Scenario 4: Cross-Vendor GPU Collective (PCIeBAR Backend)
+// Scenario 4: Cross-Vendor GPU Collective (HETEROGENEOUS Backend)
 // =============================================================================
 
 #if defined(HAVE_CUDA) && defined(HAVE_ROCM)
@@ -737,9 +737,9 @@ protected:
 };
 
 /**
- * @brief Verify PCIeBAR backend is selected for heterogeneous GPU inventory
+ * @brief Verify HETEROGENEOUS backend is selected for heterogeneous GPU inventory
  */
-TEST_F(Test__CollectiveCrossVendor, BackendSelectionIsPCIeBAR)
+TEST_F(Test__CollectiveCrossVendor, BackendSelectionIsHeterogeneous)
 {
     auto inventory = buildFullInventory();
     auto ctx = CollectiveContextFactory::createIntraNode(inventory, mpi_ctx_);
@@ -749,14 +749,14 @@ TEST_F(Test__CollectiveCrossVendor, BackendSelectionIsPCIeBAR)
     LOG_INFO("[Rank " << rank_ << "] Cross-vendor: CUDA " << cuda_count_
                       << " + ROCm " << rocm_count_);
 
-    // PCIeBAR backend should be available for cross-vendor
-    if (ctx->isBackendAvailable(CollectiveBackendType::PCIE_BAR))
+    // HETEROGENEOUS backend should be available for cross-vendor
+    if (ctx->isBackendAvailable(CollectiveBackendType::HETEROGENEOUS))
     {
-        LOG_INFO("[Rank " << rank_ << "] PCIeBAR backend available for mixed GPUs");
+        LOG_INFO("[Rank " << rank_ << "] HETEROGENEOUS backend available for mixed GPUs");
     }
     else
     {
-        LOG_INFO("[Rank " << rank_ << "] PCIeBAR backend not available (expected on some systems)");
+        LOG_INFO("[Rank " << rank_ << "] HETEROGENEOUS backend not available (expected on some systems)");
     }
 }
 

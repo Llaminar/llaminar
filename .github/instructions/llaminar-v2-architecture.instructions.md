@@ -288,14 +288,13 @@ struct Config {
     ParallelismMode mode;                        // AUTO, TP, PP, TP_PP
     vector<GlobalDeviceAddress> devices;         // TP devices
     vector<float> weights;                       // Proportional weights (e.g., {0.73, 0.27})
-    CollectiveBackendType backend;               // NCCL, RCCL, PCIeBAR, etc.
+    CollectiveBackendType backend;               // NCCL, RCCL, HOST, etc.
     vector<PPStageConfig> pp_stages;             // For PP mode
     size_t max_seq_len;
     int batch_size;
     ActivationPrecision activation_precision;
     KVCachePrecision kv_cache_precision;
     bool use_mapped_memory;                      // GPU zero-copy access
-    bool use_bar_backed_hidden;                  // Cross-vendor PP transfers
     
     ParallelismMode detectMode() const;
     static Config fromPlan(const RankExecutionPlan& plan);
@@ -304,7 +303,7 @@ struct Config {
 
 **Key Members:**
 - `vector<unique_ptr<DeviceGraphOrchestrator>> device_runners_` — per-device runners
-- `unique_ptr<ILocalTPContext> tp_ctx_` — LOCAL TP context (NCCL/RCCL/PCIeBAR)
+- `unique_ptr<ILocalTPContext> tp_ctx_` — LOCAL TP context (NCCL/RCCL/HOST)
 - `unique_ptr<ILocalPPContext> pp_ctx_` — inter-stage transfers
 - `unique_ptr<TensorBase> combined_logits_` — AllGather output
 - `unique_ptr<TPWorkerPool> tp_worker_pool_` — persistent thread pool for TP
@@ -394,7 +393,7 @@ Location: `src/v2/memory/BufferArena.h`
 struct ManagedBuffer {
     bool registered;
     shared_ptr<TensorBase> owned_tensor;    // Arena-owned
-    ITensor* external_tensor;               // Externally owned (weights, BAR)
+    ITensor* external_tensor;               // Externally owned (weights)
     size_t rows, cols;
     const char* dtype;
     DeviceId home_device;
@@ -953,7 +952,7 @@ enum class CoherenceOp : uint8_t {
 };
 
 enum class MemoryResidency : uint8_t {
-    STANDARD, BAR_BACKED, MAPPED
+    STANDARD, MAPPED
 };
 ```
 
@@ -985,11 +984,10 @@ class TransferEngine {
 | `HOST_TO_DEVICE` | Standard H2D via `IBackend::hostToDevice()` |
 | `DEVICE_TO_HOST` | Standard D2H via `IBackend::deviceToHost()` |
 | `DEVICE_TO_DEVICE_SAME_BACKEND` | P2P within same vendor (CUDA↔CUDA or ROCm↔ROCm) |
-| `BAR_HOST_BOUNCE` | BAR-backed cross-vendor: staging D2H → memcpy → H2D |
-| `HOST_STAGED` | Generic cross-vendor: D2H → memcpy → H2D (no BAR) |
+| `HOST_STAGED` | Cross-vendor: D2H → memcpy → H2D via host staging |
 | `MAPPED_NOOP` | Zero-copy mapped memory — no transfer needed |
 
-**MemoryDescriptor** — snapshot of where a tensor's data physically lives (host_ptr, device_ptr, BAR pointers, mapped pointers, residency). Created via `MemoryDescriptor::fromTensor()` to decouple transfer logic from `TensorBase` internals.
+**MemoryDescriptor** — snapshot of where a tensor's data physically lives (host_ptr, device_ptr, mapped pointers, residency). Created via `MemoryDescriptor::fromTensor()` to decouple transfer logic from `TensorBase` internals.
 
 #### Legacy Per-Tensor Methods (TensorBase)
 
@@ -1117,8 +1115,7 @@ Location: `src/v2/collective/BackendRouter.h`
 |--------------|---------|---------|
 | All CUDA | NCCL | ~5μs |
 | All ROCm | RCCL | ~5μs |
-| Mixed CUDA+ROCm (same node) | PCIeBAR | ~25μs |
-| Mixed (fallback) | HOST | ~200μs |
+| Mixed CUDA+ROCm (same node) | HOST | host-staged |
 | Cross-node | MPI | ~10-50μs |
 | CPU only | MPI | ~1-5μs |
 
@@ -1404,7 +1401,6 @@ class BackendManager {
 | ILocalTPContext | `src/v2/collective/ILocalTPContext.h` |
 | LocalTPContext | `src/v2/collective/LocalTPContext.h` |
 | ICollectiveBackend | `src/v2/collective/ICollectiveBackend.h` |
-| PCIeBARBackend | `src/v2/collective/backends/PCIeBARBackend.h` |
 | **Coherence (Execution)** | |
 | StageCoherence | `src/v2/execution/local_execution/coherence/StageCoherence.h` |
 | GpuCoherence | `src/v2/execution/local_execution/coherence/GpuCoherence.h` |
@@ -1448,8 +1444,7 @@ class BackendManager {
 10. **DeviceId not int** — Use typed `DeviceId` for device identification
 11. **Collective via BackendRouter** — Let the router select optimal backend
 12. **Implement getDumpInfo()** — All stages must support introspection
-13. **Use PCIeBAR for heterogeneous TP** — 8× faster than host staging
-14. **Use OMP_WORKSHARE_REGION** — Nested-safe OpenMP parallelism in all kernels
+13. **Use OMP_WORKSHARE_REGION** — Nested-safe OpenMP parallelism in all kernels
 
 ### 14.3 Execution Path Summary
 
@@ -1509,7 +1504,7 @@ src/v2/
 ├── tensors/                         # ITensor, TensorBase, all typed tensors, KV cache,
 │                                    #   CoherenceState, CoherenceAuditLog
 ├── backends/                        # IBackend, BackendManager, DeviceRegistry, DeviceId
-├── collective/                      # ILocalTPContext, BackendRouter, PCIeBAR, NCCL, RCCL
+├── collective/                      # ILocalTPContext, BackendRouter, HOST, NCCL, RCCL
 ├── loaders/                         # GGUF loading, WeightManager
 ├── app/                             # Application modes (ChatCompletionHandler, etc.)
 └── utils/                           # MPIContext, MPITopology, Tokenizer, Sampler, logging

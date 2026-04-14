@@ -203,7 +203,7 @@ namespace llaminar2
          * @brief Get backend that supports copy between two devices
          *
          * Selects the optimal backend for direct GPU-to-GPU copy:
-         * - Cross-vendor (CUDA↔ROCm): PCIeBAR backend
+         * - Cross-vendor (CUDA↔ROCm): HOST backend (host-staged)
          * - Same CUDA vendor: NCCL backend
          * - Same ROCm vendor: RCCL backend
          * - CPU-to-CPU: Host backend
@@ -299,7 +299,7 @@ namespace llaminar2
          *
          * Domain-aware routing logic:
          * - GPU_INTRA_RANK domains:
-         *   - Heterogeneous GPUs (CUDA+ROCm) → PCIeBAR backend (~25μs latency)
+         *   - Heterogeneous GPUs (CUDA+ROCm) → HOST backend (host-staged)
          *   - All CUDA → NCCL backend
          *   - All ROCm → RCCL backend
          * - CPU_CROSS_RANK domains → UPI backend (MPI over UPI ~50 GB/s)
@@ -339,8 +339,8 @@ namespace llaminar2
         std::unique_ptr<ICollectiveBackend> mpi_backend_;
         std::unique_ptr<ICollectiveBackend> nccl_backend_;
         std::unique_ptr<ICollectiveBackend> rccl_backend_;
-        std::unique_ptr<ICollectiveBackend> pcie_bar_backend_;
         std::unique_ptr<ICollectiveBackend> host_backend_;
+        std::unique_ptr<ICollectiveBackend> heterogeneous_backend_;
 
         // Group name → initialized backend mapping
         std::unordered_map<std::string, ICollectiveBackend *> group_backend_cache_;

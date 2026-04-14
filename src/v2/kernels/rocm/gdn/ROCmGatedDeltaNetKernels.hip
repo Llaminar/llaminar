@@ -180,10 +180,11 @@ __global__ void rocm_gdn_chunk_forward_kernel(
     const int block_size = blockDim.x;
 
     // Row-split parallelism: ROW_SPLIT threads collaborate on each
-    // column, splitting the d_k rows between them. With ROW_SPLIT=8 and
-    // 512 threads/block: 8 wavefronts/block — optimal tradeoff between
-    // latency hiding and reduction overhead on gfx906.
-    constexpr int ROW_SPLIT = 8;
+    // column, splitting the d_k rows between them. With ROW_SPLIT=4 and
+    // 256 threads/block: 4 wavefronts/block — matches CUDA's reduction
+    // structure to minimize per-step rounding error that compounds through
+    // the GDN recurrence (ROW_SPLIT=8 caused 10-40x worse parity vs CUDA).
+    constexpr int ROW_SPLIT = 4;
     const int cols_per_block = block_size / ROW_SPLIT;
     const int split_id = tid / cols_per_block;   // 0..ROW_SPLIT-1
     const int col_in_block = tid % cols_per_block;
@@ -726,14 +727,15 @@ bool rocmGDN_chunk_forward(
 {
     llaminar2::HipDeviceGuard::setDevice(device_idx);
 
-    // Row-split: 512 threads per block, 8 threads per column = 64 cols/block.
-    // 8 wavefronts/block — optimal for gfx906 latency hiding.
-    int col_threads = 512;
-    int cols_per_block = col_threads / 8; // 64 columns per block
+    // Row-split: 256 threads per block, 4 threads per column = 64 cols/block.
+    // 4 wavefronts/block — matches CUDA's ROW_SPLIT=4 to reduce per-step
+    // reduction error that compounds through the GDN recurrence.
+    int col_threads = 256;
+    int cols_per_block = col_threads / 4; // 64 columns per block
     if (d_v <= 64)
     {
-        col_threads = 256;
-        cols_per_block = col_threads / 8; // 32 columns per block
+        col_threads = 128;
+        cols_per_block = col_threads / 4; // 32 columns per block
     }
     int num_col_blocks = (d_v + cols_per_block - 1) / cols_per_block;
     // smem: q_local[d_k] + k_local[d_k] + warp_sums[16] + reduce_kv[col_threads] + reduce_out[col_threads]

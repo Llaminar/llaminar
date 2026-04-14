@@ -6,8 +6,8 @@
  * two adjacent pipeline-parallel stages. The mechanism is derived automatically
  * from the subtree topology:
  *
- * - **LOCAL_PP**: Same MPI rank, different devices. Uses NCCL/RCCL/PCIeBAR
- *   or host-staged copy depending on the local backend.
+ * - **LOCAL_PP**: Same MPI rank, different devices. Uses NCCL/RCCL/HOST
+ *   backend depending on device types.
  *
  * - **MPI_INTRAHOST**: Different MPI ranks on the same machine. Uses shared
  *   memory or UPI fabric for fast intra-node transfer.
@@ -43,7 +43,7 @@ namespace llaminar2
          */
         enum class Mechanism
         {
-            LOCAL_PP,      ///< Same MPI rank, different devices (NCCL/PCIeBAR/host-staged)
+            LOCAL_PP,      ///< Same MPI rank, different devices (NCCL/RCCL/HOST)
             MPI_INTRAHOST, ///< Same machine, different MPI ranks (UPI/shared memory)
             MPI_INTERHOST  ///< Different machines (InfiniBand/Ethernet)
         };

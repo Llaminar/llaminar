@@ -3,14 +3,13 @@
  * @brief Buffer registration interface for collective backends
  *
  * Enables collective backends to track buffer locations for cross-device
- * communication. This is essential for backends like PCIeBARBackend that
- * need to know where device buffers are located to perform direct
- * CUDA↔ROCm allreduce operations via PCIe BAR mapping.
+ * communication. Backends that need to know where device buffers are
+ * located can implement this interface.
  *
  * Usage Flow:
  * 1. Stage allocates device buffers during graph construction
  * 2. Stage registers buffers with the collective backend using a unique collective_id
- * 3. Backend stores buffer metadata (device, ptr, size, BAR offset)
+ * 3. Backend stores buffer metadata (device, ptr, size)
  * 4. During execution, backend uses allreduceRegistered() with the collective_id
  * 5. Backend looks up buffer locations and performs the operation
  * 6. At shutdown, buffers are automatically unregistered
@@ -40,7 +39,7 @@ namespace llaminar2
         DeviceId device;   ///< Device where the buffer resides
         void *ptr;         ///< Device pointer to the buffer
         size_t size;       ///< Size of the buffer in bytes
-        size_t bar_offset; ///< Offset within BAR region (for PCIe BAR mapping)
+        size_t bar_offset; ///< Offset within BAR region (legacy, unused)
         bool is_primary;   ///< True if this is the primary device in a collective
 
         /**
@@ -57,7 +56,7 @@ namespace llaminar2
          * @param device Device where buffer resides
          * @param ptr Device pointer to buffer
          * @param size Buffer size in bytes
-         * @param bar_offset Offset within BAR region (default 0)
+         * @param bar_offset Offset within BAR region (legacy, default 0)
          * @param is_primary True if primary device (default false)
          */
         RegisteredBuffer(DeviceId device, void *ptr, size_t size,
@@ -79,7 +78,7 @@ namespace llaminar2
     /**
      * @brief Interface for buffer registration in collective backends
      *
-     * Collective backends that need to track buffer locations (like PCIeBARBackend)
+     * Collective backends that need to track buffer locations
      * implement this interface. Backends that don't need registration (like MPIBackend)
      * can use the default implementations that return success/empty.
      *
@@ -138,7 +137,7 @@ namespace llaminar2
         /**
          * @brief Check if this backend requires buffer registration
          *
-         * Backends that need to track buffer locations (like PCIeBARBackend)
+         * Backends that need to track buffer locations
          * return true. Backends that work with buffer pointers passed directly
          * to allreduce() (like MPIBackend) return false.
          *

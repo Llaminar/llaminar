@@ -7,7 +7,7 @@
  *
  * Key differences from LOCAL TP:
  * - Participants are MPI ranks (not local devices)
- * - Communication uses MPI collectives (not NCCL/RCCL/PCIeBAR)
+ * - Communication uses MPI collectives (not NCCL/RCCL)
  * - Has an MPI communicator for the domain
  * - Supports point-to-point operations (send/recv)
  *

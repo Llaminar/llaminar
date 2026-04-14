@@ -367,18 +367,21 @@ namespace llaminar2
             return nullptr;
         }
 
-        // Get device pointers via get_kv_for_attention
-        const void *d_k = nullptr;
-        const void *d_v = nullptr;
+        // Get device pointers via non-virtual get_kv_typed to avoid double-mapping
+        // when called from a derived class (e.g. CUDAHybridRingKVCache) that overrides
+        // the virtual get_kv_for_attention with its own layer remapping.
+        const DataT *d_k_typed = nullptr;
+        const DataT *d_v_typed = nullptr;
         int kv_len = 0;
 
-        if (!get_kv_for_attention(layer, seq_idx, &d_k, &d_v, &kv_len, 0))
+        if (!get_kv_typed(layer, seq_idx, &d_k_typed, &d_v_typed, &kv_len, 0))
         {
-            LOG_WARN("[CUDARingKVCache::get_k] get_kv_for_attention failed for layer="
+            LOG_WARN("[CUDARingKVCache::get_k] get_kv_typed failed for layer="
                      << layer << " seq_idx=" << seq_idx);
             return nullptr;
         }
 
+        const void *d_k = d_k_typed;
         if (!d_k || kv_len == 0)
         {
             // Empty cache - valid state, return nullptr
@@ -442,18 +445,21 @@ namespace llaminar2
             return nullptr;
         }
 
-        // Get device pointers via get_kv_for_attention
-        const void *d_k = nullptr;
-        const void *d_v = nullptr;
+        // Get device pointers via non-virtual get_kv_typed to avoid double-mapping
+        // when called from a derived class (e.g. CUDAHybridRingKVCache) that overrides
+        // the virtual get_kv_for_attention with its own layer remapping.
+        const DataT *d_k_typed = nullptr;
+        const DataT *d_v_typed = nullptr;
         int kv_len = 0;
 
-        if (!get_kv_for_attention(layer, seq_idx, &d_k, &d_v, &kv_len, 0))
+        if (!get_kv_typed(layer, seq_idx, &d_k_typed, &d_v_typed, &kv_len, 0))
         {
-            LOG_WARN("[CUDARingKVCache::get_v] get_kv_for_attention failed for layer="
+            LOG_WARN("[CUDARingKVCache::get_v] get_kv_typed failed for layer="
                      << layer << " seq_idx=" << seq_idx);
             return nullptr;
         }
 
+        const void *d_v = d_v_typed;
         if (!d_v || kv_len == 0)
         {
             // Empty cache - valid state, return nullptr
@@ -520,13 +526,17 @@ namespace llaminar2
         if (layer < 0 || layer >= n_layers_ || seq_idx < 0 || seq_idx >= batch_size_)
             return false;
 
-        // Single call gets both K and V device pointers
-        const void *d_k = nullptr;
-        const void *d_v = nullptr;
+        // Single call gets both K and V device pointers (non-virtual to avoid
+        // double-mapping when called from derived class with layer remapping)
+        const DataT *d_k_typed = nullptr;
+        const DataT *d_v_typed = nullptr;
         int kv_len = 0;
 
-        if (!get_kv_for_attention(layer, seq_idx, &d_k, &d_v, &kv_len, 0))
+        if (!get_kv_typed(layer, seq_idx, &d_k_typed, &d_v_typed, &kv_len, 0))
             return false;
+
+        const void *d_k = d_k_typed;
+        const void *d_v = d_v_typed;
 
         if (kv_len == 0 || !d_k || !d_v)
         {
@@ -635,13 +645,13 @@ namespace llaminar2
         __half *d_K, int count,
         int n_kv_heads, int head_dim,
         float rope_theta, int position_start,
-        cudaStream_t stream);
+        cudaStream_t stream, int rope_dim = 0);
 
     extern "C" bool cuda_rope_apply_fp32(
         float *d_K, int count,
         int n_kv_heads, int head_dim,
         float rope_theta, int position_start,
-        cudaStream_t stream);
+        cudaStream_t stream, int rope_dim = 0);
 
     template <ActivationPrecision Precision>
     void CUDARingKVCache<Precision>::ensureRoPEShadow(int layer, int seq_idx) const
@@ -703,11 +713,14 @@ namespace llaminar2
             return true;
         }
 
-        // If no RoPE requested, fall back to default (raw cache tensors)
+        // If no RoPE requested, fall back to raw cache tensors.
+        // Use qualified call to avoid virtual dispatch — CUDAHybridRingKVCache
+        // overrides get_kv() with layer remapping, but the layer index passed here
+        // has already been remapped by the hybrid override of get_kv_converted().
         const bool want_rope = (rope && rope->rope_theta > 0.0f);
         if (!want_rope)
         {
-            return IKVCache::get_kv_converted(layer, seq_idx, target, out_k, out_v, out_kv_len, rope);
+            return CUDARingKVCache::get_kv(layer, seq_idx, out_k, out_v, out_kv_len);
         }
 
         cudaSetDevice(device_id_);
@@ -730,29 +743,33 @@ namespace llaminar2
             {
                 // Full rebuild: linearize all K/V to shadow + apply RoPE to all K
                 int kv_len = 0;
-                if (!linearize_to(layer, seq_idx, shadow.d_K, shadow.d_V, &kv_len, stream))
+                // Qualified call avoids virtual dispatch — prevents CUDAHybridRingKVCache
+                // from double-remapping the already-remapped layer index.
+                if (!CUDARingKVCache::linearize_to(layer, seq_idx, shadow.d_K, shadow.d_V, &kv_len, stream))
                     return false;
 
                 cuda_rope_apply_fp16(shadow.d_K, kv_len, n_kv_heads_, head_dim_,
-                                     rope->rope_theta, rope->position_start, stream);
+                                     rope->rope_theta, rope->position_start, stream,
+                                     rope->rope_dim);
 
                 shadow.converted_count = kv_len;
             }
             else if (new_tokens > 0)
             {
-                // Incremental: linearize all (overwrites shadow), then RoPE only new tokens.
-                // The first converted_count tokens in the linearized output match what's
-                // already in the shadow (same ring data, same order), so RoPE only needs
-                // to be applied to the new tail portion.
+                // Incremental: linearize all data from ring buffer into shadow.
+                // IMPORTANT: linearize_to overwrites the ENTIRE shadow with fresh
+                // (non-RoPE'd) data from the ring buffer. Unlike FP32/Q8_1/BF16
+                // paths which use a separate scratch buffer and only copy new tokens
+                // to the shadow, the FP16 path writes directly to the shadow.
+                // Therefore we must re-apply RoPE to ALL tokens, not just the new ones.
                 int kv_len = 0;
-                if (!linearize_to(layer, seq_idx, shadow.d_K, shadow.d_V, &kv_len, stream))
+                if (!CUDARingKVCache::linearize_to(layer, seq_idx, shadow.d_K, shadow.d_V, &kv_len, stream))
                     return false;
 
-                // Apply RoPE only to the new tokens at the end of the shadow K buffer
-                __half *new_k_start = shadow.d_K + static_cast<size_t>(shadow.converted_count) * kv_dim_;
-                cuda_rope_apply_fp16(new_k_start, new_tokens, n_kv_heads_, head_dim_,
-                                     rope->rope_theta,
-                                     rope->position_start + shadow.converted_count, stream);
+                // Apply RoPE to all tokens (linearize overwrote previously RoPE'd data)
+                cuda_rope_apply_fp16(shadow.d_K, kv_len, n_kv_heads_, head_dim_,
+                                     rope->rope_theta, rope->position_start, stream,
+                                     rope->rope_dim);
 
                 shadow.converted_count = kv_len;
             }
@@ -771,13 +788,14 @@ namespace llaminar2
             auto *d_temp_v = static_cast<float *>(conv_scratch_v_);
 
             int kv_len = 0;
-            if (!linearize_to(layer, seq_idx, d_temp_k, d_temp_v, &kv_len, stream))
+            if (!CUDARingKVCache::linearize_to(layer, seq_idx, d_temp_k, d_temp_v, &kv_len, stream))
                 return false;
 
             if (need_full_rebuild)
             {
                 cuda_rope_apply_fp32(d_temp_k, kv_len, n_kv_heads_, head_dim_,
-                                     rope->rope_theta, rope->position_start, stream);
+                                     rope->rope_theta, rope->position_start, stream,
+                                     rope->rope_dim);
 
                 cuda_convert_tensor_to_fp16(d_temp_k, TensorType::FP32,
                                             reinterpret_cast<uint16_t *>(shadow.d_K),
@@ -794,7 +812,8 @@ namespace llaminar2
                 float *new_v_start = d_temp_v + static_cast<size_t>(old_count) * kv_dim_;
 
                 cuda_rope_apply_fp32(new_k_start, new_tokens, n_kv_heads_, head_dim_,
-                                     rope->rope_theta, rope->position_start + old_count, stream);
+                                     rope->rope_theta, rope->position_start + old_count, stream,
+                                     rope->rope_dim);
 
                 __half *shadow_k_new = reinterpret_cast<__half *>(shadow.d_K) + static_cast<size_t>(old_count) * kv_dim_;
                 __half *shadow_v_new = reinterpret_cast<__half *>(shadow.d_V) + static_cast<size_t>(old_count) * kv_dim_;
@@ -822,7 +841,7 @@ namespace llaminar2
             auto *d_temp_v = static_cast<Q8_1Block *>(conv_scratch_v_);
 
             int kv_len = 0;
-            if (!linearize_to(layer, seq_idx, d_temp_k, d_temp_v, &kv_len, stream))
+            if (!CUDARingKVCache::linearize_to(layer, seq_idx, d_temp_k, d_temp_v, &kv_len, stream))
                 return false;
 
             if (need_full_rebuild)
@@ -835,7 +854,8 @@ namespace llaminar2
                                             kv_len * kv_dim_, stream);
 
                 cuda_rope_apply_fp16(shadow.d_K, kv_len, n_kv_heads_, head_dim_,
-                                     rope->rope_theta, rope->position_start, stream);
+                                     rope->rope_theta, rope->position_start, stream,
+                                     rope->rope_dim);
             }
             else if (new_tokens > 0)
             {
@@ -856,7 +876,8 @@ namespace llaminar2
 
                 cuda_rope_apply_fp16(shadow_k_new, new_tokens, n_kv_heads_, head_dim_,
                                      rope->rope_theta,
-                                     rope->position_start + old_count, stream);
+                                     rope->position_start + old_count, stream,
+                                     rope->rope_dim);
             }
 
             shadow.converted_count = kv_len;
@@ -873,7 +894,7 @@ namespace llaminar2
             auto *d_temp_v = static_cast<__nv_bfloat16 *>(conv_scratch_v_);
 
             int kv_len = 0;
-            if (!linearize_to(layer, seq_idx, d_temp_k, d_temp_v, &kv_len, stream))
+            if (!CUDARingKVCache::linearize_to(layer, seq_idx, d_temp_k, d_temp_v, &kv_len, stream))
                 return false;
 
             if (need_full_rebuild)
@@ -886,7 +907,8 @@ namespace llaminar2
                                             kv_len * kv_dim_, stream);
 
                 cuda_rope_apply_fp16(shadow.d_K, kv_len, n_kv_heads_, head_dim_,
-                                     rope->rope_theta, rope->position_start, stream);
+                                     rope->rope_theta, rope->position_start, stream,
+                                     rope->rope_dim);
             }
             else if (new_tokens > 0)
             {
@@ -906,7 +928,8 @@ namespace llaminar2
 
                 cuda_rope_apply_fp16(shadow_k_new, new_tokens, n_kv_heads_, head_dim_,
                                      rope->rope_theta,
-                                     rope->position_start + old_count, stream);
+                                     rope->position_start + old_count, stream,
+                                     rope->rope_dim);
             }
 
             shadow.converted_count = kv_len;

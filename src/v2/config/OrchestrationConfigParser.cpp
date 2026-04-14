@@ -1357,7 +1357,7 @@ Named Domains (advanced):
   --pp-stage <spec>      Define PP stage: "stage_id=domain:first_layer-last_layer"
 
 Collective Backend:
-  -b, --backend <type>   Default collective: auto, nccl, rccl, pcie_bar, upi, mpi, host
+  -b, --backend <type>   Default collective: auto, nccl, rccl, upi, mpi, host
 
 Introspection:
   --dry-run              Show configuration without executing

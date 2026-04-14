@@ -326,19 +326,17 @@ namespace llaminar2
                     {
                         errors.push_back(
                             path + ": NCCL backend specified but TP domain contains ROCm devices; "
-                                   "use PCIE_BAR or HETEROGENEOUS for mixed CUDA+ROCm TP");
+                                   "use HETEROGENEOUS or HOST for mixed CUDA+ROCm TP");
                     }
                     if (node.backend == CollectiveBackendType::RCCL && has_cuda)
                     {
                         errors.push_back(
                             path + ": RCCL backend specified but TP domain contains CUDA devices; "
-                                   "use PCIE_BAR or HETEROGENEOUS for mixed CUDA+ROCm TP");
+                                   "use HETEROGENEOUS or HOST for mixed CUDA+ROCm TP");
                     }
-                    if ((node.backend == CollectiveBackendType::PCIE_BAR ||
-                         node.backend == CollectiveBackendType::HETEROGENEOUS) &&
-                        !is_mixed)
+                    if (node.backend == CollectiveBackendType::HETEROGENEOUS && !is_mixed)
                     {
-                        // Warning-level: PCIE_BAR/HETEROGENEOUS without mixed vendors
+                        // HETEROGENEOUS without mixed vendors
                         // is valid but suboptimal — use NCCL or RCCL for same-vendor
                         // We don't error here, but could log a recommendation.
                     }

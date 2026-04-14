@@ -18,7 +18,6 @@
 #include "backends/RCCLBackend.h"
 #endif
 #if defined(HAVE_CUDA) && defined(HAVE_ROCM)
-#include "backends/PCIeBARBackend.h"
 #endif
 #include "../utils/Logger.h"
 
@@ -266,11 +265,6 @@ namespace llaminar2
                 selection.reason = "All ROCm devices - using RCCL";
             }
         }
-        else if (group.isHeterogeneous() && group.cuda_count > 0 && group.rocm_count > 0 &&
-                 selection.type == CollectiveBackendType::PCIE_BAR)
-        {
-            selection.reason = "CUDA + ROCm mix - using direct PCIe BAR P2P (~2.65 GB/s)";
-        }
         else if (group.isGlobal() && selection.type == CollectiveBackendType::MPI)
         {
             selection.reason = "Global scope (heterogeneous or CPU-only) - using MPI";
@@ -314,37 +308,12 @@ namespace llaminar2
             return nullptr;
         }
 
-        // Cross-vendor (CUDA↔ROCm): use PCIeBAR
+        // Cross-vendor (CUDA↔ROCm): use HOST backend (host-staged copy)
         if ((src.is_cuda() && dst.is_rocm()) || (src.is_rocm() && dst.is_cuda()))
         {
-            auto *backend = getOrCreateBackend(CollectiveBackendType::PCIE_BAR);
-            if (backend)
-            {
-                // PCIeBAR needs to be initialized before supportsCopy() returns true.
-                // Create a DeviceGroup with the src/dst devices.
-                if (!backend->isInitialized())
-                {
-                    DeviceGroupBuilder builder;
-                    builder.setName("copy_" + src.toString() + "_to_" + dst.toString())
-                        .setScope(CollectiveScope::LOCAL)
-                        .addDevice(src)
-                        .addDevice(dst);
-                    DeviceGroup group = builder.build();
-
-                    if (!backend->initialize(group))
-                    {
-                        LOG_ERROR("[getBackendForCopy] Failed to initialize PCIeBAR backend for "
-                                  << src.toString() << " -> " << dst.toString());
-                        return nullptr;
-                    }
-                }
-
-                if (backend->supportsCopy(src, dst))
-                {
-                    return backend;
-                }
-            }
-            // No fallback for cross-vendor - fail fast
+            auto *backend = getOrCreateBackend(CollectiveBackendType::HOST);
+            if (backend && backend->supportsCopy(src, dst))
+                return backend;
             return nullptr;
         }
 
@@ -455,10 +424,6 @@ namespace llaminar2
             result.push_back(CollectiveBackendType::NCCL);
         if (factory_->isAvailable(CollectiveBackendType::RCCL))
             result.push_back(CollectiveBackendType::RCCL);
-#if defined(HAVE_CUDA) && defined(HAVE_ROCM)
-        if (factory_->isAvailable(CollectiveBackendType::PCIE_BAR))
-            result.push_back(CollectiveBackendType::PCIE_BAR);
-#endif
         if (factory_->isAvailable(CollectiveBackendType::HOST))
             result.push_back(CollectiveBackendType::HOST);
         return result;
@@ -483,13 +448,6 @@ namespace llaminar2
             rccl_backend_->shutdown();
             rccl_backend_.reset();
         }
-#if defined(HAVE_CUDA) && defined(HAVE_ROCM)
-        if (pcie_bar_backend_)
-        {
-            pcie_bar_backend_->shutdown();
-            pcie_bar_backend_.reset();
-        }
-#endif
         if (host_backend_)
         {
             host_backend_->shutdown();
@@ -563,11 +521,6 @@ namespace llaminar2
         result += "  MPI backend: " + std::string(mpi_backend_ ? "created" : "not created") + "\n";
         result += "  NCCL backend: " + std::string(nccl_backend_ ? "created" : "not created") + "\n";
         result += "  RCCL backend: " + std::string(rccl_backend_ ? "created" : "not created") + "\n";
-#if defined(HAVE_CUDA) && defined(HAVE_ROCM)
-        result += "  PCIe_BAR backend: " + std::string(pcie_bar_backend_ ? "created" : "not created") + "\n";
-#else
-        result += "  PCIe_BAR backend: not available (requires HAVE_CUDA && HAVE_ROCM)\n";
-#endif
         result += "  Host backend: " + std::string(host_backend_ ? "created" : "not created") + "\n";
         result += "  UPI backend: " + std::string(upi_backend_ ? "registered" : "not registered") + "\n";
         result += "  Cached groups: " + std::to_string(group_backend_cache_.size()) + "\n";
@@ -602,18 +555,10 @@ namespace llaminar2
             // GPU intra-rank: check device composition
             if (hasHeterogeneousGPUs(domain->devices))
             {
-                // CUDA + ROCm mix: prefer PCIe BAR for direct P2P (~25μs latency)
-#if defined(HAVE_CUDA) && defined(HAVE_ROCM)
-                if (factory_->isAvailable(CollectiveBackendType::PCIE_BAR))
-                {
-                    LOG_DEBUG("selectBackendForDomain: GPU domain '" << domain->name
-                                                                     << "' has heterogeneous GPUs, using PCIe BAR backend");
-                    return getOrCreateBackend(CollectiveBackendType::PCIE_BAR);
-                }
-#endif
+                // CUDA + ROCm mix: use HETEROGENEOUS backend for cross-vendor collective
                 LOG_DEBUG("selectBackendForDomain: GPU domain '" << domain->name
-                                                                 << "' has heterogeneous GPUs but PCIe BAR unavailable, falling back to MPI");
-                return getOrCreateBackend(CollectiveBackendType::MPI);
+                                                                 << "' has heterogeneous GPUs, using HETEROGENEOUS backend");
+                return getOrCreateBackend(CollectiveBackendType::HETEROGENEOUS);
             }
             else if (allCUDA(domain->devices))
             {
@@ -748,24 +693,19 @@ namespace llaminar2
             }
             return rccl_backend_.get();
 
-        case CollectiveBackendType::PCIE_BAR:
-#if defined(HAVE_CUDA) && defined(HAVE_ROCM)
-            if (!pcie_bar_backend_ && factory_->isAvailable(type))
-            {
-                pcie_bar_backend_ = factory_->createBackend(type, mpi_ctx_);
-            }
-            return pcie_bar_backend_.get();
-#else
-            LOG_WARN("PCIE_BAR requested but HAVE_CUDA && HAVE_ROCM not defined");
-            return nullptr;
-#endif
-
         case CollectiveBackendType::HOST:
             if (!host_backend_ && factory_->isAvailable(type))
             {
                 host_backend_ = factory_->createBackend(type, mpi_ctx_);
             }
             return host_backend_.get();
+
+        case CollectiveBackendType::HETEROGENEOUS:
+            if (!heterogeneous_backend_ && factory_->isAvailable(type))
+            {
+                heterogeneous_backend_ = factory_->createBackend(type, mpi_ctx_);
+            }
+            return heterogeneous_backend_.get();
 
         case CollectiveBackendType::AUTO:
             // AUTO should be resolved before calling this
@@ -800,27 +740,12 @@ namespace llaminar2
         }
 
         // For GLOBAL scope (cross-rank MPI), heterogeneous groups MUST use MPI.
-        // PCIeBAR is only valid for LOCAL scope (intra-rank, same process)
-        // because it requires both CUDA and ROCm devices to be in the same process.
         if (group.isGlobal())
         {
             return CollectiveBackendType::MPI;
         }
 
-#if defined(HAVE_CUDA) && defined(HAVE_ROCM)
-        // LOCAL scope with CUDA + ROCm mix: prefer PCIe BAR if available (direct P2P)
-        // This is for intra-rank heterogeneous GPU communication where both
-        // CUDA and ROCm devices are accessible from the same MPI rank.
-        if (group.isHeterogeneous() && group.cuda_count > 0 && group.rocm_count > 0)
-        {
-            if (factory_->isAvailable(CollectiveBackendType::PCIE_BAR))
-            {
-                return CollectiveBackendType::PCIE_BAR;
-            }
-        }
-#endif
-
-        // CPU-only or heterogeneous without P2P: use Host backend
+        // Heterogeneous GPU mix or CPU-only: use Host backend
         return CollectiveBackendType::HOST;
     }
 
@@ -862,14 +787,6 @@ namespace llaminar2
             return nullptr;
 #endif
 
-        case CollectiveBackendType::PCIE_BAR:
-#if defined(HAVE_CUDA) && defined(HAVE_ROCM)
-            return std::make_unique<PCIeBARBackend>();
-#else
-            LOG_INFO("DefaultBackendFactory::createBackend - PCIE_BAR requires HAVE_CUDA && HAVE_ROCM");
-            return nullptr;
-#endif
-
         case CollectiveBackendType::AUTO:
             // AUTO should be resolved before calling createBackend
             LOG_ERROR("DefaultBackendFactory::createBackend - AUTO type should be resolved first");
@@ -899,17 +816,6 @@ namespace llaminar2
         case CollectiveBackendType::RCCL:
 #ifdef HAVE_RCCL
             return true;
-#else
-            return false;
-#endif
-
-        case CollectiveBackendType::PCIE_BAR:
-#if defined(HAVE_CUDA) && defined(HAVE_ROCM)
-        {
-            // Check runtime availability (BAR P2P requires both CUDA and ROCm GPUs + permissions)
-            auto caps = DirectP2PEngine::probeCapabilities();
-            return caps.canDoPCIeBarP2P();
-        }
 #else
             return false;
 #endif

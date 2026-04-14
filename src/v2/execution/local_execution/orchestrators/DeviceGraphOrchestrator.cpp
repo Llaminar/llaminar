@@ -19,7 +19,6 @@
 #include "../../../collective/ILocalPPContext.h" // createLocalPPContext(), HierarchicalPPConfig
 #include "../../../collective/PPStage.h"         // PPStage variant type
 #include "../../../collective/BackendRouter.h"   // GlobalBackendRouter for PP copy
-#include "../../../backends/p2p/DirectP2P.h"     // DirectP2PEngine for BAR-backed allocation
 #include "../../../backends/GPUDeviceContextPool.h"
 #include "../../../utils/Logger.h"
 #include "../../../utils/DebugEnv.h"
@@ -28,6 +27,7 @@
 #include "../../../tensors/TensorClasses.h" // For FP32Tensor::createMapped()
 #include "../../../kernels/cpu/CPUKVCache.h"
 #include "../../../kernels/KernelFactory.h"
+#include "../../../kernels/HybridKVCacheConfig.h"
 #include "../../../backends/BackendManager.h"
 #include "../../../interfaces/IWorkspaceConsumer.h"
 #include <chrono>
@@ -142,7 +142,7 @@ namespace llaminar2
             executor_.setMPIRank(injected_topology_->rank());
         }
 
-        // Wire CollectiveContext to executor for GPU-native collectives (RCCL/NCCL/PCIeBAR)
+        // Wire CollectiveContext to executor for GPU-native collectives (RCCL/NCCL/HOST)
         if (injected_collective_ctx_)
         {
             executor_.setCollectiveContext(injected_collective_ctx_.get());
@@ -302,52 +302,6 @@ namespace llaminar2
         {
             arena_config.use_mapped_memory = true;
             LOG_INFO("[DeviceGraphOrchestrator] Enabling mapped memory for GPU + snapshot mode (zero-copy host access)");
-        }
-
-        // Configure TP arena settings and BAR-backed allocation for LOCAL TP
-        if (config.tp_ctx && config.tp_ctx->degree() > 1)
-        {
-            arena_config.tp_degree = config.tp_ctx->degree();
-            arena_config.collective_backend = config.tp_ctx->backend();
-
-            // Arena needs ILocalTPContext* specifically for BAR-backed allocation
-            if (config.tp_ctx->isLocal())
-            {
-                auto *local_tp = static_cast<ILocalTPContext *>(config.tp_ctx);
-                arena_config.local_tp_ctx = local_tp;
-            }
-
-            if (config.tp_ctx->isLocal() &&
-                config.tp_ctx->backend() == CollectiveBackendType::PCIE_BAR)
-            {
-                auto *local_tp = static_cast<ILocalTPContext *>(config.tp_ctx);
-                const auto &devices = local_tp->devices();
-                for (const auto &device_addr : devices)
-                {
-                    DeviceId device_id = device_addr.toLocalDeviceId();
-                    if (device_id.is_cuda() && !arena_config.cuda_device.is_cuda())
-                    {
-                        arena_config.cuda_device = device_id;
-                    }
-                    else if (device_id.is_rocm() && !arena_config.rocm_device.is_rocm())
-                    {
-                        arena_config.rocm_device = device_id;
-                    }
-                }
-
-                if (arena_config.cuda_device.is_cuda() && arena_config.rocm_device.is_rocm())
-                {
-                    LOG_INFO("[DeviceGraphOrchestrator] Enabled BAR-backed allocation for LOCAL TP PCIeBAR: "
-                             << "CUDA=" << arena_config.cuda_device.toString()
-                             << ", ROCm=" << arena_config.rocm_device.toString());
-                }
-                else
-                {
-                    LOG_WARN("[DeviceGraphOrchestrator] PCIeBAR backend but missing CUDA/ROCm pair: "
-                             << "CUDA=" << (arena_config.cuda_device.is_cuda() ? arena_config.cuda_device.toString() : "(none)")
-                             << ", ROCm=" << (arena_config.rocm_device.is_rocm() ? arena_config.rocm_device.toString() : "(none)"));
-                }
-            }
         }
 
         // Create BufferArena with config
@@ -1338,21 +1292,6 @@ namespace llaminar2
                 owned_tensor_factory_->setUseMappedMemoryForGPU(true);
                 LOG_DEBUG("[DeviceGraphOrchestrator] Arena path: enabling mapped memory for GPU tensors");
             }
-
-            // Configure BAR-backed allocation for LOCAL TP with PCIeBAR backend
-            if (config.tp_ctx &&
-                config.tp_ctx->isLocal() &&
-                config.tp_ctx->degree() > 1 &&
-                config.tp_ctx->backend() == CollectiveBackendType::PCIE_BAR &&
-                device.is_rocm())
-            {
-                auto *local_tp = static_cast<ILocalTPContext *>(config.tp_ctx);
-                auto p2p_engine = local_tp->getDirectP2PEngine();
-                if (p2p_engine)
-                {
-                    owned_tensor_factory_->setDirectP2P(p2p_engine);
-                }
-            }
         }
 
         // =====================================================================
@@ -1451,40 +1390,6 @@ namespace llaminar2
             LOG_ERROR("[DeviceGraphOrchestrator] Missing required buffers from arena. "
                       "Ensure Qwen2Schema provides all layer_buffers and model_buffers.");
             return false;
-        }
-
-        // =====================================================================
-        // BAR-backed hidden state override for cross-vendor PP transfers
-        // =====================================================================
-        if (init_config.use_bar_backed_hidden && device.is_rocm())
-        {
-            auto p2p = DirectP2PEngine::getSharedInstance();
-            if (p2p && p2p->isPCIeBarActive() && tensor_factory_)
-            {
-                tensor_factory_->setDirectP2P(p2p);
-                DeviceId cuda_device_for_bar = DeviceId::cuda(0);
-                try
-                {
-                    auto bar_backed_hidden = tensor_factory_->createFP32BARBacked(
-                        state_.hidden->shape(), device, cuda_device_for_bar);
-                    if (bar_backed_hidden)
-                    {
-                        state_.hidden = std::move(bar_backed_hidden);
-                        LOG_INFO("[DeviceGraphOrchestrator] Arena path: overrode hidden with BAR-backed tensor "
-                                 << "for cross-vendor PP: ROCm=" << device.toString()
-                                 << ", CUDA=" << cuda_device_for_bar.toString());
-                    }
-                }
-                catch (const std::exception &e)
-                {
-                    LOG_WARN("[DeviceGraphOrchestrator] BAR-backed hidden override failed: " << e.what()
-                                                                                             << " - keeping arena-allocated hidden");
-                }
-            }
-            else if (!p2p || !p2p->isPCIeBarActive())
-            {
-                LOG_WARN("[DeviceGraphOrchestrator] use_bar_backed_hidden requested but PCIe BAR not active");
-            }
         }
 
         // =====================================================================
@@ -1693,11 +1598,46 @@ namespace llaminar2
         else
         {
             // Non-PP: Single KV cache for all layers
+            // (also used per-stage in PP mode; each stage has its own orchestrator)
             llaminar::v2::kernels::KVCacheConfig kv_config;
             kv_config.precision = kv_cache_prec;
             kv_config.device = device;
             kv_config.num_layers = n_layers;
             kv_config.batch_size = batch_size;
+            kv_config.max_seq_len = max_seq_len;
+            kv_config.n_kv_heads = n_kv_heads;
+            kv_config.head_dim = head_dim;
+            kv_config.layout_mode = kv_layout_mode;
+            kv_config.mpi_ctx = local_mpi_ctx.get();
+
+            // PP layer offset for hybrid KV cache: ensures GDN kernel init
+            // loop uses global layer indices (e.g., 12..23 for PP stage 2).
+            if (pp_stage_config_.has_value())
+            {
+                kv_config.first_layer_index = pp_stage_config_.value().first_layer;
+            }
+            kv_config.turboquant_ctx = config.turboquant_ctx;
+
+            // For hybrid models (e.g., Qwen 3.5 with GDN + FA layers),
+            // configure the hybrid KV cache with layer type mapping and GDN sizing
+            std::unique_ptr<HybridKVCacheConfig> hybrid_config_storage;
+            if (config.hasGDN() && !config.layer_types.empty())
+            {
+                hybrid_config_storage = std::make_unique<HybridKVCacheConfig>();
+                hybrid_config_storage->layer_types = config.layer_types;
+                hybrid_config_storage->gdn_conv_kernel_size = config.gdn.conv_kernel_size;
+                hybrid_config_storage->gdn_state_size = config.gdn.state_size;
+                hybrid_config_storage->gdn_inner_size = config.gdn.inner_size;
+                hybrid_config_storage->gdn_group_count = config.gdn.group_count;
+                hybrid_config_storage->gdn_time_step_rank = config.gdn.time_step_rank;
+                hybrid_config_storage->n_heads = config.n_heads;
+                hybrid_config_storage->local_n_heads = config.local_n_heads;
+                kv_config.hybrid_config = hybrid_config_storage.get();
+
+                LOG_DEBUG("[DeviceGraphOrchestrator] Hybrid KV cache config: "
+                          << hybrid_config_storage->countKVLayers() << " KV layers, "
+                          << (n_layers - hybrid_config_storage->countKVLayers()) << " GDN layers");
+            }
             kv_config.max_seq_len = max_seq_len;
             kv_config.n_kv_heads = n_kv_heads;
             kv_config.head_dim = head_dim;

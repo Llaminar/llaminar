@@ -1,6 +1,6 @@
 /**
  * @file Perf__CUDAVectorAddKernels.cpp
- * @brief Performance benchmarks for CUDA vector addition kernels used in PCIeBAR reductions
+ * @brief Performance benchmarks for CUDA vector addition kernels used in HOST backend reductions
  *
  * Measures throughput (GB/s) for in-place vector addition at realistic reduction sizes:
  *   - Small (896 elements): hidden_size after attention output projection
@@ -209,7 +209,7 @@ namespace
     };
 
     // ============================================================================
-    // FP32 In-place Addition Benchmarks (used by PCIeBAR reductions)
+    // FP32 In-place Addition Benchmarks (used by HOST backend reductions)
     // ============================================================================
 
     TEST_F(CUDAVectorAddPerf, FP32_InplaceAdd_RealisticSizes)
@@ -316,9 +316,9 @@ namespace
     {
         std::mt19937 rng(42);
 
-        // Simulate a typical PCIeBAR allreduce pattern:
-        // - ROCm writes to shared BAR buffer
-        // - CUDA reads and adds to local buffer
+        // Simulate a typical HOST backend allreduce pattern:
+        // - One GPU writes to host staging buffer
+        // - Other GPU reads and adds to local buffer
         // For 2-way TP, we do 1 reduction per collective
 
         // Typical allreduce sizes for Qwen2.5-0.5B:
@@ -334,7 +334,7 @@ namespace
         };
 
         std::cout << "\n┌─────────────────────────────────────────────────────────────────────────────────────┐" << std::endl;
-        std::cout << "│                    PCIeBAR ALLREDUCE REDUCTION SIMULATION                           │" << std::endl;
+        std::cout << "│                    HOST BACKEND ALLREDUCE REDUCTION SIMULATION                      │" << std::endl;
         std::cout << "│ Simulates the CUDA-side reduction kernel during 2-way TP allreduce                  │" << std::endl;
         std::cout << "└─────────────────────────────────────────────────────────────────────────────────────┘" << std::endl;
 

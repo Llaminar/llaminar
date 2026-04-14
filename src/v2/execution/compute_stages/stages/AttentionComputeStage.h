@@ -104,7 +104,8 @@ namespace llaminar2
             // When enabled, K in the KV cache is stored pre-RoPE, and position
             // embeddings are fused into the TQ4 dequant / applied in-place for FP32.
             bool apply_rope_to_k = false;
-            float rope_theta = 10000.0f; ///< RoPE frequency base (only used when apply_rope_to_k=true)
+            float rope_theta = 10000.0f;        ///< RoPE frequency base (only used when apply_rope_to_k=true)
+            float partial_rotary_factor = 1.0f; ///< Fraction of head dimensions to rotate (only used when apply_rope_to_k=true)
         };
 
         explicit AttentionComputeStage(Params params);

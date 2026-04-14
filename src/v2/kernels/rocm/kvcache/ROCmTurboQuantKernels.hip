@@ -903,10 +903,11 @@ namespace llaminar2
     __global__ void hip_rope_apply_fp16_kernel(
         _Float16 *__restrict__ d_K,
         int count, int n_kv_heads, int head_dim,
-        float rope_theta, int position_start)
+        float rope_theta, int position_start, int rope_dim)
     {
+        const int effective_rope_dim = (rope_dim > 0) ? rope_dim : head_dim;
         const int kv_dim = n_kv_heads * head_dim;
-        const int half_dim = head_dim / 2;
+        const int half_dim = effective_rope_dim / 2;
         const int total_pairs = count * n_kv_heads * half_dim;
         const int pair_global = blockIdx.x * blockDim.x + threadIdx.x;
 
@@ -921,7 +922,7 @@ namespace llaminar2
         const int pair_idx = remaining % pairs_per_head;
 
         const int actual_pos = position_start + pos;
-        const float freq = 1.0f / powf(rope_theta, static_cast<float>(2 * pair_idx) / static_cast<float>(head_dim));
+        const float freq = 1.0f / powf(rope_theta, static_cast<float>(2 * pair_idx) / static_cast<float>(effective_rope_dim));
         const float angle = static_cast<float>(actual_pos) * freq;
         const float cos_val = cosf(angle);
         const float sin_val = sinf(angle);
@@ -940,10 +941,11 @@ namespace llaminar2
     __global__ void hip_rope_apply_fp32_kernel(
         float *__restrict__ d_K,
         int count, int n_kv_heads, int head_dim,
-        float rope_theta, int position_start)
+        float rope_theta, int position_start, int rope_dim)
     {
+        const int effective_rope_dim = (rope_dim > 0) ? rope_dim : head_dim;
         const int kv_dim = n_kv_heads * head_dim;
-        const int half_dim = head_dim / 2;
+        const int half_dim = effective_rope_dim / 2;
         const int total_pairs = count * n_kv_heads * half_dim;
         const int pair_global = blockIdx.x * blockDim.x + threadIdx.x;
 
@@ -958,7 +960,7 @@ namespace llaminar2
         const int pair_idx = remaining % pairs_per_head;
 
         const int actual_pos = position_start + pos;
-        const float freq = 1.0f / powf(rope_theta, static_cast<float>(2 * pair_idx) / static_cast<float>(head_dim));
+        const float freq = 1.0f / powf(rope_theta, static_cast<float>(2 * pair_idx) / static_cast<float>(effective_rope_dim));
         const float angle = static_cast<float>(actual_pos) * freq;
         const float cos_val = cosf(angle);
         const float sin_val = sinf(angle);
@@ -1208,14 +1210,15 @@ namespace llaminar2
         _Float16 *d_K, int count,
         int n_kv_heads, int head_dim,
         float rope_theta, int position_start,
-        hipStream_t stream)
+        hipStream_t stream, int rope_dim)
     {
         if (!d_K || count <= 0 || rope_theta <= 0.0f)
             return false;
 
-        const int total_pairs = count * n_kv_heads * (head_dim / 2);
+        const int effective_rope_dim = (rope_dim > 0) ? rope_dim : head_dim;
+        const int total_pairs = count * n_kv_heads * (effective_rope_dim / 2);
         hipLaunchKernelGGL(hip_rope_apply_fp16_kernel, dim3((total_pairs + 255) / 256), dim3(256), 0, stream,
-                           d_K, count, n_kv_heads, head_dim, rope_theta, position_start);
+                           d_K, count, n_kv_heads, head_dim, rope_theta, position_start, rope_dim);
         return hipGetLastError() == hipSuccess;
     }
 
@@ -1223,14 +1226,15 @@ namespace llaminar2
         float *d_K, int count,
         int n_kv_heads, int head_dim,
         float rope_theta, int position_start,
-        hipStream_t stream)
+        hipStream_t stream, int rope_dim)
     {
         if (!d_K || count <= 0 || rope_theta <= 0.0f)
             return false;
 
-        const int total_pairs = count * n_kv_heads * (head_dim / 2);
+        const int effective_rope_dim = (rope_dim > 0) ? rope_dim : head_dim;
+        const int total_pairs = count * n_kv_heads * (effective_rope_dim / 2);
         hipLaunchKernelGGL(hip_rope_apply_fp32_kernel, dim3((total_pairs + 255) / 256), dim3(256), 0, stream,
-                           d_K, count, n_kv_heads, head_dim, rope_theta, position_start);
+                           d_K, count, n_kv_heads, head_dim, rope_theta, position_start, rope_dim);
         return hipGetLastError() == hipSuccess;
     }
 

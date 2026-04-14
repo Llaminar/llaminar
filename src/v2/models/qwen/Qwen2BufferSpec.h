@@ -6,19 +6,15 @@
  *
  * Qwen2BufferSpec provides utilities for determining buffer allocation
  * strategies based on tensor parallelism configuration and collective
- * backend type. This is particularly important for heterogeneous GPU
- * setups using PCIe BAR for cross-vendor communication.
+ * backend type.
  *
  * Key Use Cases:
- * - Determining which buffers need BAR-backed allocation for PCIeBAR allreduce
+ * - Determining buffer allocation strategies for LOCAL TP
  * - Supporting LOCAL TP with mixed CUDA/ROCm GPUs
  *
  * Row-Parallel Outputs:
  * - FFN down projection: row-parallel, needs allreduce
  * - Attention Wo projection: row-parallel, needs allreduce
- *
- * These buffers benefit from BAR-backed allocation when using PCIeBAR
- * backend, as it enables direct P2P access without staging through host.
  */
 
 #pragma once
@@ -43,7 +39,6 @@ namespace llaminar2
     enum class AllocationStrategy
     {
         STANDARD,   ///< Regular device memory (VRAM on GPU, system RAM on CPU)
-        BAR_BACKED, ///< PCIe BAR-backed for cross-vendor allreduce (ROCm ↔ CUDA)
         PINNED_HOST ///< Pinned host memory for CPU staging (future)
     };
 
@@ -61,25 +56,14 @@ namespace llaminar2
     {
     public:
         /**
-         * @brief Check if a buffer needs BAR-backed allocation
+         * @brief Check if a buffer needs special allocation (deprecated — always returns false)
          *
-         * Returns true for row-parallel output buffers when:
-         * - LOCAL TP is enabled (tp_degree > 1)
-         * - Backend is PCIeBAR (heterogeneous GPU setup)
+         * Legacy method retained for interface compatibility. Always returns false.
          *
-         * Affected buffers (exact match):
-         * - "ffn_down_output" / "ffn_down_allreduce" - FFN down projection result
-         * - "ffn_output" - FFN output (same buffer, different name contexts)
-         * - "attention_wo_output" / "attn_wo_output" / "attn_wo_allreduce" - Attention Wo output
-         * - "wo_output" / "attn_proj" - Attention projection output
-         *
-         * Also matches layer-prefixed names via suffix matching:
-         * - "layer0_ffn_down_output", "layer5_attn_wo_allreduce", etc.
-         *
-         * @param buffer_name Name of the buffer (exact or with layer prefix)
-         * @param backend_type Collective backend type (PCIE_BAR triggers BAR allocation)
-         * @param tp_degree Tensor parallelism degree (1 = no TP, no BAR needed)
-         * @return true if buffer should use BAR-backed allocation
+         * @param buffer_name Name of the buffer
+         * @param backend_type Collective backend type
+         * @param tp_degree Tensor parallelism degree
+         * @return false always
          */
         static bool requiresBARBacked(
             const std::string &buffer_name,

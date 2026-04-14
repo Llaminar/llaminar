@@ -372,7 +372,8 @@ namespace llaminar2
                         apply_rope_to_k_fp32(
                             entry.K->mutable_data() + static_cast<size_t>(shadow.converted_rows) * kv_dim_,
                             new_rows, rope->head_dim, rope->n_kv_heads,
-                            rope->rope_theta, rope->position_start + shadow.converted_rows);
+                            rope->rope_theta, rope->position_start + shadow.converted_rows,
+                            rope->rope_dim);
                         shadow.converted_rows = entry.size;
                     }
                 }
@@ -411,7 +412,8 @@ namespace llaminar2
                     apply_rope_to_k_fp32(
                         k_fp32 + offset,
                         entry.size - shadow.converted_rows, rope->head_dim, rope->n_kv_heads,
-                        rope->rope_theta, rope->position_start + shadow.converted_rows);
+                        rope->rope_theta, rope->position_start + shadow.converted_rows,
+                        rope->rope_dim);
                 }
 
                 shadow.converted_rows = entry.size;
@@ -520,7 +522,8 @@ namespace llaminar2
                 apply_rope_to_k_fp32(
                     k_fp32 + offset,
                     to - from, rope->head_dim, rope->n_kv_heads,
-                    rope->rope_theta, rope->position_start + from);
+                    rope->rope_theta, rope->position_start + from,
+                    rope->rope_dim);
             }
         }
         // BF16 cache
@@ -541,7 +544,8 @@ namespace llaminar2
                 apply_rope_to_k_fp32(
                     k_fp32 + offset,
                     to - from, rope->head_dim, rope->n_kv_heads,
-                    rope->rope_theta, rope->position_start + from);
+                    rope->rope_theta, rope->position_start + from,
+                    rope->rope_dim);
             }
         }
         // Q8_1 cache
@@ -564,7 +568,8 @@ namespace llaminar2
                 apply_rope_to_k_fp32(
                     k_fp32 + offset,
                     to - from, rope->head_dim, rope->n_kv_heads,
-                    rope->rope_theta, rope->position_start + from);
+                    rope->rope_theta, rope->position_start + from,
+                    rope->rope_dim);
             }
         }
         // TQ4 symmetric cache (both K and V are TQ4)
@@ -723,7 +728,8 @@ namespace llaminar2
                 apply_rope_to_k_fp32(
                     k_fp32 + offset,
                     to - from, rope->head_dim, rope->n_kv_heads,
-                    rope->rope_theta, rope->position_start + from);
+                    rope->rope_theta, rope->position_start + from,
+                    rope->rope_dim);
             }
         }
         // Symmetric TQ8 cache (both K and V are TQ8) - not yet used, stub

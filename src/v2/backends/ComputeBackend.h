@@ -49,12 +49,13 @@ namespace llaminar2
     struct PCIeLinkInfo
     {
         std::string pci_address;   // BDF address (e.g., "0000:8f:00.0")
-        double link_speed_gts = 0; // Current link speed in GT/s (e.g., 16.0 for Gen4)
-        int link_width = 0;        // Current link width (e.g., 16 for x16)
+        double link_speed_gts = 0; // Effective link speed in GT/s (bottleneck-aware)
+        int link_width = 0;        // Effective link width (bottleneck-aware)
         double max_speed_gts = 0;  // Max (capable) link speed in GT/s
         int max_width = 0;         // Max (capable) link width
         int pcie_gen = 0;          // PCIe generation (3, 4, 5, ...)
-        bool degraded = false;     // True if current < max speed or width
+        bool degraded = false;     // True if effective < max speed or width
+        std::string bottleneck_bdf; // BDF of upstream bridge causing bottleneck (empty if none)
 
         double bandwidth_gbps() const // Effective bandwidth in GB/s (per direction)
         {

@@ -384,7 +384,7 @@ TEST(Test__OrchestrationConfigParser, ParseArgs_DefineDomain_Multiple)
 TEST(Test__OrchestrationConfigParser, ParseArgs_DefineDomain_WithWeightsAndBackend)
 {
     ArgvHelper args{"llaminar2",
-                    "--define-domain", "mixed=cuda:0,rocm:0;weights=0.6,0.4;backend=pciebar"};
+                    "--define-domain", "mixed=cuda:0,rocm:0;weights=0.6,0.4;backend=heterogeneous"};
     OrchestrationConfigParser parser;
 
     auto config = parser.parseArgs(args.argc(), args.argv());
@@ -394,7 +394,7 @@ TEST(Test__OrchestrationConfigParser, ParseArgs_DefineDomain_WithWeightsAndBacke
     EXPECT_EQ(domain.name, "mixed");
     EXPECT_EQ(domain.weights.size(), 2);
     EXPECT_FLOAT_EQ(domain.weights[0], 0.6f);
-    EXPECT_EQ(domain.backend, CollectiveBackendType::PCIE_BAR);
+    EXPECT_EQ(domain.backend, CollectiveBackendType::HETEROGENEOUS);
 }
 
 TEST(Test__OrchestrationConfigParser, ParseArgs_PPStage)

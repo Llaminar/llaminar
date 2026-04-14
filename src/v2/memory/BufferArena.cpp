@@ -173,7 +173,7 @@ namespace llaminar2
     // Tensor creation helper
     // =========================================================================
 
-    /// Map BufferId to BufferNames string for Qwen2BufferSpec BAR detection.
+    /// Map BufferId to buffer name string.
     static const char *bufferIdToBufferName(BufferId id)
     {
         switch (id)
@@ -284,38 +284,6 @@ namespace llaminar2
         const ManagedBuffer &b, BufferId id) const
     {
         std::vector<size_t> shape{b.rows, b.cols};
-
-        // ── BAR-backed path ─────────────────────────────────────────────
-        if (config_.factory && config_.tp_degree > 1)
-        {
-            const char *buf_name = bufferIdToBufferName(id);
-            if (buf_name &&
-                Qwen2BufferSpec::requiresBARBacked(
-                    buf_name, config_.collective_backend, config_.tp_degree) &&
-                config_.factory->canCreateBARBacked() &&
-                config_.rocm_device.is_rocm() &&
-                config_.cuda_device.is_cuda() &&
-                b.home_device.is_rocm())
-            {
-                try
-                {
-                    auto bar_tensor = config_.factory->createFP32BARBacked(
-                        shape, config_.rocm_device, config_.cuda_device);
-                    if (bar_tensor)
-                    {
-                        LOG_DEBUG("[BufferArena] Created BAR-backed FP32 tensor for '"
-                                  << bufferIdName(id) << "'");
-                        return bar_tensor;
-                    }
-                }
-                catch (const std::exception &e)
-                {
-                    LOG_WARN("[BufferArena] BAR-backed allocation failed for '"
-                             << bufferIdName(id) << "': " << e.what()
-                             << " - falling back to standard allocation");
-                }
-            }
-        }
 
         // ── Factory-based allocation (NUMA-aware, dtype-aware) ──────────
         if (config_.factory)

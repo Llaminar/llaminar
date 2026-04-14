@@ -50,7 +50,7 @@ namespace llaminar2
     enum class TPScope
     {
         AUTO,       ///< Automatically determine based on topology
-        LOCAL,      ///< TP within single MPI rank (intra-rank: NVLink, PCIeBAR, NCCL)
+        LOCAL,      ///< TP within single MPI rank (intra-rank: NVLink, HOST, NCCL)
         NODE_LOCAL, ///< TP across MPI ranks on same physical node (UPI, shmem, cross-process NCCL)
         GLOBAL,     ///< TP across all nodes (MPI over InfiniBand/Ethernet)
         HYBRID      ///< Hierarchical: local TP + global PP

@@ -25,8 +25,7 @@ namespace llaminar2
         AUTO,          ///< Automatically select based on device types
         NCCL,          ///< NVIDIA NCCL (CUDA only)
         RCCL,          ///< AMD RCCL (ROCm only)
-        PCIE_BAR,      ///< PCIe BAR direct P2P (heterogeneous GPU, 2-device)
-        HETEROGENEOUS, ///< Multi-GPU heterogeneous (orchestrates NCCL+RCCL+PCIeBAR)
+        HETEROGENEOUS, ///< Multi-GPU heterogeneous (orchestrates NCCL+RCCL+HOST for mixed vendor)
         UPI,           ///< Intel UPI interconnect (CPU cross-socket)
         MPI,           ///< Fallback MPI_Allreduce
         HOST           ///< Host-staged (copy to CPU, reduce, copy back)

@@ -14,12 +14,12 @@
  * Configurations (Qwen3.5-0.8B Q4_0):
  *   - LocalTP_NCCL_2xCUDA_08B:       2x NVIDIA GPU via NCCL (skipped: no GPU kernels)
  *   - LocalTP_RCCL_2xROCm_08B:       2x AMD GPU via RCCL (skipped: no GPU kernels)
- *   - LocalTP_PCIeBAR_CUDA_ROCm_08B: Heterogeneous CUDA+ROCm (skipped: no GPU kernels)
+ *   - LocalTP_HOST_CUDA_ROCm_08B:    Heterogeneous CUDA+ROCm (skipped: no GPU kernels)
  *
  * Configurations (Qwen3.5-4B Q8_0):
  *   - LocalTP_NCCL_2xCUDA_4B:        2x NVIDIA GPU via NCCL (skipped: no GPU kernels)
  *   - LocalTP_RCCL_2xROCm_4B:        2x AMD GPU via RCCL (skipped: no GPU kernels)
- *   - LocalTP_PCIeBAR_CUDA_ROCm_4B:  Heterogeneous CUDA+ROCm (skipped: no GPU kernels)
+ *   - LocalTP_HOST_CUDA_ROCm_4B:     Heterogeneous CUDA+ROCm (skipped: no GPU kernels)
  *
  * @author David Sanftenberg
  * @date 2026
@@ -70,7 +70,7 @@ static const auto kQwen35_08B_TP_Thresholds = BackendThresholds{
     .decode_cosine_threshold = 0.90f,
     .early_layers_count = 6,
     .min_early_layers_passed = 4,
-    .kl_threshold = 0.35f,
+    .kl_threshold = 0.06f, // Was 0.35 = very over-relaxed; no GPU results yet, conservative estimate
     .excluded_stages = kTPExcludedStages,
 };
 
@@ -79,7 +79,7 @@ static const auto kQwen35_4B_TP_Thresholds = BackendThresholds{
     .decode_cosine_threshold = 0.90f,
     .early_layers_count = 6,
     .min_early_layers_passed = 4,
-    .kl_threshold = 0.35f,
+    .kl_threshold = 0.06f, // Was 0.35 = very over-relaxed; no GPU results yet, conservative estimate
     .excluded_stages = kTPExcludedStages,
 };
 
@@ -110,10 +110,10 @@ static const std::vector<TestConfig> kLocalTPConfigs = {
         .kv_cache_precision = KVCachePrecision::FP16,
     },
     {
-        .name = "LocalTP_PCIeBAR_CUDA_ROCm_08B",
+        .name = "LocalTP_HETEROGENEOUS_CUDA_ROCm_08B",
         .devices = {ParityDeviceType::CUDA, ParityDeviceType::ROCm},
         .parallelism = Parallelism::LocalTP,
-        .collective = Collective::PCIeBAR,
+        .collective = Collective::HETEROGENEOUS,
         .thresholds = kQwen35_08B_TP_Thresholds,
         .model_path = "models/Qwen3.5-0.8B-Q4_0.gguf",
         .snapshot_dir = "pytorch_qwen35_snapshots",
@@ -146,10 +146,10 @@ static const std::vector<TestConfig> kLocalTPConfigs = {
         .kv_cache_precision = KVCachePrecision::FP16,
     },
     {
-        .name = "LocalTP_PCIeBAR_CUDA_ROCm_4B",
+        .name = "LocalTP_HETEROGENEOUS_CUDA_ROCm_4B",
         .devices = {ParityDeviceType::CUDA, ParityDeviceType::ROCm},
         .parallelism = Parallelism::LocalTP,
-        .collective = Collective::PCIeBAR,
+        .collective = Collective::HETEROGENEOUS,
         .thresholds = kQwen35_4B_TP_Thresholds,
         .model_path = "models/Qwen3.5-4B-Q8_0.gguf",
         .snapshot_dir = "pytorch_qwen35_4b_snapshots",

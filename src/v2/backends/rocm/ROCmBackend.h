@@ -134,15 +134,15 @@ namespace llaminar2
          * @param device_id Device to use for the copy
          * @return true on success
          */
-        bool deviceToDevice(void *dst, const void *src, size_t bytes, int device_id);
+        bool deviceToDevice(void *dst, const void *src, size_t bytes, int device_id) override;
 
         /**
          * @brief Register IO memory with HIP using hipHostRegisterIoMemory flag
          *
-         * This attempts to register memory-mapped I/O regions (like PCIe BAR)
+         * This attempts to register memory-mapped I/O regions
          * with HIP so that kernels can access them directly.
          *
-         * @param ptr Host pointer to the IO memory (e.g., BAR mmap address)
+         * @param ptr Host pointer to the IO memory
          * @param size Size of the region in bytes
          * @param device_ptr Output: Device pointer that kernels can use
          * @return true if registration succeeded, false otherwise
@@ -194,7 +194,7 @@ namespace llaminar2
          * into the GPU address space. This is the most direct path to get
          * kernel-accessible pointers for external memory.
          *
-         * @param dmabuf_fd File descriptor of the dmabuf (or PCIe BAR resource fd)
+         * @param dmabuf_fd File descriptor of the dmabuf
          * @param size Output: Size of the mapped buffer (filled by API)
          * @param device_ptr Output: GPU-accessible pointer
          * @return true if mapping succeeded, false otherwise

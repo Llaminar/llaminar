@@ -9,7 +9,7 @@
  *   - LocalTP_NCCL_2xCUDA:          2x NVIDIA GPU via NCCL
  *   - LocalTP_RCCL_2xROCm:          2x AMD GPU via RCCL
  *   - LocalTP_RCCL_4xROCm:          4x AMD GPU via RCCL
- *   - LocalTP_PCIeBAR_CUDA_ROCm:    Heterogeneous CUDA+ROCm via PCIe BAR
+ *   - LocalTP_HOST_CUDA_ROCm:        Heterogeneous CUDA+ROCm via HOST backend
  *
  * @author David Sanftenberg
  * @date February 2026
@@ -75,25 +75,25 @@ static const std::vector<TestConfig> kLocalTPConfigs = {
         .parallelism = Parallelism::LocalTP,
         .collective = Collective::RCCL,
         .thresholds = {
-            .cosine_threshold = 0.90f,
-            .decode_cosine_threshold = 0.90f,
+            .cosine_threshold = 0.96f,        // Observed: 0.999 prefill cosine
+            .decode_cosine_threshold = 0.96f, // Observed: 0.999 avg decode cosine
             .early_layers_count = 6,
             .min_early_layers_passed = 4,
-            .kl_threshold = 0.50f, // Relaxed - 4-way TP + RCCL host staging adds more variance
+            .kl_threshold = 0.02f, // Observed: 0.001 prefill KL (was 0.50 = 500x over-relaxed)
             .excluded_stages = kTPExcludedStages,
         },
     },
     {
-        .name = "LocalTP_PCIeBAR_CUDA_ROCm",
+        .name = "LocalTP_HETEROGENEOUS_CUDA_ROCm",
         .devices = {ParityDeviceType::CUDA, ParityDeviceType::ROCm}, // Heterogeneous!
         .parallelism = Parallelism::LocalTP,
-        .collective = Collective::PCIeBAR,
+        .collective = Collective::HETEROGENEOUS,
         .thresholds = {
             .cosine_threshold = 0.90f,
             .decode_cosine_threshold = 0.90f,
             .early_layers_count = 6,
             .min_early_layers_passed = 4,
-            .kl_threshold = 0.50f, // Relaxed - heterogeneous TP with PCIe BAR adds variance
+            .kl_threshold = 0.50f, // Relaxed - heterogeneous TP with HOST backend adds variance
             .excluded_stages = kTPExcludedStages,
         },
     },

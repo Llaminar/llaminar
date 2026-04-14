@@ -19,12 +19,6 @@
 #include <numaif.h>
 #endif
 
-// Forward declaration for BAR-backed tensor support
-namespace llaminar2
-{
-    class DirectP2PEngine;
-}
-
 namespace llaminar2
 {
     /**
@@ -268,59 +262,10 @@ namespace llaminar2
          */
         bool useMappedMemoryForGPU() const { return use_mapped_memory_for_gpu_; }
 
-        // =========================================================================
-        // BAR-Backed Tensor Support (for PCIeBAR heterogeneous tensor parallelism)
-        // =========================================================================
-
-        /**
-         * @brief Set DirectP2PEngine context for BAR-backed tensor allocation
-         *
-         * Must be called before createFP32BARBacked() can be used.
-         * Typically called during LOCAL TP initialization when PCIeBAR backend is selected.
-         *
-         * @param p2p DirectP2PEngine context with mapped BAR regions
-         */
-        void setDirectP2P(std::shared_ptr<DirectP2PEngine> p2p);
-
-        /**
-         * @brief Check if BAR-backed tensor allocation is available
-         * @return true if DirectP2PEngine context is set and BAR regions are mapped
-         */
-        bool canCreateBARBacked() const;
-
-        /**
-         * @brief Create FP32 tensor backed by PCIe BAR memory
-         *
-         * Creates a tensor in ROCm device's BAR-exposed VRAM region.
-         * - ROCm device writes at full VRAM bandwidth (~900 GB/s)
-         * - CUDA device reads through PCIe BAR (~2.65 GB/s)
-         *
-         * Use for row-parallel output buffers (FFN_DOWN, attention Wo) in
-         * heterogeneous LOCAL TP with PCIeBAR backend.
-         *
-         * **Memory model**:
-         * - Buffer physically resides in AMD VRAM (not system DRAM)
-         * - CUDA writes via PCIe posted writes (~2.65 GB/s on PCIe 3.0)
-         * - AMD accesses locally (full VRAM bandwidth ~900 GB/s)
-         *
-         * @param shape Tensor dimensions
-         * @param rocm_device ROCm device that owns the BAR memory (writes locally)
-         * @param cuda_device CUDA device that will read through PCIe
-         * @return FP32 tensor with BAR-backed memory, or nullptr on failure
-         * @throws std::runtime_error if DirectP2PEngine not set or BAR not available
-         *
-         * @see BARBackedTensor.h for detailed design documentation
-         */
-        std::unique_ptr<FP32Tensor> createFP32BARBacked(
-            const std::vector<size_t> &shape,
-            DeviceId rocm_device,
-            DeviceId cuda_device);
-
     private:
         int mpi_rank_;
-        int numa_node_;                               // NUMA node for this rank
-        bool use_mapped_memory_for_gpu_ = false;      // When true, FP32 GPU tensors use zero-copy mapped memory
-        std::shared_ptr<DirectP2PEngine> direct_p2p_; // For BAR-backed tensor allocation
+        int numa_node_;                          // NUMA node for this rank
+        bool use_mapped_memory_for_gpu_ = false; // When true, FP32 GPU tensors use zero-copy mapped memory
 
         /**
          * @brief Bind current thread to NUMA node

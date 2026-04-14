@@ -148,7 +148,6 @@ namespace llaminar2::test
         void registerBARBackedOutput(const std::string &, const GlobalDeviceAddress &, TensorBase *) override {}
         bool hasBARBackedOutputs(const std::string &) const override { return false; }
         void clearBARBackedOutputs() override {}
-        std::shared_ptr<DirectP2PEngine> getDirectP2PEngine() const override { return nullptr; }
         bool reserveTempBufferBytes(size_t) override { return true; }
         bool broadcast(TensorBase *, int) override { return true; }
 

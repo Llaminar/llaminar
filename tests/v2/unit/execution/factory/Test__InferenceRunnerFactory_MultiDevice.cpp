@@ -126,7 +126,6 @@ namespace
         }
         bool hasBARBackedOutputs(const std::string & /*stage_name*/) const override { return false; }
         void clearBARBackedOutputs() override {}
-        std::shared_ptr<DirectP2PEngine> getDirectP2PEngine() const override { return nullptr; }
         bool reserveTempBufferBytes(size_t /*bytes*/) override { return true; }
 
         // Broadcast (no-op)

@@ -5,7 +5,7 @@
  * These tests validate Node-Local Tensor Parallelism (NodeLocalTP) infrastructure
  * for Qwen3 architecture (per-head QK RMSNorm, no QKV biases), where tensor
  * parallelism spans multiple MPI ranks on the same physical node. Unlike LocalTP
- * which uses NCCL/RCCL/PCIeBAR for intra-process multi-device communication,
+ * which uses NCCL/RCCL/HOST for intra-process multi-device communication,
  * NodeLocalTP uses MPI collectives for cross-rank communication — the correct
  * approach for multi-socket CPU TP.
  *
@@ -73,7 +73,7 @@ static const std::vector<TestConfig> kNodeLocalTPTestConfigs = {
             .decode_cosine_threshold = 0.90f,
             .early_layers_count = 6,
             .min_early_layers_passed = 4,
-            .kl_threshold = 0.20f,
+            .kl_threshold = 0.012f, // Observed: 0.003 prefill KL (was 0.20 = 80x over-relaxed)
             .excluded_stages = kNodeLocalTPExcludedStages,
         },
         .mpi_ranks = 2,

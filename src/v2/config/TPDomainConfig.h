@@ -4,7 +4,7 @@
  *
  * A TP domain is a group of devices that work together on tensor-parallel
  * sharded operations. Within a domain, devices use a collective backend
- * (NCCL, RCCL, PCIeBAR, etc.) for allreduce operations.
+ * (NCCL, RCCL, HOST, etc.) for allreduce operations.
  *
  * This is a configuration-only structure (no MPI handles). It serves as
  * the input for creating ILocalTPContext instances at runtime.
@@ -31,7 +31,7 @@ namespace llaminar2
      * @brief Configuration for a Tensor Parallel domain
      *
      * A TP domain is a group of devices that work together on sharded operations.
-     * Within a domain, devices use a collective backend (NCCL, RCCL, PCIeBAR, etc.)
+     * Within a domain, devices use a collective backend (NCCL, RCCL, HOST, etc.)
      * for allreduce operations.
      *
      * This is a pure configuration structure - it holds the specification for a
@@ -40,7 +40,7 @@ namespace llaminar2
      *
      * Example configurations:
      * - 2-way CUDA TP: devices=[cuda:0, cuda:1], backend=NCCL
-     * - Mixed GPU TP: devices=[cuda:0, rocm:0], backend=PCIE_BAR
+     * - Mixed GPU TP: devices=[cuda:0, rocm:0], backend=HOST
      * - Heterogeneous TP: devices=[cuda:0, rocm:0], weights=[0.73, 0.27]
      */
     struct TPDomainConfig

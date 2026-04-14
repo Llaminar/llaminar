@@ -339,7 +339,7 @@ namespace
     }
 
     /**
-     * @test PCIeBAR backend should be selected for CUDA↔ROCm transfers
+     * @test HOST backend should be selected for CUDA↔ROCm transfers
      */
     TEST_F(Test__LocalPPIntegration, BackendSelection_PCIeBAR_ForMixedVendor)
     {
@@ -358,10 +358,10 @@ namespace
             auto ctx = createLocalPPContext(config);
             ASSERT_NE(ctx, nullptr);
 
-            // THEN: Backend for CUDA→ROCm transfer should be PCIeBAR
+            // THEN: Backend for CUDA→ROCm transfer should be HETEROGENEOUS (HOST)
             auto backend = ctx->backendForTransfer(0, 1);
-            EXPECT_EQ(backend, CollectiveBackendType::PCIE_BAR)
-                << "CUDA→ROCm transfer should use PCIeBAR backend";
+            EXPECT_EQ(backend, CollectiveBackendType::HETEROGENEOUS)
+                << "CUDA→ROCm transfer should use HETEROGENEOUS backend";
         }
         catch (const std::exception &e)
         {
@@ -437,10 +437,10 @@ namespace
             MockLocalPPContext::Config cfg;
             cfg.stage_devices = {GlobalDeviceAddress::cuda(0), GlobalDeviceAddress::rocm(0)};
             cfg.layer_boundaries = {0, 12, 24};
-            cfg.default_backend = CollectiveBackendType::PCIE_BAR;
+            cfg.default_backend = CollectiveBackendType::HETEROGENEOUS;
 
             MockLocalPPContext mock(cfg);
-            EXPECT_EQ(mock.backendForTransfer(0, 1), CollectiveBackendType::PCIE_BAR);
+            EXPECT_EQ(mock.backendForTransfer(0, 1), CollectiveBackendType::HETEROGENEOUS);
         }
 
         // Scenario 4: GPU→CPU
@@ -608,9 +608,9 @@ namespace
 
         // The PP configuration maps stage → primary device of TP domain
         std::vector<GlobalDeviceAddress> pp_stage_devices = {
-            GlobalDeviceAddress::cuda(0),  // Primary device of TP domain 0
-            GlobalDeviceAddress::rocm(0),  // Primary device of TP domain 1
-            GlobalDeviceAddress::cpu()};   // Primary device of TP domain 2
+            GlobalDeviceAddress::cuda(0), // Primary device of TP domain 0
+            GlobalDeviceAddress::rocm(0), // Primary device of TP domain 1
+            GlobalDeviceAddress::cpu()};  // Primary device of TP domain 2
 
         std::vector<int> layer_boundaries = {0, 8, 16, 24}; // 8 layers per stage
 
@@ -694,7 +694,7 @@ namespace
         auto calls = mock.transferCalls();
         ASSERT_EQ(calls.size(), 2u);
 
-        // First transfer: CUDA → ROCm (would use PCIeBAR backend)
+        // First transfer: CUDA → ROCm (uses HOST backend)
         EXPECT_EQ(calls[0].stage_from, 0);
         EXPECT_EQ(calls[0].stage_to, 1);
 
@@ -851,7 +851,7 @@ namespace
         RankExecutionPlan plan = makeSimplePlan();
 
         LocalPPConfig config;
-        config.stage_devices = plan.local_pp_devices;       // Empty
+        config.stage_devices = plan.local_pp_devices;             // Empty
         config.layer_boundaries = plan.local_pp_layer_boundaries; // Empty
 
         // Empty config should be invalid

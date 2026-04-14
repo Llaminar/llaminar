@@ -76,10 +76,6 @@ namespace llaminar2
         if (result)
             return *result;
 
-        // Fallback: handle PCIE_BAR variations (case-sensitive upper-case)
-        if (s == "PCIE_BAR" || s == "PCIe_BAR")
-            return CollectiveBackendType::PCIE_BAR;
-
         return CollectiveBackendType::AUTO;
     }
 
@@ -137,7 +133,6 @@ namespace llaminar2
      * - Backends that need to track buffer locations inherit from IBufferRegistration
      * - Default implementations are provided that return success/empty for backends
      *   that don't require registration (like MPI, NCCL, RCCL)
-     * - PCIeBARBackend overrides these to track BAR offsets for cross-vendor transfers
      */
     class ICollectiveBackend : public IBufferRegistration
     {
@@ -444,7 +439,6 @@ namespace llaminar2
          * must synchronize the stream or use events to determine completion.
          *
          * For NCCL/RCCL: Uses ncclSend/rcclSend on the provided stream.
-         * For PCIeBAR: Uses async memcpy via the stream.
          *
          * @param buffer Source buffer on this device
          * @param count Number of elements to send
@@ -535,7 +529,7 @@ namespace llaminar2
          * - Same CUDA device: cudaMemcpy (no-op if same pointer)
          * - Different CUDA devices: cudaMemcpyPeerAsync with P2P if available
          * - Different ROCm devices: hipMemcpyPeerAsync with P2P if available
-         * - Cross-vendor (CUDA↔ROCm): PCIe BAR1 mapping
+         * - Cross-vendor (CUDA↔ROCm): HOST backend (host-staged copy)
          *
          * FAIL-FAST: Returns false if the transfer cannot be performed optimally.
          * No silent fallback to host staging - that's a performance bug.
@@ -917,8 +911,6 @@ namespace llaminar2
          * @brief In-place AllReduce using registered buffers
          *
          * Uses pre-registered buffer locations instead of explicit pointers.
-         * This is required for backends like PCIeBARBackend that need to know
-         * buffer locations in advance (e.g., BAR offsets for cross-vendor P2P).
          *
          * If the backend doesn't require buffer registration, this falls back
          * to the regular allreduce() using the registered buffer pointer.
@@ -936,7 +928,6 @@ namespace llaminar2
             CollectiveOp op)
         {
             // Default implementation: not supported for base backends
-            // Backends that support registration (like PCIeBARBackend) override this
             (void)collective_id;
             (void)count;
             (void)dtype;
@@ -968,7 +959,6 @@ namespace llaminar2
         // =====================================================================
         // Most backends (MPI, NCCL, RCCL) don't need buffer registration.
         // These defaults allow them to work without implementing the interface.
-        // PCIeBARBackend overrides these to track BAR offsets.
 
         /**
          * @brief Register a buffer (default: always succeeds, no-op)

@@ -35,8 +35,6 @@ namespace llaminar2
             return "nccl";
         case CollectiveBackendType::RCCL:
             return "rccl";
-        case CollectiveBackendType::PCIE_BAR:
-            return "pcie_bar";
         case CollectiveBackendType::HETEROGENEOUS:
             return "heterogeneous";
         case CollectiveBackendType::UPI:
@@ -59,8 +57,6 @@ namespace llaminar2
             return CollectiveBackendType::NCCL;
         if (lower == "rccl")
             return CollectiveBackendType::RCCL;
-        if (lower == "pciebar" || lower == "pcie_bar" || lower == "pcie-bar" || lower == "bar")
-            return CollectiveBackendType::PCIE_BAR;
         if (lower == "heterogeneous" || lower == "hetero")
             return CollectiveBackendType::HETEROGENEOUS;
         if (lower == "upi")

@@ -346,7 +346,7 @@ namespace llaminar2
     {
         TPDomain domain;
         domain.type = TPDomainType::GPU_INTRA_RANK;
-        domain.communicator = MPI_COMM_NULL; // No MPI comm needed - PCIeBAR direct
+        domain.communicator = MPI_COMM_NULL; // No MPI comm needed - intra-rank
         domain.devices = gpus;
         domain.local_rank_in_domain = 0; // Intra-rank, so we're always rank 0
         domain.domain_size = static_cast<int>(gpus.size());

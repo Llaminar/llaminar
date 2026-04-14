@@ -5,7 +5,7 @@
  * ITPContext provides a common interface for all TP scopes:
  *
  * - **LOCAL**:      Intra-rank, multi-device. All participants are devices owned
- *                   by a single MPI rank. Uses NVLink, PCIeBAR, or intra-process
+ *                   by a single MPI rank. Uses NVLink, HOST, or intra-process
  *                   NCCL/RCCL. Lowest latency, highest bandwidth.
  *
  * - **NODE_LOCAL**: Cross-rank, same physical machine. Participants are MPI ranks
@@ -26,7 +26,7 @@
  *
  * This interface enables stages like TPAllreduceStage to work with any scope
  * without code changes — the scope only matters for backend selection and
- * scope-specific setup (e.g., BAR registration for LOCAL TP).
+ * scope-specific setup (e.g., buffer registration for LOCAL TP).
  *
  * @author David Sanftenberg
  * @date February 2026
@@ -122,7 +122,7 @@ namespace llaminar2
         /**
          * @brief Get the collective backend type used by this context
          *
-         * For LOCAL TP: Returns NCCL, RCCL, PCIE_BAR, etc.
+         * For LOCAL TP: Returns NCCL, RCCL, HOST, etc.
          * For NODE_LOCAL TP: Returns NCCL, MPI, HOST, etc.
          * For GLOBAL TP: Returns MPI, UPI, etc.
          *
@@ -148,15 +148,13 @@ namespace llaminar2
         /**
          * @brief All-reduce sum with stage name and count (in-place)
          *
-         * Extended version for BAR-backed tensor lookup and partial reductions.
-         * The stage_name allows PCIeBAR backends to locate pre-registered tensors.
+         * Extended version with stage name and partial reduction support.
          * The count allows reducing a subset of elements (useful for decode phase).
          *
          * Default implementation delegates to allreduce(tensor) ignoring extra params.
-         * LocalTPContext provides specialized implementation with BAR support.
          *
          * @param tensor Tensor to all-reduce (modified in-place)
-         * @param stage_name Stage identifier for BAR-backed tensor lookup
+         * @param stage_name Stage identifier for tensor lookup
          * @param count Elements to reduce (0 = use tensor->numel())
          * @return true on success, false on error
          */

@@ -124,6 +124,33 @@ namespace llaminar2
         virtual bool hostToDevice(void *dst, const void *src, size_t bytes, int device_id) = 0;
 
         /**
+         * @brief Copy data between two device pointers on the same device
+         *
+         * @param dst Device destination pointer
+         * @param src Device source pointer
+         * @param bytes Number of bytes to copy
+         * @param device_id GPU device ID (0-based)
+         * @return true on success, false on error
+         *
+         * **Semantics**:
+         * - CUDA: cudaMemcpy(dst, src, bytes, cudaMemcpyDeviceToDevice)
+         * - ROCm: hipMemcpy(dst, src, bytes, hipMemcpyDeviceToDevice)
+         * - CPU: memcpy(dst, src, bytes)
+         *
+         * Used for device-to-device tensor transfers where both src and dst
+         * are in the same GPU's VRAM (standard device memory pointers).
+         */
+        virtual bool deviceToDevice(void *dst, const void *src, size_t bytes, int device_id)
+        {
+            // Default implementation: not supported
+            (void)dst;
+            (void)src;
+            (void)bytes;
+            (void)device_id;
+            return false;
+        }
+
+        /**
          * @brief Async variant of hostToDevice() - returns immediately
          *
          * @param dst Device destination pointer (must be pre-allocated)
@@ -605,6 +632,157 @@ namespace llaminar2
             int n,
             int k,
             int device_id) = 0;
+
+        // ====================================================================
+        // Stream Management
+        // ====================================================================
+
+        /**
+         * @brief Create a non-blocking stream on the specified device
+         *
+         * @param device_id GPU device ID (0-based)
+         * @return Opaque stream handle (nullptr on failure)
+         *
+         * **Semantics**:
+         * - CUDA: cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking)
+         * - ROCm: hipStreamCreateWithFlags(&stream, hipStreamNonBlocking)
+         * - CPU: returns dummy non-null pointer
+         *
+         * **Lifetime**: Caller owns the stream and must call destroyStream()
+         */
+        virtual void *createStream(int device_id)
+        {
+            (void)device_id;
+            return nullptr;
+        }
+
+        /**
+         * @brief Destroy a stream created by createStream()
+         *
+         * @param stream Opaque stream handle (may be nullptr)
+         * @param device_id GPU device ID (0-based)
+         */
+        virtual void destroyStream(void *stream, int device_id)
+        {
+            (void)stream;
+            (void)device_id;
+        }
+
+        /**
+         * @brief Synchronize a specific stream (wait for all queued work to complete)
+         *
+         * @param stream Opaque stream handle (nullptr = default stream)
+         * @param device_id GPU device ID (0-based)
+         * @return true on success, false on error
+         *
+         * **Semantics**:
+         * - CUDA: cudaStreamSynchronize(stream)
+         * - ROCm: hipStreamSynchronize(stream)
+         * - CPU: no-op (always synchronous)
+         */
+        virtual bool synchronizeStream(void *stream, int device_id)
+        {
+            (void)stream;
+            (void)device_id;
+            return true;
+        }
+
+        /**
+         * @brief Make a stream wait for an event before proceeding
+         *
+         * All operations enqueued on the stream after this call will wait until
+         * the event is recorded and completed.
+         *
+         * @param stream Opaque stream handle
+         * @param event Opaque event handle
+         * @param device_id GPU device ID (0-based)
+         * @return true on success, false on error
+         *
+         * **Semantics**:
+         * - CUDA: cudaStreamWaitEvent(stream, event, 0)
+         * - ROCm: hipStreamWaitEvent(stream, event, 0)
+         * - CPU: no-op (always synchronous)
+         */
+        virtual bool streamWaitEvent(void *stream, void *event, int device_id)
+        {
+            (void)stream;
+            (void)event;
+            (void)device_id;
+            return true;
+        }
+
+        // ====================================================================
+        // Stream-Aware Memory Operations
+        // ====================================================================
+
+        /**
+         * @brief Async device-to-device copy on a specific stream
+         *
+         * Both src and dst must be device pointers on the same device (or
+         * accessible from that device, e.g., BAR-mapped UVA pointers).
+         *
+         * @param dst Device destination pointer
+         * @param src Device source pointer
+         * @param bytes Number of bytes to copy
+         * @param device_id GPU device ID (0-based)
+         * @param stream Opaque stream handle (nullptr = default stream)
+         * @return true on success, false on error
+         *
+         * **Semantics**:
+         * - CUDA: cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToDevice, stream)
+         * - ROCm: hipMemcpyAsync(dst, src, bytes, hipMemcpyDeviceToDevice, stream)
+         * - CPU: memcpy(dst, src, bytes)
+         */
+        virtual bool deviceCopyAsync(void *dst, const void *src, size_t bytes,
+                                     int device_id, void *stream = nullptr)
+        {
+            (void)dst;
+            (void)src;
+            (void)bytes;
+            (void)device_id;
+            (void)stream;
+            return false;
+        }
+
+        // ====================================================================
+        // Collective Reduction Primitives
+        // ====================================================================
+
+        /**
+         * @brief In-place element-wise vector addition: output += input
+         *
+         * Performs output[i] += input[i] for count elements on the GPU.
+         * Used by cross-vendor collective backends for allreduce operations.
+         *
+         * @param output Device pointer to accumulate into (read+write)
+         * @param input Device pointer to add (read-only)
+         * @param count Number of elements
+         * @param element_size Size of each element in bytes (4=FP32, 2=FP16/BF16, 1=INT8)
+         * @param device_id GPU device ID (0-based)
+         * @param stream Opaque stream handle (nullptr = synchronous on default stream)
+         * @return true on success, false if not supported or error
+         *
+         * The element_size parameter determines the data type:
+         * - 4 bytes: FP32 addition
+         * - 2 bytes: FP16 or BF16 addition (backend-specific)
+         * - 1 byte: INT8 saturating addition
+         *
+         * **Semantics**:
+         * - CUDA: Launches vectorAdd kernel
+         * - ROCm: Launches HIP vectorAdd kernel (future)
+         * - CPU: Scalar loop
+         */
+        virtual bool vectorAddInplace(void *output, const void *input, size_t count,
+                                      int element_size, int device_id, void *stream = nullptr)
+        {
+            (void)output;
+            (void)input;
+            (void)count;
+            (void)element_size;
+            (void)device_id;
+            (void)stream;
+            return false;
+        }
 
         // ====================================================================
         // Backend Identity

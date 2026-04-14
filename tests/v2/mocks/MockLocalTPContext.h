@@ -287,11 +287,6 @@ namespace llaminar2::test
             // Mock: No-op
         }
 
-        std::shared_ptr<DirectP2PEngine> getDirectP2PEngine() const override
-        {
-            return nullptr; // Mock: No P2P engine
-        }
-
         bool reserveTempBufferBytes(size_t bytes) override
         {
             (void)bytes;

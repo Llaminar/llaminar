@@ -3773,7 +3773,10 @@ namespace llaminar2
         // Handle special weights (embedding, output norm, LM head)
         if (name == "token_embd.weight")
         {
-            return has_embedding_;
+            // Allow embedding through if this stage owns the LM head too —
+            // tied-embedding models (e.g. Qwen3.5) have no output.weight and
+            // the LM head falls back to token_embd.weight.
+            return has_embedding_ || has_lm_head_;
         }
         if (name == "output_norm.weight" || name == "output.weight")
         {

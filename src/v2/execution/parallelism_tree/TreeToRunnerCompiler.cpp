@@ -164,8 +164,8 @@ namespace llaminar2
             if (child.type == ParallelismNodeType::DEVICE)
             {
                 LOG_DEBUG("TreeToRunnerCompiler: skipping DEVICE child '" << child.name
-                          << "' of TP node '" << node.name
-                          << "' — TP orchestrator manages device runners internally");
+                                                                          << "' of TP node '" << node.name
+                                                                          << "' — TP orchestrator manages device runners internally");
                 continue;
             }
             auto runner = compileNode(child, ctx);
@@ -194,7 +194,17 @@ namespace llaminar2
                                                                     << "' (" << node.children.size() << " children"
                                                                     << ", layers=" << node.first_layer << "-" << node.last_layer << ")");
 
-        // Compile children first
+        // Use factory if provided — do NOT pre-compile children.
+        // The factory (e.g. MDO constructor) creates its own runners internally,
+        // so pre-compiling would create duplicate runners on the same GPUs,
+        // wasting memory and potentially corrupting shared device state.
+        if (ctx.local_pp_runner_factory)
+        {
+            std::vector<std::unique_ptr<IInferenceRunner>> no_children;
+            return ctx.local_pp_runner_factory(node, std::move(no_children), ctx.model_ctx);
+        }
+
+        // No factory: compile children for default handling
         std::vector<std::unique_ptr<IInferenceRunner>> child_runners;
         for (const auto &child : node.children)
         {
@@ -203,12 +213,6 @@ namespace llaminar2
             {
                 child_runners.push_back(std::move(runner));
             }
-        }
-
-        // Use factory if provided
-        if (ctx.local_pp_runner_factory)
-        {
-            return ctx.local_pp_runner_factory(node, std::move(child_runners), ctx.model_ctx);
         }
 
         // Default: Would create MultiDeviceOrchestrator(PP mode)

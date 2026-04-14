@@ -5,7 +5,7 @@
  * These tests validate Node-Local Tensor Parallelism (NodeLocalTP) infrastructure
  * for Qwen3.5 GDN+FA hybrid architecture, where tensor parallelism spans
  * multiple MPI ranks on the same physical node. Unlike LocalTP which uses
- * NCCL/RCCL/PCIeBAR for intra-process multi-device communication, NodeLocalTP
+ * NCCL/RCCL/HOST for intra-process multi-device communication, NodeLocalTP
  * uses MPI collectives for cross-rank communication — the correct approach
  * for multi-socket CPU TP.
  *
@@ -89,11 +89,11 @@ static const std::vector<TestConfig> kNodeLocalTPTestConfigs = {
         .parallelism = Parallelism::NodeLocalTP,
         .collective = Collective::MPI,
         .thresholds = {
-            .cosine_threshold = 0.90f,
-            .decode_cosine_threshold = 0.90f,
+            .cosine_threshold = 0.96f,        // Observed: 0.999 prefill cosine (was 0.90)
+            .decode_cosine_threshold = 0.96f, // Observed: 0.994 avg decode cosine (was 0.90)
             .early_layers_count = 6,
             .min_early_layers_passed = 4,
-            .kl_threshold = 0.35f,
+            .kl_threshold = 0.012f, // Observed: 0.002 prefill KL (was 0.35 = 148x over-relaxed)
             .excluded_stages = kNodeLocalTPExcludedStages,
         },
         .mpi_ranks = 2,
@@ -112,11 +112,11 @@ static const std::vector<TestConfig> kNodeLocalTPTestConfigs = {
         .parallelism = Parallelism::NodeLocalTP,
         .collective = Collective::MPI,
         .thresholds = {
-            .cosine_threshold = 0.90f,
-            .decode_cosine_threshold = 0.90f,
+            .cosine_threshold = 0.96f,        // Observed: 0.998 prefill cosine (was 0.90)
+            .decode_cosine_threshold = 0.96f, // Observed: 0.997 avg decode cosine (was 0.90)
             .early_layers_count = 6,
             .min_early_layers_passed = 4,
-            .kl_threshold = 0.35f,
+            .kl_threshold = 0.015f, // Observed: 0.004 prefill KL (was 0.35 = 94x over-relaxed)
             .excluded_stages = kNodeLocalTPExcludedStages,
         },
         .mpi_ranks = 2,

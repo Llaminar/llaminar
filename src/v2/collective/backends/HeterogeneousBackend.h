@@ -1,25 +1,23 @@
 /**
  * @file HeterogeneousBackend.h
- * @brief Heterogeneous multi-GPU collective backend orchestrating NCCL, RCCL, and PCIeBAR
+ * @brief Heterogeneous multi-GPU collective backend orchestrating NCCL, RCCL, and HOST
  *
  * The HeterogeneousBackend enables collective operations across mixed NVIDIA (CUDA)
  * and AMD (ROCm) GPU configurations. It orchestrates sub-backends:
  * - NCCL for intra-NVIDIA communication (when >1 CUDA GPU)
  * - RCCL for intra-AMD communication (when >1 ROCm GPU)
- * - PCIeBAR for cross-vendor bridge transfers (CUDA:0 ↔ ROCm:0)
+ * - HostBackend for cross-vendor bridge transfers (host-staged)
  *
  * Example configuration: RTX 3090 (cuda:0) + 2x MI50 (rocm:0, rocm:1)
  *
  * AllReduce algorithm (3 GPUs: 1 CUDA + 2 ROCm):
  * 1. RCCL: AllReduce within ROCm domain → rocm:0 has ROCm partial
- * 2. PCIeBAR: Transfer cuda:0 ↔ rocm:0 partials, reduce
- * 3. PCIeBAR: Write final result back to both bridge devices
- * 4. RCCL: Broadcast from rocm:0 to rocm:1
+ * 2. HOST: Transfer cuda:0 ↔ rocm:0 partials via host-staged allreduce
+ * 3. RCCL: Broadcast from rocm:0 to rocm:1
  *
  * Requirements:
  * - HAVE_CUDA and HAVE_ROCM both defined
  * - At least 1 CUDA device and 1 ROCm device in the group
- * - PCIe BAR P2P capability between bridge devices
  *
  * @author David Sanftenberg
  * @date January 2026
@@ -29,7 +27,6 @@
 
 #include "../ICollectiveBackend.h"
 #include "../DeviceGroup.h"
-#include "PCIeBARBackend.h" // For DevicePair struct
 #include <memory>
 #include <vector>
 
@@ -39,16 +36,17 @@ namespace llaminar2
     // Forward declarations for sub-backends
     class NCCLBackend;
     class RCCLBackend;
+    class HostBackend;
 
 #if defined(HAVE_CUDA) && defined(HAVE_ROCM)
 
     /**
      * @brief Heterogeneous multi-GPU collective backend
      *
-     * Orchestrates NCCL, RCCL, and PCIeBAR backends for mixed NVIDIA+AMD
+     * Orchestrates NCCL, RCCL, and HOST backends for mixed NVIDIA+AMD
      * GPU configurations. Uses a hierarchical reduction pattern:
      * 1. Reduce within each vendor domain (NCCL/RCCL if >1 GPU)
-     * 2. Cross-vendor reduction via PCIeBAR bridge
+     * 2. Cross-vendor reduction via host-staged bridge
      * 3. Broadcast back within each domain
      *
      * Thread Safety: Not thread-safe. Use one instance per device/stream.
@@ -96,7 +94,7 @@ namespace llaminar2
          * 1. Separates devices into CUDA and ROCm vectors
          * 2. Selects bridge devices (cuda:0 and rocm:0)
          * 3. Creates sub-backends for each domain (if >1 device)
-         * 4. Creates PCIeBAR backend for cross-domain bridge
+         * 4. Creates HOST backend for cross-domain bridge
          *
          * @param group Device group with mixed CUDA and ROCm devices
          * @return true on success, false if validation fails
@@ -129,7 +127,7 @@ namespace llaminar2
          *
          * Performs 3-phase allreduce:
          * 1. Intra-domain reduce (NCCL for CUDA, RCCL for ROCm)
-         * 2. Cross-domain bridge exchange (PCIeBAR between cuda:0 ↔ rocm:0)
+         * 2. Cross-domain bridge exchange (host-staged between cuda:0 ↔ rocm:0)
          * 3. Intra-domain broadcast (NCCL for CUDA, RCCL for ROCm)
          *
          * IMPORTANT: Buffer order must match device order in the DeviceGroup.
@@ -208,7 +206,7 @@ namespace llaminar2
         /// Check if RCCL sub-backend is active (>1 ROCm device)
         bool hasRCCLBackend() const { return rccl_backend_ != nullptr; }
 
-        /// Check if PCIeBAR bridge backend is active
+        /// Check if HOST bridge backend is active
         bool hasBridgeBackend() const { return bridge_backend_ != nullptr; }
 
         // =====================================================================
@@ -221,7 +219,7 @@ namespace llaminar2
         /**
          * @brief Check if reduce-scatter pattern should be used for this tensor size
          *
-         * The reduce-scatter pattern reduces cross-vendor PCIe BAR traffic for
+         * The reduce-scatter pattern reduces cross-vendor HOST bridge traffic for
          * large tensors. Instead of sending 100% of the tensor across the bridge,
          * it sends only 1/max(N,M) of the tensor, where N and M are the device
          * counts in each domain.
@@ -329,7 +327,7 @@ namespace llaminar2
 
             /// GCD-way parallel bridge for asymmetric configs
             /// Best for: N CUDA + M ROCm where GCD(N,M) > 1
-            /// Uses GCD parallel PCIeBAR bridges for increased bandwidth
+            /// Uses GCD parallel host-staged bridges for increased bandwidth
             GCD_MULTI_BRIDGE
         };
 
@@ -392,34 +390,18 @@ namespace llaminar2
         AsymmetricReduceScatterPlan planAsymmetricReduceScatter(size_t count, size_t element_size) const;
 
         /**
-         * @brief Compute bridge device pairs for GCD-based parallel bridging
-         *
-         * For asymmetric configs where GCD(cuda_count, rocm_count) > 1,
-         * multiple bridge pairs can operate in parallel for increased bandwidth.
-         *
-         * Example: 2 CUDA + 4 ROCm (GCD=2)
-         *   - Pair 0: CUDA[0] ↔ ROCm[0]
-         *   - Pair 1: CUDA[1] ↔ ROCm[2]
-         *
-         * The spacing in the ROCm array ensures even distribution.
-         *
-         * @return Vector of DevicePairs for parallel bridging
-         */
-        std::vector<DevicePair> computeBridgePairs() const;
-
-        /**
          * @brief Execute GCD-way multi-bridge allreduce pattern
          *
          * For asymmetric configs where GCD(cuda_count, rocm_count) > 1,
-         * this pattern uses GCD parallel PCIeBAR bridges:
+         * this pattern uses GCD parallel host-staged bridges:
          *
          * Phase 1: Parallel intra-domain allreduce
          *   - NCCL allreduce (all CUDA devices)
          *   - RCCL allreduce (all ROCm devices)
          *   - Both run in parallel
          *
-         * Phase 2: Multi-pair PCIeBAR allreduce
-         *   - GCD pairs exchange in parallel via PCIeBAR
+         * Phase 2: Multi-pair host-staged allreduce
+         *   - GCD pairs exchange in parallel via host-staged bridge
          *   - Each pair: CUDA[i] ↔ ROCm[i * (M/G)]
          *
          * Phase 3: Intra-domain broadcast from bridge devices
@@ -519,7 +501,7 @@ namespace llaminar2
          */
         struct Phase2Plan
         {
-            bool will_call_bridge_allreduce = false; ///< True if PCIeBAR allreduce will be called
+            bool will_call_bridge_allreduce = false; ///< True if host-staged bridge allreduce will be called
             DeviceId cuda_bridge_device;             ///< CUDA bridge device (cuda:0)
             DeviceId rocm_bridge_device;             ///< ROCm bridge device (rocm:0)
         };
@@ -528,7 +510,7 @@ namespace llaminar2
          * @brief Plan Phase 2 without executing
          *
          * Returns information about cross-domain bridge exchange.
-         * Phase 2 uses PCIeBAR to allreduce between cuda:0 and rocm:0.
+         * Phase 2 uses host-staged allreduce between cuda:0 and rocm:0.
          *
          * @return Phase2Plan with execution details
          */
@@ -598,8 +580,8 @@ namespace llaminar2
          * @brief Execute Phase 2: Cross-domain bridge exchange
          *
          * Performs allreduce between the CUDA and ROCm bridge devices via
-         * PCIeBAR. After Phase 1, each bridge has its domain's partial sum.
-         * Phase 2 combines these via PCIeBAR to produce the global sum.
+         * host-staged bridge. After Phase 1, each bridge has its domain's partial sum.
+         * Phase 2 combines these via host-staged allreduce to produce the global sum.
          *
          * After this phase:
          * - cuda_bridge_buffer contains global sum
@@ -649,7 +631,7 @@ namespace llaminar2
          *
          * Convenience helper that runs the standard 3-phase pattern:
          * 1. Phase 1: Intra-domain reduce (NCCL/RCCL)
-         * 2. Phase 2: Bridge exchange (PCIeBAR)
+         * 2. Phase 2: Bridge exchange (host-staged)
          * 3. Phase 3: Intra-domain broadcast (NCCL/RCCL)
          *
          * Used as fallback when optimized patterns (reduce-scatter, pipelining)
@@ -677,7 +659,7 @@ namespace llaminar2
          * 2. Bridge exchange (only exchange bridge device chunks, much smaller)
          * 3. AllGather in each domain (reassemble full tensor)
          *
-         * This reduces cross-vendor PCIe BAR traffic from 100% to 1/max(N,M).
+         * This reduces cross-vendor HOST bridge traffic from 100% to 1/max(N,M).
          *
          * @param cuda_buffers Device buffers for CUDA GPUs
          * @param rocm_buffers Device buffers for ROCm GPUs
@@ -828,7 +810,7 @@ namespace llaminar2
          * @brief Execute reduce-scatter pattern with Phase 2→3 pipelining
          *
          * Optimized version of executeReduceScatterPattern that overlaps
-         * Phase 2 (PCIe BAR bridge transfer) with Phase 3 (intra-domain allgather)
+         * Phase 2 (HOST bridge transfer) with Phase 3 (intra-domain allgather)
          * using chunk-based pipelining.
          *
          * Algorithm:
@@ -878,7 +860,7 @@ namespace llaminar2
         /// Create RCCL backend for ROCm devices (if needed)
         bool createRCCLBackend();
 
-        /// Create PCIeBAR backend for cross-vendor bridge
+        /// Create HOST backend for cross-vendor bridge
         bool createBridgeBackend();
 
         // =====================================================================
@@ -900,15 +882,9 @@ namespace llaminar2
         DeviceGroup device_group_;
 
         /// Sub-backends
-        std::unique_ptr<NCCLBackend> nccl_backend_;      ///< For CUDA domain (only if >1 CUDA)
-        std::unique_ptr<RCCLBackend> rccl_backend_;      ///< For ROCm domain (only if >1 ROCm)
-        std::unique_ptr<PCIeBARBackend> bridge_backend_; ///< For cross-domain (cuda:0 ↔ rocm:0)
-
-        /// Multi-pair bridge backend for GCD > 1 asymmetric configs
-        std::unique_ptr<PCIeBARBackend> multi_pair_bridge_backend_;
-
-        /// Cached bridge pairs for GCD multi-bridge pattern
-        std::vector<DevicePair> bridge_pairs_;
+        std::unique_ptr<NCCLBackend> nccl_backend_;   ///< For CUDA domain (only if >1 CUDA)
+        std::unique_ptr<RCCLBackend> rccl_backend_;   ///< For ROCm domain (only if >1 ROCm)
+        std::unique_ptr<HostBackend> bridge_backend_; ///< For cross-domain (host-staged)
 
         /// Last error message
         std::string last_error_;
@@ -966,9 +942,6 @@ namespace llaminar2
         bool hasNCCLBackend() const { return false; }
         bool hasRCCLBackend() const { return false; }
         bool hasBridgeBackend() const { return false; }
-
-        // GCD multi-bridge stubs
-        std::vector<DevicePair> computeBridgePairs() const { return {}; }
 
         // Allreduce pattern enum (stub version)
         enum class AllreducePattern

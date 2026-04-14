@@ -571,11 +571,11 @@ namespace llaminar2
                     double total_mb = total_bytes / (1024.0 * 1024.0);
                     double used_mb = (total_bytes - free_bytes) / (1024.0 * 1024.0);
                     LOG_ERROR("[ROCmBackend] Insufficient GPU memory on device " << device_id
-                              << ": requested " << std::fixed << std::setprecision(1) << req_mb
-                              << " MB but only " << free_mb << " MB free ("
-                              << used_mb << " / " << total_mb << " MB used). "
-                              << "Try reducing context length (-c), using a smaller model, "
-                              << "or adding more GPUs for tensor parallelism.");
+                                                                                 << ": requested " << std::fixed << std::setprecision(1) << req_mb
+                                                                                 << " MB but only " << free_mb << " MB free ("
+                                                                                 << used_mb << " / " << total_mb << " MB used). "
+                                                                                 << "Try reducing context length (-c), using a smaller model, "
+                                                                                 << "or adding more GPUs for tensor parallelism.");
                     return nullptr;
                 }
             }
@@ -1265,7 +1265,7 @@ namespace llaminar2
 
         hipError_t err;
 
-        // Attempt 1: IoMemory flag (most promising for BAR memory)
+        // Attempt 1: IoMemory flag (for memory-mapped I/O regions)
         LOG_INFO("[ROCmBackend::registerIoMemory] Trying hipHostRegisterIoMemory flag (0x4)");
         err = hipHostRegister(ptr, size, hipHostRegisterIoMemory);
 

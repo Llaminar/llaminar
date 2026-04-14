@@ -185,7 +185,7 @@ TEST_F(Test__ExecutionPlanBuilder, BuildPlan_LocalTP_MixedGPUs_UsesPCIeBAR)
     const auto &plan = plans[0];
 
     EXPECT_EQ(plan.local_tp_devices.size(), 2);
-    EXPECT_EQ(plan.local_tp_backend, CollectiveBackendType::PCIE_BAR);
+    EXPECT_EQ(plan.local_tp_backend, CollectiveBackendType::HETEROGENEOUS);
 
     auto errors = plan.validate();
     EXPECT_TRUE(errors.empty()) << "Errors: " << (errors.empty() ? "" : errors[0]);
@@ -573,7 +573,7 @@ TEST_F(Test__ExecutionPlanBuilder, BuildPlan_NamedDomains_LocalPP_TPWeightsPropa
     mixed.name = "mixed_tp";
     mixed.devices = {GlobalDeviceAddress::cuda(0, 0), GlobalDeviceAddress::rocm(0, 0)};
     mixed.weights = {0.7f, 0.3f};
-    mixed.backend = CollectiveBackendType::PCIE_BAR;
+    mixed.backend = CollectiveBackendType::HETEROGENEOUS;
 
     DomainDefinition single;
     single.name = "single_gpu";
@@ -607,7 +607,7 @@ TEST_F(Test__ExecutionPlanBuilder, BuildPlan_NamedDomains_LocalPP_TPWeightsPropa
     ASSERT_EQ(plan.local_pp_stage_tp_info[0].tp_weights.size(), 2);
     EXPECT_FLOAT_EQ(plan.local_pp_stage_tp_info[0].tp_weights[0], 0.7f);
     EXPECT_FLOAT_EQ(plan.local_pp_stage_tp_info[0].tp_weights[1], 0.3f);
-    EXPECT_EQ(plan.local_pp_stage_tp_info[0].tp_backend, CollectiveBackendType::PCIE_BAR);
+    EXPECT_EQ(plan.local_pp_stage_tp_info[0].tp_backend, CollectiveBackendType::HETEROGENEOUS);
 
     // Stage 1: single device (no TP weights)
     EXPECT_EQ(plan.local_pp_stage_tp_info[1].devices.size(), 1);
@@ -779,7 +779,7 @@ TEST_F(Test__ExecutionPlanBuilder, BuildPlan_NamedDomains_MixedVendorTP)
         GlobalDeviceAddress::cuda(0, 0),
         GlobalDeviceAddress::rocm(0, 0)};
     mixed.weights = {0.6f, 0.4f}; // CUDA is faster
-    mixed.backend = CollectiveBackendType::PCIE_BAR;
+    mixed.backend = CollectiveBackendType::HETEROGENEOUS;
 
     config.domain_definitions = {mixed};
 
@@ -795,7 +795,7 @@ TEST_F(Test__ExecutionPlanBuilder, BuildPlan_NamedDomains_MixedVendorTP)
     EXPECT_EQ(domain.devices.size(), 2);
     EXPECT_EQ(domain.weights.size(), 2);
     EXPECT_FLOAT_EQ(domain.weights[0], 0.6f);
-    EXPECT_EQ(domain.backend, CollectiveBackendType::PCIE_BAR);
+    EXPECT_EQ(domain.backend, CollectiveBackendType::HETEROGENEOUS);
 
     auto errors = plan.validate();
     EXPECT_TRUE(errors.empty()) << "Errors: " << (errors.empty() ? "" : errors[0]);

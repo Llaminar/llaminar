@@ -75,7 +75,7 @@ namespace llaminar2
      * When transferring FROM a TP domain:
      * - After TP allreduce, all devices have identical data
      * - Use any device as source (typically device 0)
-     * - The TP context may have BAR-backed buffers for cross-vendor transfer
+     * - The TP context may have registered output tensors for cross-vendor transfer
      *
      * When transferring TO a TP domain:
      * - For replicated data: broadcast to all devices
@@ -153,7 +153,7 @@ namespace llaminar2
         /**
          * @brief Get the single device (only valid for SINGLE_DEVICE type)
          */
-        const GlobalDeviceAddress& device() const
+        const GlobalDeviceAddress &device() const
         {
             if (type_ != PPStageType::SINGLE_DEVICE)
             {
@@ -165,7 +165,7 @@ namespace llaminar2
         /**
          * @brief Get the TP context (only valid for TP_DOMAIN type)
          */
-        ILocalTPContext* asTPContext() const
+        ILocalTPContext *asTPContext() const
         {
             if (type_ != PPStageType::TP_DOMAIN)
             {
@@ -185,7 +185,7 @@ namespace llaminar2
         /**
          * @brief Get the global TP context (only valid for GLOBAL_TP_DOMAIN type)
          */
-        IGlobalTPContext* asGlobalTPContext() const
+        IGlobalTPContext *asGlobalTPContext() const
         {
             if (type_ != PPStageType::GLOBAL_TP_DOMAIN)
             {
@@ -205,7 +205,7 @@ namespace llaminar2
         /**
          * @brief Get the nested PP context (only valid for NESTED_PP type)
          */
-        ILocalPPContext* asNestedPP() const
+        ILocalPPContext *asNestedPP() const
         {
             if (type_ != PPStageType::NESTED_PP)
             {
@@ -246,7 +246,7 @@ namespace llaminar2
         /**
          * @brief Check if this stage contains a specific device
          */
-        bool containsDevice(const GlobalDeviceAddress& device) const;
+        bool containsDevice(const GlobalDeviceAddress &device) const;
 
         /**
          * @brief Human-readable description

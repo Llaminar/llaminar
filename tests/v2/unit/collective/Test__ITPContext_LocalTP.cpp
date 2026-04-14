@@ -22,7 +22,7 @@
  * For actual collective operation testing with real data, see:
  * - Test__CollectiveBackendIntegration.cpp (MPI-based CPU collectives)
  * - Test__LocalTPMultiDevice.cpp (GPU-based NCCL/RCCL collectives)
- * - Test__LocalTPBackendBehavior.cpp (PCIeBAR heterogeneous collectives)
+ * - Test__LocalTPBackendBehavior.cpp (HETEROGENEOUS collectives)
  *
  * These tests verify the ITPContext interface abstraction works correctly,
  * which is the foundation for the unified TP interface plan.
@@ -58,7 +58,7 @@ protected:
         // Create a LocalTPContext with HOST backend (works without GPU)
         local_ctx_ = createLocalTPContext(
             {cpu0_, cpu1_},
-            {},  // Equal weights
+            {}, // Equal weights
             CollectiveBackendType::HOST);
 
         // Cast to base interface for testing
@@ -360,7 +360,7 @@ protected:
 
         local_ctx_ = createLocalTPContext(
             {cpu0_, cpu1_, cpu2_},
-            {},  // Equal weights
+            {}, // Equal weights
             CollectiveBackendType::HOST);
 
         base_ctx_ = local_ctx_.get();

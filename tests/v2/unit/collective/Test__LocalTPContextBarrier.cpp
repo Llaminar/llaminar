@@ -2,11 +2,11 @@
  * @file Test__LocalTPContextBarrier.cpp
  * @brief Unit tests for LocalTPContext barrier synchronization
  *
- * Tests the NCCL-style barrier mechanism for PCIeBAR heterogeneous allreduce
+ * Tests the NCCL-style barrier mechanism for HETEROGENEOUS allreduce
  * where multiple device threads must rendezvous before the actual data transfer.
  *
- * NOTE: The barrier mechanism is only active for PCIeBAR backend with CUDA+ROCm.
- * Single-device tests verify basic functionality, while PCIeBAR tests verify
+ * NOTE: The barrier mechanism is only active for HETEROGENEOUS backend with CUDA+ROCm.
+ * Single-device tests verify basic functionality, while HETEROGENEOUS tests verify
  * the actual barrier synchronization.
  *
  * @author David Sanftenberg
@@ -41,7 +41,7 @@ using namespace llaminar2::test;
  *
  * Tests the barrier mechanism using realistic device configurations.
  * - Single-device tests verify no-op behavior
- * - PCIeBAR tests verify actual barrier rendezvous (requires CUDA+ROCm)
+ * - HETEROGENEOUS tests verify actual barrier rendezvous (requires CUDA+ROCm)
  */
 class Test__LocalTPContextBarrier : public ::testing::Test
 {
@@ -195,12 +195,12 @@ TEST_F(Test__LocalTPContextBarrier, OutOfPlaceAllreduceSingleDevice)
 }
 
 // =============================================================================
-// PCIeBAR-Specific Tests - MIGRATED TO INTEGRATION TESTS
+// HETEROGENEOUS-Specific Tests - MIGRATED TO INTEGRATION TESTS
 // =============================================================================
-// NOTE: Hardware-dependent PCIeBAR barrier tests (PCIeBarBarrierRendezvous,
-// PCIeBarMultipleBarrierCycles, PCIeBarStressTest, FirstArrivalWaitsSecondTriggers)
+// NOTE: Hardware-dependent HETEROGENEOUS barrier tests (BarrierRendezvous,
+// MultipleBarrierCycles, StressTest, FirstArrivalWaitsSecondTriggers)
 // have been migrated to integration tests in Test__LocalTPBackendBehavior.cpp.
-// Those tests require actual CUDA+ROCm hardware with PCIe BAR support.
+// Those tests require actual CUDA+ROCm hardware.
 
 // =============================================================================
 // Backend Fallback Tests

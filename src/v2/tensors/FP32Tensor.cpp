@@ -16,7 +16,6 @@
 #include "../backends/IBackend.h"
 #include "../backends/BackendManager.h"
 #include "../kernels/cpu/ops/CPURMSNormKernelT.h"
-#include "../collective/backends/PCIeBARBackend.h" // For BAR-backed tensor support
 
 #include "../kernels/cpu/ops/CPUEmbeddingKernelT.h"
 #include <cstring>
@@ -121,76 +120,9 @@ namespace llaminar2
         return tensor;
     }
 
-    std::unique_ptr<FP32Tensor> FP32Tensor::createBARBacked(
-        const std::vector<size_t> &shape,
-        DeviceId cuda_device,
-        DeviceId rocm_device,
-        PCIeBARBackend *backend)
-    {
-#if defined(HAVE_CUDA) && defined(HAVE_ROCM)
-        // Validate inputs
-        if (!cuda_device.is_cuda())
-        {
-            LOG_ERROR("[FP32Tensor::createBARBacked] cuda_device must be CUDA, got: " << cuda_device.toString());
-            return nullptr;
-        }
-        if (!rocm_device.is_rocm())
-        {
-            LOG_ERROR("[FP32Tensor::createBARBacked] rocm_device must be ROCm, got: " << rocm_device.toString());
-            return nullptr;
-        }
-        if (!backend)
-        {
-            LOG_ERROR("[FP32Tensor::createBARBacked] backend must not be null");
-            return nullptr;
-        }
-        if (!backend->isInitialized())
-        {
-            LOG_ERROR("[FP32Tensor::createBARBacked] backend must be initialized");
-            return nullptr;
-        }
-
-        // Calculate tensor size
-        size_t count = 1;
-        for (auto dim : shape)
-        {
-            count *= dim;
-        }
-        size_t bytes = count * sizeof(float);
-
-        // Create tensor with regular constructor
-        // Note: We use cuda_device as the "home" device since CUDA will write to it
-        auto tensor = std::make_unique<FP32Tensor>(shape, cuda_device);
-
-        // Try to initialize as BAR-backed tensor via base class
-        if (!tensor->initBARBackedMemory(bytes, cuda_device, rocm_device, backend))
-        {
-            LOG_ERROR("[FP32Tensor::createBARBacked] Failed to allocate BAR-backed memory ("
-                      << bytes << " bytes)");
-            return nullptr; // Unlike createMapped, we don't fall back - BAR is required
-        }
-
-        LOG_DEBUG("[FP32Tensor::createBARBacked] Created BAR-backed tensor: "
-                  << shape[0] << "x" << (shape.size() > 1 ? shape[1] : 1)
-                  << " (" << bytes << " bytes)"
-                  << " cuda=" << cuda_device.toString()
-                  << " rocm=" << rocm_device.toString());
-
-        return tensor;
-#else
-        // Stub when CUDA and ROCm are not both available
-        LOG_ERROR("[FP32Tensor::createBARBacked] Requires both HAVE_CUDA and HAVE_ROCM");
-        (void)shape;
-        (void)cuda_device;
-        (void)rocm_device;
-        (void)backend;
-        return nullptr;
-#endif
-    }
-
     FP32Tensor::~FP32Tensor()
     {
-        // Mapped memory and BAR-backed memory cleanup is handled by TensorBase destructor
+        // Mapped memory cleanup is handled by TensorBase destructor
         // Nothing tensor-specific to clean up here
     }
 

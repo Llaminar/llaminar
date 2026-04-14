@@ -150,9 +150,9 @@ namespace llaminar2
         }
 
         cudaMemcpyAsync(result.d_rotations, host_rot.data(),
-                         total_floats * sizeof(float), cudaMemcpyHostToDevice, stream);
+                        total_floats * sizeof(float), cudaMemcpyHostToDevice, stream);
         cudaMemcpyAsync(result.d_rotations_t, host_rot_t.data(),
-                         total_floats * sizeof(float), cudaMemcpyHostToDevice, stream);
+                        total_floats * sizeof(float), cudaMemcpyHostToDevice, stream);
 
         return result;
     }
@@ -277,9 +277,10 @@ namespace llaminar2
 
         // Binary search for nearest TQ8 centroid
         int idx = 0;
-        // 7 binary search steps for 255 thresholds
-        #define TQ8_GPU_BSEARCH(STEP, OFFSET) \
-            if (rotated > d_TQ8_THRESHOLDS[idx + OFFSET]) idx += STEP;
+// 7 binary search steps for 255 thresholds
+#define TQ8_GPU_BSEARCH(STEP, OFFSET)             \
+    if (rotated > d_TQ8_THRESHOLDS[idx + OFFSET]) \
+        idx += STEP;
         TQ8_GPU_BSEARCH(128, 127)
         TQ8_GPU_BSEARCH(64, 63)
         TQ8_GPU_BSEARCH(32, 31)
@@ -287,8 +288,9 @@ namespace llaminar2
         TQ8_GPU_BSEARCH(8, 7)
         TQ8_GPU_BSEARCH(4, 3)
         TQ8_GPU_BSEARCH(2, 1)
-        if (rotated > d_TQ8_THRESHOLDS[idx]) idx += 1;
-        #undef TQ8_GPU_BSEARCH
+        if (rotated > d_TQ8_THRESHOLDS[idx])
+            idx += 1;
+#undef TQ8_GPU_BSEARCH
 
         // Write TQ8Block: [norm, residual_norm, indices[D]]
         // Layout: norm(4B) + residual_norm(4B) + indices(D bytes)
@@ -366,13 +368,15 @@ namespace llaminar2
 
         // Binary search for nearest TQ4 centroid (15 thresholds)
         int idx = 0;
-        #define TQ4_GPU_BSEARCH(STEP, OFFSET) \
-            if (rotated > d_TQ4_THRESHOLDS[idx + OFFSET]) idx += STEP;
+#define TQ4_GPU_BSEARCH(STEP, OFFSET)             \
+    if (rotated > d_TQ4_THRESHOLDS[idx + OFFSET]) \
+        idx += STEP;
         TQ4_GPU_BSEARCH(8, 7)
         TQ4_GPU_BSEARCH(4, 3)
         TQ4_GPU_BSEARCH(2, 1)
-        if (rotated > d_TQ4_THRESHOLDS[idx]) idx += 1;
-        #undef TQ4_GPU_BSEARCH
+        if (rotated > d_TQ4_THRESHOLDS[idx])
+            idx += 1;
+#undef TQ4_GPU_BSEARCH
 
         // TQ4 packing: 3 low bits go to mse_indices (packed 8→3 bytes),
         // 1 high bit goes to high_bits (packed 8→1 byte)
@@ -448,8 +452,8 @@ namespace llaminar2
 
         const int kv_dim = n_kv_heads * D;
         const float x = (phase == 0)
-            ? d_K_input[head * D + tid]
-            : d_V_input[head * D + tid];
+                            ? d_K_input[head * D + tid]
+                            : d_V_input[head * D + tid];
 
         // Block reduction for L2 norm
         __shared__ float s_reduce[32];
@@ -483,8 +487,9 @@ namespace llaminar2
         {
             // ---- TQ8: 8-bit binary search + write to ring ----
             int idx = 0;
-            #define TQ8_GPU_BSEARCH_F(STEP, OFFSET) \
-                if (rotated > d_TQ8_THRESHOLDS[idx + OFFSET]) idx += STEP;
+#define TQ8_GPU_BSEARCH_F(STEP, OFFSET)           \
+    if (rotated > d_TQ8_THRESHOLDS[idx + OFFSET]) \
+        idx += STEP;
             TQ8_GPU_BSEARCH_F(128, 127)
             TQ8_GPU_BSEARCH_F(64, 63)
             TQ8_GPU_BSEARCH_F(32, 31)
@@ -492,12 +497,13 @@ namespace llaminar2
             TQ8_GPU_BSEARCH_F(8, 7)
             TQ8_GPU_BSEARCH_F(4, 3)
             TQ8_GPU_BSEARCH_F(2, 1)
-            if (rotated > d_TQ8_THRESHOLDS[idx]) idx += 1;
-            #undef TQ8_GPU_BSEARCH_F
+            if (rotated > d_TQ8_THRESHOLDS[idx])
+                idx += 1;
+#undef TQ8_GPU_BSEARCH_F
 
             constexpr size_t block_size = sizeof(TQ8Block<D>);
             uint8_t *block_ptr = d_K_ring +
-                (static_cast<size_t>(ring_pos) * n_kv_heads + head) * block_size;
+                                 (static_cast<size_t>(ring_pos) * n_kv_heads + head) * block_size;
 
             if (tid == 0)
             {
@@ -511,13 +517,15 @@ namespace llaminar2
         {
             // ---- TQ4: 4-bit binary search + parallel packing + write to ring ----
             int idx = 0;
-            #define TQ4_GPU_BSEARCH_F(STEP, OFFSET) \
-                if (rotated > d_TQ4_THRESHOLDS[idx + OFFSET]) idx += STEP;
+#define TQ4_GPU_BSEARCH_F(STEP, OFFSET)           \
+    if (rotated > d_TQ4_THRESHOLDS[idx + OFFSET]) \
+        idx += STEP;
             TQ4_GPU_BSEARCH_F(8, 7)
             TQ4_GPU_BSEARCH_F(4, 3)
             TQ4_GPU_BSEARCH_F(2, 1)
-            if (rotated > d_TQ4_THRESHOLDS[idx]) idx += 1;
-            #undef TQ4_GPU_BSEARCH_F
+            if (rotated > d_TQ4_THRESHOLDS[idx])
+                idx += 1;
+#undef TQ4_GPU_BSEARCH_F
 
             // Store full index to shared memory for packing
             __shared__ uint8_t s_indices[128];
@@ -527,7 +535,7 @@ namespace llaminar2
             constexpr size_t MSE_BYTES = D * 3 / 8;
             constexpr size_t block_size = sizeof(TQ4Block<D>);
             uint8_t *block_ptr = d_V_ring +
-                (static_cast<size_t>(ring_pos) * n_kv_heads + head) * block_size;
+                                 (static_cast<size_t>(ring_pos) * n_kv_heads + head) * block_size;
 
             if (tid == 0)
             {
@@ -576,13 +584,13 @@ namespace llaminar2
     template <int D>
     __global__ void tq8_dequantize_kernel(
         const uint8_t *__restrict__ d_tq8_bytes, // raw TQ8Block<D> array
-        const float *__restrict__ d_rotations_t,  // [n_kv_heads * D * D] transposed
-        float *__restrict__ d_output,             // [count, n_kv_heads * D]
+        const float *__restrict__ d_rotations_t, // [n_kv_heads * D * D] transposed
+        float *__restrict__ d_output,            // [count, n_kv_heads * D]
         int count, int n_kv_heads,
         float rope_theta, int position_start,
         int max_seq_len, int tail)
     {
-        const int pos = blockIdx.x;  // position in linearized output
+        const int pos = blockIdx.x; // position in linearized output
         const int head = blockIdx.y;
         const int tid = threadIdx.x;
 
@@ -701,15 +709,33 @@ namespace llaminar2
         uint8_t low3;
         switch (within)
         {
-        case 0: low3 = b0 & 0x07; break;
-        case 1: low3 = (b0 >> 3) & 0x07; break;
-        case 2: low3 = ((b0 >> 6) | (b1 << 2)) & 0x07; break;
-        case 3: low3 = (b1 >> 1) & 0x07; break;
-        case 4: low3 = (b1 >> 4) & 0x07; break;
-        case 5: low3 = ((b1 >> 7) | (b2 << 1)) & 0x07; break;
-        case 6: low3 = (b2 >> 2) & 0x07; break;
-        case 7: low3 = (b2 >> 5) & 0x07; break;
-        default: low3 = 0; break;
+        case 0:
+            low3 = b0 & 0x07;
+            break;
+        case 1:
+            low3 = (b0 >> 3) & 0x07;
+            break;
+        case 2:
+            low3 = ((b0 >> 6) | (b1 << 2)) & 0x07;
+            break;
+        case 3:
+            low3 = (b1 >> 1) & 0x07;
+            break;
+        case 4:
+            low3 = (b1 >> 4) & 0x07;
+            break;
+        case 5:
+            low3 = ((b1 >> 7) | (b2 << 1)) & 0x07;
+            break;
+        case 6:
+            low3 = (b2 >> 2) & 0x07;
+            break;
+        case 7:
+            low3 = (b2 >> 5) & 0x07;
+            break;
+        default:
+            low3 = 0;
+            break;
         }
 
         // Unpack high bit
@@ -792,7 +818,7 @@ namespace llaminar2
         {
             constexpr size_t block_size = sizeof(TQ8Block<D>);
             const uint8_t *block_ptr = k_cache +
-                (static_cast<size_t>(ring_pos) * n_kv_heads + head) * block_size;
+                                       (static_cast<size_t>(ring_pos) * n_kv_heads + head) * block_size;
             const float norm = reinterpret_cast<const float *>(block_ptr)[0];
             const uint8_t idx = block_ptr[2 * sizeof(float) + tid];
 
@@ -832,7 +858,7 @@ namespace llaminar2
         {
             constexpr size_t block_size = sizeof(TQ4Block<D>);
             const uint8_t *block_ptr = v_cache +
-                (static_cast<size_t>(ring_pos) * n_kv_heads + head) * block_size;
+                                       (static_cast<size_t>(ring_pos) * n_kv_heads + head) * block_size;
             const float norm = reinterpret_cast<const float *>(block_ptr)[0];
 
             constexpr size_t MSE_BYTES = D * 3 / 8;
@@ -850,15 +876,33 @@ namespace llaminar2
             uint8_t low3;
             switch (within)
             {
-            case 0: low3 = b0 & 0x07; break;
-            case 1: low3 = (b0 >> 3) & 0x07; break;
-            case 2: low3 = ((b0 >> 6) | (b1 << 2)) & 0x07; break;
-            case 3: low3 = (b1 >> 1) & 0x07; break;
-            case 4: low3 = (b1 >> 4) & 0x07; break;
-            case 5: low3 = ((b1 >> 7) | (b2 << 1)) & 0x07; break;
-            case 6: low3 = (b2 >> 2) & 0x07; break;
-            case 7: low3 = (b2 >> 5) & 0x07; break;
-            default: low3 = 0; break;
+            case 0:
+                low3 = b0 & 0x07;
+                break;
+            case 1:
+                low3 = (b0 >> 3) & 0x07;
+                break;
+            case 2:
+                low3 = ((b0 >> 6) | (b1 << 2)) & 0x07;
+                break;
+            case 3:
+                low3 = (b1 >> 1) & 0x07;
+                break;
+            case 4:
+                low3 = (b1 >> 4) & 0x07;
+                break;
+            case 5:
+                low3 = ((b1 >> 7) | (b2 << 1)) & 0x07;
+                break;
+            case 6:
+                low3 = (b2 >> 2) & 0x07;
+                break;
+            case 7:
+                low3 = (b2 >> 5) & 0x07;
+                break;
+            default:
+                low3 = 0;
+                break;
             }
             const uint8_t high1 = (high_ptr[tid / 8] >> (tid % 8)) & 0x01;
             const uint8_t full_idx = low3 | (high1 << 3);
@@ -895,7 +939,7 @@ namespace llaminar2
 
         // Load centroid for the single new position
         const uint8_t *block_ptr = p.cache +
-            (static_cast<size_t>(p.ring_pos) * n_kv_heads + head) * block_size;
+                                   (static_cast<size_t>(p.ring_pos) * n_kv_heads + head) * block_size;
         const float norm = reinterpret_cast<const float *>(block_ptr)[0];
         const uint8_t idx = block_ptr[2 * sizeof(float) + tid];
 
@@ -951,7 +995,7 @@ namespace llaminar2
 
         // Load TQ4 centroid for the single new position
         const uint8_t *block_ptr = p.cache +
-            (static_cast<size_t>(p.ring_pos) * n_kv_heads + head) * block_size;
+                                   (static_cast<size_t>(p.ring_pos) * n_kv_heads + head) * block_size;
         const float norm = reinterpret_cast<const float *>(block_ptr)[0];
 
         constexpr size_t MSE_BYTES = D * 3 / 8;
@@ -969,15 +1013,33 @@ namespace llaminar2
         uint8_t low3;
         switch (within)
         {
-        case 0: low3 = b0 & 0x07; break;
-        case 1: low3 = (b0 >> 3) & 0x07; break;
-        case 2: low3 = ((b0 >> 6) | (b1 << 2)) & 0x07; break;
-        case 3: low3 = (b1 >> 1) & 0x07; break;
-        case 4: low3 = (b1 >> 4) & 0x07; break;
-        case 5: low3 = ((b1 >> 7) | (b2 << 1)) & 0x07; break;
-        case 6: low3 = (b2 >> 2) & 0x07; break;
-        case 7: low3 = (b2 >> 5) & 0x07; break;
-        default: low3 = 0; break;
+        case 0:
+            low3 = b0 & 0x07;
+            break;
+        case 1:
+            low3 = (b0 >> 3) & 0x07;
+            break;
+        case 2:
+            low3 = ((b0 >> 6) | (b1 << 2)) & 0x07;
+            break;
+        case 3:
+            low3 = (b1 >> 1) & 0x07;
+            break;
+        case 4:
+            low3 = (b1 >> 4) & 0x07;
+            break;
+        case 5:
+            low3 = ((b1 >> 7) | (b2 << 1)) & 0x07;
+            break;
+        case 6:
+            low3 = (b2 >> 2) & 0x07;
+            break;
+        case 7:
+            low3 = (b2 >> 5) & 0x07;
+            break;
+        default:
+            low3 = 0;
+            break;
         }
         const uint8_t high1 = (high_ptr[tid / 8] >> (tid % 8)) & 0x01;
         const uint8_t full_idx = low3 | (high1 << 3);
@@ -1030,7 +1092,7 @@ namespace llaminar2
     template <int D, int TILE, typename OutT = float>
     __global__ void tq8_dequantize_tiled_kernel(
         const uint8_t *__restrict__ d_tq8_bytes,
-        const float *__restrict__ d_rotations,    // R (non-transposed, row-major) for coalesced access
+        const float *__restrict__ d_rotations, // R (non-transposed, row-major) for coalesced access
         OutT *__restrict__ d_output,
         int count, int n_kv_heads,
         float rope_theta, int position_start,
@@ -1055,7 +1117,7 @@ namespace llaminar2
         // Phase 1: Load all TILE positions' centroid values into transposed shared memory
         float norms[TILE];
         int tile_count = 0;
-        #pragma unroll
+#pragma unroll
         for (int t = 0; t < TILE; ++t)
         {
             const int pos = tile_start + t;
@@ -1065,7 +1127,7 @@ namespace llaminar2
 
                 const int ring_pos = (tail + pos) % max_seq_len;
                 const uint8_t *block_ptr = d_tq8_bytes +
-                    (static_cast<size_t>(ring_pos) * n_kv_heads + head) * block_size;
+                                           (static_cast<size_t>(ring_pos) * n_kv_heads + head) * block_size;
 
                 norms[t] = reinterpret_cast<const float *>(block_ptr)[0];
                 const uint8_t idx = block_ptr[2 * sizeof(float) + tid];
@@ -1082,15 +1144,15 @@ namespace llaminar2
         // Phase 2: Loop-interchanged matmul — j outer, t inner
         // Rotation loaded ONCE per j (coalesced), TILE independent FMAs per j
         float vals[TILE];
-        #pragma unroll
+#pragma unroll
         for (int t = 0; t < TILE; ++t)
             vals[t] = 0.0f;
 
         for (int j = 0; j < D; ++j)
         {
             const float r = rot_head[j * D + tid]; // Coalesced: consecutive threads read consecutive addresses
-            #pragma unroll
-            for (int t = 0; t < TILE; ++t)          // TILE is compile-time → fully unrolls for 16-way ILP
+#pragma unroll
+            for (int t = 0; t < TILE; ++t)            // TILE is compile-time → fully unrolls for 16-way ILP
                 vals[t] += r * s_cents[j * TILE + t]; // Broadcast: all threads read same address
         }
 
@@ -1140,7 +1202,7 @@ namespace llaminar2
     template <int D, int TILE, typename OutT = float>
     __global__ void tq4_dequantize_tiled_kernel(
         const uint8_t *__restrict__ d_tq4_bytes,
-        const float *__restrict__ d_rotations,    // R (non-transposed, row-major) for coalesced access
+        const float *__restrict__ d_rotations, // R (non-transposed, row-major) for coalesced access
         OutT *__restrict__ d_output,
         int count, int n_kv_heads,
         int max_seq_len, int tail)
@@ -1169,7 +1231,7 @@ namespace llaminar2
         const int within = tid % 8;
         const int byte_idx = group8 * 3;
 
-        #pragma unroll
+#pragma unroll
         for (int t = 0; t < TILE; ++t)
         {
             const int pos = tile_start + t;
@@ -1179,7 +1241,7 @@ namespace llaminar2
 
                 const int ring_pos = (tail + pos) % max_seq_len;
                 const uint8_t *block_ptr = d_tq4_bytes +
-                    (static_cast<size_t>(ring_pos) * n_kv_heads + head) * block_size;
+                                           (static_cast<size_t>(ring_pos) * n_kv_heads + head) * block_size;
 
                 norms[t] = reinterpret_cast<const float *>(block_ptr)[0];
 
@@ -1193,15 +1255,33 @@ namespace llaminar2
                 uint8_t low3;
                 switch (within)
                 {
-                case 0: low3 = b0 & 0x07; break;
-                case 1: low3 = (b0 >> 3) & 0x07; break;
-                case 2: low3 = ((b0 >> 6) | (b1 << 2)) & 0x07; break;
-                case 3: low3 = (b1 >> 1) & 0x07; break;
-                case 4: low3 = (b1 >> 4) & 0x07; break;
-                case 5: low3 = ((b1 >> 7) | (b2 << 1)) & 0x07; break;
-                case 6: low3 = (b2 >> 2) & 0x07; break;
-                case 7: low3 = (b2 >> 5) & 0x07; break;
-                default: low3 = 0; break;
+                case 0:
+                    low3 = b0 & 0x07;
+                    break;
+                case 1:
+                    low3 = (b0 >> 3) & 0x07;
+                    break;
+                case 2:
+                    low3 = ((b0 >> 6) | (b1 << 2)) & 0x07;
+                    break;
+                case 3:
+                    low3 = (b1 >> 1) & 0x07;
+                    break;
+                case 4:
+                    low3 = (b1 >> 4) & 0x07;
+                    break;
+                case 5:
+                    low3 = ((b1 >> 7) | (b2 << 1)) & 0x07;
+                    break;
+                case 6:
+                    low3 = (b2 >> 2) & 0x07;
+                    break;
+                case 7:
+                    low3 = (b2 >> 5) & 0x07;
+                    break;
+                default:
+                    low3 = 0;
+                    break;
                 }
 
                 const uint8_t high1 = (high_ptr[tid / 8] >> (tid % 8)) & 0x01;
@@ -1219,15 +1299,15 @@ namespace llaminar2
 
         // Phase 2: Loop-interchanged matmul
         float vals[TILE];
-        #pragma unroll
+#pragma unroll
         for (int t = 0; t < TILE; ++t)
             vals[t] = 0.0f;
 
         for (int j = 0; j < D; ++j)
         {
             const float r = rot_head[j * D + tid];
-            #pragma unroll
-            for (int t = 0; t < TILE; ++t)          // TILE is compile-time → fully unrolls for 16-way ILP
+#pragma unroll
+            for (int t = 0; t < TILE; ++t) // TILE is compile-time → fully unrolls for 16-way ILP
                 vals[t] += r * s_cents[j * TILE + t];
         }
 
@@ -1243,12 +1323,14 @@ namespace llaminar2
     __global__ void rope_apply_fp16_kernel(
         __half *__restrict__ d_K,
         int count, int n_kv_heads, int head_dim,
-        float rope_theta, int position_start)
+        float rope_theta, int position_start, int rope_dim)
     {
         // Each thread handles one (cos, sin) pair using half-split convention
         // Pair i: elements (i, i + half_dim) within each head
+        // rope_dim: number of dimensions to rotate (partial RoPE). 0 = full head_dim.
+        const int effective_rope_dim = (rope_dim > 0) ? rope_dim : head_dim;
         const int kv_dim = n_kv_heads * head_dim;
-        const int half_dim = head_dim / 2;
+        const int half_dim = effective_rope_dim / 2;
         const int total_pairs = count * n_kv_heads * half_dim;
         const int pair_global = blockIdx.x * blockDim.x + threadIdx.x;
 
@@ -1265,7 +1347,7 @@ namespace llaminar2
         const int pair_idx = remaining % pairs_per_head;
 
         const int actual_pos = position_start + pos;
-        const float freq = 1.0f / powf(rope_theta, static_cast<float>(2 * pair_idx) / static_cast<float>(head_dim));
+        const float freq = 1.0f / powf(rope_theta, static_cast<float>(2 * pair_idx) / static_cast<float>(effective_rope_dim));
         const float angle = static_cast<float>(actual_pos) * freq;
         const float cos_val = cosf(angle);
         const float sin_val = sinf(angle);
@@ -1284,10 +1366,11 @@ namespace llaminar2
     __global__ void rope_apply_fp32_kernel(
         float *__restrict__ d_K,
         int count, int n_kv_heads, int head_dim,
-        float rope_theta, int position_start)
+        float rope_theta, int position_start, int rope_dim)
     {
+        const int effective_rope_dim = (rope_dim > 0) ? rope_dim : head_dim;
         const int kv_dim = n_kv_heads * head_dim;
-        const int half_dim = head_dim / 2;
+        const int half_dim = effective_rope_dim / 2;
         const int total_pairs = count * n_kv_heads * half_dim;
         const int pair_global = blockIdx.x * blockDim.x + threadIdx.x;
 
@@ -1303,7 +1386,7 @@ namespace llaminar2
         const int pair_idx = remaining % pairs_per_head;
 
         const int actual_pos = position_start + pos;
-        const float freq = 1.0f / powf(rope_theta, static_cast<float>(2 * pair_idx) / static_cast<float>(head_dim));
+        const float freq = 1.0f / powf(rope_theta, static_cast<float>(2 * pair_idx) / static_cast<float>(effective_rope_dim));
         const float angle = static_cast<float>(actual_pos) * freq;
         const float cos_val = cosf(angle);
         const float sin_val = sinf(angle);
@@ -1589,11 +1672,11 @@ namespace llaminar2
 
         // Quantize
         bool ok = cuda_tq8_quantize(d_K_new, d_K_rotations, d_k_temp,
-                                     num_tokens, n_kv_heads, head_dim, stream);
+                                    num_tokens, n_kv_heads, head_dim, stream);
         if (ok)
         {
             ok = cuda_tq4_quantize(d_V_new, d_V_rotations, d_v_temp,
-                                    num_tokens, n_kv_heads, head_dim, stream);
+                                   num_tokens, n_kv_heads, head_dim, stream);
         }
 
         if (ok)
@@ -1859,17 +1942,18 @@ namespace llaminar2
         __half *d_K, int count,
         int n_kv_heads, int head_dim,
         float rope_theta, int position_start,
-        cudaStream_t stream)
+        cudaStream_t stream, int rope_dim)
     {
         if (!d_K || count <= 0 || rope_theta <= 0.0f)
             return false;
 
-        const int total_pairs = count * n_kv_heads * (head_dim / 2);
+        const int effective_rope_dim = (rope_dim > 0) ? rope_dim : head_dim;
+        const int total_pairs = count * n_kv_heads * (effective_rope_dim / 2);
         const dim3 block(256);
         const dim3 grid((total_pairs + 255) / 256);
 
         rope_apply_fp16_kernel<<<grid, block, 0, stream>>>(
-            d_K, count, n_kv_heads, head_dim, rope_theta, position_start);
+            d_K, count, n_kv_heads, head_dim, rope_theta, position_start, rope_dim);
 
         return cudaGetLastError() == cudaSuccess;
     }
@@ -1878,17 +1962,18 @@ namespace llaminar2
         float *d_K, int count,
         int n_kv_heads, int head_dim,
         float rope_theta, int position_start,
-        cudaStream_t stream)
+        cudaStream_t stream, int rope_dim)
     {
         if (!d_K || count <= 0 || rope_theta <= 0.0f)
             return false;
 
-        const int total_pairs = count * n_kv_heads * (head_dim / 2);
+        const int effective_rope_dim = (rope_dim > 0) ? rope_dim : head_dim;
+        const int total_pairs = count * n_kv_heads * (effective_rope_dim / 2);
         const dim3 block(256);
         const dim3 grid((total_pairs + 255) / 256);
 
         rope_apply_fp32_kernel<<<grid, block, 0, stream>>>(
-            d_K, count, n_kv_heads, head_dim, rope_theta, position_start);
+            d_K, count, n_kv_heads, head_dim, rope_theta, position_start, rope_dim);
 
         return cudaGetLastError() == cudaSuccess;
     }

@@ -80,7 +80,6 @@ TEST(Test__OrchestrationConfig, CollectiveBackendTypeToString)
     EXPECT_STREQ(collectiveBackendTypeToString(CollectiveBackendType::AUTO), "auto");
     EXPECT_STREQ(collectiveBackendTypeToString(CollectiveBackendType::NCCL), "nccl");
     EXPECT_STREQ(collectiveBackendTypeToString(CollectiveBackendType::RCCL), "rccl");
-    EXPECT_STREQ(collectiveBackendTypeToString(CollectiveBackendType::PCIE_BAR), "pcie_bar");
     EXPECT_STREQ(collectiveBackendTypeToString(CollectiveBackendType::UPI), "upi");
     EXPECT_STREQ(collectiveBackendTypeToString(CollectiveBackendType::MPI), "mpi");
     EXPECT_STREQ(collectiveBackendTypeToString(CollectiveBackendType::HOST), "host");
@@ -92,9 +91,6 @@ TEST(Test__OrchestrationConfig, ParseCollectiveBackendType)
     EXPECT_EQ(parseCollectiveBackendType("nccl"), CollectiveBackendType::NCCL);
     EXPECT_EQ(parseCollectiveBackendType("NCCL"), CollectiveBackendType::NCCL);
     EXPECT_EQ(parseCollectiveBackendType("rccl"), CollectiveBackendType::RCCL);
-    EXPECT_EQ(parseCollectiveBackendType("pcie_bar"), CollectiveBackendType::PCIE_BAR);
-    EXPECT_EQ(parseCollectiveBackendType("pcie-bar"), CollectiveBackendType::PCIE_BAR);
-    EXPECT_EQ(parseCollectiveBackendType("bar"), CollectiveBackendType::PCIE_BAR);
     EXPECT_EQ(parseCollectiveBackendType("upi"), CollectiveBackendType::UPI);
     EXPECT_EQ(parseCollectiveBackendType("mpi"), CollectiveBackendType::MPI);
     EXPECT_EQ(parseCollectiveBackendType("host"), CollectiveBackendType::HOST);
@@ -141,14 +137,14 @@ TEST(Test__DomainDefinition, Parse_WithBackend)
 
 TEST(Test__DomainDefinition, Parse_WithWeightsAndBackend)
 {
-    auto def = DomainDefinition::parse("hybrid=cuda:0,rocm:0;weights=0.6,0.4;backend=pciebar");
+    auto def = DomainDefinition::parse("hybrid=cuda:0,rocm:0;weights=0.6,0.4;backend=heterogeneous");
 
     EXPECT_EQ(def.name, "hybrid");
     EXPECT_EQ(def.devices.size(), 2);
     EXPECT_EQ(def.weights.size(), 2);
     EXPECT_FLOAT_EQ(def.weights[0], 0.6f);
     EXPECT_FLOAT_EQ(def.weights[1], 0.4f);
-    EXPECT_EQ(def.backend, CollectiveBackendType::PCIE_BAR);
+    EXPECT_EQ(def.backend, CollectiveBackendType::HETEROGENEOUS);
 }
 
 TEST(Test__DomainDefinition, Parse_SingleDevice)

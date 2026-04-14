@@ -298,7 +298,6 @@ TEST(Test__CoherenceState, ToString_Operations)
 TEST(Test__CoherenceState, ToString_Residency)
 {
     EXPECT_EQ(to_string(MemoryResidency::STANDARD), "STANDARD");
-    EXPECT_EQ(to_string(MemoryResidency::BAR_BACKED), "BAR_BACKED");
     EXPECT_EQ(to_string(MemoryResidency::MAPPED), "MAPPED");
 }
 

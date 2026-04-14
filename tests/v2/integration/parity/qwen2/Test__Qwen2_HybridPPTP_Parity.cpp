@@ -47,14 +47,14 @@ static const std::vector<TestConfig> kHybridPPTPConfigs = {
     {
         .name = "LocalPP_TP2xCUDA_ROCm",
         .devices = {ParityDeviceType::CUDA, ParityDeviceType::CUDA, ParityDeviceType::ROCm},
-        .parallelism = Parallelism::LocalPP, // PP between TP domain and ROCm
-        .collective = Collective::PCIeBAR,   // Cross-vendor transfer between stages
+        .parallelism = Parallelism::LocalPP,     // PP between TP domain and ROCm
+        .collective = Collective::HETEROGENEOUS, // Cross-vendor transfer between stages
         .thresholds = {
-            .cosine_threshold = 0.85f,
-            .decode_cosine_threshold = 0.80f,
+            .cosine_threshold = 0.96f,        // Observed: 0.998 prefill cosine
+            .decode_cosine_threshold = 0.95f, // Observed: 0.984 avg decode cosine
             .early_layers_count = 6,
             .min_early_layers_passed = 4,
-            .kl_threshold = 0.50f,                // Relaxed - combined TP+PP adds variance
+            .kl_threshold = 0.015f,               // Observed: 0.003 prefill KL (was 0.50 = 167x over-relaxed)
             .excluded_stages = kTPExcludedStages, // TP excluded stages apply to stage 0
         },
         .pp_stage_sizes = {2, 1},          // Stage 0: 2 devices (TP), Stage 1: 1 device
@@ -64,14 +64,14 @@ static const std::vector<TestConfig> kHybridPPTPConfigs = {
     {
         .name = "LocalPP_TP2xROCm_CUDA",
         .devices = {ParityDeviceType::ROCm, ParityDeviceType::ROCm, ParityDeviceType::CUDA},
-        .parallelism = Parallelism::LocalPP, // PP between TP domain and CUDA
-        .collective = Collective::PCIeBAR,   // Cross-vendor transfer between stages
+        .parallelism = Parallelism::LocalPP,     // PP between TP domain and CUDA
+        .collective = Collective::HETEROGENEOUS, // Cross-vendor transfer between stages
         .thresholds = {
-            .cosine_threshold = 0.85f,
-            .decode_cosine_threshold = 0.80f,
+            .cosine_threshold = 0.96f,        // Observed: 0.998 prefill cosine
+            .decode_cosine_threshold = 0.95f, // Observed: 0.984 avg decode cosine
             .early_layers_count = 6,
             .min_early_layers_passed = 4,
-            .kl_threshold = 0.50f,                // Relaxed - combined TP+PP adds variance
+            .kl_threshold = 0.015f,               // Observed: 0.002 prefill KL (was 0.50 = 239x over-relaxed)
             .excluded_stages = kTPExcludedStages, // TP excluded stages apply to stage 0
         },
         .pp_stage_sizes = {2, 1},          // Stage 0: 2 devices (TP), Stage 1: 1 device
@@ -84,11 +84,11 @@ static const std::vector<TestConfig> kHybridPPTPConfigs = {
         .parallelism = Parallelism::LocalPP, // PP between TP domain and CPU
         .collective = Collective::None,      // HOST backend for GPU→CPU transfer
         .thresholds = {
-            .cosine_threshold = 0.85f,
-            .decode_cosine_threshold = 0.80f,
+            .cosine_threshold = 0.96f,        // Observed: 0.998 prefill cosine
+            .decode_cosine_threshold = 0.95f, // Observed: 0.984 avg decode cosine
             .early_layers_count = 6,
             .min_early_layers_passed = 4,
-            .kl_threshold = 0.50f,                // Relaxed - combined TP+PP adds variance
+            .kl_threshold = 0.015f,               // Observed: 0.002 prefill KL (was 0.50 = 208x over-relaxed)
             .excluded_stages = kTPExcludedStages, // TP excluded stages apply to stage 0
         },
         .pp_stage_sizes = {2, 1},          // Stage 0: 2 devices (TP), Stage 1: 1 device

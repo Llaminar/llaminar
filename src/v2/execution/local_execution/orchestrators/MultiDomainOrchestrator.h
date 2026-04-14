@@ -64,7 +64,7 @@ namespace llaminar2
      * @brief Multi-domain tensor parallelism wrapper for DeviceGraphOrchestrator
      *
      * This class wraps DeviceGraphOrchestrator to add multi-domain TP support:
-     * - GPU_INTRA_RANK domain for attention head parallelism via PCIeBAR
+     * - GPU_INTRA_RANK domain for attention head parallelism via HOST
      * - CPU_CROSS_RANK domain for FFN parallelism via MPI/UPI
      *
      * The orchestrator manages:

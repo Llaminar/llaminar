@@ -122,19 +122,18 @@ namespace llaminar2
         void setComputeStreams(const std::vector<void *> &compute_streams) override;
 
         // =====================================================================
-        // BAR-Backed Tensor Registry (ILocalTPContext interface + concrete impl)
+        // Output Tensor Registry (ILocalTPContext interface + concrete impl)
         // =====================================================================
 
         /**
-         * @brief Register a BAR-backed tensor for a stage's output (interface impl)
+         * @brief Register an output tensor for a stage (interface impl)
          *
          * Called during graph construction for row-parallel stages (FFN_DOWN, Wo)
-         * when using PCIeBAR backend. The registered tensors are used by
-         * executePCIeBarAllreduce() for zero-copy reduction.
+         * to register output tensors for collective operations.
          *
          * @param stage_name Stage identifier (e.g., "layer0_ffn_down_allreduce")
          * @param device Device that owns this tensor (must be in devices())
-         * @param tensor Tensor to register (must be BAR-backed FP32 for PCIeBAR)
+         * @param tensor Tensor to register (must be FP32)
          */
         void registerBARBackedOutput(
             const std::string &stage_name,
@@ -142,7 +141,7 @@ namespace llaminar2
             TensorBase *tensor) override;
 
         /**
-         * @brief Check if a stage has any BAR-backed outputs registered
+         * @brief Check if a stage has any registered outputs
          *
          * @param stage_name Stage identifier
          * @return true if at least one device has a tensor registered
@@ -150,21 +149,11 @@ namespace llaminar2
         bool hasBARBackedOutputs(const std::string &stage_name) const override;
 
         /**
-         * @brief Clear all BAR-backed tensor registrations
+         * @brief Clear all registered output tensor registrations
          *
          * Called when resetting the context or changing buffer sizes.
          */
         void clearBARBackedOutputs() override;
-
-        /**
-         * @brief Get DirectP2PEngine for BAR-backed tensor allocation
-         *
-         * For PCIeBAR backend, returns the DirectP2PEngine used for BAR memory
-         * management. This allows TensorFactory to create BAR-backed tensors.
-         *
-         * @return Shared pointer to DirectP2PEngine, or nullptr if not available
-         */
-        std::shared_ptr<DirectP2PEngine> getDirectP2PEngine() const override;
 
         /**
          * @brief Reserve temporary buffer capacity for collective operations
@@ -177,10 +166,10 @@ namespace llaminar2
         bool reserveTempBufferBytes(size_t bytes) override;
 
         /**
-         * @brief Get all BAR-backed tensors for a stage (concrete implementation)
+         * @brief Get all registered tensors for a stage (concrete implementation)
          *
          * Returns tensors in device order (index i = tensor for devices()[i]).
-         * May contain nullptr entries for devices without BAR-backed outputs.
+         * May contain nullptr entries for devices without registered outputs.
          *
          * @param stage_name Stage identifier
          * @return Vector of FP32Tensor pointers (size = degree()), nullptr for missing entries
@@ -249,27 +238,12 @@ namespace llaminar2
         bool backend_initialized_ = false;
 
         // =====================================================================
-        // PCIeBAR Buffer Registration State
+        // Barrier Synchronization State
         // =====================================================================
-        // For PCIeBAR backend, we must allocate ROCm buffers in the BAR region
-        // so the correct offsets are used during cross-vendor allreduce.
-
-        /// Cached buffer size for PCIeBAR allreduce (to detect size changes)
-        size_t pciebar_buffer_size_ = 0;
-
-        /// Collective ID for PCIeBAR registered allreduce
-        std::string pciebar_collective_id_;
-
-        /// Whether PCIeBAR buffers have been registered
-        bool pciebar_buffers_registered_ = false;
-
-        // =====================================================================
-        // PCIeBAR Barrier Synchronization State
-        // =====================================================================
-        // For PCIeBAR backend with heterogeneous GPUs (CUDA + ROCm), threads from
+        // For multi-GPU backends with heterogeneous GPUs, threads from
         // different devices call allreduce() concurrently. We need a rendezvous
-        // barrier so all devices have contributed their data before the PCIeBAR
-        // transfer happens (NCCL-style collective semantics).
+        // barrier so all devices have contributed their data before the
+        // collective transfer happens.
 
         /// Mutex for barrier synchronization (separate from mutex_ to avoid deadlock)
         mutable std::mutex barrier_mutex_;
@@ -290,7 +264,7 @@ namespace llaminar2
         /// Tensor being reduced (set by first arrival, used by executor) [DEPRECATED: use barrier_tensors_]
         TensorBase *barrier_tensor_{nullptr};
 
-        /// Stage name for current barrier operation (for BAR-backed tensor lookup)
+        /// Stage name for current barrier operation (for registered tensor lookup)
         std::string barrier_stage_name_;
 
         /// Element count for current barrier operation (0 = use tensor->numel())
@@ -338,12 +312,10 @@ namespace llaminar2
         // =====================================================================
         // BAR-Backed Tensor Registry
         // =====================================================================
-        // For zero-copy allreduce, we need to know which stage outputs are
-        // allocated in BAR memory. When a stage has BAR-backed outputs registered,
-        // executePCIeBarAllreduce() can read directly from BAR instead of
-        // copying through host memory.
+        // For collective allreduce, we track which stage outputs are
+        // allocated for collective operations.
 
-        /// Map: stage_name -> (device_index -> BAR-backed FP32 tensor)
+        /// Map: stage_name -> (device_index -> registered FP32 tensor)
         /// The tensor at index i belongs to devices_[i]
         std::unordered_map<std::string, std::vector<FP32Tensor *>> bar_output_tensors_;
 
@@ -356,20 +328,6 @@ namespace llaminar2
          * @return true if backend was successfully initialized
          */
         bool initializeBackend();
-
-        /**
-         * @brief Ensure PCIeBAR buffers are allocated and registered
-         *
-         * For PCIeBAR backend, ROCm buffers must be allocated within the BAR region
-         * to get correct BAR offsets. This method:
-         * 1. Allocates ROCm buffer in BAR region (if not already done for this size)
-         * 2. Registers both CUDA and ROCm buffers with the backend
-         * 3. Returns the collective_id to use with allreduceRegistered()
-         *
-         * @param tensor Tensor to prepare for allreduce
-         * @return true if buffers are ready, false on failure
-         */
-        bool ensurePCIeBarBuffersRegistered(TensorBase *tensor);
 
         /**
          * @brief Get device pointers for all devices participating in collective
@@ -399,26 +357,6 @@ namespace llaminar2
          * @return true on success
          */
         bool allreduceImpl(TensorBase *tensor);
-
-        /**
-         * @brief Allreduce with barrier synchronization for PCIeBAR backend
-         *
-         * Implements NCCL-style collective semantics where all devices must
-         * call allreduce before any data transfer happens. This is necessary
-         * for heterogeneous GPU setups where CUDA and ROCm threads run
-         * independently and may be at different pipeline stages.
-         *
-         * The barrier works as follows:
-         * 1. First arrivals wait at the barrier
-         * 2. Last arrival executes the actual PCIeBAR transfer
-         * 3. All devices are released with the same result
-         *
-         * @param tensor Tensor to allreduce in-place
-         * @param stage_name Stage identifier for BAR-backed tensor lookup (optional)
-         * @param count Number of elements to reduce (0 = use tensor->numel())
-         * @return true on success (same result for all participants)
-         */
-        bool allreduceWithBarrier(TensorBase *tensor, const std::string &stage_name = "", size_t count = 0);
 
         /**
          * @brief Barrier-synchronized allreduce for NCCL/RCCL multi-GPU backends
@@ -496,18 +434,6 @@ namespace llaminar2
             CollectiveDataType expected_dtype) const;
 
         /**
-         * @brief Execute the actual PCIeBAR allreduce operation
-         *
-         * Called by the last arrival in allreduceWithBarrier(). All other
-         * threads are waiting, so we have exclusive access to the barrier_tensor_.
-         *
-         * @param tensor Tensor to allreduce in-place
-         * @param count Number of elements to reduce (0 = use tensor->numel())
-         * @return true on success
-         */
-        bool executePCIeBarAllreduce(TensorBase *tensor, size_t count = 0);
-
-        /**
          * @brief Normalize weights to sum to 1.0
          * @param weights Input weights (may not sum to 1.0)
          * @return Normalized weights
@@ -531,7 +457,7 @@ namespace llaminar2
          *
          * - All CUDA devices → NCCL
          * - All ROCm devices → RCCL
-         * - Mixed GPU types → PCIE_BAR
+         * - Mixed GPU types → HOST
          * - CPU involved → HOST
          *
          * @param devices Device list to analyze

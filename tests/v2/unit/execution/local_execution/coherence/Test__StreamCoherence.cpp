@@ -699,9 +699,9 @@ TEST_F(Test__StreamCoherence, Bug6_EnsureOnHost_NoEvent_UsesFullSync)
 
     // Simulate: tensor has been uploaded to GPU and a kernel has written to it
     // 1. Set gpu_device_ (tells ensureOnHost which backend to use)
-    //    Use ROCm device to avoid the PCIeBAR CUDA event proxy path
+    //    Use ROCm device to avoid the cross-vendor CUDA event proxy path
     //    (waitForEventWithProxy checks gpu_device.is_cuda() and routes through
-    //    PCIeBAR singleton if active, bypassing our mock)
+    //    backend singleton if active, bypassing our mock)
     tensor->injectGpuDevice(DeviceId::rocm(0));
 
     // 2. Allocate "device" memory through the mock backend
@@ -771,7 +771,7 @@ TEST_F(Test__StreamCoherence, Bug6_EnsureOnHost_WithEvent_UsesEventSync)
     // This verifies the event path still works correctly after the fix.
     //
     // We inject state directly (rather than calling mark_device_dirty_with_event)
-    // to avoid triggering the real PCIeBAR proxy path that the static
+    // to avoid triggering the real cross-vendor proxy path that the static
     // waitForEventWithProxy() uses for CUDA devices. The MockBackend handles
     // waitForEvent() correctly, but the static proxy bypasses it.
 
@@ -785,9 +785,9 @@ TEST_F(Test__StreamCoherence, Bug6_EnsureOnHost_WithEvent_UsesEventSync)
     MockBackend mock_backend;
     tensor->setBackendForTesting(&mock_backend);
 
-    // Use ROCm device to avoid the PCIeBAR CUDA event proxy path
+    // Use ROCm device to avoid the cross-vendor CUDA event proxy path
     // (waitForEventWithProxy checks gpu_device.is_cuda() and routes through
-    // PCIeBAR singleton if active, bypassing our mock)
+    // backend singleton if active, bypassing our mock)
     tensor->injectGpuDevice(DeviceId::rocm(0));
 
     size_t bytes = ROWS * COLS * sizeof(float);

@@ -160,7 +160,7 @@ namespace llaminar2::test
     {
     public:
         // Identity
-        CollectiveBackendType type() const override { return CollectiveBackendType::PCIE_BAR; }
+        CollectiveBackendType type() const override { return CollectiveBackendType::HOST; }
         std::string name() const override { return "MockRegistrationBackend"; }
 
         // Capability queries

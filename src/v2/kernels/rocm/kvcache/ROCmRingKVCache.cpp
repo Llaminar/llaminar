@@ -1316,18 +1316,21 @@ namespace llaminar2
             return nullptr;
         }
 
-        // Get device pointers via get_kv_for_attention
-        const void *d_k = nullptr;
-        const void *d_v = nullptr;
+        // Get device pointers via non-virtual get_kv_typed to avoid double-mapping
+        // when called from a derived class (e.g. ROCmHybridRingKVCache) that overrides
+        // the virtual get_kv_for_attention with its own layer remapping.
+        const DataT *d_k_typed = nullptr;
+        const DataT *d_v_typed = nullptr;
         int kv_len = 0;
 
-        if (!get_kv_for_attention(layer, seq_idx, &d_k, &d_v, &kv_len, 0))
+        if (!get_kv_typed(layer, seq_idx, &d_k_typed, &d_v_typed, &kv_len, 0))
         {
-            LOG_WARN("[ROCmRingKVCache::get_k] get_kv_for_attention failed for layer="
+            LOG_WARN("[ROCmRingKVCache::get_k] get_kv_typed failed for layer="
                      << layer << " seq_idx=" << seq_idx);
             return nullptr;
         }
 
+        const void *d_k = d_k_typed;
         if (!d_k || kv_len == 0)
         {
             // Empty cache - valid state, return nullptr
@@ -1387,18 +1390,21 @@ namespace llaminar2
             return nullptr;
         }
 
-        // Get device pointers via get_kv_for_attention
-        const void *d_k = nullptr;
-        const void *d_v = nullptr;
+        // Get device pointers via non-virtual get_kv_typed to avoid double-mapping
+        // when called from a derived class (e.g. ROCmHybridRingKVCache) that overrides
+        // the virtual get_kv_for_attention with its own layer remapping.
+        const DataT *d_k_typed = nullptr;
+        const DataT *d_v_typed = nullptr;
         int kv_len = 0;
 
-        if (!get_kv_for_attention(layer, seq_idx, &d_k, &d_v, &kv_len, 0))
+        if (!get_kv_typed(layer, seq_idx, &d_k_typed, &d_v_typed, &kv_len, 0))
         {
-            LOG_WARN("[ROCmRingKVCache::get_v] get_kv_for_attention failed for layer="
+            LOG_WARN("[ROCmRingKVCache::get_v] get_kv_typed failed for layer="
                      << layer << " seq_idx=" << seq_idx);
             return nullptr;
         }
 
+        const void *d_v = d_v_typed;
         if (!d_v || kv_len == 0)
         {
             // Empty cache - valid state, return nullptr
@@ -1525,21 +1531,67 @@ namespace llaminar2
                                             ITensor **out_k, ITensor **out_v,
                                             int *out_kv_len)
     {
-        ITensor *k = get_k(layer, seq_idx);
-        ITensor *v = get_v(layer, seq_idx);
-        if (!k || !v)
+        if (layer < 0 || layer >= n_layers_ || seq_idx < 0 || seq_idx >= batch_size_)
+            return false;
+
+        // Single call gets both K and V device pointers (non-virtual to avoid
+        // double-mapping when called from derived class with layer remapping)
+        const DataT *d_k_typed = nullptr;
+        const DataT *d_v_typed = nullptr;
+        int kv_len = 0;
+
+        if (!get_kv_typed(layer, seq_idx, &d_k_typed, &d_v_typed, &kv_len, 0))
+            return false;
+
+        const void *d_k = d_k_typed;
+        const void *d_v = d_v_typed;
+
+        if (kv_len == 0 || !d_k || !d_v)
         {
-            // Empty cache is valid — not an error
             if (out_kv_len)
                 *out_kv_len = 0;
-            return (entries_[layer][seq_idx].count == 0); // true if empty, false if error
+            return true;
         }
+
+        constexpr TensorType tensor_type = []() constexpr
+        {
+            if constexpr (Precision == ActivationPrecision::FP16)
+                return TensorType::FP16;
+            else if constexpr (Precision == ActivationPrecision::BF16)
+                return TensorType::BF16;
+            else if constexpr (Precision == ActivationPrecision::Q8_1)
+                return TensorType::Q8_1;
+            else
+                return TensorType::FP32;
+        }();
+
+        const size_t view_cols = (Precision == ActivationPrecision::Q8_1)
+                                     ? static_cast<size_t>(kv_storage_dim_)
+                                     : static_cast<size_t>(kv_dim_);
+        const size_t rows = static_cast<size_t>(kv_len);
+
+        // Update K view (index 0)
+        auto &k_view = tensor_views_[layer][seq_idx][0];
+        if (!k_view || k_view->gpu_data_ptr() != d_k || k_view->rows() != rows)
+        {
+            k_view = std::make_unique<GpuTensorView>(
+                const_cast<void *>(d_k), rows, view_cols, tensor_type, device_id_);
+        }
+
+        // Update V view (index 1)
+        auto &v_view = tensor_views_[layer][seq_idx][1];
+        if (!v_view || v_view->gpu_data_ptr() != d_v || v_view->rows() != rows)
+        {
+            v_view = std::make_unique<GpuTensorView>(
+                const_cast<void *>(d_v), rows, view_cols, tensor_type, device_id_);
+        }
+
         if (out_k)
-            *out_k = k;
+            *out_k = k_view.get();
         if (out_v)
-            *out_v = v;
+            *out_v = v_view.get();
         if (out_kv_len)
-            *out_kv_len = entries_[layer][seq_idx].count;
+            *out_kv_len = kv_len;
         return true;
     }
 
@@ -1563,13 +1615,13 @@ namespace llaminar2
         _Float16 *d_K, int count,
         int n_kv_heads, int head_dim,
         float rope_theta, int position_start,
-        hipStream_t stream);
+        hipStream_t stream, int rope_dim = 0);
 
     extern "C" bool hip_rope_apply_fp32(
         float *d_K, int count,
         int n_kv_heads, int head_dim,
         float rope_theta, int position_start,
-        hipStream_t stream);
+        hipStream_t stream, int rope_dim = 0);
 
     template <ActivationPrecision Precision>
     void ROCmRingKVCache<Precision>::ensureRoPEShadow(int layer, int seq_idx) const
@@ -1635,11 +1687,14 @@ namespace llaminar2
             return true;
         }
 
-        // If no RoPE requested, fall back to default (raw cache tensors)
+        // If no RoPE requested, fall back to raw cache tensors.
+        // Use qualified call to avoid virtual dispatch — ROCmHybridRingKVCache
+        // overrides get_kv() with layer remapping, but the layer index passed here
+        // has already been remapped by the hybrid override of get_kv_converted().
         const bool want_rope = (rope && rope->rope_theta > 0.0f);
         if (!want_rope)
         {
-            return get_kv(layer, seq_idx, out_k, out_v, out_kv_len);
+            return ROCmRingKVCache::get_kv(layer, seq_idx, out_k, out_v, out_kv_len);
         }
 
         hipSetDevice(device_id_);
@@ -1662,24 +1717,28 @@ namespace llaminar2
             if (need_full_rebuild)
             {
                 int kv_len = 0;
-                if (!linearize_to(layer, seq_idx, shadow_k, shadow_v, &kv_len, stream))
+                // Qualified call avoids virtual dispatch — prevents ROCmHybridRingKVCache
+                // from double-remapping the already-remapped layer index.
+                if (!ROCmRingKVCache::linearize_to(layer, seq_idx, shadow_k, shadow_v, &kv_len, stream))
                     return false;
 
                 hip_rope_apply_fp16(shadow_k, kv_len, local_n_kv_heads_, head_dim_,
-                                    rope->rope_theta, rope->position_start, stream);
+                                    rope->rope_theta, rope->position_start, stream,
+                                    rope->rope_dim);
 
                 shadow.converted_count = kv_len;
             }
             else if (new_tokens > 0)
             {
                 int kv_len = 0;
-                if (!linearize_to(layer, seq_idx, shadow_k, shadow_v, &kv_len, stream))
+                if (!ROCmRingKVCache::linearize_to(layer, seq_idx, shadow_k, shadow_v, &kv_len, stream))
                     return false;
 
-                _Float16 *new_k_start = shadow_k + static_cast<size_t>(shadow.converted_count) * kv_dim_;
-                hip_rope_apply_fp16(new_k_start, new_tokens, local_n_kv_heads_, head_dim_,
-                                    rope->rope_theta,
-                                    rope->position_start + shadow.converted_count, stream);
+                // Apply RoPE to ALL tokens — linearize_to overwrites the entire
+                // shadow with fresh (non-RoPE'd) data from the ring buffer.
+                hip_rope_apply_fp16(shadow_k, kv_len, local_n_kv_heads_, head_dim_,
+                                    rope->rope_theta, rope->position_start, stream,
+                                    rope->rope_dim);
 
                 shadow.converted_count = kv_len;
             }
@@ -1697,7 +1756,7 @@ namespace llaminar2
             auto *d_temp_v = static_cast<float *>(conv_scratch_v_);
 
             int kv_len = 0;
-            if (!linearize_to(layer, seq_idx, d_temp_k, d_temp_v, &kv_len, stream))
+            if (!ROCmRingKVCache::linearize_to(layer, seq_idx, d_temp_k, d_temp_v, &kv_len, stream))
                 return false;
 
             auto *shadow_k = static_cast<_Float16 *>(shadow.d_K);
@@ -1706,7 +1765,8 @@ namespace llaminar2
             if (need_full_rebuild)
             {
                 hip_rope_apply_fp32(d_temp_k, kv_len, local_n_kv_heads_, head_dim_,
-                                    rope->rope_theta, rope->position_start, stream);
+                                    rope->rope_theta, rope->position_start, stream,
+                                    rope->rope_dim);
 
                 hip_convert_tensor_to_fp16(d_temp_k, TensorType::FP32,
                                            reinterpret_cast<uint16_t *>(shadow_k),
@@ -1722,7 +1782,8 @@ namespace llaminar2
                 float *new_v_start = d_temp_v + static_cast<size_t>(old_count) * kv_dim_;
 
                 hip_rope_apply_fp32(new_k_start, new_tokens, local_n_kv_heads_, head_dim_,
-                                    rope->rope_theta, rope->position_start + old_count, stream);
+                                    rope->rope_theta, rope->position_start + old_count, stream,
+                                    rope->rope_dim);
 
                 _Float16 *shadow_k_new = shadow_k + static_cast<size_t>(old_count) * kv_dim_;
                 _Float16 *shadow_v_new = shadow_v + static_cast<size_t>(old_count) * kv_dim_;
@@ -1750,7 +1811,7 @@ namespace llaminar2
             auto *d_temp_v = static_cast<Q8_1Block *>(conv_scratch_v_);
 
             int kv_len = 0;
-            if (!linearize_to(layer, seq_idx, d_temp_k, d_temp_v, &kv_len, stream))
+            if (!ROCmRingKVCache::linearize_to(layer, seq_idx, d_temp_k, d_temp_v, &kv_len, stream))
                 return false;
 
             auto *shadow_k = static_cast<_Float16 *>(shadow.d_K);
@@ -1766,7 +1827,8 @@ namespace llaminar2
                                            kv_len * kv_dim_, stream);
 
                 hip_rope_apply_fp16(shadow_k, kv_len, local_n_kv_heads_, head_dim_,
-                                    rope->rope_theta, rope->position_start, stream);
+                                    rope->rope_theta, rope->position_start, stream,
+                                    rope->rope_dim);
             }
             else if (new_tokens > 0)
             {
@@ -1786,7 +1848,8 @@ namespace llaminar2
 
                 hip_rope_apply_fp16(shadow_k_new, new_tokens, local_n_kv_heads_, head_dim_,
                                     rope->rope_theta,
-                                    rope->position_start + old_count, stream);
+                                    rope->position_start + old_count, stream,
+                                    rope->rope_dim);
             }
 
             shadow.converted_count = kv_len;
@@ -1803,7 +1866,7 @@ namespace llaminar2
             auto *d_temp_v = static_cast<hip_bfloat16 *>(conv_scratch_v_);
 
             int kv_len = 0;
-            if (!linearize_to(layer, seq_idx, d_temp_k, d_temp_v, &kv_len, stream))
+            if (!ROCmRingKVCache::linearize_to(layer, seq_idx, d_temp_k, d_temp_v, &kv_len, stream))
                 return false;
 
             auto *shadow_k = static_cast<_Float16 *>(shadow.d_K);
@@ -1819,7 +1882,8 @@ namespace llaminar2
                                            kv_len * kv_dim_, stream);
 
                 hip_rope_apply_fp16(shadow_k, kv_len, local_n_kv_heads_, head_dim_,
-                                    rope->rope_theta, rope->position_start, stream);
+                                    rope->rope_theta, rope->position_start, stream,
+                                    rope->rope_dim);
             }
             else if (new_tokens > 0)
             {
@@ -1839,7 +1903,8 @@ namespace llaminar2
 
                 hip_rope_apply_fp16(shadow_k_new, new_tokens, local_n_kv_heads_, head_dim_,
                                     rope->rope_theta,
-                                    rope->position_start + old_count, stream);
+                                    rope->position_start + old_count, stream,
+                                    rope->rope_dim);
             }
 
             shadow.converted_count = kv_len;

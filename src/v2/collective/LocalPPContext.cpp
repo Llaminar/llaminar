@@ -6,8 +6,11 @@
  * Backend selection is automatic based on device types:
  * - CUDA→CUDA: NCCL
  * - ROCm→ROCm: RCCL
- * - CUDA↔ROCm: PCIeBAR
+ * - CUDA↔ROCm: HOST (host-staged via HostBackend)
  * - GPU↔CPU or CPU→CPU: HOST
+ *
+ * All GPU synchronization goes through the IBackend interface
+ * (BackendManager::getBackendFor) rather than direct CUDA/ROCm API calls.
  *
  * @author David Sanftenberg
  * @date January 2026
@@ -31,18 +34,15 @@
 
 // Conditionally include GPU-specific backends
 #ifdef HAVE_CUDA
-#include "backends/NCCLBackend.h"
-#include <cuda_runtime.h>
+// (CUDA runtime access via IBackend interface — no direct cuda_runtime.h needed)
 #endif
 
 #ifdef HAVE_ROCM
-#include "backends/RCCLBackend.h"
-#include "../backends/rocm/ROCmBackend.h"
+// (ROCm runtime access via IBackend interface — no direct ROCmBackend.h needed)
 #endif
 
 #if defined(HAVE_CUDA) && defined(HAVE_ROCM)
-#include "backends/PCIeBARBackend.h"
-#include "../backends/p2p/DirectP2P.h"
+// (Cross-vendor transfers use HostBackend host-staged path)
 #endif
 
 namespace llaminar2
@@ -73,11 +73,11 @@ namespace llaminar2
             return CollectiveBackendType::RCCL;
         }
 
-        // Cross-vendor GPU → PCIeBAR
+        // Cross-vendor GPU → HOST (host-staged transfer)
         if ((src == DeviceType::CUDA && dst == DeviceType::ROCm) ||
             (src == DeviceType::ROCm && dst == DeviceType::CUDA))
         {
-            return CollectiveBackendType::PCIE_BAR;
+            return CollectiveBackendType::HOST;
         }
 
         // Any path involving CPU → HOST
@@ -339,18 +339,17 @@ namespace llaminar2
             activations->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, src_device);
         }
 
-        // Cross-vendor GPU transfer (CUDA↔ROCm): use host bounce if tensor
-        // is not BAR-backed. PCIeBAR requires allocateInBarRegion(); normal
-        // device memory won't work for cross-vendor direct copies.
+        // Cross-vendor GPU transfer (CUDA↔ROCm): use host-staged transfer.
+        // Direct cross-vendor copies are not supported.
         const bool is_cross_vendor =
             (src_device.is_cuda() && dst_device.is_rocm()) ||
             (src_device.is_rocm() && dst_device.is_cuda());
 
-        if (is_cross_vendor && !activations->isBARBacked())
+        if (is_cross_vendor)
         {
             // Cross-vendor GPU transfer: delegate to TransferEngine which
             // handles the host-bounce pattern (D2H → H2D) correctly for all
-            // memory residency types including BAR-backed tensors.
+            // memory residency types.
             auto result = TransferEngine::instance().transferActivation(activations, dst_device);
             if (!result.success)
             {
@@ -366,7 +365,7 @@ namespace llaminar2
             return true;
         }
 
-        // Same-vendor GPU-to-GPU or BAR-backed cross-vendor: direct transfer
+        // Same-vendor GPU-to-GPU: direct transfer
         if (!activations->transferTo(dst_device, active_bytes))
         {
             LOG_ERROR("LocalPPContext::transfer: transferTo() failed "
@@ -423,19 +422,19 @@ namespace llaminar2
 
     void LocalPPContext::synchronize()
     {
-        // Synchronize all GPU devices - transfers go through TensorBase::transferTo()
-        // which uses GlobalBackendRouter, so we just need device-level sync here
-#ifdef HAVE_CUDA
-        (void)cudaDeviceSynchronize();
-#endif
-
-#ifdef HAVE_ROCM
-        auto *rocm_backend = getROCmBackend();
-        if (rocm_backend)
+        // Synchronize all stage devices via IBackend interfaces
+        for (const auto &addr : config_.stage_devices)
         {
-            rocm_backend->synchronize(0); // Sync default ROCm device
+            DeviceId device = addr.toLocalDeviceId();
+            if (device.is_cpu())
+                continue;
+
+            IBackend *backend = getBackendFor(device);
+            if (backend)
+            {
+                backend->synchronize(device.ordinal);
+            }
         }
-#endif
 
         LOG_TRACE("LocalPPContext::synchronize: devices synchronized");
     }
@@ -448,13 +447,19 @@ namespace llaminar2
             return;
         }
 
-#ifdef HAVE_CUDA
-        cudaStreamSynchronize(static_cast<cudaStream_t>(stream));
-#endif
+        // Synchronize the specific stream on all GPU stage devices
+        for (const auto &addr : config_.stage_devices)
+        {
+            DeviceId device = addr.toLocalDeviceId();
+            if (device.is_cpu())
+                continue;
 
-#ifdef HAVE_ROCM
-        // hipStreamSynchronize(static_cast<hipStream_t>(stream));
-#endif
+            IBackend *backend = getBackendFor(device);
+            if (backend)
+            {
+                backend->synchronizeStream(stream, device.ordinal);
+            }
+        }
     }
 
     // =========================================================================
@@ -478,13 +483,11 @@ namespace llaminar2
      *
      * This implementation extends LocalPPContext to support:
      * - Stages that are TP domains (multiple devices with shared state)
-     * - Automatic BAR-backed tensor handling for cross-vendor transfers
      * - Proper coordination with nested TP context synchronization
      *
      * Key insight: When a stage is a TP domain, the transfer() method needs to:
      * 1. Get data from the TP domain's representative device
-     * 2. If TP uses BAR-backed buffers, use those for cross-vendor transfer
-     * 3. Distribute data to the destination stage (broadcast for TP domains)
+     * 2. Distribute data to the destination stage (broadcast for TP domains)
      */
     class HierarchicalPPContext : public ILocalPPContext
     {
@@ -589,7 +592,7 @@ namespace llaminar2
          * @brief Find the best source device from a TP domain for transfer to dst_device
          *
          * For heterogeneous TP domains, prefer same-vendor device to avoid cross-vendor
-         * PCIe BAR staging. Falls back to representative device (index 0) if no
+         * HOST staging. Falls back to representative device (index 0) if no
          * same-vendor device exists.
          *
          * @param tp_ctx TP context containing the source devices
@@ -604,7 +607,6 @@ namespace llaminar2
          * For TP domains:
          * 1. After allreduce, all devices have identical data
          * 2. Pick best source device (prefer same vendor as destination)
-         * 3. Use TP context's DirectP2PEngine if available (BAR-backed)
          */
         bool transferFromTPDomain(TensorBase *activations,
                                   const PPStage &src_stage,
@@ -777,11 +779,11 @@ namespace llaminar2
                                                          const DeviceId &dst_device)
     {
         // For heterogeneous TP domains (e.g., TP(rocm:0, cuda:0)), prefer a source device
-        // that matches the destination's vendor to avoid cross-vendor PCIe BAR staging.
+        // that matches the destination's vendor to avoid cross-vendor HOST staging.
         //
         // After TP allreduce, all devices in the domain have identical data, so any device
         // can serve as the source. Choosing a same-vendor device enables fast D2D transfer
-        // via NCCL/RCCL/NVLink instead of the slower 2-hop BAR path.
+        // via NCCL/RCCL/NVLink instead of the slower 2-hop host-staged path.
 
         const int degree = tp_ctx->degree();
 
@@ -838,7 +840,7 @@ namespace llaminar2
 
         // After TP allreduce, all devices in the TP domain have identical data.
         // For heterogeneous TP domains, prefer a same-vendor source device to avoid
-        // cross-vendor PCIe BAR staging when possible.
+        // cross-vendor HOST staging when possible.
         DeviceId dst_device = dst_stage.representativeDevice().toLocalDeviceId();
 
         // Smart source selection: find best source device from TP domain
@@ -859,231 +861,9 @@ namespace llaminar2
             return transferSingleToSingle(activations, src_device, dst_device, active_bytes);
         }
 
-        // Cross-vendor transfer: check for BAR-backed fast path
-        if (activations->isBARBacked())
-        {
-            LOG_DEBUG("HierarchicalPPContext::transferFromTPDomain: Tensor is BAR-backed, "
-                      << "CUDA can read directly via PCIe BAR");
-
-            // For BAR-backed tensors, we just need to switch the view
-            // The physical memory (in AMD BAR region) is already accessible to both vendors
-            if (!activations->ensureOnDevice(dst_device))
-            {
-                LOG_ERROR("HierarchicalPPContext::transferFromTPDomain: "
-                          "Failed to set up destination view of BAR-backed tensor");
-                return false;
-            }
-
-            activations->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, dst_device);
-            LOG_DEBUG("HierarchicalPPContext::transferFromTPDomain: BAR-backed zero-copy complete");
-            return true;
-        }
-
-#if defined(HAVE_CUDA) && defined(HAVE_ROCM)
-        // Cross-vendor transfer: use PCIe BAR staging (ROCm VRAM → BAR → CUDA or vice versa)
-
-        // Check if we have DirectP2P with active BAR
-        auto p2p = DirectP2PEngine::getSharedInstance();
-        if (!p2p || !p2p->isPCIeBarActive())
-        {
-            LOG_ERROR("HierarchicalPPContext::transferFromTPDomain: "
-                      "PCIe BAR not initialized for cross-vendor transfer "
-                      << src_device.toString() << " → " << dst_device.toString());
-            return false;
-        }
-
-        // PCIe BAR staging path: ROCm VRAM → BAR → CUDA (or reverse)
-        LOG_DEBUG("HierarchicalPPContext::transferFromTPDomain: PCIe BAR staging "
-                  << src_device.toString() << " → BAR → " << dst_device.toString());
-
-        const size_t bytes = (active_bytes > 0 && active_bytes <= activations->size_bytes())
-                                 ? active_bytes
-                                 : activations->size_bytes();
-
-        // Ensure tensor has data on the source device
-        if (!activations->ensureOnDevice(src_device))
-        {
-            LOG_ERROR("HierarchicalPPContext::transferFromTPDomain: "
-                      "Failed to ensure on source device for BAR staging");
-            return false;
-        }
-
-        void *src_ptr = activations->gpu_data_ptr();
-        if (!src_ptr)
-        {
-            LOG_ERROR("HierarchicalPPContext::transferFromTPDomain: "
-                      "Source GPU pointer is null after ensureOnDevice");
-            return false;
-        }
-
-        if (src_device.is_rocm() && dst_device.is_cuda())
-        {
-            // ROCm → CUDA via BAR
-            // Step 1: ROCm D2D copy to BAR (hipMemcpy can use BAR mmap as destination)
-            void *bar_host_ptr = p2p->getBarHostPtr();
-            if (!bar_host_ptr)
-            {
-                LOG_ERROR("HierarchicalPPContext::transferFromTPDomain: "
-                          "BAR host pointer is null");
-                return false;
-            }
-
-            // Use ROCm backend to copy to BAR (D2D copy, very fast)
-            // Need concrete ROCmBackend for deviceToDevice() method
-            auto *rocm_backend = dynamic_cast<ROCmBackend *>(getROCmBackend());
-            if (!rocm_backend)
-            {
-                LOG_ERROR("HierarchicalPPContext::transferFromTPDomain: "
-                          "ROCm backend not available or wrong type");
-                return false;
-            }
-
-            LOG_DEBUG("HierarchicalPPContext::transferFromTPDomain: "
-                      "ROCm D2D to BAR: "
-                      << bytes << " bytes");
-
-            // hipMemcpy D2D from ROCm VRAM to BAR mmap address
-            bool d2d_ok = rocm_backend->deviceToDevice(bar_host_ptr, src_ptr, bytes,
-                                                       src_device.toKernelDeviceIndex());
-            if (!d2d_ok)
-            {
-                LOG_ERROR("HierarchicalPPContext::transferFromTPDomain: "
-                          "ROCm D2D to BAR failed");
-                return false;
-            }
-
-            rocm_backend->synchronize(src_device.toKernelDeviceIndex());
-
-            // Step 2: CUDA D2D copy from BAR to CUDA device
-            void *cuda_bar_ptr = p2p->getCudaBarPointer();
-            if (!cuda_bar_ptr)
-            {
-                LOG_ERROR("HierarchicalPPContext::transferFromTPDomain: "
-                          "CUDA BAR pointer is null");
-                return false;
-            }
-
-            // Ensure tensor is allocated on destination
-            if (!activations->allocateOnDevice(dst_device))
-            {
-                LOG_ERROR("HierarchicalPPContext::transferFromTPDomain: "
-                          "Failed to allocate on CUDA device");
-                return false;
-            }
-
-            void *dst_ptr = activations->gpu_data_ptr();
-
-#ifdef HAVE_CUDA
-            cudaSetDevice(dst_device.toKernelDeviceIndex());
-            cudaError_t err = cudaMemcpy(dst_ptr, cuda_bar_ptr, bytes, cudaMemcpyDeviceToDevice);
-            if (err != cudaSuccess)
-            {
-                LOG_ERROR("HierarchicalPPContext::transferFromTPDomain: "
-                          "CUDA D2D from BAR failed: "
-                          << cudaGetErrorString(err));
-                return false;
-            }
-            cudaDeviceSynchronize();
-#endif
-
-            // Clear any ROCm completion event before marking dirty
-            activations->clearCompletionEvent();
-            activations->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, dst_device);
-
-            LOG_DEBUG("HierarchicalPPContext::transferFromTPDomain: "
-                      "PCIe BAR staging complete: "
-                      << bytes << " bytes");
-            return true;
-        }
-        else if (src_device.is_cuda() && dst_device.is_rocm())
-        {
-            // CUDA → ROCm via BAR
-            // Step 1: CUDA D2D copy to BAR
-            void *cuda_bar_ptr = p2p->getCudaBarPointer();
-            if (!cuda_bar_ptr)
-            {
-                LOG_ERROR("HierarchicalPPContext::transferFromTPDomain: "
-                          "CUDA BAR pointer is null for CUDA→ROCm");
-                return false;
-            }
-
-#ifdef HAVE_CUDA
-            cudaSetDevice(src_device.toKernelDeviceIndex());
-            cudaError_t err = cudaMemcpy(cuda_bar_ptr, src_ptr, bytes, cudaMemcpyDeviceToDevice);
-            if (err != cudaSuccess)
-            {
-                LOG_ERROR("HierarchicalPPContext::transferFromTPDomain: "
-                          "CUDA D2D to BAR failed: "
-                          << cudaGetErrorString(err));
-                return false;
-            }
-            cudaDeviceSynchronize();
-
-            // Step 2: ROCm D2D copy from BAR to ROCm device
-            void *bar_host_ptr = p2p->getBarHostPtr();
-            if (!bar_host_ptr)
-            {
-                LOG_ERROR("HierarchicalPPContext::transferFromTPDomain: "
-                          "BAR host pointer is null for CUDA→ROCm");
-                return false;
-            }
-
-            // Need concrete ROCmBackend for deviceToDevice() method
-            auto *rocm_backend = dynamic_cast<ROCmBackend *>(getROCmBackend());
-            if (!rocm_backend)
-            {
-                LOG_ERROR("HierarchicalPPContext::transferFromTPDomain: "
-                          "ROCm backend not available or wrong type");
-                return false;
-            }
-
-            // Ensure tensor is allocated on destination
-            if (!activations->allocateOnDevice(dst_device))
-            {
-                LOG_ERROR("HierarchicalPPContext::transferFromTPDomain: "
-                          "Failed to allocate on ROCm device");
-                return false;
-            }
-
-            void *dst_ptr = activations->gpu_data_ptr();
-
-            // hipMemcpy D2D from BAR mmap to ROCm VRAM
-            bool d2d_ok = rocm_backend->deviceToDevice(dst_ptr, bar_host_ptr, bytes,
-                                                       dst_device.toKernelDeviceIndex());
-            if (!d2d_ok)
-            {
-                LOG_ERROR("HierarchicalPPContext::transferFromTPDomain: "
-                          "ROCm D2D from BAR failed");
-                return false;
-            }
-            rocm_backend->synchronize(dst_device.toKernelDeviceIndex());
-
-            // Clear any CUDA completion event before marking dirty
-            activations->clearCompletionEvent();
-            activations->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, dst_device);
-
-            LOG_DEBUG("HierarchicalPPContext::transferFromTPDomain: "
-                      "PCIe BAR staging complete (CUDA→ROCm): "
-                      << bytes << " bytes");
-            return true;
-#else
-            LOG_ERROR("HierarchicalPPContext::transferFromTPDomain: "
-                      "CUDA not available for CUDA→ROCm transfer");
-            return false;
-#endif
-        }
-
-        LOG_ERROR("HierarchicalPPContext::transferFromTPDomain: "
-                  "Unsupported cross-vendor transfer direction: "
-                  << src_device.toString() << " → " << dst_device.toString());
-        return false;
-#else
-        // Cross-vendor transfers not supported without both CUDA and ROCm
-        LOG_ERROR("HierarchicalPPContext::transferFromTPDomain: "
-                  "Cross-vendor transfer not supported (requires both CUDA and ROCm): "
-                  << src_device.toString() << " → " << dst_device.toString());
-        return false;
-#endif // HAVE_CUDA && HAVE_ROCM
+        // Cross-vendor transfer: delegate to transferSingleToSingle which handles
+        // host-bounce via the tensor coherence model (no hot-path allocations).
+        return transferSingleToSingle(activations, src_device, dst_device, active_bytes);
     }
 
     bool HierarchicalPPContext::transferFromGlobalTPDomain(TensorBase *activations,
@@ -1378,14 +1158,12 @@ namespace llaminar2
             activations->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, src_device);
         }
 
-        // Cross-vendor GPU transfer (CUDA↔ROCm): use host bounce if tensor
-        // is not BAR-backed. PCIeBAR requires allocateInBarRegion(); normal
-        // device memory won't work for cross-vendor direct copies.
+        // Cross-vendor GPU transfer (CUDA↔ROCm): use host bounce.
         const bool is_cross_vendor =
             (src_device.is_cuda() && dst_device.is_rocm()) ||
             (src_device.is_rocm() && dst_device.is_cuda());
 
-        if (is_cross_vendor && !activations->isBARBacked())
+        if (is_cross_vendor)
         {
             // GPU → host (data() triggers D2H sync for device-dirty tensors)
             const void *host_ptr = activations->data();
@@ -1419,7 +1197,7 @@ namespace llaminar2
             return true;
         }
 
-        // Same-vendor GPU-to-GPU or BAR-backed cross-vendor: use direct transfer
+        // Same-vendor GPU-to-GPU: use direct transfer
         if (!activations->transferTo(dst_device, active_bytes))
         {
             LOG_ERROR("HierarchicalPPContext::transferSingleToSingle: transferTo() failed "
@@ -1464,26 +1242,16 @@ namespace llaminar2
             }
             else if (stage.isSingleDevice())
             {
-                // Non-TP stages: synchronize the device directly via backend
+                // Non-TP stages: synchronize the device via IBackend
                 DeviceId device = stage.representativeDevice().toLocalDeviceId();
-                if (device.is_cuda())
+                if (!device.is_cpu())
                 {
-#ifdef HAVE_CUDA
-                    (void)cudaSetDevice(device.ordinal);
-                    (void)cudaDeviceSynchronize();
-#endif
-                }
-                else if (device.is_rocm())
-                {
-#ifdef HAVE_ROCM
-                    auto *rocm_backend = getROCmBackend();
-                    if (rocm_backend)
+                    IBackend *backend = getBackendFor(device);
+                    if (backend)
                     {
-                        rocm_backend->synchronize(device.ordinal);
+                        backend->synchronize(device.ordinal);
                     }
-#endif
                 }
-                // CPU stages don't need synchronization
             }
             else if (stage.isNestedPP())
             {

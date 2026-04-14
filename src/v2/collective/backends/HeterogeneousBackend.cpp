@@ -12,7 +12,7 @@
 #include "HeterogeneousBackend.h"
 #include "NCCLBackend.h"
 #include "RCCLBackend.h"
-#include "PCIeBARBackend.h"
+#include "HostBackend.h"
 #include "../../utils/Logger.h"
 #include "../../backends/rocm/ROCmBackend.h" // For ROCmBackend::deviceToDevice
 #include "../../backends/BackendManager.h"   // For getBackend()
@@ -64,7 +64,7 @@ namespace llaminar2
             return true;
         }
 
-        // Cross-vendor via PCIeBAR bridge (only between bridge devices)
+        // Cross-vendor via host-staged bridge (between bridge devices)
         if (initialized_ && bridge_backend_)
         {
             return bridge_backend_->supportsDirectTransfer(src, dst);
@@ -75,9 +75,9 @@ namespace llaminar2
 
     bool HeterogeneousBackend::isAvailable() const
     {
-        // Check if PCIeBAR capability is available (required for cross-vendor)
-        PCIeBARBackend probe;
-        return probe.isAvailable();
+        // Heterogeneous backend is available when both CUDA and ROCm are compiled in
+        // Cross-vendor bridge is handled by HostBackend (always available)
+        return true;
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -148,12 +148,6 @@ namespace llaminar2
         LOG_DEBUG("HeterogeneousBackend: Shutting down");
 
         // Shutdown sub-backends in reverse order
-        if (multi_pair_bridge_backend_)
-        {
-            multi_pair_bridge_backend_->shutdown();
-            multi_pair_bridge_backend_.reset();
-        }
-
         if (bridge_backend_)
         {
             bridge_backend_->shutdown();
@@ -172,10 +166,9 @@ namespace llaminar2
             nccl_backend_.reset();
         }
 
-        // Clear device lists and cached data
+        // Clear device lists
         cuda_devices_.clear();
         rocm_devices_.clear();
-        bridge_pairs_.clear();
         cuda_bridge_ = DeviceId::cpu();
         rocm_bridge_ = DeviceId::cpu();
 
@@ -396,7 +389,7 @@ namespace llaminar2
         // ═══════════════════════════════════════════════════════════════════════
         // Phase 2: Cross-domain bridge exchange
         // ═══════════════════════════════════════════════════════════════════════
-        // PCIeBAR allreduce between cuda:0 and rocm:0
+        // HOST-staged allreduce between cuda:0 and rocm:0
         if (!executePhase2_BridgeExchange(cuda_bridge_buf, rocm_bridge_buf, count, dtype, op))
         {
             return false;
@@ -752,50 +745,6 @@ namespace llaminar2
     // GCD Multi-Bridge Pattern
     // ═══════════════════════════════════════════════════════════════════════════
 
-    std::vector<DevicePair> HeterogeneousBackend::computeBridgePairs() const
-    {
-        std::vector<DevicePair> pairs;
-
-        if (cuda_devices_.empty() || rocm_devices_.empty())
-        {
-            return pairs;
-        }
-
-        // G = GCD(cuda_count, rocm_count)
-        size_t G = computeGCD(cuda_devices_.size(), rocm_devices_.size());
-
-        if (G == 0)
-        {
-            return pairs;
-        }
-
-        // For i in 0..G-1:
-        //   cuda_idx = i
-        //   rocm_idx = i * (rocm_count / G)
-        //   Create pair: {cuda_devices_[cuda_idx], rocm_devices_[rocm_idx], i}
-        size_t rocm_stride = rocm_devices_.size() / G;
-
-        pairs.reserve(G);
-        for (size_t i = 0; i < G; ++i)
-        {
-            size_t cuda_idx = i;
-            size_t rocm_idx = i * rocm_stride;
-
-            DevicePair pair;
-            pair.cuda_device = cuda_devices_[cuda_idx];
-            pair.rocm_device = rocm_devices_[rocm_idx];
-            pair.pair_index = static_cast<int>(i);
-
-            pairs.push_back(pair);
-
-            LOG_DEBUG("HeterogeneousBackend: Bridge pair " << i << ": "
-                                                           << pair.cuda_device.toString() << " <-> "
-                                                           << pair.rocm_device.toString());
-        }
-
-        return pairs;
-    }
-
     bool HeterogeneousBackend::executeGcdMultiBridge(
         const std::vector<void *> &cuda_buffers,
         const std::vector<void *> &rocm_buffers,
@@ -820,20 +769,6 @@ namespace llaminar2
 
         LOG_DEBUG("HeterogeneousBackend: Executing GCD_MULTI_BRIDGE pattern (GCD=" << G << ")");
         LOG_DEBUG("  CUDA devices: " << cuda_devices_.size() << ", ROCm devices: " << rocm_devices_.size());
-
-        // Compute bridge pairs if not already cached
-        if (bridge_pairs_.empty() || bridge_pairs_.size() != G)
-        {
-            bridge_pairs_ = computeBridgePairs();
-        }
-
-        if (bridge_pairs_.size() != G)
-        {
-            last_error_ = "Failed to compute bridge pairs (expected " + std::to_string(G) +
-                          ", got " + std::to_string(bridge_pairs_.size()) + ")";
-            LOG_ERROR("HeterogeneousBackend: " << last_error_);
-            return false;
-        }
 
         // ═══════════════════════════════════════════════════════════════════════
         // Phase 1: Parallel intra-domain ALLREDUCE (not reduce!)
@@ -901,94 +836,32 @@ namespace llaminar2
         LOG_DEBUG("HeterogeneousBackend GCD Phase1: Intra-domain allreduce complete");
 
         // ═══════════════════════════════════════════════════════════════════════
-        // Phase 2: Multi-pair PCIeBAR allreduce
+        // Phase 2: Host-staged bridge exchange for each GCD pair
         // ═══════════════════════════════════════════════════════════════════════
-        // Each bridge pair exchanges and reduces in parallel.
+        // Each bridge pair exchanges and reduces via host-staged transfer.
 
-        LOG_DEBUG("HeterogeneousBackend GCD Phase2: Multi-pair bridge exchange ("
+        LOG_DEBUG("HeterogeneousBackend GCD Phase2: Bridge exchange ("
                   << G << " pairs)");
 
-        // Initialize multi-pair bridge backend if needed
-        if (!multi_pair_bridge_backend_ || !multi_pair_bridge_backend_->isMultiPairMode())
-        {
-            multi_pair_bridge_backend_ = std::make_unique<PCIeBARBackend>();
-            if (!multi_pair_bridge_backend_->initializeMultiPair(bridge_pairs_))
-            {
-                last_error_ = "GCD Phase 2: Failed to initialize multi-pair bridge backend";
-                LOG_ERROR("HeterogeneousBackend: " << last_error_);
-                multi_pair_bridge_backend_.reset();
-                // Fall back to serial bridge exchanges using standard bridge_backend_
-                LOG_WARN("HeterogeneousBackend: Falling back to serial bridge exchanges");
-            }
-        }
-
         // Build buffer vectors for each pair
-        // cuda_buffers[pair.cuda_device.ordinal] and rocm_buffers[corresponding_idx]
-        std::vector<void *> cuda_pair_buffers;
-        std::vector<void *> rocm_pair_buffers;
-        cuda_pair_buffers.reserve(G);
-        rocm_pair_buffers.reserve(G);
+        // Bridge pairs: CUDA[i] ↔ ROCm[i * (M/G)] for i in [0, G)
+        size_t rocm_stride = rocm_devices_.size() / G;
 
-        // Map device ordinals to buffer indices
-        // cuda_buffers are in cuda_devices_ order (sorted by ordinal)
-        // rocm_buffers are in rocm_devices_ order (sorted by ordinal)
-        for (const auto &pair : bridge_pairs_)
+        for (size_t i = 0; i < G; ++i)
         {
-            // Find cuda buffer index
-            size_t cuda_buf_idx = 0;
-            for (size_t i = 0; i < cuda_devices_.size(); ++i)
+            size_t cuda_idx = i;
+            size_t rocm_idx = i * rocm_stride;
+
+            LOG_DEBUG("  Bridge pair " << i << ": CUDA buf[" << cuda_idx
+                                       << "] <-> ROCm buf[" << rocm_idx << "]");
+
+            if (!executePhase2_BridgeExchange(
+                    cuda_buffers[cuda_idx], rocm_buffers[rocm_idx], count, dtype, op))
             {
-                if (cuda_devices_[i] == pair.cuda_device)
-                {
-                    cuda_buf_idx = i;
-                    break;
-                }
-            }
-
-            // Find rocm buffer index
-            size_t rocm_buf_idx = 0;
-            for (size_t i = 0; i < rocm_devices_.size(); ++i)
-            {
-                if (rocm_devices_[i] == pair.rocm_device)
-                {
-                    rocm_buf_idx = i;
-                    break;
-                }
-            }
-
-            cuda_pair_buffers.push_back(cuda_buffers[cuda_buf_idx]);
-            rocm_pair_buffers.push_back(rocm_buffers[rocm_buf_idx]);
-
-            LOG_DEBUG("  Pair " << pair.pair_index << ": CUDA buf[" << cuda_buf_idx
-                                << "] <-> ROCm buf[" << rocm_buf_idx << "]");
-        }
-
-        // Execute multi-pair allreduce
-        if (multi_pair_bridge_backend_ && multi_pair_bridge_backend_->isMultiPairMode())
-        {
-            if (!multi_pair_bridge_backend_->allreduceMultiPair(
-                    cuda_pair_buffers, rocm_pair_buffers, count, dtype))
-            {
-                last_error_ = "GCD Phase 2: Multi-pair bridge allreduce failed";
+                last_error_ = "GCD Phase 2: Bridge exchange failed for pair " +
+                              std::to_string(i);
                 LOG_ERROR("HeterogeneousBackend: " << last_error_);
                 return false;
-            }
-        }
-        else
-        {
-            // Fallback: Serial bridge exchanges using standard bridge_backend_
-            // This is slower but works when multi-pair init fails
-            for (size_t i = 0; i < G; ++i)
-            {
-                LOG_DEBUG("  Serial bridge exchange for pair " << i);
-                if (!executePhase2_BridgeExchange(
-                        cuda_pair_buffers[i], rocm_pair_buffers[i], count, dtype, op))
-                {
-                    last_error_ = "GCD Phase 2: Serial bridge exchange failed for pair " +
-                                  std::to_string(i);
-                    LOG_ERROR("HeterogeneousBackend: " << last_error_);
-                    return false;
-                }
             }
         }
 
@@ -1592,7 +1465,7 @@ namespace llaminar2
             LOG_DEBUG("  Chunk " << chunk_idx << ": exchanging " << this_chunk_elements
                                  << " elements (smaller offset: " << chunk_offset_elements << ")");
 
-            // Create a temporary PCIeBAR exchange between these specific buffers
+            // Create a temporary HOST-staged exchange between these specific buffers
             // We need to:
             // 1. Read larger domain's chunk
             // 2. Add to smaller domain's chunk
@@ -1612,7 +1485,7 @@ namespace llaminar2
             //
             // The bridge is cuda:0 ↔ rocm:0. For chunk 0, this works directly.
             // For chunk 1 (rocm:1), we need to go through rocm:0 as a relay OR
-            // use direct PCIe BAR access to rocm:1.
+            // use HOST-staged access to rocm:1.
             //
             // For V1, let's use the bridge (rocm:0) as a staging point for non-bridge devices.
 
@@ -1660,7 +1533,7 @@ namespace llaminar2
 
                 // For now, use a simpler approach: do sequential copies
                 // 1. larger[i] → bridge (via intra-domain copy, e.g., NCCL sendrecv or cudaMemcpyPeer)
-                // 2. bridge ↔ smaller (PCIeBAR allreduce)
+                // 2. bridge ↔ smaller (HOST-staged allreduce)
                 // 3. bridge → larger[i] (via intra-domain copy)
 
                 // Get bridge buffer (larger[0] after reduce-scatter contains chunk 0, not what we want)
@@ -1764,7 +1637,7 @@ namespace llaminar2
     //   Phase 2: Chunked bridge exchange with staging:
     //            for i in 0..3:
     //              if i != 0: ROCm[i] → ROCm[0] via RCCL p2p
-    //              ROCm[0] ↔ CUDA[0] via PCIeBAR (chunk[i])
+    //              ROCm[0] ↔ CUDA[0] via HOST staging (chunk[i])
     //              if i != 0: ROCm[0] → ROCm[i] via RCCL p2p
     //   Phase 3: RCCL allgather to reconstruct full tensor
     //
@@ -2682,10 +2555,7 @@ namespace llaminar2
             // Phase 2 for this chunk: Bridge exchange using staging buffer pattern
             // ─────────────────────────────────────────────────────────────────
             // CRITICAL: Use executePhase2_BridgeExchange which knows about BOTH
-            // buffers and uses the BAR staging pattern. The old call to
-            // bridge_backend_->allreduce(cuda_chunk, ...) was broken because
-            // PCIeBARBackend reads ROCm data from BAR offset 0, but hipMalloc
-            // buffers are at different VRAM offsets.
+            // buffers and uses the host staging pattern.
             if (!executePhase2_BridgeExchange(cuda_chunk, rocm_chunk, this_chunk_elements, dtype, op))
             {
                 last_error_ = "Pipelined Phase 2: Bridge exchange failed for chunk " +
@@ -2833,130 +2703,15 @@ namespace llaminar2
             return false;
         }
 
-        LOG_DEBUG("HeterogeneousBackend Phase2: Starting bridge exchange between "
+        LOG_DEBUG("HeterogeneousBackend Phase2: Starting host-staged bridge exchange between "
                   << cuda_bridge_.toString() << " and " << rocm_bridge_.toString()
                   << " (count=" << count << ")");
 
-        // ═══════════════════════════════════════════════════════════════════
-        // CRITICAL: Staging Buffer Pattern for Cross-Vendor Allreduce
-        // ═══════════════════════════════════════════════════════════════════
-        // The ROCm buffer is allocated via hipMalloc(), which places it in GPU
-        // VRAM at an arbitrary offset. The PCIeBAR backend maps only a portion
-        // of the AMD VRAM (1GB at offset 0), so hipMalloc buffers are NOT
-        // directly accessible via BAR.
-        //
-        // Solution: Use the BAR mmap as a staging area:
-        // 1. hipMemcpy(D2D) ROCm buffer → BAR mmap (uses AMD DMA engine, ~4 GB/s)
-        // 2. CUDA reduces: cuda_buffer + BAR_data → cuda_buffer
-        // 3. cudaMemcpy(D2D) cuda_buffer → BAR mmap (CUDA writes to BAR)
-        // 4. hipMemcpy(D2D) BAR mmap → ROCm buffer (AMD DMA reads from BAR)
-        //
-        // This is the known-good pattern from LocalTPContext::executePCIeBarAllreduce.
-        // ═══════════════════════════════════════════════════════════════════
-
-        size_t bytes = count * collectiveDataTypeSize(dtype);
-
-        // Get the BAR staging pointer
-        void *bar_staging_ptr = bridge_backend_->getBarHostPtr();
-        if (!bar_staging_ptr)
+        // Use HostBackend's allreduceMulti which handles CUDA↔ROCm via host-staged transfer
+        std::vector<void *> bridge_buffers = {cuda_bridge_buffer, rocm_bridge_buffer};
+        if (!bridge_backend_->allreduceMulti(bridge_buffers, count, dtype, op))
         {
-            last_error_ = "Phase 2: BAR staging pointer not available";
-            LOG_ERROR("HeterogeneousBackend: " << last_error_);
-            return false;
-        }
-
-        // Check BAR has enough space
-        if (bytes > bridge_backend_->getBarTotalMappedSize())
-        {
-            last_error_ = "Phase 2: Transfer size (" + std::to_string(bytes) +
-                          ") exceeds BAR mapped size (" +
-                          std::to_string(bridge_backend_->getBarTotalMappedSize()) + ")";
-            LOG_ERROR("HeterogeneousBackend: " << last_error_);
-            return false;
-        }
-
-        LOG_DEBUG("HeterogeneousBackend Phase2: Using BAR staging pattern "
-                  << "(rocm_buf=" << rocm_bridge_buffer << ", bar=" << bar_staging_ptr
-                  << ", cuda_buf=" << cuda_bridge_buffer << ", bytes=" << bytes << ")");
-
-        // Get ROCmBackend for HIP memory operations (avoids HIP header conflicts)
-        ROCmBackend *rocm_backend = dynamic_cast<ROCmBackend *>(getROCmBackend());
-        if (!rocm_backend)
-        {
-            last_error_ = "Phase 2: ROCmBackend not available";
-            LOG_ERROR("HeterogeneousBackend: " << last_error_);
-            return false;
-        }
-
-        int rocm_ordinal = rocm_bridge_.ordinal;
-
-        // Step 1: Copy ROCm data to BAR staging via ROCmBackend::deviceToDevice
-        // The BAR mmap is accessible to HIP as a "device" pointer for D2D copies
-        rocm_backend->setDevice(rocm_ordinal);
-        if (!rocm_backend->deviceToDevice(bar_staging_ptr, rocm_bridge_buffer, bytes, rocm_ordinal))
-        {
-            last_error_ = "Phase 2: ROCm → BAR copy failed";
-            LOG_ERROR("HeterogeneousBackend: " << last_error_);
-            return false;
-        }
-        rocm_backend->synchronize(rocm_ordinal);
-
-        LOG_DEBUG("HeterogeneousBackend Phase2: Step 1 complete - ROCm data staged to BAR");
-
-        // Step 2: CUDA reduction - read from BAR, accumulate into CUDA buffer
-        // cuda_buffer = cuda_buffer + bar_staging
-        if (!bridge_backend_->reduceOnCUDA(cuda_bridge_buffer, cuda_bridge_buffer, bar_staging_ptr,
-                                           count, dtype, op))
-        {
-            last_error_ = "Phase 2: CUDA reduction failed: " + bridge_backend_->lastError();
-            LOG_ERROR("HeterogeneousBackend: " << last_error_);
-            return false;
-        }
-
-        LOG_DEBUG("HeterogeneousBackend Phase2: Step 2 complete - CUDA reduction done");
-
-        // Step 3: Write CUDA result to BAR staging using DirectP2PEngine
-        // CRITICAL: Use the DirectP2PEngine's transferViaPCIeBar() method instead of
-        // cudaMemcpy because it properly uses the CUDA driver API (cuMemcpyDtoD) with
-        // the registered IOMEMORY pointer, ensuring correct cache coherency for
-        // PCIe BAR writes. Using cudaMemcpy with a host-registered IOMEMORY pointer
-        // can leave tail data unflushed, causing partial transfer failures.
-        auto *p2p_engine = bridge_backend_->getDirectP2PEngine();
-        if (!p2p_engine || !p2p_engine->isPCIeBarActive())
-        {
-            last_error_ = "Phase 2: DirectP2P engine not available";
-            LOG_ERROR("HeterogeneousBackend: " << last_error_);
-            return false;
-        }
-
-        auto transfer_result = p2p_engine->transferViaPCIeBar(
-            cuda_bridge_buffer, 0, bytes, DirectP2PEngine::Direction::ToAMD);
-        if (!transfer_result.success)
-        {
-            last_error_ = "Phase 2: CUDA → BAR transfer failed: " + transfer_result.error_message;
-            LOG_ERROR("HeterogeneousBackend: " << last_error_);
-            return false;
-        }
-
-        LOG_DEBUG("HeterogeneousBackend Phase2: Step 3 complete - Result written to BAR");
-
-        // Step 4: Copy from BAR staging to ROCm buffer via ROCmBackend::deviceToDevice
-        rocm_backend->setDevice(rocm_ordinal);
-        if (!rocm_backend->deviceToDevice(rocm_bridge_buffer, bar_staging_ptr, bytes, rocm_ordinal))
-        {
-            last_error_ = "Phase 2: BAR → ROCm copy failed";
-            LOG_ERROR("HeterogeneousBackend: " << last_error_);
-            return false;
-        }
-        rocm_backend->synchronize(rocm_ordinal);
-
-        LOG_DEBUG("HeterogeneousBackend Phase2: Step 4 complete - ROCm buffer updated");
-
-        bool success = true; // All steps completed
-
-        if (!success)
-        {
-            last_error_ = "Phase 2: Bridge allreduce failed: " + bridge_backend_->lastError();
+            last_error_ = "Phase 2: Host-staged bridge allreduce failed: " + bridge_backend_->lastError();
             LOG_ERROR("HeterogeneousBackend: " << last_error_);
             return false;
         }
@@ -3239,7 +2994,7 @@ namespace llaminar2
         // patterns (reduce-scatter, pipelining) are not applicable.
         //
         // Phase 1: Intra-domain reduce (each domain reduces to its bridge device)
-        // Phase 2: Bridge exchange (PCIeBAR allreduce between bridge devices)
+        // Phase 2: Bridge exchange (HOST-staged allreduce between bridge devices)
         // Phase 3: Intra-domain broadcast (broadcast result to all devices)
 
         LOG_DEBUG("HeterogeneousBackend: Executing standard 3-phase allreduce for "
@@ -3254,7 +3009,7 @@ namespace llaminar2
             return false;
         }
 
-        // Phase 2: Bridge exchange via PCIeBAR
+        // Phase 2: Bridge exchange via HOST staging
         // Bridge devices are cuda_buffers[0] and rocm_buffers[0]
         void *cuda_bridge_buf = cuda_buffers[0];
         void *rocm_bridge_buf = rocm_buffers[0];
@@ -3495,31 +3250,31 @@ namespace llaminar2
 
     bool HeterogeneousBackend::createBridgeBackend()
     {
-        LOG_INFO("HeterogeneousBackend: Creating PCIeBAR bridge backend for "
+        LOG_INFO("HeterogeneousBackend: Creating HOST bridge backend for "
                  << cuda_bridge_.toString() << " <-> " << rocm_bridge_.toString());
 
-        // Create PCIeBAR backend
-        bridge_backend_ = std::make_unique<PCIeBARBackend>();
+        // Create HostBackend for cross-vendor bridge (host-staged transfers)
+        bridge_backend_ = std::make_unique<HostBackend>();
 
         // Build a bridge-only device group (just the two bridge devices)
         DeviceGroupBuilder builder;
-        builder.setName("pcie_bridge")
+        builder.setName("host_bridge")
             .setScope(CollectiveScope::LOCAL)
             .addDevice(cuda_bridge_)
             .addDevice(rocm_bridge_)
-            .setLocalRank(0); // Bridge operates from CUDA perspective
+            .setLocalRank(0);
 
         DeviceGroup bridge_group = builder.build();
 
         if (!bridge_backend_->initialize(bridge_group))
         {
-            last_error_ = "Failed to initialize PCIeBAR bridge backend";
+            last_error_ = "Failed to initialize HOST bridge backend";
             LOG_ERROR("HeterogeneousBackend: " << last_error_);
             bridge_backend_.reset();
             return false;
         }
 
-        LOG_INFO("HeterogeneousBackend: PCIeBAR bridge backend initialized");
+        LOG_INFO("HeterogeneousBackend: HOST bridge backend initialized");
         return true;
     }
 

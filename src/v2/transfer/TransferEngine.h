@@ -35,8 +35,7 @@ namespace llaminar2
     ///   CPU → GPU                        → HOST_TO_DEVICE
     ///   GPU → CPU                        → DEVICE_TO_HOST
     ///   GPU → GPU same vendor            → DEVICE_TO_DEVICE_SAME_BACKEND
-    ///   GPU → GPU cross-vendor + BAR     → BAR_HOST_BOUNCE
-    ///   GPU → GPU cross-vendor + no BAR  → HOST_STAGED
+    ///   GPU → GPU cross-vendor           → HOST_STAGED
     ///
     class TransferEngine
     {
@@ -80,16 +79,16 @@ namespace llaminar2
         TransferResult download(TensorBase *tensor);
 
         /// Transfer activation data for pipeline parallelism.
-        /// Handles all memory residency variants (standard, BAR, mapped).
+        /// Handles all memory residency variants (standard, mapped).
         TransferResult transferActivation(TensorBase *tensor, DeviceId target_device);
 
         /// Full upload lifecycle: replaces TensorBase::ensureOnDevice() logic.
-        /// Handles BAR, mapped, event wait, device migration, allocation, H2D.
+        /// Handles mapped, event wait, device migration, allocation, H2D.
         /// Caller must hold coherence_mutex_ and check graph-capture/CPU bailouts.
         TransferResult uploadFull(TensorBase *tensor, DeviceId target_device);
 
         /// Full download lifecycle: replaces TensorBase::ensureOnHost() logic.
-        /// Handles mapped sync, BAR D2H, event wait, standard D2H.
+        /// Handles mapped sync, event wait, standard D2H.
         /// Caller must hold coherence_mutex_.
         TransferResult downloadFull(TensorBase *tensor);
 
@@ -114,16 +113,13 @@ namespace llaminar2
         /// Execute DEVICE_TO_DEVICE_SAME_BACKEND transfer
         TransferResult executeDeviceToDeviceSameBackend(const TransferRequest &req);
 
-        /// Execute BAR_HOST_BOUNCE transfer
-        TransferResult executeBarHostBounce(const TransferRequest &req);
-
         /// Execute HOST_STAGED transfer (generic cross-vendor bounce)
         TransferResult executeHostStaged(const TransferRequest &req);
 
         /// Log transfer if tracing is enabled
         void traceTransfer(const TransferRequest &req, const TransferResult &result) const;
 
-        /// Wait for a GPU completion event, routing through PCIeBAR proxy if needed.
+        /// Wait for a GPU completion event.
         static bool waitForEventWithProxy(IBackend *backend, void *event, int device_id,
                                           const DeviceId &gpu_device);
 

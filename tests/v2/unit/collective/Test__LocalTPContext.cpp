@@ -96,7 +96,7 @@ TEST_F(Test__LocalTPContext, ConstructTwoDevicesEqualWeights)
 TEST_F(Test__LocalTPContext, ConstructProportionalWeights)
 {
     // 73% / 27% split (like NVIDIA vs AMD performance ratio)
-    auto ctx = createLocalTPContext({cuda0_, rocm0_}, {0.73f, 0.27f}, CollectiveBackendType::PCIE_BAR);
+    auto ctx = createLocalTPContext({cuda0_, rocm0_}, {0.73f, 0.27f}, CollectiveBackendType::HETEROGENEOUS);
 
     ASSERT_NE(ctx, nullptr);
     EXPECT_EQ(ctx->degree(), 2);
@@ -180,9 +180,9 @@ TEST_F(Test__LocalTPContext, AutoBackendAllCuda)
 }
 
 // NOTE: Hardware-dependent backend auto-detection tests (AutoBackendAllRocm,
-// AutoBackendMixedGpus, AutoBackendSelectsPCIeBarFor*, AutoBackendSelectsHeterogeneousFor*)
+// AutoBackendMixedGpus, AutoBackendSelectsHeterogeneousFor*)
 // have been migrated to integration tests in Test__LocalTPBackendBehavior.cpp.
-// Those tests require actual GPU hardware (RCCL, PCIeBAR, HETEROGENEOUS backends).
+// Those tests require actual GPU hardware (RCCL, HETEROGENEOUS backends).
 
 /**
  * @test AUTO backend with CPU involved -> HOST
@@ -213,7 +213,7 @@ TEST_F(Test__LocalTPContext, ExplicitBackendPreserved)
  */
 TEST_F(Test__LocalTPContext, IndexForDeviceCorrect)
 {
-    auto ctx = createLocalTPContext({cuda0_, cuda1_, rocm0_}, {}, CollectiveBackendType::PCIE_BAR);
+    auto ctx = createLocalTPContext({cuda0_, cuda1_, rocm0_}, {}, CollectiveBackendType::HETEROGENEOUS);
 
     EXPECT_EQ(ctx->indexForDevice(cuda0_), 0);
     EXPECT_EQ(ctx->indexForDevice(cuda1_), 1);
@@ -236,7 +236,7 @@ TEST_F(Test__LocalTPContext, IndexForDeviceNotFound)
  */
 TEST_F(Test__LocalTPContext, DeviceAtCorrect)
 {
-    auto ctx = createLocalTPContext({cuda0_, cuda1_, rocm0_}, {}, CollectiveBackendType::PCIE_BAR);
+    auto ctx = createLocalTPContext({cuda0_, cuda1_, rocm0_}, {}, CollectiveBackendType::HETEROGENEOUS);
 
     EXPECT_EQ(ctx->deviceAt(0), cuda0_);
     EXPECT_EQ(ctx->deviceAt(1), cuda1_);
@@ -260,7 +260,7 @@ TEST_F(Test__LocalTPContext, DeviceAtThrowsForInvalidIndex)
  */
 TEST_F(Test__LocalTPContext, WeightForDeviceCorrect)
 {
-    auto ctx = createLocalTPContext({cuda0_, rocm0_}, {0.73f, 0.27f}, CollectiveBackendType::PCIE_BAR);
+    auto ctx = createLocalTPContext({cuda0_, rocm0_}, {0.73f, 0.27f}, CollectiveBackendType::HETEROGENEOUS);
 
     EXPECT_FLOAT_EQ(ctx->weightForDevice(cuda0_), 0.73f);
     EXPECT_FLOAT_EQ(ctx->weightForDevice(rocm0_), 0.27f);
@@ -318,7 +318,7 @@ TEST_F(Test__LocalTPContext, HeadsForDeviceOddHeads)
  */
 TEST_F(Test__LocalTPContext, HeadsForDeviceProportional)
 {
-    auto ctx = createLocalTPContext({cuda0_, rocm0_}, {0.73f, 0.27f}, CollectiveBackendType::PCIE_BAR);
+    auto ctx = createLocalTPContext({cuda0_, rocm0_}, {0.73f, 0.27f}, CollectiveBackendType::HETEROGENEOUS);
 
     // 28 heads with 73%/27% split
     int h0 = ctx->headsForDevice(cuda0_, 28); // Should get ~20 heads (73% of 28)
@@ -387,7 +387,7 @@ TEST_F(Test__LocalTPContext, RowRangeForDeviceEqual)
  */
 TEST_F(Test__LocalTPContext, RowRangeForDeviceProportional)
 {
-    auto ctx = createLocalTPContext({cuda0_, rocm0_}, {0.73f, 0.27f}, CollectiveBackendType::PCIE_BAR);
+    auto ctx = createLocalTPContext({cuda0_, rocm0_}, {0.73f, 0.27f}, CollectiveBackendType::HETEROGENEOUS);
 
     auto [r0_start, r0_end] = ctx->rowRangeForDevice(cuda0_, 1000);
     auto [r1_start, r1_end] = ctx->rowRangeForDevice(rocm0_, 1000);
@@ -416,7 +416,7 @@ TEST_F(Test__LocalTPContext, ColRangeForDeviceThreeDevices)
     auto ctx = createLocalTPContext(
         {cuda0_, rocm0_, rocm1},
         {0.5f, 0.25f, 0.25f},
-        CollectiveBackendType::PCIE_BAR);
+        CollectiveBackendType::HETEROGENEOUS);
 
     auto [c0_start, c0_end] = ctx->colRangeForDevice(cuda0_, 1024);
     auto [c1_start, c1_end] = ctx->colRangeForDevice(rocm0_, 1024);

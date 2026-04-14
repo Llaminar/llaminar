@@ -3,7 +3,7 @@
  * @brief Tensor parallel domain management for hybrid parallelism
  *
  * Supports two types of tensor parallel domains:
- * 1. GPU_INTRA_RANK: NVIDIA↔AMD GPUs on the same socket communicate via PCIeBAR (~25μs)
+ * 1. GPU_INTRA_RANK: NVIDIA↔AMD GPUs on the same socket communicate via HOST backend
  * 2. CPU_CROSS_RANK: CPUs across sockets communicate via MPI over UPI (~50 GB/s)
  *
  * Design:
@@ -35,7 +35,7 @@ namespace llaminar2
      */
     enum class TPDomainType
     {
-        GPU_INTRA_RANK, ///< PCIeBAR for NVIDIA↔AMD on same socket (intra-rank only)
+        GPU_INTRA_RANK, ///< HOST backend for NVIDIA↔AMD on same socket (intra-rank only)
         CPU_CROSS_RANK, ///< MPI over UPI for CPUs across sockets (cross-rank)
     };
 
@@ -236,7 +236,7 @@ namespace llaminar2
         ~TPDomainBuilder() = default;
 
         /**
-         * Create a GPU intra-rank domain (no MPI communicator needed - uses PCIeBAR)
+         * Create a GPU intra-rank domain (no MPI communicator needed - uses HOST backend)
          * @param gpus GPU devices in this domain
          * @param name Domain name for logging
          * @return Configured TPDomain

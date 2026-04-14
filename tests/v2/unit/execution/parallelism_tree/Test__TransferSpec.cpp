@@ -6,7 +6,7 @@
  *
  * Tests for TransferSpec::derive() which determines how activation data
  * should be transferred between adjacent PP stages:
- * - LOCAL_PP: Same-rank transfer using NCCL/PCIeBAR/host-staged
+ * - LOCAL_PP: Same-rank transfer using NCCL/HOST/host-staged
  * - MPI_INTRAHOST: Cross-rank on same machine
  * - MPI_INTERHOST: Cross-rank on different machines
  *
@@ -95,13 +95,11 @@ TEST(Test__TransferSpec, CrossRankSameHost)
 TEST(Test__TransferSpec, CrossRankSameHostMultiDevice)
 {
     // TP on rank 0 with devices on "node0"
-    auto from = TP("tp0", {GlobalDeviceAddress::cuda(0, 0, "node0"),
-                           GlobalDeviceAddress::cuda(1, 0, "node0")},
+    auto from = TP("tp0", {GlobalDeviceAddress::cuda(0, 0, "node0"), GlobalDeviceAddress::cuda(1, 0, "node0")},
                    0);
 
     // TP on rank 1 with devices on "node0" (same host, different rank)
-    auto to = TP("tp1", {GlobalDeviceAddress::cuda(2, 1, "node0"),
-                         GlobalDeviceAddress::cuda(3, 1, "node0")},
+    auto to = TP("tp1", {GlobalDeviceAddress::cuda(2, 1, "node0"), GlobalDeviceAddress::cuda(3, 1, "node0")},
                  1);
 
     auto spec = TransferSpec::derive(from, to, 300);
@@ -139,21 +137,17 @@ TEST(Test__TransferSpec, CrossRankDifferentHostComplex)
 {
     // Build host0 PP stage: two TP domains on ranks 0 and 1
     auto from = PP("host0", {
-                                TP("socket0", {GlobalDeviceAddress::cuda(0, 0, "host0"),
-                                               GlobalDeviceAddress::cuda(1, 0, "host0")},
+                                TP("socket0", {GlobalDeviceAddress::cuda(0, 0, "host0"), GlobalDeviceAddress::cuda(1, 0, "host0")},
                                    0),
-                                TP("socket1", {GlobalDeviceAddress::cuda(0, 1, "host0"),
-                                               GlobalDeviceAddress::cuda(1, 1, "host0")},
+                                TP("socket1", {GlobalDeviceAddress::cuda(0, 1, "host0"), GlobalDeviceAddress::cuda(1, 1, "host0")},
                                    1),
                             });
 
     // Build host1 PP stage: two TP domains on ranks 2 and 3
     auto to = PP("host1", {
-                              TP("socket2", {GlobalDeviceAddress::cuda(0, 0, "host1"),
-                                             GlobalDeviceAddress::cuda(1, 0, "host1")},
+                              TP("socket2", {GlobalDeviceAddress::cuda(0, 0, "host1"), GlobalDeviceAddress::cuda(1, 0, "host1")},
                                  2),
-                              TP("socket3", {GlobalDeviceAddress::cuda(0, 1, "host1"),
-                                             GlobalDeviceAddress::cuda(1, 1, "host1")},
+                              TP("socket3", {GlobalDeviceAddress::cuda(0, 1, "host1"), GlobalDeviceAddress::cuda(1, 1, "host1")},
                                  3),
                           });
 

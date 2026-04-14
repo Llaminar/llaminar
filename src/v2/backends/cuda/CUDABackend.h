@@ -97,6 +97,20 @@ namespace llaminar2
             int k,
             int device_id) override;
 
+        // Stream management
+        void *createStream(int device_id) override;
+        void destroyStream(void *stream, int device_id) override;
+        bool synchronizeStream(void *stream, int device_id) override;
+        bool streamWaitEvent(void *stream, void *event, int device_id) override;
+
+        // Stream-aware memory operations
+        bool deviceCopyAsync(void *dst, const void *src, size_t bytes,
+                             int device_id, void *stream = nullptr) override;
+
+        // Collective reduction primitives
+        bool vectorAddInplace(void *output, const void *input, size_t count,
+                              int element_size, int device_id, void *stream = nullptr) override;
+
         // Backend identity
         DeviceType backendDeviceType() const override { return DeviceType::CUDA; }
 

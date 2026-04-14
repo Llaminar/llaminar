@@ -27,13 +27,6 @@ set(CMAKE_CONFIGURATION_TYPES "Debug;Release;E2ERelease;Integration" CACHE STRIN
 project(llaminar2 LANGUAGES C CXX)
 
 # =============================================================================
-# Automatic Linux Capability Assignment (PCIe BAR P2P support)
-# =============================================================================
-# This MUST be included early, before any add_executable() calls, because it
-# overrides add_executable to automatically set CAP_SYS_ADMIN on all executables.
-# This enables PCIe BAR direct P2P transfers between CUDA and ROCm GPUs.
-include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/AutoSetCapabilities.cmake)
-
 # Enable ccache if available
 find_program(CCACHE_PROGRAM ccache)
 if(CCACHE_PROGRAM)
@@ -926,19 +919,7 @@ if(HAVE_ROCM)
     list(APPEND BENCHMARK_SOURCES backends/benchmarks/ROCmBenchmark.cpp)
 endif()
 
-# Add cross-vendor P2P if both CUDA and ROCm enabled
-if(HAVE_CUDA AND HAVE_ROCM)
-    list(APPEND BENCHMARK_SOURCES
-        # Direct P2P via PCIe BAR mapping (no DMA-BUF, no fallback)
-        backends/p2p/DirectP2P.cpp
-        backends/p2p/DirectP2P_CUDA.cu
-        backends/p2p/DirectP2P_ROCm.cpp
-        # PCIe BAR collective backend for CUDA↔ROCm direct P2P
-        collective/backends/PCIeBARBackend.cpp
-        # NOTE: HeterogeneousBackend.cpp is in llaminar2_core (not here) because
-        # it includes NCCLBackend.h/RCCLBackend.h which depend on MPIContext.h
-    )
-endif()
+
 
 add_library(device_benchmarks STATIC ${BENCHMARK_SOURCES})
 # Resolve device symbols at library build time (same rationale as cuda_backend/rocm_backend).
@@ -974,7 +955,6 @@ if(HAVE_ROCM)
     )
     if(HAVE_CUDA)
         set_source_files_properties(
-            backends/p2p/DirectP2P_ROCm.cpp
             collective/backends/HostBackendROCm.cpp
             PROPERTIES LANGUAGE HIP
         )
@@ -1426,6 +1406,7 @@ add_library(llaminar2_core STATIC
     kernels/cpu/gdn/CPUGatedDeltaNet.cpp
     # Kernel dispatch factory (centralized device-aware kernel creation)
     kernels/KernelFactory.cpp
+    kernels/HybridKVCacheConfig.cpp
     kernels/common/PreparedEmbeddingWeights.cpp
     # Universal device kernel cache (hipBLAS, cuBLAS handles, etc.)
     kernels/DeviceKernelCache.cpp
@@ -1637,6 +1618,7 @@ if(HAVE_ROCM)
         kernels/rocm/kvcache/ROCmRingKVCache.cpp              # Ring buffer KV cache implementation
         kernels/rocm/kvcache/ROCmRingKVCacheBase.cpp          # Shared base class for ring buffer KV caches
         kernels/rocm/kvcache/ROCmRingKVCacheFactory.cpp       # Factory for creating ROCm KV cache instances
+        kernels/rocm/kvcache/ROCmHybridRingKVCacheFactory.cpp # Factory for creating ROCm Hybrid KV cache instances
         kernels/rocm/ops/ROCmSwiGLUKernelT.cpp                # SwiGLU ITensor implementation
         kernels/rocm/ops/ROCmRoPEKernelT.cpp                  # RoPE ITensor implementation
         kernels/rocm/ops/ROCmRMSNormKernelT.cpp               # RMSNorm ITensor implementation

@@ -55,12 +55,15 @@ namespace llaminar2
 
         if (config.gdn.full_attention_interval > 0)
         {
-            const int n_layers = config.n_layers;
-            config.layer_types.resize(n_layers);
+            // Use total_n_layers so the layer_types array covers all model
+            // layers with correct global GDN/FA pattern.  PP stages index
+            // into this with absolute layer indices.
+            const int total_layers = config.total_n_layers > 0 ? config.total_n_layers : config.n_layers;
+            config.layer_types.resize(total_layers);
 
             int fa_count = 0;
             int gdn_count = 0;
-            for (int i = 0; i < n_layers; ++i)
+            for (int i = 0; i < total_layers; ++i)
             {
                 // Pattern: every Nth layer is full attention (1-indexed check)
                 // Layer indices 3, 7, 11, ... are FA when interval=4

@@ -121,7 +121,7 @@ namespace llaminar2
         // Device leaf configuration
         // =====================================================================
 
-        GlobalDeviceAddress device;  ///< Valid only for DEVICE nodes
+        GlobalDeviceAddress device; ///< Valid only for DEVICE nodes
         int owning_rank = -1;       ///< MPI rank that owns this device
 
         // =====================================================================
@@ -190,7 +190,7 @@ namespace llaminar2
          *
          * Returns true if the leaf devices include both CUDA and ROCm
          * (or any other combination of different GPU types). This is
-         * the key indicator that PCIeBAR or HETEROGENEOUS backend is needed.
+         * the key indicator that HOST or HETEROGENEOUS backend is needed.
          *
          * @return true if leaves contain more than one GPU vendor type
          */

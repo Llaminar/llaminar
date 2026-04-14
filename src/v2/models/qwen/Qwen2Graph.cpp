@@ -506,6 +506,7 @@ namespace llaminar2
             {
                 attn_params.apply_rope_to_k = true;
                 attn_params.rope_theta = config_.rope_theta;
+                attn_params.partial_rotary_factor = config_.partial_rotary_factor;
             }
 
             graph.addNode(prefix + "attention",

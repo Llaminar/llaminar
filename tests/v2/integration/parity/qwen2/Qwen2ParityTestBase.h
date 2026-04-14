@@ -112,7 +112,7 @@ namespace llaminar2::test::parity::qwen2
      * @brief Extended hardware availability check for Qwen2 tests
      *
      * Extends the base checkHardwareAvailability() with collective backend checks
-     * (NCCL, RCCL, PCIeBAR availability).
+     * (NCCL, RCCL, HOST availability).
      */
     inline std::optional<std::string> checkQwen2HardwareAvailability(const TestConfig &cfg)
     {
@@ -131,9 +131,9 @@ namespace llaminar2::test::parity::qwen2
             if (!isRcclAvailable())
                 return "RCCL not available";
             break;
-        case Collective::PCIeBAR:
+        case Collective::HETEROGENEOUS:
             if (!isPcieBarAvailable())
-                return "PCIeBAR requires both CUDA and ROCm devices";
+                return "HETEROGENEOUS requires both CUDA and ROCm devices";
             break;
         case Collective::MPI:
         case Collective::HOST:
@@ -865,7 +865,7 @@ namespace llaminar2::test::parity::qwen2
 
         void SetUp() override
         {
-            // Check hardware availability (includes MPI check for LocalTP + NCCL/RCCL/PCIeBAR)
+            // Check hardware availability (includes MPI check for LocalTP + NCCL/RCCL/HOST)
             if (auto skip_reason = checkQwen2HardwareAvailability(cfg()))
             {
                 GTEST_SKIP() << *skip_reason;

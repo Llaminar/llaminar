@@ -165,34 +165,11 @@ namespace llaminar2::test
     }
 
 #if defined(HAVE_CUDA) && defined(HAVE_ROCM)
-    TEST_F(Test__BackendRouter, SelectsPCIeBARForCUDAROCmMix)
+    TEST_F(Test__BackendRouter, FallsBackToHostForCUDAROCmMix)
     {
         auto factory = std::make_unique<MockBackendFactory>();
 
-        // Configure PCIE_BAR as available (simulating runtime detection success)
-        factory->setAvailable(CollectiveBackendType::PCIE_BAR, true);
-        factory->setAvailable(CollectiveBackendType::HOST, true);
-
-        // Add mock PCIE_BAR backend
-        auto *mock_pcie = factory->addMockBackend(CollectiveBackendType::PCIE_BAR);
-        mock_pcie->setAvailable(true);
-
-        auto router = createRouter(std::move(factory));
-        auto group = createCUDAROCmMixGroup("cuda_rocm_mix");
-
-        auto selection = router->selectBackend(group);
-        EXPECT_EQ(selection.type, CollectiveBackendType::PCIE_BAR);
-        EXPECT_FALSE(selection.requires_multi_phase);
-        EXPECT_NE(selection.reason.find("PCIe BAR"), std::string::npos)
-            << "Expected reason to mention PCIe BAR, got: " << selection.reason;
-    }
-
-    TEST_F(Test__BackendRouter, FallsBackToHostWhenPCIeBARUnavailableForCUDAROCm)
-    {
-        auto factory = std::make_unique<MockBackendFactory>();
-
-        // Configure PCIE_BAR as NOT available, HOST as available
-        factory->setAvailable(CollectiveBackendType::PCIE_BAR, false);
+        // Configure HOST as available
         factory->setAvailable(CollectiveBackendType::HOST, true);
 
         // Add mock HOST backend
@@ -261,7 +238,7 @@ namespace llaminar2::test
 
         auto selection = router->selectBackend(group);
         // Heterogeneous global groups should fall back to MPI
-        // (PCIeBAR is only for local scope)
+        // (HETEROGENEOUS backend is only for local scope)
         EXPECT_EQ(selection.type, CollectiveBackendType::MPI);
         EXPECT_FALSE(selection.requires_multi_phase);
     }
@@ -687,10 +664,10 @@ namespace llaminar2::test
     TEST_F(Test__BackendRouter, SelectBackendForGPUIntraRankHeterogeneous)
     {
         auto factory = std::make_unique<MockBackendFactory>();
-        factory->setAvailable(CollectiveBackendType::PCIE_BAR, true);
+        factory->setAvailable(CollectiveBackendType::HETEROGENEOUS, true);
         factory->setAvailable(CollectiveBackendType::MPI, true);
-        auto *mock_pcie = factory->addMockBackend(CollectiveBackendType::PCIE_BAR);
-        mock_pcie->setAvailable(true);
+        auto *mock_hetero = factory->addMockBackend(CollectiveBackendType::HETEROGENEOUS);
+        mock_hetero->setAvailable(true);
 
         auto router = createRouter(std::move(factory));
 
@@ -702,10 +679,10 @@ namespace llaminar2::test
         gpu_domain.name = "gpu_hetero_domain";
         gpu_domain.local_rank_in_domain = 0;
 
-        // Heterogeneous GPU domain should use PCIe BAR
+        // Heterogeneous GPU domain should use HETEROGENEOUS backend
         ICollectiveBackend *backend = router->selectBackendForDomain(&gpu_domain);
         ASSERT_NE(backend, nullptr);
-        EXPECT_EQ(backend->type(), CollectiveBackendType::PCIE_BAR);
+        EXPECT_EQ(backend->type(), CollectiveBackendType::HETEROGENEOUS);
     }
 #endif // HAVE_CUDA && HAVE_ROCM
 
@@ -873,19 +850,19 @@ namespace llaminar2::test
         domain.name = "cuda_rocm_mix";
 
         // We test this indirectly through selectBackendForDomain
-        // Create factory with both PCIe BAR and MPI available
+        // Create factory with HETEROGENEOUS and MPI available
 #if defined(HAVE_CUDA) && defined(HAVE_ROCM)
         auto factory2 = std::make_unique<MockBackendFactory>();
-        factory2->setAvailable(CollectiveBackendType::PCIE_BAR, true);
+        factory2->setAvailable(CollectiveBackendType::HETEROGENEOUS, true);
         factory2->setAvailable(CollectiveBackendType::MPI, true);
-        auto *mock_pcie = factory2->addMockBackend(CollectiveBackendType::PCIE_BAR);
-        mock_pcie->setAvailable(true);
+        auto *mock_hetero = factory2->addMockBackend(CollectiveBackendType::HETEROGENEOUS);
+        mock_hetero->setAvailable(true);
 
         auto router2 = createRouter(std::move(factory2));
 
         ICollectiveBackend *backend = router2->selectBackendForDomain(&domain);
         ASSERT_NE(backend, nullptr);
-        EXPECT_EQ(backend->type(), CollectiveBackendType::PCIE_BAR);
+        EXPECT_EQ(backend->type(), CollectiveBackendType::HETEROGENEOUS);
 #endif
     }
 

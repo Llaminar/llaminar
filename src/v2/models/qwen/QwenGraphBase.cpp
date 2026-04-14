@@ -546,6 +546,28 @@ namespace llaminar2
                           ComputeStageFactory::createEmbedding(embed_params),
                           device);
             prev_node = "embedding";
+
+            // Stage 1b: Embedding AllReduce (vocab-parallel embedding sharding)
+            // When embedding is column-parallel sharded, each device holds
+            // vocab_size/tp_degree rows. Tokens outside the local range produce zeros.
+            // AllReduce(sum) combines the partial results.
+            const bool embedding_is_sharded =
+                weights_.embedding_table &&
+                static_cast<int>(weights_.embedding_table->rows()) < config_.vocab_size;
+            if (embedding_is_sharded && needsTPAllreduce())
+            {
+                size_t allreduce_count = static_cast<size_t>(total_tokens) * config_.d_model;
+                auto allreduce_stage = createTPAllreduceStage(
+                    embed_output, allreduce_count, device, -1,
+                    /*is_attention=*/false, "embedding_allreduce",
+                    BufferId::HIDDEN_STATE);
+                if (allreduce_stage)
+                {
+                    graph.addNode("embedding_allreduce", std::move(allreduce_stage), device);
+                    graph.addDependency("embedding_allreduce", "embedding");
+                    prev_node = "embedding_allreduce";
+                }
+            }
         }
         else if (input.external_hidden_state)
         {
@@ -582,9 +604,9 @@ namespace llaminar2
                     copy_bytes *= sizeof(float);
                 }
 
-                // Unified PP copy: data() handles all device/BAR coherence sync
-                // automatically (including BAR-backed D2H via staging buffer).
-                // This eliminates the previous 3-way BAR/D2D/CPU branch.
+                // Unified PP copy: data() handles all device coherence sync
+                // automatically (including D2H via staging buffer).
+                // This eliminates the previous 3-way D2D/CPU branch.
                 const void *src = input.external_hidden_state->data();
                 void *dst = working_buffer->mutable_data();
                 std::memcpy(dst, src, copy_bytes);
@@ -1730,22 +1752,6 @@ namespace llaminar2
                       << " backend=" << static_cast<int>(config_.tp_ctx->backend())
                       << " local=" << config_.tp_ctx->isLocal()
                       << " stage_name=" << stage_name);
-
-            // =========================================================
-            // LOCAL TP only: Register BAR-backed tensor for PCIeBAR allreduce
-            // =========================================================
-            if (config_.tp_ctx->isLocal())
-            {
-                auto *local_ctx = static_cast<ILocalTPContext *>(config_.tp_ctx);
-                if (local_ctx->backend() == CollectiveBackendType::PCIE_BAR &&
-                    config_.tp_device_idx >= 0 &&
-                    static_cast<size_t>(config_.tp_device_idx) < local_ctx->devices().size())
-                {
-                    const GlobalDeviceAddress &device_addr =
-                        local_ctx->devices()[config_.tp_device_idx];
-                    local_ctx->registerBARBackedOutput(stage_name, device_addr, buffer);
-                }
-            }
 
             TPAllreduceStage::Params params;
             params.device_id = device;

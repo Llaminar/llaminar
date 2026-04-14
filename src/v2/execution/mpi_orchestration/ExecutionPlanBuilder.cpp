@@ -1061,46 +1061,10 @@ namespace llaminar2
             return CollectiveBackendType::MPI;
         }
 
-        // Heterogeneous GPUs on same host: PCIeBAR only if same NUMA
+        // Heterogeneous GPUs on same host: use HETEROGENEOUS backend
         if (has_cuda && has_rocm)
         {
-            // GlobalDeviceAddress.numa_node defaults to 0 and cannot be trusted.
-            // Query DeviceManager for real NUMA affinity from hardware.
-            bool real_same_numa = true;
-            int real_first_numa = -1;
-            const auto &dm = DeviceManager::instance();
-            for (const auto &dev : devices)
-            {
-                if (!dev.isGPU())
-                    continue;
-                int dev_numa = -1;
-                for (const auto &cd : dm.devices())
-                {
-                    bool type_match =
-                        (dev.isCUDA() && cd.type == ComputeBackendType::GPU_CUDA) ||
-                        (dev.isROCm() && cd.type == ComputeBackendType::GPU_ROCM);
-                    if (type_match && cd.device_id == dev.device_ordinal)
-                    {
-                        dev_numa = cd.numa_node;
-                        break;
-                    }
-                }
-                if (dev_numa < 0)
-                    continue; // Unknown NUMA — don't block
-                if (real_first_numa < 0)
-                    real_first_numa = dev_numa;
-                else if (dev_numa != real_first_numa)
-                    real_same_numa = false;
-            }
-            if (real_same_numa)
-            {
-                return CollectiveBackendType::PCIE_BAR;
-            }
-            LOG_WARN("Cross-NUMA heterogeneous GPU collective: HOST backend selected "
-                     "instead of PCIeBAR — this will be slow! "
-                     "For best performance, use GPUs on the same NUMA node "
-                     "so PCIeBAR peer-to-peer transfers can be used.");
-            return CollectiveBackendType::HOST;
+            return CollectiveBackendType::HETEROGENEOUS;
         }
 
         // GPU + CPU mix uses HOST staging

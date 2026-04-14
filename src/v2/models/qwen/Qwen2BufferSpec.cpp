@@ -17,8 +17,8 @@ namespace llaminar2
     // These buffers hold the output of row-parallel matrix multiplications
     // (Wo projection, FFN down projection) and need allreduce for TP.
     //
-    // When using PCIeBAR backend with heterogeneous GPUs, these should be
-    // allocated in BAR memory for efficient cross-vendor communication.
+    // When using HOST backend with heterogeneous GPUs, these are
+    // communicated via host-staged transfers.
 
     static const std::unordered_set<std::string> ROW_PARALLEL_OUTPUT_SUFFIXES = {
         // FFN down projection outputs
@@ -91,31 +91,11 @@ namespace llaminar2
         CollectiveBackendType backend_type,
         int tp_degree)
     {
-        // Condition 1: Must have LOCAL TP enabled (tp_degree > 1)
-        if (tp_degree <= 1)
-        {
-            LOG_TRACE("[Qwen2BufferSpec] requiresBARBacked(" << buffer_name
-                                                             << "): false (tp_degree=" << tp_degree << " <= 1)");
-            return false;
-        }
-
-        // Condition 2: Must be using PCIeBAR backend
-        if (backend_type != CollectiveBackendType::PCIE_BAR)
-        {
-            LOG_TRACE("[Qwen2BufferSpec] requiresBARBacked(" << buffer_name
-                                                             << "): false (backend=" << collectiveBackendTypeToString(backend_type)
-                                                             << " != PCIE_BAR)");
-            return false;
-        }
-
-        // Condition 3: Must be a row-parallel output buffer
-        bool is_row_parallel = matchesRowParallelOutput(buffer_name);
-
-        LOG_TRACE("[Qwen2BufferSpec] requiresBARBacked(" << buffer_name
-                                                         << "): " << (is_row_parallel ? "true" : "false")
-                                                         << " (row_parallel_match=" << is_row_parallel << ")");
-
-        return is_row_parallel;
+        // Legacy stub — always returns false
+        (void)buffer_name;
+        (void)backend_type;
+        (void)tp_degree;
+        return false;
     }
 
     AllocationStrategy Qwen2BufferSpec::getAllocationStrategy(
@@ -123,10 +103,9 @@ namespace llaminar2
         CollectiveBackendType backend_type,
         int tp_degree)
     {
-        if (requiresBARBacked(buffer_name, backend_type, tp_degree))
-        {
-            return AllocationStrategy::BAR_BACKED;
-        }
+        (void)buffer_name;
+        (void)backend_type;
+        (void)tp_degree;
         return AllocationStrategy::STANDARD;
     }
 

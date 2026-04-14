@@ -195,8 +195,8 @@ protected:
     llaminar2::testing::MockDeviceContext mock_ctx_{DeviceId::cpu()};
 
     ForwardExecutionEngine makeEngine(bool cache_enabled = true,
-                                       bool has_pp = false,
-                                       std::optional<FactoryPPStageConfig> pp = std::nullopt)
+                                      bool has_pp = false,
+                                      std::optional<FactoryPPStageConfig> pp = std::nullopt)
     {
         ForwardExecutionEngine::Config config;
         config.cache_config.enabled = cache_enabled;
@@ -590,16 +590,10 @@ TEST_F(Test__ForwardExecutionEngineAdvanced, DifferentSeqLens_SeparateCacheEntri
 TEST(Test__ForwardGraphSignature_PP, DifferentPPLayerRanges_DifferentSignatures)
 {
     ForwardGraphSignature sig_a{
-        .seq_len = 1, .batch_size = 1, .decode = true,
-        .pp_stage_enabled = true,
-        .pp_first_layer = 0, .pp_last_layer = 12,
-        .pp_has_embedding = true, .pp_has_lm_head = false};
+        .seq_len = 1, .batch_size = 1, .decode = true, .pp_stage_enabled = true, .pp_first_layer = 0, .pp_last_layer = 12, .pp_has_embedding = true, .pp_has_lm_head = false};
 
     ForwardGraphSignature sig_b{
-        .seq_len = 1, .batch_size = 1, .decode = true,
-        .pp_stage_enabled = true,
-        .pp_first_layer = 12, .pp_last_layer = 24,
-        .pp_has_embedding = false, .pp_has_lm_head = true};
+        .seq_len = 1, .batch_size = 1, .decode = true, .pp_stage_enabled = true, .pp_first_layer = 12, .pp_last_layer = 24, .pp_has_embedding = false, .pp_has_lm_head = true};
 
     EXPECT_NE(sig_a, sig_b);
 
@@ -611,13 +605,17 @@ TEST(Test__ForwardGraphSignature_PP, PPEmbeddingFlag_AffectsSignature)
 {
     ForwardGraphSignature sig_a{
         .pp_stage_enabled = true,
-        .pp_first_layer = 0, .pp_last_layer = 12,
-        .pp_has_embedding = true, .pp_has_lm_head = false};
+        .pp_first_layer = 0,
+        .pp_last_layer = 12,
+        .pp_has_embedding = true,
+        .pp_has_lm_head = false};
 
     ForwardGraphSignature sig_b{
         .pp_stage_enabled = true,
-        .pp_first_layer = 0, .pp_last_layer = 12,
-        .pp_has_embedding = false, .pp_has_lm_head = false};
+        .pp_first_layer = 0,
+        .pp_last_layer = 12,
+        .pp_has_embedding = false,
+        .pp_has_lm_head = false};
 
     EXPECT_NE(sig_a, sig_b);
 }
@@ -626,13 +624,17 @@ TEST(Test__ForwardGraphSignature_PP, PPLMHeadFlag_AffectsSignature)
 {
     ForwardGraphSignature sig_a{
         .pp_stage_enabled = true,
-        .pp_first_layer = 12, .pp_last_layer = 24,
-        .pp_has_embedding = false, .pp_has_lm_head = true};
+        .pp_first_layer = 12,
+        .pp_last_layer = 24,
+        .pp_has_embedding = false,
+        .pp_has_lm_head = true};
 
     ForwardGraphSignature sig_b{
         .pp_stage_enabled = true,
-        .pp_first_layer = 12, .pp_last_layer = 24,
-        .pp_has_embedding = false, .pp_has_lm_head = false};
+        .pp_first_layer = 12,
+        .pp_last_layer = 24,
+        .pp_has_embedding = false,
+        .pp_has_lm_head = false};
 
     EXPECT_NE(sig_a, sig_b);
 }
@@ -640,10 +642,7 @@ TEST(Test__ForwardGraphSignature_PP, PPLMHeadFlag_AffectsSignature)
 TEST(Test__ForwardGraphSignature_PP, SameSignature_WithPP_CacheKey)
 {
     ForwardGraphSignature sig_a{
-        .seq_len = 1, .batch_size = 1, .decode = true,
-        .pp_stage_enabled = true,
-        .pp_first_layer = 0, .pp_last_layer = 12,
-        .pp_has_embedding = true, .pp_has_lm_head = false};
+        .seq_len = 1, .batch_size = 1, .decode = true, .pp_stage_enabled = true, .pp_first_layer = 0, .pp_last_layer = 12, .pp_has_embedding = true, .pp_has_lm_head = false};
 
     ForwardGraphSignature sig_b = sig_a;
 
@@ -739,23 +738,13 @@ TEST(Test__PPCopyInfo, ConfiguredForMiddleStage)
 // FactoryPPStageConfig — Edge Cases Beyond Existing Tests
 // =========================================================================
 
-TEST(Test__FactoryPPStageConfig_Extended, UseBarBackedHidden_DefaultFalse)
+TEST(Test__FactoryPPStageConfig_Extended, DefaultConfig)
 {
     FactoryPPStageConfig config{};
-    EXPECT_FALSE(config.use_bar_backed_hidden);
-}
-
-TEST(Test__FactoryPPStageConfig_Extended, UseBarBackedHidden_SetTrue)
-{
-    FactoryPPStageConfig config{
-        .first_layer = 0,
-        .last_layer = 12,
-        .has_embedding = true,
-        .has_lm_head = false,
-        .use_bar_backed_hidden = true};
-
-    EXPECT_TRUE(config.isValid());
-    EXPECT_TRUE(config.use_bar_backed_hidden);
+    EXPECT_EQ(config.first_layer, 0);
+    EXPECT_EQ(config.last_layer, 0);
+    EXPECT_FALSE(config.has_embedding);
+    EXPECT_FALSE(config.has_lm_head);
 }
 
 TEST(Test__FactoryPPStageConfig_Extended, SingleLayerStage)

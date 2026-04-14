@@ -307,7 +307,7 @@ TEST(Test__TPDomainConfig, Validate_SucceedsWithoutWeights)
     config.name = "no_weights";
     config.devices.push_back(DeviceId::cuda(0));
     config.devices.push_back(DeviceId::rocm(0));
-    config.tp_backend = CollectiveBackendType::PCIE_BAR;
+    config.tp_backend = CollectiveBackendType::HETEROGENEOUS;
 
     std::string error;
     EXPECT_TRUE(config.validate(&error));

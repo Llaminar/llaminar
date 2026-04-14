@@ -4,13 +4,13 @@
  *
  * LOCAL PP = pipeline parallel stages within a single MPI rank, decoupled from MPI world_size.
  * This enables pipeline parallelism across devices owned by one rank, using high-bandwidth
- * backends like NCCL, RCCL, PCIeBAR, or HOST for activation transfer between stages.
+ * backends like NCCL, RCCL, or HOST for activation transfer between stages.
  *
  * Key concepts:
  * - LOCAL PP degree can be different from MPI world_size
  * - Each PP stage maps to a specific device OR a nested TP/PP context
  * - Layer boundaries define which layers execute on which stage
- * - Backend selection based on device types (NCCL for CUDA-only, PCIeBAR for mixed)
+ * - Backend selection based on device types (NCCL for CUDA-only, HOST for mixed)
  *
  * Pipeline parallel activation flow (simple):
  *   Stage 0 (layers 0-5)    → transfer →    Stage 1 (layers 6-11)    → transfer →    Stage 2 (layers 12-23)
@@ -157,7 +157,6 @@ namespace llaminar2
      * When transferring FROM a TP domain:
      * - After TP allreduce, all devices have identical data
      * - Uses representative device (device 0) as source
-     * - TP context may provide BAR-backed buffers for cross-vendor transfer
      *
      * When transferring TO a TP domain:
      * - For activations: broadcast to all TP devices
@@ -264,8 +263,8 @@ namespace llaminar2
         /**
          * @brief Check if any PP transfer is cross-vendor (CUDA↔ROCm)
          *
-         * Cross-vendor transfers require BAR-backed tensors for efficient
-         * data movement via PCIe BAR mapping.
+         * Cross-vendor transfers use host-staged memory for
+         * data movement.
          *
          * @return true if any consecutive stages have different GPU vendors
          */
@@ -297,7 +296,7 @@ namespace llaminar2
         /**
          * @brief Check if stage N outputs to a cross-vendor stage
          *
-         * Used to determine if stage N's hidden state tensor should be BAR-backed.
+         * Used to determine if stage N's hidden state tensor needs host-staged allocation.
          *
          * @param stage_idx The stage to check
          * @return true if next stage has a different GPU vendor
@@ -373,7 +372,7 @@ namespace llaminar2
          * Backend selection based on device types:
          * - Both CUDA devices → NCCL
          * - Both ROCm devices → RCCL
-         * - Mixed types → PCIeBAR or HOST
+         * - Mixed types → HOST
          *
          * @param stage_from Source stage index
          * @param stage_to Destination stage index
@@ -513,7 +512,7 @@ namespace llaminar2
      * configuration. Backend selection is automatic based on device types:
      * - Homogeneous CUDA → NCCL for all transfers
      * - Homogeneous ROCm → RCCL for all transfers
-     * - Heterogeneous → PCIeBAR or HOST depending on topology
+     * - Heterogeneous → HOST depending on topology
      *
      * @param config PP configuration (devices and layer boundaries)
      * @return Unique pointer to ILocalPPContext implementation
@@ -530,7 +529,7 @@ namespace llaminar2
      * Key differences from flat createLocalPPContext():
      * - Stages can be TP domains (multiple devices with shared state)
      * - Transfer operations automatically handle TP context boundaries
-     * - BAR-backed tensor handling delegated to TP context
+     * - Registered tensor handling delegated to TP context
      *
      * ## Usage
      *
@@ -550,7 +549,7 @@ namespace llaminar2
      * // Create PP context
      * auto pp_ctx = createLocalPPContext(config);
      *
-     * // Transfer from TP domain → single device (handles BAR automatically)
+     * // Transfer from TP domain → single device (handles staging automatically)
      * pp_ctx->transfer(activations, 0, 1);
      * ```
      *

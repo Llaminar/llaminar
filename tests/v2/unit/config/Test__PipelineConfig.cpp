@@ -47,7 +47,7 @@ namespace
         config.pp_stages.push_back(PPStageConfig::firstStage(0, "gpu0", 0, 12));
         config.pp_stages.push_back(PPStageConfig::lastStage(1, "gpu1", 12, 24));
 
-        config.pp_transfer_backends[{0, 1}] = CollectiveBackendType::PCIE_BAR;
+        config.pp_transfer_backends[{0, 1}] = CollectiveBackendType::HOST;
 
         return config;
     }
@@ -240,7 +240,7 @@ TEST(Test__PipelineConfig, GetTransferBackend_ReturnsConfiguredBackend)
 
     CollectiveBackendType backend = config.getTransferBackend(0, 1);
 
-    EXPECT_EQ(backend, CollectiveBackendType::PCIE_BAR);
+    EXPECT_EQ(backend, CollectiveBackendType::HOST);
 }
 
 TEST(Test__PipelineConfig, GetTransferBackend_ReturnsAutoForUnconfigured)
@@ -708,7 +708,7 @@ TEST(Test__PipelineConfig, TensorParallel_CreatesValidConfig)
 TEST(Test__PipelineConfig, TensorParallel_WorksWithMixedGPUs)
 {
     std::vector<DeviceId> devices = {DeviceId::cuda(0), DeviceId::rocm(0)};
-    PipelineConfig config = PipelineConfig::tensorParallel(24, devices, CollectiveBackendType::PCIE_BAR);
+    PipelineConfig config = PipelineConfig::tensorParallel(24, devices, CollectiveBackendType::HETEROGENEOUS);
 
     std::string error;
     ASSERT_TRUE(config.validate(&error)) << error;
@@ -726,7 +726,7 @@ TEST(Test__PipelineConfig, PipelineParallel2Stage_CreatesValidConfig)
         24,
         DeviceId::cuda(0), 12,
         DeviceId::cuda(1),
-        CollectiveBackendType::PCIE_BAR);
+        CollectiveBackendType::HOST);
 
     std::string error;
     ASSERT_TRUE(config.validate(&error)) << error;
@@ -745,7 +745,7 @@ TEST(Test__PipelineConfig, PipelineParallel2Stage_CreatesValidConfig)
     EXPECT_EQ(config.pp_stages[1].last_layer, 24);
 
     // Check transfer backend
-    EXPECT_EQ(config.getTransferBackend(0, 1), CollectiveBackendType::PCIE_BAR);
+    EXPECT_EQ(config.getTransferBackend(0, 1), CollectiveBackendType::HOST);
 }
 
 TEST(Test__PipelineConfig, PipelineParallel2Stage_WorksWithHeterogeneousDevices)
@@ -837,7 +837,7 @@ TEST(Test__PipelineConfig, ComplexConfig_ThreeStages_Validates)
     config.pp_stages.push_back(PPStageConfig::middleStage(1, "amd", 9, 18));
     config.pp_stages.push_back(PPStageConfig::lastStage(2, "cpu", 18, 27));
 
-    config.pp_transfer_backends[{0, 1}] = CollectiveBackendType::PCIE_BAR;
+    config.pp_transfer_backends[{0, 1}] = CollectiveBackendType::HETEROGENEOUS;
     config.pp_transfer_backends[{1, 2}] = CollectiveBackendType::HOST;
 
     std::string error;
@@ -1022,9 +1022,9 @@ TEST(Test__PipelineConfig, AutoSelectBackends_CPUToCPUGetsHOST)
 // Cross-Vendor PP Transfer Backend Tests
 // =============================================================================
 
-TEST(Test__PipelineConfig, AutoSelectBackends_CUDAToROCmGetsPCIeBAR)
+TEST(Test__PipelineConfig, AutoSelectBackends_CUDAToROCmGetsHETEROGENEOUS)
 {
-    // Cross-vendor GPU PP transfer: CUDA → ROCm should get PCIe BAR
+    // Cross-vendor GPU PP transfer: CUDA → ROCm should get HETEROGENEOUS
     PipelineConfig config;
     config.total_layers = 28;
 
@@ -1044,7 +1044,7 @@ TEST(Test__PipelineConfig, AutoSelectBackends_CUDAToROCmGetsPCIeBAR)
     config.autoSelectBackends();
 
     auto backend = config.pp_transfer_backends[{0, 1}];
-    EXPECT_EQ(backend, CollectiveBackendType::PCIE_BAR);
+    EXPECT_EQ(backend, CollectiveBackendType::HETEROGENEOUS);
 }
 
 TEST(Test__PipelineConfig, AutoSelectBackends_ROCmToROCmGetsRCCL)
@@ -1124,17 +1124,17 @@ TEST(Test__PipelineConfig, AutoSelectBackends_ThreeStageChain_MixedVendors)
 
     config.autoSelectBackends();
 
-    // CUDA → ROCm: PCIeBAR
+    // CUDA → ROCm: HETEROGENEOUS
     auto backend_0_1 = config.pp_transfer_backends[{0, 1}];
-    EXPECT_EQ(backend_0_1, CollectiveBackendType::PCIE_BAR);
+    EXPECT_EQ(backend_0_1, CollectiveBackendType::HETEROGENEOUS);
     // ROCm → CPU: HOST
     auto backend_1_2 = config.pp_transfer_backends[{1, 2}];
     EXPECT_EQ(backend_1_2, CollectiveBackendType::HOST);
 }
 
-TEST(Test__PipelineConfig, AutoSelectBackends_MixedTPDomainAutoSelectsPCIeBAR)
+TEST(Test__PipelineConfig, AutoSelectBackends_MixedTPDomainAutoSelectsHETEROGENEOUS)
 {
-    // TP domain with CUDA + ROCm should auto-select PCIe BAR
+    // TP domain with CUDA + ROCm should auto-select HETEROGENEOUS
     PipelineConfig config;
     config.total_layers = 28;
 
@@ -1149,7 +1149,7 @@ TEST(Test__PipelineConfig, AutoSelectBackends_MixedTPDomainAutoSelectsPCIeBAR)
 
     config.autoSelectBackends();
 
-    EXPECT_EQ(config.tp_domains[0].tp_backend, CollectiveBackendType::PCIE_BAR);
+    EXPECT_EQ(config.tp_domains[0].tp_backend, CollectiveBackendType::HETEROGENEOUS);
 }
 
 // =============================================================================

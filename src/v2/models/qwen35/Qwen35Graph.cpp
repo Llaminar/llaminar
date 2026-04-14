@@ -7,8 +7,12 @@
 #include "Qwen35Schema.h"
 #include "../../execution/compute_stages/ComputeStages.h"
 #include "../../execution/local_execution/graph/GraphBuildUtils.h"
+#include "../../kernels/HybridKVCacheConfig.h"
+#include "../../kernels/HybridKVCacheConfig.h"
+#include "../../kernels/IHybridKVCache.h"
 #include "../../kernels/KernelFactory.h"
 #include "../../tensors/TensorKernels.h"
+#include "../../utils/Assertions.h"
 #include "../../utils/Logger.h"
 
 namespace llaminar2
@@ -25,7 +29,6 @@ namespace llaminar2
         const GraphConfig &config)
         : QwenGraphBase(std::move(model_ctx), std::move(mpi_ctx), config)
     {
-        ensureGDNStates();
     }
 
     Qwen35Graph::Qwen35Graph(
@@ -33,120 +36,17 @@ namespace llaminar2
         std::shared_ptr<IMPIContext> mpi_ctx)
         : QwenGraphBase(config, std::move(mpi_ctx))
     {
-        ensureGDNStates();
     }
 
     // =========================================================================
-    // GDN State Management
+    // GDN Layer Type Detection
     // =========================================================================
-
-    void Qwen35Graph::ensureGDNStates()
-    {
-        if (!config_.hasGDN())
-            return;
-
-        const int n_layers = config_.n_layers;
-        const int conv_kernel = config_.gdn.conv_kernel_size;
-
-        // GDN dimensions: Qwen 3.5 can have different key and value head counts.
-        // n_k_heads: number of key/query heads (gdn_group_count)
-        // n_v_heads: number of value heads (gdn_time_step_rank)
-        // When n_v_heads > n_k_heads, Q and K are repeat_interleaved before recurrence.
-        const int n_k_heads_full = config_.gdn.group_count > 0
-                                       ? config_.gdn.group_count
-                                       : config_.n_heads;
-        const int n_v_heads_full = config_.gdn.time_step_rank > 0
-                                       ? config_.gdn.time_step_rank
-                                       : n_k_heads_full;
-
-        // TP-aware local head counts: states must match local weight dimensions.
-        // For GDN modular repeat (n_v > n_k), Q/K are replicated across TP ranks
-        // so n_k stays at full count. Only n_v is sharded.
-        int n_k_heads = n_k_heads_full;
-        int n_v_heads = n_v_heads_full;
-        const bool gdn_modular_repeat = (n_v_heads_full > n_k_heads_full);
-        if (config_.qkv_column_parallel && config_.local_n_heads > 0 && config_.n_heads > 0)
-        {
-            // V-heads are always sharded
-            n_v_heads = n_v_heads_full * config_.local_n_heads / config_.n_heads;
-            if (n_v_heads <= 0)
-                n_v_heads = 1;
-
-            // K-heads: replicated for GDN modular repeat, sharded otherwise
-            if (!gdn_modular_repeat)
-            {
-                n_k_heads = n_k_heads_full * config_.local_n_heads / config_.n_heads;
-                if (n_k_heads <= 0)
-                    n_k_heads = 1;
-            }
-            // else: n_k_heads stays at full count (replicated)
-        }
-
-        const int d_v = config_.gdn.state_size;
-        const int d_k = d_v;
-        const int key_dim = n_k_heads * d_k;
-        const int value_dim = config_.gdn.inner_size > 0
-                                  ? (config_.gdn.inner_size * n_v_heads / n_v_heads_full)
-                                  : n_v_heads * d_v;
-        const int qkv_dim = 2 * key_dim + value_dim; // Q(key_dim) + K(key_dim) + V(value_dim)
-
-        conv_states_.resize(n_layers);
-        recurrence_states_.resize(n_layers);
-        conv_kernels_.resize(n_layers);
-        rec_kernels_.resize(n_layers);
-
-        for (int i = 0; i < n_layers; ++i)
-        {
-            if (!isGDNLayer(i))
-                continue;
-
-            // Conv state: [qkv_dim, kernel_size - 1] (covers full QKV channels)
-            const int conv_state_size = qkv_dim * (conv_kernel - 1);
-            conv_states_[i].resize(conv_state_size, 0.0f);
-
-            // Recurrence state: [n_v_heads, d_k, d_v] — recurrence runs with value head count
-            const int recurrence_state_size = n_v_heads * d_k * d_v;
-            recurrence_states_[i].resize(recurrence_state_size, 0.0f);
-
-            // Create kernel instances via KernelFactory (lifetime tied to Qwen35Graph)
-            auto dev_type = KernelFactory::getDeviceType(config_.default_device);
-            int dev_ordinal = config_.default_device.toKernelDeviceIndex();
-            conv_kernels_[i] = KernelFactory::createShortConvolution(dev_type, dev_ordinal);
-            rec_kernels_[i] = KernelFactory::createGatedDeltaNet(dev_type, dev_ordinal);
-
-            // For GPU kernels, allocate device-resident state buffers
-            // (no-op for CPU implementations via virtual dispatch)
-            conv_kernels_[i]->allocateGPUState(conv_state_size);
-            rec_kernels_[i]->allocateGPUState(recurrence_state_size);
-
-            LOG_DEBUG("[Qwen35Graph] Layer " << i << " GDN state: conv_state="
-                                             << conv_state_size << " recurrence_state=" << recurrence_state_size);
-        }
-    }
 
     bool Qwen35Graph::isGDNLayer(int layer_idx) const
     {
         if (layer_idx < 0 || layer_idx >= static_cast<int>(config_.layer_types.size()))
             return false;
         return config_.layer_types[layer_idx] == "gdn";
-    }
-
-    void Qwen35Graph::resetState()
-    {
-        for (auto &state : conv_states_)
-            std::fill(state.begin(), state.end(), 0.0f);
-        for (auto &state : recurrence_states_)
-            std::fill(state.begin(), state.end(), 0.0f);
-
-        // Also reset GPU-resident state via virtual dispatch (no-op for CPU kernels)
-        for (auto &kernel : conv_kernels_)
-            if (kernel)
-                kernel->resetGPUState();
-        for (auto &kernel : rec_kernels_)
-            if (kernel)
-                kernel->resetGPUState();
-
-        LOG_DEBUG("[Qwen35Graph] GDN conv/recurrence state reset");
     }
 
     // =========================================================================
@@ -295,7 +195,7 @@ namespace llaminar2
         if (isGDNLayer(layer_idx))
         {
             return buildGDNAttentionGraph(layer, buffers, layer_idx,
-                                          seq_len, batch_size, device);
+                                          seq_len, batch_size, kv_cache, device);
         }
         else
         {
@@ -316,11 +216,20 @@ namespace llaminar2
         int layer_idx,
         int seq_len,
         int batch_size,
+        IKVCache *kv_cache,
         DeviceId device)
     {
         ComputeGraph graph;
         std::string prefix = "layer" + std::to_string(layer_idx) + "_";
         int total_tokens = batch_size * seq_len;
+
+        // Get GDN state from hybrid KV cache
+        auto *hybrid_cache = dynamic_cast<IHybridKVCache *>(kv_cache);
+        LLAMINAR_ASSERT(hybrid_cache != nullptr,
+                        "GDN layers require a hybrid KV cache (IHybridKVCache)");
+        auto *gdn_state = hybrid_cache->getGDNState(layer_idx);
+        LLAMINAR_ASSERTF(gdn_state != nullptr,
+                         "No GDN state found for layer " << layer_idx);
 
         // Full (global) head counts from model config
         const int n_k_heads_full = config_.gdn.group_count > 0
@@ -454,13 +363,13 @@ namespace llaminar2
         conv_params.output = buffers.get(BufferId::GDN_QKV); // In-place (conv modifies QKV)
         conv_params.weight = layer.ssm_conv1d;
         conv_params.bias = nullptr; // Conv bias from ssm_dt.bias if available
-        conv_params.conv_state = conv_states_[layer_idx].data();
+        conv_params.conv_state = gdn_state->conv_state.data();
         conv_params.seq_len = total_tokens;
         conv_params.channels = qkv_dim;
         conv_params.kernel_size = config_.gdn.conv_kernel_size;
 
-        // Use stored kernel instance (lifetime tied to Qwen35Graph)
-        conv_params.kernel = conv_kernels_[layer_idx].get();
+        // Use kernel instance from hybrid cache (lifetime tied to cache)
+        conv_params.kernel = gdn_state->conv_kernel.get();
 
         conv_params.input_buffer_id = BufferId::GDN_QKV;
         conv_params.output_buffer_id = BufferId::GDN_QKV;
@@ -488,7 +397,7 @@ namespace llaminar2
         rec_params.A_log = layer.ssm_a; // Learnable log-space gate
         rec_params.dt_bias = layer.ssm_dt_bias;
         rec_params.output = buffers.attn_output;
-        rec_params.recurrence_state = recurrence_states_[layer_idx].data();
+        rec_params.recurrence_state = gdn_state->recurrence_state.data();
         rec_params.seq_len = total_tokens;
         rec_params.n_heads = n_v_heads;   // Recurrence runs with value head count
         rec_params.n_k_heads = n_k_heads; // Key head count for QKV split
@@ -517,8 +426,8 @@ namespace llaminar2
         rec_params.alpha_buffer_id = BufferId::GDN_ALPHA;
         rec_params.beta_buffer_id = BufferId::GDN_BETA;
 
-        // Use stored kernel instance (lifetime tied to Qwen35Graph)
-        rec_params.kernel = rec_kernels_[layer_idx].get();
+        // Use kernel instance from hybrid cache (lifetime tied to cache)
+        rec_params.kernel = gdn_state->rec_kernel.get();
 
         graph.addNode(prefix + "gdn_recurrence",
                       ComputeStageFactory::createGDNRecurrence(rec_params),
@@ -998,6 +907,7 @@ namespace llaminar2
                 {
                     attn_params.apply_rope_to_k = true;
                     attn_params.rope_theta = config_.rope_theta;
+                    attn_params.partial_rotary_factor = config_.partial_rotary_factor;
                 }
 
                 graph.addNode(prefix + "attention",

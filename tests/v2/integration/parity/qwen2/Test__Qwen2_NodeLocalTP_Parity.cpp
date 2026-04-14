@@ -4,7 +4,7 @@
  *
  * These tests validate Node-Local Tensor Parallelism (NodeLocalTP) infrastructure
  * where tensor parallelism spans multiple MPI ranks on the same physical node.
- * Unlike LocalTP which uses NCCL/RCCL/PCIeBAR for intra-process multi-device
+ * Unlike LocalTP which uses NCCL/RCCL/HOST for intra-process multi-device
  * communication, NodeLocalTP uses MPI collectives for cross-rank communication
  * within the same machine (e.g., CPU sockets connected via UPI).
  *
@@ -76,7 +76,7 @@ static const std::vector<TestConfig> kNodeLocalTPTestConfigs = {
             .decode_cosine_threshold = 0.98f,
             .early_layers_count = 4,
             .min_early_layers_passed = 3,
-            .kl_threshold = 0.20f,
+            .kl_threshold = 0.008f, // Observed: 0.002 prefill KL (was 0.20 = 128x over-relaxed)
             .excluded_stages = kNodeLocalTPExcludedStages,
         },
         .mpi_ranks = 2,

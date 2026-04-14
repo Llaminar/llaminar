@@ -3,7 +3,7 @@
  * @brief Unit tests for HeterogeneousBackend
  *
  * Tests the heterogeneous multi-GPU collective backend that orchestrates
- * NCCL, RCCL, and PCIeBAR backends for mixed NVIDIA+AMD configurations.
+ * NCCL, RCCL, and HOST backends for mixed NVIDIA+AMD configurations.
  *
  * IMPORTANT: These are UNIT tests that run in build_v2 (Debug) and must NOT
  * invoke actual GPUs. They test class logic using DeviceGroup objects with
@@ -1036,14 +1036,6 @@ namespace llaminar2::test
         EXPECT_NE(pattern_standard, pattern_gcd_mb);
         EXPECT_NE(pattern_symmetric_rs, pattern_partial_rs);
         EXPECT_NE(pattern_gcd_rs, pattern_gcd_mb);
-    }
-
-    TEST_F(Test__HeterogeneousBackend, ComputeBridgePairs_UninitializedReturnsEmpty)
-    {
-        // Before initialization, computeBridgePairs() should return empty vector
-        auto pairs = backend_->computeBridgePairs();
-        EXPECT_TRUE(pairs.empty())
-            << "Uninitialized backend should return empty bridge pairs";
     }
 
     // ─────────────────────────────────────────────────────────────────────────

@@ -6,7 +6,6 @@
 
 #include "backends/BackendManager.h"
 #include "backends/IBackend.h"
-#include "collective/backends/PCIeBARBackend.h"
 #include "tensors/TensorClasses.h"
 #include "utils/DebugEnv.h"
 #include "utils/KernelProfiler.h"
@@ -62,13 +61,7 @@ namespace llaminar2
             if (src.type == dst.type)
                 return TransferMethod::DEVICE_TO_DEVICE_SAME_BACKEND;
 
-            // Cross-vendor (CUDA↔ROCm)
-            // CRITICAL: BAR D2D copies are UNRELIABLE (per RCA findings).
-            // Always use host bounce for cross-vendor transfers.
-            if (residency == MemoryResidency::BAR_BACKED)
-                return TransferMethod::BAR_HOST_BOUNCE;
-
-            // Generic cross-vendor without BAR
+            // Cross-vendor (CUDA↔ROCm) — host-staged transfer
             return TransferMethod::HOST_STAGED;
         }
 
@@ -116,10 +109,6 @@ namespace llaminar2
 
         case TransferMethod::DEVICE_TO_DEVICE_SAME_BACKEND:
             result = executeDeviceToDeviceSameBackend(request);
-            break;
-
-        case TransferMethod::BAR_HOST_BOUNCE:
-            result = executeBarHostBounce(request);
             break;
 
         case TransferMethod::HOST_STAGED:
@@ -322,15 +311,7 @@ namespace llaminar2
             return TransferResult::fail(req.method,
                                         "no backend for source device " + req.source.device.toString());
 
-        // For BAR-backed tensors, use the HIP staging buffer (not the device_ptr)
-        const void *src = req.source.device_ptr;
-        if (req.source.residency == MemoryResidency::BAR_BACKED && req.source.bar_staging_ptr)
-        {
-            src = req.source.bar_staging_ptr;
-            // D2H from staging buffer (real VRAM) is reliable
-        }
-
-        bool ok = backend->deviceToHost(req.source.host_ptr, src,
+        bool ok = backend->deviceToHost(req.source.host_ptr, req.source.device_ptr,
                                         req.source.size_bytes, req.source.device.ordinal);
         if (!ok)
             return TransferResult::fail(req.method, "deviceToHost failed");
@@ -378,57 +359,10 @@ namespace llaminar2
         return TransferResult::ok(req.method);
     }
 
-    TransferResult TransferEngine::executeBarHostBounce(const TransferRequest &req)
-    {
-        // BAR_HOST_BOUNCE: staging D2H → memcpy to host → H2D to target
-        //
-        // Per RCA findings: BAR D2D copies (hipMemcpy/cudaMemcpy with BAR pointers)
-        // are UNRELIABLE and produce corrupt data. Always bounce through host.
-
-        if (!req.source.bar_staging_ptr && !req.source.device_ptr)
-            return TransferResult::fail(req.method, "no source pointer (staging or device) for BAR bounce");
-        if (!req.source.host_ptr)
-            return TransferResult::fail(req.method, "host buffer needed for BAR host bounce");
-
-        // Step 1: D2H from staging buffer (or device_ptr if no staging)
-        const void *staging = req.source.bar_staging_ptr ? req.source.bar_staging_ptr
-                                                         : req.source.device_ptr;
-        DeviceId staging_device = req.source.bar_staging_ptr ? req.source.bar_host_device
-                                                             : req.source.device;
-
-        IBackend *src_backend = resolveBackend(staging_device);
-        if (!src_backend)
-            return TransferResult::fail(req.method,
-                                        "no backend for staging device " + staging_device.toString());
-
-        bool d2h = src_backend->deviceToHost(
-            req.source.host_ptr, staging,
-            req.source.size_bytes, staging_device.ordinal);
-        if (!d2h)
-            return TransferResult::fail(req.method, "D2H from staging failed in BAR bounce");
-
-        // Step 2: H2D to target device
-        if (!req.target_ptr)
-            return TransferResult::fail(req.method, "target device ptr is null for BAR bounce H2D");
-
-        IBackend *dst_backend = resolveBackend(req.target_device);
-        if (!dst_backend)
-            return TransferResult::fail(req.method,
-                                        "no backend for target device " + req.target_device.toString());
-
-        bool h2d = dst_backend->hostToDevice(
-            req.target_ptr, req.source.host_ptr,
-            req.source.size_bytes, req.target_device.ordinal);
-        if (!h2d)
-            return TransferResult::fail(req.method, "H2D to target failed in BAR bounce");
-
-        return TransferResult::ok(req.method);
-    }
-
     TransferResult TransferEngine::executeHostStaged(const TransferRequest &req)
     {
         // HOST_STAGED: D2H from source GPU → memcpy → H2D to target GPU
-        // Used for cross-vendor transfers without BAR backing.
+        // Used for cross-vendor transfers.
 
         if (!req.source.device_ptr)
             return TransferResult::fail(req.method, "source device_ptr is null for host staged");
@@ -468,26 +402,9 @@ namespace llaminar2
     // Backend resolution
     // ============================================================================
 
-    // ============================================================================
-    // waitForEventWithProxy — route CUDA event waits through PCIeBAR proxy
-    // ============================================================================
-
     bool TransferEngine::waitForEventWithProxy(IBackend *backend, void *event, int device_id,
                                                const DeviceId &gpu_device)
     {
-        // If this is a CUDA event and we have a PCIeBAR backend with worker thread,
-        // use the proxy to avoid cross-thread context issues
-        if (gpu_device.is_cuda())
-        {
-            auto *pcie_backend = PCIeBARBackend::getInstance();
-            if (pcie_backend && pcie_backend->isPCIeBarActive() && pcie_backend->hasCUDAWorkerFor(device_id))
-            {
-                LOG_TRACE("[TransferEngine::waitForEventWithProxy] Routing CUDA event wait through PCIeBAR worker");
-                return pcie_backend->waitForCUDAEvent(event, device_id);
-            }
-        }
-
-        // Default: use backend directly
         return backend->waitForEvent(event, device_id);
     }
 
@@ -509,48 +426,6 @@ namespace llaminar2
 
         const bool trace = debugEnv().rocm.trace_coherence;
         auto overall_start = std::chrono::high_resolution_clock::now();
-
-        // ===== BAR-BACKED TENSOR FAST PATH =====
-        if (tensor->is_bar_backed_)
-        {
-            if (target_device.is_cuda())
-            {
-                if (!tensor->bar_cuda_device_ptr_)
-                {
-                    return TransferResult::fail(TransferMethod::NOOP, "BAR-backed tensor has no CUDA pointer");
-                }
-                tensor->gpu_data_ptr_ = tensor->bar_cuda_device_ptr_;
-                if (trace)
-                {
-                    LOG_INFO("[TransferEngine::uploadFull] BAR-BACKED CUDA: Using BAR pointer " << tensor->bar_cuda_device_ptr_);
-                }
-            }
-            else if (target_device.is_rocm())
-            {
-                if (tensor->hip_staging_ptr_)
-                {
-                    tensor->gpu_data_ptr_ = tensor->hip_staging_ptr_;
-                    if (trace)
-                    {
-                        LOG_INFO("[TransferEngine::uploadFull] BAR-BACKED ROCm: Using HIP staging buffer "
-                                 << tensor->hip_staging_ptr_ << " (BAR mmap=" << tensor->bar_rocm_ptr_ << ")");
-                    }
-                }
-                else
-                {
-                    return TransferResult::fail(TransferMethod::NOOP, "BAR-backed ROCm tensor has no HIP staging buffer");
-                }
-            }
-            else
-            {
-                return TransferResult::fail(TransferMethod::NOOP,
-                                            "BAR-backed tensor cannot target device type: " + target_device.toString());
-            }
-
-            tensor->gpu_device_ = target_device;
-            tensor->applyCoherenceOp_(CoherenceOp::UPLOAD);
-            return TransferResult::ok(TransferMethod::NOOP);
-        }
 
         // ===== ZERO-COPY MAPPED MEMORY FAST PATH =====
         if (tensor->is_mapped_ && tensor->mapped_device_ptr_ != nullptr)
@@ -630,10 +505,6 @@ namespace llaminar2
                 if (tensor->secondary_device_buffers_.find(old_key) == tensor->secondary_device_buffers_.end())
                 {
                     tensor->secondary_device_buffers_[old_key] = tensor->gpu_data_ptr_;
-                    if (tensor->is_bar_backed_)
-                    {
-                        tensor->secondary_bar_allocated_keys_.insert(old_key);
-                    }
                 }
 
                 // Promote target secondary buffer to primary
@@ -643,13 +514,6 @@ namespace llaminar2
                 tensor->gpu_data_ptr_ = promoted_ptr;
                 tensor->gpu_device_ = target_device;
                 tensor->setCoherenceState_(TensorCoherenceState::HOST_AUTHORITATIVE);
-
-                bool was_bar = (tensor->secondary_bar_allocated_keys_.count(target_key) > 0);
-                if (was_bar)
-                {
-                    tensor->secondary_bar_allocated_keys_.erase(target_key);
-                }
-                tensor->is_bar_backed_ = was_bar;
 
                 if (tensor->device_completion_event_)
                 {
@@ -673,10 +537,6 @@ namespace llaminar2
                 if (tensor->secondary_device_buffers_.find(old_key) == tensor->secondary_device_buffers_.end())
                 {
                     tensor->secondary_device_buffers_[old_key] = tensor->gpu_data_ptr_;
-                    if (tensor->is_bar_backed_)
-                    {
-                        tensor->secondary_bar_allocated_keys_.insert(old_key);
-                    }
                 }
 
                 if (tensor->device_completion_event_)
@@ -696,7 +556,6 @@ namespace llaminar2
                 tensor->gpu_data_ptr_ = nullptr;
                 tensor->gpu_device_.reset();
                 tensor->applyCoherenceOp_(CoherenceOp::RELEASE_DEVICE);
-                tensor->is_bar_backed_ = false;
 
                 LOG_DEBUG("[TransferEngine::uploadFull] Parked previous primary buffer for "
                           << old_device.toString() << " and allocating fresh buffer for "
@@ -915,70 +774,6 @@ namespace llaminar2
                                         "COHERENCE ERROR: Both host and device are invalid");
         }
 
-        // ===== BAR-BACKED BUFFER PATH =====
-        if (tensor->is_bar_backed_ && tensor->gpu_data_ptr_ && tensor->gpu_device_.has_value())
-        {
-            size_t bytes = tensor->byte_size();
-            void *dst = tensor->raw_host_data_ptr();
-            if (!dst)
-            {
-                return TransferResult::fail(TransferMethod::DEVICE_TO_HOST, "Host data pointer is null");
-            }
-
-            // Synchronize with GPU before reading
-            if (tensor->device_completion_event_)
-            {
-                IBackend *backend = tensor->resolveBackend(*tensor->gpu_device_);
-                int backend_device_id = tensor->gpu_device_->gpu_ordinal();
-                if (backend && !waitForEventWithProxy(backend, tensor->device_completion_event_, backend_device_id, *tensor->gpu_device_))
-                {
-                    LOG_WARN("[TransferEngine::downloadFull] Event wait failed for BAR-backed tensor, continuing anyway");
-                }
-            }
-
-#if defined(HAVE_ROCM)
-            if (tensor->gpu_device_->is_rocm() && tensor->hip_staging_ptr_ && tensor->gpu_data_ptr_ == tensor->hip_staging_ptr_)
-            {
-                hipError_t hip_err = hipSetDevice(tensor->gpu_device_->rocm_ordinal());
-                if (hip_err != hipSuccess)
-                {
-                    return TransferResult::fail(TransferMethod::DEVICE_TO_HOST,
-                                                std::string("hipSetDevice failed: ") + hipGetErrorString(hip_err));
-                }
-
-                hip_err = hipMemcpy(dst, tensor->hip_staging_ptr_, bytes, hipMemcpyDeviceToHost);
-                if (hip_err != hipSuccess)
-                {
-                    return TransferResult::fail(TransferMethod::DEVICE_TO_HOST,
-                                                std::string("hipMemcpy D2H from staging failed: ") + hipGetErrorString(hip_err));
-                }
-
-                tensor->applyCoherenceOp_(CoherenceOp::DOWNLOAD);
-                tensor->authoritative_device_ = std::nullopt;
-
-                LOG_DEBUG("[TransferEngine::downloadFull] BAR-BACKED: Direct D2H from staging "
-                          << tensor->hip_staging_ptr_ << " -> " << dst
-                          << " (" << bytes << " bytes)");
-                return TransferResult::ok(TransferMethod::DEVICE_TO_HOST);
-            }
-#endif
-
-            // Non-ROCm BAR or no staging: direct memcpy from BAR region
-            const void *host_visible_src = tensor->bar_rocm_ptr_ ? tensor->bar_rocm_ptr_ : tensor->gpu_data_ptr_;
-
-            LOG_DEBUG("[TransferEngine::downloadFull] BAR-BACKED: Direct memcpy from BAR region "
-                      << host_visible_src << " -> " << dst
-                      << " (" << bytes << " bytes)");
-
-            std::memcpy(dst, host_visible_src, bytes);
-
-            tensor->applyCoherenceOp_(CoherenceOp::DOWNLOAD);
-            tensor->authoritative_device_ = std::nullopt;
-
-            LOG_DEBUG("[TransferEngine::downloadFull] BAR-BACKED: Copied " << bytes << " bytes from BAR region");
-            return TransferResult::ok(TransferMethod::DEVICE_TO_HOST);
-        }
-
         // ===== STANDARD GPU D2H =====
         if (tensor->gpu_data_ptr_ && tensor->gpu_device_.has_value())
         {
@@ -1170,14 +965,6 @@ namespace llaminar2
         {
             desc.mapped_host_ptr = tensor->mapped_host_ptr_;
             desc.mapped_device_ptr = tensor->mapped_device_ptr_;
-        }
-        else if (desc.residency == MemoryResidency::BAR_BACKED)
-        {
-            desc.bar_staging_ptr = tensor->hip_staging_ptr_;
-            desc.bar_rocm_ptr = tensor->bar_rocm_ptr_;
-            desc.bar_cuda_ptr = tensor->bar_cuda_device_ptr_;
-            desc.bar_host_device = tensor->bar_host_device_;
-            desc.bar_accessor_device = tensor->bar_accessor_device_;
         }
 
         return desc;

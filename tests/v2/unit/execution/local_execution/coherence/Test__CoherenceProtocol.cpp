@@ -11,7 +11,7 @@
  *   6. Full coherence state machine cycle
  *   7. Failure paths (allocation, H2D, D2H failures)
  *
- * All tests use DeviceId::rocm(0) to avoid PCIeBAR proxy in waitForEventWithProxy.
+ * All tests use DeviceId::rocm(0) to avoid cross-vendor proxy in waitForEventWithProxy.
  */
 
 #include <gtest/gtest.h>
@@ -100,8 +100,8 @@ protected:
     static constexpr size_t kElements = kRows * kCols;
     static constexpr size_t kBytes = kElements * sizeof(float);
 
-    // Use ROCm device to avoid PCIeBAR proxy in waitForEventWithProxy
-    // Use ROCm device to avoid PCIeBAR proxy in waitForEventWithProxy
+    // Use ROCm device to avoid cross-vendor proxy in waitForEventWithProxy
+    // Use ROCm device to avoid cross-vendor proxy in waitForEventWithProxy
     DeviceId device_ = DeviceId::rocm(0);
 
     // Mock backend configured as ROCm type to match device_

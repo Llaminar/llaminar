@@ -62,10 +62,17 @@ namespace llaminar2
         bool supportsBackend(ComputeBackendType backend) const override;
         bool isGraphCapturable() const override { return true; }
         bool hasDynamicParams() const override { return true; }
-        /// In vocab-parallel TP, each rank only embeds tokens in its shard;
+        /// In vocab-parallel TP, each device only embeds tokens in its shard;
         /// tokens outside the shard produce all-zero output (summed via AllReduce).
+        /// This applies to both MPI-based TP (world_size > 1) and LOCAL TP
+        /// (single rank, multi-device) where the embedding table is column-sharded.
         bool allowsZeroOutput() const override
         {
+            // Sharded embedding: table rows < full vocab_size
+            if (params_.embed_table && params_.vocab_size > 0 &&
+                static_cast<int>(params_.embed_table->rows()) < params_.vocab_size)
+                return true;
+            // Legacy MPI TP check
             return params_.mpi_ctx && params_.mpi_ctx->world_size() > 1;
         }
         void updateDynamicParams(int pos_offset, int seq_len) override

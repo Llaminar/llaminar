@@ -128,6 +128,7 @@ namespace llaminar2
     class FP16Tensor;
     class BF16Tensor;
     class TurboQuantContext;
+    struct HybridKVCacheConfig;
 
     enum class TensorType; // Forward declare from Tensors.h
 
@@ -268,6 +269,17 @@ namespace llaminar
 
                 /// TurboQuant context (for TQ4 KV cache). Not owned.
                 const ::llaminar2::TurboQuantContext *turboquant_ctx = nullptr;
+
+                /// Hybrid KV cache config (for models with GDN + FA layers). Not owned.
+                /// When non-null, createKVCache() produces a hybrid cache that only allocates
+                /// KV entries for full-attention layers and manages GDN state for GDN layers.
+                const ::llaminar2::HybridKVCacheConfig *hybrid_config = nullptr;
+
+                /**
+                 * @brief Check if this config requests a hybrid (FA+GDN) cache
+                 * @return true if hybrid_config is non-null
+                 */
+                bool is_hybrid() const { return hybrid_config != nullptr; }
 
                 /**
                  * @brief Check if this config requests sharded (tensor-parallel) cache
@@ -1182,6 +1194,19 @@ namespace llaminar
                  * @throws std::runtime_error if device type is not supported or config is invalid
                  */
                 static std::unique_ptr<llaminar2::IKVCache> createKVCache(const KVCacheConfig &config);
+
+                /**
+                 * @brief Create a hybrid KV cache (FA layers get KV entries, GDN layers get state)
+                 *
+                 * Dispatches to CPU, CUDA, or ROCm hybrid cache based on config.device.
+                 * Requires config.hybrid_config to be non-null.
+                 *
+                 * @param config KVCacheConfig with hybrid_config set
+                 * @return Unique pointer to IKVCache (underlying is CPUHybridRingKVCache,
+                 *         CUDAHybridRingKVCache, or ROCmHybridRingKVCache)
+                 * @throws std::runtime_error if hybrid_config is null or config is invalid
+                 */
+                static std::unique_ptr<llaminar2::IKVCache> createHybridKVCache(const KVCacheConfig &config);
 
                 /**
                  * @brief Create a CPU KV cache

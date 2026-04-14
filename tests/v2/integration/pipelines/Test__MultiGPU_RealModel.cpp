@@ -863,7 +863,7 @@ TEST_F(Test__GPU_to_GPU_Transfer, MultipleRoundTrips_CrossVendor)
  *
  * This test demonstrates the proper way to do cross-vendor GPU transfers:
  * 1. Use ensureOnDevice() to upload to first GPU
- * 2. Use PCIeBARBackend::copy() for direct GPU→GPU transfer
+ * 2. Use HostBackend::copy() for host-staged GPU→GPU transfer
  * 3. Use ensureOnHost() to download back for verification
  */
 TEST_F(Test__GPU_to_GPU_Transfer, Q4_0_Weight_CrossVendor)
@@ -961,26 +961,26 @@ TEST_F(Test__GPU_to_GPU_Transfer, DirectCopy_API)
 
     std::cout << "Testing copy() API: capability checks (" << bytes << " bytes)\n";
 
-    // Test PCIeBAR for cross-vendor using LocalPPContext's backend creation
+    // Test HOST backend for cross-vendor using LocalPPContext's backend creation
     // For now, just verify the API exists by checking GlobalBackendRouter if available
     auto *router = GlobalBackendRouter::get();
     if (router)
     {
-        // Test PCIeBAR for cross-vendor
-        // Use getBackendForCopy() which properly initializes PCIeBAR (unlike getBackend())
-        auto *pcie_backend = router->getBackendForCopy(cuda, rocm);
-        if (pcie_backend)
+        // Test HOST backend for cross-vendor
+        // Use getBackendForCopy() which properly initializes HOST backend (unlike getBackend())
+        auto *cross_vendor_backend = router->getBackendForCopy(cuda, rocm);
+        if (cross_vendor_backend)
         {
-            bool supports_cuda_rocm = pcie_backend->supportsCopy(cuda, rocm);
-            bool supports_rocm_cuda = pcie_backend->supportsCopy(rocm, cuda);
-            std::cout << "  PCIeBAR supportsCopy(CUDA→ROCm): " << (supports_cuda_rocm ? "yes" : "no") << "\n";
-            std::cout << "  PCIeBAR supportsCopy(ROCm→CUDA): " << (supports_rocm_cuda ? "yes" : "no") << "\n";
-            EXPECT_TRUE(supports_cuda_rocm) << "PCIeBAR should support CUDA→ROCm copy";
-            EXPECT_TRUE(supports_rocm_cuda) << "PCIeBAR should support ROCm→CUDA copy";
+            bool supports_cuda_rocm = cross_vendor_backend->supportsCopy(cuda, rocm);
+            bool supports_rocm_cuda = cross_vendor_backend->supportsCopy(rocm, cuda);
+            std::cout << "  HOST supportsCopy(CUDA→ROCm): " << (supports_cuda_rocm ? "yes" : "no") << "\n";
+            std::cout << "  HOST supportsCopy(ROCm→CUDA): " << (supports_rocm_cuda ? "yes" : "no") << "\n";
+            EXPECT_TRUE(supports_cuda_rocm) << "HOST backend should support CUDA→ROCm copy";
+            EXPECT_TRUE(supports_rocm_cuda) << "HOST backend should support ROCm→CUDA copy";
         }
         else
         {
-            std::cout << "  PCIeBAR backend not available for CUDA→ROCm (init failed?)\n";
+            std::cout << "  HOST backend not available for CUDA→ROCm (init failed?)\n";
         }
 
         // Test NCCL for CUDA↔CUDA
@@ -1105,14 +1105,14 @@ TEST_F(Test__GPU_to_GPU_Transfer, TransferTo_DirectGPUTransfer)
 
     // Step 2: Direct transfer to ROCm (NO host staging!)
     ASSERT_TRUE(tensor->transferTo(rocm))
-        << "transferTo(rocm) failed - check PCIeBARBackend availability";
+        << "transferTo(rocm) failed - check HostBackend availability";
     EXPECT_TRUE(tensor->isDeviceAuthoritative(rocm));
     EXPECT_FALSE(tensor->isHostAuthoritative());
     std::cout << "  [2] Direct CUDA→ROCm transfer completed\n";
 
     // Step 3: Direct transfer back to CUDA
     ASSERT_TRUE(tensor->transferTo(cuda))
-        << "transferTo(cuda) failed - check PCIeBARBackend availability";
+        << "transferTo(cuda) failed - check HostBackend availability";
     EXPECT_TRUE(tensor->isDeviceAuthoritative(cuda));
     std::cout << "  [3] Direct ROCm→CUDA transfer completed\n";
 
@@ -1203,8 +1203,8 @@ TEST_F(Test__GPU_to_GPU_Transfer, TransferTo_vs_EnsureOnDevice_Comparison)
 //   3. Verification that transferTo() is used (no host staging)
 //
 // Background: LocalPPContext wraps the transferTo() API to provide PP-specific
-// semantics (stage indices, layer boundaries) while leveraging direct GPU-to-GPU
-// transfers via PCIeBAR for cross-vendor topologies.
+// semantics (stage indices, layer boundaries) while leveraging host-staged
+// transfers via HOST backend for cross-vendor topologies.
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /**
@@ -1275,7 +1275,7 @@ TEST_F(Test__GPU_to_GPU_Transfer, LocalPP_CrossVendor_UsesTransferTo)
 
     // Step 2: PP transfer from Stage 0 → Stage 1 (should use transferTo internally)
     ASSERT_TRUE(pp_ctx->transfer(tensor.get(), 0, 1))
-        << "LocalPPContext::transfer() failed - check PCIeBAR backend";
+        << "LocalPPContext::transfer() failed - check HOST backend";
 
     // After transfer, tensor should be authoritative on ROCm:0 (Stage 1's device)
     EXPECT_TRUE(tensor->isDeviceAuthoritative(rocm))

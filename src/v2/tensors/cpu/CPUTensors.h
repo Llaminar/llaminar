@@ -1322,7 +1322,7 @@ namespace llaminar2
 
         // ===== Zero-Copy Mapped Memory =====
         // When a tensor uses mapped memory (hipHostMallocMapped/cudaHostAllocMapped):
-        // - Host and device share the SAME physical memory via PCIe BAR
+        // - Host and device share the SAME physical memory via mapped pinned memory
         // - GPU can read/write directly without memcpy
         // - ensureOnDevice()/ensureOnHost() become no-ops
         // - Eliminates sync memcpy bottleneck (1.5-1.7x speedup in benchmarks)

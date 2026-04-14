@@ -32,11 +32,170 @@
 #include "execution/compute_stages/stages/GatedRMSNormStage.h"
 #include "execution/compute_stages/stages/AttentionOutputGateStage.h"
 #include "execution/compute_stages/stages/GEMMStage.h"
+#include "kernels/IKVCache.h"
+#include "kernels/IHybridKVCache.h"
+#include "kernels/HybridKVCacheConfig.h"
+#include "tensors/TensorKernels.h"
 #include "memory/BufferId.h"
 #include "../../../utils/TestTensorFactory.h"
 
 using namespace llaminar2;
 using namespace llaminar2::test;
+
+// ============================================================================
+// Stub implementations for unit testing (graph construction only, never executed)
+// ============================================================================
+
+namespace
+{
+    /// Minimal ITensorShortConvolution stub — forward() is never called during graph build
+    class StubShortConvolution : public ITensorShortConvolution
+    {
+    public:
+        bool forward(const float *, const float *, const float *,
+                     float *, float *, int, int, int, bool) override
+        {
+            return true;
+        }
+    };
+
+    /// Minimal ITensorGatedDeltaNet stub — methods never called during graph build
+    class StubGatedDeltaNet : public ITensorGatedDeltaNet
+    {
+    public:
+        bool chunk_forward(const float *, const float *, const float *,
+                           const float *, const float *, const float *, const float *,
+                           float *, float *, int, int, int, int, int, bool) override
+        {
+            return true;
+        }
+        bool recurrent_step(const float *, const float *, const float *,
+                            const float *, const float *, const float *, const float *,
+                            float *, float *, int, int, int, bool) override
+        {
+            return true;
+        }
+    };
+
+    /**
+     * @brief Minimal hybrid KV cache stub for graph construction tests.
+     *
+     * Provides GDN state and stub kernels so buildGDNAttentionGraph() can
+     * succeed without requiring a full KV cache implementation.
+     * IKVCache methods are stubbed out — they're never called by graph builders.
+     */
+    class StubHybridKVCache : public IKVCache, public IHybridKVCache
+    {
+    public:
+        StubHybridKVCache(const GraphConfig &config)
+        {
+            n_layers_ = config.n_layers;
+            layer_types_ = config.layer_types;
+
+            // Compute GDN dimensions
+            const int n_k = config.gdn.group_count > 0 ? config.gdn.group_count : config.n_heads;
+            const int n_v = config.gdn.time_step_rank > 0 ? config.gdn.time_step_rank : n_k;
+            const int d_k = config.gdn.state_size;
+            const int d_v = d_k;
+            const int qkv_dim = 2 * n_k * d_k + n_v * d_v;
+
+            gdn_states_.resize(n_layers_);
+            for (int i = 0; i < n_layers_; ++i)
+            {
+                if (i < static_cast<int>(layer_types_.size()) && layer_types_[i] == "gdn")
+                {
+                    auto &s = gdn_states_[i];
+                    s.n_v_heads = n_v;
+                    s.n_k_heads = n_k;
+                    s.d_k = d_k;
+                    s.d_v = d_v;
+                    s.conv_kernel_size = config.gdn.conv_kernel_size;
+                    s.initialize(qkv_dim);
+                    s.conv_kernel = std::make_shared<StubShortConvolution>();
+                    s.rec_kernel = std::make_shared<StubGatedDeltaNet>();
+                }
+            }
+        }
+
+        // --- IHybridKVCache ---
+        bool isGDNLayer(int layer) const override
+        {
+            return layer >= 0 && layer < static_cast<int>(layer_types_.size()) &&
+                   layer_types_[layer] == "gdn";
+        }
+        bool isFullAttentionLayer(int layer) const override { return !isGDNLayer(layer); }
+        int kvLayerCount() const override
+        {
+            return static_cast<int>(std::count(layer_types_.begin(), layer_types_.end(), "full_attention"));
+        }
+        int gdnLayerCount() const override { return n_layers_ - kvLayerCount(); }
+        HybridGDNLayerState *getGDNState(int layer) override
+        {
+            if (!isGDNLayer(layer))
+                return nullptr;
+            return &gdn_states_[layer];
+        }
+        const HybridGDNLayerState *getGDNState(int layer) const override
+        {
+            if (!isGDNLayer(layer))
+                return nullptr;
+            return &gdn_states_[layer];
+        }
+        float *getRecurrenceState(int layer) override
+        {
+            auto *s = getGDNState(layer);
+            return s ? s->recurrence_state.data() : nullptr;
+        }
+        float *getConvState(int layer) override
+        {
+            auto *s = getGDNState(layer);
+            return s ? s->conv_state.data() : nullptr;
+        }
+        ITensorShortConvolution *getConvKernel(int layer) override
+        {
+            auto *s = getGDNState(layer);
+            return s ? s->conv_kernel.get() : nullptr;
+        }
+        ITensorGatedDeltaNet *getRecurrenceKernel(int layer) override
+        {
+            auto *s = getGDNState(layer);
+            return s ? s->rec_kernel.get() : nullptr;
+        }
+        void resetGDNStates() override
+        {
+            for (auto &s : gdn_states_)
+                s.reset();
+        }
+        size_t gdnMemoryBytes() const override
+        {
+            size_t total = 0;
+            for (const auto &s : gdn_states_)
+                total += s.memoryBytes();
+            return total;
+        }
+
+        // --- IKVCache stubs (never called by graph builders) ---
+        ActivationPrecision k_precision() const override { return ActivationPrecision::FP32; }
+        int get_cached_tokens(int, int) const override { return 0; }
+        int max_seq_len() const override { return 32; }
+        int n_layers() const override { return n_layers_; }
+        bool get_kv(int, int, ITensor **, ITensor **, int *) override { return false; }
+        bool get_kv(int, int, const ITensor **, const ITensor **, int *) const override { return false; }
+        ITensor *get_k(int, int) override { return nullptr; }
+        const ITensor *get_k(int, int) const override { return nullptr; }
+        ITensor *get_v(int, int) override { return nullptr; }
+        const ITensor *get_v(int, int) const override { return nullptr; }
+        bool append(int, int, const ITensor *, const ITensor *, int) override { return false; }
+        void clear() override {}
+        void clear_sequence(int, int) override {}
+        void clear_layer(int) override {}
+
+    private:
+        int n_layers_ = 0;
+        std::vector<std::string> layer_types_;
+        std::vector<HybridGDNLayerState> gdn_states_;
+    };
+} // namespace
 
 namespace
 {
@@ -578,11 +737,15 @@ namespace
             buffers_.attn_output = attn_output_.get();
             buffers_.attn_proj = attn_proj_.get();
             buffers_.gate = gate_.get();
+
+            // Create a stub hybrid KV cache for GDN graph construction tests
+            stub_cache_ = std::make_unique<StubHybridKVCache>(config_);
         }
 
         GraphConfig config_;
         LayerWeights layer_;
         ActivationBuffers buffers_;
+        std::unique_ptr<StubHybridKVCache> stub_cache_;
 
         // Weight tensors (ownership)
         std::unique_ptr<FP32Tensor> norm_weight_;
@@ -616,7 +779,7 @@ TEST_F(Qwen35GraphBuildTest, GDNAttentionGraph_HasExpectedNodeCount)
     // Build attention graph for GDN layer 0
     ComputeGraph attn_graph = graph.buildAttentionGraph(
         layer_, buffers_, /*layer_idx=*/0, /*seq_len=*/2,
-        /*batch_size=*/1, /*kv_cache=*/nullptr, /*position_ids=*/nullptr,
+        /*batch_size=*/1, /*kv_cache=*/stub_cache_.get(), /*position_ids=*/nullptr,
         DeviceId::cpu());
 
     // Expected nodes: attn_norm, gdn_proj, short_conv, gdn_recurrence,
@@ -631,7 +794,7 @@ TEST_F(Qwen35GraphBuildTest, GDNAttentionGraph_NodesExist)
     Qwen35Graph graph(config_, nullptr);
 
     ComputeGraph attn_graph = graph.buildAttentionGraph(
-        layer_, buffers_, 0, 2, 1, nullptr, nullptr, DeviceId::cpu());
+        layer_, buffers_, 0, 2, 1, stub_cache_.get(), nullptr, DeviceId::cpu());
 
     EXPECT_NE(attn_graph.getNode("layer0_attn_norm"), nullptr);
     EXPECT_NE(attn_graph.getNode("layer0_gdn_proj"), nullptr);
@@ -649,7 +812,7 @@ TEST_F(Qwen35GraphBuildTest, GDNAttentionGraph_StageTypes)
     Qwen35Graph graph(config_, nullptr);
 
     ComputeGraph attn_graph = graph.buildAttentionGraph(
-        layer_, buffers_, 0, 2, 1, nullptr, nullptr, DeviceId::cpu());
+        layer_, buffers_, 0, 2, 1, stub_cache_.get(), nullptr, DeviceId::cpu());
 
     auto *proj = attn_graph.getNode("layer0_gdn_proj");
     ASSERT_NE(proj, nullptr);
@@ -676,7 +839,7 @@ TEST_F(Qwen35GraphBuildTest, GDNAttentionGraph_DependencyChain)
     Qwen35Graph graph(config_, nullptr);
 
     ComputeGraph attn_graph = graph.buildAttentionGraph(
-        layer_, buffers_, 0, 2, 1, nullptr, nullptr, DeviceId::cpu());
+        layer_, buffers_, 0, 2, 1, stub_cache_.get(), nullptr, DeviceId::cpu());
 
     // Verify linear dependency chain
     auto verifyDep = [&](const std::string &node, const std::string &expected_dep)
@@ -702,7 +865,7 @@ TEST_F(Qwen35GraphBuildTest, GDNProjection_ZWeightIsAttnGate)
     Qwen35Graph graph(config_, nullptr);
 
     ComputeGraph attn_graph = graph.buildAttentionGraph(
-        layer_, buffers_, 0, 2, 1, nullptr, nullptr, DeviceId::cpu());
+        layer_, buffers_, 0, 2, 1, stub_cache_.get(), nullptr, DeviceId::cpu());
 
     auto *proj_node = attn_graph.getNode("layer0_gdn_proj");
     ASSERT_NE(proj_node, nullptr);
@@ -724,7 +887,7 @@ TEST_F(Qwen35GraphBuildTest, GDNProjection_AllWeightsWired)
     Qwen35Graph graph(config_, nullptr);
 
     ComputeGraph attn_graph = graph.buildAttentionGraph(
-        layer_, buffers_, 0, 2, 1, nullptr, nullptr, DeviceId::cpu());
+        layer_, buffers_, 0, 2, 1, stub_cache_.get(), nullptr, DeviceId::cpu());
 
     auto *proj_stage = dynamic_cast<GDNProjectionStage *>(
         attn_graph.getNode("layer0_gdn_proj")->stage.get());
@@ -744,7 +907,7 @@ TEST_F(Qwen35GraphBuildTest, OutputGate_NotUsedInGDNLayers)
     Qwen35Graph graph(config_, nullptr);
 
     ComputeGraph attn_graph = graph.buildAttentionGraph(
-        layer_, buffers_, 0, 2, 1, nullptr, nullptr, DeviceId::cpu());
+        layer_, buffers_, 0, 2, 1, stub_cache_.get(), nullptr, DeviceId::cpu());
 
     // Should NOT have an output gate node in GDN layers
     EXPECT_EQ(attn_graph.getNode("layer0_attn_output_gate"), nullptr)
@@ -760,7 +923,7 @@ TEST_F(Qwen35GraphBuildTest, ShortConv_UsesInterfaceKernel)
     Qwen35Graph graph(config_, nullptr);
 
     ComputeGraph attn_graph = graph.buildAttentionGraph(
-        layer_, buffers_, 0, 2, 1, nullptr, nullptr, DeviceId::cpu());
+        layer_, buffers_, 0, 2, 1, stub_cache_.get(), nullptr, DeviceId::cpu());
 
     auto *conv_stage = dynamic_cast<ShortConv1dStage *>(
         attn_graph.getNode("layer0_short_conv")->stage.get());
@@ -776,7 +939,7 @@ TEST_F(Qwen35GraphBuildTest, GDNRecurrence_UsesInterfaceKernel)
     Qwen35Graph graph(config_, nullptr);
 
     ComputeGraph attn_graph = graph.buildAttentionGraph(
-        layer_, buffers_, 0, 2, 1, nullptr, nullptr, DeviceId::cpu());
+        layer_, buffers_, 0, 2, 1, stub_cache_.get(), nullptr, DeviceId::cpu());
 
     auto *rec_stage = dynamic_cast<GDNRecurrenceStage *>(
         attn_graph.getNode("layer0_gdn_recurrence")->stage.get());
@@ -793,7 +956,7 @@ TEST_F(Qwen35GraphBuildTest, GDNRecurrence_DKConsistentWithState)
     Qwen35Graph graph(config_, nullptr);
 
     ComputeGraph attn_graph = graph.buildAttentionGraph(
-        layer_, buffers_, 0, 2, 1, nullptr, nullptr, DeviceId::cpu());
+        layer_, buffers_, 0, 2, 1, stub_cache_.get(), nullptr, DeviceId::cpu());
 
     auto *rec_stage = dynamic_cast<GDNRecurrenceStage *>(
         attn_graph.getNode("layer0_gdn_recurrence")->stage.get());
@@ -816,7 +979,7 @@ TEST_F(Qwen35GraphBuildTest, IsGDNLayer_DispatchesCorrectly)
 
     // Layer 0 = GDN: should produce GDN graph (has gdn_proj)
     ComputeGraph gdn_graph = graph.buildAttentionGraph(
-        layer_, buffers_, 0, 2, 1, nullptr, nullptr, DeviceId::cpu());
+        layer_, buffers_, 0, 2, 1, stub_cache_.get(), nullptr, DeviceId::cpu());
     EXPECT_NE(gdn_graph.getNode("layer0_gdn_proj"), nullptr)
         << "Layer 0 should produce GDN graph";
 
@@ -847,7 +1010,7 @@ TEST_F(Qwen35GraphBuildTest, GatedNorm_UsesCorrectWeightAndBuffers)
     Qwen35Graph graph(config_, nullptr);
 
     ComputeGraph attn_graph = graph.buildAttentionGraph(
-        layer_, buffers_, 0, 2, 1, nullptr, nullptr, DeviceId::cpu());
+        layer_, buffers_, 0, 2, 1, stub_cache_.get(), nullptr, DeviceId::cpu());
 
     auto *gnorm_stage = dynamic_cast<GatedRMSNormStage *>(
         attn_graph.getNode("layer0_gated_norm")->stage.get());
@@ -954,7 +1117,7 @@ TEST_F(Qwen35GraphBuildTest, GDNOutProj_KDimMatchesGDNInner)
     Qwen35Graph graph(config_, nullptr);
 
     ComputeGraph attn_graph = graph.buildAttentionGraph(
-        layer_, buffers_, 0, 2, 1, nullptr, nullptr, DeviceId::cpu());
+        layer_, buffers_, 0, 2, 1, stub_cache_.get(), nullptr, DeviceId::cpu());
 
     auto *gemm_node = attn_graph.getNode("layer0_gdn_out_proj");
     ASSERT_NE(gemm_node, nullptr);
@@ -1002,7 +1165,7 @@ TEST_F(Qwen35GraphBuildTest, ResetState_SafeAfterGraphBuild)
     // Build a GDN attention graph (this internally uses conv/recurrence state)
     ComputeGraph attn_graph = graph.buildAttentionGraph(
         layer_, buffers_, /*layer_idx=*/0, /*seq_len=*/2,
-        /*batch_size=*/1, /*kv_cache=*/nullptr, /*position_ids=*/nullptr,
+        /*batch_size=*/1, /*kv_cache=*/stub_cache_.get(), /*position_ids=*/nullptr,
         DeviceId::cpu());
     ASSERT_GT(attn_graph.size(), 0u);
 
@@ -1012,7 +1175,7 @@ TEST_F(Qwen35GraphBuildTest, ResetState_SafeAfterGraphBuild)
     // Should be able to build another graph after reset
     ComputeGraph attn_graph2 = graph.buildAttentionGraph(
         layer_, buffers_, /*layer_idx=*/0, /*seq_len=*/2,
-        /*batch_size=*/1, /*kv_cache=*/nullptr, /*position_ids=*/nullptr,
+        /*batch_size=*/1, /*kv_cache=*/stub_cache_.get(), /*position_ids=*/nullptr,
         DeviceId::cpu());
     EXPECT_GT(attn_graph2.size(), 0u);
 }

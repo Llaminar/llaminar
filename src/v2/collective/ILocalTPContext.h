@@ -4,12 +4,12 @@
  *
  * LOCAL TP = multiple devices within a single MPI rank, decoupled from MPI world_size.
  * This enables tensor parallelism across GPUs owned by one rank, using high-bandwidth
- * backends like NCCL, RCCL, or PCIeBAR instead of cross-node MPI.
+ * backends like NCCL, RCCL, or HOST instead of cross-node MPI.
  *
  * Key concepts:
  * - LOCAL TP degree can be different from MPI world_size
  * - Supports proportional work distribution via weights (e.g., NVIDIA 73%, AMD 27%)
- * - Backend selection based on device types (NCCL for CUDA-only, PCIeBAR for mixed)
+ * - Backend selection based on device types (NCCL for CUDA-only, HOST for mixed)
  *
  * @author David Sanftenberg
  * @date January 2026
@@ -31,7 +31,6 @@ namespace llaminar2
 
     // Forward declarations
     class TensorBase;
-    class DirectP2PEngine;
 
     /**
      * @brief Interface for LOCAL tensor parallelism operations
@@ -82,7 +81,7 @@ namespace llaminar2
          * AUTO resolution:
          * - All CUDA devices → NCCL
          * - All ROCm devices → RCCL
-         * - Mixed or CPU involved → PCIeBAR or HOST
+         * - Mixed or CPU involved → HOST
          *
          * @return CollectiveBackendType
          */
@@ -123,9 +122,9 @@ namespace llaminar2
         /**
          * @brief All-reduce across LOCAL devices with stage name (in-place)
          *
-         * Like allreduce(), but with stage name for BAR-backed tensor lookup.
-         * For PCIeBAR backend, if BAR-backed tensors are registered for this stage,
-         * they are used for zero-copy operation.
+         * Like allreduce(), but with stage name for tensor lookup.
+         * If output tensors are registered for this stage,
+         * they are used for the reduction.
          *
          * @param tensor Tensor to all-reduce (modified in-place)
          * @param stage_name Stage identifier (e.g., "layer0_wo_allreduce")
@@ -198,7 +197,7 @@ namespace llaminar2
          * Used when receiving PP activations that need to be available on all TP devices.
          *
          * For homogeneous backends (NCCL/RCCL), this uses the native broadcast.
-         * For heterogeneous backends (PCIeBAR), this may use staged transfers.
+         * For heterogeneous backends (HOST), this may use staged transfers.
          *
          * @param tensor Tensor to broadcast (must be valid on source device)
          * @param source_device_index Index of source device in devices() (0-based)
@@ -322,21 +321,18 @@ namespace llaminar2
             const GlobalDeviceAddress &device, int total_cols) const = 0;
 
         // =====================================================================
-        // BAR-Backed Tensor Registry (PCIeBAR Backend)
+        // Tensor Registry (Collective Backend)
         // =====================================================================
 
         /**
-         * @brief Register a BAR-backed tensor for a stage's output
+         * @brief Register a tensor for a stage's output
          *
-         * Called during graph construction for row-parallel stages (FFN_DOWN, Wo)
-         * when using PCIeBAR backend. The registered tensors are used by
-         * executePCIeBarAllreduce() for zero-copy reduction.
-         *
-         * For non-PCIeBAR backends, this is a no-op.
+         * Called during graph construction for row-parallel stages (FFN_DOWN, Wo).
+         * The registered tensors are used by collective allreduce operations.
          *
          * @param stage_name Stage identifier (e.g., "layer0_wo_allreduce")
          * @param device Device that owns this tensor (must be in devices())
-         * @param tensor Tensor to register (must be BAR-backed for PCIeBAR backend)
+         * @param tensor Tensor to register
          */
         virtual void registerBARBackedOutput(
             const std::string &stage_name,
@@ -344,7 +340,7 @@ namespace llaminar2
             TensorBase *tensor) = 0;
 
         /**
-         * @brief Check if a stage has any BAR-backed outputs registered
+         * @brief Check if a stage has any outputs registered
          *
          * @param stage_name Stage identifier
          * @return true if at least one device has a tensor registered
@@ -352,24 +348,11 @@ namespace llaminar2
         virtual bool hasBARBackedOutputs(const std::string &stage_name) const = 0;
 
         /**
-         * @brief Clear all BAR-backed tensor registrations
+         * @brief Clear all tensor registrations
          *
          * Called when resetting the context or changing buffer sizes.
          */
         virtual void clearBARBackedOutputs() = 0;
-
-        /**
-         * @brief Get DirectP2PEngine for BAR-backed tensor allocation
-         *
-         * For PCIeBAR backend, returns the DirectP2PEngine used for BAR memory
-         * management. This allows TensorFactory to create BAR-backed tensors
-         * for row-parallel outputs (attn_proj, ffn_output).
-         *
-         * For non-PCIeBAR backends, returns nullptr.
-         *
-         * @return Shared pointer to DirectP2PEngine, or nullptr if not available
-         */
-        virtual std::shared_ptr<DirectP2PEngine> getDirectP2PEngine() const = 0;
 
         /**
          * @brief Reserve temporary buffer capacity for collective operations

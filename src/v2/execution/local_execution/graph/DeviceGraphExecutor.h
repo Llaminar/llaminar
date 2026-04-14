@@ -242,7 +242,7 @@ namespace llaminar2
          *
          * When a collective context is set, ALLREDUCE and ALLGATHER stages
          * will be intercepted and executed via the CollectiveContext
-         * infrastructure (RCCL, NCCL, PCIeBAR) instead of the stage's
+         * infrastructure (RCCL, NCCL, HOST) instead of the stage's
          * internal MPI fallback.
          *
          * @param ctx Collective context (not owned, must outlive executor)

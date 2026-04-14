@@ -202,7 +202,7 @@ namespace llaminar2
          * @brief Execute an AllReduce operation in a specific TP domain
          *
          * Domain-aware routing:
-         * - GPU_INTRA_RANK domains → PCIeBAR/NCCL/RCCL backends
+         * - GPU_INTRA_RANK domains → HOST/NCCL/RCCL backends
          * - CPU_CROSS_RANK domains → UPI/MPI backends
          *
          * @param buffer In-place buffer to reduce

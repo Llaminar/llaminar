@@ -247,79 +247,66 @@ namespace llaminar2
                 auto *base_tensor = dynamic_cast<TensorBase *>(output.tensor);
                 if (base_tensor && base_tensor->deviceValid())
                 {
-                    // Skip GPU validation for BAR-backed tensors - they're shared between
-                    // CUDA and ROCm devices. Using current_device() returns CUDA device,
-                    // but validation might be called from ROCm device thread. Fall through
-                    // to host validation which works reliably for mapped/BAR-backed tensors.
-                    if (base_tensor->isBARBacked())
+                    // Get GPU validator for this device type
+                    auto device_opt = base_tensor->current_device();
+                    if (device_opt.has_value())
                     {
-                        LOG_DEBUG("[StageVerifier] Skipping GPU validation for BAR-backed tensor '"
-                                  << output.name << "' - using host validation instead");
-                        // Fall through to host validation
-                    }
-                    else
-                    {
-                        // Get GPU validator for this device type
-                        auto device_opt = base_tensor->current_device();
-                        if (device_opt.has_value())
+                        ITensorValidator *validator = getTensorValidator(device_opt->type);
+                        if (validator)
                         {
-                            ITensorValidator *validator = getTensorValidator(device_opt->type);
-                            if (validator)
+                            const void *device_ptr = base_tensor->gpu_data_ptr();
+                            int device_id = device_opt->ordinal;
+
+                            // Launch GPU validation kernel (async)
+                            bool launched = false;
+                            if (std::string(output.dtype) == "FP32")
                             {
-                                const void *device_ptr = base_tensor->gpu_data_ptr();
-                                int device_id = device_opt->ordinal;
-
-                                // Launch GPU validation kernel (async)
-                                bool launched = false;
-                                if (std::string(output.dtype) == "FP32")
-                                {
-                                    launched = validator->validateFP32Async(device_ptr, numel, device_id);
-                                }
-                                else if (std::string(output.dtype) == "BF16")
-                                {
-                                    launched = validator->validateBF16Async(device_ptr, numel, device_id);
-                                }
-                                else if (std::string(output.dtype) == "FP16")
-                                {
-                                    launched = validator->validateFP16Async(device_ptr, numel, device_id);
-                                }
-
-                                if (launched)
-                                {
-                                    TensorValidationResult result;
-                                    if (validator->getResult(result))
-                                    {
-                                        if (result.appears_zero && numel > 10)
-                                        {
-                                            LOG_WARN("[StageVerifier] Stage '" << node.name << "' output '" << output.name
-                                                                               << "' appears to be all zeros (GPU validation)");
-                                            if (validation.fail_on_zero && !node.stage->allowsZeroOutput())
-                                            {
-                                                LOG_ERROR("[StageVerifier] Buffer validation failed: zero tensor detected");
-                                                all_valid = false;
-                                            }
-                                        }
-
-                                        if (result.has_nan || result.has_inf)
-                                        {
-                                            LOG_WARN("[StageVerifier] Stage '" << node.name << "' output '" << output.name
-                                                                               << "' contains " << result.nan_count << " NaN, "
-                                                                               << result.inf_count << " Inf values (GPU validation)");
-                                            if (validation.fail_on_nan)
-                                            {
-                                                LOG_ERROR("[StageVerifier] Buffer validation failed: NaN/Inf detected");
-                                                all_valid = false;
-                                            }
-                                        }
-
-                                        // Successfully validated on GPU, continue to next output
-                                        continue;
-                                    }
-                                }
-                                // Fall through to host validation if GPU validation failed to launch
+                                launched = validator->validateFP32Async(device_ptr, numel, device_id);
                             }
+                            else if (std::string(output.dtype) == "BF16")
+                            {
+                                launched = validator->validateBF16Async(device_ptr, numel, device_id);
+                            }
+                            else if (std::string(output.dtype) == "FP16")
+                            {
+                                launched = validator->validateFP16Async(device_ptr, numel, device_id);
+                            }
+
+                            if (launched)
+                            {
+                                TensorValidationResult result;
+                                if (validator->getResult(result))
+                                {
+                                    if (result.appears_zero && numel > 10)
+                                    {
+                                        LOG_WARN("[StageVerifier] Stage '" << node.name << "' output '" << output.name
+                                                                           << "' appears to be all zeros (GPU validation)");
+                                        if (validation.fail_on_zero && !node.stage->allowsZeroOutput())
+                                        {
+                                            LOG_ERROR("[StageVerifier] Buffer validation failed: zero tensor detected");
+                                            all_valid = false;
+                                        }
+                                    }
+
+                                    if (result.has_nan || result.has_inf)
+                                    {
+                                        LOG_WARN("[StageVerifier] Stage '" << node.name << "' output '" << output.name
+                                                                           << "' contains " << result.nan_count << " NaN, "
+                                                                           << result.inf_count << " Inf values (GPU validation)");
+                                        if (validation.fail_on_nan)
+                                        {
+                                            LOG_ERROR("[StageVerifier] Buffer validation failed: NaN/Inf detected");
+                                            all_valid = false;
+                                        }
+                                    }
+
+                                    // Successfully validated on GPU, continue to next output
+                                    continue;
+                                }
+                            }
+                            // Fall through to host validation if GPU validation failed to launch
                         }
-                    } // End of non-BAR-backed validation
+                    }
                 }
             }
 

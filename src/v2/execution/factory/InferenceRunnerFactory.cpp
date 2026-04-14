@@ -600,7 +600,7 @@ namespace llaminar2
         //
         // A) LOCAL TP (config.tp_ctx->isLocal()): Single MPI rank, multiple devices
         //    - Configured via ITPContext (polymorphic) in InferenceRunnerConfig
-        //    - Collectives via NCCL/RCCL/PCIeBAR (high bandwidth, no host staging)
+        //    - Collectives via NCCL/RCCL/HOST (high bandwidth for same-vendor)
         //    - Uses ILocalTPContext for proportional head/FFN/vocab assignment
         //
         // B) TensorParallelConfig (Phase 1c): Proportional GLOBAL TP
@@ -762,7 +762,7 @@ namespace llaminar2
         }
 
         // =====================================================================
-        // GPU-Native Collectives (NCCL/RCCL/PCIeBAR)
+        // GPU-Native Collectives (NCCL/RCCL/HOST)
         // =====================================================================
         // Create CollectiveContext for GPU-native collective operations.
         // This eliminates GPU→CPU→GPU transfers during tensor-parallel inference:
@@ -1178,75 +1178,31 @@ namespace llaminar2
         // =====================================================================
         // Layer weight accessor - returns weights ONLY for this stage's layers
         // =====================================================================
-        // Capture by value for lambda lifetime safety
+        // Layer weight accessor via polymorphic builder (handles GDN/FA layers)
+        // =====================================================================
+        auto config_builder = createGraphConfigBuilder(arch);
+        auto builder_weights = config_builder->buildWeights(
+            [weight_mgr](const std::string &name)
+            {
+                return weight_mgr->getWeightForDevice(name);
+            });
+
+        // Use the builder's model-aware get_layer_weights, augmented with
+        // PP layer-range validation
         const int stage_first_layer = first_layer;
         const int stage_last_layer = last_layer;
+        auto builder_get_layer = builder_weights.get_layer_weights;
 
-        weights.get_layer_weights = [weight_mgr, stage_first_layer, stage_last_layer](int layer_idx) -> LayerWeights
+        weights.get_layer_weights = [builder_get_layer, stage_first_layer, stage_last_layer](int layer_idx) -> LayerWeights
         {
-            LayerWeights layer;
-
             // Validate layer is within this stage's range
             if (layer_idx < stage_first_layer || layer_idx >= stage_last_layer)
             {
                 LOG_ERROR("[PPStageRunner] Layer " << layer_idx << " requested but stage only owns ["
                                                    << stage_first_layer << ", " << stage_last_layer << ")");
-                return layer; // Return empty layer
+                return LayerWeights{};
             }
-
-            std::string prefix = "blk." + std::to_string(layer_idx) + ".";
-
-            // Attention weights - all required
-            auto wq = weight_mgr->getWeightForDevice(prefix + "attn_q.weight");
-            auto wk = weight_mgr->getWeightForDevice(prefix + "attn_k.weight");
-            auto wv = weight_mgr->getWeightForDevice(prefix + "attn_v.weight");
-            auto wo = weight_mgr->getWeightForDevice(prefix + "attn_output.weight");
-            auto attn_norm = weight_mgr->getWeightForDevice(prefix + "attn_norm.weight");
-
-            if (!wq || !wk || !wv || !wo || !attn_norm)
-            {
-                LOG_ERROR("[PPStageRunner] Missing required attention weight for layer " << layer_idx);
-                return layer;
-            }
-
-            layer.wq = wq.get();
-            layer.wk = wk.get();
-            layer.wv = wv.get();
-            layer.wo = wo.get();
-            layer.attn_norm = attn_norm.get();
-
-            // Attention biases (may be null)
-            auto q_bias = weight_mgr->getWeightForDevice(prefix + "attn_q.bias");
-            auto k_bias = weight_mgr->getWeightForDevice(prefix + "attn_k.bias");
-            auto v_bias = weight_mgr->getWeightForDevice(prefix + "attn_v.bias");
-            layer.q_bias = q_bias ? q_bias.get() : nullptr;
-            layer.k_bias = k_bias ? k_bias.get() : nullptr;
-            layer.v_bias = v_bias ? v_bias.get() : nullptr;
-
-            // QK norm weights (Qwen3: per-head RMSNorm, may be null for Qwen2)
-            auto q_norm = weight_mgr->getWeightForDevice(prefix + "attn_q_norm.weight");
-            auto k_norm = weight_mgr->getWeightForDevice(prefix + "attn_k_norm.weight");
-            layer.q_norm = q_norm ? q_norm.get() : nullptr;
-            layer.k_norm = k_norm ? k_norm.get() : nullptr;
-
-            // FFN weights - all required
-            auto gate_proj = weight_mgr->getWeightForDevice(prefix + "ffn_gate.weight");
-            auto up_proj = weight_mgr->getWeightForDevice(prefix + "ffn_up.weight");
-            auto down_proj = weight_mgr->getWeightForDevice(prefix + "ffn_down.weight");
-            auto ffn_norm = weight_mgr->getWeightForDevice(prefix + "ffn_norm.weight");
-
-            if (!gate_proj || !up_proj || !down_proj || !ffn_norm)
-            {
-                LOG_ERROR("[PPStageRunner] Missing required FFN weight for layer " << layer_idx);
-                return layer;
-            }
-
-            layer.gate_proj = gate_proj.get();
-            layer.up_proj = up_proj.get();
-            layer.down_proj = down_proj.get();
-            layer.ffn_norm = ffn_norm.get();
-
-            return layer;
+            return builder_get_layer(layer_idx);
         };
 
         orchestrator->setWeights(weights);
@@ -1617,7 +1573,6 @@ namespace llaminar2
         // =====================================================================
         InferenceStateInitConfig init_config;
         init_config.use_mapped_memory = config.use_mapped_memory;
-        init_config.use_bar_backed_hidden = pp_config.use_bar_backed_hidden;
 
         if (!orchestrator->initializeInferenceStateFromArena(
                 config.batch_size, config.max_seq_len, device, init_config))
@@ -1774,7 +1729,6 @@ namespace llaminar2
         // Initialize inference state via schema-driven BufferArena path
         InferenceStateInitConfig init_config;
         init_config.use_mapped_memory = config.use_mapped_memory;
-        init_config.use_bar_backed_hidden = config.use_bar_backed_hidden;
 
         if (!orchestrator->initializeInferenceStateFromArena(
                 config.batch_size, config.max_seq_len, device, init_config))

@@ -216,7 +216,7 @@ namespace llaminar2
     {
         // TODO: Wire up to LocalTPContext factory in Phase 1.2
         // This will instantiate the appropriate context based on:
-        // - Backend type (NCCL, RCCL, PCIeBAR, HOST)
+        // - Backend type (NCCL, RCCL, HOST)
         // - Device configuration
         // - Weights for proportional TP
         return nullptr;

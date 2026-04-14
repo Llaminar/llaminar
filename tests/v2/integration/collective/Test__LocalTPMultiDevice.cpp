@@ -9,7 +9,7 @@
  * 1. Hardware Detection - Verify GPU enumeration and device discovery
  * 2. CUDA LOCAL TP - Tests requiring 2+ CUDA GPUs (NCCL backend)
  * 3. ROCm LOCAL TP - Tests requiring 2+ ROCm GPUs (RCCL backend)
- * 4. Heterogeneous LOCAL TP - Tests requiring 1 CUDA + 1 ROCm (PCIeBAR backend)
+ * 4. Heterogeneous LOCAL TP - Tests requiring 1 CUDA + 1 ROCm (HOST backend)
  *
  * All tests gracefully skip if hardware requirements are not met.
  *
@@ -757,12 +757,12 @@ TEST_F(Test__LocalTPMultiDevice, Heterogeneous_LocalTPContextCreation)
         GlobalDeviceAddress::cuda(0),
         GlobalDeviceAddress::rocm(0)};
 
-    // PCIeBAR is the only backend that supports heterogeneous GPU types
-    auto tp_ctx = createLocalTPContext(devices, {}, CollectiveBackendType::PCIE_BAR);
+    // HETEROGENEOUS is the backend that supports heterogeneous GPU types
+    auto tp_ctx = createLocalTPContext(devices, {}, CollectiveBackendType::HETEROGENEOUS);
 
     ASSERT_NE(tp_ctx, nullptr) << "Failed to create heterogeneous LocalTPContext";
     EXPECT_EQ(tp_ctx->degree(), 2);
-    EXPECT_EQ(tp_ctx->backend(), CollectiveBackendType::PCIE_BAR);
+    EXPECT_EQ(tp_ctx->backend(), CollectiveBackendType::HETEROGENEOUS);
 
     // Verify device types differ
     EXPECT_NE(tp_ctx->devices()[0].device_type, tp_ctx->devices()[1].device_type);
@@ -787,7 +787,7 @@ TEST_F(Test__LocalTPMultiDevice, Heterogeneous_CUDAROCm_ForwardSucceeds)
     config.devices = {
         GlobalDeviceAddress::cuda(0),
         GlobalDeviceAddress::rocm(0)};
-    config.backend = CollectiveBackendType::PCIE_BAR;
+    config.backend = CollectiveBackendType::HETEROGENEOUS;
     config.max_seq_len = 512;
 
     auto multi_orch = std::make_unique<MultiDeviceOrchestrator>(model_ctx, config);
@@ -857,7 +857,7 @@ TEST_F(Test__LocalTPMultiDevice, DISABLED_Heterogeneous_CUDAROCm_LogitsReasonabl
     multi_config.devices = {
         GlobalDeviceAddress::cuda(0),
         GlobalDeviceAddress::rocm(0)};
-    multi_config.backend = CollectiveBackendType::PCIE_BAR;
+    multi_config.backend = CollectiveBackendType::HETEROGENEOUS;
     multi_config.max_seq_len = 512;
 
     auto multi_orch = std::make_unique<MultiDeviceOrchestrator>(model_ctx, multi_config);
@@ -910,7 +910,7 @@ TEST_F(Test__LocalTPMultiDevice, DISABLED_Heterogeneous_ProportionalWeights)
         GlobalDeviceAddress::cuda(0),
         GlobalDeviceAddress::rocm(0)};
     config.weights = {0.73f, 0.27f};
-    config.backend = CollectiveBackendType::PCIE_BAR;
+    config.backend = CollectiveBackendType::HETEROGENEOUS;
     config.max_seq_len = 512;
 
     auto multi_orch = std::make_unique<MultiDeviceOrchestrator>(model_ctx, config);

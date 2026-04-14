@@ -12,6 +12,7 @@
 #include "../GPUDeviceContextPool.h"
 #include "NvidiaDeviceContext.h"
 #include "../../utils/Logger.h"
+#include "../../kernels/cuda/ops/CUDAVectorAddKernels.h"
 #include <cuda_runtime.h>
 #include <cuda.h> // For cuCtxSetCurrent, cuDevicePrimaryCtxRetain
 #include <future>
@@ -291,11 +292,11 @@ namespace llaminar2
                     double total_mb = total_bytes / (1024.0 * 1024.0);
                     double used_mb = (total_bytes - free_bytes) / (1024.0 * 1024.0);
                     LOG_ERROR("[CUDABackend] Insufficient GPU memory on device " << device_id
-                              << ": requested " << std::fixed << std::setprecision(1) << req_mb
-                              << " MB but only " << free_mb << " MB free ("
-                              << used_mb << " / " << total_mb << " MB used). "
-                              << "Try reducing context length (-c), using a smaller model, "
-                              << "or adding more GPUs for tensor parallelism.");
+                                                                                 << ": requested " << std::fixed << std::setprecision(1) << req_mb
+                                                                                 << " MB but only " << free_mb << " MB free ("
+                                                                                 << used_mb << " / " << total_mb << " MB used). "
+                                                                                 << "Try reducing context length (-c), using a smaller model, "
+                                                                                 << "or adding more GPUs for tensor parallelism.");
                     return nullptr;
                 }
             }
@@ -944,6 +945,129 @@ namespace llaminar2
             std::promise<bool> p;
             p.set_value(memset(ptr, value, bytes, device_id));
             return p.get_future();
+        }
+    }
+
+    // ====================================================================
+    // Stream Management
+    // ====================================================================
+
+    void *CUDABackend::createStream(int device_id)
+    {
+        cudaError_t err = cudaSetDevice(device_id);
+        if (err != cudaSuccess)
+        {
+            LOG_ERROR("[CUDABackend::createStream] cudaSetDevice(" << device_id
+                                                                   << ") failed: " << cudaGetErrorString(err));
+            return nullptr;
+        }
+
+        cudaStream_t stream;
+        err = cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking);
+        if (err != cudaSuccess)
+        {
+            LOG_ERROR("[CUDABackend::createStream] cudaStreamCreateWithFlags failed: "
+                      << cudaGetErrorString(err));
+            return nullptr;
+        }
+        return stream;
+    }
+
+    void CUDABackend::destroyStream(void *stream, int device_id)
+    {
+        if (!stream)
+            return;
+        cudaSetDevice(device_id);
+        cudaStreamDestroy(static_cast<cudaStream_t>(stream));
+    }
+
+    bool CUDABackend::synchronizeStream(void *stream, int device_id)
+    {
+        cudaError_t err = cudaSetDevice(device_id);
+        if (err != cudaSuccess)
+            return false;
+        err = cudaStreamSynchronize(static_cast<cudaStream_t>(stream));
+        if (err != cudaSuccess)
+        {
+            LOG_ERROR("[CUDABackend::synchronizeStream] failed: " << cudaGetErrorString(err));
+            return false;
+        }
+        return true;
+    }
+
+    bool CUDABackend::streamWaitEvent(void *stream, void *event, int device_id)
+    {
+        (void)device_id;
+        cudaError_t err = cudaStreamWaitEvent(
+            static_cast<cudaStream_t>(stream),
+            static_cast<cudaEvent_t>(event), 0);
+        if (err != cudaSuccess)
+        {
+            LOG_ERROR("[CUDABackend::streamWaitEvent] failed: " << cudaGetErrorString(err));
+            return false;
+        }
+        return true;
+    }
+
+    // ====================================================================
+    // Stream-Aware Memory Operations
+    // ====================================================================
+
+    bool CUDABackend::deviceCopyAsync(void *dst, const void *src, size_t bytes,
+                                      int device_id, void *stream)
+    {
+        cudaError_t err = cudaSetDevice(device_id);
+        if (err != cudaSuccess)
+            return false;
+        err = cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToDevice,
+                              static_cast<cudaStream_t>(stream));
+        if (err != cudaSuccess)
+        {
+            LOG_ERROR("[CUDABackend::deviceCopyAsync] failed: " << cudaGetErrorString(err));
+            return false;
+        }
+        return true;
+    }
+
+    // ====================================================================
+    // Collective Reduction Primitives
+    // ====================================================================
+
+    bool CUDABackend::vectorAddInplace(void *output, const void *input, size_t count,
+                                       int element_size, int device_id, void *stream)
+    {
+        cudaError_t err = cudaSetDevice(device_id);
+        if (err != cudaSuccess)
+        {
+            LOG_ERROR("[CUDABackend::vectorAddInplace] cudaSetDevice failed: "
+                      << cudaGetErrorString(err));
+            return false;
+        }
+
+        cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
+
+        switch (element_size)
+        {
+        case 4: // FP32 or INT32
+            return cuda::launchVectorAddInplace_f32(
+                static_cast<float *>(output),
+                static_cast<const float *>(input),
+                count, cuda_stream);
+
+        case 2: // FP16 or BF16 — defaults to FP16
+            return cuda::launchVectorAddInplace_f16(
+                output, input, count, cuda_stream);
+
+        case 1: // INT8
+            return cuda::launchVectorAddInplace_i8(
+                static_cast<int8_t *>(output),
+                static_cast<const int8_t *>(input),
+                count, cuda_stream);
+
+        default:
+            LOG_ERROR("[CUDABackend::vectorAddInplace] unsupported element_size: "
+                      << element_size);
+            return false;
         }
     }
 

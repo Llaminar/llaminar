@@ -41,7 +41,7 @@
  *
  * 2. LOCAL TP (single-rank): One MPI rank with multiple devices
  *    - Configured via ILocalTPContext in InferenceRunnerConfig
- *    - Collectives via NCCL/RCCL/PCIeBAR (no host staging)
+ *    - Collectives via NCCL/RCCL/HOST
  *    - Use: llaminar2 --tp 2 --tp-scope local --tp-devices cuda:0,rocm:0
  *
  * @code
@@ -144,12 +144,6 @@ namespace llaminar2
         /// For LOCAL TP: index into ILocalTPContext::devices().
         /// For GLOBAL TP: rank within the global TP domain.
         int tp_device_index = 0;
-
-        /// Allocate hidden state in PCIe BAR region for cross-vendor PP transfers.
-        /// When true and device is ROCm, the final hidden state buffer is allocated
-        /// via PCIeBARBackend::allocateInBarRegion() to enable zero-copy transfers
-        /// to CUDA devices in subsequent PP stages.
-        bool use_bar_backed_hidden = false;
 
         /// PP stage config for nested TP-in-PP runners.
         /// When set, the factory uses partial weight loading (only embedding/lm_head

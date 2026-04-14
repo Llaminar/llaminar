@@ -309,8 +309,6 @@ namespace llaminar2
         // =====================================================================
 
         /// Whether this buffer participates in collective operations (AllReduce, etc.)
-        /// When true and a CollectiveContext with PCIeBARBackend is active,
-        /// the buffer will be allocated from the BAR region for cross-vendor P2P.
         bool participates_in_collective = false;
 
         /// Unique identifier linking buffers for the same collective operation
@@ -487,11 +485,6 @@ namespace llaminar2
 
         /**
          * @brief Mark this buffer as participating in a collective operation
-         *
-         * When a buffer participates in a collective and the DeviceGraphBufferManager
-         * has a CollectiveContext with a backend requiring registration (e.g.,
-         * PCIeBARBackend), the buffer will be allocated from the BAR region
-         * for cross-vendor P2P transfers.
          *
          * @param collective_id Unique identifier for the collective
          *                      (e.g., "layer0_attn_allreduce")

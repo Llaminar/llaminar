@@ -492,14 +492,12 @@ namespace llaminar2::test
         config.last_layer = 12;
         config.has_embedding = true;
         config.has_lm_head = false;
-        config.use_bar_backed_hidden = true;
 
         // Verify all fields are accessible
         EXPECT_EQ(config.first_layer, 0);
         EXPECT_EQ(config.last_layer, 12);
         EXPECT_TRUE(config.has_embedding);
         EXPECT_FALSE(config.has_lm_head);
-        EXPECT_TRUE(config.use_bar_backed_hidden);
     }
 
     /**

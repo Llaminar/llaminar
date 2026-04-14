@@ -491,7 +491,7 @@ TEST(Test__RankExecutionPlan_Integration, FullyConfiguredPlan)
     plan.tp_scope = TPScope::LOCAL;
     plan.local_tp_devices = {GlobalDeviceAddress::cuda(0), GlobalDeviceAddress::rocm(0)};
     plan.local_tp_weights = {0.6f, 0.4f};
-    plan.local_tp_backend = CollectiveBackendType::PCIE_BAR;
+    plan.local_tp_backend = CollectiveBackendType::HETEROGENEOUS;
 
     // Weight shard
     plan.weight_shard.shard_index = 1;

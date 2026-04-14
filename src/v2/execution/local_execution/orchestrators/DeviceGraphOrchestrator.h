@@ -128,22 +128,6 @@ namespace llaminar2
          * Default: false (use device memory for best GPU performance)
          */
         bool use_mapped_memory = false;
-
-        /**
-         * @brief Use BAR-backed memory for hidden state tensor
-         *
-         * When true and the device is ROCm, the hidden state output tensor will
-         * be allocated in PCIe BAR memory, enabling zero-copy reads from CUDA
-         * devices. This is required for cross-vendor PP transfers (ROCm→CUDA).
-         *
-         * Conditions for BAR-backed allocation:
-         * 1. Device is ROCm (source of cross-vendor transfer)
-         * 2. Next PP stage is CUDA (destination)
-         * 3. DirectP2PEngine is available with active BAR mapping
-         *
-         * Default: false (use standard VRAM allocation)
-         */
-        bool use_bar_backed_hidden = false;
     };
 
     /**
@@ -669,7 +653,7 @@ namespace llaminar2
         bool isWeightStreamingEnabled() const;
 
         // =========================================================================
-        // Collective Context (NCCL/RCCL/PCIeBAR)
+        // Collective Context (NCCL/RCCL/HOST)
         // =========================================================================
 
         /**
@@ -677,7 +661,7 @@ namespace llaminar2
          *
          * When set, AllreduceStage and AllGatherStage execution will be intercepted
          * by DeviceGraphExecutor and routed through the BackendRouter for device-native
-         * collectives (NCCL for CUDA, RCCL for ROCm, PCIeBAR for P2P).
+         * collectives (NCCL for CUDA, RCCL for ROCm, HOST for cross-vendor).
          *
          * This eliminates the need for GPU→CPU→GPU transfers during tensor-parallel
          * inference, significantly reducing coherence overhead.
@@ -1561,7 +1545,8 @@ namespace llaminar2
             // the lifetime of the orchestrator.
             // Reset input-dependent cached state on all kernels (e.g., stale token IDs)
             resetKernelDynamicState();
-            // Reset model-internal recurrence state (e.g., GDN conv/recurrence in Qwen3.5)
+            // Reset model-internal state (no-op for models with hybrid cache since
+            // state_.clear() → kv_cache->clear() already handles GDN state reset)
             if (graph_builder_)
                 graph_builder_->resetState();
             // Note: host_resident_released_ is NOT reset here —

@@ -192,11 +192,11 @@ namespace llaminar2
         // Tensor Parallelism Context (Polymorphic — LOCAL or GLOBAL)
         // =================================================================
         /// Polymorphic ITPContext for tensor parallelism collective operations.
-        /// Set to either an ILocalTPContext* (intra-rank multi-device: NCCL/RCCL/PCIeBAR)
+        /// Set to either an ILocalTPContext* (intra-rank multi-device: NCCL/RCCL/HOST)
         /// or an IGlobalTPContext* (cross-rank: MPI/UPI).
         ///
         /// Graph builders use this via TPAllreduceStage for all TP modes.
-        /// Code needing LOCAL TP-specific features (BAR registration, device lists)
+        /// Code needing LOCAL TP-specific features (device lists)
         /// should check tp_ctx->isLocal() and static_cast<ILocalTPContext*>.
         ///
         /// In a nested PP+TP topology like:

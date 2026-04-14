@@ -48,7 +48,7 @@ namespace llaminar2
      * @brief Activation transfer stage for LOCAL pipeline parallelism
      *
      * Transfers activations from one PP stage device to another within
-     * the same MPI rank. Uses the LOCAL PP context's backend (NCCL/RCCL/PCIeBAR)
+     * the same MPI rank. Uses the LOCAL PP context's backend (NCCL/RCCL/HOST)
      * based on device types.
      *
      * Usage:

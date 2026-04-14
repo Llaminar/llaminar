@@ -26,7 +26,6 @@
 #include "../graph/SchemaFactoryRegistry.h" // Model-agnostic sharding config access
 #include "../../../tensors/TensorClasses.h"
 #include "../../../tensors/TensorFactory.h"
-#include "../../../backends/p2p/DirectP2P.h"        // DirectP2PEngine for BAR pre-init in cross-vendor PP
 #include "../../../backends/BackendManager.h"       // getBackendFor() for partial D2H in gatherLogits
 #include "../../../backends/GPUDeviceContextPool.h" // Compute stream registration for event-based collective sync
 #include "../../../utils/Logger.h"
@@ -271,7 +270,7 @@ namespace llaminar2
                     stage_cfg.stage_devices = {pp_devices[i]};
                 }
 
-                // Cross-vendor detection for BAR-backed hidden state transfer
+                // Cross-vendor detection for host-staged hidden state transfer
                 // Compare primary devices of adjacent stages
                 auto primaryDeviceType = [&](size_t idx) -> DeviceType
                 {
@@ -284,7 +283,7 @@ namespace llaminar2
                 if (i + 1 < pp_devices.size() &&
                     primaryDeviceType(i) != primaryDeviceType(i + 1))
                 {
-                    stage_cfg.requires_bar_backed_hidden = true;
+                    // Cross-vendor PP stage boundary detected
                 }
 
                 config.pp_stages.push_back(std::move(stage_cfg));
@@ -675,7 +674,6 @@ namespace llaminar2
                                                  runner_config.kv_cache_scale_v = config_.kv_cache_scale_v;
                                                  runner_config.kv_cache_precision = config_.kv_cache_precision;
                                                  runner_config.use_mapped_memory = config_.use_mapped_memory;
-                                                 runner_config.use_bar_backed_hidden = config_.use_bar_backed_hidden;
 
                                                  // Set TP parameters (LOCAL TP context here)
                                                  runner_config.tp_ctx = tp_ctx_.get();
@@ -817,8 +815,8 @@ namespace llaminar2
         // Cross-Vendor PP Detection
         // =========================================================================
         // Check if any PP transfer is cross-vendor (ROCm→CUDA or CUDA→ROCm).
-        // If so, the source stage's hidden state tensor needs BAR-backed allocation
-        // to enable zero-copy PCIe BAR transfers.
+        // If so, the source stage's hidden state tensor needs host-staged allocation
+        // to enable cross-vendor transfers via HOST backend.
         // =========================================================================
         auto isCrossVendorTransfer = [](const PPStageConfig &src, const PPStageConfig &dst) -> bool
         {
@@ -837,62 +835,14 @@ namespace llaminar2
             return (src_cuda && dst_rocm) || (src_rocm && dst_cuda);
         };
 
-        // Pre-compute which stages need BAR-backed hidden state
-        std::vector<bool> needs_bar_backed(num_stages, false);
+        // Check for cross-vendor transfers for logging purposes
         for (size_t i = 0; i + 1 < num_stages; ++i)
         {
             if (isCrossVendorTransfer(config_.pp_stages[i], config_.pp_stages[i + 1]))
             {
-                // Source stage outputs to cross-vendor, needs BAR-backed hidden
-                needs_bar_backed[i] = true;
                 LOG_INFO("MultiDeviceOrchestrator: PP stage " << i
                                                               << " outputs to cross-vendor stage " << (i + 1)
-                                                              << " - will use BAR-backed hidden state");
-            }
-        }
-
-        // =========================================================================
-        // Pre-initialize PCIe BAR for Cross-Vendor PP
-        // =========================================================================
-        // If any stage needs BAR-backed hidden state, we must initialize the
-        // DirectP2PEngine's BAR mapping NOW, before creating device runners.
-        // Otherwise, when DeviceGraphOrchestrator calls initializeInferenceStateFromArena(),
-        // isPCIeBarActive() will return false and it will fall back to standard
-        // allocation (which will fail during cross-vendor transfer).
-        // =========================================================================
-        for (size_t i = 0; i < num_stages; ++i)
-        {
-            if (needs_bar_backed[i] && i + 1 < num_stages)
-            {
-                const auto &src_stage = config_.pp_stages[i];
-                const auto &dst_stage = config_.pp_stages[i + 1];
-
-                if (!src_stage.stage_devices.empty() && !dst_stage.stage_devices.empty())
-                {
-                    DeviceId src_dev = src_stage.stage_devices[0].toLocalDeviceId();
-                    DeviceId dst_dev = dst_stage.stage_devices[0].toLocalDeviceId();
-
-                    DeviceId cuda_dev = src_dev.is_cuda() ? src_dev : dst_dev;
-                    DeviceId rocm_dev = src_dev.is_rocm() ? src_dev : dst_dev;
-
-                    auto p2p = DirectP2PEngine::getSharedInstance();
-                    if (!p2p->isPCIeBarActive())
-                    {
-                        LOG_INFO("MultiDeviceOrchestrator: Pre-initializing PCIe BAR for cross-vendor PP "
-                                 << "(CUDA:" << cuda_dev.cuda_ordinal() << " <-> ROCm:" << rocm_dev.rocm_ordinal() << ")");
-
-                        constexpr size_t bar_map_size = 1024 * 1024 * 1024; // 1GB BAR region
-                        if (!p2p->initializePCIeBar(cuda_dev, rocm_dev, 0, bar_map_size))
-                        {
-                            LOG_ERROR("MultiDeviceOrchestrator: Failed to pre-initialize PCIe BAR. "
-                                      "Cross-vendor PP transfer will fail.");
-                            throw std::runtime_error("Failed to initialize PCIe BAR for cross-vendor PP");
-                        }
-
-                        LOG_INFO("MultiDeviceOrchestrator: PCIe BAR pre-initialized successfully");
-                        break; // Only need to initialize once
-                    }
-                }
+                                                              << " - will use host-staged transfer");
             }
         }
 
@@ -906,8 +856,7 @@ namespace llaminar2
                                                                     << " [layers " << stage_config.first_layer
                                                                     << "-" << stage_config.last_layer << ")"
                                                                     << " has_embedding=" << stage_config.has_embedding
-                                                                    << " has_lm_head=" << stage_config.has_lm_head
-                                                                    << " needs_bar_backed=" << needs_bar_backed[stage_idx]);
+                                                                    << " has_lm_head=" << stage_config.has_lm_head);
 
             // Validate stage has at least one device
             if (stage_config.stage_devices.empty())
@@ -955,7 +904,6 @@ namespace llaminar2
             factory_pp_config.last_layer = stage_config.last_layer;
             factory_pp_config.has_embedding = stage_config.has_embedding;
             factory_pp_config.has_lm_head = stage_config.has_lm_head;
-            factory_pp_config.use_bar_backed_hidden = needs_bar_backed[stage_idx] || stage_config.requires_bar_backed_hidden;
 
             // =====================================================================
             // Handle single-device vs TP-domain stages
@@ -981,7 +929,6 @@ namespace llaminar2
                 nested_config.kv_cache_scale_v = config_.kv_cache_scale_v;
                 nested_config.kv_cache_precision = config_.kv_cache_precision;
                 nested_config.use_mapped_memory = config_.use_mapped_memory;
-                nested_config.use_bar_backed_hidden = needs_bar_backed[stage_idx] || stage_config.requires_bar_backed_hidden;
 
                 // CRITICAL: Pass PP stage config to nested TP MDO so its DeviceGraphOrchestrators
                 // build partial graphs instead of full graphs. Without this, the TP devices would

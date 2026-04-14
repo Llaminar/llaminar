@@ -190,7 +190,7 @@ static const std::vector<TestConfig> kQwen35SingleDeviceConfigs = {
             .decode_cosine_threshold = 0.93f, // Observed: ~0.97+ post exp() fix
             .early_layers_count = 8,
             .min_early_layers_passed = 8, // All 8 early layers pass with rotation
-            .kl_threshold = 0.10f,        // Observed: 0.04 prefill post exp() fix
+            .kl_threshold = 0.03f,        // Observed: 0.008 prefill KL (was 0.10 = 12.7x over-relaxed)
             .min_top1_accuracy = 80.0f,   // Observed: 100% post exp() fix
             .min_top5_accuracy = 80.0f,   // Observed: 100% post exp() fix
             .pytorch_top1_in_topk = 3,    // Re-enabled: exp() fix restored accuracy
@@ -242,7 +242,7 @@ static const std::vector<TestConfig> kQwen35SingleDeviceConfigs = {
             .decode_cosine_threshold = 0.93f,
             .early_layers_count = 8,
             .min_early_layers_passed = 8,
-            .kl_threshold = 0.10f,
+            .kl_threshold = 0.06f, // Observed: 0.018 prefill KL (was 0.10 = 5.5x over-relaxed)
             .min_top1_accuracy = 80.0f,
             .min_top5_accuracy = 80.0f,
             .pytorch_top1_in_topk = 3,
@@ -262,7 +262,7 @@ static const std::vector<TestConfig> kQwen35SingleDeviceConfigs = {
             .decode_cosine_threshold = 0.93f,
             .early_layers_count = 8,
             .min_early_layers_passed = 8,
-            .kl_threshold = 0.10f,
+            .kl_threshold = 0.07f, // Observed: 0.021 prefill KL (was 0.10 = 4.7x over-relaxed)
             .min_top1_accuracy = 80.0f,
             .min_top5_accuracy = 80.0f,
             .pytorch_top1_in_topk = 3,

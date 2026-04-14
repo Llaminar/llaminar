@@ -25,8 +25,7 @@ namespace llaminar2
         HOST_TO_DEVICE,                // Standard H2D via IBackend::hostToDevice()
         DEVICE_TO_HOST,                // Standard D2H via IBackend::deviceToHost()
         DEVICE_TO_DEVICE_SAME_BACKEND, // P2P within same vendor (CUDA↔CUDA or ROCm↔ROCm)
-        BAR_HOST_BOUNCE,               // BAR-backed: staging D2H → memcpy → H2D (safe cross-vendor)
-        HOST_STAGED,                   // Generic cross-vendor: D2H → memcpy → H2D (no BAR)
+        HOST_STAGED,                   // Generic cross-vendor: D2H → memcpy → H2D
         MAPPED_NOOP,                   // Zero-copy mapped memory — no transfer needed
     };
 
@@ -42,8 +41,6 @@ namespace llaminar2
             return "DEVICE_TO_HOST";
         case TransferMethod::DEVICE_TO_DEVICE_SAME_BACKEND:
             return "DEVICE_TO_DEVICE_SAME_BACKEND";
-        case TransferMethod::BAR_HOST_BOUNCE:
-            return "BAR_HOST_BOUNCE";
         case TransferMethod::HOST_STAGED:
             return "HOST_STAGED";
         case TransferMethod::MAPPED_NOOP:
@@ -69,13 +66,6 @@ namespace llaminar2
         size_t size_bytes = 0;      // Data size in bytes
         MemoryResidency residency = MemoryResidency::STANDARD;
 
-        // BAR-specific (only valid if residency == BAR_BACKED)
-        void *bar_staging_ptr = nullptr; // HIP staging VRAM pointer (for ROCm kernel writes)
-        void *bar_rocm_ptr = nullptr;    // mmap'd BAR pointer (ROCm host-visible)
-        void *bar_cuda_ptr = nullptr;    // CUDA device pointer via cuMemHostGetDevicePointer
-        DeviceId bar_host_device;        // ROCm device whose BAR hosts this buffer
-        DeviceId bar_accessor_device;    // CUDA device with registered BAR access
-
         // Mapped-specific (only valid if residency == MAPPED)
         void *mapped_host_ptr = nullptr;   // Host-visible pointer for mapped memory
         void *mapped_device_ptr = nullptr; // Device-visible pointer for mapped memory
@@ -89,12 +79,6 @@ namespace llaminar2
             s += ", residency=" + std::string(to_string(residency));
             s += ", host=" + std::to_string(host_ptr != nullptr);
             s += ", device_ptr=" + std::to_string(device_ptr != nullptr);
-            if (residency == MemoryResidency::BAR_BACKED)
-            {
-                s += ", bar_staging=" + std::to_string(bar_staging_ptr != nullptr);
-                s += ", bar_rocm=" + std::to_string(bar_rocm_ptr != nullptr);
-                s += ", bar_cuda=" + std::to_string(bar_cuda_ptr != nullptr);
-            }
             if (residency == MemoryResidency::MAPPED)
             {
                 s += ", mapped_host=" + std::to_string(mapped_host_ptr != nullptr);

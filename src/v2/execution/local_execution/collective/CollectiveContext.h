@@ -42,7 +42,6 @@ namespace llaminar2
     // Forward declarations
     class ITensor;
     class ClusterInventory;
-    class PCIeBARBackend;
 
     // =========================================================================
     // Utility Functions
@@ -313,23 +312,11 @@ namespace llaminar2
         // =====================================================================
 
         /**
-         * @brief Get the PCIeBARBackend if available
-         *
-         * Returns the PCIeBARBackend from the router if one is registered
-         * and active. This is used by DeviceGraphBufferManager to allocate
-         * collective buffers from the BAR region.
-         *
-         * @return Pointer to PCIeBARBackend, or nullptr if not available
-         */
-        PCIeBARBackend *getPCIeBarBackend() const;
-
-        /**
          * @brief Check if buffer registration is required for any backend
          *
-         * Returns true if any available backend requires buffer registration
-         * (e.g., PCIeBARBackend for cross-vendor P2P).
+         * Returns false — no backends require buffer registration.
          *
-         * @return true if buffer registration is needed
+         * @return false always
          */
         bool requiresBufferRegistration() const;
 

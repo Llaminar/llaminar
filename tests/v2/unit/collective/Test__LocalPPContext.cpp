@@ -90,9 +90,9 @@ namespace llaminar2::test
         LocalPPConfig makeMixedVendorConfig()
         {
             LocalPPConfig config;
-            config.stage_devices.push_back(GlobalDeviceAddress::cuda(0));  // Stage 0
-            config.stage_devices.push_back(GlobalDeviceAddress::rocm(0));  // Stage 1
-            config.stage_devices.push_back(GlobalDeviceAddress::cpu());    // Stage 2
+            config.stage_devices.push_back(GlobalDeviceAddress::cuda(0)); // Stage 0
+            config.stage_devices.push_back(GlobalDeviceAddress::rocm(0)); // Stage 1
+            config.stage_devices.push_back(GlobalDeviceAddress::cpu());   // Stage 2
 
             // 24 layers: 8 per stage
             config.layer_boundaries = {0, 8, 16, 24};
@@ -455,15 +455,15 @@ namespace llaminar2::test
         EXPECT_EQ(mock->backendForTransfer(0, 1), CollectiveBackendType::HOST);
     }
 
-    TEST_F(Test__LocalPPContext, MockBackendForTransfer_CanBePCIE_BAR)
+    TEST_F(Test__LocalPPContext, MockBackendForTransfer_CanBeHETEROGENEOUS)
     {
         auto mock = MockLocalPPContextBuilder()
                         .withDevices({GlobalDeviceAddress::cuda(0), GlobalDeviceAddress::rocm(0)})
                         .withEqualLayerSplit(24)
-                        .withBackend(CollectiveBackendType::PCIE_BAR)
+                        .withBackend(CollectiveBackendType::HETEROGENEOUS)
                         .build();
 
-        EXPECT_EQ(mock->backendForTransfer(0, 1), CollectiveBackendType::PCIE_BAR);
+        EXPECT_EQ(mock->backendForTransfer(0, 1), CollectiveBackendType::HETEROGENEOUS);
     }
 
     TEST_F(Test__LocalPPContext, MockBackendForTransfer_CanBeRCCL)
@@ -1011,13 +1011,13 @@ namespace llaminar2::test
     //
     // NOTE: Tests requiring real GPU hardware belong in integration tests:
     //   tests/v2/integration/pipelines/Test__MultiGPU_RealModel.cpp
-    // 
+    //
     // Unit tests here use ONLY mocks and do NOT require GPU hardware.
     // ═══════════════════════════════════════════════════════════════════════════
 
     /**
      * @test Transfer to same device returns true without actual transfer
-     * 
+     *
      * When stage_from and stage_to map to the same physical device,
      * transfer() should return true immediately as a no-op.
      */
@@ -1027,7 +1027,7 @@ namespace llaminar2::test
         MockLocalPPContext::Config config;
         config.stage_devices = {
             GlobalDeviceAddress::cuda(0),
-            GlobalDeviceAddress::cuda(0)  // Same device!
+            GlobalDeviceAddress::cuda(0) // Same device!
         };
         config.layer_boundaries = {0, 12, 24};
 

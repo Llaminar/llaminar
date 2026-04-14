@@ -66,28 +66,14 @@ TEST(Test__TransferEngine_Plan, RocmToRocm_SameBackend)
     EXPECT_EQ(method, TransferMethod::DEVICE_TO_DEVICE_SAME_BACKEND);
 }
 
-TEST(Test__TransferEngine_Plan, CudaToRocm_BarBacked_HostBounce)
-{
-    auto method = TransferEngine::planTransfer(
-        DeviceId::cuda(0), DeviceId::rocm(0), MemoryResidency::BAR_BACKED);
-    EXPECT_EQ(method, TransferMethod::BAR_HOST_BOUNCE);
-}
-
-TEST(Test__TransferEngine_Plan, RocmToCuda_BarBacked_HostBounce)
-{
-    auto method = TransferEngine::planTransfer(
-        DeviceId::rocm(0), DeviceId::cuda(0), MemoryResidency::BAR_BACKED);
-    EXPECT_EQ(method, TransferMethod::BAR_HOST_BOUNCE);
-}
-
-TEST(Test__TransferEngine_Plan, CudaToRocm_NoBar_HostStaged)
+TEST(Test__TransferEngine_Plan, CudaToRocm_HostStaged)
 {
     auto method = TransferEngine::planTransfer(
         DeviceId::cuda(0), DeviceId::rocm(0), MemoryResidency::STANDARD);
     EXPECT_EQ(method, TransferMethod::HOST_STAGED);
 }
 
-TEST(Test__TransferEngine_Plan, RocmToCuda_NoBar_HostStaged)
+TEST(Test__TransferEngine_Plan, RocmToCuda_HostStaged)
 {
     auto method = TransferEngine::planTransfer(
         DeviceId::rocm(0), DeviceId::cuda(0), MemoryResidency::STANDARD);
@@ -152,7 +138,7 @@ TEST(Test__TransferEngine_Plan, HostResident_AlwaysNoop)
 TEST(Test__TransferEngine_Plan, HostResident_PrecedesOtherChecks)
 {
     // HOST_RESIDENT should NOOP even for cross-vendor transfers that would
-    // normally be HOST_STAGED or BAR_HOST_BOUNCE — residency takes priority.
+    // normally be HOST_STAGED — residency takes priority.
     EXPECT_EQ(TransferEngine::planTransfer(
                   DeviceId::rocm(0), DeviceId::cuda(0), MemoryResidency::HOST_RESIDENT),
               TransferMethod::NOOP);
@@ -337,60 +323,6 @@ TEST_F(Test__TransferEngine_Execute, HostStaged_RecordsBothTransfers)
     EXPECT_FLOAT_EQ(result_data[3], 4.0f);
 
     mock_backend_->free(src_device, 0);
-    mock_backend_->free(dst_device, 0);
-}
-
-TEST_F(Test__TransferEngine_Execute, BarHostBounce_UsesStagingPtr)
-{
-    s_mock_ = mock_backend_.get();
-    TransferEngine engine(resolver_);
-
-    constexpr size_t bytes = 4 * sizeof(float);
-
-    // Staging buffer (simulating HIP VRAM)
-    void *staging = mock_backend_->allocate(bytes, 0);
-    ASSERT_NE(staging, nullptr);
-    float staging_data[4] = {5.0f, 6.0f, 7.0f, 8.0f};
-    std::memcpy(staging, staging_data, bytes);
-
-    // Target "device" memory
-    void *dst_device = mock_backend_->allocate(bytes, 0);
-    ASSERT_NE(dst_device, nullptr);
-
-    // Host bounce buffer
-    float host_bounce[4] = {0};
-
-    MemoryDescriptor desc;
-    desc.host_ptr = host_bounce;
-    desc.device_ptr = nullptr; // BAR tensors may not have generic device_ptr
-    desc.device = DeviceId::rocm(0);
-    desc.size_bytes = bytes;
-    desc.residency = MemoryResidency::BAR_BACKED;
-    desc.bar_staging_ptr = staging;
-    desc.bar_host_device = DeviceId::rocm(0);
-
-    TransferRequest req;
-    req.source = desc;
-    req.target_device = DeviceId::cuda(0);
-    req.method = TransferMethod::BAR_HOST_BOUNCE;
-    req.target_ptr = dst_device;
-
-    auto result = engine.execute(req);
-
-    EXPECT_TRUE(result.success);
-    EXPECT_EQ(result.method_used, TransferMethod::BAR_HOST_BOUNCE);
-
-    // Should have done D2H from staging + H2D to target
-    auto stats = mock_backend_->getTransferStats();
-    EXPECT_EQ(stats.d2h_count, 1u);
-    EXPECT_EQ(stats.h2d_count, 1u);
-
-    // Data should have arrived
-    auto *result_data = static_cast<float *>(dst_device);
-    EXPECT_FLOAT_EQ(result_data[0], 5.0f);
-    EXPECT_FLOAT_EQ(result_data[3], 8.0f);
-
-    mock_backend_->free(staging, 0);
     mock_backend_->free(dst_device, 0);
 }
 
@@ -609,7 +541,6 @@ TEST(Test__TransferEngine_Strings, TransferMethodToString)
     EXPECT_EQ(to_string(TransferMethod::HOST_TO_DEVICE), "HOST_TO_DEVICE");
     EXPECT_EQ(to_string(TransferMethod::DEVICE_TO_HOST), "DEVICE_TO_HOST");
     EXPECT_EQ(to_string(TransferMethod::DEVICE_TO_DEVICE_SAME_BACKEND), "DEVICE_TO_DEVICE_SAME_BACKEND");
-    EXPECT_EQ(to_string(TransferMethod::BAR_HOST_BOUNCE), "BAR_HOST_BOUNCE");
     EXPECT_EQ(to_string(TransferMethod::HOST_STAGED), "HOST_STAGED");
     EXPECT_EQ(to_string(TransferMethod::MAPPED_NOOP), "MAPPED_NOOP");
 }
@@ -628,19 +559,6 @@ TEST(Test__TransferEngine_Descriptor, Describe_ContainsDevice)
     std::string s = desc.describe();
     EXPECT_NE(s.find("1024"), std::string::npos);
     EXPECT_NE(s.find("STANDARD"), std::string::npos);
-}
-
-TEST(Test__TransferEngine_Descriptor, Describe_BarBacked_ShowsBarFields)
-{
-    MemoryDescriptor desc;
-    desc.device = DeviceId::rocm(0);
-    desc.size_bytes = 2048;
-    desc.residency = MemoryResidency::BAR_BACKED;
-    desc.bar_staging_ptr = reinterpret_cast<void *>(0x1);
-
-    std::string s = desc.describe();
-    EXPECT_NE(s.find("BAR_BACKED"), std::string::npos);
-    EXPECT_NE(s.find("bar_staging=1"), std::string::npos);
 }
 
 TEST(Test__TransferEngine_Descriptor, TransferResult_Ok)

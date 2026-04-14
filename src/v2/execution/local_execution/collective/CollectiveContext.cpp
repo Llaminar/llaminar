@@ -9,7 +9,6 @@
 #include "CollectiveContext.h"
 #include "../../mpi_orchestration/DeviceInventory.h"
 #if defined(HAVE_CUDA) && defined(HAVE_ROCM)
-#include "../../../collective/backends/PCIeBARBackend.h"
 #endif
 #ifdef HAVE_CUDA
 #include "../../../collective/backends/NCCLBackend.h"
@@ -197,7 +196,7 @@ namespace llaminar2
         }
 
         // =========================================================================
-        // Standard Path: Direct backend call (NCCL, RCCL, PCIeBAR, or MPI+CPU)
+        // Standard Path: Direct backend call (NCCL, RCCL, HOST, or MPI+CPU)
         // =========================================================================
         // CRITICAL: Use active_mutable_data_ptr() to get GPU pointer without invalidating
         // GPU data. Using mutable_data() would mark device_valid_=false, causing expensive
@@ -288,7 +287,7 @@ namespace llaminar2
         }
 
         // =========================================================================
-        // Standard Path: Direct backend call (NCCL, RCCL, PCIeBAR, or MPI+CPU)
+        // Standard Path: Direct backend call (NCCL, RCCL, HOST, or MPI+CPU)
         // =========================================================================
         // Use active_data_ptr() for send and active_mutable_data_ptr() for receive
         // to avoid invalidating GPU data on tensors that should remain on device
@@ -500,7 +499,7 @@ namespace llaminar2
         }
 
         // =========================================================================
-        // Standard Path: Direct backend call (NCCL, RCCL, PCIeBAR, or MPI+CPU)
+        // Standard Path: Direct backend call (NCCL, RCCL, HOST, or MPI+CPU)
         // =========================================================================
         // Use active_data_ptr() for send and active_mutable_data_ptr() for receive
         // to avoid invalidating GPU data on tensors that should remain on device
@@ -574,7 +573,7 @@ namespace llaminar2
         }
 
         // =========================================================================
-        // Standard Path: Direct backend call (NCCL, RCCL, PCIeBAR, or MPI+CPU)
+        // Standard Path: Direct backend call (NCCL, RCCL, HOST, or MPI+CPU)
         // =========================================================================
         // Use active_mutable_data_ptr() to get GPU pointer without invalidating GPU data
         void *data_ptr = buffer->active_mutable_data_ptr();
@@ -606,68 +605,9 @@ namespace llaminar2
     // Buffer Registration Support (Phase 3)
     // =========================================================================
 
-    PCIeBARBackend *CollectiveContext::getPCIeBarBackend() const
-    {
-        if (!router_)
-        {
-            return nullptr;
-        }
-
-        // Check if PCIe BAR backend is available
-        if (!router_->isAvailable(CollectiveBackendType::PCIE_BAR))
-        {
-            return nullptr;
-        }
-
-        // Build a device group to get the backend
-        // Use first local device to query
-        DeviceGroup group;
-        if (!local_devices_.empty())
-        {
-            DeviceGroupBuilder builder;
-            builder.setName("bar_query_group")
-                .setScope(CollectiveScope::LOCAL);
-            for (const auto &device : local_devices_)
-            {
-                builder.addDevice(device);
-            }
-            group = builder.build();
-        }
-        else
-        {
-            return nullptr;
-        }
-
-        ICollectiveBackend *backend = router_->getBackend(group);
-        if (!backend)
-        {
-            return nullptr;
-        }
-
-        // Check if it's actually a PCIeBARBackend
-        if (backend->type() != CollectiveBackendType::PCIE_BAR)
-        {
-            return nullptr;
-        }
-
-#if defined(HAVE_CUDA) && defined(HAVE_ROCM)
-        return static_cast<PCIeBARBackend *>(backend);
-#else
-        return nullptr;
-#endif
-    }
-
     bool CollectiveContext::requiresBufferRegistration() const
     {
-#if defined(HAVE_CUDA) && defined(HAVE_ROCM)
-        // Check if any available backend requires buffer registration
-        PCIeBARBackend *bar_backend = getPCIeBarBackend();
-        if (bar_backend && bar_backend->requiresBufferRegistration())
-        {
-            return true;
-        }
-#endif
-
+        // No backends require buffer registration
         return false;
     }
 

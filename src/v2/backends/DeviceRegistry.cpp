@@ -481,7 +481,7 @@ namespace llaminar2
         if (a.isCPU() || b.isCPU())
             return false;
 
-        // Different device types can't do P2P (CUDA ↔ ROCm requires PCIeBAR)
+        // Different device types can't do P2P (CUDA ↔ ROCm uses HOST staging)
         if (a.device_type != b.device_type)
             return false;
 

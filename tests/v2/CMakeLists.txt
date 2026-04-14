@@ -266,7 +266,7 @@ function(add_v2_test TEST_NAME)
     # GPU resource contention when running with `ctest --parallel`.
     # CPU-only integration tests (quantization GEMM, tokenization, etc.) are unaffected.
     if("${ARG_LABELS}" MATCHES "Integration")
-        if("${ARG_LABELS}" MATCHES "CUDA|ROCm|GPU|HIP|NCCL|RCCL|PCIeBAR|P2P|CrossVendor|MultiGPU|cuBLAS|hipBLAS")
+        if("${ARG_LABELS}" MATCHES "CUDA|ROCm|GPU|HIP|NCCL|RCCL|P2P|CrossVendor|MultiGPU|cuBLAS|hipBLAS")
             list(APPEND ARG_RESOURCE_LOCK "GPU_Hardware")
         endif()
     endif()
@@ -281,6 +281,64 @@ function(add_v2_test TEST_NAME)
         set_tests_properties(${TEST_NAME} PROPERTIES
             TIMEOUT ${ARG_TIMEOUT}
         )
+    endif()
+endfunction()
+
+# =============================================================================
+# discover_v2_parity_tests() — Dynamic GTest discovery with per-test process isolation
+#
+# Runs the test binary with --gtest_list_tests at POST_BUILD time (no mpirun),
+# parses discovered test cases, and generates individual CTest entries for each.
+# Each test case runs in its own process, avoiding state accumulation bugs
+# (e.g. ROCm CLR corruption between RCCL init/destroy cycles).
+#
+# Usage:
+#   discover_v2_parity_tests(my_target
+#       TEST_PREFIX V2_Integration_Parity_Qwen2_SingleDevice
+#       LABELS "V2;Integration;Parity;..."
+#       MPI_PROCS 1
+#   )
+# =============================================================================
+function(discover_v2_parity_tests TARGET)
+    cmake_parse_arguments(ARG "" "MPI_PROCS;TEST_PREFIX" "LABELS" ${ARGN})
+
+    if(NOT ARG_TEST_PREFIX)
+        set(ARG_TEST_PREFIX "${TARGET}")
+    endif()
+    if(NOT ARG_MPI_PROCS)
+        set(ARG_MPI_PROCS 1)
+    endif()
+
+    # Paths for generated artifacts
+    set(_ctest_file "${CMAKE_CURRENT_BINARY_DIR}/${TARGET}_discovered_tests.cmake")
+
+    # Working directory: project root (CMAKE_SOURCE_DIR is src/v2, go up two levels)
+    get_filename_component(_working_dir "${CMAKE_SOURCE_DIR}/../.." ABSOLUTE)
+
+    # POST_BUILD: run discovery script (no mpirun needed, just the binary directly)
+    add_custom_command(
+        TARGET ${TARGET} POST_BUILD
+        COMMAND ${CMAKE_COMMAND}
+            -D "TEST_EXECUTABLE=$<TARGET_FILE:${TARGET}>"
+            -D "CTEST_FILE=${_ctest_file}"
+            -D "TEST_PREFIX=${ARG_TEST_PREFIX}"
+            -D "LABELS=${ARG_LABELS}"
+            -D "MPI_PROCS=${ARG_MPI_PROCS}"
+            -D "NUM_SOCKETS=${NUM_SOCKETS}"
+            -D "CORES_PER_SOCKET=${CORES_PER_SOCKET}"
+            -D "WORKING_DIR=${_working_dir}"
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/V2ParityTestDiscovery.cmake"
+        BYPRODUCTS "${_ctest_file}"
+        COMMENT "Discovering parity tests in ${TARGET}..."
+        VERBATIM
+    )
+
+    # Tell CTest to include the generated file (tests appear after first build)
+    set_property(DIRECTORY APPEND PROPERTY TEST_INCLUDE_FILES "${_ctest_file}")
+
+    # Create an empty file so CTest doesn't error before the first build
+    if(NOT EXISTS "${_ctest_file}")
+        file(WRITE "${_ctest_file}" "# Placeholder — tests will be discovered after building ${TARGET}\n")
     endif()
 endfunction()
 
@@ -393,33 +451,7 @@ add_v2_test(V2_Unit_TensorByteSize
 #       because they require GPU allocation and fail with OOM when run in parallel
 #       with other GPU-heavy unit tests.
 
-# Test: BARBackedTensor - BAR-backed tensor factory and operations
-add_executable(v2_test_bar_backed_tensor unit/tensors/Test__BARBackedTensor.cpp)
-target_link_libraries(v2_test_bar_backed_tensor 
-    llaminar2_core 
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Unit_BARBackedTensor 
-    COMMAND $<TARGET_FILE:v2_test_bar_backed_tensor>
-    LABELS "V2;Unit;TensorOperations;PCIeBAR;Heterogeneous;ZeroCopy"
-    MPI_PROCS 1
-)
-
-# Test: TensorFactory_BARBacked - TensorFactory BAR-backed tensor creation methods
-add_executable(v2_test_tensor_factory_bar_backed unit/tensors/Test__TensorFactory_BARBacked.cpp)
-target_link_libraries(v2_test_tensor_factory_bar_backed 
-    llaminar2_core 
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Unit_TensorFactory_BARBacked 
-    COMMAND $<TARGET_FILE:v2_test_tensor_factory_bar_backed>
-    LABELS "V2;Unit;TensorOperations;TensorFactory;PCIeBAR;Heterogeneous"
-    MPI_PROCS 1
-)
-
-# Test: Qwen2BufferSpec - Buffer allocation strategy for BAR-backed tensors
+# Test: Qwen2BufferSpec - Buffer allocation strategy
 add_executable(v2_test_qwen2_buffer_spec unit/models/qwen/Test__Qwen2BufferSpec.cpp)
 target_link_libraries(v2_test_qwen2_buffer_spec 
     llaminar2_core 
@@ -428,7 +460,7 @@ target_link_libraries(v2_test_qwen2_buffer_spec
 )
 add_v2_test(V2_Unit_Qwen2BufferSpec 
     COMMAND $<TARGET_FILE:v2_test_qwen2_buffer_spec>
-    LABELS "V2;Unit;BufferAllocation;PCIeBAR;Heterogeneous;TensorParallelism"
+    LABELS "V2;Unit;BufferAllocation;Heterogeneous;TensorParallelism"
     MPI_PROCS 1
 )
 
@@ -634,176 +666,8 @@ add_v2_test(V2_Integration_DeviceBenchmark
     MPI_PROCS 1
 )
 
-# Test: DirectP2P - Cross-vendor P2P via PCIe BAR mapping
-# Requires both CUDA and ROCm - tests true zero-copy P2P between GPU vendors
+# Cross-vendor integration tests (require both CUDA and ROCm)
 if(HAVE_CUDA AND HAVE_ROCM)
-    add_executable(v2_integration_direct_p2p integration/collective/Test__DirectP2P.cpp)
-    target_link_libraries(v2_integration_direct_p2p 
-        llaminar2_core 
-        device_benchmarks
-        GTest::gtest
-        GTest::gtest_main
-    )
-    add_v2_test(V2_Integration_DirectP2P 
-        COMMAND $<TARGET_FILE:v2_integration_direct_p2p>
-        LABELS "V2;Integration;DeviceManagement;P2P;PCIeBAR;CUDA;ROCm;CrossVendor"
-        MPI_PROCS 1
-        RESOURCE_LOCK "PCIeBAR_P2P"
-    )
-
-    # Test: CrossVendorTensorParallel - Real tensor parallel inference across NVIDIA+AMD
-    # Tests FP32/Q8_1 tensor transfers, column/row parallel GEMM, AllReduce semantics
-    add_executable(v2_integration_cross_vendor_tp integration/execution/Test__CrossVendorTensorParallel.cpp)
-    target_link_libraries(v2_integration_cross_vendor_tp 
-        llaminar2_core 
-        device_benchmarks
-        GTest::gtest
-        GTest::gtest_main
-    )
-    target_include_directories(v2_integration_cross_vendor_tp PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/utils
-    )
-    add_v2_test(V2_Integration_CrossVendorTensorParallel 
-        COMMAND $<TARGET_FILE:v2_integration_cross_vendor_tp>
-        LABELS "V2;Integration;TensorParallel;P2P;CUDA;ROCm;CrossVendor;GEMM;AllReduce"
-        MPI_PROCS 1
-        RESOURCE_LOCK "PCIeBAR_P2P"
-    )
-
-    # Test: PCIeBARBackend Integration - End-to-end collective operations via PCIe BAR P2P
-    add_executable(v2_integration_pcie_bar_backend integration/collective/backends/Test__PCIeBARBackendIntegration.cpp)
-    target_link_libraries(v2_integration_pcie_bar_backend 
-        llaminar2_core 
-        device_benchmarks
-        GTest::gtest
-        GTest::gtest_main
-    )
-    target_include_directories(v2_integration_pcie_bar_backend PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/utils
-    )
-    add_v2_test(V2_Integration_PCIeBARBackend 
-        COMMAND $<TARGET_FILE:v2_integration_pcie_bar_backend>
-        LABELS "V2;Integration;Collective;PCIeBARBackend;P2P;CUDA;ROCm;CrossVendor;TensorParallel;AllReduce"
-        MPI_PROCS 1
-        RESOURCE_LOCK "PCIeBAR_P2P"
-    )
-
-    # Test: PCIeBARBackend HardwareInit - Hardware initialization, lifecycle, and BAR allocation tests
-    # These were moved from unit/ because they call DirectP2PEngine::probeCapabilities()
-    # and backend_->initialize() which maps 1GB BAR regions and benchmarks bandwidth.
-    add_executable(v2_integration_pcie_bar_backend_hw_init integration/collective/backends/Test__PCIeBARBackend_HardwareInit.cpp)
-    target_link_libraries(v2_integration_pcie_bar_backend_hw_init 
-        llaminar2_core 
-        device_benchmarks
-        GTest::gtest
-        GTest::gtest_main
-    )
-    add_v2_test(V2_Integration_PCIeBARBackend_HardwareInit 
-        COMMAND $<TARGET_FILE:v2_integration_pcie_bar_backend_hw_init>
-        LABELS "V2;Integration;Collective;PCIeBARBackend;P2P;CUDA;ROCm;CrossVendor"
-        MPI_PROCS 1
-        RESOURCE_LOCK "PCIeBAR_P2P"
-    )
-
-    # Test: PCIeBARBackend Multi-Pair - Multi-pair CUDA↔ROCm collective operations
-    # Tests GCD-based parallel bridging where multiple device pairs perform
-    # allreduce operations simultaneously. Requires 2+ CUDA and 2+ ROCm devices
-    # for full multi-pair tests; single-pair tests run with 1 CUDA + 1 ROCm.
-    add_executable(v2_integration_pcie_bar_backend_multi_pair integration/collective/backends/Test__PCIeBarBackend_MultiPair.cpp)
-    target_link_libraries(v2_integration_pcie_bar_backend_multi_pair 
-        llaminar2_core 
-        device_benchmarks
-        GTest::gtest
-        GTest::gtest_main
-    )
-    target_include_directories(v2_integration_pcie_bar_backend_multi_pair PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/utils
-    )
-    add_v2_test(V2_Integration_PCIeBARBackend_MultiPair 
-        COMMAND $<TARGET_FILE:v2_integration_pcie_bar_backend_multi_pair>
-        LABELS "V2;Integration;Collective;PCIeBARBackend;MultiPair;P2P;CUDA;ROCm;CrossVendor;TensorParallel;AllReduce;GCD"
-        MPI_PROCS 1
-        RESOURCE_LOCK "PCIeBAR_P2P"
-    )
-
-    # Test: PCIeBARBackend Worker Pool - Per-device worker threads, allocation-free
-    # event waits, per-pair resources, and ROCm event integration.
-    add_executable(v2_integration_pcie_bar_backend_worker_pool integration/collective/backends/Test__PCIeBARBackend_WorkerPool.cpp)
-    target_link_libraries(v2_integration_pcie_bar_backend_worker_pool
-        llaminar2_core
-        device_benchmarks
-        GTest::gtest
-        GTest::gtest_main
-    )
-    target_include_directories(v2_integration_pcie_bar_backend_worker_pool PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/utils
-    )
-    add_v2_test(V2_Integration_PCIeBARBackend_WorkerPool
-        COMMAND $<TARGET_FILE:v2_integration_pcie_bar_backend_worker_pool>
-        LABELS "V2;Integration;Collective;PCIeBARBackend;WorkerPool;P2P;CUDA;ROCm;CrossVendor;TensorParallel;AllReduce"
-        MPI_PROCS 1
-        RESOURCE_LOCK "PCIeBAR_P2P"
-    )
-
-    # Test: BAR-backed HIP allocation - Exploratory test for HIP memory in BAR
-    # DISABLED: This was an exploratory test that exhaustively tested all HIP/HSA/CUDA APIs
-    # for direct kernel access to PCIe BAR memory. Key findings:
-    # - HIP kernels CANNOT directly dereference BAR mmap addresses (memory fault)
-    # - hipMemcpy(D2D) with BAR as destination WORKS at ~4+ GB/s (uses DMA engine)
-    # - All HIP/HSA import APIs reject BAR fd (not a dmabuf)
-    # - AMD dmabuf export → CUDA import FAILS (NVIDIA rejects foreign dmabufs, error 999)
-    # - Dmabuf CPU mmap is slow (~21 MB/s, uncached PCIe access)
-    # Conclusion: Use hipMemcpy(D2D) to stage ROCm kernel output to BAR before CUDA reads.
-    # See: tests/v2/integration/backends/rocm/Test__BARBackedHipAllocation.cpp for detailed documentation.
-    add_executable(v2_integration_bar_backed_hip_allocation integration/backends/rocm/Test__BARBackedHipAllocation.cpp)
-    target_link_libraries(v2_integration_bar_backed_hip_allocation 
-        llaminar2_core 
-        GTest::gtest
-        GTest::gtest_main
-    )
-    # Disabled from regular CI - run manually via: ctest -R DISABLED_V2_Integration_BARBackedHipAllocation
-    add_v2_test(DISABLED_V2_Integration_BARBackedHipAllocation 
-        COMMAND $<TARGET_FILE:v2_integration_bar_backed_hip_allocation>
-        LABELS "V2;Integration;PCIeBAR;HIP;CUDA;ROCm;CrossVendor;Exploration;DISABLED"
-        MPI_PROCS 1
-        RESOURCE_LOCK "PCIeBAR_P2P"
-    )
-
-    # Test: AMD PCIe P2P Mapping (tinygrad-style) - Experimental test for AMD-side BAR mapping
-    # This explores mapping NVIDIA GPU BAR memory into AMD GPU's address space using
-    # direct page table manipulation, as implemented by tinygrad for bidirectional P2P.
-    # DISABLED: Requires root access and deep understanding of AMD GPU page table format.
-    # Run manually via: ctest -R DISABLED_V2_Integration_AMD_PCIe_P2P_Mapping
-    add_executable(v2_integration_amd_pcie_p2p_mapping integration/backends/rocm/Test__AMD_PCIe_P2P_Mapping.cpp)
-    target_link_libraries(v2_integration_amd_pcie_p2p_mapping 
-        llaminar2_core 
-        GTest::gtest
-        GTest::gtest_main
-    )
-    add_v2_test(DISABLED_V2_Integration_AMD_PCIe_P2P_Mapping 
-        COMMAND $<TARGET_FILE:v2_integration_amd_pcie_p2p_mapping>
-        LABELS "V2;Integration;PCIeBAR;P2P;CUDA;ROCm;CrossVendor;Exploration;AMD;Tinygrad;DISABLED"
-        MPI_PROCS 1
-        RESOURCE_LOCK "PCIeBAR_P2P"
-    )
-
-    # Test: PCIeBAR Latency Benchmark - Performance benchmark for cross-vendor collective latency
-    add_executable(v2_integration_pcie_bar_latency_benchmark integration/collective/backends/Test__PCIeBARLatencyBenchmark.cpp)
-    target_link_libraries(v2_integration_pcie_bar_latency_benchmark 
-        llaminar2_core 
-        device_benchmarks
-        GTest::gtest
-        GTest::gtest_main
-    )
-    target_include_directories(v2_integration_pcie_bar_latency_benchmark PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/utils
-    )
-    add_v2_test(V2_Integration_PCIeBAR_LatencyBenchmark 
-        COMMAND $<TARGET_FILE:v2_integration_pcie_bar_latency_benchmark>
-        LABELS "V2;Integration;Benchmark;PCIeBAR;Latency;P2P;CUDA;ROCm;CrossVendor;Performance"
-        MPI_PROCS 1
-        RESOURCE_LOCK "PCIeBAR_P2P"
-    )
 
     # Test: CUDA Vector Add Kernels - Accuracy tests for FP32/FP16/BF16/INT8/INT32 reduction kernels
     add_executable(v2_integration_cuda_vector_add_kernels integration/kernels/cuda/ops/Test__CUDAVectorAddKernels.cpp)
@@ -819,7 +683,7 @@ if(HAVE_CUDA AND HAVE_ROCM)
     )
 
     # Test: CollectiveBackendIntegration - Comprehensive collective backend tests
-    # Tests CPU+CPU (MPI), NVIDIA+NVIDIA (NCCL), AMD+AMD (RCCL), NVIDIA+AMD (PCIeBAR),
+    # Tests CPU+CPU (MPI), NVIDIA+NVIDIA (NCCL), AMD+AMD (RCCL), NVIDIA+AMD (HOST),
     # and complex heterogeneous scenarios with multi-domain tensor parallelism
     add_executable(v2_integration_collective_backend integration/collective/Test__CollectiveBackendIntegration.cpp)
     target_link_libraries(v2_integration_collective_backend 
@@ -834,9 +698,8 @@ if(HAVE_CUDA AND HAVE_ROCM)
     # Multi-rank collective tests (requires 2 MPI ranks)
     add_v2_test(V2_Integration_CollectiveBackendIntegration 
         COMMAND $<TARGET_FILE:v2_integration_collective_backend>
-        LABELS "V2;Integration;Collective;BackendRouter;MPI;NCCL;RCCL;PCIeBAR;TensorParallel;Heterogeneous;AllReduce"
+        LABELS "V2;Integration;Collective;BackendRouter;MPI;NCCL;RCCL;TensorParallel;Heterogeneous;AllReduce"
         MPI_PROCS 2
-        RESOURCE_LOCK "PCIeBAR_P2P"
     )
     # Single-rank collective tests (requires exactly 1 MPI rank)
     # These tests verify single-rank optimizations like no-op AllReduce
@@ -846,37 +709,6 @@ if(HAVE_CUDA AND HAVE_ROCM)
         MPI_PROCS 1
     )
 
-    # Test: CrossBackendP2P - P2P operations across NCCL, RCCL, and PCIeBAR backends
-    # Tests send/recv/sendrecv primitives for cross-device data movement:
-    # - NCCL P2P within CUDA domain
-    # - RCCL P2P within ROCm domain
-    # - PCIeBAR P2P between CUDA and ROCm
-    # - Cross-backend staging patterns
-    # NOTE: This test is DISABLED by default - it hangs for hours on some systems
-    #       due to PCIe BAR P2P initialization issues. Enable with -DENABLE_CROSS_BACKEND_P2P_TEST=ON
-    option(ENABLE_CROSS_BACKEND_P2P_TEST "Enable the slow CrossBackendP2P test" OFF)
-    if(ENABLE_CROSS_BACKEND_P2P_TEST)
-        add_executable(v2_integration_cross_backend_p2p integration/collective/Test__CrossBackendP2P.cpp)
-        target_link_libraries(v2_integration_cross_backend_p2p 
-            llaminar2_core 
-            GTest::gtest
-            GTest::gtest_main
-        )
-        if(HAVE_CUDA)
-            target_link_libraries(v2_integration_cross_backend_p2p CUDA::cudart)
-        endif()
-        if(HAVE_ROCM)
-            target_link_libraries(v2_integration_cross_backend_p2p hip::host)
-        endif()
-        add_v2_test(V2_Integration_CrossBackendP2P
-            COMMAND $<TARGET_FILE:v2_integration_cross_backend_p2p>
-            LABELS "V2;Integration;Collective;P2P;NCCL;RCCL;PCIeBAR;Send;Recv;Sendrecv;CrossVendor"
-            MPI_PROCS 1
-        )
-        message(STATUS "V2 Tests: Added CrossBackendP2P integration tests")
-    else()
-        message(STATUS "V2 Tests: CrossBackendP2P test DISABLED (hangs on some systems) - enable with -DENABLE_CROSS_BACKEND_P2P_TEST=ON")
-    endif()
 endif()
 
 # Test: CrossDomainTransferGPU - GPU integration tests for cross-domain activation transfer
@@ -922,19 +754,6 @@ target_link_libraries(v2_unit_buffer_registration
 add_v2_test(V2_Unit_BufferRegistration 
     COMMAND $<TARGET_FILE:v2_unit_buffer_registration>
     LABELS "V2;Unit;Collective;BufferRegistration;Interface"
-    MPI_PROCS 1
-)
-
-# Test: CollectiveBackend_Copy - copy() API across all collective backends
-add_executable(v2_unit_collective_backend_copy unit/collective/Test__CollectiveBackend_Copy.cpp)
-target_link_libraries(v2_unit_collective_backend_copy 
-    llaminar2_core 
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Unit_CollectiveBackend_Copy 
-    COMMAND $<TARGET_FILE:v2_unit_collective_backend_copy>
-    LABELS "V2;Unit;Collective;Copy;Backend;HostBackend;NCCLBackend;RCCLBackend;PCIeBARBackend"
     MPI_PROCS 1
 )
 
@@ -1029,21 +848,6 @@ add_v2_test(V2_Unit_UPIBackend
     LABELS "V2;Unit;Collective;UPIBackend;UPI;CPU"
     MPI_PROCS 1
 )
-
-# Test: PCIeBARBackend - PCIe BAR direct P2P collective backend (CUDA + ROCm)
-if(HAVE_CUDA AND HAVE_ROCM)
-    add_executable(v2_unit_pcie_bar_backend unit/collective/backends/Test__PCIeBARBackend.cpp)
-    target_link_libraries(v2_unit_pcie_bar_backend 
-        llaminar2_core 
-        GTest::gtest
-        GTest::gtest_main
-    )
-    add_v2_test(V2_Unit_PCIeBARBackend 
-        COMMAND $<TARGET_FILE:v2_unit_pcie_bar_backend>
-        LABELS "V2;Unit;Collective;PCIeBARBackend;P2P;CUDA;ROCm;CrossVendor"
-        MPI_PROCS 1
-    )
-endif()
 
 # Test: NCCLBackend - NCCL collective backend for NVIDIA GPUs (P2P operations)
 if(HAVE_CUDA)
@@ -2774,6 +2578,19 @@ add_v2_test(V2_Unit_KernelFactory_KVCache
     MPI_PROCS 1
 )
 
+# Test: HybridKVCache (hybrid FA+GDN cache: layer mapping, GDN state, factory creation)
+add_executable(v2_test_hybrid_kvcache unit/kernels/Test__HybridKVCache.cpp)
+target_link_libraries(v2_test_hybrid_kvcache 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_HybridKVCache 
+    COMMAND $<TARGET_FILE:v2_test_hybrid_kvcache>
+    LABELS "V2;Unit;KVCache;HybridKVCache;GDN;Qwen35;KernelFactory"
+    MPI_PROCS 1
+)
+
 # Test: Q16SafeBlockAccess (Phase 2 - Safe Q16 block accessors and dispatch helpers)
 add_executable(v2_test_q16_safe_block_access unit/tensors/Test__Q16SafeBlockAccess.cpp)
 target_link_libraries(v2_test_q16_safe_block_access 
@@ -4025,6 +3842,19 @@ add_v2_test(V2_Perf_CoherenceTransferOverhead
     MPI_PROCS 1  # Benchmarks run locally, no MPI needed
 )
 
+# HostBackend Cross-Vendor Copy Benchmark
+# =============================================================================
+add_executable(v2_perf_host_backend_cross_vendor performance/Perf__HostBackendCrossVendorCopy.cpp)
+target_include_directories(v2_perf_host_backend_cross_vendor PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+target_link_libraries(v2_perf_host_backend_cross_vendor llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Perf_HostBackendCrossVendorCopy
+    COMMAND $<TARGET_FILE:v2_perf_host_backend_cross_vendor>
+    LABELS "V2;Performance;HostBackend;CrossVendor;PCIe;Bandwidth"
+    MPI_PROCS 1
+)
+
 # CUDA Event Synchronization Tests
 # =============================================================================
 # Tests for CUDA event-based synchronization in the backend.
@@ -4252,22 +4082,6 @@ add_v2_test(V2_Integration_HeterogeneousBackend_Phase1
 )
 message(STATUS "V2 Tests: Added HeterogeneousBackend Phase 1 integration tests")
 
-# Test: HeterogeneousBackend Phase 2 - Cross-Domain Bridge Exchange
-# Tests PCIeBAR allreduce between CUDA and ROCm bridge devices
-# Requires both CUDA and ROCm hardware
-add_executable(v2_integration_heterogeneous_backend_phase2 integration/collective/backends/Test__HeterogeneousBackend_Phase2.cpp)
-target_link_libraries(v2_integration_heterogeneous_backend_phase2 
-    llaminar2_core 
-    GTest::gtest 
-    GTest::gtest_main
-)
-add_v2_test(V2_Integration_HeterogeneousBackend_Phase2
-    COMMAND $<TARGET_FILE:v2_integration_heterogeneous_backend_phase2>
-    LABELS "V2;Integration;CUDA;ROCm;Heterogeneous;Collective;Allreduce;Phase2;CrossVendor;PCIeBAR"
-    MPI_PROCS 1  # Single process with multiple GPUs
-)
-message(STATUS "V2 Tests: Added HeterogeneousBackend Phase 2 integration tests")
-
 # Test: HeterogeneousBackend Phase 3 - Intra-Domain Broadcast
 # Tests NCCL/RCCL broadcast from bridge devices to all domain devices
 # Requires both CUDA and ROCm hardware
@@ -4295,75 +4109,11 @@ target_link_libraries(v2_integration_heterogeneous_backend_full_allreduce
 )
 add_v2_test(V2_Integration_HeterogeneousBackend_FullAllReduce
     COMMAND $<TARGET_FILE:v2_integration_heterogeneous_backend_full_allreduce>
-    LABELS "V2;Integration;CUDA;ROCm;Heterogeneous;Collective;AllReduce;FullPipeline;NCCL;RCCL;PCIeBAR"
+    LABELS "V2;Integration;CUDA;ROCm;Heterogeneous;Collective;AllReduce;FullPipeline;NCCL;RCCL"
     MPI_PROCS 1  # Single process with multiple GPUs
 )
 message(STATUS "V2 Tests: Added HeterogeneousBackend Full AllReduce integration tests")
 
-# Test: HeterogeneousBackend Reduce-Scatter Pattern
-# Tests the reduce-scatter + allgather optimization for large tensors (>=4MB)
-# This pattern reduces cross-vendor PCIe BAR traffic from 100% to 1/max(N,M)
-add_executable(v2_integration_heterogeneous_backend_reduce_scatter integration/collective/backends/Test__HeterogeneousBackend_ReduceScatter.cpp)
-target_link_libraries(v2_integration_heterogeneous_backend_reduce_scatter 
-    llaminar2_core 
-    GTest::gtest 
-    GTest::gtest_main
-)
-add_v2_test(V2_Integration_HeterogeneousBackend_ReduceScatter
-    COMMAND $<TARGET_FILE:v2_integration_heterogeneous_backend_reduce_scatter>
-    LABELS "V2;Integration;CUDA;ROCm;Heterogeneous;Collective;AllReduce;ReduceScatter;NCCL;RCCL;PCIeBAR;BandwidthOptimization"
-    MPI_PROCS 1  # Single process with multiple GPUs
-)
-message(STATUS "V2 Tests: Added HeterogeneousBackend Reduce-Scatter pattern integration tests")
-
-# Test: HeterogeneousBackend Phase 2→3 Pipelining
-# Tests chunk-based pipelining that overlaps PCIe BAR bridge transfer with intra-domain allgather
-# This optimization reduces latency for large tensors by processing chunks in parallel
-add_executable(v2_integration_heterogeneous_backend_pipelining integration/collective/backends/Test__HeterogeneousBackend_Pipelining.cpp)
-target_link_libraries(v2_integration_heterogeneous_backend_pipelining 
-    llaminar2_core 
-    GTest::gtest 
-    GTest::gtest_main
-)
-add_v2_test(V2_Integration_HeterogeneousBackend_Pipelining
-    COMMAND $<TARGET_FILE:v2_integration_heterogeneous_backend_pipelining>
-    LABELS "V2;Integration;CUDA;ROCm;Heterogeneous;Collective;AllReduce;Pipelining;PCIeBAR;NCCL;RCCL;BandwidthOptimization"
-    MPI_PROCS 1  # Single process with multiple GPUs
-)
-message(STATUS "V2 Tests: Added HeterogeneousBackend Pipelining integration tests")
-
-# Test: HeterogeneousBackend GCD Multi-Bridge Pattern
-# Tests the GCD-based multi-bridge pattern for asymmetric GPU configurations
-# where GCD(cuda_count, rocm_count) > 1 (uses parallel PCIeBAR bridges)
-add_executable(v2_integration_heterogeneous_backend_gcd_multi_bridge integration/collective/backends/Test__HeterogeneousBackend_GcdMultiBridge.cpp)
-target_link_libraries(v2_integration_heterogeneous_backend_gcd_multi_bridge 
-    llaminar2_core 
-    GTest::gtest 
-    GTest::gtest_main
-)
-add_v2_test(V2_Integration_HeterogeneousBackend_GcdMultiBridge
-    COMMAND $<TARGET_FILE:v2_integration_heterogeneous_backend_gcd_multi_bridge>
-    LABELS "V2;Integration;CUDA;ROCm;Heterogeneous;Collective;AllReduce;GcdMultiBridge;PCIeBAR;NCCL;RCCL;BandwidthOptimization"
-    MPI_PROCS 1  # Single process with multiple GPUs
-)
-message(STATUS "V2 Tests: Added HeterogeneousBackend GCD Multi-Bridge pattern integration tests")
-
-# Test: HeterogeneousBackend Partial Reduce-Scatter Pattern
-# Tests the partial reduce-scatter pattern for singleton GPU configurations
-# Singleton configs: 1 CUDA + N ROCm (N > 1) or N CUDA + 1 ROCm (N > 1)
-# Our hardware (1 CUDA + 2 ROCm) is perfect for testing this pattern!
-add_executable(v2_integration_heterogeneous_backend_partial_rs integration/collective/backends/Test__HeterogeneousBackend_PartialRS.cpp)
-target_link_libraries(v2_integration_heterogeneous_backend_partial_rs 
-    llaminar2_core 
-    GTest::gtest 
-    GTest::gtest_main
-)
-add_v2_test(V2_Integration_HeterogeneousBackend_PartialRS
-    COMMAND $<TARGET_FILE:v2_integration_heterogeneous_backend_partial_rs>
-    LABELS "V2;Integration;CUDA;ROCm;Heterogeneous;Collective;AllReduce;PartialReduceScatter;PCIeBAR;NCCL;RCCL;Singleton;BandwidthOptimization"
-    MPI_PROCS 1  # Single process with multiple GPUs
-)
-message(STATUS "V2 Tests: Added HeterogeneousBackend Partial Reduce-Scatter pattern integration tests")
 endif()
 
 # Test: CUDA Full Model Inference
@@ -4415,14 +4165,13 @@ if(ZLIB_FOUND)
         ${WORKSPACE_ROOT_PARITY}/external/cnpy
         ${CMAKE_CURRENT_SOURCE_DIR}
     )
-    add_v2_test(V2_Integration_Parity_Qwen2_SingleDevice
-        COMMAND $<TARGET_FILE:v2_integration_parity_qwen2_single_device>
+    discover_v2_parity_tests(v2_integration_parity_qwen2_single_device
+        TEST_PREFIX V2_Integration_Parity_Qwen2_SingleDevice
         LABELS "V2;Integration;Parity;Qwen2;CPU;CUDA;ROCm;SingleDevice;PyTorch;GoldenReference;FullModel"
         MPI_PROCS 1
-        TIMEOUT 1200
     )
 
-    # ---- Local Tensor Parallelism (NCCL, RCCL, PCIeBAR) ----
+    # ---- Local Tensor Parallelism (NCCL, RCCL, HOST) ----
     add_executable(v2_integration_parity_qwen2_local_tp
         integration/parity/qwen2/Test__Qwen2_LocalTP_Parity.cpp
         ${WORKSPACE_ROOT_PARITY}/external/cnpy/cnpy.cpp
@@ -4434,20 +4183,13 @@ if(ZLIB_FOUND)
         ${WORKSPACE_ROOT_PARITY}/external/cnpy
         ${CMAKE_CURRENT_SOURCE_DIR}
     )
-    if(HAVE_CUDA AND HAVE_ROCM)
-        add_custom_command(TARGET v2_integration_parity_qwen2_local_tp POST_BUILD
-            COMMAND ${CMAKE_COMMAND} -E echo "Setting CAP_SYS_ADMIN on v2_integration_parity_qwen2_local_tp for PCIe BAR P2P"
-            COMMAND sudo setcap cap_sys_admin+ep $<TARGET_FILE:v2_integration_parity_qwen2_local_tp> || true
-        )
-    endif()
-    add_v2_test(V2_Integration_Parity_Qwen2_LocalTP
-        COMMAND $<TARGET_FILE:v2_integration_parity_qwen2_local_tp>
-        LABELS "V2;Integration;Parity;Qwen2;CUDA;ROCm;NCCL;RCCL;PCIeBAR;LOCAL;TensorParallel;PyTorch;GoldenReference;MultiDevice"
+    discover_v2_parity_tests(v2_integration_parity_qwen2_local_tp
+        TEST_PREFIX V2_Integration_Parity_Qwen2_LocalTP
+        LABELS "V2;Integration;Parity;Qwen2;CUDA;ROCm;NCCL;RCCL;LOCAL;TensorParallel;PyTorch;GoldenReference;MultiDevice"
         MPI_PROCS 1
-        RESOURCE_LOCK "PCIeBAR_P2P"
     )
 
-    # ---- Local Pipeline Parallelism (NCCL, RCCL, PCIeBAR, HOST) ----
+    # ---- Local Pipeline Parallelism (NCCL, RCCL, HOST) ----
     add_executable(v2_integration_parity_qwen2_local_pp
         integration/parity/qwen2/Test__Qwen2_LocalPP_Parity.cpp
         ${WORKSPACE_ROOT_PARITY}/external/cnpy/cnpy.cpp
@@ -4459,17 +4201,10 @@ if(ZLIB_FOUND)
         ${WORKSPACE_ROOT_PARITY}/external/cnpy
         ${CMAKE_CURRENT_SOURCE_DIR}
     )
-    if(HAVE_CUDA AND HAVE_ROCM)
-        add_custom_command(TARGET v2_integration_parity_qwen2_local_pp POST_BUILD
-            COMMAND ${CMAKE_COMMAND} -E echo "Setting CAP_SYS_ADMIN on v2_integration_parity_qwen2_local_pp for PCIe BAR P2P"
-            COMMAND sudo setcap cap_sys_admin+ep $<TARGET_FILE:v2_integration_parity_qwen2_local_pp> || true
-        )
-    endif()
-    add_v2_test(V2_Integration_Parity_Qwen2_LocalPP
-        COMMAND $<TARGET_FILE:v2_integration_parity_qwen2_local_pp>
-        LABELS "V2;Integration;Parity;Qwen2;CUDA;ROCm;CPU;NCCL;RCCL;PCIeBAR;HOST;LOCAL;PipelineParallel;PyTorch;GoldenReference;MultiDevice"
+    discover_v2_parity_tests(v2_integration_parity_qwen2_local_pp
+        TEST_PREFIX V2_Integration_Parity_Qwen2_LocalPP
+        LABELS "V2;Integration;Parity;Qwen2;CUDA;ROCm;CPU;NCCL;RCCL;HOST;LOCAL;PipelineParallel;PyTorch;GoldenReference;MultiDevice"
         MPI_PROCS 1
-        RESOURCE_LOCK "PCIeBAR_P2P"
     )
 
     # ---- Hybrid PP+TP (nested TP domains within PP stages) ----
@@ -4484,17 +4219,14 @@ if(ZLIB_FOUND)
         ${WORKSPACE_ROOT_PARITY}/external/cnpy
         ${CMAKE_CURRENT_SOURCE_DIR}
     )
-    if(HAVE_CUDA AND HAVE_ROCM)
-        add_custom_command(TARGET v2_integration_parity_qwen2_hybrid_pptp POST_BUILD
-            COMMAND ${CMAKE_COMMAND} -E echo "Setting CAP_SYS_ADMIN on v2_integration_parity_qwen2_hybrid_pptp for PCIe BAR P2P"
-            COMMAND sudo setcap cap_sys_admin+ep $<TARGET_FILE:v2_integration_parity_qwen2_hybrid_pptp> || true
-        )
-    endif()
-    add_v2_test(V2_Integration_Parity_Qwen2_HybridPPTP
-        COMMAND $<TARGET_FILE:v2_integration_parity_qwen2_hybrid_pptp>
-        LABELS "V2;Integration;Parity;Qwen2;CUDA;ROCm;CPU;NCCL;RCCL;PCIeBAR;LOCAL;TensorParallel;PipelineParallel;Hybrid;PyTorch;GoldenReference;MultiDevice"
+    # Each test case runs in its own process to avoid ROCm CLR state
+    # accumulation between RCCL init/destroy cycles (a known ROCm bug
+    # that causes "Memobj map does not have ptr: 0x0" crashes when
+    # multiple TP configs or test types run back-to-back in the same process).
+    discover_v2_parity_tests(v2_integration_parity_qwen2_hybrid_pptp
+        TEST_PREFIX V2_Integration_Parity_Qwen2_HybridPPTP
+        LABELS "V2;Integration;Parity;Qwen2;CUDA;ROCm;CPU;NCCL;RCCL;LOCAL;TensorParallel;PipelineParallel;Hybrid;PyTorch;GoldenReference;MultiDevice"
         MPI_PROCS 1
-        RESOURCE_LOCK "PCIeBAR_P2P"
     )
 
     # =========================================================================
@@ -4516,8 +4248,8 @@ if(ZLIB_FOUND)
         ${WORKSPACE_ROOT_PARITY}/external/cnpy
         ${CMAKE_CURRENT_SOURCE_DIR}
     )
-    add_v2_test(V2_Integration_Parity_Qwen3_SingleDevice
-        COMMAND $<TARGET_FILE:v2_integration_parity_qwen3_single_device>
+    discover_v2_parity_tests(v2_integration_parity_qwen3_single_device
+        TEST_PREFIX V2_Integration_Parity_Qwen3_SingleDevice
         LABELS "V2;Integration;Parity;Qwen3;CPU;CUDA;ROCm;SingleDevice;PyTorch;GoldenReference;FullModel"
         MPI_PROCS 1
     )
@@ -4534,8 +4266,8 @@ if(ZLIB_FOUND)
         ${WORKSPACE_ROOT_PARITY}/external/cnpy
         ${CMAKE_CURRENT_SOURCE_DIR}
     )
-    add_v2_test(V2_Integration_Parity_Qwen3_SplitTQ_Analysis
-        COMMAND $<TARGET_FILE:v2_integration_parity_qwen3_splittq_analysis>
+    discover_v2_parity_tests(v2_integration_parity_qwen3_splittq_analysis
+        TEST_PREFIX V2_Integration_Parity_Qwen3_SplitTQ_Analysis
         LABELS "V2;Integration;Parity;Qwen3;CPU;TQ8;TQ4;SplitTQ;Analysis;PyTorch;GoldenReference;FullModel"
         MPI_PROCS 1
     )
@@ -4552,11 +4284,10 @@ if(ZLIB_FOUND)
         ${WORKSPACE_ROOT_PARITY}/external/cnpy
         ${CMAKE_CURRENT_SOURCE_DIR}
     )
-    add_v2_test(V2_Integration_Parity_Qwen3_NodeLocalTP
-        COMMAND $<TARGET_FILE:v2_integration_parity_qwen3_node_local_tp>
+    discover_v2_parity_tests(v2_integration_parity_qwen3_node_local_tp
+        TEST_PREFIX V2_Integration_Parity_Qwen3_NodeLocalTP
         LABELS "V2;Integration;Parity;Qwen3;NodeLocalTP;MPI;TensorParallel;UPI;CrossRank;CPU"
         MPI_PROCS 2
-        TIMEOUT 300
     )
 
     message(STATUS "V2: Qwen3 NodeLocalTP parity tests enabled (requires mpirun -np 2+)")
@@ -4582,13 +4313,13 @@ if(ZLIB_FOUND)
         ${WORKSPACE_ROOT_PARITY}/external/cnpy
         ${CMAKE_CURRENT_SOURCE_DIR}
     )
-    add_v2_test(V2_Integration_Parity_Qwen35_SingleDevice
-        COMMAND $<TARGET_FILE:v2_integration_parity_qwen35_single_device>
+    discover_v2_parity_tests(v2_integration_parity_qwen35_single_device
+        TEST_PREFIX V2_Integration_Parity_Qwen35_SingleDevice
         LABELS "V2;Integration;Parity;Qwen35;GatedDeltaNet;CPU;CUDA;ROCm;SingleDevice;PyTorch;GoldenReference;FullModel"
         MPI_PROCS 1
     )
 
-    # ---- Local Tensor Parallelism (HOST, NCCL, RCCL, PCIeBAR) ----
+    # ---- Local Tensor Parallelism (HOST, NCCL, RCCL) ----
     add_executable(v2_integration_parity_qwen35_local_tp
         integration/parity/qwen35/Test__Qwen35_LocalTP_Parity.cpp
         ${WORKSPACE_ROOT_PARITY}/external/cnpy/cnpy.cpp
@@ -4600,20 +4331,13 @@ if(ZLIB_FOUND)
         ${WORKSPACE_ROOT_PARITY}/external/cnpy
         ${CMAKE_CURRENT_SOURCE_DIR}
     )
-    if(HAVE_CUDA AND HAVE_ROCM)
-        add_custom_command(TARGET v2_integration_parity_qwen35_local_tp POST_BUILD
-            COMMAND ${CMAKE_COMMAND} -E echo "Setting CAP_SYS_ADMIN on v2_integration_parity_qwen35_local_tp for PCIe BAR P2P"
-            COMMAND sudo setcap cap_sys_admin+ep $<TARGET_FILE:v2_integration_parity_qwen35_local_tp> || true
-        )
-    endif()
-    add_v2_test(V2_Integration_Parity_Qwen35_LocalTP
-        COMMAND $<TARGET_FILE:v2_integration_parity_qwen35_local_tp>
-        LABELS "V2;Integration;Parity;Qwen35;GatedDeltaNet;CUDA;ROCm;NCCL;RCCL;PCIeBAR;LOCAL;TensorParallel;PyTorch;GoldenReference;MultiDevice"
+    discover_v2_parity_tests(v2_integration_parity_qwen35_local_tp
+        TEST_PREFIX V2_Integration_Parity_Qwen35_LocalTP
+        LABELS "V2;Integration;Parity;Qwen35;GatedDeltaNet;CUDA;ROCm;NCCL;RCCL;LOCAL;TensorParallel;PyTorch;GoldenReference;MultiDevice"
         MPI_PROCS 1
-        RESOURCE_LOCK "PCIeBAR_P2P"
     )
 
-    # ---- Local Pipeline Parallelism (HOST, NCCL, RCCL, PCIeBAR) ----
+    # ---- Local Pipeline Parallelism (HOST, NCCL, RCCL) ----
     add_executable(v2_integration_parity_qwen35_local_pp
         integration/parity/qwen35/Test__Qwen35_LocalPP_Parity.cpp
         ${WORKSPACE_ROOT_PARITY}/external/cnpy/cnpy.cpp
@@ -4625,17 +4349,10 @@ if(ZLIB_FOUND)
         ${WORKSPACE_ROOT_PARITY}/external/cnpy
         ${CMAKE_CURRENT_SOURCE_DIR}
     )
-    if(HAVE_CUDA AND HAVE_ROCM)
-        add_custom_command(TARGET v2_integration_parity_qwen35_local_pp POST_BUILD
-            COMMAND ${CMAKE_COMMAND} -E echo "Setting CAP_SYS_ADMIN on v2_integration_parity_qwen35_local_pp for PCIe BAR P2P"
-            COMMAND sudo setcap cap_sys_admin+ep $<TARGET_FILE:v2_integration_parity_qwen35_local_pp> || true
-        )
-    endif()
-    add_v2_test(V2_Integration_Parity_Qwen35_LocalPP
-        COMMAND $<TARGET_FILE:v2_integration_parity_qwen35_local_pp>
-        LABELS "V2;Integration;Parity;Qwen35;GatedDeltaNet;CPU;CUDA;ROCm;NCCL;RCCL;PCIeBAR;HOST;LOCAL;PipelineParallel;PyTorch;GoldenReference;MultiDevice"
+    discover_v2_parity_tests(v2_integration_parity_qwen35_local_pp
+        TEST_PREFIX V2_Integration_Parity_Qwen35_LocalPP
+        LABELS "V2;Integration;Parity;Qwen35;GatedDeltaNet;CPU;CUDA;ROCm;NCCL;RCCL;HOST;LOCAL;PipelineParallel;PyTorch;GoldenReference;MultiDevice"
         MPI_PROCS 1
-        RESOURCE_LOCK "PCIeBAR_P2P"
     )
 
     # =========================================================================
@@ -4722,11 +4439,10 @@ if(ZLIB_FOUND)
         ${CMAKE_CURRENT_SOURCE_DIR}
     )
 
-    add_v2_test(V2_Integration_Parity_Qwen35_NodeLocalTP
-        COMMAND $<TARGET_FILE:v2_integration_parity_qwen35_node_local_tp>
+    discover_v2_parity_tests(v2_integration_parity_qwen35_node_local_tp
+        TEST_PREFIX V2_Integration_Parity_Qwen35_NodeLocalTP
         LABELS "V2;Integration;Parity;Qwen35;GatedDeltaNet;NodeLocalTP;MPI;TensorParallel;UPI;CrossRank;CPU"
         MPI_PROCS 2
-        TIMEOUT 300
     )
 
     message(STATUS "V2: Qwen3.5 NodeLocalTP parity tests enabled (requires mpirun -np 2+)")
@@ -4735,7 +4451,7 @@ if(ZLIB_FOUND)
     # Test: Qwen2 NodeLocalTP Parity (Multi-Socket CPU TP)
     #
     # NodeLocalTP parity tests using MPI for cross-rank tensor parallelism
-    # on the same physical node. Unlike LocalTP (NCCL/RCCL/PCIeBAR),
+    # on the same physical node. Unlike LocalTP (NCCL/RCCL/HOST),
     # NodeLocalTP uses MPI collectives for CPU sockets connected via UPI.
     #
     # REQUIRES: mpirun -np 2 (or more) to run these tests
@@ -4765,12 +4481,10 @@ if(ZLIB_FOUND)
         ${CMAKE_CURRENT_SOURCE_DIR}  # For tests/v2/utils/ includes
     )
 
-    # NodeLocalTP tests require 2+ MPI ranks
-    add_v2_test(V2_Integration_Parity_NodeLocalTP
-        COMMAND $<TARGET_FILE:v2_integration_node_local_tp_parity>
+    discover_v2_parity_tests(v2_integration_node_local_tp_parity
+        TEST_PREFIX V2_Integration_Parity_NodeLocalTP
         LABELS "V2;Integration;Parity;Qwen2;NodeLocalTP;MPI;TensorParallel;UPI;CrossRank"
-        MPI_PROCS 2  # Minimum 2 ranks for NodeLocalTP
-        TIMEOUT 300  # 5 minute timeout for MPI tests
+        MPI_PROCS 2
     )
 
     message(STATUS "V2: NodeLocalTP parity tests enabled (requires mpirun -np 2+)")
@@ -5944,13 +5658,13 @@ add_v2_test(V2_Unit_LocalPPTransferStage
 )
 
 # Test: LocalTPContext Barrier Synchronization
-# Tests the NCCL-style barrier for PCIeBAR heterogeneous allreduce
+# Tests the NCCL-style barrier for host-staged heterogeneous allreduce
 # Validates that multiple device threads rendezvous before data transfer
 add_executable(v2_test_local_tp_context_barrier unit/collective/Test__LocalTPContextBarrier.cpp)
 target_link_libraries(v2_test_local_tp_context_barrier PRIVATE llaminar2_core GTest::gtest_main)
 add_v2_test(V2_Integration_LocalTPContextBarrier
     COMMAND $<TARGET_FILE:v2_test_local_tp_context_barrier>
-    LABELS "V2;Integration;LocalTP;Barrier;Synchronization;PCIeBAR;Heterogeneous;Collective"
+    LABELS "V2;Integration;LocalTP;Barrier;Synchronization;Heterogeneous;Collective"
     MPI_PROCS 1
 )
 
@@ -5962,28 +5676,6 @@ target_link_libraries(v2_test_local_tp_context_cpu_barrier PRIVATE llaminar2_cor
 add_v2_test(V2_Unit_LocalTPContext_CpuBarrier
     COMMAND $<TARGET_FILE:v2_test_local_tp_context_cpu_barrier>
     LABELS "V2;Unit;LocalTP;CpuBarrier;HOST;Allreduce;Allgather;Regression;Collective"
-    MPI_PROCS 1
-)
-
-# Test: LocalTPContext BAR-backed Tensor Management
-# Tests registration and lookup of BAR-backed tensors for zero-copy allreduce
-# Phase 2 of PCIeBAR zero-copy allreduce implementation
-add_executable(v2_test_local_tp_context_bar_management unit/collective/Test__LocalTPContext_BARManagement.cpp)
-target_link_libraries(v2_test_local_tp_context_bar_management PRIVATE llaminar2_core GTest::gtest_main)
-add_v2_test(V2_Integration_LocalTPContext_BARManagement
-    COMMAND $<TARGET_FILE:v2_test_local_tp_context_bar_management>
-    LABELS "V2;Integration;LocalTP;BARManagement;PCIeBAR;ZeroCopy;TensorTracking"
-    MPI_PROCS 1
-)
-
-# Test: LocalTPContext Zero-Copy Allreduce (executePCIeBarAllreduce)
-# Tests Phase 4 implementation: proper A+B summation (not 2A bug)
-# Validates zero-copy path with BAR-backed tensors and host staging fallback
-add_executable(v2_test_local_tp_context_zero_copy_allreduce unit/collective/Test__LocalTPContext_ZeroCopyAllreduce.cpp)
-target_link_libraries(v2_test_local_tp_context_zero_copy_allreduce PRIVATE llaminar2_core GTest::gtest_main)
-add_v2_test(V2_Integration_LocalTPContext_ZeroCopyAllreduce
-    COMMAND $<TARGET_FILE:v2_test_local_tp_context_zero_copy_allreduce>
-    LABELS "V2;Integration;LocalTP;ZeroCopyAllreduce;PCIeBAR;Allreduce;BugFix"
     MPI_PROCS 1
 )
 
@@ -6348,7 +6040,7 @@ target_link_libraries(v2_orchestration_scenario7
 )
 add_v2_test(V2_Unit_Orchestration_Scenario7_HeterogeneousPipelineCluster 
     COMMAND $<TARGET_FILE:v2_orchestration_scenario7>
-    LABELS "V2;Unit;Orchestration;Scenario;HeterogeneousPipeline;CrossVendor;IntraNode;PP;PipelineParallel;TP;TensorParallel;CUDA;ROCm;GPU;RTX3090;MI50;PCIeBAR;UPI;Infiniband;MultiNode;Qwen2;7B;72B;120B;NUMA"
+    LABELS "V2;Unit;Orchestration;Scenario;HeterogeneousPipeline;CrossVendor;IntraNode;PP;PipelineParallel;TP;TensorParallel;CUDA;ROCm;GPU;RTX3090;MI50;UPI;Infiniband;MultiNode;Qwen2;7B;72B;120B;NUMA"
     MPI_PROCS 1
 )
 
@@ -8436,6 +8128,24 @@ if(HAVE_CUDA OR HAVE_ROCM)
     message(STATUS "V2 Tests: Added CollectiveContext GPU metadata integration tests")
 endif()
 
+# --- HostBackend copy integration tests (CPU↔CPU, CUDA↔ROCm) ---
+if(HAVE_CUDA OR HAVE_ROCM)
+    add_executable(v2_integration_host_backend_copy
+        integration/collective/Test__HostBackendCopy.cpp
+    )
+    target_link_libraries(v2_integration_host_backend_copy PRIVATE
+        llaminar2_core
+        GTest::gtest
+        GTest::gtest_main
+    )
+    add_v2_test(V2_Integration_HostBackendCopy
+        COMMAND $<TARGET_FILE:v2_integration_host_backend_copy>
+        LABELS "V2;Integration;Collective;HostBackend;Copy;CrossVendor"
+        MPI_PROCS 1
+    )
+    message(STATUS "V2 Tests: Added HostBackend copy integration tests")
+endif()
+
 # =============================================================================
 # NCCLCoordinator Integration Tests
 # =============================================================================
@@ -8493,23 +8203,6 @@ if(HAVE_ROCM)
 endif()
 
 # =============================================================================
-# PCIeBARCoordinator Integration Tests
-# =============================================================================
-# Tests PCIeBARCoordinator with heterogeneous CUDA+ROCm GPU hardware.
-# Validates:
-# - CUDA-only initialization (delegates to NCCLCoordinator)
-# - ROCm-only initialization (delegates to RCCLCoordinator)
-# - Heterogeneous (CUDA+ROCm) initialization and operations
-# - Cross-vendor memory copies via host staging
-# - Hierarchical allreduce across vendors
-# - Sub-coordinator accessor validation
-#
-# Tests degrade gracefully when specific hardware is unavailable.
-
-# NOTE: PCIeBARCoordinator was removed - it was dead code never used in production.
-# Cross-vendor PCIe BAR functionality is handled by PCIeBARBackend + DirectP2PEngine.
-
-# =============================================================================
 # Backend-Coordinator Integration Tests
 # =============================================================================
 # Tests that NCCLBackend and RCCLBackend properly delegate to their respective
@@ -8553,7 +8246,7 @@ endif()
 # - Hardware detection (CUDA/ROCm device enumeration)
 # - 2-GPU CUDA LOCAL TP (NCCL backend)
 # - 2-GPU ROCm LOCAL TP (RCCL backend)
-# - Heterogeneous CUDA+ROCm LOCAL TP (PCIeBAR backend)
+# - Heterogeneous CUDA+ROCm LOCAL TP (HOST backend)
 # - Logit parity between single-device and multi-device execution
 
 if(HAVE_CUDA OR HAVE_ROCM)
@@ -8574,7 +8267,7 @@ if(HAVE_CUDA OR HAVE_ROCM)
     endif()
     add_v2_test(V2_Integration_LocalTP_MultiDevice
         COMMAND $<TARGET_FILE:v2_integration_local_tp_multi_device>
-        LABELS "V2;Integration;LocalTP;MultiDevice;MultiDeviceOrchestrator;TensorParallelism;GPU;NCCL;RCCL;PCIeBAR;CUDA;ROCm;Heterogeneous"
+        LABELS "V2;Integration;LocalTP;MultiDevice;MultiDeviceOrchestrator;TensorParallelism;GPU;NCCL;RCCL;CUDA;ROCm;Heterogeneous"
         MPI_PROCS 1  # LOCAL TP runs within a single MPI rank
     )
     message(STATUS "V2 Tests: Added LOCAL TP Multi-Device integration tests")
@@ -8605,8 +8298,7 @@ message(STATUS "V2 Tests: Added ITPContext LocalTP unit tests (CPU-only)")
 # =============================================================================
 # LOCAL TP Backend Behavior Integration Tests
 # =============================================================================
-# Tests for LocalTPContext backend auto-detection, PCIeBAR barrier synchronization,
-# and BAR-backed tensor management. Migrated from unit tests that require real hardware.
+# Tests for LocalTPContext backend auto-detection, barrier synchronization,\n# and tensor management. Migrated from unit tests that require real hardware.
 
 if(HAVE_CUDA OR HAVE_ROCM)
     add_executable(v2_integration_local_tp_backend_behavior
@@ -8626,36 +8318,10 @@ if(HAVE_CUDA OR HAVE_ROCM)
     endif()
     add_v2_test(V2_Integration_LocalTP_BackendBehavior
         COMMAND $<TARGET_FILE:v2_integration_local_tp_backend_behavior>
-        LABELS "V2;Integration;LocalTP;BackendBehavior;AutoDetection;PCIeBAR;Barrier;BARManagement;CUDA;ROCm;Heterogeneous"
+        LABELS "V2;Integration;LocalTP;BackendBehavior;AutoDetection;Barrier;BARManagement;CUDA;ROCm;Heterogeneous"
         MPI_PROCS 1  # LOCAL TP runs within a single MPI rank
     )
     message(STATUS "V2 Tests: Added LOCAL TP Backend Behavior integration tests")
-endif()
-
-# =============================================================================
-# PCIeBAR CUDA Event Lifecycle Test
-# =============================================================================
-# Minimal test to reproduce CUDA event "context is destroyed" (error 709)
-# when events created on main thread are queried from PCIeBAR worker thread.
-
-if(HAVE_CUDA AND HAVE_ROCM)
-    add_executable(v2_integration_pciebar_cuda_event_lifecycle
-        integration/collective/backends/Test__PCIeBAR_CUDA_EventLifecycle.cpp
-    )
-    target_link_libraries(v2_integration_pciebar_cuda_event_lifecycle PRIVATE
-        llaminar2_core
-        GTest::gtest
-        GTest::gtest_main
-        CUDA::cudart
-        CUDA::cuda_driver
-        hip::host
-    )
-    add_v2_test(V2_Integration_PCIeBAR_CUDA_EventLifecycle
-        COMMAND $<TARGET_FILE:v2_integration_pciebar_cuda_event_lifecycle>
-        LABELS "V2;Integration;PCIeBAR;CUDA;ROCm;EventHandling;Heterogeneous"
-        MPI_PROCS 1
-    )
-    message(STATUS "V2 Tests: Added PCIeBAR CUDA event lifecycle tests")
 endif()
 
 # =============================================================================
@@ -8797,64 +8463,21 @@ add_v2_test(V2_Integration_PPStageRunner
 message(STATUS "V2 Tests: Added PPStageRunner integration tests")
 
 # =============================================================================
-# Performance: CUDA Vector Add Kernels (used by PCIeBAR reductions)
+# Performance: CUDA Vector Add Kernels (used by host-staged reductions)
 # =============================================================================
 # Benchmarks the in-place vector addition kernels that perform GPU-side reductions
-# during PCIeBAR allreduce operations. Tests realistic sizes (hidden_size, intermediate_size,
+# during host-staged allreduce operations. Tests realistic sizes (hidden_size, intermediate_size,
 # vocab_size) and measures throughput (GB/s), latency, and kernel launch overhead.
 if(HAVE_CUDA)
 add_executable(v2_perf_cuda_vector_add performance/kernels/cuda/ops/Perf__CUDAVectorAddKernels.cpp)
 target_link_libraries(v2_perf_cuda_vector_add llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Perf_CUDAVectorAddKernels
     COMMAND $<TARGET_FILE:v2_perf_cuda_vector_add>
-    LABELS "V2;Performance;CUDA;Kernels;VectorAdd;PCIeBAR;Allreduce;Throughput;Latency"
+    LABELS "V2;Performance;CUDA;Kernels;VectorAdd;Allreduce;Throughput;Latency"
     MPI_PROCS 1
 )
 message(STATUS "V2 Tests: Added CUDA Vector Add kernel performance benchmarks")
 endif()
-
-# Performance: PCIeBAR Pipelined Allreduce
-# =============================================================================
-# Benchmarks the triple-buffered pipelined allreduce that overlaps BAR transfers
-# with CUDA compute. Compares throughput at various buffer sizes.
-if(HAVE_CUDA AND HAVE_ROCM)
-add_executable(v2_perf_pciebar_pipelined performance/collective/Perf__PCIeBARPipelinedAllreduce.cpp)
-target_link_libraries(v2_perf_pciebar_pipelined llaminar2_core GTest::gtest GTest::gtest_main)
-add_v2_test(V2_Perf_PCIeBARPipelinedAllreduce
-    COMMAND $<TARGET_FILE:v2_perf_pciebar_pipelined>
-    LABELS "V2;Performance;CUDA;ROCm;PCIeBAR;Allreduce;Pipelined;Throughput;CrossVendor"
-    MPI_PROCS 1
-)
-message(STATUS "V2 Tests: Added PCIeBAR pipelined allreduce performance benchmarks")
-
-# Performance: 3-Backend AllReduce Latency Comparison
-# =============================================================================
-# Side-by-side allreduce latency comparison across NCCL, RCCL, and PCIeBAR
-# backends via ICollectiveBackend abstractions. Tests the full Llaminar code
-# path for each backend at various message sizes (256B to 8.5MB).
-add_executable(v2_perf_allreduce_3backend performance/collective/Perf__AllreduceLatency_3Backend.cpp)
-target_link_libraries(v2_perf_allreduce_3backend llaminar2_core GTest::gtest GTest::gtest_main)
-add_v2_test(V2_Perf_AllreduceLatency_3Backend
-    COMMAND $<TARGET_FILE:v2_perf_allreduce_3backend>
-    LABELS "V2;Performance;CUDA;ROCm;NCCL;RCCL;PCIeBAR;Allreduce;Latency;CrossVendor;Benchmark"
-    MPI_PROCS 1
-    TIMEOUT 600
-)
-message(STATUS "V2 Tests: Added 3-backend allreduce latency comparison benchmarks")
-
-# Performance: HeterogeneousBackend Pipeline Benchmark
-# =============================================================================
-# Benchmarks the double-buffered pipeline optimization for singleton configs
-# (1 CUDA + N ROCm or N CUDA + 1 ROCm). Compares pipelined vs non-pipelined
-# partial reduce-scatter at various tensor sizes (8MB, 32MB, 128MB, 512MB).
-add_executable(v2_perf_heterogeneous_pipeline performance/collective/Test__HeterogeneousBackend_PipelineBenchmark.cpp)
-target_link_libraries(v2_perf_heterogeneous_pipeline llaminar2_core GTest::gtest GTest::gtest_main)
-add_v2_test(V2_Perf_HeterogeneousBackend_Pipeline
-    COMMAND $<TARGET_FILE:v2_perf_heterogeneous_pipeline>
-    LABELS "V2;Performance;CUDA;ROCm;Heterogeneous;Allreduce;Pipelined;Throughput;CrossVendor;Singleton"
-    MPI_PROCS 1
-)
-message(STATUS "V2 Tests: Added HeterogeneousBackend pipeline performance benchmarks")
 
 # =============================================================================
 # Global Pipeline Parallelism (Global PP) Tests
@@ -8907,7 +8530,7 @@ message(STATUS "V2 Tests: Added ParallelismTree unit tests")
 
 # Test: TransferSpec
 # Unit tests for transfer mechanism derivation between adjacent PP stages:
-# - LOCAL_PP: Same-rank transfer (NCCL/PCIeBAR/host-staged)
+# - LOCAL_PP: Same-rank transfer (NCCL/HOST)
 # - MPI_INTRAHOST: Cross-rank on same machine
 # - MPI_INTERHOST: Cross-rank on different machines
 # - Tag assignment and rank selection
@@ -9746,5 +9369,3 @@ add_v2_test(V2_Unit_VocabParallelEmbeddingSharding
     LABELS "V2;Unit;Loaders;WeightSharding;Embedding;VocabParallel;TensorParallelism"
     MPI_PROCS 1
 )
-
-endif()

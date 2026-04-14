@@ -116,13 +116,13 @@ namespace llaminar2
         _Float16 *d_K, int count,
         int n_kv_heads, int head_dim,
         float rope_theta, int position_start,
-        hipStream_t stream);
+        hipStream_t stream, int rope_dim = 0);
 
     extern "C" bool hip_rope_apply_fp32(
         float *d_K, int count,
         int n_kv_heads, int head_dim,
         float rope_theta, int position_start,
-        hipStream_t stream);
+        hipStream_t stream, int rope_dim = 0);
 
     // =========================================================================
     // RoPE Frequency Precomputation

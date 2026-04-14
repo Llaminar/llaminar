@@ -33,7 +33,7 @@ constexpr int DEFAULT_WORLD_SIZE = 4;
 
 TEST(Test__ParallelismTreeParser, ParseYAML_SimpleTPOnly)
 {
-    const char* yaml = R"(
+    const char *yaml = R"(
 topology:
   type: tp
   name: gpu_tp
@@ -45,13 +45,14 @@ topology:
     ASSERT_TRUE(result.success()) << result.errorString();
     ASSERT_TRUE(result.tree.has_value());
 
-    const auto& tree = *result.tree;
+    const auto &tree = *result.tree;
     EXPECT_EQ(tree.root.type, ParallelismNodeType::TENSOR_PARALLEL);
     EXPECT_EQ(tree.root.name, "gpu_tp");
     EXPECT_EQ(tree.root.children.size(), 2);
 
     // All children should be DEVICE nodes
-    for (const auto& child : tree.root.children) {
+    for (const auto &child : tree.root.children)
+    {
         EXPECT_EQ(child.type, ParallelismNodeType::DEVICE);
         EXPECT_EQ(child.owning_rank, 0);
     }
@@ -63,7 +64,7 @@ topology:
 
 TEST(Test__ParallelismTreeParser, ParseYAML_SimplePPTP)
 {
-    const char* yaml = R"(
+    const char *yaml = R"(
 topology:
   type: pp
   name: global
@@ -82,20 +83,20 @@ topology:
     ASSERT_TRUE(result.success()) << result.errorString();
     ASSERT_TRUE(result.tree.has_value());
 
-    const auto& tree = *result.tree;
+    const auto &tree = *result.tree;
     EXPECT_EQ(tree.root.type, ParallelismNodeType::PIPELINE_PARALLEL);
     EXPECT_EQ(tree.root.name, "global");
     EXPECT_EQ(tree.root.children.size(), 2);
 
     // First TP node
-    const auto& tp0 = tree.root.children[0];
+    const auto &tp0 = tree.root.children[0];
     EXPECT_EQ(tp0.type, ParallelismNodeType::TENSOR_PARALLEL);
     EXPECT_EQ(tp0.name, "socket0_tp");
     EXPECT_EQ(tp0.owning_rank, 0);
     EXPECT_EQ(tp0.children.size(), 2);
 
     // Second TP node
-    const auto& tp1 = tree.root.children[1];
+    const auto &tp1 = tree.root.children[1];
     EXPECT_EQ(tp1.type, ParallelismNodeType::TENSOR_PARALLEL);
     EXPECT_EQ(tp1.name, "socket1_tp");
     EXPECT_EQ(tp1.owning_rank, 1);
@@ -110,7 +111,7 @@ topology:
 
 TEST(Test__ParallelismTreeParser, ParseYAML_NestedPPTPPP)
 {
-    const char* yaml = R"(
+    const char *yaml = R"(
 topology:
   type: pp
   name: global
@@ -143,12 +144,12 @@ topology:
     ASSERT_TRUE(result.success()) << result.errorString();
     ASSERT_TRUE(result.tree.has_value());
 
-    const auto& tree = *result.tree;
+    const auto &tree = *result.tree;
     EXPECT_EQ(tree.root.type, ParallelismNodeType::PIPELINE_PARALLEL);
     EXPECT_EQ(tree.root.children.size(), 2);
 
     // Host0 (nested PP)
-    const auto& host0 = tree.root.children[0];
+    const auto &host0 = tree.root.children[0];
     EXPECT_EQ(host0.type, ParallelismNodeType::PIPELINE_PARALLEL);
     EXPECT_EQ(host0.name, "host0");
     EXPECT_EQ(host0.children.size(), 2);
@@ -160,7 +161,7 @@ topology:
 
 TEST(Test__ParallelismTreeParser, ParseYAML_WithBackends)
 {
-    const char* yaml = R"(
+    const char *yaml = R"(
 topology:
   type: pp
   name: global
@@ -181,14 +182,14 @@ topology:
     ASSERT_TRUE(result.success()) << result.errorString();
     ASSERT_TRUE(result.tree.has_value());
 
-    const auto& tree = *result.tree;
+    const auto &tree = *result.tree;
     EXPECT_EQ(tree.root.children[0].backend, CollectiveBackendType::NCCL);
     EXPECT_EQ(tree.root.children[1].backend, CollectiveBackendType::RCCL);
 }
 
 TEST(Test__ParallelismTreeParser, ParseYAML_WithWeights)
 {
-    const char* yaml = R"(
+    const char *yaml = R"(
 topology:
   type: pp
   name: global
@@ -208,8 +209,8 @@ topology:
     ASSERT_TRUE(result.success()) << result.errorString();
     ASSERT_TRUE(result.tree.has_value());
 
-    const auto& tree = *result.tree;
-    const auto& tp0 = tree.root.children[0];
+    const auto &tree = *result.tree;
+    const auto &tp0 = tree.root.children[0];
     ASSERT_EQ(tp0.tp_weights.size(), 2);
     EXPECT_FLOAT_EQ(tp0.tp_weights[0], 0.6f);
     EXPECT_FLOAT_EQ(tp0.tp_weights[1], 0.4f);
@@ -217,7 +218,7 @@ topology:
 
 TEST(Test__ParallelismTreeParser, ParseYAML_DeviceLeaf)
 {
-    const char* yaml = R"(
+    const char *yaml = R"(
 topology:
   type: device
   name: single_gpu
@@ -229,7 +230,7 @@ topology:
     ASSERT_TRUE(result.success()) << result.errorString();
     ASSERT_TRUE(result.tree.has_value());
 
-    const auto& tree = *result.tree;
+    const auto &tree = *result.tree;
     EXPECT_EQ(tree.root.type, ParallelismNodeType::DEVICE);
     EXPECT_EQ(tree.root.name, "single_gpu");
     EXPECT_EQ(tree.root.device.device_type, DeviceType::CUDA);
@@ -238,12 +239,12 @@ topology:
 
 TEST(Test__ParallelismTreeParser, ParseYAML_MixedVendorTP)
 {
-    const char* yaml = R"(
+    const char *yaml = R"(
 topology:
   type: tp
   name: mixed_gpu
   rank: 0
-  backend: pcie_bar
+  backend: heterogeneous
   devices: [cuda:0, rocm:0]
 )";
 
@@ -251,8 +252,8 @@ topology:
     ASSERT_TRUE(result.success()) << result.errorString();
     ASSERT_TRUE(result.tree.has_value());
 
-    const auto& tree = *result.tree;
-    EXPECT_EQ(tree.root.backend, CollectiveBackendType::PCIE_BAR);
+    const auto &tree = *result.tree;
+    EXPECT_EQ(tree.root.backend, CollectiveBackendType::HETEROGENEOUS);
     EXPECT_TRUE(tree.root.isMixedVendor());
 
     auto device_types = tree.root.leafDeviceTypes();
@@ -262,7 +263,7 @@ topology:
 
 TEST(Test__ParallelismTreeParser, ParseYAML_ErrorMissingType)
 {
-    const char* yaml = R"(
+    const char *yaml = R"(
 topology:
   name: no_type
   devices: [cuda:0, cuda:1]
@@ -276,7 +277,7 @@ topology:
 
 TEST(Test__ParallelismTreeParser, ParseYAML_ErrorInvalidType)
 {
-    const char* yaml = R"(
+    const char *yaml = R"(
 topology:
   type: unknown_type
   name: bad
@@ -290,7 +291,7 @@ topology:
 
 TEST(Test__ParallelismTreeParser, ParseYAML_ErrorMissingDevices)
 {
-    const char* yaml = R"(
+    const char *yaml = R"(
 topology:
   type: tp
   name: empty_tp
@@ -304,7 +305,7 @@ topology:
 
 TEST(Test__ParallelismTreeParser, ParseYAML_ErrorInvalidDevice)
 {
-    const char* yaml = R"(
+    const char *yaml = R"(
 topology:
   type: tp
   name: bad_tp
@@ -331,7 +332,7 @@ TEST(Test__ParallelismTreeParser, ParseCLI_SimpleTP)
     ASSERT_TRUE(result.success()) << result.errorString();
     ASSERT_TRUE(result.tree.has_value());
 
-    const auto& tree = *result.tree;
+    const auto &tree = *result.tree;
     EXPECT_EQ(tree.root.type, ParallelismNodeType::TENSOR_PARALLEL);
     EXPECT_EQ(tree.root.name, "tp0");
     EXPECT_EQ(tree.root.children.size(), 2);
@@ -346,7 +347,7 @@ TEST(Test__ParallelismTreeParser, ParseCLI_SimplePP)
     ASSERT_TRUE(result.success()) << result.errorString();
     ASSERT_TRUE(result.tree.has_value());
 
-    const auto& tree = *result.tree;
+    const auto &tree = *result.tree;
     EXPECT_EQ(tree.root.type, ParallelismNodeType::PIPELINE_PARALLEL);
     EXPECT_EQ(tree.root.name, "global");
     EXPECT_EQ(tree.root.children.size(), 2);
@@ -364,7 +365,7 @@ TEST(Test__ParallelismTreeParser, ParseCLI_NestedPP)
     ASSERT_TRUE(result.success()) << result.errorString();
     ASSERT_TRUE(result.tree.has_value());
 
-    const auto& tree = *result.tree;
+    const auto &tree = *result.tree;
     EXPECT_EQ(tree.root.type, ParallelismNodeType::PIPELINE_PARALLEL);
     EXPECT_EQ(tree.root.children.size(), 2);
     EXPECT_EQ(tree.root.children[0].type, ParallelismNodeType::PIPELINE_PARALLEL);
@@ -380,7 +381,7 @@ TEST(Test__ParallelismTreeParser, ParseCLI_WithOptions)
     ASSERT_TRUE(result.success()) << result.errorString();
     ASSERT_TRUE(result.tree.has_value());
 
-    const auto& tree = *result.tree;
+    const auto &tree = *result.tree;
     EXPECT_EQ(tree.root.owning_rank, 2);
     EXPECT_EQ(tree.root.backend, CollectiveBackendType::NCCL);
 }
@@ -411,7 +412,7 @@ TEST(Test__ParallelismTreeParser, ParseCLI_ErrorEmptyTP)
 
 TEST(Test__ParallelismTreeParser, ToYAMLRoundTrip_Simple)
 {
-    const char* original_yaml = R"(
+    const char *original_yaml = R"(
 topology:
   type: tp
   name: gpu_tp
@@ -438,7 +439,7 @@ topology:
 
 TEST(Test__ParallelismTreeParser, ToYAMLRoundTrip_Complex)
 {
-    const char* original_yaml = R"(
+    const char *original_yaml = R"(
 topology:
   type: pp
   name: global
@@ -471,7 +472,8 @@ topology:
 
     // Parse serialized
     auto result2 = ParallelismTreeParser::parseYAML(serialized, DEFAULT_TOTAL_LAYERS, DEFAULT_WORLD_SIZE);
-    ASSERT_TRUE(result2.success()) << "Serialized YAML:\n" << serialized << "\nError: " << result2.errorString();
+    ASSERT_TRUE(result2.success()) << "Serialized YAML:\n"
+                                   << serialized << "\nError: " << result2.errorString();
 
     // Compare structure
     EXPECT_EQ(result1.tree->root.type, result2.tree->root.type);
@@ -535,7 +537,7 @@ TEST(Test__ParallelismTreeParser, ParseCLI_EmptyContent)
 
 TEST(Test__ParallelismTreeParser, ParseYAML_MissingTopologyKey)
 {
-    const char* yaml = R"(
+    const char *yaml = R"(
 other_key:
   type: tp
   name: no_topology_key

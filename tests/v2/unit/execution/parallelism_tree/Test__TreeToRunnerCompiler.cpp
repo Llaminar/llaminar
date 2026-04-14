@@ -206,9 +206,9 @@ static ParallelismTree buildCrossRankPP()
 static ParallelismTree buildPPWithTP()
 {
     auto root = PP("global", {
-        TP("tp_r0", {GlobalDeviceAddress::cuda(0), GlobalDeviceAddress::cuda(1)}, 0, CollectiveBackendType::NCCL),
-        TP("tp_r1", {GlobalDeviceAddress::cuda(0), GlobalDeviceAddress::cuda(1)}, 1, CollectiveBackendType::NCCL),
-    });
+                                 TP("tp_r0", {GlobalDeviceAddress::cuda(0), GlobalDeviceAddress::cuda(1)}, 0, CollectiveBackendType::NCCL),
+                                 TP("tp_r1", {GlobalDeviceAddress::cuda(0), GlobalDeviceAddress::cuda(1)}, 1, CollectiveBackendType::NCCL),
+                             });
 
     ParallelismTree tree;
     tree.root = std::move(root);
@@ -379,8 +379,9 @@ TEST(Test__TreeToRunnerCompiler, CompileLocalPP)
     auto runner = TreeToRunnerCompiler::compile(tree, ctx);
 
     ASSERT_NE(runner, nullptr);
-    // Should create 2 device runners + 1 PP runner
-    EXPECT_EQ(created.size(), 3);
+    // Should create 1 PP runner only (children are NOT pre-compiled
+    // when a factory is provided — the factory creates its own runners)
+    EXPECT_EQ(created.size(), 1);
 
     // Verify PP wrapper was created
     auto *mock = dynamic_cast<MockInferenceRunner *>(runner.get());

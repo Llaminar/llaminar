@@ -144,15 +144,17 @@ namespace llaminar2
      * @param n_kv_heads     Number of KV heads
      * @param rope_theta     RoPE frequency base
      * @param position_start Starting position index
+     * @param rope_dim       Number of dimensions to rotate per head (0 = full head_dim)
      */
     inline void apply_rope_to_k_fp32(
         float *k_fp32,
         int seq_len, int head_dim, int n_kv_heads,
-        float rope_theta, int position_start)
+        float rope_theta, int position_start, int rope_dim = 0)
     {
+        const int effective_rope_dim = (rope_dim > 0) ? rope_dim : head_dim;
         const int kv_dim = n_kv_heads * head_dim;
-        const int half_dim = head_dim / 2;
-        const auto &inv_freq = primitives::get_inv_freq_cached(head_dim, rope_theta);
+        const int half_dim = effective_rope_dim / 2;
+        const auto &inv_freq = primitives::get_inv_freq_cached(effective_rope_dim, rope_theta);
 
         auto work = [&]()
         {
@@ -175,7 +177,7 @@ namespace llaminar2
                 for (int h = 0; h < n_kv_heads; ++h)
                 {
                     apply_rope_to_head_inline(k_row + h * head_dim,
-                                              cos_buf, sin_buf, head_dim);
+                                              cos_buf, sin_buf, effective_rope_dim);
                 }
             }
         };

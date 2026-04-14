@@ -5,7 +5,7 @@
  * **Hardware Configuration** (from conversation):
  * - 2 physical nodes connected via InfiniBand (400 Gbps)
  * - 4 MPI ranks (2 per node, 1 per socket)
- * - Each rank has 1× RTX 3090 (CUDA) + 1× MI50 (ROCm) = cross-vendor TP via PCIeBAR
+ * - Each rank has 1× RTX 3090 (CUDA) + 1× MI50 (ROCm) = cross-vendor TP via HETEROGENEOUS backend
  * - 2 CPU sockets per node, connected via UPI for CPU TP
  *
  * **GPU Summary**:
@@ -14,8 +14,8 @@
  * - Total: 8 GPUs, 160 GB VRAM
  *
  * **Domain Structure (per node)**:
- * - GPU_TP_0: 3090_0 + MI50_0 on Rank 0 (PCIeBAR, NUMA 0)
- * - GPU_TP_1: 3090_1 + MI50_1 on Rank 1 (PCIeBAR, NUMA 1)
+ * - GPU_TP_0: 3090_0 + MI50_0 on Rank 0 (HETEROGENEOUS, NUMA 0)
+ * - GPU_TP_1: 3090_1 + MI50_1 on Rank 1 (HETEROGENEOUS, NUMA 1)
  * - CPU_TP: CPU0 + CPU1 across Ranks 0+1 (MPI/UPI, NUMA 0+1)
  *
  * **Intra-Node Pipeline** (3 stages):
@@ -87,7 +87,7 @@ protected:
      * orchestrator should conclude:
      *
      * - PP = 2 (one stage per physical node, connected via InfiniBand)
-     * - GPU TP = 2 (both GPUs per rank: 3090 + MI50 via PCIeBAR)
+     * - GPU TP = 2 (both GPUs per rank: 3090 + MI50 via HETEROGENEOUS backend)
      * - CPU TP = 2 (both ranks per node: CPU0 + CPU1 via UPI)
      * - 4 GPU domains (1 per rank × 4 ranks)
      * - 2 CPU domains (1 per node × 2 nodes)
@@ -113,7 +113,7 @@ protected:
         expected.domains_per_pp_stage = 3; // 2 GPU + 1 CPU per node
 
         // Domain types
-        expected.gpu_domains_are_intra_rank = true; // PCIeBAR (same rank)
+        expected.gpu_domains_are_intra_rank = true; // HETEROGENEOUS (same rank)
         expected.cpu_domains_are_cross_rank = true; // MPI over UPI (2 ranks)
 
         // Layer distribution

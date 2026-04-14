@@ -3,7 +3,7 @@
  * @brief All-reduce stage for tensor parallelism (LOCAL and GLOBAL)
  *
  * Performs all-reduce across devices within a TP context, supporting both:
- * - LOCAL TP: Intra-rank device all-reduce (NCCL/RCCL/PCIeBAR)
+ * - LOCAL TP: Intra-rank device all-reduce (NCCL/RCCL/HOST)
  * - GLOBAL TP: Cross-rank MPI all-reduce (UPI/MPI backends)
  *
  * This stage uses ITPContext to abstract over both LOCAL and GLOBAL contexts,
@@ -38,7 +38,7 @@ namespace llaminar2
         ITPContext *tp_ctx = nullptr;             ///< TP context (LOCAL or GLOBAL, required)
         TensorBase *tensor = nullptr;             ///< Tensor to all-reduce (in-place)
         size_t count = 0;                         ///< Elements to reduce (0 = use tensor->numel())
-        std::string stage_name;                   ///< Stage identifier for BAR-backed tensor lookup (optional)
+        std::string stage_name;                   ///< Stage identifier for registered tensor lookup (optional)
         std::string precision;                    ///< Allreduce precision override ("fp32", "fp16", "bf16", "" = use global default)
         std::optional<BufferId> tensor_buffer_id; ///< Arena BufferId for the in-place tensor (enables contract-based coherence)
     };
@@ -47,7 +47,7 @@ namespace llaminar2
      * @brief All-reduce stage for tensor parallelism
      *
      * Performs in-place sum reduction across all devices in the TP context.
-     * The actual backend (NCCL/RCCL/PCIeBAR for LOCAL, UPI/MPI for GLOBAL)
+     * The actual backend (NCCL/RCCL/HOST for LOCAL, UPI/MPI for GLOBAL)
      * is determined by the tp_ctx implementation.
      *
      * Thread safety: Execute must be called from appropriate device context.

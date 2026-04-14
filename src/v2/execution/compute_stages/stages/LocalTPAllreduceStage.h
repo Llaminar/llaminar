@@ -36,14 +36,14 @@ namespace llaminar2
         ILocalTPContext *tp_ctx = nullptr; ///< LOCAL TP context (required)
         TensorBase *tensor = nullptr;      ///< Tensor to all-reduce (in-place)
         size_t count = 0;                  ///< Elements to reduce (0 = use tensor->numel())
-        std::string stage_name;            ///< Stage identifier for BAR-backed tensor lookup (optional)
+        std::string stage_name;            ///< Stage identifier for registered tensor lookup (optional)
     };
 
     /**
      * @brief All-reduce stage for LOCAL tensor parallelism
      *
      * Performs in-place sum reduction across all devices in the LOCAL TP context.
-     * Uses NCCL/RCCL/PCIeBAR based on backend configuration in tp_ctx.
+     * Uses NCCL/RCCL/HOST based on backend configuration in tp_ctx.
      *
      * Thread safety: Execute must be called from appropriate device context.
      */

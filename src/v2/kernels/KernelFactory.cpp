@@ -23,9 +23,13 @@
 
 // KVCache includes
 #include "cpu/CPURingKVCache.h"
+#include "cpu/CPUHybridRingKVCache.h"
+#include "HybridKVCacheConfig.h"
+#include "IHybridKVCache.h"
 #ifdef HAVE_CUDA
 #include "cuda/kvcache/CUDARingKVCache.h"
 #include "cuda/kvcache/CUDARingKVCacheTQ.h"
+#include "cuda/kvcache/CUDAHybridRingKVCache.h"
 #endif
 
 #include "../tensors/Tensors.h"
@@ -55,18 +59,19 @@ extern "C" void cudaNativeVNNIGemvTuned_clearStaticState();
 
 // ROCm kernel classes
 #ifdef HAVE_ROCM
-#include "rocm/gemm/ROCmFloatingPointGemmKernel.h"    // FP32/FP16/BF16 via hipBLAS
-#include "rocm/gemm/ROCmQuantisedGemmKernel.h"        // Quantized tensors via CK INT8/FP16
-#include "rocm/kvcache/ROCmRingKVCacheFactory.h"      // ROCm Ring Buffer KV Cache factory
-#include "rocm/kvcache/ROCmRingKVCacheTQFactory.h"    // ROCm TurboQuant KV Cache factory
-#include "rocm/ops/ROCmEmbeddingKernelT.h"            // Embedding FP32/BF16/FP16/Q8_1
-#include "rocm/ops/ROCmRMSNormKernelT.h"              // RMSNorm FP32/BF16/FP16
-#include "rocm/ops/ROCmRoPEKernelT.h"                 // RoPE FP32
-#include "rocm/ops/ROCmSwiGLUKernelT.h"               // SwiGLU FP32
-#include "rocm/ops/ROCmResidualAddKernelT.h"          // ResidualAdd FP32
-#include "rocm/attention/ROCmFlashAttentionKernelT.h" // Flash Attention
-#include "rocm/gdn/ROCmGatedDeltaNet.h"               // GDN recurrence
-#include "rocm/gdn/ROCmShortConvolution.h"            // GDN short conv1d
+#include "rocm/gemm/ROCmFloatingPointGemmKernel.h"     // FP32/FP16/BF16 via hipBLAS
+#include "rocm/gemm/ROCmQuantisedGemmKernel.h"         // Quantized tensors via CK INT8/FP16
+#include "rocm/kvcache/ROCmRingKVCacheFactory.h"       // ROCm Ring Buffer KV Cache factory
+#include "rocm/kvcache/ROCmRingKVCacheTQFactory.h"     // ROCm TurboQuant KV Cache factory
+#include "rocm/kvcache/ROCmHybridRingKVCacheFactory.h" // ROCm Hybrid KV Cache factory
+#include "rocm/ops/ROCmEmbeddingKernelT.h"             // Embedding FP32/BF16/FP16/Q8_1
+#include "rocm/ops/ROCmRMSNormKernelT.h"               // RMSNorm FP32/BF16/FP16
+#include "rocm/ops/ROCmRoPEKernelT.h"                  // RoPE FP32
+#include "rocm/ops/ROCmSwiGLUKernelT.h"                // SwiGLU FP32
+#include "rocm/ops/ROCmResidualAddKernelT.h"           // ResidualAdd FP32
+#include "rocm/attention/ROCmFlashAttentionKernelT.h"  // Flash Attention
+#include "rocm/gdn/ROCmGatedDeltaNet.h"                // GDN recurrence
+#include "rocm/gdn/ROCmShortConvolution.h"             // GDN short conv1d
 #endif
 
 namespace llaminar
@@ -4266,6 +4271,12 @@ namespace llaminar
 
             std::unique_ptr<llaminar2::IKVCache> KernelFactory::createKVCache(const KVCacheConfig &config)
             {
+                // If hybrid config is provided, create a hybrid cache
+                if (config.is_hybrid())
+                {
+                    return createHybridKVCache(config);
+                }
+
                 if (config.device.is_cpu())
                 {
                     return createCPUKVCache(config);
@@ -4581,6 +4592,258 @@ namespace llaminar
                 }
             }
 #endif // HAVE_ROCM
+
+            // ==========================================================================
+            // Hybrid KV Cache Factory
+            // ==========================================================================
+
+            std::unique_ptr<llaminar2::IKVCache> KernelFactory::createHybridKVCache(const KVCacheConfig &config)
+            {
+                if (!config.hybrid_config)
+                {
+                    throw std::runtime_error("KernelFactory::createHybridKVCache: hybrid_config is null");
+                }
+
+                const auto &hc = *config.hybrid_config;
+                std::unique_ptr<llaminar2::IKVCache> cache;
+
+                if (config.device.is_cpu())
+                {
+                    if (!config.mpi_ctx)
+                    {
+                        throw std::runtime_error("KernelFactory::createHybridKVCache: mpi_ctx is required for CPU");
+                    }
+
+                    LOG_INFO("[KernelFactory] Creating CPU Hybrid KVCache: "
+                             << "precision=" << llaminar2::activationPrecisionToString(config.precision)
+                             << ", total_layers=" << config.num_layers
+                             << ", kv_layers=" << hc.countKVLayers()
+                             << ", n_kv_heads=" << config.n_kv_heads
+                             << ", head_dim=" << config.head_dim);
+
+                    if (config.is_sharded())
+                    {
+                        switch (config.precision)
+                        {
+                        case llaminar2::ActivationPrecision::FP32:
+                            cache = std::make_unique<llaminar2::CPUHybridRingKVCache<llaminar2::ActivationPrecision::FP32>>(
+                                hc, *config.mpi_ctx, config.num_layers, config.batch_size,
+                                config.max_seq_len, config.n_kv_heads, config.local_n_kv_heads,
+                                config.kv_head_start, config.head_dim, config.device, config.layout_mode);
+                            break;
+                        case llaminar2::ActivationPrecision::BF16:
+                            cache = std::make_unique<llaminar2::CPUHybridRingKVCache<llaminar2::ActivationPrecision::BF16>>(
+                                hc, *config.mpi_ctx, config.num_layers, config.batch_size,
+                                config.max_seq_len, config.n_kv_heads, config.local_n_kv_heads,
+                                config.kv_head_start, config.head_dim, config.device, config.layout_mode);
+                            break;
+                        case llaminar2::ActivationPrecision::FP16:
+                            cache = std::make_unique<llaminar2::CPUHybridRingKVCache<llaminar2::ActivationPrecision::FP16>>(
+                                hc, *config.mpi_ctx, config.num_layers, config.batch_size,
+                                config.max_seq_len, config.n_kv_heads, config.local_n_kv_heads,
+                                config.kv_head_start, config.head_dim, config.device, config.layout_mode);
+                            break;
+                        case llaminar2::ActivationPrecision::Q8_1:
+                            cache = std::make_unique<llaminar2::CPUHybridRingKVCache<llaminar2::ActivationPrecision::Q8_1>>(
+                                hc, *config.mpi_ctx, config.num_layers, config.batch_size,
+                                config.max_seq_len, config.n_kv_heads, config.local_n_kv_heads,
+                                config.kv_head_start, config.head_dim, config.device, config.layout_mode);
+                            break;
+                        case llaminar2::ActivationPrecision::Q16_1:
+                            cache = std::make_unique<llaminar2::CPUHybridRingKVCache<llaminar2::ActivationPrecision::Q16_1>>(
+                                hc, *config.mpi_ctx, config.num_layers, config.batch_size,
+                                config.max_seq_len, config.n_kv_heads, config.local_n_kv_heads,
+                                config.kv_head_start, config.head_dim, config.device, config.layout_mode);
+                            break;
+                        default:
+                            throw std::runtime_error("KernelFactory::createHybridKVCache: Unsupported CPU precision");
+                        }
+                    }
+                    else
+                    {
+                        switch (config.precision)
+                        {
+                        case llaminar2::ActivationPrecision::FP32:
+                            cache = std::make_unique<llaminar2::CPUHybridRingKVCacheFP32>(
+                                hc, *config.mpi_ctx, config.num_layers, config.batch_size,
+                                config.max_seq_len, config.n_kv_heads, config.head_dim,
+                                config.device, config.layout_mode);
+                            break;
+                        case llaminar2::ActivationPrecision::BF16:
+                            cache = std::make_unique<llaminar2::CPUHybridRingKVCacheBF16>(
+                                hc, *config.mpi_ctx, config.num_layers, config.batch_size,
+                                config.max_seq_len, config.n_kv_heads, config.head_dim,
+                                config.device, config.layout_mode);
+                            break;
+                        case llaminar2::ActivationPrecision::FP16:
+                            cache = std::make_unique<llaminar2::CPUHybridRingKVCacheFP16>(
+                                hc, *config.mpi_ctx, config.num_layers, config.batch_size,
+                                config.max_seq_len, config.n_kv_heads, config.head_dim,
+                                config.device, config.layout_mode);
+                            break;
+                        case llaminar2::ActivationPrecision::Q8_1:
+                            cache = std::make_unique<llaminar2::CPUHybridRingKVCacheQ8_1>(
+                                hc, *config.mpi_ctx, config.num_layers, config.batch_size,
+                                config.max_seq_len, config.n_kv_heads, config.head_dim,
+                                config.device, config.layout_mode);
+                            break;
+                        case llaminar2::ActivationPrecision::Q16_1:
+                            cache = std::make_unique<llaminar2::CPUHybridRingKVCacheQ16_1>(
+                                hc, *config.mpi_ctx, config.num_layers, config.batch_size,
+                                config.max_seq_len, config.n_kv_heads, config.head_dim,
+                                config.device, config.layout_mode);
+                            break;
+                        default:
+                            throw std::runtime_error("KernelFactory::createHybridKVCache: Unsupported CPU precision");
+                        }
+                    }
+                }
+#ifdef HAVE_CUDA
+                else if (config.device.is_cuda())
+                {
+                    const int cuda_device = config.device.cuda_ordinal();
+
+                    LOG_INFO("[KernelFactory] Creating CUDA Hybrid KVCache: "
+                             << "precision=" << llaminar2::activationPrecisionToString(config.precision)
+                             << ", device=CUDA:" << cuda_device
+                             << ", total_layers=" << config.num_layers
+                             << ", kv_layers=" << hc.countKVLayers()
+                             << ", n_kv_heads=" << config.n_kv_heads
+                             << ", head_dim=" << config.head_dim);
+
+                    if (config.is_sharded())
+                    {
+                        switch (config.precision)
+                        {
+                        case llaminar2::ActivationPrecision::FP32:
+                            cache = std::make_unique<llaminar2::CUDAHybridRingKVCacheFP32>(
+                                hc, config.num_layers, config.batch_size, config.max_seq_len,
+                                config.n_kv_heads, config.local_n_kv_heads, config.kv_head_start,
+                                config.head_dim, cuda_device);
+                            break;
+                        case llaminar2::ActivationPrecision::FP16:
+                            cache = std::make_unique<llaminar2::CUDAHybridRingKVCacheFP16>(
+                                hc, config.num_layers, config.batch_size, config.max_seq_len,
+                                config.n_kv_heads, config.local_n_kv_heads, config.kv_head_start,
+                                config.head_dim, cuda_device);
+                            break;
+                        case llaminar2::ActivationPrecision::BF16:
+                            cache = std::make_unique<llaminar2::CUDAHybridRingKVCacheBF16>(
+                                hc, config.num_layers, config.batch_size, config.max_seq_len,
+                                config.n_kv_heads, config.local_n_kv_heads, config.kv_head_start,
+                                config.head_dim, cuda_device);
+                            break;
+                        case llaminar2::ActivationPrecision::Q8_1:
+                            cache = std::make_unique<llaminar2::CUDAHybridRingKVCacheQ8_1>(
+                                hc, config.num_layers, config.batch_size, config.max_seq_len,
+                                config.n_kv_heads, config.local_n_kv_heads, config.kv_head_start,
+                                config.head_dim, cuda_device);
+                            break;
+                        default:
+                            throw std::runtime_error("KernelFactory::createHybridKVCache: Unsupported CUDA precision");
+                        }
+                    }
+                    else
+                    {
+                        switch (config.precision)
+                        {
+                        case llaminar2::ActivationPrecision::FP32:
+                            cache = std::make_unique<llaminar2::CUDAHybridRingKVCacheFP32>(
+                                hc, config.num_layers, config.batch_size, config.max_seq_len,
+                                config.n_kv_heads, config.head_dim, cuda_device);
+                            break;
+                        case llaminar2::ActivationPrecision::FP16:
+                            cache = std::make_unique<llaminar2::CUDAHybridRingKVCacheFP16>(
+                                hc, config.num_layers, config.batch_size, config.max_seq_len,
+                                config.n_kv_heads, config.head_dim, cuda_device);
+                            break;
+                        case llaminar2::ActivationPrecision::BF16:
+                            cache = std::make_unique<llaminar2::CUDAHybridRingKVCacheBF16>(
+                                hc, config.num_layers, config.batch_size, config.max_seq_len,
+                                config.n_kv_heads, config.head_dim, cuda_device);
+                            break;
+                        case llaminar2::ActivationPrecision::Q8_1:
+                            cache = std::make_unique<llaminar2::CUDAHybridRingKVCacheQ8_1>(
+                                hc, config.num_layers, config.batch_size, config.max_seq_len,
+                                config.n_kv_heads, config.head_dim, cuda_device);
+                            break;
+                        default:
+                            throw std::runtime_error("KernelFactory::createHybridKVCache: Unsupported CUDA precision");
+                        }
+                    }
+                }
+#endif // HAVE_CUDA
+#ifdef HAVE_ROCM
+                else if (config.device.is_rocm())
+                {
+                    const int rocm_device = config.device.rocm_ordinal();
+
+                    LOG_INFO("[KernelFactory] Creating ROCm Hybrid KVCache: "
+                             << "precision=" << llaminar2::activationPrecisionToString(config.precision)
+                             << ", device=ROCm:" << rocm_device
+                             << ", total_layers=" << config.num_layers
+                             << ", kv_layers=" << hc.countKVLayers()
+                             << ", n_kv_heads=" << config.n_kv_heads
+                             << ", head_dim=" << config.head_dim);
+
+                    if (config.is_sharded())
+                    {
+                        cache = llaminar2::createShardedROCmHybridRingKVCache(
+                            hc, config.precision, config.num_layers, config.batch_size,
+                            config.max_seq_len, config.n_kv_heads, config.local_n_kv_heads,
+                            config.kv_head_start, config.head_dim, rocm_device);
+                    }
+                    else
+                    {
+                        cache = llaminar2::createROCmHybridRingKVCache(
+                            hc, config.precision, config.num_layers, config.batch_size,
+                            config.max_seq_len, config.n_kv_heads, config.head_dim, rocm_device);
+                    }
+                }
+#endif // HAVE_ROCM
+                else
+                {
+                    throw std::runtime_error("KernelFactory::createHybridKVCache: Unsupported device type: " +
+                                             config.device.to_string());
+                }
+
+                // Post-creation: initialize GDN kernel instances in each GDN layer's state.
+                // This must happen after cache construction since initHybrid() only allocates
+                // host-side state buffers — kernel creation requires KernelFactory access.
+                auto *hybrid = dynamic_cast<llaminar2::IHybridKVCache *>(cache.get());
+                if (hybrid)
+                {
+                    auto dev_type = getDeviceType(config.device);
+                    int dev_ordinal = config.device.toKernelDeviceIndex();
+
+                    for (int i = 0; i < config.num_layers; ++i)
+                    {
+                        // Use global layer index for PP-aware GDN state lookup.
+                        // For PP stage 2 with first_layer_index=12, local layer 0
+                        // corresponds to global layer 12.
+                        int global_layer = i + config.first_layer_index;
+                        auto *gdn_state = hybrid->getGDNState(global_layer);
+                        if (!gdn_state)
+                            continue; // FA layer
+
+                        gdn_state->conv_kernel = createShortConvolution(dev_type, dev_ordinal);
+                        gdn_state->rec_kernel = createGatedDeltaNet(dev_type, dev_ordinal);
+
+                        // Allocate device-resident state buffers for GPU kernels
+                        // (no-op for CPU via virtual dispatch)
+                        gdn_state->conv_kernel->allocateGPUState(
+                            static_cast<int>(gdn_state->conv_state.size()));
+                        gdn_state->rec_kernel->allocateGPUState(
+                            static_cast<int>(gdn_state->recurrence_state.size()));
+                    }
+
+                    LOG_INFO("[KernelFactory] Initialized GDN kernels for "
+                             << hybrid->gdnLayerCount() << " GDN layers on "
+                             << config.device.to_string());
+                }
+
+                return cache;
+            }
 
             // ==========================================================================
             // Activation/Weight Type Compatibility

@@ -12,7 +12,7 @@ namespace llaminar2
     // ============================================================================
     //
     // Replaces the implicit boolean combination of (host_valid_, device_valid_,
-    // authoritative_device_, is_mapped_, is_bar_backed_) with a single enum that
+    // authoritative_device_, is_mapped_) with a single enum that
     // captures the VALID states a tensor can be in.
     //
     // State diagram:
@@ -58,7 +58,6 @@ namespace llaminar2
     enum class MemoryResidency : uint8_t
     {
         STANDARD,      // Normal host + GPU allocations
-        BAR_BACKED,    // PCIe BAR cross-vendor memory (3-pointer: staging, BAR mmap, CUDA ptr)
         MAPPED,        // Zero-copy mapped (host-allocated, device-visible)
         HOST_RESIDENT, // Host-only: device uploads are no-ops. Data lives on host
                        // and is consumed there (e.g., embedding tables that are
@@ -256,8 +255,6 @@ namespace llaminar2
         {
         case MemoryResidency::STANDARD:
             return "STANDARD";
-        case MemoryResidency::BAR_BACKED:
-            return "BAR_BACKED";
         case MemoryResidency::MAPPED:
             return "MAPPED";
         case MemoryResidency::HOST_RESIDENT:

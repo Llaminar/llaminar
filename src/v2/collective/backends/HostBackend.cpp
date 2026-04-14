@@ -62,16 +62,18 @@ namespace llaminar2
         if (staging_buffer_)
         {
 #ifdef HAVE_CUDA
-            if (has_cuda_)
+            if (staging_registered_cuda_)
                 host_backend_detail::cudaHostUnregisterBuffer(staging_buffer_);
 #endif
 #ifdef HAVE_ROCM
-            if (has_rocm_)
+            if (staging_registered_rocm_)
                 host_backend_detail::hipHostUnregisterBuffer(staging_buffer_);
 #endif
             std::free(staging_buffer_);
             staging_buffer_ = nullptr;
             staging_buffer_size_ = 0;
+            staging_registered_cuda_ = false;
+            staging_registered_rocm_ = false;
         }
     }
 
@@ -616,20 +618,52 @@ namespace llaminar2
         const void *src_ptr, DeviceId src_device,
         size_t bytes)
     {
-        // Only support CPU to CPU
-        if (!src_device.is_cpu() || !dst_device.is_cpu())
-        {
-            LOG_DEBUG("HostBackend::copy: Only CPU↔CPU supported, got "
-                      << src_device.toString() << " -> " << dst_device.toString());
-            return false;
-        }
-
         if (bytes == 0)
             return true;
         if (!dst_ptr || !src_ptr)
             return false;
 
-        std::memcpy(dst_ptr, src_ptr, bytes);
+        // CPU ↔ CPU: direct memcpy
+        if (src_device.is_cpu() && dst_device.is_cpu())
+        {
+            std::memcpy(dst_ptr, src_ptr, bytes);
+            return true;
+        }
+
+        // GPU → CPU
+        if (!src_device.is_cpu() && dst_device.is_cpu())
+        {
+            return copyToHost(dst_ptr, src_ptr, src_device, bytes);
+        }
+
+        // CPU → GPU
+        if (src_device.is_cpu() && !dst_device.is_cpu())
+        {
+            return copyFromHost(dst_ptr, src_ptr, dst_device, bytes);
+        }
+
+        // GPU → GPU (cross-vendor or same-vendor): stage through host
+        if (!ensureStagingBuffer(bytes))
+        {
+            LOG_ERROR("HostBackend::copy: Failed to ensure staging buffer for "
+                      << bytes << " bytes");
+            return false;
+        }
+
+        // D2H from source GPU to staging buffer
+        if (!copyToHost(staging_buffer_, src_ptr, src_device, bytes))
+        {
+            LOG_ERROR("HostBackend::copy: D2H failed from " << src_device.toString());
+            return false;
+        }
+
+        // H2D from staging buffer to destination GPU
+        if (!copyFromHost(dst_ptr, staging_buffer_, dst_device, bytes))
+        {
+            LOG_ERROR("HostBackend::copy: H2D failed to " << dst_device.toString());
+            return false;
+        }
+
         return true;
     }
 
@@ -644,7 +678,8 @@ namespace llaminar2
 
     bool HostBackend::supportsCopy(DeviceId src_device, DeviceId dst_device) const
     {
-        return src_device.is_cpu() && dst_device.is_cpu();
+        // HostBackend can copy between any device pair via host staging
+        return true;
     }
 
     // =========================================================================
@@ -681,12 +716,18 @@ namespace llaminar2
         if (staging_buffer_)
         {
 #ifdef HAVE_CUDA
-            if (has_cuda_)
+            if (staging_registered_cuda_)
+            {
                 host_backend_detail::cudaHostUnregisterBuffer(staging_buffer_);
+                staging_registered_cuda_ = false;
+            }
 #endif
 #ifdef HAVE_ROCM
-            if (has_rocm_)
+            if (staging_registered_rocm_)
+            {
                 host_backend_detail::hipHostUnregisterBuffer(staging_buffer_);
+                staging_registered_rocm_ = false;
+            }
 #endif
             std::free(staging_buffer_);
             staging_buffer_ = nullptr;
@@ -713,6 +754,10 @@ namespace llaminar2
             {
                 LOG_WARN("HostBackend: cudaHostRegister failed");
             }
+            else
+            {
+                staging_registered_cuda_ = true;
+            }
         }
 #endif
 #ifdef HAVE_ROCM
@@ -721,6 +766,10 @@ namespace llaminar2
             if (!host_backend_detail::hipHostRegisterBuffer(staging_buffer_, alloc_size))
             {
                 LOG_WARN("HostBackend: hipHostRegister failed");
+            }
+            else
+            {
+                staging_registered_rocm_ = true;
             }
         }
 #endif

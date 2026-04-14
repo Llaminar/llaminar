@@ -115,7 +115,7 @@ namespace llaminar2
          * The LOCAL TP context manages collective operations (allreduce, allgather)
          * across devices within this rank. It handles:
          * - Device synchronization
-         * - Backend selection (NCCL/RCCL/PCIeBAR/HOST)
+         * - Backend selection (NCCL/RCCL/HOST)
          * - Proportional work distribution (weights)
          *
          * @return Pointer to the LOCAL TP context (may be nullptr if device_count() == 1)

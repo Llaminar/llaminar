@@ -2477,31 +2477,8 @@ namespace llaminar2
             }
 
             // Check if tensors are on GPU
-            // IMPORTANT: For BAR-backed tensors, use rocm_data_ptr() (HIP pointer) instead of
-            // gpu_data_ptr() (which returns CUDA pointer for BAR-backed). This enables zero-copy
-            // where ROCm kernels write directly to BAR memory that CUDA can then read.
-            const float *d_input = nullptr;
-            float *d_output = nullptr;
-
-            if (A_fp32->isBARBacked() && A_fp32->rocm_data_ptr() != nullptr)
-            {
-                d_input = static_cast<const float *>(A_fp32->rocm_data_ptr());
-                LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_tensor] Using BAR rocm_data_ptr for input A: " << d_input);
-            }
-            else
-            {
-                d_input = static_cast<const float *>(A_fp32->gpu_data_ptr());
-            }
-
-            if (C_fp32->isBARBacked() && C_fp32->rocm_data_ptr() != nullptr)
-            {
-                d_output = static_cast<float *>(C_fp32->rocm_data_ptr());
-                LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_tensor] Using BAR rocm_data_ptr for output C: " << d_output);
-            }
-            else
-            {
-                d_output = static_cast<float *>(C_fp32->gpu_data_ptr());
-            }
+            const float *d_input = static_cast<const float *>(A_fp32->gpu_data_ptr());
+            float *d_output = static_cast<float *>(C_fp32->gpu_data_ptr());
 
             // Apply activation row offset (used by LMHeadStage to process only last token)
             if (activation_row_offset > 0 && d_input != nullptr)
@@ -2599,10 +2576,7 @@ namespace llaminar2
                             return false;
                         }
 
-                        if (bias->isBARBacked())
-                            d_bias = static_cast<const float *>(bias->rocm_data_ptr());
-                        else
-                            d_bias = static_cast<const float *>(bias->gpu_data_ptr());
+                        d_bias = static_cast<const float *>(bias->gpu_data_ptr());
                     }
 
                     LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_tensor] GEMV fast path M=1 N=" << n << " K=" << k
@@ -2626,8 +2600,7 @@ namespace llaminar2
                     // Fix: redirect kernel output to HBM workspace, then bulk DMA.
                     // =================================================================
                     const bool gemv_output_is_mapped = C_fp32->isMapped();
-                    const bool gemv_output_is_bar = C_fp32->isBARBacked() && C_fp32->bar_address() != nullptr;
-                    const bool gemv_output_needs_copyout = gemv_output_is_mapped || gemv_output_is_bar;
+                    const bool gemv_output_needs_copyout = gemv_output_is_mapped;
                     float *d_gemv_output = d_output;
                     if (gemv_output_needs_copyout)
                     {
@@ -2697,9 +2670,7 @@ namespace llaminar2
                                 return false;
                             }
                         }
-                        // Bulk DMA from HBM workspace to output (d_output = hip_staging_ptr for BAR-backed)
-                        // IMPORTANT: Always copy to d_output, NOT bar_address(). The allreduce
-                        // pipeline reads from hip_staging_ptr and handles the staging→BAR→CUDA transfer.
+                        // Bulk DMA from HBM workspace to output
                         if (gemv_output_needs_copyout)
                         {
                             hipMemcpyAsync(d_output, impl_->d_C_fp32,
@@ -2744,7 +2715,7 @@ namespace llaminar2
                         }
                     }
 
-                    // Bulk DMA from HBM workspace to output (d_output = hip_staging_ptr for BAR-backed)
+                    // Bulk DMA from HBM workspace to output
                     if (gemv_output_needs_copyout)
                     {
                         hipMemcpyAsync(d_output, impl_->d_C_fp32,
@@ -2772,16 +2743,8 @@ namespace llaminar2
             // The VNNI paths handle bias via rocmQuantGemm_biasAdd post-kernel.
             if (bias && use_gpu_path && force_ck)
             {
-                // Get bias device pointer - check BAR-backed status
-                const float *d_bias = nullptr;
-                if (bias->isBARBacked())
-                {
-                    d_bias = static_cast<const float *>(bias->rocm_data_ptr());
-                }
-                else
-                {
-                    d_bias = static_cast<const float *>(bias->gpu_data_ptr());
-                }
+                // Get bias device pointer
+                const float *d_bias = static_cast<const float *>(bias->gpu_data_ptr());
 
                 if (d_bias)
                 {
@@ -3132,8 +3095,7 @@ namespace llaminar2
                 // Fix: redirect scaling output to device workspace (d_C_fp32), then
                 // do a bulk hipMemcpyAsync to the mapped output.
                 const bool output_is_mapped = use_gpu_path && C_fp32->isMapped();
-                const bool output_is_bar = use_gpu_path && C_fp32->isBARBacked() && C_fp32->bar_address() != nullptr;
-                const bool output_needs_copyout = output_is_mapped || output_is_bar;
+                const bool output_needs_copyout = output_is_mapped;
                 float *d_prefill_output = (use_gpu_path && !output_needs_copyout) ? d_output : impl_->d_C_fp32;
 
                 // One-time diagnostic for mapped output redirect
@@ -3160,9 +3122,7 @@ namespace llaminar2
                         return false;
                     }
 
-                    d_prefill_bias = bias_tensor->isBARBacked()
-                                         ? static_cast<const float *>(bias_tensor->rocm_data_ptr())
-                                         : static_cast<const float *>(bias_tensor->gpu_data_ptr());
+                    d_prefill_bias = static_cast<const float *>(bias_tensor->gpu_data_ptr());
                 }
 
                 // Try native-VNNI GEMM first (halved HBM bandwidth for Q4_0/IQ4_NL)
@@ -3203,10 +3163,7 @@ namespace llaminar2
                                 }
                             }
 
-                            // Handle host/BAR output redirect after native prefill.
-                            // IMPORTANT: For BAR-backed outputs, copy to d_output (= hip_staging_ptr),
-                            // NOT bar_address(). The allreduce pipeline reads from hip_staging_ptr
-                            // and handles the staging→BAR→CUDA transfer.
+                            // Copy from workspace to output if needed.
                             if (!use_gpu_path || output_needs_copyout)
                             {
                                 const size_t nvnni_c_size = static_cast<size_t>(m) * n;
@@ -3739,16 +3696,7 @@ namespace llaminar2
                     return false;
                 }
                 // Coherence handled automatically by DeviceGraphExecutor
-                // IMPORTANT: For BAR-backed tensors, use rocm_data_ptr() (HIP pointer)
-                if (fp32_input->isBARBacked() && fp32_input->rocm_data_ptr() != nullptr)
-                {
-                    d_input = static_cast<const float *>(fp32_input->rocm_data_ptr());
-                    LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Using BAR rocm_data_ptr for input: " << d_input);
-                }
-                else
-                {
-                    d_input = static_cast<const float *>(fp32_input->gpu_data_ptr());
-                }
+                d_input = static_cast<const float *>(fp32_input->gpu_data_ptr());
                 // NOTE: Don't log fp32_input->data() here - it triggers D2H transfer!
                 LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Input GPU ptr=" << d_input);
             }
@@ -3871,7 +3819,7 @@ namespace llaminar2
             //   - M > 1 (prefill, not decode)
             //   - >= 2 projections
             //   - All projections have VNNI weights (tryPrefillNativeGemm path)
-            //   - No BAR-backed or mapped outputs (those need shared d_C_fp32)
+            //   - No mapped outputs (those need shared d_C_fp32)
             //
             // DAG: quantization (main stream)
             //        ├──> projection 0 (stream 0, scratch 0)
@@ -3900,8 +3848,7 @@ namespace llaminar2
                         concurrent_eligible = false;
                         break;
                     }
-                    if (fp32_out->isMapped() ||
-                        (fp32_out->isBARBacked() && fp32_out->bar_address() != nullptr))
+                    if (fp32_out->isMapped())
                     {
                         concurrent_eligible = false;
                         break;
@@ -3936,11 +3883,7 @@ namespace llaminar2
 
                         // Get output pointer
                         auto *fp32_output = dynamic_cast<FP32Tensor *>(proj.output);
-                        float *d_output = nullptr;
-                        if (fp32_output->isBARBacked() && fp32_output->rocm_data_ptr() != nullptr)
-                            d_output = static_cast<float *>(fp32_output->rocm_data_ptr());
-                        else
-                            d_output = static_cast<float *>(fp32_output->gpu_data_ptr());
+                        float *d_output = static_cast<float *>(fp32_output->gpu_data_ptr());
 
                         if (!d_output)
                         {
@@ -3957,10 +3900,7 @@ namespace llaminar2
                             auto *bias_fp32 = dynamic_cast<FP32Tensor *>(const_cast<TensorBase *>(proj.bias));
                             if (bias_fp32)
                             {
-                                if (bias_fp32->isBARBacked() && bias_fp32->rocm_data_ptr() != nullptr)
-                                    d_bias = static_cast<const float *>(bias_fp32->rocm_data_ptr());
-                                else
-                                    d_bias = static_cast<const float *>(bias_fp32->gpu_data_ptr());
+                                d_bias = static_cast<const float *>(bias_fp32->gpu_data_ptr());
                             }
                         }
 
@@ -4085,9 +4025,8 @@ namespace llaminar2
                         decode_concurrent_eligible = false;
                         break;
                     }
-                    // Mapped or BAR outputs use shared d_C_fp32 — cannot overlap
-                    if (fp32_out->isMapped() ||
-                        (fp32_out->isBARBacked() && fp32_out->bar_address() != nullptr))
+                    // Mapped outputs use shared d_C_fp32 — cannot overlap
+                    if (fp32_out->isMapped())
                     {
                         decode_concurrent_eligible = false;
                         break;
@@ -4118,11 +4057,7 @@ namespace llaminar2
                         const int n = proj.n;
 
                         auto *fp32_output = dynamic_cast<FP32Tensor *>(proj.output);
-                        float *d_output = nullptr;
-                        if (fp32_output->isBARBacked() && fp32_output->rocm_data_ptr() != nullptr)
-                            d_output = static_cast<float *>(fp32_output->rocm_data_ptr());
-                        else
-                            d_output = static_cast<float *>(fp32_output->gpu_data_ptr());
+                        float *d_output = static_cast<float *>(fp32_output->gpu_data_ptr());
 
                         if (!d_output)
                         {
@@ -4137,10 +4072,7 @@ namespace llaminar2
                             auto *bias_fp32 = dynamic_cast<FP32Tensor *>(const_cast<TensorBase *>(proj.bias));
                             if (bias_fp32)
                             {
-                                if (bias_fp32->isBARBacked() && bias_fp32->rocm_data_ptr() != nullptr)
-                                    d_bias = static_cast<const float *>(bias_fp32->rocm_data_ptr());
-                                else
-                                    d_bias = static_cast<const float *>(bias_fp32->gpu_data_ptr());
+                                d_bias = static_cast<const float *>(bias_fp32->gpu_data_ptr());
                             }
                         }
 
@@ -4298,17 +4230,7 @@ namespace llaminar2
                 }
 
                 // Coherence handled automatically by DeviceGraphExecutor
-                // IMPORTANT: For BAR-backed tensors, use rocm_data_ptr() (HIP staging pointer)
-                float *d_output = nullptr;
-                if (fp32_output->isBARBacked() && fp32_output->rocm_data_ptr() != nullptr)
-                {
-                    d_output = static_cast<float *>(fp32_output->rocm_data_ptr());
-                    LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Using BAR rocm_data_ptr for output: " << d_output);
-                }
-                else
-                {
-                    d_output = static_cast<float *>(fp32_output->gpu_data_ptr());
-                }
+                float *d_output = static_cast<float *>(fp32_output->gpu_data_ptr());
                 if (!d_output)
                 {
                     LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Output has no GPU data for projection " << i);
@@ -4360,15 +4282,7 @@ namespace llaminar2
 
                     if (current_dev.has_value() && current_dev.value() == target_device)
                     {
-                        if (bias_tensor->isBARBacked() && bias_tensor->rocm_data_ptr() != nullptr)
-                        {
-                            d_bias = static_cast<const float *>(bias_tensor->rocm_data_ptr());
-                            LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Using BAR rocm_data_ptr for bias: " << d_bias);
-                        }
-                        else
-                        {
-                            d_bias = static_cast<const float *>(bias_tensor->gpu_data_ptr());
-                        }
+                        d_bias = static_cast<const float *>(bias_tensor->gpu_data_ptr());
                     }
                     else if (current_dev.has_value() && current_dev->is_gpu())
                     {
@@ -4386,14 +4300,7 @@ namespace llaminar2
                             all_success = false;
                             break;
                         }
-                        if (bias_tensor->isBARBacked() && bias_tensor->rocm_data_ptr() != nullptr)
-                        {
-                            d_bias = static_cast<const float *>(bias_tensor->rocm_data_ptr());
-                        }
-                        else
-                        {
-                            d_bias = static_cast<const float *>(bias_tensor->gpu_data_ptr());
-                        }
+                        d_bias = static_cast<const float *>(bias_tensor->gpu_data_ptr());
                     }
 
                     if (!d_bias)
@@ -4439,8 +4346,7 @@ namespace llaminar2
                     if (rocm_kernel->impl_->has_native_vnni)
                     {
                         const bool output_is_mapped = fp32_output->isMapped();
-                        const bool output_is_bar = fp32_output->isBARBacked() && fp32_output->bar_address() != nullptr;
-                        const bool output_needs_copyout = output_is_mapped || output_is_bar;
+                        const bool output_needs_copyout = output_is_mapped;
                         float *d_native_output = output_needs_copyout ? impl_->d_C_fp32 : d_output;
 
                         // Activations are always pre-quantized above (Step 3)
@@ -4477,7 +4383,7 @@ namespace llaminar2
                             }
                         }
 
-                        // Copy back from workspace to d_output (= hip_staging_ptr for BAR-backed)
+                        // Copy back from workspace to d_output
                         if (output_needs_copyout)
                         {
                             const size_t output_bytes = static_cast<size_t>(m) * n * sizeof(float);
@@ -4568,8 +4474,7 @@ namespace llaminar2
                 // =========================================================================
 
                 const bool output_is_mapped = fp32_output->isMapped();
-                const bool output_is_bar = fp32_output->isBARBacked() && fp32_output->bar_address() != nullptr;
-                const bool output_needs_copyout = output_is_mapped || output_is_bar;
+                const bool output_needs_copyout = output_is_mapped;
                 float *d_prefill_output = output_needs_copyout ? impl_->d_C_fp32 : d_output;
 
                 if (rocm_kernel->tryPrefillNativeGemm(
@@ -4583,7 +4488,7 @@ namespace llaminar2
                         1.0f, 0.0f,
                         "ROCmQuantisedGemmKernel::multiply_fused_tensor"))
                 {
-                    // Copy back from workspace to d_output (= hip_staging_ptr for BAR-backed)
+                    // Copy back from workspace to d_output
                     if (output_needs_copyout)
                     {
                         const size_t output_bytes = static_cast<size_t>(m) * n * sizeof(float);

@@ -68,8 +68,8 @@ namespace llaminar2
      */
     struct CUDATurboQuantRotations
     {
-        float *d_rotations = nullptr;     ///< [n_layers * n_kv_heads * D * D] rotation matrices
-        float *d_rotations_t = nullptr;   ///< [n_layers * n_kv_heads * D * D] transposed rotations
+        float *d_rotations = nullptr;   ///< [n_layers * n_kv_heads * D * D] rotation matrices
+        float *d_rotations_t = nullptr; ///< [n_layers * n_kv_heads * D * D] transposed rotations
         int n_layers = 0;
         int n_kv_heads = 0;
         int head_dim = 0;
@@ -362,12 +362,12 @@ namespace llaminar2
      */
     struct IncrementalDequantParam
     {
-        const uint8_t *cache;     ///< TQ cache (K or V) for this layer
-        __half *output;           ///< FP16 scratch output for this layer
-        const float *rotation;    ///< Rotation Π for this layer [n_kv_heads * D * D]
-        int ring_pos;             ///< Ring buffer position of the new entry
-        int out_offset;           ///< Output offset: (count-1) * kv_dim
-        int rope_position;        ///< Position for RoPE (0 if no RoPE)
+        const uint8_t *cache;  ///< TQ cache (K or V) for this layer
+        __half *output;        ///< FP16 scratch output for this layer
+        const float *rotation; ///< Rotation Π for this layer [n_kv_heads * D * D]
+        int ring_pos;          ///< Ring buffer position of the new entry
+        int out_offset;        ///< Output offset: (count-1) * kv_dim
+        int rope_position;     ///< Position for RoPE (0 if no RoPE)
     };
 
     /**
@@ -453,12 +453,13 @@ namespace llaminar2
      * @param rope_theta   RoPE base frequency
      * @param position_start Starting position for RoPE
      * @param stream       CUDA stream
+     * @param rope_dim     Number of dimensions to rotate per head (0 = full head_dim)
      */
     extern "C" bool cuda_rope_apply_fp16(
         __half *d_K, int count,
         int n_kv_heads, int head_dim,
         float rope_theta, int position_start,
-        cudaStream_t stream);
+        cudaStream_t stream, int rope_dim = 0);
 
     /**
      * @brief Apply RoPE to FP32 K tensor on GPU (for FP32 caches).
@@ -467,6 +468,6 @@ namespace llaminar2
         float *d_K, int count,
         int n_kv_heads, int head_dim,
         float rope_theta, int position_start,
-        cudaStream_t stream);
+        cudaStream_t stream, int rope_dim = 0);
 
 } // namespace llaminar2

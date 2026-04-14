@@ -140,7 +140,7 @@ namespace llaminar2
         if (use_cached_forward)
         {
             return executeCacheHit(input, output, *active_forward_cache, host,
-                                  is_decode, start);
+                                   is_decode, start);
         }
 
         // Cache MISS path
@@ -209,8 +209,8 @@ namespace llaminar2
             forward_cache.pp_external_hidden_state &&
             forward_cache.pp_working_buffer)
         {
-            // Unified PP copy: data() handles all device/BAR coherence sync
-            // automatically (including BAR-backed D2H via staging buffer).
+            // Unified PP copy: data() handles all device coherence sync
+            // automatically (including D2H via staging buffer).
             const void *src = forward_cache.pp_external_hidden_state->data();
             void *dst = forward_cache.pp_working_buffer->mutable_data();
             std::memcpy(dst, src, forward_cache.pp_copy_bytes);

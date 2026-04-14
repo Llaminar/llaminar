@@ -39,12 +39,6 @@
 
 namespace llaminar2
 {
-    class ITensorShortConvolution;
-    class ITensorGatedDeltaNet;
-} // namespace llaminar2
-
-namespace llaminar2
-{
 
     /**
      * @brief Qwen 3.5 graph builder with GDN + FA hybrid attention
@@ -74,8 +68,8 @@ namespace llaminar2
 
         GraphSchema getSchema() const override;
 
-        /// Reset GDN conv/recurrence state between sessions
-        void resetState() override;
+        /// Reset GDN conv/recurrence state between sessions (no-op: state is in hybrid cache)
+        void resetState() override {};
 
         /// Wire GDN-specific arena buffers after base wiring
         void setArena(BufferArena *arena) override;
@@ -138,31 +132,13 @@ namespace llaminar2
             int layer_idx,
             int seq_len,
             int batch_size,
+            IKVCache *kv_cache,
             DeviceId device);
 
         /**
          * @brief Check if a layer uses GDN (vs full attention)
          */
         bool isGDNLayer(int layer_idx) const;
-
-        // =====================================================================
-        // GDN State Management
-        // =====================================================================
-
-        /// Per-layer conv state buffers [channels, kernel_size - 1]
-        /// Persistent across decode steps, initialized to zero on first use
-        std::vector<std::vector<float>> conv_states_;
-
-        /// Per-layer recurrence state buffers [n_heads, d_k, d_v]
-        /// Persistent across decode steps, initialized to zero on first use
-        std::vector<std::vector<float>> recurrence_states_;
-
-        /// Per-layer GDN kernel instances (kept alive for stages that hold raw ptrs)
-        std::vector<std::shared_ptr<ITensorShortConvolution>> conv_kernels_;
-        std::vector<std::shared_ptr<ITensorGatedDeltaNet>> rec_kernels_;
-
-        /// Initialize GDN state buffers if not already allocated
-        void ensureGDNStates();
     };
 
 } // namespace llaminar2

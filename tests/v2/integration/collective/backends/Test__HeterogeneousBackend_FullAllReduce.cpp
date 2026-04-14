@@ -4,7 +4,7 @@
  *
  * These tests require actual GPU hardware and test the complete allreduce:
  * - Phase 1: Intra-domain reduce (NCCL for CUDA, RCCL for ROCm)
- * - Phase 2: Bridge exchange via PCIeBAR
+ * - Phase 2: Bridge exchange via HOST staging
  * - Phase 3: Intra-domain broadcast
  *
  * Test naming: V2_Integration_HeterogeneousBackend_FullAllReduce_*

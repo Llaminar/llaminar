@@ -8,7 +8,7 @@
  * Key concepts:
  * - LOCAL TP: Multiple devices owned by one MPI rank (decoupled from MPI world_size)
  * - Proportional TP: Devices can have different capacities (weights)
- * - Backend selection: NCCL, RCCL, PCIeBAR, or HOST based on device types
+ * - Backend selection: NCCL, RCCL, or HOST based on device types
  *
  * Design philosophy:
  * - Extends IMultiDeviceOrchestrator (which extends IInferenceRunner)
@@ -138,11 +138,6 @@ namespace llaminar2
             /// TP backend for this stage (only used when stage_devices.size() > 1)
             CollectiveBackendType tp_backend = CollectiveBackendType::AUTO;
 
-            /// Whether hidden state output should be BAR-backed for cross-vendor PP transfer
-            /// Set true when this stage outputs to a stage with a different GPU vendor
-            /// (e.g., ROCm stage outputs to CUDA stage via PCIe BAR)
-            bool requires_bar_backed_hidden = false;
-
             /// Get the number of layers in this stage
             int numLayers() const { return last_layer - first_layer; }
 
@@ -214,12 +209,6 @@ namespace llaminar2
             /// Use mapped memory for GPU tensors (zero-copy host access)
             /// Required for correct coherence with column-parallel LM head
             bool use_mapped_memory = false;
-
-            /// Use PCIe BAR-backed memory for hidden state allocation.
-            /// Required for cross-vendor PP transfers (ROCm→CUDA).
-            /// When enabled, hidden state tensors are allocated in BAR region
-            /// so that CUDA can access them for P2P transfers.
-            bool use_bar_backed_hidden = false;
 
             // =================================================================
             // Nested TP-in-PP Configuration
@@ -302,7 +291,7 @@ namespace llaminar2
              * - TP: Copies devices, weights, backend from plan.local_tp_*
              * - PP: Sets mode=PP, builds PPStageConfig entries from
              *       plan.local_pp_devices + plan.local_pp_layer_boundaries
-             *       with cross-vendor BAR detection
+             *       with cross-vendor detection
              *
              * Runtime fields (max_seq_len, activation_precision, etc.) come
              * from plan.runtime which was pre-parsed in ExecutionPlanBuilder.

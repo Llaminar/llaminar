@@ -462,9 +462,19 @@ namespace llaminar2
                              dev.pcie.max_speed_gts * dev.pcie.max_width * ((max_gen >= 3) ? (128.0 / 130.0) : 0.8) / 8.0);
 
                     const char *type_prefix = (dev.type == ComputeBackendType::GPU_CUDA) ? "cuda" : "rocm";
-                    LOG_WARN("  ⚠ " << type_prefix << ":" << dev.device_id
-                                    << " link degraded: " << format_pcie_link(dev.pcie)
-                                    << " — capable of " << cap_buf);
+                    if (!dev.pcie.bottleneck_bdf.empty())
+                    {
+                        LOG_WARN("  ⚠ " << type_prefix << ":" << dev.device_id
+                                        << " link degraded: " << format_pcie_link(dev.pcie)
+                                        << " — capable of " << cap_buf
+                                        << " (bottleneck at upstream bridge " << dev.pcie.bottleneck_bdf << ")");
+                    }
+                    else
+                    {
+                        LOG_WARN("  ⚠ " << type_prefix << ":" << dev.device_id
+                                        << " link degraded: " << format_pcie_link(dev.pcie)
+                                        << " — capable of " << cap_buf);
+                    }
                 }
             }
         }

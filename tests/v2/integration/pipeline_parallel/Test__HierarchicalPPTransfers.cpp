@@ -7,7 +7,7 @@
  *
  * 1. Smart Source Selection (findBestSourceDevice):
  *    - When transferring FROM a heterogeneous TP domain (e.g., TP(rocm:0, cuda:0))
- *    - Prefer same-vendor source device to avoid cross-vendor PCIe BAR staging
+ *    - Prefer same-vendor source device to avoid cross-vendor HOST staging
  *    - Fall back to representative device (index 0) if no match
  *
  * 2. Broadcast to TP Domain:
@@ -138,7 +138,6 @@ namespace
         void registerBARBackedOutput(const std::string &, const GlobalDeviceAddress &, TensorBase *) override {}
         bool hasBARBackedOutputs(const std::string &) const override { return false; }
         void clearBARBackedOutputs() override {}
-        std::shared_ptr<DirectP2PEngine> getDirectP2PEngine() const override { return nullptr; }
         bool reserveTempBufferBytes(size_t) override { return true; }
 
         // ILocalTPContext - Abort

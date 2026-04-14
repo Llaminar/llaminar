@@ -400,12 +400,12 @@ namespace llaminar2::test::parity
      */
     enum class Collective
     {
-        None,    ///< No collective needed (single device)
-        HOST,    ///< Host-based collective (staging through CPU)
-        NCCL,    ///< NVIDIA NCCL (CUDA-CUDA)
-        RCCL,    ///< AMD RCCL (ROCm-ROCm)
-        PCIeBAR, ///< Cross-vendor via PCIe BAR (CUDA-ROCm)
-        MPI,     ///< MPI backend (for global TP, cross-rank)
+        None,          ///< No collective needed (single device)
+        HOST,          ///< Host-based collective (staging through CPU)
+        NCCL,          ///< NVIDIA NCCL (CUDA-CUDA)
+        RCCL,          ///< AMD RCCL (ROCm-ROCm)
+        HETEROGENEOUS, ///< Cross-vendor heterogeneous (CUDA-ROCm)
+        MPI,           ///< MPI backend (for global TP, cross-rank)
     };
 
     // =============================================================================
@@ -452,8 +452,8 @@ namespace llaminar2::test::parity
             return CollectiveBackendType::NCCL;
         case Collective::RCCL:
             return CollectiveBackendType::RCCL;
-        case Collective::PCIeBAR:
-            return CollectiveBackendType::PCIE_BAR;
+        case Collective::HETEROGENEOUS:
+            return CollectiveBackendType::HETEROGENEOUS;
         case Collective::MPI:
             return CollectiveBackendType::MPI;
         }
@@ -504,8 +504,8 @@ namespace llaminar2::test::parity
             return "NCCL";
         case Collective::RCCL:
             return "RCCL";
-        case Collective::PCIeBAR:
-            return "PCIeBAR";
+        case Collective::HETEROGENEOUS:
+            return "HETEROGENEOUS";
         case Collective::MPI:
             return "MPI";
         }
@@ -1854,7 +1854,14 @@ namespace llaminar2::test::parity
 #ifdef HAVE_ROCM
             if (auto *rocm_backend = llaminar2::getROCmBackend())
             {
-                rocm_backend->synchronize(0);
+                // Synchronize ALL ROCm devices, not just device 0.
+                // TP configs use multiple ROCm GPUs; leaving device 1+
+                // unsynchronized causes ROCm runtime corruption (null pointer
+                // in memobj map) when the next test config allocates memory.
+                for (int d = 0; d < rocm_backend->deviceCount(); ++d)
+                {
+                    rocm_backend->synchronize(d);
+                }
             }
 #endif
 

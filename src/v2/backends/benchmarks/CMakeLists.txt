@@ -39,19 +39,11 @@ if(HAVE_CUDA AND HAVE_ROCM)
         CrossVendorP2P.cpp
         CrossVendorP2P_CUDA.cu
         CrossVendorP2P_ROCm.cpp
-        # EXPERIMENTAL: Direct P2P via DMA-BUF
-        DirectP2P.cpp
-        DirectP2P_CUDA.cu
-        DirectP2P_ROCm.cpp
     )
     list(APPEND BENCHMARK_HEADERS
         CrossVendorP2P.h
         CrossVendorP2P_CUDA.h
         CrossVendorP2P_ROCm.h
-        # EXPERIMENTAL: Direct P2P via DMA-BUF
-        DirectP2P.h
-        DirectP2P_CUDA.h
-        DirectP2P_ROCm.h
     )
 endif()
 

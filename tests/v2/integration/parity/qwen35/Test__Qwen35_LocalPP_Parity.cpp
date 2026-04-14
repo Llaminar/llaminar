@@ -11,13 +11,13 @@
  *   - LocalPP_HOST_2xCPU_08B:        2x CPU via HOST backend
  *   - LocalPP_NCCL_2xCUDA_08B:       2x NVIDIA GPU via NCCL (skipped: no GPU kernels)
  *   - LocalPP_RCCL_2xROCm_08B:       2x AMD GPU via RCCL (skipped: no GPU kernels)
- *   - LocalPP_PCIeBAR_CUDA_ROCm_08B: Heterogeneous CUDA+ROCm (skipped: no GPU kernels)
+ *   - LocalPP_HOST_CUDA_ROCm_08B:    Heterogeneous CUDA+ROCm (skipped: no GPU kernels)
  *
  * Configurations (Qwen3.5-4B Q8_0):
  *   - LocalPP_HOST_2xCPU_4B:         2x CPU via HOST backend
  *   - LocalPP_NCCL_2xCUDA_4B:        2x NVIDIA GPU via NCCL (skipped: no GPU kernels)
  *   - LocalPP_RCCL_2xROCm_4B:        2x AMD GPU via RCCL (skipped: no GPU kernels)
- *   - LocalPP_PCIeBAR_CUDA_ROCm_4B:  Heterogeneous CUDA+ROCm (skipped: no GPU kernels)
+ *   - LocalPP_HOST_CUDA_ROCm_4B:     Heterogeneous CUDA+ROCm (skipped: no GPU kernels)
  *
  * @author David Sanftenberg
  * @date 2026
@@ -38,19 +38,19 @@ using namespace llaminar2::test::parity::qwen35;
 // =============================================================================
 
 static const auto kQwen35_08B_PP_Thresholds = BackendThresholds{
-    .cosine_threshold = 0.95f,
-    .decode_cosine_threshold = 0.90f,
+    .cosine_threshold = 0.96f,        // Observed min: 0.989 (RCCL), was 0.95
+    .decode_cosine_threshold = 0.95f, // Observed min: 0.983 avg decode, was 0.90
     .early_layers_count = 6,
     .min_early_layers_passed = 4,
-    .kl_threshold = 0.20f,
+    .kl_threshold = 0.06f, // Observed max: 0.017 (RCCL), was 0.20 = 12x over-relaxed
 };
 
 static const auto kQwen35_4B_PP_Thresholds = BackendThresholds{
-    .cosine_threshold = 0.95f,
-    .decode_cosine_threshold = 0.90f,
+    .cosine_threshold = 0.96f,        // Observed min: 0.990 (RCCL), was 0.95
+    .decode_cosine_threshold = 0.95f, // Observed min: 0.991 avg decode, was 0.90
     .early_layers_count = 6,
     .min_early_layers_passed = 4,
-    .kl_threshold = 0.20f,
+    .kl_threshold = 0.05f, // Observed max: 0.014 (HETERO), was 0.20 = 14x over-relaxed
 };
 
 static const std::vector<TestConfig> kLocalPPConfigs = {
@@ -94,10 +94,10 @@ static const std::vector<TestConfig> kLocalPPConfigs = {
         .kv_cache_precision = KVCachePrecision::FP16,
     },
     {
-        .name = "LocalPP_PCIeBAR_CUDA_ROCm_08B",
+        .name = "LocalPP_HETEROGENEOUS_CUDA_ROCm_08B",
         .devices = {ParityDeviceType::CUDA, ParityDeviceType::ROCm},
         .parallelism = Parallelism::LocalPP,
-        .collective = Collective::PCIeBAR,
+        .collective = Collective::HETEROGENEOUS,
         .thresholds = kQwen35_08B_PP_Thresholds,
         .model_path = "models/Qwen3.5-0.8B-Q4_0.gguf",
         .snapshot_dir = "pytorch_qwen35_snapshots",
@@ -144,10 +144,10 @@ static const std::vector<TestConfig> kLocalPPConfigs = {
         .kv_cache_precision = KVCachePrecision::FP16,
     },
     {
-        .name = "LocalPP_PCIeBAR_CUDA_ROCm_4B",
+        .name = "LocalPP_HETEROGENEOUS_CUDA_ROCm_4B",
         .devices = {ParityDeviceType::CUDA, ParityDeviceType::ROCm},
         .parallelism = Parallelism::LocalPP,
-        .collective = Collective::PCIeBAR,
+        .collective = Collective::HETEROGENEOUS,
         .thresholds = kQwen35_4B_PP_Thresholds,
         .model_path = "models/Qwen3.5-4B-Q8_0.gguf",
         .snapshot_dir = "pytorch_qwen35_4b_snapshots",

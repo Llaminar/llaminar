@@ -148,6 +148,7 @@ namespace llaminar2
             writeValue(buffer, static_cast<int32_t>(info.pcie_max_width));
             writeValue(buffer, info.pcie_max_speed_gts);
             writeValue(buffer, static_cast<uint8_t>(info.pcie_degraded ? 1 : 0));
+            writeString(buffer, info.pcie_bottleneck_bdf);
         }
 
         // Deserialize a single DeviceInfo
@@ -176,6 +177,7 @@ namespace llaminar2
             info.pcie_max_width = readValue<int32_t>(ptr, end);
             info.pcie_max_speed_gts = readValue<double>(ptr, end);
             info.pcie_degraded = (readValue<uint8_t>(ptr, end) != 0);
+            info.pcie_bottleneck_bdf = readString(ptr, end);
             return info;
         }
     } // anonymous namespace
@@ -671,6 +673,7 @@ namespace llaminar2
                     gpu_info.pcie_max_width = dev.pcie.max_width;
                     gpu_info.pcie_max_speed_gts = dev.pcie.max_speed_gts;
                     gpu_info.pcie_degraded = dev.pcie.degraded;
+                    gpu_info.pcie_bottleneck_bdf = dev.pcie.bottleneck_bdf;
                     break;
                 }
             }

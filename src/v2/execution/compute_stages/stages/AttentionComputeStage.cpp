@@ -210,6 +210,8 @@ namespace llaminar2
                         {
                             read_params.rope_theta = params_.rope_theta;
                             read_params.position_start = 0; // Cache rows are stored in position order
+                            read_params.rope_dim = static_cast<int>(
+                                params_.partial_rotary_factor * params_.head_dim);
                         }
                         read_params.n_kv_heads = params_.n_kv_heads;
                         read_params.head_dim = params_.head_dim;
@@ -287,6 +289,8 @@ namespace llaminar2
                         {
                             read_params.rope_theta = params_.rope_theta;
                             read_params.position_start = 0;
+                            read_params.rope_dim = static_cast<int>(
+                                params_.partial_rotary_factor * params_.head_dim);
                         }
                         read_params.n_kv_heads = params_.n_kv_heads;
                         read_params.head_dim = params_.head_dim;

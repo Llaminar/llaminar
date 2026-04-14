@@ -1464,7 +1464,7 @@ Legacy utilities (`StageCoherence`, `GpuCoherence`) remain available for tests a
 - `src/v2/memory/StageBufferContract.h` — Declarative I/O specification for stages
 - `src/v2/memory/BufferAccess.h` — Template-based READ/WRITE/READWRITE access modes
 - `src/v2/transfer/TransferEngine.h` — Unified data movement (replaces per-tensor `ensureOnDevice` logic)
-- `src/v2/transfer/TransferMethod.h` — Transfer strategy enum (HOST_TO_DEVICE, BAR_HOST_BOUNCE, MAPPED_NOOP, etc.)
+- `src/v2/transfer/TransferMethod.h` — Transfer strategy enum (HOST_TO_DEVICE, HOST_STAGED, MAPPED_NOOP, etc.)
 - `src/v2/tensors/CoherenceState.h` — `TensorCoherenceState` enum and transition table
 - `src/v2/execution/local_execution/coherence/StageCoherence.h` — Automatic stage boundary coherence
 - `src/v2/execution/local_execution/coherence/GpuCoherence.h` — RAII utilities for tests
@@ -1566,7 +1566,7 @@ TransferEngine::execute(method, tensor, device);
 | `HOST_TO_DEVICE` | Standard H2D upload |
 | `DEVICE_TO_HOST` | Standard D2H download |
 | `DEVICE_TO_DEVICE_SAME_BACKEND` | Same-vendor GPU transfer (peer DMA) |
-| `BAR_HOST_BOUNCE` | Cross-vendor via PCIe BAR with host staging |
+| `HOST_STAGED` | Via pinned host memory |
 | `HOST_STAGED` | Via pinned host memory |
 | `MAPPED_NOOP` | Zero-copy mapped memory (no transfer needed) |
 
@@ -1652,7 +1652,7 @@ const float* result = output->data();  // Correctly syncs GPU→host
 
 Weight sharding enables Megatron-style tensor parallelism by distributing weights across devices. Llaminar V2 supports two TP scopes:
 
-- **LOCAL TP**: Multiple devices within a single MPI rank (NCCL/RCCL/PCIe BAR)
+- **LOCAL TP**: Multiple devices within a single MPI rank (NCCL/RCCL/HOST)
 - **GLOBAL TP**: Distributed across MPI ranks (MPI collectives)
 - **HYBRID TP**: Combination of local + global
 
@@ -1661,7 +1661,7 @@ Weight sharding enables Megatron-style tensor parallelism by distributing weight
 | Scope | Use Case | Collective Backend |
 |-------|----------|--------------------|
 | `auto` | Let orchestrator decide (default) | Auto-detected |
-| `local` | Multi-GPU single machine | NCCL (CUDA), RCCL (ROCm), PCIe BAR (mixed) |
+| `local` | Multi-GPU single machine | NCCL (CUDA), RCCL (ROCm), HOST (mixed) |
 | `global` | Multi-machine distributed | MPI |
 | `hybrid` | Multi-GPU + multi-machine | Local + MPI |
 

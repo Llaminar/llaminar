@@ -45,15 +45,15 @@ using namespace llaminar2;
 static ParallelismTree build4Machine2Socket2GPU()
 {
     auto root = PP("global", {
-        PP("host0", {
-            TP("socket0", {GlobalDeviceAddress::cuda(0), GlobalDeviceAddress::cuda(1)}, 0, CollectiveBackendType::NCCL),
-            TP("socket1", {GlobalDeviceAddress::cuda(0), GlobalDeviceAddress::cuda(1)}, 1, CollectiveBackendType::NCCL),
-        }),
-        PP("host1", {
-            TP("socket2", {GlobalDeviceAddress::cuda(0), GlobalDeviceAddress::cuda(1)}, 2, CollectiveBackendType::NCCL),
-            TP("socket3", {GlobalDeviceAddress::cuda(0), GlobalDeviceAddress::cuda(1)}, 3, CollectiveBackendType::NCCL),
-        }),
-    });
+                                 PP("host0", {
+                                                 TP("socket0", {GlobalDeviceAddress::cuda(0), GlobalDeviceAddress::cuda(1)}, 0, CollectiveBackendType::NCCL),
+                                                 TP("socket1", {GlobalDeviceAddress::cuda(0), GlobalDeviceAddress::cuda(1)}, 1, CollectiveBackendType::NCCL),
+                                             }),
+                                 PP("host1", {
+                                                 TP("socket2", {GlobalDeviceAddress::cuda(0), GlobalDeviceAddress::cuda(1)}, 2, CollectiveBackendType::NCCL),
+                                                 TP("socket3", {GlobalDeviceAddress::cuda(0), GlobalDeviceAddress::cuda(1)}, 3, CollectiveBackendType::NCCL),
+                                             }),
+                             });
 
     ParallelismTree tree;
     tree.root = std::move(root);
@@ -71,9 +71,9 @@ static ParallelismTree build4Machine2Socket2GPU()
 static ParallelismTree buildSimple2RankPPTP()
 {
     auto root = PP("cross_socket", {
-        TP("socket0", {GlobalDeviceAddress::cuda(0), GlobalDeviceAddress::cuda(1)}, 0, CollectiveBackendType::NCCL),
-        TP("socket1", {GlobalDeviceAddress::rocm(0), GlobalDeviceAddress::rocm(1)}, 1, CollectiveBackendType::RCCL),
-    });
+                                       TP("socket0", {GlobalDeviceAddress::cuda(0), GlobalDeviceAddress::cuda(1)}, 0, CollectiveBackendType::NCCL),
+                                       TP("socket1", {GlobalDeviceAddress::rocm(0), GlobalDeviceAddress::rocm(1)}, 1, CollectiveBackendType::RCCL),
+                                   });
 
     ParallelismTree tree;
     tree.root = std::move(root);
@@ -82,18 +82,18 @@ static ParallelismTree buildSimple2RankPPTP()
 }
 
 /**
- * Build a mixed CUDA+ROCm TP domain using PCIeBAR backend:
+ * Build a mixed CUDA+ROCm TP domain using HETEROGENEOUS backend:
  *
- * TP(mixed_tp, rank=0, [cuda:0, rocm:0], backend=PCIE_BAR)
+ * TP(mixed_tp, rank=0, [cuda:0, rocm:0], backend=HETEROGENEOUS)
  *
  * This is the canonical mixed-vendor TP case: two GPUs from different vendors
- * on the same PCIe fabric, using BAR-mapped P2P for allreduce.
+ * on the same PCIe fabric, using host-staged allreduce.
  */
 static ParallelismTree buildMixedTPPcieBar()
 {
     auto root = TP("mixed_tp",
                    {GlobalDeviceAddress::cuda(0), GlobalDeviceAddress::rocm(0)},
-                   0, CollectiveBackendType::PCIE_BAR);
+                   0, CollectiveBackendType::HETEROGENEOUS);
 
     ParallelismTree tree;
     tree.root = std::move(root);
@@ -105,15 +105,15 @@ static ParallelismTree buildMixedTPPcieBar()
  * Build a PP topology with mixed-vendor TP on each socket:
  *
  * PP(cross_socket)
- * ├── TP(socket0, rank=0, [cuda:0, rocm:0], backend=PCIE_BAR)
- * └── TP(socket1, rank=1, [cuda:1, rocm:1], backend=PCIE_BAR)
+ * ├── TP(socket0, rank=0, [cuda:0, rocm:0], backend=HETEROGENEOUS)
+ * └── TP(socket1, rank=1, [cuda:1, rocm:1], backend=HETEROGENEOUS)
  */
 static ParallelismTree buildPPWithMixedTP()
 {
     auto root = PP("cross_socket", {
-        TP("socket0", {GlobalDeviceAddress::cuda(0), GlobalDeviceAddress::rocm(0)}, 0, CollectiveBackendType::PCIE_BAR),
-        TP("socket1", {GlobalDeviceAddress::cuda(1), GlobalDeviceAddress::rocm(1)}, 1, CollectiveBackendType::PCIE_BAR),
-    });
+                                       TP("socket0", {GlobalDeviceAddress::cuda(0), GlobalDeviceAddress::rocm(0)}, 0, CollectiveBackendType::HETEROGENEOUS),
+                                       TP("socket1", {GlobalDeviceAddress::cuda(1), GlobalDeviceAddress::rocm(1)}, 1, CollectiveBackendType::HETEROGENEOUS),
+                                   });
 
     ParallelismTree tree;
     tree.root = std::move(root);
@@ -127,7 +127,7 @@ static ParallelismTree buildPPWithMixedTP()
  * TP(hetero_tp, rank=0, [cuda:0, cuda:1, rocm:0, rocm:1], backend=HETEROGENEOUS)
  *
  * The HETEROGENEOUS backend orchestrates NCCL among CUDA devices, RCCL among
- * ROCm devices, and PCIeBAR for cross-vendor pairs.
+ * ROCm devices, and HETEROGENEOUS for cross-vendor pairs.
  */
 static ParallelismTree buildHeterogeneousTP()
 {
@@ -198,9 +198,9 @@ TEST(Test__ParallelismTree, TPNodeFromChildren)
 TEST(Test__ParallelismTree, PPNodeCreation)
 {
     auto node = PP("pipeline", {
-        Device(GlobalDeviceAddress::cuda(0), 0),
-        Device(GlobalDeviceAddress::cuda(1), 0),
-    });
+                                   Device(GlobalDeviceAddress::cuda(0), 0),
+                                   Device(GlobalDeviceAddress::cuda(1), 0),
+                               });
 
     EXPECT_EQ(node.type, ParallelismNodeType::PIPELINE_PARALLEL);
     EXPECT_EQ(node.name, "pipeline");
@@ -309,8 +309,10 @@ TEST(Test__ParallelismTree, AssignLayers4Machine48Layers)
     int emb_count = 0, lm_count = 0;
     for (auto *leaf : leaves)
     {
-        if (leaf->has_embedding) emb_count++;
-        if (leaf->has_lm_head) lm_count++;
+        if (leaf->has_embedding)
+            emb_count++;
+        if (leaf->has_lm_head)
+            lm_count++;
     }
     // All TP siblings share flags, so 2 leaves have embedding (socket0's 2 devices)
     // and 2 have lm_head (socket3's 2 devices)
@@ -322,10 +324,10 @@ TEST(Test__ParallelismTree, AssignLayersOddSplit)
 {
     // 7 layers across 3 PP children → 3, 2, 2 (extra goes to first children)
     auto root = PP("pipeline", {
-        Device(GlobalDeviceAddress::cuda(0), 0),
-        Device(GlobalDeviceAddress::cuda(1), 0),
-        Device(GlobalDeviceAddress::cuda(2), 0),
-    });
+                                   Device(GlobalDeviceAddress::cuda(0), 0),
+                                   Device(GlobalDeviceAddress::cuda(1), 0),
+                                   Device(GlobalDeviceAddress::cuda(2), 0),
+                               });
 
     ParallelismTree tree;
     tree.root = std::move(root);
@@ -333,11 +335,11 @@ TEST(Test__ParallelismTree, AssignLayersOddSplit)
     tree.assignLayers(7);
 
     EXPECT_EQ(tree.root.children[0].first_layer, 0);
-    EXPECT_EQ(tree.root.children[0].last_layer, 2);  // 3 layers
+    EXPECT_EQ(tree.root.children[0].last_layer, 2); // 3 layers
     EXPECT_EQ(tree.root.children[1].first_layer, 3);
-    EXPECT_EQ(tree.root.children[1].last_layer, 4);  // 2 layers
+    EXPECT_EQ(tree.root.children[1].last_layer, 4); // 2 layers
     EXPECT_EQ(tree.root.children[2].first_layer, 5);
-    EXPECT_EQ(tree.root.children[2].last_layer, 6);  // 2 layers
+    EXPECT_EQ(tree.root.children[2].last_layer, 6); // 2 layers
 }
 
 TEST(Test__ParallelismTree, AssignLayersSingleDevice)
@@ -565,7 +567,7 @@ TEST(Test__ParallelismTree, LeafCountNested)
     auto tree = build4Machine2Socket2GPU();
 
     EXPECT_EQ(tree.root.leafCount(), 8);
-    EXPECT_EQ(tree.root.children[0].leafCount(), 4); // host0
+    EXPECT_EQ(tree.root.children[0].leafCount(), 4);             // host0
     EXPECT_EQ(tree.root.children[0].children[0].leafCount(), 2); // socket0
 }
 
@@ -604,7 +606,7 @@ TEST(Test__ParallelismTree, ToStringContainsLayerRanges)
 }
 
 // =============================================================================
-// Test Suite: Mixed CUDA+ROCm TP (PCIeBAR / HETEROGENEOUS backends)
+// Test Suite: Mixed CUDA+ROCm TP (HETEROGENEOUS backends)
 // =============================================================================
 
 TEST(Test__ParallelismTree, MixedTPPcieBarConstruction)
@@ -613,7 +615,7 @@ TEST(Test__ParallelismTree, MixedTPPcieBarConstruction)
 
     EXPECT_EQ(tree.root.type, ParallelismNodeType::TENSOR_PARALLEL);
     EXPECT_EQ(tree.root.name, "mixed_tp");
-    EXPECT_EQ(tree.root.backend, CollectiveBackendType::PCIE_BAR);
+    EXPECT_EQ(tree.root.backend, CollectiveBackendType::HETEROGENEOUS);
     EXPECT_EQ(tree.root.children.size(), 2u);
     EXPECT_EQ(tree.root.tpDegree(), 2);
     EXPECT_EQ(tree.root.leafCount(), 2);
@@ -717,8 +719,8 @@ TEST(Test__ParallelismTree, PPWithMixedTPValidation)
     // Both sockets are mixed-vendor
     EXPECT_TRUE(s0.isMixedVendor());
     EXPECT_TRUE(s1.isMixedVendor());
-    EXPECT_EQ(s0.backend, CollectiveBackendType::PCIE_BAR);
-    EXPECT_EQ(s1.backend, CollectiveBackendType::PCIE_BAR);
+    EXPECT_EQ(s0.backend, CollectiveBackendType::HETEROGENEOUS);
+    EXPECT_EQ(s1.backend, CollectiveBackendType::HETEROGENEOUS);
 }
 
 TEST(Test__ParallelismTree, InvalidNCCLWithROCmDevice)
@@ -780,8 +782,8 @@ TEST(Test__ParallelismTree, MixedTPToStringContainsBackend)
 
     auto str = tree.toString();
 
-    EXPECT_NE(str.find("pcie_bar"), std::string::npos)
-        << "toString should show pcie_bar backend";
+    EXPECT_NE(str.find("heterogeneous"), std::string::npos)
+        << "toString should show heterogeneous backend";
     EXPECT_NE(str.find("mixed_tp"), std::string::npos);
     EXPECT_NE(str.find("cuda"), std::string::npos);
     EXPECT_NE(str.find("rocm"), std::string::npos);
@@ -802,11 +804,11 @@ TEST(Test__ParallelismTree, HeterogeneousTPToStringContainsBackend)
 TEST(Test__ParallelismTree, NestedPPWithMixedAndSameVendorTP)
 {
     // Real-world scenario: one socket has same-vendor TP (NCCL),
-    // another socket has mixed-vendor TP (PCIeBAR)
+    // another socket has mixed-vendor TP (HETEROGENEOUS)
     auto root = PP("cross_socket", {
-        TP("socket0_nccl", {GlobalDeviceAddress::cuda(0), GlobalDeviceAddress::cuda(1)}, 0, CollectiveBackendType::NCCL),
-        TP("socket1_pciebar", {GlobalDeviceAddress::cuda(2), GlobalDeviceAddress::rocm(0)}, 1, CollectiveBackendType::PCIE_BAR),
-    });
+                                       TP("socket0_nccl", {GlobalDeviceAddress::cuda(0), GlobalDeviceAddress::cuda(1)}, 0, CollectiveBackendType::NCCL),
+                                       TP("socket1_pciebar", {GlobalDeviceAddress::cuda(2), GlobalDeviceAddress::rocm(0)}, 1, CollectiveBackendType::HETEROGENEOUS),
+                                   });
 
     ParallelismTree tree;
     tree.root = std::move(root);
@@ -874,13 +876,13 @@ TEST(Test__ParallelismTree, DeepNesting3Levels)
 {
     // PP → PP → TP → DEVICE (3 levels of nesting)
     auto root = PP("global", {
-        PP("host0", {
-            TP("s0", {GlobalDeviceAddress::cuda(0), GlobalDeviceAddress::cuda(1)}, 0),
-        }),
-        PP("host1", {
-            TP("s1", {GlobalDeviceAddress::cuda(0), GlobalDeviceAddress::cuda(1)}, 1),
-        }),
-    });
+                                 PP("host0", {
+                                                 TP("s0", {GlobalDeviceAddress::cuda(0), GlobalDeviceAddress::cuda(1)}, 0),
+                                             }),
+                                 PP("host1", {
+                                                 TP("s1", {GlobalDeviceAddress::cuda(0), GlobalDeviceAddress::cuda(1)}, 1),
+                                             }),
+                             });
 
     ParallelismTree tree;
     tree.root = std::move(root);

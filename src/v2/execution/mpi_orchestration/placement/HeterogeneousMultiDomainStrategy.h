@@ -7,13 +7,13 @@
  *
  * 1. **Pipeline Parallel (PP)** across physical nodes (InfiniBand)
  * 2. **Tensor Parallel (TP)** within nodes:
- *    - GPU domains: NVIDIA↔AMD via PCIeBAR (intra-rank)
+ *    - GPU domains: NVIDIA↔AMD via HOST (intra-rank)
  *    - CPU domains: CPUs across ranks via MPI over UPI (cross-rank)
  *
  * Example 4-rank, 2-node cluster:
  *   Node 0: Ranks 0-1
- *     - GPU_TP_0 (Rank 0's GPUs, PCIeBAR) → layers 0-4
- *     - GPU_TP_1 (Rank 1's GPUs, PCIeBAR) → layers 5-9
+ *     - GPU_TP_0 (Rank 0's GPUs, HOST) → layers 0-4
+ *     - GPU_TP_1 (Rank 1's GPUs, HOST) → layers 5-9
  *     - CPU_TP (Ranks 0+1 CPUs, MPI/UPI) → layers 10-13
  *   Node 1: Ranks 2-3 (similar structure)
  *
@@ -134,7 +134,7 @@ namespace llaminar2
      *
      * - **Level 1**: Pipeline Parallel across physical nodes
      * - **Level 2**: Tensor Parallel within nodes
-     *   - GPU domains: Per-rank GPUs (PCIeBAR)
+     *   - GPU domains: Per-rank GPUs (HOST)
      *   - CPU domains: CPUs across ranks (MPI/UPI)
      *
      * Key features:

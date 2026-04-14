@@ -25,11 +25,10 @@ namespace llaminar2
      */
     struct FactoryPPStageConfig
     {
-        int first_layer = 0;                ///< First layer index this stage executes (inclusive)
-        int last_layer = 0;                 ///< Last layer index this stage executes (exclusive)
-        bool has_embedding = false;         ///< True if this stage owns the token embedding lookup
-        bool has_lm_head = false;           ///< True if this stage owns output_norm and LM head projection
-        bool use_bar_backed_hidden = false; ///< True if hidden state should use BAR-backed memory for cross-vendor PP
+        int first_layer = 0;        ///< First layer index this stage executes (inclusive)
+        int last_layer = 0;         ///< Last layer index this stage executes (exclusive)
+        bool has_embedding = false; ///< True if this stage owns the token embedding lookup
+        bool has_lm_head = false;   ///< True if this stage owns output_norm and LM head projection
 
         /**
          * @brief Validate the PP stage configuration
