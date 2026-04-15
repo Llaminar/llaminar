@@ -8,6 +8,7 @@
  */
 
 #include "ROCmRingKVCacheBase.h"
+#include "../../../backends/GPUDeviceContextPool.h"
 #include "../../../utils/Logger.h"
 #include <hip/hip_runtime.h>
 #include <cstring>
@@ -66,7 +67,10 @@ namespace llaminar2
             return;
         }
 
-        hipMemset(d_head_params_, 0, num_entries * sizeof(int));
+        hipStream_t init_stream = static_cast<hipStream_t>(
+            GPUDeviceContextPool::instance().getAMDContext(device_id_).defaultStream());
+        hipMemsetAsync(d_head_params_, 0, num_entries * sizeof(int), init_stream);
+        hipStreamSynchronize(init_stream);
         std::memset(h_head_params_, 0, num_entries * sizeof(int));
 
         LOG_DEBUG("[ROCmRingKVCacheBase] Allocated device params for graph capture: "

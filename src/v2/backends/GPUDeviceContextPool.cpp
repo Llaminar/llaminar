@@ -72,6 +72,14 @@ namespace llaminar2
 
     IWorkerGPUContext &GPUDeviceContextPool::getNvidiaContext(int device_ordinal)
     {
+#ifdef HAVE_CUDA
+        // Auto-register factory if not yet registered (same pattern as getContext(DeviceId))
+        if (!hasNvidiaSupport())
+        {
+            ensureNvidiaFactoryRegistered();
+        }
+#endif
+
         std::lock_guard<std::mutex> lock(mutex_);
 
         if (!nvidia_factory_)
@@ -110,6 +118,14 @@ namespace llaminar2
 
     IWorkerGPUContext &GPUDeviceContextPool::getAMDContext(int device_ordinal)
     {
+#ifdef HAVE_ROCM
+        // Auto-register factory if not yet registered (same pattern as getContext(DeviceId))
+        if (!hasAMDSupport())
+        {
+            ensureAMDFactoryRegistered();
+        }
+#endif
+
         std::lock_guard<std::mutex> lock(mutex_);
 
         if (!amd_factory_)

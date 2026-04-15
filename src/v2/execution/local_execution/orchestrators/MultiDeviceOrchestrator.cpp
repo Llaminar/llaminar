@@ -35,6 +35,9 @@
 #include "../../../utils/CUDAKernelProfiler.h"         // Phase propagation to worker threads
 #include "../../../utils/KVCacheProfiler.h"            // Phase propagation to worker threads
 #include "../../mpi_orchestration/RankExecutionPlan.h" // For Config::fromPlan()
+#include "../../../loaders/ISharedWeightPool.h"        // SharedWeightPool for PP mode
+#include "../../../collective/PPActivationContract.h"  // PPActivationContract for forwardPP
+#include "../../../kernels/DeviceWeightPreparer.h"     // Per-stage weight preparation for PP mode
 #include "fort.hpp"                                    // libfort for TP profiling summary table
 #include <algorithm>
 #include <future>
@@ -432,6 +435,43 @@ namespace llaminar2
 
         LOG_DEBUG("MultiDeviceOrchestrator: Created via createForTest with "
                   << device_runners_.size() << " injected device runners");
+    }
+
+    MultiDeviceOrchestrator::MultiDeviceOrchestrator(
+        std::shared_ptr<IModelContext> model_ctx,
+        std::shared_ptr<ISharedWeightPool> pool,
+        const Config &config)
+        : model_ctx_(std::move(model_ctx)),
+          shared_pool_(std::move(pool)),
+          config_(config)
+    {
+        if (!config_.validate())
+        {
+            throw std::invalid_argument("Invalid MultiDeviceOrchestrator configuration (pool ctor)");
+        }
+
+        // Initialize stage sharding map from model architecture
+        stage_sharding_map_ = SchemaFactoryRegistry::getStageShardingConfig(model_ctx_->architecture());
+
+        // Pool constructor is only for PP or TP_PP mode
+        mode_ = config_.effectiveMode();
+
+        if (mode_ == ParallelismMode::TP)
+        {
+            throw std::invalid_argument(
+                "SharedWeightPool constructor is for PP/TP_PP mode only. "
+                "Use the standard constructor for pure TP mode.");
+        }
+
+        LOG_INFO("MultiDeviceOrchestrator: Creating with SharedWeightPool, mode="
+                 << (mode_ == ParallelismMode::PP ? "PP" : "TP_PP")
+                 << ", " << config_.pp_stages.size() << " stages");
+
+        initializePPDeviceRunners();
+        initializePPContext();
+
+        LOG_INFO("MultiDeviceOrchestrator: Initialized PP mode with SharedWeightPool, "
+                 << pp_stage_runners_.size() << " stages");
     }
 
     MultiDeviceOrchestrator::~MultiDeviceOrchestrator() = default;
@@ -869,19 +909,70 @@ namespace llaminar2
 
             // =====================================================================
             // Create stage-specific ModelContext with layer-partitioned weights
-            // This only loads weights for this stage's layer range, reducing memory
+            // When SharedWeightPool is available, tensors are shared (no re-parse)
+            // Otherwise, falls back to independent GGUF re-parse per stage
             // =====================================================================
-            auto stage_ctx = ModelContext::createForPPStage(
-                model_path,
-                stage_config.first_layer,
-                stage_config.last_layer,
-                stage_config.has_embedding,
-                stage_config.has_lm_head);
+            std::shared_ptr<ModelContext> stage_ctx;
+            if (shared_pool_)
+            {
+                stage_ctx = ModelContext::createFromSharedPool(
+                    *shared_pool_,
+                    model_path,
+                    stage_config.first_layer,
+                    stage_config.last_layer,
+                    stage_config.has_embedding,
+                    stage_config.has_lm_head);
+            }
+            else
+            {
+                stage_ctx = ModelContext::createForPPStage(
+                    model_path,
+                    stage_config.first_layer,
+                    stage_config.last_layer,
+                    stage_config.has_embedding,
+                    stage_config.has_lm_head);
+            }
 
             if (!stage_ctx)
             {
                 throw std::runtime_error("Failed to create ModelContext for PP stage " +
                                          std::to_string(stage_idx));
+            }
+
+            // =====================================================================
+            // Pre-warm weight preparation via DeviceWeightPreparer
+            // When SharedWeightPool is available, creates a WeightViewSet for this
+            // stage and prepares all weights (GEMM repacking + non-GEMM device upload)
+            // on the primary device BEFORE runner creation. This ensures:
+            //   - KernelFactory's PreparedGemmHandle cache is pre-warmed
+            //   - Non-GEMM weights are already on-device
+            //   - The factory's finalizeForDevice() becomes all cache-hits
+            // =====================================================================
+            if (shared_pool_)
+            {
+                auto views = shared_pool_->createViewSet(
+                    stage_config.first_layer,
+                    stage_config.last_layer,
+                    stage_config.has_embedding,
+                    stage_config.has_lm_head);
+
+                DeviceWeightPreparer preparer;
+                auto prep_result = preparer.prepare(views, primary_device);
+
+                if (prep_result.failures > 0)
+                {
+                    LOG_WARN("MultiDeviceOrchestrator: " << prep_result.failures
+                                                         << " weight preparation failures for PP stage "
+                                                         << stage_idx << " on " << primary_device.to_string());
+                }
+                else
+                {
+                    LOG_INFO("MultiDeviceOrchestrator: Pre-warmed " << prep_result.gemm_weights_prepared
+                                                                    << " GEMM + " << prep_result.non_gemm_weights_uploaded
+                                                                    << " non-GEMM weights for PP stage " << stage_idx
+                                                                    << " on " << primary_device.to_string()
+                                                                    << " (" << (prep_result.total_device_bytes / (1024 * 1024)) << " MB)");
+                }
             }
 
             // =====================================================================
@@ -974,6 +1065,45 @@ namespace llaminar2
         }
 
         LOG_INFO("MultiDeviceOrchestrator: Successfully initialized " << pp_stage_runners_.size() << " PP stage runners");
+
+        // Build PPActivationContract describing inter-stage data transfers
+        if (config_.pp_stages.size() > 1)
+        {
+            pp_activation_contract_ = std::make_unique<PPActivationContract>();
+
+            const size_t embedding_dim = model_ctx_->embeddingLength();
+            const size_t max_seq_len = model_ctx_->contextLength();
+
+            for (size_t i = 0; i + 1 < config_.pp_stages.size(); ++i)
+            {
+                const auto &src = config_.pp_stages[i];
+                const auto &dst = config_.pp_stages[i + 1];
+
+                PPStageTransferContract xfer;
+                xfer.source_stage = static_cast<int>(i);
+                xfer.target_stage = static_cast<int>(i + 1);
+                xfer.source_device = src.stage_devices[0].toLocalDeviceId();
+                xfer.target_device = dst.stage_devices[0].toLocalDeviceId();
+                xfer.embedding_dim = embedding_dim;
+                xfer.dtype = ActivationDType::FP32;
+                xfer.max_seq_len = max_seq_len;
+
+                pp_activation_contract_->addTransfer(std::move(xfer));
+            }
+
+            auto validation_err = pp_activation_contract_->validate();
+            if (!validation_err.empty())
+            {
+                LOG_ERROR("MultiDeviceOrchestrator: PPActivationContract validation failed: " << validation_err);
+                pp_activation_contract_.reset();
+            }
+            else
+            {
+                LOG_INFO("MultiDeviceOrchestrator: PPActivationContract built with "
+                         << pp_activation_contract_->numTransfers() << " transfers"
+                         << " (embedding=" << embedding_dim << ", max_seq=" << max_seq_len << ")");
+            }
+        }
 
         // Note: PP context initialization is done by the caller (constructor)
         // after this method returns, to avoid double-initialization
@@ -1592,8 +1722,9 @@ namespace llaminar2
 
             // Transfer activations from previous stage to current stage
             // Only transfer the active region (seq_len tokens), not the full buffer
-            const size_t active_bytes =
-                static_cast<size_t>(seq_len) * model_ctx_->embeddingLength() * sizeof(float);
+            const size_t active_bytes = pp_activation_contract_
+                                            ? pp_activation_contract_->transfer(static_cast<int>(stage_idx - 1)).activeBytes(seq_len)
+                                            : static_cast<size_t>(seq_len) * model_ctx_->embeddingLength() * sizeof(float);
 
             LOG_DEBUG("MultiDeviceOrchestrator::forwardPP: Transferring hidden state from stage "
                       << (stage_idx - 1) << " to stage " << stage_idx

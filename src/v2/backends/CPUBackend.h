@@ -122,7 +122,7 @@ namespace llaminar2
          * @param device_id Must be 0
          * @return true on success
          */
-        bool memset(void *ptr, int value, size_t bytes, int device_id) override;
+        bool memset(void *ptr, int value, size_t bytes, int device_id, void *stream = nullptr) override;
 
         /**
          * @brief Allocate "mapped" memory (on CPU, just regular allocation)
@@ -152,7 +152,7 @@ namespace llaminar2
          * @param device_id Must be 0
          * @return true on success
          */
-        bool deviceToHost(void *dst, const void *src, size_t bytes, int device_id) override;
+        bool deviceToHost(void *dst, const void *src, size_t bytes, int device_id, void *stream = nullptr) override;
 
         /**
          * @brief Copy from host (CPU) to "device" (CPU) - just memcpy
@@ -162,7 +162,7 @@ namespace llaminar2
          * @param device_id Must be 0
          * @return true on success
          */
-        bool hostToDevice(void *dst, const void *src, size_t bytes, int device_id) override;
+        bool hostToDevice(void *dst, const void *src, size_t bytes, int device_id, void *stream = nullptr) override;
 
         /**
          * @brief Synchronize (no-op for CPU - always synchronous)

@@ -74,6 +74,8 @@ namespace llaminar2
     class DeviceSampler;
     struct GraphExecutorStats;
     struct PlacementPlan;
+    class ISharedWeightPool;
+    struct PPActivationContract;
 
     /**
      * @brief Multi-device orchestrator for LOCAL tensor parallelism
@@ -355,6 +357,22 @@ namespace llaminar2
             std::shared_ptr<IModelContext> model_ctx,
             const Config &config,
             std::unique_ptr<ILocalTPContext> tp_ctx = nullptr);
+
+        /**
+         * @brief Construct with model context, shared weight pool, and configuration
+         *
+         * When a SharedWeightPool is provided, PP stage initialization will use
+         * pre-loaded tensors from the pool via ModelContext::createFromSharedPool()
+         * instead of re-parsing the GGUF file per stage.
+         *
+         * @param model_ctx Model context with metadata
+         * @param pool Shared weight pool (already loaded, not nullptr)
+         * @param config Multi-device configuration
+         */
+        MultiDeviceOrchestrator(
+            std::shared_ptr<IModelContext> model_ctx,
+            std::shared_ptr<ISharedWeightPool> pool,
+            const Config &config);
 
         /// Destructor
         ~MultiDeviceOrchestrator() override;
@@ -756,6 +774,12 @@ namespace llaminar2
 
         /// Model context (shared across device runners)
         std::shared_ptr<IModelContext> model_ctx_;
+
+        /// Shared weight pool for PP (optional — when set, avoids per-stage GGUF re-parse)
+        std::shared_ptr<ISharedWeightPool> shared_pool_;
+
+        /// PP activation transfer contract (built during initializePPDeviceRunners)
+        std::unique_ptr<PPActivationContract> pp_activation_contract_;
 
         /// LOCAL TP context for collective operations (TP mode)
         std::unique_ptr<ILocalTPContext> tp_ctx_;

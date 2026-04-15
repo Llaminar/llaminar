@@ -8,6 +8,7 @@
  */
 
 #include "CUDARingKVCacheBase.h"
+#include "../../../backends/GPUDeviceContextPool.h"
 #include "../../../utils/Logger.h"
 #include <cuda_runtime.h>
 #include <cstring>
@@ -66,7 +67,10 @@ namespace llaminar2
             return;
         }
 
-        cudaMemset(d_head_params_, 0, num_entries * sizeof(int));
+        cudaStream_t init_stream = static_cast<cudaStream_t>(
+            GPUDeviceContextPool::instance().getNvidiaContext(device_id_).defaultStream());
+        cudaMemsetAsync(d_head_params_, 0, num_entries * sizeof(int), init_stream);
+        cudaStreamSynchronize(init_stream);
         std::memset(h_head_params_, 0, num_entries * sizeof(int));
 
         LOG_DEBUG("[CUDARingKVCacheBase] Allocated device params for graph capture: "

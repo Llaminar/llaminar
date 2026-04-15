@@ -631,6 +631,15 @@ namespace
 
     static int chooseSplitK(ShapeFamily family, int M, int N, int K, int bm, int bn)
     {
+        // Deterministic mode: split-K uses FP32 atomicAdd, always return 1
+        static const bool s_deterministic = []()
+        {
+            const char *env = std::getenv("LLAMINAR_DETERMINISTIC");
+            return env && std::atoi(env) != 0;
+        }();
+        if (s_deterministic)
+            return 1;
+
         const int grid_blocks = ((M + bm - 1) / bm) * ((N + bn - 1) / bn);
         const int num_k_blocks = K / BK;
         const bool k_rich = (family == ShapeFamily::DeepK) || (K > 2 * N);

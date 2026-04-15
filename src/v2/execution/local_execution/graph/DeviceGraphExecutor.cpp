@@ -666,6 +666,11 @@ namespace llaminar2
         const StageBufferContract contract = arena_ ? node.stage->bufferContract() : StageBufferContract{};
         const bool use_contract = !contract.empty() && arena_ != nullptr;
 
+        // Bind GPU stream early so coherence operations (H2D/D2H) run on
+        // the same stream as the stage's compute kernels.
+        ensureStageGPUStreamBound(node, ctx);
+        void *stage_stream = node.stage ? node.stage->gpuStream() : nullptr;
+
         if (policy.coherence)
         {
             auto coh_policy = node.stage->coherencePolicy();
@@ -683,7 +688,7 @@ namespace llaminar2
 
                 for (const auto &binding : contract.allArenaReads())
                 {
-                    if (!arena_->prepareForRead(binding.id, target_device))
+                    if (!arena_->prepareForRead(binding.id, target_device, stage_stream))
                     {
                         LOG_ERROR("[DeviceGraphExecutor] Arena prepareForRead failed for "
                                   << bufferIdName(binding.id) << " in stage '" << node.name << "'");
@@ -714,7 +719,7 @@ namespace llaminar2
                     {
                         if (auto *tb = dynamic_cast<TensorBase *>(weight))
                         {
-                            if (!tb->ensureOnDevice(target_device))
+                            if (!tb->ensureOnDevice(target_device, stage_stream))
                             {
                                 LOG_ERROR("[DeviceGraphExecutor] Weight upload failed for stage '"
                                           << node.name << "'"
@@ -740,7 +745,7 @@ namespace llaminar2
 
                 for (const auto &binding : contract.allWrites())
                 {
-                    if (!arena_->prepareForWrite(binding.id, target_device))
+                    if (!arena_->prepareForWrite(binding.id, target_device, stage_stream))
                     {
                         LOG_ERROR("[DeviceGraphExecutor] Arena prepareForWrite failed for "
                                   << bufferIdName(binding.id) << " in stage '" << node.name << "'");
@@ -859,7 +864,7 @@ namespace llaminar2
         if (profiling)
             phase_start = std::chrono::high_resolution_clock::now();
 
-        ensureStageGPUStreamBound(node, ctx);
+        // Stream already bound above (before coherence section)
         bool success = node.stage->execute(ctx);
 
         if (success && debugEnv().validation.sync_each_stage)
@@ -895,7 +900,7 @@ namespace llaminar2
             if (profiling)
                 phase_start = std::chrono::high_resolution_clock::now();
 
-            const bool need_event = node.is_final_output
+            const bool need_event = node.is_final_output || policy.snapshot_callback
 #if LLAMINAR_ASSERTIONS_ACTIVE
                                     || debugEnv().validation.validate_buffers
 #endif

@@ -887,7 +887,7 @@ namespace llaminar2
         }
     }
 
-    bool TensorBase::ensureOnDevice(DeviceId target_device)
+    bool TensorBase::ensureOnDevice(DeviceId target_device, void *stream)
     {
         std::lock_guard<std::mutex> lock(coherence_mutex_);
 
@@ -921,7 +921,7 @@ namespace llaminar2
         }
 
         // Delegate to TransferEngine for all data movement
-        auto result = TransferEngine::instance().uploadFull(this, target_device);
+        auto result = TransferEngine::instance().uploadFull(this, target_device, stream);
         if (!result.success)
         {
             LOG_ERROR("[TensorBase::ensureOnDevice] TransferEngine::uploadFull failed: " << result.error);
@@ -929,7 +929,7 @@ namespace llaminar2
         return result.success;
     }
 
-    bool TensorBase::allocateOnDevice(DeviceId target_device)
+    bool TensorBase::allocateOnDevice(DeviceId target_device, void *stream)
     {
         std::lock_guard<std::mutex> lock(coherence_mutex_);
 
@@ -1078,12 +1078,12 @@ namespace llaminar2
 
     // =========================================================================
     // Helper: Wait for CUDA event with cross-thread proxy support
-    bool TensorBase::ensureOnHost()
+    bool TensorBase::ensureOnHost(void *stream)
     {
         std::lock_guard<std::mutex> lock(coherence_mutex_);
 
         // Delegate to TransferEngine for all data movement
-        auto result = TransferEngine::instance().downloadFull(this);
+        auto result = TransferEngine::instance().downloadFull(this, stream);
         if (!result.success)
         {
             LOG_ERROR("[TensorBase::ensureOnHost] TransferEngine::downloadFull failed: " << result.error);

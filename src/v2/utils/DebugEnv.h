@@ -291,10 +291,15 @@ namespace llaminar2
             const char *cuda_concurrent_env = std::getenv("LLAMINAR_CUDA_CONCURRENT_PREFILL");
             if (cuda_concurrent_env)
                 cuda_concurrent_prefill = (std::atoi(cuda_concurrent_env) != 0);
+
+            const char *fused_trace_env = std::getenv("LLAMINAR_CUDA_FUSED_GEMM_TRACE");
+            if (fused_trace_env)
+                cuda_fused_gemm_trace = (std::atoi(fused_trace_env) != 0);
         }
 
         bool trace_q8_1_direct = false;      ///< Enable detailed Q8_1 JIT kernel tracing
         bool cuda_concurrent_prefill = true; ///< Multi-stream concurrent fused GEMM projections during CUDA prefill (LLAMINAR_CUDA_CONCURRENT_PREFILL, default ON)
+        bool cuda_fused_gemm_trace = false;  ///< Trace fused GEMM output checksums for debugging (LLAMINAR_CUDA_FUSED_GEMM_TRACE)
     };
 
     /**

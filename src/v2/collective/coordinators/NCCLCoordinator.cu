@@ -1182,7 +1182,7 @@ namespace llaminar2
             return false;
         }
 
-        // Same device - use cudaMemcpy on coordinator thread (synchronous)
+        // Same device - use cudaMemcpyAsync on coordinator stream (synchronous wait)
         if (src_device_idx == dst_device_idx)
         {
             return submitAndWait([&]()
@@ -1194,10 +1194,17 @@ namespace llaminar2
                 return false;
             }
 
-            err = cudaMemcpy(dst_ptr, src_ptr, bytes, cudaMemcpyDeviceToDevice);
+            cudaStream_t stream = static_cast<cudaStream_t>(streams_[src_device_idx]);
+            err = cudaMemcpyAsync(dst_ptr, src_ptr, bytes, cudaMemcpyDeviceToDevice, stream);
             if (err != cudaSuccess)
             {
-                last_error_ = std::string("cudaMemcpy failed: ") + cudaGetErrorString(err);
+                last_error_ = std::string("cudaMemcpyAsync failed: ") + cudaGetErrorString(err);
+                return false;
+            }
+            err = cudaStreamSynchronize(stream);
+            if (err != cudaSuccess)
+            {
+                last_error_ = std::string("cudaStreamSynchronize failed: ") + cudaGetErrorString(err);
                 return false;
             }
             return true; });

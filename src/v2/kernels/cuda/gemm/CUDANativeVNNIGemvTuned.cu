@@ -996,9 +996,15 @@ namespace
                                     target_waves, min_kgroups_per_cta);
         const int kb_capped = (max_kb > 0) ? std::min(kb, max_kb) : kb;
 
-        // Choose two-phase vs atomic based on partials buffer size
+        // Choose two-phase vs atomic based on partials buffer size.
+        // Deterministic mode always uses two-phase to avoid atomicAdd non-determinism.
         const size_t partials_bytes = static_cast<size_t>(kb_capped) * N * sizeof(float);
-        const bool use_two_phase = (partials_bytes <= kTwoPhaseMaxBytes);
+        static const bool s_deterministic = []()
+        {
+            const char *env = std::getenv("LLAMINAR_DETERMINISTIC");
+            return env && std::atoi(env) != 0;
+        }();
+        const bool use_two_phase = s_deterministic || (partials_bytes <= kTwoPhaseMaxBytes);
 
         dim3 grid(grid_n, kb_capped);
 

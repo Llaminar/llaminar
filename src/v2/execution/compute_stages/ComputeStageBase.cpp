@@ -575,6 +575,21 @@ namespace llaminar2
             {
                 if (auto *cpu_tensor = dynamic_cast<TensorBase *>(output.tensor))
                 {
+                    // DIAGNOSTIC: Check coherence state BEFORE ensureOnHost for output_up
+                    const bool diag = debugEnv().gemm.cuda_fused_gemm_trace &&
+                                      output.name && std::string(output.name) == "output_up";
+                    int state_before = -1;
+                    if (diag)
+                    {
+                        state_before = static_cast<int>(cpu_tensor->coherenceState());
+                        auto dev = cpu_tensor->current_device();
+                        LOG_WARN("[DIAG_UP] BEFORE ensureOnHost: coherence=" << state_before
+                                 << " gpu_ptr=" << cpu_tensor->gpu_data_ptr()
+                                 << " host_ptr=" << cpu_tensor->raw_data()
+                                 << " device=" << (dev ? dev->to_string() : "none")
+                                 << " rows=" << output.rows << " cols=" << output.cols);
+                    }
+
                     auto t0 = std::chrono::high_resolution_clock::now();
                     cpu_tensor->ensureOnHost();
                     auto t1 = std::chrono::high_resolution_clock::now();
@@ -585,6 +600,24 @@ namespace llaminar2
                     }
                     // Update data pointer after sync (may have changed)
                     output.data = cpu_tensor->raw_data();
+
+                    // DIAGNOSTIC: Check host data after ensureOnHost
+                    if (diag)
+                    {
+                        int state_after = static_cast<int>(cpu_tensor->coherenceState());
+                        const float *host_data = static_cast<const float *>(output.data);
+                        size_t numel = output.rows * output.cols;
+                        float host_sum = 0.0f;
+                        float first4[4] = {0,0,0,0};
+                        for (size_t i = 0; i < numel && i < 4; i++) first4[i] = host_data[i];
+                        for (size_t i = 0; i < numel; i++) host_sum += host_data[i];
+                        LOG_WARN("[DIAG_UP] AFTER ensureOnHost: host_sum=" << host_sum
+                                 << " coherence_before=" << state_before
+                                 << " coherence_after=" << state_after
+                                 << " d2h_ms=" << elapsed_ms
+                                 << " first4=[" << first4[0] << "," << first4[1] << ","
+                                 << first4[2] << "," << first4[3] << "]");
+                    }
                 }
             }
         }

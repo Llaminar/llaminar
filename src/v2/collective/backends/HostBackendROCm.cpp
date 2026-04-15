@@ -22,7 +22,7 @@ namespace host_backend_detail {
 // updates from different threads are not safe.
 static std::mutex s_hip_host_register_mutex;
 
-bool hipCopyToHost(void* host_dst, const void* device_src, int device_ordinal, size_t bytes)
+bool hipCopyToHost(void* host_dst, const void* device_src, int device_ordinal, size_t bytes, void* stream)
 {
     hipError_t err = hipSetDevice(device_ordinal);
     if (err != hipSuccess)
@@ -30,11 +30,15 @@ bool hipCopyToHost(void* host_dst, const void* device_src, int device_ordinal, s
         return false;
     }
     
-    err = hipMemcpy(host_dst, device_src, bytes, hipMemcpyDeviceToHost);
+    hipStream_t s = static_cast<hipStream_t>(stream);
+    err = hipMemcpyAsync(host_dst, device_src, bytes, hipMemcpyDeviceToHost, s);
+    if (err != hipSuccess)
+        return false;
+    err = hipStreamSynchronize(s);
     return (err == hipSuccess);
 }
 
-bool hipCopyFromHost(void* device_dst, const void* host_src, int device_ordinal, size_t bytes)
+bool hipCopyFromHost(void* device_dst, const void* host_src, int device_ordinal, size_t bytes, void* stream)
 {
     hipError_t err = hipSetDevice(device_ordinal);
     if (err != hipSuccess)
@@ -42,7 +46,11 @@ bool hipCopyFromHost(void* device_dst, const void* host_src, int device_ordinal,
         return false;
     }
     
-    err = hipMemcpy(device_dst, host_src, bytes, hipMemcpyHostToDevice);
+    hipStream_t s = static_cast<hipStream_t>(stream);
+    err = hipMemcpyAsync(device_dst, host_src, bytes, hipMemcpyHostToDevice, s);
+    if (err != hipSuccess)
+        return false;
+    err = hipStreamSynchronize(s);
     return (err == hipSuccess);
 }
 

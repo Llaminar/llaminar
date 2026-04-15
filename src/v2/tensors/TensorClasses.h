@@ -914,7 +914,7 @@ namespace llaminar2
          * @note For quantized weight tensors, uploads quantized blocks (not dequantized FP32)
          * @note Implementation in TensorBase.cpp - uses raw_host_data_ptr() and byte_size()
          */
-        virtual bool ensureOnDevice(DeviceId target_device);
+        virtual bool ensureOnDevice(DeviceId target_device, void *stream = nullptr);
 
         /**
          * @brief Allocate GPU buffer without uploading host data
@@ -935,7 +935,7 @@ namespace llaminar2
          *
          * @note Implementation in TensorBase.cpp
          */
-        virtual bool allocateOnDevice(DeviceId target_device);
+        virtual bool allocateOnDevice(DeviceId target_device, void *stream = nullptr);
 
         /**
          * @brief Invalidate GPU data, forcing re-upload on next ensureOnDevice() call
@@ -957,7 +957,7 @@ namespace llaminar2
          * **Memory**: Host buffer is always retained; GPU buffer optionally freed (see releaseDeviceMemory)
          * @note Implementation in TensorBase.cpp - uses raw_host_data_ptr() and byte_size()
          */
-        virtual bool ensureOnHost();
+        virtual bool ensureOnHost(void *stream = nullptr);
 
         /**
          * @brief Check if tensor data is currently resident on GPU

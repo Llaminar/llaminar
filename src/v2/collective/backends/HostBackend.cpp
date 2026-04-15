@@ -11,6 +11,7 @@
 
 #include "HostBackend.h"
 #include "../../utils/Logger.h"
+#include "../../backends/GPUDeviceContextPool.h"
 #include <cstring>
 #include <cstdlib>
 #include <algorithm>
@@ -22,15 +23,15 @@ namespace llaminar2
     {
 
 #ifdef HAVE_CUDA
-        bool cudaCopyToHost(void *host_dst, const void *device_src, int device_ordinal, size_t bytes);
-        bool cudaCopyFromHost(void *device_dst, const void *host_src, int device_ordinal, size_t bytes);
+        bool cudaCopyToHost(void *host_dst, const void *device_src, int device_ordinal, size_t bytes, void *stream);
+        bool cudaCopyFromHost(void *device_dst, const void *host_src, int device_ordinal, size_t bytes, void *stream);
         bool cudaHostRegisterBuffer(void *ptr, size_t size);
         void cudaHostUnregisterBuffer(void *ptr);
 #endif
 
 #ifdef HAVE_ROCM
-        bool hipCopyToHost(void *host_dst, const void *device_src, int device_ordinal, size_t bytes);
-        bool hipCopyFromHost(void *device_dst, const void *host_src, int device_ordinal, size_t bytes);
+        bool hipCopyToHost(void *host_dst, const void *device_src, int device_ordinal, size_t bytes, void *stream);
+        bool hipCopyFromHost(void *device_dst, const void *host_src, int device_ordinal, size_t bytes, void *stream);
         bool hipHostRegisterBuffer(void *ptr, size_t size);
         void hipHostUnregisterBuffer(void *ptr);
 #endif
@@ -787,17 +788,19 @@ namespace llaminar2
             return true;
         }
 
+        void *stream = GPUDeviceContextPool::instance().getContext(device).defaultStream();
+
 #ifdef HAVE_CUDA
         if (device.type == DeviceType::CUDA)
         {
-            return host_backend_detail::cudaCopyToHost(host_dst, device_src, device.ordinal, bytes);
+            return host_backend_detail::cudaCopyToHost(host_dst, device_src, device.ordinal, bytes, stream);
         }
 #endif
 
 #ifdef HAVE_ROCM
         if (device.type == DeviceType::ROCm)
         {
-            return host_backend_detail::hipCopyToHost(host_dst, device_src, device.ordinal, bytes);
+            return host_backend_detail::hipCopyToHost(host_dst, device_src, device.ordinal, bytes, stream);
         }
 #endif
 
@@ -814,17 +817,19 @@ namespace llaminar2
             return true;
         }
 
+        void *stream = GPUDeviceContextPool::instance().getContext(device).defaultStream();
+
 #ifdef HAVE_CUDA
         if (device.type == DeviceType::CUDA)
         {
-            return host_backend_detail::cudaCopyFromHost(device_dst, host_src, device.ordinal, bytes);
+            return host_backend_detail::cudaCopyFromHost(device_dst, host_src, device.ordinal, bytes, stream);
         }
 #endif
 
 #ifdef HAVE_ROCM
         if (device.type == DeviceType::ROCm)
         {
-            return host_backend_detail::hipCopyFromHost(device_dst, host_src, device.ordinal, bytes);
+            return host_backend_detail::hipCopyFromHost(device_dst, host_src, device.ordinal, bytes, stream);
         }
 #endif
 

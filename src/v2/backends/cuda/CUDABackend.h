@@ -32,8 +32,8 @@ namespace llaminar2
         ~CUDABackend() override;
 
         // Memory transfer operations (see IBackend documentation)
-        bool deviceToHost(void *dst, const void *src, size_t bytes, int device_id) override;
-        bool hostToDevice(void *dst, const void *src, size_t bytes, int device_id) override;
+        bool deviceToHost(void *dst, const void *src, size_t bytes, int device_id, void *stream = nullptr) override;
+        bool hostToDevice(void *dst, const void *src, size_t bytes, int device_id, void *stream = nullptr) override;
         bool synchronize(int device_id) override;
         bool streamSynchronize(int device_id) override;
         bool setDevice(int device_id) override;
@@ -52,7 +52,7 @@ namespace llaminar2
         // Memory allocation operations
         void *allocate(size_t bytes, int device_id) override;
         void free(void *ptr, int device_id) override;
-        bool memset(void *ptr, int value, size_t bytes, int device_id) override;
+        bool memset(void *ptr, int value, size_t bytes, int device_id, void *stream = nullptr) override;
 
         // Async variants of allocation operations
         std::future<void *> allocateAsync(size_t bytes, int device_id) override;
@@ -76,11 +76,11 @@ namespace llaminar2
 
         // GPU-side argmax for greedy sampling
         bool argmaxF32(const void *data_device, int n, int device_id,
-                       float *out_value, int *out_index) override;
+                       float *out_value, int *out_index, void *stream = nullptr) override;
 
         // GPU-side top-k selection for sampling
         bool topKF32(const void *data_device, int n, int k, int device_id,
-                     float *out_values, int *out_indices) override;
+                     float *out_values, int *out_indices, void *stream = nullptr) override;
 
         // Capability queries
         bool supportsBF16(int device_id) const override;

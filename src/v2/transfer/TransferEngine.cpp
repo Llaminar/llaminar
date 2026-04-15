@@ -412,7 +412,7 @@ namespace llaminar2
     // uploadFull — full ensureOnDevice lifecycle (called with coherence_mutex_ held)
     // ============================================================================
 
-    TransferResult TransferEngine::uploadFull(TensorBase *tensor, DeviceId target_device)
+    TransferResult TransferEngine::uploadFull(TensorBase *tensor, DeviceId target_device, void *stream)
     {
         if (!tensor)
             return TransferResult::fail(TransferMethod::NOOP, "null tensor");
@@ -658,7 +658,7 @@ namespace llaminar2
             }
 
             auto h2d_start = std::chrono::high_resolution_clock::now();
-            bool h2d_ok = target_backend->hostToDevice(tensor->gpu_data_ptr_, src, bytes, backend_device_id);
+            bool h2d_ok = target_backend->hostToDevice(tensor->gpu_data_ptr_, src, bytes, backend_device_id, stream);
             auto h2d_end = std::chrono::high_resolution_clock::now();
             auto h2d_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(h2d_end - h2d_start).count();
             auto h2d_us = h2d_ns / 1000;
@@ -713,7 +713,7 @@ namespace llaminar2
     // downloadFull — full ensureOnHost lifecycle (called with coherence_mutex_ held)
     // ============================================================================
 
-    TransferResult TransferEngine::downloadFull(TensorBase *tensor)
+    TransferResult TransferEngine::downloadFull(TensorBase *tensor, void *stream)
     {
         if (!tensor)
             return TransferResult::fail(TransferMethod::NOOP, "null tensor");
@@ -844,7 +844,7 @@ namespace llaminar2
                       << " backend_device_id=" << backend_device_id);
 
             auto d2h_start = std::chrono::high_resolution_clock::now();
-            bool d2h_ok = backend->deviceToHost(dst, tensor->gpu_data_ptr_, bytes, backend_device_id);
+            bool d2h_ok = backend->deviceToHost(dst, tensor->gpu_data_ptr_, bytes, backend_device_id, stream);
             auto d2h_end = std::chrono::high_resolution_clock::now();
             auto d2h_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(d2h_end - d2h_start).count();
 

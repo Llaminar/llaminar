@@ -617,18 +617,18 @@ public:
         return MockBackend::allocate(bytes, device_id);
     }
 
-    bool hostToDevice(void *dst, const void *src, size_t bytes, int device_id) override
+    bool hostToDevice(void *dst, const void *src, size_t bytes, int device_id, void *stream = nullptr) override
     {
         if (fail_h2d)
             return false;
-        return MockBackend::hostToDevice(dst, src, bytes, device_id);
+        return MockBackend::hostToDevice(dst, src, bytes, device_id, stream);
     }
 
-    bool deviceToHost(void *dst, const void *src, size_t bytes, int device_id) override
+    bool deviceToHost(void *dst, const void *src, size_t bytes, int device_id, void *stream = nullptr) override
     {
         if (fail_d2h)
             return false;
-        return MockBackend::deviceToHost(dst, src, bytes, device_id);
+        return MockBackend::deviceToHost(dst, src, bytes, device_id, stream);
     }
 };
 

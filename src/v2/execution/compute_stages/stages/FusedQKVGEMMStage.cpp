@@ -171,7 +171,7 @@ namespace llaminar2
                 params_.m,
                 params_.k);
 
-            if (success)
+            if (success && Logger::getInstance().shouldLog(LogLevel::TRACE))
             {
                 const float *q_data = output_q_base->data();
                 LOG_TRACE("[FusedQKVGEMMStage] Q output[0:8]=" << std::setprecision(10)

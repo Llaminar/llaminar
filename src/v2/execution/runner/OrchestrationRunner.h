@@ -38,6 +38,7 @@
 
 namespace llaminar2
 {
+    class ISharedWeightPool;
 
     /**
      * @brief Concrete implementation of IOrchestrationRunner
@@ -397,6 +398,7 @@ namespace llaminar2
         std::unique_ptr<IExecutionPlanBuilder> plan_builder_;
         std::shared_ptr<IMPIContext> mpi_ctx_;
         std::shared_ptr<ModelContext> model_ctx_;
+        std::shared_ptr<ISharedWeightPool> shared_pool_;  // PP weight sharing (optional)
         std::unique_ptr<ILocalTPContext> local_tp_ctx_;
         std::unique_ptr<ILocalPPContext> local_pp_ctx_;
 

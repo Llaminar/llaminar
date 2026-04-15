@@ -1413,8 +1413,9 @@ namespace llaminar2
                     // CPU-side repack: any quant format → EmbedQ8Block via IINT8Unpackable
                     auto repacked = repackEmbeddingToQ8(embed_table, d_model);
 
-                    err = cudaMemcpy(d_embed_q8, repacked.data.data(), repacked.byte_size,
-                                     cudaMemcpyHostToDevice);
+                    err = cudaMemcpyAsync(d_embed_q8, repacked.data.data(), repacked.byte_size,
+                                          cudaMemcpyHostToDevice,
+                                          static_cast<cudaStream_t>(gpu_stream_));
                     if (err != cudaSuccess)
                     {
                         fprintf(stderr, "[CUDAEmbeddingKernelT] Failed to upload EmbedQ8 data: %s\n",

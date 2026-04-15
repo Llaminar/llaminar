@@ -43,6 +43,7 @@
 #include <cmath>
 #include <algorithm>
 #include <cstring>
+#include <iomanip>
 #include <mutex>
 #include <atomic>
 #include <unordered_set>
@@ -716,31 +717,15 @@ namespace llaminar2
                         return true;
                     }
 
-                    // Fallback: CUTLASS-based decomposed TC GEMM (sm_75+ or unhandled shapes)
+                    // Do not use the CUTLASS decomposed TC fallback here.
+                    // The caller will fall back to our in-tree blockwise kernel
+                    // instead, which keeps the blockwise prefill path on one
+                    // dispatch stack for this investigation.
                     if (d_partial_int32)
                     {
-                        static std::once_flag cutlass_tc_once;
-                        std::call_once(cutlass_tc_once, []()
-                                       { LOG_INFO("[CUDAQuantisedGemmKernel] CUTLASS tensor-core GEMM prefill fallback active"); });
-
-                        if (cudaTCGemm_blockwiseGemm(
-                                d_A_int8,
-                                impl->d_weights_int8_tc_blocked,
-                                d_partial_int32,
-                                d_C_fp32,
-                                d_scales_A_blockwise,
-                                impl->d_scales_B,
-                                m, n, k,
-                                alpha, beta,
-                                d_C_existing,
-                                d_bias,
-                                cuda_device_id,
-                                stream))
-                        {
-                            return true;
-                        }
-
-                        LOG_WARN("[CUDAQuantisedGemmKernel] CUTLASS tensor-core GEMM prefill also failed");
+                        static std::once_flag cutlass_tc_disabled_once;
+                        std::call_once(cutlass_tc_disabled_once, []()
+                                       { LOG_INFO("[CUDAQuantisedGemmKernel] CUTLASS tensor-core GEMM prefill fallback disabled; using in-tree blockwise fallback instead"); });
                     }
                 }
 
@@ -1416,6 +1401,8 @@ namespace llaminar2
             void *streams[MAX_STREAMS] = {};
             void *completion[MAX_STREAMS] = {};
             void *quant_ready = nullptr;
+            int32_t *scratch[MAX_STREAMS] = {};        // Per-stream INT32 accumulator
+            size_t scratch_capacity[MAX_STREAMS] = {}; // In elements (M*N)
             int count = 0;
             int device_id = -1;
             bool initialized = false;
@@ -1437,6 +1424,39 @@ namespace llaminar2
                                                                     << " streams on device " << dev_id);
             }
 
+            /// Ensure per-stream scratch buffer has at least `elements` int32s.
+            bool ensureScratch(int idx, size_t elements)
+            {
+                if (idx < 0 || idx >= count)
+                    return false;
+                if (scratch_capacity[idx] >= elements)
+                    return true;
+
+                // Free old
+                if (scratch[idx])
+                {
+                    cudaQuantGemm_freeDevice(scratch[idx]);
+                    scratch[idx] = nullptr;
+                    scratch_capacity[idx] = 0;
+                }
+
+                cudaQuantGemm_setDevice(device_id);
+                float *tmp = nullptr;
+                // Allocate int32 buffer via allocFloat (same underlying cudaMalloc)
+                size_t float_count = (elements * sizeof(int32_t) + sizeof(float) - 1) / sizeof(float);
+                if (!cudaQuantGemm_allocFloat(&tmp, float_count, device_id))
+                {
+                    LOG_ERROR("[CUDAConcurrentPrefillPool] Failed to allocate scratch["
+                              << idx << "] (" << (elements * 4 / 1024) << " KB)");
+                    return false;
+                }
+                scratch[idx] = reinterpret_cast<int32_t *>(tmp);
+                scratch_capacity[idx] = elements;
+                LOG_DEBUG("[CUDAConcurrentPrefillPool] Allocated scratch[" << idx
+                                                                          << "] = " << (elements * 4 / 1024) << " KB");
+                return true;
+            }
+
             void destroy()
             {
                 if (!initialized)
@@ -1447,6 +1467,12 @@ namespace llaminar2
                     streams[i] = nullptr;
                     cudaQuantGemm_destroyEvent(completion[i]);
                     completion[i] = nullptr;
+                    if (scratch[i])
+                    {
+                        cudaQuantGemm_freeDevice(scratch[i]);
+                        scratch[i] = nullptr;
+                        scratch_capacity[i] = 0;
+                    }
                 }
                 cudaQuantGemm_destroyEvent(quant_ready);
                 quant_ready = nullptr;
@@ -1608,9 +1634,17 @@ namespace llaminar2
 
                     const int n = proj.n;
                     cuda_kernel->ensureWeightsConverted();
-                    cuda_kernel->validateWorkspace();
-                    int32_t *proj_d_C_int32 = static_cast<int32_t *>(
-                        cuda_kernel->workspace_->getBuffer(GemmWorkspaceBuffers::ACC_INT32));
+
+                    // Use per-stream scratch buffer instead of shared workspace ACC_INT32
+                    // to avoid write-after-write races between concurrent projections.
+                    int stream_idx = pi % pool.count;
+                    size_t acc_elements = static_cast<size_t>(m) * static_cast<size_t>(n);
+                    if (!pool.ensureScratch(stream_idx, acc_elements))
+                    {
+                        concurrent_ok = false;
+                        break;
+                    }
+                    int32_t *proj_d_C_int32 = pool.scratch[stream_idx];
 
                     auto *fp32_output = dynamic_cast<FP32Tensor *>(proj.output);
                     if (!fp32_output)
@@ -1646,7 +1680,7 @@ namespace llaminar2
                         }
                     }
 
-                    int stream_idx = pi % pool.count;
+                    // stream_idx already computed above for scratch allocation
 
                     // This stream waits for quantization to complete
                     cudaQuantGemm_streamWaitEvent(pool.streams[stream_idx], pool.quant_ready);
@@ -1854,7 +1888,30 @@ namespace llaminar2
 
                 if (use_blockwise)
                 {
-                    if (runNativeVNNIBlockwiseIfSupported(
+                    const bool trace_fused = debugEnv().gemm.cuda_fused_gemm_trace;
+
+                    // Diagnostic: checksum weight data to detect weight corruption
+                    if (trace_fused && cuda_kernel->impl_)
+                    {
+                        cudaStreamSynchronize(static_cast<cudaStream_t>(gpu_stream_));
+                        const void* wt_ptr = cuda_kernel->impl_->d_weights_native_vnni;
+                        if (wt_ptr)
+                        {
+                            const int wt_bytes = 1024;
+                            std::vector<uint8_t> wt_host(wt_bytes);
+                            cudaMemcpy(wt_host.data(), wt_ptr,
+                                       wt_bytes, cudaMemcpyDeviceToHost);
+                            uint64_t wt_hash = 0;
+                            for (int wi = 0; wi < wt_bytes; ++wi)
+                                wt_hash = wt_hash * 31 + wt_host[wi];
+                            LOG_WARN("[GEMM_WEIGHTS] proj=" << i
+                                     << " name=" << (proj.name ? proj.name : "?")
+                                     << " wt_hash=" << wt_hash
+                                     << " d_output=" << static_cast<void*>(d_output));
+                        }
+                    }
+
+                        const bool used_native = runNativeVNNIBlockwiseIfSupported(
                             cuda_kernel->impl_.get(),
                             d_A_int8,
                             proj_d_C_int32,
@@ -1864,8 +1921,49 @@ namespace llaminar2
                             1.0f, 0.0f,
                             nullptr,
                             d_bias,
-                            cuda_device_id_, gpu_stream_))
+                            cuda_device_id_, gpu_stream_);
+
+                    if (trace_fused)
                     {
+                        LOG_WARN("[GEMM_PATH] proj=" << i
+                                 << " name=" << (proj.name ? proj.name : "?")
+                                 << " backend=" << (used_native ? "native_vnni" : "fallback_blockwise")
+                                 << " m=" << m << " n=" << n << " k=" << k
+                                 << " output=" << static_cast<void *>(d_output)
+                                 << " acc=" << static_cast<void *>(proj_d_C_int32));
+                    }
+
+                    if (used_native)
+                    {
+                        // DIAGNOSTIC: sync between projections to test if inter-projection
+                        // race causes corruption in PP mode
+                        if (gpu_stream_ && i + 1 < projections.size())
+                            cudaStreamSynchronize(static_cast<cudaStream_t>(gpu_stream_));
+
+                        // Diagnostic: checksum output after GEMM to detect corruption source
+                        if (trace_fused)
+                        {
+                            cudaStreamSynchronize(static_cast<cudaStream_t>(gpu_stream_));
+                            const size_t total = static_cast<size_t>(m) * n;
+                            std::vector<float> host_all(total);
+                            cudaMemcpy(host_all.data(), d_output, total * sizeof(float),
+                                       cudaMemcpyDeviceToHost);
+                            double sum = 0;
+                            float abs_max = 0;
+                            for (size_t ci = 0; ci < total; ++ci) {
+                                sum += static_cast<double>(host_all[ci]);
+                                float a = std::fabs(host_all[ci]);
+                                if (a > abs_max) abs_max = a;
+                            }
+                            LOG_WARN("[GEMM_DIAG] proj=" << i
+                                     << " name=" << (proj.name ? proj.name : "?")
+                                     << " m=" << m << " n=" << n << " k=" << k
+                                     << " total=" << total
+                                     << " fullsum=" << std::fixed << std::setprecision(6) << sum
+                                     << " absmax=" << abs_max
+                                     << " first4=[" << host_all[0] << "," << host_all[1]
+                                     << "," << host_all[2] << "," << host_all[3] << "]");
+                        }
                         continue;
                     }
 
@@ -2008,6 +2106,29 @@ namespace llaminar2
                         packed_ ? &packed_->rowmajor_ : nullptr))
                 {
                     LOG_DEBUG("[CUDAQuantisedGemmKernel::multiply_with_fused_swiglu] Complete (native GEMV)");
+
+                    // Diagnostic: checksum FFN_DOWN output (NativeVNNI path)
+                    if (debugEnv().gemm.cuda_fused_gemm_trace)
+                    {
+                        cudaStreamSynchronize(static_cast<cudaStream_t>(gpu_stream_));
+                        const size_t total = static_cast<size_t>(m) * n;
+                        std::vector<float> host_all(total);
+                        cudaMemcpy(host_all.data(), d_C, total * sizeof(float),
+                                   cudaMemcpyDeviceToHost);
+                        double sum = 0;
+                        float abs_max = 0;
+                        for (size_t ci = 0; ci < total; ++ci) {
+                            sum += static_cast<double>(host_all[ci]);
+                            float a = std::fabs(host_all[ci]);
+                            if (a > abs_max) abs_max = a;
+                        }
+                        LOG_WARN("[GEMM_SWIGLU] m=" << m << " n=" << n << " k=" << k
+                                 << " total=" << total
+                                 << " fullsum=" << std::fixed << std::setprecision(6) << sum
+                                 << " absmax=" << abs_max
+                                 << " first4=[" << host_all[0] << "," << host_all[1]
+                                 << "," << host_all[2] << "," << host_all[3] << "]");
+                    }
                     return true;
                 }
 
@@ -2032,6 +2153,29 @@ namespace llaminar2
                 }
 
                 LOG_DEBUG("[CUDAQuantisedGemmKernel::multiply_with_fused_swiglu] Complete (blockwise)");
+
+                // Diagnostic: checksum FFN_DOWN output
+                if (debugEnv().gemm.cuda_fused_gemm_trace)
+                {
+                    cudaStreamSynchronize(static_cast<cudaStream_t>(gpu_stream_));
+                    const size_t total = static_cast<size_t>(m) * n;
+                    std::vector<float> host_all(total);
+                    cudaMemcpy(host_all.data(), d_C, total * sizeof(float),
+                               cudaMemcpyDeviceToHost);
+                    double sum = 0;
+                    float abs_max = 0;
+                    for (size_t ci = 0; ci < total; ++ci) {
+                        sum += static_cast<double>(host_all[ci]);
+                        float a = std::fabs(host_all[ci]);
+                        if (a > abs_max) abs_max = a;
+                    }
+                    LOG_WARN("[GEMM_SWIGLU] m=" << m << " n=" << n << " k=" << k
+                             << " total=" << total
+                             << " fullsum=" << std::fixed << std::setprecision(6) << sum
+                             << " absmax=" << abs_max
+                             << " first4=[" << host_all[0] << "," << host_all[1]
+                             << "," << host_all[2] << "," << host_all[3] << "]");
+                }
                 return true;
             }
 

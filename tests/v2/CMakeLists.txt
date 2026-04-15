@@ -3577,6 +3577,33 @@ add_v2_test(V2_Unit_WeightSlicer
     MPI_PROCS 1
 )
 
+# Test: WeightViewSet (PP weight view accessor)
+add_executable(v2_unit_weight_view_set unit/loaders/Test__WeightViewSet.cpp)
+target_link_libraries(v2_unit_weight_view_set llaminar2_core GTest::gtest_main)
+add_v2_test(V2_Unit_WeightViewSet
+    COMMAND $<TARGET_FILE:v2_unit_weight_view_set>
+    LABELS "V2;Unit;PipelineParallelism;WeightSharding"
+    MPI_PROCS 1
+)
+
+# Test: PPActivationContract (PP inter-stage transfer contract)
+add_executable(v2_unit_pp_activation_contract unit/collective/Test__PPActivationContract.cpp)
+target_link_libraries(v2_unit_pp_activation_contract llaminar2_core GTest::gtest_main)
+add_v2_test(V2_Unit_PPActivationContract
+    COMMAND $<TARGET_FILE:v2_unit_pp_activation_contract>
+    LABELS "V2;Unit;PipelineParallelism;Collective"
+    MPI_PROCS 1
+)
+
+# Test: DeviceWeightPreparer (per-stage weight preparation for PP)
+add_executable(v2_unit_device_weight_preparer unit/kernels/Test__DeviceWeightPreparer.cpp)
+target_link_libraries(v2_unit_device_weight_preparer llaminar2_core GTest::gtest_main)
+add_v2_test(V2_Unit_DeviceWeightPreparer
+    COMMAND $<TARGET_FILE:v2_unit_device_weight_preparer>
+    LABELS "V2;Unit;PipelineParallelism;Kernels;WeightPreparation"
+    MPI_PROCS 1
+)
+
 add_v2_test(V2_Unit_WeightManagerFusedQKVTiedEmbeddings
     COMMAND $<TARGET_FILE:v2_test_weight_manager_fusedqkv_tied_embeddings>
     LABELS "V2;Unit;TensorParallelism;WeightSharding;FusedQKV;TiedEmbeddings;GatedDeltaNet;Qwen35"
@@ -3885,6 +3912,17 @@ add_v2_test(V2_Integration_CUDAGemmParity
     COMMAND $<TARGET_FILE:v2_integration_cuda_gemm_parity>
     LABELS "V2;Integration;CUDA;GEMM;Parity;FP32;IQ4_NL;Quantized;KernelFactory;CosineSimilarity"
     MPI_PROCS 1  # Tests GPU vs CPU parity locally, no MPI needed
+)
+
+# Test: CUDA GEMM Non-Determinism (self-consistency across repeated calls)
+# Exercises multiply_fused_tensor() N times with same input and checks output stability.
+# Reproduces split-K atomicAdd non-determinism seen in PP parity tests.
+add_executable(v2_integration_cuda_gemm_nondet integration/kernels/cuda/Test__CUDAGemmNonDeterminism.cpp)
+target_link_libraries(v2_integration_cuda_gemm_nondet llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Integration_CUDAGemmNonDeterminism
+    COMMAND $<TARGET_FILE:v2_integration_cuda_gemm_nondet>
+    LABELS "V2;Integration;CUDA;GEMM;NonDeterminism;Quantized;SplitK"
+    MPI_PROCS 1
 )
 
 # Test: CUDA Ops Parity (RMSNorm, SwiGLU, RoPE)

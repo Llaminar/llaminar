@@ -19,7 +19,7 @@
 #include "../../../execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "../ROCmKernelBase.h"
 #include "../../../backends/rocm/HipDeviceGuard.h"
-
+#include "../../../backends/GPUDeviceContextPool.h"
 #include "../../../utils/KVCacheProfiler.h"
 
 #include <algorithm>
@@ -678,7 +678,10 @@ namespace llaminar2
         }
 
         // Zero-initialize the entire pool
-        hipMemset(pool_base_, 0, pool_size_);
+        hipStream_t init_stream = static_cast<hipStream_t>(
+            GPUDeviceContextPool::instance().getAMDContext(device_id_).defaultStream());
+        hipMemsetAsync(pool_base_, 0, pool_size_, init_stream);
+        hipStreamSynchronize(init_stream);
 
         LOG_DEBUG("[ROCmRingKVCache] Pooled KV cache: 1 hipMalloc for "
                   << total_entries << " entries × 4 buffers = "

@@ -11,7 +11,7 @@
 namespace llaminar2
 {
 
-    bool CoherenceTracker::prepareForRead(TensorBase *tensor, CoherenceState &state, DeviceId target)
+    bool CoherenceTracker::prepareForRead(TensorBase *tensor, CoherenceState &state, DeviceId target, void *stream)
     {
         if (!tensor)
             return true; // External or null — nothing to do
@@ -43,7 +43,7 @@ namespace llaminar2
         if (target.is_gpu())
         {
             // Need data on GPU — upload from host
-            if (!tensor->ensureOnDevice(target))
+            if (!tensor->ensureOnDevice(target, stream))
             {
                 LOG_ERROR("CoherenceTracker: failed to upload tensor to " << target.to_string());
                 return false;
@@ -52,7 +52,7 @@ namespace llaminar2
         else
         {
             // Need data on CPU — download from GPU
-            if (!tensor->ensureOnHost())
+            if (!tensor->ensureOnHost(stream))
             {
                 LOG_ERROR("CoherenceTracker: failed to download tensor to host");
                 return false;
@@ -62,7 +62,7 @@ namespace llaminar2
         return true;
     }
 
-    bool CoherenceTracker::prepareForWrite(TensorBase *tensor, CoherenceState &state, DeviceId target)
+    bool CoherenceTracker::prepareForWrite(TensorBase *tensor, CoherenceState &state, DeviceId target, void *stream)
     {
         if (!tensor)
             return true;
@@ -70,7 +70,7 @@ namespace llaminar2
         if (target.is_gpu())
         {
             // Allocate GPU buffer if not yet allocated (don't transfer data)
-            if (!tensor->allocateOnDevice(target))
+            if (!tensor->allocateOnDevice(target, stream))
             {
                 LOG_ERROR("CoherenceTracker: failed to allocate device buffer on " << target.to_string());
                 return false;

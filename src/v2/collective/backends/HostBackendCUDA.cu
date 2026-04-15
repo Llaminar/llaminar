@@ -16,7 +16,7 @@ namespace llaminar2
     namespace host_backend_detail
     {
 
-        bool cudaCopyToHost(void *host_dst, const void *device_src, int device_ordinal, size_t bytes)
+        bool cudaCopyToHost(void *host_dst, const void *device_src, int device_ordinal, size_t bytes, void *stream)
         {
             cudaError_t err = cudaSetDevice(device_ordinal);
             if (err != cudaSuccess)
@@ -24,11 +24,15 @@ namespace llaminar2
                 return false;
             }
 
-            err = cudaMemcpy(host_dst, device_src, bytes, cudaMemcpyDeviceToHost);
+            cudaStream_t s = static_cast<cudaStream_t>(stream);
+            err = cudaMemcpyAsync(host_dst, device_src, bytes, cudaMemcpyDeviceToHost, s);
+            if (err != cudaSuccess)
+                return false;
+            err = cudaStreamSynchronize(s);
             return (err == cudaSuccess);
         }
 
-        bool cudaCopyFromHost(void *device_dst, const void *host_src, int device_ordinal, size_t bytes)
+        bool cudaCopyFromHost(void *device_dst, const void *host_src, int device_ordinal, size_t bytes, void *stream)
         {
             cudaError_t err = cudaSetDevice(device_ordinal);
             if (err != cudaSuccess)
@@ -36,7 +40,11 @@ namespace llaminar2
                 return false;
             }
 
-            err = cudaMemcpy(device_dst, host_src, bytes, cudaMemcpyHostToDevice);
+            cudaStream_t s = static_cast<cudaStream_t>(stream);
+            err = cudaMemcpyAsync(device_dst, host_src, bytes, cudaMemcpyHostToDevice, s);
+            if (err != cudaSuccess)
+                return false;
+            err = cudaStreamSynchronize(s);
             return (err == cudaSuccess);
         }
 

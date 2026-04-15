@@ -1358,7 +1358,7 @@ namespace llaminar2
             return false;
         }
 
-        // Same device - use hipMemcpy on coordinator thread (synchronous)
+        // Same device - use hipMemcpyAsync on coordinator stream (synchronous wait)
         if (src_device_idx == dst_device_idx)
         {
             return submitAndWait([&]()
@@ -1370,10 +1370,17 @@ namespace llaminar2
                 return false;
             }
 
-            err = hipMemcpy(dst_ptr, src_ptr, bytes, hipMemcpyDeviceToDevice);
+            hipStream_t stream = static_cast<hipStream_t>(streams_[src_device_idx]);
+            err = hipMemcpyAsync(dst_ptr, src_ptr, bytes, hipMemcpyDeviceToDevice, stream);
             if (err != hipSuccess)
             {
-                last_error_ = std::string("hipMemcpy failed: ") + hipGetErrorString(err);
+                last_error_ = std::string("hipMemcpyAsync failed: ") + hipGetErrorString(err);
+                return false;
+            }
+            err = hipStreamSynchronize(stream);
+            if (err != hipSuccess)
+            {
+                last_error_ = std::string("hipStreamSynchronize failed: ") + hipGetErrorString(err);
                 return false;
             }
             return true; });

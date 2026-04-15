@@ -292,14 +292,14 @@ namespace llaminar2
         // TensorSlice must delegate coherence operations to its wrapped inner
         // tensor for proper device memory management in MPI tensor parallelism.
 
-        bool ensureOnDevice(DeviceId target_device) override
+        bool ensureOnDevice(DeviceId target_device, void *stream = nullptr) override
         {
-            return inner()->ensureOnDevice(target_device);
+            return inner()->ensureOnDevice(target_device, stream);
         }
 
-        bool ensureOnHost() override
+        bool ensureOnHost(void *stream = nullptr) override
         {
-            return inner()->ensureOnHost();
+            return inner()->ensureOnHost(stream);
         }
 
         void mark_host_dirty() override
@@ -327,9 +327,9 @@ namespace llaminar2
             inner()->setGpuOnly();
         }
 
-        bool allocateOnDevice(DeviceId target_device) override
+        bool allocateOnDevice(DeviceId target_device, void *stream = nullptr) override
         {
-            return inner()->allocateOnDevice(target_device);
+            return inner()->allocateOnDevice(target_device, stream);
         }
 
         void invalidateGpuData() override

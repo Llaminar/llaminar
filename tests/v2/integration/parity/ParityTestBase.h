@@ -90,6 +90,8 @@
 #ifdef HAVE_CUDA
 #include "kernels/cuda/ops/CUDAEmbeddingKernelT.h"
 #include <cuda_runtime.h>
+// Deterministic mode: disables FP32 atomicAdd in split-K/stream-K GEMM
+extern "C" void cudaNativeVNNIPrefill_setDeterministicMode(bool enabled);
 #endif
 #ifdef HAVE_ROCM
 #include "kernels/rocm/ops/ROCmEmbeddingKernelT.h"
@@ -1743,6 +1745,20 @@ namespace llaminar2::test::parity
 
         void SetUp() override
         {
+            // Enable deterministic CUDA GEMM for reproducible parity results.
+            // Split-K and stream-K use FP32 atomicAdd whose non-associative
+            // accumulation order varies with CTA scheduling, causing run-to-run
+            // cosine similarity variance that can cross parity thresholds.
+            // For M=9 (typical parity prompt), all GEMM shapes except LM_head
+            // use split_k=2..8 with atomicAdd. CTA scheduling variance from
+            // concurrent prefill pool causes cross-run divergence that compounds
+            // through transformer layers into massive LM_HEAD cosine variance
+            // (observed 0.60-0.99 in PP HOST_CUDA_CPU without this flag).
+            setenv("LLAMINAR_DETERMINISTIC", "1", 1);
+#ifdef HAVE_CUDA
+            cudaNativeVNNIPrefill_setDeterministicMode(true);
+#endif
+
             // Start log file capture for this test run (rank 0 only)
             if (isRank0())
             {
@@ -2437,6 +2453,17 @@ namespace llaminar2::test::parity
             mdo_config.max_seq_len = 4096;
             mdo_config.batch_size = 1;
             mdo_config.activation_precision = ActivationPrecision::FP32;
+
+            // Match single-device parity setup: GPU snapshot capture uses mapped
+            // memory to avoid stage-by-stage D2H races on reused activation buffers.
+            for (auto dt : cfg().devices)
+            {
+                if (dt == ParityDeviceType::CUDA || dt == ParityDeviceType::ROCm)
+                {
+                    mdo_config.use_mapped_memory = true;
+                    break;
+                }
+            }
 
             // Create PP stage configurations
             // Track which device index we're at in the flat device list

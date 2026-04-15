@@ -44,10 +44,36 @@ namespace llaminar2
     }
 
     // ====================================================================
+    // Stream Resolution Helper
+    // ====================================================================
+
+    /// Resolve a CUDA stream for the given device. When the caller passes
+    /// nullptr we look up the device context's default (non-blocking) stream
+    /// so that NO operation ever runs on the null CUDA stream.
+    static cudaStream_t resolveStream(int device_id, void *stream)
+    {
+        if (stream)
+            return static_cast<cudaStream_t>(stream);
+
+        try
+        {
+            auto &ctx = GPUDeviceContextPool::instance().getNvidiaContext(device_id);
+            void *def = ctx.defaultStream();
+            if (def)
+                return static_cast<cudaStream_t>(def);
+        }
+        catch (...)
+        {
+            // Context not yet initialised (early weight load, tests).
+        }
+        return nullptr; // absolute fallback
+    }
+
+    // ====================================================================
     // Memory Transfer Operations
     // ====================================================================
 
-    bool CUDABackend::deviceToHost(void *dst, const void *src, size_t bytes, int device_id)
+    bool CUDABackend::deviceToHost(void *dst, const void *src, size_t bytes, int device_id, void *stream)
     {
         if (device_id >= device_count_ || device_id < 0)
         {
@@ -60,11 +86,15 @@ namespace llaminar2
             return false;
         }
 
-        cudaError_t err = cudaMemcpy(dst, src, bytes, cudaMemcpyDeviceToHost);
+        cudaStream_t s = resolveStream(device_id, stream);
+        cudaError_t err = cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToHost, s);
+        if (err != cudaSuccess)
+            return false;
+        err = cudaStreamSynchronize(s);
         return (err == cudaSuccess);
     }
 
-    bool CUDABackend::hostToDevice(void *dst, const void *src, size_t bytes, int device_id)
+    bool CUDABackend::hostToDevice(void *dst, const void *src, size_t bytes, int device_id, void *stream)
     {
         if (device_id >= device_count_ || device_id < 0)
         {
@@ -77,7 +107,11 @@ namespace llaminar2
             return false;
         }
 
-        cudaError_t err = cudaMemcpy(dst, src, bytes, cudaMemcpyHostToDevice);
+        cudaStream_t s = resolveStream(device_id, stream);
+        cudaError_t err = cudaMemcpyAsync(dst, src, bytes, cudaMemcpyHostToDevice, s);
+        if (err != cudaSuccess)
+            return false;
+        err = cudaStreamSynchronize(s);
         return (err == cudaSuccess);
     }
 
@@ -134,7 +168,8 @@ namespace llaminar2
         }
 
         cudaEvent_t event;
-        err = cudaEventCreate(&event);
+        err = cudaEventCreateWithFlags(&event, cudaEventDisableTiming);
+        // Note: cudaEventDisableTiming avoids GPU pipeline flush from timing events
         if (err != cudaSuccess)
         {
             LOG_ERROR("[CUDABackend::createEvent] cudaEventCreate failed: " << cudaGetErrorString(err));
@@ -350,7 +385,7 @@ namespace llaminar2
         }
     }
 
-    bool CUDABackend::memset(void *ptr, int value, size_t bytes, int device_id)
+    bool CUDABackend::memset(void *ptr, int value, size_t bytes, int device_id, void *stream)
     {
         if (ptr == nullptr || bytes == 0)
         {
@@ -372,10 +407,10 @@ namespace llaminar2
             return false;
         }
 
-        err = cudaMemset(ptr, value, bytes);
+        err = cudaMemsetAsync(ptr, value, bytes, resolveStream(device_id, stream));
         if (err != cudaSuccess)
         {
-            LOG_ERROR("[CUDABackend] cudaMemset failed: " << cudaGetErrorString(err));
+            LOG_ERROR("[CUDABackend] cudaMemsetAsync failed: " << cudaGetErrorString(err));
             return false;
         }
 
@@ -651,7 +686,7 @@ namespace llaminar2
         int device_idx, void *stream);
 
     bool CUDABackend::argmaxF32(const void *data_device, int n, int device_id,
-                                float *out_value, int *out_index)
+                                float *out_value, int *out_index, void *stream)
     {
         if (device_id >= device_count_ || device_id < 0 || !data_device || n <= 0)
             return false;
@@ -679,26 +714,26 @@ namespace llaminar2
         }
 
         cudaSetDevice(device_id);
+        cudaStream_t s = resolveStream(device_id, stream);
         if (!cudaOps_argmax_f32(
                 static_cast<const float *>(data_device), n,
                 static_cast<float *>(bufs.value_ptr),
                 static_cast<int *>(bufs.index_ptr),
-                device_id, nullptr))
+                device_id, s))
         {
             return false;
         }
 
-        // Sync only the default stream (where the kernel launched) instead
-        // of device-wide cudaDeviceSynchronize to avoid stalling other streams.
-        cudaStreamSynchronize(nullptr);
-        cudaMemcpy(out_value, bufs.value_ptr, sizeof(float), cudaMemcpyDeviceToHost);
-        cudaMemcpy(out_index, bufs.index_ptr, sizeof(int), cudaMemcpyDeviceToHost);
+        cudaStreamSynchronize(s);
+        cudaMemcpyAsync(out_value, bufs.value_ptr, sizeof(float), cudaMemcpyDeviceToHost, s);
+        cudaMemcpyAsync(out_index, bufs.index_ptr, sizeof(int), cudaMemcpyDeviceToHost, s);
+        cudaStreamSynchronize(s);
 
         return true;
     }
 
     bool CUDABackend::topKF32(const void *data_device, int n, int k, int device_id,
-                              float *out_values, int *out_indices)
+                              float *out_values, int *out_indices, void *stream)
     {
         if (device_id >= device_count_ || device_id < 0 || !data_device || n <= 0 || k <= 0)
             return false;
@@ -739,18 +774,20 @@ namespace llaminar2
         }
 
         cudaSetDevice(device_id);
+        cudaStream_t s = resolveStream(device_id, stream);
         if (!cudaOps_topk_f32(
                 static_cast<const float *>(data_device), n, k,
                 static_cast<float *>(bufs.values_ptr),
                 static_cast<int *>(bufs.indices_ptr),
-                device_id, nullptr))
+                device_id, s))
         {
             return false;
         }
 
-        cudaStreamSynchronize(nullptr);
-        cudaMemcpy(out_values, bufs.values_ptr, k * sizeof(float), cudaMemcpyDeviceToHost);
-        cudaMemcpy(out_indices, bufs.indices_ptr, k * sizeof(int), cudaMemcpyDeviceToHost);
+        cudaStreamSynchronize(s);
+        cudaMemcpyAsync(out_values, bufs.values_ptr, k * sizeof(float), cudaMemcpyDeviceToHost, s);
+        cudaMemcpyAsync(out_indices, bufs.indices_ptr, k * sizeof(int), cudaMemcpyDeviceToHost, s);
+        cudaStreamSynchronize(s);
 
         return true;
     }
@@ -776,7 +813,9 @@ namespace llaminar2
             auto future = promise->get_future();
             ctx.submitAsync([this, dst, src, bytes, device_id, promise]()
                             {
-                cudaError_t err = cudaMemcpy(dst, src, bytes, cudaMemcpyDeviceToHost);
+                cudaStream_t ws = resolveStream(device_id, nullptr);
+                cudaError_t err = cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToHost, ws);
+                if (err == cudaSuccess) err = cudaStreamSynchronize(ws);
                 promise->set_value(err == cudaSuccess); });
             return future;
         }
@@ -806,7 +845,9 @@ namespace llaminar2
             auto future = promise->get_future();
             ctx.submitAsync([this, dst, src, bytes, device_id, promise]()
                             {
-                cudaError_t err = cudaMemcpy(dst, src, bytes, cudaMemcpyHostToDevice);
+                cudaStream_t ws = resolveStream(device_id, nullptr);
+                cudaError_t err = cudaMemcpyAsync(dst, src, bytes, cudaMemcpyHostToDevice, ws);
+                if (err == cudaSuccess) err = cudaStreamSynchronize(ws);
                 promise->set_value(err == cudaSuccess); });
             return future;
         }
@@ -933,9 +974,11 @@ namespace llaminar2
                 GPUDeviceContextPool::instance().getNvidiaContext(device_id));
             auto promise = std::make_shared<std::promise<bool>>();
             auto future = promise->get_future();
-            ctx.submitAsync([ptr, value, bytes, promise]()
+            ctx.submitAsync([this, ptr, value, bytes, device_id, promise]()
                             {
-                cudaError_t err = cudaMemset(ptr, value, bytes);
+                cudaStream_t ws = resolveStream(device_id, nullptr);
+                cudaError_t err = cudaMemsetAsync(ptr, value, bytes, ws);
+                if (err == cudaSuccess) err = cudaStreamSynchronize(ws);
                 promise->set_value(err == cudaSuccess); });
             return future;
         }

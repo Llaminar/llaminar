@@ -1336,6 +1336,8 @@ add_library(llaminar2_core STATIC
     loaders/WeightStreamerFactory.cpp
     # Partial weight loader (Phase 3 - PP partial weight loading)
     loaders/PartialWeightLoader.cpp
+    # Shared weight pool (PP shared GGUF weight storage)
+    loaders/SharedWeightPool.cpp
     # Layer device placement (Phase 2 - multi-device graph building)
     execution/local_execution/device/LayerDevicePlacement.cpp
     # Qwen2 model and graph configuration
@@ -1408,6 +1410,8 @@ add_library(llaminar2_core STATIC
     kernels/KernelFactory.cpp
     kernels/HybridKVCacheConfig.cpp
     kernels/common/PreparedEmbeddingWeights.cpp
+    # Device weight preparer (PP per-device weight preparation)
+    kernels/DeviceWeightPreparer.cpp
     # Universal device kernel cache (hipBLAS, cuBLAS handles, etc.)
     kernels/DeviceKernelCache.cpp
     # Testing infrastructure

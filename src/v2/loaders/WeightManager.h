@@ -38,6 +38,7 @@
 
 namespace llaminar2
 {
+    class WeightViewSet; // Forward declaration for populateCacheFromPool()
 
     // WeightDistributionStrategy and ShardingMode are now in WeightTypes.h
     // (included transitively via WeightManagerConfig.h → WeightTypes.h)
@@ -453,6 +454,19 @@ namespace llaminar2
          * @return true if weight is a GEMM matrix (should release raw data after packing)
          */
         bool isGemmWeight(const std::string &name) const override;
+
+        /**
+         * @brief Pre-populate cache with shared tensors from a WeightViewSet
+         *
+         * Used by SharedWeightPool-based PP to avoid re-loading tensors from disk.
+         * The shared_ptr ownership is shared between the pool and this cache,
+         * so no tensor data is duplicated on host.
+         *
+         * Must be called BEFORE any getWeightForDevice() calls.
+         *
+         * @param views Weight view set containing shared tensors for this stage
+         */
+        void populateCacheFromPool(const WeightViewSet &views);
 
         // =========================================================================
         // Static utility methods (public for tensor slicing)

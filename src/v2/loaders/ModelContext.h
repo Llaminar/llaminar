@@ -24,6 +24,9 @@
 namespace llaminar2
 {
 
+    class ISharedWeightPool;
+    class WeightViewSet;
+
     /**
      * @brief Model context for pipeline initialization
      *
@@ -103,6 +106,35 @@ namespace llaminar2
          * @return Shared pointer to context, or nullptr on error
          */
         static std::shared_ptr<ModelContext> createForPPStage(
+            const std::string &model_path,
+            int first_layer,
+            int last_layer,
+            bool has_embedding,
+            bool has_lm_head,
+            std::shared_ptr<IMPIContext> mpi_ctx = nullptr,
+            WeightPrecision weight_precision = WeightPrecision::NATIVE);
+
+        /**
+         * @brief Create PP stage context backed by a SharedWeightPool
+         *
+         * Like createForPPStage(), but avoids re-parsing the GGUF file and
+         * re-loading weight tensors. Instead, the WeightManager's cache is
+         * pre-populated with shared_ptrs from the pool's WeightViewSet.
+         *
+         * The pool must have been loaded before calling this factory.
+         *
+         * @param pool Shared weight pool (already loaded)
+         * @param model_path Path to GGUF model file (for metadata re-parse only — fast)
+         * @param first_layer First layer index (inclusive)
+         * @param last_layer Last layer index (exclusive)
+         * @param has_embedding True if this stage should load embedding
+         * @param has_lm_head True if this stage should load output norm and LM head
+         * @param mpi_ctx MPI context (optional)
+         * @param weight_precision Weight loading precision (default: NATIVE)
+         * @return Shared pointer to context, or nullptr on error
+         */
+        static std::shared_ptr<ModelContext> createFromSharedPool(
+            ISharedWeightPool &pool,
             const std::string &model_path,
             int first_layer,
             int last_layer,

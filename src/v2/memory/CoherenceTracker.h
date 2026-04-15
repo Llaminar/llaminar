@@ -102,7 +102,7 @@ namespace llaminar2
          * @param target  Target device for reading
          * @return true on success
          */
-        static bool prepareForRead(TensorBase *tensor, CoherenceState &state, DeviceId target);
+        static bool prepareForRead(TensorBase *tensor, CoherenceState &state, DeviceId target, void *stream = nullptr);
 
         /**
          * @brief Ensure tensor has allocated storage on target device for writing.
@@ -115,7 +115,7 @@ namespace llaminar2
          * @param target  Target device for writing
          * @return true on success
          */
-        static bool prepareForWrite(TensorBase *tensor, CoherenceState &state, DeviceId target);
+        static bool prepareForWrite(TensorBase *tensor, CoherenceState &state, DeviceId target, void *stream = nullptr);
 
         /**
          * @brief Mark buffer as written on device.

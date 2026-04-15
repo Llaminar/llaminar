@@ -85,12 +85,12 @@ namespace llaminar2
         /// Full upload lifecycle: replaces TensorBase::ensureOnDevice() logic.
         /// Handles mapped, event wait, device migration, allocation, H2D.
         /// Caller must hold coherence_mutex_ and check graph-capture/CPU bailouts.
-        TransferResult uploadFull(TensorBase *tensor, DeviceId target_device);
+        TransferResult uploadFull(TensorBase *tensor, DeviceId target_device, void *stream = nullptr);
 
         /// Full download lifecycle: replaces TensorBase::ensureOnHost() logic.
         /// Handles mapped sync, event wait, standard D2H.
         /// Caller must hold coherence_mutex_.
-        TransferResult downloadFull(TensorBase *tensor);
+        TransferResult downloadFull(TensorBase *tensor, void *stream = nullptr);
 
         // ========================================================================
         // Singleton access (using default backend resolver)

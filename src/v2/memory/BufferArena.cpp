@@ -463,16 +463,16 @@ namespace llaminar2
     // Runtime coherence
     // =========================================================================
 
-    bool BufferArena::prepareForRead(BufferId id, DeviceId target)
+    bool BufferArena::prepareForRead(BufferId id, DeviceId target, void *stream)
     {
         auto &b = buf(id);
-        return CoherenceTracker::prepareForRead(b.tensorBase(), b.coherence, target);
+        return CoherenceTracker::prepareForRead(b.tensorBase(), b.coherence, target, stream);
     }
 
-    bool BufferArena::prepareForWrite(BufferId id, DeviceId target)
+    bool BufferArena::prepareForWrite(BufferId id, DeviceId target, void *stream)
     {
         auto &b = buf(id);
-        return CoherenceTracker::prepareForWrite(b.tensorBase(), b.coherence, target);
+        return CoherenceTracker::prepareForWrite(b.tensorBase(), b.coherence, target, stream);
     }
 
     void BufferArena::markWritten(BufferId id, DeviceId device, void *stream)

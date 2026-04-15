@@ -688,8 +688,9 @@ namespace llaminar2
                         return false;
                     }
 
-                    err = hipMemcpy(d_embed_q8, repacked.data.data(), repacked.byte_size,
-                                    hipMemcpyHostToDevice);
+                    err = hipMemcpyAsync(d_embed_q8, repacked.data.data(), repacked.byte_size,
+                                         hipMemcpyHostToDevice,
+                                         static_cast<hipStream_t>(getStream()));
                     if (err != hipSuccess)
                     {
                         LOG_ERROR("[ROCmEmbeddingKernelT] Failed to upload EmbedQ8 data: " << hipGetErrorString(err));
@@ -811,19 +812,23 @@ namespace llaminar2
                 std::vector<unsigned char> pre(kCanaryGuardBytes);
                 std::vector<unsigned char> post(kCanaryGuardBytes);
 
-                err = hipMemcpy(pre.data(), canary_base, kCanaryGuardBytes, hipMemcpyDeviceToHost);
+                err = hipMemcpyAsync(pre.data(), canary_base, kCanaryGuardBytes, hipMemcpyDeviceToHost,
+                                     static_cast<hipStream_t>(getStream()));
                 if (err != hipSuccess)
                 {
                     LOG_ERROR("[ROCmEmbeddingKernelT] Failed to read pre-guard: " << hipGetErrorString(err));
                     return false;
                 }
-                err = hipMemcpy(post.data(), static_cast<unsigned char *>(canary_base) + kCanaryGuardBytes + output_bytes,
-                                kCanaryGuardBytes, hipMemcpyDeviceToHost);
+                err = hipMemcpyAsync(post.data(), static_cast<unsigned char *>(canary_base) + kCanaryGuardBytes + output_bytes,
+                                     kCanaryGuardBytes, hipMemcpyDeviceToHost,
+                                     static_cast<hipStream_t>(getStream()));
                 if (err != hipSuccess)
                 {
                     LOG_ERROR("[ROCmEmbeddingKernelT] Failed to read post-guard: " << hipGetErrorString(err));
                     return false;
                 }
+                // Synchronize to ensure canary data is available on host
+                hipStreamSynchronize(static_cast<hipStream_t>(getStream()));
 
                 auto find_mismatch = [](const std::vector<unsigned char> &buf, unsigned char expected) -> size_t
                 {

@@ -8,6 +8,7 @@
 #include "CUDATurboQuantKernels.h"
 #include "../../../tensors/GpuTensorView.h"
 #include "../../../kernels/cpu/turboquant/TurboQuantContext.h"
+#include "../../../backends/GPUDeviceContextPool.h"
 #include "../../../utils/Logger.h"
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
@@ -72,8 +73,11 @@ namespace llaminar2
                 const auto &head0_ctx = layer0_ctx.for_layer(0);
                 const auto &cpu_rot = head0_ctx.rotation();
                 float gpu_rot_val = 0.0f;
-                cudaMemcpy(&gpu_rot_val, rotations_.d_rotations,
-                           sizeof(float), cudaMemcpyDeviceToHost);
+                cudaStream_t init_stream = static_cast<cudaStream_t>(
+                    GPUDeviceContextPool::instance().getNvidiaContext(device_id).defaultStream());
+                cudaMemcpyAsync(&gpu_rot_val, rotations_.d_rotations,
+                           sizeof(float), cudaMemcpyDeviceToHost, init_stream);
+                cudaStreamSynchronize(init_stream);
                 LOG_INFO("[CUDARingKVCacheTQ] Rotation check: CPU[0,0]=" << cpu_rot.matrix[0]
                                                                          << " GPU[0,0]=" << gpu_rot_val
                                                                          << " match=" << (std::abs(cpu_rot.matrix[0] - gpu_rot_val) < 1e-6f)
@@ -218,8 +222,11 @@ namespace llaminar2
 
         cudaMalloc(&entry.d_K, k_bytes);
         cudaMalloc(&entry.d_V, v_bytes);
-        cudaMemset(entry.d_K, 0, k_bytes);
-        cudaMemset(entry.d_V, 0, v_bytes);
+        cudaStream_t alloc_stream = static_cast<cudaStream_t>(
+            GPUDeviceContextPool::instance().getNvidiaContext(device_id_).defaultStream());
+        cudaMemsetAsync(entry.d_K, 0, k_bytes, alloc_stream);
+        cudaMemsetAsync(entry.d_V, 0, v_bytes, alloc_stream);
+        cudaStreamSynchronize(alloc_stream);
 
         entry.head = 0;
         entry.count = 0;

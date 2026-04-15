@@ -5,6 +5,7 @@
  */
 
 #include "WeightManager.h"
+#include "WeightViewSet.h"
 #include "../utils/Logger.h"
 #include "../utils/WeightLoadingProfiler.h"
 #include "../utils/DebugEnv.h"
@@ -3797,6 +3798,29 @@ namespace llaminar2
         // Unknown weight pattern - include by default (e.g., custom weights)
         LOG_DEBUG("[WeightManager] Unknown weight pattern, including: " << name);
         return true;
+    }
+
+    // =========================================================================
+    // SharedWeightPool integration
+    // =========================================================================
+
+    void WeightManager::populateCacheFromPool(const WeightViewSet &views)
+    {
+        std::unique_lock<std::mutex> lock(cache_mutex_);
+
+        size_t populated = 0;
+        for (const auto &view : views)
+        {
+            if (view.tensor)
+            {
+                cache_[view.name] = view.tensor; // shared_ptr — no data copy
+                populated++;
+            }
+        }
+
+        LOG_INFO("[WeightManager] Pre-populated cache with " << populated
+                                                             << " tensors from SharedWeightPool"
+                                                             << " (layer range [" << layer_first_ << ", " << layer_last_ << "))");
     }
 
 } // namespace llaminar2

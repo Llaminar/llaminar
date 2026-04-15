@@ -275,7 +275,8 @@ namespace llaminar2
             }
 
             size_t pos_bytes = static_cast<size_t>(seq_len) * sizeof(int);
-            hipError_t err = hipMemcpy(d_position_ids, position_ids, pos_bytes, hipMemcpyHostToDevice);
+            hipError_t err = hipMemcpyAsync(d_position_ids, position_ids, pos_bytes, hipMemcpyHostToDevice,
+                                            static_cast<hipStream_t>(gpu_stream_));
             if (err != hipSuccess)
             {
                 LOG_ERROR("[ROCmRoPEKernelT<FP32>] Failed to copy position_ids to GPU: " << hipGetErrorString(err));
@@ -562,7 +563,8 @@ namespace llaminar2
             }
 
             size_t pos_bytes = static_cast<size_t>(seq_len) * sizeof(int);
-            hipError_t err = hipMemcpy(d_position_ids, position_ids, pos_bytes, hipMemcpyHostToDevice);
+            hipError_t err = hipMemcpyAsync(d_position_ids, position_ids, pos_bytes, hipMemcpyHostToDevice,
+                                            static_cast<hipStream_t>(gpu_stream_));
             if (err != hipSuccess)
             {
                 LOG_ERROR("[ROCmRoPEKernelT<BF16>] Failed to copy position_ids to GPU: " << hipGetErrorString(err));
@@ -842,7 +844,8 @@ namespace llaminar2
             }
 
             size_t pos_bytes = static_cast<size_t>(seq_len) * sizeof(int);
-            hipError_t err = hipMemcpy(d_position_ids, position_ids, pos_bytes, hipMemcpyHostToDevice);
+            hipError_t err = hipMemcpyAsync(d_position_ids, position_ids, pos_bytes, hipMemcpyHostToDevice,
+                                            static_cast<hipStream_t>(gpu_stream_));
             if (err != hipSuccess)
             {
                 LOG_ERROR("[ROCmRoPEKernelT<FP16>] Failed to copy position_ids to GPU: " << hipGetErrorString(err));

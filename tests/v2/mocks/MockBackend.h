@@ -107,7 +107,7 @@ namespace llaminar2
             // IBackend Memory Transfer Operations
             // =================================================================
 
-            bool deviceToHost(void *dst, const void *src, size_t bytes, int device_id) override
+            bool deviceToHost(void *dst, const void *src, size_t bytes, int device_id, void *stream = nullptr) override
             {
                 std::lock_guard<std::mutex> lock(mutex_);
 
@@ -134,7 +134,7 @@ namespace llaminar2
                 return true;
             }
 
-            bool hostToDevice(void *dst, const void *src, size_t bytes, int device_id) override
+            bool hostToDevice(void *dst, const void *src, size_t bytes, int device_id, void *stream = nullptr) override
             {
                 std::lock_guard<std::mutex> lock(mutex_);
 
@@ -274,7 +274,7 @@ namespace llaminar2
                 }
             }
 
-            bool memset(void *ptr, int value, size_t bytes, int device_id) override
+            bool memset(void *ptr, int value, size_t bytes, int device_id, void *stream = nullptr) override
             {
                 (void)device_id;
                 if (ptr && bytes > 0)

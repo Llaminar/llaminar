@@ -31,6 +31,12 @@ struct CUDAPrefillContext_
     // Stream-K two-pass fixup buffer
     float *fixup_buf = nullptr;
     size_t fixup_buf_size = 0; // in bytes
+
+    // Split-K two-phase partials buffer: each z-slice writes its partial
+    // result to partials[z * M * N], then a reduce kernel sums them into C.
+    // This replaces the non-deterministic FP32 atomicAdd accumulation pattern.
+    float *splitk_partials = nullptr;
+    size_t splitk_partials_size = 0; // in bytes
 };
 
 static int querySmCount(CUDAPrefillContext_ *ctx)
@@ -60,6 +66,22 @@ static float *getOrAllocFixupBuffer(CUDAPrefillContext_ *ctx, size_t required_by
     }
     cudaMemsetAsync(ctx->fixup_buf, 0, required_bytes, stream);
     return ctx->fixup_buf;
+}
+
+static float *getOrAllocSplitkPartials(CUDAPrefillContext_ *ctx, size_t required_bytes)
+{
+    if (ctx->splitk_partials_size < required_bytes)
+    {
+        if (ctx->splitk_partials)
+            cudaFree(ctx->splitk_partials);
+        ctx->splitk_partials = nullptr;
+        ctx->splitk_partials_size = 0;
+        cudaSetDevice(ctx->device_id);
+        if (cudaMalloc(&ctx->splitk_partials, required_bytes) != cudaSuccess)
+            return nullptr;
+        ctx->splitk_partials_size = required_bytes;
+    }
+    return ctx->splitk_partials;
 }
 
 namespace
@@ -97,6 +119,37 @@ namespace
         TileId tile;
         int split_k;
     };
+
+    // ─── Split-K two-phase reduce kernel ───────────────────────────────
+    // Sums SPLIT_K partial results into the final output buffer C.
+    // Each z-slice of the GEMM wrote its partial to partials[z * M * N].
+    // This kernel sums across z-slices for each (m, n) element.
+    // Also applies beta * C_existing + bias if present.
+    // Grid: ceil(M*N / 256), Block: 256
+    __global__ void splitk_reduce(
+        const float *__restrict__ partials,
+        float *__restrict__ C,
+        const float *__restrict__ C_existing,
+        const float *__restrict__ bias,
+        int M, int N, int split_k,
+        float beta)
+    {
+        const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+        const int total = M * N;
+        if (idx >= total)
+            return;
+
+        float sum = 0.0f;
+        for (int z = 0; z < split_k; ++z)
+            sum += partials[z * total + idx];
+
+        if (beta != 0.0f && C_existing)
+            sum += beta * C_existing[idx];
+        if (bias)
+            sum += bias[idx % N];
+
+        C[idx] = sum;
+    }
 
     __device__ __forceinline__ int frag_row(int lane_id, int elem)
     {
@@ -517,6 +570,12 @@ namespace
 
         const bool simple_epilogue = (beta == 0.0f) && (bias == nullptr);
 
+        // Two-phase split-K: each z-slice writes to partials at offset
+        // blockIdx.z * M * N. The reduce kernel sums across z-slices.
+        float *__restrict__ C_out = C;
+        if constexpr (SPLIT_K > 1)
+            C_out = C + blockIdx.z * M * N;
+
 #pragma unroll
         for (int wj = 0; wj < WN; ++wj)
         {
@@ -534,27 +593,17 @@ namespace
                 const int tile_m = block_m + wr * WARP_M + wi * 16;
                 const bool interior = (tile_m + 15 < M) && (tile_n + 7 < N);
 
-                if (interior && simple_epilogue)
+                if (interior && (simple_epilogue || SPLIT_K > 1))
                 {
                     const int out_idx0 = (tile_m + frag_row(lane_id, 0)) * N + gc0;
                     const int out_idx1 = (tile_m + frag_row(lane_id, 1)) * N + gc1;
                     const int out_idx2 = (tile_m + frag_row(lane_id, 2)) * N + gc0;
                     const int out_idx3 = (tile_m + frag_row(lane_id, 3)) * N + gc1;
 
-                    if constexpr (SPLIT_K > 1)
-                    {
-                        atomicAdd(&C[out_idx0], acc[wi][wj][0] * alpha);
-                        atomicAdd(&C[out_idx1], acc[wi][wj][1] * alpha);
-                        atomicAdd(&C[out_idx2], acc[wi][wj][2] * alpha);
-                        atomicAdd(&C[out_idx3], acc[wi][wj][3] * alpha);
-                    }
-                    else
-                    {
-                        C[out_idx0] = acc[wi][wj][0] * alpha;
-                        C[out_idx1] = acc[wi][wj][1] * alpha;
-                        C[out_idx2] = acc[wi][wj][2] * alpha;
-                        C[out_idx3] = acc[wi][wj][3] * alpha;
-                    }
+                    C_out[out_idx0] = acc[wi][wj][0] * alpha;
+                    C_out[out_idx1] = acc[wi][wj][1] * alpha;
+                    C_out[out_idx2] = acc[wi][wj][2] * alpha;
+                    C_out[out_idx3] = acc[wi][wj][3] * alpha;
                     continue;
                 }
 
@@ -569,25 +618,14 @@ namespace
                         const int out_idx = gr * N + gc;
                         float val = acc[wi][wj][e] * alpha;
 
-                        if constexpr (SPLIT_K > 1)
-                        {
-                            if (blockIdx.z == 0)
-                            {
-                                if (beta != 0.0f && C_existing)
-                                    val += beta * C_existing[out_idx];
-                                if (bias)
-                                    val += (e & 1) ? bias1 : bias0;
-                            }
-                            atomicAdd(&C[out_idx], val);
-                        }
-                        else
+                        if constexpr (SPLIT_K == 1)
                         {
                             if (beta != 0.0f && C_existing)
                                 val += beta * C_existing[out_idx];
                             if (bias)
                                 val += (e & 1) ? bias1 : bias0;
-                            C[out_idx] = val;
                         }
+                        C_out[out_idx] = val;
                     }
                 }
             }
@@ -1930,6 +1968,13 @@ namespace
             // Epilogue: write accumulators to global memory
             const bool simple_epilogue = (beta == 0.0f) && (bias == nullptr);
 
+            // Two-phase split-K: each z-slice writes to partials at offset
+            // blockIdx.z * M * N. The reduce kernel sums across z-slices.
+            // For SPLIT_K == 1, C points to the final output directly.
+            float *__restrict__ C_out = C;
+            if constexpr (SPLIT_K > 1)
+                C_out = C + blockIdx.z * M * N;
+
 #pragma unroll
             for (int wj = 0; wj < WN; ++wj)
             {
@@ -1947,27 +1992,18 @@ namespace
                     const int tile_m = block_m + wr * WARP_M + wi * 16;
                     const bool interior = (tile_m + 15 < M) && (tile_n + 7 < N);
 
-                    if (interior && simple_epilogue)
+                    if (interior && (simple_epilogue || SPLIT_K > 1))
                     {
                         const int out_idx0 = (tile_m + frag_row(lane_id, 0)) * N + gc0;
                         const int out_idx1 = (tile_m + frag_row(lane_id, 1)) * N + gc1;
                         const int out_idx2 = (tile_m + frag_row(lane_id, 2)) * N + gc0;
                         const int out_idx3 = (tile_m + frag_row(lane_id, 3)) * N + gc1;
 
-                        if constexpr (SPLIT_K > 1)
-                        {
-                            atomicAdd(&C[out_idx0], acc[wi][wj][0] * alpha);
-                            atomicAdd(&C[out_idx1], acc[wi][wj][1] * alpha);
-                            atomicAdd(&C[out_idx2], acc[wi][wj][2] * alpha);
-                            atomicAdd(&C[out_idx3], acc[wi][wj][3] * alpha);
-                        }
-                        else
-                        {
-                            C[out_idx0] = acc[wi][wj][0] * alpha;
-                            C[out_idx1] = acc[wi][wj][1] * alpha;
-                            C[out_idx2] = acc[wi][wj][2] * alpha;
-                            C[out_idx3] = acc[wi][wj][3] * alpha;
-                        }
+                        // Direct stores: for SPLIT_K > 1, beta/bias handled by reduce kernel
+                        C_out[out_idx0] = acc[wi][wj][0] * alpha;
+                        C_out[out_idx1] = acc[wi][wj][1] * alpha;
+                        C_out[out_idx2] = acc[wi][wj][2] * alpha;
+                        C_out[out_idx3] = acc[wi][wj][3] * alpha;
                         continue;
                     }
 
@@ -1982,25 +2018,15 @@ namespace
                             const int out_idx = gr * N + gc;
                             float val = acc[wi][wj][e] * alpha;
 
-                            if constexpr (SPLIT_K > 1)
-                            {
-                                if (blockIdx.z == 0)
-                                {
-                                    if (beta != 0.0f && C_existing)
-                                        val += beta * C_existing[out_idx];
-                                    if (bias)
-                                        val += (e & 1) ? bias1 : bias0;
-                                }
-                                atomicAdd(&C[out_idx], val);
-                            }
-                            else
+                            if constexpr (SPLIT_K == 1)
                             {
                                 if (beta != 0.0f && C_existing)
                                     val += beta * C_existing[out_idx];
                                 if (bias)
                                     val += (e & 1) ? bias1 : bias0;
-                                C[out_idx] = val;
                             }
+                            // Direct store: for SPLIT_K > 1, beta/bias handled by reduce kernel
+                            C_out[out_idx] = val;
                         }
                     }
                 }
@@ -2306,6 +2332,12 @@ namespace
         // Epilogue: write accumulators to global memory
         const bool simple_epilogue = (beta == 0.0f) && (bias == nullptr);
 
+        // Two-phase split-K: each z-slice writes to partials at offset
+        // blockIdx.z * M * N. The reduce kernel sums across z-slices.
+        float *__restrict__ C_out = C;
+        if constexpr (SPLIT_K > 1)
+            C_out = C + blockIdx.z * M * N;
+
 #pragma unroll
         for (int wj = 0; wj < WN; ++wj)
         {
@@ -2323,27 +2355,17 @@ namespace
                 const int tile_m = block_m + wr * WARP_M + wi * 16;
                 const bool interior = (tile_m + 15 < M) && (tile_n + 7 < N);
 
-                if (interior && simple_epilogue)
+                if (interior && (simple_epilogue || SPLIT_K > 1))
                 {
                     const int out_idx0 = (tile_m + frag_row(lane_id, 0)) * N + gc0;
                     const int out_idx1 = (tile_m + frag_row(lane_id, 1)) * N + gc1;
                     const int out_idx2 = (tile_m + frag_row(lane_id, 2)) * N + gc0;
                     const int out_idx3 = (tile_m + frag_row(lane_id, 3)) * N + gc1;
 
-                    if constexpr (SPLIT_K > 1)
-                    {
-                        atomicAdd(&C[out_idx0], acc[wi][wj][0] * alpha);
-                        atomicAdd(&C[out_idx1], acc[wi][wj][1] * alpha);
-                        atomicAdd(&C[out_idx2], acc[wi][wj][2] * alpha);
-                        atomicAdd(&C[out_idx3], acc[wi][wj][3] * alpha);
-                    }
-                    else
-                    {
-                        C[out_idx0] = acc[wi][wj][0] * alpha;
-                        C[out_idx1] = acc[wi][wj][1] * alpha;
-                        C[out_idx2] = acc[wi][wj][2] * alpha;
-                        C[out_idx3] = acc[wi][wj][3] * alpha;
-                    }
+                    C_out[out_idx0] = acc[wi][wj][0] * alpha;
+                    C_out[out_idx1] = acc[wi][wj][1] * alpha;
+                    C_out[out_idx2] = acc[wi][wj][2] * alpha;
+                    C_out[out_idx3] = acc[wi][wj][3] * alpha;
                     continue;
                 }
 
@@ -2358,25 +2380,14 @@ namespace
                         const int out_idx = gr * N + gc;
                         float val = acc[wi][wj][e] * alpha;
 
-                        if constexpr (SPLIT_K > 1)
-                        {
-                            if (blockIdx.z == 0)
-                            {
-                                if (beta != 0.0f && C_existing)
-                                    val += beta * C_existing[out_idx];
-                                if (bias)
-                                    val += (e & 1) ? bias1 : bias0;
-                            }
-                            atomicAdd(&C[out_idx], val);
-                        }
-                        else
+                        if constexpr (SPLIT_K == 1)
                         {
                             if (beta != 0.0f && C_existing)
                                 val += beta * C_existing[out_idx];
                             if (bias)
                                 val += (e & 1) ? bias1 : bias0;
-                            C[out_idx] = val;
                         }
+                        C_out[out_idx] = val;
                     }
                 }
             }
@@ -2404,6 +2415,16 @@ namespace
     // =========================================================================
     static int g_force_tile_id = -1;
     static int g_force_split_k = 0;
+
+    // Deterministic mode: disables stream-K (which still uses FP32 atomicAdd).
+    // Standard split-K paths use deterministic two-phase reduction and are
+    // unaffected by this flag.
+    // Set via LLAMINAR_DETERMINISTIC=1 env var.
+    static bool g_deterministic_mode = []()
+    {
+        const char *env = std::getenv("LLAMINAR_DETERMINISTIC");
+        return env && std::atoi(env) != 0;
+    }();
 
     // BK256 mode: 0=auto (heuristic), 1=force ON, -1=force OFF
     // Set via LLAMINAR_BK256_MODE env var or extern C API.
@@ -2703,19 +2724,28 @@ namespace
         float beta,
         const float *d_C_existing,
         const float *d_bias,
-        cudaStream_t cuda_stream)
+        cudaStream_t cuda_stream,
+        CUDAPrefillContext_ *prefill_ctx = nullptr)
     {
         const dim3 grid((M + BM - 1) / BM, (N + BN - 1) / BN, SPLIT_K);
         const dim3 block(WM * WN * 32);
 
+        // Two-phase split-K: allocate partials, pass as C, reduce after
+        float *d_kernel_C = d_C_fp32;
         if constexpr (SPLIT_K > 1)
-            cudaMemsetAsync(d_C_fp32, 0, static_cast<size_t>(M) * N * sizeof(float), cuda_stream);
+        {
+            const size_t partials_bytes = static_cast<size_t>(SPLIT_K) * M * N * sizeof(float);
+            float *partials = prefill_ctx ? getOrAllocSplitkPartials(prefill_ctx, partials_bytes) : nullptr;
+            if (!partials)
+                return false;
+            d_kernel_C = partials;
+        }
 
         q40NativeVNNITensorCoreKernel<BM, BN, WM, WN, SPLIT_K, SINGLE_PASS_MATERIALIZE><<<grid, block, 0, cuda_stream>>>(
             d_A_int8,
             d_payload,
             d_scales,
-            d_C_fp32,
+            d_kernel_C,
             d_scales_A_block,
             d_C_existing,
             d_bias,
@@ -2724,7 +2754,21 @@ namespace
             K,
             alpha,
             beta);
-        return cudaGetLastError() == cudaSuccess;
+        if (cudaGetLastError() != cudaSuccess)
+            return false;
+
+        if constexpr (SPLIT_K > 1)
+        {
+            const int total = M * N;
+            const int threads = 256;
+            const int blocks = (total + threads - 1) / threads;
+            splitk_reduce<<<blocks, threads, 0, cuda_stream>>>(
+                d_kernel_C, d_C_fp32, d_C_existing, d_bias,
+                M, N, SPLIT_K, beta);
+            if (cudaGetLastError() != cudaSuccess)
+                return false;
+        }
+        return true;
     }
 
     template <uint8_t CODEBOOK_ID, int BM, int BN, int WM, int WN, int SPLIT_K = 1>
@@ -2743,7 +2787,8 @@ namespace
         float beta,
         const float *d_C_existing,
         const float *d_bias,
-        cudaStream_t cuda_stream)
+        cudaStream_t cuda_stream,
+        CUDAPrefillContext_ *prefill_ctx = nullptr)
     {
         const int num_k_tiles = (K / 32 + 1) / 2; // ceil: handles K%64!=0
         int kt_per_part = num_k_tiles;
@@ -2755,8 +2800,16 @@ namespace
         const dim3 grid((M + BM - 1) / BM, (N + BN - 1) / BN, SPLIT_K);
         const dim3 block(WM * WN * 32);
 
+        // Two-phase split-K: allocate partials, pass as C, reduce after
+        float *d_kernel_C = d_C_fp32;
         if constexpr (SPLIT_K > 1)
-            cudaMemsetAsync(d_C_fp32, 0, static_cast<size_t>(M) * N * sizeof(float), cuda_stream);
+        {
+            const size_t partials_bytes = static_cast<size_t>(SPLIT_K) * M * N * sizeof(float);
+            float *partials = prefill_ctx ? getOrAllocSplitkPartials(prefill_ctx, partials_bytes) : nullptr;
+            if (!partials)
+                return false;
+            d_kernel_C = partials;
+        }
 
         // Clear any stale CUDA error from prior operations (e.g. CUTLASS reference path)
         (void)cudaGetLastError();
@@ -2767,7 +2820,7 @@ namespace
             d_scales,
             d_mins,
             d_emins,
-            d_C_fp32,
+            d_kernel_C,
             d_scales_A_block,
             d_C_existing,
             d_bias,
@@ -2777,7 +2830,22 @@ namespace
             alpha,
             beta,
             nullptr);
-        return cudaGetLastError() == cudaSuccess;
+        if (cudaGetLastError() != cudaSuccess)
+            return false;
+
+        // Launch reduce kernel to sum partials into final output
+        if constexpr (SPLIT_K > 1)
+        {
+            const int total = M * N;
+            const int threads = 256;
+            const int blocks = (total + threads - 1) / threads;
+            splitk_reduce<<<blocks, threads, 0, cuda_stream>>>(
+                d_kernel_C, d_C_fp32, d_C_existing, d_bias,
+                M, N, SPLIT_K, beta);
+            if (cudaGetLastError() != cudaSuccess)
+                return false;
+        }
+        return true;
     }
 
     // Single-buffered BK=64 launch helper (STAGES_=1, higher occupancy target)
@@ -2797,7 +2865,8 @@ namespace
         float beta,
         const float *d_C_existing,
         const float *d_bias,
-        cudaStream_t cuda_stream)
+        cudaStream_t cuda_stream,
+        CUDAPrefillContext_ *prefill_ctx = nullptr)
     {
         const int num_k_tiles = (K / 32 + 1) / 2;
         int kt_per_part = num_k_tiles;
@@ -2809,8 +2878,16 @@ namespace
         const dim3 grid((M + BM - 1) / BM, (N + BN - 1) / BN, SPLIT_K);
         const dim3 block(WM * WN * 32);
 
+        // Two-phase split-K: allocate partials, pass as C, reduce after
+        float *d_kernel_C = d_C_fp32;
         if constexpr (SPLIT_K > 1)
-            cudaMemsetAsync(d_C_fp32, 0, static_cast<size_t>(M) * N * sizeof(float), cuda_stream);
+        {
+            const size_t partials_bytes = static_cast<size_t>(SPLIT_K) * M * N * sizeof(float);
+            float *partials = prefill_ctx ? getOrAllocSplitkPartials(prefill_ctx, partials_bytes) : nullptr;
+            if (!partials)
+                return false;
+            d_kernel_C = partials;
+        }
 
         (void)cudaGetLastError();
 
@@ -2821,7 +2898,7 @@ namespace
             d_scales,
             d_mins,
             d_emins,
-            d_C_fp32,
+            d_kernel_C,
             d_scales_A_block,
             d_C_existing,
             d_bias,
@@ -2831,7 +2908,21 @@ namespace
             alpha,
             beta,
             nullptr);
-        return cudaGetLastError() == cudaSuccess;
+        if (cudaGetLastError() != cudaSuccess)
+            return false;
+
+        if constexpr (SPLIT_K > 1)
+        {
+            const int total = M * N;
+            const int threads = 256;
+            const int blocks = (total + threads - 1) / threads;
+            splitk_reduce<<<blocks, threads, 0, cuda_stream>>>(
+                d_kernel_C, d_C_fp32, d_C_existing, d_bias,
+                M, N, SPLIT_K, beta);
+            if (cudaGetLastError() != cudaSuccess)
+                return false;
+        }
+        return true;
     }
 
     // =========================================================================
@@ -3090,6 +3181,10 @@ namespace
     // =========================================================================
     bool shouldUseStreamK(int M, int N, int K, int bm, int bn, CUDAPrefillContext_ *prefill_ctx)
     {
+        // Deterministic mode: stream-K uses FP32 atomicAdd, disable completely
+        if (g_deterministic_mode)
+            return false;
+
         // Respect force mode from test harness
         if (g_stream_k_force_mode < 0)
             return false;
@@ -3160,7 +3255,8 @@ namespace
         float beta,
         const float *d_C_existing,
         const float *d_bias,
-        cudaStream_t cuda_stream)
+        cudaStream_t cuda_stream,
+        CUDAPrefillContext_ *prefill_ctx = nullptr)
     {
         // Compute dynamic smem size (must match kernel layout: A uses K=128 half)
         constexpr int SCALES_B_OFF = BM * BK128_STRIDE + BN * BK256_STRIDE;
@@ -3187,8 +3283,16 @@ namespace
         const dim3 grid((M + BM - 1) / BM, (N + BN - 1) / BN, SPLIT_K);
         const dim3 block(WM * WN * 32);
 
+        // Two-phase split-K: allocate partials, pass as C, reduce after
+        float *d_kernel_C = d_C_fp32;
         if constexpr (SPLIT_K > 1)
-            cudaMemsetAsync(d_C_fp32, 0, static_cast<size_t>(M) * N * sizeof(float), cuda_stream);
+        {
+            const size_t partials_bytes = static_cast<size_t>(SPLIT_K) * M * N * sizeof(float);
+            float *partials = prefill_ctx ? getOrAllocSplitkPartials(prefill_ctx, partials_bytes) : nullptr;
+            if (!partials)
+                return false;
+            d_kernel_C = partials;
+        }
 
         (void)cudaGetLastError(); // clear stale errors
 
@@ -3196,7 +3300,7 @@ namespace
             d_A_int8,
             d_payload,
             d_scales,
-            d_C_fp32,
+            d_kernel_C,
             d_scales_A_block,
             d_C_existing,
             d_bias,
@@ -3205,7 +3309,21 @@ namespace
             K,
             alpha,
             beta);
-        return cudaGetLastError() == cudaSuccess;
+        if (cudaGetLastError() != cudaSuccess)
+            return false;
+
+        if constexpr (SPLIT_K > 1)
+        {
+            const int total = M * N;
+            const int threads = 256;
+            const int blocks = (total + threads - 1) / threads;
+            splitk_reduce<<<blocks, threads, 0, cuda_stream>>>(
+                d_kernel_C, d_C_fp32, d_C_existing, d_bias,
+                M, N, SPLIT_K, beta);
+            if (cudaGetLastError() != cudaSuccess)
+                return false;
+        }
+        return true;
     }
 
     int chooseSplitK_BK256(int M, int N, int K, int bm, int bn, CUDAPrefillContext_ *prefill_ctx)
@@ -3264,16 +3382,18 @@ namespace
             const bool bk256_auto = !bk256_disabled && (K > 2 * N) && (t64x128_check < SM);
             if (bk256_forced || bk256_auto)
             {
-                const int sk = chooseSplitK_BK256(M, N, K, 128, 128, prefill_ctx);
+                int sk = chooseSplitK_BK256(M, N, K, 128, 128, prefill_ctx);
+                // Deterministic mode: cap split_k for PyTorch numerical parity
+                if (g_deterministic_mode && sk > 1) sk = 1;
                 bool ok = false;
                 if (sk >= 2)
                     ok = launchNativeVNNITC_BK256<128, 128, 4, 4, 2>(
                         d_A_int8, d_payload, d_scales, d_C_fp32, d_scales_A_block,
-                        M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream);
+                        M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
                 else
                     ok = launchNativeVNNITC_BK256<128, 128, 4, 4, 1>(
                         d_A_int8, d_payload, d_scales, d_C_fp32, d_scales_A_block,
-                        M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream);
+                        M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
                 if (ok)
                     return true;
                 // Fall through to BK64 dispatch if BK256 failed
@@ -3305,6 +3425,13 @@ namespace
             }
         }
 
+        // Deterministic mode: cap split_k to 1 for maximum numerical parity
+        // with PyTorch's single-pass FP32 matmul. Two-phase split-K is
+        // deterministic by design, but split-K introduces FP32 rounding
+        // differences vs single-pass that compound through transformer layers.
+        if (g_deterministic_mode && tc.split_k > 1)
+            tc.split_k = 1;
+
         // ─── Tile launch with StreamK evaluation (CB=0) ──────────────
         // For CB=0: try StreamK (wave-tail smoothing) before standard split_k.
         // Other formats use standard split_k directly.
@@ -3332,22 +3459,22 @@ namespace
             return launchNativeVNNITC_BK64<CB, BM_, BN_, WM_, WN_, 8>(                  \
                 d_A_int8, d_payload, d_scales, d_mins, d_emins, d_C_fp32,               \
                 d_scales_A_block, M, N, K, alpha, beta, d_C_existing, d_bias,           \
-                cuda_stream);                                                           \
+                cuda_stream, prefill_ctx);                                              \
         case 4:                                                                         \
             return launchNativeVNNITC_BK64<CB, BM_, BN_, WM_, WN_, 4>(                  \
                 d_A_int8, d_payload, d_scales, d_mins, d_emins, d_C_fp32,               \
                 d_scales_A_block, M, N, K, alpha, beta, d_C_existing, d_bias,           \
-                cuda_stream);                                                           \
+                cuda_stream, prefill_ctx);                                              \
         case 2:                                                                         \
             return launchNativeVNNITC_BK64<CB, BM_, BN_, WM_, WN_, 2>(                  \
                 d_A_int8, d_payload, d_scales, d_mins, d_emins, d_C_fp32,               \
                 d_scales_A_block, M, N, K, alpha, beta, d_C_existing, d_bias,           \
-                cuda_stream);                                                           \
+                cuda_stream, prefill_ctx);                                              \
         default:                                                                        \
             return launchNativeVNNITC_BK64<CB, BM_, BN_, WM_, WN_, 1>(                  \
                 d_A_int8, d_payload, d_scales, d_mins, d_emins, d_C_fp32,               \
                 d_scales_A_block, M, N, K, alpha, beta, d_C_existing, d_bias,           \
-                cuda_stream);                                                           \
+                cuda_stream, prefill_ctx);                                              \
         }                                                                               \
     } while (0)
 
@@ -3400,6 +3527,17 @@ extern "C"
     {
         // Fixup buffer is now owned by CUDAPrefillContext, freed on context destroy.
         // This function is kept for backward compatibility but is a no-op.
+    }
+
+    // Deterministic mode API: disables all FP32 atomicAdd paths (split-K, stream-K)
+    void cudaNativeVNNIPrefill_setDeterministicMode(bool enabled)
+    {
+        g_deterministic_mode = enabled;
+    }
+
+    bool cudaNativeVNNIPrefill_getDeterministicMode()
+    {
+        return g_deterministic_mode;
     }
 
     // Force-tile/split-k override for sweep benchmarks.
@@ -3463,6 +3601,11 @@ extern "C"
         {
             cudaSetDevice(ctx->device_id);
             cudaFree(ctx->fixup_buf);
+        }
+        if (ctx->splitk_partials)
+        {
+            cudaSetDevice(ctx->device_id);
+            cudaFree(ctx->splitk_partials);
         }
         delete ctx;
     }

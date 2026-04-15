@@ -67,7 +67,7 @@ public:
     mutable DeviceId last_allocateOnDevice_target = DeviceId::cpu();
 
     // Override coherence methods to track calls
-    bool ensureOnDevice(DeviceId target_device) override
+    bool ensureOnDevice(DeviceId target_device, void *stream = nullptr) override
     {
         ensureOnDevice_calls++;
         last_ensureOnDevice_target = target_device;
@@ -75,13 +75,13 @@ public:
         return true;
     }
 
-    bool ensureOnHost() override
+    bool ensureOnHost(void *stream = nullptr) override
     {
         ensureOnHost_calls++;
         return true;
     }
 
-    bool allocateOnDevice(DeviceId target_device) override
+    bool allocateOnDevice(DeviceId target_device, void *stream = nullptr) override
     {
         allocateOnDevice_calls++;
         last_allocateOnDevice_target = target_device;

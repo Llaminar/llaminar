@@ -200,7 +200,7 @@ namespace llaminar2
          *
          * @return true on success
          */
-        bool prepareForRead(BufferId id, DeviceId target);
+        bool prepareForRead(BufferId id, DeviceId target, void *stream = nullptr);
 
         /**
          * @brief Ensure buffer has allocated storage on target for writing.
@@ -209,7 +209,7 @@ namespace llaminar2
          *
          * @return true on success
          */
-        bool prepareForWrite(BufferId id, DeviceId target);
+        bool prepareForWrite(BufferId id, DeviceId target, void *stream = nullptr);
 
         /**
          * @brief Mark buffer as written on the given device.

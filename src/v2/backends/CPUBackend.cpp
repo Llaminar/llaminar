@@ -234,7 +234,7 @@ namespace llaminar2
         std::free(ptr);
     }
 
-    bool CPUBackend::memset(void *ptr, int value, size_t bytes, int device_id)
+    bool CPUBackend::memset(void *ptr, int value, size_t bytes, int device_id, void *stream)
     {
         if (ptr == nullptr || bytes == 0)
         {
@@ -272,7 +272,7 @@ namespace llaminar2
     // Transfer Operations (memcpy for CPU)
     // ====================================================================
 
-    bool CPUBackend::deviceToHost(void *dst, const void *src, size_t bytes, int device_id)
+    bool CPUBackend::deviceToHost(void *dst, const void *src, size_t bytes, int device_id, void *stream)
     {
         if (!isValidDeviceId(device_id))
         {
@@ -288,7 +288,7 @@ namespace llaminar2
         return true;
     }
 
-    bool CPUBackend::hostToDevice(void *dst, const void *src, size_t bytes, int device_id)
+    bool CPUBackend::hostToDevice(void *dst, const void *src, size_t bytes, int device_id, void *stream)
     {
         if (!isValidDeviceId(device_id))
         {

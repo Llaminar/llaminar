@@ -128,10 +128,36 @@ namespace llaminar2
     }
 
     // ====================================================================
+    // Stream Resolution Helper
+    // ====================================================================
+
+    /// Resolve a HIP stream for the given device. When the caller passes
+    /// nullptr we look up the device context's default (non-blocking) stream
+    /// so that NO operation ever runs on the null HIP stream.
+    static hipStream_t resolveStream(int device_id, void *stream)
+    {
+        if (stream)
+            return static_cast<hipStream_t>(stream);
+
+        try
+        {
+            auto &ctx = GPUDeviceContextPool::instance().getAMDContext(device_id);
+            void *def = ctx.defaultStream();
+            if (def)
+                return static_cast<hipStream_t>(def);
+        }
+        catch (...)
+        {
+            // Context not yet initialised (early weight load, tests).
+        }
+        return nullptr; // absolute fallback
+    }
+
+    // ====================================================================
     // Memory Transfer Operations
     // ====================================================================
 
-    bool ROCmBackend::deviceToHost(void *dst, const void *src, size_t bytes, int device_id)
+    bool ROCmBackend::deviceToHost(void *dst, const void *src, size_t bytes, int device_id, void *stream)
     {
         if (device_id >= device_count_ || device_id < 0)
         {
@@ -166,11 +192,15 @@ namespace llaminar2
             return false;
         }
 
-        hipError_t err = hipMemcpy(dst, src, bytes, hipMemcpyDeviceToHost);
+        hipError_t err = hipMemcpyAsync(dst, src, bytes, hipMemcpyDeviceToHost,
+                                        resolveStream(device_id, stream));
+        if (err != hipSuccess)
+            return false;
+        err = hipStreamSynchronize(resolveStream(device_id, stream));
         return (err == hipSuccess);
     }
 
-    bool ROCmBackend::deviceToHostFast(void *dst, const void *src, size_t bytes, int device_id)
+    bool ROCmBackend::deviceToHostFast(void *dst, const void *src, size_t bytes, int device_id, void *stream)
     {
         // Fast path: skip pointer validation and device save/restore.
         // Caller guarantees src is valid device memory and GPU work is complete.
@@ -178,7 +208,11 @@ namespace llaminar2
         {
             return false;
         }
-        hipError_t err = hipMemcpy(dst, src, bytes, hipMemcpyDeviceToHost);
+        hipStream_t s = resolveStream(device_id, stream);
+        hipError_t err = hipMemcpyAsync(dst, src, bytes, hipMemcpyDeviceToHost, s);
+        if (err != hipSuccess)
+            return false;
+        err = hipStreamSynchronize(s);
         return (err == hipSuccess);
     }
 
@@ -212,7 +246,7 @@ namespace llaminar2
         int device_idx, void *stream);
 
     bool ROCmBackend::argmaxF32(const void *data_device, int n, int device_id,
-                                float *out_value, int *out_index)
+                                float *out_value, int *out_index, void *stream)
     {
         if (device_id >= device_count_ || device_id < 0 || !data_device || n <= 0)
             return false;
@@ -239,24 +273,22 @@ namespace llaminar2
             }
         }
 
-        // Launch kernel on device's default stream
+        // Launch kernel on device's managed stream
         hipSetDevice(device_id);
+        hipStream_t s = resolveStream(device_id, stream);
         if (!rocmOps_argmax_f32(
                 static_cast<const float *>(data_device), n,
                 static_cast<float *>(bufs.value_ptr),
                 static_cast<int *>(bufs.index_ptr),
-                device_id, nullptr /* default stream */))
+                device_id, s))
         {
             return false;
         }
 
-        // Sync the default stream (where the kernel was launched) and D2H
-        // the tiny result (8 bytes total).  hipStreamSynchronize(nullptr)
-        // waits only for the default stream instead of the device-wide
-        // hipDeviceSynchronize, avoiding a redundant barrier on other streams.
-        hipStreamSynchronize(nullptr);
-        hipMemcpy(out_value, bufs.value_ptr, sizeof(float), hipMemcpyDeviceToHost);
-        hipMemcpy(out_index, bufs.index_ptr, sizeof(int), hipMemcpyDeviceToHost);
+        hipStreamSynchronize(s);
+        hipMemcpyAsync(out_value, bufs.value_ptr, sizeof(float), hipMemcpyDeviceToHost, s);
+        hipMemcpyAsync(out_index, bufs.index_ptr, sizeof(int), hipMemcpyDeviceToHost, s);
+        hipStreamSynchronize(s);
 
         return true;
     }
@@ -267,7 +299,7 @@ namespace llaminar2
         int device_idx, void *stream);
 
     bool ROCmBackend::topKF32(const void *data_device, int n, int k, int device_id,
-                              float *out_values, int *out_indices)
+                              float *out_values, int *out_indices, void *stream)
     {
         if (device_id >= device_count_ || device_id < 0 || !data_device || n <= 0 || k <= 0)
             return false;
@@ -311,24 +343,25 @@ namespace llaminar2
 
         // Launch kernel
         hipSetDevice(device_id);
+        hipStream_t s = resolveStream(device_id, stream);
         if (!rocmOps_topk_f32(
                 static_cast<const float *>(data_device), n, k,
                 static_cast<float *>(bufs.values_ptr),
                 static_cast<int *>(bufs.indices_ptr),
-                device_id, nullptr /* default stream */))
+                device_id, s))
         {
             return false;
         }
 
-        // Sync the default stream and D2H the result (k * 8 bytes total)
-        hipStreamSynchronize(nullptr);
-        hipMemcpy(out_values, bufs.values_ptr, k * sizeof(float), hipMemcpyDeviceToHost);
-        hipMemcpy(out_indices, bufs.indices_ptr, k * sizeof(int), hipMemcpyDeviceToHost);
+        hipStreamSynchronize(s);
+        hipMemcpyAsync(out_values, bufs.values_ptr, k * sizeof(float), hipMemcpyDeviceToHost, s);
+        hipMemcpyAsync(out_indices, bufs.indices_ptr, k * sizeof(int), hipMemcpyDeviceToHost, s);
+        hipStreamSynchronize(s);
 
         return true;
     }
 
-    bool ROCmBackend::hostToDevice(void *dst, const void *src, size_t bytes, int device_id)
+    bool ROCmBackend::hostToDevice(void *dst, const void *src, size_t bytes, int device_id, void *stream)
     {
         if (device_id >= device_count_ || device_id < 0)
         {
@@ -363,7 +396,11 @@ namespace llaminar2
             return false;
         }
 
-        hipError_t err = hipMemcpy(dst, src, bytes, hipMemcpyHostToDevice);
+        hipStream_t s = resolveStream(device_id, stream);
+        hipError_t err = hipMemcpyAsync(dst, src, bytes, hipMemcpyHostToDevice, s);
+        if (err != hipSuccess)
+            return false;
+        err = hipStreamSynchronize(s);
         return (err == hipSuccess);
     }
 
@@ -831,7 +868,7 @@ namespace llaminar2
         }
     }
 
-    bool ROCmBackend::memset(void *ptr, int value, size_t bytes, int device_id)
+    bool ROCmBackend::memset(void *ptr, int value, size_t bytes, int device_id, void *stream)
     {
         if (ptr == nullptr || bytes == 0)
         {
@@ -854,10 +891,10 @@ namespace llaminar2
             return false;
         }
 
-        err = hipMemset(ptr, value, bytes);
+        err = hipMemsetAsync(ptr, value, bytes, resolveStream(device_id, stream));
         if (err != hipSuccess)
         {
-            LOG_ERROR("[ROCmBackend] hipMemset failed: " << hipGetErrorString(err));
+            LOG_ERROR("[ROCmBackend] hipMemsetAsync failed: " << hipGetErrorString(err));
             return false;
         }
 
@@ -1231,7 +1268,7 @@ namespace llaminar2
         return true;
     }
 
-    bool ROCmBackend::deviceToDevice(void *dst, const void *src, size_t bytes, int device_id)
+    bool ROCmBackend::deviceToDevice(void *dst, const void *src, size_t bytes, int device_id, void *stream)
     {
         if (device_id >= device_count_ || device_id < 0)
         {
@@ -1245,7 +1282,11 @@ namespace llaminar2
             return false;
         }
 
-        hipError_t err = hipMemcpy(dst, src, bytes, hipMemcpyDeviceToDevice);
+        hipStream_t s = resolveStream(device_id, stream);
+        hipError_t err = hipMemcpyAsync(dst, src, bytes, hipMemcpyDeviceToDevice, s);
+        if (err != hipSuccess)
+            return false;
+        err = hipStreamSynchronize(s);
         return (err == hipSuccess);
     }
 

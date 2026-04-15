@@ -5,6 +5,7 @@
  */
 
 #include "ModelContext.h"
+#include "ISharedWeightPool.h"
 #include "../utils/Logger.h"
 #include <iostream>
 #include <limits>
@@ -274,6 +275,59 @@ namespace llaminar2
         LOG_INFO("[ModelContext] Created PP stage context for layers [" << first_layer << ", " << last_layer
                                                                         << "), embedding=" << (has_embedding ? "yes" : "no")
                                                                         << ", lm_head=" << (has_lm_head ? "yes" : "no"));
+
+        return ctx;
+    }
+
+    std::shared_ptr<ModelContext> ModelContext::createFromSharedPool(
+        ISharedWeightPool &pool,
+        const std::string &model_path,
+        int first_layer,
+        int last_layer,
+        bool has_embedding,
+        bool has_lm_head,
+        std::shared_ptr<IMPIContext> mpi_ctx,
+        WeightPrecision weight_precision)
+    {
+        if (!pool.isLoaded())
+        {
+            LOG_ERROR("[ModelContext] SharedWeightPool not loaded");
+            return nullptr;
+        }
+
+        // Create context — still need to parse GGUF for metadata
+        auto ctx = std::shared_ptr<ModelContext>(
+            new ModelContext(model_path, mpi_ctx, nullptr, nullptr, WeightDistributionStrategy::LAYER_PARTITIONED));
+
+        // Parse GGUF metadata only (fast — no tensor data loaded)
+        if (!ctx->loader_.loadModel(model_path))
+        {
+            LOG_ERROR("[ModelContext] Failed to load model metadata: " << model_path);
+            return nullptr;
+        }
+
+        // Create WeightManager with LAYER_PARTITIONED strategy
+        ctx->weight_manager_ = std::make_shared<WeightManager>(
+            ctx->loader_, mpi_ctx, nullptr, WeightDistributionStrategy::LAYER_PARTITIONED, weight_precision);
+
+        // Configure layer range
+        ctx->weight_manager_->setLayerRange(first_layer, last_layer, has_embedding, has_lm_head);
+
+        // Pre-populate the WeightManager cache with shared tensors from the pool
+        auto views = pool.createViewSet(first_layer, last_layer, has_embedding, has_lm_head);
+        ctx->weight_manager_->populateCacheFromPool(views);
+
+        // Set up interface wrappers
+        ctx->loader_interface_ = std::make_shared<ModelLoaderInterfaceWrapper>(ctx->loader_);
+
+        // Override blockCount for this stage
+        ctx->pp_block_count_override_ = last_layer - first_layer;
+
+        LOG_INFO("[ModelContext] Created PP stage context from SharedWeightPool for layers ["
+                 << first_layer << ", " << last_layer
+                 << "), embedding=" << (has_embedding ? "yes" : "no")
+                 << ", lm_head=" << (has_lm_head ? "yes" : "no")
+                 << " (" << views.size() << " shared tensors)");
 
         return ctx;
     }

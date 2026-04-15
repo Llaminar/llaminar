@@ -14,6 +14,7 @@
 #pragma once
 
 #include "../../../tensors/TensorKernels.h"
+#include "../../../backends/GPUDeviceContextPool.h"
 #include "../../../utils/Logger.h"
 
 // Forward declaration of extern "C" kernel wrapper
@@ -30,7 +31,9 @@ extern "C"
     bool cudaGDN_gpu_malloc(float **ptr, size_t count);
     void cudaGDN_gpu_free(float *ptr);
     void cudaGDN_gpu_memset_zero(float *ptr, size_t count);
+    void cudaGDN_gpu_memset_zero_async(float *ptr, size_t count, void *stream);
     void cudaGDN_gpu_set_device(int ordinal);
+    void cudaGDN_stream_synchronize(void *stream);
 }
 
 namespace llaminar2
@@ -69,7 +72,9 @@ namespace llaminar2
                 gpu_state_ = nullptr;
                 return;
             }
-            cudaGDN_gpu_memset_zero(gpu_state_, state_size);
+            void *stream = GPUDeviceContextPool::instance().getNvidiaContext(device_ordinal_).defaultStream();
+            cudaGDN_gpu_memset_zero_async(gpu_state_, state_size, stream);
+            cudaGDN_stream_synchronize(stream);
             LOG_DEBUG("[CUDAShortConvolution] Allocated GPU state: " << state_size << " floats on device " << device_ordinal_);
         }
 
@@ -78,7 +83,9 @@ namespace llaminar2
             if (gpu_state_ && state_size_ > 0)
             {
                 cudaGDN_gpu_set_device(device_ordinal_);
-                cudaGDN_gpu_memset_zero(gpu_state_, state_size_);
+                void *stream = GPUDeviceContextPool::instance().getNvidiaContext(device_ordinal_).defaultStream();
+                cudaGDN_gpu_memset_zero_async(gpu_state_, state_size_, stream);
+                cudaGDN_stream_synchronize(stream);
             }
         }
 

@@ -69,11 +69,15 @@ namespace llaminar2
          * @return true on success, false on error
          *
          * **Semantics**:
-         * - CUDA: cudaMemcpy(dst, src, bytes, cudaMemcpyDeviceToHost)
-         * - ROCm: hipMemcpy(dst, src, bytes, hipMemcpyDeviceToHost)
+         * - CUDA: cudaMemcpyAsync on stream, then cudaStreamSynchronize
+         * - ROCm: hipMemcpyAsync on stream, then hipStreamSynchronize
          * - CPU: memcpy(dst, src, bytes)
+         *
+         * @param stream Opaque GPU stream handle. When nullptr, backends
+         *               auto-resolve to the device context's default stream
+         *               (never the null CUDA/HIP stream).
          */
-        virtual bool deviceToHost(void *dst, const void *src, size_t bytes, int device_id) = 0;
+        virtual bool deviceToHost(void *dst, const void *src, size_t bytes, int device_id, void *stream = nullptr) = 0;
 
         /**
          * @brief Fast D2H copy — skips pointer validation for hot paths
@@ -86,9 +90,9 @@ namespace llaminar2
          * Default implementation delegates to deviceToHost().
          * ROCm override skips hipPointerGetAttributes() + HipDeviceSaveRestore (~30-60µs savings).
          */
-        virtual bool deviceToHostFast(void *dst, const void *src, size_t bytes, int device_id)
+        virtual bool deviceToHostFast(void *dst, const void *src, size_t bytes, int device_id, void *stream = nullptr)
         {
-            return deviceToHost(dst, src, bytes, device_id);
+            return deviceToHost(dst, src, bytes, device_id, stream);
         }
 
         /**
@@ -117,11 +121,15 @@ namespace llaminar2
          * @return true on success, false on error
          *
          * **Semantics**:
-         * - CUDA: cudaMemcpy(dst, src, bytes, cudaMemcpyHostToDevice)
-         * - ROCm: hipMemcpy(dst, src, bytes, hipMemcpyHostToDevice)
+         * - CUDA: cudaMemcpyAsync on stream, then cudaStreamSynchronize
+         * - ROCm: hipMemcpyAsync on stream, then hipStreamSynchronize
          * - CPU: memcpy(dst, src, bytes)
+         *
+         * @param stream Opaque GPU stream handle. When nullptr, backends
+         *               auto-resolve to the device context's default stream
+         *               (never the null CUDA/HIP stream).
          */
-        virtual bool hostToDevice(void *dst, const void *src, size_t bytes, int device_id) = 0;
+        virtual bool hostToDevice(void *dst, const void *src, size_t bytes, int device_id, void *stream = nullptr) = 0;
 
         /**
          * @brief Copy data between two device pointers on the same device
@@ -139,14 +147,18 @@ namespace llaminar2
          *
          * Used for device-to-device tensor transfers where both src and dst
          * are in the same GPU's VRAM (standard device memory pointers).
+         *
+         * @param stream Opaque GPU stream handle. When nullptr, backends
+         *               auto-resolve to the device context's default stream.
          */
-        virtual bool deviceToDevice(void *dst, const void *src, size_t bytes, int device_id)
+        virtual bool deviceToDevice(void *dst, const void *src, size_t bytes, int device_id, void *stream = nullptr)
         {
             // Default implementation: not supported
             (void)dst;
             (void)src;
             (void)bytes;
             (void)device_id;
+            (void)stream;
             return false;
         }
 
@@ -376,8 +388,11 @@ namespace llaminar2
          * - Clear buffers between operations in P2P testing
          *
          * **Thread Safety**: Caller must ensure device is set before calling
+         *
+         * @param stream Opaque GPU stream handle. When nullptr, backends
+         *               auto-resolve to the device context's default stream.
          */
-        virtual bool memset(void *ptr, int value, size_t bytes, int device_id) = 0;
+        virtual bool memset(void *ptr, int value, size_t bytes, int device_id, void *stream = nullptr) = 0;
 
         /**
          * @brief Async variant of memset() - returns immediately
@@ -554,13 +569,14 @@ namespace llaminar2
          * @return true if executed on device, false if not supported (caller should fall back)
          */
         virtual bool argmaxF32(const void *data_device, int n, int device_id,
-                               float *out_value, int *out_index)
+                               float *out_value, int *out_index, void *stream = nullptr)
         {
             (void)data_device;
             (void)n;
             (void)device_id;
             (void)out_value;
             (void)out_index;
+            (void)stream;
             return false; // Not supported by default
         }
 
@@ -580,7 +596,7 @@ namespace llaminar2
          * @return true if executed on device, false if not supported
          */
         virtual bool topKF32(const void *data_device, int n, int k, int device_id,
-                             float *out_values, int *out_indices)
+                             float *out_values, int *out_indices, void *stream = nullptr)
         {
             (void)data_device;
             (void)n;
@@ -588,6 +604,7 @@ namespace llaminar2
             (void)device_id;
             (void)out_values;
             (void)out_indices;
+            (void)stream;
             return false; // Not supported by default
         }
 
