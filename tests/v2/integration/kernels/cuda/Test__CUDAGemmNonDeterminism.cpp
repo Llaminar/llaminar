@@ -185,7 +185,7 @@ TEST_F(Test__CUDAGemmNonDeterminism, FusedGateUp_SelfConsistency)
     ASSERT_NE(w_gate, nullptr);
     ASSERT_NE(w_up, nullptr);
 
-    const int M = 9; // Qwen2 parity prompt: 9 tokens
+    const int M = 9;                                         // Qwen2 parity prompt: 9 tokens
     const int N_gate = static_cast<int>(w_gate->shape()[0]); // 4864
     const int N_up = static_cast<int>(w_up->shape()[0]);     // 4864
     const int K = static_cast<int>(w_gate->shape()[1]);      // 896
@@ -464,8 +464,8 @@ TEST_F(Test__CUDAGemmNonDeterminism, SingleKernel_SelfConsistency)
     ASSERT_NE(w_up, nullptr);
 
     const int M = 9;
-    const int N = static_cast<int>(w_up->shape()[0]);  // 4864
-    const int K = static_cast<int>(w_up->shape()[1]);  // 896
+    const int N = static_cast<int>(w_up->shape()[0]); // 4864
+    const int K = static_cast<int>(w_up->shape()[1]); // 896
 
     std::cout << "Single kernel non-determinism test: M=" << M
               << " N=" << N << " K=" << K

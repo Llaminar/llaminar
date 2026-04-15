@@ -76,7 +76,7 @@ namespace llaminar2
                 cudaStream_t init_stream = static_cast<cudaStream_t>(
                     GPUDeviceContextPool::instance().getNvidiaContext(device_id).defaultStream());
                 cudaMemcpyAsync(&gpu_rot_val, rotations_.d_rotations,
-                           sizeof(float), cudaMemcpyDeviceToHost, init_stream);
+                                sizeof(float), cudaMemcpyDeviceToHost, init_stream);
                 cudaStreamSynchronize(init_stream);
                 LOG_INFO("[CUDARingKVCacheTQ] Rotation check: CPU[0,0]=" << cpu_rot.matrix[0]
                                                                          << " GPU[0,0]=" << gpu_rot_val

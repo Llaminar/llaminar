@@ -35,10 +35,10 @@ namespace llaminar2
      */
     struct WeightPreparationResult
     {
-        size_t gemm_weights_prepared = 0;    ///< Count of GEMM weights repacked
-        size_t non_gemm_weights_uploaded = 0; ///< Count of non-GEMM weights uploaded
-        size_t total_device_bytes = 0;       ///< Total device memory allocated
-        size_t failures = 0;                 ///< Number of failed preparations
+        size_t gemm_weights_prepared = 0;      ///< Count of GEMM weights repacked
+        size_t non_gemm_weights_uploaded = 0;  ///< Count of non-GEMM weights uploaded
+        size_t total_device_bytes = 0;         ///< Total device memory allocated
+        size_t failures = 0;                   ///< Number of failed preparations
         std::vector<std::string> failed_names; ///< Names of weights that failed
     };
 

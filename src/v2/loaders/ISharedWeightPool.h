@@ -37,22 +37,22 @@ namespace llaminar2
      */
     struct PoolModelMetadata
     {
-        std::string architecture;         ///< e.g., "qwen2", "llama", "qwen3"
-        std::string model_path;           ///< Path to the GGUF file
+        std::string architecture; ///< e.g., "qwen2", "llama", "qwen3"
+        std::string model_path;   ///< Path to the GGUF file
 
-        int n_layers = 0;                 ///< Total transformer layers in the model
-        int d_model = 0;                  ///< Hidden dimension (embedding length)
-        int n_heads = 0;                  ///< Number of query attention heads
-        int n_kv_heads = 0;               ///< Number of KV heads (GQA)
-        int head_dim = 0;                 ///< Dimension per head (d_model / n_heads or explicit)
-        int d_ff = 0;                     ///< FFN intermediate dimension
-        int vocab_size = 0;               ///< Vocabulary size
-        int context_length = 0;           ///< Maximum context length
+        int n_layers = 0;       ///< Total transformer layers in the model
+        int d_model = 0;        ///< Hidden dimension (embedding length)
+        int n_heads = 0;        ///< Number of query attention heads
+        int n_kv_heads = 0;     ///< Number of KV heads (GQA)
+        int head_dim = 0;       ///< Dimension per head (d_model / n_heads or explicit)
+        int d_ff = 0;           ///< FFN intermediate dimension
+        int vocab_size = 0;     ///< Vocabulary size
+        int context_length = 0; ///< Maximum context length
 
         // GDN-specific dimensions (optional)
-        int gdn_n_k_heads = 0;            ///< GDN key heads
-        int gdn_n_v_heads = 0;            ///< GDN value heads
-        int gdn_d_state = 0;              ///< GDN state dimension
+        int gdn_n_k_heads = 0; ///< GDN key heads
+        int gdn_n_v_heads = 0; ///< GDN value heads
+        int gdn_d_state = 0;   ///< GDN state dimension
 
         bool hasGDN() const { return gdn_n_k_heads > 0 && gdn_n_v_heads > 0; }
     };

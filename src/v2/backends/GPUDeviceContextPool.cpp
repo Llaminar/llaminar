@@ -264,8 +264,8 @@ namespace llaminar2
         amd_contexts_.clear();
 
         LOG_DEBUG("[GPUDeviceContextPool] Shutdown cleared " << nvidia_count
-                                                              << " NVIDIA and " << amd_count
-                                                              << " AMD contexts");
+                                                             << " NVIDIA and " << amd_count
+                                                             << " AMD contexts");
     }
 
 } // namespace llaminar2

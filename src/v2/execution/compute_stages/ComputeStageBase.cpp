@@ -584,10 +584,10 @@ namespace llaminar2
                         state_before = static_cast<int>(cpu_tensor->coherenceState());
                         auto dev = cpu_tensor->current_device();
                         LOG_WARN("[DIAG_UP] BEFORE ensureOnHost: coherence=" << state_before
-                                 << " gpu_ptr=" << cpu_tensor->gpu_data_ptr()
-                                 << " host_ptr=" << cpu_tensor->raw_data()
-                                 << " device=" << (dev ? dev->to_string() : "none")
-                                 << " rows=" << output.rows << " cols=" << output.cols);
+                                                                             << " gpu_ptr=" << cpu_tensor->gpu_data_ptr()
+                                                                             << " host_ptr=" << cpu_tensor->raw_data()
+                                                                             << " device=" << (dev ? dev->to_string() : "none")
+                                                                             << " rows=" << output.rows << " cols=" << output.cols);
                     }
 
                     auto t0 = std::chrono::high_resolution_clock::now();
@@ -608,15 +608,17 @@ namespace llaminar2
                         const float *host_data = static_cast<const float *>(output.data);
                         size_t numel = output.rows * output.cols;
                         float host_sum = 0.0f;
-                        float first4[4] = {0,0,0,0};
-                        for (size_t i = 0; i < numel && i < 4; i++) first4[i] = host_data[i];
-                        for (size_t i = 0; i < numel; i++) host_sum += host_data[i];
+                        float first4[4] = {0, 0, 0, 0};
+                        for (size_t i = 0; i < numel && i < 4; i++)
+                            first4[i] = host_data[i];
+                        for (size_t i = 0; i < numel; i++)
+                            host_sum += host_data[i];
                         LOG_WARN("[DIAG_UP] AFTER ensureOnHost: host_sum=" << host_sum
-                                 << " coherence_before=" << state_before
-                                 << " coherence_after=" << state_after
-                                 << " d2h_ms=" << elapsed_ms
-                                 << " first4=[" << first4[0] << "," << first4[1] << ","
-                                 << first4[2] << "," << first4[3] << "]");
+                                                                           << " coherence_before=" << state_before
+                                                                           << " coherence_after=" << state_after
+                                                                           << " d2h_ms=" << elapsed_ms
+                                                                           << " first4=[" << first4[0] << "," << first4[1] << ","
+                                                                           << first4[2] << "," << first4[3] << "]");
                     }
                 }
             }

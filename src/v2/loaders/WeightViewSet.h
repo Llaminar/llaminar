@@ -33,10 +33,10 @@ namespace llaminar2
      */
     struct WeightView
     {
-        std::string name;                      ///< Weight name (e.g., "blk.3.attn_q.weight")
-        std::shared_ptr<TensorBase> tensor;    ///< Shared pointer to tensor (pool retains primary ownership)
-        int layer_index = -1;                  ///< Layer index (-1 for non-layer weights like embedding)
-        bool is_gemm_weight = false;           ///< Whether this weight needs GEMM repacking
+        std::string name;                   ///< Weight name (e.g., "blk.3.attn_q.weight")
+        std::shared_ptr<TensorBase> tensor; ///< Shared pointer to tensor (pool retains primary ownership)
+        int layer_index = -1;               ///< Layer index (-1 for non-layer weights like embedding)
+        bool is_gemm_weight = false;        ///< Whether this weight needs GEMM repacking
     };
 
     /**

@@ -1453,7 +1453,7 @@ namespace llaminar2
                 scratch[idx] = reinterpret_cast<int32_t *>(tmp);
                 scratch_capacity[idx] = elements;
                 LOG_DEBUG("[CUDAConcurrentPrefillPool] Allocated scratch[" << idx
-                                                                          << "] = " << (elements * 4 / 1024) << " KB");
+                                                                           << "] = " << (elements * 4 / 1024) << " KB");
                 return true;
             }
 
@@ -1894,7 +1894,7 @@ namespace llaminar2
                     if (trace_fused && cuda_kernel->impl_)
                     {
                         cudaStreamSynchronize(static_cast<cudaStream_t>(gpu_stream_));
-                        const void* wt_ptr = cuda_kernel->impl_->d_weights_native_vnni;
+                        const void *wt_ptr = cuda_kernel->impl_->d_weights_native_vnni;
                         if (wt_ptr)
                         {
                             const int wt_bytes = 1024;
@@ -1905,32 +1905,32 @@ namespace llaminar2
                             for (int wi = 0; wi < wt_bytes; ++wi)
                                 wt_hash = wt_hash * 31 + wt_host[wi];
                             LOG_WARN("[GEMM_WEIGHTS] proj=" << i
-                                     << " name=" << (proj.name ? proj.name : "?")
-                                     << " wt_hash=" << wt_hash
-                                     << " d_output=" << static_cast<void*>(d_output));
+                                                            << " name=" << (proj.name ? proj.name : "?")
+                                                            << " wt_hash=" << wt_hash
+                                                            << " d_output=" << static_cast<void *>(d_output));
                         }
                     }
 
-                        const bool used_native = runNativeVNNIBlockwiseIfSupported(
-                            cuda_kernel->impl_.get(),
-                            d_A_int8,
-                            proj_d_C_int32,
-                            d_output,
-                            d_scales_A_blockwise,
-                            m, n, k,
-                            1.0f, 0.0f,
-                            nullptr,
-                            d_bias,
-                            cuda_device_id_, gpu_stream_);
+                    const bool used_native = runNativeVNNIBlockwiseIfSupported(
+                        cuda_kernel->impl_.get(),
+                        d_A_int8,
+                        proj_d_C_int32,
+                        d_output,
+                        d_scales_A_blockwise,
+                        m, n, k,
+                        1.0f, 0.0f,
+                        nullptr,
+                        d_bias,
+                        cuda_device_id_, gpu_stream_);
 
                     if (trace_fused)
                     {
                         LOG_WARN("[GEMM_PATH] proj=" << i
-                                 << " name=" << (proj.name ? proj.name : "?")
-                                 << " backend=" << (used_native ? "native_vnni" : "fallback_blockwise")
-                                 << " m=" << m << " n=" << n << " k=" << k
-                                 << " output=" << static_cast<void *>(d_output)
-                                 << " acc=" << static_cast<void *>(proj_d_C_int32));
+                                                     << " name=" << (proj.name ? proj.name : "?")
+                                                     << " backend=" << (used_native ? "native_vnni" : "fallback_blockwise")
+                                                     << " m=" << m << " n=" << n << " k=" << k
+                                                     << " output=" << static_cast<void *>(d_output)
+                                                     << " acc=" << static_cast<void *>(proj_d_C_int32));
                     }
 
                     if (used_native)
@@ -1950,19 +1950,21 @@ namespace llaminar2
                                        cudaMemcpyDeviceToHost);
                             double sum = 0;
                             float abs_max = 0;
-                            for (size_t ci = 0; ci < total; ++ci) {
+                            for (size_t ci = 0; ci < total; ++ci)
+                            {
                                 sum += static_cast<double>(host_all[ci]);
                                 float a = std::fabs(host_all[ci]);
-                                if (a > abs_max) abs_max = a;
+                                if (a > abs_max)
+                                    abs_max = a;
                             }
                             LOG_WARN("[GEMM_DIAG] proj=" << i
-                                     << " name=" << (proj.name ? proj.name : "?")
-                                     << " m=" << m << " n=" << n << " k=" << k
-                                     << " total=" << total
-                                     << " fullsum=" << std::fixed << std::setprecision(6) << sum
-                                     << " absmax=" << abs_max
-                                     << " first4=[" << host_all[0] << "," << host_all[1]
-                                     << "," << host_all[2] << "," << host_all[3] << "]");
+                                                         << " name=" << (proj.name ? proj.name : "?")
+                                                         << " m=" << m << " n=" << n << " k=" << k
+                                                         << " total=" << total
+                                                         << " fullsum=" << std::fixed << std::setprecision(6) << sum
+                                                         << " absmax=" << abs_max
+                                                         << " first4=[" << host_all[0] << "," << host_all[1]
+                                                         << "," << host_all[2] << "," << host_all[3] << "]");
                         }
                         continue;
                     }
@@ -2117,17 +2119,19 @@ namespace llaminar2
                                    cudaMemcpyDeviceToHost);
                         double sum = 0;
                         float abs_max = 0;
-                        for (size_t ci = 0; ci < total; ++ci) {
+                        for (size_t ci = 0; ci < total; ++ci)
+                        {
                             sum += static_cast<double>(host_all[ci]);
                             float a = std::fabs(host_all[ci]);
-                            if (a > abs_max) abs_max = a;
+                            if (a > abs_max)
+                                abs_max = a;
                         }
                         LOG_WARN("[GEMM_SWIGLU] m=" << m << " n=" << n << " k=" << k
-                                 << " total=" << total
-                                 << " fullsum=" << std::fixed << std::setprecision(6) << sum
-                                 << " absmax=" << abs_max
-                                 << " first4=[" << host_all[0] << "," << host_all[1]
-                                 << "," << host_all[2] << "," << host_all[3] << "]");
+                                                    << " total=" << total
+                                                    << " fullsum=" << std::fixed << std::setprecision(6) << sum
+                                                    << " absmax=" << abs_max
+                                                    << " first4=[" << host_all[0] << "," << host_all[1]
+                                                    << "," << host_all[2] << "," << host_all[3] << "]");
                     }
                     return true;
                 }
@@ -2164,17 +2168,19 @@ namespace llaminar2
                                cudaMemcpyDeviceToHost);
                     double sum = 0;
                     float abs_max = 0;
-                    for (size_t ci = 0; ci < total; ++ci) {
+                    for (size_t ci = 0; ci < total; ++ci)
+                    {
                         sum += static_cast<double>(host_all[ci]);
                         float a = std::fabs(host_all[ci]);
-                        if (a > abs_max) abs_max = a;
+                        if (a > abs_max)
+                            abs_max = a;
                     }
                     LOG_WARN("[GEMM_SWIGLU] m=" << m << " n=" << n << " k=" << k
-                             << " total=" << total
-                             << " fullsum=" << std::fixed << std::setprecision(6) << sum
-                             << " absmax=" << abs_max
-                             << " first4=[" << host_all[0] << "," << host_all[1]
-                             << "," << host_all[2] << "," << host_all[3] << "]");
+                                                << " total=" << total
+                                                << " fullsum=" << std::fixed << std::setprecision(6) << sum
+                                                << " absmax=" << abs_max
+                                                << " first4=[" << host_all[0] << "," << host_all[1]
+                                                << "," << host_all[2] << "," << host_all[3] << "]");
                 }
                 return true;
             }

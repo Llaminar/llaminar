@@ -29,9 +29,9 @@ namespace llaminar2
      */
     enum class ActivationDType : uint8_t
     {
-        FP32,   ///< 32-bit float (default)
-        BF16,   ///< Brain float 16
-        FP16,   ///< IEEE half-precision
+        FP32, ///< 32-bit float (default)
+        BF16, ///< Brain float 16
+        FP16, ///< IEEE half-precision
     };
 
     /**
@@ -72,15 +72,15 @@ namespace llaminar2
      */
     struct PPStageTransferContract
     {
-        int source_stage = -1;             ///< Source PP stage index
-        int target_stage = -1;             ///< Target PP stage index
+        int source_stage = -1; ///< Source PP stage index
+        int target_stage = -1; ///< Target PP stage index
 
-        DeviceId source_device;            ///< Device producing the activation
-        DeviceId target_device;            ///< Device consuming the activation
+        DeviceId source_device; ///< Device producing the activation
+        DeviceId target_device; ///< Device consuming the activation
 
-        size_t embedding_dim = 0;          ///< Hidden dimension (d_model)
+        size_t embedding_dim = 0;                      ///< Hidden dimension (d_model)
         ActivationDType dtype = ActivationDType::FP32; ///< Activation data type
-        size_t max_seq_len = 0;            ///< Maximum sequence length
+        size_t max_seq_len = 0;                        ///< Maximum sequence length
 
         /**
          * @brief Compute active transfer size for a given sequence length

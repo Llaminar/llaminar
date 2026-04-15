@@ -3384,7 +3384,8 @@ namespace
             {
                 int sk = chooseSplitK_BK256(M, N, K, 128, 128, prefill_ctx);
                 // Deterministic mode: cap split_k for PyTorch numerical parity
-                if (g_deterministic_mode && sk > 1) sk = 1;
+                if (g_deterministic_mode && sk > 1)
+                    sk = 1;
                 bool ok = false;
                 if (sk >= 2)
                     ok = launchNativeVNNITC_BK256<128, 128, 4, 4, 2>(

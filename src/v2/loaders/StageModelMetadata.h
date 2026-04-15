@@ -46,21 +46,21 @@ namespace llaminar2
         // Architecture
         // =========================================================================
 
-        std::string architecture;          ///< e.g., "qwen2", "llama", "qwen3"
-        std::string model_path;            ///< Path to the GGUF model file
+        std::string architecture; ///< e.g., "qwen2", "llama", "qwen3"
+        std::string model_path;   ///< Path to the GGUF model file
 
         // =========================================================================
         // Full Model Dimensions
         // =========================================================================
 
-        int total_layers = 0;              ///< Total layers in the full model
-        int d_model = 0;                   ///< Hidden dimension (embedding length)
-        int n_heads = 0;                   ///< Number of query attention heads
-        int n_kv_heads = 0;                ///< Number of KV heads (GQA)
-        int head_dim = 0;                  ///< Dimension per head
-        int d_ff = 0;                      ///< FFN intermediate dimension
-        int vocab_size = 0;                ///< Vocabulary size
-        int context_length = 0;            ///< Maximum context length
+        int total_layers = 0;   ///< Total layers in the full model
+        int d_model = 0;        ///< Hidden dimension (embedding length)
+        int n_heads = 0;        ///< Number of query attention heads
+        int n_kv_heads = 0;     ///< Number of KV heads (GQA)
+        int head_dim = 0;       ///< Dimension per head
+        int d_ff = 0;           ///< FFN intermediate dimension
+        int vocab_size = 0;     ///< Vocabulary size
+        int context_length = 0; ///< Maximum context length
 
         // GDN-specific dimensions
         int gdn_n_k_heads = 0;
@@ -71,10 +71,10 @@ namespace llaminar2
         // PP Stage Assignment
         // =========================================================================
 
-        int first_layer = 0;               ///< First layer index (inclusive)
-        int last_layer = 0;                ///< Last layer index (exclusive)
-        bool has_embedding = false;        ///< This stage owns the embedding table
-        bool has_lm_head = false;          ///< This stage owns the output norm + LM head
+        int first_layer = 0;        ///< First layer index (inclusive)
+        int last_layer = 0;         ///< Last layer index (exclusive)
+        bool has_embedding = false; ///< This stage owns the embedding table
+        bool has_lm_head = false;   ///< This stage owns the output norm + LM head
 
         // =========================================================================
         // Derived Accessors
