@@ -506,8 +506,7 @@ namespace llaminar2
         TEST_F(Test__WeightManagerInputParallelSlicing, SliceColumnRange_NullTensor_ReturnsNull)
         {
             std::shared_ptr<TensorBase> null_tensor = nullptr;
-            auto sliced = WeightManager::sliceColumnRange(null_tensor, 0, 1);
-            EXPECT_EQ(sliced, nullptr);
+            EXPECT_THROW(WeightManager::sliceColumnRange(null_tensor, 0, 1), std::runtime_error);
         }
 
         // =============================================================================
@@ -703,8 +702,7 @@ namespace llaminar2
             auto tensor = createSequentialTensor(16, 8);
 
             // col_start=5 + col_count=5 = 10, but tensor only has 8 columns
-            auto sliced = WeightManager::sliceColumnRange(tensor, 5, 5);
-            EXPECT_EQ(sliced, nullptr) << "Should return nullptr for out-of-bounds slice";
+            EXPECT_THROW(WeightManager::sliceColumnRange(tensor, 5, 5), std::runtime_error);
         }
 
         TEST_F(Test__WeightManagerInputParallelSlicing, SliceColumnRange_StartAtEnd)
@@ -712,21 +710,15 @@ namespace llaminar2
             auto tensor = createSequentialTensor(16, 8);
 
             // col_start=8 is out of bounds (columns are 0-7)
-            auto sliced = WeightManager::sliceColumnRange(tensor, 8, 1);
-            EXPECT_EQ(sliced, nullptr) << "Should return nullptr when start is at end";
+            EXPECT_THROW(WeightManager::sliceColumnRange(tensor, 8, 1), std::runtime_error);
         }
 
         TEST_F(Test__WeightManagerInputParallelSlicing, SliceColumnRange_ZeroCount)
         {
             auto tensor = createSequentialTensor(16, 8);
 
-            // Zero columns requested - should probably return empty or nullptr
-            auto sliced = WeightManager::sliceColumnRange(tensor, 0, 0);
-            // The behavior depends on implementation - but it should handle gracefully
-            if (sliced != nullptr)
-            {
-                EXPECT_EQ(sliced->shape()[1], 0) << "Zero-count slice should be empty if returned";
-            }
+            // Zero columns requested
+            EXPECT_THROW(WeightManager::sliceColumnRange(tensor, 0, 0), std::runtime_error);
         }
 
         // =============================================================================
@@ -756,15 +748,13 @@ namespace llaminar2
             auto tensor = createSequentialTensor(10, 8);
 
             // row_start=7 + row_count=5 = 12 > 10
-            auto sliced = WeightManager::sliceRowRange(tensor, 7, 5);
-            EXPECT_EQ(sliced, nullptr);
+            EXPECT_THROW(WeightManager::sliceRowRange(tensor, 7, 5), std::runtime_error);
         }
 
         TEST_F(Test__WeightManagerInputParallelSlicing, SliceRowRange_NullTensor)
         {
             std::shared_ptr<TensorBase> null_tensor = nullptr;
-            auto sliced = WeightManager::sliceRowRange(null_tensor, 0, 1);
-            EXPECT_EQ(sliced, nullptr);
+            EXPECT_THROW(WeightManager::sliceRowRange(null_tensor, 0, 1), std::runtime_error);
         }
 
         // =============================================================================

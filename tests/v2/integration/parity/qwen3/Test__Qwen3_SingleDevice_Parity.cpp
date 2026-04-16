@@ -159,7 +159,7 @@ static const std::vector<TestConfig> kQwen3SingleDeviceConfigs = {
             .decode_cosine_threshold = 0.90f,
             .early_layers_count = 6,
             .min_early_layers_passed = 4,
-            .kl_threshold = 0.01f,
+            .kl_threshold = 0.04f, // ROCm: rocBLAS/hipblasLt heuristic selection adds run-to-run variance
             .min_top1_accuracy = 60.0f,
             .min_top5_accuracy = 60.0f,
         },
@@ -178,7 +178,7 @@ static const std::vector<TestConfig> kQwen3SingleDeviceConfigs = {
             .decode_cosine_threshold = 0.90f,
             .early_layers_count = 6,
             .min_early_layers_passed = 4,
-            .kl_threshold = 0.01f,
+            .kl_threshold = 0.04f, // ROCm: rocBLAS/hipblasLt heuristic selection adds run-to-run variance
             .min_top1_accuracy = 60.0f,
             .min_top5_accuracy = 60.0f,
         },
@@ -197,7 +197,7 @@ static const std::vector<TestConfig> kQwen3SingleDeviceConfigs = {
             .decode_cosine_threshold = 0.90f,
             .early_layers_count = 6,
             .min_early_layers_passed = 4,
-            .kl_threshold = 0.01f,
+            .kl_threshold = 0.04f, // ROCm: rocBLAS/hipblasLt heuristic selection adds run-to-run variance
             .min_top1_accuracy = 60.0f,
             .min_top5_accuracy = 60.0f,
         },
@@ -216,7 +216,7 @@ static const std::vector<TestConfig> kQwen3SingleDeviceConfigs = {
             .decode_cosine_threshold = 0.90f,
             .early_layers_count = 6,
             .min_early_layers_passed = 4,
-            .kl_threshold = 0.01f,
+            .kl_threshold = 0.04f, // ROCm: rocBLAS/hipblasLt heuristic selection adds run-to-run variance
             .min_top1_accuracy = 60.0f,
             .min_top5_accuracy = 60.0f,
         },

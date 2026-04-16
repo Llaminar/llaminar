@@ -30,6 +30,7 @@
 #include "backends/DeviceId.h"
 #include "backends/GlobalDeviceAddress.h"
 #include "collective/ILocalPPContext.h"
+#include "kernels/KernelFactory.h"
 
 #ifdef HAVE_ROCM
 #include <hip/hip_runtime.h>
@@ -68,6 +69,17 @@ protected:
         model_ctx_ = ModelContext::create(TEST_MODEL_PATH);
         ASSERT_NE(model_ctx_, nullptr);
         ASSERT_EQ(model_ctx_->blockCount(), NUM_LAYERS) << "Expected 24 layer model";
+    }
+
+    void TearDown() override
+    {
+        // Destroy orchestrators before clearing caches so GPU memory is freed
+        // in the correct order (orchestrator → kernels → device handles).
+        model_ctx_.reset();
+
+        // Clear global KernelFactory caches to prevent stale pointer hits
+        // when mmap reuses the same virtual addresses across tests.
+        llaminar::v2::kernels::KernelFactory::clearCache();
     }
 
     bool hasCUDADevice() const

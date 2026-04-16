@@ -17,7 +17,9 @@
 #include <cstdio>
 #include <ctime>
 #include <deque>
+#include <filesystem>
 #include <mutex>
+#include <system_error>
 #include <vector>
 
 namespace llaminar2
@@ -106,7 +108,19 @@ namespace llaminar2
          * @brief Set a log file path to tee all log output to a file
          *
          * When set, every log message is written to both stdout and the file.
-         * The file is opened in truncate mode. Call closeLogFile() to flush and close.
+         * Before opening, any existing log file at @p path is rotated through
+         * a sliding window of up to 10 previous runs (logrotate-style):
+         *
+         *   test_log.txt     ->  test_log.1.txt
+         *   test_log.1.txt   ->  test_log.2.txt
+         *   ...
+         *   test_log.9.txt   ->  test_log.10.txt
+         *   test_log.10.txt  (deleted)
+         *
+         * This preserves the logs of the prior 10 runs for post-mortem
+         * diagnosis of flaky failures — the current run's log would otherwise
+         * be lost on truncation-on-open. The new file is then opened in
+         * truncate mode. Call closeLogFile() to flush and close.
          *
          * @param path Filesystem path for the log file
          * @return true if the file was opened successfully
@@ -116,6 +130,46 @@ namespace llaminar2
             std::lock_guard<std::mutex> lk(buffer_mutex_);
             if (log_file_.is_open())
                 log_file_.close();
+
+            // Rotate prior logs so flaky failures keep their evidence across
+            // up to 10 retries.
+            try
+            {
+                constexpr int kMaxRotations = 10;
+                std::filesystem::path p(path);
+                std::string stem = p.stem().string();     // "test_log"
+                std::string ext = p.extension().string(); // ".txt"
+
+                auto rotated_path = [&](int n) {
+                    std::filesystem::path rp = p;
+                    rp.replace_filename(stem + "." + std::to_string(n) + ext);
+                    return rp;
+                };
+
+                std::error_code ec;
+                // Drop the oldest slot if present.
+                std::filesystem::remove(rotated_path(kMaxRotations), ec);
+                // Shift N-1 -> N, N-2 -> N-1, ..., 1 -> 2.
+                for (int i = kMaxRotations - 1; i >= 1; --i)
+                {
+                    auto src = rotated_path(i);
+                    auto dst = rotated_path(i + 1);
+                    if (std::filesystem::exists(src, ec))
+                    {
+                        std::filesystem::rename(src, dst, ec);
+                    }
+                }
+                // Move current log to slot .1
+                if (std::filesystem::exists(p, ec))
+                {
+                    std::filesystem::rename(p, rotated_path(1), ec);
+                }
+            }
+            catch (...)
+            {
+                // Never let log rotation break logging itself.
+            }
+
             log_file_.open(path, std::ios::out | std::ios::trunc);
             return log_file_.is_open();
         }

@@ -249,6 +249,19 @@ namespace llaminar2
             // Non-fatal - continue with default stream
         }
 
+        // Disable atomic reductions inside rocBLAS/Tensile kernels.  Atomic
+        // reductions produce nondeterministic FP accumulation order across
+        // runs, which causes parity tests to flake (~14x KL divergence
+        // spread on gfx906).  The non-atomic Tensile paths are selected
+        // instead; perf impact is minor since SGEMM on gfx906 is
+        // compute-bound rather than reduction-bound.
+        hipblas_status = hipblasSetAtomicsMode(hipblas_handle_, HIPBLAS_ATOMICS_NOT_ALLOWED);
+        if (hipblas_status != HIPBLAS_STATUS_SUCCESS)
+        {
+            LOG_WARN("[AMDDeviceContext] hipblasSetAtomicsMode failed: " << hipblas_status);
+            // Non-fatal - results may be nondeterministic but correct
+        }
+
         // Step 4: Query device name
         hipDeviceProp_t props;
         HIP_CHECK(hipGetDeviceProperties(&props, device_ordinal_));

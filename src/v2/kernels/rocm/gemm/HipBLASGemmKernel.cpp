@@ -115,6 +115,12 @@ namespace llaminar2
             }
             handle_ = static_cast<void *>(temp_handle);
 
+            // Disable atomic reductions for deterministic GEMM output.
+            // Atomic accumulation in rocBLAS/Tensile kernels produces
+            // nondeterministic FP reduction order.  Non-atomic paths are
+            // selected instead.
+            hipblasSetAtomicsMode(temp_handle, HIPBLAS_ATOMICS_NOT_ALLOWED);
+
             // Create hipBLASLt handle for fused operations (e.g., GEMM + bias)
             hipblasLtHandle_t temp_lt_handle = nullptr;
             hipblasStatus_t lt_err = hipblasLtCreate(&temp_lt_handle);

@@ -236,6 +236,104 @@ namespace llaminar2
         return true;
     }
 
+    bool HostBackend::allreduceMulti(
+        const std::vector<void *> &buffers,
+        size_t count,
+        CollectiveDataType dtype,
+        CollectiveOp op)
+    {
+        if (!initialized_)
+        {
+            last_error_ = "HostBackend::allreduceMulti: Backend not initialized";
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        if (buffers.size() != group_.size())
+        {
+            last_error_ = "HostBackend::allreduceMulti: buffer count " +
+                          std::to_string(buffers.size()) + " != group size " +
+                          std::to_string(group_.size());
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        LOG_DEBUG("HostBackend::allreduceMulti: count=" << count
+                                                        << " dtype=" << static_cast<int>(dtype)
+                                                        << " op=" << toString(op)
+                                                        << " devices=" << group_.size());
+
+        // Single-device group: nothing to reduce
+        if (group_.size() <= 1)
+        {
+            return true;
+        }
+
+        size_t bytes = count * elementSize(dtype);
+
+        // Ensure staging buffer is sized for one device's payload
+        if (!ensureStagingBuffer(bytes))
+        {
+            last_error_ = "HostBackend::allreduceMulti: Failed to allocate staging buffer";
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        // Reduction accumulator on host
+        std::vector<uint8_t> accumulator(bytes, 0);
+        bool first = true;
+
+        // Phase 1: D2H from each device and reduce into accumulator
+        for (size_t i = 0; i < group_.size(); ++i)
+        {
+            const auto &device = group_.devices[i];
+            const void *src = buffers[i];
+
+            if (src == nullptr)
+            {
+                last_error_ = "HostBackend::allreduceMulti: buffer[" +
+                              std::to_string(i) + "] is null";
+                LOG_ERROR(last_error_);
+                return false;
+            }
+
+            if (!copyToHost(staging_buffer_, src, device, bytes))
+            {
+                last_error_ = "HostBackend::allreduceMulti: D2H copy failed from " +
+                              device.toString();
+                LOG_ERROR(last_error_);
+                return false;
+            }
+
+            if (first)
+            {
+                std::memcpy(accumulator.data(), staging_buffer_, bytes);
+                first = false;
+            }
+            else
+            {
+                reduceOnHost(accumulator.data(), staging_buffer_, count, dtype, op);
+            }
+        }
+
+        // Phase 2: H2D reduced result back to each device
+        std::memcpy(staging_buffer_, accumulator.data(), bytes);
+        for (size_t i = 0; i < group_.size(); ++i)
+        {
+            const auto &device = group_.devices[i];
+            if (!copyFromHost(buffers[i], staging_buffer_, device, bytes))
+            {
+                last_error_ = "HostBackend::allreduceMulti: H2D copy failed to " +
+                              device.toString();
+                LOG_ERROR(last_error_);
+                return false;
+            }
+        }
+
+        LOG_DEBUG("HostBackend::allreduceMulti: Completed successfully");
+        return true;
+    }
+
     bool HostBackend::allgather(
         const void *send_buf,
         void *recv_buf,

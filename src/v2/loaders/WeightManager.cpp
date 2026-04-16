@@ -14,6 +14,7 @@
 #include "../backends/BackendManager.h"
 #include <iostream>
 #include <cstring>
+#include <stdexcept>
 #include <regex>
 #include <algorithm>
 #include <chrono>
@@ -354,8 +355,8 @@ namespace llaminar2
         const auto &shape = full_tensor->shape();
         if (shape.size() != 2)
         {
-            LOG_ERROR("[WeightManager] Column slicing requires 2D tensor, got " << shape.size() << "D");
-            return nullptr;
+            throw std::runtime_error("[WeightManager] Column slicing requires 2D tensor, got " +
+                                     std::to_string(shape.size()) + "D");
         }
 
         size_t out_dim = shape[0];
@@ -378,9 +379,8 @@ namespace llaminar2
         auto *fp32_tensor = dynamic_cast<FP32Tensor *>(full_tensor.get());
         if (!fp32_tensor)
         {
-            LOG_ERROR("[WeightManager] Column slicing currently requires FP32 tensor. "
-                      "Use CONVERT_TO_FP32 weight precision for sharded strategy.");
-            return nullptr;
+            throw std::runtime_error("[WeightManager] Column slicing currently requires FP32 tensor. "
+                                     "Use CONVERT_TO_FP32 weight precision for sharded strategy.");
         }
 
         // Create sliced tensor
@@ -405,8 +405,8 @@ namespace llaminar2
         const auto &shape = full_tensor->shape();
         if (shape.size() != 2)
         {
-            LOG_ERROR("[WeightManager] Row slicing requires 2D tensor, got " << shape.size() << "D");
-            return nullptr;
+            throw std::runtime_error("[WeightManager] Row slicing requires 2D tensor, got " +
+                                     std::to_string(shape.size()) + "D");
         }
 
         size_t out_dim = shape[0];
@@ -428,9 +428,8 @@ namespace llaminar2
         auto *fp32_tensor = dynamic_cast<FP32Tensor *>(full_tensor.get());
         if (!fp32_tensor)
         {
-            LOG_ERROR("[WeightManager] Row slicing currently requires FP32 tensor. "
-                      "Use CONVERT_TO_FP32 weight precision for sharded strategy.");
-            return nullptr;
+            throw std::runtime_error("[WeightManager] Row slicing currently requires FP32 tensor. "
+                                     "Use CONVERT_TO_FP32 weight precision for sharded strategy.");
         }
 
         // Create sliced tensor
@@ -528,9 +527,8 @@ namespace llaminar2
                 return std::make_unique<FP16Tensor>(shape, fp16_data);
             }
             default:
-                LOG_ERROR("[WeightManager] Unsupported tensor type for createTensorFromRawData: "
-                          << static_cast<int>(type));
-                return nullptr;
+                throw std::runtime_error("[WeightManager] Unsupported tensor type for createTensorFromRawData: " +
+                                         std::to_string(static_cast<int>(type)));
             }
         }
     } // anonymous namespace
@@ -573,8 +571,8 @@ namespace llaminar2
             }
             if (dims_opt->size() != 2)
             {
-                LOG_ERROR("[WeightManager] Rank " << rank << " invalid tensor for row-parallel (expected 2D): " << name);
-                return nullptr;
+                throw std::runtime_error("[WeightManager] Rank " + std::to_string(rank) +
+                                         " invalid tensor for row-parallel (expected 2D): " + name);
             }
             const auto &dims = *dims_opt;
 
@@ -607,8 +605,8 @@ namespace llaminar2
 
             if (!slice_tensor)
             {
-                LOG_ERROR("[WeightManager] Rank " << rank << " failed to load row slice for: " << name);
-                return nullptr;
+                throw std::runtime_error("[WeightManager] Rank " + std::to_string(rank) +
+                                         " failed to load row slice for: " + name);
             }
 
             LOG_TRACE("[WeightManager] Rank " << rank << " row-parallel " << name
@@ -702,16 +700,15 @@ namespace llaminar2
                 auto full_tensor = loader_.loadTensor(name, device, WeightPrecision::NATIVE);
                 if (!full_tensor)
                 {
-                    LOG_ERROR("[WeightManager] Rank " << rank << " failed to load 1D tensor for: " << name);
-                    return nullptr;
+                    throw std::runtime_error("[WeightManager] Rank " + std::to_string(rank) +
+                                             " failed to load 1D tensor for: " + name);
                 }
 
                 // Cast to FP32 (biases are stored as FP32)
                 auto *fp32_full = dynamic_cast<FP32Tensor *>(full_tensor.get());
                 if (!fp32_full)
                 {
-                    LOG_ERROR("[WeightManager] 1D tensor is not FP32 for: " << name);
-                    return nullptr;
+                    throw std::runtime_error("[WeightManager] 1D tensor is not FP32 for: " + name);
                 }
 
                 // Create sliced 1D tensor
@@ -738,9 +735,8 @@ namespace llaminar2
             // Handle 2D tensors (weight matrices)
             if (dims.size() != 2)
             {
-                LOG_ERROR("[WeightManager] Column-parallel requires 1D or 2D tensor, got "
-                          << dims.size() << "D for: " << name);
-                return nullptr;
+                throw std::runtime_error("[WeightManager] Column-parallel requires 1D or 2D tensor, got " +
+                                         std::to_string(dims.size()) + "D for: " + name);
             }
 
             size_t total_rows = dims[0]; // N = output features
@@ -946,11 +942,9 @@ namespace llaminar2
 
                         if (!slices[s])
                         {
-                            LOG_ERROR("[WeightManager] Rank " << rank
-                                                              << " failed to load fused-QKV sub-block " << s
-                                                              << " rows [" << abs_row_start << ", " << abs_row_end << ")"
-                                                              << " for: " << name);
-                            return nullptr;
+                            throw std::runtime_error("[WeightManager] Rank " + std::to_string(rank) +
+                                                     " failed to load fused-QKV sub-block " + std::to_string(s) +
+                                                     " for: " + name);
                         }
 
                         total_out_rows += local_count;
@@ -969,8 +963,8 @@ namespace llaminar2
                         const void *src = slices[s]->raw_data();
                         if (!src)
                         {
-                            LOG_ERROR("[WeightManager] Null raw_data for fused-QKV sub-block " << s << ": " << name);
-                            return nullptr;
+                            throw std::runtime_error("[WeightManager] Null raw_data for fused-QKV sub-block " +
+                                                     std::to_string(s) + ": " + name);
                         }
                         std::memcpy(combined_raw.data() + byte_offset, src, slices[s]->size_bytes());
                         byte_offset += slices[s]->size_bytes();
@@ -984,8 +978,7 @@ namespace llaminar2
 
                     if (!result_tensor)
                     {
-                        LOG_ERROR("[WeightManager] Failed to create fused-QKV tensor for: " << name);
-                        return nullptr;
+                        throw std::runtime_error("[WeightManager] Failed to create fused-QKV tensor for: " + name);
                     }
 
                     auto meta = SliceMetadata::forColumnParallel(
@@ -1031,8 +1024,8 @@ namespace llaminar2
 
             if (!slice_tensor)
             {
-                LOG_ERROR("[WeightManager] Rank " << rank << " failed to load row slice for: " << name);
-                return nullptr;
+                throw std::runtime_error("[WeightManager] Rank " + std::to_string(rank) +
+                                         " failed to load row slice for: " + name);
             }
 
             LOG_TRACE("[WeightManager] Rank " << rank << " column-parallel " << name
@@ -1079,8 +1072,7 @@ namespace llaminar2
             }
             if (dims_opt->size() != 2)
             {
-                LOG_ERROR("[WeightManager] Invalid tensor for input-parallel (expected 2D): " << name);
-                return nullptr;
+                throw std::runtime_error("[WeightManager] Invalid tensor for input-parallel (expected 2D): " + name);
             }
             const auto &dims = *dims_opt;
 
@@ -1110,8 +1102,8 @@ namespace llaminar2
 
             if (!slice_tensor)
             {
-                LOG_ERROR("[WeightManager] Rank " << rank << " failed to load column slice for: " << name);
-                return nullptr;
+                throw std::runtime_error("[WeightManager] Rank " + std::to_string(rank) +
+                                         " failed to load column slice for: " + name);
             }
 
             LOG_TRACE("[WeightManager] Rank " << rank << " input-parallel " << name
@@ -1130,8 +1122,7 @@ namespace llaminar2
             return slice;
         }
 
-        LOG_ERROR("[WeightManager] Unknown sharding mode for: " << name);
-        return nullptr;
+        throw std::runtime_error("[WeightManager] Unknown sharding mode for: " + name);
     }
 
     std::shared_ptr<TensorBase> WeightManager::getInterleavedWeight(const std::string &name, DeviceId device)
@@ -1162,9 +1153,8 @@ namespace llaminar2
         // Validate fraction
         if (fraction <= 0.0f || fraction > 1.0f)
         {
-            LOG_ERROR("[WeightManager] Invalid decode fraction: " << fraction
-                                                                  << " (must be 0 < fraction <= 1)");
-            return nullptr;
+            throw std::runtime_error("[WeightManager] Invalid decode fraction: " +
+                                     std::to_string(fraction) + " (must be 0 < fraction <= 1)");
         }
 
         std::lock_guard<std::mutex> lock(cache_mutex_);
@@ -1200,8 +1190,7 @@ namespace llaminar2
 
         if (!full_tensor)
         {
-            LOG_ERROR("[WeightManager] Failed to load full weight for decode shard: " << name);
-            return nullptr;
+            throw std::runtime_error("[WeightManager] Failed to load full weight for decode shard: " + name);
         }
 
         // Determine sharding mode for this weight
@@ -1243,8 +1232,7 @@ namespace llaminar2
             decode_shard = sliceTailRows(full_tensor, fraction);
             if (!decode_shard)
             {
-                LOG_ERROR("[WeightManager] Failed to slice tail rows for decode: " << name);
-                return nullptr;
+                throw std::runtime_error("[WeightManager] Failed to slice tail rows for decode: " + name);
             }
             LOG_DEBUG("[WeightManager] Decode shard for COLUMN_PARALLEL " << name
                                                                           << ": tail " << (fraction * 100) << "% rows -> ["
@@ -1262,8 +1250,7 @@ namespace llaminar2
             decode_shard = sliceTailColumns(full_tensor, fraction);
             if (!decode_shard)
             {
-                LOG_ERROR("[WeightManager] Failed to slice tail columns for decode: " << name);
-                return nullptr;
+                throw std::runtime_error("[WeightManager] Failed to slice tail columns for decode: " + name);
             }
             LOG_DEBUG("[WeightManager] Decode shard for " << (mode == ShardingMode::ROW_PARALLEL ? "ROW_PARALLEL" : "INPUT_PARALLEL")
                                                           << " " << name
@@ -1274,8 +1261,7 @@ namespace llaminar2
         }
 
         default:
-            LOG_ERROR("[WeightManager] Unknown sharding mode for decode weight: " << name);
-            return nullptr;
+            throw std::runtime_error("[WeightManager] Unknown sharding mode for decode weight: " + name);
         }
 
         // Cache the decode shard
@@ -1297,8 +1283,8 @@ namespace llaminar2
         const auto &shape = full_tensor->shape();
         if (shape.size() != 2)
         {
-            LOG_ERROR("[WeightManager] Tail row slicing requires 2D tensor, got " << shape.size() << "D");
-            return nullptr;
+            throw std::runtime_error("[WeightManager] Tail row slicing requires 2D tensor, got " +
+                                     std::to_string(shape.size()) + "D");
         }
 
         size_t out_dim = shape[0];
@@ -1325,9 +1311,8 @@ namespace llaminar2
         auto *fp32_tensor = dynamic_cast<FP32Tensor *>(full_tensor.get());
         if (!fp32_tensor)
         {
-            LOG_ERROR("[WeightManager] Tail row slicing currently requires FP32 tensor. "
-                      "Use CONVERT_TO_FP32 weight precision for decode shards.");
-            return nullptr;
+            throw std::runtime_error("[WeightManager] Tail row slicing currently requires FP32 tensor. "
+                                     "Use CONVERT_TO_FP32 weight precision for decode shards.");
         }
 
         // Create sliced tensor
@@ -1352,8 +1337,8 @@ namespace llaminar2
         const auto &shape = full_tensor->shape();
         if (shape.size() != 2)
         {
-            LOG_ERROR("[WeightManager] Tail column slicing requires 2D tensor, got " << shape.size() << "D");
-            return nullptr;
+            throw std::runtime_error("[WeightManager] Tail column slicing requires 2D tensor, got " +
+                                     std::to_string(shape.size()) + "D");
         }
 
         size_t out_dim = shape[0];
@@ -1380,9 +1365,8 @@ namespace llaminar2
         auto *fp32_tensor = dynamic_cast<FP32Tensor *>(full_tensor.get());
         if (!fp32_tensor)
         {
-            LOG_ERROR("[WeightManager] Tail column slicing currently requires FP32 tensor. "
-                      "Use CONVERT_TO_FP32 weight precision for decode shards.");
-            return nullptr;
+            throw std::runtime_error("[WeightManager] Tail column slicing currently requires FP32 tensor. "
+                                     "Use CONVERT_TO_FP32 weight precision for decode shards.");
         }
 
         // Create sliced tensor
@@ -1485,8 +1469,7 @@ namespace llaminar2
                                                    : tp_config_->totalHeads();
             if (total_heads_for_weight <= 0)
             {
-                LOG_ERROR("[WeightManager] Invalid total_heads/total_kv_heads in TensorParallelConfig");
-                return {0, total_rows};
+                throw std::runtime_error("[WeightManager] Invalid total_heads/total_kv_heads in TensorParallelConfig");
             }
             const size_t head_dim = total_rows / static_cast<size_t>(total_heads_for_weight);
 
@@ -1627,8 +1610,7 @@ namespace llaminar2
             int total_heads = tp_config_->totalHeads();
             if (total_heads <= 0)
             {
-                LOG_ERROR("[WeightManager] Invalid total_heads in TensorParallelConfig");
-                return {0, total_cols};
+                throw std::runtime_error("[WeightManager] Invalid total_heads in TensorParallelConfig");
             }
             size_t head_dim = total_cols / total_heads;
             size_t start = assignment.head_start * head_dim;
@@ -1764,8 +1746,7 @@ namespace llaminar2
 
         if (!raw_ptr || byte_count == 0)
         {
-            LOG_WARN("[WeightManager] Cannot clone tensor with no data: " << name);
-            return nullptr;
+            throw std::runtime_error("[WeightManager] Cannot clone tensor with no data: " + name);
         }
 
         // Copy raw bytes
@@ -1776,9 +1757,8 @@ namespace llaminar2
             tensor_type, original->shape(), std::move(raw_copy));
         if (!unique_clone)
         {
-            LOG_WARN("[WeightManager] Failed to create clone for tensor type "
-                     << static_cast<int>(tensor_type));
-            return nullptr;
+            throw std::runtime_error("[WeightManager] Failed to create clone for tensor type " +
+                                     std::to_string(static_cast<int>(tensor_type)));
         }
         std::shared_ptr<TensorBase> clone = std::shared_ptr<TensorBase>(std::move(unique_clone));
 
@@ -1895,9 +1875,8 @@ namespace llaminar2
                 tensor = getInterleavedWeight(name, target_device);
                 break;
             default:
-                LOG_ERROR("[WeightManager] Unknown strategy: " << static_cast<int>(strategy_));
-                lock.lock();
-                return nullptr;
+                throw std::runtime_error("[WeightManager] Unknown strategy: " +
+                                         std::to_string(static_cast<int>(strategy_)));
             }
 
             lock.lock();
@@ -1962,8 +1941,7 @@ namespace llaminar2
         auto clone = cloneTensorForDevice(name, original, device);
         if (!clone)
         {
-            LOG_ERROR("[WeightManager] getWeightForDevice: failed to clone " << name);
-            return nullptr;
+            throw std::runtime_error("[WeightManager] getWeightForDevice: failed to clone " + name);
         }
 
         per_device_cache_[cache_key] = clone;
@@ -2144,7 +2122,7 @@ namespace llaminar2
             non_gemm_ok = uploadNonGemmWeights(device, layer_filter);
             if (!non_gemm_ok)
             {
-                LOG_WARN("[WeightManager] Non-GEMM weight upload failed for " << device_name);
+                LOG_ERROR("[WeightManager] Non-GEMM weight upload failed for " << device_name);
             }
         }
 
@@ -2177,7 +2155,7 @@ namespace llaminar2
                 auto *handle = KernelFactory::getOrCreatePreparedEmbeddingWeights(
                     embed_tensor, d_model, device, /*vocab_offset=*/0, /*total_vocab=*/0);
                 if (!handle)
-                    LOG_WARN("[WeightManager] Embedding preparation failed for " << device_name);
+                    LOG_ERROR("[WeightManager] Embedding preparation failed for " << device_name);
                 else
                     LOG_DEBUG("[WeightManager] Embedding prepared for " << device_name);
             }
@@ -2198,6 +2176,70 @@ namespace llaminar2
         {
             LOG_WARN("[WeightManager] GEMM weight packing failed for " << device_name
                                                                        << ", will use lazy kernel creation");
+        }
+
+        // Step 4: For tied-embedding models, pre-pack token_embd.weight as GEMM
+        // so it can be used for lm_head projection. Without this, the lm_head
+        // kernel would lazy-pack on first forward() — but by that point host
+        // weight data may have been released by releaseAllHostWeightData(),
+        // causing a segfault when reading the original quantized blocks.
+        //
+        // Applies to PP stages that own the lm_head (has_lm_head=true) when
+        // output.weight is absent in the GGUF (tied to token_embd.weight).
+        if (is_gpu && layer_filter)
+        {
+            bool stage_has_lm_head = layer_filter("output.weight");
+            if (stage_has_lm_head)
+            {
+                auto output_shape = loader_.getTensorShape("output.weight");
+                bool tied = !output_shape || output_shape->empty();
+                if (tied)
+                {
+                    using namespace llaminar::v2::kernels;
+                    const TensorBase *embed_for_lm = nullptr;
+                    {
+                        std::lock_guard<std::mutex> lock(cache_mutex_);
+                        const std::string device_key = device.to_string() + ":token_embd.weight";
+                        auto pdit = per_device_cache_.find(device_key);
+                        if (pdit != per_device_cache_.end() && pdit->second)
+                            embed_for_lm = pdit->second.get();
+                        else
+                        {
+                            auto it = cache_.find("token_embd.weight");
+                            if (it != cache_.end() && it->second)
+                                embed_for_lm = it->second.get();
+                        }
+                    }
+
+                    if (embed_for_lm)
+                    {
+                        try
+                        {
+                            const auto *handle = KernelFactory::getOrCreatePreparedGemmWeights(
+                                embed_for_lm, device);
+                            if (handle)
+                            {
+                                auto *kernel = KernelFactory::getOrCreateGemmEngine(handle);
+                                if (kernel)
+                                {
+                                    kernel->prepareWeights();
+                                    LOG_INFO("[WeightManager] Pre-packed tied lm_head (token_embd.weight) as GEMM for "
+                                             << device_name);
+                                }
+                            }
+                            else
+                            {
+                                LOG_WARN("[WeightManager] Failed to prepare tied lm_head GEMM weights for "
+                                         << device_name);
+                            }
+                        }
+                        catch (const std::exception &e)
+                        {
+                            LOG_WARN("[WeightManager] Tied lm_head GEMM preparation threw: " << e.what());
+                        }
+                    }
+                }
+            }
         }
 
         return gemm_ok && non_gemm_ok;
@@ -2316,7 +2358,7 @@ namespace llaminar2
                         embed_tensor, d_model, dev, vocab_offset, total_vocab);
                     if (!handle)
                     {
-                        LOG_WARN("[WeightManager] Embedding preparation failed for " << dev.toString());
+                        LOG_ERROR("[WeightManager] Embedding preparation failed for " << dev.toString());
                     }
                 }
             }
@@ -2862,7 +2904,7 @@ namespace llaminar2
                 auto base_it = cache_.find(name);
                 if (base_it == cache_.end() || !base_it->second)
                 {
-                    LOG_WARN("[WeightManager] Non-GEMM weight missing from cache: " << name);
+                    LOG_ERROR("[WeightManager] Non-GEMM weight missing from cache: " << name);
                     continue;
                 }
                 tensor = base_it->second;
@@ -2903,7 +2945,7 @@ namespace llaminar2
 
             if (!device_tensor_holder)
             {
-                LOG_WARN("[WeightManager] Failed to get device tensor for: " << name);
+                LOG_ERROR("[WeightManager] Failed to get device tensor for: " << name);
                 continue;
             }
 
@@ -3099,15 +3141,14 @@ namespace llaminar2
     {
         if (!tensor)
         {
-            LOG_ERROR("[WeightManager] sliceRowRange: null tensor");
-            return nullptr;
+            throw std::runtime_error("[WeightManager] sliceRowRange: null tensor");
         }
 
         const auto &shape = tensor->shape();
         if (shape.size() != 2)
         {
-            LOG_ERROR("[WeightManager] sliceRowRange requires 2D tensor, got " << shape.size() << "D");
-            return nullptr;
+            throw std::runtime_error("[WeightManager] sliceRowRange requires 2D tensor, got " +
+                                     std::to_string(shape.size()) + "D");
         }
 
         size_t out_dim = shape[0];
@@ -3115,18 +3156,17 @@ namespace llaminar2
 
         if (row_start + row_count > out_dim)
         {
-            LOG_ERROR("[WeightManager] sliceRowRange: row_start=" << row_start
-                                                                  << " + row_count=" << row_count << " > out_dim=" << out_dim);
-            return nullptr;
+            throw std::runtime_error("[WeightManager] sliceRowRange: row_start=" + std::to_string(row_start) +
+                                     " + row_count=" + std::to_string(row_count) +
+                                     " > out_dim=" + std::to_string(out_dim));
         }
 
         // Currently only FP32 slicing is supported
         auto *fp32_tensor = dynamic_cast<FP32Tensor *>(tensor.get());
         if (!fp32_tensor)
         {
-            LOG_ERROR("[WeightManager] sliceRowRange currently requires FP32 tensor. "
-                      "For quantized weights, use GGUF loadTensorRowSlice instead.");
-            return nullptr;
+            throw std::runtime_error("[WeightManager] sliceRowRange currently requires FP32 tensor. "
+                                     "For quantized weights, use GGUF loadTensorRowSlice instead.");
         }
 
         // Create sliced tensor
@@ -3152,15 +3192,14 @@ namespace llaminar2
     {
         if (!tensor)
         {
-            LOG_ERROR("[WeightManager] sliceColumnRange: null tensor");
-            return nullptr;
+            throw std::runtime_error("[WeightManager] sliceColumnRange: null tensor");
         }
 
         const auto &shape = tensor->shape();
         if (shape.size() != 2)
         {
-            LOG_ERROR("[WeightManager] sliceColumnRange requires 2D tensor, got " << shape.size() << "D");
-            return nullptr;
+            throw std::runtime_error("[WeightManager] sliceColumnRange requires 2D tensor, got " +
+                                     std::to_string(shape.size()) + "D");
         }
 
         size_t rows = shape[0];
@@ -3168,24 +3207,22 @@ namespace llaminar2
 
         if (col_start + col_count > cols)
         {
-            LOG_ERROR("[WeightManager] sliceColumnRange: col_start=" << col_start
-                                                                     << " + col_count=" << col_count << " > cols=" << cols);
-            return nullptr;
+            throw std::runtime_error("[WeightManager] sliceColumnRange: col_start=" + std::to_string(col_start) +
+                                     " + col_count=" + std::to_string(col_count) +
+                                     " > cols=" + std::to_string(cols));
         }
 
         if (col_count == 0)
         {
-            LOG_ERROR("[WeightManager] sliceColumnRange: col_count cannot be 0");
-            return nullptr;
+            throw std::runtime_error("[WeightManager] sliceColumnRange: col_count cannot be 0");
         }
 
         // Currently only FP32 slicing is supported
         auto *fp32_tensor = dynamic_cast<FP32Tensor *>(tensor.get());
         if (!fp32_tensor)
         {
-            LOG_ERROR("[WeightManager] sliceColumnRange currently requires FP32 tensor. "
-                      "For quantized weights, use GGUF loadTensorColumnSlice instead.");
-            return nullptr;
+            throw std::runtime_error("[WeightManager] sliceColumnRange currently requires FP32 tensor. "
+                                     "For quantized weights, use GGUF loadTensorColumnSlice instead.");
         }
 
         // Create sliced tensor
@@ -3224,8 +3261,7 @@ namespace llaminar2
     {
         if (!has_sharding_config_)
         {
-            LOG_ERROR("[WeightManager] No sharding config set - cannot compute slice boundaries");
-            return false;
+            throw std::runtime_error("[WeightManager] No sharding config set - cannot compute slice boundaries");
         }
 
         WeightDimensionType dim_type = sharding_config_.getDimensionType(name);
@@ -3237,8 +3273,7 @@ namespace llaminar2
             const int total_heads = tp_config_->totalHeads();
             if (total_heads <= 0)
             {
-                LOG_ERROR("[WeightManager] Invalid total_heads in TensorParallelConfig");
-                return false;
+                throw std::runtime_error("[WeightManager] Invalid total_heads in TensorParallelConfig");
             }
             const size_t head_dim = total_size / static_cast<size_t>(total_heads);
             out_start = assignment.head_start * head_dim;
@@ -3254,8 +3289,7 @@ namespace llaminar2
             const int total_kv_heads = tp_config_->totalKVHeads();
             if (total_kv_heads <= 0)
             {
-                LOG_ERROR("[WeightManager] Invalid total_kv_heads in TensorParallelConfig");
-                return false;
+                throw std::runtime_error("[WeightManager] Invalid total_kv_heads in TensorParallelConfig");
             }
             const size_t head_dim = total_size / static_cast<size_t>(total_kv_heads);
             out_start = assignment.kv_head_start * head_dim;
@@ -3289,8 +3323,7 @@ namespace llaminar2
             const int total_heads = tp_config_->totalHeads();
             if (total_heads <= 0)
             {
-                LOG_ERROR("[WeightManager] Invalid total_heads for ProportionalHeads slicing");
-                return false;
+                throw std::runtime_error("[WeightManager] Invalid total_heads for ProportionalHeads slicing");
             }
             out_start = total_size * static_cast<size_t>(assignment.head_start) / static_cast<size_t>(total_heads);
             const size_t end = total_size * static_cast<size_t>(assignment.head_start + assignment.head_count) / static_cast<size_t>(total_heads);
@@ -3304,11 +3337,9 @@ namespace llaminar2
         case WeightDimensionType::Bias1D:
         case WeightDimensionType::None:
         default:
-            LOG_ERROR("[WeightManager] Cannot compute slice boundaries for dimension type "
-                      << static_cast<int>(dim_type) << " on weight: " << name);
-            return false;
+            throw std::runtime_error("[WeightManager] Cannot compute slice boundaries for dimension type " +
+                                     std::to_string(static_cast<int>(dim_type)) + " on weight: " + name);
         } // switch
-        return false; // unreachable but silences -Wreturn-type
     }
 
     std::shared_ptr<TensorBase> WeightManager::loadColumnParallel1DBias(
@@ -3325,24 +3356,21 @@ namespace llaminar2
         // Use config to determine dimension type for slicing
         if (!computeSliceBoundaries(name, total_size, assignment, slice_start, slice_count))
         {
-            LOG_ERROR("[WeightManager] Failed to compute slice boundaries for 1D tensor: " << name);
-            return nullptr;
+            throw std::runtime_error("[WeightManager] Failed to compute slice boundaries for 1D tensor: " + name);
         }
 
         // Load full tensor and slice in memory (biases are small)
         auto full_tensor = loader_.loadTensor(name, device, WeightPrecision::NATIVE);
         if (!full_tensor)
         {
-            LOG_ERROR("[WeightManager] Failed to load 1D tensor: " << name);
-            return nullptr;
+            throw std::runtime_error("[WeightManager] Failed to load 1D tensor: " + name);
         }
 
         // Create sliced tensor
         auto *fp32_full = dynamic_cast<FP32Tensor *>(full_tensor.get());
         if (!fp32_full)
         {
-            LOG_ERROR("[WeightManager] 1D bias must be FP32: " << name);
-            return nullptr;
+            throw std::runtime_error("[WeightManager] 1D bias must be FP32: " + name);
         }
 
         std::vector<size_t> slice_shape = {slice_count};
@@ -3384,8 +3412,7 @@ namespace llaminar2
         // Use config-based dimension type to determine slicing
         if (!computeSliceBoundaries(name, total_rows, assignment, row_start, row_count))
         {
-            LOG_ERROR("[WeightManager] Failed to compute slice boundaries for 2D column-parallel: " << name);
-            return nullptr;
+            throw std::runtime_error("[WeightManager] Failed to compute slice boundaries for 2D column-parallel: " + name);
         }
 
         // Load only the slice from GGUF file (memory efficient, preserves quantization)
@@ -3394,8 +3421,7 @@ namespace llaminar2
 
         if (!slice_tensor)
         {
-            LOG_ERROR("[WeightManager] Failed to load row slice for: " << name);
-            return nullptr;
+            throw std::runtime_error("[WeightManager] Failed to load row slice for: " + name);
         }
 
         // Wrap in TensorSlice with metadata
@@ -3466,11 +3492,8 @@ namespace llaminar2
         {
             if (total_rows % 3 != 0)
             {
-                LOG_ERROR("[WeightManager] FusedQKVHeads: total_rows " << total_rows
-                                                                       << " not divisible by 3"
-                                                                       << " and no GDN layout match"
-                                                                       << " for weight: " << name);
-                return nullptr;
+                throw std::runtime_error("[WeightManager] FusedQKVHeads: total_rows " + std::to_string(total_rows) +
+                                         " not divisible by 3 and no GDN layout match for weight: " + name);
             }
             const size_t equal_rows = total_rows / 3;
             sub_block_sizes[0] = equal_rows;
@@ -3503,11 +3526,10 @@ namespace llaminar2
                     continue; // Replicated sub-blocks are always valid
                 if (sub_block_sizes[s] % static_cast<size_t>(world_size) != 0)
                 {
-                    LOG_ERROR("[WeightManager] Cannot shard FusedQKV weight '" << name
-                                                                               << "': sub-block " << sub_names[s]
-                                                                               << " has " << sub_block_sizes[s]
-                                                                               << " rows, not divisible by TP degree " << world_size);
-                    return nullptr;
+                    throw std::runtime_error(std::string("[WeightManager] Cannot shard FusedQKV weight '") + name +
+                                             "': sub-block " + sub_names[s] +
+                                             " has " + std::to_string(sub_block_sizes[s]) +
+                                             " rows, not divisible by TP degree " + std::to_string(world_size));
                 }
             }
         }
@@ -3528,10 +3550,8 @@ namespace llaminar2
 
             if (!slices[s])
             {
-                LOG_ERROR("[WeightManager] Failed to load fused-QKV sub-block " << s
-                                                                                << " rows [" << abs_row_start << ", " << abs_row_end << ")"
-                                                                                << " for: " << name);
-                return nullptr;
+                throw std::runtime_error("[WeightManager] Failed to load fused-QKV sub-block " +
+                                         std::to_string(s) + " for: " + name);
             }
 
             total_out_rows += local_count;
@@ -3551,8 +3571,8 @@ namespace llaminar2
             const void *src = slices[s]->raw_data();
             if (!src)
             {
-                LOG_ERROR("[WeightManager] Null raw_data for fused-QKV sub-block " << s << ": " << name);
-                return nullptr;
+                throw std::runtime_error("[WeightManager] Null raw_data for fused-QKV sub-block " +
+                                         std::to_string(s) + ": " + name);
             }
             std::memcpy(combined_raw.data() + byte_offset, src, slices[s]->size_bytes());
             byte_offset += slices[s]->size_bytes();
@@ -3567,9 +3587,8 @@ namespace llaminar2
 
         if (!result_tensor)
         {
-            LOG_ERROR("[WeightManager] Failed to create fused-QKV tensor of type "
-                      << static_cast<int>(native_type) << " for: " << name);
-            return nullptr;
+            throw std::runtime_error("[WeightManager] Failed to create fused-QKV tensor of type " +
+                                     std::to_string(static_cast<int>(native_type)) + " for: " + name);
         }
 
         // Wrap in TensorSlice with column-parallel metadata so downstream TP
@@ -3607,8 +3626,7 @@ namespace llaminar2
         // Use config-based dimension type to determine row slicing
         if (!computeSliceBoundaries(name, total_rows, assignment, row_start, row_count))
         {
-            LOG_ERROR("[WeightManager] Failed to compute slice boundaries for row-parallel: " << name);
-            return nullptr;
+            throw std::runtime_error("[WeightManager] Failed to compute slice boundaries for row-parallel: " + name);
         }
 
         auto slice_tensor = loader_.loadTensorRowSlice(
@@ -3616,8 +3634,7 @@ namespace llaminar2
 
         if (!slice_tensor)
         {
-            LOG_ERROR("[WeightManager] Failed to load row slice for row-parallel: " << name);
-            return nullptr;
+            throw std::runtime_error("[WeightManager] Failed to load row slice for row-parallel: " + name);
         }
 
         auto meta = SliceMetadata::forRowParallel(
@@ -3651,8 +3668,7 @@ namespace llaminar2
 
         if (!computeSliceBoundaries(name, total_cols, assignment, col_start, col_count))
         {
-            LOG_ERROR("[WeightManager] Failed to compute slice boundaries for input-parallel: " << name);
-            return nullptr;
+            throw std::runtime_error("[WeightManager] Failed to compute slice boundaries for input-parallel: " + name);
         }
 
         auto slice_tensor = loader_.loadTensorColumnSlice(
@@ -3660,8 +3676,7 @@ namespace llaminar2
 
         if (!slice_tensor)
         {
-            LOG_ERROR("[WeightManager] Failed to load column slice for input-parallel: " << name);
-            return nullptr;
+            throw std::runtime_error("[WeightManager] Failed to load column slice for input-parallel: " + name);
         }
 
         // Input-parallel uses row-parallel metadata (mathematically similar but with column slicing)
@@ -3771,8 +3786,7 @@ namespace llaminar2
                         "token_embd.weight", row_start, row_start + row_count, device, WeightPrecision::NATIVE);
                     if (!slice_tensor)
                     {
-                        LOG_ERROR("[WeightManager] Failed to load tied embedding row slice");
-                        return nullptr;
+                        throw std::runtime_error("[WeightManager] Failed to load tied embedding row slice");
                     }
 
                     auto meta = SliceMetadata::forColumnParallel(
@@ -3807,8 +3821,7 @@ namespace llaminar2
             }
             else
             {
-                LOG_ERROR("[WeightManager] Invalid tensor for column-parallel (expected 1D or 2D): " << name);
-                return nullptr;
+                throw std::runtime_error("[WeightManager] Invalid tensor for column-parallel (expected 1D or 2D): " + name);
             }
             break;
         }
@@ -3823,8 +3836,7 @@ namespace llaminar2
             }
             if (dims_opt->size() != 2)
             {
-                LOG_ERROR("[WeightManager] Invalid tensor for row-parallel (expected 2D): " << name);
-                return nullptr;
+                throw std::runtime_error("[WeightManager] Invalid tensor for row-parallel (expected 2D): " + name);
             }
             result = loadRowParallelWeight(name, device, assignment, *dims_opt);
             break;
@@ -3840,16 +3852,14 @@ namespace llaminar2
             }
             if (dims_opt->size() != 2)
             {
-                LOG_ERROR("[WeightManager] Invalid tensor for input-parallel (expected 2D): " << name);
-                return nullptr;
+                throw std::runtime_error("[WeightManager] Invalid tensor for input-parallel (expected 2D): " + name);
             }
             result = loadInputParallelWeight(name, device, assignment, *dims_opt);
             break;
         }
 
         default:
-            LOG_ERROR("[WeightManager] Unknown sharding mode for: " << name);
-            return nullptr;
+            throw std::runtime_error("[WeightManager] Unknown sharding mode for: " + name);
         }
 
         // Cache the result for subsequent requests

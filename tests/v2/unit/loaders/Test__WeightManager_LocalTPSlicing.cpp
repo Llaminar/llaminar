@@ -179,8 +179,7 @@ namespace llaminar2
         TEST_F(Test__WeightManager_LocalTPSlicing, SliceRowRange_NullTensor_ReturnsNull)
         {
             std::shared_ptr<TensorBase> null_tensor = nullptr;
-            auto sliced = WeightManager::sliceRowRange(null_tensor, 0, 1);
-            EXPECT_EQ(sliced, nullptr);
+            EXPECT_THROW(WeightManager::sliceRowRange(null_tensor, 0, 1), std::runtime_error);
         }
 
         TEST_F(Test__WeightManager_LocalTPSlicing, SliceRowRange_OutOfBounds_ReturnsNull)
@@ -189,8 +188,7 @@ namespace llaminar2
             auto shared_tensor = std::shared_ptr<TensorBase>(tensor.release());
 
             // Start + count exceeds tensor dimensions
-            auto sliced = WeightManager::sliceRowRange(shared_tensor, 8, 5);
-            EXPECT_EQ(sliced, nullptr);
+            EXPECT_THROW(WeightManager::sliceRowRange(shared_tensor, 8, 5), std::runtime_error);
         }
 
         TEST_F(Test__WeightManager_LocalTPSlicing, SliceRowRange_StartAtEnd_ReturnsNull)
@@ -199,8 +197,7 @@ namespace llaminar2
             auto shared_tensor = std::shared_ptr<TensorBase>(tensor.release());
 
             // Start at row 10 (out of bounds)
-            auto sliced = WeightManager::sliceRowRange(shared_tensor, 10, 1);
-            EXPECT_EQ(sliced, nullptr);
+            EXPECT_THROW(WeightManager::sliceRowRange(shared_tensor, 10, 1), std::runtime_error);
         }
 
         // =============================================================================

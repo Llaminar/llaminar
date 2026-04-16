@@ -280,9 +280,8 @@ TEST_F(WeightManagerDecodeShardTest, SliceTailRows_RejectsNonTwoDimTensor)
     // Create 1D tensor
     auto tensor_1d = std::make_shared<FP32Tensor>(std::vector<size_t>{100});
 
-    // Should return nullptr for 1D tensor
-    auto sliced = WeightManager::sliceTailRows(tensor_1d, 0.20f);
-    EXPECT_EQ(sliced, nullptr);
+    // Should throw for 1D tensor
+    EXPECT_THROW(WeightManager::sliceTailRows(tensor_1d, 0.20f), std::runtime_error);
 }
 
 TEST_F(WeightManagerDecodeShardTest, SliceTailColumns_RejectsNonTwoDimTensor)
@@ -290,9 +289,8 @@ TEST_F(WeightManagerDecodeShardTest, SliceTailColumns_RejectsNonTwoDimTensor)
     // Create 3D tensor
     auto tensor_3d = std::make_shared<FP32Tensor>(std::vector<size_t>{10, 10, 10});
 
-    // Should return nullptr for 3D tensor
-    auto sliced = WeightManager::sliceTailColumns(tensor_3d, 0.20f);
-    EXPECT_EQ(sliced, nullptr);
+    // Should throw for 3D tensor
+    EXPECT_THROW(WeightManager::sliceTailColumns(tensor_3d, 0.20f), std::runtime_error);
 }
 
 // =============================================================================

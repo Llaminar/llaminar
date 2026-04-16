@@ -134,6 +134,25 @@ namespace llaminar2
             CollectiveOp op) override;
 
         /**
+         * @brief Multi-buffer AllReduce operation
+         *
+         * Each buffers[i] is on group_.devices[i]. Host-staged reduction:
+         * D2H each device buffer, reduce on host, H2D result back to each device.
+         * This is the bridge-backend path used by HeterogeneousBackend Phase 2.
+         *
+         * @param buffers One device buffer per member of the group (in-place).
+         * @param count Number of elements per buffer
+         * @param dtype Data type of elements
+         * @param op Reduction operation (SUM, MAX, MIN)
+         * @return true on success
+         */
+        bool allreduceMulti(
+            const std::vector<void *> &buffers,
+            size_t count,
+            CollectiveDataType dtype,
+            CollectiveOp op) override;
+
+        /**
          * @brief AllGather operation
          *
          * For single-device groups: copies send_buf to recv_buf

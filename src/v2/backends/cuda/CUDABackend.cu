@@ -671,6 +671,10 @@ namespace llaminar2
         {
             LOG_WARN("[CUDABackend::unpinHostMemory] cudaHostUnregister failed: "
                      << cudaGetErrorString(err));
+            // Clear the sticky CUDA error so it doesn't contaminate subsequent
+            // CUDA operations (kernel launches, memcpy, etc.).  This commonly
+            // happens during teardown when mmap pages are already unmapped.
+            (void)cudaGetLastError();
             return false;
         }
         return true;

@@ -1874,6 +1874,13 @@ static hipblasHandle_t get_cached_rocblas_handle(int device_id) {
         printf("[rocblas_prefill] Failed to create hipBLAS handle for device %d\n", device_id);
         return nullptr;
     }
+    // Disable atomic reductions inside rocBLAS/Tensile GEMM kernels.
+    // Atomic accumulation produces nondeterministic floating-point reduction
+    // order across runs, which causes parity tests to drift ~14x in KL
+    // divergence and occasionally fail tight thresholds. The deterministic
+    // (non-atomic) Tensile paths are selected instead; perf impact is minor
+    // on gfx906 since SGEMM there is compute-bound, not reduction-bound.
+    hipblasSetAtomicsMode(h, HIPBLAS_ATOMICS_NOT_ALLOWED);
     handles[device_id] = h;
     return h;
 }
@@ -1911,6 +1918,9 @@ static PrefillPoolState& get_stream_pool(int device_id) {
         hipStreamCreateWithFlags(&state.streams[i].stream, hipStreamNonBlocking);
         hipblasCreate(&state.streams[i].handle);
         hipblasSetStream(state.streams[i].handle, state.streams[i].stream);
+        // Disable atomic reductions inside rocBLAS/Tensile GEMM kernels for
+        // deterministic output (see get_cached_rocblas_handle for rationale).
+        hipblasSetAtomicsMode(state.streams[i].handle, HIPBLAS_ATOMICS_NOT_ALLOWED);
         hipEventCreateWithFlags(&state.streams[i].completion_event, hipEventDisableTiming);
     }
     hipEventCreateWithFlags(&state.input_ready, hipEventDisableTiming);

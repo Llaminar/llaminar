@@ -1065,6 +1065,8 @@ namespace llaminar2
                 return nullptr;
             }
             hipblasSetStream(hipblas_handle, stream);
+            // Disable atomic reductions for deterministic GEMM output.
+            hipblasSetAtomicsMode(hipblas_handle, HIPBLAS_ATOMICS_NOT_ALLOWED);
             rocm_ctx->hipblas_handle = hipblas_handle;
             ctx = rocm_ctx;
             break;
