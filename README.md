@@ -1,5 +1,5 @@
 # llaminar
-An LLM inferencing engine.
+An LLM inferencing engine in C++.
 
 Llaminar tries to solve a variety of problems encountered in other projects:
 
