@@ -31,7 +31,11 @@ ENV DEBIAN_FRONTEND=noninteractive \
     CMAKE_BUILD_PARALLEL_LEVEL=8 \
     CUDAARCHS=${LLAMINAR_CUDA_ARCHS}
 
-# Core build deps. GCC 14 is required for the project's C++23 usage (std::print).
+# Core build deps plus NCCL (CUDA 13). The nvidia/cuda:*-devel-* base image
+# already has the official CUDA apt repo configured, so libnccl2/libnccl-dev
+# install directly without needing a separate cuda-keyring step.
+#
+# GCC 14 is required for the project's C++23 usage (std::print).
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential \
         ca-certificates \
@@ -47,6 +51,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libgmock-dev \
         libgtest-dev \
         libhwloc-dev \
+        libnccl2 \
+        libnccl-dev \
         libnuma-dev \
         libopenblas-dev \
         libopenmpi-dev \
@@ -60,18 +66,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         python3-dev \
         python3-pip \
         python3-venv \
-        wget \
     && rm -rf /var/lib/apt/lists/*
-
-# NCCL matched to CUDA 13 major (avoids stub library errors at link time).
-RUN wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb \
-        -O /tmp/cuda-keyring.deb \
-    && dpkg -i /tmp/cuda-keyring.deb \
-    && apt-get update \
-    && apt-get install -y --no-install-recommends \
-        'libnccl2=*+cuda13.0' \
-        'libnccl-dev=*+cuda13.0' \
-    && rm -rf /var/lib/apt/lists/* /tmp/cuda-keyring.deb
 
 # Default GCC = 14 for C++23 support.
 RUN update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-14 100 \

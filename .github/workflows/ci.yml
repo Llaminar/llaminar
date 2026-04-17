@@ -30,6 +30,15 @@ env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
   MODELS_DIR: /opt/llaminar-models
+  # Self-hosted runner toolchain paths. The runner daemon starts with a minimal
+  # PATH that does not include /usr/local/cuda/bin, so CMake's CUDAToolkit
+  # lookup fails. These make CUDA + ROCm discoverable for all gates that build
+  # the tree directly on the runner (unit, parity, e2e, perf).
+  CUDA_PATH: /usr/local/cuda
+  CUDA_HOME: /usr/local/cuda
+  CUDACXX: /usr/local/cuda/bin/nvcc
+  ROCM_PATH: /opt/rocm
+  PATH: /usr/local/cuda/bin:/opt/rocm/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 jobs:
   # ---------------------------------------------------------------------------
@@ -279,15 +288,16 @@ jobs:
     steps:
       - name: Verify all gates passed
         run: |
-          results='${{ toJSON(needs) }}'
-          echo "$results" | python3 -c '
-          import json, sys
-          data = json.load(sys.stdin)
+          python3 <<'PYEOF'
+          import json, sys, os
+          data = json.loads(os.environ["NEEDS"])
           failed = [k for k, v in data.items() if v.get("result") not in ("success", "skipped")]
           for k, v in data.items():
-              print(f"  {k}: {v.get(\"result\")}")
+              print(f"  {k}: {v.get('result')}")
           if failed:
               print(f"\nFAILED gates: {failed}", file=sys.stderr)
               sys.exit(1)
           print("\nAll gates passed.")
-          '
+          PYEOF
+        env:
+          NEEDS: ${{ toJSON(needs) }}
