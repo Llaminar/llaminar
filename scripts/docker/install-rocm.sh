@@ -34,7 +34,7 @@ apt-get "${APT_OPTS[@]}"
 curl -fsSL --retry 5 --retry-delay 5 -o /tmp/amdgpu-install.deb \
     "https://repo.radeon.com/amdgpu-install/${ROCM_VERSION}/ubuntu/noble/amdgpu-install_${ROCM_DEB_VERSION}_all.deb"
 apt-get "${APT_OPTS[@]}" update
-apt-get "${APT_OPTS[@]}" install -y /tmp/amdgpu-install.deb
+apt-get "${APT_OPTS[@]}" install -y --allow-change-held-packages /tmp/amdgpu-install.deb
 rm /tmp/amdgpu-install.deb
 
 if [[ "${MODE}" == "full" ]]; then
@@ -50,7 +50,7 @@ fi
 amdgpu-install --usecase="${USECASE}" --no-dkms -y
 
 # Restore gfx906 (MI50 / Vega 20) Tensile kernels removed in ROCm 7.x.
-apt-get "${APT_OPTS[@]}" install -y --no-install-recommends zstd
+apt-get "${APT_OPTS[@]}" install -y --no-install-recommends --allow-change-held-packages zstd
 curl -fsSL --retry 5 --retry-delay 5 -o /tmp/rocblas-arch.pkg.tar.zst \
     "https://archlinux.org/packages/extra/x86_64/rocblas/download"
 mkdir -p /tmp/rocblas-arch

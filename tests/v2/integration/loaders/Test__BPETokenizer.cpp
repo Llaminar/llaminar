@@ -17,9 +17,9 @@
 #include <string>
 #include <vector>
 
-#include "../../../src/v2/utils/Tokenizer.h"
-#include "../../../src/v2/loaders/ModelContext.h"
-#include "../../../src/v2/utils/Logger.h"
+#include "utils/Tokenizer.h"
+#include "loaders/ModelContext.h"
+#include "utils/Logger.h"
 
 using namespace llaminar2;
 
