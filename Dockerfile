@@ -32,13 +32,18 @@ ENV DEBIAN_FRONTEND=noninteractive \
     CUDAARCHS=${LLAMINAR_CUDA_ARCHS}
 
 # Core build deps plus NCCL (CUDA 13). The nvidia/cuda:*-devel-* base image
-# already has the official CUDA apt repo configured, so libnccl2/libnccl-dev
-# install directly without needing a separate cuda-keyring step.
+# has the CUDA apt repo configured but ships without Ubuntu's `universe`
+# repository enabled, so cmake / ninja-build / libopenblas-dev / libgtest-dev
+# etc. are invisible. Enable universe explicitly before the main install.
 #
 # GCC 14 is required for the project's C++23 usage (std::print).
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        build-essential \
         ca-certificates \
+        gnupg \
+        software-properties-common \
+    && add-apt-repository -y universe \
+    && apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
         ccache \
         cmake \
         curl \
@@ -46,7 +51,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         gcc-14 \
         gfortran-14 \
         git \
-        gnupg \
         jq \
         libgmock-dev \
         libgtest-dev \
