@@ -165,6 +165,12 @@ namespace llaminar2
         // 339-stage loop on subsequent decode steps.
         bool gpu_stream_applied = false;
 
+        // The stream pointer that was last applied to all stages. If
+        // segment_cache.reset() destroys the capture_stream and a new one is
+        // created, we must re-apply it to avoid stages holding a dangling
+        // stream pointer.
+        void *applied_stream = nullptr;
+
         // Tracks whether Phase 3 graph replay is active (no markCompleted calls),
         // allowing us to skip the 339-node graph.reset() since flags are already clear.
         bool phase3_active = false;
@@ -208,6 +214,7 @@ namespace llaminar2
             dynamic_param_stages.clear();
             dynamic_param_stages_cached = false;
             gpu_stream_applied = false;
+            applied_stream = nullptr;
             phase3_active = false;
             pp_external_hidden_state = nullptr;
             pp_working_buffer = nullptr;

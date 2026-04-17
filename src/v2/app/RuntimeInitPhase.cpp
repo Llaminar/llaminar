@@ -202,10 +202,15 @@ namespace llaminar2
         auto &dm = DeviceManager::instance();
         dm.initialize(device_manager_numa_filter, false); // No local table printing
 
-        // Print hardware inventory tables on rank 0 from AllGathered cluster data
+        // Build cluster inventory on ALL ranks (collective MPI_Allgatherv inside).
+        // Printing is rank-0 only, but the exchange must be collective across
+        // the world communicator. Calling clusterInventory() only on rank 0
+        // leaves other ranks out of the collective and causes subsequent
+        // MPI collectives (e.g. syncInitStep Allreduce) to mis-match and
+        // report MPI_ERR_TRUNCATE.
+        const auto &cluster = mpi_ctx->topology().clusterInventory();
         if (mpi_ctx->rank() == 0)
         {
-            const auto &cluster = mpi_ctx->topology().clusterInventory();
             InventoryPrinter::printClusterInventory(cluster);
         }
 

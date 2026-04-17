@@ -169,9 +169,14 @@ namespace llaminar2
          * 3. Release all host weight data (cache_ + per_device_cache_)
          *
          * @param devices List of devices
+         * @param release_host_data If true, release host weight copies after
+         *                          packing and upload. Set false for nested
+         *                          TP-in-PP setups where a later PP stage on
+         *                          a different device still needs host copies.
          * @return true on success
          */
-        bool finalizeForDevices(const std::vector<DeviceId> &devices) override;
+        bool finalizeForDevices(const std::vector<DeviceId> &devices,
+                                bool release_host_data = true) override;
 
         // =========================================================================
         // Weight Packing and Preloading (folded from WeightPreloader)

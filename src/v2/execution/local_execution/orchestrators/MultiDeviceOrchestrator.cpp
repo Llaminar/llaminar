@@ -623,8 +623,17 @@ namespace llaminar2
             auto weight_mgr = model_ctx_->weightManager();
             if (weight_mgr)
             {
-                LOG_INFO("MultiDeviceOrchestrator: Finalizing weights for " << device_ids.size() << " devices");
-                if (!weight_mgr->finalizeForDevices(device_ids))
+                // When this MDO is itself a nested TP stage inside a larger PP
+                // pipeline (hybrid PP+TP), the outer caller still owns host
+                // copies that later PP stages need. Skip release here — the
+                // outer caller will release once all stages are prepared.
+                const bool is_nested_tp_in_pp = config_.nested_pp_stage_config.has_value();
+                const bool release_host_data = !is_nested_tp_in_pp;
+
+                LOG_INFO("MultiDeviceOrchestrator: Finalizing weights for "
+                         << device_ids.size() << " devices"
+                         << " (release_host_data=" << release_host_data << ")");
+                if (!weight_mgr->finalizeForDevices(device_ids, release_host_data))
                 {
                     LOG_WARN("MultiDeviceOrchestrator: Weight finalization failed, will use lazy packing");
                 }

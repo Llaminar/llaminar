@@ -2211,33 +2211,33 @@ namespace llaminar2
                         }
                     }
 
-                    if (embed_for_lm)
+                    if (!embed_for_lm)
                     {
-                        try
-                        {
-                            const auto *handle = KernelFactory::getOrCreatePreparedGemmWeights(
-                                embed_for_lm, device);
-                            if (handle)
-                            {
-                                auto *kernel = KernelFactory::getOrCreateGemmEngine(handle);
-                                if (kernel)
-                                {
-                                    kernel->prepareWeights();
-                                    LOG_INFO("[WeightManager] Pre-packed tied lm_head (token_embd.weight) as GEMM for "
-                                             << device_name);
-                                }
-                            }
-                            else
-                            {
-                                LOG_WARN("[WeightManager] Failed to prepare tied lm_head GEMM weights for "
-                                         << device_name);
-                            }
-                        }
-                        catch (const std::exception &e)
-                        {
-                            LOG_WARN("[WeightManager] Tied lm_head GEMM preparation threw: " << e.what());
-                        }
+                        throw std::runtime_error(
+                            std::string("[WeightManager] Tied lm_head requested for ") +
+                            device_name + " but token_embd.weight is not loaded on the device");
                     }
+
+                    const auto *handle = KernelFactory::getOrCreatePreparedGemmWeights(
+                        embed_for_lm, device);
+                    if (!handle)
+                    {
+                        throw std::runtime_error(
+                            std::string("[WeightManager] Failed to prepare tied lm_head GEMM weights for ") +
+                            device_name);
+                    }
+
+                    auto *kernel = KernelFactory::getOrCreateGemmEngine(handle);
+                    if (!kernel)
+                    {
+                        throw std::runtime_error(
+                            std::string("[WeightManager] Failed to create GEMM engine for tied lm_head on ") +
+                            device_name);
+                    }
+
+                    kernel->prepareWeights();
+                    LOG_INFO("[WeightManager] Pre-packed tied lm_head (token_embd.weight) as GEMM for "
+                             << device_name);
                 }
             }
         }
@@ -2268,7 +2268,8 @@ namespace llaminar2
         return ok;
     }
 
-    bool WeightManager::finalizeForDevices(const std::vector<DeviceId> &devices)
+    bool WeightManager::finalizeForDevices(const std::vector<DeviceId> &devices,
+                                            bool release_host_data)
     {
         if (devices.empty())
         {
@@ -2364,10 +2365,20 @@ namespace llaminar2
             }
         }
 
-        // Step 3: Release all host weight data
-        size_t released = releaseAllHostWeightData();
-        LOG_INFO("[WeightManager] finalizeForDevices: released " << released
-                                                                 << " host tensors across " << devices.size() << " devices");
+        // Step 3: Release all host weight data (unless caller opts out — e.g.
+        // nested TP-in-PP, where a later PP stage on a different device still
+        // needs host copies to clone from).
+        if (release_host_data)
+        {
+            size_t released = releaseAllHostWeightData();
+            LOG_INFO("[WeightManager] finalizeForDevices: released " << released
+                                                                     << " host tensors across " << devices.size() << " devices");
+        }
+        else
+        {
+            LOG_INFO("[WeightManager] finalizeForDevices: retaining host weight data "
+                     "(nested TP-in-PP; outer caller will release)");
+        }
 
         // Step 4: Return freed memory to the OS.
         // glibc malloc keeps freed blocks in its arena and only returns memory
@@ -2375,6 +2386,7 @@ namespace llaminar2
         // tensors (several GB), the arena is heavily fragmented.  malloc_trim
         // forces glibc to release free pages back to the kernel via madvise.
 #ifdef __linux__
+        if (release_host_data)
         {
             auto report_rss = [](const char *label)
             {

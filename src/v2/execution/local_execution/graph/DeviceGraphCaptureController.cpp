@@ -1193,7 +1193,27 @@ namespace llaminar2
                 // post-capture operations can sync normally.
                 gpu_ctx->setGraphCaptureActive(false);
 
-                if (!exec_ok || !seg.capture->endCapture())
+                // If a stage failed mid-capture, we MUST still call endCapture()
+                // to exit capture mode on the stream. Otherwise the stream
+                // remains in capture state and any subsequent
+                // synchronizeStream()/clearLastError()/kernel launch will fail
+                // with "operation not permitted when stream is capturing",
+                // cascading into a SIGSEGV inside libcudart when it tries to
+                // cuMemcpyHtoDAsync on a still-capturing stream.
+                bool end_capture_ok = true;
+                if (!exec_ok)
+                {
+                    // Call endCapture() for its side-effect (exit capture mode);
+                    // the resulting graph is unusable because the stage failed.
+                    seg.capture->endCapture();
+                    end_capture_ok = false;
+                }
+                else
+                {
+                    end_capture_ok = seg.capture->endCapture();
+                }
+
+                if (!exec_ok || !end_capture_ok)
                 {
                     LOG_WARN("[DeviceGraphCaptureController] Segmented capture failed, "
                              "continuing without capture to preserve collective sync");

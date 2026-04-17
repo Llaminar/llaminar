@@ -224,11 +224,49 @@ namespace llaminar2
             }
         }
 
-        // For GPU graph replay: set the capture stream on all stages ONCE.
-        // The capture_stream never changes between decode steps, so after the
-        // first pass we skip this 339-stage loop entirely.
+        // For GPU graph replay: set the capture stream on all stages.
+        // Normally the capture_stream never changes between decode steps,
+        // but segment_cache.reset() (on capture retry or repeated replay
+        // failures) destroys the stream and the next call creates a NEW one.
+        // We track the last applied stream pointer and re-apply whenever it
+        // changes so stages never hold a dangling/stale stream.
+        //
+        // Critical: if capture_stream was destroyed but not yet recreated
+        // (e.g. between segment_cache.reset() and the next warmup phase),
+        // applied_stream points at freed memory. Fall back to the device's
+        // default stream for this forward pass so updateDynamicParams and
+        // any stage kernels issue work on a live stream. The warmup phase
+        // will re-apply the fresh capture_stream to all stages before
+        // capture is attempted again.
         void *replay_stream = forward_cache.segment_cache.capture_stream;
-        if (replay_stream && !forward_cache.gpu_stream_applied)
+        if (!replay_stream && forward_cache.applied_stream != nullptr)
+        {
+            // capture_stream was destroyed — previously applied stream is
+            // now invalid. Fall back to the context's default stream.
+            IDeviceContext *fallback_ctx = host.getDeviceContext(input.device);
+            void *fallback_stream = nullptr;
+            if (fallback_ctx && fallback_ctx->deviceId().is_gpu())
+            {
+                auto &pool = GPUDeviceContextPool::instance();
+                IWorkerGPUContext &gpu_ctx = pool.getContext(fallback_ctx->deviceId());
+                fallback_stream = gpu_ctx.defaultStream();
+            }
+            if (fallback_stream && fallback_stream != forward_cache.applied_stream)
+            {
+                const auto &order = forward_cache.graph->getExecutionOrder();
+                for (const auto &node_name : order)
+                {
+                    ComputeNode *node = forward_cache.graph->getNode(node_name);
+                    if (node && node->stage)
+                        node->stage->setGPUStream(fallback_stream);
+                }
+                forward_cache.applied_stream = fallback_stream;
+                // Leave gpu_stream_applied=true so warmup will still detect
+                // the pointer change when it installs the new capture_stream.
+            }
+        }
+        else if (replay_stream && (!forward_cache.gpu_stream_applied ||
+                                   forward_cache.applied_stream != replay_stream))
         {
             const auto &order = forward_cache.graph->getExecutionOrder();
             for (const auto &node_name : order)
@@ -238,6 +276,7 @@ namespace llaminar2
                     node->stage->setGPUStream(replay_stream);
             }
             forward_cache.gpu_stream_applied = true;
+            forward_cache.applied_stream = replay_stream;
         }
 
         // Update position-dependent params using cached stage pointers.

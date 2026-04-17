@@ -292,9 +292,14 @@ namespace llaminar2
          * Call ONCE during MultiDeviceOrchestrator init.
          *
          * @param devices List of devices that will use the weights
+         * @param release_host_data If true, release host weight copies after
+         *                          packing and upload. Set false for nested
+         *                          TP-in-PP setups where a later PP stage on
+         *                          a different device still needs host copies.
          * @return true on success
          */
-        virtual bool finalizeForDevices(const std::vector<DeviceId> & /*devices*/) { return true; }
+        virtual bool finalizeForDevices(const std::vector<DeviceId> & /*devices*/,
+                                         bool /*release_host_data*/ = true) { return true; }
 
         // =========================================================================
         // Internal Lifecycle (called by prepareWeightsForDevice/finalizeForDevice)
