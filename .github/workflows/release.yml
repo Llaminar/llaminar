@@ -65,15 +65,10 @@ jobs:
     name: Publish release artefacts
     if: needs.release-please.outputs.release_created == 'true'
     needs: [release-please, ci]
-    runs-on: ubuntu-24.04
+    runs-on: [self-hosted, linux, x64, llaminar-bench]
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
-
-      - name: Free runner disk
-        run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
-          df -h /
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3

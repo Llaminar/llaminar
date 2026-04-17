@@ -1,7 +1,8 @@
 {
     "name": "Llaminar CMake Development",
-    "dockerFile": "Dockerfile",
     "build": {
+        "dockerfile": ".devcontainer/Dockerfile",
+        "context": "..",
         "args": {
             "INSTALL_CUDA": "true",
             "INSTALL_ROCM": "true"

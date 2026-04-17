@@ -147,18 +147,12 @@ jobs:
   # ---------------------------------------------------------------------------
   docker-build:
     name: Docker build
-    runs-on: ubuntu-24.04
+    runs-on: [self-hosted, linux, x64, llaminar-bench]
     timeout-minutes: 120
     outputs:
       image-ref: ${{ steps.meta.outputs.tags }}
     steps:
       - uses: actions/checkout@v4
-
-      - name: Free runner disk
-        run: |
-          df -h /
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
-          df -h /
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -284,7 +278,7 @@ jobs:
     name: CI complete
     if: always()
     needs: [unit-tests, parity-tests, docker-build, e2e-tests, perf-regression]
-    runs-on: ubuntu-24.04
+    runs-on: [self-hosted, linux, x64, llaminar-bench]
     steps:
       - name: Verify all gates passed
         run: |

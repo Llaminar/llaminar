@@ -60,11 +60,14 @@ changelog/
 README.md
 HANDOVER_*.md
 
-# Scripts not needed at runtime
+# Scripts not needed at runtime (but KEEP scripts/docker/*.sh — those are
+# used by the Dockerfile itself to install system deps).
 *.sh
 run_llaminar*
 test_pytorch_parity.sh
 install_onednn.sh
+!scripts/docker/
+!scripts/docker/**
 
 # Python scripts at repo root (debug/analysis helpers)
 debug_*.py
