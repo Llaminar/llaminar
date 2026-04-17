@@ -19,20 +19,29 @@ set -euo pipefail
 MODE="${MODE:-build}"
 export DEBIAN_FRONTEND=noninteractive
 
+# Make apt resilient to transient network failures. Self-hosted runners and
+# some corporate egress paths see occasional timeouts to archive.ubuntu.com,
+# so retry each individual package fetch up to 5 times before giving up.
+APT_OPTS=(
+    -o Acquire::Retries=5
+    -o Acquire::http::Timeout=30
+    -o Acquire::https::Timeout=30
+)
+
 # --- Bootstrap: packages required to enable `universe` --------------------
-apt-get update
-apt-get install -y --no-install-recommends \
+apt-get "${APT_OPTS[@]}" update
+apt-get "${APT_OPTS[@]}" install -y --no-install-recommends \
     ca-certificates \
     gnupg \
     software-properties-common \
     curl \
     wget
 add-apt-repository -y universe
-apt-get update
+apt-get "${APT_OPTS[@]}" update
 
 if [[ "${MODE}" == "build" ]]; then
     # --- Full build toolchain --------------------------------------------
-    apt-get install -y --no-install-recommends \
+    apt-get "${APT_OPTS[@]}" install -y --no-install-recommends \
         build-essential \
         ccache \
         cmake \
@@ -77,7 +86,7 @@ else
     # --- Slim runtime libraries ------------------------------------------
     # Only what the compiled binary needs at process start. No compilers, no
     # -dev packages, no GTest. Keeps the runtime image as small as possible.
-    apt-get install -y --no-install-recommends \
+    apt-get "${APT_OPTS[@]}" install -y --no-install-recommends \
         libgomp1 \
         libhwloc15 \
         libnuma1 \

@@ -15,16 +15,22 @@ set -euo pipefail
 MODE="${MODE:-full}"
 export DEBIAN_FRONTEND=noninteractive
 
+APT_OPTS=(
+    -o Acquire::Retries=5
+    -o Acquire::http::Timeout=30
+    -o Acquire::https::Timeout=30
+)
+
 # --- Register NVIDIA apt repo --------------------------------------------
-curl -fsSL -o /tmp/cuda-keyring.deb \
+curl -fsSL --retry 5 --retry-delay 5 -o /tmp/cuda-keyring.deb \
     https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
 dpkg -i /tmp/cuda-keyring.deb
 rm /tmp/cuda-keyring.deb
-apt-get update
+apt-get "${APT_OPTS[@]}" update
 
 if [[ "${MODE}" == "full" ]]; then
     # Full toolkit + NCCL headers.
-    apt-get install -y --no-install-recommends \
+    apt-get "${APT_OPTS[@]}" install -y --no-install-recommends \
         cuda-toolkit-13-0 \
         "libnccl2=*+cuda13.0" \
         "libnccl-dev=*+cuda13.0"
@@ -32,7 +38,7 @@ else
     # Runtime libraries only. These are the minimum a dynamically-linked
     # llaminar2 binary needs at process start: cuBLAS, cuBLASLt, cuSPARSE,
     # cuSOLVER, cuRAND, cuFFT, NPP, NVRTC, and the NCCL runtime.
-    apt-get install -y --no-install-recommends \
+    apt-get "${APT_OPTS[@]}" install -y --no-install-recommends \
         cuda-cudart-13-0 \
         cuda-nvrtc-13-0 \
         libcublas-13-0 \

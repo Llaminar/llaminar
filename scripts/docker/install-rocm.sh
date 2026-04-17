@@ -18,11 +18,17 @@ ROCM_VERSION="${ROCM_VERSION:-7.1.1}"
 ROCM_DEB_VERSION="${ROCM_DEB_VERSION:-7.1.1.70101-1}"
 export DEBIAN_FRONTEND=noninteractive
 
+APT_OPTS=(
+    -o Acquire::Retries=5
+    -o Acquire::http::Timeout=30
+    -o Acquire::https::Timeout=30
+)
+
 # amdgpu-install is the canonical installer for ROCm on Ubuntu.
-curl -fsSL -o /tmp/amdgpu-install.deb \
+curl -fsSL --retry 5 --retry-delay 5 -o /tmp/amdgpu-install.deb \
     "https://repo.radeon.com/amdgpu-install/${ROCM_VERSION}/ubuntu/noble/amdgpu-install_${ROCM_DEB_VERSION}_all.deb"
-apt-get update
-apt-get install -y /tmp/amdgpu-install.deb
+apt-get "${APT_OPTS[@]}" update
+apt-get "${APT_OPTS[@]}" install -y /tmp/amdgpu-install.deb
 rm /tmp/amdgpu-install.deb
 
 if [[ "${MODE}" == "full" ]]; then
@@ -38,8 +44,8 @@ fi
 amdgpu-install --usecase="${USECASE}" --no-dkms -y
 
 # Restore gfx906 (MI50 / Vega 20) Tensile kernels removed in ROCm 7.x.
-apt-get install -y --no-install-recommends zstd
-curl -fsSL -o /tmp/rocblas-arch.pkg.tar.zst \
+apt-get "${APT_OPTS[@]}" install -y --no-install-recommends zstd
+curl -fsSL --retry 5 --retry-delay 5 -o /tmp/rocblas-arch.pkg.tar.zst \
     "https://archlinux.org/packages/extra/x86_64/rocblas/download"
 mkdir -p /tmp/rocblas-arch
 tar -I zstd -xf /tmp/rocblas-arch.pkg.tar.zst -C /tmp/rocblas-arch
