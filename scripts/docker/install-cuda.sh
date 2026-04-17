@@ -38,6 +38,12 @@ else
     # Runtime libraries only. These are the minimum a dynamically-linked
     # llaminar2 binary needs at process start: cuBLAS, cuBLASLt, cuSPARSE,
     # cuSOLVER, cuRAND, cuFFT, NPP, NVRTC, and the NCCL runtime.
+    apt-get "${APT_OPTS[@]}"bnccl2=*+cuda13.0" \
+        "libnccl-dev=*+cuda13.0"
+else
+    # Runtime libraries only. These are the minimum a dynamically-linked
+    # llaminar2 binary needs at process start: cuBLAS, cuBLASLt, cuSPARSE,
+    # cuSOLVER, cuRAND, cuFFT, NPP, NVRTC, and the NCCL runtime.
     apt-get "${APT_OPTS[@]}" install -y --no-install-recommends \
         cuda-cudart-13-0 \
         cuda-nvrtc-13-0 \
