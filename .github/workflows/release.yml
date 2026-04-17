@@ -58,21 +58,18 @@ jobs:
       image-tag: ${{ needs.release-please.outputs.tag_name || github.sha }}
 
   # ---------------------------------------------------------------------------
-  # On a release commit, publish the versioned Docker image to GHCR and attach
-  # the image reference to the GitHub Release.
+  # On a release commit, the CI workflow above has already built and pushed
+  # the versioned runtime image (tag = release tag_name, e.g. v0.1.0). Here
+  # we just add the semver aliases (latest, major, major.minor) pointing at
+  # the same digest, and edit the GitHub Release notes to reference it.
   # ---------------------------------------------------------------------------
   publish-release:
     name: Publish release artefacts
     if: needs.release-please.outputs.release_created == 'true'
     needs: [release-please, ci]
     runs-on: [self-hosted, linux, x64, llaminar-bench]
-    timeout-minutes: 120
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
       - name: Log in to GHCR
         uses: docker/login-action@v3
         with:
@@ -80,32 +77,24 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Compute image metadata
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          tags: |
-            type=raw,value=latest
-            type=raw,value=${{ needs.release-please.outputs.tag_name }}
-            type=raw,value=${{ needs.release-please.outputs.major }}
-            type=raw,value=${{ needs.release-please.outputs.major }}.${{ needs.release-please.outputs.minor }}
-
-      - name: Build & push release image
-        id: build
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: Dockerfile
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-          build-args: |
-            VERSION=${{ needs.release-please.outputs.tag_name }}
-            VCS_REF=${{ github.sha }}
-            BUILD_DATE=${{ github.event.repository.updated_at }}
+      - name: Alias versioned image to latest / major / major.minor
+        env:
+          REGISTRY: ${{ env.REGISTRY }}
+          IMAGE_NAME: ${{ env.IMAGE_NAME }}
+          TAG: ${{ needs.release-please.outputs.tag_name }}
+          MAJOR: ${{ needs.release-please.outputs.major }}
+          MINOR: ${{ needs.release-please.outputs.minor }}
+        run: |
+          set -euo pipefail
+          SRC="${REGISTRY}/${IMAGE_NAME}:${TAG}"
+          docker pull "${SRC}"
+          for alias in latest "${MAJOR}" "${MAJOR}.${MINOR}"; do
+            dst="${REGISTRY}/${IMAGE_NAME}:${alias}"
+            docker tag "${SRC}" "${dst}"
+            docker push "${dst}"
+          done
+          DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' "${SRC}" | awk -F'@' '{print $2}')
+          echo "DIGEST=${DIGEST}" >> "${GITHUB_ENV}"
 
       - name: Attach image reference to release
         env:
@@ -113,7 +102,6 @@ jobs:
           IMAGE_NAME: ${{ env.IMAGE_NAME }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ needs.release-please.outputs.tag_name }}
-          DIGEST: ${{ steps.build.outputs.digest }}
         run: |
           cat > /tmp/release-note.md <<EOF
           ## Docker image

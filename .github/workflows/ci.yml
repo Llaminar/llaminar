@@ -8,16 +8,15 @@ on:
   workflow_call:
     inputs:
       image-tag:
-        description: "Tag to use when referring to the Llaminar image produced by this workflow"
+        description: "Tag applied to the runtime image published by this workflow"
         required: false
         type: string
         default: ci
     outputs:
       image-ref:
-        description: "Full image reference (registry/owner/name:tag) that was built"
-        value: ${{ jobs.docker-build.outputs.image-ref }}
+        description: "Full image reference (registry/owner/name:tag) of the published runtime image"
+        value: ${{ jobs.ci.outputs.image-ref }}
 
-# Cancel stale runs for the same branch / PR.
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -30,125 +29,25 @@ env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
   MODELS_DIR: /opt/llaminar-models
-  # Self-hosted runner toolchain paths. The runner daemon starts with a minimal
-  # PATH that does not include /usr/local/cuda/bin, so CMake's CUDAToolkit
-  # lookup fails. These make CUDA + ROCm discoverable for all gates that build
-  # the tree directly on the runner (unit, parity, e2e, perf).
-  CUDA_PATH: /usr/local/cuda
-  CUDA_HOME: /usr/local/cuda
-  CUDACXX: /usr/local/cuda/bin/nvcc
-  ROCM_PATH: /opt/rocm
-  PATH: /usr/local/cuda/bin:/opt/rocm/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+  # Tag used for the ephemeral builder image (not pushed to GHCR).
+  BUILDER_IMAGE: llaminar-builder:${{ github.sha }}
 
 jobs:
-  # ---------------------------------------------------------------------------
-  # Gate 1: Unit tests (Integration build on GPU self-hosted runner — exercises
-  # CUDA/ROCm unit tests). github-hosted runners cannot build the full tree
-  # since it requires CUDAToolkit + hipblas + NCCL.
-  # ---------------------------------------------------------------------------
-  unit-tests:
-    name: Unit tests
+  # ===========================================================================
+  # Single job on the self-hosted GPU runner. We build the full "builder"
+  # Docker stage once (has source tree, Integration + Release builds, CUDA,
+  # ROCm, test binaries), then exec ctest / benchmark scripts inside it for
+  # each gate. Finally we build the slim runtime image and push to GHCR.
+  #
+  # Running every gate inside the same container removes the need to install
+  # CUDA/ROCm/MPI on the host runner itself — Docker is the only host
+  # dependency. It also keeps the CI environment bit-for-bit identical to the
+  # devcontainer (same install-*.sh scripts) and to what we ship.
+  # ===========================================================================
+  ci:
+    name: CI gates
     runs-on: [self-hosted, linux, x64, llaminar-bench]
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Configure (Integration)
-        run: |
-          cmake -B build_v2_integration -S src/v2 -G Ninja \
-            -DCMAKE_BUILD_TYPE=Integration \
-            -DHAVE_CUDA=ON -DHAVE_ROCM=ON
-
-      - name: Build
-        run: cmake --build build_v2_integration --parallel
-
-      - name: Run V2_Unit_* (parallel)
-        run: |
-          ctest --test-dir build_v2_integration \
-                --output-on-failure \
-                --parallel \
-                -R '^V2_Unit_'
-
-      - name: Upload ctest logs on failure
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: unit-test-logs
-          path: |
-            build_v2_integration/Testing/Temporary/LastTest.log
-          if-no-files-found: ignore
-          retention-days: 14
-
-  # ---------------------------------------------------------------------------
-  # Gate 2: PyTorch parity integration tests (Qwen2 + Qwen3.5, single-device
-  # and node-local TP). Needs models staged at ${MODELS_DIR}.
-  # ---------------------------------------------------------------------------
-  parity-tests:
-    name: PyTorch parity
-    needs: unit-tests
-    runs-on: [self-hosted, linux, x64, llaminar-bench]
-    timeout-minutes: 90
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Stage models
-        run: |
-          if [ ! -d "${MODELS_DIR}" ]; then
-            echo "::error::Models directory ${MODELS_DIR} not found on runner. Populate it with the GGUF weights referenced by the parity tests."
-            exit 1
-          fi
-          ln -snf "${MODELS_DIR}" models
-          ls -1 models | head
-
-      - name: Build Integration
-        run: |
-          cmake -B build_v2_integration -S src/v2 -G Ninja \
-            -DCMAKE_BUILD_TYPE=Integration \
-            -DHAVE_CUDA=ON -DHAVE_ROCM=ON
-          cmake --build build_v2_integration --parallel
-
-      - name: Qwen2 SingleDevice parity
-        run: |
-          ctest --test-dir build_v2_integration --output-on-failure --timeout 900 \
-                -R '^V2_Integration_Parity_Qwen2_SingleDevice$'
-
-      - name: Qwen35 SingleDevice parity (08B only)
-        env:
-          GTEST_FILTER: "*08B*"
-        run: |
-          ctest --test-dir build_v2_integration --output-on-failure --timeout 900 \
-                -R '^V2_Integration_Parity_Qwen35_SingleDevice$'
-
-      - name: Qwen2 NodeLocalTP parity
-        run: |
-          ctest --test-dir build_v2_integration --output-on-failure --timeout 900 \
-                -R '^V2_Integration_Parity_NodeLocalTP$'
-
-      - name: Qwen35 NodeLocalTP parity (08B only)
-        env:
-          GTEST_FILTER: "*08B*"
-        run: |
-          ctest --test-dir build_v2_integration --output-on-failure --timeout 900 \
-                -R '^V2_Integration_Parity_Qwen35_NodeLocalTP$'
-
-      - name: Upload parity CSV artefacts on failure
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: parity-results
-          path: tests/v2/integration/parity/results/
-          if-no-files-found: ignore
-          retention-days: 14
-
-  # ---------------------------------------------------------------------------
-  # Gate 3: Docker build (github-hosted — fast, exercises the Dockerfile).
-  # Builds a multi-stage CUDA runtime image, pushes to GHCR on push events so
-  # downstream jobs can pull it. On pull_request events we only build (no push).
-  # ---------------------------------------------------------------------------
-  docker-build:
-    name: Docker build
-    runs-on: [self-hosted, linux, x64, llaminar-bench]
-    timeout-minutes: 120
+    timeout-minutes: 240
     outputs:
       image-ref: ${{ steps.meta.outputs.tags }}
     steps:
@@ -165,7 +64,7 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Resolve image tags / metadata
+      - name: Resolve runtime-image tags
         id: meta
         uses: docker/metadata-action@v5
         with:
@@ -176,11 +75,154 @@ jobs:
             type=sha,format=short
             type=raw,value=${{ inputs.image-tag || 'ci' }},enable=${{ inputs.image-tag != '' }}
 
-      - name: Build (and push on non-PR)
+      # ---------------------------------------------------------------------
+      # Build the builder stage. `load: true` makes the image available to
+      # the local Docker daemon so subsequent `docker run` steps can use it.
+      # The builder image is NOT pushed to any registry.
+      # ---------------------------------------------------------------------
+      - name: Build builder image
         uses: docker/build-push-action@v6
         with:
           context: .
           file: Dockerfile
+          target: builder
+          load: true
+          tags: ${{ env.BUILDER_IMAGE }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            VERSION=${{ github.ref_name }}
+            VCS_REF=${{ github.sha }}
+            BUILD_DATE=${{ github.event.repository.updated_at }}
+
+      # ---------------------------------------------------------------------
+      # Gate 1: unit tests. Fast, no models needed, pure CPU/GPU isolation.
+      # ---------------------------------------------------------------------
+      - name: Gate 1 — Unit tests
+        run: |
+          docker run --rm \
+            --gpus all \
+            --device=/dev/kfd --device=/dev/dri \
+            --group-add video --group-add render \
+            --ipc=host --shm-size=16g \
+            --workdir /src \
+            ${{ env.BUILDER_IMAGE }} \
+            ctest --test-dir build_v2_integration \
+                  --output-on-failure --parallel \
+                  -R '^V2_Unit_'
+
+      # ---------------------------------------------------------------------
+      # Gate 2: PyTorch parity (Qwen2 + Qwen3.5). Needs models staged at
+      # ${MODELS_DIR} on the runner host — mounted read-only at /src/models
+      # so ctest sees them at the conventional path.
+      # ---------------------------------------------------------------------
+      - name: Stage models
+        run: |
+          if [ ! -d "${MODELS_DIR}" ]; then
+            echo "::error::Models directory ${MODELS_DIR} not found on runner. Populate it with the GGUF weights referenced by the parity tests."
+            exit 1
+          fi
+          ls -1 "${MODELS_DIR}" | head
+
+      - name: Gate 2 — PyTorch parity (Qwen2 SingleDevice)
+        run: |
+          docker run --rm \
+            --gpus all \
+            --device=/dev/kfd --device=/dev/dri \
+            --group-add video --group-add render \
+            --ipc=host --shm-size=16g \
+            -v "${MODELS_DIR}:/src/models:ro" \
+            --workdir /src \
+            ${{ env.BUILDER_IMAGE }} \
+            ctest --test-dir build_v2_integration --output-on-failure \
+                  --timeout 900 -R '^V2_Integration_Parity_Qwen2_SingleDevice$'
+
+      - name: Gate 2 — PyTorch parity (Qwen35 SingleDevice, 08B)
+        run: |
+          docker run --rm \
+            --gpus all \
+            --device=/dev/kfd --device=/dev/dri \
+            --group-add video --group-add render \
+            --ipc=host --shm-size=16g \
+            -v "${MODELS_DIR}:/src/models:ro" \
+            -e GTEST_FILTER='*08B*' \
+            --workdir /src \
+            ${{ env.BUILDER_IMAGE }} \
+            ctest --test-dir build_v2_integration --output-on-failure \
+                  --timeout 900 -R '^V2_Integration_Parity_Qwen35_SingleDevice$'
+
+      - name: Gate 2 — PyTorch parity (Qwen2 NodeLocalTP)
+        run: |
+          docker run --rm \
+            --gpus all \
+            --device=/dev/kfd --device=/dev/dri \
+            --group-add video --group-add render \
+            --ipc=host --shm-size=16g \
+            -v "${MODELS_DIR}:/src/models:ro" \
+            --workdir /src \
+            ${{ env.BUILDER_IMAGE }} \
+            ctest --test-dir build_v2_integration --output-on-failure \
+                  --timeout 900 -R '^V2_Integration_Parity_NodeLocalTP$'
+
+      - name: Gate 2 — PyTorch parity (Qwen35 NodeLocalTP, 08B)
+        run: |
+          docker run --rm \
+            --gpus all \
+            --device=/dev/kfd --device=/dev/dri \
+            --group-add video --group-add render \
+            --ipc=host --shm-size=16g \
+            -v "${MODELS_DIR}:/src/models:ro" \
+            -e GTEST_FILTER='*08B*' \
+            --workdir /src \
+            ${{ env.BUILDER_IMAGE }} \
+            ctest --test-dir build_v2_integration --output-on-failure \
+                  --timeout 900 -R '^V2_Integration_Parity_Qwen35_NodeLocalTP$'
+
+      # ---------------------------------------------------------------------
+      # Gate 3: E2E server tests. Drives the compiled llaminar2 binary via a
+      # shell harness that boots the server and curls it.
+      # ---------------------------------------------------------------------
+      - name: Gate 3 — E2E server tests
+        run: |
+          docker run --rm \
+            --gpus all \
+            --device=/dev/kfd --device=/dev/dri \
+            --group-add video --group-add render \
+            --ipc=host --shm-size=16g \
+            -v "${MODELS_DIR}:/src/models:ro" \
+            --workdir /src \
+            ${{ env.BUILDER_IMAGE }} \
+            tests/v2/e2e/server/test_server_e2e.sh \
+              --binary build_v2_integration/llaminar2 \
+              --backends "cpu,cuda:0,rocm:0"
+
+      # ---------------------------------------------------------------------
+      # Gate 4: performance ratchet. Uses the existing
+      # .githooks/run_benchmark_check.sh (baseline is committed; agents are
+      # forbidden to lower thresholds without explicit approval).
+      # ---------------------------------------------------------------------
+      - name: Gate 4 — Performance regression ratchet
+        run: |
+          docker run --rm \
+            --gpus all \
+            --device=/dev/kfd --device=/dev/dri \
+            --group-add video --group-add render \
+            --ipc=host --shm-size=16g \
+            -v "${MODELS_DIR}:/src/models:ro" \
+            --workdir /src \
+            ${{ env.BUILDER_IMAGE }} \
+            .githooks/run_benchmark_check.sh
+
+      # ---------------------------------------------------------------------
+      # All gates passed. Build the slim runtime stage and push to GHCR
+      # (non-PR only — PRs only build, never publish).
+      # ---------------------------------------------------------------------
+      - name: Build + push runtime image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          target: runtime
           push: ${{ github.event_name != 'pull_request' }}
           load: ${{ github.event_name == 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
@@ -192,106 +234,13 @@ jobs:
             VCS_REF=${{ github.sha }}
             BUILD_DATE=${{ github.event.repository.updated_at }}
 
-  # ---------------------------------------------------------------------------
-  # Gate 4: E2E server tests. Boots the server (via the Integration build on
-  # the runner, not the Docker image — the E2E script drives the binary
-  # directly for fine-grained kill/restart control) and drives it with curl.
-  # ---------------------------------------------------------------------------
-  e2e-tests:
-    name: E2E server tests
-    needs: [unit-tests, docker-build]
-    runs-on: [self-hosted, linux, x64, llaminar-bench]
-    timeout-minutes: 45
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Stage models
-        run: |
-          if [ ! -d "${MODELS_DIR}" ]; then
-            echo "::error::Models directory ${MODELS_DIR} not found on runner."
-            exit 1
-          fi
-          ln -snf "${MODELS_DIR}" models
-
-      - name: Build Integration
-        run: |
-          cmake -B build_v2_integration -S src/v2 -G Ninja \
-            -DCMAKE_BUILD_TYPE=Integration \
-            -DHAVE_CUDA=ON -DHAVE_ROCM=ON
-          cmake --build build_v2_integration --parallel
-
-      - name: Run E2E server tests
-        run: |
-          tests/v2/e2e/server/test_server_e2e.sh \
-            --binary build_v2_integration/llaminar2 \
-            --backends "cpu,cuda:0,rocm:0"
-
-      - name: Upload E2E logs on failure
+      - name: Upload logs on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: e2e-logs
-          path: /tmp/srv_*.log
+          name: ci-logs-${{ github.run_id }}
+          path: |
+            /tmp/srv_*.log
+            tests/v2/integration/parity/results/
           if-no-files-found: ignore
           retention-days: 14
-
-  # ---------------------------------------------------------------------------
-  # Gate 5: Performance regression gate. Uses the existing
-  # .githooks/run_benchmark_check.sh ratchet — ratchets stay in the baseline
-  # JSON (agents are forbidden to edit thresholds without human approval).
-  # ---------------------------------------------------------------------------
-  perf-regression:
-    name: Performance regression
-    needs: unit-tests
-    runs-on: [self-hosted, linux, x64, llaminar-bench]
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Stage models
-        run: |
-          if [ ! -d "${MODELS_DIR}" ]; then
-            echo "::error::Models directory ${MODELS_DIR} not found on runner."
-            exit 1
-          fi
-          ln -snf "${MODELS_DIR}" models
-
-      - name: Run benchmark ratchet
-        run: .githooks/run_benchmark_check.sh
-
-      - name: Upload benchmark output on failure
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: benchmark-logs
-          path: |
-            build_v2_release/benchmark_*.log
-            .githooks/benchmark_baseline.json
-          if-no-files-found: ignore
-          retention-days: 30
-
-  # ---------------------------------------------------------------------------
-  # Aggregate gate. Lets branch protection require a single "CI" check instead
-  # of every job individually (easier to manage, still enforces all gates).
-  # ---------------------------------------------------------------------------
-  ci-complete:
-    name: CI complete
-    if: always()
-    needs: [unit-tests, parity-tests, docker-build, e2e-tests, perf-regression]
-    runs-on: [self-hosted, linux, x64, llaminar-bench]
-    steps:
-      - name: Verify all gates passed
-        run: |
-          python3 <<'PYEOF'
-          import json, sys, os
-          data = json.loads(os.environ["NEEDS"])
-          failed = [k for k, v in data.items() if v.get("result") not in ("success", "skipped")]
-          for k, v in data.items():
-              print(f"  {k}: {v.get('result')}")
-          if failed:
-              print(f"\nFAILED gates: {failed}", file=sys.stderr)
-              sys.exit(1)
-          print("\nAll gates passed.")
-          PYEOF
-        env:
-          NEEDS: ${{ toJSON(needs) }}

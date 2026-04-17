@@ -63,15 +63,25 @@ COPY tests ./tests
 COPY CMakeLists.txt ./CMakeLists.txt
 COPY .githooks ./.githooks
 
-# Compile Release. Tests stay in-tree but are not exercised here; the
-# Integration build on a GPU self-hosted runner drives ctest separately.
+# Integration build — what CI drives for unit, parity, and E2E tests. Has
+# debug symbols, assertions active, tensor verification enabled.
 RUN --mount=type=cache,target=/root/.ccache \
-    cmake -B build -S src/v2 -G Ninja \
+    cmake -B build_v2_integration -S src/v2 -G Ninja \
+        -DCMAKE_BUILD_TYPE=Integration \
+        -DHAVE_CUDA=ON \
+        -DHAVE_ROCM=ON \
+        -DCMAKE_CUDA_ARCHITECTURES="${LLAMINAR_CUDA_ARCHS}" \
+ && cmake --build build_v2_integration --parallel
+
+# Release build — what the runtime image ships. Optimized, no assertions,
+# only the llaminar2 target (skip test binaries).
+RUN --mount=type=cache,target=/root/.ccache \
+    cmake -B build_v2_release -S src/v2 -G Ninja \
         -DCMAKE_BUILD_TYPE=${LLAMINAR_BUILD_TYPE} \
         -DHAVE_CUDA=ON \
         -DHAVE_ROCM=ON \
         -DCMAKE_CUDA_ARCHITECTURES="${LLAMINAR_CUDA_ARCHS}" \
- && cmake --build build --parallel --target llaminar2
+ && cmake --build build_v2_release --parallel --target llaminar2
 
 # =============================================================================
 # Stage 2: Runtime — slim image with only shared libs + the binary
@@ -107,7 +117,7 @@ RUN rm -rf /tmp/install-scripts
 
 # Copy just the compiled binary. Dynamic linker resolves libs from the apt
 # packages installed above (CUDA shared libs, ROCm runtime, MPI, OpenBLAS).
-COPY --from=builder /src/build/llaminar2 /usr/local/bin/llaminar2
+COPY --from=builder /src/build_v2_release/llaminar2 /usr/local/bin/llaminar2
 
 # Non-root user for the runtime. GPU devices on the host expose render/video
 # group ownership; join those so /dev/kfd + /dev/dri work for ROCm.
