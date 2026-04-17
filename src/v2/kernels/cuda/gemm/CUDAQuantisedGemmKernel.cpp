@@ -1960,12 +1960,12 @@ namespace llaminar2
 
                     if (used_native)
                     {
-                        // DIAGNOSTIC: sync between projections to test if inter-projection
-                        // race causes corruption in PP mode
-                        if (gpu_stream_ && i + 1 < projections.size())
-                            cudaStreamSynchronize(static_cast<cudaStream_t>(gpu_stream_));
-
-                        // Diagnostic: checksum output after GEMM to detect corruption source
+                        // Diagnostic: checksum output after GEMM to detect corruption source.
+                        // NOTE: cudaStreamSynchronize is ILLEGAL during stream capture and
+                        // would leave the capture stream in an error state, failing the
+                        // next projection's GEMV with a sticky cudaErrorStreamCaptureUnsupported.
+                        // Only sync when the trace is explicitly requested — callers using
+                        // LLAMINAR_CUDA_FUSED_GEMM_TRACE must not be running under capture.
                         if (trace_fused)
                         {
                             cudaStreamSynchronize(static_cast<cudaStream_t>(gpu_stream_));
