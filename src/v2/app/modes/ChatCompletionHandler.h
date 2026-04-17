@@ -30,11 +30,26 @@ namespace llaminar2
      * Extracted from the JSON body before any inference begins.
      * Separating parsing from execution enables independent testing.
      */
+    /// Per-field overrides: true if the client explicitly specified this field in the request body.
+    /// Used to merge with model-recommended defaults (only unspecified fields get the model defaults).
+    struct SamplingOverrides
+    {
+        bool temperature{false};
+        bool top_p{false};
+        bool top_k{false};
+        bool presence_penalty{false};
+        bool frequency_penalty{false};
+        bool seed{false};
+    };
+
     struct ChatCompletionRequest
     {
         std::vector<ChatMessage> messages;
-        int max_tokens{128};
+        /// -1 means "unspecified": the handler will use (context_window - prompt_tokens)
+        /// so the model can generate up to the remaining context.
+        int max_tokens{-1};
         SamplingParams sampling;
+        SamplingOverrides sampling_set;  ///< Per-field "user specified" flags
         bool stream{false};         ///< If true, use SSE streaming response
         bool enable_thinking{true}; ///< If true, enable thinking mode for thinking models
         std::string model;          ///< Model identifier from request (optional)
