@@ -632,9 +632,17 @@ if(HAVE_ROCM)
     # Workaround: Build RCCL from source with explicit GPU_TARGETS for gfx906.
     # See: https://github.com/ROCm/rocm-systems/issues/2805
     #
-    # Like oneDNN, we clone to external/rccl if not present
-    # and build locally. The build is cached based on git commit hash.
-    find_package(Git REQUIRED)
+    # This is OPT-IN because building RCCL from source takes 30-60+ minutes
+    # and requires hipcc (so it can't share the C++23 compiler we use for
+    # llaminar). The Docker release image and CI default to OFF and rely on
+    # the system librccl.so loaded dynamically at runtime via dlopen(). Set
+    # LLAMINAR_BUILD_RCCL_FROM_SOURCE=ON locally if you need the gfx906 fix.
+    option(LLAMINAR_BUILD_RCCL_FROM_SOURCE
+           "Clone and build RCCL from source (workaround for broken gfx906 binaries in packaged RCCL)"
+           OFF)
+
+    if(LLAMINAR_BUILD_RCCL_FROM_SOURCE)
+        find_package(Git REQUIRED)
     
     get_filename_component(REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
     set(RCCL_EXTERNAL_DIR "${REPO_ROOT}/external/rccl")
@@ -757,6 +765,7 @@ if(HAVE_ROCM)
     else()
         message(STATUS "V2: RCCL already built in ${RCCL_BUILD_DIR}")
     endif()
+    endif() # LLAMINAR_BUILD_RCCL_FROM_SOURCE
     
     # =========================================================================
     # RCCL Detection (ROCm Collective Communications Library)
