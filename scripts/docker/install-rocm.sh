@@ -28,12 +28,6 @@ APT_OPTS=(
 curl -fsSL --retry 5 --retry-delay 5 -o /tmp/amdgpu-install.deb \
     "https://repo.radeon.com/amdgpu-install/${ROCM_VERSION}/ubuntu/noble/amdgpu-install_${ROCM_DEB_VERSION}_all.deb"
 apt-get "${APT_OPTS[@]}" update
-apt-get "${APT_OPTS[@]}"
-
-# amdgpu-install is the canonical installer for ROCm on Ubuntu.
-curl -fsSL --retry 5 --retry-delay 5 -o /tmp/amdgpu-install.deb \
-    "https://repo.radeon.com/amdgpu-install/${ROCM_VERSION}/ubuntu/noble/amdgpu-install_${ROCM_DEB_VERSION}_all.deb"
-apt-get "${APT_OPTS[@]}" update
 apt-get "${APT_OPTS[@]}" install -y --allow-change-held-packages /tmp/amdgpu-install.deb
 rm /tmp/amdgpu-install.deb
 
