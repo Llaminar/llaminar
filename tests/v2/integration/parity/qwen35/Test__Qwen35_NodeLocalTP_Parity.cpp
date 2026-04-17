@@ -60,11 +60,16 @@ static const std::vector<std::string> kNodeLocalTPExcludedStages = {
     "FFN_UP",
     "FFN_SWIGLU",
     // Row-parallel: outputs are partial sums before allreduce
-    "ATTENTION_OUTPUT",
-    "FFN_DOWN",
-    // These also have sharded intermediate states
-    "ATTN_RESIDUAL",
-    "FFN_RESIDUAL",
+    // NOTE: ATTENTION_OUTPUT and FFN_DOWN snapshot keys are written by the
+    // POST-allreduce stage (gdn_wo_allreduce / down_allreduce), so they ARE
+    // replicated and safe to compare. We keep them in the comparison to
+    // isolate TP regressions.
+    // "ATTENTION_OUTPUT",
+    // "FFN_DOWN",
+    // NOTE: ATTN_RESIDUAL and FFN_RESIDUAL are post-allreduce and should be
+    // replicated — we include them in the comparison to help isolate TP bugs.
+    // "ATTN_RESIDUAL",
+    // "FFN_RESIDUAL",
     // GDN-specific: QKV projection covers gdn_proj (same snapshot key)
     "QKV_PROJECTION",
     // GDN-specific: Z gate output is column-parallel (sharded by v_heads)
@@ -122,6 +127,34 @@ static const std::vector<TestConfig> kNodeLocalTPTestConfigs = {
         .mpi_ranks = 2,
         .model_path = "models/Qwen3.5-4B-Q8_0.gguf",
         .snapshot_dir = "pytorch_qwen35_4b_snapshots",
+        .activation_precision = ActivationPrecision::FP32,
+        .kv_cache_precision = KVCachePrecision::FP16,
+    },
+
+    // =========================================================================
+    // Qwen3.5-27B (Q8_0) — 2-way Node-Local TP with CPU (UPI interconnect)
+    //
+    // 27B is the critical 27B-sized model where GDN under TP=2 exhibits
+    // non-integer V/K head ratios (n_v_heads_local=24, n_k_heads=16) that
+    // previously triggered expansion-branch bugs. This test is the primary
+    // parity guard for the GDN deinterleave modular-mapping path.
+    // =========================================================================
+    {
+        .name = "NodeLocalTP_2xMPI_CPU_27B",
+        .devices = {ParityDeviceType::CPU, ParityDeviceType::CPU},
+        .parallelism = Parallelism::NodeLocalTP,
+        .collective = Collective::MPI,
+        .thresholds = {
+            .cosine_threshold = 0.96f,
+            .decode_cosine_threshold = 0.96f,
+            .early_layers_count = 6,
+            .min_early_layers_passed = 4,
+            .kl_threshold = 0.020f,
+            .excluded_stages = kNodeLocalTPExcludedStages,
+        },
+        .mpi_ranks = 2,
+        .model_path = "models/Qwen3.5-27B-Q8_0.gguf",
+        .snapshot_dir = "pytorch_qwen35_27b_snapshots",
         .activation_precision = ActivationPrecision::FP32,
         .kv_cache_precision = KVCachePrecision::FP16,
     },

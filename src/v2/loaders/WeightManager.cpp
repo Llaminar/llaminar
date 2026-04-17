@@ -1661,8 +1661,13 @@ namespace llaminar2
                         const size_t head_dim = total_cols / static_cast<size_t>(total_heads);
                         size_t start = static_cast<size_t>(assignment.head_start) * head_dim;
                         size_t count = static_cast<size_t>(assignment.head_count) * head_dim;
-                        LOG_TRACE("[WeightManager] Schema heads row-slice for " << name
-                                                                                << " -> [" << start << ", " << (start + count) << ")");
+                        LOG_WARN("[WeightManager] Schema heads row-slice for " << name
+                                                                               << " total_cols=" << total_cols
+                                                                               << " total_heads=" << total_heads
+                                                                               << " head_dim=" << head_dim
+                                                                               << " assignment.head_start=" << assignment.head_start
+                                                                               << " head_count=" << assignment.head_count
+                                                                               << " -> [" << start << ", " << (start + count) << ")");
                         return {start, count};
                     }
                 }
@@ -2269,7 +2274,7 @@ namespace llaminar2
     }
 
     bool WeightManager::finalizeForDevices(const std::vector<DeviceId> &devices,
-                                            bool release_host_data)
+                                           bool release_host_data)
     {
         if (devices.empty())
         {

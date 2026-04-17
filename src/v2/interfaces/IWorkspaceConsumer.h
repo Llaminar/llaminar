@@ -168,15 +168,6 @@ namespace llaminar2
         constexpr const char *FULL_B_FP16 = "gemm_full_b_fp16"; ///< [K × N] FP16 full matrix
         constexpr const char *FULL_C_FP16 = "gemm_full_c_fp16"; ///< [M × N] FP16 full matrix
 
-        // ROCm M-padding buffers (for CK when M < 8)
-        constexpr const char *ROCM_A_PADDED = "rocm_a_padded";             ///< [padded_m × K] INT8 padded activations
-        constexpr const char *ROCM_SCALE_A_PADDED = "rocm_scale_a_padded"; ///< [padded_m] FP32 padded scales
-        constexpr const char *ROCM_E_PADDED = "rocm_e_padded";             ///< [padded_m × N] FP32 padded output
-        constexpr const char *ROCM_CK_INT32 = "rocm_ck_int32";             ///< [padded_m × N] INT32 CK accumulator
-
-        // ROCm VNNI→row-major repack scratch buffer (Option B: single-layout VRAM)
-        constexpr const char *ROCM_B_REPACK = "rocm_b_repack"; ///< [N × K] INT8 scratch for VNNI→row-major repacking
-
         // ROCm scatter+reduce partial buffer for fused GEMV
         constexpr const char *ROCM_SCATTER_PARTIAL = "rocm_scatter_partial"; ///< [KB_MAX × N] FP32 scatter partials
     }

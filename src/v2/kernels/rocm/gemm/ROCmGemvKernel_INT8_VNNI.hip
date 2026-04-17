@@ -3170,14 +3170,9 @@ __global__ void gemv_fused_fp32_int8_vnni_kernel_t(
             local_max = (other > local_max) ? other : local_max;
         }
 
-        // Thread 0 writes the block absmax
-        if (tid == 0)
-        {
-            s_absmax = local_max;
-        }
-        __syncthreads();
-
-        const float absmax = s_absmax;
+        // Broadcast absmax from lane 0 to all lanes via __shfl (no LDS, no sync).
+        // (s_absmax LDS slot is reused later in Phase 6 as a completion flag.)
+        const float absmax = __shfl(local_max, 0);
         const float scale = (absmax > 0.0f) ? (absmax / 127.0f) : 1.0f;
         const float inv_scale = (absmax > 0.0f) ? (127.0f / absmax) : 0.0f;
 
@@ -3333,10 +3328,8 @@ __global__ void gemv_fused_scatter_int8_vnni_kernel_t(
             local_max = (other > local_max) ? other : local_max;
         }
 
-        if (tid == 0) s_absmax = local_max;
-        __syncthreads();
-
-        const float absmax = s_absmax;
+        // Broadcast absmax from lane 0 to all lanes via __shfl (no LDS, no sync).
+        const float absmax = __shfl(local_max, 0);
         const float scale = (absmax > 0.0f) ? (absmax / 127.0f) : 1.0f;
         const float inv_scale = (absmax > 0.0f) ? (127.0f / absmax) : 0.0f;
 
@@ -3528,10 +3521,9 @@ __global__ void gemv_fused_scatter_selfreduce_int8_vnni_kernel_t(
             local_max = (other > local_max) ? other : local_max;
         }
 
-        if (tid == 0) s_absmax = local_max;
-        __syncthreads();
-
-        const float absmax = s_absmax;
+        // Broadcast absmax from lane 0 to all lanes via __shfl (no LDS, no sync).
+        // (s_absmax LDS slot is reused later in Phase 6 as a completion flag.)
+        const float absmax = __shfl(local_max, 0);
         const float scale = (absmax > 0.0f) ? (absmax / 127.0f) : 1.0f;
         const float inv_scale = (absmax > 0.0f) ? (127.0f / absmax) : 0.0f;
 

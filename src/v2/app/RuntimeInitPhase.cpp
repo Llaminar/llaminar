@@ -10,6 +10,9 @@
 #include "backends/InventoryPrinter.h"
 #include "config/OrchestrationConfigParser.h"
 #include "execution/runner/IOrchestrationRunnerFactory.h"
+#include "models/IGraphConfigBuilder.h"
+#include "utils/ChatTemplate.h"
+#include "utils/Tokenizer.h"
 #include "utils/Logger.h"
 #include "utils/DebugEnv.h"
 #include "utils/NUMATopology.h"
@@ -275,6 +278,34 @@ namespace llaminar2
 
         // Apply chat template override
         ChatTemplateResolver::resolve(config.chat_template_override, tokenizer, mpi_ctx->rank());
+
+        // Model-specific chat template override. Applied only when the user has
+        // not provided an explicit --chat-template, so user wishes take priority.
+        // This lets a model's graph-config builder bundle a community-maintained
+        // template that fixes known issues with the GGUF-embedded one.
+        if (config.chat_template_override.empty())
+        {
+            const std::string &architecture = runner->architecture();
+            if (!architecture.empty())
+            {
+                auto config_builder = createGraphConfigBuilder(architecture);
+                if (config_builder)
+                {
+                    auto model_template = config_builder->chatTemplateOverride();
+                    if (model_template.has_value() && !model_template->empty())
+                    {
+                        if (mpi_ctx->rank() == 0)
+                        {
+                            LOG_INFO("Using model-specific chat template override for '"
+                                     << architecture << "' ("
+                                     << model_template->size() << " bytes)");
+                        }
+                        tokenizer->setChatTemplate(
+                            ChatTemplate::create(*model_template, "", ""));
+                    }
+                }
+            }
+        }
 
         return AppContext{
             .config = config,

@@ -7270,11 +7270,11 @@ add_v2_test(V2_Unit_VNNIOverflowAnalysis
 )
 
 # =============================================================================
-# ROCm Quantised GEMM Kernel Tests (ComposableKernel INT8)
+# ROCm Quantised GEMM Kernel Tests (INT8 + native-VNNI)
 # =============================================================================
 if(HAVE_ROCM)
-    # Test: ROCm Quantised GEMM Kernel (INT8×INT8→INT32 via ComposableKernel)
-    # Tests weight packing, activation quantization, CK GEMM, and output scaling
+    # Test: ROCm Quantised GEMM Kernel (INT8×INT8→INT32 VNNI)
+    # Tests weight packing, activation quantization, VNNI GEMM, and output scaling
     add_executable(v2_unit_rocm_quantised_gemm_kernel 
         unit/kernels/rocm/Test__ROCmQuantisedGemmKernel.cpp
     )
@@ -7285,7 +7285,7 @@ if(HAVE_ROCM)
     )
     add_v2_test(V2_Unit_ROCmQuantisedGemmKernel
         COMMAND $<TARGET_FILE:v2_unit_rocm_quantised_gemm_kernel>
-        LABELS "V2;Unit;ROCm;GEMM;INT8;Quantized;ComposableKernel;gfx906"
+        LABELS "V2;Unit;ROCm;GEMM;INT8;Quantized;gfx906"
         MPI_PROCS 1
     )
     message(STATUS "V2 Tests: Added ROCm Quantised GEMM kernel unit tests")
@@ -7302,7 +7302,7 @@ if(HAVE_ROCM)
     )
     add_v2_test(V2_Integration_ROCmQuantisedGemmKernel
         COMMAND $<TARGET_FILE:v2_integration_rocm_quantised_gemm_kernel>
-        LABELS "V2;Integration;ROCm;GEMM;INT8;Quantized;ComposableKernel;gfx906;Qwen2"
+        LABELS "V2;Integration;ROCm;GEMM;INT8;Quantized;gfx906;Qwen2"
         MPI_PROCS 1
     )
     message(STATUS "V2 Tests: Added ROCm Quantised GEMM kernel integration tests")
@@ -7373,27 +7373,10 @@ if(HAVE_ROCM)
     )
     add_v2_test(V2_Perf_ROCmQuantisedGemmKernel
         COMMAND $<TARGET_FILE:v2_perf_rocm_quantised_gemm_kernel>
-        LABELS "V2;Performance;ROCm;GEMM;INT8;Quantized;ComposableKernel;gfx906;Qwen2;Benchmark"
+        LABELS "V2;Performance;ROCm;GEMM;INT8;Quantized;gfx906;Qwen2;Benchmark"
         MPI_PROCS 1
     )
     message(STATUS "V2 Tests: Added ROCm Quantised GEMM kernel performance benchmarks")
-
-    # Performance Test: CK GEMM Isolation Test
-    # Isolated test to reproduce and characterize CK GEMM performance issues
-    add_executable(v2_perf_rocm_ck_gemm_isolation
-        performance/Perf__ROCmCKGemmIsolation.cpp
-    )
-    target_link_libraries(v2_perf_rocm_ck_gemm_isolation 
-        llaminar2_core 
-        GTest::gtest 
-        GTest::gtest_main
-    )
-    add_v2_test(V2_Perf_ROCmCKGemmIsolation
-        COMMAND $<TARGET_FILE:v2_perf_rocm_ck_gemm_isolation>
-        LABELS "V2;Performance;ROCm;GEMM;INT8;ComposableKernel;gfx906;Isolation;Debug"
-        MPI_PROCS 1
-    )
-    message(STATUS "V2 Tests: Added CK GEMM isolation performance test")
 
     # Performance Test: ROCm GEMV Kernel (bandwidth-optimized M=1 decode)
     # Benchmarks and validates the INT8 GEMV kernel against CPU reference
@@ -9212,6 +9195,23 @@ target_link_libraries(v2_test_gdn_dynamic_params_regression
 add_v2_test(V2_Unit_GDNDynamicParamsRegression
     COMMAND $<TARGET_FILE:v2_test_gdn_dynamic_params_regression>
     LABELS "V2;Unit;Regression;GDN;DynamicParams"
+    MPI_PROCS 1
+)
+
+# Regression: Qwen35Graph global_v_head_offset under TP sharding.
+# Locks in the fix that sets the offset in ALL TP modes where V is sharded
+# (selection / identity / expansion), not only selection/identity. The
+# expansion branch was missed, causing rank>0 to pick the wrong K-heads
+# on 27B Qwen-3.5 under 2xMPI CPU.
+add_executable(v2_test_gdn_tp_offset_regression unit/execution/Test__GDNTPOffsetRegression.cpp)
+target_link_libraries(v2_test_gdn_tp_offset_regression
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_GDNTPOffsetRegression
+    COMMAND $<TARGET_FILE:v2_test_gdn_tp_offset_regression>
+    LABELS "V2;Unit;Regression;GDN;TensorParallel;Qwen35"
     MPI_PROCS 1
 )
 

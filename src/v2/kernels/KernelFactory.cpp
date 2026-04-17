@@ -3314,6 +3314,16 @@ namespace llaminar
                 // Clear CUDA GEMV static caches (row-major weight transpose, sweep
                 // state) to prevent cross-test contamination.
                 cudaNativeVNNIGemvTuned_clearStaticState();
+
+                // Release per-device shared CUDAConcurrentPrefillPool singletons
+                // (CUDA streams, events, scratch GPU buffers).
+                llaminar2::cuda::CUDAQuantisedGemmKernel::clearSharedPrefillPools();
+#endif
+
+#ifdef HAVE_ROCM
+                // Release per-device shared ConcurrentPrefillPool singletons
+                // (HIP streams, events, scratch/scatter GPU buffers).
+                llaminar2::rocm::ROCmQuantisedGemmKernel::clearSharedPrefillPools();
 #endif
             }
 

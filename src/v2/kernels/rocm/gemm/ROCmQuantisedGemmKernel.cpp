@@ -99,6 +99,7 @@
 #include <string>
 #include <mutex>
 #include <set>
+#include <unordered_map>
 
 #ifdef HAVE_ROCM
 #include <hip/hip_runtime.h>
@@ -120,13 +121,9 @@ namespace llaminar2
         //   - ROCmQuantisedGemmKernel_INT8_VNNI.hip : VNNI prefill/decode kernels
         //
 
-        // These functions are implemented in ROCmQuantisedGemmKernel_CK.hip
+        // These functions are implemented in ROCmQuantisedGemmKernel_*.hip
         extern "C"
         {
-            // Create/destroy per-instance CK kernel context (eliminates global/static cache state)
-            void *rocmQuantGemm_createKernelContext(int rocm_device_id);                   // CK.hip
-            void rocmQuantGemm_destroyKernelContext(void *kernel_ctx, int rocm_device_id); // CK.hip
-
             // Upload converted INT8 weights to device (common .hip)
             bool rocmQuantGemm_uploadWeights(
                 const int8_t *h_weights_int8, // [K x N] ColumnMajor
@@ -154,96 +151,8 @@ namespace llaminar2
                 int rocm_device_id, void *stream,
                 int block_size = 32);
 
-            // Execute INT8 GEMM using CK with SEPARATE scaling (two-kernel approach)
-            // This runs CK for INT8→INT32 GEMM, then a separate kernel for scaling. (common .hip)
-            bool rocmQuantGemm_executeTwoKernel(
-                const int8_t *d_A_int8, // [M x K] RowMajor quantized activations
-                const int8_t *d_B_int8, // [K x N] RowMajor transposed weights
-                float *d_E_fp32,        // [M x N] RowMajor FP32 output
-                const float *d_scale_A, // [M] per-row activation scales
-                const float *d_scale_B, // [N] per-column weight scales
-                int M, int N, int K,
-                int rocm_device_id, void *stream,
-                void *kernel_ctx);
-
-            // Execute INT8 GEMM without scaling (INT8→INT32 only, CK.hip)
-            // Used when you want to apply custom scaling/bias separately.
-            bool rocmQuantGemm_executeNoScale(
-                const int8_t *d_A_int8, // [M x K] RowMajor quantized activations
-                const int8_t *d_B_int8, // [K x N] RowMajor weights
-                int32_t *d_C_int32,     // [M x N] RowMajor INT32 output
-                int M, int N, int K,
-                int rocm_device_id, void *stream,
-                void *kernel_ctx);
-
-            // Execute INT8 GEMM using CK two-kernel with PRE-ALLOCATED buffer (common .hip)
-            // This is the preferred variant for hot-path execution.
-            bool rocmQuantGemm_executeTwoKernel_cached(
-                const int8_t *d_A_int8, // [M x K] RowMajor quantized activations
-                const int8_t *d_B_int8, // [K x N] RowMajor transposed weights
-                float *d_E_fp32,        // [M x N] RowMajor FP32 output
-                const float *d_scale_A, // [M] per-row activation scales
-                const float *d_scale_B, // [N] per-column weight scales
-                int32_t *d_C_int32,     // [M x N] Pre-allocated INT32 accumulator
-                int M, int N, int K,
-                int rocm_device_id, void *stream,
-                void *kernel_ctx);
-
-            // Execute INT8 GEMM using CK two-kernel with M-PADDING for decode (M < 8, common .hip)
-            // Pads activations to padded_m, runs CK, extracts first M rows of output.
-            // Note: With the 32×32 kernel, only M < 8 needs explicit padding.
-            bool rocmQuantGemm_executeTwoKernel_padded(
-                const int8_t *d_A_int8, // [M x K] RowMajor quantized activations
-                const int8_t *d_B_int8, // [N x K] RowMajor weights (viewed as [K x N] col-major)
-                float *d_E_fp32,        // [M x N] RowMajor FP32 output (only first M rows written)
-                const float *d_scale_A, // [M] per-row activation scales
-                const float *d_scale_B, // [N] per-column weight scales
-                int32_t *d_C_int32,     // [padded_m x N] Pre-allocated INT32 accumulator
-                int M,                  // Actual M (output rows needed)
-                int padded_m,           // Padded M for CK
-                int N, int K,
-                int rocm_device_id, void *stream,
-                void *kernel_ctx);
-
-            // Execute INT8 GEMM using CK two-kernel with M-PADDING and PRE-ALLOCATED buffers (common .hip)
-            // This is the preferred variant for hot-path decode execution.
-            bool rocmQuantGemm_executeTwoKernel_padded_cached(
-                const int8_t *d_A_int8,  // [M x K] RowMajor quantized activations
-                const int8_t *d_B_int8,  // [N x K] RowMajor weights (viewed as [K x N] col-major)
-                float *d_E_fp32,         // [M x N] RowMajor FP32 output (only first M rows written)
-                const float *d_scale_A,  // [M] per-row activation scales
-                const float *d_scale_B,  // [N] per-column weight scales
-                int32_t *d_C_int32,      // [padded_m x N] Pre-allocated INT32 accumulator
-                int8_t *d_A_padded,      // [padded_m x K] Pre-allocated padded activations
-                float *d_scale_A_padded, // [padded_m] Pre-allocated padded scales
-                float *d_E_padded,       // [padded_m x N] Pre-allocated padded output
-                int M,                   // Actual M (output rows needed)
-                int padded_m,            // Padded M for CK
-                int N, int K,
-                int rocm_device_id, void *stream,
-                void *kernel_ctx);
-
-            // Execute INT8 GEMM using CK two-kernel with HIP event timing (common .hip)
-            // Same as _cached but returns kernel time via kernel_time_ms parameter.
-            bool rocmQuantGemm_executeTwoKernel_timed(
-                const int8_t *d_A_int8, // [M × K] INT8 activations
-                const int8_t *d_B_int8, // [K × N] INT8 weights
-                float *d_E_fp32,        // [M × N] FP32 output
-                const float *d_scale_A, // [M] per-row scales
-                const float *d_scale_B, // [N] per-column scales
-                int32_t *d_C_int32,     // Pre-allocated [M × N] INT32 accumulator
-                int M, int N, int K,
-                int rocm_device_id,
-                float *kernel_time_ms, void *stream,
-                void *kernel_ctx);
-
             // Allocate INT8 buffer (common .hip)
             bool rocmQuantGemm_allocInt8(int8_t **d_ptr, size_t count, int rocm_device_id);
-
-            // Get CK minimum dimension requirements (CK.hip)
-            int rocmQuantGemm_getMinM();
-            int rocmQuantGemm_getMinN();
-            int rocmQuantGemm_getMinK();
 
             // Free device memory (common .hip)
             void rocmQuantGemm_freeDevice(void *d_ptr, int rocm_device_id);
@@ -316,15 +225,6 @@ namespace llaminar2
             // Get current activation block size for blockwise quantization (32, 64, or 128)
             int rocmGemv_int8_vnni_get_act_block_k();
 
-            // Repack VNNI [K/4][N][4] → row-major [N×K] into scratch buffer
-            // Used for CK GEMM prefill and legacy fp16/fp32 GEMV modes.
-            // Cost: ~65-200μs for 18944×3584 (amortized over prefill).
-            bool rocmGemv_repackVNNI_to_rowmajor(
-                const int8_t *d_B_vnni, // [K/4][N][4] VNNI input
-                int8_t *d_B_rowmajor,   // [N×K] row-major output (scratch buffer)
-                int N, int K,
-                int device_id, void *stream);
-
             // Native-VNNI GEMM: lossless decode with FP16 per-block scales (M>1 prefill).
             // Supports all native-VNNI formats via codebook_id.
             // Output is FP32 with scale_A applied inline — no separate epilogue needed.
@@ -344,7 +244,12 @@ namespace llaminar2
                 int device_id, void *stream);
 
             // Native-VNNI GEMV: lossless decode with FP16 per-block scales.
-            // Supports Q4_0, Q4_1, Q5_0, Q5_1, IQ4_NL via codebook_id.
+            // Supports all ≤6-bit quantized formats via codebook_id:
+            //   Q-quants: Q4_0, Q4_1, Q5_0, Q5_1
+            //   K-quants: Q2_K, Q3_K, Q4_K (via Q4_1 codebook), Q5_K (via Q5_1 codebook), Q6_K
+            //   IQ-quants: IQ4_NL, IQ4_XS (via IQ4_NL codebook), IQ3_S, IQ3_XXS,
+            //              IQ2_S, IQ2_XS, IQ2_XXS, IQ1_S, IQ1_M
+            // Q8_0/Q8_1/Q8_K use the INT8-VNNI path instead (already 1 byte/element).
             // Output is FP32 with scale_A applied inline — no epilogue kernel needed.
             // Uses scatter+reduce pattern: KB=1 → direct, KB>1 → scatter+reduce.
             bool rocmGemv_native_vnni_fp32(
@@ -610,25 +515,17 @@ namespace llaminar2
 
         struct ROCmQuantisedGemmKernel::Impl
         {
-            void *ck_kernel_context = nullptr;
-
             // Device memory for converted weights (only used when owns_weight_memory_ = true)
-            // Option B: Only VNNI layout is persistent on device. Row-major is repacked
-            // on-demand from VNNI into d_B_rowmajor_scratch (workspace buffer).
-            int8_t *d_weights_int8_vnni = nullptr;     // [K/4 x N x 4] VNNI layout (sole device copy)
-            int8_t *d_weights_int8_rowmajor = nullptr; // [N x K] optional persistent CK row-major buffer (startup repack)
-            float *d_scales_B = nullptr;               // [N] per-column scales
-            uint8_t *d_weights_native_vnni = nullptr;  // [blocks_per_row × N × payload_bytes]
-            void *d_weights_native_scales = nullptr;   // [blocks_per_row × N] __half*
-            void *d_weights_native_mins = nullptr;     // [blocks_per_row × N] __half* (asymmetric only, else NULL)
-            void *d_weights_native_emins = nullptr;    // [blocks_per_row × N] uint32_t* (Q2_K only, packed {lo,hi} FP16 emins)
+            // VNNI-only on device: native-VNNI (≤6-bit) or INT8-VNNI (8-bit).
+            int8_t *d_weights_int8_vnni = nullptr;    // [K/4 x N x 4] VNNI layout (sole INT8 device copy)
+            float *d_scales_B = nullptr;              // [N] per-column scales
+            uint8_t *d_weights_native_vnni = nullptr; // [blocks_per_row × N × payload_bytes]
+            void *d_weights_native_scales = nullptr;  // [blocks_per_row × N] __half*
+            void *d_weights_native_mins = nullptr;    // [blocks_per_row × N] __half* (asymmetric only, else NULL)
+            void *d_weights_native_emins = nullptr;   // [blocks_per_row × N] uint32_t* (Q2_K only, packed {lo,hi} FP16 emins)
             uint8_t native_vnni_codebook_id = 0;
             uint32_t native_vnni_blocks_per_row = 0;
             bool has_native_vnni = false;
-            void *startup_repack_ready_event = nullptr; // hipEvent_t* as opaque pointer
-            bool startup_repack_event_pending = false;
-            void *startup_commit_ready_event = nullptr; // hipEvent_t* as opaque pointer
-            bool startup_commit_event_pending = false;
             void *startup_h2d_pinned_scales = nullptr;
             void *startup_h2d_pinned_vnni = nullptr;
             void *startup_h2d_pinned_native_vnni = nullptr;
@@ -643,34 +540,16 @@ namespace llaminar2
             float *d_scales_A_blockwise = nullptr; // [M x blocks_per_row] per-block scales (blockwise mode)
             int32_t *d_C_int32 = nullptr;          // [M x N] INT32 accumulator
 
-            // CK-specific work buffers - also from workspace
-            int32_t *d_CK_int32 = nullptr;     // [M x N] CK accumulator
-            float *d_A_fp32 = nullptr;         // [M x K] input FP32
-            float *d_C_fp32 = nullptr;         // [M x N] output FP32
-            int8_t *d_A_padded = nullptr;      // [padded_m x K] padded activations
-            float *d_scale_A_padded = nullptr; // [padded_m] padded scales
-            float *d_E_padded = nullptr;       // [padded_m x N] padded output
-
-            // Option B: shared scratch buffer for VNNI→row-major repacking (from workspace)
-            int8_t *d_B_rowmajor_scratch = nullptr; // [N x K] temporary row-major weights
+            // Transfer work buffers - also from workspace
+            float *d_A_fp32 = nullptr; // [M x K] input FP32
+            float *d_C_fp32 = nullptr; // [M x N] output FP32
 
             // Scatter+reduce partial buffer (from workspace)
             float *d_scatter_partial = nullptr; // [KB_MAX × N] FP32 scatter partials
 
-            // Repack cache metadata (valid only when source pointers, dims, and scratch match)
-            bool repack_cache_valid = false;
-            int repack_cached_n = 0;
-            int repack_cached_k = 0;
-            int8_t *repack_cached_src_vnni = nullptr;
-            int8_t *repack_cached_dst = nullptr;
-
             // Capacity tracking for workspace buffers (set during validateWorkspace)
-            size_t d_CK_int32_capacity = 0;
             size_t d_A_fp32_capacity = 0;
             size_t d_C_fp32_capacity = 0;
-            size_t d_A_padded_capacity = 0;
-            size_t d_scale_A_padded_capacity = 0;
-            size_t d_E_padded_capacity = 0;
 
             // Workspace validation cache: skip redundant hash map lookups when
             // the same workspace is re-validated across GEMM calls.
@@ -684,19 +563,11 @@ namespace llaminar2
 
             ~Impl()
             {
-                if (ck_kernel_context)
-                {
-                    rocmQuantGemm_destroyKernelContext(ck_kernel_context, rocm_device_id);
-                    ck_kernel_context = nullptr;
-                }
-
                 // Only free weight memory if we own it (not from ROCmPackedWeights cache)
                 if (owns_weight_memory)
                 {
                     if (d_weights_int8_vnni)
                         rocmQuantGemm_freeDevice(d_weights_int8_vnni, rocm_device_id);
-                    if (d_weights_int8_rowmajor)
-                        rocmQuantGemm_freeDevice(d_weights_int8_rowmajor, rocm_device_id);
                     if (d_scales_B)
                         rocmQuantGemm_freeDevice(d_scales_B, rocm_device_id);
                     if (d_weights_native_vnni)
@@ -708,16 +579,6 @@ namespace llaminar2
                     if (d_weights_native_emins)
                         rocmQuantGemm_freeDevice(d_weights_native_emins, rocm_device_id);
 #ifdef HAVE_ROCM
-                    if (startup_repack_ready_event)
-                    {
-                        hipEventDestroy(reinterpret_cast<hipEvent_t>(startup_repack_ready_event));
-                        startup_repack_ready_event = nullptr;
-                    }
-                    if (startup_commit_ready_event)
-                    {
-                        hipEventDestroy(reinterpret_cast<hipEvent_t>(startup_commit_ready_event));
-                        startup_commit_ready_event = nullptr;
-                    }
                     auto free_pinned = [](void *&ptr)
                     {
                         if (ptr)
@@ -734,8 +595,7 @@ namespace llaminar2
                     free_pinned(startup_h2d_pinned_native_emins);
 #endif
                 }
-                // Work buffers (including d_B_rowmajor_scratch) are NOT freed -
-                // they are owned by workspace
+                // Work buffers are NOT freed - they are owned by workspace
             }
         };
 
@@ -780,253 +640,6 @@ namespace llaminar2
                 (void)expected_device;
                 (void)pointer_name;
                 (void)scope;
-                return true;
-#endif
-            }
-
-            template <typename ImplT>
-            inline bool ensureRepackedWeightsForCK(
-                ImplT *impl,
-                int n, int k,
-                int rocm_device_id,
-                void *gpu_stream,
-                const char *log_scope)
-            {
-                if (!impl || !impl->d_B_rowmajor_scratch)
-                {
-                    LOG_ERROR("[" << log_scope << "] Missing repack scratch buffer");
-                    return false;
-                }
-
-                if (!impl->d_weights_int8_vnni)
-                {
-                    LOG_ERROR("[" << log_scope << "] Missing VNNI source weights");
-                    return false;
-                }
-
-                const bool cache_hit = impl->repack_cache_valid &&
-                                       impl->repack_cached_n == n &&
-                                       impl->repack_cached_k == k &&
-                                       impl->repack_cached_src_vnni == impl->d_weights_int8_vnni &&
-                                       impl->repack_cached_dst == impl->d_B_rowmajor_scratch;
-
-                if (cache_hit)
-                {
-                    LOG_TRACE("[" << log_scope << "] Repack cache hit (N=" << n << ", K=" << k << ")");
-                    return true;
-                }
-
-                bool repack_ok = false;
-                if (impl->d_weights_int8_vnni)
-                {
-                    repack_ok = rocmGemv_repackVNNI_to_rowmajor(
-                        impl->d_weights_int8_vnni,
-                        impl->d_B_rowmajor_scratch,
-                        n, k,
-                        rocm_device_id, gpu_stream);
-                }
-
-                if (!repack_ok)
-                {
-                    LOG_ERROR("[" << log_scope << "] VNNI→row-major repack failed");
-                    impl->repack_cache_valid = false;
-                    return false;
-                }
-
-                impl->repack_cache_valid = true;
-                impl->repack_cached_n = n;
-                impl->repack_cached_k = k;
-                impl->repack_cached_src_vnni = impl->d_weights_int8_vnni;
-                impl->repack_cached_dst = impl->d_B_rowmajor_scratch;
-                return true;
-            }
-
-            template <typename ImplT>
-            inline bool waitForStartupRepackIfNeeded(
-                ImplT *impl,
-                int rocm_device_id,
-                void *gpu_stream,
-                const char *log_scope)
-            {
-#ifdef HAVE_ROCM
-                if (!impl || !impl->startup_repack_ready_event || !impl->startup_repack_event_pending)
-                {
-                    if (!impl || !impl->startup_commit_ready_event || !impl->startup_commit_event_pending)
-                    {
-                        return true;
-                    }
-                }
-
-                hipStream_t target_stream = reinterpret_cast<hipStream_t>(gpu_stream);
-                if (target_stream == nullptr)
-                {
-                    target_stream = nullptr; // default stream
-                }
-
-                void *event_to_wait = nullptr;
-                bool *pending_flag = nullptr;
-                if (impl->startup_commit_ready_event && impl->startup_commit_event_pending)
-                {
-                    event_to_wait = impl->startup_commit_ready_event;
-                    pending_flag = &impl->startup_commit_event_pending;
-                }
-                else if (impl->startup_repack_ready_event && impl->startup_repack_event_pending)
-                {
-                    event_to_wait = impl->startup_repack_ready_event;
-                    pending_flag = &impl->startup_repack_event_pending;
-                }
-                if (!event_to_wait || !pending_flag)
-                {
-                    return true;
-                }
-
-                const hipError_t wait_err = hipStreamWaitEvent(
-                    target_stream,
-                    reinterpret_cast<hipEvent_t>(event_to_wait),
-                    0);
-                if (wait_err != hipSuccess)
-                {
-                    LOG_ERROR("[" << log_scope << "] hipStreamWaitEvent failed: " << hipGetErrorString(wait_err)
-                                  << " device=" << rocm_device_id);
-                    return false;
-                }
-
-                *pending_flag = false;
-
-                auto free_pinned = [](void *&ptr)
-                {
-                    if (ptr)
-                    {
-                        const hipError_t err = hipHostFree(ptr);
-                        if (err != hipSuccess)
-                        {
-                            LOG_WARN("[ROCmQuantisedGemmKernel] hipHostFree failed after startup readiness wait: "
-                                     << hipGetErrorString(err));
-                        }
-                        ptr = nullptr;
-                    }
-                };
-                free_pinned(impl->startup_h2d_pinned_scales);
-                free_pinned(impl->startup_h2d_pinned_vnni);
-                return true;
-#else
-                (void)impl;
-                (void)rocm_device_id;
-                (void)gpu_stream;
-                (void)log_scope;
-                return true;
-#endif
-            }
-
-            template <typename UploadT>
-            inline bool ensureStartupStreamsAndEvents(
-                UploadT &upload,
-                const ROCmStartupRepackPipelineConfig &cfg,
-                const char *log_scope)
-            {
-#ifdef HAVE_ROCM
-                if (!cfg.enabled)
-                {
-                    return true;
-                }
-
-                if (!upload.startup_h2d_stream)
-                {
-                    hipStream_t stream = nullptr;
-                    const hipError_t create_err = hipStreamCreateWithFlags(&stream, hipStreamNonBlocking);
-                    if (create_err != hipSuccess)
-                    {
-                        LOG_WARN("[" << log_scope << "] Failed to create startup H2D stream: "
-                                     << hipGetErrorString(create_err));
-                        return false;
-                    }
-                    upload.startup_h2d_stream = reinterpret_cast<void *>(stream);
-                }
-
-                if (!upload.startup_repack_stream)
-                {
-                    if (cfg.stream_count >= 2)
-                    {
-                        hipStream_t stream = nullptr;
-                        const hipError_t create_err = hipStreamCreateWithFlags(&stream, hipStreamNonBlocking);
-                        if (create_err != hipSuccess)
-                        {
-                            LOG_WARN("[" << log_scope << "] Failed to create startup repack stream: "
-                                         << hipGetErrorString(create_err));
-                            return false;
-                        }
-                        upload.startup_repack_stream = reinterpret_cast<void *>(stream);
-                    }
-                    else
-                    {
-                        upload.startup_repack_stream = upload.startup_h2d_stream;
-                    }
-                }
-
-                if (!upload.startup_commit_stream)
-                {
-                    if (cfg.stream_count >= 3)
-                    {
-                        hipStream_t stream = nullptr;
-                        const hipError_t create_err = hipStreamCreateWithFlags(&stream, hipStreamNonBlocking);
-                        if (create_err != hipSuccess)
-                        {
-                            LOG_WARN("[" << log_scope << "] Failed to create startup commit stream: "
-                                         << hipGetErrorString(create_err));
-                            return false;
-                        }
-                        upload.startup_commit_stream = reinterpret_cast<void *>(stream);
-                    }
-                    else
-                    {
-                        upload.startup_commit_stream = upload.startup_repack_stream;
-                    }
-                }
-
-                if (!upload.startup_h2d_done_event)
-                {
-                    hipEvent_t event;
-                    const hipError_t create_err = hipEventCreateWithFlags(&event, hipEventDisableTiming);
-                    if (create_err != hipSuccess)
-                    {
-                        LOG_WARN("[" << log_scope << "] Failed to create startup H2D event: "
-                                     << hipGetErrorString(create_err));
-                        return false;
-                    }
-                    upload.startup_h2d_done_event = reinterpret_cast<void *>(event);
-                }
-
-                if (!upload.startup_repack_ready_event)
-                {
-                    hipEvent_t event;
-                    const hipError_t create_err = hipEventCreateWithFlags(&event, hipEventDisableTiming);
-                    if (create_err != hipSuccess)
-                    {
-                        LOG_WARN("[" << log_scope << "] Failed to create startup repack event: "
-                                     << hipGetErrorString(create_err));
-                        return false;
-                    }
-                    upload.startup_repack_ready_event = reinterpret_cast<void *>(event);
-                }
-
-                if (!upload.startup_commit_ready_event)
-                {
-                    hipEvent_t event;
-                    const hipError_t create_err = hipEventCreateWithFlags(&event, hipEventDisableTiming);
-                    if (create_err != hipSuccess)
-                    {
-                        LOG_WARN("[" << log_scope << "] Failed to create startup commit event: "
-                                     << hipGetErrorString(create_err));
-                        return false;
-                    }
-                    upload.startup_commit_ready_event = reinterpret_cast<void *>(event);
-                }
-
-                return true;
-#else
-                (void)upload;
-                (void)cfg;
-                (void)log_scope;
                 return true;
 #endif
             }
@@ -1116,198 +729,6 @@ namespace llaminar2
 #endif
             }
 
-            template <typename UploadT>
-            inline bool launchStartupRowmajorRepackIfEnabled(
-                UploadT &upload,
-                int N,
-                int K,
-                int rocm_device_id,
-                const ROCmStartupRepackPipelineConfig &cfg,
-                const char *log_scope)
-            {
-#ifdef HAVE_ROCM
-                // Architectural direction: startup pipeline is VNNI-only.
-                // Do not build CK row-major weights during startup.
-                (void)upload;
-                (void)N;
-                (void)K;
-                (void)rocm_device_id;
-                (void)cfg;
-                (void)log_scope;
-                return true;
-
-                if (!cfg.enabled)
-                {
-                    return true;
-                }
-
-                if (!upload.d_int8_data_vnni)
-                {
-                    return true;
-                }
-
-                const size_t rowmajor_elems = static_cast<size_t>(N) * static_cast<size_t>(K);
-                if (rowmajor_elems == 0)
-                {
-                    return true;
-                }
-
-                const size_t bytes_needed = rowmajor_elems * sizeof(int8_t);
-                const size_t budget_bytes = static_cast<size_t>(cfg.budget_mb) * 1024ull * 1024ull;
-                if (bytes_needed > budget_bytes)
-                {
-                    LOG_DEBUG("[" << log_scope << "] Skip startup GPU repack: row-major buffer "
-                                  << (bytes_needed / (1024 * 1024)) << " MB exceeds budget "
-                                  << cfg.budget_mb << " MB");
-                    return true;
-                }
-
-                if (!upload.d_int8_data_rowmajor)
-                {
-                    if (!rocmQuantGemm_allocInt8(&upload.d_int8_data_rowmajor, rowmajor_elems, rocm_device_id))
-                    {
-                        LOG_WARN("[" << log_scope << "] Failed to allocate startup row-major repack buffer; falling back to runtime repack");
-                        upload.d_int8_data_rowmajor = nullptr;
-                        return true;
-                    }
-                }
-
-                if (!ensureStartupStreamsAndEvents(upload, cfg, log_scope))
-                {
-                    return true;
-                }
-
-                hipStream_t repack_stream = reinterpret_cast<hipStream_t>(upload.startup_repack_stream);
-                if (upload.startup_h2d_event_pending && upload.startup_h2d_done_event)
-                {
-                    const hipError_t wait_err = hipStreamWaitEvent(
-                        repack_stream,
-                        reinterpret_cast<hipEvent_t>(upload.startup_h2d_done_event),
-                        0);
-                    if (wait_err != hipSuccess)
-                    {
-                        LOG_WARN("[" << log_scope << "] Failed waiting for startup H2D event: "
-                                     << hipGetErrorString(wait_err)
-                                     << "; falling back to runtime repack");
-                        return true;
-                    }
-                    upload.startup_h2d_event_pending = false;
-                }
-
-                bool repack_ok = false;
-                if (upload.d_int8_data_vnni)
-                {
-                    repack_ok = rocmGemv_repackVNNI_to_rowmajor(
-                        upload.d_int8_data_vnni,
-                        upload.d_int8_data_rowmajor,
-                        N, K,
-                        rocm_device_id,
-                        reinterpret_cast<void *>(repack_stream));
-                }
-
-                if (!repack_ok)
-                {
-                    LOG_WARN("[" << log_scope << "] Startup GPU repack kernel launch failed; falling back to runtime repack");
-                    return true;
-                }
-
-                const hipError_t record_err = hipEventRecord(
-                    reinterpret_cast<hipEvent_t>(upload.startup_repack_ready_event),
-                    repack_stream);
-                if (record_err != hipSuccess)
-                {
-                    LOG_WARN("[" << log_scope << "] Failed to record startup repack event: "
-                                 << hipGetErrorString(record_err)
-                                 << "; falling back to runtime repack");
-                    return true;
-                }
-
-                upload.startup_repack_event_pending = true;
-                LOG_DEBUG("[" << log_scope << "] Startup GPU row-major repack launched (event-driven): "
-                              << N << "x" << K << " bytes=" << bytes_needed);
-                return true;
-#else
-                (void)upload;
-                (void)N;
-                (void)K;
-                (void)rocm_device_id;
-                (void)cfg;
-                (void)log_scope;
-                return true;
-#endif
-            }
-
-            template <typename UploadT>
-            inline bool launchStartupCommitIfEnabled(
-                UploadT &upload,
-                const ROCmStartupRepackPipelineConfig &cfg,
-                const char *log_scope)
-            {
-#ifdef HAVE_ROCM
-                // Architectural direction: startup pipeline is VNNI-only.
-                // With CK startup repack disabled, commit stage is a no-op.
-                (void)upload;
-                (void)cfg;
-                (void)log_scope;
-                return true;
-
-                if (!cfg.enabled)
-                {
-                    return true;
-                }
-
-                if (!upload.startup_repack_ready_event || !upload.startup_repack_event_pending)
-                {
-                    return true;
-                }
-
-                if (!upload.startup_commit_stream || !upload.startup_commit_ready_event)
-                {
-                    return true;
-                }
-
-                hipStream_t commit_stream = reinterpret_cast<hipStream_t>(upload.startup_commit_stream);
-                const hipError_t wait_err = hipStreamWaitEvent(
-                    commit_stream,
-                    reinterpret_cast<hipEvent_t>(upload.startup_repack_ready_event),
-                    0);
-                if (wait_err != hipSuccess)
-                {
-                    LOG_WARN("[" << log_scope << "] Failed waiting on startup repack event in commit stage: "
-                                 << hipGetErrorString(wait_err));
-                    return true;
-                }
-
-                const hipError_t rec_err = hipEventRecord(
-                    reinterpret_cast<hipEvent_t>(upload.startup_commit_ready_event),
-                    commit_stream);
-                if (rec_err != hipSuccess)
-                {
-                    LOG_WARN("[" << log_scope << "] Failed recording startup commit event: "
-                                 << hipGetErrorString(rec_err));
-                    return true;
-                }
-
-                upload.startup_commit_event_pending = true;
-                return true;
-#else
-                (void)upload;
-                (void)cfg;
-                (void)log_scope;
-                return true;
-#endif
-            }
-        }
-
-        ROCmStartupRepackPipelineConfig getROCmStartupRepackPipelineConfig()
-        {
-            const auto &env = debugEnv();
-            ROCmStartupRepackPipelineConfig cfg;
-            cfg.enabled = env.rocm.startup_gpu_repack;
-            cfg.slots = std::max(1, env.rocm.repack_slots);
-            cfg.budget_mb = std::max(128, env.rocm.repack_budget_mb);
-            cfg.stream_count = std::max(1, env.rocm.repack_streams);
-            return cfg;
         }
 
         // =====================================================================
@@ -1322,8 +743,6 @@ namespace llaminar2
                 {
                     if (upload.d_int8_data_vnni)
                         rocmQuantGemm_freeDevice(upload.d_int8_data_vnni, device_id);
-                    if (upload.d_int8_data_rowmajor)
-                        rocmQuantGemm_freeDevice(upload.d_int8_data_rowmajor, device_id);
                     if (upload.d_scales)
                         rocmQuantGemm_freeDevice(upload.d_scales, device_id);
                     if (upload.d_native_vnni_payload)
@@ -1333,19 +752,7 @@ namespace llaminar2
                         hipFree(upload.d_native_vnni_scales);
                     if (upload.d_native_vnni_mins)
                         hipFree(upload.d_native_vnni_mins);
-#endif
-#ifdef HAVE_ROCM
                     freeStartupPinnedStaging(upload);
-                    if (upload.startup_h2d_done_event)
-                        hipEventDestroy(reinterpret_cast<hipEvent_t>(upload.startup_h2d_done_event));
-                    if (upload.startup_repack_ready_event)
-                        hipEventDestroy(reinterpret_cast<hipEvent_t>(upload.startup_repack_ready_event));
-                    if (upload.startup_commit_ready_event)
-                        hipEventDestroy(reinterpret_cast<hipEvent_t>(upload.startup_commit_ready_event));
-                    if (upload.startup_commit_stream && upload.startup_commit_stream != upload.startup_repack_stream)
-                        hipStreamDestroy(reinterpret_cast<hipStream_t>(upload.startup_commit_stream));
-                    if (upload.startup_repack_stream && upload.startup_repack_stream != upload.startup_h2d_stream)
-                        hipStreamDestroy(reinterpret_cast<hipStream_t>(upload.startup_repack_stream));
                     if (upload.startup_h2d_stream)
                         hipStreamDestroy(reinterpret_cast<hipStream_t>(upload.startup_h2d_stream));
 #endif
@@ -1355,16 +762,8 @@ namespace llaminar2
             {
                 if (d_int8_data_vnni)
                     rocmQuantGemm_freeDevice(d_int8_data_vnni, rocm_device_id);
-                if (d_int8_data_rowmajor)
-                    rocmQuantGemm_freeDevice(d_int8_data_rowmajor, rocm_device_id);
                 if (d_scales)
                     rocmQuantGemm_freeDevice(d_scales, rocm_device_id);
-#ifdef HAVE_ROCM
-                if (startup_repack_ready_event)
-                    hipEventDestroy(reinterpret_cast<hipEvent_t>(startup_repack_ready_event));
-                if (startup_commit_ready_event)
-                    hipEventDestroy(reinterpret_cast<hipEvent_t>(startup_commit_ready_event));
-#endif
             }
         }
 
@@ -1521,8 +920,56 @@ namespace llaminar2
         };
 
         // =====================================================================
+        // Per-device shared ConcurrentPrefillPool singleton.
+        //
+        // Previously each ROCmQuantisedGemmKernel instance owned its own pool,
+        // which for a 64-layer model meant ~80 separate pools each with its own
+        // scratch (M*N int32) and scatter_partial (64*N float) buffers —
+        // several GB of duplicated scratch on a single device. The pool is
+        // purely infrastructure (streams + events + scratch), so a single
+        // shared per-device instance is sufficient and dramatically cheaper.
+        // =====================================================================
+        static std::mutex &sharedPrefillPoolMutex()
+        {
+            static std::mutex m;
+            return m;
+        }
+
+        static std::unordered_map<int, std::unique_ptr<ConcurrentPrefillPool>> &sharedPrefillPools()
+        {
+            static std::unordered_map<int, std::unique_ptr<ConcurrentPrefillPool>> pools;
+            return pools;
+        }
+
+        static ConcurrentPrefillPool &getSharedPrefillPool(int device_id, int requested_streams)
+        {
+            std::lock_guard<std::mutex> lock(sharedPrefillPoolMutex());
+            auto &pools = sharedPrefillPools();
+            auto it = pools.find(device_id);
+            if (it == pools.end())
+            {
+                auto pool = std::make_unique<ConcurrentPrefillPool>();
+                // Initialize with MAX_STREAMS so the pool can serve any
+                // caller's concurrency request without re-initialization.
+                pool->init(device_id, ConcurrentPrefillPool::MAX_STREAMS);
+                it = pools.emplace(device_id, std::move(pool)).first;
+            }
+            (void)requested_streams; // preserved for API compat
+            return *it->second;
+        }
+
+        // =====================================================================
         // Constructor / Destructor
         // =====================================================================
+
+        void ROCmQuantisedGemmKernel::clearSharedPrefillPools()
+        {
+            std::lock_guard<std::mutex> lock(sharedPrefillPoolMutex());
+            auto &pools = sharedPrefillPools();
+            // Pool destructor calls destroy() which frees streams, events, and
+            // all scratch/scatter GPU allocations per device.
+            pools.clear();
+        }
 
         ROCmQuantisedGemmKernel::ROCmQuantisedGemmKernel(const TensorBase *weights, int rocm_device_id)
             : weights_(weights),
@@ -1532,7 +979,6 @@ namespace llaminar2
               K_(0),
               weights_converted_(false),
               owns_weight_memory_(true), // Legacy path owns weight memory
-              ck_dispatch_mutex_(std::make_unique<std::mutex>()),
               impl_(std::make_unique<Impl>())
         {
             if (!weights)
@@ -1557,11 +1003,6 @@ namespace llaminar2
 
             impl_->owns_weight_memory = true;        // Legacy constructor owns weight memory
             impl_->rocm_device_id = rocm_device_id_; // Store device ID for cleanup
-            impl_->ck_kernel_context = rocmQuantGemm_createKernelContext(rocm_device_id_);
-            if (!impl_->ck_kernel_context)
-            {
-                throw std::runtime_error("[ROCmQuantisedGemmKernel] Failed to create CK kernel context");
-            }
 
             LOG_DEBUG("[ROCmQuantisedGemmKernel] Created (legacy) for " << N_ << "x" << K_
                                                                         << " quantized weights (type=" << static_cast<int>(wt)
@@ -1576,7 +1017,6 @@ namespace llaminar2
               K_(0),
               weights_converted_(false),  // Not yet uploaded to device
               owns_weight_memory_(false), // ROCmPackedWeights owns the memory
-              ck_dispatch_mutex_(std::make_unique<std::mutex>()),
               impl_(std::make_unique<Impl>())
         {
             if (!packed)
@@ -1589,11 +1029,6 @@ namespace llaminar2
 
             impl_->owns_weight_memory = false;       // Pre-packed path doesn't own weight memory
             impl_->rocm_device_id = rocm_device_id_; // Store device ID for cleanup
-            impl_->ck_kernel_context = rocmQuantGemm_createKernelContext(rocm_device_id_);
-            if (!impl_->ck_kernel_context)
-            {
-                throw std::runtime_error("[ROCmQuantisedGemmKernel] Failed to create CK kernel context");
-            }
 
             LOG_DEBUG("[ROCmQuantisedGemmKernel] Created (pre-packed) for " << N_ << "x" << K_
                                                                             << " INT8 weights on ROCm device " << rocm_device_id_);
@@ -1630,11 +1065,9 @@ namespace llaminar2
                 return PrefillDispatchPath::CK_FALLBACK;
             }
 
-            // Debug override: force CK for all GEMMs
-            if (debugEnv().rocm.force_ck)
-            {
-                return PrefillDispatchPath::CK_FALLBACK;
-            }
+            // CK path retired: LLAMINAR_ROCM_FORCE_CK is silently ignored.
+            // The CK workspace buffers are no longer allocated, so forcing CK
+            // would only hit an unreachable code path.
 
             // ≤6-bit formats use native-VNNI (lossless decode, FP16 block scales)
             if (impl_->has_native_vnni)
@@ -2506,19 +1939,9 @@ namespace llaminar2
             //
             //   ≤6-bit weights (has_native_vnni) → native-VNNI GEMV/GEMM
             //   8-bit weights (d_weights_int8_vnni) → INT8-VNNI GEMV/GEMM
-            //   LLAMINAR_ROCM_FORCE_CK=1 → CK ComposableKernel (debug only)
             //
-            // CK is never a normal fallback. If both VNNI paths fail without
-            // force_ck, that is a hard error.
+            // If both VNNI paths fail, that is a hard error.
             // =========================================================================
-            const bool force_ck = debugEnv().rocm.force_ck;
-            if (force_ck)
-            {
-                static std::once_flag force_ck_once;
-                std::call_once(force_ck_once, []()
-                               { LOG_WARN("[ROCmQuantisedGemmKernel] LLAMINAR_ROCM_FORCE_CK=1: "
-                                          "forcing CK ComposableKernel dispatch for all GEMMs (debug override)"); });
-            }
 
             // =========================================================================
             // DECODE FAST PATH: M=1 GEMV (skips activation quantization + CK GEMM)
@@ -2534,9 +1957,8 @@ namespace llaminar2
             //   4. INT32→FP32 scale application kernel
             //
             // Handles optional bias in a single fused kernel launch.
-            // Skipped when LLAMINAR_ROCM_FORCE_CK=1 to allow CK debug testing.
             // =========================================================================
-            if (use_gpu_path && m == 1 && !force_ck)
+            if (use_gpu_path && m == 1)
             {
                 // Ensure weights are on device
                 ensureWeightsConverted();
@@ -2730,54 +2152,6 @@ namespace llaminar2
             // because both native prefill formats consume INT8 activations.
             // =========================================================================
 
-            // CK FP32 bias path: only used when LLAMINAR_ROCM_FORCE_CK=1 is set.
-            // The VNNI paths handle bias via rocmQuantGemm_biasAdd post-kernel.
-            if (bias && use_gpu_path && force_ck)
-            {
-                // Get bias device pointer
-                const float *d_bias = static_cast<const float *>(bias->gpu_data_ptr());
-
-                if (d_bias)
-                {
-                    // =================================================================
-                    // MAPPED OUTPUT REDIRECT for bias path (same fix as GEMV path).
-                    // Without this, biased LM head writes scatter to mapped memory
-                    // over PCIe instead of HBM.
-                    // =================================================================
-                    const bool bias_output_is_mapped = C_fp32->isMapped();
-                    float *d_bias_output = d_output;
-                    if (bias_output_is_mapped && impl_)
-                    {
-                        d_bias_output = impl_->d_C_fp32;
-                        static std::once_flag bias_mapped_once;
-                        std::call_once(bias_mapped_once, [&]()
-                                       { LOG_WARN("[multiply_tensor] BIAS PATH MAPPED REDIRECT: M=" << m << " N=" << n
-                                                                                                    << " mapped_ptr=" << d_output
-                                                                                                    << " -> d_C_fp32=" << impl_->d_C_fp32
-                                                                                                    << " (" << (static_cast<size_t>(m) * n * 4 / 1024) << " KB)"); });
-                    }
-
-                    LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_tensor] Using CK bias path (d_input="
-                              << d_input << ", d_output=" << d_bias_output << ", d_bias=" << d_bias << ")");
-                    bool result = multiply_fp32_to_fp32_with_bias(d_input, d_bias_output, d_bias, m, n, k, alpha, beta);
-
-                    // Bulk DMA from HBM workspace to mapped output
-                    if (result && bias_output_is_mapped)
-                    {
-                        hipMemcpyAsync(d_output, impl_->d_C_fp32,
-                                       static_cast<size_t>(m) * n * sizeof(float),
-                                       hipMemcpyDeviceToDevice,
-                                       static_cast<hipStream_t>(gpu_stream_));
-                    }
-
-                    if (ws && ws != saved_workspace)
-                    {
-                        workspace_ = saved_workspace;
-                    }
-                    return result;
-                }
-            }
-
             // Ensure weights are uploaded to device
             if (phase_timing)
                 phase_start = std::chrono::high_resolution_clock::now();
@@ -2828,175 +2202,10 @@ namespace llaminar2
                     LOG_TRACE("[ROCmGEMM::PHASES] validateWorkspace: " << workbuf_ms << "ms");
             }
 
-            // Option B: Repack VNNI→row-major into workspace scratch for CK GEMM.
-            // Skip CK row-major materialization entirely when native VNNI prefill will
-            // be attempted (M>1 and VNNI/ratio-VNNI weights exist). The native path
-            // uses d_weights_int8_vnni directly and never touches d_weights_int8.
-            // This avoids ~150ns/GEMM of cache checks + potential GPU alloc/repack on
-            // first call for qualifying FFN shapes.
-            const bool native_prefill_likely = (m > 1) &&
-                                               selectPrefillDispatchPath(m, n, k) != PrefillDispatchPath::CK_FALLBACK;
-            int8_t *d_weights_int8 = nullptr;
-
-            const auto should_materialize_persistent_rowmajor = [&](int mm, int nn, int kk) -> bool
-            {
-                if (mm <= 1 || nn <= 0 || kk <= 0)
-                {
-                    return false;
-                }
-
-                const double n_over_k = static_cast<double>(nn) / static_cast<double>(std::max(1, kk));
-                const bool ffn_like = (n_over_k >= 1.5) || (n_over_k <= 0.75);
-                if (!ffn_like)
-                {
-                    return false;
-                }
-
-                const int64_t work = static_cast<int64_t>(mm) * static_cast<int64_t>(nn) * static_cast<int64_t>(kk);
-                return work >= 300000000LL;
-            };
-
-            const auto try_materialize_persistent_rowmajor = [&](int nn, int kk) -> bool
-            {
-                if (!impl_ || impl_->d_weights_int8_rowmajor)
-                {
-                    return true;
-                }
-
-                if (!should_materialize_persistent_rowmajor(m, nn, kk))
-                {
-                    return false;
-                }
-
-                if (!impl_->d_weights_int8_vnni)
-                {
-                    return false;
-                }
-
-                int8_t **rowmajor_target = nullptr;
-                if (packed_)
-                {
-                    auto upload_it = packed_->device_uploads.find(rocm_device_id_);
-                    if (upload_it != packed_->device_uploads.end())
-                    {
-                        rowmajor_target = &upload_it->second.d_int8_data_rowmajor;
-                    }
-                }
-
-                if (!rowmajor_target)
-                {
-                    rowmajor_target = &impl_->d_weights_int8_rowmajor;
-                }
-
-                const bool had_existing_rowmajor = (*rowmajor_target != nullptr);
-                if (!(*rowmajor_target))
-                {
-                    const size_t rowmajor_elems = static_cast<size_t>(nn) * static_cast<size_t>(kk);
-                    if (!rocmQuantGemm_allocInt8(rowmajor_target, rowmajor_elems, rocm_device_id_))
-                    {
-                        return false;
-                    }
-                }
-                const bool allocated_now = (!had_existing_rowmajor && *rowmajor_target != nullptr);
-
-                bool repack_ok = false;
-                if (impl_->d_weights_int8_vnni)
-                {
-                    repack_ok = rocmGemv_repackVNNI_to_rowmajor(
-                        impl_->d_weights_int8_vnni,
-                        *rowmajor_target,
-                        nn, kk,
-                        rocm_device_id_, gpu_stream_);
-                }
-
-                if (!repack_ok)
-                {
-                    if (allocated_now && rowmajor_target && *rowmajor_target)
-                    {
-                        rocmQuantGemm_freeDevice(*rowmajor_target, rocm_device_id_);
-                        *rowmajor_target = nullptr;
-                    }
-                    return false;
-                }
-
-                impl_->d_weights_int8_rowmajor = *rowmajor_target;
-                if (packed_)
-                {
-                    packed_->d_int8_data_rowmajor = *rowmajor_target;
-                }
-
-                if (WeightLoadingProfiler::isEnabled())
-                    WeightLoadingProfiler::addDetail("prefill_gemm.ck_rowmajor_persistent.materialized", 1.0);
-                return true;
-            };
-
-            // CK row-major resolve — skip entirely when native VNNI prefill will be
-            // attempted. This avoids per-GEMM overhead of persistent-rowmajor cache
-            // checks, waitForStartupRepackIfNeeded, and ensureRepackedWeightsForCK.
-            // On first call for qualifying FFN shapes, also avoids a GPU alloc + repack
-            // kernel launch that would be immediately wasted.
-            const auto resolve_ck_rowmajor_weights = [&]() -> bool
-            {
-                if (impl_->d_weights_int8_rowmajor)
-                {
-                    if (!waitForStartupRepackIfNeeded(
-                            impl_.get(),
-                            rocm_device_id_,
-                            gpu_stream_,
-                            "ROCmQuantisedGemmKernel::multiply_tensor"))
-                    {
-                        return false;
-                    }
-                    d_weights_int8 = impl_->d_weights_int8_rowmajor;
-                }
-
-                // Skip persistent materialization — it allocates a per-weight
-                // row-major copy that accumulates to ~model_size additional VRAM.
-                // Instead, always fall through to the scratch buffer repack path
-                // which reuses a single shared workspace buffer.
-
-                if (!d_weights_int8 && impl_->d_B_rowmajor_scratch)
-                {
-                    if (phase_timing)
-                        phase_start = std::chrono::high_resolution_clock::now();
-                    if (!ensureRepackedWeightsForCK(
-                            impl_.get(), n, k, rocm_device_id_, gpu_stream_,
-                            "ROCmQuantisedGemmKernel::multiply_tensor"))
-                    {
-                        return false;
-                    }
-                    d_weights_int8 = impl_->d_B_rowmajor_scratch;
-                    if (phase_timing)
-                    {
-                        phase_end = std::chrono::high_resolution_clock::now();
-                        double repack_ms = std::chrono::duration<double, std::milli>(phase_end - phase_start).count();
-                        LOG_TRACE("[ROCmGEMM::PHASES] VNNI→rowmajor repack: " << repack_ms << "ms");
-                    }
-                }
-
-                if (!d_weights_int8)
-                {
-                    LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] No VNNI weights for CK GEMM repack");
-                    return false;
-                }
-
-                if (!validatePointerDeviceOrLog(
-                        d_weights_int8, rocm_device_id_, "workspace::ROCM_B_REPACK", "ROCmQuantisedGemmKernel::multiply_tensor"))
-                {
-                    return false;
-                }
-                return true;
-            };
-
-            // Only resolve CK weights eagerly when native prefill won't be tried.
-            // Otherwise we defer to after the native attempt (if it falls through).
-            if (!native_prefill_likely)
-            {
-                if (!resolve_ck_rowmajor_weights())
-                    return false;
-            }
-
-            LOG_TRACE("[ROCmQuantisedGemmKernel::multiply_tensor] Weight ptrs: int8(scratch)=" << (void *)d_weights_int8 << " scales=" << (void *)d_scales_B);
+            // Option B: Repack VNNI→row-major was used only by the CK fallback.
+            // CK is retired; the M>1 path dispatches native-VNNI / INT8-VNNI
+            // directly against `impl_->d_weights_int8_vnni` and never needs a
+            // row-major copy.
 
             int8_t *d_A_int8 = impl_->d_A_int8;
             float *d_scales_A = impl_->d_scales_A;
@@ -3254,394 +2463,30 @@ namespace llaminar2
                     return true;
                 }
 
-                // Both VNNI paths failed for M>1 prefill.
-                if (!force_ck)
-                {
-                    // Without force_ck, CK is not a normal fallback — this is a hard error.
-                    LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] M>1 prefill: "
-                              "both native-VNNI and INT8-VNNI paths failed (M="
-                              << m << " N=" << n << " K=" << k
-                              << "). Set LLAMINAR_ROCM_FORCE_CK=1 to use CK as a debug fallback.");
-                    return false;
-                }
-
-                // CK debug override: lazily resolve CK row-major weights
-                // now (was deferred because we expected native to succeed).
-                if (native_prefill_likely && !d_weights_int8)
-                {
-                    if (!resolve_ck_rowmajor_weights())
-                        return false;
-                }
-            }
-
-            LOG_TRACE("[ROCmQuantisedGemmKernel::multiply_tensor] CK debug path (LLAMINAR_ROCM_FORCE_CK=1): executing CK GEMM");
-
-#if 0 // Debug dump code disabled - was causing heap corruption with non-standard sizes
-      // DEBUG: Dump INT8 inputs before GEMM
-      // Note: We need to pad buffer sizes to 4-byte boundaries for the copy function
-            {
-                size_t a_bytes = static_cast<size_t>(m) * k;
-                size_t b_bytes = static_cast<size_t>(k) * n;
-                std::vector<int8_t> h_A_int8((a_bytes + 3) & ~3);  // Round up to multiple of 4
-                std::vector<int8_t> h_B_int8((b_bytes + 3) & ~3);  // Round up to multiple of 4
-                rocmQuantGemm_copyDeviceToHost(reinterpret_cast<float*>(h_A_int8.data()), 
-                                               reinterpret_cast<float*>(d_A_int8), 
-                                               (a_bytes + 3) / 4, rocm_device_id_);
-                rocmQuantGemm_copyDeviceToHost(reinterpret_cast<float*>(h_B_int8.data()), 
-                                               reinterpret_cast<float*>(d_weights_int8), 
-                                               (b_bytes + 3) / 4, rocm_device_id_);
-                
-                // Only print if we have at least 8 elements
-                if (k >= 8) {
-                    LOG_INFO("[DEBUG] A_int8 row0 first 8: " 
-                             << (int)h_A_int8[0] << ", " << (int)h_A_int8[1] << ", " 
-                             << (int)h_A_int8[2] << ", " << (int)h_A_int8[3] << ", "
-                             << (int)h_A_int8[4] << ", " << (int)h_A_int8[5] << ", "
-                             << (int)h_A_int8[6] << ", " << (int)h_A_int8[7]);
-                }
-                if (n >= 8) {
-                    // B is now [K×N] RowMajor: B[k_idx, n_idx] = h_B_int8[k_idx * n + n_idx]
-                    LOG_INFO("[DEBUG] B_int8 [K×N] RowMajor row0 (n=0..7): " 
-                             << (int)h_B_int8[0*n + 0] << ", " << (int)h_B_int8[0*n + 1] << ", " 
-                             << (int)h_B_int8[0*n + 2] << ", " << (int)h_B_int8[0*n + 3] << ", "
-                             << (int)h_B_int8[0*n + 4] << ", " << (int)h_B_int8[0*n + 5] << ", "
-                             << (int)h_B_int8[0*n + 6] << ", " << (int)h_B_int8[0*n + 7]);
-                }
-                if (k >= 2 && n >= 8) {
-                    LOG_INFO("[DEBUG] B_int8 [K×N] RowMajor row1 (n=0..7): " 
-                             << (int)h_B_int8[1*n + 0] << ", " << (int)h_B_int8[1*n + 1] << ", " 
-                             << (int)h_B_int8[1*n + 2] << ", " << (int)h_B_int8[1*n + 3] << ", "
-                             << (int)h_B_int8[1*n + 4] << ", " << (int)h_B_int8[1*n + 5] << ", "
-                             << (int)h_B_int8[1*n + 6] << ", " << (int)h_B_int8[1*n + 7]);
-                }
-                if (k >= 8) {
-                    // Show column 0 of B (the elements that will dot-product with A row 0)
-                    LOG_INFO("[DEBUG] B_int8 col0 (B[k,0] for k=0..7): " 
-                             << (int)h_B_int8[0*n + 0] << ", " << (int)h_B_int8[1*n + 0] << ", " 
-                             << (int)h_B_int8[2*n + 0] << ", " << (int)h_B_int8[3*n + 0] << ", "
-                             << (int)h_B_int8[4*n + 0] << ", " << (int)h_B_int8[5*n + 0] << ", "
-                             << (int)h_B_int8[6*n + 0] << ", " << (int)h_B_int8[7*n + 0]);
-                }
-
-                // Manual INT32 dot product for C[0,0] = A[0,:] · B[:,0]
-                // A is [M×K] row-major: A[m,k] = h_A_int8[m*K + k]
-                // B is [K×N] row-major: B[k,n] = h_B_int8[k*N + n]
-                // C[0,0] = sum_k { A[0,k] * B[k,0] }
-                int32_t manual_dot = 0;
-                for (int kk = 0; kk < k; ++kk) {
-                    int8_t a_val = h_A_int8[0 * k + kk];  // A[0,kk] row-major
-                    int8_t b_val = h_B_int8[kk * n + 0];  // B[kk,0] row-major [K×N]
-                    manual_dot += static_cast<int32_t>(a_val) * static_cast<int32_t>(b_val);
-                }
-                LOG_INFO("[DEBUG] Manual dot(A_row0, B_col0) for [K×N] layout = " << manual_dot);
-            }
-#endif
-
-            // Determine output buffer based on GPU vs CPU path
-            // CRITICAL: For mapped (host-pinned) output, redirect to device workspace
-            // to avoid catastrophic PCIe write bandwidth (~1.6 GB/s vs 1024 GB/s HBM).
-            const bool ck_output_is_mapped = use_gpu_path && C_fp32->isMapped();
-            const size_t c_fp32_size = static_cast<size_t>(m) * n;
-            float *d_C_fp32_dst = nullptr;
-
-            if (use_gpu_path && !ck_output_is_mapped)
-            {
-                // GPU path: Write directly to output tensor's GPU buffer
-                d_C_fp32_dst = d_output;
-                LOG_TRACE("[ROCmQuantisedGemmKernel::multiply_tensor] Using GPU output directly: " << d_C_fp32_dst);
-            }
-            else
-            {
-                // CPU path or mapped output: Use temp buffer from workspace
-                d_C_fp32_dst = impl_->d_C_fp32;
-            }
-
-            if (!validatePointerDeviceOrLog(
-                    d_C_fp32_dst, rocm_device_id_, "d_C_fp32_dst", "ROCmQuantisedGemmKernel::multiply_tensor"))
-            {
+                // Both VNNI paths failed for M>1 prefill — hard error.
+                LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] M>1 prefill: "
+                          "both native-VNNI and INT8-VNNI paths failed (M="
+                          << m << " N=" << n << " K=" << k << ").");
                 return false;
             }
 
-            // =========================================================================
-            // CK TWO-KERNEL DISPATCH (debug override only, LLAMINAR_ROCM_FORCE_CK=1)
-            // =========================================================================
-            //
-            // This path is only reachable when LLAMINAR_ROCM_FORCE_CK=1 is set.
-            // Normal dispatch uses native-VNNI (≤6-bit) or INT8-VNNI (8-bit).
-            //
-            // For small M (decode), we pad activations to CK_MIN_M (128), run CK,
-            // then extract first M rows.
-            //
-            // NOTE: hipBLAS INT8 on gfx906 has N <= K limitation, breaking FFN.
-            //       M-padding for CK is more efficient and universally supported.
-            //
-
-            const int padded_m = getPaddedM(m);
-            const bool needs_padding = needsMPadding(m);
-            bool success = false;
-            const bool serialize_rocm_gemm = debugEnv().validation.serialize_rocm_gemm_stage;
-
-            auto runCKDispatch = [&](auto &&dispatch_fn, const char *op_name) -> bool
-            {
-                if (!serialize_rocm_gemm)
-                {
-                    return dispatch_fn();
-                }
-
-                std::lock_guard<std::mutex> lock(*ck_dispatch_mutex_);
-                bool dispatch_success = dispatch_fn();
-                if (!dispatch_success)
-                {
-                    return false;
-                }
-
-#ifdef HAVE_ROCM
-                const hipError_t sync_err = hipStreamSynchronize(reinterpret_cast<hipStream_t>(gpu_stream_));
-                if (sync_err != hipSuccess)
-                {
-                    LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] " << op_name
-                                                                            << " stream sync failed during serialized CK dispatch: "
-                                                                            << hipGetErrorString(sync_err));
-                    return false;
-                }
-#endif
-                return true;
-            };
-
-            if (needs_padding)
-            {
-                LOG_DEBUG("[ROCmQuantisedGemmKernel] Using CK TWO-KERNEL with M-padding (M=" << m << " -> " << padded_m << ", N=" << n << ", K=" << k << ")");
-            }
-            else
-            {
-                LOG_DEBUG("[ROCmQuantisedGemmKernel] Using CK TWO-KERNEL (M=" << m << ", N=" << n << ", K=" << k << ")");
-            }
-
-            // Use workspace INT32 accumulator buffer (pre-allocated for padded size)
-            // No allocation needed - workspace provides all buffers
-
-            if (needs_padding)
-            {
-                // Padding buffers come from workspace - no allocation needed
-                // Padded execution with cached buffers (no hot-path allocations!)
-                auto gemm_start = std::chrono::high_resolution_clock::now();
-                success = runCKDispatch(
-                    [&]()
-                    {
-                        return rocmQuantGemm_executeTwoKernel_padded_cached(
-                            d_A_int8, d_weights_int8, d_C_fp32_dst,
-                            d_scales_A, d_scales_B,
-                            impl_->d_CK_int32,
-                            impl_->d_A_padded, impl_->d_scale_A_padded, impl_->d_E_padded,
-                            m, padded_m, n, k, rocm_device_id_, gpu_stream_, impl_->ck_kernel_context);
-                    },
-                    "executeTwoKernel_padded_cached");
-                auto gemm_end = std::chrono::high_resolution_clock::now();
-                double gemm_ms = std::chrono::duration<double, std::milli>(gemm_end - gemm_start).count();
-                LOG_TRACE("[ROCmGEMM::TIMING] executeTwoKernel_padded_cached M=" << m << " N=" << n << " K=" << k << " took " << gemm_ms << "ms");
-            }
-            else
-            {
-                // Direct execution: no padding needed
-                auto gemm_start = std::chrono::high_resolution_clock::now();
-                success = runCKDispatch(
-                    [&]()
-                    {
-                        return rocmQuantGemm_executeTwoKernel_cached(
-                            d_A_int8, d_weights_int8, d_C_fp32_dst,
-                            d_scales_A, d_scales_B,
-                            impl_->d_CK_int32,
-                            m, n, k, rocm_device_id_, gpu_stream_, impl_->ck_kernel_context);
-                    },
-                    "executeTwoKernel_cached");
-                auto gemm_end = std::chrono::high_resolution_clock::now();
-                double gemm_ms = std::chrono::duration<double, std::milli>(gemm_end - gemm_start).count();
-                LOG_TRACE("[ROCmGEMM::TIMING] executeTwoKernel_cached M=" << m << " N=" << n << " K=" << k << " took " << gemm_ms << "ms");
-            }
-
-            if (!success)
-            {
-                LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] All GEMM paths failed");
-                return false;
-            }
-
-            // Copy result back to host (only if not in GPU path, or mapped output)
-            if (!use_gpu_path || ck_output_is_mapped)
-            {
-                phase_start = std::chrono::high_resolution_clock::now();
-                if (ck_output_is_mapped)
-                {
-                    // Mapped output: streaming D2H from device workspace to mapped host.
-                    // Use HOST pointer, not device-visible mapped pointer.
-                    float *host_dst = C_fp32->mutable_data();
-                    hipError_t err = hipMemcpyAsync(
-                        host_dst, d_C_fp32_dst,
-                        c_fp32_size * sizeof(float),
-                        hipMemcpyDeviceToHost,
-                        static_cast<hipStream_t>(gpu_stream_));
-                    if (err != hipSuccess)
-                    {
-                        LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] CK mapped output D2H copy failed: "
-                                  << hipGetErrorString(err));
-                        return false;
-                    }
-                    LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_tensor] CK path: copied to mapped output");
-                }
-                else
-                {
-                    LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_tensor] CPU path: copying to host"
-                              << " d_C_fp32_dst=" << d_C_fp32_dst
-                              << " h_dst=" << (void *)C_fp32->mutable_data()
-                              << " c_fp32_size=" << c_fp32_size);
-                    if (!rocmQuantGemm_copyDeviceToHost(C_fp32->mutable_data(), d_C_fp32_dst, c_fp32_size, rocm_device_id_))
-                    {
-                        LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] Failed to copy output to host");
-                        return false;
-                    }
-                }
-                phase_end = std::chrono::high_resolution_clock::now();
-                double d2h_ms = std::chrono::duration<double, std::milli>(phase_end - phase_start).count();
-                if (d2h_ms > 1.0)
-                    LOG_TRACE("[ROCmGEMM::PHASES] D2H copy (C_fp32): " << d2h_ms << "ms");
-            }
-            LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_tensor] Completed " << m << "x" << n << "x" << k);
-
-            return true;
+            // Unreachable: M>1 path always returns above via native/INT8-VNNI or hard error.
+            LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] Reached unreachable CK fallback sentinel");
+            return false;
         }
 
         bool ROCmQuantisedGemmKernel::multiply_tensor_timed(
-            const TensorBase *A, TensorBase *C,
-            int m, int n, int k,
+            const TensorBase * /*A*/, TensorBase * /*C*/,
+            int /*m*/, int /*n*/, int /*k*/,
             float *kernel_time_ms)
         {
+            // CK timed path retired. The timed variant existed solely to measure
+            // CK kernel execution time for benchmarking. Use multiply_tensor() for
+            // functional execution via native-VNNI / INT8-VNNI paths.
             if (kernel_time_ms)
-                *kernel_time_ms = 0.0f;
-
-            if (!A || !C)
-            {
-                LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor_timed] Null tensor");
-                return false;
-            }
-
-            auto *A_fp32 = dynamic_cast<const FP32Tensor *>(A);
-            auto *C_fp32 = dynamic_cast<FP32Tensor *>(C);
-            if (!A_fp32)
-            {
-                LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor_timed] A must be FP32Tensor");
-                return false;
-            }
-            if (!C_fp32)
-            {
-                LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor_timed] C must be FP32Tensor");
-                return false;
-            }
-
-            // Get weight device pointers — Option B: VNNI and/or ratio-VNNI, repack to scratch
-            validateWorkspace();
-            if ((!impl_->d_weights_int8_vnni && !impl_->d_weights_int8_rowmajor) ||
-                (!impl_->d_B_rowmajor_scratch && !impl_->d_weights_int8_rowmajor))
-            {
-                static std::once_flag timed_path_unavailable_once;
-                std::call_once(timed_path_unavailable_once, []()
-                               { LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_tensor_timed] Timed path unavailable for this weight layout (missing VNNI/ratio buffers or repack scratch); caller may fallback to multiply_tensor()"); });
-                return false;
-            }
-            float *d_scales_B = impl_->d_scales_B;
-            if (!d_scales_B)
-            {
-                LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor_timed] Weights not uploaded");
-                return false;
-            }
-            int8_t *d_weights_int8 = nullptr;
-            if (impl_->d_weights_int8_rowmajor)
-            {
-                if (!waitForStartupRepackIfNeeded(
-                        impl_.get(),
-                        rocm_device_id_,
-                        gpu_stream_,
-                        "ROCmQuantisedGemmKernel::multiply_tensor_timed"))
-                {
-                    return false;
-                }
-                d_weights_int8 = impl_->d_weights_int8_rowmajor;
-            }
-            else
-            {
-                if (!ensureRepackedWeightsForCK(
-                        impl_.get(), n, k, rocm_device_id_, gpu_stream_,
-                        "ROCmQuantisedGemmKernel::multiply_tensor_timed"))
-                {
-                    return false;
-                }
-                d_weights_int8 = impl_->d_B_rowmajor_scratch;
-            }
-
-            int8_t *d_A_int8 = impl_->d_A_int8;
-            float *d_scales_A = impl_->d_scales_A;
-            float *d_A_fp32 = impl_->d_A_fp32;
-            float *d_C_fp32 = impl_->d_C_fp32;
-
-            // Copy activations H2D and quantize (OUTSIDE timing)
-            const size_t a_fp32_size = static_cast<size_t>(m) * k;
-            const size_t c_fp32_size = static_cast<size_t>(m) * n;
-            if (!rocmQuantGemm_copyHostToDevice(d_A_fp32, A_fp32->data(), a_fp32_size, rocm_device_id_))
-            {
-                LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor_timed] Failed to copy A");
-                return false;
-            }
-            {
-                const int act_block_k = rocmGemv_int8_vnni_get_act_block_k();
-                if (!rocmQuantGemm_quantizeActivationsBlockwise(d_A_fp32, d_A_int8, impl_->d_scales_A_blockwise, m, k, rocm_device_id_, gpu_stream_, act_block_k))
-                {
-                    LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor_timed] Failed to blockwise-quantize A");
-                    return false;
-                }
-            }
-
-            // Calculate padding
-            int padded_m = getPaddedM(m);
-            bool needs_padding = (padded_m > m);
-
-            // Execute GEMM with HIP event timing (ONLY this is timed)
-            bool success = false;
-            if (needs_padding)
-            {
-                // Use cached padded buffers from workspace (no hot-path allocations)
-                success = rocmQuantGemm_executeTwoKernel_padded_cached(
-                    d_A_int8, d_weights_int8, d_C_fp32,
-                    d_scales_A, d_scales_B,
-                    impl_->d_CK_int32,
-                    impl_->d_A_padded, impl_->d_scale_A_padded, impl_->d_E_padded,
-                    m, padded_m, n, k, rocm_device_id_, gpu_stream_, impl_->ck_kernel_context);
-                // Can't get accurate timing for padded path without modifying it
-                if (kernel_time_ms)
-                    *kernel_time_ms = -1.0f; // Indicate timing not available
-            }
-            else
-            {
-                // Direct execution with timing
-                success = rocmQuantGemm_executeTwoKernel_timed(
-                    d_A_int8, d_weights_int8, d_C_fp32,
-                    d_scales_A, d_scales_B,
-                    impl_->d_CK_int32,
-                    m, n, k, rocm_device_id_,
-                    kernel_time_ms, gpu_stream_, impl_->ck_kernel_context);
-            }
-
-            if (!success)
-            {
-                LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor_timed] GEMM failed");
-                return false;
-            }
-
-            // Copy result D2H (OUTSIDE timing)
-            if (!rocmQuantGemm_copyDeviceToHost(C_fp32->mutable_data(), d_C_fp32, c_fp32_size, rocm_device_id_))
-            {
-                LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor_timed] Failed to copy C");
-                return false;
-            }
-
-            return true;
+                *kernel_time_ms = -1.0f;
+            LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor_timed] CK timed path retired");
+            return false;
         }
 
         bool ROCmQuantisedGemmKernel::multiply_fused_tensor(
@@ -3761,7 +2606,6 @@ namespace llaminar2
             // For M=1, VNNI projections are batched into a single kernel dispatch.
             // Native-VNNI (Q4/IQ4) and M>1 projections are dispatched individually.
             bool all_success = true;
-            const bool serialize_rocm_gemm = debugEnv().validation.serialize_rocm_gemm_stage;
 
             // Batched INT8 scatter GEMV collection arrays (for M=1 VNNI projections)
             const int8_t *batch_B_ptrs[8] = {};
@@ -3770,33 +2614,6 @@ namespace llaminar2
             const float *batch_bias_ptrs[8] = {};
             int batch_N[8] = {};
             int batch_count = 0;
-
-            auto runCKDispatch = [&](auto &&dispatch_fn, const char *op_name) -> bool
-            {
-                if (!serialize_rocm_gemm)
-                {
-                    return dispatch_fn();
-                }
-
-                std::lock_guard<std::mutex> lock(*ck_dispatch_mutex_);
-                bool dispatch_success = dispatch_fn();
-                if (!dispatch_success)
-                {
-                    return false;
-                }
-
-#ifdef HAVE_ROCM
-                const hipError_t sync_err = hipStreamSynchronize(reinterpret_cast<hipStream_t>(gpu_stream_));
-                if (sync_err != hipSuccess)
-                {
-                    LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fused_tensor] " << op_name
-                                                                                  << " stream sync failed during serialized CK dispatch: "
-                                                                                  << hipGetErrorString(sync_err));
-                    return false;
-                }
-#endif
-                return true;
-            };
 
             // =========================================================================
             // CONCURRENT PREFILL PATH: Multi-stream dispatch for M>1 projections
@@ -3855,10 +2672,7 @@ namespace llaminar2
                 if (concurrent_eligible)
                 {
                     const int num_proj = static_cast<int>(projections.size());
-                    if (!prefill_pool_)
-                        prefill_pool_ = std::make_unique<ConcurrentPrefillPool>();
-                    auto &pool = *prefill_pool_;
-                    pool.init(rocm_device_id_, num_proj);
+                    auto &pool = getSharedPrefillPool(rocm_device_id_, num_proj);
 
                     // Record event after quantization completes on main stream
                     hipEventRecord(pool.quant_ready,
@@ -4035,10 +2849,7 @@ namespace llaminar2
                 if (decode_concurrent_eligible)
                 {
                     const int num_proj = static_cast<int>(projections.size());
-                    if (!prefill_pool_)
-                        prefill_pool_ = std::make_unique<ConcurrentPrefillPool>();
-                    auto &pool = *prefill_pool_;
-                    pool.init(rocm_device_id_, num_proj);
+                    auto &pool = getSharedPrefillPool(rocm_device_id_, num_proj);
 
                     // Record event after quantization completes on main stream
                     hipEventRecord(pool.quant_ready,
@@ -4510,175 +3321,12 @@ namespace llaminar2
                     continue;
                 }
 
-                // Repack VNNI→row-major into this kernel's workspace scratch for CK
-                int8_t *d_weights_int8 = nullptr;
-                int8_t *d_vnni = rocm_kernel->impl_ ? rocm_kernel->impl_->d_weights_int8_vnni : nullptr;
-                int8_t *d_scratch = rocm_kernel->impl_ ? rocm_kernel->impl_->d_B_rowmajor_scratch : nullptr;
-
-                if (d_scratch)
-                {
-                    if (!ensureRepackedWeightsForCK(
-                            rocm_kernel->impl_.get(), n, k, rocm_device_id_, gpu_stream_,
-                            "ROCmQuantisedGemmKernel::multiply_fused_tensor"))
-                    {
-                        all_success = false;
-                        break;
-                    }
-                    d_weights_int8 = d_scratch;
-                }
-
-                if (!d_weights_int8)
-                {
-                    LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Projection " << i << " weights not on device");
-                    all_success = false;
-                    break;
-                }
-
-                // M-padding logic for small batch sizes
-                const int padded_m = getPaddedM(m);
-                const bool needs_padding = needsMPadding(m);
-
-                // Ensure CK INT32 buffer
-                const size_t ck_int32_size = static_cast<size_t>(padded_m) * n;
-                if (ck_int32_size > rocm_kernel->impl_->d_CK_int32_capacity)
-                {
-                    if (rocm_kernel->impl_->d_CK_int32)
-                        rocmQuantGemm_freeDevice(rocm_kernel->impl_->d_CK_int32, rocm_device_id_);
-                    rocm_kernel->impl_->d_CK_int32 = nullptr;
-                    rocm_kernel->impl_->d_CK_int32_capacity = 0;
-
-                    if (!rocmQuantGemm_allocInt32(&rocm_kernel->impl_->d_CK_int32, ck_int32_size, rocm_device_id_))
-                    {
-                        LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Failed to allocate CK INT32 buffer for projection " << i);
-                        all_success = false;
-                        break;
-                    }
-                    rocm_kernel->impl_->d_CK_int32_capacity = ck_int32_size;
-                }
-
-                // Execute CK GEMM using SHARED quantized activations (M>1 only)
-                bool success = false;
-
-                if (d_bias)
-                {
-                    // When bias is present, use two-stage approach:
-                    // 1. executeNoScale → INT32
-                    // 2. applyScaling with bias → FP32
-
-                    if (needs_padding)
-                    {
-                        // Padding buffers come from workspace - no allocation needed
-                        // Use CACHED version to avoid hipMalloc/hipFree per call!
-                        success = runCKDispatch(
-                            [&]()
-                            {
-                                return rocmQuantGemm_executeTwoKernel_padded_cached(
-                                    impl_->d_A_int8,
-                                    d_weights_int8,
-                                    d_output,
-                                    impl_->d_scales_A,
-                                    d_scales_B,
-                                    rocm_kernel->impl_->d_CK_int32,
-                                    impl_->d_A_padded, impl_->d_scale_A_padded, impl_->d_E_padded,
-                                    m, padded_m, n, k, rocm_device_id_, gpu_stream_, rocm_kernel->impl_->ck_kernel_context);
-                            },
-                            "executeTwoKernel_padded_cached");
-
-                        if (success)
-                        {
-                            // Apply bias using GPU kernel (fast path)
-                            success = rocmQuantGemm_biasAdd(d_output, d_bias, m, n, rocm_device_id_, gpu_stream_);
-                            if (!success)
-                            {
-                                LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Bias add failed for projection " << i);
-                            }
-                        }
-                    }
-                    else
-                    {
-                        // Non-padded case: use executeNoScale + applyScaling with bias
-                        LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Projection " << i
-                                                                                                 << " BEFORE executeNoScale m=" << m << " n=" << n << " k=" << k
-                                                                                                 << " device=" << rocm_device_id_);
-                        success = runCKDispatch(
-                            [&]()
-                            {
-                                return rocmQuantGemm_executeNoScale(
-                                    impl_->d_A_int8,
-                                    d_weights_int8,
-                                    rocm_kernel->impl_->d_CK_int32,
-                                    m, n, k, rocm_device_id_, gpu_stream_, rocm_kernel->impl_->ck_kernel_context);
-                            },
-                            "executeNoScale");
-                        LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Projection " << i
-                                                                                                 << " AFTER executeNoScale success=" << success);
-
-                        if (success)
-                        {
-                            // Apply scaling with bias: output = C_int32 * scale_A * scale_B + bias
-                            LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Projection " << i
-                                                                                                     << " BEFORE applyScaling device=" << rocm_device_id_);
-                            success = rocmQuantGemm_applyScaling(
-                                rocm_kernel->impl_->d_CK_int32,
-                                d_output,
-                                impl_->d_scales_A,
-                                d_scales_B,
-                                m, n,
-                                1.0f, 0.0f,
-                                nullptr, // No existing C
-                                d_bias,  // Add bias
-                                rocm_device_id_, gpu_stream_);
-                            LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Projection " << i
-                                                                                                     << " AFTER applyScaling success=" << success);
-                        }
-                    }
-                }
-                else
-                {
-                    // No bias: use fast path
-                    if (needs_padding)
-                    {
-                        success = runCKDispatch(
-                            [&]()
-                            {
-                                return rocmQuantGemm_executeTwoKernel_padded_cached(
-                                    impl_->d_A_int8,
-                                    d_weights_int8,
-                                    d_output,
-                                    impl_->d_scales_A,
-                                    d_scales_B,
-                                    rocm_kernel->impl_->d_CK_int32,
-                                    impl_->d_A_padded, impl_->d_scale_A_padded, impl_->d_E_padded,
-                                    m, padded_m, n, k, rocm_device_id_, gpu_stream_, rocm_kernel->impl_->ck_kernel_context);
-                            },
-                            "executeTwoKernel_padded_cached");
-                    }
-                    else
-                    {
-                        success = runCKDispatch(
-                            [&]()
-                            {
-                                return rocmQuantGemm_executeTwoKernel_cached(
-                                    impl_->d_A_int8,
-                                    d_weights_int8,
-                                    d_output,
-                                    impl_->d_scales_A,
-                                    d_scales_B,
-                                    rocm_kernel->impl_->d_CK_int32,
-                                    m, n, k, rocm_device_id_, gpu_stream_, rocm_kernel->impl_->ck_kernel_context);
-                            },
-                            "executeTwoKernel_cached");
-                    }
-                }
-
-                if (!success)
-                {
-                    LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fused_tensor] CK GEMM failed for projection " << i);
-                    all_success = false;
-                    break;
-                }
-
-                LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Projection " << i << " complete");
+                // Native prefill failed and CK is retired — hard error.
+                LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Projection " << i
+                                                                                         << " native-VNNI prefill failed (m=" << m << " n=" << n << " k=" << k
+                                                                                         << "); CK fallback has been removed.");
+                all_success = false;
+                break;
             }
 
             // =========================================================================
@@ -4845,30 +3493,14 @@ namespace llaminar2
             reqs.buffers.push_back({GemmWorkspaceBuffers::TEMP_A_FP32, temp_a_fp32_bytes, 256, true});
             reqs.buffers.push_back({GemmWorkspaceBuffers::TEMP_C_FP32, temp_c_fp32_bytes, 256, true});
 
-            // ROCm-specific: M-padding buffers for CK when M < 8
-            // For CK INT32 accumulator, we need max(m, CK_MIN_M_FOR_EXPLICIT_PADDING) * n
-            // because direct execution uses m, padded uses CK_MIN_M_FOR_EXPLICIT_PADDING
-            const int effective_m_for_ck = std::max(m, CK_MIN_M_FOR_EXPLICIT_PADDING);
-            size_t ck_int32_bytes = static_cast<size_t>(effective_m_for_ck) * n * sizeof(int32_t);
-
-            // Padding buffers only need to fit padded_m=8 since padding is only used for M < 8
-            const int padded_m = CK_MIN_M_FOR_EXPLICIT_PADDING;
-            size_t a_padded_bytes = static_cast<size_t>(padded_m) * k * sizeof(int8_t);
-            size_t scale_a_padded_bytes = static_cast<size_t>(padded_m) * sizeof(float);
-            size_t e_padded_bytes = static_cast<size_t>(padded_m) * n * sizeof(float);
-
-            reqs.buffers.push_back({GemmWorkspaceBuffers::ROCM_CK_INT32, ck_int32_bytes, 256, true});
-            reqs.buffers.push_back({GemmWorkspaceBuffers::ROCM_A_PADDED, a_padded_bytes, 256, true});
-            reqs.buffers.push_back({GemmWorkspaceBuffers::ROCM_SCALE_A_PADDED, scale_a_padded_bytes, 256, true});
-            reqs.buffers.push_back({GemmWorkspaceBuffers::ROCM_E_PADDED, e_padded_bytes, 256, true});
-
-            // Option B: shared scratch buffer for VNNI→row-major repacking
-            // Sized to N×K for this kernel's weight matrix. The workspace manager
-            // allocates max(N×K) across all kernel instances, so the largest weight
-            // matrix (Gate/Up: 18944×3584 ≈ 65MB) determines the actual allocation.
-            // This buffer is reused across layers since they execute sequentially.
-            size_t repack_bytes = static_cast<size_t>(n) * k * sizeof(int8_t);
-            reqs.buffers.push_back({GemmWorkspaceBuffers::ROCM_B_REPACK, repack_bytes, 256, true});
+            // NOTE: CK (ComposableKernel) workspace buffers (ROCM_CK_INT32,
+            // ROCM_A_PADDED, ROCM_SCALE_A_PADDED, ROCM_E_PADDED, ROCM_B_REPACK)
+            // are intentionally NOT requested. The CK dispatch path is being
+            // retired — all quantized prefill now routes through native-VNNI
+            // (≤6-bit) or INT8-VNNI (8-bit) kernels, neither of which needs
+            // the CK scratch. The legacy CK dispatch code still exists in this
+            // file but is no longer reachable in normal execution. This saves
+            // up to N×K bytes (≈1.27 GB for a Q4_K LM head).
 
             // Scatter+reduce partial buffer: KB_MAX × N × sizeof(float)
             // KB_MAX=64 is the maximum k-blocks the scatter dispatch can produce.
@@ -4884,9 +3516,7 @@ namespace llaminar2
                       << "scales_a=" << (scales_a_bytes) << "B, "
                       << "scales_a_blockwise=" << (scales_a_blockwise_bytes) << "B"
                       << " (blocks_per_row=" << blocks_per_row << "), "
-                      << "acc=" << (acc_int32_bytes / 1024) << "KB, "
-                      << "ck_int32=" << (ck_int32_bytes / 1024) << "KB (padded), "
-                      << "repack=" << (repack_bytes / 1024) << "KB");
+                      << "acc=" << (acc_int32_bytes / 1024) << "KB");
 
             return reqs;
         }
@@ -4940,17 +3570,8 @@ namespace llaminar2
                 if (upload_it == packed_->device_uploads.end())
                 {
                     ROCmPackedWeights::DeviceUpload upload;
-                    const auto startup_repack_cfg = getROCmStartupRepackPipelineConfig();
-                    // Architectural direction: startup preparation is VNNI-only.
-                    // Disable CK startup row-major repack orchestration (async streams/events)
-                    // while preserving runtime fallback behavior.
-                    const bool startup_repack_enabled = false;
 
-                    // Option B: Upload ONLY VNNI layout + scales to device.
-                    // Row-major weights are repacked on-demand from VNNI into a
-                    // shared workspace scratch buffer for CK GEMM prefill.
-
-                    // Upload scales
+                    // Upload only VNNI layout + scales to device.
                     rocmQuantGemm_setDevice(rocm_device_id_);
 
                     // Create a dedicated H2D upload stream for this weight.
@@ -4976,51 +3597,16 @@ namespace llaminar2
                         }
                     }
 #endif
-                    if (startup_repack_enabled && !async_upload_enabled)
-                    {
-                        async_upload_enabled = ensureStartupStreamsAndEvents(
-                            upload,
-                            startup_repack_cfg,
-                            "ROCmQuantisedGemmKernel::ensureWeightsConverted");
-                    }
 
                     auto cleanup_startup_async_resources = [&upload, &h2d_upload_stream]()
                     {
 #ifdef HAVE_ROCM
-                        upload.startup_h2d_event_pending = false;
-                        upload.startup_repack_event_pending = false;
-                        upload.startup_commit_event_pending = false;
                         freeStartupPinnedStaging(upload);
-                        if (upload.startup_h2d_done_event)
-                        {
-                            hipEventDestroy(reinterpret_cast<hipEvent_t>(upload.startup_h2d_done_event));
-                            upload.startup_h2d_done_event = nullptr;
-                        }
-                        if (upload.startup_repack_ready_event)
-                        {
-                            hipEventDestroy(reinterpret_cast<hipEvent_t>(upload.startup_repack_ready_event));
-                            upload.startup_repack_ready_event = nullptr;
-                        }
-                        if (upload.startup_commit_ready_event)
-                        {
-                            hipEventDestroy(reinterpret_cast<hipEvent_t>(upload.startup_commit_ready_event));
-                            upload.startup_commit_ready_event = nullptr;
-                        }
-                        if (upload.startup_commit_stream && upload.startup_commit_stream != upload.startup_repack_stream)
-                        {
-                            hipStreamDestroy(reinterpret_cast<hipStream_t>(upload.startup_commit_stream));
-                        }
-                        if (upload.startup_repack_stream && upload.startup_repack_stream != upload.startup_h2d_stream)
-                        {
-                            hipStreamDestroy(reinterpret_cast<hipStream_t>(upload.startup_repack_stream));
-                        }
                         if (upload.startup_h2d_stream)
                         {
                             hipStreamDestroy(reinterpret_cast<hipStream_t>(upload.startup_h2d_stream));
                         }
                         upload.startup_h2d_stream = nullptr;
-                        upload.startup_repack_stream = nullptr;
-                        upload.startup_commit_stream = nullptr;
                         h2d_upload_stream = nullptr;
 #endif
                     };
@@ -5107,7 +3693,9 @@ namespace llaminar2
                         // a persistent row-major copy per weight would double GPU
                         // memory usage (VNNI + row-major) and OOM on large models.
 
-                        // Upload native-VNNI payload + scales + mins (Q4_0, Q4_1, Q5_0, Q5_1, IQ4_NL)
+                        // Upload native-VNNI payload + scales + mins (Q4_0, Q4_1, Q5_0, Q5_1,
+                        // Q6_K, Q3_K, Q2_K, Q4_K, Q5_K, IQ4_NL, IQ4_XS, IQ3_S, IQ3_XXS,
+                        // IQ2_S, IQ2_XS, IQ2_XXS, IQ1_S, IQ1_M)
                         if (!packed_->native_vnni_payload.empty() && !packed_->native_vnni_scales.empty())
                         {
                             // Allocate payload buffer
@@ -5273,27 +3861,7 @@ namespace llaminar2
                         if (packed_->int8_data_vnni.empty() && packed_->native_vnni_payload.empty())
                         {
                             LOG_WARN("[ROCmQuantisedGemmKernel] No VNNI layout available. "
-                                     "ROCm GEMV/CK prefill paths may not work.");
-                        }
-
-                        if (async_upload_enabled && upload.startup_h2d_done_event)
-                        {
-#ifdef HAVE_ROCM
-                            const hipError_t h2d_record_err = hipEventRecord(
-                                reinterpret_cast<hipEvent_t>(upload.startup_h2d_done_event),
-                                reinterpret_cast<hipStream_t>(upload.startup_h2d_stream));
-                            if (h2d_record_err == hipSuccess)
-                            {
-                                upload.startup_h2d_event_pending = true;
-                            }
-                            else
-                            {
-                                LOG_WARN("[ROCmQuantisedGemmKernel] Failed to record startup H2D event: "
-                                         << hipGetErrorString(h2d_record_err)
-                                         << "; falling back to synchronous copy semantics");
-                                upload.startup_h2d_event_pending = false;
-                            }
-#endif
+                                     "ROCm GEMV prefill paths may not work.");
                         }
 
                         // Synchronize and destroy the per-weight H2D stream.
@@ -5313,31 +3881,6 @@ namespace llaminar2
                     }
 
                     {
-                        ScopedWeightLoadDetailTimer repack_timer("weights.gemm_pack.gpu_repack_stage");
-                        if (!launchStartupRowmajorRepackIfEnabled(
-                                upload,
-                                packed_->N,
-                                packed_->K,
-                                rocm_device_id_,
-                                startup_repack_cfg,
-                                "ROCmQuantisedGemmKernel::ensureWeightsConverted"))
-                        {
-                            LOG_WARN("[ROCmQuantisedGemmKernel] Startup GPU row-major repack launch failed; continuing with runtime repack fallback");
-                        }
-                    }
-
-                    {
-                        ScopedWeightLoadDetailTimer commit_timer("weights.gemm_pack.commit_stage");
-                        if (!launchStartupCommitIfEnabled(
-                                upload,
-                                startup_repack_cfg,
-                                "ROCmQuantisedGemmKernel::ensureWeightsConverted"))
-                        {
-                            LOG_WARN("[ROCmQuantisedGemmKernel] Startup GPU commit stage launch failed; continuing with repack readiness event fallback");
-                        }
-                    }
-
-                    {
                         ScopedWeightLoadDetailTimer commit_timer("weights.gemm_pack.commit_publish");
                         auto emplaced = packed_->device_uploads.emplace(rocm_device_id_, upload);
                         upload_it = emplaced.first;
@@ -5346,29 +3889,23 @@ namespace llaminar2
                     LOG_DEBUG("[ROCmQuantisedGemmKernel] Uploaded pre-packed weights to ROCm:" << rocm_device_id_
                                                                                                << " " << packed_->N << "x" << packed_->K
                                                                                                << " vnni=" << (packed_->int8_data_vnni.size() / 1024) << " KB"
-                                                                                               << " (VNNI-only, row-major via scratch repack)");
+                                                                                               << " (VNNI-only)");
                 }
 
                 {
                     ScopedWeightLoadDetailTimer commit_timer("weights.gemm_pack.commit_publish");
                     auto &upload = upload_it->second;
                     packed_->d_int8_data_vnni = upload.d_int8_data_vnni;
-                    packed_->d_int8_data_rowmajor = upload.d_int8_data_rowmajor;
                     packed_->d_scales = upload.d_scales;
                     packed_->d_native_vnni_payload = upload.d_native_vnni_payload;
                     packed_->d_native_vnni_scales = upload.d_native_vnni_scales;
                     packed_->d_native_vnni_mins = upload.d_native_vnni_mins;
                     packed_->d_native_vnni_emins = upload.d_native_vnni_emins;
-                    packed_->startup_repack_ready_event = upload.startup_repack_ready_event;
-                    packed_->startup_repack_event_pending = upload.startup_repack_event_pending;
-                    packed_->startup_commit_ready_event = upload.startup_commit_ready_event;
-                    packed_->startup_commit_event_pending = upload.startup_commit_event_pending;
                     packed_->uploaded = true;
                     packed_->rocm_device_id = rocm_device_id_;
 
                     // Point impl_ to packed_ device pointers
                     impl_->d_weights_int8_vnni = upload.d_int8_data_vnni;
-                    impl_->d_weights_int8_rowmajor = upload.d_int8_data_rowmajor;
                     impl_->d_scales_B = upload.d_scales;
                     impl_->d_weights_native_vnni = upload.d_native_vnni_payload;
                     impl_->d_weights_native_scales = upload.d_native_vnni_scales;
@@ -5377,10 +3914,6 @@ namespace llaminar2
                     impl_->native_vnni_codebook_id = packed_->native_vnni_codebook_id;
                     impl_->native_vnni_blocks_per_row = packed_->native_vnni_blocks_per_row;
                     impl_->has_native_vnni = (upload.d_native_vnni_payload != nullptr && upload.d_native_vnni_scales != nullptr);
-                    impl_->startup_repack_ready_event = upload.startup_repack_ready_event;
-                    impl_->startup_repack_event_pending = upload.startup_repack_event_pending;
-                    impl_->startup_commit_ready_event = upload.startup_commit_ready_event;
-                    impl_->startup_commit_event_pending = upload.startup_commit_event_pending;
                     impl_->startup_h2d_pinned_scales = upload.startup_h2d_pinned_scales;
                     impl_->startup_h2d_pinned_vnni = upload.startup_h2d_pinned_vnni;
                     impl_->startup_h2d_pinned_native_vnni = upload.startup_h2d_pinned_native_vnni;
@@ -5644,31 +4177,9 @@ namespace llaminar2
                 throw std::runtime_error(
                     "[ROCmQuantisedGemmKernel] Workspace missing required buffer: TEMP_C_FP32");
             }
-            if (!workspace_->hasBuffer(GemmWorkspaceBuffers::ROCM_CK_INT32))
-            {
-                throw std::runtime_error(
-                    "[ROCmQuantisedGemmKernel] Workspace missing required buffer: ROCM_CK_INT32");
-            }
-            if (!workspace_->hasBuffer(GemmWorkspaceBuffers::ROCM_A_PADDED))
-            {
-                throw std::runtime_error(
-                    "[ROCmQuantisedGemmKernel] Workspace missing required buffer: ROCM_A_PADDED");
-            }
-            if (!workspace_->hasBuffer(GemmWorkspaceBuffers::ROCM_SCALE_A_PADDED))
-            {
-                throw std::runtime_error(
-                    "[ROCmQuantisedGemmKernel] Workspace missing required buffer: ROCM_SCALE_A_PADDED");
-            }
-            if (!workspace_->hasBuffer(GemmWorkspaceBuffers::ROCM_E_PADDED))
-            {
-                throw std::runtime_error(
-                    "[ROCmQuantisedGemmKernel] Workspace missing required buffer: ROCM_E_PADDED");
-            }
-            if (!workspace_->hasBuffer(GemmWorkspaceBuffers::ROCM_B_REPACK))
-            {
-                throw std::runtime_error(
-                    "[ROCmQuantisedGemmKernel] Workspace missing required buffer: ROCM_B_REPACK");
-            }
+            // NOTE: CK-specific buffers (ROCM_CK_INT32, ROCM_A_PADDED,
+            // ROCM_SCALE_A_PADDED, ROCM_E_PADDED, ROCM_B_REPACK) are no
+            // longer requested — the CK path is retired. Skipped here.
             if (!workspace_->hasBuffer(GemmWorkspaceBuffers::ROCM_SCATTER_PARTIAL))
             {
                 throw std::runtime_error(
@@ -5676,33 +4187,18 @@ namespace llaminar2
             }
 
             // Populate impl_ pointers from workspace
-            const auto prev_repack_scratch = impl_->d_B_rowmajor_scratch;
             impl_->d_A_int8 = static_cast<int8_t *>(workspace_->getBuffer(GemmWorkspaceBuffers::QUANT_A));
             impl_->d_scales_A = static_cast<float *>(workspace_->getBuffer(GemmWorkspaceBuffers::SCALES_A));
             impl_->d_scales_A_blockwise = static_cast<float *>(workspace_->getBuffer(GemmWorkspaceBuffers::SCALES_A_BLOCKWISE));
             impl_->d_C_int32 = static_cast<int32_t *>(workspace_->getBuffer(GemmWorkspaceBuffers::ACC_INT32));
             impl_->d_A_fp32 = static_cast<float *>(workspace_->getBuffer(GemmWorkspaceBuffers::TEMP_A_FP32));
             impl_->d_C_fp32 = static_cast<float *>(workspace_->getBuffer(GemmWorkspaceBuffers::TEMP_C_FP32));
-            impl_->d_CK_int32 = static_cast<int32_t *>(workspace_->getBuffer(GemmWorkspaceBuffers::ROCM_CK_INT32));
-            impl_->d_A_padded = static_cast<int8_t *>(workspace_->getBuffer(GemmWorkspaceBuffers::ROCM_A_PADDED));
-            impl_->d_scale_A_padded = static_cast<float *>(workspace_->getBuffer(GemmWorkspaceBuffers::ROCM_SCALE_A_PADDED));
-            impl_->d_E_padded = static_cast<float *>(workspace_->getBuffer(GemmWorkspaceBuffers::ROCM_E_PADDED));
-            impl_->d_B_rowmajor_scratch = static_cast<int8_t *>(workspace_->getBuffer(GemmWorkspaceBuffers::ROCM_B_REPACK));
             impl_->d_scatter_partial = static_cast<float *>(workspace_->getBuffer(GemmWorkspaceBuffers::ROCM_SCATTER_PARTIAL));
-
-            if (impl_->d_B_rowmajor_scratch != prev_repack_scratch)
-            {
-                impl_->repack_cache_valid = false;
-            }
 
             // Set capacity values to max (workspace is pre-sized for maximum dimensions)
             // These are used by code paths that check capacity before use
             impl_->d_A_fp32_capacity = SIZE_MAX;
             impl_->d_C_fp32_capacity = SIZE_MAX;
-            impl_->d_CK_int32_capacity = SIZE_MAX;
-            impl_->d_A_padded_capacity = SIZE_MAX;
-            impl_->d_scale_A_padded_capacity = SIZE_MAX;
-            impl_->d_E_padded_capacity = SIZE_MAX;
 
             // Mark workspace as validated to skip re-validation on next call
             impl_->validated_workspace = workspace_;
@@ -6017,20 +4513,6 @@ namespace llaminar2
             ensureWeightsConverted();
             validateWorkspace();
 
-            // Option B: Repack VNNI→row-major into workspace scratch for CK GEMM
-            if (!impl_->d_weights_int8_vnni ||
-                !impl_->d_B_rowmajor_scratch)
-            {
-                LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32_with_bias] No VNNI weights or repack scratch for CK GEMM");
-                return false;
-            }
-            if (!ensureRepackedWeightsForCK(
-                    impl_.get(), n, k, rocm_device_id_, gpu_stream_,
-                    "ROCmQuantisedGemmKernel::multiply_fp32_to_fp32_with_bias"))
-            {
-                return false;
-            }
-
             // Step 1: Quantize FP32 activations to INT8 (blockwise)
             if (!rocmQuantGemm_quantizeActivationsBlockwise(
                     d_A, impl_->d_A_int8, impl_->d_scales_A_blockwise, m, k, rocm_device_id_, gpu_stream_))
@@ -6094,45 +4576,12 @@ namespace llaminar2
                 return true;
             }
 
-            // Step 2+3: CK INT8 GEMM with scaling
-            // Fast path: fused two-kernel approach (GEMM + scaling in one cached dispatch)
-            // when no bias and standard alpha/beta. Otherwise, separate GEMM + scaling epilogue.
-            if (!d_bias && alpha == 1.0f && beta == 0.0f)
-            {
-                if (!rocmQuantGemm_executeTwoKernel_cached(
-                        impl_->d_A_int8, impl_->d_B_rowmajor_scratch,
-                        d_C,
-                        impl_->d_scales_A, impl_->d_scales_B,
-                        impl_->d_C_int32,
-                        m, n, k, rocm_device_id_, gpu_stream_, impl_->ck_kernel_context))
-                {
-                    LOG_ERROR("[ROCmQuantisedGemmKernel] CK two-kernel fused GEMM failed");
-                    return false;
-                }
-            }
-            else
-            {
-                // Separate GEMM → INT32, then scaling epilogue with bias/alpha/beta
-                if (!rocmQuantGemm_executeNoScale(
-                        impl_->d_A_int8, impl_->d_B_rowmajor_scratch, impl_->d_C_int32,
-                        m, n, k, rocm_device_id_, gpu_stream_, impl_->ck_kernel_context))
-                {
-                    LOG_ERROR("[ROCmQuantisedGemmKernel] CK NoScale GEMM failed");
-                    return false;
-                }
-
-                const float *d_C_existing = (beta != 0.0f) ? d_C : nullptr;
-                if (!rocmQuantGemm_applyScaling(
-                        impl_->d_C_int32, d_C, impl_->d_scales_A, impl_->d_scales_B,
-                        m, n, alpha, beta, d_C_existing, d_bias, rocm_device_id_, gpu_stream_))
-                {
-                    LOG_ERROR("[ROCmQuantisedGemmKernel] Scaling with bias failed");
-                    return false;
-                }
-            }
-
-            LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32_with_bias] Complete");
-            return true;
+            // CK fallback retired — native-VNNI / INT8-VNNI are the only supported paths.
+            LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32_with_bias] "
+                      "Native-VNNI and INT8-VNNI prefill both failed (m="
+                      << m
+                      << " n=" << n << " k=" << k << "); CK fallback has been removed.");
+            return false;
         }
 
         bool ROCmQuantisedGemmKernel::multiply_fp32_to_q8(

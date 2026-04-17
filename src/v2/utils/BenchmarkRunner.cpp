@@ -14,12 +14,15 @@
 #include "ROCmKernelProfiler.h"
 #include "WeightLoadingProfiler.h"
 #include "../execution/local_execution/graph/IGraphExecutor.h"
+#include "../backends/BackendManager.h"
+#include "../backends/IBackend.h"
 #include "fort.hpp"
 #include <iomanip>
 #include <print>
 #include <sstream>
 #include <mpi.h>
 #include <numeric>
+#include <cstdlib>
 
 namespace llaminar2
 {
@@ -27,6 +30,32 @@ namespace llaminar2
     // Number of benchmark iterations (after warmup)
     static constexpr int BENCHMARK_ITERATIONS = 3;
     static constexpr int WARMUP_ITERATIONS = 1;
+
+    // Log GPU memory on all GPUs (enabled via LLAMINAR_BENCH_MEM_LOG=1).
+    static void logGPUMemorySnapshot(const char *label)
+    {
+        static const bool enabled = std::getenv("LLAMINAR_BENCH_MEM_LOG") != nullptr;
+        if (!enabled)
+            return;
+
+        auto log_backend = [&](IBackend *b, const char *name) {
+            if (!b) return;
+            int n = b->deviceCount();
+            for (int i = 0; i < n; ++i) {
+                size_t free_b = b->deviceMemoryFree(i);
+                size_t total_b = b->deviceMemoryTotal(i);
+                if (total_b == 0) continue;
+                double free_mb = free_b / (1024.0 * 1024.0);
+                double total_mb = total_b / (1024.0 * 1024.0);
+                double used_mb = total_mb - free_mb;
+                LOG_INFO("[MemProbe] " << label << " " << name << ":" << i
+                                       << " used=" << std::fixed << std::setprecision(1) << used_mb
+                                       << " MB free=" << free_mb << " MB / " << total_mb << " MB");
+            }
+        };
+        log_backend(getCUDABackend(), "CUDA");
+        log_backend(getROCmBackend(), "ROCm");
+    }
 
     BenchmarkRunner::BenchmarkRunner(
         std::shared_ptr<IInferenceRunner> runner,
@@ -292,6 +321,7 @@ namespace llaminar2
 
         // Reset pipeline state before warmup
         runner_->clear_cache();
+        logGPUMemorySnapshot("before-warmup");
 
         // Suppress GPU stage timeline during warmup — warmup includes one-time costs
         // (weight H2D transfers, buffer allocation, kernel JIT) that inflate overhead
@@ -304,8 +334,7 @@ namespace llaminar2
         runner_->setSkipLogitsGatherPrefill(true);
 
         // Warmup prefill
-        auto [warmup_prefill_success, warmup_prefill_time] = runPrefill(tokens);
-        if (!warmup_prefill_success)
+        auto [warmup_prefill_success, warmup_prefill_time] = runPrefill(tokens);        if (!warmup_prefill_success)
         {
             if (mpi_ctx_->rank() == 0)
             {
@@ -336,6 +365,7 @@ namespace llaminar2
             LOG_INFO("");
             LOG_INFO("Running " << BENCHMARK_ITERATIONS << " benchmark iterations...");
         }
+        logGPUMemorySnapshot("after-warmup");
 
         // Reset profiling after warmup (only track actual benchmark iterations)
         if (KernelProfiler::isEnabled())
@@ -364,10 +394,13 @@ namespace llaminar2
         std::vector<int> decode_token_counts;
         std::string last_generated_text;
 
+        logGPUMemorySnapshot("pre-iter-loop");
+
         for (int iter = 0; iter < BENCHMARK_ITERATIONS; ++iter)
         {
             // Reset pipeline state before each iteration
             runner_->clear_cache();
+            logGPUMemorySnapshot(("after-clear-cache iter=" + std::to_string(iter + 1)).c_str());
 
             if (mpi_ctx_->rank() == 0)
             {
@@ -387,9 +420,11 @@ namespace llaminar2
                 {
                     LOG_ERROR("Prefill failed on iteration " << (iter + 1));
                 }
+                logGPUMemorySnapshot(("prefill-fail iter=" + std::to_string(iter + 1)).c_str());
                 return result;
             }
             prefill_times.push_back(prefill_time);
+            logGPUMemorySnapshot(("after-prefill iter=" + std::to_string(iter + 1)).c_str());
 
             // Run decode (if requested)
             if (n_decode > 0)
@@ -413,6 +448,7 @@ namespace llaminar2
                 decode_times.push_back(decode_time);
                 decode_token_counts.push_back(tokens_generated);
                 last_generated_text = generated_text;
+                logGPUMemorySnapshot(("after-decode iter=" + std::to_string(iter + 1)).c_str());
             }
 
             if (mpi_ctx_->rank() == 0)

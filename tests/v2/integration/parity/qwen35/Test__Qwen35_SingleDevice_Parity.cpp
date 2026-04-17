@@ -202,6 +202,58 @@ static const std::vector<TestConfig> kQwen35SingleDeviceConfigs = {
     },
 
     // =========================================================================
+    // Qwen3.5-27B (Q8_0) — dense 27B hybrid GDN+FA (64 layers)
+    //
+    // DIAGNOSTIC: Added to investigate 27B degenerate-loop behavior observed
+    // after the thinking block (`</think>`) in the server's chat-completion
+    // path, while llama.cpp with the same weights produces a clean essay.
+    //
+    // Thresholds intentionally loose — goal is to observe which layer /
+    // stage first diverges from PyTorch FP32 reference. Narrow once baseline
+    // numbers are known.
+    // =========================================================================
+    {
+        .name = "Qwen35_27B_CPU_KV_FP16",
+        .devices = {ParityDeviceType::CPU},
+        .parallelism = Parallelism::None,
+        .collective = Collective::None,
+        .thresholds = {
+            .cosine_threshold = 0.90f,        // Diagnostic — narrow after baseline
+            .decode_cosine_threshold = 0.85f, // Decode: expect some GDN drift
+            .early_layers_count = 8,
+            .min_early_layers_passed = 4, // Lenient — diagnostic
+            .kl_threshold = 0.20f,        // Lenient — characterize, not gate
+            .min_top1_accuracy = 40.0f,
+            .min_top5_accuracy = 60.0f,
+            .pytorch_top1_in_topk = 0, // Disabled — diagnostic
+        },
+        .model_path = "models/Qwen3.5-27B-Q8_0.gguf",
+        .snapshot_dir = "pytorch_qwen35_27b_snapshots",
+        .activation_precision = ActivationPrecision::FP32,
+        .kv_cache_precision = KVCachePrecision::FP16,
+    },
+    {
+        .name = "Qwen35_27B_CPU_KV_Q8_1",
+        .devices = {ParityDeviceType::CPU},
+        .parallelism = Parallelism::None,
+        .collective = Collective::None,
+        .thresholds = {
+            .cosine_threshold = 0.90f,
+            .decode_cosine_threshold = 0.85f,
+            .early_layers_count = 8,
+            .min_early_layers_passed = 4,
+            .kl_threshold = 0.20f,
+            .min_top1_accuracy = 40.0f,
+            .min_top5_accuracy = 60.0f,
+            .pytorch_top1_in_topk = 0,
+        },
+        .model_path = "models/Qwen3.5-27B-Q8_0.gguf",
+        .snapshot_dir = "pytorch_qwen35_27b_snapshots",
+        .activation_precision = ActivationPrecision::FP32,
+        .kv_cache_precision = KVCachePrecision::Q8_1,
+    },
+
+    // =========================================================================
     // Qwen3.5-4B Extended Decode (20 steps)
     //
     // Tests decode parity over 20 tokens to detect GDN state drift that may

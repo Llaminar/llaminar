@@ -173,7 +173,7 @@ namespace llaminar2
         const float *lastLogits() const override;
         void setStopTokens(const std::vector<int32_t> &stop_tokens) override;
         std::shared_ptr<ITokenizer> tokenizer() const override;
-
+        const std::string &architecture() const override;
         // =====================================================================
         // IOrchestrationRunner: Snapshot API
         // =====================================================================

@@ -406,18 +406,23 @@ namespace llaminar2
         rec_params.chunk_size = 64;
         rec_params.use_qk_l2norm = true;
 
-        // Under TP with GDN modular repeat (repeat_type=1), Q/K are replicated
-        // while V is sharded contiguously. The global_v_head_offset tells the
-        // recurrence stage which global V-heads this rank owns, so it can select
-        // the correct K-heads: k_head = (v_local + offset) % n_k_heads_global.
-        if (mpi_ctx_ && mpi_ctx_->world_size() > 1 && n_k_heads > n_v_heads)
+        // Under TP, V-heads are always sharded (each rank owns a contiguous
+        // slice of global V-heads). The global_v_head_offset tells the
+        // recurrence stage which global V-heads this rank owns, so the
+        // deinterleave helper can select the correct K-heads:
+        //   k_idx = (v_local + offset) % n_k_heads_local
+        //
+        // This is required in ALL TP modes where V is sharded:
+        //   - Selection   (n_k > n_v_local):  K sharded alongside V
+        //   - Identity    (n_k == n_v_local, K replicated at full count)
+        //   - Expansion   (n_k < n_v_local):  K replicated, modular GQA repeat
+        //                                     (e.g. 27B TP=2: n_k=16, n_v_local=24)
+        //
+        // V is sharded whenever n_v_heads < n_v_heads_full. Previously the
+        // expansion case was missed, leaving rank>0 with offset=0 and reading
+        // the wrong K-heads for its V-head slice.
+        if (mpi_ctx_ && mpi_ctx_->world_size() > 1 && n_v_heads < n_v_heads_full)
         {
-            rec_params.global_v_head_offset = mpi_ctx_->rank() * n_v_heads;
-        }
-        else if (mpi_ctx_ && mpi_ctx_->world_size() > 1 && n_k_heads == n_v_heads && n_k_heads == n_k_heads_full)
-        {
-            // n_k == n_v_local (e.g. TP=2 with 4B: 16 k_heads, 16 v_heads_local)
-            // Identity mapping for rank 0, rotation for other ranks
             rec_params.global_v_head_offset = mpi_ctx_->rank() * n_v_heads;
         }
 

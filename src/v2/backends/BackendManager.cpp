@@ -17,8 +17,7 @@
 
 #ifdef HAVE_ROCM
 #include "rocm/ROCmBackend.h"
-#include "../kernels/rocm/gemm/HipBLASGemmKernel.h"       // For registerHipBLASGemmKernelFactory
-#include "../kernels/rocm/gemm/ROCmQuantisedGemmKernel.h" // For rocmQuantGemm_warmupKernels
+#include "../kernels/rocm/gemm/HipBLASGemmKernel.h" // For registerHipBLASGemmKernelFactory
 #endif
 
 #include <mutex>
@@ -70,10 +69,6 @@ namespace llaminar2
 
             // Register hipBLAS GEMM kernel factory for DeviceKernelCache
             rocm::registerHipBLASGemmKernelFactory();
-
-            // Pre-initialize CK INT8 GEMM kernels to avoid first-call latency
-            // This takes ~15-20 seconds on gfx906 but happens at startup, not during inference
-            rocmQuantGemm_warmupKernels();
 #else
             g_rocm_backend = nullptr;
             LOG_DEBUG("[BackendManager] ROCm backend not available (HAVE_ROCM not defined)");

@@ -98,6 +98,16 @@ namespace llaminar2
             static bool isForceCutlassFallback();
 
             /**
+             * @brief Release all per-device shared CUDAConcurrentPrefillPool
+             *        singletons (CUDA streams, events, and scratch buffers).
+             *
+             * The pool is shared across kernel instances on the same device, so it
+             * must be torn down when KernelFactory::clearCache() runs to avoid
+             * leaking static state between test runs / orchestrator resets.
+             */
+            static void clearSharedPrefillPools();
+
+            /**
              * @brief Construct kernel for quantized weight tensor (lazy conversion)
              *
              * @param weights Any quantized tensor (must be on GPU)
@@ -472,8 +482,9 @@ namespace llaminar2
             // GPU stream for graph capture (nullptr = default stream)
             void *gpu_stream_ = nullptr;
 
-            // Per-kernel concurrent prefill stream pool (owns CUDA streams + scratch)
-            std::unique_ptr<CUDAConcurrentPrefillPool> prefill_pool_;
+            // Concurrent prefill pool is a per-device shared singleton (see
+            // getSharedCUDAPrefillPool in CUDAQuantisedGemmKernel.cpp) to avoid
+            // allocating duplicate scratch buffers per kernel instance.
 
             // PIMPL for CUTLASS implementation (definition in .cpp)
             std::unique_ptr<Impl> impl_;

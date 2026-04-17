@@ -545,7 +545,11 @@ __device__ __forceinline__ void iq_decode_accumulate_block(
 // ============================================================================
 // Native-VNNI GEMV kernel: lossless decode with per-block FP16 scales
 //
-// Supports Q4_0, Q4_1, Q5_0, Q5_1, IQ4_NL via compile-time NativeVNNIFormat tag.
+// Supports all ≤6-bit quantized formats via compile-time NativeVNNIFormat tag:
+//   Q-quants:  Q4_0, Q4_1, Q5_0, Q5_1
+//   K-quants:  Q2_K, Q3_K, Q4_K (Q4_1-like), Q5_K (Q5_1-like), Q6_K
+//   IQ-quants: IQ4_NL, IQ4_XS (IQ4_NL-like), IQ3_S, IQ3_XXS,
+//              IQ2_S, IQ2_XS, IQ2_XXS, IQ1_S, IQ1_M
 //
 // Symmetric formats (Q4_0, Q5_0, IQ4_NL):
 //   int32_block = Σ sdot4(a_packed, w_packed)   // 8 sdot4 calls

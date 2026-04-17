@@ -250,6 +250,14 @@ namespace llaminar2
          */
         virtual std::shared_ptr<ITokenizer> tokenizer() const = 0;
 
+        /**
+         * @brief Get the model architecture string (e.g., "qwen2", "qwen35")
+         *
+         * Returned string is valid for the lifetime of the runner. Empty when
+         * the runner has not yet been initialized or does not know its arch.
+         */
+        virtual const std::string &architecture() const = 0;
+
         // =====================================================================
         // Snapshot Capture (for parity testing)
         // =====================================================================
