@@ -1,0 +1,51 @@
+name: Branch policy — master merges only from develop
+
+# Acts as a required status check on PRs targeting master. Fails unless the
+# head branch is exactly `develop` (release-please autorelease branches land
+# on master via a GitHub App bot path handled by release-please itself, which
+# is allowed below). Pair with a ruleset that makes this check required.
+
+on:
+  pull_request:
+    branches: [master]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  enforce-source-branch:
+    name: Only develop may merge to master
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Validate head_ref
+        env:
+          HEAD_REF: ${{ github.head_ref }}
+          BASE_REF: ${{ github.base_ref }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          BASE_REPO: ${{ github.event.pull_request.base.repo.full_name }}
+        run: |
+          echo "PR: ${HEAD_REPO}:${HEAD_REF} -> ${BASE_REPO}:${BASE_REF}"
+
+          # Forks are not allowed to target master at all.
+          if [ "${HEAD_REPO}" != "${BASE_REPO}" ]; then
+            echo "::error::PRs from forks may not target master. Open the PR against develop instead."
+            exit 1
+          fi
+
+          # Allow release-please's autorelease branches (they reconcile the
+          # release PR / changelog into master as the final step of a release).
+          case "${HEAD_REF}" in
+            develop)
+              echo "Source branch is develop — allowed."
+              exit 0
+              ;;
+            release-please--branches--master*)
+              echo "Source branch is a release-please autorelease branch — allowed."
+              exit 0
+              ;;
+            *)
+              echo "::error::master only accepts PRs from develop (got: ${HEAD_REF}). Retarget your PR to develop."
+              exit 1
+              ;;
+          esac

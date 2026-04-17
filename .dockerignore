@@ -1,0 +1,78 @@
+# Build artefacts
+build/
+build_*/
+install/
+out/
+.git/
+.vs/
+.vscode/
+.venv/
+.devcontainer/
+venv/
+
+# Core dumps & profiling artefacts
+core
+core.*
+gpucore
+gpucore.*
+*.cubin
+*.nsys-rep
+*.ncu-rep
+*.qdrep
+
+# Test / benchmark outputs
+results.*
+gemm_tuning_results.csv
+gemv_tile_occupancy*.csv
+rocm_worker*.csv
+vnni_only_ab.csv
+perf.data*
+tests/v2/integration/parity/results/
+attention_dumps/
+artifacts/
+
+# Large model files — NEVER bake into the image
+models/
+*.gguf
+*.safetensors
+*.bin
+
+# Python / node caches
+__pycache__/
+*.pyc
+*.pyo
+node_modules/
+
+# Editor cruft
+.DS_Store
+.idea/
+*.swp
+*.swo
+*~
+
+# Logs
+*.log
+logs/
+
+# Docs / markdown not needed in image
+docs/
+changelog/
+README.md
+HANDOVER_*.md
+
+# Scripts not needed at runtime
+*.sh
+run_llaminar*
+test_pytorch_parity.sh
+install_onednn.sh
+
+# Python scripts at repo root (debug/analysis helpers)
+debug_*.py
+analyze_*.py
+inspect_*.py
+playground_*.py
+
+# Random text artefacts
+check_p2p.cpp
+test_rccl_init.cpp
+requirements.txt

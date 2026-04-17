@@ -1,0 +1,293 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [develop, master]
+  push:
+    branches: [develop]
+  workflow_call:
+    inputs:
+      image-tag:
+        description: "Tag to use when referring to the Llaminar image produced by this workflow"
+        required: false
+        type: string
+        default: ci
+    outputs:
+      image-ref:
+        description: "Full image reference (registry/owner/name:tag) that was built"
+        value: ${{ jobs.docker-build.outputs.image-ref }}
+
+# Cancel stale runs for the same branch / PR.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  MODELS_DIR: /opt/llaminar-models
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Gate 1: Unit tests (Integration build on GPU self-hosted runner — exercises
+  # CUDA/ROCm unit tests). github-hosted runners cannot build the full tree
+  # since it requires CUDAToolkit + hipblas + NCCL.
+  # ---------------------------------------------------------------------------
+  unit-tests:
+    name: Unit tests
+    runs-on: [self-hosted, linux, x64, llaminar-bench]
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure (Integration)
+        run: |
+          cmake -B build_v2_integration -S src/v2 -G Ninja \
+            -DCMAKE_BUILD_TYPE=Integration \
+            -DHAVE_CUDA=ON -DHAVE_ROCM=ON
+
+      - name: Build
+        run: cmake --build build_v2_integration --parallel
+
+      - name: Run V2_Unit_* (parallel)
+        run: |
+          ctest --test-dir build_v2_integration \
+                --output-on-failure \
+                --parallel \
+                -R '^V2_Unit_'
+
+      - name: Upload ctest logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: unit-test-logs
+          path: |
+            build_v2_integration/Testing/Temporary/LastTest.log
+          if-no-files-found: ignore
+          retention-days: 14
+
+  # ---------------------------------------------------------------------------
+  # Gate 2: PyTorch parity integration tests (Qwen2 + Qwen3.5, single-device
+  # and node-local TP). Needs models staged at ${MODELS_DIR}.
+  # ---------------------------------------------------------------------------
+  parity-tests:
+    name: PyTorch parity
+    needs: unit-tests
+    runs-on: [self-hosted, linux, x64, llaminar-bench]
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Stage models
+        run: |
+          if [ ! -d "${MODELS_DIR}" ]; then
+            echo "::error::Models directory ${MODELS_DIR} not found on runner. Populate it with the GGUF weights referenced by the parity tests."
+            exit 1
+          fi
+          ln -snf "${MODELS_DIR}" models
+          ls -1 models | head
+
+      - name: Build Integration
+        run: |
+          cmake -B build_v2_integration -S src/v2 -G Ninja \
+            -DCMAKE_BUILD_TYPE=Integration \
+            -DHAVE_CUDA=ON -DHAVE_ROCM=ON
+          cmake --build build_v2_integration --parallel
+
+      - name: Qwen2 SingleDevice parity
+        run: |
+          ctest --test-dir build_v2_integration --output-on-failure --timeout 900 \
+                -R '^V2_Integration_Parity_Qwen2_SingleDevice$'
+
+      - name: Qwen35 SingleDevice parity (08B only)
+        env:
+          GTEST_FILTER: "*08B*"
+        run: |
+          ctest --test-dir build_v2_integration --output-on-failure --timeout 900 \
+                -R '^V2_Integration_Parity_Qwen35_SingleDevice$'
+
+      - name: Qwen2 NodeLocalTP parity
+        run: |
+          ctest --test-dir build_v2_integration --output-on-failure --timeout 900 \
+                -R '^V2_Integration_Parity_NodeLocalTP$'
+
+      - name: Qwen35 NodeLocalTP parity (08B only)
+        env:
+          GTEST_FILTER: "*08B*"
+        run: |
+          ctest --test-dir build_v2_integration --output-on-failure --timeout 900 \
+                -R '^V2_Integration_Parity_Qwen35_NodeLocalTP$'
+
+      - name: Upload parity CSV artefacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: parity-results
+          path: tests/v2/integration/parity/results/
+          if-no-files-found: ignore
+          retention-days: 14
+
+  # ---------------------------------------------------------------------------
+  # Gate 3: Docker build (github-hosted — fast, exercises the Dockerfile).
+  # Builds a multi-stage CUDA runtime image, pushes to GHCR on push events so
+  # downstream jobs can pull it. On pull_request events we only build (no push).
+  # ---------------------------------------------------------------------------
+  docker-build:
+    name: Docker build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    outputs:
+      image-ref: ${{ steps.meta.outputs.tags }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free runner disk
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
+          df -h /
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve image tags / metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=pr,prefix=pr-
+            type=ref,event=branch
+            type=sha,format=short
+            type=raw,value=${{ inputs.image-tag || 'ci' }},enable=${{ inputs.image-tag != '' }}
+
+      - name: Build (and push on non-PR)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          push: ${{ github.event_name != 'pull_request' }}
+          load: ${{ github.event_name == 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            VERSION=${{ github.ref_name }}
+            VCS_REF=${{ github.sha }}
+            BUILD_DATE=${{ github.event.repository.updated_at }}
+
+  # ---------------------------------------------------------------------------
+  # Gate 4: E2E server tests. Boots the server (via the Integration build on
+  # the runner, not the Docker image — the E2E script drives the binary
+  # directly for fine-grained kill/restart control) and drives it with curl.
+  # ---------------------------------------------------------------------------
+  e2e-tests:
+    name: E2E server tests
+    needs: [unit-tests, docker-build]
+    runs-on: [self-hosted, linux, x64, llaminar-bench]
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Stage models
+        run: |
+          if [ ! -d "${MODELS_DIR}" ]; then
+            echo "::error::Models directory ${MODELS_DIR} not found on runner."
+            exit 1
+          fi
+          ln -snf "${MODELS_DIR}" models
+
+      - name: Build Integration
+        run: |
+          cmake -B build_v2_integration -S src/v2 -G Ninja \
+            -DCMAKE_BUILD_TYPE=Integration \
+            -DHAVE_CUDA=ON -DHAVE_ROCM=ON
+          cmake --build build_v2_integration --parallel
+
+      - name: Run E2E server tests
+        run: |
+          tests/v2/e2e/server/test_server_e2e.sh \
+            --binary build_v2_integration/llaminar2 \
+            --backends "cpu,cuda:0,rocm:0"
+
+      - name: Upload E2E logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-logs
+          path: /tmp/srv_*.log
+          if-no-files-found: ignore
+          retention-days: 14
+
+  # ---------------------------------------------------------------------------
+  # Gate 5: Performance regression gate. Uses the existing
+  # .githooks/run_benchmark_check.sh ratchet — ratchets stay in the baseline
+  # JSON (agents are forbidden to edit thresholds without human approval).
+  # ---------------------------------------------------------------------------
+  perf-regression:
+    name: Performance regression
+    needs: unit-tests
+    runs-on: [self-hosted, linux, x64, llaminar-bench]
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Stage models
+        run: |
+          if [ ! -d "${MODELS_DIR}" ]; then
+            echo "::error::Models directory ${MODELS_DIR} not found on runner."
+            exit 1
+          fi
+          ln -snf "${MODELS_DIR}" models
+
+      - name: Run benchmark ratchet
+        run: .githooks/run_benchmark_check.sh
+
+      - name: Upload benchmark output on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-logs
+          path: |
+            build_v2_release/benchmark_*.log
+            .githooks/benchmark_baseline.json
+          if-no-files-found: ignore
+          retention-days: 30
+
+  # ---------------------------------------------------------------------------
+  # Aggregate gate. Lets branch protection require a single "CI" check instead
+  # of every job individually (easier to manage, still enforces all gates).
+  # ---------------------------------------------------------------------------
+  ci-complete:
+    name: CI complete
+    if: always()
+    needs: [unit-tests, parity-tests, docker-build, e2e-tests, perf-regression]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Verify all gates passed
+        run: |
+          results='${{ toJSON(needs) }}'
+          echo "$results" | python3 -c '
+          import json, sys
+          data = json.load(sys.stdin)
+          failed = [k for k, v in data.items() if v.get("result") not in ("success", "skipped")]
+          for k, v in data.items():
+              print(f"  {k}: {v.get(\"result\")}")
+          if failed:
+              print(f"\nFAILED gates: {failed}", file=sys.stderr)
+              sys.exit(1)
+          print("\nAll gates passed.")
+          '
