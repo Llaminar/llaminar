@@ -8,3 +8,5 @@ rccl/
 # amdgpu DKMS - auto-cloned from our fork with P2P fix for PCIe switches on mainline kernels
 # See: https://github.com/dbsanfte/amdgpu/tree/fix/pex-pcie-switch-p2p-enable
 amdgpu/
+# hf_transformers - cloned from dbsanfte/hf_transformers for parity testing
+hf_transformers/

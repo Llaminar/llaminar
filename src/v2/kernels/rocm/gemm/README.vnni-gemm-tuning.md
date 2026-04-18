@@ -832,7 +832,7 @@ cat results.stats.csv | column -t -s,
 
 | File | Purpose |
 |------|---------|
-| [ROCmQuantisedGemmKernel_CK.hip](ROCmQuantisedGemmKernel_CK.hip) | All V1–V7 kernel templates and dispatch functions |
+| [ROCmQuantisedGemmKernel.hip](ROCmQuantisedGemmKernel.hip) | All V1–V7 kernel templates, dispatch functions, and CK stubs |
 | [ROCmQuantisedGemmKernel.cpp](ROCmQuantisedGemmKernel.cpp) | Dispatch wiring (env var → kernel selection) |
 | [../../utils/DebugEnv.h](../../utils/DebugEnv.h) | Environment variable definitions |
 | [../../../../tests/v2/performance/kernels/rocm/Perf__ROCmPrefillDispatchComparison.cpp](../../../../tests/v2/performance/kernels/rocm/Perf__ROCmPrefillDispatchComparison.cpp) | Benchmark test |
