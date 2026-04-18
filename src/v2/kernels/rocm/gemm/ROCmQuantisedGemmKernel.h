@@ -3,9 +3,9 @@
 
 /**
  * @file ROCmQuantisedGemmKernel.h
- * @brief ROCm INT8 GEMM kernel for quantized tensors using AMD ComposableKernel (CK)
+ * @brief ROCm INT8 GEMM kernel for quantized tensors using native VNNI instructions
  *
- * Implements ITensorGemm using ComposableKernel (CK) INT8 GEMM for any quantized weight tensor.
+ * Implements ITensorGemm using native VNNI INT8 GEMM for any quantized weight tensor.
  * This is the ROCm counterpart to CUDAQuantisedGemmKernel (which uses CUTLASS).
  *
  * ## Design Overview
@@ -14,7 +14,7 @@
  * - **Supported Weight Types**: IQ4_NL, Q8_0, Q4_0, Q4_K, and all GGUF quantized formats
  * - **Weight Conversion**: Dequantize → re-quantize to symmetric INT8 with per-column scales
  * - **Activation Handling**: FP32 activations quantized on-the-fly with per-row scales
- * - **CK Backend**: DeviceGemmMultipleD_Dl for gfx906 (MI50/MI60)
+ * - **Backend**: Native VNNI wide-tile kernels for gfx906 (MI50/MI60)
  *
  * ## Type Dispatch Matrix
  *
@@ -27,7 +27,7 @@
  *
  * ## Memory Layout Convention
  *
- * This kernel uses **Row-Major layout for all matrices**, following CK's `mk_kn_mn` convention:
+ * This kernel uses **Row-Major layout for all matrices**:
  *
  * - **A (activations)**: [M × K] row-major, element A[m,k] at offset `m * K + k`
  * - **B (weights)**: [K × N] row-major, element B[k,n] at offset `k * N + n`
@@ -38,25 +38,11 @@
  *
  * ## Architecture Support
  *
- * | GPU Family | Architecture | CK Template Used       | Notes                    |
+ * | GPU Family | Architecture | Kernel Used            | Notes                    |
  * |------------|--------------|------------------------|-------------------------|
- * | MI50/MI60  | gfx906       | DeviceGemmMultipleD_Dl | DL instructions (4-way) |
- * | MI100      | gfx908       | DeviceGemmXdl          | MFMA (future)           |
- * | MI200/MI300| gfx90a/940a  | DeviceGemmXdl          | MFMA (future)           |
- *
- * ## References
- *
- * This implementation was developed using the following CK resources:
- *
- * - **Instance configuration**: device_gemm_dl_i8_i8_i8_mk_kn_mn_instance.cpp
- *   https://github.com/ROCm/composable_kernel/blob/develop/library/src/tensor_operation_instance/gpu/gemm_universal/device_gemm_dl_i8_i8_i8_mk_kn_mn_instance.cpp
- *
- * - **INT8 quantization example**: gemm_dl_quantization_int8.cpp
- *   https://github.com/ROCm/composable_kernel/blob/develop/example/14_gemm_quantization/gemm_dl_quantization_int8.cpp
- *
- * - **Key insight**: Tile parameters (ABlockTransfer*, BBlockTransfer*) are layout-specific.
- *   The `mk_kn_mn` suffix indicates Row,Row,Row layout; `km_kn_mn` indicates Col,Row,Row.
- *   Using wrong tile parameters causes incorrect numerical results without any error messages.
+ * | MI50/MI60  | gfx906       | INT8 VNNI wide-tile    | v_dot4_i32_i8 (4-way)   |
+ * | MI100      | gfx908       | (future)               | MFMA (future)           |
+ * | MI200/MI300| gfx90a/940a  | (future)               | MFMA (future)           |
  *
  * ## Usage Example
  *
@@ -315,7 +301,7 @@ namespace llaminar2
         bool packWeightsToROCm(const TensorBase *tensor, ROCmPackedWeights &out);
 
         /**
-         * @brief ROCm GEMM kernel for quantized weight tensors using ComposableKernel INT8
+         * @brief ROCm GEMM kernel for quantized weight tensors using native VNNI INT8
          *
          * Implements ITensorGemm for any quantized weight tensor type.
          *
@@ -806,7 +792,7 @@ namespace llaminar2
 } // namespace llaminar2
 
 // =====================================================================
-// Low-level CK GEMM Functions (exposed for benchmarking)
+// Low-level ROCm INT8 GEMM Functions (exposed for benchmarking)
 // =====================================================================
 //
 // NOTE: These are declared with C linkage to match the existing .cpp/.hip
@@ -816,24 +802,18 @@ namespace llaminar2
 extern "C"
 {
     /**
-     * @brief Pre-initialize all CK GEMM kernels to avoid first-call latency
+     * @brief No-op stub (ComposableKernel has been removed).
      *
-     * CK device objects are expensive to construct (5-10 seconds each on gfx906)
-     * due to template instantiation and GPU ISA checks. Call this function
-     * during backend initialization to avoid blocking on first inference call.
-     *
-     * Pre-initializes:
-     *   - 32x32 kernel (for decode, M <= 32)
-     *   - 64x64 kernel (for small batch, 32 < M < 128)
-     *   - 128x128 kernel (for prefill, M >= 128)
+     * Previously warmed up CK device objects. Now a no-op since the CK-backed
+     * fallback path has been replaced by native VNNI kernels.
      */
     void rocmQuantGemm_warmupKernels();
 
     /**
-     * @brief Execute Two-Kernel INT8 GEMM (CK NoScale + applyScales_kernel)
+     * @brief Execute Two-Kernel INT8 GEMM (NoScale + applyScales_kernel)
      *
      * This is the DEFAULT and RECOMMENDED path. It uses:
-     *   1. CK INT8×INT8→INT32 GEMM (executeNoScale)
+     *   1. INT8×INT8→INT32 GEMM (executeNoScale)
      *   2. Custom scale application kernel (applyScales_kernel)
      *
      * Achieves ~0.9999 cosine similarity vs reference.

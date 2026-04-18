@@ -431,68 +431,6 @@ if(HAVE_CUDA)
     endif()
 endif()
 
-# =============================================================================
-# ComposableKernel (CK) Auto-Clone for ROCm INT8 GEMM
-# =============================================================================
-# CK is AMD's template-based GPU kernel library. We use a fork that includes
-# fixes for gfx906 (MI50/MI60) GPUs which don't have MFMA instructions.
-# See: https://github.com/ROCm/composable_kernel/pull/3593
-if(HAVE_ROCM)
-    find_package(Git REQUIRED)
-
-    # Ensure CK exists in external/ and is on our fix branch
-    get_filename_component(REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
-    set(CK_EXTERNAL_DIR "${REPO_ROOT}/external/composable_kernel")
-    set(CK_GIT_URL "https://github.com/dbsanfte/composable_kernel.git")
-    # Track our fork's fix branch for gfx906 issues (OOB buffer loads, etc.)
-    set(CK_GIT_REF "gfx-906-issues")
-
-    if(NOT EXISTS "${REPO_ROOT}/external")
-        file(MAKE_DIRECTORY ${REPO_ROOT}/external)
-    endif()
-
-    if(NOT EXISTS "${CK_EXTERNAL_DIR}")
-        message(STATUS "V2: ComposableKernel not found in external/, cloning ${CK_GIT_URL} (${CK_GIT_REF})...")
-        execute_process(
-            COMMAND ${GIT_EXECUTABLE} clone --depth 1 --branch ${CK_GIT_REF}
-                ${CK_GIT_URL}
-                composable_kernel
-            WORKING_DIRECTORY ${REPO_ROOT}/external
-            RESULT_VARIABLE GIT_CLONE_RESULT
-            OUTPUT_VARIABLE GIT_CLONE_OUTPUT
-            ERROR_VARIABLE GIT_CLONE_ERROR
-            OUTPUT_STRIP_TRAILING_WHITESPACE
-            ERROR_STRIP_TRAILING_WHITESPACE
-        )
-
-        if(NOT GIT_CLONE_RESULT EQUAL 0)
-            message(FATAL_ERROR "V2: Failed to clone ComposableKernel: ${GIT_CLONE_ERROR}")
-        endif()
-
-        message(STATUS "V2: ComposableKernel ${CK_GIT_REF} cloned successfully")
-    else()
-        # Verify CK is on the expected branch (don't force-checkout, just warn if different)
-        execute_process(
-            COMMAND ${GIT_EXECUTABLE} rev-parse --abbrev-ref HEAD
-            WORKING_DIRECTORY ${CK_EXTERNAL_DIR}
-            RESULT_VARIABLE CK_BRANCH_RESULT
-            OUTPUT_VARIABLE CK_CURRENT_BRANCH
-            ERROR_VARIABLE CK_BRANCH_ERROR
-            OUTPUT_STRIP_TRAILING_WHITESPACE
-        )
-        if(CK_BRANCH_RESULT EQUAL 0)
-            if(NOT CK_CURRENT_BRANCH STREQUAL CK_GIT_REF)
-                message(WARNING "V2: ComposableKernel is on branch '${CK_CURRENT_BRANCH}', expected '${CK_GIT_REF}'. "
-                                "INT8 GEMM may not work correctly without the fix branch.")
-            else()
-                message(STATUS "V2: ComposableKernel already present at ${CK_EXTERNAL_DIR} on branch ${CK_GIT_REF}")
-            endif()
-        else()
-            message(STATUS "V2: ComposableKernel already present at ${CK_EXTERNAL_DIR}; leaving existing checkout untouched")
-        endif()
-    endif()
-endif()
-
 # amdgpu DKMS Auto-Clone for P2P Fix
 # =============================================================================
 # The upstream amdgpu DKMS (ROCm/amdgpu) gates CONFIG_HSA_AMD_P2P on
@@ -539,14 +477,9 @@ endif()
 
 # ROCm backend (separate .cpp compilation unit with HIP)
 if(HAVE_ROCM)
-    # Find ComposableKernel library (AMD's template-based GPU kernel library)
-    list(APPEND CMAKE_MODULE_PATH ${CMAKE_CURRENT_SOURCE_DIR}/cmake)
-    find_package(ComposableKernel QUIET)
-    
     # ROCm kernels compiled with hipcc
     set(ROCM_KERNEL_SOURCES
         kernels/rocm/gemm/ROCmQuantisedGemmKernel.hip           # Common INT8 GEMM utilities (quantization, scaling, memory)
-        kernels/rocm/gemm/ROCmQuantisedGemmKernel_CK.hip        # ComposableKernel INT8×INT8→INT32 GEMM dispatch
         kernels/rocm/gemm/ROCmQuantisedGemmKernel_INT8_VNNI.hip # INT8 VNNI wide-tile V3+V7 kernels (gfx906)
         kernels/rocm/gemm/ROCmGemvKernel.hip               # GEMV kernel suite documentation index (split into files below)
         kernels/rocm/gemm/ROCmGemvKernel_INT8_VNNI.hip    # INT8 VNNI GEMV/GEMM kernels for decode + prefill (gfx906)
@@ -634,15 +567,6 @@ if(HAVE_ROCM)
         message(STATUS "V2: RCCL will be loaded dynamically (dlopen) from rocm_backend for symbol isolation")
     endif()
     
-    # Link ComposableKernel if found
-    if(ComposableKernel_FOUND)
-        target_link_libraries(rocm_backend PUBLIC ComposableKernel::ComposableKernel)
-        target_compile_definitions(rocm_backend PUBLIC HAVE_COMPOSABLE_KERNEL)
-        message(STATUS "V2: ROCm backend using ComposableKernel for INT8 GEMM")
-    else()
-        message(WARNING "V2: ComposableKernel not found - ROCm INT8 GEMM will be disabled")
-    endif()
-    
     # Set HIP compiler for ROCm source files
     # NOTE: RCCLBackend.cpp, RCCLDynamicLoader.cpp, and RCCLBackendHIP.cpp are NOT
     # compiled with HIP because:
@@ -708,7 +632,7 @@ if(HAVE_ROCM)
     # Workaround: Build RCCL from source with explicit GPU_TARGETS for gfx906.
     # See: https://github.com/ROCm/rocm-systems/issues/2805
     #
-    # Like oneDNN and ComposableKernel, we clone to external/rccl if not present
+    # Like oneDNN, we clone to external/rccl if not present
     # and build locally. The build is cached based on git commit hash.
     find_package(Git REQUIRED)
     

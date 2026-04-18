@@ -1,8 +1,8 @@
 /**
  * @file ROCmQuantisedGemmKernel.cpp
- * @brief ITensorGemm adapter implementation for ComposableKernel INT8 quantized GEMM
+ * @brief ITensorGemm adapter implementation for ROCm INT8 quantized GEMM
  *
- * This is the C++ adapter that wraps the CK INT8 GEMM kernel. It implements
+ * This is the C++ adapter that wraps the ROCm INT8 GEMM kernels. It implements
  * the full ITensorGemm interface and can be compiled with the regular C++ compiler
  * (not hipcc), avoiding MPI/TensorKernels.h compilation issues with HIP headers.
  *
@@ -13,14 +13,9 @@
  *       │
  *       │ extern "C" function calls
  *       ▼
- * ROCmQuantisedGemmKernel_CK.hip (compiled with hipcc)
- *       │
- *       │ CK template instantiation (3-way dispatch)
- *       ▼
- * ComposableKernel DeviceGemmMultipleD_Dl (mk_nk_mn layout)
- *   - 32×32 kernel  for M ≤ 32  (decode: M=1 handled natively)
- *   - 64×64 kernel  for 32 < M < 128
- *   - 128×128 kernel for M ≥ 128 (prefill: peak throughput)
+ * ROCmQuantisedGemmKernel.hip + ROCmQuantisedGemmKernel_INT8_VNNI.hip
+ *   - VNNI INT8×INT8→INT32 GEMM (primary path)
+ *   - Common utilities (quantization, scaling, memory)
  * ```
  *
  * ## Weight Conversion Pipeline (packWeightsToROCm) - ONE-TIME AT LOAD
@@ -39,32 +34,27 @@
  *
  * ## Memory Layout Convention (mk_nk_mn - optimized for 128x128 tiles)
  *
- * | Matrix        | Shape    | Memory Layout | Element Access          | CK View         |
- * |---------------|----------|---------------|-------------------------|-----------------|
- * | Model Weights | [N × K]  | Row-Major     | W[n,k] = data[n*K + k]  | ColMajor [K×N]  |
- * | Activations   | [M × K]  | Row-Major     | A[m,k] = data[m*K + k]  | RowMajor [M×K]  |
- * | Output        | [M × N]  | Row-Major     | C[m,n] = data[m*N + n]  | RowMajor [M×N]  |
+ * | Matrix        | Shape    | Memory Layout | Element Access          |
+ * |---------------|----------|---------------|-------------------------|
+ * | Model Weights | [N × K]  | Row-Major     | W[n,k] = data[n*K + k]  |
+ * | Activations   | [M × K]  | Row-Major     | A[m,k] = data[m*K + k]  |
+ * | Output        | [M × N]  | Row-Major     | C[m,n] = data[m*N + n]  |
  *
  * Key insight: Model weights [N×K] Row-Major == Column-Major [K×N]!
- * No transpose needed - we just reinterpret the layout for CK's mk_nk_mn convention.
- * This enables 128×128 tile sizes (4x larger than mk_kn_mn) for ~2-4x speedup.
+ * No transpose needed - this enables 128×128 tile sizes for peak throughput.
  *
  * ## Two-Kernel Execution Path (PER-INFERENCE)
  *
  * Production path uses rocmQuantGemm_executeTwoKernel_cached():
  *   1. Upload FP32 activations to GPU (H2D)
  *   2. Quantize activations FP32→INT8 on GPU (rocmQuantGemm_quantizeActivationsBlockwise)
- *   3. CK INT8×INT8→INT32 GEMM (no scaling in kernel)
+ *   3. INT8×INT8→INT32 GEMM (no scaling in kernel)
  *   4. Separate applyScales_kernel: E[m,n] = C_int32[m,n] * scale_A[m] * scale_B[n]
  *   5. Download FP32 output to host (D2H)
  *
  * Activation quantization happens ON GPU every inference call - this is the
  * per-row symmetric quantization that produces INT8 activations + scales.
  *
- * The two-kernel GEMM approach is required because CK's fused D-tensor scaling
- * doesn't support the per-row × per-column broadcast pattern we need.
- *
- * @see ROCmQuantisedGemmKernel_CK.hip for HIP kernel implementation
  * @see ROCmQuantisedGemmKernel.h for class documentation
  *
  * @author David Sanftenberg
@@ -114,18 +104,18 @@ namespace llaminar2
         // Forward declarations for HIP implementation
         // =====================================================================
         //
-        // Functions are defined across three .hip files:
+        // Functions are defined across two .hip files:
         //   - ROCmQuantisedGemmKernel.hip      : Common kernels + utilities (quantization, scaling, memory)
-        //   - ROCmQuantisedGemmKernel_CK.hip   : CK INT8 GEMM dispatch + kernel context
         //   - ROCmQuantisedGemmKernel_INT8_VNNI.hip : VNNI prefill/decode kernels
         //
 
-        // These functions are implemented in ROCmQuantisedGemmKernel_CK.hip
+        // These functions are stubs now that ComposableKernel has been removed.
+        // The CK-backed INT8 GEMM path is superseded by native VNNI kernels.
         extern "C"
         {
-            // Create/destroy per-instance CK kernel context (eliminates global/static cache state)
-            void *rocmQuantGemm_createKernelContext(int rocm_device_id);                   // CK.hip
-            void rocmQuantGemm_destroyKernelContext(void *kernel_ctx, int rocm_device_id); // CK.hip
+            // CK kernel context stubs (no-ops without ComposableKernel)
+            void *rocmQuantGemm_createKernelContext(int rocm_device_id);
+            void rocmQuantGemm_destroyKernelContext(void *kernel_ctx, int rocm_device_id);
 
             // Upload converted INT8 weights to device (common .hip)
             bool rocmQuantGemm_uploadWeights(
@@ -154,8 +144,8 @@ namespace llaminar2
                 int rocm_device_id, void *stream,
                 int block_size = 32);
 
-            // Execute INT8 GEMM using CK with SEPARATE scaling (two-kernel approach)
-            // This runs CK for INT8→INT32 GEMM, then a separate kernel for scaling. (common .hip)
+            // Execute INT8 GEMM using native VNNI with SEPARATE scaling (two-kernel approach)
+            // This runs INT8→INT32 GEMM, then a separate kernel for scaling. (common .hip)
             bool rocmQuantGemm_executeTwoKernel(
                 const int8_t *d_A_int8, // [M x K] RowMajor quantized activations
                 const int8_t *d_B_int8, // [K x N] RowMajor transposed weights
@@ -166,7 +156,7 @@ namespace llaminar2
                 int rocm_device_id, void *stream,
                 void *kernel_ctx);
 
-            // Execute INT8 GEMM without scaling (INT8→INT32 only, CK.hip)
+            // Execute INT8 GEMM without scaling (INT8→INT32 only)
             // Used when you want to apply custom scaling/bias separately.
             bool rocmQuantGemm_executeNoScale(
                 const int8_t *d_A_int8, // [M x K] RowMajor quantized activations
@@ -189,8 +179,8 @@ namespace llaminar2
                 int rocm_device_id, void *stream,
                 void *kernel_ctx);
 
-            // Execute INT8 GEMM using CK two-kernel with M-PADDING for decode (M < 8, common .hip)
-            // Pads activations to padded_m, runs CK, extracts first M rows of output.
+            // Execute INT8 GEMM using two-kernel with M-PADDING for decode (M < 8, common .hip)
+            // Pads activations to padded_m, runs GEMM, extracts first M rows of output.
             // Note: With the 32×32 kernel, only M < 8 needs explicit padding.
             bool rocmQuantGemm_executeTwoKernel_padded(
                 const int8_t *d_A_int8, // [M x K] RowMajor quantized activations
@@ -205,7 +195,7 @@ namespace llaminar2
                 int rocm_device_id, void *stream,
                 void *kernel_ctx);
 
-            // Execute INT8 GEMM using CK two-kernel with M-PADDING and PRE-ALLOCATED buffers (common .hip)
+            // Execute INT8 GEMM using two-kernel with M-PADDING and PRE-ALLOCATED buffers (common .hip)
             // This is the preferred variant for hot-path decode execution.
             bool rocmQuantGemm_executeTwoKernel_padded_cached(
                 const int8_t *d_A_int8,  // [M x K] RowMajor quantized activations
@@ -223,7 +213,7 @@ namespace llaminar2
                 int rocm_device_id, void *stream,
                 void *kernel_ctx);
 
-            // Execute INT8 GEMM using CK two-kernel with HIP event timing (common .hip)
+            // Execute INT8 GEMM using two-kernel with HIP event timing (common .hip)
             // Same as _cached but returns kernel time via kernel_time_ms parameter.
             bool rocmQuantGemm_executeTwoKernel_timed(
                 const int8_t *d_A_int8, // [M × K] INT8 activations
@@ -240,7 +230,7 @@ namespace llaminar2
             // Allocate INT8 buffer (common .hip)
             bool rocmQuantGemm_allocInt8(int8_t **d_ptr, size_t count, int rocm_device_id);
 
-            // Get CK minimum dimension requirements (CK.hip)
+            // Get minimum dimension requirements
             int rocmQuantGemm_getMinM();
             int rocmQuantGemm_getMinN();
             int rocmQuantGemm_getMinK();
@@ -2506,9 +2496,9 @@ namespace llaminar2
             //
             //   ≤6-bit weights (has_native_vnni) → native-VNNI GEMV/GEMM
             //   8-bit weights (d_weights_int8_vnni) → INT8-VNNI GEMV/GEMM
-            //   LLAMINAR_ROCM_FORCE_CK=1 → CK ComposableKernel (debug only)
+            //   LLAMINAR_ROCM_FORCE_CK=1 → legacy CK stub path (debug only, always returns false)
             //
-            // CK is never a normal fallback. If both VNNI paths fail without
+            // The CK path has been removed. If both VNNI paths fail without
             // force_ck, that is a hard error.
             // =========================================================================
             const bool force_ck = debugEnv().rocm.force_ck;
@@ -2517,7 +2507,7 @@ namespace llaminar2
                 static std::once_flag force_ck_once;
                 std::call_once(force_ck_once, []()
                                { LOG_WARN("[ROCmQuantisedGemmKernel] LLAMINAR_ROCM_FORCE_CK=1: "
-                                          "forcing CK ComposableKernel dispatch for all GEMMs (debug override)"); });
+                                          "CK has been removed; this flag is a no-op (debug override)"); });
             }
 
             // =========================================================================

@@ -17,11 +17,13 @@
  *     - rocmQuantGemm_ensureWorkBuffers()      : Work buffer management
  *     - rocmQuantGemm_applyScaling()           : INT32 → FP32 scaling epilogue
  *     - rocmQuantGemm_biasAdd()                : In-place bias addition
- *     - rocmQuantGemm_executeTwoKernel*()      : CK GEMM + scaling orchestrators
+ *     - rocmQuantGemm_executeTwoKernel*()      : INT8 GEMM + scaling orchestrators
  *     - rocmQuantGemm_alloc*(), copy*(), free* : Memory management utilities
+ *     - rocmQuantGemm_executeNoScale()         : Stub (CK removed; returns false)
+ *     - rocmQuantGemm_createKernelContext()    : Stub (CK removed; returns nullptr)
+ *     - rocmQuantGemm_destroyKernelContext()   : Stub (CK removed; no-op)
  *
  * Backend-specific GEMM implementations live in separate files:
- *   - ROCmQuantisedGemmKernel_CK.hip       : ComposableKernel INT8 GEMM (gfx906)
  *   - ROCmQuantisedGemmKernel_INT8_VNNI.hip : INT8 VNNI prefill kernels (gfx906)
  *
  * @author David Sanftenberg
@@ -795,14 +797,28 @@ void quantizeActivationsQ8_blockwise_v5_kernel(
 
 extern "C"
 {
-    // Forward declaration: CK INT8 GEMM (defined in ROCmQuantisedGemmKernel_CK.hip)
+    // Stub: ComposableKernel has been removed. ROCm INT8 GEMM now uses native
+    // VNNI kernels exclusively (ROCmQuantisedGemmKernel_INT8_VNNI.hip).
     bool rocmQuantGemm_executeNoScale(
-        const int8_t *d_A_int8,
-        const int8_t *d_weights_int8,
-        int32_t *d_C_int32,
-        int M, int N, int K,
-        int rocm_device_id, void* stream,
-        void* kernel_ctx);
+        const int8_t * /*d_A_int8*/,
+        const int8_t * /*d_weights_int8*/,
+        int32_t * /*d_C_int32*/,
+        int /*M*/, int /*N*/, int /*K*/,
+        int /*rocm_device_id*/, void * /*stream*/,
+        void * /*kernel_ctx*/)
+    {
+        fprintf(stderr, "[rocmQuantGemm_executeNoScale] ComposableKernel has been removed. "
+                        "This path should not be reached; use VNNI kernels instead.\n");
+        return false;
+    }
+
+    void *rocmQuantGemm_createKernelContext(int /*rocm_device_id*/) { return nullptr; }
+    void  rocmQuantGemm_destroyKernelContext(void * /*ctx*/, int /*rocm_device_id*/) {}
+    int   rocmQuantGemm_getMinM() { return 1; }
+    int   rocmQuantGemm_getMinN() { return 1; }
+    int   rocmQuantGemm_getMinK() { return 1; }
+    bool  rocmQuantGemm_isSupportedDimensions(int /*M*/, int /*N*/, int /*K*/) { return false; }
+    void  rocmQuantGemm_warmupKernels() {}
 
     // -------------------------------------------------------------------------
     // Device management
