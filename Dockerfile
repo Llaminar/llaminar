@@ -94,6 +94,13 @@ RUN --mount=type=cache,target=/root/.ccache \
         -DCMAKE_CUDA_ARCHITECTURES="${LLAMINAR_CUDA_ARCHS}" \
  && cmake --build build_v2_release --parallel --target llaminar2
 
+# CI runs `docker run --group-add render --group-add video` against this
+# builder image; docker resolves --group-add names from the image's /etc/group,
+# not the host's. Ensure those groups exist so the gates can attach to
+# /dev/dri/renderD* and /dev/kfd. Placed last to keep the cmake layer cache
+# valid on Dockerfile edits.
+RUN groupadd -f render && groupadd -f video
+
 # =============================================================================
 # Stage 2: Runtime — slim image with only shared libs + the binary
 # =============================================================================
