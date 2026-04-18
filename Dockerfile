@@ -62,6 +62,7 @@ COPY src ./src
 COPY tests ./tests
 COPY CMakeLists.txt ./CMakeLists.txt
 COPY .githooks ./.githooks
+COPY jinja ./jinja
 
 # Integration build — what CI drives for unit, parity, and E2E tests. Has
 # debug symbols, assertions active, tensor verification enabled.
