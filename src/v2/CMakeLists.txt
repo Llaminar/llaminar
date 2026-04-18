@@ -33,6 +33,10 @@ if(CCACHE_PROGRAM)
     message(STATUS "V2: Found ccache: ${CCACHE_PROGRAM}")
     set(CMAKE_C_COMPILER_LAUNCHER "${CCACHE_PROGRAM}")
     set(CMAKE_CXX_COMPILER_LAUNCHER "${CCACHE_PROGRAM}")
+    # Also cache nvcc and hipcc TUs — these are the slowest in the build
+    # (multi-arch fatbin + ROCm headers). Ccache 4.0+ supports both.
+    set(CMAKE_CUDA_COMPILER_LAUNCHER "${CCACHE_PROGRAM}")
+    set(CMAKE_HIP_COMPILER_LAUNCHER "${CCACHE_PROGRAM}")
 else()
     message(STATUS "V2: ccache not found - using direct compilation")
 endif()

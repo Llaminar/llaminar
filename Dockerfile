@@ -47,7 +47,15 @@ ENV DEBIAN_FRONTEND=noninteractive \
     LD_LIBRARY_PATH=/usr/local/cuda/lib64:/opt/rocm/lib \
     ROCM_HOME=/opt/rocm \
     HIP_PATH=/opt/rocm \
-    CUTLASS_DIR=/opt/cutlass
+    CUTLASS_DIR=/opt/cutlass \
+    CCACHE_DIR=/root/.ccache \
+    CCACHE_MAXSIZE=20G \
+    CCACHE_COMPRESS=1 \
+    CCACHE_COMPRESSLEVEL=6 \
+    CCACHE_SLOPPINESS=time_macros,include_file_mtime,include_file_ctime,pch_defines,locale,system_headers \
+    CCACHE_COMPILERCHECK=content \
+    CCACHE_NOHASHDIR=1 \
+    CCACHE_BASEDIR=/src
 
 COPY scripts/docker /tmp/install-scripts
 RUN MODE=build  /tmp/install-scripts/install-system-deps.sh

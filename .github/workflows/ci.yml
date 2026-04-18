@@ -47,7 +47,7 @@ jobs:
   ci:
     name: CI gates
     runs-on: [self-hosted, linux, x64, llaminar-bench]
-    timeout-minutes: 240
+    timeout-minutes: 480
     outputs:
       image-ref: ${{ steps.meta.outputs.tags }}
     steps:
@@ -76,6 +76,31 @@ jobs:
             type=raw,value=${{ inputs.image-tag || 'ci' }},enable=${{ inputs.image-tag != '' }}
 
       # ---------------------------------------------------------------------
+      # Restore ccache directory from previous CI runs. We use actions/cache
+      # against a host directory (~/.ccache-llaminar) and then "inject" it
+      # into the BuildKit cache mount via buildkit-cache-dance below. This
+      # gives us cross-run persistence for nvcc + hipcc + g++ TUs.
+      # ---------------------------------------------------------------------
+      - name: Restore ccache from previous runs
+        id: ccache-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/.ccache-llaminar
+          key: ccache-builder-${{ runner.os }}-${{ hashFiles('Dockerfile', 'scripts/docker/**', 'src/v2/CMakeLists.txt') }}-${{ github.sha }}
+          restore-keys: |
+            ccache-builder-${{ runner.os }}-${{ hashFiles('Dockerfile', 'scripts/docker/**', 'src/v2/CMakeLists.txt') }}-
+            ccache-builder-${{ runner.os }}-
+
+      - name: Inject ccache into BuildKit
+        uses: reproducible-containers/buildkit-cache-dance@v3.1.2
+        with:
+          cache-map: |
+            {
+              "${{ runner.temp }}/.ccache-llaminar": "/root/.ccache"
+            }
+          skip-extraction: true
+
+      # ---------------------------------------------------------------------
       # Build the builder stage. `load: true` makes the image available to
       # the local Docker daemon so subsequent `docker run` steps can use it.
       # The builder image is NOT pushed to any registry.
@@ -94,6 +119,16 @@ jobs:
             VERSION=${{ github.ref_name }}
             VCS_REF=${{ github.sha }}
             BUILD_DATE=${{ github.event.repository.updated_at }}
+
+      - name: Extract ccache from BuildKit
+        if: always()
+        uses: reproducible-containers/buildkit-cache-dance@v3.1.2
+        with:
+          cache-map: |
+            {
+              "${{ runner.temp }}/.ccache-llaminar": "/root/.ccache"
+            }
+          skip-extraction: false
 
       # ---------------------------------------------------------------------
       # Gate 1: unit tests. Fast, no models needed, pure CPU/GPU isolation.
