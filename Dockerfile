@@ -101,6 +101,12 @@ RUN --mount=type=cache,target=/root/.ccache \
 # valid on Dockerfile edits.
 RUN groupadd -f render && groupadd -f video
 
+# OpenMPI refuses to run as root unless explicitly opted in. The CI gates run
+# the test binaries as root inside the container and many of them call
+# mpirun() under the hood, so set the bypass env vars at image scope.
+ENV OMPI_ALLOW_RUN_AS_ROOT=1 \
+    OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1
+
 # =============================================================================
 # Stage 2: Runtime — slim image with only shared libs + the binary
 # =============================================================================
