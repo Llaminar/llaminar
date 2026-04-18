@@ -33,6 +33,10 @@ if(CCACHE_PROGRAM)
     message(STATUS "V2: Found ccache: ${CCACHE_PROGRAM}")
     set(CMAKE_C_COMPILER_LAUNCHER "${CCACHE_PROGRAM}")
     set(CMAKE_CXX_COMPILER_LAUNCHER "${CCACHE_PROGRAM}")
+    # Also cache nvcc and hipcc TUs — these are the slowest in the build
+    # (multi-arch fatbin + ROCm headers). Ccache 4.0+ supports both.
+    set(CMAKE_CUDA_COMPILER_LAUNCHER "${CCACHE_PROGRAM}")
+    set(CMAKE_HIP_COMPILER_LAUNCHER "${CCACHE_PROGRAM}")
 else()
     message(STATUS "V2: ccache not found - using direct compilation")
 endif()
@@ -632,9 +636,17 @@ if(HAVE_ROCM)
     # Workaround: Build RCCL from source with explicit GPU_TARGETS for gfx906.
     # See: https://github.com/ROCm/rocm-systems/issues/2805
     #
-    # Like oneDNN, we clone to external/rccl if not present
-    # and build locally. The build is cached based on git commit hash.
-    find_package(Git REQUIRED)
+    # This is OPT-IN because building RCCL from source takes 30-60+ minutes
+    # and requires hipcc (so it can't share the C++23 compiler we use for
+    # llaminar). The Docker release image and CI default to OFF and rely on
+    # the system librccl.so loaded dynamically at runtime via dlopen(). Set
+    # LLAMINAR_BUILD_RCCL_FROM_SOURCE=ON locally if you need the gfx906 fix.
+    option(LLAMINAR_BUILD_RCCL_FROM_SOURCE
+           "Clone and build RCCL from source (workaround for broken gfx906 binaries in packaged RCCL)"
+           OFF)
+
+    if(LLAMINAR_BUILD_RCCL_FROM_SOURCE)
+        find_package(Git REQUIRED)
     
     get_filename_component(REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
     set(RCCL_EXTERNAL_DIR "${REPO_ROOT}/external/rccl")
@@ -757,6 +769,7 @@ if(HAVE_ROCM)
     else()
         message(STATUS "V2: RCCL already built in ${RCCL_BUILD_DIR}")
     endif()
+    endif() # LLAMINAR_BUILD_RCCL_FROM_SOURCE
     
     # =========================================================================
     # RCCL Detection (ROCm Collective Communications Library)
@@ -1270,8 +1283,7 @@ add_library(llaminar2_core STATIC
     models/qwen/Qwen2BufferSpec.cpp
     # Qwen3.5 Dense (hybrid GDN + Full Attention)
     models/qwen35/Qwen35Graph.cpp
-    models/qwen35/Qwen35GraphConfigBuilder.cpp
-    tensors/TensorBase.cpp
+    models/qwen35/Qwen35GraphConfigBuilder.cpp    tensors/TensorBase.cpp
     tensors/FP32Tensor.cpp
     tensors/FP16Tensor.cpp
     tensors/BF16Tensor.cpp
@@ -1407,6 +1419,60 @@ add_library(llaminar2_core STATIC
     vendor/jinja/string.cpp
     vendor/jinja/value.cpp
 )
+
+# ---------------------------------------------------------------------------
+# Embed model-specific Jinja chat templates
+#
+# Each (jinja file -> generated header) pair lives under jinja/<family>/<ver>/.
+# The generator script `cmake/EmbedJinjaTemplate.cmake` reads the .jinja file
+# and wraps its contents in a C++ raw-string literal. Generated headers land
+# in ${CMAKE_CURRENT_BINARY_DIR}/generated/jinja_templates/ so we add that to
+# the include path.
+# ---------------------------------------------------------------------------
+set(LLAMINAR2_JINJA_EMBED_SCRIPT "${CMAKE_CURRENT_SOURCE_DIR}/../../cmake/EmbedJinjaTemplate.cmake")
+set(LLAMINAR2_JINJA_GEN_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated/jinja_templates")
+file(MAKE_DIRECTORY "${LLAMINAR2_JINJA_GEN_DIR}")
+
+function(llaminar2_embed_jinja_template)
+    cmake_parse_arguments(ARG "" "INPUT;OUTPUT;NAMESPACE;SYMBOL;SOURCE_URL;LICENSE" "" ${ARGN})
+    if(NOT ARG_INPUT OR NOT ARG_OUTPUT OR NOT ARG_NAMESPACE OR NOT ARG_SYMBOL)
+        message(FATAL_ERROR "llaminar2_embed_jinja_template: INPUT, OUTPUT, NAMESPACE, SYMBOL required")
+    endif()
+    if(NOT ARG_SOURCE_URL)
+        set(ARG_SOURCE_URL "(not provided)")
+    endif()
+    if(NOT ARG_LICENSE)
+        set(ARG_LICENSE "(not provided)")
+    endif()
+    add_custom_command(
+        OUTPUT "${ARG_OUTPUT}"
+        COMMAND ${CMAKE_COMMAND}
+            -DJINJA_INPUT=${ARG_INPUT}
+            -DHEADER_OUTPUT=${ARG_OUTPUT}
+            -DNAMESPACE=${ARG_NAMESPACE}
+            -DSYMBOL=${ARG_SYMBOL}
+            -DSOURCE_URL=${ARG_SOURCE_URL}
+            -DLICENSE=${ARG_LICENSE}
+            -P "${LLAMINAR2_JINJA_EMBED_SCRIPT}"
+        DEPENDS "${ARG_INPUT}" "${LLAMINAR2_JINJA_EMBED_SCRIPT}"
+        COMMENT "Embedding Jinja template: ${ARG_INPUT}"
+        VERBATIM
+    )
+endfunction()
+
+# --- Qwen 3.5 community chat template (MIT) --------------------------------
+set(QWEN35_JINJA_SRC "${CMAKE_CURRENT_SOURCE_DIR}/../../jinja/qwen/qwen35/template.jinja")
+set(QWEN35_JINJA_HDR "${LLAMINAR2_JINJA_GEN_DIR}/qwen/qwen35/Qwen35ChatTemplate.generated.h")
+llaminar2_embed_jinja_template(
+    INPUT       "${QWEN35_JINJA_SRC}"
+    OUTPUT      "${QWEN35_JINJA_HDR}"
+    NAMESPACE   "llaminar2::qwen35"
+    SYMBOL      "kCommunityChatTemplate"
+    SOURCE_URL  "https://huggingface.co/froggeric/Qwen3.5-35B-A3B-Uncensored-FernflowerAI-MLX-8bit/resolve/main/chat_template.jinja"
+    LICENSE     "MIT"
+)
+target_sources(llaminar2_core PRIVATE "${QWEN35_JINJA_HDR}")
+target_include_directories(llaminar2_core PRIVATE "${LLAMINAR2_JINJA_GEN_DIR}")
 
 target_include_directories(llaminar2_core PUBLIC 
     ${CMAKE_CURRENT_SOURCE_DIR}

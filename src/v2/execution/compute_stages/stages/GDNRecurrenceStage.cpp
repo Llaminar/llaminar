@@ -30,6 +30,83 @@
 namespace llaminar2
 {
 
+    namespace
+    {
+        /**
+         * Deinterleave a merged QKV buffer into separate contiguous Q, K, V arrays.
+         *
+         * Merged layout per row t (length = q_src_dim + k_src_dim + v_dim):
+         *   [ Q (nkh * d_k) | K (nkh * d_k) | V (n_v_heads_local * d_v) ]
+         *
+         * Output layout:
+         *   q_dst, k_dst : [T, n_v_heads_local * d_k]
+         *   v_dst        : [T, n_v_heads_local * d_v]  (straight copy)
+         *
+         * Head mapping: for each local V-head j in [0, n_v_heads_local),
+         *   k_idx = (j + global_v_offset) % nkh
+         *   q_dst[t, j] = q_src[t, k_idx]
+         *   k_dst[t, j] = k_src[t, k_idx]
+         *
+         * This single modular formula correctly covers all three regimes:
+         *   - nkh > n_v_heads_local  (selection, e.g. high-degree TP)
+         *   - nkh == n_v_heads_local (identity or rotation)
+         *   - nkh < n_v_heads_local  (expansion / modular GQA repeat)
+         * including non-integer ratios (e.g. 27B under TP=2: nkh=16, n_v_local=24).
+         *
+         * Fast path: when global_v_offset == 0 AND nkh == n_v_heads_local, the
+         * Q and K regions become a contiguous copy of the source buffer — emitted
+         * as a single memcpy per token.
+         */
+        void deinterleaveMergedQKV(
+            const float *qkv, int T, int qkv_stride,
+            int nkh, int n_v_heads_local, int d_k, int d_v,
+            int global_v_offset,
+            float *q_dst_buf, float *k_dst_buf, float *v_dst_buf)
+        {
+            const int q_src_dim = nkh * d_k;
+            const int k_src_dim = nkh * d_k;
+            const int v_dim = n_v_heads_local * d_v;
+            const int q_dst_dim = n_v_heads_local * d_k;
+            const int k_dst_dim = n_v_heads_local * d_k;
+
+            const bool identity_fast_path =
+                (global_v_offset == 0) && (nkh == n_v_heads_local);
+
+            for (int t = 0; t < T; ++t)
+            {
+                const float *row = qkv + static_cast<size_t>(t) * qkv_stride;
+                const float *q_src = row;
+                const float *k_src = row + q_src_dim;
+                const float *v_src = row + q_src_dim + k_src_dim;
+                float *q_dst = q_dst_buf + static_cast<size_t>(t) * q_dst_dim;
+                float *k_dst = k_dst_buf + static_cast<size_t>(t) * k_dst_dim;
+                float *v_dst = v_dst_buf + static_cast<size_t>(t) * v_dim;
+
+                if (identity_fast_path)
+                {
+                    std::memcpy(q_dst, q_src, q_dst_dim * sizeof(float));
+                    std::memcpy(k_dst, k_src, k_dst_dim * sizeof(float));
+                }
+                else
+                {
+                    for (int j = 0; j < n_v_heads_local; ++j)
+                    {
+                        const int k_idx = (j + global_v_offset) % nkh;
+                        std::memcpy(q_dst + j * d_k,
+                                    q_src + k_idx * d_k,
+                                    d_k * sizeof(float));
+                        std::memcpy(k_dst + j * d_k,
+                                    k_src + k_idx * d_k,
+                                    d_k * sizeof(float));
+                    }
+                }
+
+                // V is already n_v_heads_local wide — straight copy.
+                std::memcpy(v_dst, v_src, v_dim * sizeof(float));
+            }
+        }
+    } // namespace
+
     GDNRecurrenceStage::GDNRecurrenceStage(Params params)
         : IComputeStage(params.device_id), params_(std::move(params))
     {
@@ -248,115 +325,13 @@ namespace llaminar2
 
             const float *qkv = q_data; // merged buffer
 
-            if (nkh > params_.n_heads)
-            {
-                // Selection mode: Q/K replicated (n_k_heads > n_v_heads_local).
-                // Under TP with GDN modular repeat, each local v_head j maps to
-                // k_head (j + global_v_head_offset) % n_k_heads_global.
-                // Select the right K-head for each local V-head.
-                const int gvo = params_.global_v_head_offset;
-                for (int t = 0; t < T; ++t)
-                {
-                    const float *row = qkv + static_cast<size_t>(t) * qkv_stride;
-                    float *q_dst = q_deinterleave_.data() + static_cast<size_t>(t) * q_dst_dim;
-                    float *k_dst = k_deinterleave_.data() + static_cast<size_t>(t) * k_dst_dim;
-                    const float *q_src = row;
-                    const float *k_src = row + q_src_dim;
-
-                    for (int j = 0; j < params_.n_heads; ++j)
-                    {
-                        const int k_idx = (j + gvo) % nkh;
-                        std::memcpy(q_dst + j * params_.d_k,
-                                    q_src + k_idx * params_.d_k,
-                                    params_.d_k * sizeof(float));
-                        std::memcpy(k_dst + j * params_.d_k,
-                                    k_src + k_idx * params_.d_k,
-                                    params_.d_k * sizeof(float));
-                    }
-
-                    // V: straight copy (already n_v_heads_local wide)
-                    std::memcpy(v_deinterleave_.data() + static_cast<size_t>(t) * v_dim,
-                                row + q_src_dim + k_src_dim, v_dim * sizeof(float));
-                }
-            }
-            else if (nkh == params_.n_heads)
-            {
-                // Identity: n_k_heads == n_v_heads_local, simple deinterleave.
-                // Common case for TP=2 with 4B model (16 k_heads, 16 v_heads_local).
-                // With global_v_head_offset, verify identity mapping is correct:
-                // k_head = (j + offset) % n_k. When n_k == n_v_local, this simplifies.
-                for (int t = 0; t < T; ++t)
-                {
-                    const float *row = qkv + static_cast<size_t>(t) * qkv_stride;
-
-                    if (params_.global_v_head_offset == 0)
-                    {
-                        // rank 0 or single-device: identity mapping
-                        std::memcpy(q_deinterleave_.data() + static_cast<size_t>(t) * q_dst_dim,
-                                    row, q_dst_dim * sizeof(float));
-                        std::memcpy(k_deinterleave_.data() + static_cast<size_t>(t) * k_dst_dim,
-                                    row + q_src_dim, k_dst_dim * sizeof(float));
-                    }
-                    else
-                    {
-                        // Non-zero offset: rotate Q/K heads. For modular repeat,
-                        // k_head = (j + offset) % n_k. Since n_k == n_v_local,
-                        // this is a circular rotation.
-                        float *q_dst = q_deinterleave_.data() + static_cast<size_t>(t) * q_dst_dim;
-                        float *k_dst = k_deinterleave_.data() + static_cast<size_t>(t) * k_dst_dim;
-                        const float *q_src = row;
-                        const float *k_src = row + q_src_dim;
-                        const int gvo = params_.global_v_head_offset;
-
-                        for (int j = 0; j < params_.n_heads; ++j)
-                        {
-                            const int k_idx = (j + gvo) % nkh;
-                            std::memcpy(q_dst + j * params_.d_k,
-                                        q_src + k_idx * params_.d_k,
-                                        params_.d_k * sizeof(float));
-                            std::memcpy(k_dst + j * params_.d_k,
-                                        k_src + k_idx * params_.d_k,
-                                        params_.d_k * sizeof(float));
-                        }
-                    }
-
-                    std::memcpy(v_deinterleave_.data() + static_cast<size_t>(t) * v_dim,
-                                row + q_src_dim + k_src_dim, v_dim * sizeof(float));
-                }
-            }
-            else
-            {
-                // Expansion mode: n_k_heads < n_v_heads (single-device or TP=1)
-                // Modular GQA expansion of Q/K from n_k_heads to n_v_heads:
-                //   V-head h maps to K-head (h % n_k_heads)
-                //   Q[t, h, d_k] -> Q[t, r*nkh+h, d_k] for r in [0, repeat_factor)
-                const int repeat_factor = params_.n_heads / nkh;
-                for (int t = 0; t < T; ++t)
-                {
-                    const float *row = qkv + static_cast<size_t>(t) * qkv_stride;
-                    float *q_dst = q_deinterleave_.data() + static_cast<size_t>(t) * q_dst_dim;
-                    float *k_dst = k_deinterleave_.data() + static_cast<size_t>(t) * k_dst_dim;
-                    const float *q_src = row;
-                    const float *k_src = row + q_src_dim;
-
-                    for (int h = 0; h < nkh; ++h)
-                    {
-                        for (int r = 0; r < repeat_factor; ++r)
-                        {
-                            std::memcpy(q_dst + (r * nkh + h) * params_.d_k,
-                                        q_src + h * params_.d_k,
-                                        params_.d_k * sizeof(float));
-                            std::memcpy(k_dst + (r * nkh + h) * params_.d_k,
-                                        k_src + h * params_.d_k,
-                                        params_.d_k * sizeof(float));
-                        }
-                    }
-
-                    // V: straight copy (already n_v_heads wide)
-                    std::memcpy(v_deinterleave_.data() + static_cast<size_t>(t) * v_dim,
-                                row + q_src_dim + k_src_dim, v_dim * sizeof(float));
-                }
-            }
+            deinterleaveMergedQKV(
+                qkv, T, qkv_stride,
+                nkh, params_.n_heads, params_.d_k, params_.d_v,
+                params_.global_v_head_offset,
+                q_deinterleave_.data(),
+                k_deinterleave_.data(),
+                v_deinterleave_.data());
 
             q_data = q_deinterleave_.data();
             k_data = k_deinterleave_.data();

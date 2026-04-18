@@ -23,6 +23,7 @@
 #include "../loaders/IWeightManager.h"                            // For IWeightManager interface
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 
 namespace llaminar2
@@ -157,6 +158,25 @@ namespace llaminar2
          * @return Populated weights struct (embedding, norms, lm_head, layer accessor)
          */
         virtual ModelWeights buildWeights(WeightAccessor get_weight) = 0;
+
+        /**
+         * @brief Optional model-specific chat template override
+         *
+         * Returns a raw Jinja2 chat-template string that should replace the
+         * one embedded in the GGUF's `tokenizer.chat_template` metadata.
+         *
+         * Use this for models whose bundled chat template is known to be
+         * broken or suboptimal, allowing the fix to live alongside the
+         * model's other configuration instead of being baked into the
+         * tokenizer loader. Any explicit user-provided override (e.g.
+         * `--chat-template`) takes precedence over this.
+         *
+         * Default: returns `std::nullopt` (keep GGUF-embedded template).
+         */
+        virtual std::optional<std::string> chatTemplateOverride() const
+        {
+            return std::nullopt;
+        }
     };
 
     // =========================================================================

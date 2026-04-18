@@ -1661,8 +1661,13 @@ namespace llaminar2
                         const size_t head_dim = total_cols / static_cast<size_t>(total_heads);
                         size_t start = static_cast<size_t>(assignment.head_start) * head_dim;
                         size_t count = static_cast<size_t>(assignment.head_count) * head_dim;
-                        LOG_TRACE("[WeightManager] Schema heads row-slice for " << name
-                                                                                << " -> [" << start << ", " << (start + count) << ")");
+                        LOG_WARN("[WeightManager] Schema heads row-slice for " << name
+                                                                               << " total_cols=" << total_cols
+                                                                               << " total_heads=" << total_heads
+                                                                               << " head_dim=" << head_dim
+                                                                               << " assignment.head_start=" << assignment.head_start
+                                                                               << " head_count=" << assignment.head_count
+                                                                               << " -> [" << start << ", " << (start + count) << ")");
                         return {start, count};
                     }
                 }
@@ -2269,7 +2274,7 @@ namespace llaminar2
     }
 
     bool WeightManager::finalizeForDevices(const std::vector<DeviceId> &devices,
-                                            bool release_host_data)
+                                           bool release_host_data)
     {
         if (devices.empty())
         {
@@ -2558,43 +2563,11 @@ namespace llaminar2
                                       : 1u;
         size_t queue_capacity = std::max<size_t>(4, static_cast<size_t>(upload_workers) * 4);
 
-        // Phase 4 Step 2 pilot (control-plane only): historical worker/slot shaping
-        // for ROCm startup CK row-major repack pipeline.
-        //
-        // Architectural direction is now VNNI-only startup preparation. CK row-major
-        // startup repack is disabled, so we intentionally keep default producer/
-        // consumer topology to avoid injecting control-plane overhead that no longer
-        // has corresponding GPU overlap benefits.
-        if (target_device.is_rocm() && debugEnv().rocm.startup_gpu_repack)
-        {
-            const auto &rocm_cfg = debugEnv().rocm;
-
-            const size_t requested_budget_mb = static_cast<size_t>(std::max(128, rocm_cfg.repack_budget_mb));
-            size_t effective_budget_mb = requested_budget_mb;
-            if (auto *rocm_backend = getROCmBackend())
-            {
-                const size_t free_mb = rocm_backend->deviceMemoryFree(target_device.ordinal) / (1024ull * 1024ull);
-                if (free_mb > 512)
-                {
-                    effective_budget_mb = std::min(effective_budget_mb, free_mb - 512);
-                }
-            }
-
-            LOG_INFO("[WeightManager][Phase4Pilot] ROCm startup GPU repack control enabled: "
-                     << "prepare_workers=" << prepare_workers
-                     << " upload_workers=" << upload_workers
-                     << " queue_slots=" << queue_capacity
-                     << " budget_mb=" << requested_budget_mb
-                     << " effective_budget_mb=" << effective_budget_mb);
-
-            if (detail_enabled)
-            {
-                WeightLoadingProfiler::addDetail("weights.gemm_pack.phase4.prepare_workers", static_cast<double>(prepare_workers));
-                WeightLoadingProfiler::addDetail("weights.gemm_pack.phase4.upload_workers", static_cast<double>(upload_workers));
-                WeightLoadingProfiler::addDetail("weights.gemm_pack.phase4.queue_slots", static_cast<double>(queue_capacity));
-                WeightLoadingProfiler::addDetail("weights.gemm_pack.phase4.effective_budget_mb", static_cast<double>(effective_budget_mb));
-            }
-        }
+        // Architectural direction is now VNNI-only startup preparation. The
+        // legacy ROCm CK row-major startup repack pipeline (and its per-device
+        // budget/worker shaping) has been removed. We intentionally keep the
+        // default producer/consumer topology since there is no corresponding
+        // GPU overlap benefit to recover.
 
         struct PreparedJob
         {

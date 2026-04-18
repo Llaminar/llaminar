@@ -75,6 +75,7 @@ namespace llaminar2::test
         MOCK_METHOD(const float *, lastLogits, (), (const, override));
         MOCK_METHOD(void, setStopTokens, (const std::vector<int32_t> &stop_tokens), (override));
         MOCK_METHOD(std::shared_ptr<ITokenizer>, tokenizer, (), (const, override));
+        MOCK_METHOD(const std::string &, architecture, (), (const, override));
 
         // Snapshot
         MOCK_METHOD(void, enableSnapshotCapture, (const std::string &output_dir), (override));

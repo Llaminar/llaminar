@@ -47,14 +47,23 @@ jobs:
   ci:
     name: CI gates
     runs-on: [self-hosted, linux, x64, llaminar-bench]
-    timeout-minutes: 240
+    timeout-minutes: 480
     outputs:
       image-ref: ${{ steps.meta.outputs.tags }}
     steps:
       - uses: actions/checkout@v4
 
+      # Use the host docker engine as the buildx driver (instead of the
+      # default docker-container driver). With the docker driver, `--load`
+      # is a no-op: the image is already in the local engine after build,
+      # avoiding the multi-GB OCI tar export + re-import cycle that took
+      # >1h of single-threaded buildkitd CPU on the previous attempts.
+      # Tradeoff: no multi-platform / no cache-to=registry, neither of
+      # which we use on the self-hosted GPU runner.
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
+        with:
+          driver: docker
 
       - name: Log in to GHCR
         if: github.event_name != 'pull_request'
@@ -76,10 +85,43 @@ jobs:
             type=raw,value=${{ inputs.image-tag || 'ci' }},enable=${{ inputs.image-tag != '' }}
 
       # ---------------------------------------------------------------------
+      # Restore ccache directory from previous CI runs. We use actions/cache
+      # against a host directory (~/.ccache-llaminar) and then "inject" it
+      # into the BuildKit cache mount via buildkit-cache-dance below. This
+      # gives us cross-run persistence for nvcc + hipcc + g++ TUs.
+      # ---------------------------------------------------------------------
+      - name: Restore ccache from previous runs
+        id: ccache-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/.ccache-llaminar
+          key: ccache-builder-${{ runner.os }}-${{ hashFiles('Dockerfile', 'scripts/docker/**', 'src/v2/CMakeLists.txt') }}-${{ github.sha }}
+          restore-keys: |
+            ccache-builder-${{ runner.os }}-${{ hashFiles('Dockerfile', 'scripts/docker/**', 'src/v2/CMakeLists.txt') }}-
+            ccache-builder-${{ runner.os }}-
+
+      - name: Inject ccache into BuildKit
+        uses: reproducible-containers/buildkit-cache-dance@v3.1.2
+        with:
+          cache-map: |
+            {
+              "${{ runner.temp }}/.ccache-llaminar": "/root/.ccache"
+            }
+          skip-extraction: true
+
+      # ---------------------------------------------------------------------
       # Build the builder stage. `load: true` makes the image available to
       # the local Docker daemon so subsequent `docker run` steps can use it.
       # The builder image is NOT pushed to any registry.
       # ---------------------------------------------------------------------
+      # NOTE: cache-to/from removed for self-hosted runner.
+      # The runner uploads to GHA cache over a residential wifi uplink, which
+      # made `mode=max` exports of the (~200 GB) builder image stall the job
+      # for >40 min and trip the runner watchdog. The local Docker daemon on
+      # tmpfs already keeps layers between runs, and ccache is persisted
+      # separately via actions/cache + buildkit-cache-dance above. If we ever
+      # move to a faster uplink or a dedicated registry mirror we can re-add
+      # `cache-to: type=registry,...` here.
       - name: Build builder image
         uses: docker/build-push-action@v6
         with:
@@ -88,12 +130,20 @@ jobs:
           target: builder
           load: true
           tags: ${{ env.BUILDER_IMAGE }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
           build-args: |
             VERSION=${{ github.ref_name }}
             VCS_REF=${{ github.sha }}
             BUILD_DATE=${{ github.event.repository.updated_at }}
+
+      - name: Extract ccache from BuildKit
+        if: always()
+        uses: reproducible-containers/buildkit-cache-dance@v3.1.2
+        with:
+          cache-map: |
+            {
+              "${{ runner.temp }}/.ccache-llaminar": "/root/.ccache"
+            }
+          skip-extraction: false
 
       # ---------------------------------------------------------------------
       # Gate 1: unit tests. Fast, no models needed, pure CPU/GPU isolation.
@@ -217,6 +267,7 @@ jobs:
       # All gates passed. Build the slim runtime stage and push to GHCR
       # (non-PR only — PRs only build, never publish).
       # ---------------------------------------------------------------------
+      # NOTE: cache-to/from removed — same wifi-uplink rationale as above.
       - name: Build + push runtime image
         uses: docker/build-push-action@v6
         with:
@@ -227,8 +278,6 @@ jobs:
           load: ${{ github.event_name == 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
           build-args: |
             VERSION=${{ github.ref_name }}
             VCS_REF=${{ github.sha }}

@@ -148,13 +148,16 @@ TEST_F(Test__ChatCompletionHandler, ParseRequest_MinimalValid_Succeeds)
     EXPECT_EQ(result->messages[0].content, "Hello");
 }
 
-TEST_F(Test__ChatCompletionHandler, ParseRequest_DefaultMaxTokens_Is128)
+TEST_F(Test__ChatCompletionHandler, ParseRequest_DefaultMaxTokens_IsSentinelForFullContext)
 {
+    // When the client does not specify max_tokens, parseRequest leaves the field
+    // at the sentinel value -1. The handler then defaults to (context_window -
+    // prompt_tokens) at decode time so the model can fill the remaining context.
     ChatCompletionResponse error;
     auto result = ChatCompletionHandler::parseRequest(minimalRequest(), error);
 
     ASSERT_TRUE(result.has_value());
-    EXPECT_EQ(result->max_tokens, 128);
+    EXPECT_EQ(result->max_tokens, -1);
 }
 
 TEST_F(Test__ChatCompletionHandler, ParseRequest_CustomMaxTokens)
@@ -376,6 +379,10 @@ TEST_F(Test__ChatCompletionHandler, HandleRequest_PassesSamplingParams_ToRunner)
     request.sampling.top_p = 0.95f;
     request.sampling.top_k = 40;
     request.sampling.seed = 999;
+    request.sampling_set.temperature = true;
+    request.sampling_set.top_p = true;
+    request.sampling_set.top_k = true;
+    request.sampling_set.seed = true;
 
     handler->handleRequest(request);
 
@@ -407,6 +414,7 @@ TEST_F(Test__ChatCompletionHandler, HandleRequest_GreedySampling_WhenTemp0)
     ChatCompletionRequest request;
     request.messages = {ChatMessage("user", "2+2?")};
     request.sampling.temperature = 0.0f;
+    request.sampling_set.temperature = true;
 
     handler->handleRequest(request);
 
@@ -879,7 +887,7 @@ TEST_F(Test__ChatCompletionHandler, ParseRequest_AllParams_Combined)
 // Model defaults merging
 // =============================================================================
 
-TEST_F(Test__ChatCompletionHandler, HandleRawRequest_ModelDefaultsNotUsedWhenUserSpecifiesTemp)
+TEST_F(Test__ChatCompletionHandler, HandleRawRequest_ModelDefaultsMergedPerFieldWhenUserSpecifiesTemp)
 {
     auto handler = makeHandler();
 
@@ -906,7 +914,7 @@ TEST_F(Test__ChatCompletionHandler, HandleRawRequest_ModelDefaultsNotUsedWhenUse
     EXPECT_CALL(*runner_, decodeStep())
         .WillOnce(Return(makeToken(42, true)));
 
-    // User explicitly sets temperature — model defaults should NOT be applied
+    // User sets only temperature — other fields must still receive model defaults.
     json body = {
         {"messages", json::array({json{{"role", "user"}, {"content", "test"}}})},
         {"temperature", 0.3}};
@@ -914,12 +922,12 @@ TEST_F(Test__ChatCompletionHandler, HandleRawRequest_ModelDefaultsNotUsedWhenUse
     auto response = handler->handleRawRequest(body.dump());
     EXPECT_TRUE(response.ok);
     EXPECT_FLOAT_EQ(captured.temperature, 0.3f)
-        << "Should use user-specified temperature, not model default";
-    EXPECT_FLOAT_EQ(captured.presence_penalty, 0.0f)
-        << "Model defaults should not be merged when user specified any param";
+        << "Should use user-specified temperature";
+    EXPECT_FLOAT_EQ(captured.presence_penalty, 1.5f)
+        << "Model defaults must still be applied to fields the user did NOT specify";
 }
 
-TEST_F(Test__ChatCompletionHandler, HandleRawRequest_ModelDefaultsNotUsedWhenUserSpecifiesPenalty)
+TEST_F(Test__ChatCompletionHandler, HandleRawRequest_ModelDefaultsMergedPerFieldWhenUserSpecifiesPenalty)
 {
     auto handler = makeHandler();
 
@@ -946,7 +954,7 @@ TEST_F(Test__ChatCompletionHandler, HandleRawRequest_ModelDefaultsNotUsedWhenUse
     EXPECT_CALL(*runner_, decodeStep())
         .WillOnce(Return(makeToken(42, true)));
 
-    // User explicitly sets presence_penalty — model defaults should NOT be applied
+    // User sets only presence_penalty — other fields must still receive model defaults.
     json body = {
         {"messages", json::array({json{{"role", "user"}, {"content", "test"}}})},
         {"presence_penalty", 0.5}};
@@ -955,8 +963,8 @@ TEST_F(Test__ChatCompletionHandler, HandleRawRequest_ModelDefaultsNotUsedWhenUse
     EXPECT_TRUE(response.ok);
     EXPECT_FLOAT_EQ(captured.presence_penalty, 0.5f)
         << "Should use user-specified penalty";
-    EXPECT_FLOAT_EQ(captured.temperature, 1.0f)
-        << "Non-specified params should stay at API defaults, not model defaults";
+    EXPECT_FLOAT_EQ(captured.temperature, 0.6f)
+        << "Non-specified params must receive model defaults (per-field merge)";
 }
 
 TEST_F(Test__ChatCompletionHandler, HandleRawRequest_PenaltiesPassedToRunner)

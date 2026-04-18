@@ -47,6 +47,8 @@
 #include <iomanip>
 #include <mutex>
 #include <atomic>
+#include <memory>
+#include <unordered_map>
 #include <unordered_set>
 
 namespace llaminar2
@@ -949,6 +951,47 @@ namespace llaminar2
 
         CUDAQuantisedGemmKernel::~CUDAQuantisedGemmKernel() = default;
 
+        // ---------------------------------------------------------------------
+        // Shared per-device prefill stream pool.
+        //
+        // Multiple kernels on the same CUDA device share a single pool so that
+        // we don't allocate duplicate scratch buffers / streams per kernel
+        // instance. KernelFactory::clearCache() invokes
+        // clearSharedPrefillPools() to release these between test runs.
+        // ---------------------------------------------------------------------
+        namespace
+        {
+            std::mutex &sharedPrefillPoolsMutex()
+            {
+                static std::mutex m;
+                return m;
+            }
+
+            std::unordered_map<int, std::unique_ptr<CUDAConcurrentPrefillPool>> &sharedPrefillPools()
+            {
+                static std::unordered_map<int, std::unique_ptr<CUDAConcurrentPrefillPool>> pools;
+                return pools;
+            }
+
+            CUDAConcurrentPrefillPool &getSharedCUDAPrefillPool(int cuda_device_id)
+            {
+                std::lock_guard<std::mutex> lk(sharedPrefillPoolsMutex());
+                auto &pools = sharedPrefillPools();
+                auto it = pools.find(cuda_device_id);
+                if (it == pools.end())
+                {
+                    it = pools.emplace(cuda_device_id, std::make_unique<CUDAConcurrentPrefillPool>()).first;
+                }
+                return *it->second;
+            }
+        } // namespace
+
+        void CUDAQuantisedGemmKernel::clearSharedPrefillPools()
+        {
+            std::lock_guard<std::mutex> lk(sharedPrefillPoolsMutex());
+            sharedPrefillPools().clear();
+        }
+
         CUDAQuantisedGemmKernel::CUDAQuantisedGemmKernel(CUDAQuantisedGemmKernel &&other) noexcept
             : weights_(other.weights_),
               packed_(other.packed_),
@@ -957,7 +1000,6 @@ namespace llaminar2
               K_(other.K_),
               weights_converted_(other.weights_converted_),
               owns_weight_memory_(other.owns_weight_memory_),
-              prefill_pool_(std::move(other.prefill_pool_)),
               impl_(std::move(other.impl_))
         {
             other.weights_ = nullptr;
@@ -977,7 +1019,6 @@ namespace llaminar2
                 K_ = other.K_;
                 weights_converted_ = other.weights_converted_;
                 owns_weight_memory_ = other.owns_weight_memory_;
-                prefill_pool_ = std::move(other.prefill_pool_);
                 impl_ = std::move(other.impl_);
 
                 other.weights_ = nullptr;
@@ -1638,9 +1679,7 @@ namespace llaminar2
             if (concurrent_eligible)
             {
                 const int num_proj = static_cast<int>(projections.size());
-                if (!prefill_pool_)
-                    prefill_pool_ = std::make_unique<CUDAConcurrentPrefillPool>();
-                auto &pool = *prefill_pool_;
+                auto &pool = getSharedCUDAPrefillPool(cuda_device_id_);
                 pool.init(cuda_device_id_, num_proj);
 
                 // Record event after quantization completes on main stream
@@ -1960,12 +1999,12 @@ namespace llaminar2
 
                     if (used_native)
                     {
-                        // DIAGNOSTIC: sync between projections to test if inter-projection
-                        // race causes corruption in PP mode
-                        if (gpu_stream_ && i + 1 < projections.size())
-                            cudaStreamSynchronize(static_cast<cudaStream_t>(gpu_stream_));
-
-                        // Diagnostic: checksum output after GEMM to detect corruption source
+                        // Diagnostic: checksum output after GEMM to detect corruption source.
+                        // NOTE: cudaStreamSynchronize is ILLEGAL during stream capture and
+                        // would leave the capture stream in an error state, failing the
+                        // next projection's GEMV with a sticky cudaErrorStreamCaptureUnsupported.
+                        // Only sync when the trace is explicitly requested — callers using
+                        // LLAMINAR_CUDA_FUSED_GEMM_TRACE must not be running under capture.
                         if (trace_fused)
                         {
                             cudaStreamSynchronize(static_cast<cudaStream_t>(gpu_stream_));

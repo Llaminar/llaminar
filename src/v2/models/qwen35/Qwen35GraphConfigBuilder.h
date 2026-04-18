@@ -14,6 +14,9 @@
 
 #include "../qwen/Qwen2GraphConfigBuilder.h"
 
+#include <optional>
+#include <string>
+
 namespace llaminar2
 {
 
@@ -58,6 +61,17 @@ namespace llaminar2
          * Both load:       attn_norm, post_attention_norm (as ffn_norm), ffn_gate/up/down
          */
         ModelWeights buildWeights(WeightAccessor get_weight) override;
+
+        /**
+         * @brief Returns the community-maintained Qwen 3.5 chat template.
+         *
+         * The template embedded in many Qwen 3.5 GGUF artifacts has been
+         * observed to leave the model in a degenerate repetition state after
+         * the `</think>` block closes. We replace it with a community-
+         * maintained variant (MIT licensed — see Qwen35ChatTemplate.h for
+         * full attribution and source URL).
+         */
+        std::optional<std::string> chatTemplateOverride() const override;
     };
 
 } // namespace llaminar2

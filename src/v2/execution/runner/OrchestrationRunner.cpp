@@ -1164,6 +1164,12 @@ namespace llaminar2
         return tokenizer_;
     }
 
+    const std::string &OrchestrationRunner::architecture() const
+    {
+        static const std::string kEmpty;
+        return model_ctx_ ? model_ctx_->architecture() : kEmpty;
+    }
+
     bool OrchestrationRunner::buildMultiDeviceComputeGraph()
     {
         // Validate that all requested devices actually exist in hardware

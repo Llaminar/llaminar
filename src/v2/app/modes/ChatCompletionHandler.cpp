@@ -9,6 +9,7 @@
 #include "utils/Logger.h"
 #include "nlohmann/json.hpp"
 
+#include <algorithm>
 #include <ctime>
 #include <random>
 #include <sstream>
@@ -203,8 +204,11 @@ namespace llaminar2
 
         ChatCompletionRequest request;
 
-        // Extract parameters with OpenAI-compatible defaults
-        request.max_tokens = body.value("max_tokens", 128);
+        // Extract parameters. If the client does not specify max_tokens, leave it at -1
+        // (sentinel) so handleRequest/handleStreamRequest can default it to the remaining
+        // context window (max_seq_len - prompt_tokens) after prefill sizing is known.
+        if (body.contains("max_tokens"))
+            request.max_tokens = body["max_tokens"].get<int>();
 
         // Streaming and thinking control
         if (body.contains("stream"))
@@ -216,21 +220,39 @@ namespace llaminar2
         if (body.contains("model"))
             request.model = body["model"].get<std::string>();
 
-        // Sampling parameters — only override SamplingParams defaults if user specified them.
-        // Unspecified fields stay at SamplingParams constructor defaults, allowing
-        // handleRequest() to detect "no user sampling specified" and apply model defaults.
+        // Sampling parameters — track which fields the client explicitly specified.
+        // Fields not set by the client will be filled in from model-recommended defaults
+        // during setupInference(), per-field (not all-or-nothing).
         if (body.contains("temperature"))
+        {
             request.sampling.temperature = body["temperature"].get<float>();
+            request.sampling_set.temperature = true;
+        }
         if (body.contains("top_p"))
+        {
             request.sampling.top_p = body["top_p"].get<float>();
+            request.sampling_set.top_p = true;
+        }
         if (body.contains("top_k"))
+        {
             request.sampling.top_k = body["top_k"].get<int>();
+            request.sampling_set.top_k = true;
+        }
         if (body.contains("seed"))
+        {
             request.sampling.seed = body["seed"].get<unsigned int>();
+            request.sampling_set.seed = true;
+        }
         if (body.contains("presence_penalty"))
+        {
             request.sampling.presence_penalty = body["presence_penalty"].get<float>();
+            request.sampling_set.presence_penalty = true;
+        }
         if (body.contains("frequency_penalty"))
+        {
             request.sampling.frequency_penalty = body["frequency_penalty"].get<float>();
+            request.sampling_set.frequency_penalty = true;
+        }
 
         // Build conversation
         for (const auto &msg : body["messages"])
@@ -255,34 +277,33 @@ namespace llaminar2
         // Clear KV cache for fresh conversation
         runner_.clearCache();
 
-        // Merge model-recommended defaults for unspecified sampling params.
+        // Per-field merge of model-recommended defaults: the model defaults apply to
+        // any field the client did NOT explicitly set. This prevents a client that sets
+        // e.g. temperature from accidentally dropping critical knobs like presence_penalty
+        // that some models (e.g. Qwen3.5) require to avoid repetition-loop degeneration.
         SamplingParams effective = request.sampling;
         SamplingParams model_defaults = runner_.getRecommendedSamplingParams();
-        SamplingParams api_defaults;
+        const auto &set_ = request.sampling_set;
 
-        if (effective.temperature == api_defaults.temperature &&
-            effective.top_p == api_defaults.top_p &&
-            effective.top_k == api_defaults.top_k &&
-            effective.presence_penalty == api_defaults.presence_penalty &&
-            effective.frequency_penalty == api_defaults.frequency_penalty)
-        {
-            effective = model_defaults;
-            LOG_INFO("[ChatCompletion] No user sampling params specified, using model defaults: "
-                     << "temp=" << effective.temperature
-                     << " top_p=" << effective.top_p
-                     << " top_k=" << effective.top_k
-                     << " presence_penalty=" << effective.presence_penalty
-                     << " frequency_penalty=" << effective.frequency_penalty);
-        }
-        else
-        {
-            LOG_INFO("[ChatCompletion] User sampling params: "
-                     << "temp=" << effective.temperature
-                     << " top_p=" << effective.top_p
-                     << " top_k=" << effective.top_k
-                     << " presence_penalty=" << effective.presence_penalty
-                     << " frequency_penalty=" << effective.frequency_penalty);
-        }
+        if (!set_.temperature)
+            effective.temperature = model_defaults.temperature;
+        if (!set_.top_p)
+            effective.top_p = model_defaults.top_p;
+        if (!set_.top_k)
+            effective.top_k = model_defaults.top_k;
+        if (!set_.presence_penalty)
+            effective.presence_penalty = model_defaults.presence_penalty;
+        if (!set_.frequency_penalty)
+            effective.frequency_penalty = model_defaults.frequency_penalty;
+        if (!set_.seed)
+            effective.seed = model_defaults.seed;
+
+        LOG_INFO("[ChatCompletion] Sampling params (user-set fields marked *): "
+                 << "temp=" << effective.temperature << (set_.temperature ? "* " : " ")
+                 << "top_p=" << effective.top_p << (set_.top_p ? "* " : " ")
+                 << "top_k=" << effective.top_k << (set_.top_k ? "* " : " ")
+                 << "presence_penalty=" << effective.presence_penalty << (set_.presence_penalty ? "* " : " ")
+                 << "frequency_penalty=" << effective.frequency_penalty << (set_.frequency_penalty ? "*" : ""));
 
         runner_.setSamplingParams(effective);
 
@@ -340,12 +361,18 @@ namespace llaminar2
 
         int max_context = runner_.config().max_seq_len;
 
+        // Resolve effective max_tokens: if client did not specify a positive value,
+        // default to the remaining context window (max_seq_len - prompt_tokens).
+        int effective_max_tokens = (request.max_tokens > 0)
+                                       ? request.max_tokens
+                                       : std::max(1, max_context - prompt_tokens);
+
         // Decode loop
         std::string generated_text;
         int completion_tokens = 0;
         std::string finish_reason = "length";
 
-        for (int i = 0; i < request.max_tokens; ++i)
+        for (int i = 0; i < effective_max_tokens; ++i)
         {
             GenerationResult result = runner_.decodeStep();
 
@@ -435,6 +462,13 @@ namespace llaminar2
         if (prompt_tokens < 0)
             return response;
 
+        // Resolve effective max_tokens: if client did not specify a positive value,
+        // default to the remaining context window (max_seq_len - prompt_tokens).
+        int max_context = runner_.config().max_seq_len;
+        int effective_max_tokens = (request.max_tokens > 0)
+                                       ? request.max_tokens
+                                       : std::max(1, max_context - prompt_tokens);
+
         // Generate consistent metadata for all chunks
         std::string request_id = generateRequestId();
         std::string model = request.model.empty() ? model_name_ : request.model;
@@ -489,7 +523,7 @@ namespace llaminar2
         int completion_tokens = 0;
         std::string finish_reason = "length";
 
-        for (int i = 0; i < request.max_tokens; ++i)
+        for (int i = 0; i < effective_max_tokens; ++i)
         {
             GenerationResult result = runner_.decodeStep();
 

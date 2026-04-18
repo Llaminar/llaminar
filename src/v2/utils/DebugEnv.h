@@ -2253,11 +2253,6 @@ namespace llaminar2
         int ratio_prefill_linear_kb = 0;       ///< Linear codebook ratio prefill split-K override (0=use global/auto)
         int ratio_prefill_iq4_variant = -1;    ///< IQ4 codebook ratio prefill tile override (-1=use global/auto)
         int ratio_prefill_iq4_kb = 0;          ///< IQ4 codebook ratio prefill split-K override (0=use global/auto)
-        bool startup_gpu_repack = false;       ///< Enable startup GPU repack pipeline (LLAMINAR_ROCM_STARTUP_GPU_REPACK)
-        int repack_slots = 8;                  ///< Ring-buffer slot count for startup GPU repack pipeline
-        int repack_budget_mb = 1024;           ///< VRAM budget cap for startup GPU repack staging buffers
-        int repack_streams = 3;                ///< Stream count hint for startup GPU repack pipeline
-        bool force_ck = false;                 ///< Force CK ComposableKernel dispatch for all GEMMs (LLAMINAR_ROCM_FORCE_CK)
         bool concurrent_prefill = true;        ///< Multi-stream concurrent fused GEMM projections during prefill (LLAMINAR_ROCM_CONCURRENT_PREFILL, default ON)
         bool concurrent_decode = false;        ///< Enable multi-stream concurrent fused GEMV projections during decode (LLAMINAR_ROCM_CONCURRENT_DECODE)
 
@@ -2309,11 +2304,6 @@ namespace llaminar2
             ratio_prefill_linear_kb = 0;
             ratio_prefill_iq4_variant = -1;
             ratio_prefill_iq4_kb = 0;
-            startup_gpu_repack = false;
-            repack_slots = 8;
-            repack_budget_mb = 1024;
-            repack_streams = 3;
-            force_ck = false;
             concurrent_prefill = true;
             concurrent_decode = false;
 
@@ -2579,36 +2569,6 @@ namespace llaminar2
             if (ratio_prefill_iq4_kb_env)
             {
                 ratio_prefill_iq4_kb = std::clamp(std::atoi(ratio_prefill_iq4_kb_env), 0, 32);
-            }
-
-            const char *startup_gpu_repack_env = std::getenv("LLAMINAR_ROCM_STARTUP_GPU_REPACK");
-            if (startup_gpu_repack_env)
-            {
-                startup_gpu_repack = (std::atoi(startup_gpu_repack_env) != 0);
-            }
-
-            const char *repack_slots_env = std::getenv("LLAMINAR_ROCM_REPACK_SLOTS");
-            if (repack_slots_env)
-            {
-                repack_slots = std::max(1, std::atoi(repack_slots_env));
-            }
-
-            const char *repack_budget_env = std::getenv("LLAMINAR_ROCM_REPACK_BUDGET_MB");
-            if (repack_budget_env)
-            {
-                repack_budget_mb = std::max(128, std::atoi(repack_budget_env));
-            }
-
-            const char *repack_streams_env = std::getenv("LLAMINAR_ROCM_REPACK_STREAMS");
-            if (repack_streams_env)
-            {
-                repack_streams = std::max(1, std::atoi(repack_streams_env));
-            }
-
-            const char *force_ck_env = std::getenv("LLAMINAR_ROCM_FORCE_CK");
-            if (force_ck_env)
-            {
-                force_ck = (std::atoi(force_ck_env) != 0);
             }
 
             const char *concurrent_prefill_env = std::getenv("LLAMINAR_ROCM_CONCURRENT_PREFILL");

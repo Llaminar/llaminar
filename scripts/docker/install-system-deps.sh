@@ -31,6 +31,7 @@ APT_OPTS=(
 # --- Bootstrap: packages required to enable `universe` --------------------
 apt-get "${APT_OPTS[@]}" update
 apt-get "${APT_OPTS[@]}" install -y --no-install-recommends \
+    --allow-change-held-packages \
     ca-certificates \
     gnupg \
     software-properties-common \
@@ -42,6 +43,7 @@ apt-get "${APT_OPTS[@]}" update
 if [[ "${MODE}" == "build" ]]; then
     # --- Full build toolchain --------------------------------------------
     apt-get "${APT_OPTS[@]}" install -y --no-install-recommends \
+        --allow-change-held-packages \
         build-essential \
         ccache \
         cmake \
@@ -87,6 +89,7 @@ else
     # Only what the compiled binary needs at process start. No compilers, no
     # -dev packages, no GTest. Keeps the runtime image as small as possible.
     apt-get "${APT_OPTS[@]}" install -y --no-install-recommends \
+        --allow-change-held-packages \
         libgomp1 \
         libhwloc15 \
         libnuma1 \

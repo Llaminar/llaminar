@@ -1699,10 +1699,19 @@ TEST_F(Test__ROCmFlashAttentionParity, FlashDecode_FP32_VeryLong_Parity)
     std::vector<float> rocm_output(out_size, 0.0f);
 
     // CPU reference using production CPUFlashAttentionKernelT::compute_decode()
+    //
+    // NOTE: For seq_len=1 decode, production (AttentionComputeStage.cpp) always
+    // passes causal=false because the query is implicitly at position (kv_len-1)
+    // and a causal mask would be all-zeros (sees everything). Passing causal=true
+    // with position_offset=0 means "query at absolute position 0" — the CPU kernel
+    // would mask out kv[1..kv_len-1] and only attend to kv[0], which is not what
+    // this test intends to validate. The ROCm decode kernel does not honor a
+    // causal flag at all (always behaves like causal=false), so causal=false on
+    // the CPU side is the only setting that produces a meaningful parity check.
     CPUFlashAttentionKernelT<ActivationPrecision::FP32> cpu_kernel;
     bool cpu_success = cpu_kernel.compute_decode(
         Q_data.data(), K_data.data(), V_data.data(), cpu_output.data(),
-        seq_len, kv_len, n_heads, n_kv_heads, head_dim, true);
+        seq_len, kv_len, n_heads, n_kv_heads, head_dim, false);
     ASSERT_TRUE(cpu_success) << "CPU compute_decode failed";
 
     // ROCm decode
@@ -1725,8 +1734,8 @@ TEST_F(Test__ROCmFlashAttentionParity, FlashDecode_FP32_VeryLong_Parity)
     bool rocm_success = rocm_kernel.compute_decode(
         d_Q, d_K, d_V, d_output,
         seq_len, kv_len, n_heads, n_kv_heads, head_dim,
-        true, // causal
-        0);   // position_offset
+        false, // causal (see note above — production also uses false for seq_len=1)
+        0);    // position_offset
     hipDeviceSynchronize();
 
     ASSERT_TRUE(rocm_success);
@@ -1779,10 +1788,11 @@ TEST_F(Test__ROCmFlashAttentionParity, FlashDecode_FP32_MHA_Parity)
     std::vector<float> rocm_output(out_size, 0.0f);
 
     // CPU reference using production CPUFlashAttentionKernelT::compute_decode()
+    // (see VeryLong test above for note on why causal=false is correct here)
     CPUFlashAttentionKernelT<ActivationPrecision::FP32> cpu_kernel;
     bool cpu_success = cpu_kernel.compute_decode(
         Q_data.data(), K_data.data(), V_data.data(), cpu_output.data(),
-        seq_len, kv_len, n_heads, n_kv_heads, head_dim, true);
+        seq_len, kv_len, n_heads, n_kv_heads, head_dim, false);
     ASSERT_TRUE(cpu_success) << "CPU compute_decode failed";
 
     llaminar2::rocm::ROCmFlashAttentionKernelT<ActivationPrecision::FP32> rocm_kernel(0);
@@ -1803,8 +1813,8 @@ TEST_F(Test__ROCmFlashAttentionParity, FlashDecode_FP32_MHA_Parity)
     bool rocm_success = rocm_kernel.compute_decode(
         d_Q, d_K, d_V, d_output,
         seq_len, kv_len, n_heads, n_kv_heads, head_dim,
-        true, // causal
-        0);   // position_offset
+        false, // causal (see VeryLong test for explanation)
+        0);    // position_offset
     hipDeviceSynchronize();
 
     ASSERT_TRUE(rocm_success);
@@ -1856,10 +1866,11 @@ TEST_F(Test__ROCmFlashAttentionParity, FlashDecode_FP32_HeadDim128_Parity)
     std::vector<float> rocm_output(out_size, 0.0f);
 
     // CPU reference using production CPUFlashAttentionKernelT::compute_decode()
+    // (see VeryLong test above for note on why causal=false is correct here)
     CPUFlashAttentionKernelT<ActivationPrecision::FP32> cpu_kernel;
     bool cpu_success = cpu_kernel.compute_decode(
         Q_data.data(), K_data.data(), V_data.data(), cpu_output.data(),
-        seq_len, kv_len, n_heads, n_kv_heads, head_dim, true);
+        seq_len, kv_len, n_heads, n_kv_heads, head_dim, false);
     ASSERT_TRUE(cpu_success) << "CPU compute_decode failed";
 
     llaminar2::rocm::ROCmFlashAttentionKernelT<ActivationPrecision::FP32> rocm_kernel(0);
@@ -1880,8 +1891,8 @@ TEST_F(Test__ROCmFlashAttentionParity, FlashDecode_FP32_HeadDim128_Parity)
     bool rocm_success = rocm_kernel.compute_decode(
         d_Q, d_K, d_V, d_output,
         seq_len, kv_len, n_heads, n_kv_heads, head_dim,
-        true, // causal
-        0);   // position_offset
+        false, // causal (see VeryLong test for explanation)
+        0);    // position_offset
     hipDeviceSynchronize();
 
     ASSERT_TRUE(rocm_success);

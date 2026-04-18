@@ -278,44 +278,71 @@ namespace llaminar2
 
     void ChatTemplate::detectThinkingTags()
     {
-        // Differential rendering approach (like llama.cpp):
-        // Compare enable_thinking=true vs NOT passing enable_thinking at all
-        // This makes `enable_thinking is defined` differ between the two.
+        // Differential rendering approach (inspired by llama.cpp):
+        // Render the generation prompt three ways and compare.
+        //
+        //   A) enable_thinking=true   (thinking active)
+        //   B) enable_thinking=false  (thinking suppressed — templates often
+        //                              emit an empty `<think></think>` block
+        //                              here, which exposes both tags)
+        //   C) enable_thinking unset  (pre-2025 Qwen / non-thinking templates
+        //                              behave as if thinking were off)
+        //
+        // Historically we only compared (A) vs (C). That works for templates
+        // whose internal default is "off when unset", but fails silently when
+        // a template defaults `enable_thinking=true` in its own namespace
+        // (e.g. the community Qwen 3.5 Jinja) — (A) and (C) render identically
+        // and the detector incorrectly concludes the template is not a
+        // thinking model. Adding the (A) vs (B) comparison fixes that class.
         std::vector<ChatMessage> test_messages = {
             {"user", "Hello"}};
 
         std::string with_thinking = renderJinja(test_messages, true, true);
+        std::string no_thinking = renderJinja(test_messages, true, false);
         std::string without_thinking = renderJinjaWithoutThinkingVar(test_messages, true);
 
         LOG_DEBUG("[ChatTemplate] detectThinkingTags: with_thinking (" << with_thinking.size()
+                                                                        << " chars), no_thinking ("
+                                                                        << no_thinking.size()
                                                                         << " chars), without_thinking ("
                                                                         << without_thinking.size() << " chars)");
 
-        if (with_thinking.empty() || without_thinking.empty())
+        if (with_thinking.empty())
         {
             return;
         }
 
-        // Find the suffix difference: what's appended when thinking is enabled
-        // Both should share the same prefix up to the generation prompt
-        if (with_thinking == without_thinking)
+        // Prefer whichever non-thinking rendering actually differs from the
+        // thinking one. For modern Qwen 3.x templates this will be
+        // no_thinking; for legacy ones it will be without_thinking.
+        std::string reference;
+        if (!no_thinking.empty() && no_thinking != with_thinking)
         {
-            // No difference — not a thinking model
+            reference = no_thinking;
+        }
+        else if (!without_thinking.empty() && without_thinking != with_thinking)
+        {
+            reference = without_thinking;
+        }
+        else
+        {
+            // All three renderings are identical — template does not branch on
+            // enable_thinking, so it is not a thinking model.
             is_thinking_model_ = false;
             return;
         }
 
         // Find the common prefix
         size_t common = 0;
-        size_t min_len = std::min(with_thinking.size(), without_thinking.size());
-        while (common < min_len && with_thinking[common] == without_thinking[common])
+        size_t min_len = std::min(with_thinking.size(), reference.size());
+        while (common < min_len && with_thinking[common] == reference[common])
         {
             common++;
         }
 
         // The difference at the end tells us the thinking tags
         std::string thinking_suffix = with_thinking.substr(common);
-        std::string non_thinking_suffix = without_thinking.substr(common);
+        std::string non_thinking_suffix = reference.substr(common);
 
         // Helper: find a closing tag like </think> in a string
         auto find_close_tag = [](const std::string &s) -> std::string

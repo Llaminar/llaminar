@@ -223,6 +223,24 @@ namespace llaminar2
         dst[idx] = __float2half(to_float_device(src[idx]));
     }
 
+    // =========================================================================
+    // convert_to_q8_1_kernel — wave-shuffle optimized
+    //
+    // Layout: one 32-thread workgroup per Q8_1 block. Each lane owns one
+    // element, keeps it in a register, and uses cross-lane XOR butterflies
+    // for absmax + sum reductions. This replaces the prior implementation,
+    // which used 3 LDS arrays (s_absmax / s_q / s_sum), 2 LDS tree reductions,
+    // and 10 __syncthreads() barriers — all avoidable when all participating
+    // threads live in a single wavefront and the reduction width equals the
+    // shuffle width.
+    //
+    // Benefits on gfx906/gfx90a:
+    //   - 0 __syncthreads() (down from ~10)
+    //   - 0 LDS usage (down from 3 × 32 × 4 B = 384 B)
+    //   - 5 __shfl_xor butterflies replace each 5-level LDS tree reduction
+    //   - Register-resident q value streams directly into coalesced qs[] store
+    //   - Higher occupancy (no LDS pressure)
+    // =========================================================================
     template <typename SrcT>
     __global__ void convert_to_q8_1_kernel(
         const SrcT *__restrict__ src,
@@ -231,63 +249,54 @@ namespace llaminar2
         int cols,
         int blocks_per_row)
     {
+        constexpr int BS = Q8_1Block::BLOCK_SIZE;  // 32
         const int row = blockIdx.y;
         const int block_col = blockIdx.x;
         const int lane = threadIdx.x;
 
-        if (row >= rows || block_col >= blocks_per_row || lane >= Q8_1Block::BLOCK_SIZE)
+        if (row >= rows || block_col >= blocks_per_row || lane >= BS)
             return;
 
-        const int col = block_col * Q8_1Block::BLOCK_SIZE + lane;
+        const int col = block_col * BS + lane;
         const bool in_bounds = (col < cols);
         const float x = in_bounds ? to_float_device(src[row * cols + col]) : 0.0f;
 
-        __shared__ float s_absmax[Q8_1Block::BLOCK_SIZE];
-        __shared__ int s_q[Q8_1Block::BLOCK_SIZE];
-        __shared__ int s_sum[Q8_1Block::BLOCK_SIZE];
-
-        s_absmax[lane] = fabsf(x);
-        __syncthreads();
-
-        for (int stride = Q8_1Block::BLOCK_SIZE / 2; stride > 0; stride >>= 1)
+        // -------- 1) Absmax via __shfl_xor butterfly (register-only) --------
+        float absmax = fabsf(x);
+        #pragma unroll
+        for (int offset = BS / 2; offset > 0; offset >>= 1)
         {
-            if (lane < stride)
-            {
-                s_absmax[lane] = fmaxf(s_absmax[lane], s_absmax[lane + stride]);
-            }
-            __syncthreads();
+            absmax = fmaxf(absmax, __shfl_xor(absmax, offset));
         }
+        // After butterfly, every lane in the 32-thread group holds the full absmax.
 
-        const float absmax = s_absmax[0];
+        // -------- 2) Compute per-lane quantum --------
         const float d = (absmax > 0.0f) ? (absmax / 127.0f) : 0.0f;
+        const float inv_d = (d > 0.0f) ? (127.0f / absmax) : 0.0f;
         int q = 0;
         if (d > 0.0f)
         {
-            q = __float2int_rn(x / d);
+            q = __float2int_rn(x * inv_d);
             q = max(-127, min(127, q));
         }
 
-        s_q[lane] = q;
-        s_sum[lane] = q;
-        __syncthreads();
-
-        for (int stride = Q8_1Block::BLOCK_SIZE / 2; stride > 0; stride >>= 1)
+        // -------- 3) Sum via __shfl_xor butterfly (register-only) --------
+        int sum_qs = q;
+        #pragma unroll
+        for (int offset = BS / 2; offset > 0; offset >>= 1)
         {
-            if (lane < stride)
-            {
-                s_sum[lane] += s_sum[lane + stride];
-            }
-            __syncthreads();
+            sum_qs += __shfl_xor(sum_qs, offset);
         }
+        // After butterfly, every lane holds the block sum.
 
+        // -------- 4) Write qs[] in coalesced fashion + scalars from lane 0 --------
+        Q8_1Block &out = dst[row * blocks_per_row + block_col];
+        out.qs[lane] = static_cast<int8_t>(q);
         if (lane == 0)
         {
-            Q8_1Block &out = dst[row * blocks_per_row + block_col];
             out.d = __half_as_ushort(__float2half(d));
-            out.sum_qs = static_cast<int16_t>(s_sum[0]);
+            out.sum_qs = static_cast<int16_t>(sum_qs);
         }
-
-        dst[row * blocks_per_row + block_col].qs[lane] = static_cast<int8_t>(s_q[lane]);
     }
 
     // =========================================================================
