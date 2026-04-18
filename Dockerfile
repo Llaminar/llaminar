@@ -94,6 +94,19 @@ RUN --mount=type=cache,target=/root/.ccache \
         -DCMAKE_CUDA_ARCHITECTURES="${LLAMINAR_CUDA_ARCHS}" \
  && cmake --build build_v2_release --parallel --target llaminar2
 
+# Strip debug info from every executable + .a/.so in both build trees.
+# Integration test binaries average ~370 MB unstripped (mostly CUDA fatbin
+# + DWARF), ~85 MB stripped — a 4x shrink across ~600 binaries dominates
+# the builder image size. We keep assertions / sanitizers (those are
+# compile-flag controlled, not stripped), so test fidelity is unchanged.
+# `--strip-debug` (not `--strip-all`) preserves the symbol table, so
+# stack traces from gtest / gdb attach still resolve function names.
+RUN find build_v2_integration build_v2_release \
+        \( -type f -executable -o -name '*.a' -o -name '*.so' -o -name '*.so.*' \) \
+        -not -path '*/CMakeFiles/*' \
+        -print0 \
+    | xargs -0 -r -P "$(nproc)" -n 32 strip --strip-debug 2>/dev/null || true
+
 # CI runs `docker run --group-add render --group-add video` against this
 # builder image; docker resolves --group-add names from the image's /etc/group,
 # not the host's. Ensure those groups exist so the gates can attach to

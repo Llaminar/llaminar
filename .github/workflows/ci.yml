@@ -135,6 +135,11 @@ jobs:
             VERSION=${{ github.ref_name }}
             VCS_REF=${{ github.sha }}
             BUILD_DATE=${{ github.event.repository.updated_at }}
+            # The self-hosted runner has a single RTX 3090 (sm_86). Building
+            # fatbins for the full 75/80/86/89/90 set ~5x's CUDA code size
+            # for hardware we cannot exercise here. Devs still get the full
+            # set when building locally via the default Dockerfile ARG.
+            LLAMINAR_CUDA_ARCHS=86
 
       - name: Extract ccache from BuildKit
         if: always()
