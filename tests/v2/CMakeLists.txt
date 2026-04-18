@@ -4166,6 +4166,31 @@ find_package(ZLIB QUIET)
 if(ZLIB_FOUND)
     get_filename_component(WORKSPACE_ROOT_PARITY "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
 
+    # Auto-clone cnpy if missing (small header + single .cpp for .npy file loading).
+    # cnpy is .gitignored under external/ so fresh checkouts (and Docker builds that
+    # COPY only src/+tests/) won't have it. Clone shallowly when needed.
+    set(CNPY_DIR "${WORKSPACE_ROOT_PARITY}/external/cnpy")
+    if(NOT EXISTS "${CNPY_DIR}/cnpy.cpp")
+        find_package(Git REQUIRED)
+        message(STATUS "V2 Tests: cnpy not found in external/, cloning https://github.com/rogersce/cnpy.git ...")
+        if(NOT EXISTS "${WORKSPACE_ROOT_PARITY}/external")
+            file(MAKE_DIRECTORY "${WORKSPACE_ROOT_PARITY}/external")
+        endif()
+        execute_process(
+            COMMAND ${GIT_EXECUTABLE} clone --depth 1 https://github.com/rogersce/cnpy.git cnpy
+            WORKING_DIRECTORY "${WORKSPACE_ROOT_PARITY}/external"
+            RESULT_VARIABLE CNPY_CLONE_RESULT
+            ERROR_VARIABLE CNPY_CLONE_ERROR
+        )
+        if(NOT CNPY_CLONE_RESULT EQUAL 0)
+            message(WARNING "V2 Tests: Failed to clone cnpy: ${CNPY_CLONE_ERROR}\n  Parity tests will be disabled.")
+        endif()
+    endif()
+
+    if(NOT EXISTS "${CNPY_DIR}/cnpy.cpp")
+        message(WARNING "V2 Tests: cnpy unavailable; skipping parity test executables")
+    else()
+
     # =========================================================================
     # Qwen2 Parity Test Matrix (integration/parity/qwen2/)
     # =========================================================================
@@ -4509,6 +4534,7 @@ if(ZLIB_FOUND)
 
     message(STATUS "V2: NodeLocalTP parity tests enabled (requires mpirun -np 2+)")
 
+    endif() # cnpy available
 else()
     message(STATUS "V2: Parity tests disabled (ZLIB not found)")
 endif()
