@@ -56,6 +56,7 @@ jobs:
     secrets: inherit
     with:
       image-tag: ${{ needs.release-please.outputs.tag_name || github.sha }}
+      run-gates: false
 
   # ---------------------------------------------------------------------------
   # On a release commit, the CI workflow above has already built and pushed

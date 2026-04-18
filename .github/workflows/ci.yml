@@ -2,9 +2,7 @@ name: CI
 
 on:
   pull_request:
-    branches: [develop, master]
-  push:
-    branches: [develop]
+    branches: [master]
   workflow_call:
     inputs:
       image-tag:
@@ -12,6 +10,11 @@ on:
         required: false
         type: string
         default: ci
+      run-gates:
+        description: "Run gate checks (tests/parity/e2e/perf)"
+        required: false
+        type: boolean
+        default: true
     outputs:
       image-ref:
         description: "Full image reference (registry/owner/name:tag) of the published runtime image"
@@ -46,6 +49,9 @@ jobs:
   # ===========================================================================
   ci:
     name: CI gates
+    if: |
+      github.event_name == 'workflow_call' ||
+      (github.event_name == 'pull_request' && github.base_ref == 'master' && github.head_ref == 'develop')
     runs-on: [self-hosted, linux, x64, llaminar-bench]
     timeout-minutes: 240
     outputs:
@@ -99,6 +105,7 @@ jobs:
       # Gate 1: unit tests. Fast, no models needed, pure CPU/GPU isolation.
       # ---------------------------------------------------------------------
       - name: Gate 1 — Unit tests
+        if: ${{ inputs.run-gates != false }}
         run: |
           docker run --rm \
             --gpus all \
@@ -117,6 +124,7 @@ jobs:
       # so ctest sees them at the conventional path.
       # ---------------------------------------------------------------------
       - name: Stage models
+        if: ${{ inputs.run-gates != false }}
         run: |
           if [ ! -d "${MODELS_DIR}" ]; then
             echo "::error::Models directory ${MODELS_DIR} not found on runner. Populate it with the GGUF weights referenced by the parity tests."
@@ -125,6 +133,7 @@ jobs:
           ls -1 "${MODELS_DIR}" | head
 
       - name: Gate 2 — PyTorch parity (Qwen2 SingleDevice)
+        if: ${{ inputs.run-gates != false }}
         run: |
           docker run --rm \
             --gpus all \
@@ -138,6 +147,7 @@ jobs:
                   --timeout 900 -R '^V2_Integration_Parity_Qwen2_SingleDevice$'
 
       - name: Gate 2 — PyTorch parity (Qwen35 SingleDevice, 08B)
+        if: ${{ inputs.run-gates != false }}
         run: |
           docker run --rm \
             --gpus all \
@@ -152,6 +162,7 @@ jobs:
                   --timeout 900 -R '^V2_Integration_Parity_Qwen35_SingleDevice$'
 
       - name: Gate 2 — PyTorch parity (Qwen2 NodeLocalTP)
+        if: ${{ inputs.run-gates != false }}
         run: |
           docker run --rm \
             --gpus all \
@@ -165,6 +176,7 @@ jobs:
                   --timeout 900 -R '^V2_Integration_Parity_NodeLocalTP$'
 
       - name: Gate 2 — PyTorch parity (Qwen35 NodeLocalTP, 08B)
+        if: ${{ inputs.run-gates != false }}
         run: |
           docker run --rm \
             --gpus all \
@@ -183,6 +195,7 @@ jobs:
       # shell harness that boots the server and curls it.
       # ---------------------------------------------------------------------
       - name: Gate 3 — E2E server tests
+        if: ${{ inputs.run-gates != false }}
         run: |
           docker run --rm \
             --gpus all \
@@ -202,6 +215,7 @@ jobs:
       # forbidden to lower thresholds without explicit approval).
       # ---------------------------------------------------------------------
       - name: Gate 4 — Performance regression ratchet
+        if: ${{ inputs.run-gates != false }}
         run: |
           docker run --rm \
             --gpus all \
