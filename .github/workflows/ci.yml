@@ -53,8 +53,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Use the host docker engine as the buildx driver (instead of the
+      # default docker-container driver). With the docker driver, `--load`
+      # is a no-op: the image is already in the local engine after build,
+      # avoiding the multi-GB OCI tar export + re-import cycle that took
+      # >1h of single-threaded buildkitd CPU on the previous attempts.
+      # Tradeoff: no multi-platform / no cache-to=registry, neither of
+      # which we use on the self-hosted GPU runner.
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
+        with:
+          driver: docker
 
       - name: Log in to GHCR
         if: github.event_name != 'pull_request'
