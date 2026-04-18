@@ -8,7 +8,12 @@
 # - Trust: dockerd configured to allow http for localhost:5000 + LAN host name
 set -euo pipefail
 
-REG_HOST="home.sanftenberg.net"
+# `xeon` is the physical runner box on the LAN (192.168.50.98). DO NOT use
+# `home.sanftenberg.net` here — that resolves to the router downstairs and
+# would force every registry round-trip out to wifi and back. CI itself uses
+# `localhost:5000` so it's pure loopback; this LAN entry is only here so
+# other LAN hosts (devboxes etc.) can also pull from the registry.
+REG_HOST="xeon"
 REG_PORT=5000
 DATA_DIR="/var/lib/llaminar-registry/data"
 UNIT="/etc/systemd/system/llaminar-registry.service"
@@ -63,8 +68,11 @@ cfg = json.load(sys.stdin) if sys.stdin.read else {}
 if ! command -v jq >/dev/null; then
     sudo apt-get install -y jq
 fi
+# Replace any prior insecure-registries list (we want to drop stale entries
+# like `home.sanftenberg.net:5000` from earlier runs that pointed at the
+# router instead of the host).
 sudo jq --arg h1 "localhost:${REG_PORT}" --arg h2 "127.0.0.1:${REG_PORT}" --arg h3 "${REG_HOST}:${REG_PORT}" \
-    '. + {"insecure-registries": ((."insecure-registries" // []) + [$h1, $h2, $h3] | unique)}' \
+    '. + {"insecure-registries": [$h1, $h2, $h3]}' \
     "$DOCKER_CFG" > "$TMP"
 sudo mv "$TMP" "$DOCKER_CFG"
 sudo chmod 0644 "$DOCKER_CFG"
