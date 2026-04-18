@@ -31,6 +31,12 @@ env:
   MODELS_DIR: /opt/llaminar-models
   # Tag used for the ephemeral builder image (not pushed to GHCR).
   BUILDER_IMAGE: llaminar-builder:${{ github.sha }}
+  # Disk-backed Docker registry running on the self-hosted runner host
+  # (llaminar-registry.service). Stores builder image layers across reboots
+  # so we don't pay the ~50min cold-build cost when tmpfs /var/lib/docker
+  # is wiped. See ops/setup-local-registry.sh for provisioning.
+  LOCAL_REGISTRY: localhost:5000
+  BUILDER_CACHE_REF: localhost:5000/llaminar-builder:cache-warmer
 
 jobs:
   # ===========================================================================
@@ -110,18 +116,34 @@ jobs:
           skip-extraction: true
 
       # ---------------------------------------------------------------------
+      # Warm the local Docker engine's layer cache from the disk-backed
+      # registry running on the host (llaminar-registry.service, port 5000).
+      # tmpfs /var/lib/docker means a host reboot wipes every layer; the
+      # registry is on the rootfs nvme so layers survive.
+      #
+      # We pull the previous builder image under the BUILDER_CACHE_REF tag.
+      # With `driver: docker`, BuildKit consults the local engine's image
+      # store for cache hits, so identical Dockerfile layers (system deps,
+      # CUDA, ROCm, CUTLASS install) hit cache immediately. The `|| true`
+      # makes the very first run on a fresh registry a no-op.
+      # ---------------------------------------------------------------------
+      - name: Warm builder cache from local registry
+        run: |
+          docker pull "${BUILDER_CACHE_REF}" || \
+            echo "::notice::No prior builder image in local registry — first run, will populate after build."
+
+      # ---------------------------------------------------------------------
       # Build the builder stage. `load: true` makes the image available to
       # the local Docker daemon so subsequent `docker run` steps can use it.
-      # The builder image is NOT pushed to any registry.
+      # The builder image is NOT pushed to any external registry.
       # ---------------------------------------------------------------------
-      # NOTE: cache-to/from removed for self-hosted runner.
-      # The runner uploads to GHA cache over a residential wifi uplink, which
-      # made `mode=max` exports of the (~200 GB) builder image stall the job
-      # for >40 min and trip the runner watchdog. The local Docker daemon on
-      # tmpfs already keeps layers between runs, and ccache is persisted
-      # separately via actions/cache + buildkit-cache-dance above. If we ever
-      # move to a faster uplink or a dedicated registry mirror we can re-add
-      # `cache-to: type=registry,...` here.
+      # NOTE: we deliberately do NOT use `cache-to: type=gha,mode=max` on the
+      # self-hosted runner. The runner uploads to GHA cache over a residential
+      # wifi uplink, which made `mode=max` exports of the (~200 GB) builder
+      # image stall the job for >40 min and trip the runner watchdog. The
+      # warm-cache step above gives us cross-reboot layer reuse via the local
+      # disk-backed registry, and ccache is persisted separately via
+      # actions/cache + buildkit-cache-dance above.
       - name: Build builder image
         uses: docker/build-push-action@v6
         with:
@@ -134,6 +156,20 @@ jobs:
             VERSION=${{ github.ref_name }}
             VCS_REF=${{ github.sha }}
             BUILD_DATE=${{ github.event.repository.updated_at }}
+
+      # ---------------------------------------------------------------------
+      # Push the freshly built image to the local registry under the
+      # cache-warmer tag so the NEXT run can warm from it. Also tag by
+      # short-sha for traceability / debugging. This is loopback HTTP, so
+      # push speed is only bound by the rootfs nvme write throughput.
+      # ---------------------------------------------------------------------
+      - name: Push builder image to local registry (cache for next run)
+        run: |
+          SHORT_SHA="${GITHUB_SHA:0:7}"
+          docker tag "${BUILDER_IMAGE}" "${BUILDER_CACHE_REF}"
+          docker tag "${BUILDER_IMAGE}" "${LOCAL_REGISTRY}/llaminar-builder:sha-${SHORT_SHA}"
+          docker push "${BUILDER_CACHE_REF}"
+          docker push "${LOCAL_REGISTRY}/llaminar-builder:sha-${SHORT_SHA}"
 
       - name: Extract ccache from BuildKit
         if: always()
