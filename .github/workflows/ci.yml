@@ -53,6 +53,11 @@ env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
   MODELS_DIR: /opt/llaminar-models
+  # Persistent host directories used to accumulate parity / benchmark results
+  # across CI runs. The summary scripts read the last N <git-hash>/ subdirs to
+  # produce trend charts and tables. Populate with `mkdir -p` on the runner.
+  PARITY_HISTORY_DIR: /opt/llaminar-parity-history
+  BENCHMARK_HISTORY_DIR: /opt/llaminar-benchmark-history
   # Tag used for the ephemeral builder image (not pushed to GHCR).
   BUILDER_IMAGE: llaminar-builder:${{ github.sha }}
 
@@ -204,10 +209,12 @@ jobs:
             exit 1
           fi
           ls -1 "${MODELS_DIR}" | head
-          # Host-side directory that the parity gates bind-mount into the
-          # container. Tests write results/<git-hash>/<test>/*.csv here so we
-          # can summarize + upload after the gates complete (success or fail).
-          mkdir -p "${{ github.workspace }}/parity-results"
+          # Persistent host directories accumulate per-commit results across
+          # CI runs so the summary scripts can produce trend charts. We use
+          # `sudo mkdir` because docker bind-mounts may have created them as
+          # root with restrictive permissions on a previous run.
+          sudo mkdir -p "${PARITY_HISTORY_DIR}" "${BENCHMARK_HISTORY_DIR}"
+          sudo chown -R "$(id -u):$(id -g)" "${PARITY_HISTORY_DIR}" "${BENCHMARK_HISTORY_DIR}" || true
 
       - name: Gate 2 — PyTorch parity (Qwen2 SingleDevice)
         run: |
@@ -217,7 +224,7 @@ jobs:
             --group-add video --group-add render \
             --ipc=host --shm-size=16g \
             -v "${MODELS_DIR}:/src/models:ro" \
-            -v "${{ github.workspace }}/parity-results:/src/tests/v2/integration/parity/results" \
+            -v "${PARITY_HISTORY_DIR}:/src/tests/v2/integration/parity/results" \
             --workdir /src \
             ${{ env.BUILDER_IMAGE }} \
             ctest --test-dir build_v2_integration --output-on-failure \
@@ -231,7 +238,7 @@ jobs:
             --group-add video --group-add render \
             --ipc=host --shm-size=16g \
             -v "${MODELS_DIR}:/src/models:ro" \
-            -v "${{ github.workspace }}/parity-results:/src/tests/v2/integration/parity/results" \
+            -v "${PARITY_HISTORY_DIR}:/src/tests/v2/integration/parity/results" \
             -e GTEST_FILTER='*08B*' \
             --workdir /src \
             ${{ env.BUILDER_IMAGE }} \
@@ -246,7 +253,7 @@ jobs:
             --group-add video --group-add render \
             --ipc=host --shm-size=16g \
             -v "${MODELS_DIR}:/src/models:ro" \
-            -v "${{ github.workspace }}/parity-results:/src/tests/v2/integration/parity/results" \
+            -v "${PARITY_HISTORY_DIR}:/src/tests/v2/integration/parity/results" \
             --workdir /src \
             ${{ env.BUILDER_IMAGE }} \
             ctest --test-dir build_v2_integration --output-on-failure \
@@ -260,7 +267,7 @@ jobs:
             --group-add video --group-add render \
             --ipc=host --shm-size=16g \
             -v "${MODELS_DIR}:/src/models:ro" \
-            -v "${{ github.workspace }}/parity-results:/src/tests/v2/integration/parity/results" \
+            -v "${PARITY_HISTORY_DIR}:/src/tests/v2/integration/parity/results" \
             -e GTEST_FILTER='*08B*' \
             --workdir /src \
             ${{ env.BUILDER_IMAGE }} \
@@ -276,16 +283,33 @@ jobs:
         if: always()
         run: |
           python3 scripts/ci/summarize_parity_results.py \
-            --results-root "${{ github.workspace }}/parity-results" \
+            --results-root "${PARITY_HISTORY_DIR}" \
             --artifact-name parity-results-${{ github.run_id }}
+
+      - name: Generate parity trend charts
+        if: always()
+        run: |
+          python3 scripts/ci/summarize_parity_trends.py \
+            --results-root "${PARITY_HISTORY_DIR}" \
+            --out-dir "${{ github.workspace }}/parity-trends" \
+            --history 10
 
       - name: Upload parity result CSVs
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: parity-results-${{ github.run_id }}
-          path: ${{ github.workspace }}/parity-results/
+          path: ${PARITY_HISTORY_DIR}/
           if-no-files-found: warn
+          retention-days: 30
+
+      - name: Upload parity trend charts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: parity-trends-${{ github.run_id }}
+          path: ${{ github.workspace }}/parity-trends/
+          if-no-files-found: ignore
           retention-days: 30
 
       # ---------------------------------------------------------------------
@@ -319,9 +343,26 @@ jobs:
             --group-add video --group-add render \
             --ipc=host --shm-size=16g \
             -v "${MODELS_DIR}:/src/models:ro" \
+            -v "${BENCHMARK_HISTORY_DIR}:/benchmark-history" \
+            -e LLAMINAR_BENCHMARK_RESULTS_DIR=/benchmark-history \
             --workdir /src \
             ${{ env.BUILDER_IMAGE }} \
             .githooks/run_benchmark_check.sh
+
+      - name: Summarize performance results
+        if: always()
+        run: |
+          python3 scripts/ci/summarize_perf_results.py \
+            --results-root "${BENCHMARK_HISTORY_DIR}"
+
+      - name: Upload benchmark result JSON
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results-${{ github.run_id }}
+          path: ${BENCHMARK_HISTORY_DIR}/
+          if-no-files-found: ignore
+          retention-days: 90
 
       # ---------------------------------------------------------------------
       # All gates passed. Build the slim runtime stage and push to GHCR

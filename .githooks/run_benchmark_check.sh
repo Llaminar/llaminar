@@ -145,6 +145,62 @@ for (( mi=0; mi<NUM_MODELS; mi++ )); do
 done
 
 # ---------------------------------------------------------------------------
+# Emit machine-readable results JSON for CI summary tooling.
+# Path: $LLAMINAR_BENCHMARK_RESULTS_DIR/<git-hash>/benchmark_results.json
+# Schema: { "commit": "...", "timestamp": "...", "models": [
+#            { "name": "...", "model": "...", "devices": [
+#               { "device": "cuda:0", "prefill_tok_s": N, "decode_tok_s": N,
+#                 "baseline_prefill_tok_s": N, "baseline_decode_tok_s": N } ] } ] }
+# ---------------------------------------------------------------------------
+RESULTS_DIR="${LLAMINAR_BENCHMARK_RESULTS_DIR:-${ROOT_DIR}/benchmark_results}"
+COMMIT_HASH=$(git -C "$ROOT_DIR" rev-parse --short=8 HEAD 2>/dev/null || echo "unknown")
+mkdir -p "${RESULTS_DIR}/${COMMIT_HASH}"
+RESULTS_JSON="${RESULTS_DIR}/${COMMIT_HASH}/benchmark_results.json"
+
+{
+    echo "{"
+    echo "  \"commit\": \"${COMMIT_HASH}\","
+    echo "  \"timestamp\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\","
+    echo "  \"models\": ["
+    FIRST_MODEL=true
+    for (( mi=0; mi<NUM_MODELS; mi++ )); do
+        MODEL_NAME=$(jq -r ".models[$mi].name" "$BASELINE_FILE")
+        MODEL=$(jq -r ".models[$mi].model" "$BASELINE_FILE")
+        DEVICES=$(jq -r ".models[$mi].devices | keys[]" "$BASELINE_FILE")
+        $FIRST_MODEL || echo ","
+        FIRST_MODEL=false
+        echo "    {"
+        echo "      \"name\": $(jq -Rn --arg s "$MODEL_NAME" '$s'),"
+        echo "      \"model\": $(jq -Rn --arg s "$MODEL" '$s'),"
+        echo "      \"devices\": ["
+        FIRST_DEV=true
+        for DEVICE in $DEVICES; do
+            KEY="${mi}:${DEVICE}"
+            $FIRST_DEV || echo ","
+            FIRST_DEV=false
+            BL_P=$(jq -r ".models[$mi].devices[\"$DEVICE\"].prefill_tok_s" "$BASELINE_FILE")
+            BL_D=$(jq -r ".models[$mi].devices[\"$DEVICE\"].decode_tok_s" "$BASELINE_FILE")
+            CUR_P="${RESULTS_PREFILL[$KEY]:-null}"
+            CUR_D="${RESULTS_DECODE[$KEY]:-null}"
+            echo "        {"
+            echo "          \"device\": \"${DEVICE}\","
+            echo "          \"prefill_tok_s\": ${CUR_P},"
+            echo "          \"decode_tok_s\": ${CUR_D},"
+            echo "          \"baseline_prefill_tok_s\": ${BL_P},"
+            echo "          \"baseline_decode_tok_s\": ${BL_D}"
+            echo -n "        }"
+        done
+        echo
+        echo "      ]"
+        echo -n "    }"
+    done
+    echo
+    echo "  ]"
+    echo "}"
+} > "$RESULTS_JSON"
+echo -e "${BLUE}Wrote benchmark results JSON: ${RESULTS_JSON}${NC}"
+
+# ---------------------------------------------------------------------------
 # Update baseline mode
 # ---------------------------------------------------------------------------
 if $UPDATE_BASELINE; then

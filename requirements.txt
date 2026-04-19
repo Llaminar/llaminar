@@ -23,6 +23,9 @@ numpy>=1.24.0
 # Testing
 pytest>=8.0.0
 
+# Charting (CI: parity trend graphs in step summary)
+matplotlib>=3.8.0
+
 # Data handling
 sentencepiece>=0.2.0
 tokenizers>=0.19.0
