@@ -191,6 +191,11 @@ if(HAVE_ROCM)
     set(CMAKE_HIP_ARCHITECTURES "gfx906")
     # Note: hipcc's -parallel-jobs conflicts with CMake's --parallel, so we rely
     # on CMake's build parallelism instead (multiple hipcc processes in parallel)
+
+    # Suppress hipFree/hipMalloc [[nodiscard]] warnings — many tests intentionally
+    # ignore the return value during teardown when the program is about to exit.
+    # We still check return codes in production paths via HIP_CHECK macros.
+    set(CMAKE_HIP_FLAGS "${CMAKE_HIP_FLAGS} -Wno-unused-result")
 endif()
 
 # =============================================================================

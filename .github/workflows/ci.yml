@@ -180,6 +180,10 @@ jobs:
             exit 1
           fi
           ls -1 "${MODELS_DIR}" | head
+          # Host-side directory that the parity gates bind-mount into the
+          # container. Tests write results/<git-hash>/<test>/*.csv here so we
+          # can summarize + upload after the gates complete (success or fail).
+          mkdir -p "${{ github.workspace }}/parity-results"
 
       - name: Gate 2 — PyTorch parity (Qwen2 SingleDevice)
         run: |
@@ -189,6 +193,7 @@ jobs:
             --group-add video --group-add render \
             --ipc=host --shm-size=16g \
             -v "${MODELS_DIR}:/src/models:ro" \
+            -v "${{ github.workspace }}/parity-results:/src/tests/v2/integration/parity/results" \
             --workdir /src \
             ${{ env.BUILDER_IMAGE }} \
             ctest --test-dir build_v2_integration --output-on-failure \
@@ -202,6 +207,7 @@ jobs:
             --group-add video --group-add render \
             --ipc=host --shm-size=16g \
             -v "${MODELS_DIR}:/src/models:ro" \
+            -v "${{ github.workspace }}/parity-results:/src/tests/v2/integration/parity/results" \
             -e GTEST_FILTER='*08B*' \
             --workdir /src \
             ${{ env.BUILDER_IMAGE }} \
@@ -216,6 +222,7 @@ jobs:
             --group-add video --group-add render \
             --ipc=host --shm-size=16g \
             -v "${MODELS_DIR}:/src/models:ro" \
+            -v "${{ github.workspace }}/parity-results:/src/tests/v2/integration/parity/results" \
             --workdir /src \
             ${{ env.BUILDER_IMAGE }} \
             ctest --test-dir build_v2_integration --output-on-failure \
@@ -229,11 +236,33 @@ jobs:
             --group-add video --group-add render \
             --ipc=host --shm-size=16g \
             -v "${MODELS_DIR}:/src/models:ro" \
+            -v "${{ github.workspace }}/parity-results:/src/tests/v2/integration/parity/results" \
             -e GTEST_FILTER='*08B*' \
             --workdir /src \
             ${{ env.BUILDER_IMAGE }} \
             ctest --test-dir build_v2_integration --output-on-failure \
                   --timeout 900 -R '^V2_Integration_Parity_Qwen35_NodeLocalTP_'
+
+      # ---------------------------------------------------------------------
+      # Summarize parity CSVs into the GitHub Actions step summary +
+      # upload the raw CSVs as a workflow artifact. Runs even if a parity
+      # gate failed so we can see partial results.
+      # ---------------------------------------------------------------------
+      - name: Summarize parity results
+        if: always()
+        run: |
+          python3 scripts/ci/summarize_parity_results.py \
+            --results-root "${{ github.workspace }}/parity-results" \
+            --artifact-name parity-results-${{ github.run_id }}
+
+      - name: Upload parity result CSVs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: parity-results-${{ github.run_id }}
+          path: ${{ github.workspace }}/parity-results/
+          if-no-files-found: warn
+          retention-days: 30
 
       # ---------------------------------------------------------------------
       # Gate 3: E2E server tests. Drives the compiled llaminar2 binary via a
@@ -297,6 +326,5 @@ jobs:
           name: ci-logs-${{ github.run_id }}
           path: |
             /tmp/srv_*.log
-            tests/v2/integration/parity/results/
           if-no-files-found: ignore
           retention-days: 14
