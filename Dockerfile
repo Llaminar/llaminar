@@ -64,6 +64,22 @@ RUN MODE=full   /tmp/install-scripts/install-rocm.sh
 RUN CUTLASS_VERSION=${CUTLASS_VERSION} /tmp/install-scripts/install-cutlass.sh
 RUN rm -rf /tmp/install-scripts
 
+# `docker build` cannot use `--gpus`, so nvidia-container-runtime never
+# injects the real /usr/lib/x86_64-linux-gnu/libcuda.so.1 driver lib.
+# Without it, any CUDA-linked binary (e.g. our parity test executables)
+# fails to start with exit 127 ("error while loading shared libraries:
+# libcuda.so.1") — which breaks the cmake POST_BUILD --gtest_list_tests
+# discovery step in tests/v2/cmake/V2ParityTestDiscovery.cmake.
+#
+# Resolve the SONAME against the CUDA toolkit's link-time stub for build
+# time only. At `docker run --gpus all` time, the real driver gets
+# injected at /usr/lib/x86_64-linux-gnu/libcuda.so.1 and wins via
+# ld.so.cache, so this stub is invisible at actual test execution time.
+RUN ln -sf /usr/local/cuda/lib64/stubs/libcuda.so \
+           /usr/local/cuda/lib64/stubs/libcuda.so.1 && \
+    echo "/usr/local/cuda/lib64/stubs" > /etc/ld.so.conf.d/zz-cuda-stubs.conf && \
+    ldconfig
+
 WORKDIR /src
 
 # Python dependencies for the reference tests + parity gates. Pulls the
