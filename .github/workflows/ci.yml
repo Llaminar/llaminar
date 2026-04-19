@@ -192,7 +192,7 @@ jobs:
             --workdir /src \
             ${{ env.BUILDER_IMAGE }} \
             ctest --test-dir build_v2_integration --output-on-failure \
-                  --timeout 900 -R '^V2_Integration_Parity_Qwen2_SingleDevice$'
+                  --timeout 900 -R '^V2_Integration_Parity_Qwen2_SingleDevice_'
 
       - name: Gate 2 — PyTorch parity (Qwen35 SingleDevice, 08B)
         run: |
@@ -206,7 +206,7 @@ jobs:
             --workdir /src \
             ${{ env.BUILDER_IMAGE }} \
             ctest --test-dir build_v2_integration --output-on-failure \
-                  --timeout 900 -R '^V2_Integration_Parity_Qwen35_SingleDevice$'
+                  --timeout 900 -R '^V2_Integration_Parity_Qwen35_SingleDevice_'
 
       - name: Gate 2 — PyTorch parity (Qwen2 NodeLocalTP)
         run: |
@@ -219,7 +219,7 @@ jobs:
             --workdir /src \
             ${{ env.BUILDER_IMAGE }} \
             ctest --test-dir build_v2_integration --output-on-failure \
-                  --timeout 900 -R '^V2_Integration_Parity_NodeLocalTP$'
+                  --timeout 900 -R '^V2_Integration_Parity_NodeLocalTP_'
 
       - name: Gate 2 — PyTorch parity (Qwen35 NodeLocalTP, 08B)
         run: |
@@ -233,7 +233,7 @@ jobs:
             --workdir /src \
             ${{ env.BUILDER_IMAGE }} \
             ctest --test-dir build_v2_integration --output-on-failure \
-                  --timeout 900 -R '^V2_Integration_Parity_Qwen35_NodeLocalTP$'
+                  --timeout 900 -R '^V2_Integration_Parity_Qwen35_NodeLocalTP_'
 
       # ---------------------------------------------------------------------
       # Gate 3: E2E server tests. Drives the compiled llaminar2 binary via a

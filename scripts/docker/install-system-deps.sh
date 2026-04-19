@@ -44,6 +44,7 @@ if [[ "${MODE}" == "build" ]]; then
     # --- Full build toolchain --------------------------------------------
     apt-get "${APT_OPTS[@]}" install -y --no-install-recommends \
         --allow-change-held-packages \
+        bc \
         build-essential \
         ccache \
         cmake \
