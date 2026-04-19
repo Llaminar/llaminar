@@ -66,6 +66,14 @@ RUN rm -rf /tmp/install-scripts
 
 WORKDIR /src
 
+# Python dependencies for the reference tests + parity gates. Pulls the
+# CPU-only PyTorch wheel (~250 MB) plus our transformers fork. Cached as a
+# separate layer keyed only on requirements.txt so source edits don't
+# invalidate it.
+COPY requirements.txt ./requirements.txt
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --break-system-packages -r requirements.txt
+
 COPY src ./src
 COPY tests ./tests
 COPY CMakeLists.txt ./CMakeLists.txt
@@ -73,6 +81,7 @@ COPY .githooks ./.githooks
 COPY jinja ./jinja
 COPY cmake ./cmake
 COPY external/vendor ./external/vendor
+COPY python ./python
 
 # Integration build — what CI drives for unit, parity, and E2E tests. Has
 # debug symbols, assertions active, tensor verification enabled.
