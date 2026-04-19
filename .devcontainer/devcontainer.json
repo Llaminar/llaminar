@@ -78,7 +78,7 @@
         3000,
         5000
     ],
-    "postCreateCommand": "bash -c 'sudo chmod 666 /dev/dri/render* 2>/dev/null || true && sudo chown -R vscode:vscode /workspace || true && git config --global --add safe.directory /workspaces/llaminar && bash /workspaces/llaminar/.devcontainer/setup-ccache.sh && bash /workspaces/llaminar/.devcontainer/setup-python-env.sh && gh auth login && cmake --version && gcc --version'",
+    "postCreateCommand": "bash -c 'sudo chmod 666 /dev/dri/render* 2>/dev/null || true && sudo chown -R vscode:vscode /workspace || true && git config --global --add safe.directory /workspaces/llaminar && bash /workspaces/llaminar/.devcontainer/setup-ccache.sh && bash /workspaces/llaminar/.devcontainer/setup-python-env.sh && gh auth login && GH_USER=$(gh api user --jq .login) && GH_NAME=$(gh api user --jq .name) && GH_ID=$(gh api user --jq .id) && git config --global user.name \"${GH_NAME:-$GH_USER}\" && git config --global user.email \"${GH_ID}+${GH_USER}@users.noreply.github.com\" && cmake --version && gcc --version'",
     "postStartCommand": "bash /workspaces/llaminar/.devcontainer/onstart.sh && bash /workspaces/llaminar/.devcontainer/setup-pcie-bar-caps.sh",
     "postAttachCommand": "bash /workspaces/llaminar/.devcontainer/onstart.sh",
     "remoteUser": "vscode",
