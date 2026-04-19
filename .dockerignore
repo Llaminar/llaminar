@@ -78,4 +78,3 @@ playground_*.py
 # Random text artefacts
 check_p2p.cpp
 test_rccl_init.cpp
-requirements.txt
