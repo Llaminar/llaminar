@@ -200,6 +200,31 @@ RESULTS_JSON="${RESULTS_DIR}/${COMMIT_HASH}/benchmark_results.json"
 } > "$RESULTS_JSON"
 echo -e "${BLUE}Wrote benchmark results JSON: ${RESULTS_JSON}${NC}"
 
+# Also emit a flat CSV alongside the JSON so trend tooling can ingest the
+# same per-commit history the same way the parity tests do.
+RESULTS_CSV="${RESULTS_DIR}/${COMMIT_HASH}/benchmark_results.csv"
+{
+    echo "commit,timestamp,model_name,model_path,device,prefill_tok_s,decode_tok_s,baseline_prefill_tok_s,baseline_decode_tok_s"
+    TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    for (( mi=0; mi<NUM_MODELS; mi++ )); do
+        MODEL_NAME=$(jq -r ".models[$mi].name" "$BASELINE_FILE")
+        MODEL=$(jq -r ".models[$mi].model" "$BASELINE_FILE")
+        DEVICES=$(jq -r ".models[$mi].devices | keys[]" "$BASELINE_FILE")
+        for DEVICE in $DEVICES; do
+            KEY="${mi}:${DEVICE}"
+            BL_P=$(jq -r ".models[$mi].devices[\"$DEVICE\"].prefill_tok_s" "$BASELINE_FILE")
+            BL_D=$(jq -r ".models[$mi].devices[\"$DEVICE\"].decode_tok_s" "$BASELINE_FILE")
+            CUR_P="${RESULTS_PREFILL[$KEY]:-}"
+            CUR_D="${RESULTS_DECODE[$KEY]:-}"
+            # Quote text columns that may contain commas/quotes.
+            esc_name=$(printf '%s' "$MODEL_NAME" | sed 's/"/""/g')
+            esc_model=$(printf '%s' "$MODEL" | sed 's/"/""/g')
+            echo "${COMMIT_HASH},${TS},\"${esc_name}\",\"${esc_model}\",${DEVICE},${CUR_P},${CUR_D},${BL_P},${BL_D}"
+        done
+    done
+} > "$RESULTS_CSV"
+echo -e "${BLUE}Wrote benchmark results CSV:  ${RESULTS_CSV}${NC}"
+
 # ---------------------------------------------------------------------------
 # Update baseline mode
 # ---------------------------------------------------------------------------

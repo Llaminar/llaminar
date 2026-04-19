@@ -355,6 +355,14 @@ jobs:
           python3 scripts/ci/summarize_perf_results.py \
             --results-root "${BENCHMARK_HISTORY_DIR}"
 
+      - name: Generate performance trend charts
+        if: always()
+        run: |
+          python3 scripts/ci/summarize_perf_trends.py \
+            --results-root "${BENCHMARK_HISTORY_DIR}" \
+            --out-dir "${{ github.workspace }}/perf-trends" \
+            --history 10
+
       - name: Upload benchmark result JSON
         if: always()
         uses: actions/upload-artifact@v4
@@ -363,6 +371,15 @@ jobs:
           path: ${BENCHMARK_HISTORY_DIR}/
           if-no-files-found: ignore
           retention-days: 90
+
+      - name: Upload performance trend charts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-trends-${{ github.run_id }}
+          path: ${{ github.workspace }}/perf-trends/
+          if-no-files-found: ignore
+          retention-days: 30
 
       # ---------------------------------------------------------------------
       # All gates passed. Build the slim runtime stage and push to GHCR
