@@ -3,8 +3,32 @@ name: CI
 on:
   pull_request:
     branches: [develop, master]
+    paths-ignore:
+      - 'README.md'
+      - 'LICENSE'
+      - 'docs/**'
+      - 'changelog/**'
+      - '.devcontainer/**'
+      - '.vscode/**'
+      - '.gitignore'
+      - '.gitattributes'
+      - '.editorconfig'
+      - '**/*.md'
+      - '**/.gitkeep'
   push:
     branches: [develop]
+    paths-ignore:
+      - 'README.md'
+      - 'LICENSE'
+      - 'docs/**'
+      - 'changelog/**'
+      - '.devcontainer/**'
+      - '.vscode/**'
+      - '.gitignore'
+      - '.gitattributes'
+      - '.editorconfig'
+      - '**/*.md'
+      - '**/.gitkeep'
   workflow_call:
     inputs:
       image-tag:
