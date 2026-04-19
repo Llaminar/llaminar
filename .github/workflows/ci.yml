@@ -164,8 +164,9 @@ jobs:
             --workdir /src \
             ${{ env.BUILDER_IMAGE }} \
             ctest --test-dir build_v2_integration \
-                  --output-on-failure --parallel \
-                  -R '^V2_Unit_'
+                  -R '^V2_Unit_' \
+                  --output-on-failure \
+                  --parallel
 
       # ---------------------------------------------------------------------
       # Gate 2: PyTorch parity (Qwen2 + Qwen3.5). Needs models staged at

@@ -4,18 +4,17 @@
             "name": "Linux",
             "includePath": [
                 "${workspaceFolder}/**",
-                "${workspaceFolder}/external/onednn/build/include",
-                "/usr/lib/x86_64-linux-gnu/openmpi/include"
+                "${workspaceFolder}/external/onednn/build/include"
             ],
             "defines": [
                 "HAVE_ONEDNN"
             ],
             "compilerPath": "/usr/bin/g++",
             "cStandard": "c17",
-            "cppStandard": "c++17",
+            "cppStandard": "c++23",
             "intelliSenseMode": "linux-gcc-x64",
             "compileCommands": [
-                "${workspaceFolder}/compile_commands.json"
+                "${workspaceFolder}/build_v2_integration/compile_commands.json"
             ],
             "configurationProvider": "ms-vscode.cmake-tools"
         }
