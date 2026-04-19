@@ -1898,7 +1898,10 @@ namespace llaminar2::test::parity
             LOG_INFO("[" << getBackendName() << " Parity] Regenerating PyTorch snapshots from GGUF: " << config_.model_path);
 
             std::ostringstream cmd;
-            cmd << "bash -c 'source /workspaces/llaminar/.venv/bin/activate && python3"
+            // Source devcontainer venv if present, else fall back to system
+            // python3 (which is what the CI builder image uses, where Python
+            // deps were installed via `pip install --break-system-packages`).
+            cmd << "bash -c '[ -f /workspaces/llaminar/.venv/bin/activate ] && source /workspaces/llaminar/.venv/bin/activate; python3"
                 << " python/reference/generate_qwen_pipeline_snapshots.py"
                 << " --model " << config_.model_path
                 << " --prompt \"" << config_.prompt << "\""

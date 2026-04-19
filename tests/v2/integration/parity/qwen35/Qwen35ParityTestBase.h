@@ -92,7 +92,9 @@ namespace llaminar2::test::parity::qwen35
                          << Base::config_.model_path);
 
             std::ostringstream cmd;
-            cmd << "bash -c 'source /workspaces/llaminar/.venv/bin/activate && python3"
+            // Source devcontainer venv if present, else fall back to system
+            // python3 (CI builder image installs deps to system site-packages).
+            cmd << "bash -c '[ -f /workspaces/llaminar/.venv/bin/activate ] && source /workspaces/llaminar/.venv/bin/activate; python3"
                 << " python/reference/generate_qwen35_pipeline_snapshots.py"
                 << " --model " << Base::config_.model_path
                 << " --prompt \"" << Base::config_.prompt << "\""

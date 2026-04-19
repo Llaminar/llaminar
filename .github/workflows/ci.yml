@@ -289,10 +289,19 @@ jobs:
       - name: Generate parity trend charts
         if: always()
         run: |
-          python3 scripts/ci/summarize_parity_trends.py \
-            --results-root "${PARITY_HISTORY_DIR}" \
-            --out-dir "${{ github.workspace }}/parity-trends" \
-            --history 10
+          mkdir -p "${{ github.workspace }}/parity-trends"
+          # Run inside the builder image so matplotlib (from requirements.txt)
+          # is available. Pipe stdout (markdown) to GITHUB_STEP_SUMMARY.
+          docker run --rm \
+            -v "${PARITY_HISTORY_DIR}:/parity-history:ro" \
+            -v "${{ github.workspace }}/parity-trends:/out" \
+            --workdir /src \
+            ${{ env.BUILDER_IMAGE }} \
+            python3 scripts/ci/summarize_parity_trends.py \
+              --results-root /parity-history \
+              --out-dir /out \
+              --history 10 \
+            >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload parity result CSVs
         if: always()
@@ -358,10 +367,17 @@ jobs:
       - name: Generate performance trend charts
         if: always()
         run: |
-          python3 scripts/ci/summarize_perf_trends.py \
-            --results-root "${BENCHMARK_HISTORY_DIR}" \
-            --out-dir "${{ github.workspace }}/perf-trends" \
-            --history 10
+          mkdir -p "${{ github.workspace }}/perf-trends"
+          docker run --rm \
+            -v "${BENCHMARK_HISTORY_DIR}:/bench-history:ro" \
+            -v "${{ github.workspace }}/perf-trends:/out" \
+            --workdir /src \
+            ${{ env.BUILDER_IMAGE }} \
+            python3 scripts/ci/summarize_perf_trends.py \
+              --results-root /bench-history \
+              --out-dir /out \
+              --history 10 \
+            >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload benchmark result JSON
         if: always()

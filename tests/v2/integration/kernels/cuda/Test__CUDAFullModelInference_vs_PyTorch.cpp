@@ -150,7 +150,9 @@ protected:
         LOG_INFO("[CUDA Parity] Regenerating PyTorch snapshots from GGUF: " << model_path_);
 
         std::ostringstream cmd;
-        cmd << "bash -c 'source /workspaces/llaminar/.venv/bin/activate && python3"
+        // Source devcontainer venv if present, else fall back to system python3
+        // (CI builder image installs deps via pip --break-system-packages).
+        cmd << "bash -c '[ -f /workspaces/llaminar/.venv/bin/activate ] && source /workspaces/llaminar/.venv/bin/activate; python3"
             << " python/reference/generate_qwen_pipeline_snapshots.py"
             << " --model " << model_path_
             << " --prompt \"" << TEST_PROMPT << "\""
