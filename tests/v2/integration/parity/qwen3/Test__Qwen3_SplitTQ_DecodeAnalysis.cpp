@@ -1558,7 +1558,13 @@ TEST_F(Qwen3SplitTQDecodeAnalysis, SplitTQCacheFlowSimulation_Layer0)
     // This is EXACTLY what AttentionComputeStage does in split regime
     std::cout << ">>> Step 4: Dequantize from cache buffer (pipeline-exact, split TQ8/TQ4)...\n";
 
-    std::vector<float> k_cache_dequant(k_rows * kv_dim, 0.0f);
+    // k_cache_dequant must be sized for the FULL cache (max_seq_len rows), not
+    // just k_rows: TQ8Tensor::dequantize_to_fp32 iterates over rows() = max_seq_len,
+    // and writing past the buffer end corrupts the heap (manifesting as a later
+    // crash inside TurboQuantContext::for_layer's hashtable lookup). v_cache
+    // uses turboquant_dequantize_v_rows which respects [from_row, to_row), so
+    // it can stay sized for v_rows only.
+    std::vector<float> k_cache_dequant(static_cast<size_t>(max_seq_len) * kv_dim, 0.0f);
     std::vector<float> v_cache_dequant(v_rows * kv_dim, 0.0f);
 
     // K dequant via TQ8Tensor
