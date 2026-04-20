@@ -249,19 +249,37 @@ jobs:
                   --timeout 900 -R '^V2_Integration_Parity_Qwen35_SingleDevice_'
 
       - name: Gate 2 — PyTorch parity (Qwen2 NodeLocalTP)
+        id: qwen2_node_local_tp
         run: |
+          # Enable core dumps so we can post-mortem any segfault. Stored on
+          # host under runner workspace, uploaded as artifact below.
+          mkdir -p "${{ github.workspace }}/cores"
+          chmod 1777 "${{ github.workspace }}/cores"
           docker run --rm \
             --gpus all \
             --device=/dev/kfd --device=/dev/dri \
             --group-add video --group-add render \
-            --cap-add SYS_NICE \
+            --cap-add SYS_NICE --cap-add SYS_PTRACE \
+            --ulimit core=-1 \
             --ipc=host --shm-size=16g \
             -v "${MODELS_DIR}:/src/models:ro" \
             -v "${PARITY_HISTORY_DIR}:/src/tests/v2/integration/parity/results" \
+            -v "${{ github.workspace }}/cores:/cores" \
             --workdir /src \
             ${{ env.BUILDER_IMAGE }} \
-            ctest --test-dir build_v2_integration --output-on-failure \
-                  --timeout 900 -R '^V2_Integration_Parity_NodeLocalTP_'
+            bash -c "echo '/cores/core.%e.%p.%t' > /proc/sys/kernel/core_pattern 2>/dev/null || true; \
+                     ulimit -c unlimited; \
+                     ctest --test-dir build_v2_integration --output-on-failure \
+                           --timeout 900 -R '^V2_Integration_Parity_NodeLocalTP_'"
+
+      - name: Upload NodeLocalTP core dumps (on failure)
+        if: failure() && steps.qwen2_node_local_tp.conclusion == 'failure'
+        uses: actions/upload-artifact@v4
+        with:
+          name: qwen2-node-local-tp-cores
+          path: ${{ github.workspace }}/cores/
+          if-no-files-found: ignore
+          retention-days: 7
 
       - name: Gate 2 — PyTorch parity (Qwen35 NodeLocalTP, 08B)
         run: |

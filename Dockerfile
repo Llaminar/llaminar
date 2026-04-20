@@ -98,6 +98,10 @@ COPY jinja ./jinja
 COPY cmake ./cmake
 COPY external/vendor ./external/vendor
 COPY python ./python
+# CI helper scripts (parity/perf trend chart generation, etc.). Copied as a
+# separate cheap layer so post-build CI steps that invoke
+# `python3 scripts/ci/summarize_*_trends.py` inside this image find them.
+COPY scripts/ci ./scripts/ci
 
 # Integration build — what CI drives for unit, parity, and E2E tests. Has
 # debug symbols, assertions active, tensor verification enabled.
