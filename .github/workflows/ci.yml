@@ -189,6 +189,7 @@ jobs:
             --gpus all \
             --device=/dev/kfd --device=/dev/dri \
             --group-add video --group-add render \
+            --cap-add SYS_NICE \
             --ipc=host --shm-size=16g \
             --workdir /src \
             ${{ env.BUILDER_IMAGE }} \
@@ -222,6 +223,7 @@ jobs:
             --gpus all \
             --device=/dev/kfd --device=/dev/dri \
             --group-add video --group-add render \
+            --cap-add SYS_NICE \
             --ipc=host --shm-size=16g \
             -v "${MODELS_DIR}:/src/models:ro" \
             -v "${PARITY_HISTORY_DIR}:/src/tests/v2/integration/parity/results" \
@@ -236,6 +238,7 @@ jobs:
             --gpus all \
             --device=/dev/kfd --device=/dev/dri \
             --group-add video --group-add render \
+            --cap-add SYS_NICE \
             --ipc=host --shm-size=16g \
             -v "${MODELS_DIR}:/src/models:ro" \
             -v "${PARITY_HISTORY_DIR}:/src/tests/v2/integration/parity/results" \
@@ -251,6 +254,7 @@ jobs:
             --gpus all \
             --device=/dev/kfd --device=/dev/dri \
             --group-add video --group-add render \
+            --cap-add SYS_NICE \
             --ipc=host --shm-size=16g \
             -v "${MODELS_DIR}:/src/models:ro" \
             -v "${PARITY_HISTORY_DIR}:/src/tests/v2/integration/parity/results" \
@@ -265,6 +269,7 @@ jobs:
             --gpus all \
             --device=/dev/kfd --device=/dev/dri \
             --group-add video --group-add render \
+            --cap-add SYS_NICE \
             --ipc=host --shm-size=16g \
             -v "${MODELS_DIR}:/src/models:ro" \
             -v "${PARITY_HISTORY_DIR}:/src/tests/v2/integration/parity/results" \
@@ -331,6 +336,7 @@ jobs:
             --gpus all \
             --device=/dev/kfd --device=/dev/dri \
             --group-add video --group-add render \
+            --cap-add SYS_NICE \
             --ipc=host --shm-size=16g \
             -v "${MODELS_DIR}:/src/models:ro" \
             --workdir /src \
@@ -350,6 +356,7 @@ jobs:
             --gpus all \
             --device=/dev/kfd --device=/dev/dri \
             --group-add video --group-add render \
+            --cap-add SYS_NICE \
             --ipc=host --shm-size=16g \
             -v "${MODELS_DIR}:/src/models:ro" \
             -v "${BENCHMARK_HISTORY_DIR}:/benchmark-history" \

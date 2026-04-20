@@ -1784,6 +1784,15 @@ namespace llaminar2::test::parity
             // Device-specific setup first (may skip)
             setupDeviceSpecific();
 
+            // Skip cleanly if the model GGUF isn't staged on this runner.
+            // Missing models otherwise produce confusing snapshot-regeneration
+            // failures inside Python rather than a clear "model not found".
+            if (!config_.model_path.empty() && !std::filesystem::exists(config_.model_path))
+            {
+                GTEST_SKIP() << "Model file not found: " << config_.model_path
+                             << " (populate MODELS_DIR on the runner)";
+            }
+
             resolveSnapshotDirIfNeeded();
 
             // Regenerate snapshots only on rank 0 to avoid race conditions
