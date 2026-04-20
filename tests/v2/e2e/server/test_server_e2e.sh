@@ -77,7 +77,10 @@ if [ ${#SUITES[@]} -eq 0 ]; then
     fi
 fi
 
-STARTUP_TIMEOUT=60    # seconds to wait for server startup (larger models need more)
+STARTUP_TIMEOUT=300   # seconds to wait for server startup. Most models load in
+                      # <10s; the 4B Qwen3.5 GGUF on CPU needs ~60-120s for
+                      # weight load + GDN init. The smaller suites finish in
+                      # ~5s either way, so this is just an upper bound.
 REQUEST_TIMEOUT=180   # seconds per curl request
 
 # Colors
@@ -179,6 +182,9 @@ run_backend_tests() {
     # Wait for health
     if ! wait_for_health "$port"; then
         fail "[${tag}] Server failed to start within ${STARTUP_TIMEOUT}s"
+        echo "    ── Last 80 lines of server log (/tmp/server_e2e_trace.log) ──"
+        tail -n 80 /tmp/server_e2e_trace.log 2>/dev/null | sed 's/^/    /' || echo "    (server log not available)"
+        echo "    ────────────────────────────────────────────────────────────"
         cleanup_server "$server_pid"
         return
     fi
