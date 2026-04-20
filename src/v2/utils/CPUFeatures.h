@@ -87,9 +87,14 @@ namespace llaminar2
                                           uint32_t *out_max_cores_in_pkg = nullptr)
         {
             // Ordered: try Intel 0x04 first (more fields), then AMD 0x8000001D
-            struct LeafInfo { uint32_t leaf; uint32_t min_supported; bool is_extended; };
+            struct LeafInfo
+            {
+                uint32_t leaf;
+                uint32_t min_supported;
+                bool is_extended;
+            };
             const LeafInfo leaves[] = {
-                {0x04, 4, false},            // Intel Deterministic Cache Parameters
+                {0x04, 4, false},              // Intel Deterministic Cache Parameters
                 {0x8000001D, 0x8000001D, true} // AMD Cache Topology
             };
 
@@ -122,8 +127,8 @@ namespace llaminar2
                     uint32_t cache_level = (regs[0] >> 5) & 0x7;
 
                     bool type_match = data_only
-                                         ? (cache_type == 1)
-                                         : (cache_type == 1 || cache_type == 3);
+                                          ? (cache_type == 1)
+                                          : (cache_type == 1 || cache_type == 3);
 
                     if (cache_level == static_cast<uint32_t>(target_level) && type_match)
                     {
@@ -510,6 +515,7 @@ namespace llaminar2
 #else
             return false;
 #endif
+            (void)xcr0_hi; // upper 32 bits not needed for AMX checks
             // AMX requires bits 17 (XTILECFG) and 18 (XTILEDATA)
             constexpr uint32_t AMX_MASK = (1u << 17) | (1u << 18);
             if ((xcr0_lo & AMX_MASK) != AMX_MASK)
@@ -549,6 +555,7 @@ namespace llaminar2
 #else
             return false;
 #endif
+            (void)xcr0_hi; // upper 32 bits not needed for AMX checks
             constexpr uint32_t AMX_MASK = (1u << 17) | (1u << 18);
             if ((xcr0_lo & AMX_MASK) != AMX_MASK)
                 return false;

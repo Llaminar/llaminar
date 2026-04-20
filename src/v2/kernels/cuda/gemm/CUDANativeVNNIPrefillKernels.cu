@@ -128,15 +128,15 @@ namespace
     using llaminar2::cuda_native_vnni::fp16_bits_to_float;
 
     constexpr int BK = 32;
-    constexpr int Q40_PAYLOAD_BYTES = llaminar2::cuda_native_vnni::CodebookTraits<0>::payload_bytes;
+    [[maybe_unused]] constexpr int Q40_PAYLOAD_BYTES = llaminar2::cuda_native_vnni::CodebookTraits<0>::payload_bytes;
     constexpr int SMEM_PAD = 16;
-    constexpr int SMEM_STRIDE = BK + SMEM_PAD;
-    constexpr int STAGES = 2;
+    [[maybe_unused]] constexpr int SMEM_STRIDE = BK + SMEM_PAD;
+    [[maybe_unused]] constexpr int STAGES = 2;
 
     // BK=64 constants (CUTLASS-standard K-tile for INT8 on SM80+)
     constexpr int BK64 = 64;
     constexpr int SMEM_PAD_64 = 16;
-    constexpr int SMEM_STRIDE_64 = BK64 + SMEM_PAD_64; // 80, 16-byte aligned for ldmatrix
+    [[maybe_unused]] constexpr int SMEM_STRIDE_64 = BK64 + SMEM_PAD_64; // 80, 16-byte aligned for ldmatrix
 
     // ─── Sweep-derived tile dispatch ───────────────────────────────────
     // Tile configurations validated via exhaustive sweep across 336 shapes,
@@ -190,24 +190,24 @@ namespace
         C[idx] = sum;
     }
 
-    __device__ __forceinline__ int frag_row(int lane_id, int elem)
+    [[maybe_unused]] __device__ __forceinline__ int frag_row(int lane_id, int elem)
     {
         return (elem >> 1) * 8 + (lane_id >> 2);
     }
 
-    __device__ __forceinline__ int frag_col(int lane_id, int elem)
+    [[maybe_unused]] __device__ __forceinline__ int frag_col(int lane_id, int elem)
     {
         return (lane_id & 3) * 2 + (elem & 1);
     }
 
-    __device__ __forceinline__ void cp_async_cg_16_zfill_128(
+    [[maybe_unused]] __device__ __forceinline__ void cp_async_cg_16_zfill_128(
         void *smem_dst, const void *gmem_src, int src_size)
     {
         const uint32_t smem_addr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_dst));
         asm volatile("cp.async.cg.shared.global.L2::128B [%0], [%1], 16, %2;\n" ::"r"(smem_addr), "l"(gmem_src), "r"(src_size) : "memory");
     }
 
-    __device__ __forceinline__ void cp_async_commit()
+    [[maybe_unused]] __device__ __forceinline__ void cp_async_commit()
     {
         asm volatile("cp.async.commit_group;\n" ::: "memory");
     }
@@ -221,12 +221,12 @@ namespace
     // Named barrier: sync a subset of threads within a CTA.
     // barrier_id: 0-15 (hardware barrier slot), thread_count: participating threads.
     // Has acquire/release memory ordering (like __syncthreads but scoped to participants).
-    __device__ __forceinline__ void named_bar_sync(int barrier_id, int thread_count)
+    [[maybe_unused]] __device__ __forceinline__ void named_bar_sync(int barrier_id, int thread_count)
     {
         asm volatile("bar.sync %0, %1;" : : "r"(barrier_id), "r"(thread_count) : "memory");
     }
 
-    __device__ __forceinline__ void load_ldmatrix_a_m16n8k32(
+    [[maybe_unused]] __device__ __forceinline__ void load_ldmatrix_a_m16n8k32(
         uint32_t frag[4],
         const int *smem_base,
         int stride_words,
@@ -245,7 +245,7 @@ namespace
 #endif
     }
 
-    __device__ __forceinline__ void load_ldmatrix_b_m16n8k32(
+    [[maybe_unused]] __device__ __forceinline__ void load_ldmatrix_b_m16n8k32(
         uint32_t frag[2],
         const int *smem_base,
         int stride_words,
@@ -264,7 +264,7 @@ namespace
 #endif
     }
 
-    __device__ __forceinline__ void mma_m16n8k32_s8(
+    [[maybe_unused]] __device__ __forceinline__ void mma_m16n8k32_s8(
         int32_t D[4],
         const uint32_t A[4],
         const uint32_t B[2])
@@ -755,7 +755,7 @@ namespace
         // instead of one full-CTA barrier, reducing barrier stall from 16→4 warp convergence.
         // PERF NOTE: benchmarking showed ~1% regression due to 2× barrier instruction overhead
         // outweighing the smaller sync group benefit. Disabled pending a single-barrier solution.
-        constexpr bool USE_NAMED_BARRIERS = false; // (A_VEC_LOADS == BLOCK_SIZE) && (BLOCK_SIZE >= 2 * BN);
+        [[maybe_unused]] constexpr bool USE_NAMED_BARRIERS = false; // (A_VEC_LOADS == BLOCK_SIZE) && (BLOCK_SIZE >= 2 * BN);
 
         static_assert(BM % WARPS_M == 0 && BN % WARPS_N == 0);
         static_assert(WARP_M % 16 == 0);
@@ -3019,8 +3019,6 @@ namespace
         const int nsm = querySmCount(prefill_ctx);
         const int ntx = (N + BN - 1) / BN;
         const int nty = (M + BM - 1) / BM;
-        const int num_k_tiles = (K / 32 + 1) / 2;
-        const int total_tiles = ntx * nty;
 
         // Query how many blocks the hardware can run concurrently per SM,
         // given the kernel's compiled register and shared memory usage.

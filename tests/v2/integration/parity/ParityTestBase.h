@@ -1910,7 +1910,14 @@ namespace llaminar2::test::parity
             // Source devcontainer venv if present, else fall back to system
             // python3 (which is what the CI builder image uses, where Python
             // deps were installed via `pip install --break-system-packages`).
-            cmd << "bash -c '[ -f /workspaces/llaminar/.venv/bin/activate ] && source /workspaces/llaminar/.venv/bin/activate; python3"
+            //
+            // IMPORTANT: CTest sets OMP_NUM_THREADS=1 and MKL_NUM_THREADS=1 for the
+            // Llaminar test process (intentional: mpirun -np 1 handles affinity itself).
+            // Those env vars are inherited by this python3 subprocess, which would pin
+            // PyTorch's CPU forward pass to a single thread — catastrophic for large
+            // models. We unset them and let PyTorch/OpenMP/MKL use all available cores.
+            cmd << "bash -c 'unset OMP_NUM_THREADS MKL_NUM_THREADS OPENBLAS_NUM_THREADS OMP_PROC_BIND OMP_PLACES KMP_AFFINITY; "
+                << "[ -f /workspaces/llaminar/.venv/bin/activate ] && source /workspaces/llaminar/.venv/bin/activate; python3"
                 << " python/reference/generate_qwen_pipeline_snapshots.py"
                 << " --model " << config_.model_path
                 << " --prompt \"" << config_.prompt << "\""

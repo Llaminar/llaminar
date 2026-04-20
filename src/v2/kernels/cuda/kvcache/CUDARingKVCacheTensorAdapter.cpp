@@ -201,7 +201,15 @@ namespace llaminar2
 
         const auto stream = static_cast<cudaStream_t>(gpu_stream);
 
-        if (precision() == ActivationPrecision::FP16 &&
+        // NOTE: We use k_precision() for both K and V conversion paths below.
+        // For symmetric caches (k_precision() == v_precision(), which is the
+        // default), this is correct. For asymmetric caches such as
+        // CUDARingKVCacheTQ (TQ8 K + TQ4 V) the TQ path is not handled by
+        // these blocks at all - those tensors fall through to the native
+        // append() call below. If a future asymmetric FP16/Q8_1 cache is
+        // added, the conversion paths must be split into separate K and V
+        // gates using k_precision() / v_precision() respectively.
+        if (k_precision() == ActivationPrecision::FP16 &&
             (K->native_type() != TensorType::FP16 || V->native_type() != TensorType::FP16))
         {
             const auto &k_shape = K->shape();
@@ -270,7 +278,7 @@ namespace llaminar2
             return ok;
         }
 
-        if (precision() == ActivationPrecision::Q8_1 &&
+        if (k_precision() == ActivationPrecision::Q8_1 &&
             (K->native_type() != TensorType::Q8_1 || V->native_type() != TensorType::Q8_1))
         {
             const auto &k_shape = K->shape();

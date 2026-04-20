@@ -43,6 +43,10 @@ namespace llaminar2
         CUDARingKVCacheBase(const CUDARingKVCacheBase &) = delete;
         CUDARingKVCacheBase &operator=(const CUDARingKVCacheBase &) = delete;
 
+        // Bring the base-class single-arg overload into scope so it isn't
+        // hidden by the two-arg override below (silences NVCC #611-D).
+        using IKVCache::clear_sequence;
+
         // =====================================================================
         // IKVCache implementations
         // =====================================================================

@@ -61,9 +61,9 @@ namespace
     // Bank analysis: stride 48 ÷ 4 = 12 words. For mma.sync A fragment loads
     // (gid=0..7, tid=0..3), bank = (gid*12 + tid) % 32 → all 32 unique banks.
     // Zero bank conflicts empirically verified for all 4 A fragment registers.
-    constexpr int BK = 32;                     // quantisation block size (fixed)
-    constexpr int SMEM_PAD = 16;               // padding bytes per row
-    constexpr int SMEM_STRIDE = BK + SMEM_PAD; // = 48
+    constexpr int BK = 32;                                      // quantisation block size (fixed)
+    constexpr int SMEM_PAD = 16;                                // padding bytes per row
+    [[maybe_unused]] constexpr int SMEM_STRIDE = BK + SMEM_PAD; // = 48
     constexpr int MAX_SPLIT_K_PARTITIONS = 8;
     constexpr size_t SPLIT_K_PARTIAL_SCRATCH_BUDGET_BYTES = 256ull * 1024ull * 1024ull;
 
@@ -77,26 +77,26 @@ namespace
     //   row = (l / 2) * 8 + groupID     → l<2: rows 0-7;  l≥2: rows 8-15
     //   col = tid_in_group * 2 + (l % 2) → 0-7
 
-    __device__ __forceinline__ int v2_frag_row(int lane_id, int elem)
+    [[maybe_unused]] __device__ __forceinline__ int v2_frag_row(int lane_id, int elem)
     {
         return (elem >> 1) * 8 + (lane_id >> 2);
     }
 
-    __device__ __forceinline__ int v2_frag_col(int lane_id, int elem)
+    [[maybe_unused]] __device__ __forceinline__ int v2_frag_col(int lane_id, int elem)
     {
         return (lane_id & 3) * 2 + (elem & 1);
     }
 
     // ─── cp.async inline PTX helpers ───
 
-    __device__ __forceinline__ void cp_async_cg_16_zfill_128(
+    [[maybe_unused]] __device__ __forceinline__ void cp_async_cg_16_zfill_128(
         void *smem_dst, const void *gmem_src, int src_size)
     {
         const uint32_t smem_addr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_dst));
         asm volatile("cp.async.cg.shared.global.L2::128B [%0], [%1], 16, %2;\n" ::"r"(smem_addr), "l"(gmem_src), "r"(src_size) : "memory");
     }
 
-    __device__ __forceinline__ void cp_async_commit()
+    [[maybe_unused]] __device__ __forceinline__ void cp_async_commit()
     {
         asm volatile("cp.async.commit_group;\n" ::: "memory");
     }
@@ -107,7 +107,7 @@ namespace
         asm volatile("cp.async.wait_group %0;\n" ::"n"(N) : "memory");
     }
 
-    __device__ __forceinline__ void load_ldmatrix_a_m16n8k32(
+    [[maybe_unused]] __device__ __forceinline__ void load_ldmatrix_a_m16n8k32(
         uint32_t frag[4],
         const int *smem_base,
         int stride_words,
@@ -126,7 +126,7 @@ namespace
 #endif
     }
 
-    __device__ __forceinline__ void load_ldmatrix_b_m16n8k32(
+    [[maybe_unused]] __device__ __forceinline__ void load_ldmatrix_b_m16n8k32(
         uint32_t frag[2],
         const int *smem_base,
         int stride_words,
@@ -154,7 +154,7 @@ namespace
     //   B: 2 × uint32_t  (8 INT8 values, k32×n8 col-major)
     //   D: 4 × int32_t   (4 INT32 output/accumulator, m16×n8)
 
-    __device__ __forceinline__ void mma_m16n8k32_s8(
+    [[maybe_unused]] __device__ __forceinline__ void mma_m16n8k32_s8(
         int32_t D[4],
         const uint32_t A[4],
         const uint32_t B[2])
@@ -221,7 +221,8 @@ namespace
         const int wr = warp_id / WARPS_N; // warp row in CTA grid
         const int wc = warp_id % WARPS_N; // warp col in CTA grid
         const int gid = lane_id >> 2;     // groupID for MMA (0-7)
-        const int tid = lane_id & 3;      // tid_in_group for MMA (0-3)
+        // Note: tid_in_group (lane_id & 3) is implicit inside the ldmatrix/mma
+        // helpers; not needed as a separate local here.
 
         const int block_m = blockIdx.x * BM;
         const int block_n = blockIdx.y * BN;

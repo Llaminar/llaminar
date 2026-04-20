@@ -152,7 +152,13 @@ protected:
         std::ostringstream cmd;
         // Source devcontainer venv if present, else fall back to system python3
         // (CI builder image installs deps via pip --break-system-packages).
-        cmd << "bash -c '[ -f /workspaces/llaminar/.venv/bin/activate ] && source /workspaces/llaminar/.venv/bin/activate; python3"
+        //
+        // IMPORTANT: CTest sets OMP_NUM_THREADS=1 / MKL_NUM_THREADS=1 for the test
+        // process; these are inherited by python3 and pin PyTorch's CPU forward
+        // pass to a single thread. Unset them so the snapshot generator can use
+        // all cores.
+        cmd << "bash -c 'unset OMP_NUM_THREADS MKL_NUM_THREADS OPENBLAS_NUM_THREADS OMP_PROC_BIND OMP_PLACES KMP_AFFINITY; "
+            << "[ -f /workspaces/llaminar/.venv/bin/activate ] && source /workspaces/llaminar/.venv/bin/activate; python3"
             << " python/reference/generate_qwen_pipeline_snapshots.py"
             << " --model " << model_path_
             << " --prompt \"" << TEST_PROMPT << "\""

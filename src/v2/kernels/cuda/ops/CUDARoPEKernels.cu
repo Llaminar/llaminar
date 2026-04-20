@@ -168,9 +168,6 @@ namespace
 // Optimized RoPE CUDA Kernels (v3 - with precomputed inv_freq)
 // =========================================================================
 
-// Maximum head_dim/2 we support in shared memory (covers up to head_dim=256)
-constexpr int MAX_HALF_DIM = 128;
-
 /**
  * @brief FP32 RoPE kernel with shared memory sin/cos table
  *
@@ -956,12 +953,6 @@ extern "C"
     // WORKSPACE-AWARE API (v3)
     // These functions take external inv_freq buffer allocated from workspace
     // =========================================================================
-
-    /**
-     * @brief Maximum supported head_dim/2 for workspace allocation
-     * This covers head_dim up to 256 (128 * 4 = 512 bytes)
-     */
-    constexpr int ROPE_MAX_HALF_DIM = 128;
 
     /**
      * @brief Populate inverse frequency table in an external buffer
