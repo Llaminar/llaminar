@@ -195,7 +195,11 @@ if(HAVE_ROCM)
     # Suppress hipFree/hipMalloc [[nodiscard]] warnings — many tests intentionally
     # ignore the return value during teardown when the program is about to exit.
     # We still check return codes in production paths via HIP_CHECK macros.
+    # Apply to BOTH HIP-compiled and CXX-compiled units, since some test .cpp
+    # files include <hip/hip_runtime.h> directly and call hipFree() / hipMalloc()
+    # without going through hipcc.
     set(CMAKE_HIP_FLAGS "${CMAKE_HIP_FLAGS} -Wno-unused-result")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-unused-result")
 endif()
 
 # =============================================================================
