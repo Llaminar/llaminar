@@ -480,6 +480,18 @@ jobs:
             type=sha,format=short
             type=raw,value=${{ inputs.image-tag || 'ci' }},enable=${{ inputs.image-tag != '' }}
 
+      # Diagnostic: list the persistent host dirs so we can see whether the
+      # parity / perf gates actually wrote anything. Useful when the upload
+      # steps below say 'No files were found'.
+      - name: Diagnostic — list persistent host result dirs
+        if: always()
+        run: |
+          echo "=== ${PARITY_HISTORY_DIR} ==="
+          ls -laR "${PARITY_HISTORY_DIR}" 2>&1 | head -100 || true
+          echo ""
+          echo "=== ${BENCHMARK_HISTORY_DIR} ==="
+          ls -laR "${BENCHMARK_HISTORY_DIR}" 2>&1 | head -100 || true
+
       - name: Summarize parity results
         if: always()
         run: |
@@ -507,7 +519,7 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: parity-results-${{ github.run_id }}
-          path: ${PARITY_HISTORY_DIR}/
+          path: ${{ env.PARITY_HISTORY_DIR }}/
           if-no-files-found: warn
           retention-days: 30
 
@@ -546,8 +558,8 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: benchmark-results-${{ github.run_id }}
-          path: ${BENCHMARK_HISTORY_DIR}/
-          if-no-files-found: ignore
+          path: ${{ env.BENCHMARK_HISTORY_DIR }}/
+          if-no-files-found: warn
           retention-days: 90
 
       - name: Upload performance trend charts

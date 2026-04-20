@@ -388,9 +388,17 @@ if $OVERALL_PASS; then
     done
 
     if $RATCHETED; then
-        git -C "$ROOT_DIR" add "$BASELINE_FILE"
-        echo ""
-        echo -e "${GREEN}✓ Baseline ratcheted and staged for commit${NC}"
+        # `git add` is only meaningful in a working git checkout (e.g. the
+        # pre-commit hook context). In CI we run inside a docker container
+        # that doesn't have .git mounted, so skip silently.
+        if git -C "$ROOT_DIR" rev-parse --git-dir &>/dev/null; then
+            git -C "$ROOT_DIR" add "$BASELINE_FILE"
+            echo ""
+            echo -e "${GREEN}✓ Baseline ratcheted and staged for commit${NC}"
+        else
+            echo ""
+            echo -e "${GREEN}✓ Baseline ratcheted (not in a git repo; skipping git add)${NC}"
+        fi
     fi
 
     exit 0
