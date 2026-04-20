@@ -183,13 +183,32 @@ jobs:
       # ---------------------------------------------------------------------
       # Gate 1: unit tests. Fast, no models needed, pure CPU/GPU isolation.
       # ---------------------------------------------------------------------
+      # ---------------------------------------------------------------------
+      # Configure core-dump capture for the rest of the job. The container
+      # shares the host kernel, so kernel.core_pattern must be set on the
+      # host (writes to /proc/sys/kernel/core_pattern from inside the
+      # container fail with EACCES even with SYS_NICE — procfs there is
+      # read-only). We point it at a workspace-relative directory so cores
+      # land on the host filesystem and a single upload step at the end of
+      # the job can grab them regardless of which gate crashed.
+      # ---------------------------------------------------------------------
+      - name: Configure core-dump capture
+        run: |
+          sudo mkdir -p "${{ github.workspace }}/cores"
+          sudo chmod 1777 "${{ github.workspace }}/cores"
+          sudo sysctl -w "kernel.core_pattern=${{ github.workspace }}/cores/core.%e.%p.%t"
+          sudo sysctl -w kernel.core_uses_pid=1
+          # Verify the override took (apport on Ubuntu 24.04 may have set a pipe).
+          echo "core_pattern: $(cat /proc/sys/kernel/core_pattern)"
+
       - name: Gate 1 — Unit tests
         run: |
           docker run --rm \
             --gpus all \
             --device=/dev/kfd --device=/dev/dri \
             --group-add video --group-add render \
-            --cap-add SYS_NICE \
+            --cap-add SYS_NICE --cap-add SYS_PTRACE \
+            --ulimit core=-1 \
             --ipc=host --shm-size=16g \
             --workdir /src \
             ${{ env.BUILDER_IMAGE }} \
@@ -223,7 +242,8 @@ jobs:
             --gpus all \
             --device=/dev/kfd --device=/dev/dri \
             --group-add video --group-add render \
-            --cap-add SYS_NICE \
+            --cap-add SYS_NICE --cap-add SYS_PTRACE \
+            --ulimit core=-1 \
             --ipc=host --shm-size=16g \
             -v "${MODELS_DIR}:/src/models:ro" \
             -v "${PARITY_HISTORY_DIR}:/src/tests/v2/integration/parity/results" \
@@ -238,7 +258,8 @@ jobs:
             --gpus all \
             --device=/dev/kfd --device=/dev/dri \
             --group-add video --group-add render \
-            --cap-add SYS_NICE \
+            --cap-add SYS_NICE --cap-add SYS_PTRACE \
+            --ulimit core=-1 \
             --ipc=host --shm-size=16g \
             -v "${MODELS_DIR}:/src/models:ro" \
             -v "${PARITY_HISTORY_DIR}:/src/tests/v2/integration/parity/results" \
@@ -250,10 +271,6 @@ jobs:
       - name: Gate 2 — PyTorch parity (Qwen2 NodeLocalTP)
         id: qwen2_node_local_tp
         run: |
-          # Enable core dumps so we can post-mortem any segfault. Stored on
-          # host under runner workspace, uploaded as artifact below.
-          mkdir -p "${{ github.workspace }}/cores"
-          chmod 1777 "${{ github.workspace }}/cores"
           docker run --rm \
             --gpus all \
             --device=/dev/kfd --device=/dev/dri \
@@ -263,22 +280,10 @@ jobs:
             --ipc=host --shm-size=16g \
             -v "${MODELS_DIR}:/src/models:ro" \
             -v "${PARITY_HISTORY_DIR}:/src/tests/v2/integration/parity/results" \
-            -v "${{ github.workspace }}/cores:/cores" \
             --workdir /src \
             ${{ env.BUILDER_IMAGE }} \
-            bash -c "echo '/cores/core.%e.%p.%t' > /proc/sys/kernel/core_pattern 2>/dev/null || true; \
-                     ulimit -c unlimited; \
-                     ctest --test-dir build_v2_integration --output-on-failure \
-                           --timeout 900 -R '^V2_Integration_Parity_NodeLocalTP_'"
-
-      - name: Upload NodeLocalTP core dumps (on failure)
-        if: failure() && steps.qwen2_node_local_tp.conclusion == 'failure'
-        uses: actions/upload-artifact@v7
-        with:
-          name: qwen2-node-local-tp-cores
-          path: ${{ github.workspace }}/cores/
-          if-no-files-found: ignore
-          retention-days: 7
+            ctest --test-dir build_v2_integration --output-on-failure \
+                  --timeout 900 -R '^V2_Integration_Parity_NodeLocalTP_'
 
       - name: Gate 2 — PyTorch parity (Qwen35 NodeLocalTP)
         run: |
@@ -286,7 +291,8 @@ jobs:
             --gpus all \
             --device=/dev/kfd --device=/dev/dri \
             --group-add video --group-add render \
-            --cap-add SYS_NICE \
+            --cap-add SYS_NICE --cap-add SYS_PTRACE \
+            --ulimit core=-1 \
             --ipc=host --shm-size=16g \
             -v "${MODELS_DIR}:/src/models:ro" \
             -v "${PARITY_HISTORY_DIR}:/src/tests/v2/integration/parity/results" \
@@ -352,7 +358,8 @@ jobs:
             --gpus all \
             --device=/dev/kfd --device=/dev/dri \
             --group-add video --group-add render \
-            --cap-add SYS_NICE \
+            --cap-add SYS_NICE --cap-add SYS_PTRACE \
+            --ulimit core=-1 \
             --ipc=host --shm-size=16g \
             -v "${MODELS_DIR}:/src/models:ro" \
             --workdir /src \
@@ -372,7 +379,8 @@ jobs:
             --gpus all \
             --device=/dev/kfd --device=/dev/dri \
             --group-add video --group-add render \
-            --cap-add SYS_NICE \
+            --cap-add SYS_NICE --cap-add SYS_PTRACE \
+            --ulimit core=-1 \
             --ipc=host --shm-size=16g \
             -v "${MODELS_DIR}:/src/models:ro" \
             -v "${BENCHMARK_HISTORY_DIR}:/benchmark-history" \
@@ -449,3 +457,18 @@ jobs:
             /tmp/srv_*.log
           if-no-files-found: ignore
           retention-days: 14
+
+      # ---------------------------------------------------------------------
+      # Single uniform core-dump upload at the end of the job. Triggered
+      # whenever any prior step failed; cores from any docker run land in
+      # ${{ github.workspace }}/cores via the host's kernel.core_pattern
+      # configured at the start of the job.
+      # ---------------------------------------------------------------------
+      - name: Upload core dumps (any failure)
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: cores-${{ github.run_id }}
+          path: ${{ github.workspace }}/cores/
+          if-no-files-found: ignore
+          retention-days: 7
