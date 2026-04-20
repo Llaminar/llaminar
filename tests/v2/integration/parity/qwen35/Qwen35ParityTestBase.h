@@ -56,6 +56,31 @@ namespace llaminar2::test::parity::qwen35
             // Qwen3.5 uses a different tokenizer (vocab_size=248320) than Qwen2/3
             // (vocab_size=151936), so the default hardcoded token_ids are wrong.
             // Read the actual token_ids used by the PyTorch reference generator.
+            //
+            // CRITICAL: metadata.txt is only written by the snapshot generator,
+            // which normally runs later in the test body. On a fresh checkout
+            // (e.g. CI) the metadata file does not exist yet and we would silently
+            // fall back to Qwen2's default token IDs, embedding the wrong tokens
+            // and producing catastrophic cosine drops (~0.18) at every stage.
+            //
+            // Trigger snapshot regeneration here if metadata is missing, so the
+            // token IDs are always consistent with what PyTorch will emit. Skip
+            // the regen if the model file is missing (the test will GTEST_SKIP
+            // later in ParityTestBase::SetUp when it sees the missing model).
+            const auto metadata_path = std::filesystem::path(Base::config_.snapshot_dir) /
+                                       "metadata.txt";
+            if (!std::filesystem::exists(metadata_path) &&
+                std::filesystem::exists(Base::config_.model_path))
+            {
+                LOG_INFO("[Qwen3.5 Parity] metadata.txt missing — running PyTorch "
+                         "snapshot generator early to obtain consistent prefill tokens");
+                if (!regeneratePyTorchSnapshots())
+                {
+                    LOG_ERROR("[Qwen3.5 Parity] Early snapshot regeneration failed; "
+                              "test will likely fail with stale Qwen2 token IDs");
+                }
+            }
+
             auto prefill_tokens = Base::readPrefillTokensFromMetadata();
             if (!prefill_tokens.empty())
             {
