@@ -195,7 +195,7 @@ jobs:
   # -------------------------------------------------------------------------
   parity-cpu:
     name: Gate — Parity (CPU, all Qwen families)
-    needs: unit
+    needs: [build, unit]
     runs-on: [self-hosted, linux, x64, llaminar-bench]
     timeout-minutes: 120
     steps:
@@ -247,7 +247,7 @@ jobs:
   # -------------------------------------------------------------------------
   parity-gpu:
     name: Gate — Parity (GPU, all Qwen families)
-    needs: unit
+    needs: [build, unit]
     runs-on: [self-hosted, linux, x64, llaminar-bench]
     timeout-minutes: 180
     steps:
@@ -305,7 +305,7 @@ jobs:
   # -------------------------------------------------------------------------
   e2e:
     name: Gate — E2E server tests
-    needs: [parity-cpu, parity-gpu]
+    needs: [build, parity-cpu, parity-gpu]
     runs-on: [self-hosted, linux, x64, llaminar-bench]
     timeout-minutes: 45
     steps:
@@ -354,7 +354,7 @@ jobs:
   # -------------------------------------------------------------------------
   perf:
     name: Gate — Performance ratchet
-    needs: [parity-cpu, parity-gpu]
+    needs: [build, parity-cpu, parity-gpu]
     runs-on: [self-hosted, linux, x64, llaminar-bench]
     timeout-minutes: 60
     steps:
