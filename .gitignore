@@ -111,3 +111,4 @@ src/v2/kernels/cuda/*_heuristic_*.h
 *.lock-*
 run_gemv_timing.sh
 
+models

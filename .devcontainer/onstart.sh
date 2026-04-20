@@ -83,32 +83,6 @@ if [ -e /dev/kfd ]; then
     echo "[onstart] Fixed /dev/kfd permissions"
 fi
 
-# Enable PCIe BAR access for AMD GPUs (required for cross-vendor P2P: CUDA <-> ROCm)
-# This allows DirectP2P to map AMD GPU BARs for direct PCIe transfers
-echo "[onstart] Setting up PCIe BAR access for AMD GPUs..."
-AMD_BAR_COUNT=0
-for device in /sys/bus/pci/devices/*; do
-    if [ -f "$device/vendor" ] && [ -f "$device/class" ]; then
-        vendor=$(cat "$device/vendor" 2>/dev/null)
-        class=$(cat "$device/class" 2>/dev/null)
-        # AMD vendor (0x1002) and display class (0x03xxxx)
-        if [ "$vendor" = "0x1002" ] && [[ "$class" == 0x03* ]]; then
-            if [ -f "$device/resource0" ]; then
-                size=$(stat -c%s "$device/resource0" 2>/dev/null || echo 0)
-                if [ "$size" -gt 0 ]; then
-                    sudo chmod 666 "$device/resource0" 2>/dev/null || true
-                    AMD_BAR_COUNT=$((AMD_BAR_COUNT + 1))
-                fi
-            fi
-        fi
-    fi
-done
-if [ "$AMD_BAR_COUNT" -gt 0 ]; then
-    echo "[onstart] Enabled PCIe BAR access for $AMD_BAR_COUNT AMD GPU(s)"
-else
-    echo "[onstart] No AMD GPU BARs found (PCIe BAR P2P not available)"
-fi
-
 # Report GPU status
 echo "[onstart] Checking GPU availability..."
 
@@ -122,6 +96,14 @@ fi
 if command -v rocm-smi &>/dev/null; then
     ROCM_COUNT=$(rocm-smi --showid 2>/dev/null | grep -c "GPU" || echo 0)
     echo "[onstart] Found $ROCM_COUNT ROCm GPU(s)"
+fi
+
+# Create models symlink
+if [ ! -L /workspace/models ]; then
+    ln -s /opt/llaminar-models /workspace/models
+    echo "[onstart] Created symlink for models directory"
+else
+    echo "[onstart] Symlink for models directory already exists"
 fi
 
 echo "[onstart] Done."
