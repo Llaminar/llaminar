@@ -101,36 +101,53 @@ COPY python ./python
 
 # Integration build — what CI drives for unit, parity, and E2E tests. Has
 # debug symbols, assertions active, tensor verification enabled.
+#
+# Strip + intermediate cleanup happens INSIDE this RUN so the committed
+# layer is already minimal. Splitting build / strip / clean across multiple
+# RUNs would commit a 150 GB+ snapshot first (BuildKit's `exporting layers`
+# step has to write the full overlay diff), then a smaller delta — total
+# export time scales with the largest intermediate, not the final size.
+#
+# Stripping (--strip-debug, not --strip-all) keeps the symbol table so
+# stack traces from gtest / gdb attach still resolve function names.
+# Removing .o / .d / .gch files is safe: ctest never re-invokes the
+# compiler at test time.
 RUN --mount=type=cache,target=/root/.ccache \
     cmake -B build_v2_integration -S src/v2 -G Ninja \
         -DCMAKE_BUILD_TYPE=Integration \
         -DHAVE_CUDA=ON \
         -DHAVE_ROCM=ON \
         -DCMAKE_CUDA_ARCHITECTURES="${LLAMINAR_CUDA_ARCHS}" \
- && cmake --build build_v2_integration --parallel
+ && cmake --build build_v2_integration --parallel \
+ && find build_v2_integration \
+        \( -type f -executable -o -name '*.a' -o -name '*.so' -o -name '*.so.*' \) \
+        -not -path '*/CMakeFiles/*' \
+        -print0 \
+    | xargs -0 -r -P "$(nproc)" -n 32 strip --strip-debug 2>/dev/null || true \
+ && find build_v2_integration \
+        \( -name '*.o' -o -name '*.d' -o -name '*.gch' -o -name '*.cmake_pch.hxx' \) \
+        -delete \
+ && find build_v2_integration -depth -type d -name CMakeFiles -exec rm -rf {} + \
+ && rm -rf build_v2_integration/Testing build_v2_integration/_deps/*-build/CMakeFiles
 
 # Release build — what the runtime image ships. Optimized, no assertions,
-# only the llaminar2 target (skip test binaries).
+# only the llaminar2 target (skip test binaries). Same in-RUN cleanup.
 RUN --mount=type=cache,target=/root/.ccache \
     cmake -B build_v2_release -S src/v2 -G Ninja \
         -DCMAKE_BUILD_TYPE=${LLAMINAR_BUILD_TYPE} \
         -DHAVE_CUDA=ON \
         -DHAVE_ROCM=ON \
         -DCMAKE_CUDA_ARCHITECTURES="${LLAMINAR_CUDA_ARCHS}" \
- && cmake --build build_v2_release --parallel --target llaminar2
-
-# Strip debug info from every executable + .a/.so in both build trees.
-# Integration test binaries average ~370 MB unstripped (mostly CUDA fatbin
-# + DWARF), ~85 MB stripped — a 4x shrink across ~600 binaries dominates
-# the builder image size. We keep assertions / sanitizers (those are
-# compile-flag controlled, not stripped), so test fidelity is unchanged.
-# `--strip-debug` (not `--strip-all`) preserves the symbol table, so
-# stack traces from gtest / gdb attach still resolve function names.
-RUN find build_v2_integration build_v2_release \
+ && cmake --build build_v2_release --parallel --target llaminar2 \
+ && find build_v2_release \
         \( -type f -executable -o -name '*.a' -o -name '*.so' -o -name '*.so.*' \) \
         -not -path '*/CMakeFiles/*' \
         -print0 \
-    | xargs -0 -r -P "$(nproc)" -n 32 strip --strip-debug 2>/dev/null || true
+    | xargs -0 -r -P "$(nproc)" -n 32 strip --strip-debug 2>/dev/null || true \
+ && find build_v2_release \
+        \( -name '*.o' -o -name '*.d' -o -name '*.gch' -o -name '*.cmake_pch.hxx' \) \
+        -delete \
+ && find build_v2_release -depth -type d -name CMakeFiles -exec rm -rf {} +
 
 # CI runs `docker run --group-add render --group-add video` against this
 # builder image; docker resolves --group-add names from the image's /etc/group,
