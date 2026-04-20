@@ -25,13 +25,11 @@
                 "ms-python.python",
                 "ms-python.pylint",
                 "ms-python.debugpy",
-                "GitHub.copilot",
                 "GitHub.copilot-chat",
                 "redhat.vscode-yaml",
                 "ms-vscode.vscode-json",
                 "bradlc.vscode-tailwindcss",
-                "esbenp.prettier-vscode",
-                "jacqueslucke.gcov-viewer"
+                "esbenp.prettier-vscode"
             ],
             "settings": {
                 "cmake.configureOnOpen": true,
