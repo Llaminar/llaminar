@@ -218,72 +218,80 @@ class GGUFLoader:
                 'other': 0
             }
             
-            # PERF: Parallelize raw-read + dequantize across CPU cores. The
-            # numpy dequantization paths are vectorized and release the GIL,
-            # so threads scale well. We cap workers because each output array
-            # can be very large (FP32 weights for big models hold gigabytes
-            # in memory simultaneously) and more workers don't help once
-            # we're memory-bandwidth bound. mmap reads are thread-safe.
+            # PERF: Parallelize raw-read + dequantize + name-mapping +
+            # qwen35-transforms + torch.from_numpy across CPU cores. All of
+            # these steps either release the GIL (numpy dequant kernels,
+            # torch.from_numpy share-memory path) or are pure Python that
+            # is short enough to overlap with bandwidth-bound work in other
+            # threads. By moving them into the worker we keep the serial
+            # consumer loop down to a single dict insert per tensor.
+            #
+            # We also stream the iterator (no list(...)) so the consumer
+            # runs concurrently with workers and peak FP32 memory is
+            # bounded by ``n_workers × largest_tensor`` instead of the
+            # full materialized 110 GB on a 27B Q8_0 model.
             n_workers = min(os.cpu_count() or 4, 16)
             tensors_list = list(parser.tensors)
 
-            def _read_and_dequantize(tensor_info):
+            def _process_tensor(tensor_info):
                 raw = parser.read_tensor_data(tensor_info)
                 fp32 = dequantize.dequantize(raw, tensor_info.type, tensor_info.shape)
-                # Make writable up-front so torch.from_numpy doesn't warn
-                # (mmap-backed arrays are read-only).
+                # mmap-backed views are read-only; torch.from_numpy needs a
+                # writable buffer. ``.copy()`` releases the GIL for the
+                # actual memcpy.
                 if not fp32.flags.writeable:
                     fp32 = fp32.copy()
-                return fp32
+                # Explicitly drop the memoryview so the mmap can be closed
+                # cleanly later (memoryviews hold exported pointers into
+                # the mmap; any live view blocks ``mmap.close()``).
+                if isinstance(raw, memoryview):
+                    raw.release()
+
+                hf_name = mapper.map_name(tensor_info.name)
+                local_unmapped = (
+                    hf_name == tensor_info.name
+                    and not any(hf_name.startswith(p) for p in ('model.', 'lm_head'))
+                )
+
+                if as_torch:
+                    if not HAS_TORCH:
+                        raise RuntimeError("PyTorch not available but as_torch=True")
+                    tensor = torch.from_numpy(fp32)
+                    if model_type == 'qwen35':
+                        tensor = self._apply_qwen35_transforms(
+                            tensor, tensor_info.name, hf_name
+                        )
+                else:
+                    tensor = fp32
+
+                return tensor_info, hf_name, tensor, local_unmapped
 
             if show_progress:
                 print(f"  Dequantizing {total_tensors} tensors with {n_workers} threads...")
 
             with ThreadPoolExecutor(max_workers=n_workers) as ex:
-                fp32_arrays = list(ex.map(_read_and_dequantize, tensors_list))
+                # Stream results so the consumer overlaps with worker pool.
+                # ``ex.map`` preserves input order; results are yielded as
+                # the next-in-order future completes.
+                for tensor_info, hf_name, tensor, was_unmapped in ex.map(
+                    _process_tensor, tensors_list
+                ):
+                    type_name = tensor_info.type.name
+                    if type_name in dequant_stats:
+                        dequant_stats[type_name] += 1
+                    else:
+                        dequant_stats['other'] += 1
 
-            for i, (tensor_info, fp32_array) in enumerate(zip(tensors_list, fp32_arrays)):
-                # Track dequantization stats
-                type_name = tensor_info.type.name
-                if type_name in dequant_stats:
-                    dequant_stats[type_name] += 1
-                else:
-                    dequant_stats['other'] += 1
-                
-                # Map GGUF name to HuggingFace name
-                hf_name = mapper.map_name(tensor_info.name)
-                
-                # Track unmapped tensors
-                if hf_name == tensor_info.name:
-                    # Name unchanged - possibly unmapped
-                    if not any(hf_name.startswith(p) for p in ['model.', 'lm_head']):
+                    if was_unmapped:
                         unmapped_count += 1
                         if self.verbose:
                             print(f"  WARNING: Tensor may be unmapped: {tensor_info.name}")
-                
-                # Convert to PyTorch tensor if requested
-                if as_torch:
-                    if not HAS_TORCH:
-                        raise RuntimeError("PyTorch not available but as_torch=True")
-                    # Make a writable copy to avoid PyTorch warning about read-only arrays
-                    # (memory-mapped arrays from GGUF files are read-only)
-                    if not fp32_array.flags.writeable:
-                        fp32_array = fp32_array.copy()
-                    tensor = torch.from_numpy(fp32_array)
-                else:
-                    tensor = fp32_array
-                
-                # Qwen 3.5 transforms for directly-mapped tensors
-                if model_type == 'qwen35' and as_torch:
-                    tensor = self._apply_qwen35_transforms(
-                        tensor, tensor_info.name, hf_name
-                    )
-                
-                # NOTE: As of the dimension reversal fix in gguf_parser.py, dimensions are now
-                # in standard row-major order (matching PyTorch/NumPy conventions).
-                # No additional transposition is needed.
-                
-                state_dict[hf_name] = tensor
+
+                    # NOTE: As of the dimension reversal fix in gguf_parser.py,
+                    # dimensions are now in standard row-major order
+                    # (matching PyTorch/NumPy conventions). No additional
+                    # transposition is needed.
+                    state_dict[hf_name] = tensor
             
             # Handle tied embeddings: if lm_head.weight is missing, copy from embeddings
             if 'lm_head.weight' not in state_dict:

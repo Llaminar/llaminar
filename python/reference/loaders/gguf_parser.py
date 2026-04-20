@@ -329,27 +329,38 @@ class GGUFParser:
             
         print(f"Tensor data starts at offset: {self.data_offset}")
         
-    def read_tensor_data(self, tensor_info: GGUFTensorInfo) -> bytes:
+    def read_tensor_data(self, tensor_info: GGUFTensorInfo) -> memoryview:
         """
         Read raw tensor data from file.
-        
+
+        Returns a zero-copy ``memoryview`` over the memory-mapped region.
+        Downstream consumers feed this into ``np.frombuffer(...)`` which
+        accepts any buffer-protocol object and itself does not copy.
+
+        PERF: Previously this returned ``bytes(self.mmap[a:b])`` which forces
+        the kernel to copy the entire slice (28+ GB on 27B Q8_0 models)
+        out of the page cache into a Python bytes object before the
+        dequant kernel even runs. The memoryview alternative defers all
+        page faulting to the actual numpy reads, which then happen in
+        parallel from worker threads.
+
         Args:
             tensor_info: Tensor information
-            
+
         Returns:
-            Raw tensor data as bytes
+            Read-only memoryview of the raw tensor data.
         """
         if self.data_offset is None:
             raise ValueError("Must call parse() before reading tensor data")
-        
+
         # Calculate actual file offset
         file_offset = self.data_offset + tensor_info.offset
-        
+
         # Calculate data size based on tensor type and dimensions
         data_size = self._calculate_tensor_size(tensor_info)
-        
-        # Read data from memory-mapped file
-        return bytes(self.mmap[file_offset:file_offset + data_size])
+
+        # Zero-copy view into the mmap. mmap is thread-safe for reads.
+        return memoryview(self.mmap)[file_offset:file_offset + data_size]
     
     def _calculate_tensor_size(self, tensor_info: GGUFTensorInfo) -> int:
         """Calculate size in bytes of tensor data"""

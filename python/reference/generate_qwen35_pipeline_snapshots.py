@@ -58,24 +58,42 @@ def save_snapshots_as_npy(
       - Decode steps: decode_step{S}_{key}.npy
     """
     output_dir.mkdir(parents=True, exist_ok=True)
-    count = 0
+
+    # Build (path, data) pairs first so the parallel save loop has nothing
+    # to compute beyond filesystem writes.
+    items: list = []
     for (stage, layer_idx), data in snapshots.items():
         stage_name = stage_to_string(stage)
         if layer_idx >= 0:
             key = f"layer{layer_idx}_{stage_name}"
         else:
             key = stage_name
-
         if prefix:
             key = f"{prefix}_{key}"
+        items.append((output_dir / f"{key}.npy", key, data))
 
-        npy_path = output_dir / f"{key}.npy"
-        np.save(npy_path, data)
-        count += 1
-        if verbose:
-            print(f"  Saved {key}: shape={list(data.shape)}")
+    # PERF: ``np.save`` releases the GIL during the actual write, and on
+    # NVMe the bottleneck is per-file syscall latency rather than
+    # bandwidth. A small thread pool overlaps those syscalls and cuts the
+    # snapshot save phase by ~Nx for large layer counts (27B → 64 layers ×
+    # ~12 stages = 770 files).
+    from concurrent.futures import ThreadPoolExecutor
+    n_workers = min(os.cpu_count() or 4, 16)
 
-    return count
+    def _save_one(item):
+        npy_path, _key, payload = item
+        np.save(npy_path, payload)
+
+    with ThreadPoolExecutor(max_workers=n_workers) as ex:
+        # Drain to surface any exception.
+        for _ in ex.map(_save_one, items):
+            pass
+
+    if verbose:
+        for _path, key, payload in items:
+            print(f"  Saved {key}: shape={list(payload.shape)}")
+
+    return len(items)
 
 
 def write_metadata(
