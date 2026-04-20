@@ -101,6 +101,7 @@
         "HSA_OVERRIDE_GFX_VERSION": "9.0.6"
     },
     "mounts": [
-        "source=${localWorkspaceFolder},target=/workspace,type=bind,consistency=cached"
+        "source=${localWorkspaceFolder},target=/workspace,type=bind,consistency=cached",
+        "source=/opt/llaminar-models,target=/opt/llaminar-models,type=bind,consistency=cached,readonly"
     ]
 }
