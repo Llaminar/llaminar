@@ -81,12 +81,8 @@ RUN if [ "$INSTALL_CUDA" = "true" ]; then \
     fi
 
 # Conditional ROCm 7.1.1 (gfx906 Tensile overlay handled inside script).
-# Also clones our P2P-fix amdgpu DKMS fork — used to rebuild the host driver
-# when PCIe-switch P2P is silently disabled on mainline kernels.
 RUN if [ "$INSTALL_ROCM" = "true" ]; then \
-        MODE=full /tmp/install-scripts/install-rocm.sh && \
-        git clone --depth 1 --branch fix/pex-pcie-switch-p2p-enable \
-            https://github.com/dbsanfte/amdgpu.git /opt/amdgpu-dkms; \
+        MODE=full /tmp/install-scripts/install-rocm.sh; \
     else \
         echo "Skipping ROCm installation"; \
     fi
