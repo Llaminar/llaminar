@@ -132,7 +132,12 @@ def run_prefill_and_decode(
 
     # ---- Prefill ----
     print("\n[Prefill] Running forward pass...")
-    result = model.forward(token_ids, clear_snapshots=True)
+    # PERF: Run prefill with use_cache=True so subsequent decode steps only
+    # need to forward the new token through cached K/V (and GDN recurrent
+    # state). Without this, each decode step re-runs the full prompt + all
+    # prior decoded tokens — O(S²) attention work that produces snapshots
+    # we then throw away (the C++ parity test only compares the LAST row).
+    result = model.forward(token_ids, clear_snapshots=True, use_cache=True)
     prefill_snaps = model.get_snapshots()
     total = save_snapshots_as_npy(prefill_snaps, output_dir, prefix="", verbose=verbose)
     print(f"  Captured {total} prefill snapshots")
@@ -147,16 +152,20 @@ def run_prefill_and_decode(
         return total, token_ids, decode_tokens
 
     # ---- Decode steps ----
-    # Build the full input so far
-    all_tokens = list(token_ids) + [next_token]
+    # Cache from prefill carries K/V for the prompt + GDN recurrent state.
+    cache = result.get("past_key_values")
     decode_tokens.append(next_token)
 
     for step in range(decode_steps):
         prefix = f"decode_step{step}"
-        print(f"\n[Decode step {step}] token={all_tokens[-1]}")
+        print(f"\n[Decode step {step}] token={next_token}")
 
-        # Run full forward on all tokens so far (no KV cache — matches C++ test)
-        result = model.forward(all_tokens, clear_snapshots=True)
+        # Single-token forward using cache. Snapshots from this step have
+        # shape [1, 1, H] (one new position), matching what Llaminar's
+        # incremental decode produces.
+        result = model.forward([next_token], clear_snapshots=True,
+                               past_key_values=cache, use_cache=True)
+        cache = result.get("past_key_values")
         step_snaps = model.get_snapshots()
         n = save_snapshots_as_npy(step_snaps, output_dir, prefix=prefix, verbose=verbose)
         total += n
@@ -165,7 +174,6 @@ def run_prefill_and_decode(
         # Pick next token
         logits = result["logits"]
         next_token = int(np.argmax(logits[0, -1, :]))
-        all_tokens.append(next_token)
         decode_tokens.append(next_token)
         print(f"  Next token (greedy): {next_token}")
 

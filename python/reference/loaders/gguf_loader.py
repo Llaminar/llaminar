@@ -26,8 +26,10 @@ Author: David Sanftenberg
 
 from pathlib import Path
 from typing import Dict, Tuple, Any, Optional, Union
+import os
 import re
 import sys
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 
@@ -216,21 +218,31 @@ class GGUFLoader:
                 'other': 0
             }
             
-            for i, tensor_info in enumerate(parser.tensors):
-                # Progress message
-                if show_progress and (i % 50 == 0 or i == total_tensors - 1):
-                    print(f"  Loading tensor {i+1}/{total_tensors}: {tensor_info.name}")
-                
-                # Read raw tensor data
-                raw_data = parser.read_tensor_data(tensor_info)
-                
-                # Dequantize to FP32
-                fp32_array = dequantize.dequantize(
-                    raw_data, 
-                    tensor_info.type, 
-                    tensor_info.shape
-                )
-                
+            # PERF: Parallelize raw-read + dequantize across CPU cores. The
+            # numpy dequantization paths are vectorized and release the GIL,
+            # so threads scale well. We cap workers because each output array
+            # can be very large (FP32 weights for big models hold gigabytes
+            # in memory simultaneously) and more workers don't help once
+            # we're memory-bandwidth bound. mmap reads are thread-safe.
+            n_workers = min(os.cpu_count() or 4, 16)
+            tensors_list = list(parser.tensors)
+
+            def _read_and_dequantize(tensor_info):
+                raw = parser.read_tensor_data(tensor_info)
+                fp32 = dequantize.dequantize(raw, tensor_info.type, tensor_info.shape)
+                # Make writable up-front so torch.from_numpy doesn't warn
+                # (mmap-backed arrays are read-only).
+                if not fp32.flags.writeable:
+                    fp32 = fp32.copy()
+                return fp32
+
+            if show_progress:
+                print(f"  Dequantizing {total_tensors} tensors with {n_workers} threads...")
+
+            with ThreadPoolExecutor(max_workers=n_workers) as ex:
+                fp32_arrays = list(ex.map(_read_and_dequantize, tensors_list))
+
+            for i, (tensor_info, fp32_array) in enumerate(zip(tensors_list, fp32_arrays)):
                 # Track dequantization stats
                 type_name = tensor_info.type.name
                 if type_name in dequant_stats:

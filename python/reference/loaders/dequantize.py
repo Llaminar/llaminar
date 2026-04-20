@@ -180,26 +180,30 @@ def dequantize_q8_0(data: bytes, n_elements: int) -> np.ndarray:
     
     # Convert to numpy array
     data_array = np.frombuffer(data, dtype=np.uint8)
-    
+
     # Reshape to blocks
     full_blocks = len(data) // BLOCK_BYTES
     data_blocks = data_array[:full_blocks * BLOCK_BYTES].reshape(full_blocks, BLOCK_BYTES)
-    
-    # Extract scales (first 2 bytes of each block) - vectorized FP16 conversion
-    scale_bytes = data_blocks[:, :2].copy()
-    scales = np.frombuffer(scale_bytes.tobytes(), dtype=np.float16).astype(np.float32)
-    
-    # Extract quantized data (remaining 32 bytes per block)
-    quant_data = data_blocks[:, 2:].copy()
-    
-    # Reinterpret as signed int8
-    quant_signed = quant_data.view(np.int8)
-    
+
+    # Extract scales (first 2 bytes of each block) — view as FP16 directly.
+    # The original code did `data_blocks[:, :2].copy().tobytes()` which forced
+    # two extra copies before the FP16 cast. We can skip that by reinterpreting
+    # the underlying bytes as FP16 since data_array is contiguous and we know
+    # each block's first 2 bytes are the scale.
+    scales_view = data_array[:full_blocks * BLOCK_BYTES].view(np.uint8).reshape(full_blocks, BLOCK_BYTES)
+    scales = np.ascontiguousarray(scales_view[:, :2]).view(np.float16).reshape(full_blocks).astype(np.float32)
+
+    # Extract quantized data (remaining 32 bytes per block) and reinterpret as
+    # signed int8 directly — no intermediate `.copy()` is needed because we
+    # immediately astype to FP32 (which already produces a fresh array).
+    quant_signed = data_blocks[:, 2:].view(np.int8)
+
     # Apply scales (broadcast over block elements)
     dequantized = quant_signed.astype(np.float32) * scales[:, np.newaxis]
-    
-    # Flatten and truncate to actual element count
-    result = dequantized.flatten()[:n_elements]
+
+    # Reshape (no copy) instead of flatten (always copies). Since `dequantized`
+    # is C-contiguous from the multiplication above, reshape returns a view.
+    result = dequantized.reshape(-1)[:n_elements]
     
     # Handle partial last block if exists
     if len(result) < n_elements:
