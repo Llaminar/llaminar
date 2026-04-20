@@ -80,7 +80,7 @@ jobs:
     outputs:
       image-ref: ${{ steps.meta.outputs.tags }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       # Use the host docker engine as the buildx driver (instead of the
       # default docker-container driver). With the docker driver, `--load`
@@ -90,13 +90,13 @@ jobs:
       # Tradeoff: no multi-platform / no cache-to=registry, neither of
       # which we use on the self-hosted GPU runner.
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
         with:
           driver: docker
 
       - name: Log in to GHCR
         if: github.event_name != 'pull_request'
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -104,7 +104,7 @@ jobs:
 
       - name: Resolve runtime-image tags
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
@@ -121,7 +121,7 @@ jobs:
       # ---------------------------------------------------------------------
       - name: Restore ccache from previous runs
         id: ccache-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ${{ runner.temp }}/.ccache-llaminar
           key: ccache-builder-${{ runner.os }}-${{ hashFiles('Dockerfile', 'scripts/docker/**', 'src/v2/CMakeLists.txt') }}-${{ github.sha }}
@@ -130,7 +130,7 @@ jobs:
             ccache-builder-${{ runner.os }}-
 
       - name: Inject ccache into BuildKit
-        uses: reproducible-containers/buildkit-cache-dance@v3.1.2
+        uses: reproducible-containers/buildkit-cache-dance@v3.3.2
         with:
           cache-map: |
             {
@@ -153,7 +153,7 @@ jobs:
       # uploads to GHA cache over residential wifi, which made `mode=max`
       # exports of the ~200 GB builder image stall the job for >40 min.
       - name: Build builder image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: Dockerfile
@@ -172,7 +172,7 @@ jobs:
 
       - name: Extract ccache from BuildKit
         if: always()
-        uses: reproducible-containers/buildkit-cache-dance@v3.1.2
+        uses: reproducible-containers/buildkit-cache-dance@v3.3.2
         with:
           cache-map: |
             {
@@ -273,7 +273,7 @@ jobs:
 
       - name: Upload NodeLocalTP core dumps (on failure)
         if: failure() && steps.qwen2_node_local_tp.conclusion == 'failure'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: qwen2-node-local-tp-cores
           path: ${{ github.workspace }}/cores/
@@ -326,7 +326,7 @@ jobs:
 
       - name: Upload parity result CSVs
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: parity-results-${{ github.run_id }}
           path: ${PARITY_HISTORY_DIR}/
@@ -335,7 +335,7 @@ jobs:
 
       - name: Upload parity trend charts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: parity-trends-${{ github.run_id }}
           path: ${{ github.workspace }}/parity-trends/
@@ -404,7 +404,7 @@ jobs:
 
       - name: Upload benchmark result JSON
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: benchmark-results-${{ github.run_id }}
           path: ${BENCHMARK_HISTORY_DIR}/
@@ -413,7 +413,7 @@ jobs:
 
       - name: Upload performance trend charts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: perf-trends-${{ github.run_id }}
           path: ${{ github.workspace }}/perf-trends/
@@ -426,7 +426,7 @@ jobs:
       # ---------------------------------------------------------------------
       # NOTE: cache-to/from removed — same wifi-uplink rationale as above.
       - name: Build + push runtime image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: Dockerfile
@@ -442,7 +442,7 @@ jobs:
 
       - name: Upload logs on failure
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ci-logs-${{ github.run_id }}
           path: |
