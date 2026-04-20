@@ -435,49 +435,13 @@ if(HAVE_CUDA)
     endif()
 endif()
 
-# amdgpu DKMS Auto-Clone for P2P Fix
+# amdgpu DKMS Auto-Clone for P2P Fix — REMOVED
 # =============================================================================
-# The upstream amdgpu DKMS (ROCm/amdgpu) gates CONFIG_HSA_AMD_P2P on
-# CONFIG_DMABUF_MOVENOTIFY, an AMD out-of-tree Kconfig that doesn't exist in
-# mainline kernels >= 5.12. This silently disables GPU-to-GPU P2P through
-# PCIe switches (e.g., Broadcom PEX88096). Our fork removes this gate.
-# See: https://github.com/dbsanfte/amdgpu/tree/fix/pex-pcie-switch-p2p-enable
-if(HAVE_ROCM)
-    find_package(Git REQUIRED)
-
-    get_filename_component(REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
-    set(AMDGPU_EXTERNAL_DIR "${REPO_ROOT}/external/amdgpu")
-    set(AMDGPU_GIT_URL "https://github.com/dbsanfte/amdgpu.git")
-    set(AMDGPU_GIT_REF "fix/pex-pcie-switch-p2p-enable")
-
-    if(NOT EXISTS "${REPO_ROOT}/external")
-        file(MAKE_DIRECTORY ${REPO_ROOT}/external)
-    endif()
-
-    if(NOT EXISTS "${AMDGPU_EXTERNAL_DIR}")
-        message(STATUS "V2: amdgpu DKMS not found in external/, cloning ${AMDGPU_GIT_URL} (${AMDGPU_GIT_REF})...")
-        execute_process(
-            COMMAND ${GIT_EXECUTABLE} clone --depth 1 --branch ${AMDGPU_GIT_REF}
-                ${AMDGPU_GIT_URL}
-                amdgpu
-            WORKING_DIRECTORY ${REPO_ROOT}/external
-            RESULT_VARIABLE GIT_CLONE_RESULT
-            OUTPUT_VARIABLE GIT_CLONE_OUTPUT
-            ERROR_VARIABLE GIT_CLONE_ERROR
-            OUTPUT_STRIP_TRAILING_WHITESPACE
-            ERROR_STRIP_TRAILING_WHITESPACE
-        )
-
-        if(NOT GIT_CLONE_RESULT EQUAL 0)
-            message(WARNING "V2: Failed to clone amdgpu DKMS fork: ${GIT_CLONE_ERROR}\n"
-                            "P2P through PCIe switches may not work with the stock amdgpu DKMS on mainline kernels.")
-        else()
-            message(STATUS "V2: amdgpu DKMS fork (${AMDGPU_GIT_REF}) cloned successfully")
-        endif()
-    else()
-        message(STATUS "V2: amdgpu DKMS already present at ${AMDGPU_EXTERNAL_DIR}")
-    endif()
-endif()
+# Previously cloned dbsanfte/amdgpu@fix/pex-pcie-switch-p2p-enable into
+# external/amdgpu so the host driver could be rebuilt with a P2P-through-
+# PCIe-switch patch. The build never compiled or linked anything from that
+# tree — kernel-driver rebuild is a host-side concern. The clone added
+# ~1 minute and ~80 MB to every fresh build for no in-tree benefit.
 
 # ROCm backend (separate .cpp compilation unit with HIP)
 if(HAVE_ROCM)
@@ -914,12 +878,31 @@ if(USE_ONEDNN)
     # Note: Repository root is two levels up from src/v2
     get_filename_component(REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
     set(ONEDNN_EXTERNAL_DIR "${REPO_ROOT}/external/onednn")
-    set(ONEDNN_GIT_URL "https://github.com/dbsanfte/oneDNN.git")
-    # Track dbsanfte fork main branch so fused softmax patches are always available
-    set(ONEDNN_GIT_REF "main")
+    set(ONEDNN_GIT_URL "https://github.com/uxlfoundation/oneDNN.git")
+    # Pinned to an upstream SemVer release tag for reproducible builds.
+    # We previously tracked dbsanfte/oneDNN@main for "fused softmax matmul"
+    # APIs, but that codepath is no longer used in llaminar. Bump this tag
+    # when picking up new upstream features. Latest releases:
+    # https://github.com/uxlfoundation/oneDNN/releases
+    set(ONEDNN_GIT_REF "v3.11.3")
 
     if(NOT EXISTS "${REPO_ROOT}/external")
         file(MAKE_DIRECTORY ${REPO_ROOT}/external)
+    endif()
+
+    # If an existing checkout points at the wrong remote (e.g. the old
+    # dbsanfte/oneDNN fork), wipe it so we re-clone the pinned upstream tag.
+    if(EXISTS "${ONEDNN_EXTERNAL_DIR}/.git")
+        execute_process(
+            COMMAND ${GIT_EXECUTABLE} -C ${ONEDNN_EXTERNAL_DIR} remote get-url origin
+            OUTPUT_VARIABLE _ONEDNN_EXISTING_URL
+            ERROR_QUIET
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+        )
+        if(NOT _ONEDNN_EXISTING_URL STREQUAL ONEDNN_GIT_URL)
+            message(STATUS "V2: OneDNN at ${ONEDNN_EXTERNAL_DIR} points at '${_ONEDNN_EXISTING_URL}', expected '${ONEDNN_GIT_URL}'; re-cloning")
+            file(REMOVE_RECURSE "${ONEDNN_EXTERNAL_DIR}")
+        endif()
     endif()
 
     if(NOT EXISTS "${ONEDNN_EXTERNAL_DIR}")
