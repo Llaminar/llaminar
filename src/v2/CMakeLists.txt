@@ -919,16 +919,24 @@ if(USE_ONEDNN)
     # Note: Repository root is two levels up from src/v2
     get_filename_component(REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
     set(ONEDNN_EXTERNAL_DIR "${REPO_ROOT}/external/onednn")
-    set(ONEDNN_GIT_URL "https://github.com/dbsanfte/oneDNN.git")
-    # Track dbsanfte fork main branch so fused softmax patches are always available
-    set(ONEDNN_GIT_REF "main")
+    set(ONEDNN_GIT_URL "https://github.com/uxlfoundation/oneDNN.git")
+    # Pinned to an upstream SemVer release tag for reproducible builds.
+    # We previously tracked dbsanfte/oneDNN@main for "fused softmax matmul"
+    # APIs, but the fused-softmax codepath in
+    # FloatingPointGemmKernel::multiply_with_softmax_strided_typed_impl is
+    # NOT actually using those APIs — it composes upstream matmul with our
+    # own primitives::softmax_row_major_fp32 (which handles -inf masks
+    # correctly, unlike dnnl::softmax_forward). So we can safely use
+    # upstream and drop the fork dependency.
+    # Bump this tag when intentionally pulling new upstream changes.
+    set(ONEDNN_GIT_REF "v3.11.3")
 
     if(NOT EXISTS "${REPO_ROOT}/external")
         file(MAKE_DIRECTORY ${REPO_ROOT}/external)
     endif()
 
     if(NOT EXISTS "${ONEDNN_EXTERNAL_DIR}")
-        message(STATUS "V2: OneDNN not found in external/, cloning ${ONEDNN_GIT_URL} (${ONEDNN_GIT_REF})...")
+        message(STATUS "V2: OneDNN not found in external/, cloning ${ONEDNN_GIT_URL} @ ${ONEDNN_GIT_REF}...")
         execute_process(
             COMMAND ${GIT_EXECUTABLE} clone --depth 1 --branch ${ONEDNN_GIT_REF}
                 ${ONEDNN_GIT_URL}

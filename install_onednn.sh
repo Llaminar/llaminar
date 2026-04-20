@@ -4,7 +4,7 @@
 
 set -e
 
-ONEDNN_VERSION="v3.6.1"  # Latest stable as of Nov 2025
+ONEDNN_VERSION="v3.11.3"  # Latest stable as of Apr 2026
 INSTALL_DIR="/opt/onednn"
 BUILD_THREADS=$(nproc)
 
