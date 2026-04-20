@@ -10,6 +10,12 @@ out/
 .devcontainer/
 venv/
 
+# OneDNN is cloned + built inside the Docker image in a dedicated early
+# layer (see Dockerfile). Excluding it from the build context avoids
+# uploading the host's local checkout (which can include a multi-GB
+# build/ dir after a dev build) on every `docker build`.
+external/onednn/
+
 # Core dumps & profiling artefacts
 core
 core.*

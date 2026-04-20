@@ -82,6 +82,44 @@ RUN ln -sf /usr/local/cuda/lib64/stubs/libcuda.so \
 
 WORKDIR /src
 
+# ---------------------------------------------------------------------------
+# OneDNN — clone + build in a dedicated layer BEFORE the source COPYs.
+#
+# This layer's cache key depends only on the install scripts, the base image,
+# and the pinned tag below. Source edits (src/, tests/, CMakeLists.txt) do
+# NOT invalidate it, so the ~2-minute clone + configure + compile only re-runs
+# when ONEDNN_GIT_REF is bumped here OR when an earlier layer changes.
+#
+# The src/v2/CMakeLists.txt OneDNN integration script detects the prebuilt
+# tree at external/onednn/build/include/oneapi/dnnl/dnnl.hpp and skips its
+# own clone+build entirely. Keep ONEDNN_GIT_REF in sync with the pin in
+# src/v2/CMakeLists.txt (search for ONEDNN_GIT_REF).
+# ---------------------------------------------------------------------------
+ARG ONEDNN_GIT_REF=v3.11.3
+RUN set -e; \
+    mkdir -p /src/external; \
+    git clone --depth 1 --branch ${ONEDNN_GIT_REF} \
+        https://github.com/uxlfoundation/oneDNN.git /src/external/onednn; \
+    cmake -B /src/external/onednn/build -S /src/external/onednn \
+        -G Ninja \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_INSTALL_PREFIX=/src/external/onednn/build \
+        -DDNNL_CPU_RUNTIME=OMP \
+        -DDNNL_BUILD_TESTS=OFF \
+        -DDNNL_BUILD_EXAMPLES=OFF \
+        -DDNNL_EXPERIMENTAL_UKERNEL=ON \
+        -DCMAKE_CXX_FLAGS=-march=native \
+        -DCMAKE_C_FLAGS=-march=native; \
+    cmake --build /src/external/onednn/build --parallel --target install; \
+    git -C /src/external/onednn rev-parse HEAD \
+        > /src/external/onednn/build/.llaminar-onednn-commit; \
+    # Drop OneDNN's intermediate .o / .d files but keep the installed lib +
+    # headers + .git (cmake checks `git remote get-url origin` to validate
+    # the checkout matches the expected upstream URL).
+    find /src/external/onednn/build \
+        \( -name '*.o' -o -name '*.d' -o -name CMakeFiles \) \
+        -prune -exec rm -rf {} +
+
 # Python dependencies for the reference tests + parity gates. Pulls the
 # CPU-only PyTorch wheel (~250 MB) plus our transformers fork. Cached as a
 # separate layer keyed only on requirements.txt so source edits don't
