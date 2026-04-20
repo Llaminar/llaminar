@@ -184,131 +184,18 @@ jobs:
           retention-days: 7
 
   # -------------------------------------------------------------------------
-  # Gate 2a: Qwen2 SingleDevice parity.
+  # Gate 2a: parity — CPU (all Qwen2 / Qwen3 / Qwen3.5 suites).
+  #
+  # Runs three Qwen families in parallel inside a single container: one
+  # ctest invocation per family, each filtered to pure-CPU tests
+  # (backend tag "CPU" anywhere in the test name, and no "CUDA" or "ROCm").
+  # Per-family subsets are disjoint by test-name prefix, so the CSV output
+  # directories (per-test subdir under tests/v2/integration/parity/results/
+  # <git-hash>/<test-name>/) never collide.
   # -------------------------------------------------------------------------
-  parity-qwen2-sd:
-    name: Gate — Parity (Qwen2 SingleDevice)
-    needs: build
-    runs-on: [self-hosted, linux, x64, llaminar-bench]
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@v6
-      - name: Configure core-dump capture
-        run: |
-          sudo mkdir -p "${{ github.workspace }}/cores"
-          sudo chmod 1777 "${{ github.workspace }}/cores"
-          sudo sysctl -w "kernel.core_pattern=${{ github.workspace }}/cores/core.%e.%p.%t"
-          sudo sysctl -w kernel.core_uses_pid=1
-      - name: Run Qwen2 SingleDevice parity
-        run: |
-          docker run --rm \
-            --gpus all \
-            --device=/dev/kfd --device=/dev/dri \
-            --group-add video --group-add render \
-            --cap-add SYS_NICE --cap-add SYS_PTRACE \
-            --ulimit core=-1 \
-            --ipc=host --shm-size=16g \
-            -v "${MODELS_DIR}:/src/models:ro" \
-            -v "${PARITY_HISTORY_DIR}:/src/tests/v2/integration/parity/results" \
-            --workdir /src \
-            ${{ needs.build.outputs.builder-image }} \
-            ctest --test-dir build_v2_integration --output-on-failure \
-                  --timeout 900 -R '^V2_Integration_Parity_Qwen2_SingleDevice_'
-      - name: Upload core dumps on failure
-        if: failure()
-        uses: actions/upload-artifact@v7
-        with:
-          name: cores-parity-qwen2-sd-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ github.workspace }}/cores/
-          if-no-files-found: ignore
-          retention-days: 7
-
-  # -------------------------------------------------------------------------
-  # Gate 2b: Qwen3.5 SingleDevice parity (includes 27B Q8_0).
-  # -------------------------------------------------------------------------
-  parity-qwen35-sd:
-    name: Gate — Parity (Qwen3.5 SingleDevice)
-    needs: build
-    runs-on: [self-hosted, linux, x64, llaminar-bench]
-    timeout-minutes: 90
-    steps:
-      - uses: actions/checkout@v6
-      - name: Configure core-dump capture
-        run: |
-          sudo mkdir -p "${{ github.workspace }}/cores"
-          sudo chmod 1777 "${{ github.workspace }}/cores"
-          sudo sysctl -w "kernel.core_pattern=${{ github.workspace }}/cores/core.%e.%p.%t"
-          sudo sysctl -w kernel.core_uses_pid=1
-      - name: Run Qwen3.5 SingleDevice parity
-        run: |
-          docker run --rm \
-            --gpus all \
-            --device=/dev/kfd --device=/dev/dri \
-            --group-add video --group-add render \
-            --cap-add SYS_NICE --cap-add SYS_PTRACE \
-            --ulimit core=-1 \
-            --ipc=host --shm-size=16g \
-            -v "${MODELS_DIR}:/src/models:ro" \
-            -v "${PARITY_HISTORY_DIR}:/src/tests/v2/integration/parity/results" \
-            --workdir /src \
-            ${{ needs.build.outputs.builder-image }} \
-            ctest --test-dir build_v2_integration --output-on-failure \
-                  --timeout 1800 -R '^V2_Integration_Parity_Qwen35_SingleDevice_'
-      - name: Upload core dumps on failure
-        if: failure()
-        uses: actions/upload-artifact@v7
-        with:
-          name: cores-parity-qwen35-sd-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ github.workspace }}/cores/
-          if-no-files-found: ignore
-          retention-days: 7
-
-  # -------------------------------------------------------------------------
-  # Gate 2c: Qwen2 NodeLocalTP parity.
-  # -------------------------------------------------------------------------
-  parity-qwen2-nltp:
-    name: Gate — Parity (Qwen2 NodeLocalTP)
-    needs: build
-    runs-on: [self-hosted, linux, x64, llaminar-bench]
-    timeout-minutes: 45
-    steps:
-      - uses: actions/checkout@v6
-      - name: Configure core-dump capture
-        run: |
-          sudo mkdir -p "${{ github.workspace }}/cores"
-          sudo chmod 1777 "${{ github.workspace }}/cores"
-          sudo sysctl -w "kernel.core_pattern=${{ github.workspace }}/cores/core.%e.%p.%t"
-          sudo sysctl -w kernel.core_uses_pid=1
-      - name: Run Qwen2 NodeLocalTP parity
-        run: |
-          docker run --rm \
-            --gpus all \
-            --device=/dev/kfd --device=/dev/dri \
-            --group-add video --group-add render \
-            --cap-add SYS_NICE --cap-add SYS_PTRACE \
-            --ulimit core=-1 \
-            --ipc=host --shm-size=16g \
-            -v "${MODELS_DIR}:/src/models:ro" \
-            -v "${PARITY_HISTORY_DIR}:/src/tests/v2/integration/parity/results" \
-            --workdir /src \
-            ${{ needs.build.outputs.builder-image }} \
-            ctest --test-dir build_v2_integration --output-on-failure \
-                  --timeout 900 -R '^V2_Integration_Parity_NodeLocalTP_'
-      - name: Upload core dumps on failure
-        if: failure()
-        uses: actions/upload-artifact@v7
-        with:
-          name: cores-parity-qwen2-nltp-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ github.workspace }}/cores/
-          if-no-files-found: ignore
-          retention-days: 7
-
-  # -------------------------------------------------------------------------
-  # Gate 2d: Qwen3.5 NodeLocalTP parity (includes 27B Q8_0).
-  # -------------------------------------------------------------------------
-  parity-qwen35-nltp:
-    name: Gate — Parity (Qwen3.5 NodeLocalTP)
-    needs: build
+  parity-cpu:
+    name: Gate — Parity (CPU, all Qwen families)
+    needs: unit
     runs-on: [self-hosted, linux, x64, llaminar-bench]
     timeout-minutes: 120
     steps:
@@ -319,7 +206,7 @@ jobs:
           sudo chmod 1777 "${{ github.workspace }}/cores"
           sudo sysctl -w "kernel.core_pattern=${{ github.workspace }}/cores/core.%e.%p.%t"
           sudo sysctl -w kernel.core_uses_pid=1
-      - name: Run Qwen3.5 NodeLocalTP parity
+      - name: Run CPU parity (Qwen2 ‖ Qwen3 ‖ Qwen3.5)
         run: |
           docker run --rm \
             --gpus all \
@@ -332,13 +219,83 @@ jobs:
             -v "${PARITY_HISTORY_DIR}:/src/tests/v2/integration/parity/results" \
             --workdir /src \
             ${{ needs.build.outputs.builder-image }} \
-            ctest --test-dir build_v2_integration --output-on-failure \
-                  --timeout 1800 -R '^V2_Integration_Parity_Qwen35_NodeLocalTP_'
+            bash scripts/ci/run_parity_slots.sh \
+              qwen2-cpu  '^V2_Integration_Parity_(Qwen2_|NodeLocalTP_Qwen2)' 'CUDA|ROCm' \
+              qwen3-cpu  '^V2_Integration_Parity_Qwen3_'                      'CUDA|ROCm' \
+              qwen35-cpu '^V2_Integration_Parity_Qwen35_'                     'CUDA|ROCm'
       - name: Upload core dumps on failure
         if: failure()
         uses: actions/upload-artifact@v7
         with:
-          name: cores-parity-qwen35-nltp-${{ github.run_id }}-${{ github.run_attempt }}
+          name: cores-parity-cpu-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ github.workspace }}/cores/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # -------------------------------------------------------------------------
+  # Gate 2b: parity — GPU (all Qwen2 / Qwen3 / Qwen3.5 suites).
+  #
+  # 3 parallel phases + 1 serial phase. In each parallel phase, exactly one
+  # slot uses CUDA and one uses ROCm, so we never contend for the same GPU
+  # type. The final phase runs heterogeneous tests (HybridPPTP / multi-GPU
+  # mixed-backend) serially because they need both GPU types simultaneously.
+  #
+  #   Phase 1 (‖): Qwen2 CUDA    ‖ Qwen3.5 ROCm
+  #   Phase 2 (‖): Qwen2 ROCm    ‖ Qwen3.5 CUDA
+  #   Phase 3 (‖): Qwen3 CUDA    ‖ Qwen3 ROCm
+  #   Phase 4 (serial): heterogeneous (CUDA+ROCm in same test)
+  # -------------------------------------------------------------------------
+  parity-gpu:
+    name: Gate — Parity (GPU, all Qwen families)
+    needs: unit
+    runs-on: [self-hosted, linux, x64, llaminar-bench]
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v6
+      - name: Configure core-dump capture
+        run: |
+          sudo mkdir -p "${{ github.workspace }}/cores"
+          sudo chmod 1777 "${{ github.workspace }}/cores"
+          sudo sysctl -w "kernel.core_pattern=${{ github.workspace }}/cores/core.%e.%p.%t"
+          sudo sysctl -w kernel.core_uses_pid=1
+      - name: Run GPU parity (phases 1-4)
+        run: |
+          docker run --rm \
+            --gpus all \
+            --device=/dev/kfd --device=/dev/dri \
+            --group-add video --group-add render \
+            --cap-add SYS_NICE --cap-add SYS_PTRACE \
+            --ulimit core=-1 \
+            --ipc=host --shm-size=16g \
+            -v "${MODELS_DIR}:/src/models:ro" \
+            -v "${PARITY_HISTORY_DIR}:/src/tests/v2/integration/parity/results" \
+            --workdir /src \
+            ${{ needs.build.outputs.builder-image }} \
+            bash -c '
+              set -u
+              fail=0
+              scripts/ci/run_parity_slots.sh \
+                qwen2-cuda  "^V2_Integration_Parity_(Qwen2_|NodeLocalTP_Qwen2).*CUDA" "ROCm" \
+                qwen35-rocm "^V2_Integration_Parity_Qwen35_.*ROCm"                     "CUDA" \
+                || fail=1
+              scripts/ci/run_parity_slots.sh \
+                qwen2-rocm  "^V2_Integration_Parity_(Qwen2_|NodeLocalTP_Qwen2).*ROCm" "CUDA" \
+                qwen35-cuda "^V2_Integration_Parity_Qwen35_.*CUDA"                     "ROCm" \
+                || fail=1
+              scripts/ci/run_parity_slots.sh \
+                qwen3-cuda "^V2_Integration_Parity_Qwen3_.*CUDA" "ROCm" \
+                qwen3-rocm "^V2_Integration_Parity_Qwen3_.*ROCm" "CUDA" \
+                || fail=1
+              scripts/ci/run_parity_slots.sh \
+                hetero "^V2_Integration_Parity_.*(CUDA.*ROCm|ROCm.*CUDA)" "__never_match__" \
+                || fail=1
+              exit $fail
+            '
+      - name: Upload core dumps on failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: cores-parity-gpu-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ github.workspace }}/cores/
           if-no-files-found: ignore
           retention-days: 7
@@ -348,7 +305,7 @@ jobs:
   # -------------------------------------------------------------------------
   e2e:
     name: Gate — E2E server tests
-    needs: build
+    needs: [parity-cpu, parity-gpu]
     runs-on: [self-hosted, linux, x64, llaminar-bench]
     timeout-minutes: 45
     steps:
@@ -397,7 +354,7 @@ jobs:
   # -------------------------------------------------------------------------
   perf:
     name: Gate — Performance ratchet
-    needs: build
+    needs: [parity-cpu, parity-gpu]
     runs-on: [self-hosted, linux, x64, llaminar-bench]
     timeout-minutes: 60
     steps:
@@ -442,10 +399,8 @@ jobs:
     needs:
       - build
       - unit
-      - parity-qwen2-sd
-      - parity-qwen35-sd
-      - parity-qwen2-nltp
-      - parity-qwen35-nltp
+      - parity-cpu
+      - parity-gpu
       - e2e
       - perf
     if: always()
@@ -575,10 +530,8 @@ jobs:
         if: |
           needs.build.result == 'success' &&
           needs.unit.result == 'success' &&
-          needs.parity-qwen2-sd.result == 'success' &&
-          needs.parity-qwen35-sd.result == 'success' &&
-          needs.parity-qwen2-nltp.result == 'success' &&
-          needs.parity-qwen35-nltp.result == 'success' &&
+          needs.parity-cpu.result == 'success' &&
+          needs.parity-gpu.result == 'success' &&
           needs.e2e.result == 'success' &&
           needs.perf.result == 'success'
         uses: docker/build-push-action@v7
