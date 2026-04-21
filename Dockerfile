@@ -155,41 +155,51 @@ COPY scripts/ci ./scripts/ci
 # Removing .o / .d / .gch files is safe: ctest never re-invokes the
 # compiler at test time.
 RUN --mount=type=cache,target=/root/.ccache \
-    cmake -B build_v2_integration -S src/v2 -G Ninja \
+    echo "==> [integration] cmake configure" \
+ && cmake -B build_v2_integration -S src/v2 -G Ninja \
         -DCMAKE_BUILD_TYPE=Integration \
         -DHAVE_CUDA=ON \
         -DHAVE_ROCM=ON \
         -DCMAKE_CUDA_ARCHITECTURES="${LLAMINAR_CUDA_ARCHS}" \
+ && echo "==> [integration] cmake build (parallel)" \
  && cmake --build build_v2_integration --parallel \
+ && echo "==> [integration] strip --strip-debug on executables/.a/.so (parallel, $(nproc) jobs)" \
  && find build_v2_integration \
         \( -type f -executable -o -name '*.a' -o -name '*.so' -o -name '*.so.*' \) \
         -not -path '*/CMakeFiles/*' \
         -print0 \
     | xargs -0 -r -P "$(nproc)" -n 32 strip --strip-debug 2>/dev/null || true \
+ && echo "==> [integration] removing intermediates (.o/.d/.gch/CMakeFiles)" \
  && find build_v2_integration \
         \( -name '*.o' -o -name '*.d' -o -name '*.gch' -o -name '*.cmake_pch.hxx' \) \
         -delete \
  && find build_v2_integration -depth -type d -name CMakeFiles -exec rm -rf {} + \
- && rm -rf build_v2_integration/Testing build_v2_integration/_deps/*-build/CMakeFiles
+ && rm -rf build_v2_integration/Testing build_v2_integration/_deps/*-build/CMakeFiles \
+ && echo "==> [integration] done; final size: $(du -sh build_v2_integration | cut -f1)"
 
 # Release build — what the runtime image ships. Optimized, no assertions,
 # only the llaminar2 target (skip test binaries). Same in-RUN cleanup.
 RUN --mount=type=cache,target=/root/.ccache \
-    cmake -B build_v2_release -S src/v2 -G Ninja \
+    echo "==> [release] cmake configure" \
+ && cmake -B build_v2_release -S src/v2 -G Ninja \
         -DCMAKE_BUILD_TYPE=${LLAMINAR_BUILD_TYPE} \
         -DHAVE_CUDA=ON \
         -DHAVE_ROCM=ON \
         -DCMAKE_CUDA_ARCHITECTURES="${LLAMINAR_CUDA_ARCHS}" \
+ && echo "==> [release] cmake build --target llaminar2 (parallel)" \
  && cmake --build build_v2_release --parallel --target llaminar2 \
+ && echo "==> [release] strip --strip-debug on executables/.a/.so (parallel, $(nproc) jobs)" \
  && find build_v2_release \
         \( -type f -executable -o -name '*.a' -o -name '*.so' -o -name '*.so.*' \) \
         -not -path '*/CMakeFiles/*' \
         -print0 \
     | xargs -0 -r -P "$(nproc)" -n 32 strip --strip-debug 2>/dev/null || true \
+ && echo "==> [release] removing intermediates (.o/.d/.gch/CMakeFiles)" \
  && find build_v2_release \
         \( -name '*.o' -o -name '*.d' -o -name '*.gch' -o -name '*.cmake_pch.hxx' \) \
         -delete \
- && find build_v2_release -depth -type d -name CMakeFiles -exec rm -rf {} +
+ && find build_v2_release -depth -type d -name CMakeFiles -exec rm -rf {} + \
+ && echo "==> [release] done; final size: $(du -sh build_v2_release | cut -f1)"
 
 # CI runs `docker run --group-add render --group-add video` against this
 # builder image; docker resolves --group-add names from the image's /etc/group,
