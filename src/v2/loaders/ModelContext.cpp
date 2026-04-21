@@ -6,6 +6,7 @@
 
 #include "ModelContext.h"
 #include "../utils/Logger.h"
+#include <exception>
 #include <iostream>
 #include <limits>
 
@@ -134,9 +135,13 @@ namespace llaminar2
         }
 
         // Load model metadata
-        if (!ctx->loader_.loadModel(model_path))
+        try
         {
-            LOG_ERROR("[ModelContext] Failed to load model: " << model_path);
+            ctx->loader_.loadModel(model_path);
+        }
+        catch (const std::exception &e)
+        {
+            LOG_ERROR("[ModelContext] Failed to load model: " << model_path << " (" << e.what() << ")");
             return nullptr;
         }
 
@@ -195,9 +200,13 @@ namespace llaminar2
         ctx->loader_.setUseMmap(config.use_mmap);
 
         // Load model metadata
-        if (!ctx->loader_.loadModel(model_path))
+        try
         {
-            LOG_ERROR("[ModelContext] Failed to load model: " << model_path);
+            ctx->loader_.loadModel(model_path);
+        }
+        catch (const std::exception &e)
+        {
+            LOG_ERROR("[ModelContext] Failed to load model: " << model_path << " (" << e.what() << ")");
             return nullptr;
         }
 
@@ -251,9 +260,13 @@ namespace llaminar2
             new ModelContext(model_path, mpi_ctx, nullptr, nullptr, WeightDistributionStrategy::LAYER_PARTITIONED));
 
         // Load model metadata
-        if (!ctx->loader_.loadModel(model_path))
+        try
         {
-            LOG_ERROR("[ModelContext] Failed to load model: " << model_path);
+            ctx->loader_.loadModel(model_path);
+        }
+        catch (const std::exception &e)
+        {
+            LOG_ERROR("[ModelContext] Failed to load model: " << model_path << " (" << e.what() << ")");
             return nullptr;
         }
 

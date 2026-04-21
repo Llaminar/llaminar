@@ -29,6 +29,51 @@
 namespace llaminar2
 {
 
+    // Check a HIP API result and throw on failure with full diagnostic context.
+    //
+    // Use this for HIP calls in **normal control-flow** that have no meaningful
+    // local recovery — e.g. a failed hipSetDevice or hipStreamSynchronize on a
+    // hot path means subsequent calls hit the wrong device or run on stale data.
+    // Continuing typically produces silent miscompute or a delayed segfault
+    // inside the HIP runtime, which is much harder to debug than failing fast.
+    //
+    // For HIP calls in **cleanup paths** (destructors, freeXxx, destroyXxx,
+    // resource clear-before-reuse, error-rollback after a prior failure), use
+    // HIP_WARN_IF_FAIL instead so we don't throw during teardown / mask the
+    // original failure.
+#define HIP_CHECK_OR_THROW(call)                                                    \
+    do                                                                              \
+    {                                                                               \
+        hipError_t _err = (call);                                                   \
+        if (_err != hipSuccess)                                                     \
+        {                                                                           \
+            std::ostringstream _oss;                                                \
+            _oss << "[ROCmBackend] " << #call << " failed: "                        \
+                 << hipGetErrorString(_err) << " (" << __FILE__ << ":" << __LINE__  \
+                 << ")";                                                            \
+            LOG_ERROR(_oss.str());                                                  \
+            throw std::runtime_error(_oss.str());                                   \
+        }                                                                           \
+    } while (0)
+
+    // Best-effort logging for HIP calls in cleanup paths (destructors, freeXxx,
+    // destroyXxx, error-rollback after a prior failure). Logs at WARN and
+    // continues — we deliberately don't throw or log at ERROR here because the
+    // caller is already tearing down or unwinding from a different failure.
+    // Throwing during stack unwind would call std::terminate; logging at ERROR
+    // would mask the real upstream failure.
+#define HIP_WARN_IF_FAIL(call)                                                      \
+    do                                                                              \
+    {                                                                               \
+        hipError_t _err = (call);                                                   \
+        if (_err != hipSuccess)                                                     \
+        {                                                                           \
+            LOG_WARN("[ROCmBackend] " << #call << " failed: "                       \
+                                      << hipGetErrorString(_err) << " ("           \
+                                      << __FILE__ << ":" << __LINE__ << ")");      \
+        }                                                                           \
+    } while (0)
+
     namespace
     {
         /**
@@ -175,7 +220,7 @@ namespace llaminar2
         hipError_t src_attr_err = hipPointerGetAttributes(&src_attrs, src);
         if (src_attr_err != hipSuccess)
         {
-            hipGetLastError();
+            (void)hipGetLastError();  // clear sticky error state
             LOG_ERROR("[ROCmBackend::deviceToHost] Invalid source device pointer: src=" << src
                                                                                         << " bytes=" << bytes
                                                                                         << " device_id=" << device_id
@@ -267,14 +312,14 @@ namespace llaminar2
             err = hipMalloc(&bufs.index_ptr, sizeof(int));
             if (err != hipSuccess)
             {
-                hipFree(bufs.value_ptr);
+                HIP_WARN_IF_FAIL(hipFree(bufs.value_ptr));  // rollback after malloc fail
                 bufs.value_ptr = nullptr;
                 return false;
             }
         }
 
         // Launch kernel on device's managed stream
-        hipSetDevice(device_id);
+        HIP_CHECK_OR_THROW(hipSetDevice(device_id));
         hipStream_t s = resolveStream(device_id, stream);
         if (!rocmOps_argmax_f32(
                 static_cast<const float *>(data_device), n,
@@ -285,10 +330,10 @@ namespace llaminar2
             return false;
         }
 
-        hipStreamSynchronize(s);
-        hipMemcpyAsync(out_value, bufs.value_ptr, sizeof(float), hipMemcpyDeviceToHost, s);
-        hipMemcpyAsync(out_index, bufs.index_ptr, sizeof(int), hipMemcpyDeviceToHost, s);
-        hipStreamSynchronize(s);
+        HIP_CHECK_OR_THROW(hipStreamSynchronize(s));
+        HIP_CHECK_OR_THROW(hipMemcpyAsync(out_value, bufs.value_ptr, sizeof(float), hipMemcpyDeviceToHost, s));
+        HIP_CHECK_OR_THROW(hipMemcpyAsync(out_index, bufs.index_ptr, sizeof(int), hipMemcpyDeviceToHost, s));
+        HIP_CHECK_OR_THROW(hipStreamSynchronize(s));
 
         return true;
     }
@@ -317,11 +362,11 @@ namespace llaminar2
         // Reallocate if k grew beyond previous allocation
         if (bufs.allocated_k < k)
         {
-            hipSetDevice(device_id);
+            HIP_CHECK_OR_THROW(hipSetDevice(device_id));
             if (bufs.values_ptr)
-                hipFree(bufs.values_ptr);
+                HIP_WARN_IF_FAIL(hipFree(bufs.values_ptr));   // clearing old buffer before realloc
             if (bufs.indices_ptr)
-                hipFree(bufs.indices_ptr);
+                HIP_WARN_IF_FAIL(hipFree(bufs.indices_ptr));  // clearing old buffer before realloc
 
             hipError_t err = hipMalloc(&bufs.values_ptr, k * sizeof(float));
             if (err != hipSuccess)
@@ -333,7 +378,7 @@ namespace llaminar2
             err = hipMalloc(&bufs.indices_ptr, k * sizeof(int));
             if (err != hipSuccess)
             {
-                hipFree(bufs.values_ptr);
+                HIP_WARN_IF_FAIL(hipFree(bufs.values_ptr));   // rollback after malloc fail
                 bufs.values_ptr = nullptr;
                 bufs.allocated_k = 0;
                 return false;
@@ -342,7 +387,7 @@ namespace llaminar2
         }
 
         // Launch kernel
-        hipSetDevice(device_id);
+        HIP_CHECK_OR_THROW(hipSetDevice(device_id));
         hipStream_t s = resolveStream(device_id, stream);
         if (!rocmOps_topk_f32(
                 static_cast<const float *>(data_device), n, k,
@@ -353,10 +398,10 @@ namespace llaminar2
             return false;
         }
 
-        hipStreamSynchronize(s);
-        hipMemcpyAsync(out_values, bufs.values_ptr, k * sizeof(float), hipMemcpyDeviceToHost, s);
-        hipMemcpyAsync(out_indices, bufs.indices_ptr, k * sizeof(int), hipMemcpyDeviceToHost, s);
-        hipStreamSynchronize(s);
+        HIP_CHECK_OR_THROW(hipStreamSynchronize(s));
+        HIP_CHECK_OR_THROW(hipMemcpyAsync(out_values, bufs.values_ptr, k * sizeof(float), hipMemcpyDeviceToHost, s));
+        HIP_CHECK_OR_THROW(hipMemcpyAsync(out_indices, bufs.indices_ptr, k * sizeof(int), hipMemcpyDeviceToHost, s));
+        HIP_CHECK_OR_THROW(hipStreamSynchronize(s));
 
         return true;
     }
@@ -379,7 +424,7 @@ namespace llaminar2
         hipError_t dst_attr_err = hipPointerGetAttributes(&dst_attrs, dst);
         if (dst_attr_err != hipSuccess)
         {
-            hipGetLastError();
+            (void)hipGetLastError();  // clear sticky error state
             LOG_ERROR("[ROCmBackend::hostToDevice] Invalid destination device pointer: dst=" << dst
                                                                                              << " bytes=" << bytes
                                                                                              << " device_id=" << device_id
@@ -484,9 +529,9 @@ namespace llaminar2
         }
 
         HipDeviceSaveRestore device_guard;
-        hipSetDevice(device_id);
+        HIP_WARN_IF_FAIL(hipSetDevice(device_id));
         hipEvent_t hip_event = reinterpret_cast<hipEvent_t>(event);
-        hipEventDestroy(hip_event);
+        HIP_WARN_IF_FAIL(hipEventDestroy(hip_event));
     }
 
     bool ROCmBackend::recordEvent(void *event, int device_id, void *stream)
@@ -624,7 +669,7 @@ namespace llaminar2
         {
             // Include memory diagnostics in the error message
             size_t free_bytes = 0, total_bytes = 0;
-            hipMemGetInfo(&free_bytes, &total_bytes);
+            (void)hipMemGetInfo(&free_bytes, &total_bytes);  // diagnostic-only; OK if it fails
             LOG_ERROR("[ROCmBackend] hipMalloc failed for " << bytes << " bytes on device "
                                                             << device_id << ": " << hipGetErrorString(err)
                                                             << " (free: " << (free_bytes / (1024 * 1024))
@@ -712,7 +757,7 @@ namespace llaminar2
             if (err != hipSuccess)
             {
                 LOG_ERROR("[ROCmBackend] hipHostGetDevicePointer failed: " << hipGetErrorString(err));
-                hipHostFree(host_ptr);
+                HIP_WARN_IF_FAIL(hipHostFree(host_ptr));  // rollback after getDevicePointer fail
                 *device_ptr = nullptr;
                 return nullptr;
             }
@@ -738,13 +783,13 @@ namespace llaminar2
         }
         else
         {
-            hipSetDevice(device_id); // Best effort
+            HIP_WARN_IF_FAIL(hipSetDevice(device_id));  // best-effort in cleanup path
         }
 
         hipError_t err = hipHostFree(host_ptr);
         if (err != hipSuccess)
         {
-            LOG_ERROR("[ROCmBackend] hipHostFree failed: " << hipGetErrorString(err));
+            LOG_WARN("[ROCmBackend] hipHostFree failed: " << hipGetErrorString(err));
         }
     }
 
@@ -1324,7 +1369,7 @@ namespace llaminar2
             {
                 LOG_WARN("[ROCmBackend::registerIoMemory] hipHostGetDevicePointer failed: "
                          << hipGetErrorString(err));
-                hipHostUnregister(ptr);
+                HIP_WARN_IF_FAIL(hipHostUnregister(ptr));  // rollback after getDevicePointer fail
             }
         }
         else
@@ -1351,7 +1396,7 @@ namespace llaminar2
             {
                 LOG_WARN("[ROCmBackend::registerIoMemory] hipHostGetDevicePointer failed: "
                          << hipGetErrorString(err));
-                hipHostUnregister(ptr);
+                HIP_WARN_IF_FAIL(hipHostUnregister(ptr));  // rollback after getDevicePointer fail
             }
         }
         else
@@ -1376,7 +1421,7 @@ namespace llaminar2
             }
             else
             {
-                hipHostUnregister(ptr);
+                HIP_WARN_IF_FAIL(hipHostUnregister(ptr));  // rollback after getDevicePointer fail
             }
         }
 
@@ -1701,7 +1746,7 @@ namespace llaminar2
         {
             LOG_ERROR("[ROCmBackend::importExternalMemory] hipExternalMemoryGetMappedBuffer failed: "
                       << hipGetErrorString(err));
-            hipDestroyExternalMemory(extMem);
+            HIP_WARN_IF_FAIL(hipDestroyExternalMemory(extMem));  // rollback after mapped-buffer fail
             *device_ptr = nullptr;
             return false;
         }

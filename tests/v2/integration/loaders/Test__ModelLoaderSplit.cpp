@@ -28,6 +28,7 @@
 #include <algorithm>
 #include <cstring>
 #include <numeric>
+#include <stdexcept>
 
 using namespace llaminar2;
 
@@ -545,8 +546,8 @@ TEST_F(Test__ModelLoaderSplit, MissingSplitPartFails)
 
     // Try to load — should fail because part 2 is missing
     ModelLoader loader;
-    bool result = loader.loadModel(temp_path);
-    EXPECT_FALSE(result) << "Loading should fail when a split part is missing";
+    EXPECT_THROW(loader.loadModel(temp_path), std::runtime_error)
+        << "Loading should fail when a split part is missing";
 
     // Cleanup
     system(("rm -rf " + temp_dir).c_str());

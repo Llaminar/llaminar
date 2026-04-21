@@ -627,7 +627,18 @@ namespace llaminar2
             TensorFactory metadata_factory(*metadata_mpi_ctx);
             ModelLoader metadata_loader(&metadata_factory);
             metadata_loader.setUseMmap(false); // Only reading header metadata, skip mmap
-            if (metadata_loader.loadModel(config_.model_path))
+            bool metadata_ok = false;
+            try
+            {
+                metadata_ok = metadata_loader.loadModel(config_.model_path);
+            }
+            catch (const std::exception &e)
+            {
+                LOG_WARN("Failed to read model metadata from " << config_.model_path
+                                                               << " (" << e.what() << "), using defaults for plan building");
+                metadata_ok = false;
+            }
+            if (metadata_ok)
             {
                 model_config.n_layers = static_cast<int>(metadata_loader.blockCount());
                 model_config.n_heads = static_cast<int>(metadata_loader.headCount());

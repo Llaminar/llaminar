@@ -316,7 +316,7 @@ namespace llaminar2
             {
                 if (i < static_cast<int>(device_ordinals_.size()))
                 {
-                    cudaSetDevice(device_ordinals_[i]);
+                    CUDA_CHECK_VOID(cudaSetDevice(device_ordinals_[i]));
                 }
                 nccl::ncclResult_t r = nccl::ncclCommAbort(
                     static_cast<nccl::ncclComm_t>(comms_[i]));
@@ -397,7 +397,7 @@ namespace llaminar2
         for (auto &evt : compute_events_)
         {
             if (evt)
-                cudaEventDestroy(static_cast<cudaEvent_t>(evt));
+                CUDA_CHECK_VOID(cudaEventDestroy(static_cast<cudaEvent_t>(evt)));
         }
         compute_events_.resize(num_devices_);
 
@@ -612,7 +612,7 @@ namespace llaminar2
             {
                 if (i < static_cast<int>(device_ordinals_.size()))
                 {
-                    cudaSetDevice(device_ordinals_[i]);
+                    CUDA_CHECK_VOID(cudaSetDevice(device_ordinals_[i]));
                 }
                 nccl::ncclCommDestroy(static_cast<nccl::ncclComm_t>(comms_[i]));
                 comms_[i] = nullptr;
@@ -627,7 +627,7 @@ namespace llaminar2
             {
                 if (i < static_cast<int>(device_ordinals_.size()))
                 {
-                    cudaSetDevice(device_ordinals_[i]);
+                    CUDA_CHECK_VOID(cudaSetDevice(device_ordinals_[i]));
                 }
                 CUDA_CHECK_VOID(cudaEventDestroy(static_cast<cudaEvent_t>(completion_events_[i])));
                 completion_events_[i] = nullptr;
@@ -642,7 +642,7 @@ namespace llaminar2
             {
                 if (i < static_cast<int>(device_ordinals_.size()))
                 {
-                    cudaSetDevice(device_ordinals_[i]);
+                    CUDA_CHECK_VOID(cudaSetDevice(device_ordinals_[i]));
                 }
                 CUDA_CHECK_VOID(cudaStreamDestroy(static_cast<cudaStream_t>(streams_[i])));
                 streams_[i] = nullptr;
@@ -1867,12 +1867,12 @@ namespace llaminar2
         err = cudaSetDevice(device_ordinals_[src_device_idx]);
         if (err == cudaSuccess)
         {
-            cudaEventRecord(static_cast<cudaEvent_t>(completion_events_[src_device_idx]), src_stream);
+            CUDA_CHECK_VOID(cudaEventRecord(static_cast<cudaEvent_t>(completion_events_[src_device_idx]), src_stream));
         }
         err = cudaSetDevice(device_ordinals_[dst_device_idx]);
         if (err == cudaSuccess)
         {
-            cudaEventRecord(static_cast<cudaEvent_t>(completion_events_[dst_device_idx]), dst_stream);
+            CUDA_CHECK_VOID(cudaEventRecord(static_cast<cudaEvent_t>(completion_events_[dst_device_idx]), dst_stream));
         }
 
         LOG_DEBUG("[NCCLCoordinator] Copy " << (wait_for_completion ? "completed" : "enqueued")

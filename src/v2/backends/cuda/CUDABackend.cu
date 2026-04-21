@@ -24,6 +24,57 @@ namespace llaminar2
 {
 
     // ====================================================================
+    // Helper Macros for CUDA Error Checking
+    // ====================================================================
+    //
+    // CUDA_CHECK_OR_THROW: Use for hot-path control flow (success-path API
+    // calls in compute kernels) where silent failure causes silent miscompute
+    // or delayed segfault. Logs at ERROR and throws std::runtime_error with
+    // file/line context.
+    //
+    // CUDA_WARN_IF_FAIL: Use for cleanup/destructor/rollback paths (free,
+    // destroy, error-recovery after upstream failure, resource-clear-before-
+    // reuse). Logs at WARN and continues. Throwing here would call
+    // std::terminate from destructors on stack unwind, or mask the real
+    // upstream failure when called during error rollback.
+    //
+    // cudaErrorCudartUnloading is silenced because it is expected during
+    // process exit when the CUDA runtime tears down before our cleanup runs.
+#define CUDA_CHECK_OR_THROW(call)                                                          \
+    do                                                                                     \
+    {                                                                                      \
+        cudaError_t _err = (call);                                                         \
+        if (_err != cudaSuccess)                                                           \
+        {                                                                                  \
+            std::ostringstream _oss;                                                       \
+            _oss << "[CUDABackend] " << #call << " failed: "                               \
+                 << cudaGetErrorString(_err) << " (" << __FILE__ << ":" << __LINE__ << ")";\
+            LOG_ERROR(_oss.str());                                                         \
+            throw std::runtime_error(_oss.str());                                          \
+        }                                                                                  \
+    } while (0)
+
+#define CUDA_WARN_IF_FAIL(call)                                                            \
+    do                                                                                     \
+    {                                                                                      \
+        cudaError_t _err = (call);                                                         \
+        if (_err != cudaSuccess)                                                           \
+        {                                                                                  \
+            if (_err == cudaErrorCudartUnloading)                                          \
+            {                                                                              \
+                LOG_TRACE("[CUDABackend] " << #call                                        \
+                                           << " skipped: CUDA runtime shutting down");    \
+            }                                                                              \
+            else                                                                           \
+            {                                                                              \
+                LOG_WARN("[CUDABackend] " << #call << " failed: "                          \
+                                          << cudaGetErrorString(_err) << " ("             \
+                                          << __FILE__ << ":" << __LINE__ << ")");         \
+            }                                                                              \
+        }                                                                                  \
+    } while (0)
+
+    // ====================================================================
     // Constructor / Destructor
     // ====================================================================
 
@@ -186,9 +237,9 @@ namespace llaminar2
             return;
         }
 
-        cudaSetDevice(device_id);
+        CUDA_WARN_IF_FAIL(cudaSetDevice(device_id)); // cleanup path
         cudaEvent_t cuda_event = reinterpret_cast<cudaEvent_t>(event);
-        cudaEventDestroy(cuda_event);
+        CUDA_WARN_IF_FAIL(cudaEventDestroy(cuda_event));
     }
 
     bool CUDABackend::recordEvent(void *event, int device_id, void *stream)
@@ -343,7 +394,7 @@ namespace llaminar2
         {
             // Include memory diagnostics in the error message
             size_t free_bytes = 0, total_bytes = 0;
-            cudaMemGetInfo(&free_bytes, &total_bytes);
+            (void)cudaMemGetInfo(&free_bytes, &total_bytes); // best-effort enrichment for the LOG_ERROR below
             LOG_ERROR("[CUDABackend] cudaMalloc failed for " << bytes << " bytes on device "
                                                              << device_id << ": " << cudaGetErrorString(err)
                                                              << " (free: " << (free_bytes / (1024 * 1024))
@@ -460,7 +511,7 @@ namespace llaminar2
             if (err != cudaSuccess)
             {
                 LOG_ERROR("[CUDABackend] cudaHostGetDevicePointer failed: " << cudaGetErrorString(err));
-                cudaFreeHost(host_ptr);
+                CUDA_WARN_IF_FAIL(cudaFreeHost(host_ptr)); // rollback after cudaHostGetDevicePointer fail
                 *device_ptr = nullptr;
                 return nullptr;
             }
@@ -485,7 +536,7 @@ namespace llaminar2
         }
         else
         {
-            cudaSetDevice(device_id); // Best effort
+            CUDA_WARN_IF_FAIL(cudaSetDevice(device_id)); // best-effort in cleanup path
         }
 
         cudaError_t err = cudaFreeHost(host_ptr);
@@ -711,13 +762,13 @@ namespace llaminar2
             err = cudaMalloc(&bufs.index_ptr, sizeof(int));
             if (err != cudaSuccess)
             {
-                cudaFree(bufs.value_ptr);
+                CUDA_WARN_IF_FAIL(cudaFree(bufs.value_ptr)); // rollback after cudaMalloc fail
                 bufs.value_ptr = nullptr;
                 return false;
             }
         }
 
-        cudaSetDevice(device_id);
+        CUDA_CHECK_OR_THROW(cudaSetDevice(device_id));
         cudaStream_t s = resolveStream(device_id, stream);
         if (!cudaOps_argmax_f32(
                 static_cast<const float *>(data_device), n,
@@ -728,10 +779,10 @@ namespace llaminar2
             return false;
         }
 
-        cudaStreamSynchronize(s);
-        cudaMemcpyAsync(out_value, bufs.value_ptr, sizeof(float), cudaMemcpyDeviceToHost, s);
-        cudaMemcpyAsync(out_index, bufs.index_ptr, sizeof(int), cudaMemcpyDeviceToHost, s);
-        cudaStreamSynchronize(s);
+        CUDA_CHECK_OR_THROW(cudaStreamSynchronize(s));
+        CUDA_CHECK_OR_THROW(cudaMemcpyAsync(out_value, bufs.value_ptr, sizeof(float), cudaMemcpyDeviceToHost, s));
+        CUDA_CHECK_OR_THROW(cudaMemcpyAsync(out_index, bufs.index_ptr, sizeof(int), cudaMemcpyDeviceToHost, s));
+        CUDA_CHECK_OR_THROW(cudaStreamSynchronize(s));
 
         return true;
     }
@@ -753,11 +804,11 @@ namespace llaminar2
 
         if (bufs.allocated_k < k)
         {
-            cudaSetDevice(device_id);
+            CUDA_WARN_IF_FAIL(cudaSetDevice(device_id)); // realloc path; subsequent cudaMalloc will surface real errors
             if (bufs.values_ptr)
-                cudaFree(bufs.values_ptr);
+                CUDA_WARN_IF_FAIL(cudaFree(bufs.values_ptr)); // clearing old buffer before realloc
             if (bufs.indices_ptr)
-                cudaFree(bufs.indices_ptr);
+                CUDA_WARN_IF_FAIL(cudaFree(bufs.indices_ptr)); // clearing old buffer before realloc
 
             cudaError_t err = cudaMalloc(&bufs.values_ptr, k * sizeof(float));
             if (err != cudaSuccess)
@@ -769,7 +820,7 @@ namespace llaminar2
             err = cudaMalloc(&bufs.indices_ptr, k * sizeof(int));
             if (err != cudaSuccess)
             {
-                cudaFree(bufs.values_ptr);
+                CUDA_WARN_IF_FAIL(cudaFree(bufs.values_ptr)); // rollback after cudaMalloc fail
                 bufs.values_ptr = nullptr;
                 bufs.allocated_k = 0;
                 return false;
@@ -777,7 +828,7 @@ namespace llaminar2
             bufs.allocated_k = k;
         }
 
-        cudaSetDevice(device_id);
+        CUDA_CHECK_OR_THROW(cudaSetDevice(device_id));
         cudaStream_t s = resolveStream(device_id, stream);
         if (!cudaOps_topk_f32(
                 static_cast<const float *>(data_device), n, k,
@@ -788,10 +839,10 @@ namespace llaminar2
             return false;
         }
 
-        cudaStreamSynchronize(s);
-        cudaMemcpyAsync(out_values, bufs.values_ptr, k * sizeof(float), cudaMemcpyDeviceToHost, s);
-        cudaMemcpyAsync(out_indices, bufs.indices_ptr, k * sizeof(int), cudaMemcpyDeviceToHost, s);
-        cudaStreamSynchronize(s);
+        CUDA_CHECK_OR_THROW(cudaStreamSynchronize(s));
+        CUDA_CHECK_OR_THROW(cudaMemcpyAsync(out_values, bufs.values_ptr, k * sizeof(float), cudaMemcpyDeviceToHost, s));
+        CUDA_CHECK_OR_THROW(cudaMemcpyAsync(out_indices, bufs.indices_ptr, k * sizeof(int), cudaMemcpyDeviceToHost, s));
+        CUDA_CHECK_OR_THROW(cudaStreamSynchronize(s));
 
         return true;
     }
@@ -942,7 +993,7 @@ namespace llaminar2
             auto future = promise->get_future();
             ctx.submitAsync([ptr, promise]()
                             {
-                cudaFree(ptr);
+                CUDA_WARN_IF_FAIL(cudaFree(ptr)); // async free; no return path to caller
                 promise->set_value(); });
             return future;
         }
@@ -1024,8 +1075,8 @@ namespace llaminar2
     {
         if (!stream)
             return;
-        cudaSetDevice(device_id);
-        cudaStreamDestroy(static_cast<cudaStream_t>(stream));
+        CUDA_WARN_IF_FAIL(cudaSetDevice(device_id)); // cleanup path
+        CUDA_WARN_IF_FAIL(cudaStreamDestroy(static_cast<cudaStream_t>(stream)));
     }
 
     bool CUDABackend::synchronizeStream(void *stream, int device_id)

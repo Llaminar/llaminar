@@ -6,6 +6,35 @@
 namespace llaminar2
 {
 
+    // Best-effort error logging for CUDA cleanup paths (destructors, reset(),
+    // resource-clear-before-reuse). Failure here typically means the GPU state is
+    // already corrupted, but we are tearing down anyway — logging at WARN keeps
+    // diagnostics visible without escalating during shutdown/error rollback,
+    // where throwing or logging at ERROR could mask the real failure or trigger
+    // std::terminate from a destructor on stack unwind.
+    //
+    // cudaErrorCudartUnloading is silenced because it's expected during process
+    // exit when the CUDA runtime tears down before our cleanup code runs.
+#define CUDA_WARN_IF_FAIL(call)                                                            \
+    do                                                                                     \
+    {                                                                                      \
+        cudaError_t _err = (call);                                                         \
+        if (_err != cudaSuccess)                                                           \
+        {                                                                                  \
+            if (_err == cudaErrorCudartUnloading)                                          \
+            {                                                                              \
+                LOG_TRACE("[CUDAGraphCapture] " << #call                                   \
+                                                << " skipped: CUDA runtime shutting down");\
+            }                                                                              \
+            else                                                                           \
+            {                                                                              \
+                LOG_WARN("[CUDAGraphCapture] " << #call << " failed: "                     \
+                                               << cudaGetErrorString(_err) << " ("        \
+                                               << __FILE__ << ":" << __LINE__ << ")");    \
+            }                                                                              \
+        }                                                                                  \
+    } while (0)
+
     CUDAGraphCapture::CUDAGraphCapture(cudaStream_t stream) : stream_(stream) {}
 
     CUDAGraphCapture::~CUDAGraphCapture() { reset(); }
@@ -46,7 +75,7 @@ namespace llaminar2
         // Destroy any previous graph (but keep exec_ for tryUpdate)
         if (graph_)
         {
-            cudaGraphDestroy(graph_);
+            CUDA_WARN_IF_FAIL(cudaGraphDestroy(graph_));
             graph_ = nullptr;
             node_count_ = 0;
         }
@@ -96,7 +125,7 @@ namespace llaminar2
         // Destroy old executable
         if (exec_)
         {
-            cudaGraphExecDestroy(exec_);
+            CUDA_WARN_IF_FAIL(cudaGraphExecDestroy(exec_));
             exec_ = nullptr;
         }
 
@@ -179,12 +208,12 @@ namespace llaminar2
     {
         if (exec_)
         {
-            cudaGraphExecDestroy(exec_);
+            CUDA_WARN_IF_FAIL(cudaGraphExecDestroy(exec_));
             exec_ = nullptr;
         }
         if (graph_)
         {
-            cudaGraphDestroy(graph_);
+            CUDA_WARN_IF_FAIL(cudaGraphDestroy(graph_));
             graph_ = nullptr;
         }
         node_count_ = 0;

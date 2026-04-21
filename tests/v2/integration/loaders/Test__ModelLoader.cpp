@@ -28,6 +28,7 @@
 #include <fstream>
 #include <cstring>
 #include <cstdio>
+#include <stdexcept>
 
 using namespace llaminar2;
 
@@ -392,7 +393,7 @@ TEST_F(Test__ModelLoader, LoadInvalidMagic)
     createInvalidGGUF(path);
 
     ModelLoader loader;
-    EXPECT_FALSE(loader.loadModel(path));
+    EXPECT_THROW(loader.loadModel(path), std::runtime_error);
     EXPECT_FALSE(loader.isLoaded());
 }
 
@@ -402,7 +403,7 @@ TEST_F(Test__ModelLoader, LoadInvalidMagic)
 TEST_F(Test__ModelLoader, LoadNonExistentFile)
 {
     ModelLoader loader;
-    EXPECT_FALSE(loader.loadModel("/nonexistent/file.gguf"));
+    EXPECT_THROW(loader.loadModel("/nonexistent/file.gguf"), std::runtime_error);
     EXPECT_FALSE(loader.isLoaded());
 }
 
@@ -1282,7 +1283,7 @@ TEST_F(Test__ModelLoader, CorruptedStringLength)
 
     ModelLoader loader;
     // Should fail to load due to corrupted string length
-    EXPECT_FALSE(loader.loadModel(path));
+    EXPECT_THROW(loader.loadModel(path), std::runtime_error);
 }
 
 /**

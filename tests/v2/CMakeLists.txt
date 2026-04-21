@@ -4,6 +4,18 @@
 # Note: enable_testing() is called in parent CMakeLists.txt (src/v2/CMakeLists.txt)
 
 # =============================================================================
+# Test-only compile flags
+# =============================================================================
+# Test code intentionally ignores hipError_t / cudaError_t returns from setup
+# helpers (hipMalloc/hipFree/hipMemcpy in fixtures, etc.) because the GTest
+# assertion framework handles failures separately. Silence the noise here so
+# real warnings stay visible. This scope ONLY affects targets defined in
+# tests/v2/ — llaminar2_core production code is unaffected.
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    add_compile_options(-Wno-unused-result)
+endif()
+
+# =============================================================================
 # Linker Workaround for Circular Static Library Dependencies
 # =============================================================================
 # llaminar2_core links cuda_backend, but cuda_backend uses symbols from llaminar2_core.

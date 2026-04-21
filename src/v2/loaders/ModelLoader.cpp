@@ -11,6 +11,7 @@
 #include "../utils/MPIContext.h"
 #include <cstring>
 #include <iostream>
+#include <stdexcept>
 
 namespace llaminar2
 {
@@ -365,8 +366,7 @@ namespace llaminar2
         file_stream_.open(file_path, std::ios::binary);
         if (!file_stream_)
         {
-            LOG_ERROR("[ModelLoader] Failed to open file: " << file_path);
-            return false;
+            throw std::runtime_error("[ModelLoader] Failed to open GGUF file: " + file_path);
         }
 
         file_path_ = file_path;
@@ -374,20 +374,17 @@ namespace llaminar2
         // Parse Model structure
         if (!parseHeader())
         {
-            LOG_ERROR("[ModelLoader] Failed to parse header");
-            return false;
+            throw std::runtime_error("[ModelLoader] Invalid GGUF header (corrupted or truncated): " + file_path);
         }
 
         if (!parseMetadata())
         {
-            LOG_ERROR("[ModelLoader] Failed to parse metadata");
-            return false;
+            throw std::runtime_error("[ModelLoader] Failed to parse GGUF metadata (corrupted): " + file_path);
         }
 
         if (!parseTensorInfo())
         {
-            LOG_ERROR("[ModelLoader] Failed to parse tensor info");
-            return false;
+            throw std::runtime_error("[ModelLoader] Failed to parse GGUF tensor directory (corrupted): " + file_path);
         }
 
         // Extract model hyperparameters from metadata
@@ -417,8 +414,7 @@ namespace llaminar2
             file_stream_.seekg(static_cast<std::streamoff>(aligned), std::ios::beg);
             if (!file_stream_)
             {
-                LOG_ERROR("[ModelLoader] Failed to seek to aligned data offset");
-                return false;
+                throw std::runtime_error("[ModelLoader] Failed to seek to aligned data offset (file corruption or disk error): " + file_path);
             }
         }
 
@@ -429,8 +425,7 @@ namespace llaminar2
         {
             if (!loadSplitFiles())
             {
-                LOG_ERROR("[ModelLoader] Failed to load split files");
-                return false;
+                throw std::runtime_error("[ModelLoader] Failed to load split files for multi-part GGUF: " + file_path);
             }
         }
 
@@ -1952,29 +1947,25 @@ namespace llaminar2
         char magic[4];
         if (!file_stream_.read(magic, 4) || std::string(magic, 4) != "GGUF")
         {
-            LOG_ERROR("[ModelLoader] Invalid magic number (not a GGUF file)");
-            return false;
+            throw std::runtime_error("[ModelLoader] Invalid magic number (not a GGUF file): " + file_path_);
         }
 
         // Read version
         if (!readValue(model_.version))
         {
-            LOG_ERROR("[ModelLoader] Failed to read version");
-            return false;
+            throw std::runtime_error("[ModelLoader] Failed to read GGUF version (truncated header)");
         }
 
         // Read tensor count
         if (!readValue(model_.tensor_count))
         {
-            LOG_ERROR("[ModelLoader] Failed to read tensor count");
-            return false;
+            throw std::runtime_error("[ModelLoader] Failed to read tensor count (truncated header)");
         }
 
         // Read metadata count
         if (!readValue(model_.metadata_kv_count))
         {
-            LOG_ERROR("[ModelLoader] Failed to read metadata count");
-            return false;
+            throw std::runtime_error("[ModelLoader] Failed to read metadata count (truncated header)");
         }
 
         LOG_DEBUG("[ModelLoader] Header: version=" << model_.version
@@ -1988,17 +1979,16 @@ namespace llaminar2
     {
         uint64_t len;
         if (!readValue(len))
-            return false;
+            throw std::runtime_error("[ModelLoader] Failed to read string length (truncated)");
 
         if (len > 1000000)
         { // 1MB sanity check
-            LOG_ERROR("[ModelLoader] String length too large: " << len);
-            return false;
+            throw std::runtime_error("[ModelLoader] String length too large: " + std::to_string(len) + " bytes (>1MB)");
         }
 
         std::vector<char> buffer(len);
         if (!file_stream_.read(buffer.data(), len))
-            return false;
+            throw std::runtime_error("[ModelLoader] Failed to read string data (" + std::to_string(len) + " bytes, truncated)");
 
         str.assign(buffer.data(), len);
         return true;
@@ -2009,18 +1999,17 @@ namespace llaminar2
         // Read array element type
         uint32_t elem_type;
         if (!readValue(elem_type))
-            return false;
+            throw std::runtime_error("[ModelLoader] Failed to read array element type (truncated)");
 
         // Read array length
         uint64_t array_len;
         if (!readValue(array_len))
-            return false;
+            throw std::runtime_error("[ModelLoader] Failed to read array length (truncated)");
 
         // Sanity check on array length
         if (array_len > 1000000)
         {
-            LOG_ERROR("[ModelLoader] Array length too large: " << array_len);
-            return false;
+            throw std::runtime_error("[ModelLoader] Array length too large: " + std::to_string(array_len) + " elements (>1M)");
         }
 
         // Actually read the array data (don't skip it!)
@@ -2060,13 +2049,12 @@ namespace llaminar2
             {
                 std::string str;
                 if (!readString(str))
-                    return false;
+                    throw std::runtime_error("[ModelLoader] Failed to read string array element " + std::to_string(i) + " (truncated)");
                 value.string_array_value.push_back(std::move(str));
             }
             return true;
         default:
-            LOG_ERROR("[ModelLoader] Unknown array element type: " << elem_type);
-            return false;
+            throw std::runtime_error("[ModelLoader] Unsupported array element type: " + std::to_string(elem_type));
         }
 
         // Read fixed-size array elements
@@ -2074,8 +2062,7 @@ namespace llaminar2
         value.data.resize(total_bytes);
         if (!file_stream_.read(reinterpret_cast<char *>(value.data.data()), total_bytes))
         {
-            LOG_ERROR("[ModelLoader] Failed to read array data");
-            return false;
+            throw std::runtime_error("[ModelLoader] Failed to read array data (" + std::to_string(total_bytes) + " bytes, truncated or corrupted)");
         }
 
         return true;
@@ -2089,16 +2076,14 @@ namespace llaminar2
             std::string key;
             if (!readString(key))
             {
-                LOG_ERROR("[ModelLoader] Failed to read metadata key " << i);
-                return false;
+                throw std::runtime_error("[ModelLoader] Failed to read metadata key " + std::to_string(i) + " (truncated)");
             }
 
             // Read value type
             uint32_t value_type;
             if (!readValue(value_type))
             {
-                LOG_ERROR("[ModelLoader] Failed to read value type for key: " << key);
-                return false;
+                throw std::runtime_error("[ModelLoader] Failed to read metadata value type for key: " + key);
             }
 
             GGUFValue value;
@@ -2108,25 +2093,24 @@ namespace llaminar2
             if (value.type == GGUFValueType::ARRAY)
             {
                 if (!readArray(value))
-                    return false;
+                    throw std::runtime_error("[ModelLoader] Failed to read metadata array value for key: " + key);
             }
             else if (value.type == GGUFValueType::STRING)
             {
                 uint64_t str_len;
                 if (!readValue(str_len))
-                    return false;
+                    throw std::runtime_error("[ModelLoader] Failed to read metadata string length for key: " + key);
 
                 if (str_len > 1000000)
                 {
-                    LOG_ERROR("[ModelLoader] String value too large: " << str_len);
-                    return false;
+                    throw std::runtime_error("[ModelLoader] Metadata string too large for key '" + key + "': " + std::to_string(str_len) + " bytes (>1MB)");
                 }
 
                 value.data.resize(8 + str_len);
                 std::memcpy(value.data.data(), &str_len, 8);
                 if (!file_stream_.read(reinterpret_cast<char *>(value.data.data() + 8), str_len))
                 {
-                    return false;
+                    throw std::runtime_error("[ModelLoader] Failed to read metadata string data for key: " + key);
                 }
             }
             else
@@ -2155,14 +2139,13 @@ namespace llaminar2
                     value_size = 8;
                     break;
                 default:
-                    LOG_ERROR("[ModelLoader] Unknown value type: " << value_type);
-                    return false;
+                    throw std::runtime_error("[ModelLoader] Unsupported metadata value type " + std::to_string(value_type) + " for key: " + key);
                 }
 
                 value.data.resize(value_size);
                 if (!file_stream_.read(reinterpret_cast<char *>(value.data.data()), value_size))
                 {
-                    return false;
+                    throw std::runtime_error("[ModelLoader] Failed to read metadata value for key: " + key);
                 }
             }
 
@@ -2183,16 +2166,14 @@ namespace llaminar2
             // Read tensor name
             if (!readString(tensor.name))
             {
-                LOG_ERROR("[ModelLoader] Failed to read tensor name " << i);
-                return false;
+                throw std::runtime_error("[ModelLoader] Failed to read tensor name " + std::to_string(i) + " (truncated)");
             }
 
             // Read number of dimensions
             uint32_t n_dims;
             if (!readValue(n_dims))
             {
-                LOG_ERROR("[ModelLoader] Failed to read dimensions for: " << tensor.name);
-                return false;
+                throw std::runtime_error("[ModelLoader] Failed to read dimension count for tensor: " + tensor.name);
             }
 
             // Read dimensions
@@ -2201,9 +2182,7 @@ namespace llaminar2
             {
                 if (!readValue(tensor.dimensions[j]))
                 {
-                    LOG_ERROR("[ModelLoader] Failed to read dimension " << j
-                                                                        << " for: " << tensor.name);
-                    return false;
+                    throw std::runtime_error("[ModelLoader] Failed to read dimension " + std::to_string(j) + " for tensor: " + tensor.name);
                 }
             }
 
@@ -2219,16 +2198,14 @@ namespace llaminar2
             uint32_t type_val;
             if (!readValue(type_val))
             {
-                LOG_ERROR("[ModelLoader] Failed to read type for: " << tensor.name);
-                return false;
+                throw std::runtime_error("[ModelLoader] Failed to read tensor type for: " + tensor.name);
             }
             tensor.type = static_cast<GGUFTensorType>(type_val);
 
             // Read tensor offset
             if (!readValue(tensor.offset))
             {
-                LOG_ERROR("[ModelLoader] Failed to read offset for: " << tensor.name);
-                return false;
+                throw std::runtime_error("[ModelLoader] Failed to read tensor offset for: " + tensor.name);
             }
 
             // Calculate size in bytes
@@ -2257,9 +2234,7 @@ namespace llaminar2
             }
             else
             {
-                LOG_ERROR("[ModelLoader] Unknown tensor type: " << type_val
-                                                                << " for: " << tensor.name);
-                return false;
+                throw std::runtime_error("[ModelLoader] Unsupported tensor type " + std::to_string(type_val) + " for: " + tensor.name);
             }
 
             // Initialize split index to 0 (main file) - will be updated by loadSplitFiles() if needed
@@ -2455,8 +2430,7 @@ namespace llaminar2
         // Verify main file is split 0
         if (model_.split_no != 0)
         {
-            LOG_ERROR("[ModelLoader] Main file must be split 0, got split " << model_.split_no);
-            return false;
+            throw std::runtime_error("[ModelLoader] Main file must be split 0, got split " + std::to_string(model_.split_no) + " for: " + file_path_);
         }
 
         // Generate paths for all splits
@@ -2480,8 +2454,7 @@ namespace llaminar2
             split_streams_[idx - 1].open(split_path, std::ios::binary);
             if (!split_streams_[idx - 1])
             {
-                LOG_ERROR("[ModelLoader] Failed to open split file: " << split_path);
-                return false;
+                throw std::runtime_error("[ModelLoader] Failed to open split file: " + split_path);
             }
 
             // Parse split header to get tensor info
@@ -2492,8 +2465,7 @@ namespace llaminar2
             stream.read(reinterpret_cast<char *>(&magic), sizeof(magic));
             if (magic != 0x46554747) // "GGUF"
             {
-                LOG_ERROR("[ModelLoader] Invalid GGUF magic in split " << idx);
-                return false;
+                throw std::runtime_error("[ModelLoader] Invalid GGUF magic in split " + std::to_string(idx) + ": " + split_path);
             }
 
             // Read version
@@ -2590,16 +2562,14 @@ namespace llaminar2
                             elem_size = 8;
                             break; // UINT64, INT64, FLOAT64
                         default:
-                            LOG_ERROR("[ModelLoader] Unknown array element type " << arr_type << " in split " << idx);
-                            return false;
+                            throw std::runtime_error("[ModelLoader] Unsupported array element type " + std::to_string(arr_type) + " in split " + std::to_string(idx));
                         }
                         stream.seekg(static_cast<std::streamoff>(elem_size * arr_len), std::ios::cur);
                     }
                     break;
                 }
                 default:
-                    LOG_ERROR("[ModelLoader] Unknown metadata value type " << value_type << " in split " << idx);
-                    return false;
+                    throw std::runtime_error("[ModelLoader] Unsupported metadata value type " + std::to_string(value_type) + " in split " + std::to_string(idx));
                 }
             }
 

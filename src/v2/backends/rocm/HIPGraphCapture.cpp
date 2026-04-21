@@ -6,6 +6,24 @@
 namespace llaminar2
 {
 
+    // Best-effort error logging for HIP cleanup paths (destructors, reset(),
+    // resource-clear-before-reuse). Failure here typically means the GPU state is
+    // already corrupted, but we are tearing down anyway — logging at WARN keeps
+    // diagnostics visible without escalating during shutdown/error rollback,
+    // where throwing or logging at ERROR could mask the real failure or trigger
+    // std::terminate from a destructor on stack unwind.
+#define HIP_WARN_IF_FAIL(call)                                                      \
+    do                                                                              \
+    {                                                                               \
+        hipError_t _err = (call);                                                   \
+        if (_err != hipSuccess)                                                     \
+        {                                                                           \
+            LOG_WARN("[HIPGraphCapture] " << #call << " failed: "                   \
+                                          << hipGetErrorString(_err) << " ("       \
+                                          << __FILE__ << ":" << __LINE__ << ")");  \
+        }                                                                           \
+    } while (0)
+
     HIPGraphCapture::HIPGraphCapture(hipStream_t stream) : stream_(stream) {}
 
     HIPGraphCapture::~HIPGraphCapture() { reset(); }
@@ -46,7 +64,7 @@ namespace llaminar2
         // Destroy any previous graph (but keep exec_ for tryUpdate)
         if (graph_)
         {
-            hipGraphDestroy(graph_);
+            HIP_WARN_IF_FAIL(hipGraphDestroy(graph_));
             graph_ = nullptr;
             node_count_ = 0;
         }
@@ -96,7 +114,7 @@ namespace llaminar2
         // Destroy old executable
         if (exec_)
         {
-            hipGraphExecDestroy(exec_);
+            HIP_WARN_IF_FAIL(hipGraphExecDestroy(exec_));
             exec_ = nullptr;
         }
 
@@ -177,12 +195,12 @@ namespace llaminar2
     {
         if (exec_)
         {
-            hipGraphExecDestroy(exec_);
+            HIP_WARN_IF_FAIL(hipGraphExecDestroy(exec_));
             exec_ = nullptr;
         }
         if (graph_)
         {
-            hipGraphDestroy(graph_);
+            HIP_WARN_IF_FAIL(hipGraphDestroy(graph_));
             graph_ = nullptr;
         }
         node_count_ = 0;

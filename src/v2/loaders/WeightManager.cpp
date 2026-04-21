@@ -2299,8 +2299,8 @@ namespace llaminar2
                  << devices.size() << " devices");
         if (!preloadForDevices(devices))
         {
-            LOG_ERROR("[WeightManager] finalizeForDevices: preloadForDevices failed");
-            return false;
+            throw std::runtime_error("[WeightManager] finalizeForDevices: preloadForDevices failed for " +
+                                     std::to_string(devices.size()) + " device(s)");
         }
 
         // Step 2: Pack GEMM weights per device (sequential across devices to
