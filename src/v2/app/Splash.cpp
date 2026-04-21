@@ -49,32 +49,43 @@ namespace llaminar2
         if (!splashEnabled())
             return;
 
-        // Tilted shower head (45° down-right) with a column of perfectly
-        // parallel diagonal water streams — laminar flow.  Streams shift
-        // +1 column right per row so each "\" continues the diagonal of
-        // the row above it. The wordmark sits to the right of the streams.
+        // Layout note:
+        //   The wordmark is held at a FIXED column on every row (column 44 from
+        //   the start of the line). Each row's "stream zone" before the
+        //   wordmark is exactly 41 chars wide:
+        //       leading_spaces(16+r) + "\  \  \  \  \  \"(16) + trailing_spaces(7-r)
+        //   The 6 backslashes shift +1 column per row to form perfectly
+        //   parallel 45° diagonals (laminar flow), but the wordmark stays
+        //   straight because trailing pad shrinks by the same amount.
+        //
+        //   The shower head's spout `\.` lands at column 18-19, exactly
+        //   above the leftmost stream of row 0 (col 19), so the head's
+        //   diagonal continues seamlessly into the stream column.
         std::cout
             << '\n'
-            // ── tilted shower head ────────────────────────────────────────
-            << "  " << kAqua  << "      .-~~~-." << kReset << '\n'
-            << "  " << kAqua  << "     ( " << kSky << "o o" << kAqua << "  '\\." << kReset << '\n'
-            << "  " << kAzure << "      \\_" << kIce << "o_o_o" << kAzure << "_'\\." << kReset << '\n'
-            // ── 6 parallel streams + wordmark ─────────────────────────────
-            << "  " << "                " << kAqua  << "\\  \\  \\  \\  \\  \\"  << kReset << "  "
-            << kBold << kOcean << " ██╗     ██╗      █████╗ ███╗   ███╗██╗███╗   ██╗ █████╗ ██████╗ " << kReset << '\n'
-            << "  " << "                 " << kAqua  << "\\  \\  \\  \\  \\  \\"  << kReset << "  "
-            << kBold << kOcean << " ██║     ██║     ██╔══██╗████╗ ████║██║████╗  ██║██╔══██╗██╔══██╗" << kReset << '\n'
-            << "  " << "                  " << kAzure << "\\  \\  \\  \\  \\  \\"  << kReset << "  "
-            << kBold << kOcean << " ██║     ██║     ███████║██╔████╔██║██║██╔██╗ ██║███████║██████╔╝" << kReset << '\n'
-            << "  " << "                   " << kAzure << "\\  \\  \\  \\  \\  \\"  << kReset << "  "
-            << kBold << kDeep  << " ██║     ██║     ██╔══██║██║╚██╔╝██║██║██║╚██╗██║██╔══██║██╔══██╗" << kReset << '\n'
-            << "  " << "                    " << kOcean << "\\  \\  \\  \\  \\  \\"  << kReset << "  "
-            << kBold << kDeep  << " ███████╗███████╗██║  ██║██║ ╚═╝ ██║██║██║ ╚████║██║  ██║██║  ██║" << kReset << '\n'
-            << "  " << "                     " << kDeep  << "\\  \\  \\  \\  \\  \\"  << kReset << "  "
-            << kDim           << " ╚══════╝╚══════╝╚═╝  ╚═╝╚═╝     ╚═╝╚═╝╚═╝  ╚═══╝╚═╝  ╚═╝╚═╝  ╚═╝" << kReset << '\n'
-            // ── ripples beneath where the streams land ────────────────────
-            << "  " << "                      " << kDim  << "~  ~  ~  ~  ~  ~" << kReset << "      "
-            << kDim << "l a m i n a r   l l m   i n f e r e n c e" << kReset << '\n'
+            // ── tilted shower head (45° down-right, spout feeds streams) ──
+            // Each line shifts +1 column right going down (tilt). The spout
+            // `\.` on line 3 lands at columns 18-19, exactly aligned with
+            // the diagonal of row 0's leftmost stream `\` at column 19.
+            << "  " << kAqua  << "  .-~~-._" << kReset << '\n'
+            << "  " << kAqua  << "   (  " << kSky << "o o" << kAqua << "  )" << kReset << '\n'
+            << "  " << kAzure << "    '-." << kIce << "o_o_o" << kAzure << ".-'\\." << kReset << '\n'
+            // ── 6 parallel streams + fixed-column wordmark ────────────────
+            << "  " << "                " << kAqua  << "\\  \\  \\  \\  \\  \\"  << kReset << "         "
+            << kBold << kOcean << "██╗     ██╗      █████╗ ███╗   ███╗██╗███╗   ██╗ █████╗ ██████╗" << kReset << '\n'
+            << "  " << "                 " << kAqua  << "\\  \\  \\  \\  \\  \\"  << kReset << "        "
+            << kBold << kOcean << "██║     ██║     ██╔══██╗████╗ ████║██║████╗  ██║██╔══██╗██╔══██╗" << kReset << '\n'
+            << "  " << "                  " << kAzure << "\\  \\  \\  \\  \\  \\"  << kReset << "       "
+            << kBold << kOcean << "██║     ██║     ███████║██╔████╔██║██║██╔██╗ ██║███████║██████╔╝" << kReset << '\n'
+            << "  " << "                   " << kAzure << "\\  \\  \\  \\  \\  \\"  << kReset << "      "
+            << kBold << kDeep  << "██║     ██║     ██╔══██║██║╚██╔╝██║██║██║╚██╗██║██╔══██║██╔══██╗" << kReset << '\n'
+            << "  " << "                    " << kOcean << "\\  \\  \\  \\  \\  \\"  << kReset << "     "
+            << kBold << kDeep  << "███████╗███████╗██║  ██║██║ ╚═╝ ██║██║██║ ╚████║██║  ██║██║  ██║" << kReset << '\n'
+            << "  " << "                     " << kDeep  << "\\  \\  \\  \\  \\  \\"  << kReset << "    "
+            << kDim           << "╚══════╝╚══════╝╚═╝  ╚═╝╚═╝     ╚═╝╚═╝╚═╝  ╚═══╝╚═╝  ╚═╝╚═╝  ╚═╝" << kReset << '\n'
+            // ── ripples beneath the landing zone + tagline ────────────────
+            << "  " << "                      " << kDim  << "~  ~  ~  ~  ~  ~" << kReset << "                "
+            << kDim << "l l m   i n f e r e n c e" << kReset << '\n'
             << '\n';
         std::cout.flush();
     }
