@@ -34,6 +34,7 @@
 #include "loaders/ModelLoader.h"
 #include "tensors/TensorFactory.h"
 #include "utils/MPIContext.h"
+#include "../../../utils/TestModelHelper.h"
 #ifdef HAVE_CUDA
 #include "backends/cuda/CUDABackend.h"
 #include <cuda_runtime.h> // For cudaMalloc, cudaMemcpy, etc.
@@ -984,7 +985,7 @@ TEST_F(Test__CUDAGemmParity, RealModel_Q4_0_AttnQ_Layer0)
     TensorFactory factory(*mpi_ctx);
     ModelLoader loader(&factory);
 
-    if (!loader.loadModel(REAL_MODEL_PATH))
+    if (!tryLoadModel(loader, REAL_MODEL_PATH))
     {
         GTEST_SKIP() << "Failed to load model: " << REAL_MODEL_PATH;
     }
@@ -1047,7 +1048,7 @@ TEST_F(Test__CUDAGemmParity, RealModel_Q4_0_AttnK_Layer0)
     TensorFactory factory(*mpi_ctx);
     ModelLoader loader(&factory);
 
-    if (!loader.loadModel(REAL_MODEL_PATH))
+    if (!tryLoadModel(loader, REAL_MODEL_PATH))
     {
         GTEST_SKIP() << "Failed to load model: " << REAL_MODEL_PATH;
     }
@@ -1102,7 +1103,7 @@ TEST_F(Test__CUDAGemmParity, RealModel_Q4_0_AttnV_Layer0)
     TensorFactory factory(*mpi_ctx);
     ModelLoader loader(&factory);
 
-    if (!loader.loadModel(REAL_MODEL_PATH))
+    if (!tryLoadModel(loader, REAL_MODEL_PATH))
     {
         GTEST_SKIP() << "Failed to load model: " << REAL_MODEL_PATH;
     }
@@ -1156,7 +1157,7 @@ TEST_F(Test__CUDAGemmParity, RealModel_Q4_0_FFNGate_Layer0)
     TensorFactory factory(*mpi_ctx);
     ModelLoader loader(&factory);
 
-    if (!loader.loadModel(REAL_MODEL_PATH))
+    if (!tryLoadModel(loader, REAL_MODEL_PATH))
     {
         GTEST_SKIP() << "Failed to load model: " << REAL_MODEL_PATH;
     }
@@ -1211,7 +1212,7 @@ TEST_F(Test__CUDAGemmParity, RealModel_Q4_0_LMHead)
     TensorFactory factory(*mpi_ctx);
     ModelLoader loader(&factory);
 
-    if (!loader.loadModel(REAL_MODEL_PATH))
+    if (!tryLoadModel(loader, REAL_MODEL_PATH))
     {
         GTEST_SKIP() << "Failed to load model: " << REAL_MODEL_PATH;
     }
@@ -1273,7 +1274,7 @@ TEST_F(Test__CUDAGemmParity, RealModel_Q4_0_AttnQ_TensorAPI)
     TensorFactory factory(*mpi_ctx);
     ModelLoader loader(&factory);
 
-    if (!loader.loadModel(REAL_MODEL_PATH))
+    if (!tryLoadModel(loader, REAL_MODEL_PATH))
     {
         GTEST_SKIP() << "Failed to load model: " << REAL_MODEL_PATH;
     }
@@ -1377,7 +1378,7 @@ TEST_F(Test__CUDAGemmParity, FusedQKV_TensorAPI_vs_Separate)
     TensorFactory factory(*mpi_ctx);
     ModelLoader loader(&factory);
 
-    if (!loader.loadModel(REAL_MODEL_PATH))
+    if (!tryLoadModel(loader, REAL_MODEL_PATH))
     {
         GTEST_SKIP() << "Failed to load model: " << REAL_MODEL_PATH;
     }
@@ -1578,7 +1579,7 @@ TEST_F(Test__CUDAGemmParity, FusedQKV_DecodeSize_M1)
     TensorFactory factory(*mpi_ctx);
     ModelLoader loader(&factory);
 
-    if (!loader.loadModel(REAL_MODEL_PATH))
+    if (!tryLoadModel(loader, REAL_MODEL_PATH))
     {
         GTEST_SKIP() << "Failed to load model: " << REAL_MODEL_PATH;
     }
@@ -1723,7 +1724,7 @@ TEST_F(Test__CUDAGemmParity, CachedKernel_vs_FreshKernel)
     TensorFactory factory(*mpi_ctx);
     ModelLoader loader(&factory);
 
-    if (!loader.loadModel(REAL_MODEL_PATH))
+    if (!tryLoadModel(loader, REAL_MODEL_PATH))
     {
         GTEST_SKIP() << "Failed to load model: " << REAL_MODEL_PATH;
     }
@@ -1893,7 +1894,7 @@ TEST_F(Test__CUDAGemmParity, CachedKernel_MultipleCallsConsistent)
     TensorFactory factory(*mpi_ctx);
     ModelLoader loader(&factory);
 
-    if (!loader.loadModel(REAL_MODEL_PATH))
+    if (!tryLoadModel(loader, REAL_MODEL_PATH))
     {
         GTEST_SKIP() << "Failed to load model: " << REAL_MODEL_PATH;
     }
@@ -1988,7 +1989,7 @@ TEST_F(Test__CUDAGemmParity, CachedKernel_VaryingBatchSizes)
     TensorFactory factory(*mpi_ctx);
     ModelLoader loader(&factory);
 
-    if (!loader.loadModel(REAL_MODEL_PATH))
+    if (!tryLoadModel(loader, REAL_MODEL_PATH))
     {
         GTEST_SKIP() << "Failed to load model: " << REAL_MODEL_PATH;
     }
@@ -2091,7 +2092,7 @@ TEST_F(Test__CUDAGemmParity, FusedQKV_WithBias)
     TensorFactory factory(*mpi_ctx);
     ModelLoader loader(&factory);
 
-    if (!loader.loadModel(REAL_MODEL_PATH))
+    if (!tryLoadModel(loader, REAL_MODEL_PATH))
     {
         GTEST_SKIP() << "Failed to load model: " << REAL_MODEL_PATH;
     }
@@ -2295,7 +2296,7 @@ TEST_F(Test__CUDAGemmParity, FusedQKV_CachedKernels_MultipleIterations)
     TensorFactory factory(*mpi_ctx);
     ModelLoader loader(&factory);
 
-    if (!loader.loadModel(REAL_MODEL_PATH))
+    if (!tryLoadModel(loader, REAL_MODEL_PATH))
     {
         GTEST_SKIP() << "Failed to load model: " << REAL_MODEL_PATH;
     }

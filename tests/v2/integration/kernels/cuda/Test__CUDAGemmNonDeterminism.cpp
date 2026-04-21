@@ -24,6 +24,7 @@
 #include "execution/local_execution/device/DeviceContext.h"
 #include "execution/local_execution/coherence/GpuCoherence.h"
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
+#include "../../../utils/TestModelHelper.h"
 #include "loaders/ModelLoader.h"
 #include "tensors/TensorFactory.h"
 #include "utils/MPIContext.h"
@@ -272,7 +273,7 @@ protected:
         auto mpi_ctx = std::make_shared<MPIContext>(0, 1, MPI_COMM_WORLD);
         TensorFactory factory(*mpi_ctx);
         ModelLoader loader(&factory);
-        if (!loader.loadModel(MODEL_PATH))
+        if (!tryLoadModel(loader, MODEL_PATH))
             return false;
 
         auto weight_base = loader.loadTensor(weight_name, DeviceId::cpu());

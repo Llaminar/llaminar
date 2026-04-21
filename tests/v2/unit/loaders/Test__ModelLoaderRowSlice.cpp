@@ -15,6 +15,7 @@
 #include "loaders/ModelLoader.h"
 #include "tensors/TensorFactory.h"
 #include "utils/MPIContext.h"
+#include "../../utils/TestModelHelper.h"
 #include "backends/DeviceId.h"
 #include <cmath>
 #include <numeric>
@@ -37,18 +38,9 @@ namespace llaminar2
                 factory_ = std::make_unique<TensorFactory>(*mpi_ctx_);
                 loader_ = std::make_unique<ModelLoader>(factory_.get());
 
-                // loadModel() throws on missing/corrupt files; convert to a skip
-                // so the test is benign when the GGUF fixture isn't available.
-                try
+                if (!tryLoadModel(*loader_, model_path_))
                 {
-                    if (!loader_->loadModel(model_path_))
-                    {
-                        GTEST_SKIP() << "Model file not found: " << model_path_;
-                    }
-                }
-                catch (const std::exception &e)
-                {
-                    GTEST_SKIP() << "Model file unavailable (" << e.what() << ")";
+                    GTEST_SKIP() << "Model file not found: " << model_path_;
                 }
             }
 

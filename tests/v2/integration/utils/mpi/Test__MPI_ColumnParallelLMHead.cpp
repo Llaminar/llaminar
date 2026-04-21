@@ -20,6 +20,7 @@
 #include <cmath>
 #include <vector>
 
+#include "../../../utils/TestModelHelper.h"
 #include "loaders/WeightManager.h"
 #include "loaders/ModelLoader.h"
 #include "models/qwen/Qwen2Schema.h"
@@ -72,7 +73,7 @@ protected:
 
         // Load model
         loader_ = std::make_unique<ModelLoader>(factory_.get());
-        if (!loader_->loadModel(MODEL_PATH))
+        if (!tryLoadModel(*loader_, MODEL_PATH))
         {
             GTEST_SKIP() << "Model file not found: " << MODEL_PATH;
         }

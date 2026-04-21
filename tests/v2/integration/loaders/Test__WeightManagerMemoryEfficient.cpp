@@ -12,6 +12,7 @@
  */
 
 #include <gtest/gtest.h>
+#include "../../utils/TestModelHelper.h"
 #include "../../src/v2/loaders/WeightManager.h"
 #include "../../src/v2/loaders/ModelLoader.h"
 #include "../../src/v2/tensors/TensorSlice.h"
@@ -64,7 +65,7 @@ namespace llaminar2
             ModelLoader loader0(&factory0);
             ModelLoader loader1(&factory1);
 
-            if (!loader0.loadModel(model_path_) || !loader1.loadModel(model_path_))
+            if (!tryLoadModel(loader0, model_path_) || !tryLoadModel(loader1, model_path_))
             {
                 GTEST_SKIP() << "Model file not found: " << model_path_;
             }
@@ -114,7 +115,7 @@ namespace llaminar2
             TensorFactory factory(*mpi_ctx);
             ModelLoader loader(&factory);
 
-            if (!loader.loadModel(model_path_))
+            if (!tryLoadModel(loader, model_path_))
             {
                 GTEST_SKIP() << "Model file not found: " << model_path_;
             }
@@ -162,7 +163,7 @@ namespace llaminar2
             TensorFactory factory(*mpi_ctx);
             ModelLoader loader(&factory);
 
-            if (!loader.loadModel(model_path_))
+            if (!tryLoadModel(loader, model_path_))
             {
                 GTEST_SKIP() << "Model file not found: " << model_path_;
             }
@@ -223,7 +224,7 @@ namespace llaminar2
             TensorFactory factory_single(*mpi_ctx_single);
             ModelLoader loader_single(&factory_single);
 
-            if (!loader_single.loadModel(model_path_))
+            if (!tryLoadModel(loader_single, model_path_))
             {
                 GTEST_SKIP() << "Model file not found: " << model_path_;
             }
@@ -349,7 +350,7 @@ namespace llaminar2
             TensorFactory factory(*mpi_ctx);
             ModelLoader loader(&factory);
 
-            if (!loader.loadModel(model_path_))
+            if (!tryLoadModel(loader, model_path_))
             {
                 GTEST_SKIP() << "Model file not found: " << model_path_;
             }

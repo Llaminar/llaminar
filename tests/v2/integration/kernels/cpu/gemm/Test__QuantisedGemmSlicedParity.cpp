@@ -20,6 +20,7 @@
 #include <numeric>
 #include <vector>
 
+#include "../../../../utils/TestModelHelper.h"
 #include "../../src/v2/loaders/ModelLoader.h"
 #include "../../src/v2/loaders/WeightManager.h"
 #include "../../src/v2/tensors/TensorSlice.h"
@@ -117,7 +118,7 @@ namespace llaminar2
             TensorFactory factory(*mpi_ctx);
             ModelLoader loader(&factory);
 
-            if (!loader.loadModel(MODEL_PATH))
+            if (!tryLoadModel(loader, MODEL_PATH))
             {
                 GTEST_SKIP() << "Model file not found: " << MODEL_PATH;
             }
@@ -290,7 +291,7 @@ namespace llaminar2
             TensorFactory factory(*mpi_ctx);
             ModelLoader loader(&factory);
 
-            if (!loader.loadModel(MODEL_PATH))
+            if (!tryLoadModel(loader, MODEL_PATH))
             {
                 GTEST_SKIP() << "Model file not found: " << MODEL_PATH;
             }
@@ -407,7 +408,7 @@ namespace llaminar2
             TensorFactory factory(*mpi_ctx);
             ModelLoader loader(&factory);
 
-            if (!loader.loadModel(MODEL_PATH))
+            if (!tryLoadModel(loader, MODEL_PATH))
             {
                 GTEST_SKIP() << "Model file not found: " << MODEL_PATH;
             }
