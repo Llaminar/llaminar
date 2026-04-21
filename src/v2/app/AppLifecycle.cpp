@@ -8,6 +8,7 @@
 #include "config/OrchestrationConfigParser.h"
 #include "app/MPIBootstrapPhase.h"
 #include "app/RuntimeInitPhase.h"
+#include "app/Splash.h"
 #include "app/modes/InteractiveChatMode.h"
 #include "app/modes/SingleShotChatMode.h"
 #include "app/modes/BenchmarkMode.h"
@@ -23,6 +24,7 @@ namespace llaminar2
     int AppLifecycle::run(int argc, char *argv[])
     {
         initializeLogging();
+        printSplash();
 
         OrchestrationConfigParser parser;
         OrchestrationConfig config = parser.parseArgs(argc, argv);

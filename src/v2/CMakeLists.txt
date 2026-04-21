@@ -1235,6 +1235,7 @@ add_library(llaminar2_core STATIC
     execution/factory/InferenceRunnerFactory.cpp
     # App-level components (extracted from Main.cpp)
     app/AppLifecycle.cpp
+    app/Splash.cpp
     app/InferenceRunnerAdapter.cpp
     app/ChatTemplateResolver.cpp
     app/MPIBootstrapPhase.cpp
