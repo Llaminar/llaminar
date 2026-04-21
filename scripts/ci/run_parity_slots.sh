@@ -62,8 +62,11 @@ fi
 
 declare -a SLOT_NAMES=()
 declare -a SLOT_PIDS=()
+declare -a SLOT_LOGS=()
 
-# Kick off each slot (3 args per slot)
+# Kick off each slot (3 args per slot). Each slot's output goes to its own
+# log file; a single `tail -F` below streams every log to stdout so the
+# GitHub Actions UI shows live per-test progress while the slots run.
 while (( $# >= 3 )); do
   name="$1"
   include="$2"
@@ -76,34 +79,31 @@ while (( $# >= 3 )); do
   fi
 
   log="$LOG_DIR/${name}.log"
-  echo ":: starting slot '${name}'"
+  # Pre-create the log file so `tail -F` can attach immediately (avoids a
+  # race where tail spins waiting for the file to appear).
+  : > "$log"
+
+  echo ":: starting slot '${name}' (log=${log})"
   echo ":::: include: ${include}"
   echo ":::: exclude: ${exclude}"
 
-  # Stream each slot's output in real time, line-prefixed with the slot name
-  # so interleaved output from concurrent slots is still legible. A copy of
-  # the prefixed stream is also captured to "$log" for the failure-summary
-  # block at the end.
-  #
-  # Buffering notes:
-  #   - stdbuf -oL forces ctest to flush its stdout per line. ctest's
-  #     non-TTY default is block-buffered, which was eating live progress
-  #     in CI logs.
-  #   - awk uses fflush() after every line so the prefixed stream itself is
-  #     line-buffered.
-  #
-  # The subshell propagates ctest's exit code via PIPESTATUS[0], bypassing
-  # awk's. Process substitution ('> >(tee ...)') keeps the subshell as the
-  # foreground process so "$!" (and the later wait) returns ctest's exit
-  # code, not tee's.
-  #
-  # shellcheck disable=SC2086  # TEST_PARALLEL may be empty or "-j 8"
-  (
+  # Header is written to the log, not stdout, so `tail -F` streams it as
+  # part of the slot's live output (complete with the `==> log <==` banner
+  # that tail emits when switching between files).
+  {
     echo "=== SLOT ${name} BEGIN ==="
     echo "include: ${include}"
     echo "exclude: ${exclude}"
     echo "build:   ${BUILD_DIR}"
     echo "=============================="
+  } >> "$log"
+
+  # stdbuf -oL forces ctest to line-buffer its stdout; ctest's default when
+  # stdout is a regular file is full-block-buffered, which is what caused
+  # the previous "no live progress" symptom.
+  #
+  # shellcheck disable=SC2086  # TEST_PARALLEL may be empty or "-j 8"
+  (
     stdbuf -oL ctest \
       --test-dir "$BUILD_DIR" \
       --output-on-failure \
@@ -111,18 +111,31 @@ while (( $# >= 3 )); do
       --timeout "$TIMEOUT_SECS" \
       ${TEST_PARALLEL} \
       -R "$include" \
-      -E "$exclude" 2>&1 \
-      | awk -v t="[${name}] " '{ print t $0; fflush(); }'
-    rc=${PIPESTATUS[0]}
+      -E "$exclude"
+    rc=$?
     echo "=== SLOT ${name} END (exit=$rc) ==="
     exit "$rc"
-  ) > >(tee "$log") 2>&1 &
+  ) >> "$log" 2>&1 &
 
   SLOT_NAMES+=("$name")
   SLOT_PIDS+=("$!")
+  SLOT_LOGS+=("$log")
 done
 
-# Wait for all slots and collect exit codes
+# Stream all slot logs live. `tail -F` retries on missing/truncated files,
+# prints `==> file <==` banners when switching between files, and is
+# line-buffered when writing to a pipe. We start from the top of each file
+# (-n +1) so the slot headers emitted above are included in the stream.
+#
+# The tail runs in the background so the script can still wait on the
+# slot PIDs and collect exit codes. It is stopped explicitly after all
+# slots complete.
+tail -n +1 -F "${SLOT_LOGS[@]}" &
+TAIL_PID=$!
+# Make sure we always clean up the tail, even on abnormal exit.
+trap 'kill "$TAIL_PID" 2>/dev/null || true' EXIT
+
+# Wait for all slots and collect exit codes.
 declare -A SLOT_RC=()
 overall_rc=0
 
@@ -140,10 +153,17 @@ for i in "${!SLOT_PIDS[@]}"; do
   fi
 done
 
-# Per-slot output already streamed live (prefix-tagged with slot name).
-# For any slot that failed, re-emit its full log inside a GitHub Actions
-# collapsible group so the failure context is easy to locate without
-# re-dumping every slot's passing output a second time.
+# Give tail a brief moment to flush any trailing lines written between the
+# last tail poll interval and now, then stop it.
+sleep 1
+kill "$TAIL_PID" 2>/dev/null || true
+wait "$TAIL_PID" 2>/dev/null || true
+trap - EXIT
+
+# All slot output already streamed live via `tail -F`. Re-emit the full log
+# of any failed slot inside a GitHub Actions collapsible group so the
+# failure context is easy to locate without scrolling back through the
+# interleaved live stream.
 for name in "${SLOT_NAMES[@]}"; do
   rc=${SLOT_RC[$name]}
   if [[ $rc -ne 0 ]]; then
