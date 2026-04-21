@@ -11,6 +11,7 @@
 #pragma once
 
 #include "IOrchestrationConfigParser.h"
+#include "CliSpec.h"
 #include <string>
 #include <vector>
 #include <functional>
@@ -78,23 +79,13 @@ namespace llaminar2
         static std::vector<std::pair<int, GlobalDeviceAddress>> parseDeviceMap(const std::string &spec);
 
         /**
-         * @brief Check if argument matches a flag
-         * @param arg Argument to check
-         * @param short_form Short flag (e.g., "-t")
-         * @param long_form Long flag (e.g., "--tp")
-         * @return true if argument matches
+         * @brief Build the structured CLI specification.
+         *
+         * Declares every supported flag (short form, long form, aliases,
+         * category, description, validation) in one place. Used by both
+         * `parseArgs` and `getHelpText` so the two can never drift.
          */
-        static bool matchesFlag(const std::string &arg,
-                                const std::string &short_form,
-                                const std::string &long_form);
-
-        /**
-         * @brief Get value for a flag (handles --flag=value and --flag value)
-         * @param args All arguments
-         * @param idx Current index (will be incremented if value follows flag)
-         * @return Value string, or empty if not found
-         */
-        static std::string getFlagValue(const std::vector<std::string> &args, size_t &idx);
+        static CliSpec<OrchestrationConfig> buildSpec();
     };
 
 } // namespace llaminar2

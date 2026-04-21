@@ -221,44 +221,760 @@ namespace llaminar2
         }
     }
 
-    bool OrchestrationConfigParser::matchesFlag(const std::string &arg,
-                                                const std::string &short_form,
-                                                const std::string &long_form)
+    // =========================================================================
+    // Structured CLI specification
+    // =========================================================================
+    //
+    // Every flag lives in one place: a `CliSpec<OrchestrationConfig>` built by
+    // `buildSpec()` below. The spec drives both `parseArgs()` (generic
+    // parse / validation loop) and `getHelpText()` (auto-formatted) so the
+    // two can't drift apart.
+    //
+    // A handful of flags still need custom setters because they either touch
+    // multiple fields (`--device`, `--device-map`, `--deterministic`) or push
+    // into a vector (`--define-domain`, `--pp-stage`). Those are wrapped in
+    // `setters::custom(...)` inline; everything else uses the generic helpers
+    // from `CliSpec.h`.
+
+    namespace
     {
-        // Check exact match
-        if (arg == short_form || arg == long_form)
+        using Opt = CliOption<OrchestrationConfig>;
+
+        // Small helpers to bridge existing enum parsers (which return
+        // std::optional) into CliSpec setters.
+        template <typename EnumT, typename Parser>
+        Opt::Setter enumSetter(EnumT OrchestrationConfig::*member,
+                               Parser parser,
+                               std::string option_name,
+                               std::string valid_list)
         {
-            return true;
+            return [member, parser, option_name, valid_list](OrchestrationConfig &c,
+                                                             const std::string &v) {
+                auto parsed = parser(v);
+                if (!parsed)
+                {
+                    throw std::invalid_argument("Invalid value for " + option_name +
+                                                ": '" + v + "' (valid: " + valid_list + ")");
+                }
+                c.*member = *parsed;
+            };
         }
+    } // namespace
 
-        // Check --flag=value format
-        if (!long_form.empty() && arg.substr(0, long_form.size() + 1) == long_form + "=")
-        {
-            return true;
-        }
-
-        return false;
-    }
-
-    std::string OrchestrationConfigParser::getFlagValue(const std::vector<std::string> &args, size_t &idx)
+    CliSpec<OrchestrationConfig> OrchestrationConfigParser::buildSpec()
     {
-        const std::string &arg = args[idx];
+        CliSpec<OrchestrationConfig> spec;
 
-        // Check --flag=value format
-        size_t eq_pos = arg.find('=');
-        if (eq_pos != std::string::npos)
-        {
-            return arg.substr(eq_pos + 1);
-        }
+        // Preserve the order in which categories appear in --help.
+        spec.addCategory("Model Configuration")
+            .addCategory("Inference Configuration")
+            .addCategory("Sampling Configuration")
+            .addCategory("Chat Configuration")
+            .addCategory("Benchmark Configuration")
+            .addCategory("Server Configuration")
+            .addCategory("Fused Attention")
+            .addCategory("MPI Bootstrap")
+            .addCategory("Device Assignment")
+            .addCategory("Tensor Parallelism")
+            .addCategory("Pipeline Parallelism")
+            .addCategory("Named Domains (advanced)")
+            .addCategory("Collective Backend")
+            .addCategory("Introspection")
+            .addCategory("Config File")
+            .addCategory("MoE Configuration")
+            .addCategory("Precision")
+            .addCategory("Heterogeneous Mode")
+            .addCategory("Verbosity");
 
-        // Check --flag value format
-        if (idx + 1 < args.size() && !args[idx + 1].empty() && args[idx + 1][0] != '-')
-        {
-            ++idx;
-            return args[idx];
-        }
+        // --- Model Configuration ---------------------------------------------
+        spec.add({
+            .short_name  = "-m",
+            .long_name   = "--model",
+            .category    = "Model Configuration",
+            .value_label = "<path>",
+            .description = "Path to GGUF model file (required)",
+            .setter      = setters::assignString(&OrchestrationConfig::model_path),
+        });
+        spec.add({
+            .short_name  = "-c",
+            .long_name   = "--context-length",
+            .category    = "Model Configuration",
+            .value_label = "<n>",
+            .description = "Maximum context/sequence length (default: 4096)",
+            .setter      = setters::parseInt(&OrchestrationConfig::max_seq_len, "--context-length"),
+        });
+        spec.add({
+            .long_name   = "--mmap",
+            .category    = "Model Configuration",
+            .description = "Use memory-mapped file loading (default)",
+            .setter      = setters::assignBoolTrue(&OrchestrationConfig::use_mmap),
+        });
+        spec.add({
+            .long_name   = "--no-mmap",
+            .category    = "Model Configuration",
+            .description = "Disable memory-mapped file loading",
+            .setter      = setters::assignBoolFalse(&OrchestrationConfig::use_mmap),
+        });
 
-        return "";
+        // --- Inference Configuration -----------------------------------------
+        spec.add({
+            .short_name  = "-p",
+            .long_name   = "--prompt",
+            .category    = "Inference Configuration",
+            .value_label = "<text>",
+            .description = "Input prompt text",
+            .setter      = setters::assignString(&OrchestrationConfig::prompt),
+        });
+        spec.add({
+            .short_name  = "-n",
+            .long_name   = "--n-predict",
+            .category    = "Inference Configuration",
+            .value_label = "<n>",
+            .description = "Tokens to generate (-1 = until EOS, default: -1)",
+            .setter      = setters::parseInt(&OrchestrationConfig::n_predict, "--n-predict"),
+        });
+        spec.add({
+            .long_name   = "--batch-size",
+            .category    = "Inference Configuration",
+            .value_label = "<n>",
+            .description = "Batch size (default: 1)",
+            .setter      = setters::parseInt(&OrchestrationConfig::batch_size, "--batch-size"),
+        });
+        spec.add({
+            .long_name   = "--threads",
+            .category    = "Inference Configuration",
+            .value_label = "<n>",
+            .description = "Thread count override for OpenMP / BLAS (-1 = auto)",
+            .setter      = setters::parseInt(&OrchestrationConfig::n_threads, "--threads"),
+        });
+        spec.add({
+            .short_name  = "-s",
+            .long_name   = "--seed",
+            .category    = "Inference Configuration",
+            .value_label = "<n>",
+            .description = "Random seed (-1 = random, default: -1)",
+            .setter      = setters::parseInt(&OrchestrationConfig::seed, "--seed"),
+        });
+
+        // --- Sampling Configuration ------------------------------------------
+        spec.add({
+            .short_name  = "-t",
+            .long_name   = "--temperature",
+            .category    = "Sampling Configuration",
+            .value_label = "<f>",
+            .description = "Sampling temperature (default: 0.8; 0 = greedy)",
+            .setter      = setters::parseFloat(&OrchestrationConfig::temperature, "--temperature"),
+        });
+        spec.add({
+            .long_name   = "--top-k",
+            .category    = "Sampling Configuration",
+            .value_label = "<n>",
+            .description = "Top-K sampling (default: 40)",
+            .setter      = setters::parseInt(&OrchestrationConfig::top_k, "--top-k"),
+        });
+        spec.add({
+            .long_name   = "--top-p",
+            .category    = "Sampling Configuration",
+            .value_label = "<f>",
+            .description = "Top-P (nucleus) sampling (default: 0.9)",
+            .setter      = setters::parseFloat(&OrchestrationConfig::top_p, "--top-p"),
+        });
+        spec.add({
+            .long_name   = "--deterministic",
+            .category    = "Sampling Configuration",
+            .description = "Force greedy sampling (temperature=0) and export "
+                           "LLAMINAR_DETERMINISTIC=1 for kernel-level determinism",
+            .setter      = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &) {
+                    c.deterministic = true;
+                    c.temperature   = 0.0f;
+                    setenv("LLAMINAR_DETERMINISTIC", "1", 1);
+                }),
+        });
+
+        // --- Chat Configuration ----------------------------------------------
+        spec.add({
+            .long_name   = "--chat",
+            .category    = "Chat Configuration",
+            .description = "Interactive chat mode",
+            .setter      = setters::assignBoolTrue(&OrchestrationConfig::chat_mode),
+        });
+        spec.add({
+            .long_name   = "--chat-single",
+            .category    = "Chat Configuration",
+            .description = "Single prompt with chat template applied",
+            .setter      = setters::assignBoolTrue(&OrchestrationConfig::single_shot_chat),
+        });
+        spec.add({
+            .long_name   = "--system",
+            .category    = "Chat Configuration",
+            .value_label = "<text>",
+            .description = "System prompt for chat",
+            .setter      = setters::assignString(&OrchestrationConfig::system_prompt),
+        });
+        spec.add({
+            .long_name   = "--chat-template",
+            .category    = "Chat Configuration",
+            .value_label = "<name>",
+            .description = "Override chat template (chatml, llama3, etc.)",
+            .setter      = setters::assignString(&OrchestrationConfig::chat_template_override),
+        });
+
+        // --- Benchmark Configuration -----------------------------------------
+        spec.add({
+            .long_name   = "--benchmark",
+            .category    = "Benchmark Configuration",
+            .description = "Run benchmark (warmup + multiple timed runs)",
+            .setter      = setters::assignBoolTrue(&OrchestrationConfig::benchmark_mode),
+        });
+
+        // --- Server Configuration --------------------------------------------
+        spec.add({
+            .long_name   = "--serve",
+            .category    = "Server Configuration",
+            .description = "Start HTTP server (OpenAI-compatible REST API)",
+            .setter      = setters::assignBoolTrue(&OrchestrationConfig::serve_mode),
+        });
+        spec.add({
+            .long_name   = "--port",
+            .category    = "Server Configuration",
+            .value_label = "<n>",
+            .description = "Server port (default: 8080)",
+            .setter      = setters::parseInt(&OrchestrationConfig::serve_port, "--port"),
+        });
+        spec.add({
+            .long_name   = "--host",
+            .category    = "Server Configuration",
+            .value_label = "<addr>",
+            .description = "Server bind address (default: 127.0.0.1)",
+            .setter      = setters::assignString(&OrchestrationConfig::serve_host),
+        });
+
+        // --- Fused Attention -------------------------------------------------
+        spec.add({
+            .long_name   = "--fused-attention-backend",
+            .category    = "Fused Attention",
+            .value_label = "<type>",
+            .description = "Backend: jit (default), reference, tiled, q16",
+            .setter      = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &v) {
+                    c.fused_attention_backend = parseFusedAttentionBackend(v);
+                }),
+        });
+
+        // --- MPI Bootstrap ---------------------------------------------------
+        spec.add({
+            .long_name   = "--mpi-procs",
+            .category    = "MPI Bootstrap",
+            .value_label = "<n>",
+            .description = "Number of MPI processes (0 = auto)",
+            .setter      = setters::parseInt(&OrchestrationConfig::mpi_procs, "--mpi-procs"),
+        });
+        spec.add({
+            .long_name   = "--mpi-hostfile",
+            .category    = "MPI Bootstrap",
+            .value_label = "<path>",
+            .description = "MPI hostfile path (also used for node detection)",
+            .setter      = setters::assignString(&OrchestrationConfig::hostfile),
+        });
+        spec.add({
+            .long_name   = "--mpi-dry-run",
+            .category    = "MPI Bootstrap",
+            .description = "Print MPI launch command and exit",
+            .setter      = setters::assignBoolTrue(&OrchestrationConfig::mpi_dry_run),
+        });
+        spec.add({
+            .long_name   = "--mpi-verbose",
+            .category    = "MPI Bootstrap",
+            .description = "Verbose MPI output",
+            .setter      = setters::assignBoolTrue(&OrchestrationConfig::mpi_verbose),
+        });
+        spec.add({
+            .long_name   = "--no-mpi-bootstrap",
+            .category    = "MPI Bootstrap",
+            .description = "Disable auto MPI bootstrap (DEBUG ONLY; use for ncu/nsys/perf only)",
+            .setter      = setters::assignBoolTrue(&OrchestrationConfig::mpi_no_bootstrap),
+        });
+        spec.add({
+            .long_name   = "--mpi-oversubscribe",
+            .category    = "MPI Bootstrap",
+            .description = "Allow MPI oversubscription",
+            .setter      = setters::assignBoolTrue(&OrchestrationConfig::mpi_oversubscribe),
+        });
+        spec.add({
+            .long_name    = "--mpi-profile",
+            .category     = "MPI Bootstrap",
+            .value_label  = "<mode>",
+            .description  = "MPI bootstrap profile: auto (default), tuned",
+            .valid_values = {"auto", "tuned"},
+            .setter       = enumSetter(&OrchestrationConfig::mpi_profile,
+                                       parseMPIProfile, "--mpi-profile", "auto, tuned"),
+        });
+
+        // --- Device Assignment -----------------------------------------------
+        spec.add({
+            .short_name  = "-d",
+            .long_name   = "--device",
+            .category    = "Device Assignment",
+            .value_label = "<spec>",
+            .description = "Device for this rank. cuda:N / rocm:N for GPUs; "
+                           "cpu selects all local NUMA nodes; cpu:N selects one",
+            .setter      = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &value) {
+                    std::string lower = toLower(value);
+                    if (lower == "cpu")
+                    {
+                        c.device_for_this_rank              = GlobalDeviceAddress::cpu(0);
+                        c.device_for_this_rank_numa_explicit = false;
+                        c.cpu_global_tp_all_local            = true;
+                        return;
+                    }
+                    if (lower.rfind("cpu:", 0) == 0)
+                    {
+                        try
+                        {
+                            int numa = std::stoi(value.substr(4));
+                            if (numa < 0)
+                                throw std::invalid_argument("negative NUMA");
+                            c.device_for_this_rank              = GlobalDeviceAddress::cpu(numa);
+                            c.device_for_this_rank_numa_explicit = true;
+                            c.cpu_global_tp_all_local            = false;
+                        }
+                        catch (const std::exception &)
+                        {
+                            throw std::invalid_argument(
+                                "Invalid CPU device specification: '" + value +
+                                "' (expected cpu or cpu:<numa>)");
+                        }
+                        return;
+                    }
+                    auto addr = GlobalDeviceAddress::tryParse(value);
+                    if (!addr)
+                        throw std::invalid_argument(
+                            "Invalid device specification: '" + value + "'");
+                    c.device_for_this_rank = *addr;
+                    size_t colon_count = static_cast<size_t>(
+                        std::count(value.begin(), value.end(), ':'));
+                    c.device_for_this_rank_numa_explicit = (colon_count >= 2);
+                    c.cpu_global_tp_all_local            = false;
+                }),
+        });
+        spec.add({
+            .long_name   = "--device-mode",
+            .category    = "Device Assignment",
+            .value_label = "<mode>",
+            .description = "Assignment mode: auto, local_gpu, round_robin, explicit "
+                           "(dashes also accepted: local-gpu, round-robin)",
+            .setter      = enumSetter(&OrchestrationConfig::device_mode,
+                                      parseDeviceAssignmentMode, "--device-mode",
+                                      "auto, local_gpu, round_robin, explicit"),
+        });
+        spec.add({
+            .long_name   = "--device-map",
+            .category    = "Device Assignment",
+            .value_label = "<map>",
+            .description = "Explicit rank->device mapping, e.g. \"0=cuda:0,1=cuda:1\"",
+            .setter      = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &v) {
+                    c.device_map                = parseDeviceMap(v);
+                    c.device_map_numa_explicit  = parseDeviceMapNumaExplicit(v);
+                    c.device_mode               = DeviceAssignmentMode::EXPLICIT;
+                }),
+        });
+
+        // --- Tensor Parallelism ----------------------------------------------
+        spec.add({
+            .short_name  = "-tp",
+            .long_name   = "--tensor-parallelism-degree",
+            .category    = "Tensor Parallelism",
+            .value_label = "<n>",
+            .description = "TP parallelism degree",
+            .setter      = setters::parseInt(&OrchestrationConfig::tp_degree,
+                                             "--tensor-parallelism-degree"),
+        });
+        spec.add({
+            .long_name   = "--tp-scope",
+            .category    = "Tensor Parallelism",
+            .value_label = "<scope>",
+            .description = "Scope: auto, local, node_local, global, hybrid",
+            .setter      = enumSetter(&OrchestrationConfig::tp_scope,
+                                      parseTpScope, "--tp-scope",
+                                      "auto, local, node_local, global, hybrid"),
+        });
+        spec.add({
+            .long_name   = "--tp-devices",
+            .category    = "Tensor Parallelism",
+            .value_label = "<list>",
+            .description = "Device list, e.g. \"cuda:0,cuda:1\"",
+            .setter      = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &v) {
+                    c.tp_devices = parseDeviceList(v);
+                }),
+        });
+        spec.add({
+            .long_name   = "--tp-weights",
+            .category    = "Tensor Parallelism",
+            .value_label = "<list>",
+            .description = "Weight distribution (requires --tp-devices), e.g. \"0.73,0.27\"",
+            .setter      = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &v) {
+                    c.tp_weights = parseWeightList(v);
+                }),
+        });
+
+        // --- Pipeline Parallelism --------------------------------------------
+        spec.add({
+            .short_name  = "-pp",
+            .long_name   = "--pipeline-parallelism-degree",
+            .category    = "Pipeline Parallelism",
+            .value_label = "<n>",
+            .description = "PP parallelism degree",
+            .setter      = setters::parseInt(&OrchestrationConfig::pp_degree,
+                                             "--pipeline-parallelism-degree"),
+        });
+        spec.add({
+            .long_name   = "--pp-split",
+            .category    = "Pipeline Parallelism",
+            .value_label = "<mode>",
+            .description = "Layer split: equal, weighted, manual",
+            .setter      = enumSetter(&OrchestrationConfig::pp_split,
+                                      parsePpSplitMode, "--pp-split",
+                                      "equal, weighted, manual"),
+        });
+
+        // --- Named Domains (advanced) ----------------------------------------
+        spec.add({
+            .long_name   = "--define-domain",
+            .category    = "Named Domains (advanced)",
+            .value_label = "<spec>",
+            .description = "Define domain: \"name=device1,device2[;weights=w1,w2][;backend=type]\"",
+            .setter      = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &v) {
+                    c.domain_definitions.push_back(DomainDefinition::parse(v));
+                }),
+        });
+        spec.add({
+            .long_name   = "--pp-stage",
+            .category    = "Named Domains (advanced)",
+            .value_label = "<spec>",
+            .description = "Define PP stage: \"stage_id=domain:first_layer-last_layer\"",
+            .setter      = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &v) {
+                    c.pp_stage_definitions.push_back(PPStageDefinition::parse(v));
+                }),
+        });
+
+        // --- Collective Backend ----------------------------------------------
+        spec.add({
+            .short_name  = "-b",
+            .long_name   = "--backend",
+            .category    = "Collective Backend",
+            .value_label = "<type>",
+            .description = "Default collective: auto, nccl, rccl, upi, mpi, host, heterogeneous",
+            .setter      = enumSetter(&OrchestrationConfig::default_backend,
+                                      parseCollectiveBackendType, "--backend",
+                                      "auto, nccl, rccl, upi, mpi, host, heterogeneous"),
+        });
+
+        // --- Introspection ---------------------------------------------------
+        spec.add({
+            .long_name   = "--dry-run",
+            .category    = "Introspection",
+            .description = "Validate configuration and cluster inventory, then exit",
+            .setter      = setters::assignBoolTrue(&OrchestrationConfig::dry_run),
+        });
+        spec.add({
+            .long_name   = "--explain-placement",
+            .category    = "Introspection",
+            .description = "Dump resolved orchestration plan on rank 0",
+            .setter      = setters::assignBoolTrue(&OrchestrationConfig::explain_placement),
+        });
+        spec.add({
+            .long_name   = "--show-topology",
+            .category    = "Introspection",
+            .description = "Show detected CPU topology and exit",
+            .setter      = setters::assignBoolTrue(&OrchestrationConfig::show_topology),
+        });
+        spec.add({
+            .long_name   = "--show-numa",
+            .category    = "Introspection",
+            .description = "Show NUMA configuration and exit",
+            .setter      = setters::assignBoolTrue(&OrchestrationConfig::show_numa),
+        });
+        spec.add({
+            .long_name   = "--validate-only",
+            .category    = "Introspection",
+            .description = "Validate configuration and exit",
+            .setter      = setters::assignBoolTrue(&OrchestrationConfig::validate_only),
+        });
+        spec.add({
+            .long_name   = "--list-devices",
+            .category    = "Introspection",
+            .description = "List available devices and exit",
+            .setter      = setters::assignBoolTrue(&OrchestrationConfig::list_devices),
+        });
+
+        // --- Config File -----------------------------------------------------
+        // Loaded as the base config in the first pass of parseArgs; on the
+        // second pass we just record the path so downstream code sees it.
+        spec.add({
+            .long_name   = "--config",
+            .category    = "Config File",
+            .value_label = "<path>",
+            .description = "Load base configuration from YAML; subsequent CLI flags override it",
+            .setter      = setters::assignString(&OrchestrationConfig::config_file_path),
+        });
+
+        // --- MoE Configuration -----------------------------------------------
+        spec.add({
+            .long_name   = "--moe-shared-gpu",
+            .category    = "MoE Configuration",
+            .description = "Place shared experts on GPU (default)",
+            .setter      = setters::assignBoolTrue(&OrchestrationConfig::moe_shared_experts_gpu),
+        });
+        spec.add({
+            .long_name   = "--moe-shared-cpu",
+            .category    = "MoE Configuration",
+            .description = "Place shared experts on CPU",
+            .setter      = setters::assignBoolFalse(&OrchestrationConfig::moe_shared_experts_gpu),
+        });
+        spec.add({
+            .long_name   = "--moe-sparse-gpu",
+            .category    = "MoE Configuration",
+            .description = "Place sparse experts on GPU",
+            .setter      = setters::assignBoolFalse(&OrchestrationConfig::moe_sparse_experts_cpu),
+        });
+        spec.add({
+            .long_name   = "--moe-sparse-cpu",
+            .category    = "MoE Configuration",
+            .description = "Place sparse experts on CPU (default)",
+            .setter      = setters::assignBoolTrue(&OrchestrationConfig::moe_sparse_experts_cpu),
+        });
+
+        // --- Precision -------------------------------------------------------
+        spec.add({
+            .long_name    = "--activation-precision",
+            .aliases      = {"--activation-prec", "--act-prec"},
+            .category     = "Precision",
+            .value_label  = "<type>",
+            .description  = "Activation precision: fp32, bf16, fp16, q8_1",
+            .valid_values = {"fp32", "bf16", "fp16", "q8_1"},
+            .setter       = setters::assignString(&OrchestrationConfig::activation_precision),
+        });
+        // --kv-cache-precision accepts many short aliases; normalise to
+        // lowercase and validate against the full alias list.
+        spec.add({
+            .long_name   = "--kv-cache-precision",
+            .aliases     = {"--kv-prec"},
+            .category    = "Precision",
+            .value_label = "<type>",
+            .description = "KV cache precision: auto (default), fp32, fp16, q8_1, q16_1, tq4, tq "
+                           "(short aliases: f32, f16, q8, q16, i16)",
+            .setter      = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &value) {
+                    std::string lower = toLower(value);
+                    static const std::set<std::string> valid_precisions = {
+                        "auto", "fp32", "f32", "fp16", "f16",
+                        "q8_1", "q8", "q81",
+                        "q16_1", "q16", "q161",
+                        "i16", "int16", "tq4", "tq"};
+                    if (valid_precisions.find(lower) == valid_precisions.end())
+                    {
+                        throw std::invalid_argument(
+                            "Invalid value for --kv-cache-precision: '" + value +
+                            "' (valid: auto, fp32, fp16, q8_1, q16_1, tq4, tq)");
+                    }
+                    c.kv_cache_precision = lower;
+                }),
+        });
+
+        // --- Heterogeneous Mode ----------------------------------------------
+        spec.add({
+            .long_name   = "--cpu-fraction",
+            .category    = "Heterogeneous Mode",
+            .value_label = "<f>",
+            .description = "CPU compute fraction (0.0-1.0, default: 0.2)",
+            .setter      = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &v) {
+                    try
+                    {
+                        c.cpu_compute_fraction = std::stof(v);
+                    }
+                    catch (const std::exception &)
+                    {
+                        throw std::invalid_argument(
+                            "Invalid value for --cpu-fraction: '" + v + "'");
+                    }
+                    if (c.cpu_compute_fraction < 0.0f || c.cpu_compute_fraction > 1.0f)
+                        throw std::invalid_argument(
+                            "--cpu-fraction must be between 0.0 and 1.0");
+                }),
+        });
+        spec.add({
+            .long_name   = "--min-layers-per-domain",
+            .category    = "Heterogeneous Mode",
+            .value_label = "<n>",
+            .description = "Minimum layers per domain (default: 2)",
+            .setter      = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &v) {
+                    try
+                    {
+                        c.min_layers_per_domain = std::stoi(v);
+                    }
+                    catch (const std::exception &)
+                    {
+                        throw std::invalid_argument(
+                            "Invalid value for --min-layers-per-domain: '" + v + "'");
+                    }
+                    if (c.min_layers_per_domain < 1)
+                        throw std::invalid_argument(
+                            "--min-layers-per-domain must be >= 1");
+                }),
+        });
+
+        // --- Verbosity -------------------------------------------------------
+        spec.add({
+            .short_name  = "-v",
+            .category    = "Verbosity",
+            .description = "Increase verbosity (-v, -vv, -vvv)",
+            .setter      = setters::incrementInt(&OrchestrationConfig::verbose_level, 3),
+        });
+        spec.add({
+            .short_name  = "-vv",
+            .category    = "Verbosity",
+            .description = "Shorthand for verbosity level 2 (DEBUG)",
+            .setter      = setters::assignIntLiteral(&OrchestrationConfig::verbose_level, 2),
+        });
+        spec.add({
+            .short_name  = "-vvv",
+            .category    = "Verbosity",
+            .description = "Shorthand for verbosity level 3 (TRACE)",
+            .setter      = setters::assignIntLiteral(&OrchestrationConfig::verbose_level, 3),
+        });
+        spec.add({
+            .short_name  = "-h",
+            .long_name   = "--help",
+            .category    = "Verbosity",
+            .description = "Show this help message",
+            .setter      = setters::assignBoolTrue(&OrchestrationConfig::show_help),
+        });
+
+        // =====================================================================
+        // Not yet implemented (parsed for back-compat, rendered in NYI section)
+        // =====================================================================
+        spec.add({
+            .long_name              = "--fused-attention",
+            .category               = "Fused Attention",
+            .description            = "Superseded by --fused-attention-backend",
+            .not_yet_implemented    = true,
+            .setter                 = setters::assignBoolTrue(&OrchestrationConfig::use_fused_attention),
+        });
+        spec.add({
+            .long_name              = "--shard-weights",
+            .category               = "Tensor Parallelism",
+            .description            = "Weight sharding is automatic based on TP",
+            .not_yet_implemented    = true,
+            .setter                 = setters::assignBoolTrue(&OrchestrationConfig::shard_weights),
+        });
+        spec.add({
+            .long_name              = "--no-shard-weights",
+            .category               = "Tensor Parallelism",
+            .description            = "Weight sharding is automatic based on TP",
+            .not_yet_implemented    = true,
+            .setter                 = setters::assignBoolTrue(&OrchestrationConfig::disable_weight_sharding),
+        });
+        spec.add({
+            .long_name              = "--heterogeneous",
+            .category               = "Heterogeneous Mode",
+            .description            = "No-op; use --define-domain for heterogeneous setups",
+            .not_yet_implemented    = true,
+            .setter                 = setters::assignBoolTrue(&OrchestrationConfig::heterogeneous_mode),
+        });
+        spec.add({
+            .long_name              = "--no-gpu-tp",
+            .category               = "Heterogeneous Mode",
+            .description            = "No-op under the current heterogeneous path",
+            .not_yet_implemented    = true,
+            .setter                 = setters::assignBoolTrue(&OrchestrationConfig::disable_gpu_tp),
+        });
+        spec.add({
+            .long_name              = "--no-cpu-tp",
+            .category               = "Heterogeneous Mode",
+            .description            = "No-op under the current heterogeneous path",
+            .not_yet_implemented    = true,
+            .setter                 = setters::assignBoolTrue(&OrchestrationConfig::disable_cpu_tp),
+        });
+        spec.add({
+            .long_name              = "--tp-local",
+            .category               = "Tensor Parallelism",
+            .value_label            = "<degree>",
+            .description            = "Hybrid-TP local subdegree (not yet consumed)",
+            .not_yet_implemented    = true,
+            .setter                 = setters::parseInt(&OrchestrationConfig::tp_local_degree, "--tp-local"),
+        });
+        spec.add({
+            .long_name              = "--tp-global",
+            .category               = "Tensor Parallelism",
+            .value_label            = "<degree>",
+            .description            = "Hybrid-TP global subdegree (not yet consumed)",
+            .not_yet_implemented    = true,
+            .setter                 = setters::parseInt(&OrchestrationConfig::tp_global_degree, "--tp-global"),
+        });
+        spec.add({
+            .long_name              = "--cpu-layers",
+            .category               = "Layer Placement",
+            .value_label            = "<n>",
+            .description            = "Legacy layer-placement; use --pp-stage with CPU domains",
+            .not_yet_implemented    = true,
+            .setter                 = setters::parseInt(&OrchestrationConfig::cpu_layers, "--cpu-layers"),
+        });
+        spec.add({
+            .long_name              = "--cpu-layers-first",
+            .category               = "Layer Placement",
+            .description            = "Legacy layer-placement; use --pp-stage with CPU domains",
+            .not_yet_implemented    = true,
+            .setter                 = setters::assignBoolTrue(&OrchestrationConfig::cpu_layers_first),
+        });
+        spec.add({
+            .long_name              = "--max-gpu-memory",
+            .category               = "Memory Constraints",
+            .value_label            = "<mb>",
+            .description            = "Legacy DeviceOrchestrator is inactive",
+            .not_yet_implemented    = true,
+            .setter                 = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &v) {
+                    c.max_gpu_memory_mb = std::stoull(v);
+                }),
+        });
+        spec.add({
+            .long_name              = "--max-cpu-memory",
+            .category               = "Memory Constraints",
+            .value_label            = "<mb>",
+            .description            = "Legacy DeviceOrchestrator is inactive",
+            .not_yet_implemented    = true,
+            .setter                 = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &v) {
+                    c.max_cpu_memory_mb = std::stoull(v);
+                }),
+        });
+        spec.add({
+            .long_name              = "--topology",
+            .category               = "Topology",
+            .value_label            = "<spec>",
+            .description            = "Tree parsing not yet wired into runner",
+            .not_yet_implemented    = true,
+            .setter                 = setters::assignString(&OrchestrationConfig::topology_string),
+        });
+        spec.add({
+            .long_name              = "--topology-file",
+            .category               = "Topology",
+            .value_label            = "<path>",
+            .description            = "Tree parsing not yet wired into runner",
+            .not_yet_implemented    = true,
+            .setter                 = setters::assignString(&OrchestrationConfig::topology_file_path),
+        });
+
+        return spec;
     }
 
     // =========================================================================
@@ -267,17 +983,16 @@ namespace llaminar2
 
     OrchestrationConfig OrchestrationConfigParser::parseArgs(int argc, char **argv)
     {
-        OrchestrationConfig config;
-
-        // Convert to vector for easier handling
+        // Convert argc/argv into a vector for ergonomic iteration.
         std::vector<std::string> args;
+        args.reserve(static_cast<size_t>(std::max(0, argc - 1)));
         for (int i = 1; i < argc; ++i)
-        {
-            args.push_back(argv[i]);
-        }
+            args.emplace_back(argv[i]);
 
-        // First pass: if --config <path> is present, load YAML as the base config.
-        // CLI arguments processed in the second pass will then override YAML values.
+        // First pass: if --config <path> was supplied, load the YAML file as
+        // the base config. The second pass (full CLI parse) will override any
+        // individual fields specified on the command line.
+        OrchestrationConfig config;
         for (size_t i = 0; i + 1 < args.size(); ++i)
         {
             if (args[i] == "--config")
@@ -286,779 +1001,29 @@ namespace llaminar2
                 config.config_file_path = args[i + 1];
                 break;
             }
-        }
-
-        for (size_t i = 0; i < args.size(); ++i)
-        {
-            const std::string &arg = args[i];
-
-            // ===== Help and info flags =====
-            if (arg == "-h" || arg == "--help")
+            // Also handle --config=<path>
+            static const std::string kPrefix = "--config=";
+            if (args[i].compare(0, kPrefix.size(), kPrefix) == 0)
             {
-                config.show_help = true;
-            }
-            else if (arg == "-v")
-            {
-                config.verbose_level++;
-            }
-            else if (arg == "-vv")
-            {
-                config.verbose_level = 2;
-            }
-            else if (arg == "-vvv")
-            {
-                config.verbose_level = 3;
-            }
-            else if (arg == "--list-devices")
-            {
-                config.list_devices = true;
-            }
-
-            // ===== Introspection flags =====
-            else if (arg == "--dry-run")
-            {
-                config.dry_run = true;
-            }
-            else if (arg == "--explain-placement")
-            {
-                config.explain_placement = true;
-            }
-            else if (arg == "--show-topology")
-            {
-                config.show_topology = true;
-            }
-            else if (arg == "--show-numa")
-            {
-                config.show_numa = true;
-            }
-            else if (arg == "--validate-only")
-            {
-                config.validate_only = true;
-            }
-
-            // ===== Model Configuration =====
-            else if (matchesFlag(arg, "-m", "--model"))
-            {
-                std::string value = getFlagValue(args, i);
-                if (value.empty())
-                {
-                    throw std::invalid_argument("--model requires a path");
-                }
-                config.model_path = value;
-            }
-            else if (matchesFlag(arg, "-c", "--context-length"))
-            {
-                std::string value = getFlagValue(args, i);
-                if (value.empty())
-                {
-                    throw std::invalid_argument("--context-length requires a value");
-                }
-                try
-                {
-                    config.max_seq_len = std::stoi(value);
-                }
-                catch (const std::exception &)
-                {
-                    throw std::invalid_argument("Invalid context length: '" + value + "'");
-                }
-            }
-            else if (arg == "--mmap")
-            {
-                config.use_mmap = true;
-            }
-            else if (arg == "--no-mmap")
-            {
-                config.use_mmap = false;
-            }
-
-            // ===== Inference Configuration =====
-            else if (matchesFlag(arg, "-p", "--prompt"))
-            {
-                std::string value = getFlagValue(args, i);
-                if (value.empty())
-                {
-                    throw std::invalid_argument("--prompt requires a value");
-                }
-                config.prompt = value;
-            }
-            else if (matchesFlag(arg, "-n", "--n-predict"))
-            {
-                std::string value = getFlagValue(args, i);
-                if (value.empty())
-                {
-                    throw std::invalid_argument("--n-predict requires a value");
-                }
-                try
-                {
-                    config.n_predict = std::stoi(value);
-                }
-                catch (const std::exception &)
-                {
-                    throw std::invalid_argument("Invalid n-predict value: '" + value + "'");
-                }
-            }
-            else if (matchesFlag(arg, "", "--batch-size"))
-            {
-                std::string value = getFlagValue(args, i);
-                if (value.empty())
-                {
-                    throw std::invalid_argument("--batch-size requires a value");
-                }
-                try
-                {
-                    config.batch_size = std::stoi(value);
-                }
-                catch (const std::exception &)
-                {
-                    throw std::invalid_argument("Invalid batch size: '" + value + "'");
-                }
-            }
-            else if (matchesFlag(arg, "", "--threads"))
-            {
-                std::string value = getFlagValue(args, i);
-                if (value.empty())
-                {
-                    throw std::invalid_argument("--threads requires a value");
-                }
-                try
-                {
-                    config.n_threads = std::stoi(value);
-                }
-                catch (const std::exception &)
-                {
-                    throw std::invalid_argument("Invalid threads value: '" + value + "'");
-                }
-            }
-            else if (matchesFlag(arg, "-s", "--seed"))
-            {
-                std::string value = getFlagValue(args, i);
-                if (value.empty())
-                {
-                    throw std::invalid_argument("--seed requires a value");
-                }
-                try
-                {
-                    config.seed = std::stoi(value);
-                }
-                catch (const std::exception &)
-                {
-                    throw std::invalid_argument("Invalid seed value: '" + value + "'");
-                }
-            }
-
-            // ===== Sampling Configuration =====
-            else if (matchesFlag(arg, "-t", "--temperature"))
-            {
-                std::string value = getFlagValue(args, i);
-                if (value.empty())
-                {
-                    throw std::invalid_argument("--temperature requires a value");
-                }
-                try
-                {
-                    config.temperature = std::stof(value);
-                }
-                catch (const std::exception &)
-                {
-                    throw std::invalid_argument("Invalid temperature value: '" + value + "'");
-                }
-            }
-            else if (matchesFlag(arg, "", "--top-k"))
-            {
-                std::string value = getFlagValue(args, i);
-                if (value.empty())
-                {
-                    throw std::invalid_argument("--top-k requires a value");
-                }
-                try
-                {
-                    config.top_k = std::stoi(value);
-                }
-                catch (const std::exception &)
-                {
-                    throw std::invalid_argument("Invalid top-k value: '" + value + "'");
-                }
-            }
-            else if (matchesFlag(arg, "", "--top-p"))
-            {
-                std::string value = getFlagValue(args, i);
-                if (value.empty())
-                {
-                    throw std::invalid_argument("--top-p requires a value");
-                }
-                try
-                {
-                    config.top_p = std::stof(value);
-                }
-                catch (const std::exception &)
-                {
-                    throw std::invalid_argument("Invalid top-p value: '" + value + "'");
-                }
-            }
-            else if (arg == "--deterministic")
-            {
-                config.deterministic = true;
-                // Force greedy sampling (temperature 0). This is the cheapest
-                // knob that actually makes inference reproducible from the
-                // CLI and is what the help text has always advertised.
-                config.temperature = 0.0f;
-                // Also export LLAMINAR_DETERMINISTIC so kernels that opt into
-                // deterministic execution (e.g. CUDA quantised GEMM) pick it up.
-                setenv("LLAMINAR_DETERMINISTIC", "1", 1);
-            }
-
-            // ===== Chat Configuration =====
-            else if (arg == "--chat")
-            {
-                config.chat_mode = true;
-            }
-            else if (arg == "--chat-single")
-            {
-                config.single_shot_chat = true;
-            }
-            else if (matchesFlag(arg, "", "--system"))
-            {
-                std::string value = getFlagValue(args, i);
-                if (value.empty())
-                {
-                    throw std::invalid_argument("--system requires a value");
-                }
-                config.system_prompt = value;
-            }
-            else if (matchesFlag(arg, "", "--chat-template"))
-            {
-                std::string value = getFlagValue(args, i);
-                if (value.empty())
-                {
-                    throw std::invalid_argument("--chat-template requires a value");
-                }
-                config.chat_template_override = value;
-            }
-
-            // ===== Benchmark Configuration =====
-            else if (arg == "--benchmark")
-            {
-                config.benchmark_mode = true;
-            }
-
-            // ===== Server Configuration =====
-            else if (arg == "--serve")
-            {
-                config.serve_mode = true;
-            }
-            else if (matchesFlag(arg, "", "--port"))
-            {
-                std::string value = getFlagValue(args, i);
-                if (value.empty())
-                    throw std::invalid_argument("--port requires a value");
-                try
-                {
-                    config.serve_port = std::stoi(value);
-                }
-                catch (...)
-                {
-                    throw std::invalid_argument("Invalid port value: " + value);
-                }
-            }
-            else if (matchesFlag(arg, "", "--host"))
-            {
-                std::string value = getFlagValue(args, i);
-                if (value.empty())
-                    throw std::invalid_argument("--host requires a value");
-                config.serve_host = value;
-            }
-
-            // ===== Fused Attention Configuration =====
-            else if (arg == "--fused-attention")
-            {
-                config.use_fused_attention = true;
-            }
-            else if (matchesFlag(arg, "", "--fused-attention-backend"))
-            {
-                std::string value = getFlagValue(args, i);
-                if (value.empty())
-                {
-                    throw std::invalid_argument("--fused-attention-backend requires a value");
-                }
-                config.fused_attention_backend = parseFusedAttentionBackend(value);
-            }
-
-            // ===== MPI Bootstrap Configuration =====
-            else if (matchesFlag(arg, "", "--mpi-procs"))
-            {
-                std::string value = getFlagValue(args, i);
-                if (value.empty())
-                {
-                    throw std::invalid_argument("--mpi-procs requires a value");
-                }
-                try
-                {
-                    config.mpi_procs = std::stoi(value);
-                }
-                catch (const std::exception &)
-                {
-                    throw std::invalid_argument("Invalid mpi-procs value: '" + value + "'");
-                }
-            }
-            else if (matchesFlag(arg, "", "--mpi-hostfile"))
-            {
-                std::string value = getFlagValue(args, i);
-                if (value.empty())
-                {
-                    throw std::invalid_argument("--mpi-hostfile requires a path");
-                }
-                config.hostfile = value;
-            }
-            else if (arg == "--mpi-dry-run")
-            {
-                config.mpi_dry_run = true;
-            }
-            else if (arg == "--mpi-verbose")
-            {
-                config.mpi_verbose = true;
-            }
-            else if (arg == "--no-mpi-bootstrap")
-            {
-                config.mpi_no_bootstrap = true;
-            }
-            else if (arg == "--mpi-oversubscribe")
-            {
-                config.mpi_oversubscribe = true;
-            }
-            else if (matchesFlag(arg, "", "--mpi-profile"))
-            {
-                std::string value = getFlagValue(args, i);
-                if (value.empty())
-                {
-                    throw std::invalid_argument("--mpi-profile requires a value (auto|tuned)");
-                }
-                auto profile = parseMPIProfile(value);
-                if (!profile)
-                {
-                    throw std::invalid_argument("Invalid mpi profile: '" + value + "' (valid: auto, tuned)");
-                }
-                config.mpi_profile = *profile;
-            }
-
-            // ===== Device assignment =====
-            else if (matchesFlag(arg, "-d", "--device"))
-            {
-                std::string value = getFlagValue(args, i);
-                if (value.empty())
-                {
-                    throw std::invalid_argument("--device requires a device specification");
-                }
-                const std::string lower = toLower(value);
-
-                // CPU shorthand semantics:
-                // - "cpu"   => all local NUMA CPU devices (global CPU TP intent)
-                // - "cpu:N" => explicit NUMA-node CPU target
-                if (lower == "cpu")
-                {
-                    config.device_for_this_rank = GlobalDeviceAddress::cpu(0);
-                    config.device_for_this_rank_numa_explicit = false;
-                    config.cpu_global_tp_all_local = true;
-                }
-                else if (lower.rfind("cpu:", 0) == 0)
+                std::string path = args[i].substr(kPrefix.size());
+                if (!path.empty())
                 {
-                    try
-                    {
-                        int numa = std::stoi(value.substr(4));
-                        if (numa < 0)
-                        {
-                            throw std::invalid_argument("negative NUMA");
-                        }
-                        config.device_for_this_rank = GlobalDeviceAddress::cpu(numa);
-                        config.device_for_this_rank_numa_explicit = true;
-                        config.cpu_global_tp_all_local = false;
-                    }
-                    catch (const std::exception &)
-                    {
-                        throw std::invalid_argument("Invalid CPU device specification: '" + value + "' (expected cpu or cpu:<numa>)");
-                    }
+                    config = parseYamlFile(path);
+                    config.config_file_path = path;
                 }
-                else
-                {
-                    auto addr = GlobalDeviceAddress::tryParse(value);
-                    if (!addr)
-                    {
-                        throw std::invalid_argument("Invalid device specification: '" + value + "'");
-                    }
-                    config.device_for_this_rank = *addr;
-
-                    // Short form "type:ordinal" is NUMA-ambiguous; forms with >=3 fields are explicit.
-                    size_t colon_count = static_cast<size_t>(std::count(value.begin(), value.end(), ':'));
-                    config.device_for_this_rank_numa_explicit = (colon_count >= 2);
-                    config.cpu_global_tp_all_local = false;
-                }
-            }
-            else if (matchesFlag(arg, "", "--device-mode"))
-            {
-                std::string value = getFlagValue(args, i);
-                if (value.empty())
-                {
-                    throw std::invalid_argument("--device-mode requires a mode");
-                }
-                auto mode = parseDeviceAssignmentMode(value);
-                if (!mode)
-                {
-                    throw std::invalid_argument("Invalid device mode: '" + value + "'");
-                }
-                config.device_mode = *mode;
-            }
-            else if (matchesFlag(arg, "", "--device-map"))
-            {
-                std::string value = getFlagValue(args, i);
-                if (value.empty())
-                {
-                    throw std::invalid_argument("--device-map requires a mapping");
-                }
-                config.device_map = parseDeviceMap(value);
-                config.device_map_numa_explicit = parseDeviceMapNumaExplicit(value);
-                config.device_mode = DeviceAssignmentMode::EXPLICIT;
-            }
-
-            // ===== Named domains =====
-            else if (matchesFlag(arg, "", "--define-domain"))
-            {
-                std::string value = getFlagValue(args, i);
-                if (value.empty())
-                {
-                    throw std::invalid_argument("--define-domain requires a specification");
-                }
-                config.domain_definitions.push_back(DomainDefinition::parse(value));
-            }
-            else if (matchesFlag(arg, "", "--pp-stage"))
-            {
-                std::string value = getFlagValue(args, i);
-                if (value.empty())
-                {
-                    throw std::invalid_argument("--pp-stage requires a specification");
-                }
-                config.pp_stage_definitions.push_back(PPStageDefinition::parse(value));
-            }
-
-            // ===== Simple TP options =====
-            else if (matchesFlag(arg, "-tp", "--tensor-parallelism-degree"))
-            {
-                std::string value = getFlagValue(args, i);
-                if (value.empty())
-                {
-                    throw std::invalid_argument("--tensor-parallelism-degree requires a degree");
-                }
-                try
-                {
-                    config.tp_degree = std::stoi(value);
-                }
-                catch (const std::exception &)
-                {
-                    throw std::invalid_argument("Invalid TP degree: '" + value + "'");
-                }
-            }
-            else if (matchesFlag(arg, "", "--tp-scope"))
-            {
-                std::string value = getFlagValue(args, i);
-                if (value.empty())
-                {
-                    throw std::invalid_argument("--tp-scope requires a scope");
-                }
-                auto scope = parseTpScope(value);
-                if (!scope)
-                {
-                    throw std::invalid_argument("Invalid TP scope: '" + value + "'");
-                }
-                config.tp_scope = *scope;
-            }
-            else if (matchesFlag(arg, "", "--tp-devices"))
-            {
-                std::string value = getFlagValue(args, i);
-                if (value.empty())
-                {
-                    throw std::invalid_argument("--tp-devices requires a device list");
-                }
-                config.tp_devices = parseDeviceList(value);
-            }
-            else if (matchesFlag(arg, "", "--tp-weights"))
-            {
-                std::string value = getFlagValue(args, i);
-                if (value.empty())
-                {
-                    throw std::invalid_argument("--tp-weights requires a weight list");
-                }
-                config.tp_weights = parseWeightList(value);
-            }
-            else if (matchesFlag(arg, "", "--tp-local"))
-            {
-                std::string value = getFlagValue(args, i);
-                if (value.empty())
-                {
-                    throw std::invalid_argument("--tp-local requires a degree");
-                }
-                try
-                {
-                    config.tp_local_degree = std::stoi(value);
-                }
-                catch (const std::exception &)
-                {
-                    throw std::invalid_argument("Invalid TP local degree: '" + value + "'");
-                }
-            }
-            else if (matchesFlag(arg, "", "--tp-global"))
-            {
-                std::string value = getFlagValue(args, i);
-                if (value.empty())
-                {
-                    throw std::invalid_argument("--tp-global requires a degree");
-                }
-                try
-                {
-                    config.tp_global_degree = std::stoi(value);
-                }
-                catch (const std::exception &)
-                {
-                    throw std::invalid_argument("Invalid TP global degree: '" + value + "'");
-                }
-            }
-
-            // ===== Simple PP options =====
-            else if (matchesFlag(arg, "-pp", "--pipeline-parallelism-degree"))
-            {
-                std::string value = getFlagValue(args, i);
-                if (value.empty())
-                {
-                    throw std::invalid_argument("--pipeline-parallelism-degree requires a degree");
-                }
-                try
-                {
-                    config.pp_degree = std::stoi(value);
-                }
-                catch (const std::exception &)
-                {
-                    throw std::invalid_argument("Invalid PP degree: '" + value + "'");
-                }
-            }
-            else if (matchesFlag(arg, "", "--pp-split"))
-            {
-                std::string value = getFlagValue(args, i);
-                if (value.empty())
-                {
-                    throw std::invalid_argument("--pp-split requires a mode");
-                }
-                auto mode = parsePpSplitMode(value);
-                if (!mode)
-                {
-                    throw std::invalid_argument("Invalid PP split mode: '" + value + "'");
-                }
-                config.pp_split = *mode;
-            }
-
-            // ===== Layer placement =====
-            else if (matchesFlag(arg, "", "--cpu-layers"))
-            {
-                std::string value = getFlagValue(args, i);
-                if (value.empty())
-                {
-                    throw std::invalid_argument("--cpu-layers requires a count");
-                }
-                try
-                {
-                    config.cpu_layers = std::stoi(value);
-                }
-                catch (const std::exception &)
-                {
-                    throw std::invalid_argument("Invalid CPU layers count: '" + value + "'");
-                }
-            }
-            else if (arg == "--cpu-layers-first")
-            {
-                config.cpu_layers_first = true;
-            }
-
-            // ===== Backend =====
-            else if (matchesFlag(arg, "-b", "--backend"))
-            {
-                std::string value = getFlagValue(args, i);
-                if (value.empty())
-                {
-                    throw std::invalid_argument("--backend requires a type");
-                }
-                auto backend = parseCollectiveBackendType(value);
-                if (!backend)
-                {
-                    throw std::invalid_argument("Invalid backend type: '" + value + "'");
-                }
-                config.default_backend = *backend;
-            }
-
-            // ===== Config file =====
-            else if (matchesFlag(arg, "", "--config"))
-            {
-                std::string value = getFlagValue(args, i);
-                if (value.empty())
-                {
-                    throw std::invalid_argument("--config requires a file path");
-                }
-                // YAML was already loaded as the base config in the first pass
-                // (see top of parseArgs). We consume the argument here so it
-                // doesn't trigger "Unknown argument" and so downstream code
-                // sees config_file_path correctly populated.
-                config.config_file_path = value;
-            }
-
-            // ===== Topology Tree (Global PP Phase 8) =====
-            else if (matchesFlag(arg, "", "--topology"))
-            {
-                std::string value = getFlagValue(args, i);
-                if (value.empty())
-                {
-                    throw std::invalid_argument("--topology requires an inline topology specification");
-                }
-                config.topology_string = value;
-                // Note: Tree parsing deferred until we know model n_layers
-                // The factory will parse when n_layers is available from model
-            }
-            else if (matchesFlag(arg, "", "--topology-file"))
-            {
-                std::string value = getFlagValue(args, i);
-                if (value.empty())
-                {
-                    throw std::invalid_argument("--topology-file requires a file path");
-                }
-                config.topology_file_path = value;
-                // Note: Tree parsing deferred until we know model n_layers
-                // The factory will parse when n_layers is available from model
-            }
-
-            // ===== Memory Constraints =====
-            else if (matchesFlag(arg, "", "--max-gpu-memory"))
-            {
-                std::string value = getFlagValue(args, i);
-                if (value.empty())
-                {
-                    throw std::invalid_argument("--max-gpu-memory requires a value in MB");
-                }
-                config.max_gpu_memory_mb = std::stoull(value);
-            }
-            else if (matchesFlag(arg, "", "--max-cpu-memory"))
-            {
-                std::string value = getFlagValue(args, i);
-                if (value.empty())
-                {
-                    throw std::invalid_argument("--max-cpu-memory requires a value in MB");
-                }
-                config.max_cpu_memory_mb = std::stoull(value);
-            }
-
-            // ===== MoE Configuration =====
-            else if (arg == "--moe-shared-gpu")
-            {
-                config.moe_shared_experts_gpu = true;
-            }
-            else if (arg == "--moe-shared-cpu")
-            {
-                config.moe_shared_experts_gpu = false;
-            }
-            else if (arg == "--moe-sparse-gpu")
-            {
-                config.moe_sparse_experts_cpu = false;
-            }
-            else if (arg == "--moe-sparse-cpu")
-            {
-                config.moe_sparse_experts_cpu = true;
-            }
-
-            // ===== Activation Precision =====
-            else if (arg == "--activation-precision" || arg == "--activation-prec" || arg == "--act-prec")
-            {
-                std::string value = getFlagValue(args, i);
-                if (value.empty())
-                {
-                    throw std::invalid_argument("--activation-precision requires a value");
-                }
-                static const std::set<std::string> valid_precisions = {"fp32", "bf16", "fp16", "q8_1"};
-                if (valid_precisions.find(value) == valid_precisions.end())
-                {
-                    throw std::invalid_argument("Invalid activation precision: '" + value + "'. Valid: fp32, bf16, fp16, q8_1");
-                }
-                config.activation_precision = value;
-            }
-            else if (arg == "--kv-cache-precision" || arg == "--kv-prec")
-            {
-                std::string value = getFlagValue(args, i);
-                if (value.empty())
-                {
-                    throw std::invalid_argument("--kv-cache-precision requires a value");
-                }
-                value = toLower(value);
-                static const std::set<std::string> valid_precisions = {"auto", "fp32", "f32", "fp16", "f16", "q8_1", "q8", "q81", "q16_1", "q16", "q161", "i16", "int16", "tq4", "tq"};
-                if (valid_precisions.find(value) == valid_precisions.end())
-                {
-                    throw std::invalid_argument("Invalid KV cache precision: '" + value + "'. Valid: auto, fp32, fp16, q8_1, q16_1, tq4, tq");
-                }
-                config.kv_cache_precision = value;
-            }
-
-            // ===== Weight Sharding =====
-            else if (arg == "--shard-weights")
-            {
-                config.shard_weights = true;
-            }
-            else if (arg == "--no-shard-weights")
-            {
-                config.disable_weight_sharding = true;
-            }
-
-            // ===== Heterogeneous Mode =====
-            else if (arg == "--heterogeneous")
-            {
-                config.heterogeneous_mode = true;
-            }
-            else if (matchesFlag(arg, "", "--cpu-fraction"))
-            {
-                std::string value = getFlagValue(args, i);
-                if (value.empty())
-                {
-                    throw std::invalid_argument("--cpu-fraction requires a value");
-                }
-                config.cpu_compute_fraction = std::stof(value);
-                if (config.cpu_compute_fraction < 0.0f || config.cpu_compute_fraction > 1.0f)
-                {
-                    throw std::invalid_argument("--cpu-fraction must be between 0.0 and 1.0");
-                }
-            }
-            else if (arg == "--no-gpu-tp")
-            {
-                config.disable_gpu_tp = true;
-            }
-            else if (arg == "--no-cpu-tp")
-            {
-                config.disable_cpu_tp = true;
-            }
-            else if (matchesFlag(arg, "", "--min-layers-per-domain"))
-            {
-                std::string value = getFlagValue(args, i);
-                if (value.empty())
-                {
-                    throw std::invalid_argument("--min-layers-per-domain requires a value");
-                }
-                config.min_layers_per_domain = std::stoi(value);
-                if (config.min_layers_per_domain < 1)
-                {
-                    throw std::invalid_argument("--min-layers-per-domain must be >= 1");
-                }
-            }
-
-            // Unknown argument - throw error
-            else
-            {
-                throw std::invalid_argument("Unknown argument: '" + arg + "'. Use --help to see available options.");
+                break;
             }
         }
 
-        // Validate heterogeneous mode
+        // Second pass: apply every flag through the structured spec.
+        static const CliSpec<OrchestrationConfig> spec = buildSpec();
+        spec.parse(args, config);
+
+        // Cross-flag validation that doesn't fit cleanly into per-option setters.
         if (config.heterogeneous_mode && config.disable_gpu_tp && config.disable_cpu_tp)
         {
-            throw std::invalid_argument("Cannot use --heterogeneous with both --no-gpu-tp and --no-cpu-tp");
+            throw std::invalid_argument(
+                "Cannot use --heterogeneous with both --no-gpu-tp and --no-cpu-tp");
         }
 
         return config;
@@ -1292,149 +1257,23 @@ namespace llaminar2
 
     std::string OrchestrationConfigParser::getHelpText()
     {
-        return R"HELPTEXT(
-Llaminar V2 LLM Inference Engine
+        // Help text is auto-generated from the structured CLI spec so flag
+        // wiring and help text can never drift apart.
+        static const CliSpec<OrchestrationConfig> spec = buildSpec();
 
-Usage: llaminar2 [OPTIONS]
+        const std::string header =
+            "\nLlaminar V2 LLM Inference Engine\n\n"
+            "Usage: llaminar2 [OPTIONS]\n";
 
-Model Configuration:
-  -m, --model <path>     Path to GGUF model file (required)
-  -c, --context-length <n>  Maximum context/sequence length (default: 4096)
-  --mmap                 Use memory-mapped file loading (default)
-  --no-mmap              Disable memory-mapped file loading
+        const std::string footer =
+            "Examples:\n"
+            "  llaminar2 -m model.gguf -p \"Hello world\" -n 50\n"
+            "  llaminar2 -m model.gguf --chat\n"
+            "  llaminar2 -m model.gguf --benchmark -n 100\n"
+            "  llaminar2 -m model.gguf --tp 2 --tp-devices \"cuda:0,cuda:1\"\n"
+            "  llaminar2 -m model.gguf -d cuda:0 --fused-attention-backend jit\n";
 
-Inference Configuration:
-  -p, --prompt <text>    Input prompt text
-  -n, --n-predict <n>    Tokens to generate (-1 = until EOS, default: -1)
-  --batch-size <n>       Batch size (default: 1)
-  --threads <n>          Thread count override for OpenMP / BLAS (-1 = auto)
-  -s, --seed <n>         Random seed (-1 = random, default: -1)
-
-Sampling Configuration:
-  -t, --temperature <f>  Sampling temperature (default: 0.8; 0 = greedy)
-  --top-k <n>            Top-K sampling (default: 40)
-  --top-p <f>            Top-P (nucleus) sampling (default: 0.9)
-  --deterministic        Force greedy sampling (temperature=0) and set
-                         LLAMINAR_DETERMINISTIC=1 for kernel-level determinism
-
-Chat Configuration:
-  --chat                 Interactive chat mode
-  --chat-single          Single prompt with chat template applied
-  --system <text>        System prompt for chat
-  --chat-template <name> Override chat template (chatml, llama3, etc.)
-
-Benchmark Configuration:
-  --benchmark            Run benchmark (warmup + multiple timed runs)
-
-Server Configuration:
-  --serve                Start HTTP server (OpenAI-compatible REST API)
-  --port <n>             Server port (default: 8080)
-  --host <addr>          Server bind address (default: 127.0.0.1)
-
-Fused Attention:
-  --fused-attention-backend <type>  Backend: jit (default), reference, tiled, q16
-
-MPI Bootstrap:
-  --mpi-procs <n>        Number of MPI processes (0 = auto)
-  --mpi-hostfile <path>  MPI hostfile path (also used for node detection)
-  --mpi-dry-run          Print MPI launch command and exit
-  --mpi-verbose          Verbose MPI output
-  --no-mpi-bootstrap     Disable automatic MPI bootstrap (DEBUG ONLY — disables
-                         thread pinning and NUMA-aware placement; use only for
-                         profiling with ncu/nsys/perf, never for benchmarks)
-  --mpi-oversubscribe    Allow MPI oversubscription
-  --mpi-profile <mode>   MPI bootstrap profile: auto (default), tuned
-
-Device Assignment:
-  -d, --device <spec>    Device for this rank. Examples:
-                           cuda:0, rocm:0      — specific GPU
-                           cpu                  — all CPU NUMA nodes (auto TP)
-                           cpu:N                — single CPU NUMA node N
-  --device-mode <mode>   Assignment mode: auto, local_gpu, round_robin, explicit
-                         (also accepts local-gpu, round-robin with dashes)
-  --device-map <map>     Explicit mapping: "0=cuda:0,1=cuda:1"
-
-Tensor Parallelism:
-  -tp, --tensor-parallelism-degree <n>  TP parallelism degree
-  --tp-scope <scope>     Scope: auto, local, global, hybrid, node_local
-  --tp-devices <list>    Device list: "cuda:0,cuda:1"
-  --tp-weights <list>    Weight distribution: "0.73,0.27" (requires --tp-devices)
-
-Pipeline Parallelism:
-  -pp, --pipeline-parallelism-degree <n>  PP parallelism degree
-  --pp-split <mode>      Layer split: equal, weighted, manual
-
-Named Domains (advanced):
-  --define-domain <spec> Define domain: "name=device1,device2[;weights=w1,w2][;backend=type]"
-  --pp-stage <spec>      Define PP stage: "stage_id=domain:first_layer-last_layer"
-
-Collective Backend:
-  -b, --backend <type>   Default collective: auto, nccl, rccl, upi, mpi, host,
-                         heterogeneous
-
-Introspection:
-  --dry-run              Validate configuration, print cluster inventory,
-                         then exit before loading the model
-  --explain-placement    Dump resolved orchestration plan on rank 0
-  --show-topology        Show detected CPU topology and exit
-  --show-numa            Show NUMA configuration and exit
-  --validate-only        Validate configuration and exit
-  --list-devices         List available devices and exit
-
-Config File:
-  --config <path>        Load configuration from YAML file. YAML values are
-                         loaded as the base config; subsequent CLI flags
-                         override any value from the file.
-
-MoE Configuration:
-  --moe-shared-gpu       Place shared experts on GPU (default)
-  --moe-shared-cpu       Place shared experts on CPU
-  --moe-sparse-gpu       Place sparse experts on GPU
-  --moe-sparse-cpu       Place sparse experts on CPU (default)
-
-Precision:
-  --activation-precision <type> / --activation-prec / --act-prec
-                         Activation precision: fp32, bf16, fp16, q8_1
-  --kv-cache-precision <type>  / --kv-prec
-                         KV cache precision: auto (default — q16_1 on CPU,
-                         fp16 on GPU), fp32, fp16, q8_1, q16_1, tq4, tq
-                         (short aliases accepted: f32, f16, q8, q16, i16)
-
-Heterogeneous Mode:
-  --cpu-fraction <f>     CPU compute fraction (0.0-1.0, default: 0.2)
-  --min-layers-per-domain <n>  Minimum layers per domain (default: 2)
-
-Verbosity:
-  -v                     Increase verbosity (-v = DEBUG, -vv / -vvv = TRACE)
-  -h, --help             Show this help message
-
-Not yet implemented (accepted but currently inert):
-  --fused-attention              superseded by --fused-attention-backend
-  --shard-weights / --no-shard-weights
-                                 weight sharding is automatic based on TP
-  --heterogeneous                no-op; use --define-domain for heterogeneous
-                                 setups
-  --no-gpu-tp / --no-cpu-tp      no-op under the current heterogeneous path
-  --tp-local / --tp-global       hybrid-TP subdegrees not yet consumed
-  --cpu-layers / --cpu-layers-first
-                                 legacy layer-placement path; use --pp-stage
-                                 with CPU domains instead
-  --max-gpu-memory / --max-cpu-memory
-                                 legacy DeviceOrchestrator is inactive
-  --topology / --topology-file   tree parsing not yet wired into runner
-
-Examples:
-  llaminar2 -m model.gguf -p "Hello world" -n 50
-  llaminar2 -m model.gguf --chat
-  llaminar2 -m model.gguf --benchmark -n 100
-  llaminar2 -m model.gguf --tp 2 --tp-devices "cuda:0,cuda:1"
-  llaminar2 -m model.gguf -d cuda:0 --fused-attention-backend jit
-  llaminar2 -m model.gguf -p "Hello world" -n 50
-  llaminar2 -m model.gguf --chat
-  llaminar2 -m model.gguf --benchmark -n 100
-  llaminar2 -m model.gguf --tp 2 --tp-devices "cuda:0,cuda:1"
-  llaminar2 -m model.gguf -d cuda:0 --fused-attention-backend jit
-)HELPTEXT";
+        return spec.getHelpText(header, footer);
     }
 
 } // namespace llaminar2

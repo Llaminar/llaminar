@@ -4919,6 +4919,15 @@ add_v2_test(V2_Unit_OrchestrationConfigParser
     MPI_PROCS 1
 )
 
+# Test: CliSpec (structured CLI flag spec framework: parsing, validation, help-gen)
+add_executable(v2_test_cli_spec unit/config/Test__CliSpec.cpp)
+target_link_libraries(v2_test_cli_spec llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_CliSpec
+    COMMAND $<TARGET_FILE:v2_test_cli_spec>
+    LABELS "V2;Unit;Config;CLI;Parser"
+    MPI_PROCS 1
+)
+
 # Test: ConfigValidator (declarative device selection validation rules)
 # Tests mutual exclusion, co-requirements, intra-mode consistency, mode detection.
 # Part of CLI Device Selection Cleanup
