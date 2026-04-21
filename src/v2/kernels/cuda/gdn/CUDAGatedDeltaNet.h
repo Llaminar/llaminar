@@ -15,6 +15,7 @@
 #pragma once
 
 #include "../../../tensors/TensorKernels.h"
+#include "../../../interfaces/IWorkspaceConsumer.h"
 #include "../../../backends/GPUDeviceContextPool.h"
 #include "../../../utils/Logger.h"
 
@@ -58,9 +59,13 @@ extern "C"
 namespace llaminar2
 {
 
-    class CUDAGatedDeltaNet : public ITensorGatedDeltaNet
+    class CUDAGatedDeltaNet : public ITensorGatedDeltaNet, public IWorkspaceConsumer
     {
     public:
+        /// Well-known workspace buffer names for GDN
+        static constexpr const char* WS_GDN_STATE = "gdn_state";
+        static constexpr const char* WS_GDN_DEINTERLEAVE = "gdn_deinterleave_scratch";
+
         explicit CUDAGatedDeltaNet(int device_ordinal)
             : device_ordinal_(device_ordinal) {}
 
@@ -191,6 +196,34 @@ namespace llaminar2
                 device_ordinal_, stream_);
         }
 
+        // =====================================================================
+        // IWorkspaceConsumer Interface
+        // =====================================================================
+
+        WorkspaceRequirements getWorkspaceRequirements(int m, int n = 0, int k = 0) const override
+        {
+            WorkspaceRequirements reqs;
+            // State buffer: n_heads * d_k * d_v floats (use state_size_ if known, else estimate from m,n,k)
+            size_t state_bytes = (state_size_ > 0)
+                ? static_cast<size_t>(state_size_) * sizeof(float)
+                : static_cast<size_t>(m) * static_cast<size_t>(n) * static_cast<size_t>(k) * sizeof(float);
+            if (state_bytes > 0)
+                reqs.buffers.push_back({WS_GDN_STATE, state_bytes, 256, true});
+
+            // Deinterleave scratch: estimate based on typical usage (3 × seq × heads × head_dim)
+            size_t scratch_bytes = (deinterleave_scratch_size_ > 0)
+                ? deinterleave_scratch_size_ * sizeof(float)
+                : static_cast<size_t>(m) * 3 * sizeof(float);  // Conservative estimate
+            if (scratch_bytes > 0)
+                reqs.buffers.push_back({WS_GDN_DEINTERLEAVE, scratch_bytes, 256, false});
+
+            return reqs;
+        }
+
+        void bindWorkspace(DeviceWorkspaceManager *workspace) override { workspace_ = workspace; }
+        bool hasWorkspace() const override { return workspace_ != nullptr; }
+        DeviceWorkspaceManager *getWorkspace() const override { return workspace_; }
+
     private:
         int device_ordinal_;
         void *stream_ = nullptr;
@@ -198,6 +231,7 @@ namespace llaminar2
         int state_size_ = 0;
         float *deinterleave_scratch_ = nullptr;
         size_t deinterleave_scratch_size_ = 0;
+        DeviceWorkspaceManager *workspace_ = nullptr;
     };
 
 } // namespace llaminar2

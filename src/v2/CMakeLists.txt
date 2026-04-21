@@ -218,9 +218,6 @@ if(HAVE_CUDA)
         kernels/cuda/gemm/CUDANativeVNNIIQTables.cu    # shared IQ lookup table symbol definitions for native-vnni decode
         kernels/cuda/gemm/CUDANativeVNNIGemvTuned.cu  # tuned shape-specific native-vnni GEMV (Wide/KPar/Direct)
         kernels/cuda/gemm/CUDANativeVNNIPrefillKernels.cu  # custom native-vnni prefill GEMM family (Q4_0 first)
-        kernels/cuda/gemm/CUDAFusedTCGemm_Turing.cu       # fused tensor-core GEMM: single-launch WMMA over full K (sm_75+)
-        kernels/cuda/gemm/CUDAFusedTCGemm_Ampere.cu        # fused TC GEMM: mma.sync m16n8k32 (sm_80+ Ampere)
-        kernels/cuda/gemm/CUDADecomposedTCGemm.cu         # decomposed tensor-core GEMM fallback (SmallM, WideN, Balanced)
         kernels/cuda/gemm/CUDAcuBLASQuantGemm.cu          # cuBLAS FP16 GEMM path for quantized weights (env: LLAMINAR_CUBLAS_GEMM=1)
         # Ops kernels (split from monolithic CUDAOpsKernels.cu)
         kernels/cuda/ops/CUDARMSNormKernels.cu        # RMSNorm kernels (FP32, BF16, FP16)
@@ -1227,6 +1224,14 @@ add_library(llaminar2_core STATIC
     execution/mpi_orchestration/PlacementPlan.cpp
     execution/mpi_orchestration/PlacementStrategy.cpp
     execution/mpi_orchestration/placement/HeterogeneousMultiDomainStrategy.cpp
+    # Memory planning (pre-flight VRAM/RAM budget estimation)
+    planning/ClusterInventoryGatherer.cpp
+    planning/ModelMemoryProfile.cpp
+    planning/WeightMemoryEstimator.cpp
+    planning/KVCacheMemoryEstimator.cpp
+    planning/ActivationMemoryEstimator.cpp
+    planning/WorkspaceMemoryEstimator.cpp
+    planning/MemoryPlanner.cpp
     # Execution plan builder (Phase 1 - Plan-to-Graph translation)
     execution/mpi_orchestration/ExecutionPlanBuilder.cpp
     # Pipeline parallel graph builder (Phase 3 - PP stage insertion)

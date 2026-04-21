@@ -247,6 +247,31 @@ namespace llaminar2
         return dynamic_cast<IWorkspaceConsumer *>(gemm);
     }
 
+    WorkspaceRequirements GDNProjectionStage::getWorkspaceRequirements(int m, int n, int k) const
+    {
+        // Must merge requirements from ALL 4 GEMM kernels, not just QKV.
+        // Each ROCm kernel has a unique slice_id_ generating per-instance buffer
+        // names (e.g., gemm_temp_a_fp32_<id>). Reporting only QKV's requirements
+        // leaves the Z, A, B kernels' buffers unallocated.
+        auto *self = const_cast<GDNProjectionStage *>(this);
+
+        WorkspaceRequirements combined;
+        auto mergeFrom = [&](const ITensor *weight, ITensorGemm *&cached, const char *name)
+        {
+            auto *gemm = self->resolveGemm(weight, cached, name);
+            if (auto *consumer = dynamic_cast<IWorkspaceConsumer *>(gemm))
+            {
+                combined.merge(consumer->getWorkspaceRequirements(m, n, k));
+            }
+        };
+
+        mergeFrom(self->params_.w_qkv, self->params_.gemm_qkv, "w_qkv");
+        mergeFrom(self->params_.w_z, self->params_.gemm_z, "w_z");
+        mergeFrom(self->params_.w_a, self->params_.gemm_a, "w_a");
+        mergeFrom(self->params_.w_b, self->params_.gemm_b, "w_b");
+        return combined;
+    }
+
     void GDNProjectionStage::bindWorkspace(DeviceWorkspaceManager *workspace)
     {
         // Resolve all 4 GEMM kernels and bind workspace to each

@@ -71,7 +71,7 @@ echo -e "${YELLOW}[3/8] Running Qwen2 SingleDevice parity tests (prefill + decod
 echo ""
 
 set +e
-ctest --test-dir "$BUILD_V2_INTEGRATION" -R "^V2_Integration_Parity_Qwen2_SingleDevice$" --output-on-failure --timeout 600
+ctest --test-dir "$BUILD_V2_INTEGRATION" -R "^V2_Integration_Parity_Qwen2_SingleDevice" --no-tests=error --output-on-failure --timeout 600
 PARITY_EXIT_CODE=$?
 set -e
 
@@ -93,14 +93,13 @@ echo ""
 # Step 4: Run Qwen35 SingleDevice Parity Tests (prefill + decode)
 # Validates Qwen3.5 hybrid GDN/FA architecture: GatedDeltaNet recurrence,
 # short convolution, Q-gate split, partial RoPE, and sigmoid output gate.
-# GPU configs are automatically skipped (CPU-only kernels).
-# NOTE: 4B model decode parity is excluded (known pre-existing failure due to
-# different GGUF weight naming conventions in the 4B checkpoint).
+# NOTE: 4B ROCm tests are excluded — known pre-existing workspace OOM on MI60
+# (4B model needs ~34GB workspace, MI60 budget is 4GB).
 echo -e "${YELLOW}[4/8] Running Qwen35 SingleDevice parity tests (prefill + decode)...${NC}"
 echo ""
 
 set +e
-GTEST_FILTER="*08B*" ctest --test-dir "$BUILD_V2_INTEGRATION" -R "^V2_Integration_Parity_Qwen35_SingleDevice$" --output-on-failure --timeout 600
+ctest --test-dir "$BUILD_V2_INTEGRATION" -R "^V2_Integration_Parity_Qwen35_SingleDevice" -E "Qwen35_4B_ROCm" --no-tests=error --output-on-failure --timeout 600
 QWEN35_PARITY_EXIT_CODE=$?
 set -e
 
@@ -126,7 +125,7 @@ echo -e "${YELLOW}[5/8] Running Qwen2 NodeLocalTP parity tests...${NC}"
 echo ""
 
 set +e
-ctest --test-dir "$BUILD_V2_INTEGRATION" -R "^V2_Integration_Parity_NodeLocalTP$" --output-on-failure --timeout 600
+ctest --test-dir "$BUILD_V2_INTEGRATION" -R "^V2_Integration_Parity_NodeLocalTP" --no-tests=error --output-on-failure --timeout 600
 QWEN2_NLTP_EXIT_CODE=$?
 set -e
 
@@ -148,11 +147,12 @@ echo ""
 # Step 6: Run Qwen35 NodeLocalTP Parity Tests (multi-device TP)
 # Validates Qwen3.5 GDN/FA hybrid architecture under tensor parallelism:
 # FusedQKV 3-sub-block sharding, tied embedding LM head, GDN weight distribution.
+# NOTE: 4B ROCm tests excluded (same workspace OOM issue as step 4).
 echo -e "${YELLOW}[6/8] Running Qwen35 NodeLocalTP parity tests...${NC}"
 echo ""
 
 set +e
-GTEST_FILTER="*08B*" ctest --test-dir "$BUILD_V2_INTEGRATION" -R "^V2_Integration_Parity_Qwen35_NodeLocalTP$" --output-on-failure --timeout 600
+ctest --test-dir "$BUILD_V2_INTEGRATION" -R "^V2_Integration_Parity_Qwen35_NodeLocalTP" -E "Qwen35_4B_ROCm" --no-tests=error --output-on-failure --timeout 600
 QWEN35_NLTP_EXIT_CODE=$?
 set -e
 

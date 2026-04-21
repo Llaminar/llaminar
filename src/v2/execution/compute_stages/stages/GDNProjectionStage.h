@@ -94,6 +94,7 @@ namespace llaminar2
 
         // IWorkspaceConsumerStage - multi-kernel pattern (4 GEMM kernels)
         IWorkspaceConsumer *getKernelAsWorkspaceConsumer() override;
+        WorkspaceRequirements getWorkspaceRequirements(int m, int n = 0, int k = 0) const override;
         void bindWorkspace(DeviceWorkspaceManager *workspace) override;
         void unbindWorkspace() override;
 

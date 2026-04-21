@@ -65,15 +65,6 @@ namespace llaminar2
         {
             bool cudaNativeVNNIPrefill_getDeterministicMode();
 
-            // Upload converted INT8 weights to device
-            bool cudaQuantGemm_uploadWeights(
-                const int8_t *h_weights_int8, // [K x N] ColumnMajor
-                const float *h_scales_B,      // [N] per-column scales
-                int8_t **d_weights_int8,      // Output device pointer
-                float **d_scales_B,           // Output device pointer
-                int K, int N,
-                int cuda_device_id);
-
             // Upload work buffers for activation quantization
             bool cudaQuantGemm_ensureWorkBuffers(
                 int8_t **d_A_int8,   // [M x K] quantized activations
@@ -83,64 +74,12 @@ namespace llaminar2
                 int M, int K, int N,
                 int cuda_device_id);
 
-            // Execute CUTLASS INT8 GEMM
-            bool cudaQuantGemm_execute(
-                const int8_t *d_A_int8,       // [M x K] RowMajor
-                const int8_t *d_weights_int8, // [K x N] ColumnMajor
-                int32_t *d_C_int32,           // [M x N] RowMajor
-                int M, int N, int K,
-                int cuda_device_id,
-                void *stream = nullptr);
-
-            // Apply output scaling: C_fp32 = C_int32 * scales_A * scales_B + bias
-            bool cudaQuantGemm_applyScaling(
-                const int32_t *d_C_int32, // [M x N]
-                float *d_C_fp32,          // [M x N] output
-                const float *d_scales_A,  // [M]
-                const float *d_scales_B,  // [N]
-                int M, int N,
-                float alpha, float beta,
-                const float *d_C_existing, // For beta != 0
-                const float *d_bias,       // [N] optional bias
-                int cuda_device_id,
-                void *stream = nullptr);
-
-            // Quantize FP32 activations to INT8
-            bool cudaQuantGemm_quantizeActivations(
-                const float *d_A_fp32, // [M x K]
-                int8_t *d_A_int8,      // [M x K] output
-                float *d_scales_A,     // [M] output
-                int M, int K,
-                int cuda_device_id,
-                void *stream = nullptr);
-
             // Quantize FP32 activations to INT8 with per-block-of-32 scales
             bool cudaQuantGemm_quantizeActivationsBlockwise(
                 const float *d_A_fp32,       // [M x K]
                 int8_t *d_A_int8,            // [M x K] output
                 float *d_scales_A_blockwise, // [M x (K/32)] output
                 int M, int K,
-                int cuda_device_id,
-                void *stream = nullptr);
-
-            // Execute blockwise INT8 GEMM with dp4a and FP32 accumulation
-            bool cudaQuantGemm_blockwiseGemm(
-                const int8_t *d_A_int8,            // [M x K] row-major
-                const int8_t *d_weights_int8,      // [K x N] col-major
-                float *d_C_fp32,                   // [M x N] output
-                const float *d_scales_A_blockwise, // [M x (K/32)]
-                const float *d_scales_B,           // [N]
-                int M, int N, int K,
-                float alpha, float beta,
-                const float *d_C_existing,
-                const float *d_bias,
-                int cuda_device_id,
-                void *stream = nullptr);
-
-            bool cudaQuantGemm_prepareTensorCoreBlockedWeights(
-                const int8_t *d_weights_int8,
-                int8_t **d_weights_int8_tc_blocked,
-                int K, int N,
                 int cuda_device_id,
                 void *stream = nullptr);
 
@@ -223,64 +162,6 @@ namespace llaminar2
                 int cuda_device_id,
                 void *stream,
                 CUDAPrefillContext *prefill_ctx);
-
-            // -----------------------------------------------------------------
-            // V2 Fused tensor-core GEMM (CUDAFusedTCGemm_Ampere.cu)
-            // mma.sync.m16n8k32 Ampere kernel. Returns false on sm_75.
-            // -----------------------------------------------------------------
-            bool cudaFusedTCGemmV2_blockwiseGemm(
-                const int8_t *d_A_int8,
-                const int8_t *d_B_int8_tc_blocked,
-                int32_t *d_partial_int32,
-                float *d_C_fp32,
-                const float *d_scales_A_block,
-                const float *d_scales_B,
-                int M, int N, int K,
-                float alpha, float beta,
-                const float *d_C_existing,
-                const float *d_bias,
-                int cuda_device_id,
-                void *stream);
-
-            // -----------------------------------------------------------------
-            // V1 Fused tensor-core GEMM (CUDAFusedTCGemm_Turing.cu)
-            // Single-launch WMMA kernel, processes full K in-register.
-            // Requires sm_75+. Returns false on older architectures.
-            // -----------------------------------------------------------------
-            bool cudaFusedTCGemm_blockwiseGemm(
-                const int8_t *d_A_int8,
-                const int8_t *d_B_int8_tc_blocked,
-                int32_t *d_partial_int32,
-                float *d_C_fp32,
-                const float *d_scales_A_block,
-                const float *d_scales_B,
-                int M, int N, int K,
-                float alpha, float beta,
-                const float *d_C_existing,
-                const float *d_bias,
-                int cuda_device_id,
-                void *stream);
-
-            // -----------------------------------------------------------------
-            // Per-shape tensor-core GEMM kernel family (CUTLASS-based)
-            // (CUDADecomposedTCGemm.cu) — fallback for sm_75 or
-            // shapes not yet covered by the fused path.
-            // -----------------------------------------------------------------
-            void cudaTCGemm_setTuningOverrides(int force_v3, int force_v7, int mt, int kt, int splitk);
-
-            bool cudaTCGemm_blockwiseGemm(
-                const int8_t *d_A_int8,
-                const int8_t *d_B_int8_tc_blocked,
-                int32_t *d_partial_int32,
-                float *d_C_fp32,
-                const float *d_scales_A_block,
-                const float *d_scales_B,
-                int M, int N, int K,
-                float alpha, float beta,
-                const float *d_C_existing,
-                const float *d_bias,
-                int cuda_device_id,
-                void *stream);
 
             // cuBLAS FP16 GEMM for Q4_0 native VNNI weights (CUDAcuBLASQuantGemm.cu)
             bool cudaCuBLAS_fp16_gemm_q40(
@@ -396,9 +277,6 @@ namespace llaminar2
         struct CUDAQuantisedGemmKernel::Impl
         {
             // Device memory for converted weights (only used when owns_weight_memory_ = true)
-            int8_t *d_weights_int8 = nullptr;            // [K x N] ColumnMajor
-            float *d_scales_B = nullptr;                 // [N] per-column scales
-            int8_t *d_weights_int8_tc_blocked = nullptr; // [K/32][N][32] tensor-core layout
             uint8_t *d_weights_native_vnni = nullptr;
             uint16_t *d_weights_native_scales = nullptr;
             uint16_t *d_weights_native_mins = nullptr;
@@ -419,22 +297,10 @@ namespace llaminar2
 
             // Flag to track if we own weight memory
             bool owns_weight_memory = false;
-            bool owns_tc_blocked_weight_memory = false;
 
             ~Impl()
             {
                 // Only free weight memory if we own it (not from CUDAPackedWeights cache)
-                if (owns_weight_memory)
-                {
-                    if (d_weights_int8)
-                        cudaQuantGemm_freeDevice(d_weights_int8);
-                    if (d_scales_B)
-                        cudaQuantGemm_freeDevice(d_scales_B);
-                }
-                if (owns_tc_blocked_weight_memory && d_weights_int8_tc_blocked)
-                {
-                    cudaQuantGemm_freeDevice(d_weights_int8_tc_blocked);
-                }
                 if (owns_weight_memory)
                 {
                     if (d_weights_native_vnni)
@@ -468,36 +334,6 @@ namespace llaminar2
 
         namespace
         {
-            thread_local bool g_native_vnni_enabled = true;
-            thread_local bool g_force_cutlass_fallback = false;
-            constexpr int kTensorCoreBlockwiseMaxPartialChunkBlocks = 8;
-            constexpr size_t kTensorCoreBlockwisePartialScratchBudgetBytes = 256ull * 1024ull * 1024ull;
-
-            size_t getTensorCorePartialChunkBlocksForWorkspace(int m, int n, int k)
-            {
-                const int num_k_blocks = (k > 0) ? (k / 32) : 0;
-                if (num_k_blocks <= 1)
-                    return 1;
-
-                const size_t partial_plane_bytes = static_cast<size_t>(m) * static_cast<size_t>(n) * sizeof(int32_t);
-                const int budget_limited_chunk_count = (partial_plane_bytes == 0)
-                                                           ? 1
-                                                           : static_cast<int>(kTensorCoreBlockwisePartialScratchBudgetBytes / partial_plane_bytes);
-                const size_t max_chunk_count = static_cast<size_t>(std::max(1, std::min(kTensorCoreBlockwiseMaxPartialChunkBlocks, budget_limited_chunk_count)));
-                const int deepk_grid_blocks = ((m + 64 - 1) / 64) * ((n + 128 - 1) / 128);
-                const int balanced_grid_blocks = ((m + 128 - 1) / 128) * ((n + 128 - 1) / 128);
-                const int effective_grid_blocks = std::min(deepk_grid_blocks, balanced_grid_blocks);
-                const bool k_rich = k > 2 * n;
-                const bool recover_underfill = effective_grid_blocks < 64;
-                const uint64_t total_output_elements = static_cast<uint64_t>(m) * static_cast<uint64_t>(n);
-                if (num_k_blocks >= 64 && (k_rich || recover_underfill))
-                    return std::min(static_cast<size_t>(num_k_blocks), max_chunk_count);
-                if (m >= 64 || n >= 16384 || total_output_elements >= (1ull << 20))
-                    return std::min(static_cast<size_t>(num_k_blocks), max_chunk_count);
-                if (total_output_elements >= (1ull << 18))
-                    return std::min(static_cast<size_t>(4), max_chunk_count);
-                return 1;
-            }
 
             template <typename T>
             bool uploadHostArrayToDevice(
@@ -556,51 +392,28 @@ namespace llaminar2
             }
 
             bool runSelectedBlockwiseBackend(
-                const int8_t *d_A_int8,
-                const int8_t *d_weights_int8,
-                const int8_t *d_weights_int8_tc_blocked,
-                int32_t *d_partial_int32,
-                float *d_C_fp32,
-                const float *d_scales_A_blockwise,
-                const float *d_scales_B,
-                int m, int n, int k,
-                float alpha, float beta,
-                const float *d_C_existing,
-                const float *d_bias,
-                int cuda_device_id,
-                void *stream)
+                const int8_t * /*d_A_int8*/,
+                const int8_t * /*d_weights_int8*/,
+                const int8_t * /*d_weights_int8_tc_blocked*/,
+                int32_t * /*d_partial_int32*/,
+                float * /*d_C_fp32*/,
+                const float * /*d_scales_A_blockwise*/,
+                const float * /*d_scales_B*/,
+                int /*m*/, int /*n*/, int /*k*/,
+                float /*alpha*/, float /*beta*/,
+                const float * /*d_C_existing*/,
+                const float * /*d_bias*/,
+                int /*cuda_device_id*/,
+                void * /*stream*/)
             {
-                // Guard: NativeVNNI-only mode skips INT8 expanded weight upload,
-                // so d_weights_int8 and d_scales_B are null.  Return false to
-                // let the caller report the error instead of crashing inside
-                // the blockwise kernel with a null-pointer dereference.
-                if (!d_weights_int8 || !d_scales_B)
-                {
-                    LOG_WARN("[CUDAQuantisedGemmKernel] Blockwise fallback skipped: "
-                             "d_weights_int8="
-                             << static_cast<const void *>(d_weights_int8)
-                             << " d_scales_B=" << static_cast<const void *>(d_scales_B)
-                             << " (NativeVNNI-only mode?)");
-                    return false;
-                }
-                return cudaQuantGemm_blockwiseGemm(
-                    d_A_int8,
-                    d_weights_int8,
-                    d_C_fp32,
-                    d_scales_A_blockwise,
-                    d_scales_B,
-                    m, n, k,
-                    alpha, beta,
-                    d_C_existing,
-                    d_bias,
-                    cuda_device_id,
-                    stream);
+                // TC/CUTLASS fallback paths have been removed.
+                // NativeVNNI is the only CUDA GEMM path.
+                LOG_ERROR("[CUDAQuantisedGemmKernel] Blockwise TC/CUTLASS fallback called but has been removed. "
+                          "NativeVNNI is now the only CUDA GEMM path.");
+                return false;
             }
 
-            // Returns true if a codebook has native VNNI tensor-core prefill support.
-            // Single-scale: 0 (Q4_0), 4 (IQ4_NL), 6 (Q5_0), 11 (IQ3_S), 12 (IQ3_XXS), 15 (IQ2_XXS)
-            // Asymmetric:   5 (Q4_1/Q4_K/Q5_K), 7 (Q5_1), 16 (IQ1_S)
-            // Dual-scale:   8 (Q6_K), 9 (Q3_K), 10 (Q2_K), 13 (IQ2_S), 14 (IQ2_XS), 17 (IQ1_M)
+            // Returns true if a codebook has native VNNI prefill support.
             bool nativeVNNIPrefillSupportsCodebook(uint8_t cb)
             {
                 switch (cb)
@@ -627,36 +440,9 @@ namespace llaminar2
                 }
             }
 
-            // Returns true only for codebooks where the NativeVNNI prefill path
-            // succeeds unconditionally (no profitability gate).  Dual-scale
-            // codebooks (8,9,10,13,14,17) have a runtime profitability check
-            // that can reject large-M or K-poor shapes, so the expanded weight
-            // fallback must remain available for those.
-            bool nativeVNNIPrefillAlwaysSucceeds(uint8_t cb)
-            {
-                switch (cb)
-                {
-                case 0:  // Q4_0
-                case 4:  // IQ4_NL
-                case 5:  // Q4_1 / Q4_K / Q5_K
-                case 6:  // Q5_0
-                case 7:  // Q5_1
-                case 11: // IQ3_S
-                case 12: // IQ3_XXS
-                case 15: // IQ2_XXS
-                case 16: // IQ1_S
-                case 19: // Q8_0
-                    return true;
-                default:
-                    return false; // dual-scale: 8,9,10,13,14,17
-                }
-            }
-
             template <typename ImplT>
             bool canUseNativeVNNIBlockwise(const ImplT *impl, int m, int k)
             {
-                if (!g_native_vnni_enabled || g_force_cutlass_fallback)
-                    return false;
                 return impl &&
                        m > 0 &&
                        k > 0 &&
@@ -665,8 +451,7 @@ namespace llaminar2
                        impl->d_weights_native_scales &&
                        (m == 1
                             ? cudaNativeVNNIGemvTuned_supportsCodebook(impl->native_codebook_id)
-                            : (nativeVNNIPrefillSupportsCodebook(impl->native_codebook_id) ||
-                               (impl->d_weights_int8_tc_blocked && impl->d_scales_B)));
+                            : nativeVNNIPrefillSupportsCodebook(impl->native_codebook_id));
             }
 
             template <typename ImplT>
@@ -713,8 +498,7 @@ namespace llaminar2
                     }
                 }
 
-                if (g_native_vnni_enabled &&
-                    impl->d_weights_native_vnni &&
+                if (impl->d_weights_native_vnni &&
                     impl->d_weights_native_scales &&
                     m == 1)
                 {
@@ -746,8 +530,7 @@ namespace llaminar2
                 }
 
                 // Unified native VNNI prefill for all supported codebooks
-                if (g_native_vnni_enabled &&
-                    impl->d_weights_native_vnni &&
+                if (impl->d_weights_native_vnni &&
                     impl->d_weights_native_scales &&
                     nativeVNNIPrefillSupportsCodebook(impl->native_codebook_id))
                 {
@@ -779,100 +562,25 @@ namespace llaminar2
                         return true;
                     }
 
-                    LOG_WARN("[CUDAQuantisedGemmKernel] NativeVNNI prefill kernel failed for codebook "
+                    LOG_ERROR("[CUDAQuantisedGemmKernel] NativeVNNI prefill kernel failed for codebook "
                              << static_cast<int>(impl->native_codebook_id)
-                             << ", falling back to tensor-core expanded path");
-                }
-
-                if (!g_force_cutlass_fallback && impl->d_weights_int8_tc_blocked && impl->d_scales_B)
-                {
-                    // Try V2 fused TC GEMM first (mma.sync m16n8k32, sm_80+)
-                    if (cudaFusedTCGemmV2_blockwiseGemm(
-                            d_A_int8,
-                            impl->d_weights_int8_tc_blocked,
-                            d_partial_int32,
-                            d_C_fp32,
-                            d_scales_A_blockwise,
-                            impl->d_scales_B,
-                            m, n, k,
-                            alpha, beta,
-                            d_C_existing,
-                            d_bias,
-                            cuda_device_id,
-                            stream))
-                    {
-                        static std::once_flag fused_tc_v2_once;
-                        std::call_once(fused_tc_v2_once, []()
-                                       { LOG_INFO("[CUDAQuantisedGemmKernel] Fused tensor-core GEMM V2 prefill active (mma.sync m16n8k32)"); });
-                        return true;
-                    }
-
-                    // Try V1 fused TC GEMM (WMMA m16n16k16, sm_75+)
-                    if (cudaFusedTCGemm_blockwiseGemm(
-                            d_A_int8,
-                            impl->d_weights_int8_tc_blocked,
-                            d_partial_int32,
-                            d_C_fp32,
-                            d_scales_A_blockwise,
-                            impl->d_scales_B,
-                            m, n, k,
-                            alpha, beta,
-                            d_C_existing,
-                            d_bias,
-                            cuda_device_id,
-                            stream))
-                    {
-                        static std::once_flag fused_tc_once;
-                        std::call_once(fused_tc_once, []()
-                                       { LOG_INFO("[CUDAQuantisedGemmKernel] Fused tensor-core GEMM V1 prefill active (WMMA m16n16k16)"); });
-                        return true;
-                    }
-
-                    // Do not use the CUTLASS decomposed TC fallback here.
-                    // The caller will fall back to our in-tree blockwise kernel
-                    // instead, which keeps the blockwise prefill path on one
-                    // dispatch stack for this investigation.
-                    if (d_partial_int32)
-                    {
-                        static std::once_flag cutlass_tc_disabled_once;
-                        std::call_once(cutlass_tc_disabled_once, []()
-                                       { LOG_INFO("[CUDAQuantisedGemmKernel] CUTLASS tensor-core GEMM prefill fallback disabled; using in-tree blockwise fallback instead"); });
-                    }
+                             << " (no fallback available — TC/CUTLASS paths have been removed)");
                 }
 
                 return false;
             }
         }
 
-        void CUDAQuantisedGemmKernel::setNativeVNNIEnabled(bool enabled)
-        {
-            g_native_vnni_enabled = enabled;
-        }
-
-        bool CUDAQuantisedGemmKernel::isNativeVNNIEnabled()
-        {
-            return g_native_vnni_enabled;
-        }
-
-        void CUDAQuantisedGemmKernel::setForceCutlassFallback(bool enabled)
-        {
-            g_force_cutlass_fallback = enabled;
-        }
-
-        bool CUDAQuantisedGemmKernel::isForceCutlassFallback()
-        {
-            return g_force_cutlass_fallback;
-        }
+        // Static method stubs kept for ABI compatibility but are no-ops.
+        // NativeVNNI is now always enabled; CUTLASS fallback no longer exists.
+        void CUDAQuantisedGemmKernel::setNativeVNNIEnabled(bool /*enabled*/) {}
+        bool CUDAQuantisedGemmKernel::isNativeVNNIEnabled() { return true; }
+        void CUDAQuantisedGemmKernel::setForceCutlassFallback(bool /*enabled*/) {}
+        bool CUDAQuantisedGemmKernel::isForceCutlassFallback() { return false; }
 
         // =====================================================================
         // Constructor / Destructor
         // =====================================================================
-
-        // Per-process atomic counter that hands out a unique slice id to every
-        // CUDAQuantisedGemmKernel instance. Used to give each kernel its own
-        // TEMP_C_FP32 workspace slice so concurrent async D2D copies queued by
-        // different kernels cannot clobber each other.
-        static std::atomic<uint32_t> g_cuda_quant_gemm_slice_counter{0};
 
         CUDAQuantisedGemmKernel::CUDAQuantisedGemmKernel(const TensorBase *weights, int cuda_device_id)
             : weights_(weights),
@@ -884,7 +592,6 @@ namespace llaminar2
               owns_weight_memory_(true), // Legacy path owns weight memory
               impl_(std::make_unique<Impl>())
         {
-            slice_id_ = g_cuda_quant_gemm_slice_counter.fetch_add(1, std::memory_order_relaxed);
             if (!weights)
             {
                 throw std::runtime_error("[CUDAQuantisedGemmKernel] Null weight tensor");
@@ -942,7 +649,6 @@ namespace llaminar2
               owns_weight_memory_(false), // CUDAPackedWeights owns the memory
               impl_(std::make_unique<Impl>())
         {
-            slice_id_ = g_cuda_quant_gemm_slice_counter.fetch_add(1, std::memory_order_relaxed);
             if (!packed)
             {
                 throw std::runtime_error("[CUDAQuantisedGemmKernel] Null packed weights");
@@ -1010,7 +716,6 @@ namespace llaminar2
               owns_weight_memory_(other.owns_weight_memory_),
               impl_(std::move(other.impl_))
         {
-            slice_id_ = other.slice_id_;
             other.weights_ = nullptr;
             other.packed_ = nullptr;
             other.weights_converted_ = false;
@@ -1046,8 +751,8 @@ namespace llaminar2
         {
             LOG_DEBUG("[CUDAQuantisedGemmKernel::ensureWeightsConverted] Entry: N_=" << N_ << " K_=" << K_
                                                                                      << " weights_converted_=" << weights_converted_
-                                                                                     << " d_scales_B=" << (impl_ ? (void *)impl_->d_scales_B : nullptr)
-                                                                                     << " d_weights_int8=" << (impl_ ? (void *)impl_->d_weights_int8 : nullptr));
+                                                                                     << " d_native_vnni=" << (impl_ ? (void *)impl_->d_weights_native_vnni : nullptr)
+                                                                                     << " d_native_scales=" << (impl_ ? (void *)impl_->d_weights_native_scales : nullptr));
             if (weights_converted_)
             {
                 return;
@@ -1063,74 +768,16 @@ namespace llaminar2
                 {
                     CUDAPackedWeights::DeviceUpload upload;
 
-                    // Check if NativeVNNI alone covers both decode (GEMV) and
-                    // prefill (GEMM) for this codebook on this device.  When it
-                    // does, uploading the INT8 expanded + TC-blocked weights is
-                    // pure VRAM waste (~3× the quantised weight size).  For a 7B
-                    // model this saves ~13 GB of device memory.
-                    const bool vnni_only =
-                        packed_->active_family == CUDAPackedWeightFamily::NativeVNNI &&
-                        !packed_->native_vnni.empty() &&
-                        g_native_vnni_enabled &&
-                        !g_force_cutlass_fallback &&
-                        (packed_->K % 32) == 0 &&
-                        cudaNativeVNNIGemvTuned_supportsCodebook(packed_->native_codebook_id) &&
-                        nativeVNNIPrefillAlwaysSucceeds(packed_->native_codebook_id) &&
-                        [&]()
-                    {
-                        cudaDeviceProp prop;
-                        return cudaGetDeviceProperties(&prop, cuda_device_id_) == cudaSuccess &&
-                               prop.major >= 8; // Ampere+ required for NativeVNNI prefill
-                    }();
-
-                    if (vnni_only)
-                    {
-                        static std::once_flag vnni_only_once;
-                        std::call_once(vnni_only_once, [&]()
-                                       { LOG_INFO("[CUDAQuantisedGemmKernel] NativeVNNI-only mode: skipping INT8 expanded + TC-blocked upload (codebook "
-                                                  << static_cast<int>(packed_->native_codebook_id) << ")"); });
-                    }
-                    else
-                    {
-                        LOG_DEBUG("[CUDAQuantisedGemmKernel::ensureWeightsConverted] Uploading packed weights to CUDA:"
-                                  << cuda_device_id_ << " K=" << packed_->K << " N=" << packed_->N);
-                        if (!cudaQuantGemm_uploadWeights(
-                                packed_->int8_data.data(),
-                                packed_->scales.data(),
-                                &upload.d_int8_data,
-                                &upload.d_scales,
-                                packed_->K,
-                                packed_->N,
-                                cuda_device_id_))
-                        {
-                            if (upload.d_int8_data)
-                                cudaQuantGemm_freeDevice(upload.d_int8_data);
-                            if (upload.d_scales)
-                                cudaQuantGemm_freeDevice(upload.d_scales);
-                            throw std::runtime_error("[CUDAQuantisedGemmKernel] Failed to upload pre-packed weights");
-                        }
-                    }
+                    // NativeVNNI is the only CUDA GEMM path.
+                    // No Int8Expanded or TC-blocked weights are uploaded.
+                    static std::once_flag vnni_only_once;
+                    std::call_once(vnni_only_once, [&]()
+                                   { LOG_INFO("[CUDAQuantisedGemmKernel] NativeVNNI-only mode (codebook "
+                                              << static_cast<int>(packed_->native_codebook_id) << ")"); });
 
                     if (!uploadNativePackedWeights(*packed_, upload, cuda_device_id_))
                     {
-                        if (upload.d_int8_data)
-                            cudaQuantGemm_freeDevice(upload.d_int8_data);
-                        if (upload.d_scales)
-                            cudaQuantGemm_freeDevice(upload.d_scales);
                         throw std::runtime_error("[CUDAQuantisedGemmKernel] Failed to upload pre-packed native buffers");
-                    }
-
-                    if (!vnni_only && upload.d_int8_data)
-                    {
-                        if (!cudaQuantGemm_prepareTensorCoreBlockedWeights(
-                                upload.d_int8_data,
-                                &upload.d_int8_data_tc_blocked,
-                                packed_->K,
-                                packed_->N,
-                                cuda_device_id_))
-                        {
-                            LOG_WARN("[CUDAQuantisedGemmKernel] Failed to prepare tensor-core blocked weights; legacy blockwise path remains available");
-                        }
                     }
 
                     auto emplaced = packed_->device_uploads.emplace(cuda_device_id_, upload);
@@ -1138,9 +785,6 @@ namespace llaminar2
                 }
 
                 const auto &upload = upload_it->second;
-                packed_->d_int8_data = upload.d_int8_data;
-                packed_->d_scales = upload.d_scales;
-                packed_->d_int8_data_tc_blocked = upload.d_int8_data_tc_blocked;
                 packed_->d_native_vnni = upload.d_native_vnni;
                 packed_->d_native_scales = upload.d_native_scales;
                 packed_->d_native_mins = upload.d_native_mins;
@@ -1148,9 +792,6 @@ namespace llaminar2
                 packed_->cuda_device_id = cuda_device_id_;
                 packed_->uploaded = true;
 
-                impl_->d_weights_int8 = upload.d_int8_data;
-                impl_->d_scales_B = upload.d_scales;
-                impl_->d_weights_int8_tc_blocked = upload.d_int8_data_tc_blocked;
                 impl_->d_weights_native_vnni = upload.d_native_vnni;
                 impl_->d_weights_native_scales = upload.d_native_scales;
                 impl_->d_weights_native_mins = upload.d_native_mins;
@@ -1167,16 +808,10 @@ namespace llaminar2
                 if (packed_->device_uploads.size() <= 1)
                 {
                     const size_t freed_bytes =
-                        packed_->int8_data.capacity() +
-                        packed_->scales.capacity() * sizeof(float) +
                         packed_->native_vnni.capacity() +
                         packed_->native_scales.capacity() * sizeof(uint16_t) +
                         packed_->native_mins.capacity() * sizeof(uint16_t) +
                         packed_->native_emins.capacity() * sizeof(uint32_t);
-                    packed_->int8_data.clear();
-                    packed_->int8_data.shrink_to_fit();
-                    packed_->scales.clear();
-                    packed_->scales.shrink_to_fit();
                     packed_->native_vnni.clear();
                     packed_->native_vnni.shrink_to_fit();
                     packed_->native_scales.clear();
@@ -1229,42 +864,12 @@ namespace llaminar2
                     "[CUDAQuantisedGemmKernel] Failed to pack converted weights");
             }
 
-            // Upload to device
-            if (!cudaQuantGemm_uploadWeights(
-                    legacy_packed.int8_data.data(),
-                    legacy_packed.scales.data(),
-                    &impl_->d_weights_int8,
-                    &impl_->d_scales_B,
-                    static_cast<int>(K_),
-                    static_cast<int>(N_),
-                    cuda_device_id_))
-            {
-                throw std::runtime_error("[CUDAQuantisedGemmKernel] Failed to upload converted weights");
-            }
-
+            // Upload native VNNI weights to device (NativeVNNI-only, no Int8Expanded upload)
             if (!uploadNativePackedWeights(legacy_packed, legacy_packed.device_uploads[cuda_device_id_], cuda_device_id_))
             {
                 throw std::runtime_error("[CUDAQuantisedGemmKernel] Failed to upload converted native buffers");
             }
 
-            legacy_packed.device_uploads[cuda_device_id_].d_int8_data = impl_->d_weights_int8;
-            legacy_packed.device_uploads[cuda_device_id_].d_scales = impl_->d_scales_B;
-
-            if (cudaQuantGemm_prepareTensorCoreBlockedWeights(
-                    impl_->d_weights_int8,
-                    &impl_->d_weights_int8_tc_blocked,
-                    static_cast<int>(K_),
-                    static_cast<int>(N_),
-                    cuda_device_id_))
-            {
-                impl_->owns_tc_blocked_weight_memory = true;
-            }
-            else
-            {
-                LOG_WARN("[CUDAQuantisedGemmKernel] Failed to prepare tensor-core blocked weights in legacy path; legacy blockwise path remains available");
-            }
-
-            legacy_packed.device_uploads[cuda_device_id_].d_int8_data_tc_blocked = impl_->d_weights_int8_tc_blocked;
             impl_->d_weights_native_vnni = legacy_packed.device_uploads[cuda_device_id_].d_native_vnni;
             impl_->d_weights_native_scales = legacy_packed.device_uploads[cuda_device_id_].d_native_scales;
             impl_->d_weights_native_mins = legacy_packed.device_uploads[cuda_device_id_].d_native_mins;
@@ -1436,7 +1041,7 @@ namespace llaminar2
                 {
                     validateWorkspace();
                     d_mapped_output = d_C;
-                    d_C = static_cast<float *>(workspace_->getBuffer(tempCFp32BufferName()));
+                    d_C = static_cast<float *>(workspace_->getBuffer(GemmWorkspaceBuffers::TEMP_C_FP32));
                     static std::once_flag q8_mapped_once;
                     std::call_once(q8_mapped_once, [&]()
                                    { LOG_WARN("[CUDAQuantisedGemmKernel] Q8→FP32 MAPPED REDIRECT: M=" << m << " N=" << n
@@ -1473,7 +1078,7 @@ namespace llaminar2
                 {
                     validateWorkspace();
                     d_mapped_output = d_C;
-                    d_C = static_cast<float *>(workspace_->getBuffer(tempCFp32BufferName()));
+                    d_C = static_cast<float *>(workspace_->getBuffer(GemmWorkspaceBuffers::TEMP_C_FP32));
                     static std::once_flag fp32_mapped_once;
                     std::call_once(fp32_mapped_once, [&]()
                                    { LOG_WARN("[CUDAQuantisedGemmKernel] FP32→FP32 MAPPED REDIRECT: M=" << m << " N=" << n
@@ -1638,32 +1243,24 @@ namespace llaminar2
             // Use blockwise quantization for prefill and for decode when a native
             // payload GEMV path is available.
             const bool use_blockwise = (k % 32 == 0) && (m > 1 || canUseNativeVNNIBlockwise(impl_.get(), m, k));
-            float *d_scales_A = nullptr;
             float *d_scales_A_blockwise = nullptr;
 
-            if (use_blockwise)
+            if (!use_blockwise)
+            {
+                LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fused_tensor] K=" << k
+                          << " not divisible by 32; NativeVNNI requires K%32==0");
+                return false;
+            }
+
             {
                 d_scales_A_blockwise = static_cast<float *>(workspace_->getBuffer(GemmWorkspaceBuffers::SCALES_A_BLOCKWISE));
                 LOG_DEBUG("[CUDAQuantisedGemmKernel::multiply_fused_tensor] Blockwise quantizing activations once, m=" << m << " k=" << k);
 
-                // Step 3a: Blockwise quantize activations ONCE (shared across all projections)
+                // Blockwise quantize activations ONCE (shared across all projections)
                 if (!cudaQuantGemm_quantizeActivationsBlockwise(
                         d_input, d_A_int8, d_scales_A_blockwise, m, k, cuda_device_id_, gpu_stream_))
                 {
                     LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fused_tensor] Blockwise activation quantization failed");
-                    return false;
-                }
-            }
-            else
-            {
-                d_scales_A = static_cast<float *>(workspace_->getBuffer(GemmWorkspaceBuffers::SCALES_A));
-                LOG_DEBUG("[CUDAQuantisedGemmKernel::multiply_fused_tensor] Row-wise quantizing activations once, m=" << m << " k=" << k);
-
-                // Step 3b: Row-wise quantize activations ONCE (shared across all projections)
-                if (!cudaQuantGemm_quantizeActivations(
-                        d_input, d_A_int8, d_scales_A, m, k, cuda_device_id_, gpu_stream_))
-                {
-                    LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fused_tensor] Activation quantization failed");
                     return false;
                 }
             }
@@ -1772,19 +1369,6 @@ namespace llaminar2
                         d_A_int8, proj_d_C_int32, d_output, d_scales_A_blockwise,
                         m, n, k, 1.0f, 0.0f, nullptr, d_bias,
                         cuda_device_id_, pool.streams[stream_idx]);
-
-                    if (!proj_ok)
-                    {
-                        proj_ok = runSelectedBlockwiseBackend(
-                            d_A_int8,
-                            cuda_kernel->impl_->d_weights_int8,
-                            cuda_kernel->impl_->d_weights_int8_tc_blocked,
-                            proj_d_C_int32, d_output,
-                            d_scales_A_blockwise,
-                            cuda_kernel->impl_->d_scales_B,
-                            m, n, k, 1.0f, 0.0f, nullptr, d_bias,
-                            cuda_device_id_, pool.streams[stream_idx]);
-                    }
 
                     if (!proj_ok)
                     {
@@ -2042,57 +1626,11 @@ namespace llaminar2
                         continue;
                     }
 
-                    // Blockwise GEMM: produces final FP32 output directly (includes per-block scales, weight scales, bias)
-                    CUDA_KERNEL_PROFILE_SCOPE(CUDAKernelType::GEMM);
-                    if (!runSelectedBlockwiseBackend(
-                            d_A_int8,
-                            cuda_kernel->impl_->d_weights_int8,
-                            cuda_kernel->impl_->d_weights_int8_tc_blocked,
-                            proj_d_C_int32,
-                            d_output,
-                            d_scales_A_blockwise,
-                            cuda_kernel->impl_->d_scales_B,
-                            m, n, k,
-                            1.0f, 0.0f,
-                            nullptr,
-                            d_bias,
-                            cuda_device_id_, gpu_stream_))
-                    {
-                        LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fused_tensor] Blockwise GEMM failed for projection " << i);
-                        all_success = false;
-                        break;
-                    }
-                }
-                else
-                {
-                    // CUTLASS INT8 GEMM → INT32 accumulator, then separate scaling epilogue
-                    {
-                        CUDA_KERNEL_PROFILE_SCOPE(CUDAKernelType::GEMM);
-                        if (!cudaQuantGemm_execute(
-                                d_A_int8,                           // SHARED quantized activations (from this kernel's workspace)
-                                cuda_kernel->impl_->d_weights_int8, // This projection's weights
-                                proj_d_C_int32,                     // This projection's INT32 work buffer (from its workspace)
-                                m, n, k, cuda_device_id_, gpu_stream_))
-                        {
-                            LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fused_tensor] CUTLASS GEMM failed for projection " << i);
-                            all_success = false;
-                            break;
-                        }
-                    }
-
-                    // Apply scaling: output = int32_accum * scales_A * scales_B + bias
-                    // Note: Use the SHARED scales_A from the quantized activations (from this kernel's workspace)
-                    if (!cudaQuantGemm_applyScaling(
-                            proj_d_C_int32,                 // This projection's INT32 result
-                            d_output,                       // Output FP32
-                            d_scales_A,                     // SHARED activation scales (from this kernel's workspace)
-                            cuda_kernel->impl_->d_scales_B, // This projection's weight scales
-                            m, n, 1.0f, 0.0f, nullptr, d_bias, cuda_device_id_, gpu_stream_))
-                    {
-                        LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fused_tensor] Scaling failed for projection " << i);
-                        all_success = false;
-                        break;
-                    }
+                    // NativeVNNI is the only path — no TC/CUTLASS fallback.
+                    LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fused_tensor] NativeVNNI GEMM failed for projection " << i
+                              << " (no fallback available)");
+                    all_success = false;
+                    break;
                 }
 
 #ifdef LLAMINAR_DEBUG_GEMM_VALUES
@@ -2152,7 +1690,6 @@ namespace llaminar2
             ensureWeightsConverted();
 
             const bool use_blockwise =
-                !g_force_cutlass_fallback &&
                 (k % 32 == 0) &&
                 (m > 1 || canUseNativeVNNIBlockwise(impl_.get(), m, k));
 
@@ -2209,53 +1746,9 @@ namespace llaminar2
                     return true;
                 }
 
-                // Blockwise GEMM
-                int32_t *d_C_int32 = static_cast<int32_t *>(
-                    workspace_->getBuffer(GemmWorkspaceBuffers::ACC_INT32));
-                {
-                    CUDA_KERNEL_PROFILE_SCOPE(CUDAKernelType::GEMM);
-                    if (!runSelectedBlockwiseBackend(
-                            d_A_int8,
-                            impl_->d_weights_int8,
-                            impl_->d_weights_int8_tc_blocked,
-                            d_C_int32, d_C,
-                            d_scales_A_blockwise,
-                            impl_->d_scales_B,
-                            m, n, k, alpha, beta, d_C_existing, nullptr,
-                            cuda_device_id_, gpu_stream_))
-                    {
-                        LOG_ERROR("[CUDAQuantisedGemmKernel] Fused SwiGLU GEMM failed");
-                        return false;
-                    }
-                }
-
-                LOG_DEBUG("[CUDAQuantisedGemmKernel::multiply_with_fused_swiglu] Complete (blockwise)");
-
-                // Diagnostic: checksum FFN_DOWN output
-                if (debugEnv().gemm.cuda_fused_gemm_trace)
-                {
-                    cudaStreamSynchronize(static_cast<cudaStream_t>(gpu_stream_));
-                    const size_t total = static_cast<size_t>(m) * n;
-                    std::vector<float> host_all(total);
-                    cudaMemcpy(host_all.data(), d_C, total * sizeof(float),
-                               cudaMemcpyDeviceToHost);
-                    double sum = 0;
-                    float abs_max = 0;
-                    for (size_t ci = 0; ci < total; ++ci)
-                    {
-                        sum += static_cast<double>(host_all[ci]);
-                        float a = std::fabs(host_all[ci]);
-                        if (a > abs_max)
-                            abs_max = a;
-                    }
-                    LOG_WARN("[GEMM_SWIGLU] m=" << m << " n=" << n << " k=" << k
-                                                << " total=" << total
-                                                << " fullsum=" << std::fixed << std::setprecision(6) << sum
-                                                << " absmax=" << abs_max
-                                                << " first4=[" << host_all[0] << "," << host_all[1]
-                                                << "," << host_all[2] << "," << host_all[3] << "]");
-                }
-                return true;
+                // NativeVNNI is the only path — no TC/CUTLASS fallback.
+                LOG_ERROR("[CUDAQuantisedGemmKernel] Fused SwiGLU NativeVNNI GEMM failed (no fallback available)");
+                return false;
             }
 
             // Fallback: row-wise path (K not divisible by 32).
@@ -2352,7 +1845,6 @@ namespace llaminar2
             // Use blockwise quantization for prefill and for decode when a native
             // payload GEMV path is available.
             const bool use_blockwise =
-                !g_force_cutlass_fallback &&
                 (k % 32 == 0) &&
                 (m > 1 || canUseNativeVNNIBlockwise(impl_.get(), m, k));
 
@@ -2386,149 +1878,15 @@ namespace llaminar2
                     return true;
                 }
 
-                // NativeVNNI-only mode: no INT8 expanded weights, so blockwise
-                // fallback is impossible.  Return false immediately — the caller
-                // knows this codebook only supports NativeVNNI paths.
-                if (!impl_->d_weights_int8 && !impl_->d_scales_B)
-                {
-                    LOG_DEBUG("[CUDAQuantisedGemmKernel] NativeVNNI GEMV declined and no INT8 fallback (vnni-only mode)");
-                    return false;
-                }
-
-                // Step 2: Blockwise GEMM (produces FP32 directly, includes scaling)
-                {
-                    CUDA_KERNEL_PROFILE_SCOPE(CUDAKernelType::GEMM);
-                    if (!runSelectedBlockwiseBackend(
-                            d_A_int8,
-                            impl_->d_weights_int8,
-                            impl_->d_weights_int8_tc_blocked,
-                            d_C_int32,
-                            d_C,
-                            d_scales_A_blockwise,
-                            impl_->d_scales_B,
-                            m, n, k,
-                            alpha, beta,
-                            d_C_existing,
-                            nullptr,
-                            cuda_device_id_, gpu_stream_))
-                    {
-                        LOG_ERROR("[CUDAQuantisedGemmKernel] Blockwise GEMM failed");
-                        return false;
-                    }
-                }
-
-                LOG_DEBUG("[CUDAQuantisedGemmKernel::multiply_fp32_to_fp32] Complete (blockwise)");
-                return true;
-            }
-
-            // Row-wise CUTLASS path (fallback when K not divisible by 32)
-            float *d_scales_A = static_cast<float *>(workspace_->getBuffer(GemmWorkspaceBuffers::SCALES_A));
-
-#ifdef LLAMINAR_DEBUG_GEMM_VALUES
-            // Debug: Sample scales_B (weight scales) - EXPENSIVE, guarded by compile flag
-            LOG_DEBUG("[CUDAQuantisedGemmKernel::multiply_fp32_to_fp32] d_scales_B="
-                      << static_cast<const void *>(impl_->d_scales_B)
-                      << " d_weights_int8=" << static_cast<const void *>(impl_->d_weights_int8));
-            if (impl_->d_scales_B && n > 0)
-            {
-                std::vector<float> h_scales_B(std::min(n, 8));
-                cudaQuantGemm_copyDeviceToHost(h_scales_B.data(), impl_->d_scales_B, h_scales_B.size(), cuda_device_id_);
-                LOG_DEBUG("[CUDAQuantisedGemmKernel::multiply_fp32_to_fp32] scales_B[0:4]="
-                          << h_scales_B[0] << "," << (h_scales_B.size() > 1 ? h_scales_B[1] : 0.f) << ","
-                          << (h_scales_B.size() > 2 ? h_scales_B[2] : 0.f) << "," << (h_scales_B.size() > 3 ? h_scales_B[3] : 0.f));
-            }
-#endif
-
-            // Step 1: Quantize activations
-            if (!cudaQuantGemm_quantizeActivations(
-                    d_A, d_A_int8, d_scales_A, m, k, cuda_device_id_, gpu_stream_))
-            {
-                LOG_ERROR("[CUDAQuantisedGemmKernel] Activation quantization failed");
+                // NativeVNNI-only mode: no INT8 expanded fallback.
+                LOG_ERROR("[CUDAQuantisedGemmKernel] NativeVNNI GEMM failed (no fallback available)");
                 return false;
             }
 
-#ifdef LLAMINAR_DEBUG_GEMM_VALUES
-            // Debug: dump scales_A (activation row scales) - EXPENSIVE, guarded by compile flag
-            if (d_scales_A && m > 0)
-            {
-                std::vector<float> h_scales_A(std::min(m, 8));
-                cudaQuantGemm_copyDeviceToHost(h_scales_A.data(), d_scales_A, h_scales_A.size(), cuda_device_id_);
-                LOG_DEBUG("[CUDAQuantisedGemmKernel::multiply_fp32_to_fp32] scales_A[0:4]="
-                          << h_scales_A[0] << "," << (h_scales_A.size() > 1 ? h_scales_A[1] : 0.f) << ","
-                          << (h_scales_A.size() > 2 ? h_scales_A[2] : 0.f) << "," << (h_scales_A.size() > 3 ? h_scales_A[3] : 0.f));
-            }
-#endif
-
-            // Step 2: Execute CUTLASS INT8 GEMM
-            {
-                CUDA_KERNEL_PROFILE_SCOPE(CUDAKernelType::GEMM);
-                if (!cudaQuantGemm_execute(
-                        d_A_int8, impl_->d_weights_int8, d_C_int32,
-                        m, n, k, cuda_device_id_, gpu_stream_))
-                {
-                    LOG_ERROR("[CUDAQuantisedGemmKernel] CUTLASS GEMM failed");
-                    return false;
-                }
-            }
-
-#ifdef LLAMINAR_DEBUG_GEMM_VALUES
-            // Debug: dump some int32 outputs - EXPENSIVE, guarded by compile flag
-            if (d_C_int32 && m > 0 && n > 0)
-            {
-                size_t copy_count = std::min(static_cast<size_t>(m) * static_cast<size_t>(n), static_cast<size_t>(8));
-                std::vector<int32_t> h_C_int32(copy_count);
-                cudaQuantGemm_copyInt32DeviceToHost(h_C_int32.data(), d_C_int32, h_C_int32.size(), cuda_device_id_);
-                LOG_DEBUG("[CUDAQuantisedGemmKernel::multiply_fp32_to_fp32] C_int32[0:4]="
-                          << h_C_int32[0] << "," << (h_C_int32.size() > 1 ? h_C_int32[1] : 0) << ","
-                          << (h_C_int32.size() > 2 ? h_C_int32[2] : 0) << "," << (h_C_int32.size() > 3 ? h_C_int32[3] : 0));
-
-                // For LMHead (large n), dump row 1 as well
-                if (m == 2 && n > 1000)
-                {
-                    std::vector<int32_t> h_C_int32_row1(8);
-                    cudaQuantGemm_copyInt32DeviceToHost(h_C_int32_row1.data(), d_C_int32 + n, 8, cuda_device_id_);
-                    LOG_DEBUG("[CUDAQuantisedGemmKernel::multiply_fp32_to_fp32] C_int32[row1,0:4]="
-                              << h_C_int32_row1[0] << "," << h_C_int32_row1[1] << ","
-                              << h_C_int32_row1[2] << "," << h_C_int32_row1[3]);
-                }
-            }
-#endif
-
-            // Step 3: Apply scaling and output to FP32 (no bias)
-            const float *d_C_existing = (beta != 0.0f) ? d_C : nullptr;
-            if (!cudaQuantGemm_applyScaling(
-                    d_C_int32, d_C, d_scales_A, impl_->d_scales_B,
-                    m, n, alpha, beta, d_C_existing, nullptr, cuda_device_id_, gpu_stream_))
-            {
-                LOG_ERROR("[CUDAQuantisedGemmKernel] Scaling failed");
-                return false;
-            }
-
-#ifdef LLAMINAR_DEBUG_GEMM_VALUES
-            // Debug: dump final FP32 outputs - EXPENSIVE, guarded by compile flag
-            if (d_C && m > 0 && n > 0)
-            {
-                size_t copy_count = std::min(static_cast<size_t>(m) * static_cast<size_t>(n), static_cast<size_t>(8));
-                std::vector<float> h_C_fp32(copy_count);
-                cudaQuantGemm_copyDeviceToHost(h_C_fp32.data(), d_C, h_C_fp32.size(), cuda_device_id_);
-                LOG_DEBUG("[CUDAQuantisedGemmKernel::multiply_fp32_to_fp32] C_fp32[0:4]="
-                          << h_C_fp32[0] << "," << (h_C_fp32.size() > 1 ? h_C_fp32[1] : 0.f) << ","
-                          << (h_C_fp32.size() > 2 ? h_C_fp32[2] : 0.f) << "," << (h_C_fp32.size() > 3 ? h_C_fp32[3] : 0.f));
-
-                // For LMHead (large n), dump row 1 as well
-                if (m == 2 && n > 1000)
-                {
-                    std::vector<float> h_C_fp32_row1(8);
-                    cudaQuantGemm_copyDeviceToHost(h_C_fp32_row1.data(), d_C + n, 8, cuda_device_id_);
-                    LOG_DEBUG("[CUDAQuantisedGemmKernel::multiply_fp32_to_fp32] C_fp32[row1,0:4]="
-                              << h_C_fp32_row1[0] << "," << h_C_fp32_row1[1] << ","
-                              << h_C_fp32_row1[2] << "," << h_C_fp32_row1[3]);
-                }
-            }
-#endif
-
-            LOG_DEBUG("[CUDAQuantisedGemmKernel::multiply_fp32_to_fp32] Complete");
-            return true;
+            // K not divisible by 32 — no blockwise path available.
+            LOG_ERROR("[CUDAQuantisedGemmKernel] K=" << k << " not divisible by 32; "
+                      "NativeVNNI requires K%32==0 and row-wise CUTLASS has been removed");
+            return false;
         }
 
         bool CUDAQuantisedGemmKernel::multiply_fp32_to_fp32_with_bias(
@@ -2546,11 +1904,8 @@ namespace llaminar2
             // Ensure weights converted
             ensureWeightsConverted();
 
-            // Use blockwise quantization whenever K is block-aligned so decode can
-            // share one quantization pass across projections and choose either the
-            // NativeVNNI or Int8Expanded GEMV path per projection.
+            // Use blockwise quantization whenever K is block-aligned.
             const bool use_blockwise =
-                !g_force_cutlass_fallback &&
                 (k % 32 == 0);
 
             if (use_blockwise)
@@ -2586,71 +1941,15 @@ namespace llaminar2
                     return true;
                 }
 
-                // Step 2: Blockwise GEMM (produces FP32 directly, includes scaling + bias)
-                {
-                    CUDA_KERNEL_PROFILE_SCOPE(CUDAKernelType::GEMM);
-                    if (!runSelectedBlockwiseBackend(
-                            d_A_int8,
-                            impl_->d_weights_int8,
-                            impl_->d_weights_int8_tc_blocked,
-                            d_C_int32,
-                            d_C,
-                            d_scales_A_blockwise,
-                            impl_->d_scales_B,
-                            m, n, k,
-                            alpha, beta,
-                            d_C_existing,
-                            d_bias,
-                            cuda_device_id_, gpu_stream_))
-                    {
-                        LOG_ERROR("[CUDAQuantisedGemmKernel] Blockwise GEMM with bias failed");
-                        return false;
-                    }
-                }
-
-                return true;
+                // NativeVNNI is the only path — no TC/CUTLASS fallback.
+                LOG_ERROR("[CUDAQuantisedGemmKernel] NativeVNNI GEMM with bias failed (no fallback available)");
+                return false;
             }
 
-            // Row-wise CUTLASS path (fallback when K not divisible by 32)
-            float *d_scales_A = static_cast<float *>(workspace_->getBuffer(GemmWorkspaceBuffers::SCALES_A));
-
-            // Step 1: Quantize activations
-            {
-                CUDA_KERNEL_PROFILE_SCOPE(CUDAKernelType::QUANTIZE_ACTIVATIONS);
-                if (!cudaQuantGemm_quantizeActivations(
-                        d_A, d_A_int8, d_scales_A, m, k, cuda_device_id_, gpu_stream_))
-                {
-                    LOG_ERROR("[CUDAQuantisedGemmKernel] Activation quantization failed");
-                    return false;
-                }
-            }
-
-            // Step 2: Execute CUTLASS INT8 GEMM
-            {
-                CUDA_KERNEL_PROFILE_SCOPE(CUDAKernelType::GEMM);
-                if (!cudaQuantGemm_execute(
-                        d_A_int8, impl_->d_weights_int8, d_C_int32,
-                        m, n, k, cuda_device_id_, gpu_stream_))
-                {
-                    LOG_ERROR("[CUDAQuantisedGemmKernel] CUTLASS GEMM failed");
-                    return false;
-                }
-            }
-
-            // Step 3: Apply scaling, bias, and output to FP32
-            const float *d_C_existing = (beta != 0.0f) ? d_C : nullptr;
-            {
-                CUDA_KERNEL_PROFILE_SCOPE(CUDAKernelType::GEMM_SCALE_OUTPUT);
-                if (!cudaQuantGemm_applyScaling(
-                        d_C_int32, d_C, d_scales_A, impl_->d_scales_B,
-                        m, n, alpha, beta, d_C_existing, d_bias, cuda_device_id_, gpu_stream_))
-                {
-                    LOG_ERROR("[CUDAQuantisedGemmKernel] Scaling with bias failed");
-                    return false;
-                }
-            }
-
-            return true;
+            // K not divisible by 32 — no blockwise path available.
+            LOG_ERROR("[CUDAQuantisedGemmKernel] K=" << k << " not divisible by 32; "
+                      "NativeVNNI requires K%32==0 and row-wise CUTLASS has been removed");
+            return false;
         }
 
         bool CUDAQuantisedGemmKernel::multiply_fp32_to_q8(
@@ -2746,7 +2045,8 @@ namespace llaminar2
             // INT8 path needs quantization + accumulator buffers
             size_t quant_a_bytes = static_cast<size_t>(m) * k * sizeof(int8_t);
             size_t scales_a_bytes = static_cast<size_t>(m) * sizeof(float);
-            const size_t partial_chunk_blocks = getTensorCorePartialChunkBlocksForWorkspace(m, n, k);
+            // NativeVNNI doesn't use INT32 accumulator split-K, so 1 chunk is sufficient.
+            constexpr size_t partial_chunk_blocks = 1;
             size_t acc_int32_bytes = static_cast<size_t>(m) * n * partial_chunk_blocks * sizeof(int32_t);
 
             reqs.buffers.push_back({GemmWorkspaceBuffers::QUANT_A, quant_a_bytes, 256, true});
@@ -2762,7 +2062,17 @@ namespace llaminar2
             // When output is host-mapped (e.g., logits), scattered GPU writes go over PCIe.
             // This buffer provides an HBM target; we bulk-DMA to mapped memory after.
             size_t temp_c_fp32_bytes = static_cast<size_t>(m) * n * sizeof(float);
-            reqs.buffers.push_back({tempCFp32BufferName(), temp_c_fp32_bytes, 256, true});
+            reqs.buffers.push_back({GemmWorkspaceBuffers::TEMP_C_FP32, temp_c_fp32_bytes, 256, true});
+
+            // GEMV kpar partials for decode (M=1): two-phase K-parallel reduction
+            // Size: kpar_factor × N floats. kpar_factor ≈ ceil(K/tile_k) capped by SM count.
+            // Use conservative estimate: min(ceil(K/128), 84) × N × sizeof(float)
+            if (m <= 4)
+            {
+                int kpar_factor = std::min((k + 127) / 128, 84);  // 84 SMs is RTX 3090
+                size_t kpar_bytes = static_cast<size_t>(kpar_factor) * n * sizeof(float);
+                reqs.buffers.push_back({GemmWorkspaceBuffers::GEMV_KPAR_PARTIALS, kpar_bytes, 256, false});
+            }
 
             LOG_DEBUG("[CUDAQuantisedGemmKernel::getWorkspaceRequirements] INT8 path: "
                       << "quant_a=" << (quant_a_bytes / 1024) << "KB, "

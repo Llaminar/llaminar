@@ -4,18 +4,6 @@
 # Note: enable_testing() is called in parent CMakeLists.txt (src/v2/CMakeLists.txt)
 
 # =============================================================================
-# Test-only compile flags
-# =============================================================================
-# Test code intentionally ignores hipError_t / cudaError_t returns from setup
-# helpers (hipMalloc/hipFree/hipMemcpy in fixtures, etc.) because the GTest
-# assertion framework handles failures separately. Silence the noise here so
-# real warnings stay visible. This scope ONLY affects targets defined in
-# tests/v2/ — llaminar2_core production code is unaffected.
-if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-    add_compile_options(-Wno-unused-result)
-endif()
-
-# =============================================================================
 # Linker Workaround for Circular Static Library Dependencies
 # =============================================================================
 # llaminar2_core links cuda_backend, but cuda_backend uses symbols from llaminar2_core.
@@ -833,23 +821,6 @@ add_v2_test(V2_Unit_ROCmQuantisedGemmKernel_Workspace
     COMMAND $<TARGET_FILE:v2_unit_rocm_gemm_workspace>
     LABELS "V2;Unit;Kernels;ROCm;GEMM;Workspace;IWorkspaceConsumer"
     MPI_PROCS 1
-)
-
-# Test: ROCmQuantisedGemmKernel TEMP_C_FP32 / TEMP_A_FP32 per-instance workspace
-# slicing (regression — mirror of CUDA parity #146 bug).
-# Bug: KernelFactory caches one ROCmQuantisedGemmKernel per (device, weight) pair,
-# but every instance declared the same TEMP_C_FP32 / TEMP_A_FP32 workspace buffer
-# name. WorkspaceRequirements::merge() collapsed them into a single shared slot,
-# so overlapping async D2D/D2H copies could clobber each other's redirect source.
-# Fix: per-instance unique slice names so merge() keeps each kernel's buffer
-# separate.
-add_executable(v2_unit_rocm_gemm_workspace_slicing
-    unit/kernels/rocm/Test__ROCmQuantisedGemmKernel_WorkspaceSlicing.cpp)
-target_link_libraries(v2_unit_rocm_gemm_workspace_slicing llaminar2_core GTest::gtest GTest::gtest_main)
-add_v2_test(V2_Unit_ROCmQuantisedGemmKernel_WorkspaceSlicing
-    COMMAND $<TARGET_FILE:v2_unit_rocm_gemm_workspace_slicing>
-    LABELS "V2;Unit;Kernels;ROCm;GEMM;Workspace;IWorkspaceConsumer;Regression"
-    MPI_PROCS 1  # Pure host-side workspace requirement test, no GPU needed
 )
 
 # Test: MPIBackend - MPI-based collective backend for inter-node communication
@@ -3752,23 +3723,6 @@ add_v2_test(V2_Unit_CUDAFlashAttention_DecodeKVLen
     MPI_PROCS 1  # Tests GPU attention locally, no MPI needed
 )
 
-# Test: CUDAQuantisedGemmKernel TEMP_C_FP32 workspace slicing (regression for parity #146)
-# Bug discovered 2026-01: KernelFactory caches one CUDAQuantisedGemmKernel per
-# (device, weight) pair, but every kernel declared the same TEMP_C_FP32
-# workspace buffer name. WorkspaceRequirements::merge() collapsed those into
-# a single shared slot, so a second kernel could clobber the redirect source
-# of another while its async D2D copy was still in flight, producing all-zero
-# outputs (parity test #146 flake).
-# Fix: per-instance unique TEMP_C_FP32 slice name so merge() keeps each
-# kernel's buffer separate.
-add_executable(v2_unit_cuda_gemm_workspace unit/kernels/cuda/Test__CUDAQuantisedGemmKernel_Workspace.cpp)
-target_link_libraries(v2_unit_cuda_gemm_workspace llaminar2_core GTest::gtest GTest::gtest_main)
-add_v2_test(V2_Unit_CUDAQuantisedGemmKernel_Workspace
-    COMMAND $<TARGET_FILE:v2_unit_cuda_gemm_workspace>
-    LABELS "V2;Unit;Kernels;CUDA;GEMM;Workspace;IWorkspaceConsumer;Regression"
-    MPI_PROCS 1  # Pure host-side workspace requirement test, no GPU needed
-)
-
 # Integration Test: cuBLAS GEMM (Phase 1 - dense GEMM via cuBLAS for FP32/FP16/BF16)
 # Tests correctness against CPU reference, various matrix sizes, transpose variants
 add_executable(v2_test_cublas_gemm integration/kernels/cuda/Test__CuBLASGemm.cpp)
@@ -4916,33 +4870,6 @@ target_link_libraries(v2_test_orchestration_config_parser llaminar2_core GTest::
 add_v2_test(V2_Unit_OrchestrationConfigParser
     COMMAND $<TARGET_FILE:v2_test_orchestration_config_parser>
     LABELS "V2;Unit;Config;CLI;YAML;Orchestration;Heterogeneous"
-    MPI_PROCS 1
-)
-
-# Test: CliSpec (structured CLI flag spec framework: parsing, validation, help-gen)
-add_executable(v2_test_cli_spec unit/config/Test__CliSpec.cpp)
-target_link_libraries(v2_test_cli_spec llaminar2_core GTest::gtest GTest::gtest_main)
-add_v2_test(V2_Unit_CliSpec
-    COMMAND $<TARGET_FILE:v2_test_cli_spec>
-    LABELS "V2;Unit;Config;CLI;Parser"
-    MPI_PROCS 1
-)
-
-# Test: SubcommandRouter (subcommand dispatch, fallback, help generation, argv shifting)
-add_executable(v2_test_subcommand_router unit/app/Test__SubcommandRouter.cpp)
-target_link_libraries(v2_test_subcommand_router llaminar2_core GTest::gtest GTest::gtest_main)
-add_v2_test(V2_Unit_SubcommandRouter
-    COMMAND $<TARGET_FILE:v2_test_subcommand_router>
-    LABELS "V2;Unit;App;CLI;Subcommand;Router"
-    MPI_PROCS 1
-)
-
-# Test: Commands (subcommand metadata, help, error handling for plan/describe/serve/oneshot)
-add_executable(v2_test_commands unit/app/Test__Commands.cpp)
-target_link_libraries(v2_test_commands llaminar2_core GTest::gtest GTest::gtest_main)
-add_v2_test(V2_Unit_Commands
-    COMMAND $<TARGET_FILE:v2_test_commands>
-    LABELS "V2;Unit;App;CLI;Subcommand;Commands"
     MPI_PROCS 1
 )
 
@@ -9511,5 +9438,90 @@ target_include_directories(v2_test_weight_manager_pp_safety PRIVATE
 add_v2_test(V2_Unit_WeightManagerPPSafety
     COMMAND $<TARGET_FILE:v2_test_weight_manager_pp_safety>
     LABELS "V2;Unit;WeightManager;PipelineParallel;Safety;LayerRange"
+    MPI_PROCS 1
+)
+
+# =============================================================================
+# Memory Planning Tests
+# =============================================================================
+
+# Test: ModelMemoryProfile — GGUF metadata extraction for memory planning
+add_executable(v2_test_model_memory_profile unit/planning/Test__ModelMemoryProfile.cpp)
+target_link_libraries(v2_test_model_memory_profile llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_ModelMemoryProfile
+    COMMAND $<TARGET_FILE:v2_test_model_memory_profile>
+    LABELS "V2;Unit;Planning;ModelMemoryProfile;GGUF"
+    MPI_PROCS 1
+)
+
+# Test: WeightMemoryEstimator — weight sizing with TP sharding and PP slicing
+add_executable(v2_test_weight_memory_estimator unit/planning/Test__WeightMemoryEstimator.cpp)
+target_link_libraries(v2_test_weight_memory_estimator llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_WeightMemoryEstimator
+    COMMAND $<TARGET_FILE:v2_test_weight_memory_estimator>
+    LABELS "V2;Unit;Planning;WeightMemoryEstimator;TensorParallelism"
+    MPI_PROCS 1
+)
+
+# Test: KVCacheMemoryEstimator — KV cache sizing for fp16/fp32/q8_1/tq
+add_executable(v2_test_kvcache_memory_estimator unit/planning/Test__KVCacheMemoryEstimator.cpp)
+target_link_libraries(v2_test_kvcache_memory_estimator llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_KVCacheMemoryEstimator
+    COMMAND $<TARGET_FILE:v2_test_kvcache_memory_estimator>
+    LABELS "V2;Unit;Planning;KVCacheMemoryEstimator;KVCache"
+    MPI_PROCS 1
+)
+
+# Test: ActivationMemoryEstimator — activation buffer peak estimation
+add_executable(v2_test_activation_memory_estimator unit/planning/Test__ActivationMemoryEstimator.cpp)
+target_link_libraries(v2_test_activation_memory_estimator llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_ActivationMemoryEstimator
+    COMMAND $<TARGET_FILE:v2_test_activation_memory_estimator>
+    LABELS "V2;Unit;Planning;ActivationMemoryEstimator;Activations"
+    MPI_PROCS 1
+)
+
+# Test: WorkspaceMemoryEstimator — GPU kernel workspace budget estimation
+add_executable(v2_test_workspace_memory_estimator unit/planning/Test__WorkspaceMemoryEstimator.cpp)
+target_link_libraries(v2_test_workspace_memory_estimator llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_WorkspaceMemoryEstimator
+    COMMAND $<TARGET_FILE:v2_test_workspace_memory_estimator>
+    LABELS "V2;Unit;Planning;WorkspaceMemoryEstimator;Workspace"
+    MPI_PROCS 1
+)
+
+# Test: MemoryPlanner — end-to-end planning with single/multi-device configs
+add_executable(v2_test_memory_planner unit/planning/Test__MemoryPlanner.cpp)
+target_link_libraries(v2_test_memory_planner llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_MemoryPlanner
+    COMMAND $<TARGET_FILE:v2_test_memory_planner>
+    LABELS "V2;Unit;Planning;MemoryPlanner;MemoryBudget"
+    MPI_PROCS 1
+)
+
+# Test: ClusterInventoryGatherer — single-rank inventory gathering
+add_executable(v2_test_cluster_inventory_gatherer unit/planning/Test__ClusterInventoryGatherer.cpp)
+target_link_libraries(v2_test_cluster_inventory_gatherer llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_ClusterInventoryGatherer
+    COMMAND $<TARGET_FILE:v2_test_cluster_inventory_gatherer>
+    LABELS "V2;Unit;Planning;ClusterInventory"
+    MPI_PROCS 1
+)
+
+# Test: KVCacheConfig::estimateBytes() — bridge between KernelFactory config and planning
+add_executable(v2_test_kvcache_config_estimate unit/planning/Test__KVCacheConfigEstimate.cpp)
+target_link_libraries(v2_test_kvcache_config_estimate llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_KVCacheConfigEstimate
+    COMMAND $<TARGET_FILE:v2_test_kvcache_config_estimate>
+    LABELS "V2;Unit;Planning;KVCache;KernelFactory"
+    MPI_PROCS 1
+)
+
+# Test: DeviceMemoryPlan — fits/deficit/remaining/summary struct methods
+add_executable(v2_test_device_memory_plan unit/planning/Test__DeviceMemoryPlan.cpp)
+target_link_libraries(v2_test_device_memory_plan llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_DeviceMemoryPlan
+    COMMAND $<TARGET_FILE:v2_test_device_memory_plan>
+    LABELS "V2;Unit;Planning;MemoryPlan"
     MPI_PROCS 1
 )

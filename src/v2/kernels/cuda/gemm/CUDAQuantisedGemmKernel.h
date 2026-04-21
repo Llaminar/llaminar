@@ -93,6 +93,8 @@ namespace llaminar2
         public:
             struct Impl; // Forward declaration for PIMPL (definition in .cpp)
 
+            // Legacy stubs — NativeVNNI is always enabled; CUTLASS fallback removed.
+            // Kept for ABI compatibility with test code; will be removed in a future cleanup.
             static void setNativeVNNIEnabled(bool enabled);
             static bool isNativeVNNIEnabled();
             static void setForceCutlassFallback(bool enabled);

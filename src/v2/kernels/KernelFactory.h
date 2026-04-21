@@ -307,6 +307,13 @@ namespace llaminar
                 {
                     return device.is_rocm();
                 }
+
+                /**
+                 * @brief Estimate total device memory for this KV cache configuration.
+                 * Does not allocate. Uses the same formulas as actual constructors.
+                 * @return Estimated bytes needed on device
+                 */
+                size_t estimateBytes() const;
             };
 
             /**

@@ -6,6 +6,7 @@
 
 #include "KernelFactory.h"
 #include "../backends/BackendManager.h"
+#include "../planning/KVCacheMemoryEstimator.h"
 #include "cpu/native_vnni/CPUNativeVNNIGemmKernel.h"
 #include "cpu/gemm/FloatingPointGemmKernel.h"
 #include "../tensors/TensorSlice.h"
@@ -2976,8 +2977,7 @@ namespace llaminar
                           << " preferred_family="
                           << llaminar2::cuda::cudaPackedWeightFamilyName(new_cache->packed.preferred_family)
                           << " active_family="
-                          << llaminar2::cuda::cudaPackedWeightFamilyName(new_cache->packed.active_family)
-                          << " int8_fallback=" << (!new_cache->packed.int8_data.empty()));
+                          << llaminar2::cuda::cudaPackedWeightFamilyName(new_cache->packed.active_family));
 
                 return &new_cache->packed;
             }
@@ -4273,6 +4273,30 @@ namespace llaminar
                     fused_gate_up_cache_[key] = std::move(kernel);
                     return raw_ptr;
                 }
+            }
+
+            // ==========================================================================
+            // KVCacheConfig estimation
+            // ==========================================================================
+
+            size_t KVCacheConfig::estimateBytes() const
+            {
+                int effective_kv_heads = (local_n_kv_heads > 0) ? local_n_kv_heads : n_kv_heads;
+                if (effective_kv_heads <= 0 || num_layers <= 0 || head_dim <= 0)
+                    return 0;
+
+                std::string prec_str;
+                switch (precision)
+                {
+                case ::llaminar2::ActivationPrecision::FP32:   prec_str = "fp32"; break;
+                case ::llaminar2::ActivationPrecision::FP16:   prec_str = "fp16"; break;
+                case ::llaminar2::ActivationPrecision::Q8_1:   prec_str = "q8_1"; break;
+                default:                                       prec_str = "fp16"; break;
+                }
+
+                return ::llaminar2::KVCacheMemoryEstimator::estimate(
+                    num_layers, batch_size, max_seq_len,
+                    effective_kv_heads, head_dim, prec_str, device);
             }
 
             // ==========================================================================

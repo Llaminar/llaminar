@@ -26,6 +26,7 @@
 #include "../local_execution/orchestrators/IInferenceRunner.h"
 #include "../mpi_orchestration/DeviceInventory.h"
 #include "../local_execution/orchestrators/MultiDeviceOrchestrator.h"
+#include "../../planning/MemoryPlanner.h"
 #include "../../collective/ILocalTPContext.h"
 #include "../../collective/ILocalPPContext.h"
 #include "../../loaders/ModelContext.h"
@@ -313,6 +314,16 @@ namespace llaminar2
         bool validateContextLength();
 
         /**
+         * @brief Validate that the model fits in device memory
+         *
+         * Uses MemoryPlanner to check weight + KV cache + activation
+         * memory against available device memory.
+         *
+         * @return true if model fits, false with error if not
+         */
+        bool validateMemoryPlan();
+
+        /**
          * @brief Build compute graphs
          */
         bool buildComputeGraph();
@@ -392,6 +403,7 @@ namespace llaminar2
         OrchestrationConfig config_;
         RankExecutionPlan plan_;
         bool plan_built_{false};
+        ClusterInventory cluster_inventory_;
 
         // Dependencies (injected or created)
         std::unique_ptr<IExecutionPlanBuilder> plan_builder_;

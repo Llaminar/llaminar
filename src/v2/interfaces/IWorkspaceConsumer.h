@@ -170,6 +170,9 @@ namespace llaminar2
 
         // ROCm scatter+reduce partial buffer for fused GEMV
         constexpr const char *ROCM_SCATTER_PARTIAL = "rocm_scatter_partial"; ///< [KB_MAX × N] FP32 scatter partials
+
+        // GEMV kpar partials buffer for CUDA NativeVNNI two-phase reduction
+        constexpr const char *GEMV_KPAR_PARTIALS = "gemv_kpar_partials"; ///< [kpar × N] FP32 reduction partials
     }
 
     // =============================================================================
