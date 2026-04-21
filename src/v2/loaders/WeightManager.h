@@ -659,6 +659,7 @@ namespace llaminar2
         std::unordered_map<std::string, std::shared_ptr<TensorBase>> cache_;        ///< Weight cache
         mutable std::mutex cache_mutex_;                                            ///< Protects cache_ and decode_cache_ access
         mutable std::unordered_map<std::string, ShardingMode> sharding_mode_cache_; ///< Cached sharding modes
+        mutable std::mutex sharding_mode_cache_mutex_;                              ///< Protects sharding_mode_cache_ (separate from cache_mutex_ to avoid deadlock — getShardingMode may be called while cache_mutex_ is held)
         WeightShardingConfig sharding_config_;                                      ///< Model-specific sharding patterns
         bool has_sharding_config_ = false;                                          ///< True if config was set explicitly
         WeightPreprocessor weight_preprocessor_;                                    ///< Optional per-weight transform before packing

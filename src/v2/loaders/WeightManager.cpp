@@ -322,16 +322,28 @@ namespace llaminar2
 
     ShardingMode WeightManager::getShardingMode(const std::string &name) const
     {
-        // Check cache first
-        auto it = sharding_mode_cache_.find(name);
-        if (it != sharding_mode_cache_.end())
+        // Check cache first (sharding_mode_cache_ is touched by parallel
+        // weight-loader workers in configureOrchestratorWeightsImpl, so the
+        // read+write must be serialized — otherwise concurrent rehashes
+        // corrupt hash node next-pointers and crash later in destruction).
         {
-            return it->second;
+            std::lock_guard<std::mutex> lock(sharding_mode_cache_mutex_);
+            auto it = sharding_mode_cache_.find(name);
+            if (it != sharding_mode_cache_.end())
+            {
+                return it->second;
+            }
         }
 
-        // Determine and cache (cache is mutable)
+        // Determine outside the lock (sharding_config_ is read-only after setup)
         ShardingMode mode = determineShardingMode(name);
-        sharding_mode_cache_[name] = mode;
+
+        // Cache it (another thread may have raced and inserted the same key — the
+        // result is identical so either insert or assignment is correct)
+        {
+            std::lock_guard<std::mutex> lock(sharding_mode_cache_mutex_);
+            sharding_mode_cache_[name] = mode;
+        }
         return mode;
     }
 
