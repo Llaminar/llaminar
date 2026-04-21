@@ -50,30 +50,30 @@ namespace llaminar2
             return;
 
         // Layout note:
-        //   The wordmark is held at a FIXED column on every row (column 44 from
-        //   the start of the line). Each row's "stream zone" before the
-        //   wordmark is exactly 41 chars wide:
-        //       leading_spaces(16+r) + "\  \  \  \  \  \"(16) + trailing_spaces(7-r)
+        // Layout note:
+        //   Splash is left-justified. Each row's "stream zone" before the
+        //   wordmark is exactly 23 chars wide:
+        //       leading_spaces(r) + "\  \  \  \  \  \"(16) + trailing_spaces(7-r)
         //   The 6 backslashes shift +1 column per row to form perfectly
         //   parallel 45° diagonals (laminar flow), but the wordmark stays
-        //   straight because trailing pad shrinks by the same amount.
+        //   straight at column 24 because trailing pad shrinks by the same amount.
         std::cout
             << '\n'
             // ── 6 parallel streams + fixed-column wordmark ────────────────
-            << "  " << "                " << kAqua  << "\\  \\  \\  \\  \\  \\"  << kReset << "         "
+            <<                          kAqua  << "\\  \\  \\  \\  \\  \\"  << kReset << "         "
             << kBold << kOcean << "██╗     ██╗      █████╗ ███╗   ███╗██╗███╗   ██╗ █████╗ ██████╗" << kReset << '\n'
-            << "  " << "                 " << kAqua  << "\\  \\  \\  \\  \\  \\"  << kReset << "        "
+            << " "                  << kAqua  << "\\  \\  \\  \\  \\  \\"  << kReset << "        "
             << kBold << kOcean << "██║     ██║     ██╔══██╗████╗ ████║██║████╗  ██║██╔══██╗██╔══██╗" << kReset << '\n'
-            << "  " << "                  " << kAzure << "\\  \\  \\  \\  \\  \\"  << kReset << "       "
+            << "  "                 << kAzure << "\\  \\  \\  \\  \\  \\"  << kReset << "       "
             << kBold << kOcean << "██║     ██║     ███████║██╔████╔██║██║██╔██╗ ██║███████║██████╔╝" << kReset << '\n'
-            << "  " << "                   " << kAzure << "\\  \\  \\  \\  \\  \\"  << kReset << "      "
+            << "   "                << kAzure << "\\  \\  \\  \\  \\  \\"  << kReset << "      "
             << kBold << kDeep  << "██║     ██║     ██╔══██║██║╚██╔╝██║██║██║╚██╗██║██╔══██║██╔══██╗" << kReset << '\n'
-            << "  " << "                    " << kOcean << "\\  \\  \\  \\  \\  \\"  << kReset << "     "
+            << "    "               << kOcean << "\\  \\  \\  \\  \\  \\"  << kReset << "     "
             << kBold << kDeep  << "███████╗███████╗██║  ██║██║ ╚═╝ ██║██║██║ ╚████║██║  ██║██║  ██║" << kReset << '\n'
-            << "  " << "                     " << kDeep  << "\\  \\  \\  \\  \\  \\"  << kReset << "    "
+            << "     "              << kDeep  << "\\  \\  \\  \\  \\  \\"  << kReset << "    "
             << kDim           << "╚══════╝╚══════╝╚═╝  ╚═╝╚═╝     ╚═╝╚═╝╚═╝  ╚═══╝╚═╝  ╚═╝╚═╝  ╚═╝" << kReset << '\n'
             // ── ripples beneath the landing zone + tagline ────────────────
-            << "  " << "                      " << kDim  << "~  ~  ~  ~  ~  ~" << kReset << "                "
+            << "      "             << kDim  << "~  ~  ~  ~  ~  ~" << kReset << "                "
             << kDim << "l l m   i n f e r e n c e" << kReset << '\n'
             << '\n';
         std::cout.flush();
