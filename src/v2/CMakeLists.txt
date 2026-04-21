@@ -1235,11 +1235,19 @@ add_library(llaminar2_core STATIC
     execution/factory/InferenceRunnerFactory.cpp
     # App-level components (extracted from Main.cpp)
     app/AppLifecycle.cpp
+    app/SubcommandRouter.cpp
     app/Splash.cpp
     app/InferenceRunnerAdapter.cpp
     app/ChatTemplateResolver.cpp
     app/MPIBootstrapPhase.cpp
     app/RuntimeInitPhase.cpp
+    # Subcommands
+    app/commands/LegacyCommand.cpp
+    app/commands/DescribeCommand.cpp
+    app/commands/OneshotCommand.cpp
+    app/commands/ServeCommand.cpp
+    app/commands/PlanCommand.cpp
+    # Execution modes (used by LegacyCommand)
     app/modes/InteractiveChatMode.cpp
     app/modes/SingleShotChatMode.cpp
     app/modes/BenchmarkMode.cpp

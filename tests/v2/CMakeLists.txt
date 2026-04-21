@@ -4928,6 +4928,24 @@ add_v2_test(V2_Unit_CliSpec
     MPI_PROCS 1
 )
 
+# Test: SubcommandRouter (subcommand dispatch, fallback, help generation, argv shifting)
+add_executable(v2_test_subcommand_router unit/app/Test__SubcommandRouter.cpp)
+target_link_libraries(v2_test_subcommand_router llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_SubcommandRouter
+    COMMAND $<TARGET_FILE:v2_test_subcommand_router>
+    LABELS "V2;Unit;App;CLI;Subcommand;Router"
+    MPI_PROCS 1
+)
+
+# Test: Commands (subcommand metadata, help, error handling for plan/describe/serve/oneshot)
+add_executable(v2_test_commands unit/app/Test__Commands.cpp)
+target_link_libraries(v2_test_commands llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_Commands
+    COMMAND $<TARGET_FILE:v2_test_commands>
+    LABELS "V2;Unit;App;CLI;Subcommand;Commands"
+    MPI_PROCS 1
+)
+
 # Test: ConfigValidator (declarative device selection validation rules)
 # Tests mutual exclusion, co-requirements, intra-mode consistency, mode detection.
 # Part of CLI Device Selection Cleanup
