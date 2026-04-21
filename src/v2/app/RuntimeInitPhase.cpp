@@ -20,6 +20,9 @@
 #include <iostream>
 #include <algorithm>
 #include <cstdlib>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 namespace llaminar2
 {
@@ -43,6 +46,18 @@ namespace llaminar2
         config = parser.parseArgs(argc, argv);
 
         auto mpi_ctx = MPIContextFactory::global();
+
+        // Honor --threads override (if > 0). MPIBootstrap has already set
+        // OMP_NUM_THREADS based on topology; --threads lets the user force a
+        // specific count. OpenMP-threaded BLAS backends (OpenBLAS, MKL) also
+        // honor OMP_NUM_THREADS, so this single override propagates.
+        if (config.n_threads > 0)
+        {
+            setenv("OMP_NUM_THREADS", std::to_string(config.n_threads).c_str(), 1);
+#ifdef _OPENMP
+            omp_set_num_threads(config.n_threads);
+#endif
+        }
 
         // Check OMP_NUM_THREADS
         if (std::getenv("OMP_NUM_THREADS") == nullptr)
@@ -215,6 +230,13 @@ namespace llaminar2
         if (mpi_ctx->rank() == 0)
         {
             InventoryPrinter::printClusterInventory(cluster);
+        }
+
+        // --explain-placement: dump the resolved orchestration config on rank 0.
+        if (config.explain_placement && mpi_ctx->rank() == 0)
+        {
+            std::cout << "\n=== Placement Explanation ===\n"
+                      << config.toString() << std::endl;
         }
 
         // Dry-run check (post-MPI)

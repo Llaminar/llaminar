@@ -5,6 +5,7 @@
 
 #include "app/AppLifecycle.h"
 #include "utils/Logger.h"
+#include "utils/MPIBootstrap.h"
 #include "config/OrchestrationConfigParser.h"
 #include "app/MPIBootstrapPhase.h"
 #include "app/RuntimeInitPhase.h"
@@ -39,6 +40,45 @@ namespace llaminar2
         if (config.list_devices)
         {
             MPIBootstrapPhase::listDevices();
+            return 0;
+        }
+
+        if (config.show_topology)
+        {
+            auto topo = MPIBootstrap::detectCPUTopology();
+            std::cout << "\n=== CPU Topology ===\n"
+                      << "  Detection method  : " << topo.detection_method << "\n"
+                      << "  Sockets           : " << topo.num_sockets << "\n"
+                      << "  Physical cores    : " << topo.physical_cores << "\n"
+                      << "  Logical cores     : " << topo.logical_cores << "\n"
+                      << "  Cores/socket      : " << topo.cores_per_socket << "\n"
+                      << "  Threads/core      : " << topo.threads_per_core << "\n"
+                      << "  NUMA nodes        : " << topo.numa_nodes << "\n"
+                      << "  Hyperthreading    : " << (topo.hyperthreading ? "yes" : "no") << "\n"
+                      << std::endl;
+            return 0;
+        }
+
+        if (config.show_numa)
+        {
+            auto topo = MPIBootstrap::detectCPUTopology();
+            std::cout << "\n=== NUMA Configuration ===\n"
+                      << "  NUMA nodes        : " << topo.numa_nodes << "\n"
+                      << "  Sockets           : " << topo.num_sockets << "\n"
+                      << "  Cores per node    : " << (topo.physical_cores / std::max(1, topo.numa_nodes)) << "\n"
+                      << std::endl;
+            return 0;
+        }
+
+        if (config.validate_only)
+        {
+            // parseArgs() already called config.validate() and threw on failure,
+            // so if we got here the configuration is valid.
+            std::cout << "Configuration is valid." << std::endl;
+            if (config.explain_placement || config.verbose_level > 0)
+            {
+                std::cout << "\n" << config.toString() << std::endl;
+            }
             return 0;
         }
 

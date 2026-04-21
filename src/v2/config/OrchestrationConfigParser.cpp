@@ -14,6 +14,7 @@
 #include <sstream>
 #include <algorithm>
 #include <cctype>
+#include <cstdlib>
 #include <stdexcept>
 #include <set>
 
@@ -275,6 +276,18 @@ namespace llaminar2
             args.push_back(argv[i]);
         }
 
+        // First pass: if --config <path> is present, load YAML as the base config.
+        // CLI arguments processed in the second pass will then override YAML values.
+        for (size_t i = 0; i + 1 < args.size(); ++i)
+        {
+            if (args[i] == "--config")
+            {
+                config = parseYamlFile(args[i + 1]);
+                config.config_file_path = args[i + 1];
+                break;
+            }
+        }
+
         for (size_t i = 0; i < args.size(); ++i)
         {
             const std::string &arg = args[i];
@@ -485,6 +498,13 @@ namespace llaminar2
             else if (arg == "--deterministic")
             {
                 config.deterministic = true;
+                // Force greedy sampling (temperature 0). This is the cheapest
+                // knob that actually makes inference reproducible from the
+                // CLI and is what the help text has always advertised.
+                config.temperature = 0.0f;
+                // Also export LLAMINAR_DETERMINISTIC so kernels that opt into
+                // deterministic execution (e.g. CUDA quantised GEMM) pick it up.
+                setenv("LLAMINAR_DETERMINISTIC", "1", 1);
             }
 
             // ===== Chat Configuration =====
@@ -585,7 +605,7 @@ namespace llaminar2
                 std::string value = getFlagValue(args, i);
                 if (value.empty())
                 {
-                    throw std::invalid_argument("--mpi-mpi-hostfile requires a path");
+                    throw std::invalid_argument("--mpi-hostfile requires a path");
                 }
                 config.hostfile = value;
             }
@@ -878,19 +898,11 @@ namespace llaminar2
                 {
                     throw std::invalid_argument("--config requires a file path");
                 }
+                // YAML was already loaded as the base config in the first pass
+                // (see top of parseArgs). We consume the argument here so it
+                // doesn't trigger "Unknown argument" and so downstream code
+                // sees config_file_path correctly populated.
                 config.config_file_path = value;
-
-                // Parse the config file and merge
-                OrchestrationConfig file_config = parseYamlFile(value);
-
-                // Merge: CLI options override file options
-                // Only override fields that weren't explicitly set via CLI
-                // For now, just use file config as base if we got this far
-                // (A more sophisticated merge would track which CLI flags were set)
-                if (config.mpi_profile == MPIProfile::AUTO && file_config.mpi_profile != MPIProfile::AUTO)
-                {
-                    config.mpi_profile = file_config.mpi_profile;
-                }
             }
 
             // ===== Topology Tree (Global PP Phase 8) =====
@@ -1287,7 +1299,7 @@ Usage: llaminar2 [OPTIONS]
 
 Model Configuration:
   -m, --model <path>     Path to GGUF model file (required)
-  -c, --context-length <n>  Maximum context/sequence length (default: 2048)
+  -c, --context-length <n>  Maximum context/sequence length (default: 4096)
   --mmap                 Use memory-mapped file loading (default)
   --no-mmap              Disable memory-mapped file loading
 
@@ -1295,14 +1307,15 @@ Inference Configuration:
   -p, --prompt <text>    Input prompt text
   -n, --n-predict <n>    Tokens to generate (-1 = until EOS, default: -1)
   --batch-size <n>       Batch size (default: 1)
-  --threads <n>          Thread count (-1 = auto, default: -1)
+  --threads <n>          Thread count override for OpenMP / BLAS (-1 = auto)
   -s, --seed <n>         Random seed (-1 = random, default: -1)
 
 Sampling Configuration:
-  -t, --temperature <f>  Sampling temperature (default: 0.8)
+  -t, --temperature <f>  Sampling temperature (default: 0.8; 0 = greedy)
   --top-k <n>            Top-K sampling (default: 40)
   --top-p <f>            Top-P (nucleus) sampling (default: 0.9)
-  --deterministic        Force deterministic mode (temperature=0)
+  --deterministic        Force greedy sampling (temperature=0) and set
+                         LLAMINAR_DETERMINISTIC=1 for kernel-level determinism
 
 Chat Configuration:
   --chat                 Interactive chat mode
@@ -1319,64 +1332,59 @@ Server Configuration:
   --host <addr>          Server bind address (default: 127.0.0.1)
 
 Fused Attention:
-  --fused-attention      Enable fused attention+Wo kernel
   --fused-attention-backend <type>  Backend: jit (default), reference, tiled, q16
 
 MPI Bootstrap:
   --mpi-procs <n>        Number of MPI processes (0 = auto)
-  --mpi-hostfile <path>  MPI hostfile path (also used for node detection) (also used for node detection)
+  --mpi-hostfile <path>  MPI hostfile path (also used for node detection)
   --mpi-dry-run          Print MPI launch command and exit
   --mpi-verbose          Verbose MPI output
-  --no-mpi-bootstrap     Disable automatic MPI bootstrap
+  --no-mpi-bootstrap     Disable automatic MPI bootstrap (DEBUG ONLY — disables
+                         thread pinning and NUMA-aware placement; use only for
+                         profiling with ncu/nsys/perf, never for benchmarks)
   --mpi-oversubscribe    Allow MPI oversubscription
-    --mpi-profile <mode>   MPI bootstrap profile: auto (default), tuned
+  --mpi-profile <mode>   MPI bootstrap profile: auto (default), tuned
 
 Device Assignment:
-  -d, --device <spec>    Device for this rank (e.g., cuda:0, rocm:0, cpu)
+  -d, --device <spec>    Device for this rank. Examples:
+                           cuda:0, rocm:0      — specific GPU
+                           cpu                  — all CPU NUMA nodes (auto TP)
+                           cpu:N                — single CPU NUMA node N
   --device-mode <mode>   Assignment mode: auto, local_gpu, round_robin, explicit
+                         (also accepts local-gpu, round-robin with dashes)
   --device-map <map>     Explicit mapping: "0=cuda:0,1=cuda:1"
 
 Tensor Parallelism:
   -tp, --tensor-parallelism-degree <n>  TP parallelism degree
-  --tp-scope <scope>     Scope: auto, local, global, hybrid
+  --tp-scope <scope>     Scope: auto, local, global, hybrid, node_local
   --tp-devices <list>    Device list: "cuda:0,cuda:1"
-  --tp-weights <list>    Weight distribution: "0.73,0.27"
-  --tp-local <degree>    Local TP degree for hybrid
-  --tp-global <degree>   Global TP degree for hybrid
+  --tp-weights <list>    Weight distribution: "0.73,0.27" (requires --tp-devices)
 
 Pipeline Parallelism:
   -pp, --pipeline-parallelism-degree <n>  PP parallelism degree
   --pp-split <mode>      Layer split: equal, weighted, manual
-
-Layer Placement:
-  --cpu-layers <n>       Number of layers on CPU
-  --cpu-layers-first     Put CPU layers at beginning (default: end)
 
 Named Domains (advanced):
   --define-domain <spec> Define domain: "name=device1,device2[;weights=w1,w2][;backend=type]"
   --pp-stage <spec>      Define PP stage: "stage_id=domain:first_layer-last_layer"
 
 Collective Backend:
-  -b, --backend <type>   Default collective: auto, nccl, rccl, upi, mpi, host
+  -b, --backend <type>   Default collective: auto, nccl, rccl, upi, mpi, host,
+                         heterogeneous
 
 Introspection:
-  --dry-run              Show configuration without executing
-  --explain-placement    Explain device placement decisions
-  --show-topology        Show detected topology and exit
+  --dry-run              Validate configuration, print cluster inventory,
+                         then exit before loading the model
+  --explain-placement    Dump resolved orchestration plan on rank 0
+  --show-topology        Show detected CPU topology and exit
   --show-numa            Show NUMA configuration and exit
-  --validate-only        Validate configuration without running
+  --validate-only        Validate configuration and exit
+  --list-devices         List available devices and exit
 
 Config File:
-  --config <path>        Load configuration from YAML file
-                                                 (supports mpi_profile: auto|tuned)
-
-Topology Tree (Global PP):
-  --topology <spec>      Inline topology: "PP(name, Device(cpu,0), Device(cpu,0))"
-  --topology-file <path> Load topology from YAML file
-
-Memory Constraints:
-  --max-gpu-memory <mb>  Maximum GPU memory in MB
-  --max-cpu-memory <mb>  Maximum CPU memory in MB
+  --config <path>        Load configuration from YAML file. YAML values are
+                         loaded as the base config; subsequent CLI flags
+                         override any value from the file.
 
 MoE Configuration:
   --moe-shared-gpu       Place shared experts on GPU (default)
@@ -1385,33 +1393,47 @@ MoE Configuration:
   --moe-sparse-cpu       Place sparse experts on CPU (default)
 
 Precision:
-  --activation-precision <type>  Activation precision: fp32, bf16, fp16, q8_1
-  --act-prec <type>      Alias for --activation-precision
-    --kv-cache-precision <type>  KV cache precision: auto (q16_1 on CPU, fp16 on GPU), fp32, fp16, q8_1, q16_1, tq4, tq (TQ8 K + TQ4 V)
-    --kv-prec <type>       Alias for --kv-cache-precision
-
-Weight Sharding:
-  --shard-weights        Enable weight sharding
-  --no-shard-weights     Disable weight sharding
+  --activation-precision <type> / --activation-prec / --act-prec
+                         Activation precision: fp32, bf16, fp16, q8_1
+  --kv-cache-precision <type>  / --kv-prec
+                         KV cache precision: auto (default — q16_1 on CPU,
+                         fp16 on GPU), fp32, fp16, q8_1, q16_1, tq4, tq
+                         (short aliases accepted: f32, f16, q8, q16, i16)
 
 Heterogeneous Mode:
-  --heterogeneous        Enable heterogeneous mode
   --cpu-fraction <f>     CPU compute fraction (0.0-1.0, default: 0.2)
-  --no-gpu-tp            Disable GPU tensor parallelism
-  --no-cpu-tp            Disable CPU tensor parallelism
   --min-layers-per-domain <n>  Minimum layers per domain (default: 2)
 
 Verbosity:
-  -v                     Increase verbosity (-v = DEBUG, -vv = TRACE)
-  --list-devices         List available devices and exit
+  -v                     Increase verbosity (-v = DEBUG, -vv / -vvv = TRACE)
   -h, --help             Show this help message
+
+Not yet implemented (accepted but currently inert):
+  --fused-attention              superseded by --fused-attention-backend
+  --shard-weights / --no-shard-weights
+                                 weight sharding is automatic based on TP
+  --heterogeneous                no-op; use --define-domain for heterogeneous
+                                 setups
+  --no-gpu-tp / --no-cpu-tp      no-op under the current heterogeneous path
+  --tp-local / --tp-global       hybrid-TP subdegrees not yet consumed
+  --cpu-layers / --cpu-layers-first
+                                 legacy layer-placement path; use --pp-stage
+                                 with CPU domains instead
+  --max-gpu-memory / --max-cpu-memory
+                                 legacy DeviceOrchestrator is inactive
+  --topology / --topology-file   tree parsing not yet wired into runner
 
 Examples:
   llaminar2 -m model.gguf -p "Hello world" -n 50
   llaminar2 -m model.gguf --chat
   llaminar2 -m model.gguf --benchmark -n 100
   llaminar2 -m model.gguf --tp 2 --tp-devices "cuda:0,cuda:1"
-  llaminar2 -m model.gguf -d cuda:0 --fused-attention
+  llaminar2 -m model.gguf -d cuda:0 --fused-attention-backend jit
+  llaminar2 -m model.gguf -p "Hello world" -n 50
+  llaminar2 -m model.gguf --chat
+  llaminar2 -m model.gguf --benchmark -n 100
+  llaminar2 -m model.gguf --tp 2 --tp-devices "cuda:0,cuda:1"
+  llaminar2 -m model.gguf -d cuda:0 --fused-attention-backend jit
 )HELPTEXT";
     }
 
