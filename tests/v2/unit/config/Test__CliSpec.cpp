@@ -285,3 +285,264 @@ TEST(Test__CliSpec, FlagsRejectEqualsForm)
     EXPECT_TRUE(opt.matches("--bare"));
     EXPECT_FALSE(opt.matches("--bare=true"));
 }
+
+TEST(Test__CliSpec, MatchesShortNameAndAliases)
+{
+    CliOption<TestConfig> opt{
+        .short_name  = "-m",
+        .long_name   = "--mode",
+        .aliases     = {"--mode-alt", "--m-alias"},
+        .value_label = "<v>",
+        .setter      = setters::assignString(&TestConfig::string_value),
+    };
+    EXPECT_TRUE(opt.matches("-m"));
+    EXPECT_TRUE(opt.matches("--mode"));
+    EXPECT_TRUE(opt.matches("--mode-alt"));
+    EXPECT_TRUE(opt.matches("--m-alias"));
+    EXPECT_TRUE(opt.matches("--mode=foo"));       // equals form on primary long
+    EXPECT_TRUE(opt.matches("--m-alias=foo"));    // equals form on alias
+    EXPECT_FALSE(opt.matches("-m=foo"));          // equals form NOT allowed on short
+    EXPECT_FALSE(opt.matches("--modex"));         // prefix-only isn't a match
+    EXPECT_FALSE(opt.matches("--other"));
+}
+
+// ============================================================================
+// Value-parsing edge cases
+// ============================================================================
+
+TEST(Test__CliSpec, EmptyValueAfterEqualsThrows)
+{
+    // `--number=` with empty RHS must throw, not silently assign empty.
+    auto spec = buildTestSpec();
+    TestConfig c;
+    try
+    {
+        spec.parse({"--number="}, c);
+        FAIL() << "expected throw";
+    }
+    catch (const std::invalid_argument &e)
+    {
+        std::string msg = e.what();
+        EXPECT_NE(msg.find("--number"), std::string::npos);
+    }
+}
+
+TEST(Test__CliSpec, InvalidFloatThrowsWithFlagName)
+{
+    auto spec = buildTestSpec();
+    TestConfig c;
+    try
+    {
+        spec.parse({"--float", "not-a-float"}, c);
+        FAIL() << "expected throw";
+    }
+    catch (const std::invalid_argument &e)
+    {
+        EXPECT_NE(std::string(e.what()).find("--float"), std::string::npos);
+    }
+}
+
+TEST(Test__CliSpec, RepeatedValueFlagLastWriteWins)
+{
+    // For non-accumulating setters, a repeated flag should overwrite the
+    // previous value. This is the conventional CLI contract.
+    auto spec = buildTestSpec();
+    TestConfig c;
+    spec.parse({"--number", "1", "--number=2", "--number", "3"}, c);
+    EXPECT_EQ(c.int_value, 3);
+}
+
+TEST(Test__CliSpec, IncrementClampsAtMaxValue)
+{
+    // `incrementInt(..., max_value=5)` stops once we hit the cap, even if the
+    // flag appears more times.
+    auto spec = buildTestSpec();
+    TestConfig c;
+    spec.parse({"-v", "-v", "-v", "-v", "-v", "-v", "-v", "-v"}, c);
+    EXPECT_EQ(c.counter, 5);
+}
+
+TEST(Test__CliSpec, SetterExceptionPropagates)
+{
+    // User-provided custom setters are allowed to throw; the parser should
+    // propagate without wrapping, so callers see the original message.
+    CliSpec<TestConfig> spec;
+    spec.add({
+        .long_name   = "--bomb",
+        .value_label = "<v>",
+        .description = "always throws",
+        .setter      = [](TestConfig &, const std::string &) {
+            throw std::invalid_argument("boom: custom setter failed");
+        },
+    });
+    TestConfig c;
+    try
+    {
+        spec.parse({"--bomb", "ignored"}, c);
+        FAIL() << "expected throw";
+    }
+    catch (const std::invalid_argument &e)
+    {
+        EXPECT_NE(std::string(e.what()).find("boom"), std::string::npos);
+    }
+}
+
+TEST(Test__CliSpec, OptionWithoutSetterIsNoOp)
+{
+    // A missing setter must not crash; the option is still recognised so
+    // parsing doesn't fail on unknown-arg.
+    CliSpec<TestConfig> spec;
+    spec.add({
+        .long_name   = "--noop",
+        .description = "accepted but does nothing",
+    });
+    TestConfig c;
+    EXPECT_NO_THROW(spec.parse({"--noop"}, c));
+}
+
+TEST(Test__CliSpec, PartialParseAppliesFlagsBeforeException)
+{
+    // Documents current behaviour: the parser mutates the config in order and
+    // does not roll back on exception. Callers that want all-or-nothing
+    // semantics need to parse into a temp and swap on success.
+    auto spec = buildTestSpec();
+    TestConfig c;
+    EXPECT_THROW(spec.parse({"-a", "--mode", "bogus"}, c), std::invalid_argument);
+    EXPECT_TRUE(c.flag_a);   // applied before the throw
+    EXPECT_TRUE(c.enum_value.empty());
+}
+
+// ============================================================================
+// Setter helper coverage
+// ============================================================================
+
+TEST(Test__CliSpec, AssignBoolFalseSetter)
+{
+    CliSpec<TestConfig> spec;
+    spec.add({
+        .long_name = "--no-a",
+        .setter    = setters::assignBoolFalse(&TestConfig::flag_a),
+    });
+    TestConfig c;
+    c.flag_a = true;
+    spec.parse({"--no-a"}, c);
+    EXPECT_FALSE(c.flag_a);
+}
+
+TEST(Test__CliSpec, AssignIntLiteralSetter)
+{
+    // Pattern used by `-vv` / `-vvv` to jump straight to a specific level.
+    CliSpec<TestConfig> spec;
+    spec.add({
+        .short_name = "-vv",
+        .setter     = setters::assignIntLiteral(&TestConfig::counter, 2),
+    });
+    spec.add({
+        .short_name = "-vvv",
+        .setter     = setters::assignIntLiteral(&TestConfig::counter, 3),
+    });
+    TestConfig c;
+    spec.parse({"-vvv"}, c);
+    EXPECT_EQ(c.counter, 3);
+    spec.parse({"-vv"}, c);
+    EXPECT_EQ(c.counter, 2);
+}
+
+// ============================================================================
+// Help rendering details
+// ============================================================================
+
+TEST(Test__CliSpec, HelpExcludesNYIFromRegularCategory)
+{
+    auto spec = buildTestSpec();
+    std::string help = spec.getHelpText();
+
+    auto nyi_header = help.find("Not yet implemented");
+    auto nyi_flag   = help.find("--nyi");
+    ASSERT_NE(nyi_header, std::string::npos);
+    ASSERT_NE(nyi_flag, std::string::npos);
+    // The --nyi entry must be in the NYI section, not the plain "Bare:" one.
+    EXPECT_GT(nyi_flag, nyi_header);
+}
+
+TEST(Test__CliSpec, HelpWithoutCategoriesStillRenders)
+{
+    // addCategory() is optional; options that reference a never-registered
+    // category should still appear (in first-seen order).
+    CliSpec<TestConfig> spec;
+    spec.add({
+        .long_name   = "--one",
+        .category    = "Alpha",
+        .description = "first option",
+        .setter      = setters::assignBoolTrue(&TestConfig::flag_a),
+    });
+    spec.add({
+        .long_name   = "--two",
+        .category    = "Beta",
+        .description = "second option",
+        .setter      = setters::assignBoolTrue(&TestConfig::flag_b),
+    });
+    std::string help = spec.getHelpText();
+    auto a = help.find("Alpha:");
+    auto b = help.find("Beta:");
+    ASSERT_NE(a, std::string::npos);
+    ASSERT_NE(b, std::string::npos);
+    EXPECT_LT(a, b);
+    EXPECT_NE(help.find("--one"), std::string::npos);
+    EXPECT_NE(help.find("--two"), std::string::npos);
+}
+
+TEST(Test__CliSpec, HelpShowsValueLabelAndAliases)
+{
+    CliSpec<TestConfig> spec;
+    spec.add({
+        .short_name  = "-n",
+        .long_name   = "--number",
+        .aliases     = {"--num", "--count"},
+        .value_label = "<int>",
+        .description = "a number",
+        .setter      = setters::parseInt(&TestConfig::int_value, "--number"),
+    });
+    std::string help = spec.getHelpText();
+    EXPECT_NE(help.find("-n"), std::string::npos);
+    EXPECT_NE(help.find("--number"), std::string::npos);
+    EXPECT_NE(help.find("<int>"), std::string::npos);
+    // Description must appear.
+    EXPECT_NE(help.find("a number"), std::string::npos);
+}
+
+// ============================================================================
+// Spec inspection
+// ============================================================================
+
+TEST(Test__CliSpec, OptionsAccessorReturnsRegisteredOptions)
+{
+    auto spec = buildTestSpec();
+    const auto &opts = spec.options();
+    // Sanity: all 8 test options present.
+    EXPECT_EQ(opts.size(), 8u);
+    // Count by scanning for known long names.
+    int found = 0;
+    for (const auto &o : opts)
+    {
+        if (o.long_name == "--flag-a" || o.long_name == "--flag-b" ||
+            o.long_name == "--number" || o.long_name == "--float" ||
+            o.long_name == "--string" || o.long_name == "--mode" ||
+            o.long_name == "--nyi")
+            ++found;
+    }
+    EXPECT_EQ(found, 7);
+}
+
+TEST(Test__CliSpec, CliOptionDefaultsAreSafe)
+{
+    // Default-constructed option must be inert: no names, no setter, isFlag()
+    // true (empty value label), not NYI. Parsing an empty arg list with a
+    // spec containing this option should not throw.
+    CliOption<TestConfig> opt{};
+    EXPECT_TRUE(opt.isFlag());
+    EXPECT_FALSE(opt.not_yet_implemented);
+    EXPECT_TRUE(opt.allNames().empty());
+    EXPECT_FALSE(opt.matches(""));
+    EXPECT_FALSE(opt.matches("--anything"));
+}

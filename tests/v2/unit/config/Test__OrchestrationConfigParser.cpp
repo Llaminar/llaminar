@@ -1386,3 +1386,320 @@ TEST(Test__OrchestrationConfigParser, GetHelpText_ContainsExamples)
     EXPECT_TRUE(help.find("Examples:") != std::string::npos);
     EXPECT_TRUE(help.find("llaminar2") != std::string::npos);
 }
+
+// ============================================================================
+// Precision Tests (activation + kv-cache, with all short aliases)
+// ============================================================================
+
+TEST(Test__OrchestrationConfigParser, ParseArgs_KvCachePrecision_LongForm)
+{
+    ArgvHelper args({"llaminar2", "--kv-cache-precision", "q16_1"});
+    auto parser = createOrchestrationConfigParser();
+    auto config = parser->parseArgs(args.argc(), args.argv());
+    EXPECT_EQ(config.kv_cache_precision, "q16_1");
+}
+
+TEST(Test__OrchestrationConfigParser, ParseArgs_KvCachePrecision_ShortAliasFlag)
+{
+    ArgvHelper args({"llaminar2", "--kv-prec", "fp16"});
+    auto parser = createOrchestrationConfigParser();
+    auto config = parser->parseArgs(args.argc(), args.argv());
+    EXPECT_EQ(config.kv_cache_precision, "fp16");
+}
+
+TEST(Test__OrchestrationConfigParser, ParseArgs_KvCachePrecision_AcceptsShortValueAliases)
+{
+    // The kv-cache parser normalises to lowercase and accepts short value
+    // aliases (f32, f16, q8, q16, i16) in addition to canonical forms.
+    for (const auto &alias : {"f32", "f16", "q8", "q16", "i16", "tq4", "tq"})
+    {
+        ArgvHelper args({"llaminar2", "--kv-cache-precision", alias});
+        auto parser = createOrchestrationConfigParser();
+        auto config = parser->parseArgs(args.argc(), args.argv());
+        EXPECT_EQ(config.kv_cache_precision, alias) << "alias=" << alias;
+    }
+}
+
+TEST(Test__OrchestrationConfigParser, ParseArgs_KvCachePrecision_InvalidThrows)
+{
+    ArgvHelper args({"llaminar2", "--kv-cache-precision", "nonsense"});
+    auto parser = createOrchestrationConfigParser();
+    EXPECT_THROW(parser->parseArgs(args.argc(), args.argv()), std::invalid_argument);
+}
+
+TEST(Test__OrchestrationConfigParser, ParseArgs_ActivationPrecision_InvalidThrowsViaValidValues)
+{
+    // --activation-precision uses CliSpec's valid_values whitelist, so an
+    // unknown value must be rejected with a listing of the accepted set.
+    ArgvHelper args({"llaminar2", "--activation-precision", "int4"});
+    auto parser = createOrchestrationConfigParser();
+    try
+    {
+        parser->parseArgs(args.argc(), args.argv());
+        FAIL() << "expected throw";
+    }
+    catch (const std::invalid_argument &e)
+    {
+        std::string msg = e.what();
+        EXPECT_NE(msg.find("fp32"), std::string::npos);
+        EXPECT_NE(msg.find("bf16"), std::string::npos);
+    }
+}
+
+TEST(Test__OrchestrationConfigParser, ParseArgs_ActivationPrecision_AllThreeAliases)
+{
+    for (const auto &flag : {"--activation-precision", "--activation-prec", "--act-prec"})
+    {
+        ArgvHelper args({"llaminar2", flag, "bf16"});
+        auto parser = createOrchestrationConfigParser();
+        auto config = parser->parseArgs(args.argc(), args.argv());
+        EXPECT_EQ(config.activation_precision, "bf16") << "flag=" << flag;
+    }
+}
+
+// ============================================================================
+// MPI profile (enum) + backend / scope / split enum coverage
+// ============================================================================
+
+TEST(Test__OrchestrationConfigParser, ParseArgs_MPIProfile_Tuned)
+{
+    ArgvHelper args({"llaminar2", "--mpi-profile", "tuned"});
+    auto parser = createOrchestrationConfigParser();
+    auto config = parser->parseArgs(args.argc(), args.argv());
+    EXPECT_EQ(config.mpi_profile, MPIProfile::TUNED);
+}
+
+TEST(Test__OrchestrationConfigParser, ParseArgs_MPIProfile_InvalidThrows)
+{
+    ArgvHelper args({"llaminar2", "--mpi-profile", "turbo"});
+    auto parser = createOrchestrationConfigParser();
+    try
+    {
+        parser->parseArgs(args.argc(), args.argv());
+        FAIL() << "expected throw";
+    }
+    catch (const std::invalid_argument &e)
+    {
+        std::string msg = e.what();
+        EXPECT_NE(msg.find("--mpi-profile"), std::string::npos);
+        // valid_values whitelist should mention both accepted values.
+        EXPECT_NE(msg.find("auto"), std::string::npos);
+        EXPECT_NE(msg.find("tuned"), std::string::npos);
+    }
+}
+
+TEST(Test__OrchestrationConfigParser, ParseArgs_TpScope_NodeLocal)
+{
+    ArgvHelper args({"llaminar2", "--tp-scope", "node_local"});
+    auto parser = createOrchestrationConfigParser();
+    auto config = parser->parseArgs(args.argc(), args.argv());
+    EXPECT_EQ(config.tp_scope, TPScope::NODE_LOCAL);
+}
+
+TEST(Test__OrchestrationConfigParser, ParseArgs_Backend_Heterogeneous)
+{
+    ArgvHelper args({"llaminar2", "--backend", "heterogeneous"});
+    auto parser = createOrchestrationConfigParser();
+    auto config = parser->parseArgs(args.argc(), args.argv());
+    EXPECT_EQ(config.default_backend, CollectiveBackendType::HETEROGENEOUS);
+}
+
+TEST(Test__OrchestrationConfigParser, ParseArgs_PpSplit_InvalidThrows)
+{
+    ArgvHelper args({"llaminar2", "--pp-split", "lopsided"});
+    auto parser = createOrchestrationConfigParser();
+    EXPECT_THROW(parser->parseArgs(args.argc(), args.argv()), std::invalid_argument);
+}
+
+// ============================================================================
+// Device shorthand semantics
+// ============================================================================
+
+TEST(Test__OrchestrationConfigParser, ParseArgs_Device_CpuMarksAllLocal)
+{
+    // Bare `-d cpu` should set cpu_global_tp_all_local=true and leave
+    // numa_explicit=false (the orchestrator will fan out across NUMA nodes).
+    ArgvHelper args({"llaminar2", "-d", "cpu"});
+    auto parser = createOrchestrationConfigParser();
+    auto config = parser->parseArgs(args.argc(), args.argv());
+    EXPECT_TRUE(config.cpu_global_tp_all_local);
+    EXPECT_FALSE(config.device_for_this_rank_numa_explicit);
+}
+
+TEST(Test__OrchestrationConfigParser, ParseArgs_Device_InvalidCpuNumaThrows)
+{
+    ArgvHelper args({"llaminar2", "-d", "cpu:abc"});
+    auto parser = createOrchestrationConfigParser();
+    EXPECT_THROW(parser->parseArgs(args.argc(), args.argv()), std::invalid_argument);
+}
+
+// ============================================================================
+// Verbosity: -v / -vv / -vvv / repeated -v
+// ============================================================================
+
+TEST(Test__OrchestrationConfigParser, ParseArgs_Verbose_Triple)
+{
+    ArgvHelper args({"llaminar2", "-vvv"});
+    auto parser = createOrchestrationConfigParser();
+    auto config = parser->parseArgs(args.argc(), args.argv());
+    EXPECT_EQ(config.verbose_level, 3);
+}
+
+TEST(Test__OrchestrationConfigParser, ParseArgs_Verbose_RepeatedIncrements)
+{
+    ArgvHelper args({"llaminar2", "-v", "-v", "-v"});
+    auto parser = createOrchestrationConfigParser();
+    auto config = parser->parseArgs(args.argc(), args.argv());
+    EXPECT_EQ(config.verbose_level, 3);
+}
+
+TEST(Test__OrchestrationConfigParser, ParseArgs_Verbose_RepeatedIncrementsClampAt3)
+{
+    ArgvHelper args({"llaminar2", "-v", "-v", "-v", "-v", "-v"});
+    auto parser = createOrchestrationConfigParser();
+    auto config = parser->parseArgs(args.argc(), args.argv());
+    EXPECT_EQ(config.verbose_level, 3);
+}
+
+// ============================================================================
+// Deterministic: temperature forcing + env var side effect
+// ============================================================================
+
+TEST(Test__OrchestrationConfigParser, ParseArgs_Deterministic_ForcesTemperatureZero)
+{
+    // Even when --temperature is supplied non-zero before --deterministic,
+    // the deterministic flag must zero it out.
+    ArgvHelper args({"llaminar2", "--temperature", "0.8", "--deterministic"});
+    auto parser = createOrchestrationConfigParser();
+    auto config = parser->parseArgs(args.argc(), args.argv());
+    EXPECT_TRUE(config.deterministic);
+    EXPECT_FLOAT_EQ(config.temperature, 0.0f);
+}
+
+TEST(Test__OrchestrationConfigParser, ParseArgs_Deterministic_SetsEnvVar)
+{
+    unsetenv("LLAMINAR_DETERMINISTIC");
+    ArgvHelper args({"llaminar2", "--deterministic"});
+    auto parser = createOrchestrationConfigParser();
+    (void)parser->parseArgs(args.argc(), args.argv());
+    const char *env = std::getenv("LLAMINAR_DETERMINISTIC");
+    ASSERT_NE(env, nullptr);
+    EXPECT_STREQ(env, "1");
+    unsetenv("LLAMINAR_DETERMINISTIC");
+}
+
+// ============================================================================
+// Server mode flags
+// ============================================================================
+
+TEST(Test__OrchestrationConfigParser, ParseArgs_Serve_WithHostAndPort)
+{
+    ArgvHelper args({"llaminar2", "--serve", "--host", "0.0.0.0", "--port", "9000"});
+    auto parser = createOrchestrationConfigParser();
+    auto config = parser->parseArgs(args.argc(), args.argv());
+    EXPECT_TRUE(config.serve_mode);
+    EXPECT_EQ(config.serve_host, "0.0.0.0");
+    EXPECT_EQ(config.serve_port, 9000);
+}
+
+// ============================================================================
+// MPI bootstrap flags
+// ============================================================================
+
+TEST(Test__OrchestrationConfigParser, ParseArgs_MpiHostfile)
+{
+    ArgvHelper args({"llaminar2", "--mpi-hostfile", "/etc/hosts.txt"});
+    auto parser = createOrchestrationConfigParser();
+    auto config = parser->parseArgs(args.argc(), args.argv());
+    EXPECT_EQ(config.hostfile, "/etc/hosts.txt");
+}
+
+// ============================================================================
+// NYI flags still parse (back-compat)
+// ============================================================================
+
+TEST(Test__OrchestrationConfigParser, ParseArgs_NYIFlags_StillAccepted)
+{
+    // All NYI flags must still be parseable so existing scripts don't break.
+    ArgvHelper args({
+        "llaminar2",
+        "--topology", "PP(a)",
+        "--topology-file", "topo.yaml",
+        "--max-gpu-memory", "8192",
+        "--max-cpu-memory", "16384",
+        "--cpu-layers", "4",
+        "--cpu-layers-first",
+    });
+    auto parser = createOrchestrationConfigParser();
+    OrchestrationConfig config;
+    EXPECT_NO_THROW(config = parser->parseArgs(args.argc(), args.argv()));
+    EXPECT_EQ(config.topology_string, "PP(a)");
+    EXPECT_EQ(config.topology_file_path, "topo.yaml");
+    EXPECT_EQ(config.max_gpu_memory_mb, 8192u);
+    EXPECT_EQ(config.max_cpu_memory_mb, 16384u);
+    EXPECT_EQ(config.cpu_layers, 4);
+    EXPECT_TRUE(config.cpu_layers_first);
+}
+
+// ============================================================================
+// Cross-flag validation
+// ============================================================================
+
+TEST(Test__OrchestrationConfigParser, ParseArgs_Heterogeneous_NoGpuTp_NoCpuTp_Throws)
+{
+    ArgvHelper args({"llaminar2", "--heterogeneous", "--no-gpu-tp", "--no-cpu-tp"});
+    auto parser = createOrchestrationConfigParser();
+    EXPECT_THROW(parser->parseArgs(args.argc(), args.argv()), std::invalid_argument);
+}
+
+// ============================================================================
+// Negative-number value support for int options (regression guard)
+// ============================================================================
+
+TEST(Test__OrchestrationConfigParser, ParseArgs_NegativeSeedSpaceForm)
+{
+    ArgvHelper args({"llaminar2", "--seed", "-1"});
+    auto parser = createOrchestrationConfigParser();
+    auto config = parser->parseArgs(args.argc(), args.argv());
+    EXPECT_EQ(config.seed, -1);
+}
+
+TEST(Test__OrchestrationConfigParser, ParseArgs_NegativeNPredictSpaceForm)
+{
+    ArgvHelper args({"llaminar2", "-n", "-1"});
+    auto parser = createOrchestrationConfigParser();
+    auto config = parser->parseArgs(args.argc(), args.argv());
+    EXPECT_EQ(config.n_predict, -1);
+}
+
+// ============================================================================
+// Equals-form coverage for assorted option types
+// ============================================================================
+
+TEST(Test__OrchestrationConfigParser, ParseArgs_EqualsForm_OnEnum)
+{
+    ArgvHelper args({"llaminar2", "--tp-scope=local"});
+    auto parser = createOrchestrationConfigParser();
+    auto config = parser->parseArgs(args.argc(), args.argv());
+    EXPECT_EQ(config.tp_scope, TPScope::LOCAL);
+}
+
+TEST(Test__OrchestrationConfigParser, ParseArgs_EqualsForm_OnString)
+{
+    ArgvHelper args({"llaminar2", "--model=/tmp/model.gguf"});
+    auto parser = createOrchestrationConfigParser();
+    auto config = parser->parseArgs(args.argc(), args.argv());
+    EXPECT_EQ(config.model_path, "/tmp/model.gguf");
+}
+
+// ============================================================================
+// Last-write-wins for repeated value flags
+// ============================================================================
+
+TEST(Test__OrchestrationConfigParser, ParseArgs_RepeatedFlag_LastWriteWins)
+{
+    ArgvHelper args({"llaminar2", "--temperature", "0.5", "--temperature", "0.9"});
+    auto parser = createOrchestrationConfigParser();
+    auto config = parser->parseArgs(args.argc(), args.argv());
+    EXPECT_FLOAT_EQ(config.temperature, 0.9f);
+}
