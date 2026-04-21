@@ -17,13 +17,13 @@ namespace llaminar2
         // ANSI 256-color blue/cyan/water palette, light → deep.
         constexpr const char *kReset = "\033[0m";
         constexpr const char *kBold = "\033[1m";
-        constexpr const char *kSky = "\033[38;5;159m";    // very pale cyan
-        constexpr const char *kIce = "\033[38;5;123m";    // light cyan
-        constexpr const char *kAqua = "\033[38;5;87m";    // aqua
-        constexpr const char *kAzure = "\033[38;5;45m";   // bright blue
-        constexpr const char *kOcean = "\033[38;5;33m";   // deep blue
-        constexpr const char *kDeep = "\033[38;5;27m";    // deeper blue
-        constexpr const char *kDim = "\033[38;5;24m";     // muted teal
+        constexpr const char *kSky = "\033[38;5;159m";  // very pale cyan
+        constexpr const char *kIce = "\033[38;5;123m";  // light cyan
+        constexpr const char *kAqua = "\033[38;5;87m";  // aqua
+        constexpr const char *kAzure = "\033[38;5;45m"; // bright blue
+        constexpr const char *kOcean = "\033[38;5;33m"; // deep blue
+        constexpr const char *kDeep = "\033[38;5;27m";  // deeper blue
+        constexpr const char *kDim = "\033[38;5;24m";   // muted teal
 
         bool splashEnabled()
         {
@@ -49,29 +49,32 @@ namespace llaminar2
         if (!splashEnabled())
             return;
 
-        // Shower head: rounded top, perforated underside.
-        // Water column: gradient cyan ribbons of varying density.
-        // Wordmark: blocky LLAMINAR in azure/ocean blue.
+        // Tilted shower head (45° down-right) with a column of perfectly
+        // parallel diagonal water streams — laminar flow.  Streams shift
+        // +1 column right per row so each "\" continues the diagonal of
+        // the row above it. The wordmark sits to the right of the streams.
         std::cout
             << '\n'
-            << "  " << kAqua << "      .-~~~~~~-.        " << kReset << '\n'
-            << "  " << kAqua << "    .'  " << kSky << "o o o o" << kAqua << "  '.      " << kReset << '\n'
-            << "  " << kAqua << "   /   " << kSky << "o o o o o" << kAqua << "   \\     " << kReset << '\n'
-            << "  " << kAzure << "  '._" << kIce << ".o.o.o.o.o._" << kAzure << ".'    " << kReset << '\n'
-            << "  " << kAzure << "     " << kIce << "│ │ │ │ │ │      " << kReset
+            // ── tilted shower head ────────────────────────────────────────
+            << "  " << kAqua  << "      .-~~~-." << kReset << '\n'
+            << "  " << kAqua  << "     ( " << kSky << "o o" << kAqua << "  '\\." << kReset << '\n'
+            << "  " << kAzure << "      \\_" << kIce << "o_o_o" << kAzure << "_'\\." << kReset << '\n'
+            // ── 6 parallel streams + wordmark ─────────────────────────────
+            << "  " << "                " << kAqua  << "\\  \\  \\  \\  \\  \\"  << kReset << "  "
             << kBold << kOcean << " ██╗     ██╗      █████╗ ███╗   ███╗██╗███╗   ██╗ █████╗ ██████╗ " << kReset << '\n'
-            << "  " << kAzure << "     " << kAqua << "╵ │ ╵ │ ╵ │      " << kReset
+            << "  " << "                 " << kAqua  << "\\  \\  \\  \\  \\  \\"  << kReset << "  "
             << kBold << kOcean << " ██║     ██║     ██╔══██╗████╗ ████║██║████╗  ██║██╔══██╗██╔══██╗" << kReset << '\n'
-            << "  " << kOcean << "       " << kAqua << "│ ╵ │ ╵ │       " << kReset
-            << kBold << kDeep  << " ██║     ██║     ███████║██╔████╔██║██║██╔██╗ ██║███████║██████╔╝" << kReset << '\n'
-            << "  " << kOcean << "       " << kAqua << "╵   ╵   ╵       " << kReset
+            << "  " << "                  " << kAzure << "\\  \\  \\  \\  \\  \\"  << kReset << "  "
+            << kBold << kOcean << " ██║     ██║     ███████║██╔████╔██║██║██╔██╗ ██║███████║██████╔╝" << kReset << '\n'
+            << "  " << "                   " << kAzure << "\\  \\  \\  \\  \\  \\"  << kReset << "  "
             << kBold << kDeep  << " ██║     ██║     ██╔══██║██║╚██╔╝██║██║██║╚██╗██║██╔══██║██╔══██╗" << kReset << '\n'
-            << "  " << kDeep  << "                       " << kReset
+            << "  " << "                    " << kOcean << "\\  \\  \\  \\  \\  \\"  << kReset << "  "
             << kBold << kDeep  << " ███████╗███████╗██║  ██║██║ ╚═╝ ██║██║██║ ╚████║██║  ██║██║  ██║" << kReset << '\n'
-            << "  " << kDim   << "        ~ ~  ~ ~       " << kReset
+            << "  " << "                     " << kDeep  << "\\  \\  \\  \\  \\  \\"  << kReset << "  "
             << kDim           << " ╚══════╝╚══════╝╚═╝  ╚═╝╚═╝     ╚═╝╚═╝╚═╝  ╚═══╝╚═╝  ╚═╝╚═╝  ╚═╝" << kReset << '\n'
-            << "  " << kDim   << "      ~  ~ ~  ~ ~        " << kReset
-            << kDim           << "        l a m i n a r   l l m   i n f e r e n c e" << kReset << '\n'
+            // ── ripples beneath where the streams land ────────────────────
+            << "  " << "                      " << kDim  << "~  ~  ~  ~  ~  ~" << kReset << "      "
+            << kDim << "l a m i n a r   l l m   i n f e r e n c e" << kReset << '\n'
             << '\n';
         std::cout.flush();
     }
