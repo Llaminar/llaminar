@@ -153,6 +153,8 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v6
+      - name: Preflight — clear stale MPI/IPC state
+        run: bash scripts/ci/preflight_clean.sh
       - name: Configure core-dump capture
         run: |
           sudo mkdir -p "${{ github.workspace }}/cores"
@@ -200,6 +202,8 @@ jobs:
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v6
+      - name: Preflight — clear stale MPI/IPC state
+        run: bash scripts/ci/preflight_clean.sh
       - name: Configure core-dump capture
         run: |
           sudo mkdir -p "${{ github.workspace }}/cores"
@@ -252,6 +256,8 @@ jobs:
     timeout-minutes: 180
     steps:
       - uses: actions/checkout@v6
+      - name: Preflight — clear stale MPI/IPC state
+        run: bash scripts/ci/preflight_clean.sh
       - name: Configure core-dump capture
         run: |
           sudo mkdir -p "${{ github.workspace }}/cores"
@@ -310,6 +316,8 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v6
+      - name: Preflight — clear stale MPI/IPC state
+        run: bash scripts/ci/preflight_clean.sh
       - name: Configure core-dump capture
         run: |
           sudo mkdir -p "${{ github.workspace }}/cores"
@@ -359,6 +367,8 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v6
+      - name: Preflight — clear stale MPI/IPC state
+        run: bash scripts/ci/preflight_clean.sh
       - name: Configure core-dump capture
         run: |
           sudo mkdir -p "${{ github.workspace }}/cores"
