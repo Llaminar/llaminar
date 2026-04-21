@@ -86,28 +86,28 @@ namespace llaminar2
         /**
          * @brief RAII helper for static initialization registration
          *
-         * This struct's constructor runs during static initialization (before main)
-         * to register the AMD factory with GPUDeviceContextPool.
+         * NOTE: The static constructor intentionally does NOT enumerate ROCm
+         * devices. GPU enumeration during static init runs before main() and
+         * cannot be controlled by environment variables or CLI flags, adding
+         * measurable latency to every process start (even for `--help`) and
+         * emitting log lines before logging has been configured by the app.
          *
-         * NOTE: This may not run if the linker strips this TU from the static
-         * library. Use ensureAMDFactoryRegistered() as an explicit fallback.
+         * Actual registration is deferred to ensureAMDFactoryRegistered()
+         * which is called explicitly from GPUDeviceContextPool when an AMD
+         * context is first needed. This makes startup zero-cost when only
+         * CUDA or CPU backends are used, and avoids spurious ROCm output
+         * during early-exit paths like `--help` and `--version`.
          */
         struct AMDFactoryRegistrar
         {
             AMDFactoryRegistrar()
             {
-                try
-                {
-                    doRegisterAMDFactory();
-                }
-                catch (const std::exception &e)
-                {
-                    LOG_WARN("[AMDContextFactory] Failed to register ROCm factory: " << e.what());
-                }
+                // Intentionally empty - registration deferred to
+                // ensureAMDFactoryRegistered() for controllable startup.
             }
         };
 
-        // Static instance triggers registration during library load
+        // Static instance kept for linker inclusion (ensures TU is not stripped)
         static AMDFactoryRegistrar amd_factory_registrar;
 
     } // anonymous namespace
