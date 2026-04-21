@@ -94,6 +94,19 @@ namespace llaminar2
             return;
         }
 
+        // NCCL collectives require at least 2 ranks. Single-device configurations
+        // (TP=1, single-GPU tests) cannot benefit from pre-initialization and
+        // would only pay the cost of spawning NCCL proxy threads. Lazy init via
+        // getBackend() will still trigger if a multi-device DeviceGroup is
+        // requested later, so skipping here is purely an optimisation.
+        if (cuda_ordinals.size() < 2)
+        {
+            LOG_INFO("[BackendRouter] Only " << cuda_ordinals.size()
+                     << " CUDA device in cluster inventory; skipping NCCL pre-initialization "
+                     << "(collectives require >=2 devices, lazy init will run on demand if needed)");
+            return;
+        }
+
         // Build a device group with ALL available CUDA devices from inventory
         // This triggers the NCCL backend's copy communicator initialization
         DeviceGroupBuilder builder;
@@ -163,6 +176,21 @@ namespace llaminar2
         if (rocm_ordinals.empty())
         {
             LOG_DEBUG("[BackendRouter] No ROCm devices in cluster inventory, skipping RCCL pre-initialization");
+            return;
+        }
+
+        // RCCL collectives require at least 2 ranks. Single-device configurations
+        // (TP=1, single-GPU tests, CPU-only tests in ROCm-visible containers)
+        // cannot benefit from pre-initialization and would only pay the cost of
+        // spawning RCCL proxy threads (which has been observed to crash inside
+        // libamdhip64 on some driver/firmware combinations). Lazy init via
+        // getBackend() will still trigger if a multi-device DeviceGroup is
+        // requested later, so skipping here is purely an optimisation.
+        if (rocm_ordinals.size() < 2)
+        {
+            LOG_INFO("[BackendRouter] Only " << rocm_ordinals.size()
+                     << " ROCm device in cluster inventory; skipping RCCL pre-initialization "
+                     << "(collectives require >=2 devices, lazy init will run on demand if needed)");
             return;
         }
 

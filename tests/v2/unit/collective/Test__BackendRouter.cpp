@@ -1117,12 +1117,19 @@ namespace llaminar2::test
         rank0.node_id = 0;
         rank0.local_rank = 0;
 
-        // Add 1 CUDA and 1 ROCm GPU
+        // Add 2 CUDA and 2 ROCm GPUs. Both vendor counts must be >=2 so that
+        // the per-vendor "skip pre-init when <2 devices" gate does not fire.
         DeviceInfo cuda0;
         cuda0.type = DeviceType::CUDA;
         cuda0.local_device_id = 0;
         cuda0.name = "NVIDIA A100";
         rank0.gpus.push_back(cuda0);
+
+        DeviceInfo cuda1;
+        cuda1.type = DeviceType::CUDA;
+        cuda1.local_device_id = 1;
+        cuda1.name = "NVIDIA A100";
+        rank0.gpus.push_back(cuda1);
 
         DeviceInfo rocm0;
         rocm0.type = DeviceType::ROCm;
@@ -1130,8 +1137,14 @@ namespace llaminar2::test
         rocm0.name = "AMD MI250";
         rank0.gpus.push_back(rocm0);
 
+        DeviceInfo rocm1;
+        rocm1.type = DeviceType::ROCm;
+        rocm1.local_device_id = 1;
+        rocm1.name = "AMD MI250";
+        rank0.gpus.push_back(rocm1);
+
         cluster_inventory_.ranks.push_back(rank0);
-        cluster_inventory_.total_gpus = 2;
+        cluster_inventory_.total_gpus = 4;
 
         auto factory = std::make_unique<MockBackendFactory>();
         factory->setAvailable(CollectiveBackendType::NCCL, true);
@@ -1146,18 +1159,20 @@ namespace llaminar2::test
 
         // Verify BOTH backends were initialized
         EXPECT_TRUE(mock_nccl->wasInitialized())
-            << "NCCL should be initialized (CUDA device in inventory)";
+            << "NCCL should be initialized (>=2 CUDA devices in inventory)";
         EXPECT_TRUE(mock_rccl->wasInitialized())
-            << "RCCL should be initialized (ROCm device in inventory)";
+            << "RCCL should be initialized (>=2 ROCm devices in inventory)";
 
         // Verify each was initialized with correct device type only
         const auto &nccl_group = mock_nccl->initGroup();
-        EXPECT_EQ(nccl_group.devices.size(), 1u);
+        EXPECT_EQ(nccl_group.devices.size(), 2u);
         EXPECT_EQ(nccl_group.devices[0], DeviceId::cuda(0));
+        EXPECT_EQ(nccl_group.devices[1], DeviceId::cuda(1));
 
         const auto &rccl_group = mock_rccl->initGroup();
-        EXPECT_EQ(rccl_group.devices.size(), 1u);
+        EXPECT_EQ(rccl_group.devices.size(), 2u);
         EXPECT_EQ(rccl_group.devices[0], DeviceId::rocm(0));
+        EXPECT_EQ(rccl_group.devices[1], DeviceId::rocm(1));
     }
 #endif // HAVE_NCCL && HAVE_RCCL
 
@@ -1230,5 +1245,138 @@ namespace llaminar2::test
         EXPECT_FALSE(mock_rccl->wasInitialized())
             << "RCCL should NOT be initialized when only CUDA devices in inventory";
     }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Pre-Initialization Single-Device Skip Tests
+    //
+    // Regression tests for the "skip pre-init when fewer than 2 same-vendor
+    // devices are present" gate. NCCL/RCCL collectives require >=2 ranks; a
+    // single-device inventory cannot benefit from pre-initialisation and the
+    // unconditional eager init has been observed to crash inside libamdhip64
+    // when an RCCL proxy thread is spawned in unsuitable Docker/driver
+    // environments. Lazy init via getBackend() will still trigger if a
+    // multi-device DeviceGroup is requested later, so skipping here is purely
+    // an optimisation.
+    // ═══════════════════════════════════════════════════════════════════════════
+
+#ifdef HAVE_NCCL
+    TEST_F(Test__BackendRouter, PreInitSkipsNCCLWhenOnlyOneCUDADevice)
+    {
+        // Setup: Inventory with exactly 1 CUDA device (TP=1 / single-GPU test).
+        cluster_inventory_.world_size = 1;
+        cluster_inventory_.node_count = 1;
+        cluster_inventory_.ranks.clear();
+
+        RankInventory rank0;
+        rank0.rank = 0;
+        rank0.node_id = 0;
+        rank0.local_rank = 0;
+
+        DeviceInfo cuda0;
+        cuda0.type = DeviceType::CUDA;
+        cuda0.local_device_id = 0;
+        cuda0.name = "TestGPU0";
+        rank0.gpus.push_back(cuda0);
+
+        cluster_inventory_.ranks.push_back(rank0);
+        cluster_inventory_.total_gpus = 1;
+
+        auto factory = std::make_unique<MockBackendFactory>();
+        factory->setAvailable(CollectiveBackendType::NCCL, true);
+        auto *mock_nccl = factory->addMockBackend(CollectiveBackendType::NCCL);
+        mock_nccl->setAvailable(true);
+
+        // Create router - pre-init runs in constructor and should bail out.
+        auto router = createRouter(std::move(factory));
+
+        EXPECT_FALSE(mock_nccl->wasInitialized())
+            << "NCCL pre-init must skip when only 1 CUDA device is in inventory "
+               "(collectives require >=2 ranks); lazy init should run on demand "
+               "if a multi-device group is later requested.";
+    }
+#endif // HAVE_NCCL
+
+#ifdef HAVE_RCCL
+    TEST_F(Test__BackendRouter, PreInitSkipsRCCLWhenOnlyOneROCmDevice)
+    {
+        // Setup: Inventory with exactly 1 ROCm device. This is the common Docker
+        // CI scenario (single MI50 visible) where unconditional RCCL pre-init
+        // spawned a proxy thread that segfaulted inside libamdhip64.so.
+        cluster_inventory_.world_size = 1;
+        cluster_inventory_.node_count = 1;
+        cluster_inventory_.ranks.clear();
+
+        RankInventory rank0;
+        rank0.rank = 0;
+        rank0.node_id = 0;
+        rank0.local_rank = 0;
+
+        DeviceInfo rocm0;
+        rocm0.type = DeviceType::ROCm;
+        rocm0.local_device_id = 0;
+        rocm0.name = "TestMI100_0";
+        rank0.gpus.push_back(rocm0);
+
+        cluster_inventory_.ranks.push_back(rank0);
+        cluster_inventory_.total_gpus = 1;
+
+        auto factory = std::make_unique<MockBackendFactory>();
+        factory->setAvailable(CollectiveBackendType::RCCL, true);
+        auto *mock_rccl = factory->addMockBackend(CollectiveBackendType::RCCL);
+        mock_rccl->setAvailable(true);
+
+        // Create router - pre-init runs in constructor and should bail out.
+        auto router = createRouter(std::move(factory));
+
+        EXPECT_FALSE(mock_rccl->wasInitialized())
+            << "RCCL pre-init must skip when only 1 ROCm device is in inventory "
+               "(collectives require >=2 ranks); lazy init should run on demand "
+               "if a multi-device group is later requested.";
+    }
+#endif // HAVE_RCCL
+
+#if defined(HAVE_NCCL) && defined(HAVE_RCCL)
+    TEST_F(Test__BackendRouter, PreInitSkipsBothWhenEachVendorHasOnlyOneDevice)
+    {
+        // Setup: 1 CUDA + 1 ROCm. Total GPU count is 2, but each vendor
+        // individually has only 1, so neither NCCL nor RCCL should pre-init.
+        cluster_inventory_.world_size = 1;
+        cluster_inventory_.node_count = 1;
+        cluster_inventory_.ranks.clear();
+
+        RankInventory rank0;
+        rank0.rank = 0;
+        rank0.node_id = 0;
+        rank0.local_rank = 0;
+
+        DeviceInfo cuda0;
+        cuda0.type = DeviceType::CUDA;
+        cuda0.local_device_id = 0;
+        rank0.gpus.push_back(cuda0);
+
+        DeviceInfo rocm0;
+        rocm0.type = DeviceType::ROCm;
+        rocm0.local_device_id = 0;
+        rank0.gpus.push_back(rocm0);
+
+        cluster_inventory_.ranks.push_back(rank0);
+        cluster_inventory_.total_gpus = 2;
+
+        auto factory = std::make_unique<MockBackendFactory>();
+        factory->setAvailable(CollectiveBackendType::NCCL, true);
+        factory->setAvailable(CollectiveBackendType::RCCL, true);
+        auto *mock_nccl = factory->addMockBackend(CollectiveBackendType::NCCL);
+        mock_nccl->setAvailable(true);
+        auto *mock_rccl = factory->addMockBackend(CollectiveBackendType::RCCL);
+        mock_rccl->setAvailable(true);
+
+        auto router = createRouter(std::move(factory));
+
+        EXPECT_FALSE(mock_nccl->wasInitialized())
+            << "NCCL pre-init must skip when only 1 CUDA device (per-vendor count <2)";
+        EXPECT_FALSE(mock_rccl->wasInitialized())
+            << "RCCL pre-init must skip when only 1 ROCm device (per-vendor count <2)";
+    }
+#endif // HAVE_NCCL && HAVE_RCCL
 
 } // namespace llaminar2::test
