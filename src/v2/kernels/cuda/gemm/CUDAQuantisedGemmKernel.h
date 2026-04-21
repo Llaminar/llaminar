@@ -40,6 +40,7 @@
 #include "interfaces/IWorkspaceConsumer.h"
 #include <memory>
 #include <cstdint>
+#include <string>
 #include <vector>
 #include <unordered_map>
 #include <mutex>
@@ -478,6 +479,19 @@ namespace llaminar2
             // IWorkspaceConsumer state - REQUIRED for execution
             // Kernels do not own any work buffers; all buffers come from workspace
             DeviceWorkspaceManager *workspace_ = nullptr; ///< Bound workspace manager (not owned, REQUIRED)
+
+            // Per-kernel-instance unique slice id for the TEMP_C_FP32 redirect
+            // buffer. Each cached GEMM kernel needs its OWN slice in the shared
+            // workspace; otherwise a kernel can clobber the redirect source of
+            // another kernel whose async D2D copy is still pending. Set in the
+            // constructors from a static atomic counter.
+            uint32_t slice_id_ = 0;
+
+            // Helper: unique workspace buffer name for this kernel's TEMP_C_FP32 slice.
+            std::string tempCFp32BufferName() const
+            {
+                return std::string(GemmWorkspaceBuffers::TEMP_C_FP32) + "_" + std::to_string(slice_id_);
+            }
 
             // GPU stream for graph capture (nullptr = default stream)
             void *gpu_stream_ = nullptr;

@@ -868,6 +868,12 @@ namespace llaminar2
         // Constructor / Destructor
         // =====================================================================
 
+        // Per-process atomic counter that hands out a unique slice id to every
+        // CUDAQuantisedGemmKernel instance. Used to give each kernel its own
+        // TEMP_C_FP32 workspace slice so concurrent async D2D copies queued by
+        // different kernels cannot clobber each other.
+        static std::atomic<uint32_t> g_cuda_quant_gemm_slice_counter{0};
+
         CUDAQuantisedGemmKernel::CUDAQuantisedGemmKernel(const TensorBase *weights, int cuda_device_id)
             : weights_(weights),
               packed_(nullptr),
@@ -878,6 +884,7 @@ namespace llaminar2
               owns_weight_memory_(true), // Legacy path owns weight memory
               impl_(std::make_unique<Impl>())
         {
+            slice_id_ = g_cuda_quant_gemm_slice_counter.fetch_add(1, std::memory_order_relaxed);
             if (!weights)
             {
                 throw std::runtime_error("[CUDAQuantisedGemmKernel] Null weight tensor");
@@ -935,6 +942,7 @@ namespace llaminar2
               owns_weight_memory_(false), // CUDAPackedWeights owns the memory
               impl_(std::make_unique<Impl>())
         {
+            slice_id_ = g_cuda_quant_gemm_slice_counter.fetch_add(1, std::memory_order_relaxed);
             if (!packed)
             {
                 throw std::runtime_error("[CUDAQuantisedGemmKernel] Null packed weights");
@@ -1002,6 +1010,7 @@ namespace llaminar2
               owns_weight_memory_(other.owns_weight_memory_),
               impl_(std::move(other.impl_))
         {
+            slice_id_ = other.slice_id_;
             other.weights_ = nullptr;
             other.packed_ = nullptr;
             other.weights_converted_ = false;
@@ -1427,7 +1436,7 @@ namespace llaminar2
                 {
                     validateWorkspace();
                     d_mapped_output = d_C;
-                    d_C = static_cast<float *>(workspace_->getBuffer(GemmWorkspaceBuffers::TEMP_C_FP32));
+                    d_C = static_cast<float *>(workspace_->getBuffer(tempCFp32BufferName()));
                     static std::once_flag q8_mapped_once;
                     std::call_once(q8_mapped_once, [&]()
                                    { LOG_WARN("[CUDAQuantisedGemmKernel] Q8→FP32 MAPPED REDIRECT: M=" << m << " N=" << n
@@ -1464,7 +1473,7 @@ namespace llaminar2
                 {
                     validateWorkspace();
                     d_mapped_output = d_C;
-                    d_C = static_cast<float *>(workspace_->getBuffer(GemmWorkspaceBuffers::TEMP_C_FP32));
+                    d_C = static_cast<float *>(workspace_->getBuffer(tempCFp32BufferName()));
                     static std::once_flag fp32_mapped_once;
                     std::call_once(fp32_mapped_once, [&]()
                                    { LOG_WARN("[CUDAQuantisedGemmKernel] FP32→FP32 MAPPED REDIRECT: M=" << m << " N=" << n
@@ -2753,7 +2762,7 @@ namespace llaminar2
             // When output is host-mapped (e.g., logits), scattered GPU writes go over PCIe.
             // This buffer provides an HBM target; we bulk-DMA to mapped memory after.
             size_t temp_c_fp32_bytes = static_cast<size_t>(m) * n * sizeof(float);
-            reqs.buffers.push_back({GemmWorkspaceBuffers::TEMP_C_FP32, temp_c_fp32_bytes, 256, true});
+            reqs.buffers.push_back({tempCFp32BufferName(), temp_c_fp32_bytes, 256, true});
 
             LOG_DEBUG("[CUDAQuantisedGemmKernel::getWorkspaceRequirements] INT8 path: "
                       << "quant_a=" << (quant_a_bytes / 1024) << "KB, "

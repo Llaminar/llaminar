@@ -96,6 +96,7 @@
 #include <vector>
 #include <cmath>
 #include <algorithm>
+#include <atomic>
 #include <string>
 #include <mutex>
 #include <set>
@@ -971,6 +972,12 @@ namespace llaminar2
             pools.clear();
         }
 
+        // Per-process atomic counter that hands out a unique slice id to every
+        // ROCmQuantisedGemmKernel instance. Used to give each kernel its own
+        // TEMP_C_FP32 / TEMP_A_FP32 workspace slices so concurrent async D2D/D2H
+        // copies queued by different kernels cannot clobber each other.
+        static std::atomic<uint32_t> g_rocm_quant_gemm_slice_counter{0};
+
         ROCmQuantisedGemmKernel::ROCmQuantisedGemmKernel(const TensorBase *weights, int rocm_device_id)
             : weights_(weights),
               packed_(nullptr),
@@ -981,6 +988,7 @@ namespace llaminar2
               owns_weight_memory_(true), // Legacy path owns weight memory
               impl_(std::make_unique<Impl>())
         {
+            slice_id_ = g_rocm_quant_gemm_slice_counter.fetch_add(1, std::memory_order_relaxed);
             if (!weights)
             {
                 throw std::runtime_error("[ROCmQuantisedGemmKernel] Null weight tensor");
@@ -1019,6 +1027,7 @@ namespace llaminar2
               owns_weight_memory_(false), // ROCmPackedWeights owns the memory
               impl_(std::make_unique<Impl>())
         {
+            slice_id_ = g_rocm_quant_gemm_slice_counter.fetch_add(1, std::memory_order_relaxed);
             if (!packed)
             {
                 throw std::runtime_error("[ROCmQuantisedGemmKernel] Null packed weights");
@@ -3490,8 +3499,12 @@ namespace llaminar2
             reqs.buffers.push_back({GemmWorkspaceBuffers::SCALES_A, scales_a_bytes, 256, true});
             reqs.buffers.push_back({GemmWorkspaceBuffers::SCALES_A_BLOCKWISE, scales_a_blockwise_bytes, 256, true});
             reqs.buffers.push_back({GemmWorkspaceBuffers::ACC_INT32, acc_int32_bytes, 256, true});
-            reqs.buffers.push_back({GemmWorkspaceBuffers::TEMP_A_FP32, temp_a_fp32_bytes, 256, true});
-            reqs.buffers.push_back({GemmWorkspaceBuffers::TEMP_C_FP32, temp_c_fp32_bytes, 256, true});
+            // Per-instance slice names for TEMP_A_FP32 / TEMP_C_FP32 so that
+            // multiple cached GEMM kernels do not alias the same redirect
+            // source across overlapping async D2D/D2H copies (see note at
+            // slice_id_ definition in the header).
+            reqs.buffers.push_back({tempAFp32BufferName(), temp_a_fp32_bytes, 256, true});
+            reqs.buffers.push_back({tempCFp32BufferName(), temp_c_fp32_bytes, 256, true});
 
             // NOTE: CK (ComposableKernel) workspace buffers (ROCM_CK_INT32,
             // ROCM_A_PADDED, ROCM_SCALE_A_PADDED, ROCM_E_PADDED, ROCM_B_REPACK)
@@ -4166,16 +4179,18 @@ namespace llaminar2
                 throw std::runtime_error(
                     "[ROCmQuantisedGemmKernel] Workspace missing required buffer: ACC_INT32");
             }
-            // ROCm-specific buffers
-            if (!workspace_->hasBuffer(GemmWorkspaceBuffers::TEMP_A_FP32))
+            // ROCm-specific buffers (per-instance slices)
+            if (!workspace_->hasBuffer(tempAFp32BufferName()))
             {
                 throw std::runtime_error(
-                    "[ROCmQuantisedGemmKernel] Workspace missing required buffer: TEMP_A_FP32");
+                    "[ROCmQuantisedGemmKernel] Workspace missing required buffer: " +
+                    tempAFp32BufferName());
             }
-            if (!workspace_->hasBuffer(GemmWorkspaceBuffers::TEMP_C_FP32))
+            if (!workspace_->hasBuffer(tempCFp32BufferName()))
             {
                 throw std::runtime_error(
-                    "[ROCmQuantisedGemmKernel] Workspace missing required buffer: TEMP_C_FP32");
+                    "[ROCmQuantisedGemmKernel] Workspace missing required buffer: " +
+                    tempCFp32BufferName());
             }
             // NOTE: CK-specific buffers (ROCM_CK_INT32, ROCM_A_PADDED,
             // ROCM_SCALE_A_PADDED, ROCM_E_PADDED, ROCM_B_REPACK) are no
@@ -4191,8 +4206,8 @@ namespace llaminar2
             impl_->d_scales_A = static_cast<float *>(workspace_->getBuffer(GemmWorkspaceBuffers::SCALES_A));
             impl_->d_scales_A_blockwise = static_cast<float *>(workspace_->getBuffer(GemmWorkspaceBuffers::SCALES_A_BLOCKWISE));
             impl_->d_C_int32 = static_cast<int32_t *>(workspace_->getBuffer(GemmWorkspaceBuffers::ACC_INT32));
-            impl_->d_A_fp32 = static_cast<float *>(workspace_->getBuffer(GemmWorkspaceBuffers::TEMP_A_FP32));
-            impl_->d_C_fp32 = static_cast<float *>(workspace_->getBuffer(GemmWorkspaceBuffers::TEMP_C_FP32));
+            impl_->d_A_fp32 = static_cast<float *>(workspace_->getBuffer(tempAFp32BufferName()));
+            impl_->d_C_fp32 = static_cast<float *>(workspace_->getBuffer(tempCFp32BufferName()));
             impl_->d_scatter_partial = static_cast<float *>(workspace_->getBuffer(GemmWorkspaceBuffers::ROCM_SCATTER_PARTIAL));
 
             // Set capacity values to max (workspace is pre-sized for maximum dimensions)

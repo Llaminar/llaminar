@@ -823,6 +823,23 @@ add_v2_test(V2_Unit_ROCmQuantisedGemmKernel_Workspace
     MPI_PROCS 1
 )
 
+# Test: ROCmQuantisedGemmKernel TEMP_C_FP32 / TEMP_A_FP32 per-instance workspace
+# slicing (regression — mirror of CUDA parity #146 bug).
+# Bug: KernelFactory caches one ROCmQuantisedGemmKernel per (device, weight) pair,
+# but every instance declared the same TEMP_C_FP32 / TEMP_A_FP32 workspace buffer
+# name. WorkspaceRequirements::merge() collapsed them into a single shared slot,
+# so overlapping async D2D/D2H copies could clobber each other's redirect source.
+# Fix: per-instance unique slice names so merge() keeps each kernel's buffer
+# separate.
+add_executable(v2_unit_rocm_gemm_workspace_slicing
+    unit/kernels/rocm/Test__ROCmQuantisedGemmKernel_WorkspaceSlicing.cpp)
+target_link_libraries(v2_unit_rocm_gemm_workspace_slicing llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_ROCmQuantisedGemmKernel_WorkspaceSlicing
+    COMMAND $<TARGET_FILE:v2_unit_rocm_gemm_workspace_slicing>
+    LABELS "V2;Unit;Kernels;ROCm;GEMM;Workspace;IWorkspaceConsumer;Regression"
+    MPI_PROCS 1  # Pure host-side workspace requirement test, no GPU needed
+)
+
 # Test: MPIBackend - MPI-based collective backend for inter-node communication
 add_executable(v2_unit_mpi_backend unit/collective/backends/Test__MPIBackend.cpp)
 target_link_libraries(v2_unit_mpi_backend 
@@ -3721,6 +3738,23 @@ add_v2_test(V2_Unit_CUDAFlashAttention_DecodeKVLen
     COMMAND $<TARGET_FILE:v2_unit_cuda_flash_attention_decode_kvlen>
     LABELS "V2;Unit;CUDA;Attention;FlashAttention;FlashDecode;DecodeMode;KVCache;BugFix"
     MPI_PROCS 1  # Tests GPU attention locally, no MPI needed
+)
+
+# Test: CUDAQuantisedGemmKernel TEMP_C_FP32 workspace slicing (regression for parity #146)
+# Bug discovered 2026-01: KernelFactory caches one CUDAQuantisedGemmKernel per
+# (device, weight) pair, but every kernel declared the same TEMP_C_FP32
+# workspace buffer name. WorkspaceRequirements::merge() collapsed those into
+# a single shared slot, so a second kernel could clobber the redirect source
+# of another while its async D2D copy was still in flight, producing all-zero
+# outputs (parity test #146 flake).
+# Fix: per-instance unique TEMP_C_FP32 slice name so merge() keeps each
+# kernel's buffer separate.
+add_executable(v2_unit_cuda_gemm_workspace unit/kernels/cuda/Test__CUDAQuantisedGemmKernel_Workspace.cpp)
+target_link_libraries(v2_unit_cuda_gemm_workspace llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_CUDAQuantisedGemmKernel_Workspace
+    COMMAND $<TARGET_FILE:v2_unit_cuda_gemm_workspace>
+    LABELS "V2;Unit;Kernels;CUDA;GEMM;Workspace;IWorkspaceConsumer;Regression"
+    MPI_PROCS 1  # Pure host-side workspace requirement test, no GPU needed
 )
 
 # Integration Test: cuBLAS GEMM (Phase 1 - dense GEMM via cuBLAS for FP32/FP16/BF16)
