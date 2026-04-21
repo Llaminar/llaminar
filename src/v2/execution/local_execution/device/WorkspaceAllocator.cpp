@@ -211,10 +211,104 @@ namespace llaminar2
             auto existing = device_workspaces_.find(device);
             if (existing != device_workspaces_.end() && existing->second)
             {
+                // Check if new consumers need buffers not yet in the existing workspace.
+                // This happens when per-layer graphs create new GEMM kernel instances
+                // with unique per-instance buffer names (e.g., gemm_temp_c_fp32_<id>).
+                bool needs_realloc = false;
                 for (const auto &consumer_binding : consumers)
                 {
-                    consumer_binding.consumer->bindWorkspace(existing->second.get());
+                    auto reqs = consumer_binding.consumer->getWorkspaceRequirements(
+                        consumer_binding.m,
+                        consumer_binding.n,
+                        consumer_binding.k);
+                    for (const auto &buf : reqs.buffers)
+                    {
+                        if (!existing->second->hasBuffer(buf.name))
+                        {
+                            needs_realloc = true;
+                            break;
+                        }
+                    }
+                    if (needs_realloc)
+                        break;
                 }
+
+                if (!needs_realloc)
+                {
+                    for (const auto &consumer_binding : consumers)
+                    {
+                        consumer_binding.consumer->bindWorkspace(existing->second.get());
+                    }
+                    continue;
+                }
+
+                // Reconstruct existing requirements from current workspace
+                WorkspaceRequirements existing_reqs;
+                for (const auto &name : existing->second->bufferNames())
+                {
+                    size_t sz = existing->second->getBufferSize(name);
+                    existing_reqs.buffers.push_back({name, sz, 256, true});
+                }
+
+                // Release old workspace so we can reallocate with merged requirements
+                size_t old_budget = existing->second->budget();
+                existing->second->release();
+                existing->second.reset();
+                device_workspaces_.erase(device);
+                device_workspace_budgets_.erase(device);
+
+                // Merge existing + new requirements
+                WorkspaceRequirements combined = existing_reqs;
+                for (const auto &consumer_binding : consumers)
+                {
+                    auto reqs = consumer_binding.consumer->getWorkspaceRequirements(
+                        consumer_binding.m,
+                        consumer_binding.n,
+                        consumer_binding.k);
+                    combined.merge(reqs);
+                }
+
+                size_t budget = std::max(old_budget, model_floor_budget);
+                const size_t needed = combined.total_bytes_with_alignment();
+                if (needed > budget)
+                {
+                    const size_t available = queryAvailableMemory(device);
+                    const size_t max_expandable = (available > config.headroom)
+                                                      ? available - config.headroom
+                                                      : 0;
+                    if (needed <= max_expandable)
+                    {
+                        budget = needed;
+                    }
+                }
+
+                LOG_INFO("[WorkspaceAllocator] Reallocating workspace on "
+                         << device.toString() << " with "
+                         << combined.buffers.size() << " buffers ("
+                         << (needed / (1024 * 1024)) << "MB needed, budget="
+                         << (budget / (1024 * 1024)) << "MB)");
+
+                auto manager = std::make_unique<DeviceWorkspaceManager>(device, budget);
+                if (!manager->allocate(combined))
+                {
+                    LOG_ERROR("[WorkspaceAllocator] Failed to reallocate workspace on "
+                              << device.toString()
+                              << " (needed=" << needed
+                              << ", budget=" << budget << ")");
+                    return false;
+                }
+
+                for (const auto &consumer_binding : consumers)
+                {
+                    consumer_binding.consumer->bindWorkspace(manager.get());
+                }
+
+                LOG_INFO("[WorkspaceAllocator] Reallocated " << (manager->used() / (1024 * 1024))
+                                                             << "MB workspace on " << device.toString()
+                                                             << " (" << manager->bufferCount() << " buffers)");
+
+                device_workspace_budgets_[device] = budget;
+                device_workspaces_[device] = std::move(manager);
                 continue;
             }
 
@@ -238,12 +332,34 @@ namespace llaminar2
                 continue;
             }
 
+            // If the combined requirements exceed the initial budget, try to
+            // expand up to the available device memory (minus headroom).
+            // The initial budget uses a conservative max_budget cap that may
+            // be too small for models with many per-instance GEMM workspaces.
+            const size_t needed = combined.total_bytes_with_alignment();
+            if (needed > budget)
+            {
+                const size_t available = queryAvailableMemory(device);
+                const size_t max_expandable = (available > config.headroom)
+                                                  ? available - config.headroom
+                                                  : 0;
+                if (needed <= max_expandable)
+                {
+                    LOG_INFO("[WorkspaceAllocator] Expanding budget on "
+                             << device.toString() << " from "
+                             << (budget / (1024 * 1024)) << "MB to "
+                             << (needed / (1024 * 1024)) << "MB (available="
+                             << (available / (1024 * 1024)) << "MB)");
+                    budget = needed;
+                }
+            }
+
             auto manager = std::make_unique<DeviceWorkspaceManager>(device, budget);
             if (!manager->allocate(combined))
             {
                 LOG_ERROR("[WorkspaceAllocator] Failed to allocate workspace on "
                           << device.toString()
-                          << " (needed=" << combined.total_bytes_with_alignment()
+                          << " (needed=" << needed
                           << ", budget=" << budget << ")");
                 return false;
             }

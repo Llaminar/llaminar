@@ -355,6 +355,52 @@ namespace llaminar2
         return dynamic_cast<IWorkspaceConsumer *>(cached_gemm_q_);
     }
 
+    WorkspaceRequirements FusedQKVGEMMStage::getWorkspaceRequirements(int m, int n, int k) const
+    {
+        // Ensure all three kernels are resolved so we report ALL per-instance buffers.
+        auto *self = const_cast<FusedQKVGEMMStage *>(this);
+        if (!cache_resolved_individual_)
+        {
+            if (params_.wq)
+            {
+                auto *wq_base = dynamic_cast<TensorBase *>(const_cast<ITensor *>(params_.wq));
+                if (wq_base)
+                {
+                    auto *prepared = llaminar::v2::kernels::KernelFactory::getOrCreatePreparedGemmWeights(wq_base, params_.device_id);
+                    self->cached_gemm_q_ = llaminar::v2::kernels::KernelFactory::getOrCreateGemmEngine(prepared);
+                }
+            }
+            if (params_.wk)
+            {
+                auto *wk_base = dynamic_cast<TensorBase *>(const_cast<ITensor *>(params_.wk));
+                if (wk_base)
+                {
+                    auto *prepared = llaminar::v2::kernels::KernelFactory::getOrCreatePreparedGemmWeights(wk_base, params_.device_id);
+                    self->cached_gemm_k_ = llaminar::v2::kernels::KernelFactory::getOrCreateGemmEngine(prepared);
+                }
+            }
+            if (params_.wv)
+            {
+                auto *wv_base = dynamic_cast<TensorBase *>(const_cast<ITensor *>(params_.wv));
+                if (wv_base)
+                {
+                    auto *prepared = llaminar::v2::kernels::KernelFactory::getOrCreatePreparedGemmWeights(wv_base, params_.device_id);
+                    self->cached_gemm_v_ = llaminar::v2::kernels::KernelFactory::getOrCreateGemmEngine(prepared);
+                }
+            }
+            self->cache_resolved_individual_ = true;
+        }
+
+        WorkspaceRequirements combined;
+        if (auto *consumer_q = dynamic_cast<IWorkspaceConsumer *>(cached_gemm_q_))
+            combined.merge(consumer_q->getWorkspaceRequirements(m, n, k));
+        if (auto *consumer_k = dynamic_cast<IWorkspaceConsumer *>(cached_gemm_k_))
+            combined.merge(consumer_k->getWorkspaceRequirements(m, n, k));
+        if (auto *consumer_v = dynamic_cast<IWorkspaceConsumer *>(cached_gemm_v_))
+            combined.merge(consumer_v->getWorkspaceRequirements(m, n, k));
+        return combined;
+    }
+
     void FusedQKVGEMMStage::bindWorkspace(DeviceWorkspaceManager *workspace)
     {
         // Bind workspace to ALL THREE kernels (Q, K, V)

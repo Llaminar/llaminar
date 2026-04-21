@@ -931,6 +931,7 @@ namespace llaminar2
             cache_stats_.attention_cache_misses++;
 
             // Execute the newly built graph
+            ensureDeviceWorkspaceAllocated(*cache.attention_decode);
             bool success = executor_.execute(*cache.attention_decode, ctx);
             if (!success)
             {
@@ -974,6 +975,7 @@ namespace llaminar2
             }
         }
 
+        ensureDeviceWorkspaceAllocated(graph);
         bool success = executor_.execute(graph, ctx);
 
         // Debug: dump intermediate buffers (for layer 0 only)
@@ -1055,6 +1057,7 @@ namespace llaminar2
             cache_stats_.ffn_cache_misses++;
 
             // Execute the newly built graph
+            ensureDeviceWorkspaceAllocated(*cache.ffn_decode);
             bool success = executor_.execute(*cache.ffn_decode, ctx);
             if (!success)
             {
@@ -1085,6 +1088,7 @@ namespace llaminar2
 
         ComputeGraph graph = result.takeGraph();
 
+        ensureDeviceWorkspaceAllocated(graph);
         bool success = executor_.execute(graph, ctx);
 
         if (!success)

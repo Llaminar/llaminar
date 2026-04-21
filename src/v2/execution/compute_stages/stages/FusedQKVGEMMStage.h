@@ -83,13 +83,21 @@ namespace llaminar2
         /**
          * @brief Get a GEMM kernel as IWorkspaceConsumer for delegation
          *
-         * Returns the Q projection kernel from KernelFactory. All three kernels
-         * (Q, K, V) share the same workspace, so returning any one works for
-         * workspace requirements calculation.
+         * Returns the Q projection kernel from KernelFactory. Used for
+         * single-kernel operations (e.g., hasWorkspace checks).
          *
          * @return Kernel implementing IWorkspaceConsumer, or nullptr if not available
          */
         IWorkspaceConsumer *getKernelAsWorkspaceConsumer() override;
+
+        /**
+         * @brief Get workspace requirements from ALL THREE GEMM kernels (Q, K, V)
+         *
+         * Override the default single-kernel delegation because each kernel has
+         * per-instance unique buffer names (e.g., gemm_temp_c_fp32_<id>).
+         * Reporting only Q's requirements would miss K's and V's unique buffers.
+         */
+        WorkspaceRequirements getWorkspaceRequirements(int m, int n = 0, int k = 0) const override;
 
         /**
          * @brief Bind workspace to ALL THREE underlying GEMM kernels (Q, K, V)
