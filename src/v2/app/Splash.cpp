@@ -57,23 +57,8 @@ namespace llaminar2
         //   The 6 backslashes shift +1 column per row to form perfectly
         //   parallel 45° diagonals (laminar flow), but the wordmark stays
         //   straight because trailing pad shrinks by the same amount.
-        //
-        //   The shower head is a flat perforated disc spanning columns 5-17.
-        //   Its bottom-right spout `\` lands at column 18 — exactly one
-        //   diagonal step (+1 row, +1 col) from row 0's leftmost stream `\`
-        //   at column 19, so water visibly emerges from the spout into the
-        //   laminar flow column.
         std::cout
             << '\n'
-            // ── perforated showerhead (flat disc, spout at bottom-right) ──
-            //   Row 1 (dome top):    cols 6-17  ".-========-."
-            //   Row 2 (face+holes):  cols 5-17  "| o o o o o |"
-            //   Row 3 (bottom+spout):cols 6-17  "'-========-'"  + spout `\` at col 18
-            << "  " << kAqua  << "   .-========-." << kReset << '\n'
-            << "  " << kAqua  << "  | "
-                   << kSky    << "o o o o o"
-                   << kAqua   << " |" << kReset << '\n'
-            << "  " << kAzure << "   '-========-'" << kIce << "\\" << kReset << '\n'
             // ── 6 parallel streams + fixed-column wordmark ────────────────
             << "  " << "                " << kAqua  << "\\  \\  \\  \\  \\  \\"  << kReset << "         "
             << kBold << kOcean << "██╗     ██╗      █████╗ ███╗   ███╗██╗███╗   ██╗ █████╗ ██████╗" << kReset << '\n'
