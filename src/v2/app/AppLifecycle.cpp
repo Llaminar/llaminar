@@ -5,7 +5,7 @@
 
 #include "app/AppLifecycle.h"
 #include "app/SubcommandRouter.h"
-#include "app/commands/LegacyCommand.h"
+#include "app/commands/BenchmarkCommand.h"
 #include "app/commands/DescribeCommand.h"
 #include "app/commands/OneshotCommand.h"
 #include "app/commands/ServeCommand.h"
@@ -21,11 +21,9 @@ namespace llaminar2
         // Register subcommands
         router.add(std::make_unique<OneshotCommand>());
         router.add(std::make_unique<ServeCommand>());
+        router.add(std::make_unique<BenchmarkCommand>());
         router.add(std::make_unique<PlanCommand>());
         router.add(std::make_unique<DescribeCommand>());
-
-        // Legacy fallback: full flat-flag path (backward compat)
-        router.setFallback(std::make_unique<LegacyCommand>());
 
         return router.dispatch(argc, argv);
     }

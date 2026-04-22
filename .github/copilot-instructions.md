@@ -107,19 +107,19 @@ The `llaminar2` executable automatically bootstraps MPI and configures the runti
 
 ```bash
 # Standard inference (auto-detects topology, single device)
-./build_v2_release/llaminar2 -m models/qwen2.5-0.5b-instruct-q4_0.gguf -p "Hello, world!" -n 50
+./build_v2_release/llaminar2 oneshot -m models/qwen2.5-0.5b-instruct-q4_0.gguf -p "Hello, world!" -n 50
 
 # Debug logging
-LLAMINAR_LOG_LEVEL=DEBUG ./build_v2/llaminar2 -m models/qwen2.5-0.5b-instruct-q4_0.gguf -p "Hello, world!" -n 50
+LLAMINAR_LOG_LEVEL=DEBUG ./build_v2/llaminar2 oneshot -m models/qwen2.5-0.5b-instruct-q4_0.gguf -p "Hello, world!" -n 50
 
 # Specify device explicitly
-./build_v2_release/llaminar2 -d cuda:0 -m model.gguf -p "Hello" -n 50
+./build_v2_release/llaminar2 oneshot -d cuda:0 -m model.gguf -p "Hello" -n 50
 
 # Dry-run to preview configuration without execution
-./build_v2_release/llaminar2 --dry-run -m models/qwen2.5-0.5b-instruct-q4_0.gguf
+./build_v2_release/llaminar2 oneshot --dry-run -m models/qwen2.5-0.5b-instruct-q4_0.gguf
 
 # Show detected topology and exit
-./build_v2_release/llaminar2 --show-topology
+./build_v2_release/llaminar2 oneshot --show-topology
 ```
 
 The executable automatically configures:
@@ -228,7 +228,7 @@ For complex heterogeneous setups, define named TP domains and PP stage mappings.
 
 ```bash
 # Heterogeneous PP+TP: 2 CUDA GPUs for layers 0-13, 2 ROCm GPUs for layers 14-27
-./build_v2_release/llaminar2 \
+./build_v2_release/llaminar2 oneshot \
   --define-domain "gpu_fast=cuda:0,cuda:1;weights=0.6,0.4;backend=nccl" \
   --define-domain "gpu_slow=rocm:0,rocm:1;backend=rccl" \
   --pp-stage "0=gpu_fast:0-13" \
@@ -236,13 +236,13 @@ For complex heterogeneous setups, define named TP domains and PP stage mappings.
   -m model.gguf -p "Hello" -n 50
 
 # Single domain (equivalent to --tp-devices but with explicit backend)
-./build_v2_release/llaminar2 \
+./build_v2_release/llaminar2 oneshot \
   --define-domain "tp_group=cuda:0,cuda:1;backend=nccl" \
   --pp-stage "0=tp_group:0-27" \
   -m model.gguf -p "Hello"
 
 # Preview domain configuration without running
-./build_v2_release/llaminar2 \
+./build_v2_release/llaminar2 oneshot \
   --define-domain "gpu_fast=cuda:0,cuda:1;backend=nccl" \
   --define-domain "gpu_slow=rocm:0,rocm:1;backend=rccl" \
   --pp-stage "0=gpu_fast:0-13" \
@@ -264,19 +264,19 @@ For complex heterogeneous setups, define named TP domains and PP stage mappings.
 
 ```bash
 # Benchmark on first CUDA GPU
-./build_v2_release/llaminar2 --benchmark -m model.gguf -d cuda:0
+./build_v2_release/llaminar2 benchmark -m model.gguf -d cuda:0
 
 # Benchmark on second ROCm GPU
-./build_v2_release/llaminar2 --benchmark -m model.gguf -d rocm:1
+./build_v2_release/llaminar2 benchmark -m model.gguf -d rocm:1
 
 # Benchmark on CPU (all sockets — auto tensor parallel across sockets)
-./build_v2_release/llaminar2 --benchmark -m model.gguf -d cpu
+./build_v2_release/llaminar2 benchmark -m model.gguf -d cpu
 
 # Benchmark on a specific CPU socket only
-./build_v2_release/llaminar2 --benchmark -m model.gguf -d cpu:0
+./build_v2_release/llaminar2 benchmark -m model.gguf -d cpu:0
 
 # With full profiling (kernel + executor overhead)
-LLAMINAR_PROFILING=1 ./build_v2_release/llaminar2 --benchmark -m model.gguf -d cuda:0
+LLAMINAR_PROFILING=1 ./build_v2_release/llaminar2 benchmark -m model.gguf -d cuda:0
 ```
 
 **Device Selection** (`-d <device>:<ordinal>`):
@@ -320,7 +320,7 @@ LLAMINAR_PROFILING=1 ./build_v2_release/llaminar2 --benchmark -m model.gguf -d c
 Enable per-kernel timing breakdown:
 
 ```bash
-LLAMINAR_PROFILING=1 ./build_v2_release/llaminar2 --benchmark -m model.gguf -d cuda:0
+LLAMINAR_PROFILING=1 ./build_v2_release/llaminar2 benchmark -m model.gguf -d cuda:0
 ```
 
 **Profiled Operations**: `GEMM_Q8`, `ATTENTION`, `FFN_DOWN`, `FFN_GATE`, `FFN_UP`, `LM_HEAD`, `QUANTIZE_Q8`, `RMS_NORM`, `SWIGLU`, `ROPE`, `RESIDUAL_ADD`, `EMBEDDING`
@@ -349,10 +349,10 @@ Llaminar auto-bootstraps MPI via `mpirun` when launched directly. Profiling tool
 
 ```bash
 # ❌ WRONG - ncu attaches to mpirun, not llaminar2
-sudo /usr/local/cuda/bin/ncu ./build_v2_release/llaminar2 -d cuda:0 -m model.gguf -p "test" -n 5
+sudo /usr/local/cuda/bin/ncu ./build_v2_release/llaminar2 oneshot -d cuda:0 -m model.gguf -p "test" -n 5
 
 # ✅ CORRECT - ncu profiles the actual GPU process
-sudo /usr/local/cuda/bin/ncu ./build_v2_release/llaminar2 --no-mpi-bootstrap -d cuda:0 -m model.gguf -p "test" -n 5
+sudo /usr/local/cuda/bin/ncu ./build_v2_release/llaminar2 oneshot --no-mpi-bootstrap -d cuda:0 -m model.gguf -p "test" -n 5
 ```
 
 This flag is **not needed** when profiling standalone test binaries (e.g., `v2_perf_cuda_streamk_ab`) since they don't auto-bootstrap MPI.
@@ -380,7 +380,7 @@ Use nsys for a high-level view of kernel launches, durations, and CPU/GPU overla
 # Full trace with kernel summary statistics
 sudo /usr/local/cuda/bin/nsys profile -t cuda --stats=true \
   -o /tmp/my_trace -f true \
-  ./build_v2_release/llaminar2 --no-mpi-bootstrap -d cuda:0 -m model.gguf -p "test" -n 10
+  ./build_v2_release/llaminar2 oneshot --no-mpi-bootstrap -d cuda:0 -m model.gguf -p "test" -n 10
 
 # Extract per-kernel summary from a saved report
 /usr/local/cuda/bin/nsys stats --report cuda_gpu_kern_sum /tmp/my_trace.nsys-rep
@@ -407,7 +407,7 @@ sudo -E /usr/local/cuda/bin/ncu \
   --section LaunchStats \
   --target-processes all \
   -o /tmp/my_kernel_ncu -f \
-  ./build_v2_release/llaminar2 --no-mpi-bootstrap -d cuda:0 -m model.gguf -p "test" -n 1
+  ./build_v2_release/llaminar2 oneshot --no-mpi-bootstrap -d cuda:0 -m model.gguf -p "test" -n 1
 
 # Read saved report
 sudo /usr/local/cuda/bin/ncu -i /tmp/my_kernel_ncu.ncu-rep --page details
@@ -543,9 +543,9 @@ cat > /tmp/run_bench.sh << 'SCRIPT'
 export OMP_NUM_THREADS=28
 export OMP_PLACES=cores
 export OMP_PROC_BIND=close
-exec ./build_v2_release/llaminar2 --no-mpi-bootstrap -d cpu:0 \
+exec ./build_v2_release/llaminar2 benchmark --no-mpi-bootstrap -d cpu:0 \
   -m models/Qwen2.5-7B-Instruct-Q8_0.gguf \
-  --benchmark -p "Your prompt here" -n 1
+  -p "Your prompt here" -n 1
 SCRIPT
 chmod +x /tmp/run_bench.sh
 ```
@@ -752,7 +752,7 @@ mpirun -np 2 valgrind --tool=memcheck --leak-check=full ./build_v2/tests/v2/v2_t
 |---------|----------|
 | MPI hangs | Use `MPI_Barrier` before/after collective operations |
 | Numerical divergence | Run parity tests, check layer-by-layer snapshots |
-| Performance regression | Use `--benchmark` mode, verify Release build with `-march=native` |
+| Performance regression | Use `llaminar2 benchmark` subcommand, verify Release build with `-march=native` |
 | Memory allocation failures | Enable NUMA verification, check first-touch allocation |
 | Race conditions | Use `OMP_WORKSHARE_REGION` macro, avoid shared mutable state |
 | Inference produces garbage | Use `-t 0` (greedy sampling) to eliminate randomness |
@@ -802,13 +802,13 @@ The async system copies tensor data to an internal queue and immediately returns
 
 ```bash
 # Default: async mode with 2 I/O threads
-LLAMINAR_STAGE_DUMP_ENABLED=1 ./llaminar2 -m model.gguf -p "test"
+LLAMINAR_STAGE_DUMP_ENABLED=1 ./llaminar2 oneshot -m model.gguf -p "test"
 
 # Disable async for debugging or when memory is constrained
-LLAMINAR_STAGE_DUMP_ENABLED=1 LLAMINAR_STAGE_DUMP_ASYNC=0 ./llaminar2 -m model.gguf -p "test"
+LLAMINAR_STAGE_DUMP_ENABLED=1 LLAMINAR_STAGE_DUMP_ASYNC=0 ./llaminar2 oneshot -m model.gguf -p "test"
 
 # Increase I/O threads for faster writes on fast storage
-LLAMINAR_STAGE_DUMP_ENABLED=1 LLAMINAR_STAGE_DUMP_ASYNC_THREADS=4 ./llaminar2 -m model.gguf -p "test"
+LLAMINAR_STAGE_DUMP_ENABLED=1 LLAMINAR_STAGE_DUMP_ASYNC_THREADS=4 ./llaminar2 oneshot -m model.gguf -p "test"
 ```
 
 ### Substring Matching for Stage Names
@@ -839,12 +839,12 @@ LLAMINAR_STAGE_DUMP_LAYERS=0,1,2 \
 LLAMINAR_STAGE_DUMP_ENABLED=1 \
 LLAMINAR_STAGE_DUMP_NAMES=layer0_ \
 LLAMINAR_STAGE_DUMP_ITERATION=0 \
-./build_v2_release/llaminar2 -m model.gguf -p "test"
+./build_v2_release/llaminar2 oneshot -m model.gguf -p "test"
 
 # Dump only attention type stages (by type, not name)
 LLAMINAR_STAGE_DUMP_ENABLED=1 \
 LLAMINAR_STAGE_DUMP_TYPES=ATTENTION,GEMM \
-./build_v2_release/llaminar2 -m model.gguf -p "test"
+./build_v2_release/llaminar2 oneshot -m model.gguf -p "test"
 ```
 
 ### Output Structure
@@ -967,18 +967,18 @@ The Stage Output Print facility provides a lightweight way to inspect tensor val
 
 ```bash
 # Print outputs for all stages (verbose!)
-LLAMINAR_STAGE_OUTPUT_PRINT=1 ./build_v2_release/llaminar2 -m model.gguf -p "Hello"
+LLAMINAR_STAGE_OUTPUT_PRINT=1 ./build_v2_release/llaminar2 oneshot -m model.gguf -p "Hello"
 
 # Print only FFN stages for layer 0
 LLAMINAR_STAGE_OUTPUT_PRINT=1 \
 LLAMINAR_STAGE_OUTPUT_PRINT_STAGES=layer0_gate_up_proj,layer0_swiglu,layer0_down_proj \
-./build_v2_release/llaminar2 -m model.gguf -p "Hello"
+./build_v2_release/llaminar2 oneshot -m model.gguf -p "Hello"
 
 # Print with more elements per row
 LLAMINAR_STAGE_OUTPUT_PRINT=1 \
 LLAMINAR_STAGE_OUTPUT_PRINT_N=16 \
 LLAMINAR_STAGE_OUTPUT_PRINT_STAGES=layer0_swiglu \
-./build_v2_release/llaminar2 -m model.gguf -p "Hello"
+./build_v2_release/llaminar2 oneshot -m model.gguf -p "Hello"
 ```
 
 ### Output Format
@@ -1077,12 +1077,12 @@ For example, if Layer 8 shows `Min Cosine=0.47` at `FFN_RESIDUAL` but `Max Drop=
 
 **Step 1**: Use greedy sampling to eliminate randomness:
 ```bash
-./build_v2_release/llaminar2 -m model.gguf -p "prompt" -n 10 -t 0
+./build_v2_release/llaminar2 oneshot -m model.gguf -p "prompt" -n 10 -t 0
 ```
 
 **Step 2**: Compare top-5 predictions:
 ```bash
-LLAMINAR_LOG_LEVEL=TRACE ./build_v2_release/llaminar2 -m model.gguf -p "prompt" -n 1 -t 0 2>&1 | grep "Top-5"
+LLAMINAR_LOG_LEVEL=TRACE ./build_v2_release/llaminar2 oneshot -m model.gguf -p "prompt" -n 1 -t 0 2>&1 | grep "Top-5"
 ```
 
 **Step 3**: Run parity tests:
@@ -1093,7 +1093,7 @@ ctest --test-dir build_v2_integration -R "V2_Integration_Parity_Qwen2" -V
 **Step 4**: Enable stage tracing for full visibility:
 ```bash
 LLAMINAR_STAGE_DUMP_ENABLED=1 LLAMINAR_MPI_LOG_COLLECTIVES=1 \
-./build_v2_release/llaminar2 -tp 2 --explain-placement -m model.gguf -p "test"
+./build_v2_release/llaminar2 oneshot -tp 2 --explain-placement -m model.gguf -p "test"
 ```
 
 ### CSV Output for Automated Analysis
@@ -1578,16 +1578,16 @@ With 2-way TP: ~50% reduction for sharded weights, ~25-30% overall.
 
 ```bash
 # 2-way LOCAL TP on CUDA GPUs (auto-detects NCCL)
-./build_v2_release/llaminar2 -tp 2 --tp-scope local -m model.gguf -p "Hello"
+./build_v2_release/llaminar2 oneshot -tp 2 --tp-scope local -m model.gguf -p "Hello"
 
 # Explicit device list for LOCAL TP
-./build_v2_release/llaminar2 --tp-devices "cuda:0,cuda:1" -m model.gguf -p "Hello"
+./build_v2_release/llaminar2 oneshot --tp-devices "cuda:0,cuda:1" -m model.gguf -p "Hello"
 
 # Proportional TP (73%/27% split for heterogeneous GPUs)
-./build_v2_release/llaminar2 --tp-devices "cuda:0,rocm:0" --tp-weights "0.73,0.27" -m model.gguf -p "Hello"
+./build_v2_release/llaminar2 oneshot --tp-devices "cuda:0,rocm:0" --tp-weights "0.73,0.27" -m model.gguf -p "Hello"
 
 # Preview TP configuration without running
-./build_v2_release/llaminar2 -tp 4 --tp-scope local --explain-placement --dry-run -m model.gguf
+./build_v2_release/llaminar2 oneshot -tp 4 --tp-scope local --explain-placement --dry-run -m model.gguf
 ```
 
 ### YAML Configuration
@@ -1604,7 +1604,7 @@ backend: nccl
 ```
 
 ```bash
-./build_v2_release/llaminar2 --config orchestration.yaml -m model.gguf -p "Hello"
+./build_v2_release/llaminar2 oneshot --config orchestration.yaml -m model.gguf -p "Hello"
 ```
 
 ---
@@ -1632,10 +1632,10 @@ MPI_Barrier(MPI_COMM_WORLD);
 ```bash
 # Log all MPI collectives with timing
 LLAMINAR_MPI_LOG_COLLECTIVES=1 LLAMINAR_MPI_LOG_TIMING=1 \
-mpirun -np 2 ./build_v2_release/llaminar2 -m model.gguf -p "test"
+mpirun -np 2 ./build_v2_release/llaminar2 oneshot -m model.gguf -p "test"
 
 # Enable checksum verification (slow)
-LLAMINAR_MPI_VERIFY_CHECKSUMS=1 mpirun -np 2 ./build_v2_release/llaminar2 -m model.gguf -p "test"
+LLAMINAR_MPI_VERIFY_CHECKSUMS=1 mpirun -np 2 ./build_v2_release/llaminar2 oneshot -m model.gguf -p "test"
 ```
 
 ### Rank Comparison Testing
@@ -1957,13 +1957,13 @@ The transfer tracing system helps identify unnecessary or wasteful memory transf
 LLAMINAR_TRACE_TRANSFERS=1 \
 LLAMINAR_TRACE_TRANSFERS_ONLY_D2H=1 \
 LLAMINAR_TRACE_TRANSFERS_MIN_BYTES=1000000 \
-./build_v2_release/llaminar2 -m model.gguf -p "test" -n 10
+./build_v2_release/llaminar2 oneshot -m model.gguf -p "test" -n 10
 
 # Throw exception on first large transfer (for stack trace debugging)
 LLAMINAR_TRACE_TRANSFERS=1 \
 LLAMINAR_TRACE_TRANSFERS_THROW=1 \
 LLAMINAR_TRACE_TRANSFERS_MIN_BYTES=1000000 \
-./build_v2_release/llaminar2 -m model.gguf -p "test"
+./build_v2_release/llaminar2 oneshot -m model.gguf -p "test"
 ```
 
 **Common Issues Detected**:

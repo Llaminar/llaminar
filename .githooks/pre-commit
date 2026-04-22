@@ -200,7 +200,7 @@ echo -e "${GREEN}✓ E2E server tests passed${NC}"
 echo ""
 
 # Step 6: Performance Regression Benchmarks
-# Runs --benchmark for each model × device combination defined in
+# Runs 'llaminar2 benchmark' for each model × device combination defined in
 # benchmark_baseline.json and compares prefill/decode throughput against
 # canonical baselines. Devices that are unavailable are skipped gracefully.
 echo -e "${YELLOW}[8/8] Running performance regression benchmarks...${NC}"

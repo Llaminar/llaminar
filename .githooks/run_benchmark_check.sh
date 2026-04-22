@@ -1,8 +1,8 @@
 #!/bin/bash
 # Performance regression benchmark check for Llaminar pre-commit hook.
 #
-# Runs --benchmark for each model × device combination listed in the
-# baseline JSON, parses prefill/decode tok/s, and fails if any metric
+# Runs 'llaminar2 benchmark' for each model × device combination listed in
+# the baseline JSON, parses prefill/decode tok/s, and fails if any metric
 # regresses beyond the configured threshold.
 #
 # Baseline JSON format (array of model configs):
@@ -106,8 +106,9 @@ for (( mi=0; mi<NUM_MODELS; mi++ )); do
 
     MODEL_PATH="$ROOT_DIR/$MODEL"
     if [[ ! -f "$MODEL_PATH" ]]; then
-        echo -e "${YELLOW}Skipping ${MODEL_NAME}: model not found (${MODEL})${NC}"
-        echo ""
+        echo -e "${RED}✗ FAILED: ${MODEL_NAME}: model not found (${MODEL})${NC}" >&2
+        OVERALL_PASS=false
+        FAILED_CHECKS+="  [${MODEL_NAME}] Model file missing: ${MODEL}\n"
         continue
     fi
 
@@ -120,19 +121,23 @@ for (( mi=0; mi<NUM_MODELS; mi++ )); do
         echo -ne "  Benchmarking ${BOLD}${DEVICE}${NC} ... "
 
         set +e
-        BENCH_OUTPUT=$("$RELEASE_BIN" --benchmark -d "$DEVICE" -m "$MODEL_PATH" -n "$DECODE_TOKENS" 2>&1)
+        BENCH_OUTPUT=$("$RELEASE_BIN" benchmark -d "$DEVICE" -m "$MODEL_PATH" -n "$DECODE_TOKENS" 2>&1)
         BENCH_EXIT=$?
         set -e
 
         if [[ $BENCH_EXIT -ne 0 ]]; then
-            echo -e "${YELLOW}SKIPPED (device unavailable or error)${NC}"
+            echo -e "${RED}FAILED (exit code ${BENCH_EXIT})${NC}"
+            OVERALL_PASS=false
+            FAILED_CHECKS+="  [${MODEL_NAME}] ${DEVICE}: benchmark failed (exit code ${BENCH_EXIT})\n"
             continue
         fi
 
         read -r PREFILL DECODE <<< "$(parse_benchmark_output "$BENCH_OUTPUT")"
 
         if [[ "$PREFILL" == "0" || "$DECODE" == "0" ]]; then
-            echo -e "${YELLOW}SKIPPED (could not parse output)${NC}"
+            echo -e "${RED}FAILED (could not parse output)${NC}"
+            OVERALL_PASS=false
+            FAILED_CHECKS+="  [${MODEL_NAME}] ${DEVICE}: benchmark produced unparseable output\n"
             continue
         fi
 
@@ -298,9 +303,9 @@ for (( mi=0; mi<NUM_MODELS; mi++ )); do
         KEY="${mi}:${DEVICE}"
         if [[ -z "${RESULTS_PREFILL[$KEY]:-}" ]]; then
             printf "  %-10s  %-10s  %12s  %12s  %8s  " "$DEVICE" "prefill" "-" "-" "-"
-            echo -e "${YELLOW}SKIPPED${NC}"
+            echo -e "${RED}FAILED${NC}"
             printf "  %-10s  %-10s  %12s  %12s  %8s  " "$DEVICE" "decode" "-" "-" "-"
-            echo -e "${YELLOW}SKIPPED${NC}"
+            echo -e "${RED}FAILED${NC}"
             continue
         fi
 

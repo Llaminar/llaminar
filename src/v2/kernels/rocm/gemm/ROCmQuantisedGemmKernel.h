@@ -749,24 +749,16 @@ namespace llaminar2
             // Kernels do not own any work buffers; all buffers come from workspace
             DeviceWorkspaceManager *workspace_ = nullptr; ///< Bound workspace manager (not owned, REQUIRED)
 
-            // Per-kernel-instance unique slice id for the TEMP_C_FP32 / TEMP_A_FP32
-            // redirect buffers. Each cached GEMM kernel needs its OWN slice in the
-            // shared workspace; otherwise a kernel can clobber the redirect source
-            // of another kernel whose async D2D/D2H copy is still pending. Set in
-            // the constructors from a static atomic counter.
-            uint32_t slice_id_ = 0;
-
-            // Helper: unique workspace buffer name for this kernel's TEMP_C_FP32 slice.
-            std::string tempCFp32BufferName() const
-            {
-                return std::string(GemmWorkspaceBuffers::TEMP_C_FP32) + "_" + std::to_string(slice_id_);
-            }
-
-            // Helper: unique workspace buffer name for this kernel's TEMP_A_FP32 slice.
-            std::string tempAFp32BufferName() const
-            {
-                return std::string(GemmWorkspaceBuffers::TEMP_A_FP32) + "_" + std::to_string(slice_id_);
-            }
+            // Workspace buffer names for TEMP_C_FP32 / TEMP_A_FP32 are SHARED
+            // across all ROCm GEMM kernel instances (matching CUDA).  The workspace
+            // merger takes the max size, so all kernels share one allocation.
+            //
+            // Concurrent execution paths (FusedQKV prefill/decode) use the
+            // ConcurrentPrefillPool's own per-stream scratch and scatter_partial
+            // buffers — NOT these workspace buffers.  The workspace TEMP buffers
+            // are only used in serial paths (standalone multiply_tensor, sequential
+            // fallback in multiply_fused_tensor, fused SwiGLU decode), so a single
+            // shared allocation is safe.
 
             // GPU stream for graph capture (nullptr = default stream)
             void *gpu_stream_ = nullptr;

@@ -4,7 +4,7 @@
  *
  * Reuses OrchestrationConfigParser for flag parsing (all inference/sampling/
  * device/parallelism flags are available). After parsing, dispatches to the
- * same IExecutionMode chain as LegacyCommand.
+ * appropriate IExecutionMode.
  */
 
 #include "app/commands/OneshotCommand.h"
@@ -14,7 +14,6 @@
 #include "app/Splash.h"
 #include "app/modes/InteractiveChatMode.h"
 #include "app/modes/SingleShotChatMode.h"
-#include "app/modes/BenchmarkMode.h"
 #include "app/modes/CompletionMode.h"
 #include "config/OrchestrationConfigParser.h"
 #include "utils/Logger.h"
@@ -55,6 +54,13 @@ namespace llaminar2
             return 1;
         }
 
+        // Reject benchmark mode under oneshot — it has its own subcommand
+        if (config.benchmark_mode)
+        {
+            std::cerr << "Error: --benchmark is not valid with 'oneshot'. Use 'llaminar2 benchmark' instead.\n";
+            return 1;
+        }
+
         // MPI Bootstrap
         MPIBootstrapPhase bootstrap;
         auto bs_result = bootstrap.execute(config, argc, argv);
@@ -68,11 +74,10 @@ namespace llaminar2
             return 1;
         auto ctx = std::move(*ctx_opt);
 
-        // Dispatch: same mode chain minus ServerMode
+        // Dispatch: mode chain (no BenchmarkMode — use 'llaminar2 benchmark')
         std::vector<std::unique_ptr<IExecutionMode>> modes;
         modes.push_back(std::make_unique<InteractiveChatMode>());
         modes.push_back(std::make_unique<SingleShotChatMode>());
-        modes.push_back(std::make_unique<BenchmarkMode>());
         modes.push_back(std::make_unique<CompletionMode>()); // catch-all
 
         for (auto &mode : modes)

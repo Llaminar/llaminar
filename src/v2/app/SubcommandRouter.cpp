@@ -4,6 +4,7 @@
  */
 
 #include "app/SubcommandRouter.h"
+#include "app/Splash.h"
 #include "utils/Logger.h"
 #include <cstring>
 #include <iostream>
@@ -27,18 +28,13 @@ namespace llaminar2
 
     int SubcommandRouter::dispatch(int argc, char *argv[]) const
     {
-        // No arguments or first arg is a flag → legacy
-        if (argc < 2 || looksLikeFlag(argv[1]))
+        // No arguments, first arg is a flag, or bare "help" → print help
+        if (argc < 2 || looksLikeFlag(argv[1]) ||
+            std::strcmp(argv[1], "help") == 0)
         {
-            if (isHelpRequest(argc >= 2 ? argv[1] : nullptr))
-            {
-                std::cout << getTopLevelHelp(argv[0]) << std::endl;
-                return 0;
-            }
-            if (fallback_)
-                return fallback_->execute(argc, argv);
-            std::cerr << "No subcommand specified. Use --help for usage.\n";
-            return 1;
+            printSplash();
+            std::cout << getTopLevelHelp(argv[0]) << std::endl;
+            return 0;
         }
 
         // Look up subcommand
@@ -57,10 +53,6 @@ namespace llaminar2
                 return cmd->execute(static_cast<int>(shifted.size()), shifted.data());
             }
         }
-
-        // Unknown token — try legacy fallback (handles bare model paths etc.)
-        if (fallback_)
-            return fallback_->execute(argc, argv);
 
         std::cerr << "Unknown subcommand: '" << token
                   << "'. Use --help for available commands.\n";
@@ -86,8 +78,7 @@ namespace llaminar2
         }
 
         os << "\nRun '" << (binary_name ? binary_name : "llaminar2")
-           << " <command> --help' for command-specific options.\n"
-           << "\nLegacy flag-based invocation (e.g. -m model.gguf -p \"Hello\") is still supported.";
+           << " <command> --help' for command-specific options.";
 
         return os.str();
     }

@@ -15,9 +15,9 @@
         },
         "rocm:0": {
           "prefill_tok_s": 1214.71,
-          "decode_tok_s": 78.08,
+          "decode_tok_s": 78.72,
           "regression_threshold_pct": 5,
-          "_comment": "High-water mark set at commit f902826e on 2026-04-10. Note to agents: It is FORBIDDEN to update these thresholds without explicit human approval."
+          "_comment": "High-water mark set at commit c51d5583 on 2026-04-22. Note to agents: It is FORBIDDEN to update these thresholds without explicit human approval."
         },
         "cpu": {
           "prefill_tok_s": 337.99,

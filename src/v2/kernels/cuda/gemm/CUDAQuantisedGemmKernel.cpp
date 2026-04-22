@@ -563,8 +563,8 @@ namespace llaminar2
                     }
 
                     LOG_ERROR("[CUDAQuantisedGemmKernel] NativeVNNI prefill kernel failed for codebook "
-                             << static_cast<int>(impl->native_codebook_id)
-                             << " (no fallback available — TC/CUTLASS paths have been removed)");
+                              << static_cast<int>(impl->native_codebook_id)
+                              << " (no fallback available — TC/CUTLASS paths have been removed)");
                 }
 
                 return false;
@@ -1248,7 +1248,7 @@ namespace llaminar2
             if (!use_blockwise)
             {
                 LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fused_tensor] K=" << k
-                          << " not divisible by 32; NativeVNNI requires K%32==0");
+                                                                                << " not divisible by 32; NativeVNNI requires K%32==0");
                 return false;
             }
 
@@ -1291,15 +1291,15 @@ namespace llaminar2
                 // Record event after quantization completes on main stream
                 cudaQuantGemm_recordEvent(pool.quant_ready, gpu_stream_);
 
-                bool concurrent_ok = true;
-                for (int pi = 0; pi < num_proj && concurrent_ok; ++pi)
+                for (int pi = 0; pi < num_proj; ++pi)
                 {
                     const auto &proj = projections[pi];
                     auto *cuda_kernel = dynamic_cast<CUDAQuantisedGemmKernel *>(proj.kernel);
                     if (!cuda_kernel || !proj.output)
                     {
-                        concurrent_ok = false;
-                        break;
+                        throw std::runtime_error(
+                            "[ConcurrentPrefill] Projection " + std::to_string(pi) +
+                            " has null kernel or output — cannot continue inference");
                     }
 
                     const int n = proj.n;
@@ -1311,22 +1311,26 @@ namespace llaminar2
                     size_t acc_elements = static_cast<size_t>(m) * static_cast<size_t>(n);
                     if (!pool.ensureScratch(stream_idx, acc_elements))
                     {
-                        concurrent_ok = false;
-                        break;
+                        throw std::runtime_error(
+                            "[ConcurrentPrefill] Failed to allocate scratch for projection " +
+                            std::to_string(pi) + " (" + std::to_string(acc_elements * sizeof(int32_t)) +
+                            " bytes) — GPU OOM");
                     }
                     int32_t *proj_d_C_int32 = pool.scratch[stream_idx];
 
                     auto *fp32_output = dynamic_cast<FP32Tensor *>(proj.output);
                     if (!fp32_output)
                     {
-                        concurrent_ok = false;
-                        break;
+                        throw std::runtime_error(
+                            "[ConcurrentPrefill] Projection " + std::to_string(pi) +
+                            " output is not FP32Tensor — cannot continue inference");
                     }
                     float *d_output = static_cast<float *>(fp32_output->gpu_data_ptr());
                     if (!d_output)
                     {
-                        concurrent_ok = false;
-                        break;
+                        throw std::runtime_error(
+                            "[ConcurrentPrefill] Projection " + std::to_string(pi) +
+                            " output has no GPU data — cannot continue inference");
                     }
 
                     const float *d_bias = nullptr;
@@ -1372,30 +1376,23 @@ namespace llaminar2
 
                     if (!proj_ok)
                     {
-                        LOG_WARN("[ConcurrentPrefill] Projection " << pi << " failed; falling back to sequential");
-                        concurrent_ok = false;
-                        break;
+                        throw std::runtime_error(
+                            "[ConcurrentPrefill] Projection " + std::to_string(pi) +
+                            " (" + std::string(proj.name ? proj.name : "?") +
+                            ") kernel launch failed on stream " + std::to_string(stream_idx) +
+                            " — cannot continue inference");
                     }
 
                     cudaQuantGemm_recordEvent(pool.completion[stream_idx], pool.streams[stream_idx]);
                 }
 
-                if (concurrent_ok)
+                // All projections dispatched — main stream waits for completion
+                for (int si = 0; si < std::min(num_proj, pool.count); ++si)
                 {
-                    for (int si = 0; si < std::min(num_proj, pool.count); ++si)
-                    {
-                        cudaQuantGemm_streamWaitEvent(gpu_stream_, pool.completion[si]);
-                    }
-                    LOG_DEBUG("[ConcurrentPrefill] All " << num_proj << " projections dispatched concurrently");
-                    return true;
+                    cudaQuantGemm_streamWaitEvent(gpu_stream_, pool.completion[si]);
                 }
-
-                // Concurrent path failed — sync all streams and fall through to sequential
-                for (int si = 0; si < pool.count; ++si)
-                {
-                    cudaQuantGemm_streamSync(cuda_device_id_, pool.streams[si]);
-                }
-                LOG_WARN("[ConcurrentPrefill] Falling back to sequential dispatch");
+                LOG_DEBUG("[ConcurrentPrefill] All " << num_proj << " projections dispatched concurrently");
+                return true;
             }
 
             // Step 5: Execute each projection using the SHARED quantized activations (sequential fallback)
@@ -1628,7 +1625,7 @@ namespace llaminar2
 
                     // NativeVNNI is the only path — no TC/CUTLASS fallback.
                     LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fused_tensor] NativeVNNI GEMM failed for projection " << i
-                              << " (no fallback available)");
+                                                                                                                        << " (no fallback available)");
                     all_success = false;
                     break;
                 }
@@ -1885,7 +1882,7 @@ namespace llaminar2
 
             // K not divisible by 32 — no blockwise path available.
             LOG_ERROR("[CUDAQuantisedGemmKernel] K=" << k << " not divisible by 32; "
-                      "NativeVNNI requires K%32==0 and row-wise CUTLASS has been removed");
+                                                             "NativeVNNI requires K%32==0 and row-wise CUTLASS has been removed");
             return false;
         }
 
@@ -1948,7 +1945,7 @@ namespace llaminar2
 
             // K not divisible by 32 — no blockwise path available.
             LOG_ERROR("[CUDAQuantisedGemmKernel] K=" << k << " not divisible by 32; "
-                      "NativeVNNI requires K%32==0 and row-wise CUTLASS has been removed");
+                                                             "NativeVNNI requires K%32==0 and row-wise CUTLASS has been removed");
             return false;
         }
 
@@ -2069,7 +2066,7 @@ namespace llaminar2
             // Use conservative estimate: min(ceil(K/128), 84) × N × sizeof(float)
             if (m <= 4)
             {
-                int kpar_factor = std::min((k + 127) / 128, 84);  // 84 SMs is RTX 3090
+                int kpar_factor = std::min((k + 127) / 128, 84); // 84 SMs is RTX 3090
                 size_t kpar_bytes = static_cast<size_t>(kpar_factor) * n * sizeof(float);
                 reqs.buffers.push_back({GemmWorkspaceBuffers::GEMV_KPAR_PARTIALS, kpar_bytes, 256, false});
             }

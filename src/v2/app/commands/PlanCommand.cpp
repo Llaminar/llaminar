@@ -2,12 +2,14 @@
  * @file PlanCommand.cpp
  * @brief 'llaminar plan' — cluster analysis and execution plan generation.
  *
- * Lightweight command that reads the GGUF model header (no weight data),
- * gathers the cluster device inventory, runs the MemoryPlanner to evaluate
- * candidate strategies, and outputs a memory breakdown table + YAML config.
+ * MPI-aware command that bootstraps MPI, gathers the cluster device inventory
+ * via MPI_Allgatherv (same code path as real inference), reads the GGUF model
+ * header, runs the MemoryPlanner to evaluate candidate strategies, and outputs
+ * a memory breakdown table + YAML config.
  */
 
 #include "app/commands/PlanCommand.h"
+#include "app/commands/CommandMPI.h"
 #include "config/CliSpec.h"
 #include "utils/Logger.h"
 #include "loaders/ModelLoader.h"
@@ -35,9 +37,12 @@ namespace llaminar2
             std::string output_file;
             std::string format = "table";
             std::string kv_precision = "fp16";
-            int max_seq_len = 0;   // 0 = use model default
+            int max_seq_len = 0; // 0 = use model default
             int batch_size = 1;
             int headroom_mb = 128;
+            // MPI bootstrap control
+            bool no_mpi_bootstrap = false;
+            std::string hostfile;
         };
 
         CliSpec<PlanConfig> buildPlanSpec()
@@ -48,80 +53,93 @@ namespace llaminar2
             spec.addCategory("Output");
 
             spec.add({
-                .short_name  = "-h",
-                .long_name   = "--help",
-                .category    = "Output",
+                .short_name = "-h",
+                .long_name = "--help",
+                .category = "Output",
                 .description = "Show this help message",
-                .setter      = setters::assignBoolTrue(&PlanConfig::show_help),
+                .setter = setters::assignBoolTrue(&PlanConfig::show_help),
             });
             spec.add({
-                .short_name  = "-m",
-                .long_name   = "--model",
-                .category    = "Model",
+                .short_name = "-m",
+                .long_name = "--model",
+                .category = "Model",
                 .value_label = "<path>",
                 .description = "Path to GGUF model file (required)",
-                .setter      = setters::assignString(&PlanConfig::model_path),
+                .setter = setters::assignString(&PlanConfig::model_path),
             });
             spec.add({
-                .short_name  = "-s",
-                .long_name   = "--strategy",
-                .category    = "Strategy",
+                .short_name = "-s",
+                .long_name = "--strategy",
+                .category = "Strategy",
                 .value_label = "<type>",
                 .description = "Placement strategy: auto, single-gpu, tp, pp, hybrid, cpu-only",
                 .valid_values = {"auto", "single-gpu", "tp", "pp", "hybrid", "cpu-only"},
-                .setter      = setters::assignString(&PlanConfig::strategy),
+                .setter = setters::assignString(&PlanConfig::strategy),
             });
             spec.add({
-                .long_name   = "--max-seq-len",
-                .category    = "Model",
+                .long_name = "--max-seq-len",
+                .category = "Model",
                 .value_label = "<n>",
                 .description = "Context length for KV cache sizing (default: model max)",
-                .setter      = setters::parseInt(&PlanConfig::max_seq_len, "max-seq-len"),
+                .setter = setters::parseInt(&PlanConfig::max_seq_len, "max-seq-len"),
             });
             spec.add({
-                .long_name   = "--batch-size",
-                .category    = "Model",
+                .long_name = "--batch-size",
+                .category = "Model",
                 .value_label = "<n>",
                 .description = "Batch size (default: 1)",
-                .setter      = setters::parseInt(&PlanConfig::batch_size, "batch-size"),
+                .setter = setters::parseInt(&PlanConfig::batch_size, "batch-size"),
             });
             spec.add({
-                .long_name   = "--kv-precision",
-                .category    = "Model",
+                .long_name = "--kv-precision",
+                .category = "Model",
                 .value_label = "<type>",
                 .description = "KV cache precision: fp16, fp32, q8_1, auto",
-                .setter      = setters::assignString(&PlanConfig::kv_precision),
+                .setter = setters::assignString(&PlanConfig::kv_precision),
             });
             spec.add({
-                .long_name   = "--headroom",
-                .category    = "Strategy",
+                .long_name = "--headroom",
+                .category = "Strategy",
                 .value_label = "<mb>",
                 .description = "Reserved headroom per device in MB (default: 128)",
-                .setter      = setters::parseInt(&PlanConfig::headroom_mb, "headroom"),
+                .setter = setters::parseInt(&PlanConfig::headroom_mb, "headroom"),
             });
             spec.add({
-                .short_name  = "-o",
-                .long_name   = "--output",
-                .category    = "Output",
+                .short_name = "-o",
+                .long_name = "--output",
+                .category = "Output",
                 .value_label = "<file>",
                 .description = "Write plan to file (default: stdout)",
-                .setter      = setters::assignString(&PlanConfig::output_file),
+                .setter = setters::assignString(&PlanConfig::output_file),
             });
             spec.add({
-                .long_name    = "--format",
-                .category     = "Output",
-                .value_label  = "<fmt>",
-                .description  = "Output format: table, yaml, json",
+                .long_name = "--format",
+                .category = "Output",
+                .value_label = "<fmt>",
+                .description = "Output format: table, yaml, json",
                 .valid_values = {"table", "yaml", "json"},
-                .setter       = setters::assignString(&PlanConfig::format),
+                .setter = setters::assignString(&PlanConfig::format),
+            });
+            spec.add({
+                .long_name = "--no-mpi-bootstrap",
+                .category = "Strategy",
+                .description = "Skip MPI bootstrap (local-only inventory)",
+                .setter = setters::assignBoolTrue(&PlanConfig::no_mpi_bootstrap),
+            });
+            spec.add({
+                .long_name = "--hostfile",
+                .category = "Strategy",
+                .value_label = "<path>",
+                .description = "MPI hostfile for multi-node inventory",
+                .setter = setters::assignString(&PlanConfig::hostfile),
             });
 
             return spec;
         }
 
         /// Build a YAML plan string from a MemoryPlan and PlanConfig.
-        std::string buildYAML(const PlanConfig& cfg, const ModelMemoryProfile& profile,
-                              const MemoryPlan& plan, const std::string& strategy_label)
+        std::string buildYAML(const PlanConfig &cfg, const ModelMemoryProfile &profile,
+                              const MemoryPlan &plan, const std::string &strategy_label)
         {
             auto mb = [](size_t bytes) -> int
             {
@@ -149,7 +167,7 @@ namespace llaminar2
 
             if (plan.devices.size() == 1)
             {
-                const auto& d = plan.devices[0];
+                const auto &d = plan.devices[0];
                 yaml << "device: " << d.device.to_string() << "\n";
                 yaml << "memory:\n"
                      << "  weights_mb: " << mb(d.weight_bytes) << "\n"
@@ -165,7 +183,7 @@ namespace llaminar2
                 yaml << "devices:\n";
                 for (size_t i = 0; i < plan.devices.size(); ++i)
                 {
-                    const auto& d = plan.devices[i];
+                    const auto &d = plan.devices[i];
                     yaml << "  - id: " << d.device.to_string() << "\n"
                          << "    weights_mb: " << mb(d.weight_bytes) << "\n"
                          << "    kv_cache_mb: " << mb(d.kv_cache_bytes) << "\n"
@@ -181,8 +199,8 @@ namespace llaminar2
 
         /// Build DevicePlanConfig for a single-device strategy.
         DevicePlanConfig buildSingleDeviceConfig(
-            const PlanConfig& cfg, const ModelMemoryProfile& profile,
-            const DeviceInfo& gpu, DeviceId device)
+            const PlanConfig &cfg, const ModelMemoryProfile &profile,
+            const DeviceInfo &gpu, DeviceId device)
         {
             DevicePlanConfig dc;
             dc.device = device;
@@ -199,8 +217,8 @@ namespace llaminar2
 
         /// Build DevicePlanConfigs for TP across N GPUs.
         std::vector<DevicePlanConfig> buildTPConfigs(
-            const PlanConfig& cfg, const ModelMemoryProfile& profile,
-            const std::vector<DeviceInfo>& gpus, int tp_degree)
+            const PlanConfig &cfg, const ModelMemoryProfile &profile,
+            const std::vector<DeviceInfo> &gpus, int tp_degree)
         {
             std::vector<DevicePlanConfig> configs;
             int actual_tp = std::min(tp_degree, static_cast<int>(gpus.size()));
@@ -226,8 +244,8 @@ namespace llaminar2
 
         /// Build DevicePlanConfigs for PP across N GPUs (equal layer split).
         std::vector<DevicePlanConfig> buildPPConfigs(
-            const PlanConfig& cfg, const ModelMemoryProfile& profile,
-            const std::vector<DeviceInfo>& gpus, int pp_degree)
+            const PlanConfig &cfg, const ModelMemoryProfile &profile,
+            const std::vector<DeviceInfo> &gpus, int pp_degree)
         {
             std::vector<DevicePlanConfig> configs;
             int actual_pp = std::min(pp_degree, static_cast<int>(gpus.size()));
@@ -256,7 +274,7 @@ namespace llaminar2
 
         /// Build DevicePlanConfig for CPU-only.
         DevicePlanConfig buildCPUConfig(
-            const PlanConfig& cfg, const ModelMemoryProfile& profile,
+            const PlanConfig &cfg, const ModelMemoryProfile &profile,
             size_t cpu_memory_bytes)
         {
             DevicePlanConfig dc;
@@ -318,28 +336,77 @@ namespace llaminar2
             return 1;
         }
 
-        // --- Step 1: Load GGUF header (metadata only, no weight data) ---
-        ModelLoader loader(nullptr);  // creates internal factory
-        loader.setUseMmap(false);
-        if (!loader.loadModel(cfg.model_path))
+        // Initialize devices and gather cluster inventory (local or MPI)
+        auto [session, early_exit] = CommandMPI::bootstrap({
+            .subcommand = name(),
+            .argc = argc,
+            .argv = argv,
+            .no_mpi_bootstrap = cfg.no_mpi_bootstrap,
+            .hostfile = cfg.hostfile,
+        });
+        if (early_exit.has_value())
+            return *early_exit;
+
+        // --- Step 1: Rank 0 reads GGUF header; broadcasts profile to all ranks ---
+        ModelMemoryProfile profile;
+        if (session.is_mpi())
         {
-            std::cerr << "Error: Failed to load model: " << cfg.model_path << "\n";
-            return 1;
+            MPI_Comm comm = session.communicator();
+            std::vector<uint8_t> buf;
+
+            if (session.is_output_rank)
+            {
+                // Rank 0: load model and serialize profile
+                ModelLoader loader(nullptr);
+                loader.setUseMmap(false);
+                if (!loader.loadModel(cfg.model_path))
+                {
+                    std::cerr << "Error: Failed to load model: " << cfg.model_path << "\n";
+                    // Signal failure to other ranks (size = 0)
+                    int32_t sz = 0;
+                    MPI_Bcast(&sz, 1, MPI_INT, 0, comm);
+                    return 1;
+                }
+                profile = ModelMemoryProfile::fromGGUF(loader.getModel());
+                buf = profile.serialize();
+            }
+
+            // Broadcast serialized size, then data
+            int32_t sz = static_cast<int32_t>(buf.size());
+            MPI_Bcast(&sz, 1, MPI_INT, 0, comm);
+            if (sz == 0)
+                return 1; // rank 0 signalled load failure
+
+            buf.resize(static_cast<size_t>(sz));
+            MPI_Bcast(buf.data(), sz, MPI_BYTE, 0, comm);
+
+            if (!session.is_output_rank)
+            {
+                profile = ModelMemoryProfile::deserialize(buf.data(), buf.size());
+            }
+        }
+        else
+        {
+            // Local-only (no MPI): load directly
+            ModelLoader loader(nullptr);
+            loader.setUseMmap(false);
+            if (!loader.loadModel(cfg.model_path))
+            {
+                std::cerr << "Error: Failed to load model: " << cfg.model_path << "\n";
+                return 1;
+            }
+            profile = ModelMemoryProfile::fromGGUF(loader.getModel());
         }
 
-        auto profile = ModelMemoryProfile::fromGGUF(loader.getModel());
         int seq_len = cfg.max_seq_len > 0 ? cfg.max_seq_len : profile.max_seq_len;
 
-        // --- Step 2: Gather cluster inventory (local-only, no MPI) ---
-        auto inventory = gatherClusterInventory(nullptr);
-
-        // Collect available GPUs
+        // --- Step 2: Collect available GPUs from inventory ---
         std::vector<DeviceInfo> gpus;
         size_t cpu_memory = 0;
-        if (!inventory.ranks.empty())
+        if (!session.inventory.ranks.empty())
         {
-            gpus = inventory.ranks[0].gpus;
-            cpu_memory = inventory.ranks[0].cpu_memory_bytes;
+            gpus = session.inventory.ranks[0].gpus;
+            cpu_memory = session.inventory.ranks[0].cpu_memory_bytes;
             if (cpu_memory == 0)
             {
                 cpu_memory = 64ULL * 1024 * 1024 * 1024; // fallback: 64 GB
@@ -354,89 +421,87 @@ namespace llaminar2
             // Enumerate candidates in preference order: single-gpu > tp > pp > cpu-only
             if (!gpus.empty())
             {
-                // Single-GPU on the largest GPU
                 auto best_gpu = *std::max_element(gpus.begin(), gpus.end(),
-                    [](const DeviceInfo& a, const DeviceInfo& b)
-                    { return a.free_memory_bytes < b.free_memory_bytes; });
+                                                  [](const DeviceInfo &a, const DeviceInfo &b)
+                                                  { return a.free_memory_bytes < b.free_memory_bytes; });
                 DeviceId best_id(best_gpu.type, best_gpu.local_device_id);
                 candidates.push_back({"single-gpu",
-                    {buildSingleDeviceConfig(cfg, profile, best_gpu, best_id)}});
+                                      {buildSingleDeviceConfig(cfg, profile, best_gpu, best_id)}});
 
-                // TP across all GPUs
                 if (gpus.size() >= 2)
                 {
                     candidates.push_back({"tp-" + std::to_string(gpus.size()),
-                        buildTPConfigs(cfg, profile, gpus, static_cast<int>(gpus.size()))});
+                                          buildTPConfigs(cfg, profile, gpus, static_cast<int>(gpus.size()))});
                 }
 
-                // PP across 2 GPUs
                 if (gpus.size() >= 2)
                 {
                     candidates.push_back({"pp-2",
-                        buildPPConfigs(cfg, profile, gpus, 2)});
+                                          buildPPConfigs(cfg, profile, gpus, 2)});
                 }
 
-                // PP across all GPUs
                 if (gpus.size() > 2)
                 {
                     candidates.push_back({"pp-" + std::to_string(gpus.size()),
-                        buildPPConfigs(cfg, profile, gpus, static_cast<int>(gpus.size()))});
+                                          buildPPConfigs(cfg, profile, gpus, static_cast<int>(gpus.size()))});
                 }
             }
 
-            // CPU-only fallback
             candidates.push_back({"cpu-only",
-                {buildCPUConfig(cfg, profile, cpu_memory)}});
+                                  {buildCPUConfig(cfg, profile, cpu_memory)}});
         }
         else if (cfg.strategy == "single-gpu")
         {
             if (gpus.empty())
             {
-                std::cerr << "Error: No GPUs available for single-gpu strategy.\n";
+                if (session.is_output_rank)
+                    std::cerr << "Error: No GPUs available for single-gpu strategy.\n";
                 return 1;
             }
             auto best_gpu = *std::max_element(gpus.begin(), gpus.end(),
-                [](const DeviceInfo& a, const DeviceInfo& b)
-                { return a.free_memory_bytes < b.free_memory_bytes; });
+                                              [](const DeviceInfo &a, const DeviceInfo &b)
+                                              { return a.free_memory_bytes < b.free_memory_bytes; });
             DeviceId best_id(best_gpu.type, best_gpu.local_device_id);
             candidates.push_back({"single-gpu",
-                {buildSingleDeviceConfig(cfg, profile, best_gpu, best_id)}});
+                                  {buildSingleDeviceConfig(cfg, profile, best_gpu, best_id)}});
         }
         else if (cfg.strategy == "tp")
         {
             if (gpus.size() < 2)
             {
-                std::cerr << "Error: Need at least 2 GPUs for tp strategy.\n";
+                if (session.is_output_rank)
+                    std::cerr << "Error: Need at least 2 GPUs for tp strategy.\n";
                 return 1;
             }
             candidates.push_back({"tp-" + std::to_string(gpus.size()),
-                buildTPConfigs(cfg, profile, gpus, static_cast<int>(gpus.size()))});
+                                  buildTPConfigs(cfg, profile, gpus, static_cast<int>(gpus.size()))});
         }
         else if (cfg.strategy == "pp")
         {
             if (gpus.size() < 2)
             {
-                std::cerr << "Error: Need at least 2 GPUs for pp strategy.\n";
+                if (session.is_output_rank)
+                    std::cerr << "Error: Need at least 2 GPUs for pp strategy.\n";
                 return 1;
             }
             candidates.push_back({"pp-" + std::to_string(gpus.size()),
-                buildPPConfigs(cfg, profile, gpus, static_cast<int>(gpus.size()))});
+                                  buildPPConfigs(cfg, profile, gpus, static_cast<int>(gpus.size()))});
         }
         else if (cfg.strategy == "hybrid")
         {
             if (gpus.size() < 2)
             {
-                std::cerr << "Error: Need at least 2 GPUs for hybrid strategy.\n";
+                if (session.is_output_rank)
+                    std::cerr << "Error: Need at least 2 GPUs for hybrid strategy.\n";
                 return 1;
             }
-            // Hybrid: TP across all GPUs (PP+TP would need more config)
             candidates.push_back({"hybrid-tp" + std::to_string(gpus.size()),
-                buildTPConfigs(cfg, profile, gpus, static_cast<int>(gpus.size()))});
+                                  buildTPConfigs(cfg, profile, gpus, static_cast<int>(gpus.size()))});
         }
         else if (cfg.strategy == "cpu-only")
         {
             candidates.push_back({"cpu-only",
-                {buildCPUConfig(cfg, profile, cpu_memory)}});
+                                  {buildCPUConfig(cfg, profile, cpu_memory)}});
         }
 
         // Evaluate each candidate
@@ -444,7 +509,7 @@ namespace llaminar2
         std::string best_strategy;
         bool found_feasible = false;
 
-        for (const auto& candidate : candidates)
+        for (const auto &candidate : candidates)
         {
             auto plan = MemoryPlanner::plan(profile, candidate.configs);
             if (plan.fits() && !found_feasible)
@@ -455,56 +520,58 @@ namespace llaminar2
             }
             else if (!found_feasible)
             {
-                // Keep the last one if nothing fits (for diagnostics)
                 best_plan = std::move(plan);
                 best_strategy = candidate.name;
             }
         }
 
-        // --- Step 4: Output results ---
-        std::ostringstream output;
+        // --- Step 4: Output results (rank 0 / local only) ---
+        int exit_code = found_feasible ? 0 : 1;
 
-        // Header
-        output << "=== Memory Plan ===\n";
-        output << "Model: " << cfg.model_path << "\n";
-        output << "Architecture: " << profile.architecture
-               << " (" << profile.n_layers << " layers, d=" << profile.d_model
-               << ", vocab=" << profile.vocab_size << ")\n";
-        output << "Strategy: " << best_strategy
-               << (found_feasible ? "" : " [DOES NOT FIT]") << "\n";
-        output << "Context: " << seq_len << " tokens, batch=" << cfg.batch_size
-               << ", kv=" << cfg.kv_precision << "\n\n";
-
-        // Memory table
-        output << best_plan.renderTable();
-
-        // YAML section (always appended unless format is table-only)
-        if (cfg.format == "yaml" || cfg.format == "json")
+        if (session.is_output_rank)
         {
-            output << "\n--- plan.yaml ---\n";
-            output << buildYAML(cfg, profile, best_plan, best_strategy);
-        }
+            std::ostringstream output;
 
-        // Emit output
-        if (!cfg.output_file.empty())
-        {
-            std::ofstream out(cfg.output_file);
-            if (!out.is_open())
+            output << "=== Memory Plan ===\n";
+            output << "Model: " << cfg.model_path << "\n";
+            output << "Architecture: " << profile.architecture
+                   << " (" << profile.n_layers << " layers, d=" << profile.d_model
+                   << ", vocab=" << profile.vocab_size << ")\n";
+            output << "Strategy: " << best_strategy
+                   << (found_feasible ? "" : " [DOES NOT FIT]") << "\n";
+            output << "Context: " << seq_len << " tokens, batch=" << cfg.batch_size
+                   << ", kv=" << cfg.kv_precision << "\n\n";
+
+            output << best_plan.renderTable();
+
+            if (cfg.format == "yaml" || cfg.format == "json")
             {
-                std::cerr << "Error: Cannot write to " << cfg.output_file << "\n";
-                return 1;
+                output << "\n--- plan.yaml ---\n";
+                output << buildYAML(cfg, profile, best_plan, best_strategy);
             }
-            // Write YAML to file regardless of format flag
-            out << buildYAML(cfg, profile, best_plan, best_strategy);
-            std::cout << output.str();
-            std::cout << "\nPlan written to: " << cfg.output_file << std::endl;
-        }
-        else
-        {
-            std::cout << output.str();
+
+            if (!cfg.output_file.empty())
+            {
+                std::ofstream out(cfg.output_file);
+                if (!out.is_open())
+                {
+                    std::cerr << "Error: Cannot write to " << cfg.output_file << "\n";
+                    exit_code = 1;
+                }
+                else
+                {
+                    out << buildYAML(cfg, profile, best_plan, best_strategy);
+                    std::cout << output.str();
+                    std::cout << "\nPlan written to: " << cfg.output_file << std::endl;
+                }
+            }
+            else
+            {
+                std::cout << output.str();
+            }
         }
 
-        return found_feasible ? 0 : 1;
+        return exit_code;
     }
 
 } // namespace llaminar2

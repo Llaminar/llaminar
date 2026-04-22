@@ -5444,6 +5444,18 @@ add_v2_test(V2_Unit_ChatCompletionHandler
     MPI_PROCS 1
 )
 
+# CLI Commands: DescribeCommand, PlanCommand, SubcommandRouter
+add_executable(v2_test_commands unit/app/Test__Commands.cpp)
+target_include_directories(v2_test_commands PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../external/vendor  # For nlohmann/json.hpp
+)
+target_link_libraries(v2_test_commands llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_Commands
+    COMMAND $<TARGET_FILE:v2_test_commands>
+    LABELS "V2;Unit;CLI;Commands;DescribeCommand;PlanCommand"
+    MPI_PROCS 1
+)
+
 # Test: Qwen2GraphSchema (schema-based Qwen2Graph building - Phase 4d)
 # Tests the new buildForwardGraphFromSchema() method that uses
 # Qwen2Schema + GraphResolver + GraphBuilder architecture.

@@ -972,12 +972,6 @@ namespace llaminar2
             pools.clear();
         }
 
-        // Per-process atomic counter that hands out a unique slice id to every
-        // ROCmQuantisedGemmKernel instance. Used to give each kernel its own
-        // TEMP_C_FP32 / TEMP_A_FP32 workspace slices so concurrent async D2D/D2H
-        // copies queued by different kernels cannot clobber each other.
-        static std::atomic<uint32_t> g_rocm_quant_gemm_slice_counter{0};
-
         ROCmQuantisedGemmKernel::ROCmQuantisedGemmKernel(const TensorBase *weights, int rocm_device_id)
             : weights_(weights),
               packed_(nullptr),
@@ -988,7 +982,6 @@ namespace llaminar2
               owns_weight_memory_(true), // Legacy path owns weight memory
               impl_(std::make_unique<Impl>())
         {
-            slice_id_ = g_rocm_quant_gemm_slice_counter.fetch_add(1, std::memory_order_relaxed);
             if (!weights)
             {
                 throw std::runtime_error("[ROCmQuantisedGemmKernel] Null weight tensor");
@@ -1027,7 +1020,6 @@ namespace llaminar2
               owns_weight_memory_(false), // ROCmPackedWeights owns the memory
               impl_(std::make_unique<Impl>())
         {
-            slice_id_ = g_rocm_quant_gemm_slice_counter.fetch_add(1, std::memory_order_relaxed);
             if (!packed)
             {
                 throw std::runtime_error("[ROCmQuantisedGemmKernel] Null packed weights");
@@ -2687,8 +2679,7 @@ namespace llaminar2
                     hipEventRecord(pool.quant_ready,
                                    static_cast<hipStream_t>(gpu_stream_));
 
-                    bool concurrent_ok = true;
-                    for (int pi = 0; pi < num_proj && concurrent_ok; ++pi)
+                    for (int pi = 0; pi < num_proj; ++pi)
                     {
                         const auto &proj = projections[pi];
                         auto *rocm_kernel = dynamic_cast<ROCmQuantisedGemmKernel *>(proj.kernel);
@@ -2703,9 +2694,9 @@ namespace llaminar2
 
                         if (!d_output)
                         {
-                            LOG_ERROR("[ConcurrentPrefill] Projection " << pi << " output has no GPU data");
-                            concurrent_ok = false;
-                            break;
+                            throw std::runtime_error(
+                                "[ConcurrentPrefill] Projection " + std::to_string(pi) +
+                                " output has no GPU data — cannot continue inference");
                         }
 
                         // Get per-projection weight scales and bias
@@ -2725,9 +2716,10 @@ namespace llaminar2
                         int stream_idx = pi % pool.count;
                         if (!pool.ensureScratch(stream_idx, scratch_elements))
                         {
-                            LOG_ERROR("[ConcurrentPrefill] Failed to allocate scratch for projection " << pi);
-                            concurrent_ok = false;
-                            break;
+                            throw std::runtime_error(
+                                "[ConcurrentPrefill] Failed to allocate scratch for projection " +
+                                std::to_string(pi) + " (" + std::to_string(scratch_elements * sizeof(int32_t)) +
+                                " bytes) — GPU OOM");
                         }
 
                         // This stream waits for quantization to complete
@@ -2761,10 +2753,11 @@ namespace llaminar2
 
                         if (!proj_ok)
                         {
-                            LOG_WARN("[ConcurrentPrefill] Projection " << pi
-                                                                       << " failed on concurrent path; falling back to sequential");
-                            concurrent_ok = false;
-                            break;
+                            throw std::runtime_error(
+                                "[ConcurrentPrefill] Projection " + std::to_string(pi) +
+                                " (" + std::string(proj.name ? proj.name : "?") +
+                                ") kernel launch failed on stream " + std::to_string(stream_idx) +
+                                " — cannot continue inference");
                         }
 
                         // Record completion event for this stream
@@ -2772,32 +2765,21 @@ namespace llaminar2
                                        pool.streams[stream_idx]);
                     }
 
-                    if (concurrent_ok)
+                    // All projections dispatched — main stream waits for completion
+                    for (int si = 0; si < std::min(num_proj, pool.count); ++si)
                     {
-                        // Main stream waits for all projection streams to finish
-                        for (int si = 0; si < std::min(num_proj, pool.count); ++si)
-                        {
-                            hipStreamWaitEvent(
-                                static_cast<hipStream_t>(gpu_stream_),
-                                pool.completion[si], 0);
-                        }
-
-                        LOG_DEBUG("[ConcurrentPrefill] All " << num_proj
-                                                             << " projections dispatched concurrently");
-
-                        // Restore workspace and return success
-                        if (ws && ws != saved_workspace)
-                            workspace_ = saved_workspace;
-                        return true;
+                        hipStreamWaitEvent(
+                            static_cast<hipStream_t>(gpu_stream_),
+                            pool.completion[si], 0);
                     }
 
-                    // Concurrent path failed — fall through to sequential path below
-                    // Sync all concurrent streams to avoid data races with sequential fallback
-                    for (int si = 0; si < pool.count; ++si)
-                    {
-                        hipStreamSynchronize(pool.streams[si]);
-                    }
-                    LOG_WARN("[ConcurrentPrefill] Falling back to sequential dispatch");
+                    LOG_DEBUG("[ConcurrentPrefill] All " << num_proj
+                                                         << " projections dispatched concurrently");
+
+                    // Restore workspace and return success
+                    if (ws && ws != saved_workspace)
+                        workspace_ = saved_workspace;
+                    return true;
                 }
             }
 #endif // HAVE_ROCM
@@ -2864,8 +2846,7 @@ namespace llaminar2
                     hipEventRecord(pool.quant_ready,
                                    static_cast<hipStream_t>(gpu_stream_));
 
-                    bool concurrent_ok = true;
-                    for (int pi = 0; pi < num_proj && concurrent_ok; ++pi)
+                    for (int pi = 0; pi < num_proj; ++pi)
                     {
                         const auto &proj = projections[pi];
                         auto *rocm_kernel = dynamic_cast<ROCmQuantisedGemmKernel *>(proj.kernel);
@@ -2876,8 +2857,9 @@ namespace llaminar2
 
                         if (!d_output)
                         {
-                            concurrent_ok = false;
-                            break;
+                            throw std::runtime_error(
+                                "[ConcurrentDecode] Projection " + std::to_string(pi) +
+                                " output has no GPU data — cannot continue inference");
                         }
 
                         const float *d_scales_B = rocm_kernel->impl_->d_scales_B;
@@ -2912,8 +2894,10 @@ namespace llaminar2
                             const size_t partial_elements = static_cast<size_t>(SCATTER_KB_MAX) * n;
                             if (!pool.ensureScatterPartial(stream_idx, partial_elements))
                             {
-                                concurrent_ok = false;
-                                break;
+                                throw std::runtime_error(
+                                    "[ConcurrentDecode] Failed to allocate scatter_partial for projection " +
+                                    std::to_string(pi) + " (" + std::to_string(partial_elements * sizeof(float)) +
+                                    " bytes) — GPU OOM");
                             }
 
                             proj_ok = rocmGemv_native_vnni_fp32(
@@ -2936,8 +2920,9 @@ namespace llaminar2
                             int8_t *d_vnni = rocm_kernel->impl_->d_weights_int8_vnni;
                             if (!d_vnni)
                             {
-                                concurrent_ok = false;
-                                break;
+                                throw std::runtime_error(
+                                    "[ConcurrentDecode] Projection " + std::to_string(pi) +
+                                    " has no INT8-VNNI weights — kernel not prepared");
                             }
 
                             proj_ok = rocmGemv_int8_int8_fp32_vnni_blockwise_scaled(
@@ -2951,20 +2936,20 @@ namespace llaminar2
 
                         if (!proj_ok)
                         {
-                            LOG_WARN("[ConcurrentDecode] Projection " << pi
-                                                                      << " failed; falling back to sequential");
-                            concurrent_ok = false;
-                            break;
+                            throw std::runtime_error(
+                                "[ConcurrentDecode] Projection " + std::to_string(pi) +
+                                " GEMV kernel launch failed on stream " + std::to_string(pi % pool.count) +
+                                " — cannot continue inference");
                         }
 
-                        // Bias for native-VNNI (INT8-VNNI handles bias in-kernel)
                         if (rocm_kernel->impl_->has_native_vnni && d_bias)
                         {
                             if (!rocmQuantGemm_biasAdd(d_output, d_bias, m, n,
                                                        rocm_device_id_, pool.streams[stream_idx]))
                             {
-                                concurrent_ok = false;
-                                break;
+                                throw std::runtime_error(
+                                    "[ConcurrentDecode] Bias add failed for projection " +
+                                    std::to_string(pi) + " on stream " + std::to_string(stream_idx));
                             }
                         }
 
@@ -2972,29 +2957,20 @@ namespace llaminar2
                                        pool.streams[stream_idx]);
                     }
 
-                    if (concurrent_ok)
+                    // All projections dispatched — main stream waits for completion
+                    for (int si = 0; si < std::min(num_proj, pool.count); ++si)
                     {
-                        for (int si = 0; si < std::min(num_proj, pool.count); ++si)
-                        {
-                            hipStreamWaitEvent(
-                                static_cast<hipStream_t>(gpu_stream_),
-                                pool.completion[si], 0);
-                        }
-
-                        LOG_DEBUG("[ConcurrentDecode] All " << num_proj
-                                                            << " projections dispatched concurrently");
-
-                        if (ws && ws != saved_workspace)
-                            workspace_ = saved_workspace;
-                        return true;
+                        hipStreamWaitEvent(
+                            static_cast<hipStream_t>(gpu_stream_),
+                            pool.completion[si], 0);
                     }
 
-                    // Fallback: sync all streams, fall through to sequential
-                    for (int si = 0; si < pool.count; ++si)
-                    {
-                        hipStreamSynchronize(pool.streams[si]);
-                    }
-                    LOG_WARN("[ConcurrentDecode] Falling back to sequential dispatch");
+                    LOG_DEBUG("[ConcurrentDecode] All " << num_proj
+                                                        << " projections dispatched concurrently");
+
+                    if (ws && ws != saved_workspace)
+                        workspace_ = saved_workspace;
+                    return true;
                 }
             }
 #endif // HAVE_ROCM
@@ -3499,12 +3475,11 @@ namespace llaminar2
             reqs.buffers.push_back({GemmWorkspaceBuffers::SCALES_A, scales_a_bytes, 256, true});
             reqs.buffers.push_back({GemmWorkspaceBuffers::SCALES_A_BLOCKWISE, scales_a_blockwise_bytes, 256, true});
             reqs.buffers.push_back({GemmWorkspaceBuffers::ACC_INT32, acc_int32_bytes, 256, true});
-            // Per-instance slice names for TEMP_A_FP32 / TEMP_C_FP32 so that
-            // multiple cached GEMM kernels do not alias the same redirect
-            // source across overlapping async D2D/D2H copies (see note at
-            // slice_id_ definition in the header).
-            reqs.buffers.push_back({tempAFp32BufferName(), temp_a_fp32_bytes, 256, true});
-            reqs.buffers.push_back({tempCFp32BufferName(), temp_c_fp32_bytes, 256, true});
+            // Shared buffer names (matching CUDA).  Concurrent paths use
+            // ConcurrentPrefillPool's per-stream scratch — these workspace
+            // buffers are only used in serial execution paths.
+            reqs.buffers.push_back({GemmWorkspaceBuffers::TEMP_A_FP32, temp_a_fp32_bytes, 256, true});
+            reqs.buffers.push_back({GemmWorkspaceBuffers::TEMP_C_FP32, temp_c_fp32_bytes, 256, true});
 
             // NOTE: CK (ComposableKernel) workspace buffers (ROCM_CK_INT32,
             // ROCM_A_PADDED, ROCM_SCALE_A_PADDED, ROCM_E_PADDED, ROCM_B_REPACK)
@@ -4179,18 +4154,16 @@ namespace llaminar2
                 throw std::runtime_error(
                     "[ROCmQuantisedGemmKernel] Workspace missing required buffer: ACC_INT32");
             }
-            // ROCm-specific buffers (per-instance slices)
-            if (!workspace_->hasBuffer(tempAFp32BufferName()))
+            // Shared FP32 temp buffers (used by serial paths only)
+            if (!workspace_->hasBuffer(GemmWorkspaceBuffers::TEMP_A_FP32))
             {
                 throw std::runtime_error(
-                    "[ROCmQuantisedGemmKernel] Workspace missing required buffer: " +
-                    tempAFp32BufferName());
+                    "[ROCmQuantisedGemmKernel] Workspace missing required buffer: TEMP_A_FP32");
             }
-            if (!workspace_->hasBuffer(tempCFp32BufferName()))
+            if (!workspace_->hasBuffer(GemmWorkspaceBuffers::TEMP_C_FP32))
             {
                 throw std::runtime_error(
-                    "[ROCmQuantisedGemmKernel] Workspace missing required buffer: " +
-                    tempCFp32BufferName());
+                    "[ROCmQuantisedGemmKernel] Workspace missing required buffer: TEMP_C_FP32");
             }
             // NOTE: CK-specific buffers (ROCM_CK_INT32, ROCM_A_PADDED,
             // ROCM_SCALE_A_PADDED, ROCM_E_PADDED, ROCM_B_REPACK) are no
@@ -4206,8 +4179,8 @@ namespace llaminar2
             impl_->d_scales_A = static_cast<float *>(workspace_->getBuffer(GemmWorkspaceBuffers::SCALES_A));
             impl_->d_scales_A_blockwise = static_cast<float *>(workspace_->getBuffer(GemmWorkspaceBuffers::SCALES_A_BLOCKWISE));
             impl_->d_C_int32 = static_cast<int32_t *>(workspace_->getBuffer(GemmWorkspaceBuffers::ACC_INT32));
-            impl_->d_A_fp32 = static_cast<float *>(workspace_->getBuffer(tempAFp32BufferName()));
-            impl_->d_C_fp32 = static_cast<float *>(workspace_->getBuffer(tempCFp32BufferName()));
+            impl_->d_A_fp32 = static_cast<float *>(workspace_->getBuffer(GemmWorkspaceBuffers::TEMP_A_FP32));
+            impl_->d_C_fp32 = static_cast<float *>(workspace_->getBuffer(GemmWorkspaceBuffers::TEMP_C_FP32));
             impl_->d_scatter_partial = static_cast<float *>(workspace_->getBuffer(GemmWorkspaceBuffers::ROCM_SCATTER_PARTIAL));
 
             // Set capacity values to max (workspace is pre-sized for maximum dimensions)

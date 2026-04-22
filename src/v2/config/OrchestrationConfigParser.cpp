@@ -249,7 +249,8 @@ namespace llaminar2
                                std::string valid_list)
         {
             return [member, parser, option_name, valid_list](OrchestrationConfig &c,
-                                                             const std::string &v) {
+                                                             const std::string &v)
+            {
                 auto parsed = parser(v);
                 if (!parsed)
                 {
@@ -288,245 +289,250 @@ namespace llaminar2
 
         // --- Model Configuration ---------------------------------------------
         spec.add({
-            .short_name  = "-m",
-            .long_name   = "--model",
-            .category    = "Model Configuration",
+            .short_name = "-m",
+            .long_name = "--model",
+            .category = "Model Configuration",
             .value_label = "<path>",
             .description = "Path to GGUF model file (required)",
-            .setter      = setters::assignString(&OrchestrationConfig::model_path),
+            .setter = setters::assignString(&OrchestrationConfig::model_path),
         });
         spec.add({
-            .short_name  = "-c",
-            .long_name   = "--context-length",
-            .category    = "Model Configuration",
+            .short_name = "-c",
+            .long_name = "--context-length",
+            .category = "Model Configuration",
             .value_label = "<n>",
             .description = "Maximum context/sequence length (default: 4096)",
-            .setter      = setters::parseInt(&OrchestrationConfig::max_seq_len, "--context-length"),
+            .setter = setters::parseInt(&OrchestrationConfig::max_seq_len, "--context-length"),
         });
         spec.add({
-            .long_name   = "--mmap",
-            .category    = "Model Configuration",
+            .long_name = "--mmap",
+            .category = "Model Configuration",
             .description = "Use memory-mapped file loading (default)",
-            .setter      = setters::assignBoolTrue(&OrchestrationConfig::use_mmap),
+            .setter = setters::assignBoolTrue(&OrchestrationConfig::use_mmap),
         });
         spec.add({
-            .long_name   = "--no-mmap",
-            .category    = "Model Configuration",
+            .long_name = "--no-mmap",
+            .category = "Model Configuration",
             .description = "Disable memory-mapped file loading",
-            .setter      = setters::assignBoolFalse(&OrchestrationConfig::use_mmap),
+            .setter = setters::assignBoolFalse(&OrchestrationConfig::use_mmap),
         });
 
         // --- Inference Configuration -----------------------------------------
         spec.add({
-            .short_name  = "-p",
-            .long_name   = "--prompt",
-            .category    = "Inference Configuration",
+            .short_name = "-p",
+            .long_name = "--prompt",
+            .category = "Inference Configuration",
             .value_label = "<text>",
             .description = "Input prompt text",
-            .setter      = setters::assignString(&OrchestrationConfig::prompt),
+            .setter = setters::assignString(&OrchestrationConfig::prompt),
         });
         spec.add({
-            .short_name  = "-n",
-            .long_name   = "--n-predict",
-            .category    = "Inference Configuration",
+            .short_name = "-n",
+            .long_name = "--n-predict",
+            .category = "Inference Configuration",
             .value_label = "<n>",
             .description = "Tokens to generate (-1 = until EOS, default: -1)",
-            .setter      = setters::parseInt(&OrchestrationConfig::n_predict, "--n-predict"),
+            .setter = setters::parseInt(&OrchestrationConfig::n_predict, "--n-predict"),
         });
         spec.add({
-            .long_name   = "--batch-size",
-            .category    = "Inference Configuration",
+            .long_name = "--batch-size",
+            .category = "Inference Configuration",
             .value_label = "<n>",
             .description = "Batch size (default: 1)",
-            .setter      = setters::parseInt(&OrchestrationConfig::batch_size, "--batch-size"),
+            .setter = setters::parseInt(&OrchestrationConfig::batch_size, "--batch-size"),
         });
         spec.add({
-            .long_name   = "--threads",
-            .category    = "Inference Configuration",
+            .long_name = "--threads",
+            .category = "Inference Configuration",
             .value_label = "<n>",
             .description = "Thread count override for OpenMP / BLAS (-1 = auto)",
-            .setter      = setters::parseInt(&OrchestrationConfig::n_threads, "--threads"),
+            .setter = setters::parseInt(&OrchestrationConfig::n_threads, "--threads"),
         });
         spec.add({
-            .short_name  = "-s",
-            .long_name   = "--seed",
-            .category    = "Inference Configuration",
+            .short_name = "-s",
+            .long_name = "--seed",
+            .category = "Inference Configuration",
             .value_label = "<n>",
             .description = "Random seed (-1 = random, default: -1)",
-            .setter      = setters::parseInt(&OrchestrationConfig::seed, "--seed"),
+            .setter = setters::parseInt(&OrchestrationConfig::seed, "--seed"),
         });
 
         // --- Sampling Configuration ------------------------------------------
         spec.add({
-            .short_name  = "-t",
-            .long_name   = "--temperature",
-            .category    = "Sampling Configuration",
+            .short_name = "-t",
+            .long_name = "--temperature",
+            .category = "Sampling Configuration",
             .value_label = "<f>",
             .description = "Sampling temperature (default: 0.8; 0 = greedy)",
-            .setter      = setters::parseFloat(&OrchestrationConfig::temperature, "--temperature"),
+            .setter = setters::parseFloat(&OrchestrationConfig::temperature, "--temperature"),
         });
         spec.add({
-            .long_name   = "--top-k",
-            .category    = "Sampling Configuration",
+            .long_name = "--top-k",
+            .category = "Sampling Configuration",
             .value_label = "<n>",
             .description = "Top-K sampling (default: 40)",
-            .setter      = setters::parseInt(&OrchestrationConfig::top_k, "--top-k"),
+            .setter = setters::parseInt(&OrchestrationConfig::top_k, "--top-k"),
         });
         spec.add({
-            .long_name   = "--top-p",
-            .category    = "Sampling Configuration",
+            .long_name = "--top-p",
+            .category = "Sampling Configuration",
             .value_label = "<f>",
             .description = "Top-P (nucleus) sampling (default: 0.9)",
-            .setter      = setters::parseFloat(&OrchestrationConfig::top_p, "--top-p"),
+            .setter = setters::parseFloat(&OrchestrationConfig::top_p, "--top-p"),
         });
         spec.add({
-            .long_name   = "--deterministic",
-            .category    = "Sampling Configuration",
+            .long_name = "--deterministic",
+            .category = "Sampling Configuration",
             .description = "Force greedy sampling (temperature=0) and export "
                            "LLAMINAR_DETERMINISTIC=1 for kernel-level determinism",
-            .setter      = setters::custom<OrchestrationConfig>(
-                [](OrchestrationConfig &c, const std::string &) {
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &)
+                {
                     c.deterministic = true;
-                    c.temperature   = 0.0f;
+                    c.temperature = 0.0f;
                     setenv("LLAMINAR_DETERMINISTIC", "1", 1);
                 }),
         });
 
         // --- Chat Configuration ----------------------------------------------
         spec.add({
-            .long_name   = "--chat",
-            .category    = "Chat Configuration",
+            .long_name = "--chat",
+            .category = "Chat Configuration",
             .description = "Interactive chat mode",
-            .setter      = setters::assignBoolTrue(&OrchestrationConfig::chat_mode),
+            .setter = setters::assignBoolTrue(&OrchestrationConfig::chat_mode),
         });
         spec.add({
-            .long_name   = "--chat-single",
-            .category    = "Chat Configuration",
+            .long_name = "--chat-single",
+            .category = "Chat Configuration",
             .description = "Single prompt with chat template applied",
-            .setter      = setters::assignBoolTrue(&OrchestrationConfig::single_shot_chat),
+            .setter = setters::assignBoolTrue(&OrchestrationConfig::single_shot_chat),
         });
         spec.add({
-            .long_name   = "--system",
-            .category    = "Chat Configuration",
+            .long_name = "--system",
+            .category = "Chat Configuration",
             .value_label = "<text>",
             .description = "System prompt for chat",
-            .setter      = setters::assignString(&OrchestrationConfig::system_prompt),
+            .setter = setters::assignString(&OrchestrationConfig::system_prompt),
         });
         spec.add({
-            .long_name   = "--chat-template",
-            .category    = "Chat Configuration",
+            .long_name = "--chat-template",
+            .category = "Chat Configuration",
             .value_label = "<name>",
             .description = "Override chat template (chatml, llama3, etc.)",
-            .setter      = setters::assignString(&OrchestrationConfig::chat_template_override),
+            .setter = setters::assignString(&OrchestrationConfig::chat_template_override),
         });
 
         // --- Benchmark Configuration -----------------------------------------
+        // NOTE: --benchmark is accepted for backward compatibility but is
+        // deprecated.  Use 'llaminar2 benchmark' subcommand instead.
         spec.add({
-            .long_name   = "--benchmark",
-            .category    = "Benchmark Configuration",
-            .description = "Run benchmark (warmup + multiple timed runs)",
-            .setter      = setters::assignBoolTrue(&OrchestrationConfig::benchmark_mode),
+            .long_name = "--benchmark",
+            .category = "Benchmark Configuration",
+            .description = "(deprecated) Use 'llaminar2 benchmark' subcommand instead",
+            .setter = setters::assignBoolTrue(&OrchestrationConfig::benchmark_mode),
         });
 
         // --- Server Configuration --------------------------------------------
         spec.add({
-            .long_name   = "--serve",
-            .category    = "Server Configuration",
+            .long_name = "--serve",
+            .category = "Server Configuration",
             .description = "Start HTTP server (OpenAI-compatible REST API)",
-            .setter      = setters::assignBoolTrue(&OrchestrationConfig::serve_mode),
+            .setter = setters::assignBoolTrue(&OrchestrationConfig::serve_mode),
         });
         spec.add({
-            .long_name   = "--port",
-            .category    = "Server Configuration",
+            .long_name = "--port",
+            .category = "Server Configuration",
             .value_label = "<n>",
             .description = "Server port (default: 8080)",
-            .setter      = setters::parseInt(&OrchestrationConfig::serve_port, "--port"),
+            .setter = setters::parseInt(&OrchestrationConfig::serve_port, "--port"),
         });
         spec.add({
-            .long_name   = "--host",
-            .category    = "Server Configuration",
+            .long_name = "--host",
+            .category = "Server Configuration",
             .value_label = "<addr>",
             .description = "Server bind address (default: 127.0.0.1)",
-            .setter      = setters::assignString(&OrchestrationConfig::serve_host),
+            .setter = setters::assignString(&OrchestrationConfig::serve_host),
         });
 
         // --- Fused Attention -------------------------------------------------
         spec.add({
-            .long_name   = "--fused-attention-backend",
-            .category    = "Fused Attention",
+            .long_name = "--fused-attention-backend",
+            .category = "Fused Attention",
             .value_label = "<type>",
             .description = "Backend: jit (default), reference, tiled, q16",
-            .setter      = setters::custom<OrchestrationConfig>(
-                [](OrchestrationConfig &c, const std::string &v) {
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &v)
+                {
                     c.fused_attention_backend = parseFusedAttentionBackend(v);
                 }),
         });
 
         // --- MPI Bootstrap ---------------------------------------------------
         spec.add({
-            .long_name   = "--mpi-procs",
-            .category    = "MPI Bootstrap",
+            .long_name = "--mpi-procs",
+            .category = "MPI Bootstrap",
             .value_label = "<n>",
             .description = "Number of MPI processes (0 = auto)",
-            .setter      = setters::parseInt(&OrchestrationConfig::mpi_procs, "--mpi-procs"),
+            .setter = setters::parseInt(&OrchestrationConfig::mpi_procs, "--mpi-procs"),
         });
         spec.add({
-            .long_name   = "--mpi-hostfile",
-            .category    = "MPI Bootstrap",
+            .long_name = "--mpi-hostfile",
+            .category = "MPI Bootstrap",
             .value_label = "<path>",
             .description = "MPI hostfile path (also used for node detection)",
-            .setter      = setters::assignString(&OrchestrationConfig::hostfile),
+            .setter = setters::assignString(&OrchestrationConfig::hostfile),
         });
         spec.add({
-            .long_name   = "--mpi-dry-run",
-            .category    = "MPI Bootstrap",
+            .long_name = "--mpi-dry-run",
+            .category = "MPI Bootstrap",
             .description = "Print MPI launch command and exit",
-            .setter      = setters::assignBoolTrue(&OrchestrationConfig::mpi_dry_run),
+            .setter = setters::assignBoolTrue(&OrchestrationConfig::mpi_dry_run),
         });
         spec.add({
-            .long_name   = "--mpi-verbose",
-            .category    = "MPI Bootstrap",
+            .long_name = "--mpi-verbose",
+            .category = "MPI Bootstrap",
             .description = "Verbose MPI output",
-            .setter      = setters::assignBoolTrue(&OrchestrationConfig::mpi_verbose),
+            .setter = setters::assignBoolTrue(&OrchestrationConfig::mpi_verbose),
         });
         spec.add({
-            .long_name   = "--no-mpi-bootstrap",
-            .category    = "MPI Bootstrap",
+            .long_name = "--no-mpi-bootstrap",
+            .category = "MPI Bootstrap",
             .description = "Disable auto MPI bootstrap (DEBUG ONLY; use for ncu/nsys/perf only)",
-            .setter      = setters::assignBoolTrue(&OrchestrationConfig::mpi_no_bootstrap),
+            .setter = setters::assignBoolTrue(&OrchestrationConfig::mpi_no_bootstrap),
         });
         spec.add({
-            .long_name   = "--mpi-oversubscribe",
-            .category    = "MPI Bootstrap",
+            .long_name = "--mpi-oversubscribe",
+            .category = "MPI Bootstrap",
             .description = "Allow MPI oversubscription",
-            .setter      = setters::assignBoolTrue(&OrchestrationConfig::mpi_oversubscribe),
+            .setter = setters::assignBoolTrue(&OrchestrationConfig::mpi_oversubscribe),
         });
         spec.add({
-            .long_name    = "--mpi-profile",
-            .category     = "MPI Bootstrap",
-            .value_label  = "<mode>",
-            .description  = "MPI bootstrap profile: auto (default), tuned",
+            .long_name = "--mpi-profile",
+            .category = "MPI Bootstrap",
+            .value_label = "<mode>",
+            .description = "MPI bootstrap profile: auto (default), tuned",
             .valid_values = {"auto", "tuned"},
-            .setter       = enumSetter(&OrchestrationConfig::mpi_profile,
-                                       parseMPIProfile, "--mpi-profile", "auto, tuned"),
+            .setter = enumSetter(&OrchestrationConfig::mpi_profile,
+                                 parseMPIProfile, "--mpi-profile", "auto, tuned"),
         });
 
         // --- Device Assignment -----------------------------------------------
         spec.add({
-            .short_name  = "-d",
-            .long_name   = "--device",
-            .category    = "Device Assignment",
+            .short_name = "-d",
+            .long_name = "--device",
+            .category = "Device Assignment",
             .value_label = "<spec>",
             .description = "Device for this rank. cuda:N / rocm:N for GPUs; "
                            "cpu selects all local NUMA nodes; cpu:N selects one",
-            .setter      = setters::custom<OrchestrationConfig>(
-                [](OrchestrationConfig &c, const std::string &value) {
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &value)
+                {
                     std::string lower = toLower(value);
                     if (lower == "cpu")
                     {
-                        c.device_for_this_rank              = GlobalDeviceAddress::cpu(0);
+                        c.device_for_this_rank = GlobalDeviceAddress::cpu(0);
                         c.device_for_this_rank_numa_explicit = false;
-                        c.cpu_global_tp_all_local            = true;
+                        c.cpu_global_tp_all_local = true;
                         return;
                     }
                     if (lower.rfind("cpu:", 0) == 0)
@@ -536,9 +542,9 @@ namespace llaminar2
                             int numa = std::stoi(value.substr(4));
                             if (numa < 0)
                                 throw std::invalid_argument("negative NUMA");
-                            c.device_for_this_rank              = GlobalDeviceAddress::cpu(numa);
+                            c.device_for_this_rank = GlobalDeviceAddress::cpu(numa);
                             c.device_for_this_rank_numa_explicit = true;
-                            c.cpu_global_tp_all_local            = false;
+                            c.cpu_global_tp_all_local = false;
                         }
                         catch (const std::exception &)
                         {
@@ -556,222 +562,228 @@ namespace llaminar2
                     size_t colon_count = static_cast<size_t>(
                         std::count(value.begin(), value.end(), ':'));
                     c.device_for_this_rank_numa_explicit = (colon_count >= 2);
-                    c.cpu_global_tp_all_local            = false;
+                    c.cpu_global_tp_all_local = false;
                 }),
         });
         spec.add({
-            .long_name   = "--device-mode",
-            .category    = "Device Assignment",
+            .long_name = "--device-mode",
+            .category = "Device Assignment",
             .value_label = "<mode>",
             .description = "Assignment mode: auto, local_gpu, round_robin, explicit "
                            "(dashes also accepted: local-gpu, round-robin)",
-            .setter      = enumSetter(&OrchestrationConfig::device_mode,
-                                      parseDeviceAssignmentMode, "--device-mode",
-                                      "auto, local_gpu, round_robin, explicit"),
+            .setter = enumSetter(&OrchestrationConfig::device_mode,
+                                 parseDeviceAssignmentMode, "--device-mode",
+                                 "auto, local_gpu, round_robin, explicit"),
         });
         spec.add({
-            .long_name   = "--device-map",
-            .category    = "Device Assignment",
+            .long_name = "--device-map",
+            .category = "Device Assignment",
             .value_label = "<map>",
             .description = "Explicit rank->device mapping, e.g. \"0=cuda:0,1=cuda:1\"",
-            .setter      = setters::custom<OrchestrationConfig>(
-                [](OrchestrationConfig &c, const std::string &v) {
-                    c.device_map                = parseDeviceMap(v);
-                    c.device_map_numa_explicit  = parseDeviceMapNumaExplicit(v);
-                    c.device_mode               = DeviceAssignmentMode::EXPLICIT;
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &v)
+                {
+                    c.device_map = parseDeviceMap(v);
+                    c.device_map_numa_explicit = parseDeviceMapNumaExplicit(v);
+                    c.device_mode = DeviceAssignmentMode::EXPLICIT;
                 }),
         });
 
         // --- Tensor Parallelism ----------------------------------------------
         spec.add({
-            .short_name  = "-tp",
-            .long_name   = "--tensor-parallelism-degree",
-            .category    = "Tensor Parallelism",
+            .short_name = "-tp",
+            .long_name = "--tensor-parallelism-degree",
+            .category = "Tensor Parallelism",
             .value_label = "<n>",
             .description = "TP parallelism degree",
-            .setter      = setters::parseInt(&OrchestrationConfig::tp_degree,
-                                             "--tensor-parallelism-degree"),
+            .setter = setters::parseInt(&OrchestrationConfig::tp_degree,
+                                        "--tensor-parallelism-degree"),
         });
         spec.add({
-            .long_name   = "--tp-scope",
-            .category    = "Tensor Parallelism",
+            .long_name = "--tp-scope",
+            .category = "Tensor Parallelism",
             .value_label = "<scope>",
             .description = "Scope: auto, local, node_local, global, hybrid",
-            .setter      = enumSetter(&OrchestrationConfig::tp_scope,
-                                      parseTpScope, "--tp-scope",
-                                      "auto, local, node_local, global, hybrid"),
+            .setter = enumSetter(&OrchestrationConfig::tp_scope,
+                                 parseTpScope, "--tp-scope",
+                                 "auto, local, node_local, global, hybrid"),
         });
         spec.add({
-            .long_name   = "--tp-devices",
-            .category    = "Tensor Parallelism",
+            .long_name = "--tp-devices",
+            .category = "Tensor Parallelism",
             .value_label = "<list>",
             .description = "Device list, e.g. \"cuda:0,cuda:1\"",
-            .setter      = setters::custom<OrchestrationConfig>(
-                [](OrchestrationConfig &c, const std::string &v) {
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &v)
+                {
                     c.tp_devices = parseDeviceList(v);
                 }),
         });
         spec.add({
-            .long_name   = "--tp-weights",
-            .category    = "Tensor Parallelism",
+            .long_name = "--tp-weights",
+            .category = "Tensor Parallelism",
             .value_label = "<list>",
             .description = "Weight distribution (requires --tp-devices), e.g. \"0.73,0.27\"",
-            .setter      = setters::custom<OrchestrationConfig>(
-                [](OrchestrationConfig &c, const std::string &v) {
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &v)
+                {
                     c.tp_weights = parseWeightList(v);
                 }),
         });
 
         // --- Pipeline Parallelism --------------------------------------------
         spec.add({
-            .short_name  = "-pp",
-            .long_name   = "--pipeline-parallelism-degree",
-            .category    = "Pipeline Parallelism",
+            .short_name = "-pp",
+            .long_name = "--pipeline-parallelism-degree",
+            .category = "Pipeline Parallelism",
             .value_label = "<n>",
             .description = "PP parallelism degree",
-            .setter      = setters::parseInt(&OrchestrationConfig::pp_degree,
-                                             "--pipeline-parallelism-degree"),
+            .setter = setters::parseInt(&OrchestrationConfig::pp_degree,
+                                        "--pipeline-parallelism-degree"),
         });
         spec.add({
-            .long_name   = "--pp-split",
-            .category    = "Pipeline Parallelism",
+            .long_name = "--pp-split",
+            .category = "Pipeline Parallelism",
             .value_label = "<mode>",
             .description = "Layer split: equal, weighted, manual",
-            .setter      = enumSetter(&OrchestrationConfig::pp_split,
-                                      parsePpSplitMode, "--pp-split",
-                                      "equal, weighted, manual"),
+            .setter = enumSetter(&OrchestrationConfig::pp_split,
+                                 parsePpSplitMode, "--pp-split",
+                                 "equal, weighted, manual"),
         });
 
         // --- Named Domains (advanced) ----------------------------------------
         spec.add({
-            .long_name   = "--define-domain",
-            .category    = "Named Domains (advanced)",
+            .long_name = "--define-domain",
+            .category = "Named Domains (advanced)",
             .value_label = "<spec>",
             .description = "Define domain: \"name=device1,device2[;weights=w1,w2][;backend=type]\"",
-            .setter      = setters::custom<OrchestrationConfig>(
-                [](OrchestrationConfig &c, const std::string &v) {
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &v)
+                {
                     c.domain_definitions.push_back(DomainDefinition::parse(v));
                 }),
         });
         spec.add({
-            .long_name   = "--pp-stage",
-            .category    = "Named Domains (advanced)",
+            .long_name = "--pp-stage",
+            .category = "Named Domains (advanced)",
             .value_label = "<spec>",
             .description = "Define PP stage: \"stage_id=domain:first_layer-last_layer\"",
-            .setter      = setters::custom<OrchestrationConfig>(
-                [](OrchestrationConfig &c, const std::string &v) {
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &v)
+                {
                     c.pp_stage_definitions.push_back(PPStageDefinition::parse(v));
                 }),
         });
 
         // --- Collective Backend ----------------------------------------------
         spec.add({
-            .short_name  = "-b",
-            .long_name   = "--backend",
-            .category    = "Collective Backend",
+            .short_name = "-b",
+            .long_name = "--backend",
+            .category = "Collective Backend",
             .value_label = "<type>",
             .description = "Default collective: auto, nccl, rccl, upi, mpi, host, heterogeneous",
-            .setter      = enumSetter(&OrchestrationConfig::default_backend,
-                                      parseCollectiveBackendType, "--backend",
-                                      "auto, nccl, rccl, upi, mpi, host, heterogeneous"),
+            .setter = enumSetter(&OrchestrationConfig::default_backend,
+                                 parseCollectiveBackendType, "--backend",
+                                 "auto, nccl, rccl, upi, mpi, host, heterogeneous"),
         });
 
         // --- Introspection ---------------------------------------------------
         spec.add({
-            .long_name   = "--dry-run",
-            .category    = "Introspection",
+            .long_name = "--dry-run",
+            .category = "Introspection",
             .description = "Validate configuration and cluster inventory, then exit",
-            .setter      = setters::assignBoolTrue(&OrchestrationConfig::dry_run),
+            .setter = setters::assignBoolTrue(&OrchestrationConfig::dry_run),
         });
         spec.add({
-            .long_name   = "--explain-placement",
-            .category    = "Introspection",
+            .long_name = "--explain-placement",
+            .category = "Introspection",
             .description = "Dump resolved orchestration plan on rank 0",
-            .setter      = setters::assignBoolTrue(&OrchestrationConfig::explain_placement),
+            .setter = setters::assignBoolTrue(&OrchestrationConfig::explain_placement),
         });
         spec.add({
-            .long_name   = "--show-topology",
-            .category    = "Introspection",
+            .long_name = "--show-topology",
+            .category = "Introspection",
             .description = "Show detected CPU topology and exit",
-            .setter      = setters::assignBoolTrue(&OrchestrationConfig::show_topology),
+            .setter = setters::assignBoolTrue(&OrchestrationConfig::show_topology),
         });
         spec.add({
-            .long_name   = "--show-numa",
-            .category    = "Introspection",
+            .long_name = "--show-numa",
+            .category = "Introspection",
             .description = "Show NUMA configuration and exit",
-            .setter      = setters::assignBoolTrue(&OrchestrationConfig::show_numa),
+            .setter = setters::assignBoolTrue(&OrchestrationConfig::show_numa),
         });
         spec.add({
-            .long_name   = "--validate-only",
-            .category    = "Introspection",
+            .long_name = "--validate-only",
+            .category = "Introspection",
             .description = "Validate configuration and exit",
-            .setter      = setters::assignBoolTrue(&OrchestrationConfig::validate_only),
+            .setter = setters::assignBoolTrue(&OrchestrationConfig::validate_only),
         });
         spec.add({
-            .long_name   = "--list-devices",
-            .category    = "Introspection",
+            .long_name = "--list-devices",
+            .category = "Introspection",
             .description = "List available devices and exit",
-            .setter      = setters::assignBoolTrue(&OrchestrationConfig::list_devices),
+            .setter = setters::assignBoolTrue(&OrchestrationConfig::list_devices),
         });
 
         // --- Config File -----------------------------------------------------
         // Loaded as the base config in the first pass of parseArgs; on the
         // second pass we just record the path so downstream code sees it.
         spec.add({
-            .long_name   = "--config",
-            .category    = "Config File",
+            .long_name = "--config",
+            .category = "Config File",
             .value_label = "<path>",
             .description = "Load base configuration from YAML; subsequent CLI flags override it",
-            .setter      = setters::assignString(&OrchestrationConfig::config_file_path),
+            .setter = setters::assignString(&OrchestrationConfig::config_file_path),
         });
 
         // --- MoE Configuration -----------------------------------------------
         spec.add({
-            .long_name   = "--moe-shared-gpu",
-            .category    = "MoE Configuration",
+            .long_name = "--moe-shared-gpu",
+            .category = "MoE Configuration",
             .description = "Place shared experts on GPU (default)",
-            .setter      = setters::assignBoolTrue(&OrchestrationConfig::moe_shared_experts_gpu),
+            .setter = setters::assignBoolTrue(&OrchestrationConfig::moe_shared_experts_gpu),
         });
         spec.add({
-            .long_name   = "--moe-shared-cpu",
-            .category    = "MoE Configuration",
+            .long_name = "--moe-shared-cpu",
+            .category = "MoE Configuration",
             .description = "Place shared experts on CPU",
-            .setter      = setters::assignBoolFalse(&OrchestrationConfig::moe_shared_experts_gpu),
+            .setter = setters::assignBoolFalse(&OrchestrationConfig::moe_shared_experts_gpu),
         });
         spec.add({
-            .long_name   = "--moe-sparse-gpu",
-            .category    = "MoE Configuration",
+            .long_name = "--moe-sparse-gpu",
+            .category = "MoE Configuration",
             .description = "Place sparse experts on GPU",
-            .setter      = setters::assignBoolFalse(&OrchestrationConfig::moe_sparse_experts_cpu),
+            .setter = setters::assignBoolFalse(&OrchestrationConfig::moe_sparse_experts_cpu),
         });
         spec.add({
-            .long_name   = "--moe-sparse-cpu",
-            .category    = "MoE Configuration",
+            .long_name = "--moe-sparse-cpu",
+            .category = "MoE Configuration",
             .description = "Place sparse experts on CPU (default)",
-            .setter      = setters::assignBoolTrue(&OrchestrationConfig::moe_sparse_experts_cpu),
+            .setter = setters::assignBoolTrue(&OrchestrationConfig::moe_sparse_experts_cpu),
         });
 
         // --- Precision -------------------------------------------------------
         spec.add({
-            .long_name    = "--activation-precision",
-            .aliases      = {"--activation-prec", "--act-prec"},
-            .category     = "Precision",
-            .value_label  = "<type>",
-            .description  = "Activation precision: fp32, bf16, fp16, q8_1",
+            .long_name = "--activation-precision",
+            .aliases = {"--activation-prec", "--act-prec"},
+            .category = "Precision",
+            .value_label = "<type>",
+            .description = "Activation precision: fp32, bf16, fp16, q8_1",
             .valid_values = {"fp32", "bf16", "fp16", "q8_1"},
-            .setter       = setters::assignString(&OrchestrationConfig::activation_precision),
+            .setter = setters::assignString(&OrchestrationConfig::activation_precision),
         });
         // --kv-cache-precision accepts many short aliases; normalise to
         // lowercase and validate against the full alias list.
         spec.add({
-            .long_name   = "--kv-cache-precision",
-            .aliases     = {"--kv-prec"},
-            .category    = "Precision",
+            .long_name = "--kv-cache-precision",
+            .aliases = {"--kv-prec"},
+            .category = "Precision",
             .value_label = "<type>",
             .description = "KV cache precision: auto (default), fp32, fp16, q8_1, q16_1, tq4, tq "
                            "(short aliases: f32, f16, q8, q16, i16)",
-            .setter      = setters::custom<OrchestrationConfig>(
-                [](OrchestrationConfig &c, const std::string &value) {
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &value)
+                {
                     std::string lower = toLower(value);
                     static const std::set<std::string> valid_precisions = {
                         "auto", "fp32", "f32", "fp16", "f16",
@@ -790,12 +802,13 @@ namespace llaminar2
 
         // --- Heterogeneous Mode ----------------------------------------------
         spec.add({
-            .long_name   = "--cpu-fraction",
-            .category    = "Heterogeneous Mode",
+            .long_name = "--cpu-fraction",
+            .category = "Heterogeneous Mode",
             .value_label = "<f>",
             .description = "CPU compute fraction (0.0-1.0, default: 0.2)",
-            .setter      = setters::custom<OrchestrationConfig>(
-                [](OrchestrationConfig &c, const std::string &v) {
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &v)
+                {
                     try
                     {
                         c.cpu_compute_fraction = std::stof(v);
@@ -811,12 +824,13 @@ namespace llaminar2
                 }),
         });
         spec.add({
-            .long_name   = "--min-layers-per-domain",
-            .category    = "Heterogeneous Mode",
+            .long_name = "--min-layers-per-domain",
+            .category = "Heterogeneous Mode",
             .value_label = "<n>",
             .description = "Minimum layers per domain (default: 2)",
-            .setter      = setters::custom<OrchestrationConfig>(
-                [](OrchestrationConfig &c, const std::string &v) {
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &v)
+                {
                     try
                     {
                         c.min_layers_per_domain = std::stoi(v);
@@ -834,144 +848,146 @@ namespace llaminar2
 
         // --- Verbosity -------------------------------------------------------
         spec.add({
-            .short_name  = "-v",
-            .category    = "Verbosity",
+            .short_name = "-v",
+            .category = "Verbosity",
             .description = "Increase verbosity (-v, -vv, -vvv)",
-            .setter      = setters::incrementInt(&OrchestrationConfig::verbose_level, 3),
+            .setter = setters::incrementInt(&OrchestrationConfig::verbose_level, 3),
         });
         spec.add({
-            .short_name  = "-vv",
-            .category    = "Verbosity",
+            .short_name = "-vv",
+            .category = "Verbosity",
             .description = "Shorthand for verbosity level 2 (DEBUG)",
-            .setter      = setters::assignIntLiteral(&OrchestrationConfig::verbose_level, 2),
+            .setter = setters::assignIntLiteral(&OrchestrationConfig::verbose_level, 2),
         });
         spec.add({
-            .short_name  = "-vvv",
-            .category    = "Verbosity",
+            .short_name = "-vvv",
+            .category = "Verbosity",
             .description = "Shorthand for verbosity level 3 (TRACE)",
-            .setter      = setters::assignIntLiteral(&OrchestrationConfig::verbose_level, 3),
+            .setter = setters::assignIntLiteral(&OrchestrationConfig::verbose_level, 3),
         });
         spec.add({
-            .short_name  = "-h",
-            .long_name   = "--help",
-            .category    = "Verbosity",
+            .short_name = "-h",
+            .long_name = "--help",
+            .category = "Verbosity",
             .description = "Show this help message",
-            .setter      = setters::assignBoolTrue(&OrchestrationConfig::show_help),
+            .setter = setters::assignBoolTrue(&OrchestrationConfig::show_help),
         });
 
         // =====================================================================
         // Not yet implemented (parsed for back-compat, rendered in NYI section)
         // =====================================================================
         spec.add({
-            .long_name              = "--fused-attention",
-            .category               = "Fused Attention",
-            .description            = "Superseded by --fused-attention-backend",
-            .not_yet_implemented    = true,
-            .setter                 = setters::assignBoolTrue(&OrchestrationConfig::use_fused_attention),
+            .long_name = "--fused-attention",
+            .category = "Fused Attention",
+            .description = "Superseded by --fused-attention-backend",
+            .not_yet_implemented = true,
+            .setter = setters::assignBoolTrue(&OrchestrationConfig::use_fused_attention),
         });
         spec.add({
-            .long_name              = "--shard-weights",
-            .category               = "Tensor Parallelism",
-            .description            = "Weight sharding is automatic based on TP",
-            .not_yet_implemented    = true,
-            .setter                 = setters::assignBoolTrue(&OrchestrationConfig::shard_weights),
+            .long_name = "--shard-weights",
+            .category = "Tensor Parallelism",
+            .description = "Weight sharding is automatic based on TP",
+            .not_yet_implemented = true,
+            .setter = setters::assignBoolTrue(&OrchestrationConfig::shard_weights),
         });
         spec.add({
-            .long_name              = "--no-shard-weights",
-            .category               = "Tensor Parallelism",
-            .description            = "Weight sharding is automatic based on TP",
-            .not_yet_implemented    = true,
-            .setter                 = setters::assignBoolTrue(&OrchestrationConfig::disable_weight_sharding),
+            .long_name = "--no-shard-weights",
+            .category = "Tensor Parallelism",
+            .description = "Weight sharding is automatic based on TP",
+            .not_yet_implemented = true,
+            .setter = setters::assignBoolTrue(&OrchestrationConfig::disable_weight_sharding),
         });
         spec.add({
-            .long_name              = "--heterogeneous",
-            .category               = "Heterogeneous Mode",
-            .description            = "No-op; use --define-domain for heterogeneous setups",
-            .not_yet_implemented    = true,
-            .setter                 = setters::assignBoolTrue(&OrchestrationConfig::heterogeneous_mode),
+            .long_name = "--heterogeneous",
+            .category = "Heterogeneous Mode",
+            .description = "No-op; use --define-domain for heterogeneous setups",
+            .not_yet_implemented = true,
+            .setter = setters::assignBoolTrue(&OrchestrationConfig::heterogeneous_mode),
         });
         spec.add({
-            .long_name              = "--no-gpu-tp",
-            .category               = "Heterogeneous Mode",
-            .description            = "No-op under the current heterogeneous path",
-            .not_yet_implemented    = true,
-            .setter                 = setters::assignBoolTrue(&OrchestrationConfig::disable_gpu_tp),
+            .long_name = "--no-gpu-tp",
+            .category = "Heterogeneous Mode",
+            .description = "No-op under the current heterogeneous path",
+            .not_yet_implemented = true,
+            .setter = setters::assignBoolTrue(&OrchestrationConfig::disable_gpu_tp),
         });
         spec.add({
-            .long_name              = "--no-cpu-tp",
-            .category               = "Heterogeneous Mode",
-            .description            = "No-op under the current heterogeneous path",
-            .not_yet_implemented    = true,
-            .setter                 = setters::assignBoolTrue(&OrchestrationConfig::disable_cpu_tp),
+            .long_name = "--no-cpu-tp",
+            .category = "Heterogeneous Mode",
+            .description = "No-op under the current heterogeneous path",
+            .not_yet_implemented = true,
+            .setter = setters::assignBoolTrue(&OrchestrationConfig::disable_cpu_tp),
         });
         spec.add({
-            .long_name              = "--tp-local",
-            .category               = "Tensor Parallelism",
-            .value_label            = "<degree>",
-            .description            = "Hybrid-TP local subdegree (not yet consumed)",
-            .not_yet_implemented    = true,
-            .setter                 = setters::parseInt(&OrchestrationConfig::tp_local_degree, "--tp-local"),
+            .long_name = "--tp-local",
+            .category = "Tensor Parallelism",
+            .value_label = "<degree>",
+            .description = "Hybrid-TP local subdegree (not yet consumed)",
+            .not_yet_implemented = true,
+            .setter = setters::parseInt(&OrchestrationConfig::tp_local_degree, "--tp-local"),
         });
         spec.add({
-            .long_name              = "--tp-global",
-            .category               = "Tensor Parallelism",
-            .value_label            = "<degree>",
-            .description            = "Hybrid-TP global subdegree (not yet consumed)",
-            .not_yet_implemented    = true,
-            .setter                 = setters::parseInt(&OrchestrationConfig::tp_global_degree, "--tp-global"),
+            .long_name = "--tp-global",
+            .category = "Tensor Parallelism",
+            .value_label = "<degree>",
+            .description = "Hybrid-TP global subdegree (not yet consumed)",
+            .not_yet_implemented = true,
+            .setter = setters::parseInt(&OrchestrationConfig::tp_global_degree, "--tp-global"),
         });
         spec.add({
-            .long_name              = "--cpu-layers",
-            .category               = "Layer Placement",
-            .value_label            = "<n>",
-            .description            = "Legacy layer-placement; use --pp-stage with CPU domains",
-            .not_yet_implemented    = true,
-            .setter                 = setters::parseInt(&OrchestrationConfig::cpu_layers, "--cpu-layers"),
+            .long_name = "--cpu-layers",
+            .category = "Layer Placement",
+            .value_label = "<n>",
+            .description = "Legacy layer-placement; use --pp-stage with CPU domains",
+            .not_yet_implemented = true,
+            .setter = setters::parseInt(&OrchestrationConfig::cpu_layers, "--cpu-layers"),
         });
         spec.add({
-            .long_name              = "--cpu-layers-first",
-            .category               = "Layer Placement",
-            .description            = "Legacy layer-placement; use --pp-stage with CPU domains",
-            .not_yet_implemented    = true,
-            .setter                 = setters::assignBoolTrue(&OrchestrationConfig::cpu_layers_first),
+            .long_name = "--cpu-layers-first",
+            .category = "Layer Placement",
+            .description = "Legacy layer-placement; use --pp-stage with CPU domains",
+            .not_yet_implemented = true,
+            .setter = setters::assignBoolTrue(&OrchestrationConfig::cpu_layers_first),
         });
         spec.add({
-            .long_name              = "--max-gpu-memory",
-            .category               = "Memory Constraints",
-            .value_label            = "<mb>",
-            .description            = "Legacy DeviceOrchestrator is inactive",
-            .not_yet_implemented    = true,
-            .setter                 = setters::custom<OrchestrationConfig>(
-                [](OrchestrationConfig &c, const std::string &v) {
+            .long_name = "--max-gpu-memory",
+            .category = "Memory Constraints",
+            .value_label = "<mb>",
+            .description = "Legacy DeviceOrchestrator is inactive",
+            .not_yet_implemented = true,
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &v)
+                {
                     c.max_gpu_memory_mb = std::stoull(v);
                 }),
         });
         spec.add({
-            .long_name              = "--max-cpu-memory",
-            .category               = "Memory Constraints",
-            .value_label            = "<mb>",
-            .description            = "Legacy DeviceOrchestrator is inactive",
-            .not_yet_implemented    = true,
-            .setter                 = setters::custom<OrchestrationConfig>(
-                [](OrchestrationConfig &c, const std::string &v) {
+            .long_name = "--max-cpu-memory",
+            .category = "Memory Constraints",
+            .value_label = "<mb>",
+            .description = "Legacy DeviceOrchestrator is inactive",
+            .not_yet_implemented = true,
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &v)
+                {
                     c.max_cpu_memory_mb = std::stoull(v);
                 }),
         });
         spec.add({
-            .long_name              = "--topology",
-            .category               = "Topology",
-            .value_label            = "<spec>",
-            .description            = "Tree parsing not yet wired into runner",
-            .not_yet_implemented    = true,
-            .setter                 = setters::assignString(&OrchestrationConfig::topology_string),
+            .long_name = "--topology",
+            .category = "Topology",
+            .value_label = "<spec>",
+            .description = "Tree parsing not yet wired into runner",
+            .not_yet_implemented = true,
+            .setter = setters::assignString(&OrchestrationConfig::topology_string),
         });
         spec.add({
-            .long_name              = "--topology-file",
-            .category               = "Topology",
-            .value_label            = "<path>",
-            .description            = "Tree parsing not yet wired into runner",
-            .not_yet_implemented    = true,
-            .setter                 = setters::assignString(&OrchestrationConfig::topology_file_path),
+            .long_name = "--topology-file",
+            .category = "Topology",
+            .value_label = "<path>",
+            .description = "Tree parsing not yet wired into runner",
+            .not_yet_implemented = true,
+            .setter = setters::assignString(&OrchestrationConfig::topology_file_path),
         });
 
         return spec;

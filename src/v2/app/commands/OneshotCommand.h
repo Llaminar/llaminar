@@ -1,10 +1,11 @@
 /**
  * @file OneshotCommand.h
- * @brief 'llaminar oneshot' — single inference (completion, chat, benchmark) and exit.
+ * @brief 'llaminar oneshot' — single inference (completion, chat) and exit.
  *
- * Consolidates CompletionMode, SingleShotChatMode, InteractiveChatMode, and
- * BenchmarkMode under a single subcommand. The existing OrchestrationConfig
- * flags control which mode runs.
+ * Consolidates CompletionMode, SingleShotChatMode, and InteractiveChatMode
+ * under a single subcommand. Benchmark mode has its own subcommand
+ * ('llaminar benchmark'). The existing OrchestrationConfig flags control
+ * which mode runs.
  */
 
 #pragma once

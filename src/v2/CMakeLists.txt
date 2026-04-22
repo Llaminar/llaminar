@@ -1247,6 +1247,8 @@ add_library(llaminar2_core STATIC
     app/MPIBootstrapPhase.cpp
     app/RuntimeInitPhase.cpp
     # Subcommands
+    app/commands/CommandMPI.cpp
+    app/commands/BenchmarkCommand.cpp
     app/commands/LegacyCommand.cpp
     app/commands/DescribeCommand.cpp
     app/commands/OneshotCommand.cpp

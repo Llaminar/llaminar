@@ -2,8 +2,9 @@
  * @file DescribeCommand.h
  * @brief 'llaminar describe' — print cluster/device inventory and exit.
  *
- * Lightweight command that queries CPU topology, GPU devices, and NUMA
- * configuration without loading a model or bootstrapping MPI.
+ * MPI-aware command that bootstraps MPI to gather the full cluster inventory
+ * via MPI_Allgatherv, exercising the same code path as real inference.
+ * Use --no-mpi-bootstrap for local-only mode.
  */
 
 #pragma once
