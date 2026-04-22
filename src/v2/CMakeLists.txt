@@ -1394,6 +1394,8 @@ add_library(llaminar2_core STATIC
     # Global Pipeline Parallelism topology and planning
     execution/global_pp/GlobalPPTopology.cpp
     execution/global_pp/GlobalPPRankPlanBuilder.cpp
+    # GlobalOrchestrator (Phase 1: cross-machine MPI cluster inference)
+    execution/global/GlobalOrchestrator.cpp
     # Parallelism tree (recursive PP/TP composition)
     execution/parallelism_tree/ParallelismTree.cpp
     execution/parallelism_tree/TransferSpec.cpp

@@ -8562,6 +8562,24 @@ add_v2_test(V2_Unit_GlobalPPTopology
 
 message(STATUS "V2 Tests: Added Global PP unit tests")
 
+# Test: GlobalOrchestrator
+# Unit tests for the cross-machine MPI cluster inference orchestrator (Phase 1).
+# Tests construction, validation, forward delegation, logits access (tail rank only),
+# clear_cache with barrier, greedy/full sampling with MPI_Bcast, pipeline head/tail
+# detection, global TP and PP topologies. Uses MockMPIContext and MockDeviceRunner.
+add_executable(v2_test_global_orchestrator unit/execution/global/Test__GlobalOrchestrator.cpp)
+target_include_directories(v2_test_global_orchestrator PRIVATE 
+    ${CMAKE_CURRENT_SOURCE_DIR}  # For tests/v2/mocks/ include path
+)
+target_link_libraries(v2_test_global_orchestrator llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_GlobalOrchestrator
+    COMMAND $<TARGET_FILE:v2_test_global_orchestrator>
+    LABELS "V2;Unit;GlobalOrchestrator;GlobalPP;PipelineParallel;TensorParallel;MPI"
+    MPI_PROCS 1
+)
+
+message(STATUS "V2 Tests: Added GlobalOrchestrator unit tests")
+
 # Test: ParallelismTree
 # Unit tests for recursive parallelism tree data structure:
 # - Fluent builder construction (PP, TP, Device)

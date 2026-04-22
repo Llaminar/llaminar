@@ -226,7 +226,7 @@ namespace llaminar2::test
             return !config_.allreduce_should_fail;
         }
 
-        bool allreduce(TensorBase *tensor, const std::string & /*stage_name*/) override
+        bool allreduce(TensorBase *tensor, const std::string & /*stage_name*/, size_t /*count*/ = 0) override
         {
             return allreduce(tensor);
         }
