@@ -263,6 +263,27 @@ namespace llaminar2::test
         EXPECT_THROW(GlobalOrchestrator(std::move(config)), std::invalid_argument);
     }
 
+    TEST_F(Test__GlobalOrchestrator, ThrowsOnNegativeRank)
+    {
+        MockMPIContext mpi(0, 1);
+        auto topo = buildSingleStageTopo(1);
+        auto runner = std::make_unique<MockDeviceRunner>();
+
+        auto config = makeConfig(std::move(topo), -1, 1, &mpi, std::move(runner));
+        EXPECT_THROW(GlobalOrchestrator(std::move(config)), std::invalid_argument);
+    }
+
+    TEST_F(Test__GlobalOrchestrator, ThrowsOnNegativeVocabSize)
+    {
+        MockMPIContext mpi(0, 1);
+        auto topo = buildSingleStageTopo(1);
+        auto runner = std::make_unique<MockDeviceRunner>();
+
+        auto config = makeConfig(std::move(topo), 0, 1, &mpi, std::move(runner));
+        config.vocab_size = -1;
+        EXPECT_THROW(GlobalOrchestrator(std::move(config)), std::invalid_argument);
+    }
+
     // =========================================================================
     // Forward Pass Tests
     // =========================================================================
@@ -303,15 +324,16 @@ namespace llaminar2::test
         EXPECT_EQ(log[42], 1.0f);
     }
 
-    TEST_F(Test__GlobalOrchestrator, ForwardReturnsNullLogits_NonTailRank)
+    TEST_F(Test__GlobalOrchestrator, LogitsNullOnNonTailRank)
     {
         MockMPIContext mpi(0, 2);
         auto topo = buildTwoStagePPTopo();
         auto runner = std::make_unique<MockDeviceRunner>();
 
-        // Rank 0 is head, not tail
+        // Rank 0 is head, not tail — logits() should always be nullptr
         GlobalOrchestrator orch(makeConfig(std::move(topo), 0, 2, &mpi, std::move(runner)));
 
+        EXPECT_FALSE(orch.isPipelineTail());
         EXPECT_EQ(orch.logits(), nullptr);
     }
 
@@ -352,7 +374,7 @@ namespace llaminar2::test
     // Sampling Tests
     // =========================================================================
 
-    TEST_F(Test__GlobalOrchestrator, SampleGreedyBroadcasts_SingleStage)
+    TEST_F(Test__GlobalOrchestrator, SampleGreedyCPUFallbackAndBroadcast)
     {
         MockMPIContext mpi(0, 1);
         auto topo = buildSingleStageTopo(1);
@@ -361,22 +383,45 @@ namespace llaminar2::test
         runner_config.vocab_size = VOCAB_SIZE;
         runner_config.mock_logits = std::vector<float>(VOCAB_SIZE, 0.0f);
         runner_config.mock_logits[7] = 99.0f; // Token 7 wins argmax
+        // greedy_sample_token = -1 (default) → forces CPU argmax fallback
         auto runner = std::make_unique<MockDeviceRunner>(runner_config);
 
         GlobalOrchestrator orch(makeConfig(std::move(topo), 0, 1, &mpi, std::move(runner)));
 
-        // Forward first to populate logits
         std::vector<int> tokens = {1};
         ASSERT_TRUE(orch.forward(tokens.data(), 1));
 
+        size_t broadcast_before = mpi.broadcast_call_count();
         int token = orch.sampleGreedyOnDevice();
-        // MockDeviceRunner::sampleGreedyOnDevice() returns -1, so fallback to CPU argmax
-        EXPECT_EQ(token, 7);
-        // Should have called broadcast_int32 once
-        EXPECT_GE(mpi.broadcast_call_count(), 1u);
+
+        EXPECT_EQ(token, 7); // CPU argmax picks token 7
+        EXPECT_EQ(mpi.broadcast_call_count(), broadcast_before + 1);
     }
 
-    TEST_F(Test__GlobalOrchestrator, SampleOnDeviceBroadcasts)
+    TEST_F(Test__GlobalOrchestrator, SampleGreedyUsesRunnerWhenAvailable)
+    {
+        MockMPIContext mpi(0, 1);
+        auto topo = buildSingleStageTopo(1);
+
+        auto runner_config = MockDeviceRunner::Config{};
+        runner_config.vocab_size = VOCAB_SIZE;
+        runner_config.greedy_sample_token = 42; // Runner returns valid token
+        auto runner = std::make_unique<MockDeviceRunner>(runner_config);
+
+        GlobalOrchestrator orch(makeConfig(std::move(topo), 0, 1, &mpi, std::move(runner)));
+
+        std::vector<int> tokens = {1};
+        ASSERT_TRUE(orch.forward(tokens.data(), 1));
+
+        size_t broadcast_before = mpi.broadcast_call_count();
+        int token = orch.sampleGreedyOnDevice();
+
+        // Runner returned 42 directly, no CPU fallback needed
+        EXPECT_EQ(token, 42);
+        EXPECT_EQ(mpi.broadcast_call_count(), broadcast_before + 1);
+    }
+
+    TEST_F(Test__GlobalOrchestrator, SampleOnDeviceFallsBackToGreedyWhenRunnerReturnsNegative)
     {
         MockMPIContext mpi(0, 1);
         auto topo = buildSingleStageTopo(1);
@@ -384,7 +429,8 @@ namespace llaminar2::test
         auto runner_config = MockDeviceRunner::Config{};
         runner_config.vocab_size = VOCAB_SIZE;
         runner_config.mock_logits = std::vector<float>(VOCAB_SIZE, 0.0f);
-        runner_config.mock_logits[3] = 99.0f;
+        runner_config.mock_logits[3] = 99.0f; // Token 3 wins argmax
+        // sample_on_device_token = -1 (default) → triggers greedy fallback
         auto runner = std::make_unique<MockDeviceRunner>(runner_config);
 
         GlobalOrchestrator orch(makeConfig(std::move(topo), 0, 1, &mpi, std::move(runner)));
@@ -393,9 +439,39 @@ namespace llaminar2::test
         ASSERT_TRUE(orch.forward(tokens.data(), 1));
 
         SamplingParams params;
-        params.temperature = 0.0f; // greedy
+        params.temperature = 0.8f;
+        size_t broadcast_before = mpi.broadcast_call_count();
         int token = orch.sampleOnDevice(params);
+
+        // Fell back to greedy (CPU argmax) → token 3
         EXPECT_EQ(token, 3);
+        // Greedy fallback internally broadcasts once
+        EXPECT_GE(mpi.broadcast_call_count(), broadcast_before + 1);
+    }
+
+    TEST_F(Test__GlobalOrchestrator, SampleOnDeviceSuccessPathBroadcasts)
+    {
+        MockMPIContext mpi(0, 1);
+        auto topo = buildSingleStageTopo(1);
+
+        auto runner_config = MockDeviceRunner::Config{};
+        runner_config.vocab_size = VOCAB_SIZE;
+        runner_config.sample_on_device_token = 99; // Runner returns valid token
+        auto runner = std::make_unique<MockDeviceRunner>(runner_config);
+
+        GlobalOrchestrator orch(makeConfig(std::move(topo), 0, 1, &mpi, std::move(runner)));
+
+        std::vector<int> tokens = {1};
+        ASSERT_TRUE(orch.forward(tokens.data(), 1));
+
+        SamplingParams params;
+        params.temperature = 0.8f;
+        size_t broadcast_before = mpi.broadcast_call_count();
+        int token = orch.sampleOnDevice(params);
+
+        // Runner returned 99, broadcast to all ranks
+        EXPECT_EQ(token, 99);
+        EXPECT_EQ(mpi.broadcast_call_count(), broadcast_before + 1);
     }
 
     // =========================================================================
@@ -492,23 +568,24 @@ namespace llaminar2::test
     // Activation Buffer Allocation for PP
     // =========================================================================
 
-    TEST_F(Test__GlobalOrchestrator, AllocatesActivationBufferForPP)
+    TEST_F(Test__GlobalOrchestrator, PPRankPlanHasTransfersForPP)
     {
-        // 2-stage PP: rank 0 should have transfer steps → buffer allocated
+        // 2-stage PP: rank 0 has EXECUTE + SEND steps
         MockMPIContext mpi(0, 2);
         auto topo = buildTwoStagePPTopo();
         auto runner = std::make_unique<MockDeviceRunner>();
 
-        // Just verify construction succeeds (buffer is private, but the plan
-        // will have transfers which triggers buffer allocation)
         GlobalOrchestrator orch(makeConfig(std::move(topo), 0, 2, &mpi, std::move(runner)));
 
         const auto &plan = orch.rankPlan();
         auto transfers = plan.transferActions();
         EXPECT_FALSE(transfers.empty());
+        // Rank 0 sends to rank 1
+        EXPECT_EQ(transfers[0]->direction, RankTransferAction::Direction::SEND);
+        EXPECT_EQ(transfers[0]->peer_rank, 1);
     }
 
-    TEST_F(Test__GlobalOrchestrator, NoActivationBufferForPureTP)
+    TEST_F(Test__GlobalOrchestrator, PureTPHasNoTransfers)
     {
         // Single-stage global TP: no transfers needed
         MockMPIContext mpi(0, 2);
@@ -520,6 +597,110 @@ namespace llaminar2::test
         const auto &plan = orch.rankPlan();
         auto transfers = plan.transferActions();
         EXPECT_TRUE(transfers.empty());
+    }
+
+    // =========================================================================
+    // Forward on PP Topology — Error Paths
+    // =========================================================================
+
+    TEST_F(Test__GlobalOrchestrator, ForwardPP_Rank0_FailsWhenHiddenStateNull)
+    {
+        // Rank 0 in 2-stage PP: EXECUTE succeeds, then SEND fails because
+        // MockDeviceRunner::getHiddenState() returns nullptr (default).
+        MockMPIContext mpi(0, 2);
+        auto topo = buildTwoStagePPTopo();
+        auto runner_raw = new MockDeviceRunner();
+        auto runner = std::unique_ptr<MockDeviceRunner>(runner_raw);
+
+        GlobalOrchestrator orch(makeConfig(std::move(topo), 0, 2, &mpi, std::move(runner)));
+
+        std::vector<int> tokens = {1, 2, 3};
+        // forward() should execute the EXECUTE_STAGE step (succeeds), then
+        // attempt SEND transfer, which fails because getHiddenState() is null
+        EXPECT_FALSE(orch.forward(tokens.data(), 3));
+        // The EXECUTE step ran before the SEND failed
+        EXPECT_EQ(runner_raw->forward_call_count(), 1u);
+    }
+
+    // =========================================================================
+    // Non-Tail Rank Sampling Behavior
+    // =========================================================================
+
+    TEST_F(Test__GlobalOrchestrator, SampleGreedyOnNonTailRankSkipsLocalSampling)
+    {
+        // In PP, the non-tail rank should NOT do local sampling.
+        // It only participates in the broadcast (receiving the token).
+        // With MockMPIContext (no-op broadcast), the token stays -1 on non-tail
+        // because the mock doesn't actually send data from the tail.
+        MockMPIContext mpi(0, 2);
+        auto topo = buildTwoStagePPTopo();
+
+        auto runner_config = MockDeviceRunner::Config{};
+        runner_config.vocab_size = VOCAB_SIZE;
+        runner_config.greedy_sample_token = 42; // Would be used if tail sampled
+        auto runner = std::make_unique<MockDeviceRunner>(runner_config);
+
+        // Rank 0 = head, not tail
+        GlobalOrchestrator orch(makeConfig(std::move(topo), 0, 2, &mpi, std::move(runner)));
+        ASSERT_FALSE(orch.isPipelineTail());
+
+        // Non-tail rank: token starts as -1, broadcast is no-op in mock,
+        // so token remains -1 (in real MPI, tail would supply the value)
+        int token = orch.sampleGreedyOnDevice();
+        EXPECT_EQ(token, -1);
+
+        // Broadcast was still called (non-tail participates in collective)
+        EXPECT_GE(mpi.broadcast_call_count(), 1u);
+    }
+
+    TEST_F(Test__GlobalOrchestrator, SampleOnDeviceNonTailRankSkipsLocalSampling)
+    {
+        MockMPIContext mpi(0, 2);
+        auto topo = buildTwoStagePPTopo();
+
+        auto runner_config = MockDeviceRunner::Config{};
+        runner_config.vocab_size = VOCAB_SIZE;
+        runner_config.sample_on_device_token = 77;
+        auto runner = std::make_unique<MockDeviceRunner>(runner_config);
+
+        // Rank 0 = head, not tail
+        GlobalOrchestrator orch(makeConfig(std::move(topo), 0, 2, &mpi, std::move(runner)));
+        ASSERT_FALSE(orch.isPipelineTail());
+
+        SamplingParams params;
+        params.temperature = 0.8f;
+        int token = orch.sampleOnDevice(params);
+
+        // Non-tail: local sampling skipped, broadcast no-op → token stays -1
+        EXPECT_EQ(token, -1);
+        EXPECT_GE(mpi.broadcast_call_count(), 1u);
+    }
+
+    // =========================================================================
+    // hasLogitsLocal — Tail vs Non-Tail
+    // =========================================================================
+
+    TEST_F(Test__GlobalOrchestrator, HasLogitsLocalOnlyOnTailRank)
+    {
+        // Non-tail rank should return false regardless of runner
+        {
+            MockMPIContext mpi(0, 2);
+            auto topo = buildTwoStagePPTopo();
+            auto runner = std::make_unique<MockDeviceRunner>();
+            GlobalOrchestrator orch(makeConfig(std::move(topo), 0, 2, &mpi, std::move(runner)));
+            EXPECT_FALSE(orch.hasLogitsLocal());
+        }
+
+        // Tail rank delegates to runner (MockDeviceRunner returns false by default)
+        {
+            MockMPIContext mpi(1, 2);
+            auto topo = buildTwoStagePPTopo();
+            auto runner = std::make_unique<MockDeviceRunner>();
+            GlobalOrchestrator orch(makeConfig(std::move(topo), 1, 2, &mpi, std::move(runner)));
+            // Still false because MockDeviceRunner::hasLogitsLocal() returns false,
+            // but the path through GlobalOrchestrator delegates correctly
+            EXPECT_FALSE(orch.hasLogitsLocal());
+        }
     }
 
 } // namespace llaminar2::test

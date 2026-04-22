@@ -48,6 +48,8 @@ namespace llaminar2::test
             std::vector<float> mock_logits;          ///< Mock logits to return
             bool forward_should_fail = false;        ///< If true, forward() returns false
             std::string architecture = "mock_qwen2"; ///< Architecture name
+            int greedy_sample_token = -1;            ///< Token returned by sampleGreedyOnDevice (-1 = not supported)
+            int sample_on_device_token = -1;         ///< Token returned by sampleOnDevice (-1 = not supported)
 
             Config() = default;
         };
@@ -111,6 +113,16 @@ namespace llaminar2::test
         const char *architecture() const override
         {
             return config_.architecture.c_str();
+        }
+
+        int sampleGreedyOnDevice() override
+        {
+            return config_.greedy_sample_token;
+        }
+
+        int sampleOnDevice(const SamplingParams & /*params*/) override
+        {
+            return config_.sample_on_device_token;
         }
 
         // =====================================================================
