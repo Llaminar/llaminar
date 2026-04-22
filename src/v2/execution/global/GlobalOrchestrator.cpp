@@ -10,9 +10,11 @@
 #include "../global_pp/GlobalPPRankPlanBuilder.h"
 #include "../../tensors/TensorClasses.h"
 #include "../../utils/Logger.h"
+#include "../../utils/DebugEnv.h"
 
 #include <stdexcept>
 #include <cassert>
+#include <chrono>
 
 namespace llaminar2
 {
@@ -154,7 +156,15 @@ namespace llaminar2
     {
         rank_runner_->clear_cache();
         // Synchronize across ranks to ensure all caches are cleared
-        config_.mpi_ctx->barrier();
+        try
+        {
+            config_.mpi_ctx->barrier();
+        }
+        catch (const std::exception &e)
+        {
+            LOG_ERROR("GlobalOrchestrator: rank " << config_.rank
+                      << " barrier in clear_cache failed: " << e.what());
+        }
     }
 
     int GlobalOrchestrator::get_position() const
@@ -179,6 +189,7 @@ namespace llaminar2
     int GlobalOrchestrator::sampleGreedyOnDevice()
     {
         int32_t token = -1;
+        const auto &mpi_log = debugEnv().mpi_logging;
 
         if (is_pipeline_tail_)
         {
@@ -206,7 +217,25 @@ namespace llaminar2
         }
 
         // Broadcast sampled token from tail rank to all ranks
-        config_.mpi_ctx->broadcast_int32(&token, 1, tail_rank_);
+        try
+        {
+            auto t0 = std::chrono::steady_clock::now();
+            config_.mpi_ctx->broadcast_int32(&token, 1, tail_rank_);
+            if (mpi_log.log_collectives)
+            {
+                auto dt = std::chrono::steady_clock::now() - t0;
+                double ms = std::chrono::duration<double, std::milli>(dt).count();
+                LOG_INFO("[MPI] rank " << config_.rank << " broadcast_int32 token="
+                         << token << " root=" << tail_rank_
+                         << (mpi_log.log_timing ? (" " + std::to_string(ms) + "ms") : ""));
+            }
+        }
+        catch (const std::exception &e)
+        {
+            LOG_ERROR("GlobalOrchestrator: rank " << config_.rank
+                      << " broadcast_int32 failed: " << e.what());
+            return -1;
+        }
         return token;
     }
 
@@ -227,7 +256,16 @@ namespace llaminar2
         }
 
         // Broadcast sampled token from tail rank to all ranks
-        config_.mpi_ctx->broadcast_int32(&token, 1, tail_rank_);
+        try
+        {
+            config_.mpi_ctx->broadcast_int32(&token, 1, tail_rank_);
+        }
+        catch (const std::exception &e)
+        {
+            LOG_ERROR("GlobalOrchestrator: rank " << config_.rank
+                      << " broadcast_int32 failed: " << e.what());
+            return -1;
+        }
         return token;
     }
 
@@ -417,6 +455,8 @@ namespace llaminar2
         if (action.direction == RankTransferAction::Direction::NONE)
             return true;
 
+        const auto &mpi_log = debugEnv().mpi_logging;
+
         if (action.direction == RankTransferAction::Direction::SEND)
         {
             // Get hidden state from rank runner
@@ -424,7 +464,8 @@ namespace llaminar2
             if (!hidden)
             {
                 LOG_ERROR("GlobalOrchestrator: rank " << config_.rank
-                          << " has no hidden state to send");
+                          << " has no hidden state to send to rank " << action.peer_rank
+                          << " (stage " << action.from_stage << " → " << action.to_stage << ")");
                 return false;
             }
 
@@ -434,11 +475,40 @@ namespace llaminar2
             size_t count = static_cast<size_t>(last_seq_len_) * config_.d_model;
             if (count == 0) count = static_cast<size_t>(config_.d_model);
 
-            LOG_DEBUG("GlobalOrchestrator: rank " << config_.rank
-                      << " SEND " << count << " floats to rank " << action.peer_rank
-                      << " tag=" << action.mpi_tag);
+            if (mpi_log.log_collectives)
+            {
+                LOG_INFO("[MPI] rank " << config_.rank << " SEND " << count
+                         << " floats (" << (count * sizeof(float) / 1024) << " KB)"
+                         << " → rank " << action.peer_rank << " tag=" << action.mpi_tag);
+            }
+            else
+            {
+                LOG_DEBUG("GlobalOrchestrator: rank " << config_.rank
+                          << " SEND " << count << " floats to rank " << action.peer_rank
+                          << " tag=" << action.mpi_tag);
+            }
 
-            config_.mpi_ctx->sendFloat(send_data, count, action.peer_rank, action.mpi_tag);
+            try
+            {
+                auto t0 = std::chrono::steady_clock::now();
+                config_.mpi_ctx->sendFloat(send_data, count, action.peer_rank, action.mpi_tag);
+                if (mpi_log.log_timing)
+                {
+                    auto dt = std::chrono::steady_clock::now() - t0;
+                    double ms = std::chrono::duration<double, std::milli>(dt).count();
+                    double bw_mbps = (count * sizeof(float)) / (ms * 1000.0); // MB/s
+                    LOG_INFO("[MPI] rank " << config_.rank << " SEND complete: "
+                             << ms << "ms, " << bw_mbps << " MB/s");
+                }
+            }
+            catch (const std::exception &e)
+            {
+                LOG_ERROR("GlobalOrchestrator: rank " << config_.rank
+                          << " sendFloat failed (peer=" << action.peer_rank
+                          << " count=" << count << " tag=" << action.mpi_tag
+                          << "): " << e.what());
+                return false;
+            }
             return true;
         }
         else // RECV
@@ -452,18 +522,80 @@ namespace llaminar2
             if (!recv_tensor)
             {
                 LOG_ERROR("GlobalOrchestrator: rank " << config_.rank
-                          << " has no activation buffer for RECV");
+                          << " has no activation buffer for RECV from rank " << action.peer_rank
+                          << " (stage " << action.from_stage << " → " << action.to_stage << ")");
                 return false;
             }
 
             float *recv_data = recv_tensor->mutable_data();
             size_t count = recv_tensor->numel();
 
-            LOG_DEBUG("GlobalOrchestrator: rank " << config_.rank
-                      << " RECV " << count << " floats from rank " << action.peer_rank
-                      << " tag=" << action.mpi_tag);
+            if (mpi_log.log_collectives)
+            {
+                LOG_INFO("[MPI] rank " << config_.rank << " RECV " << count
+                         << " floats (" << (count * sizeof(float) / 1024) << " KB)"
+                         << " ← rank " << action.peer_rank << " tag=" << action.mpi_tag);
+            }
+            else
+            {
+                LOG_DEBUG("GlobalOrchestrator: rank " << config_.rank
+                          << " RECV " << count << " floats from rank " << action.peer_rank
+                          << " tag=" << action.mpi_tag);
+            }
 
-            config_.mpi_ctx->recvFloat(recv_data, count, action.peer_rank, action.mpi_tag, nullptr);
+            try
+            {
+                auto t0 = std::chrono::steady_clock::now();
+
+                // Timeout detection: poll with iprobe before blocking recv
+                int timeout_ms = mpi_log.recv_timeout_ms;
+                if (timeout_ms > 0)
+                {
+                    bool ready = false;
+                    auto deadline = t0 + std::chrono::milliseconds(timeout_ms);
+                    bool warned = false;
+
+                    while (!ready)
+                    {
+                        MPI_Status probe_status;
+                        ready = config_.mpi_ctx->iprobe(action.peer_rank, action.mpi_tag, &probe_status);
+                        if (ready) break;
+
+                        auto now = std::chrono::steady_clock::now();
+                        if (!warned && now >= deadline)
+                        {
+                            double elapsed_ms = std::chrono::duration<double, std::milli>(now - t0).count();
+                            LOG_WARN("GlobalOrchestrator: rank " << config_.rank
+                                     << " RECV from rank " << action.peer_rank
+                                     << " blocked for " << elapsed_ms << "ms"
+                                     << " (expected " << count << " floats, "
+                                     << (count * sizeof(float) / 1024) << " KB"
+                                     << ", tag=" << action.mpi_tag << ")");
+                            warned = true;
+                            // Continue waiting — this is a warning, not an error
+                        }
+                    }
+                }
+
+                config_.mpi_ctx->recvFloat(recv_data, count, action.peer_rank, action.mpi_tag, nullptr);
+
+                if (mpi_log.log_timing)
+                {
+                    auto dt = std::chrono::steady_clock::now() - t0;
+                    double ms = std::chrono::duration<double, std::milli>(dt).count();
+                    double bw_mbps = (count * sizeof(float)) / (ms * 1000.0); // MB/s
+                    LOG_INFO("[MPI] rank " << config_.rank << " RECV complete: "
+                             << ms << "ms, " << bw_mbps << " MB/s");
+                }
+            }
+            catch (const std::exception &e)
+            {
+                LOG_ERROR("GlobalOrchestrator: rank " << config_.rank
+                          << " recvFloat failed (peer=" << action.peer_rank
+                          << " count=" << count << " tag=" << action.mpi_tag
+                          << "): " << e.what());
+                return false;
+            }
 
             // Pass received hidden state to rank runner for the next stage
             rank_runner_->setHiddenState(recv_tensor);

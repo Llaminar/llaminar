@@ -1527,6 +1527,7 @@ namespace llaminar2
         bool log_collectives = false;  ///< Log MPI collective operations (start/end)
         bool log_timing = false;       ///< Log timing of MPI operations
         bool verify_checksums = false; ///< Verify checksums before/after MPI ops (slow)
+        int recv_timeout_ms = 0;       ///< MPI_Recv timeout warning threshold (0 = disabled)
 
         MPILoggingConfig()
         {
@@ -1551,6 +1552,12 @@ namespace llaminar2
             if (verify_checksums_env)
             {
                 verify_checksums = (std::atoi(verify_checksums_env) != 0);
+            }
+
+            const char *recv_timeout_env = std::getenv("LLAMINAR_MPI_RECV_TIMEOUT_MS");
+            if (recv_timeout_env)
+            {
+                recv_timeout_ms = std::atoi(recv_timeout_env);
             }
         }
     };

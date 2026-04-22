@@ -8,6 +8,7 @@
 
 #include "GlobalPPTopology.h"
 #include "../../utils/Logger.h"
+#include "fort.hpp"
 #include <algorithm>
 #include <set>
 #include <sstream>
@@ -498,6 +499,136 @@ namespace llaminar2
         }
 
         oss << "}";
+        return oss.str();
+    }
+
+    std::string GlobalPPTopology::toTable() const
+    {
+        std::ostringstream oss;
+
+        // ── Stage table ──
+        fort::utf8_table table;
+        table.set_border_style(FT_DOUBLE2_STYLE);
+
+        table << fort::header
+              << "Stage" << "Layers" << "Rank(s)" << "Embed" << "LM Head"
+              << "Mode" << "Device(s)" << fort::endr;
+
+        table.column(0).set_cell_text_align(fort::text_align::center);
+        table.column(3).set_cell_text_align(fort::text_align::center);
+        table.column(4).set_cell_text_align(fort::text_align::center);
+
+        for (const auto &stage : stages)
+        {
+            std::string layer_range = "[" + std::to_string(stage.first_layer) + "-"
+                                      + std::to_string(stage.last_layer) + "] ("
+                                      + std::to_string(stage.layerCount()) + ")";
+
+            std::string ranks;
+            if (stage.is_global_tp)
+            {
+                for (size_t i = 0; i < stage.participating_ranks.size(); ++i)
+                {
+                    if (i > 0) ranks += ",";
+                    ranks += std::to_string(stage.participating_ranks[i]);
+                }
+            }
+            else
+            {
+                ranks = std::to_string(stage.owning_rank);
+            }
+
+            std::string mode;
+            if (stage.is_global_tp)
+                mode = "Global TP (" + std::to_string(stage.participating_ranks.size()) + "-way)";
+            else
+                mode = innerParallelismName(stage.inner_mode);
+
+            std::string devices;
+            if (stage.is_global_tp && !stage.devices.empty())
+            {
+                devices = stage.per_rank_device.toString() + " (each)";
+            }
+            else
+            {
+                for (size_t i = 0; i < stage.devices.size(); ++i)
+                {
+                    if (i > 0) devices += ", ";
+                    devices += stage.devices[i].toString();
+                }
+                if (devices.empty()) devices = "cpu";
+            }
+
+            table << std::to_string(stage.stage_id)
+                  << layer_range
+                  << ranks
+                  << (stage.has_embedding ? "Y" : "-")
+                  << (stage.has_lm_head ? "Y" : "-")
+                  << mode
+                  << devices
+                  << fort::endr;
+        }
+
+        oss << "\n"
+            << "Global Pipeline Topology (" << stages.size() << " stages, "
+            << total_layers << " layers, " << world_size << " ranks)\n"
+            << table.to_string();
+
+        // ── Transfer table ──
+        if (!transfers.empty())
+        {
+            fort::utf8_table ttable;
+            ttable.set_border_style(FT_DOUBLE2_STYLE);
+
+            ttable << fort::header
+                   << "From" << "To" << "Sender" << "Receiver"
+                   << "Locality" << "Tag" << fort::endr;
+
+            ttable.column(0).set_cell_text_align(fort::text_align::center);
+            ttable.column(1).set_cell_text_align(fort::text_align::center);
+            ttable.column(2).set_cell_text_align(fort::text_align::center);
+            ttable.column(3).set_cell_text_align(fort::text_align::center);
+            ttable.column(5).set_cell_text_align(fort::text_align::center);
+
+            for (const auto &t : transfers)
+            {
+                if (t.isNoop()) continue;
+                std::string locality;
+                if (t.locality != TransferLocality::UNKNOWN)
+                    locality = transferLocalityName(t.locality);
+                else
+                    locality = "-";
+
+                ttable << ("Stage " + std::to_string(t.from_stage))
+                       << ("Stage " + std::to_string(t.to_stage))
+                       << ("Rank " + std::to_string(t.sender_rank))
+                       << ("Rank " + std::to_string(t.receiver_rank))
+                       << locality
+                       << std::to_string(t.mpi_tag)
+                       << fort::endr;
+            }
+
+            oss << "\nActivation Transfers:\n"
+                << ttable.to_string();
+        }
+
+        // ── Node info ──
+        if (!rank_localities.empty())
+        {
+            oss << "\nNodes: " << nodeCount() << " (";
+            std::set<std::string> hostnames;
+            for (const auto &loc : rank_localities)
+                hostnames.insert(loc.hostname);
+            bool first = true;
+            for (const auto &h : hostnames)
+            {
+                if (!first) oss << ", ";
+                oss << h;
+                first = false;
+            }
+            oss << ")\n";
+        }
+
         return oss.str();
     }
 

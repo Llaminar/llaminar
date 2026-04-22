@@ -293,6 +293,14 @@ namespace llaminar2
          * @brief Human-readable summary for logging
          */
         std::string toString() const;
+
+        /**
+         * @brief Formatted ASCII table for --show-topology output
+         *
+         * Produces a libfort-formatted table showing PP stages, layer ranges,
+         * rank assignments, devices, and transfer paths.
+         */
+        std::string toTable() const;
     };
 
 } // namespace llaminar2
