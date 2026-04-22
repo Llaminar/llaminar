@@ -12,6 +12,7 @@
 #include "interfaces/IWorkspaceConsumer.h"
 #include "kernels/KernelFactory.h"
 #include "kernels/cuda/gemm/CUDAQuantisedGemmKernel.h"
+#include "kernels/cuda/gemm/CuBLASGemmKernel.h"
 #include "../../../../utils/TestTensorFactory.h"
 
 #include <algorithm>
@@ -35,8 +36,6 @@ namespace llaminar2::test::native_vnni_gemm_perf
 {
     using llaminar::v2::kernels::KernelFactory;
 
-    extern "C" const char *cudaFusedTCGemm_lastSelectedFamily();
-    extern "C" const char *cudaFusedTCGemmV2_lastSelectedFamily();
 
     constexpr int kDefaultWarmupRuns = 3;
     constexpr int kDefaultBenchRuns = 10;
@@ -177,27 +176,16 @@ namespace llaminar2::test::native_vnni_gemm_perf
     enum class RunPath
     {
         NativeVNNITensorCore,
-        CutlassFallback,
+        // CutlassFallback removed — NativeVNNI is the sole CUDA GEMM path.
     };
 
+    // KernelModeGuard is no longer needed — NativeVNNI is always enabled
+    // and CUTLASS fallback no longer exists. Kept as a no-op struct for
+    // compatibility with test call sites.
     struct KernelModeGuard
     {
-        KernelModeGuard(bool native_vnni_enabled, bool force_cutlass_fallback)
-            : native_vnni_enabled_(llaminar2::cuda::CUDAQuantisedGemmKernel::isNativeVNNIEnabled()),
-              force_cutlass_fallback_(llaminar2::cuda::CUDAQuantisedGemmKernel::isForceCutlassFallback())
-        {
-            llaminar2::cuda::CUDAQuantisedGemmKernel::setNativeVNNIEnabled(native_vnni_enabled);
-            llaminar2::cuda::CUDAQuantisedGemmKernel::setForceCutlassFallback(force_cutlass_fallback);
-        }
-
-        ~KernelModeGuard()
-        {
-            llaminar2::cuda::CUDAQuantisedGemmKernel::setNativeVNNIEnabled(native_vnni_enabled_);
-            llaminar2::cuda::CUDAQuantisedGemmKernel::setForceCutlassFallback(force_cutlass_fallback_);
-        }
-
-        bool native_vnni_enabled_;
-        bool force_cutlass_fallback_;
+        KernelModeGuard(bool /*native_vnni_enabled*/, bool /*force_cutlass_fallback*/) {}
+        ~KernelModeGuard() = default;
     };
 
     inline std::string toLower(std::string value)
@@ -403,12 +391,112 @@ namespace llaminar2::test::native_vnni_gemm_perf
         return static_cast<float>(dot / (std::sqrt(norm_a) * std::sqrt(norm_b)));
     }
 
-    inline RunResult runKernel(TensorBase *weights, int m, int n, int k, RunPath path, int warmup_runs, int bench_runs, int cuda_device_id = 0)
+    /**
+     * @brief Run cuBLAS FP32 GEMM as a ground-truth reference.
+     *
+     * Dequantizes quantized weights to FP32 on host, uploads A and B_dequant
+     * to GPU, then runs cuBLAS sgemm. The result serves as a numerically
+     * exact (FP32) reference for validating quantized NativeVNNI output.
+     *
+     * Weight layout: quantized tensors store weights as [N × K] (row per
+     * output neuron). cuBLAS expects B in row-major [N × K] with transB=true,
+     * which matches the dequantized layout directly.
+     *
+     * @param weights     Quantized weight tensor (any supported format)
+     * @param h_input     Host FP32 input tensor [M × K] (shared with NativeVNNI run)
+     * @param m           Number of input rows (sequence length)
+     * @param n           Output columns (hidden dim)
+     * @param k           Inner dimension
+     * @param cuda_device_id  CUDA device ordinal
+     * @return RunResult with FP32 output vector (timing fields unused)
+     */
+    inline RunResult runCuBLASReference(TensorBase *weights, const float *h_input, int m, int n, int k, int cuda_device_id = 0)
     {
-        const bool native_vnni_enabled = (path == RunPath::NativeVNNITensorCore);
-        const bool force_cutlass_fallback = (path == RunPath::CutlassFallback);
-        KernelModeGuard mode_guard(native_vnni_enabled, force_cutlass_fallback);
+        if (cudaSetDevice(cuda_device_id) != cudaSuccess)
+            throw std::runtime_error("cudaSetDevice failed");
 
+        // Dequantize weights to FP32 on host — data() returns [N × K] row-major
+        const float *h_weights_fp32 = weights->data();
+        if (!h_weights_fp32)
+            throw std::runtime_error("Failed to dequantize weights to FP32");
+
+        // Allocate GPU buffers
+        float *d_A = nullptr;
+        float *d_B = nullptr;
+        float *d_C = nullptr;
+        const size_t a_bytes = static_cast<size_t>(m) * k * sizeof(float);
+        const size_t b_bytes = static_cast<size_t>(n) * k * sizeof(float);
+        const size_t c_bytes = static_cast<size_t>(m) * n * sizeof(float);
+
+        if (cudaMalloc(&d_A, a_bytes) != cudaSuccess)
+            throw std::runtime_error("cudaMalloc d_A failed");
+        if (cudaMalloc(&d_B, b_bytes) != cudaSuccess)
+        {
+            cudaFree(d_A);
+            throw std::runtime_error("cudaMalloc d_B failed");
+        }
+        if (cudaMalloc(&d_C, c_bytes) != cudaSuccess)
+        {
+            cudaFree(d_A);
+            cudaFree(d_B);
+            throw std::runtime_error("cudaMalloc d_C failed");
+        }
+
+        // Upload A [M×K] and B [N×K] to GPU
+        cudaMemcpy(d_A, h_input, a_bytes, cudaMemcpyHostToDevice);
+        cudaMemcpy(d_B, h_weights_fp32, b_bytes, cudaMemcpyHostToDevice);
+        cudaMemset(d_C, 0, c_bytes);
+
+        // Run cuBLAS sgemm: C[M×N] = A[M×K] × B^T[K×N]  (B stored as [N×K], transB=true)
+        auto cublas_kernel = llaminar2::cuda::createCuBLASGemm(cuda_device_id);
+        if (!cublas_kernel)
+        {
+            cudaFree(d_A);
+            cudaFree(d_B);
+            cudaFree(d_C);
+            throw std::runtime_error("createCuBLASGemm returned null");
+        }
+
+        bool ok = cublas_kernel->execute(d_A, d_B, d_C, m, n, k,
+                                         /*transA=*/false, /*transB=*/true);
+        if (!ok)
+        {
+            cudaFree(d_A);
+            cudaFree(d_B);
+            cudaFree(d_C);
+            throw std::runtime_error("cuBLAS GEMM execute failed");
+        }
+
+        cudaDeviceSynchronize();
+
+        // Download result
+        RunResult result;
+        result.output.resize(static_cast<size_t>(m) * n);
+        cudaMemcpy(result.output.data(), d_C, c_bytes, cudaMemcpyDeviceToHost);
+
+        cudaFree(d_A);
+        cudaFree(d_B);
+        cudaFree(d_C);
+
+        result.native_family = "cublas_fp32";
+        return result;
+    }
+
+    /**
+     * @brief Run NativeVNNI quantized GEMM kernel.
+     *
+     * @param weights       Quantized weight tensor
+     * @param m,n,k         GEMM dimensions
+     * @param path          RunPath (only NativeVNNITensorCore supported)
+     * @param warmup_runs   Number of warmup iterations
+     * @param bench_runs    Number of timed iterations
+     * @param cuda_device_id CUDA device ordinal
+     * @param shared_input  Optional pre-created FP32 input [M×K] for deterministic
+     *                      comparison with cuBLAS reference. If nullptr, creates
+     *                      random input internally (seed 7).
+     */
+    inline RunResult runKernel(TensorBase *weights, int m, int n, int k, RunPath path, int warmup_runs, int bench_runs, int cuda_device_id = 0, const float *shared_input = nullptr)
+    {
         if (cudaSetDevice(cuda_device_id) != cudaSuccess)
             throw std::runtime_error("cudaSetDevice failed");
 
@@ -440,11 +528,18 @@ namespace llaminar2::test::native_vnni_gemm_perf
             workspace_consumer->bindWorkspace(workspace.get());
         }
 
-        auto h_input = TestTensorFactory::createFP32Random({static_cast<size_t>(m), static_cast<size_t>(k)}, -0.25f, 0.25f, 7);
+        // Use shared input if provided, otherwise create random input
+        std::unique_ptr<FP32Tensor> h_input;
+        const float *input_ptr = shared_input;
+        if (!input_ptr)
+        {
+            h_input = TestTensorFactory::createFP32Random({static_cast<size_t>(m), static_cast<size_t>(k)}, -0.25f, 0.25f, 7);
+            input_ptr = h_input->data();
+        }
 
         // Create tensor wrappers and upload to GPU
         auto A_tensor = std::make_unique<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(m), static_cast<size_t>(k)});
-        std::memcpy(A_tensor->mutable_data(), h_input->data(), static_cast<size_t>(m) * k * sizeof(float));
+        std::memcpy(A_tensor->mutable_data(), input_ptr, static_cast<size_t>(m) * k * sizeof(float));
         auto C_tensor = std::make_unique<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(m), static_cast<size_t>(n)});
 
         DeviceId gpu_device(DeviceType::CUDA, 0);
@@ -503,15 +598,7 @@ namespace llaminar2::test::native_vnni_gemm_perf
         result.mean_us = std::accumulate(times_us.begin(), times_us.end(), 0.0) / static_cast<double>(times_us.size());
         if (path == RunPath::NativeVNNITensorCore)
         {
-            // Prefer V2 fused TC → V1 fused TC
-            const char *fused_v2 = cudaFusedTCGemmV2_lastSelectedFamily();
-            const char *fused_v1 = cudaFusedTCGemm_lastSelectedFamily();
-            if (fused_v2 && std::string(fused_v2).substr(0, 2) == "v2")
-                result.native_family = fused_v2;
-            else if (fused_v1 && std::string(fused_v1) != "unknown")
-                result.native_family = fused_v1;
-            else
-                result.native_family = "native_vnni_tc";
+            result.native_family = "native_vnni_tc";
         }
         return result;
     }

@@ -17,6 +17,7 @@
 #include "fort.hpp"
 
 using namespace llaminar2::test::native_vnni_gemm_perf;
+using llaminar2::test::TestTensorFactory;
 using llaminar2::TensorBase;
 
 extern "C"
@@ -123,13 +124,23 @@ namespace
                                  device_id, format.name.c_str(), shape.name.c_str(), cfg.correctness_prefill_m);
                 }
 
-                auto cutlass_weights = format.create(static_cast<size_t>(shape.n), static_cast<size_t>(shape.k));
-                const RunResult cutlass = runKernel(cutlass_weights.get(), cfg.correctness_prefill_m, shape.n, shape.k, RunPath::CutlassFallback, 0, 1, device_id);
+                // Create shared input so both cuBLAS and NativeVNNI see identical data
+                auto h_input = TestTensorFactory::createFP32Random(
+                    {static_cast<size_t>(cfg.correctness_prefill_m), static_cast<size_t>(shape.k)}, -0.25f, 0.25f, 7);
+                const float *input_ptr = h_input->data();
 
+                // cuBLAS FP32 reference (ground truth)
+                auto ref_weights = format.create(static_cast<size_t>(shape.n), static_cast<size_t>(shape.k));
+                const RunResult cublas_ref = runCuBLASReference(ref_weights.get(), input_ptr,
+                    cfg.correctness_prefill_m, shape.n, shape.k, device_id);
+
+                // NativeVNNI quantized GEMM
                 auto native_vnni_weights = format.create(static_cast<size_t>(shape.n), static_cast<size_t>(shape.k));
-                const RunResult native_vnni = runKernel(native_vnni_weights.get(), cfg.correctness_prefill_m, shape.n, shape.k, RunPath::NativeVNNITensorCore, 0, 1, device_id);
+                const RunResult native_vnni = runKernel(native_vnni_weights.get(),
+                    cfg.correctness_prefill_m, shape.n, shape.k, RunPath::NativeVNNITensorCore,
+                    0, 1, device_id, input_ptr);
 
-                const double cosine = cosineSimilarity(cutlass.output, native_vnni.output);
+                const double cosine = cosineSimilarity(cublas_ref.output, native_vnni.output);
                 results[task_index] = {format.name + " " + shape.name, cosine, cosine >= kCosineGate};
             }
         };
@@ -168,16 +179,11 @@ namespace
             int warmup_runs = 0;
             int bench_runs = 0;
             size_t weight_bytes = 0;
-            double cutlass_min_us = 0.0;
-            double cutlass_mean_us = 0.0;
-            double cutlass_tops = 0.0;
-            double cutlass_pct_tc_peak = 0.0;
             std::string native_family;
-            double native_min_us = 0.0;
-            double native_mean_us = 0.0;
-            double native_tops = 0.0;
-            double native_pct_tc_peak = 0.0;
-            double speedup_vs_cutlass = 0.0;
+            double min_us = 0.0;
+            double mean_us = 0.0;
+            double tops = 0.0;
+            double pct_tc_peak = 0.0;
         };
 
         std::vector<PerfTask> tasks;
@@ -236,23 +242,17 @@ namespace
 
                 for (int m : cfg.performance_prefill_m)
                 {
-                    auto cutlass_weights = format.create(static_cast<size_t>(shape.n), static_cast<size_t>(shape.k));
-                    const size_t weight_bytes = cutlass_weights->size_bytes();
-                    const RunResult cutlass = runKernel(cutlass_weights.get(), m, shape.n, shape.k, RunPath::CutlassFallback, cfg.warmup_runs, cfg.bench_runs, device_id);
+                    auto weights = format.create(static_cast<size_t>(shape.n), static_cast<size_t>(shape.k));
+                    const size_t weight_bytes = weights->size_bytes();
+                    const RunResult result = runKernel(weights.get(), m, shape.n, shape.k, RunPath::NativeVNNITensorCore, cfg.warmup_runs, cfg.bench_runs, device_id);
 
-                    auto native_vnni_weights = format.create(static_cast<size_t>(shape.n), static_cast<size_t>(shape.k));
-                    const RunResult native_vnni = runKernel(native_vnni_weights.get(), m, shape.n, shape.k, RunPath::NativeVNNITensorCore, cfg.warmup_runs, cfg.bench_runs, device_id);
-
-                    const auto cutlass_metrics = computeGemmThroughputMetrics(m, shape.n, shape.k, cutlass.min_us, peak_tc_tops_);
-                    const auto native_vnni_metrics = computeGemmThroughputMetrics(m, shape.n, shape.k, native_vnni.min_us, peak_tc_tops_);
+                    const auto metrics = computeGemmThroughputMetrics(m, shape.n, shape.k, result.min_us, peak_tc_tops_);
 
                     {
                         std::lock_guard<std::mutex> lock(log_mutex);
                         std::fprintf(stderr,
-                                     "[CUDANativeVNNIGemm][Perf][gpu=%d] format=%s codebook=%u shape=%s M=%d N=%d K=%d warmup=%d bench=%d "
-                                     "cutlass_min_us=%.3f cutlass_tops=%.3f cutlass_pct_tc_peak=%.1f%% "
-                                     "native_vnni_family=%s native_vnni_min_us=%.3f native_vnni_tops=%.3f native_vnni_pct_tc_peak=%.1f%% "
-                                     "speedup_vs_cutlass=%.3fx\n",
+                                     "[CUDANativeVNNIGemm][Perf][gpu=%d] format=%s codebook=%u shape=%s M=%d N=%d K=%d "
+                                     "family=%s min_us=%.3f tops=%.3f pct_tc_peak=%.1f%%\n",
                                      device_id,
                                      format.name.c_str(),
                                      static_cast<unsigned>(format.codebook_id),
@@ -260,16 +260,10 @@ namespace
                                      m,
                                      shape.n,
                                      shape.k,
-                                     cfg.warmup_runs,
-                                     cfg.bench_runs,
-                                     cutlass.min_us,
-                                     cutlass_metrics.achieved_tops,
-                                     cutlass_metrics.pct_tc_peak,
-                                     native_vnni.native_family.c_str(),
-                                     native_vnni.min_us,
-                                     native_vnni_metrics.achieved_tops,
-                                     native_vnni_metrics.pct_tc_peak,
-                                     cutlass.min_us / native_vnni.min_us);
+                                     result.native_family.c_str(),
+                                     result.min_us,
+                                     metrics.achieved_tops,
+                                     metrics.pct_tc_peak);
                     }
 
                     rows.push_back(PerfRow{
@@ -282,16 +276,11 @@ namespace
                         cfg.warmup_runs,
                         cfg.bench_runs,
                         weight_bytes,
-                        cutlass.min_us,
-                        cutlass.mean_us,
-                        cutlass_metrics.achieved_tops,
-                        cutlass_metrics.pct_tc_peak,
-                        native_vnni.native_family,
-                        native_vnni.min_us,
-                        native_vnni.mean_us,
-                        native_vnni_metrics.achieved_tops,
-                        native_vnni_metrics.pct_tc_peak,
-                        cutlass.min_us / native_vnni.min_us,
+                        result.native_family,
+                        result.min_us,
+                        result.mean_us,
+                        metrics.achieved_tops,
+                        metrics.pct_tc_peak,
                     });
                 }
 
@@ -313,7 +302,7 @@ namespace
             ASSERT_NE(csv, nullptr) << "Failed to open CSV: " << cfg.csv_path;
             std::fprintf(
                 csv,
-                "format,codebook,shape,m,n,k,warmup_runs,bench_runs,weight_bytes,cutlass_min_us,cutlass_mean_us,cutlass_tops,cutlass_pct_tc_peak,native_family,native_min_us,native_mean_us,native_tops,native_pct_tc_peak,speedup_vs_cutlass\n");
+                "format,codebook,shape,m,n,k,warmup_runs,bench_runs,weight_bytes,family,min_us,mean_us,tops,pct_tc_peak\n");
         }
 
         int executed_cases = 0;
@@ -328,7 +317,7 @@ namespace
                 {
                     std::fprintf(
                         csv,
-                        "%s,%u,%s,%d,%d,%d,%d,%d,%zu,%.3f,%.3f,%.3f,%.1f,%s,%.3f,%.3f,%.3f,%.1f,%.3f\n",
+                        "%s,%u,%s,%d,%d,%d,%d,%d,%zu,%s,%.3f,%.3f,%.3f,%.1f\n",
                         row.format_name.c_str(),
                         static_cast<unsigned>(row.codebook_id),
                         row.shape_name.c_str(),
@@ -338,16 +327,11 @@ namespace
                         row.warmup_runs,
                         row.bench_runs,
                         row.weight_bytes,
-                        row.cutlass_min_us,
-                        row.cutlass_mean_us,
-                        row.cutlass_tops,
-                        row.cutlass_pct_tc_peak,
                         row.native_family.c_str(),
-                        row.native_min_us,
-                        row.native_mean_us,
-                        row.native_tops,
-                        row.native_pct_tc_peak,
-                        row.speedup_vs_cutlass);
+                        row.min_us,
+                        row.mean_us,
+                        row.tops,
+                        row.pct_tc_peak);
                 }
                 ++executed_cases;
             }

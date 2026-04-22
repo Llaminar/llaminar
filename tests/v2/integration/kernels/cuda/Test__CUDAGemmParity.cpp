@@ -1833,7 +1833,6 @@ TEST_F(Test__CUDAGemmParity, CachedIQ4_NLKernel_FirstExecutionPopulatesLazyCUDAU
     EXPECT_EQ(packed->active_family, llaminar2::cuda::CUDAPackedWeightFamily::NativeVNNI);
     EXPECT_FALSE(packed->uploaded);
     EXPECT_TRUE(packed->device_uploads.empty());
-    EXPECT_FALSE(packed->int8_data.empty());
     EXPECT_FALSE(packed->native_vnni.empty());
 
     auto *cached_kernel = getPreparedKernel(weights.get(), gpu_device_);
@@ -1858,16 +1857,11 @@ TEST_F(Test__CUDAGemmParity, CachedIQ4_NLKernel_FirstExecutionPopulatesLazyCUDAU
     ASSERT_NE(upload_it, packed->device_uploads.end());
 
     const auto &upload = upload_it->second;
-    EXPECT_NE(upload.d_int8_data, nullptr);
-    EXPECT_NE(upload.d_scales, nullptr);
-    EXPECT_NE(upload.d_int8_data_tc_blocked, nullptr);
     EXPECT_NE(upload.d_native_vnni, nullptr);
     EXPECT_NE(upload.d_native_scales, nullptr);
     EXPECT_EQ(upload.d_native_mins, nullptr);
     EXPECT_EQ(upload.d_native_emins, nullptr);
 
-    EXPECT_TRUE(packed->int8_data.empty()) << "INT8 fallback host buffers should be released after first upload";
-    EXPECT_TRUE(packed->scales.empty()) << "INT8 fallback host scales should be released after first upload";
     EXPECT_TRUE(packed->native_vnni.empty()) << "Native payload host buffers should be released after first upload";
     EXPECT_TRUE(packed->native_scales.empty()) << "Native payload host scales should be released after first upload";
 

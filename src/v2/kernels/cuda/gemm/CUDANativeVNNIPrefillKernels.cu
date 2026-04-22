@@ -3701,24 +3701,9 @@ extern "C"
     }
 } // extern "C"
 
-// Profitability gate for dual-scale formats.
-// Split-MMA doubles IMMA count per K-tile. NativeVNNI only wins over
-// CUTLASS expanded path when the shape is memory-bound (high K/N, small M).
-// Empirical data (RTX 3090, BK64, M∈{32,64,128}):
-//   K/N ≥ 2 && M ≤ 64  → 81% profitable, avg 1.15x speedup
-//   K/N < 2 || M > 64  → only ~8% profitable, avg 0.67x
-//   IQ1_M (CB17)       → 3.89x instruction count, 16.7% occupancy,
-//                         only 3% profitable (mean 0.38x) — always gate out
-static bool isDualScalePrefillProfitable(int M, int N, int K, uint8_t codebook_id)
-{
-    // IQ1_M: delta correction overhead is too extreme (13424 insns vs 3448 baseline)
-    if (codebook_id == 17)
-        return false;
-
-    // Dual-scale formats: CB 8 (Q6_K), 9 (Q3_K), 10 (Q2_K), 13 (IQ2_S), 14 (IQ2_XS)
-    // Profitable when K-rich (memory-bound) and M is not too large (not compute-bound)
-    return (K >= 2 * N && M <= 64);
-}
+// Profitability gate removed: NativeVNNI is now the only CUDA GEMM path.
+// TC/CUTLASS expanded fallback has been sunset. All codebooks always use
+// the NativeVNNI prefill kernel regardless of shape.
 
 extern "C" bool cudaNativeVNNIPrefill_fp32(
     const int8_t *d_A_int8,
@@ -3802,39 +3787,38 @@ extern "C" bool cudaNativeVNNIPrefill_fp32(
             M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
 
     // --- Dual-scale formats (separate lo/hi scales via split MMA) ---
-    // Profitability gate: only launch for shapes where NativeVNNI beats CUTLASS.
     case 8: // Q6_K
-        if (!d_mins || !isDualScalePrefillProfitable(M, N, K, 8))
+        if (!d_mins)
             return false;
         return launchGenericPrefillBK64<8>(
             d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32, d_scales_A_block,
             M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
     case 9: // Q3_K
-        if (!d_mins || !isDualScalePrefillProfitable(M, N, K, 9))
+        if (!d_mins)
             return false;
         return launchGenericPrefillBK64<9>(
             d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32, d_scales_A_block,
             M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
     case 10: // Q2_K (dual-scale + asymmetric via emins)
-        if (!d_mins || !isDualScalePrefillProfitable(M, N, K, 10))
+        if (!d_mins)
             return false;
         return launchGenericPrefillBK64<10>(
             d_A_int8, d_payload, d_scales, d_mins, d_emins, d_C_fp32, d_scales_A_block,
             M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
     case 13: // IQ2_S
-        if (!d_mins || !isDualScalePrefillProfitable(M, N, K, 13))
+        if (!d_mins)
             return false;
         return launchGenericPrefillBK64<13>(
             d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32, d_scales_A_block,
             M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
     case 14: // IQ2_XS
-        if (!d_mins || !isDualScalePrefillProfitable(M, N, K, 14))
+        if (!d_mins)
             return false;
         return launchGenericPrefillBK64<14>(
             d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32, d_scales_A_block,
             M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
     case 17: // IQ1_M (dual-scale + delta correction)
-        if (!d_mins || !isDualScalePrefillProfitable(M, N, K, 17))
+        if (!d_mins)
             return false;
         return launchGenericPrefillBK64<17>(
             d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32, d_scales_A_block,

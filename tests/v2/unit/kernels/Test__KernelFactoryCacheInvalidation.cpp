@@ -463,8 +463,6 @@ TEST_F(Test__KernelFactoryCacheInvalidation, CUDAPackedWeights_NativeFormatsPopu
     EXPECT_EQ(packed->K, 32);
     EXPECT_EQ(packed->native_blocks_per_row, 1u);
 
-    EXPECT_FALSE(packed->int8_data.empty()) << "Native formats should still build the INT8 fallback mirror";
-    EXPECT_FALSE(packed->scales.empty()) << "INT8 fallback scales should be populated";
     EXPECT_FALSE(packed->native_vnni.empty()) << "Native formats should keep compact native payload in cache";
     EXPECT_FALSE(packed->native_scales.empty()) << "Native payload scales should be populated";
     EXPECT_EQ(packed->native_mins.size(), 0u) << "IQ4_NL is symmetric and should not allocate mins";
@@ -504,7 +502,6 @@ TEST_F(Test__KernelFactoryCacheInvalidation, CUDAPackedWeights_NativeFormatsRema
     ASSERT_NE(packed, nullptr);
     EXPECT_FALSE(packed->uploaded) << "CUDA packed weights should remain lazy until first execution";
     EXPECT_TRUE(packed->device_uploads.empty()) << "Kernel construction alone should not populate device upload state";
-    EXPECT_FALSE(packed->int8_data.empty()) << "Lazy CUDA cache should retain INT8 fallback host buffers";
     EXPECT_FALSE(packed->native_vnni.empty()) << "Lazy CUDA cache should retain native payload host buffers";
 }
 

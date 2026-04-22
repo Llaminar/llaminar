@@ -38,12 +38,7 @@ using namespace llaminar2::cuda;
 using namespace llaminar2::test;
 using llaminar::v2::kernels::KernelFactory;
 
-extern "C"
-{
-    void cudaTCGemm_setTuningOverrides(int force_small_m, int force_wide_n, int force_balanced, int unused0, int unused1);
-    const char *cudaFusedTCGemmV2_lastSelectedFamily();
-    int cudaFusedTCGemmV2_lastSelectedSplitK();
-}
+// TC tuning extern removed — NativeVNNI is the sole CUDA GEMM path
 
 namespace
 {
@@ -199,24 +194,11 @@ namespace
         std::string gemm_dispatch = "auto";
     };
 
+    // KernelModeGuard is a no-op — NativeVNNI is always enabled, CUTLASS removed.
     struct KernelModeGuard
     {
-        KernelModeGuard(bool native_vnni_enabled, bool force_cutlass_fallback)
-            : native_vnni_enabled_(CUDAQuantisedGemmKernel::isNativeVNNIEnabled()),
-              force_cutlass_fallback_(CUDAQuantisedGemmKernel::isForceCutlassFallback())
-        {
-            CUDAQuantisedGemmKernel::setNativeVNNIEnabled(native_vnni_enabled);
-            CUDAQuantisedGemmKernel::setForceCutlassFallback(force_cutlass_fallback);
-        }
-
-        ~KernelModeGuard()
-        {
-            CUDAQuantisedGemmKernel::setNativeVNNIEnabled(native_vnni_enabled_);
-            CUDAQuantisedGemmKernel::setForceCutlassFallback(force_cutlass_fallback_);
-        }
-
-        bool native_vnni_enabled_;
-        bool force_cutlass_fallback_;
+        KernelModeGuard(bool /*native_vnni_enabled*/, bool /*force_cutlass_fallback*/) {}
+        ~KernelModeGuard() = default;
     };
 
     std::string toLower(std::string value)
@@ -350,31 +332,9 @@ namespace
         return cfg;
     }
 
-    void applyGemmTuningOverride(const SweepConfig &cfg, int m)
+    // TC tuning overrides removed — NativeVNNI handles dispatch internally.
+    void applyGemmTuningOverride(const SweepConfig & /*cfg*/, int /*m*/)
     {
-        const bool is_gemm = (m > 1);
-        if (!is_gemm)
-        {
-            cudaTCGemm_setTuningOverrides(0, 0, 0, 0, 0);
-            return;
-        }
-
-        if (cfg.gemm_dispatch == "small_m")
-        {
-            cudaTCGemm_setTuningOverrides(1, 0, 0, 0, 0);
-        }
-        else if (cfg.gemm_dispatch == "wide_n")
-        {
-            cudaTCGemm_setTuningOverrides(0, 1, 0, 0, 0);
-        }
-        else if (cfg.gemm_dispatch == "balanced")
-        {
-            cudaTCGemm_setTuningOverrides(0, 0, 1, 0, 0);
-        }
-        else
-        {
-            cudaTCGemm_setTuningOverrides(0, 0, 0, 0, 0);
-        }
     }
 
     bool shouldRunName(const std::set<std::string> &filters, const std::string &name)
@@ -574,12 +534,7 @@ namespace
 
             result.min_us = *std::min_element(times_us.begin(), times_us.end());
             result.mean_us = std::accumulate(times_us.begin(), times_us.end(), 0.0) / static_cast<double>(times_us.size());
-            if (!cfg.native_vnni_enabled)
-            {
-                const char *family = cudaFusedTCGemmV2_lastSelectedFamily();
-                result.backend_family = family ? family : "unknown";
-                result.split_k = cudaFusedTCGemmV2_lastSelectedSplitK();
-            }
+            result.backend_family = "native_vnni_tc";
             return result;
         }
 

@@ -55,8 +55,6 @@ using TensorProjectionDesc = llaminar2::ITensorGemm::TensorProjectionDesc;
 #ifdef HAVE_CUDA
 extern "C"
 {
-    const char *cudaFusedTCGemmV2_lastSelectedFamily();
-    int cudaFusedTCGemmV2_lastSelectedSplitK();
     void cudaNativeVNNIPrefill_setStreamKMode(int mode);
     int cudaNativeVNNIPrefill_getStreamKMode();
     void cudaNativeVNNIPrefill_setBK256Mode(int mode);
@@ -885,47 +883,13 @@ TEST_F(Test__CUDAGemmNonDeterminism, DISABLED_FFNDown_SplitKComparison)
 #endif
 }
 
-TEST_F(Test__CUDAGemmNonDeterminism, AmpereV2_DeepKSplitK_SelfConsistency)
+TEST_F(Test__CUDAGemmNonDeterminism, NativeVNNI_SelfConsistency)
 {
 #ifndef HAVE_CUDA
     GTEST_SKIP() << "CUDA build required";
 #else
-    cudaDeviceProp prop{};
-    ASSERT_EQ(cudaGetDeviceProperties(&prop, gpu_device_.cuda_ordinal()), cudaSuccess);
-    if (prop.major < 8)
-        GTEST_SKIP() << "Ampere+ GPU required for CUDAFusedTCGemmV2";
-
-    const bool saved_native = llaminar2::cuda::CUDAQuantisedGemmKernel::isNativeVNNIEnabled();
-    const bool saved_cutlass = llaminar2::cuda::CUDAQuantisedGemmKernel::isForceCutlassFallback();
-    const char *saved_family = std::getenv("LLAMINAR_CUDA_FUSEDTC_V2_FORCE_FAMILY");
-    const std::string saved_family_value = saved_family ? saved_family : "";
-    const char *saved_det = std::getenv("LLAMINAR_DETERMINISTIC");
-    const std::string saved_det_value = saved_det ? saved_det : "";
-
-    auto restore = [&]()
-    {
-        llaminar2::cuda::CUDAQuantisedGemmKernel::setNativeVNNIEnabled(saved_native);
-        llaminar2::cuda::CUDAQuantisedGemmKernel::setForceCutlassFallback(saved_cutlass);
-        if (saved_family)
-            setenv("LLAMINAR_CUDA_FUSEDTC_V2_FORCE_FAMILY", saved_family_value.c_str(), 1);
-        else
-            unsetenv("LLAMINAR_CUDA_FUSEDTC_V2_FORCE_FAMILY");
-        if (saved_det)
-            setenv("LLAMINAR_DETERMINISTIC", saved_det_value.c_str(), 1);
-        else
-            unsetenv("LLAMINAR_DETERMINISTIC");
-    };
-    const auto restore_guard = std::unique_ptr<void, std::function<void(void *)>>(
-        nullptr,
-        [&](void *)
-        {
-            restore();
-        });
-
-    llaminar2::cuda::CUDAQuantisedGemmKernel::setNativeVNNIEnabled(false);
-    llaminar2::cuda::CUDAQuantisedGemmKernel::setForceCutlassFallback(false);
-    setenv("LLAMINAR_CUDA_FUSEDTC_V2_FORCE_FAMILY", "deep_k", 1);
-    setenv("LLAMINAR_DETERMINISTIC", "0", 1);
+    // NativeVNNI is now the sole CUDA GEMM path. Verify it produces
+    // bitwise-identical results across repeated invocations.
 
     const int M = 9;
     const int N = 896;
@@ -972,13 +936,6 @@ TEST_F(Test__CUDAGemmNonDeterminism, AmpereV2_DeepKSplitK_SelfConsistency)
                     input.get(), output.get(), M, N, K, true, 1.0f, 0.0f, nullptr, nullptr, -1);
             }));
 
-        const char *family = cudaFusedTCGemmV2_lastSelectedFamily();
-        ASSERT_NE(family, nullptr);
-        EXPECT_EQ(std::strncmp(family, "v2_", 3), 0) << "Expected Ampere V2 fused path, got " << family;
-
-        const int split_k = cudaFusedTCGemmV2_lastSelectedSplitK();
-        EXPECT_GT(split_k, 1) << "Expected split-K > 1 for the forced deep-K shape";
-
         const float *data = output->data();
         if (rep == 0)
         {
@@ -992,14 +949,13 @@ TEST_F(Test__CUDAGemmNonDeterminism, AmpereV2_DeepKSplitK_SelfConsistency)
         }
     }
 
-    std::cout << "AmpereV2 deep-k split-K summary: min_cos=" << std::fixed << std::setprecision(6) << min_cos
+    std::cout << "NativeVNNI self-consistency: min_cos=" << std::fixed << std::setprecision(6) << min_cos
               << " max_diffs=" << max_diffs
-              << " max_abs=" << std::scientific << max_abs
-              << " split_k=" << cudaFusedTCGemmV2_lastSelectedSplitK() << "\n";
+              << " max_abs=" << std::scientific << max_abs << "\n";
 
-    EXPECT_EQ(max_diffs, 0u) << "Ampere V2 split-K path changed bitwise across repeats";
-    EXPECT_FLOAT_EQ(max_abs, 0.0f) << "Ampere V2 split-K path drift should be zero";
-    EXPECT_GE(min_cos, 0.999999) << "Ampere V2 split-K path should be deterministic";
+    EXPECT_EQ(max_diffs, 0u) << "NativeVNNI path changed bitwise across repeats";
+    EXPECT_FLOAT_EQ(max_abs, 0.0f) << "NativeVNNI path drift should be zero";
+    EXPECT_GE(min_cos, 0.999999) << "NativeVNNI path should be deterministic";
 
     ws->unbindWorkspace();
     workspace_.reset();

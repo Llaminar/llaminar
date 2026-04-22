@@ -1,90 +1,22 @@
 /**
  * @file CUDAQuantisedGemmKernel_CUTLASS.cu
- * @brief CUTLASS INT8 GEMM implementation for CUDAQuantisedGemmKernel
+ * @brief CUDA utility kernels and memory management for CUDAQuantisedGemmKernel
  *
- * This file contains the actual CUDA kernel implementations:
- * - CUTLASS INT8×INT8→INT32 GEMM using Tensor Cores
- * - Activation quantization (FP32→INT8)
- * - Output scaling (INT32→FP32)
- * - Memory management utilities
+ * After the NativeVNNI-only transition, this file retains:
+ * - Blockwise activation quantization (FP32→INT8 per-block-of-32)
+ * - Work buffer management
+ * - Device memory utilities (upload, alloc, copy, free)
+ * - Stream/event management
  *
- * **CUTLASS Configuration**:
- * - ThreadBlock: 128×128×64 (optimized for Tensor Core tiles)
- * - Warp: 64×64×64 (must align with Tensor Core)
- * - Instruction: 16×8×32 (mma.sync.m16n8k32.s8.s8.s32)
- * - Pipeline stages: 3 (overlapped loads/compute)
- *
- * **Memory Layout Requirements**:
- * - A: INT8 [M×K] RowMajor
- * - B: INT8 [K×N] ColumnMajor (Tensor Core requirement!)
- * - C: INT32 [M×N] RowMajor
- *
- * @author David Sanftenberg
- * @date January 2026
+ * The CUTLASS INT8 GEMM, row-wise quantization, output scaling, and
+ * blockwise dp4a GEMM kernels have been removed — NativeVNNI is now
+ * the sole CUDA GEMM execution path.
  */
 
 #include <cuda_runtime.h>
-#include <cutlass/cutlass.h>
-#include <cutlass/gemm/device/gemm.h>
 #include <iostream>
 #include <cmath>
 #include <algorithm>
-
-// =========================================================================
-// CUTLASS GEMM Type Definition
-// =========================================================================
-
-// CUTLASS INT8 GEMM using Tensor Cores (SM 8.0+ Ampere/Ada/Hopper)
-// Uses dp4a instruction for int8×int8 dot product with int32 accumulation
-//
-// Standard tile: 128×128×64 — optimized for large M (prefill, batched)
-using CutlassInt8Gemm = cutlass::gemm::device::Gemm<
-    int8_t,                                 // ElementA
-    cutlass::layout::RowMajor,              // LayoutA
-    int8_t,                                 // ElementB
-    cutlass::layout::ColumnMajor,           // LayoutB (MUST be ColumnMajor for Tensor Cores!)
-    int32_t,                                // ElementOutput (accumulator)
-    cutlass::layout::RowMajor,              // LayoutC
-    int32_t,                                // ElementAccumulator
-    cutlass::arch::OpClassTensorOp,         // OpClass (Tensor Cores)
-    cutlass::arch::Sm80,                    // ArchTag (Ampere SM 8.0+)
-    cutlass::gemm::GemmShape<128, 128, 64>, // ThreadblockShape
-    cutlass::gemm::GemmShape<64, 64, 64>,   // WarpShape
-    cutlass::gemm::GemmShape<16, 8, 32>,    // InstructionShape (mma.sync.m16n8k32)
-    cutlass::epilogue::thread::LinearCombination<
-        int32_t, 1, int32_t, int32_t>,                            // EpilogueOp (passthrough)
-    cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>, // Swizzle
-    3                                                             // Pipeline stages
-    >;
-
-// GEMV-optimized tile: 32×128×64 — for small M (decode, M=1-4)
-// With 128×128 at M=1: only 1 of 128 M-rows is used (99.2% waste).
-// With 32×128 at M=1: only 1 of 32 M-rows is used (96.9% waste in tiles,
-// but 4× more tiles → 4× more SMs utilized → much better occupancy).
-// For N=3584, K=3584: 128×128 gives ceil(3584/128)=28 tiles on N.
-// 32×128 gives 28 tiles on N × 4 = effectively 4× the grid parallelism.
-using CutlassInt8GemmSmallM = cutlass::gemm::device::Gemm<
-    int8_t,                                // ElementA
-    cutlass::layout::RowMajor,             // LayoutA
-    int8_t,                                // ElementB
-    cutlass::layout::ColumnMajor,          // LayoutB
-    int32_t,                               // ElementOutput
-    cutlass::layout::RowMajor,             // LayoutC
-    int32_t,                               // ElementAccumulator
-    cutlass::arch::OpClassTensorOp,        // OpClass (Tensor Cores)
-    cutlass::arch::Sm80,                   // ArchTag (Ampere SM 8.0+)
-    cutlass::gemm::GemmShape<32, 128, 64>, // ThreadblockShape (4× smaller M tile)
-    cutlass::gemm::GemmShape<32, 64, 64>,  // WarpShape (fits 32×128 with 2 warps on N)
-    cutlass::gemm::GemmShape<16, 8, 32>,   // InstructionShape (same mma)
-    cutlass::epilogue::thread::LinearCombination<
-        int32_t, 1, int32_t, int32_t>,                            // EpilogueOp
-    cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>, // Swizzle
-    3                                                             // Pipeline stages
-    >;
-
-// Threshold for switching between large and small M tiles.
-// At M <= this value, we use the GEMV-optimized 32×128 tile.
-static constexpr int GEMV_M_THRESHOLD = 4;
 
 // =========================================================================
 // CUDA Error Checking Macros
@@ -147,7 +79,6 @@ static constexpr int GEMV_M_THRESHOLD = 4;
 namespace
 {
     static constexpr int BLOCKWISE_BLOCK_SIZE = 32;                        // Elements per quantization block
-    static constexpr int BLOCKWISE_DP4A_GROUPS = BLOCKWISE_BLOCK_SIZE / 4; // dp4a groups per block
 
     /**
      * @brief Quantize FP32 activations to INT8 with per-block scales
@@ -213,203 +144,8 @@ namespace
         }
     }
 
-    /**
-     * @brief Blockwise INT8 GEMM with dp4a and FP32 accumulation
-     *
-     * Custom GEMM kernel that applies per-block activation scales during
-     * accumulation, avoiding the precision loss of full-K INT32 accumulation.
-     *
-     * For each output element C[m][n]:
-     *   C[m][n] = alpha * sum_b(dp4a_block(A[m], B[n], block_b) * scale_A[m][b]) * scale_B[n]
-     *           + beta * C_existing[m][n] + bias[n]
-     *
-     * A block at b is 32 INT8 elements = 8 dp4a groups of 4.
-     * Uses shared memory for A (broadcast to all threads in block).
-     *
-     * Grid: (ceil(N/N_TILE), M) where N_TILE = blockDim.x
-     * Block: (N_TILE, 1, 1) - each thread computes one N output
-     */
-    __global__ void blockwise_gemm_dp4a_kernel(
-        const int8_t *__restrict__ A_int8,            // [M × K] row-major
-        const int8_t *__restrict__ B_int8,            // [K × N] col-major (stored as [N][K])
-        float *__restrict__ C_fp32,                   // [M × N] row-major output
-        const float *__restrict__ scales_A_blockwise, // [M × num_blocks]
-        const float *__restrict__ scales_B,           // [N]
-        int M, int N, int K,
-        float alpha, float beta,
-        const float *__restrict__ C_existing, // For beta != 0
-        const float *__restrict__ bias)       // [N] optional
-    {
-        const int m = blockIdx.y;
-        const int n = blockIdx.x * blockDim.x + threadIdx.x;
-
-        if (m >= M)
-            return;
-
-        const int num_blocks = K / BLOCKWISE_BLOCK_SIZE;
-
-        // Shared memory for current A block (32 bytes, broadcast to all threads)
-        __shared__ int8_t smem_A[BLOCKWISE_BLOCK_SIZE];
-
-        float acc = 0.0f;
-        float comp = 0.0f; // Kahan compensation for FP32 accumulation
-
-        for (int b = 0; b < num_blocks; b++)
-        {
-            const int k_start = b * BLOCKWISE_BLOCK_SIZE;
-
-            // Load A[m, k_start:k_start+32] into shared memory
-            if (threadIdx.x < BLOCKWISE_BLOCK_SIZE)
-            {
-                smem_A[threadIdx.x] = A_int8[m * K + k_start + threadIdx.x];
-            }
-            __syncthreads();
-
-            // Each thread computes dp4a dot product for its N column
-            int32_t partial = 0;
-            if (n < N)
-            {
-                // dp4a groups per block (BLOCKWISE_BLOCK_SIZE/4 groups of 4 elements)
-                for (int g = 0; g < BLOCKWISE_DP4A_GROUPS; g++)
-                {
-                    int32_t a_pack = *reinterpret_cast<const int32_t *>(&smem_A[g * 4]);
-                    int32_t b_pack = *reinterpret_cast<const int32_t *>(&B_int8[n * K + k_start + g * 4]);
-                    partial = __dp4a(a_pack, b_pack, partial);
-                }
-
-                // Apply per-block activation scale with Kahan compensated summation
-                float term = static_cast<float>(partial) * scales_A_blockwise[m * num_blocks + b] - comp;
-                float new_acc = acc + term;
-                comp = (new_acc - acc) - term;
-                acc = new_acc;
-            }
-
-            __syncthreads();
-        }
-
-        // Write output with weight scale, alpha/beta, and bias
-        if (n < N)
-        {
-            float result = alpha * acc * scales_B[n];
-
-            if (beta != 0.0f && C_existing != nullptr)
-            {
-                result += beta * C_existing[m * N + n];
-            }
-
-            if (bias != nullptr)
-            {
-                result += bias[n];
-            }
-
-            C_fp32[m * N + n] = result;
-        }
-    }
-
-    /**
-     * @brief Quantize FP32 activations to INT8 (symmetric per-row quantization)
-     *
-     * Each block processes one row:
-     * 1. Find max_abs across row (parallel reduction)
-     * 2. Compute scale = max_abs / 127
-     * 3. Quantize: A_int8[j] = round(A_fp32[j] / scale)
-     *
-     * Grid: (M, 1, 1) - one block per row
-     * Block: (min(K, 256), 1, 1)
-     */
-    __global__ void quantize_activations_kernel(
-        const float *A_fp32, // [M×K]
-        int8_t *A_int8,      // [M×K] output
-        float *scales_A,     // [M] output
-        int M, int K)
-    {
-        int row = blockIdx.x;
-        if (row >= M)
-            return;
-
-        const float *row_fp32 = A_fp32 + row * K;
-        int8_t *row_int8 = A_int8 + row * K;
-
-        // Phase 1: Find max_abs (parallel reduction in shared memory)
-        __shared__ float shared_max[256];
-
-        float local_max = 0.0f;
-        for (int j = threadIdx.x; j < K; j += blockDim.x)
-        {
-            local_max = fmaxf(local_max, fabsf(row_fp32[j]));
-        }
-        shared_max[threadIdx.x] = local_max;
-        __syncthreads();
-
-        // Reduce to thread 0
-        for (int stride = blockDim.x / 2; stride > 0; stride >>= 1)
-        {
-            if (threadIdx.x < stride)
-            {
-                shared_max[threadIdx.x] = fmaxf(shared_max[threadIdx.x],
-                                                shared_max[threadIdx.x + stride]);
-            }
-            __syncthreads();
-        }
-
-        float max_abs = shared_max[0];
-        float scale = (max_abs > 0.0f) ? (max_abs / 127.0f) : 1.0f;
-
-        if (threadIdx.x == 0)
-        {
-            scales_A[row] = scale;
-        }
-        __syncthreads();
-
-        // Phase 2: Quantize row
-        float inv_scale = 1.0f / scale;
-        for (int j = threadIdx.x; j < K; j += blockDim.x)
-        {
-            float val = row_fp32[j] * inv_scale;
-            int8_t quantized = (int8_t)rintf(fminf(127.0f, fmaxf(-127.0f, val)));
-            row_int8[j] = quantized;
-        }
-    }
-
-    /**
-     * @brief Apply output scaling: C_fp32 = alpha * C_int32 * scales_A * scales_B + beta * C_existing + bias
-     *
-     * Grid: (ceil(N/16), ceil(M/16), 1)
-     * Block: (16, 16, 1)
-     */
-    __global__ void apply_scaling_kernel(
-        const int32_t *C_int32, // [M×N]
-        float *C_fp32,          // [M×N] output
-        const float *scales_A,  // [M] row scales
-        const float *scales_B,  // [N] column scales
-        int M, int N,
-        float alpha, float beta,
-        const float *C_existing, // For beta != 0
-        const float *bias)       // [N] optional bias, broadcasted across rows
-    {
-        int col = blockIdx.x * blockDim.x + threadIdx.x;
-        int row = blockIdx.y * blockDim.y + threadIdx.y;
-
-        if (row < M && col < N)
-        {
-            int idx = row * N + col;
-            int32_t val_int32 = C_int32[idx];
-            float scale_combined = scales_A[row] * scales_B[col];
-            float result = alpha * (float)val_int32 * scale_combined;
-
-            if (beta != 0.0f && C_existing != nullptr)
-            {
-                result += beta * C_existing[idx];
-            }
-
-            if (bias != nullptr)
-            {
-                result += bias[col];
-            }
-
-            C_fp32[idx] = result;
-        }
-    }
+    // NOTE: blockwise_gemm_dp4a_kernel, quantize_activations_kernel, and
+    // apply_scaling_kernel have been removed — NativeVNNI-only mode.
 
 } // anonymous namespace
 
@@ -420,43 +156,8 @@ namespace
 extern "C"
 {
 
-    /**
-     * @brief Upload converted INT8 weights to device
-     */
-    bool cudaQuantGemm_uploadWeights(
-        const int8_t *h_weights_int8,
-        const float *h_scales_B,
-        int8_t **d_weights_int8,
-        float **d_scales_B,
-        int K, int N,
-        int cuda_device_id)
-    {
-        CUDA_CHECK(cudaSetDevice(cuda_device_id));
-
-        // Free existing if any
-        if (*d_weights_int8)
-        {
-            cudaFree(*d_weights_int8);
-            *d_weights_int8 = nullptr;
-        }
-        if (*d_scales_B)
-        {
-            cudaFree(*d_scales_B);
-            *d_scales_B = nullptr;
-        }
-
-        // Allocate and upload weights [K x N] ColumnMajor
-        size_t weights_bytes = static_cast<size_t>(K) * static_cast<size_t>(N) * sizeof(int8_t);
-        CUDA_CHECK(cudaMalloc(d_weights_int8, weights_bytes));
-        CUDA_CHECK(cudaMemcpy(*d_weights_int8, h_weights_int8, weights_bytes, cudaMemcpyHostToDevice));
-
-        // Allocate and upload scales [N]
-        size_t scales_bytes = static_cast<size_t>(N) * sizeof(float);
-        CUDA_CHECK(cudaMalloc(d_scales_B, scales_bytes));
-        CUDA_CHECK(cudaMemcpy(*d_scales_B, h_scales_B, scales_bytes, cudaMemcpyHostToDevice));
-
-        return true;
-    }
+    // NOTE: cudaQuantGemm_uploadWeights removed — NativeVNNI-only mode,
+    // no Int8Expanded weight upload needed.
 
     /**
      * @brief Ensure work buffers are allocated for given M
@@ -501,209 +202,10 @@ extern "C"
         return true;
     }
 
-    /**
-     * @brief Execute CUTLASS INT8 GEMM
-     */
-    /**
-     * @brief Execute CUTLASS INT8 GEMM with automatic tile selection
-     *
-     * For small M (decode, M<=4), uses GemmShape<32,128,64> for better SM
-     * utilization. For large M (prefill), uses GemmShape<128,128,64>.
-     *
-     * With 128×128 at M=1 and N=3584: ceil(3584/128)=28 tiles, all waste
-     * 127/128 of their M dimension. With 32×128: same 28 N-tiles but the
-     * M-tile granularity is 4× smaller, allowing CUTLASS to skip more
-     * empty tiles and reducing wasted Tensor Core cycles.
-     */
-    bool cudaQuantGemm_execute(
-        const int8_t *d_A_int8,
-        const int8_t *d_weights_int8,
-        int32_t *d_C_int32,
-        int M, int N, int K,
-        int cuda_device_id,
-        void *stream)
-    {
-        // Validate pointers
-        if (!d_A_int8 || !d_weights_int8 || !d_C_int32)
-        {
-            std::ostringstream oss;
-            oss << "[CUDAQuantGemm::execute] Null pointer: "
-                << "d_A_int8=" << (void *)d_A_int8
-                << " d_weights_int8=" << (void *)d_weights_int8
-                << " d_C_int32=" << (void *)d_C_int32;
-            throw std::runtime_error(oss.str());
-        }
-
-        // Always set device — stream carries device context but kernel
-        // launch uses the runtime's current-device for PTX code lookup.
-        CUDA_CHECK_THROW(cudaSetDevice(cuda_device_id));
-
-        cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
-
-        if (M <= GEMV_M_THRESHOLD)
-        {
-            // Small-M path: use 32×128×64 tile for better occupancy
-            CutlassInt8GemmSmallM gemm_op;
-
-            typename CutlassInt8GemmSmallM::Arguments args(
-                {M, N, K},
-                {d_A_int8, K},
-                {d_weights_int8, K},
-                {d_C_int32, N},
-                {d_C_int32, N},
-                {1, 0});
-
-            cutlass::Status can_status = CutlassInt8GemmSmallM::can_implement(args);
-            if (can_status != cutlass::Status::kSuccess)
-            {
-                // Fall through to large tile if small tile can't handle it
-                goto large_tile;
-            }
-
-            cutlass::Status status = gemm_op(args, nullptr, cuda_stream);
-            if (status != cutlass::Status::kSuccess)
-            {
-                std::ostringstream oss;
-                oss << "[CUDAQuantGemm] CUTLASS GEMM (small-M) failed with status " << static_cast<int>(status)
-                    << " (M=" << M << ", N=" << N << ", K=" << K << ")";
-                throw std::runtime_error(oss.str());
-            }
-            return true;
-        }
-
-    large_tile:
-    {
-        // Large-M path: standard 128×128×64 tile
-        CutlassInt8Gemm gemm_op;
-
-        typename CutlassInt8Gemm::Arguments args(
-            {M, N, K},
-            {d_A_int8, K},
-            {d_weights_int8, K},
-            {d_C_int32, N},
-            {d_C_int32, N},
-            {1, 0});
-
-        cutlass::Status can_status = CutlassInt8Gemm::can_implement(args);
-        if (can_status != cutlass::Status::kSuccess)
-        {
-            std::ostringstream oss;
-            oss << "[CUDAQuantGemm] CUTLASS can_implement failed with status " << static_cast<int>(can_status)
-                << " (M=" << M << ", N=" << N << ", K=" << K << ")";
-            throw std::runtime_error(oss.str());
-        }
-
-        cutlass::Status status = gemm_op(args, nullptr, cuda_stream);
-        if (status != cutlass::Status::kSuccess)
-        {
-            std::ostringstream oss;
-            oss << "[CUDAQuantGemm] CUTLASS GEMM failed with status " << static_cast<int>(status)
-                << " (M=" << M << ", N=" << N << ", K=" << K << ")";
-            throw std::runtime_error(oss.str());
-        }
-    }
-
-        return true;
-    }
-
-    /**
-     * @brief Apply output scaling with optional bias
-     */
-    bool cudaQuantGemm_applyScaling(
-        const int32_t *d_C_int32,
-        float *d_C_fp32,
-        const float *d_scales_A,
-        const float *d_scales_B,
-        int M, int N,
-        float alpha, float beta,
-        const float *d_C_existing,
-        const float *d_bias,
-        int cuda_device_id,
-        void *stream)
-    {
-        // Validate pointers before launching kernel
-        if (!d_C_int32 || !d_C_fp32 || !d_scales_A || !d_scales_B)
-        {
-            std::ostringstream oss;
-            oss << "[CUDAQuantGemm::applyScaling] Null pointer: "
-                << "d_C_int32=" << (void *)d_C_int32
-                << " d_C_fp32=" << (void *)d_C_fp32
-                << " d_scales_A=" << (void *)d_scales_A
-                << " d_scales_B=" << (void *)d_scales_B;
-            throw std::runtime_error(oss.str());
-        }
-
-        // Always set device — stream carries device context but kernel
-        // launch uses the runtime's current-device for PTX code lookup.
-        CUDA_CHECK_THROW(cudaSetDevice(cuda_device_id));
-
-        dim3 block(16, 16);
-        dim3 grid((N + 15) / 16, (M + 15) / 16);
-
-        cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
-        apply_scaling_kernel<<<grid, block, 0, cuda_stream>>>(
-            d_C_int32, d_C_fp32, d_scales_A, d_scales_B,
-            M, N, alpha, beta, d_C_existing, d_bias);
-
-        cudaError_t err = cudaGetLastError();
-        if (err != cudaSuccess)
-        {
-            std::ostringstream oss;
-            oss << "[CUDAQuantGemm] apply_scaling kernel launch failed: "
-                << cudaGetErrorString(err)
-                << " (M=" << M << ", N=" << N << ")";
-            throw std::runtime_error(oss.str());
-        }
-
-        // Note: No sync - CUDA stream ordering handles dependencies
-        return true;
-    }
-
-    /**
-     * @brief Quantize FP32 activations to INT8
-     */
-    bool cudaQuantGemm_quantizeActivations(
-        const float *d_A_fp32,
-        int8_t *d_A_int8,
-        float *d_scales_A,
-        int M, int K,
-        int cuda_device_id,
-        void *stream)
-    {
-        // Validate pointers
-        if (!d_A_fp32 || !d_A_int8 || !d_scales_A)
-        {
-            std::ostringstream oss;
-            oss << "[CUDAQuantGemm::quantizeActivations] Null pointer: "
-                << "d_A_fp32=" << (void *)d_A_fp32
-                << " d_A_int8=" << (void *)d_A_int8
-                << " d_scales_A=" << (void *)d_scales_A;
-            throw std::runtime_error(oss.str());
-        }
-
-        // Always set device — stream carries device context but kernel
-        // launch uses the runtime's current-device for PTX code lookup.
-        CUDA_CHECK_THROW(cudaSetDevice(cuda_device_id));
-
-        dim3 grid(M);
-        dim3 block(std::min(K, 256));
-
-        cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
-        quantize_activations_kernel<<<grid, block, 0, cuda_stream>>>(d_A_fp32, d_A_int8, d_scales_A, M, K);
-
-        cudaError_t err = cudaGetLastError();
-        if (err != cudaSuccess)
-        {
-            std::ostringstream oss;
-            oss << "[CUDAQuantGemm] quantize kernel launch failed: "
-                << cudaGetErrorString(err)
-                << " (M=" << M << ", K=" << K << ")";
-            throw std::runtime_error(oss.str());
-        }
-
-        // Note: No sync - CUDA stream ordering handles dependencies
-        return true;
-    }
+    // NOTE: cudaQuantGemm_execute, cudaQuantGemm_applyScaling,
+    // cudaQuantGemm_quantizeActivations (row-wise), and cudaQuantGemm_blockwiseGemm
+    // have been removed — NativeVNNI is now the sole CUDA GEMM execution path.
+    // Only cudaQuantGemm_quantizeActivationsBlockwise is retained (used by NativeVNNI).
 
     /**
      * @brief Quantize FP32 activations to INT8 with per-block-of-32 scales
@@ -757,62 +259,7 @@ extern "C"
         return true;
     }
 
-    /**
-     * @brief Execute blockwise INT8 GEMM with dp4a and FP32 accumulation
-     *
-     * Custom GEMM that applies per-block activation scales inline during
-     * K-accumulation, producing final FP32 output (no separate epilogue needed).
-     */
-    bool cudaQuantGemm_blockwiseGemm(
-        const int8_t *d_A_int8,
-        const int8_t *d_weights_int8,
-        float *d_C_fp32,
-        const float *d_scales_A_blockwise,
-        const float *d_scales_B,
-        int M, int N, int K,
-        float alpha, float beta,
-        const float *d_C_existing,
-        const float *d_bias,
-        int cuda_device_id,
-        void *stream)
-    {
-        if (!d_A_int8 || !d_weights_int8 || !d_C_fp32 || !d_scales_A_blockwise || !d_scales_B)
-        {
-            std::ostringstream oss;
-            oss << "[CUDAQuantGemm::blockwiseGemm] Null pointer: "
-                << "d_A_int8=" << (void *)d_A_int8
-                << " d_weights_int8=" << (void *)d_weights_int8
-                << " d_C_fp32=" << (void *)d_C_fp32
-                << " d_scales_A_blockwise=" << (void *)d_scales_A_blockwise
-                << " d_scales_B=" << (void *)d_scales_B;
-            throw std::runtime_error(oss.str());
-        }
-
-        CUDA_CHECK_THROW(cudaSetDevice(cuda_device_id));
-
-        const int N_TILE = 128;
-        dim3 block(N_TILE);
-        dim3 grid((N + N_TILE - 1) / N_TILE, M);
-
-        cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
-        blockwise_gemm_dp4a_kernel<<<grid, block, 0, cuda_stream>>>(
-            d_A_int8, d_weights_int8, d_C_fp32,
-            d_scales_A_blockwise, d_scales_B,
-            M, N, K,
-            alpha, beta, d_C_existing, d_bias);
-
-        cudaError_t err = cudaGetLastError();
-        if (err != cudaSuccess)
-        {
-            std::ostringstream oss;
-            oss << "[CUDAQuantGemm] blockwise GEMM dp4a kernel launch failed: "
-                << cudaGetErrorString(err)
-                << " (M=" << M << ", N=" << N << ", K=" << K << ")";
-            throw std::runtime_error(oss.str());
-        }
-
-        return true;
-    }
+    // NOTE: cudaQuantGemm_blockwiseGemm removed — NativeVNNI-only mode.
 
     /**
      * @brief Free device memory
@@ -983,75 +430,7 @@ extern "C"
         return true;
     }
 
-    // ── Weight repacking: row-major → K-blocked tensor-core layout ──────────
-    // Moved from CUDATensorCoreBlockwiseGemm.cu (dead scaffold removed)
-
-    namespace
-    {
-        constexpr int kTCBlockK = 32;
-
-        __global__ void repack_weights_tc_blocked_kernel(
-            const int8_t *__restrict__ weights_col_major,
-            int8_t *__restrict__ weights_tc_blocked,
-            int K, int N)
-        {
-            const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-            const int total = K * N;
-            if (idx >= total)
-                return;
-
-            const int k_block = idx / (N * kTCBlockK);
-            const int rem = idx % (N * kTCBlockK);
-            const int n = rem / kTCBlockK;
-            const int k_in_block = rem % kTCBlockK;
-            const int k = k_block * kTCBlockK + k_in_block;
-
-            weights_tc_blocked[idx] = weights_col_major[n * K + k];
-        }
-    } // namespace
-
-    bool cudaQuantGemm_prepareTensorCoreBlockedWeights(
-        const int8_t *d_weights_int8,
-        int8_t **d_weights_int8_tc_blocked,
-        int K, int N,
-        int cuda_device_id,
-        void *stream)
-    {
-        if (!d_weights_int8 || !d_weights_int8_tc_blocked || K <= 0 || N <= 0 || (K % kTCBlockK) != 0)
-        {
-            return false;
-        }
-
-        try
-        {
-            CUDA_CHECK(cudaSetDevice(cuda_device_id));
-            cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
-
-            if (*d_weights_int8_tc_blocked == nullptr)
-            {
-                CUDA_CHECK(cudaMalloc(d_weights_int8_tc_blocked, static_cast<size_t>(K) * N * sizeof(int8_t)));
-            }
-
-            const int total = K * N;
-            const int threads = 256;
-            const int blocks = (total + threads - 1) / threads;
-            repack_weights_tc_blocked_kernel<<<blocks, threads, 0, cuda_stream>>>(
-                d_weights_int8,
-                *d_weights_int8_tc_blocked,
-                K,
-                N);
-            CUDA_CHECK(cudaGetLastError());
-            return true;
-        }
-        catch (...)
-        {
-            if (d_weights_int8_tc_blocked && *d_weights_int8_tc_blocked)
-            {
-                cudaFree(*d_weights_int8_tc_blocked);
-                *d_weights_int8_tc_blocked = nullptr;
-            }
-            return false;
-        }
-    }
+    // NOTE: repack_weights_tc_blocked_kernel and cudaQuantGemm_prepareTensorCoreBlockedWeights
+    // removed — TC-blocked weight format is no longer used (NativeVNNI-only mode).
 
 } // extern "C"

@@ -41,62 +41,6 @@ namespace llaminar2::cuda
             return (tensor->cols() % 32) == 0;
         }
 
-        bool packInt8ExpandedCUDA(const TensorBase *tensor, CUDAPackedWeights &out)
-        {
-            const int N = static_cast<int>(tensor->rows());
-            const int K = static_cast<int>(tensor->cols());
-
-            out.int8_data.assign(static_cast<size_t>(K) * N, int8_t{0});
-            out.scales.assign(N, 1.0f);
-            out.K = K;
-            out.N = N;
-
-            if (const auto *quant_accessor = dynamic_cast<const IINT8Unpackable *>(tensor);
-                quant_accessor && (K % 32) == 0)
-            {
-#pragma omp parallel for schedule(static)
-                for (int n = 0; n < N; ++n)
-                {
-                    out.scales[n] = quant_accessor->requantizeRowToInt8(
-                        static_cast<size_t>(n),
-                        static_cast<size_t>(K),
-                        out.int8_data.data() + static_cast<size_t>(n) * K);
-                }
-
-                return true;
-            }
-
-            const float *h_weights_fp32 = tensor->data();
-            if (!h_weights_fp32)
-            {
-                LOG_ERROR("[packInt8ExpandedCUDA] Failed to get FP32 data from tensor");
-                return false;
-            }
-
-#pragma omp parallel for schedule(static)
-            for (int n = 0; n < N; ++n)
-            {
-                float max_abs = 0.0f;
-                for (int k = 0; k < K; ++k)
-                {
-                    max_abs = std::max(max_abs, std::abs(h_weights_fp32[n * K + k]));
-                }
-
-                const float scale = (max_abs > 0.0f) ? (max_abs / 127.0f) : 1.0f;
-                const float inv_scale = 1.0f / scale;
-                out.scales[n] = scale;
-
-                for (int k = 0; k < K; ++k)
-                {
-                    const float val = h_weights_fp32[n * K + k];
-                    out.int8_data[n * K + k] = static_cast<int8_t>(
-                        std::round(std::clamp(val * inv_scale, -127.0f, 127.0f)));
-                }
-            }
-
-            return true;
-        }
-
         bool packNativeVNNICUDA(const TensorBase *tensor, CUDAPackedWeights &out)
         {
             const auto *quant_accessor = dynamic_cast<const IINT8Unpackable *>(tensor);
@@ -177,12 +121,6 @@ namespace llaminar2::cuda
         for (auto &[device_id, upload] : device_uploads)
         {
             (void)device_id;
-            if (upload.d_int8_data)
-                cudaQuantGemm_freeDevice(upload.d_int8_data);
-            if (upload.d_scales)
-                cudaQuantGemm_freeDevice(upload.d_scales);
-            if (upload.d_int8_data_tc_blocked)
-                cudaQuantGemm_freeDevice(upload.d_int8_data_tc_blocked);
             if (upload.d_native_vnni)
                 cudaQuantGemm_freeDevice(upload.d_native_vnni);
             if (upload.d_native_scales)
@@ -195,12 +133,6 @@ namespace llaminar2::cuda
 
         if (device_uploads.empty())
         {
-            if (d_int8_data)
-                cudaQuantGemm_freeDevice(d_int8_data);
-            if (d_scales)
-                cudaQuantGemm_freeDevice(d_scales);
-            if (d_int8_data_tc_blocked)
-                cudaQuantGemm_freeDevice(d_int8_data_tc_blocked);
             if (d_native_vnni)
                 cudaQuantGemm_freeDevice(d_native_vnni);
             if (d_native_scales)
@@ -212,31 +144,15 @@ namespace llaminar2::cuda
         }
     }
 
-    CUDAPackedWeightFamily classifyCUDAPackedWeightFamily(TensorType type)
+    CUDAPackedWeightFamily classifyCUDAPackedWeightFamily(TensorType /*type*/)
     {
-        if (isNativeVnniFormat(type))
-        {
-            return CUDAPackedWeightFamily::NativeVNNI;
-        }
-
-        // Q8_0 has per-block-of-32 FP16 scales (codebook 18) that the CUDA
-        // native-VNNI GEMV and prefill kernels already support.  Routing Q8_0
-        // through NativeVNNI preserves these per-block scales, avoiding the
-        // precision loss of Int8Expanded's single per-row scale.
-        if (type == TensorType::Q8_0)
-        {
-            return CUDAPackedWeightFamily::NativeVNNI;
-        }
-
-        return CUDAPackedWeightFamily::Int8Expanded;
+        return CUDAPackedWeightFamily::NativeVNNI;
     }
 
     const char *cudaPackedWeightFamilyName(CUDAPackedWeightFamily family)
     {
         switch (family)
         {
-        case CUDAPackedWeightFamily::Int8Expanded:
-            return "Int8Expanded";
         case CUDAPackedWeightFamily::NativeVNNI:
             return "NativeVNNI";
         default:
@@ -252,8 +168,8 @@ namespace llaminar2::cuda
             return false;
         }
 
-        out.preferred_family = classifyCUDAPackedWeightFamily(tensor->native_type());
-        out.active_family = CUDAPackedWeightFamily::Int8Expanded;
+        out.preferred_family = CUDAPackedWeightFamily::NativeVNNI;
+        out.active_family = CUDAPackedWeightFamily::NativeVNNI;
         out.native_vnni.clear();
         out.native_scales.clear();
         out.native_mins.clear();
@@ -266,43 +182,26 @@ namespace llaminar2::cuda
         out.K = K;
         out.N = N;
 
-        if (out.preferred_family == CUDAPackedWeightFamily::NativeVNNI && canPackNativeVNNICUDA(tensor))
+        if (!canPackNativeVNNICUDA(tensor))
         {
-            if (packNativeVNNICUDA(tensor, out))
-            {
-                out.active_family = CUDAPackedWeightFamily::NativeVNNI;
-            }
-            else
-            {
-                LOG_WARN("[packWeightsToCUDA] NativeVNNI packing unavailable for "
-                         << tensorTypeName(tensor->native_type()) << " " << N << "x" << K
-                         << "; falling back to Int8Expanded");
-            }
-        }
-        else if (out.preferred_family == CUDAPackedWeightFamily::NativeVNNI)
-        {
-            LOG_DEBUG("[packWeightsToCUDA] NativeVNNI not eligible for "
+            LOG_ERROR("[packWeightsToCUDA] NativeVNNI packing not available for "
                       << tensorTypeName(tensor->native_type()) << " " << N << "x" << K
-                      << "; using Int8Expanded as active family");
+                      << " (no Int8Expanded fallback — TC/CUTLASS paths have been removed)");
+            return false;
         }
 
-        if (!packInt8ExpandedCUDA(tensor, out))
+        if (!packNativeVNNICUDA(tensor, out))
         {
-            LOG_ERROR("[packWeightsToCUDA] Int8Expanded packing failed for "
+            LOG_ERROR("[packWeightsToCUDA] NativeVNNI packing failed for "
                       << tensorTypeName(tensor->native_type()) << " " << N << "x" << K);
             return false;
         }
 
         LOG_DEBUG("[packWeightsToCUDA] Packed " << N << "x" << K
-                                                << " weights with active_family=" << cudaPackedWeightFamilyName(out.active_family)
-                                                << " preferred_family=" << cudaPackedWeightFamilyName(out.preferred_family)
+                                                << " weights with active_family=NativeVNNI"
                                                 << " source_type=" << tensorTypeName(tensor->native_type())
                                                 << " native_vnni_bytes=" << out.native_vnni.size()
-                                                << " int8_fallback_bytes=" << out.int8_data.size()
                                                 << ")");
-        LOG_DEBUG("[packWeightsToCUDA] First 4 host scales: "
-                  << out.scales[0] << "," << (N > 1 ? out.scales[1] : 0.f) << ","
-                  << (N > 2 ? out.scales[2] : 0.f) << "," << (N > 3 ? out.scales[3] : 0.f));
         return true;
     }
 } // namespace llaminar2::cuda

@@ -17,7 +17,6 @@ namespace llaminar2
     {
         enum class CUDAPackedWeightFamily
         {
-            Int8Expanded,
             NativeVNNI,
         };
 
@@ -25,22 +24,14 @@ namespace llaminar2
         {
             struct DeviceUpload
             {
-                int8_t *d_int8_data = nullptr;
-                float *d_scales = nullptr;
-                int8_t *d_int8_data_tc_blocked = nullptr;
                 uint8_t *d_native_vnni = nullptr;
                 uint16_t *d_native_scales = nullptr;
                 uint16_t *d_native_mins = nullptr;
                 uint32_t *d_native_emins = nullptr;
             };
 
-            CUDAPackedWeightFamily preferred_family = CUDAPackedWeightFamily::Int8Expanded;
-            CUDAPackedWeightFamily active_family = CUDAPackedWeightFamily::Int8Expanded;
-
-            // Int8Expanded fallback buffers remain populated even when NativeVNNI
-            // is the active execution family.
-            std::vector<int8_t> int8_data;
-            std::vector<float> scales;
+            CUDAPackedWeightFamily preferred_family = CUDAPackedWeightFamily::NativeVNNI;
+            CUDAPackedWeightFamily active_family = CUDAPackedWeightFamily::NativeVNNI;
 
             std::vector<uint8_t> native_vnni;
             std::vector<uint16_t> native_scales;
@@ -55,9 +46,6 @@ namespace llaminar2
             mutable std::mutex upload_mutex;
             std::unordered_map<int, DeviceUpload> device_uploads;
 
-            int8_t *d_int8_data = nullptr;
-            float *d_scales = nullptr;
-            int8_t *d_int8_data_tc_blocked = nullptr;
             uint8_t *d_native_vnni = nullptr;
             uint16_t *d_native_scales = nullptr;
             uint16_t *d_native_mins = nullptr;
@@ -86,8 +74,6 @@ namespace llaminar2
                     std::scoped_lock guard(upload_mutex, other.upload_mutex);
                     preferred_family = other.preferred_family;
                     active_family = other.active_family;
-                    int8_data = std::move(other.int8_data);
-                    scales = std::move(other.scales);
                     native_vnni = std::move(other.native_vnni);
                     native_scales = std::move(other.native_scales);
                     native_mins = std::move(other.native_mins);
@@ -97,9 +83,6 @@ namespace llaminar2
                     K = other.K;
                     N = other.N;
                     device_uploads = std::move(other.device_uploads);
-                    d_int8_data = other.d_int8_data;
-                    d_scales = other.d_scales;
-                    d_int8_data_tc_blocked = other.d_int8_data_tc_blocked;
                     d_native_vnni = other.d_native_vnni;
                     d_native_scales = other.d_native_scales;
                     d_native_mins = other.d_native_mins;
@@ -109,9 +92,6 @@ namespace llaminar2
                     source_tensor_ = other.source_tensor_;
                     rowmajor_ = other.rowmajor_;
 
-                    other.d_int8_data = nullptr;
-                    other.d_scales = nullptr;
-                    other.d_int8_data_tc_blocked = nullptr;
                     other.d_native_vnni = nullptr;
                     other.d_native_scales = nullptr;
                     other.d_native_mins = nullptr;

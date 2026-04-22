@@ -559,7 +559,7 @@ namespace
             const SweepConfig &cfg,
             const TuneCandidate &candidate)
         {
-            CUDAQuantisedGemmKernel::setNativeVNNIEnabled(true);
+            // NativeVNNI is always enabled (sole CUDA GEMM path)
 
             cudaNativeVNNIGemvSweep_setConfig(
                 static_cast<int>(candidate.family),
