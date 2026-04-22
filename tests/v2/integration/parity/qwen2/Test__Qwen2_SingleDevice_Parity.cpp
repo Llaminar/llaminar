@@ -16,6 +16,7 @@
 
 #include <gtest/gtest.h>
 #include <mpi.h>
+#include <unistd.h>
 #include "Qwen2ParityTestBase.h"
 #include "collective/BackendRouter.h"
 #include "backends/GPUDeviceContextPool.h"
@@ -434,5 +435,14 @@ int main(int argc, char **argv)
     GPUDeviceContextPool::instance().shutdown();
 
     MPI_Finalize();
-    return result;
+
+    // Skip C++ static destructors via _exit() to avoid CUDA/ROCm atexit
+    // handler races. Meyers singletons (GPUDeviceWorkerPool, CUDABackend,
+    // CUDAConcurrentPrefillPool, etc.) may call CUDA/HIP APIs after the
+    // runtime's own atexit handler has torn down the driver context,
+    // causing intermittent SIGSEGV that mpirun reports as non-zero exit.
+    // Same pattern as Main.cpp.
+    std::cout.flush();
+    std::cerr.flush();
+    _exit(result);
 }

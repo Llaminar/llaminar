@@ -22,6 +22,7 @@
 
 #include <gtest/gtest.h>
 #include <mpi.h>
+#include <unistd.h>
 #include "Qwen2ParityTestBase.h"
 #include "collective/BackendRouter.h"
 #include "backends/GPUDeviceContextPool.h"
@@ -335,5 +336,8 @@ int main(int argc, char **argv)
     // Finalize MPI
     MPI_Finalize();
 
-    return global_result;
+    // Skip static destructors — see Test__Qwen2_SingleDevice_Parity.cpp for rationale.
+    std::cout.flush();
+    std::cerr.flush();
+    _exit(global_result);
 }

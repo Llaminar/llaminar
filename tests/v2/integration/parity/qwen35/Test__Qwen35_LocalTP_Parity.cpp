@@ -27,6 +27,7 @@
 
 #include <gtest/gtest.h>
 #include <mpi.h>
+#include <unistd.h>
 #include "Qwen35ParityTestBase.h"
 #include "collective/BackendRouter.h"
 #include "backends/GPUDeviceContextPool.h"
@@ -236,5 +237,9 @@ int main(int argc, char **argv)
     GPUDeviceContextPool::instance().shutdown();
 
     MPI_Finalize();
-    return result;
+
+    // Skip static destructors — see Test__Qwen2_SingleDevice_Parity.cpp for rationale.
+    std::cout.flush();
+    std::cerr.flush();
+    _exit(result);
 }
