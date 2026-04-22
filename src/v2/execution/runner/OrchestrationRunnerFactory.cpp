@@ -166,7 +166,36 @@ namespace llaminar2
                 // auto runner = TreeToRunnerCompiler::compile(*config.topology_tree, compile_ctx);
                 // But we need model context first, so fall through to standard path
             }
-            
+
+            // ================================================================
+            // Global orchestration detection (Phase 4: GlobalOrchestrator path)
+            // ================================================================
+            // When multi-rank PP or global/node-local TP is requested, the
+            // GlobalOrchestratorRunner should be used instead of OrchestrationRunner.
+            //
+            // Currently this is a detection + log hook. Automatic topology
+            // construction from OrchestrationConfig requires the model layer
+            // count (only known after model loading), which creates a circular
+            // dependency with the current factory flow. Full activation is
+            // Phase 7 work (parity tests provide explicit topologies).
+            {
+                auto mpi_ctx = MPIContextFactory::global();
+                int world_size = mpi_ctx->world_size();
+                bool needs_global = (world_size > 1 && config.pp_degree > 1) ||
+                                    config.tp_scope == TPScope::GLOBAL ||
+                                    config.tp_scope == TPScope::NODE_LOCAL;
+
+                if (needs_global)
+                {
+                    LOG_INFO("Global orchestration conditions detected ("
+                             << "world_size=" << world_size
+                             << ", pp_degree=" << config.pp_degree
+                             << ", tp_scope=" << tpScopeToString(config.tp_scope) << ")");
+                    LOG_INFO("Note: Automatic GlobalOrchestratorRunner creation "
+                             "requires model context. Using standard path for now.");
+                }
+            }
+
             // Standard path: Create OrchestrationRunner with ExecutionPlanBuilder
             // Create a copy of plan builder for the runner
             // (each runner needs its own instance)

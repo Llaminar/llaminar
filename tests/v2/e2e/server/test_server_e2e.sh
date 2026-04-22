@@ -2,7 +2,7 @@
 # =============================================================================
 # E2E Server Integration Test — Multi-Turn Inference via REST API
 #
-# Tests the Llaminar HTTP server (--serve) with curl against the
+# Tests the Llaminar HTTP server (serve subcommand) with curl against the
 # /v1/chat/completions endpoint for multiple model × backend combinations.
 #
 # Default test suites:
@@ -10,7 +10,7 @@
 #   Suite 2: Qwen3.5 4B   Q8_0 on cpu
 #
 # Each backend test:
-#   1. Starts llaminar2 --serve on a unique port
+#   1. Starts llaminar2 serve on a unique port
 #   2. Waits for /health to respond
 #   3. Sends a single-turn greedy chat request, validates response
 #   4. Sends a multi-turn conversation, validates response
@@ -175,7 +175,7 @@ run_backend_tests() {
     local device_flag="-d ${backend}"
 
     # Start server
-    LLAMINAR_LOG_LEVEL="$LOG_LEVEL" "$BINARY" --serve --port "$port" \
+    LLAMINAR_LOG_LEVEL="$LOG_LEVEL" "$BINARY" serve --port "$port" \
         $device_flag -m "$model" >/tmp/server_e2e_trace.log 2>&1 &
     local server_pid=$!
 

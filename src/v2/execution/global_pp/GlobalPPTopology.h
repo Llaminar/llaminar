@@ -57,6 +57,48 @@ namespace llaminar2
     }
 
     // =========================================================================
+    // Rank Locality
+    // =========================================================================
+
+    /**
+     * @brief Physical location of an MPI rank
+     *
+     * Populated from MPI_Get_processor_name() during topology construction.
+     * Used by strategy selectors (backend routing, auto TP/PP placement)
+     * to make topology-aware decisions.
+     */
+    struct RankLocality
+    {
+        int rank = -1;              ///< MPI rank index
+        std::string hostname;       ///< Hostname from MPI_Get_processor_name()
+        int node_id = -1;           ///< Derived: ranks with same hostname get same node_id
+    };
+
+    /**
+     * @brief Locality of an inter-stage transfer
+     */
+    enum class TransferLocality
+    {
+        INTRA_NODE,  ///< Both sender and receiver are on the same physical node
+        INTER_NODE,  ///< Sender and receiver are on different physical nodes
+        UNKNOWN,     ///< Locality not yet determined (no rank localities provided)
+    };
+
+    /**
+     * @brief Convert TransferLocality to string
+     */
+    inline const char *transferLocalityName(TransferLocality loc)
+    {
+        switch (loc)
+        {
+        case TransferLocality::INTRA_NODE: return "INTRA_NODE";
+        case TransferLocality::INTER_NODE: return "INTER_NODE";
+        case TransferLocality::UNKNOWN:    return "UNKNOWN";
+        default:                           return "UNKNOWN";
+        }
+    }
+
+    // =========================================================================
     // GlobalPPStageSpec
     // =========================================================================
 
@@ -149,6 +191,7 @@ namespace llaminar2
         int sender_rank = -1;    ///< MPI rank that sends
         int receiver_rank = -1;  ///< MPI rank that receives (-1 if global TP → same set)
         int mpi_tag = 0;         ///< Unique MPI tag for this transfer
+        TransferLocality locality = TransferLocality::UNKNOWN; ///< Physical locality of this transfer
 
         /** @brief Check if this transfer is a no-op (both ranks are the same) */
         bool isNoop() const { return sender_rank == receiver_rank; }
@@ -178,6 +221,7 @@ namespace llaminar2
         std::vector<GlobalPPTransfer> transfers;     ///< Inter-stage transfers (derived)
         int total_layers = 0;                        ///< Total transformer layers in model
         int world_size = 0;                          ///< Number of MPI ranks
+        std::vector<RankLocality> rank_localities;    ///< Physical location of each rank (optional)
 
         // =====================================================================
         // Factory
@@ -197,6 +241,16 @@ namespace llaminar2
         static GlobalPPTopology build(std::vector<GlobalPPStageSpec> specs,
                                       int total_layers, int world_size);
 
+        /**
+         * @brief Build topology with rank locality information
+         *
+         * Same as build() but also populates TransferLocality on each transfer
+         * based on whether sender and receiver are co-located.
+         */
+        static GlobalPPTopology build(std::vector<GlobalPPStageSpec> specs,
+                                      int total_layers, int world_size,
+                                      std::vector<RankLocality> localities);
+
         // =====================================================================
         // Queries
         // =====================================================================
@@ -212,6 +266,15 @@ namespace llaminar2
 
         /** @brief Get transfer record between two adjacent stages (nullptr if not found) */
         const GlobalPPTransfer *transferBetween(int from_stage, int to_stage) const;
+
+        /** @brief Check if two ranks are on the same physical node */
+        bool areColocated(int rank_a, int rank_b) const;
+
+        /** @brief Get all ranks on a given node */
+        std::vector<int> ranksOnNode(int node_id) const;
+
+        /** @brief Number of distinct physical nodes */
+        int nodeCount() const;
 
         /** @brief Number of stages */
         int numStages() const { return static_cast<int>(stages.size()); }

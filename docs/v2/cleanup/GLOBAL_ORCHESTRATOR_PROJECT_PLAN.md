@@ -11,13 +11,13 @@
 Enable full cross-machine inference over an MPI cluster with multiple hosts.
 The design introduces a **GlobalOrchestrator** that coordinates cross-rank
 pipeline parallelism (PP) and tensor parallelism (TP), delegating per-rank
-execution to **RankOrchestrator** (renamed from `RankOrchestrator`).
+execution to **RankOrchestrator** (renamed from `MultiDeviceOrchestrator`).
 
 ### Three-Tier Orchestration Stack
 
 ```
 GlobalOrchestrator               ← NEW (cross-rank: MPI PP + Global TP)
-  └─ RankOrchestrator            ← RENAME of RankOrchestrator (per-rank: local devices)
+  └─ RankOrchestrator            ← RENAME of MultiDeviceOrchestrator (per-rank: local devices)
        └─ DeviceGraphOrchestrator  ← UNCHANGED (per-device: graph execution)
 ```
 
@@ -241,24 +241,74 @@ private:
 
 ---
 
-## Phase 4: Factory Integration
+## Phase 4: Factory Integration + Rank Locality
 
-**Goal**: Wire `GlobalOrchestrator` into the existing `InferenceRunnerFactory` so the CLI/server paths use it automatically.
+**Goal**: Wire `GlobalOrchestrator` into `OrchestrationRunnerFactory` so the CLI/server paths use it automatically, and add rank locality metadata so the framework can make topology-aware strategy decisions.
+
+### Rank Locality
+
+MPI ranks may be co-located on a single physical machine (NodeLocal) or distributed
+across machines (Global). The orchestrator code path is the same for both, but
+**strategy selectors** need this information to make good decisions:
+
+| Consumer | What it uses locality for |
+|----------|--------------------------|
+| `BackendRouter` | Prefer shared-memory/HOST for intra-node, NCCL-over-IB for inter-node |
+| Topology builder (`4.3`) | `--tp-scope auto` → TP within a node, PP across nodes |
+| `--explain-placement` | "ranks 0,1 on node alpha (NodeLocal TP), PP to node beta" |
+| Future 1F1B scheduler | Prioritize compute-communication overlap for inter-node transfers |
+
+**Data model** (added to `GlobalPPTopology`):
+
+```cpp
+struct RankLocality {
+    int rank;
+    std::string hostname;   // from MPI_Get_processor_name()
+    int node_id;            // derived: ranks with same hostname get same node_id
+};
+
+// In GlobalPPTopology:
+std::vector<RankLocality> rank_localities;
+bool areColocated(int rank_a, int rank_b) const;
+std::vector<int> ranksOnNode(int node_id) const;
+int nodeCount() const;
+```
+
+**Transfer locality** (added to `GlobalPPTransfer`):
+
+```cpp
+enum class TransferLocality { INTRA_NODE, INTER_NODE, UNKNOWN };
+TransferLocality locality = TransferLocality::UNKNOWN;
+```
+
+Populated during `GlobalPPTopology::build()` when rank localities are available.
 
 ### Tasks
 
-- [ ] **4.1** Extend `InferenceRunnerFactory` to detect multi-rank scenarios (`mpi_ctx->world_size() > 1`)
-- [ ] **4.2** Build `GlobalPPTopology` from `OrchestrationConfig` (pp_degree, tp_scope, domain definitions)
-- [ ] **4.3** Instantiate `GlobalOrchestrator` instead of `RankOrchestrator` when world_size > 1
-- [ ] **4.4** Ensure single-rank paths are unchanged (GlobalOrchestrator is not created)
-- [ ] **4.5** Wire into `OneshotCommand`, `BenchmarkMode`, `ChatCompletionHandler`, `InteractiveChatMode`
-- [ ] **4.6** Update `--dry-run` / `--explain-placement` to show GlobalOrchestrator topology
+- [ ] **4.1** Add `RankLocality` struct to `GlobalPPTopology.h` with `hostname`, `node_id`
+- [ ] **4.2** Add `areColocated()`, `ranksOnNode()`, `nodeCount()` queries to `GlobalPPTopology`
+- [ ] **4.3** Add `TransferLocality` enum to `GlobalPPTransfer`; populate in `build()` from rank localities
+- [ ] **4.4** Build `GlobalPPTopology` from `OrchestrationConfig` in `OrchestrationRunnerFactory`
+  - Parse `pp_degree`, `tp_scope`, domain definitions into `GlobalPPStageSpec` list
+  - Query `MPI_Get_processor_name()` per rank to populate `RankLocality`
+  - `--tp-scope auto` with localities: prefer TP within a node, PP across nodes
+- [ ] **4.5** Instantiate `GlobalOrchestrator` when `world_size > 1` or `pp_degree > 1`
+  - `GlobalOrchestrator` wraps a per-rank `DeviceGraphOrchestrator` (created via existing `InferenceRunnerFactory`)
+  - Wrap in `IOrchestrationRunner` adapter for `AppContext` compatibility
+- [ ] **4.6** Ensure single-rank paths are unchanged (`GlobalOrchestrator` not created)
+- [ ] **4.7** Update `--dry-run` / `--explain-placement` to show `GlobalOrchestrator` topology
+  - Display rank→node mapping, transfer localities, TP/PP structure
+  - Example: `GlobalOrchestrator: 4 ranks on 2 nodes, 2 PP stages × 2-way NodeLocal TP`
+- [ ] **4.8** Unit tests for rank locality (co-location queries, transfer locality derivation)
+- [ ] **4.9** Unit tests for topology builder (OrchestrationConfig → GlobalPPTopology)
 
 ### Acceptance Criteria
 
 - `mpirun -np 2 llaminar2 oneshot --pp 2 ...` works without explicit GlobalOrchestrator construction
 - Single-rank inference is unchanged (no regression)
-- `--dry-run` shows: `GlobalOrchestrator: 2 ranks, 2 PP stages, 1-way TP`
+- `--dry-run` shows topology with rank→node locality: `ranks 0,1 on node0 (NodeLocal TP), PP → ranks 2,3 on node1`
+- `GlobalPPTransfer::locality` correctly reflects INTRA_NODE vs INTER_NODE
+- `areColocated(0, 1)` returns true for same-machine ranks, false for cross-machine
 
 ---
 
@@ -300,6 +350,66 @@ private:
 - No silent failures — all MPI errors surface as exceptions with rank context
 - `--show-topology` renders correct table for any PP×TP configuration
 - Multi-rank parity test matches single-device reference within tolerance
+
+---
+
+## Phase 7: Parity Test Migration to GlobalOrchestrator
+
+**Goal**: Migrate existing NodeLocalTP parity tests to use `GlobalOrchestrator` instead of ad-hoc factory wiring, and add a new NodeLocalPP parity test. This ensures parity tests exercise the production code path end-to-end.
+
+### Background
+
+The current NodeLocalTP parity tests (`Test__Qwen3_NodeLocalTP_Parity`, `Test__Qwen35_NodeLocalTP_Parity`) work around the absence of `GlobalOrchestrator` by:
+1. Calling `InferenceRunnerFactory::createInferenceRunner()` directly with an `mpi_ctx`
+2. The factory detects `world_size > 1` and applies global TP weight sharding internally
+3. Each rank gets a `DeviceGraphOrchestrator` — there is no orchestrator coordinating across ranks
+4. A separate `GlobalTPContext::createForTest()` is created just for infrastructure tests
+
+This works for pure global TP (no PP, all ranks run all layers), but:
+- It bypasses the production `GlobalOrchestrator` → `RankOrchestrator` → `DeviceGraphOrchestrator` stack
+- It can't test PP at all (different ranks running different layers)
+- If the production path diverges from the test wiring, parity tests won't catch it
+
+### Tasks
+
+- [ ] **7.1** Add `GlobalOrchestrator`-aware pipeline setup path to `ConfigDrivenParityTest`
+  - New method `setupGlobalOrchestratorPipeline()` that builds `GlobalPPTopology` → `GlobalOrchestrator`
+  - Route `Parallelism::NodeLocalTP` and `Parallelism::GlobalTP` configs through this path
+  - `GlobalOrchestrator` wraps the per-rank `DeviceGraphOrchestrator` (created via existing factory)
+  - The `GlobalTPContext` is owned by `GlobalOrchestrator`, not created separately
+- [ ] **7.2** Migrate `Test__Qwen3_NodeLocalTP_Parity` to use GlobalOrchestrator path
+  - `setupPipeline()` → `setupGlobalOrchestratorPipeline()` → `GlobalOrchestrator` as runner
+  - Verify same parity results (cosine similarity, KL divergence) as before migration
+  - Infrastructure tests (allreduce, broadcast, barrier) use `GlobalOrchestrator::globalTPContext()`
+- [ ] **7.3** Migrate `Test__Qwen35_NodeLocalTP_Parity` (same changes, all 3 model configs)
+- [ ] **7.4** Add `Parallelism::NodeLocalPP` enum value and test config support
+  - 2-rank PP on a single machine (rank 0 = first half of layers on socket 0, rank 1 = second half on socket 1)
+  - Embedding on rank 0, LM head on rank 1
+  - MPI send/recv of activations between ranks (exercises `GlobalOrchestrator::executeTransfer()`)
+- [ ] **7.5** Create `Test__Qwen3_NodeLocalPP_Parity` test file
+  - Config: `{ Parallelism::NodeLocalPP, Collective::MPI, mpi_ranks=2, model="Qwen3-0.6B-Q8_0.gguf" }`
+  - Tests: `PrefillParity`, `DecodeParity` — compare against single-device PyTorch reference
+  - Verify greedy token predictions match single-device (PP should be numerically identical for same-precision weights)
+- [ ] **7.6** Create `Test__Qwen35_NodeLocalPP_Parity` (0.8B model, 2-rank PP)
+- [ ] **7.7** Remove old `setupGlobalTPPipeline()` and `GlobalTPContext::createForTest()` usage from migrated tests
+- [ ] **7.8** Full parity test suite pass (all existing + new tests)
+
+### NodeLocalPP Topology Construction
+
+For a model with N layers on 2 ranks:
+```
+GlobalPPStageSpec stage_0: layers [0, N/2-1], has_embedding=true,  owning_rank=0
+GlobalPPStageSpec stage_1: layers [N/2, N-1], has_lm_head=true,    owning_rank=1
+Transfer: rank 0 → rank 1 (MPI send/recv of hidden state)
+```
+
+### Acceptance Criteria
+
+- All migrated NodeLocalTP parity tests produce identical results to before migration
+- New NodeLocalPP parity tests pass with greedy token prediction match
+- No test creates `GlobalTPContext::createForTest()` for production-path TP — all TP contexts come from `GlobalOrchestrator`
+- `grep -r 'createForTest' tests/v2/integration/parity/` returns zero hits (after migration)
+- 2-rank PP parity shows cosine similarity > 0.999 vs single-device at every layer
 
 ---
 
@@ -346,6 +456,10 @@ These items are tracked but deferred beyond this project:
 |------|-------------|
 | `V2_Parity_GlobalPP_Qwen2_CPU` | 2-rank PP parity vs single-device PyTorch |
 | `V2_Parity_GlobalTP_Qwen2_CUDA` | 2-rank TP parity vs single-device PyTorch |
+| `V2_Parity_NodeLocalTP_Qwen3` | Migrated: 2-rank TP via GlobalOrchestrator (was direct factory) |
+| `V2_Parity_NodeLocalTP_Qwen35` | Migrated: 2-rank TP via GlobalOrchestrator (0.8B, 4B, 27B) |
+| `V2_Parity_NodeLocalPP_Qwen3` | **NEW**: 2-rank PP (half layers per socket) via GlobalOrchestrator |
+| `V2_Parity_NodeLocalPP_Qwen35` | **NEW**: 2-rank PP via GlobalOrchestrator (0.8B) |
 
 ---
 
@@ -370,7 +484,13 @@ Phase 2 (PP)   Phase 3 (TP+PP)
            │
            ▼
     Phase 6 (Hardening)
+           │
+           ▼
+    Phase 7 (Parity Migration)
 ```
 
 Phase 2 and Phase 3 can proceed in parallel after Phase 1.
 Phase 3 depends on Phase 2 only for the integration test (not implementation).
+Phase 7 depends on Phase 4 (factory integration) so that parity tests can
+construct GlobalOrchestrator through the production path. Phase 6 is a soft
+dependency — hardening is nice-to-have before parity migration but not blocking.

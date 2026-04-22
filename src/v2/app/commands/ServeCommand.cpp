@@ -16,6 +16,7 @@
 #include "utils/Logger.h"
 #include <iostream>
 #include <memory>
+#include <vector>
 
 namespace llaminar2
 {
@@ -46,9 +47,20 @@ namespace llaminar2
         // Force serve mode — 'llaminar serve' implies --serve
         config.serve_mode = true;
 
+        // SubcommandRouter strips argv[1] ("serve") before calling us.
+        // Re-inject it so MPIBootstrapPhase's selfLaunchMPI re-creates
+        // the correct command line: llaminar2 serve <flags...>
+        static const char *kSubcmd = "serve";
+        std::vector<char *> full_argv;
+        full_argv.push_back(argv[0]);
+        full_argv.push_back(const_cast<char *>(kSubcmd));
+        for (int i = 1; i < argc; ++i)
+            full_argv.push_back(argv[i]);
+        int full_argc = static_cast<int>(full_argv.size());
+
         // MPI Bootstrap
         MPIBootstrapPhase bootstrap;
-        auto bs_result = bootstrap.execute(config, argc, argv);
+        auto bs_result = bootstrap.execute(config, full_argc, full_argv.data());
         if (bs_result.action == BootstrapResult::Action::EXIT)
             return bs_result.exit_code;
 

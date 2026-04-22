@@ -676,3 +676,281 @@ TEST_F(Test__GlobalPPRankPlanBuilder, AllGlobalTP)
     EXPECT_TRUE(plan0.transferActions().empty());
     EXPECT_TRUE(plan1.transferActions().empty());
 }
+
+// =============================================================================
+// Rank Locality Tests
+// =============================================================================
+
+/**
+ * @test Two ranks on the same node → all transfers are INTRA_NODE
+ */
+TEST_F(Test__GlobalPPTopology, BuildWithLocalities_SameNode)
+{
+    GlobalPPStageSpec s0;
+    s0.stage_id = 0;
+    s0.first_layer = 0;
+    s0.last_layer = 11;
+    s0.has_embedding = true;
+    s0.is_global_tp = false;
+    s0.owning_rank = 0;
+
+    GlobalPPStageSpec s1;
+    s1.stage_id = 1;
+    s1.first_layer = 12;
+    s1.last_layer = 23;
+    s1.has_lm_head = true;
+    s1.is_global_tp = false;
+    s1.owning_rank = 1;
+
+    std::vector<RankLocality> localities = {
+        {0, "node-alpha", 0},
+        {1, "node-alpha", 0},
+    };
+    auto topo = GlobalPPTopology::build({s0, s1}, 24, 2, localities);
+
+    ASSERT_EQ(topo.rank_localities.size(), 2u);
+    EXPECT_TRUE(topo.areColocated(0, 1));
+    EXPECT_EQ(topo.nodeCount(), 1);
+
+    ASSERT_EQ(topo.transfers.size(), 1u);
+    EXPECT_EQ(topo.transfers[0].locality, TransferLocality::INTRA_NODE);
+}
+
+/**
+ * @test Two ranks on different nodes → transfers are INTER_NODE
+ */
+TEST_F(Test__GlobalPPTopology, BuildWithLocalities_DifferentNodes)
+{
+    GlobalPPStageSpec s0;
+    s0.stage_id = 0;
+    s0.first_layer = 0;
+    s0.last_layer = 11;
+    s0.has_embedding = true;
+    s0.is_global_tp = false;
+    s0.owning_rank = 0;
+
+    GlobalPPStageSpec s1;
+    s1.stage_id = 1;
+    s1.first_layer = 12;
+    s1.last_layer = 23;
+    s1.has_lm_head = true;
+    s1.is_global_tp = false;
+    s1.owning_rank = 1;
+
+    std::vector<RankLocality> localities = {
+        {0, "node-alpha", 0},
+        {1, "node-beta", 1},
+    };
+    auto topo = GlobalPPTopology::build({s0, s1}, 24, 2, localities);
+
+    EXPECT_FALSE(topo.areColocated(0, 1));
+    EXPECT_EQ(topo.nodeCount(), 2);
+
+    ASSERT_EQ(topo.transfers.size(), 1u);
+    EXPECT_EQ(topo.transfers[0].locality, TransferLocality::INTER_NODE);
+}
+
+/**
+ * @test No localities provided → existing build() path → locality stays UNKNOWN
+ */
+TEST_F(Test__GlobalPPTopology, BuildWithoutLocalities_TransfersAreUnknown)
+{
+    auto topo = buildCanonical3Stage();
+    for (const auto &t : topo.transfers)
+    {
+        EXPECT_EQ(t.locality, TransferLocality::UNKNOWN);
+    }
+}
+
+/**
+ * @test areColocated returns false when no localities provided
+ */
+TEST_F(Test__GlobalPPTopology, AreColocated_NoLocalities)
+{
+    auto topo = buildCanonical3Stage();
+    EXPECT_FALSE(topo.areColocated(0, 1));
+}
+
+/**
+ * @test nodeCount returns 0 when no localities provided
+ */
+TEST_F(Test__GlobalPPTopology, NodeCount_NoLocalities)
+{
+    auto topo = buildCanonical3Stage();
+    EXPECT_EQ(topo.nodeCount(), 0);
+}
+
+/**
+ * @test ranksOnNode returns correct groupings for multi-node topology
+ */
+TEST_F(Test__GlobalPPTopology, RanksOnNode)
+{
+    std::vector<RankLocality> localities = {
+        {0, "host-a", 0}, {1, "host-a", 0},
+        {2, "host-b", 1}, {3, "host-b", 1},
+    };
+
+    GlobalPPStageSpec s0;
+    s0.stage_id = 0;
+    s0.first_layer = 0;
+    s0.last_layer = 11;
+    s0.has_embedding = true;
+    s0.is_global_tp = true;
+    s0.participating_ranks = {0, 1};
+    s0.per_rank_device = GlobalDeviceAddress::cpu(0);
+
+    GlobalPPStageSpec s1;
+    s1.stage_id = 1;
+    s1.first_layer = 12;
+    s1.last_layer = 23;
+    s1.has_lm_head = true;
+    s1.is_global_tp = true;
+    s1.participating_ranks = {2, 3};
+    s1.per_rank_device = GlobalDeviceAddress::cpu(0);
+
+    auto topo = GlobalPPTopology::build({s0, s1}, 24, 4, localities);
+
+    auto node0_ranks = topo.ranksOnNode(0);
+    ASSERT_EQ(node0_ranks.size(), 2u);
+    EXPECT_EQ(node0_ranks[0], 0);
+    EXPECT_EQ(node0_ranks[1], 1);
+
+    auto node1_ranks = topo.ranksOnNode(1);
+    ASSERT_EQ(node1_ranks.size(), 2u);
+    EXPECT_EQ(node1_ranks[0], 2);
+    EXPECT_EQ(node1_ranks[1], 3);
+
+    EXPECT_EQ(topo.nodeCount(), 2);
+    EXPECT_TRUE(topo.areColocated(0, 1));
+    EXPECT_TRUE(topo.areColocated(2, 3));
+    EXPECT_FALSE(topo.areColocated(0, 2));
+    EXPECT_FALSE(topo.areColocated(1, 3));
+}
+
+/**
+ * @test Fan-out transfers with mixed locality (single → global TP, cross-node)
+ */
+TEST_F(Test__GlobalPPTopology, FanOutTransfers_MixedLocality)
+{
+    std::vector<RankLocality> localities = {
+        {0, "node-a", 0},
+        {1, "node-b", 1},
+        {2, "node-b", 1},
+    };
+
+    GlobalPPStageSpec s0;
+    s0.stage_id = 0;
+    s0.first_layer = 0;
+    s0.last_layer = 11;
+    s0.has_embedding = true;
+    s0.is_global_tp = false;
+    s0.owning_rank = 0;
+    s0.inner_mode = InnerParallelism::SINGLE_DEVICE;
+    s0.devices = {GlobalDeviceAddress::cpu(0)};
+
+    GlobalPPStageSpec s1;
+    s1.stage_id = 1;
+    s1.first_layer = 12;
+    s1.last_layer = 23;
+    s1.has_lm_head = true;
+    s1.is_global_tp = true;
+    s1.participating_ranks = {1, 2};
+    s1.per_rank_device = GlobalDeviceAddress::cpu(0);
+
+    auto topo = GlobalPPTopology::build({s0, s1}, 24, 3, localities);
+
+    // Fan-out: 2 transfers (rank 0 → rank 1, rank 0 → rank 2)
+    ASSERT_EQ(topo.transfers.size(), 2u);
+    for (const auto &t : topo.transfers)
+    {
+        EXPECT_EQ(t.sender_rank, 0);
+        EXPECT_EQ(t.locality, TransferLocality::INTER_NODE);
+    }
+}
+
+/**
+ * @test Fan-out transfers with all ranks on same node → INTRA_NODE
+ */
+TEST_F(Test__GlobalPPTopology, FanOutTransfers_IntraNodeLocality)
+{
+    std::vector<RankLocality> localities = {
+        {0, "same-host", 0},
+        {1, "same-host", 0},
+        {2, "same-host", 0},
+    };
+
+    GlobalPPStageSpec s0;
+    s0.stage_id = 0;
+    s0.first_layer = 0;
+    s0.last_layer = 11;
+    s0.has_embedding = true;
+    s0.is_global_tp = false;
+    s0.owning_rank = 0;
+    s0.inner_mode = InnerParallelism::SINGLE_DEVICE;
+    s0.devices = {GlobalDeviceAddress::cpu(0)};
+
+    GlobalPPStageSpec s1;
+    s1.stage_id = 1;
+    s1.first_layer = 12;
+    s1.last_layer = 23;
+    s1.has_lm_head = true;
+    s1.is_global_tp = true;
+    s1.participating_ranks = {1, 2};
+    s1.per_rank_device = GlobalDeviceAddress::cpu(0);
+
+    auto topo = GlobalPPTopology::build({s0, s1}, 24, 3, localities);
+
+    ASSERT_EQ(topo.transfers.size(), 2u);
+    for (const auto &t : topo.transfers)
+    {
+        EXPECT_EQ(t.locality, TransferLocality::INTRA_NODE);
+    }
+}
+
+/**
+ * @test toString includes locality and node info when localities are present
+ */
+TEST_F(Test__GlobalPPTopology, ToStringIncludesLocality)
+{
+    std::vector<RankLocality> localities = {
+        {0, "host-a", 0},
+        {1, "host-b", 1},
+    };
+
+    GlobalPPStageSpec s0;
+    s0.stage_id = 0;
+    s0.first_layer = 0;
+    s0.last_layer = 11;
+    s0.has_embedding = true;
+    s0.is_global_tp = false;
+    s0.owning_rank = 0;
+    s0.inner_mode = InnerParallelism::SINGLE_DEVICE;
+    s0.devices = {GlobalDeviceAddress::cpu(0)};
+
+    GlobalPPStageSpec s1;
+    s1.stage_id = 1;
+    s1.first_layer = 12;
+    s1.last_layer = 23;
+    s1.has_lm_head = true;
+    s1.is_global_tp = false;
+    s1.owning_rank = 1;
+    s1.inner_mode = InnerParallelism::SINGLE_DEVICE;
+    s1.devices = {GlobalDeviceAddress::cpu(0)};
+
+    auto topo = GlobalPPTopology::build({s0, s1}, 24, 2, localities);
+
+    std::string str = topo.toString();
+    EXPECT_NE(str.find("INTER_NODE"), std::string::npos);
+    EXPECT_NE(str.find("host-a"), std::string::npos);
+    EXPECT_NE(str.find("host-b"), std::string::npos);
+}
+
+/**
+ * @test transferLocalityName returns correct strings
+ */
+TEST(Test__TransferLocality, TransferLocalityName)
+{
+    EXPECT_STREQ(transferLocalityName(TransferLocality::INTRA_NODE), "INTRA_NODE");
+    EXPECT_STREQ(transferLocalityName(TransferLocality::INTER_NODE), "INTER_NODE");
+    EXPECT_STREQ(transferLocalityName(TransferLocality::UNKNOWN), "UNKNOWN");
+}

@@ -218,6 +218,72 @@ namespace llaminar2
         return result;
     }
 
+    GlobalPPTopology GlobalPPTopology::build(std::vector<GlobalPPStageSpec> specs,
+                                            int num_layers, int num_ranks,
+                                            std::vector<RankLocality> localities)
+    {
+        auto topo = build(std::move(specs), num_layers, num_ranks);
+        topo.rank_localities = std::move(localities);
+
+        // Annotate transfers with locality
+        for (auto &t : topo.transfers)
+        {
+            if (t.sender_rank < 0 || t.receiver_rank < 0)
+                continue;
+
+            int node_sender = -1, node_receiver = -1;
+            for (const auto &loc : topo.rank_localities)
+            {
+                if (loc.rank == t.sender_rank) node_sender = loc.node_id;
+                if (loc.rank == t.receiver_rank) node_receiver = loc.node_id;
+            }
+
+            if (node_sender >= 0 && node_receiver >= 0)
+            {
+                t.locality = (node_sender == node_receiver)
+                    ? TransferLocality::INTRA_NODE
+                    : TransferLocality::INTER_NODE;
+            }
+        }
+
+        return topo;
+    }
+
+    bool GlobalPPTopology::areColocated(int rank_a, int rank_b) const
+    {
+        if (rank_localities.empty()) return false;
+        int node_a = -1, node_b = -1;
+        for (const auto &loc : rank_localities)
+        {
+            if (loc.rank == rank_a) node_a = loc.node_id;
+            if (loc.rank == rank_b) node_b = loc.node_id;
+        }
+        return node_a >= 0 && node_a == node_b;
+    }
+
+    std::vector<int> GlobalPPTopology::ranksOnNode(int node_id) const
+    {
+        std::vector<int> result;
+        for (const auto &loc : rank_localities)
+        {
+            if (loc.node_id == node_id)
+                result.push_back(loc.rank);
+        }
+        return result;
+    }
+
+    int GlobalPPTopology::nodeCount() const
+    {
+        if (rank_localities.empty()) return 0;
+        std::set<int> nodes;
+        for (const auto &loc : rank_localities)
+        {
+            if (loc.node_id >= 0)
+                nodes.insert(loc.node_id);
+        }
+        return static_cast<int>(nodes.size());
+    }
+
     const GlobalPPStageSpec *GlobalPPTopology::stageForLayer(int layer) const
     {
         for (const auto &stage : stages)
@@ -370,6 +436,22 @@ namespace llaminar2
         oss << "  total_layers=" << total_layers << ", world_size=" << world_size
             << ", stages=" << stages.size() << ", transfers=" << transfers.size() << "\n";
 
+        if (!rank_localities.empty())
+        {
+            oss << "  Nodes: " << nodeCount() << " (";
+            std::set<std::string> hostnames;
+            for (const auto &loc : rank_localities)
+                hostnames.insert(loc.hostname);
+            bool first = true;
+            for (const auto &h : hostnames)
+            {
+                if (!first) oss << ", ";
+                oss << h;
+                first = false;
+            }
+            oss << ")\n";
+        }
+
         for (const auto &stage : stages)
         {
             oss << "  Stage " << stage.stage_id << ": layers ["
@@ -412,8 +494,7 @@ namespace llaminar2
             oss << "  Transfer: stage " << t.from_stage << " → " << t.to_stage
                 << " (rank " << t.sender_rank << " → " << t.receiver_rank
                 << " tag=" << t.mpi_tag;
-            if (t.isNoop()) oss << " NO-OP";
-            oss << ")\n";
+            if (t.isNoop()) oss << " NO-OP";            if (t.locality != TransferLocality::UNKNOWN) oss << " " << transferLocalityName(t.locality);            oss << ")\n";
         }
 
         oss << "}";

@@ -8580,6 +8580,23 @@ add_v2_test(V2_Unit_GlobalOrchestrator
 
 message(STATUS "V2 Tests: Added GlobalOrchestrator unit tests")
 
+# Test: GlobalOrchestratorRunner
+# Unit tests for IOrchestrationRunner adapter wrapping GlobalOrchestrator (Phase 4).
+# Verifies lifecycle (init/shutdown), inference delegation (prefill/decodeStep/generate),
+# sampling state, stop tokens, GPU sampling delegation, PP topologies.
+add_executable(v2_test_global_orchestrator_runner unit/execution/global/Test__GlobalOrchestratorRunner.cpp)
+target_include_directories(v2_test_global_orchestrator_runner PRIVATE 
+    ${CMAKE_CURRENT_SOURCE_DIR}  # For tests/v2/mocks/ include path
+)
+target_link_libraries(v2_test_global_orchestrator_runner llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_GlobalOrchestratorRunner
+    COMMAND $<TARGET_FILE:v2_test_global_orchestrator_runner>
+    LABELS "V2;Unit;GlobalOrchestratorRunner;GlobalOrchestrator;GlobalPP;IOrchestrationRunner"
+    MPI_PROCS 1
+)
+
+message(STATUS "V2 Tests: Added GlobalOrchestratorRunner unit tests")
+
 # Test: ParallelismTree
 # Unit tests for recursive parallelism tree data structure:
 # - Fluent builder construction (PP, TP, Device)

@@ -61,9 +61,20 @@ namespace llaminar2
             return 1;
         }
 
+        // SubcommandRouter strips argv[1] ("oneshot") before calling us.
+        // Re-inject it so MPIBootstrapPhase's selfLaunchMPI re-creates
+        // the correct command line: llaminar2 oneshot <flags...>
+        static const char *kSubcmd = "oneshot";
+        std::vector<char *> full_argv;
+        full_argv.push_back(argv[0]);
+        full_argv.push_back(const_cast<char *>(kSubcmd));
+        for (int i = 1; i < argc; ++i)
+            full_argv.push_back(argv[i]);
+        int full_argc = static_cast<int>(full_argv.size());
+
         // MPI Bootstrap
         MPIBootstrapPhase bootstrap;
-        auto bs_result = bootstrap.execute(config, argc, argv);
+        auto bs_result = bootstrap.execute(config, full_argc, full_argv.data());
         if (bs_result.action == BootstrapResult::Action::EXIT)
             return bs_result.exit_code;
 
