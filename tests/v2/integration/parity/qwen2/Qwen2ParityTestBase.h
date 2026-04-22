@@ -37,6 +37,9 @@
 #include "execution/mpi_orchestration/RankExecutionPlan.h"
 #include "execution/local_execution/graph/DeviceGraphExecutor.h"
 #include "execution/local_execution/device/DeviceContext.h"
+// GlobalOrchestrator (cross-rank PP + global TP)
+#include "execution/global/GlobalOrchestrator.h"
+#include "execution/global_pp/GlobalPPTopology.h"
 #include "collective/ILocalTPContext.h"
 #include "collective/LocalTPContext.h"
 #include "collective/ILocalPPContext.h"
@@ -849,7 +852,7 @@ namespace llaminar2::test::parity::qwen2
             // GlobalTP shards weights across MPI ranks
             if (cfg().is_local_tp() || cfg().is_cross_rank_tp())
                 return WeightDistributionStrategy::SHARDED;
-            else if (cfg().is_local_pp())
+            else if (cfg().is_local_pp() || cfg().is_cross_rank_pp())
                 return WeightDistributionStrategy::LAYER_PARTITIONED;
             else
                 return WeightDistributionStrategy::REPLICATED;
@@ -891,8 +894,8 @@ namespace llaminar2::test::parity::qwen2
 
                 mpi_ctx_ = std::make_shared<MPIContext>(rank, world_size, MPI_COMM_WORLD);
             }
-            // MPI setup for cross-rank TP (NodeLocal or Global, requires multiple ranks)
-            else if (cfg().is_cross_rank_tp())
+            // MPI setup for cross-rank (NodeLocal or Global, requires multiple ranks)
+            else if (cfg().is_cross_rank())
             {
                 int rank = 0, world_size = 1;
                 MPI_Comm_rank(MPI_COMM_WORLD, &rank);
@@ -900,7 +903,7 @@ namespace llaminar2::test::parity::qwen2
 
                 if (world_size < cfg().mpi_ranks)
                 {
-                    GTEST_SKIP() << "Cross-rank TP test requires " << cfg().mpi_ranks
+                    GTEST_SKIP() << "Cross-rank test requires " << cfg().mpi_ranks
                                  << " MPI ranks (got " << world_size << ")";
                 }
 
@@ -933,6 +936,7 @@ namespace llaminar2::test::parity::qwen2
         void TearDown() override
         {
             multi_orch_.reset();
+            global_orchestrator_ptr_ = nullptr;
             global_tp_ctx_.reset();
             pp_orchestrator_.reset();
             Qwen2ParityTestBase::TearDown();
@@ -959,9 +963,9 @@ namespace llaminar2::test::parity::qwen2
          */
         bool setupPipeline()
         {
-            // Cross-rank TP (NodeLocal/Global) uses the MPI-based path
-            if (cfg().is_cross_rank_tp())
-                return setupGlobalTPPipeline();
+            // Cross-rank TP or PP uses GlobalOrchestrator
+            if (cfg().is_cross_rank())
+                return setupGlobalOrchestratorPipeline();
 
             // Single device also uses old path (no tree needed)
             if (cfg().is_single_device())
@@ -1170,39 +1174,187 @@ namespace llaminar2::test::parity::qwen2
          *
          * @return true if setup succeeded, false on error
          */
-        bool setupGlobalTPPipeline()
+        bool setupGlobalOrchestratorPipeline()
         {
-            // Production GlobalTP uses:
-            //   1. SHARDED weight loading (getWeightStrategy() already returns SHARDED)
-            //   2. createInferenceRunner() with mpi_ctx_ → applyProportionalGlobalTPAssignment()
-            //   3. AllreduceStage → MPI_Allreduce directly (no CollectiveContext needed)
-            //
-            // ParityTestBase::setupPipeline() does exactly this when mpi_ctx_ is set
-            // and getWeightStrategy() returns SHARDED, so delegate to it.
-            if (!ParityTestBase::setupPipeline())
-                return false;
+            DeviceManager::instance().initialize(-1);
 
-            // Also create GlobalTPContext for infrastructure tests
-            // (allreduce, broadcast, barrier verification).
-            // Production doesn't use GlobalTPContext — stages call MPI directly.
-            int world_size = mpi_ctx_->world_size();
-            std::vector<int> world_ranks;
-            for (int r = 0; r < world_size; ++r)
-                world_ranks.push_back(r);
+            const int rank = mpi_ctx_->rank();
+            const int world_size = mpi_ctx_->world_size();
 
-            global_tp_ctx_ = GlobalTPContext::createForTest(
-                MPI_COMM_WORLD,
-                0, // domain_id
-                world_ranks);
-
-            if (!global_tp_ctx_)
+            // Step 1: Load model
+            model_ctx_ = ModelContext::create(
+                config_.model_path,
+                mpi_ctx_,
+                nullptr,            // placement_map
+                nullptr,            // factory
+                getWeightStrategy());
+            if (!model_ctx_)
             {
-                LOG_ERROR("[Parity] Failed to create GlobalTPContext");
+                LOG_ERROR("[Parity] Failed to load model");
+                return false;
+            }
+            configureModel(model_ctx_);
+
+            const int n_layers = model_ctx_->blockCount();
+            const int vocab_size = model_ctx_->vocabSize();
+            const int d_model = model_ctx_->embeddingLength();
+            const std::string arch_name = model_ctx_->architecture();
+
+            // Step 2: Build GlobalPPTopology
+            GlobalPPTopology topology;
+
+            if (cfg().is_cross_rank_tp())
+            {
+                // Pure global TP: single stage, all ranks, all layers
+                GlobalPPStageSpec stage;
+                stage.stage_id = 0;
+                stage.first_layer = 0;
+                stage.last_layer = n_layers - 1;
+                stage.has_embedding = true;
+                stage.has_lm_head = true;
+                stage.is_global_tp = true;
+                for (int r = 0; r < world_size; ++r)
+                    stage.participating_ranks.push_back(r);
+
+                topology = GlobalPPTopology::build({stage}, n_layers, world_size);
+            }
+            else if (cfg().is_cross_rank_pp())
+            {
+                // Pure global PP: one stage per rank, equal layer split
+                int layers_per_rank = n_layers / world_size;
+                int remainder = n_layers % world_size;
+                std::vector<GlobalPPStageSpec> stages;
+
+                int layer_offset = 0;
+                for (int r = 0; r < world_size; ++r)
+                {
+                    int count = layers_per_rank + (r < remainder ? 1 : 0);
+                    GlobalPPStageSpec stage;
+                    stage.stage_id = r;
+                    stage.first_layer = layer_offset;
+                    stage.last_layer = layer_offset + count - 1;
+                    stage.has_embedding = (r == 0);
+                    stage.has_lm_head = (r == world_size - 1);
+                    stage.is_global_tp = false;
+                    stage.owning_rank = r;
+                    stages.push_back(stage);
+                    layer_offset += count;
+                }
+
+                topology = GlobalPPTopology::build(std::move(stages), n_layers, world_size);
+            }
+            else
+            {
+                LOG_ERROR("[Parity] setupGlobalOrchestratorPipeline() called for unsupported parallelism");
                 return false;
             }
 
-            LOG_INFO("[Parity] GlobalTP setup complete: degree=" << global_tp_ctx_->degree()
-                                                                 << ", myIndex=" << global_tp_ctx_->myIndex());
+            // Validate topology
+            auto errors = topology.validate();
+            if (!errors.empty())
+            {
+                for (const auto &err : errors)
+                    LOG_ERROR("[Parity] Topology error: " << err);
+                return false;
+            }
+
+            // Step 3: Create per-rank runner
+            InferenceRunnerConfig inf_config;
+            inf_config.max_seq_len = 4096;
+            inf_config.batch_size = 1;
+            inf_config.force_graph = true;
+            inf_config.activation_precision = cfg().activation_precision;
+            inf_config.kv_cache_precision = cfg().kv_cache_precision;
+
+            DeviceId device = getDevice();
+            if (device.is_gpu())
+                inf_config.use_mapped_memory = true;
+
+            if (cfg().is_cross_rank_pp())
+            {
+                // PP: configure runner for this rank's layer range
+                const auto *my_stage = topology.stageForLayer(
+                    topology.stages[rank].first_layer);
+                if (!my_stage)
+                {
+                    LOG_ERROR("[Parity] No stage found for rank " << rank);
+                    return false;
+                }
+
+                FactoryPPStageConfig pp_cfg;
+                pp_cfg.first_layer = my_stage->first_layer;
+                pp_cfg.last_layer = my_stage->last_layer + 1; // exclusive
+                pp_cfg.has_embedding = my_stage->has_embedding;
+                pp_cfg.has_lm_head = my_stage->has_lm_head;
+
+                // Use createPPStageRunner which builds a partial graph with only
+                // this rank's layers (skips embedding/LM head as appropriate).
+                // createInferenceRunner ignores pp_stage_config and builds a full graph.
+                runner_ = createPPStageRunner(model_ctx_, device, pp_cfg, inf_config);
+                if (!runner_)
+                {
+                    LOG_ERROR("[Parity] Failed to create PP stage runner for rank " << rank);
+                    return false;
+                }
+                runner_->enableSnapshotCapture();
+            }
+            else
+            {
+                // Pure TP: create full-model runner
+                runner_ = createInferenceRunner(model_ctx_, mpi_ctx_, device, inf_config);
+                if (!runner_)
+                {
+                    LOG_ERROR("[Parity] Failed to create per-rank inference runner");
+                    return false;
+                }
+                runner_->enableSnapshotCapture();
+            }
+
+            // Step 4: Build GlobalOrchestrator wrapping the per-rank runner
+            GlobalOrchestrator::Config go_config;
+            go_config.topology = std::move(topology);
+            go_config.rank = rank;
+            go_config.world_size = world_size;
+            go_config.mpi_ctx = mpi_ctx_.get();
+            go_config.rank_runner = std::move(runner_);  // Transfer ownership
+            go_config.vocab_size = vocab_size;
+            go_config.d_model = d_model;
+            go_config.architecture_name = arch_name;
+
+            auto go = std::make_unique<GlobalOrchestrator>(std::move(go_config));
+
+            // Keep a non-owning pointer for tests that need GlobalOrchestrator-specific APIs
+            global_orchestrator_ptr_ = go.get();
+
+            // Re-assign runner_ so parity test infrastructure uses GlobalOrchestrator
+            runner_ = std::move(go);
+
+            LOG_INFO("[Parity] GlobalOrchestrator setup complete (rank " << rank
+                     << "/" << world_size << ")");
+
+            // Step 5: Also create GlobalTPContext for infrastructure tests
+            // (allreduce, broadcast, barrier verification).
+            if (cfg().is_cross_rank_tp())
+            {
+                std::vector<int> world_ranks;
+                for (int r = 0; r < world_size; ++r)
+                    world_ranks.push_back(r);
+
+                global_tp_ctx_ = GlobalTPContext::createForTest(
+                    MPI_COMM_WORLD,
+                    0, // domain_id
+                    world_ranks);
+
+                if (!global_tp_ctx_)
+                {
+                    LOG_ERROR("[Parity] Failed to create GlobalTPContext");
+                    return false;
+                }
+
+                LOG_INFO("[Parity] GlobalTP context: degree=" << global_tp_ctx_->degree()
+                                                              << ", myIndex=" << global_tp_ctx_->myIndex());
+            }
+
             return true;
         }
 
@@ -1210,7 +1362,10 @@ namespace llaminar2::test::parity::qwen2
         // PP-specific storage (production DeviceGraphOrchestrator for unified PP)
         std::unique_ptr<DeviceGraphOrchestrator> pp_orchestrator_;
 
-        // GlobalTP-specific storage
+        // Non-owning pointer to GlobalOrchestrator (owned by runner_)
+        GlobalOrchestrator *global_orchestrator_ptr_ = nullptr;
+
+        // GlobalTP-specific storage (for infrastructure tests)
         std::unique_ptr<GlobalTPContext> global_tp_ctx_;
     };
 

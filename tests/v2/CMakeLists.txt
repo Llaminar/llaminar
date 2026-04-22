@@ -4337,6 +4337,26 @@ if(ZLIB_FOUND)
 
     message(STATUS "V2: Qwen3 NodeLocalTP parity tests enabled (requires mpirun -np 2+)")
 
+    # ---- NodeLocalPP Parity (Cross-Rank Pipeline Parallelism via GlobalOrchestrator) ----
+    add_executable(v2_integration_parity_qwen3_node_local_pp
+        integration/parity/qwen3/Test__Qwen3_NodeLocalPP_Parity.cpp
+        ${WORKSPACE_ROOT_PARITY}/external/cnpy/cnpy.cpp
+    )
+    target_link_libraries(v2_integration_parity_qwen3_node_local_pp
+        llaminar2_core v2_test_utils GTest::gtest ZLIB::ZLIB
+    )
+    target_include_directories(v2_integration_parity_qwen3_node_local_pp PRIVATE
+        ${WORKSPACE_ROOT_PARITY}/external/cnpy
+        ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    discover_v2_parity_tests(v2_integration_parity_qwen3_node_local_pp
+        TEST_PREFIX V2_Integration_Parity_Qwen3_NodeLocalPP
+        LABELS "V2;Integration;Parity;Qwen3;NodeLocalPP;MPI;PipelineParallel;CrossRank;CPU;GlobalOrchestrator"
+        MPI_PROCS 2
+    )
+
+    message(STATUS "V2: Qwen3 NodeLocalPP parity tests enabled (requires mpirun -np 2+)")
+
     # =========================================================================
     # Qwen3.5 Parity Test Matrix (integration/parity/qwen35/)
     # =========================================================================
@@ -4491,6 +4511,26 @@ if(ZLIB_FOUND)
     )
 
     message(STATUS "V2: Qwen3.5 NodeLocalTP parity tests enabled (requires mpirun -np 2+)")
+
+    # ---- NodeLocalPP Parity (Cross-Rank Pipeline Parallelism via GlobalOrchestrator) ----
+    add_executable(v2_integration_parity_qwen35_node_local_pp
+        integration/parity/qwen35/Test__Qwen35_NodeLocalPP_Parity.cpp
+        ${WORKSPACE_ROOT_PARITY}/external/cnpy/cnpy.cpp
+    )
+    target_link_libraries(v2_integration_parity_qwen35_node_local_pp
+        llaminar2_core v2_test_utils GTest::gtest ZLIB::ZLIB
+    )
+    target_include_directories(v2_integration_parity_qwen35_node_local_pp PRIVATE
+        ${WORKSPACE_ROOT_PARITY}/external/cnpy
+        ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    discover_v2_parity_tests(v2_integration_parity_qwen35_node_local_pp
+        TEST_PREFIX V2_Integration_Parity_Qwen35_NodeLocalPP
+        LABELS "V2;Integration;Parity;Qwen35;GatedDeltaNet;NodeLocalPP;MPI;PipelineParallel;CrossRank;CPU;GlobalOrchestrator"
+        MPI_PROCS 2
+    )
+
+    message(STATUS "V2: Qwen3.5 NodeLocalPP parity tests enabled (requires mpirun -np 2+)")
 
     # =========================================================================
     # Test: Qwen2 NodeLocalTP Parity (Multi-Socket CPU TP)

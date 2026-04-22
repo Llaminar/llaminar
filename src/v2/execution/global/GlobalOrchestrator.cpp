@@ -428,9 +428,11 @@ namespace llaminar2
                 return false;
             }
 
-            // Send via IMPIContext wrapper (data() triggers GPU→host sync if needed)
+            // Send only the effective data (last_seq_len_ * d_model), not the full
+            // allocated buffer which may be max_seq_len * d_model.
             const float *send_data = hidden->data();
-            size_t count = hidden->numel();
+            size_t count = static_cast<size_t>(last_seq_len_) * config_.d_model;
+            if (count == 0) count = static_cast<size_t>(config_.d_model);
 
             LOG_DEBUG("GlobalOrchestrator: rank " << config_.rank
                       << " SEND " << count << " floats to rank " << action.peer_rank
