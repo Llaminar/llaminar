@@ -297,14 +297,6 @@ namespace llaminar2
                                       static_cast<size_t>(n_tokens), 0);
         }
 
-        // For PP: head stage receives activations from external source
-        // (handled by MPI in distributed setting)
-        if (!isPipelineHead())
-        {
-            // Non-head stages wait for activations from previous stage
-            receiveActivationsFromPrevStage();
-        }
-
         // Run forward pass
         try
         {
@@ -317,12 +309,6 @@ namespace llaminar2
         catch (const std::exception &e)
         {
             return setError(std::string("Prefill failed: ") + e.what());
-        }
-
-        // For PP: non-tail stages send activations to next stage
-        if (!isPipelineTail())
-        {
-            sendActivationsToNextStage();
         }
 
         // Signal that prefill logits are ready for sampling.
@@ -359,24 +345,10 @@ namespace llaminar2
         }
         else
         {
-            // For PP: non-head stages receive from previous
-            if (!isPipelineHead())
-            {
-                receiveActivationsFromPrevStage();
-            }
-
             // Run single-token forward with last token
             if (!runner_->forward(&last_token_, 1))
             {
                 result.error = "Forward pass failed during decode";
-                return result;
-            }
-
-            // For PP: send to next stage if not tail
-            if (!isPipelineTail())
-            {
-                sendActivationsToNextStage();
-                // Non-tail stages don't sample
                 return result;
             }
         }
@@ -1234,44 +1206,6 @@ namespace llaminar2
 
         LOG_INFO("[OrchestrationRunner] Compute graph built successfully");
         return true;
-    }
-
-    // =========================================================================
-    // PP Communication Helpers
-    // =========================================================================
-
-    void OrchestrationRunner::sendActivationsToNextStage()
-    {
-        if (!plan_.next_rank.has_value())
-        {
-            return;
-        }
-
-        // TODO: Implement MPI_Send for activations
-        // This requires serializing the hidden states and sending to next_rank
-        LOG_DEBUG("PP: Would send activations to rank " << *plan_.next_rank);
-    }
-
-    void OrchestrationRunner::receiveActivationsFromPrevStage()
-    {
-        if (!plan_.prev_rank.has_value())
-        {
-            return;
-        }
-
-        // TODO: Implement MPI_Recv for activations
-        // This requires receiving hidden states from prev_rank
-        LOG_DEBUG("PP: Would receive activations from rank " << *plan_.prev_rank);
-    }
-
-    bool OrchestrationRunner::isPipelineHead() const
-    {
-        return !plan_.prev_rank.has_value();
-    }
-
-    bool OrchestrationRunner::isPipelineTail() const
-    {
-        return !plan_.next_rank.has_value();
     }
 
     // =========================================================================

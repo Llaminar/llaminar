@@ -334,30 +334,6 @@ namespace llaminar2
         bool initializeMPI();
 
         // =====================================================================
-        // PP Communication Helpers
-        // =====================================================================
-
-        /**
-         * @brief Check if this is the first PP stage
-         */
-        bool isPipelineHead() const;
-
-        /**
-         * @brief Check if this is the last PP stage
-         */
-        bool isPipelineTail() const;
-
-        /**
-         * @brief Send activations to next PP stage
-         */
-        void sendActivationsToNextStage();
-
-        /**
-         * @brief Receive activations from previous PP stage
-         */
-        void receiveActivationsFromPrevStage();
-
-        // =====================================================================
         // Multi-Device Helpers
         // =====================================================================
 
