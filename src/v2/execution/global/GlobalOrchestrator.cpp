@@ -96,6 +96,8 @@ namespace llaminar2
 
     bool GlobalOrchestrator::forward(const int *tokens, int seq_len)
     {
+        last_seq_len_ = seq_len;
+
         for (const auto &step : rank_plan_.steps)
         {
             switch (step.type)
@@ -399,7 +401,7 @@ namespace llaminar2
                 return false;
             }
 
-            // Send via MPI (data() triggers GPU→host sync if needed)
+            // Send via IMPIContext wrapper (data() triggers GPU→host sync if needed)
             const float *send_data = hidden->data();
             size_t count = hidden->numel();
 
@@ -407,15 +409,16 @@ namespace llaminar2
                       << " SEND " << count << " floats to rank " << action.peer_rank
                       << " tag=" << action.mpi_tag);
 
-            MPI_Send(send_data, static_cast<int>(count), MPI_FLOAT,
-                     action.peer_rank, action.mpi_tag,
-                     config_.mpi_ctx->communicator());
+            config_.mpi_ctx->sendFloat(send_data, count, action.peer_rank, action.mpi_tag);
             return true;
         }
         else // RECV
         {
-            // Ensure activation buffer is large enough
-            // For the first recv, we use the d_model-sized buffer and resize if needed
+            // Ensure activation buffer is sized for current sequence
+            size_t needed = static_cast<size_t>(last_seq_len_) * config_.d_model;
+            if (needed == 0) needed = static_cast<size_t>(config_.d_model); // fallback for single token
+            ensureActivationBufferCapacity(needed);
+
             TensorBase *recv_tensor = activation_buffer_.get();
             if (!recv_tensor)
             {
@@ -431,14 +434,21 @@ namespace llaminar2
                       << " RECV " << count << " floats from rank " << action.peer_rank
                       << " tag=" << action.mpi_tag);
 
-            MPI_Status status;
-            MPI_Recv(recv_data, static_cast<int>(count), MPI_FLOAT,
-                     action.peer_rank, action.mpi_tag,
-                     config_.mpi_ctx->communicator(), &status);
+            config_.mpi_ctx->recvFloat(recv_data, count, action.peer_rank, action.mpi_tag, nullptr);
 
             // Pass received hidden state to rank runner for the next stage
             rank_runner_->setHiddenState(recv_tensor);
             return true;
+        }
+    }
+
+    void GlobalOrchestrator::ensureActivationBufferCapacity(size_t num_elements)
+    {
+        if (!activation_buffer_ || activation_buffer_->numel() < num_elements)
+        {
+            activation_buffer_ = std::make_shared<FP32Tensor>(
+                std::vector<size_t>{num_elements});
+            LOG_DEBUG("GlobalOrchestrator: resized activation buffer to " << num_elements << " elements");
         }
     }
 

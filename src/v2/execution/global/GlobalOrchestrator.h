@@ -247,6 +247,11 @@ namespace llaminar2
         int tail_rank_ = 0;
         bool is_pipeline_head_ = false;
         bool is_pipeline_tail_ = false;
+
+        int last_seq_len_ = 0;   ///< Sequence length from last forward() call (for buffer sizing)
+
+        /// Ensure activation buffer can hold seq_len * d_model elements
+        void ensureActivationBufferCapacity(size_t num_elements);
     };
 
 } // namespace llaminar2

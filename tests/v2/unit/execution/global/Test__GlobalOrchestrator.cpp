@@ -68,6 +68,7 @@ namespace llaminar2::test
          * @brief Build a 2-stage PP topology (rank 0: layers 0-11, rank 1: layers 12-23)
          */
         static GlobalPPTopology buildTwoStagePPTopo()
+
         {
             GlobalPPStageSpec s0;
             s0.stage_id = 0;
@@ -114,6 +115,47 @@ namespace llaminar2::test
             config.d_model = D_MODEL;
             config.architecture_name = "test_qwen2";
             return config;
+        }
+
+        /**
+         * @brief Build a 3-stage PP topology (3 ranks, each owning 8 layers)
+         */
+        static GlobalPPTopology buildThreeStagePPTopo()
+        {
+            GlobalPPStageSpec s0;
+            s0.stage_id = 0;
+            s0.first_layer = 0;
+            s0.last_layer = 7;
+            s0.has_embedding = true;
+            s0.has_lm_head = false;
+            s0.is_global_tp = false;
+            s0.owning_rank = 0;
+            s0.inner_mode = InnerParallelism::SINGLE_DEVICE;
+            s0.devices = {GlobalDeviceAddress::cpu()};
+
+            GlobalPPStageSpec s1;
+            s1.stage_id = 1;
+            s1.first_layer = 8;
+            s1.last_layer = 15;
+            s1.has_embedding = false;
+            s1.has_lm_head = false;
+            s1.is_global_tp = false;
+            s1.owning_rank = 1;
+            s1.inner_mode = InnerParallelism::SINGLE_DEVICE;
+            s1.devices = {GlobalDeviceAddress::cpu()};
+
+            GlobalPPStageSpec s2;
+            s2.stage_id = 2;
+            s2.first_layer = 16;
+            s2.last_layer = 23;
+            s2.has_embedding = false;
+            s2.has_lm_head = true;
+            s2.is_global_tp = false;
+            s2.owning_rank = 2;
+            s2.inner_mode = InnerParallelism::SINGLE_DEVICE;
+            s2.devices = {GlobalDeviceAddress::cpu()};
+
+            return GlobalPPTopology::build({s0, s1, s2}, TOTAL_LAYERS, 3);
         }
     };
 
@@ -701,6 +743,213 @@ namespace llaminar2::test
             // but the path through GlobalOrchestrator delegates correctly
             EXPECT_FALSE(orch.hasLogitsLocal());
         }
+    }
+
+    // =========================================================================
+    // Phase 2: PP Forward Path with IMPIContext Wrappers
+    // =========================================================================
+
+    TEST_F(Test__GlobalOrchestrator, ForwardPP_Rank0_SendsViaMPIContext)
+    {
+        MockMPIContext mpi(0, 2);
+        auto topo = buildTwoStagePPTopo();
+
+        MockDeviceRunner::Config runner_config;
+        runner_config.vocab_size = VOCAB_SIZE;
+        runner_config.has_hidden_state = true;
+        runner_config.hidden_state_dim = D_MODEL;
+        auto runner_raw = new MockDeviceRunner(runner_config);
+        auto runner = std::unique_ptr<MockDeviceRunner>(runner_raw);
+
+        GlobalOrchestrator orch(makeConfig(std::move(topo), 0, 2, &mpi, std::move(runner)));
+
+        std::vector<int> tokens = {1, 2, 3};
+        EXPECT_TRUE(orch.forward(tokens.data(), 3));
+        EXPECT_EQ(runner_raw->forward_call_count(), 1u);
+        // SEND was called via IMPIContext (not raw MPI)
+        EXPECT_EQ(mpi.send_call_count(), 1u);
+    }
+
+    TEST_F(Test__GlobalOrchestrator, ForwardPP_Rank1_RecvsViaMPIContext)
+    {
+        MockMPIContext mpi(1, 2);
+        auto topo = buildTwoStagePPTopo();
+
+        auto runner_raw = new MockDeviceRunner();
+        auto runner = std::unique_ptr<MockDeviceRunner>(runner_raw);
+
+        GlobalOrchestrator orch(makeConfig(std::move(topo), 1, 2, &mpi, std::move(runner)));
+
+        std::vector<int> tokens = {1, 2, 3};
+        EXPECT_TRUE(orch.forward(tokens.data(), 3));
+        // RECV was called via IMPIContext
+        EXPECT_EQ(mpi.recv_call_count(), 1u);
+        // Forward was called (after receiving hidden state)
+        EXPECT_EQ(runner_raw->forward_call_count(), 1u);
+        // setHiddenState was called on the runner
+        EXPECT_EQ(runner_raw->set_hidden_state_call_count(), 1u);
+    }
+
+    TEST_F(Test__GlobalOrchestrator, ForwardPP_Rank0_HiddenStateHasCorrectSize)
+    {
+        MockMPIContext mpi(0, 2);
+        auto topo = buildTwoStagePPTopo();
+
+        MockDeviceRunner::Config runner_config;
+        runner_config.vocab_size = VOCAB_SIZE;
+        runner_config.has_hidden_state = true;
+        runner_config.hidden_state_dim = D_MODEL;
+        auto runner_raw = new MockDeviceRunner(runner_config);
+        auto runner = std::unique_ptr<MockDeviceRunner>(runner_raw);
+
+        GlobalOrchestrator orch(makeConfig(std::move(topo), 0, 2, &mpi, std::move(runner)));
+
+        // Prefill with 5 tokens
+        std::vector<int> tokens = {1, 2, 3, 4, 5};
+        EXPECT_TRUE(orch.forward(tokens.data(), 5));
+
+        // The runner should have produced a hidden state of size seq_len * d_model
+        auto *hs = runner_raw->getHiddenState();
+        ASSERT_NE(hs, nullptr);
+        EXPECT_EQ(hs->numel(), static_cast<size_t>(5 * D_MODEL));
+    }
+
+    TEST_F(Test__GlobalOrchestrator, ForwardPP_Rank1_BufferResizesForPrefillThenDecode)
+    {
+        // Rank 1 (tail) receives activations — buffer should resize for prefill
+        // then work correctly for decode (seq_len=1)
+        MockMPIContext mpi(1, 2);
+        auto topo = buildTwoStagePPTopo();
+        auto runner = std::make_unique<MockDeviceRunner>();
+
+        GlobalOrchestrator orch(makeConfig(std::move(topo), 1, 2, &mpi, std::move(runner)));
+
+        // Prefill: seq_len=10
+        std::vector<int> tokens_prefill(10, 1);
+        EXPECT_TRUE(orch.forward(tokens_prefill.data(), 10));
+        EXPECT_EQ(mpi.recv_call_count(), 1u);
+
+        // Decode: seq_len=1
+        std::vector<int> tokens_decode = {42};
+        EXPECT_TRUE(orch.forward(tokens_decode.data(), 1));
+        EXPECT_EQ(mpi.recv_call_count(), 2u);
+    }
+
+    TEST_F(Test__GlobalOrchestrator, ThreeStagePP_Rank0_IsHeadOnly)
+    {
+        MockMPIContext mpi(0, 3);
+        auto topo = buildThreeStagePPTopo();
+        auto runner = std::make_unique<MockDeviceRunner>();
+
+        GlobalOrchestrator orch(makeConfig(std::move(topo), 0, 3, &mpi, std::move(runner)));
+
+        EXPECT_TRUE(orch.isPipelineHead());
+        EXPECT_FALSE(orch.isPipelineTail());
+        EXPECT_EQ(orch.pipelineDepth(), 3);
+    }
+
+    TEST_F(Test__GlobalOrchestrator, ThreeStagePP_Rank1_IsMiddle)
+    {
+        MockMPIContext mpi(1, 3);
+        auto topo = buildThreeStagePPTopo();
+        auto runner = std::make_unique<MockDeviceRunner>();
+
+        GlobalOrchestrator orch(makeConfig(std::move(topo), 1, 3, &mpi, std::move(runner)));
+
+        EXPECT_FALSE(orch.isPipelineHead());
+        EXPECT_FALSE(orch.isPipelineTail());
+
+        // Middle rank has both RECV and SEND transfers
+        const auto &plan = orch.rankPlan();
+        auto transfers = plan.transferActions();
+        ASSERT_GE(transfers.size(), 2u);
+
+        // Find RECV and SEND
+        bool has_recv = false, has_send = false;
+        for (const auto *t : transfers)
+        {
+            if (t->direction == RankTransferAction::Direction::RECV) has_recv = true;
+            if (t->direction == RankTransferAction::Direction::SEND) has_send = true;
+        }
+        EXPECT_TRUE(has_recv);
+        EXPECT_TRUE(has_send);
+    }
+
+    TEST_F(Test__GlobalOrchestrator, ThreeStagePP_Rank2_IsTailOnly)
+    {
+        MockMPIContext mpi(2, 3);
+        auto topo = buildThreeStagePPTopo();
+        auto runner = std::make_unique<MockDeviceRunner>();
+
+        GlobalOrchestrator orch(makeConfig(std::move(topo), 2, 3, &mpi, std::move(runner)));
+
+        EXPECT_FALSE(orch.isPipelineHead());
+        EXPECT_TRUE(orch.isPipelineTail());
+    }
+
+    TEST_F(Test__GlobalOrchestrator, ThreeStagePP_MiddleRank_ForwardRecvsAndSends)
+    {
+        MockMPIContext mpi(1, 3);
+        auto topo = buildThreeStagePPTopo();
+
+        MockDeviceRunner::Config runner_config;
+        runner_config.vocab_size = VOCAB_SIZE;
+        runner_config.has_hidden_state = true;
+        runner_config.hidden_state_dim = D_MODEL;
+        auto runner_raw = new MockDeviceRunner(runner_config);
+        auto runner = std::unique_ptr<MockDeviceRunner>(runner_raw);
+
+        GlobalOrchestrator orch(makeConfig(std::move(topo), 1, 3, &mpi, std::move(runner)));
+
+        std::vector<int> tokens = {1, 2, 3};
+        EXPECT_TRUE(orch.forward(tokens.data(), 3));
+
+        // Middle rank: RECV from rank 0, EXECUTE, SEND to rank 2
+        EXPECT_EQ(mpi.recv_call_count(), 1u);
+        EXPECT_EQ(runner_raw->forward_call_count(), 1u);
+        EXPECT_EQ(mpi.send_call_count(), 1u);
+        // setHiddenState called once (from RECV)
+        EXPECT_EQ(runner_raw->set_hidden_state_call_count(), 1u);
+    }
+
+    TEST_F(Test__GlobalOrchestrator, ForwardPP_WorksWithMockMPIContext)
+    {
+        // This test proves the raw MPI_Send/MPI_Recv calls were replaced with
+        // IMPIContext wrappers, since MockMPIContext returns MPI_COMM_NULL
+        // for communicator() — raw MPI calls would crash/hang.
+        for (int rank = 0; rank < 2; ++rank)
+        {
+            MockMPIContext mpi(rank, 2);
+            auto topo = buildTwoStagePPTopo();
+
+            MockDeviceRunner::Config runner_config;
+            runner_config.vocab_size = VOCAB_SIZE;
+            runner_config.has_hidden_state = (rank == 0); // Head produces hidden state
+            runner_config.hidden_state_dim = D_MODEL;
+            auto runner = std::make_unique<MockDeviceRunner>(runner_config);
+
+            GlobalOrchestrator orch(makeConfig(std::move(topo), rank, 2, &mpi, std::move(runner)));
+
+            std::vector<int> tokens = {1, 2};
+            // If raw MPI calls were still used, this would crash (MPI_COMM_NULL)
+            EXPECT_TRUE(orch.forward(tokens.data(), 2))
+                << "forward() failed for rank " << rank;
+        }
+    }
+
+    TEST_F(Test__GlobalOrchestrator, ThreeStagePP_ClearCacheBarrier)
+    {
+        MockMPIContext mpi(1, 3);
+        auto topo = buildThreeStagePPTopo();
+        auto runner_raw = new MockDeviceRunner();
+        auto runner = std::unique_ptr<MockDeviceRunner>(runner_raw);
+
+        GlobalOrchestrator orch(makeConfig(std::move(topo), 1, 3, &mpi, std::move(runner)));
+
+        size_t barrier_before = mpi.barrier_call_count();
+        orch.clear_cache();
+        EXPECT_EQ(runner_raw->clear_cache_call_count(), 1u);
+        EXPECT_GT(mpi.barrier_call_count(), barrier_before);
     }
 
 } // namespace llaminar2::test

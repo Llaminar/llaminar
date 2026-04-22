@@ -16,6 +16,7 @@
 
 #include "execution/local_execution/orchestrators/IRankOrchestrator.h"
 #include "collective/ILocalTPContext.h"
+#include "tensors/TensorClasses.h"
 #include <vector>
 #include <memory>
 #include <functional>
@@ -50,6 +51,8 @@ namespace llaminar2::test
             std::string architecture = "mock_qwen2"; ///< Architecture name
             int greedy_sample_token = -1;            ///< Token returned by sampleGreedyOnDevice (-1 = not supported)
             int sample_on_device_token = -1;         ///< Token returned by sampleOnDevice (-1 = not supported)
+            bool has_hidden_state = false;       ///< If true, produce a hidden state after forward
+            int hidden_state_dim = 128;          ///< Dimension for generated hidden state
 
             Config() = default;
         };
@@ -81,6 +84,20 @@ namespace llaminar2::test
             }
 
             config_.position += seq_len;
+
+            // Generate a hidden state tensor if configured (for PP testing)
+            if (config_.has_hidden_state)
+            {
+                size_t numel = static_cast<size_t>(seq_len) * config_.hidden_state_dim;
+                hidden_state_ = std::make_shared<FP32Tensor>(std::vector<size_t>{numel});
+                // Fill with a recognizable pattern: rank-based offset + position
+                float *data = hidden_state_->mutable_data();
+                for (size_t i = 0; i < numel; ++i)
+                {
+                    data[i] = static_cast<float>(config_.device_idx * 1000 + i);
+                }
+            }
+
             return true;
         }
 
@@ -125,6 +142,42 @@ namespace llaminar2::test
             return config_.sample_on_device_token;
         }
 
+        TensorBase *getHiddenState() override
+        {
+            return hidden_state_.get();
+        }
+
+        const TensorBase *getHiddenState() const override
+        {
+            return hidden_state_.get();
+        }
+
+        void setHiddenState(TensorBase *hidden_state) override
+        {
+            set_hidden_state_calls_.fetch_add(1, std::memory_order_relaxed);
+            // Store a non-owning reference by wrapping in a shared_ptr with no-op deleter
+            if (hidden_state)
+            {
+                hidden_state_ = std::shared_ptr<TensorBase>(hidden_state, [](TensorBase *) {});
+                hidden_state_was_set_ = true;
+            }
+            else
+            {
+                hidden_state_.reset();
+                hidden_state_was_set_ = false;
+            }
+        }
+
+        bool hasHiddenStateInput() const override
+        {
+            return hidden_state_was_set_;
+        }
+
+        void clearHiddenStateInput() override
+        {
+            hidden_state_was_set_ = false;
+        }
+
         // =====================================================================
         // Test Utilities - Call Tracking
         // =====================================================================
@@ -146,6 +199,19 @@ namespace llaminar2::test
         {
             forward_calls_.store(0, std::memory_order_relaxed);
             clear_cache_calls_.store(0, std::memory_order_relaxed);
+            set_hidden_state_calls_.store(0, std::memory_order_relaxed);
+        }
+
+        size_t set_hidden_state_call_count() const
+        {
+            return set_hidden_state_calls_.load(std::memory_order_relaxed);
+        }
+
+        bool was_hidden_state_set() const { return hidden_state_was_set_; }
+
+        void set_hidden_state_tensor(std::shared_ptr<TensorBase> tensor)
+        {
+            hidden_state_ = std::move(tensor);
         }
 
         // =====================================================================
@@ -162,8 +228,11 @@ namespace llaminar2::test
         Config config_;
         mutable std::atomic<size_t> forward_calls_{0};
         mutable std::atomic<size_t> clear_cache_calls_{0};
+        mutable std::atomic<size_t> set_hidden_state_calls_{0};
         std::vector<int> last_tokens_;
         int last_seq_len_ = 0;
+        std::shared_ptr<TensorBase> hidden_state_;  ///< Hidden state tensor (generated or set externally)
+        bool hidden_state_was_set_ = false;         ///< True if setHiddenState was called
     };
 
     /**
