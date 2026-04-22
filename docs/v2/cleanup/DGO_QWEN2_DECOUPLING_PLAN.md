@@ -273,7 +273,7 @@ Replace `Qwen2ForwardInput` / `Qwen2ForwardOutput` in:
 - `Test__ForwardExecutionEngine.cpp`
 - `Test__ForwardGraphTypes.cpp`
 - `Test__MultiDomainOrchestrator.cpp`
-- `Test__MultiDeviceOrchestrator.cpp`
+- `Test__RankOrchestrator.cpp`
 
 ### D.5 — Update InferenceRunnerFactory.cpp
 
@@ -322,7 +322,7 @@ Should return zero matches.
 | `tests/v2/unit/.../Test__ForwardExecutionEngine.cpp` | Replace types |
 | `tests/v2/unit/.../Test__ForwardGraphTypes.cpp` | Replace types |
 | `tests/v2/unit/.../Test__MultiDomainOrchestrator.cpp` | Replace types |
-| `tests/v2/unit/.../Test__MultiDeviceOrchestrator.cpp` | Replace types |
+| `tests/v2/unit/.../Test__RankOrchestrator.cpp` | Replace types |
 
 ---
 

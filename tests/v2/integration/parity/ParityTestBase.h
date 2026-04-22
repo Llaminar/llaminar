@@ -73,7 +73,7 @@
 #include "execution/factory/InferenceRunnerFactory.h"
 #include "execution/local_execution/orchestrators/IInferenceRunner.h"
 #include "execution/debug/TPSnapshot.h"
-#include "execution/local_execution/orchestrators/MultiDeviceOrchestrator.h"
+#include "execution/local_execution/orchestrators/RankOrchestrator.h"
 #include "execution/local_execution/orchestrators/DeviceGraphOrchestrator.h"
 
 // Pipeline parallelism support
@@ -2118,7 +2118,7 @@ namespace llaminar2::test::parity
          * 1. Verify all devices have consistent data
          * 2. Compare combined output against full PyTorch
          *
-         * @param tp_snapshot The TPSnapshot from MultiDeviceOrchestrator::getTPSnapshot()
+         * @param tp_snapshot The TPSnapshot from RankOrchestrator::getTPSnapshot()
          * @param pytorch_data Full PyTorch reference data
          * @param pytorch_rows Number of rows in PyTorch data (seq_len)
          * @param pytorch_cols Number of columns in PyTorch data (feature_dim)
@@ -2386,7 +2386,7 @@ namespace llaminar2::test::parity
          * @brief Setup pipeline for LocalPP (Pipeline Parallelism) tests
          *
          * Creates a pipeline parallel configuration where layers are split across
-         * multiple devices. Uses MultiDeviceOrchestrator with PP mode which:
+         * multiple devices. Uses RankOrchestrator with PP mode which:
          * - Creates per-stage DeviceGraphOrchestrator instances
          * - Handles sequential forward execution through stages
          * - Manages activation transfer via LocalPPContext
@@ -2466,11 +2466,11 @@ namespace llaminar2::test::parity
                                                             << n_layers << " layers");
             }
 
-            // Create MultiDeviceOrchestrator::Config with PP mode (or TP_PP for hybrid)
-            MultiDeviceOrchestrator::Config mdo_config;
+            // Create RankOrchestrator::Config with PP mode (or TP_PP for hybrid)
+            RankOrchestrator::Config mdo_config;
             mdo_config.mode = cfg().is_hybrid_pp_tp()
-                                  ? MultiDeviceOrchestrator::ParallelismMode::TP_PP
-                                  : MultiDeviceOrchestrator::ParallelismMode::PP;
+                                  ? RankOrchestrator::ParallelismMode::TP_PP
+                                  : RankOrchestrator::ParallelismMode::PP;
             mdo_config.max_seq_len = 4096;
             mdo_config.batch_size = 1;
             mdo_config.activation_precision = ActivationPrecision::FP32;
@@ -2492,7 +2492,7 @@ namespace llaminar2::test::parity
 
             for (int s = 0; s < num_stages; ++s)
             {
-                MultiDeviceOrchestrator::PPStageConfig stage_config;
+                RankOrchestrator::PPStageConfig stage_config;
                 stage_config.first_layer = s * layers_per_stage;
                 stage_config.last_layer = (s == num_stages - 1) ? n_layers : (s + 1) * layers_per_stage;
                 stage_config.has_embedding = (s == 0);
@@ -2544,23 +2544,23 @@ namespace llaminar2::test::parity
             // Validate PP config
             if (!mdo_config.validate())
             {
-                LOG_ERROR("[Parity] Invalid MultiDeviceOrchestrator PP config");
+                LOG_ERROR("[Parity] Invalid RankOrchestrator PP config");
                 return false;
             }
 
-            // Create MultiDeviceOrchestrator with PP mode
-            auto multi_orch = std::make_unique<MultiDeviceOrchestrator>(model_ctx_, mdo_config);
+            // Create RankOrchestrator with PP mode
+            auto multi_orch = std::make_unique<RankOrchestrator>(model_ctx_, mdo_config);
 
             if (!multi_orch)
             {
-                LOG_ERROR("[Parity] Failed to create MultiDeviceOrchestrator for PP");
+                LOG_ERROR("[Parity] Failed to create RankOrchestrator for PP");
                 return false;
             }
 
             // Enable snapshot capture for parity testing
             multi_orch->enableSnapshotCapture();
 
-            LOG_INFO("[Parity] MultiDeviceOrchestrator " << (cfg().is_hybrid_pp_tp() ? "TP_PP" : "PP")
+            LOG_INFO("[Parity] RankOrchestrator " << (cfg().is_hybrid_pp_tp() ? "TP_PP" : "PP")
                                                          << " created with " << num_stages << " stages");
 
             // Transfer ownership to base class runner_
@@ -3237,7 +3237,7 @@ namespace llaminar2::test::parity
          * 1. Per-device partial outputs against corresponding PyTorch slices
          * 2. Combined (concatenated) outputs against full PyTorch reference
          *
-         * Requires runner_ to be a MultiDeviceOrchestrator (will cast and check).
+         * Requires runner_ to be a RankOrchestrator (will cast and check).
          *
          * @return TPParityTestSummary with per-device and combined metrics
          */
@@ -3254,11 +3254,11 @@ namespace llaminar2::test::parity
                     return summary;
             }
 
-            // Try to cast to MultiDeviceOrchestrator for TP snapshot access
-            auto *multi_device = dynamic_cast<MultiDeviceOrchestrator *>(runner_.get());
+            // Try to cast to RankOrchestrator for TP snapshot access
+            auto *multi_device = dynamic_cast<RankOrchestrator *>(runner_.get());
             if (!multi_device)
             {
-                LOG_ERROR("[TP Parity] runner_ is not a MultiDeviceOrchestrator - "
+                LOG_ERROR("[TP Parity] runner_ is not a RankOrchestrator - "
                           "ensure test calls setupLocalTPPipeline() or similar before runTPPrefillParity()");
                 return summary;
             }
@@ -3270,7 +3270,7 @@ namespace llaminar2::test::parity
                 if (dev_runner)
                 {
                     // Use index-based name for simplicity
-                    // MultiDeviceOrchestrator stores device info in config
+                    // RankOrchestrator stores device info in config
                     summary.device_names.push_back("TP_rank_" + std::to_string(i));
                 }
             }
@@ -3621,10 +3621,10 @@ namespace llaminar2::test::parity
             }
 
             // Verify we have a multi-device orchestrator
-            auto *multi_device = dynamic_cast<MultiDeviceOrchestrator *>(runner_.get());
+            auto *multi_device = dynamic_cast<RankOrchestrator *>(runner_.get());
             if (!multi_device)
             {
-                LOG_ERROR("[TP Decode Parity] runner_ is not a MultiDeviceOrchestrator - "
+                LOG_ERROR("[TP Decode Parity] runner_ is not a RankOrchestrator - "
                           "ensure test calls setupLocalTPPipeline() or similar before runTPDecodeParity()");
                 return summary;
             }
@@ -3686,7 +3686,7 @@ namespace llaminar2::test::parity
                 if (!success)
                     continue;
 
-                // Get Llaminar's logits (MultiDeviceOrchestrator gathers from all devices)
+                // Get Llaminar's logits (RankOrchestrator gathers from all devices)
                 const float *llaminar_logits = runner_->logits();
                 if (!llaminar_logits)
                 {

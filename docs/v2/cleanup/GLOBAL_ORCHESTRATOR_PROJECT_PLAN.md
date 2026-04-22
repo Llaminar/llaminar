@@ -11,13 +11,13 @@
 Enable full cross-machine inference over an MPI cluster with multiple hosts.
 The design introduces a **GlobalOrchestrator** that coordinates cross-rank
 pipeline parallelism (PP) and tensor parallelism (TP), delegating per-rank
-execution to **RankOrchestrator** (renamed from `MultiDeviceOrchestrator`).
+execution to **RankOrchestrator** (renamed from `RankOrchestrator`).
 
 ### Three-Tier Orchestration Stack
 
 ```
 GlobalOrchestrator               ← NEW (cross-rank: MPI PP + Global TP)
-  └─ RankOrchestrator            ← RENAME of MultiDeviceOrchestrator (per-rank: local devices)
+  └─ RankOrchestrator            ← RENAME of RankOrchestrator (per-rank: local devices)
        └─ DeviceGraphOrchestrator  ← UNCHANGED (per-device: graph execution)
 ```
 
@@ -75,15 +75,15 @@ GlobalOrchestrator               ← NEW (cross-rank: MPI PP + Global TP)
 
 ---
 
-## Phase 0: Rename `MultiDeviceOrchestrator` → `RankOrchestrator`
+## Phase 0: Rename `RankOrchestrator` → `RankOrchestrator`
 
 **Goal**: Align naming with the three-tier stack before adding new code.
 
 ### Tasks
 
-- [ ] **0.1** Rename `MultiDeviceOrchestrator` → `RankOrchestrator` (class, files, CMake)
-- [ ] **0.2** Rename `IMultiDeviceOrchestrator` → `IRankOrchestrator`
-- [ ] **0.3** Rename `MockMultiDeviceOrchestrator` → `MockRankOrchestrator`
+- [ ] **0.1** Rename `RankOrchestrator` → `RankOrchestrator` (class, files, CMake)
+- [ ] **0.2** Rename `IRankOrchestrator` → `IRankOrchestrator`
+- [ ] **0.3** Rename `MockRankOrchestrator` → `MockRankOrchestrator`
 - [ ] **0.4** Update all `#include` paths, forward declarations, factory references
 - [ ] **0.5** Update docs referencing old name (`MULTI_DEVICE_ARCHITECTURE.md`, `MULTI_DEVICE_ORCHESTRATOR_PLAN.md`, etc.)
 - [ ] **0.6** Full build + full test suite (unit, integration, parity)
@@ -91,20 +91,20 @@ GlobalOrchestrator               ← NEW (cross-rank: MPI PP + Global TP)
 ### Files Affected
 
 ```
-src/v2/execution/local_execution/orchestrators/MultiDeviceOrchestrator.h  → RankOrchestrator.h
-src/v2/execution/local_execution/orchestrators/MultiDeviceOrchestrator.cpp → RankOrchestrator.cpp
-src/v2/execution/local_execution/orchestrators/IMultiDeviceOrchestrator.h → IRankOrchestrator.h
-src/v2/interfaces/IMultiDeviceOrchestrator.h                              → IRankOrchestrator.h
+src/v2/execution/local_execution/orchestrators/RankOrchestrator.h  → RankOrchestrator.h
+src/v2/execution/local_execution/orchestrators/RankOrchestrator.cpp → RankOrchestrator.cpp
+src/v2/execution/local_execution/orchestrators/IRankOrchestrator.h → IRankOrchestrator.h
+src/v2/interfaces/IRankOrchestrator.h                              → IRankOrchestrator.h
 src/v2/execution/factory/InferenceRunnerFactory.h  (forward decl)
-tests/v2/unit/**/MockMultiDeviceOrchestrator.*     → MockRankOrchestrator.*
-tests/v2/unit/**/Test__MultiDeviceOrchestrator.*   → Test__RankOrchestrator.*
+tests/v2/unit/**/MockRankOrchestrator.*     → MockRankOrchestrator.*
+tests/v2/unit/**/Test__RankOrchestrator.*   → Test__RankOrchestrator.*
 ```
 
 ### Acceptance Criteria
 
 - All 397+ unit tests pass
 - All 40+ parity tests pass
-- `grep -r MultiDeviceOrchestrator src/ tests/` returns zero hits
+- `grep -r RankOrchestrator src/ tests/` returns zero hits
 
 ---
 

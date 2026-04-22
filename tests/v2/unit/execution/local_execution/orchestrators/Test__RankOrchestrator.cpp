@@ -1,14 +1,14 @@
 /**
- * @file Test__MultiDeviceOrchestrator.cpp
- * @brief Unit tests for MultiDeviceOrchestrator mocks and interface contract
+ * @file Test__RankOrchestrator.cpp
+ * @brief Unit tests for RankOrchestrator mocks and interface contract
  * @author David Sanftenberg
  * @date January 2026
  *
- * Tests the mock implementations used for testing MultiDeviceOrchestrator
+ * Tests the mock implementations used for testing RankOrchestrator
  * coordination logic. The mocks enable testing LOCAL tensor parallelism
  * coordination without real devices.
  *
- * Note: Tests for the actual MultiDeviceOrchestrator class will be enabled
+ * Note: Tests for the actual RankOrchestrator class will be enabled
  * once the implementation is added to the build.
  */
 
@@ -35,7 +35,7 @@ using namespace llaminar2;
  * @brief Mock inference runner for per-device testing
  *
  * Tracks method calls and provides configurable return values for testing
- * the MultiDeviceOrchestrator coordination logic.
+ * the RankOrchestrator coordination logic.
  */
 class MockDeviceGraphOrchestrator : public IInferenceRunner
 {
@@ -427,12 +427,12 @@ private:
 // =============================================================================
 
 /**
- * @brief Test fixture for MultiDeviceOrchestrator tests
+ * @brief Test fixture for RankOrchestrator tests
  *
  * Provides helper methods to create mock orchestrators with different
  * configurations.
  */
-class Test__MultiDeviceOrchestrator : public ::testing::Test
+class Test__RankOrchestrator : public ::testing::Test
 {
 protected:
     void SetUp() override
@@ -468,7 +468,7 @@ protected:
 // Construction Tests
 // =============================================================================
 
-TEST_F(Test__MultiDeviceOrchestrator, ConstructsWithValidConfig)
+TEST_F(Test__RankOrchestrator, ConstructsWithValidConfig)
 {
     // Verify mock setup is valid
     ASSERT_EQ(mock_runners_.size(), 2u);
@@ -476,7 +476,7 @@ TEST_F(Test__MultiDeviceOrchestrator, ConstructsWithValidConfig)
     EXPECT_EQ(mock_tp_ctx_->degree(), 2);
 }
 
-TEST_F(Test__MultiDeviceOrchestrator, MockTPContextDegreeMatchesDevices)
+TEST_F(Test__RankOrchestrator, MockTPContextDegreeMatchesDevices)
 {
     // Create TP context with 3 devices
     MockLocalTPContext::Config tp_config;
@@ -494,7 +494,7 @@ TEST_F(Test__MultiDeviceOrchestrator, MockTPContextDegreeMatchesDevices)
 // Mock Device Runner Tests
 // =============================================================================
 
-TEST_F(Test__MultiDeviceOrchestrator, MockDeviceRunnerForwardTracksCallCount)
+TEST_F(Test__RankOrchestrator, MockDeviceRunnerForwardTracksCallCount)
 {
     auto runner = std::make_unique<MockDeviceGraphOrchestrator>();
     int tokens[] = {1, 2, 3};
@@ -510,7 +510,7 @@ TEST_F(Test__MultiDeviceOrchestrator, MockDeviceRunnerForwardTracksCallCount)
     EXPECT_EQ(runner->forward_call_count(), 2u);
 }
 
-TEST_F(Test__MultiDeviceOrchestrator, MockDeviceRunnerClearCacheTracksCallCount)
+TEST_F(Test__RankOrchestrator, MockDeviceRunnerClearCacheTracksCallCount)
 {
     auto runner = std::make_unique<MockDeviceGraphOrchestrator>();
 
@@ -523,7 +523,7 @@ TEST_F(Test__MultiDeviceOrchestrator, MockDeviceRunnerClearCacheTracksCallCount)
     EXPECT_EQ(runner->clear_cache_call_count(), 2u);
 }
 
-TEST_F(Test__MultiDeviceOrchestrator, MockDeviceRunnerReturnsConfiguredVocabSize)
+TEST_F(Test__RankOrchestrator, MockDeviceRunnerReturnsConfiguredVocabSize)
 {
     MockDeviceGraphOrchestrator::Config config;
     config.vocab_size = 50000;
@@ -532,7 +532,7 @@ TEST_F(Test__MultiDeviceOrchestrator, MockDeviceRunnerReturnsConfiguredVocabSize
     EXPECT_EQ(runner->vocab_size(), 50000);
 }
 
-TEST_F(Test__MultiDeviceOrchestrator, MockDeviceRunnerForwardCanFail)
+TEST_F(Test__RankOrchestrator, MockDeviceRunnerForwardCanFail)
 {
     auto runner = std::make_unique<MockDeviceGraphOrchestrator>();
     runner->set_forward_fails(true);
@@ -544,7 +544,7 @@ TEST_F(Test__MultiDeviceOrchestrator, MockDeviceRunnerForwardCanFail)
     EXPECT_EQ(runner->forward_call_count(), 1u); // Still tracked
 }
 
-TEST_F(Test__MultiDeviceOrchestrator, MockDeviceRunnerReturnsLogits)
+TEST_F(Test__RankOrchestrator, MockDeviceRunnerReturnsLogits)
 {
     auto runner = std::make_unique<MockDeviceGraphOrchestrator>();
     runner->set_mock_logits({1.0f, 2.0f, 3.0f, 4.0f, 5.0f});
@@ -555,7 +555,7 @@ TEST_F(Test__MultiDeviceOrchestrator, MockDeviceRunnerReturnsLogits)
     EXPECT_FLOAT_EQ(logits[4], 5.0f);
 }
 
-TEST_F(Test__MultiDeviceOrchestrator, MockDeviceRunnerReturnsArchitecture)
+TEST_F(Test__RankOrchestrator, MockDeviceRunnerReturnsArchitecture)
 {
     MockDeviceGraphOrchestrator::Config config;
     config.architecture = "test_arch";
@@ -564,7 +564,7 @@ TEST_F(Test__MultiDeviceOrchestrator, MockDeviceRunnerReturnsArchitecture)
     EXPECT_STREQ(runner->architecture(), "test_arch");
 }
 
-TEST_F(Test__MultiDeviceOrchestrator, MockDeviceRunnerReturnsGraphExecutionPath)
+TEST_F(Test__RankOrchestrator, MockDeviceRunnerReturnsGraphExecutionPath)
 {
     auto runner = std::make_unique<MockDeviceGraphOrchestrator>();
     EXPECT_EQ(runner->executionPath(), ExecutionPath::GRAPH);
@@ -574,7 +574,7 @@ TEST_F(Test__MultiDeviceOrchestrator, MockDeviceRunnerReturnsGraphExecutionPath)
 // Mock TP Context Tests
 // =============================================================================
 
-TEST_F(Test__MultiDeviceOrchestrator, MockTPContextReturnsConfiguredDevices)
+TEST_F(Test__RankOrchestrator, MockTPContextReturnsConfiguredDevices)
 {
     MockLocalTPContext::Config config;
     config.devices = {GlobalDeviceAddress::cuda(0), GlobalDeviceAddress::cuda(1)};
@@ -585,7 +585,7 @@ TEST_F(Test__MultiDeviceOrchestrator, MockTPContextReturnsConfiguredDevices)
     EXPECT_EQ(ctx->devices()[1], GlobalDeviceAddress::cuda(1));
 }
 
-TEST_F(Test__MultiDeviceOrchestrator, MockTPContextReturnsConfiguredWeights)
+TEST_F(Test__RankOrchestrator, MockTPContextReturnsConfiguredWeights)
 {
     MockLocalTPContext::Config config;
     config.devices = {GlobalDeviceAddress::cpu(), GlobalDeviceAddress::cpu()};
@@ -597,7 +597,7 @@ TEST_F(Test__MultiDeviceOrchestrator, MockTPContextReturnsConfiguredWeights)
     EXPECT_FLOAT_EQ(ctx->weights()[1], 0.3f);
 }
 
-TEST_F(Test__MultiDeviceOrchestrator, MockTPContextSynchronizeTracksCallCount)
+TEST_F(Test__RankOrchestrator, MockTPContextSynchronizeTracksCallCount)
 {
     auto ctx = std::make_unique<MockLocalTPContext>();
 
@@ -611,7 +611,7 @@ TEST_F(Test__MultiDeviceOrchestrator, MockTPContextSynchronizeTracksCallCount)
     EXPECT_EQ(ctx->synchronize_call_count(), 3u);
 }
 
-TEST_F(Test__MultiDeviceOrchestrator, MockTPContextAllreduceReturnsTrue)
+TEST_F(Test__RankOrchestrator, MockTPContextAllreduceReturnsTrue)
 {
     auto ctx = std::make_unique<MockLocalTPContext>();
 
@@ -620,7 +620,7 @@ TEST_F(Test__MultiDeviceOrchestrator, MockTPContextAllreduceReturnsTrue)
     EXPECT_EQ(ctx->allreduce_call_count(), 1u);
 }
 
-TEST_F(Test__MultiDeviceOrchestrator, MockTPContextAllreduceCanFail)
+TEST_F(Test__RankOrchestrator, MockTPContextAllreduceCanFail)
 {
     auto ctx = std::make_unique<MockLocalTPContext>();
     ctx->set_allreduce_fails(true);
@@ -630,7 +630,7 @@ TEST_F(Test__MultiDeviceOrchestrator, MockTPContextAllreduceCanFail)
     EXPECT_EQ(ctx->allreduce_call_count(), 1u); // Still tracked
 }
 
-TEST_F(Test__MultiDeviceOrchestrator, MockTPContextAllgatherReturnsTrue)
+TEST_F(Test__RankOrchestrator, MockTPContextAllgatherReturnsTrue)
 {
     auto ctx = std::make_unique<MockLocalTPContext>();
 
@@ -639,7 +639,7 @@ TEST_F(Test__MultiDeviceOrchestrator, MockTPContextAllgatherReturnsTrue)
     EXPECT_EQ(ctx->allgather_call_count(), 1u);
 }
 
-TEST_F(Test__MultiDeviceOrchestrator, MockTPContextDeviceIndexing)
+TEST_F(Test__RankOrchestrator, MockTPContextDeviceIndexing)
 {
     MockLocalTPContext::Config config;
     config.devices = {GlobalDeviceAddress::cuda(0), GlobalDeviceAddress::rocm(1)};
@@ -650,7 +650,7 @@ TEST_F(Test__MultiDeviceOrchestrator, MockTPContextDeviceIndexing)
     EXPECT_EQ(ctx->indexForDevice(GlobalDeviceAddress::cpu()), -1); // Not found
 }
 
-TEST_F(Test__MultiDeviceOrchestrator, MockTPContextDeviceAtReturnsCorrectDevice)
+TEST_F(Test__RankOrchestrator, MockTPContextDeviceAtReturnsCorrectDevice)
 {
     MockLocalTPContext::Config config;
     config.devices = {GlobalDeviceAddress::cuda(0), GlobalDeviceAddress::cuda(1)};
@@ -660,7 +660,7 @@ TEST_F(Test__MultiDeviceOrchestrator, MockTPContextDeviceAtReturnsCorrectDevice)
     EXPECT_EQ(ctx->deviceAt(1), GlobalDeviceAddress::cuda(1));
 }
 
-TEST_F(Test__MultiDeviceOrchestrator, MockTPContextDeviceAtThrowsForInvalidIndex)
+TEST_F(Test__RankOrchestrator, MockTPContextDeviceAtThrowsForInvalidIndex)
 {
     auto ctx = std::make_unique<MockLocalTPContext>();
 
@@ -668,7 +668,7 @@ TEST_F(Test__MultiDeviceOrchestrator, MockTPContextDeviceAtThrowsForInvalidIndex
     EXPECT_THROW(ctx->deviceAt(99), std::out_of_range);
 }
 
-TEST_F(Test__MultiDeviceOrchestrator, MockTPContextWeightForDevice)
+TEST_F(Test__RankOrchestrator, MockTPContextWeightForDevice)
 {
     MockLocalTPContext::Config config;
     config.devices = {GlobalDeviceAddress::cuda(0), GlobalDeviceAddress::cuda(1)};
@@ -680,7 +680,7 @@ TEST_F(Test__MultiDeviceOrchestrator, MockTPContextWeightForDevice)
     EXPECT_FLOAT_EQ(ctx->weightForDevice(GlobalDeviceAddress::cpu()), 0.0f); // Not found
 }
 
-TEST_F(Test__MultiDeviceOrchestrator, MockTPContextHeadsForDevice)
+TEST_F(Test__RankOrchestrator, MockTPContextHeadsForDevice)
 {
     MockLocalTPContext::Config config;
     config.devices = {GlobalDeviceAddress::cpu(), GlobalDeviceAddress::cpu()};
@@ -696,7 +696,7 @@ TEST_F(Test__MultiDeviceOrchestrator, MockTPContextHeadsForDevice)
 // Integration: Multi-Runner Coordination Tests
 // =============================================================================
 
-TEST_F(Test__MultiDeviceOrchestrator, AllDevicesReadyWhenAllHaveVocabSize)
+TEST_F(Test__RankOrchestrator, AllDevicesReadyWhenAllHaveVocabSize)
 {
     // Verify that when all mock runners have valid vocab_size, allDevicesReady would return true
     // (Testing the mock behavior that the real orchestrator uses)
@@ -707,9 +707,9 @@ TEST_F(Test__MultiDeviceOrchestrator, AllDevicesReadyWhenAllHaveVocabSize)
     EXPECT_EQ(mock_runners_.size(), 2u);
 }
 
-TEST_F(Test__MultiDeviceOrchestrator, MultipleRunnersCanBeCalledInParallel)
+TEST_F(Test__RankOrchestrator, MultipleRunnersCanBeCalledInParallel)
 {
-    // Simulate what MultiDeviceOrchestrator does: call forward on all runners
+    // Simulate what RankOrchestrator does: call forward on all runners
     int tokens[] = {1, 2, 3};
 
     // Call forward on all mock runners
@@ -729,14 +729,14 @@ TEST_F(Test__MultiDeviceOrchestrator, MultipleRunnersCanBeCalledInParallel)
     }
 }
 
-TEST_F(Test__MultiDeviceOrchestrator, ForwardFailsIfAnyDeviceFails)
+TEST_F(Test__RankOrchestrator, ForwardFailsIfAnyDeviceFails)
 {
     // Set one runner to fail
     mock_runners_[1]->set_forward_fails(true);
 
     int tokens[] = {1, 2, 3};
 
-    // Simulate MultiDeviceOrchestrator::forward
+    // Simulate RankOrchestrator::forward
     bool all_success = true;
     for (auto &runner : mock_runners_)
     {
@@ -752,9 +752,9 @@ TEST_F(Test__MultiDeviceOrchestrator, ForwardFailsIfAnyDeviceFails)
     EXPECT_EQ(mock_runners_[1]->forward_call_count(), 1u);
 }
 
-TEST_F(Test__MultiDeviceOrchestrator, ClearCacheClearsAllDevices)
+TEST_F(Test__RankOrchestrator, ClearCacheClearsAllDevices)
 {
-    // Simulate MultiDeviceOrchestrator::clear_cache
+    // Simulate RankOrchestrator::clear_cache
     for (auto &runner : mock_runners_)
     {
         runner->clear_cache();
@@ -766,13 +766,13 @@ TEST_F(Test__MultiDeviceOrchestrator, ClearCacheClearsAllDevices)
     }
 }
 
-TEST_F(Test__MultiDeviceOrchestrator, LogitsReturnsFromPrimaryDevice)
+TEST_F(Test__RankOrchestrator, LogitsReturnsFromPrimaryDevice)
 {
     // Set different logits on each runner
     mock_runners_[0]->set_mock_logits({10.0f, 20.0f, 30.0f});
     mock_runners_[1]->set_mock_logits({1.0f, 2.0f, 3.0f});
 
-    // Simulate MultiDeviceOrchestrator::logits (returns from primary device)
+    // Simulate RankOrchestrator::logits (returns from primary device)
     const float *logits = mock_runners_[0]->logits();
 
     ASSERT_NE(logits, nullptr);
@@ -781,32 +781,32 @@ TEST_F(Test__MultiDeviceOrchestrator, LogitsReturnsFromPrimaryDevice)
     EXPECT_FLOAT_EQ(logits[2], 30.0f);
 }
 
-TEST_F(Test__MultiDeviceOrchestrator, VocabSizeFromPrimaryDevice)
+TEST_F(Test__RankOrchestrator, VocabSizeFromPrimaryDevice)
 {
     mock_runners_[0]->set_vocab_size(50000);
     mock_runners_[1]->set_vocab_size(32000);
 
-    // Simulate MultiDeviceOrchestrator::vocab_size (returns from primary device)
+    // Simulate RankOrchestrator::vocab_size (returns from primary device)
     int vocab = mock_runners_[0]->vocab_size();
 
     EXPECT_EQ(vocab, 50000);
 }
 
-TEST_F(Test__MultiDeviceOrchestrator, SynchronizeDevicesCallsTPContext)
+TEST_F(Test__RankOrchestrator, SynchronizeDevicesCallsTPContext)
 {
-    // Simulate MultiDeviceOrchestrator::synchronizeDevices
+    // Simulate RankOrchestrator::synchronizeDevices
     mock_tp_ctx_->synchronize();
 
     EXPECT_EQ(mock_tp_ctx_->synchronize_call_count(), 1u);
 }
 
-TEST_F(Test__MultiDeviceOrchestrator, DeviceCountMatchesTPDegree)
+TEST_F(Test__RankOrchestrator, DeviceCountMatchesTPDegree)
 {
     // Verify TP context degree matches expected device count
     EXPECT_EQ(mock_tp_ctx_->degree(), static_cast<int>(mock_runners_.size()));
 }
 
-TEST_F(Test__MultiDeviceOrchestrator, LocalTPContextReturnsContext)
+TEST_F(Test__RankOrchestrator, LocalTPContextReturnsContext)
 {
     // Verify mock TP context is valid
     ASSERT_NE(mock_tp_ctx_, nullptr);
@@ -818,7 +818,7 @@ TEST_F(Test__MultiDeviceOrchestrator, LocalTPContextReturnsContext)
 // Edge Cases and Error Handling
 // =============================================================================
 
-TEST_F(Test__MultiDeviceOrchestrator, EmptyDeviceRunnersReturnsSafeDefaults)
+TEST_F(Test__RankOrchestrator, EmptyDeviceRunnersReturnsSafeDefaults)
 {
     std::vector<std::unique_ptr<MockDeviceGraphOrchestrator>> empty_runners;
 
@@ -826,7 +826,7 @@ TEST_F(Test__MultiDeviceOrchestrator, EmptyDeviceRunnersReturnsSafeDefaults)
     EXPECT_TRUE(empty_runners.empty());
 }
 
-TEST_F(Test__MultiDeviceOrchestrator, SingleTPContextWithOneDevice)
+TEST_F(Test__RankOrchestrator, SingleTPContextWithOneDevice)
 {
     // Test TP context with single device - should work but is unusual
     MockLocalTPContext::Config config;
@@ -838,7 +838,7 @@ TEST_F(Test__MultiDeviceOrchestrator, SingleTPContextWithOneDevice)
     EXPECT_FLOAT_EQ(ctx->weights()[0], 1.0f);
 }
 
-TEST_F(Test__MultiDeviceOrchestrator, MockRunnerPositionUpdatesOnForward)
+TEST_F(Test__RankOrchestrator, MockRunnerPositionUpdatesOnForward)
 {
     auto runner = std::make_unique<MockDeviceGraphOrchestrator>();
     int tokens[] = {1, 2, 3, 4, 5};
@@ -852,7 +852,7 @@ TEST_F(Test__MultiDeviceOrchestrator, MockRunnerPositionUpdatesOnForward)
     EXPECT_EQ(runner->get_position(), 8);
 }
 
-TEST_F(Test__MultiDeviceOrchestrator, MockRunnerClearCacheResetsPosition)
+TEST_F(Test__RankOrchestrator, MockRunnerClearCacheResetsPosition)
 {
     auto runner = std::make_unique<MockDeviceGraphOrchestrator>();
     int tokens[] = {1, 2, 3};
@@ -864,7 +864,7 @@ TEST_F(Test__MultiDeviceOrchestrator, MockRunnerClearCacheResetsPosition)
     EXPECT_EQ(runner->get_position(), 0);
 }
 
-TEST_F(Test__MultiDeviceOrchestrator, MockTPContextRowRangeCalculation)
+TEST_F(Test__RankOrchestrator, MockTPContextRowRangeCalculation)
 {
     MockLocalTPContext::Config config;
     // Use distinct devices so indexForDevice can differentiate them
@@ -884,7 +884,7 @@ TEST_F(Test__MultiDeviceOrchestrator, MockTPContextRowRangeCalculation)
     EXPECT_EQ(end1, 100);
 }
 
-TEST_F(Test__MultiDeviceOrchestrator, MockTPContextColRangeMatchesRowRange)
+TEST_F(Test__RankOrchestrator, MockTPContextColRangeMatchesRowRange)
 {
     MockLocalTPContext::Config config;
     // Use distinct devices so indexForDevice can differentiate them
@@ -898,7 +898,7 @@ TEST_F(Test__MultiDeviceOrchestrator, MockTPContextColRangeMatchesRowRange)
     EXPECT_EQ(row_range, col_range);
 }
 
-TEST_F(Test__MultiDeviceOrchestrator, ResetCallCountsWorks)
+TEST_F(Test__RankOrchestrator, ResetCallCountsWorks)
 {
     auto runner = std::make_unique<MockDeviceGraphOrchestrator>();
     int tokens[] = {1, 2, 3};
@@ -915,7 +915,7 @@ TEST_F(Test__MultiDeviceOrchestrator, ResetCallCountsWorks)
     EXPECT_EQ(runner->clear_cache_call_count(), 0u);
 }
 
-TEST_F(Test__MultiDeviceOrchestrator, MockTPContextResetCallCountsWorks)
+TEST_F(Test__RankOrchestrator, MockTPContextResetCallCountsWorks)
 {
     mock_tp_ctx_->synchronize();
     mock_tp_ctx_->allreduce(static_cast<TensorBase *>(nullptr));
@@ -936,7 +936,7 @@ TEST_F(Test__MultiDeviceOrchestrator, MockTPContextResetCallCountsWorks)
 // for column-parallel stages. The fix ensures local_cols is properly computed
 // from hidden_size/tp_degree rather than using flattened size.
 
-TEST_F(Test__MultiDeviceOrchestrator, TPSnapshot_ColumnParallel_CorrectRowsColsForSingleRowData)
+TEST_F(Test__RankOrchestrator, TPSnapshot_ColumnParallel_CorrectRowsColsForSingleRowData)
 {
     // Test case: Single-row column-parallel data (typical decode case)
     // hidden_size=896, tp_degree=2, local_cols=448, seq_len=1
@@ -981,7 +981,7 @@ TEST_F(Test__MultiDeviceOrchestrator, TPSnapshot_ColumnParallel_CorrectRowsColsF
     EXPECT_FLOAT_EQ(snapshot.combined_data[895], 2.0f); // Last from device 1
 }
 
-TEST_F(Test__MultiDeviceOrchestrator, TPSnapshot_ColumnParallel_CorrectRowsColsForMultiRowData)
+TEST_F(Test__RankOrchestrator, TPSnapshot_ColumnParallel_CorrectRowsColsForMultiRowData)
 {
     // Test case: Multi-row column-parallel data (typical prefill case)
     // hidden_size=896, tp_degree=2, local_cols=448, seq_len=9
@@ -1051,7 +1051,7 @@ TEST_F(Test__MultiDeviceOrchestrator, TPSnapshot_ColumnParallel_CorrectRowsColsF
     EXPECT_FLOAT_EQ(snapshot.combined_data[row5_offset + 448], 51.0f); // Row 5, dev1
 }
 
-TEST_F(Test__MultiDeviceOrchestrator, TPSnapshot_ColumnParallel_WrongColsBreaksCombine)
+TEST_F(Test__RankOrchestrator, TPSnapshot_ColumnParallel_WrongColsBreaksCombine)
 {
     // Test case: What happens if cols is incorrectly set to flattened size?
     // This was the BUG: cols=4032 instead of cols=448
@@ -1132,7 +1132,7 @@ TEST_F(Test__MultiDeviceOrchestrator, TPSnapshot_ColumnParallel_WrongColsBreaksC
     EXPECT_NE(buggy_snapshot.combined_cols, snapshot.combined_cols);
 }
 
-TEST_F(Test__MultiDeviceOrchestrator, TPSnapshot_ColumnParallel_ProportionalWeights)
+TEST_F(Test__RankOrchestrator, TPSnapshot_ColumnParallel_ProportionalWeights)
 {
     // Test case: Proportional TP with 73%/27% split (heterogeneous GPUs)
     // hidden_size=896, device0 gets 73% = 654 cols, device1 gets 27% = 242 cols
@@ -1178,7 +1178,7 @@ TEST_F(Test__MultiDeviceOrchestrator, TPSnapshot_ColumnParallel_ProportionalWeig
     EXPECT_FLOAT_EQ(snapshot.combined_data[total_cols - 1], 2.0f); // Last col from dev1
 }
 
-TEST_F(Test__MultiDeviceOrchestrator, TPSnapshot_Replicated_SingleRowMultipleDevices)
+TEST_F(Test__RankOrchestrator, TPSnapshot_Replicated_SingleRowMultipleDevices)
 {
     // Test case: Replicated stage (same output on all devices)
     // Each device has full [1, 896] output

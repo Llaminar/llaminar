@@ -11,7 +11,7 @@ The Llaminar V2 orchestration architecture has **three distinct layers** designe
 | **Layer 2** | `OrchestrationRunner` | ✅ Implemented | But NOT wired to Main.cpp |
 | **Layer 2** | `TPPPValidator` | ✅ Implemented | But NOT called in Main.cpp path |
 | **Layer 3** | `DeviceGraphOrchestrator` | ✅ Implemented | Single-device graph execution |
-| **Layer 3** | `MultiDeviceOrchestrator` | ✅ Implemented | LOCAL TP across devices |
+| **Layer 3** | `RankOrchestrator` | ✅ Implemented | LOCAL TP across devices |
 | **Layer 3** | `MultiDomainOrchestrator` | ⚠️ Stub | PP composition unimplemented |
 | **Main.cpp** | Integration | ❌ Broken | Uses old path, ignores new orchestration |
 
@@ -76,7 +76,7 @@ The Llaminar V2 orchestration architecture has **three distinct layers** designe
        OrchestrationRunner (Phase 3)             │
    Creates appropriate orchestrator:             │
    - DeviceGraphOrchestrator (single device)     │
-   - MultiDeviceOrchestrator (LOCAL TP)          │
+   - RankOrchestrator (LOCAL TP)          │
    - MultiDomainOrchestrator (PP + TP)           │
 
 ```
@@ -196,7 +196,7 @@ Main.cpp → DeviceOrchestrator (legacy) → InferenceRunnerFactory → DeviceGr
 **Required Flow**:
 ```
 Main.cpp → OrchestrationConfigParser → ExecutionPlanBuilder → OrchestrationRunner 
-         → (MultiDomainOrchestrator | MultiDeviceOrchestrator | DeviceGraphOrchestrator)
+         → (MultiDomainOrchestrator | RankOrchestrator | DeviceGraphOrchestrator)
 ```
 
 ## Gap 4: Pipeline Parallel Unfinished

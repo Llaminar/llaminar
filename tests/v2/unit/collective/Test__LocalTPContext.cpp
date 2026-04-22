@@ -1017,7 +1017,7 @@ TEST_F(Test__LocalTPContext, ConcurrentSynchronizeDoesNotCrash)
 }
 
 // =============================================================================
-// GatherFromDevices Tests (for MultiDeviceOrchestrator support)
+// GatherFromDevices Tests (for RankOrchestrator support)
 // =============================================================================
 
 /**

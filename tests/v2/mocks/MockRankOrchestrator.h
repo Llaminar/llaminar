@@ -1,9 +1,9 @@
 /**
- * @file MockMultiDeviceOrchestrator.h
- * @brief Mock implementation of IMultiDeviceOrchestrator for unit testing
+ * @file MockRankOrchestrator.h
+ * @brief Mock implementation of IRankOrchestrator for unit testing
  *
  * This mock enables:
- * - Testing code that depends on IMultiDeviceOrchestrator without real devices
+ * - Testing code that depends on IRankOrchestrator without real devices
  * - Configuring mock per-device runners
  * - Failure injection for robustness testing
  * - Call tracking for behavior verification
@@ -14,7 +14,7 @@
 
 #pragma once
 
-#include "execution/local_execution/orchestrators/IMultiDeviceOrchestrator.h"
+#include "execution/local_execution/orchestrators/IRankOrchestrator.h"
 #include "collective/ILocalTPContext.h"
 #include <vector>
 #include <memory>
@@ -29,7 +29,7 @@ namespace llaminar2::test
 {
 
     /**
-     * @brief Mock inference runner for use as device runners within MockMultiDeviceOrchestrator
+     * @brief Mock inference runner for use as device runners within MockRankOrchestrator
      *
      * Lightweight mock that implements IInferenceRunner for testing device runner access.
      * Can be configured with mock logits and failure modes.
@@ -453,13 +453,13 @@ namespace llaminar2::test
      * Usage:
      * @code
      * // Simple construction with Builder
-     * auto mock = MockMultiDeviceOrchestrator::Builder()
+     * auto mock = MockRankOrchestrator::Builder()
      *     .withDeviceCount(2)
      *     .withVocabSize(32000)
      *     .withMockLogits({1.0f, 2.0f, 3.0f})  // Same for all devices
      *     .build();
      *
-     * // Use as IMultiDeviceOrchestrator
+     * // Use as IRankOrchestrator
      * mock->forward(tokens, seq_len);
      *
      * // Verify behavior
@@ -471,7 +471,7 @@ namespace llaminar2::test
      * EXPECT_EQ(runner0->forward_call_count(), 1);
      * @endcode
      */
-    class MockMultiDeviceOrchestrator : public IMultiDeviceOrchestrator
+    class MockRankOrchestrator : public IRankOrchestrator
     {
     public:
         // =====================================================================
@@ -501,7 +501,7 @@ namespace llaminar2::test
         };
 
         /**
-         * @brief Builder pattern for MockMultiDeviceOrchestrator configuration
+         * @brief Builder pattern for MockRankOrchestrator configuration
          */
         class Builder
         {
@@ -572,15 +572,15 @@ namespace llaminar2::test
             }
 
             /// Build the mock orchestrator
-            std::unique_ptr<MockMultiDeviceOrchestrator> build()
+            std::unique_ptr<MockRankOrchestrator> build()
             {
-                return std::make_unique<MockMultiDeviceOrchestrator>(config_);
+                return std::make_unique<MockRankOrchestrator>(config_);
             }
 
             /// Build as shared_ptr
-            std::shared_ptr<MockMultiDeviceOrchestrator> buildShared()
+            std::shared_ptr<MockRankOrchestrator> buildShared()
             {
-                return std::make_shared<MockMultiDeviceOrchestrator>(config_);
+                return std::make_shared<MockRankOrchestrator>(config_);
             }
 
         private:
@@ -594,7 +594,7 @@ namespace llaminar2::test
         /**
          * @brief Create a single-device mock (no TP)
          */
-        static std::unique_ptr<MockMultiDeviceOrchestrator> singleDevice()
+        static std::unique_ptr<MockRankOrchestrator> singleDevice()
         {
             return Builder()
                 .withDeviceCount(1)
@@ -605,7 +605,7 @@ namespace llaminar2::test
          * @brief Create a multi-device mock with equal weights
          * @param device_count Number of devices
          */
-        static std::unique_ptr<MockMultiDeviceOrchestrator> multiDevice(int device_count)
+        static std::unique_ptr<MockRankOrchestrator> multiDevice(int device_count)
         {
             return Builder()
                 .withDeviceCount(device_count)
@@ -615,7 +615,7 @@ namespace llaminar2::test
         /**
          * @brief Create a mock that simulates forward failure
          */
-        static std::unique_ptr<MockMultiDeviceOrchestrator> failingForward()
+        static std::unique_ptr<MockRankOrchestrator> failingForward()
         {
             return Builder()
                 .withDeviceCount(2)
@@ -626,7 +626,7 @@ namespace llaminar2::test
         /**
          * @brief Create a mock that simulates collective failure
          */
-        static std::unique_ptr<MockMultiDeviceOrchestrator> failingCollectives()
+        static std::unique_ptr<MockRankOrchestrator> failingCollectives()
         {
             return Builder()
                 .withDeviceCount(2)
@@ -641,21 +641,21 @@ namespace llaminar2::test
         /**
          * @brief Default constructor (single device)
          */
-        MockMultiDeviceOrchestrator()
-            : MockMultiDeviceOrchestrator(Config{}) {}
+        MockRankOrchestrator()
+            : MockRankOrchestrator(Config{}) {}
 
         /**
          * @brief Construct with configuration
          * @param config Configuration options
          */
-        explicit MockMultiDeviceOrchestrator(const Config &config)
+        explicit MockRankOrchestrator(const Config &config)
             : config_(config)
         {
             // Validate configuration
             if (config_.device_count < 1)
             {
                 throw std::invalid_argument(
-                    "MockMultiDeviceOrchestrator: device_count must be >= 1. Got " +
+                    "MockRankOrchestrator: device_count must be >= 1. Got " +
                     std::to_string(config_.device_count));
             }
 
@@ -769,7 +769,7 @@ namespace llaminar2::test
         }
 
         // =====================================================================
-        // IMultiDeviceOrchestrator Implementation
+        // IRankOrchestrator Implementation
         // =====================================================================
 
         int device_count() const override
@@ -782,7 +782,7 @@ namespace llaminar2::test
             if (device_idx < 0 || device_idx >= static_cast<int>(device_runners_.size()))
             {
                 throw std::out_of_range(
-                    "MockMultiDeviceOrchestrator::deviceRunner: device_idx out of range. Got " +
+                    "MockRankOrchestrator::deviceRunner: device_idx out of range. Got " +
                     std::to_string(device_idx) + ", device_count=" + std::to_string(device_count()));
             }
             return device_runners_[device_idx].get();
@@ -793,7 +793,7 @@ namespace llaminar2::test
             if (device_idx < 0 || device_idx >= static_cast<int>(device_runners_.size()))
             {
                 throw std::out_of_range(
-                    "MockMultiDeviceOrchestrator::deviceRunner: device_idx out of range. Got " +
+                    "MockRankOrchestrator::deviceRunner: device_idx out of range. Got " +
                     std::to_string(device_idx) + ", device_count=" + std::to_string(device_count()));
             }
             return device_runners_[device_idx].get();
@@ -941,7 +941,7 @@ namespace llaminar2::test
         std::string description() const
         {
             std::ostringstream oss;
-            oss << "MockMultiDeviceOrchestrator{devices=" << config_.device_count
+            oss << "MockRankOrchestrator{devices=" << config_.device_count
                 << ", vocab_size=" << config_.vocab_size
                 << ", forward_calls=" << forward_call_count()
                 << ", position=" << position_ << "}";

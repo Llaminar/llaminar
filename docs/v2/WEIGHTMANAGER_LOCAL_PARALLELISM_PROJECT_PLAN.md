@@ -99,14 +99,14 @@ Implementation mirrors the calculation in `InferenceRunnerFactory.cpp:294-369`:
 - Compute cumulative `head_start`, `kv_head_start`, `d_ff_start`, `vocab_start`
 - Last device gets remainder for exact totals
 
-#### 1.2 Set TensorParallelConfig in MultiDeviceOrchestrator
+#### 1.2 Set TensorParallelConfig in RankOrchestrator
 
-**File**: `src/v2/execution/MultiDeviceOrchestrator.cpp`
+**File**: `src/v2/execution/RankOrchestrator.cpp`
 
 In `initializeDeviceRunners()`, before the device loop:
 
 ```cpp
-void MultiDeviceOrchestrator::initializeDeviceRunners()
+void RankOrchestrator::initializeDeviceRunners()
 {
     // ... existing validation ...
 
@@ -134,7 +134,7 @@ void MultiDeviceOrchestrator::initializeDeviceRunners()
             
             weight_mgr->setTensorParallelConfig(tp_config);
             
-            LOG_INFO("MultiDeviceOrchestrator: Set TensorParallelConfig for LOCAL TP ("
+            LOG_INFO("RankOrchestrator: Set TensorParallelConfig for LOCAL TP ("
                      << tp_ctx_->degree() << " devices)");
         }
     }
@@ -389,7 +389,7 @@ static std::shared_ptr<TensorBase> sliceColumnRange(
 | `src/v2/config/TensorParallelConfig.cpp` | Implement factory method |
 | `src/v2/loaders/WeightManager.h` | Add `getShardedWeightForAssignment()`, helpers |
 | `src/v2/loaders/WeightManager.cpp` | Implement device-aware slicing |
-| `src/v2/execution/MultiDeviceOrchestrator.cpp` | Build and set TensorParallelConfig |
+| `src/v2/execution/RankOrchestrator.cpp` | Build and set TensorParallelConfig |
 
 ---
 
@@ -755,12 +755,12 @@ DeviceShardingAssignment {
 };
 ```
 
-#### 3.3 Modify MultiDeviceOrchestrator for Compositions
+#### 3.3 Modify RankOrchestrator for Compositions
 
-**File**: `src/v2/execution/MultiDeviceOrchestrator.h`
+**File**: `src/v2/execution/RankOrchestrator.h`
 
 ```cpp
-class MultiDeviceOrchestrator : public IMultiDeviceOrchestrator
+class RankOrchestrator : public IRankOrchestrator
 {
     // ... existing members ...
 
@@ -773,10 +773,10 @@ private:
 };
 ```
 
-**File**: `src/v2/execution/MultiDeviceOrchestrator.cpp`
+**File**: `src/v2/execution/RankOrchestrator.cpp`
 
 ```cpp
-void MultiDeviceOrchestrator::initializeDeviceRunners()
+void RankOrchestrator::initializeDeviceRunners()
 {
     // If we have PP+TP composition, use TPContextManager
     if (hasComposedParallelism())
@@ -802,7 +802,7 @@ void MultiDeviceOrchestrator::initializeDeviceRunners()
     }
 }
 
-void MultiDeviceOrchestrator::createRunnersForPPStage(
+void RankOrchestrator::createRunnersForPPStage(
     int pp_stage_id, 
     ILocalTPContext* stage_tp_ctx)
 {
@@ -859,10 +859,10 @@ public:
         int num_pp_stages);
 
     /**
-     * @brief Execute schedule using MultiDeviceOrchestrator
+     * @brief Execute schedule using RankOrchestrator
      */
     void execute(
-        MultiDeviceOrchestrator& orchestrator,
+        RankOrchestrator& orchestrator,
         const std::vector<MicroBatch>& schedule);
 };
 ```
@@ -893,8 +893,8 @@ public:
 |------|---------|
 | NEW: `src/v2/config/TPContextManager.h` | Per-PP-stage context manager |
 | NEW: `src/v2/config/TPContextManager.cpp` | Implementation |
-| `src/v2/execution/MultiDeviceOrchestrator.h` | Add `tp_manager_`, composition support |
-| `src/v2/execution/MultiDeviceOrchestrator.cpp` | Composed initialization |
+| `src/v2/execution/RankOrchestrator.h` | Add `tp_manager_`, composition support |
+| `src/v2/execution/RankOrchestrator.cpp` | Composed initialization |
 | `src/v2/execution/InferenceRunnerConfig.h` | Add PP config fields |
 | OPTIONAL: `src/v2/execution/PipelineScheduler.h/cpp` | Micro-batch scheduling |
 
@@ -908,7 +908,7 @@ public:
 Phase 1 (LOCAL TP) ─────────────────────────────────────────────────────────────►
                    [2-3 days]
     ├── 1.1 TensorParallelConfig::fromLocalTPContext()
-    ├── 1.2 MultiDeviceOrchestrator sets config
+    ├── 1.2 RankOrchestrator sets config
     ├── 1.3-1.4 WeightManager device-aware slicing
     ├── 1.5-1.6 Helper methods
     └── Tests
@@ -926,7 +926,7 @@ Phase 3 (Compositions) ───────────────────
                        [2-3 weeks]
     ├── 3.1 TPContextManager
     ├── 3.2 Combined TP+PP assignments
-    ├── 3.3 MultiDeviceOrchestrator composition mode
+    ├── 3.3 RankOrchestrator composition mode
     ├── 3.4 PipelineScheduler (optional)
     └── Tests
 ```
@@ -1151,6 +1151,6 @@ std::shared_ptr<TensorBase> WeightManager::sliceRowRange(
 
 - [TensorParallelConfig.h](../src/v2/config/TensorParallelConfig.h) - Existing TP config
 - [WeightManager.cpp](../src/v2/loaders/WeightManager.cpp) - Current weight loading
-- [MultiDeviceOrchestrator.cpp](../src/v2/execution/MultiDeviceOrchestrator.cpp) - Multi-device setup
+- [RankOrchestrator.cpp](../src/v2/execution/RankOrchestrator.cpp) - Multi-device setup
 - [HYBRID_PARALLELISM_PROJECT_PLAN.md](./HYBRID_PARALLELISM_PROJECT_PLAN.md) - Full hybrid plan
 - [MULTI_DEVICE_ORCHESTRATOR_PLAN.md](./MULTI_DEVICE_ORCHESTRATOR_PLAN.md) - Orchestrator design

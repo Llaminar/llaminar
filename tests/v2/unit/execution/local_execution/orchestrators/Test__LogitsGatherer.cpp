@@ -1,6 +1,6 @@
 /**
  * @file Test__LogitsGatherer.cpp
- * @brief Unit tests for LogitsGatherer extracted from MultiDeviceOrchestrator
+ * @brief Unit tests for LogitsGatherer extracted from RankOrchestrator
  *
  * Tests buffer allocation, skip-gather control, needsGather() logic,
  * single-device gather path, and copyFromStage delegation.

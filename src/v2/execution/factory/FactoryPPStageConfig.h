@@ -3,7 +3,7 @@
  * @brief PP stage configuration for inference runner factory
  *
  * This header is separate from InferenceRunnerFactory.h to avoid circular
- * dependencies with MultiDeviceOrchestrator.h
+ * dependencies with RankOrchestrator.h
  */
 
 #pragma once

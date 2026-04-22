@@ -2,7 +2,7 @@
  * @file DeviceSampler.h
  * @brief GPU-side sampling across tensor-parallel device runners
  *
- * Extracted from MultiDeviceOrchestrator to isolate GPU sampling logic:
+ * Extracted from RankOrchestrator to isolate GPU sampling logic:
  * per-device argmax (greedy) and top-k/top-p (non-greedy) with cross-device
  * result merging on host.
  *

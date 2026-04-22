@@ -1178,7 +1178,7 @@ add_library(llaminar2_core STATIC
     execution/local_execution/orchestrators/MultiDomainOrchestrator.cpp
     execution/local_execution/orchestrators/LogitsGatherer.cpp
     execution/local_execution/orchestrators/DeviceSampler.cpp
-    execution/local_execution/orchestrators/MultiDeviceOrchestrator.cpp
+    execution/local_execution/orchestrators/RankOrchestrator.cpp
     execution/local_execution/model/HeterogeneousLayerExecutor.cpp
     execution/local_execution/coherence/CrossDomainTransfer.cpp
     execution/config/HybridPrecisionConfig.cpp

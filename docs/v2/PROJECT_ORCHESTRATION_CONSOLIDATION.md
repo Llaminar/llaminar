@@ -823,7 +823,7 @@ runner->initialize();
 |----|------|---------|------|
 | 4.1 | Mark public functions deprecated | `InferenceRunnerFactory.h` | 30m |
 | 4.2 | Move to internal header | `src/v2/execution/factory/internal/` | 1h |
-| 4.3 | Update `MultiDeviceOrchestrator` | `MultiDeviceOrchestrator.cpp` | 1h |
+| 4.3 | Update `RankOrchestrator` | `RankOrchestrator.cpp` | 1h |
 | 4.4 | Remove deprecated legacy overloads from `ModelContext` | `ModelContext.h/cpp` | 30m |
 | 4.5 | Update documentation | `.github/instructions/*.md`, `README.md` | 2h |
 
@@ -831,7 +831,7 @@ runner->initialize();
 
 - [ ] `InferenceRunnerFactory.h` not in public include path
 - [ ] No deprecation warnings in clean build
-- [ ] `createMultiDeviceOrchestrator` still works (used internally)
+- [ ] `createRankOrchestrator` still works (used internally)
 - [ ] Documentation updated
 - [ ] No test failures
 

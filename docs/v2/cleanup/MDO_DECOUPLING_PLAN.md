@@ -1,13 +1,13 @@
-# MultiDeviceOrchestrator Decoupling & Test-Coverage Plan
+# RankOrchestrator Decoupling & Test-Coverage Plan
 
 **Date**: 2026-04-01
 **Status**: P0 Complete ✅, P1 Deferred, P2 Complete ✅
-**Scope**: Break concrete `DeviceGraphOrchestrator` coupling in `MultiDeviceOrchestrator`, add unit test coverage.
+**Scope**: Break concrete `DeviceGraphOrchestrator` coupling in `RankOrchestrator`, add unit test coverage.
 
 ## Current State (Post-Refactor)
 
-- **Header**: `MultiDeviceOrchestrator.h` — 900 lines
-- **Implementation**: `MultiDeviceOrchestrator.cpp` — 3,256 lines (4,156 total)
+- **Header**: `RankOrchestrator.h` — 900 lines
+- **Implementation**: `RankOrchestrator.cpp` — 3,256 lines (4,156 total)
 - **Model coupling**: Zero — already model-agnostic via SchemaFactoryRegistry
 - **Interface usage**: ✅ `device_runners_` now typed as `vector<unique_ptr<IInferenceRunner>>`
 - **DGO coupling**: ✅ Zero — all `inferenceState()` / `hasInferenceState()` calls eliminated
@@ -62,7 +62,7 @@ LogitsLocalInfo getLogitsLocalInfo() const override;
 
 ## Phase 1: Extract LogitsGatherer + DeviceSampler ✅ COMPLETE
 
-Extracted two helper classes from MultiDeviceOrchestrator:
+Extracted two helper classes from RankOrchestrator:
 
 ### LogitsGatherer
 - **File**: `src/v2/execution/local_execution/orchestrators/LogitsGatherer.h/cpp`
@@ -130,9 +130,9 @@ Extracted two helper classes from MultiDeviceOrchestrator:
 ### Modified
 - `IInferenceRunner.h` — added LogitsLocalInfo struct + 3 virtual methods with defaults
 - `DeviceGraphOrchestrator.h` — 3 inline override implementations
-- `MultiDeviceOrchestrator.h` — device_runners_ type changed, forward decl removed
-- `MultiDeviceOrchestrator.cpp` — all 11 inferenceState()/hasInferenceState() sites migrated
-- `InferenceRunnerFactory.h/cpp` — createTestableMultiDeviceOrchestrator signature updated
+- `RankOrchestrator.h` — device_runners_ type changed, forward decl removed
+- `RankOrchestrator.cpp` — all 11 inferenceState()/hasInferenceState() sites migrated
+- `InferenceRunnerFactory.h/cpp` — createTestableRankOrchestrator signature updated
 - `Test__InferenceRunnerFactory_MultiDevice.cpp` — vector type updated
 
 ### New

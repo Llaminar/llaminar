@@ -5054,20 +5054,20 @@ add_v2_test(V2_Unit_MultiDomainOrchestrator
     MPI_PROCS 1
 )
 
-# Test: MultiDeviceOrchestrator (LOCAL tensor parallelism across multiple devices)
+# Test: RankOrchestrator (LOCAL tensor parallelism across multiple devices)
 # Tests mock device runner and TP context, configuration validation, device coordination,
 # forward/clear_cache delegation, logits retrieval, and synchronization.
 # Part of LOCAL TP implementation for multi-GPU inference within single MPI rank.
-add_executable(v2_test_multi_device_orchestrator unit/execution/local_execution/orchestrators/Test__MultiDeviceOrchestrator.cpp)
+add_executable(v2_test_multi_device_orchestrator unit/execution/local_execution/orchestrators/Test__RankOrchestrator.cpp)
 target_link_libraries(v2_test_multi_device_orchestrator llaminar2_core GTest::gtest GTest::gtest_main)
-add_v2_test(V2_Unit_MultiDeviceOrchestrator
+add_v2_test(V2_Unit_RankOrchestrator
     COMMAND $<TARGET_FILE:v2_test_multi_device_orchestrator>
-    LABELS "V2;Unit;LocalTP;MultiDevice;IMultiDeviceOrchestrator;TensorParallelism;Execution"
+    LABELS "V2;Unit;LocalTP;MultiDevice;IRankOrchestrator;TensorParallelism;Execution"
     MPI_PROCS 1
 )
 
 # Test: MDO Interface Decoupling (IInferenceRunner-based device_runners_)
-# Verifies that MultiDeviceOrchestrator works through IInferenceRunner interface
+# Verifies that RankOrchestrator works through IInferenceRunner interface
 # without concrete DeviceGraphOrchestrator dependency. Tests primaryDeviceId(),
 # hasLogitsLocal(), getLogitsLocalInfo(), and gatherLogits via CPU-only mocks.
 add_executable(v2_test_mdo_interface_decoupling unit/execution/local_execution/orchestrators/Test__MDO_InterfaceDecoupling.cpp)
@@ -5082,7 +5082,7 @@ add_v2_test(V2_Unit_MDO_InterfaceDecoupling
 )
 
 # Test: MDO Delegation Coverage (comprehensive delegation pattern tests)
-# Verifies that MultiDeviceOrchestrator correctly delegates to device runners,
+# Verifies that RankOrchestrator correctly delegates to device runners,
 # TP context, and PP stage runners for all public API methods.
 add_executable(v2_test_mdo_delegation_coverage unit/execution/local_execution/orchestrators/Test__MDO_DelegationCoverage.cpp)
 target_include_directories(v2_test_mdo_delegation_coverage PRIVATE
@@ -5119,62 +5119,62 @@ add_v2_test(V2_Unit_DeviceSampler
     MPI_PROCS 1
 )
 
-# Test: MultiDeviceOrchestrator PP Config (Pipeline Parallelism configuration validation)
+# Test: RankOrchestrator PP Config (Pipeline Parallelism configuration validation)
 # Tests PPStageConfig validation, ParallelismMode detection, and Config::validate() for PP mode.
-# Phase 1 of MultiDeviceOrchestrator PP support implementation.
-add_executable(v2_test_multi_device_orchestrator_pp_config unit/orchestrators/Test__MultiDeviceOrchestrator_PPConfig.cpp)
+# Phase 1 of RankOrchestrator PP support implementation.
+add_executable(v2_test_multi_device_orchestrator_pp_config unit/orchestrators/Test__RankOrchestrator_PPConfig.cpp)
 target_link_libraries(v2_test_multi_device_orchestrator_pp_config llaminar2_core GTest::gtest GTest::gtest_main)
-add_v2_test(V2_Unit_MultiDeviceOrchestrator_PPConfig
+add_v2_test(V2_Unit_RankOrchestrator_PPConfig
     COMMAND $<TARGET_FILE:v2_test_multi_device_orchestrator_pp_config>
-    LABELS "V2;Unit;LocalPP;MultiDevice;IMultiDeviceOrchestrator;PipelineParallelism;Config"
+    LABELS "V2;Unit;LocalPP;MultiDevice;IRankOrchestrator;PipelineParallelism;Config"
     MPI_PROCS 1
 )
 
-# Test: MultiDeviceOrchestrator PP Interface (Hidden State API for PP nesting)
+# Test: RankOrchestrator PP Interface (Hidden State API for PP nesting)
 # Tests getHiddenState, setHiddenState, hasHiddenStateInput, clearHiddenStateInput
-# for TP and PP modes to enable MultiDeviceOrchestrator to be nested as a PP stage.
-add_executable(v2_test_multi_device_orchestrator_pp_interface unit/orchestrators/Test__MultiDeviceOrchestrator_PPInterface.cpp)
+# for TP and PP modes to enable RankOrchestrator to be nested as a PP stage.
+add_executable(v2_test_multi_device_orchestrator_pp_interface unit/orchestrators/Test__RankOrchestrator_PPInterface.cpp)
 target_link_libraries(v2_test_multi_device_orchestrator_pp_interface llaminar2_core GTest::gtest GTest::gtest_main)
-add_v2_test(V2_Unit_MultiDeviceOrchestrator_PPInterface
+add_v2_test(V2_Unit_RankOrchestrator_PPInterface
     COMMAND $<TARGET_FILE:v2_test_multi_device_orchestrator_pp_interface>
-    LABELS "V2;Unit;LocalPP;MultiDevice;IMultiDeviceOrchestrator;PipelineParallelism;HiddenState"
+    LABELS "V2;Unit;LocalPP;MultiDevice;IRankOrchestrator;PipelineParallelism;HiddenState"
     MPI_PROCS 1
 )
 
-# Test: MultiDeviceOrchestrator Nested TP (TP+PP hybrid mode nested MDO creation)
-# Tests that PP stages configured as TP domains create nested MultiDeviceOrchestrators
+# Test: RankOrchestrator Nested TP (TP+PP hybrid mode nested MDO creation)
+# Tests that PP stages configured as TP domains create nested RankOrchestrators
 # Phase 5: TP+PP hybrid where each PP stage can be a TP domain with multiple devices.
-add_executable(v2_test_multi_device_orchestrator_nested_tp unit/orchestrators/Test__MultiDeviceOrchestrator_NestedTP.cpp)
+add_executable(v2_test_multi_device_orchestrator_nested_tp unit/orchestrators/Test__RankOrchestrator_NestedTP.cpp)
 target_link_libraries(v2_test_multi_device_orchestrator_nested_tp llaminar2_core GTest::gtest GTest::gtest_main)
-add_v2_test(V2_Unit_MultiDeviceOrchestrator_NestedTP
+add_v2_test(V2_Unit_RankOrchestrator_NestedTP
     COMMAND $<TARGET_FILE:v2_test_multi_device_orchestrator_nested_tp>
-    LABELS "V2;Unit;LocalPP;MultiDevice;IMultiDeviceOrchestrator;PipelineParallelism;TP_PP;Hybrid"
+    LABELS "V2;Unit;LocalPP;MultiDevice;IRankOrchestrator;PipelineParallelism;TP_PP;Hybrid"
     MPI_PROCS 1
 )
 
-# Test: MultiDeviceOrchestrator getSnapshot in PP+TP mode (ownership-aware LM_HEAD retrieval)
+# Test: RankOrchestrator getSnapshot in PP+TP mode (ownership-aware LM_HEAD retrieval)
 # Tests that getSnapshot("LM_HEAD") respects hasLMHead() ownership in hybrid PP+TP mode.
 # Bug Caught: Stage 0 returned stale combined_logits_ even though it didn't own LM_HEAD.
 # Root Cause: Missing hasLMHead() check before returning combined_logits_.
-add_executable(v2_test_multi_device_orchestrator_get_snapshot_pptp unit/orchestrators/Test__MultiDeviceOrchestrator_GetSnapshotPPTP.cpp)
+add_executable(v2_test_multi_device_orchestrator_get_snapshot_pptp unit/orchestrators/Test__RankOrchestrator_GetSnapshotPPTP.cpp)
 target_include_directories(v2_test_multi_device_orchestrator_get_snapshot_pptp PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}  # For tests/v2/mocks/ include path
 )
 target_link_libraries(v2_test_multi_device_orchestrator_get_snapshot_pptp llaminar2_core GTest::gtest GTest::gtest_main)
-add_v2_test(V2_Unit_MultiDeviceOrchestrator_GetSnapshotPPTP
+add_v2_test(V2_Unit_RankOrchestrator_GetSnapshotPPTP
     COMMAND $<TARGET_FILE:v2_test_multi_device_orchestrator_get_snapshot_pptp>
-    LABELS "V2;Unit;LocalPP;MultiDevice;IMultiDeviceOrchestrator;PipelineParallelism;TP_PP;Snapshot;LMHead"
+    LABELS "V2;Unit;LocalPP;MultiDevice;IRankOrchestrator;PipelineParallelism;TP_PP;Snapshot;LMHead"
     MPI_PROCS 1
 )
 
-# Test: MultiDeviceOrchestrator PP Integration (Pipeline Parallelism end-to-end)
+# Test: RankOrchestrator PP Integration (Pipeline Parallelism end-to-end)
 # Tests PP mode construction, forward execution, and parity with single-device mode.
-# Phase 2 of MultiDeviceOrchestrator PP support implementation.
-add_executable(v2_integration_multi_device_orchestrator_pp integration/orchestrators/Test__MultiDeviceOrchestrator_PP.cpp)
+# Phase 2 of RankOrchestrator PP support implementation.
+add_executable(v2_integration_multi_device_orchestrator_pp integration/orchestrators/Test__RankOrchestrator_PP.cpp)
 target_link_libraries(v2_integration_multi_device_orchestrator_pp llaminar2_core GTest::gtest GTest::gtest_main)
-add_v2_test(V2_Integration_MultiDeviceOrchestrator_PP
+add_v2_test(V2_Integration_RankOrchestrator_PP
     COMMAND $<TARGET_FILE:v2_integration_multi_device_orchestrator_pp>
-    LABELS "V2;Integration;LocalPP;MultiDevice;IMultiDeviceOrchestrator;PipelineParallelism"
+    LABELS "V2;Integration;LocalPP;MultiDevice;IRankOrchestrator;PipelineParallelism"
     MPI_PROCS 1
 )
 
@@ -5197,10 +5197,10 @@ add_v2_test(V2_Unit_EagerWeightValidator
     MPI_PROCS 1
 )
 
-# Test: InferenceRunnerFactory MultiDevice (factory functions for MultiDeviceOrchestrator)
-# Tests createMultiDeviceOrchestrator and createTestableMultiDeviceOrchestrator
+# Test: InferenceRunnerFactory MultiDevice (factory functions for RankOrchestrator)
+# Tests createRankOrchestrator and createTestableRankOrchestrator
 # factory functions with various configurations, validation, and error handling.
-# Part of Phase 5: MultiDeviceOrchestrator integration with InferenceRunnerFactory
+# Part of Phase 5: RankOrchestrator integration with InferenceRunnerFactory
 add_executable(v2_unit_inference_runner_factory_multidevice unit/execution/factory/Test__InferenceRunnerFactory_MultiDevice.cpp)
 target_include_directories(v2_unit_inference_runner_factory_multidevice PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}  # For tests/v2/mocks/ include path
@@ -8293,7 +8293,7 @@ endif()
 # =============================================================================
 # LOCAL TP Multi-Device Integration Tests
 # =============================================================================
-# Tests MultiDeviceOrchestrator with real GPU hardware for LOCAL tensor parallelism.
+# Tests RankOrchestrator with real GPU hardware for LOCAL tensor parallelism.
 # Validates:
 # - Hardware detection (CUDA/ROCm device enumeration)
 # - 2-GPU CUDA LOCAL TP (NCCL backend)
@@ -8319,7 +8319,7 @@ if(HAVE_CUDA OR HAVE_ROCM)
     endif()
     add_v2_test(V2_Integration_LocalTP_MultiDevice
         COMMAND $<TARGET_FILE:v2_integration_local_tp_multi_device>
-        LABELS "V2;Integration;LocalTP;MultiDevice;MultiDeviceOrchestrator;TensorParallelism;GPU;NCCL;RCCL;CUDA;ROCm;Heterogeneous"
+        LABELS "V2;Integration;LocalTP;MultiDevice;RankOrchestrator;TensorParallelism;GPU;NCCL;RCCL;CUDA;ROCm;Heterogeneous"
         MPI_PROCS 1  # LOCAL TP runs within a single MPI rank
     )
     message(STATUS "V2 Tests: Added LOCAL TP Multi-Device integration tests")

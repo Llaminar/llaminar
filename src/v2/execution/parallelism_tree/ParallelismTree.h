@@ -19,7 +19,7 @@
  *
  * The tree is compiled bottom-up into nested IInferenceRunner instances by
  * TreeToRunnerCompiler (Phase 5). Each PP node becomes a PipelineRunner, each
- * TP node becomes a MultiDeviceOrchestrator(TP mode), and each DEVICE leaf
+ * TP node becomes a RankOrchestrator(TP mode), and each DEVICE leaf
  * becomes a DeviceGraphOrchestrator.
  *
  * Example: 2 machines × 2 sockets × 2 GPUs per socket

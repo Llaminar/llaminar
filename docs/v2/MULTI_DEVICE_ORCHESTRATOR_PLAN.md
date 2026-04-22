@@ -10,7 +10,7 @@
 | Phase | Status | Tests |
 |-------|--------|-------|
 | Phase 1: GraphOrchestrator Rename | ✅ Complete | All existing tests pass |
-| Phase 2: MultiDeviceOrchestrator Implementation | ✅ Complete | 37/37 unit tests pass |
+| Phase 2: RankOrchestrator Implementation | ✅ Complete | 37/37 unit tests pass |
 | Phase 3: ILocalTPContext Wiring | ✅ Complete | 48/48 unit tests pass |
 | Phase 4: Test Infrastructure | ✅ Complete | 8/8 integration tests pass |
 | Phase 5: Integration and Validation | ✅ Complete | 21/21 factory tests + 11/11 orchestration tests pass |
@@ -24,7 +24,7 @@
 
 ### Current State
 
-The `MultiDeviceOrchestrator::initializeDeviceRunners()` method correctly sets LOCAL TP parameters:
+The `RankOrchestrator::initializeDeviceRunners()` method correctly sets LOCAL TP parameters:
 ```cpp
 runner_config.local_tp_ctx = tp_ctx_.get();
 runner_config.local_tp_device_index = device_idx;
@@ -34,7 +34,7 @@ runner_config.local_tp_device_index = device_idx;
 
 **Location**: `src/v2/execution/InferenceRunnerFactory.cpp` lines 738-881
 
-The `createTestableInferenceRunner()` function (used by `MultiDeviceOrchestrator`) does **NOT** process `config.local_tp_ctx` and `config.local_tp_device_index`. Instead, it hardcodes single-rank configuration:
+The `createTestableInferenceRunner()` function (used by `RankOrchestrator`) does **NOT** process `config.local_tp_ctx` and `config.local_tp_device_index`. Instead, it hardcodes single-rank configuration:
 
 ```cpp
 // Lines 789-796 - HARDCODED single-rank, ignores LOCAL TP!
@@ -88,12 +88,12 @@ Without weight sharding:
 
 ## Executive Summary
 
-This document outlines the implementation plan for **Option A**: creating a new `MultiDeviceOrchestrator` class that manages multiple `DeviceGraphOrchestrator` instances (renamed from `GraphOrchestrator`) for LOCAL tensor parallelism.
+This document outlines the implementation plan for **Option A**: creating a new `RankOrchestrator` class that manages multiple `DeviceGraphOrchestrator` instances (renamed from `GraphOrchestrator`) for LOCAL tensor parallelism.
 
 ### Key Changes
 
 1. **Rename**: `GraphOrchestrator` → `DeviceGraphOrchestrator` (clarifies single-device scope)
-2. **New Class**: `MultiDeviceOrchestrator` coordinates N `DeviceGraphOrchestrator` instances
+2. **New Class**: `RankOrchestrator` coordinates N `DeviceGraphOrchestrator` instances
 3. **Parallel Execution**: Thread pool executes device graphs concurrently
 4. **Collective Integration**: `ILocalTPContext` handles allreduce/allgather between devices
 
@@ -112,7 +112,7 @@ This document outlines the implementation plan for **Option A**: creating a new 
 
 1. [Architecture Overview](#1-architecture-overview)
 2. [Phase 1: GraphOrchestrator Rename](#2-phase-1-graphorchestrator-rename)
-3. [Phase 2: MultiDeviceOrchestrator Implementation](#3-phase-2-multideviceorchestrator-implementation)
+3. [Phase 2: RankOrchestrator Implementation](#3-phase-2-multideviceorchestrator-implementation)
 4. [Phase 3: ILocalTPContext Wiring](#4-phase-3-ilocalptcontext-wiring)
 5. [Phase 4: Test Infrastructure](#5-phase-4-test-infrastructure)
 6. [Phase 5: Integration and Validation](#6-phase-5-integration-and-validation)
@@ -157,7 +157,7 @@ This document outlines the implementation plan for **Option A**: creating a new 
                               │
                               ▼
 ┌─────────────────────────────────────────────────────────────┐
-│                  MultiDeviceOrchestrator                     │
+│                  RankOrchestrator                     │
 │                                                              │
 │  ┌─────────────────────────────────────────────────────┐    │
 │  │ ILocalTPContext* tp_ctx                              │    │
@@ -375,13 +375,13 @@ ctest --test-dir build_v2 -R "^V2_Unit_" --output-on-failure --parallel
 
 ---
 
-## 3. Phase 2: MultiDeviceOrchestrator Implementation
+## 3. Phase 2: RankOrchestrator Implementation
 
 **Goal**: Create the new multi-device orchestration class.
 
 ### 3.1 Class Definition
 
-**Location**: `src/v2/execution/MultiDeviceOrchestrator.h`
+**Location**: `src/v2/execution/RankOrchestrator.h`
 
 ```cpp
 #pragma once
@@ -401,7 +401,7 @@ class IModelContext;
 /**
  * @brief Coordinates multiple DeviceGraphOrchestrator instances for LOCAL TP.
  *
- * MultiDeviceOrchestrator manages tensor-parallel inference across multiple
+ * RankOrchestrator manages tensor-parallel inference across multiple
  * devices within a single MPI rank. It:
  *   1. Creates N DeviceGraphOrchestrator instances (one per LOCAL TP device)
  *   2. Executes forward() in parallel across devices via thread pool
@@ -414,10 +414,10 @@ class IModelContext;
  *   - LocalTPAllreduceStage stages use ILocalTPContext for synchronization
  *   - AllGather combines logits at the end
  */
-class MultiDeviceOrchestrator : public IInferenceRunner {
+class RankOrchestrator : public IInferenceRunner {
 public:
     /**
-     * @brief Configuration for MultiDeviceOrchestrator.
+     * @brief Configuration for RankOrchestrator.
      */
     struct Config {
         std::vector<GlobalDeviceAddress> devices;    ///< Participating devices
@@ -432,25 +432,25 @@ public:
     };
 
     /**
-     * @brief Construct MultiDeviceOrchestrator with ILocalTPContext.
+     * @brief Construct RankOrchestrator with ILocalTPContext.
      * @param model_ctx Shared model context (weights, metadata)
      * @param tp_ctx LOCAL TP context for collective operations
      * @param config Configuration for all device runners
      */
-    MultiDeviceOrchestrator(
+    RankOrchestrator(
         std::shared_ptr<IModelContext> model_ctx,
         std::unique_ptr<ILocalTPContext> tp_ctx,
         const Config& config);
 
-    ~MultiDeviceOrchestrator() override;
+    ~RankOrchestrator() override;
 
     // Disable copy
-    MultiDeviceOrchestrator(const MultiDeviceOrchestrator&) = delete;
-    MultiDeviceOrchestrator& operator=(const MultiDeviceOrchestrator&) = delete;
+    RankOrchestrator(const RankOrchestrator&) = delete;
+    RankOrchestrator& operator=(const RankOrchestrator&) = delete;
 
     // Allow move
-    MultiDeviceOrchestrator(MultiDeviceOrchestrator&&) = default;
-    MultiDeviceOrchestrator& operator=(MultiDeviceOrchestrator&&) = default;
+    RankOrchestrator(RankOrchestrator&&) = default;
+    RankOrchestrator& operator=(RankOrchestrator&&) = default;
 
     // ==================== IInferenceRunner Interface ====================
 
@@ -537,17 +537,17 @@ private:
 
 ### 3.2 Implementation Outline
 
-**Location**: `src/v2/execution/MultiDeviceOrchestrator.cpp`
+**Location**: `src/v2/execution/RankOrchestrator.cpp`
 
 ```cpp
-#include "MultiDeviceOrchestrator.h"
+#include "RankOrchestrator.h"
 #include "DeviceGraphOrchestrator.h"
 #include "InferenceRunnerFactory.h"
 #include <execution>
 
 namespace llaminar2 {
 
-MultiDeviceOrchestrator::MultiDeviceOrchestrator(
+RankOrchestrator::RankOrchestrator(
     std::shared_ptr<IModelContext> model_ctx,
     std::unique_ptr<ILocalTPContext> tp_ctx,
     const Config& config)
@@ -557,15 +557,15 @@ MultiDeviceOrchestrator::MultiDeviceOrchestrator(
     LLAMINAR_ASSERT_NOT_NULL(model_ctx_.get(), "model_ctx");
     LLAMINAR_ASSERT_NOT_NULL(tp_ctx_.get(), "tp_ctx");
     LLAMINAR_ASSERT(tp_ctx_->degree() >= 2, 
-        "MultiDeviceOrchestrator requires at least 2 devices");
+        "RankOrchestrator requires at least 2 devices");
     
     initializeDeviceRunners(config);
     
-    LOG_INFO("[MultiDeviceOrchestrator] Initialized with " 
+    LOG_INFO("[RankOrchestrator] Initialized with " 
              << device_runners_.size() << " devices");
 }
 
-void MultiDeviceOrchestrator::initializeDeviceRunners(const Config& config)
+void RankOrchestrator::initializeDeviceRunners(const Config& config)
 {
     const int tp_degree = tp_ctx_->degree();
     device_runners_.reserve(tp_degree);
@@ -611,12 +611,12 @@ void MultiDeviceOrchestrator::initializeDeviceRunners(const Config& config)
         DeviceId::cpu());
 }
 
-bool MultiDeviceOrchestrator::forward(const int* tokens, int seq_len)
+bool RankOrchestrator::forward(const int* tokens, int seq_len)
 {
     return executeParallelForward(tokens, seq_len);
 }
 
-bool MultiDeviceOrchestrator::executeParallelForward(const int* tokens, int seq_len)
+bool RankOrchestrator::executeParallelForward(const int* tokens, int seq_len)
 {
     const int num_devices = device_runners_.size();
     
@@ -637,7 +637,7 @@ bool MultiDeviceOrchestrator::executeParallelForward(const int* tokens, int seq_
     }
     
     if (!all_success) {
-        LOG_ERROR("[MultiDeviceOrchestrator] One or more devices failed forward()");
+        LOG_ERROR("[RankOrchestrator] One or more devices failed forward()");
         return false;
     }
     
@@ -647,14 +647,14 @@ bool MultiDeviceOrchestrator::executeParallelForward(const int* tokens, int seq_
     return true;
 }
 
-const float* MultiDeviceOrchestrator::logits() const
+const float* RankOrchestrator::logits() const
 {
     // If vocab is column-parallel, AllGather was already done in the graph
     // Return logits from primary device
     return device_runners_[0]->logits();
 }
 
-void MultiDeviceOrchestrator::clear_cache()
+void RankOrchestrator::clear_cache()
 {
     for (auto& runner : device_runners_) {
         runner->clear_cache();
@@ -662,57 +662,57 @@ void MultiDeviceOrchestrator::clear_cache()
     position_ = 0;
 }
 
-int MultiDeviceOrchestrator::get_position() const
+int RankOrchestrator::get_position() const
 {
     return position_;
 }
 
-int MultiDeviceOrchestrator::vocab_size() const
+int RankOrchestrator::vocab_size() const
 {
     return vocab_size_;
 }
 
-const char* MultiDeviceOrchestrator::architecture() const
+const char* RankOrchestrator::architecture() const
 {
     return device_runners_[0]->architecture();
 }
 
-ExecutionPath MultiDeviceOrchestrator::executionPath() const
+ExecutionPath RankOrchestrator::executionPath() const
 {
     return ExecutionPath::GRAPH;
 }
 
 // ==================== Snapshot Support ====================
 
-void MultiDeviceOrchestrator::enableSnapshotCapture(const std::string& dir)
+void RankOrchestrator::enableSnapshotCapture(const std::string& dir)
 {
     for (auto& runner : device_runners_) {
         runner->enableSnapshotCapture(dir);
     }
 }
 
-void MultiDeviceOrchestrator::disableSnapshotCapture()
+void RankOrchestrator::disableSnapshotCapture()
 {
     for (auto& runner : device_runners_) {
         runner->disableSnapshotCapture();
     }
 }
 
-void MultiDeviceOrchestrator::clearSnapshots()
+void RankOrchestrator::clearSnapshots()
 {
     for (auto& runner : device_runners_) {
         runner->clearSnapshots();
     }
 }
 
-const float* MultiDeviceOrchestrator::getSnapshot(const std::string& key, size_t& size) const
+const float* RankOrchestrator::getSnapshot(const std::string& key, size_t& size) const
 {
     // Route to appropriate device based on key
     // For now, return from primary device
     return device_runners_[0]->getSnapshot(key, size);
 }
 
-std::vector<std::string> MultiDeviceOrchestrator::getSnapshotKeys() const
+std::vector<std::string> RankOrchestrator::getSnapshotKeys() const
 {
     // Merge keys from all devices (deduplicate)
     std::set<std::string> all_keys;
@@ -725,7 +725,7 @@ std::vector<std::string> MultiDeviceOrchestrator::getSnapshotKeys() const
 
 // ==================== Batch Interface ====================
 
-bool MultiDeviceOrchestrator::forward_batch(const std::vector<std::vector<int>>& token_batches)
+bool RankOrchestrator::forward_batch(const std::vector<std::vector<int>>& token_batches)
 {
     // Parallel batched forward across devices
     const int num_devices = device_runners_.size();
@@ -745,29 +745,29 @@ bool MultiDeviceOrchestrator::forward_batch(const std::vector<std::vector<int>>&
     return all_success;
 }
 
-const float* MultiDeviceOrchestrator::getLogits(int seq_idx) const
+const float* RankOrchestrator::getLogits(int seq_idx) const
 {
     return device_runners_[0]->getLogits(seq_idx);
 }
 
-int MultiDeviceOrchestrator::batch_size() const
+int RankOrchestrator::batch_size() const
 {
     return batch_size_;
 }
 
-int MultiDeviceOrchestrator::padded_seq_len() const
+int RankOrchestrator::padded_seq_len() const
 {
     return device_runners_[0]->padded_seq_len();
 }
 
-const std::vector<int>& MultiDeviceOrchestrator::sequence_lengths() const
+const std::vector<int>& RankOrchestrator::sequence_lengths() const
 {
     return sequence_lengths_;
 }
 
 // ==================== Profiling ====================
 
-GraphExecutorStats* MultiDeviceOrchestrator::executorStats()
+GraphExecutorStats* RankOrchestrator::executorStats()
 {
     // Aggregate stats from all devices
     aggregated_stats_ = GraphExecutorStats{};
@@ -782,7 +782,7 @@ GraphExecutorStats* MultiDeviceOrchestrator::executorStats()
     return &aggregated_stats_;
 }
 
-void MultiDeviceOrchestrator::resetExecutorStats()
+void RankOrchestrator::resetExecutorStats()
 {
     for (auto& runner : device_runners_) {
         runner->resetExecutorStats();
@@ -792,14 +792,14 @@ void MultiDeviceOrchestrator::resetExecutorStats()
 
 // ==================== Multi-Device Specific ====================
 
-DeviceGraphOrchestrator* MultiDeviceOrchestrator::deviceRunner(int idx)
+DeviceGraphOrchestrator* RankOrchestrator::deviceRunner(int idx)
 {
     LLAMINAR_ASSERT(idx >= 0 && idx < device_runners_.size(), 
         "Device index out of range");
     return device_runners_[idx].get();
 }
 
-const DeviceGraphOrchestrator* MultiDeviceOrchestrator::deviceRunner(int idx) const
+const DeviceGraphOrchestrator* RankOrchestrator::deviceRunner(int idx) const
 {
     LLAMINAR_ASSERT(idx >= 0 && idx < device_runners_.size(), 
         "Device index out of range");
@@ -815,23 +815,23 @@ Add factory function in `InferenceRunnerFactory.h`:
 
 ```cpp
 /**
- * @brief Create MultiDeviceOrchestrator for LOCAL TP.
+ * @brief Create RankOrchestrator for LOCAL TP.
  * @param model_ctx Shared model context
  * @param tp_ctx LOCAL TP context (takes ownership)
  * @param config Multi-device configuration
- * @return Unique pointer to MultiDeviceOrchestrator as IInferenceRunner
+ * @return Unique pointer to RankOrchestrator as IInferenceRunner
  */
-std::unique_ptr<IInferenceRunner> createMultiDeviceOrchestrator(
+std::unique_ptr<IInferenceRunner> createRankOrchestrator(
     std::shared_ptr<IModelContext> model_ctx,
     std::unique_ptr<ILocalTPContext> tp_ctx,
-    const MultiDeviceOrchestrator::Config& config);
+    const RankOrchestrator::Config& config);
 ```
 
 ### 3.4 CMakeLists.txt Updates
 
 ```cmake
 # Add to llaminar2_core sources
-execution/MultiDeviceOrchestrator.cpp
+execution/RankOrchestrator.cpp
 ```
 
 ---
@@ -934,26 +934,26 @@ std::unordered_map<DeviceId, void*> device_buffers_;
 
 ## 5. Phase 4: Test Infrastructure
 
-**Goal**: Create comprehensive tests for MultiDeviceOrchestrator and real LOCAL TP.
+**Goal**: Create comprehensive tests for RankOrchestrator and real LOCAL TP.
 
 ### 5.1 Unit Tests
 
-**Location**: `tests/v2/unit/Test__MultiDeviceOrchestrator.cpp`
+**Location**: `tests/v2/unit/Test__RankOrchestrator.cpp`
 
 ```cpp
 /**
- * @file Test__MultiDeviceOrchestrator.cpp
- * @brief Unit tests for MultiDeviceOrchestrator
+ * @file Test__RankOrchestrator.cpp
+ * @brief Unit tests for RankOrchestrator
  */
 
 #include <gtest/gtest.h>
-#include "execution/local_execution/orchestrators/MultiDeviceOrchestrator.h"
+#include "execution/local_execution/orchestrators/RankOrchestrator.h"
 #include "utils/MockModelContext.h"
 #include "utils/TestTensorFactory.h"
 
 namespace llaminar2::test {
 
-class Test__MultiDeviceOrchestrator : public ::testing::Test {
+class Test__RankOrchestrator : public ::testing::Test {
 protected:
     void SetUp() override {
         // Create mock model context
@@ -970,39 +970,39 @@ protected:
     std::shared_ptr<IModelContext> model_ctx_;
 };
 
-TEST_F(Test__MultiDeviceOrchestrator, RejectsSingleDevice)
+TEST_F(Test__RankOrchestrator, RejectsSingleDevice)
 {
     auto tp_ctx = createLocalTPContext(
         {GlobalDeviceAddress::cpu()},
         {1.0f},
         CollectiveBackendType::HOST);
     
-    MultiDeviceOrchestrator::Config config;
+    RankOrchestrator::Config config;
     config.devices = tp_ctx->devices();
     
     EXPECT_THROW(
-        MultiDeviceOrchestrator(model_ctx_, std::move(tp_ctx), config),
+        RankOrchestrator(model_ctx_, std::move(tp_ctx), config),
         std::invalid_argument);
 }
 
-TEST_F(Test__MultiDeviceOrchestrator, InitializesWithTwoDevices)
+TEST_F(Test__RankOrchestrator, InitializesWithTwoDevices)
 {
     auto tp_ctx = createLocalTPContext(
         {GlobalDeviceAddress::cpu(), GlobalDeviceAddress::cpu()},  // Use CPU for unit test
         {0.5f, 0.5f},
         CollectiveBackendType::HOST);
     
-    MultiDeviceOrchestrator::Config config;
+    RankOrchestrator::Config config;
     config.devices = tp_ctx->devices();
     
-    MultiDeviceOrchestrator orchestrator(model_ctx_, std::move(tp_ctx), config);
+    RankOrchestrator orchestrator(model_ctx_, std::move(tp_ctx), config);
     
     EXPECT_EQ(orchestrator.device_count(), 2);
     EXPECT_NE(orchestrator.deviceRunner(0), nullptr);
     EXPECT_NE(orchestrator.deviceRunner(1), nullptr);
 }
 
-TEST_F(Test__MultiDeviceOrchestrator, ClearCacheAffectsAllDevices)
+TEST_F(Test__RankOrchestrator, ClearCacheAffectsAllDevices)
 {
     // ... test that clear_cache() is called on all device runners
 }
@@ -1017,7 +1017,7 @@ TEST_F(Test__MultiDeviceOrchestrator, ClearCacheAffectsAllDevices)
 ```cpp
 /**
  * @file Test__LocalTPMultiDevice.cpp
- * @brief Integration tests for real LOCAL TP with MultiDeviceOrchestrator
+ * @brief Integration tests for real LOCAL TP with RankOrchestrator
  */
 
 class Test__LocalTPMultiDevice : public ::testing::Test {
@@ -1053,11 +1053,11 @@ TEST_F(Test__LocalTPMultiDevice, CUDA_TwoGPU_ForwardProducesSameLogits)
     auto model_ctx = loadModel("models/qwen2.5-0.5b-instruct-q4_0.gguf");
     
     // Create multi-device orchestrator
-    MultiDeviceOrchestrator::Config config;
+    RankOrchestrator::Config config;
     config.devices = tp_ctx->devices();
     config.max_seq_len = 512;
     
-    MultiDeviceOrchestrator multi_orch(model_ctx, std::move(tp_ctx), config);
+    RankOrchestrator multi_orch(model_ctx, std::move(tp_ctx), config);
     
     // Create single-device baseline
     auto single_runner = createInferenceRunner(
@@ -1107,10 +1107,10 @@ protected:
             {0.5f, 0.5f},
             CollectiveBackendType::NCCL);
         
-        MultiDeviceOrchestrator::Config config;
+        RankOrchestrator::Config config;
         config.devices = tp_ctx->devices();
         
-        return std::make_unique<MultiDeviceOrchestrator>(
+        return std::make_unique<RankOrchestrator>(
             model_ctx_, std::move(tp_ctx), config);
     }
 };
@@ -1124,7 +1124,7 @@ REGISTER_PARITY_TESTS(Test__Qwen2_LocalTP_NCCL_vs_PyTorch)
 
 ### 6.1 OrchestrationRunner Integration
 
-Update `OrchestrationRunner` to use `MultiDeviceOrchestrator` when LOCAL TP is configured:
+Update `OrchestrationRunner` to use `RankOrchestrator` when LOCAL TP is configured:
 
 **Location**: `src/v2/execution/runner/OrchestrationRunner.cpp`
 
@@ -1132,7 +1132,7 @@ Update `OrchestrationRunner` to use `MultiDeviceOrchestrator` when LOCAL TP is c
 std::unique_ptr<IInferenceRunner> OrchestrationRunner::createRunner()
 {
     if (hasLocalTP()) {
-        return createMultiDeviceOrchestrator(
+        return createRankOrchestrator(
             model_ctx_,
             std::move(local_tp_ctx_),
             buildMultiDeviceConfig());
@@ -1145,7 +1145,7 @@ std::unique_ptr<IInferenceRunner> OrchestrationRunner::createRunner()
 
 ### 6.2 CLI Integration
 
-The existing CLI flags should work with `MultiDeviceOrchestrator`:
+The existing CLI flags should work with `RankOrchestrator`:
 
 ```bash
 # 2-way LOCAL TP with NCCL
@@ -1165,7 +1165,7 @@ The existing CLI flags should work with `MultiDeviceOrchestrator`:
 ### 6.3 Validation Checklist
 
 - [ ] **Rename verification**: All unit tests pass after GraphOrchestrator rename
-- [ ] **Single-device parity**: MultiDeviceOrchestrator with 1 device matches baseline
+- [ ] **Single-device parity**: RankOrchestrator with 1 device matches baseline
 - [ ] **Two-device parity**: 2-GPU LOCAL TP matches single-device output
 - [ ] **Proportional TP**: Unequal weights (0.73/0.27) produce correct results
 - [ ] **Cross-vendor**: CUDA + ROCm LOCAL TP works via PCIeBAR
@@ -1196,9 +1196,9 @@ The existing CLI flags should work with `MultiDeviceOrchestrator`:
 
 | File | Description |
 |------|-------------|
-| `src/v2/execution/MultiDeviceOrchestrator.h` | Class definition |
-| `src/v2/execution/MultiDeviceOrchestrator.cpp` | Implementation |
-| `tests/v2/unit/Test__MultiDeviceOrchestrator.cpp` | Unit tests |
+| `src/v2/execution/RankOrchestrator.h` | Class definition |
+| `src/v2/execution/RankOrchestrator.cpp` | Implementation |
+| `tests/v2/unit/Test__RankOrchestrator.cpp` | Unit tests |
 
 ### 7.3 Phase 3: ILocalTPContext Wiring (2-3 files)
 
@@ -1220,7 +1220,7 @@ The existing CLI flags should work with `MultiDeviceOrchestrator`:
 
 | File | Change |
 |------|--------|
-| `src/v2/execution/runner/OrchestrationRunner.cpp` | Use MultiDeviceOrchestrator |
+| `src/v2/execution/runner/OrchestrationRunner.cpp` | Use RankOrchestrator |
 | `src/v2/execution/InferenceRunnerFactory.cpp` | Add factory function |
 
 ---
@@ -1243,7 +1243,7 @@ The existing CLI flags should work with `MultiDeviceOrchestrator`:
 | Phase | Duration | Depends On |
 |-------|----------|------------|
 | Phase 1: Rename | 2-3 hours | - |
-| Phase 2: MultiDeviceOrchestrator | 4-6 hours | Phase 1 |
+| Phase 2: RankOrchestrator | 4-6 hours | Phase 1 |
 | Phase 3: ILocalTPContext Wiring | 3-4 hours | Phase 2 |
 | Phase 4: Test Infrastructure | 4-5 hours | Phase 2, 3 |
 | Phase 5: Integration | 2-3 hours | Phase 2, 3 |

@@ -1,6 +1,6 @@
 # Unified Multi-Device Orchestration Architecture
 
-## Phase 3: Unifying TP and PP in MultiDeviceOrchestrator
+## Phase 3: Unifying TP and PP in RankOrchestrator
 
 **Date**: February 2026  
 **Status**: Design Document  
@@ -30,7 +30,7 @@
 
 ### Current State
 
-- **LOCAL TP** (working): `MultiDeviceOrchestrator` manages N `DeviceGraphOrchestrator` instances. Each has its own `InferenceState` with sharded KV cache. Forward runs all in parallel via `std::async`, followed by allgather for logits.
+- **LOCAL TP** (working): `RankOrchestrator` manages N `DeviceGraphOrchestrator` instances. Each has its own `InferenceState` with sharded KV cache. Forward runs all in parallel via `std::async`, followed by allgather for logits.
 
 - **LOCAL PP** (broken): Uses single `DeviceGraphOrchestrator` with a unified graph spanning all devices. This causes:
   - KV cache device mismatch (crash when KV cache on device A but layer runs on device B)
@@ -45,7 +45,7 @@
 
 ### Proposed Solution
 
-Extend `MultiDeviceOrchestrator` to handle both TP and PP through a **unified execution model**:
+Extend `RankOrchestrator` to handle both TP and PP through a **unified execution model**:
 - Each device gets its own `DeviceGraphOrchestrator` (whether for TP or PP)
 - Coordination logic differs: parallel + allreduce (TP) vs sequential + transfer (PP)
 - Hybrid TP+PP composes: each PP stage IS a TP domain with its own sub-orchestrator
@@ -88,7 +88,7 @@ Problems:
 ```
 CURRENT (WORKING) TP ARCHITECTURE:
 ┌─────────────────────────────────────────────────────────────────┐
-│               MultiDeviceOrchestrator                            │
+│               RankOrchestrator                            │
 │  ┌──────────────────┐        ┌──────────────────┐               │
 │  │DeviceGraphOrch #0│        │DeviceGraphOrch #1│               │
 │  │ (cuda:0)         │        │ (cuda:1)         │               │
@@ -114,7 +114,7 @@ Why it works:
 1. Each device has its OWN InferenceState with its OWN KV cache
 2. Each device runs SAME layers with DIFFERENT heads (horizontal shard)
 3. Clear ownership: device 0 owns its buffers, device 1 owns its buffers
-4. Coordination happens in MultiDeviceOrchestrator, not in graph
+4. Coordination happens in RankOrchestrator, not in graph
 ```
 
 ### 2.3 Applying TP Pattern to PP
@@ -122,7 +122,7 @@ Why it works:
 ```
 PROPOSED PP ARCHITECTURE (same pattern as TP):
 ┌─────────────────────────────────────────────────────────────────┐
-│               MultiDeviceOrchestrator                            │
+│               RankOrchestrator                            │
 │  ┌──────────────────┐        ┌──────────────────┐               │
 │  │DeviceGraphOrch #0│        │DeviceGraphOrch #1│               │
 │  │ (cuda:0, stage 0)│        │ (cuda:1, stage 1)│               │
@@ -155,7 +155,7 @@ Key differences from TP:
 
 ## 3. Proposed Architecture
 
-### 3.1 Should MultiDeviceOrchestrator Handle Both?
+### 3.1 Should RankOrchestrator Handle Both?
 
 **Answer: YES**, with a clear internal strategy pattern.
 
@@ -186,7 +186,7 @@ What differs is **coordination strategy**:
          ┌─────────────────────┴─────────────────────┐
          │                                           │
 ┌────────────────────────┐              ┌────────────────────────┐
-│IMultiDeviceOrchestrator│              │DeviceGraphOrchestrator │
+│IRankOrchestrator│              │DeviceGraphOrchestrator │
 │  device_count()        │              │  (single device)        │
 │  deviceRunner(idx)     │              │                         │
 │  localTPContext()      │              │                         │
@@ -195,7 +195,7 @@ What differs is **coordination strategy**:
             ▲
             │
 ┌────────────────────────────────────────────────────────────────────┐
-│              MultiDeviceOrchestrator                                │
+│              RankOrchestrator                                │
 │                                                                     │
 │  Config:                                                            │
 │  - ParallelismMode: TP_ONLY, PP_ONLY, TP_PLUS_PP                   │
@@ -371,7 +371,7 @@ enum class ParallelismMode {
  * @brief Assignment of layers to a device (PP mode)
  */
 struct PPDeviceAssignment {
-    int device_index;        // Index in MultiDeviceOrchestrator's device list
+    int device_index;        // Index in RankOrchestrator's device list
     DeviceId device_id;      // The device
     int first_layer;         // First layer (inclusive)
     int last_layer;          // Last layer (exclusive)
@@ -382,10 +382,10 @@ struct PPDeviceAssignment {
 };
 
 // ============================================================================
-// Extended IMultiDeviceOrchestrator
+// Extended IRankOrchestrator
 // ============================================================================
 
-class IMultiDeviceOrchestrator : public IInferenceRunner {
+class IRankOrchestrator : public IInferenceRunner {
 public:
     // Existing methods
     virtual int device_count() const = 0;
@@ -530,10 +530,10 @@ forward(tokens, seq_len):
 
 ## 6. Configuration Design
 
-### 6.1 Extended MultiDeviceOrchestrator::Config
+### 6.1 Extended RankOrchestrator::Config
 
 ```cpp
-struct MultiDeviceOrchestrator::Config {
+struct RankOrchestrator::Config {
     // =========================================================================
     // Parallelism Mode (inferred or explicit)
     // =========================================================================
@@ -784,7 +784,7 @@ public:
 ### 8.3 Weight Loading Flow for PP
 
 ```cpp
-// In MultiDeviceOrchestrator::initializeDeviceRunners()
+// In RankOrchestrator::initializeDeviceRunners()
 
 if (pipeline_config_->hasPP()) {
     auto* weight_mgr = model_ctx_->weightManager();
@@ -860,7 +860,7 @@ ComputeGraph DeviceGraphOrchestrator::buildComputeGraph(
         
         // TP AllGather for column-parallel LM head (if in TP mode)
         if (local_tp_ctx_) {
-            // Note: AllGather for logits is handled by MultiDeviceOrchestrator
+            // Note: AllGather for logits is handled by RankOrchestrator
             // to gather across all TP devices, not within the graph
         }
     }
@@ -911,7 +911,7 @@ public:
 
 ### 10.1 Transfer Location: Coordinator vs Graph
 
-**Recommendation**: **Handle transfers in the coordinator (MultiDeviceOrchestrator)**, not in the graph.
+**Recommendation**: **Handle transfers in the coordinator (RankOrchestrator)**, not in the graph.
 
 Rationale:
 - Graphs are per-device; transfers are cross-device coordination
@@ -1090,11 +1090,11 @@ protected:
         }
         
         // Create orchestrator
-        MultiDeviceOrchestrator::Config config;
+        RankOrchestrator::Config config;
         config.pipeline_config = std::make_shared<PipelineConfig>(pp_config);
         config.max_seq_len = max_seq_len_;
         
-        return std::make_unique<MultiDeviceOrchestrator>(
+        return std::make_unique<RankOrchestrator>(
             loadModel(model_path), config);
     }
     
@@ -1110,10 +1110,10 @@ protected:
         pp_config.total_layers = /* compute from stages */;
         pp_config.autoSelectBackends();
         
-        MultiDeviceOrchestrator::Config config;
+        RankOrchestrator::Config config;
         config.pipeline_config = std::make_shared<PipelineConfig>(pp_config);
         
-        return std::make_unique<MultiDeviceOrchestrator>(
+        return std::make_unique<RankOrchestrator>(
             loadModel(model_path), config);
     }
 };
@@ -1171,7 +1171,7 @@ TEST_F(TPPPParityTest, TwoStage_TwoWayTP) {
 
 1. **Add ParallelismMode enum** to `OrchestrationConfig.h`
 2. **Add IExecutionStrategy interface** to `execution/strategies/`
-3. **Implement TPExecutionStrategy** (extract from current MultiDeviceOrchestrator)
+3. **Implement TPExecutionStrategy** (extract from current RankOrchestrator)
 4. **Add pp_assignment to DeviceGraphConfig**
 5. **Unit tests for strategy interface**
 
@@ -1192,10 +1192,10 @@ TEST_F(TPPPParityTest, TwoStage_TwoWayTP) {
    - `setPipelineConfig()`
    - `layerOnDevice()`
    - `preloadForPPStage()`
-2. **Update weight preloading** in MultiDeviceOrchestrator
+2. **Update weight preloading** in RankOrchestrator
 3. **Integration tests** with real model weights
 
-### Phase 3.4: MultiDeviceOrchestrator Integration (Week 3)
+### Phase 3.4: RankOrchestrator Integration (Week 3)
 
 1. **Extend Config** with `pipeline_config`
 2. **Add strategy selection** in constructor
@@ -1223,14 +1223,14 @@ TEST_F(TPPPParityTest, TwoStage_TwoWayTP) {
 
 ## 13. Code Sketches
 
-### 13.1 Extended MultiDeviceOrchestrator Header
+### 13.1 Extended RankOrchestrator Header
 
 ```cpp
-// src/v2/execution/local_execution/orchestrators/MultiDeviceOrchestrator.h
+// src/v2/execution/local_execution/orchestrators/RankOrchestrator.h
 
 #pragma once
 
-#include "IMultiDeviceOrchestrator.h"
+#include "IRankOrchestrator.h"
 #include "DeviceGraphOrchestrator.h"
 #include "../strategies/IExecutionStrategy.h"
 #include "../../../collective/ILocalTPContext.h"
@@ -1249,7 +1249,7 @@ enum class ParallelismMode {
     TP_PLUS_PP,
 };
 
-class MultiDeviceOrchestrator : public IMultiDeviceOrchestrator {
+class RankOrchestrator : public IRankOrchestrator {
 public:
     struct Config {
         // Mode (AUTO = infer)
@@ -1273,11 +1273,11 @@ public:
     };
     
     // Constructors
-    MultiDeviceOrchestrator(
+    RankOrchestrator(
         std::shared_ptr<IModelContext> model_ctx,
         const Config& config);
     
-    ~MultiDeviceOrchestrator() override;
+    ~RankOrchestrator() override;
     
     // IInferenceRunner
     bool forward(const int* tokens, int seq_len) override;
@@ -1287,7 +1287,7 @@ public:
     int vocab_size() const override;
     const char* architecture() const override;
     
-    // IMultiDeviceOrchestrator
+    // IRankOrchestrator
     int device_count() const override;
     IInferenceRunner* deviceRunner(int device_idx) override;
     ILocalTPContext* localTPContext() override;
@@ -1554,7 +1554,7 @@ private:
 
 ## Summary
 
-This design unifies TP and PP handling in `MultiDeviceOrchestrator` through:
+This design unifies TP and PP handling in `RankOrchestrator` through:
 
 1. **Same fundamental pattern**: N devices → N `DeviceGraphOrchestrator` instances, each with own state
 2. **Strategy pattern for coordination**: `IExecutionStrategy` encapsulates TP vs PP vs hybrid execution

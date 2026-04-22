@@ -78,7 +78,7 @@ namespace llaminar2
      * ## Usage
      *
      * ```cpp
-     * // In MultiDeviceOrchestrator
+     * // In RankOrchestrator
      * std::unique_ptr<IExecutionStrategy> strategy_;
      *
      * bool forward(const int* tokens, int seq_len) {

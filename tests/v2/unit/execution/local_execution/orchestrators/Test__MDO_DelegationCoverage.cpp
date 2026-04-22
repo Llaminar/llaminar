@@ -1,6 +1,6 @@
 /**
  * @file Test__MDO_DelegationCoverage.cpp
- * @brief Comprehensive unit tests for MultiDeviceOrchestrator delegation patterns
+ * @brief Comprehensive unit tests for RankOrchestrator delegation patterns
  *
  * Covers the MDO methods that delegate to device runners, PP stage runners,
  * and/or the TP context. Grouped by delegation pattern:
@@ -20,7 +20,7 @@
 
 #include <gtest/gtest.h>
 
-#include "execution/local_execution/orchestrators/MultiDeviceOrchestrator.h"
+#include "execution/local_execution/orchestrators/RankOrchestrator.h"
 #include "execution/local_execution/orchestrators/IInferenceRunner.h"
 #include "collective/ILocalTPContext.h"
 #include "backends/GlobalDeviceAddress.h"
@@ -325,15 +325,15 @@ private:
 class Test__MDO_DelegationCoverage : public ::testing::Test
 {
 protected:
-    std::unique_ptr<MultiDeviceOrchestrator> createMDO(
+    std::unique_ptr<RankOrchestrator> createMDO(
         std::vector<std::unique_ptr<IInferenceRunner>> runners,
         std::unique_ptr<ILocalTPContext> tp_ctx = nullptr)
     {
-        MultiDeviceOrchestrator::Config config;
+        RankOrchestrator::Config config;
         for (size_t i = 0; i < runners.size(); ++i)
             config.devices.push_back(GlobalDeviceAddress::cpu());
 
-        return MultiDeviceOrchestrator::createForTest(
+        return RankOrchestrator::createForTest(
             model_ctx_, std::move(runners), std::move(tp_ctx), config);
     }
 
@@ -352,7 +352,7 @@ protected:
         return ctx;
     }
 
-    std::pair<std::unique_ptr<MultiDeviceOrchestrator>, std::vector<TrackingMockRunner *>>
+    std::pair<std::unique_ptr<RankOrchestrator>, std::vector<TrackingMockRunner *>>
     createMDOWithTracking(int n_runners)
     {
         std::vector<TrackingMockRunner *> raw_ptrs;
@@ -715,7 +715,7 @@ TEST_F(Test__MDO_DelegationCoverage, SnapshotCapture_EnableDisableRoundtrip)
 }
 
 // =============================================================================
-// 9. MultiDeviceOrchestrator device_count and deviceRunner access
+// 9. RankOrchestrator device_count and deviceRunner access
 // =============================================================================
 
 TEST_F(Test__MDO_DelegationCoverage, DeviceCount_MatchesRunnerCount)

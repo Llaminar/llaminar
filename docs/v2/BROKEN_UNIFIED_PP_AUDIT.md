@@ -2,7 +2,7 @@
 
 **Date**: February 3, 2026  
 **Status**: To Be Removed  
-**Replacement**: MultiDeviceOrchestrator-based PP (per-stage orchestrators)
+**Replacement**: RankOrchestrator-based PP (per-stage orchestrators)
 
 ---
 
@@ -10,7 +10,7 @@
 
 The current PP implementation uses a "single DeviceGraphOrchestrator with unified graph" approach that is **architecturally broken**. The fundamental problem: **a single graph cannot span multiple GPU execution contexts**. Each GPU has its own execution queue, command buffer, and synchronization primitives - you cannot interleave stages across devices in a single DAG.
 
-This document audits exactly what code needs to be removed so the new MultiDeviceOrchestrator-based PP can replace it cleanly.
+This document audits exactly what code needs to be removed so the new RankOrchestrator-based PP can replace it cleanly.
 
 ---
 
@@ -80,7 +80,7 @@ ComputeGraph buildPartialForwardGraph(
     bool has_lm_head);    // Include LM head?
 ```
 
-This is what the new MultiDeviceOrchestrator uses - one partial graph per stage.
+This is what the new RankOrchestrator uses - one partial graph per stage.
 
 ### **ACTION**: Remove `buildUnifiedPipelineGraph()` (~350 lines in Qwen2Graph.cpp)
 Keep `buildPartialForwardGraph()` - it's the correct approach.
@@ -255,19 +255,19 @@ bool setupLocalPPPipeline()
 ```
 
 ### Contrast with `setupLocalTPPipeline()`
-The TP pipeline uses `MultiDeviceOrchestrator` - the CORRECT approach:
+The TP pipeline uses `RankOrchestrator` - the CORRECT approach:
 ```cpp
 bool setupLocalTPPipeline()
 {
-    // ... create multi_orch_ with MultiDeviceOrchestrator
+    // ... create multi_orch_ with RankOrchestrator
     runner_.reset(multi_orch_.release());
 }
 ```
 
-### **ACTION**: Rewrite `setupLocalPPPipeline()` to use MultiDeviceOrchestrator
+### **ACTION**: Rewrite `setupLocalPPPipeline()` to use RankOrchestrator
 - Remove call to `createUnifiedPipelineRunner()`
 - Create per-stage orchestrators via `createPPStageRunner()`
-- Coordinate execution via `MultiDeviceOrchestrator` pattern
+- Coordinate execution via `RankOrchestrator` pattern
 
 ---
 
@@ -339,7 +339,7 @@ bool setupLocalTPPipeline()
 
 | Item | Change Needed |
 |------|---------------|
-| `setupLocalPPPipeline()` | Use MultiDeviceOrchestrator instead of unified runner |
+| `setupLocalPPPipeline()` | Use RankOrchestrator instead of unified runner |
 | Tests calling `setupLocalPPPipeline()` | Update to use new API |
 
 ---
@@ -369,10 +369,10 @@ createUnifiedPipelineRunner()
 
 ## 8. The Correct Approach (for reference)
 
-The new MultiDeviceOrchestrator-based PP:
+The new RankOrchestrator-based PP:
 
 ```
-MultiDeviceOrchestrator
+RankOrchestrator
 ├── PPStageRunner[0] (DeviceGraphOrchestrator with partial graph)
 │   └── buildPartialForwardGraph(layers 0..N/2, has_embedding=true)
 │   └── KV cache for layers 0..N/2 only
@@ -390,7 +390,7 @@ Each orchestrator owns its own:
 - Partial compute graph
 - Execution loop
 
-The MultiDeviceOrchestrator coordinates:
+The RankOrchestrator coordinates:
 - Prefill/decode phase transitions
 - Activation transfers between stages
 - KV cache state synchronization (positions, etc.)

@@ -1,6 +1,6 @@
 /**
  * @file Test__DeviceSampler.cpp
- * @brief Unit tests for DeviceSampler extracted from MultiDeviceOrchestrator
+ * @brief Unit tests for DeviceSampler extracted from RankOrchestrator
  *
  * Tests the CPU-only fallback paths and edge cases. GPU-side sampling
  * (argmax, topK) is tested via integration tests.

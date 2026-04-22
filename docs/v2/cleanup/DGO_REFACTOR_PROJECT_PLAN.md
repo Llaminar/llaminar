@@ -27,7 +27,7 @@ The DeviceGraphOrchestrator is a 6,356-line monolith with:
 | Consumer | Relationship |
 |----------|-------------|
 | `InferenceRunnerFactory` | Creates DGO via constructor + 10+ setter calls |
-| `MultiDeviceOrchestrator` | Owns `vector<unique_ptr<DGO>>` (1 per TP device / PP stage) |
+| `RankOrchestrator` | Owns `vector<unique_ptr<DGO>>` (1 per TP device / PP stage) |
 | `MultiDomainOrchestrator` | Wraps 1 DGO |
 | `PPExecutionStrategy` | Takes `vector<DGO*>&` |
 | 7 unit test files + 4 integration test files | Direct construction and API calls |

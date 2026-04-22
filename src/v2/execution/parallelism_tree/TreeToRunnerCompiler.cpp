@@ -181,7 +181,7 @@ namespace llaminar2
             return ctx.tp_runner_factory(node, std::move(child_runners), ctx.model_ctx);
         }
 
-        // Default: Would create MultiDeviceOrchestrator(TP mode)
+        // Default: Would create RankOrchestrator(TP mode)
         LOG_WARN("TreeToRunnerCompiler: no tp_runner_factory provided, returning nullptr");
         return nullptr;
     }
@@ -215,7 +215,7 @@ namespace llaminar2
             }
         }
 
-        // Default: Would create MultiDeviceOrchestrator(PP mode)
+        // Default: Would create RankOrchestrator(PP mode)
         LOG_WARN("TreeToRunnerCompiler: no local_pp_runner_factory provided, returning nullptr");
         return nullptr;
     }

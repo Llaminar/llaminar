@@ -11,7 +11,7 @@
 #include "../../config/TPPPValidator.h"
 #include "../mpi_orchestration/ExecutionPlanBuilder.h"
 #include "../factory/InferenceRunnerFactory.h"
-#include "../local_execution/orchestrators/MultiDeviceOrchestrator.h"
+#include "../local_execution/orchestrators/RankOrchestrator.h"
 #include "../parallelism_tree/ParallelismTree.h"
 #include "../parallelism_tree/TreeToRunnerCompiler.h"
 #include "../../collective/LocalTPContext.h"
@@ -1063,7 +1063,7 @@ namespace llaminar2
         }
 
         // Build config from execution plan via canonical factory
-        auto mdo_config = MultiDeviceOrchestrator::Config::fromPlan(plan_);
+        auto mdo_config = RankOrchestrator::Config::fromPlan(plan_);
 
         LOG_INFO("[OrchestrationRunner] Multi-device precision config: activation="
                  << activationPrecisionToString(mdo_config.activation_precision)
@@ -1075,19 +1075,19 @@ namespace llaminar2
             return setError("Invalid multi-device configuration");
         }
 
-        // Create MultiDeviceOrchestrator via factory
+        // Create RankOrchestrator via factory
         // Note: local_tp_ctx_ was already created in setupLocalTPContext()
-        auto multi_orchestrator = createMultiDeviceOrchestrator(
+        auto multi_orchestrator = createRankOrchestrator(
             model_ctx_,
             std::move(local_tp_ctx_),
             mdo_config);
 
         if (!multi_orchestrator)
         {
-            return setError("Failed to create MultiDeviceOrchestrator");
+            return setError("Failed to create RankOrchestrator");
         }
 
-        // Store as IInferenceRunner (MultiDeviceOrchestrator extends it)
+        // Store as IInferenceRunner (RankOrchestrator extends it)
         runner_ = std::move(multi_orchestrator);
 
         LOG_INFO("Multi-device compute graph built successfully");
@@ -1122,7 +1122,7 @@ namespace llaminar2
         }
 
         // Build config from execution plan via canonical factory
-        auto mdo_config = MultiDeviceOrchestrator::Config::fromPlan(plan_);
+        auto mdo_config = RankOrchestrator::Config::fromPlan(plan_);
 
         // Log PP stage details
         for (size_t i = 0; i < mdo_config.pp_stages.size(); ++i)
@@ -1145,8 +1145,8 @@ namespace llaminar2
         // LOCAL PP uses TensorBase::transferTo() which routes through the backend router.
         GlobalBackendRouter::initForTests();
 
-        std::unique_ptr<MultiDeviceOrchestrator> orch;
-        orch = std::make_unique<MultiDeviceOrchestrator>(model_ctx_, mdo_config);
+        std::unique_ptr<RankOrchestrator> orch;
+        orch = std::make_unique<RankOrchestrator>(model_ctx_, mdo_config);
         runner_ = std::move(orch);
 
         LOG_INFO("Local PP compute graph built successfully");

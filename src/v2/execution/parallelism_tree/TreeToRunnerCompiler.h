@@ -6,8 +6,8 @@
  * IInferenceRunner instances:
  *
  * - DEVICE leaf → DeviceGraphOrchestrator (or mock for testing)
- * - TP node (same rank) → MultiDeviceOrchestrator(TP mode)
- * - PP node (same rank) → MultiDeviceOrchestrator(PP mode)
+ * - TP node (same rank) → RankOrchestrator(TP mode)
+ * - PP node (same rank) → RankOrchestrator(PP mode)
  * - PP node (cross rank) → PipelineRunner
  *
  * Each rank compiles only its portion of the tree. Nodes not owned by
@@ -20,8 +20,8 @@
  * └── TP(rank1, [cuda:0, cuda:1])  ← rank 1 compiles this subtree
  * ```
  *
- * Rank 0 gets: PipelineRunner with stage 0 = MultiDeviceOrchestrator(TP)
- * Rank 1 gets: PipelineRunner with stage 1 = MultiDeviceOrchestrator(TP)
+ * Rank 0 gets: PipelineRunner with stage 0 = RankOrchestrator(TP)
+ * Rank 1 gets: PipelineRunner with stage 1 = RankOrchestrator(TP)
  *
  * @author David Sanftenberg
  * @date February 2026
@@ -47,7 +47,7 @@ namespace llaminar2
      *
      * The compiler walks the tree and produces appropriate runner instances
      * for each node type. Cross-rank PP produces PipelineRunner, local TP/PP
-     * produces MultiDeviceOrchestrator.
+     * produces RankOrchestrator.
      */
     class TreeToRunnerCompiler
     {
@@ -130,10 +130,10 @@ namespace llaminar2
             /// Factory for creating device runners (default: real orchestrator)
             DeviceRunnerFactory device_runner_factory;
 
-            /// Factory for creating TP runners (default: real MultiDeviceOrchestrator)
+            /// Factory for creating TP runners (default: real RankOrchestrator)
             TPRunnerFactory tp_runner_factory;
 
-            /// Factory for creating local PP runners (default: real MultiDeviceOrchestrator)
+            /// Factory for creating local PP runners (default: real RankOrchestrator)
             LocalPPRunnerFactory local_pp_runner_factory;
         };
 
@@ -219,7 +219,7 @@ namespace llaminar2
          *
          * @param node TP node
          * @param ctx Compilation context
-         * @return MultiDeviceOrchestrator(TP mode) (or mock)
+         * @return RankOrchestrator(TP mode) (or mock)
          */
         static std::unique_ptr<IInferenceRunner> compileTP(
             const ParallelismNode &node,
@@ -230,7 +230,7 @@ namespace llaminar2
          *
          * @param node PP node (all children same rank)
          * @param ctx Compilation context
-         * @return MultiDeviceOrchestrator(PP mode) (or mock)
+         * @return RankOrchestrator(PP mode) (or mock)
          */
         static std::unique_ptr<IInferenceRunner> compileLocalPP(
             const ParallelismNode &node,

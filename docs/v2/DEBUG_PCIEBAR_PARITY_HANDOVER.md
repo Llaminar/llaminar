@@ -266,7 +266,7 @@ python3 scripts/pytorch_parity_reference.py \
 | File | Purpose |
 |------|---------|
 | `tests/v2/integration/parity/qwen2/Test__Qwen2_LocalTP_PCIeBAR_vs_PyTorch.cpp` | Main test file |
-| `src/v2/execution/MultiDeviceOrchestrator.cpp` | `gatherLogits()` implementation |
+| `src/v2/execution/RankOrchestrator.cpp` | `gatherLogits()` implementation |
 | `src/v2/execution/DeviceGraphOrchestrator.cpp` | Per-device runner, KV cache handling |
 | `src/v2/pipelines/qwen/Qwen2Pipeline.cpp` | Decode loop, position management |
 | `src/v2/collective/backends/PCIeBARBackend.cpp` | AllReduce implementation |

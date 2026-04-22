@@ -12,7 +12,7 @@ WeightManager has grown to ~4700 lines across 3 files (896 `.h`, 3428 `.cpp`, 37
 
 ### Symptoms
 
-1. **Multi-Phase Initialization**: After construction, callers must invoke 5-8 setter methods in correct order. This sequence is duplicated in 3 places (InferenceRunnerFactory, MultiDeviceOrchestrator, tests). Forgetting a call silently produces wrong results.
+1. **Multi-Phase Initialization**: After construction, callers must invoke 5-8 setter methods in correct order. This sequence is duplicated in 3 places (InferenceRunnerFactory, RankOrchestrator, tests). Forgetting a call silently produces wrong results.
 
 2. **Bloated Interface**: `IWeightManager` has 20+ pure virtuals spanning unrelated concerns (weight access, sharding queries, cache management, device lifecycle, configuration, PP info). The existing `MockWeightManager` is 350+ lines and still incomplete.
 
@@ -208,7 +208,7 @@ Each step is independently buildable and testable. Old code continues to work at
 | 5 | Add `configure(WeightManagerConfig)` to IWeightManager + WeightManager | Modify interface + WM | Low — backward compat | ✅ Done (8 tests) |
 | 6 | ~~Wire `WeightManager` internals to use extracted components~~ | ~~Modify WM~~ | — | ❌ Cancelled — no extracted components to wire to |
 | 7 | Slim `IWeightManager` (move lifecycle methods off interface) | Modify interface + callers | Medium | ✅ Done (22→9 pure virtuals) |
-| 8 | Update callers to use `configure()` instead of setter chains | Modify InferenceRunnerFactory, MultiDeviceOrchestrator | Low — mechanical | ✅ Done |
+| 8 | Update callers to use `configure()` instead of setter chains | Modify InferenceRunnerFactory, RankOrchestrator | Low — mechanical | ✅ Done |
 | 9 | Delete deprecated static helpers (`isQKVWeight`, etc.) | Modify WM + tests | Low | ✅ Done — 8 helpers + 25 tests removed |
 
 ---

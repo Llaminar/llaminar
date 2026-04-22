@@ -1,6 +1,6 @@
 /**
- * @file Test__MultiDeviceOrchestrator_GetSnapshotPPTP.cpp
- * @brief Unit tests for MultiDeviceOrchestrator::getSnapshot in PP+TP hybrid mode
+ * @file Test__RankOrchestrator_GetSnapshotPPTP.cpp
+ * @brief Unit tests for RankOrchestrator::getSnapshot in PP+TP hybrid mode
  *
  * These tests verify correct behavior of getSnapshot("LM_HEAD") when
  * PP stages don't own the LM head but still have combined_logits_ allocated.
@@ -17,7 +17,7 @@
  */
 
 #include <gtest/gtest.h>
-#include "execution/local_execution/orchestrators/MultiDeviceOrchestrator.h"
+#include "execution/local_execution/orchestrators/RankOrchestrator.h"
 #include "execution/local_execution/orchestrators/IInferenceRunner.h"
 #include "execution/factory/FactoryPPStageConfig.h"
 #include "collective/ILocalTPContext.h"
@@ -35,12 +35,12 @@ namespace llaminar2::test
     // Test Fixture
     // =========================================================================
 
-    class Test__MultiDeviceOrchestrator_GetSnapshotPPTP : public ::testing::Test
+    class Test__RankOrchestrator_GetSnapshotPPTP : public ::testing::Test
     {
     protected:
-        using Config = MultiDeviceOrchestrator::Config;
-        using PPStageConfig = MultiDeviceOrchestrator::PPStageConfig;
-        using ParallelismMode = MultiDeviceOrchestrator::ParallelismMode;
+        using Config = RankOrchestrator::Config;
+        using PPStageConfig = RankOrchestrator::PPStageConfig;
+        using ParallelismMode = RankOrchestrator::ParallelismMode;
     };
 
     // =========================================================================
@@ -53,7 +53,7 @@ namespace llaminar2::test
      * This tests the hasLMHead() / hasEmbedding() interface that allows
      * PP stages to declare what they own.
      */
-    TEST_F(Test__MultiDeviceOrchestrator_GetSnapshotPPTP, WeightManager_ReportsOwnership)
+    TEST_F(Test__RankOrchestrator_GetSnapshotPPTP, WeightManager_ReportsOwnership)
     {
         auto wm = std::make_shared<MockWeightManager>();
 
@@ -78,7 +78,7 @@ namespace llaminar2::test
      * Verifies that PPStageConfig.has_lm_head and has_embedding are
      * correctly stored and can be used to configure nested stages.
      */
-    TEST_F(Test__MultiDeviceOrchestrator_GetSnapshotPPTP, PPStageConfig_OwnershipFlags)
+    TEST_F(Test__RankOrchestrator_GetSnapshotPPTP, PPStageConfig_OwnershipFlags)
     {
         PPStageConfig stage0;
         stage0.first_layer = 0;
@@ -111,7 +111,7 @@ namespace llaminar2::test
      * should include the has_lm_head flag so the nested runners know whether
      * to build LM_HEAD stages or not.
      */
-    TEST_F(Test__MultiDeviceOrchestrator_GetSnapshotPPTP, NestedPPConfig_IncludesHasLMHead)
+    TEST_F(Test__RankOrchestrator_GetSnapshotPPTP, NestedPPConfig_IncludesHasLMHead)
     {
         Config outer_config;
         outer_config.mode = ParallelismMode::TP_PP;
@@ -152,7 +152,7 @@ namespace llaminar2::test
      *
      * Counterpart to the above test - verify stage 1 correctly gets has_lm_head=true.
      */
-    TEST_F(Test__MultiDeviceOrchestrator_GetSnapshotPPTP, NestedPPConfig_Stage1HasLMHead)
+    TEST_F(Test__RankOrchestrator_GetSnapshotPPTP, NestedPPConfig_Stage1HasLMHead)
     {
         PPStageConfig stage1;
         stage1.first_layer = 12;
@@ -191,7 +191,7 @@ namespace llaminar2::test
      * The bug was that getSnapshot() only checked if combined_logits_ was non-null,
      * not whether this stage actually owned the LM_HEAD.
      */
-    TEST_F(Test__MultiDeviceOrchestrator_GetSnapshotPPTP, GetSnapshot_LMHead_RespectsOwnership)
+    TEST_F(Test__RankOrchestrator_GetSnapshotPPTP, GetSnapshot_LMHead_RespectsOwnership)
     {
         // This test documents the expected CONTRACT:
         // - An MDO with hasLMHead()=false should NOT return its combined_logits_
@@ -223,7 +223,7 @@ namespace llaminar2::test
     /**
      * @brief Test: Weight manager correctly simulates PP stage 0 (no LM_HEAD)
      */
-    TEST_F(Test__MultiDeviceOrchestrator_GetSnapshotPPTP, WeightManager_SimulatesPPStage0)
+    TEST_F(Test__RankOrchestrator_GetSnapshotPPTP, WeightManager_SimulatesPPStage0)
     {
         auto wm = std::make_shared<MockWeightManager>();
         wm->setHasLMHead(false);
@@ -237,7 +237,7 @@ namespace llaminar2::test
     /**
      * @brief Test: Weight manager correctly simulates PP stage 1 (has LM_HEAD)
      */
-    TEST_F(Test__MultiDeviceOrchestrator_GetSnapshotPPTP, WeightManager_SimulatesPPStage1)
+    TEST_F(Test__RankOrchestrator_GetSnapshotPPTP, WeightManager_SimulatesPPStage1)
     {
         auto wm = std::make_shared<MockWeightManager>();
         wm->setHasLMHead(true);
@@ -253,7 +253,7 @@ namespace llaminar2::test
      *
      * Ensures that PP stage configs require explicit ownership specification.
      */
-    TEST_F(Test__MultiDeviceOrchestrator_GetSnapshotPPTP, PPStageConfig_RequiresExplicitOwnership)
+    TEST_F(Test__RankOrchestrator_GetSnapshotPPTP, PPStageConfig_RequiresExplicitOwnership)
     {
         // When creating PP configs, ownership must be explicitly set
         Config config;
@@ -297,7 +297,7 @@ namespace llaminar2::test
      * The FactoryPPStageConfig is used to pass PP stage info through the
      * InferenceRunnerFactory to nested MDOs.
      */
-    TEST_F(Test__MultiDeviceOrchestrator_GetSnapshotPPTP, FactoryPPStageConfig_TransfersOwnership)
+    TEST_F(Test__RankOrchestrator_GetSnapshotPPTP, FactoryPPStageConfig_TransfersOwnership)
     {
         PPStageConfig pp_stage;
         pp_stage.first_layer = 0;
@@ -326,7 +326,7 @@ namespace llaminar2::test
      * Complex PP+TP scenario where both stages are TP domains but with
      * different ownership flags.
      */
-    TEST_F(Test__MultiDeviceOrchestrator_GetSnapshotPPTP, MultiTPDomain_DifferentOwnership)
+    TEST_F(Test__RankOrchestrator_GetSnapshotPPTP, MultiTPDomain_DifferentOwnership)
     {
         Config config;
         config.mode = ParallelismMode::TP_PP;
@@ -375,7 +375,7 @@ namespace llaminar2::test
      *
      * Sanity check that layer ranges and ownership flags are consistent.
      */
-    TEST_F(Test__MultiDeviceOrchestrator_GetSnapshotPPTP, LayerRangeOwnershipConsistency)
+    TEST_F(Test__RankOrchestrator_GetSnapshotPPTP, LayerRangeOwnershipConsistency)
     {
         const int total_layers = 24;
 

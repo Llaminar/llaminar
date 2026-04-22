@@ -29,7 +29,7 @@ namespace llaminar2
      *
      * Returned by getLogitsLocalInfo() to provide GPU pointer, device, and
      * shape information for column-parallel LM head gather and GPU-side sampling.
-     * This decouples MultiDeviceOrchestrator from DeviceGraphOrchestrator's
+     * This decouples RankOrchestrator from DeviceGraphOrchestrator's
      * internal InferenceState struct.
      */
     struct LogitsLocalInfo
@@ -364,7 +364,7 @@ namespace llaminar2
         // Device & Logits Local API
         // =====================================================================
         // These methods expose device identity and column-parallel logits state
-        // so that MultiDeviceOrchestrator can coordinate logits gathering and
+        // so that RankOrchestrator can coordinate logits gathering and
         // GPU-side sampling without downcasting to a concrete runner type.
 
         /**
@@ -387,7 +387,7 @@ namespace llaminar2
          * @brief Get local logits info for column-parallel gathering
          *
          * Returns GPU pointer, device, shape, and tensor pointer for the
-         * per-device logits shard. Used by MultiDeviceOrchestrator for
+         * per-device logits shard. Used by RankOrchestrator for
          * AllGather of column-parallel LM head output.
          *
          * @return LogitsLocalInfo (empty by default)

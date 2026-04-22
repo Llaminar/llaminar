@@ -70,7 +70,7 @@ Apply the same self-registration pattern to `SchemaFactoryRegistry`:
 - `src/v2/execution/local_execution/graph/SchemaFactoryRegistry.h` — Added `registerFactory()`, `SchemaFactoryRegistrar`, `REGISTER_SCHEMA_FACTORY` macro
 - `src/v2/execution/local_execution/graph/SchemaFactoryRegistry.cpp` — Replaced includes + if/else with dynamic map lookup (no model includes)
 - `src/v2/models/qwen/Qwen2Graph.cpp` — Added schema self-registration for both "qwen2" and "qwen3"
-- `src/v2/execution/local_execution/orchestrators/MultiDeviceOrchestrator.cpp` — Made createForTest tolerant of unregistered architectures
+- `src/v2/execution/local_execution/orchestrators/RankOrchestrator.cpp` — Made createForTest tolerant of unregistered architectures
 
 ### Tests
 - `tests/v2/unit/execution/local_execution/graph/Test__SchemaFactoryRegistry.cpp` — 8 tests

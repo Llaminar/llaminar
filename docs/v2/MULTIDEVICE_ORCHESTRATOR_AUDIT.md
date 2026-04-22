@@ -1,12 +1,12 @@
-# MultiDeviceOrchestrator Class Audit
+# RankOrchestrator Class Audit
 
-**Purpose**: Document the EXACT current interface of `MultiDeviceOrchestrator` to plan minimal, surgical changes for Pipeline Parallelism support.
+**Purpose**: Document the EXACT current interface of `RankOrchestrator` to plan minimal, surgical changes for Pipeline Parallelism support.
 
 **Date**: 2026-02-03  
 **Files Audited**:
-- [MultiDeviceOrchestrator.h](../../src/v2/execution/local_execution/orchestrators/MultiDeviceOrchestrator.h) (526 lines)
-- [MultiDeviceOrchestrator.cpp](../../src/v2/execution/local_execution/orchestrators/MultiDeviceOrchestrator.cpp) (1371 lines)
-- [IMultiDeviceOrchestrator.h](../../src/v2/execution/local_execution/orchestrators/IMultiDeviceOrchestrator.h) (162 lines)
+- [RankOrchestrator.h](../../src/v2/execution/local_execution/orchestrators/RankOrchestrator.h) (526 lines)
+- [RankOrchestrator.cpp](../../src/v2/execution/local_execution/orchestrators/RankOrchestrator.cpp) (1371 lines)
+- [IRankOrchestrator.h](../../src/v2/execution/local_execution/orchestrators/IRankOrchestrator.h) (162 lines)
 - [IInferenceRunner.h](../../src/v2/execution/local_execution/orchestrators/IInferenceRunner.h) (268 lines)
 
 ---
@@ -15,8 +15,8 @@
 
 ```
 IInferenceRunner (base interface)
-    ↳ IMultiDeviceOrchestrator (adds multi-device methods)
-        ↳ MultiDeviceOrchestrator (concrete implementation)
+    ↳ IRankOrchestrator (adds multi-device methods)
+        ↳ RankOrchestrator (concrete implementation)
 ```
 
 ---
@@ -77,12 +77,12 @@ virtual const PlacementPlan &getPlacementPlan() const { throw ...; }
 
 ---
 
-## 3. IMultiDeviceOrchestrator Interface (Full)
+## 3. IRankOrchestrator Interface (Full)
 
-**File**: [IMultiDeviceOrchestrator.h#L63-L162](../../src/v2/execution/local_execution/orchestrators/IMultiDeviceOrchestrator.h#L63-L162)
+**File**: [IRankOrchestrator.h#L63-L162](../../src/v2/execution/local_execution/orchestrators/IRankOrchestrator.h#L63-L162)
 
 ```cpp
-class IMultiDeviceOrchestrator : public IInferenceRunner
+class IRankOrchestrator : public IInferenceRunner
 {
 public:
     // Multi-Device Query API
@@ -102,9 +102,9 @@ public:
 
 ---
 
-## 4. MultiDeviceOrchestrator::Config Structure
+## 4. RankOrchestrator::Config Structure
 
-**File**: [MultiDeviceOrchestrator.h#L84-L133](../../src/v2/execution/local_execution/orchestrators/MultiDeviceOrchestrator.h#L84-L133)
+**File**: [RankOrchestrator.h#L84-L133](../../src/v2/execution/local_execution/orchestrators/RankOrchestrator.h#L84-L133)
 
 ```cpp
 struct Config
@@ -141,13 +141,13 @@ struct Config
 
 ---
 
-## 5. MultiDeviceOrchestrator Public Methods (Full)
+## 5. RankOrchestrator Public Methods (Full)
 
-**File**: [MultiDeviceOrchestrator.h](../../src/v2/execution/local_execution/orchestrators/MultiDeviceOrchestrator.h)
+**File**: [RankOrchestrator.h](../../src/v2/execution/local_execution/orchestrators/RankOrchestrator.h)
 
 ### Factory Methods
 ```cpp
-static std::unique_ptr<MultiDeviceOrchestrator> createForTest(
+static std::unique_ptr<RankOrchestrator> createForTest(
     std::shared_ptr<IModelContext> model_ctx,
     std::vector<std::unique_ptr<DeviceGraphOrchestrator>> device_runners,
     std::unique_ptr<ILocalTPContext> tp_ctx,
@@ -157,23 +157,23 @@ static std::unique_ptr<MultiDeviceOrchestrator> createForTest(
 ### Constructors
 ```cpp
 // Primary constructor - creates tp_ctx_ and device_runners_ internally
-MultiDeviceOrchestrator(
+RankOrchestrator(
     std::shared_ptr<IModelContext> model_ctx,
     const Config &config);
 
 // Pre-existing TP context constructor
-MultiDeviceOrchestrator(
+RankOrchestrator(
     std::shared_ptr<IModelContext> model_ctx,
     std::unique_ptr<ILocalTPContext> tp_ctx,
     const Config &config);
 
-~MultiDeviceOrchestrator() override;
+~RankOrchestrator() override;
 
 // Non-copyable, movable
-MultiDeviceOrchestrator(const MultiDeviceOrchestrator &) = delete;
-MultiDeviceOrchestrator &operator=(const MultiDeviceOrchestrator &) = delete;
-MultiDeviceOrchestrator(MultiDeviceOrchestrator &&) noexcept;
-MultiDeviceOrchestrator &operator=(MultiDeviceOrchestrator &&) noexcept;
+RankOrchestrator(const RankOrchestrator &) = delete;
+RankOrchestrator &operator=(const RankOrchestrator &) = delete;
+RankOrchestrator(RankOrchestrator &&) noexcept;
+RankOrchestrator &operator=(RankOrchestrator &&) noexcept;
 ```
 
 ### IInferenceRunner Implementation
@@ -217,7 +217,7 @@ bool hasPlacementPlan() const override;
 const PlacementPlan &getPlacementPlan() const override;
 ```
 
-### IMultiDeviceOrchestrator Implementation
+### IRankOrchestrator Implementation
 ```cpp
 int device_count() const override;
 IInferenceRunner *deviceRunner(int device_idx) override;
@@ -230,9 +230,9 @@ void synchronizeDevices() override;
 
 ---
 
-## 6. MultiDeviceOrchestrator Member Variables
+## 6. RankOrchestrator Member Variables
 
-**File**: [MultiDeviceOrchestrator.h#L479-L526](../../src/v2/execution/local_execution/orchestrators/MultiDeviceOrchestrator.h#L479-L526)
+**File**: [RankOrchestrator.h#L479-L526](../../src/v2/execution/local_execution/orchestrators/RankOrchestrator.h#L479-L526)
 
 ```cpp
 private:
@@ -280,7 +280,7 @@ private:
 ```cpp
 private:
     // Private constructor for createForTest factory
-    MultiDeviceOrchestrator(
+    RankOrchestrator(
         std::shared_ptr<IModelContext> model_ctx,
         std::vector<std::unique_ptr<DeviceGraphOrchestrator>> device_runners,
         std::unique_ptr<ILocalTPContext> tp_ctx,
@@ -295,12 +295,12 @@ private:
 
 ## 8. forward() Implementation Analysis
 
-**File**: [MultiDeviceOrchestrator.cpp#L620-L753](../../src/v2/execution/local_execution/orchestrators/MultiDeviceOrchestrator.cpp#L620-L753)
+**File**: [RankOrchestrator.cpp#L620-L753](../../src/v2/execution/local_execution/orchestrators/RankOrchestrator.cpp#L620-L753)
 
 ### Execution Flow
 
 ```cpp
-bool MultiDeviceOrchestrator::forward(const int *tokens, int seq_len)
+bool RankOrchestrator::forward(const int *tokens, int seq_len)
 {
     // 1. Launch PARALLEL forward passes on ALL devices
     std::vector<std::future<bool>> futures;
@@ -351,12 +351,12 @@ bool MultiDeviceOrchestrator::forward(const int *tokens, int seq_len)
 
 ## 9. gatherLogits() Implementation Analysis
 
-**File**: [MultiDeviceOrchestrator.cpp#L403-L565](../../src/v2/execution/local_execution/orchestrators/MultiDeviceOrchestrator.cpp#L403-L565)
+**File**: [RankOrchestrator.cpp#L403-L565](../../src/v2/execution/local_execution/orchestrators/RankOrchestrator.cpp#L403-L565)
 
 ### Logic Flow
 
 ```cpp
-bool MultiDeviceOrchestrator::gatherLogits(size_t seq_len)
+bool RankOrchestrator::gatherLogits(size_t seq_len)
 {
     // Single device: just copy from primary
     if (!tp_ctx_ || device_runners_.size() == 1) {
@@ -404,7 +404,7 @@ bool MultiDeviceOrchestrator::gatherLogits(size_t seq_len)
 
 ## 10. initializeDeviceRunners() Implementation Analysis
 
-**File**: [MultiDeviceOrchestrator.cpp#L206-L400](../../src/v2/execution/local_execution/orchestrators/MultiDeviceOrchestrator.cpp#L206-L400)
+**File**: [RankOrchestrator.cpp#L206-L400](../../src/v2/execution/local_execution/orchestrators/RankOrchestrator.cpp#L206-L400)
 
 ### Steps
 
@@ -446,12 +446,12 @@ bool MultiDeviceOrchestrator::gatherLogits(size_t seq_len)
 
 ## 11. Constructor Logic
 
-**File**: [MultiDeviceOrchestrator.cpp#L116-L195](../../src/v2/execution/local_execution/orchestrators/MultiDeviceOrchestrator.cpp#L116-L195)
+**File**: [RankOrchestrator.cpp#L116-L195](../../src/v2/execution/local_execution/orchestrators/RankOrchestrator.cpp#L116-L195)
 
 ### Primary Constructor
 
 ```cpp
-MultiDeviceOrchestrator(model_ctx, config)
+RankOrchestrator(model_ctx, config)
 {
     // 1. Validate config
     config_.validate();
@@ -470,7 +470,7 @@ MultiDeviceOrchestrator(model_ctx, config)
 ### With Pre-existing TP Context
 
 ```cpp
-MultiDeviceOrchestrator(model_ctx, tp_ctx, config)
+RankOrchestrator(model_ctx, tp_ctx, config)
 {
     // Skip creating tp_ctx_, use provided one
     tp_ctx_ = std::move(tp_ctx);
@@ -494,7 +494,7 @@ virtual void clearHiddenStateInput() {}
 
 **These methods exist but have DEFAULT NO-OP implementations in IInferenceRunner!**
 
-### What MultiDeviceOrchestrator DOES NOT Override
+### What RankOrchestrator DOES NOT Override
 
 - `getHiddenState()` - uses default `return nullptr`
 - `setHiddenState()` - uses default no-op
@@ -514,7 +514,7 @@ Current `Config` has:
 
 ## 13. Summary: Minimal Changes for PP Support
 
-### Option A: Extend MultiDeviceOrchestrator
+### Option A: Extend RankOrchestrator
 
 Add to `Config`:
 ```cpp
@@ -537,7 +537,7 @@ void clearHiddenStateInput() override;
 ### Option B: Create PipelineParallelOrchestrator
 
 New class that:
-- Owns multiple `MultiDeviceOrchestrator` instances (one per PP stage)
+- Owns multiple `RankOrchestrator` instances (one per PP stage)
 - Coordinates hidden state transfer between stages
 - Manages inter-stage communication (P2P or memcpy)
 
@@ -555,10 +555,10 @@ Single class supporting both:
 |-----------|------|------------|
 | IInferenceRunner interface | `orchestrators/IInferenceRunner.h` | 38-268 |
 | Hidden State API | `orchestrators/IInferenceRunner.h` | 192-223 |
-| IMultiDeviceOrchestrator | `orchestrators/IMultiDeviceOrchestrator.h` | 63-162 |
-| MultiDeviceOrchestrator::Config | `orchestrators/MultiDeviceOrchestrator.h` | 84-133 |
-| MultiDeviceOrchestrator class | `orchestrators/MultiDeviceOrchestrator.h` | 75-526 |
-| forward() implementation | `orchestrators/MultiDeviceOrchestrator.cpp` | 620-753 |
-| gatherLogits() | `orchestrators/MultiDeviceOrchestrator.cpp` | 403-565 |
-| initializeDeviceRunners() | `orchestrators/MultiDeviceOrchestrator.cpp` | 206-400 |
-| Constructor | `orchestrators/MultiDeviceOrchestrator.cpp` | 116-195 |
+| IRankOrchestrator | `orchestrators/IRankOrchestrator.h` | 63-162 |
+| RankOrchestrator::Config | `orchestrators/RankOrchestrator.h` | 84-133 |
+| RankOrchestrator class | `orchestrators/RankOrchestrator.h` | 75-526 |
+| forward() implementation | `orchestrators/RankOrchestrator.cpp` | 620-753 |
+| gatherLogits() | `orchestrators/RankOrchestrator.cpp` | 403-565 |
+| initializeDeviceRunners() | `orchestrators/RankOrchestrator.cpp` | 206-400 |
+| Constructor | `orchestrators/RankOrchestrator.cpp` | 116-195 |

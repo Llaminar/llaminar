@@ -2,7 +2,7 @@
  * @file Test__InferenceRunnerFactory_MultiDevice.cpp
  * @brief Unit tests for MultiDevice factory functions in InferenceRunnerFactory
  *
- * Tests the createMultiDeviceOrchestrator and createTestableMultiDeviceOrchestrator
+ * Tests the createRankOrchestrator and createTestableRankOrchestrator
  * factory functions with various configurations.
  *
  * @author David Sanftenberg
@@ -13,9 +13,9 @@
 #include <gmock/gmock.h>
 
 #include "execution/factory/InferenceRunnerFactory.h"
-#include "execution/local_execution/orchestrators/MultiDeviceOrchestrator.h"
+#include "execution/local_execution/orchestrators/RankOrchestrator.h"
 #include "execution/local_execution/orchestrators/DeviceGraphOrchestrator.h"
-#include "execution/local_execution/orchestrators/IMultiDeviceOrchestrator.h"
+#include "execution/local_execution/orchestrators/IRankOrchestrator.h"
 #include "collective/ILocalTPContext.h"
 #include "backends/GlobalDeviceAddress.h"
 #include "mocks/MockModelContext.h"
@@ -157,7 +157,7 @@ namespace
     };
 
     // =============================================================================
-    // createMultiDeviceOrchestrator Tests
+    // createRankOrchestrator Tests
     // =============================================================================
 
     TEST_F(Test__InferenceRunnerFactory_MultiDevice, NullModelContextReturnsNull)
@@ -167,19 +167,19 @@ namespace
             std::vector<GlobalDeviceAddress>{GlobalDeviceAddress::cpu()},
             std::vector<float>{1.0f});
 
-        MultiDeviceOrchestrator::Config config;
+        RankOrchestrator::Config config;
         config.devices = tp_ctx->devices();
 
-        auto result = createMultiDeviceOrchestrator(nullptr, std::move(tp_ctx), config);
+        auto result = createRankOrchestrator(nullptr, std::move(tp_ctx), config);
         EXPECT_EQ(result, nullptr);
     }
 
     TEST_F(Test__InferenceRunnerFactory_MultiDevice, NullTPContextReturnsNull)
     {
-        MultiDeviceOrchestrator::Config config;
+        RankOrchestrator::Config config;
         config.devices = {GlobalDeviceAddress::cpu()};
 
-        auto result = createMultiDeviceOrchestrator(model_ctx_, nullptr, config);
+        auto result = createRankOrchestrator(model_ctx_, nullptr, config);
         EXPECT_EQ(result, nullptr);
     }
 
@@ -189,10 +189,10 @@ namespace
             std::vector<GlobalDeviceAddress>{},
             std::vector<float>{});
 
-        MultiDeviceOrchestrator::Config config;
+        RankOrchestrator::Config config;
         // config.devices is empty - should fail validation
 
-        auto result = createMultiDeviceOrchestrator(model_ctx_, std::move(tp_ctx), config);
+        auto result = createRankOrchestrator(model_ctx_, std::move(tp_ctx), config);
         EXPECT_EQ(result, nullptr);
     }
 
@@ -202,16 +202,16 @@ namespace
             std::vector<GlobalDeviceAddress>{GlobalDeviceAddress::cpu(), GlobalDeviceAddress::cpu()},
             std::vector<float>{0.3f, 0.3f}); // Sum != 1.0
 
-        MultiDeviceOrchestrator::Config config;
+        RankOrchestrator::Config config;
         config.devices = tp_ctx->devices();
         config.weights = {0.3f, 0.3f}; // Invalid - doesn't sum to 1.0
 
-        auto result = createMultiDeviceOrchestrator(model_ctx_, std::move(tp_ctx), config);
+        auto result = createRankOrchestrator(model_ctx_, std::move(tp_ctx), config);
         EXPECT_EQ(result, nullptr);
     }
 
     // =============================================================================
-    // createTestableMultiDeviceOrchestrator Tests
+    // createTestableRankOrchestrator Tests
     // =============================================================================
 
     TEST_F(Test__InferenceRunnerFactory_MultiDevice, TestableWithNullModelCtxReturnsNull)
@@ -219,10 +219,10 @@ namespace
         std::vector<std::unique_ptr<IInferenceRunner>> runners;
         // Can't create real runners without model - this tests null check
 
-        MultiDeviceOrchestrator::Config config;
+        RankOrchestrator::Config config;
         config.devices = {GlobalDeviceAddress::cpu()};
 
-        auto result = createTestableMultiDeviceOrchestrator(
+        auto result = createTestableRankOrchestrator(
             nullptr, std::move(runners), nullptr, config);
         EXPECT_EQ(result, nullptr);
     }
@@ -231,10 +231,10 @@ namespace
     {
         std::vector<std::unique_ptr<IInferenceRunner>> empty_runners;
 
-        MultiDeviceOrchestrator::Config config;
+        RankOrchestrator::Config config;
         config.devices = {GlobalDeviceAddress::cpu()};
 
-        auto result = createTestableMultiDeviceOrchestrator(
+        auto result = createTestableRankOrchestrator(
             model_ctx_, std::move(empty_runners), nullptr, config);
         EXPECT_EQ(result, nullptr);
     }
@@ -243,61 +243,61 @@ namespace
     // Config Validation Tests
     // =============================================================================
 
-    TEST(Test__MultiDeviceOrchestratorConfig, ValidateEmptyDevicesFails)
+    TEST(Test__RankOrchestratorConfig, ValidateEmptyDevicesFails)
     {
-        MultiDeviceOrchestrator::Config config;
+        RankOrchestrator::Config config;
         EXPECT_FALSE(config.validate());
     }
 
-    TEST(Test__MultiDeviceOrchestratorConfig, ValidateSingleDeviceSucceeds)
+    TEST(Test__RankOrchestratorConfig, ValidateSingleDeviceSucceeds)
     {
-        MultiDeviceOrchestrator::Config config;
+        RankOrchestrator::Config config;
         config.devices = {GlobalDeviceAddress::cpu()};
         EXPECT_TRUE(config.validate());
     }
 
-    TEST(Test__MultiDeviceOrchestratorConfig, ValidateTwoDevicesSucceeds)
+    TEST(Test__RankOrchestratorConfig, ValidateTwoDevicesSucceeds)
     {
-        MultiDeviceOrchestrator::Config config;
+        RankOrchestrator::Config config;
         config.devices = {GlobalDeviceAddress::cpu(), GlobalDeviceAddress::cpu()};
         EXPECT_TRUE(config.validate());
     }
 
-    TEST(Test__MultiDeviceOrchestratorConfig, ValidateWithEqualWeightsSucceeds)
+    TEST(Test__RankOrchestratorConfig, ValidateWithEqualWeightsSucceeds)
     {
-        MultiDeviceOrchestrator::Config config;
+        RankOrchestrator::Config config;
         config.devices = {GlobalDeviceAddress::cpu(), GlobalDeviceAddress::cpu()};
         config.weights = {0.5f, 0.5f};
         EXPECT_TRUE(config.validate());
     }
 
-    TEST(Test__MultiDeviceOrchestratorConfig, ValidateWithUnequalWeightsSucceeds)
+    TEST(Test__RankOrchestratorConfig, ValidateWithUnequalWeightsSucceeds)
     {
-        MultiDeviceOrchestrator::Config config;
+        RankOrchestrator::Config config;
         config.devices = {GlobalDeviceAddress::cpu(), GlobalDeviceAddress::cpu()};
         config.weights = {0.73f, 0.27f};
         EXPECT_TRUE(config.validate());
     }
 
-    TEST(Test__MultiDeviceOrchestratorConfig, ValidateWeightCountMismatchFails)
+    TEST(Test__RankOrchestratorConfig, ValidateWeightCountMismatchFails)
     {
-        MultiDeviceOrchestrator::Config config;
+        RankOrchestrator::Config config;
         config.devices = {GlobalDeviceAddress::cpu(), GlobalDeviceAddress::cpu()};
         config.weights = {1.0f}; // Only one weight for two devices
         EXPECT_FALSE(config.validate());
     }
 
-    TEST(Test__MultiDeviceOrchestratorConfig, ValidateWeightsSumWrongFails)
+    TEST(Test__RankOrchestratorConfig, ValidateWeightsSumWrongFails)
     {
-        MultiDeviceOrchestrator::Config config;
+        RankOrchestrator::Config config;
         config.devices = {GlobalDeviceAddress::cpu(), GlobalDeviceAddress::cpu()};
         config.weights = {0.4f, 0.4f}; // Sum to 0.8, not 1.0
         EXPECT_FALSE(config.validate());
     }
 
-    TEST(Test__MultiDeviceOrchestratorConfig, GetNormalizedWeightsDefault)
+    TEST(Test__RankOrchestratorConfig, GetNormalizedWeightsDefault)
     {
-        MultiDeviceOrchestrator::Config config;
+        RankOrchestrator::Config config;
         config.devices = {GlobalDeviceAddress::cpu(), GlobalDeviceAddress::cpu()};
         // No weights set
 
@@ -307,9 +307,9 @@ namespace
         EXPECT_FLOAT_EQ(weights[1], 0.5f);
     }
 
-    TEST(Test__MultiDeviceOrchestratorConfig, GetNormalizedWeightsExplicit)
+    TEST(Test__RankOrchestratorConfig, GetNormalizedWeightsExplicit)
     {
-        MultiDeviceOrchestrator::Config config;
+        RankOrchestrator::Config config;
         config.devices = {GlobalDeviceAddress::cpu(), GlobalDeviceAddress::cpu()};
         config.weights = {0.7f, 0.3f};
 
@@ -319,9 +319,9 @@ namespace
         EXPECT_FLOAT_EQ(weights[1], 0.3f);
     }
 
-    TEST(Test__MultiDeviceOrchestratorConfig, GetNormalizedWeightsThreeDevices)
+    TEST(Test__RankOrchestratorConfig, GetNormalizedWeightsThreeDevices)
     {
-        MultiDeviceOrchestrator::Config config;
+        RankOrchestrator::Config config;
         config.devices = {
             GlobalDeviceAddress::cpu(),
             GlobalDeviceAddress::cpu(),
@@ -335,41 +335,41 @@ namespace
         EXPECT_NEAR(weights[2], 1.0f / 3.0f, 0.0001f);
     }
 
-    TEST(Test__MultiDeviceOrchestratorConfig, ValidateWeightsWithSmallTolerance)
+    TEST(Test__RankOrchestratorConfig, ValidateWeightsWithSmallTolerance)
     {
         // Test that weights summing to ~1.0 with floating point error still validate
-        MultiDeviceOrchestrator::Config config;
+        RankOrchestrator::Config config;
         config.devices = {GlobalDeviceAddress::cpu(), GlobalDeviceAddress::cpu()};
         config.weights = {0.6666666f, 0.3333334f}; // Sum = 1.0000000
 
         EXPECT_TRUE(config.validate());
     }
 
-    TEST(Test__MultiDeviceOrchestratorConfig, ValidateMixedDeviceTypes)
+    TEST(Test__RankOrchestratorConfig, ValidateMixedDeviceTypes)
     {
         // Test heterogeneous device configuration
-        MultiDeviceOrchestrator::Config config;
+        RankOrchestrator::Config config;
         config.devices = {GlobalDeviceAddress::cuda(0), GlobalDeviceAddress::rocm(0)};
         config.weights = {0.73f, 0.27f};
 
         EXPECT_TRUE(config.validate());
     }
 
-    TEST(Test__MultiDeviceOrchestratorConfig, DefaultBackendIsAuto)
+    TEST(Test__RankOrchestratorConfig, DefaultBackendIsAuto)
     {
-        MultiDeviceOrchestrator::Config config;
+        RankOrchestrator::Config config;
         EXPECT_EQ(config.backend, CollectiveBackendType::AUTO);
     }
 
-    TEST(Test__MultiDeviceOrchestratorConfig, DefaultMaxSeqLen)
+    TEST(Test__RankOrchestratorConfig, DefaultMaxSeqLen)
     {
-        MultiDeviceOrchestrator::Config config;
+        RankOrchestrator::Config config;
         EXPECT_EQ(config.max_seq_len, 4096u);
     }
 
-    TEST(Test__MultiDeviceOrchestratorConfig, DefaultBatchSize)
+    TEST(Test__RankOrchestratorConfig, DefaultBatchSize)
     {
-        MultiDeviceOrchestrator::Config config;
+        RankOrchestrator::Config config;
         EXPECT_EQ(config.batch_size, 1);
     }
 

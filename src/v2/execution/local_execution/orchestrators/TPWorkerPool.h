@@ -54,7 +54,7 @@ namespace llaminar2
                 workers_.emplace_back([this, i]()
                                       { workerLoop(i); });
             }
-            // Note: construction logging handled by caller (MultiDeviceOrchestrator)
+            // Note: construction logging handled by caller (RankOrchestrator)
         }
 
         ~TPWorkerPool()

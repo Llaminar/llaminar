@@ -2,7 +2,7 @@
  * @file LogitsGatherer.h
  * @brief Manages combined logits buffer and D2H gather/copy operations
  *
- * Extracted from MultiDeviceOrchestrator to isolate logits gathering
+ * Extracted from RankOrchestrator to isolate logits gathering
  * responsibilities: buffer allocation/pinning, column-parallel D2H gather
  * from TP device runners, and PP stage logits copy.
  *

@@ -308,7 +308,7 @@ std::unique_ptr<IInferenceRunner> createInferenceRunner(...);
 std::unique_ptr<IInferenceRunner> createTestableInferenceRunner(...);
 
 // Keep multi-device - still needed internally
-std::unique_ptr<IMultiDeviceOrchestrator> createMultiDeviceOrchestrator(...);
+std::unique_ptr<IRankOrchestrator> createRankOrchestrator(...);
 ```
 
 ### 4.2 Move to internal header
@@ -327,8 +327,8 @@ src/v2/execution/factory/internal/InferenceRunnerImpl.h  → NEW (internal)
 ### 5.1 Remove deprecated code paths
 
 - Delete `createInferenceRunner()` and `createTestableInferenceRunner()`
-- Keep `createMultiDeviceOrchestrator()` (used by OrchestrationRunner)
-- Simplify `MultiDeviceOrchestrator` to use OrchestrationConfig directly
+- Keep `createRankOrchestrator()` (used by OrchestrationRunner)
+- Simplify `RankOrchestrator` to use OrchestrationConfig directly
 
 ### 5.2 Update documentation
 

@@ -1247,7 +1247,7 @@ namespace llaminar2
         // We use arrival_order for slot assignment. This means shard ordering depends
         // on thread arrival order, which is non-deterministic.
         // In practice, this method is currently dead code for LOCAL CPU TP because
-        // MultiDeviceOrchestrator::gatherLogits() handles LM head vocab gathering
+        // RankOrchestrator::gatherLogits() handles LM head vocab gathering
         // directly at the orchestrator level, bypassing LocalTPContext::allgather().
         // If this method is ever used in a context where shard ordering matters,
         // a thread-safe device identification mechanism will be needed.

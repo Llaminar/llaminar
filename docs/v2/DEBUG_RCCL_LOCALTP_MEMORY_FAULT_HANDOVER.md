@@ -163,7 +163,7 @@ The test now correctly runs with 2-way TP (both devices loading sharded weights)
 ## Key Files Involved
 
 ### Core Execution
-- `src/v2/execution/MultiDeviceOrchestrator.cpp` - Parallel device execution via `std::async`
+- `src/v2/execution/RankOrchestrator.cpp` - Parallel device execution via `std::async`
 - `src/v2/execution/DeviceGraphOrchestrator.cpp` - Single-device graph execution
 - `src/v2/execution/InferenceRunnerFactory.cpp` - Creates device runners
 
@@ -261,7 +261,7 @@ LLAMINAR_ASSERT(tensor->device_id() == expected_device,
 ```
 
 ### 3. Check for Cross-Device Pointer Usage
-In `MultiDeviceOrchestrator::forward()`, verify each device's runner only accesses its own data:
+In `RankOrchestrator::forward()`, verify each device's runner only accesses its own data:
 - Look for shared state that might have GPU pointers
 - Check if `TPSnapshot` or other shared structures contain device pointers
 
@@ -337,7 +337,7 @@ The crash happens at the transition from weight loading to actual forward pass e
 
 ```
 src/v2/kernels/rocm/ROCmEmbeddingKernelT.cpp:307  # Crash location
-src/v2/execution/MultiDeviceOrchestrator.cpp      # Parallel execution
+src/v2/execution/RankOrchestrator.cpp      # Parallel execution
 src/v2/execution/DeviceGraphOrchestrator.cpp      # Per-device execution
 src/v2/loaders/WeightManager.cpp                  # Weight distribution
 src/v2/kernels/KernelFactory.h                    # Kernel caching

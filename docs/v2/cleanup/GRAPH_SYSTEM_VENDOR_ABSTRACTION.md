@@ -66,7 +66,7 @@ However, **18 vendor-specific `#ifdef HAVE_ROCM` / `#ifdef HAVE_CUDA`** sites ex
 | 14 | L724–727 | `HAVE_CUDA` | Factory registration | `ensureNvidiaFactoryRegistered()` |
 | 15 | L730–738 | *(runtime)* | Context resolution | `is_rocm()` → `pool.getAMDContext()` / `is_cuda()` → `pool.getNvidiaContext()` |
 
-### File 4: `MultiDeviceOrchestrator.cpp` — 4 occurrences (2 `#ifdef` + 2 runtime branches)
+### File 4: `RankOrchestrator.cpp` — 4 occurrences (2 `#ifdef` + 2 runtime branches)
 
 | # | Lines | Guard | Category | Description |
 |---|-------|-------|----------|-------------|
@@ -204,7 +204,7 @@ This also enables CUDA diagnostic parity automatically.
 | `src/v2/execution/local_execution/graph/DeviceGraphExecutor.cpp` | Remove all `#ifdef` blocks, use new APIs |
 | `src/v2/execution/local_execution/graph/DeviceGraphCaptureController.cpp` | Remove `#ifdef HAVE_ROCM` + `hip_runtime.h`, use `clearLastError()` |
 | `src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp` | Use `getContext(DeviceId)` |
-| `src/v2/execution/local_execution/orchestrators/MultiDeviceOrchestrator.cpp` | Use `getContext(DeviceId)` |
+| `src/v2/execution/local_execution/orchestrators/RankOrchestrator.cpp` | Use `getContext(DeviceId)` |
 
 ---
 

@@ -16,7 +16,7 @@ Llaminar V2 uses a **5-phase configuration pipeline** that parses user input onc
 Phase 0: CLI/YAML → OrchestrationConfig (raw user-facing config, strings)
 Phase 1: ExecutionPlanBuilder → RankExecutionPlan (per-rank contract, parsed RuntimeConfig)
 Phase 2: IGraphConfigBuilder → GraphConfig (model-specific execution config)
-Phase 3: InferenceRunnerFactory → DeviceGraphOrchestrator / MultiDeviceOrchestrator
+Phase 3: InferenceRunnerFactory → DeviceGraphOrchestrator / RankOrchestrator
 Phase 4: IGraphBuilder (via GraphBuilderRegistry) + GraphResolver → ComputeGraph (declarative DAG of stages)
 ```
 
@@ -102,7 +102,7 @@ Three build paths from `OrchestrationRunner::buildComputeGraph()`:
 | Scenario | Method | Creates |
 |----------|--------|---------|
 | Single device | `buildSingleDeviceComputeGraph()` | `DeviceGraphOrchestrator` |
-| LOCAL TP | `buildMultiDeviceComputeGraph()` | `MultiDeviceOrchestrator` (owns N `DeviceGraphOrchestrator`s) |
+| LOCAL TP | `buildMultiDeviceComputeGraph()` | `RankOrchestrator` (owns N `DeviceGraphOrchestrator`s) |
 | LOCAL PP | `buildLocalPPComputeGraph()` | `TreeToRunnerCompiler` → N `DeviceGraphOrchestrator`s |
 
 ### 1.6 File Locations
@@ -159,7 +159,7 @@ Ownership chain:
 - `RankExecutionPlan plan_` ← per-rank contract (with pre-parsed `RuntimeConfig`)
 - `ILocalTPContext`, `ILocalPPContext` ← multi-device contexts
 - `ModelContext` ← model weights + metadata
-- `IInferenceRunner local_runner_` ← one of: DeviceGraphOrchestrator, MultiDeviceOrchestrator, or compiled PP graph
+- `IInferenceRunner local_runner_` ← one of: DeviceGraphOrchestrator, RankOrchestrator, or compiled PP graph
 
 ### 2.3 IOrchestrationRunnerFactory
 
@@ -276,9 +276,9 @@ if (seq_len == 1 && layer_graph_cache_[layer_idx].valid) {
 }
 ```
 
-### 3.3 MultiDeviceOrchestrator
+### 3.3 RankOrchestrator
 
-Location: `src/v2/execution/local_execution/orchestrators/MultiDeviceOrchestrator.h`
+Location: `src/v2/execution/local_execution/orchestrators/RankOrchestrator.h`
 
 Coordinates multiple `DeviceGraphOrchestrator` instances for **LOCAL tensor parallelism (TP)** across multiple devices within a single MPI rank. Also supports **Pipeline Parallelism (PP)** via nested orchestrators.
 
@@ -1354,7 +1354,7 @@ class BackendManager {
 | **Local Execution** | |
 | IInferenceRunner | `src/v2/execution/local_execution/orchestrators/IInferenceRunner.h` |
 | DeviceGraphOrchestrator | `src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.h` |
-| MultiDeviceOrchestrator | `src/v2/execution/local_execution/orchestrators/MultiDeviceOrchestrator.h` |
+| RankOrchestrator | `src/v2/execution/local_execution/orchestrators/RankOrchestrator.h` |
 | MultiDomainOrchestrator | `src/v2/execution/local_execution/orchestrators/MultiDomainOrchestrator.h` |
 | **Memory Management** | |
 | BufferArena | `src/v2/memory/BufferArena.h` |
@@ -1457,7 +1457,7 @@ main()
       → loadWeights()
       → buildComputeGraph()
         ├── Single: DeviceGraphOrchestrator (IGraphBuilder via registry → ComputeGraph → DeviceGraphExecutor)
-        ├── TP: MultiDeviceOrchestrator (N DeviceGraphOrchestrators, TPWorkerPool)
+        ├── TP: RankOrchestrator (N DeviceGraphOrchestrators, TPWorkerPool)
         └── PP: TreeToRunnerCompiler (N DeviceGraphOrchestrators, PPContext)
   → runner.prefill(tokens)
     → forward(tokens, seq_len)
@@ -1478,7 +1478,7 @@ src/v2/
 │   ├── mpi_orchestration/           # Tier 2: RankExecutionPlan, ExecutionPlanBuilder
 │   ├── config/                      # RuntimeConfig, ExecutionPolicy
 │   ├── local_execution/
-│   │   ├── orchestrators/           # Tier 3: DeviceGraphOrchestrator, MultiDeviceOrchestrator
+│   │   ├── orchestrators/           # Tier 3: DeviceGraphOrchestrator, RankOrchestrator
 │   │   ├── model/                   # IModelExecutor, ModelExecutor, ILayerExecutor
 │   │   ├── graph/                   # GraphSchema, GraphResolver, DeviceGraphExecutor, ComputeGraph,
 │   │   │                            #   GraphBuilderRegistry, SchemaFactoryRegistry, IGraphBuilder

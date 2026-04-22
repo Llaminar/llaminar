@@ -1,5 +1,5 @@
 /**
- * @file MultiDeviceOrchestrator.h
+ * @file RankOrchestrator.h
  * @brief Multi-device orchestrator for LOCAL tensor parallelism
  *
  * Coordinates multiple DeviceGraphOrchestrator instances for LOCAL tensor
@@ -11,7 +11,7 @@
  * - Backend selection: NCCL, RCCL, or HOST based on device types
  *
  * Design philosophy:
- * - Extends IMultiDeviceOrchestrator (which extends IInferenceRunner)
+ * - Extends IRankOrchestrator (which extends IInferenceRunner)
  * - Drop-in replacement for single-device DeviceGraphOrchestrator
  * - Coordinates collective operations (AllReduce, AllGather) across local devices
  *
@@ -23,12 +23,12 @@
  *
  * Usage:
  * @code
- * MultiDeviceOrchestrator::Config config;
+ * RankOrchestrator::Config config;
  * config.devices = {GlobalDeviceAddress::cuda(0), GlobalDeviceAddress::cuda(1)};
  * config.weights = {0.73f, 0.27f};  // Optional proportional weights
  * config.backend = CollectiveBackendType::NCCL;
  *
- * auto orchestrator = std::make_unique<MultiDeviceOrchestrator>(model_ctx, config);
+ * auto orchestrator = std::make_unique<RankOrchestrator>(model_ctx, config);
  *
  * // Use as IInferenceRunner (same API as single-device)
  * orchestrator->forward(tokens, seq_len);
@@ -45,7 +45,7 @@
 
 #pragma once
 
-#include "IMultiDeviceOrchestrator.h"
+#include "IRankOrchestrator.h"
 #include "TPWorkerPool.h"
 #include "../../../backends/GlobalDeviceAddress.h"
 #include "../../../config/OrchestrationConfig.h"
@@ -81,7 +81,7 @@ namespace llaminar2
      *
      * Coordinates multiple DeviceGraphOrchestrator instances to enable tensor
      * parallelism across devices within a single MPI rank. This is the primary
-     * implementation of IMultiDeviceOrchestrator.
+     * implementation of IRankOrchestrator.
      *
      * Key features:
      * - Manages per-device inference runners (DeviceGraphOrchestrator instances)
@@ -92,7 +92,7 @@ namespace llaminar2
      * Thread safety: All public methods are thread-safe. Internal synchronization
      * ensures correct ordering of collective operations.
      */
-    class MultiDeviceOrchestrator : public IMultiDeviceOrchestrator
+    class RankOrchestrator : public IRankOrchestrator
     {
     public:
         // =====================================================================
@@ -317,7 +317,7 @@ namespace llaminar2
          * @param device_runners Pre-constructed per-device runners
          * @param tp_ctx Pre-constructed LOCAL TP context
          * @param config Configuration
-         * @return Unique pointer to MultiDeviceOrchestrator
+         * @return Unique pointer to RankOrchestrator
          *
          * @code
          * // Test setup with mocks
@@ -327,11 +327,11 @@ namespace llaminar2
          * runners.push_back(createMockRunner(cuda1));
          * auto tp_ctx = std::make_unique<MockLocalTPContext>(devices, weights);
          *
-         * auto orchestrator = MultiDeviceOrchestrator::createForTest(
+         * auto orchestrator = RankOrchestrator::createForTest(
          *     model_ctx, std::move(runners), std::move(tp_ctx), config);
          * @endcode
          */
-        static std::unique_ptr<MultiDeviceOrchestrator> createForTest(
+        static std::unique_ptr<RankOrchestrator> createForTest(
             std::shared_ptr<IModelContext> model_ctx,
             std::vector<std::unique_ptr<IInferenceRunner>> device_runners,
             std::unique_ptr<ILocalTPContext> tp_ctx,
@@ -352,22 +352,22 @@ namespace llaminar2
          * @param config Multi-device configuration
          * @param tp_ctx Optional pre-constructed LOCAL TP context (ownership transferred)
          */
-        MultiDeviceOrchestrator(
+        RankOrchestrator(
             std::shared_ptr<IModelContext> model_ctx,
             const Config &config,
             std::unique_ptr<ILocalTPContext> tp_ctx = nullptr);
 
         /// Destructor
-        ~MultiDeviceOrchestrator() override;
+        ~RankOrchestrator() override;
 
         // Non-copyable, movable
-        MultiDeviceOrchestrator(const MultiDeviceOrchestrator &) = delete;
-        MultiDeviceOrchestrator &operator=(const MultiDeviceOrchestrator &) = delete;
-        MultiDeviceOrchestrator(MultiDeviceOrchestrator &&) noexcept;
-        MultiDeviceOrchestrator &operator=(MultiDeviceOrchestrator &&) noexcept;
+        RankOrchestrator(const RankOrchestrator &) = delete;
+        RankOrchestrator &operator=(const RankOrchestrator &) = delete;
+        RankOrchestrator(RankOrchestrator &&) noexcept;
+        RankOrchestrator &operator=(RankOrchestrator &&) noexcept;
 
         // =====================================================================
-        // IInferenceRunner Interface (from IMultiDeviceOrchestrator)
+        // IInferenceRunner Interface (from IRankOrchestrator)
         // =====================================================================
 
         /**
@@ -626,7 +626,7 @@ namespace llaminar2
         const PlacementPlan &getPlacementPlan() const override;
 
         // =====================================================================
-        // IMultiDeviceOrchestrator Interface
+        // IRankOrchestrator Interface
         // =====================================================================
 
         /**
@@ -690,7 +690,7 @@ namespace llaminar2
         /**
          * @brief Private constructor for factory method
          */
-        MultiDeviceOrchestrator(
+        RankOrchestrator(
             std::shared_ptr<IModelContext> model_ctx,
             std::vector<std::unique_ptr<IInferenceRunner>> device_runners,
             std::unique_ptr<ILocalTPContext> tp_ctx,
@@ -709,7 +709,7 @@ namespace llaminar2
          * @brief Initialize device runners for PP mode
          *
          * Creates one DeviceGraphOrchestrator per PP stage (or one
-         * MultiDeviceOrchestrator per stage for TP+PP mode).
+         * RankOrchestrator per stage for TP+PP mode).
          */
         void initializePPDeviceRunners();
 
@@ -775,7 +775,7 @@ namespace llaminar2
         /// In PP mode: one runner per stage
         std::vector<std::unique_ptr<IInferenceRunner>> device_runners_;
 
-        /// PP stage runners (when stages are TP domains, these are MultiDeviceOrchestrator)
+        /// PP stage runners (when stages are TP domains, these are RankOrchestrator)
         /// Only used in TP+PP mode - in pure PP mode, device_runners_ holds stage runners
         std::vector<std::unique_ptr<IInferenceRunner>> pp_stage_runners_;
 

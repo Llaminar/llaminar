@@ -385,10 +385,10 @@ public:
         const InferenceRunnerConfig& config);
 
     /// Create multi-device LOCAL TP runner
-    std::unique_ptr<IMultiDeviceOrchestrator> createMultiDevice(
+    std::unique_ptr<IRankOrchestrator> createMultiDevice(
         std::shared_ptr<IModelContext> model_ctx,
         std::unique_ptr<ILocalTPContext> tp_ctx,
-        const MultiDeviceOrchestrator::Config& config);
+        const RankOrchestrator::Config& config);
 
     /// Create unified PP pipeline runner
     std::unique_ptr<IInferenceRunner> createPipeline(

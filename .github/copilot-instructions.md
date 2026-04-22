@@ -2,7 +2,7 @@
 
 This document provides practical guidelines for working with the **Llaminar V2** LLM inference engine, including build processes, testing, debugging, and kernel / MPI / attention development best practices.
 
-**Architecture Note (V2)**: The active architecture is **Llaminar V2** in `src/v2/`, an operator-free, kernel-centric design with **DeviceGraphOrchestrator** (single-device) and **MultiDeviceOrchestrator** (multi-device TP/PP) as execution paths.
+**Architecture Note (V2)**: The active architecture is **Llaminar V2** in `src/v2/`, an operator-free, kernel-centric design with **DeviceGraphOrchestrator** (single-device) and **RankOrchestrator** (multi-device TP/PP) as execution paths.
 
 - For a **high-level architecture map** of tensors, kernels, attention, MPI orchestration, and graph execution, see:
     - `.github/instructions/llaminar-architecture-v2.instructions.md`
@@ -36,7 +36,7 @@ This document provides practical guidelines for working with the **Llaminar V2**
 **Design Philosophy**: Operator-free, tensor-centric, kernel-oriented design with declarative graph execution.
 
 **Key Characteristics**:
-- **DeviceGraphOrchestrator / MultiDeviceOrchestrator**: Execution via declarative compute DAGs
+- **DeviceGraphOrchestrator / RankOrchestrator**: Execution via declarative compute DAGs
 - **No Operator Layer**: Graph stages orchestrate kernels directly
 - **Model-Agnostic Graph System**: `GraphBuilderRegistry` and `SchemaFactoryRegistry` enable adding models without touching core infrastructure
 - **BufferArena + TransferEngine**: Central activation memory management with explicit coherence state tracking
@@ -1992,7 +1992,7 @@ LLAMINAR_TRACE_TRANSFERS_MIN_BYTES=1000000 \
 | `src/v2/inference/` | IInferenceRunner interface and factory |
 | `src/v2/execution/` | ComputeGraph, DeviceGraphExecutor, ComputeStages |
 | `src/v2/execution/local_execution/graph/` | GraphBuilderRegistry, SchemaFactoryRegistry, IGraphBuilder, GraphSchema, ComputeGraph |
-| `src/v2/execution/local_execution/orchestrators/` | DeviceGraphOrchestrator, MultiDeviceOrchestrator |
+| `src/v2/execution/local_execution/orchestrators/` | DeviceGraphOrchestrator, RankOrchestrator |
 | `src/v2/execution/local_execution/coherence/` | StageCoherence, GpuCoherence, CrossDomainTransfer |
 | `src/v2/models/` | Model-specific graph builders, schema factories, ModelRegistrations |
 | `src/v2/models/qwen/` | Qwen2Graph, Qwen2Schema, Qwen2BufferSpec, Qwen2GraphConfigBuilder |

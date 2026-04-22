@@ -289,7 +289,7 @@ namespace llaminar2
          * 2. Pack GEMM weights per device
          * 3. Release all host weight data (cache_ + per_device_cache_)
          *
-         * Call ONCE during MultiDeviceOrchestrator init.
+         * Call ONCE during RankOrchestrator init.
          *
          * @param devices List of devices that will use the weights
          * @param release_host_data If true, release host weight copies after

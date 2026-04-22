@@ -60,7 +60,7 @@ namespace llaminar2
      */
     struct PPDeviceAssignment
     {
-        /// Index of this device in MultiDeviceOrchestrator's device list
+        /// Index of this device in RankOrchestrator's device list
         int device_index = -1;
 
         /// The device ID

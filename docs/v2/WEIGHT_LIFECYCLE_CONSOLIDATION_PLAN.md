@@ -29,7 +29,7 @@ created the runner.
    - `createTestableInferenceRunner()` → calls `buildWeights()` only → no
      packing, no upload, no release. Broken for production multi-device.
 
-4. **MultiDeviceOrchestrator** had to manually call `releaseAllHostWeightData()`
+4. **RankOrchestrator** had to manually call `releaseAllHostWeightData()`
    because the factory it delegates to (`createTestableInferenceRunner`) doesn't.
    This was a bug until last session.
 
@@ -62,7 +62,7 @@ created the runner.
     │   Has own packWeight   Orchestrates the 4-step sequence      │
     │                        BUT only for single-device path       │
     │                                                              │
-    │   MultiDeviceOrchestrator                                    │
+    │   RankOrchestrator                                    │
     │   ───────────────────────                                    │
     │   Calls preloadForDevices (clone + upload)                   │
     │   Creates runners via createTestableInferenceRunner          │
@@ -78,7 +78,7 @@ created the runner.
 - The 4-step sequence (pack GEMM → upload non-GEMM → sync → release) is
   implicit knowledge baked into a factory helper, not enforced by the type
   system.
-- `MultiDeviceOrchestrator` reimplements part of this sequence ad-hoc.
+- `RankOrchestrator` reimplements part of this sequence ad-hoc.
 - Two dead classes (`WeightPreloader`, `WeightManager::packWeight()`) add
   confusion.
 
@@ -128,7 +128,7 @@ complete sequence and is impossible to get wrong.
 |-----------|--------|-------|
 | **WeightManager** | Has `packGemmWeights`, `uploadNonGemmWeights`, `releaseAllHostWeightData` as separate public methods | Adds `finalizeForDevice(device)` and `finalizeForDevices(devices)` that call the sequence internally |
 | **InferenceRunnerFactory** | `preloadAndUploadWeights()` static helper orchestrates the 4-step sequence | Calls `weight_mgr->finalizeForDevice(device)` — one line |
-| **MultiDeviceOrchestrator** | Manually calls `preloadForDevices()` then patches `releaseAllHostWeightData()` | Calls `weight_mgr->finalizeForDevices(device_ids)` — one line |
+| **RankOrchestrator** | Manually calls `preloadForDevices()` then patches `releaseAllHostWeightData()` | Calls `weight_mgr->finalizeForDevices(device_ids)` — one line |
 | **WeightPreloader** | Dead class, never instantiated | Delete |
 | **WeightManager::packWeight()** | Dead method, never called | Delete |
 | **createTestableInferenceRunner** | Skips all weight lifecycle | Calls `finalizeForDevice()` like everyone else |
@@ -158,7 +158,7 @@ public:
      * 2. Pack GEMM weights per device
      * 3. Release all host weight data (cache_ + per_device_cache_)
      *
-     * Call ONCE during MultiDeviceOrchestrator init.
+     * Call ONCE during RankOrchestrator init.
      */
     virtual bool finalizeForDevices(const std::vector<DeviceId>& devices) { return true; }
 };
@@ -201,7 +201,7 @@ weight_mgr->finalizeForDevice(device);
 The async overlap, error handling, and release logic moves *into* WeightManager
 where it belongs. The factory doesn't need to know the sequencing.
 
-**Before** (MultiDeviceOrchestrator.cpp — init, ~30 lines of weight plumbing):
+**Before** (RankOrchestrator.cpp — init, ~30 lines of weight plumbing):
 ```cpp
 weight_mgr->preloadForDevices(device_ids);
 // ... create runners via createTestableInferenceRunner ...
@@ -229,9 +229,9 @@ weight_mgr->finalizeForDevices(device_ids);
    `preloadForDevices()` + per-device `packGemmWeights()` + `releaseAllHostWeightData()`.
 
 3. **Wire in callers** — replace `preloadAndUploadWeights()` call sites and
-   `MultiDeviceOrchestrator` manual sequence with new methods.
+   `RankOrchestrator` manual sequence with new methods.
 
-4. **Remove duplicate release block** in MultiDeviceOrchestrator (the
+4. **Remove duplicate release block** in RankOrchestrator (the
    `concreteWeightManager()` copy-paste).
 
 5. **Fix `packGemmWeights` to handle `per_device_cache_`** — when called with a

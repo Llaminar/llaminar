@@ -735,7 +735,7 @@ namespace llaminar2
          *
          * Returns a map from stage type strings (e.g., "Q_PROJECTION", "FFN_DOWN",
          * "LM_HEAD") to their SnapshotShardingMode. This drives snapshot reassembly
-         * in MultiDeviceOrchestrator and parity testing.
+         * in RankOrchestrator and parity testing.
          *
          * Each model architecture declares how its stage outputs are distributed
          * across TP devices, replacing the hardcoded if-chain in getStageShardingMode().

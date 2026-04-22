@@ -1,6 +1,6 @@
 /**
  * @file Test__LocalTPMultiDevice.cpp
- * @brief Integration tests for real LOCAL TP with MultiDeviceOrchestrator
+ * @brief Integration tests for real LOCAL TP with RankOrchestrator
  *
  * These tests require actual GPU hardware and test the full inference pipeline
  * with tensor parallelism across multiple devices within a single MPI rank.
@@ -25,7 +25,7 @@
 #include <fstream>
 #include <iostream>
 
-#include "execution/local_execution/orchestrators/MultiDeviceOrchestrator.h"
+#include "execution/local_execution/orchestrators/RankOrchestrator.h"
 #include "execution/local_execution/orchestrators/DeviceGraphOrchestrator.h"
 #include "execution/factory/InferenceRunnerFactory.h"
 #include "collective/ILocalTPContext.h"
@@ -395,11 +395,11 @@ TEST_F(Test__LocalTPMultiDevice, CUDA_TwoGPU_LocalTPContextCreation)
 /**
  * @test Verify forward pass produces output with correct shape
  *
- * NOTE: This test requires MultiDeviceOrchestrator weight sharding to be fully
+ * NOTE: This test requires RankOrchestrator weight sharding to be fully
  * implemented. Currently, device runners are created but weights aren't loaded
  * with proper LOCAL TP sharding, causing kernel device errors.
  *
- * TODO: Enable once MultiDeviceOrchestrator::initializeDeviceRunners() properly
+ * TODO: Enable once RankOrchestrator::initializeDeviceRunners() properly
  * loads sharded weights for each device.
  */
 TEST_F(Test__LocalTPMultiDevice, DISABLED_CUDA_TwoGPU_ForwardProducesSameShape)
@@ -411,7 +411,7 @@ TEST_F(Test__LocalTPMultiDevice, DISABLED_CUDA_TwoGPU_ForwardProducesSameShape)
     ASSERT_NE(model_ctx, nullptr) << "Failed to load model";
 
     // Create multi-device config
-    MultiDeviceOrchestrator::Config config;
+    RankOrchestrator::Config config;
     config.devices = {
         GlobalDeviceAddress::cuda(0),
         GlobalDeviceAddress::cuda(1)};
@@ -419,7 +419,7 @@ TEST_F(Test__LocalTPMultiDevice, DISABLED_CUDA_TwoGPU_ForwardProducesSameShape)
     config.max_seq_len = 512;
 
     // Create orchestrator
-    auto multi_orch = std::make_unique<MultiDeviceOrchestrator>(model_ctx, config);
+    auto multi_orch = std::make_unique<RankOrchestrator>(model_ctx, config);
 
     ASSERT_NE(multi_orch, nullptr);
     EXPECT_EQ(multi_orch->device_count(), 2);
@@ -456,7 +456,7 @@ TEST_F(Test__LocalTPMultiDevice, DISABLED_CUDA_TwoGPU_ForwardProducesSameShape)
 /**
  * @test Compare multi-device vs single-device logits (should match closely)
  *
- * NOTE: Disabled until MultiDeviceOrchestrator weight sharding is implemented.
+ * NOTE: Disabled until RankOrchestrator weight sharding is implemented.
  * See CUDA_TwoGPU_ForwardProducesSameShape for details.
  */
 TEST_F(Test__LocalTPMultiDevice, DISABLED_CUDA_TwoGPU_LogitsMatchSingleDevice)
@@ -493,7 +493,7 @@ TEST_F(Test__LocalTPMultiDevice, DISABLED_CUDA_TwoGPU_LogitsMatchSingleDevice)
     // =========================================================================
     // Multi-device (CUDA:0 + CUDA:1)
     // =========================================================================
-    MultiDeviceOrchestrator::Config multi_config;
+    RankOrchestrator::Config multi_config;
     multi_config.devices = {
         GlobalDeviceAddress::cuda(0),
         GlobalDeviceAddress::cuda(1)};
@@ -501,7 +501,7 @@ TEST_F(Test__LocalTPMultiDevice, DISABLED_CUDA_TwoGPU_LogitsMatchSingleDevice)
     multi_config.max_seq_len = 512;
     multi_config.activation_precision = ActivationPrecision::FP32;
 
-    auto multi_orch = std::make_unique<MultiDeviceOrchestrator>(model_ctx, multi_config);
+    auto multi_orch = std::make_unique<RankOrchestrator>(model_ctx, multi_config);
     ASSERT_NE(multi_orch, nullptr);
 
     bool multi_success = multi_orch->forward(tokens.data(), seq_len);
@@ -534,7 +534,7 @@ TEST_F(Test__LocalTPMultiDevice, DISABLED_CUDA_TwoGPU_LogitsMatchSingleDevice)
 /**
  * @test Verify cache clearing works across devices
  *
- * NOTE: Disabled until MultiDeviceOrchestrator weight sharding is implemented.
+ * NOTE: Disabled until RankOrchestrator weight sharding is implemented.
  */
 TEST_F(Test__LocalTPMultiDevice, DISABLED_CUDA_TwoGPU_ClearCacheWorks)
 {
@@ -544,14 +544,14 @@ TEST_F(Test__LocalTPMultiDevice, DISABLED_CUDA_TwoGPU_ClearCacheWorks)
     auto model_ctx = loadModel();
     ASSERT_NE(model_ctx, nullptr);
 
-    MultiDeviceOrchestrator::Config config;
+    RankOrchestrator::Config config;
     config.devices = {
         GlobalDeviceAddress::cuda(0),
         GlobalDeviceAddress::cuda(1)};
     config.backend = CollectiveBackendType::NCCL;
     config.max_seq_len = 512;
 
-    auto multi_orch = std::make_unique<MultiDeviceOrchestrator>(model_ctx, config);
+    auto multi_orch = std::make_unique<RankOrchestrator>(model_ctx, config);
     ASSERT_NE(multi_orch, nullptr);
 
     // First forward
@@ -573,7 +573,7 @@ TEST_F(Test__LocalTPMultiDevice, DISABLED_CUDA_TwoGPU_ClearCacheWorks)
 /**
  * @test Verify multiple forward passes work correctly
  *
- * NOTE: Disabled until MultiDeviceOrchestrator weight sharding is implemented.
+ * NOTE: Disabled until RankOrchestrator weight sharding is implemented.
  */
 TEST_F(Test__LocalTPMultiDevice, DISABLED_CUDA_TwoGPU_MultipleForwardPasses)
 {
@@ -583,14 +583,14 @@ TEST_F(Test__LocalTPMultiDevice, DISABLED_CUDA_TwoGPU_MultipleForwardPasses)
     auto model_ctx = loadModel();
     ASSERT_NE(model_ctx, nullptr);
 
-    MultiDeviceOrchestrator::Config config;
+    RankOrchestrator::Config config;
     config.devices = {
         GlobalDeviceAddress::cuda(0),
         GlobalDeviceAddress::cuda(1)};
     config.backend = CollectiveBackendType::NCCL;
     config.max_seq_len = 512;
 
-    auto multi_orch = std::make_unique<MultiDeviceOrchestrator>(model_ctx, config);
+    auto multi_orch = std::make_unique<RankOrchestrator>(model_ctx, config);
     ASSERT_NE(multi_orch, nullptr);
 
     // Run multiple forward passes (simulating decode)
@@ -651,7 +651,7 @@ TEST_F(Test__LocalTPMultiDevice, ROCm_TwoGPU_LocalTPContextCreation)
 /**
  * @test Verify forward pass produces output with correct shape on ROCm
  *
- * NOTE: Disabled until MultiDeviceOrchestrator weight sharding is implemented.
+ * NOTE: Disabled until RankOrchestrator weight sharding is implemented.
  */
 TEST_F(Test__LocalTPMultiDevice, DISABLED_ROCm_TwoGPU_ForwardProducesSameShape)
 {
@@ -661,14 +661,14 @@ TEST_F(Test__LocalTPMultiDevice, DISABLED_ROCm_TwoGPU_ForwardProducesSameShape)
     auto model_ctx = loadModel();
     ASSERT_NE(model_ctx, nullptr) << "Failed to load model";
 
-    MultiDeviceOrchestrator::Config config;
+    RankOrchestrator::Config config;
     config.devices = {
         GlobalDeviceAddress::rocm(0),
         GlobalDeviceAddress::rocm(1)};
     config.backend = CollectiveBackendType::RCCL;
     config.max_seq_len = 512;
 
-    auto multi_orch = std::make_unique<MultiDeviceOrchestrator>(model_ctx, config);
+    auto multi_orch = std::make_unique<RankOrchestrator>(model_ctx, config);
     ASSERT_NE(multi_orch, nullptr);
     EXPECT_EQ(multi_orch->device_count(), 2);
 
@@ -688,7 +688,7 @@ TEST_F(Test__LocalTPMultiDevice, DISABLED_ROCm_TwoGPU_ForwardProducesSameShape)
 /**
  * @test Compare ROCm multi-device vs single-device logits
  *
- * NOTE: Disabled until MultiDeviceOrchestrator weight sharding is implemented.
+ * NOTE: Disabled until RankOrchestrator weight sharding is implemented.
  */
 TEST_F(Test__LocalTPMultiDevice, DISABLED_ROCm_TwoGPU_LogitsMatchSingleDevice)
 {
@@ -714,14 +714,14 @@ TEST_F(Test__LocalTPMultiDevice, DISABLED_ROCm_TwoGPU_LogitsMatchSingleDevice)
     std::vector<float> single_logits_copy(single_logits, single_logits + vocab_size);
 
     // Multi-device (ROCm:0 + ROCm:1)
-    MultiDeviceOrchestrator::Config multi_config;
+    RankOrchestrator::Config multi_config;
     multi_config.devices = {
         GlobalDeviceAddress::rocm(0),
         GlobalDeviceAddress::rocm(1)};
     multi_config.backend = CollectiveBackendType::RCCL;
     multi_config.max_seq_len = 512;
 
-    auto multi_orch = std::make_unique<MultiDeviceOrchestrator>(model_ctx, multi_config);
+    auto multi_orch = std::make_unique<RankOrchestrator>(model_ctx, multi_config);
     ASSERT_NE(multi_orch, nullptr);
 
     ASSERT_TRUE(multi_orch->forward(tokens.data(), seq_len));
@@ -783,14 +783,14 @@ TEST_F(Test__LocalTPMultiDevice, Heterogeneous_CUDAROCm_ForwardSucceeds)
     auto model_ctx = loadModel();
     ASSERT_NE(model_ctx, nullptr);
 
-    MultiDeviceOrchestrator::Config config;
+    RankOrchestrator::Config config;
     config.devices = {
         GlobalDeviceAddress::cuda(0),
         GlobalDeviceAddress::rocm(0)};
     config.backend = CollectiveBackendType::HETEROGENEOUS;
     config.max_seq_len = 512;
 
-    auto multi_orch = std::make_unique<MultiDeviceOrchestrator>(model_ctx, config);
+    auto multi_orch = std::make_unique<RankOrchestrator>(model_ctx, config);
     ASSERT_NE(multi_orch, nullptr);
     EXPECT_EQ(multi_orch->device_count(), 2);
 
@@ -827,7 +827,7 @@ TEST_F(Test__LocalTPMultiDevice, Heterogeneous_CUDAROCm_ForwardSucceeds)
  * - Different floating-point implementations
  * - Different quantization precision characteristics
  *
- * NOTE: Disabled until MultiDeviceOrchestrator weight sharding is implemented.
+ * NOTE: Disabled until RankOrchestrator weight sharding is implemented.
  */
 TEST_F(Test__LocalTPMultiDevice, DISABLED_Heterogeneous_CUDAROCm_LogitsReasonable)
 {
@@ -853,14 +853,14 @@ TEST_F(Test__LocalTPMultiDevice, DISABLED_Heterogeneous_CUDAROCm_LogitsReasonabl
     std::vector<float> single_logits_copy(single_logits, single_logits + vocab_size);
 
     // Heterogeneous (CUDA:0 + ROCm:0)
-    MultiDeviceOrchestrator::Config multi_config;
+    RankOrchestrator::Config multi_config;
     multi_config.devices = {
         GlobalDeviceAddress::cuda(0),
         GlobalDeviceAddress::rocm(0)};
     multi_config.backend = CollectiveBackendType::HETEROGENEOUS;
     multi_config.max_seq_len = 512;
 
-    auto multi_orch = std::make_unique<MultiDeviceOrchestrator>(model_ctx, multi_config);
+    auto multi_orch = std::make_unique<RankOrchestrator>(model_ctx, multi_config);
     ASSERT_NE(multi_orch, nullptr);
 
     ASSERT_TRUE(multi_orch->forward(tokens.data(), seq_len));
@@ -894,7 +894,7 @@ TEST_F(Test__LocalTPMultiDevice, DISABLED_Heterogeneous_CUDAROCm_LogitsReasonabl
 /**
  * @test Verify proportional weights work with heterogeneous setup
  *
- * NOTE: Disabled until MultiDeviceOrchestrator weight sharding is implemented.
+ * NOTE: Disabled until RankOrchestrator weight sharding is implemented.
  */
 TEST_F(Test__LocalTPMultiDevice, DISABLED_Heterogeneous_ProportionalWeights)
 {
@@ -905,7 +905,7 @@ TEST_F(Test__LocalTPMultiDevice, DISABLED_Heterogeneous_ProportionalWeights)
     ASSERT_NE(model_ctx, nullptr);
 
     // 73% CUDA, 27% ROCm (common for NVIDIA vs AMD performance ratio)
-    MultiDeviceOrchestrator::Config config;
+    RankOrchestrator::Config config;
     config.devices = {
         GlobalDeviceAddress::cuda(0),
         GlobalDeviceAddress::rocm(0)};
@@ -913,7 +913,7 @@ TEST_F(Test__LocalTPMultiDevice, DISABLED_Heterogeneous_ProportionalWeights)
     config.backend = CollectiveBackendType::HETEROGENEOUS;
     config.max_seq_len = 512;
 
-    auto multi_orch = std::make_unique<MultiDeviceOrchestrator>(model_ctx, config);
+    auto multi_orch = std::make_unique<RankOrchestrator>(model_ctx, config);
     ASSERT_NE(multi_orch, nullptr);
 
     // Verify weights via TP context
@@ -943,7 +943,7 @@ TEST_F(Test__LocalTPMultiDevice, ConfigValidation_InvalidWeights)
 {
     skipIfLessThan2CUDA();
 
-    MultiDeviceOrchestrator::Config config;
+    RankOrchestrator::Config config;
     config.devices = {
         GlobalDeviceAddress::cuda(0),
         GlobalDeviceAddress::cuda(1)};
@@ -967,7 +967,7 @@ TEST_F(Test__LocalTPMultiDevice, ConfigValidation_InvalidWeights)
  */
 TEST_F(Test__LocalTPMultiDevice, ConfigValidation_EmptyDevices)
 {
-    MultiDeviceOrchestrator::Config config;
+    RankOrchestrator::Config config;
     config.devices = {};
 
     EXPECT_FALSE(config.validate()) << "Should reject empty device list";

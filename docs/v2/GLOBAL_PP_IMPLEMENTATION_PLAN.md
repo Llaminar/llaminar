@@ -58,13 +58,13 @@ ParallelismTree node              →  IInferenceRunner implementation
 ──────────────────                   ─────────────────────────────
 PP("global", 4 children)          →  PipelineRunner(4 stage_runners)
   PP("host0", 2 children)        →  PipelineRunner(2 stage_runners)
-    PP("socket0", 2 children)    →  MultiDeviceOrchestrator(PP mode)
-      TP("cuda:0","cuda:1")      →  MultiDeviceOrchestrator(TP, NCCL)
-      TP("rocm:0","rocm:1")      →  MultiDeviceOrchestrator(TP, RCCL)
-    PP("socket1", ...)           →  MultiDeviceOrchestrator(PP mode)
+    PP("socket0", 2 children)    →  RankOrchestrator(PP mode)
+      TP("cuda:0","cuda:1")      →  RankOrchestrator(TP, NCCL)
+      TP("rocm:0","rocm:1")      →  RankOrchestrator(TP, RCCL)
+    PP("socket1", ...)           →  RankOrchestrator(PP mode)
 ```
 
-`MultiDeviceOrchestrator` already supports `pp_stage_runners_` as a `vector<unique_ptr<IInferenceRunner>>` — allowing PP-wrapping-TP composition today. The tree simply adds more nesting levels and cross-machine edges.
+`RankOrchestrator` already supports `pp_stage_runners_` as a `vector<unique_ptr<IInferenceRunner>>` — allowing PP-wrapping-TP composition today. The tree simply adds more nesting levels and cross-machine edges.
 
 ### Relationship to Flat Global PP (Phases 1-2)
 
@@ -94,7 +94,7 @@ The Phase 1-2 implementations (`GlobalPPTransferStage`, `GlobalPPTopology`, `Glo
 7. **Correct weight sharding**: Compound sharding — TP shards within PP stages within TP domains
 8. **Deadlock-free**: Deterministic pipeline ordering at every tree level
 9. **CLI/YAML driven**: Full topology expressible via configuration
-10. **Incremental implementation**: Build on existing `IInferenceRunner`, `MultiDeviceOrchestrator`, and Phase 1-2 code
+10. **Incremental implementation**: Build on existing `IInferenceRunner`, `RankOrchestrator`, and Phase 1-2 code
 
 ### Non-Goals
 
@@ -157,7 +157,7 @@ Compile(node):
   
   if node.type == TP:
     runners = [Compile(child) for child in node.children]
-    return MultiDeviceOrchestrator(TP mode, runners, backend, weights)
+    return RankOrchestrator(TP mode, runners, backend, weights)
   
   if node.type == PP:
     stage_runners = [Compile(child) for child in node.children]
@@ -266,7 +266,7 @@ PP nodes partition layers across children. TP nodes shard weights across childre
 │                         EXISTING: Execution Layer (reused)                         │
 │                                                                                   │
 │  ┌─────────────────────┐  ┌───────────────────────┐  ┌───────────────────────┐  │
-│  │DeviceGraphOrchest.  │  │MultiDeviceOrchestrator│  │PipelineRunner (new)   │  │
+│  │DeviceGraphOrchest.  │  │RankOrchestrator│  │PipelineRunner (new)   │  │
 │  │(single device)      │  │(TP, PP, TP+PP modes)  │  │(cross-rank PP)        │  │
 │  │= tree DEVICE leaf   │  │= tree TP/PP node      │  │= tree cross-rank PP   │  │
 │  └─────────────────────┘  └───────────────────────┘  └───────────────────────┘  │
@@ -565,8 +565,8 @@ These remain as single-level building blocks used internally by the tree compile
    - Prune the tree to only subtrees containing this rank's devices
    - Recursively compile bottom-up:
      - DEVICE → `DeviceGraphOrchestrator` configured for `[first_layer, last_layer]`
-     - TP → `MultiDeviceOrchestrator(TP mode)` with children as device runners
-     - PP (same-rank) → `MultiDeviceOrchestrator(PP mode)` with children as stage runners
+     - TP → `RankOrchestrator(TP mode)` with children as device runners
+     - PP (same-rank) → `RankOrchestrator(PP mode)` with children as stage runners
      - PP (cross-rank) → `PipelineRunner` (new class, see below) with GlobalPPTransferStages
 
 2. **`PipelineRunner`** (new `IInferenceRunner` subclass):
@@ -579,8 +579,8 @@ These remain as single-level building blocks used internally by the tree compile
 
 **Unit Tests** (single-process, mock runners):
 - Compile a single device → produces `DeviceGraphOrchestrator`
-- Compile a 2-device TP → produces `MultiDeviceOrchestrator(TP mode)`
-- Compile a 2-stage local PP → produces `MultiDeviceOrchestrator(PP mode)`
+- Compile a 2-device TP → produces `RankOrchestrator(TP mode)`
+- Compile a 2-stage local PP → produces `RankOrchestrator(PP mode)`
 - Compile a 2-level tree (PP wrapping TP) → produces nested orchestrators
 - Verify layer assignment propagates to runner config
 
@@ -800,7 +800,7 @@ topology:
 | Component | Used By | Purpose |
 |-----------|---------|---------|
 | `IInferenceRunner` | `TreeToRunnerCompiler` | Polymorphic composition target |
-| `MultiDeviceOrchestrator` | TP / Local PP nodes | Already supports both modes with `pp_stage_runners_` |
+| `RankOrchestrator` | TP / Local PP nodes | Already supports both modes with `pp_stage_runners_` |
 | `DeviceGraphOrchestrator` | DEVICE leaf nodes | Runs a subset of layers on a single device |
 | `GlobalPPTransferStage` | `PipelineRunner` | MPI send/recv for cross-rank PP |
 | `ITPContext` / `GlobalTPContext` | Cross-rank TP nodes | Existing allreduce interface |

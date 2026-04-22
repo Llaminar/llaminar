@@ -22,8 +22,8 @@
 #include "../../collective/ILocalTPContext.h"
 #include "../../collective/ITPContext.h"
 #include "../../collective/GlobalTPContext.h"
-#include "../local_execution/orchestrators/IMultiDeviceOrchestrator.h"
-#include "../local_execution/orchestrators/MultiDeviceOrchestrator.h"
+#include "../local_execution/orchestrators/IRankOrchestrator.h"
+#include "../local_execution/orchestrators/RankOrchestrator.h"
 #include "../../config/PipelineConfig.h"
 #include "../../config/TensorParallelConfig.h"
 #include "../../utils/DebugEnv.h"
@@ -1795,54 +1795,54 @@ namespace llaminar2
     // Multi-Device Orchestrator Factory Functions
     // =========================================================================
 
-    std::unique_ptr<IMultiDeviceOrchestrator> createMultiDeviceOrchestrator(
+    std::unique_ptr<IRankOrchestrator> createRankOrchestrator(
         std::shared_ptr<IModelContext> model_ctx,
         std::unique_ptr<ILocalTPContext> tp_ctx,
-        const MultiDeviceOrchestrator::Config &config)
+        const RankOrchestrator::Config &config)
     {
         if (!model_ctx)
         {
-            LOG_ERROR("[InferenceRunner] model_ctx is null for createMultiDeviceOrchestrator");
+            LOG_ERROR("[InferenceRunner] model_ctx is null for createRankOrchestrator");
             return nullptr;
         }
 
         if (!tp_ctx)
         {
-            LOG_ERROR("[InferenceRunner] tp_ctx is null for createMultiDeviceOrchestrator");
+            LOG_ERROR("[InferenceRunner] tp_ctx is null for createRankOrchestrator");
             return nullptr;
         }
 
         if (!config.validate())
         {
-            LOG_ERROR("[InferenceRunner] Invalid MultiDeviceOrchestrator config");
+            LOG_ERROR("[InferenceRunner] Invalid RankOrchestrator config");
             return nullptr;
         }
 
-        LOG_INFO("[InferenceRunner] Creating MultiDeviceOrchestrator with "
+        LOG_INFO("[InferenceRunner] Creating RankOrchestrator with "
                  << config.devices.size() << " devices, backend="
                  << static_cast<int>(config.backend));
 
         try
         {
-            return std::make_unique<MultiDeviceOrchestrator>(
+            return std::make_unique<RankOrchestrator>(
                 model_ctx, config, std::move(tp_ctx));
         }
         catch (const std::exception &e)
         {
-            LOG_ERROR("[InferenceRunner] Failed to create MultiDeviceOrchestrator: " << e.what());
+            LOG_ERROR("[InferenceRunner] Failed to create RankOrchestrator: " << e.what());
             return nullptr;
         }
     }
 
-    std::unique_ptr<IMultiDeviceOrchestrator> createTestableMultiDeviceOrchestrator(
+    std::unique_ptr<IRankOrchestrator> createTestableRankOrchestrator(
         std::shared_ptr<IModelContext> model_ctx,
         std::vector<std::unique_ptr<IInferenceRunner>> device_runners,
         std::unique_ptr<ILocalTPContext> tp_ctx,
-        const MultiDeviceOrchestrator::Config &config)
+        const RankOrchestrator::Config &config)
     {
         if (!model_ctx)
         {
-            LOG_ERROR("[InferenceRunner] model_ctx is null for createTestableMultiDeviceOrchestrator");
+            LOG_ERROR("[InferenceRunner] model_ctx is null for createTestableRankOrchestrator");
             return nullptr;
         }
 
@@ -1852,17 +1852,17 @@ namespace llaminar2
             return nullptr;
         }
 
-        LOG_DEBUG("[InferenceRunner] Creating testable MultiDeviceOrchestrator with "
+        LOG_DEBUG("[InferenceRunner] Creating testable RankOrchestrator with "
                   << device_runners.size() << " injected runners");
 
         try
         {
-            return MultiDeviceOrchestrator::createForTest(
+            return RankOrchestrator::createForTest(
                 model_ctx, std::move(device_runners), std::move(tp_ctx), config);
         }
         catch (const std::exception &e)
         {
-            LOG_ERROR("[InferenceRunner] Failed to create testable MultiDeviceOrchestrator: " << e.what());
+            LOG_ERROR("[InferenceRunner] Failed to create testable RankOrchestrator: " << e.what());
             return nullptr;
         }
     }

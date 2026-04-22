@@ -1,6 +1,6 @@
 /**
  * @file Test__MDO_InterfaceDecoupling.cpp
- * @brief Tests that MultiDeviceOrchestrator works through IInferenceRunner interface
+ * @brief Tests that RankOrchestrator works through IInferenceRunner interface
  *
  * Verifies the P0 interface decoupling: MDO stores device_runners_ as
  * vector<unique_ptr<IInferenceRunner>> and accesses device state through
@@ -13,7 +13,7 @@
 
 #include <gtest/gtest.h>
 
-#include "execution/local_execution/orchestrators/MultiDeviceOrchestrator.h"
+#include "execution/local_execution/orchestrators/RankOrchestrator.h"
 #include "execution/local_execution/orchestrators/IInferenceRunner.h"
 #include "collective/ILocalTPContext.h"
 #include "backends/GlobalDeviceAddress.h"
@@ -125,17 +125,17 @@ private:
 class Test__MDO_InterfaceDecoupling : public ::testing::Test
 {
 protected:
-    std::unique_ptr<MultiDeviceOrchestrator> createMDO(
+    std::unique_ptr<RankOrchestrator> createMDO(
         std::vector<std::unique_ptr<IInferenceRunner>> runners,
         std::unique_ptr<ILocalTPContext> tp_ctx = nullptr)
     {
-        MultiDeviceOrchestrator::Config config;
+        RankOrchestrator::Config config;
         for (size_t i = 0; i < runners.size(); ++i)
         {
             config.devices.push_back(GlobalDeviceAddress::cpu());
         }
 
-        return MultiDeviceOrchestrator::createForTest(
+        return RankOrchestrator::createForTest(
             model_ctx_, std::move(runners), std::move(tp_ctx), config);
     }
 
@@ -435,7 +435,7 @@ TEST_F(Test__MDO_InterfaceDecoupling, ArchitectureFromPrimaryRunner)
 }
 
 // =============================================================================
-// Device Runner Access Via IMultiDeviceOrchestrator
+// Device Runner Access Via IRankOrchestrator
 // =============================================================================
 
 TEST_F(Test__MDO_InterfaceDecoupling, DeviceRunnerReturnsIInferenceRunner)

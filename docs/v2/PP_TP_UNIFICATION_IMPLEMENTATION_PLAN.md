@@ -28,7 +28,7 @@ The current single-orchestrator PP approach (`buildUnifiedPipelineGraph()`) is a
 3. [Implementation Phases](#3-implementation-phases)
 4. [Phase 4.1: Core Infrastructure](#4-phase-41-core-infrastructure)
 5. [Phase 4.2: DeviceGraphOrchestrator Enhancements](#5-phase-42-devicegraphorchestrator-enhancements)
-6. [Phase 4.3: MultiDeviceOrchestrator PP Support](#6-phase-43-multideviceorchestrator-pp-support)
+6. [Phase 4.3: RankOrchestrator PP Support](#6-phase-43-multideviceorchestrator-pp-support)
 7. [Phase 4.4: Factory Function Migration](#7-phase-44-factory-function-migration)
 8. [Phase 4.5: Deprecation and Cleanup](#8-phase-45-deprecation-and-cleanup)
 9. [Test Plan](#9-test-plan)
@@ -41,10 +41,10 @@ The current single-orchestrator PP approach (`buildUnifiedPipelineGraph()`) is a
 
 ### 1.1 TP Implementation (Working ✓)
 
-**Pattern**: MultiDeviceOrchestrator creates one DeviceGraphOrchestrator per device.
+**Pattern**: RankOrchestrator creates one DeviceGraphOrchestrator per device.
 
 ```
-MultiDeviceOrchestrator
+RankOrchestrator
 ├── DeviceGraphOrchestrator[cuda:0] ─┬─ forward() ─┐
 ├── DeviceGraphOrchestrator[cuda:1] ─┴─ forward() ─┤ std::async parallel
 └── ILocalTPContext (allreduce, allgather)         │
@@ -53,8 +53,8 @@ MultiDeviceOrchestrator
 ```
 
 **Key Files**:
-- `src/v2/execution/local_execution/orchestrators/MultiDeviceOrchestrator.h` (526 lines)
-- `src/v2/execution/local_execution/orchestrators/MultiDeviceOrchestrator.cpp` (1371 lines)
+- `src/v2/execution/local_execution/orchestrators/RankOrchestrator.h` (526 lines)
+- `src/v2/execution/local_execution/orchestrators/RankOrchestrator.cpp` (1371 lines)
 - `src/v2/collective/ILocalTPContext.h` (373 lines)
 
 ### 1.2 PP Implementation (Broken ✗)
@@ -87,7 +87,7 @@ DeviceGraphOrchestrator (single instance)
 | Graph building | `buildUnifiedPipelineGraph()` | `buildPartialForwardGraph()` per stage |
 | Activation transfer | None (in-graph) | `ILocalPPContext.sendActivations()` |
 | Weight loading | Complex lambda | Normal per-device loading |
-| Factory | `createUnifiedPipelineRunner()` | `MultiDeviceOrchestrator(pp_config)` |
+| Factory | `createUnifiedPipelineRunner()` | `RankOrchestrator(pp_config)` |
 
 ---
 
@@ -96,7 +96,7 @@ DeviceGraphOrchestrator (single instance)
 ### 2.1 PP-Only (2-stage example)
 
 ```
-MultiDeviceOrchestrator (parallelism_mode = PP)
+RankOrchestrator (parallelism_mode = PP)
 ├── PPStageOrchestrator[stage=0, cuda:0]
 │   ├── DeviceGraphOrchestrator
 │   │   ├── layers 0-11
@@ -116,7 +116,7 @@ MultiDeviceOrchestrator (parallelism_mode = PP)
 ### 2.2 TP-Only (existing, unchanged)
 
 ```
-MultiDeviceOrchestrator (parallelism_mode = TP)
+RankOrchestrator (parallelism_mode = TP)
 ├── DeviceGraphOrchestrator[cuda:0] ─┐
 ├── DeviceGraphOrchestrator[cuda:1] ─┤ parallel forward
 └── ILocalTPContext                  │
@@ -126,9 +126,9 @@ MultiDeviceOrchestrator (parallelism_mode = TP)
 ### 2.3 TP+PP (composite)
 
 ```
-MultiDeviceOrchestrator (parallelism_mode = TP_PP)
+RankOrchestrator (parallelism_mode = TP_PP)
 ├── PPStageOrchestrator[stage=0]
-│   └── MultiDeviceOrchestrator (TP)
+│   └── RankOrchestrator (TP)
 │       ├── DeviceGraphOrchestrator[rocm:0] ─┐
 │       ├── DeviceGraphOrchestrator[rocm:1] ─┤ parallel
 │       └── ILocalTPContext (RCCL)           │
@@ -158,7 +158,7 @@ Phase 4.2: DeviceGraphOrchestrator Enhancements (Week 1-2)
     ├── has_embedding / has_lm_head flags
     └── Unit tests for partial graphs
 
-Phase 4.3: MultiDeviceOrchestrator PP Support (Week 2-3)
+Phase 4.3: RankOrchestrator PP Support (Week 2-3)
     ├── Accept PipelineConfig
     ├── Strategy pattern (TP vs PP vs TP+PP)
     ├── Sequential forward logic for PP
@@ -207,7 +207,7 @@ Phase 4.3           Phase 4.4                   │
 ```cpp
 /**
  * @file ParallelismMode.h
- * @brief Parallelism mode enum for MultiDeviceOrchestrator
+ * @brief Parallelism mode enum for RankOrchestrator
  */
 
 #pragma once
@@ -281,7 +281,7 @@ ParallelismMode detectParallelismMode(const PipelineConfig& config);
  * 
  * Abstracts over:
  * - Single DeviceGraphOrchestrator (PP-only stage)
- * - MultiDeviceOrchestrator (TP domain as PP stage)
+ * - RankOrchestrator (TP domain as PP stage)
  */
 
 #pragma once
@@ -312,7 +312,7 @@ struct PPStageOrchestratorConfig {
  * 
  * A PP stage can be:
  * - A single DeviceGraphOrchestrator (simple PP)
- * - A MultiDeviceOrchestrator (TP domain)
+ * - A RankOrchestrator (TP domain)
  */
 class IStageOrchestrator {
 public:
@@ -735,11 +735,11 @@ TEST(Test__DeviceGraphOrchestrator_PP, OutputHiddenReturnsCorrectBuffer) {
 
 ---
 
-## 6. Phase 4.3: MultiDeviceOrchestrator PP Support
+## 6. Phase 4.3: RankOrchestrator PP Support
 
 ### 6.3.1 Add: ParallelismMode field and strategy selection
 
-**File**: `src/v2/execution/local_execution/orchestrators/MultiDeviceOrchestrator.h`  
+**File**: `src/v2/execution/local_execution/orchestrators/RankOrchestrator.h`  
 **Changes**: Accept PipelineConfig, add strategy pattern
 
 ```cpp
@@ -785,11 +785,11 @@ public:
 
 ### 6.3.2 Modify: forward() for PP
 
-**File**: `src/v2/execution/local_execution/orchestrators/MultiDeviceOrchestrator.cpp`  
+**File**: `src/v2/execution/local_execution/orchestrators/RankOrchestrator.cpp`  
 **Changes**: Add sequential execution path for PP
 
 ```cpp
-bool MultiDeviceOrchestrator::forward(const int* tokens, int seq_len)
+bool RankOrchestrator::forward(const int* tokens, int seq_len)
 {
     if (parallelism_mode_ == ParallelismMode::TENSOR_PARALLEL) {
         // Existing TP path: parallel forward across devices
@@ -806,16 +806,16 @@ bool MultiDeviceOrchestrator::forward(const int* tokens, int seq_len)
     }
 }
 
-bool MultiDeviceOrchestrator::forwardTP(const int* tokens, int seq_len)
+bool RankOrchestrator::forwardTP(const int* tokens, int seq_len)
 {
     // Existing parallel implementation...
     // (Move current forward() logic here)
 }
 
-bool MultiDeviceOrchestrator::forwardPP(const int* tokens, int seq_len)
+bool RankOrchestrator::forwardPP(const int* tokens, int seq_len)
 {
     if (pp_stage_orchestrators_.empty()) {
-        LOG_ERROR("MultiDeviceOrchestrator::forwardPP: No PP stages configured");
+        LOG_ERROR("RankOrchestrator::forwardPP: No PP stages configured");
         return false;
     }
     
@@ -840,7 +840,7 @@ bool MultiDeviceOrchestrator::forwardPP(const int* tokens, int seq_len)
         }
         
         if (!current_hidden) {
-            LOG_ERROR("MultiDeviceOrchestrator::forwardPP: Stage " << stage_idx << " failed");
+            LOG_ERROR("RankOrchestrator::forwardPP: Stage " << stage_idx << " failed");
             return false;
         }
     }
@@ -870,7 +870,7 @@ bool MultiDeviceOrchestrator::forwardPP(const int* tokens, int seq_len)
  * @brief Wrapper that adapts DeviceGraphOrchestrator to IStageOrchestrator
  * 
  * For simple PP (no TP within stages), this wraps a single DeviceGraphOrchestrator.
- * For TP+PP, use MultiDeviceOrchestratorStage instead.
+ * For TP+PP, use RankOrchestratorStage instead.
  */
 
 #pragma once
@@ -915,21 +915,21 @@ private:
 };
 
 /**
- * @brief Adapts MultiDeviceOrchestrator (TP domain) to IStageOrchestrator
+ * @brief Adapts RankOrchestrator (TP domain) to IStageOrchestrator
  * 
  * For TP+PP mode where each PP stage is a TP domain.
  */
-class MultiDeviceOrchestratorStage : public IStageOrchestrator {
+class RankOrchestratorStage : public IStageOrchestrator {
 public:
-    explicit MultiDeviceOrchestratorStage(
-        std::unique_ptr<MultiDeviceOrchestrator> orchestrator,
+    explicit RankOrchestratorStage(
+        std::unique_ptr<RankOrchestrator> orchestrator,
         const PPStageOrchestratorConfig& config);
     
     // IStageOrchestrator implementation
     // ... similar to PPStageOrchestrator ...
 
 private:
-    std::unique_ptr<MultiDeviceOrchestrator> orchestrator_;
+    std::unique_ptr<RankOrchestrator> orchestrator_;
     PPStageOrchestratorConfig config_;
 };
 
@@ -940,11 +940,11 @@ private:
 
 ### 6.3.4 Modify: Constructor for PP initialization
 
-**File**: `src/v2/execution/local_execution/orchestrators/MultiDeviceOrchestrator.cpp`  
+**File**: `src/v2/execution/local_execution/orchestrators/RankOrchestrator.cpp`  
 **Changes**: Initialize PP stages when pipeline_config is provided
 
 ```cpp
-void MultiDeviceOrchestrator::initializePPStages()
+void RankOrchestrator::initializePPStages()
 {
     if (!config_.pipeline_config) {
         return;
@@ -958,7 +958,7 @@ void MultiDeviceOrchestrator::initializePPStages()
         return;
     }
     
-    LOG_INFO("MultiDeviceOrchestrator: Initializing " << pp_config.numStages() 
+    LOG_INFO("RankOrchestrator: Initializing " << pp_config.numStages() 
              << " PP stages, mode=" << parallelismModeToString(parallelism_mode_));
     
     pp_stage_orchestrators_.reserve(pp_config.numStages());
@@ -978,10 +978,10 @@ void MultiDeviceOrchestrator::initializePPStages()
             pp_stage_orchestrators_.push_back(
                 std::make_unique<PPStageOrchestrator>(std::move(device_orch), stage_config));
         } else {
-            // TP domain: create MultiDeviceOrchestratorStage
+            // TP domain: create RankOrchestratorStage
             auto tp_orch = createTPOrchestratorForStage(*domain, stage_config);
             pp_stage_orchestrators_.push_back(
-                std::make_unique<MultiDeviceOrchestratorStage>(std::move(tp_orch), stage_config));
+                std::make_unique<RankOrchestratorStage>(std::move(tp_orch), stage_config));
         }
     }
     
@@ -994,17 +994,17 @@ void MultiDeviceOrchestrator::initializePPStages()
 
 ---
 
-### 6.3.5 Test File: Test__MultiDeviceOrchestrator_PP.cpp
+### 6.3.5 Test File: Test__RankOrchestrator_PP.cpp
 
-**Path**: `tests/v2/integration/execution/Test__MultiDeviceOrchestrator_PP.cpp`  
+**Path**: `tests/v2/integration/execution/Test__RankOrchestrator_PP.cpp`  
 **LOC**: ~600 lines
 
 ```cpp
 /**
- * Integration tests for MultiDeviceOrchestrator with Pipeline Parallelism
+ * Integration tests for RankOrchestrator with Pipeline Parallelism
  */
 
-class MultiDeviceOrchestratorPPTest : public ::testing::Test {
+class RankOrchestratorPPTest : public ::testing::Test {
 protected:
     void SetUp() override {
         model_ctx_ = MockModelContextBuilder()
@@ -1015,38 +1015,38 @@ protected:
     std::shared_ptr<IModelContext> model_ctx_;
 };
 
-TEST_F(MultiDeviceOrchestratorPPTest, DetectsTPMode) {
+TEST_F(RankOrchestratorPPTest, DetectsTPMode) {
     auto config = PipelineConfig::tensorParallel(24,
         {DeviceId::cpu(), DeviceId::cpu()},  // Two CPU "devices" for testing
         CollectiveBackendType::HOST);
     
-    MultiDeviceOrchestrator::Config orch_config;
+    RankOrchestrator::Config orch_config;
     orch_config.devices = {GlobalDeviceAddress::cpu(), GlobalDeviceAddress::cpu()};
     orch_config.pipeline_config = std::make_shared<PipelineConfig>(config);
     
-    MultiDeviceOrchestrator orch(model_ctx_, orch_config);
+    RankOrchestrator orch(model_ctx_, orch_config);
     
     EXPECT_EQ(orch.parallelismMode(), ParallelismMode::TENSOR_PARALLEL);
     EXPECT_FALSE(orch.hasPipelineParallelism());
 }
 
-TEST_F(MultiDeviceOrchestratorPPTest, DetectsPPMode) {
+TEST_F(RankOrchestratorPPTest, DetectsPPMode) {
     auto config = PipelineConfig::pipelineParallel2Stage(24,
         DeviceId::cpu(), 12,
         DeviceId::cpu(),
         CollectiveBackendType::HOST);
     
-    MultiDeviceOrchestrator::Config orch_config;
+    RankOrchestrator::Config orch_config;
     orch_config.devices = {GlobalDeviceAddress::cpu(), GlobalDeviceAddress::cpu()};
     orch_config.pipeline_config = std::make_shared<PipelineConfig>(config);
     
-    MultiDeviceOrchestrator orch(model_ctx_, orch_config);
+    RankOrchestrator orch(model_ctx_, orch_config);
     
     EXPECT_EQ(orch.parallelismMode(), ParallelismMode::PIPELINE_PARALLEL);
     EXPECT_TRUE(orch.hasPipelineParallelism());
 }
 
-TEST_F(MultiDeviceOrchestratorPPTest, ForwardPPExecutesStagesSequentially) {
+TEST_F(RankOrchestratorPPTest, ForwardPPExecutesStagesSequentially) {
     // Create 2-stage PP config
     auto config = PipelineConfig::pipelineParallel2Stage(24,
         DeviceId::cpu(), 12,
@@ -1072,11 +1072,11 @@ TEST_F(MultiDeviceOrchestratorPPTest, ForwardPPExecutesStagesSequentially) {
     EXPECT_TRUE(has_non_zero);
 }
 
-TEST_F(MultiDeviceOrchestratorPPTest, PPClearsCacheOnAllStages) {
+TEST_F(RankOrchestratorPPTest, PPClearsCacheOnAllStages) {
     // ... test that clear_cache() propagates to all PP stages ...
 }
 
-TEST_F(MultiDeviceOrchestratorPPTest, PPPositionTrackingIsCorrect) {
+TEST_F(RankOrchestratorPPTest, PPPositionTrackingIsCorrect) {
     // ... test that get_position() returns correct cumulative position ...
 }
 ```
@@ -1087,11 +1087,11 @@ TEST_F(MultiDeviceOrchestratorPPTest, PPPositionTrackingIsCorrect) {
 
 | File | Action | LOC | Dependencies |
 |------|--------|-----|--------------|
-| `src/v2/execution/.../MultiDeviceOrchestrator.h` | Modify | +100 | ParallelismMode.h, IStageOrchestrator.h |
-| `src/v2/execution/.../MultiDeviceOrchestrator.cpp` | Modify | +450 | PPStageOrchestrator.h |
+| `src/v2/execution/.../RankOrchestrator.h` | Modify | +100 | ParallelismMode.h, IStageOrchestrator.h |
+| `src/v2/execution/.../RankOrchestrator.cpp` | Modify | +450 | PPStageOrchestrator.h |
 | `src/v2/execution/.../PPStageOrchestrator.h` | Create | 200 | IStageOrchestrator.h |
 | `src/v2/execution/.../PPStageOrchestrator.cpp` | Create | 300 | DeviceGraphOrchestrator.h |
-| `tests/v2/integration/execution/Test__MultiDeviceOrchestrator_PP.cpp` | Create | 600 | - |
+| `tests/v2/integration/execution/Test__RankOrchestrator_PP.cpp` | Create | 600 | - |
 
 **Total**: ~1650 lines
 
@@ -1108,16 +1108,16 @@ TEST_F(MultiDeviceOrchestratorPPTest, PPPositionTrackingIsCorrect) {
 /**
  * @brief [DEPRECATED] Factory function to create a unified LOCAL PP runner
  * 
- * @deprecated Use MultiDeviceOrchestrator with PipelineConfig instead:
+ * @deprecated Use RankOrchestrator with PipelineConfig instead:
  * @code
- * MultiDeviceOrchestrator::Config config;
+ * RankOrchestrator::Config config;
  * config.pipeline_config = your_pipeline_config;
- * auto runner = std::make_unique<MultiDeviceOrchestrator>(model_ctx, config);
+ * auto runner = std::make_unique<RankOrchestrator>(model_ctx, config);
  * @endcode
  * 
  * This function will be removed in a future release.
  */
-[[deprecated("Use MultiDeviceOrchestrator with pipeline_config instead")]]
+[[deprecated("Use RankOrchestrator with pipeline_config instead")]]
 std::unique_ptr<IInferenceRunner> createUnifiedPipelineRunner(
     std::shared_ptr<ModelContext> model_ctx,
     std::shared_ptr<PipelineConfig> pipeline_config,
@@ -1135,11 +1135,11 @@ std::unique_ptr<IInferenceRunner> createUnifiedPipelineRunner(
 /**
  * @brief Create a multi-device runner with full parallelism support
  * 
- * Creates a MultiDeviceOrchestrator configured for the specified pipeline:
+ * Creates a RankOrchestrator configured for the specified pipeline:
  * - Single device → Direct DeviceGraphOrchestrator
- * - TP only → MultiDeviceOrchestrator with parallel forward
- * - PP only → MultiDeviceOrchestrator with sequential stages
- * - TP+PP → MultiDeviceOrchestrator with nested TP domains per PP stage
+ * - TP only → RankOrchestrator with parallel forward
+ * - PP only → RankOrchestrator with sequential stages
+ * - TP+PP → RankOrchestrator with nested TP domains per PP stage
  * 
  * @param model_ctx Model context with weights
  * @param pipeline_config Complete pipeline configuration
@@ -1179,8 +1179,8 @@ std::unique_ptr<IInferenceRunner> createMultiDevicePipelineRunner(
             pipeline_config->getAllDevices()[0], config);
     }
     
-    // Multi-device: create MultiDeviceOrchestrator
-    MultiDeviceOrchestrator::Config orch_config;
+    // Multi-device: create RankOrchestrator
+    RankOrchestrator::Config orch_config;
     orch_config.pipeline_config = pipeline_config;
     orch_config.max_seq_len = config.max_seq_len;
     orch_config.batch_size = config.batch_size;
@@ -1192,7 +1192,7 @@ std::unique_ptr<IInferenceRunner> createMultiDevicePipelineRunner(
         orch_config.devices.push_back(GlobalDeviceAddress::fromDeviceId(device));
     }
     
-    return std::make_unique<MultiDeviceOrchestrator>(model_ctx, orch_config);
+    return std::make_unique<RankOrchestrator>(model_ctx, orch_config);
 }
 ```
 
@@ -1247,7 +1247,7 @@ done
 | File | Action | LOC | Dependencies |
 |------|--------|-----|--------------|
 | `src/v2/execution/factory/InferenceRunnerFactory.h` | Modify | +50 | ParallelismMode.h |
-| `src/v2/execution/factory/InferenceRunnerFactory.cpp` | Modify | +100 | MultiDeviceOrchestrator.h |
+| `src/v2/execution/factory/InferenceRunnerFactory.cpp` | Modify | +100 | RankOrchestrator.h |
 | `tests/v2/integration/parity/ParityTestBase.h` | Modify | +10 | - |
 | `tests/v2/integration/parity/qwen2/Qwen2ParityTestBase.h` | Modify | +10 | - |
 | `scripts/migrate_pp_factories.sh` | Create | 20 | - |
@@ -1270,7 +1270,7 @@ done
 
 **Migration strategy for tests**:
 1. Tests that verify graph structure → Migrate to use `buildPartialForwardGraph()`
-2. Tests that verify end-to-end PP → Migrate to `Test__MultiDeviceOrchestrator_PP.cpp`
+2. Tests that verify end-to-end PP → Migrate to `Test__RankOrchestrator_PP.cpp`
 
 ---
 
@@ -1366,7 +1366,7 @@ Areas to clean up:
 
 | Test Suite | File | Purpose |
 |------------|------|---------|
-| `V2_Unit_MultiDeviceOrchestrator` | Existing | TP forward, allgather |
+| `V2_Unit_RankOrchestrator` | Existing | TP forward, allgather |
 | `V2_Integration_LocalTP_*` | Existing | End-to-end TP inference |
 | `V2_Integration_Parity_TP_*` | Existing | TP parity vs PyTorch |
 
@@ -1385,7 +1385,7 @@ Areas to clean up:
 
 | Test | File | Coverage |
 |------|------|----------|
-| MultiDevice PP 2-stage | `Test__MultiDeviceOrchestrator_PP.cpp` | Sequential stage execution |
+| MultiDevice PP 2-stage | `Test__RankOrchestrator_PP.cpp` | Sequential stage execution |
 | PP activation transfer | `Test__PPActivationTransfer.cpp` | Hidden state passing |
 | PP+TP composite | `Test__TPPP_Composite.cpp` | TP domains as PP stages |
 
@@ -1409,7 +1409,7 @@ Phase 4.2 tests:
   ctest -R "V2_Unit_.*" (regression)
 
 Phase 4.3 tests:
-  ctest -R "V2_Integration_MultiDeviceOrchestrator_PP"
+  ctest -R "V2_Integration_RankOrchestrator_PP"
   ctest -R "V2_Integration_LocalTP" (regression)
 
 Phase 4.4 tests:
@@ -1439,7 +1439,7 @@ Each phase can be rolled back independently:
 
 **Phase 4.1**: Delete new files, revert CMakeLists.txt  
 **Phase 4.2**: Revert DeviceGraphOrchestrator changes  
-**Phase 4.3**: Revert MultiDeviceOrchestrator changes  
+**Phase 4.3**: Revert RankOrchestrator changes  
 **Phase 4.4**: Re-enable deprecated function  
 **Phase 4.5**: Restore removed code from git history
 
@@ -1463,7 +1463,7 @@ Each phase can be rolled back independently:
 ### 11.1 Pre-Implementation
 
 - [ ] Read this plan completely
-- [ ] Review current TP implementation (MultiDeviceOrchestrator.cpp)
+- [ ] Review current TP implementation (RankOrchestrator.cpp)
 - [ ] Review ILocalPPContext interface
 - [ ] Identify all tests using createUnifiedPipelineRunner
 
@@ -1487,11 +1487,11 @@ Each phase can be rolled back independently:
 
 ### 11.4 Phase 4.3 Checklist
 
-- [ ] Add ParallelismMode to MultiDeviceOrchestrator
+- [ ] Add ParallelismMode to RankOrchestrator
 - [ ] Implement forwardPP()
 - [ ] Create PPStageOrchestrator.h/cpp
-- [ ] Create MultiDeviceOrchestratorStage
-- [ ] Create Test__MultiDeviceOrchestrator_PP.cpp
+- [ ] Create RankOrchestratorStage
+- [ ] Create Test__RankOrchestrator_PP.cpp
 - [ ] TP regression tests pass
 - [ ] New PP tests pass
 
@@ -1529,7 +1529,7 @@ Each phase can be rolled back independently:
 | `src/v2/execution/.../PPStageOrchestrator.cpp` | 300 |
 | `tests/v2/unit/config/Test__ParallelismMode.cpp` | 150 |
 | `tests/v2/unit/orchestrators/Test__DeviceGraphOrchestrator_PP.cpp` | 400 |
-| `tests/v2/integration/execution/Test__MultiDeviceOrchestrator_PP.cpp` | 600 |
+| `tests/v2/integration/execution/Test__RankOrchestrator_PP.cpp` | 600 |
 | `scripts/migrate_pp_factories.sh` | 20 |
 
 ### Modified Files (10 files, ~1200 LOC added)
@@ -1541,8 +1541,8 @@ Each phase can be rolled back independently:
 | `src/v2/models/qwen/Qwen2Graph.cpp` | +100 |
 | `src/v2/execution/.../DeviceGraphOrchestrator.h` | +60 |
 | `src/v2/execution/.../DeviceGraphOrchestrator.cpp` | +230 |
-| `src/v2/execution/.../MultiDeviceOrchestrator.h` | +100 |
-| `src/v2/execution/.../MultiDeviceOrchestrator.cpp` | +450 |
+| `src/v2/execution/.../RankOrchestrator.h` | +100 |
+| `src/v2/execution/.../RankOrchestrator.cpp` | +450 |
 | `src/v2/execution/factory/InferenceRunnerFactory.h` | +50 |
 | `src/v2/execution/factory/InferenceRunnerFactory.cpp` | +100 |
 | `tests/v2/integration/parity/*.h` | +20 |
@@ -1586,7 +1586,7 @@ Each phase can be rolled back independently:
 // - After clear_cache(): getPosition() == 0, kvCache()->position() == 0
 ```
 
-### B.2 MultiDeviceOrchestrator PP Contract
+### B.2 RankOrchestrator PP Contract
 
 ```cpp
 // Invariants:

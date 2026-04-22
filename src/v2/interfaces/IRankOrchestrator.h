@@ -1,5 +1,5 @@
 /**
- * @file IMultiDeviceOrchestrator.h
+ * @file IRankOrchestrator.h
  * @brief Interface for multi-device orchestration extending IInferenceRunner
  *
  * This interface extends IInferenceRunner to add multi-device specific
@@ -11,7 +11,7 @@
  * Design goals:
  * - Drop-in replacement for IInferenceRunner (extends it)
  * - Testable via dependency injection
- * - Compatible with MockMultiDeviceOrchestrator for unit testing
+ * - Compatible with MockRankOrchestrator for unit testing
  *
  * @author David Sanftenberg
  * @date January 2026
@@ -45,7 +45,7 @@ namespace llaminar2
      * Usage:
      * @code
      * // Get orchestrator from factory
-     * auto orchestrator = createMultiDeviceOrchestrator(config);
+     * auto orchestrator = createRankOrchestrator(config);
      *
      * // Use as IInferenceRunner (single interface)
      * orchestrator->forward(tokens, seq_len);
@@ -63,10 +63,10 @@ namespace llaminar2
      * tp_ctx->allreduce(tensor);
      * @endcode
      */
-    class IMultiDeviceOrchestrator : public IInferenceRunner
+    class IRankOrchestrator : public IInferenceRunner
     {
     public:
-        ~IMultiDeviceOrchestrator() override = default;
+        ~IRankOrchestrator() override = default;
 
         // =====================================================================
         // Multi-Device Query API

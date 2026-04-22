@@ -1,6 +1,6 @@
 /**
- * @file Test__MultiDeviceOrchestrator_PPConfig.cpp
- * @brief Unit tests for MultiDeviceOrchestrator PP config validation
+ * @file Test__RankOrchestrator_PPConfig.cpp
+ * @brief Unit tests for RankOrchestrator PP config validation
  *
  * Tests the Phase 1 PP config extensions:
  * - ParallelismMode enum and detection
@@ -13,25 +13,25 @@
  */
 
 #include <gtest/gtest.h>
-#include "execution/local_execution/orchestrators/MultiDeviceOrchestrator.h"
+#include "execution/local_execution/orchestrators/RankOrchestrator.h"
 #include "backends/GlobalDeviceAddress.h"
 
 namespace llaminar2::test
 {
 
-    class Test__MultiDeviceOrchestrator_PPConfig : public ::testing::Test
+    class Test__RankOrchestrator_PPConfig : public ::testing::Test
     {
     protected:
-        using Config = MultiDeviceOrchestrator::Config;
-        using PPStageConfig = MultiDeviceOrchestrator::PPStageConfig;
-        using ParallelismMode = MultiDeviceOrchestrator::ParallelismMode;
+        using Config = RankOrchestrator::Config;
+        using PPStageConfig = RankOrchestrator::PPStageConfig;
+        using ParallelismMode = RankOrchestrator::ParallelismMode;
     };
 
     // =========================================================================
     // PPStageConfig Validation Tests
     // =========================================================================
 
-    TEST_F(Test__MultiDeviceOrchestrator_PPConfig, PPStageConfig_ValidSingleDevice)
+    TEST_F(Test__RankOrchestrator_PPConfig, PPStageConfig_ValidSingleDevice)
     {
         PPStageConfig stage;
         stage.first_layer = 0;
@@ -43,7 +43,7 @@ namespace llaminar2::test
         EXPECT_FALSE(stage.isTPDomain());
     }
 
-    TEST_F(Test__MultiDeviceOrchestrator_PPConfig, PPStageConfig_ValidTPDomain)
+    TEST_F(Test__RankOrchestrator_PPConfig, PPStageConfig_ValidTPDomain)
     {
         PPStageConfig stage;
         stage.first_layer = 12;
@@ -56,7 +56,7 @@ namespace llaminar2::test
         EXPECT_TRUE(stage.isTPDomain());
     }
 
-    TEST_F(Test__MultiDeviceOrchestrator_PPConfig, PPStageConfig_InvalidLayerRange)
+    TEST_F(Test__RankOrchestrator_PPConfig, PPStageConfig_InvalidLayerRange)
     {
         PPStageConfig stage;
         stage.first_layer = 12;
@@ -66,7 +66,7 @@ namespace llaminar2::test
         EXPECT_FALSE(stage.validate());
     }
 
-    TEST_F(Test__MultiDeviceOrchestrator_PPConfig, PPStageConfig_EmptyDevices)
+    TEST_F(Test__RankOrchestrator_PPConfig, PPStageConfig_EmptyDevices)
     {
         PPStageConfig stage;
         stage.first_layer = 0;
@@ -76,7 +76,7 @@ namespace llaminar2::test
         EXPECT_FALSE(stage.validate());
     }
 
-    TEST_F(Test__MultiDeviceOrchestrator_PPConfig, PPStageConfig_MismatchedWeights)
+    TEST_F(Test__RankOrchestrator_PPConfig, PPStageConfig_MismatchedWeights)
     {
         PPStageConfig stage;
         stage.first_layer = 0;
@@ -91,7 +91,7 @@ namespace llaminar2::test
     // ParallelismMode Detection Tests
     // =========================================================================
 
-    TEST_F(Test__MultiDeviceOrchestrator_PPConfig, DetectMode_TP)
+    TEST_F(Test__RankOrchestrator_PPConfig, DetectMode_TP)
     {
         Config config;
         config.devices = {GlobalDeviceAddress::cuda(0), GlobalDeviceAddress::cuda(1)};
@@ -101,7 +101,7 @@ namespace llaminar2::test
         EXPECT_EQ(config.effectiveMode(), ParallelismMode::TP);
     }
 
-    TEST_F(Test__MultiDeviceOrchestrator_PPConfig, DetectMode_PP)
+    TEST_F(Test__RankOrchestrator_PPConfig, DetectMode_PP)
     {
         Config config;
         config.devices.clear();
@@ -123,7 +123,7 @@ namespace llaminar2::test
         EXPECT_EQ(config.effectiveMode(), ParallelismMode::PP);
     }
 
-    TEST_F(Test__MultiDeviceOrchestrator_PPConfig, DetectMode_TP_PP)
+    TEST_F(Test__RankOrchestrator_PPConfig, DetectMode_TP_PP)
     {
         Config config;
         config.devices.clear();
@@ -146,7 +146,7 @@ namespace llaminar2::test
         EXPECT_EQ(config.effectiveMode(), ParallelismMode::TP_PP);
     }
 
-    TEST_F(Test__MultiDeviceOrchestrator_PPConfig, EffectiveMode_AutoResolves)
+    TEST_F(Test__RankOrchestrator_PPConfig, EffectiveMode_AutoResolves)
     {
         Config config;
         config.mode = ParallelismMode::AUTO;
@@ -155,7 +155,7 @@ namespace llaminar2::test
         EXPECT_EQ(config.effectiveMode(), ParallelismMode::TP);
     }
 
-    TEST_F(Test__MultiDeviceOrchestrator_PPConfig, EffectiveMode_ExplicitOverridesAuto)
+    TEST_F(Test__RankOrchestrator_PPConfig, EffectiveMode_ExplicitOverridesAuto)
     {
         Config config;
         config.mode = ParallelismMode::TP;
@@ -176,7 +176,7 @@ namespace llaminar2::test
     // Config::validate() Tests for TP Mode
     // =========================================================================
 
-    TEST_F(Test__MultiDeviceOrchestrator_PPConfig, Validate_TP_Valid)
+    TEST_F(Test__RankOrchestrator_PPConfig, Validate_TP_Valid)
     {
         Config config;
         config.devices = {GlobalDeviceAddress::cuda(0), GlobalDeviceAddress::cuda(1)};
@@ -185,7 +185,7 @@ namespace llaminar2::test
         EXPECT_TRUE(config.validate());
     }
 
-    TEST_F(Test__MultiDeviceOrchestrator_PPConfig, Validate_TP_NoDevices)
+    TEST_F(Test__RankOrchestrator_PPConfig, Validate_TP_NoDevices)
     {
         Config config;
         config.devices.clear();
@@ -194,7 +194,7 @@ namespace llaminar2::test
         EXPECT_FALSE(config.validate());
     }
 
-    TEST_F(Test__MultiDeviceOrchestrator_PPConfig, Validate_TP_MismatchedWeights)
+    TEST_F(Test__RankOrchestrator_PPConfig, Validate_TP_MismatchedWeights)
     {
         Config config;
         config.devices = {GlobalDeviceAddress::cuda(0), GlobalDeviceAddress::cuda(1)};
@@ -207,7 +207,7 @@ namespace llaminar2::test
     // Config::validate() Tests for PP Mode
     // =========================================================================
 
-    TEST_F(Test__MultiDeviceOrchestrator_PPConfig, Validate_PP_Valid)
+    TEST_F(Test__RankOrchestrator_PPConfig, Validate_PP_Valid)
     {
         Config config;
         config.devices.clear();
@@ -227,7 +227,7 @@ namespace llaminar2::test
         EXPECT_TRUE(config.validate());
     }
 
-    TEST_F(Test__MultiDeviceOrchestrator_PPConfig, Validate_PP_LayerGap)
+    TEST_F(Test__RankOrchestrator_PPConfig, Validate_PP_LayerGap)
     {
         Config config;
         config.devices.clear();
@@ -247,7 +247,7 @@ namespace llaminar2::test
         EXPECT_FALSE(config.validate());
     }
 
-    TEST_F(Test__MultiDeviceOrchestrator_PPConfig, Validate_PP_InvalidStage)
+    TEST_F(Test__RankOrchestrator_PPConfig, Validate_PP_InvalidStage)
     {
         Config config;
         config.devices.clear();
@@ -266,7 +266,7 @@ namespace llaminar2::test
     // Helper Method Tests
     // =========================================================================
 
-    TEST_F(Test__MultiDeviceOrchestrator_PPConfig, HasPP_True)
+    TEST_F(Test__RankOrchestrator_PPConfig, HasPP_True)
     {
         Config config;
         PPStageConfig stage;
@@ -278,7 +278,7 @@ namespace llaminar2::test
         EXPECT_TRUE(config.hasPP());
     }
 
-    TEST_F(Test__MultiDeviceOrchestrator_PPConfig, HasPP_False)
+    TEST_F(Test__RankOrchestrator_PPConfig, HasPP_False)
     {
         Config config;
         config.pp_stages.clear();
@@ -286,7 +286,7 @@ namespace llaminar2::test
         EXPECT_FALSE(config.hasPP());
     }
 
-    TEST_F(Test__MultiDeviceOrchestrator_PPConfig, BuildLayerBoundaries_TwoStages)
+    TEST_F(Test__RankOrchestrator_PPConfig, BuildLayerBoundaries_TwoStages)
     {
         Config config;
 
@@ -309,7 +309,7 @@ namespace llaminar2::test
         EXPECT_EQ(boundaries[2], 24);
     }
 
-    TEST_F(Test__MultiDeviceOrchestrator_PPConfig, BuildLayerBoundaries_Empty)
+    TEST_F(Test__RankOrchestrator_PPConfig, BuildLayerBoundaries_Empty)
     {
         Config config;
         config.pp_stages.clear();
@@ -318,7 +318,7 @@ namespace llaminar2::test
         EXPECT_TRUE(boundaries.empty());
     }
 
-    TEST_F(Test__MultiDeviceOrchestrator_PPConfig, GetNormalizedWeights_DefaultsToEqual)
+    TEST_F(Test__RankOrchestrator_PPConfig, GetNormalizedWeights_DefaultsToEqual)
     {
         Config config;
         config.devices = {GlobalDeviceAddress::cuda(0), GlobalDeviceAddress::cuda(1)};

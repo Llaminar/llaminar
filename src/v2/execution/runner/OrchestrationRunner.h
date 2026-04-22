@@ -25,7 +25,7 @@
 #include "../mpi_orchestration/IExecutionPlanBuilder.h"
 #include "../local_execution/orchestrators/IInferenceRunner.h"
 #include "../mpi_orchestration/DeviceInventory.h"
-#include "../local_execution/orchestrators/MultiDeviceOrchestrator.h"
+#include "../local_execution/orchestrators/RankOrchestrator.h"
 #include "../../planning/MemoryPlanner.h"
 #include "../../collective/ILocalTPContext.h"
 #include "../../collective/ILocalPPContext.h"

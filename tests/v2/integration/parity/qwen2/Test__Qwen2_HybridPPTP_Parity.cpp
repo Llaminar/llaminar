@@ -112,7 +112,7 @@ TEST_P(Qwen2HybridPPTPParityTest, PrefillParity)
 {
     // Hybrid PP+TP: pipeline uses LocalPPTestRunner wrapping pre-compiled
     // TP MDO + single-device DGO. Use non-TP parity comparison since the
-    // outer runner is not a MultiDeviceOrchestrator (TP-specific snapshot
+    // outer runner is not a RankOrchestrator (TP-specific snapshot
     // access requires MDO cast). The combined output is still compared
     // against PyTorch reference for correctness.
     ASSERT_TRUE(setupPipeline()) << "Pipeline setup failed";

@@ -1286,7 +1286,7 @@ TEST(GDNTPRealModelLimits, Qwen35_08B_SupportsTP8)
 // =============================================================================
 // IWeightManager Default Interface Methods (Regression for Bug #5)
 //
-// Bug: MultiDeviceOrchestrator (Local TP path) never called
+// Bug: RankOrchestrator (Local TP path) never called
 // setModelDimensions() or setGDNDimensions() on the WeightManager.
 // These methods were only called in InferenceRunnerFactory (Global TP path).
 // Without them, loadFusedQKVColumnParallel() couldn't detect the GDN
@@ -1296,7 +1296,7 @@ TEST(GDNTPRealModelLimits, Qwen35_08B_SupportsTP8)
 // with default no-op implementations so that existing MockWeightManager
 // and other IWeightManager implementations don't break.
 //
-// Fix part 2: MultiDeviceOrchestrator::initializeWeightSharding() now calls
+// Fix part 2: RankOrchestrator::initializeWeightSharding() now calls
 // both methods after configuring TP.
 // =============================================================================
 
@@ -1328,7 +1328,7 @@ TEST(IWeightManagerDefaults, SetModelDimensionsCallableViaInterface)
         WeightDistributionStrategy::SHARDED,
         WeightPrecision::NATIVE);
 
-    // Call via IWeightManager pointer (the actual dispatch path in MultiDeviceOrchestrator)
+    // Call via IWeightManager pointer (the actual dispatch path in RankOrchestrator)
     IWeightManager *iface = wm.get();
     EXPECT_NO_THROW(iface->setModelDimensions(16, 4, 128));
     EXPECT_NO_THROW(iface->setGDNDimensions(16, 32, 128));
@@ -1339,7 +1339,7 @@ TEST(IWeightManagerDefaults, SetModelDimensionsCallableViaInterface)
  *
  * Verify that setGDNDimensions can be called after construction and
  * before weight loading, which is the exact calling pattern used by
- * MultiDeviceOrchestrator::initializeWeightSharding().
+ * RankOrchestrator::initializeWeightSharding().
  */
 TEST(IWeightManagerDefaults, SetGDNDimensionsBeforeWeightLoad)
 {
@@ -1372,7 +1372,7 @@ TEST(IWeightManagerDefaults, SetGDNDimensionsBeforeWeightLoad)
         WeightPrecision::NATIVE);
     wm->setWeightShardingConfig(config);
 
-    // This is the calling order from MultiDeviceOrchestrator
+    // This is the calling order from RankOrchestrator
     wm->setModelDimensions(8, 2, 8); // FA: 8*8 + 2*2*8 = 96 ≠ 64
     wm->setGDNDimensions(4, 8, 4);   // GDN: 2*4*4 + 8*4 = 64 ✓
 

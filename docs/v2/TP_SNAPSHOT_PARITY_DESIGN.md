@@ -12,7 +12,7 @@ The current snapshot/parity testing system was designed before tensor parallelis
 2. **Shard combination**: Column-parallel stages need concatenation; row-parallel need validation
 3. **Proper comparison**: Sharded outputs must be compared against correct slices of PyTorch reference
 
-Currently, `MultiDeviceOrchestrator::getSnapshot()` only returns device 0's data (except for LM_HEAD), and `compareTensors()` silently returns cosine=0.0 on size mismatches. This makes parity results unreliable.
+Currently, `RankOrchestrator::getSnapshot()` only returns device 0's data (except for LM_HEAD), and `compareTensors()` silently returns cosine=0.0 on size mismatches. This makes parity results unreliable.
 
 ## Requirements
 
@@ -60,7 +60,7 @@ The parity table should show:
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                     MultiDeviceOrchestrator                      │
+│                     RankOrchestrator                      │
 │  ┌──────────────────┐  ┌──────────────────┐                     │
 │  │ DeviceRunner[0]  │  │ DeviceRunner[1]  │  (LOCAL TP)         │
 │  │   CUDA:0         │  │   ROCm:0         │                     │
@@ -93,7 +93,7 @@ The parity table should show:
 ### New Data Structures
 
 ```cpp
-// In MultiDeviceOrchestrator.h or a new TPSnapshot.h
+// In RankOrchestrator.h or a new TPSnapshot.h
 
 /**
  * @brief Sharding pattern for a snapshot
@@ -167,7 +167,7 @@ public:
 
 1. Modify `DeviceGraphOrchestrator` to include `GlobalDeviceId` in snapshot storage
 2. Add sharding mode metadata to each captured snapshot
-3. Update `MultiDeviceOrchestrator::getSnapshot()` to return TPSnapshot
+3. Update `RankOrchestrator::getSnapshot()` to return TPSnapshot
 
 ### Phase 3: ParityTestBase Updates
 
@@ -286,7 +286,7 @@ size_t computeSliceSize(int device_idx, int tp_degree, size_t total_cols) {
 2. **Add `SnapshotShardingMode` enum and registry** - Define stage sharding patterns
 3. **Modify `DeviceGraphOrchestrator` snapshot capture** - Include device ID and sharding mode
 4. **Add `TPSnapshot` struct and `getTPSnapshot()` API** - New retrieval interface
-5. **Update `MultiDeviceOrchestrator` to populate `TPSnapshot`** - Combine device data
+5. **Update `RankOrchestrator` to populate `TPSnapshot`** - Combine device data
 6. **Add `compareTPSnapshot()` to ParityTestBase** - TP-aware comparison logic
 7. **Update `renderParityTable()`** - Show per-device and combined results
 8. **Update PCIeBAR parity test** - Use new TP-aware comparison
@@ -298,7 +298,7 @@ size_t computeSliceSize(int device_idx, int tp_degree, size_t total_cols) {
 | `src/v2/execution/DeviceInventory.h` | Add `toString()` implementation, add hostname |
 | `src/v2/execution/TPSnapshot.h` (NEW) | `SnapshotShardingMode`, `DeviceSnapshotData`, `TPSnapshot` |
 | `src/v2/execution/DeviceGraphOrchestrator.h` | Store `GlobalDeviceId` with snapshots |
-| `src/v2/execution/MultiDeviceOrchestrator.h/cpp` | Implement `getTPSnapshot()` |
+| `src/v2/execution/RankOrchestrator.h/cpp` | Implement `getTPSnapshot()` |
 | `src/v2/execution/IInferenceRunner.h` | Add `getTPSnapshot()` to interface |
 | `tests/v2/integration/parity/ParityTestBase.h` | Add `compareTPSnapshot()`, update table |
 | `tests/v2/integration/parity/qwen2/Test__Qwen2_LocalTP_PCIeBAR_vs_PyTorch.cpp` | Use new API |

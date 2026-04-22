@@ -7,7 +7,7 @@
 
 ## Executive Summary
 
-Enable **Pipeline Parallelism with Tensor Parallel domains** (TP_PP mode) in `MultiDeviceOrchestrator`. This allows topologies like:
+Enable **Pipeline Parallelism with Tensor Parallel domains** (TP_PP mode) in `RankOrchestrator`. This allows topologies like:
 
 ```
 Stage 0: TP(rocm:0, rocm:1)  ← 2 ROCm GPUs with RCCL allreduce
@@ -24,7 +24,7 @@ The implementation leverages existing infrastructure rather than creating new ab
 ### Current State
 
 ```
-MultiDeviceOrchestrator
+RankOrchestrator
 ├── mode_ = TP_PP (detected, but returns false)
 ├── pp_stage_runners_: vector<unique_ptr<IInferenceRunner>>
 │   └── Currently: DeviceGraphOrchestrator only (ignores TP domains)
@@ -34,8 +34,8 @@ MultiDeviceOrchestrator
 ### Target State
 
 ```
-MultiDeviceOrchestrator (outer, mode=TP_PP)
-├── pp_stage_runners_[0]: MultiDeviceOrchestrator (nested, mode=TP)
+RankOrchestrator (outer, mode=TP_PP)
+├── pp_stage_runners_[0]: RankOrchestrator (nested, mode=TP)
 │   ├── device_runners_[0]: DeviceGraphOrchestrator[rocm:0]
 │   ├── device_runners_[1]: DeviceGraphOrchestrator[rocm:1]
 │   └── tp_ctx_: LocalTPContext (RCCL)
@@ -51,15 +51,15 @@ The existing `forwardPP()` method works through `IInferenceRunner` interface:
 - `setHiddenState(hidden_state)`
 - `clearHiddenStateInput()`
 
-If `MultiDeviceOrchestrator` implements these methods (delegating to its primary device runner), it can be nested as a PP stage without any new abstraction layer.
+If `RankOrchestrator` implements these methods (delegating to its primary device runner), it can be nested as a PP stage without any new abstraction layer.
 
 ---
 
 ## Implementation Tasks
 
-### Task 1: PP Interface Methods in MultiDeviceOrchestrator
+### Task 1: PP Interface Methods in RankOrchestrator
 
-**File**: `src/v2/execution/local_execution/orchestrators/MultiDeviceOrchestrator.h/cpp`
+**File**: `src/v2/execution/local_execution/orchestrators/RankOrchestrator.h/cpp`
 
 Add overrides for the PP hidden state methods:
 
@@ -76,20 +76,20 @@ Implementation delegates to primary runner:
 - For TP mode: `device_runners_[0]`
 - For PP mode: `pp_stage_runners_.back()` (last stage has final hidden state)
 
-**Tests**: Unit tests in `Test__MultiDeviceOrchestrator_PPInterface.cpp`
+**Tests**: Unit tests in `Test__RankOrchestrator_PPInterface.cpp`
 
 ---
 
 ### Task 2: Create Nested MDO for TP Domains
 
-**File**: `src/v2/execution/local_execution/orchestrators/MultiDeviceOrchestrator.cpp`
+**File**: `src/v2/execution/local_execution/orchestrators/RankOrchestrator.cpp`
 
-Modify `initializePPDeviceRunners()` to create nested `MultiDeviceOrchestrator` when `stage_config.isTPDomain()`:
+Modify `initializePPDeviceRunners()` to create nested `RankOrchestrator` when `stage_config.isTPDomain()`:
 
 ```cpp
 if (stage_config.isTPDomain())
 {
-    // Create nested MultiDeviceOrchestrator for this TP stage
+    // Create nested RankOrchestrator for this TP stage
     Config nested_config;
     nested_config.mode = ParallelismMode::TP;
     nested_config.devices = stage_config.stage_devices;
@@ -99,7 +99,7 @@ if (stage_config.isTPDomain())
     nested_config.batch_size = config_.batch_size;
     nested_config.activation_precision = config_.activation_precision;
     
-    auto nested_mdo = std::make_unique<MultiDeviceOrchestrator>(stage_ctx, nested_config);
+    auto nested_mdo = std::make_unique<RankOrchestrator>(stage_ctx, nested_config);
     pp_stage_runners_.push_back(std::move(nested_mdo));
 }
 else
@@ -116,12 +116,12 @@ else
 
 ### Task 3: Unify forward() Dispatch
 
-**File**: `src/v2/execution/local_execution/orchestrators/MultiDeviceOrchestrator.cpp`
+**File**: `src/v2/execution/local_execution/orchestrators/RankOrchestrator.cpp`
 
 Simplify `forward()` to use `forwardPP()` for both PP and TP_PP modes:
 
 ```cpp
-bool MultiDeviceOrchestrator::forward(const int *tokens, int seq_len)
+bool RankOrchestrator::forward(const int *tokens, int seq_len)
 {
     switch (mode_)
     {
@@ -131,7 +131,7 @@ bool MultiDeviceOrchestrator::forward(const int *tokens, int seq_len)
     case ParallelismMode::TP_PP:  // TP_PP uses same flow as PP
         return forwardPP(tokens, seq_len);
     default:
-        LOG_ERROR("MultiDeviceOrchestrator::forward: Unknown parallelism mode");
+        LOG_ERROR("RankOrchestrator::forward: Unknown parallelism mode");
         return false;
     }
 }
@@ -183,10 +183,10 @@ The existing `LocalPP_TP2xROCm_CUDA` test should pass after implementation. Veri
 
 | File | Change Type | Lines |
 |------|-------------|-------|
-| `MultiDeviceOrchestrator.h` | Modify | +15 |
-| `MultiDeviceOrchestrator.cpp` | Modify | +80 |
-| `Test__MultiDeviceOrchestrator_PPInterface.cpp` | New | ~150 |
-| `Test__MultiDeviceOrchestrator_NestedTP.cpp` | New | ~200 |
+| `RankOrchestrator.h` | Modify | +15 |
+| `RankOrchestrator.cpp` | Modify | +80 |
+| `Test__RankOrchestrator_PPInterface.cpp` | New | ~150 |
+| `Test__RankOrchestrator_NestedTP.cpp` | New | ~200 |
 
 ---
 
@@ -207,7 +207,7 @@ The existing `LocalPP_TP2xROCm_CUDA` test should pass after implementation. Veri
 3. ✅ `LocalPP_TP2xROCm_CUDA/PrefillParity` passes
 4. ✅ `LocalPP_TP2xROCm_CUDA/DecodeParity` passes
 5. ✅ `LocalPP_TP2xROCm_CUDA/TopKOverlap` passes
-6. ✅ All existing `MultiDeviceOrchestrator` tests still pass
+6. ✅ All existing `RankOrchestrator` tests still pass
 
 ---
 

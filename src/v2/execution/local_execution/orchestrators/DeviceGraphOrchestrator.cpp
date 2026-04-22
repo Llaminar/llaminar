@@ -777,7 +777,7 @@ namespace llaminar2
 
         // For Local TP (multi-GPU, single MPI rank), the per-device
         // DeviceGraphOrchestrator may not have an injected_collective_ctx_
-        // because the MultiDeviceOrchestrator owns the LocalTPContext.
+        // because the RankOrchestrator owns the LocalTPContext.
         // The collective stages (TPAllreduceStage) execute as manual segments
         // between graph-captured compute segments, so segmented replay is safe
         // as long as the backend supports stream-ordered collectives.

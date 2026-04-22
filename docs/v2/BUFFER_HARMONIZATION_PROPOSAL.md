@@ -33,7 +33,7 @@ Today, every compute stage can (and often does) bypass the automatic coherence s
 | **String-based routing** | Buffer name suffix matching determines BAR allocation | Qwen2BufferSpec lines 46-118 | High |
 | **data() in hot path** | GPU→CPU sync triggered by `->data()` inside stages | KVCacheAppend (15 calls), GEMMStage, AllreduceStage | High |
 | **PP outside graph** | Pipeline-parallel copies bypass ComputeGraph entirely | Qwen2Graph lines 552-579 | High |
-| **No buffer namespace** | Same name → different memory per device in MultiDeviceOrchestrator | logits_local on device 0 vs. device 1 | Medium |
+| **No buffer namespace** | Same name → different memory per device in RankOrchestrator | logits_local on device 0 vs. device 1 | Medium |
 
 ---
 
@@ -701,7 +701,7 @@ bool GraphExecutor::executeStage(ComputeNode& node) {
 | Mode | Current Approach | New Approach |
 |------|-----------------|-------------|
 | **Single device** | InferenceState owns buffers, Qwen2Graph wires them, DeviceGraphExecutor coheres | BufferArena owns all buffers. Same execute loop. |
-| **Tensor Parallel** | MultiDeviceOrchestrator creates N DeviceGraphOrchestrators, each with own InferenceState. BAR buffers registered manually by name. AllreduceStage has `CoherencePolicy::NONE`. | Each device gets its own BufferArena. AllreduceStage is a normal stage with `addInOut()`. BAR buffers are registered via `registerExternalBuffer()` with `BufferId::ALLREDUCE_STAGING`. |
+| **Tensor Parallel** | RankOrchestrator creates N DeviceGraphOrchestrators, each with own InferenceState. BAR buffers registered manually by name. AllreduceStage has `CoherencePolicy::NONE`. | Each device gets its own BufferArena. AllreduceStage is a normal stage with `addInOut()`. BAR buffers are registered via `registerExternalBuffer()` with `BufferId::ALLREDUCE_STAGING`. |
 | **Pipeline Parallel** | PP transfers happen outside the graph in Qwen2Graph::buildPartialForwardGraph(). Manual backend->copy() calls. | PPTransferStage is a first-class node in the graph with contract: `addInput(HIDDEN_STATE)` + `addOutput(HIDDEN_STATE)`. Uses CollectiveContext for the transfer. Arena handles coherence. |
 
 **For TP specifically**, the per-device BufferArena eliminates the "same name, different memory" problem. Device 0's arena has `BufferId::LOGITS_LOCAL` pointing to VRAM on GPU 0. Device 1's arena has the same BufferId pointing to VRAM on GPU 1. The executor for each device only interacts with its own arena.
@@ -746,7 +746,7 @@ For each stage:
 - Remove all internal `ensureOnDevice()`, `data()`, `mark_device_dirty()` calls
 - Run parity tests
 
-### Phase 4: Wire BufferArena into PP Path (MultiDeviceOrchestrator)
+### Phase 4: Wire BufferArena into PP Path (RankOrchestrator)
 
 The PP path currently uses a completely separate allocation mechanism (`PerStageBufferPool` + `PPStageBufferSpec` + `ActivationBuffers` struct). This phase eliminates that parallel path so all inference modes use BufferArena.
 
@@ -776,7 +776,7 @@ The PP path currently uses a completely separate allocation mechanism (`PerStage
 
 ### Phase 6: TP Hardening
 
-1. Per-device BufferArena in MultiDeviceOrchestrator
+1. Per-device BufferArena in RankOrchestrator
 2. BAR buffers registered as external buffers with proper device affinity
 3. Collective operations use arena-issued BufferViews
 4. End-to-end TP parity tests

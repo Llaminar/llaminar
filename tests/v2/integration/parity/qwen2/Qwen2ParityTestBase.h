@@ -27,7 +27,7 @@
 #include "../ParityTestBase.h"
 #include "models/qwen/Qwen2Schema.h"
 #include "models/qwen/Qwen2Graph.h"
-#include "execution/local_execution/orchestrators/MultiDeviceOrchestrator.h"
+#include "execution/local_execution/orchestrators/RankOrchestrator.h"
 #include "execution/local_execution/orchestrators/DeviceGraphOrchestrator.h"
 #include "execution/runner/OrchestrationRunner.h"
 // Tree-based pipeline compilation (dogfooding ParallelismTree + TreeToRunnerCompiler)
@@ -317,7 +317,7 @@ namespace llaminar2::test::parity::qwen2
      * @brief Create real runner factories for TreeToRunnerCompiler
      *
      * These factories bridge the tree compiler to the existing InferenceRunnerFactory
-     * and MultiDeviceOrchestrator infrastructure. They are the "real implementation"
+     * and RankOrchestrator infrastructure. They are the "real implementation"
      * that the compiler calls when it encounters DEVICE/TP/PP nodes.
      */
     namespace tree_factories
@@ -362,10 +362,10 @@ namespace llaminar2::test::parity::qwen2
         }
 
         /**
-         * @brief Factory that creates a MultiDeviceOrchestrator(TP) from a TP node
+         * @brief Factory that creates a RankOrchestrator(TP) from a TP node
          *
          * The child_runners are already compiled DeviceGraphOrchestrators.
-         * We wrap them in a MultiDeviceOrchestrator for TP coordination.
+         * We wrap them in a RankOrchestrator for TP coordination.
          */
         inline TreeToRunnerCompiler::TPRunnerFactory makeTPFactory()
         {
@@ -405,8 +405,8 @@ namespace llaminar2::test::parity::qwen2
                 }
 
                 // Build MDO config for TP mode
-                MultiDeviceOrchestrator::Config mdo_config;
-                mdo_config.mode = MultiDeviceOrchestrator::ParallelismMode::TP;
+                RankOrchestrator::Config mdo_config;
+                mdo_config.mode = RankOrchestrator::ParallelismMode::TP;
                 mdo_config.devices = devices;
                 mdo_config.weights = weights;
                 mdo_config.backend = node.backend;
@@ -426,7 +426,7 @@ namespace llaminar2::test::parity::qwen2
                     mdo_config.nested_pp_stage_config = pp_cfg;
                 }
 
-                auto orch = std::make_unique<MultiDeviceOrchestrator>(
+                auto orch = std::make_unique<RankOrchestrator>(
                     model_ctx, mdo_config, std::move(tp_ctx));
 
                 return orch;
@@ -444,7 +444,7 @@ namespace llaminar2::test::parity::qwen2
          * PP forward sequencing: runs stages sequentially, transferring the
          * hidden state between them via a LocalPPContext.
          *
-         * This avoids creating a MultiDeviceOrchestrator(TP_PP) from scratch,
+         * This avoids creating a RankOrchestrator(TP_PP) from scratch,
          * which fails for hybrid PP+TP because the MDO's internal
          * initializePPDeviceRunners() creates PP-stage-filtered model contexts
          * that lack global weights (output_norm, output/lm_head) needed by
@@ -643,7 +643,7 @@ namespace llaminar2::test::parity::qwen2
          * @brief Factory that creates a PP runner from a PP node
          *
          * For pure PP (all stages are single devices): creates a
-         * MultiDeviceOrchestrator(PP) from scratch (works correctly because
+         * RankOrchestrator(PP) from scratch (works correctly because
          * MDO(PP) uses createPPStageRunner for each stage, handling partial
          * weights properly).
          *
@@ -678,13 +678,13 @@ namespace llaminar2::test::parity::qwen2
                 (void)has_tp_stages; // Used only for logging below
                 (void)child_runners; // MDO creates its own runners internally
 
-                MultiDeviceOrchestrator::Config mdo_config;
+                RankOrchestrator::Config mdo_config;
                 mdo_config.max_seq_len = 4096;
                 mdo_config.batch_size = 1;
 
                 for (const auto &child : node.children)
                 {
-                    MultiDeviceOrchestrator::PPStageConfig stage_cfg;
+                    RankOrchestrator::PPStageConfig stage_cfg;
                     stage_cfg.first_layer = child.first_layer;
                     stage_cfg.last_layer = child.last_layer + 1;
                     stage_cfg.has_embedding = child.has_embedding;
@@ -707,7 +707,7 @@ namespace llaminar2::test::parity::qwen2
                 }
 
                 // AUTO mode: MDO detects PP vs TP_PP based on stage device counts
-                mdo_config.mode = MultiDeviceOrchestrator::ParallelismMode::AUTO;
+                mdo_config.mode = RankOrchestrator::ParallelismMode::AUTO;
 
                 if (!mdo_config.validate())
                 {
@@ -715,7 +715,7 @@ namespace llaminar2::test::parity::qwen2
                     return nullptr;
                 }
 
-                auto orch = std::make_unique<MultiDeviceOrchestrator>(model_ctx, mdo_config);
+                auto orch = std::make_unique<RankOrchestrator>(model_ctx, mdo_config);
                 return orch;
             };
         }
@@ -787,7 +787,7 @@ namespace llaminar2::test::parity::qwen2
     class ConfigDrivenParityTest : public Qwen2ParityTestBase
     {
     protected:
-        std::unique_ptr<MultiDeviceOrchestrator> multi_orch_;
+        std::unique_ptr<RankOrchestrator> multi_orch_;
 
         /**
          * @brief Get the test configuration (implement in derived class)
@@ -977,7 +977,7 @@ namespace llaminar2::test::parity::qwen2
          * @brief Tree-based pipeline setup for LocalTP, LocalPP, and HybridPP+TP
          *
          * Builds a ParallelismTree from TestConfig, creates real factories
-         * that produce DeviceGraphOrchestrators and MultiDeviceOrchestrators,
+         * that produce DeviceGraphOrchestrators and RankOrchestrators,
          * then compiles the tree into a nested IInferenceRunner hierarchy.
          */
         bool setupTreePipeline()
@@ -1112,25 +1112,25 @@ namespace llaminar2::test::parity::qwen2
             LOG_INFO("[Parity] LocalTPContext: degree=" << tp_ctx->degree()
                                                         << ", backend=" << static_cast<int>(tp_ctx->backend()));
 
-            MultiDeviceOrchestrator::Config orch_config;
+            RankOrchestrator::Config orch_config;
             orch_config.devices = devices;
             orch_config.weights = weights;
             orch_config.backend = toCollectiveBackend(cfg().collective);
             orch_config.max_seq_len = 4096;
             orch_config.batch_size = 1;
 
-            multi_orch_ = std::make_unique<MultiDeviceOrchestrator>(
+            multi_orch_ = std::make_unique<RankOrchestrator>(
                 model_ctx_, orch_config, std::move(tp_ctx));
 
             if (!multi_orch_)
             {
-                LOG_ERROR("[Parity] Failed to create MultiDeviceOrchestrator");
+                LOG_ERROR("[Parity] Failed to create RankOrchestrator");
                 return false;
             }
 
             multi_orch_->enableSnapshotCapture();
 
-            LOG_INFO("[Parity] MultiDeviceOrchestrator created with "
+            LOG_INFO("[Parity] RankOrchestrator created with "
                      << multi_orch_->device_count() << " devices");
 
             runner_.reset(multi_orch_.release());
@@ -1140,10 +1140,10 @@ namespace llaminar2::test::parity::qwen2
         }
 
         /**
-         * @brief Setup pipeline for LocalPP tests using MultiDeviceOrchestrator PP mode
+         * @brief Setup pipeline for LocalPP tests using RankOrchestrator PP mode
          *
          * Creates a pipeline parallel configuration where layers are split across
-         * multiple devices. Uses MultiDeviceOrchestrator with PP mode which:
+         * multiple devices. Uses RankOrchestrator with PP mode which:
          * - Creates per-stage DeviceGraphOrchestrator instances
          * - Handles sequential forward execution through stages
          * - Manages activation transfer via LocalPPContext

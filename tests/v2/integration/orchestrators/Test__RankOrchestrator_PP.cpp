@@ -1,8 +1,8 @@
 /**
- * @file Test__MultiDeviceOrchestrator_PP.cpp
- * @brief Integration tests for MultiDeviceOrchestrator Pipeline Parallelism mode
+ * @file Test__RankOrchestrator_PP.cpp
+ * @brief Integration tests for RankOrchestrator Pipeline Parallelism mode
  *
- * Tests the PP mode of MultiDeviceOrchestrator:
+ * Tests the PP mode of RankOrchestrator:
  * - PP stage runner creation with layer-partitioned model contexts
  * - Sequential forward execution through stages
  * - Activation transfer between stages via LocalPPContext
@@ -23,7 +23,7 @@
 #include <algorithm>
 #include <numeric>
 
-#include "execution/local_execution/orchestrators/MultiDeviceOrchestrator.h"
+#include "execution/local_execution/orchestrators/RankOrchestrator.h"
 #include "execution/local_execution/orchestrators/DeviceGraphOrchestrator.h"
 #include "execution/config/RuntimeConfig.h"
 #include "loaders/ModelContext.h"
@@ -48,7 +48,7 @@ using namespace llaminar2;
 // Test Fixture
 // =============================================================================
 
-class Test__MultiDeviceOrchestrator_PP : public ::testing::Test
+class Test__RankOrchestrator_PP : public ::testing::Test
 {
 protected:
     static constexpr const char *TEST_MODEL_PATH = "models/qwen2.5-0.5b-instruct-q4_0.gguf";
@@ -119,11 +119,11 @@ protected:
     /**
      * @brief Create PPStageConfig for a given layer range
      */
-    MultiDeviceOrchestrator::PPStageConfig createPPStageConfig(
+    RankOrchestrator::PPStageConfig createPPStageConfig(
         int first_layer, int last_layer, DeviceId device,
         bool has_embedding = false, bool has_lm_head = false)
     {
-        MultiDeviceOrchestrator::PPStageConfig config;
+        RankOrchestrator::PPStageConfig config;
         config.first_layer = first_layer;
         config.last_layer = last_layer;
         config.has_embedding = has_embedding;
@@ -135,13 +135,13 @@ protected:
     /**
      * @brief Create 2-stage PP config on CPU
      */
-    MultiDeviceOrchestrator::Config create2StageCPUConfig()
+    RankOrchestrator::Config create2StageCPUConfig()
     {
-        MultiDeviceOrchestrator::Config config;
+        RankOrchestrator::Config config;
         config.max_seq_len = MAX_SEQ_LEN;
         config.batch_size = BATCH_SIZE;
         config.activation_precision = ActivationPrecision::FP32;
-        config.mode = MultiDeviceOrchestrator::ParallelismMode::PP;
+        config.mode = RankOrchestrator::ParallelismMode::PP;
 
         // Stage 0: layers [0, 12) with embedding
         config.pp_stages.push_back(createPPStageConfig(
@@ -164,24 +164,24 @@ protected:
 /**
  * @test PP mode detection from config
  */
-TEST_F(Test__MultiDeviceOrchestrator_PP, ConfigDetectsMode_PP)
+TEST_F(Test__RankOrchestrator_PP, ConfigDetectsMode_PP)
 {
-    MultiDeviceOrchestrator::Config config;
+    RankOrchestrator::Config config;
     config.max_seq_len = MAX_SEQ_LEN;
     config.batch_size = BATCH_SIZE;
-    config.mode = MultiDeviceOrchestrator::ParallelismMode::AUTO;
+    config.mode = RankOrchestrator::ParallelismMode::AUTO;
 
     // No TP devices, only PP stages
     config.pp_stages.push_back(createPPStageConfig(0, 12, DeviceId::cpu(), true, false));
     config.pp_stages.push_back(createPPStageConfig(12, 24, DeviceId::cpu(), false, true));
 
-    EXPECT_EQ(config.detectMode(), MultiDeviceOrchestrator::ParallelismMode::PP);
+    EXPECT_EQ(config.detectMode(), RankOrchestrator::ParallelismMode::PP);
 }
 
 /**
  * @test 2-stage PP config validates successfully
  */
-TEST_F(Test__MultiDeviceOrchestrator_PP, Config_2Stage_IsValid)
+TEST_F(Test__RankOrchestrator_PP, Config_2Stage_IsValid)
 {
     auto config = create2StageCPUConfig();
     EXPECT_TRUE(config.validate()) << "2-stage CPU PP config should be valid";
@@ -190,12 +190,12 @@ TEST_F(Test__MultiDeviceOrchestrator_PP, Config_2Stage_IsValid)
 /**
  * @test PP config with layer gap fails validation
  */
-TEST_F(Test__MultiDeviceOrchestrator_PP, Config_LayerGap_IsInvalid)
+TEST_F(Test__RankOrchestrator_PP, Config_LayerGap_IsInvalid)
 {
-    MultiDeviceOrchestrator::Config config;
+    RankOrchestrator::Config config;
     config.max_seq_len = MAX_SEQ_LEN;
     config.batch_size = BATCH_SIZE;
-    config.mode = MultiDeviceOrchestrator::ParallelismMode::PP;
+    config.mode = RankOrchestrator::ParallelismMode::PP;
 
     // Gap: [0, 10), [12, 24) - missing layers 10-11
     config.pp_stages.push_back(createPPStageConfig(0, 10, DeviceId::cpu(), true, false));
@@ -207,7 +207,7 @@ TEST_F(Test__MultiDeviceOrchestrator_PP, Config_LayerGap_IsInvalid)
 /**
  * @test PP config layer boundaries extraction
  */
-TEST_F(Test__MultiDeviceOrchestrator_PP, Config_LayerBoundaries)
+TEST_F(Test__RankOrchestrator_PP, Config_LayerBoundaries)
 {
     auto config = create2StageCPUConfig();
     auto boundaries = config.buildLayerBoundaries();
@@ -223,21 +223,21 @@ TEST_F(Test__MultiDeviceOrchestrator_PP, Config_LayerBoundaries)
 // =============================================================================
 
 /**
- * @test MultiDeviceOrchestrator construction in PP mode (CPU)
+ * @test RankOrchestrator construction in PP mode (CPU)
  *
  * This test verifies that the orchestrator can be constructed in PP mode
  * and creates the expected number of stage runners.
  */
-TEST_F(Test__MultiDeviceOrchestrator_PP, ConstructionCreatesStageRunners)
+TEST_F(Test__RankOrchestrator_PP, ConstructionCreatesStageRunners)
 {
     auto config = create2StageCPUConfig();
 
     // Create orchestrator - this should create 2 PP stage runners
-    auto orchestrator = std::make_unique<MultiDeviceOrchestrator>(model_ctx_, config);
+    auto orchestrator = std::make_unique<RankOrchestrator>(model_ctx_, config);
     ASSERT_NE(orchestrator, nullptr);
 
     // Verify PP mode was selected
-    EXPECT_EQ(orchestrator->effectiveMode(), MultiDeviceOrchestrator::ParallelismMode::PP);
+    EXPECT_EQ(orchestrator->effectiveMode(), RankOrchestrator::ParallelismMode::PP);
 
     // Verify vocabulary size is available (implies successful initialization)
     EXPECT_GT(orchestrator->vocab_size(), 0) << "Should have valid vocab_size from model";
@@ -258,10 +258,10 @@ TEST_F(Test__MultiDeviceOrchestrator_PP, ConstructionCreatesStageRunners)
  * Verifies that forward() in PP mode produces non-null logits output.
  * This is an integration test that exercises the full PP execution path.
  */
-TEST_F(Test__MultiDeviceOrchestrator_PP, Forward_ProducesLogits)
+TEST_F(Test__RankOrchestrator_PP, Forward_ProducesLogits)
 {
     auto config = create2StageCPUConfig();
-    auto orchestrator = std::make_unique<MultiDeviceOrchestrator>(model_ctx_, config);
+    auto orchestrator = std::make_unique<RankOrchestrator>(model_ctx_, config);
     ASSERT_NE(orchestrator, nullptr);
 
     // Run forward with a simple prompt
@@ -280,11 +280,11 @@ TEST_F(Test__MultiDeviceOrchestrator_PP, Forward_ProducesLogits)
  * This is a smoke test to verify PP doesn't produce wildly different results.
  * More rigorous parity testing is done in the parity test suite.
  */
-TEST_F(Test__MultiDeviceOrchestrator_PP, Forward_SimilarToSingleDevice)
+TEST_F(Test__RankOrchestrator_PP, Forward_SimilarToSingleDevice)
 {
     // Create PP orchestrator
     auto pp_config = create2StageCPUConfig();
-    auto pp_orchestrator = std::make_unique<MultiDeviceOrchestrator>(model_ctx_, pp_config);
+    auto pp_orchestrator = std::make_unique<RankOrchestrator>(model_ctx_, pp_config);
     ASSERT_NE(pp_orchestrator, nullptr);
 
     // Create single-device reference with its OWN ModelContext.
@@ -293,14 +293,14 @@ TEST_F(Test__MultiDeviceOrchestrator_PP, Forward_SimilarToSingleDevice)
     auto ref_model_ctx = ModelContext::create(TEST_MODEL_PATH);
     ASSERT_NE(ref_model_ctx, nullptr);
 
-    MultiDeviceOrchestrator::Config tp_config;
+    RankOrchestrator::Config tp_config;
     tp_config.max_seq_len = MAX_SEQ_LEN;
     tp_config.batch_size = BATCH_SIZE;
     tp_config.activation_precision = ActivationPrecision::FP32;
-    tp_config.mode = MultiDeviceOrchestrator::ParallelismMode::TP;
+    tp_config.mode = RankOrchestrator::ParallelismMode::TP;
     tp_config.devices.push_back(GlobalDeviceAddress::cpu());
 
-    auto tp_orchestrator = std::make_unique<MultiDeviceOrchestrator>(ref_model_ctx, tp_config);
+    auto tp_orchestrator = std::make_unique<RankOrchestrator>(ref_model_ctx, tp_config);
     ASSERT_NE(tp_orchestrator, nullptr);
 
     // Run same tokens through both
@@ -354,10 +354,10 @@ TEST_F(Test__MultiDeviceOrchestrator_PP, Forward_SimilarToSingleDevice)
  *
  * DISABLED: Requires DeviceGraphOrchestrator fix for PP middle stage forward()
  */
-TEST_F(Test__MultiDeviceOrchestrator_PP, ClearCache_PropagatestoStages)
+TEST_F(Test__RankOrchestrator_PP, ClearCache_PropagatestoStages)
 {
     auto config = create2StageCPUConfig();
-    auto orchestrator = std::make_unique<MultiDeviceOrchestrator>(model_ctx_, config);
+    auto orchestrator = std::make_unique<RankOrchestrator>(model_ctx_, config);
     ASSERT_NE(orchestrator, nullptr);
 
     // Run forward to populate caches
@@ -381,15 +381,15 @@ TEST_F(Test__MultiDeviceOrchestrator_PP, ClearCache_PropagatestoStages)
  * Verifies that the config auto-detects TP_PP mode when one PP stage
  * has multiple devices (a TP domain).
  */
-TEST_F(Test__MultiDeviceOrchestrator_PP, ConfigDetectsMode_TP_PP)
+TEST_F(Test__RankOrchestrator_PP, ConfigDetectsMode_TP_PP)
 {
-    MultiDeviceOrchestrator::Config config;
+    RankOrchestrator::Config config;
     config.max_seq_len = MAX_SEQ_LEN;
     config.batch_size = BATCH_SIZE;
-    config.mode = MultiDeviceOrchestrator::ParallelismMode::AUTO;
+    config.mode = RankOrchestrator::ParallelismMode::AUTO;
 
     // Stage 0: single CUDA device (layers 0-12)
-    MultiDeviceOrchestrator::PPStageConfig stage0;
+    RankOrchestrator::PPStageConfig stage0;
     stage0.first_layer = 0;
     stage0.last_layer = 12;
     stage0.has_embedding = true;
@@ -398,7 +398,7 @@ TEST_F(Test__MultiDeviceOrchestrator_PP, ConfigDetectsMode_TP_PP)
     config.pp_stages.push_back(stage0);
 
     // Stage 1: 2-device ROCm TP domain (layers 12-24)
-    MultiDeviceOrchestrator::PPStageConfig stage1;
+    RankOrchestrator::PPStageConfig stage1;
     stage1.first_layer = 12;
     stage1.last_layer = 24;
     stage1.has_embedding = false;
@@ -408,7 +408,7 @@ TEST_F(Test__MultiDeviceOrchestrator_PP, ConfigDetectsMode_TP_PP)
     stage1.tp_backend = CollectiveBackendType::RCCL;
     config.pp_stages.push_back(stage1);
 
-    EXPECT_EQ(config.detectMode(), MultiDeviceOrchestrator::ParallelismMode::TP_PP)
+    EXPECT_EQ(config.detectMode(), RankOrchestrator::ParallelismMode::TP_PP)
         << "One single-device stage + one TP-domain stage should detect TP_PP mode";
 
     EXPECT_FALSE(stage0.isTPDomain());
@@ -418,27 +418,27 @@ TEST_F(Test__MultiDeviceOrchestrator_PP, ConfigDetectsMode_TP_PP)
 /**
  * @test Heterogeneous PP+TP construction: CUDA prefix + ROCm TP suffix
  *
- * Creates a MultiDeviceOrchestrator in TP_PP mode:
+ * Creates a RankOrchestrator in TP_PP mode:
  * - Stage 0: CUDA:0 runs layers [0, 12) with embedding (single device)
  * - Stage 1: ROCm:0 + ROCm:1 run layers [12, 24) with LM head (TP domain)
  *
  * Stage 1 is a nested MDO in TP mode that shards weights across 2 ROCm devices.
  */
-TEST_F(Test__MultiDeviceOrchestrator_PP, Construction_CUDAPrefix_ROCmTPSuffix)
+TEST_F(Test__RankOrchestrator_PP, Construction_CUDAPrefix_ROCmTPSuffix)
 {
     if (!hasCUDADevice())
         GTEST_SKIP() << "No CUDA device available";
     if (rocmDeviceCount() < 2)
         GTEST_SKIP() << "Need at least 2 ROCm devices for TP domain";
 
-    MultiDeviceOrchestrator::Config config;
+    RankOrchestrator::Config config;
     config.max_seq_len = MAX_SEQ_LEN;
     config.batch_size = BATCH_SIZE;
     config.activation_precision = ActivationPrecision::FP32;
-    config.mode = MultiDeviceOrchestrator::ParallelismMode::TP_PP;
+    config.mode = RankOrchestrator::ParallelismMode::TP_PP;
 
     // Stage 0: CUDA single device
-    MultiDeviceOrchestrator::PPStageConfig stage0;
+    RankOrchestrator::PPStageConfig stage0;
     stage0.first_layer = 0;
     stage0.last_layer = NUM_LAYERS / 2;
     stage0.has_embedding = true;
@@ -447,7 +447,7 @@ TEST_F(Test__MultiDeviceOrchestrator_PP, Construction_CUDAPrefix_ROCmTPSuffix)
     config.pp_stages.push_back(stage0);
 
     // Stage 1: 2-device ROCm TP domain
-    MultiDeviceOrchestrator::PPStageConfig stage1;
+    RankOrchestrator::PPStageConfig stage1;
     stage1.first_layer = NUM_LAYERS / 2;
     stage1.last_layer = NUM_LAYERS;
     stage1.has_embedding = false;
@@ -459,10 +459,10 @@ TEST_F(Test__MultiDeviceOrchestrator_PP, Construction_CUDAPrefix_ROCmTPSuffix)
 
     EXPECT_TRUE(config.validate()) << "CUDA + ROCm TP PP config should be valid";
 
-    auto orchestrator = std::make_unique<MultiDeviceOrchestrator>(model_ctx_, config);
+    auto orchestrator = std::make_unique<RankOrchestrator>(model_ctx_, config);
     ASSERT_NE(orchestrator, nullptr);
 
-    EXPECT_EQ(orchestrator->effectiveMode(), MultiDeviceOrchestrator::ParallelismMode::TP_PP);
+    EXPECT_EQ(orchestrator->effectiveMode(), RankOrchestrator::ParallelismMode::TP_PP);
     EXPECT_GT(orchestrator->vocab_size(), 0);
 
     std::cout << "CUDA + ROCm(2) TP_PP orchestrator constructed successfully, vocab_size="
@@ -480,7 +480,7 @@ TEST_F(Test__MultiDeviceOrchestrator_PP, Construction_CUDAPrefix_ROCmTPSuffix)
  * Expected cosine > 0.95 (quantized GEMM + cross-vendor transfer + TP reductions
  * introduce more numerical divergence than single-vendor tests).
  */
-TEST_F(Test__MultiDeviceOrchestrator_PP, Forward_CUDAPrefix_ROCmTPSuffix_VsCPU)
+TEST_F(Test__RankOrchestrator_PP, Forward_CUDAPrefix_ROCmTPSuffix_VsCPU)
 {
     if (!hasCUDADevice())
         GTEST_SKIP() << "No CUDA device available";
@@ -503,14 +503,14 @@ TEST_F(Test__MultiDeviceOrchestrator_PP, Forward_CUDAPrefix_ROCmTPSuffix_VsCPU)
         auto ref_model_ctx = ModelContext::create(TEST_MODEL_PATH);
         ASSERT_NE(ref_model_ctx, nullptr);
 
-        MultiDeviceOrchestrator::Config ref_config;
+        RankOrchestrator::Config ref_config;
         ref_config.max_seq_len = MAX_SEQ_LEN;
         ref_config.batch_size = BATCH_SIZE;
         ref_config.activation_precision = ActivationPrecision::FP32;
-        ref_config.mode = MultiDeviceOrchestrator::ParallelismMode::TP;
+        ref_config.mode = RankOrchestrator::ParallelismMode::TP;
         ref_config.devices.push_back(GlobalDeviceAddress::cpu());
 
-        auto ref_orchestrator = std::make_unique<MultiDeviceOrchestrator>(ref_model_ctx, ref_config);
+        auto ref_orchestrator = std::make_unique<RankOrchestrator>(ref_model_ctx, ref_config);
         ASSERT_NE(ref_orchestrator, nullptr);
 
         ASSERT_TRUE(ref_orchestrator->forward(tokens.data(), static_cast<int>(tokens.size())))
@@ -526,14 +526,14 @@ TEST_F(Test__MultiDeviceOrchestrator_PP, Forward_CUDAPrefix_ROCmTPSuffix_VsCPU)
     // =========================================================================
     // Under test: CUDA prefix + ROCm TP suffix
     // =========================================================================
-    MultiDeviceOrchestrator::Config test_config;
+    RankOrchestrator::Config test_config;
     test_config.max_seq_len = MAX_SEQ_LEN;
     test_config.batch_size = BATCH_SIZE;
     test_config.activation_precision = ActivationPrecision::FP32;
-    test_config.mode = MultiDeviceOrchestrator::ParallelismMode::TP_PP;
+    test_config.mode = RankOrchestrator::ParallelismMode::TP_PP;
 
     // Stage 0: CUDA:0 → layers [0, 12) with embedding
-    MultiDeviceOrchestrator::PPStageConfig stage0;
+    RankOrchestrator::PPStageConfig stage0;
     stage0.first_layer = 0;
     stage0.last_layer = NUM_LAYERS / 2;
     stage0.has_embedding = true;
@@ -542,7 +542,7 @@ TEST_F(Test__MultiDeviceOrchestrator_PP, Forward_CUDAPrefix_ROCmTPSuffix_VsCPU)
     test_config.pp_stages.push_back(stage0);
 
     // Stage 1: ROCm:0 + ROCm:1 → layers [12, 24) with LM head, TP sharded
-    MultiDeviceOrchestrator::PPStageConfig stage1;
+    RankOrchestrator::PPStageConfig stage1;
     stage1.first_layer = NUM_LAYERS / 2;
     stage1.last_layer = NUM_LAYERS;
     stage1.has_embedding = false;
@@ -552,7 +552,7 @@ TEST_F(Test__MultiDeviceOrchestrator_PP, Forward_CUDAPrefix_ROCmTPSuffix_VsCPU)
     stage1.tp_backend = CollectiveBackendType::RCCL;
     test_config.pp_stages.push_back(stage1);
 
-    auto test_orchestrator = std::make_unique<MultiDeviceOrchestrator>(model_ctx_, test_config);
+    auto test_orchestrator = std::make_unique<RankOrchestrator>(model_ctx_, test_config);
     ASSERT_NE(test_orchestrator, nullptr);
 
     ASSERT_TRUE(test_orchestrator->forward(tokens.data(), static_cast<int>(tokens.size())))
@@ -585,15 +585,15 @@ TEST_F(Test__MultiDeviceOrchestrator_PP, Forward_CUDAPrefix_ROCmTPSuffix_VsCPU)
  * Verifies that when all PP stages have exactly 1 device, the mode
  * is PP (not TP_PP), even on a heterogeneous CUDA+ROCm config.
  */
-TEST_F(Test__MultiDeviceOrchestrator_PP, ConfigDetectsMode_HeterogeneousPP_NotTP_PP)
+TEST_F(Test__RankOrchestrator_PP, ConfigDetectsMode_HeterogeneousPP_NotTP_PP)
 {
-    MultiDeviceOrchestrator::Config config;
+    RankOrchestrator::Config config;
     config.max_seq_len = MAX_SEQ_LEN;
     config.batch_size = BATCH_SIZE;
-    config.mode = MultiDeviceOrchestrator::ParallelismMode::AUTO;
+    config.mode = RankOrchestrator::ParallelismMode::AUTO;
 
     // Stage 0: single CUDA device
-    MultiDeviceOrchestrator::PPStageConfig stage0;
+    RankOrchestrator::PPStageConfig stage0;
     stage0.first_layer = 0;
     stage0.last_layer = 12;
     stage0.has_embedding = true;
@@ -602,7 +602,7 @@ TEST_F(Test__MultiDeviceOrchestrator_PP, ConfigDetectsMode_HeterogeneousPP_NotTP
     config.pp_stages.push_back(stage0);
 
     // Stage 1: single ROCm device (NOT a TP domain)
-    MultiDeviceOrchestrator::PPStageConfig stage1;
+    RankOrchestrator::PPStageConfig stage1;
     stage1.first_layer = 12;
     stage1.last_layer = 24;
     stage1.has_embedding = false;
@@ -611,5 +611,5 @@ TEST_F(Test__MultiDeviceOrchestrator_PP, ConfigDetectsMode_HeterogeneousPP_NotTP
     config.pp_stages.push_back(stage1);
 
     // All stages are single-device → PP mode, not TP_PP
-    EXPECT_EQ(config.detectMode(), MultiDeviceOrchestrator::ParallelismMode::PP);
+    EXPECT_EQ(config.detectMode(), RankOrchestrator::ParallelismMode::PP);
 }

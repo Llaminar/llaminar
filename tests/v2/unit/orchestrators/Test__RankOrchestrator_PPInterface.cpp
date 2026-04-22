@@ -1,8 +1,8 @@
 /**
- * @file Test__MultiDeviceOrchestrator_PPInterface.cpp
- * @brief Unit tests for MultiDeviceOrchestrator PP hidden state interface
+ * @file Test__RankOrchestrator_PPInterface.cpp
+ * @brief Unit tests for RankOrchestrator PP hidden state interface
  *
- * Tests the Hidden State API implementation that enables MultiDeviceOrchestrator
+ * Tests the Hidden State API implementation that enables RankOrchestrator
  * to be nested as a PP stage in TP_PP hybrid mode.
  *
  * Key methods tested:
@@ -16,7 +16,7 @@
  */
 
 #include <gtest/gtest.h>
-#include "execution/local_execution/orchestrators/MultiDeviceOrchestrator.h"
+#include "execution/local_execution/orchestrators/RankOrchestrator.h"
 #include "execution/local_execution/orchestrators/IInferenceRunner.h"
 #include "collective/ILocalTPContext.h"
 #include "backends/GlobalDeviceAddress.h"
@@ -163,12 +163,12 @@ namespace llaminar2::test
     // Test Fixture
     // =========================================================================
 
-    class Test__MultiDeviceOrchestrator_PPInterface : public ::testing::Test
+    class Test__RankOrchestrator_PPInterface : public ::testing::Test
     {
     protected:
-        using Config = MultiDeviceOrchestrator::Config;
-        using ParallelismMode = MultiDeviceOrchestrator::ParallelismMode;
-        using PPStageConfig = MultiDeviceOrchestrator::PPStageConfig;
+        using Config = RankOrchestrator::Config;
+        using ParallelismMode = RankOrchestrator::ParallelismMode;
+        using PPStageConfig = RankOrchestrator::PPStageConfig;
 
         void SetUp() override
         {
@@ -183,7 +183,7 @@ namespace llaminar2::test
     // TP Mode Tests
     // =========================================================================
 
-    TEST_F(Test__MultiDeviceOrchestrator_PPInterface, TPMode_GetHiddenState_DelegatesToPrimaryRunner)
+    TEST_F(Test__RankOrchestrator_PPInterface, TPMode_GetHiddenState_DelegatesToPrimaryRunner)
     {
         // Create mock device runners
         auto runner0 = std::make_unique<MockHiddenStateRunner>();
@@ -217,7 +217,7 @@ namespace llaminar2::test
         EXPECT_EQ(runner1_raw->getHiddenStateCallCount(), 0);
     }
 
-    TEST_F(Test__MultiDeviceOrchestrator_PPInterface, TPMode_SetHiddenState_SetsOnAllRunners)
+    TEST_F(Test__RankOrchestrator_PPInterface, TPMode_SetHiddenState_SetsOnAllRunners)
     {
         // Create mock device runners
         auto runner0 = std::make_unique<MockHiddenStateRunner>();
@@ -247,7 +247,7 @@ namespace llaminar2::test
     // PP Mode Tests
     // =========================================================================
 
-    TEST_F(Test__MultiDeviceOrchestrator_PPInterface, PPMode_GetHiddenState_DelegatesToLastStage)
+    TEST_F(Test__RankOrchestrator_PPInterface, PPMode_GetHiddenState_DelegatesToLastStage)
     {
         // Create mock stage runners
         auto stage0 = std::make_unique<MockHiddenStateRunner>();
@@ -275,7 +275,7 @@ namespace llaminar2::test
         EXPECT_EQ(stage1_raw->getHiddenStateCallCount(), 0);
     }
 
-    TEST_F(Test__MultiDeviceOrchestrator_PPInterface, PPMode_SetHiddenState_SetsOnFirstStage)
+    TEST_F(Test__RankOrchestrator_PPInterface, PPMode_SetHiddenState_SetsOnFirstStage)
     {
         // Create mock stage runners
         auto stage0 = std::make_unique<MockHiddenStateRunner>();
@@ -304,7 +304,7 @@ namespace llaminar2::test
     // State Tracking Tests
     // =========================================================================
 
-    TEST_F(Test__MultiDeviceOrchestrator_PPInterface, HasHiddenStateInput_ReturnsTrueAfterSet)
+    TEST_F(Test__RankOrchestrator_PPInterface, HasHiddenStateInput_ReturnsTrueAfterSet)
     {
         auto runner = std::make_unique<MockHiddenStateRunner>();
 
@@ -316,7 +316,7 @@ namespace llaminar2::test
         EXPECT_TRUE(runner->hasHiddenStateInput());
     }
 
-    TEST_F(Test__MultiDeviceOrchestrator_PPInterface, HasHiddenStateInput_ReturnsFalseAfterClear)
+    TEST_F(Test__RankOrchestrator_PPInterface, HasHiddenStateInput_ReturnsFalseAfterClear)
     {
         auto runner = std::make_unique<MockHiddenStateRunner>();
 
@@ -328,7 +328,7 @@ namespace llaminar2::test
         EXPECT_FALSE(runner->hasHiddenStateInput());
     }
 
-    TEST_F(Test__MultiDeviceOrchestrator_PPInterface, ClearHiddenStateInput_ResetsState)
+    TEST_F(Test__RankOrchestrator_PPInterface, ClearHiddenStateInput_ResetsState)
     {
         auto runner = std::make_unique<MockHiddenStateRunner>();
 
@@ -349,7 +349,7 @@ namespace llaminar2::test
     // Integration-Style Tests (Mock Orchestrator Behavior)
     // =========================================================================
 
-    TEST_F(Test__MultiDeviceOrchestrator_PPInterface, TPMode_ClearHiddenState_ClearsAllRunners)
+    TEST_F(Test__RankOrchestrator_PPInterface, TPMode_ClearHiddenState_ClearsAllRunners)
     {
         // Create mock device runners
         auto runner0 = std::make_unique<MockHiddenStateRunner>();
@@ -379,7 +379,7 @@ namespace llaminar2::test
         EXPECT_FALSE(runner1_raw->hasHiddenStateInput());
     }
 
-    TEST_F(Test__MultiDeviceOrchestrator_PPInterface, PPMode_ClearHiddenState_ClearsFirstStage)
+    TEST_F(Test__RankOrchestrator_PPInterface, PPMode_ClearHiddenState_ClearsFirstStage)
     {
         // Create mock stage runners
         auto stage0 = std::make_unique<MockHiddenStateRunner>();
@@ -406,7 +406,7 @@ namespace llaminar2::test
         EXPECT_FALSE(stage0_raw->hasHiddenStateInput());
     }
 
-    TEST_F(Test__MultiDeviceOrchestrator_PPInterface, NullHiddenState_HandledGracefully)
+    TEST_F(Test__RankOrchestrator_PPInterface, NullHiddenState_HandledGracefully)
     {
         auto runner = std::make_unique<MockHiddenStateRunner>();
 
@@ -422,7 +422,7 @@ namespace llaminar2::test
         EXPECT_FALSE(runner->hasHiddenStateInput());
     }
 
-    TEST_F(Test__MultiDeviceOrchestrator_PPInterface, MultipleSetHiddenState_LastOneWins)
+    TEST_F(Test__RankOrchestrator_PPInterface, MultipleSetHiddenState_LastOneWins)
     {
         auto runner = std::make_unique<MockHiddenStateRunner>();
 

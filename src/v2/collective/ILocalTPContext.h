@@ -163,7 +163,7 @@ namespace llaminar2
          * each device to call allgather independently (SPMD pattern), this method
          * accepts all shards at once from a single control thread.
          *
-         * Used by MultiDeviceOrchestrator to gather partial logits from column-parallel
+         * Used by RankOrchestrator to gather partial logits from column-parallel
          * LM head execution across LOCAL TP devices.
          *
          * @param shards Vector of shard tensors (one per device, in device order)

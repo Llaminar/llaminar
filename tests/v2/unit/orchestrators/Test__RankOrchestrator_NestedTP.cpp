@@ -1,9 +1,9 @@
 /**
- * @file Test__MultiDeviceOrchestrator_NestedTP.cpp
- * @brief Unit tests for nested MultiDeviceOrchestrator creation in TP+PP hybrid mode
+ * @file Test__RankOrchestrator_NestedTP.cpp
+ * @brief Unit tests for nested RankOrchestrator creation in TP+PP hybrid mode
  *
  * Tests the Phase 5 implementation where PP stages configured as TP domains
- * create nested MultiDeviceOrchestrators instead of single DeviceGraphOrchestrators.
+ * create nested RankOrchestrators instead of single DeviceGraphOrchestrators.
  *
  * Test cases:
  * - InitializePP_TPDomain_CreatesNestedMDO: Verify TP domain creates MDO
@@ -17,7 +17,7 @@
  */
 
 #include <gtest/gtest.h>
-#include "execution/local_execution/orchestrators/MultiDeviceOrchestrator.h"
+#include "execution/local_execution/orchestrators/RankOrchestrator.h"
 #include "execution/local_execution/orchestrators/IInferenceRunner.h"
 #include "execution/factory/FactoryPPStageConfig.h"
 #include "collective/ILocalTPContext.h"
@@ -33,12 +33,12 @@ namespace llaminar2::test
     // Test Fixture
     // =========================================================================
 
-    class Test__MultiDeviceOrchestrator_NestedTP : public ::testing::Test
+    class Test__RankOrchestrator_NestedTP : public ::testing::Test
     {
     protected:
-        using Config = MultiDeviceOrchestrator::Config;
-        using ParallelismMode = MultiDeviceOrchestrator::ParallelismMode;
-        using PPStageConfig = MultiDeviceOrchestrator::PPStageConfig;
+        using Config = RankOrchestrator::Config;
+        using ParallelismMode = RankOrchestrator::ParallelismMode;
+        using PPStageConfig = RankOrchestrator::PPStageConfig;
     };
 
     // =========================================================================
@@ -48,7 +48,7 @@ namespace llaminar2::test
     /**
      * @brief Verify that a TP domain stage (multiple devices) is correctly identified
      */
-    TEST_F(Test__MultiDeviceOrchestrator_NestedTP, PPStageConfig_TPDomain_CorrectlyIdentified)
+    TEST_F(Test__RankOrchestrator_NestedTP, PPStageConfig_TPDomain_CorrectlyIdentified)
     {
         // Create a TP domain stage with 2 devices
         PPStageConfig stage;
@@ -66,7 +66,7 @@ namespace llaminar2::test
     /**
      * @brief Verify that a single-device stage is not a TP domain
      */
-    TEST_F(Test__MultiDeviceOrchestrator_NestedTP, PPStageConfig_SingleDevice_NotTPDomain)
+    TEST_F(Test__RankOrchestrator_NestedTP, PPStageConfig_SingleDevice_NotTPDomain)
     {
         PPStageConfig stage;
         stage.first_layer = 12;
@@ -81,7 +81,7 @@ namespace llaminar2::test
     /**
      * @brief Verify mixed stages mode detection results in TP_PP
      */
-    TEST_F(Test__MultiDeviceOrchestrator_NestedTP, Config_MixedStages_DetectedAsTPPP)
+    TEST_F(Test__RankOrchestrator_NestedTP, Config_MixedStages_DetectedAsTPPP)
     {
         Config config;
         config.devices.clear(); // No TP-level devices, all in PP stages
@@ -110,7 +110,7 @@ namespace llaminar2::test
     /**
      * @brief Verify all single-device stages mode detection results in PP (not TP_PP)
      */
-    TEST_F(Test__MultiDeviceOrchestrator_NestedTP, Config_AllSingleDevice_DetectedAsPP)
+    TEST_F(Test__RankOrchestrator_NestedTP, Config_AllSingleDevice_DetectedAsPP)
     {
         Config config;
         config.devices.clear();
@@ -142,9 +142,9 @@ namespace llaminar2::test
      * @brief Verify that TP configuration would be correctly built for nested MDO
      *
      * This tests the Config struct creation logic that would be used when
-     * creating a nested MultiDeviceOrchestrator for a TP domain stage.
+     * creating a nested RankOrchestrator for a TP domain stage.
      */
-    TEST_F(Test__MultiDeviceOrchestrator_NestedTP, NestedConfig_PropagatesTPSettings)
+    TEST_F(Test__RankOrchestrator_NestedTP, NestedConfig_PropagatesTPSettings)
     {
         // Outer (PP) configuration
         Config outer_config;
@@ -212,7 +212,7 @@ namespace llaminar2::test
     /**
      * @brief Verify that layer range is correctly specified in stage config
      */
-    TEST_F(Test__MultiDeviceOrchestrator_NestedTP, NestedMDO_HasCorrectLayerRange)
+    TEST_F(Test__RankOrchestrator_NestedTP, NestedMDO_HasCorrectLayerRange)
     {
         // Stage configuration for layers 14-27 (14 layers)
         PPStageConfig stage;
@@ -233,7 +233,7 @@ namespace llaminar2::test
     /**
      * @brief Verify that three-stage PP with mixed TP domains has correct config
      */
-    TEST_F(Test__MultiDeviceOrchestrator_NestedTP, ThreeStage_MixedTPDomains_ValidConfig)
+    TEST_F(Test__RankOrchestrator_NestedTP, ThreeStage_MixedTPDomains_ValidConfig)
     {
         Config config;
         config.mode = ParallelismMode::AUTO;
@@ -293,7 +293,7 @@ namespace llaminar2::test
     /**
      * @brief Verify different backends can be specified per TP domain stage
      */
-    TEST_F(Test__MultiDeviceOrchestrator_NestedTP, DifferentBackendsPerStage)
+    TEST_F(Test__RankOrchestrator_NestedTP, DifferentBackendsPerStage)
     {
         Config config;
 
@@ -327,7 +327,7 @@ namespace llaminar2::test
     /**
      * @brief Verify AUTO backend is default when not specified
      */
-    TEST_F(Test__MultiDeviceOrchestrator_NestedTP, DefaultBackendIsAuto)
+    TEST_F(Test__RankOrchestrator_NestedTP, DefaultBackendIsAuto)
     {
         PPStageConfig stage;
         stage.first_layer = 0;
@@ -346,7 +346,7 @@ namespace llaminar2::test
     /**
      * @brief Verify empty weights defaults to equal distribution
      */
-    TEST_F(Test__MultiDeviceOrchestrator_NestedTP, EmptyWeights_DefaultsToEqual)
+    TEST_F(Test__RankOrchestrator_NestedTP, EmptyWeights_DefaultsToEqual)
     {
         PPStageConfig stage;
         stage.first_layer = 0;
@@ -361,7 +361,7 @@ namespace llaminar2::test
     /**
      * @brief Verify TP domain with 3 devices works
      */
-    TEST_F(Test__MultiDeviceOrchestrator_NestedTP, TPDomainWithThreeDevices)
+    TEST_F(Test__RankOrchestrator_NestedTP, TPDomainWithThreeDevices)
     {
         PPStageConfig stage;
         stage.first_layer = 0;
@@ -404,7 +404,7 @@ namespace llaminar2::test
      * the PP stage config so its DeviceGraphOrchestrators know to build
      * partial graphs instead of full graphs.
      */
-    TEST_F(Test__MultiDeviceOrchestrator_NestedTP, NestedMDO_MustReceivePPStageConfig)
+    TEST_F(Test__RankOrchestrator_NestedTP, NestedMDO_MustReceivePPStageConfig)
     {
         // Outer PP config with TP domain as stage 0
         PPStageConfig stage0;
@@ -446,7 +446,7 @@ namespace llaminar2::test
      * is NOT set, the DeviceGraphOrchestrators won't call setPPStageConfig()
      * and will build full graphs including LM_HEAD even when they shouldn't.
      */
-    TEST_F(Test__MultiDeviceOrchestrator_NestedTP, NestedMDO_MissingPPConfig_WouldBuildFullGraph)
+    TEST_F(Test__RankOrchestrator_NestedTP, NestedMDO_MissingPPConfig_WouldBuildFullGraph)
     {
         PPStageConfig stage0;
         stage0.first_layer = 0;
@@ -485,7 +485,7 @@ namespace llaminar2::test
      * Verifies that FactoryPPStageConfig has all the fields needed for
      * DeviceGraphOrchestrator to build the correct partial graph.
      */
-    TEST_F(Test__MultiDeviceOrchestrator_NestedTP, FactoryPPStageConfig_HasAllFields)
+    TEST_F(Test__RankOrchestrator_NestedTP, FactoryPPStageConfig_HasAllFields)
     {
         FactoryPPStageConfig config;
         config.first_layer = 0;
@@ -506,7 +506,7 @@ namespace llaminar2::test
      * The DeviceGraphOrchestrator uses first_layer/last_layer to determine
      * which transformer blocks to include in its graph.
      */
-    TEST_F(Test__MultiDeviceOrchestrator_NestedTP, NestedPPConfig_LayerRangeDeterminesStages)
+    TEST_F(Test__RankOrchestrator_NestedTP, NestedPPConfig_LayerRangeDeterminesStages)
     {
         // Stage 0: layers 0-11 (12 layers)
         FactoryPPStageConfig stage0_config;
@@ -542,7 +542,7 @@ namespace llaminar2::test
      * Documents the complete pattern for creating nested MDO configs
      * in PP+TP hybrid mode to prevent future regressions.
      */
-    TEST_F(Test__MultiDeviceOrchestrator_NestedTP, HybridPPTP_CorrectConfigPattern)
+    TEST_F(Test__RankOrchestrator_NestedTP, HybridPPTP_CorrectConfigPattern)
     {
         // Step 1: Define outer PP config with TP domain stages
         Config outer_config;

@@ -2,7 +2,7 @@
 
 **Date**: 2026-03-10  
 **Status**: Complete (all 4 phases done)  
-**Scope**: `OrchestrationRunner`, `ExecutionPlanBuilder`, `MultiDeviceOrchestrator`, `InferenceRunnerFactory`
+**Scope**: `OrchestrationRunner`, `ExecutionPlanBuilder`, `RankOrchestrator`, `InferenceRunnerFactory`
 
 ---
 
@@ -22,7 +22,7 @@ The journey from CLI flags to inference traverses a 5-struct degradation chain, 
 |---|------|----------|------|
 | 1 | `OrchestrationConfig` | `src/v2/config/OrchestrationConfig.h` | User-facing CLI/YAML config. ~150 fields (raw strings, enums, everything). |
 | 2 | `RankExecutionPlan` | `src/v2/execution/mpi_orchestration/RankExecutionPlan.h` | Per-rank contract: "what devices + layers this rank owns." Topology only. |
-| 3 | `MultiDeviceOrchestrator::Config` | `src/v2/execution/local_execution/orchestrators/MultiDeviceOrchestrator.h` | Multi-device orchestration: devices, weights, PP stages, mode. |
+| 3 | `RankOrchestrator::Config` | `src/v2/execution/local_execution/orchestrators/RankOrchestrator.h` | Multi-device orchestration: devices, weights, PP stages, mode. |
 | 4 | `InferenceRunnerConfig` | `src/v2/execution/factory/InferenceRunnerFactory.h` | Per-device runner: seq_len, precision, TP context pointer. |
 | 5 | `GraphConfig` | `src/v2/models/GraphTypes.h` | Final per-orchestrator config: architecture dims, TP slices, device. ~50 fields. |
 
@@ -58,7 +58,7 @@ OrchestrationConfig
   → ExecutionPlanBuilder::buildSimplePlan()     → RankExecutionPlan (local_tp_devices populated)
   → buildMultiDeviceConfig()                    → MDO::Config (manual field copy)
   → buildMultiDeviceComputeGraph()
-  → MultiDeviceOrchestrator(model_ctx, tp_ctx, config)  [TP constructor]
+  → RankOrchestrator(model_ctx, tp_ctx, config)  [TP constructor]
   → initializeDeviceRunners()                   → FOR EACH device:
       → InferenceRunnerConfig (manual field copy from MDO::Config)
       → createTestableInferenceRunner()
@@ -73,7 +73,7 @@ OrchestrationConfig
 OrchestrationConfig
   → ExecutionPlanBuilder::buildSimplePlan()     → RankExecutionPlan (local_pp_devices populated)
   → buildLocalPPComputeGraph()                  → MDO::Config (manual field copy, mode=PP hardcoded)
-  → MultiDeviceOrchestrator(model_ctx, config)  [Config-only constructor]
+  → RankOrchestrator(model_ctx, config)  [Config-only constructor]
   → initializePPDeviceRunners()                 → FOR EACH stage:
       → ModelContext::createForPPStage()        [partitioned model context]
       → InferenceRunnerConfig (manual field copy from MDO::Config)
@@ -116,9 +116,9 @@ But each does it its own way with no shared abstraction.
 
 | Constructor Signature | Line | Purpose |
 |----------------------|------|---------|
-| `MDO(model_ctx, config)` | `MultiDeviceOrchestrator.cpp:245` | Config-only: detects TP vs PP via `effectiveMode()` |
-| `MDO(model_ctx, tp_ctx, config)` | `MultiDeviceOrchestrator.cpp:301` | Pre-made TP context: forces TP mode |
-| `MDO(model_ctx, runners, tp_ctx, config)` | `MultiDeviceOrchestrator.cpp:333` | Test injection: pre-made runners |
+| `MDO(model_ctx, config)` | `RankOrchestrator.cpp:245` | Config-only: detects TP vs PP via `effectiveMode()` |
+| `MDO(model_ctx, tp_ctx, config)` | `RankOrchestrator.cpp:301` | Pre-made TP context: forces TP mode |
+| `MDO(model_ctx, runners, tp_ctx, config)` | `RankOrchestrator.cpp:333` | Test injection: pre-made runners |
 
 The first constructor dispatches to `initializeDeviceRunners()` (TP) or `initializePPDeviceRunners()` (PP) — two completely separate init paths inside the same class.
 
@@ -187,7 +187,7 @@ The two paths don't even read from the same intermediate struct consistently.
 **Goal**: Replace manual field-copy boilerplate in OrchestrationRunner with canonical `fromPlan()` factory methods on the config structs.
 
 **Refined scope** (updated after code analysis): The original proposal suggested replacing all three `build*ComputeGraph()` methods with a single method. After examining the code, each path has genuinely distinct logic:
-- **TP path**: Passes pre-created `local_tp_ctx_`, uses `createMultiDeviceOrchestrator()` factory
+- **TP path**: Passes pre-created `local_tp_ctx_`, uses `createRankOrchestrator()` factory
 - **PP path**: Builds `PPStageConfig` entries with cross-vendor detection, creates MDO directly, initializes `GlobalBackendRouter`
 - **Single-device path**: Resolves device from multiple sources with NUMA support, passes `mpi_ctx_`, uses `createInferenceRunner()` factory
 
@@ -203,7 +203,7 @@ Forcing these into a single method would create an unreadable if/else. Instead, 
 
 4. **Simplify the three build methods** to use the new factories. They keep their path-specific logic (device validation, strategy logging, runner creation) but lose the config-construction boilerplate.
 
-**Files changed**: `MultiDeviceOrchestrator.h`, `InferenceRunnerFactory.h`, `OrchestrationRunner.h`, `OrchestrationRunner.cpp`.
+**Files changed**: `RankOrchestrator.h`, `InferenceRunnerFactory.h`, `OrchestrationRunner.h`, `OrchestrationRunner.cpp`.
 
 **Risk**: Low. Config translation moves but its logic is unchanged.
 
@@ -211,11 +211,11 @@ Forcing these into a single method would create an unreadable if/else. Instead, 
 
 **Goal**: Reduce MDO's three constructors to two (production + test injection).
 
-1. **Merged the Config-only and TP-context constructors** into a single constructor with an optional `tp_ctx` parameter: `MultiDeviceOrchestrator(model_ctx, config, tp_ctx = nullptr)`. If `tp_ctx` is provided, uses it directly (TP mode). Otherwise, auto-detects mode from config and creates TP context if needed.
+1. **Merged the Config-only and TP-context constructors** into a single constructor with an optional `tp_ctx` parameter: `RankOrchestrator(model_ctx, config, tp_ctx = nullptr)`. If `tp_ctx` is provided, uses it directly (TP mode). Otherwise, auto-detects mode from config and creates TP context if needed.
 
 2. **Kept the test-injection constructor** (private, via `createForTest()`) — unchanged.
 
-**Files changed**: `MultiDeviceOrchestrator.h/.cpp`, `InferenceRunnerFactory.cpp`, `Qwen2ParityTestBase.h`.
+**Files changed**: `RankOrchestrator.h/.cpp`, `InferenceRunnerFactory.cpp`, `Qwen2ParityTestBase.h`.
 
 **Result**: 3 constructors → 2 (unified production + private test injection). All 374 unit tests pass.
 

@@ -19,8 +19,8 @@
 ### 2. MDO `kv_cache_scale` Default Mismatch
 
 - **Symptom**: Decode parity ~0.77 cosine similarity (threshold 0.80) for PP configurations
-- **Root Cause**: `MultiDeviceOrchestrator::Config::kv_cache_scale` defaulted to `1.0f` while every other path in the codebase uses `256.0f`
-- **Fix**: Changed default in `MultiDeviceOrchestrator.h` to `256.0f`
+- **Root Cause**: `RankOrchestrator::Config::kv_cache_scale` defaulted to `1.0f` while every other path in the codebase uses `256.0f`
+- **Fix**: Changed default in `RankOrchestrator.h` to `256.0f`
 - **Brittleness signal**: Critical numerical parameters are duplicated across config structs with no shared constant or validation. A new orchestration path silently picked up the wrong default.
 
 ### 3. BAR IOMEMORY `cudaMemcpy(D2D)` Produces NaN
@@ -54,7 +54,7 @@ PP activation transfer is implemented in at least four places:
 
 1. `Qwen2Graph::buildPartialForwardGraph()` — inline CPU memcpy or GPU BAR host-bounce (fresh graph build)
 2. `DeviceGraphOrchestrator` cached decode path — BAR host-bounce for cached graphs
-3. `MultiDeviceOrchestrator::forwardPP()` → `PPContext::transfer()` — the "official" PP transfer
+3. `RankOrchestrator::forwardPP()` → `PPContext::transfer()` — the "official" PP transfer
 4. Collective backends (`NCCLBackend::copy()`, `RCCLBackend::copy()`) — repurposed for point-to-point
 
 Each path has its own logic for handling BAR vs. non-BAR, GPU vs. CPU, with no shared primitives.
@@ -94,7 +94,7 @@ The `LocalPPTestRunner` test harness had been passing while the production MDO T
 |------|--------|
 | `src/v2/collective/backends/NCCLBackend.cpp` | Same-device copy fast path |
 | `src/v2/collective/backends/RCCLBackend.cpp` | Same-device copy fast path |
-| `src/v2/execution/local_execution/orchestrators/MultiDeviceOrchestrator.h` | `kv_cache_scale` default 1.0→256.0 |
+| `src/v2/execution/local_execution/orchestrators/RankOrchestrator.h` | `kv_cache_scale` default 1.0→256.0 |
 | `src/v2/models/qwen/Qwen2Graph.cpp` | BAR host-bounce for PP copy |
 | `src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp` | BAR host-bounce for cached PP copy |
 | `src/v2/tensors/TensorBase.cpp` | Direct D2H for BAR-backed `ensureOnHost()` |

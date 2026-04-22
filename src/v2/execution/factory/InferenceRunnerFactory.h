@@ -62,7 +62,7 @@
 #include "../../loaders/ModelContext.h"
 #include "../../interfaces/IModelContext.h"
 #include "../config/RuntimeConfig.h"
-#include "../local_execution/orchestrators/MultiDeviceOrchestrator.h"
+#include "../local_execution/orchestrators/RankOrchestrator.h"
 #include "../../backends/DeviceId.h"
 #include "../../utils/MPIContext.h"
 #include "../mpi_orchestration/PlacementPlan.h"
@@ -78,10 +78,10 @@ namespace llaminar2
     class DeviceGraphOrchestrator;
     class ITPContext;
     class ILocalTPContext;
-    class IMultiDeviceOrchestrator;
+    class IRankOrchestrator;
 
     // Note: FactoryPPStageConfig is now defined in FactoryPPStageConfig.h
-    // to avoid circular dependencies with MultiDeviceOrchestrator.h
+    // to avoid circular dependencies with RankOrchestrator.h
 
     /**
      * @brief Configuration for inference runner creation
@@ -294,15 +294,15 @@ namespace llaminar2
         const InferenceRunnerConfig &config = {});
 
     /**
-     * @brief Factory function to create MultiDeviceOrchestrator for LOCAL TP
+     * @brief Factory function to create RankOrchestrator for LOCAL TP
      *
-     * Creates a MultiDeviceOrchestrator that coordinates multiple devices within
+     * Creates a RankOrchestrator that coordinates multiple devices within
      * a single MPI rank. Use this when LOCAL TP is configured via --tp-scope local.
      *
      * @param model_ctx Model context with weights
      * @param tp_ctx Pre-constructed LOCAL TP context (ownership transferred)
      * @param config Multi-device configuration
-     * @return Unique pointer to IMultiDeviceOrchestrator (extends IInferenceRunner)
+     * @return Unique pointer to IRankOrchestrator (extends IInferenceRunner)
      *
      * @code
      * // Create LOCAL TP context
@@ -312,22 +312,22 @@ namespace llaminar2
      *     CollectiveBackendType::NCCL);
      *
      * // Create multi-device config
-     * MultiDeviceOrchestrator::Config config;
+     * RankOrchestrator::Config config;
      * config.devices = tp_ctx->devices();
      * config.weights = tp_ctx->weights();
      * config.backend = CollectiveBackendType::NCCL;
      *
      * // Create orchestrator (returns IInferenceRunner-compatible)
-     * auto runner = createMultiDeviceOrchestrator(model_ctx, std::move(tp_ctx), config);
+     * auto runner = createRankOrchestrator(model_ctx, std::move(tp_ctx), config);
      * @endcode
      */
-    std::unique_ptr<IMultiDeviceOrchestrator> createMultiDeviceOrchestrator(
+    std::unique_ptr<IRankOrchestrator> createRankOrchestrator(
         std::shared_ptr<IModelContext> model_ctx,
         std::unique_ptr<ILocalTPContext> tp_ctx,
-        const MultiDeviceOrchestrator::Config &config);
+        const RankOrchestrator::Config &config);
 
     /**
-     * @brief Factory function to create MultiDeviceOrchestrator with testable dependencies
+     * @brief Factory function to create RankOrchestrator with testable dependencies
      *
      * For unit testing: allows injecting mock device runners and TP context.
      *
@@ -335,12 +335,12 @@ namespace llaminar2
      * @param device_runners Pre-constructed per-device runners (ownership transferred)
      * @param tp_ctx Pre-constructed LOCAL TP context (can be mock)
      * @param config Multi-device configuration
-     * @return Unique pointer to IMultiDeviceOrchestrator
+     * @return Unique pointer to IRankOrchestrator
      */
-    std::unique_ptr<IMultiDeviceOrchestrator> createTestableMultiDeviceOrchestrator(
+    std::unique_ptr<IRankOrchestrator> createTestableRankOrchestrator(
         std::shared_ptr<IModelContext> model_ctx,
         std::vector<std::unique_ptr<IInferenceRunner>> device_runners,
         std::unique_ptr<ILocalTPContext> tp_ctx,
-        const MultiDeviceOrchestrator::Config &config);
+        const RankOrchestrator::Config &config);
 
 } // namespace llaminar2
