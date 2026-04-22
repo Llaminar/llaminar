@@ -360,6 +360,25 @@ namespace llaminar2
     const GlobalPPRankPlan &GlobalOrchestrator::rankPlan() const { return rank_plan_; }
     const GlobalPPTopology &GlobalOrchestrator::topology() const { return config_.topology; }
 
+    ITPContext *GlobalOrchestrator::globalTPContext() const
+    {
+        return config_.global_tp_ctx;
+    }
+
+    const WeightShardInfo *GlobalOrchestrator::weightShardForStage(int stage_id) const
+    {
+        for (const auto &step : rank_plan_.steps)
+        {
+            if (step.type == GlobalPPRankPlan::Step::Type::EXECUTE_STAGE &&
+                step.stage_action.role == RankStageAction::Role::EXECUTE &&
+                step.stage_action.stage_id == stage_id)
+            {
+                return &step.stage_action.weight_shard;
+            }
+        }
+        return nullptr;
+    }
+
     // =========================================================================
     // Internal: Execute Stage
     // =========================================================================
@@ -367,6 +386,14 @@ namespace llaminar2
     bool GlobalOrchestrator::executeStage(const RankStageAction &action,
                                           const int *tokens, int seq_len)
     {
+        if (action.is_global_tp)
+        {
+            LOG_DEBUG("GlobalOrchestrator: rank " << config_.rank
+                      << " executing global TP stage " << action.stage_id
+                      << " (tp_rank=" << action.tp_rank_in_domain
+                      << " of " << action.tp_domain_size << ")");
+        }
+
         if (action.has_embedding)
         {
             // Pipeline head: pass tokens to rank runner for embedding + layers

@@ -115,11 +115,38 @@ namespace llaminar2
             // Determine sender and receiver ranks
             if (from_stage.is_global_tp && to_stage.is_global_tp)
             {
-                // Both are global TP — no transfer needed if same ranks
-                // If different ranks, need special handling
-                // For now: no-op (both sets of ranks have the same data after allreduce)
-                transfer.sender_rank = -1;
-                transfer.receiver_rank = -1;
+                // Both are global TP — check which receiver ranks need data
+                std::set<int> sender_set(from_stage.participating_ranks.begin(),
+                                         from_stage.participating_ranks.end());
+
+                std::vector<int> needs_data;
+                for (int r : to_stage.participating_ranks)
+                {
+                    if (sender_set.find(r) == sender_set.end())
+                    {
+                        needs_data.push_back(r);
+                    }
+                }
+
+                if (needs_data.empty())
+                {
+                    // All receiver ranks already have data — no transfer needed
+                    continue;
+                }
+
+                // Fan-out from designated sender (first rank in sender domain)
+                int src = from_stage.participating_ranks[0];
+                for (int target_rank : needs_data)
+                {
+                    GlobalPPTransfer fan_out;
+                    fan_out.from_stage = from_stage.stage_id;
+                    fan_out.to_stage = to_stage.stage_id;
+                    fan_out.sender_rank = src;
+                    fan_out.receiver_rank = target_rank;
+                    fan_out.mpi_tag = 1000 + static_cast<int>(i) * 100 + target_rank;
+                    topo.transfers.push_back(fan_out);
+                }
+                continue;
             }
             else if (from_stage.is_global_tp)
             {

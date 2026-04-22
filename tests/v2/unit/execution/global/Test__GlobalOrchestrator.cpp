@@ -1,6 +1,6 @@
 /**
  * @file Test__GlobalOrchestrator.cpp
- * @brief Unit tests for GlobalOrchestrator (Phase 1)
+ * @brief Unit tests for GlobalOrchestrator (Phase 1-3)
  *
  * Tests the cross-machine MPI cluster inference orchestrator using
  * MockMPIContext and MockDeviceRunner (no real MPI or devices needed).
@@ -156,6 +156,166 @@ namespace llaminar2::test
             s2.devices = {GlobalDeviceAddress::cpu()};
 
             return GlobalPPTopology::build({s0, s1, s2}, TOTAL_LAYERS, 3);
+        }
+
+        /**
+         * @brief Build a 2-stage PP topology with 2-way global TP per stage
+         *
+         * 4 ranks total:
+         *   Stage 0 (layers 0-11, has_embedding): ranks 0,1 (global TP)
+         *   Stage 1 (layers 12-23, has_lm_head):  ranks 2,3 (global TP)
+         *
+         * Rank assignments:
+         *   Rank 0: stage 0, tp_rank=0 (PP head)
+         *   Rank 1: stage 0, tp_rank=1 (PP head)
+         *   Rank 2: stage 1, tp_rank=0 (PP tail)
+         *   Rank 3: stage 1, tp_rank=1 (PP tail)
+         *
+         * Disjoint rank sets → fan-out transfers from rank 0 (first rank
+         * in sender domain) to ranks 2 and 3 (receiver domain ranks that
+         * are not in the sender domain).
+         */
+        static GlobalPPTopology buildTwoStageTwoWayTPTopo()
+        {
+            GlobalPPStageSpec s0;
+            s0.stage_id = 0;
+            s0.first_layer = 0;
+            s0.last_layer = 11;
+            s0.has_embedding = true;
+            s0.has_lm_head = false;
+            s0.is_global_tp = true;
+            s0.participating_ranks = {0, 1};
+            s0.per_rank_device = GlobalDeviceAddress::cpu();
+
+            GlobalPPStageSpec s1;
+            s1.stage_id = 1;
+            s1.first_layer = 12;
+            s1.last_layer = 23;
+            s1.has_embedding = false;
+            s1.has_lm_head = true;
+            s1.is_global_tp = true;
+            s1.participating_ranks = {2, 3};
+            s1.per_rank_device = GlobalDeviceAddress::cpu();
+
+            return GlobalPPTopology::build({s0, s1}, TOTAL_LAYERS, 4);
+        }
+
+        /**
+         * @brief Build a mixed topology: 2 PP-only stages + 1 global TP stage
+         *
+         * 4 ranks total:
+         *   Stage 0 (layers 0-7, has_embedding): rank 0 only (PP-only)
+         *   Stage 1 (layers 8-15): rank 1 only (PP-only)
+         *   Stage 2 (layers 16-23, has_lm_head): ranks 2,3 (global TP)
+         *
+         * Transfers:
+         *   Stage 0→1: rank 0 → rank 1 (single→single)
+         *   Stage 1→2: rank 1 → rank 2, rank 1 → rank 3 (single→TP fan-out)
+         */
+        static GlobalPPTopology buildMixedPPAndTPTopo()
+        {
+            GlobalPPStageSpec s0;
+            s0.stage_id = 0;
+            s0.first_layer = 0;
+            s0.last_layer = 7;
+            s0.has_embedding = true;
+            s0.has_lm_head = false;
+            s0.is_global_tp = false;
+            s0.owning_rank = 0;
+            s0.inner_mode = InnerParallelism::SINGLE_DEVICE;
+            s0.devices = {GlobalDeviceAddress::cpu()};
+
+            GlobalPPStageSpec s1;
+            s1.stage_id = 1;
+            s1.first_layer = 8;
+            s1.last_layer = 15;
+            s1.has_embedding = false;
+            s1.has_lm_head = false;
+            s1.is_global_tp = false;
+            s1.owning_rank = 1;
+            s1.inner_mode = InnerParallelism::SINGLE_DEVICE;
+            s1.devices = {GlobalDeviceAddress::cpu()};
+
+            GlobalPPStageSpec s2;
+            s2.stage_id = 2;
+            s2.first_layer = 16;
+            s2.last_layer = 23;
+            s2.has_embedding = false;
+            s2.has_lm_head = true;
+            s2.is_global_tp = true;
+            s2.participating_ranks = {2, 3};
+            s2.per_rank_device = GlobalDeviceAddress::cpu();
+
+            return GlobalPPTopology::build({s0, s1, s2}, TOTAL_LAYERS, 4);
+        }
+
+        /**
+         * @brief Build a 2-stage TP topology with the SAME rank set
+         *
+         * 2 ranks total:
+         *   Stage 0 (layers 0-11, has_embedding): ranks 0,1 (global TP)
+         *   Stage 1 (layers 12-23, has_lm_head):  ranks 0,1 (global TP)
+         *
+         * Same rank set — no transfers should be generated.
+         */
+        static GlobalPPTopology buildTwoStageSameTPTopo()
+        {
+            GlobalPPStageSpec s0;
+            s0.stage_id = 0;
+            s0.first_layer = 0;
+            s0.last_layer = 11;
+            s0.has_embedding = true;
+            s0.has_lm_head = false;
+            s0.is_global_tp = true;
+            s0.participating_ranks = {0, 1};
+            s0.per_rank_device = GlobalDeviceAddress::cpu();
+
+            GlobalPPStageSpec s1;
+            s1.stage_id = 1;
+            s1.first_layer = 12;
+            s1.last_layer = 23;
+            s1.has_embedding = false;
+            s1.has_lm_head = true;
+            s1.is_global_tp = true;
+            s1.participating_ranks = {0, 1};
+            s1.per_rank_device = GlobalDeviceAddress::cpu();
+
+            return GlobalPPTopology::build({s0, s1}, TOTAL_LAYERS, 2);
+        }
+
+        /**
+         * @brief Build a 2-stage TP topology with PARTIAL overlap
+         *
+         * 3 ranks total:
+         *   Stage 0 (layers 0-11, has_embedding): ranks 0,1 (global TP)
+         *   Stage 1 (layers 12-23, has_lm_head):  ranks 1,2 (global TP)
+         *
+         * Partial overlap: rank 1 is in both domains, rank 2 needs data.
+         * Fan-out from rank 0 (first in sender domain) to rank 2.
+         */
+        static GlobalPPTopology buildPartialOverlapTPTopo()
+        {
+            GlobalPPStageSpec s0;
+            s0.stage_id = 0;
+            s0.first_layer = 0;
+            s0.last_layer = 11;
+            s0.has_embedding = true;
+            s0.has_lm_head = false;
+            s0.is_global_tp = true;
+            s0.participating_ranks = {0, 1};
+            s0.per_rank_device = GlobalDeviceAddress::cpu();
+
+            GlobalPPStageSpec s1;
+            s1.stage_id = 1;
+            s1.first_layer = 12;
+            s1.last_layer = 23;
+            s1.has_embedding = false;
+            s1.has_lm_head = true;
+            s1.is_global_tp = true;
+            s1.participating_ranks = {1, 2};
+            s1.per_rank_device = GlobalDeviceAddress::cpu();
+
+            return GlobalPPTopology::build({s0, s1}, TOTAL_LAYERS, 3);
         }
     };
 
@@ -950,6 +1110,671 @@ namespace llaminar2::test
         orch.clear_cache();
         EXPECT_EQ(runner_raw->clear_cache_call_count(), 1u);
         EXPECT_GT(mpi.barrier_call_count(), barrier_before);
+    }
+
+    // =========================================================================
+    // Phase 3: Global TP + PP Composition
+    // =========================================================================
+
+    // --- 2PP × 2TP Topology Construction ---
+
+    TEST_F(Test__GlobalOrchestrator, TwoPPTwoTP_Rank0_IsHeadNotTail)
+    {
+        MockMPIContext mpi(0, 4);
+        auto topo = buildTwoStageTwoWayTPTopo();
+        auto runner = std::make_unique<MockDeviceRunner>();
+
+        GlobalOrchestrator orch(makeConfig(std::move(topo), 0, 4, &mpi, std::move(runner)));
+
+        EXPECT_TRUE(orch.isPipelineHead());
+        EXPECT_FALSE(orch.isPipelineTail());
+        EXPECT_EQ(orch.pipelineDepth(), 2);
+    }
+
+    TEST_F(Test__GlobalOrchestrator, TwoPPTwoTP_Rank1_IsHeadNotTail)
+    {
+        MockMPIContext mpi(1, 4);
+        auto topo = buildTwoStageTwoWayTPTopo();
+        auto runner = std::make_unique<MockDeviceRunner>();
+
+        GlobalOrchestrator orch(makeConfig(std::move(topo), 1, 4, &mpi, std::move(runner)));
+
+        EXPECT_TRUE(orch.isPipelineHead());
+        EXPECT_FALSE(orch.isPipelineTail());
+    }
+
+    TEST_F(Test__GlobalOrchestrator, TwoPPTwoTP_Rank2_IsTailNotHead)
+    {
+        MockMPIContext mpi(2, 4);
+        auto topo = buildTwoStageTwoWayTPTopo();
+        auto runner = std::make_unique<MockDeviceRunner>();
+
+        GlobalOrchestrator orch(makeConfig(std::move(topo), 2, 4, &mpi, std::move(runner)));
+
+        EXPECT_FALSE(orch.isPipelineHead());
+        EXPECT_TRUE(orch.isPipelineTail());
+    }
+
+    TEST_F(Test__GlobalOrchestrator, TwoPPTwoTP_Rank3_IsTailNotHead)
+    {
+        MockMPIContext mpi(3, 4);
+        auto topo = buildTwoStageTwoWayTPTopo();
+        auto runner = std::make_unique<MockDeviceRunner>();
+
+        GlobalOrchestrator orch(makeConfig(std::move(topo), 3, 4, &mpi, std::move(runner)));
+
+        EXPECT_FALSE(orch.isPipelineHead());
+        EXPECT_TRUE(orch.isPipelineTail());
+    }
+
+    // --- TP Rank Plan Metadata ---
+
+    TEST_F(Test__GlobalOrchestrator, TwoPPTwoTP_Rank0_HasCorrectTPMetadata)
+    {
+        MockMPIContext mpi(0, 4);
+        auto topo = buildTwoStageTwoWayTPTopo();
+        auto runner = std::make_unique<MockDeviceRunner>();
+
+        GlobalOrchestrator orch(makeConfig(std::move(topo), 0, 4, &mpi, std::move(runner)));
+
+        const auto &plan = orch.rankPlan();
+        auto stages = plan.executeStages();
+        ASSERT_EQ(stages.size(), 1u);
+
+        const auto &action = *stages[0];
+        EXPECT_TRUE(action.is_global_tp);
+        EXPECT_EQ(action.tp_rank_in_domain, 0);
+        EXPECT_EQ(action.tp_domain_size, 2);
+        EXPECT_EQ(action.stage_id, 0);
+        EXPECT_EQ(action.first_layer, 0);
+        EXPECT_EQ(action.last_layer, 11);
+        EXPECT_TRUE(action.has_embedding);
+        EXPECT_FALSE(action.has_lm_head);
+    }
+
+    TEST_F(Test__GlobalOrchestrator, TwoPPTwoTP_Rank1_HasCorrectTPMetadata)
+    {
+        MockMPIContext mpi(1, 4);
+        auto topo = buildTwoStageTwoWayTPTopo();
+        auto runner = std::make_unique<MockDeviceRunner>();
+
+        GlobalOrchestrator orch(makeConfig(std::move(topo), 1, 4, &mpi, std::move(runner)));
+
+        const auto &plan = orch.rankPlan();
+        auto stages = plan.executeStages();
+        ASSERT_EQ(stages.size(), 1u);
+
+        const auto &action = *stages[0];
+        EXPECT_TRUE(action.is_global_tp);
+        EXPECT_EQ(action.tp_rank_in_domain, 1);
+        EXPECT_EQ(action.tp_domain_size, 2);
+        EXPECT_EQ(action.stage_id, 0);
+    }
+
+    TEST_F(Test__GlobalOrchestrator, TwoPPTwoTP_Rank2_HasCorrectTPMetadata)
+    {
+        MockMPIContext mpi(2, 4);
+        auto topo = buildTwoStageTwoWayTPTopo();
+        auto runner = std::make_unique<MockDeviceRunner>();
+
+        GlobalOrchestrator orch(makeConfig(std::move(topo), 2, 4, &mpi, std::move(runner)));
+
+        const auto &plan = orch.rankPlan();
+        auto stages = plan.executeStages();
+        ASSERT_EQ(stages.size(), 1u);
+
+        const auto &action = *stages[0];
+        EXPECT_TRUE(action.is_global_tp);
+        EXPECT_EQ(action.tp_rank_in_domain, 0);
+        EXPECT_EQ(action.tp_domain_size, 2);
+        EXPECT_EQ(action.stage_id, 1);
+        EXPECT_EQ(action.first_layer, 12);
+        EXPECT_EQ(action.last_layer, 23);
+        EXPECT_FALSE(action.has_embedding);
+        EXPECT_TRUE(action.has_lm_head);
+    }
+
+    // --- Weight Shard Info Access ---
+
+    TEST_F(Test__GlobalOrchestrator, TwoPPTwoTP_WeightShardInfoAccessible)
+    {
+        MockMPIContext mpi(0, 4);
+        auto topo = buildTwoStageTwoWayTPTopo();
+        auto runner = std::make_unique<MockDeviceRunner>();
+
+        GlobalOrchestrator orch(makeConfig(std::move(topo), 0, 4, &mpi, std::move(runner)));
+
+        const auto *shard = orch.weightShardForStage(0);
+        ASSERT_NE(shard, nullptr);
+        // GlobalPPRankPlanBuilder populates weight_shard from TP metadata
+        EXPECT_EQ(shard->total_shards, 2);
+        EXPECT_EQ(shard->shard_index, 0);
+        EXPECT_FLOAT_EQ(shard->work_fraction, 0.5f);
+    }
+
+    TEST_F(Test__GlobalOrchestrator, TwoPPTwoTP_Rank1_WeightShardInfoShard1)
+    {
+        MockMPIContext mpi(1, 4);
+        auto topo = buildTwoStageTwoWayTPTopo();
+        auto runner = std::make_unique<MockDeviceRunner>();
+
+        GlobalOrchestrator orch(makeConfig(std::move(topo), 1, 4, &mpi, std::move(runner)));
+
+        const auto *shard = orch.weightShardForStage(0);
+        ASSERT_NE(shard, nullptr);
+        EXPECT_EQ(shard->total_shards, 2);
+        EXPECT_EQ(shard->shard_index, 1);
+        EXPECT_FLOAT_EQ(shard->work_fraction, 0.5f);
+    }
+
+    TEST_F(Test__GlobalOrchestrator, WeightShardForNonExistentStageReturnsNull)
+    {
+        MockMPIContext mpi(0, 4);
+        auto topo = buildTwoStageTwoWayTPTopo();
+        auto runner = std::make_unique<MockDeviceRunner>();
+
+        GlobalOrchestrator orch(makeConfig(std::move(topo), 0, 4, &mpi, std::move(runner)));
+
+        // Rank 0 doesn't execute stage 1, should return nullptr
+        EXPECT_EQ(orch.weightShardForStage(1), nullptr);
+        // Stage 99 doesn't exist at all
+        EXPECT_EQ(orch.weightShardForStage(99), nullptr);
+    }
+
+    // --- Global TP Context Propagation ---
+
+    TEST_F(Test__GlobalOrchestrator, GlobalTPContextPropagation)
+    {
+        MockMPIContext mpi(0, 4);
+        auto topo = buildTwoStageTwoWayTPTopo();
+        auto runner = std::make_unique<MockDeviceRunner>();
+
+        // Create a mock TP context
+        MockLocalTPContext::Config tp_config;
+        tp_config.devices = {GlobalDeviceAddress::cpu(), GlobalDeviceAddress::cpu()};
+        auto tp_ctx = std::make_unique<MockLocalTPContext>(tp_config);
+        auto *tp_ctx_raw = tp_ctx.get();
+
+        auto config = makeConfig(std::move(topo), 0, 4, &mpi, std::move(runner));
+        config.global_tp_ctx = tp_ctx_raw;
+
+        GlobalOrchestrator orch(std::move(config));
+
+        EXPECT_EQ(orch.globalTPContext(), tp_ctx_raw);
+    }
+
+    TEST_F(Test__GlobalOrchestrator, GlobalTPContextNullForPurePP)
+    {
+        MockMPIContext mpi(0, 2);
+        auto topo = buildTwoStagePPTopo();
+        auto runner = std::make_unique<MockDeviceRunner>();
+
+        GlobalOrchestrator orch(makeConfig(std::move(topo), 0, 2, &mpi, std::move(runner)));
+
+        // Pure PP: no global TP context configured
+        EXPECT_EQ(orch.globalTPContext(), nullptr);
+    }
+
+    // --- Forward with 2PP × 2TP (disjoint rank sets) ---
+
+    TEST_F(Test__GlobalOrchestrator, TwoPPTwoTP_Rank0_ForwardExecutesStage)
+    {
+        MockMPIContext mpi(0, 4);
+        auto topo = buildTwoStageTwoWayTPTopo();
+
+        MockDeviceRunner::Config runner_config;
+        runner_config.vocab_size = VOCAB_SIZE;
+        runner_config.has_hidden_state = true;
+        runner_config.hidden_state_dim = D_MODEL;
+        auto runner_raw = new MockDeviceRunner(runner_config);
+        auto runner = std::unique_ptr<MockDeviceRunner>(runner_raw);
+
+        GlobalOrchestrator orch(makeConfig(std::move(topo), 0, 4, &mpi, std::move(runner)));
+
+        std::vector<int> tokens = {1, 2, 3};
+        EXPECT_TRUE(orch.forward(tokens.data(), 3));
+        EXPECT_EQ(runner_raw->forward_call_count(), 1u);
+        // Rank 0 is the designated sender (first in sender domain {0,1}),
+        // sends to rank 2 and rank 3 (disjoint receiver domain)
+        EXPECT_EQ(mpi.send_call_count(), 2u);
+    }
+
+    TEST_F(Test__GlobalOrchestrator, TwoPPTwoTP_Rank2_ForwardExecutesStage)
+    {
+        MockMPIContext mpi(2, 4);
+        auto topo = buildTwoStageTwoWayTPTopo();
+
+        auto runner_raw = new MockDeviceRunner();
+        auto runner = std::unique_ptr<MockDeviceRunner>(runner_raw);
+
+        GlobalOrchestrator orch(makeConfig(std::move(topo), 2, 4, &mpi, std::move(runner)));
+
+        std::vector<int> tokens = {1, 2, 3};
+        EXPECT_TRUE(orch.forward(tokens.data(), 3));
+        // Rank 2 receives hidden state from rank 0 (designated sender)
+        EXPECT_EQ(mpi.recv_call_count(), 1u);
+        EXPECT_EQ(runner_raw->set_hidden_state_call_count(), 1u);
+        EXPECT_EQ(runner_raw->forward_call_count(), 1u);
+    }
+
+    TEST_F(Test__GlobalOrchestrator, TwoPPTwoTP_Rank1_ForwardExecutesStage)
+    {
+        MockMPIContext mpi(1, 4);
+        auto topo = buildTwoStageTwoWayTPTopo();
+
+        auto runner_raw = new MockDeviceRunner();
+        auto runner = std::unique_ptr<MockDeviceRunner>(runner_raw);
+
+        GlobalOrchestrator orch(makeConfig(std::move(topo), 1, 4, &mpi, std::move(runner)));
+
+        std::vector<int> tokens = {1, 2, 3};
+        EXPECT_TRUE(orch.forward(tokens.data(), 3));
+        EXPECT_EQ(runner_raw->forward_call_count(), 1u);
+        // Rank 1 is NOT the designated sender (only rank 0 fans out),
+        // so it has no send operations
+        EXPECT_EQ(mpi.send_call_count(), 0u);
+    }
+
+    // --- Mixed PP-only + Global TP Topology ---
+
+    TEST_F(Test__GlobalOrchestrator, MixedPPTP_Rank0_IsPureHead)
+    {
+        MockMPIContext mpi(0, 4);
+        auto topo = buildMixedPPAndTPTopo();
+        auto runner = std::make_unique<MockDeviceRunner>();
+
+        GlobalOrchestrator orch(makeConfig(std::move(topo), 0, 4, &mpi, std::move(runner)));
+
+        EXPECT_TRUE(orch.isPipelineHead());
+        EXPECT_FALSE(orch.isPipelineTail());
+        EXPECT_EQ(orch.pipelineDepth(), 3);
+
+        // Stage 0 is NOT global TP (single rank)
+        const auto &plan = orch.rankPlan();
+        auto stages = plan.executeStages();
+        ASSERT_EQ(stages.size(), 1u);
+        EXPECT_FALSE(stages[0]->is_global_tp);
+        EXPECT_EQ(stages[0]->stage_id, 0);
+    }
+
+    TEST_F(Test__GlobalOrchestrator, MixedPPTP_Rank2_IsTPTail)
+    {
+        MockMPIContext mpi(2, 4);
+        auto topo = buildMixedPPAndTPTopo();
+        auto runner = std::make_unique<MockDeviceRunner>();
+
+        GlobalOrchestrator orch(makeConfig(std::move(topo), 2, 4, &mpi, std::move(runner)));
+
+        EXPECT_FALSE(orch.isPipelineHead());
+        EXPECT_TRUE(orch.isPipelineTail());
+
+        // Stage 2 IS global TP
+        const auto &plan = orch.rankPlan();
+        auto stages = plan.executeStages();
+        ASSERT_EQ(stages.size(), 1u);
+        EXPECT_TRUE(stages[0]->is_global_tp);
+        EXPECT_EQ(stages[0]->tp_rank_in_domain, 0);
+        EXPECT_EQ(stages[0]->tp_domain_size, 2);
+    }
+
+    TEST_F(Test__GlobalOrchestrator, MixedPPTP_Rank3_IsTPTail)
+    {
+        MockMPIContext mpi(3, 4);
+        auto topo = buildMixedPPAndTPTopo();
+        auto runner = std::make_unique<MockDeviceRunner>();
+
+        GlobalOrchestrator orch(makeConfig(std::move(topo), 3, 4, &mpi, std::move(runner)));
+
+        EXPECT_FALSE(orch.isPipelineHead());
+        EXPECT_TRUE(orch.isPipelineTail());
+
+        const auto &plan = orch.rankPlan();
+        auto stages = plan.executeStages();
+        ASSERT_EQ(stages.size(), 1u);
+        EXPECT_TRUE(stages[0]->is_global_tp);
+        EXPECT_EQ(stages[0]->tp_rank_in_domain, 1);
+    }
+
+    // --- Mixed PP+TP Forward Path (exercises real send/recv via fan-out) ---
+
+    TEST_F(Test__GlobalOrchestrator, MixedPPTP_Rank0_ForwardSendsToRank1)
+    {
+        MockMPIContext mpi(0, 4);
+        auto topo = buildMixedPPAndTPTopo();
+
+        MockDeviceRunner::Config runner_config;
+        runner_config.vocab_size = VOCAB_SIZE;
+        runner_config.has_hidden_state = true;
+        runner_config.hidden_state_dim = D_MODEL;
+        auto runner_raw = new MockDeviceRunner(runner_config);
+        auto runner = std::unique_ptr<MockDeviceRunner>(runner_raw);
+
+        GlobalOrchestrator orch(makeConfig(std::move(topo), 0, 4, &mpi, std::move(runner)));
+
+        std::vector<int> tokens = {1, 2, 3};
+        EXPECT_TRUE(orch.forward(tokens.data(), 3));
+        EXPECT_EQ(runner_raw->forward_call_count(), 1u);
+        // Stage 0 (single) → Stage 1 (single): sends to rank 1
+        EXPECT_EQ(mpi.send_call_count(), 1u);
+    }
+
+    TEST_F(Test__GlobalOrchestrator, MixedPPTP_Rank2_ForwardRecvsAndExecutes)
+    {
+        MockMPIContext mpi(2, 4);
+        auto topo = buildMixedPPAndTPTopo();
+
+        auto runner_raw = new MockDeviceRunner();
+        auto runner = std::unique_ptr<MockDeviceRunner>(runner_raw);
+
+        GlobalOrchestrator orch(makeConfig(std::move(topo), 2, 4, &mpi, std::move(runner)));
+
+        std::vector<int> tokens = {1, 2, 3};
+        EXPECT_TRUE(orch.forward(tokens.data(), 3));
+        // Stage 1 (single, rank 1) → Stage 2 (TP, ranks 2,3): rank 2 receives
+        EXPECT_EQ(mpi.recv_call_count(), 1u);
+        EXPECT_EQ(runner_raw->forward_call_count(), 1u);
+        EXPECT_EQ(runner_raw->set_hidden_state_call_count(), 1u);
+    }
+
+    TEST_F(Test__GlobalOrchestrator, MixedPPTP_Rank3_ForwardRecvsAndExecutes)
+    {
+        MockMPIContext mpi(3, 4);
+        auto topo = buildMixedPPAndTPTopo();
+
+        auto runner_raw = new MockDeviceRunner();
+        auto runner = std::unique_ptr<MockDeviceRunner>(runner_raw);
+
+        GlobalOrchestrator orch(makeConfig(std::move(topo), 3, 4, &mpi, std::move(runner)));
+
+        std::vector<int> tokens = {1, 2, 3};
+        EXPECT_TRUE(orch.forward(tokens.data(), 3));
+        // Stage 1 (single, rank 1) → Stage 2 (TP, ranks 2,3): rank 3 receives
+        EXPECT_EQ(mpi.recv_call_count(), 1u);
+        EXPECT_EQ(runner_raw->forward_call_count(), 1u);
+        EXPECT_EQ(runner_raw->set_hidden_state_call_count(), 1u);
+    }
+
+    // --- Tail Rank Identification with Global TP ---
+
+    TEST_F(Test__GlobalOrchestrator, TwoPPTwoTP_SamplingBroadcastsFromFirstTailTPRank)
+    {
+        // With global TP, the tail stage has multiple ranks (2, 3).
+        // The first participating rank (2) is the broadcast root.
+        // Rank 2 (tail, tp_rank=0): samples + broadcasts
+        MockMPIContext mpi(2, 4);
+        auto topo = buildTwoStageTwoWayTPTopo();
+
+        MockDeviceRunner::Config runner_config;
+        runner_config.vocab_size = VOCAB_SIZE;
+        runner_config.greedy_sample_token = 55;
+        auto runner = std::make_unique<MockDeviceRunner>(runner_config);
+
+        GlobalOrchestrator orch(makeConfig(std::move(topo), 2, 4, &mpi, std::move(runner)));
+        ASSERT_TRUE(orch.isPipelineTail());
+
+        int token = orch.sampleGreedyOnDevice();
+        EXPECT_EQ(token, 55);
+        EXPECT_GE(mpi.broadcast_call_count(), 1u);
+    }
+
+    TEST_F(Test__GlobalOrchestrator, TwoPPTwoTP_Rank3_IsTailAndSamples)
+    {
+        // Rank 3 is also in the tail stage (global TP) with has_lm_head = true
+        MockMPIContext mpi(3, 4);
+        auto topo = buildTwoStageTwoWayTPTopo();
+
+        MockDeviceRunner::Config runner_config;
+        runner_config.vocab_size = VOCAB_SIZE;
+        runner_config.greedy_sample_token = 66;
+        auto runner = std::make_unique<MockDeviceRunner>(runner_config);
+
+        GlobalOrchestrator orch(makeConfig(std::move(topo), 3, 4, &mpi, std::move(runner)));
+        ASSERT_TRUE(orch.isPipelineTail());
+
+        // Rank 3 is pipeline tail (via global TP), so it samples locally too.
+        // In the mock, broadcast is a no-op so the local value is retained.
+        int token = orch.sampleGreedyOnDevice();
+        EXPECT_EQ(token, 66);
+        EXPECT_GE(mpi.broadcast_call_count(), 1u);
+    }
+
+    TEST_F(Test__GlobalOrchestrator, TwoPPTwoTP_Rank0_NonTailSampling)
+    {
+        // Rank 0 is head (not tail) — should not sample locally
+        MockMPIContext mpi(0, 4);
+        auto topo = buildTwoStageTwoWayTPTopo();
+        auto runner = std::make_unique<MockDeviceRunner>();
+
+        GlobalOrchestrator orch(makeConfig(std::move(topo), 0, 4, &mpi, std::move(runner)));
+        ASSERT_FALSE(orch.isPipelineTail());
+
+        int token = orch.sampleGreedyOnDevice();
+        EXPECT_EQ(token, -1); // Non-tail: broadcast no-op in mock
+        EXPECT_GE(mpi.broadcast_call_count(), 1u);
+    }
+
+    // --- Clear Cache with Global TP ---
+
+    TEST_F(Test__GlobalOrchestrator, TwoPPTwoTP_ClearCacheBarriers)
+    {
+        MockMPIContext mpi(1, 4);
+        auto topo = buildTwoStageTwoWayTPTopo();
+        auto runner_raw = new MockDeviceRunner();
+        auto runner = std::unique_ptr<MockDeviceRunner>(runner_raw);
+
+        GlobalOrchestrator orch(makeConfig(std::move(topo), 1, 4, &mpi, std::move(runner)));
+
+        size_t barrier_before = mpi.barrier_call_count();
+        orch.clear_cache();
+        EXPECT_EQ(runner_raw->clear_cache_call_count(), 1u);
+        EXPECT_GT(mpi.barrier_call_count(), barrier_before);
+    }
+
+    // --- Weight Shard Info for Non-TP Stages ---
+
+    TEST_F(Test__GlobalOrchestrator, MixedPPTP_SingleRankStage_WeightShardIsUnsharded)
+    {
+        MockMPIContext mpi(0, 4);
+        auto topo = buildMixedPPAndTPTopo();
+        auto runner = std::make_unique<MockDeviceRunner>();
+
+        GlobalOrchestrator orch(makeConfig(std::move(topo), 0, 4, &mpi, std::move(runner)));
+
+        const auto *shard = orch.weightShardForStage(0);
+        ASSERT_NE(shard, nullptr);
+        // Single-rank stage: no sharding
+        EXPECT_EQ(shard->total_shards, 1);
+        EXPECT_EQ(shard->shard_index, 0);
+        EXPECT_FLOAT_EQ(shard->work_fraction, 1.0f);
+        EXPECT_FALSE(shard->isSharded());
+    }
+
+    TEST_F(Test__GlobalOrchestrator, MixedPPTP_TPStage_WeightShardIsSharded)
+    {
+        MockMPIContext mpi(2, 4);
+        auto topo = buildMixedPPAndTPTopo();
+        auto runner = std::make_unique<MockDeviceRunner>();
+
+        GlobalOrchestrator orch(makeConfig(std::move(topo), 2, 4, &mpi, std::move(runner)));
+
+        const auto *shard = orch.weightShardForStage(2);
+        ASSERT_NE(shard, nullptr);
+        // Global TP stage with 2 participants
+        EXPECT_EQ(shard->total_shards, 2);
+        EXPECT_EQ(shard->shard_index, 0);
+        EXPECT_FLOAT_EQ(shard->work_fraction, 0.5f);
+        EXPECT_TRUE(shard->isSharded());
+    }
+
+    // --- 2PP × 2TP Topology Has Correct Fan-Out Transfers (TP→TP, disjoint) ---
+
+    TEST_F(Test__GlobalOrchestrator, TwoPPTwoTP_HasCorrectTransfersForTPToTP)
+    {
+        // Disjoint rank sets: stage 0 {0,1} → stage 1 {2,3}
+        // Rank 0: 2 SEND transfers (to rank 2, to rank 3)
+        // Rank 1: 0 transfers (not the designated sender, not a receiver)
+        // Rank 2: 1 RECV transfer (from rank 0)
+        // Rank 3: 1 RECV transfer (from rank 0)
+
+        auto verify_rank = [this](int rank, int expected_sends, int expected_recvs)
+        {
+            MockMPIContext mpi(rank, 4);
+            auto topo = buildTwoStageTwoWayTPTopo();
+            auto runner = std::make_unique<MockDeviceRunner>();
+
+            GlobalOrchestrator orch(makeConfig(std::move(topo), rank, 4, &mpi, std::move(runner)));
+
+            const auto &plan = orch.rankPlan();
+            auto transfers = plan.transferActions();
+
+            int send_count = 0, recv_count = 0;
+            for (const auto *t : transfers)
+            {
+                if (t->direction == RankTransferAction::Direction::SEND) send_count++;
+                if (t->direction == RankTransferAction::Direction::RECV) recv_count++;
+            }
+            EXPECT_EQ(send_count, expected_sends) << "rank " << rank << " send count";
+            EXPECT_EQ(recv_count, expected_recvs) << "rank " << rank << " recv count";
+        };
+
+        verify_rank(0, 2, 0); // Designated sender → rank 2, rank 3
+        verify_rank(1, 0, 0); // Not designated sender, not a receiver
+        verify_rank(2, 0, 1); // Receiver from rank 0
+        verify_rank(3, 0, 1); // Receiver from rank 0
+    }
+
+    // --- Mixed PP+TP Topology Has Correct Transfer Structure ---
+
+    TEST_F(Test__GlobalOrchestrator, MixedPPTP_Rank1_HasSendFanOut)
+    {
+        // Rank 1 (middle, single) sends to both rank 2 and rank 3 (TP stage)
+        MockMPIContext mpi(1, 4);
+        auto topo = buildMixedPPAndTPTopo();
+
+        MockDeviceRunner::Config runner_config;
+        runner_config.vocab_size = VOCAB_SIZE;
+        runner_config.has_hidden_state = true;
+        runner_config.hidden_state_dim = D_MODEL;
+        auto runner = std::make_unique<MockDeviceRunner>(runner_config);
+
+        GlobalOrchestrator orch(makeConfig(std::move(topo), 1, 4, &mpi, std::move(runner)));
+
+        const auto &plan = orch.rankPlan();
+        auto transfers = plan.transferActions();
+
+        // Rank 1: RECV from rank 0 + SEND to rank 2 + SEND to rank 3
+        int recv_count = 0, send_count = 0;
+        for (const auto *t : transfers)
+        {
+            if (t->direction == RankTransferAction::Direction::RECV) recv_count++;
+            if (t->direction == RankTransferAction::Direction::SEND) send_count++;
+        }
+        EXPECT_EQ(recv_count, 1); // From rank 0
+        EXPECT_EQ(send_count, 2); // To rank 2 and rank 3 (fan-out)
+    }
+
+    // --- Same TP Rank Set (no transfers needed) ---
+
+    TEST_F(Test__GlobalOrchestrator, SameTPTopo_NoTransfers)
+    {
+        // Same rank set {0,1} in both stages — all ranks already have data
+        for (int rank = 0; rank < 2; ++rank)
+        {
+            MockMPIContext mpi(rank, 2);
+            auto topo = buildTwoStageSameTPTopo();
+            auto runner = std::make_unique<MockDeviceRunner>();
+
+            GlobalOrchestrator orch(makeConfig(std::move(topo), rank, 2, &mpi, std::move(runner)));
+
+            const auto &plan = orch.rankPlan();
+            auto transfers = plan.transferActions();
+            EXPECT_TRUE(transfers.empty()) << "rank " << rank << " unexpectedly has transfers";
+        }
+    }
+
+    TEST_F(Test__GlobalOrchestrator, SameTPTopo_Rank0_ForwardExecutesStage)
+    {
+        MockMPIContext mpi(0, 2);
+        auto topo = buildTwoStageSameTPTopo();
+
+        auto runner_raw = new MockDeviceRunner();
+        auto runner = std::unique_ptr<MockDeviceRunner>(runner_raw);
+
+        GlobalOrchestrator orch(makeConfig(std::move(topo), 0, 2, &mpi, std::move(runner)));
+
+        std::vector<int> tokens = {1, 2, 3};
+        EXPECT_TRUE(orch.forward(tokens.data(), 3));
+        // Rank 0 participates in both stages, no MPI send/recv needed
+        EXPECT_EQ(mpi.send_call_count(), 0u);
+        EXPECT_EQ(mpi.recv_call_count(), 0u);
+        EXPECT_EQ(runner_raw->forward_call_count(), 2u); // Executes both stages
+    }
+
+    // --- Partial Overlap TP Rank Sets ---
+
+    TEST_F(Test__GlobalOrchestrator, PartialOverlapTP_Rank2Receives)
+    {
+        // Rank 2 is in stage 1 {1,2} but NOT in stage 0 {0,1} — needs data
+        MockMPIContext mpi(2, 3);
+        auto topo = buildPartialOverlapTPTopo();
+
+        auto runner_raw = new MockDeviceRunner();
+        auto runner = std::unique_ptr<MockDeviceRunner>(runner_raw);
+
+        GlobalOrchestrator orch(makeConfig(std::move(topo), 2, 3, &mpi, std::move(runner)));
+
+        const auto &plan = orch.rankPlan();
+        auto transfers = plan.transferActions();
+
+        int recv_count = 0;
+        for (const auto *t : transfers)
+        {
+            if (t->direction == RankTransferAction::Direction::RECV) recv_count++;
+        }
+        EXPECT_EQ(recv_count, 1); // Receives from rank 0
+    }
+
+    TEST_F(Test__GlobalOrchestrator, PartialOverlapTP_Rank0Sends)
+    {
+        // Rank 0 is the first rank in sender domain {0,1} — designated sender
+        MockMPIContext mpi(0, 3);
+        auto topo = buildPartialOverlapTPTopo();
+
+        MockDeviceRunner::Config runner_config;
+        runner_config.vocab_size = VOCAB_SIZE;
+        runner_config.has_hidden_state = true;
+        runner_config.hidden_state_dim = D_MODEL;
+        auto runner_raw = new MockDeviceRunner(runner_config);
+        auto runner = std::unique_ptr<MockDeviceRunner>(runner_raw);
+
+        GlobalOrchestrator orch(makeConfig(std::move(topo), 0, 3, &mpi, std::move(runner)));
+
+        const auto &plan = orch.rankPlan();
+        auto transfers = plan.transferActions();
+
+        int send_count = 0;
+        for (const auto *t : transfers)
+        {
+            if (t->direction == RankTransferAction::Direction::SEND) send_count++;
+        }
+        EXPECT_EQ(send_count, 1); // Sends to rank 2
+    }
+
+    TEST_F(Test__GlobalOrchestrator, PartialOverlapTP_Rank1NoTransfers)
+    {
+        // Rank 1 is in BOTH domains {0,1} and {1,2} — already has data,
+        // and is not the designated sender (rank 0 is)
+        MockMPIContext mpi(1, 3);
+        auto topo = buildPartialOverlapTPTopo();
+
+        auto runner_raw = new MockDeviceRunner();
+        auto runner = std::unique_ptr<MockDeviceRunner>(runner_raw);
+
+        GlobalOrchestrator orch(makeConfig(std::move(topo), 1, 3, &mpi, std::move(runner)));
+
+        const auto &plan = orch.rankPlan();
+        auto transfers = plan.transferActions();
+        EXPECT_TRUE(transfers.empty()) << "rank 1 unexpectedly has transfers";
     }
 
 } // namespace llaminar2::test

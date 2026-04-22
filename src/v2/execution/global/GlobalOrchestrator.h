@@ -11,10 +11,11 @@
  * (ChatCompletionHandler, BenchmarkMode, etc.). One instance per MPI rank;
  * each rank consults its own GlobalPPRankPlan.
  *
- * Phase 1 scope:
+ * Phase 1-3 scope:
  * - Pure global-TP (all ranks, all layers) — pass-through to RankOrchestrator
  * - Pure global-PP (disjoint layer ranges) — MPI send/recv of activations
  * - Tail-rank sampling with MPI_Bcast of token
+ * - Global TP + PP composition (2PP×2TP, mixed PP+TP topologies)
  *
  * @author David Sanftenberg
  * @date April 2026
@@ -203,6 +204,12 @@ namespace llaminar2
 
         /** @brief The cluster topology */
         const GlobalPPTopology &topology() const;
+
+        /** @brief The global TP context (may be nullptr for pure PP) */
+        ITPContext *globalTPContext() const;
+
+        /** @brief Get weight shard info for a stage this rank executes */
+        const WeightShardInfo *weightShardForStage(int stage_id) const;
 
     private:
         // =================================================================
