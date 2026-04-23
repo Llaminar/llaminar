@@ -105,35 +105,54 @@ namespace llaminar2
         const std::vector<size_t> &new_shape,
         size_t offset)
     {
-        // Validate: must be 2D
+        // Validate: view must be 2D
         if (new_shape.size() != 2)
         {
             throw std::invalid_argument("Q8_KTensor::create_view: only 2D views supported");
         }
 
+        // Compute effective 2D layout (supports both 2D and 3D parents).
+        // GGUF 3D: shape=[ne0, ne1, ne2] where ne0=cols (fastest), ne2=outermost.
+        // Flattened to 2D [ne1*ne2, ne0] = [total_rows, K].
+        size_t K, total_rows;
+        if (shape_.size() == 2)
+        {
+            K = shape_[1];
+            total_rows = shape_[0];
+        }
+        else if (shape_.size() == 3)
+        {
+            // GGUF 3D: shape = [ne[0], ne[1], ne[2]], ne[0] is fastest-varying (cols/K)
+            K = shape_[0];
+            total_rows = shape_[1] * shape_[2];
+        }
+        else
+        {
+            throw std::invalid_argument("Q8_KTensor::create_view: parent must be 2D or 3D");
+        }
+
         // Validate: K dimension must match
-        if (new_shape[1] != shape_[1])
+        if (new_shape[1] != K)
         {
             throw std::invalid_argument("Q8_KTensor::create_view: K dimension must match parent");
         }
 
         // Validate: offset must be row-aligned (multiple of K)
-        if (offset % shape_[1] != 0)
+        if (offset % K != 0)
         {
             throw std::invalid_argument("Q8_KTensor::create_view: offset must be row-aligned");
         }
 
         // Validate: view must fit within parent bounds
-        size_t start_row = offset / shape_[1];
+        size_t start_row = offset / K;
         size_t end_row = start_row + new_shape[0];
-        if (end_row > shape_[0])
+        if (end_row > total_rows)
         {
-            throw std::out_of_range("Q8_KTensor::create_view: view extends beyond parent bounds");
+            throw std::out_of_range("Q8_KTensor::create_view: view exceeds parent bounds");
         }
 
         // Calculate byte offset for view
         // Q8_K: 256 elements per block, 288 bytes per block
-        const size_t K = shape_[1];
         const size_t blocks_per_row = (K + Q8_KBlock::BLOCK_SIZE - 1) / Q8_KBlock::BLOCK_SIZE;
         const size_t bytes_per_row = blocks_per_row * sizeof(Q8_KBlock);
         size_t byte_offset = start_row * bytes_per_row;

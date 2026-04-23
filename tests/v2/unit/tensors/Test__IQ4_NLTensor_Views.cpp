@@ -123,9 +123,7 @@ TEST_F(Test__IQ4_NLTensor_Views, KDimensionMustMatch)
     auto parent = createTestTensor(10, 64);
 
     // Try to create view with different K dimension - should fail
-    auto view = parent->create_view({5, 32}, 0);
-
-    EXPECT_EQ(view, nullptr) << "View with mismatched K dimension should fail";
+    EXPECT_THROW(parent->create_view({5, 32}, 0), std::invalid_argument);
 }
 
 /**
@@ -136,9 +134,7 @@ TEST_F(Test__IQ4_NLTensor_Views, OffsetMustBeRowAligned)
     auto parent = createTestTensor(10, 64);
 
     // Try to create view with non-row-aligned offset - should fail
-    auto view = parent->create_view({5, 64}, 32); // 32 is not multiple of 64
-
-    EXPECT_EQ(view, nullptr) << "View with non-row-aligned offset should fail";
+    EXPECT_THROW(parent->create_view({5, 64}, 32), std::invalid_argument);
 }
 
 /**
@@ -149,9 +145,7 @@ TEST_F(Test__IQ4_NLTensor_Views, ViewBoundsChecking)
     auto parent = createTestTensor(10, 64);
 
     // Try to create view that exceeds parent bounds - should fail
-    auto view = parent->create_view({8, 64}, 5 * 64); // Rows 5-12, but parent only has 10 rows
-
-    EXPECT_EQ(view, nullptr) << "View exceeding parent bounds should fail";
+    EXPECT_THROW(parent->create_view({8, 64}, 5 * 64), std::out_of_range);
 }
 
 /**
@@ -365,4 +359,48 @@ TEST_F(Test__IQ4_NLTensor_Views, DecodeRowFromView)
         EXPECT_FLOAT_EQ(view_row[i], parent_row[i])
             << "decodeRow mismatch at column " << i;
     }
+}
+
+// --- 3D Parent → 2D View regression tests ---
+// NOTE: IQ4_NLTensor constructor does not yet support 3D shapes.
+// These tests verify the rejection and will be updated when 3D support is added.
+
+TEST_F(Test__IQ4_NLTensor_Views, View3DParentBasicSlice)
+{
+    // 3D GGUF shape: [cols=128(ne[0]), rows_per_expert=8(ne[1]), num_experts=4(ne[2])]
+    const size_t N = 4, R = 8, K = 128;
+    const size_t blocks_per_row = K / IQ4_NLBlock::BLOCK_SIZE;
+    const size_t total_blocks = N * R * blocks_per_row;
+    std::vector<uint8_t> raw(total_blocks * sizeof(IQ4_NLBlock));
+
+    // IQ4_NL doesn't support 3D shapes yet - constructor should throw
+    EXPECT_THROW(
+        std::make_shared<IQ4_NLTensor>(std::vector<size_t>{K, R, N}, raw),
+        std::invalid_argument);
+}
+
+TEST_F(Test__IQ4_NLTensor_Views, View3DParentWithOffset)
+{
+    const size_t N = 4, R = 8, K = 128;
+    const size_t blocks_per_row = K / IQ4_NLBlock::BLOCK_SIZE;
+    const size_t total_blocks = N * R * blocks_per_row;
+    std::vector<uint8_t> raw(total_blocks * sizeof(IQ4_NLBlock));
+
+    // IQ4_NL doesn't support 3D shapes yet - constructor should throw
+    EXPECT_THROW(
+        std::make_shared<IQ4_NLTensor>(std::vector<size_t>{K, R, N}, raw),
+        std::invalid_argument);
+}
+
+TEST_F(Test__IQ4_NLTensor_Views, View3DParentBoundsCheck)
+{
+    const size_t N = 4, R = 8, K = 128;
+    const size_t blocks_per_row = K / IQ4_NLBlock::BLOCK_SIZE;
+    const size_t total_blocks = N * R * blocks_per_row;
+    std::vector<uint8_t> raw(total_blocks * sizeof(IQ4_NLBlock));
+
+    // IQ4_NL doesn't support 3D shapes yet - constructor should throw
+    EXPECT_THROW(
+        std::make_shared<IQ4_NLTensor>(std::vector<size_t>{K, R, N}, raw),
+        std::invalid_argument);
 }

@@ -26,17 +26,19 @@ namespace llaminar2
 
     namespace
     {
-        /// Get the byte stride per expert for a 3D quantized tensor.
-        /// Shape is [num_experts, rows_per_expert, cols_per_expert].
-        /// Returns 0 on error.
+        /// Get the byte stride per expert for a 3D quantized expert tensor.
+        /// GGUF 3D layout (no swap during loading):
+        ///   shape[0] = ne[0] = fastest-varying = cols_per_expert
+        ///   shape[1] = ne[1] = middle          = rows_per_expert
+        ///   shape[2] = ne[2] = slowest-varying  = num_experts
         struct ExpertTensorInfo
         {
             const void *raw_blocks = nullptr;
             size_t block_byte_size = 0;      ///< sizeof(BlockType)
             size_t block_element_size = 0;    ///< elements per block (256 for Q4_K, Q6_K)
             size_t blocks_per_row = 0;        ///< cols / block_element_size
-            size_t rows_per_expert = 0;       ///< shape[1]
-            size_t cols_per_expert = 0;       ///< shape[2]
+            size_t rows_per_expert = 0;       ///< shape[1] = ne[1]
+            size_t cols_per_expert = 0;       ///< shape[0] = ne[0]
             TensorType tensor_type = TensorType::FP32;
         };
 
@@ -53,8 +55,10 @@ namespace llaminar2
             }
 
             info.raw_blocks = tensor->raw_data();
-            info.rows_per_expert = shape[1];
-            info.cols_per_expert = shape[2];
+            // GGUF 3D: shape = [ne[0], ne[1], ne[2]] = [cols, rows, num_experts]
+            // ne[0] is fastest-varying (contiguous), ne[2] is slowest (outermost)
+            info.cols_per_expert = shape[0];  // ne[0] = K dimension (d_model or intermediate)
+            info.rows_per_expert = shape[1];  // ne[1] = rows per expert slice
             info.tensor_type = tensor->native_type();
 
             switch (info.tensor_type)
@@ -82,8 +86,8 @@ namespace llaminar2
 
         /// Dequantize a full row from a 3D expert tensor
         /// @param info Expert tensor metadata
-        /// @param expert_id Which expert (shape[0] index)
-        /// @param row Row within the expert slice (shape[1] index)
+        /// @param expert_id Which expert (shape[2] / ne[2] index)
+        /// @param row Row within the expert slice (shape[1] / ne[1] index)
         /// @param output Output FP32 buffer, must be >= cols_per_expert elements
         void dequantizeExpertRow(const ExpertTensorInfo &info, int expert_id, int row, float *output)
         {
@@ -150,6 +154,9 @@ namespace llaminar2
         expert_indices.resize(seq_len * top_k);
         expert_weights.resize(seq_len * top_k);
 
+        // Stash raw router logits for snapshot capture [seq_len, num_experts]
+        router_logits_.resize(static_cast<size_t>(seq_len) * num_experts);
+
         // For each token: compute router logits, softmax, top-k selection
         for (int t = 0; t < seq_len; ++t)
         {
@@ -181,6 +188,10 @@ namespace llaminar2
                 logits[e] /= sum_exp;
             }
 
+            // Stash post-softmax probabilities (matches PyTorch gate output[0])
+            std::copy(logits.begin(), logits.end(),
+                      router_logits_.begin() + static_cast<size_t>(t) * num_experts);
+
             // Top-k selection
             std::vector<int> indices(num_experts);
             std::iota(indices.begin(), indices.end(), 0);
@@ -205,6 +216,22 @@ namespace llaminar2
         }
 
         return true;
+    }
+
+    void MoEFFNStage::stashRoutingResults(
+        const std::vector<int> &expert_indices,
+        const std::vector<float> &expert_weights,
+        int seq_len, int top_k) const
+    {
+        const size_t n = static_cast<size_t>(seq_len) * top_k;
+        routing_indices_f32_.resize(n);
+        routing_weights_.resize(n);
+        for (size_t i = 0; i < n; ++i)
+            routing_indices_f32_[i] = static_cast<float>(expert_indices[i]);
+        std::copy(expert_weights.begin(), expert_weights.end(), routing_weights_.begin());
+
+        // Invalidate cached dump info so snapshot callback sees the routing data
+        invalidateDumpInfoCache();
     }
 
     bool MoEFFNStage::executeExpertFFN(
@@ -338,6 +365,7 @@ namespace llaminar2
             LOG_ERROR("[MoEFFNStage] Routing failed");
             return false;
         }
+        stashRoutingResults(expert_indices, expert_weights_vec, seq_len, top_k);
 
         // Step 2: Zero output
         std::memset(output, 0, static_cast<size_t>(seq_len) * d_model * sizeof(float));
@@ -443,6 +471,7 @@ namespace llaminar2
             LOG_ERROR("[MoEFFNStage] GPU routing failed");
             return false;
         }
+        stashRoutingResults(expert_indices, expert_weights_vec, seq_len, top_k);
 
         // Step 2: Zero output
         std::memset(output, 0, static_cast<size_t>(seq_len) * d_model * sizeof(float));
@@ -579,8 +608,9 @@ namespace llaminar2
         params.expert_down_views.resize(num_experts);
 
         // Extract 2D views for each expert.
-        // For a 3D tensor [num_experts, rows, cols], each expert's 2D slice is
-        // at byte offset = expert_id * (rows * blocks_per_row * block_byte_size)
+        // GGUF 3D: shape = [ne[0], ne[1], ne[2]] = [cols, rows, num_experts]
+        // Each expert's 2D slice is [rows, cols] at element offset = expert_id * rows * cols.
+        // create_view() handles 3D→2D slicing internally.
         auto extract_views = [](TensorBase *tensor_3d, int n_experts,
                                 std::vector<std::shared_ptr<TensorBase>> &views) -> bool
         {
@@ -591,40 +621,16 @@ namespace llaminar2
                 return false;
             }
 
+            // GGUF 3D: shape[0]=ne[0]=cols (fastest), shape[1]=ne[1]=rows, shape[2]=ne[2]=experts (slowest)
+            size_t cols = shape[0];
             size_t rows = shape[1];
-            size_t cols = shape[2];
-
-            // Calculate byte stride per expert based on tensor type
-            size_t block_byte_size = 0;
-            size_t block_element_size = 0;
-            switch (tensor_3d->native_type())
-            {
-            case TensorType::Q4_K:
-                block_byte_size = sizeof(Q4_KBlock);
-                block_element_size = Q4_KBlock::BLOCK_SIZE;
-                break;
-            case TensorType::Q5_K:
-                block_byte_size = sizeof(Q5_KBlock);
-                block_element_size = Q5_KBlock::BLOCK_SIZE;
-                break;
-            case TensorType::Q6_K:
-                block_byte_size = sizeof(Q6_KBlock);
-                block_element_size = Q6_KBlock::BLOCK_SIZE;
-                break;
-            default:
-                LOG_ERROR("[MoE] Unsupported expert tensor type for view extraction: "
-                          << static_cast<int>(tensor_3d->native_type()));
-                return false;
-            }
-
-            size_t blocks_per_row = cols / block_element_size;
-            size_t expert_byte_stride = rows * blocks_per_row * block_byte_size;
+            size_t elements_per_expert = rows * cols;
 
             for (int e = 0; e < n_experts; ++e)
             {
-                size_t byte_offset = static_cast<size_t>(e) * expert_byte_stride;
+                size_t element_offset = static_cast<size_t>(e) * elements_per_expert;
                 std::vector<size_t> view_shape = {rows, cols};
-                auto view = tensor_3d->create_view(view_shape, byte_offset);
+                auto view = tensor_3d->create_view(view_shape, element_offset);
                 if (!view)
                 {
                     LOG_ERROR("[MoE] Failed to create view for expert " << e);
@@ -700,6 +706,20 @@ namespace llaminar2
             info.addWeight("down_exps", params_.down_exps);
         if (params_.output)
             info.addOutput("output", params_.output, params_.seq_len, params_.d_model);
+
+        // Routing data (stashed during execute) — outputs[1..3]
+        if (!router_logits_.empty())
+            info.addOutput("router_logits", router_logits_.data(),
+                           static_cast<size_t>(params_.seq_len),
+                           static_cast<size_t>(params_.num_experts));
+        if (!routing_indices_f32_.empty())
+            info.addOutput("routing_indices", routing_indices_f32_.data(),
+                           static_cast<size_t>(params_.seq_len),
+                           static_cast<size_t>(params_.top_k));
+        if (!routing_weights_.empty())
+            info.addOutput("routing_weights", routing_weights_.data(),
+                           static_cast<size_t>(params_.seq_len),
+                           static_cast<size_t>(params_.top_k));
 
         info.addScalarInt("num_experts", params_.num_experts);
         info.addScalarInt("top_k", params_.top_k);

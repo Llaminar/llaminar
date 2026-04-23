@@ -111,6 +111,23 @@ namespace llaminar2
             return;
         }
 
+        // Handle fused MoE FFN stage — split into expert output + routing data
+        if (name.find("_moe_ffn") != std::string::npos && dump.outputs.size() >= 4)
+        {
+            size_t pos = name.find("_moe_ffn");
+            std::string prefix = name.substr(0, pos);
+
+            // outputs[0] = expert output [seq_len, d_model]
+            // outputs[1] = router logits [seq_len, num_experts]
+            // outputs[2] = routing indices [seq_len, top_k] (int as float)
+            // outputs[3] = routing weights [seq_len, top_k]
+            storeOutput(prefix + "_MOE_EXPERT_OUTPUT", dump.outputs[0]);
+            storeOutput(prefix + "_MOE_ROUTER_OUTPUT", dump.outputs[1]);
+            storeOutput(prefix + "_MOE_ROUTING_INDICES", dump.outputs[2]);
+            storeOutput(prefix + "_MOE_ROUTING_WEIGHTS", dump.outputs[3]);
+            return;
+        }
+
         // Standard single-output stages
         LOG_DEBUG("[Snapshot] Standard path: stage=" << name
                                                      << " outputs.size=" << dump.outputs.size()
@@ -261,6 +278,11 @@ namespace llaminar2
             {"_swiglu", "_FFN_SWIGLU"},
             {"_down_proj", "_FFN_DOWN"},
             {"_ffn_residual", "_FFN_RESIDUAL"},
+            // MoE stages
+            {"_shared_expert_gate", "_MOE_SHARED_GATE_OUTPUT"},
+            {"_shared_expert", "_MOE_SHARED_EXPERT_OUTPUT"},
+            {"_moe_ffn", "_MOE_EXPERT_OUTPUT"},
+            {"_moe_add", "_MOE_COMBINED_OUTPUT"},
         };
 
         // Global stages

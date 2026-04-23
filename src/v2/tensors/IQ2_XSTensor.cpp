@@ -100,25 +100,46 @@ namespace llaminar2
         {
             throw std::invalid_argument("IQ2_XSTensor::create_view: only 2D views supported");
         }
-        if (new_shape[1] != shape_[1])
+
+        // Compute effective 2D layout (supports both 2D and 3D parents).
+        // GGUF 3D: shape=[ne0, ne1, ne2] where ne0=cols (fastest), ne2=outermost.
+        // Flattened to 2D [ne1*ne2, ne0] = [total_rows, K].
+        size_t K, total_rows;
+        if (shape_.size() == 2)
+        {
+            K = shape_[1];
+            total_rows = shape_[0];
+        }
+        else if (shape_.size() == 3)
+        {
+            // GGUF 3D: shape = [ne[0], ne[1], ne[2]], ne[0] is fastest-varying (cols/K)
+            K = shape_[0];
+            total_rows = shape_[1] * shape_[2];
+        }
+        else
+        {
+            throw std::invalid_argument("IQ2_XSTensor::create_view: parent must be 2D or 3D");
+        }
+
+        if (new_shape[1] != K)
         {
             throw std::invalid_argument("IQ2_XSTensor::create_view: K dimension must match parent");
         }
 
-        if (offset % shape_[1] != 0)
+        if (offset % K != 0)
         {
             throw std::invalid_argument("IQ2_XSTensor::create_view: offset must be row-aligned");
         }
 
-        const size_t offset_rows = offset / shape_[1];
+        const size_t offset_rows = offset / K;
         const size_t view_rows = new_shape[0];
 
-        if (offset_rows + view_rows > shape_[0])
+        if (offset_rows + view_rows > total_rows)
         {
             throw std::out_of_range("IQ2_XSTensor::create_view: view exceeds parent bounds");
         }
 
-        const size_t blocks_per_row = (shape_[1] + IQ2_XSBlock::BLOCK_SIZE - 1) / IQ2_XSBlock::BLOCK_SIZE;
+        const size_t blocks_per_row = (K + IQ2_XSBlock::BLOCK_SIZE - 1) / IQ2_XSBlock::BLOCK_SIZE;
         const size_t bytes_per_row = blocks_per_row * sizeof(IQ2_XSBlock);
         const size_t new_byte_offset = offset_rows * bytes_per_row;
 

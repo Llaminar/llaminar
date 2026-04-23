@@ -105,11 +105,11 @@ namespace llaminar2
     {
         if (shape_.size() != 2 || new_shape.size() != 2)
         {
-            throw std::invalid_argument("Q3_KTensor::create_view: only 2D row-slice views supported");
+            throw std::invalid_argument("Q3_KTensor::create_view: only 2D views supported");
         }
         if (new_shape[1] != shape_[1])
         {
-            throw std::invalid_argument("Q3_KTensor::create_view: column count (K) must match parent");
+            throw std::invalid_argument("Q3_KTensor::create_view: K dimension must match parent");
         }
         if (offset % shape_[1] != 0)
         {

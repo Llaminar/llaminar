@@ -97,6 +97,12 @@ namespace llaminar2
     private:
         Params params_;
 
+        /// Stashed routing results from last execute() — for snapshot capture.
+        /// Stored as FP32 [seq_len, top_k] so buildDumpInfoImpl() can expose them.
+        mutable std::vector<float> routing_indices_f32_;  ///< Expert IDs cast to float
+        mutable std::vector<float> routing_weights_;      ///< Normalized top-k weights
+        mutable std::vector<float> router_logits_;        ///< Raw router logits [seq_len, num_experts]
+
         /// CPU execution path: inline dequantization + scalar GEMV
         bool executeCPU(IDeviceContext *ctx);
 
@@ -109,6 +115,12 @@ namespace llaminar2
             const float *gate_w, int num_experts, int top_k,
             std::vector<int> &expert_indices,
             std::vector<float> &expert_weights) const;
+
+        /// Stash routing results for snapshot capture
+        void stashRoutingResults(
+            const std::vector<int> &expert_indices,
+            const std::vector<float> &expert_weights,
+            int seq_len, int top_k) const;
 
         /// Execute SwiGLU FFN for a single expert on gathered tokens (CPU path)
         bool executeExpertFFN(

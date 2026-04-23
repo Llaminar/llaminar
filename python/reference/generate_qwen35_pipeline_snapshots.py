@@ -119,7 +119,9 @@ def write_metadata(
         f.write(f"d_model: {config.hidden_size}\n")
         head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
         f.write(f"d_head: {head_dim}\n")
-        f.write(f"d_ff: {config.intermediate_size}\n")
+        # MoE configs use moe_intermediate_size instead of intermediate_size
+        d_ff = getattr(config, "intermediate_size", None) or getattr(config, "moe_intermediate_size", 0)
+        f.write(f"d_ff: {d_ff}\n")
         f.write(f"vocab_size: {config.vocab_size}\n")
         f.write(f"prompt: {prompt}\n")
         f.write(f"token_ids: {','.join(map(str, token_ids))}\n")

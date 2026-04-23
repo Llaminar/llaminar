@@ -110,34 +110,54 @@ namespace llaminar2
         const std::vector<size_t> &new_shape,
         size_t offset)
     {
-        // Validation: must be 2D
-        if (shape_.size() != 2 || new_shape.size() != 2)
+        // Validate: view must be 2D
+        if (new_shape.size() != 2)
         {
-            throw std::invalid_argument("Q6_KTensor::create_view: only 2D row-slice views supported");
+            throw std::invalid_argument("Q6_KTensor::create_view: only 2D views supported");
         }
 
-        // Validation: K dimension must match
-        if (new_shape[1] != shape_[1])
+        // Compute effective 2D layout (supports both 2D and 3D parents).
+        // GGUF 3D: shape=[ne0, ne1, ne2] where ne0=cols (fastest), ne2=outermost.
+        // Flattened to 2D [ne1*ne2, ne0] = [total_rows, K].
+        size_t K, total_rows;
+        if (shape_.size() == 2)
         {
-            throw std::invalid_argument("Q6_KTensor::create_view: column count (K) must match parent");
+            K = shape_[1];
+            total_rows = shape_[0];
+        }
+        else if (shape_.size() == 3)
+        {
+            // GGUF 3D: shape = [ne[0], ne[1], ne[2]], ne[0] is fastest-varying (cols/K)
+            K = shape_[0];
+            total_rows = shape_[1] * shape_[2];
+        }
+        else
+        {
+            throw std::invalid_argument("Q6_KTensor::create_view: parent must be 2D or 3D");
         }
 
-        // Validation: offset must be row-aligned
-        if (offset % shape_[1] != 0)
+        // Validate: K dimension must match
+        if (new_shape[1] != K)
+        {
+            throw std::invalid_argument("Q6_KTensor::create_view: K dimension must match parent");
+        }
+
+        // Validate: offset must be row-aligned
+        if (offset % K != 0)
         {
             throw std::invalid_argument("Q6_KTensor::create_view: offset must be row-aligned");
         }
 
-        // Validation: bounds check
-        if (offset + new_shape[0] * new_shape[1] > shape_[0] * shape_[1])
+        // Validate: bounds check
+        size_t total_elements = total_rows * K;
+        if (offset + new_shape[0] * new_shape[1] > total_elements)
         {
             throw std::out_of_range("Q6_KTensor::create_view: view exceeds parent bounds");
         }
 
         // Calculate block offset
-        const size_t cols = shape_[1];
-        const size_t blocks_per_row = (cols + Q6_KBlock::BLOCK_SIZE - 1) / Q6_KBlock::BLOCK_SIZE;
-        const size_t first_row = offset / cols;
+        const size_t blocks_per_row = (K + Q6_KBlock::BLOCK_SIZE - 1) / Q6_KBlock::BLOCK_SIZE;
+        const size_t first_row = offset / K;
         const size_t block_offset = first_row * blocks_per_row;
         const size_t byte_offset = block_offset * sizeof(Q6_KBlock);
 

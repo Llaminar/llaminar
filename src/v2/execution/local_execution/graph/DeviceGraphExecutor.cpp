@@ -977,6 +977,11 @@ namespace llaminar2
         {
             if (profiling)
                 phase_start = std::chrono::high_resolution_clock::now();
+            // Re-fetch dump info post-execute: stages like MoEFFNStage stash
+            // runtime routing data during execute() and invalidate the cache.
+            // Since cached_dump_info aliases the stage's internal cached object,
+            // this getDumpInfo() call rebuilds it with post-execute data.
+            node.stage->getDumpInfo();
             cached_dump_info.ensureOutputsOnHost();
             LOG_DEBUG("[DeviceGraphExecutor::runStage] Invoking callback for " << node.name);
             config_.snapshot_callback(node.name, cached_dump_info);

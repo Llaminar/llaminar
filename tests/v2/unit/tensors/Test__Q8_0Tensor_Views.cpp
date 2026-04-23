@@ -87,22 +87,19 @@ TEST_F(Test__Q8_0Tensor_Views, ViewWithOffset)
 TEST_F(Test__Q8_0Tensor_Views, KDimensionMustMatch)
 {
     auto parent = createTestTensor(10, 64);
-    auto view = parent->create_view({5, 32}, 0);
-    EXPECT_EQ(view, nullptr);
+    EXPECT_THROW(parent->create_view({5, 32}, 0), std::invalid_argument);
 }
 
 TEST_F(Test__Q8_0Tensor_Views, OffsetMustBeRowAligned)
 {
     auto parent = createTestTensor(10, 64);
-    auto view = parent->create_view({5, 64}, 32);
-    EXPECT_EQ(view, nullptr);
+    EXPECT_THROW(parent->create_view({5, 64}, 32), std::invalid_argument);
 }
 
 TEST_F(Test__Q8_0Tensor_Views, ViewBoundsChecking)
 {
     auto parent = createTestTensor(10, 64);
-    auto view = parent->create_view({8, 64}, 5 * 64);
-    EXPECT_EQ(view, nullptr);
+    EXPECT_THROW(parent->create_view({8, 64}, 5 * 64), std::out_of_range);
 }
 
 TEST_F(Test__Q8_0Tensor_Views, ViewLifetime)
@@ -149,4 +146,49 @@ TEST_F(Test__Q8_0Tensor_Views, IBlockDecoderInterface)
     {
         EXPECT_FLOAT_EQ(view_block[i], parent_block[i]);
     }
+}
+
+// --- 3D Parent → 2D View regression tests ---
+
+TEST_F(Test__Q8_0Tensor_Views, View3DParentBasicSlice)
+{
+    // 3D GGUF shape: [cols=128(ne[0]), rows_per_expert=8(ne[1]), num_experts=4(ne[2])]
+    const size_t N = 4, R = 8, K = 128;
+    const size_t blocks_per_row = K / Q8_0Block::BLOCK_SIZE;
+    const size_t total_blocks = N * R * blocks_per_row;
+    std::vector<uint8_t> raw(total_blocks * sizeof(Q8_0Block));
+    auto tensor_3d = std::make_shared<Q8_0Tensor>(std::vector<size_t>{K, R, N}, raw);
+
+    // Extract expert 0 as 2D view
+    auto view = tensor_3d->create_view({R, K}, 0);
+    ASSERT_NE(view, nullptr);
+    EXPECT_EQ(view->shape()[0], R);
+    EXPECT_EQ(view->shape()[1], K);
+}
+
+TEST_F(Test__Q8_0Tensor_Views, View3DParentWithOffset)
+{
+    const size_t N = 4, R = 8, K = 128;
+    const size_t blocks_per_row = K / Q8_0Block::BLOCK_SIZE;
+    const size_t total_blocks = N * R * blocks_per_row;
+    std::vector<uint8_t> raw(total_blocks * sizeof(Q8_0Block));
+    auto tensor_3d = std::make_shared<Q8_0Tensor>(std::vector<size_t>{K, R, N}, raw);
+
+    // Extract expert 2 (middle expert)
+    auto view = tensor_3d->create_view({R, K}, 2 * R * K);
+    ASSERT_NE(view, nullptr);
+    EXPECT_EQ(view->shape()[0], R);
+    EXPECT_EQ(view->shape()[1], K);
+}
+
+TEST_F(Test__Q8_0Tensor_Views, View3DParentBoundsCheck)
+{
+    const size_t N = 4, R = 8, K = 128;
+    const size_t blocks_per_row = K / Q8_0Block::BLOCK_SIZE;
+    const size_t total_blocks = N * R * blocks_per_row;
+    std::vector<uint8_t> raw(total_blocks * sizeof(Q8_0Block));
+    auto tensor_3d = std::make_shared<Q8_0Tensor>(std::vector<size_t>{K, R, N}, raw);
+
+    // View starting at row 25 with 8 rows needs rows 25-32, but total is 32 → overflow
+    EXPECT_THROW(tensor_3d->create_view({R, K}, (N * R - R + 1) * K), std::out_of_range);
 }

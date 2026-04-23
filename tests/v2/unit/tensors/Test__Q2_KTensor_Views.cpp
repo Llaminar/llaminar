@@ -208,3 +208,50 @@ TEST(Test__Q2_KTensor, SuperBlockAlignment)
     const size_t expected_blocks_per_row = (300 + 255) / 256;
     EXPECT_EQ(expected_blocks_per_row, 2);
 }
+
+// --- 3D Parent → 2D View regression tests ---
+// NOTE: Q2_KTensor::create_view does not yet support 3D parents.
+// These tests verify the rejection and will be updated when 3D support is added.
+
+TEST(Test__Q2_KTensor, View3DParentBasicSlice)
+{
+    // 3D GGUF shape: [cols=512(ne[0]), rows_per_expert=8(ne[1]), num_experts=4(ne[2])]
+    const size_t N = 4, R = 8, K = 512;
+    const size_t blocks_per_row = K / 256;
+    const size_t total_blocks = N * R * blocks_per_row;
+    std::vector<uint8_t> raw(total_blocks * sizeof(Q2_KBlock));
+    auto tensor_3d = std::make_shared<Q2_KTensor>(std::vector<size_t>{K, R, N}, raw);
+
+    // Q2_K doesn't support 3D parents yet - should throw
+    EXPECT_THROW(
+        tensor_3d->create_view({R, K}, 0),
+        std::invalid_argument);
+}
+
+TEST(Test__Q2_KTensor, View3DParentWithOffset)
+{
+    const size_t N = 4, R = 8, K = 512;
+    const size_t blocks_per_row = K / 256;
+    const size_t total_blocks = N * R * blocks_per_row;
+    std::vector<uint8_t> raw(total_blocks * sizeof(Q2_KBlock));
+    auto tensor_3d = std::make_shared<Q2_KTensor>(std::vector<size_t>{K, R, N}, raw);
+
+    // Q2_K doesn't support 3D parents yet - should throw
+    EXPECT_THROW(
+        tensor_3d->create_view({R, K}, 2 * R * K),
+        std::invalid_argument);
+}
+
+TEST(Test__Q2_KTensor, View3DParentBoundsCheck)
+{
+    const size_t N = 4, R = 8, K = 512;
+    const size_t blocks_per_row = K / 256;
+    const size_t total_blocks = N * R * blocks_per_row;
+    std::vector<uint8_t> raw(total_blocks * sizeof(Q2_KBlock));
+    auto tensor_3d = std::make_shared<Q2_KTensor>(std::vector<size_t>{K, R, N}, raw);
+
+    // Q2_K doesn't support 3D parents yet - should throw
+    EXPECT_THROW(
+        tensor_3d->create_view({R, K}, (N * R - R + 1) * K),
+        std::invalid_argument);
+}

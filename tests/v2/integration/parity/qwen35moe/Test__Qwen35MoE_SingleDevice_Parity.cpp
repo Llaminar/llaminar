@@ -1,0 +1,233 @@
+/**
+ * @file Test__Qwen35MoE_SingleDevice_Parity.cpp
+ * @brief Single-device Qwen3.5 MoE parity tests (CPU, CUDA, ROCm)
+ *
+ * Tests that single-device Qwen3.5 MoE inference produces results matching
+ * PyTorch reference outputs. Validates:
+ *   - GDN (Gated Delta Network) layer integration (same as dense Qwen3.5)
+ *   - Full Attention layer integration (same as dense Qwen3.5)
+ *   - MoE Router: softmax top-k expert selection (256 experts, top-8)
+ *   - MoE Expert FFN: per-expert SwiGLU + weighted combine
+ *   - Shared Expert: always-active dense SwiGLU + sigmoid gate
+ *   - MoE Combined Output: routed + gated shared expert
+ *   - Residual connections across the MoE FFN block
+ *
+ * Configurations:
+ *   - CPU: Full-precision baseline with FP16 KV cache
+ *   - CUDA: Single NVIDIA GPU (SKIP for now — model too large for single 3090)
+ *   - ROCm: Single AMD GPU (SKIP for now — requires testing)
+ *
+ * Model: Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf at /opt/llaminar-models/
+ *   - Q4_K/Q5_K/Q6_K quantization (expect wider tolerances than Q8_0)
+ *   - 40 layers, 256 experts (top-8), 2048 hidden dim, 512 expert intermediate
+ *
+ * NOTE: Thresholds are intentionally loose (diagnostic mode) — the primary goal
+ * is to identify WHERE drift occurs between Llaminar and PyTorch, not to gate on
+ * a tight tolerance. Tighten once baseline numbers are established.
+ *
+ * @author David Sanftenberg
+ * @date 2026
+ */
+
+#include <gtest/gtest.h>
+#include <mpi.h>
+#include <unistd.h>
+#include "Qwen35MoEParityTestBase.h"
+#include "collective/BackendRouter.h"
+#include "backends/GPUDeviceContextPool.h"
+
+using namespace llaminar2;
+using namespace llaminar2::test::parity;
+using namespace llaminar2::test::parity::qwen35moe;
+
+// =============================================================================
+// Test Configuration Definitions
+// =============================================================================
+
+// NOTE: Qwen3.5-35B MoE uses mixed Q4_K/Q5_K/Q6_K quantization which diverges
+// more from FP32 reference than Q8_0. Additionally:
+// - MoE routing introduces discrete expert selection (potential divergence source)
+// - GDN layers use recurrent delta-rule (accumulates numerical differences)
+// - 35B model with 256 experts — large model increases error accumulation
+// Thresholds are set very conservatively for initial diagnostic characterization.
+
+static const std::vector<TestConfig> kQwen35MoESingleDeviceConfigs = {
+    // =========================================================================
+    // Qwen3.5-35B MoE (Q4_K_XL) — CPU baseline
+    //
+    // This is the primary diagnostic configuration. CPU execution is fully
+    // deterministic and exercises the scalar reference MoEFFNStage code path.
+    // The model is at /opt/llaminar-models/ (not in the models/ workspace dir).
+    //
+    // Expert routing: 256 experts, top-8 selection, norm_topk_prob=true
+    // Shared expert: always-active with sigmoid gate
+    // =========================================================================
+    {
+        .name = "Qwen35MoE_35B_CPU_KV_FP16",
+        .devices = {ParityDeviceType::CPU},
+        .parallelism = Parallelism::None,
+        .collective = Collective::None,
+        .thresholds = {
+            .cosine_threshold = 0.80f,        // Diagnostic — very loose
+            .decode_cosine_threshold = 0.70f, // Diagnostic — MoE + GDN drift
+            .early_layers_count = 6,
+            .min_early_layers_passed = 2,     // Diagnostic — just want to see numbers
+            .kl_threshold = 0.50f,            // Diagnostic — characterize, don't gate
+            .min_top1_accuracy = 0.0f,        // Disabled — diagnostic mode
+            .min_top5_accuracy = 0.0f,        // Disabled — diagnostic mode
+            .pytorch_top1_in_topk = 0,        // Disabled — diagnostic mode
+        },
+        .model_path = "/opt/llaminar-models/Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf",
+        .snapshot_dir = "pytorch_qwen35_moe_snapshots",
+        .activation_precision = ActivationPrecision::FP32,
+        .kv_cache_precision = KVCachePrecision::FP16,
+    },
+    // =========================================================================
+    // Qwen3.5-35B MoE (Q4_K_XL) — CUDA single GPU
+    //
+    // SKIP: The 35B model needs ~21GB for weights alone. Single RTX 3090 (24GB)
+    // may not have headroom for activations + KV cache. Enable once weight
+    // streaming or a smaller MoE checkpoint is available.
+    // =========================================================================
+    {
+        .name = "Qwen35MoE_35B_CUDA_KV_FP16",
+        .devices = {ParityDeviceType::CUDA},
+        .parallelism = Parallelism::None,
+        .collective = Collective::None,
+        .thresholds = {
+            .cosine_threshold = 0.80f,
+            .decode_cosine_threshold = 0.70f,
+            .early_layers_count = 6,
+            .min_early_layers_passed = 2,
+            .kl_threshold = 0.50f,
+            .min_top1_accuracy = 0.0f,
+            .min_top5_accuracy = 0.0f,
+            .pytorch_top1_in_topk = 0,
+        },
+        .model_path = "/opt/llaminar-models/Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf",
+        .snapshot_dir = "pytorch_qwen35_moe_snapshots",
+        .activation_precision = ActivationPrecision::FP32,
+        .kv_cache_precision = KVCachePrecision::FP16,
+    },
+    // =========================================================================
+    // Qwen3.5-35B MoE (Q4_K_XL) — ROCm single GPU
+    //
+    // SKIP: Same memory concerns as CUDA. Enable once validated.
+    // =========================================================================
+    {
+        .name = "Qwen35MoE_35B_ROCm_KV_FP16",
+        .devices = {ParityDeviceType::ROCm},
+        .parallelism = Parallelism::None,
+        .collective = Collective::None,
+        .thresholds = {
+            .cosine_threshold = 0.80f,
+            .decode_cosine_threshold = 0.70f,
+            .early_layers_count = 6,
+            .min_early_layers_passed = 2,
+            .kl_threshold = 0.50f,
+            .min_top1_accuracy = 0.0f,
+            .min_top5_accuracy = 0.0f,
+            .pytorch_top1_in_topk = 0,
+        },
+        .model_path = "/opt/llaminar-models/Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf",
+        .snapshot_dir = "pytorch_qwen35_moe_snapshots",
+        .activation_precision = ActivationPrecision::FP32,
+        .kv_cache_precision = KVCachePrecision::FP16,
+    },
+};
+
+// =============================================================================
+// Parameterized Test Fixture
+// =============================================================================
+
+class Qwen35MoESingleDeviceParityTest
+    : public Qwen35MoEConfigDrivenParityTest<Qwen35MoESingleDeviceParityTest>,
+      public ::testing::WithParamInterface<TestConfig>
+{
+public:
+    const TestConfig &getTestConfig() const { return GetParam(); }
+};
+
+// =============================================================================
+// Test Cases
+// =============================================================================
+
+TEST_P(Qwen35MoESingleDeviceParityTest, PrefillParity)
+{
+    auto summary = runSingleDevicePrefillParity();
+    assertParity(summary);
+}
+
+TEST_P(Qwen35MoESingleDeviceParityTest, DecodeParity)
+{
+    auto summary = runSingleDeviceDecodeParity();
+    assertDecodeParity(summary);
+}
+
+TEST_P(Qwen35MoESingleDeviceParityTest, SnapshotInfrastructure)
+{
+    ASSERT_TRUE(setupPipeline()) << "Pipeline setup failed";
+
+    auto embedding = loadPyTorchSnapshot("EMBEDDING");
+    ASSERT_FALSE(embedding.empty()) << "Failed to load EMBEDDING snapshot";
+
+    ASSERT_TRUE(runner_ != nullptr);
+    runner_->forward(config_.token_ids.data(), config_.token_ids.size());
+
+    auto keys = runner_->getSnapshotKeys();
+    EXPECT_GT(keys.size(), 0) << "No snapshots captured";
+
+    bool has_embedding = std::find(keys.begin(), keys.end(), "EMBEDDING") != keys.end();
+    bool has_lm_head = std::find(keys.begin(), keys.end(), "LM_HEAD") != keys.end();
+    EXPECT_TRUE(has_embedding) << "Missing EMBEDDING snapshot";
+    EXPECT_TRUE(has_lm_head) << "Missing LM_HEAD snapshot";
+
+    // MoE-specific: verify that FFN_RESIDUAL snapshots exist (MoE combined output + residual)
+    bool has_ffn_residual = false;
+    for (const auto &key : keys)
+    {
+        if (key.find("FFN_RESIDUAL") != std::string::npos)
+        {
+            has_ffn_residual = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(has_ffn_residual) << "Missing FFN_RESIDUAL snapshot (MoE combined output path)";
+}
+
+// =============================================================================
+// Test Instantiation
+// =============================================================================
+
+INSTANTIATE_TEST_SUITE_P(
+    Qwen35MoE,
+    Qwen35MoESingleDeviceParityTest,
+    ::testing::ValuesIn(kQwen35MoESingleDeviceConfigs),
+    [](const ::testing::TestParamInfo<TestConfig> &info)
+    {
+        return info.param.name;
+    });
+
+// =============================================================================
+// Custom Main with MPI Initialization
+// =============================================================================
+
+int main(int argc, char **argv)
+{
+    int provided;
+    MPI_Init_thread(&argc, &argv, MPI_THREAD_MULTIPLE, &provided);
+    ::testing::InitGoogleTest(&argc, argv);
+    int result = RUN_ALL_TESTS();
+
+    // CRITICAL: Shutdown GlobalBackendRouter before MPI_Finalize to ensure
+    // NCCLCoordinator cleanup happens while CUDA runtime is still active.
+    GlobalBackendRouter::shutdown();
+    GPUDeviceContextPool::instance().shutdown();
+
+    MPI_Finalize();
+
+    // Skip static destructors — avoid CUDA/ROCm atexit races.
+    std::cout.flush();
+    std::cerr.flush();
+    _exit(result);
+}

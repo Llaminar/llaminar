@@ -49,13 +49,15 @@ protected:
         cpu_ctx_ = std::make_unique<MockDeviceContext>(DeviceId::cpu(), ComputeBackendType::CPU);
     }
 
-    /// Create a 3D Q4_K expert tensor [num_experts, rows, cols]
-    /// where cols must be a multiple of 256 (Q4_K block size)
+    /// Create a 3D Q4_K expert tensor in GGUF layout [cols, rows, num_experts]
+    /// where cols (ne[0]) must be a multiple of 256 (Q4_K block size)
+    /// Memory: ne[0]=cols is fastest-varying, ne[2]=num_experts is slowest
     std::unique_ptr<Q4_KTensor> createExpertQ4K(int num_experts, int rows, int cols, uint32_t seed = 42)
     {
-        std::vector<size_t> shape = {static_cast<size_t>(num_experts),
+        // GGUF 3D convention: shape = [ne[0]=cols, ne[1]=rows, ne[2]=num_experts]
+        std::vector<size_t> shape = {static_cast<size_t>(cols),
                                      static_cast<size_t>(rows),
-                                     static_cast<size_t>(cols)};
+                                     static_cast<size_t>(num_experts)};
         size_t blocks_per_row = cols / Q4_KBlock::BLOCK_SIZE;
         size_t total_blocks = num_experts * rows * blocks_per_row;
         std::vector<uint8_t> raw(total_blocks * sizeof(Q4_KBlock));
@@ -85,13 +87,15 @@ protected:
         return std::make_unique<Q4_KTensor>(shape, raw);
     }
 
-    /// Create a 3D Q5_K expert tensor [num_experts, rows, cols]
-    /// where cols must be a multiple of 256 (Q5_K block size)
+    /// Create a 3D Q5_K expert tensor in GGUF layout [cols, rows, num_experts]
+    /// where cols (ne[0]) must be a multiple of 256 (Q5_K block size)
+    /// Memory: ne[0]=cols is fastest-varying, ne[2]=num_experts is slowest
     std::unique_ptr<Q5_KTensor> createExpertQ5K(int num_experts, int rows, int cols, uint32_t seed = 42)
     {
-        std::vector<size_t> shape = {static_cast<size_t>(num_experts),
+        // GGUF 3D convention: shape = [ne[0]=cols, ne[1]=rows, ne[2]=num_experts]
+        std::vector<size_t> shape = {static_cast<size_t>(cols),
                                      static_cast<size_t>(rows),
-                                     static_cast<size_t>(cols)};
+                                     static_cast<size_t>(num_experts)};
         size_t blocks_per_row = cols / Q5_KBlock::BLOCK_SIZE;
         size_t total_blocks = num_experts * rows * blocks_per_row;
         std::vector<uint8_t> raw(total_blocks * sizeof(Q5_KBlock));

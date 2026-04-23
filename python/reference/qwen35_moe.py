@@ -349,12 +349,21 @@ class Qwen35MoEReferenceModel(HuggingFaceReferenceModel):
             # --- MoE FFN hooks ---
             moe_block = layer.mlp
 
-            # Router output (gate)
+            # Router output (gate) + routing indices and weights
             def _router(mod, inp, out, i=idx):
-                if self._should_capture(PipelineStage.MOE_ROUTER_OUTPUT):
+                if isinstance(out, tuple) and len(out) >= 3:
                     # gate returns (router_logits, routing_weights, selected_experts)
+                    if self._should_capture(PipelineStage.MOE_ROUTER_OUTPUT):
+                        self.capture_stage(PipelineStage.MOE_ROUTER_OUTPUT, out[0], i)
+                    if self._should_capture(PipelineStage.MOE_ROUTING_WEIGHTS):
+                        self.capture_stage(PipelineStage.MOE_ROUTING_WEIGHTS, out[1], i)
+                    if self._should_capture(PipelineStage.MOE_ROUTING_INDICES):
+                        # selected_experts is int64 — store as float for snapshot compat
+                        self.capture_stage(PipelineStage.MOE_ROUTING_INDICES, out[2].float(), i)
+                else:
                     router_logits = out[0] if isinstance(out, tuple) else out
-                    self.capture_stage(PipelineStage.MOE_ROUTER_OUTPUT, router_logits, i)
+                    if self._should_capture(PipelineStage.MOE_ROUTER_OUTPUT):
+                        self.capture_stage(PipelineStage.MOE_ROUTER_OUTPUT, router_logits, i)
             self._hook_handles.append(
                 moe_block.gate.register_forward_hook(_router)
             )
@@ -376,9 +385,25 @@ class Qwen35MoEReferenceModel(HuggingFaceReferenceModel):
             )
 
             # Shared expert gate (sigmoid scaling)
+            # Capture the GATED result: sigmoid(gate_logit) * shared_expert_output
+            # to match Llaminar's SharedExpertGateStage output [seq, d_model].
+            # The shared_expert hook fires before this one, so MOE_SHARED_EXPERT_OUTPUT
+            # is already captured in self.snapshots.
             def _shared_gate(mod, inp, out, i=idx):
                 if self._should_capture(PipelineStage.MOE_SHARED_GATE_OUTPUT):
-                    self.capture_stage(PipelineStage.MOE_SHARED_GATE_OUTPUT, out, i)
+                    import torch.nn.functional as F
+                    gate_weight = F.sigmoid(out)  # [seq, 1]
+                    shared_key = (PipelineStage.MOE_SHARED_EXPERT_OUTPUT, i)
+                    if shared_key in self.snapshots:
+                        shared_np = self.snapshots[shared_key]
+                        shared_t = torch.from_numpy(shared_np).to(gate_weight.device)
+                        if shared_t.dim() == 2 and gate_weight.dim() == 2:
+                            gated = shared_t * gate_weight  # [seq, d_model] * [seq, 1] broadcast
+                            self.capture_stage(PipelineStage.MOE_SHARED_GATE_OUTPUT, gated, i)
+                        else:
+                            self.capture_stage(PipelineStage.MOE_SHARED_GATE_OUTPUT, out, i)
+                    else:
+                        self.capture_stage(PipelineStage.MOE_SHARED_GATE_OUTPUT, out, i)
             self._hook_handles.append(
                 moe_block.shared_expert_gate.register_forward_hook(_shared_gate)
             )

@@ -3114,6 +3114,54 @@ add_v2_test(V2_Unit_Q8_K_Views
     LABELS "V2;Unit;TensorOperations;Q8_K;Quantization;ViewSupport;RowSlice;KQuant;SuperBlock"
 )
 
+# Test: Q5_0 Tensor Views
+add_executable(v2_test_q5_0_views unit/tensors/Test__Q5_0Tensor_Views.cpp)
+target_link_libraries(v2_test_q5_0_views 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_Q5_0_Views 
+    COMMAND $<TARGET_FILE:v2_test_q5_0_views>
+    LABELS "V2;Unit;TensorOperations;Q5_0;Quantization;ViewSupport;RowSlice"
+)
+
+# Test: Q5_1 Tensor Views
+add_executable(v2_test_q5_1_views unit/tensors/Test__Q5_1Tensor_Views.cpp)
+target_link_libraries(v2_test_q5_1_views 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_Q5_1_Views 
+    COMMAND $<TARGET_FILE:v2_test_q5_1_views>
+    LABELS "V2;Unit;TensorOperations;Q5_1;Quantization;ViewSupport;RowSlice"
+)
+
+# Test: Q8_1 Tensor Views
+add_executable(v2_test_q8_1_views unit/tensors/Test__Q8_1Tensor_Views.cpp)
+target_link_libraries(v2_test_q8_1_views 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_Q8_1_Views 
+    COMMAND $<TARGET_FILE:v2_test_q8_1_views>
+    LABELS "V2;Unit;TensorOperations;Q8_1;Quantization;ViewSupport;RowSlice"
+)
+
+# Test: Q16_1 Tensor Views
+add_executable(v2_test_q16_1_views unit/tensors/Test__Q16_1Tensor_Views.cpp)
+target_link_libraries(v2_test_q16_1_views 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_Q16_1_Views 
+    COMMAND $<TARGET_FILE:v2_test_q16_1_views>
+    LABELS "V2;Unit;TensorOperations;Q16_1;Quantization;ViewSupport;RowSlice"
+)
+
 # =============================================================================
 # SIMD Path Equivalency Tests (Phase 1: Q4_0, Q4_1, Q5_0, Q5_1, Q6_K)
 # =============================================================================
@@ -4531,6 +4579,45 @@ if(ZLIB_FOUND)
     )
 
     message(STATUS "V2: Qwen3.5 NodeLocalPP parity tests enabled (requires mpirun -np 2+)")
+
+    # =========================================================================
+    # Test: Qwen3.5 MoE Parity (Mixture-of-Experts variant)
+    #
+    # Parity tests for Qwen3.5 MoE (35B-A3B) which replaces dense SwiGLU FFN
+    # with SparseMoeBlock: router (256 experts, top-8) + shared expert.
+    # Attention architecture (GDN + FA hybrid) is identical to dense Qwen3.5.
+    #
+    # Model: /opt/llaminar-models/Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf
+    #   - Q4_K/Q5_K/Q6_K mixed quantization, 40 layers, 2048 hidden dim
+    #   - 256 experts × 512 intermediate + 1 shared expert
+    #
+    # Validates:
+    #   - MoE routing (softmax top-k expert selection)
+    #   - Per-expert SwiGLU FFN (dequant from 3D packed tensors)
+    #   - Shared expert + sigmoid gate
+    #   - MoE combined output (routed + gated shared)
+    #   - End-to-end token prediction quality
+    # =========================================================================
+
+    # ---- Single-Device MoE Parity (CPU, CUDA, ROCm) ----
+    add_executable(v2_integration_parity_qwen35moe_single_device
+        integration/parity/qwen35moe/Test__Qwen35MoE_SingleDevice_Parity.cpp
+        ${WORKSPACE_ROOT_PARITY}/external/cnpy/cnpy.cpp
+    )
+    target_link_libraries(v2_integration_parity_qwen35moe_single_device
+        llaminar2_core v2_test_utils GTest::gtest ZLIB::ZLIB
+    )
+    target_include_directories(v2_integration_parity_qwen35moe_single_device PRIVATE
+        ${WORKSPACE_ROOT_PARITY}/external/cnpy
+        ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    discover_v2_parity_tests(v2_integration_parity_qwen35moe_single_device
+        TEST_PREFIX V2_Integration_Parity_Qwen35MoE_SingleDevice
+        LABELS "V2;Integration;Parity;Qwen35MoE;MixtureOfExperts;GatedDeltaNet;CPU;CUDA;ROCm;SingleDevice;PyTorch;GoldenReference;FullModel"
+        MPI_PROCS 1
+    )
+
+    message(STATUS "V2: Qwen3.5 MoE SingleDevice parity tests enabled")
 
     # =========================================================================
     # Test: Qwen2 NodeLocalTP Parity (Multi-Socket CPU TP)

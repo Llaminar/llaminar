@@ -162,23 +162,69 @@ namespace llaminar2
     {
         if (new_shape.size() != 2)
         {
-            throw std::invalid_argument("Q5_1Tensor view requires 2D shape");
+            throw std::invalid_argument("Q5_1Tensor::create_view: only 2D views supported");
+        }
+
+        // Compute effective 2D layout (supports both 2D and 3D parents).
+        // GGUF 3D: shape=[ne0, ne1, ne2] where ne0=cols (fastest), ne2=outermost.
+        // Flattened to 2D [ne1*ne2, ne0] = [total_rows, K].
+        size_t K, total_rows;
+        if (shape_.size() == 2)
+        {
+            K = shape_[1];
+            total_rows = shape_[0];
+        }
+        else if (shape_.size() == 3)
+        {
+            // GGUF 3D: shape = [ne[0], ne[1], ne[2]], ne[0] is fastest-varying (cols/K)
+            K = shape_[0];
+            total_rows = shape_[1] * shape_[2];
+        }
+        else
+        {
+            throw std::invalid_argument("Q5_1Tensor::create_view: parent must be 2D or 3D");
+        }
+
+        // Validate: K dimension must match
+        if (new_shape[1] != K)
+        {
+            throw std::invalid_argument("Q5_1Tensor::create_view: K dimension must match parent");
         }
 
         // Row-slice only: offset must be row-aligned
-        if (offset % shape_[1] != 0)
+        if (offset % K != 0)
         {
-            throw std::invalid_argument("Q5_1Tensor view offset must be row-aligned");
+            throw std::invalid_argument("Q5_1Tensor::create_view: offset must be row-aligned");
         }
 
-        const size_t row_offset = offset / shape_[1];
-        const size_t blocks_per_row = (shape_[1] + Q5_1Block::BLOCK_SIZE - 1) / Q5_1Block::BLOCK_SIZE;
-        const size_t byte_offset = row_offset * blocks_per_row * sizeof(Q5_1Block);
+        // Validate: view must fit within parent bounds
+        const size_t start_row = offset / K;
+        const size_t end_row = start_row + new_shape[0];
+        if (end_row > total_rows)
+        {
+            throw std::out_of_range("Q5_1Tensor::create_view: view exceeds parent bounds");
+        }
 
-        const uint8_t *parent_data = is_view_ ? raw_data_ptr_ : raw_data_.data();
-        std::shared_ptr<TensorBase> parent = is_view_ ? parent_ : std::static_pointer_cast<TensorBase>(shared_from_this());
+        const size_t blocks_per_row = (K + Q5_1Block::BLOCK_SIZE - 1) / Q5_1Block::BLOCK_SIZE;
+        size_t byte_offset = start_row * blocks_per_row * sizeof(Q5_1Block);
 
-        return std::shared_ptr<Q5_1Tensor>(new Q5_1Tensor(new_shape, parent_data, byte_offset, parent));
+        const uint8_t *base_ptr;
+        std::shared_ptr<TensorBase> root_parent;
+
+        if (is_view_)
+        {
+            // Chain views: add offsets
+            byte_offset += view_byte_offset_;
+            base_ptr = raw_data_ptr_;
+            root_parent = parent_;
+        }
+        else
+        {
+            base_ptr = raw_data_.data();
+            root_parent = std::static_pointer_cast<TensorBase>(shared_from_this());
+        }
+
+        return std::shared_ptr<Q5_1Tensor>(new Q5_1Tensor(new_shape, base_ptr, byte_offset, root_parent));
     }
 
     void Q5_1Tensor::decodeBlock(const Q5_1Block &block, float *output)

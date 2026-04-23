@@ -557,62 +557,73 @@ namespace llaminar2
         const std::vector<size_t> &new_shape,
         size_t offset)
     {
+        // Validate: view must be 2D
         if (new_shape.size() != 2)
         {
-            LOG_ERROR("[Q16_1Tensor::create_view] ERROR: View must be 2D (got "
-                      << new_shape.size() << "D)");
-            return nullptr;
+            throw std::invalid_argument("Q16_1Tensor::create_view: only 2D views supported");
         }
 
-        if (new_shape[1] != shape_[1])
+        // Compute effective 2D layout (supports both 2D and 3D parents).
+        // GGUF 3D: shape=[ne0, ne1, ne2] where ne0=cols (fastest), ne2=outermost.
+        // Flattened to 2D [ne1*ne2, ne0] = [total_rows, K].
+        size_t K, total_rows;
+        if (shape_.size() == 2)
         {
-            LOG_ERROR("[Q16_1Tensor::create_view] ERROR: View must preserve K dimension");
-            return nullptr;
+            K = shape_[1];
+            total_rows = shape_[0];
+        }
+        else if (shape_.size() == 3)
+        {
+            // GGUF 3D: shape = [ne[0], ne[1], ne[2]], ne[0] is fastest-varying (cols/K)
+            K = shape_[0];
+            total_rows = shape_[1] * shape_[2];
+        }
+        else
+        {
+            throw std::invalid_argument("Q16_1Tensor::create_view: parent must be 2D or 3D");
         }
 
-        size_t K = shape_[1];
+        // Validation: K dimension must match
+        if (new_shape[1] != K)
+        {
+            throw std::invalid_argument("Q16_1Tensor::create_view: K dimension must match parent");
+        }
 
+        // Validation: offset must be row-aligned
         if (offset % K != 0)
         {
-            LOG_ERROR("[Q16_1Tensor::create_view] ERROR: Offset must be row-aligned");
-            return nullptr;
+            throw std::invalid_argument("Q16_1Tensor::create_view: offset must be row-aligned");
         }
 
+        // Validation: bounds check
         size_t start_row = offset / K;
         size_t view_rows = new_shape[0];
-        if (start_row + view_rows > shape_[0])
+        if (start_row + view_rows > total_rows)
         {
-            LOG_ERROR("[Q16_1Tensor::create_view] ERROR: View exceeds parent bounds");
-            return nullptr;
+            throw std::out_of_range("Q16_1Tensor::create_view: view exceeds parent bounds");
         }
 
+        // Calculate byte offset
         size_t blocks_per_row_ = (K + Q16_1Block::BLOCK_SIZE - 1) / Q16_1Block::BLOCK_SIZE;
         size_t block_offset = start_row * blocks_per_row_;
         size_t byte_offset = block_offset * sizeof(Q16_1Block);
 
-        std::shared_ptr<TensorBase> root_parent;
+        // Determine root parent
         const uint8_t *root_data_ptr;
         size_t root_byte_offset;
+        std::shared_ptr<TensorBase> root_parent;
 
         if (is_view_)
         {
-            root_parent = parent_;
             root_data_ptr = raw_data_ptr_;
             root_byte_offset = view_byte_offset_ + byte_offset;
+            root_parent = parent_;
         }
         else
         {
-            try
-            {
-                root_parent = shared_from_this();
-            }
-            catch (const std::bad_weak_ptr &e)
-            {
-                LOG_ERROR("[Q16_1Tensor::create_view] ERROR: shared_from_this() failed");
-                return nullptr;
-            }
             root_data_ptr = raw_data_.data();
             root_byte_offset = byte_offset;
+            root_parent = std::static_pointer_cast<TensorBase>(shared_from_this());
         }
 
         return std::shared_ptr<Q16_1Tensor>(new Q16_1Tensor(
