@@ -69,9 +69,9 @@ namespace llaminar2
     }
     // Zero-copy constructor for mmap-backed data
     Q3_KTensor::Q3_KTensor(const std::vector<size_t> &shape,
-          const uint8_t *mmap_data,
-          size_t byte_size,
-          std::shared_ptr<void> mmap_lifetime_owner)
+                           const uint8_t *mmap_data,
+                           size_t byte_size,
+                           std::shared_ptr<void> mmap_lifetime_owner)
         : shape_(shape), is_view_(true), raw_data_(), raw_data_ptr_(mmap_data),
           view_byte_offset_(0), parent_(nullptr), mmap_owner_(std::move(mmap_lifetime_owner)),
           data_byte_size_(byte_size), device_(DeviceId::cpu()), device_blocks_(nullptr)
@@ -97,7 +97,6 @@ namespace llaminar2
                                         std::to_string(expected_bytes) + ")");
         }
     }
-
 
     std::shared_ptr<TensorBase> Q3_KTensor::create_view(
         const std::vector<size_t> &new_shape,
@@ -417,7 +416,6 @@ namespace llaminar2
 #endif
 
     Q3_KTensor::~Q3_KTensor() {}
-
 
     const float *Q3_KTensor::data() const
     {
@@ -789,7 +787,6 @@ namespace llaminar2
         to_fp32(temp_fp32.data());
         std::memcpy(buffer, temp_fp32.data() + offset, count * sizeof(float));
     }
-
 
     void Q3_KTensor::packVnniBlock(const VnniPackContext &ctx, int n, int b) const
     {

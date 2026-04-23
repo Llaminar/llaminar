@@ -133,6 +133,30 @@ namespace llaminar2
              */
             CUDAQuantisedGemmKernel(CUDAPackedWeights *packed, int cuda_device_id);
 
+            /**
+             * @brief Construct kernel from pre-uploaded device pointers (MoE batch path)
+             *
+             * Used for MoE expert weights that are batch-packed and uploaded as a single
+             * contiguous allocation. The kernel references device pointers at calculated
+             * offsets into the shared allocation.
+             *
+             * @param N Output features (rows per expert)
+             * @param K Input features (columns)
+             * @param cuda_device_id CUDA device ID
+             * @param d_vnni Device pointer to NativeVNNI payload for this expert
+             * @param d_scales Device pointer to FP16 scales for this expert
+             * @param d_mins Device pointer to FP16 mins (nullptr if symmetric)
+             * @param d_emins Device pointer to extended mins (nullptr if not needed)
+             * @param codebook_id NativeVNNI codebook identifier
+             * @param blocks_per_row Number of 32-element blocks per row (K/32)
+             * @param lifetime_owner Shared pointer that keeps the GPU allocation alive
+             */
+            CUDAQuantisedGemmKernel(
+                int N, int K, int cuda_device_id,
+                uint8_t *d_vnni, uint16_t *d_scales, uint16_t *d_mins, uint32_t *d_emins,
+                uint8_t codebook_id, uint32_t blocks_per_row,
+                std::shared_ptr<void> lifetime_owner);
+
             ~CUDAQuantisedGemmKernel() override;
 
             // Non-copyable
@@ -467,6 +491,7 @@ namespace llaminar2
 
             const TensorBase *weights_ = nullptr; // Original weight tensor (null if using packed_)
             CUDAPackedWeights *packed_ = nullptr; // Pre-packed weights (owned by tensor cache)
+            std::shared_ptr<void> lifetime_owner_; // Keeps shared MoE batch allocation alive
             int cuda_device_id_;
             size_t N_; // Output features (weight rows)
             size_t K_; // Input features (weight cols)

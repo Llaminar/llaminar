@@ -2345,7 +2345,7 @@ namespace llaminar2::test::parity
             const size_t seq_len = size / static_cast<size_t>(top_k);
             double total_overlap = 0.0;
             double total_rank_corr = 0.0;
-            int position_0_match = 0;  // How often the top-1 expert matches
+            int position_0_match = 0; // How often the top-1 expert matches
 
             for (size_t t = 0; t < seq_len; ++t)
             {
@@ -2363,7 +2363,8 @@ namespace llaminar2::test::parity
                 // Set intersection size
                 int overlap = 0;
                 for (int id : ll_set)
-                    if (pt_set.count(id)) overlap++;
+                    if (pt_set.count(id))
+                        overlap++;
 
                 total_overlap += static_cast<double>(overlap) / top_k;
 
@@ -2444,7 +2445,8 @@ namespace llaminar2::test::parity
                     norm_b += pt_sparse[e] * pt_sparse[e];
                     float diff = std::abs(ll_sparse[e] - pt_sparse[e]);
                     l1 += diff;
-                    if (diff > max_weight_diff) max_weight_diff = diff;
+                    if (diff > max_weight_diff)
+                        max_weight_diff = diff;
                 }
 
                 double denom = std::sqrt(norm_a) * std::sqrt(norm_b);
@@ -2921,7 +2923,7 @@ namespace llaminar2::test::parity
             multi_orch->enableSnapshotCapture();
 
             LOG_INFO("[Parity] RankOrchestrator " << (cfg().is_hybrid_pp_tp() ? "TP_PP" : "PP")
-                                                         << " created with " << num_stages << " stages");
+                                                  << " created with " << num_stages << " stages");
 
             // Transfer ownership to base class runner_
             runner_ = std::move(multi_orch);
@@ -3390,9 +3392,9 @@ namespace llaminar2::test::parity
             if (gdn_cfg.needsPermutation())
             {
                 LOG_INFO("[Parity] GDN V-head permutation active: n_k=" << gdn_cfg.n_k_heads
-                                                                         << " n_v=" << gdn_cfg.n_v_heads
-                                                                         << " d=" << gdn_cfg.d_state
-                                                                         << " heads_per_group=" << gdn_cfg.headsPerGroup());
+                                                                        << " n_v=" << gdn_cfg.n_v_heads
+                                                                        << " d=" << gdn_cfg.d_state
+                                                                        << " heads_per_group=" << gdn_cfg.headsPerGroup());
             }
 
             // Compare each layer
@@ -3438,7 +3440,7 @@ namespace llaminar2::test::parity
                     if (stage == "MOE_ROUTING_INDICES")
                     {
                         result = compareRoutingIndices(compare_data, pytorch_data, llaminar_size,
-                                                      moe_cfg.top_k, stage);
+                                                       moe_cfg.top_k, stage);
                     }
                     else if (stage == "MOE_ROUTING_WEIGHTS")
                     {
@@ -3448,7 +3450,7 @@ namespace llaminar2::test::parity
                         auto pt_idx = loadPyTorchSnapshot(idx_key);
                         if (ll_idx && !pt_idx.empty())
                             result = compareRoutingWeights(compare_data, pytorch_data, ll_idx, pt_idx,
-                                                          llaminar_size, moe_cfg.top_k, moe_cfg.num_experts, stage);
+                                                           llaminar_size, moe_cfg.top_k, moe_cfg.num_experts, stage);
                         else
                             result = compareTensors(compare_data, pytorch_data, llaminar_size, stage);
                     }
@@ -4521,7 +4523,7 @@ namespace llaminar2::test::parity
                             if (stage == "MOE_ROUTING_INDICES")
                             {
                                 result = compareRoutingIndices(decode_compare, pytorch_data, llaminar_size,
-                                                              moe_cfg_decode.top_k, stage);
+                                                               moe_cfg_decode.top_k, stage);
                             }
                             else if (stage == "MOE_ROUTING_WEIGHTS")
                             {
@@ -4531,8 +4533,8 @@ namespace llaminar2::test::parity
                                 auto pt_idx = loadPyTorchSnapshot(idx_key);
                                 if (ll_idx && !pt_idx.empty())
                                     result = compareRoutingWeights(decode_compare, pytorch_data, ll_idx, pt_idx,
-                                                                  llaminar_size, moe_cfg_decode.top_k,
-                                                                  moe_cfg_decode.num_experts, stage);
+                                                                   llaminar_size, moe_cfg_decode.top_k,
+                                                                   moe_cfg_decode.num_experts, stage);
                                 else
                                     result = compareTensors(decode_compare, pytorch_data, llaminar_size, stage);
                             }
@@ -4934,7 +4936,8 @@ namespace llaminar2::test::parity
             exportDecodeCSV(summary);
 
             // Assertions — skip on ranks that lack logit data (PP non-tail ranks)
-            if (!has_logit_data) return;
+            if (!has_logit_data)
+                return;
 
             int min_steps_required = static_cast<int>(summary.steps_total * config_.min_decode_pass_rate);
             EXPECT_GE(summary.steps_passed, min_steps_required)

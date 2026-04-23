@@ -52,7 +52,7 @@ protected:
     /// Create a 3D Q4_K expert tensor in GGUF layout [cols, rows, num_experts]
     /// where cols (ne[0]) must be a multiple of 256 (Q4_K block size)
     /// Memory: ne[0]=cols is fastest-varying, ne[2]=num_experts is slowest
-    std::unique_ptr<Q4_KTensor> createExpertQ4K(int num_experts, int rows, int cols, uint32_t seed = 42)
+    std::shared_ptr<Q4_KTensor> createExpertQ4K(int num_experts, int rows, int cols, uint32_t seed = 42)
     {
         // GGUF 3D convention: shape = [ne[0]=cols, ne[1]=rows, ne[2]=num_experts]
         std::vector<size_t> shape = {static_cast<size_t>(cols),
@@ -84,13 +84,13 @@ protected:
                 blocks[i].scales[j] = static_cast<uint8_t>(rng());
         }
 
-        return std::make_unique<Q4_KTensor>(shape, raw);
+        return std::make_shared<Q4_KTensor>(shape, raw);
     }
 
     /// Create a 3D Q5_K expert tensor in GGUF layout [cols, rows, num_experts]
     /// where cols (ne[0]) must be a multiple of 256 (Q5_K block size)
     /// Memory: ne[0]=cols is fastest-varying, ne[2]=num_experts is slowest
-    std::unique_ptr<Q5_KTensor> createExpertQ5K(int num_experts, int rows, int cols, uint32_t seed = 42)
+    std::shared_ptr<Q5_KTensor> createExpertQ5K(int num_experts, int rows, int cols, uint32_t seed = 42)
     {
         // GGUF 3D convention: shape = [ne[0]=cols, ne[1]=rows, ne[2]=num_experts]
         std::vector<size_t> shape = {static_cast<size_t>(cols),
@@ -114,7 +114,7 @@ protected:
                 blocks[i].scales[j] = static_cast<uint8_t>(rng());
         }
 
-        return std::make_unique<Q5_KTensor>(shape, raw);
+        return std::make_shared<Q5_KTensor>(shape, raw);
     }
 
     /// Compute reference SwiGLU: silu(gate) * up, where silu(x) = x * sigmoid(x)
@@ -416,6 +416,9 @@ TEST_F(MoEFFNStageTest, MoEFFN_OutputNonZero_Q4K)
     params.expert_intermediate = inter;
     params.norm_topk_prob = true;
 
+    // Extract 2D expert views from 3D packed tensors (required by GEMM path)
+    ASSERT_TRUE(MoEFFNStage::extractExpertViews(params));
+
     MoEFFNStage stage(params);
     ASSERT_TRUE(stage.execute(cpu_ctx_.get()));
 
@@ -473,6 +476,8 @@ TEST_F(MoEFFNStageTest, MoEFFN_OutputNonZero_Q5K)
     params.expert_intermediate = inter;
     params.norm_topk_prob = true;
 
+    ASSERT_TRUE(MoEFFNStage::extractExpertViews(params));
+
     MoEFFNStage stage(params);
     ASSERT_TRUE(stage.execute(cpu_ctx_.get()));
 
@@ -522,6 +527,8 @@ TEST_F(MoEFFNStageTest, MoEFFN_MultipleTokens)
     params.top_k = topk;
     params.expert_intermediate = inter;
     params.norm_topk_prob = true;
+
+    ASSERT_TRUE(MoEFFNStage::extractExpertViews(params));
 
     MoEFFNStage stage(params);
     ASSERT_TRUE(stage.execute(cpu_ctx_.get()));
@@ -579,8 +586,8 @@ TEST_F(MoEFFNStageTest, MoEFFN_DifferentTokensGetDifferentOutputs)
     float *inp = input->mutable_data();
     for (int i = 0; i < d; ++i)
     {
-        inp[i] = 1.0f;         // Token 0: all 1s
-        inp[d + i] = -1.0f;    // Token 1: all -1s
+        inp[i] = 1.0f;      // Token 0: all 1s
+        inp[d + i] = -1.0f; // Token 1: all -1s
     }
 
     auto gate_weights = TestTensorFactory::createFP32Random({experts, d}, -0.1f, 0.1f, 501);
@@ -605,6 +612,8 @@ TEST_F(MoEFFNStageTest, MoEFFN_DifferentTokensGetDifferentOutputs)
     params.top_k = topk;
     params.expert_intermediate = inter;
     params.norm_topk_prob = true;
+
+    ASSERT_TRUE(MoEFFNStage::extractExpertViews(params));
 
     MoEFFNStage stage(params);
     ASSERT_TRUE(stage.execute(cpu_ctx_.get()));
@@ -656,6 +665,8 @@ TEST_F(MoEFFNStageTest, MoEFFN_NormTopKProbSumsToOne)
         params.expert_intermediate = inter;
         params.norm_topk_prob = true;
 
+        ASSERT_TRUE(MoEFFNStage::extractExpertViews(params));
+
         MoEFFNStage stage(params);
         ASSERT_TRUE(stage.execute(cpu_ctx_.get()));
     }
@@ -677,6 +688,8 @@ TEST_F(MoEFFNStageTest, MoEFFN_NormTopKProbSumsToOne)
         params.expert_intermediate = inter;
         params.norm_topk_prob = false;
 
+        ASSERT_TRUE(MoEFFNStage::extractExpertViews(params));
+
         MoEFFNStage stage(params);
         ASSERT_TRUE(stage.execute(cpu_ctx_.get()));
     }
@@ -689,8 +702,10 @@ TEST_F(MoEFFNStageTest, MoEFFN_NormTopKProbSumsToOne)
     bool no_norm_nonzero = false;
     for (int i = 0; i < d; ++i)
     {
-        if (norm_out[i] != 0.0f) norm_nonzero = true;
-        if (no_norm_out[i] != 0.0f) no_norm_nonzero = true;
+        if (norm_out[i] != 0.0f)
+            norm_nonzero = true;
+        if (no_norm_out[i] != 0.0f)
+            no_norm_nonzero = true;
     }
     EXPECT_TRUE(norm_nonzero);
     EXPECT_TRUE(no_norm_nonzero);

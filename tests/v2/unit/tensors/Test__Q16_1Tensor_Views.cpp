@@ -17,7 +17,7 @@ class Test__Q16_1Tensor_Views : public ::testing::Test
 protected:
     /**
      * @brief Create a Q16_1 tensor with known pattern for testing
-     * 
+     *
      * Q16_1Block has BLOCK_SIZE=32 with: float d, int32_t sum_qs, int16_t qs[32]
      * Constructor: Q16_1Tensor(shape, raw_data) where shape is 2D {rows, cols}
      * and cols must be divisible by BLOCK_SIZE (32).

@@ -76,9 +76,9 @@ namespace llaminar2
     }
     // Zero-copy constructor for mmap-backed data
     Q6_KTensor::Q6_KTensor(const std::vector<size_t> &shape,
-          const uint8_t *mmap_data,
-          size_t byte_size,
-          std::shared_ptr<void> mmap_lifetime_owner)
+                           const uint8_t *mmap_data,
+                           size_t byte_size,
+                           std::shared_ptr<void> mmap_lifetime_owner)
         : shape_(shape), is_view_(true), raw_data_(), raw_data_ptr_(mmap_data),
           view_byte_offset_(0), parent_(nullptr), mmap_owner_(std::move(mmap_lifetime_owner)),
           data_byte_size_(byte_size), device_(DeviceId::cpu()), device_blocks_(nullptr)
@@ -104,7 +104,6 @@ namespace llaminar2
                                         std::to_string(expected_bytes) + ")");
         }
     }
-
 
     std::shared_ptr<TensorBase> Q6_KTensor::create_view(
         const std::vector<size_t> &new_shape,
@@ -332,7 +331,6 @@ namespace llaminar2
 #endif
 
     Q6_KTensor::~Q6_KTensor() {}
-
 
     const float *Q6_KTensor::data() const
     {
@@ -625,10 +623,18 @@ namespace llaminar2
         {
             switch (sub_in_half)
             {
-            case 0: raw6[l] = (ql[l] & 0xF) | (((qh[l] >> 0) & 3) << 4); break;
-            case 1: raw6[l] = (ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4); break;
-            case 2: raw6[l] = (ql[l] >> 4) | (((qh[l] >> 4) & 3) << 4); break;
-            case 3: raw6[l] = (ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4); break;
+            case 0:
+                raw6[l] = (ql[l] & 0xF) | (((qh[l] >> 0) & 3) << 4);
+                break;
+            case 1:
+                raw6[l] = (ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4);
+                break;
+            case 2:
+                raw6[l] = (ql[l] >> 4) | (((qh[l] >> 4) & 3) << 4);
+                break;
+            case 3:
+                raw6[l] = (ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4);
+                break;
             }
         }
 

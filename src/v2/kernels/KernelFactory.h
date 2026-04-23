@@ -98,6 +98,7 @@ namespace llaminar2
     class ITensorResidualAdd;
     class ITensorAttention;
     class ITensorEmbedding;
+    class IMoEKernel;
     class ITensorFusedQKVGemm;
     class ITensorFusedGateUpGemm;
     class ITensorShortConvolution;
@@ -175,6 +176,7 @@ namespace llaminar
                 EMBEDDING,
                 FUSED_QKV,
                 FUSED_GATE_UP,
+                MOE,
             };
 
             /**
@@ -1102,6 +1104,19 @@ namespace llaminar
                     llaminar2::DeviceId target_device);
 
                 /**
+                 * @brief Get or create a device-scoped MoE kernel
+                 *
+                 * Cache key is target_device only (MoE always operates on FP32).
+                 * Returns a device-appropriate IMoEKernel for routing, gather/scatter,
+                 * shared expert gating, and SwiGLU fallback operations.
+                 *
+                 * @param target_device Target device for execution
+                 * @return Cached or newly created IMoEKernel instance
+                 */
+                static llaminar2::IMoEKernel *getOrCreateMoEKernel(
+                    llaminar2::DeviceId target_device);
+
+                /**
                  * @brief Create RoPE kernel for any tensor type via dynamic dispatch
                  *
                  * Dispatches to the appropriate typed createRoPE overload based on
@@ -1880,6 +1895,25 @@ namespace llaminar
                 static std::unordered_map<ResidualAddCacheKey, std::unique_ptr<llaminar2::ITensorResidualAdd>, ResidualAddCacheKeyHash> residual_add_cache_;
                 static std::unordered_map<AttentionCacheKey, std::unique_ptr<llaminar2::ITensorAttention>, AttentionCacheKeyHash> attention_cache_;
                 static std::unordered_map<EmbeddingCacheKey, std::unique_ptr<llaminar2::ITensorEmbedding>, EmbeddingCacheKeyHash> embedding_cache_;
+
+                // MoE kernel cache — keyed by DeviceId (always FP32, no tensor type variant)
+                struct MoECacheKey
+                {
+                    llaminar2::DeviceId device_id;
+                    bool operator==(const MoECacheKey &other) const
+                    {
+                        return device_id == other.device_id;
+                    }
+                };
+                struct MoECacheKeyHash
+                {
+                    size_t operator()(const MoECacheKey &k) const
+                    {
+                        return std::hash<int>()(static_cast<int>(k.device_id.type)) ^
+                               (std::hash<int>()(k.device_id.ordinal) << 1);
+                    }
+                };
+                static std::unordered_map<MoECacheKey, std::unique_ptr<llaminar2::IMoEKernel>, MoECacheKeyHash> moe_cache_;
 
                 // Generic device-scoped non-GEMM registry
                 static std::unordered_map<DeviceKernelKey, std::shared_ptr<void>, DeviceKernelKeyHash> device_kernel_registry_;

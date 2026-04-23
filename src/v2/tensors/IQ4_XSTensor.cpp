@@ -66,9 +66,9 @@ namespace llaminar2
     }
     // Zero-copy constructor for mmap-backed data
     IQ4_XSTensor::IQ4_XSTensor(const std::vector<size_t> &shape,
-          const uint8_t *mmap_data,
-          size_t byte_size,
-          std::shared_ptr<void> mmap_lifetime_owner)
+                               const uint8_t *mmap_data,
+                               size_t byte_size,
+                               std::shared_ptr<void> mmap_lifetime_owner)
         : shape_(shape), is_view_(true), raw_data_(), raw_data_ptr_(mmap_data),
           view_byte_offset_(0), parent_(nullptr), mmap_owner_(std::move(mmap_lifetime_owner)),
           data_byte_size_(byte_size), device_(DeviceId::cpu()), device_blocks_(nullptr)
@@ -94,7 +94,6 @@ namespace llaminar2
                                         std::to_string(expected_bytes) + ")");
         }
     }
-
 
     // View creation (row-slice only - preserves K dimension)
     std::shared_ptr<TensorBase> IQ4_XSTensor::create_view(
@@ -235,7 +234,6 @@ namespace llaminar2
 #endif
 
     IQ4_XSTensor::~IQ4_XSTensor() {}
-
 
     const float *IQ4_XSTensor::data() const
     {
@@ -471,7 +469,6 @@ namespace llaminar2
         if (mins)
             std::memset(mins, 0, 8 * sizeof(float));
     }
-
 
     void IQ4_XSTensor::packVnniBlock(const VnniPackContext &ctx, int n, int b) const
     {

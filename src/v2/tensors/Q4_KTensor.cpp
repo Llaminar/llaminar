@@ -756,7 +756,6 @@ namespace llaminar2
         simd::decode_q4_k_to_q8_0(block, subblock_idx, output->qs, &output->d);
     }
 
-
     void Q4_KTensor::packVnniBlock(const VnniPackContext &ctx, int n, int b) const
     {
         const size_t linear = vnniLinearIdx(ctx, n, b);

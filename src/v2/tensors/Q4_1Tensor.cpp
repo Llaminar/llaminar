@@ -76,9 +76,9 @@ namespace llaminar2
     }
     // Zero-copy constructor for mmap-backed data
     Q4_1Tensor::Q4_1Tensor(const std::vector<size_t> &shape,
-          const uint8_t *mmap_data,
-          size_t byte_size,
-          std::shared_ptr<void> mmap_lifetime_owner)
+                           const uint8_t *mmap_data,
+                           size_t byte_size,
+                           std::shared_ptr<void> mmap_lifetime_owner)
         : shape_(shape), is_view_(true), raw_data_(), raw_data_ptr_(mmap_data),
           view_byte_offset_(0), parent_(nullptr), mmap_owner_(std::move(mmap_lifetime_owner)),
           data_byte_size_(byte_size), device_(DeviceId::cpu()), device_blocks_(nullptr)
@@ -104,7 +104,6 @@ namespace llaminar2
                                         std::to_string(expected_bytes) + ")");
         }
     }
-
 
     std::shared_ptr<TensorBase> Q4_1Tensor::create_view(
         const std::vector<size_t> &new_shape,
@@ -318,7 +317,6 @@ namespace llaminar2
 #endif
 
     Q4_1Tensor::~Q4_1Tensor() {}
-
 
     const float *Q4_1Tensor::data() const
     {
@@ -615,7 +613,6 @@ namespace llaminar2
 
         return fp16_to_fp32(q4_block.m);
     }
-
 
     void Q4_1Tensor::packVnniBlock(const VnniPackContext &ctx, int n, int b) const
     {

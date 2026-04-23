@@ -632,7 +632,6 @@ namespace llaminar2
         return fp16_to_fp32(q5_block.d);
     }
 
-
     void Q5_0Tensor::packVnniBlock(const VnniPackContext &ctx, int n, int b) const
     {
         const size_t linear = vnniLinearIdx(ctx, n, b);

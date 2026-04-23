@@ -73,9 +73,9 @@ namespace llaminar2
     }
     // Zero-copy constructor for mmap-backed data
     IQ4_NLTensor::IQ4_NLTensor(const std::vector<size_t> &shape,
-          const uint8_t *mmap_data,
-          size_t byte_size,
-          std::shared_ptr<void> mmap_lifetime_owner)
+                               const uint8_t *mmap_data,
+                               size_t byte_size,
+                               std::shared_ptr<void> mmap_lifetime_owner)
         : shape_(shape), is_view_(true), raw_data_(), raw_data_ptr_(mmap_data),
           view_byte_offset_(0), parent_(nullptr), mmap_owner_(std::move(mmap_lifetime_owner)),
           data_byte_size_(byte_size), device_(DeviceId::cpu()), device_blocks_(nullptr)
@@ -101,7 +101,6 @@ namespace llaminar2
                                         std::to_string(expected_bytes) + ")");
         }
     }
-
 
     IQ4_NLTensor::~IQ4_NLTensor()
     {
@@ -206,7 +205,6 @@ namespace llaminar2
     }
 
     // ========== Device Management ==========
-
 
     // ========== Data Access ==========
 
@@ -685,7 +683,6 @@ namespace llaminar2
             output->qs,   // Output: Q8_0 int8 values
             &output->d);  // Output: Q8_0 FP16 scale
     }
-
 
     void IQ4_NLTensor::packVnniBlock(const VnniPackContext &ctx, int n, int b) const
     {

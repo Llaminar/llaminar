@@ -7,8 +7,19 @@
 #include "../../../tensors/Tensors.h"
 #include "../../../tensors/BlockStructures.h"
 #include "../../../kernels/KernelFactory.h"
+#include "../../../kernels/IMoEKernel.h"
 #include "../../../utils/Logger.h"
 #include "../../../utils/OpenMPUtils.h"
+
+#ifdef HAVE_CUDA
+#include "../../../kernels/cuda/gemm/CUDAWeightPacker.h"
+#include "../../../kernels/cuda/gemm/CUDAQuantisedGemmKernel.h"
+#endif
+
+#ifdef HAVE_ROCM
+#include "../../../kernels/rocm/ROCmWeightPacker.h"
+#include "../../../kernels/rocm/gemm/ROCmQuantisedGemmKernel.h"
+#endif
 
 #include <algorithm>
 #include <cmath>
@@ -20,118 +31,40 @@ namespace llaminar2
     // Alias for fully-qualified KernelFactory access
     using KernelFactory = llaminar::v2::kernels::KernelFactory;
 
-    // =========================================================================
-    // Helper: Dequantize a single row from a 3D quantized expert tensor
-    // =========================================================================
-
     namespace
     {
-        /// Get the byte stride per expert for a 3D quantized expert tensor.
-        /// GGUF 3D layout (no swap during loading):
-        ///   shape[0] = ne[0] = fastest-varying = cols_per_expert
-        ///   shape[1] = ne[1] = middle          = rows_per_expert
-        ///   shape[2] = ne[2] = slowest-varying  = num_experts
-        struct ExpertTensorInfo
+        /// Execute SwiGLU activation + Down projection via fused kernel when available,
+        /// falling back to IMoEKernel::swiGLU + separate GEMM when not (e.g., FP32 weights).
+        /// @param gate_tensor [m, intermediate] — gate projection output (modified in-place on fallback)
+        /// @param up_tensor [m, intermediate] — up projection output
+        /// @param output [m, n] — final output
+        /// @param down_gemm GEMM engine for down projection
+        /// @param moe_kernel MoE kernel for SwiGLU fallback
+        /// @param m sequence length / batch size
+        /// @param n output dimension (d_model)
+        /// @param intermediate intermediate dimension
+        void fusedSwigluDown(
+            FP32Tensor *gate_tensor, FP32Tensor *up_tensor, TensorBase *output,
+            ITensorGemm *down_gemm, IMoEKernel *moe_kernel,
+            int m, int n, int intermediate)
         {
-            const void *raw_blocks = nullptr;
-            size_t block_byte_size = 0;      ///< sizeof(BlockType)
-            size_t block_element_size = 0;    ///< elements per block (256 for Q4_K, Q6_K)
-            size_t blocks_per_row = 0;        ///< cols / block_element_size
-            size_t rows_per_expert = 0;       ///< shape[1] = ne[1]
-            size_t cols_per_expert = 0;       ///< shape[0] = ne[0]
-            TensorType tensor_type = TensorType::FP32;
-        };
-
-        bool getExpertTensorInfo(TensorBase *tensor, ExpertTensorInfo &info)
-        {
-            if (!tensor)
-                return false;
-
-            const auto &shape = tensor->shape();
-            if (shape.size() != 3)
+            // Try fused path first (quantized GEMM engines support this)
+            if (down_gemm->multiply_tensor_with_fused_swiglu(
+                    gate_tensor, up_tensor, output,
+                    m, n, intermediate))
             {
-                LOG_ERROR("[MoE] Expert tensor must be 3D, got " << shape.size() << "D");
-                return false;
+                return;
             }
 
-            info.raw_blocks = tensor->raw_data();
-            // GGUF 3D: shape = [ne[0], ne[1], ne[2]] = [cols, rows, num_experts]
-            // ne[0] is fastest-varying (contiguous), ne[2] is slowest (outermost)
-            info.cols_per_expert = shape[0];  // ne[0] = K dimension (d_model or intermediate)
-            info.rows_per_expert = shape[1];  // ne[1] = rows per expert slice
-            info.tensor_type = tensor->native_type();
-
-            switch (info.tensor_type)
-            {
-            case TensorType::Q4_K:
-                info.block_byte_size = sizeof(Q4_KBlock);
-                info.block_element_size = Q4_KBlock::BLOCK_SIZE;
-                break;
-            case TensorType::Q5_K:
-                info.block_byte_size = sizeof(Q5_KBlock);
-                info.block_element_size = Q5_KBlock::BLOCK_SIZE;
-                break;
-            case TensorType::Q6_K:
-                info.block_byte_size = sizeof(Q6_KBlock);
-                info.block_element_size = Q6_KBlock::BLOCK_SIZE;
-                break;
-            default:
-                LOG_ERROR("[MoE] Unsupported expert tensor type: " << static_cast<int>(info.tensor_type));
-                return false;
-            }
-
-            info.blocks_per_row = info.cols_per_expert / info.block_element_size;
-            return true;
+            // Fallback: SwiGLU via device-agnostic kernel, then separate down GEMM
+            float *g = gate_tensor->mutable_data();
+            const float *u = up_tensor->data();
+            const int count = m * intermediate;
+            moe_kernel->swiGLU(g, u, count);
+            down_gemm->multiply_tensor(
+                gate_tensor, output,
+                m, n, intermediate);
         }
-
-        /// Dequantize a full row from a 3D expert tensor
-        /// @param info Expert tensor metadata
-        /// @param expert_id Which expert (shape[2] / ne[2] index)
-        /// @param row Row within the expert slice (shape[1] / ne[1] index)
-        /// @param output Output FP32 buffer, must be >= cols_per_expert elements
-        void dequantizeExpertRow(const ExpertTensorInfo &info, int expert_id, int row, float *output)
-        {
-            const size_t blocks_per_expert = info.rows_per_expert * info.blocks_per_row;
-            const size_t block_offset = static_cast<size_t>(expert_id) * blocks_per_expert
-                                        + static_cast<size_t>(row) * info.blocks_per_row;
-
-            switch (info.tensor_type)
-            {
-            case TensorType::Q4_K:
-            {
-                const auto *blocks = static_cast<const Q4_KBlock *>(info.raw_blocks);
-                for (size_t b = 0; b < info.blocks_per_row; ++b)
-                {
-                    Q4_KTensor::decodeBlock(blocks[block_offset + b],
-                                            output + b * info.block_element_size);
-                }
-                break;
-            }
-            case TensorType::Q5_K:
-            {
-                const auto *blocks = static_cast<const Q5_KBlock *>(info.raw_blocks);
-                for (size_t b = 0; b < info.blocks_per_row; ++b)
-                {
-                    Q5_KTensor::decodeBlock(blocks[block_offset + b],
-                                            output + b * info.block_element_size);
-                }
-                break;
-            }
-            case TensorType::Q6_K:
-            {
-                const auto *blocks = static_cast<const Q6_KBlock *>(info.raw_blocks);
-                for (size_t b = 0; b < info.blocks_per_row; ++b)
-                {
-                    Q6_KTensor::decodeBlock(blocks[block_offset + b],
-                                            output + b * info.block_element_size);
-                }
-                break;
-            }
-            default:
-                break;
-            }
-        }
-
     } // anonymous namespace
 
     // =========================================================================
@@ -139,83 +72,15 @@ namespace llaminar2
     // =========================================================================
 
     MoEFFNStage::MoEFFNStage(Params params)
-        : IComputeStage(params.device_id)
-        , params_(std::move(params))
+        : IComputeStage(params.device_id), params_(std::move(params))
     {
     }
 
-    bool MoEFFNStage::executeRouting(
-        const float *hidden, int seq_len, int d_model,
-        const float *gate_w, int num_experts, int top_k,
-        std::vector<int> &expert_indices,
-        std::vector<float> &expert_weights) const
+    IMoEKernel *MoEFFNStage::ensureMoEKernel() const
     {
-        // Output: expert_indices[seq_len * top_k], expert_weights[seq_len * top_k]
-        expert_indices.resize(seq_len * top_k);
-        expert_weights.resize(seq_len * top_k);
-
-        // Stash raw router logits for snapshot capture [seq_len, num_experts]
-        router_logits_.resize(static_cast<size_t>(seq_len) * num_experts);
-
-        // For each token: compute router logits, softmax, top-k selection
-        for (int t = 0; t < seq_len; ++t)
-        {
-            const float *h = hidden + t * d_model;
-
-            // Compute router logits: gate_w[e] · h for each expert
-            std::vector<float> logits(num_experts);
-            for (int e = 0; e < num_experts; ++e)
-            {
-                float dot = 0.0f;
-                const float *w = gate_w + e * d_model;
-                for (int d = 0; d < d_model; ++d)
-                {
-                    dot += w[d] * h[d];
-                }
-                logits[e] = dot;
-            }
-
-            // Softmax
-            float max_logit = *std::max_element(logits.begin(), logits.end());
-            float sum_exp = 0.0f;
-            for (int e = 0; e < num_experts; ++e)
-            {
-                logits[e] = std::exp(logits[e] - max_logit);
-                sum_exp += logits[e];
-            }
-            for (int e = 0; e < num_experts; ++e)
-            {
-                logits[e] /= sum_exp;
-            }
-
-            // Stash post-softmax probabilities (matches PyTorch gate output[0])
-            std::copy(logits.begin(), logits.end(),
-                      router_logits_.begin() + static_cast<size_t>(t) * num_experts);
-
-            // Top-k selection
-            std::vector<int> indices(num_experts);
-            std::iota(indices.begin(), indices.end(), 0);
-            std::partial_sort(indices.begin(), indices.begin() + top_k, indices.end(),
-                              [&logits](int a, int b)
-                              { return logits[a] > logits[b]; });
-
-            // Normalize top-k weights
-            float topk_sum = 0.0f;
-            for (int k = 0; k < top_k; ++k)
-            {
-                topk_sum += logits[indices[k]];
-            }
-
-            for (int k = 0; k < top_k; ++k)
-            {
-                expert_indices[t * top_k + k] = indices[k];
-                expert_weights[t * top_k + k] = params_.norm_topk_prob
-                                                     ? logits[indices[k]] / topk_sum
-                                                     : logits[indices[k]];
-            }
-        }
-
-        return true;
+        if (!moe_kernel_)
+            moe_kernel_ = KernelFactory::getOrCreateMoEKernel(params_.device_id);
+        return moe_kernel_;
     }
 
     void MoEFFNStage::stashRoutingResults(
@@ -232,75 +97,6 @@ namespace llaminar2
 
         // Invalidate cached dump info so snapshot callback sees the routing data
         invalidateDumpInfoCache();
-    }
-
-    bool MoEFFNStage::executeExpertFFN(
-        const float *input_tokens, int num_tokens, int d_model,
-        const float *gate_w, const float *up_w, const float *down_w,
-        int intermediate, float *output) const
-    {
-        // SwiGLU FFN: output = down_proj(silu(gate_proj(x)) * up_proj(x))
-        // gate_w: [intermediate, d_model]
-        // up_w:   [intermediate, d_model]
-        // down_w: [d_model, intermediate]
-
-        std::vector<float> gate_buf(num_tokens * intermediate);
-        std::vector<float> up_buf(num_tokens * intermediate);
-
-        // Gate and Up projections
-        for (int t = 0; t < num_tokens; ++t)
-        {
-            const float *x = input_tokens + t * d_model;
-
-            // Gate projection
-            for (int i = 0; i < intermediate; ++i)
-            {
-                float dot = 0.0f;
-                const float *w = gate_w + i * d_model;
-                for (int d = 0; d < d_model; ++d)
-                {
-                    dot += w[d] * x[d];
-                }
-                gate_buf[t * intermediate + i] = dot;
-            }
-
-            // Up projection
-            for (int i = 0; i < intermediate; ++i)
-            {
-                float dot = 0.0f;
-                const float *w = up_w + i * d_model;
-                for (int d = 0; d < d_model; ++d)
-                {
-                    dot += w[d] * x[d];
-                }
-                up_buf[t * intermediate + i] = dot;
-            }
-        }
-
-        // SwiGLU activation: silu(gate) * up
-        for (int i = 0; i < num_tokens * intermediate; ++i)
-        {
-            float g = gate_buf[i];
-            float silu_g = g / (1.0f + std::exp(-g)); // silu(x) = x * sigmoid(x)
-            gate_buf[i] = silu_g * up_buf[i];
-        }
-
-        // Down projection
-        for (int t = 0; t < num_tokens; ++t)
-        {
-            for (int d = 0; d < d_model; ++d)
-            {
-                float dot = 0.0f;
-                const float *w = down_w + d * intermediate;
-                for (int i = 0; i < intermediate; ++i)
-                {
-                    dot += w[i] * gate_buf[t * intermediate + i];
-                }
-                output[t * d_model + d] = dot;
-            }
-        }
-
-        return true;
     }
 
     bool MoEFFNStage::execute(IDeviceContext *ctx)
@@ -323,265 +119,164 @@ namespace llaminar2
             return false;
         }
 
-        // Dispatch to GPU path if we have expert views and are on a GPU device
-        const bool on_gpu = (ctx->backendType() == ComputeBackendType::GPU_CUDA ||
-                             ctx->backendType() == ComputeBackendType::GPU_ROCM);
-        if (on_gpu && !params_.expert_gate_views.empty())
-        {
-            return executeGPU(ctx);
-        }
-
-        return executeCPU(ctx);
-    }
-
-    bool MoEFFNStage::executeCPU(IDeviceContext *ctx)
-    {
         const int seq_len = params_.seq_len;
         const int d_model = params_.d_model;
         const int num_experts = params_.num_experts;
         const int top_k = params_.top_k;
         const int intermediate = params_.expert_intermediate;
 
+        if (params_.expert_gate_views.empty())
+        {
+            LOG_ERROR("[MoEFFNStage] Requires pre-extracted expert views. "
+                      "Call extractExpertViews() at graph build time.");
+            return false;
+        }
+
         const float *hidden = params_.input->data();
         const float *gate_w = params_.gate_weights->data();
         float *output = params_.output->mutable_data();
 
-        // Prepare expert tensor info for 3D quantized weight access
-        ExpertTensorInfo gate_info, up_info, down_info;
-        if (!getExpertTensorInfo(params_.gate_exps, gate_info) ||
-            !getExpertTensorInfo(params_.up_exps, up_info) ||
-            !getExpertTensorInfo(params_.down_exps, down_info))
-        {
-            LOG_ERROR("[MoEFFNStage] Failed to get expert tensor info");
-            return false;
-        }
+        // Get device-appropriate MoE kernel for routing/gather/scatter
+        IMoEKernel *kernel = ensureMoEKernel();
 
-        // Step 1: Routing — softmax top-k
-        std::vector<int> expert_indices;
-        std::vector<float> expert_weights_vec;
-        if (!executeRouting(hidden, seq_len, d_model, gate_w, num_experts, top_k,
-                            expert_indices, expert_weights_vec))
+        // Step 1: Routing — softmax top-k via device kernel
+        MoERoutingResult routing;
+        if (!kernel->route(hidden, gate_w, seq_len, d_model,
+                           num_experts, top_k, params_.norm_topk_prob, routing))
         {
             LOG_ERROR("[MoEFFNStage] Routing failed");
             return false;
         }
-        stashRoutingResults(expert_indices, expert_weights_vec, seq_len, top_k);
+
+        // Stash routing data for snapshot capture
+        router_logits_ = std::move(routing.router_logits);
+        stashRoutingResults(routing.expert_indices, routing.expert_weights, seq_len, top_k);
 
         // Step 2: Zero output
         std::memset(output, 0, static_cast<size_t>(seq_len) * d_model * sizeof(float));
 
-        // Step 3: For each token, execute top-k expert FFNs and combine
-        // Thread-local scratch buffers for dequantized weight rows and intermediate results
-        for (int t = 0; t < seq_len; ++t)
-        {
-            const float *token_input = hidden + t * d_model;
-            float *token_output = output + t * d_model;
-
-            // Scratch buffers (per-row dequant + intermediate activations)
-            std::vector<float> row_buf(std::max(d_model, intermediate));
-            std::vector<float> gate_buf(intermediate);
-            std::vector<float> up_buf(intermediate);
-            std::vector<float> expert_output(d_model);
-
-            for (int k = 0; k < top_k; ++k)
-            {
-                int expert_id = expert_indices[t * top_k + k];
-                float weight = expert_weights_vec[t * top_k + k];
-
-                // Gate projection: gate_exps[expert_id] × input → gate_buf
-                // gate_exps[expert_id] shape: [intermediate, d_model]
-                for (int i = 0; i < intermediate; ++i)
-                {
-                    dequantizeExpertRow(gate_info, expert_id, i, row_buf.data());
-                    float dot = 0.0f;
-                    for (int d = 0; d < d_model; ++d)
-                        dot += row_buf[d] * token_input[d];
-                    gate_buf[i] = dot;
-                }
-
-                // Up projection: up_exps[expert_id] × input → up_buf
-                for (int i = 0; i < intermediate; ++i)
-                {
-                    dequantizeExpertRow(up_info, expert_id, i, row_buf.data());
-                    float dot = 0.0f;
-                    for (int d = 0; d < d_model; ++d)
-                        dot += row_buf[d] * token_input[d];
-                    up_buf[i] = dot;
-                }
-
-                // SwiGLU activation: silu(gate) * up
-                for (int i = 0; i < intermediate; ++i)
-                {
-                    float g = gate_buf[i];
-                    float silu_g = g / (1.0f + std::exp(-g));
-                    gate_buf[i] = silu_g * up_buf[i];
-                }
-
-                // Down projection: down_exps[expert_id] × activated → expert_output
-                // down_exps[expert_id] shape: [d_model, intermediate]
-                for (int d = 0; d < d_model; ++d)
-                {
-                    dequantizeExpertRow(down_info, expert_id, d, row_buf.data());
-                    float dot = 0.0f;
-                    for (int i = 0; i < intermediate; ++i)
-                        dot += row_buf[i] * gate_buf[i];
-                    expert_output[d] = dot;
-                }
-
-                // Accumulate weighted output
-                for (int d = 0; d < d_model; ++d)
-                {
-                    token_output[d] += weight * expert_output[d];
-                }
-            }
-        }
-
-        LOG_DEBUG("[MoEFFNStage] Processed " << seq_len << " tokens, "
-                                              << top_k << " experts per token");
-        return true;
-    }
-
-    // =========================================================================
-    // MoEFFNStage::executeGPU — GPU execution via KernelFactory GEMM kernels
-    // =========================================================================
-
-    bool MoEFFNStage::executeGPU(IDeviceContext *ctx)
-    {
-        const int seq_len = params_.seq_len;
-        const int d_model = params_.d_model;
-        const int num_experts = params_.num_experts;
-        const int top_k = params_.top_k;
-        const int intermediate = params_.expert_intermediate;
-
-        // Router logits are computed on device via GEMM (hidden @ gate_weights^T)
-        // gate_weights is FP32 [num_experts, d_model], so we can use it directly.
-        // For now, routing stays on CPU (copy hidden to host, route, copy back).
-        // This is fine because routing is O(seq_len * num_experts * d_model) — small
-        // compared to expert FFN work O(seq_len * top_k * d_model * intermediate * 3).
-        const float *hidden = params_.input->data();
-        const float *gate_w = params_.gate_weights->data();
-        float *output = params_.output->mutable_data();
-
-        // Step 1: Routing — softmax top-k (CPU)
-        std::vector<int> expert_indices;
-        std::vector<float> expert_weights_vec;
-        if (!executeRouting(hidden, seq_len, d_model, gate_w, num_experts, top_k,
-                            expert_indices, expert_weights_vec))
-        {
-            LOG_ERROR("[MoEFFNStage] GPU routing failed");
-            return false;
-        }
-        stashRoutingResults(expert_indices, expert_weights_vec, seq_len, top_k);
-
-        // Step 2: Zero output
-        std::memset(output, 0, static_cast<size_t>(seq_len) * d_model * sizeof(float));
-
-        // Step 3: Group tokens by expert for batched execution
-        // expert_token_lists[expert_id] = list of (token_idx, routing_weight)
+        // Step 3: Group tokens by expert for batched GEMM execution
         std::vector<std::vector<std::pair<int, float>>> expert_token_lists(num_experts);
         for (int t = 0; t < seq_len; ++t)
         {
             for (int k = 0; k < top_k; ++k)
             {
-                int expert_id = expert_indices[t * top_k + k];
-                float weight = expert_weights_vec[t * top_k + k];
+                int expert_id = routing.expert_indices[t * top_k + k];
+                float weight = routing.expert_weights[t * top_k + k];
                 expert_token_lists[expert_id].emplace_back(t, weight);
             }
         }
 
-        // Step 4: Execute each active expert's FFN via GEMM kernels
-        // For each expert with assigned tokens, we:
-        //   a) Gather token inputs into a contiguous batch
-        //   b) gate_proj: batch @ expert_gate_view^T → gate_out [num_tokens, intermediate]
-        //   c) up_proj: batch @ expert_up_view^T → up_out [num_tokens, intermediate]
-        //   d) SwiGLU: silu(gate_out) * up_out
-        //   e) down_proj: activated @ expert_down_view^T → expert_out [num_tokens, d_model]
-        //   f) Scatter weighted results back to output
+        // Ensure GEMM engines are cached (lazy init on first call)
+        ensureGemmEnginesCached();
+
+        // Ensure scratch buffers have enough capacity for largest expert batch
+        int max_batch = 0;
+        for (const auto &tl : expert_token_lists)
+            max_batch = std::max(max_batch, static_cast<int>(tl.size()));
+
+        if (max_batch > 0 && max_batch > scratch_capacity_)
+        {
+            scratch_batch_ = std::make_shared<FP32Tensor>(
+                std::vector<size_t>{static_cast<size_t>(max_batch), static_cast<size_t>(d_model)});
+            scratch_gate_ = std::make_shared<FP32Tensor>(
+                std::vector<size_t>{static_cast<size_t>(max_batch), static_cast<size_t>(intermediate)});
+            scratch_up_ = std::make_shared<FP32Tensor>(
+                std::vector<size_t>{static_cast<size_t>(max_batch), static_cast<size_t>(intermediate)});
+            scratch_out_ = std::make_shared<FP32Tensor>(
+                std::vector<size_t>{static_cast<size_t>(max_batch), static_cast<size_t>(d_model)});
+            scratch_capacity_ = max_batch;
+        }
+
+        // Step 4: Execute each active expert (reusing cached engines + scratch)
         for (int expert_id = 0; expert_id < num_experts; ++expert_id)
         {
             const auto &token_list = expert_token_lists[expert_id];
-            if (token_list.empty()) continue;
+            if (token_list.empty())
+                continue;
 
             const int num_tokens = static_cast<int>(token_list.size());
 
-            // Gather tokens into contiguous batch
-            std::vector<float> batch_input(num_tokens * d_model);
+            // Build token indices and weights arrays for kernel calls
+            std::vector<int> token_indices(num_tokens);
+            std::vector<float> token_weights(num_tokens);
             for (int i = 0; i < num_tokens; ++i)
             {
-                const float *src = hidden + token_list[i].first * d_model;
-                std::copy(src, src + d_model, batch_input.data() + i * d_model);
+                token_indices[i] = token_list[i].first;
+                token_weights[i] = token_list[i].second;
             }
 
-            // Get expert 2D tensor views
-            TensorBase *gate_view = params_.expert_gate_views[expert_id].get();
-            TensorBase *up_view = params_.expert_up_views[expert_id].get();
-            TensorBase *down_view = params_.expert_down_views[expert_id].get();
+            // Gather tokens into reusable scratch batch via kernel
+            kernel->gatherTokenBatch(
+                hidden, scratch_batch_->mutable_data(),
+                token_indices.data(), num_tokens, d_model);
 
-            // Get GEMM engines via KernelFactory for this expert's weight views
-            auto *gate_prepared = KernelFactory::getOrCreatePreparedGemmWeights(gate_view, params_.device_id);
-            auto *up_prepared = KernelFactory::getOrCreatePreparedGemmWeights(up_view, params_.device_id);
-            auto *down_prepared = KernelFactory::getOrCreatePreparedGemmWeights(down_view, params_.device_id);
+            // Use cached GEMM engines (device-agnostic via ITensorGemm)
+            ITensorGemm *gate_gemm = cached_gate_gemm_[expert_id];
+            ITensorGemm *up_gemm = cached_up_gemm_[expert_id];
+            ITensorGemm *down_gemm = cached_down_gemm_[expert_id];
 
-            ITensorGemm *gate_gemm = KernelFactory::getOrCreateGemmEngine(gate_prepared);
-            ITensorGemm *up_gemm = KernelFactory::getOrCreateGemmEngine(up_prepared);
-            ITensorGemm *down_gemm = KernelFactory::getOrCreateGemmEngine(down_prepared);
+            // Gate+Up projections via fused multi-projection (quantizes input once)
+            std::vector<ITensorGemm::TensorProjectionDesc> projections = {
+                {gate_gemm, scratch_gate_.get(), intermediate, nullptr, "gate"},
+                {up_gemm, scratch_up_.get(), intermediate, nullptr, "up"}};
+            gate_gemm->multiply_fused_tensor(
+                scratch_batch_.get(), projections,
+                num_tokens, d_model);
 
-            // Allocate FP32 scratch for gate/up/down projections
-            // Create temporary FP32 tensors with proper shape
-            auto batch_tensor = std::make_shared<FP32Tensor>(
-                std::vector<size_t>{static_cast<size_t>(num_tokens), static_cast<size_t>(d_model)});
-            std::copy(batch_input.data(), batch_input.data() + num_tokens * d_model,
-                      batch_tensor->mutable_data());
+            // SwiGLU+Down via fused kernel with fallback through MoE kernel
+            fusedSwigluDown(
+                scratch_gate_.get(), scratch_up_.get(), scratch_out_.get(),
+                down_gemm, kernel, num_tokens, d_model, intermediate);
 
-            auto gate_tensor = std::make_shared<FP32Tensor>(
-                std::vector<size_t>{static_cast<size_t>(num_tokens), static_cast<size_t>(intermediate)});
-            auto up_tensor = std::make_shared<FP32Tensor>(
-                std::vector<size_t>{static_cast<size_t>(num_tokens), static_cast<size_t>(intermediate)});
-            auto output_tensor = std::make_shared<FP32Tensor>(
-                std::vector<size_t>{static_cast<size_t>(num_tokens), static_cast<size_t>(d_model)});
-
-            // Gate projection: [num_tokens, d_model] × [intermediate, d_model]^T → [num_tokens, intermediate]
-            gate_gemm->multiply_tensor(
-                batch_tensor.get(), gate_tensor.get(),
-                num_tokens, intermediate, d_model);
-
-            // Up projection: same dimensions
-            up_gemm->multiply_tensor(
-                batch_tensor.get(), up_tensor.get(),
-                num_tokens, intermediate, d_model);
-
-            // SwiGLU activation: silu(gate) * up (in-place on gate_tensor)
-            float *g = gate_tensor->mutable_data();
-            const float *u = up_tensor->data();
-            for (int i = 0; i < num_tokens * intermediate; ++i)
-            {
-                float gv = g[i];
-                g[i] = (gv / (1.0f + std::exp(-gv))) * u[i];
-            }
-
-            // Down projection with SwiGLU'd input: [num_tokens, intermediate] → [num_tokens, d_model]
-            down_gemm->multiply_tensor(
-                gate_tensor.get(), output_tensor.get(),
-                num_tokens, d_model, intermediate);
-
-            // Scatter weighted results back to output
-            const float *exp_out = output_tensor->data();
-            for (int i = 0; i < num_tokens; ++i)
-            {
-                int token_idx = token_list[i].first;
-                float weight = token_list[i].second;
-                float *dst = output + token_idx * d_model;
-                const float *src = exp_out + i * d_model;
-                for (int d = 0; d < d_model; ++d)
-                {
-                    dst[d] += weight * src[d];
-                }
-            }
+            // Scatter weighted results back via kernel
+            kernel->scatterAddWeighted(
+                output, scratch_out_->data(),
+                token_indices.data(), token_weights.data(),
+                num_tokens, d_model);
         }
 
-        LOG_DEBUG("[MoEFFNStage] GPU processed " << seq_len << " tokens, "
-                                                  << top_k << " experts per token");
+        LOG_DEBUG("[MoEFFNStage] Processed " << seq_len << " tokens via GEMM kernels, "
+                                             << top_k << " experts per token");
         return true;
+    }
+
+    void MoEFFNStage::ensureGemmEnginesCached() const
+    {
+        if (!cached_gate_gemm_.empty())
+            return;
+
+        const int num_experts = params_.num_experts;
+
+        // Use pre-resolved engines from graph build time if available
+        if (!params_.prepared_gate_gemm.empty())
+        {
+            cached_gate_gemm_ = params_.prepared_gate_gemm;
+            cached_up_gemm_ = params_.prepared_up_gemm;
+            cached_down_gemm_ = params_.prepared_down_gemm;
+            return;
+        }
+
+        // Fallback: resolve on first call (triggers VNNI repacking — slow)
+        LOG_WARN("[MoEFFNStage] GEMM engines not pre-resolved; "
+                 "call prepareExpertGemmEngines() at graph build time for better perf");
+
+        cached_gate_gemm_.resize(num_experts);
+        cached_up_gemm_.resize(num_experts);
+        cached_down_gemm_.resize(num_experts);
+
+        for (int e = 0; e < num_experts; ++e)
+        {
+            auto *gp = KernelFactory::getOrCreatePreparedGemmWeights(
+                params_.expert_gate_views[e].get(), params_.device_id);
+            auto *up = KernelFactory::getOrCreatePreparedGemmWeights(
+                params_.expert_up_views[e].get(), params_.device_id);
+            auto *dp = KernelFactory::getOrCreatePreparedGemmWeights(
+                params_.expert_down_views[e].get(), params_.device_id);
+            cached_gate_gemm_[e] = KernelFactory::getOrCreateGemmEngine(gp);
+            cached_up_gemm_[e] = KernelFactory::getOrCreateGemmEngine(up);
+            cached_down_gemm_[e] = KernelFactory::getOrCreateGemmEngine(dp);
+        }
     }
 
     // =========================================================================
@@ -649,7 +344,68 @@ namespace llaminar2
             return false;
 
         LOG_INFO("[MoEFFNStage] Extracted " << num_experts
-                 << " expert 2D views per weight tensor");
+                                            << " expert 2D views per weight tensor");
+        return true;
+    }
+
+    bool MoEFFNStage::prepareExpertGemmEngines(Params &params)
+    {
+        const int num_experts = params.num_experts;
+        if (params.expert_gate_views.empty() ||
+            static_cast<int>(params.expert_gate_views.size()) != num_experts)
+        {
+            LOG_ERROR("[MoEFFNStage] prepareExpertGemmEngines: call extractExpertViews() first");
+            return false;
+        }
+
+        params.prepared_gate_gemm.resize(num_experts);
+        params.prepared_up_gemm.resize(num_experts);
+        params.prepared_down_gemm.resize(num_experts);
+
+        LOG_INFO("[MoEFFNStage] Preparing GEMM engines for " << num_experts
+                 << " experts (3 weights each = " << (num_experts * 3) << " total)...");
+
+#ifdef HAVE_CUDA
+        if (params.device_id.is_cuda())
+        {
+            return prepareExpertGemmEnginesCUDA(params);
+        }
+#endif
+#ifdef HAVE_ROCM
+        if (params.device_id.is_rocm())
+        {
+            return prepareExpertGemmEnginesROCm(params);
+        }
+#endif
+
+        // CPU path: use KernelFactory (existing behavior)
+        for (int e = 0; e < num_experts; ++e)
+        {
+            auto *gp = KernelFactory::getOrCreatePreparedGemmWeights(
+                params.expert_gate_views[e].get(), params.device_id);
+            auto *up = KernelFactory::getOrCreatePreparedGemmWeights(
+                params.expert_up_views[e].get(), params.device_id);
+            auto *dp = KernelFactory::getOrCreatePreparedGemmWeights(
+                params.expert_down_views[e].get(), params.device_id);
+
+            if (!gp || !up || !dp)
+            {
+                LOG_ERROR("[MoEFFNStage] Failed to prepare GEMM weights for expert " << e);
+                return false;
+            }
+
+            params.prepared_gate_gemm[e] = KernelFactory::getOrCreateGemmEngine(gp);
+            params.prepared_up_gemm[e] = KernelFactory::getOrCreateGemmEngine(up);
+            params.prepared_down_gemm[e] = KernelFactory::getOrCreateGemmEngine(dp);
+
+            if (!params.prepared_gate_gemm[e] || !params.prepared_up_gemm[e] || !params.prepared_down_gemm[e])
+            {
+                LOG_ERROR("[MoEFFNStage] Failed to create GEMM engine for expert " << e);
+                return false;
+            }
+        }
+
+        LOG_INFO("[MoEFFNStage] All " << (num_experts * 3) << " expert GEMM engines prepared (CPU/KernelFactory path)");
         return true;
     }
 
@@ -732,9 +488,20 @@ namespace llaminar2
     // =========================================================================
 
     SharedExpertFFNStage::SharedExpertFFNStage(Params params)
-        : IComputeStage(params.device_id)
-        , params_(std::move(params))
+        : IComputeStage(params.device_id), params_(std::move(params))
     {
+    }
+
+    void SharedExpertFFNStage::ensureGemmEnginesCached() const
+    {
+        if (cached_gate_gemm_)
+            return;
+        auto *gp = KernelFactory::getOrCreatePreparedGemmWeights(params_.gate_w, params_.device_id);
+        auto *up = KernelFactory::getOrCreatePreparedGemmWeights(params_.up_w, params_.device_id);
+        auto *dp = KernelFactory::getOrCreatePreparedGemmWeights(params_.down_w, params_.device_id);
+        cached_gate_gemm_ = KernelFactory::getOrCreateGemmEngine(gp);
+        cached_up_gemm_ = KernelFactory::getOrCreateGemmEngine(up);
+        cached_down_gemm_ = KernelFactory::getOrCreateGemmEngine(dp);
     }
 
     bool SharedExpertFFNStage::execute(IDeviceContext *ctx)
@@ -751,142 +518,45 @@ namespace llaminar2
             return false;
         }
 
-        const bool on_gpu = (ctx->backendType() == ComputeBackendType::GPU_CUDA ||
-                             ctx->backendType() == ComputeBackendType::GPU_ROCM);
-
-        if (on_gpu)
-        {
-            return executeGPU_SharedExpert(ctx);
-        }
-
-        return executeCPU_SharedExpert(ctx);
-    }
-
-    bool SharedExpertFFNStage::executeCPU_SharedExpert(IDeviceContext *ctx)
-    {
         const int seq_len = params_.seq_len;
         const int d_model = params_.d_model;
         const int intermediate = params_.intermediate;
 
-        const float *input = params_.input->data();
-        const float *gate_w = params_.gate_w->data();
-        const float *up_w = params_.up_w->data();
-        const float *down_w = params_.down_w->data();
-        float *output = params_.output->mutable_data();
+        // Cache GEMM engines on first call
+        ensureGemmEnginesCached();
 
-        // SwiGLU FFN: output = down(silu(gate(x)) * up(x))
-        auto do_work = [=]()
+        // Ensure scratch buffers are large enough
+        if (seq_len > scratch_seq_len_)
         {
-            // Allocate thread-local buffers
-            std::vector<float> gate_buf(intermediate);
-            std::vector<float> up_buf(intermediate);
+            scratch_gate_ = std::make_shared<FP32Tensor>(
+                std::vector<size_t>{static_cast<size_t>(seq_len), static_cast<size_t>(intermediate)});
+            scratch_up_ = std::make_shared<FP32Tensor>(
+                std::vector<size_t>{static_cast<size_t>(seq_len), static_cast<size_t>(intermediate)});
+            scratch_seq_len_ = seq_len;
+        }
 
-            #pragma omp for schedule(static)
-            for (int t = 0; t < seq_len; ++t)
-            {
-                const float *x = input + t * d_model;
+        // Gate+Up projections via fused multi-projection (quantizes input once)
+        std::vector<ITensorGemm::TensorProjectionDesc> projections = {
+            {cached_gate_gemm_, scratch_gate_.get(), intermediate, nullptr, "shared_gate"},
+            {cached_up_gemm_, scratch_up_.get(), intermediate, nullptr, "shared_up"}};
+        cached_gate_gemm_->multiply_fused_tensor(
+            params_.input, projections,
+            seq_len, d_model);
 
-                // Gate projection: gate_w [intermediate, d_model] × x [d_model]
-                for (int i = 0; i < intermediate; ++i)
-                {
-                    float dot = 0.0f;
-                    const float *w = gate_w + i * d_model;
-                    for (int d = 0; d < d_model; ++d)
-                    {
-                        dot += w[d] * x[d];
-                    }
-                    gate_buf[i] = dot;
-                }
-
-                // Up projection
-                for (int i = 0; i < intermediate; ++i)
-                {
-                    float dot = 0.0f;
-                    const float *w = up_w + i * d_model;
-                    for (int d = 0; d < d_model; ++d)
-                    {
-                        dot += w[d] * x[d];
-                    }
-                    up_buf[i] = dot;
-                }
-
-                // SwiGLU: silu(gate) * up
-                for (int i = 0; i < intermediate; ++i)
-                {
-                    float g = gate_buf[i];
-                    float silu_g = g / (1.0f + std::exp(-g));
-                    gate_buf[i] = silu_g * up_buf[i];
-                }
-
-                // Down projection: down_w [d_model, intermediate] × activated [intermediate]
-                float *out = output + t * d_model;
-                for (int d = 0; d < d_model; ++d)
-                {
-                    float dot = 0.0f;
-                    const float *w = down_w + d * intermediate;
-                    for (int i = 0; i < intermediate; ++i)
-                    {
-                        dot += w[i] * gate_buf[i];
-                    }
-                    out[d] = dot;
-                }
-            }
-        };
-        OMP_WORKSHARE_REGION(do_work);
+        // SwiGLU+Down via fused kernel with MoE kernel fallback
+        IMoEKernel *kernel = ensureMoEKernel();
+        fusedSwigluDown(
+            scratch_gate_.get(), scratch_up_.get(), params_.output,
+            cached_down_gemm_, kernel, seq_len, d_model, intermediate);
 
         return true;
     }
 
-    bool SharedExpertFFNStage::executeGPU_SharedExpert(IDeviceContext *ctx)
+    IMoEKernel *SharedExpertFFNStage::ensureMoEKernel() const
     {
-        const int seq_len = params_.seq_len;
-        const int d_model = params_.d_model;
-        const int intermediate = params_.intermediate;
-
-        // Use KernelFactory GEMM for gate/up/down projections
-        // Shared expert weights are regular 2D tensors (not 3D packed)
-        auto *gate_prepared = KernelFactory::getOrCreatePreparedGemmWeights(
-            params_.gate_w, params_.device_id);
-        auto *up_prepared = KernelFactory::getOrCreatePreparedGemmWeights(
-            params_.up_w, params_.device_id);
-        auto *down_prepared = KernelFactory::getOrCreatePreparedGemmWeights(
-            params_.down_w, params_.device_id);
-
-        ITensorGemm *gate_gemm = KernelFactory::getOrCreateGemmEngine(gate_prepared);
-        ITensorGemm *up_gemm = KernelFactory::getOrCreateGemmEngine(up_prepared);
-        ITensorGemm *down_gemm = KernelFactory::getOrCreateGemmEngine(down_prepared);
-
-        // Allocate scratch tensors for intermediate activations
-        auto gate_tensor = std::make_shared<FP32Tensor>(
-            std::vector<size_t>{static_cast<size_t>(seq_len), static_cast<size_t>(intermediate)});
-        auto up_tensor = std::make_shared<FP32Tensor>(
-            std::vector<size_t>{static_cast<size_t>(seq_len), static_cast<size_t>(intermediate)});
-
-        // Gate projection: [seq_len, d_model] × [intermediate, d_model]^T → [seq_len, intermediate]
-        gate_gemm->multiply_tensor(
-            params_.input, gate_tensor.get(),
-            seq_len, intermediate, d_model);
-
-        // Up projection
-        up_gemm->multiply_tensor(
-            params_.input, up_tensor.get(),
-            seq_len, intermediate, d_model);
-
-        // SwiGLU activation: silu(gate) * up
-        float *g = gate_tensor->mutable_data();
-        const float *u = up_tensor->data();
-        for (int i = 0; i < seq_len * intermediate; ++i)
-        {
-            float gv = g[i];
-            g[i] = (gv / (1.0f + std::exp(-gv))) * u[i];
-        }
-
-        // Down projection: [seq_len, intermediate] × [d_model, intermediate]^T → [seq_len, d_model]
-        down_gemm->multiply_tensor(
-            gate_tensor.get(), params_.output,
-            seq_len, d_model, intermediate);
-
-        return true;
+        if (!moe_kernel_)
+            moe_kernel_ = KernelFactory::getOrCreateMoEKernel(params_.device_id);
+        return moe_kernel_;
     }
 
     size_t SharedExpertFFNStage::estimatedFlops() const
@@ -928,9 +598,12 @@ namespace llaminar2
         StageDumpInfo info;
         if (params_.input)
             info.addInput("input", params_.input, params_.seq_len, params_.d_model);
-        if (params_.gate_w) info.addWeight("gate_w", params_.gate_w);
-        if (params_.up_w) info.addWeight("up_w", params_.up_w);
-        if (params_.down_w) info.addWeight("down_w", params_.down_w);
+        if (params_.gate_w)
+            info.addWeight("gate_w", params_.gate_w);
+        if (params_.up_w)
+            info.addWeight("up_w", params_.up_w);
+        if (params_.down_w)
+            info.addWeight("down_w", params_.down_w);
         if (params_.output)
             info.addOutput("output", params_.output, params_.seq_len, params_.d_model);
         info.addScalarInt("seq_len", params_.seq_len);
@@ -944,8 +617,7 @@ namespace llaminar2
     // =========================================================================
 
     SharedExpertGateStage::SharedExpertGateStage(Params params)
-        : IComputeStage(params.device_id)
-        , params_(std::move(params))
+        : IComputeStage(params.device_id), params_(std::move(params))
     {
     }
 
@@ -970,35 +642,18 @@ namespace llaminar2
         const float *gate_inp = params_.gate_inp->data();
         float *shared = params_.shared_output->mutable_data();
 
-        // For each token:
-        // g = sigmoid(dot(gate_inp, input[t]))
-        // shared_output[t] *= g
-        auto do_work = [=]()
-        {
-            #pragma omp for schedule(static)
-            for (int t = 0; t < seq_len; ++t)
-            {
-                const float *x = input + t * d_model;
-
-                // Compute gate value: dot product + sigmoid
-                float dot = 0.0f;
-                for (int d = 0; d < d_model; ++d)
-                {
-                    dot += gate_inp[d] * x[d];
-                }
-                float gate = 1.0f / (1.0f + std::exp(-dot)); // sigmoid
-
-                // Apply gate: shared_output[t] *= gate
-                float *out = shared + t * d_model;
-                for (int d = 0; d < d_model; ++d)
-                {
-                    out[d] *= gate;
-                }
-            }
-        };
-        OMP_WORKSHARE_REGION(do_work);
+        // Delegate sigmoid gating to device-agnostic MoE kernel
+        IMoEKernel *kernel = ensureMoEKernel();
+        kernel->sharedExpertGate(input, gate_inp, shared, seq_len, d_model);
 
         return true;
+    }
+
+    IMoEKernel *SharedExpertGateStage::ensureMoEKernel() const
+    {
+        if (!moe_kernel_)
+            moe_kernel_ = KernelFactory::getOrCreateMoEKernel(params_.device_id);
+        return moe_kernel_;
     }
 
     size_t SharedExpertGateStage::estimatedFlops() const
@@ -1041,12 +696,146 @@ namespace llaminar2
         StageDumpInfo info;
         if (params_.input)
             info.addInput("input", params_.input, params_.seq_len, params_.d_model);
-        if (params_.gate_inp) info.addWeight("gate_inp", params_.gate_inp);
+        if (params_.gate_inp)
+            info.addWeight("gate_inp", params_.gate_inp);
         if (params_.shared_output)
             info.addOutput("shared_output", params_.shared_output, params_.seq_len, params_.d_model);
         info.addScalarInt("seq_len", params_.seq_len);
         info.addScalarInt("d_model", params_.d_model);
         return info;
     }
+
+    // =========================================================================
+    // MoE batch packing helpers (CUDA / ROCm)
+    // =========================================================================
+
+#ifdef HAVE_CUDA
+    bool MoEFFNStage::prepareExpertGemmEnginesCUDA(Params &params)
+    {
+        using namespace llaminar2::cuda;
+        const int num_experts = params.num_experts;
+        const int cuda_id = params.device_id.cuda_ordinal();
+
+        // Helper: batch-pack one weight group and create per-expert kernels
+        auto batchPackAndCreateKernels = [&](
+            const std::vector<std::shared_ptr<TensorBase>> &views,
+            std::vector<ITensorGemm *> &out_gemms,
+            std::shared_ptr<void> &out_lifetime,
+            const char *label) -> bool
+        {
+            const int rows = static_cast<int>(views[0]->rows());
+            const int K = static_cast<int>(views[0]->cols());
+
+            auto batch = packMoEExpertsCUDA(views, num_experts, rows);
+            if (!batch)
+            {
+                LOG_ERROR("[MoEFFNStage::CUDA] Failed to batch-pack " << label);
+                return false;
+            }
+
+            if (!batch->uploadToDevice(cuda_id))
+            {
+                LOG_ERROR("[MoEFFNStage::CUDA] Failed to upload " << label << " to device " << cuda_id);
+                return false;
+            }
+
+            for (int e = 0; e < num_experts; ++e)
+            {
+                auto expert_ptrs = batch->getExpertDevicePointers(cuda_id, e);
+                auto kernel = std::make_shared<llaminar2::cuda::CUDAQuantisedGemmKernel>(
+                    rows, K, cuda_id,
+                    expert_ptrs.d_vnni, expert_ptrs.d_scales,
+                    expert_ptrs.d_mins, expert_ptrs.d_emins,
+                    batch->codebook_id, static_cast<uint32_t>(batch->blocks_per_row),
+                    batch);
+                out_gemms[e] = kernel.get();
+                params.moe_owned_kernels.push_back(std::move(kernel));
+            }
+
+            batch->freeHostBuffers();
+            out_lifetime = std::move(batch);
+            return true;
+        };
+
+        if (!batchPackAndCreateKernels(params.expert_gate_views, params.prepared_gate_gemm,
+                                       params.moe_packed_gate_lifetime, "gate"))
+            return false;
+        if (!batchPackAndCreateKernels(params.expert_up_views, params.prepared_up_gemm,
+                                       params.moe_packed_up_lifetime, "up"))
+            return false;
+        if (!batchPackAndCreateKernels(params.expert_down_views, params.prepared_down_gemm,
+                                       params.moe_packed_down_lifetime, "down"))
+            return false;
+
+        LOG_INFO("[MoEFFNStage] All " << (num_experts * 3)
+                 << " expert GEMM engines prepared (CUDA batch path, 3 GPU allocs)");
+        return true;
+    }
+#endif // HAVE_CUDA
+
+#ifdef HAVE_ROCM
+    bool MoEFFNStage::prepareExpertGemmEnginesROCm(Params &params)
+    {
+        using namespace llaminar2::rocm;
+        const int num_experts = params.num_experts;
+        const int rocm_id = params.device_id.rocm_ordinal();
+
+        auto batchPackAndCreateKernels = [&](
+            const std::vector<std::shared_ptr<TensorBase>> &views,
+            std::vector<ITensorGemm *> &out_gemms,
+            std::shared_ptr<void> &out_lifetime,
+            const char *label) -> bool
+        {
+            const int rows = static_cast<int>(views[0]->rows());
+            const int K = static_cast<int>(views[0]->cols());
+
+            auto batch = packMoEExpertsROCm(views, num_experts, rows);
+            if (!batch)
+            {
+                LOG_ERROR("[MoEFFNStage::ROCm] Failed to batch-pack " << label);
+                return false;
+            }
+
+            if (!batch->uploadToDevice(rocm_id))
+            {
+                LOG_ERROR("[MoEFFNStage::ROCm] Failed to upload " << label << " to device " << rocm_id);
+                return false;
+            }
+
+            for (int e = 0; e < num_experts; ++e)
+            {
+                auto expert_ptrs = batch->getExpertDevicePointers(rocm_id, e);
+                auto kernel = std::make_shared<llaminar2::rocm::ROCmQuantisedGemmKernel>(
+                    rows, K, rocm_id,
+                    expert_ptrs.d_native_vnni,
+                    expert_ptrs.d_native_scales,
+                    expert_ptrs.d_native_mins,
+                    expert_ptrs.d_native_emins,
+                    batch->codebook_id, static_cast<uint32_t>(batch->blocks_per_row),
+                    batch);
+                out_gemms[e] = kernel.get();
+                params.moe_owned_kernels.push_back(std::move(kernel));
+            }
+
+            batch->freeHostBuffers();
+            out_lifetime = std::move(batch);
+            return true;
+        };
+
+        if (!batchPackAndCreateKernels(params.expert_gate_views, params.prepared_gate_gemm,
+                                       params.moe_packed_gate_lifetime, "gate"))
+            return false;
+        if (!batchPackAndCreateKernels(params.expert_up_views, params.prepared_up_gemm,
+                                       params.moe_packed_up_lifetime, "up"))
+            return false;
+        if (!batchPackAndCreateKernels(params.expert_down_views, params.prepared_down_gemm,
+                                       params.moe_packed_down_lifetime, "down"))
+            return false;
+
+        LOG_INFO("[MoEFFNStage] All " << (num_experts * 3)
+                 << " expert GEMM engines prepared (ROCm batch path, 3 GPU allocs)");
+        return true;
+    }
+#endif // HAVE_ROCM
 
 } // namespace llaminar2

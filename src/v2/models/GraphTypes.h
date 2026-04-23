@@ -475,13 +475,13 @@ namespace llaminar2
         TensorBase *ffn_norm = nullptr;  ///< Pre-FFN norm gamma
 
         // MoE (Mixture of Experts) weights — used by Qwen3.5 MoE layers
-        TensorBase *moe_gate = nullptr;             ///< Router gate [num_experts, d_model]
-        TensorBase *moe_gate_exps = nullptr;         ///< Expert gate projections 3D [num_experts, intermediate, d_model]
-        TensorBase *moe_up_exps = nullptr;           ///< Expert up projections 3D [num_experts, intermediate, d_model]
-        TensorBase *moe_down_exps = nullptr;         ///< Expert down projections 3D [num_experts, d_model, intermediate]
-        TensorBase *shared_expert_gate = nullptr;    ///< Shared expert gate proj [intermediate, d_model]
-        TensorBase *shared_expert_up = nullptr;      ///< Shared expert up proj [intermediate, d_model]
-        TensorBase *shared_expert_down = nullptr;    ///< Shared expert down proj [d_model, intermediate]
+        TensorBase *moe_gate = nullptr;               ///< Router gate [num_experts, d_model]
+        TensorBase *moe_gate_exps = nullptr;          ///< Expert gate projections 3D [num_experts, intermediate, d_model]
+        TensorBase *moe_up_exps = nullptr;            ///< Expert up projections 3D [num_experts, intermediate, d_model]
+        TensorBase *moe_down_exps = nullptr;          ///< Expert down projections 3D [num_experts, d_model, intermediate]
+        TensorBase *shared_expert_gate = nullptr;     ///< Shared expert gate proj [intermediate, d_model]
+        TensorBase *shared_expert_up = nullptr;       ///< Shared expert up proj [intermediate, d_model]
+        TensorBase *shared_expert_down = nullptr;     ///< Shared expert down proj [d_model, intermediate]
         TensorBase *shared_expert_gate_inp = nullptr; ///< Shared expert sigmoid gate [d_model]
     };
 

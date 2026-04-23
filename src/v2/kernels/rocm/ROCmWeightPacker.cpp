@@ -315,5 +315,231 @@ namespace llaminar2
             return false;
         }
 
+    // =========================================================================
+    // MoE Batch Packing — pack all experts into one contiguous slab for ROCm
+    // =========================================================================
+
+    extern "C"
+    {
+        void rocmQuantGemm_freeDevice(void *d_ptr, int rocm_device_id);
+    }
+
+    MoEBatchPackedWeightsROCm::~MoEBatchPackedWeightsROCm()
+    {
+#ifdef HAVE_ROCM
+        for (auto &[device_id, upload] : device_uploads)
+        {
+            if (upload.d_native_vnni)
+                rocmQuantGemm_freeDevice(upload.d_native_vnni, device_id);
+            if (upload.d_native_scales)
+                rocmQuantGemm_freeDevice(upload.d_native_scales, device_id);
+            if (upload.d_native_mins)
+                rocmQuantGemm_freeDevice(upload.d_native_mins, device_id);
+            if (upload.d_native_emins)
+                rocmQuantGemm_freeDevice(upload.d_native_emins, device_id);
+        }
+#endif
+    }
+
+    bool MoEBatchPackedWeightsROCm::uploadToDevice(int rocm_device_id)
+    {
+#ifdef HAVE_ROCM
+        std::lock_guard<std::mutex> lock(upload_mutex);
+
+        auto it = device_uploads.find(rocm_device_id);
+        if (it != device_uploads.end())
+            return true;
+
+        DeviceUpload upload;
+
+        auto uploadBuffer = [&](const void *host_data, size_t bytes, void **d_ptr) -> bool
+        {
+            *d_ptr = nullptr;
+            if (!host_data || bytes == 0)
+                return true;
+            hipError_t err = hipSetDevice(rocm_device_id);
+            if (err != hipSuccess)
+                return false;
+            err = hipMalloc(d_ptr, bytes);
+            if (err != hipSuccess || !*d_ptr)
+                return false;
+            err = hipMemcpy(*d_ptr, host_data, bytes, hipMemcpyHostToDevice);
+            if (err != hipSuccess)
+            {
+                hipFree(*d_ptr);
+                *d_ptr = nullptr;
+                return false;
+            }
+            return true;
+        };
+
+        void *d_vnni = nullptr, *d_scales = nullptr, *d_mins = nullptr, *d_emins = nullptr;
+
+        if (!uploadBuffer(all_native_vnni.data(),
+                          all_native_vnni.size() * sizeof(uint8_t), &d_vnni) ||
+            !uploadBuffer(all_native_scales.data(),
+                          all_native_scales.size() * sizeof(uint16_t), &d_scales) ||
+            !uploadBuffer(all_native_mins.empty() ? nullptr : all_native_mins.data(),
+                          all_native_mins.size() * sizeof(uint16_t), &d_mins) ||
+            !uploadBuffer(all_native_emins.empty() ? nullptr : all_native_emins.data(),
+                          all_native_emins.size() * sizeof(uint32_t), &d_emins))
+        {
+            if (d_vnni) hipFree(d_vnni);
+            if (d_scales) hipFree(d_scales);
+            if (d_mins) hipFree(d_mins);
+            if (d_emins) hipFree(d_emins);
+            return false;
+        }
+
+        upload.d_native_vnni = reinterpret_cast<uint8_t *>(d_vnni);
+        upload.d_native_scales = d_scales;
+        upload.d_native_mins = d_mins;
+        upload.d_native_emins = d_emins;
+        device_uploads.emplace(rocm_device_id, upload);
+        return true;
+#else
+        (void)rocm_device_id;
+        return false;
+#endif
+    }
+
+    MoEBatchPackedWeightsROCm::DeviceUpload
+    MoEBatchPackedWeightsROCm::getExpertDevicePointers(int rocm_device_id, int expert_id) const
+    {
+        auto it = device_uploads.find(rocm_device_id);
+        if (it == device_uploads.end())
+            return {};
+
+        const auto &base = it->second;
+        DeviceUpload expert;
+        expert.d_native_vnni = base.d_native_vnni
+                                   ? base.d_native_vnni + expert_id * vnni_bytes_per_expert
+                                   : nullptr;
+        expert.d_native_scales = base.d_native_scales
+                                     ? reinterpret_cast<uint16_t *>(base.d_native_scales) + expert_id * scales_per_expert
+                                     : nullptr;
+        expert.d_native_mins = base.d_native_mins
+                                   ? reinterpret_cast<uint16_t *>(base.d_native_mins) + expert_id * mins_per_expert
+                                   : nullptr;
+        expert.d_native_emins = base.d_native_emins
+                                    ? reinterpret_cast<uint32_t *>(base.d_native_emins) + expert_id * emins_per_expert
+                                    : nullptr;
+        return expert;
+    }
+
+    void MoEBatchPackedWeightsROCm::freeHostBuffers()
+    {
+        const size_t freed = all_native_vnni.capacity() +
+                             all_native_scales.capacity() * sizeof(uint16_t) +
+                             all_native_mins.capacity() * sizeof(uint16_t) +
+                             all_native_emins.capacity() * sizeof(uint32_t);
+        all_native_vnni.clear();
+        all_native_vnni.shrink_to_fit();
+        all_native_scales.clear();
+        all_native_scales.shrink_to_fit();
+        all_native_mins.clear();
+        all_native_mins.shrink_to_fit();
+        all_native_emins.clear();
+        all_native_emins.shrink_to_fit();
+        if (freed > 0)
+        {
+            LOG_DEBUG("[MoEBatchPackedWeightsROCm] Released host buffers: "
+                      << (freed / (1024 * 1024)) << " MB");
+        }
+    }
+
+    std::shared_ptr<MoEBatchPackedWeightsROCm> packMoEExpertsROCm(
+        const std::vector<std::shared_ptr<TensorBase>> &expert_views,
+        int num_experts, int rows_per_expert)
+    {
+        if (expert_views.empty() || num_experts <= 0 || rows_per_expert <= 0)
+        {
+            LOG_ERROR("[packMoEExpertsROCm] Invalid arguments");
+            return nullptr;
+        }
+
+        const auto *quant = dynamic_cast<const IINT8Unpackable *>(expert_views[0].get());
+        if (!quant)
+        {
+            LOG_ERROR("[packMoEExpertsROCm] Expert view does not implement IINT8Unpackable");
+            return nullptr;
+        }
+        const auto *info = quant->vnniFormatInfo();
+        if (!info)
+        {
+            LOG_ERROR("[packMoEExpertsROCm] Expert view has no VNNI format info");
+            return nullptr;
+        }
+
+        const int K = static_cast<int>(expert_views[0]->cols());
+        if ((K % 32) != 0)
+        {
+            LOG_ERROR("[packMoEExpertsROCm] K=" << K << " not divisible by 32");
+            return nullptr;
+        }
+
+        const int blocks_per_row = K / 32;
+
+        auto batch = std::make_shared<MoEBatchPackedWeightsROCm>();
+        batch->num_experts = num_experts;
+        batch->rows_per_expert = rows_per_expert;
+        batch->K = K;
+        batch->blocks_per_row = blocks_per_row;
+        batch->codebook_id = info->codebook_id;
+
+        batch->vnni_bytes_per_expert = static_cast<size_t>(blocks_per_row) * rows_per_expert * info->payload_bytes;
+        batch->scales_per_expert = static_cast<size_t>(blocks_per_row) * rows_per_expert;
+        batch->mins_per_expert = info->is_asymmetric ? batch->scales_per_expert : 0;
+        batch->emins_per_expert = info->has_emins ? batch->scales_per_expert : 0;
+
+        batch->all_native_vnni.assign(static_cast<size_t>(num_experts) * batch->vnni_bytes_per_expert, uint8_t{0});
+        batch->all_native_scales.assign(static_cast<size_t>(num_experts) * batch->scales_per_expert, uint16_t{0});
+        if (info->is_asymmetric)
+            batch->all_native_mins.assign(static_cast<size_t>(num_experts) * batch->mins_per_expert, uint16_t{0});
+        if (info->has_emins)
+            batch->all_native_emins.assign(static_cast<size_t>(num_experts) * batch->emins_per_expert, uint32_t{0});
+
+        for (int e = 0; e < num_experts; ++e)
+        {
+            const auto *eq = dynamic_cast<const IINT8Unpackable *>(expert_views[e].get());
+            if (!eq)
+            {
+                LOG_ERROR("[packMoEExpertsROCm] Expert " << e << " not IINT8Unpackable");
+                return nullptr;
+            }
+
+            VnniPackContext ctx{};
+            ctx.raw_bytes = nullptr;
+            ctx.N = rows_per_expert;
+            ctx.K = K;
+            ctx.blocks_per_row = blocks_per_row;
+            ctx.payload_bytes = info->payload_bytes;
+            ctx.payload_array = batch->all_native_vnni.data() + e * batch->vnni_bytes_per_expert;
+            ctx.scales_array = batch->all_native_scales.data() + e * batch->scales_per_expert;
+            ctx.mins_array = info->is_asymmetric
+                                 ? batch->all_native_mins.data() + e * batch->mins_per_expert
+                                 : nullptr;
+            ctx.emins_array = info->has_emins
+                                  ? batch->all_native_emins.data() + e * batch->emins_per_expert
+                                  : nullptr;
+
+#pragma omp parallel for schedule(static)
+            for (int n = 0; n < rows_per_expert; ++n)
+            {
+                for (int b = 0; b < blocks_per_row; ++b)
+                {
+                    eq->packVnniBlock(ctx, n, b);
+                }
+            }
+        }
+
+        LOG_INFO("[packMoEExpertsROCm] Packed " << num_experts << " experts ("
+                 << rows_per_expert << "x" << K << " each), total slab "
+                 << (batch->all_native_vnni.size() / (1024 * 1024)) << " MB vnni + "
+                 << (batch->all_native_scales.size() * 2 / (1024 * 1024)) << " MB scales");
+
+        return batch;
+    }
+
     } // namespace rocm
 } // namespace llaminar2

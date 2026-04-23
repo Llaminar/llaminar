@@ -79,11 +79,11 @@ namespace llaminar2
         Allgather,
 
         // MoE
-        MoERouter,          ///< Router: hidden × gate → softmax top-k
-        MoEFFN,             ///< Full MoE FFN: route + expert SwiGLU + combine
-        MoECombine,         ///< Weighted combination of expert outputs
-        MoESharedExpert,    ///< Always-active shared expert SwiGLU FFN
-        MoESharedGate,      ///< Sigmoid gating on shared expert output
+        MoERouter,       ///< Router: hidden × gate → softmax top-k
+        MoEFFN,          ///< Full MoE FFN: route + expert SwiGLU + combine
+        MoECombine,      ///< Weighted combination of expert outputs
+        MoESharedExpert, ///< Always-active shared expert SwiGLU FFN
+        MoESharedGate,   ///< Sigmoid gating on shared expert output
 
         // Quantization
         Quantize,

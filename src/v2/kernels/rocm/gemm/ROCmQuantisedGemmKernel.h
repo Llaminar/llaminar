@@ -367,6 +367,31 @@ namespace llaminar2
              */
             ROCmQuantisedGemmKernel(ROCmPackedWeights *packed, int rocm_device_id);
 
+            /**
+             * @brief Construct kernel from pre-uploaded device pointers (MoE batch path)
+             *
+             * Used for MoE expert weights that are batch-packed and uploaded as a single
+             * contiguous allocation. The kernel references device pointers at calculated
+             * offsets into the shared allocation.
+             *
+             * @param N Output features (rows per expert)
+             * @param K Input features (columns)
+             * @param rocm_device_id ROCm device ID
+             * @param d_native_vnni Device pointer to native-VNNI payload for this expert
+             * @param d_native_scales Device pointer to FP16 scales (void* for __half*)
+             * @param d_native_mins Device pointer to FP16 mins (nullptr if symmetric)
+             * @param d_native_emins Device pointer to extended mins (nullptr if not needed)
+             * @param codebook_id NativeVNNI codebook identifier
+             * @param blocks_per_row Number of 32-element blocks per row (K/32)
+             * @param lifetime_owner Shared pointer that keeps the GPU allocation alive
+             */
+            ROCmQuantisedGemmKernel(
+                int N, int K, int rocm_device_id,
+                uint8_t *d_native_vnni, void *d_native_scales,
+                void *d_native_mins, void *d_native_emins,
+                uint8_t codebook_id, uint32_t blocks_per_row,
+                std::shared_ptr<void> lifetime_owner);
+
             ~ROCmQuantisedGemmKernel() override;
 
             // Non-copyable
@@ -733,6 +758,7 @@ namespace llaminar2
 
             const TensorBase *weights_ = nullptr; // Original weight tensor (null if using packed_)
             ROCmPackedWeights *packed_ = nullptr; // Pre-packed weights (owned by tensor cache)
+            std::shared_ptr<void> lifetime_owner_; // Keeps shared MoE batch allocation alive
             int rocm_device_id_;
             size_t N_; // Output features (weight rows)
             size_t K_; // Input features (weight cols)

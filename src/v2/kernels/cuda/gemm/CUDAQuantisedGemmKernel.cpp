@@ -663,6 +663,33 @@ namespace llaminar2
                                                                             << " INT8 weights on CUDA device " << cuda_device_id_);
         }
 
+        CUDAQuantisedGemmKernel::CUDAQuantisedGemmKernel(
+            int N, int K, int cuda_device_id,
+            uint8_t *d_vnni, uint16_t *d_scales, uint16_t *d_mins, uint32_t *d_emins,
+            uint8_t codebook_id, uint32_t blocks_per_row,
+            std::shared_ptr<void> lifetime_owner)
+            : weights_(nullptr),
+              packed_(nullptr),
+              lifetime_owner_(std::move(lifetime_owner)),
+              cuda_device_id_(cuda_device_id),
+              N_(static_cast<size_t>(N)),
+              K_(static_cast<size_t>(K)),
+              weights_converted_(true),    // Already on device
+              owns_weight_memory_(false),  // Shared batch allocation owns it
+              impl_(std::make_unique<Impl>())
+        {
+            impl_->d_weights_native_vnni = d_vnni;
+            impl_->d_weights_native_scales = d_scales;
+            impl_->d_weights_native_mins = d_mins;
+            impl_->d_weights_native_emins = d_emins;
+            impl_->native_codebook_id = codebook_id;
+            impl_->native_blocks_per_row = blocks_per_row;
+            impl_->owns_weight_memory = false;
+
+            LOG_DEBUG("[CUDAQuantisedGemmKernel] Created (MoE batch) for " << N_ << "x" << K_
+                                                                           << " on CUDA device " << cuda_device_id_);
+        }
+
         CUDAQuantisedGemmKernel::~CUDAQuantisedGemmKernel() = default;
 
         // ---------------------------------------------------------------------
@@ -709,6 +736,7 @@ namespace llaminar2
         CUDAQuantisedGemmKernel::CUDAQuantisedGemmKernel(CUDAQuantisedGemmKernel &&other) noexcept
             : weights_(other.weights_),
               packed_(other.packed_),
+              lifetime_owner_(std::move(other.lifetime_owner_)),
               cuda_device_id_(other.cuda_device_id_),
               N_(other.N_),
               K_(other.K_),
@@ -728,6 +756,7 @@ namespace llaminar2
             {
                 weights_ = other.weights_;
                 packed_ = other.packed_;
+                lifetime_owner_ = std::move(other.lifetime_owner_);
                 cuda_device_id_ = other.cuda_device_id_;
                 N_ = other.N_;
                 K_ = other.K_;

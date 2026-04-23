@@ -1330,6 +1330,7 @@ add_library(llaminar2_core STATIC
     kernels/cpu/primitives/RMSNormPrimitives.cpp
     kernels/cpu/primitives/SoftmaxPrimitives.cpp
     kernels/cpu/primitives/SwiGLUPrimitives.cpp
+    kernels/cpu/primitives/VectorPrimitives.cpp
     kernels/cpu/primitives/Q16HeadNormalization.cpp
     # CPU GEMM kernels and auto-tuning infrastructure
     # NOTE: Legacy GEMM implementations (v1/v2/v3) removed - only gemm (OneDNN) remains
@@ -1344,6 +1345,8 @@ add_library(llaminar2_core STATIC
     # GDN kernel implementations (Gated Delta Net)
     kernels/cpu/gdn/CPUShortConvolution.cpp
     kernels/cpu/gdn/CPUGatedDeltaNet.cpp
+    # MoE kernel implementations (routing, gather/scatter, SwiGLU fallback)
+    kernels/cpu/moe/CPUMoEKernel.cpp
     # Kernel dispatch factory (centralized device-aware kernel creation)
     kernels/KernelFactory.cpp
     kernels/HybridKVCacheConfig.cpp

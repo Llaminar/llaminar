@@ -71,11 +71,11 @@ static const std::vector<TestConfig> kQwen35MoESingleDeviceConfigs = {
             .cosine_threshold = 0.80f,        // Diagnostic — very loose
             .decode_cosine_threshold = 0.70f, // Diagnostic — MoE + GDN drift
             .early_layers_count = 6,
-            .min_early_layers_passed = 2,     // Diagnostic — just want to see numbers
-            .kl_threshold = 0.50f,            // Diagnostic — characterize, don't gate
-            .min_top1_accuracy = 0.0f,        // Disabled — diagnostic mode
-            .min_top5_accuracy = 0.0f,        // Disabled — diagnostic mode
-            .pytorch_top1_in_topk = 0,        // Disabled — diagnostic mode
+            .min_early_layers_passed = 2, // Diagnostic — just want to see numbers
+            .kl_threshold = 0.50f,        // Diagnostic — characterize, don't gate
+            .min_top1_accuracy = 0.0f,    // Disabled — diagnostic mode
+            .min_top5_accuracy = 0.0f,    // Disabled — diagnostic mode
+            .pytorch_top1_in_topk = 0,    // Disabled — diagnostic mode
         },
         .model_path = "/opt/llaminar-models/Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf",
         .snapshot_dir = "pytorch_qwen35_moe_snapshots",

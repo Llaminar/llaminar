@@ -1035,6 +1035,36 @@ namespace llaminar2
                                                                             << " INT8 weights on ROCm device " << rocm_device_id_);
         }
 
+        ROCmQuantisedGemmKernel::ROCmQuantisedGemmKernel(
+            int N, int K, int rocm_device_id,
+            uint8_t *d_native_vnni, void *d_native_scales,
+            void *d_native_mins, void *d_native_emins,
+            uint8_t codebook_id, uint32_t blocks_per_row,
+            std::shared_ptr<void> lifetime_owner)
+            : weights_(nullptr),
+              packed_(nullptr),
+              lifetime_owner_(std::move(lifetime_owner)),
+              rocm_device_id_(rocm_device_id),
+              N_(static_cast<size_t>(N)),
+              K_(static_cast<size_t>(K)),
+              weights_converted_(true),   // Already on device
+              owns_weight_memory_(false), // Batch allocation owns the memory
+              impl_(std::make_unique<Impl>())
+        {
+            impl_->d_weights_native_vnni = d_native_vnni;
+            impl_->d_weights_native_scales = d_native_scales;
+            impl_->d_weights_native_mins = d_native_mins;
+            impl_->d_weights_native_emins = d_native_emins;
+            impl_->native_vnni_codebook_id = codebook_id;
+            impl_->native_vnni_blocks_per_row = blocks_per_row;
+            impl_->has_native_vnni = true;
+            impl_->owns_weight_memory = false;
+            impl_->rocm_device_id = rocm_device_id;
+
+            LOG_DEBUG("[ROCmQuantisedGemmKernel] Created (MoE batch device ptrs) for " << N_ << "x" << K_
+                                                                                        << " on ROCm device " << rocm_device_id_);
+        }
+
         ROCmQuantisedGemmKernel::~ROCmQuantisedGemmKernel() = default;
 
         ROCmQuantisedGemmKernel::ROCmQuantisedGemmKernel(ROCmQuantisedGemmKernel &&) noexcept = default;

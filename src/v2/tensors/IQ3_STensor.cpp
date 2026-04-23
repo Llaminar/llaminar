@@ -59,9 +59,9 @@ namespace llaminar2
           view_byte_offset_(byte_offset), parent_(parent), device_(DeviceId::cpu()), device_blocks_(nullptr) {}
     // Zero-copy constructor for mmap-backed data
     IQ3_STensor::IQ3_STensor(const std::vector<size_t> &shape,
-          const uint8_t *mmap_data,
-          size_t byte_size,
-          std::shared_ptr<void> mmap_lifetime_owner)
+                             const uint8_t *mmap_data,
+                             size_t byte_size,
+                             std::shared_ptr<void> mmap_lifetime_owner)
         : shape_(shape), is_view_(true), raw_data_(), raw_data_ptr_(mmap_data),
           view_byte_offset_(0), parent_(nullptr), mmap_owner_(std::move(mmap_lifetime_owner)),
           data_byte_size_(byte_size), device_(DeviceId::cpu()), device_blocks_(nullptr)
@@ -87,7 +87,6 @@ namespace llaminar2
                                         std::to_string(expected_bytes) + ")");
         }
     }
-
 
     std::shared_ptr<TensorBase> IQ3_STensor::create_view(
         const std::vector<size_t> &view_shape, size_t offset_elements)
@@ -229,7 +228,6 @@ namespace llaminar2
 #endif
 
     IQ3_STensor::~IQ3_STensor() {}
-
 
     const float *IQ3_STensor::data() const
     {
@@ -452,7 +450,6 @@ namespace llaminar2
                 mins[i] = 0.0f;
         }
     }
-
 
     void IQ3_STensor::packVnniBlock(const VnniPackContext &ctx, int n, int b) const
     {

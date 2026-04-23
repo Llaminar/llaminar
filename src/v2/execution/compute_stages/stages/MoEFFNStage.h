@@ -23,8 +23,10 @@
 namespace llaminar2
 {
 
-    // Forward declarations for GPU GEMM support
+    // Forward declarations
     class ITensorGemm;
+    class FP32Tensor;
+    class IMoEKernel;
 
     /**
      * @brief Unified MoE FFN stage (router + expert execution + combine)
@@ -68,6 +70,20 @@ namespace llaminar2
             std::vector<std::shared_ptr<TensorBase>> expert_up_views;   ///< [intermediate, d_model] per expert
             std::vector<std::shared_ptr<TensorBase>> expert_down_views; ///< [d_model, intermediate] per expert
 
+            // Pre-resolved GEMM engines per expert — set by prepareExpertGemmEngines()
+            // at graph build time so that execute() never triggers weight repacking.
+            std::vector<ITensorGemm *> prepared_gate_gemm; ///< [num_experts] GEMM engines
+            std::vector<ITensorGemm *> prepared_up_gemm;   ///< [num_experts] GEMM engines
+            std::vector<ITensorGemm *> prepared_down_gemm;  ///< [num_experts] GEMM engines
+
+            // MoE batch-packed GPU lifetime management:
+            // owned_kernels keeps MoE batch-constructed kernels alive,
+            // packed_*_lifetime keeps the shared GPU allocation alive.
+            std::vector<std::shared_ptr<ITensorGemm>> moe_owned_kernels;
+            std::shared_ptr<void> moe_packed_gate_lifetime;
+            std::shared_ptr<void> moe_packed_up_lifetime;
+            std::shared_ptr<void> moe_packed_down_lifetime;
+
             // Scratch buffers for GPU expert execution
             TensorBase *gate_scratch = nullptr; ///< [seq_len, intermediate] FP32 scratch
             TensorBase *up_scratch = nullptr;   ///< [seq_len, intermediate] FP32 scratch
@@ -94,39 +110,50 @@ namespace llaminar2
         /// Call once at graph-build time. Views are stored in params.
         static bool extractExpertViews(Params &params);
 
+        /// Prepare GEMM engines for all expert views at graph-build time.
+        /// Must be called after extractExpertViews(). Triggers VNNI repacking
+        /// during model loading rather than on first inference call.
+        static bool prepareExpertGemmEngines(Params &params);
+
     private:
         Params params_;
 
+#ifdef HAVE_CUDA
+        static bool prepareExpertGemmEnginesCUDA(Params &params);
+#endif
+#ifdef HAVE_ROCM
+        static bool prepareExpertGemmEnginesROCm(Params &params);
+#endif
+
         /// Stashed routing results from last execute() — for snapshot capture.
         /// Stored as FP32 [seq_len, top_k] so buildDumpInfoImpl() can expose them.
-        mutable std::vector<float> routing_indices_f32_;  ///< Expert IDs cast to float
-        mutable std::vector<float> routing_weights_;      ///< Normalized top-k weights
-        mutable std::vector<float> router_logits_;        ///< Raw router logits [seq_len, num_experts]
+        mutable std::vector<float> routing_indices_f32_; ///< Expert IDs cast to float
+        mutable std::vector<float> routing_weights_;     ///< Normalized top-k weights
+        mutable std::vector<float> router_logits_;       ///< Raw router logits [seq_len, num_experts]
 
-        /// CPU execution path: inline dequantization + scalar GEMV
-        bool executeCPU(IDeviceContext *ctx);
+        /// Cached GEMM engines per expert (resolved on first execute)
+        mutable std::vector<ITensorGemm *> cached_gate_gemm_;
+        mutable std::vector<ITensorGemm *> cached_up_gemm_;
+        mutable std::vector<ITensorGemm *> cached_down_gemm_;
 
-        /// GPU execution path: KernelFactory GEMM per active expert
-        bool executeGPU(IDeviceContext *ctx);
+        /// Reusable scratch tensors (allocated on first use, grown if needed)
+        mutable std::shared_ptr<FP32Tensor> scratch_batch_;
+        mutable std::shared_ptr<FP32Tensor> scratch_gate_;
+        mutable std::shared_ptr<FP32Tensor> scratch_up_;
+        mutable std::shared_ptr<FP32Tensor> scratch_out_;
+        mutable int scratch_capacity_ = 0;
 
-        /// Execute routing: softmax top-k selection (CPU always)
-        bool executeRouting(
-            const float *hidden, int seq_len, int d_model,
-            const float *gate_w, int num_experts, int top_k,
-            std::vector<int> &expert_indices,
-            std::vector<float> &expert_weights) const;
+        /// Cached MoE kernel (routing, gather/scatter, SwiGLU fallback)
+        mutable IMoEKernel *moe_kernel_ = nullptr;
+
+        void ensureGemmEnginesCached() const;
+        IMoEKernel *ensureMoEKernel() const;
 
         /// Stash routing results for snapshot capture
         void stashRoutingResults(
             const std::vector<int> &expert_indices,
             const std::vector<float> &expert_weights,
             int seq_len, int top_k) const;
-
-        /// Execute SwiGLU FFN for a single expert on gathered tokens (CPU path)
-        bool executeExpertFFN(
-            const float *input_tokens, int num_tokens, int d_model,
-            const float *gate_w, const float *up_w, const float *down_w,
-            int intermediate, float *output) const;
     };
 
     /**
@@ -142,11 +169,11 @@ namespace llaminar2
         {
             STAGE_PARAMS_COMMON_FIELDS;
 
-            TensorBase *input = nullptr;    ///< Normalized hidden [seq_len, d_model]
-            TensorBase *gate_w = nullptr;   ///< Shared expert gate [intermediate, d_model]
-            TensorBase *up_w = nullptr;     ///< Shared expert up [intermediate, d_model]
-            TensorBase *down_w = nullptr;   ///< Shared expert down [d_model, intermediate]
-            TensorBase *output = nullptr;   ///< Output [seq_len, d_model]
+            TensorBase *input = nullptr;  ///< Normalized hidden [seq_len, d_model]
+            TensorBase *gate_w = nullptr; ///< Shared expert gate [intermediate, d_model]
+            TensorBase *up_w = nullptr;   ///< Shared expert up [intermediate, d_model]
+            TensorBase *down_w = nullptr; ///< Shared expert down [d_model, intermediate]
+            TensorBase *output = nullptr; ///< Output [seq_len, d_model]
             int seq_len = 0;
             int d_model = 0;
             int intermediate = 0;
@@ -168,8 +195,18 @@ namespace llaminar2
     private:
         Params params_;
 
-        bool executeCPU_SharedExpert(IDeviceContext *ctx);
-        bool executeGPU_SharedExpert(IDeviceContext *ctx);
+        mutable ITensorGemm *cached_gate_gemm_ = nullptr;
+        mutable ITensorGemm *cached_up_gemm_ = nullptr;
+        mutable ITensorGemm *cached_down_gemm_ = nullptr;
+        mutable std::shared_ptr<FP32Tensor> scratch_gate_;
+        mutable std::shared_ptr<FP32Tensor> scratch_up_;
+        mutable int scratch_seq_len_ = 0;
+
+        void ensureGemmEnginesCached() const;
+
+        /// Cached MoE kernel for SwiGLU fallback
+        mutable IMoEKernel *moe_kernel_ = nullptr;
+        IMoEKernel *ensureMoEKernel() const;
     };
 
     /**
@@ -187,9 +224,9 @@ namespace llaminar2
         {
             STAGE_PARAMS_COMMON_FIELDS;
 
-            TensorBase *input = nullptr;          ///< Normalized hidden [seq_len, d_model]
-            TensorBase *gate_inp = nullptr;        ///< Gate vector [d_model]
-            TensorBase *shared_output = nullptr;   ///< Shared expert output (in-place) [seq_len, d_model]
+            TensorBase *input = nullptr;         ///< Normalized hidden [seq_len, d_model]
+            TensorBase *gate_inp = nullptr;      ///< Gate vector [d_model]
+            TensorBase *shared_output = nullptr; ///< Shared expert output (in-place) [seq_len, d_model]
             int seq_len = 0;
             int d_model = 0;
 
@@ -209,6 +246,10 @@ namespace llaminar2
 
     private:
         Params params_;
+
+        /// Cached MoE kernel for sigmoid gating
+        mutable IMoEKernel *moe_kernel_ = nullptr;
+        IMoEKernel *ensureMoEKernel() const;
     };
 
 } // namespace llaminar2

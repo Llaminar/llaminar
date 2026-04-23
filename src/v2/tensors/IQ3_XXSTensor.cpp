@@ -59,9 +59,9 @@ namespace llaminar2
           view_byte_offset_(byte_offset), parent_(parent), device_(DeviceId::cpu()), device_blocks_(nullptr) {}
     // Zero-copy constructor for mmap-backed data
     IQ3_XXSTensor::IQ3_XXSTensor(const std::vector<size_t> &shape,
-          const uint8_t *mmap_data,
-          size_t byte_size,
-          std::shared_ptr<void> mmap_lifetime_owner)
+                                 const uint8_t *mmap_data,
+                                 size_t byte_size,
+                                 std::shared_ptr<void> mmap_lifetime_owner)
         : shape_(shape), is_view_(true), raw_data_(), raw_data_ptr_(mmap_data),
           view_byte_offset_(0), parent_(nullptr), mmap_owner_(std::move(mmap_lifetime_owner)),
           data_byte_size_(byte_size), device_(DeviceId::cpu()), device_blocks_(nullptr)
@@ -87,7 +87,6 @@ namespace llaminar2
                                         std::to_string(expected_bytes) + ")");
         }
     }
-
 
     std::shared_ptr<TensorBase> IQ3_XXSTensor::create_view(
         const std::vector<size_t> &view_shape, size_t offset_elements)
@@ -217,7 +216,6 @@ namespace llaminar2
 #endif
 
     IQ3_XXSTensor::~IQ3_XXSTensor() {}
-
 
     const float *IQ3_XXSTensor::data() const
     {
@@ -435,7 +433,6 @@ namespace llaminar2
         // Unpack all 8 sub-blocks (256 elements total)
         simd::unpack_iq3_xxs_superblock_to_int8(super_block, output, scales, mins);
     }
-
 
     void IQ3_XXSTensor::packVnniBlock(const VnniPackContext &ctx, int n, int b) const
     {
