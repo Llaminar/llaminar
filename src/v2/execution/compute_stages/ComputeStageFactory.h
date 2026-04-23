@@ -26,6 +26,7 @@
 #include "stages/SendActivationsStage.h"
 #include "stages/ReceiveActivationsStage.h"
 #include "stages/MoEStages.h"
+#include "stages/MoEFFNStage.h"
 #include "stages/QKNormStage.h"
 #include "stages/FusedResidualNormStage.h"
 #include "stages/GDNProjectionStage.h"
@@ -193,6 +194,24 @@ namespace llaminar2
          */
         static std::unique_ptr<IComputeStage> createMoECombine(
             const MoECombineStage::Params &params);
+
+        /**
+         * @brief Create a unified MoE FFN stage (router + expert SwiGLU + combine)
+         */
+        static std::unique_ptr<IComputeStage> createMoEFFN(
+            const MoEFFNStage::Params &params);
+
+        /**
+         * @brief Create a shared expert FFN stage (always-active dense SwiGLU)
+         */
+        static std::unique_ptr<IComputeStage> createSharedExpertFFN(
+            const SharedExpertFFNStage::Params &params);
+
+        /**
+         * @brief Create a shared expert sigmoid gate stage
+         */
+        static std::unique_ptr<IComputeStage> createSharedExpertGate(
+            const SharedExpertGateStage::Params &params);
 
         // =====================================================================
         // GDN (Gated Delta Net) Stages

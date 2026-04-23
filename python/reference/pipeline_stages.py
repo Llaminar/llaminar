@@ -55,6 +55,13 @@ class PipelineStage(Enum):
     GDN_DELTA_RULE_OUTPUT = auto()  # Output of chunk/recurrent gated delta rule kernel
     GDN_NORM_GATE_OUTPUT = auto()   # Output of RMSNormGated (norm + SiLU gate with z)
 
+    # === Mixture of Experts ===
+    MOE_ROUTER_OUTPUT = auto()      # Router logits [seq_len, num_experts]
+    MOE_EXPERT_OUTPUT = auto()      # Combined routed expert output [seq_len, d_model]
+    MOE_SHARED_EXPERT_OUTPUT = auto()  # Shared expert FFN output (before gate)
+    MOE_SHARED_GATE_OUTPUT = auto()    # Gated shared expert output (after sigmoid gate)
+    MOE_COMBINED_OUTPUT = auto()    # Final MoE output (routed + shared expert)
+
     # === Extensibility ===
     CUSTOM = auto()                 # Custom stage for architecture-specific extensions
 
@@ -85,6 +92,11 @@ _STAGE_TO_STRING: Dict[PipelineStage, str] = {
     PipelineStage.GDN_Z_PROJECTION: "GDN_Z_PROJECTION",
     PipelineStage.GDN_DELTA_RULE_OUTPUT: "GDN_DELTA_RULE_OUTPUT",
     PipelineStage.GDN_NORM_GATE_OUTPUT: "GDN_NORM_GATE_OUTPUT",
+    PipelineStage.MOE_ROUTER_OUTPUT: "MOE_ROUTER_OUTPUT",
+    PipelineStage.MOE_EXPERT_OUTPUT: "MOE_EXPERT_OUTPUT",
+    PipelineStage.MOE_SHARED_EXPERT_OUTPUT: "MOE_SHARED_EXPERT_OUTPUT",
+    PipelineStage.MOE_SHARED_GATE_OUTPUT: "MOE_SHARED_GATE_OUTPUT",
+    PipelineStage.MOE_COMBINED_OUTPUT: "MOE_COMBINED_OUTPUT",
     PipelineStage.CUSTOM: "CUSTOM",
 }
 

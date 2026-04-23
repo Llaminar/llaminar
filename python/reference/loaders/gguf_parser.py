@@ -392,6 +392,11 @@ class GGUFParser:
             block_size = 256
             n_blocks = (n_elements + block_size - 1) // block_size
             return n_blocks * 176
+        elif tensor_type == GGUFTensorType.Q4_K:
+            # Q4_K: 256 elements per block, 144 bytes per block (2d+2dmin+12scales+128qs)
+            block_size = 256
+            n_blocks = (n_elements + block_size - 1) // block_size
+            return n_blocks * 144
         elif tensor_type == GGUFTensorType.Q4_1:
             # Q4_1: 32 elements per block, 20 bytes per block (2 scale + 2 min + 16 data)
             block_size = 32
@@ -468,7 +473,7 @@ class GGUFParser:
                 break
         
         # Qwen 3.5 Gated Delta Net specific metadata
-        if model_type == 'qwen35':
+        if model_type in ('qwen35', 'qwen35moe'):
             qwen35_keys = {
                 'attention.head_count_kv': 'num_key_value_heads',
                 'attention.key_length': 'head_dim',
@@ -490,6 +495,19 @@ class GGUFParser:
             dim_sections_key = prefix + 'rope.dimension_sections'
             if dim_sections_key in self.metadata:
                 config['rope_dimension_sections'] = self.metadata[dim_sections_key]
+
+        # Qwen 3.5 MoE specific metadata
+        if model_type == 'qwen35moe':
+            moe_keys = {
+                'expert_count': 'num_experts',
+                'expert_used_count': 'num_experts_per_tok',
+                'expert_feed_forward_length': 'moe_intermediate_size',
+                'expert_shared_feed_forward_length': 'shared_expert_intermediate_size',
+            }
+            for gguf_key, hf_key in moe_keys.items():
+                full_key = prefix + gguf_key
+                if full_key in self.metadata:
+                    config[hf_key] = self.metadata[full_key]
         
         return config
     

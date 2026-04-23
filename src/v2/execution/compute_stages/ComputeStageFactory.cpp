@@ -106,8 +106,25 @@ namespace llaminar2
     std::unique_ptr<IComputeStage> ComputeStageFactory::createMoECombine(
         const MoECombineStage::Params &params)
     {
-        // Unified: MoECombineStage will use KernelFactory at execute-time
         return std::make_unique<MoECombineStage>(params);
+    }
+
+    std::unique_ptr<IComputeStage> ComputeStageFactory::createMoEFFN(
+        const MoEFFNStage::Params &params)
+    {
+        return std::make_unique<MoEFFNStage>(params);
+    }
+
+    std::unique_ptr<IComputeStage> ComputeStageFactory::createSharedExpertFFN(
+        const SharedExpertFFNStage::Params &params)
+    {
+        return std::make_unique<SharedExpertFFNStage>(params);
+    }
+
+    std::unique_ptr<IComputeStage> ComputeStageFactory::createSharedExpertGate(
+        const SharedExpertGateStage::Params &params)
+    {
+        return std::make_unique<SharedExpertGateStage>(params);
     }
 
     std::unique_ptr<IComputeStage> ComputeStageFactory::createAllreduce(

@@ -66,6 +66,9 @@ namespace llaminar2
         MOE_EXPERT_OUTPUT,        ///< Scratch for per-expert FFN output
         MOE_COMBINED_OUTPUT,      ///< Final combined expert output
         MOE_SHARED_EXPERT_OUTPUT, ///< Shared expert FFN output
+        MOE_SHARED_GATE_OUTPUT,   ///< Shared expert after sigmoid gating
+        MOE_GATE_SCRATCH,         ///< Expert gate projection scratch [seq, intermediate]
+        MOE_UP_SCRATCH,           ///< Expert up projection scratch [seq, intermediate]
 
         // ── GDN (Gated Delta Network) buffers ───────────────────────────
         ATTN_OUTPUT_GATE,   ///< Sigmoid gate weight for attention output [batch, d_model]
@@ -149,6 +152,12 @@ namespace llaminar2
             return "MOE_COMBINED_OUTPUT";
         case BufferId::MOE_SHARED_EXPERT_OUTPUT:
             return "MOE_SHARED_EXPERT_OUTPUT";
+        case BufferId::MOE_SHARED_GATE_OUTPUT:
+            return "MOE_SHARED_GATE_OUTPUT";
+        case BufferId::MOE_GATE_SCRATCH:
+            return "MOE_GATE_SCRATCH";
+        case BufferId::MOE_UP_SCRATCH:
+            return "MOE_UP_SCRATCH";
         case BufferId::ATTN_OUTPUT_GATE:
             return "ATTN_OUTPUT_GATE";
         case BufferId::GDN_CONV_STATE:

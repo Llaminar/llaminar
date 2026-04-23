@@ -1141,6 +1141,7 @@ add_library(llaminar2_core STATIC
     execution/compute_stages/stages/SendActivationsStage.cpp
     execution/compute_stages/stages/ReceiveActivationsStage.cpp
     execution/compute_stages/stages/MoEStages.cpp
+    execution/compute_stages/stages/MoEFFNStage.cpp
     execution/compute_stages/stages/AttentionOutputGateStage.cpp
     execution/compute_stages/stages/GatedRMSNormStage.cpp
     execution/compute_stages/stages/GDNProjectionStage.cpp
@@ -1282,7 +1283,11 @@ add_library(llaminar2_core STATIC
     models/qwen/Qwen2BufferSpec.cpp
     # Qwen3.5 Dense (hybrid GDN + Full Attention)
     models/qwen35/Qwen35Graph.cpp
-    models/qwen35/Qwen35GraphConfigBuilder.cpp    tensors/TensorBase.cpp
+    models/qwen35/Qwen35GraphConfigBuilder.cpp
+    # Qwen3.5 MoE (hybrid GDN + Full Attention + Mixture of Experts)
+    models/qwen35moe/Qwen35MoEGraph.cpp
+    models/qwen35moe/Qwen35MoEGraphConfigBuilder.cpp
+    tensors/TensorBase.cpp
     tensors/FP32Tensor.cpp
     tensors/FP16Tensor.cpp
     tensors/BF16Tensor.cpp

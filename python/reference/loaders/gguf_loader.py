@@ -257,9 +257,10 @@ class GGUFLoader:
                     if not HAS_TORCH:
                         raise RuntimeError("PyTorch not available but as_torch=True")
                     tensor = torch.from_numpy(fp32)
-                    if model_type == 'qwen35':
+                    if model_type in ('qwen35', 'qwen35moe'):
                         tensor = self._apply_qwen35_transforms(
-                            tensor, tensor_info.name, hf_name
+                            tensor, tensor_info.name, hf_name,
+                            metadata=parser.metadata,
                         )
                 else:
                     tensor = fp32
@@ -325,6 +326,7 @@ class GGUFLoader:
         tensor: 'torch.Tensor',
         gguf_name: str,
         hf_name: str,
+        metadata: Dict[str, Any] = None,
     ) -> 'torch.Tensor':
         """
         Apply Qwen 3.5 specific transforms to directly-mapped tensors.
@@ -334,6 +336,7 @@ class GGUFLoader:
           - norm weights (except linear_attn.norm): GGUF stores w+1 → subtract 1
           - ssm_a → A_log: GGUF stores -exp(A_log) → apply log(-x)
           - ssm_conv1d: GGUF squeezes dim-1 → unsqueeze back
+          - V-head reorder: GGUF stores V heads in tiled order → reverse to grouped
         """
         # Norm weights: reverse the +1 from pre_rmsnorm_1p convention
         # "linear_attn.norm.weight" is excluded (not pre_rmsnorm_1p)
@@ -344,11 +347,120 @@ class GGUFLoader:
         if hf_name.endswith('.A_log'):
             tensor = torch.log(-tensor)
 
+        # V-head reorder reversal: the converter reorders V heads from
+        # grouped (by K head) to tiled order for ggml broadcast.
+        # We reverse this to get back to HF's grouped order.
+        # See _LinearAttentionVReorderBase in convert_hf_to_gguf.py.
+        # NOTE: For conv1d, this also handles the unsqueeze.
+        v_head_reordered = False
+        if metadata is not None and 'linear_attn.' in hf_name:
+            tensor, v_head_reordered = self._reverse_v_head_reorder(
+                tensor, hf_name, metadata)
+
         # conv1d: converter squeezed (out, 1, kernel) → (out, kernel); unsqueeze back
-        if hf_name.endswith('conv1d.weight'):
+        # Skip if V-head reorder already handled the unsqueeze.
+        if hf_name.endswith('conv1d.weight') and not v_head_reordered:
             tensor = tensor.unsqueeze(1)  # (out, kernel) → (out, 1, kernel)
 
         return tensor
+
+    @staticmethod
+    def _reorder_v_heads(
+        tensor: 'torch.Tensor', dim: int,
+        num_k_heads: int, num_v_per_k: int, head_dim: int,
+    ) -> 'torch.Tensor':
+        """Reorder V heads along given dimension (mirrors converter's _reorder_v_heads)."""
+        shape = list(tensor.shape)
+        if dim < 0:
+            dim += len(shape)
+        new_shape = shape[:dim] + [num_k_heads, num_v_per_k, head_dim] + shape[dim + 1:]
+        tensor = tensor.reshape(*new_shape)
+        perm = list(range(len(new_shape)))
+        perm[dim], perm[dim + 1] = perm[dim + 1], perm[dim]
+        return tensor.permute(*perm).contiguous().reshape(*shape)
+
+    def _reverse_v_head_reorder(
+        self,
+        tensor: 'torch.Tensor',
+        hf_name: str,
+        metadata: Dict[str, Any],
+    ) -> tuple:
+        """
+        Reverse the V-head tiled→grouped reordering applied by the converter.
+
+        Returns (tensor, was_reordered) where was_reordered indicates if any
+        reordering was applied (used to skip redundant conv1d unsqueeze).
+
+        The converter calls _reorder_v_heads(tensor, dim, num_k_heads, num_v_per_k, head_dim)
+        which reshapes [num_k, num_v_per_k, head_dim] → swaps → [num_v_per_k, num_k, head_dim].
+
+        To reverse, we call the same function with num_k_heads and num_v_per_k swapped:
+        reshape [num_v_per_k, num_k, head_dim] → swaps → [num_k, num_v_per_k, head_dim].
+        """
+        # Extract GDN config from GGUF metadata
+        # Try model-prefixed keys first (e.g. qwen35moe.ssm.group_count),
+        # fall back to unprefixed
+        def _get(key):
+            for prefix in ('qwen35moe.', 'qwen35.', ''):
+                full = prefix + key
+                if full in metadata:
+                    return metadata[full]
+            return None
+
+        num_k_heads = _get('ssm.group_count')
+        num_v_heads = _get('ssm.time_step_rank')
+        head_k_dim = _get('ssm.state_size')  # linear_key_head_dim
+        head_v_dim = head_k_dim  # same for this architecture
+
+        if num_k_heads is None or num_v_heads is None or head_k_dim is None:
+            return tensor, False
+        if num_k_heads == num_v_heads:
+            return tensor, False  # no reorder needed when k==v heads
+
+        num_v_per_k = num_v_heads // num_k_heads
+
+        # Reverse = call reorder with num_v_per_k and num_k_heads swapped
+        if '.in_proj_qkv.' in hf_name:
+            # Only the V portion was reordered; Q and K are unchanged
+            q_dim = head_k_dim * num_k_heads
+            k_dim = head_k_dim * num_k_heads
+            q = tensor[:q_dim]
+            k = tensor[q_dim:q_dim + k_dim]
+            v = tensor[q_dim + k_dim:]
+            v = self._reorder_v_heads(v, 0, num_v_per_k, num_k_heads, head_v_dim)
+            tensor = torch.cat([q, k, v], dim=0)
+
+        elif '.in_proj_z.' in hf_name:
+            tensor = self._reorder_v_heads(tensor, 0, num_v_per_k, num_k_heads, head_v_dim)
+
+        elif '.in_proj_a.' in hf_name or '.in_proj_b.' in hf_name:
+            tensor = self._reorder_v_heads(tensor, 0, num_v_per_k, num_k_heads, 1)
+
+        elif '.A_log' in hf_name or '.dt_bias' in hf_name:
+            if tensor.ndim == 1:
+                tensor = self._reorder_v_heads(
+                    tensor.unsqueeze(-1), 0, num_v_per_k, num_k_heads, 1
+                ).squeeze(-1)
+            else:
+                tensor = self._reorder_v_heads(tensor, -1, num_v_per_k, num_k_heads, 1)
+
+        elif '.conv1d' in hf_name:
+            # Conv1d: only the V channel portion was reordered
+            # After unsqueeze: shape is (channels, 1, kernel) — operate on dim 0
+            data = tensor.squeeze()  # (channels, kernel) or (channels,)
+            qk_channels = head_k_dim * num_k_heads * 2
+            qk_part = data[:qk_channels]
+            v_part = data[qk_channels:]
+            v_part = self._reorder_v_heads(v_part, 0, num_v_per_k, num_k_heads, head_v_dim)
+            tensor = torch.cat([qk_part, v_part], dim=0)
+            tensor = tensor.unsqueeze(1)  # restore (channels, 1, kernel)
+
+        elif '.out_proj.' in hf_name:
+            tensor = self._reorder_v_heads(tensor, 1, num_v_per_k, num_k_heads, head_v_dim)
+
+        # Return True for conv1d_handled so caller skips redundant unsqueeze
+        conv1d_handled = '.conv1d' in hf_name
+        return tensor, conv1d_handled
 
     def _reconstruct_qwen35_fused_tensors(
         self,

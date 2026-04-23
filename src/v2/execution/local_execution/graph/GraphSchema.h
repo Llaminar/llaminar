@@ -78,9 +78,12 @@ namespace llaminar2
         Allreduce,
         Allgather,
 
-        // MoE (future)
-        MoERouter,
-        MoEFFN,
+        // MoE
+        MoERouter,          ///< Router: hidden × gate → softmax top-k
+        MoEFFN,             ///< Full MoE FFN: route + expert SwiGLU + combine
+        MoECombine,         ///< Weighted combination of expert outputs
+        MoESharedExpert,    ///< Always-active shared expert SwiGLU FFN
+        MoESharedGate,      ///< Sigmoid gating on shared expert output
 
         // Quantization
         Quantize,
@@ -527,6 +530,12 @@ namespace llaminar2
                 return true;
             // SSM/GDN per-head scalar parameters (e.g. ssm_a, ssm_dt) without .weight suffix
             if (name.find(".ssm_a") != std::string::npos && name.find(".weight") == std::string::npos)
+                return true;
+            // MoE 3D expert weight tensors (gate_exps, up_exps, down_exps)
+            if (name.find("_exps.weight") != std::string::npos)
+                return true;
+            // MoE router gate and shared expert sigmoid gate
+            if (name.find("ffn_gate_inp") != std::string::npos)
                 return true;
             return false;
         }

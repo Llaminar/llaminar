@@ -8971,188 +8971,34 @@ add_v2_test(V2_Perf_TurboQuant
 # Python Reference Module Tests (PyTorch parity infrastructure)
 # =============================================================================
 # The python/reference/ package provides the PyTorch reference implementation
-# used by C++ parity tests. These Python unit tests validate the reference
-# module itself: dequantization, GGUF parsing, pipeline stages, model registry.
+# used by C++ parity tests. Pytest auto-discovers all test_*.py files under
+# python/reference/tests/, so new pure-unit test files are picked up
+# automatically without editing this CMakeLists.txt.
 #
-# Test tiers:
-#   Unit   — Fast, no model files needed (~4s total)
-#   Integration — Require GGUF model files on disk (~90s total)
+# Only fast unit tests run here (no GGUF model loading, ~15s total).
+# Integration tests (model loading, inference) are excluded via --ignore
+# for pure-integration files and -k filters for mixed files.
 #
 # Python3 is already found by the parent CMakeLists.txt (src/v2/CMakeLists.txt).
 
-set(PYTHON_REFERENCE_TEST_DIR "${CMAKE_SOURCE_DIR}/../../python/reference/tests")
 set(PYTHON_REFERENCE_ROOT "${CMAKE_SOURCE_DIR}/../..")
 
-# --- Python Unit Tests (fast, no model dependencies) ---
-
-# PipelineStage enum, ModelRegistry factory, AbstractReferenceModel base class
+# Auto-discovers every test_*.py in python/reference/tests/ EXCEPT:
+#   --ignore: pure-integration files (all classes load GGUF models)
+#   -k:       integration classes in mixed files (GGUFLoading, Inference, etc.)
 add_test(
-    NAME V2_Unit_Python_Reference
+    NAME V2_Unit_Python_Reference_All
     COMMAND ${Python3_EXECUTABLE} -m pytest
-        ${PYTHON_REFERENCE_TEST_DIR}/test_reference.py
-        -v --tb=short -q
+        python/reference/tests/
+        --ignore=python/reference/tests/test_gguf_parser.py
+        --ignore=python/reference/tests/test_gguf_inference.py
+        -v --tb=short
+        -k "not (GGUFLoading or Inference or GGUFCompatLoading or GGUFDimensionOrder or DequantizationVsLlamaCpp)"
 )
-set_tests_properties(V2_Unit_Python_Reference PROPERTIES
-    LABELS "V2;Unit;Python;Reference;PipelineStage;ModelRegistry"
+set_tests_properties(V2_Unit_Python_Reference_All PROPERTIES
+    LABELS "V2;Unit;Python;Reference;Dequantize;GGUFParser;Qwen35;MoE;GatedDeltaNet"
     WORKING_DIRECTORY "${PYTHON_REFERENCE_ROOT}"
-    TIMEOUT 30
-)
-
-# Dequantization format tests (Q4_0, Q4_1, Q5_0, Q6_K, Q8_0, F16, F32)
-add_test(
-    NAME V2_Unit_Python_Dequantize
-    COMMAND ${Python3_EXECUTABLE} -m pytest
-        ${PYTHON_REFERENCE_TEST_DIR}/test_dequantize.py
-        -v --tb=short -q
-)
-set_tests_properties(V2_Unit_Python_Dequantize PROPERTIES
-    LABELS "V2;Unit;Python;Dequantize;Quantization;Q4_0;Q8_0;F16"
-    WORKING_DIRECTORY "${PYTHON_REFERENCE_ROOT}"
-    TIMEOUT 30
-)
-
-# --- Python Integration Tests (require GGUF model files) ---
-
-# Dequantization validation against real GGUF tensors
-add_test(
-    NAME V2_Integration_Python_DequantValidation
-    COMMAND ${Python3_EXECUTABLE} -m pytest
-        ${PYTHON_REFERENCE_TEST_DIR}/test_dequantization_validation.py
-        -v --tb=short -q
-)
-set_tests_properties(V2_Integration_Python_DequantValidation PROPERTIES
-    LABELS "V2;Integration;Python;Dequantize;Validation"
-    FIXTURES_REQUIRED V2_Models
-    WORKING_DIRECTORY "${PYTHON_REFERENCE_ROOT}"
-    TIMEOUT 120
-)
-
-# GGUF parser: header, metadata, tensor info from real model files
-add_test(
-    NAME V2_Integration_Python_GGUFParser
-    COMMAND ${Python3_EXECUTABLE} -m pytest
-        ${PYTHON_REFERENCE_TEST_DIR}/test_gguf_parser.py
-        -v --tb=short -q
-)
-set_tests_properties(V2_Integration_Python_GGUFParser PROPERTIES
-    LABELS "V2;Integration;Python;GGUFParser;ModelLoading"
-    FIXTURES_REQUIRED V2_Models
-    WORKING_DIRECTORY "${PYTHON_REFERENCE_ROOT}"
-    TIMEOUT 60
-)
-
-# GGUF dimension order: reversal correctness, PyTorch compatibility
-add_test(
-    NAME V2_Integration_Python_GGUFDimensionOrder
-    COMMAND ${Python3_EXECUTABLE} -m pytest
-        ${PYTHON_REFERENCE_TEST_DIR}/test_gguf_dimension_order.py
-        -v --tb=short -q
-)
-set_tests_properties(V2_Integration_Python_GGUFDimensionOrder PROPERTIES
-    LABELS "V2;Integration;Python;GGUFParser;DimensionOrder"
-    FIXTURES_REQUIRED V2_Models
-    WORKING_DIRECTORY "${PYTHON_REFERENCE_ROOT}"
-    TIMEOUT 180
-)
-
-# GGUF inference parity: end-to-end Llaminar vs PyTorch
-# Exclude tests that require the Llaminar C++ binary (llaminar_runner fixture)
-add_test(
-    NAME V2_Integration_Python_GGUFInference
-    COMMAND ${Python3_EXECUTABLE} -m pytest
-        ${PYTHON_REFERENCE_TEST_DIR}/test_gguf_inference.py
-        -v --tb=short -q
-        -k "not (llaminar_runner or llaminar_runs or logits_parity or generation_parity)"
-)
-set_tests_properties(V2_Integration_Python_GGUFInference PROPERTIES
-    LABELS "V2;Integration;Python;GGUFInference;Parity"
-    FIXTURES_REQUIRED V2_Models
-    WORKING_DIRECTORY "${PYTHON_REFERENCE_ROOT}"
-    TIMEOUT 300
-)
-
-message(STATUS "V2 Tests: Added Python reference module tests (2 unit + 4 integration)")
-
-# --- Qwen 3.5 (Gated Delta Net) Python Tests ---
-
-# Qwen 3.5 unit tests: tensor name mapping, fused tensor reconstruction,
-# transforms, config extraction, model registry (no model files required)
-add_test(
-    NAME V2_Unit_Python_Qwen35
-    COMMAND ${Python3_EXECUTABLE} -m pytest
-        ${PYTHON_REFERENCE_TEST_DIR}/test_qwen35.py
-        -v --tb=short -q
-        -k "not (GGUFLoading or Inference)"
-)
-set_tests_properties(V2_Unit_Python_Qwen35 PROPERTIES
-    LABELS "V2;Unit;Python;Qwen35;GatedDeltaNet;TensorMapping;FusedTensors"
-    WORKING_DIRECTORY "${PYTHON_REFERENCE_ROOT}"
-    TIMEOUT 30
-)
-
-# Qwen 3.5 GGUF loading integration tests: fused tensor reconstruction,
-# state dict completeness, transforms (requires Qwen3.5-0.8B-Q4_0.gguf)
-add_test(
-    NAME V2_Integration_Python_Qwen35Loading
-    COMMAND ${Python3_EXECUTABLE} -m pytest
-        ${PYTHON_REFERENCE_TEST_DIR}/test_qwen35.py
-        -v --tb=short -q
-        -k "GGUFLoading"
-)
-set_tests_properties(V2_Integration_Python_Qwen35Loading PROPERTIES
-    LABELS "V2;Integration;Python;Qwen35;GatedDeltaNet;GGUFLoading;FusedTensors"
-    FIXTURES_REQUIRED V2_Models
-    WORKING_DIRECTORY "${PYTHON_REFERENCE_ROOT}"
-    TIMEOUT 300
-)
-
-# Qwen 3.5 inference integration tests: forward pass, snapshots, NaN checks
-# (requires Qwen3.5-0.8B-Q4_0.gguf + network for tokenizer)
-add_test(
-    NAME V2_Integration_Python_Qwen35Inference
-    COMMAND ${Python3_EXECUTABLE} -m pytest
-        ${PYTHON_REFERENCE_TEST_DIR}/test_qwen35.py
-        -v --tb=short -q
-        -k "Inference"
-)
-set_tests_properties(V2_Integration_Python_Qwen35Inference PROPERTIES
-    LABELS "V2;Integration;Python;Qwen35;GatedDeltaNet;Inference;Parity"
-    FIXTURES_REQUIRED V2_Models
-    WORKING_DIRECTORY "${PYTHON_REFERENCE_ROOT}"
-    TIMEOUT 600
-)
-
-# --- HuggingFace GGUF Compatibility Shim Tests (gguf_compat.py) ---
-
-# Unit tests: patch/unpatch lifecycle, config mapping, layer types,
-# postprocess config, tensor processor transforms (no model files required)
-add_test(
-    NAME V2_Unit_Python_GGUFCompat
-    COMMAND ${Python3_EXECUTABLE} -m pytest
-        ${PYTHON_REFERENCE_TEST_DIR}/test_gguf_compat.py
-        -v --tb=short -q
-        -k "not GGUFCompatLoading"
-)
-set_tests_properties(V2_Unit_Python_GGUFCompat PROPERTIES
-    LABELS "V2;Unit;Python;GGUFCompat;Qwen35;GatedDeltaNet"
-    WORKING_DIRECTORY "${PYTHON_REFERENCE_ROOT}"
-    TIMEOUT 30
-)
-
-# Integration: full AutoModel loading via patched HF path
-# (requires models/Qwen3.5-4B-Q8_0.gguf)
-add_test(
-    NAME V2_Integration_Python_GGUFCompat
-    COMMAND ${Python3_EXECUTABLE} -m pytest
-        ${PYTHON_REFERENCE_TEST_DIR}/test_gguf_compat.py
-        -v --tb=short -q
-        -k "GGUFCompatLoading"
-)
-set_tests_properties(V2_Integration_Python_GGUFCompat PROPERTIES
-    LABELS "V2;Integration;Python;GGUFCompat;Qwen35;GatedDeltaNet;GGUFLoading"
-    FIXTURES_REQUIRED V2_Models
-    WORKING_DIRECTORY "${PYTHON_REFERENCE_ROOT}"
-    TIMEOUT 600
+    TIMEOUT 900
 )
 
 # =============================================================================
@@ -9610,5 +9456,21 @@ target_link_libraries(v2_test_device_memory_plan llaminar2_core GTest::gtest GTe
 add_v2_test(V2_Unit_DeviceMemoryPlan
     COMMAND $<TARGET_FILE:v2_test_device_memory_plan>
     LABELS "V2;Unit;Planning;MemoryPlan"
+    MPI_PROCS 1
+)
+
+# =============================================================================
+# MoE Stage Tests
+# =============================================================================
+
+# Test: MoEFFNStage — Router + Expert SwiGLU + Combine (Q4_K/Q5_K 3D weights)
+# Tests: MoEFFNStage (routing, expert FFN, combine), SharedExpertFFNStage (dense SwiGLU),
+# SharedExpertGateStage (sigmoid gating), isNonGemmWeight regression for 3D expert tensors
+add_executable(v2_test_moe_ffn_stage unit/stages/Test__MoEFFNStage.cpp)
+target_include_directories(v2_test_moe_ffn_stage PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(v2_test_moe_ffn_stage llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_MoEFFNStage
+    COMMAND $<TARGET_FILE:v2_test_moe_ffn_stage>
+    LABELS "V2;Unit;MoE;Stages;Kernels;Q4_K;Q5_K"
     MPI_PROCS 1
 )

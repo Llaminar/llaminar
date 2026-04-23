@@ -136,6 +136,34 @@ QWEN35_SHARED_MAP = {
     'blk.{}.ffn_down.weight': 'model.layers.{}.mlp.down_proj.weight',
 }
 
+# Qwen 3.5 MoE: Shared expert and router mappings
+QWEN35_MOE_MAP = {
+    # Router
+    'blk.{}.ffn_gate_inp.weight': 'model.layers.{}.mlp.gate.weight',
+    # Expert weights (3D packed tensors - bare nn.Parameter, no .weight suffix)
+    'blk.{}.ffn_gate_exps.weight': 'model.layers.{}.mlp.experts.gate_proj.weight',
+    'blk.{}.ffn_up_exps.weight': 'model.layers.{}.mlp.experts.up_proj.weight',
+    'blk.{}.ffn_down_exps.weight': 'model.layers.{}.mlp.experts.down_proj',
+    # Shared expert
+    'blk.{}.ffn_gate_shexp.weight': 'model.layers.{}.mlp.shared_expert.gate_proj.weight',
+    'blk.{}.ffn_up_shexp.weight': 'model.layers.{}.mlp.shared_expert.up_proj.weight',
+    'blk.{}.ffn_down_shexp.weight': 'model.layers.{}.mlp.shared_expert.down_proj.weight',
+    # Shared expert gate
+    'blk.{}.ffn_gate_inp_shexp.weight': 'model.layers.{}.mlp.shared_expert_gate.weight',
+}
+
+# Qwen 3.5 MoE shared mappings (same as dense but without ffn_gate/up/down)
+QWEN35_MOE_SHARED_MAP = {
+    # Embedding and output
+    'token_embd.weight': 'model.embed_tokens.weight',
+    'output.weight': 'lm_head.weight',
+    'output_norm.weight': 'model.norm.weight',
+
+    # Per-layer (shared by both linear and full attention layers)
+    'blk.{}.attn_norm.weight': 'model.layers.{}.input_layernorm.weight',
+    'blk.{}.post_attention_norm.weight': 'model.layers.{}.post_attention_layernorm.weight',
+}
+
 class TensorNameMapper:
     """
     Maps GGUF tensor names to HuggingFace naming conventions.
@@ -166,9 +194,13 @@ class TensorNameMapper:
             # The fused tensors (attn_qkv, attn_gate, ssm_alpha, ssm_beta) are
             # handled separately in gguf_loader.py, not by simple name mapping.
             self.mapping = {**QWEN35_SHARED_MAP, **QWEN35_FULL_ATTN_MAP, **QWEN35_LINEAR_ATTN_MAP}
+        elif self.model_type == 'qwen35moe':
+            # Qwen 3.5 MoE: same attention as dense but MoE FFN instead of dense FFN
+            self.mapping = {**QWEN35_MOE_SHARED_MAP, **QWEN35_FULL_ATTN_MAP,
+                            **QWEN35_LINEAR_ATTN_MAP, **QWEN35_MOE_MAP}
         else:
             raise ValueError(f"Unsupported model type: {model_type}. "
-                           f"Supported: qwen2, llama, qwen35")
+                           f"Supported: qwen2, llama, qwen35, qwen35moe")
     
     def map_name(self, gguf_name: str) -> str:
         """
@@ -255,7 +287,9 @@ def detect_model_type_from_metadata(metadata: dict) -> str:
     # Check general.architecture key
     if 'general.architecture' in metadata:
         arch = metadata['general.architecture'].lower()
-        if arch == 'qwen35':
+        if arch == 'qwen35moe':
+            return 'qwen35moe'
+        elif arch == 'qwen35':
             return 'qwen35'
         elif 'qwen' in arch:
             return 'qwen2'
@@ -263,7 +297,9 @@ def detect_model_type_from_metadata(metadata: dict) -> str:
             return 'llama'
     
     # Fallback: check for model-specific keys
-    if any(k.startswith('qwen35') for k in metadata):
+    if any(k.startswith('qwen35moe') for k in metadata):
+        return 'qwen35moe'
+    elif any(k.startswith('qwen35') for k in metadata):
         return 'qwen35'
     elif any(k.startswith('qwen') for k in metadata):
         return 'qwen2'
@@ -287,9 +323,9 @@ def create_mapper_from_metadata(metadata: dict) -> TensorNameMapper:
     model_type = detect_model_type_from_metadata(metadata)
     
     kwargs = {}
-    if model_type == 'qwen35':
+    if model_type in ('qwen35', 'qwen35moe'):
         # Extract full_attention_interval for heterogeneous layer type detection
-        interval_key = 'qwen35.full_attention_interval'
+        interval_key = 'qwen35moe.full_attention_interval' if model_type == 'qwen35moe' else 'qwen35.full_attention_interval'
         if interval_key in metadata:
             kwargs['full_attention_interval'] = metadata[interval_key]
     

@@ -16,6 +16,8 @@
 #include "qwen3/Qwen3Schema.h"
 #include "qwen35/Qwen35Graph.h"
 #include "qwen35/Qwen35Schema.h"
+#include "qwen35moe/Qwen35MoEGraph.h"
+#include "qwen35moe/Qwen35MoESchema.h"
 #include "../execution/local_execution/graph/GraphBuilderRegistry.h"
 #include "../execution/local_execution/graph/SchemaFactoryRegistry.h"
 
@@ -61,6 +63,19 @@ namespace llaminar2
         SchemaFactoryRegistry::registerFactory("qwen35",
                                                []()
                                                { return std::make_unique<Qwen35SchemaFactory>(); });
+
+        // =================================================================
+        // Qwen3.5 MoE (hybrid GDN + Full Attention + Mixture of Experts)
+        // =================================================================
+        GraphBuilderRegistry::registerFactory("qwen35moe",
+                                              [](const GraphConfig &cfg, std::shared_ptr<IMPIContext> mpi)
+                                              {
+                                                  return std::make_shared<Qwen35MoEGraph>(cfg, std::move(mpi));
+                                              });
+
+        SchemaFactoryRegistry::registerFactory("qwen35moe",
+                                               []()
+                                               { return std::make_unique<Qwen35MoESchemaFactory>(); });
 
         // =================================================================
         // Future models: add registration calls here
