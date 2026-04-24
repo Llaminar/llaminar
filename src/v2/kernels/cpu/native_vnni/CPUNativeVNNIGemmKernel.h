@@ -308,8 +308,15 @@ namespace llaminar2::cpu::native_vnni
             if (swiglu_scratch_.size() < needed)
                 swiglu_scratch_.resize(needed);
 
-            primitives::compute_swiglu(gate_fp32, up_fp32, swiglu_scratch_.data(),
-                                       static_cast<int>(input_size));
+            // M=1 decode: use serial SwiGLU to avoid OMP fork/join overhead.
+            // For MoE experts with intermediate=512, the 512-element SwiGLU
+            // takes ~0.1µs in SIMD vs ~6µs OMP barrier cost.
+            if (m == 1)
+                primitives::compute_swiglu_serial(gate_fp32, up_fp32, swiglu_scratch_.data(),
+                                                  static_cast<int>(input_size));
+            else
+                primitives::compute_swiglu(gate_fp32, up_fp32, swiglu_scratch_.data(),
+                                           static_cast<int>(input_size));
 
             // Apply activation rotation for kurtosis reduction (if configured)
             const float *gemm_input = maybe_rotate_activation(swiglu_scratch_.data(), m, k);
