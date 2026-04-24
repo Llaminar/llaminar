@@ -485,11 +485,11 @@ namespace llaminar2::cpu::native_vnni
                     }
 
                     // Build fused GEMV descriptors
-                    FusedGemvDesc descs[8]; // Stack-allocated, max 8 projections
+                    FusedGemvDesc descs[16]; // Stack-allocated, max 16 projections (MoE batches 8 gate+up)
                     int num_descs = 0;
                     for (const auto &proj : projections)
                     {
-                        if (num_descs >= 8)
+                        if (num_descs >= 16)
                             break;
                         auto *vnni = static_cast<CPUNativeVNNIGemmKernel *>(proj.kernel);
                         auto &d = descs[num_descs++];

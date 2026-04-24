@@ -314,34 +314,47 @@ namespace llaminar2
         // Ensure GEMM engines are cached
         ensureGemmEnginesCached();
 
-        // Ensure scratch buffers for M=1 (allocated once, reused across experts)
-        if (scratch_capacity_ < 1)
+        // Ensure batch scratch buffers for gate+up (one per top-k expert).
+        // All experts' gate+up are fused into a single OMP region, so we need
+        // all outputs to exist simultaneously.
+        if (static_cast<int>(scratch_gate_batch_.size()) < top_k)
         {
-            scratch_gate_ = std::make_shared<FP32Tensor>(
-                std::vector<size_t>{1, static_cast<size_t>(intermediate)});
-            scratch_up_ = std::make_shared<FP32Tensor>(
-                std::vector<size_t>{1, static_cast<size_t>(intermediate)});
+            scratch_gate_batch_.resize(top_k);
+            scratch_up_batch_.resize(top_k);
+            for (int i = 0; i < top_k; ++i)
+            {
+                scratch_gate_batch_[i] = std::make_shared<FP32Tensor>(
+                    std::vector<size_t>{1, static_cast<size_t>(intermediate)});
+                scratch_up_batch_[i] = std::make_shared<FP32Tensor>(
+                    std::vector<size_t>{1, static_cast<size_t>(intermediate)});
+            }
+        }
+        // Scratch for down projection output (reused per expert)
+        if (!scratch_out_)
+        {
             scratch_out_ = std::make_shared<FP32Tensor>(
                 std::vector<size_t>{1, static_cast<size_t>(d_model)});
-            scratch_capacity_ = 1;
         }
 
         // Use input tensor directly (no gather needed for 1 token)
         const TensorBase *input_tensor = params_.input;
 
-        // Pre-allocate projections vector ONCE (reuse across experts, update kernel ptrs)
-        std::vector<ITensorGemm::TensorProjectionDesc> projections = {
-            {nullptr, scratch_gate_.get(), intermediate, nullptr, "gate"},
-            {nullptr, scratch_up_.get(), intermediate, nullptr, "up"}};
+        // ---------------------------------------------------------------
+        // Phase 1: Batch all experts' gate+up into ONE fused GEMV call.
+        // This quantizes the input to Q8_1 once (not 8×) and uses a single
+        // OMP parallel region (not 8×), saving ~7×(2µs quant + 6µs OMP)
+        // = ~56µs per layer × 36 MoE layers = ~2ms per decode token.
+        // ---------------------------------------------------------------
+        struct ActiveExpert { int expert_id; float weight; int batch_idx; };
+        ActiveExpert active_experts[16]; // stack-allocated, max top_k
+        int num_active = 0;
 
-        // Get raw pointer to scratch output ONCE (avoids per-expert mutex in data())
-        float *scratch_out_ptr = scratch_out_->mutable_data();
+        batch_projections_.clear();
+        batch_projections_.reserve(top_k * 2);
 
-        // Process each selected expert directly — no grouping overhead
         for (int k = 0; k < top_k; ++k)
         {
             const int expert_id = routing.expert_indices[k];
-            const float weight = routing.expert_weights[k];
 
             // EP: skip experts not assigned to this rank
             if (expert_id < local_start || expert_id >= local_end)
@@ -349,34 +362,60 @@ namespace llaminar2
 
             ITensorGemm *gate_gemm = cached_gate_gemm_[expert_id];
             ITensorGemm *up_gemm = cached_up_gemm_[expert_id];
-            ITensorGemm *down_gemm = cached_down_gemm_[expert_id];
 
-            if (!gate_gemm || !up_gemm || !down_gemm)
+            if (!gate_gemm || !up_gemm)
             {
-                LOG_ERROR("[MoEFFNStage] Null GEMM engine for expert " << expert_id);
+                LOG_ERROR("[MoEFFNStage] Null gate/up GEMM engine for expert " << expert_id);
                 return false;
             }
 
-            // Gate+Up fused projection (quantizes input once, produces both outputs)
-            projections[0].kernel = gate_gemm;
-            projections[1].kernel = up_gemm;
-            gate_gemm->multiply_fused_tensor(
-                input_tensor, projections, /*m=*/1, d_model);
+            batch_projections_.push_back(
+                {gate_gemm, scratch_gate_batch_[num_active].get(), intermediate, nullptr, "gate"});
+            batch_projections_.push_back(
+                {up_gemm, scratch_up_batch_[num_active].get(), intermediate, nullptr, "up"});
+
+            active_experts[num_active] = {expert_id, routing.expert_weights[k], num_active};
+            num_active++;
+        }
+
+        // Single fused call: quantize once + single OMP region for all gate+up
+        if (num_active > 0)
+        {
+            batch_projections_[0].kernel->multiply_fused_tensor(
+                input_tensor, batch_projections_, /*m=*/1, d_model);
+        }
+
+        // ---------------------------------------------------------------
+        // Phase 2: Per-expert SwiGLU + Down projection + weighted accumulate
+        // ---------------------------------------------------------------
+        float *scratch_out_ptr = scratch_out_->mutable_data();
+
+        for (int i = 0; i < num_active; ++i)
+        {
+            const auto &info = active_experts[i];
+            ITensorGemm *down_gemm = cached_down_gemm_[info.expert_id];
+
+            if (!down_gemm)
+            {
+                LOG_ERROR("[MoEFFNStage] Null down GEMM engine for expert " << info.expert_id);
+                return false;
+            }
 
             // SwiGLU + Down projection
             fusedSwigluDown(
-                scratch_gate_.get(), scratch_up_.get(), scratch_out_.get(),
+                scratch_gate_batch_[info.batch_idx].get(),
+                scratch_up_batch_[info.batch_idx].get(),
+                scratch_out_.get(),
                 down_gemm, kernel, /*m=*/1, d_model, intermediate);
 
-            // Direct weighted accumulation (replaces scatter for single token)
-            // scratch_out_ was just written by fusedSwigluDown, read via raw ptr
-            for (int i = 0; i < d_model; ++i)
+            // Direct weighted accumulation
+            for (int j = 0; j < d_model; ++j)
             {
-                output[i] += weight * scratch_out_ptr[i];
+                output[j] += info.weight * scratch_out_ptr[j];
             }
         }
 
-        LOG_DEBUG("[MoEFFNStage] Single-token decode: " << top_k << " experts");
+        LOG_DEBUG("[MoEFFNStage] Single-token decode (batched gate+up): " << num_active << " experts");
         return true;
     }
 

@@ -151,6 +151,14 @@ namespace llaminar2
         mutable std::shared_ptr<FP32Tensor> scratch_out_;
         mutable int scratch_capacity_ = 0;
 
+        /// Batched gate+up scratch buffers for M=1 decode (one per top-k expert).
+        /// Enables fusing all experts' gate+up into a single OMP region.
+        mutable std::vector<std::shared_ptr<FP32Tensor>> scratch_gate_batch_;
+        mutable std::vector<std::shared_ptr<FP32Tensor>> scratch_up_batch_;
+
+        /// Reusable projection descriptor vector (avoids per-call heap alloc)
+        mutable std::vector<ITensorGemm::TensorProjectionDesc> batch_projections_;
+
         /// Cached MoE kernel (routing, gather/scatter, SwiGLU fallback)
         mutable IMoEKernel *moe_kernel_ = nullptr;
 
