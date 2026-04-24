@@ -323,6 +323,8 @@ namespace llaminar2
 
     ShardingMode WeightManager::getShardingMode(const std::string &name) const
     {
+        std::lock_guard<std::mutex> lock(sharding_mode_cache_mutex_);
+
         // Check cache first
         auto it = sharding_mode_cache_.find(name);
         if (it != sharding_mode_cache_.end())
@@ -2781,9 +2783,11 @@ namespace llaminar2
 
                     // Release mmap pages for this weight now that the GEMM engine
                     // has its own copy (VNNI-packed on CPU, or uploaded to GPU).
-                    // is_view() identifies mmap-backed tensors — we must NOT call
-                    // MADV_DONTNEED on heap-allocated data (it would zero the pages).
-                    if (job.tensor && job.tensor->is_view())
+                    // is_mmap_data() checks the tensor's data is actually in an
+                    // mmap'd region. is_view() is NOT safe here — TensorSlice
+                    // (from TP sharding) returns is_view()=true but has heap data.
+                    // MADV_DONTNEED on heap pages zeroes them, causing corruption.
+                    if (job.tensor && job.tensor->is_mmap_data())
                     {
                         MmapRegion::adviseDontneedRange(
                             job.tensor->raw_data(), job.tensor->size_bytes());

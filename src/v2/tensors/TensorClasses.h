@@ -1289,6 +1289,20 @@ namespace llaminar2
         virtual bool is_raw_data_released() const { return false; }
 
         /**
+         * @brief Check if the tensor's data resides in an mmap'd region.
+         *
+         * Returns true only when raw_data() points into a memory-mapped file
+         * (GGUF mmap). Use this instead of is_view() when deciding whether it
+         * is safe to call madvise(MADV_DONTNEED) — calling MADV_DONTNEED on
+         * heap-allocated data zeroes the pages and corrupts the heap.
+         *
+         * TensorSlice delegates to its inner tensor; heap-owning tensors
+         * created by loadTensorRowSlice() return false even though
+         * TensorSlice::is_view() returns true.
+         */
+        virtual bool is_mmap_data() const { return false; }
+
+        /**
          * @brief Release ALL host-side weight data for GPU-offloaded tensors
          *
          * After weights have been uploaded to GPU, this frees:
@@ -3105,6 +3119,7 @@ namespace llaminar2
             }
         }
         bool is_raw_data_released() const override { return raw_data_released_; }
+        bool is_mmap_data() const override { return mmap_owner_ != nullptr; }
 
         void release_host_weight_data() override
         {
@@ -3356,6 +3371,7 @@ namespace llaminar2
             }
         }
         bool is_raw_data_released() const override { return raw_data_released_; }
+        bool is_mmap_data() const override { return mmap_owner_ != nullptr; }
 
         void release_host_weight_data() override
         {
@@ -4607,6 +4623,7 @@ namespace llaminar2
             }
         }
         bool is_raw_data_released() const override { return raw_data_released_; }
+        bool is_mmap_data() const override { return mmap_owner_ != nullptr; }
 
         void release_host_weight_data() override
         {
@@ -4827,6 +4844,7 @@ namespace llaminar2
             }
         }
         bool is_raw_data_released() const override { return raw_data_released_; }
+        bool is_mmap_data() const override { return mmap_owner_ != nullptr; }
 
         void release_host_weight_data() override
         {
@@ -5045,6 +5063,7 @@ namespace llaminar2
             }
         }
         bool is_raw_data_released() const override { return raw_data_released_; }
+        bool is_mmap_data() const override { return mmap_owner_ != nullptr; }
 
         void release_host_weight_data() override
         {
@@ -5254,6 +5273,7 @@ namespace llaminar2
             }
         }
         bool is_raw_data_released() const override { return raw_data_released_; }
+        bool is_mmap_data() const override { return mmap_owner_ != nullptr; }
 
         void release_host_weight_data() override
         {
@@ -5459,6 +5479,7 @@ namespace llaminar2
             }
         }
         bool is_raw_data_released() const override { return raw_data_released_; }
+        bool is_mmap_data() const override { return mmap_owner_ != nullptr; }
 
         void release_host_weight_data() override
         {
@@ -5627,6 +5648,7 @@ namespace llaminar2
             }
         }
         bool is_raw_data_released() const override { return raw_data_released_; }
+        bool is_mmap_data() const override { return mmap_owner_ != nullptr; }
 
         void release_host_weight_data() override
         {
@@ -5809,6 +5831,7 @@ namespace llaminar2
             }
         }
         bool is_raw_data_released() const override { return raw_data_released_; }
+        bool is_mmap_data() const override { return mmap_owner_ != nullptr; }
 
         void release_host_weight_data() override
         {
@@ -5968,6 +5991,7 @@ namespace llaminar2
             }
         }
         bool is_raw_data_released() const override { return raw_data_released_; }
+        bool is_mmap_data() const override { return mmap_owner_ != nullptr; }
 
         void release_host_weight_data() override
         {
@@ -6136,6 +6160,7 @@ namespace llaminar2
             }
         }
         bool is_raw_data_released() const override { return raw_data_released_; }
+        bool is_mmap_data() const override { return mmap_owner_ != nullptr; }
 
         void release_host_weight_data() override
         {
@@ -6308,6 +6333,7 @@ namespace llaminar2
             }
         }
         bool is_raw_data_released() const override { return raw_data_released_; }
+        bool is_mmap_data() const override { return mmap_owner_ != nullptr; }
 
         void release_host_weight_data() override
         {
@@ -6509,6 +6535,7 @@ namespace llaminar2
             }
         }
         bool is_raw_data_released() const override { return raw_data_released_; }
+        bool is_mmap_data() const override { return mmap_owner_ != nullptr; }
 
         void release_host_weight_data() override
         {
@@ -6708,6 +6735,7 @@ namespace llaminar2
             }
         }
         bool is_raw_data_released() const override { return raw_data_released_; }
+        bool is_mmap_data() const override { return mmap_owner_ != nullptr; }
 
         void release_host_weight_data() override
         {
@@ -6895,6 +6923,7 @@ namespace llaminar2
             }
         }
         bool is_raw_data_released() const override { return raw_data_released_; }
+        bool is_mmap_data() const override { return mmap_owner_ != nullptr; }
 
         void release_host_weight_data() override
         {
@@ -7082,6 +7111,7 @@ namespace llaminar2
             }
         }
         bool is_raw_data_released() const override { return raw_data_released_; }
+        bool is_mmap_data() const override { return mmap_owner_ != nullptr; }
 
         void release_host_weight_data() override
         {
@@ -7273,6 +7303,7 @@ namespace llaminar2
             }
         }
         bool is_raw_data_released() const override { return raw_data_released_; }
+        bool is_mmap_data() const override { return mmap_owner_ != nullptr; }
 
         void release_host_weight_data() override
         {
@@ -7460,6 +7491,7 @@ namespace llaminar2
             }
         }
         bool is_raw_data_released() const override { return raw_data_released_; }
+        bool is_mmap_data() const override { return mmap_owner_ != nullptr; }
 
         void release_host_weight_data() override
         {
@@ -7651,6 +7683,7 @@ namespace llaminar2
             }
         }
         bool is_raw_data_released() const override { return raw_data_released_; }
+        bool is_mmap_data() const override { return mmap_owner_ != nullptr; }
 
         void release_host_weight_data() override
         {
@@ -7838,6 +7871,7 @@ namespace llaminar2
             }
         }
         bool is_raw_data_released() const override { return raw_data_released_; }
+        bool is_mmap_data() const override { return mmap_owner_ != nullptr; }
 
         void release_host_weight_data() override
         {

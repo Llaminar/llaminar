@@ -156,6 +156,12 @@ namespace llaminar2::test::parity
         /// Used for GLOBAL scope TP where column-parallel stages (Q/K/V projections)
         /// produce partial outputs that can't be directly compared to full PyTorch outputs.
         std::vector<std::string> excluded_stages;
+
+        /// Stages whose snapshots should be allreduced (SUM) across MPI ranks before
+        /// comparing to PyTorch reference. Used for EP/TP partial sums (e.g., MoE expert
+        /// output, shared expert output) where each rank holds a partial contribution.
+        /// Requires mpi_ctx_ to be set. Stages listed here should NOT also be excluded.
+        std::vector<std::string> allreduce_stages;
     };
 
     // =============================================================================
@@ -564,6 +570,7 @@ namespace llaminar2::test::parity
         int min_early_layers_passed = 4;               ///< Min early layers that must pass
         float kl_threshold = 0.05f;                    ///< Max KL divergence for logits
         std::vector<std::string> excluded_stages = {}; ///< Stages to exclude from parity comparison
+        std::vector<std::string> allreduce_stages = {}; ///< Stages to allreduce across MPI ranks before comparison
         float min_top1_accuracy = 80.0f;               ///< Min Top-1 accuracy %
         float min_top5_accuracy = 80.0f;               ///< Min Top-5 accuracy %
         float min_decode_pass_rate = 0.8f;             ///< Min fraction of decode steps passing
@@ -3437,6 +3444,18 @@ namespace llaminar2::test::parity
                     const float *compare_data = permuted.empty() ? llaminar_data : permuted.data();
 
                     StageComparisonResult result;
+                    // EP/TP allreduce: reconstruct full output from partial sums across ranks
+                    bool did_allreduce = false;
+                    std::vector<float> allreduced_buf;
+                    if (mpi_ctx_ && !config_.allreduce_stages.empty() &&
+                        std::find(config_.allreduce_stages.begin(), config_.allreduce_stages.end(), stage) !=
+                            config_.allreduce_stages.end())
+                    {
+                        allreduced_buf.resize(llaminar_size);
+                        mpi_ctx_->allreduce_sum(compare_data, allreduced_buf.data(), llaminar_size);
+                        compare_data = allreduced_buf.data();
+                        did_allreduce = true;
+                    }
                     if (stage == "MOE_ROUTING_INDICES")
                     {
                         result = compareRoutingIndices(compare_data, pytorch_data, llaminar_size,
@@ -3464,6 +3483,7 @@ namespace llaminar2::test::parity
 
                     // Per-stage cosine logging for diagnostics
                     LOG_INFO("[Parity] Layer " << layer_idx << " " << stage
+                                               << (did_allreduce ? " (allreduced)" : "")
                                                << " cosine=" << std::fixed << std::setprecision(6) << result.cosine_similarity
                                                << " size=" << llaminar_size);
 
@@ -4520,6 +4540,18 @@ namespace llaminar2::test::parity
                             const float *decode_compare = permuted_decode.empty() ? llaminar_data : permuted_decode.data();
 
                             StageComparisonResult result;
+                            // EP/TP allreduce: reconstruct full output from partial sums across ranks
+                            bool did_allreduce_decode = false;
+                            std::vector<float> allreduced_decode_buf;
+                            if (mpi_ctx_ && !config_.allreduce_stages.empty() &&
+                                std::find(config_.allreduce_stages.begin(), config_.allreduce_stages.end(), stage) !=
+                                    config_.allreduce_stages.end())
+                            {
+                                allreduced_decode_buf.resize(llaminar_size);
+                                mpi_ctx_->allreduce_sum(decode_compare, allreduced_decode_buf.data(), llaminar_size);
+                                decode_compare = allreduced_decode_buf.data();
+                                did_allreduce_decode = true;
+                            }
                             if (stage == "MOE_ROUTING_INDICES")
                             {
                                 result = compareRoutingIndices(decode_compare, pytorch_data, llaminar_size,

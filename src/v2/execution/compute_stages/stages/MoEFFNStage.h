@@ -62,6 +62,14 @@ namespace llaminar2
             TensorBase *down_exps = nullptr; ///< [num_experts, d_model, intermediate]
             int expert_intermediate = 0;
 
+            // Expert Parallelism (EP): partition experts across TP ranks.
+            // When active, this rank only computes experts in
+            // [local_expert_start, local_expert_start + local_expert_count).
+            // Set by graph builder when TP degree > 1.
+            // -1 means all experts (no EP, single-device mode).
+            int local_expert_start = 0;
+            int local_expert_count = -1;
+
             // Per-expert 2D tensor views — used by GPU path
             // Each vector has num_experts entries; each entry is a 2D view
             // into the corresponding 3D packed tensor.

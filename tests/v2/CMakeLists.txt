@@ -4619,6 +4619,37 @@ if(ZLIB_FOUND)
 
     message(STATUS "V2: Qwen3.5 MoE SingleDevice parity tests enabled")
 
+    # ---- NodeLocalTP MoE Parity (Cross-Socket CPU TP with Expert Parallelism) ----
+    #
+    # Tests Node-Local Tensor Parallelism for MoE models:
+    #   - Expert Parallelism (EP): each rank computes a subset of experts
+    #   - Shared Expert: Megatron TP (ColumnParallel gate/up, InputParallel down)
+    #   - Single allreduce per layer on attn_proj
+    #
+    # REQUIRES: mpirun -np 2 (or more)
+    add_executable(v2_integration_parity_qwen35moe_node_local_tp
+        integration/parity/qwen35moe/Test__Qwen35MoE_NodeLocalTP_Parity.cpp
+        ${WORKSPACE_ROOT_PARITY}/external/cnpy/cnpy.cpp
+    )
+    target_link_libraries(v2_integration_parity_qwen35moe_node_local_tp
+        llaminar2_core
+        v2_test_utils
+        GTest::gtest
+        ZLIB::ZLIB
+    )
+    target_include_directories(v2_integration_parity_qwen35moe_node_local_tp PRIVATE
+        ${WORKSPACE_ROOT_PARITY}/external/cnpy
+        ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+
+    discover_v2_parity_tests(v2_integration_parity_qwen35moe_node_local_tp
+        TEST_PREFIX V2_Integration_Parity_Qwen35MoE_NodeLocalTP
+        LABELS "V2;Integration;Parity;Qwen35MoE;MixtureOfExperts;NodeLocalTP;MPI;TensorParallel;UPI;CrossRank;CPU;ExpertParallel"
+        MPI_PROCS 2
+    )
+
+    message(STATUS "V2: Qwen3.5 MoE NodeLocalTP parity tests enabled (requires mpirun -np 2+)")
+
     # =========================================================================
     # Test: Qwen2 NodeLocalTP Parity (Multi-Socket CPU TP)
     #

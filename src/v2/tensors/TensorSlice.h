@@ -285,6 +285,7 @@ namespace llaminar2
         float *mutable_fp32_data() override { return inner()->mutable_fp32_data(); }
         bool is_fp32_backed() const override { return inner()->is_fp32_backed(); }
         bool is_view() const override { return true; } // TensorSlice is always a view/wrapper
+        bool is_mmap_data() const override { return inner() ? inner()->is_mmap_data() : false; }
 
         // =======================================================================
         // GPU Coherence Methods (delegate to inner)

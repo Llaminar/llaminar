@@ -767,6 +767,7 @@ namespace llaminar2::test::parity::qwen2
             config_.min_early_layers_passed = thresholds.min_early_layers_passed;
             config_.kl_threshold = thresholds.kl_threshold;
             config_.excluded_stages = thresholds.excluded_stages;
+            config_.allreduce_stages = thresholds.allreduce_stages;
             config_.min_top1_accuracy = thresholds.min_top1_accuracy;
             config_.min_top5_accuracy = thresholds.min_top5_accuracy;
             config_.min_decode_pass_rate = thresholds.min_decode_pass_rate;

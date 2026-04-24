@@ -23,6 +23,7 @@
 #endif
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <numeric>
 #include <vector>
@@ -156,7 +157,15 @@ namespace llaminar2
         // Step 2: Zero output
         std::memset(output, 0, static_cast<size_t>(seq_len) * d_model * sizeof(float));
 
-        // Step 3: Group tokens by expert for batched GEMM execution
+        // Step 3: Group tokens by expert for batched GEMM execution.
+        // With EP, we only process experts in our local range, but still
+        // build the full routing map so scratch sizing is correct.
+        const int local_start = params_.local_expert_start;
+        const int local_count = (params_.local_expert_count < 0)
+                                    ? num_experts
+                                    : params_.local_expert_count;
+        const int local_end = local_start + local_count;
+
         std::vector<std::vector<std::pair<int, float>>> expert_token_lists(num_experts);
         for (int t = 0; t < seq_len; ++t)
         {
@@ -164,7 +173,9 @@ namespace llaminar2
             {
                 int expert_id = routing.expert_indices[t * top_k + k];
                 float weight = routing.expert_weights[t * top_k + k];
-                expert_token_lists[expert_id].emplace_back(t, weight);
+                // With EP, only accumulate tokens for local experts
+                if (expert_id >= local_start && expert_id < local_end)
+                    expert_token_lists[expert_id].emplace_back(t, weight);
             }
         }
 
@@ -262,12 +273,20 @@ namespace llaminar2
         LOG_WARN("[MoEFFNStage] GEMM engines not pre-resolved; "
                  "call prepareExpertGemmEngines() at graph build time for better perf");
 
-        cached_gate_gemm_.resize(num_experts);
-        cached_up_gemm_.resize(num_experts);
-        cached_down_gemm_.resize(num_experts);
+        const int local_start = params_.local_expert_start;
+        const int local_count = (params_.local_expert_count < 0)
+                                    ? num_experts
+                                    : params_.local_expert_count;
+        const int local_end = local_start + local_count;
 
-        for (int e = 0; e < num_experts; ++e)
+        cached_gate_gemm_.resize(num_experts, nullptr);
+        cached_up_gemm_.resize(num_experts, nullptr);
+        cached_down_gemm_.resize(num_experts, nullptr);
+
+        for (int e = local_start; e < local_end; ++e)
         {
+            if (!params_.expert_gate_views[e])
+                continue;
             auto *gp = KernelFactory::getOrCreatePreparedGemmWeights(
                 params_.expert_gate_views[e].get(), params_.device_id);
             auto *up = KernelFactory::getOrCreatePreparedGemmWeights(
@@ -299,6 +318,13 @@ namespace llaminar2
             return false;
         }
 
+        // EP range: only extract views for local experts
+        const int local_start = params.local_expert_start;
+        const int local_count = (params.local_expert_count < 0)
+                                    ? num_experts
+                                    : params.local_expert_count;
+        const int local_end = local_start + local_count;
+
         params.expert_gate_views.resize(num_experts);
         params.expert_up_views.resize(num_experts);
         params.expert_down_views.resize(num_experts);
@@ -307,8 +333,10 @@ namespace llaminar2
         // GGUF 3D: shape = [ne[0], ne[1], ne[2]] = [cols, rows, num_experts]
         // Each expert's 2D slice is [rows, cols] at element offset = expert_id * rows * cols.
         // create_view() handles 3D→2D slicing internally.
-        auto extract_views = [](TensorBase *tensor_3d, int n_experts,
-                                std::vector<std::shared_ptr<TensorBase>> &views) -> bool
+        // With EP, only local experts get populated; remote experts stay nullptr.
+        auto extract_views = [local_start, local_end](
+                                 TensorBase *tensor_3d, int n_experts,
+                                 std::vector<std::shared_ptr<TensorBase>> &views) -> bool
         {
             const auto &shape = tensor_3d->shape();
             if (shape.size() != 3)
@@ -324,6 +352,10 @@ namespace llaminar2
 
             for (int e = 0; e < n_experts; ++e)
             {
+                // Skip non-local experts under EP
+                if (e < local_start || e >= local_end)
+                    continue;
+
                 size_t element_offset = static_cast<size_t>(e) * elements_per_expert;
                 std::vector<size_t> view_shape = {rows, cols};
                 auto view = tensor_3d->create_view(view_shape, element_offset);
@@ -344,8 +376,9 @@ namespace llaminar2
         if (!extract_views(params.down_exps, num_experts, params.expert_down_views))
             return false;
 
-        LOG_INFO("[MoEFFNStage] Extracted " << num_experts
-                                            << " expert 2D views per weight tensor");
+        LOG_INFO("[MoEFFNStage] Extracted " << local_count << "/" << num_experts
+                                            << " expert 2D views (EP range [" << local_start
+                                            << ", " << local_end << "))");
         return true;
     }
 
@@ -359,12 +392,20 @@ namespace llaminar2
             return false;
         }
 
-        params.prepared_gate_gemm.resize(num_experts);
-        params.prepared_up_gemm.resize(num_experts);
-        params.prepared_down_gemm.resize(num_experts);
+        // EP range
+        const int local_start = params.local_expert_start;
+        const int local_count = (params.local_expert_count < 0)
+                                    ? num_experts
+                                    : params.local_expert_count;
+        const int local_end = local_start + local_count;
 
-        LOG_INFO("[MoEFFNStage] Preparing GEMM engines for " << num_experts
-                 << " experts (3 weights each = " << (num_experts * 3) << " total)...");
+        params.prepared_gate_gemm.resize(num_experts, nullptr);
+        params.prepared_up_gemm.resize(num_experts, nullptr);
+        params.prepared_down_gemm.resize(num_experts, nullptr);
+
+        LOG_INFO("[MoEFFNStage] Preparing GEMM engines for " << local_count << "/" << num_experts
+                 << " local experts (EP range [" << local_start << ", " << local_end
+                 << "), 3 weights each = " << (local_count * 3) << " total)...");
 
 #ifdef HAVE_CUDA
         if (params.device_id.is_cuda())
@@ -379,9 +420,24 @@ namespace llaminar2
         }
 #endif
 
-        // CPU path: use KernelFactory (existing behavior)
-        for (int e = 0; e < num_experts; ++e)
+        // CPU path: parallelize expert GEMM engine preparation.
+        // Each expert has unique tensors (unique raw_data() keys), so no cache
+        // key collisions.  The heavy VNNI interleave runs lock-free; only the
+        // KernelFactory registry insert takes a brief mutex.
+        std::atomic<bool> error_flag{false};
+
+        #pragma omp parallel for schedule(static)
+        for (int e = local_start; e < local_end; ++e)
         {
+            if (error_flag.load(std::memory_order_relaxed)) continue;
+
+            if (!params.expert_gate_views[e] || !params.expert_up_views[e] || !params.expert_down_views[e])
+            {
+                LOG_ERROR("[MoEFFNStage] Null expert view for local expert " << e);
+                error_flag.store(true, std::memory_order_relaxed);
+                continue;
+            }
+
             auto *gp = KernelFactory::getOrCreatePreparedGemmWeights(
                 params.expert_gate_views[e].get(), params.device_id);
             auto *up = KernelFactory::getOrCreatePreparedGemmWeights(
@@ -392,7 +448,8 @@ namespace llaminar2
             if (!gp || !up || !dp)
             {
                 LOG_ERROR("[MoEFFNStage] Failed to prepare GEMM weights for expert " << e);
-                return false;
+                error_flag.store(true, std::memory_order_relaxed);
+                continue;
             }
 
             params.prepared_gate_gemm[e] = KernelFactory::getOrCreateGemmEngine(gp);
@@ -402,11 +459,17 @@ namespace llaminar2
             if (!params.prepared_gate_gemm[e] || !params.prepared_up_gemm[e] || !params.prepared_down_gemm[e])
             {
                 LOG_ERROR("[MoEFFNStage] Failed to create GEMM engine for expert " << e);
-                return false;
+                error_flag.store(true, std::memory_order_relaxed);
+                continue;
             }
         }
 
-        LOG_INFO("[MoEFFNStage] All " << (num_experts * 3) << " expert GEMM engines prepared (CPU/KernelFactory path)");
+        if (error_flag.load())
+        {
+            return false;
+        }
+
+        LOG_INFO("[MoEFFNStage] All " << (local_count * 3) << " local expert GEMM engines prepared (CPU/KernelFactory path)");
 
         // Release mmap pages backing the raw expert weight data.
         // The VNNI interleaved engines now own their own copy — the original
@@ -498,6 +561,8 @@ namespace llaminar2
         info.addScalarInt("num_experts", params_.num_experts);
         info.addScalarInt("top_k", params_.top_k);
         info.addScalarInt("expert_intermediate", params_.expert_intermediate);
+        info.addScalarInt("local_expert_start", params_.local_expert_start);
+        info.addScalarInt("local_expert_count", params_.local_expert_count);
         return info;
     }
 
