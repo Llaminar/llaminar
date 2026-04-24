@@ -502,6 +502,14 @@ namespace llaminar2
         // Ensure GPU workspace is allocated for GEMM kernels (lazy initialization)
         host.ensureDeviceWorkspaceAllocated(graph);
 
+        // Notify host that graph is ready — allows releasing transient resources
+        // (e.g., mmap pages) before execution allocates large activation buffers.
+        if (!first_graph_ready_fired_)
+        {
+            first_graph_ready_fired_ = true;
+            host.onFirstGraphReady();
+        }
+
         bool success = false;
 
         // Execution path depends on configuration:

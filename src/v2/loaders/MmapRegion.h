@@ -116,6 +116,70 @@ namespace llaminar2
         const std::string &path() const { return path_; }
 
         /**
+         * @brief Release physical pages backing this mmap region.
+         *
+         * Calls madvise(MADV_DONTNEED) to tell the kernel it can reclaim the
+         * physical pages. The virtual address range remains valid — future reads
+         * will re-fault pages from the underlying file (via page cache).
+         *
+         * This is safe to call after all tensor data has been copied to owned
+         * buffers (e.g., VNNI interleaved format). Small weights like FP32 norms
+         * (~0.7 MB) will transparently re-fault on next access with negligible cost.
+         *
+         * @return Number of bytes advised, or 0 on failure/unsupported platform
+         */
+        size_t adviseDontneed()
+        {
+#ifdef __linux__
+            if (base_ && length_ > 0)
+            {
+                if (::madvise(base_, length_, MADV_DONTNEED) == 0)
+                {
+                    return length_;
+                }
+                LOG_WARN("[MmapRegion] madvise(MADV_DONTNEED) failed: errno=" << errno);
+            }
+#endif
+            return 0;
+        }
+
+        /**
+         * @brief Release physical pages for an arbitrary address range within any mmap'd region.
+         *
+         * Page-aligns the range and calls madvise(MADV_DONTNEED). Safe to call on
+         * sub-ranges of mmap'd files — the VA range stays valid and will re-fault
+         * from the page cache on next access.
+         *
+         * Use this to incrementally release mmap pages after tensor data has been
+         * copied to owned buffers (e.g., VNNI interleaved engines), reducing peak RSS
+         * during weight preparation.
+         *
+         * @param addr Start of the range (need not be page-aligned)
+         * @param len  Length in bytes
+         * @return Number of bytes advised (page-aligned), or 0 on failure
+         */
+        static size_t adviseDontneedRange(const void *addr, size_t len)
+        {
+#ifdef __linux__
+            if (!addr || len == 0)
+                return 0;
+
+            const size_t page_size = 4096;
+            auto raw = reinterpret_cast<uintptr_t>(addr);
+            uintptr_t aligned_start = raw & ~(page_size - 1);
+            uintptr_t aligned_end = (raw + len + page_size - 1) & ~(page_size - 1);
+            size_t aligned_len = aligned_end - aligned_start;
+
+            if (::madvise(reinterpret_cast<void *>(aligned_start), aligned_len, MADV_DONTNEED) == 0)
+            {
+                return aligned_len;
+            }
+            // Silently ignore failures (addr might not be in an mmap'd region)
+#endif
+            return 0;
+        }
+
+        /**
          * @brief Create an MmapRegion by memory-mapping an entire file
          *
          * When numa_node >= 0, uses mbind(MPOL_BIND) to ensure pages are allocated

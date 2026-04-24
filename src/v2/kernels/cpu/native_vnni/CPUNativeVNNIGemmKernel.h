@@ -80,17 +80,34 @@ namespace llaminar2::cpu::native_vnni
             // only the native quantized blocks (~0.5-1.06 B/elem) and repack
             // into a shared workspace on demand for each GEMM/GEMV call.
             //
-            // Superblock formats (Q6_K, Q3_K, etc.) and rotation paths retain
-            // permanent interleaved data since repacking from native blocks is
-            // not supported (superblocks need full context, rotation fuses into packing).
+            // Q4_K superblocks: synthesize Q4_1-compatible elementary blocks
+            // from the superblock structure, enabling deferred packing. Each
+            // 256-element superblock is decomposed into 8 × 32-element blocks
+            // with FP16 scale + min + 16-byte nibble payload = 20 bytes each.
+            //
+            // Other superblock formats (Q6_K, Q3_K, etc.) and rotation paths
+            // retain permanent interleaved data since repacking from native
+            // blocks is not supported.
             // ---------------------------------------------------------------
             const bool is_superblock = packed_.is_superblock;
-            const bool can_defer = !is_superblock && !activation_rotation_ && native_block_size_ > 0;
+            const bool is_q4k_superblock = is_superblock && packed_.codebook_id == 5;
+            // TEMPORARILY DISABLED: Q4_K deferred packing saves only ~2GB but costs -30% decode.
+            // TODO: Share engines between prefill/decode graphs to reduce memory.
+            const bool can_defer = !is_superblock
+                                   && !activation_rotation_ && native_block_size_ > 0;
 
             if (can_defer)
             {
-                // Store native blocks from the weight tensor
-                storeNativeBlocks(weights, row_start, row_end);
+                if (is_q4k_superblock)
+                {
+                    // Q4_K: synthesize Q4_1 elementary blocks from superblocks
+                    synthesizeElementaryBlocksFromSuperblock(weights, row_start, row_end);
+                }
+                else
+                {
+                    // Non-superblock: store native blocks directly
+                    storeNativeBlocks(weights, row_start, row_end);
+                }
             }
 
             // Release the permanent interleaved data if deferred packing is active.
@@ -367,17 +384,138 @@ namespace llaminar2::cpu::native_vnni
             const int K_blocks = (k + 31) / 32;
 
             // -----------------------------------------------------------
-            // M==1 decode path: delegate to multiply_tensor per projection.
-            // multiply_tensor handles ensureWorkspace + gemv + clearWorkspace
-            // correctly for all weight formats and configurations.
+            // M==1 decode path: try fused single-OMP-region GEMV first.
+            // This quantizes the input to Q8_1 once and runs all projections
+            // with nowait in a single OMP parallel region, saving:
+            //   - (N-1) × Q8_1 quantization (~2μs each)
+            //   - (N-1) × OMP fork/join (~6μs each)
+            // Falls back to individual calls for non-VNNI kernels.
             // -----------------------------------------------------------
             if (m == 1)
             {
+                // Check if ALL projections are CPUNativeVNNIGemmKernel
+                bool all_vnni = true;
                 for (const auto &proj : projections)
                 {
                     if (!proj.kernel || !proj.output)
                         return false;
-                    
+                    auto *vnni = dynamic_cast<CPUNativeVNNIGemmKernel *>(proj.kernel);
+                    if (!vnni || !vnni->valid_)
+                    {
+                        all_vnni = false;
+                        break;
+                    }
+                }
+
+                if (all_vnni && projections.size() >= 2)
+                {
+                    // Fused path: quantize once, single OMP region for all projections
+
+                    // Apply activation rotation (if configured on this kernel)
+                    input_data = maybe_rotate_activation(input_data, 1, k);
+
+                    // Set up workspace for deferred-packing kernels.
+                    // Multiple deferred kernels need simultaneous workspace slots
+                    // since the fused GEMV reads all weights in parallel.
+                    {
+                        size_t max_interleave_ws = 0;
+                        int deferred_interleave_count = 0;
+                        for (const auto &proj : projections)
+                        {
+                            auto *vnni = static_cast<CPUNativeVNNIGemmKernel *>(proj.kernel);
+                            if (vnni->deferred_packing_ && vnni->packed_.codebook_id != 19)
+                            {
+                                max_interleave_ws = std::max(max_interleave_ws,
+                                                             interleavedWorkspaceSize(vnni->packed_));
+                                deferred_interleave_count++;
+                            }
+                        }
+                        if (deferred_interleave_count > 0)
+                        {
+                            auto &ws = sharedWorkspace();
+                            const size_t total = max_interleave_ws * deferred_interleave_count;
+                            if (ws.size() < total)
+                                ws.resize_uninitialized(total);
+                        }
+                        int slot_idx = 0;
+                        for (const auto &proj : projections)
+                        {
+                            auto *vnni = static_cast<CPUNativeVNNIGemmKernel *>(proj.kernel);
+                            if (vnni->deferred_packing_)
+                            {
+                                if (vnni->packed_.codebook_id == 19)
+                                {
+                                    vnni->ensureWorkspaceRaw();
+                                }
+                                else
+                                {
+                                    uint8_t *slot = sharedWorkspace().data() +
+                                                    static_cast<size_t>(slot_idx) * max_interleave_ws;
+                                    repackNativeBlocksToInterleaved(
+                                        vnni->native_blocks_ptr_, vnni->native_block_size_,
+                                        vnni->packed_, slot);
+                                    vnni->packed_.setWorkspace(slot);
+                                    slot_idx++;
+                                }
+                            }
+                        }
+                    }
+
+                    // Quantize activations to Q8_1 once (shared across all projections)
+                    thread_local std::vector<Q8_1Block> fused_q8_tls;
+                    if (static_cast<int>(fused_q8_tls.size()) < K_blocks)
+                        fused_q8_tls.resize(K_blocks);
+                    {
+                        int kb = 0;
+#if defined(__AVX512F__)
+                        for (; kb + 1 < K_blocks; kb += 2)
+                            simd::quantize_two_blocks_avx512(input_data + kb * 32,
+                                                             fused_q8_tls[kb], fused_q8_tls[kb + 1]);
+#endif
+                        for (; kb < K_blocks; ++kb)
+                            simd::quantize_single_block(input_data + kb * 32, fused_q8_tls[kb],
+                                                        std::min(32, k - kb * 32));
+                    }
+
+                    // Build fused GEMV descriptors
+                    FusedGemvDesc descs[8]; // Stack-allocated, max 8 projections
+                    int num_descs = 0;
+                    for (const auto &proj : projections)
+                    {
+                        if (num_descs >= 8)
+                            break;
+                        auto *vnni = static_cast<CPUNativeVNNIGemmKernel *>(proj.kernel);
+                        auto &d = descs[num_descs++];
+                        d.packed = &vnni->packed_;
+                        d.output = proj.output->mutable_data();
+                        d.bias = proj.bias ? proj.bias->data() : nullptr;
+                        d.N = proj.n;
+                        d.bpr = K_blocks;
+
+                        // Check for Q8_0 raw path (deferred zero-copy)
+                        if (vnni->packed_.codebook_id == 19 && vnni->packed_.workspace_data_)
+                            d.q8_0_raw = reinterpret_cast<const Q8_0Block *>(vnni->packed_.workspace_data_);
+                        else
+                            d.q8_0_raw = nullptr;
+                    }
+
+                    // Single OMP region with nowait between projections
+                    gemv_native_vnni_fused_preq(fused_q8_tls.data(), descs, num_descs);
+
+                    // Clean up deferred workspace
+                    for (const auto &proj : projections)
+                    {
+                        auto *vnni = static_cast<CPUNativeVNNIGemmKernel *>(proj.kernel);
+                        if (vnni->deferred_packing_)
+                            vnni->packed_.clearWorkspace();
+                    }
+
+                    return true;
+                }
+
+                // Fallback: individual calls for non-VNNI or single projection
+                for (const auto &proj : projections)
+                {
                     bool success = proj.kernel->multiply_tensor(
                         input, proj.output, m, proj.n, k,
                         true, 1.0f, 0.0f, proj.bias, mpi_ctx, -1, workspace);
@@ -527,6 +665,115 @@ namespace llaminar2::cpu::native_vnni
                 // mmap view: zero-copy pointer, data survives release_raw_data()
                 native_blocks_ptr_ = src;
             }
+        }
+
+        // -------------------------------------------------------------------
+        // Q4_K superblock → Q4_1 elementary block synthesis
+        // -------------------------------------------------------------------
+
+        /// Synthesize Q4_1-compatible elementary blocks from Q4_K superblock data.
+        ///
+        /// Each Q4_K superblock (144 bytes, 256 elements) is decomposed into
+        /// 8 elementary blocks (20 bytes each, 32 elements). The elementary
+        /// block format matches Q4_1: [scale_fp16(2) | min_fp16(2) | payload(16)].
+        ///
+        /// The resulting blocks are stored in native_blocks_owned_ and can be
+        /// repacked by the standard repackNativeBlocksToInterleaved() function
+        /// since packed_.codebook_id == 5 (Q4_1).
+        ///
+        /// This enables MoE expert weights to use deferred packing instead of
+        /// permanent VNNI interleaved buffers, saving ~33 GB for 256-expert MoE.
+        void synthesizeElementaryBlocksFromSuperblock(const TensorBase *weights,
+                                                       int row_start, int row_end)
+        {
+            if (row_start < 0)
+                row_start = 0;
+            if (row_end < 0)
+                row_end = weights->shape()[0];
+
+            const int N = row_end - row_start;
+            const int K = packed_.K;
+            const int bpr = packed_.blocks_per_row; // elementary blocks per row (K/32)
+            const int sbpr = K / 256;               // superblocks per row
+
+            // Elementary Q4_1 block: scale_fp16(2) + min_fp16(2) + payload(16) = 20 bytes
+            static constexpr size_t ELEM_BLOCK_SIZE = 20;
+
+            const auto *base = reinterpret_cast<const uint8_t *>(weights->raw_data());
+
+            if (!base || sbpr == 0)
+            {
+                LOG_WARN("[CPUNativeVNNIGemmKernel] Cannot synthesize elementary blocks: "
+                         << "raw_data()=" << (const void *)base
+                         << " sbpr=" << sbpr
+                         << " — keeping permanent interleaved data");
+                native_blocks_ptr_ = nullptr;
+                return;
+            }
+
+            // Q4_K superblock layout: row_stride = sbpr * sizeof(Q4_KBlock)
+            // Compute from shape instead of size_bytes() (views may report 0).
+            static constexpr size_t Q4K_BLOCK_SIZE = 144; // sizeof(Q4_KBlock)
+            const size_t sb_row_stride = static_cast<size_t>(sbpr) * Q4K_BLOCK_SIZE;
+            const uint8_t *row_base = base + static_cast<size_t>(row_start) * sb_row_stride;
+
+            // Allocate elementary blocks: N rows × bpr blocks × 20 bytes each
+            native_blocks_owned_.resize(static_cast<size_t>(N) * bpr * ELEM_BLOCK_SIZE);
+
+#pragma omp parallel for schedule(static)
+            for (int n = 0; n < N; ++n)
+            {
+                const uint8_t *row_ptr = row_base + static_cast<size_t>(n) * sb_row_stride;
+
+                for (int sb = 0; sb < sbpr; ++sb)
+                {
+                    const auto *blk = reinterpret_cast<const Q4_KBlock *>(
+                        row_ptr + static_cast<size_t>(sb) * Q4K_BLOCK_SIZE);
+
+                    const float d = fp16_to_fp32(blk->d);
+                    const float dmin = fp16_to_fp32(blk->dmin);
+
+                    for (int sub = 0; sub < 8; ++sub)
+                    {
+                        const int kb = sb * 8 + sub;
+                        uint8_t *dst = native_blocks_owned_.data() +
+                                       (static_cast<size_t>(n) * bpr + kb) * ELEM_BLOCK_SIZE;
+
+                        // Decode 6-bit packed scale and min for this sub-block
+                        uint8_t sc, m_val;
+                        simd::get_scale_min_k4(sub, blk->scales, &sc, &m_val);
+
+                        // Convert to FP16 (matches packVnniBlock() output)
+                        const uint16_t scale_fp16 = fp32_to_fp16(d * static_cast<float>(sc));
+                        const uint16_t min_fp16 = fp32_to_fp16(-dmin * static_cast<float>(m_val));
+
+                        std::memcpy(dst, &scale_fp16, 2);
+                        std::memcpy(dst + 2, &min_fp16, 2);
+
+                        // Extract nibble payload: repack from Q4_K interleaved layout
+                        // to contiguous 16 bytes (matches packVnniBlock() nibble extraction)
+                        const int group_idx = sub / 2;
+                        const int is_high = sub & 1;
+                        const uint8_t *src32 = blk->qs + group_idx * 32;
+
+                        if (is_high)
+                        {
+                            for (int i = 0; i < 16; ++i)
+                                dst[4 + i] = (src32[i] >> 4) | (src32[i + 16] & 0xF0);
+                        }
+                        else
+                        {
+                            for (int i = 0; i < 16; ++i)
+                                dst[4 + i] = (src32[i] & 0xF) | ((src32[i + 16] & 0xF) << 4);
+                        }
+                    }
+                }
+            }
+
+            native_blocks_ptr_ = native_blocks_owned_.data();
+            // Override native_block_size_ to elementary Q4_1 block size
+            // (the codebook_id-based default of 20 already matches, but be explicit)
+            native_block_size_ = ELEM_BLOCK_SIZE;
         }
 
         // -------------------------------------------------------------------

@@ -276,6 +276,27 @@ namespace llaminar2
          * @brief Get RMSNorm epsilon
          */
         virtual float rmsNormEps() const = 0;
+
+        /**
+         * @brief Release mmap regions to free mapped file memory.
+         *
+         * Called after all weight data has been consumed (packed into kernel
+         * storage or copied into BufferArena). Only the concrete loader
+         * implementation needs to act; mock loaders can no-op.
+         */
+        virtual void releaseMmapRegions() {}
+
+        /**
+         * @brief Advise the OS to reclaim physical pages backing the mmap regions.
+         *
+         * Uses madvise(MADV_DONTNEED) to release physical pages without
+         * unmapping the virtual address range. Future reads re-fault from
+         * the page cache. Safe to call after all GEMM weights have been
+         * packed into interleaved format.
+         *
+         * @return Total bytes advised
+         */
+        virtual size_t adviseMmapDontneed() { return 0; }
     };
 
 } // namespace llaminar2

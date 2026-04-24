@@ -146,7 +146,13 @@ namespace llaminar2
         /// Cached MoE kernel (routing, gather/scatter, SwiGLU fallback)
         mutable IMoEKernel *moe_kernel_ = nullptr;
 
+        /// Fast path for decode (seq_len=1): avoids token grouping, gather/scatter,
+        /// and per-expert heap allocations. Uses routing results directly.
+        bool executeSingleToken(IDeviceContext *ctx);
+
+
         void ensureGemmEnginesCached() const;
+        void ensureScratchBuffers(int max_batch) const;
         IMoEKernel *ensureMoEKernel() const;
 
         /// Stash routing results for snapshot capture

@@ -198,8 +198,21 @@ namespace llaminar2
         // Unpin host memory if pinned (after freeing GPU memory)
         unpinHostMemory();
 
-        // Clear kernel cache
-        llaminar::v2::kernels::KernelFactory::clearCacheFor(this);
+        // Clear kernel cache — but skip for temporary tensors that never had
+        // cached state. This avoids a global mutex + cache scan on every
+        // temporary tensor destruction (e.g., Q16_1 scratch in KV cache append).
+        if (in_prepared_gemm_registry_
+            || cache_.has_value()
+#ifdef HAVE_CUDA
+            || cuda_cache_.has_value()
+#endif
+#ifdef HAVE_ROCM
+            || rocm_cache_.has_value()
+#endif
+        )
+        {
+            llaminar::v2::kernels::KernelFactory::clearCacheFor(this);
+        }
     }
 
     // ===== Zero-Copy Mapped Memory Implementation =====

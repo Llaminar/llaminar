@@ -849,6 +849,18 @@ namespace llaminar2
         return workspace_allocator_->allocateForGraph(graph, hints, extras, workspace_budget);
     }
 
+    void DeviceGraphOrchestrator::onFirstGraphReady()
+    {
+        // Release mmap physical pages now that all GEMM engines have packed
+        // their weight data into owned interleaved buffers. Doing this before
+        // execution starts (and before activation allocation) reduces peak RSS
+        // by the full mmap size (~21 GB for the 35B MoE model).
+        if (weight_manager_)
+        {
+            weight_manager_->adviseMmapDontneed();
+        }
+    }
+
     bool DeviceGraphOrchestrator::executeAttention(
         const LayerWeights &layer,
         ActivationBuffers &buffers,

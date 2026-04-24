@@ -232,6 +232,16 @@ namespace llaminar2
          */
         size_t releaseHostResidentWeightData() override;
 
+        /**
+         * @brief Advise the OS to reclaim mmap physical pages.
+         *
+         * Delegates to the loader's adviseMmapDontneed(). Safe to call
+         * after all GEMM engines have packed their weight data.
+         *
+         * @return Total bytes advised
+         */
+        size_t adviseMmapDontneed() { return loader_.adviseMmapDontneed(); }
+
         size_t getPreparedEmbeddingCount() const override;
 
         /**

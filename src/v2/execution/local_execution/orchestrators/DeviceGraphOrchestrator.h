@@ -1935,6 +1935,14 @@ namespace llaminar2
          */
         bool ensureDeviceWorkspaceAllocated(const ComputeGraph &graph) override;
 
+        /**
+         * @brief Called once after the first graph build + workspace allocation.
+         *
+         * Releases mmap physical pages via madvise(MADV_DONTNEED) before
+         * execution allocates activation buffers, reducing peak RSS.
+         */
+        void onFirstGraphReady() override;
+
         // =========================================================================
         // Phase-Aware Weight Access Members (Gap 3 - CPU Decode Participation)
         // =========================================================================

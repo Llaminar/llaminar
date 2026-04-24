@@ -32,52 +32,67 @@ namespace llaminar2
         result.expert_weights.resize(static_cast<size_t>(seq_len) * top_k);
         result.router_logits.resize(static_cast<size_t>(seq_len) * num_experts);
 
-        // Pre-allocate scratch outside token loop (avoids per-token heap allocs)
-        std::vector<float> logits(num_experts);
-        std::vector<int> indices(num_experts);
-
-        for (int t = 0; t < seq_len; ++t)
+        auto do_routing = [&]()
         {
-            const float *h = hidden + t * d_model;
+            // Thread-local scratch (allocated per-thread inside parallel region)
+            std::vector<float> logits(num_experts);
+            std::vector<int> indices(num_experts);
 
-            // Compute router logits via ISA-dispatched dot products
-            for (int e = 0; e < num_experts; ++e)
-                logits[e] = primitives::vec_dot(gate_weights + e * d_model, h, d_model);
-
-            // Softmax (num_experts ~256: scalar is adequate for this size)
-            float max_logit = *std::max_element(logits.begin(), logits.end());
-            float sum_exp = 0.0f;
-            for (int e = 0; e < num_experts; ++e)
+#pragma omp for schedule(static)
+            for (int t = 0; t < seq_len; ++t)
             {
-                logits[e] = std::exp(logits[e] - max_logit);
-                sum_exp += logits[e];
+                const float *h = hidden + t * d_model;
+
+                // Compute router logits via ISA-dispatched dot products
+                for (int e = 0; e < num_experts; ++e)
+                    logits[e] = primitives::vec_dot(gate_weights + e * d_model, h, d_model);
+
+                // Softmax (num_experts ~256: scalar is adequate for this size)
+                float max_logit = *std::max_element(logits.begin(), logits.end());
+                float sum_exp = 0.0f;
+                for (int e = 0; e < num_experts; ++e)
+                {
+                    logits[e] = std::exp(logits[e] - max_logit);
+                    sum_exp += logits[e];
+                }
+                const float inv_sum = 1.0f / sum_exp;
+                for (int e = 0; e < num_experts; ++e)
+                    logits[e] *= inv_sum;
+
+                // Stash post-softmax probabilities
+                std::copy(logits.begin(), logits.end(),
+                          result.router_logits.begin() + static_cast<size_t>(t) * num_experts);
+
+                // Top-k selection (reuse pre-allocated indices)
+                std::iota(indices.begin(), indices.end(), 0);
+                std::partial_sort(indices.begin(), indices.begin() + top_k, indices.end(),
+                                  [&logits](int a, int b)
+                                  { return logits[a] > logits[b]; });
+
+                // Normalize top-k weights
+                float topk_sum = 0.0f;
+                for (int k = 0; k < top_k; ++k)
+                    topk_sum += logits[indices[k]];
+
+                for (int k = 0; k < top_k; ++k)
+                {
+                    result.expert_indices[t * top_k + k] = indices[k];
+                    result.expert_weights[t * top_k + k] = normalize_weights
+                                                                ? logits[indices[k]] / topk_sum
+                                                                : logits[indices[k]];
+                }
             }
-            const float inv_sum = 1.0f / sum_exp;
-            for (int e = 0; e < num_experts; ++e)
-                logits[e] *= inv_sum;
+        };
 
-            // Stash post-softmax probabilities
-            std::copy(logits.begin(), logits.end(),
-                      result.router_logits.begin() + static_cast<size_t>(t) * num_experts);
-
-            // Top-k selection (reuse pre-allocated indices)
-            std::iota(indices.begin(), indices.end(), 0);
-            std::partial_sort(indices.begin(), indices.begin() + top_k, indices.end(),
-                              [&logits](int a, int b)
-                              { return logits[a] > logits[b]; });
-
-            // Normalize top-k weights
-            float topk_sum = 0.0f;
-            for (int k = 0; k < top_k; ++k)
-                topk_sum += logits[indices[k]];
-
-            for (int k = 0; k < top_k; ++k)
-            {
-                result.expert_indices[t * top_k + k] = indices[k];
-                result.expert_weights[t * top_k + k] = normalize_weights
-                                                            ? logits[indices[k]] / topk_sum
-                                                            : logits[indices[k]];
-            }
+        // For single token (decode), run without OpenMP overhead.
+        // For multi-token (prefill), parallelize across tokens.
+        if (seq_len <= 1)
+        {
+            do_routing();
+        }
+        else
+        {
+            OMP_WORKSHARE_REGION(do_routing);
         }
 
         return true;

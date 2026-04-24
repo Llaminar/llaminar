@@ -385,6 +385,46 @@ namespace llaminar2
         float ropeTheta() const override { return model_.rope_theta; }
         float rmsNormEps() const override { return model_.rms_norm_eps; }
 
+        void releaseMmapRegions() override
+        {
+            if (mmap_region_)
+            {
+                LOG_INFO("[ModelLoader] Releasing mmap region ("
+                         << (mmap_region_->size() / (1024 * 1024)) << " MB)");
+                mmap_region_.reset();
+            }
+            for (auto &region : split_mmap_regions_)
+            {
+                if (region)
+                {
+                    LOG_INFO("[ModelLoader] Releasing split mmap region ("
+                             << (region->size() / (1024 * 1024)) << " MB)");
+                    region.reset();
+                }
+            }
+            split_mmap_regions_.clear();
+        }
+
+        size_t adviseMmapDontneed() override
+        {
+            size_t total = 0;
+            if (mmap_region_)
+            {
+                total += mmap_region_->adviseDontneed();
+            }
+            for (auto &region : split_mmap_regions_)
+            {
+                if (region)
+                    total += region->adviseDontneed();
+            }
+            if (total > 0)
+            {
+                LOG_INFO("[ModelLoader] Advised DONTNEED on mmap regions ("
+                         << (total / (1024 * 1024)) << " MB) — pages reclaimable by OS");
+            }
+            return total;
+        }
+
     private:
         // Tensor factory (created internally if not provided)
         TensorFactory *factory_;

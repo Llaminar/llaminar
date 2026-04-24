@@ -3242,7 +3242,7 @@ namespace llaminar
 
                 for (auto it = prepared_gemm_registry_.begin(); it != prepared_gemm_registry_.end();)
                 {
-                    if (it->first.tensor == tensor)
+                    if (it->second && it->second->tensor == tensor)
                     {
                         it = prepared_gemm_registry_.erase(it);
                     }
@@ -3262,9 +3262,9 @@ namespace llaminar
 
                 for (const auto &entry : prepared_gemm_registry_)
                 {
-                    if (entry.first.tensor)
+                    if (entry.second && entry.second->tensor)
                     {
-                        tracked_tensors.insert(entry.first.tensor);
+                        tracked_tensors.insert(entry.second->tensor);
                     }
                 }
                 for (const auto &entry : sliced_cache_)
@@ -3624,7 +3624,9 @@ namespace llaminar
                 }
 
                 const PreparedGemmKey key{
-                    tensor,
+                    tensor->raw_data(),
+                    static_cast<size_t>(tensor->shape().size() > 0 ? tensor->shape()[0] : 0),
+                    static_cast<size_t>(tensor->shape().size() > 1 ? tensor->shape()[1] : 0),
                     target_device,
                     static_cast<int>(resolved_kind)};
 
@@ -3684,6 +3686,10 @@ namespace llaminar
 
                 std::lock_guard<std::mutex> lock(cache_mutex_);
                 auto [it, inserted] = prepared_gemm_registry_.emplace(key, std::move(handle));
+                if (inserted)
+                {
+                    tensor->in_prepared_gemm_registry_ = true;
+                }
                 LOG_DEBUG("[KernelFactory][PhaseC] prepared weights " << (inserted ? "create" : "race-hit")
                                                                       << " dev=" << static_cast<int>(target_device.type)
                                                                       << ":" << target_device.ordinal
@@ -3738,7 +3744,7 @@ namespace llaminar
 
                 for (auto it = prepared_gemm_registry_.begin(); it != prepared_gemm_registry_.end();)
                 {
-                    if (it->first.tensor == tensor)
+                    if (it->second && it->second->tensor == tensor)
                     {
                         it = prepared_gemm_registry_.erase(it);
                     }

@@ -8,6 +8,7 @@
 #include "../../../tensors/BlockStructures.h"
 #include "../../../kernels/KernelFactory.h"
 #include "../../../kernels/IMoEKernel.h"
+#include "../../../loaders/MmapRegion.h"
 #include "../../../utils/Logger.h"
 #include "../../../utils/OpenMPUtils.h"
 
@@ -406,6 +407,23 @@ namespace llaminar2
         }
 
         LOG_INFO("[MoEFFNStage] All " << (num_experts * 3) << " expert GEMM engines prepared (CPU/KernelFactory path)");
+
+        // Release mmap pages backing the raw expert weight data.
+        // The VNNI interleaved engines now own their own copy — the original
+        // mmap data is never accessed again. Releasing per-layer reduces peak RSS
+        // by ~500 MB/layer instead of waiting for a bulk release at the end.
+        {
+            size_t released = 0;
+            if (params.gate_exps)
+                released += MmapRegion::adviseDontneedRange(params.gate_exps->raw_data(), params.gate_exps->size_bytes());
+            if (params.up_exps)
+                released += MmapRegion::adviseDontneedRange(params.up_exps->raw_data(), params.up_exps->size_bytes());
+            if (params.down_exps)
+                released += MmapRegion::adviseDontneedRange(params.down_exps->raw_data(), params.down_exps->size_bytes());
+            if (released > 0)
+                LOG_DEBUG("[MoEFFNStage] Advised " << (released >> 20) << " MB of mmap pages DONTNEED after engine packing");
+        }
+
         return true;
     }
 
@@ -769,6 +787,20 @@ namespace llaminar2
 
         LOG_INFO("[MoEFFNStage] All " << (num_experts * 3)
                  << " expert GEMM engines prepared (CUDA batch path, 3 GPU allocs)");
+
+        // Release mmap pages for raw expert weights (now uploaded to GPU)
+        {
+            size_t released = 0;
+            if (params.gate_exps)
+                released += MmapRegion::adviseDontneedRange(params.gate_exps->raw_data(), params.gate_exps->size_bytes());
+            if (params.up_exps)
+                released += MmapRegion::adviseDontneedRange(params.up_exps->raw_data(), params.up_exps->size_bytes());
+            if (params.down_exps)
+                released += MmapRegion::adviseDontneedRange(params.down_exps->raw_data(), params.down_exps->size_bytes());
+            if (released > 0)
+                LOG_DEBUG("[MoEFFNStage] Advised " << (released >> 20) << " MB of mmap pages DONTNEED after CUDA packing");
+        }
+
         return true;
     }
 #endif // HAVE_CUDA
@@ -834,6 +866,20 @@ namespace llaminar2
 
         LOG_INFO("[MoEFFNStage] All " << (num_experts * 3)
                  << " expert GEMM engines prepared (ROCm batch path, 3 GPU allocs)");
+
+        // Release mmap pages for raw expert weights (now uploaded to GPU)
+        {
+            size_t released = 0;
+            if (params.gate_exps)
+                released += MmapRegion::adviseDontneedRange(params.gate_exps->raw_data(), params.gate_exps->size_bytes());
+            if (params.up_exps)
+                released += MmapRegion::adviseDontneedRange(params.up_exps->raw_data(), params.up_exps->size_bytes());
+            if (params.down_exps)
+                released += MmapRegion::adviseDontneedRange(params.down_exps->raw_data(), params.down_exps->size_bytes());
+            if (released > 0)
+                LOG_DEBUG("[MoEFFNStage] Advised " << (released >> 20) << " MB of mmap pages DONTNEED after ROCm packing");
+        }
+
         return true;
     }
 #endif // HAVE_ROCM

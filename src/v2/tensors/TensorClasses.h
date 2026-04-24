@@ -681,6 +681,12 @@ namespace llaminar2
         // Separate from cache_ and cuda_cache_ to allow CPU, CUDA, and ROCm paths to coexist
         mutable std::any rocm_cache_;
 
+        // Set by KernelFactory::getOrCreatePreparedGemmWeights when an entry is
+        // added to prepared_gemm_registry_.  Checked by the destructor so that
+        // clearCacheFor(this) is called even when cache_/cuda_cache_/rocm_cache_
+        // are empty (CPU NativeVNNI, FP32 tensors, etc.).
+        mutable bool in_prepared_gemm_registry_ = false;
+
         // Synchronizes cache_ / cuda_cache_ / rocm_cache_ initialization and reset
         mutable std::mutex packed_cache_mutex_;
 

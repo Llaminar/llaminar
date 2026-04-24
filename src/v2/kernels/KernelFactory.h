@@ -1628,13 +1628,21 @@ namespace llaminar
 
                 struct PreparedGemmKey
                 {
-                    const llaminar2::TensorBase *tensor{nullptr};
+                    // Key by data identity (raw_data pointer + dimensions) rather than
+                    // tensor object pointer. This allows views into the same underlying
+                    // data (e.g., MoE expert views created independently by prefill and
+                    // decode graphs) to share the same prepared GEMM engine, eliminating
+                    // duplicate interleaved weight storage.
+                    const void *raw_data{nullptr};
+                    size_t N{0};
+                    size_t K{0};
                     llaminar2::DeviceId device_id;
                     int prep_kind{0};
 
                     bool operator==(const PreparedGemmKey &other) const
                     {
-                        return tensor == other.tensor &&
+                        return raw_data == other.raw_data &&
+                               N == other.N && K == other.K &&
                                device_id == other.device_id &&
                                prep_kind == other.prep_kind;
                     }
@@ -1644,10 +1652,12 @@ namespace llaminar
                 {
                     size_t operator()(const PreparedGemmKey &k) const
                     {
-                        return std::hash<const void *>()(k.tensor) ^
-                               (std::hash<int>()(static_cast<int>(k.device_id.type)) << 1) ^
-                               (std::hash<int>()(k.device_id.ordinal) << 2) ^
-                               (std::hash<int>()(k.prep_kind) << 3);
+                        return std::hash<const void *>()(k.raw_data) ^
+                               (std::hash<size_t>()(k.N) << 1) ^
+                               (std::hash<size_t>()(k.K) << 2) ^
+                               (std::hash<int>()(static_cast<int>(k.device_id.type)) << 3) ^
+                               (std::hash<int>()(k.device_id.ordinal) << 4) ^
+                               (std::hash<int>()(k.prep_kind) << 5);
                     }
                 };
 

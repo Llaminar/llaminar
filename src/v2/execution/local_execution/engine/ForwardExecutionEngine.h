@@ -72,6 +72,15 @@ namespace llaminar2
         /** Ensure GPU workspace is allocated for GEMM kernels in the graph. */
         virtual bool ensureDeviceWorkspaceAllocated(const ComputeGraph &graph) = 0;
 
+        /**
+         * @brief Called once after the first graph build completes and workspace
+         *        is allocated, but before execution starts.
+         *
+         * Use this to release transient resources that are only needed during
+         * graph construction (e.g., mmap pages via madvise(MADV_DONTNEED)).
+         */
+        virtual void onFirstGraphReady() {}
+
         // ----- Logits Synchronization -----
 
         /** Sync GPU stream and mark logits as host-readable. */
@@ -207,6 +216,7 @@ namespace llaminar2
         // ----- Mutable execution flags -----
         bool suppress_timeline_ = false;
         bool accumulate_prefill_ = false;
+        bool first_graph_ready_fired_ = false;
     };
 
 } // namespace llaminar2
