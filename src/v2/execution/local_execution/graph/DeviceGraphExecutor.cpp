@@ -614,12 +614,67 @@ namespace llaminar2
                 }
             }
 
-            // LOCAL TP: collective_ctx_ is nullptr, stage handles collective internally
-            // In fast decode mode (no coherence), just execute and return
+            // LOCAL TP / GLOBAL TP: collective_ctx_ is nullptr, stage handles
+            // collective internally.  In fast-decode mode (no coherence) we can
+            // skip the full coherence/validation pipeline, but we must still
+            // accumulate profiling stats so ALLREDUCE/ALLGATHER appear in the
+            // executor timing tables.
             if (!policy.coherence)
             {
                 ensureStageGPUStreamBound(node, ctx);
-                return node.stage->execute(ctx);
+
+                const bool profiling_fast = policy.profiling && config_.enable_profiling;
+                std::chrono::high_resolution_clock::time_point t0{};
+                if (profiling_fast)
+                    t0 = std::chrono::high_resolution_clock::now();
+
+                bool ok = node.stage->execute(ctx);
+
+                if (profiling_fast)
+                {
+                    auto t1 = std::chrono::high_resolution_clock::now();
+                    double exec_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+
+                    const std::string stage_type_name = computeStageTypeName(node.stage->type());
+                    stats_.stage_times_ms[node.name] = exec_ms;
+                    stats_.total_execute_ms += exec_ms;
+                    stats_.total_stages_executed++;
+                    stats_.stage_type_execute_ms[stage_type_name] += exec_ms;
+                    stats_.stage_type_counts[stage_type_name]++;
+
+                    const auto stype = node.stage->type();
+                    if (stype == ComputeStageType::ALLREDUCE ||
+                        stype == ComputeStageType::ALLGATHER ||
+                        stype == ComputeStageType::ALLGATHER_V)
+                    {
+                        stats_.total_collective_ms += exec_ms;
+                        stats_.total_collective_calls++;
+                    }
+
+                    const auto phase = GraphExecutorStats::currentPhase();
+                    PhaseStats *phase_stats = nullptr;
+                    if (phase == ExecutionPhase::PREFILL)
+                        phase_stats = &stats_.prefill;
+                    else if (phase == ExecutionPhase::DECODE)
+                        phase_stats = &stats_.decode;
+
+                    if (phase_stats)
+                    {
+                        phase_stats->total_execute_ms += exec_ms;
+                        phase_stats->total_stages_executed++;
+                        phase_stats->stage_type_execute_ms[stage_type_name] += exec_ms;
+                        phase_stats->stage_type_counts[stage_type_name]++;
+                        if (stype == ComputeStageType::ALLREDUCE ||
+                            stype == ComputeStageType::ALLGATHER ||
+                            stype == ComputeStageType::ALLGATHER_V)
+                        {
+                            phase_stats->total_collective_ms += exec_ms;
+                            phase_stats->total_collective_calls++;
+                        }
+                    }
+                }
+
+                return ok;
             }
         }
 

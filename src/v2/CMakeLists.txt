@@ -1135,6 +1135,7 @@ add_library(llaminar2_core STATIC
     execution/compute_stages/stages/RoPEStage.cpp
     execution/compute_stages/stages/ResidualAddStage.cpp
     execution/compute_stages/stages/FusedResidualNormStage.cpp
+    execution/compute_stages/stages/FusedAddAllreduceStage.cpp
     execution/compute_stages/stages/AllreduceStage.cpp
     execution/compute_stages/stages/AllGatherStage.cpp
     execution/compute_stages/stages/AllGatherVStage.cpp

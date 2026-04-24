@@ -121,6 +121,13 @@ namespace llaminar2
             return false;
         }
 
+        // Fast path for decode (seq_len=1): eliminates gather/scatter overhead,
+        // vector allocations, and expert_token_lists construction.
+        if (params_.seq_len == 1)
+        {
+            return executeSingleToken(ctx);
+        }
+
         const int seq_len = params_.seq_len;
         const int d_model = params_.d_model;
         const int num_experts = params_.num_experts;
@@ -250,6 +257,126 @@ namespace llaminar2
 
         LOG_DEBUG("[MoEFFNStage] Processed " << seq_len << " tokens via GEMM kernels, "
                                              << top_k << " experts per token");
+        return true;
+    }
+
+    // =========================================================================
+    // MoEFFNStage::executeSingleToken — Optimized decode path (seq_len=1)
+    //
+    // Eliminates per-expert overhead:
+    // - No gather (input IS the single token)
+    // - No scatter (direct weighted accumulation into output)
+    // - No vector allocations (stack arrays for top_k ≤ 16)
+    // - No expert_token_lists grouping
+    // - Reuses a single pair of scratch buffers across all experts
+    // =========================================================================
+
+    bool MoEFFNStage::executeSingleToken(IDeviceContext *ctx)
+    {
+        const int d_model = params_.d_model;
+        const int num_experts = params_.num_experts;
+        const int top_k = params_.top_k;
+        const int intermediate = params_.expert_intermediate;
+
+        if (params_.expert_gate_views.empty())
+        {
+            LOG_ERROR("[MoEFFNStage] Requires pre-extracted expert views.");
+            return false;
+        }
+
+        const float *hidden = params_.input->data();
+        const float *gate_w = params_.gate_weights->data();
+        float *output = params_.output->mutable_data();
+
+        // Routing
+        IMoEKernel *kernel = ensureMoEKernel();
+        MoERoutingResult routing;
+        if (!kernel->route(hidden, gate_w, /*seq_len=*/1, d_model,
+                           num_experts, top_k, params_.norm_topk_prob, routing))
+        {
+            LOG_ERROR("[MoEFFNStage] Routing failed (single-token)");
+            return false;
+        }
+
+        router_logits_ = std::move(routing.router_logits);
+        stashRoutingResults(routing.expert_indices, routing.expert_weights, 1, top_k);
+
+        // Zero output
+        std::memset(output, 0, static_cast<size_t>(d_model) * sizeof(float));
+
+        // EP range
+        const int local_start = params_.local_expert_start;
+        const int local_count = (params_.local_expert_count < 0)
+                                    ? num_experts
+                                    : params_.local_expert_count;
+        const int local_end = local_start + local_count;
+
+        // Ensure GEMM engines are cached
+        ensureGemmEnginesCached();
+
+        // Ensure scratch buffers for M=1 (allocated once, reused across experts)
+        if (scratch_capacity_ < 1)
+        {
+            scratch_gate_ = std::make_shared<FP32Tensor>(
+                std::vector<size_t>{1, static_cast<size_t>(intermediate)});
+            scratch_up_ = std::make_shared<FP32Tensor>(
+                std::vector<size_t>{1, static_cast<size_t>(intermediate)});
+            scratch_out_ = std::make_shared<FP32Tensor>(
+                std::vector<size_t>{1, static_cast<size_t>(d_model)});
+            scratch_capacity_ = 1;
+        }
+
+        // Use input tensor directly (no gather needed for 1 token)
+        const TensorBase *input_tensor = params_.input;
+
+        // Pre-allocate projections vector ONCE (reuse across experts, update kernel ptrs)
+        std::vector<ITensorGemm::TensorProjectionDesc> projections = {
+            {nullptr, scratch_gate_.get(), intermediate, nullptr, "gate"},
+            {nullptr, scratch_up_.get(), intermediate, nullptr, "up"}};
+
+        // Get raw pointer to scratch output ONCE (avoids per-expert mutex in data())
+        float *scratch_out_ptr = scratch_out_->mutable_data();
+
+        // Process each selected expert directly — no grouping overhead
+        for (int k = 0; k < top_k; ++k)
+        {
+            const int expert_id = routing.expert_indices[k];
+            const float weight = routing.expert_weights[k];
+
+            // EP: skip experts not assigned to this rank
+            if (expert_id < local_start || expert_id >= local_end)
+                continue;
+
+            ITensorGemm *gate_gemm = cached_gate_gemm_[expert_id];
+            ITensorGemm *up_gemm = cached_up_gemm_[expert_id];
+            ITensorGemm *down_gemm = cached_down_gemm_[expert_id];
+
+            if (!gate_gemm || !up_gemm || !down_gemm)
+            {
+                LOG_ERROR("[MoEFFNStage] Null GEMM engine for expert " << expert_id);
+                return false;
+            }
+
+            // Gate+Up fused projection (quantizes input once, produces both outputs)
+            projections[0].kernel = gate_gemm;
+            projections[1].kernel = up_gemm;
+            gate_gemm->multiply_fused_tensor(
+                input_tensor, projections, /*m=*/1, d_model);
+
+            // SwiGLU + Down projection
+            fusedSwigluDown(
+                scratch_gate_.get(), scratch_up_.get(), scratch_out_.get(),
+                down_gemm, kernel, /*m=*/1, d_model, intermediate);
+
+            // Direct weighted accumulation (replaces scatter for single token)
+            // scratch_out_ was just written by fusedSwigluDown, read via raw ptr
+            for (int i = 0; i < d_model; ++i)
+            {
+                output[i] += weight * scratch_out_ptr[i];
+            }
+        }
+
+        LOG_DEBUG("[MoEFFNStage] Single-token decode: " << top_k << " experts");
         return true;
     }
 

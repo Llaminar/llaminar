@@ -199,7 +199,7 @@ namespace llaminar2
         explicit SharedExpertFFNStage(Params params);
 
         bool execute(IDeviceContext *ctx) override;
-        ComputeStageType type() const override { return ComputeStageType::MOE_EXPERT_FFN; }
+        ComputeStageType type() const override { return ComputeStageType::MOE_SHARED_EXPERT_FFN; }
         std::string name() const override { return "shared_expert_ffn"; }
         size_t estimatedFlops() const override;
         bool supportsBackend(ComputeBackendType backend) const override;
@@ -251,7 +251,7 @@ namespace llaminar2
         explicit SharedExpertGateStage(Params params);
 
         bool execute(IDeviceContext *ctx) override;
-        ComputeStageType type() const override { return ComputeStageType::MOE_COMBINE; }
+        ComputeStageType type() const override { return ComputeStageType::MOE_SHARED_EXPERT_GATE; }
         std::string name() const override { return "shared_expert_gate"; }
         size_t estimatedFlops() const override;
         bool supportsBackend(ComputeBackendType backend) const override;

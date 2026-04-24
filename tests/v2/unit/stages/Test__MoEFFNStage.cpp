@@ -742,7 +742,7 @@ TEST_F(MoEFFNStageTest, SharedExpert_TypeAndName)
     params.intermediate = INTERMEDIATE;
 
     SharedExpertFFNStage stage(params);
-    EXPECT_EQ(stage.type(), ComputeStageType::MOE_EXPERT_FFN);
+    EXPECT_EQ(stage.type(), ComputeStageType::MOE_SHARED_EXPERT_FFN);
     EXPECT_EQ(stage.name(), "shared_expert_ffn");
     EXPECT_TRUE(stage.supportsBackend(ComputeBackendType::CPU));
     EXPECT_GT(stage.estimatedFlops(), 0u);
@@ -756,7 +756,7 @@ TEST_F(MoEFFNStageTest, SharedGate_TypeAndName)
     params.d_model = D_MODEL;
 
     SharedExpertGateStage stage(params);
-    EXPECT_EQ(stage.type(), ComputeStageType::MOE_COMBINE);
+    EXPECT_EQ(stage.type(), ComputeStageType::MOE_SHARED_EXPERT_GATE);
     EXPECT_EQ(stage.name(), "shared_expert_gate");
     EXPECT_TRUE(stage.supportsBackend(ComputeBackendType::CPU));
 }

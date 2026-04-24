@@ -286,6 +286,8 @@ namespace llaminar2
         MOE_ROUTER,
         MOE_EXPERT_FFN,
         MOE_COMBINE,
+        MOE_SHARED_EXPERT_FFN, ///< Shared expert FFN (distinct from per-expert MOE_EXPERT_FFN)
+        MOE_SHARED_EXPERT_GATE, ///< Shared expert sigmoid gate
 
         // Collective
         ALLREDUCE,
@@ -321,6 +323,7 @@ namespace llaminar2
 
         // Fused operations (GPU optimization)
         FUSED_RESIDUAL_NORM,
+        FUSED_ADD_ALLREDUCE, ///< Fused residual-add + allreduce (MoE output combine + TP reduce)
 
         // GDN (Gated Delta Network) stages
         ATTENTION_OUTPUT_GATE, ///< Sigmoid gate on attention output

@@ -35,6 +35,7 @@
 #include "stages/GatedRMSNormStage.h"
 #include "stages/AttentionOutputGateStage.h"
 #include "stages/QGateSplitStage.h"
+#include "stages/FusedAddAllreduceStage.h"
 
 namespace llaminar2
 {
@@ -117,6 +118,12 @@ namespace llaminar2
          */
         static std::unique_ptr<IComputeStage> createFusedResidualNorm(
             const FusedResidualNormStage::Params &params);
+
+        /**
+         * @brief Create a fused residual-add + TP allreduce stage
+         */
+        static std::unique_ptr<IComputeStage> createFusedAddAllreduce(
+            const FusedAddAllreduceStage::Params &params);
 
         // =====================================================================
         // Attention Stages

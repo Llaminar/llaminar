@@ -71,6 +71,8 @@ TEST_F(ComputeStageTest, StageTypeNames)
     EXPECT_STREQ(computeStageTypeName(ComputeStageType::MOE_ROUTER), "MOE_ROUTER");
     EXPECT_STREQ(computeStageTypeName(ComputeStageType::MOE_EXPERT_FFN), "MOE_EXPERT_FFN");
     EXPECT_STREQ(computeStageTypeName(ComputeStageType::MOE_COMBINE), "MOE_COMBINE");
+    EXPECT_STREQ(computeStageTypeName(ComputeStageType::MOE_SHARED_EXPERT_FFN), "MOE_SHARED_EXPERT_FFN");
+    EXPECT_STREQ(computeStageTypeName(ComputeStageType::MOE_SHARED_EXPERT_GATE), "MOE_SHARED_EXPERT_GATE");
     EXPECT_STREQ(computeStageTypeName(ComputeStageType::ALLREDUCE), "ALLREDUCE");
 }
 

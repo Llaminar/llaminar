@@ -4100,12 +4100,64 @@ namespace llaminar2
             uint64_t qk_duration_ns = 0;
             uint64_t v_duration_ns = 0;
 
-            const int attn_threads = computeOptimalAttentionThreads(
-                n_heads, 1, kv_len, head_dim, causal);
-
             // For VNNI QK: Q is quantized once per head to int16 (head_dim elements).
             // qmax=2047 ≈ 12 effective bits, matching the existing I12 scheme.
             constexpr int QMAX = 2047;
+
+            // =================================================================
+            // Split-KV parallelization (FlashDecoding-style)
+            //
+            // When n_heads << available threads, head-parallel attention wastes
+            // cores (e.g. 8 heads on 28 threads = 71% idle). Split-KV distributes
+            // KV chunks across surplus threads, then reduces partial online
+            // softmax states. Each (head, kv_chunk) pair is an independent work
+            // item. Q quantization is redundantly computed per-item (cheap: single
+            // row of head_dim int16s).
+            //
+            // Activation thresholds (conservative to avoid overhead on small KV):
+            //   - Thread utilization ≤50% (n_heads * 2 ≤ max_threads)
+            //   - Enough KV work per chunk (min 128 positions/chunk)
+            //   - KV length ≥ 512 to amortize scheduling + reduction overhead
+            // =================================================================
+            const int max_threads_avail = omp_get_max_threads();
+            const bool use_split_kv = (n_heads * 2 <= max_threads_avail) && (kv_len >= 512);
+
+            int kv_splits = 1;
+            int kv_chunk_size = kv_len;
+            int total_work_items = n_heads;
+            const int padded_hd = (head_dim + 15) & ~15; // 16-float aligned for AVX-512
+
+            // Persistent partial result storage — avoids per-call heap allocation.
+            // Safe: this static function is always called from the same executor
+            // thread (sequential stage execution), and OMP workers only access
+            // these via captured references inside the parallel region.
+            static std::vector<float> split_partial_out;
+            static std::vector<float> split_partial_m;
+            static std::vector<float> split_partial_l;
+
+            if (use_split_kv)
+            {
+                kv_splits = std::min(
+                    (max_threads_avail + n_heads - 1) / n_heads,
+                    std::max(1, kv_len / 128) // at least 128 KV positions per chunk
+                );
+                kv_chunk_size = (kv_len + kv_splits - 1) / kv_splits;
+                total_work_items = n_heads * kv_splits;
+
+                // Grow-only: avoid repeated alloc/dealloc across calls
+                const size_t out_need = static_cast<size_t>(total_work_items) * padded_hd;
+                if (split_partial_out.size() < out_need)
+                    split_partial_out.resize(out_need);
+                if (split_partial_m.size() < static_cast<size_t>(total_work_items))
+                    split_partial_m.resize(total_work_items);
+                if (split_partial_l.size() < static_cast<size_t>(total_work_items))
+                    split_partial_l.resize(total_work_items);
+                // No need to zero — each work item's std::fill and
+                // explicit writes to partial_m/partial_l handle initialization
+            }
+
+            const int attn_threads = computeOptimalAttentionThreads(
+                n_heads, 1, kv_len, head_dim, causal);
 
             auto work = [&]()
             {
@@ -4113,14 +4165,33 @@ namespace llaminar2
                 alignas(64) int16_t q_i16_buf[detail::kMaxI16RowStride];
 
 #pragma omp for schedule(static) reduction(+ : qk_duration_ns, v_duration_ns)
-                for (int h = 0; h < n_heads; ++h)
+                for (int item = 0; item < total_work_items; ++item)
                 {
+                    // Derive head index and KV range from work item
+                    const int h = use_split_kv ? (item / kv_splits) : item;
+                    const int kv_range_start = use_split_kv ? ((item % kv_splits) * kv_chunk_size) : 0;
+                    const int kv_range_end = use_split_kv
+                                                 ? std::min(kv_range_start + kv_chunk_size, kv_len)
+                                                 : kv_len;
+                    if (kv_range_start >= kv_len)
+                        continue;
+
                     // GQA mapping: replicated KV uses global head position;
                     // sharded KV uses local indexing (see compute_flash_fp32 comment).
                     const int kv_h = (gqa_n_rep > 0)
                                          ? (head_start + h) / heads_per_kv
                                          : h / heads_per_kv;
-                    float *out = output + static_cast<size_t>(h) * head_dim;
+
+                    // Output pointer: partial buffer for split-KV, direct output otherwise
+                    float *out;
+                    if (use_split_kv)
+                    {
+                        out = split_partial_out.data() + static_cast<size_t>(item) * padded_hd;
+                    }
+                    else
+                    {
+                        out = output + static_cast<size_t>(h) * head_dim;
+                    }
                     std::fill(out, out + head_dim, 0.0f);
 
                     float running_m = -std::numeric_limits<float>::infinity();
@@ -4151,9 +4222,9 @@ namespace llaminar2
 
                     float block_scores[detail::kMaxKVTile];
 
-                    for (int k0 = 0; k0 < kv_len; k0 += kv_tile)
+                    for (int k0 = kv_range_start; k0 < kv_range_end; k0 += kv_tile)
                     {
-                        const int k1 = std::min(k0 + kv_tile, kv_len);
+                        const int k1 = std::min(k0 + kv_tile, kv_range_end);
                         float block_max = -std::numeric_limits<float>::infinity();
 
                         const int blk = k1 - k0;
@@ -4431,31 +4502,131 @@ namespace llaminar2
                         running_l = new_l;
                     } // end KV tile loop
 
-                    // Final normalisation
-                    if (running_l > 0.0f)
+                    if (use_split_kv)
                     {
-                        const float inv_l = 1.0f / running_l;
-#if defined(__AVX512F__)
-                        const __m512 vi = _mm512_set1_ps(inv_l);
-                        int sd = 0;
-                        for (; sd + 15 < head_dim; sd += 16)
-                            _mm512_storeu_ps(out + sd, _mm512_mul_ps(vi, _mm512_loadu_ps(out + sd)));
-                        for (; sd < head_dim; ++sd)
-                            out[sd] *= inv_l;
-#else
-                        const __m256 vi = _mm256_set1_ps(inv_l);
-                        int sd = 0;
-                        for (; sd + 7 < head_dim; sd += 8)
-                            _mm256_storeu_ps(out + sd, _mm256_mul_ps(vi, _mm256_loadu_ps(out + sd)));
-                        for (; sd < head_dim; ++sd)
-                            out[sd] *= inv_l;
-#endif
+                        // Store partial online softmax state for reduction
+                        split_partial_m[item] = running_m;
+                        split_partial_l[item] = running_l;
+                        // out (partial buffer) already accumulated
                     }
-                } // end head loop
+                    else
+                    {
+                        // Final normalisation (original head-parallel path)
+                        if (running_l > 0.0f)
+                        {
+                            const float inv_l = 1.0f / running_l;
+#if defined(__AVX512F__)
+                            const __m512 vi = _mm512_set1_ps(inv_l);
+                            int sd = 0;
+                            for (; sd + 15 < head_dim; sd += 16)
+                                _mm512_storeu_ps(out + sd, _mm512_mul_ps(vi, _mm512_loadu_ps(out + sd)));
+                            for (; sd < head_dim; ++sd)
+                                out[sd] *= inv_l;
+#else
+                            const __m256 vi = _mm256_set1_ps(inv_l);
+                            int sd = 0;
+                            for (; sd + 7 < head_dim; sd += 8)
+                                _mm256_storeu_ps(out + sd, _mm256_mul_ps(vi, _mm256_loadu_ps(out + sd)));
+                            for (; sd < head_dim; ++sd)
+                                out[sd] *= inv_l;
+#endif
+                        }
+                    }
+                } // end item loop
+
+                // =============================================================
+                // Split-KV reduction: merge partial online softmax per head
+                //
+                // For each head, we have kv_splits partial results with:
+                //   partial_m[i] = max score seen in chunk i
+                //   partial_l[i] = sum of exp(score - partial_m[i]) in chunk i
+                //   partial_out[i][d] = sum of exp(score_k - partial_m[i]) * V_k[d]
+                //
+                // To merge: global_m = max(partial_m), then rescale each chunk's
+                // contribution by exp(partial_m[i] - global_m) before summing.
+                // =============================================================
+                if (use_split_kv)
+                {
+                    // implicit barrier from the omp for above ensures all partials are written
+
+#pragma omp for schedule(static)
+                    for (int rh = 0; rh < n_heads; ++rh)
+                    {
+                        float *final_out = output + static_cast<size_t>(rh) * head_dim;
+
+                        // Pass 1: find global max across all splits for this head
+                        float global_m = -std::numeric_limits<float>::infinity();
+                        for (int s = 0; s < kv_splits; ++s)
+                        {
+                            const int idx = rh * kv_splits + s;
+                            if (idx < total_work_items && split_partial_m[idx] > global_m)
+                                global_m = split_partial_m[idx];
+                        }
+
+                        // Pass 2: merge with online softmax correction
+                        std::fill(final_out, final_out + head_dim, 0.0f);
+                        float global_l = 0.0f;
+
+                        for (int s = 0; s < kv_splits; ++s)
+                        {
+                            const int idx = rh * kv_splits + s;
+                            if (idx >= total_work_items || split_partial_l[idx] == 0.0f)
+                                continue;
+
+                            const float correction = std::exp(split_partial_m[idx] - global_m);
+                            global_l += split_partial_l[idx] * correction;
+
+                            const float *pout = split_partial_out.data() +
+                                                static_cast<size_t>(idx) * padded_hd;
+
+                            // Vectorized FMA: final_out[d] += correction * pout[d]
+#if defined(__AVX512F__)
+                            const __m512 vc = _mm512_set1_ps(correction);
+                            int sd = 0;
+                            for (; sd + 15 < head_dim; sd += 16)
+                                _mm512_storeu_ps(final_out + sd,
+                                                 _mm512_fmadd_ps(vc,
+                                                                 _mm512_loadu_ps(pout + sd),
+                                                                 _mm512_loadu_ps(final_out + sd)));
+                            for (; sd < head_dim; ++sd)
+                                final_out[sd] += correction * pout[sd];
+#else
+                            for (int sd = 0; sd < head_dim; ++sd)
+                                final_out[sd] += correction * pout[sd];
+#endif
+                        }
+
+                        // Final normalization
+                        if (global_l > 0.0f)
+                        {
+                            const float inv_l = 1.0f / global_l;
+#if defined(__AVX512F__)
+                            const __m512 vi = _mm512_set1_ps(inv_l);
+                            int sd = 0;
+                            for (; sd + 15 < head_dim; sd += 16)
+                                _mm512_storeu_ps(final_out + sd,
+                                                 _mm512_mul_ps(vi, _mm512_loadu_ps(final_out + sd)));
+                            for (; sd < head_dim; ++sd)
+                                final_out[sd] *= inv_l;
+#else
+                            const __m256 vi = _mm256_set1_ps(inv_l);
+                            int sd = 0;
+                            for (; sd + 7 < head_dim; sd += 8)
+                                _mm256_storeu_ps(final_out + sd,
+                                                 _mm256_mul_ps(vi, _mm256_loadu_ps(final_out + sd)));
+                            for (; sd < head_dim; ++sd)
+                                final_out[sd] *= inv_l;
+#endif
+                        }
+                    } // end reduction loop
+                }     // end split-KV reduction
             };
 
-            // Same decode threading strategy — see detailed comment in compute_flash_fp32.
-            const bool force_full_pool_q16 = kv_len > 100;
+            // Threading strategy:
+            // - Split-KV: always use full thread pool (that's the whole point)
+            // - Large KV (>100): use full pool for head-parallel
+            // - Small KV: use computeOptimalAttentionThreads() cap
+            const bool force_full_pool_q16 = kv_len > 100 || use_split_kv;
 
             int actual_threads_q16;
             if (force_full_pool_q16)

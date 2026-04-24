@@ -72,6 +72,10 @@ namespace llaminar2
             return "MOE_EXPERT_FFN";
         case ComputeStageType::MOE_COMBINE:
             return "MOE_COMBINE";
+        case ComputeStageType::MOE_SHARED_EXPERT_FFN:
+            return "MOE_SHARED_EXPERT_FFN";
+        case ComputeStageType::MOE_SHARED_EXPERT_GATE:
+            return "MOE_SHARED_EXPERT_GATE";
         case ComputeStageType::ALLREDUCE:
             return "ALLREDUCE";
         case ComputeStageType::ALLGATHER:
@@ -102,6 +106,8 @@ namespace llaminar2
             return "QK_NORM";
         case ComputeStageType::FUSED_RESIDUAL_NORM:
             return "FUSED_RESIDUAL_NORM";
+        case ComputeStageType::FUSED_ADD_ALLREDUCE:
+            return "FUSED_ADD_ALLREDUCE";
         case ComputeStageType::KV_CACHE_APPEND:
             return "KV_CACHE_APPEND";
         case ComputeStageType::KV_CACHE_GATHER:

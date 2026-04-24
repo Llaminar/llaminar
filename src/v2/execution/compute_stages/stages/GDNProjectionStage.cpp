@@ -63,61 +63,40 @@ namespace llaminar2
         if (!A_base)
             return false;
 
-        // Execute each projection via its GEMM kernel (lazy resolution from weight tensors)
-        // QKV projection
-        {
-            auto *gemm = resolveGemm(params_.w_qkv, params_.gemm_qkv, "w_qkv");
-            if (!gemm)
-                return false;
-            gemm->setGPUStream(gpuStream());
-            auto *C_base = asTensorBase(params_.output_qkv, "output_qkv");
-            if (!gemm->multiply_tensor(A_base, C_base, M, params_.n_qkv, K))
-            {
-                LOG_ERROR("[GDNProjectionStage] QKV GEMM failed");
-                return false;
-            }
-        }
+        // Resolve all 4 GEMM engines (lazy, cached after first call)
+        auto *gemm_qkv = resolveGemm(params_.w_qkv, params_.gemm_qkv, "w_qkv");
+        auto *gemm_z = resolveGemm(params_.w_z, params_.gemm_z, "w_z");
+        auto *gemm_a = resolveGemm(params_.w_a, params_.gemm_a, "w_a");
+        auto *gemm_b = resolveGemm(params_.w_b, params_.gemm_b, "w_b");
+        if (!gemm_qkv || !gemm_z || !gemm_a || !gemm_b)
+            return false;
 
-        // Z projection
-        {
-            auto *gemm = resolveGemm(params_.w_z, params_.gemm_z, "w_z");
-            if (!gemm)
-                return false;
-            gemm->setGPUStream(gpuStream());
-            auto *C_base = asTensorBase(params_.output_z, "output_z");
-            if (!gemm->multiply_tensor(A_base, C_base, M, params_.n_z, K))
-            {
-                LOG_ERROR("[GDNProjectionStage] Z GEMM failed");
-                return false;
-            }
-        }
+        auto *C_qkv = asTensorBase(params_.output_qkv, "output_qkv");
+        auto *C_z = asTensorBase(params_.output_z, "output_z");
+        auto *C_a = asTensorBase(params_.output_a, "output_a");
+        auto *C_b = asTensorBase(params_.output_b, "output_b");
+        if (!C_qkv || !C_z || !C_a || !C_b)
+            return false;
 
-        // A projection
-        {
-            auto *gemm = resolveGemm(params_.w_a, params_.gemm_a, "w_a");
-            if (!gemm)
-                return false;
-            gemm->setGPUStream(gpuStream());
-            auto *C_base = asTensorBase(params_.output_a, "output_a");
-            if (!gemm->multiply_tensor(A_base, C_base, M, params_.n_a, K))
-            {
-                LOG_ERROR("[GDNProjectionStage] A GEMM failed");
-                return false;
-            }
-        }
+        // Set GPU stream on all engines (no-op for CPU)
+        gemm_qkv->setGPUStream(gpuStream());
+        gemm_z->setGPUStream(gpuStream());
+        gemm_a->setGPUStream(gpuStream());
+        gemm_b->setGPUStream(gpuStream());
 
-        // B projection
+        // Fused 4-projection GEMM: quantizes input once, single OMP region
+        // for decode (M=1). For prefill (M>1), falls back to sequential GEMMs
+        // inside the kernel but still avoids 4 separate stage-level dispatches.
+        std::vector<ITensorGemm::TensorProjectionDesc> projections = {
+            {gemm_qkv, C_qkv, params_.n_qkv, nullptr, "qkv"},
+            {gemm_z, C_z, params_.n_z, nullptr, "z"},
+            {gemm_a, C_a, params_.n_a, nullptr, "alpha"},
+            {gemm_b, C_b, params_.n_b, nullptr, "beta"}};
+
+        if (!gemm_qkv->multiply_fused_tensor(A_base, projections, M, K))
         {
-            auto *gemm = resolveGemm(params_.w_b, params_.gemm_b, "w_b");
-            if (!gemm)
-                return false;
-            gemm->setGPUStream(gpuStream());
-            auto *C_base = asTensorBase(params_.output_b, "output_b");
-            if (!gemm->multiply_tensor(A_base, C_base, M, params_.n_b, K))
-            {
-                LOG_ERROR("[GDNProjectionStage] B GEMM failed");
-                return false;
-            }
+            LOG_ERROR("[GDNProjectionStage] Fused 4-projection GEMM failed");
+            return false;
         }
 
         LOG_DEBUG("[GDNProjectionStage] Executed: M=" << M << " K=" << K
