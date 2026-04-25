@@ -1128,6 +1128,16 @@ namespace llaminar2
         }
         else if (mode == ShardingMode::EXPERT_PARALLEL)
         {
+            // Dynamic MoE rebalancing: load full (replicated) expert tensor so that
+            // any expert can be assigned to any rank at runtime.
+            // mmap-backed, so no extra physical RAM — pages fault in on demand.
+            const auto& env = debugEnv();
+            if (env.moe_rebalance.mode == "dynamic") {
+                LOG_INFO("[WeightManager] MoE rebalance=dynamic: loading FULL expert tensor "
+                         << name << " (replicated mmap, all experts accessible)");
+                return getReplicatedWeight(name, device);
+            }
+
             // Expert-parallel: split the EXPERT dimension of 3D MoE weight tensors
             //
             // Expert weights are stored as 3D tensors [ne0, ne1, num_experts] where:

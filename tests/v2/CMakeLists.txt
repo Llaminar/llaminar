@@ -9204,6 +9204,42 @@ add_v2_test(V2_Unit_ExpertRebalancer
     LABELS "V2;Unit;MoE;Rebalancer;Histogram;DynamicPlacement"
 )
 
+# Test: DecodeExpertHistogram — per-layer decode expert utilization tracking
+add_executable(v2_test_decode_expert_histogram unit/moe/Test__DecodeExpertHistogram.cpp)
+target_link_libraries(v2_test_decode_expert_histogram
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_DecodeExpertHistogram
+    COMMAND $<TARGET_FILE:v2_test_decode_expert_histogram>
+    LABELS "V2;Unit;MoE;Histogram;DecodeTracking;DynamicPlacement"
+)
+
+# Test: SocketAwareRebalancer — socket-load-aware expert swap proposals
+add_executable(v2_test_socket_aware_rebalancer unit/moe/Test__SocketAwareRebalancer.cpp)
+target_link_libraries(v2_test_socket_aware_rebalancer
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_SocketAwareRebalancer
+    COMMAND $<TARGET_FILE:v2_test_socket_aware_rebalancer>
+    LABELS "V2;Unit;MoE;Rebalancer;SocketAware;DynamicPlacement"
+)
+
+# Test: MoERebalanceController — histogram + rebalancer orchestration
+add_executable(v2_test_moe_rebalance_controller unit/moe/Test__MoERebalanceController.cpp)
+target_link_libraries(v2_test_moe_rebalance_controller
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_MoERebalanceController
+    COMMAND $<TARGET_FILE:v2_test_moe_rebalance_controller>
+    LABELS "V2;Unit;MoE;Rebalancer;Controller;DynamicPlacement"
+)
+
 # Test: MoEConfig — configuration validation, isMoELayer()
 add_executable(v2_test_moe_config unit/moe/Test__MoEConfig.cpp)
 target_link_libraries(v2_test_moe_config

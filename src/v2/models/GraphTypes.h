@@ -44,7 +44,9 @@ namespace llaminar2
     class ILocalPPContext;
     class TurboQuantContext;
     class ActivationRotation;
+    class DecodeExpertHistogram;
     struct PipelineConfig;
+    enum class MoERebalanceMode;
 
     // =========================================================================
     // Configuration
@@ -310,6 +312,15 @@ namespace llaminar2
             bool has_shared_expert = false;   ///< Has always-active shared expert
             int shared_intermediate_size = 0; ///< Shared expert FFN intermediate dim
             bool shared_expert_gate = false;  ///< Has sigmoid gating on shared expert
+
+            /// Optional histogram for decode expert tracking.
+            /// Set by the orchestrator when MoE rebalancing is enabled.
+            /// Lifetime managed by MoERebalanceController. Not owned.
+            DecodeExpertHistogram* decode_histogram = nullptr;
+
+            /// MoE rebalancing mode (OFF / OBSERVE / DYNAMIC).
+            /// Set by InferenceRunnerFactory from MoERebalanceController.
+            MoERebalanceMode rebalance_mode{}; // default-initialized to OFF (value 0)
 
             /// Returns true if MoE is enabled
             bool enabled() const { return num_experts > 0 && top_k > 0; }

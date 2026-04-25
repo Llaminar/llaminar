@@ -27,6 +27,7 @@ namespace llaminar2
     class ITensorGemm;
     class FP32Tensor;
     class IMoEKernel;
+    class DecodeExpertHistogram;
 
     /**
      * @brief Unified MoE FFN stage (router + expert execution + combine)
@@ -69,6 +70,19 @@ namespace llaminar2
             // -1 means all experts (no EP, single-device mode).
             int local_expert_start = 0;
             int local_expert_count = -1;
+
+            // Layer index for histogram recording
+            int layer_idx = -1;
+
+            // Optional histogram for decode expert tracking (not owned)
+            // Set by MoERebalanceController; null = no tracking.
+            DecodeExpertHistogram* decode_histogram = nullptr;
+
+            /// Per-expert active mask for dynamic rebalancing.
+            /// When non-empty (size == num_experts), expert_mask[e] == true means
+            /// this rank should compute expert e. Overrides local_expert_start/count.
+            /// When empty, falls back to contiguous range behavior.
+            std::vector<bool> expert_mask;
 
             // Per-expert 2D tensor views — used by GPU path
             // Each vector has num_experts entries; each entry is a 2D view
@@ -116,8 +130,17 @@ namespace llaminar2
         /// AllReduce combines partial results across ranks.
         bool allowsZeroOutput() const override
         {
-            return params_.local_expert_count >= 0;
+            return params_.local_expert_count >= 0 || !params_.expert_mask.empty();
         }
+
+        /// Update expert mask for dynamic rebalancing (runtime, no rebuild needed).
+        /// mask.size() must == num_experts. Returns false on size mismatch.
+        bool updateExpertMask(const std::vector<bool>& mask);
+
+        /// Update mask AND lazily prepare GEMM engines for newly-acquired experts.
+        /// Call this after rebalancing — it only VNNI-packs experts that weren't
+        /// previously prepared, avoiding the 2x memory overhead of preparing all upfront.
+        bool updateExpertMaskAndPrepareEngines(const std::vector<bool>& new_mask);
         bool supportsBackend(ComputeBackendType backend) const override;
         StageBufferRequirements getBufferRequirements() const override;
         StageDumpInfo buildDumpInfoImpl() const override;

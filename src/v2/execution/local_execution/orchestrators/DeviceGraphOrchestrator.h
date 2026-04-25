@@ -70,6 +70,7 @@ namespace llaminar2
     class WeightPlacementMap;
     class TensorParallelConfig;
     class TurboQuantContext;
+    class MoERebalanceController;
     class ActivationRotation;
 
     /**
@@ -426,13 +427,13 @@ namespace llaminar2
             std::shared_ptr<IMPIContext> mpi_ctx = nullptr,
             const GraphCacheConfig &cache_config = {});
 
-        ~DeviceGraphOrchestrator() = default;
+        ~DeviceGraphOrchestrator();
 
         // Non-copyable, movable
         DeviceGraphOrchestrator(const DeviceGraphOrchestrator &) = delete;
         DeviceGraphOrchestrator &operator=(const DeviceGraphOrchestrator &) = delete;
-        DeviceGraphOrchestrator(DeviceGraphOrchestrator &&) = default;
-        DeviceGraphOrchestrator &operator=(DeviceGraphOrchestrator &&) = default;
+        DeviceGraphOrchestrator(DeviceGraphOrchestrator &&) noexcept;
+        DeviceGraphOrchestrator &operator=(DeviceGraphOrchestrator &&) noexcept;
 
         // =========================================================================
         // Execution Methods (moved from QwenStandardGraph)
@@ -708,6 +709,21 @@ namespace llaminar2
         {
             kv_rotation_ = std::move(rot);
         }
+
+        // =========================================================================
+        // MoE Expert Rebalance Controller
+        // =========================================================================
+
+        /// Set MoE rebalance controller (ownership transfer)
+        void setMoERebalanceController(std::unique_ptr<MoERebalanceController> controller);
+
+        /// Get MoE rebalance controller (for post-decode logging)
+        MoERebalanceController* moeRebalanceController() const { return moe_rebalance_controller_.get(); }
+
+        /// Apply expert masks to all MoEFFNStages in cached FFN graphs.
+        /// Called after rebalancing to update which experts each rank computes.
+        /// @param masks Per-layer expert masks (masks[layer][expert] == true means active)
+        void applyExpertMasks(const std::vector<std::vector<bool>>& masks);
 
         /**
          * @brief Set GlobalTPContext for cross-MPI-rank tensor parallelism
@@ -2041,6 +2057,13 @@ namespace llaminar2
 
         /// Whether host-resident weight data has been released after first prefill
         bool host_resident_released_ = false;
+
+        // =========================================================================
+        // MoE Expert Rebalance Controller
+        // =========================================================================
+
+        /// Optional MoE expert rebalance controller (owned)
+        std::unique_ptr<MoERebalanceController> moe_rebalance_controller_;
 
         /// Reset input-dependent dynamic state on all cached kernels
         /// Implemented in .cpp to avoid including KernelFactory.h in the header

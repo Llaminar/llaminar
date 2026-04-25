@@ -2683,6 +2683,14 @@ namespace llaminar2
         TopologyEnvConfig topology;                ///< Topology-related environment configuration
         MPIBootstrapEnvConfig mpi_bootstrap;       ///< MPI bootstrap environment snapshot
 
+        /// MoE expert rebalancing configuration
+        struct {
+            /// Rebalance mode: "off", "observe", "dynamic" (from LLAMINAR_MOE_REBALANCE)
+            std::string mode = "off";
+            /// Histogram window size in decode tokens (from LLAMINAR_MOE_REBALANCE_WINDOW)
+            int window_size = 256;
+        } moe_rebalance;
+
         bool tp_timing = false;               ///< Enable TP forward timing breakdown (env: LLAMINAR_TP_TIMING)
         bool skip_allreduce = false;          ///< DIAGNOSTIC: Skip allreduce for profiling (env: LLAMINAR_SKIP_ALLREDUCE)
         bool gpu_stage_timing = true;         ///< GPU event-based per-stage timing (env: LLAMINAR_GPU_STAGE_TIMING)
@@ -2747,6 +2755,13 @@ namespace llaminar2
             const char *kv_rot = std::getenv("LLAMINAR_KV_ROTATION");
             if (kv_rot && std::string(kv_rot) == "0")
                 kv_rotation = false;
+            // MoE rebalancing
+            const char *moe_reb = std::getenv("LLAMINAR_MOE_REBALANCE");
+            if (moe_reb)
+                moe_rebalance.mode = moe_reb;
+            const char *moe_reb_win = std::getenv("LLAMINAR_MOE_REBALANCE_WINDOW");
+            if (moe_reb_win)
+                moe_rebalance.window_size = std::atoi(moe_reb_win);
         }
 
         void reload()
@@ -2782,6 +2797,15 @@ namespace llaminar2
             const char *kv_rot = std::getenv("LLAMINAR_KV_ROTATION");
             if (kv_rot && std::string(kv_rot) == "0")
                 kv_rotation = false;
+            // MoE rebalancing
+            moe_rebalance.mode = "off";
+            const char *moe_reb = std::getenv("LLAMINAR_MOE_REBALANCE");
+            if (moe_reb)
+                moe_rebalance.mode = moe_reb;
+            moe_rebalance.window_size = 256;
+            const char *moe_reb_win = std::getenv("LLAMINAR_MOE_REBALANCE_WINDOW");
+            if (moe_reb_win)
+                moe_rebalance.window_size = std::atoi(moe_reb_win);
             gemm.reload();
             profile.reload();
             rmsnorm.reload();

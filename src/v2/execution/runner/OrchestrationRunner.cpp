@@ -32,6 +32,8 @@
 #include "../../utils/NodeDetection.h"
 #include "../../utils/NUMATopology.h"
 #include "../../utils/WeightLoadingProfiler.h"
+#include "../local_execution/orchestrators/DeviceGraphOrchestrator.h"
+#include "../../execution/moe/MoERebalanceController.h"
 
 #include <algorithm>
 #include <cctype>
@@ -1306,6 +1308,29 @@ namespace llaminar2
         if (runner_)
         {
             runner_->resetExecutorStats();
+        }
+    }
+
+    MoERebalanceController* OrchestrationRunner::moeRebalanceController() const
+    {
+        if (runner_)
+        {
+            if (auto* dgo = dynamic_cast<DeviceGraphOrchestrator*>(runner_.get()))
+            {
+                return dgo->moeRebalanceController();
+            }
+        }
+        return nullptr;
+    }
+
+    void OrchestrationRunner::applyMoEExpertMasks(const std::vector<std::vector<bool>>& masks)
+    {
+        if (runner_)
+        {
+            if (auto* dgo = dynamic_cast<DeviceGraphOrchestrator*>(runner_.get()))
+            {
+                dgo->applyExpertMasks(masks);
+            }
         }
     }
 

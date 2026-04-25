@@ -14,6 +14,7 @@
 #include "ROCmKernelProfiler.h"
 #include "WeightLoadingProfiler.h"
 #include "../execution/local_execution/graph/IGraphExecutor.h"
+
 #include "../backends/BackendManager.h"
 #include "../backends/IBackend.h"
 #include "fort.hpp"
@@ -362,10 +363,20 @@ namespace llaminar2
         if (mpi_ctx_->rank() == 0)
         {
             LOG_INFO("Warmup complete.");
+        }
+        logGPUMemorySnapshot("after-warmup");
+
+        // Post-warmup callback (e.g., MoE expert rebalancing)
+        if (post_warmup_cb_)
+        {
+            post_warmup_cb_();
+        }
+
+        if (mpi_ctx_->rank() == 0)
+        {
             LOG_INFO("");
             LOG_INFO("Running " << BENCHMARK_ITERATIONS << " benchmark iterations...");
         }
-        logGPUMemorySnapshot("after-warmup");
 
         // Reset profiling after warmup (only track actual benchmark iterations)
         if (KernelProfiler::isEnabled())

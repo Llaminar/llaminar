@@ -27,6 +27,7 @@
 #include <string>
 #include <vector>
 #include <chrono>
+#include <functional>
 
 namespace llaminar2
 {
@@ -104,10 +105,17 @@ namespace llaminar2
          */
         void printResults(const BenchmarkResult &result);
 
+        /**
+         * @brief Set callback invoked after warmup run completes
+         * @param cb Callback (e.g., for MoE expert rebalancing)
+         */
+        void setPostWarmupCallback(std::function<void()> cb) { post_warmup_cb_ = std::move(cb); }
+
     private:
         std::shared_ptr<IInferenceRunner> runner_;
         std::shared_ptr<ITokenizer> tokenizer_;
         std::shared_ptr<IMPIContext> mpi_ctx_;
+        std::function<void()> post_warmup_cb_;
 
         /**
          * @brief Generate a default benchmark prompt if none provided

@@ -1156,6 +1156,9 @@ add_library(llaminar2_core STATIC
     execution/moe/ExpertPlacementMap.cpp
     execution/moe/ExpertWeightCache.cpp
     execution/moe/ExpertRebalancer.cpp
+    execution/moe/DecodeExpertHistogram.cpp
+    execution/moe/SocketAwareRebalancer.cpp
+    execution/moe/MoERebalanceController.cpp
     execution/moe/MoEPipeline.cpp
     execution/cache/HybridCacheManager.cpp
     execution/compute_stages/stages/AttentionWithKVCacheStage.cpp

@@ -28,8 +28,10 @@
 #include "../../../kernels/cpu/CPUKVCache.h"
 #include "../../../kernels/KernelFactory.h"
 #include "../../../kernels/HybridKVCacheConfig.h"
+#include "../../compute_stages/stages/MoEFFNStage.h"
 #include "../../../backends/BackendManager.h"
 #include "../../../interfaces/IWorkspaceConsumer.h"
+#include "../../moe/MoERebalanceController.h"
 #include <chrono>
 #include <algorithm>
 
@@ -191,6 +193,10 @@ namespace llaminar2
         LOG_INFO("[DeviceGraphOrchestrator] Initialized with graph builder, caching="
                  << (cache_config_.enabled ? "enabled" : "disabled"));
     }
+
+    DeviceGraphOrchestrator::~DeviceGraphOrchestrator() = default;
+    DeviceGraphOrchestrator::DeviceGraphOrchestrator(DeviceGraphOrchestrator &&) noexcept = default;
+    DeviceGraphOrchestrator &DeviceGraphOrchestrator::operator=(DeviceGraphOrchestrator &&) noexcept = default;
 
     // =========================================================================
     // Device Context Management
@@ -2036,6 +2042,44 @@ namespace llaminar2
 
         const auto &cache = layer_graph_cache_[layer_idx];
         return cache.valid && cache.cached_seq_len == seq_len;
+    }
+
+    // =========================================================================
+    // MoE Expert Rebalance Controller
+    // =========================================================================
+
+    void DeviceGraphOrchestrator::setMoERebalanceController(
+        std::unique_ptr<MoERebalanceController> controller)
+    {
+        moe_rebalance_controller_ = std::move(controller);
+    }
+
+    void DeviceGraphOrchestrator::applyExpertMasks(const std::vector<std::vector<bool>>& masks)
+    {
+        int applied = 0;
+        for (size_t layer = 0; layer < layer_graph_cache_.size() && layer < masks.size(); ++layer)
+        {
+            auto& cache = layer_graph_cache_[layer];
+            if (!cache.valid || !cache.ffn_decode)
+                continue;
+
+            for (const auto& node_name : cache.ffn_decode->getExecutionOrder())
+            {
+                auto* node = cache.ffn_decode->getNode(node_name);
+                if (!node || !node->stage)
+                    continue;
+                if (node->stage->type() == ComputeStageType::MOE_EXPERT_FFN)
+                {
+                    auto* moe_stage = dynamic_cast<MoEFFNStage*>(node->stage.get());
+                    if (moe_stage && moe_stage->updateExpertMaskAndPrepareEngines(masks[layer]))
+                    {
+                        applied++;
+                    }
+                }
+            }
+        }
+        LOG_INFO("[DGO] Applied expert masks to " << applied
+                 << " MoEFFNStages across " << masks.size() << " layers");
     }
 
     // =========================================================================

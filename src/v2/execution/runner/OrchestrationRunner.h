@@ -40,6 +40,8 @@
 namespace llaminar2
 {
 
+    class MoERebalanceController;
+
     /**
      * @brief Concrete implementation of IOrchestrationRunner
      *
@@ -191,6 +193,12 @@ namespace llaminar2
 
         const GraphExecutorStats *executorStats() const override;
         void resetExecutorStats() override;
+
+        /// Get MoE rebalance controller from the underlying DGO (if any)
+        MoERebalanceController* moeRebalanceController() const;
+
+        /// Apply rebalanced expert masks to DGO's cached MoEFFNStages
+        void applyMoEExpertMasks(const std::vector<std::vector<bool>>& masks);
 
         // =====================================================================
         // IOrchestrationRunner: GPU-side Sampling

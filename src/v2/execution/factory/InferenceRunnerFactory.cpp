@@ -31,6 +31,8 @@
 #include "../../utils/WeightLoadingProfiler.h"
 #include "../../kernels/cpu/turboquant/TurboQuantContext.h"
 #include "../../kernels/cpu/rotation/ActivationRotation.h"
+#include "../../execution/moe/MoERebalanceController.h"
+#include "../../execution/moe/DecodeExpertHistogram.h"
 #include <atomic>
 #include <future>
 #include <thread>
@@ -683,6 +685,55 @@ namespace llaminar2
                   << ", n_kv_heads=" << graph_config.n_kv_heads
                   << ", d_ff=" << graph_config.d_ff);
 
+        // =====================================================================
+        // MoE Expert Rebalance Controller (Phase 4a)
+        // =====================================================================
+        // Must be set BEFORE graph builder creation so the histogram pointer
+        // propagates into MoEFFNStage params during graph construction.
+        std::unique_ptr<MoERebalanceController> moe_controller;
+        {
+            const auto& env = debugEnv();
+            if (env.moe_rebalance.mode != "off" && graph_config.moe.enabled())
+            {
+                MoERebalanceMode mode = MoERebalanceMode::OFF;
+                if (env.moe_rebalance.mode == "observe")
+                    mode = MoERebalanceMode::OBSERVE;
+                else if (env.moe_rebalance.mode == "dynamic")
+                    mode = MoERebalanceMode::DYNAMIC;
+
+                if (mode != MoERebalanceMode::OFF)
+                {
+                    int world_size = mpi_ctx ? mpi_ctx->world_size() : 1;
+                    std::vector<DeviceId> sockets;
+                    for (int s = 0; s < world_size; ++s)
+                        sockets.push_back(DeviceId(DeviceType::CPU, s));
+
+                    std::vector<int> initial_placement(graph_config.moe.num_experts);
+                    int experts_per_socket = graph_config.moe.num_experts / std::max(1, world_size);
+                    for (int e = 0; e < graph_config.moe.num_experts; ++e)
+                        initial_placement[e] = std::min(e / std::max(1, experts_per_socket), world_size - 1);
+
+                    MoERebalanceController::Config ctrl_config;
+                    ctrl_config.mode = mode;
+                    ctrl_config.num_layers = graph_config.n_layers;
+                    ctrl_config.num_experts = graph_config.moe.num_experts;
+                    ctrl_config.top_k = graph_config.moe.top_k;
+                    ctrl_config.window_size = env.moe_rebalance.window_size;
+                    ctrl_config.sockets = std::move(sockets);
+                    ctrl_config.initial_expert_to_socket = std::move(initial_placement);
+
+                    moe_controller = std::make_unique<MoERebalanceController>(std::move(ctrl_config));
+                    graph_config.moe.decode_histogram = moe_controller->histogram();
+                    graph_config.moe.rebalance_mode = moe_controller->mode();
+
+                    LOG_INFO("[InferenceRunner] MoE rebalance controller: mode="
+                             << env.moe_rebalance.mode
+                             << " window=" << env.moe_rebalance.window_size
+                             << " experts=" << graph_config.moe.num_experts);
+                }
+            }
+        }
+
         // Create DeviceGraphOrchestrator with config
         LOG_DEBUG("[InferenceRunner] About to create DeviceGraphOrchestrator with mpi_ctx="
                   << (mpi_ctx ? "valid" : "nullptr")
@@ -706,6 +757,12 @@ namespace llaminar2
         if (kv_rotation)
         {
             orchestrator->setKVRotation(std::move(kv_rotation));
+        }
+
+        // Transfer MoE rebalance controller ownership to orchestrator
+        if (moe_controller)
+        {
+            orchestrator->setMoERebalanceController(std::move(moe_controller));
         }
 
         // Transfer GlobalTPContext ownership to orchestrator
