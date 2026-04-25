@@ -1,12 +1,12 @@
 # Qwen3.5 MoE Decode Expert Utilisation and Socket Rebalancing Plan
 
 **Status:** Project plan
-**Scope:** CPU two-socket Qwen3.5 MoE decode throughput
+**Scope:** CPU dual-socket Qwen3.5 MoE decode throughput
 **Related design:** `docs/v2/MOE_EXPERT_PLACEMENT_DESIGN.md`
 
 ## Problem
 
-Qwen3.5 MoE decode currently partitions experts statically across tensor-parallel ranks or local devices. `MoEFFNStage` already skips experts outside the local expert range, and 3D expert tensors can be loaded as expert-parallel slices, but the decode path does not yet use live routing statistics to correct hot-expert skew across CPU sockets. This can leave one socket doing most of the active top-k expert work while the other socket waits for the MoE output reduction.
+Qwen3.5 MoE decode currently partitions experts statically across tensor-parallel ranks or local devices. `MoEFFNStage` already skips experts outside the local expert range, and 3D expert tensors can be loaded as expert-parallel slices. The decode path does not yet use live routing statistics to correct hot-expert skew across CPU sockets, so one socket can do most of the active top-k expert work while the other waits for the MoE output reduction.
 
 ## Goals
 
@@ -34,7 +34,7 @@ Qwen3.5 MoE decode currently partitions experts statically across tensor-paralle
 - `src/v2/loaders/WeightManager.cpp`
   - Supports loading expert-parallel slices for 3D expert tensors.
 - `src/v2/execution/local_execution/graph/GraphResolver.cpp`
-  - `TPMode::ExpertParallel` is still a TODO, so MoE expert parallelism is currently stage-local rather than graph-resolved.
+  - `TPMode::ExpertParallel` is still a TODO. MoE expert parallelism is currently implemented inside `MoEFFNStage` filtering logic rather than being resolved into explicit graph stages and collectives.
 
 ## Proposed Architecture
 
@@ -60,7 +60,7 @@ Core metrics:
 - imbalance ratio between sockets
 - moving-window hotness score
 
-The first version should store integer counts and optionally routing-weight sums. Keep the fast path allocation-free after initialization.
+The first version should use fixed-size per-layer arrays for integer counts and optional routing-weight sums. Keep the fast path allocation-free after initialization.
 
 ### 2. Record Routing in `MoEFFNStage`
 
@@ -126,7 +126,7 @@ Apply rebalances through the orchestration layer rather than inside low-level ke
 - broadcast/apply the same placement generation to both sockets
 - ensure the downstream MoE allreduce sees outputs from the same placement generation
 
-The initial two-socket CPU version can use existing MPI/local TP synchronization primitives. Avoid new collectives until graph-level `TPMode::ExpertParallel` is implemented.
+The initial dual-socket CPU version can use existing MPI/local TP synchronization primitives. Avoid new collectives until graph-level `TPMode::ExpertParallel` is implemented.
 
 ### 7. Configuration
 
@@ -231,7 +231,7 @@ Exit criteria:
   - hysteresis and max-move limits
   - placement generation transitions
 - Integration tests:
-  - synthetic two-socket expert routing distribution
+  - synthetic dual-socket expert routing distribution
   - deterministic decode with rebalancing disabled vs enabled
   - observe mode does not change output
 - Performance tests:
