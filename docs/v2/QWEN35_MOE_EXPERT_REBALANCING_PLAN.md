@@ -34,7 +34,7 @@ Qwen3.5 MoE decode currently partitions experts statically across tensor-paralle
 - `src/v2/loaders/WeightManager.cpp`
   - Supports loading expert-parallel slices for 3D expert tensors.
 - `src/v2/execution/local_execution/graph/GraphResolver.cpp`
-  - Graph-resolved `TPMode::ExpertParallel` is still a missing feature.
+  - Graph-resolved `TPMode::ExpertParallel` is not yet implemented.
   - This mode should let the graph resolver represent expert distribution, routing, and required collectives explicitly.
   - The current behavior lives inside `MoEFFNStage` filtering logic; a later refactor should move that implicit stage-local behavior into explicit graph stages so scheduling, profiling, and synchronization are visible to the executor.
 
@@ -115,7 +115,7 @@ For CPU sockets, expert movement should prefer pointer/ownership reassignment ov
 
 Two implementation modes should be supported:
 
-- **metadata-only rebalance:** fastest to implement; updates placement metadata and execution affinity without physically moving weight data, so it may use remote NUMA memory if packed weights remain on the original socket. Cross-socket memory latency may partially offset load-balancing gains in this mode.
+- **metadata-only rebalance:** fastest to implement; updates placement metadata and execution affinity without physically moving weight data. If packed weights remain on the original socket, this mode may use remote NUMA memory, and cross-socket memory latency may partially offset load-balancing gains.
 - **socket-local repack rebalance:** higher payoff, requires asynchronous repack/prewarm before applying placement
 
 ### 6. Scheduling and Synchronization
@@ -217,7 +217,7 @@ Exit criteria:
 
 - Benchmark static EP, observe-only, metadata-only dynamic, and socket-local dynamic modes.
 - Report decode tokens/sec, per-token MoE latency, allreduce time, socket imbalance, and rebalancing overhead.
-- Tune default thresholds for the Qwen3.5 35B total / 3B active and 122B total / 10B active variants.
+- Tune default thresholds for the Qwen3.5 35B-total/3B-active and 122B-total/10B-active variants.
 
 Exit criteria:
 
