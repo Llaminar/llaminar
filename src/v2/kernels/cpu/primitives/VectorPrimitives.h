@@ -22,4 +22,7 @@ namespace llaminar2::primitives
     /// @brief Scale in-place: data[i] *= s for i in [0, n)
     void vec_scale(float *data, float s, int n);
 
+    /// @brief Vector add: out[i] = a[i] + b[i] for i in [0, n)
+    void vec_add(float *out, const float *a, const float *b, int n);
+
 } // namespace llaminar2::primitives

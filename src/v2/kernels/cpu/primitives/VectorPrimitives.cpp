@@ -225,4 +225,62 @@ namespace llaminar2::primitives
         ISA_DISPATCH_VOID(vec_scale, data, s, n);
     }
 
+    // ========================================================================
+    // vec_add — out = a + b
+    // ========================================================================
+
+    static void vec_add_scalar(float *out, const float *a, const float *b, int n)
+    {
+        for (int i = 0; i < n; ++i)
+            out[i] = a[i] + b[i];
+    }
+
+#if defined(__AVX2__)
+    static void vec_add_avx2(float *out, const float *a, const float *b, int n)
+    {
+        int i = 0;
+        const int n16 = n & ~15;
+        for (; i < n16; i += 16)
+        {
+            _mm256_storeu_ps(out + i, _mm256_add_ps(_mm256_loadu_ps(a + i), _mm256_loadu_ps(b + i)));
+            _mm256_storeu_ps(out + i + 8, _mm256_add_ps(_mm256_loadu_ps(a + i + 8), _mm256_loadu_ps(b + i + 8)));
+        }
+        for (; i < n; ++i)
+            out[i] = a[i] + b[i];
+    }
+#endif
+
+#if defined(__AVX512F__)
+    static void vec_add_avx512(float *out, const float *a, const float *b, int n)
+    {
+        int i = 0;
+        const int n32 = n & ~31;
+        for (; i < n32; i += 32)
+        {
+            _mm512_storeu_ps(out + i, _mm512_add_ps(_mm512_loadu_ps(a + i), _mm512_loadu_ps(b + i)));
+            _mm512_storeu_ps(out + i + 16, _mm512_add_ps(_mm512_loadu_ps(a + i + 16), _mm512_loadu_ps(b + i + 16)));
+        }
+        for (; i < n; ++i)
+            out[i] = a[i] + b[i];
+    }
+#endif
+
+#if !defined(__AVX2__)
+    static void vec_add_avx2(float *out, const float *a, const float *b, int n)
+    {
+        vec_add_scalar(out, a, b, n);
+    }
+#endif
+#if !defined(__AVX512F__)
+    static void vec_add_avx512(float *out, const float *a, const float *b, int n)
+    {
+        vec_add_avx2(out, a, b, n);
+    }
+#endif
+
+    void vec_add(float *out, const float *a, const float *b, int n)
+    {
+        ISA_DISPATCH_VOID(vec_add, out, a, b, n);
+    }
+
 } // namespace llaminar2::primitives

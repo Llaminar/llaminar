@@ -8,6 +8,7 @@
 #include "../../../tensors/BlockStructures.h"
 #include "../../../kernels/KernelFactory.h"
 #include "../../../kernels/IMoEKernel.h"
+#include "../../../kernels/cpu/primitives/VectorPrimitives.h"
 #include "../../../loaders/MmapRegion.h"
 #include "../../../utils/Logger.h"
 #include "../../../utils/OpenMPUtils.h"
@@ -408,11 +409,8 @@ namespace llaminar2
                 scratch_out_.get(),
                 down_gemm, kernel, /*m=*/1, d_model, intermediate);
 
-            // Direct weighted accumulation
-            for (int j = 0; j < d_model; ++j)
-            {
-                output[j] += info.weight * scratch_out_ptr[j];
-            }
+            // Vectorized weighted accumulation (AVX-512 AXPY)
+            primitives::vec_axpy(output, scratch_out_ptr, info.weight, d_model);
         }
 
         LOG_DEBUG("[MoEFFNStage] Single-token decode (batched gate+up): " << num_active << " experts");

@@ -6,6 +6,7 @@
 #include "FusedAddAllreduceStage.h"
 #include "../../../memory/StageBufferContract.h"
 #include "../../../tensors/TensorClasses.h"
+#include "../../../kernels/cpu/primitives/VectorPrimitives.h"
 #include "../../../utils/Logger.h"
 #include "../../../utils/KernelProfiler.h"
 #include "../../../utils/DebugEnv.h"
@@ -42,16 +43,12 @@ namespace llaminar2
                              ? params_.num_elements
                              : params_.input_a->numel();
 
-        // Step 1: Residual add — output = input_a + input_b
+        // Step 1: Residual add — output = input_a + input_b (AVX-512 vectorized)
         const float *a = params_.input_a->data();
         const float *b = params_.input_b->data();
         float *out = params_.output->mutable_data();
 
-        // Simple vectorized add (same as ResidualAddStage FP32 path)
-        for (size_t i = 0; i < n; ++i)
-        {
-            out[i] = a[i] + b[i];
-        }
+        primitives::vec_add(out, a, b, static_cast<int>(n));
 
         // Step 2: Allreduce the sum in-place
         if (params_.tp_ctx->degree() <= 1)
