@@ -11,7 +11,7 @@
  */
 
 #include "ModelRegistrations.h"
-#include "qwen/Qwen2Graph.h"
+#include "qwen/QwenStandardGraph.h"
 #include "qwen/Qwen2Schema.h"
 #include "qwen3/Qwen3Schema.h"
 #include "qwen35/Qwen35Graph.h"
@@ -29,18 +29,18 @@ namespace llaminar2
     static void doRegisterBuiltinModels()
     {
         // =================================================================
-        // Qwen2 (also serves Qwen3 which reuses Qwen2Graph)
+        // Qwen2 (also serves Qwen3 which reuses QwenStandardGraph)
         // =================================================================
         GraphBuilderRegistry::registerFactory("qwen2",
                                               [](const GraphConfig &cfg, std::shared_ptr<IMPIContext> mpi)
                                               {
-                                                  return std::make_shared<Qwen2Graph>(cfg, std::move(mpi));
+                                                  return std::make_shared<QwenStandardGraph>(cfg, std::move(mpi));
                                               });
 
         GraphBuilderRegistry::registerFactory("qwen3",
                                               [](const GraphConfig &cfg, std::shared_ptr<IMPIContext> mpi)
                                               {
-                                                  return std::make_shared<Qwen2Graph>(cfg, std::move(mpi));
+                                                  return std::make_shared<QwenStandardGraph>(cfg, std::move(mpi));
                                               });
 
         SchemaFactoryRegistry::registerFactory("qwen2",

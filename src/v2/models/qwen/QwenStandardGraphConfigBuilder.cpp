@@ -1,12 +1,12 @@
 /**
- * @file Qwen2GraphConfigBuilder.cpp
- * @brief Implementation of Qwen2GraphConfigBuilder
+ * @file QwenStandardGraphConfigBuilder.cpp
+ * @brief Implementation of QwenStandardGraphConfigBuilder
  * @author David Sanftenberg
  * @date January 2026
  */
 
-#include "Qwen2GraphConfigBuilder.h"
-#include "Qwen2Graph.h" // For GraphConfig definition (via GraphTypes.h)
+#include "QwenStandardGraphConfigBuilder.h"
+#include "QwenStandardGraph.h" // For GraphConfig definition (via GraphTypes.h)
 #include "../../interfaces/IModelContext.h"
 #include "../../loaders/WeightManager.h"
 #include "../qwen35/Qwen35GraphConfigBuilder.h"
@@ -22,9 +22,9 @@ namespace llaminar2
     // Factory Functions
     // =========================================================================
 
-    std::unique_ptr<IGraphConfigBuilder> createQwen2GraphConfigBuilder()
+    std::unique_ptr<IGraphConfigBuilder> createQwenStandardGraphConfigBuilder()
     {
-        return std::make_unique<Qwen2GraphConfigBuilder>();
+        return std::make_unique<QwenStandardGraphConfigBuilder>();
     }
 
     std::unique_ptr<IGraphConfigBuilder> createGraphConfigBuilder(const std::string &model_type)
@@ -33,7 +33,7 @@ namespace llaminar2
         if (model_type == "qwen2" || model_type == "Qwen2" ||
             model_type == "qwen3" || model_type == "Qwen3")
         {
-            return createQwen2GraphConfigBuilder();
+            return createQwenStandardGraphConfigBuilder();
         }
         if (model_type == "qwen35" || model_type == "Qwen35")
         {
@@ -47,10 +47,10 @@ namespace llaminar2
     }
 
     // =========================================================================
-    // Qwen2GraphConfigBuilder Implementation
+    // QwenStandardGraphConfigBuilder Implementation
     // =========================================================================
 
-    GraphConfigBuildResult Qwen2GraphConfigBuilder::buildConfig(
+    GraphConfigBuildResult QwenStandardGraphConfigBuilder::buildConfig(
         const RankExecutionPlan &plan,
         const ModelConfig &model_config,
         IWeightManager & /*weight_manager*/)
@@ -94,7 +94,7 @@ namespace llaminar2
         return result;
     }
 
-    bool Qwen2GraphConfigBuilder::buildGraphConfig(
+    bool QwenStandardGraphConfigBuilder::buildGraphConfig(
         const RankExecutionPlan &plan,
         const ModelConfig &model_config,
         IWeightManager & /*weight_manager*/,
@@ -150,7 +150,7 @@ namespace llaminar2
         return true;
     }
 
-    std::unique_ptr<LayerDevicePlacement> Qwen2GraphConfigBuilder::createPlacement(
+    std::unique_ptr<LayerDevicePlacement> QwenStandardGraphConfigBuilder::createPlacement(
         const RankExecutionPlan &plan,
         const ModelConfig &model_config)
     {
@@ -161,7 +161,7 @@ namespace llaminar2
             model_config.n_kv_heads);
     }
 
-    void Qwen2GraphConfigBuilder::configureAttentionTP(
+    void QwenStandardGraphConfigBuilder::configureAttentionTP(
         GraphConfig &config,
         const RankExecutionPlan &plan,
         const ModelConfig &model_config,
@@ -196,7 +196,7 @@ namespace llaminar2
         config.qkv_column_parallel = true;
     }
 
-    void Qwen2GraphConfigBuilder::configureFFNTP(
+    void QwenStandardGraphConfigBuilder::configureFFNTP(
         GraphConfig &config,
         const RankExecutionPlan &plan,
         const ModelConfig &model_config)
@@ -231,7 +231,7 @@ namespace llaminar2
         config.ffn_column_parallel = true;
     }
 
-    void Qwen2GraphConfigBuilder::configureLMHeadTP(
+    void QwenStandardGraphConfigBuilder::configureLMHeadTP(
         GraphConfig &config,
         const RankExecutionPlan &plan,
         const ModelConfig &model_config)
@@ -262,7 +262,7 @@ namespace llaminar2
         config.lm_head_column_parallel = true;
     }
 
-    void Qwen2GraphConfigBuilder::configurePipelineParallel(
+    void QwenStandardGraphConfigBuilder::configurePipelineParallel(
         GraphConfig & /*config*/,
         const RankExecutionPlan & /*plan*/,
         const ModelConfig & /*model_config*/)
@@ -280,7 +280,7 @@ namespace llaminar2
         // execution settings), they would be configured here.
     }
 
-    int Qwen2GraphConfigBuilder::computeHeadStart(
+    int QwenStandardGraphConfigBuilder::computeHeadStart(
         int total_heads,
         int shard_index,
         int total_shards,
@@ -307,7 +307,7 @@ namespace llaminar2
         return shard_index * heads_per_shard;
     }
 
-    int Qwen2GraphConfigBuilder::computeLocalHeads(
+    int QwenStandardGraphConfigBuilder::computeLocalHeads(
         int total_heads,
         int shard_index,
         int total_shards,
@@ -355,7 +355,7 @@ namespace llaminar2
     // IModelContext-Based Configuration (Polymorphic API)
     // =========================================================================
 
-    bool Qwen2GraphConfigBuilder::populateFromModelContext(
+    bool QwenStandardGraphConfigBuilder::populateFromModelContext(
         IModelContext &ctx,
         GraphConfig &config)
     {
@@ -380,7 +380,7 @@ namespace llaminar2
         else
         {
             config.d_ff = config.d_model * 4;
-            LOG_WARN("[Qwen2GraphConfigBuilder] feedForwardLength() returned 0, using estimate: "
+            LOG_WARN("[QwenStandardGraphConfigBuilder] feedForwardLength() returned 0, using estimate: "
                      << config.d_ff);
         }
 
@@ -415,7 +415,7 @@ namespace llaminar2
     // Weight Building (Polymorphic API)
     // =========================================================================
 
-    ModelWeights Qwen2GraphConfigBuilder::buildWeights(WeightAccessor get_weight)
+    ModelWeights QwenStandardGraphConfigBuilder::buildWeights(WeightAccessor get_weight)
     {
         ModelWeights weights;
 
@@ -426,7 +426,7 @@ namespace llaminar2
         // Tied embeddings: if output.weight is missing, reuse token_embd.weight
         if (!lm_head && embedding)
         {
-            LOG_INFO("[Qwen2GraphConfigBuilder] output.weight not found, using tied embeddings");
+            LOG_INFO("[QwenStandardGraphConfigBuilder] output.weight not found, using tied embeddings");
             lm_head = embedding;
         }
 

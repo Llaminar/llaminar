@@ -187,7 +187,7 @@ namespace llaminar2
      * @brief Create Qwen2-specific graph config builder
      * @return Unique pointer to builder instance
      */
-    std::unique_ptr<IGraphConfigBuilder> createQwen2GraphConfigBuilder();
+    std::unique_ptr<IGraphConfigBuilder> createQwenStandardGraphConfigBuilder();
 
     /**
      * @brief Create graph config builder for a model type

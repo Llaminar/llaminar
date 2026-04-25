@@ -8,7 +8,7 @@
  * graph execution concerns from graph definition (IGraphBuilder implementations).
  *
  * Design Philosophy:
- * - Graph Builders (Qwen2Graph, etc.): Declarative, stateless, build ComputeGraph DAGs
+ * - Graph Builders (QwenStandardGraph, etc.): Declarative, stateless, build ComputeGraph DAGs
  * - DeviceGraphOrchestrator: Imperative executor (manages state, caching, device contexts)
  *
  * The orchestrator owns:
@@ -19,7 +19,7 @@
  *
  * Usage:
  * @code
- * auto graph_builder = std::make_shared<Qwen2Graph>(config, mpi_ctx);
+ * auto graph_builder = std::make_shared<QwenStandardGraph>(config, mpi_ctx);
  * DeviceGraphOrchestrator orchestrator(graph_builder, mpi_ctx);
  *
  * // Execute a layer
@@ -315,7 +315,7 @@ namespace llaminar2
      * - Execution state tracking
      *
      * This class is the imperative counterpart to declarative graph builders.
-     * Currently supports Qwen2Graph, designed for extension to other architectures.
+     * Currently supports QwenStandardGraph, designed for extension to other architectures.
      *
      * Implements IInferenceRunner for unified inference API.
      */
@@ -337,7 +337,7 @@ namespace llaminar2
          * @code
          * DeviceGraphOrchestrator::Dependencies deps;
          * deps.model_ctx = model_ctx;
-         * deps.graph_builder = std::make_shared<Qwen2Graph>(config, nullptr);
+         * deps.graph_builder = std::make_shared<QwenStandardGraph>(config, nullptr);
          * deps.turboquant_ctx = turboquant_ctx;              // optional
          * deps.pp_stage_config = pp_config;                  // optional
          * auto orchestrator = DeviceGraphOrchestrator(std::move(deps));
@@ -435,7 +435,7 @@ namespace llaminar2
         DeviceGraphOrchestrator &operator=(DeviceGraphOrchestrator &&) = default;
 
         // =========================================================================
-        // Execution Methods (moved from Qwen2Graph)
+        // Execution Methods (moved from QwenStandardGraph)
         // =========================================================================
 
         /**
@@ -1055,7 +1055,7 @@ namespace llaminar2
         bool shouldUseCPUDecodeWeight(const std::string &name, int layer_idx) const;
 
         // =========================================================================
-        // Graph Buffer Management (Phase 3 - moved from Qwen2Graph)
+        // Graph Buffer Management (Phase 3 - moved from QwenStandardGraph)
         // =========================================================================
 
         /**
@@ -1902,7 +1902,7 @@ namespace llaminar2
         SnapshotCapture snapshot_capture_;
 
         // =========================================================================
-        // Graph Buffer Management Members (Phase 3 - moved from Qwen2Graph)
+        // Graph Buffer Management Members (Phase 3 - moved from QwenStandardGraph)
         // =========================================================================
 
         /// TensorFactory for buffer allocation (not owned, set via setTensorFactory())

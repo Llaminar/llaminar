@@ -13,7 +13,7 @@
  *
  * Registration (in model TU):
  *   REGISTER_GRAPH_BUILDER("qwen2", [](const GraphConfig& cfg, std::shared_ptr<IMPIContext> mpi) {
- *       return std::make_shared<Qwen2Graph>(cfg, std::move(mpi));
+ *       return std::make_shared<QwenStandardGraph>(cfg, std::move(mpi));
  *   });
  */
 
@@ -98,7 +98,7 @@ namespace llaminar2
      *
      * Usage in model TU (.cpp file):
      *   static GraphBuilderRegistrar s_qwen2_registrar("qwen2", [](auto& cfg, auto mpi) {
-     *       return std::make_shared<Qwen2Graph>(cfg, std::move(mpi));
+     *       return std::make_shared<QwenStandardGraph>(cfg, std::move(mpi));
      *   });
      */
     struct GraphBuilderRegistrar

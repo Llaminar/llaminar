@@ -143,7 +143,7 @@ namespace llaminar2
         // PP hidden state copy — for non-embedding PP stages, the external
         // hidden state must be copied to the working buffer on every forward.
         // During graph build (cache MISS) this copy happens inline in
-        // Qwen2Graph::buildPartialForwardGraph(). On cache HIT we must redo
+        // QwenStandardGraph::buildPartialForwardGraph(). On cache HIT we must redo
         // the copy here because the graph build code is not re-executed.
         TensorBase *pp_external_hidden_state = nullptr; ///< Source (stage N-1 output)
         TensorBase *pp_working_buffer = nullptr;        ///< Destination (local residual/hidden)

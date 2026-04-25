@@ -5,7 +5,7 @@
  * @date December 2025
  *
  * This header provides common helper functions used across different model
- * graph builders (Qwen2Graph, Qwen3Graph, DeepseekGraph, etc.).
+ * graph builders (QwenStandardGraph, Qwen3Graph, DeepseekGraph, etc.).
  *
  * Design Philosophy:
  * - Graph builders should be purely declarative

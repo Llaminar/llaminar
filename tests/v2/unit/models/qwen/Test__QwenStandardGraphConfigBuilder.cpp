@@ -1,6 +1,6 @@
 /**
- * @file Test__Qwen2GraphConfigBuilder.cpp
- * @brief Unit tests for Qwen2GraphConfigBuilder
+ * @file Test__QwenStandardGraphConfigBuilder.cpp
+ * @brief Unit tests for QwenStandardGraphConfigBuilder
  *
  * Tests:
  * - Building config for single device (no TP, no PP)
@@ -14,8 +14,8 @@
  */
 
 #include <gtest/gtest.h>
-#include "models/qwen/Qwen2GraphConfigBuilder.h"
-#include "models/qwen/Qwen2Graph.h" // For GraphConfig
+#include "models/qwen/QwenStandardGraphConfigBuilder.h"
+#include "models/qwen/QwenStandardGraph.h" // For GraphConfig
 #include "models/IGraphConfigBuilder.h"
 #include "execution/mpi_orchestration/RankExecutionPlan.h"
 #include "config/OrchestrationConfig.h"
@@ -34,7 +34,7 @@ namespace
     /**
      * @brief Minimal WeightManager stub for unit testing
      *
-     * Qwen2GraphConfigBuilder doesn't actually use WeightManager in buildConfig,
+     * QwenStandardGraphConfigBuilder doesn't actually use WeightManager in buildConfig,
      * so we provide a minimal stub that satisfies the interface.
      */
     class StubWeightManager : public IWeightManager
@@ -114,7 +114,7 @@ namespace
         config.vocab_size = 151936;
         config.head_dim = 128;
         // Note: rms_norm_eps and rope_theta are not in ModelConfig;
-        // they use defaults from Qwen2GraphConfig (1e-6f, 10000.0f)
+        // they use defaults from QwenStandardGraphConfig (1e-6f, 10000.0f)
         return config;
     }
 
@@ -141,13 +141,13 @@ namespace
 // Factory Tests
 // ============================================================================
 
-TEST(Test__Qwen2GraphConfigBuilder, Factory_CreatesQwen2Builder)
+TEST(Test__QwenStandardGraphConfigBuilder, Factory_CreatesQwen2Builder)
 {
-    auto builder = createQwen2GraphConfigBuilder();
+    auto builder = createQwenStandardGraphConfigBuilder();
     ASSERT_NE(builder, nullptr);
 }
 
-TEST(Test__Qwen2GraphConfigBuilder, Factory_CreateByModelType)
+TEST(Test__QwenStandardGraphConfigBuilder, Factory_CreateByModelType)
 {
     auto builder = createGraphConfigBuilder("qwen2");
     ASSERT_NE(builder, nullptr);
@@ -163,7 +163,7 @@ TEST(Test__Qwen2GraphConfigBuilder, Factory_CreateByModelType)
 // Single Device Configuration Tests
 // ============================================================================
 
-class Test__Qwen2GraphConfigBuilder_SingleDevice : public ::testing::Test
+class Test__QwenStandardGraphConfigBuilder_SingleDevice : public ::testing::Test
 {
 protected:
     std::unique_ptr<IGraphConfigBuilder> builder;
@@ -172,13 +172,13 @@ protected:
 
     void SetUp() override
     {
-        builder = createQwen2GraphConfigBuilder();
+        builder = createQwenStandardGraphConfigBuilder();
         model_config = createTestModelConfig();
         plan = createSingleDevicePlan();
     }
 };
 
-TEST_F(Test__Qwen2GraphConfigBuilder_SingleDevice, BuildConfig_ReturnsSuccess)
+TEST_F(Test__QwenStandardGraphConfigBuilder_SingleDevice, BuildConfig_ReturnsSuccess)
 {
     // Use the generic buildConfig (doesn't need WeightManager for basic test)
     // We can't use buildQwen2Config without a real WeightManager
@@ -190,7 +190,7 @@ TEST_F(Test__Qwen2GraphConfigBuilder_SingleDevice, BuildConfig_ReturnsSuccess)
     EXPECT_NE(result.placement, nullptr);
 }
 
-TEST_F(Test__Qwen2GraphConfigBuilder_SingleDevice, BuildConfig_ExtractsModelInfo)
+TEST_F(Test__QwenStandardGraphConfigBuilder_SingleDevice, BuildConfig_ExtractsModelInfo)
 {
     auto result = builder->buildConfig(plan, model_config,
                                        g_stub_weight_manager);
@@ -205,7 +205,7 @@ TEST_F(Test__Qwen2GraphConfigBuilder_SingleDevice, BuildConfig_ExtractsModelInfo
     EXPECT_EQ(result.model_info.vocab_size, 151936);
 }
 
-TEST_F(Test__Qwen2GraphConfigBuilder_SingleDevice, BuildConfig_NoSharding)
+TEST_F(Test__QwenStandardGraphConfigBuilder_SingleDevice, BuildConfig_NoSharding)
 {
     auto result = builder->buildConfig(plan, model_config,
                                        g_stub_weight_manager);
@@ -218,7 +218,7 @@ TEST_F(Test__Qwen2GraphConfigBuilder_SingleDevice, BuildConfig_NoSharding)
     EXPECT_EQ(result.execution_info.local_kv_heads, model_config.n_kv_heads);
 }
 
-TEST_F(Test__Qwen2GraphConfigBuilder_SingleDevice, BuildConfig_AllLayers)
+TEST_F(Test__QwenStandardGraphConfigBuilder_SingleDevice, BuildConfig_AllLayers)
 {
     auto result = builder->buildConfig(plan, model_config,
                                        g_stub_weight_manager);
@@ -235,7 +235,7 @@ TEST_F(Test__Qwen2GraphConfigBuilder_SingleDevice, BuildConfig_AllLayers)
 // Pipeline Parallelism Tests
 // ============================================================================
 
-class Test__Qwen2GraphConfigBuilder_PP : public ::testing::Test
+class Test__QwenStandardGraphConfigBuilder_PP : public ::testing::Test
 {
 protected:
     std::unique_ptr<IGraphConfigBuilder> builder;
@@ -243,7 +243,7 @@ protected:
 
     void SetUp() override
     {
-        builder = createQwen2GraphConfigBuilder();
+        builder = createQwenStandardGraphConfigBuilder();
         model_config = createTestModelConfig();
     }
 
@@ -286,7 +286,7 @@ protected:
     }
 };
 
-TEST_F(Test__Qwen2GraphConfigBuilder_PP, FirstStage_LayerRange)
+TEST_F(Test__QwenStandardGraphConfigBuilder_PP, FirstStage_LayerRange)
 {
     auto plan = createFirstStagePlan();
     auto result = builder->buildConfig(plan, model_config,
@@ -297,7 +297,7 @@ TEST_F(Test__Qwen2GraphConfigBuilder_PP, FirstStage_LayerRange)
     EXPECT_EQ(result.execution_info.last_layer, 15);
 }
 
-TEST_F(Test__Qwen2GraphConfigBuilder_PP, FirstStage_HasEmbedding)
+TEST_F(Test__QwenStandardGraphConfigBuilder_PP, FirstStage_HasEmbedding)
 {
     auto plan = createFirstStagePlan();
     auto result = builder->buildConfig(plan, model_config,
@@ -308,7 +308,7 @@ TEST_F(Test__Qwen2GraphConfigBuilder_PP, FirstStage_HasEmbedding)
     EXPECT_FALSE(result.execution_info.has_lm_head);
 }
 
-TEST_F(Test__Qwen2GraphConfigBuilder_PP, LastStage_LayerRange)
+TEST_F(Test__QwenStandardGraphConfigBuilder_PP, LastStage_LayerRange)
 {
     auto plan = createLastStagePlan();
     auto result = builder->buildConfig(plan, model_config,
@@ -319,7 +319,7 @@ TEST_F(Test__Qwen2GraphConfigBuilder_PP, LastStage_LayerRange)
     EXPECT_EQ(result.execution_info.last_layer, 31);
 }
 
-TEST_F(Test__Qwen2GraphConfigBuilder_PP, LastStage_HasLMHead)
+TEST_F(Test__QwenStandardGraphConfigBuilder_PP, LastStage_HasLMHead)
 {
     auto plan = createLastStagePlan();
     auto result = builder->buildConfig(plan, model_config,
@@ -330,7 +330,7 @@ TEST_F(Test__Qwen2GraphConfigBuilder_PP, LastStage_HasLMHead)
     EXPECT_TRUE(result.execution_info.has_lm_head);
 }
 
-TEST_F(Test__Qwen2GraphConfigBuilder_PP, PlacementRespectsLayerRange)
+TEST_F(Test__QwenStandardGraphConfigBuilder_PP, PlacementRespectsLayerRange)
 {
     auto plan = createFirstStagePlan();
     auto result = builder->buildConfig(plan, model_config,
@@ -356,7 +356,7 @@ TEST_F(Test__Qwen2GraphConfigBuilder_PP, PlacementRespectsLayerRange)
 // Local Tensor Parallelism Tests
 // ============================================================================
 
-class Test__Qwen2GraphConfigBuilder_LocalTP : public ::testing::Test
+class Test__QwenStandardGraphConfigBuilder_LocalTP : public ::testing::Test
 {
 protected:
     std::unique_ptr<IGraphConfigBuilder> builder;
@@ -364,7 +364,7 @@ protected:
 
     void SetUp() override
     {
-        builder = createQwen2GraphConfigBuilder();
+        builder = createQwenStandardGraphConfigBuilder();
         model_config = createTestModelConfig();
     }
 
@@ -414,7 +414,7 @@ protected:
     }
 };
 
-TEST_F(Test__Qwen2GraphConfigBuilder_LocalTP, TwoDevices_EqualSplit)
+TEST_F(Test__QwenStandardGraphConfigBuilder_LocalTP, TwoDevices_EqualSplit)
 {
     auto plan = createTwoDeviceTPPlan();
     auto result = builder->buildConfig(plan, model_config,
@@ -424,7 +424,7 @@ TEST_F(Test__Qwen2GraphConfigBuilder_LocalTP, TwoDevices_EqualSplit)
     EXPECT_EQ(result.execution_info.total_shards, 2);
 }
 
-TEST_F(Test__Qwen2GraphConfigBuilder_LocalTP, TwoDevices_HeadDistribution)
+TEST_F(Test__QwenStandardGraphConfigBuilder_LocalTP, TwoDevices_HeadDistribution)
 {
     auto plan = createTwoDeviceTPPlan();
     auto result = builder->buildConfig(plan, model_config,
@@ -442,7 +442,7 @@ TEST_F(Test__Qwen2GraphConfigBuilder_LocalTP, TwoDevices_HeadDistribution)
     EXPECT_EQ(cuda1_heads, 14);
 }
 
-TEST_F(Test__Qwen2GraphConfigBuilder_LocalTP, ProportionalWeights)
+TEST_F(Test__QwenStandardGraphConfigBuilder_LocalTP, ProportionalWeights)
 {
     auto plan = createProportionalTPPlan();
     auto result = builder->buildConfig(plan, model_config,
@@ -463,7 +463,7 @@ TEST_F(Test__Qwen2GraphConfigBuilder_LocalTP, ProportionalWeights)
     EXPECT_NEAR(cuda_fraction, 0.73f, 0.1f);
 }
 
-TEST_F(Test__Qwen2GraphConfigBuilder_LocalTP, AllDevicesBuildAllLayers)
+TEST_F(Test__QwenStandardGraphConfigBuilder_LocalTP, AllDevicesBuildAllLayers)
 {
     auto plan = createTwoDeviceTPPlan();
     auto result = builder->buildConfig(plan, model_config,
@@ -484,9 +484,9 @@ TEST_F(Test__Qwen2GraphConfigBuilder_LocalTP, AllDevicesBuildAllLayers)
 // Combined PP + TP Tests
 // ============================================================================
 
-TEST(Test__Qwen2GraphConfigBuilder_Combined, PP_WithTP)
+TEST(Test__QwenStandardGraphConfigBuilder_Combined, PP_WithTP)
 {
-    auto builder = createQwen2GraphConfigBuilder();
+    auto builder = createQwenStandardGraphConfigBuilder();
     auto model_config = createTestModelConfig();
 
     // First PP stage with 2-way TP
@@ -523,9 +523,9 @@ TEST(Test__Qwen2GraphConfigBuilder_Combined, PP_WithTP)
 // Edge Cases
 // ============================================================================
 
-TEST(Test__Qwen2GraphConfigBuilder_EdgeCases, SingleLayer)
+TEST(Test__QwenStandardGraphConfigBuilder_EdgeCases, SingleLayer)
 {
-    auto builder = createQwen2GraphConfigBuilder();
+    auto builder = createQwenStandardGraphConfigBuilder();
     ModelConfig model_config = createTestModelConfig();
     model_config.n_layers = 1;
 
@@ -540,9 +540,9 @@ TEST(Test__Qwen2GraphConfigBuilder_EdgeCases, SingleLayer)
     EXPECT_EQ(result.model_info.n_layers, 1);
 }
 
-TEST(Test__Qwen2GraphConfigBuilder_EdgeCases, ManyShards)
+TEST(Test__QwenStandardGraphConfigBuilder_EdgeCases, ManyShards)
 {
-    auto builder = createQwen2GraphConfigBuilder();
+    auto builder = createQwenStandardGraphConfigBuilder();
     ModelConfig model_config = createTestModelConfig();
 
     // 8-way TP with equal weights

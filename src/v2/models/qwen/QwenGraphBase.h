@@ -4,7 +4,7 @@
  * @author David Sanftenberg
  * @date January 2026
  *
- * QwenGraphBase extracts the shared graph-building infrastructure from Qwen2Graph.
+ * QwenGraphBase extracts the shared graph-building infrastructure from QwenStandardGraph.
  * All Qwen-family models (Qwen2, Qwen3, Qwen3.5) inherit from this base class
  * rather than from each other, promoting a clean separation of model-specific
  * attention implementations from shared transformer infrastructure.
@@ -12,7 +12,7 @@
  * The hierarchy is:
  *   IGraphBuilder (pure interface)
  *   └── QwenGraphBase (shared Qwen infrastructure)
- *       ├── Qwen2Graph (standard multi-head attention)
+ *       ├── QwenStandardGraph (standard multi-head attention)
  *       └── Qwen35Graph (hybrid GDN + full attention)
  *
  * Shared infrastructure includes:
@@ -282,6 +282,93 @@ namespace llaminar2
             bool is_attention,
             const std::string &stage_name = "",
             std::optional<BufferId> tensor_buffer_id = std::nullopt) const;
+
+        // =====================================================================
+        // Shared Attention Building Blocks
+        // =====================================================================
+
+        /** Resolve TP-aware local head counts. */
+        std::pair<int, int> resolveLocalHeadCounts() const;
+
+        /**
+         * Add pre-attention RMSNorm (fused residual+norm or standalone).
+         * @param check_hybrid_q16 If true, skip fusion in HybridQ16 mode
+         * @return Node name (prefix + "attn_norm")
+         */
+        std::string addPreAttentionNorm(
+            ComputeGraph &graph,
+            const std::string &prefix,
+            ActivationBuffers &buffers,
+            TensorBase *norm_gamma,
+            int total_tokens,
+            int layer_idx,
+            DeviceId device,
+            bool check_hybrid_q16 = true);
+
+        /**
+         * Add per-head QK RMSNorm stages if norms are present.
+         * @return true if norms were added
+         */
+        bool addQKNorms(
+            ComputeGraph &graph,
+            const std::string &prefix,
+            ActivationBuffers &buffers,
+            const LayerWeights &layer,
+            int local_n_heads,
+            int local_n_kv_heads,
+            int total_tokens,
+            DeviceId device,
+            const std::string &q_dependency,
+            const std::string &k_dependency);
+
+        /**
+         * Add RoPE stage on Q and K.
+         * @return Node name (prefix + "rope")
+         */
+        std::string addRoPE(
+            ComputeGraph &graph,
+            const std::string &prefix,
+            ActivationBuffers &buffers,
+            int local_n_heads,
+            int local_n_kv_heads,
+            int total_tokens,
+            const int *position_ids,
+            DeviceId device);
+
+        /**
+         * Add KV cache append, attention compute, and optional gather stages.
+         * @return Terminal attention node name
+         */
+        std::string addKVCacheAndAttention(
+            ComputeGraph &graph,
+            const std::string &prefix,
+            ActivationBuffers &buffers,
+            int layer_idx,
+            int seq_len,
+            int batch_size,
+            int local_n_heads,
+            int local_n_kv_heads,
+            IKVCache *kv_cache,
+            const int *position_ids,
+            DeviceId device,
+            bool has_qkv_proj,
+            const std::string &rope_dependency);
+
+        /**
+         * Add Wo GEMM projection + optional TP allreduce.
+         * @return Terminal node name
+         */
+        std::string addWoProjectionAndAllreduce(
+            ComputeGraph &graph,
+            const std::string &prefix,
+            ActivationBuffers &buffers,
+            TensorBase *wo_weight,
+            int total_tokens,
+            int layer_idx,
+            DeviceId device,
+            const std::string &dependency,
+            const std::string &wo_node_suffix = "wo_proj",
+            const std::string &allreduce_node_suffix = "wo_allreduce");
 
     public:
         static std::vector<int> buildPositionIds(int seq_len, int batch_size, int offset);

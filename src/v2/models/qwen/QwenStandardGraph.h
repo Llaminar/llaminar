@@ -1,10 +1,10 @@
 /**
- * @file Qwen2Graph.h
+ * @file QwenStandardGraph.h
  * @brief Qwen2 compute graph builder for standard multi-head attention
  * @author David Sanftenberg
  * @date December 2025
  *
- * Qwen2Graph implements the Qwen2-specific attention pattern:
+ * QwenStandardGraph implements the Qwen2-specific attention pattern:
  *   - Standard Q/K/V projections with optional biases
  *   - Optional QK normalization (Qwen3)
  *   - RoPE position embeddings
@@ -12,9 +12,9 @@
  *   - Output projection (Wo) with optional TP allreduce
  *
  * Inherits shared infrastructure from QwenGraphBase:
- *   IGraphBuilder → QwenGraphBase → Qwen2Graph
+ *   IGraphBuilder → QwenGraphBase → QwenStandardGraph
  *
- * Also serves Qwen3 (which reuses Qwen2Graph with Qwen3SchemaFactory).
+ * Also serves Qwen3 (which reuses QwenStandardGraph with Qwen3SchemaFactory).
  */
 
 #pragma once
@@ -33,34 +33,34 @@ namespace llaminar2
      * Implements standard multi-head attention for Qwen2/Qwen3 models.
      * Inherits all shared transformer infrastructure from QwenGraphBase.
      */
-    class Qwen2Graph : public QwenGraphBase
+    class QwenStandardGraph : public QwenGraphBase
     {
     public:
         /**
-         * @brief Construct Qwen2Graph with full context
+         * @brief Construct QwenStandardGraph with full context
          *
          * @param model_ctx Model context with GGUF metadata
          * @param mpi_ctx MPI context (nullptr for single-rank)
          * @param config Graph configuration
          */
-        Qwen2Graph(std::shared_ptr<ModelContext> model_ctx,
+        QwenStandardGraph(std::shared_ptr<ModelContext> model_ctx,
                    std::shared_ptr<IMPIContext> mpi_ctx,
                    const GraphConfig &config);
 
         /**
-         * @brief Construct Qwen2Graph for layer-level operations only
+         * @brief Construct QwenStandardGraph for layer-level operations only
          *
          * @param config Graph configuration
          * @param mpi_ctx MPI context (nullptr for single-rank)
          */
-        Qwen2Graph(const GraphConfig &config,
+        QwenStandardGraph(const GraphConfig &config,
                    std::shared_ptr<IMPIContext> mpi_ctx = nullptr);
 
-        ~Qwen2Graph() = default;
+        ~QwenStandardGraph() = default;
 
         // Non-copyable
-        Qwen2Graph(const Qwen2Graph &) = delete;
-        Qwen2Graph &operator=(const Qwen2Graph &) = delete;
+        QwenStandardGraph(const QwenStandardGraph &) = delete;
+        QwenStandardGraph &operator=(const QwenStandardGraph &) = delete;
 
         // =====================================================================
         // Model-Specific Overrides

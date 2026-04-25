@@ -6,7 +6,7 @@
  * AllGatherStage) and concrete backend implementations (MPI, NCCL, RCCL, Host).
  *
  * Architecture:
- * - Model graphs (Qwen2Graph) create abstract collective stages
+ * - Model graphs (QwenStandardGraph) create abstract collective stages
  * - DeviceGraphExecutor holds a CollectiveContext
  * - When executing collective stages, DeviceGraphExecutor delegates to CollectiveContext
  * - CollectiveContext selects and uses the appropriate backend

@@ -5,7 +5,7 @@
  * @date December 2025
  *
  * Tests the graph merging functionality added for Phase 3 of the
- * declarative Qwen2Graph refactoring project.
+ * declarative QwenStandardGraph refactoring project.
  */
 
 #include <gtest/gtest.h>

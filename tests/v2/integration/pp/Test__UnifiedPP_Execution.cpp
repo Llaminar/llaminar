@@ -19,7 +19,7 @@
 #include <gtest/gtest.h>
 #include <filesystem>
 
-#include "models/qwen/Qwen2Graph.h"
+#include "models/qwen/QwenStandardGraph.h"
 #include "config/PipelineConfig.h"
 #include "config/TPDomainConfig.h"
 #include "config/PPStageConfig.h"
@@ -498,7 +498,7 @@ namespace
         createMockPPContexts(pipeline_config.get());
 
         // Create graph builder
-        Qwen2Graph graph_builder(graph_config_, mpi_ctx_);
+        QwenStandardGraph graph_builder(graph_config_, mpi_ctx_);
 
         // Set weights
         auto weights = createModelWeights();
@@ -550,7 +550,7 @@ namespace
         createMockPPContexts(pipeline_config.get());
 
         // Create graph builder
-        Qwen2Graph graph_builder(graph_config_, mpi_ctx_);
+        QwenStandardGraph graph_builder(graph_config_, mpi_ctx_);
 
         // Set weights
         auto weights = createModelWeights();
@@ -596,7 +596,7 @@ namespace
         createMockPPContexts(pipeline_config.get());
 
         // Create graph builder
-        Qwen2Graph graph_builder(graph_config_, mpi_ctx_);
+        QwenStandardGraph graph_builder(graph_config_, mpi_ctx_);
 
         // Set weights
         auto weights = createModelWeights();
@@ -651,7 +651,7 @@ namespace
         MockLocalPPContext *mock_ctx = mock_pp_contexts_[0].get();
 
         // Create graph builder
-        Qwen2Graph graph_builder(graph_config_, mpi_ctx_);
+        QwenStandardGraph graph_builder(graph_config_, mpi_ctx_);
 
         // Set weights
         auto weights = createModelWeights();
@@ -701,7 +701,7 @@ namespace
         MockLocalPPContext *mock_ctx = mock_pp_contexts_[0].get();
 
         // Create graph builder
-        Qwen2Graph graph_builder(graph_config_, mpi_ctx_);
+        QwenStandardGraph graph_builder(graph_config_, mpi_ctx_);
 
         // Set weights
         auto weights = createModelWeights();
@@ -752,7 +752,7 @@ namespace
         MockLocalPPContext *mock_ctx = mock_pp_contexts_[0].get();
 
         // Create graph builder
-        Qwen2Graph graph_builder(graph_config_, mpi_ctx_);
+        QwenStandardGraph graph_builder(graph_config_, mpi_ctx_);
 
         // Set weights
         auto weights = createModelWeights();
@@ -804,7 +804,7 @@ namespace
         createMockPPContexts(pipeline_config.get());
 
         // Create graph builder
-        Qwen2Graph graph_builder(graph_config_, mpi_ctx_);
+        QwenStandardGraph graph_builder(graph_config_, mpi_ctx_);
 
         // Set weights
         auto weights = createModelWeights();
@@ -855,7 +855,7 @@ namespace
         createMockPPContexts(pipeline_config.get());
 
         // Create graph builder
-        Qwen2Graph graph_builder(graph_config_, mpi_ctx_);
+        QwenStandardGraph graph_builder(graph_config_, mpi_ctx_);
 
         // Set weights
         auto weights = createModelWeights();
@@ -902,7 +902,7 @@ namespace
         createMockPPContexts(pipeline_config.get());
 
         // Create graph builder
-        Qwen2Graph graph_builder(graph_config_, mpi_ctx_);
+        QwenStandardGraph graph_builder(graph_config_, mpi_ctx_);
 
         // Set weights
         auto weights = createModelWeights();

@@ -1,12 +1,12 @@
 /**
- * @file Test__Qwen2Graph_PPLayerRange.cpp
+ * @file Test__QwenStandardGraph_PPLayerRange.cpp
  * @brief Regression tests for PP stage absolute layer index validation
  *
  * Validates that buildPartialForwardGraph() correctly handles absolute layer indices
  * when config.n_layers (local stage count) differs from config.total_n_layers (total model).
  *
  * Root cause: For LocalPP, each PP stage's ModelContext overrides blockCount() to return
- * the local layer count (e.g., 4 for stage handling layers [4,8)). Qwen2GraphConfigBuilder
+ * the local layer count (e.g., 4 for stage handling layers [4,8)). QwenStandardGraphConfigBuilder
  * sets config.n_layers from this local count. buildPartialForwardGraph() then validates
  * absolute indices against n_layers, causing "Invalid layer range" for non-first stages.
  *
@@ -19,7 +19,7 @@
 
 #include <gtest/gtest.h>
 #include <optional>
-#include "models/qwen/Qwen2Graph.h"
+#include "models/qwen/QwenStandardGraph.h"
 #include "execution/compute_stages/IComputeStage.h"
 #include "execution/local_execution/graph/DeviceGraphExecutor.h"
 #include "tensors/TensorFactory.h"
@@ -30,7 +30,7 @@ using namespace llaminar2;
 namespace
 {
 
-    class Test__Qwen2Graph_PPLayerRange : public ::testing::Test
+    class Test__QwenStandardGraph_PPLayerRange : public ::testing::Test
     {
     protected:
         static constexpr int TOTAL_LAYERS = 8;
@@ -202,7 +202,7 @@ namespace
      * Before fix: buildPartialForwardGraph(4, 8, ...) threw "Invalid layer range"
      * because config.n_layers=4 (local PP stage count) and 8 > 4.
      */
-    TEST_F(Test__Qwen2Graph_PPLayerRange, AbsoluteIndicesBeyondLocalCount)
+    TEST_F(Test__QwenStandardGraph_PPLayerRange, AbsoluteIndicesBeyondLocalCount)
     {
         // 8-layer model, PP stage handles layers [4, 8)
         // n_layers=4 (local), total_n_layers=8 (full model)
@@ -212,7 +212,7 @@ namespace
         createWeightsForLayers(TOTAL_LAYERS);
         createBuffers();
 
-        Qwen2Graph graph(config, mpi_ctx_);
+        QwenStandardGraph graph(config, mpi_ctx_);
         graph.setWeights(weights_);
         graph.setBuffers(buffers_);
 
@@ -230,13 +230,13 @@ namespace
     /**
      * @brief Stage 0 with absolute indices [0, N/2) should also work.
      */
-    TEST_F(Test__Qwen2Graph_PPLayerRange, FirstStageAbsoluteIndicesStillWork)
+    TEST_F(Test__QwenStandardGraph_PPLayerRange, FirstStageAbsoluteIndicesStillWork)
     {
         GraphConfig config = makeConfig(LOCAL_LAYERS, TOTAL_LAYERS);
         createWeightsForLayers(TOTAL_LAYERS);
         createBuffers();
 
-        Qwen2Graph graph(config, mpi_ctx_);
+        QwenStandardGraph graph(config, mpi_ctx_);
         graph.setWeights(weights_);
         graph.setBuffers(buffers_);
 
@@ -252,14 +252,14 @@ namespace
     /**
      * @brief When total_n_layers is not set (0), fall back to n_layers for validation.
      */
-    TEST_F(Test__Qwen2Graph_PPLayerRange, FallbackToNLayersWhenTotalNotSet)
+    TEST_F(Test__QwenStandardGraph_PPLayerRange, FallbackToNLayersWhenTotalNotSet)
     {
         // total_n_layers=0 → fallback to n_layers=4
         GraphConfig config = makeConfig(4, 0);
         createWeightsForLayers(4);
         createBuffers();
 
-        Qwen2Graph graph(config, mpi_ctx_);
+        QwenStandardGraph graph(config, mpi_ctx_);
         graph.setWeights(weights_);
         graph.setBuffers(buffers_);
 
@@ -280,13 +280,13 @@ namespace
     /**
      * @brief Truly invalid layer ranges should still throw.
      */
-    TEST_F(Test__Qwen2Graph_PPLayerRange, InvalidRangesStillThrow)
+    TEST_F(Test__QwenStandardGraph_PPLayerRange, InvalidRangesStillThrow)
     {
         GraphConfig config = makeConfig(LOCAL_LAYERS, TOTAL_LAYERS);
         createWeightsForLayers(TOTAL_LAYERS);
         createBuffers();
 
-        Qwen2Graph graph(config, mpi_ctx_);
+        QwenStandardGraph graph(config, mpi_ctx_);
         graph.setWeights(weights_);
         graph.setBuffers(buffers_);
 
@@ -319,13 +319,13 @@ namespace
      * @brief 3-way PP split: stage 2 uses layers [6, 9) on a 9-layer model where
      *        n_layers=3 (local) and total_n_layers=9.
      */
-    TEST_F(Test__Qwen2Graph_PPLayerRange, ThreeWaySplitLastStage)
+    TEST_F(Test__QwenStandardGraph_PPLayerRange, ThreeWaySplitLastStage)
     {
         GraphConfig config = makeConfig(3, 9);
         createWeightsForLayers(9);
         createBuffers();
 
-        Qwen2Graph graph(config, mpi_ctx_);
+        QwenStandardGraph graph(config, mpi_ctx_);
         graph.setWeights(weights_);
         graph.setBuffers(buffers_);
 
@@ -347,7 +347,7 @@ namespace
     // ============================================================================
     // Regression: GPU residual fusion must respect pp_layer_offset
     //
-    // On GPU, Qwen2Graph uses FusedResidualNormStage (fused residual + RMSNorm)
+    // On GPU, QwenStandardGraph uses FusedResidualNormStage (fused residual + RMSNorm)
     // for all layers except the first. For PP stage 1+ this "first layer" is
     // at pp_layer_offset, not layer 0. The skip_ffn_residual optimization also
     // needs absolute-index awareness.
@@ -406,7 +406,7 @@ namespace
      * After fix: layer_idx > config_.pp_layer_offset correctly identifies layer 4
      * as the first layer of this PP stage.
      */
-    TEST_F(Test__Qwen2Graph_PPLayerRange, GPUFusedResidualNorm_FirstLayerOfPPStage)
+    TEST_F(Test__QwenStandardGraph_PPLayerRange, GPUFusedResidualNorm_FirstLayerOfPPStage)
     {
         // 8-layer model, PP stage 1 handles layers [4, 8)
         GraphConfig config = makeConfig(LOCAL_LAYERS, TOTAL_LAYERS);
@@ -416,7 +416,7 @@ namespace
         createWeightsForLayers(TOTAL_LAYERS);
         createBuffers();
 
-        Qwen2Graph graph(config, mpi_ctx_);
+        QwenStandardGraph graph(config, mpi_ctx_);
         graph.setWeights(weights_);
         graph.setBuffers(buffers_);
 
@@ -451,7 +451,7 @@ namespace
      * After fix: uses pp_layer_offset + n_layers - 1, so only the last layer (7)
      * keeps explicit residual.
      */
-    TEST_F(Test__Qwen2Graph_PPLayerRange, GPUSkipFFNResidual_PPStageMiddleLayers)
+    TEST_F(Test__QwenStandardGraph_PPLayerRange, GPUSkipFFNResidual_PPStageMiddleLayers)
     {
         // 8-layer model, PP stage 1 handles layers [4, 8)
         GraphConfig config = makeConfig(LOCAL_LAYERS, TOTAL_LAYERS);
@@ -461,7 +461,7 @@ namespace
         createWeightsForLayers(TOTAL_LAYERS);
         createBuffers();
 
-        Qwen2Graph graph(config, mpi_ctx_);
+        QwenStandardGraph graph(config, mpi_ctx_);
         graph.setWeights(weights_);
         graph.setBuffers(buffers_);
 
@@ -492,7 +492,7 @@ namespace
      *        after the PP layer offset fix. Layer 0 gets RMS_NORM, layers 1+ get
      *        FUSED_RESIDUAL_NORM, only last layer keeps explicit FFN residual.
      */
-    TEST_F(Test__Qwen2Graph_PPLayerRange, GPUResidualFusion_SingleGPUUnchanged)
+    TEST_F(Test__QwenStandardGraph_PPLayerRange, GPUResidualFusion_SingleGPUUnchanged)
     {
         // Single-GPU: all 8 layers, no PP offset
         GraphConfig config = makeConfig(TOTAL_LAYERS, TOTAL_LAYERS);
@@ -502,7 +502,7 @@ namespace
         createWeightsForLayers(TOTAL_LAYERS);
         createBuffers();
 
-        Qwen2Graph graph(config, mpi_ctx_);
+        QwenStandardGraph graph(config, mpi_ctx_);
         graph.setWeights(weights_);
         graph.setBuffers(buffers_);
 
@@ -532,7 +532,7 @@ namespace
     /**
      * @brief 3-way PP split on GPU: each stage's first layer gets plain RMS_NORM.
      */
-    TEST_F(Test__Qwen2Graph_PPLayerRange, GPUFusedResidualNorm_ThreeWaySplit)
+    TEST_F(Test__QwenStandardGraph_PPLayerRange, GPUFusedResidualNorm_ThreeWaySplit)
     {
         // 9-layer model, PP stage 1: layers [3, 6), pp_layer_offset=3
         GraphConfig config = makeConfig(3, 9);
@@ -542,7 +542,7 @@ namespace
         createWeightsForLayers(9);
         createBuffers();
 
-        Qwen2Graph graph(config, mpi_ctx_);
+        QwenStandardGraph graph(config, mpi_ctx_);
         graph.setWeights(weights_);
         graph.setBuffers(buffers_);
 
@@ -579,14 +579,14 @@ namespace
      * @brief Verify that total_n_layers == n_layers when both are set to same value
      *        (non-PP scenario). Validation should work normally.
      */
-    TEST_F(Test__Qwen2Graph_PPLayerRange, NonPPScenarioSameValues)
+    TEST_F(Test__QwenStandardGraph_PPLayerRange, NonPPScenarioSameValues)
     {
         // Non-PP: n_layers=total_n_layers=8
         GraphConfig config = makeConfig(TOTAL_LAYERS, TOTAL_LAYERS);
         createWeightsForLayers(TOTAL_LAYERS);
         createBuffers();
 
-        Qwen2Graph graph(config, mpi_ctx_);
+        QwenStandardGraph graph(config, mpi_ctx_);
         graph.setWeights(weights_);
         graph.setBuffers(buffers_);
 

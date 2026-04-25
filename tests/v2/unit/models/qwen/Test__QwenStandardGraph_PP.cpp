@@ -1,6 +1,6 @@
 /**
- * @file Test__Qwen2Graph_PP.cpp
- * @brief Unit tests for Qwen2Graph::buildUnifiedPipelineGraph()
+ * @file Test__QwenStandardGraph_PP.cpp
+ * @brief Unit tests for QwenStandardGraph::buildUnifiedPipelineGraph()
  *
  * Tests the unified PP graph building method that:
  * 1. Validates pipeline_config prerequisites
@@ -16,7 +16,7 @@
  */
 
 #include <gtest/gtest.h>
-#include "models/qwen/Qwen2Graph.h"
+#include "models/qwen/QwenStandardGraph.h"
 #include "config/PipelineConfig.h"
 #include "config/TPDomainConfig.h"
 #include "config/PPStageConfig.h"
@@ -37,9 +37,9 @@ namespace
     // ============================================================================
 
     /**
-     * @brief Test fixture for Qwen2Graph PP tests
+     * @brief Test fixture for QwenStandardGraph PP tests
      */
-    class Test__Qwen2Graph_PP : public ::testing::Test
+    class Test__QwenStandardGraph_PP : public ::testing::Test
     {
     protected:
         void SetUp() override
@@ -454,12 +454,12 @@ namespace
     /**
      * @brief Test that buildUnifiedPipelineGraph throws without pipeline_config
      */
-    TEST_F(Test__Qwen2Graph_PP, ThrowsWithoutPipelineConfig)
+    TEST_F(Test__QwenStandardGraph_PP, ThrowsWithoutPipelineConfig)
     {
         // Config has no pipeline_config (nullptr)
         EXPECT_EQ(config_.pipeline_config, nullptr);
 
-        Qwen2Graph graph(config_, mpi_ctx_);
+        QwenStandardGraph graph(config_, mpi_ctx_);
         graph.setWeights(weights_);
         graph.setBuffers(buffers_);
 
@@ -474,7 +474,7 @@ namespace
     /**
      * @brief Test that buildUnifiedPipelineGraph throws with invalid pipeline_config
      */
-    TEST_F(Test__Qwen2Graph_PP, ThrowsWithInvalidConfig)
+    TEST_F(Test__QwenStandardGraph_PP, ThrowsWithInvalidConfig)
     {
         // Create an invalid config (no stages)
         auto pipeline_config = std::make_shared<PipelineConfig>();
@@ -483,7 +483,7 @@ namespace
 
         config_.pipeline_config = pipeline_config;
 
-        Qwen2Graph graph(config_, mpi_ctx_);
+        QwenStandardGraph graph(config_, mpi_ctx_);
         graph.setWeights(weights_);
         graph.setBuffers(buffers_);
 
@@ -498,13 +498,13 @@ namespace
     /**
      * @brief Test that buildUnifiedPipelineGraph throws without layer weight accessor
      */
-    TEST_F(Test__Qwen2Graph_PP, ThrowsWithoutLayerWeightAccessor)
+    TEST_F(Test__QwenStandardGraph_PP, ThrowsWithoutLayerWeightAccessor)
     {
         auto pipeline_config = createTwoStagePPConfig();
         config_.pipeline_config = pipeline_config;
         createMockPPContexts(pipeline_config.get());
 
-        Qwen2Graph graph(config_, mpi_ctx_);
+        QwenStandardGraph graph(config_, mpi_ctx_);
 
         // Set weights without get_layer_weights accessor
         ModelWeights incomplete_weights;
@@ -530,7 +530,7 @@ namespace
     // These tests document and lock in fixes for bugs found during integration testing.
     // Bug: When calling buildUnifiedPipelineGraph() or buildPartialForwardGraph() without
     // setting position_ids in the input, RoPE uses undefined values causing NaN in outputs.
-    // Fix: Callers MUST set position_ids via Qwen2Graph::buildPositionIds() before building.
+    // Fix: Callers MUST set position_ids via QwenStandardGraph::buildPositionIds() before building.
 
     /**
      * @test Regression: buildPositionIds generates correct sequence for prefill
@@ -538,9 +538,9 @@ namespace
      * For prefill with seq_len=6, batch_size=1, offset=0:
      * Expected: [0, 1, 2, 3, 4, 5]
      */
-    TEST_F(Test__Qwen2Graph_PP, Regression_BuildPositionIdsPrefillSequence)
+    TEST_F(Test__QwenStandardGraph_PP, Regression_BuildPositionIdsPrefillSequence)
     {
-        auto pos_ids = Qwen2Graph::buildPositionIds(6, 1, 0);
+        auto pos_ids = QwenStandardGraph::buildPositionIds(6, 1, 0);
 
         ASSERT_EQ(pos_ids.size(), 6u);
         for (int i = 0; i < 6; ++i)
@@ -557,10 +557,10 @@ namespace
      *
      * This is critical for autoregressive decode - each token needs its correct position.
      */
-    TEST_F(Test__Qwen2Graph_PP, Regression_BuildPositionIdsDecodeStep)
+    TEST_F(Test__QwenStandardGraph_PP, Regression_BuildPositionIdsDecodeStep)
     {
         // Simulate decode at position 100 (after prefilling 100 tokens)
-        auto pos_ids = Qwen2Graph::buildPositionIds(1, 1, 100);
+        auto pos_ids = QwenStandardGraph::buildPositionIds(1, 1, 100);
 
         ASSERT_EQ(pos_ids.size(), 1u);
         EXPECT_EQ(pos_ids[0], 100);
@@ -572,13 +572,13 @@ namespace
      * Documents the bug where reusing prefill position IDs for decode caused wrong RoPE.
      * The fix requires rebuilding position IDs for EACH decode step with current position.
      */
-    TEST_F(Test__Qwen2Graph_PP, Regression_DecodePositionIdsMustBeRebuiltEachStep)
+    TEST_F(Test__QwenStandardGraph_PP, Regression_DecodePositionIdsMustBeRebuiltEachStep)
     {
         // Simulate decode loop: prefill with 6 tokens, then decode 3 more
         int prefill_len = 6;
 
         // Prefill position IDs
-        auto prefill_pos = Qwen2Graph::buildPositionIds(prefill_len, 1, 0);
+        auto prefill_pos = QwenStandardGraph::buildPositionIds(prefill_len, 1, 0);
         ASSERT_EQ(prefill_pos.size(), 6u);
         EXPECT_EQ(prefill_pos.back(), 5); // Last prefill position is 5
 
@@ -586,7 +586,7 @@ namespace
         for (int decode_step = 0; decode_step < 3; ++decode_step)
         {
             int current_pos = prefill_len + decode_step; // 6, 7, 8
-            auto decode_pos = Qwen2Graph::buildPositionIds(1, 1, current_pos);
+            auto decode_pos = QwenStandardGraph::buildPositionIds(1, 1, current_pos);
 
             ASSERT_EQ(decode_pos.size(), 1u);
             EXPECT_EQ(decode_pos[0], current_pos)
@@ -600,9 +600,9 @@ namespace
      * For batched inference, each sequence in the batch gets the same positions.
      * seq_len=3, batch_size=2, offset=0 → [0,1,2, 0,1,2]
      */
-    TEST_F(Test__Qwen2Graph_PP, Regression_BuildPositionIdsBatched)
+    TEST_F(Test__QwenStandardGraph_PP, Regression_BuildPositionIdsBatched)
     {
-        auto pos_ids = Qwen2Graph::buildPositionIds(3, 2, 0);
+        auto pos_ids = QwenStandardGraph::buildPositionIds(3, 2, 0);
 
         ASSERT_EQ(pos_ids.size(), 6u);
         // Batch 0: positions 0,1,2
@@ -621,9 +621,9 @@ namespace
      * When continuing generation, offset shifts all positions.
      * seq_len=3, batch_size=1, offset=50 → [50, 51, 52]
      */
-    TEST_F(Test__Qwen2Graph_PP, Regression_BuildPositionIdsWithOffset)
+    TEST_F(Test__QwenStandardGraph_PP, Regression_BuildPositionIdsWithOffset)
     {
-        auto pos_ids = Qwen2Graph::buildPositionIds(3, 1, 50);
+        auto pos_ids = QwenStandardGraph::buildPositionIds(3, 1, 50);
 
         ASSERT_EQ(pos_ids.size(), 3u);
         EXPECT_EQ(pos_ids[0], 50);
@@ -645,7 +645,7 @@ namespace
      *
      * The helper method must create ONE context with all stages, not per-transfer contexts.
      */
-    TEST_F(Test__Qwen2Graph_PP, Regression_CreateMockPPContextsCoversAllStages)
+    TEST_F(Test__QwenStandardGraph_PP, Regression_CreateMockPPContextsCoversAllStages)
     {
         auto pipeline_config = createThreeStagePPConfig();
         mock_pp_contexts_.clear();
@@ -670,10 +670,10 @@ namespace
     /**
      * @test Regression: Transfer stage indices must be valid within PP context
      *
-     * When Qwen2Graph builds transfer stages, it uses real stage indices (0, 1, 2...).
+     * When QwenStandardGraph builds transfer stages, it uses real stage indices (0, 1, 2...).
      * The PP context must have numStages() > max(stage_to) for validation to pass.
      */
-    TEST_F(Test__Qwen2Graph_PP, Regression_ThreeStageTransferIndicesAreValid)
+    TEST_F(Test__QwenStandardGraph_PP, Regression_ThreeStageTransferIndicesAreValid)
     {
         auto pipeline_config = createThreeStagePPConfig();
         mock_pp_contexts_.clear();
@@ -701,13 +701,13 @@ namespace
     /**
      * @brief Test that 2-stage PP builds a graph with the correct node count
      */
-    TEST_F(Test__Qwen2Graph_PP, TwoStage_BuildsGraphWithCorrectNodeCount)
+    TEST_F(Test__QwenStandardGraph_PP, TwoStage_BuildsGraphWithCorrectNodeCount)
     {
         auto pipeline_config = createTwoStagePPConfig();
         config_.pipeline_config = pipeline_config;
         createMockPPContexts(pipeline_config.get());
 
-        Qwen2Graph graph(config_, mpi_ctx_);
+        QwenStandardGraph graph(config_, mpi_ctx_);
         graph.setWeights(weights_);
         graph.setBuffers(buffers_);
 
@@ -729,13 +729,13 @@ namespace
     /**
      * @brief Test that first stage has embedding on correct device
      */
-    TEST_F(Test__Qwen2Graph_PP, TwoStage_HasEmbeddingStageOnFirstDevice)
+    TEST_F(Test__QwenStandardGraph_PP, TwoStage_HasEmbeddingStageOnFirstDevice)
     {
         auto pipeline_config = createTwoStagePPConfig();
         config_.pipeline_config = pipeline_config;
         createMockPPContexts(pipeline_config.get());
 
-        Qwen2Graph graph(config_, mpi_ctx_);
+        QwenStandardGraph graph(config_, mpi_ctx_);
         graph.setWeights(weights_);
         graph.setBuffers(buffers_);
 
@@ -759,13 +759,13 @@ namespace
     /**
      * @brief Test that last stage has LM head on correct device
      */
-    TEST_F(Test__Qwen2Graph_PP, TwoStage_HasLMHeadStageOnLastDevice)
+    TEST_F(Test__QwenStandardGraph_PP, TwoStage_HasLMHeadStageOnLastDevice)
     {
         auto pipeline_config = createTwoStagePPConfig();
         config_.pipeline_config = pipeline_config;
         createMockPPContexts(pipeline_config.get());
 
-        Qwen2Graph graph(config_, mpi_ctx_);
+        QwenStandardGraph graph(config_, mpi_ctx_);
         graph.setWeights(weights_);
         graph.setBuffers(buffers_);
 
@@ -789,13 +789,13 @@ namespace
     /**
      * @brief Test that PP transfer stage exists between stages
      */
-    TEST_F(Test__Qwen2Graph_PP, TwoStage_HasPPTransferBetweenStages)
+    TEST_F(Test__QwenStandardGraph_PP, TwoStage_HasPPTransferBetweenStages)
     {
         auto pipeline_config = createTwoStagePPConfig();
         config_.pipeline_config = pipeline_config;
         createMockPPContexts(pipeline_config.get());
 
-        Qwen2Graph graph(config_, mpi_ctx_);
+        QwenStandardGraph graph(config_, mpi_ctx_);
         graph.setWeights(weights_);
         graph.setBuffers(buffers_);
 
@@ -820,13 +820,13 @@ namespace
     /**
      * @brief Test that layers are assigned to correct devices
      */
-    TEST_F(Test__Qwen2Graph_PP, TwoStage_LayersAssignedToCorrectDevices)
+    TEST_F(Test__QwenStandardGraph_PP, TwoStage_LayersAssignedToCorrectDevices)
     {
         auto pipeline_config = createTwoStagePPConfig();
         config_.pipeline_config = pipeline_config;
         createMockPPContexts(pipeline_config.get());
 
-        Qwen2Graph graph(config_, mpi_ctx_);
+        QwenStandardGraph graph(config_, mpi_ctx_);
         graph.setWeights(weights_);
         graph.setBuffers(buffers_);
 
@@ -890,7 +890,7 @@ namespace
      * NOTE: Uses the CORRECT pattern of a single PP context covering ALL stages.
      * See Regression_MultiStagePPContextMustCoverAllStages for the bug this fixes.
      */
-    TEST_F(Test__Qwen2Graph_PP, ThreeStage_BuildsGraphWithTwoPPTransfers)
+    TEST_F(Test__QwenStandardGraph_PP, ThreeStage_BuildsGraphWithTwoPPTransfers)
     {
         // Helper to avoid narrowing conversions (int -> size_t)
         auto sz = [](int x)
@@ -923,7 +923,7 @@ namespace
         // Use the CORRECT pattern: single context covering all 3 stages
         createMockPPContexts(pipeline_config.get());
 
-        Qwen2Graph graph(config_, mpi_ctx_);
+        QwenStandardGraph graph(config_, mpi_ctx_);
         graph.setWeights(weights_);
         graph.setBuffers(buffers_);
 
@@ -957,7 +957,7 @@ namespace
     /**
      * @brief Test that middle stage has no embedding or LM head
      */
-    TEST_F(Test__Qwen2Graph_PP, ThreeStage_MiddleStageHasNoEmbeddingOrLMHead)
+    TEST_F(Test__QwenStandardGraph_PP, ThreeStage_MiddleStageHasNoEmbeddingOrLMHead)
     {
         // Helper to avoid narrowing conversions (int -> size_t)
         auto sz = [](int x)
@@ -990,7 +990,7 @@ namespace
         // Use the CORRECT pattern: single context covering all 3 stages
         createMockPPContexts(pipeline_config.get());
 
-        Qwen2Graph graph(config_, mpi_ctx_);
+        QwenStandardGraph graph(config_, mpi_ctx_);
         graph.setWeights(weights_);
         graph.setBuffers(buffers_);
 
@@ -1032,13 +1032,13 @@ namespace
     /**
      * @brief Test that PP transfer stage has correct from/to stage parameters
      */
-    TEST_F(Test__Qwen2Graph_PP, PPTransferStageHasCorrectParams)
+    TEST_F(Test__QwenStandardGraph_PP, PPTransferStageHasCorrectParams)
     {
         auto pipeline_config = createTwoStagePPConfig();
         config_.pipeline_config = pipeline_config;
         createMockPPContexts(pipeline_config.get());
 
-        Qwen2Graph graph(config_, mpi_ctx_);
+        QwenStandardGraph graph(config_, mpi_ctx_);
         graph.setWeights(weights_);
         graph.setBuffers(buffers_);
 
@@ -1063,13 +1063,13 @@ namespace
     /**
      * @brief Test that PP transfer depends on last layer of previous stage
      */
-    TEST_F(Test__Qwen2Graph_PP, PPTransferDependsOnLastLayerOfPrevStage)
+    TEST_F(Test__QwenStandardGraph_PP, PPTransferDependsOnLastLayerOfPrevStage)
     {
         auto pipeline_config = createTwoStagePPConfig();
         config_.pipeline_config = pipeline_config;
         createMockPPContexts(pipeline_config.get());
 
-        Qwen2Graph graph(config_, mpi_ctx_);
+        QwenStandardGraph graph(config_, mpi_ctx_);
         graph.setWeights(weights_);
         graph.setBuffers(buffers_);
 
@@ -1126,13 +1126,13 @@ namespace
     /**
      * @brief Test that stages use domain's primary device
      */
-    TEST_F(Test__Qwen2Graph_PP, StagesUseDomainPrimaryDevice)
+    TEST_F(Test__QwenStandardGraph_PP, StagesUseDomainPrimaryDevice)
     {
         auto pipeline_config = createTwoStagePPConfig();
         config_.pipeline_config = pipeline_config;
         createMockPPContexts(pipeline_config.get());
 
-        Qwen2Graph graph(config_, mpi_ctx_);
+        QwenStandardGraph graph(config_, mpi_ctx_);
         graph.setWeights(weights_);
         graph.setBuffers(buffers_);
 
@@ -1161,7 +1161,7 @@ namespace
     /**
      * @brief Test that domain lookup works correctly for each PP stage
      */
-    TEST_F(Test__Qwen2Graph_PP, DomainLookupWorksForEachStage)
+    TEST_F(Test__QwenStandardGraph_PP, DomainLookupWorksForEachStage)
     {
         auto pipeline_config = createTwoStagePPConfig();
 
@@ -1183,7 +1183,7 @@ namespace
     /**
      * @brief Test that PP context is wired correctly for transfer stages
      */
-    TEST_F(Test__Qwen2Graph_PP, PPContextWiredToTransferStage)
+    TEST_F(Test__QwenStandardGraph_PP, PPContextWiredToTransferStage)
     {
         auto pipeline_config = createTwoStagePPConfig();
         config_.pipeline_config = pipeline_config;
@@ -1194,7 +1194,7 @@ namespace
         EXPECT_NE(config_.pp_contexts.count(key), 0u);
         EXPECT_NE(config_.pp_contexts[key], nullptr);
 
-        Qwen2Graph graph(config_, mpi_ctx_);
+        QwenStandardGraph graph(config_, mpi_ctx_);
         graph.setWeights(weights_);
         graph.setBuffers(buffers_);
 
@@ -1208,13 +1208,13 @@ namespace
     /**
      * @brief Test that missing PP context throws error
      */
-    TEST_F(Test__Qwen2Graph_PP, ThrowsWhenPPContextMissing)
+    TEST_F(Test__QwenStandardGraph_PP, ThrowsWhenPPContextMissing)
     {
         auto pipeline_config = createTwoStagePPConfig();
         config_.pipeline_config = pipeline_config;
         // Don't create PP contexts - this should cause failure
 
-        Qwen2Graph graph(config_, mpi_ctx_);
+        QwenStandardGraph graph(config_, mpi_ctx_);
         graph.setWeights(weights_);
         graph.setBuffers(buffers_);
 
@@ -1232,13 +1232,13 @@ namespace
     /**
      * @brief Test that output.logits is set correctly
      */
-    TEST_F(Test__Qwen2Graph_PP, OutputLogitsIsSet)
+    TEST_F(Test__QwenStandardGraph_PP, OutputLogitsIsSet)
     {
         auto pipeline_config = createTwoStagePPConfig();
         config_.pipeline_config = pipeline_config;
         createMockPPContexts(pipeline_config.get());
 
-        Qwen2Graph graph(config_, mpi_ctx_);
+        QwenStandardGraph graph(config_, mpi_ctx_);
         graph.setWeights(weights_);
         graph.setBuffers(buffers_);
 

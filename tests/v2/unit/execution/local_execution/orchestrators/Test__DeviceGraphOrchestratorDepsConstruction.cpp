@@ -6,7 +6,7 @@
  * DGO-Qwen2 decoupling (Phase 5). Verifies:
  * - Required fields validation (model_ctx, graph_builder)
  * - Optional field wiring (topology, collective_ctx, pp_stage_config, etc.)
- * - Polymorphic IGraphBuilder usage (MockGraphBuilder, not Qwen2Graph)
+ * - Polymorphic IGraphBuilder usage (MockGraphBuilder, not QwenStandardGraph)
  * - PP stage config validation during construction
  * - Field accessibility after construction
  *
@@ -46,7 +46,7 @@ protected:
         DeviceManager::instance().initialize(-1);
 
         // Use MockGraphBuilder — verifies DGO works with IGraphBuilder interface,
-        // not just Qwen2Graph.
+        // not just QwenStandardGraph.
         mock_builder_ = std::make_shared<MockGraphBuilder>();
         mock_builder_->setNumLayers(24);
         mock_builder_->setHiddenDim(896);

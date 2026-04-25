@@ -18,7 +18,7 @@
 #include <gmock/gmock.h>
 
 #include "execution/local_execution/orchestrators/DeviceGraphOrchestrator.h"
-#include "models/qwen/Qwen2Graph.h"
+#include "models/qwen/QwenStandardGraph.h"
 #include "loaders/IWeightStreamer.h"
 #include "execution/mpi_orchestration/PlacementStrategy.h"
 #include "backends/DeviceId.h"
@@ -81,7 +81,7 @@ namespace llaminar2
             config.max_seq_len = 128;
 
             // Create orchestrator (no MPI)
-            orchestrator_ = std::make_unique<DeviceGraphOrchestrator>(std::make_shared<Qwen2Graph>(config, nullptr), nullptr);
+            orchestrator_ = std::make_unique<DeviceGraphOrchestrator>(std::make_shared<QwenStandardGraph>(config, nullptr), nullptr);
         }
 
         void TearDown() override

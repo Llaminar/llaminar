@@ -27,6 +27,7 @@
 #include "../../execution/compute_stages/stages/TPAllreduceStage.h"
 #include "../../execution/compute_stages/stages/LocalPPTransferStage.h"
 #include "../../execution/compute_stages/stages/FusedResidualNormStage.h"
+#include "../../execution/compute_stages/stages/QKNormStage.h"
 #include "../../config/PipelineConfig.h"
 #include "../../memory/BufferId.h" // Phase 2: contract BufferIds
 #include <chrono>
@@ -246,13 +247,13 @@ namespace llaminar2
         if (!weights_.embedding_table || !weights_.final_norm || !weights_.lm_head)
         {
             LOG_ERROR("[QwenGraphBase] Weights not set! Call setWeights() first.");
-            throw std::runtime_error("Qwen2Graph weights not initialized");
+            throw std::runtime_error("QwenStandardGraph weights not initialized");
         }
 
         if (!buffers_.current_hidden || !buffers_.logits)
         {
             LOG_ERROR("[QwenGraphBase] Buffers not set! Call setBuffers() first.");
-            throw std::runtime_error("Qwen2Graph buffers not initialized");
+            throw std::runtime_error("QwenStandardGraph buffers not initialized");
         }
 
         DeviceId device = config_.default_device;
@@ -329,7 +330,7 @@ namespace llaminar2
         if (!weights_.get_layer_weights)
         {
             LOG_ERROR("[QwenGraphBase] Layer weight accessor not set!");
-            throw std::runtime_error("Qwen2Graph layer weight accessor not initialized");
+            throw std::runtime_error("QwenStandardGraph layer weight accessor not initialized");
         }
 
         // Build complete graphs for each layer
@@ -489,29 +490,29 @@ namespace llaminar2
         if (has_embedding && !weights_.embedding_table)
         {
             LOG_ERROR("[QwenGraphBase] Embedding weights required but not set");
-            throw std::runtime_error("Qwen2Graph embedding weights not initialized");
+            throw std::runtime_error("QwenStandardGraph embedding weights not initialized");
         }
         if (has_lm_head && (!weights_.final_norm || !weights_.lm_head))
         {
             LOG_ERROR("[QwenGraphBase] LM head weights required but not set");
-            throw std::runtime_error("Qwen2Graph LM head weights not initialized");
+            throw std::runtime_error("QwenStandardGraph LM head weights not initialized");
         }
         if (!weights_.get_layer_weights)
         {
             LOG_ERROR("[QwenGraphBase] Layer weight accessor not set");
-            throw std::runtime_error("Qwen2Graph layer weight accessor not initialized");
+            throw std::runtime_error("QwenStandardGraph layer weight accessor not initialized");
         }
 
         // Validate buffers
         if (has_embedding && !buffers_.current_hidden && !buffers_.layer_buffers.residual)
         {
             LOG_ERROR("[QwenGraphBase] Hidden buffer required for embedding output");
-            throw std::runtime_error("Qwen2Graph hidden buffer not initialized");
+            throw std::runtime_error("QwenStandardGraph hidden buffer not initialized");
         }
         if (has_lm_head && !buffers_.logits)
         {
             LOG_ERROR("[QwenGraphBase] Logits buffer required for LM head output");
-            throw std::runtime_error("Qwen2Graph logits buffer not initialized");
+            throw std::runtime_error("QwenStandardGraph logits buffer not initialized");
         }
 
         DeviceId device = config_.default_device;
@@ -817,7 +818,7 @@ namespace llaminar2
         if (!weights_.get_layer_weights)
         {
             LOG_ERROR("[QwenGraphBase] Layer weight accessor not set");
-            throw std::runtime_error("Qwen2Graph layer weight accessor not initialized");
+            throw std::runtime_error("QwenStandardGraph layer weight accessor not initialized");
         }
 
         // =====================================================================
@@ -1336,7 +1337,7 @@ namespace llaminar2
     }
 
     // =============================================================================
-    // buildAttentionGraph is pure virtual - implemented by Qwen2Graph, Qwen35Graph
+    // buildAttentionGraph is pure virtual - implemented by QwenStandardGraph, Qwen35Graph
     // =============================================================================
 
     ComputeGraph QwenGraphBase::buildFFNGraph(
@@ -1540,7 +1541,7 @@ namespace llaminar2
         return pos_ids;
     }
 
-    // getSchema() is pure virtual - implemented by Qwen2Graph, Qwen35Graph
+    // getSchema() is pure virtual - implemented by QwenStandardGraph, Qwen35Graph
 
     TensorContext QwenGraphBase::buildTensorContext() const
     {
@@ -1787,6 +1788,393 @@ namespace llaminar2
         // No TP active - should not reach here (caller should check needsTPAllreduce())
         LOG_WARN("[QwenGraphBase] createTPAllreduceStage called but no TP active");
         return nullptr;
+    }
+
+    // =========================================================================
+    // Shared Attention Building Blocks
+    // =========================================================================
+
+    std::pair<int, int> QwenGraphBase::resolveLocalHeadCounts() const
+    {
+        int local_n_heads = config_.qkv_column_parallel
+                                ? config_.local_n_heads
+                                : config_.n_heads;
+        int local_n_kv_heads = config_.qkv_column_parallel
+                                   ? config_.local_n_kv_heads
+                                   : config_.n_kv_heads;
+        if (local_n_heads <= 0)
+            local_n_heads = config_.n_heads;
+        if (local_n_kv_heads <= 0)
+            local_n_kv_heads = config_.n_kv_heads;
+        return {local_n_heads, local_n_kv_heads};
+    }
+
+    std::string QwenGraphBase::addPreAttentionNorm(
+        ComputeGraph &graph,
+        const std::string &prefix,
+        ActivationBuffers &buffers,
+        TensorBase *norm_gamma,
+        int total_tokens,
+        int layer_idx,
+        DeviceId device,
+        bool check_hybrid_q16)
+    {
+        const std::string node_name = prefix + "attn_norm";
+        const bool use_fused = (!check_hybrid_q16 || !config_.isHybridQ16()) &&
+                               layer_idx > config_.pp_layer_offset;
+
+        if (use_fused)
+        {
+            FusedResidualNormStage::Params fused_params;
+            fused_params.device_id = device;
+            fused_params.input = buffers.attn_proj;
+            fused_params.residual = buffers.current_hidden;
+            fused_params.gamma = norm_gamma;
+            fused_params.norm_output = buffers.normalized;
+            fused_params.eps = config_.rms_norm_eps;
+            fused_params.seq_len = total_tokens;
+            fused_params.hidden_dim = config_.d_model;
+            fused_params.input_buffer_id = BufferId::ATTN_PROJ;
+            fused_params.residual_buffer_id = BufferId::HIDDEN_STATE;
+            fused_params.norm_output_buffer_id = BufferId::NORMALIZED;
+
+            graph.addNode(node_name,
+                          ComputeStageFactory::createFusedResidualNorm(fused_params),
+                          device);
+        }
+        else
+        {
+            RMSNormStage::Params norm_params;
+            norm_params.input = buffers.current_hidden;
+            norm_params.output = buffers.normalized;
+            norm_params.gamma = norm_gamma;
+            norm_params.eps = config_.rms_norm_eps;
+            norm_params.seq_len = total_tokens;
+            norm_params.device_id = device;
+            norm_params.input_buffer_id = BufferId::HIDDEN_STATE;
+            norm_params.output_buffer_id = BufferId::NORMALIZED;
+
+            graph.addNode(node_name,
+                          ComputeStageFactory::createRMSNorm(norm_params),
+                          device);
+        }
+
+        return node_name;
+    }
+
+    bool QwenGraphBase::addQKNorms(
+        ComputeGraph &graph,
+        const std::string &prefix,
+        ActivationBuffers &buffers,
+        const LayerWeights &layer,
+        int local_n_heads,
+        int local_n_kv_heads,
+        int total_tokens,
+        DeviceId device,
+        const std::string &q_dependency,
+        const std::string &k_dependency)
+    {
+        if (!layer.q_norm || !layer.k_norm)
+            return false;
+
+        LOG_DEBUG("[QwenGraphBase] Layer using QK norm");
+
+        graph.addNode(prefix + "q_norm",
+                      ComputeStageFactory::createQKNorm({
+                          .device_id = device,
+                          .input = buffers.Q,
+                          .output = buffers.Q,
+                          .gamma = layer.q_norm,
+                          .n_heads = local_n_heads,
+                          .head_dim = config_.head_dim,
+                          .eps = config_.rms_norm_eps,
+                          .seq_len = total_tokens,
+                          .input_buffer_id = BufferId::Q_PROJ,
+                          .output_buffer_id = BufferId::Q_PROJ,
+                      }),
+                      device);
+        graph.addDependency(prefix + "q_norm", q_dependency);
+
+        graph.addNode(prefix + "k_norm",
+                      ComputeStageFactory::createQKNorm({
+                          .device_id = device,
+                          .input = buffers.K,
+                          .output = buffers.K,
+                          .gamma = layer.k_norm,
+                          .n_heads = local_n_kv_heads,
+                          .head_dim = config_.head_dim,
+                          .eps = config_.rms_norm_eps,
+                          .seq_len = total_tokens,
+                          .input_buffer_id = BufferId::K_PROJ,
+                          .output_buffer_id = BufferId::K_PROJ,
+                      }),
+                      device);
+        graph.addDependency(prefix + "k_norm", k_dependency);
+
+        return true;
+    }
+
+    std::string QwenGraphBase::addRoPE(
+        ComputeGraph &graph,
+        const std::string &prefix,
+        ActivationBuffers &buffers,
+        int local_n_heads,
+        int local_n_kv_heads,
+        int total_tokens,
+        const int *position_ids,
+        DeviceId device)
+    {
+        const std::string node_name = prefix + "rope";
+        int pos_offset = position_ids ? position_ids[0] : 0;
+
+        graph.addNode(node_name,
+                      ComputeStageFactory::createRoPE({
+                          .device_id = device,
+                          .Q = buffers.Q,
+                          .K = buffers.K,
+                          .n_heads = local_n_heads,
+                          .n_kv_heads = local_n_kv_heads,
+                          .head_dim = config_.head_dim,
+                          .pos_offset = pos_offset,
+                          .theta_base = config_.rope_theta,
+                          .seq_len = total_tokens,
+                          .partial_rotary_factor = config_.partial_rotary_factor,
+                          .position_ids = position_ids,
+                          .skip_k = config_.rope_on_read,
+                          .q_buffer_id = BufferId::Q_PROJ,
+                          .k_buffer_id = BufferId::K_PROJ,
+                      }),
+                      device);
+
+        return node_name;
+    }
+
+    std::string QwenGraphBase::addKVCacheAndAttention(
+        ComputeGraph &graph,
+        const std::string &prefix,
+        ActivationBuffers &buffers,
+        int layer_idx,
+        int seq_len,
+        int batch_size,
+        int local_n_heads,
+        int local_n_kv_heads,
+        IKVCache *kv_cache,
+        const int *position_ids,
+        DeviceId device,
+        bool has_qkv_proj,
+        const std::string &rope_dependency)
+    {
+        int total_tokens = batch_size * seq_len;
+        int kv_local_layer = layer_idx - config_.pp_layer_offset;
+
+        // --- KV Cache Append ---
+        if (kv_cache)
+        {
+            graph.addNode(prefix + "kv_append",
+                          ComputeStageFactory::createKVCacheAppend({
+                              .device_id = device,
+                              .K = buffers.K,
+                              .V = buffers.V,
+                              .kv_cache = kv_cache,
+                              .layer_idx = kv_local_layer,
+                              .seq_idx = 0,
+                              .num_tokens = total_tokens,
+                              .batch_size = batch_size,
+                              .seq_len = seq_len,
+                              .kv_cache_scale_k = config_.kv_cache_scale_k,
+                              .kv_cache_scale_v = config_.kv_cache_scale_v,
+                              .head_dim = config_.head_dim,
+                              .turboquant_ctx = config_.turboquant_ctx,
+                              .kv_rotation = config_.kv_rotation,
+                              .k_buffer_id = BufferId::K_PROJ,
+                              .v_buffer_id = BufferId::V_PROJ,
+                          }),
+                          device);
+
+            if (!config_.rope_on_read)
+                graph.addDependency(prefix + "kv_append", rope_dependency);
+            else if (has_qkv_proj)
+                graph.addDependency(prefix + "kv_append", prefix + "qkv_proj");
+        }
+
+        // --- Determine K/V source for attention ---
+        ITensor *K_for_attn = buffers.K;
+        ITensor *V_for_attn = buffers.V;
+        int kv_len = total_tokens;
+        bool use_gather_stage = false;
+
+        if (kv_cache)
+        {
+            int cached_tokens = kv_cache->get_cached_tokens(kv_local_layer, 0);
+            if (cached_tokens > 0 && batch_size == 1)
+            {
+                K_for_attn = kv_cache->get_k(kv_local_layer, 0);
+                V_for_attn = kv_cache->get_v(kv_local_layer, 0);
+                kv_len = cached_tokens;
+                LOG_TRACE("[QwenGraphBase] Layer " << layer_idx << " using cached K/V (decode mode)");
+            }
+            else if (cached_tokens > 0 && batch_size > 1)
+            {
+                if (buffers.gathered_K && buffers.gathered_V)
+                {
+                    use_gather_stage = true;
+                    K_for_attn = buffers.gathered_K;
+                    V_for_attn = buffers.gathered_V;
+                    kv_len = cached_tokens;
+                    LOG_TRACE("[QwenGraphBase] Layer " << layer_idx << " using gathered K/V (batched decode)");
+                }
+                else
+                {
+                    LOG_WARN("[QwenGraphBase] Layer " << layer_idx
+                                                      << " batched decode but no gather buffers");
+                }
+            }
+        }
+
+        // --- KV Cache Gather (batched decode) ---
+        if (use_gather_stage)
+        {
+            graph.addNode(prefix + "kv_gather",
+                          ComputeStageFactory::createKVCacheGather({
+                              .kv_cache = kv_cache,
+                              .layer_idx = kv_local_layer,
+                              .batch_size = batch_size,
+                              .out_K = buffers.gathered_K,
+                              .out_V = buffers.gathered_V,
+                          }),
+                          device);
+            graph.addDependency(prefix + "kv_gather", prefix + "kv_append");
+        }
+
+        // --- Attention Compute ---
+        {
+            AttentionMode mode = detect_attention_mode(batch_size, seq_len, kv_len);
+            LOG_TRACE("[QwenGraphBase] Layer " << layer_idx
+                                               << " attention mode: " << attention_mode_name(mode)
+                                               << " (batch=" << batch_size << ", seq=" << seq_len << ", kv=" << kv_len << ")");
+
+            AttentionComputeStage::Params attn_params;
+            attn_params.device_id = device;
+            attn_params.Q = buffers.Q;
+            attn_params.K = K_for_attn;
+            attn_params.V = V_for_attn;
+            attn_params.output = buffers.attn_output;
+            attn_params.batch_size = batch_size;
+            attn_params.seq_len = seq_len;
+            attn_params.kv_len = kv_len;
+            attn_params.n_heads = local_n_heads;
+            attn_params.n_kv_heads = local_n_kv_heads;
+            attn_params.head_dim = config_.head_dim;
+            attn_params.head_start = config_.head_start;
+            // GQA rep: only when KV heads are replicated (not column-parallel)
+            if (local_n_kv_heads == config_.n_kv_heads && config_.n_kv_heads > 0 && local_n_heads != config_.n_heads)
+                attn_params.gqa_n_rep = config_.n_heads / config_.n_kv_heads;
+            attn_params.causal = true;
+            attn_params.window_size = -1;
+            attn_params.attention_mode = mode;
+            attn_params.auto_detect_mode = true;
+            attn_params.workspace_scores = buffers.workspace_scores;
+            attn_params.workspace_context = buffers.workspace_context;
+            attn_params.workspace_mask = buffers.workspace_mask;
+            attn_params.kv_cache = kv_cache;
+            attn_params.layer_idx = kv_local_layer;
+            attn_params.read_kv_from_cache = device.is_gpu() &&
+                                             (!kv_cache || kv_cache->precision() != ActivationPrecision::Q8_1) &&
+                                             (!kv_cache || (kv_cache->precision() != ActivationPrecision::TQ8 &&
+                                                           kv_cache->precision() != ActivationPrecision::TQ4));
+            attn_params.position_offset = position_ids ? position_ids[0] : 0;
+            attn_params.mpi_ctx = mpi_ctx_.get();
+            attn_params.q_buffer_id = BufferId::Q_PROJ;
+            attn_params.output_buffer_id = BufferId::ATTN_OUTPUT;
+            if (!device.is_gpu())
+            {
+                attn_params.workspace_scores_buffer_id = BufferId::ATTN_SCORES_WORKSPACE;
+                attn_params.workspace_context_buffer_id = BufferId::ATTN_CONTEXT_WORKSPACE;
+            }
+            attn_params.turboquant_ctx = config_.turboquant_ctx;
+            attn_params.kv_rotation = config_.kv_rotation;
+
+            if (config_.rope_on_read)
+            {
+                attn_params.apply_rope_to_k = true;
+                attn_params.rope_theta = config_.rope_theta;
+                attn_params.partial_rotary_factor = config_.partial_rotary_factor;
+            }
+
+            graph.addNode(prefix + "attention",
+                          ComputeStageFactory::createAttentionCompute(attn_params),
+                          device);
+
+            if (use_gather_stage)
+                graph.addDependency(prefix + "attention", prefix + "kv_gather");
+            else if (kv_cache)
+                graph.addDependency(prefix + "attention", prefix + "kv_append");
+            else
+                graph.addDependency(prefix + "attention", rope_dependency);
+        }
+
+        return prefix + "attention";
+    }
+
+    std::string QwenGraphBase::addWoProjectionAndAllreduce(
+        ComputeGraph &graph,
+        const std::string &prefix,
+        ActivationBuffers &buffers,
+        TensorBase *wo_weight,
+        int total_tokens,
+        int layer_idx,
+        DeviceId device,
+        const std::string &dependency,
+        const std::string &wo_node_suffix,
+        const std::string &allreduce_node_suffix)
+    {
+        if (!wo_weight)
+            return dependency;
+
+        int wo_n = static_cast<int>(wo_weight->shape()[0]);
+        int wo_k = static_cast<int>(wo_weight->shape()[1]);
+
+        std::string wo_node = prefix + wo_node_suffix;
+        graph.addNode(wo_node,
+                      ComputeStageFactory::createGEMM({
+                          .device_id = device,
+                          .A = buffers.attn_output,
+                          .B = wo_weight,
+                          .C = buffers.attn_proj,
+                          .m = total_tokens,
+                          .n = wo_n,
+                          .k = wo_k,
+                          .alpha = 1.0f,
+                          .beta = 0.0f,
+                          .transpose_B = false,
+                          .gemm_context = GemmContext::ATTN,
+                          .a_buffer_id = BufferId::ATTN_OUTPUT,
+                          .c_buffer_id = BufferId::ATTN_PROJ,
+                      }),
+                      device);
+        graph.addDependency(wo_node, dependency);
+
+        std::string terminal = wo_node;
+
+        // TP allreduce if row-parallel sharded
+        if (isRowParallelSharded(wo_weight) && needsTPAllreduce())
+        {
+            size_t allreduce_count = static_cast<size_t>(total_tokens) * static_cast<size_t>(config_.d_model);
+            std::string ar_node = prefix + allreduce_node_suffix;
+
+            auto allreduce_stage = createTPAllreduceStage(
+                buffers.attn_proj, allreduce_count, device, layer_idx,
+                /*is_attention=*/true, ar_node, BufferId::ATTN_PROJ);
+
+            if (allreduce_stage)
+            {
+                graph.addNode(ar_node, std::move(allreduce_stage), device);
+                graph.addDependency(ar_node, wo_node);
+                terminal = ar_node;
+            }
+        }
+
+        return terminal;
     }
 
 } // namespace llaminar2

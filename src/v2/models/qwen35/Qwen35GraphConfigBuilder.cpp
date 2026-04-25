@@ -18,7 +18,7 @@ namespace llaminar2
         GraphConfig &config)
     {
         // Base Qwen2 fields (n_layers, d_model, n_heads, etc.)
-        if (!Qwen2GraphConfigBuilder::populateFromModelContext(ctx, config))
+        if (!QwenStandardGraphConfigBuilder::populateFromModelContext(ctx, config))
         {
             return false;
         }

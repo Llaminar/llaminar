@@ -616,7 +616,7 @@ namespace llaminar2
     // =========================================================================
     // Backward-compatible type aliases
     // =========================================================================
-    using Qwen2GraphConfig = GraphConfig;
+    using QwenStandardGraphConfig = GraphConfig;
     using Qwen2LayerWeights = LayerWeights;
     using Qwen2ModelWeights = ModelWeights;
     using Qwen2ActivationBuffers = ActivationBuffers;

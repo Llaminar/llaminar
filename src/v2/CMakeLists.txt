@@ -1279,8 +1279,8 @@ add_library(llaminar2_core STATIC
     # Qwen2 model and graph configuration
     models/ModelRegistrations.cpp
     models/qwen/QwenGraphBase.cpp
-    models/qwen/Qwen2Graph.cpp
-    models/qwen/Qwen2GraphConfigBuilder.cpp
+    models/qwen/QwenStandardGraph.cpp
+    models/qwen/QwenStandardGraphConfigBuilder.cpp
     models/qwen/Qwen2BufferSpec.cpp
     # Qwen3.5 Dense (hybrid GDN + Full Attention)
     models/qwen35/Qwen35Graph.cpp

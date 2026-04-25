@@ -11,7 +11,7 @@
  *
  * Previously, Hybrid mode logic was scattered across 3+ files with repeated checks:
  * ```cpp
- * // Scattered in Qwen2Graph.cpp, DeviceGraphOrchestrator.cpp, etc.
+ * // Scattered in QwenStandardGraph.cpp, DeviceGraphOrchestrator.cpp, etc.
  * bool use_hybrid_rope = (config_.activation_precision == ActivationPrecision::Hybrid) &&
  *                        buffers.Q_rope && buffers.K_rope;
  * if (use_hybrid_rope) { ... }

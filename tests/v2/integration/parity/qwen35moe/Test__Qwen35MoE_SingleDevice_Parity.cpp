@@ -83,57 +83,12 @@ static const std::vector<TestConfig> kQwen35MoESingleDeviceConfigs = {
         .kv_cache_precision = KVCachePrecision::FP16,
     },
     // =========================================================================
-    // Qwen3.5-35B MoE (Q4_K_XL) — CUDA single GPU
+    // GPU configs (CUDA, ROCm) — DISABLED
     //
-    // SKIP: The 35B model needs ~21GB for weights alone. Single RTX 3090 (24GB)
-    // may not have headroom for activations + KV cache. Enable once weight
-    // streaming or a smaller MoE checkpoint is available.
+    // The 35B MoE model needs ~21GB for weights alone + expert GEMM slabs.
+    // Single-GPU parity tests OOM on both 24GB (RTX 3090) and 32GB (MI100).
+    // Re-enable once weight streaming or a smaller MoE checkpoint is available.
     // =========================================================================
-    {
-        .name = "Qwen35MoE_35B_CUDA_KV_FP16",
-        .devices = {ParityDeviceType::CUDA},
-        .parallelism = Parallelism::None,
-        .collective = Collective::None,
-        .thresholds = {
-            .cosine_threshold = 0.80f,
-            .decode_cosine_threshold = 0.70f,
-            .early_layers_count = 6,
-            .min_early_layers_passed = 2,
-            .kl_threshold = 0.50f,
-            .min_top1_accuracy = 0.0f,
-            .min_top5_accuracy = 0.0f,
-            .pytorch_top1_in_topk = 0,
-        },
-        .model_path = "/opt/llaminar-models/Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf",
-        .snapshot_dir = "pytorch_qwen35_moe_snapshots",
-        .activation_precision = ActivationPrecision::FP32,
-        .kv_cache_precision = KVCachePrecision::FP16,
-    },
-    // =========================================================================
-    // Qwen3.5-35B MoE (Q4_K_XL) — ROCm single GPU
-    //
-    // SKIP: Same memory concerns as CUDA. Enable once validated.
-    // =========================================================================
-    {
-        .name = "Qwen35MoE_35B_ROCm_KV_FP16",
-        .devices = {ParityDeviceType::ROCm},
-        .parallelism = Parallelism::None,
-        .collective = Collective::None,
-        .thresholds = {
-            .cosine_threshold = 0.80f,
-            .decode_cosine_threshold = 0.70f,
-            .early_layers_count = 6,
-            .min_early_layers_passed = 2,
-            .kl_threshold = 0.50f,
-            .min_top1_accuracy = 0.0f,
-            .min_top5_accuracy = 0.0f,
-            .pytorch_top1_in_topk = 0,
-        },
-        .model_path = "/opt/llaminar-models/Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf",
-        .snapshot_dir = "pytorch_qwen35_moe_snapshots",
-        .activation_precision = ActivationPrecision::FP32,
-        .kv_cache_precision = KVCachePrecision::FP16,
-    },
 };
 
 // =============================================================================

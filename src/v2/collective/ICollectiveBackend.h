@@ -5,7 +5,7 @@
  * INTERNAL IMPLEMENTATION - Not exposed to model graphs!
  *
  * This is an internal interface used by CollectiveContext to execute
- * collective operations. Model graphs (like Qwen2Graph) do NOT interact
+ * collective operations. Model graphs (like QwenStandardGraph) do NOT interact
  * with this interface directly - they use abstract AllreduceStage/AllGatherStage
  * and the DeviceGraphExecutor handles backend selection via CollectiveContext.
  *

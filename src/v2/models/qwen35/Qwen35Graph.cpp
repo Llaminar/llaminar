@@ -8,7 +8,6 @@
 #include "../../execution/compute_stages/ComputeStages.h"
 #include "../../execution/local_execution/graph/GraphBuildUtils.h"
 #include "../../kernels/HybridKVCacheConfig.h"
-#include "../../kernels/HybridKVCacheConfig.h"
 #include "../../kernels/IHybridKVCache.h"
 #include "../../kernels/KernelFactory.h"
 #include "../../tensors/TensorKernels.h"
@@ -282,41 +281,9 @@ namespace llaminar2
         // =====================================================================
         // Stage 1: Pre-attention RMSNorm
         // =====================================================================
-        if (layer_idx > config_.pp_layer_offset)
-        {
-            FusedResidualNormStage::Params fused_params;
-            fused_params.device_id = device;
-            fused_params.input = buffers.attn_proj;
-            fused_params.residual = buffers.current_hidden;
-            fused_params.gamma = layer.attn_norm;
-            fused_params.norm_output = buffers.normalized;
-            fused_params.eps = config_.rms_norm_eps;
-            fused_params.seq_len = total_tokens;
-            fused_params.hidden_dim = d_model;
-            fused_params.input_buffer_id = BufferId::ATTN_PROJ;
-            fused_params.residual_buffer_id = BufferId::HIDDEN_STATE;
-            fused_params.norm_output_buffer_id = BufferId::NORMALIZED;
-
-            graph.addNode(prefix + "attn_norm",
-                          ComputeStageFactory::createFusedResidualNorm(fused_params),
-                          device);
-        }
-        else
-        {
-            RMSNormStage::Params norm_params;
-            norm_params.input = buffers.current_hidden;
-            norm_params.output = buffers.normalized;
-            norm_params.gamma = layer.attn_norm;
-            norm_params.eps = config_.rms_norm_eps;
-            norm_params.seq_len = total_tokens;
-            norm_params.device_id = device;
-            norm_params.input_buffer_id = BufferId::HIDDEN_STATE;
-            norm_params.output_buffer_id = BufferId::NORMALIZED;
-
-            graph.addNode(prefix + "attn_norm",
-                          ComputeStageFactory::createRMSNorm(norm_params),
-                          device);
-        }
+        // GDN layers don't check HybridQ16 (always use fused when not first layer)
+        addPreAttentionNorm(graph, prefix, buffers, layer.attn_norm,
+                            total_tokens, layer_idx, device, /*check_hybrid_q16=*/false);
 
         // =====================================================================
         // Stage 2: GDN 4-way Projection
@@ -464,59 +431,13 @@ namespace llaminar2
         graph.addDependency(prefix + "gated_norm", prefix + "gdn_recurrence");
 
         // =====================================================================
-        // Stage 6: Output Projection (Wo GEMM)
+        // Stage 6: Output Projection (Wo GEMM) + optional TP AllReduce
         // =====================================================================
-        GEMMStage::Params wo_params;
-        wo_params.device_id = device;
-        wo_params.A = buffers.attn_output;
-        wo_params.B = layer.ssm_out;
-        wo_params.C = buffers.attn_proj;
-        wo_params.m = total_tokens;
-        if (layer.ssm_out)
-        {
-            wo_params.n = static_cast<int>(layer.ssm_out->shape()[0]);
-            wo_params.k = static_cast<int>(layer.ssm_out->shape()[1]);
-        }
-        wo_params.alpha = 1.0f;
-        wo_params.beta = 0.0f;
-        wo_params.transpose_B = false;
-        wo_params.a_buffer_id = BufferId::ATTN_OUTPUT;
-        wo_params.c_buffer_id = BufferId::ATTN_PROJ;
-
-        graph.addNode(prefix + "gdn_out_proj",
-                      ComputeStageFactory::createGEMM(wo_params),
-                      device);
-        graph.addDependency(prefix + "gdn_out_proj", prefix + "gated_norm");
-
-        std::string terminal_node = prefix + "gdn_out_proj";
-
-        // =====================================================================
-        // Stage 6b: TP AllReduce for ssm_out (same pattern as FA Wo AllReduce)
-        // =====================================================================
-        // ssm_out is INPUT_PARALLEL (row-parallel sharded), so each rank computes
-        // a partial sum that must be reduced across ranks.
-        if (layer.ssm_out)
-        {
-            bool wo_is_sharded = graph_utils::isRowParallelSharded(layer.ssm_out);
-            if (wo_is_sharded && needsTPAllreduce())
-            {
-                size_t allreduce_count = static_cast<size_t>(total_tokens) * d_model;
-                TensorBase *allreduce_buffer = buffers.attn_proj;
-                BufferId wo_allreduce_bid = BufferId::ATTN_PROJ;
-                std::string stage_name = prefix + "gdn_wo_allreduce";
-
-                auto allreduce_stage = createTPAllreduceStage(
-                    allreduce_buffer, allreduce_count, device, layer_idx,
-                    /*is_attention=*/true, stage_name, wo_allreduce_bid);
-
-                if (allreduce_stage)
-                {
-                    graph.addNode(stage_name, std::move(allreduce_stage), device);
-                    graph.addDependency(stage_name, prefix + "gdn_out_proj");
-                    terminal_node = stage_name;
-                }
-            }
-        }
+        std::string terminal_node = addWoProjectionAndAllreduce(
+            graph, prefix, buffers, layer.ssm_out,
+            total_tokens, layer_idx, device,
+            prefix + "gated_norm",
+            "gdn_out_proj", "gdn_wo_allreduce");
 
         // NOTE: GDN layers do NOT apply a sigmoid output gate after out_proj.
         // The Z projection is consumed entirely by GatedRMSNorm (SiLU gating).
@@ -525,7 +446,7 @@ namespace llaminar2
         // NOTE: No explicit ResidualAdd here. The FFN's FusedResidualNormStage
         // (from buildFFNGraph) fuses the attention residual add with FFN norm:
         //   HIDDEN_STATE = HIDDEN_STATE + ATTN_PROJ, then RMSNorm(HIDDEN_STATE)
-        // This matches the Qwen2Graph convention for FA layers.
+        // This matches the QwenStandardGraph convention for FA layers.
 
         graph.setTerminalNode(terminal_node);
 
@@ -539,7 +460,7 @@ namespace llaminar2
     // FA (Full Attention) Sub-Graph — Qwen 3.5 specific
     // =========================================================================
     //
-    // Key differences from Qwen2Graph::buildAttentionGraph:
+    // Key differences from QwenStandardGraph::buildAttentionGraph:
     //   1. Q GEMM outputs [seq, n_heads * head_dim * 2] to fa_q_raw buffer
     //   2. QGateSplitStage deinterleaves into Q [seq, n_heads*head_dim] + fa_gate
     //   3. QK norms, partial RoPE (config_.partial_rotary_factor), KV cache, attention — same as Qwen2
@@ -569,41 +490,8 @@ namespace llaminar2
         // =================================================================
         // Stage 1: Pre-attention RMSNorm (same as Qwen2)
         // =================================================================
-        if (!config_.isHybridQ16() && layer_idx > config_.pp_layer_offset)
-        {
-            FusedResidualNormStage::Params fused_params;
-            fused_params.device_id = device;
-            fused_params.input = buffers.attn_proj;
-            fused_params.residual = buffers.current_hidden;
-            fused_params.gamma = layer.attn_norm;
-            fused_params.norm_output = buffers.normalized;
-            fused_params.eps = config_.rms_norm_eps;
-            fused_params.seq_len = total_tokens;
-            fused_params.hidden_dim = config_.d_model;
-            fused_params.input_buffer_id = BufferId::ATTN_PROJ;
-            fused_params.residual_buffer_id = BufferId::HIDDEN_STATE;
-            fused_params.norm_output_buffer_id = BufferId::NORMALIZED;
-
-            graph.addNode(prefix + "attn_norm",
-                          ComputeStageFactory::createFusedResidualNorm(fused_params),
-                          device);
-        }
-        else
-        {
-            RMSNormStage::Params attn_norm_params;
-            attn_norm_params.input = buffers.current_hidden;
-            attn_norm_params.output = buffers.normalized;
-            attn_norm_params.gamma = layer.attn_norm;
-            attn_norm_params.eps = config_.rms_norm_eps;
-            attn_norm_params.seq_len = total_tokens;
-            attn_norm_params.device_id = device;
-            attn_norm_params.input_buffer_id = BufferId::HIDDEN_STATE;
-            attn_norm_params.output_buffer_id = BufferId::NORMALIZED;
-
-            graph.addNode(prefix + "attn_norm",
-                          ComputeStageFactory::createRMSNorm(attn_norm_params),
-                          device);
-        }
+        addPreAttentionNorm(graph, prefix, buffers, layer.attn_norm,
+                            total_tokens, layer_idx, device);
 
         // =================================================================
         // Stage 2: Q/K/V projections — Q outputs to fa_q_raw (2× width)
@@ -633,30 +521,29 @@ namespace llaminar2
                                                 << " k_n=" << k_n << " v_n=" << v_n);
 
             // Q GEMM writes to fa_q_raw (oversized: n_heads * head_dim * 2)
-            FusedQKVGEMMStage::Params qkv_params;
-            qkv_params.input = buffers.normalized;
-            qkv_params.m = total_tokens;
-            qkv_params.k = k;
-            qkv_params.wq = layer.wq;
-            qkv_params.output_q = fa_q_raw; // Write to fa_q_raw, NOT buffers.Q
-            qkv_params.n_q = q_n;
-            qkv_params.bias_q = layer.q_bias;
-            qkv_params.wk = layer.wk;
-            qkv_params.output_k = buffers.K;
-            qkv_params.n_k = k_n;
-            qkv_params.bias_k = layer.k_bias;
-            qkv_params.wv = layer.wv;
-            qkv_params.output_v = buffers.V;
-            qkv_params.n_v = v_n;
-            qkv_params.bias_v = layer.v_bias;
-            qkv_params.device_id = device;
-            qkv_params.input_buffer_id = BufferId::NORMALIZED;
-            qkv_params.output_q_buffer_id = BufferId::FA_Q_RAW;
-            qkv_params.output_k_buffer_id = BufferId::K_PROJ;
-            qkv_params.output_v_buffer_id = BufferId::V_PROJ;
-
             graph.addNode(prefix + "qkv_proj",
-                          ComputeStageFactory::createFusedQKVGEMM(qkv_params),
+                          ComputeStageFactory::createFusedQKVGEMM({
+                              .device_id = device,
+                              .input = buffers.normalized,
+                              .m = total_tokens,
+                              .k = k,
+                              .wq = layer.wq,
+                              .output_q = fa_q_raw,
+                              .n_q = q_n,
+                              .bias_q = layer.q_bias,
+                              .wk = layer.wk,
+                              .output_k = buffers.K,
+                              .n_k = k_n,
+                              .bias_k = layer.k_bias,
+                              .wv = layer.wv,
+                              .output_v = buffers.V,
+                              .n_v = v_n,
+                              .bias_v = layer.v_bias,
+                              .input_buffer_id = BufferId::NORMALIZED,
+                              .output_q_buffer_id = BufferId::FA_Q_RAW,
+                              .output_k_buffer_id = BufferId::K_PROJ,
+                              .output_v_buffer_id = BufferId::V_PROJ,
+                          }),
                           device);
             graph.addDependency(prefix + "qkv_proj", prefix + "attn_norm");
         }
@@ -664,27 +551,21 @@ namespace llaminar2
         // =================================================================
         // Stage 2.5: QGateSplit — deinterleave fa_q_raw → Q + fa_gate
         // =================================================================
+        auto [local_n_heads, local_n_kv_heads] = resolveLocalHeadCounts();
         {
-            int local_n_heads = config_.qkv_column_parallel
-                                    ? config_.local_n_heads
-                                    : config_.n_heads;
-            if (local_n_heads <= 0)
-                local_n_heads = config_.n_heads;
-
-            QGateSplitStage::Params split_params;
-            split_params.device_id = device;
-            split_params.input = fa_q_raw;
-            split_params.output_q = buffers.Q;
-            split_params.output_gate = fa_gate;
-            split_params.seq_len = total_tokens;
-            split_params.n_heads = local_n_heads;
-            split_params.head_dim = config_.head_dim;
-            split_params.input_buffer_id = BufferId::FA_Q_RAW;
-            split_params.output_q_buffer_id = BufferId::Q_PROJ;
-            split_params.output_gate_buffer_id = BufferId::FA_GATE;
-
             graph.addNode(prefix + "q_gate_split",
-                          ComputeStageFactory::createQGateSplit(split_params),
+                          ComputeStageFactory::createQGateSplit({
+                              .device_id = device,
+                              .input = fa_q_raw,
+                              .output_q = buffers.Q,
+                              .output_gate = fa_gate,
+                              .seq_len = total_tokens,
+                              .n_heads = local_n_heads,
+                              .head_dim = config_.head_dim,
+                              .input_buffer_id = BufferId::FA_Q_RAW,
+                              .output_q_buffer_id = BufferId::Q_PROJ,
+                              .output_gate_buffer_id = BufferId::FA_GATE,
+                          }),
                           device);
 
             if (has_qkv_proj)
@@ -692,320 +573,71 @@ namespace llaminar2
         }
 
         // =================================================================
-        // Resolve local head counts for TP
+        // Stage 2.75: Per-head QK RMSNorm
         // =================================================================
-        int local_n_heads = config_.qkv_column_parallel
-                                ? config_.local_n_heads
-                                : config_.n_heads;
-        int local_n_kv_heads = config_.qkv_column_parallel
-                                   ? config_.local_n_kv_heads
-                                   : config_.n_kv_heads;
-        if (local_n_heads <= 0)
-            local_n_heads = config_.n_heads;
-        if (local_n_kv_heads <= 0)
-            local_n_kv_heads = config_.n_kv_heads;
+        bool has_qk_norms = addQKNorms(
+            graph, prefix, buffers, layer,
+            local_n_heads, local_n_kv_heads, total_tokens, device,
+            prefix + "q_gate_split",
+            has_qkv_proj ? prefix + "qkv_proj" : prefix + "attn_norm");
 
         // =================================================================
-        // Stage 2.75: Per-head QK RMSNorm (Qwen3.5 FA layers have QK norm)
+        // Stage 3: RoPE on Q and K
         // =================================================================
-        if (layer.q_norm && layer.k_norm)
+        std::string rope_node = addRoPE(
+            graph, prefix, buffers,
+            local_n_heads, local_n_kv_heads, total_tokens,
+            position_ids, device);
+
+        if (has_qk_norms)
         {
-            QKNormStage::Params q_norm_params;
-            q_norm_params.input = buffers.Q;
-            q_norm_params.output = buffers.Q;
-            q_norm_params.gamma = layer.q_norm;
-            q_norm_params.n_heads = local_n_heads;
-            q_norm_params.head_dim = config_.head_dim;
-            q_norm_params.eps = config_.rms_norm_eps;
-            q_norm_params.seq_len = total_tokens;
-            q_norm_params.device_id = device;
-            q_norm_params.input_buffer_id = BufferId::Q_PROJ;
-            q_norm_params.output_buffer_id = BufferId::Q_PROJ;
-
-            graph.addNode(prefix + "q_norm",
-                          ComputeStageFactory::createQKNorm(q_norm_params),
-                          device);
-            graph.addDependency(prefix + "q_norm", prefix + "q_gate_split");
-
-            QKNormStage::Params k_norm_params;
-            k_norm_params.input = buffers.K;
-            k_norm_params.output = buffers.K;
-            k_norm_params.gamma = layer.k_norm;
-            k_norm_params.n_heads = local_n_kv_heads;
-            k_norm_params.head_dim = config_.head_dim;
-            k_norm_params.eps = config_.rms_norm_eps;
-            k_norm_params.seq_len = total_tokens;
-            k_norm_params.device_id = device;
-            k_norm_params.input_buffer_id = BufferId::K_PROJ;
-            k_norm_params.output_buffer_id = BufferId::K_PROJ;
-
-            graph.addNode(prefix + "k_norm",
-                          ComputeStageFactory::createQKNorm(k_norm_params),
-                          device);
+            graph.addDependency(rope_node, prefix + "q_norm");
+            graph.addDependency(rope_node, prefix + "k_norm");
+        }
+        else
+        {
+            graph.addDependency(rope_node, prefix + "q_gate_split");
             if (has_qkv_proj)
-                graph.addDependency(prefix + "k_norm", prefix + "qkv_proj");
+                graph.addDependency(rope_node, prefix + "qkv_proj");
         }
 
         // =================================================================
-        // Stage 3: RoPE on Q and K (with partial_rotary_factor from config)
+        // Stage 4: KV cache + attention compute
+        // =================================================================
+        std::string attn_node = addKVCacheAndAttention(
+            graph, prefix, buffers, layer_idx,
+            seq_len, batch_size, local_n_heads, local_n_kv_heads,
+            kv_cache, position_ids, device, has_qkv_proj, rope_node);
+
+        // =================================================================
+        // Stage 4.5: Sigmoid output gate — attn_output *= sigmoid(fa_gate)
         // =================================================================
         {
-            int pos_offset = position_ids ? position_ids[0] : 0;
-
-            RoPEStage::Params rope_params;
-            rope_params.device_id = device;
-            rope_params.Q = buffers.Q;
-            rope_params.K = buffers.K;
-            rope_params.n_heads = local_n_heads;
-            rope_params.n_kv_heads = local_n_kv_heads;
-            rope_params.head_dim = config_.head_dim;
-            rope_params.pos_offset = pos_offset;
-            rope_params.position_ids = position_ids;
-            rope_params.theta_base = config_.rope_theta;
-            rope_params.seq_len = total_tokens;
-            rope_params.q_buffer_id = BufferId::Q_PROJ;
-            rope_params.k_buffer_id = BufferId::K_PROJ;
-            rope_params.partial_rotary_factor = config_.partial_rotary_factor;
-            rope_params.skip_k = config_.rope_on_read;
-
-            graph.addNode(prefix + "rope",
-                          ComputeStageFactory::createRoPE(rope_params),
+            graph.addNode(prefix + "attn_output_gate",
+                          ComputeStageFactory::createAttentionOutputGate({
+                              .device_id = device,
+                              .input = buffers.attn_output,
+                              .gate = fa_gate,
+                              .output = buffers.attn_output,
+                              .seq_len = total_tokens,
+                              .input_buffer_id = BufferId::ATTN_OUTPUT,
+                              .gate_buffer_id = BufferId::FA_GATE,
+                              .output_buffer_id = BufferId::ATTN_OUTPUT,
+                          }),
                           device);
-
-            if (layer.q_norm && layer.k_norm)
-            {
-                graph.addDependency(prefix + "rope", prefix + "q_norm");
-                graph.addDependency(prefix + "rope", prefix + "k_norm");
-            }
-            else
-            {
-                graph.addDependency(prefix + "rope", prefix + "q_gate_split");
-                if (has_qkv_proj)
-                    graph.addDependency(prefix + "rope", prefix + "qkv_proj");
-            }
+            graph.addDependency(prefix + "attn_output_gate", attn_node);
+            graph.addDependency(prefix + "attn_output_gate", prefix + "q_gate_split");
         }
 
         // =================================================================
-        // Stage 4: KV cache append + attention compute (same as Qwen2)
+        // Stage 5: Wo projection + optional TP allreduce
         // =================================================================
-        std::string wo_producer_node;
+        std::string terminal = addWoProjectionAndAllreduce(
+            graph, prefix, buffers, layer.wo,
+            total_tokens, layer_idx, device,
+            prefix + "attn_output_gate");
 
-        {
-            int kv_local_layer = layer_idx - config_.pp_layer_offset;
-
-            if (kv_cache)
-            {
-                KVCacheAppendStage::Params kv_append_params;
-                kv_append_params.device_id = device;
-                kv_append_params.K = buffers.K;
-                kv_append_params.k_buffer_id = BufferId::K_PROJ;
-                kv_append_params.V = buffers.V;
-                kv_append_params.v_buffer_id = BufferId::V_PROJ;
-                kv_append_params.kv_cache = kv_cache;
-                kv_append_params.layer_idx = kv_local_layer;
-                kv_append_params.seq_idx = 0;
-                kv_append_params.num_tokens = total_tokens;
-                kv_append_params.batch_size = batch_size;
-                kv_append_params.seq_len = seq_len;
-                kv_append_params.kv_cache_scale_k = config_.kv_cache_scale_k;
-                kv_append_params.kv_cache_scale_v = config_.kv_cache_scale_v;
-                kv_append_params.head_dim = config_.head_dim;
-                kv_append_params.turboquant_ctx = config_.turboquant_ctx;
-                kv_append_params.kv_rotation = config_.kv_rotation;
-
-                graph.addNode(prefix + "kv_append",
-                              ComputeStageFactory::createKVCacheAppend(kv_append_params),
-                              device);
-
-                if (!config_.rope_on_read)
-                    graph.addDependency(prefix + "kv_append", prefix + "rope");
-                else if (has_qkv_proj)
-                    graph.addDependency(prefix + "kv_append", prefix + "qkv_proj");
-            }
-
-            // Determine K/V source for attention
-            ITensor *K_for_attn = buffers.K;
-            ITensor *V_for_attn = buffers.V;
-            int kv_len = total_tokens;
-            bool use_gather_stage = false;
-
-            if (kv_cache)
-            {
-                int cached_tokens = kv_cache->get_cached_tokens(kv_local_layer, 0);
-                if (cached_tokens > 0 && batch_size == 1)
-                {
-                    K_for_attn = kv_cache->get_k(kv_local_layer, 0);
-                    V_for_attn = kv_cache->get_v(kv_local_layer, 0);
-                    kv_len = cached_tokens;
-                }
-                else if (cached_tokens > 0 && batch_size > 1)
-                {
-                    if (buffers.gathered_K && buffers.gathered_V)
-                    {
-                        use_gather_stage = true;
-                        K_for_attn = buffers.gathered_K;
-                        V_for_attn = buffers.gathered_V;
-                        kv_len = cached_tokens;
-                    }
-                }
-            }
-
-            if (use_gather_stage)
-            {
-                KVCacheGatherStage::Params gather_params;
-                gather_params.kv_cache = kv_cache;
-                gather_params.layer_idx = kv_local_layer;
-                gather_params.batch_size = batch_size;
-                gather_params.out_K = buffers.gathered_K;
-                gather_params.out_V = buffers.gathered_V;
-
-                graph.addNode(prefix + "kv_gather",
-                              ComputeStageFactory::createKVCacheGather(gather_params),
-                              device);
-                graph.addDependency(prefix + "kv_gather", prefix + "kv_append");
-            }
-
-            // Attention compute
-            {
-                AttentionMode mode = detect_attention_mode(batch_size, seq_len, kv_len);
-
-                AttentionComputeStage::Params attn_params;
-                attn_params.Q = buffers.Q;
-                attn_params.K = K_for_attn;
-                attn_params.V = V_for_attn;
-                attn_params.output = buffers.attn_output;
-                attn_params.batch_size = batch_size;
-                attn_params.seq_len = seq_len;
-                attn_params.kv_len = kv_len;
-                attn_params.n_heads = local_n_heads;
-                attn_params.n_kv_heads = local_n_kv_heads;
-                attn_params.head_dim = config_.head_dim;
-                attn_params.causal = true;
-                attn_params.window_size = -1;
-                attn_params.attention_mode = mode;
-                attn_params.auto_detect_mode = true;
-                attn_params.workspace_scores = buffers.workspace_scores;
-                attn_params.workspace_context = buffers.workspace_context;
-                attn_params.workspace_mask = buffers.workspace_mask;
-                attn_params.kv_cache = kv_cache;
-                attn_params.layer_idx = kv_local_layer;
-                attn_params.read_kv_from_cache = device.is_gpu() &&
-                                                 (!kv_cache || kv_cache->precision() != ActivationPrecision::Q8_1) &&
-                                                 (!kv_cache || (kv_cache->precision() != ActivationPrecision::TQ8 &&
-                                                                kv_cache->precision() != ActivationPrecision::TQ4));
-                attn_params.position_offset = position_ids ? position_ids[0] : 0;
-                attn_params.mpi_ctx = mpi_ctx_.get();
-                attn_params.device_id = device;
-                attn_params.q_buffer_id = BufferId::Q_PROJ;
-                attn_params.output_buffer_id = BufferId::ATTN_OUTPUT;
-                // GPU flash attention doesn't use score/context workspace buffers —
-                // only register them for CPU attention to avoid wasting 544 MB VRAM.
-                if (!device.is_gpu())
-                {
-                    attn_params.workspace_scores_buffer_id = BufferId::ATTN_SCORES_WORKSPACE;
-                    attn_params.workspace_context_buffer_id = BufferId::ATTN_CONTEXT_WORKSPACE;
-                }
-                attn_params.turboquant_ctx = config_.turboquant_ctx;
-                attn_params.kv_rotation = config_.kv_rotation;
-
-                if (config_.rope_on_read)
-                {
-                    attn_params.apply_rope_to_k = true;
-                    attn_params.rope_theta = config_.rope_theta;
-                    attn_params.partial_rotary_factor = config_.partial_rotary_factor;
-                }
-
-                graph.addNode(prefix + "attention",
-                              ComputeStageFactory::createAttentionCompute(attn_params),
-                              device);
-
-                if (use_gather_stage)
-                    graph.addDependency(prefix + "attention", prefix + "kv_gather");
-                else if (kv_cache)
-                    graph.addDependency(prefix + "attention", prefix + "kv_append");
-                else
-                    graph.addDependency(prefix + "attention", prefix + "rope");
-            }
-
-            // =================================================================
-            // Stage 4.5: Sigmoid output gate — attn_output *= sigmoid(fa_gate)
-            // =================================================================
-            // In PyTorch: attn_output = attn_output * torch.sigmoid(gate)
-            // Applied BEFORE Wo projection.
-            {
-                AttentionOutputGateStage::Params gate_params;
-                gate_params.device_id = device;
-                gate_params.input = buffers.attn_output;
-                gate_params.gate = fa_gate;
-                gate_params.output = buffers.attn_output; // In-place
-                gate_params.seq_len = total_tokens;
-                gate_params.input_buffer_id = BufferId::ATTN_OUTPUT;
-                gate_params.gate_buffer_id = BufferId::FA_GATE;
-                gate_params.output_buffer_id = BufferId::ATTN_OUTPUT;
-
-                graph.addNode(prefix + "attn_output_gate",
-                              ComputeStageFactory::createAttentionOutputGate(gate_params),
-                              device);
-                graph.addDependency(prefix + "attn_output_gate", prefix + "attention");
-                // Gate data was produced by q_gate_split (computed much earlier)
-                graph.addDependency(prefix + "attn_output_gate", prefix + "q_gate_split");
-            }
-
-            // =================================================================
-            // Stage 5: Wo projection
-            // =================================================================
-            if (layer.wo)
-            {
-                int wo_n = static_cast<int>(layer.wo->shape()[0]);
-                int wo_k = static_cast<int>(layer.wo->shape()[1]);
-
-                wo_producer_node = prefix + "wo_proj";
-                graph.addNode(wo_producer_node,
-                              ComputeStageFactory::createGEMM(
-                                  GEMMStage::Params{
-                                      .device_id = device,
-                                      .A = buffers.attn_output,
-                                      .B = layer.wo,
-                                      .C = buffers.attn_proj,
-                                      .m = total_tokens,
-                                      .n = wo_n,
-                                      .k = wo_k,
-                                      .alpha = 1.0f,
-                                      .beta = 0.0f,
-                                      .transpose_B = false,
-                                      .gemm_context = GemmContext::ATTN,
-                                      .a_buffer_id = BufferId::ATTN_OUTPUT,
-                                      .c_buffer_id = BufferId::ATTN_PROJ}),
-                              device);
-                graph.addDependency(wo_producer_node, prefix + "attn_output_gate");
-            }
-
-            // TP AllReduce for Wo (same as Qwen2)
-            if (layer.wo && !wo_producer_node.empty())
-            {
-                bool wo_is_sharded = graph_utils::isRowParallelSharded(layer.wo);
-                if (wo_is_sharded && needsTPAllreduce())
-                {
-                    size_t allreduce_count = static_cast<size_t>(total_tokens) * config_.d_model;
-                    TensorBase *allreduce_buffer = buffers.attn_proj;
-                    BufferId wo_allreduce_bid = BufferId::ATTN_PROJ;
-                    std::string stage_name = prefix + "wo_allreduce";
-
-                    auto allreduce_stage = createTPAllreduceStage(
-                        allreduce_buffer, allreduce_count, device, layer_idx,
-                        /*is_attention=*/true, stage_name, wo_allreduce_bid);
-
-                    if (allreduce_stage)
-                    {
-                        graph.addNode(stage_name, std::move(allreduce_stage), device);
-                        graph.addDependency(stage_name, wo_producer_node);
-                        wo_producer_node = stage_name;
-                    }
-                }
-            }
-        }
-
-        graph.setTerminalNode(wo_producer_node);
+        graph.setTerminalNode(terminal);
 
         LOG_DEBUG("[Qwen35Graph] FA attention graph for layer " << layer_idx
                                                                 << " has " << graph.size() << " nodes");

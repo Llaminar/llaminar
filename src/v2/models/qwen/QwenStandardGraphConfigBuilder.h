@@ -1,8 +1,8 @@
 /**
- * @file Qwen2GraphConfigBuilder.h
+ * @file QwenStandardGraphConfigBuilder.h
  * @brief Qwen2-specific graph configuration builder
  *
- * Translates RankExecutionPlan into Qwen2GraphConfig for graph building.
+ * Translates RankExecutionPlan into QwenStandardGraphConfig for graph building.
  * Handles all Qwen2-specific configuration including:
  * - Head distribution for TP
  * - FFN dimension sharding
@@ -24,23 +24,23 @@ namespace llaminar2
 
     // Forward declaration to avoid include chain that triggers
     // duplicate CollectiveBackendType definition.
-    // Full definition included in Qwen2GraphConfigBuilder.cpp.
+    // Full definition included in QwenStandardGraphConfigBuilder.cpp.
     struct GraphConfig;
 
     /**
      * @brief Qwen2-specific implementation of IGraphConfigBuilder
      *
-     * Creates Qwen2GraphConfig from RankExecutionPlan, properly configuring:
+     * Creates QwenStandardGraphConfig from RankExecutionPlan, properly configuring:
      * - Tensor parallelism (head sharding, FFN sharding)
      * - Pipeline parallelism (layer ranges)
      * - Device placement
      * - Precision settings
      */
-    class Qwen2GraphConfigBuilder : public IGraphConfigBuilder
+    class QwenStandardGraphConfigBuilder : public IGraphConfigBuilder
     {
     public:
-        Qwen2GraphConfigBuilder() = default;
-        ~Qwen2GraphConfigBuilder() override = default;
+        QwenStandardGraphConfigBuilder() = default;
+        ~QwenStandardGraphConfigBuilder() override = default;
 
         /**
          * @brief Build generic graph configuration

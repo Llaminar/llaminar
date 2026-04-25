@@ -547,7 +547,7 @@ namespace llaminar2
         LOG_DEBUG("[InferenceRunner] Fused attention backend: " << fusedAttentionBackendToString(effective_backend));
 
         // Propagate kv_cache_precision for Q16_1 / TQ KV cache selection.
-        // kv_cache_scale_k/v are set by the model config builder (e.g. Qwen2GraphConfigBuilder)
+        // kv_cache_scale_k/v are set by the model config builder (e.g. QwenStandardGraphConfigBuilder)
         // which is the sole authority on K/V scale values for each model architecture.
         graph_config.kv_cache_precision = config.kv_cache_precision;
         LOG_DEBUG("[InferenceRunner] KV cache scale: K=" << graph_config.kv_cache_scale_k

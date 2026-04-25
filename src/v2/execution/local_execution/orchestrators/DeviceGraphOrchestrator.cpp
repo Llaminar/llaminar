@@ -259,7 +259,7 @@ namespace llaminar2
     }
 
     // =========================================================================
-    // Graph Buffer Management (Phase 3 - moved from Qwen2Graph)
+    // Graph Buffer Management (Phase 3 - moved from QwenStandardGraph)
     // =========================================================================
 
     bool DeviceGraphOrchestrator::initializeBuffers(int seq_len)

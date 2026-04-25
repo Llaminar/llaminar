@@ -8,6 +8,7 @@
 # Default test suites:
 #   Suite 1: Qwen2.5 1.5B Q8_0 on cpu, cuda:0, rocm:0
 #   Suite 2: Qwen3.5 4B   Q8_0 on cpu
+#   Suite 3: Qwen3.5 35B MoE Q4_K_XL on cpu
 #
 # Each backend test:
 #   1. Starts llaminar2 serve on a unique port
@@ -74,6 +75,15 @@ if [ ${#SUITES[@]} -eq 0 ]; then
     S2_MODEL="${REPO_ROOT}/models/Qwen3.5-4B-Q8_0.gguf"
     if [ -f "$S2_MODEL" ] && [ -z "$OVERRIDE_MODEL" ]; then
         SUITES+=("${S2_MODEL}|cpu|200|xfail_inference")
+    fi
+
+    # Suite 3: Qwen3.5 35B MoE (MoE + GDN/FA architecture — CPU only)
+    # Uses max_tokens=200 for thinking model tags.
+    # xfail_inference=1: MoE inference is WIP — output may be degenerate.
+    # Server/health/error tests still validate normally.
+    S3_MODEL="${REPO_ROOT}/models/Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf"
+    if [ -f "$S3_MODEL" ] && [ -z "$OVERRIDE_MODEL" ]; then
+        SUITES+=("${S3_MODEL}|cpu|200|xfail_inference")
     fi
 fi
 

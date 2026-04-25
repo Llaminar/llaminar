@@ -17,7 +17,7 @@
 #include "loaders/WeightManager.h"
 #include "loaders/WeightPlacementMap.h"
 #include "loaders/ModelLoader.h"
-#include "models/qwen/Qwen2Graph.h"
+#include "models/qwen/QwenStandardGraph.h"
 #include "tensors/TensorFactory.h"
 #include "tensors/Tensors.h"
 #include "utils/DebugEnv.h"
@@ -51,7 +51,7 @@ protected:
         config_.default_device = DeviceId::cpu();
 
         // Create orchestrator
-        orchestrator_ = std::make_unique<DeviceGraphOrchestrator>(std::make_shared<Qwen2Graph>(config_, nullptr), nullptr);
+        orchestrator_ = std::make_unique<DeviceGraphOrchestrator>(std::make_shared<QwenStandardGraph>(config_, nullptr), nullptr);
     }
 
     GraphConfig config_;
@@ -160,7 +160,7 @@ protected:
         config_.rope_theta = 1000000.0f;
         config_.default_device = DeviceId::cpu();
 
-        orchestrator_ = std::make_unique<DeviceGraphOrchestrator>(std::make_shared<Qwen2Graph>(config_, nullptr), nullptr);
+        orchestrator_ = std::make_unique<DeviceGraphOrchestrator>(std::make_shared<QwenStandardGraph>(config_, nullptr), nullptr);
     }
 
     /**
@@ -313,7 +313,7 @@ protected:
         config_.rope_theta = 1000000.0f;
         config_.default_device = DeviceId::cpu();
 
-        orchestrator_ = std::make_unique<DeviceGraphOrchestrator>(std::make_shared<Qwen2Graph>(config_, nullptr), nullptr);
+        orchestrator_ = std::make_unique<DeviceGraphOrchestrator>(std::make_shared<QwenStandardGraph>(config_, nullptr), nullptr);
 
         // Save original env value
         const char *orig = std::getenv("LLAMINAR_CPU_PREFILL_PARTICIPATE");

@@ -324,8 +324,8 @@ function(discover_v2_parity_tests TARGET)
             -D "TEST_PREFIX=${ARG_TEST_PREFIX}"
             -D "LABELS=${ARG_LABELS}"
             -D "MPI_PROCS=${ARG_MPI_PROCS}"
-            -D "NUM_SOCKETS=${NUM_SOCKETS}"
-            -D "CORES_PER_SOCKET=${CORES_PER_SOCKET}"
+            -D "NUM_SOCKETS=${V2_TEST_SOCKETS}"
+            -D "CORES_PER_SOCKET=${V2_TEST_CORES_PER_SOCKET}"
             -D "WORKING_DIR=${_working_dir}"
             -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/V2ParityTestDiscovery.cmake"
         BYPRODUCTS "${_ctest_file}"
@@ -648,7 +648,7 @@ target_link_libraries(v2_integration_unified_pp_execution
 )
 add_v2_test(V2_Integration_UnifiedPP_Execution 
     COMMAND $<TARGET_FILE:v2_integration_unified_pp_execution>
-    LABELS "V2;Integration;PipelineParallelism;UnifiedPPGraph;Execution;Qwen2Graph"
+    LABELS "V2;Integration;PipelineParallelism;UnifiedPPGraph;Execution;QwenStandardGraph"
     MPI_PROCS 1
 )
 
@@ -2437,8 +2437,6 @@ add_v2_test(V2_Unit_SwiGLUParity
 )
 
 # Test: Batch attention correctness - mask generation and batched processing
-
-# Test: Attention mask application - REMOVED (used deleted CPUAttentionKernelT compute/compute_batch)
 
 # Test: Sequential vs Batched Attention Comparison
 add_executable(v2_test_attention_sequential_vs_batched unit/kernels/cpu/attention/Test__AttentionSequentialVsBatched.cpp)
@@ -4795,7 +4793,7 @@ add_v2_test(V2_Unit_DomainAwareBufferManager
 
 # Test: ComputeGraphMerge (graph merging, root/leaf detection)
 # Tests merge(), getRootNodes(), getLeafNodes() for combining subgraphs
-# Part of Phase 3: Declarative Qwen2Graph refactoring
+# Part of Phase 3: Declarative QwenStandardGraph refactoring
 add_executable(v2_test_compute_graph_merge unit/execution/local_execution/graph/Test__ComputeGraphMerge.cpp)
 target_link_libraries(v2_test_compute_graph_merge llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Unit_ComputeGraphMerge
@@ -4805,7 +4803,7 @@ add_v2_test(V2_Unit_ComputeGraphMerge
 )
 
 # Test: IGraphBuilder interface and MockGraphBuilder
-# Part of Phase 5: Declarative Qwen2Graph refactoring - Interface extraction
+# Part of Phase 5: Declarative QwenStandardGraph refactoring - Interface extraction
 add_executable(v2_test_igraph_builder unit/execution/local_execution/graph/Test__IGraphBuilder.cpp)
 target_link_libraries(v2_test_igraph_builder llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Unit_IGraphBuilder
@@ -5098,13 +5096,13 @@ add_v2_test(V2_Unit_LayerDevicePlacement
     MPI_PROCS 1
 )
 
-# Test: Qwen2GraphConfigBuilder (builds Qwen2GraphConfig from RankExecutionPlan)
+# Test: QwenStandardGraphConfigBuilder (builds QwenStandardGraphConfig from RankExecutionPlan)
 # Tests config building for single device, PP layer ranges, LOCAL TP head distribution,
 # proportional weights, and combined PP+TP scenarios.
 # Part of Phase 2: Multi-Device Graph Building
-add_executable(v2_test_qwen2_graph_config_builder unit/models/qwen/Test__Qwen2GraphConfigBuilder.cpp)
+add_executable(v2_test_qwen2_graph_config_builder unit/models/qwen/Test__QwenStandardGraphConfigBuilder.cpp)
 target_link_libraries(v2_test_qwen2_graph_config_builder llaminar2_core GTest::gtest GTest::gtest_main)
-add_v2_test(V2_Unit_Qwen2GraphConfigBuilder
+add_v2_test(V2_Unit_QwenStandardGraphConfigBuilder
     COMMAND $<TARGET_FILE:v2_test_qwen2_graph_config_builder>
     LABELS "V2;Unit;Models;Qwen2;GraphConfig;Orchestration;Heterogeneous;TP;PP"
     MPI_PROCS 1
@@ -5469,7 +5467,7 @@ add_v2_test(V2_Unit_TransferEngine
     MPI_PROCS 1
 )
 
-# Test: Qwen2GraphBufferManagement (BufferArena integration with DeviceGraphOrchestrator)
+# Test: QwenStandardGraphBufferManagement (BufferArena integration with DeviceGraphOrchestrator)
 # Tests setTensorFactory/initializeBuffers workflow, buffer allocation/binding,
 # statistics tracking, and release cleanup.
 # Part of Phase 3: Buffer Management moved to DeviceGraphOrchestrator
@@ -5551,7 +5549,7 @@ add_v2_test(V2_Unit_DeviceGraphOrchestratorPPTPInit
 
 # Test: DeviceGraphOrchestrator Dependencies struct construction
 # Validates the Phase 5 preferred constructor path using MockGraphBuilder
-# (polymorphic IGraphBuilder, not Qwen2Graph) and all Dependencies fields.
+# (polymorphic IGraphBuilder, not QwenStandardGraph) and all Dependencies fields.
 add_executable(v2_test_device_graph_orchestrator_deps_construction unit/execution/local_execution/orchestrators/Test__DeviceGraphOrchestratorDepsConstruction.cpp)
 target_link_libraries(v2_test_device_graph_orchestrator_deps_construction llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Unit_DeviceGraphOrchestratorDepsConstruction
@@ -5614,13 +5612,13 @@ add_v2_test(V2_Unit_Commands
     MPI_PROCS 1
 )
 
-# Test: Qwen2GraphSchema (schema-based Qwen2Graph building - Phase 4d)
+# Test: QwenStandardGraphSchema (schema-based QwenStandardGraph building - Phase 4d)
 # Tests the new buildForwardGraphFromSchema() method that uses
 # Qwen2Schema + GraphResolver + GraphBuilder architecture.
 # Validates that schema-based graphs match legacy imperative graphs.
-add_executable(v2_test_qwen2_graph_schema unit/models/qwen/Test__Qwen2GraphSchema.cpp)
+add_executable(v2_test_qwen2_graph_schema unit/models/qwen/Test__QwenStandardGraphSchema.cpp)
 target_link_libraries(v2_test_qwen2_graph_schema llaminar2_core GTest::gtest GTest::gtest_main)
-add_v2_test(V2_Unit_Qwen2GraphSchema
+add_v2_test(V2_Unit_QwenStandardGraphSchema
     COMMAND $<TARGET_FILE:v2_test_qwen2_graph_schema>
     LABELS "V2;Unit;Qwen2;GraphSchema;DeclarativeDesign;Phase4d"
     MPI_PROCS 1
@@ -5649,7 +5647,6 @@ add_v2_test(V2_Unit_ExecutionConfigAutoEnable
 
 # Test: CPUKernelDeviceIndex (regression test for device_idx validation bug)
 # Tests that CPU kernels accept any device_idx value (not just -1) for NUMA support.
-# Covers the bug where CPUAttentionKernelT rejected device_idx=0 or 1.
 add_executable(v2_test_cpu_kernel_device_index unit/kernels/cpu/Test__CPUKernelDeviceIndex.cpp)
 target_link_libraries(v2_test_cpu_kernel_device_index llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Unit_CPUKernelDeviceIndex
@@ -6363,59 +6360,59 @@ add_v2_test(V2_Integration_ModelContext_PPStage
     LABELS "V2;Integration;Loaders;PipelineParallelism;ModelContext;LayerPartitioning"
 )
 
-# Test: Qwen2Graph with TensorParallelConfig (Phase 1c: Proportional TP)
-add_executable(v2_test_qwen2graph_proportional_tp integration/models/qwen/Test__Qwen2GraphProportionalTP.cpp)
-target_link_libraries(v2_test_qwen2graph_proportional_tp 
+# Test: QwenStandardGraph with TensorParallelConfig (Phase 1c: Proportional TP)
+add_executable(v2_test_qwen_standard_graph_proportional_tp integration/models/qwen/Test__QwenStandardGraphProportionalTP.cpp)
+target_link_libraries(v2_test_qwen_standard_graph_proportional_tp 
     llaminar2_core 
     GTest::gtest
     GTest::gtest_main
 )
-add_v2_test(V2_Integration_Qwen2GraphProportionalTP 
-    COMMAND $<TARGET_FILE:v2_test_qwen2graph_proportional_tp>
+add_v2_test(V2_Integration_QwenStandardGraphProportionalTP 
+    COMMAND $<TARGET_FILE:v2_test_qwen_standard_graph_proportional_tp>
     MPI_PROCS 1
-    LABELS "V2;Integration;Qwen2Graph;TensorParallel;Proportional;Heterogeneous;Phase1c"
+    LABELS "V2;Integration;QwenStandardGraph;TensorParallel;Proportional;Heterogeneous;Phase1c"
 )
 
-# Test: Qwen2Graph with MultiDomainTPConfig (Phase 4.3: Heterogeneous TP Domains)
-# Tests that Qwen2Graph correctly passes TPDomain to AllreduceStage for
+# Test: QwenStandardGraph with MultiDomainTPConfig (Phase 4.3: Heterogeneous TP Domains)
+# Tests that QwenStandardGraph correctly passes TPDomain to AllreduceStage for
 # domain-based collective routing in heterogeneous tensor parallelism scenarios.
-add_executable(v2_test_qwen2graph_domain unit/models/qwen/Test__Qwen2GraphDomain.cpp)
-target_link_libraries(v2_test_qwen2graph_domain 
+add_executable(v2_test_qwen_standard_graph_domain unit/models/qwen/Test__QwenStandardGraphDomain.cpp)
+target_link_libraries(v2_test_qwen_standard_graph_domain 
     llaminar2_core 
     GTest::gtest
     GTest::gtest_main
 )
-add_v2_test(V2_Unit_Qwen2GraphDomain 
-    COMMAND $<TARGET_FILE:v2_test_qwen2graph_domain>
+add_v2_test(V2_Unit_QwenStandardGraphDomain 
+    COMMAND $<TARGET_FILE:v2_test_qwen_standard_graph_domain>
     MPI_PROCS 1
-    LABELS "V2;Unit;Qwen2Graph;TensorParallel;TPDomain;MultiDomain;Heterogeneous;Phase4_3"
+    LABELS "V2;Unit;QwenStandardGraph;TensorParallel;TPDomain;MultiDomain;Heterogeneous;Phase4_3"
 )
 
-# Test: Qwen2Graph buildUnifiedPipelineGraph (Pipeline Parallelism graph building)
+# Test: QwenStandardGraph buildUnifiedPipelineGraph (Pipeline Parallelism graph building)
 # Tests the unified PP graph builder that creates compute graphs for PP + TP composition.
-add_executable(v2_test_qwen2graph_pp unit/models/qwen/Test__Qwen2Graph_PP.cpp)
-target_link_libraries(v2_test_qwen2graph_pp 
+add_executable(v2_test_qwen_standard_graph_pp unit/models/qwen/Test__QwenStandardGraph_PP.cpp)
+target_link_libraries(v2_test_qwen_standard_graph_pp 
     llaminar2_core 
     GTest::gtest
     GTest::gtest_main
 )
-add_v2_test(V2_Unit_Qwen2Graph_PP 
-    COMMAND $<TARGET_FILE:v2_test_qwen2graph_pp>
+add_v2_test(V2_Unit_QwenStandardGraph_PP 
+    COMMAND $<TARGET_FILE:v2_test_qwen_standard_graph_pp>
     MPI_PROCS 1
-    LABELS "V2;Unit;Models;Qwen2;Qwen2Graph;PipelineParallelism;UnifiedPPGraph"
+    LABELS "V2;Unit;Models;Qwen2;QwenStandardGraph;PipelineParallelism;UnifiedPPGraph"
 )
 
 # Test: PP absolute layer range validation (regression test for LocalPP crash)
-add_executable(v2_test_qwen2graph_pp_layer_range unit/models/qwen/Test__Qwen2Graph_PPLayerRange.cpp)
-target_link_libraries(v2_test_qwen2graph_pp_layer_range 
+add_executable(v2_test_qwen_standard_graph_pp_layer_range unit/models/qwen/Test__QwenStandardGraph_PPLayerRange.cpp)
+target_link_libraries(v2_test_qwen_standard_graph_pp_layer_range 
     llaminar2_core 
     GTest::gtest
     GTest::gtest_main
 )
-add_v2_test(V2_Unit_Qwen2Graph_PPLayerRange 
-    COMMAND $<TARGET_FILE:v2_test_qwen2graph_pp_layer_range>
+add_v2_test(V2_Unit_QwenStandardGraph_PPLayerRange 
+    COMMAND $<TARGET_FILE:v2_test_qwen_standard_graph_pp_layer_range>
     MPI_PROCS 1
-    LABELS "V2;Unit;Models;Qwen2;Qwen2Graph;PipelineParallelism;Regression"
+    LABELS "V2;Unit;Models;Qwen2;QwenStandardGraph;PipelineParallelism;Regression"
 )
 
 # Test: PlacementStrategy and PlacementPlan (weight/compute placement algorithms)
@@ -6572,7 +6569,7 @@ add_v2_test(V2_Integration_GraphBatchedKVCache
 
 # Test: GraphBufferManagement Parity
 # Validates that graph-managed buffer allocation produces equivalent results
-# to pipeline-managed buffer allocation. Part of Phase 5: Qwen2Graph Integration.
+# to pipeline-managed buffer allocation. Part of Phase 5: QwenStandardGraph Integration.
 # Both modes use LayerExecutor path, comparing LLAMINAR_USE_GRAPH_BUFFER_MANAGEMENT=0 vs =1.
 
 # Test: Full Graph Forward vs Legacy Parity
@@ -6730,7 +6727,7 @@ add_v2_test(V2_Integration_MPI_ShardedKVCache
 # Full end-to-end test of the distributed inference pipeline exercising:
 #   - MPITopology: Device capability exchange, work distribution
 #   - WeightManager: Column/row-parallel weight sharding
-#   - Qwen2Graph: Graph building with TP configuration
+#   - QwenStandardGraph: Graph building with TP configuration
 #   - DeviceGraphOrchestrator: Full forward execution with all stages
 #   - Sharded KV Cache: Per-rank cache with local heads
 #   - AllReduceStage: After Wo projection, FFN down projection

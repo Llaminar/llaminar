@@ -33,7 +33,7 @@ if $FULL_SUITE; then
     echo -e "${BLUE}==============================================================${NC}"
 else
     echo -e "${BLUE}==============================================================${NC}"
-    echo -e "${BLUE}Pre-commit Hook [feature branch: ${CURRENT_BRANCH}]: Build, Unit Tests & E2E${NC}"
+    echo -e "${BLUE}Pre-commit Hook [feature branch: ${CURRENT_BRANCH}]: Build, Unit Tests, E2E & Benchmarks${NC}"
     echo -e "${BLUE}==============================================================${NC}"
 fi
 echo ""
@@ -44,7 +44,7 @@ BUILD_V2_INTEGRATION="build_v2_integration"
 if $FULL_SUITE; then
     TOTAL_STEPS=8
 else
-    TOTAL_STEPS=3
+    TOTAL_STEPS=4
 fi
 
 # Step 1: Build Integration (Release optimizations + debug symbols + assertions)
@@ -229,13 +229,16 @@ fi
 echo -e "${GREEN}✓ E2E server tests passed${NC}"
 echo ""
 
-if $FULL_SUITE; then
-
-# Step 8: Performance Regression Benchmarks
+# Step 4 (feature) / Step 8 (full): Performance Regression Benchmarks
 # Runs 'llaminar2 benchmark' for each model × device combination defined in
 # benchmark_baseline.json and compares prefill/decode throughput against
 # canonical baselines. Devices that are unavailable are skipped gracefully.
-echo -e "${YELLOW}[8/${TOTAL_STEPS}] Running performance regression benchmarks...${NC}"
+if $FULL_SUITE; then
+    BENCH_STEP=8
+else
+    BENCH_STEP=4
+fi
+echo -e "${YELLOW}[${BENCH_STEP}/${TOTAL_STEPS}] Running performance regression benchmarks...${NC}"
 echo ""
 
 REPO_ROOT="$(git rev-parse --show-toplevel)"
@@ -259,8 +262,6 @@ fi
 echo -e "${GREEN}✓ Performance benchmarks passed${NC}"
 echo ""
 
-fi  # end FULL_SUITE (step 8)
-
 echo "================================================"
 echo -e "${GREEN}✅ SUCCESS: All checks passed!${NC}"
 echo -e "${GREEN}  • Integration build: OK${NC}"
@@ -272,9 +273,7 @@ echo -e "${GREEN}  • Qwen2 NodeLocalTP parity: OK${NC}"
 echo -e "${GREEN}  • Qwen35 NodeLocalTP parity: OK${NC}"
 fi
 echo -e "${GREEN}  • E2E server tests: OK${NC}"
-if $FULL_SUITE; then
 echo -e "${GREEN}  • Performance benchmarks: OK${NC}"
-fi
 echo ""
 echo -e "${GREEN}Proceeding with commit...${NC}"
 exit 0

@@ -5,7 +5,7 @@
  * @date December 19, 2025
  *
  * This interface defines the contract for building compute graphs in a
- * declarative, stateless manner. Model-specific implementations (Qwen2Graph,
+ * declarative, stateless manner. Model-specific implementations (QwenStandardGraph,
  * Qwen3Graph, LlamaGraph, etc.) derive from this interface.
  *
  * Design Principles:
@@ -142,7 +142,7 @@ namespace llaminar2
      *
      * Example usage:
      * @code
-     * std::unique_ptr<IGraphBuilder> builder = std::make_unique<Qwen2Graph>(...);
+     * std::unique_ptr<IGraphBuilder> builder = std::make_unique<QwenStandardGraph>(...);
      * ForwardInput input{...};
      * ForwardOutput output{...};
      * ComputeGraph graph = builder->buildForwardGraph(input, output);

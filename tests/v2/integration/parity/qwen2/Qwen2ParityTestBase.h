@@ -26,7 +26,7 @@
 
 #include "../ParityTestBase.h"
 #include "models/qwen/Qwen2Schema.h"
-#include "models/qwen/Qwen2Graph.h"
+#include "models/qwen/QwenStandardGraph.h"
 #include "execution/local_execution/orchestrators/RankOrchestrator.h"
 #include "execution/local_execution/orchestrators/DeviceGraphOrchestrator.h"
 #include "execution/runner/OrchestrationRunner.h"

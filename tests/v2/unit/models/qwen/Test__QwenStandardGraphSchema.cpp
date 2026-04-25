@@ -1,5 +1,5 @@
 /**
- * @file Test__Qwen2GraphSchema.cpp
+ * @file Test__QwenStandardGraphSchema.cpp
  * @brief Unit tests for schema-based Qwen2 graph building (Phase 4d)
  * @author David Sanftenberg
  * @date December 2025
@@ -28,7 +28,7 @@ using namespace llaminar2;
 /**
  * Test that Qwen2SchemaFactory creates a complete schema
  */
-TEST(Test__Qwen2GraphSchema, SchemaFactory_CreatesValidSchema)
+TEST(Test__QwenStandardGraphSchema, SchemaFactory_CreatesValidSchema)
 {
     Qwen2SchemaFactory factory;
 
@@ -53,7 +53,7 @@ TEST(Test__Qwen2GraphSchema, SchemaFactory_CreatesValidSchema)
 /**
  * Test that schema has embedding stage
  */
-TEST(Test__Qwen2GraphSchema, SchemaFactory_HasEmbeddingStage)
+TEST(Test__QwenStandardGraphSchema, SchemaFactory_HasEmbeddingStage)
 {
     Qwen2SchemaFactory factory;
     GraphSchema schema = factory.createSchema();
@@ -89,7 +89,7 @@ TEST(Test__Qwen2GraphSchema, SchemaFactory_HasEmbeddingStage)
 /**
  * Test that schema has layer template with attention stages
  */
-TEST(Test__Qwen2GraphSchema, SchemaFactory_HasAttentionStages)
+TEST(Test__QwenStandardGraphSchema, SchemaFactory_HasAttentionStages)
 {
     Qwen2SchemaFactory factory;
     GraphSchema schema = factory.createSchema();
@@ -129,7 +129,7 @@ TEST(Test__Qwen2GraphSchema, SchemaFactory_HasAttentionStages)
 /**
  * Test that schema has layer template with FFN stages
  */
-TEST(Test__Qwen2GraphSchema, SchemaFactory_HasFFNStages)
+TEST(Test__QwenStandardGraphSchema, SchemaFactory_HasFFNStages)
 {
     Qwen2SchemaFactory factory;
     GraphSchema schema = factory.createSchema();
@@ -169,7 +169,7 @@ TEST(Test__Qwen2GraphSchema, SchemaFactory_HasFFNStages)
 /**
  * Test that schema has LM head stages
  */
-TEST(Test__Qwen2GraphSchema, SchemaFactory_HasLMHeadStages)
+TEST(Test__QwenStandardGraphSchema, SchemaFactory_HasLMHeadStages)
 {
     Qwen2SchemaFactory factory;
     GraphSchema schema = factory.createSchema();
@@ -204,7 +204,7 @@ TEST(Test__Qwen2GraphSchema, SchemaFactory_HasLMHeadStages)
 /**
  * Test TensorRef default construction is required (not optional)
  */
-TEST(Test__Qwen2GraphSchema, TensorRef_DefaultIsRequired)
+TEST(Test__QwenStandardGraphSchema, TensorRef_DefaultIsRequired)
 {
     TensorRef ref;
     EXPECT_FALSE(ref.is_optional) << "Default TensorRef should be required";
@@ -213,7 +213,7 @@ TEST(Test__Qwen2GraphSchema, TensorRef_DefaultIsRequired)
 /**
  * Test TensorRef construction from string is required
  */
-TEST(Test__Qwen2GraphSchema, TensorRef_StringConstructorIsRequired)
+TEST(Test__QwenStandardGraphSchema, TensorRef_StringConstructorIsRequired)
 {
     TensorRef ref("weights.wq");
     EXPECT_EQ(ref.name, "weights.wq");
@@ -223,7 +223,7 @@ TEST(Test__Qwen2GraphSchema, TensorRef_StringConstructorIsRequired)
 /**
  * Test TensorRef named constructor creates required reference
  */
-TEST(Test__Qwen2GraphSchema, TensorRef_NamedConstructorIsRequired)
+TEST(Test__QwenStandardGraphSchema, TensorRef_NamedConstructorIsRequired)
 {
     TensorRef ref("weights.wq", BufferSemantic::Input);
     EXPECT_EQ(ref.name, "weights.wq");
@@ -234,7 +234,7 @@ TEST(Test__Qwen2GraphSchema, TensorRef_NamedConstructorIsRequired)
 /**
  * Test TensorRef::optional() factory creates optional reference
  */
-TEST(Test__Qwen2GraphSchema, TensorRef_OptionalFactoryCreatesOptional)
+TEST(Test__QwenStandardGraphSchema, TensorRef_OptionalFactoryCreatesOptional)
 {
     TensorRef ref = TensorRef::optional("weights.q_bias", BufferSemantic::Input);
     EXPECT_EQ(ref.name, "weights.q_bias");
@@ -245,7 +245,7 @@ TEST(Test__Qwen2GraphSchema, TensorRef_OptionalFactoryCreatesOptional)
 /**
  * Test TensorRef full constructor with explicit optional flag
  */
-TEST(Test__Qwen2GraphSchema, TensorRef_ExplicitOptionalFlag)
+TEST(Test__QwenStandardGraphSchema, TensorRef_ExplicitOptionalFlag)
 {
     TensorRef required_ref("weights.wq", BufferSemantic::Input, false);
     EXPECT_FALSE(required_ref.is_optional);
@@ -261,7 +261,7 @@ TEST(Test__Qwen2GraphSchema, TensorRef_ExplicitOptionalFlag)
 /**
  * Test that QKV weights are required
  */
-TEST(Test__Qwen2GraphSchema, IsWeightOptional_QKVWeightsAreRequired)
+TEST(Test__QwenStandardGraphSchema, IsWeightOptional_QKVWeightsAreRequired)
 {
     Qwen2SchemaFactory factory;
 
@@ -281,7 +281,7 @@ TEST(Test__Qwen2GraphSchema, IsWeightOptional_QKVWeightsAreRequired)
 /**
  * Test that QKV biases are optional (not all Qwen2 models have them)
  */
-TEST(Test__Qwen2GraphSchema, IsWeightOptional_QKVBiasesAreOptional)
+TEST(Test__QwenStandardGraphSchema, IsWeightOptional_QKVBiasesAreOptional)
 {
     Qwen2SchemaFactory factory;
 
@@ -301,7 +301,7 @@ TEST(Test__Qwen2GraphSchema, IsWeightOptional_QKVBiasesAreOptional)
 /**
  * Test that Wo (attention output) weight is required
  */
-TEST(Test__Qwen2GraphSchema, IsWeightOptional_WoWeightIsRequired)
+TEST(Test__QwenStandardGraphSchema, IsWeightOptional_WoWeightIsRequired)
 {
     Qwen2SchemaFactory factory;
 
@@ -313,7 +313,7 @@ TEST(Test__Qwen2GraphSchema, IsWeightOptional_WoWeightIsRequired)
 /**
  * Test that FFN weights are required
  */
-TEST(Test__Qwen2GraphSchema, IsWeightOptional_FFNWeightsAreRequired)
+TEST(Test__QwenStandardGraphSchema, IsWeightOptional_FFNWeightsAreRequired)
 {
     Qwen2SchemaFactory factory;
 
@@ -333,7 +333,7 @@ TEST(Test__Qwen2GraphSchema, IsWeightOptional_FFNWeightsAreRequired)
 /**
  * Test that norm weights are required
  */
-TEST(Test__Qwen2GraphSchema, IsWeightOptional_NormWeightsAreRequired)
+TEST(Test__QwenStandardGraphSchema, IsWeightOptional_NormWeightsAreRequired)
 {
     Qwen2SchemaFactory factory;
 
@@ -351,7 +351,7 @@ TEST(Test__Qwen2GraphSchema, IsWeightOptional_NormWeightsAreRequired)
 /**
  * Test that model-level weights are required
  */
-TEST(Test__Qwen2GraphSchema, IsWeightOptional_ModelLevelWeightsAreRequired)
+TEST(Test__QwenStandardGraphSchema, IsWeightOptional_ModelLevelWeightsAreRequired)
 {
     Qwen2SchemaFactory factory;
 
@@ -364,7 +364,7 @@ TEST(Test__Qwen2GraphSchema, IsWeightOptional_ModelLevelWeightsAreRequired)
 /**
  * Test that schema QKV projection has optional bias inputs marked correctly
  */
-TEST(Test__Qwen2GraphSchema, Schema_QKVBiasInputsMarkedOptional)
+TEST(Test__QwenStandardGraphSchema, Schema_QKVBiasInputsMarkedOptional)
 {
     Qwen2SchemaFactory factory;
     GraphSchema schema = factory.createSchema();
@@ -410,7 +410,7 @@ TEST(Test__Qwen2GraphSchema, Schema_QKVBiasInputsMarkedOptional)
 /**
  * Test that QKV projection has column-parallel annotation
  */
-TEST(Test__Qwen2GraphSchema, Schema_QKVIsColumnParallel)
+TEST(Test__QwenStandardGraphSchema, Schema_QKVIsColumnParallel)
 {
     Qwen2SchemaFactory factory;
     GraphSchema schema = factory.createSchema();
@@ -429,7 +429,7 @@ TEST(Test__Qwen2GraphSchema, Schema_QKVIsColumnParallel)
 /**
  * Test that Wo projection has row-parallel annotation
  */
-TEST(Test__Qwen2GraphSchema, Schema_WoIsRowParallel)
+TEST(Test__QwenStandardGraphSchema, Schema_WoIsRowParallel)
 {
     Qwen2SchemaFactory factory;
     GraphSchema schema = factory.createSchema();
@@ -448,7 +448,7 @@ TEST(Test__Qwen2GraphSchema, Schema_WoIsRowParallel)
 /**
  * Test that FFN down projection has row-parallel annotation
  */
-TEST(Test__Qwen2GraphSchema, Schema_FFNDownIsRowParallel)
+TEST(Test__QwenStandardGraphSchema, Schema_FFNDownIsRowParallel)
 {
     Qwen2SchemaFactory factory;
     GraphSchema schema = factory.createSchema();
@@ -467,7 +467,7 @@ TEST(Test__Qwen2GraphSchema, Schema_FFNDownIsRowParallel)
 /**
  * Test that LM head has column-parallel annotation
  */
-TEST(Test__Qwen2GraphSchema, Schema_LMHeadIsColumnParallel)
+TEST(Test__QwenStandardGraphSchema, Schema_LMHeadIsColumnParallel)
 {
     Qwen2SchemaFactory factory;
     GraphSchema schema = factory.createSchema();
@@ -490,7 +490,7 @@ TEST(Test__Qwen2GraphSchema, Schema_LMHeadIsColumnParallel)
 /**
  * Test that stages have correct execution policy keys
  */
-TEST(Test__Qwen2GraphSchema, Schema_HasExecutionPolicyKeys)
+TEST(Test__QwenStandardGraphSchema, Schema_HasExecutionPolicyKeys)
 {
     Qwen2SchemaFactory factory;
     GraphSchema schema = factory.createSchema();
@@ -528,7 +528,7 @@ TEST(Test__Qwen2GraphSchema, Schema_HasExecutionPolicyKeys)
 /**
  * Test that ExecutionPolicyFlags defaults enable all stages
  */
-TEST(Test__Qwen2GraphSchema, ExecutionPolicyFlags_DefaultsEnable)
+TEST(Test__QwenStandardGraphSchema, ExecutionPolicyFlags_DefaultsEnable)
 {
     ExecutionPolicyFlags flags;
 
@@ -545,7 +545,7 @@ TEST(Test__Qwen2GraphSchema, ExecutionPolicyFlags_DefaultsEnable)
 /**
  * Test shouldExecute() method
  */
-TEST(Test__Qwen2GraphSchema, ExecutionPolicyFlags_ShouldExecute)
+TEST(Test__QwenStandardGraphSchema, ExecutionPolicyFlags_ShouldExecute)
 {
     ExecutionPolicyFlags flags;
 
@@ -571,7 +571,7 @@ TEST(Test__Qwen2GraphSchema, ExecutionPolicyFlags_ShouldExecute)
 /**
  * Test GraphResolverConfig defaults
  */
-TEST(Test__Qwen2GraphSchema, ResolverConfig_Defaults)
+TEST(Test__QwenStandardGraphSchema, ResolverConfig_Defaults)
 {
     GraphResolverConfig config;
 
@@ -590,7 +590,7 @@ TEST(Test__Qwen2GraphSchema, ResolverConfig_Defaults)
 /**
  * Test TensorContext basic buffer resolution
  */
-TEST(Test__Qwen2GraphSchema, TensorContext_ResolvesBuffers)
+TEST(Test__QwenStandardGraphSchema, TensorContext_ResolvesBuffers)
 {
     TensorContext ctx;
 
@@ -609,7 +609,7 @@ TEST(Test__Qwen2GraphSchema, TensorContext_ResolvesBuffers)
 /**
  * Test TensorContext weight resolution
  */
-TEST(Test__Qwen2GraphSchema, TensorContext_ResolvesWeights)
+TEST(Test__QwenStandardGraphSchema, TensorContext_ResolvesWeights)
 {
     TensorContext ctx;
 
@@ -628,7 +628,7 @@ TEST(Test__Qwen2GraphSchema, TensorContext_ResolvesWeights)
 /**
  * Test TensorContext layer weight resolution
  */
-TEST(Test__Qwen2GraphSchema, TensorContext_ResolvesLayerWeights)
+TEST(Test__QwenStandardGraphSchema, TensorContext_ResolvesLayerWeights)
 {
     TensorContext ctx;
 
@@ -662,7 +662,7 @@ TEST(Test__Qwen2GraphSchema, TensorContext_ResolvesLayerWeights)
 /**
  * Test that schema has layer buffers with aliasing info
  */
-TEST(Test__Qwen2GraphSchema, Schema_HasLayerBuffersWithAliasing)
+TEST(Test__QwenStandardGraphSchema, Schema_HasLayerBuffersWithAliasing)
 {
     Qwen2SchemaFactory factory;
     GraphSchema schema = factory.createSchema();
@@ -694,7 +694,7 @@ TEST(Test__Qwen2GraphSchema, Schema_HasLayerBuffersWithAliasing)
 /**
  * Test that schema has model buffers
  */
-TEST(Test__Qwen2GraphSchema, Schema_HasModelBuffers)
+TEST(Test__QwenStandardGraphSchema, Schema_HasModelBuffers)
 {
     Qwen2SchemaFactory factory;
     GraphSchema schema = factory.createSchema();
@@ -726,7 +726,7 @@ TEST(Test__Qwen2GraphSchema, Schema_HasModelBuffers)
 /**
  * Test that schema has alias group definitions
  */
-TEST(Test__Qwen2GraphSchema, Schema_HasAliasGroups)
+TEST(Test__QwenStandardGraphSchema, Schema_HasAliasGroups)
 {
     Qwen2SchemaFactory factory;
     GraphSchema schema = factory.createSchema();
@@ -761,7 +761,7 @@ TEST(Test__Qwen2GraphSchema, Schema_HasAliasGroups)
 /**
  * Test that buffer alias priorities are set correctly
  */
-TEST(Test__Qwen2GraphSchema, Schema_BufferAliasPriorities)
+TEST(Test__QwenStandardGraphSchema, Schema_BufferAliasPriorities)
 {
     Qwen2SchemaFactory factory;
     GraphSchema schema = factory.createSchema();
@@ -789,7 +789,7 @@ TEST(Test__Qwen2GraphSchema, Schema_BufferAliasPriorities)
 /**
  * Test that BufferSpec has description field
  */
-TEST(Test__Qwen2GraphSchema, Schema_BufferHasDescription)
+TEST(Test__QwenStandardGraphSchema, Schema_BufferHasDescription)
 {
     Qwen2SchemaFactory factory;
     GraphSchema schema = factory.createSchema();
@@ -812,7 +812,7 @@ TEST(Test__Qwen2GraphSchema, Schema_BufferHasDescription)
 /**
  * Test that BufferAllocator evaluates simple formulas correctly
  */
-TEST(Test__Qwen2GraphSchema, BufferAllocator_EvaluatesSimpleFormulas)
+TEST(Test__QwenStandardGraphSchema, BufferAllocator_EvaluatesSimpleFormulas)
 {
     GraphResolverConfig config{};
     config.d_model = 896;
@@ -837,7 +837,7 @@ TEST(Test__Qwen2GraphSchema, BufferAllocator_EvaluatesSimpleFormulas)
 /**
  * Test that BufferAllocator evaluates tensor-parallel formulas
  */
-TEST(Test__Qwen2GraphSchema, BufferAllocator_EvaluatesTPFormulas)
+TEST(Test__QwenStandardGraphSchema, BufferAllocator_EvaluatesTPFormulas)
 {
     GraphResolverConfig config{};
     config.n_heads = 14;
@@ -866,7 +866,7 @@ TEST(Test__Qwen2GraphSchema, BufferAllocator_EvaluatesTPFormulas)
 /**
  * Test that BufferAllocator resolves a single BufferSpec
  */
-TEST(Test__Qwen2GraphSchema, BufferAllocator_ResolvesSingleBuffer)
+TEST(Test__QwenStandardGraphSchema, BufferAllocator_ResolvesSingleBuffer)
 {
     GraphResolverConfig config{};
     config.seq_len = 512;
@@ -894,7 +894,7 @@ TEST(Test__Qwen2GraphSchema, BufferAllocator_ResolvesSingleBuffer)
 /**
  * Test that BufferAllocator resolves all buffers from schema
  */
-TEST(Test__Qwen2GraphSchema, BufferAllocator_ResolvesAllBuffers)
+TEST(Test__QwenStandardGraphSchema, BufferAllocator_ResolvesAllBuffers)
 {
     Qwen2SchemaFactory factory;
     GraphSchema schema = factory.createSchema();
@@ -936,7 +936,7 @@ TEST(Test__Qwen2GraphSchema, BufferAllocator_ResolvesAllBuffers)
 /**
  * Test that BufferAllocator estimates memory savings correctly
  */
-TEST(Test__Qwen2GraphSchema, BufferAllocator_EstimatesMemorySavings)
+TEST(Test__QwenStandardGraphSchema, BufferAllocator_EstimatesMemorySavings)
 {
     Qwen2SchemaFactory factory;
     GraphSchema schema = factory.createSchema();
@@ -975,7 +975,7 @@ TEST(Test__Qwen2GraphSchema, BufferAllocator_EstimatesMemorySavings)
 /**
  * Test ResolvedBufferSpec totalBytes calculation
  */
-TEST(Test__Qwen2GraphSchema, ResolvedBufferSpec_CalculatesTotalBytes)
+TEST(Test__QwenStandardGraphSchema, ResolvedBufferSpec_CalculatesTotalBytes)
 {
     ResolvedBufferSpec spec;
     spec.shape = {512, 896}; // seq_len x d_model
@@ -995,7 +995,7 @@ TEST(Test__Qwen2GraphSchema, ResolvedBufferSpec_CalculatesTotalBytes)
 /**
  * Test BufferAllocator resolveLayerBuffers returns StageBufferRequirements
  */
-TEST(Test__Qwen2GraphSchema, BufferAllocator_ResolveLayerBuffers)
+TEST(Test__QwenStandardGraphSchema, BufferAllocator_ResolveLayerBuffers)
 {
     Qwen2SchemaFactory factory;
     GraphSchema schema = factory.createSchema();
@@ -1129,7 +1129,7 @@ TEST(Test__Qwen2GraphSchema, BufferAllocator_ResolveLayerBuffers)
 /**
  * Test BufferAllocator resolveModelBuffers returns StageBufferRequirements
  */
-TEST(Test__Qwen2GraphSchema, BufferAllocator_ResolveModelBuffers)
+TEST(Test__QwenStandardGraphSchema, BufferAllocator_ResolveModelBuffers)
 {
     Qwen2SchemaFactory factory;
     GraphSchema schema = factory.createSchema();
@@ -1177,7 +1177,7 @@ TEST(Test__Qwen2GraphSchema, BufferAllocator_ResolveModelBuffers)
 /**
  * Test model buffer shapes with TP=2 (local_vocab < vocab_size)
  */
-TEST(Test__Qwen2GraphSchema, BufferAllocator_ResolveModelBuffers_TP2)
+TEST(Test__QwenStandardGraphSchema, BufferAllocator_ResolveModelBuffers_TP2)
 {
     Qwen2SchemaFactory factory;
     GraphSchema schema = factory.createSchema();

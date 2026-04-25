@@ -10,7 +10,7 @@
 
 #include <gtest/gtest.h>
 #include "execution/config/InferenceMode.h"
-#include "models/qwen/Qwen2Graph.h"
+#include "models/qwen/QwenStandardGraph.h"
 #include "tensors/Tensors.h"
 
 using namespace llaminar2;

@@ -1,18 +1,18 @@
 /**
- * @file Test__Qwen2GraphDomain.cpp
- * @brief Unit tests for Qwen2Graph MultiDomainTPConfig support
+ * @file Test__QwenStandardGraphDomain.cpp
+ * @brief Unit tests for QwenStandardGraph MultiDomainTPConfig support
  *
- * Tests that Qwen2Graph correctly passes TPDomain to AllreduceStage
+ * Tests that QwenStandardGraph correctly passes TPDomain to AllreduceStage
  * for heterogeneous tensor parallelism support.
  *
- * Part of Phase 4.3: Adding MultiDomainTPConfig support to Qwen2Graph
+ * Part of Phase 4.3: Adding MultiDomainTPConfig support to QwenStandardGraph
  *
  * @author David Sanftenberg
  * @date January 2026
  */
 
 #include <gtest/gtest.h>
-#include "models/qwen/Qwen2Graph.h"
+#include "models/qwen/QwenStandardGraph.h"
 #include "config/TPDomain.h"
 #include "backends/DeviceId.h"
 #include "utils/MPIContext.h"
@@ -24,9 +24,9 @@ using namespace llaminar2;
 // =============================================================================
 
 /**
- * @brief Test fixture for Qwen2Graph domain tests
+ * @brief Test fixture for QwenStandardGraph domain tests
  */
-class Test__Qwen2GraphDomain : public ::testing::Test
+class Test__QwenStandardGraphDomain : public ::testing::Test
 {
 protected:
     void SetUp() override
@@ -87,7 +87,7 @@ protected:
  * When multi_domain_tp_config is not set (nullptr), getDomainForLayer
  * should return nullptr, allowing AllreduceStage to use the legacy MPI path.
  */
-TEST_F(Test__Qwen2GraphDomain, GetDomainForLayerReturnsNullWithoutConfig)
+TEST_F(Test__QwenStandardGraphDomain, GetDomainForLayerReturnsNullWithoutConfig)
 {
     // Config has no multi_domain_tp_config (default nullptr)
     EXPECT_EQ(config_.multi_domain_tp_config, nullptr);
@@ -95,7 +95,7 @@ TEST_F(Test__Qwen2GraphDomain, GetDomainForLayerReturnsNullWithoutConfig)
     // Create graph (we can't directly test getDomainForLayer as it's private,
     // but we can verify the config propagation)
     auto mpi_ctx = std::make_shared<MPIContext>(0, 1, MPI_COMM_NULL);
-    Qwen2Graph graph(config_, mpi_ctx);
+    QwenStandardGraph graph(config_, mpi_ctx);
 
     // The graph should be in "no domain" mode
     // This test verifies the config is correctly initialized
@@ -105,7 +105,7 @@ TEST_F(Test__Qwen2GraphDomain, GetDomainForLayerReturnsNullWithoutConfig)
 /**
  * @brief Test that config accepts MultiDomainTPConfig pointer
  */
-TEST_F(Test__Qwen2GraphDomain, ConfigAcceptsMultiDomainTPConfig)
+TEST_F(Test__QwenStandardGraphDomain, ConfigAcceptsMultiDomainTPConfig)
 {
     // Create multi-domain config
     auto tp_config = std::make_unique<MultiDomainTPConfig>(
@@ -123,7 +123,7 @@ TEST_F(Test__Qwen2GraphDomain, ConfigAcceptsMultiDomainTPConfig)
 /**
  * @brief Test that config with GPU+CPU domains works
  */
-TEST_F(Test__Qwen2GraphDomain, ConfigAcceptsMultipleDomains)
+TEST_F(Test__QwenStandardGraphDomain, ConfigAcceptsMultipleDomains)
 {
     // Create multi-domain config with GPU and CPU
     auto tp_config = std::make_unique<MultiDomainTPConfig>(
@@ -144,7 +144,7 @@ TEST_F(Test__Qwen2GraphDomain, ConfigAcceptsMultipleDomains)
 /**
  * @brief Test that attention layers route to GPU domain
  */
-TEST_F(Test__Qwen2GraphDomain, AttentionRoutesToGPUDomain)
+TEST_F(Test__QwenStandardGraphDomain, AttentionRoutesToGPUDomain)
 {
     auto tp_config = std::make_unique<MultiDomainTPConfig>(
         MultiDomainTPConfig::createForTest({createGPUDomain(), createCPUDomain()}));
@@ -163,7 +163,7 @@ TEST_F(Test__Qwen2GraphDomain, AttentionRoutesToGPUDomain)
 /**
  * @brief Test that FFN layers route to CPU domain when available
  */
-TEST_F(Test__Qwen2GraphDomain, FFNRoutesToCPUDomain)
+TEST_F(Test__QwenStandardGraphDomain, FFNRoutesToCPUDomain)
 {
     auto tp_config = std::make_unique<MultiDomainTPConfig>(
         MultiDomainTPConfig::createForTest({createGPUDomain(), createCPUDomain()}));
@@ -182,7 +182,7 @@ TEST_F(Test__Qwen2GraphDomain, FFNRoutesToCPUDomain)
 /**
  * @brief Test that FFN falls back to GPU domain when no CPU domain
  */
-TEST_F(Test__Qwen2GraphDomain, FFNFallsBackToGPUDomain)
+TEST_F(Test__QwenStandardGraphDomain, FFNFallsBackToGPUDomain)
 {
     // Only GPU domain, no CPU
     auto tp_config = std::make_unique<MultiDomainTPConfig>(
@@ -208,14 +208,14 @@ TEST_F(Test__Qwen2GraphDomain, FFNFallsBackToGPUDomain)
  * When multi_domain_tp_config is nullptr, AllreduceStage should receive
  * domain=nullptr and fall back to the legacy MPI path.
  */
-TEST_F(Test__Qwen2GraphDomain, AllreduceWithoutDomainHasNullDomain)
+TEST_F(Test__QwenStandardGraphDomain, AllreduceWithoutDomainHasNullDomain)
 {
     // No multi_domain_tp_config set
     EXPECT_EQ(config_.multi_domain_tp_config, nullptr);
 
     // Create graph with mock MPI context
     auto mpi_ctx = std::make_shared<MPIContext>(0, 1, MPI_COMM_NULL);
-    Qwen2Graph graph(config_, mpi_ctx);
+    QwenStandardGraph graph(config_, mpi_ctx);
 
     // The config should still have nullptr
     // AllreduceStage created by this graph will have domain=nullptr
@@ -225,7 +225,7 @@ TEST_F(Test__Qwen2GraphDomain, AllreduceWithoutDomainHasNullDomain)
 /**
  * @brief Test that default config has null multi_domain_tp_config
  */
-TEST_F(Test__Qwen2GraphDomain, DefaultConfigHasNullDomainConfig)
+TEST_F(Test__QwenStandardGraphDomain, DefaultConfigHasNullDomainConfig)
 {
     GraphConfig default_config;
     EXPECT_EQ(default_config.multi_domain_tp_config, nullptr);
@@ -238,7 +238,7 @@ TEST_F(Test__Qwen2GraphDomain, DefaultConfigHasNullDomainConfig)
 /**
  * @brief Test domain lookup across multiple layers
  */
-TEST_F(Test__Qwen2GraphDomain, DomainLookupAcrossLayers)
+TEST_F(Test__QwenStandardGraphDomain, DomainLookupAcrossLayers)
 {
     auto tp_config = std::make_unique<MultiDomainTPConfig>(
         MultiDomainTPConfig::createForTest({createGPUDomain(), createCPUDomain()}));
@@ -263,9 +263,9 @@ TEST_F(Test__Qwen2GraphDomain, DomainLookupAcrossLayers)
 }
 
 /**
- * @brief Test that Qwen2Graph can be constructed with domain config
+ * @brief Test that QwenStandardGraph can be constructed with domain config
  */
-TEST_F(Test__Qwen2GraphDomain, GraphConstructsWithDomainConfig)
+TEST_F(Test__QwenStandardGraphDomain, GraphConstructsWithDomainConfig)
 {
     auto tp_config = std::make_unique<MultiDomainTPConfig>(
         MultiDomainTPConfig::createForTest({createGPUDomain()}));
@@ -275,7 +275,7 @@ TEST_F(Test__Qwen2GraphDomain, GraphConstructsWithDomainConfig)
     // Should not throw
     auto mpi_ctx = std::make_shared<MPIContext>(0, 1, MPI_COMM_NULL);
     EXPECT_NO_THROW({
-        Qwen2Graph graph(config_, mpi_ctx);
+        QwenStandardGraph graph(config_, mpi_ctx);
     });
 }
 
@@ -289,7 +289,7 @@ TEST_F(Test__Qwen2GraphDomain, GraphConstructsWithDomainConfig)
  * This verifies the config struct correctly holds the domain pointer
  * and that it persists through graph construction.
  */
-TEST_F(Test__Qwen2GraphDomain, ConfigPersistsThroughGraphConstruction)
+TEST_F(Test__QwenStandardGraphDomain, ConfigPersistsThroughGraphConstruction)
 {
     auto tp_config = std::make_unique<MultiDomainTPConfig>(
         MultiDomainTPConfig::createForTest({createGPUDomain(), createCPUDomain()}));
@@ -298,7 +298,7 @@ TEST_F(Test__Qwen2GraphDomain, ConfigPersistsThroughGraphConstruction)
     MultiDomainTPConfig *original_ptr = tp_config.get();
 
     auto mpi_ctx = std::make_shared<MPIContext>(0, 1, MPI_COMM_NULL);
-    Qwen2Graph graph(config_, mpi_ctx);
+    QwenStandardGraph graph(config_, mpi_ctx);
 
     // Config should still point to our TP config
     EXPECT_EQ(config_.multi_domain_tp_config, original_ptr);

@@ -12,7 +12,7 @@
  * - Layer type pattern generation from full_attention_interval
  * - "qwen35" architecture registration in factories
  * - GDN attention graph construction: correct stages, wiring, interface usage
- * - FA attention graph delegation to Qwen2Graph
+ * - FA attention graph delegation to QwenStandardGraph
  */
 
 #include <gtest/gtest.h>

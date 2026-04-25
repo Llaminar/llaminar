@@ -8,7 +8,7 @@
  * Components exercised:
  *   - MPITopology: Device capability exchange, work distribution
  *   - WeightManager: Column/row-parallel weight sharding (QKV, FFN, LM Head)
- *   - Qwen2Graph: Graph building with TP configuration
+ *   - QwenStandardGraph: Graph building with TP configuration
  *   - DeviceGraphOrchestrator: Full forward execution with all stages
  *   - Sharded KV Cache: Per-rank cache with local heads
  *   - AllReduceStage: After Wo projection, FFN down projection
@@ -41,7 +41,7 @@
 #include "execution/factory/InferenceRunnerFactory.h"
 #include "execution/local_execution/orchestrators/IInferenceRunner.h"
 #include "execution/local_execution/orchestrators/DeviceGraphOrchestrator.h"
-#include "models/qwen/Qwen2Graph.h"
+#include "models/qwen/QwenStandardGraph.h"
 #include "models/qwen/Qwen2Schema.h"
 #include "loaders/ModelContext.h"
 #include "loaders/WeightManager.h"

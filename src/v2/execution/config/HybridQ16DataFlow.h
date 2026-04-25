@@ -4,7 +4,7 @@
  *
  * This file defines the SINGLE SOURCE OF TRUTH for how data flows through
  * the HybridQ16 pipeline. Instead of having format decisions scattered across
- * Qwen2Graph.cpp, ComputeStage.cpp, FusedAttentionWoKernel.h, and JitFusedAttentionWo.h,
+ * QwenStandardGraph.cpp, ComputeStage.cpp, FusedAttentionWoKernel.h, and JitFusedAttentionWo.h,
  * all components should reference this contract.
  *
  * HybridQ16 Mode Data Flow:
@@ -95,7 +95,7 @@
  *
  * COMPONENT RESPONSIBILITIES:
  * ───────────────────────────
- * - Qwen2Graph.cpp: Wire buffers according to this contract
+ * - QwenStandardGraph.cpp: Wire buffers according to this contract
  * - FusedAttentionWoStage: Set fuse_residual_add=true, output=residual
  * - FusedAttentionWoKernel: Set residual_type=Q16_1, use_hybrid_wo=true
  * - JitFusedAttentionWo: Handle WoFormat::FP32_STREAMING_DEQUANT + Q16_1 fusion

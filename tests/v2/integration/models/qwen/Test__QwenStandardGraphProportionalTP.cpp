@@ -1,13 +1,13 @@
 /**
- * @file Test__Qwen2GraphProportionalTP.cpp
- * @brief Integration tests for Qwen2Graph with TensorParallelConfig (Phase 1c)
+ * @file Test__QwenStandardGraphProportionalTP.cpp
+ * @brief Integration tests for QwenStandardGraph with TensorParallelConfig (Phase 1c)
  *
- * Tests that Qwen2Graph correctly uses TensorParallelConfig for proportional
+ * Tests that QwenStandardGraph correctly uses TensorParallelConfig for proportional
  * head/FFN/vocab assignment instead of equal 1/world_size splits.
  */
 
 #include <gtest/gtest.h>
-#include "../../src/v2/models/qwen/Qwen2Graph.h"
+#include "../../src/v2/models/qwen/QwenStandardGraph.h"
 #include "../../src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.h"
 #include "../../src/v2/config/TensorParallelConfig.h"
 #include "../../src/v2/loaders/WeightManager.h"
@@ -17,9 +17,9 @@
 using namespace llaminar2;
 
 /**
- * @brief Test fixture for Qwen2GraphProportionalTP tests
+ * @brief Test fixture for QwenStandardGraphProportionalTP tests
  */
-class Test__Qwen2GraphProportionalTP : public ::testing::Test
+class Test__QwenStandardGraphProportionalTP : public ::testing::Test
 {
 protected:
     void SetUp() override
@@ -78,7 +78,7 @@ protected:
 /**
  * @brief Test that TensorParallelConfig can be added to GraphConfig
  */
-TEST_F(Test__Qwen2GraphProportionalTP, ConfigAcceptsTensorParallelConfig)
+TEST_F(Test__QwenStandardGraphProportionalTP, ConfigAcceptsTensorParallelConfig)
 {
     // Create proportional config: 73% for rank 0, 27% for rank 1
     auto tp_config = std::make_shared<TensorParallelConfig>(
@@ -113,7 +113,7 @@ TEST_F(Test__Qwen2GraphProportionalTP, ConfigAcceptsTensorParallelConfig)
  * - Rank 0 (73%): 20 heads (28 * 0.73 = 20.44 → 20)
  * - Rank 1 (27%): 8 heads (remainder)
  */
-TEST_F(Test__Qwen2GraphProportionalTP, ProportionalTP_HeadCount_73_27)
+TEST_F(Test__QwenStandardGraphProportionalTP, ProportionalTP_HeadCount_73_27)
 {
     auto tp_config = std::make_shared<TensorParallelConfig>(
         TensorParallelConfig::proportionalSplit(
@@ -144,7 +144,7 @@ TEST_F(Test__Qwen2GraphProportionalTP, ProportionalTP_HeadCount_73_27)
  * - Rank 0: 3 KV heads (4 * 0.73 = 2.92 → 3)
  * - Rank 1: 1 KV head (remainder)
  */
-TEST_F(Test__Qwen2GraphProportionalTP, ProportionalTP_KVHeadCount_73_27)
+TEST_F(Test__QwenStandardGraphProportionalTP, ProportionalTP_KVHeadCount_73_27)
 {
     auto tp_config = std::make_shared<TensorParallelConfig>(
         TensorParallelConfig::proportionalSplit(
@@ -170,7 +170,7 @@ TEST_F(Test__Qwen2GraphProportionalTP, ProportionalTP_KVHeadCount_73_27)
  *
  * Q buffer should be: [seq_len, local_n_heads * head_dim]
  */
-TEST_F(Test__Qwen2GraphProportionalTP, ProportionalTP_BufferSizes)
+TEST_F(Test__QwenStandardGraphProportionalTP, ProportionalTP_BufferSizes)
 {
     auto tp_config = std::make_shared<TensorParallelConfig>(
         TensorParallelConfig::proportionalSplit(
@@ -204,7 +204,7 @@ TEST_F(Test__Qwen2GraphProportionalTP, ProportionalTP_BufferSizes)
  * - Rank 0: 3552 (73% of 4864 ≈ 3550.72 → rounded to 32 boundary)
  * - Rank 1: 1312 (remainder, 4864 - 3552 = 1312)
  */
-TEST_F(Test__Qwen2GraphProportionalTP, ProportionalTP_FFNDimension)
+TEST_F(Test__QwenStandardGraphProportionalTP, ProportionalTP_FFNDimension)
 {
     auto tp_config = std::make_shared<TensorParallelConfig>(
         TensorParallelConfig::proportionalSplit(
@@ -233,7 +233,7 @@ TEST_F(Test__Qwen2GraphProportionalTP, ProportionalTP_FFNDimension)
  *
  * When tp_config is nullptr, getAssignment() should return nullptr.
  */
-TEST_F(Test__Qwen2GraphProportionalTP, BackwardCompatible_NoConfig)
+TEST_F(Test__QwenStandardGraphProportionalTP, BackwardCompatible_NoConfig)
 {
     GraphConfig config = createConfig();
 
@@ -251,7 +251,7 @@ TEST_F(Test__Qwen2GraphProportionalTP, BackwardCompatible_NoConfig)
  *
  * For 2 identical GPUs, equal split should give 14/14 heads.
  */
-TEST_F(Test__Qwen2GraphProportionalTP, EqualSplit_HomogeneousGPUs)
+TEST_F(Test__QwenStandardGraphProportionalTP, EqualSplit_HomogeneousGPUs)
 {
     auto tp_config = std::make_shared<TensorParallelConfig>(
         TensorParallelConfig::equalSplit(
@@ -276,7 +276,7 @@ TEST_F(Test__Qwen2GraphProportionalTP, EqualSplit_HomogeneousGPUs)
 /**
  * @brief Test DeviceGraphOrchestrator accepts TensorParallelConfig
  */
-TEST_F(Test__Qwen2GraphProportionalTP, OrchestratorAcceptsTPConfig)
+TEST_F(Test__QwenStandardGraphProportionalTP, OrchestratorAcceptsTPConfig)
 {
     auto tp_config = std::make_shared<TensorParallelConfig>(
         TensorParallelConfig::proportionalSplit(
@@ -289,7 +289,7 @@ TEST_F(Test__Qwen2GraphProportionalTP, OrchestratorAcceptsTPConfig)
     config.local_rank = 0;
 
     // Create orchestrator with config
-    DeviceGraphOrchestrator orchestrator(std::make_shared<Qwen2Graph>(config, nullptr), nullptr);
+    DeviceGraphOrchestrator orchestrator(std::make_shared<QwenStandardGraph>(config, nullptr), nullptr);
 
     // Set TensorParallelConfig on orchestrator
     orchestrator.setTensorParallelConfig(tp_config);
@@ -302,7 +302,7 @@ TEST_F(Test__Qwen2GraphProportionalTP, OrchestratorAcceptsTPConfig)
 /**
  * @brief Test single-device config (no parallelism)
  */
-TEST_F(Test__Qwen2GraphProportionalTP, SingleDevice_NoParallelism)
+TEST_F(Test__QwenStandardGraphProportionalTP, SingleDevice_NoParallelism)
 {
     auto tp_config = std::make_shared<TensorParallelConfig>(
         TensorParallelConfig::singleDevice(
@@ -322,7 +322,7 @@ TEST_F(Test__Qwen2GraphProportionalTP, SingleDevice_NoParallelism)
 /**
  * @brief Test work fraction sums to 1.0
  */
-TEST_F(Test__Qwen2GraphProportionalTP, WorkFractionSumsToOne)
+TEST_F(Test__QwenStandardGraphProportionalTP, WorkFractionSumsToOne)
 {
     auto tp_config = std::make_shared<TensorParallelConfig>(
         TensorParallelConfig::proportionalSplit(
@@ -342,7 +342,7 @@ TEST_F(Test__Qwen2GraphProportionalTP, WorkFractionSumsToOne)
 /**
  * @brief Test config propagation from GraphConfig to assignment
  */
-TEST_F(Test__Qwen2GraphProportionalTP, ConfigPropagation_AssignmentValues)
+TEST_F(Test__QwenStandardGraphProportionalTP, ConfigPropagation_AssignmentValues)
 {
     auto tp_config = std::make_shared<TensorParallelConfig>(
         TensorParallelConfig::proportionalSplit(
