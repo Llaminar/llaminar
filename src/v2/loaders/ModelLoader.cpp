@@ -447,11 +447,12 @@ namespace llaminar2
         const int mmap_numa_node = factory_ ? factory_->getNumaNode() : -1;
         if (use_mmap_)
         {
-            mmap_region_ = MmapRegion::create(file_path, mmap_numa_node);
+            mmap_region_ = MmapRegion::create(file_path, mmap_numa_node, skip_mmap_cache_eviction_);
             if (mmap_region_)
             {
                 LOG_INFO("[ModelLoader] mmap enabled: " << file_path
-                                                        << " (" << (mmap_region_->size() / (1024 * 1024)) << " MB)");
+                                                        << " (" << (mmap_region_->size() / (1024 * 1024)) << " MB)"
+                                                        << (skip_mmap_cache_eviction_ ? " [cache-warm]" : ""));
 
                 // If multi-part, also mmap the split files
                 if (model_.split_count > 1)
@@ -459,7 +460,7 @@ namespace llaminar2
                     split_mmap_regions_.resize(model_.split_count - 1);
                     for (uint16_t idx = 1; idx < model_.split_count; ++idx)
                     {
-                        split_mmap_regions_[idx - 1] = MmapRegion::create(model_.split_paths[idx], mmap_numa_node);
+                        split_mmap_regions_[idx - 1] = MmapRegion::create(model_.split_paths[idx], mmap_numa_node, skip_mmap_cache_eviction_);
                         if (!split_mmap_regions_[idx - 1])
                         {
                             LOG_WARN("[ModelLoader] Failed to mmap split file " << idx
@@ -1462,6 +1463,237 @@ namespace llaminar2
             LOG_ERROR("[ModelLoader] Unsupported tensor type for row slicing: "
                       << static_cast<int>(info->type));
             return nullptr;
+        }
+
+        return tensor;
+    }
+
+    std::shared_ptr<TensorBase> ModelLoader::loadTensorExpertSlice(
+        const std::string &tensor_name,
+        size_t expert_start, size_t expert_end,
+        DeviceId device,
+        WeightPrecision weight_precision)
+    {
+        if (!loaded_)
+        {
+            LOG_ERROR("[ModelLoader] Model not loaded");
+            return nullptr;
+        }
+
+        // Find tensor metadata
+        const GGUFTensorInfo *info = model_.findTensor(tensor_name);
+        if (!info)
+        {
+            LOG_ERROR("[ModelLoader] Tensor not found: " << tensor_name);
+            return nullptr;
+        }
+
+        // Validate tensor is 3D (expert-packed: [cols, rows_per_expert, num_experts])
+        if (info->dimensions.size() != 3)
+        {
+            LOG_ERROR("[ModelLoader] Expert slicing requires 3D tensor, got "
+                      << info->dimensions.size() << "D for: " << tensor_name);
+            return nullptr;
+        }
+
+        size_t ne0 = info->dimensions[0]; // cols (fastest varying)
+        size_t ne1 = info->dimensions[1]; // rows per expert
+        size_t ne2 = info->dimensions[2]; // num_experts (slowest varying)
+
+        // Validate expert range
+        if (expert_start >= ne2 || expert_end > ne2 || expert_start >= expert_end)
+        {
+            LOG_ERROR("[ModelLoader] Invalid expert range [" << expert_start << ", " << expert_end
+                                                             << ") for tensor with " << ne2 << " experts: " << tensor_name);
+            return nullptr;
+        }
+
+        size_t local_count = expert_end - expert_start;
+
+        // Calculate bytes per expert: each expert has ne1 rows of ne0 columns
+        size_t bytes_per_row = 0;
+        size_t block_size = info->getBlockSize();
+        size_t type_size = info->getTypeSize();
+
+        if (block_size > 0)
+        {
+            if (ne0 % block_size != 0)
+            {
+                LOG_ERROR("[ModelLoader] Expert tensor columns (" << ne0 << ") not divisible by block size ("
+                                                                  << block_size << ") for: " << tensor_name);
+                return nullptr;
+            }
+            size_t blocks_per_row = ne0 / block_size;
+            bytes_per_row = blocks_per_row * type_size;
+        }
+        else
+        {
+            bytes_per_row = ne0 * type_size;
+        }
+
+        size_t bytes_per_expert = ne1 * bytes_per_row;
+        size_t slice_offset = expert_start * bytes_per_expert;
+        size_t slice_bytes = local_count * bytes_per_expert;
+
+        LOG_TRACE("[ModelLoader] Expert slice " << tensor_name << ": experts [" << expert_start << ", " << expert_end
+                                                << "), " << slice_bytes << " bytes (of " << info->size_bytes << " total)");
+
+        // Ensure NUMA binding before allocating the read buffer
+        if (factory_)
+        {
+            factory_->ensureNumaBinding();
+        }
+
+        // Read only the expert slice bytes
+        std::vector<uint8_t> raw;
+        if (mmap_region_)
+        {
+            const uint8_t *tensor_base = getMmapPtr(info);
+            const uint8_t *src = tensor_base + slice_offset;
+            raw.resize(slice_bytes);
+            std::memcpy(raw.data(), src, slice_bytes);
+        }
+        else
+        {
+            std::lock_guard<std::mutex> lock(file_mutex_);
+
+            std::ifstream *stream = &file_stream_;
+            uint64_t data_offset = model_.data_offset;
+
+            if (model_.split_count > 1)
+            {
+                if (info->split_idx == 0)
+                {
+                    stream = &file_stream_;
+                    data_offset = model_.split_data_offsets[0];
+                }
+                else if (info->split_idx < model_.split_count)
+                {
+                    stream = &split_streams_[info->split_idx - 1];
+                    data_offset = model_.split_data_offsets[info->split_idx];
+                }
+                else
+                {
+                    LOG_ERROR("[ModelLoader] Invalid split index for tensor: " << tensor_name);
+                    return nullptr;
+                }
+            }
+
+            stream->seekg(data_offset + info->offset + slice_offset, std::ios::beg);
+            if (!(*stream))
+            {
+                LOG_ERROR("[ModelLoader] Failed to seek to expert slice for: " << tensor_name);
+                return nullptr;
+            }
+
+            raw.resize(slice_bytes);
+            if (!stream->read(reinterpret_cast<char *>(raw.data()), raw.size()))
+            {
+                LOG_ERROR("[ModelLoader] Failed to read expert slice data for: " << tensor_name);
+                return nullptr;
+            }
+        }
+
+        // Create 3D shape for the sliced tensor
+        std::vector<size_t> slice_shape = {ne0, ne1, local_count};
+
+        // Handle weight precision conversion
+        bool should_convert = (weight_precision != WeightPrecision::NATIVE) && info->isQuantized();
+        if (should_convert)
+        {
+            switch (weight_precision)
+            {
+            case WeightPrecision::CONVERT_TO_FP32:
+                return dequantizeToFP32(info, slice_shape, raw);
+            case WeightPrecision::CONVERT_TO_INT8:
+                return dequantizeToINT8(info, slice_shape, raw);
+            default:
+                LOG_WARN("[ModelLoader] Unsupported conversion for expert slice, keeping native");
+                break;
+            }
+        }
+
+        // Create tensor using factory (NUMA-aware) or direct construction
+        std::shared_ptr<TensorBase> tensor;
+        TensorType ttype = ggufToTensorType(info->type);
+
+        if (info->isQuantized())
+        {
+            if (factory_)
+            {
+                tensor = factory_->createQuantized(ttype, slice_shape, raw);
+            }
+            else
+            {
+                // Non-factory path: use the same createTensorFromRawData pattern as WeightManager
+                // This handles all quantized types without a massive switch
+                switch (ttype)
+                {
+                case TensorType::Q4_0: tensor = std::make_shared<Q4_0Tensor>(slice_shape, raw); break;
+                case TensorType::Q4_1: tensor = std::make_shared<Q4_1Tensor>(slice_shape, raw); break;
+                case TensorType::Q5_0: tensor = std::make_shared<Q5_0Tensor>(slice_shape, raw); break;
+                case TensorType::Q5_1: tensor = std::make_shared<Q5_1Tensor>(slice_shape, raw); break;
+                case TensorType::Q8_0: tensor = std::make_shared<Q8_0Tensor>(slice_shape, raw); break;
+                case TensorType::Q2_K: tensor = std::make_shared<Q2_KTensor>(slice_shape, raw); break;
+                case TensorType::Q3_K: tensor = std::make_shared<Q3_KTensor>(slice_shape, raw); break;
+                case TensorType::Q4_K: tensor = std::make_shared<Q4_KTensor>(slice_shape, raw); break;
+                case TensorType::Q5_K: tensor = std::make_shared<Q5_KTensor>(slice_shape, raw); break;
+                case TensorType::Q6_K: tensor = std::make_shared<Q6_KTensor>(slice_shape, raw); break;
+                case TensorType::Q8_K: tensor = std::make_shared<Q8_KTensor>(slice_shape, raw); break;
+                case TensorType::IQ4_NL: tensor = std::make_shared<IQ4_NLTensor>(slice_shape, raw); break;
+                case TensorType::IQ4_XS: tensor = std::make_shared<IQ4_XSTensor>(slice_shape, raw); break;
+                case TensorType::IQ3_S: tensor = std::make_shared<IQ3_STensor>(slice_shape, raw); break;
+                case TensorType::IQ3_XXS: tensor = std::make_shared<IQ3_XXSTensor>(slice_shape, raw); break;
+                case TensorType::IQ2_S: tensor = std::make_shared<IQ2_STensor>(slice_shape, raw); break;
+                case TensorType::IQ2_XS: tensor = std::make_shared<IQ2_XSTensor>(slice_shape, raw); break;
+                case TensorType::IQ2_XXS: tensor = std::make_shared<IQ2_XXSTensor>(slice_shape, raw); break;
+                case TensorType::IQ1_S: tensor = std::make_shared<IQ1_STensor>(slice_shape, raw); break;
+                case TensorType::IQ1_M: tensor = std::make_shared<IQ1_MTensor>(slice_shape, raw); break;
+                default:
+                    LOG_ERROR("[ModelLoader] Unsupported quantized type for expert slicing: " << static_cast<int>(ttype));
+                    return nullptr;
+                }
+            }
+        }
+        else
+        {
+            // Non-quantized: FP32, FP16, BF16
+            switch (info->type)
+            {
+            case GGUFTensorType::F32:
+                if (factory_)
+                {
+                    auto fp32_tensor = factory_->createFP32(slice_shape, device);
+                    TensorFactory::numaMemcpy(fp32_tensor->mutable_data(), raw.data(), raw.size());
+                    tensor = std::move(fp32_tensor);
+                }
+                else
+                {
+                    tensor = std::make_shared<FP32Tensor>(slice_shape);
+                    std::memcpy(tensor->mutable_data(), raw.data(), raw.size());
+                }
+                break;
+            case GGUFTensorType::F16:
+            {
+                std::vector<uint16_t> fp16_data(raw.size() / 2);
+                std::memcpy(fp16_data.data(), raw.data(), raw.size());
+                tensor = factory_ ? factory_->createFP16(slice_shape, fp16_data)
+                                  : std::make_shared<FP16Tensor>(slice_shape, fp16_data);
+                break;
+            }
+            case GGUFTensorType::BF16:
+            {
+                std::vector<uint16_t> bf16_data(raw.size() / 2);
+                std::memcpy(bf16_data.data(), raw.data(), raw.size());
+                tensor = factory_ ? factory_->createBF16(slice_shape, bf16_data)
+                                  : std::make_shared<BF16Tensor>(slice_shape, bf16_data);
+                break;
+            }
+            default:
+                LOG_ERROR("[ModelLoader] Unsupported tensor type for expert slicing: "
+                          << static_cast<int>(info->type));
+                return nullptr;
+            }
         }
 
         return tensor;

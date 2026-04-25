@@ -231,6 +231,18 @@ namespace llaminar2
         void setUseMmap(bool use_mmap) { use_mmap_ = use_mmap; }
 
         /**
+         * @brief Skip page cache eviction during NUMA mmap
+         *
+         * When enabled, MmapRegion::create() will NOT call POSIX_FADV_DONTNEED
+         * before the NUMA first-touch loop. Use this in multi-rank mode after
+         * MmapRegion::prepopulatePageCache() has warmed the page cache, so that
+         * the first-touch loop faults from cache (fast) instead of disk (slow).
+         *
+         * Must be called BEFORE loadModel().
+         */
+        void setSkipMmapCacheEviction(bool skip) { skip_mmap_cache_eviction_ = skip; }
+
+        /**
          * @brief Check if mmap is active (file successfully memory-mapped)
          */
         bool isMmapActive() const { return mmap_region_ != nullptr; }
@@ -356,6 +368,26 @@ namespace llaminar2
          */
         std::shared_ptr<TensorBase> loadTensorColumnSlice(const std::string &tensor_name,
                                                           size_t col_start, size_t col_end,
+                                                          DeviceId device = DeviceId::cpu(),
+                                                          WeightPrecision weight_precision = WeightPrecision::NATIVE) override;
+
+        /**
+         * @brief Load an expert slice of a 3D MoE tensor from GGUF file
+         *
+         * Reads only experts [expert_start, expert_end) from a 3D tensor with shape
+         * [ne0, ne1, num_experts]. Each expert's data is contiguous in memory, so this
+         * reads a single contiguous byte range. Returns a 3D tensor with shape
+         * [ne0, ne1, expert_end - expert_start].
+         *
+         * @param tensor_name Name of tensor (e.g., "blk.0.ffn_gate_exps.weight")
+         * @param expert_start First expert to load (0-indexed)
+         * @param expert_end One past the last expert to load
+         * @param device Device for tensor placement (default: CPU)
+         * @param weight_precision How to load the weight (NATIVE recommended)
+         * @return Tensor with shape [ne0, ne1, local_count] or nullptr on error
+         */
+        std::shared_ptr<TensorBase> loadTensorExpertSlice(const std::string &tensor_name,
+                                                          size_t expert_start, size_t expert_end,
                                                           DeviceId device = DeviceId::cpu(),
                                                           WeightPrecision weight_precision = WeightPrecision::NATIVE) override;
 
@@ -487,6 +519,7 @@ namespace llaminar2
 
         // mmap state (when use_mmap_ is true)
         bool use_mmap_ = true;
+        bool skip_mmap_cache_eviction_ = false;
         std::shared_ptr<MmapRegion> mmap_region_;                     // Main file mmap (shared for zero-copy tensors)
         std::vector<std::shared_ptr<MmapRegion>> split_mmap_regions_; // Split file mmaps
 

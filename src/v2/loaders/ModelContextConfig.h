@@ -44,6 +44,7 @@ namespace llaminar2
         std::shared_ptr<WeightPlacementMap> placement_map;
         TensorFactory *factory = nullptr;
         bool use_mmap = true; ///< Use mmap for file loading (false = ifstream fallback)
+        bool skip_mmap_cache_eviction = false; ///< Skip POSIX_FADV_DONTNEED in NUMA mmap (set when page cache pre-warmed)
 
         // Factory Helpers
         static ModelContextConfig defaults();

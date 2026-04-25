@@ -12,8 +12,10 @@
 #include "UPIBackend.h"
 #include "../../utils/Logger.h"
 #include "../../utils/NodeTopology.h"
+#include <cstring>
 #include <fstream>
 #include <sstream>
+#include <vector>
 
 namespace llaminar2
 {
@@ -135,6 +137,14 @@ namespace llaminar2
         {
             last_error_ = "UPI backend not initialized";
             return false;
+        }
+
+        // FP16/BF16 reductions require special handling — MPI has no native
+        // half-precision reduction ops. Use allgather + local FP32 reduce.
+        if ((dtype == CollectiveDataType::FLOAT16 || dtype == CollectiveDataType::BFLOAT16) &&
+            (op == CollectiveOp::ALLREDUCE_SUM || op == CollectiveOp::ALLREDUCE_MAX || op == CollectiveOp::ALLREDUCE_MIN))
+        {
+            return allreduceHalfPrecision(buffer, count, dtype, op);
         }
 
         MPI_Datatype mpi_dtype = toMPIDatatype(dtype);
@@ -391,6 +401,179 @@ namespace llaminar2
             // (caller should not use reduction op for non-reduction collectives)
             return MPI_SUM;
         }
+    }
+
+    // =========================================================================
+    // Half-Precision Allreduce (allgather + local FP32 reduce)
+    // =========================================================================
+
+    namespace
+    {
+        // BF16 ↔ FP32: upper 16 bits of IEEE-754 float
+        inline float upi_bf16_to_float(uint16_t bf)
+        {
+            uint32_t f = static_cast<uint32_t>(bf) << 16;
+            float result;
+            std::memcpy(&result, &f, sizeof(float));
+            return result;
+        }
+
+        inline uint16_t upi_float_to_bf16(float val)
+        {
+            uint32_t bits;
+            std::memcpy(&bits, &val, sizeof(float));
+            return static_cast<uint16_t>(bits >> 16); // truncation
+        }
+
+        // FP16 ↔ FP32: software IEEE-754 half-precision
+        inline float upi_fp16_to_float(uint16_t h)
+        {
+            uint32_t sign = static_cast<uint32_t>(h >> 15) << 31;
+            uint32_t exp = (h >> 10) & 0x1Fu;
+            uint32_t mant = h & 0x3FFu;
+            uint32_t f;
+
+            if (exp == 0)
+            {
+                if (mant == 0)
+                    f = sign;
+                else
+                {
+                    exp = 1;
+                    while (!(mant & 0x400u))
+                    {
+                        mant <<= 1;
+                        exp--;
+                    }
+                    mant &= 0x3FFu;
+                    f = sign | ((exp + 127u - 15u) << 23) | (mant << 13);
+                }
+            }
+            else if (exp == 31)
+                f = sign | 0x7F800000u | (mant << 13);
+            else
+                f = sign | ((exp + 127u - 15u) << 23) | (mant << 13);
+
+            float result;
+            std::memcpy(&result, &f, sizeof(float));
+            return result;
+        }
+
+        inline uint16_t upi_float_to_fp16(float val)
+        {
+            uint32_t bits;
+            std::memcpy(&bits, &val, sizeof(float));
+            uint32_t sign = (bits >> 16) & 0x8000u;
+            int32_t exp = static_cast<int32_t>((bits >> 23) & 0xFFu) - 127 + 15;
+            uint32_t mant = bits & 0x7FFFFFu;
+
+            if (exp <= 0)
+            {
+                if (exp < -10)
+                    return static_cast<uint16_t>(sign);
+                mant |= 0x800000u;
+                uint32_t shift = static_cast<uint32_t>(1 - exp + 13);
+                uint32_t round_bit = 1u << (shift - 1);
+                uint32_t remainder = mant & ((1u << shift) - 1);
+                mant >>= shift;
+                if (remainder > round_bit || (remainder == round_bit && (mant & 1)))
+                    mant++;
+                return static_cast<uint16_t>(sign | mant);
+            }
+            else if (exp >= 31)
+            {
+                if (exp == (0xFF - 127 + 15) && mant)
+                    return static_cast<uint16_t>(sign | 0x7C00u | (mant >> 13));
+                return static_cast<uint16_t>(sign | 0x7C00u);
+            }
+
+            uint32_t round_bit = 1u << 12;
+            uint32_t remainder = mant & 0x1FFFu;
+            mant >>= 13;
+            if (remainder > round_bit || (remainder == round_bit && (mant & 1)))
+                mant++;
+            if (mant >= 0x400u)
+            {
+                mant = 0;
+                exp++;
+                if (exp >= 31)
+                    return static_cast<uint16_t>(sign | 0x7C00u);
+            }
+            return static_cast<uint16_t>(sign | (static_cast<uint32_t>(exp) << 10) | mant);
+        }
+    } // anonymous namespace
+
+    bool UPICollectiveBackend::allreduceHalfPrecision(
+        void *buffer, size_t count, CollectiveDataType dtype, CollectiveOp op)
+    {
+        // Step 1: Allgather raw half-precision data from all ranks
+        // (MPI_Allgather with MPI_UINT16_T is safe — just raw byte transport)
+        std::vector<uint16_t> gathered(count * static_cast<size_t>(domain_size_));
+
+        int result = MPI_Allgather(
+            buffer,
+            static_cast<int>(count),
+            MPI_UINT16_T,
+            gathered.data(),
+            static_cast<int>(count),
+            MPI_UINT16_T,
+            domain_comm_);
+
+        if (result != MPI_SUCCESS)
+        {
+            last_error_ = "MPI_Allgather (half-precision allreduce) failed with code " + std::to_string(result);
+            LOG_ERROR("UPICollectiveBackend::allreduceHalfPrecision - " << last_error_);
+            return false;
+        }
+
+        // Step 2: Local reduce in FP32 for precision
+        auto *out = static_cast<uint16_t *>(buffer);
+        const bool is_bf16 = (dtype == CollectiveDataType::BFLOAT16);
+
+        // Convert first rank's data to FP32 accumulator
+        std::vector<float> acc(count);
+        const uint16_t *rank0 = gathered.data();
+        for (size_t i = 0; i < count; ++i)
+        {
+            acc[i] = is_bf16 ? upi_bf16_to_float(rank0[i]) : upi_fp16_to_float(rank0[i]);
+        }
+
+        // Accumulate remaining ranks in FP32
+        for (int r = 1; r < domain_size_; ++r)
+        {
+            const uint16_t *rank_data = gathered.data() + static_cast<size_t>(r) * count;
+            if (op == CollectiveOp::ALLREDUCE_SUM)
+            {
+                for (size_t i = 0; i < count; ++i)
+                    acc[i] += is_bf16 ? upi_bf16_to_float(rank_data[i]) : upi_fp16_to_float(rank_data[i]);
+            }
+            else if (op == CollectiveOp::ALLREDUCE_MAX)
+            {
+                for (size_t i = 0; i < count; ++i)
+                {
+                    float v = is_bf16 ? upi_bf16_to_float(rank_data[i]) : upi_fp16_to_float(rank_data[i]);
+                    if (v > acc[i])
+                        acc[i] = v;
+                }
+            }
+            else if (op == CollectiveOp::ALLREDUCE_MIN)
+            {
+                for (size_t i = 0; i < count; ++i)
+                {
+                    float v = is_bf16 ? upi_bf16_to_float(rank_data[i]) : upi_fp16_to_float(rank_data[i]);
+                    if (v < acc[i])
+                        acc[i] = v;
+                }
+            }
+        }
+
+        // Step 3: Convert FP32 accumulator back to half-precision
+        for (size_t i = 0; i < count; ++i)
+        {
+            out[i] = is_bf16 ? upi_float_to_bf16(acc[i]) : upi_float_to_fp16(acc[i]);
+        }
+
+        return true;
     }
 
     float UPICollectiveBackend::estimateBandwidth(const NodeTopology *topology)

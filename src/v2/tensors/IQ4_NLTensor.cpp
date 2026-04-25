@@ -109,6 +109,12 @@ namespace llaminar2
         {
             LOG_DEBUG("[IQ4_NLTensor] TODO: Free device blocks in destructor");
         }
+
+        // Pre-destroy heap vectors to avoid glibc free(): invalid pointer crash
+        // during implicit member destruction of large 3D MoE expert weight tensors.
+        // See Q4_KTensor teardown investigation for details.
+        { std::vector<uint8_t>().swap(raw_data_); }
+        { std::vector<size_t>().swap(shape_); }
     }
 
     // ========== View Support ==========

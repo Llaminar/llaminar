@@ -496,10 +496,14 @@ namespace llaminar2
         params.expert_down_views.resize(num_experts);
 
         // Extract 2D views for each expert.
-        // GGUF 3D: shape = [ne[0], ne[1], ne[2]] = [cols, rows, num_experts]
-        // Each expert's 2D slice is [rows, cols] at element offset = expert_id * rows * cols.
-        // create_view() handles 3D→2D slicing internally.
-        // With EP, only local experts get populated; remote experts stay nullptr.
+        // GGUF 3D: shape = [ne[0], ne[1], ne[2]] = [cols, rows, num_experts_in_tensor]
+        // Each expert's 2D slice is [rows, cols] at element offset within the tensor.
+        //
+        // With expert-parallel weight sharding, the 3D tensor may contain only
+        // local experts (shape[2] == local_count) instead of all experts.
+        // In that case, global expert index `e` maps to local tensor index
+        // `e - local_start`. When the tensor has all experts (shape[2] == num_experts),
+        // the offset uses the global index directly.
         auto extract_views = [local_start, local_end](
                                  TensorBase *tensor_3d, int n_experts,
                                  std::vector<std::shared_ptr<TensorBase>> &views) -> bool
@@ -511,10 +515,15 @@ namespace llaminar2
                 return false;
             }
 
-            // GGUF 3D: shape[0]=ne[0]=cols (fastest), shape[1]=ne[1]=rows, shape[2]=ne[2]=experts (slowest)
+            // GGUF 3D: shape[0]=ne[0]=cols (fastest), shape[1]=ne[1]=rows, shape[2]=experts in tensor
             size_t cols = shape[0];
             size_t rows = shape[1];
+            size_t tensor_expert_count = shape[2];
             size_t elements_per_expert = rows * cols;
+
+            // Determine if the tensor was pre-sliced (expert-parallel sharding)
+            // or contains all experts (replicated mode).
+            const bool is_presliced = (static_cast<int>(tensor_expert_count) != n_experts);
 
             for (int e = 0; e < n_experts; ++e)
             {
@@ -522,12 +531,18 @@ namespace llaminar2
                 if (e < local_start || e >= local_end)
                     continue;
 
-                size_t element_offset = static_cast<size_t>(e) * elements_per_expert;
+                // For pre-sliced tensors: local expert `e` is at tensor index `e - local_start`
+                // For full tensors: expert `e` is at tensor index `e`
+                size_t tensor_idx = is_presliced ? static_cast<size_t>(e - local_start)
+                                                 : static_cast<size_t>(e);
+                size_t element_offset = tensor_idx * elements_per_expert;
+
                 std::vector<size_t> view_shape = {rows, cols};
                 auto view = tensor_3d->create_view(view_shape, element_offset);
                 if (!view)
                 {
-                    LOG_ERROR("[MoE] Failed to create view for expert " << e);
+                    LOG_ERROR("[MoE] Failed to create view for expert " << e
+                              << " (tensor_idx=" << tensor_idx << ")");
                     return false;
                 }
                 views[e] = std::move(view);
@@ -641,13 +656,15 @@ namespace llaminar2
         // The VNNI interleaved engines now own their own copy — the original
         // mmap data is never accessed again. Releasing per-layer reduces peak RSS
         // by ~500 MB/layer instead of waiting for a bulk release at the end.
+        // NOTE: Only safe for mmap-backed tensors. Expert-parallel sliced tensors
+        // are heap-allocated copies — MADV_DONTNEED on heap memory corrupts malloc metadata.
         {
             size_t released = 0;
-            if (params.gate_exps)
+            if (params.gate_exps && params.gate_exps->is_mmap_data())
                 released += MmapRegion::adviseDontneedRange(params.gate_exps->raw_data(), params.gate_exps->size_bytes());
-            if (params.up_exps)
+            if (params.up_exps && params.up_exps->is_mmap_data())
                 released += MmapRegion::adviseDontneedRange(params.up_exps->raw_data(), params.up_exps->size_bytes());
-            if (params.down_exps)
+            if (params.down_exps && params.down_exps->is_mmap_data())
                 released += MmapRegion::adviseDontneedRange(params.down_exps->raw_data(), params.down_exps->size_bytes());
             if (released > 0)
                 LOG_DEBUG("[MoEFFNStage] Advised " << (released >> 20) << " MB of mmap pages DONTNEED after engine packing");
@@ -1019,14 +1036,15 @@ namespace llaminar2
         LOG_INFO("[MoEFFNStage] All " << (num_experts * 3)
                  << " expert GEMM engines prepared (CUDA batch path, 3 GPU allocs)");
 
-        // Release mmap pages for raw expert weights (now uploaded to GPU)
+        // Release mmap pages for raw expert weights (now uploaded to GPU).
+        // Only safe for mmap-backed tensors — EP-sliced tensors are heap-allocated.
         {
             size_t released = 0;
-            if (params.gate_exps)
+            if (params.gate_exps && params.gate_exps->is_mmap_data())
                 released += MmapRegion::adviseDontneedRange(params.gate_exps->raw_data(), params.gate_exps->size_bytes());
-            if (params.up_exps)
+            if (params.up_exps && params.up_exps->is_mmap_data())
                 released += MmapRegion::adviseDontneedRange(params.up_exps->raw_data(), params.up_exps->size_bytes());
-            if (params.down_exps)
+            if (params.down_exps && params.down_exps->is_mmap_data())
                 released += MmapRegion::adviseDontneedRange(params.down_exps->raw_data(), params.down_exps->size_bytes());
             if (released > 0)
                 LOG_DEBUG("[MoEFFNStage] Advised " << (released >> 20) << " MB of mmap pages DONTNEED after CUDA packing");
@@ -1098,14 +1116,15 @@ namespace llaminar2
         LOG_INFO("[MoEFFNStage] All " << (num_experts * 3)
                  << " expert GEMM engines prepared (ROCm batch path, 3 GPU allocs)");
 
-        // Release mmap pages for raw expert weights (now uploaded to GPU)
+        // Release mmap pages for raw expert weights (now uploaded to GPU).
+        // Only safe for mmap-backed tensors — EP-sliced tensors are heap-allocated.
         {
             size_t released = 0;
-            if (params.gate_exps)
+            if (params.gate_exps && params.gate_exps->is_mmap_data())
                 released += MmapRegion::adviseDontneedRange(params.gate_exps->raw_data(), params.gate_exps->size_bytes());
-            if (params.up_exps)
+            if (params.up_exps && params.up_exps->is_mmap_data())
                 released += MmapRegion::adviseDontneedRange(params.up_exps->raw_data(), params.up_exps->size_bytes());
-            if (params.down_exps)
+            if (params.down_exps && params.down_exps->is_mmap_data())
                 released += MmapRegion::adviseDontneedRange(params.down_exps->raw_data(), params.down_exps->size_bytes());
             if (released > 0)
                 LOG_DEBUG("[MoEFFNStage] Advised " << (released >> 20) << " MB of mmap pages DONTNEED after ROCm packing");

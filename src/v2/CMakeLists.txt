@@ -1379,6 +1379,7 @@ add_library(llaminar2_core STATIC
     # NOTE: RCCLBackend.cpp is NOT here - it's in rocm_backend to isolate RCCL symbols
     # from NCCL. Both export the same symbols (ncclCommInitRank, etc.) and would conflict.
     collective/backends/UPIBackend.cpp
+    collective/backends/ShmemSpinBackend.cpp
     execution/local_execution/collective/CollectiveContext.cpp
     # NUMA-aware memory allocation
     memory/NUMAAllocator.cpp

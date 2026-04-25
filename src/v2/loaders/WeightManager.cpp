@@ -303,6 +303,8 @@ namespace llaminar2
             return ShardingMode::ROW_PARALLEL;
         case WeightShardingMode::InputParallel:
             return ShardingMode::INPUT_PARALLEL;
+        case WeightShardingMode::ExpertParallel:
+            return ShardingMode::EXPERT_PARALLEL;
         case WeightShardingMode::Replicate:
         default:
             return ShardingMode::REPLICATE;
@@ -1124,6 +1126,73 @@ namespace llaminar2
             auto slice = std::make_shared<TensorSlice>(std::move(slice_tensor), meta);
             return slice;
         }
+        else if (mode == ShardingMode::EXPERT_PARALLEL)
+        {
+            // Expert-parallel: split the EXPERT dimension of 3D MoE weight tensors
+            //
+            // Expert weights are stored as 3D tensors [ne0, ne1, num_experts] where:
+            //   ne0 = columns (fastest varying)
+            //   ne1 = rows per expert
+            //   ne2 = num_experts (slowest varying)
+            //
+            // Each rank loads only its assigned expert subset:
+            //   expert_start = rank * experts_per_rank
+            //   expert_count = experts_per_rank (or remainder for last rank)
+            //
+            // The resulting tensor has shape [ne0, ne1, local_count] and contains
+            // only the local expert data. extractExpertViews() must account for
+            // the reduced expert count when creating 2D views.
+
+            int rank = mpi_ctx_->rank();
+            int world_size = mpi_ctx_->world_size();
+
+            auto dims_opt = loader_.getTensorShape(name);
+            if (!dims_opt || dims_opt->empty())
+            {
+                LOG_DEBUG("[WeightManager] Tensor not in GGUF for expert-parallel: " << name);
+                return nullptr;
+            }
+            if (dims_opt->size() != 3)
+            {
+                throw std::runtime_error("[WeightManager] Expert-parallel requires 3D tensor, got " +
+                                         std::to_string(dims_opt->size()) + "D for: " + name);
+            }
+            const auto &dims = *dims_opt;
+            size_t ne0 = dims[0]; // cols
+            size_t ne1 = dims[1]; // rows per expert
+            size_t ne2 = dims[2]; // num_experts
+
+            // Equal split of experts across ranks
+            size_t experts_per_rank = ne2 / world_size;
+            size_t expert_start = experts_per_rank * rank;
+            size_t expert_count = (rank == world_size - 1) ? (ne2 - expert_start) : experts_per_rank;
+            size_t expert_end = expert_start + expert_count;
+
+            if (experts_per_rank == 0)
+            {
+                throw std::runtime_error("[WeightManager] Cannot shard " + std::to_string(ne2) +
+                                         " experts across " + std::to_string(world_size) +
+                                         " ranks for: " + name);
+            }
+
+            auto slice_tensor = loader_.loadTensorExpertSlice(
+                name, expert_start, expert_end, device, WeightPrecision::NATIVE);
+
+            if (!slice_tensor)
+            {
+                throw std::runtime_error("[WeightManager] Rank " + std::to_string(rank) +
+                                         " failed to load expert slice for: " + name);
+            }
+
+            LOG_INFO("[WeightManager] Rank " << rank << " expert-parallel " << name
+                                             << " [" << ne0 << ", " << ne1 << ", " << ne2
+                                             << "] -> loaded ONLY experts [" << expert_start << ", " << expert_end
+                                             << ") = " << expert_count << "/" << ne2 << " experts");
+
+            // Return the sliced 3D tensor directly (no TensorSlice wrapping needed —
+            // expert parallelism uses allreduce on the MoE output, not on weights)
+            return slice_tensor;
+        }
 
         throw std::runtime_error("[WeightManager] Unknown sharding mode for: " + name);
     }
@@ -1260,6 +1329,14 @@ namespace llaminar2
                                                           << ": tail " << (fraction * 100) << "% cols -> ["
                                                           << decode_shard->shape()[0] << ", "
                                                           << decode_shard->shape()[1] << "]");
+            break;
+        }
+
+        case ShardingMode::EXPERT_PARALLEL:
+        {
+            // Expert-parallel weights are 3D MoE tensors — decode sharding
+            // not applicable. Return the full tensor as-is.
+            decode_shard = full_tensor;
             break;
         }
 
@@ -3862,6 +3939,53 @@ namespace llaminar2
                 throw std::runtime_error("[WeightManager] Invalid tensor for input-parallel (expected 2D): " + name);
             }
             result = loadInputParallelWeight(name, device, assignment, *dims_opt);
+            break;
+        }
+
+        case ShardingMode::EXPERT_PARALLEL:
+        {
+            // Expert-parallel for LOCAL TP: split 3D expert tensors across local devices
+            auto dims_opt = loader_.getTensorShape(name);
+            if (!dims_opt || dims_opt->empty())
+            {
+                LOG_DEBUG("[WeightManager] Tensor not in GGUF for expert-parallel: " << name);
+                return nullptr;
+            }
+            if (dims_opt->size() != 3)
+            {
+                throw std::runtime_error("[WeightManager] Expert-parallel requires 3D tensor, got " +
+                                         std::to_string(dims_opt->size()) + "D for: " + name);
+            }
+            const auto &dims = *dims_opt;
+            size_t ne2 = dims[2]; // num_experts
+            int local_ws = tp_config_->worldSize();
+            size_t experts_per_rank = ne2 / local_ws;
+            size_t expert_start = experts_per_rank * assignment.local_rank;
+            size_t expert_count = (assignment.local_rank == local_ws - 1)
+                                      ? (ne2 - expert_start)
+                                      : experts_per_rank;
+
+            if (experts_per_rank == 0)
+            {
+                throw std::runtime_error("[WeightManager] Cannot shard " + std::to_string(ne2) +
+                                         " experts across " + std::to_string(local_ws) +
+                                         " devices for: " + name);
+            }
+
+            result = loader_.loadTensorExpertSlice(
+                name, expert_start, expert_start + expert_count, device, WeightPrecision::NATIVE);
+
+            if (!result)
+            {
+                throw std::runtime_error("[WeightManager] Failed to load expert slice for: " + name);
+            }
+
+            LOG_INFO("[WeightManager] Device " << device.to_string()
+                                               << " expert-parallel " << name
+                                               << " [" << dims[0] << ", " << dims[1] << ", " << ne2
+                                               << "] -> experts [" << expert_start << ", "
+                                               << (expert_start + expert_count) << ") = "
+                                               << expert_count << "/" << ne2);
             break;
         }
 

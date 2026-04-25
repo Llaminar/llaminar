@@ -318,6 +318,15 @@ namespace llaminar2
         mutable std::string last_error_; ///< Last error message
 
         /**
+         * @brief Half-precision allreduce via allgather + local FP32 reduce
+         *
+         * MPI has no native FP16/BF16 reduction support, so we allgather
+         * the raw half-precision data and reduce locally in FP32.
+         */
+        bool allreduceHalfPrecision(void *buffer, size_t count,
+                                    CollectiveDataType dtype, CollectiveOp op);
+
+        /**
          * @brief Estimate UPI/IF bandwidth based on topology
          * @param topology System topology (may be nullptr)
          * @return Estimated bandwidth in GB/s

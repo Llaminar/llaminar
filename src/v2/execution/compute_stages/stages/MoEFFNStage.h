@@ -110,6 +110,14 @@ namespace llaminar2
         ComputeStageType type() const override { return ComputeStageType::MOE_EXPERT_FFN; }
         std::string name() const override { return "moe_ffn"; }
         size_t estimatedFlops() const override;
+
+        /// In expert-parallel mode, a rank's MoE FFN output can be all zeros
+        /// when no selected experts fall in its local range. The downstream
+        /// AllReduce combines partial results across ranks.
+        bool allowsZeroOutput() const override
+        {
+            return params_.local_expert_count >= 0;
+        }
         bool supportsBackend(ComputeBackendType backend) const override;
         StageBufferRequirements getBufferRequirements() const override;
         StageDumpInfo buildDumpInfoImpl() const override;

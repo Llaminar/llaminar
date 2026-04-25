@@ -930,7 +930,9 @@ namespace llaminar2
         // Drain the RCCL coordinator pool after all backends are destroyed.
         // This ensures ncclCommDestroy only happens once at process shutdown,
         // avoiding the ROCm CLR state accumulation bug from repeated cycles.
+#ifdef HAVE_RCCL
         RCCLBackend::drainCoordinatorPool();
+#endif
     }
 
     // =========================================================================

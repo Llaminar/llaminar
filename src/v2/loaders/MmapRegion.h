@@ -17,8 +17,10 @@
  */
 
 #include "../utils/Logger.h"
+#include <chrono>
 #include <cstdint>
 #include <cstddef>
+#include <iomanip>
 #include <memory>
 #include <string>
 
@@ -180,18 +182,93 @@ namespace llaminar2
         }
 
         /**
+         * @brief Pre-populate the OS page cache for a file using sequential I/O
+         *
+         * Reads the file sequentially with large buffers to warm the page cache
+         * at full disk bandwidth. Call this on a single rank before multi-rank
+         * mmap to avoid each rank independently thrashing the disk.
+         *
+         * @param file_path Path to the file
+         * @return true if successful, false on error
+         */
+        static bool prepopulatePageCache(const std::string &file_path)
+        {
+#ifdef __linux__
+            int fd = ::open(file_path.c_str(), O_RDONLY);
+            if (fd < 0)
+            {
+                LOG_WARN("[MmapRegion] prepopulatePageCache: failed to open " << file_path);
+                return false;
+            }
+
+            struct stat st;
+            if (::fstat(fd, &st) != 0)
+            {
+                ::close(fd);
+                return false;
+            }
+            const size_t file_size = static_cast<size_t>(st.st_size);
+
+            // Use large sequential reads for maximum disk throughput.
+            // 8MB buffer aligns with typical SSD/NVMe command queue depth.
+            ::posix_fadvise(fd, 0, file_size, POSIX_FADV_SEQUENTIAL);
+
+            constexpr size_t BUF_SIZE = 8 * 1024 * 1024; // 8 MB
+            // Use mmap for the read buffer to avoid stack overflow and get page-aligned memory
+            void *buf = ::mmap(nullptr, BUF_SIZE, PROT_READ | PROT_WRITE,
+                               MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if (buf == MAP_FAILED)
+            {
+                ::close(fd);
+                return false;
+            }
+
+            size_t total_read = 0;
+            auto start = std::chrono::steady_clock::now();
+            while (total_read < file_size)
+            {
+                size_t to_read = std::min(BUF_SIZE, file_size - total_read);
+                ssize_t n = ::read(fd, buf, to_read);
+                if (n <= 0)
+                    break;
+                total_read += static_cast<size_t>(n);
+            }
+            auto elapsed = std::chrono::steady_clock::now() - start;
+            double secs = std::chrono::duration<double>(elapsed).count();
+            double mbps = (total_read / (1024.0 * 1024.0)) / (secs > 0 ? secs : 1e-9);
+
+            ::munmap(buf, BUF_SIZE);
+            ::close(fd);
+
+            LOG_INFO("[MmapRegion] Page cache pre-populated: " << file_path
+                                                               << " (" << (total_read / (1024 * 1024)) << " MB in "
+                                                               << std::fixed << std::setprecision(1) << secs << "s, "
+                                                               << std::fixed << std::setprecision(0) << mbps << " MB/s)");
+            return total_read == file_size;
+#else
+            (void)file_path;
+            return false;
+#endif
+        }
+
+        /**
          * @brief Create an MmapRegion by memory-mapping an entire file
          *
          * When numa_node >= 0, uses mbind(MPOL_BIND) to ensure pages are allocated
-         * on the specified NUMA node, then madvise(MADV_WILLNEED) to pre-fault.
+         * on the specified NUMA node, then parallel first-touch to pre-fault.
          * When numa_node < 0, uses MAP_POPULATE for immediate pre-faulting (default
          * NUMA policy applies — pages land on the calling CPU's local node).
          *
          * @param file_path Path to the file to map
          * @param numa_node Target NUMA node for page placement (-1 = default)
+         * @param skip_cache_eviction When true, skip POSIX_FADV_DONTNEED before NUMA
+         *        mmap. Set this when the page cache has been pre-populated by
+         *        prepopulatePageCache() — the first-touch loop will fault from the
+         *        warm page cache instead of disk, giving ~10× faster loading.
          * @return Unique pointer to MmapRegion, or nullptr on failure
          */
-        static std::unique_ptr<MmapRegion> create(const std::string &file_path, int numa_node = -1)
+        static std::unique_ptr<MmapRegion> create(const std::string &file_path, int numa_node = -1,
+                                                   bool skip_cache_eviction = false)
         {
 #ifdef __linux__
             // Open file read-only
@@ -221,12 +298,18 @@ namespace llaminar2
 
             const bool numa_bind = (numa_node >= 0);
 
-            if (numa_bind)
+            if (numa_bind && !skip_cache_eviction)
             {
                 // Evict any stale page-cache pages for this file so that our
                 // first-touch loop below allocates fresh pages on the target
                 // NUMA node. Without this, cached pages from a prior run (or
                 // another process) may reside on the wrong node.
+                //
+                // SKIP this in multi-rank mode (skip_cache_eviction=true):
+                // prepopulatePageCache() has already warmed the cache, and
+                // evicting it would force re-reading from disk via the OMP
+                // parallel first-touch loop, which creates N concurrent page
+                // fault streams that destroy disk readahead throughput.
                 ::posix_fadvise(fd, 0, file_size, POSIX_FADV_DONTNEED);
             }
 
@@ -300,7 +383,9 @@ namespace llaminar2
 
                 LOG_DEBUG("[MmapRegion] Mapped " << file_path << " (" << (file_size / (1024 * 1024))
                                                  << " MB) with NUMA first-touch on node " << numa_node
-                                                 << " (" << num_pages << " pages, THP requested)");
+                                                 << " (" << num_pages << " pages"
+                                                 << (skip_cache_eviction ? ", cache-warm" : ", cold")
+                                                 << ", THP requested)");
             }
             else
             {
@@ -313,6 +398,7 @@ namespace llaminar2
             return std::unique_ptr<MmapRegion>(new MmapRegion(base, file_size, fd, file_path));
 #else
             (void)numa_node;
+            (void)skip_cache_eviction;
             LOG_WARN("[MmapRegion] mmap not supported on this platform, falling back to ifstream");
             return nullptr;
 #endif

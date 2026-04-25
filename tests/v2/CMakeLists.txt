@@ -9592,3 +9592,33 @@ add_v2_test(V2_Unit_MoEFFNStage
     LABELS "V2;Unit;MoE;Stages;Kernels;Q4_K;Q5_K"
     MPI_PROCS 1
 )
+
+# =============================================================================
+# Collective Backend Tests
+# =============================================================================
+
+# Test: ShmemSpinBackend — Shared-memory spin-wait allreduce for 2-rank intra-node CPU TP
+# Single-process: arena layout, fast-path detection, identity checks
+# Two-process: allreduce correctness, repeated allreduce, boundary counts, fallback delegation, stress
+add_executable(v2_test_shmem_spin_backend unit/collective/Test__ShmemSpinBackend.cpp)
+target_include_directories(v2_test_shmem_spin_backend PRIVATE ${CMAKE_SOURCE_DIR})
+target_link_libraries(v2_test_shmem_spin_backend
+    llaminar2_core
+    GTest::gtest
+    MPI::MPI_CXX
+)
+add_v2_test(V2_Unit_ShmemSpinBackend
+    COMMAND $<TARGET_FILE:v2_test_shmem_spin_backend>
+    LABELS "V2;Unit;Collective;ShmemSpin;Allreduce"
+    MPI_PROCS 2
+)
+add_v2_test(V2_Unit_ShmemSpinBackend_NP4
+    COMMAND $<TARGET_FILE:v2_test_shmem_spin_backend>
+    LABELS "V2;Unit;Collective;ShmemSpin;Allreduce"
+    MPI_PROCS 4
+)
+add_v2_test(V2_Unit_ShmemSpinBackend_NP8
+    COMMAND $<TARGET_FILE:v2_test_shmem_spin_backend>
+    LABELS "V2;Unit;Collective;ShmemSpin;Allreduce"
+    MPI_PROCS 8
+)

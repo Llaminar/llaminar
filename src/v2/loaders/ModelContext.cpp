@@ -53,6 +53,15 @@ namespace llaminar2
             return loader_.loadTensorColumnSlice(name, col_start, col_end, device, weight_precision);
         }
 
+        std::shared_ptr<TensorBase> loadTensorExpertSlice(
+            const std::string &name,
+            size_t expert_start, size_t expert_end,
+            DeviceId device,
+            WeightPrecision weight_precision) override
+        {
+            return loader_.loadTensorExpertSlice(name, expert_start, expert_end, device, weight_precision);
+        }
+
         bool hasTensor(const std::string &name) const override { return loader_.hasTensor(name); }
         std::vector<std::string> tensorNames() const override { return loader_.tensorNames(); }
         std::string architecture() const override { return loader_.architecture(); }
@@ -198,6 +207,7 @@ namespace llaminar2
 
         // Configure mmap before loading (must precede loadModel)
         ctx->loader_.setUseMmap(config.use_mmap);
+        ctx->loader_.setSkipMmapCacheEviction(config.skip_mmap_cache_eviction);
 
         // Load model metadata
         try

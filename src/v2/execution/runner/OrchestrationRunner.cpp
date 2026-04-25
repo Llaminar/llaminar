@@ -20,6 +20,7 @@
 #include "../../loaders/ModelContext.h"
 #include "../../loaders/ModelContextConfig.h"
 #include "../../loaders/ModelLoader.h"
+#include "../../loaders/MmapRegion.h"
 #include "../local_execution/graph/SchemaFactoryRegistry.h"
 #include "../../backends/ComputeBackend.h"
 #include "../../planning/ClusterInventoryGatherer.h"
@@ -776,6 +777,26 @@ namespace llaminar2
         weight_config.mpi_ctx = mpi_ctx_;
         weight_config.weight_precision = WeightPrecision::NATIVE;
         weight_config.use_mmap = config_.use_mmap;
+
+        // Multi-rank page cache pre-population:
+        // In multi-rank mode, each rank independently mmaps and first-touches the
+        // same file. Without coordination, this creates N concurrent page fault
+        // streams that destroy disk readahead and cause ~60 MB/s throughput
+        // instead of ~1 GB/s. Fix: rank 0 reads the file sequentially to warm the
+        // page cache, then all ranks skip POSIX_FADV_DONTNEED so the OMP
+        // first-touch loop faults from cache (memory speed) instead of disk.
+        const bool is_multi_rank = mpi_ctx_ && mpi_ctx_->world_size() > 1;
+        if (is_multi_rank && config_.use_mmap)
+        {
+            if (mpi_ctx_->rank() == 0)
+            {
+                LOG_INFO("Pre-populating page cache for multi-rank mmap...");
+                MmapRegion::prepopulatePageCache(model_path);
+            }
+            // Barrier: all ranks wait for rank 0 to finish populating page cache
+            MPI_Barrier(mpi_ctx_->communicator());
+            weight_config.skip_mmap_cache_eviction = true;
+        }
 
         // Validate config
         auto errors = weight_config.validate();

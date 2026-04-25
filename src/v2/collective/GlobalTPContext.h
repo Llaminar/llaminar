@@ -12,6 +12,7 @@
 #pragma once
 
 #include "IGlobalTPContext.h"
+#include "ICollectiveBackend.h"
 #include "backends/UPIBackend.h"
 #include "config/OrchestrationConfig.h" // For CollectiveBackendType
 #include <memory>
@@ -209,7 +210,7 @@ namespace llaminar2
         int node_count_;                                ///< Cached: number of distinct nodes
         bool owns_communicator_;                        ///< Whether we created the communicator
         CollectiveBackendType backend_type_;            ///< Backend type for this context
-        std::unique_ptr<UPICollectiveBackend> backend_; ///< Backend for collective operations
+        std::unique_ptr<ICollectiveBackend> backend_;   ///< Backend for collective operations (ShmemSpin or UPI)
     };
 
 } // namespace llaminar2

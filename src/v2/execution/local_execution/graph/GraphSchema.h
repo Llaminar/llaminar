@@ -352,10 +352,11 @@ namespace llaminar2
      */
     enum class WeightShardingMode
     {
-        Replicate,      ///< Full copy on each rank (norms, biases, embeddings)
-        ColumnParallel, ///< Split output dimension (rows of weight) - QKV, Gate/Up, LM head
-        RowParallel,    ///< Split output dimension + allreduce - Wo projection
-        InputParallel   ///< Split input dimension (columns of weight) + allreduce - Down proj
+        Replicate,       ///< Full copy on each rank (norms, biases, embeddings)
+        ColumnParallel,  ///< Split output dimension (rows of weight) - QKV, Gate/Up, LM head
+        RowParallel,     ///< Split output dimension + allreduce - Wo projection
+        InputParallel,   ///< Split input dimension (columns of weight) + allreduce - Down proj
+        ExpertParallel   ///< Split expert dimension of 3D MoE tensors across ranks
     };
 
     /**

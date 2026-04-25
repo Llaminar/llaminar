@@ -11,6 +11,7 @@
 
 #include "GlobalTPContext.h"
 #include "DeviceGroup.h"
+#include "backends/ShmemSpinBackend.h"
 #include "../config/TPDomain.h"
 #include "../tensors/Tensors.h"
 #include "../utils/Logger.h"
@@ -57,12 +58,12 @@ namespace llaminar2
             node_count_ = domain_size_;
             all_same_node_ = (domain_size_ <= 1);
         }
-        // Create UPI backend for collective operations
+        // Create collective backend
+        // Fast path: 2-rank intra-node → ShmemSpinBackend (shared-memory spin-wait)
+        // Fallback:  UPICollectiveBackend (MPI) for all other topologies
         if (domain_comm_ != MPI_COMM_NULL)
         {
-            backend_ = std::make_unique<UPICollectiveBackend>(domain_comm_, nullptr);
-
-            // Initialize the backend with a minimal device group for CPU TP
+            // Build the device group (needed by both backends)
             DeviceGroup group;
             group.name = "global_tp_domain_" + std::to_string(domain_id);
             group.scope = CollectiveScope::LOCAL; // Cross-socket on same node
@@ -70,14 +71,40 @@ namespace llaminar2
             {
                 group.devices.push_back(DeviceId::cpu());
             }
-            backend_->initialize(group);
+
+            if (all_same_node_ && domain_size_ == 2)
+            {
+                // Create UPI backend as fallback for non-fast-path operations
+                auto upi = std::make_unique<UPICollectiveBackend>(domain_comm_, nullptr);
+                upi->initialize(group);
+
+                // Wrap in ShmemSpinBackend for fast allreduce
+                auto shmem = std::make_unique<ShmemSpinBackend>(
+                    domain_id_, my_rank_in_domain_, std::move(upi));
+                shmem->initialize(group);
+                backend_ = std::move(shmem);
+
+                LOG_INFO("GlobalTPContext: Using ShmemSpinBackend for domain " << domain_id_
+                                                                              << " (2-rank intra-node fast path)");
+            }
+            else
+            {
+                // Standard MPI path for multi-node or >2 ranks
+                backend_ = std::make_unique<UPICollectiveBackend>(domain_comm_, nullptr);
+                backend_->initialize(group);
+
+                LOG_DEBUG("GlobalTPContext: Using UPICollectiveBackend for domain " << domain_id_
+                                                                                   << " (domain_size=" << domain_size_
+                                                                                   << ", all_same_node=" << all_same_node_ << ")");
+            }
 
             LOG_DEBUG("GlobalTPContext: Created for domain " << domain_id_
                                                              << " with rank " << my_rank_in_domain_
                                                              << "/" << domain_size_
                                                              << " (owns_comm=" << owns_communicator_
                                                              << ", all_same_node=" << all_same_node_
-                                                             << ", node_count=" << node_count_ << ")");
+                                                             << ", node_count=" << node_count_
+                                                             << ", backend=" << backend_->name() << ")");
         }
     }
 

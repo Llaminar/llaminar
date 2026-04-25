@@ -133,6 +133,31 @@ namespace llaminar2
             WeightPrecision weight_precision = WeightPrecision::NATIVE) = 0;
 
         /**
+         * @brief Load an expert slice of a 3D MoE tensor (for expert parallelism)
+         *
+         * Only reads/returns experts [expert_start, expert_end) from a 3D tensor
+         * with shape [ne0, ne1, num_experts]. Used for MoE expert parallelism
+         * where each rank loads only its assigned expert subset.
+         *
+         * @param name Tensor name (must be 3D: [cols, rows_per_expert, num_experts])
+         * @param expert_start First expert to load (0-indexed)
+         * @param expert_end One past the last expert to load
+         * @param device Target device
+         * @param weight_precision Weight precision mode
+         * @return Tensor with shape [ne0, ne1, expert_end - expert_start] or nullptr
+         */
+        virtual std::shared_ptr<TensorBase> loadTensorExpertSlice(
+            const std::string &name,
+            size_t expert_start, size_t expert_end,
+            DeviceId device = DeviceId::cpu(),
+            WeightPrecision weight_precision = WeightPrecision::NATIVE)
+        {
+            // Default: not implemented. Override in ModelLoader for GGUF 3D tensors.
+            (void)name; (void)expert_start; (void)expert_end; (void)device; (void)weight_precision;
+            return nullptr;
+        }
+
+        /**
          * @brief Check if a tensor exists in the model
          * @param name Tensor name
          * @return true if tensor exists

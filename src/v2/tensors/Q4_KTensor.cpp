@@ -541,7 +541,16 @@ namespace llaminar2
         }
     }
 
-    Q4_KTensor::~Q4_KTensor() {}
+    Q4_KTensor::~Q4_KTensor()
+    {
+        // Pre-destroy heap vectors to avoid glibc free(): invalid pointer crash
+        // during implicit member destruction of large 3D MoE expert weight tensors.
+        // See Q4_KTensor teardown investigation: freeing raw_data_ (~72MB) during
+        // implicit destruction corrupts heap metadata for shape_ (24 bytes).
+        // Swapping to temporaries changes deallocation ordering enough to avoid it.
+        { std::vector<uint8_t>().swap(raw_data_); }
+        { std::vector<size_t>().swap(shape_); }
+    }
 
     const float *Q4_KTensor::data() const
     {
