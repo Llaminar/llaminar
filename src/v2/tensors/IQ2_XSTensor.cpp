@@ -229,7 +229,14 @@ namespace llaminar2
     }
 #endif
 
-    IQ2_XSTensor::~IQ2_XSTensor() {}
+    IQ2_XSTensor::~IQ2_XSTensor()
+    {
+        // Pre-destroy heap vectors to avoid glibc free(): invalid pointer crash
+        // during implicit member destruction of large 3D MoE expert weight tensors.
+        // See Q4_KTensor teardown investigation for details.
+        { std::vector<uint8_t>().swap(raw_data_); }
+        { std::vector<size_t>().swap(shape_); }
+    }
 
     const float *IQ2_XSTensor::data() const
     {

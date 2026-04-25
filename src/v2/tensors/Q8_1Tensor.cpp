@@ -201,7 +201,11 @@ namespace llaminar2
 
     Q8_1Tensor::~Q8_1Tensor()
     {
-        // Destructor
+        // Pre-destroy heap vectors to avoid glibc free(): invalid pointer crash
+        // during implicit member destruction of large 3D MoE expert weight tensors.
+        // See Q4_KTensor teardown investigation for details.
+        { std::vector<uint8_t>().swap(raw_data_); }
+        { std::vector<size_t>().swap(shape_); }
     }
 
     std::shared_ptr<TensorBase> Q8_1Tensor::create_view(
