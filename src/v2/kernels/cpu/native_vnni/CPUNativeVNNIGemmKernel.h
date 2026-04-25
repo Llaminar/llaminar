@@ -585,6 +585,125 @@ namespace llaminar2::cpu::native_vnni
             return true;
         }
 
+        // =====================================================================
+        // Fused multi-input GEMV for MoE expert down projections
+        // =====================================================================
+
+        bool multiply_fused_expert_down(
+            const FusedExpertDownDesc *descs, int num_descs,
+            int m, int k) override
+        {
+            if (m != 1 || num_descs < 1)
+                return false;
+
+            // Verify all kernels are CPUNativeVNNIGemmKernel
+            for (int i = 0; i < num_descs; ++i)
+            {
+                auto *vnni = dynamic_cast<CPUNativeVNNIGemmKernel *>(descs[i].kernel);
+                if (!vnni || !vnni->valid_)
+                    return false;
+            }
+
+            const int K_blocks = (k + 31) / 32;
+
+            // Set up deferred workspace for all kernels
+            {
+                size_t max_interleave_ws = 0;
+                int deferred_interleave_count = 0;
+                for (int i = 0; i < num_descs; ++i)
+                {
+                    auto *vnni = static_cast<CPUNativeVNNIGemmKernel *>(descs[i].kernel);
+                    if (vnni->deferred_packing_ && vnni->packed_.codebook_id != 19)
+                    {
+                        max_interleave_ws = std::max(max_interleave_ws,
+                                                     interleavedWorkspaceSize(vnni->packed_));
+                        deferred_interleave_count++;
+                    }
+                }
+                if (deferred_interleave_count > 0)
+                {
+                    auto &ws = sharedWorkspace();
+                    const size_t total = max_interleave_ws * deferred_interleave_count;
+                    if (ws.size() < total)
+                        ws.resize_uninitialized(total);
+                }
+                int slot_idx = 0;
+                for (int i = 0; i < num_descs; ++i)
+                {
+                    auto *vnni = static_cast<CPUNativeVNNIGemmKernel *>(descs[i].kernel);
+                    if (vnni->deferred_packing_)
+                    {
+                        if (vnni->packed_.codebook_id == 19)
+                        {
+                            vnni->ensureWorkspaceRaw();
+                        }
+                        else
+                        {
+                            uint8_t *slot = sharedWorkspace().data() +
+                                            static_cast<size_t>(slot_idx) * max_interleave_ws;
+                            repackNativeBlocksToInterleaved(
+                                vnni->native_blocks_ptr_, vnni->native_block_size_,
+                                vnni->packed_, slot);
+                            vnni->packed_.setWorkspace(slot);
+                            slot_idx++;
+                        }
+                    }
+                }
+            }
+
+            // Quantize each expert's FP32 input to Q8_1
+            // Use a contiguous buffer for all experts' Q8_1 blocks
+            thread_local std::vector<Q8_1Block> multi_q8_tls;
+            const size_t total_blocks = static_cast<size_t>(num_descs) * K_blocks;
+            if (multi_q8_tls.size() < total_blocks)
+                multi_q8_tls.resize(total_blocks);
+
+            for (int i = 0; i < num_descs; ++i)
+            {
+                Q8_1Block *A_q8 = multi_q8_tls.data() + static_cast<size_t>(i) * K_blocks;
+                const float *input_data = descs[i].input;
+                int kb = 0;
+#if defined(__AVX512F__)
+                for (; kb + 1 < K_blocks; kb += 2)
+                    simd::quantize_two_blocks_avx512(input_data + kb * 32,
+                                                     A_q8[kb], A_q8[kb + 1]);
+#endif
+                for (; kb < K_blocks; ++kb)
+                    simd::quantize_single_block(input_data + kb * 32, A_q8[kb],
+                                                std::min(32, k - kb * 32));
+            }
+
+            // Build fused multi-input GEMV descriptors
+            FusedGemvMultiInputDesc mi_descs[16]; // max 16 experts
+            int num_mi = 0;
+            for (int i = 0; i < num_descs && num_mi < 16; ++i)
+            {
+                auto *vnni = static_cast<CPUNativeVNNIGemmKernel *>(descs[i].kernel);
+                auto &d = mi_descs[num_mi++];
+                d.A_q8 = multi_q8_tls.data() + static_cast<size_t>(i) * K_blocks;
+                d.packed = &vnni->packed_;
+                d.output = descs[i].output;
+                d.N = descs[i].n;
+                d.bpr = K_blocks;
+                d.q8_0_raw = (vnni->packed_.codebook_id == 19 && vnni->packed_.workspace_data_)
+                                 ? reinterpret_cast<const Q8_0Block *>(vnni->packed_.workspace_data_)
+                                 : nullptr;
+            }
+
+            // Single OMP region with nowait between expert projections
+            gemv_fused_multi_input_preq(mi_descs, num_mi);
+
+            // Clean up deferred workspace
+            for (int i = 0; i < num_descs; ++i)
+            {
+                auto *vnni = static_cast<CPUNativeVNNIGemmKernel *>(descs[i].kernel);
+                if (vnni->deferred_packing_)
+                    vnni->packed_.clearWorkspace();
+            }
+
+            return true;
+        }
+
     private:
         CPUNativeVNNIPackedWeights packed_;
         bool valid_ = false;

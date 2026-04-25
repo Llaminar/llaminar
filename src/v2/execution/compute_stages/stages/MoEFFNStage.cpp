@@ -9,6 +9,7 @@
 #include "../../../kernels/KernelFactory.h"
 #include "../../../kernels/IMoEKernel.h"
 #include "../../../kernels/cpu/primitives/VectorPrimitives.h"
+#include "../../../kernels/cpu/primitives/SwiGLUPrimitives.h"
 #include "../../../loaders/MmapRegion.h"
 #include "../../../utils/Logger.h"
 #include "../../../utils/OpenMPUtils.h"
@@ -387,30 +388,97 @@ namespace llaminar2
         }
 
         // ---------------------------------------------------------------
-        // Phase 2: Per-expert SwiGLU + Down projection + weighted accumulate
+        // Phase 2: Fused SwiGLU + Down projection + weighted accumulate
+        //
+        // Strategy: apply SwiGLU for all experts first, then fuse all
+        // down projections into a single OMP region. This saves
+        // (num_active-1) OMP fork/join cycles (~8µs each) and improves
+        // load balance via nowait (128 total chunks vs 4×32).
+        // Falls back to sequential if fused path unavailable.
         // ---------------------------------------------------------------
-        float *scratch_out_ptr = scratch_out_->mutable_data();
 
+        // Ensure per-expert output buffers for fused approach
+        if (static_cast<int>(scratch_down_batch_.size()) < num_active)
+        {
+            scratch_down_batch_.resize(num_active);
+            for (int i = 0; i < num_active; ++i)
+            {
+                if (!scratch_down_batch_[i])
+                    scratch_down_batch_[i] = std::make_shared<FP32Tensor>(
+                        std::vector<size_t>{1, static_cast<size_t>(d_model)});
+            }
+        }
+
+        // Validate down GEMM engines
+        for (int i = 0; i < num_active; ++i)
+        {
+            if (!cached_down_gemm_[active_experts[i].expert_id])
+            {
+                LOG_ERROR("[MoEFFNStage] Null down GEMM engine for expert "
+                          << active_experts[i].expert_id);
+                return false;
+            }
+        }
+
+        // Phase 2a: Apply SwiGLU for all experts (serial, ~0.1µs each)
         for (int i = 0; i < num_active; ++i)
         {
             const auto &info = active_experts[i];
-            ITensorGemm *down_gemm = cached_down_gemm_[info.expert_id];
+            const float *gate_fp32 = scratch_gate_batch_[info.batch_idx]->data();
+            const float *up_fp32 = scratch_up_batch_[info.batch_idx]->data();
+            swiglu_scratch_batch_.resize(std::max(swiglu_scratch_batch_.size(),
+                                                  static_cast<size_t>(num_active)));
+            if (static_cast<int>(swiglu_scratch_batch_[i].size()) < intermediate)
+                swiglu_scratch_batch_[i].resize(intermediate);
 
-            if (!down_gemm)
+            primitives::compute_swiglu_serial(gate_fp32, up_fp32,
+                                              swiglu_scratch_batch_[i].data(), intermediate);
+        }
+
+        // Phase 2b: Try fused multi-input down projections
+        bool fused_ok = false;
+        if (num_active >= 2)
+        {
+            ITensorGemm::FusedExpertDownDesc down_descs[16];
+            for (int i = 0; i < num_active && i < 16; ++i)
             {
-                LOG_ERROR("[MoEFFNStage] Null down GEMM engine for expert " << info.expert_id);
-                return false;
+                const auto &info = active_experts[i];
+                down_descs[i].kernel = cached_down_gemm_[info.expert_id];
+                down_descs[i].input = swiglu_scratch_batch_[i].data();
+                down_descs[i].output = scratch_down_batch_[i]->mutable_data();
+                down_descs[i].n = d_model;
             }
+            fused_ok = cached_down_gemm_[active_experts[0].expert_id]
+                           ->multiply_fused_expert_down(down_descs, num_active, 1, intermediate);
+        }
 
-            // SwiGLU + Down projection
-            fusedSwigluDown(
-                scratch_gate_batch_[info.batch_idx].get(),
-                scratch_up_batch_[info.batch_idx].get(),
-                scratch_out_.get(),
-                down_gemm, kernel, /*m=*/1, d_model, intermediate);
+        if (fused_ok)
+        {
+            // Phase 2c: Weighted accumulate all outputs
+            for (int i = 0; i < num_active; ++i)
+            {
+                const auto &info = active_experts[i];
+                primitives::vec_axpy(output, scratch_down_batch_[i]->data(),
+                                     info.weight, d_model);
+            }
+        }
+        else
+        {
+            // Fallback: sequential per-expert SwiGLU + Down + accumulate
+            float *scratch_out_ptr = scratch_out_->mutable_data();
+            for (int i = 0; i < num_active; ++i)
+            {
+                const auto &info = active_experts[i];
+                ITensorGemm *down_gemm = cached_down_gemm_[info.expert_id];
 
-            // Vectorized weighted accumulation (AVX-512 AXPY)
-            primitives::vec_axpy(output, scratch_out_ptr, info.weight, d_model);
+                fusedSwigluDown(
+                    scratch_gate_batch_[info.batch_idx].get(),
+                    scratch_up_batch_[info.batch_idx].get(),
+                    scratch_out_.get(),
+                    down_gemm, kernel, /*m=*/1, d_model, intermediate);
+
+                primitives::vec_axpy(output, scratch_out_ptr, info.weight, d_model);
+            }
         }
 
         LOG_DEBUG("[MoEFFNStage] Single-token decode (batched gate+up): " << num_active << " experts");

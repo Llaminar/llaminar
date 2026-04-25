@@ -1808,4 +1808,93 @@ namespace llaminar2::cpu::native_vnni
 
 #endif // __AVX512F__
 
+    // =========================================================================
+    // Fused multi-input GEMV (single OMP region, different Q8_1 input per desc)
+    // =========================================================================
+
+    /**
+     * @brief Descriptor for one projection with its own pre-quantized input.
+     *
+     * Unlike FusedGemvDesc (which shares a single Q8_1 input across all
+     * projections), each descriptor here carries its own A_q8 pointer.
+     * Used for MoE expert down projections where each expert has a different
+     * SwiGLU activation as input.
+     */
+    struct FusedGemvMultiInputDesc
+    {
+        const Q8_1Block *A_q8;                    // per-projection Q8_1 input
+        const CPUNativeVNNIPackedWeights *packed;  // packed weights
+        const Q8_0Block *q8_0_raw;                // non-null for Q8_0 zero-copy path
+        float *output;                            // output vector [N]
+        int N;                                    // number of output rows
+        int bpr;                                  // blocks per row
+    };
+
+    /**
+     * @brief Fused multi-input GEMV: multiple projections with different inputs.
+     *
+     * Saves OMP fork/join overhead (3×~8µs per MoE layer for 4 experts)
+     * and improves load balance via nowait between projections
+     * (128 total chunks vs 4×32 = better utilization with 28 threads).
+     */
+    inline void gemv_fused_multi_input_preq(
+        const FusedGemvMultiInputDesc *descs,
+        int num_descs)
+    {
+        auto do_fused = [&]()
+        {
+            for (int p = 0; p < num_descs; ++p)
+            {
+                const auto &d = descs[p];
+
+                if (d.q8_0_raw)
+                {
+                    const int proj_N = d.N;
+                    const int proj_bpr = d.bpr;
+                    const Q8_0Block *__restrict blocks = d.q8_0_raw;
+                    const Q8_1Block *__restrict A_q8 = d.A_q8;
+
+#pragma omp for schedule(static) nowait
+                    for (int n = 0; n < proj_N; ++n)
+                    {
+                        const Q8_0Block *__restrict row = blocks + static_cast<size_t>(n) * proj_bpr;
+                        float val = gemv_dot_row_q8_0_vnni(row, A_q8, proj_bpr);
+                        d.output[n] = val;
+                    }
+                }
+                else
+                {
+                    const auto &packed = *d.packed;
+                    const int N = packed.N;
+                    const int N_chunks = (N + 63) / 64;
+                    const int K_blocks = packed.blocks_per_row;
+                    const Q8_1Block *__restrict A_q8 = d.A_q8;
+#if defined(__AVX512F__) && defined(__AVX512VNNI__) && defined(__AVX512BW__)
+                    const __m512i decode_lut = packed.is_nibble_lut
+                                                   ? build_decode_lut(packed.codebook_id)
+                                                   : _mm512_setzero_si512();
+
+#pragma omp for schedule(static) nowait
+                    for (int chunk = 0; chunk < N_chunks; ++chunk)
+                    {
+                        gemv_native_vnni_avx512_block(packed, A_q8, d.output,
+                                                      chunk, 1, K_blocks, N, decode_lut);
+                    }
+#else
+#pragma omp for schedule(static) nowait
+                    for (int chunk = 0; chunk < N_chunks; ++chunk)
+                    {
+                        int n_start = chunk * 64;
+                        int n_cols = std::min(64, N - n_start);
+                        gemv_native_vnni_scalar(packed, A_q8, d.output + n_start, n_cols, K_blocks);
+                    }
+#endif
+                }
+            }
+
+#pragma omp barrier
+        };
+        OMP_WORKSHARE_REGION(do_fused);
+    }
+
 } // namespace llaminar2::cpu::native_vnni

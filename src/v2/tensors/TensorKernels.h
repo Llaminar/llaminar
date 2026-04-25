@@ -561,6 +561,44 @@ namespace llaminar2
         }
 
         /**
+         * @brief Descriptor for fused multi-input down projections.
+         *
+         * Each descriptor has its own FP32 input (e.g., SwiGLU output per MoE expert),
+         * unlike TensorProjectionDesc where all projections share one input.
+         */
+        struct FusedExpertDownDesc
+        {
+            ITensorGemm *kernel;   ///< Down projection GEMM engine (with packed weights)
+            const float *input;    ///< Per-expert FP32 input [k]
+            float *output;         ///< Per-expert FP32 output [n]
+            int n;                 ///< Output dimension (d_model)
+        };
+
+        /**
+         * @brief Fused multi-input GEMV for MoE expert down projections.
+         *
+         * Processes multiple (input, weight, output) triples in a single OMP region,
+         * saving fork/join overhead (3×~8µs for 4 experts) and improving load balance
+         * via nowait between projections (128 total chunks vs 4×32 with 28 threads).
+         *
+         * @param descs Array of expert down projection descriptors
+         * @param num_descs Number of experts
+         * @param m Always 1 for decode (single token)
+         * @param k Input dimension (expert intermediate size)
+         * @return true if fused path executed, false to fall back to sequential
+         */
+        virtual bool multiply_fused_expert_down(
+            const FusedExpertDownDesc *descs, int num_descs,
+            int m, int k)
+        {
+            (void)descs;
+            (void)num_descs;
+            (void)m;
+            (void)k;
+            return false;
+        }
+
+        /**
          * @brief GEMM with pre-quantized Q8_1 activations, outputting Q8_1
          *
          * This method takes Q8_1 blocks as input and produces Q8_1 blocks as output,

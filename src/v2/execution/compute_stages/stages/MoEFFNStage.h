@@ -164,6 +164,12 @@ namespace llaminar2
         mutable std::vector<std::shared_ptr<FP32Tensor>> scratch_gate_batch_;
         mutable std::vector<std::shared_ptr<FP32Tensor>> scratch_up_batch_;
 
+        /// Per-expert down projection output buffers for fused Phase 2.
+        mutable std::vector<std::shared_ptr<FP32Tensor>> scratch_down_batch_;
+
+        /// Per-expert SwiGLU scratch buffers for fused Phase 2.
+        mutable std::vector<std::vector<float>> swiglu_scratch_batch_;
+
         /// Reusable projection descriptor vector (avoids per-call heap alloc)
         mutable std::vector<ITensorGemm::TensorProjectionDesc> batch_projections_;
 
