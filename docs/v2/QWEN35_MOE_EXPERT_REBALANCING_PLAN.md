@@ -34,7 +34,7 @@ Qwen3.5 MoE decode currently partitions experts statically across tensor-paralle
 - `src/v2/loaders/WeightManager.cpp`
   - Supports loading expert-parallel slices for 3D expert tensors.
 - `src/v2/execution/local_execution/graph/GraphResolver.cpp`
-  - Graph-resolved `TPMode::ExpertParallel` is still a missing feature. The current behavior lives inside `MoEFFNStage` filtering logic; a later refactor should turn that implicit stage-local behavior into explicit graph stages and collectives.
+  - Graph-resolved `TPMode::ExpertParallel` is still a missing feature. This mode should let the graph resolver represent expert distribution, routing, and required collectives explicitly. The current behavior lives inside `MoEFFNStage` filtering logic; a later refactor should move that implicit stage-local behavior into explicit graph stages so scheduling, profiling, and synchronization are visible to the executor.
 
 ## Proposed Architecture
 
@@ -113,7 +113,7 @@ For CPU sockets, expert movement should prefer pointer/ownership reassignment ov
 
 Two implementation modes should be supported:
 
-- **metadata-only rebalance:** fastest to implement; updates placement metadata and execution affinity without physically moving weight data, so it may use remote NUMA memory if packed weights remain on the original socket
+- **metadata-only rebalance:** fastest to implement; updates placement metadata and execution affinity without physically moving weight data, so it may use remote NUMA memory if packed weights remain on the original socket. Cross-socket memory latency may partially offset load-balancing gains in this mode.
 - **socket-local repack rebalance:** higher payoff, requires asynchronous repack/prewarm before applying placement
 
 ### 6. Scheduling and Synchronization
@@ -215,7 +215,7 @@ Exit criteria:
 
 - Benchmark static EP, observe-only, metadata-only dynamic, and socket-local dynamic modes.
 - Report decode tokens/sec, per-token MoE latency, allreduce time, socket imbalance, and rebalancing overhead.
-- Tune default thresholds for Qwen3.5 35B-A3B and 122B-A10B.
+- Tune default thresholds for Qwen3.5 35B-A3B and 122B-A10B, where the suffix indicates total parameters and active parameters per token.
 
 Exit criteria:
 
