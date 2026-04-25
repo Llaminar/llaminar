@@ -324,22 +324,37 @@ namespace llaminar2
 
         const size_t n_groups = d_model / norm_dim;
 
-        auto do_work = [&]()
+        const int total_work = seq_len * static_cast<int>(n_groups);
+
+        // Fast serial path for decode (seq_len=1): OMP fork/join overhead
+        // dominates when total_work ≤ ~16 items. Run directly.
+        if (total_work <= 16)
         {
-            // Parallelize over rows (timesteps) for prefill, or groups for single token
-            const int total_work = seq_len * static_cast<int>(n_groups);
-#pragma omp for schedule(static)
             for (int work_idx = 0; work_idx < total_work; ++work_idx)
             {
                 const int t = work_idx / static_cast<int>(n_groups);
                 const size_t g = work_idx % n_groups;
                 const size_t offset = static_cast<size_t>(t) * d_model + g * norm_dim;
-
                 gated_rmsnorm_group(input_data, gate_data, gamma_data, output_data,
                                     offset, norm_dim, gamma_period, eps, subtract_one, gate_silu);
             }
-        };
-        OMP_WORKSHARE_REGION(do_work);
+        }
+        else
+        {
+            auto do_work = [&]()
+            {
+#pragma omp for schedule(static)
+                for (int work_idx = 0; work_idx < total_work; ++work_idx)
+                {
+                    const int t = work_idx / static_cast<int>(n_groups);
+                    const size_t g = work_idx % n_groups;
+                    const size_t offset = static_cast<size_t>(t) * d_model + g * norm_dim;
+                    gated_rmsnorm_group(input_data, gate_data, gamma_data, output_data,
+                                        offset, norm_dim, gamma_period, eps, subtract_one, gate_silu);
+                }
+            };
+            OMP_WORKSHARE_REGION(do_work);
+        }
 
         LOG_DEBUG("[GatedRMSNormStage] Executed: seq_len=" << seq_len
                                                            << " d_model=" << d_model

@@ -133,6 +133,21 @@ namespace llaminar2
         float *shared_output,
         int seq_len, int d_model)
     {
+        // Fast serial path for decode (seq_len=1): OMP fork/join overhead
+        // dominates for a single dot product + sigmoid + scale.
+        if (seq_len <= 2)
+        {
+            for (int t = 0; t < seq_len; ++t)
+            {
+                const float *x = input + t * d_model;
+                float dot = primitives::vec_dot(gate_inp, x, d_model);
+                float gate = 1.0f / (1.0f + std::exp(-dot));
+                float *out = shared_output + t * d_model;
+                primitives::vec_scale(out, gate, d_model);
+            }
+            return;
+        }
+
         auto do_work = [=]()
         {
 #pragma omp for schedule(static)
