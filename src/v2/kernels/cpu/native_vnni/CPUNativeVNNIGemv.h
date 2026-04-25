@@ -697,10 +697,41 @@ namespace llaminar2::cpu::native_vnni
         }
 
         // Standard N-parallel GEMV
+        int n_block_chunks = cfg.n_block_chunks;
+        int total_blocks = (N_chunks + n_block_chunks - 1) / n_block_chunks;
+
+        // Serial fast path: when there are fewer tasks than threads and we're
+        // not already inside a parallel region, skip OMP entirely.  For MoE
+        // expert decode (N=512 → 8 tasks, N=2048 → 32 tasks with 28 threads)
+        // the fork/join overhead (~5-10µs) dominates the per-call compute.
+        bool serialize = !omp_in_parallel() && total_blocks < num_threads;
+        if (serialize)
+        {
+            for (int block_idx = 0; block_idx < total_blocks; ++block_idx)
+            {
+                int chunk_start = block_idx * n_block_chunks;
+                int chunk_count = std::min(n_block_chunks, N_chunks - chunk_start);
+
+                if (use_avx512)
+                {
+#if defined(__AVX512F__) && defined(__AVX512VNNI__) && defined(__AVX512BW__)
+                    gemv_native_vnni_avx512_block(packed, A_q8, C,
+                                                  chunk_start, chunk_count, K_blocks, N,
+                                                  decode_lut_512);
+#endif
+                }
+                else
+                {
+                    gemv_avx2_block(packed, A_q8, C,
+                                    chunk_start, chunk_count, K_blocks, N,
+                                    decode_lut_256);
+                }
+            }
+            return;
+        }
+
         auto do_gemv = [&]()
         {
-            int n_block_chunks = cfg.n_block_chunks;
-            int total_blocks = (N_chunks + n_block_chunks - 1) / n_block_chunks;
 #pragma omp for schedule(static)
             for (int block_idx = 0; block_idx < total_blocks; ++block_idx)
             {
@@ -1641,6 +1672,18 @@ namespace llaminar2::cpu::native_vnni
                 simd::quantize_two_blocks_avx512(A + kb * 32, A_q8[kb], A_q8[kb + 1]);
             for (; kb < bpr; ++kb)
                 simd::quantize_single_block(A + kb * 32, A_q8[kb], 32);
+        }
+
+        // Serial fast path for small N (same rationale as gemv_native_vnni_preq)
+        int num_threads = omp_get_max_threads();
+        if (!omp_in_parallel() && N < num_threads)
+        {
+            for (int n = 0; n < N; ++n)
+            {
+                const Q8_0Block *__restrict row = blocks + static_cast<size_t>(n) * bpr;
+                C[n] = gemv_dot_row_q8_0_vnni(row, A_q8, bpr);
+            }
+            return;
         }
 
         auto do_gemv = [&]()
