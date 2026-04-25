@@ -1,4 +1,4 @@
-# Qwen3.5 MoE Decode Expert Utilisation and Socket Rebalancing Plan
+# Qwen3.5 MoE Decode Expert Utilization and Socket Rebalancing Plan
 
 **Status:** Project plan
 **Scope:** CPU dual-socket Qwen3.5 MoE decode throughput
@@ -10,7 +10,7 @@ Qwen3.5 MoE decode currently partitions experts statically across tensor-paralle
 
 ## Goals
 
-1. Track expert utilisation during decode with low overhead.
+1. Track expert utilization during decode with low overhead.
 2. Build per-layer histograms that identify hot, cold, and imbalanced experts.
 3. Dynamically rebalance expert placement across CPU sockets without changing model numerics.
 4. Keep rebalancing deterministic, debuggable, and safe to disable.
@@ -28,13 +28,13 @@ Qwen3.5 MoE decode currently partitions experts statically across tensor-paralle
 - `src/v2/execution/compute_stages/stages/MoEFFNStage.cpp`
   - Single-token decode routes experts, filters by `local_expert_start/local_expert_count`, and executes local active experts.
 - `src/v2/execution/moe/ExpertPlacementMap.{h,cpp}`
-  - Already stores expert-to-device placement and a simple activation histogram.
+  - Existing implementation stores expert-to-device placement and a simple activation histogram.
 - `src/v2/execution/moe/ExpertRebalancer.{h,cpp}`
-  - Already proposes hot/cold expert moves from aggregate activation counts.
+  - Existing implementation proposes hot/cold expert moves from aggregate activation counts.
 - `src/v2/loaders/WeightManager.cpp`
   - Supports loading expert-parallel slices for 3D expert tensors.
 - `src/v2/execution/local_execution/graph/GraphResolver.cpp`
-  - `TPMode::ExpertParallel` is still a TODO. MoE expert parallelism is currently implemented inside `MoEFFNStage` filtering logic rather than being resolved into explicit graph stages and collectives.
+  - Graph-resolved `TPMode::ExpertParallel` is still a missing feature. The current behavior lives inside `MoEFFNStage` filtering logic; a later refactor should turn that implicit stage-local behavior into explicit graph stages and collectives.
 
 ## Proposed Architecture
 
@@ -113,7 +113,7 @@ For CPU sockets, expert movement should prefer pointer/ownership reassignment ov
 
 Two implementation modes should be supported:
 
-- **metadata-only rebalance:** fastest to implement, may use remote memory if packed weights remain on the original socket
+- **metadata-only rebalance:** fastest to implement; updates placement metadata and execution affinity without physically moving weight data, so it may use remote NUMA memory if packed weights remain on the original socket
 - **socket-local repack rebalance:** higher payoff, requires asynchronous repack/prewarm before applying placement
 
 ### 6. Scheduling and Synchronization
@@ -253,4 +253,4 @@ Exit criteria:
 2. Add socket-load-aware proposal tests.
 3. Add metadata-only placement rebalancing behind `observe|dynamic` config.
 4. Add socket-local packed-engine prewarming.
-5. Promote graph-level `TPMode::ExpertParallel` from TODO once the dynamic path is stable.
+5. Refactor stage-local expert filtering into graph-resolved `TPMode::ExpertParallel` stages and collectives once the dynamic path is stable.
