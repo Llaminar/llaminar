@@ -1,7 +1,7 @@
 # Qwen3.5 MoE Decode Expert Utilisation and Socket Rebalancing Plan
 
-**Status:** Project plan  
-**Scope:** CPU two-socket Qwen3.5 MoE decode throughput  
+**Status:** Project plan
+**Scope:** CPU two-socket Qwen3.5 MoE decode throughput
 **Related design:** `docs/v2/MOE_EXPERT_PLACEMENT_DESIGN.md`
 
 ## Problem
@@ -254,4 +254,3 @@ Exit criteria:
 3. Add metadata-only placement rebalancing behind `observe|dynamic` config.
 4. Add socket-local packed-engine prewarming.
 5. Promote graph-level `TPMode::ExpertParallel` from TODO once the dynamic path is stable.
-
