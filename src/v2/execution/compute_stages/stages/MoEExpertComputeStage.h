@@ -1,5 +1,5 @@
 /**
- * @file MoEFFNStage.h
+ * @file MoEExpertComputeStage.h
  * @brief Unified MoE FFN stage: route → expert SwiGLU → combine
  *
  * Implements the full MoE feed-forward block as a single stage:
@@ -19,6 +19,7 @@
 #include "../../../kernels/IMoEKernel.h"
 #include "../../moe/ExpertWeightTransfer.h"
 #include "../../moe/MoERebalanceController.h"
+#include "../../moe/MoEExpertWeightService.h"
 
 #include <memory>
 #include <vector>
@@ -41,7 +42,7 @@ namespace llaminar2
      * Expert views are pre-extracted at graph build time to avoid
      * runtime 3D tensor slicing overhead.
      */
-    class MoEFFNStage : public IComputeStage
+    class MoEExpertComputeStage : public IComputeStage
     {
     public:
         struct Params
@@ -53,11 +54,9 @@ namespace llaminar2
             int seq_len = 0;
             int d_model = 0;
 
-            // Router
-            TensorBase *gate_weights = nullptr; ///< Router gate [num_experts, d_model]
+            // Router config (routing done externally by MoERoutingStage)
             int num_experts = 0;
             int top_k = 0;
-            bool norm_topk_prob = true;
 
             // Expert weights (3D packed tensors) — used by CPU path
             TensorBase *gate_exps = nullptr; ///< [num_experts, intermediate, d_model]
@@ -73,12 +72,8 @@ namespace llaminar2
             int local_expert_start = 0;
             int local_expert_count = -1;
 
-            // Layer index for histogram recording
+            // Layer index (used by DGO for layer identification)
             int layer_idx = -1;
-
-            // Optional histogram for decode expert tracking (not owned)
-            // Set by MoERebalanceController; null = no tracking.
-            DecodeExpertHistogram* decode_histogram = nullptr;
 
             /// Per-expert active mask for dynamic rebalancing.
             /// When non-empty (size == num_experts), expert_mask[e] == true means
@@ -122,6 +117,12 @@ namespace llaminar2
             TensorBase *gate_scratch = nullptr; ///< [seq_len, intermediate] FP32 scratch
             TensorBase *up_scratch = nullptr;   ///< [seq_len, intermediate] FP32 scratch
 
+            // Routing results (from MoERoutingStage)
+            TensorBase *routing_indices = nullptr; ///< FP32 [seq_len * top_k] expert IDs as float
+            TensorBase *routing_weights = nullptr; ///< FP32 [seq_len * top_k] normalized weights
+            BufferId routing_indices_buffer_id = BufferId::MOE_EXPERT_INDICES;
+            BufferId routing_weights_buffer_id = BufferId::MOE_EXPERT_WEIGHTS;
+
             // Output
             TensorBase *output = nullptr; ///< Combined output [seq_len, d_model]
 
@@ -130,7 +131,7 @@ namespace llaminar2
             BufferId output_buffer_id = BufferId::MOE_COMBINED_OUTPUT;
         };
 
-        explicit MoEFFNStage(Params params);
+        explicit MoEExpertComputeStage(Params params);
 
         bool execute(IDeviceContext *ctx) override;
         ComputeStageType type() const override { return ComputeStageType::MOE_EXPERT_FFN; }
@@ -172,15 +173,6 @@ namespace llaminar2
         /// The owner keeps its GEMM engines intact. Used for replica transfers
         /// where both sockets need the weights.
         ExpertWeightBlobs serializeExpert(int expert_id) const;
-
-        /// Update mask AND lazily prepare GEMM engines for newly-acquired experts.
-        /// Call this after rebalancing — it only VNNI-packs experts that weren't
-        /// previously prepared, avoiding the 2x memory overhead of preparing all upfront.
-        /// If received_weights is non-null, uses transferred packed data for experts
-        /// that have entries, falling back to repack-from-raw for the rest.
-        bool updateExpertMaskAndPrepareEngines(
-            const std::vector<bool>& new_mask,
-            const std::unordered_map<int, ExpertWeightBlobs>* received_weights = nullptr);
 
         // ── Phased rebalance API (used by DeviceGraphOrchestrator) ───────
         //
@@ -225,26 +217,13 @@ namespace llaminar2
         /// @return Bytes freed (approximate, from 3D tensor data)
         size_t releaseRawExpertWeights();
 
-    private:
-        /// Register transferred packed weights for one expert (gate/up/down).
-        /// Returns true if all 3 projections registered successfully.
-        bool registerTransferredExpert(int expert_id, const ExpertWeightBlobs& blobs);
+        /// Build a MoEWeightContext referencing this stage's params.
+        /// Used by the weight service for rebalancing operations.
+        MoEWeightContext buildWeightContext();
 
+    private:
         Params params_;
         bool raw_weights_released_ = false; ///< Set by releaseRawExpertWeights()
-
-#ifdef HAVE_CUDA
-        static bool prepareExpertGemmEnginesCUDA(Params &params);
-#endif
-#ifdef HAVE_ROCM
-        static bool prepareExpertGemmEnginesROCm(Params &params);
-#endif
-
-        /// Stashed routing results from last execute() — for snapshot capture.
-        /// Stored as FP32 [seq_len, top_k] so buildDumpInfoImpl() can expose them.
-        mutable std::vector<float> routing_indices_f32_; ///< Expert IDs cast to float
-        mutable std::vector<float> routing_weights_;     ///< Normalized top-k weights
-        mutable std::vector<float> router_logits_;       ///< Raw router logits [seq_len, num_experts]
 
         /// Cached GEMM engines per expert (resolved on first execute)
         mutable std::vector<ITensorGemm *> cached_gate_gemm_;
@@ -272,12 +251,8 @@ namespace llaminar2
         /// Reusable projection descriptor vector (avoids per-call heap alloc)
         mutable std::vector<ITensorGemm::TensorProjectionDesc> batch_projections_;
 
-        /// Cached MoE kernel (routing, gather/scatter, SwiGLU fallback)
+        /// Cached MoE kernel (gather/scatter, SwiGLU fallback)
         mutable IMoEKernel *moe_kernel_ = nullptr;
-
-        /// Pre-allocated routing result to avoid heap allocs per decode token.
-        /// route() calls resize() which is a no-op after first call.
-        mutable MoERoutingResult cached_routing_;
 
         /// Fast path for decode (seq_len=1): avoids token grouping, gather/scatter,
         /// and per-expert heap allocations. Uses routing results directly.
@@ -287,12 +262,6 @@ namespace llaminar2
         void ensureGemmEnginesCached() const;
         void ensureScratchBuffers(int max_batch) const;
         IMoEKernel *ensureMoEKernel() const;
-
-        /// Stash routing results for snapshot capture
-        void stashRoutingResults(
-            const std::vector<int> &expert_indices,
-            const std::vector<float> &expert_weights,
-            int seq_len, int top_k) const;
     };
 
     /**

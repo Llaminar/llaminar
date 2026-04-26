@@ -8,7 +8,7 @@
  *   Phase A (blocking):  Exchange sizes so receivers can pre-allocate buffers.
  *   Phase B (non-blocking): Bulk data transfer with MPI_Isend/Irecv + Waitall.
  *
- * Header-only. No dependency on DeviceGraphOrchestrator, MoEFFNStage, or KernelFactory.
+ * Header-only. No dependency on DeviceGraphOrchestrator, MoEExpertComputeStage, or KernelFactory.
  */
 
 #pragma once

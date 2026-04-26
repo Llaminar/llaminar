@@ -70,7 +70,6 @@ TEST_F(ComputeStageTest, StageTypeNames)
     EXPECT_STREQ(computeStageTypeName(ComputeStageType::ADD_RESIDUAL), "ADD_RESIDUAL");
     EXPECT_STREQ(computeStageTypeName(ComputeStageType::MOE_ROUTER), "MOE_ROUTER");
     EXPECT_STREQ(computeStageTypeName(ComputeStageType::MOE_EXPERT_FFN), "MOE_EXPERT_FFN");
-    EXPECT_STREQ(computeStageTypeName(ComputeStageType::MOE_COMBINE), "MOE_COMBINE");
     EXPECT_STREQ(computeStageTypeName(ComputeStageType::MOE_SHARED_EXPERT_FFN), "MOE_SHARED_EXPERT_FFN");
     EXPECT_STREQ(computeStageTypeName(ComputeStageType::MOE_SHARED_EXPERT_GATE), "MOE_SHARED_EXPERT_GATE");
     EXPECT_STREQ(computeStageTypeName(ComputeStageType::ALLREDUCE), "ALLREDUCE");
@@ -597,83 +596,6 @@ TEST_F(ComputeStageTest, BackendSupport)
 #else
     EXPECT_FALSE(rms_stage.supportsBackend(ComputeBackendType::GPU_ROCM));
 #endif
-}
-
-// =============================================================================
-// MoE Stage Tests
-// =============================================================================
-
-TEST_F(ComputeStageTest, MoERouterBasic)
-{
-    const int seq_len = 2;
-    const int d_model = 4;
-    const int num_experts = 3;
-
-    // Simple hidden states using tensor helper
-    std::vector<float> hidden_data = {1.0f, 0.0f, 0.0f, 0.0f,  // Token 0
-                                      0.0f, 1.0f, 0.0f, 0.0f}; // Token 1
-    auto hidden = makeTensor(seq_len, d_model, hidden_data);
-
-    // Gate weights: each expert is a one-hot [num_experts, d_model]
-    std::vector<float> gate_data = {
-        1.0f, 0.0f, 0.0f, 0.0f, // Expert 0 responds to dim 0
-        0.0f, 1.0f, 0.0f, 0.0f, // Expert 1 responds to dim 1
-        0.0f, 0.0f, 1.0f, 0.0f  // Expert 2 responds to dim 2
-    };
-    auto gate_weights = makeTensor(num_experts, d_model, gate_data);
-
-    // Output router logits
-    auto router_logits = makeTensor(seq_len, num_experts);
-
-    MoERouterStage::Params params;
-    params.hidden = hidden.get();
-    params.gate_weights = gate_weights.get();
-    params.router_logits = router_logits.get();
-    params.seq_len = seq_len;
-    params.d_model = d_model;
-    params.num_experts = num_experts;
-
-    MoERouterStage stage(params);
-
-    EXPECT_EQ(stage.type(), ComputeStageType::MOE_ROUTER);
-    EXPECT_TRUE(stage.execute(ctx_.get()));
-
-    // Get output data for verification
-    const float *output = router_logits->data();
-
-    // Token 0: [1,0,0,0] should have logit 1 for expert 0
-    EXPECT_NEAR(output[0], 1.0f, 1e-5f); // Expert 0
-    EXPECT_NEAR(output[1], 0.0f, 1e-5f); // Expert 1
-    EXPECT_NEAR(output[2], 0.0f, 1e-5f); // Expert 2
-
-    // Token 1: [0,1,0,0] should have logit 1 for expert 1
-    EXPECT_NEAR(output[3], 0.0f, 1e-5f); // Expert 0
-    EXPECT_NEAR(output[4], 1.0f, 1e-5f); // Expert 1
-    EXPECT_NEAR(output[5], 0.0f, 1e-5f); // Expert 2
-}
-
-TEST_F(ComputeStageTest, MoEExpertNoTokens)
-{
-    // Expert with no routed tokens should be a no-op
-    std::vector<int> empty_tokens;
-
-    MoEExpertStage::Params params;
-    params.expert_id = 5;
-    params.input = nullptr;
-    params.output = nullptr;
-    params.gate_w = nullptr;
-    params.up_w = nullptr;
-    params.down_w = nullptr;
-    params.token_indices = &empty_tokens;
-    params.d_model = 896;
-    params.intermediate_dim = 4864;
-
-    MoEExpertStage stage(params);
-
-    EXPECT_EQ(stage.type(), ComputeStageType::MOE_EXPERT_FFN);
-    EXPECT_EQ(stage.name(), "MOE_EXPERT_5");
-    EXPECT_TRUE(stage.execute(ctx_.get()));  // Should succeed (no-op)
-    EXPECT_EQ(stage.estimatedFlops(), 0ULL); // No tokens = no work
 }
 
 // =============================================================================

@@ -689,7 +689,7 @@ namespace llaminar2
         // MoE Expert Rebalance Controller (Phase 4a)
         // =====================================================================
         // Must be set BEFORE graph builder creation so the histogram pointer
-        // propagates into MoEFFNStage params during graph construction.
+        // propagates into MoEExpertComputeStage params during graph construction.
         std::unique_ptr<MoERebalanceController> moe_controller;
         {
             const auto& env = debugEnv();

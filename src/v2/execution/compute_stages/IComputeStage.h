@@ -285,7 +285,6 @@ namespace llaminar2
         // MoE specific
         MOE_ROUTER,
         MOE_EXPERT_FFN,
-        MOE_COMBINE,
         MOE_SHARED_EXPERT_FFN, ///< Shared expert FFN (distinct from per-expert MOE_EXPERT_FFN)
         MOE_SHARED_EXPERT_GATE, ///< Shared expert sigmoid gate
 

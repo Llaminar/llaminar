@@ -14,7 +14,6 @@
 #include "stages/RMSNormStage.h"
 #include "stages/RoPEStage.h"
 #include "stages/ResidualAddStage.h"
-#include "stages/AttentionWithKVCacheStage.h"
 #include "stages/KVCacheAppendStage.h"
 #include "stages/KVCacheGatherStage.h"
 #include "stages/AttentionComputeStage.h"
@@ -25,8 +24,8 @@
 #include "stages/AllGatherVStage.h"
 #include "stages/SendActivationsStage.h"
 #include "stages/ReceiveActivationsStage.h"
-#include "stages/MoEStages.h"
-#include "stages/MoEFFNStage.h"
+#include "stages/MoEExpertComputeStage.h"
+#include "stages/MoERoutingStage.h"
 #include "stages/QKNormStage.h"
 #include "stages/FusedResidualNormStage.h"
 #include "stages/GDNProjectionStage.h"
@@ -130,18 +129,6 @@ namespace llaminar2
         // =====================================================================
 
         /**
-         * @brief Create a production attention stage with KV cache and MPI support
-         *
-         * This is the recommended factory for attention in production pipelines.
-         * For simple testing, use createAttention() instead.
-         *
-         * @param params Attention parameters including KV cache and MPI config
-         * @return AttentionWithKVCacheStage instance
-         */
-        static std::unique_ptr<IComputeStage> createAttentionWithKVCache(
-            const AttentionWithKVCacheStage::Params &params);
-
-        /**
          * @brief Create a KV cache append stage for explicit cache management
          *
          * For advanced use cases where cache operations need to be pipelined
@@ -172,7 +159,6 @@ namespace llaminar2
          * - Supports CPU and GPU backends transparently
          *
          * Use this with KVCacheAppendStage for composable DAG execution.
-         * For legacy integrated cache+attention, use createAttentionWithKVCache().
          *
          * @param params Attention compute parameters (Q, K, V, output, dimensions)
          * @return AttentionComputeStage instance
@@ -185,28 +171,22 @@ namespace llaminar2
         // =====================================================================
 
         /**
-         * @brief Create a MoE router stage for expert selection
+         * @brief Create a unified MoE expert compute stage (expert SwiGLU + combine, routing done externally)
          */
-        static std::unique_ptr<IComputeStage> createMoERouter(
-            const MoERouterStage::Params &params);
+        static std::unique_ptr<IComputeStage> createMoEExpertCompute(
+            const MoEExpertComputeStage::Params &params);
 
-        /**
-         * @brief Create an expert FFN stage for MoE
-         */
-        static std::unique_ptr<IComputeStage> createMoEExpert(
-            const MoEExpertStage::Params &params);
-
-        /**
-         * @brief Create a MoE combine stage for weighted expert output combination
-         */
-        static std::unique_ptr<IComputeStage> createMoECombine(
-            const MoECombineStage::Params &params);
-
-        /**
-         * @brief Create a unified MoE FFN stage (router + expert SwiGLU + combine)
-         */
         static std::unique_ptr<IComputeStage> createMoEFFN(
-            const MoEFFNStage::Params &params);
+            const MoEExpertComputeStage::Params &params);
+
+        /**
+         * @brief Create a MoE routing stage (softmax top-k expert selection)
+         *
+         * Extracted from MoEExpertComputeStage. Outputs raw routing results (indices as float,
+         * normalized weights) without EP masking.
+         */
+        static std::unique_ptr<IComputeStage> createMoERouting(
+            const MoERoutingStage::Params &params);
 
         /**
          * @brief Create a shared expert FFN stage (always-active dense SwiGLU)

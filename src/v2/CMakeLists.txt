@@ -1141,8 +1141,8 @@ add_library(llaminar2_core STATIC
     execution/compute_stages/stages/AllGatherVStage.cpp
     execution/compute_stages/stages/SendActivationsStage.cpp
     execution/compute_stages/stages/ReceiveActivationsStage.cpp
-    execution/compute_stages/stages/MoEStages.cpp
-    execution/compute_stages/stages/MoEFFNStage.cpp
+    execution/compute_stages/stages/MoEExpertComputeStage.cpp
+    execution/compute_stages/stages/MoERoutingStage.cpp
     execution/compute_stages/stages/AttentionOutputGateStage.cpp
     execution/compute_stages/stages/GatedRMSNormStage.cpp
     execution/compute_stages/stages/GDNProjectionStage.cpp
@@ -1159,9 +1159,9 @@ add_library(llaminar2_core STATIC
     execution/moe/DecodeExpertHistogram.cpp
     execution/moe/SocketAwareRebalancer.cpp
     execution/moe/MoERebalanceController.cpp
+    execution/moe/MoEExpertWeightService.cpp
     execution/moe/MoEPipeline.cpp
     execution/cache/HybridCacheManager.cpp
-    execution/compute_stages/stages/AttentionWithKVCacheStage.cpp
     execution/compute_stages/stages/KVCacheAppendStage.cpp
     execution/compute_stages/stages/KVCacheGatherStage.cpp
     execution/compute_stages/stages/AttentionComputeStage.cpp
@@ -1399,8 +1399,6 @@ add_library(llaminar2_core STATIC
     loaders/LocalTPWeightSharder.cpp
     # TP allreduce stage (Phase 4: supports both LOCAL and GLOBAL TP)
     execution/compute_stages/stages/TPAllreduceStage.cpp
-    # Legacy LOCAL TP allreduce stage (deprecated, use TPAllreduceStage)
-    execution/compute_stages/stages/LocalTPAllreduceStage.cpp
     execution/compute_stages/stages/LocalPPTransferStage.cpp
     execution/compute_stages/stages/GlobalPPTransferStage.cpp
     # Global Pipeline Parallelism topology and planning

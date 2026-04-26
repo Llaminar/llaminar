@@ -2,7 +2,7 @@
  * @file CPUMoEKernel.cpp
  * @brief CPU implementation of MoE kernel operations
  *
- * Extracted from MoEFFNStage.cpp to enable device-agnostic stage wiring.
+ * Extracted from MoEExpertComputeStage.cpp to enable device-agnostic stage wiring.
  * Uses ISA-dispatched vector primitives for all compute-bound operations.
  */
 

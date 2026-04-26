@@ -28,7 +28,7 @@
 #include "../../../kernels/cpu/CPUKVCache.h"
 #include "../../../kernels/KernelFactory.h"
 #include "../../../kernels/HybridKVCacheConfig.h"
-#include "../../compute_stages/stages/MoEFFNStage.h"
+#include "../../compute_stages/stages/MoEExpertComputeStage.h"
 #include "../../moe/ExpertWeightTransfer.h"
 #include "../../../backends/BackendManager.h"
 #include "../../../interfaces/IWorkspaceConsumer.h"
@@ -738,7 +738,7 @@ namespace llaminar2
         // Check if collectives can be captured INTO the GPU graph
         // (monolithic capture with on-stream allreduce).
         //
-        // When enabled, LocalTPAllreduceStage issues rcclAllReduce directly
+        // When enabled, TPAllreduceStage issues rcclAllReduce directly
         // on the capture stream (via allreduceOnStream), making the collective
         // part of the captured graph.  This eliminates segmentation overhead
         // (many small graphs + manual segments) in favour of a single monolithic
@@ -2064,7 +2064,7 @@ namespace llaminar2
 
         // ── Step 1: Collect all MoE stages ──────────────────────────────
         struct StageInfo {
-            MoEFFNStage* stage;
+            MoEExpertComputeStage* stage;
             int layer;
         };
         std::vector<StageInfo> moe_stages;
@@ -2074,7 +2074,7 @@ namespace llaminar2
             forward_engine_->forEachCachedStage(
                 ComputeStageType::MOE_EXPERT_FFN,
                 [&](IComputeStage* s) {
-                    auto* moe = dynamic_cast<MoEFFNStage*>(s);
+                    auto* moe = dynamic_cast<MoEExpertComputeStage*>(s);
                     if (!moe) return;
                     int layer = moe->layerIndex();
                     if (layer >= 0 && static_cast<size_t>(layer) < masks.size())
@@ -2095,7 +2095,7 @@ namespace llaminar2
                     if (!node || !node->stage) continue;
                     if (node->stage->type() == ComputeStageType::MOE_EXPERT_FFN)
                     {
-                        auto* moe = dynamic_cast<MoEFFNStage*>(node->stage.get());
+                        auto* moe = dynamic_cast<MoEExpertComputeStage*>(node->stage.get());
                         if (moe) moe_stages.push_back({moe, static_cast<int>(layer)});
                     }
                 }
@@ -2135,7 +2135,7 @@ namespace llaminar2
             stage->applyExpertMask(masks[layer]);
 
         LOG_INFO("[DGO] Applied expert masks to " << applied.load()
-                 << " MoEFFNStages across " << masks.size() << " layers");
+                 << " MoEExpertComputeStages across " << masks.size() << " layers");
 
         auto t_end = std::chrono::high_resolution_clock::now();
         double prep_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
@@ -2156,7 +2156,7 @@ namespace llaminar2
             forward_engine_->forEachCachedStage(
                 ComputeStageType::MOE_EXPERT_FFN,
                 [&](IComputeStage* s) {
-                    auto* moe = dynamic_cast<MoEFFNStage*>(s);
+                    auto* moe = dynamic_cast<MoEExpertComputeStage*>(s);
                     if (moe)
                     {
                         moe->setReplicaSet(replicas, socket_id);
@@ -2179,7 +2179,7 @@ namespace llaminar2
             forward_engine_->forEachCachedStage(
                 ComputeStageType::MOE_EXPERT_FFN,
                 [&](IComputeStage* s) {
-                    auto* moe = dynamic_cast<MoEFFNStage*>(s);
+                    auto* moe = dynamic_cast<MoEExpertComputeStage*>(s);
                     if (moe)
                     {
                         total_freed += moe->releaseRawExpertWeights();
@@ -2203,13 +2203,13 @@ namespace llaminar2
         MPI_Comm comm = mpi_ctx_->communicator();
 
         // Collect MoE stages by layer from forward engine's graph cache.
-        std::unordered_map<int, MoEFFNStage*> moe_by_layer;
+        std::unordered_map<int, MoEExpertComputeStage*> moe_by_layer;
         if (forward_engine_)
         {
             forward_engine_->forEachCachedStage(
                 ComputeStageType::MOE_EXPERT_FFN,
                 [&](IComputeStage* stage) {
-                    auto* moe_stage = dynamic_cast<MoEFFNStage*>(stage);
+                    auto* moe_stage = dynamic_cast<MoEExpertComputeStage*>(stage);
                     if (moe_stage && moe_stage->layerIndex() >= 0)
                         moe_by_layer[moe_stage->layerIndex()] = moe_stage;
                 });
@@ -2228,7 +2228,7 @@ namespace llaminar2
                     if (!node || !node->stage) continue;
                     if (node->stage->type() == ComputeStageType::MOE_EXPERT_FFN)
                     {
-                        auto* moe_stage = dynamic_cast<MoEFFNStage*>(node->stage.get());
+                        auto* moe_stage = dynamic_cast<MoEExpertComputeStage*>(node->stage.get());
                         if (moe_stage)
                             moe_by_layer[static_cast<int>(layer_idx)] = moe_stage;
                     }
@@ -2281,13 +2281,13 @@ namespace llaminar2
                  << " replicated experts × " << num_layers << " layers via MPI");
 
         // Collect MoE stages by layer
-        std::unordered_map<int, MoEFFNStage*> moe_by_layer;
+        std::unordered_map<int, MoEExpertComputeStage*> moe_by_layer;
         if (forward_engine_)
         {
             forward_engine_->forEachCachedStage(
                 ComputeStageType::MOE_EXPERT_FFN,
                 [&](IComputeStage* stage) {
-                    auto* moe_stage = dynamic_cast<MoEFFNStage*>(stage);
+                    auto* moe_stage = dynamic_cast<MoEExpertComputeStage*>(stage);
                     if (moe_stage && moe_stage->layerIndex() >= 0)
                         moe_by_layer[moe_stage->layerIndex()] = moe_stage;
                 });

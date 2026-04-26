@@ -58,7 +58,7 @@ static const std::vector<TestConfig> kQwen35MoESingleDeviceConfigs = {
     // Qwen3.5-35B MoE (Q4_K_XL) — CPU baseline
     //
     // This is the primary single-device configuration. CPU execution is fully
-    // deterministic and exercises the scalar reference MoEFFNStage code path.
+    // deterministic and exercises the scalar reference MoEExpertComputeStage code path.
     // The model is at /opt/llaminar-models/ (not in the models/ workspace dir).
     //
     // Expert routing: 256 experts, top-8 selection, norm_topk_prob=true

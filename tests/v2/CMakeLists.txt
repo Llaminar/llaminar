@@ -5625,6 +5625,16 @@ add_v2_test(V2_Unit_GraphResolver
     MPI_PROCS 1
 )
 
+# Test: GraphResolver ExpertParallel TP mode (Phase 4 MoE stage decomposition)
+# Verifies TPMode::ExpertParallel inserts allreduce collectives
+add_executable(v2_test_graph_resolver_expert_parallel unit/execution/local_execution/graph/Test__GraphResolver_ExpertParallel.cpp)
+target_link_libraries(v2_test_graph_resolver_expert_parallel llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_GraphResolver_ExpertParallel
+    COMMAND $<TARGET_FILE:v2_test_graph_resolver_expert_parallel>
+    LABELS "V2;Unit;GraphResolver;MoE;ExpertParallel"
+    MPI_PROCS 1
+)
+
 # GraphBuilderRegistry: self-registration pattern for model architectures
 add_executable(v2_test_graph_builder_registry unit/execution/local_execution/graph/Test__GraphBuilderRegistry.cpp)
 target_link_libraries(v2_test_graph_builder_registry llaminar2_core GTest::gtest GTest::gtest_main)
@@ -5713,7 +5723,7 @@ add_v2_test(V2_Unit_CPUKernelDeviceIndex
 
 # Test: DecomposedAttentionRequirement (regression test for shared_from_this crash)
 # Tests that graph buffer management requires decomposed attention path (KVCacheAppendStage +
-# AttentionComputeStage) instead of AttentionWithKVCacheStage which uses create_view().
+# AttentionComputeStage).
 # Covers the crash caused by unique_ptr buffers not supporting shared_from_this().
 
 # Test: LayerExecutorInterface (ILayerExecutor interface and MockLayerExecutor)
@@ -5887,18 +5897,6 @@ target_link_libraries(v2_test_local_tp_weight_sharder llaminar2_core GTest::gtes
 add_v2_test(V2_Unit_LocalTPWeightSharder
     COMMAND $<TARGET_FILE:v2_test_local_tp_weight_sharder>
     LABELS "V2;Unit;LocalTP;WeightSharder;TensorParallel;ColumnParallel;RowParallel"
-    MPI_PROCS 1
-)
-
-# Test: LocalTPAllreduceStage (all-reduce stage for LOCAL tensor parallelism)
-# Phase 4: Tests LocalTPAllreduceStage for intra-rank collective operations
-# Validates stage type/name, buffer requirements, single-device no-op, multi-device
-# placeholder behavior, and dump info generation.
-add_executable(v2_test_local_tp_allreduce_stage unit/execution/compute_stages/stages/Test__LocalTPAllreduceStage.cpp)
-target_link_libraries(v2_test_local_tp_allreduce_stage llaminar2_core GTest::gtest GTest::gtest_main)
-add_v2_test(V2_Unit_LocalTPAllreduceStage
-    COMMAND $<TARGET_FILE:v2_test_local_tp_allreduce_stage>
-    LABELS "V2;Unit;LocalTP;Allreduce;ComputeStage;TensorParallel;Collective"
     MPI_PROCS 1
 )
 
@@ -9340,6 +9338,29 @@ add_v2_test(V2_Unit_MoEPipeline
     LABELS "V2;Unit;MoE;Pipeline;MockModel;Rebalancing"
 )
 
+# Test: MoEExpertWeightService — weight lifecycle service extracted from MoEFFNStage
+add_executable(v2_test_moe_expert_weight_service unit/moe/Test__MoEExpertWeightService.cpp)
+target_include_directories(v2_test_moe_expert_weight_service PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(v2_test_moe_expert_weight_service
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_MoEExpertWeightService
+    COMMAND $<TARGET_FILE:v2_test_moe_expert_weight_service>
+    LABELS "V2;Unit;MoE;WeightService;WeightLifecycle"
+)
+
+# Test: MoERoutingToCompute — end-to-end two-stage pipeline (MoERoutingStage → MoEExpertComputeStage)
+add_executable(v2_test_moe_routing_to_compute unit/moe/Test__MoERoutingToCompute_Integration.cpp)
+target_include_directories(v2_test_moe_routing_to_compute PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(v2_test_moe_routing_to_compute llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_MoERoutingToCompute
+    COMMAND $<TARGET_FILE:v2_test_moe_routing_to_compute>
+    LABELS "V2;Unit;MoE;Router;Stages;Pipeline;Integration"
+    MPI_PROCS 1
+)
+
 # Test: HeterogeneousLayers — Phase B: named_templates, per-layer dispatch,
 # AttentionOutputGateStage, GatedRMSNormStage, HybridCacheManager, GraphConfig
 add_executable(v2_test_heterogeneous_layers unit/execution/Test__HeterogeneousLayers.cpp)
@@ -9690,15 +9711,25 @@ add_v2_test(V2_Unit_DeviceMemoryPlan
 # MoE Stage Tests
 # =============================================================================
 
-# Test: MoEFFNStage — Router + Expert SwiGLU + Combine (Q4_K/Q5_K 3D weights)
-# Tests: MoEFFNStage (routing, expert FFN, combine), SharedExpertFFNStage (dense SwiGLU),
+# Test: MoEExpertComputeStage — Router + Expert SwiGLU + Combine (Q4_K/Q5_K 3D weights)
+# Tests: MoEExpertComputeStage (routing, expert FFN, combine), SharedExpertFFNStage (dense SwiGLU),
 # SharedExpertGateStage (sigmoid gating), isNonGemmWeight regression for 3D expert tensors
-add_executable(v2_test_moe_ffn_stage unit/stages/Test__MoEFFNStage.cpp)
-target_include_directories(v2_test_moe_ffn_stage PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(v2_test_moe_ffn_stage llaminar2_core GTest::gtest GTest::gtest_main)
-add_v2_test(V2_Unit_MoEFFNStage
-    COMMAND $<TARGET_FILE:v2_test_moe_ffn_stage>
+add_executable(v2_test_moe_expert_compute_stage unit/stages/Test__MoEExpertComputeStage.cpp)
+target_include_directories(v2_test_moe_expert_compute_stage PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(v2_test_moe_expert_compute_stage llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_MoEExpertComputeStage
+    COMMAND $<TARGET_FILE:v2_test_moe_expert_compute_stage>
     LABELS "V2;Unit;MoE;Stages;Kernels;Q4_K;Q5_K"
+    MPI_PROCS 1
+)
+
+# Test: MoERoutingStage — extracted router stage (softmax top-k → expert indices + weights)
+add_executable(v2_test_moe_routing_stage unit/stages/Test__MoERoutingStage.cpp)
+target_include_directories(v2_test_moe_routing_stage PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(v2_test_moe_routing_stage llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_MoERoutingStage
+    COMMAND $<TARGET_FILE:v2_test_moe_routing_stage>
+    LABELS "V2;Unit;MoE;Router;Stages"
     MPI_PROCS 1
 )
 

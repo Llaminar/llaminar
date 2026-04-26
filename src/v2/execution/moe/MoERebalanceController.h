@@ -4,7 +4,7 @@
  *
  * Lifecycle:
  * 1. Created at graph-build time with model config
- * 2. Histogram pointer passed to MoEFFNStage params for recording
+ * 2. Histogram pointer passed to MoEExpertComputeStage params for recording
  * 3. After each decode step, caller checks shouldRebalance()
  * 4. If true, caller calls rebalance() which proposes + applies swaps
  * 5. Updated placement is available for next decode step
@@ -95,7 +95,7 @@ namespace llaminar2
 
         explicit MoERebalanceController(Config config);
 
-        /// Get histogram pointer for MoEFFNStage params (nullptr if OFF)
+        /// Get histogram pointer for MoEExpertComputeStage params (nullptr if OFF)
         DecodeExpertHistogram* histogram() { return histogram_.get(); }
 
         /// Check if rebalancing should be attempted (window full + mode == DYNAMIC)
@@ -104,7 +104,7 @@ namespace llaminar2
         /// Propose and apply rebalance (swap-based, global placement).
         /// Returns the new expert_to_socket mapping.
         /// Returns empty vector if no rebalancing was done.
-        /// The caller is responsible for updating MoEFFNStage local_expert_start/count.
+        /// The caller is responsible for updating MoEExpertComputeStage local_expert_start/count.
         std::vector<int> rebalance();
 
         /// Compute optimal per-layer partition using LPT (Longest Processing Time First).

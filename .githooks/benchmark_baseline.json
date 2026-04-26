@@ -8,16 +8,16 @@
       "decode_tokens": 128,
       "devices": {
         "cuda:0": {
-          "prefill_tok_s": 4879.29,
+          "prefill_tok_s": 4894.57,
           "decode_tok_s": 95.16,
           "regression_threshold_pct": 5,
-          "_comment": "High-water mark set at commit f902826e on 2026-04-10. Note to agents: It is FORBIDDEN to update these thresholds without explicit human approval."
+          "_comment": "High-water mark set at commit 7510ad25 on 2026-04-26. Note to agents: It is FORBIDDEN to update these thresholds without explicit human approval."
         },
         "rocm:0": {
           "prefill_tok_s": 1214.71,
-          "decode_tok_s": 78.72,
+          "decode_tok_s": 78.94,
           "regression_threshold_pct": 5,
-          "_comment": "High-water mark set at commit c51d5583 on 2026-04-22. Note to agents: It is FORBIDDEN to update these thresholds without explicit human approval."
+          "_comment": "High-water mark set at commit 7510ad25 on 2026-04-26. Note to agents: It is FORBIDDEN to update these thresholds without explicit human approval."
         },
         "cpu": {
           "prefill_tok_s": 337.99,
@@ -33,8 +33,8 @@
       "devices": {
         "cpu": {
           "prefill_tok_s": 440.03,
-          "decode_tok_s": 27.70,
-          "_comment": "High-water mark set at commit b91ddc53 on 2026-04-09. Note to agents: It is FORBIDDEN to update these thresholds without explicit human approval."
+          "decode_tok_s": 28.41,
+          "_comment": "High-water mark set at commit 7510ad25 on 2026-04-26. Note to agents: It is FORBIDDEN to update these thresholds without explicit human approval."
         }
       }
     },
@@ -44,14 +44,14 @@
       "decode_tokens": 128,
       "devices": {
         "cpu:0": {
-          "prefill_tok_s": 152.35,
-          "decode_tok_s": 17.39,
-          "_comment": "Initial baseline from TP scaling optimization on feat/qwen35-moe branch."
+          "prefill_tok_s": 156.63,
+          "decode_tok_s": 18.63,
+          "_comment": "High-water mark set at commit 7510ad25 on 2026-04-26. Note to agents: It is FORBIDDEN to update these thresholds without explicit human approval."
         },
         "cpu": {
-          "prefill_tok_s": 226.32,
-          "decode_tok_s": 22.05,
-          "_comment": "Initial baseline from TP scaling optimization on feat/qwen35-moe branch."
+          "prefill_tok_s": 232.76,
+          "decode_tok_s": 27.79,
+          "_comment": "High-water mark set at commit 7510ad25 on 2026-04-26. Note to agents: It is FORBIDDEN to update these thresholds without explicit human approval."
         }
       }
     }

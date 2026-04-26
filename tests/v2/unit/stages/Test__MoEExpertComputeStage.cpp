@@ -1,9 +1,9 @@
 /**
- * @file Test__MoEFFNStage.cpp
- * @brief Unit tests for MoE FFN stages: MoEFFNStage, SharedExpertFFNStage, SharedExpertGateStage
+ * @file Test__MoEExpertComputeStage.cpp
+ * @brief Unit tests for MoE FFN stages: MoEExpertComputeStage, SharedExpertFFNStage, SharedExpertGateStage
  *
  * Tests the three MoE stages used by Qwen 3.5 MoE:
- * 1. MoEFFNStage: Router (softmax top-k) → expert SwiGLU → weighted combine
+ * 1. MoEExpertComputeStage: Router (softmax top-k) → expert SwiGLU → weighted combine
  * 2. SharedExpertFFNStage: Dense SwiGLU on shared expert weights
  * 3. SharedExpertGateStage: sigmoid(gate · input) × shared_output
  *
@@ -11,11 +11,14 @@
  */
 
 #include <gtest/gtest.h>
-#include "execution/compute_stages/stages/MoEFFNStage.h"
+#include "execution/compute_stages/stages/MoEExpertComputeStage.h"
+#include "execution/compute_stages/stages/MoERoutingStage.h"
 #include "execution/local_execution/graph/GraphSchema.h"
 #include "tensors/Tensors.h"
 #include "tensors/BlockStructures.h"
 #include "tensors/FP16Utils.h"
+#include "kernels/KernelFactory.h"
+#include "kernels/IMoEKernel.h"
 #include "mocks/MockComputeStage.h"
 #include "utils/TestTensorFactory.h"
 
@@ -32,7 +35,7 @@ using namespace llaminar2::testing;
 // Test Fixture
 // =========================================================================
 
-class MoEFFNStageTest : public ::testing::Test
+class MoEExpertComputeStageTest : public ::testing::Test
 {
 protected:
     std::unique_ptr<MockDeviceContext> cpu_ctx_;
@@ -137,13 +140,39 @@ protected:
             sum += a[i] * b[i];
         return sum;
     }
+    /// Compute routing results and return as FP32 tensors for MoEExpertComputeStage input.
+    /// Runs IMoEKernel::route() directly, converts indices to float.
+    struct RoutingResult {
+        std::shared_ptr<FP32Tensor> indices;  // float-cast expert IDs [seq_len * top_k]
+        std::shared_ptr<FP32Tensor> weights;  // normalized weights [seq_len * top_k]
+    };
+
+    RoutingResult computeRouting(TensorBase* input, TensorBase* gate_weights,
+                                 int seq_len, int d_model, int num_experts, int top_k,
+                                 bool norm_topk_prob = true)
+    {
+        using KernelFactory = llaminar::v2::kernels::KernelFactory;
+        auto* kernel = KernelFactory::getOrCreateMoEKernel(DeviceId::cpu());
+        MoERoutingResult routing;
+        kernel->route(input->data(), gate_weights->data(), seq_len, d_model,
+                     num_experts, top_k, norm_topk_prob, routing);
+
+        const size_t n = static_cast<size_t>(seq_len) * top_k;
+        auto indices = std::make_shared<FP32Tensor>(std::vector<size_t>{n, 1});
+        auto weights = std::make_shared<FP32Tensor>(std::vector<size_t>{n, 1});
+        for (size_t i = 0; i < n; ++i)
+            indices->mutable_data()[i] = static_cast<float>(routing.expert_indices[i]);
+        std::copy(routing.expert_weights.begin(), routing.expert_weights.end(),
+                 weights->mutable_data());
+        return {indices, weights};
+    }
 };
 
 // =========================================================================
 // SharedExpertFFNStage Tests
 // =========================================================================
 
-TEST_F(MoEFFNStageTest, SharedExpert_OutputNonZero)
+TEST_F(MoEExpertComputeStageTest, SharedExpert_OutputNonZero)
 {
     // Create small FP32 weight tensors for shared expert
     auto input = TestTensorFactory::createFP32Random({SEQ_LEN, D_MODEL}, -0.5f, 0.5f, 100);
@@ -190,7 +219,7 @@ TEST_F(MoEFFNStageTest, SharedExpert_OutputNonZero)
     }
 }
 
-TEST_F(MoEFFNStageTest, SharedExpert_MatchesReference)
+TEST_F(MoEExpertComputeStageTest, SharedExpert_MatchesReference)
 {
     const int seq = 1;
     const int d = 8;
@@ -262,7 +291,7 @@ TEST_F(MoEFFNStageTest, SharedExpert_MatchesReference)
     }
 }
 
-TEST_F(MoEFFNStageTest, SharedExpert_NullInputReturnsError)
+TEST_F(MoEExpertComputeStageTest, SharedExpert_NullInputReturnsError)
 {
     auto output = TestTensorFactory::createFP32({SEQ_LEN, D_MODEL});
 
@@ -282,7 +311,7 @@ TEST_F(MoEFFNStageTest, SharedExpert_NullInputReturnsError)
 // SharedExpertGateStage Tests
 // =========================================================================
 
-TEST_F(MoEFFNStageTest, SharedGate_AppliesSigmoidGating)
+TEST_F(MoEExpertComputeStageTest, SharedGate_AppliesSigmoidGating)
 {
     const int seq = 2;
     const int d = 8;
@@ -323,7 +352,7 @@ TEST_F(MoEFFNStageTest, SharedGate_AppliesSigmoidGating)
     }
 }
 
-TEST_F(MoEFFNStageTest, SharedGate_LargePositiveDotSaturates)
+TEST_F(MoEExpertComputeStageTest, SharedGate_LargePositiveDotSaturates)
 {
     const int seq = 1;
     const int d = 4;
@@ -361,7 +390,7 @@ TEST_F(MoEFFNStageTest, SharedGate_LargePositiveDotSaturates)
     }
 }
 
-TEST_F(MoEFFNStageTest, SharedGate_NullInputReturnsError)
+TEST_F(MoEExpertComputeStageTest, SharedGate_NullInputReturnsError)
 {
     auto shared_output = TestTensorFactory::createFP32({SEQ_LEN, D_MODEL});
 
@@ -377,10 +406,10 @@ TEST_F(MoEFFNStageTest, SharedGate_NullInputReturnsError)
 }
 
 // =========================================================================
-// MoEFFNStage Tests (Router + Expert FFN + Combine)
+// MoEExpertComputeStage Tests (Router + Expert FFN + Combine)
 // =========================================================================
 
-TEST_F(MoEFFNStageTest, MoEFFN_OutputNonZero_Q4K)
+TEST_F(MoEExpertComputeStageTest, MoEFFN_OutputNonZero_Q4K)
 {
     // D_MODEL=64 is not divisible by 256 (Q4_K block size).
     // We need cols that are multiples of 256 for quantized tensors.
@@ -401,10 +430,14 @@ TEST_F(MoEFFNStageTest, MoEFFN_OutputNonZero_Q4K)
     auto up_exps = createExpertQ4K(experts, inter, d, 211);
     auto down_exps = createExpertQ4K(experts, d, inter, 212);
 
-    MoEFFNStage::Params params;
+    // Compute routing externally
+    auto routing = computeRouting(input.get(), gate_weights.get(), seq, d, experts, topk);
+
+    MoEExpertComputeStage::Params params;
     params.device_id = DeviceId::cpu();
     params.input = input.get();
-    params.gate_weights = gate_weights.get();
+    params.routing_indices = routing.indices.get();
+    params.routing_weights = routing.weights.get();
     params.gate_exps = gate_exps.get();
     params.up_exps = up_exps.get();
     params.down_exps = down_exps.get();
@@ -414,12 +447,11 @@ TEST_F(MoEFFNStageTest, MoEFFN_OutputNonZero_Q4K)
     params.num_experts = experts;
     params.top_k = topk;
     params.expert_intermediate = inter;
-    params.norm_topk_prob = true;
 
     // Extract 2D expert views from 3D packed tensors (required by GEMM path)
-    ASSERT_TRUE(MoEFFNStage::extractExpertViews(params));
+    ASSERT_TRUE(MoEExpertComputeStage::extractExpertViews(params));
 
-    MoEFFNStage stage(params);
+    MoEExpertComputeStage stage(params);
     ASSERT_TRUE(stage.execute(cpu_ctx_.get()));
 
     // Output should be non-zero
@@ -443,7 +475,7 @@ TEST_F(MoEFFNStageTest, MoEFFN_OutputNonZero_Q4K)
     }
 }
 
-TEST_F(MoEFFNStageTest, MoEFFN_OutputNonZero_Q5K)
+TEST_F(MoEExpertComputeStageTest, MoEFFN_OutputNonZero_Q5K)
 {
     const int d = 256;
     const int inter = 256;
@@ -461,10 +493,14 @@ TEST_F(MoEFFNStageTest, MoEFFN_OutputNonZero_Q5K)
     auto up_exps = createExpertQ4K(experts, inter, d, 311);
     auto down_exps = createExpertQ5K(experts, d, inter, 312);
 
-    MoEFFNStage::Params params;
+    // Compute routing externally
+    auto routing = computeRouting(input.get(), gate_weights.get(), seq, d, experts, topk);
+
+    MoEExpertComputeStage::Params params;
     params.device_id = DeviceId::cpu();
     params.input = input.get();
-    params.gate_weights = gate_weights.get();
+    params.routing_indices = routing.indices.get();
+    params.routing_weights = routing.weights.get();
     params.gate_exps = gate_exps.get();
     params.up_exps = up_exps.get();
     params.down_exps = down_exps.get();
@@ -474,11 +510,10 @@ TEST_F(MoEFFNStageTest, MoEFFN_OutputNonZero_Q5K)
     params.num_experts = experts;
     params.top_k = topk;
     params.expert_intermediate = inter;
-    params.norm_topk_prob = true;
 
-    ASSERT_TRUE(MoEFFNStage::extractExpertViews(params));
+    ASSERT_TRUE(MoEExpertComputeStage::extractExpertViews(params));
 
-    MoEFFNStage stage(params);
+    MoEExpertComputeStage stage(params);
     ASSERT_TRUE(stage.execute(cpu_ctx_.get()));
 
     const float *out = output->data();
@@ -496,7 +531,7 @@ TEST_F(MoEFFNStageTest, MoEFFN_OutputNonZero_Q5K)
     EXPECT_TRUE(any_nonzero) << "MoEFFN Q5K output is all zeros";
 }
 
-TEST_F(MoEFFNStageTest, MoEFFN_MultipleTokens)
+TEST_F(MoEExpertComputeStageTest, MoEFFN_MultipleTokens)
 {
     const int d = 256;
     const int inter = 256;
@@ -513,10 +548,14 @@ TEST_F(MoEFFNStageTest, MoEFFN_MultipleTokens)
     auto up_exps = createExpertQ4K(experts, inter, d, 411);
     auto down_exps = createExpertQ4K(experts, d, inter, 412);
 
-    MoEFFNStage::Params params;
+    // Compute routing externally
+    auto routing = computeRouting(input.get(), gate_weights.get(), seq, d, experts, topk);
+
+    MoEExpertComputeStage::Params params;
     params.device_id = DeviceId::cpu();
     params.input = input.get();
-    params.gate_weights = gate_weights.get();
+    params.routing_indices = routing.indices.get();
+    params.routing_weights = routing.weights.get();
     params.gate_exps = gate_exps.get();
     params.up_exps = up_exps.get();
     params.down_exps = down_exps.get();
@@ -526,11 +565,10 @@ TEST_F(MoEFFNStageTest, MoEFFN_MultipleTokens)
     params.num_experts = experts;
     params.top_k = topk;
     params.expert_intermediate = inter;
-    params.norm_topk_prob = true;
 
-    ASSERT_TRUE(MoEFFNStage::extractExpertViews(params));
+    ASSERT_TRUE(MoEExpertComputeStage::extractExpertViews(params));
 
-    MoEFFNStage stage(params);
+    MoEExpertComputeStage stage(params);
     ASSERT_TRUE(stage.execute(cpu_ctx_.get()));
 
     // Each token should get a non-zero output
@@ -549,16 +587,18 @@ TEST_F(MoEFFNStageTest, MoEFFN_MultipleTokens)
     }
 }
 
-TEST_F(MoEFFNStageTest, MoEFFN_NullWeightsReturnsError)
+TEST_F(MoEExpertComputeStageTest, MoEFFN_NullWeightsReturnsError)
 {
     auto input = TestTensorFactory::createFP32({SEQ_LEN, D_MODEL});
     auto output = TestTensorFactory::createFP32({SEQ_LEN, D_MODEL});
-    auto gate_weights = TestTensorFactory::createFP32({NUM_EXPERTS, D_MODEL});
+    auto routing_idx = TestTensorFactory::createFP32({SEQ_LEN * TOP_K, 1});
+    auto routing_wt = TestTensorFactory::createFP32({SEQ_LEN * TOP_K, 1});
 
-    MoEFFNStage::Params params;
+    MoEExpertComputeStage::Params params;
     params.device_id = DeviceId::cpu();
     params.input = input.get();
-    params.gate_weights = gate_weights.get();
+    params.routing_indices = routing_idx.get();
+    params.routing_weights = routing_wt.get();
     params.gate_exps = nullptr; // null expert weights
     params.up_exps = nullptr;
     params.down_exps = nullptr;
@@ -569,11 +609,11 @@ TEST_F(MoEFFNStageTest, MoEFFN_NullWeightsReturnsError)
     params.top_k = TOP_K;
     params.expert_intermediate = INTERMEDIATE;
 
-    MoEFFNStage stage(params);
+    MoEExpertComputeStage stage(params);
     EXPECT_FALSE(stage.execute(cpu_ctx_.get()));
 }
 
-TEST_F(MoEFFNStageTest, MoEFFN_DifferentTokensGetDifferentOutputs)
+TEST_F(MoEExpertComputeStageTest, MoEFFN_DifferentTokensGetDifferentOutputs)
 {
     const int d = 256;
     const int inter = 256;
@@ -598,10 +638,14 @@ TEST_F(MoEFFNStageTest, MoEFFN_DifferentTokensGetDifferentOutputs)
     auto up_exps = createExpertQ4K(experts, inter, d, 511);
     auto down_exps = createExpertQ4K(experts, d, inter, 512);
 
-    MoEFFNStage::Params params;
+    // Compute routing externally
+    auto routing = computeRouting(input.get(), gate_weights.get(), seq, d, experts, topk);
+
+    MoEExpertComputeStage::Params params;
     params.device_id = DeviceId::cpu();
     params.input = input.get();
-    params.gate_weights = gate_weights.get();
+    params.routing_indices = routing.indices.get();
+    params.routing_weights = routing.weights.get();
     params.gate_exps = gate_exps.get();
     params.up_exps = up_exps.get();
     params.down_exps = down_exps.get();
@@ -611,11 +655,10 @@ TEST_F(MoEFFNStageTest, MoEFFN_DifferentTokensGetDifferentOutputs)
     params.num_experts = experts;
     params.top_k = topk;
     params.expert_intermediate = inter;
-    params.norm_topk_prob = true;
 
-    ASSERT_TRUE(MoEFFNStage::extractExpertViews(params));
+    ASSERT_TRUE(MoEExpertComputeStage::extractExpertViews(params));
 
-    MoEFFNStage stage(params);
+    MoEExpertComputeStage stage(params);
     ASSERT_TRUE(stage.execute(cpu_ctx_.get()));
 
     // Token 0 and Token 1 should produce different outputs
@@ -627,7 +670,7 @@ TEST_F(MoEFFNStageTest, MoEFFN_DifferentTokensGetDifferentOutputs)
     EXPECT_GT(diff, 0.0f) << "Different input tokens produced identical outputs";
 }
 
-TEST_F(MoEFFNStageTest, MoEFFN_NormTopKProbSumsToOne)
+TEST_F(MoEExpertComputeStageTest, MoEFFN_NormTopKProbSumsToOne)
 {
     // Verify that with norm_topk_prob=true, expert weights sum to ~1
     // We test this indirectly by checking the output has reasonable magnitude
@@ -650,10 +693,13 @@ TEST_F(MoEFFNStageTest, MoEFFN_NormTopKProbSumsToOne)
 
     // Run with norm_topk_prob=true
     {
-        MoEFFNStage::Params params;
+        auto routing = computeRouting(input.get(), gate_weights.get(), seq, d, experts, topk, true);
+
+        MoEExpertComputeStage::Params params;
         params.device_id = DeviceId::cpu();
         params.input = input.get();
-        params.gate_weights = gate_weights.get();
+        params.routing_indices = routing.indices.get();
+        params.routing_weights = routing.weights.get();
         params.gate_exps = gate_exps.get();
         params.up_exps = up_exps.get();
         params.down_exps = down_exps.get();
@@ -663,20 +709,22 @@ TEST_F(MoEFFNStageTest, MoEFFN_NormTopKProbSumsToOne)
         params.num_experts = experts;
         params.top_k = topk;
         params.expert_intermediate = inter;
-        params.norm_topk_prob = true;
 
-        ASSERT_TRUE(MoEFFNStage::extractExpertViews(params));
+        ASSERT_TRUE(MoEExpertComputeStage::extractExpertViews(params));
 
-        MoEFFNStage stage(params);
+        MoEExpertComputeStage stage(params);
         ASSERT_TRUE(stage.execute(cpu_ctx_.get()));
     }
 
     // Run with norm_topk_prob=false
     {
-        MoEFFNStage::Params params;
+        auto routing = computeRouting(input.get(), gate_weights.get(), seq, d, experts, topk, false);
+
+        MoEExpertComputeStage::Params params;
         params.device_id = DeviceId::cpu();
         params.input = input.get();
-        params.gate_weights = gate_weights.get();
+        params.routing_indices = routing.indices.get();
+        params.routing_weights = routing.weights.get();
         params.gate_exps = gate_exps.get();
         params.up_exps = up_exps.get();
         params.down_exps = down_exps.get();
@@ -686,11 +734,10 @@ TEST_F(MoEFFNStageTest, MoEFFN_NormTopKProbSumsToOne)
         params.num_experts = experts;
         params.top_k = topk;
         params.expert_intermediate = inter;
-        params.norm_topk_prob = false;
 
-        ASSERT_TRUE(MoEFFNStage::extractExpertViews(params));
+        ASSERT_TRUE(MoEExpertComputeStage::extractExpertViews(params));
 
-        MoEFFNStage stage(params);
+        MoEExpertComputeStage stage(params);
         ASSERT_TRUE(stage.execute(cpu_ctx_.get()));
     }
 
@@ -715,9 +762,9 @@ TEST_F(MoEFFNStageTest, MoEFFN_NormTopKProbSumsToOne)
 // Stage Metadata Tests
 // =========================================================================
 
-TEST_F(MoEFFNStageTest, MoEFFN_TypeAndName)
+TEST_F(MoEExpertComputeStageTest, MoEFFN_TypeAndName)
 {
-    MoEFFNStage::Params params;
+    MoEExpertComputeStage::Params params;
     params.device_id = DeviceId::cpu();
     params.num_experts = NUM_EXPERTS;
     params.top_k = TOP_K;
@@ -725,7 +772,7 @@ TEST_F(MoEFFNStageTest, MoEFFN_TypeAndName)
     params.seq_len = SEQ_LEN;
     params.d_model = D_MODEL;
 
-    MoEFFNStage stage(params);
+    MoEExpertComputeStage stage(params);
     EXPECT_EQ(stage.type(), ComputeStageType::MOE_EXPERT_FFN);
     EXPECT_EQ(stage.name(), "moe_ffn");
     EXPECT_TRUE(stage.supportsBackend(ComputeBackendType::CPU));
@@ -733,7 +780,7 @@ TEST_F(MoEFFNStageTest, MoEFFN_TypeAndName)
     EXPECT_GT(stage.estimatedFlops(), 0u);
 }
 
-TEST_F(MoEFFNStageTest, SharedExpert_TypeAndName)
+TEST_F(MoEExpertComputeStageTest, SharedExpert_TypeAndName)
 {
     SharedExpertFFNStage::Params params;
     params.device_id = DeviceId::cpu();
@@ -748,7 +795,7 @@ TEST_F(MoEFFNStageTest, SharedExpert_TypeAndName)
     EXPECT_GT(stage.estimatedFlops(), 0u);
 }
 
-TEST_F(MoEFFNStageTest, SharedGate_TypeAndName)
+TEST_F(MoEExpertComputeStageTest, SharedGate_TypeAndName)
 {
     SharedExpertGateStage::Params params;
     params.device_id = DeviceId::cpu();
@@ -765,7 +812,7 @@ TEST_F(MoEFFNStageTest, SharedGate_TypeAndName)
 // isNonGemmWeight Tests (regression: 3D tensors must not go through GEMM prep)
 // =========================================================================
 
-TEST_F(MoEFFNStageTest, IsNonGemmWeight_ExpertTensorsExcluded)
+TEST_F(MoEExpertComputeStageTest, IsNonGemmWeight_ExpertTensorsExcluded)
 {
     // Verify isNonGemmWeight correctly excludes MoE tensors
     WeightShardingConfig config;

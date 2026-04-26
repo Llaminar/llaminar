@@ -70,8 +70,6 @@ namespace llaminar2
             return "MOE_ROUTER";
         case ComputeStageType::MOE_EXPERT_FFN:
             return "MOE_EXPERT_FFN";
-        case ComputeStageType::MOE_COMBINE:
-            return "MOE_COMBINE";
         case ComputeStageType::MOE_SHARED_EXPERT_FFN:
             return "MOE_SHARED_EXPERT_FFN";
         case ComputeStageType::MOE_SHARED_EXPERT_GATE:

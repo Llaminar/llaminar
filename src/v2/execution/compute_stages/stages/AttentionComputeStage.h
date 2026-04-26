@@ -29,7 +29,6 @@ namespace llaminar2
      *   output = softmax(Q @ K^T / sqrt(head_dim) + mask) @ V
      *
      * For KV cache management, use KVCacheAppendStage separately in the DAG.
-     * For integrated cache+attention, use AttentionWithKVCacheStage.
      *
      * **Workspace Management (ROCm GPU)**:
      * Implements IWorkspaceConsumerStage to delegate workspace requirements to the

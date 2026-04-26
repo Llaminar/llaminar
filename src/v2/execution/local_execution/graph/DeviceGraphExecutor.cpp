@@ -1032,7 +1032,7 @@ namespace llaminar2
         {
             if (profiling)
                 phase_start = std::chrono::high_resolution_clock::now();
-            // Re-fetch dump info post-execute: stages like MoEFFNStage stash
+            // Re-fetch dump info post-execute: stages like MoEExpertComputeStage stash
             // runtime routing data during execute() and invalidate the cache.
             // Since cached_dump_info aliases the stage's internal cached object,
             // this getDumpInfo() call rebuilds it with post-execute data.

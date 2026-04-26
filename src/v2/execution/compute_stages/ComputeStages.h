@@ -8,7 +8,6 @@
  *
  * Individual stages can also be included directly from stages/ subfolder:
  *   #include "execution/compute_stages/stages/GEMMStage.h"
- *   #include "execution/compute_stages/stages/AttentionWithKVCacheStage.h"
  */
 
 #pragma once
@@ -26,7 +25,6 @@
 #include "stages/RoPEStage.h"
 
 // Attention stages
-#include "stages/AttentionWithKVCacheStage.h"
 #include "stages/KVCacheAppendStage.h"
 #include "stages/KVCacheGatherStage.h"
 #include "stages/AttentionComputeStage.h"
@@ -41,9 +39,6 @@
 // MPI communication stages
 #include "stages/AllreduceStage.h"
 #include "stages/AllGatherStage.h"
-
-// MoE stages
-#include "stages/MoEStages.h"
 
 // Qwen 3.5 FA stages
 #include "stages/QGateSplitStage.h"

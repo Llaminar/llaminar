@@ -468,9 +468,31 @@ namespace llaminar2
         }
 
         case TPMode::ExpertParallel:
-            // MoE expert parallelism - TODO for Phase 4e
-            LOG_WARN("[GraphResolver] ExpertParallel not yet implemented");
-            return std::nullopt;
+        {
+            // Expert-parallel projection: allreduce the partial expert outputs
+            ResolvedStage allreduce;
+            allreduce.name = resolved.name + "_allreduce";
+            allreduce.type = StageType::Allreduce;
+            allreduce.device = resolved.device;
+            allreduce.dependencies.push_back(resolved.name);
+
+            if (!resolved.outputs.empty())
+            {
+                allreduce.inputs.push_back(resolved.outputs[0]);
+                allreduce.outputs.push_back(resolved.outputs[0]); // In-place
+            }
+
+            allreduce.opaque_params["mpi_ctx"] = const_cast<void *>(static_cast<const void *>(runtime.mpi_ctx));
+
+            size_t count = static_cast<size_t>(runtime.batch_size) *
+                           static_cast<size_t>(runtime.seq_len) *
+                           static_cast<size_t>(runtime.d_model);
+            allreduce.int_params["count"] = static_cast<int>(count);
+
+            LOG_TRACE("[GraphResolver] Inserting allreduce after " << resolved.name
+                      << " (ExpertParallel)");
+            return allreduce;
+        }
 
         default:
             return std::nullopt;

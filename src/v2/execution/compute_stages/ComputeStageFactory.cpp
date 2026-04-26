@@ -8,14 +8,13 @@
 #include "stages/AllGatherVStage.h"
 #include "stages/AllreduceStage.h"
 #include "stages/AttentionComputeStage.h"
-#include "stages/AttentionWithKVCacheStage.h"
 #include "stages/FusedGateUpGEMMStage.h"
 #include "stages/FusedQKVGEMMStage.h"
 #include "stages/GEMMStage.h"
 #include "stages/KVCacheAppendStage.h"
 #include "stages/KVCacheGatherStage.h"
 #include "stages/LMHeadStage.h"
-#include "stages/MoEStages.h"
+#include "stages/MoERoutingStage.h"
 #include "stages/ReceiveActivationsStage.h"
 #include "stages/ResidualAddStage.h"
 #include "stages/RMSNormStage.h"\n #include "stages/QKNormStage.h"
@@ -95,30 +94,22 @@ namespace llaminar2
         return std::make_unique<FusedAddAllreduceStage>(params);
     }
 
-    std::unique_ptr<IComputeStage> ComputeStageFactory::createMoERouter(
-        const MoERouterStage::Params &params)
+    std::unique_ptr<IComputeStage> ComputeStageFactory::createMoEExpertCompute(
+        const MoEExpertComputeStage::Params &params)
     {
-        // Unified: MoERouterStage will use KernelFactory at execute-time
-        return std::make_unique<MoERouterStage>(params);
-    }
-
-    std::unique_ptr<IComputeStage> ComputeStageFactory::createMoEExpert(
-        const MoEExpertStage::Params &params)
-    {
-        // Unified: MoEExpertStage will use KernelFactory at execute-time
-        return std::make_unique<MoEExpertStage>(params);
-    }
-
-    std::unique_ptr<IComputeStage> ComputeStageFactory::createMoECombine(
-        const MoECombineStage::Params &params)
-    {
-        return std::make_unique<MoECombineStage>(params);
+        return std::make_unique<MoEExpertComputeStage>(params);
     }
 
     std::unique_ptr<IComputeStage> ComputeStageFactory::createMoEFFN(
-        const MoEFFNStage::Params &params)
+        const MoEExpertComputeStage::Params &params)
     {
-        return std::make_unique<MoEFFNStage>(params);
+        return std::make_unique<MoEExpertComputeStage>(params);
+    }
+
+    std::unique_ptr<IComputeStage> ComputeStageFactory::createMoERouting(
+        const MoERoutingStage::Params &params)
+    {
+        return std::make_unique<MoERoutingStage>(params);
     }
 
     std::unique_ptr<IComputeStage> ComputeStageFactory::createSharedExpertFFN(
@@ -166,13 +157,6 @@ namespace llaminar2
     {
         // ReceiveActivations is backend-agnostic (uses MPI point-to-point)
         return std::make_unique<ReceiveActivationsStage>(params);
-    }
-
-    std::unique_ptr<IComputeStage> ComputeStageFactory::createAttentionWithKVCache(
-        const AttentionWithKVCacheStage::Params &params)
-    {
-        // Unified: AttentionWithKVCacheStage uses KernelFactory at execute-time
-        return std::make_unique<AttentionWithKVCacheStage>(params);
     }
 
     std::unique_ptr<IComputeStage> ComputeStageFactory::createKVCacheAppend(

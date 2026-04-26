@@ -722,7 +722,7 @@ namespace llaminar2
         /// Get MoE rebalance controller (for post-decode logging)
         MoERebalanceController* moeRebalanceController() const { return moe_rebalance_controller_.get(); }
 
-        /// Apply expert masks to all MoEFFNStages in cached FFN graphs.
+        /// Apply expert masks to all MoEExpertComputeStages in cached FFN graphs.
         /// Called after rebalancing to update which experts each rank computes.
         /// @param masks Per-layer expert masks (masks[layer][expert] == true means active)
         /// @param received_weights Optional transferred packed weights from MPI transfer

@@ -31,10 +31,6 @@ namespace llaminar2
      * - Explicit control: Manual cache management for advanced use cases
      * - Cross-device caches: Cache on GPU while computing on CPU
      *
-     * For most use cases, prefer AttentionWithKVCacheStage which handles
-     * cache operations internally. Use this stage when you need fine-grained
-     * control over cache timing.
-     *
      * VNNI-Safe Quantization (Q16_1 cache):
      * When the cache is Q16_1, this stage uses FIXED-SCALE quantization with
      * VNNI-safe clipping to prevent INT32 overflow during attention computation.
