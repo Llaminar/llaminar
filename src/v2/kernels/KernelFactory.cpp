@@ -2571,7 +2571,7 @@ namespace llaminar
                 auto *raw_ptr = kernel.get();
                 moe_cache_[key] = std::move(kernel);
                 device_kernel_registry_[registry_key] = std::shared_ptr<void>(raw_ptr, [](void *) {});
-                LOG_INFO("[KernelFactory][MOE] create dev=" << static_cast<int>(target_device.type)
+                LOG_DEBUG("[KernelFactory][MOE] create dev=" << static_cast<int>(target_device.type)
                                                             << ":" << target_device.ordinal
                                                             << " kernel=" << static_cast<const void *>(raw_ptr));
                 return raw_ptr;
@@ -3698,6 +3698,71 @@ namespace llaminar
                 return it->second.get();
             }
 
+            const KernelFactory::PreparedGemmHandle *KernelFactory::registerPreparedGemmFromTransfer(
+                const llaminar2::TensorBase *tensor,
+                llaminar2::DeviceId target_device,
+                std::unique_ptr<llaminar2::ITensorGemm> kernel)
+            {
+                if (!tensor || !kernel)
+                {
+                    LOG_ERROR("[KernelFactory] registerPreparedGemmFromTransfer: null tensor or kernel");
+                    return nullptr;
+                }
+
+                // Resolve preparation kind (same logic as getOrCreatePreparedGemmWeights)
+                const bool quantized = dynamic_cast<const llaminar2::IINT8Unpackable *>(tensor) != nullptr;
+                GemmPreparationKind resolved_kind = quantized
+                    ? GemmPreparationKind::CPU_PACKED
+                    : GemmPreparationKind::FLOATING_POINT;
+                if (quantized)
+                {
+                    switch (getDeviceType(target_device))
+                    {
+                    case DeviceType::CPU:
+                        resolved_kind = GemmPreparationKind::CPU_PACKED;
+                        break;
+                    case DeviceType::CUDA:
+                        resolved_kind = GemmPreparationKind::CUDA_INT8_PACKED;
+                        break;
+                    case DeviceType::ROCm:
+                        resolved_kind = GemmPreparationKind::ROCM_INT8_PACKED;
+                        break;
+                    default:
+                        break;
+                    }
+                }
+
+                const PreparedGemmKey key{
+                    tensor->raw_data(),
+                    static_cast<size_t>(tensor->shape().size() > 0 ? tensor->shape()[0] : 0),
+                    static_cast<size_t>(tensor->shape().size() > 1 ? tensor->shape()[1] : 0),
+                    target_device,
+                    static_cast<int>(resolved_kind)};
+
+                auto handle = std::make_shared<PreparedGemmHandle>();
+                handle->tensor = tensor;
+                handle->device_id = target_device;
+                handle->kind = resolved_kind;
+                handle->variant = static_cast<int>(tensor->native_type());
+                handle->prepared_weights = std::make_shared<PreparedGemmWeights>();
+                handle->prepared_weights->kind = resolved_kind;
+                handle->prepared_weights->owned_kernel = std::shared_ptr<llaminar2::ITensorGemm>(std::move(kernel));
+                handle->prepared_weights->kernel = handle->prepared_weights->owned_kernel.get();
+
+                std::lock_guard<std::mutex> lock(cache_mutex_);
+                auto [it, inserted] = prepared_gemm_registry_.emplace(key, std::move(handle));
+                if (inserted)
+                {
+                    tensor->in_prepared_gemm_registry_ = true;
+                }
+                LOG_TRACE("[KernelFactory] Registered transferred weights"
+                         << " dev=" << static_cast<int>(target_device.type)
+                         << ":" << target_device.ordinal
+                         << " tensor=" << tensor
+                         << (inserted ? " (new)" : " (existing)"));
+                return it->second.get();
+            }
+
             void KernelFactory::clearPreparedGemmWeightsFor(const llaminar2::TensorBase *tensor)
             {
                 std::lock_guard<std::mutex> lock(cache_mutex_);
@@ -3752,6 +3817,49 @@ namespace llaminar
                     {
                         ++it;
                     }
+                }
+            }
+
+            void KernelFactory::clearPreparedGemmWeightsForBatch(
+                const std::vector<const llaminar2::TensorBase *> &tensors)
+            {
+                if (tensors.empty()) return;
+
+                std::unordered_set<const llaminar2::TensorBase *> tensor_set(
+                    tensors.begin(), tensors.end());
+
+                std::lock_guard<std::mutex> lock(cache_mutex_);
+
+                for (auto it = fused_qkv_cache_.begin(); it != fused_qkv_cache_.end();)
+                {
+                    const auto *wq = it->first.wq_handle;
+                    const auto *wk = it->first.wk_handle;
+                    const auto *wv = it->first.wv_handle;
+                    const bool hit =
+                        (wq && tensor_set.count(wq->tensor)) ||
+                        (wk && tensor_set.count(wk->tensor)) ||
+                        (wv && tensor_set.count(wv->tensor));
+                    if (hit) it = fused_qkv_cache_.erase(it);
+                    else ++it;
+                }
+
+                for (auto it = fused_gate_up_cache_.begin(); it != fused_gate_up_cache_.end();)
+                {
+                    const auto *gate = it->first.w_gate_handle;
+                    const auto *up   = it->first.w_up_handle;
+                    const bool hit =
+                        (gate && tensor_set.count(gate->tensor)) ||
+                        (up   && tensor_set.count(up->tensor));
+                    if (hit) it = fused_gate_up_cache_.erase(it);
+                    else ++it;
+                }
+
+                for (auto it = prepared_gemm_registry_.begin(); it != prepared_gemm_registry_.end();)
+                {
+                    if (it->second && tensor_set.count(it->second->tensor))
+                        it = prepared_gemm_registry_.erase(it);
+                    else
+                        ++it;
                 }
             }
 

@@ -62,9 +62,19 @@ namespace llaminar2
          * Lazily initializes the topology on first access. The topology
          * provides device inventory and placement strategy computation.
          *
-         * @return Reference to the MPITopology instance
+         * @return Pointer to the IMPITopology instance (never null for real contexts)
          */
-        const MPITopology &topology() const;
+        const IMPITopology *topology() const override;
+
+        /**
+         * @brief Get the concrete MPITopology (non-virtual, for callers that need MPITopology-specific APIs)
+         */
+        const MPITopology &concrete_topology() const;
+
+        /**
+         * @brief Get communicator for ranks on the same physical node
+         */
+        MPI_Comm intra_node_comm() const override;
 
         /**
          * @brief All-reduce sum operation
@@ -708,12 +718,26 @@ namespace llaminar2
 
 namespace llaminar2
 {
-    inline const MPITopology &MPIContext::topology() const
+    inline const IMPITopology *MPIContext::topology() const
+    {
+        if (!topology_)
+        {
+            topology_ = std::make_unique<MPITopology>(comm_);
+        }
+        return topology_.get();
+    }
+
+    inline const MPITopology &MPIContext::concrete_topology() const
     {
         if (!topology_)
         {
             topology_ = std::make_unique<MPITopology>(comm_);
         }
         return *topology_;
+    }
+
+    inline MPI_Comm MPIContext::intra_node_comm() const
+    {
+        return concrete_topology().intra_node_comm();
     }
 } // namespace llaminar2

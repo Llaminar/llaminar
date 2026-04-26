@@ -16,6 +16,9 @@
 #include "../IComputeStage.h"
 #include "../StageParamsBase.h"
 #include "../../../memory/BufferId.h"
+#include "../../../kernels/IMoEKernel.h"
+#include "../../moe/ExpertWeightTransfer.h"
+#include "../../moe/MoERebalanceController.h"
 
 #include <memory>
 #include <vector>
@@ -26,7 +29,6 @@ namespace llaminar2
     // Forward declarations
     class ITensorGemm;
     class FP32Tensor;
-    class IMoEKernel;
     class DecodeExpertHistogram;
 
     /**
@@ -82,7 +84,17 @@ namespace llaminar2
             /// When non-empty (size == num_experts), expert_mask[e] == true means
             /// this rank should compute expert e. Overrides local_expert_start/count.
             /// When empty, falls back to contiguous range behavior.
+            /// When replicas are active, includes both owned and replicated experts.
             std::vector<bool> expert_mask;
+
+            /// Expert replication for per-token dynamic dispatch.
+            /// When set (num_replicated > 0), replicated experts are assigned
+            /// to sockets per-token to balance load. Both sockets have GEMM
+            /// engines for replicated experts; only one computes each per token.
+            ExpertReplicaSet replica_set;
+
+            /// This rank's socket ID (for per-token replica dispatch).
+            int my_socket_id = 0;
 
             // Per-expert 2D tensor views — used by GPU path
             // Each vector has num_experts entries; each entry is a 2D view
@@ -125,6 +137,9 @@ namespace llaminar2
         std::string name() const override { return "moe_ffn"; }
         size_t estimatedFlops() const override;
 
+        /// Layer index this stage belongs to (-1 if unset).
+        int layerIndex() const { return params_.layer_idx; }
+
         /// In expert-parallel mode, a rank's MoE FFN output can be all zeros
         /// when no selected experts fall in its local range. The downstream
         /// AllReduce combines partial results across ranks.
@@ -137,10 +152,58 @@ namespace llaminar2
         /// mask.size() must == num_experts. Returns false on size mismatch.
         bool updateExpertMask(const std::vector<bool>& mask);
 
+        /// Set replica info for per-token dynamic dispatch.
+        void setReplicaSet(const ExpertReplicaSet& replicas, int socket_id)
+        {
+            params_.replica_set = replicas;
+            params_.my_socket_id = socket_id;
+            // Pre-build prefill mask: single-lookup replaces multi-branch check
+            if (replicas.num_replicated > 0 && !params_.expert_mask.empty())
+                params_.replica_set.buildPrefillMask(socket_id, params_.expert_mask);
+        }
+
+        /// Detach and serialize packed weights for a departing expert.
+        /// Returns serialized gate/up/down blobs. After this call, the expert's
+        /// GEMM engines have empty weights (will be cleaned up in Phase 1 of
+        /// updateExpertMaskAndPrepareEngines).
+        ExpertWeightBlobs detachAndSerializeExpert(int expert_id);
+
+        /// Serialize packed weights for an expert without detaching.
+        /// The owner keeps its GEMM engines intact. Used for replica transfers
+        /// where both sockets need the weights.
+        ExpertWeightBlobs serializeExpert(int expert_id) const;
+
         /// Update mask AND lazily prepare GEMM engines for newly-acquired experts.
         /// Call this after rebalancing — it only VNNI-packs experts that weren't
         /// previously prepared, avoiding the 2x memory overhead of preparing all upfront.
-        bool updateExpertMaskAndPrepareEngines(const std::vector<bool>& new_mask);
+        /// If received_weights is non-null, uses transferred packed data for experts
+        /// that have entries, falling back to repack-from-raw for the rest.
+        bool updateExpertMaskAndPrepareEngines(
+            const std::vector<bool>& new_mask,
+            const std::unordered_map<int, ExpertWeightBlobs>* received_weights = nullptr);
+
+        // ── Phased rebalance API (used by DeviceGraphOrchestrator) ───────
+        //
+        // These replace the monolithic updateExpertMaskAndPrepareEngines()
+        // when the caller needs to batch cache eviction across many stages.
+
+        /// Phase 1: Release departed expert engines, return tensor views to evict.
+        /// Releases packed weights and nulls engine pointers for experts that are
+        /// NOT in new_mask but currently prepared.  Does NOT touch KernelFactory
+        /// caches — the caller must batch-evict the returned pointers.
+        std::vector<const TensorBase*> releaseDepartedExperts(
+            const std::vector<bool>& new_mask);
+
+        /// Phase 2: Register transferred weights and prepare GEMM engines for
+        /// newly-acquired experts.  Call AFTER batch cache eviction of departed
+        /// tensor views.
+        bool registerAndPrepareNewExperts(
+            const std::vector<bool>& new_mask,
+            const std::unordered_map<int, ExpertWeightBlobs>* received_weights);
+
+        /// Phase 3: Apply the new expert mask and invalidate cached engine vectors.
+        void applyExpertMask(const std::vector<bool>& new_mask);
+
         bool supportsBackend(ComputeBackendType backend) const override;
         StageBufferRequirements getBufferRequirements() const override;
         StageDumpInfo buildDumpInfoImpl() const override;
@@ -154,8 +217,21 @@ namespace llaminar2
         /// during model loading rather than on first inference call.
         static bool prepareExpertGemmEngines(Params &params);
 
+        /// Release 3D parent weight tensors to free raw (un-packed) weight memory.
+        /// After this call, expert views remain as KernelFactory cache keys but
+        /// fallback VNNI repacking from raw data is no longer possible.
+        /// Only call after all engines are prepared AND prepacked MPI transfer
+        /// is available as the sole weight transfer mechanism.
+        /// @return Bytes freed (approximate, from 3D tensor data)
+        size_t releaseRawExpertWeights();
+
     private:
+        /// Register transferred packed weights for one expert (gate/up/down).
+        /// Returns true if all 3 projections registered successfully.
+        bool registerTransferredExpert(int expert_id, const ExpertWeightBlobs& blobs);
+
         Params params_;
+        bool raw_weights_released_ = false; ///< Set by releaseRawExpertWeights()
 
 #ifdef HAVE_CUDA
         static bool prepareExpertGemmEnginesCUDA(Params &params);
@@ -198,6 +274,10 @@ namespace llaminar2
 
         /// Cached MoE kernel (routing, gather/scatter, SwiGLU fallback)
         mutable IMoEKernel *moe_kernel_ = nullptr;
+
+        /// Pre-allocated routing result to avoid heap allocs per decode token.
+        /// route() calls resize() which is a no-op after first call.
+        mutable MoERoutingResult cached_routing_;
 
         /// Fast path for decode (seq_len=1): avoids token grouping, gather/scatter,
         /// and per-expert heap allocations. Uses routing results directly.

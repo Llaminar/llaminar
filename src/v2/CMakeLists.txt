@@ -1332,7 +1332,6 @@ add_library(llaminar2_core STATIC
     # Vectorized primitives (ported from V1)
     kernels/cpu/primitives/RoPEPrimitives.cpp
     kernels/cpu/primitives/RMSNormPrimitives.cpp
-    kernels/cpu/primitives/SoftmaxPrimitives.cpp
     kernels/cpu/primitives/SwiGLUPrimitives.cpp
     kernels/cpu/primitives/VectorPrimitives.cpp
     kernels/cpu/primitives/Q16HeadNormalization.cpp

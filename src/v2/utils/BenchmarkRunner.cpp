@@ -215,6 +215,10 @@ namespace llaminar2
                 double time_ms = std::chrono::duration<double, std::milli>(end - start).count();
                 return {false, time_ms, tokens_generated, generated_text};
             }
+
+            // Optional per-step callback (e.g., incremental MoE expert rebalancing)
+            if (decode_step_cb_)
+                decode_step_cb_();
         }
 
         // Synchronize after decode phase (skip for single-rank)
@@ -370,6 +374,19 @@ namespace llaminar2
         if (post_warmup_cb_)
         {
             post_warmup_cb_();
+
+            // Re-warm caches after post-warmup work (e.g., MPI expert weight
+            // transfers can evict hot data from LLC, causing the first benchmark
+            // iteration to measure cold-cache performance).
+            if (mpi_ctx_->rank() == 0)
+                LOG_INFO("Re-warming caches after post-warmup setup...");
+            runner_->clear_cache();
+            auto [rw_ok, rw_time] = runPrefill(tokens);
+            if (rw_ok && n_decode > 0)
+            {
+                int eos_token = tokenizer_->eos_token();
+                runDecode(n_decode, eos_token, /*ignore_stop_tokens=*/true);
+            }
         }
 
         if (mpi_ctx_->rank() == 0)

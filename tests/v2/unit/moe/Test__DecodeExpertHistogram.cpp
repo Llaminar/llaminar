@@ -116,22 +116,19 @@ TEST(Test__DecodeExpertHistogram, MultipleRecords_DifferentLayers)
 
     int idx[] = {0, 1};
     float w[] = {0.5f, 0.5f};
-    hist.record(0, idx, w, 2);
-    hist.record(1, idx, w, 2);
-    hist.record(1, idx, w, 2);
-    hist.record(2, idx, w, 2);
-    hist.record(2, idx, w, 2);
-    hist.record(2, idx, w, 2);
 
-    // Layer 0: 1 token
-    EXPECT_EQ(hist.activationCount(0, 0), 1u);
-    // Layer 1: 2 tokens
-    EXPECT_EQ(hist.activationCount(1, 0), 2u);
-    // Layer 2: 3 tokens
+    // Simulate 3 complete decode tokens (all layers per token)
+    for (int token = 0; token < 3; ++token)
+        for (int l = 0; l < 3; ++l)
+            hist.record(l, idx, w, 2);
+
+    // Each layer sees 3 tokens
+    EXPECT_EQ(hist.activationCount(0, 0), 3u);
+    EXPECT_EQ(hist.activationCount(1, 0), 3u);
     EXPECT_EQ(hist.activationCount(2, 0), 3u);
 
-    // Window counts all tokens across all layers
-    EXPECT_EQ(hist.windowTokenCount(), 6u);
+    // Window counts actual decode tokens (incremented once per last-layer record)
+    EXPECT_EQ(hist.windowTokenCount(), 3u);
 }
 
 TEST(Test__DecodeExpertHistogram, SocketLoads_BalancedPlacement)
@@ -226,11 +223,15 @@ TEST(Test__DecodeExpertHistogram, WindowReset_ClearsCounters)
 
     int idx[] = {0, 1};
     float w[] = {0.6f, 0.4f};
-    for (int i = 0; i < 50; ++i)
+    // Simulate 50 complete decode tokens (both layers per token)
+    for (int i = 0; i < 50; ++i) {
         hist.record(0, idx, w, 2);
+        hist.record(1, idx, w, 2);
+    }
 
     EXPECT_EQ(hist.windowGeneration(), 0u);
     EXPECT_GT(hist.activationCount(0, 0), 0u);
+    EXPECT_EQ(hist.windowTokenCount(), 50u);
 
     hist.resetWindow();
 
@@ -377,7 +378,9 @@ TEST(Test__DecodeExpertHistogram, AllocationFree_HotPath)
     for (int i = 0; i < 10000; ++i)
         hist.record(i % 4, indices, weights, 8);
 
-    EXPECT_EQ(hist.windowTokenCount(), 10000u);
+    // 10000 record() calls cycling through 4 layers: only last-layer (3)
+    // increments the window counter, so 10000/4 = 2500 token counts.
+    EXPECT_EQ(hist.windowTokenCount(), 2500u);
 }
 
 TEST(Test__DecodeExpertHistogram, LargeScale_256Experts_36Layers)
@@ -400,7 +403,8 @@ TEST(Test__DecodeExpertHistogram, LargeScale_256Experts_36Layers)
     }
 
     EXPECT_TRUE(hist.windowFull());
-    EXPECT_EQ(hist.windowTokenCount(), 512u * 36u);
+    // Window counter increments once per decode token (on last MoE layer)
+    EXPECT_EQ(hist.windowTokenCount(), 512u);
 
     // Verify per-layer consistency
     for (int l = 0; l < 36; ++l) {

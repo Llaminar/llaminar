@@ -33,6 +33,7 @@
 #include "../../interfaces/IMPIContext.h"
 #include "../../utils/MPIContext.h"
 #include "../../utils/Tokenizer.h"
+#include "../moe/ExpertWeightTransfer.h"
 #include <memory>
 #include <mutex>
 #include <atomic>
@@ -41,6 +42,7 @@ namespace llaminar2
 {
 
     class MoERebalanceController;
+    struct ExpertReplicaSet;
 
     /**
      * @brief Concrete implementation of IOrchestrationRunner
@@ -198,7 +200,24 @@ namespace llaminar2
         MoERebalanceController* moeRebalanceController() const;
 
         /// Apply rebalanced expert masks to DGO's cached MoEFFNStages
-        void applyMoEExpertMasks(const std::vector<std::vector<bool>>& masks);
+        void applyMoEExpertMasks(
+            const std::vector<std::vector<bool>>& masks,
+            const ReceivedWeightsMap& received = {});
+
+        /// Set expert replica info for per-token dynamic dispatch
+        void setExpertReplicaSet(const ExpertReplicaSet& replicas, int socket_id);
+
+        /// Transfer packed weights for migrating experts via MPI.
+        ReceivedWeightsMap transferExpertWeights(
+            const std::vector<ExpertMigration>& manifest, int num_layers);
+
+        /// Transfer pre-packed weights for replicated experts via MPI (non-destructive).
+        ReceivedWeightsMap transferReplicaWeights(
+            const ExpertReplicaSet& replicas, int num_layers);
+
+        /// Release raw expert weight data after initial VNNI packing.
+        /// @return Total bytes freed/released
+        size_t releaseRawExpertWeights();
 
         // =====================================================================
         // IOrchestrationRunner: GPU-side Sampling

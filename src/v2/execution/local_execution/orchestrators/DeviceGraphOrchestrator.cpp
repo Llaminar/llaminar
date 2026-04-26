@@ -29,11 +29,13 @@
 #include "../../../kernels/KernelFactory.h"
 #include "../../../kernels/HybridKVCacheConfig.h"
 #include "../../compute_stages/stages/MoEFFNStage.h"
+#include "../../moe/ExpertWeightTransfer.h"
 #include "../../../backends/BackendManager.h"
 #include "../../../interfaces/IWorkspaceConsumer.h"
 #include "../../moe/MoERebalanceController.h"
 #include <chrono>
 #include <algorithm>
+#include <iomanip>
 
 namespace llaminar2
 {
@@ -880,7 +882,7 @@ namespace llaminar2
         if (layer_idx == 0)
         {
             const float *input = buffers.current_hidden->fp32_data();
-            LOG_INFO("[ORCH_ATTN_INPUT] layer=" << layer_idx << " seq_len=" << seq_len
+            LOG_TRACE("[ORCH_ATTN_INPUT] layer=" << layer_idx << " seq_len=" << seq_len
                                                 << " input[0:4]=" << input[0] << "," << input[1]
                                                 << "," << input[2] << "," << input[3]);
         }
@@ -986,10 +988,10 @@ namespace llaminar2
         if (layer_idx == 0)
         {
             auto order = graph.getExecutionOrder();
-            LOG_INFO("[ORCH_ATTN] Graph has " << graph.size() << " nodes, execution order:");
+            LOG_TRACE("[ORCH_ATTN] Graph has " << graph.size() << " nodes, execution order:");
             for (const auto &name : order)
             {
-                LOG_INFO("[ORCH_ATTN]   - " << name);
+                LOG_TRACE("[ORCH_ATTN]   - " << name);
             }
         }
 
@@ -1001,7 +1003,7 @@ namespace llaminar2
             buffers.attn_output && buffers.attn_proj)
         {
             const float *output = buffers.current_hidden->fp32_data();
-            LOG_INFO("[ORCH_ATTN_OUTPUT] layer=" << layer_idx << " seq_len=" << seq_len
+            LOG_TRACE("[ORCH_ATTN_OUTPUT] layer=" << layer_idx << " seq_len=" << seq_len
                                                  << " output[0:4]=" << output[0] << "," << output[1]
                                                  << "," << output[2] << "," << output[3]);
         }
@@ -1126,7 +1128,7 @@ namespace llaminar2
         const int *position_ids,
         DeviceId device)
     {
-        LOG_INFO("[DeviceGraphOrchestrator::executeLayer] LAYER_EXEC_ENTERED layer_idx="
+        LOG_TRACE("[DeviceGraphOrchestrator::executeLayer] LAYER_EXEC_ENTERED layer_idx="
                  << layer_idx << " seq_len=" << seq_len);
 
         // =====================================================================
@@ -2054,32 +2056,251 @@ namespace llaminar2
         moe_rebalance_controller_ = std::move(controller);
     }
 
-    void DeviceGraphOrchestrator::applyExpertMasks(const std::vector<std::vector<bool>>& masks)
+    void DeviceGraphOrchestrator::applyExpertMasks(
+        const std::vector<std::vector<bool>>& masks,
+        const ReceivedWeightsMap& received_weights)
     {
-        int applied = 0;
-        for (size_t layer = 0; layer < layer_graph_cache_.size() && layer < masks.size(); ++layer)
-        {
-            auto& cache = layer_graph_cache_[layer];
-            if (!cache.valid || !cache.ffn_decode)
-                continue;
+        auto t_start = std::chrono::high_resolution_clock::now();
 
-            for (const auto& node_name : cache.ffn_decode->getExecutionOrder())
+        // ── Step 1: Collect all MoE stages ──────────────────────────────
+        struct StageInfo {
+            MoEFFNStage* stage;
+            int layer;
+        };
+        std::vector<StageInfo> moe_stages;
+
+        if (forward_engine_)
+        {
+            forward_engine_->forEachCachedStage(
+                ComputeStageType::MOE_EXPERT_FFN,
+                [&](IComputeStage* s) {
+                    auto* moe = dynamic_cast<MoEFFNStage*>(s);
+                    if (!moe) return;
+                    int layer = moe->layerIndex();
+                    if (layer >= 0 && static_cast<size_t>(layer) < masks.size())
+                        moe_stages.push_back({moe, layer});
+                });
+        }
+
+        // Fallback: legacy layer_graph_cache_ path
+        if (moe_stages.empty())
+        {
+            for (size_t layer = 0; layer < layer_graph_cache_.size() && layer < masks.size(); ++layer)
             {
-                auto* node = cache.ffn_decode->getNode(node_name);
-                if (!node || !node->stage)
-                    continue;
-                if (node->stage->type() == ComputeStageType::MOE_EXPERT_FFN)
+                auto& cache = layer_graph_cache_[layer];
+                if (!cache.valid || !cache.ffn_decode) continue;
+                for (const auto& node_name : cache.ffn_decode->getExecutionOrder())
                 {
-                    auto* moe_stage = dynamic_cast<MoEFFNStage*>(node->stage.get());
-                    if (moe_stage && moe_stage->updateExpertMaskAndPrepareEngines(masks[layer]))
+                    auto* node = cache.ffn_decode->getNode(node_name);
+                    if (!node || !node->stage) continue;
+                    if (node->stage->type() == ComputeStageType::MOE_EXPERT_FFN)
                     {
-                        applied++;
+                        auto* moe = dynamic_cast<MoEFFNStage*>(node->stage.get());
+                        if (moe) moe_stages.push_back({moe, static_cast<int>(layer)});
                     }
                 }
             }
         }
-        LOG_INFO("[DGO] Applied expert masks to " << applied
+
+        // ── Step 2: Phase 1 — release departed experts, collect views ───
+        std::vector<const TensorBase*> all_evict;
+        for (auto& [stage, layer] : moe_stages)
+        {
+            auto evict = stage->releaseDepartedExperts(masks[layer]);
+            all_evict.insert(all_evict.end(), evict.begin(), evict.end());
+        }
+
+        // ── Step 3: Batch cache eviction (ONE scan, not thousands) ──────
+        llaminar::v2::kernels::KernelFactory::clearPreparedGemmWeightsForBatch(all_evict);
+
+        // ── Step 4: Phase 2 — register + prepare (parallel across stages)
+        std::atomic<int> applied{0};
+        const int n = static_cast<int>(moe_stages.size());
+
+        #pragma omp parallel for schedule(dynamic)
+        for (int i = 0; i < n; ++i)
+        {
+            auto& [stage, layer] = moe_stages[i];
+            const std::unordered_map<int, ExpertWeightBlobs>* layer_received = nullptr;
+            auto layer_it = received_weights.find(layer);
+            if (layer_it != received_weights.end())
+                layer_received = &layer_it->second;
+
+            if (stage->registerAndPrepareNewExperts(masks[layer], layer_received))
+                applied.fetch_add(1, std::memory_order_relaxed);
+        }
+
+        // ── Step 5: Phase 3 — apply masks (fast, no heavy ops) ─────────
+        for (auto& [stage, layer] : moe_stages)
+            stage->applyExpertMask(masks[layer]);
+
+        LOG_INFO("[DGO] Applied expert masks to " << applied.load()
                  << " MoEFFNStages across " << masks.size() << " layers");
+
+        auto t_end = std::chrono::high_resolution_clock::now();
+        double prep_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
+        if (moe_rebalance_controller_)
+            moe_rebalance_controller_->recordPrepDuration(prep_ms);
+        LOG_INFO("[DGO] Expert mask application + engine prep took "
+                 << std::fixed << std::setprecision(1) << prep_ms << " ms");
+    }
+
+    void DeviceGraphOrchestrator::setExpertReplicaSet(
+        const ExpertReplicaSet& replicas, int socket_id)
+    {
+        if (replicas.num_replicated == 0) return;
+
+        int count = 0;
+        if (forward_engine_)
+        {
+            forward_engine_->forEachCachedStage(
+                ComputeStageType::MOE_EXPERT_FFN,
+                [&](IComputeStage* s) {
+                    auto* moe = dynamic_cast<MoEFFNStage*>(s);
+                    if (moe)
+                    {
+                        moe->setReplicaSet(replicas, socket_id);
+                        count++;
+                    }
+                });
+        }
+
+        LOG_INFO("[DGO] Set expert replica info (" << replicas.num_replicated
+                 << " replicas) on " << count << " MoE stages (socket " << socket_id << ")");
+    }
+
+    size_t DeviceGraphOrchestrator::releaseRawExpertWeights()
+    {
+        size_t total_freed = 0;
+        int stage_count = 0;
+
+        if (forward_engine_)
+        {
+            forward_engine_->forEachCachedStage(
+                ComputeStageType::MOE_EXPERT_FFN,
+                [&](IComputeStage* s) {
+                    auto* moe = dynamic_cast<MoEFFNStage*>(s);
+                    if (moe)
+                    {
+                        total_freed += moe->releaseRawExpertWeights();
+                        ++stage_count;
+                    }
+                });
+        }
+
+        LOG_INFO("[DGO] Released raw expert weights across " << stage_count
+                 << " MoE stages: " << (total_freed >> 20) << " MB freed");
+        return total_freed;
+    }
+
+    ReceivedWeightsMap DeviceGraphOrchestrator::transferExpertWeights(
+        const std::vector<ExpertMigration>& manifest,
+        int num_layers)
+    {
+        if (manifest.empty() || !mpi_ctx_) return {};
+
+        int my_rank = mpi_ctx_->rank();
+        MPI_Comm comm = mpi_ctx_->communicator();
+
+        // Collect MoE stages by layer from forward engine's graph cache.
+        std::unordered_map<int, MoEFFNStage*> moe_by_layer;
+        if (forward_engine_)
+        {
+            forward_engine_->forEachCachedStage(
+                ComputeStageType::MOE_EXPERT_FFN,
+                [&](IComputeStage* stage) {
+                    auto* moe_stage = dynamic_cast<MoEFFNStage*>(stage);
+                    if (moe_stage && moe_stage->layerIndex() >= 0)
+                        moe_by_layer[moe_stage->layerIndex()] = moe_stage;
+                });
+        }
+
+        // Fallback: legacy layer_graph_cache_
+        if (moe_by_layer.empty())
+        {
+            for (size_t layer_idx = 0; layer_idx < layer_graph_cache_.size(); ++layer_idx)
+            {
+                auto& cache = layer_graph_cache_[layer_idx];
+                if (!cache.valid || !cache.ffn_decode) continue;
+                for (const auto& node_name : cache.ffn_decode->getExecutionOrder())
+                {
+                    auto* node = cache.ffn_decode->getNode(node_name);
+                    if (!node || !node->stage) continue;
+                    if (node->stage->type() == ComputeStageType::MOE_EXPERT_FFN)
+                    {
+                        auto* moe_stage = dynamic_cast<MoEFFNStage*>(node->stage.get());
+                        if (moe_stage)
+                            moe_by_layer[static_cast<int>(layer_idx)] = moe_stage;
+                    }
+                }
+            }
+        }
+
+        LOG_DEBUG("[DGO] Found " << moe_by_layer.size() << " MoE stages for weight transfer"
+                 << " (forward_engine=" << (forward_engine_ ? "yes" : "no") << ")");
+
+        auto get_blobs = [&](int layer_idx, int expert_id) -> ExpertWeightBlobs {
+            auto it = moe_by_layer.find(layer_idx);
+            if (it == moe_by_layer.end()) return {};
+            return it->second->detachAndSerializeExpert(expert_id);
+        };
+
+        return ExpertWeightTransfer::transferAllLayers(manifest, num_layers, get_blobs, my_rank, comm);
+    }
+
+    ReceivedWeightsMap DeviceGraphOrchestrator::transferReplicaWeights(
+        const ExpertReplicaSet& replicas,
+        int num_layers)
+    {
+        if (replicas.num_replicated == 0 || !mpi_ctx_)
+            return {};
+
+        int my_rank = mpi_ctx_->rank();
+        int world_size = mpi_ctx_->world_size();
+        MPI_Comm comm = mpi_ctx_->communicator();
+
+        // Build manifest: for each replicated expert, the owner sends to all
+        // non-owner ranks. With 2 sockets this is a simple bidirectional exchange.
+        std::vector<ExpertMigration> manifest;
+        for (int e = 0; e < static_cast<int>(replicas.is_replicated.size()); ++e)
+        {
+            if (!replicas.is_replicated[e]) continue;
+            int owner = replicas.owner_socket[e];
+            // Owner sends to every other rank
+            for (int r = 0; r < world_size; ++r)
+            {
+                if (r != owner)
+                    manifest.push_back({e, owner, r});
+            }
+        }
+
+        if (manifest.empty())
+            return {};
+
+        LOG_INFO("[DGO] Transferring " << replicas.num_replicated
+                 << " replicated experts × " << num_layers << " layers via MPI");
+
+        // Collect MoE stages by layer
+        std::unordered_map<int, MoEFFNStage*> moe_by_layer;
+        if (forward_engine_)
+        {
+            forward_engine_->forEachCachedStage(
+                ComputeStageType::MOE_EXPERT_FFN,
+                [&](IComputeStage* stage) {
+                    auto* moe_stage = dynamic_cast<MoEFFNStage*>(stage);
+                    if (moe_stage && moe_stage->layerIndex() >= 0)
+                        moe_by_layer[moe_stage->layerIndex()] = moe_stage;
+                });
+        }
+
+        // Non-destructive serialize callback — owner keeps its weights
+        auto get_blobs = [&](int layer_idx, int expert_id) -> ExpertWeightBlobs {
+            auto it = moe_by_layer.find(layer_idx);
+            if (it == moe_by_layer.end()) return {};
+            return it->second->serializeExpert(expert_id);
+        };
+
+        return ExpertWeightTransfer::transferAllLayers(manifest, num_layers, get_blobs, my_rank, comm);
     }
 
     // =========================================================================

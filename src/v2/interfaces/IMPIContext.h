@@ -23,7 +23,8 @@
 namespace llaminar2
 {
 
-    // Forward declarations for quantized block types
+    // Forward declarations
+    class IMPITopology;
     struct Q8_1Block;
     struct Q16_1Block;
     struct Q16_1Block_64;
@@ -81,6 +82,30 @@ namespace llaminar2
          * @return MPI_Comm handle
          */
         virtual MPI_Comm communicator() const = 0;
+
+        // =========================================================================
+        // Topology Access
+        // =========================================================================
+
+        /**
+         * @brief Get the MPI topology for node-local queries and placement
+         *
+         * Returns nullptr if topology is not available (e.g., in simple mocks).
+         * Callers should check for nullptr and use fallback behavior.
+         *
+         * @return Pointer to IMPITopology, or nullptr if unavailable
+         */
+        virtual const IMPITopology *topology() const { return nullptr; }
+
+        /**
+         * @brief Get communicator for ranks on the same physical node
+         *
+         * Used for node-local coordination (e.g., page cache prepopulation).
+         * Returns MPI_COMM_NULL if not available (mocks, or single-node).
+         *
+         * @return MPI_Comm for intra-node ranks, or MPI_COMM_NULL
+         */
+        virtual MPI_Comm intra_node_comm() const { return MPI_COMM_NULL; }
 
         // =========================================================================
         // Synchronization

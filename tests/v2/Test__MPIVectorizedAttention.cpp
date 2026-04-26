@@ -9,7 +9,7 @@
  */
 
 #include <gtest/gtest.h>
-#include "../../src/v2/kernels/cpu/primitives/SoftmaxPrimitives.h"
+#include "../../src/v2/kernels/cpu/primitives/SoftmaxPrimitives_New.h"
 #include "../../src/v2/tensors/TensorFactory.h"
 #include "../../src/v2/tensors/Tensors.h"
 #include <cmath>
@@ -43,14 +43,7 @@ TEST(Test__MPIVectorizedAttention, VectorizedSoftmax_MultiHead)
     }
 
     // Apply vectorized softmax
-    primitives::SoftmaxRowArgs args;
-    args.scores = scores_data;
-    args.rows = rows;
-    args.cols = cols;
-    args.causal = false;
-    args.scale = 1.0f;
-
-    primitives::softmax_row_major_vectorized(args);
+    primitives::softmax_row_major_fp32(scores_data, rows, cols, false, 1.0f, true);
 
     // Validate: each row should sum to 1.0
     for (int r = 0; r < rows; ++r)
@@ -89,14 +82,7 @@ TEST(Test__MPIVectorizedAttention, VectorizedSoftmax_CausalMasking)
     }
 
     // Apply vectorized causal softmax
-    primitives::SoftmaxRowArgs args;
-    args.scores = scores_data;
-    args.rows = rows;
-    args.cols = cols;
-    args.causal = true; // Enable causal masking
-    args.scale = 1.0f;
-
-    primitives::softmax_row_major_vectorized(args);
+    primitives::softmax_row_major_fp32(scores_data, rows, cols, true, 1.0f, true);
 
     // Validate causal masking: upper triangle should be zero
     for (int i = 0; i < rows; ++i)
@@ -150,14 +136,7 @@ TEST(Test__MPIVectorizedAttention, VectorizedSoftmax_AttentionScaling)
     }
 
     // Apply softmax with scaling
-    primitives::SoftmaxRowArgs args;
-    args.scores = scores_data;
-    args.rows = seq_len;
-    args.cols = seq_len;
-    args.causal = false;
-    args.scale = scale; // Attention scaling
-
-    primitives::softmax_row_major_vectorized(args);
+    primitives::softmax_row_major_fp32(scores_data, seq_len, seq_len, false, scale, true);
 
     // Validate: each row should sum to 1.0
     for (int r = 0; r < seq_len; ++r)
@@ -197,14 +176,7 @@ TEST(Test__MPIVectorizedAttention, VectorizedSoftmax_LargeMultiHead)
     }
 
     // Apply vectorized softmax
-    primitives::SoftmaxRowArgs args;
-    args.scores = scores_data;
-    args.rows = rows;
-    args.cols = cols;
-    args.causal = false;
-    args.scale = 1.0f;
-
-    primitives::softmax_row_major_vectorized(args);
+    primitives::softmax_row_major_fp32(scores_data, rows, cols, false, 1.0f, true);
 
     // Validate: sample rows should sum to 1.0
     const std::vector<int> sample_rows = {0, rows / 4, rows / 2, 3 * rows / 4, rows - 1};

@@ -226,7 +226,7 @@ namespace llaminar2
         // leaves other ranks out of the collective and causes subsequent
         // MPI collectives (e.g. syncInitStep Allreduce) to mis-match and
         // report MPI_ERR_TRUNCATE.
-        const auto &cluster = mpi_ctx->topology().clusterInventory();
+        const auto &cluster = mpi_ctx->concrete_topology().clusterInventory();
         if (mpi_ctx->rank() == 0)
         {
             InventoryPrinter::printClusterInventory(cluster);

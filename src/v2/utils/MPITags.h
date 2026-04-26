@@ -106,6 +106,40 @@ namespace llaminar2
         }
 
         // ============================================================================
+        // MoE Expert Weight Transfer Tags
+        // ============================================================================
+        // Two-phase protocol: size exchange (blocking) then data exchange (non-blocking).
+        // Size tags:  10000 + layer * 256 + expert_id          → max ~26k
+        // Data tags: 100000 + layer * 256 * 3 + expert * 3 + proj → max ~149k
+
+        constexpr int WEIGHT_TRANSFER_SIZE = 10000;  // [10000-25999] size exchange
+        constexpr int WEIGHT_TRANSFER_DATA = 100000; // [100000-149999] data exchange
+        constexpr int MAX_EXPERTS_PER_TAG = 256;     // Maximum experts for tag computation
+
+        /**
+         * @brief Tag for weight transfer SIZE exchange (Phase A).
+         * @param layer      MoE layer index (0-based)
+         * @param expert_id  Expert index (0-based, < MAX_EXPERTS_PER_TAG)
+         * @return Unique tag in [WEIGHT_TRANSFER_SIZE, WEIGHT_TRANSFER_SIZE + 16383]
+         */
+        inline constexpr int weightTransferSizeTag(int layer, int expert_id)
+        {
+            return WEIGHT_TRANSFER_SIZE + layer * MAX_EXPERTS_PER_TAG + expert_id;
+        }
+
+        /**
+         * @brief Tag for weight transfer DATA exchange (Phase B).
+         * @param layer      MoE layer index (0-based)
+         * @param expert_id  Expert index (0-based, < MAX_EXPERTS_PER_TAG)
+         * @param proj       Projection index: 0=gate, 1=up, 2=down
+         * @return Unique tag in [WEIGHT_TRANSFER_DATA, WEIGHT_TRANSFER_DATA + 49151]
+         */
+        inline constexpr int weightTransferDataTag(int layer, int expert_id, int proj)
+        {
+            return WEIGHT_TRANSFER_DATA + layer * MAX_EXPERTS_PER_TAG * 3 + expert_id * 3 + proj;
+        }
+
+        // ============================================================================
         // Wildcard Constants
         // ============================================================================
 

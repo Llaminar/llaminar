@@ -21,9 +21,10 @@
  *   - Q4_K/Q5_K/Q6_K quantization (expect wider tolerances than Q8_0)
  *   - 40 layers, 256 experts (top-8), 2048 hidden dim, 512 expert intermediate
  *
- * NOTE: Thresholds are intentionally loose (diagnostic mode) — the primary goal
- * is to identify WHERE drift occurs between Llaminar and PyTorch, not to gate on
- * a tight tolerance. Tighten once baseline numbers are established.
+ * NOTE: Decode attention drops (0.04-0.12 cosine/layer) are expected due to
+ * Llaminar's FP16 KV cache vs PyTorch's FP32 DynamicCache. MoE expert drops
+ * (0.01-0.035/layer) are from block-wise GEMM accumulation order differences.
+ * End-to-end token predictions match (100% top-1 across 5 decode steps).
  *
  * @author David Sanftenberg
  * @date 2026
@@ -49,13 +50,14 @@ using namespace llaminar2::test::parity::qwen35moe;
 // - MoE routing introduces discrete expert selection (potential divergence source)
 // - GDN layers use recurrent delta-rule (accumulates numerical differences)
 // - 35B model with 256 experts — large model increases error accumulation
-// Thresholds are set very conservatively for initial diagnostic characterization.
+// - FP16 KV cache truncation causes 0.04-0.12 attention cosine drops in decode
+// Thresholds are calibrated from observed single-run baselines with ~4-5% margin.
 
 static const std::vector<TestConfig> kQwen35MoESingleDeviceConfigs = {
     // =========================================================================
     // Qwen3.5-35B MoE (Q4_K_XL) — CPU baseline
     //
-    // This is the primary diagnostic configuration. CPU execution is fully
+    // This is the primary single-device configuration. CPU execution is fully
     // deterministic and exercises the scalar reference MoEFFNStage code path.
     // The model is at /opt/llaminar-models/ (not in the models/ workspace dir).
     //
@@ -68,14 +70,14 @@ static const std::vector<TestConfig> kQwen35MoESingleDeviceConfigs = {
         .parallelism = Parallelism::None,
         .collective = Collective::None,
         .thresholds = {
-            .cosine_threshold = 0.80f,        // Diagnostic — very loose
-            .decode_cosine_threshold = 0.70f, // Diagnostic — MoE + GDN drift
+            .cosine_threshold = 0.96f,        // Worst observed: 0.9725 layer avg
+            .decode_cosine_threshold = 0.98f, // Worst observed: 0.9952 LM_HEAD avg
             .early_layers_count = 6,
-            .min_early_layers_passed = 2, // Diagnostic — just want to see numbers
-            .kl_threshold = 0.50f,        // Diagnostic — characterize, don't gate
-            .min_top1_accuracy = 0.0f,    // Disabled — diagnostic mode
-            .min_top5_accuracy = 0.0f,    // Disabled — diagnostic mode
-            .pytorch_top1_in_topk = 0,    // Disabled — diagnostic mode
+            .min_early_layers_passed = 5, // 6/6 observed; require 5
+            .kl_threshold = 0.03f,         // LM_HEAD observed: 0.005-0.014 (run-to-run variance with dynamic rebalance)
+            .min_top1_accuracy = 0.80f,   // Observed: 100%
+            .min_top5_accuracy = 0.60f,   // Observed: 80% (0.8 on 2 steps)
+            .pytorch_top1_in_topk = 3,    // Observed: 5/5 RefInTop3
         },
         .model_path = "/opt/llaminar-models/Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf",
         .snapshot_dir = "pytorch_qwen35_moe_snapshots",

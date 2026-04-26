@@ -68,10 +68,10 @@ static const std::vector<std::string> kNodeLocalTPMoEExcludedStages = {
 // MoE EP/TP partial-sum stages: each rank holds a partial contribution.
 // Allreduce (SUM) across ranks before comparing to PyTorch reference.
 static const std::vector<std::string> kNodeLocalTPMoEAllreduceStages = {
-    "MOE_EXPERT_OUTPUT",          // EP partial sum (only local experts computed)
-    "MOE_SHARED_EXPERT_OUTPUT",   // Shared expert TP partial sum (down_proj row-parallel)
-    "MOE_SHARED_GATE_OUTPUT",     // Sigmoid-gated partial sum (s⊙y distributes over partials)
-    "MOE_COMBINED_OUTPUT",        // Total partial (expert EP + shared TP + gate)
+    "MOE_EXPERT_OUTPUT",        // EP partial sum (only local experts computed)
+    "MOE_SHARED_EXPERT_OUTPUT", // Shared expert TP partial sum (down_proj row-parallel)
+    "MOE_SHARED_GATE_OUTPUT",   // Sigmoid-gated partial sum (s⊙y distributes over partials)
+    "MOE_COMBINED_OUTPUT",      // Total partial (expert EP + shared TP + gate)
 };
 
 // =============================================================================
@@ -86,7 +86,13 @@ static const std::vector<TestConfig> kNodeLocalTPMoETestConfigs = {
     // computes half the experts (EP) and half the shared expert intermediate
     // (Megatron TP), then allreduces attn_proj once per layer.
     //
-    // Thresholds are initially loose (diagnostic) — tighten once baseline established.
+    // Thresholds calibrated from observed results (2026-04-26):
+    //   Prefill: worst min cosine 0.9335 (L15, MOE_EXPERT_OUTPUT)
+    //   Decode:  worst min cosine 0.8298 (L15, MOE_EXPERT_OUTPUT)
+    //   LM_HEAD: cosine 0.9978, KL 0.0057, Top-1 100%, Top-5 100%
+    //   Decode:  5/5 steps, AvgCosine 0.9970, Top-1 100%, RefInTop3 5/5
+    // Note: MOE_ROUTING_INDICES uses set-overlap (Jaccard) and is excluded
+    //       from layer-level aggregation by ParityTestBase.
     // =========================================================================
     {
         .name = "NodeLocalTP_2xMPI_CPU_35B_MoE",
@@ -94,16 +100,16 @@ static const std::vector<TestConfig> kNodeLocalTPMoETestConfigs = {
         .parallelism = Parallelism::NodeLocalTP,
         .collective = Collective::MPI,
         .thresholds = {
-            .cosine_threshold = 0.80f,        // Diagnostic — MoE + GDN + Q4_K drift
-            .decode_cosine_threshold = 0.70f, // Diagnostic — very loose initially
+            .cosine_threshold = 0.90f,        // Worst observed: 0.9335 (3.5% margin)
+            .decode_cosine_threshold = 0.80f, // Worst observed: 0.8298 (3.5% margin)
             .early_layers_count = 6,
-            .min_early_layers_passed = 2,     // Diagnostic — just want to see numbers
-            .kl_threshold = 0.50f,            // Diagnostic — characterize, don't gate
+            .min_early_layers_passed = 5, // 6/6 observed; require 5
+            .kl_threshold = 0.03f,        // LM_HEAD observed: 0.005-0.032 (run-to-run variance with dynamic rebalance)
             .excluded_stages = kNodeLocalTPMoEExcludedStages,
             .allreduce_stages = kNodeLocalTPMoEAllreduceStages,
-            .min_top1_accuracy = 0.0f,        // Disabled — diagnostic mode
-            .min_top5_accuracy = 0.0f,        // Disabled — diagnostic mode
-            .pytorch_top1_in_topk = 0,        // Disabled — diagnostic mode
+            .min_top1_accuracy = 0.80f, // Observed: 100%; allow 1 miss in 5
+            .min_top5_accuracy = 0.80f, // Observed: 100%; allow 1 miss in 5
+            .pytorch_top1_in_topk = 4,  // Observed: 5/5 RefInTop3; require 3
         },
         .mpi_ranks = 2,
         .model_path = "/opt/llaminar-models/Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf",

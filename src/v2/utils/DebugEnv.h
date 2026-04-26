@@ -2686,9 +2686,19 @@ namespace llaminar2
         /// MoE expert rebalancing configuration
         struct {
             /// Rebalance mode: "off", "observe", "dynamic" (from LLAMINAR_MOE_REBALANCE)
-            std::string mode = "off";
+            std::string mode = "dynamic";
             /// Histogram window size in decode tokens (from LLAMINAR_MOE_REBALANCE_WINDOW)
             int window_size = 256;
+            /// Max window size for adaptive growth (0 = no growth) (from LLAMINAR_MOE_REBALANCE_MAX_WINDOW)
+            int max_window_size = 4096;
+            /// Window growth factor after each rebalance (from LLAMINAR_MOE_REBALANCE_WINDOW_GROWTH)
+            float window_growth_factor = 1.5f;
+            /// Max experts to replicate per socket (0 = auto: 2×top_k) (from LLAMINAR_MOE_REBALANCE_REPLICAS)
+            int max_replicas = 0;
+            /// Release raw expert weight data after VNNI packing (from LLAMINAR_MOE_RELEASE_RAW_WEIGHTS)
+            /// Frees heap-allocated raw data and confirms mmap DONTNEED for mmap-backed data.
+            /// Only safe when prepacked MPI transfer is available (replicas > 0).
+            bool release_raw_weights = false;
         } moe_rebalance;
 
         bool tp_timing = false;               ///< Enable TP forward timing breakdown (env: LLAMINAR_TP_TIMING)
@@ -2762,6 +2772,18 @@ namespace llaminar2
             const char *moe_reb_win = std::getenv("LLAMINAR_MOE_REBALANCE_WINDOW");
             if (moe_reb_win)
                 moe_rebalance.window_size = std::atoi(moe_reb_win);
+            const char *moe_reb_max_win = std::getenv("LLAMINAR_MOE_REBALANCE_MAX_WINDOW");
+            if (moe_reb_max_win)
+                moe_rebalance.max_window_size = std::atoi(moe_reb_max_win);
+            const char *moe_reb_growth = std::getenv("LLAMINAR_MOE_REBALANCE_WINDOW_GROWTH");
+            if (moe_reb_growth)
+                moe_rebalance.window_growth_factor = std::atof(moe_reb_growth);
+            const char *moe_reb_replicas = std::getenv("LLAMINAR_MOE_REBALANCE_REPLICAS");
+            if (moe_reb_replicas)
+                moe_rebalance.max_replicas = std::atoi(moe_reb_replicas);
+            const char *moe_reb_release_ctor = std::getenv("LLAMINAR_MOE_RELEASE_RAW_WEIGHTS");
+            if (moe_reb_release_ctor)
+                moe_rebalance.release_raw_weights = (std::atoi(moe_reb_release_ctor) != 0);
         }
 
         void reload()
@@ -2798,7 +2820,7 @@ namespace llaminar2
             if (kv_rot && std::string(kv_rot) == "0")
                 kv_rotation = false;
             // MoE rebalancing
-            moe_rebalance.mode = "off";
+            moe_rebalance.mode = "dynamic";
             const char *moe_reb = std::getenv("LLAMINAR_MOE_REBALANCE");
             if (moe_reb)
                 moe_rebalance.mode = moe_reb;
@@ -2806,6 +2828,22 @@ namespace llaminar2
             const char *moe_reb_win = std::getenv("LLAMINAR_MOE_REBALANCE_WINDOW");
             if (moe_reb_win)
                 moe_rebalance.window_size = std::atoi(moe_reb_win);
+            moe_rebalance.max_window_size = 4096;
+            const char *moe_reb_max_win = std::getenv("LLAMINAR_MOE_REBALANCE_MAX_WINDOW");
+            if (moe_reb_max_win)
+                moe_rebalance.max_window_size = std::atoi(moe_reb_max_win);
+            moe_rebalance.window_growth_factor = 1.5f;
+            const char *moe_reb_growth = std::getenv("LLAMINAR_MOE_REBALANCE_WINDOW_GROWTH");
+            if (moe_reb_growth)
+                moe_rebalance.window_growth_factor = std::atof(moe_reb_growth);
+            moe_rebalance.max_replicas = 0;
+            const char *moe_reb_replicas = std::getenv("LLAMINAR_MOE_REBALANCE_REPLICAS");
+            if (moe_reb_replicas)
+                moe_rebalance.max_replicas = std::atoi(moe_reb_replicas);
+            moe_rebalance.release_raw_weights = false;
+            const char *moe_reb_release = std::getenv("LLAMINAR_MOE_RELEASE_RAW_WEIGHTS");
+            if (moe_reb_release)
+                moe_rebalance.release_raw_weights = (std::atoi(moe_reb_release) != 0);
             gemm.reload();
             profile.reload();
             rmsnorm.reload();

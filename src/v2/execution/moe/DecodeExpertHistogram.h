@@ -87,6 +87,9 @@ namespace llaminar2
         /// Reset all counters and advance window generation
         void resetWindow();
 
+        /// Update the window size (for adaptive window growth)
+        void setWindowSize(int new_size) { config_.window_size = new_size; }
+
         // ── Placement update ──────────────────────────────
 
         /// Update expert-to-socket mapping (called after rebalancing)

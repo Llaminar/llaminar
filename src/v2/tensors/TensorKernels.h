@@ -12,6 +12,7 @@
 
 #include "../utils/MPIContext.h"
 #include "../interfaces/IWorkspaceConsumer.h"
+#include "../kernels/IPackedWeights.h"
 #include "BlockStructures.h"
 #include "KernelSnapshotInfo.h"
 #include <memory>
@@ -1162,6 +1163,67 @@ namespace llaminar2
         {
             return false; // Default: not supported
         }
+
+        // =============================================================================
+        // Weight Lifecycle Management
+        //
+        // Enables decoupling packed weights from GEMM engines for:
+        // - Cross-NUMA expert migration (clone packed data to destination socket)
+        // - Memory reclamation (release departed expert weights)
+        // - Cross-device transfer (CPU ↔ GPU, phase 2)
+        //
+        // Default implementations are no-ops for backward compatibility.
+        // Override in kernels that own packed weight data.
+        // =============================================================================
+
+        /**
+         * @brief Detach packed weights from this kernel, transferring ownership.
+         *
+         * The kernel becomes invalid for computation after this call (hasWeights()
+         * returns false). The caller receives a transferable IPackedWeights that
+         * can be cloned to another NUMA node or converted to another device format.
+         *
+         * @return Owned packed weights, or nullptr if not supported / no weights.
+         */
+        virtual std::unique_ptr<IPackedWeights> detachWeights()
+        {
+            return nullptr; // Default: not supported
+        }
+
+        /**
+         * @brief Attach pre-packed weights to this kernel.
+         *
+         * Replaces any existing weights. The kernel takes ownership of the data.
+         * After a successful attach, hasWeights() returns true and the kernel
+         * is ready for computation.
+         *
+         * @param weights Pre-packed weights (must be compatible format)
+         * @return true if attached successfully, false if format mismatch
+         */
+        virtual bool attachWeights(std::unique_ptr<IPackedWeights> weights)
+        {
+            (void)weights;
+            return false; // Default: not supported
+        }
+
+        /**
+         * @brief Release all packed weight data, freeing memory.
+         *
+         * The kernel becomes invalid for computation after this call.
+         * Unlike detachWeights(), the data is destroyed rather than returned.
+         * Use for departed experts whose weights are no longer needed.
+         */
+        virtual void releaseWeights() {}
+
+        /**
+         * @brief Check if this kernel has valid packed weights for computation.
+         *
+         * Returns false after detachWeights() or releaseWeights() until
+         * new weights are attached via attachWeights().
+         *
+         * @return true if kernel has valid weights and can compute
+         */
+        virtual bool hasWeights() const { return true; }
 
         // =============================================================================
         // Weight Dimension Accessors (for Tensor Parallelism)

@@ -719,6 +719,13 @@ namespace llaminar2
                     ctrl_config.num_experts = graph_config.moe.num_experts;
                     ctrl_config.top_k = graph_config.moe.top_k;
                     ctrl_config.window_size = env.moe_rebalance.window_size;
+                    ctrl_config.max_window_size = env.moe_rebalance.max_window_size;
+                    ctrl_config.window_growth_factor = env.moe_rebalance.window_growth_factor;
+                    // Auto-compute max_replicas: 0 means 2×top_k (active experts)
+                    int effective_replicas = env.moe_rebalance.max_replicas;
+                    if (effective_replicas == 0 && mode == MoERebalanceMode::DYNAMIC)
+                        effective_replicas = 2 * graph_config.moe.top_k;
+                    ctrl_config.max_replicas = effective_replicas;
                     ctrl_config.sockets = std::move(sockets);
                     ctrl_config.initial_expert_to_socket = std::move(initial_placement);
 
@@ -728,6 +735,8 @@ namespace llaminar2
 
                     LOG_INFO("[InferenceRunner] MoE rebalance controller: mode="
                              << env.moe_rebalance.mode
+                             << " max_replicas=" << effective_replicas
+                             << (env.moe_rebalance.max_replicas == 0 ? " (auto: 2×top_k)" : " (explicit)")
                              << " window=" << env.moe_rebalance.window_size
                              << " experts=" << graph_config.moe.num_experts);
                 }

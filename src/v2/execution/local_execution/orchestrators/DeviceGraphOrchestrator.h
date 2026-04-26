@@ -38,6 +38,7 @@
 #include "../device/WorkspaceAllocator.h"
 #include "../../mpi_orchestration/PlacementStrategy.h" // For InferencePhase
 #include "../../compute_stages/ComputeStages.h"        // For StageDumpInfo
+#include "../../moe/ExpertWeightTransfer.h"            // For ReceivedWeightsMap, ExpertMigration
 #include "../../factory/InferenceRunnerFactory.h"      // For FactoryPPStageConfig
 #include "../../../snapshots/SnapshotCapture.h"        // Snapshot capture (extracted Phase 2)
 #include "../engine/ForwardExecutionEngine.h"          // Forward execution engine (extracted Phase 3)
@@ -71,6 +72,7 @@ namespace llaminar2
     class TensorParallelConfig;
     class TurboQuantContext;
     class MoERebalanceController;
+    struct ExpertReplicaSet;
     class ActivationRotation;
 
     /**
@@ -723,7 +725,37 @@ namespace llaminar2
         /// Apply expert masks to all MoEFFNStages in cached FFN graphs.
         /// Called after rebalancing to update which experts each rank computes.
         /// @param masks Per-layer expert masks (masks[layer][expert] == true means active)
-        void applyExpertMasks(const std::vector<std::vector<bool>>& masks);
+        /// @param received_weights Optional transferred packed weights from MPI transfer
+        void applyExpertMasks(
+            const std::vector<std::vector<bool>>& masks,
+            const ReceivedWeightsMap& received_weights = {});
+
+        /// Set expert replica info on all MoE stages for per-token dispatch.
+        /// Call after applyExpertMasks() so GEMM engines are already prepared.
+        void setExpertReplicaSet(const ExpertReplicaSet& replicas, int socket_id);
+
+        /// Release raw expert weight data from all MoE stages after initial VNNI packing.
+        /// For mmap: confirms DONTNEED already applied. For heap: frees raw_data_ vectors.
+        /// After this, fallback VNNI repacking from raw data is no longer possible —
+        /// only prepacked MPI transfer can provide weights for rebalanced experts.
+        /// @return Total bytes freed (or already DONTNEED'd)
+        size_t releaseRawExpertWeights();
+
+        /// Transfer packed weights for migrating experts via MPI.
+        /// Returns received weights map: [layer_idx][expert_id] → blobs.
+        ReceivedWeightsMap transferExpertWeights(
+            const std::vector<ExpertMigration>& manifest,
+            int num_layers);
+
+        /// Transfer packed weights for replicated experts via MPI.
+        /// Unlike transferExpertWeights(), the sender keeps its weights (non-destructive).
+        /// The receiver gets pre-packed weights to avoid VNNI repacking from raw.
+        /// @param replicas The active replica set describing which experts to transfer
+        /// @param num_layers Number of MoE layers
+        /// @return Received weights map for this rank's new replicas
+        ReceivedWeightsMap transferReplicaWeights(
+            const ExpertReplicaSet& replicas,
+            int num_layers);
 
         /**
          * @brief Set GlobalTPContext for cross-MPI-rank tensor parallelism

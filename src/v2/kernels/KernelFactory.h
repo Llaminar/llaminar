@@ -1565,6 +1565,36 @@ namespace llaminar
                 static void clearPreparedGemmWeightsFor(const llaminar2::TensorBase *tensor);
 
                 /**
+                 * @brief Batch-clear prepared GEMM entries for multiple tensors.
+                 *
+                 * Performs a SINGLE scan of each cache (fused QKV, fused gate+up,
+                 * prepared GEMM registry) checking against a hash set of tensor
+                 * pointers.  This is O(cache_size) regardless of how many tensors
+                 * are being evicted, vs O(cache_size × tensor_count) for individual
+                 * clearPreparedGemmWeightsFor() calls.
+                 */
+                static void clearPreparedGemmWeightsForBatch(
+                    const std::vector<const llaminar2::TensorBase *> &tensors);
+
+                /**
+                 * @brief Register a pre-packed GEMM kernel from cross-rank transfer.
+                 *
+                 * Inserts a PreparedGemmHandle into the registry using the tensor's key,
+                 * binding the provided kernel WITHOUT triggering the packing pipeline.
+                 * The kernel must already have valid packed weights (via pre-packed
+                 * constructor or attachWeights()).
+                 *
+                 * @param tensor        The tensor view this kernel is associated with (for cache key)
+                 * @param target_device Device ID for this kernel
+                 * @param kernel        Pre-packed GEMM kernel (ownership transferred to registry)
+                 * @return Prepared handle pointer, or nullptr on failure
+                 */
+                static const PreparedGemmHandle *registerPreparedGemmFromTransfer(
+                    const llaminar2::TensorBase *tensor,
+                    llaminar2::DeviceId target_device,
+                    std::unique_ptr<llaminar2::ITensorGemm> kernel);
+
+                /**
                  * @brief Number of active GEMM engine registry entries
                  *
                  * Alias for the device-scoped GEMM engine registry size.

@@ -823,6 +823,62 @@ add_v2_test(V2_Unit_ROCmQuantisedGemmKernel_Workspace
     MPI_PROCS 1
 )
 
+# Test: PackedWeightsSerialization - Round-trip serialization/deserialization of packed GEMM weights
+# Tests: Q4_0 round-trip, asymmetric Q4_1, WithNativeBlocks, empty sections, invalid magic/version,
+#        truncated buffer, zero-size, large weights, size calculation, int8_flat, superblock format
+add_executable(v2_unit_packed_weights_serialization unit/kernels/Test__PackedWeightsSerialization.cpp)
+target_link_libraries(v2_unit_packed_weights_serialization
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_PackedWeightsSerialization
+    COMMAND $<TARGET_FILE:v2_unit_packed_weights_serialization>
+    LABELS "V2;Unit;Kernels;Serialization;PackedWeights;MoE"
+    MPI_PROCS 1
+)
+
+# Test: GPUPackedWeightsStubs - Phase 4 GPU packed weight stub IPackedWeights implementations
+# Tests: CUDA/ROCm construction, format, clone, convertTo, serialize, compatibility, empty data
+add_executable(v2_unit_gpu_packed_weights_stubs unit/kernels/Test__GPUPackedWeightsStubs.cpp)
+target_link_libraries(v2_unit_gpu_packed_weights_stubs
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_GPUPackedWeightsStubs
+    COMMAND $<TARGET_FILE:v2_unit_gpu_packed_weights_stubs>
+    LABELS "V2;Unit;Kernels;PackedWeights;CUDA;ROCm"
+    MPI_PROCS 1
+)
+
+# Test: ExpertWeightTransfer — MoE cross-rank weight transfer logic
+add_executable(v2_unit_expert_weight_transfer unit/moe/Test__ExpertWeightTransfer.cpp)
+target_link_libraries(v2_unit_expert_weight_transfer
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_ExpertWeightTransfer
+    COMMAND $<TARGET_FILE:v2_unit_expert_weight_transfer>
+    LABELS "V2;Unit;MoE;WeightTransfer;PackedWeights"
+    MPI_PROCS 1
+)
+
+# Test: MoE Weight Transfer Attach — Phase 3 integration (register + round-trip)
+add_executable(v2_unit_moe_weight_transfer_attach unit/moe/Test__MoEWeightTransferAttach.cpp)
+target_include_directories(v2_unit_moe_weight_transfer_attach PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(v2_unit_moe_weight_transfer_attach
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_MoEWeightTransferAttach
+    COMMAND $<TARGET_FILE:v2_unit_moe_weight_transfer_attach>
+    LABELS "V2;Unit;MoE;WeightTransfer;PackedWeights;Attach"
+    MPI_PROCS 1
+)
+
 # Test: MPIBackend - MPI-based collective backend for inter-node communication
 add_executable(v2_unit_mpi_backend unit/collective/backends/Test__MPIBackend.cpp)
 target_link_libraries(v2_unit_mpi_backend 
@@ -8596,6 +8652,26 @@ add_v2_test(V2_Unit_MPICoordinatedMode
     MPI_PROCS 1
 )
 message(STATUS "V2 Tests: Added MPI coordinated mode unit tests")
+
+# Node-leader page cache coordination unit tests
+# Tests the per-node-leader page cache prepopulation logic using MockMPITopology.
+add_executable(v2_unit_node_leader_page_cache
+    unit/execution/runner/Test__NodeLeaderPageCache.cpp
+)
+target_include_directories(v2_unit_node_leader_page_cache PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}  # For tests/v2/mocks/ include path
+)
+target_link_libraries(v2_unit_node_leader_page_cache
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_NodeLeaderPageCache
+    COMMAND $<TARGET_FILE:v2_unit_node_leader_page_cache>
+    LABELS "V2;Unit;Orchestration;OrchestrationRunner;PageCache;Topology"
+    MPI_PROCS 1
+)
+message(STATUS "V2 Tests: Added node-leader page cache coordination tests")
 
 # =============================================================================
 # Phase 5: OrchestrationRunner Integration Tests

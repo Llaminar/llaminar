@@ -5,16 +5,106 @@
 
 #include "MoERebalanceController.h"
 #include "../../utils/Logger.h"
+#include "fort.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <numeric>
+#include <sstream>
+#include <iomanip>
 
 namespace llaminar2
 {
 
+    // =========================================================================
+    // ExpertReplicaSet — deterministic per-token dispatch
+    // =========================================================================
+
+    void ExpertReplicaSet::assignForToken(
+        const int* expert_indices,
+        const float* /*expert_weights*/,
+        int top_k,
+        int my_socket_id,
+        const std::vector<bool>& expert_mask,
+        bool* compute_here) const
+    {
+        if (num_replicated == 0)
+        {
+            // No replicas — simple mask check
+            for (int k = 0; k < top_k; ++k)
+                compute_here[k] = expert_mask[expert_indices[k]];
+            return;
+        }
+
+        // Phase 1: Count fixed assignments (non-replicated experts go to owner)
+        int load[8] = {}; // Per-socket load counter (max 8 sockets)
+        bool is_fixed[16]; // Stack-allocated, max top_k
+
+        for (int k = 0; k < top_k; ++k)
+        {
+            int e = expert_indices[k];
+            if (!is_replicated[e])
+            {
+                is_fixed[k] = true;
+                load[owner_socket[e]]++;
+            }
+            else
+            {
+                is_fixed[k] = false;
+            }
+        }
+
+        // Phase 2: Greedily assign replicated experts to least-loaded socket.
+        // Process in index order for determinism (both ranks see same routing).
+        for (int k = 0; k < top_k; ++k)
+        {
+            if (is_fixed[k]) continue;
+
+            int e = expert_indices[k];
+            int owner = owner_socket[e];
+
+            // Find the socket with the lowest current load.
+            // Break ties: prefer the owner socket (avoids unnecessary replica use).
+            int best = owner;
+            for (int s = 0; s < num_sockets; ++s)
+            {
+                if (load[s] < load[best] || (load[s] == load[best] && s == owner))
+                    best = s;
+            }
+
+            // Assign to chosen socket
+            load[best]++;
+            is_fixed[k] = true; // Mark as assigned
+
+            // Store assignment result directly
+            compute_here[k] = (best == my_socket_id);
+        }
+
+        // Phase 3: Fill in non-replicated assignment results
+        for (int k = 0; k < top_k; ++k)
+        {
+            int e = expert_indices[k];
+            if (!is_replicated[e])
+                compute_here[k] = (owner_socket[e] == my_socket_id);
+        }
+    }
+
+    void ExpertReplicaSet::buildPrefillMask(int my_socket_id, const std::vector<bool>& expert_mask)
+    {
+        prefill_mask.resize(expert_mask.size());
+        for (size_t e = 0; e < expert_mask.size(); ++e)
+        {
+            // During prefill, only the owner socket processes replicated experts.
+            // Non-replicated experts use the standard expert_mask.
+            prefill_mask[e] = expert_mask[e] &&
+                (!is_replicated[e] || owner_socket[e] == my_socket_id);
+        }
+    }
+
     MoERebalanceController::MoERebalanceController(Config config)
         : config_(std::move(config)),
-          current_placement_(config_.initial_expert_to_socket)
+          current_placement_(config_.initial_expert_to_socket),
+          current_window_size_(config_.window_size)
     {
         if (config_.mode == MoERebalanceMode::OFF)
             return;
@@ -62,6 +152,7 @@ namespace llaminar2
         {
             LOG_DEBUG("[MoERebalanceController] No beneficial swaps found, resetting window");
             histogram_->resetWindow();
+            growWindowIfAdaptive();
             return {};
         }
 
@@ -72,6 +163,7 @@ namespace llaminar2
         // Update histogram's socket mapping for next window
         histogram_->updatePlacement(current_placement_);
         histogram_->resetWindow();
+        growWindowIfAdaptive();
 
         total_rebalances_++;
         total_swaps_ += proposal.numSwaps();
@@ -86,7 +178,7 @@ namespace llaminar2
     {
         if (!histogram_)
         {
-            LOG_INFO("[MoERebalanceController] No histogram (mode=OFF)");
+            LOG_DEBUG("[MoERebalanceController] No histogram (mode=OFF)");
             return;
         }
 
@@ -97,7 +189,7 @@ namespace llaminar2
 
         for (int l = 0; l < config_.num_layers; ++l)
         {
-            LOG_INFO("  " << histogram_->layerSummary(l));
+            LOG_DEBUG("  " << histogram_->layerSummary(l));
         }
     }
 
@@ -133,6 +225,20 @@ namespace llaminar2
             masks.assign(num_layers, global_mask);
         }
 
+        // If replicas are active, expand masks to include replicated experts
+        // that this socket should also have GEMM engines for.
+        if (current_replicas_.num_replicated > 0)
+        {
+            for (int l = 0; l < num_layers; ++l)
+            {
+                for (int e = 0; e < num_experts; ++e)
+                {
+                    if (current_replicas_.is_replicated[e])
+                        masks[l][e] = true; // Both sockets get this expert
+                }
+            }
+        }
+
         return masks;
     }
 
@@ -140,6 +246,8 @@ namespace llaminar2
     {
         if (!histogram_)
             return;
+
+        auto t_start = std::chrono::high_resolution_clock::now();
 
         const int num_layers = config_.num_layers;
         const int num_experts = config_.num_experts;
@@ -207,6 +315,8 @@ namespace llaminar2
 
         // Also compute per-layer imbalance improvement
         float per_layer_before = 0.0f, per_layer_after = 0.0f;
+        float worst_before = 0.0f;
+        int worst_layer_before = 0;
         for (int l = 0; l < num_layers; ++l)
         {
             auto lc = histogram_->layerHistogram(l);
@@ -218,8 +328,11 @@ namespace llaminar2
             }
             auto [lb_min, lb_max] = std::minmax_element(lb.begin(), lb.end());
             auto [la_min, la_max] = std::minmax_element(la.begin(), la.end());
-            per_layer_before += (*lb_min > 0) ? float(*lb_max) / float(*lb_min) : 1.0f;
-            per_layer_after += (*la_min > 0) ? float(*la_max) / float(*la_min) : 1.0f;
+            float imb_b = (*lb_min > 0) ? float(*lb_max) / float(*lb_min) : 1.0f;
+            float imb_a = (*la_min > 0) ? float(*la_max) / float(*la_min) : 1.0f;
+            per_layer_before += imb_b;
+            per_layer_after += imb_a;
+            if (imb_b > worst_before) { worst_before = imb_b; worst_layer_before = l; }
         }
         per_layer_before /= num_layers;
         per_layer_after /= num_layers;
@@ -227,13 +340,367 @@ namespace llaminar2
         current_placement_ = new_placement;
         use_per_layer_placement_ = false; // global partition, not per-layer
         total_rebalances_++;
+        last_experts_moved_ = experts_moved;
+        last_avg_imbalance_before_ = per_layer_before;
+        last_avg_imbalance_after_ = per_layer_after;
+        last_worst_imbalance_before_ = worst_before;
+        last_worst_layer_before_ = worst_layer_before;
+
+        auto t_end = std::chrono::high_resolution_clock::now();
+        last_rebalance_duration_ms_ = std::chrono::duration<double, std::milli>(t_end - t_start).count();
 
         LOG_INFO("[MoERebalanceController] LPT global rebalance: "
                  << experts_moved << "/" << num_experts << " experts moved, "
-                 << "aggregate imbalance " << imbalance_before << " -> " << imbalance_after
-                 << ", per-layer avg " << per_layer_before << " -> " << per_layer_after);
+                 << "per-layer avg imbalance " << std::fixed << std::setprecision(3)
+                 << per_layer_before << "x -> " << per_layer_after << "x"
+                 << " (worst: " << worst_before << "x layer " << worst_layer_before << ")"
+                 << " in " << std::setprecision(2) << last_rebalance_duration_ms_ << " ms");
 
         histogram_->resetWindow();
+        growWindowIfAdaptive();
+    }
+
+    void MoERebalanceController::growWindowIfAdaptive()
+    {
+        if (config_.max_window_size <= 0 || config_.window_growth_factor <= 1.0f)
+            return;
+
+        int new_size = static_cast<int>(current_window_size_ * config_.window_growth_factor);
+        new_size = std::min(new_size, config_.max_window_size);
+        if (new_size > current_window_size_)
+        {
+            LOG_DEBUG("[MoERebalanceController] Adaptive window: "
+                      << current_window_size_ << " -> " << new_size);
+            current_window_size_ = new_size;
+            histogram_->setWindowSize(new_size);
+        }
+    }
+
+    ExpertReplicaSet MoERebalanceController::proposeReplicas(int max_replicas_per_socket)
+    {
+        ExpertReplicaSet result;
+        result.is_replicated.resize(config_.num_experts, false);
+        result.owner_socket = current_placement_;
+        result.num_replicated = 0;
+        result.num_sockets = static_cast<int>(config_.sockets.size());
+
+        if (!histogram_ || max_replicas_per_socket <= 0 || config_.sockets.size() < 2)
+            return result;
+
+        const int num_experts = config_.num_experts;
+        const int num_sockets = result.num_sockets;
+
+        // Aggregate per-expert activation counts across all layers
+        std::vector<uint64_t> total_counts(num_experts, 0);
+        for (int l = 0; l < config_.num_layers; ++l)
+        {
+            auto layer_counts = histogram_->layerHistogram(l);
+            for (int e = 0; e < num_experts; ++e)
+                total_counts[e] += layer_counts[e];
+        }
+
+        // For each socket, find the hottest experts on OTHER sockets to replicate locally.
+        for (int target_socket = 0; target_socket < num_sockets; ++target_socket)
+        {
+            // Collect experts NOT owned by this socket, sorted by count descending
+            std::vector<int> candidates;
+            for (int e = 0; e < num_experts; ++e)
+            {
+                if (current_placement_[e] != target_socket && total_counts[e] > 0)
+                    candidates.push_back(e);
+            }
+
+            std::sort(candidates.begin(), candidates.end(),
+                      [&](int a, int b) { return total_counts[a] > total_counts[b]; });
+
+            // Mark the top-K as replicated
+            int replicated = 0;
+            for (int e : candidates)
+            {
+                if (replicated >= max_replicas_per_socket) break;
+                if (result.is_replicated[e]) continue; // Already marked by another socket
+                result.is_replicated[e] = true;
+                result.num_replicated++;
+                replicated++;
+            }
+        }
+
+        // Store as current replicas
+        current_replicas_ = result;
+
+        LOG_INFO("[MoERebalanceController] Proposed " << result.num_replicated
+                 << " expert replicas (max " << max_replicas_per_socket << " per socket)");
+
+        // Log the top replicas per socket
+        for (int s = 0; s < num_sockets; ++s)
+        {
+            std::ostringstream oss;
+            oss << "  Socket " << s << " gets replicas: ";
+            int count = 0;
+            for (int e = 0; e < num_experts; ++e)
+            {
+                // Expert replicated on socket s = expert NOT owned by s but is_replicated
+                if (result.is_replicated[e] && result.owner_socket[e] != s)
+                {
+                    if (count > 0) oss << ", ";
+                    oss << "e" << e << "(" << total_counts[e] << ")";
+                    count++;
+                }
+            }
+            LOG_INFO("[MoERebalanceController] " << oss.str());
+        }
+
+        return result;
+    }
+
+    std::string MoERebalanceController::getProfilingSummary() const
+    {
+        std::ostringstream oss;
+
+        // ── Title ──────────────────────────────────────────────────
+        {
+            fort::utf8_table title;
+            title.set_border_style(FT_DOUBLE2_STYLE);
+            title << "MOE EXPERT REBALANCE PROFILING" << fort::endr;
+            title[0][0].set_cell_text_align(fort::text_align::center);
+            title.row(0).set_cell_row_type(fort::row_type::header);
+            oss << "\n" << title.to_string();
+        }
+
+        // ── Config table ───────────────────────────────────────────
+        {
+            fort::utf8_table t;
+            t.set_border_style(FT_DOUBLE2_STYLE);
+            t << fort::header << "Parameter" << "Value" << fort::endr;
+            t.column(0).set_cell_text_align(fort::text_align::left);
+            t.column(1).set_cell_text_align(fort::text_align::right);
+
+            t << "Mode" << (config_.mode == MoERebalanceMode::OBSERVE ? "OBSERVE"
+                           : config_.mode == MoERebalanceMode::DYNAMIC ? "DYNAMIC" : "OFF") << fort::endr;
+            t << "Experts" << config_.num_experts << fort::endr;
+            t << "Sockets" << config_.sockets.size() << fort::endr;
+            t << "Top-K" << config_.top_k << fort::endr;
+            t << "Window size" << config_.window_size << fort::endr;
+            if (config_.max_window_size > 0 && config_.window_growth_factor > 1.0f)
+            {
+                std::ostringstream ws;
+                ws << config_.window_size << " -> " << current_window_size_
+                   << " (x" << std::fixed << std::setprecision(1) << config_.window_growth_factor
+                   << ", max " << config_.max_window_size << ")";
+                t << "Adaptive window" << ws.str() << fort::endr;
+            }
+            oss << t.to_string();
+        }
+
+        // ── Rebalance timing (if any rebalancing occurred) ─────────
+        if (total_rebalances_ > 0)
+        {
+            fort::utf8_table t;
+            t.set_border_style(FT_DOUBLE2_STYLE);
+            t << fort::header << "Rebalance Metric" << "Value" << fort::endr;
+            t.column(0).set_cell_text_align(fort::text_align::left);
+            t.column(1).set_cell_text_align(fort::text_align::right);
+
+            t << "Total rebalances" << total_rebalances_ << fort::endr;
+            t << "Total swaps" << total_swaps_ << fort::endr;
+
+            if (last_experts_moved_ > 0)
+            {
+                std::ostringstream val;
+                val << last_experts_moved_ << " / " << config_.num_experts;
+                t << "Experts moved (last)" << val.str() << fort::endr;
+            }
+
+            if (last_rebalance_duration_ms_ > 0)
+            {
+                std::ostringstream val;
+                val << std::fixed << std::setprecision(2) << last_rebalance_duration_ms_ << " ms";
+                t << "Solve time (last)" << val.str() << fort::endr;
+            }
+
+            if (last_prep_duration_ms_ > 0)
+            {
+                std::ostringstream val;
+                val << std::fixed << std::setprecision(2) << last_prep_duration_ms_ << " ms";
+                t << "VNNI prep time" << val.str() << fort::endr;
+            }
+
+            if (last_avg_imbalance_before_ > 0)
+            {
+                std::ostringstream val;
+                val << std::fixed << std::setprecision(3)
+                    << last_avg_imbalance_before_ << "x -> " << last_avg_imbalance_after_ << "x";
+                t << "Avg imbalance" << val.str() << fort::endr;
+            }
+
+            if (last_worst_imbalance_before_ > 0)
+            {
+                std::ostringstream val;
+                val << std::fixed << std::setprecision(3)
+                    << last_worst_imbalance_before_ << "x (layer " << last_worst_layer_before_ << ")";
+                t << "Worst (before)" << val.str() << fort::endr;
+            }
+
+            oss << t.to_string();
+        }
+
+        // ── Histogram summary ──────────────────────────────────────
+        if (histogram_ && histogram_->windowTokenCount() > 0)
+        {
+            int num_layers = config_.num_layers;
+            int num_sockets = static_cast<int>(config_.sockets.size());
+
+            // Collect per-layer imbalance data
+            struct LayerImbalance {
+                int layer;
+                float imbalance;
+                std::vector<uint64_t> socket_loads;
+            };
+            std::vector<LayerImbalance> layer_data;
+            layer_data.reserve(num_layers);
+            float worst_imbalance = 0.0f;
+            int worst_layer = 0;
+            float avg_imbalance = 0.0f;
+
+            for (int l = 0; l < num_layers; ++l)
+            {
+                float imb = histogram_->socketImbalanceRatio(l);
+                auto loads = histogram_->socketLoads(l);
+                avg_imbalance += imb;
+                if (imb > worst_imbalance) { worst_imbalance = imb; worst_layer = l; }
+                layer_data.push_back({l, imb, std::move(loads)});
+            }
+            avg_imbalance /= std::max(1, num_layers);
+
+            // Top-5 hottest experts globally
+            std::vector<uint64_t> global_counts(config_.num_experts, 0);
+            for (int l = 0; l < num_layers; ++l)
+            {
+                auto lc = histogram_->layerHistogram(l);
+                for (int e = 0; e < config_.num_experts; ++e)
+                    global_counts[e] += lc[e];
+            }
+            std::vector<int> sorted(config_.num_experts);
+            std::iota(sorted.begin(), sorted.end(), 0);
+            std::sort(sorted.begin(), sorted.end(),
+                      [&](int a, int b) { return global_counts[a] > global_counts[b]; });
+
+            // Per-socket stats
+            std::vector<int> socket_expert_counts(num_sockets, 0);
+            for (int e = 0; e < config_.num_experts; ++e)
+            {
+                if (e < static_cast<int>(current_placement_.size()))
+                    socket_expert_counts[current_placement_[e]]++;
+            }
+            std::vector<uint64_t> socket_total_load(num_sockets, 0);
+            for (int l = 0; l < num_layers; ++l)
+            {
+                for (int s = 0; s < num_sockets; ++s)
+                {
+                    if (s < static_cast<int>(layer_data[l].socket_loads.size()))
+                        socket_total_load[s] += layer_data[l].socket_loads[s];
+                }
+            }
+            uint64_t total_load = 0;
+            for (int s = 0; s < num_sockets; ++s) total_load += socket_total_load[s];
+
+            // Histogram overview table
+            {
+                fort::utf8_table t;
+                t.set_border_style(FT_DOUBLE2_STYLE);
+                t << fort::header << "Histogram Metric" << "Value" << fort::endr;
+                t.column(0).set_cell_text_align(fort::text_align::left);
+                t.column(1).set_cell_text_align(fort::text_align::right);
+
+                t << "Window tokens" << histogram_->windowTokenCount() << fort::endr;
+
+                {
+                    std::ostringstream val;
+                    val << std::fixed << std::setprecision(3) << avg_imbalance << "x";
+                    t << "Avg imbalance" << val.str() << fort::endr;
+                }
+                {
+                    std::ostringstream val;
+                    val << std::fixed << std::setprecision(3) << worst_imbalance << "x (layer " << worst_layer << ")";
+                    t << "Worst imbalance" << val.str() << fort::endr;
+                }
+                {
+                    std::ostringstream val;
+                    int show = std::min(5, config_.num_experts);
+                    for (int i = 0; i < show; ++i)
+                    {
+                        if (i > 0) val << ", ";
+                        val << "e" << sorted[i] << "(" << global_counts[sorted[i]] << ")";
+                    }
+                    t << "Top-5 hottest" << val.str() << fort::endr;
+                }
+                {
+                    std::ostringstream val;
+                    for (int s = 0; s < num_sockets; ++s)
+                    {
+                        if (s > 0) val << ", ";
+                        val << "s" << s << "=" << socket_expert_counts[s];
+                    }
+                    t << "Experts/socket" << val.str() << fort::endr;
+                }
+                {
+                    std::ostringstream val;
+                    for (int s = 0; s < num_sockets; ++s)
+                    {
+                        if (s > 0) val << ", ";
+                        double pct = total_load > 0 ? 100.0 * socket_total_load[s] / total_load : 0;
+                        val << "s" << s << "=" << std::fixed << std::setprecision(1) << pct << "%";
+                    }
+                    t << "Load/socket" << val.str() << fort::endr;
+                }
+                oss << t.to_string();
+            }
+
+            // Top-5 most imbalanced layers table
+            if (num_layers > 1 && num_sockets >= 2)
+            {
+                auto sorted_layers = layer_data;
+                std::sort(sorted_layers.begin(), sorted_layers.end(),
+                          [](const auto &a, const auto &b) { return a.imbalance > b.imbalance; });
+
+                int show_layers = std::min(5, num_layers);
+
+                fort::utf8_table t;
+                t.set_border_style(FT_DOUBLE2_STYLE);
+                t << fort::header << "Layer" << "Imbalance";
+                for (int s = 0; s < num_sockets; ++s)
+                {
+                    std::ostringstream hdr;
+                    hdr << "Socket " << s;
+                    t << hdr.str();
+                }
+                t << fort::endr;
+
+                t.column(0).set_cell_text_align(fort::text_align::right);
+                t.column(1).set_cell_text_align(fort::text_align::right);
+                for (int s = 0; s < num_sockets; ++s)
+                    t.column(2 + s).set_cell_text_align(fort::text_align::right);
+
+                for (int i = 0; i < show_layers; ++i)
+                {
+                    const auto &ld = sorted_layers[i];
+                    std::ostringstream imb_ss;
+                    imb_ss << std::fixed << std::setprecision(2) << ld.imbalance << "x";
+                    t << ld.layer << imb_ss.str();
+                    for (int s = 0; s < num_sockets; ++s)
+                    {
+                        uint64_t load = (s < static_cast<int>(ld.socket_loads.size()))
+                                            ? ld.socket_loads[s] : 0;
+                        t << load;
+                    }
+                    t << fort::endr;
+                }
+
+                oss << t.to_string();
+            }
+        }
+
+        return oss.str();
     }
 
 } // namespace llaminar2

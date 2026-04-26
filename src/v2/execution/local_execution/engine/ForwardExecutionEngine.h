@@ -23,6 +23,7 @@
 #include "../../factory/InferenceRunnerFactory.h" // For FactoryPPStageConfig
 
 #include <chrono>
+#include <functional>
 #include <optional>
 #include <unordered_map>
 #include <vector>
@@ -171,6 +172,14 @@ namespace llaminar2
 
         /** Check if cache is empty. */
         [[nodiscard]] bool cacheEmpty() const { return cache_.empty(); }
+
+        /**
+         * @brief Visit all stages of a given type across all cached graphs.
+         * @param type   Stage type to filter for.
+         * @param visitor Callback receiving (IComputeStage*) for each match.
+         */
+        void forEachCachedStage(ComputeStageType type,
+                                const std::function<void(IComputeStage*)>& visitor) const;
 
         // ----- Mutable Execution Flags -----
 

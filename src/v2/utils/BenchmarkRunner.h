@@ -111,11 +111,18 @@ namespace llaminar2
          */
         void setPostWarmupCallback(std::function<void()> cb) { post_warmup_cb_ = std::move(cb); }
 
+        /**
+         * @brief Set callback invoked after each decode step
+         * @param cb Callback (e.g., for incremental MoE expert rebalancing)
+         */
+        void setDecodeStepCallback(std::function<void()> cb) { decode_step_cb_ = std::move(cb); }
+
     private:
         std::shared_ptr<IInferenceRunner> runner_;
         std::shared_ptr<ITokenizer> tokenizer_;
         std::shared_ptr<IMPIContext> mpi_ctx_;
         std::function<void()> post_warmup_cb_;
+        std::function<void()> decode_step_cb_;
 
         /**
          * @brief Generate a default benchmark prompt if none provided

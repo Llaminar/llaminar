@@ -5,15 +5,21 @@
 
 #include "MoEFFNStage.h"
 #include "../../../execution/moe/DecodeExpertHistogram.h"
+#include "../../../execution/moe/ExpertWeightTransfer.h"
 #include "../../../tensors/Tensors.h"
 #include "../../../tensors/BlockStructures.h"
 #include "../../../kernels/KernelFactory.h"
 #include "../../../kernels/IMoEKernel.h"
+#include "../../../kernels/PackedWeightsSerialization.h"
+#include "../../../kernels/cpu/native_vnni/CPUPackedWeights.h"
+#include "../../../kernels/cpu/native_vnni/CPUNativeVNNIGemmKernel.h"
 #include "../../../kernels/cpu/primitives/VectorPrimitives.h"
 #include "../../../kernels/cpu/primitives/SwiGLUPrimitives.h"
 #include "../../../loaders/MmapRegion.h"
+#include "../../../utils/Assertions.h"
 #include "../../../utils/Logger.h"
 #include "../../../utils/OpenMPUtils.h"
+#include <mpi.h>
 
 #ifdef HAVE_CUDA
 #include "../../../kernels/cuda/gemm/CUDAWeightPacker.h"
@@ -27,9 +33,18 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
+#include <iomanip>
 #include <numeric>
 #include <vector>
+
+#ifdef __linux__
+#include <unistd.h>   // syscall
+#include <sys/syscall.h>
+#include <numaif.h>    // move_pages
+#include <sched.h>     // sched_getcpu
+#endif
 
 namespace llaminar2
 {
@@ -38,6 +53,110 @@ namespace llaminar2
 
     namespace
     {
+        /// Query the NUMA node of a virtual address using move_pages(2).
+        /// Returns -1 if NUMA info unavailable (non-Linux or unmapped page).
+        static int queryNUMANode(const void* ptr) {
+#ifdef __linux__
+            if (!ptr) return -1;
+            void* pages[] = { const_cast<void*>(ptr) };
+            int status[1] = { -1 };
+            if (move_pages(0, 1, pages, nullptr, status, 0) == 0 && status[0] >= 0)
+                return status[0];
+#endif
+            (void)ptr;
+            return -1;
+        }
+
+        /// Get NUMA node of the CPU this thread is currently running on.
+        static int currentCPUNode() {
+#ifdef __linux__
+            int cpu = sched_getcpu();
+            if (cpu < 0) return -1;
+            // /sys/devices/system/cpu/cpuN/topology/physical_package_id
+            // approximates socket / NUMA node for typical 1-socket-per-NUMA configs.
+            // Simpler: use move_pages on our own stack.
+            unsigned char stack_byte;
+            return queryNUMANode(&stack_byte);
+#else
+            return -1;
+#endif
+        }
+
+        /// Audit NUMA placement of expert GEMM weights.
+        /// Samples up to `max_sample` experts and logs the NUMA node of their
+        /// native_interleaved data pointer, comparing against the expected node.
+        /// @param experts    Expert IDs to audit
+        /// @param gate_gemms Gate GEMM engines per expert
+        /// @param label      Human-readable label for the log (e.g., "initial_pack", "rebalance")
+        /// @param layer_idx  Layer index for log context
+        /// @param max_sample Maximum experts to sample (0 = all)
+        static void auditExpertNUMA(
+            const std::vector<int>& experts,
+            const std::vector<ITensorGemm*>& gate_gemms,
+            const char* label,
+            int layer_idx,
+            int max_sample = 8)
+        {
+            if (experts.empty()) return;
+
+            const int expected_node = currentCPUNode();
+            if (expected_node < 0) {
+                LOG_DEBUG("[MoEFFNStage][NUMA] Cannot determine current NUMA node, skipping audit");
+                return;
+            }
+
+            int sampled = 0, local = 0, remote = 0, unmapped = 0;
+            int first_remote_expert = -1;
+            int first_remote_node = -1;
+
+            const int step = (max_sample > 0 && static_cast<int>(experts.size()) > max_sample)
+                           ? static_cast<int>(experts.size()) / max_sample : 1;
+
+            for (size_t i = 0; i < experts.size(); i += step) {
+                const int e = experts[i];
+                if (e < 0 || e >= static_cast<int>(gate_gemms.size()) || !gate_gemms[e])
+                    continue;
+
+                auto* vnni_kernel = dynamic_cast<const cpu::native_vnni::CPUNativeVNNIGemmKernel*>(gate_gemms[e]);
+                if (!vnni_kernel) continue;
+
+                const auto& packed = vnni_kernel->packedWeights();
+                const void* data_ptr = packed.interleavedBase();
+                if (!data_ptr) continue;
+
+                int node = queryNUMANode(data_ptr);
+                ++sampled;
+
+                if (node < 0) {
+                    ++unmapped;
+                } else if (node != expected_node) {
+                    ++remote;
+                    if (first_remote_expert < 0) {
+                        first_remote_expert = e;
+                        first_remote_node = node;
+                    }
+                } else {
+                    ++local;
+                }
+            }
+
+            if (sampled == 0) return;
+
+            if (remote > 0) {
+                LOG_WARN("[MoEFFNStage][NUMA] layer " << layer_idx << " " << label
+                         << ": " << remote << "/" << sampled << " sampled experts on WRONG NUMA node"
+                         << " (expected=" << expected_node
+                         << ", first_remote: expert " << first_remote_expert
+                         << " on node " << first_remote_node << ")"
+                         << (unmapped > 0 ? (std::string(" [") + std::to_string(unmapped) + " unmapped]") : ""));
+            } else {
+                LOG_DEBUG("[MoEFFNStage][NUMA] layer " << layer_idx << " " << label
+                         << ": all " << sampled << "/" << static_cast<int>(experts.size())
+                         << " sampled experts on correct NUMA node " << expected_node
+                         << (unmapped > 0 ? (std::string(" [") + std::to_string(unmapped) + " unmapped]") : ""));
+            }
+        }
+
         /// Execute SwiGLU activation + Down projection via fused kernel when available,
         /// falling back to IMoEKernel::swiGLU + separate GEMM when not (e.g., FP32 weights).
         /// @param gate_tensor [m, intermediate] — gate projection output (modified in-place on fallback)
@@ -91,13 +210,158 @@ namespace llaminar2
         return true;
     }
 
-    bool MoEFFNStage::updateExpertMaskAndPrepareEngines(const std::vector<bool>& new_mask) {
+    ExpertWeightBlobs MoEFFNStage::detachAndSerializeExpert(int expert_id) {
+        ExpertWeightBlobs blobs;
+
+        auto serialize_proj = [&](ITensorGemm* engine, const char* /*proj_name*/) -> std::vector<uint8_t> {
+            if (!engine) return {};
+            if (!engine->hasWeights()) return {};
+            auto packed = engine->detachWeights();
+            if (!packed) return {};
+            return packed_weights_serialization::serialize(*packed);
+        };
+
+        blobs.gate = serialize_proj(params_.prepared_gate_gemm[expert_id], "gate");
+        blobs.up   = serialize_proj(params_.prepared_up_gemm[expert_id], "up");
+        blobs.down = serialize_proj(params_.prepared_down_gemm[expert_id], "down");
+
+        return blobs;
+    }
+
+    ExpertWeightBlobs MoEFFNStage::serializeExpert(int expert_id) const {
+        using namespace cpu::native_vnni;
+
+        ExpertWeightBlobs blobs;
+
+        auto serialize_proj = [](ITensorGemm* engine) -> std::vector<uint8_t> {
+            if (!engine || !engine->hasWeights()) return {};
+            auto* vnni_kernel = dynamic_cast<const CPUNativeVNNIGemmKernel*>(engine);
+            if (!vnni_kernel) return {};
+            // Wrap const ref — CPUPackedWeights const-ref ctor deep-copies.
+            // serialize() only reads, so the copy is the data we send over MPI.
+            CPUPackedWeights wrapper(vnni_kernel->packedWeights());
+            return packed_weights_serialization::serialize(wrapper);
+        };
+
+        blobs.gate = serialize_proj(params_.prepared_gate_gemm[expert_id]);
+        blobs.up   = serialize_proj(params_.prepared_up_gemm[expert_id]);
+        blobs.down = serialize_proj(params_.prepared_down_gemm[expert_id]);
+
+        return blobs;
+    }
+
+    bool MoEFFNStage::registerTransferredExpert(int expert_id, const ExpertWeightBlobs& blobs) {
+        using namespace cpu::native_vnni;
+
+        auto register_one = [&](const std::vector<uint8_t>& blob,
+                                const std::shared_ptr<TensorBase>& view) -> bool {
+            if (blob.empty() || !view) return false;
+
+            auto packed_weights = packed_weights_serialization::deserialize(blob.data(), blob.size());
+            if (!packed_weights) return false;
+
+            auto* cpu_pw = dynamic_cast<CPUPackedWeights*>(packed_weights.get());
+            if (!cpu_pw) return false;
+
+            auto kernel = std::make_unique<CPUNativeVNNIGemmKernel>(cpu_pw->takePacked());
+            return KernelFactory::registerPreparedGemmFromTransfer(
+                view.get(), params_.device_id, std::move(kernel)) != nullptr;
+        };
+
+        bool gate_ok = register_one(blobs.gate, params_.expert_gate_views[expert_id]);
+        bool up_ok   = register_one(blobs.up,   params_.expert_up_views[expert_id]);
+        bool down_ok = register_one(blobs.down,  params_.expert_down_views[expert_id]);
+
+        return gate_ok && up_ok && down_ok;
+    }
+
+    size_t MoEFFNStage::releaseRawExpertWeights() {
+        size_t freed = 0;
+
+        // Release heap-allocated raw data from 3D parent tensors.
+        // For mmap-backed tensors, the madvise(MADV_DONTNEED) already happened
+        // in prepareExpertGemmEngines(). For heap-allocated tensors, this frees
+        // the raw_data_ vector — the only way to reclaim that memory.
+        auto release_3d = [&](TensorBase* tensor, const char* name) {
+            if (!tensor) return;
+            if (tensor->is_mmap_data()) {
+                // Already madvised at pack time — just count the bytes
+                freed += tensor->size_bytes();
+                LOG_DEBUG("[MoEFFNStage] " << name << ": mmap-backed ("
+                          << (tensor->size_bytes() >> 20) << " MB) — already DONTNEED");
+            } else if (!tensor->is_raw_data_released()) {
+                size_t bytes = tensor->size_bytes();
+                tensor->release_raw_data();
+                freed += bytes;
+                LOG_DEBUG("[MoEFFNStage] " << name << ": released "
+                          << (bytes >> 20) << " MB heap data");
+            }
+        };
+
+        release_3d(params_.gate_exps, "gate_exps");
+        release_3d(params_.up_exps, "up_exps");
+        release_3d(params_.down_exps, "down_exps");
+
+        // Null out 3D pointers to prevent accidental fallback to raw repacking.
+        // Views remain valid as KernelFactory cache keys.
+        params_.gate_exps = nullptr;
+        params_.up_exps = nullptr;
+        params_.down_exps = nullptr;
+        raw_weights_released_ = true;
+
+        if (freed > 0) {
+            LOG_INFO("[MoEFFNStage] Layer " << params_.layer_idx
+                     << ": released " << (freed >> 20) << " MB raw expert weights"
+                     << " (VNNI engines retain packed data)");
+        }
+
+        return freed;
+    }
+
+    bool MoEFFNStage::updateExpertMaskAndPrepareEngines(
+        const std::vector<bool>& new_mask,
+        const std::unordered_map<int, ExpertWeightBlobs>* received_weights) {
         if (static_cast<int>(new_mask.size()) != params_.num_experts) {
             LOG_ERROR("[MoEFFNStage] Expert mask size " << new_mask.size()
                       << " != num_experts " << params_.num_experts);
             return false;
         }
 
+        // ── Phase 1: Release departed experts ────────────────────────────
+        // Experts that were active (prepared) but are no longer in new_mask.
+        // Release their packed weights to reclaim memory.
+        {
+            int departed_count = 0;
+            for (int e = 0; e < params_.num_experts; ++e) {
+                if (!new_mask[e] && params_.prepared_gate_gemm[e]) {
+                    // Release packed weights from GEMM engines
+                    params_.prepared_gate_gemm[e]->releaseWeights();
+                    params_.prepared_up_gemm[e]->releaseWeights();
+                    params_.prepared_down_gemm[e]->releaseWeights();
+
+                    // Evict from KernelFactory cache so stale pointers are cleaned up
+                    if (params_.expert_gate_views[e])
+                        KernelFactory::clearPreparedGemmWeightsFor(params_.expert_gate_views[e].get());
+                    if (params_.expert_up_views[e])
+                        KernelFactory::clearPreparedGemmWeightsFor(params_.expert_up_views[e].get());
+                    if (params_.expert_down_views[e])
+                        KernelFactory::clearPreparedGemmWeightsFor(params_.expert_down_views[e].get());
+
+                    // Null out the engine pointers
+                    params_.prepared_gate_gemm[e] = nullptr;
+                    params_.prepared_up_gemm[e] = nullptr;
+                    params_.prepared_down_gemm[e] = nullptr;
+
+                    ++departed_count;
+                }
+            }
+            if (departed_count > 0) {
+                LOG_DEBUG("[MoEFFNStage] Released " << departed_count
+                         << " departed expert weight sets");
+            }
+        }
+
+        // ── Phase 2: Prepare newly-acquired experts ──────────────────────
         // Find newly-acquired experts (true in new_mask, not previously prepared)
         std::vector<int> new_experts;
         for (int e = 0; e < params_.num_experts; ++e) {
@@ -108,12 +372,33 @@ namespace llaminar2
 
         // Lazily prepare GEMM engines for newly-acquired experts
         if (!new_experts.empty()) {
-            LOG_INFO("[MoEFFNStage] Preparing " << new_experts.size()
+            auto t_start = std::chrono::high_resolution_clock::now();
+            int transferred_count = 0;
+
+            LOG_DEBUG("[MoEFFNStage] Preparing " << new_experts.size()
                      << " new expert GEMM engines after rebalance");
 
             std::atomic<bool> error_flag{false};
             const int count = static_cast<int>(new_experts.size());
 
+            // Phase 2a: Register transferred weights (single-threaded, fast deserialization)
+            if (received_weights) {
+                for (int idx = 0; idx < count; ++idx) {
+                    const int e = new_experts[idx];
+                    auto it = received_weights->find(e);
+                    if (it != received_weights->end() && !it->second.empty()) {
+                        if (registerTransferredExpert(e, it->second)) {
+                            ++transferred_count;
+                        }
+                    }
+                }
+                if (transferred_count > 0) {
+                    LOG_DEBUG("[MoEFFNStage] Registered " << transferred_count
+                             << " experts from transferred weights (skipped VNNI packing)");
+                }
+            }
+
+            // Phase 2b: Prepare engines (cache hit for transferred, full pack for rest)
             #pragma omp parallel for schedule(static)
             for (int idx = 0; idx < count; ++idx) {
                 if (error_flag.load(std::memory_order_relaxed)) continue;
@@ -152,10 +437,145 @@ namespace llaminar2
             }
 
             if (error_flag.load()) return false;
+
+            auto t_end = std::chrono::high_resolution_clock::now();
+            double prep_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
+            LOG_DEBUG("[MoEFFNStage] VNNI prep for " << new_experts.size()
+                      << " experts (" << transferred_count << " transferred): "
+                      << std::fixed << std::setprecision(1) << prep_ms << " ms");
+
+            // NUMA audit: verify rebalanced expert weights landed on the correct NUMA node.
+            auditExpertNUMA(new_experts, params_.prepared_gate_gemm,
+                            (transferred_count > 0 ? "rebalance_transferred" : "rebalance_repacked"),
+                            params_.layer_idx);
         }
 
         params_.expert_mask = new_mask;
+
+        // Invalidate cached engine vectors so ensureGemmEnginesCached()
+        // re-copies from the updated params_ on next execute().
+        cached_gate_gemm_.clear();
+        cached_up_gemm_.clear();
+        cached_down_gemm_.clear();
+
         return true;
+    }
+
+    // ── Phased rebalance API ─────────────────────────────────────────────
+
+    std::vector<const TensorBase*> MoEFFNStage::releaseDepartedExperts(
+        const std::vector<bool>& new_mask) {
+        std::vector<const TensorBase*> evict_tensors;
+
+        for (int e = 0; e < params_.num_experts; ++e) {
+            if (!new_mask[e] && params_.prepared_gate_gemm[e]) {
+                // Release packed weights from GEMM engines
+                params_.prepared_gate_gemm[e]->releaseWeights();
+                params_.prepared_up_gemm[e]->releaseWeights();
+                params_.prepared_down_gemm[e]->releaseWeights();
+
+                // Collect tensor views for batch cache eviction by the caller
+                if (params_.expert_gate_views[e])
+                    evict_tensors.push_back(params_.expert_gate_views[e].get());
+                if (params_.expert_up_views[e])
+                    evict_tensors.push_back(params_.expert_up_views[e].get());
+                if (params_.expert_down_views[e])
+                    evict_tensors.push_back(params_.expert_down_views[e].get());
+
+                // Null out the engine pointers
+                params_.prepared_gate_gemm[e] = nullptr;
+                params_.prepared_up_gemm[e] = nullptr;
+                params_.prepared_down_gemm[e] = nullptr;
+            }
+        }
+        return evict_tensors;
+    }
+
+    bool MoEFFNStage::registerAndPrepareNewExperts(
+        const std::vector<bool>& new_mask,
+        const std::unordered_map<int, ExpertWeightBlobs>* received_weights) {
+
+        // Find newly-acquired experts (true in new_mask, not previously prepared)
+        std::vector<int> new_experts;
+        for (int e = 0; e < params_.num_experts; ++e) {
+            if (new_mask[e] && !params_.prepared_gate_gemm[e])
+                new_experts.push_back(e);
+        }
+        if (new_experts.empty()) return true;
+
+        auto t_start = std::chrono::high_resolution_clock::now();
+        int transferred_count = 0;
+        std::atomic<bool> error_flag{false};
+        const int count = static_cast<int>(new_experts.size());
+
+        // Register transferred weights (single-threaded, fast deserialization)
+        if (received_weights) {
+            for (int idx = 0; idx < count; ++idx) {
+                const int e = new_experts[idx];
+                auto it = received_weights->find(e);
+                if (it != received_weights->end() && !it->second.empty()) {
+                    if (registerTransferredExpert(e, it->second))
+                        ++transferred_count;
+                }
+            }
+        }
+
+        // Prepare engines (cache hit for transferred, full pack for rest)
+        for (int idx = 0; idx < count; ++idx) {
+            if (error_flag.load(std::memory_order_relaxed)) break;
+            const int e = new_experts[idx];
+
+            if (!params_.expert_gate_views[e] || !params_.expert_up_views[e] ||
+                !params_.expert_down_views[e]) {
+                LOG_ERROR("[MoEFFNStage] Null view for new expert " << e);
+                error_flag.store(true, std::memory_order_relaxed);
+                continue;
+            }
+
+            auto *gp = KernelFactory::getOrCreatePreparedGemmWeights(
+                params_.expert_gate_views[e].get(), params_.device_id);
+            auto *up = KernelFactory::getOrCreatePreparedGemmWeights(
+                params_.expert_up_views[e].get(), params_.device_id);
+            auto *dp = KernelFactory::getOrCreatePreparedGemmWeights(
+                params_.expert_down_views[e].get(), params_.device_id);
+
+            if (!gp || !up || !dp) {
+                LOG_ERROR("[MoEFFNStage] Failed GEMM weights for new expert " << e);
+                error_flag.store(true, std::memory_order_relaxed);
+                continue;
+            }
+
+            params_.prepared_gate_gemm[e] = KernelFactory::getOrCreateGemmEngine(gp);
+            params_.prepared_up_gemm[e] = KernelFactory::getOrCreateGemmEngine(up);
+            params_.prepared_down_gemm[e] = KernelFactory::getOrCreateGemmEngine(dp);
+
+            if (!params_.prepared_gate_gemm[e] || !params_.prepared_up_gemm[e] ||
+                !params_.prepared_down_gemm[e]) {
+                LOG_ERROR("[MoEFFNStage] Failed GEMM engine for new expert " << e);
+                error_flag.store(true, std::memory_order_relaxed);
+                continue;
+            }
+        }
+
+        if (error_flag.load()) return false;
+
+        auto t_end = std::chrono::high_resolution_clock::now();
+        double prep_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
+        LOG_DEBUG("[MoEFFNStage] Engine prep for " << new_experts.size()
+                  << " experts (" << transferred_count << " transferred): "
+                  << std::fixed << std::setprecision(1) << prep_ms << " ms");
+
+        auditExpertNUMA(new_experts, params_.prepared_gate_gemm,
+                        (transferred_count > 0 ? "rebalance_transferred" : "rebalance_repacked"),
+                        params_.layer_idx);
+        return true;
+    }
+
+    void MoEFFNStage::applyExpertMask(const std::vector<bool>& new_mask) {
+        params_.expert_mask = new_mask;
+        cached_gate_gemm_.clear();
+        cached_up_gemm_.clear();
+        cached_down_gemm_.clear();
     }
 
     IMoEKernel *MoEFFNStage::ensureMoEKernel() const
@@ -195,7 +615,7 @@ namespace llaminar2
             return false;
         }
 
-        if (!params_.gate_exps || !params_.up_exps || !params_.down_exps)
+        if (!raw_weights_released_ && (!params_.gate_exps || !params_.up_exps || !params_.down_exps))
         {
             LOG_ERROR("[MoEFFNStage] Null expert weight tensors");
             return false;
@@ -254,6 +674,18 @@ namespace llaminar2
         const int local_end = local_start + local_count;
 
         std::vector<std::vector<std::pair<int, float>>> expert_token_lists(num_experts);
+
+        // During prefill, replicated experts must only run on their owner
+        // socket.  If both sockets process the same expert, the allreduce
+        // will double-count that expert's contribution (correctness bug)
+        // and waste ~12% compute (performance bug).
+        //
+        // Use pre-built prefill mask when available (zero per-expert overhead).
+        // Falls back to multi-branch check if mask isn't built yet.
+        const bool has_prefill_mask = !params_.replica_set.prefill_mask.empty();
+        const std::vector<bool>& prefill_mask_ref = params_.replica_set.prefill_mask;
+        const bool has_replicas = params_.replica_set.num_replicated > 0;
+
         for (int t = 0; t < seq_len; ++t)
         {
             for (int k = 0; k < top_k; ++k)
@@ -262,8 +694,22 @@ namespace llaminar2
                 float weight = routing.expert_weights[t * top_k + k];
                 // With EP or dynamic mask, only accumulate tokens for local experts
                 bool is_local;
-                if (!params_.expert_mask.empty())
+                if (has_prefill_mask)
+                {
+                    // Pre-built mask: single lookup, no branches
+                    is_local = prefill_mask_ref[expert_id];
+                }
+                else if (!params_.expert_mask.empty())
+                {
                     is_local = params_.expert_mask[expert_id];
+                    // Replicated experts: only owner socket processes during prefill
+                    if (is_local && has_replicas &&
+                        params_.replica_set.is_replicated[expert_id] &&
+                        params_.replica_set.owner_socket[expert_id] != params_.my_socket_id)
+                    {
+                        is_local = false;
+                    }
+                }
                 else
                     is_local = (expert_id >= local_start && expert_id < local_end);
                 if (is_local)
@@ -340,7 +786,7 @@ namespace llaminar2
                 num_tokens, d_model);
         }
 
-        LOG_DEBUG("[MoEFFNStage] Processed " << seq_len << " tokens via GEMM kernels, "
+        LOG_TRACE("[MoEFFNStage] Processed " << seq_len << " tokens via GEMM kernels, "
                                              << top_k << " experts per token");
         return true;
     }
@@ -373,26 +819,27 @@ namespace llaminar2
         const float *gate_w = params_.gate_weights->data();
         float *output = params_.output->mutable_data();
 
-        // Routing
+        // Routing — reuse pre-allocated cached_routing_ to avoid heap allocs
         IMoEKernel *kernel = ensureMoEKernel();
-        MoERoutingResult routing;
         if (!kernel->route(hidden, gate_w, /*seq_len=*/1, d_model,
-                           num_experts, top_k, params_.norm_topk_prob, routing))
+                           num_experts, top_k, params_.norm_topk_prob, cached_routing_))
         {
             LOG_ERROR("[MoEFFNStage] Routing failed (single-token)");
             return false;
         }
 
-        router_logits_ = std::move(routing.router_logits);
-        stashRoutingResults(routing.expert_indices, routing.expert_weights, 1, top_k);
+#ifdef ENABLE_PIPELINE_SNAPSHOTS
+        router_logits_ = std::move(cached_routing_.router_logits);
+        stashRoutingResults(cached_routing_.expert_indices, cached_routing_.expert_weights, 1, top_k);
+#endif
 
         // Record routing result in decode histogram (if tracking enabled)
         if (params_.decode_histogram && params_.layer_idx >= 0)
         {
             params_.decode_histogram->record(
                 params_.layer_idx,
-                routing.expert_indices.data(),
-                routing.expert_weights.data(),
+                cached_routing_.expert_indices.data(),
+                cached_routing_.expert_weights.data(),
                 top_k);
         }
 
@@ -447,24 +894,51 @@ namespace llaminar2
         batch_projections_.clear();
         batch_projections_.reserve(top_k * 2);
 
+        // Per-token dynamic dispatch for replicated experts.
+        // When replicas are active, use ExpertReplicaSet::assignForToken()
+        // to deterministically decide which socket computes each expert.
+        bool compute_here[16]; // stack-allocated, max top_k
+
+        if (params_.replica_set.num_replicated > 0)
+        {
+            params_.replica_set.assignForToken(
+                cached_routing_.expert_indices.data(),
+                cached_routing_.expert_weights.data(),
+                top_k,
+                params_.my_socket_id,
+                params_.expert_mask,
+                compute_here);
+        }
+        else
+        {
+            // No replicas — use simple mask/range check
+            for (int k = 0; k < top_k; ++k)
+            {
+                const int expert_id = cached_routing_.expert_indices[k];
+                if (!params_.expert_mask.empty())
+                    compute_here[k] = params_.expert_mask[expert_id];
+                else
+                    compute_here[k] = (expert_id >= local_start && expert_id < local_end);
+            }
+        }
+
         for (int k = 0; k < top_k; ++k)
         {
-            const int expert_id = routing.expert_indices[k];
+            if (!compute_here[k]) continue;
 
-            // EP: skip experts not assigned to this rank
-            if (!params_.expert_mask.empty()) {
-                if (!params_.expert_mask[expert_id]) continue;
-            } else {
-                if (expert_id < local_start || expert_id >= local_end) continue;
-            }
+            const int expert_id = cached_routing_.expert_indices[k];
 
             ITensorGemm *gate_gemm = cached_gate_gemm_[expert_id];
             ITensorGemm *up_gemm = cached_up_gemm_[expert_id];
 
             if (!gate_gemm || !up_gemm)
             {
-                LOG_ERROR("[MoEFFNStage] Null gate/up GEMM engine for expert " << expert_id);
-                return false;
+                LOG_ERROR("[MoEFFNStage] FATAL: Null gate/up GEMM engine for expert "
+                    << expert_id << " (layer " << params_.layer_idx
+                    << ", mask=" << (params_.expert_mask.empty() ? -1 : (int)params_.expert_mask[expert_id])
+                    << ", replicated=" << params_.replica_set.is_replicated[expert_id]
+                    << ", prepared_gate=" << (bool)params_.prepared_gate_gemm[expert_id] << ")");
+                MPI_Abort(MPI_COMM_WORLD, 1);
             }
 
             batch_projections_.push_back(
@@ -472,7 +946,7 @@ namespace llaminar2
             batch_projections_.push_back(
                 {up_gemm, scratch_up_batch_[num_active].get(), intermediate, nullptr, "up"});
 
-            active_experts[num_active] = {expert_id, routing.expert_weights[k], num_active};
+            active_experts[num_active] = {expert_id, cached_routing_.expert_weights[k], num_active};
             num_active++;
         }
 
@@ -510,9 +984,9 @@ namespace llaminar2
         {
             if (!cached_down_gemm_[active_experts[i].expert_id])
             {
-                LOG_ERROR("[MoEFFNStage] Null down GEMM engine for expert "
-                          << active_experts[i].expert_id);
-                return false;
+                LOG_ERROR("[MoEFFNStage] FATAL: Null down GEMM engine for expert "
+                    << active_experts[i].expert_id << " (layer " << params_.layer_idx << ")");
+                MPI_Abort(MPI_COMM_WORLD, 1);
             }
         }
 
@@ -577,7 +1051,7 @@ namespace llaminar2
             }
         }
 
-        LOG_DEBUG("[MoEFFNStage] Single-token decode (batched gate+up): " << num_active << " experts");
+        LOG_TRACE("[MoEFFNStage] Single-token decode (batched gate+up): " << num_active << " experts");
         return true;
     }
 
@@ -723,9 +1197,9 @@ namespace llaminar2
         if (!extract_views(params.down_exps, num_experts, params.expert_down_views))
             return false;
 
-        LOG_INFO("[MoEFFNStage] Extracted " << (extract_all ? num_experts : local_count) << "/" << num_experts
-                                            << " expert 2D views (EP range [" << local_start
-                                            << ", " << local_end << ")"
+        LOG_DEBUG("[MoEFFNStage] Extracted " << (extract_all ? num_experts : local_count) << "/" << num_experts
+                                             << " expert 2D views (EP range [" << local_start
+                                             << ", " << local_end << ")"
                                             << (extract_all ? " extract_all=true" : "") << ")");
         return true;
     }
@@ -771,9 +1245,9 @@ namespace llaminar2
         params.prepared_up_gemm.resize(num_experts, nullptr);
         params.prepared_down_gemm.resize(num_experts, nullptr);
 
-        LOG_INFO("[MoEFFNStage] Preparing GEMM engines for " << prep_count << "/" << num_experts
-                 << " experts (3 weights each = " << (prep_count * 3) << " total"
-                 << (use_mask ? " [dynamic rebalance: mask-active only]" : "") << ")...");
+        LOG_DEBUG("[MoEFFNStage] Preparing GEMM engines for " << prep_count << "/" << num_experts
+                  << " experts (3 weights each = " << (prep_count * 3) << " total"
+                  << (use_mask ? " [dynamic rebalance: mask-active only]" : "") << ")...");
 
 #ifdef HAVE_CUDA
         if (params.device_id.is_cuda())
@@ -838,7 +1312,11 @@ namespace llaminar2
             return false;
         }
 
-        LOG_INFO("[MoEFFNStage] All " << (prep_count * 3) << " expert GEMM engines prepared (CPU/KernelFactory path)");
+        LOG_DEBUG("[MoEFFNStage] All " << (prep_count * 3) << " expert GEMM engines prepared (CPU/KernelFactory path)");
+
+        // NUMA audit: verify packed weights landed on the correct NUMA node.
+        auditExpertNUMA(experts_to_prep, params.prepared_gate_gemm,
+                        "initial_pack", params.layer_idx);
 
         // Release mmap pages backing the raw expert weight data.
         // The VNNI interleaved engines now own their own copy — the original
@@ -1221,8 +1699,8 @@ namespace llaminar2
                                        params.moe_packed_down_lifetime, "down"))
             return false;
 
-        LOG_INFO("[MoEFFNStage] All " << (num_experts * 3)
-                 << " expert GEMM engines prepared (CUDA batch path, 3 GPU allocs)");
+        LOG_DEBUG("[MoEFFNStage] All " << (num_experts * 3)
+                  << " expert GEMM engines prepared (CUDA batch path, 3 GPU allocs)");
 
         // Release mmap pages for raw expert weights (now uploaded to GPU).
         // Only safe for mmap-backed tensors — EP-sliced tensors are heap-allocated.
@@ -1301,8 +1779,8 @@ namespace llaminar2
                                        params.moe_packed_down_lifetime, "down"))
             return false;
 
-        LOG_INFO("[MoEFFNStage] All " << (num_experts * 3)
-                 << " expert GEMM engines prepared (ROCm batch path, 3 GPU allocs)");
+        LOG_DEBUG("[MoEFFNStage] All " << (num_experts * 3)
+                  << " expert GEMM engines prepared (ROCm batch path, 3 GPU allocs)");
 
         // Release mmap pages for raw expert weights (now uploaded to GPU).
         // Only safe for mmap-backed tensors — EP-sliced tensors are heap-allocated.

@@ -1130,13 +1130,17 @@ Core columns: `backend`, `layer`, `stage` (plus `step` for decode), followed by 
 
 | Column | Description |
 |--------|-------------|
-| `cosine` | Cosine similarity between Llaminar and PyTorch stage output |
-| `cosine_drop` | Error introduced by this stage: `prev_stage_cosine - cosine` (0 for first stage in a layer) |
-| `rel_l2` | Relative L2 norm of error |
-| `max_abs_diff` | Maximum absolute element-wise difference |
-| `snr_db` | Signal-to-noise ratio in dB |
-| `rmse` | Root mean squared error |
-| `error_entropy` | Shannon entropy of binned error distribution |
+| `cosine` | Cosine similarity between Llaminar and PyTorch stage output (empty for routing stages) |
+| `cosine_drop` | Error introduced by this stage: `prev_stage_cosine - cosine` (empty for routing stages) |
+| `rel_l2` | Relative L2 norm of error (empty for routing stages) |
+| `max_abs_diff` | Maximum absolute element-wise difference (always present) |
+| `snr_db` | Signal-to-noise ratio in dB (empty for routing stages) |
+| `rmse` | Root mean squared error (empty for routing stages) |
+| `error_entropy` | Shannon entropy of binned error distribution (empty for routing stages) |
+| `is_routing` | `1` for MoE routing stages (`MOE_ROUTING_INDICES`, `MOE_ROUTING_WEIGHTS`), `0` otherwise |
+| `routing_overlap` | Set overlap (Jaccard) for routing indices, sparse-vector cosine for routing weights (empty for non-routing) |
+| `routing_top1_match` | Fraction of tokens where top-1 expert matches (routing indices only) |
+| `routing_weight_l1` | Mean L1 distance of sparse weight vectors (routing weights only) |
 
 Then 15 distribution stats columns are repeated for both `llaminar_` and `pytorch_` prefixed:
 
@@ -1158,16 +1162,28 @@ Then 15 distribution stats columns are repeated for both `llaminar_` and `pytorc
 import pandas as pd
 df = pd.read_csv("tests/v2/integration/parity/results/30dd5714/Qwen2_.../decode_stages.csv")
 
-# Find stages with worst cosine per decode step
-worst = df.loc[df.groupby("step")["cosine"].idxmin()]
+# Separate tensor stages from routing stages
+tensor_df = df[df.is_routing == 0]
+routing_df = df[df.is_routing == 1]
+
+# Find stages with worst cosine per decode step (tensor stages only)
+worst = tensor_df.loc[tensor_df.groupby("step")["cosine"].idxmin()]
 print(worst[["step", "layer", "stage", "cosine", "max_abs_diff"]])
 
 # Find the stage introducing the most error per layer (most actionable)
-top_drops = df.loc[df.groupby(["step", "layer"])["cosine_drop"].idxmax()]
+top_drops = tensor_df.loc[tensor_df.groupby(["step", "layer"])["cosine_drop"].idxmax()]
 print(top_drops[top_drops.cosine_drop > 0.001][["step", "layer", "stage", "cosine_drop", "cosine"]])
 
 # Compare distribution shape between backends
-print(df[df.stage == "Q_PROJ"][["layer", "cosine", "llaminar_kurtosis", "pytorch_kurtosis"]])
+print(tensor_df[tensor_df.stage == "Q_PROJ"][["layer", "cosine", "llaminar_kurtosis", "pytorch_kurtosis"]])
+
+# MoE routing overlap analysis
+routing_indices = routing_df[routing_df.stage == "MOE_ROUTING_INDICES"]
+print(routing_indices[["step", "layer", "routing_overlap", "routing_top1_match"]])
+
+# Find layers with worst expert selection agreement
+worst_routing = routing_indices.loc[routing_indices.groupby("step")["routing_overlap"].idxmin()]
+print(worst_routing[["step", "layer", "routing_overlap", "routing_top1_match"]])
 ```
 
 ---

@@ -28,6 +28,7 @@
 
 #include "CPUNativeVNNIWeightPacker.h"
 #include "CPUNativeVNNIGemv.h"
+#include "CPUPackedWeights.h"
 #include "tensors/TensorKernels.h"
 #include "tensors/TensorClasses.h"
 #include "kernels/cpu/primitives/SwiGLUPrimitives.h"
@@ -260,6 +261,81 @@ namespace llaminar2::cpu::native_vnni
 
             return true;
         }
+
+        // -------------------------------------------------------------------
+        // Weight Lifecycle (IPackedWeights integration)
+        // -------------------------------------------------------------------
+
+        std::unique_ptr<IPackedWeights> detachWeights() override
+        {
+            if (!valid_)
+                return nullptr;
+
+            std::unique_ptr<IPackedWeights> result;
+            if (deferred_packing_ && !native_blocks_owned_.empty())
+            {
+                // Deferred packing: transfer both packed metadata and native blocks
+                result = std::make_unique<CPUPackedWeightsWithNativeBlocks>(
+                    std::move(packed_),
+                    std::move(native_blocks_owned_),
+                    native_block_size_);
+            }
+            else
+            {
+                // Permanent interleaved: transfer the packed data
+                result = std::make_unique<CPUPackedWeights>(std::move(packed_));
+            }
+
+            // Invalidate kernel
+            packed_ = CPUNativeVNNIPackedWeights{};
+            native_blocks_owned_.clear();
+            native_blocks_ptr_ = nullptr;
+            deferred_packing_ = false;
+            valid_ = false;
+            return result;
+        }
+
+        bool attachWeights(std::unique_ptr<IPackedWeights> weights) override
+        {
+            if (!weights || weights->format() != PackedWeightsFormat::CPU_NATIVE_VNNI)
+                return false;
+
+            // Check if it includes native blocks (deferred packing)
+            auto *with_native = dynamic_cast<CPUPackedWeightsWithNativeBlocks *>(weights.get());
+            if (with_native)
+            {
+                packed_ = with_native->takePacked();
+                native_blocks_owned_ = std::vector<uint8_t>(with_native->nativeBlocks());
+                native_block_size_ = with_native->nativeBlockSize();
+                native_blocks_ptr_ = native_blocks_owned_.data();
+                deferred_packing_ = true;
+            }
+            else
+            {
+                auto *cpu_packed = dynamic_cast<CPUPackedWeights *>(weights.get());
+                if (!cpu_packed)
+                    return false;
+                packed_ = cpu_packed->takePacked();
+                native_blocks_owned_.clear();
+                native_blocks_ptr_ = nullptr;
+                deferred_packing_ = false;
+            }
+
+            valid_ = true;
+            return true;
+        }
+
+        void releaseWeights() override
+        {
+            { CPUNativeVNNIPackedWeights empty; packed_ = std::move(empty); }
+            native_blocks_owned_.clear();
+            native_blocks_owned_.shrink_to_fit();
+            native_blocks_ptr_ = nullptr;
+            deferred_packing_ = false;
+            valid_ = false;
+        }
+
+        bool hasWeights() const override { return valid_; }
 
         // -------------------------------------------------------------------
         // Accessors

@@ -7,7 +7,7 @@
 #include <gtest/gtest.h>
 #include "kernels/cpu/primitives/RoPEPrimitives.h"
 #include "kernels/cpu/primitives/RMSNormPrimitives.h"
-#include "kernels/cpu/primitives/SoftmaxPrimitives.h"
+#include "kernels/cpu/primitives/SoftmaxPrimitives_New.h"
 #include <cmath>
 #include <vector>
 #include <algorithm>
@@ -198,17 +198,7 @@ TEST(Test__VectorizedPrimitives, Softmax_BasicComputation)
         }
     }
 
-    SoftmaxRowArgs args;
-    args.scores = scores.data();
-    args.rows = rows;
-    args.cols = cols;
-    args.causal = false;
-    args.scale = 1.0f;
-
-    SoftmaxExecOptions opts;
-    opts.force_scalar = false; // Use vectorized path
-
-    softmax_row_major_vectorized(args, opts);
+    softmax_row_major_fp32(scores.data(), rows, cols, false, 1.0f, true);
 
     // Verify each row sums to 1.0
     for (int r = 0; r < rows; ++r)
@@ -239,16 +229,7 @@ TEST(Test__VectorizedPrimitives, Softmax_CausalMasking)
 
     std::vector<float> scores(rows * cols, 1.0f); // All ones initially
 
-    SoftmaxRowArgs args;
-    args.scores = scores.data();
-    args.rows = rows;
-    args.cols = cols;
-    args.causal = true;
-    args.scale = 1.0f;
-
-    SoftmaxExecOptions opts;
-
-    softmax_row_major_vectorized(args, opts);
+    softmax_row_major_fp32(scores.data(), rows, cols, true, 1.0f, true);
 
     // Verify causal mask: position j > i should be 0
     for (int i = 0; i < rows; ++i)
@@ -284,16 +265,7 @@ TEST(Test__VectorizedPrimitives, Softmax_WithScaling)
 
     std::vector<float> scores(rows * cols, 2.0f);
 
-    SoftmaxRowArgs args;
-    args.scores = scores.data();
-    args.rows = rows;
-    args.cols = cols;
-    args.causal = false;
-    args.scale = scale;
-
-    SoftmaxExecOptions opts;
-
-    softmax_row_major_vectorized(args, opts);
+    softmax_row_major_fp32(scores.data(), rows, cols, false, scale, true);
 
     // With uniform input, softmax should produce uniform output
     for (int r = 0; r < rows; ++r)

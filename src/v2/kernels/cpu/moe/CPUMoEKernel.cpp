@@ -7,6 +7,7 @@
  */
 
 #include "CPUMoEKernel.h"
+#include "../../cpu/primitives/SoftmaxPrimitives_New.h"
 #include "../../cpu/primitives/SwiGLUPrimitives.h"
 #include "../../cpu/primitives/VectorPrimitives.h"
 #include "../../../utils/Logger.h"
@@ -47,17 +48,8 @@ namespace llaminar2
                 for (int e = 0; e < num_experts; ++e)
                     logits[e] = primitives::vec_dot(gate_weights + e * d_model, h, d_model);
 
-                // Softmax (num_experts ~256: scalar is adequate for this size)
-                float max_logit = *std::max_element(logits.begin(), logits.end());
-                float sum_exp = 0.0f;
-                for (int e = 0; e < num_experts; ++e)
-                {
-                    logits[e] = std::exp(logits[e] - max_logit);
-                    sum_exp += logits[e];
-                }
-                const float inv_sum = 1.0f / sum_exp;
-                for (int e = 0; e < num_experts; ++e)
-                    logits[e] *= inv_sum;
+                // Vectorized softmax with fast_exp (SIMD-dispatched)
+                primitives::softmax_row_fp32(logits.data(), num_experts);
 
                 // Stash post-softmax probabilities
                 std::copy(logits.begin(), logits.end(),
@@ -84,11 +76,51 @@ namespace llaminar2
             }
         };
 
-        // For single token (decode), run without OpenMP overhead.
-        // For multi-token (prefill), parallelize across tokens.
+        // For single token (decode), parallelize the 256 dot products across
+        // threads.  The gate-weight matrix is 256×d_model ≈ 2 MB — streaming it
+        // through a single core is L3-bandwidth-bound (~15 GB/s → ~130 µs).
+        // With 28 threads the aggregate L3 BW exceeds 400 GB/s, bringing the
+        // dot-product phase down to ~5–10 µs.  The serial softmax + top-k that
+        // follows costs only ~5 µs and is not worth parallelizing.
+        //
+        // For multi-token (prefill), parallelize across tokens as before.
         if (seq_len <= 1)
         {
-            do_routing();
+            float *logits_ptr = result.router_logits.data();
+            const float *h = hidden;
+
+            // Phase 1: parallel dot products over experts
+            auto do_dot_products = [&]()
+            {
+#pragma omp for schedule(static)
+                for (int e = 0; e < num_experts; ++e)
+                    logits_ptr[e] = primitives::vec_dot(
+                        gate_weights + e * d_model, h, d_model);
+            };
+            OMP_WORKSHARE_REGION(do_dot_products);
+
+            // Phase 2: vectorized softmax (uses fast_exp via SIMD primitives)
+            primitives::softmax_row_fp32(logits_ptr, num_experts);
+
+            // Phase 3: top-k selection (thread_local avoids per-call alloc)
+            thread_local std::vector<int> indices;
+            indices.resize(num_experts);
+            std::iota(indices.begin(), indices.end(), 0);
+            std::partial_sort(indices.begin(), indices.begin() + top_k, indices.end(),
+                              [logits_ptr](int a, int b)
+                              { return logits_ptr[a] > logits_ptr[b]; });
+
+            float topk_sum = 0.0f;
+            for (int k = 0; k < top_k; ++k)
+                topk_sum += logits_ptr[indices[k]];
+
+            for (int k = 0; k < top_k; ++k)
+            {
+                result.expert_indices[k] = indices[k];
+                result.expert_weights[k] = normalize_weights
+                                                ? logits_ptr[indices[k]] / topk_sum
+                                                : logits_ptr[indices[k]];
+            }
         }
         else
         {

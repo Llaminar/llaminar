@@ -78,12 +78,11 @@ if [ ${#SUITES[@]} -eq 0 ]; then
     fi
 
     # Suite 3: Qwen3.5 35B MoE (MoE + GDN/FA architecture — CPU only)
-    # Uses max_tokens=200 for thinking model tags.
-    # xfail_inference=1: MoE inference is WIP — output may be degenerate.
-    # Server/health/error tests still validate normally.
+    # Uses max_tokens=200 because Qwen3.5 is a thinking model that emits
+    # <think>...</think> tags before the actual answer.
     S3_MODEL="${REPO_ROOT}/models/Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf"
     if [ -f "$S3_MODEL" ] && [ -z "$OVERRIDE_MODEL" ]; then
-        SUITES+=("${S3_MODEL}|cpu|200|xfail_inference")
+        SUITES+=("${S3_MODEL}|cpu|200")
     fi
 fi
 

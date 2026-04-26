@@ -40,7 +40,6 @@ namespace llaminar2
     {
         for (auto& c : expert_counts)
             c.store(0, std::memory_order_relaxed);
-        std::lock_guard<std::mutex> lock(weight_mutex);
         std::fill(weighted_sums.begin(), weighted_sums.end(), 0.0f);
         for (auto& s : slot_counts)
             s.fill(0);
@@ -74,17 +73,21 @@ namespace llaminar2
             layer.expert_counts[eid].fetch_add(1, std::memory_order_relaxed);
         }
 
-        // Mutex-protected weighted sums and slot counts
-        {
-            std::lock_guard<std::mutex> lock(layer.weight_mutex);
-            for (int s = 0; s < k; ++s) {
-                const int eid = expert_indices[s];
-                layer.weighted_sums[eid] += expert_weights[s];
-                layer.slot_counts[eid][s] += 1;
-            }
+        // Weighted sums and slot counts — no mutex needed because decode
+        // is single-threaded (one token at a time) and rebalance reads
+        // only happen when the window is full (after record() stops).
+        for (int s = 0; s < k; ++s) {
+            const int eid = expert_indices[s];
+            layer.weighted_sums[eid] += expert_weights[s];
+            layer.slot_counts[eid][s] += 1;
         }
 
-        window_token_count_.fetch_add(1, std::memory_order_relaxed);
+        // Increment window counter only on the last MoE layer so that
+        // window_size tracks actual decode tokens, not per-layer calls.
+        // record() is called once per MoE layer per token; without this
+        // guard, window_size=256 fills after only 256/num_layers tokens.
+        if (layer_idx == config_.num_layers - 1)
+            window_token_count_.fetch_add(1, std::memory_order_relaxed);
     }
 
     // ── Queries ───────────────────────────────────────
@@ -119,7 +122,6 @@ namespace llaminar2
     float DecodeExpertHistogram::weightedActivation(int layer_idx, int expert_id) const
     {
         const auto& layer = layer_data_[layer_idx];
-        std::lock_guard<std::mutex> lock(layer.weight_mutex);
         return layer.weighted_sums[expert_id];
     }
 

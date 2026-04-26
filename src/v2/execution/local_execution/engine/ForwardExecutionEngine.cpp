@@ -668,4 +668,21 @@ namespace llaminar2
         timeline.resetTimings();
     }
 
+    void ForwardExecutionEngine::forEachCachedStage(
+        ComputeStageType type,
+        const std::function<void(IComputeStage*)>& visitor) const
+    {
+        for (const auto& [sig, cache] : cache_)
+        {
+            if (!cache.valid || !cache.graph)
+                continue;
+            for (const auto& node_name : cache.graph->getExecutionOrder())
+            {
+                auto* node = cache.graph->getNode(node_name);
+                if (node && node->stage && node->stage->type() == type)
+                    visitor(node->stage.get());
+            }
+        }
+    }
+
 } // namespace llaminar2

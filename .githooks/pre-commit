@@ -29,7 +29,7 @@ fi
 
 if $FULL_SUITE; then
     echo -e "${BLUE}==============================================================${NC}"
-    echo -e "${BLUE}Pre-commit Hook: Build, Unit Test, Parity (Qwen2+Qwen35), NodeLocalTP, E2E & Benchmarks${NC}"
+    echo -e "${BLUE}Pre-commit Hook: Build, Unit Test, Parity (Qwen2+Qwen35+MoE), NodeLocalTP, E2E & Benchmarks${NC}"
     echo -e "${BLUE}==============================================================${NC}"
 else
     echo -e "${BLUE}==============================================================${NC}"
@@ -42,7 +42,7 @@ echo ""
 BUILD_V2_INTEGRATION="build_v2_integration"
 
 if $FULL_SUITE; then
-    TOTAL_STEPS=8
+    TOTAL_STEPS=10
 else
     TOTAL_STEPS=4
 fi
@@ -194,13 +194,65 @@ fi
 echo -e "${GREEN}✓ Qwen35 NodeLocalTP parity tests passed${NC}"
 echo ""
 
-fi  # end FULL_SUITE (steps 3-6)
+# Step 7: Run Qwen35 MoE SingleDevice Parity Tests (prefill + decode)
+# Validates Qwen3.5-MoE (35B-A3B) expert routing, MoE GEMM, gating,
+# and sparse expert selection accuracy on a single device.
+echo -e "${YELLOW}[7/${TOTAL_STEPS}] Running Qwen35 MoE SingleDevice parity tests (prefill + decode)...${NC}"
+echo ""
+
+set +e
+ctest --test-dir "$BUILD_V2_INTEGRATION" -R "^V2_Integration_Parity_Qwen35MoE_SingleDevice" --no-tests=error --output-on-failure --timeout 600
+QWEN35MOE_PARITY_EXIT_CODE=$?
+set -e
+
+echo ""
+if [ $QWEN35MOE_PARITY_EXIT_CODE -ne 0 ]; then
+    echo -e "${RED}❌ Qwen35 MoE parity tests failed — possible accuracy regression in MoE routing/gating.${NC}"
+    echo ""
+    echo -e "${YELLOW}Run manually for details:${NC}"
+    echo -e "${YELLOW}  ctest --test-dir $BUILD_V2_INTEGRATION -R V2_Integration_Parity_Qwen35MoE_SingleDevice -V${NC}"
+    echo ""
+    echo -e "${YELLOW}Commit blocked. Fix failing tests or use:${NC}"
+    echo -e "${YELLOW}  git commit --no-verify${NC}"
+    echo -e "${YELLOW}to skip this check.${NC}"
+    exit 1
+fi
+echo -e "${GREEN}✓ Qwen35 MoE SingleDevice parity tests passed${NC}"
+echo ""
+
+# Step 8: Run Qwen35 MoE NodeLocalTP Parity Tests (multi-device TP)
+# Validates Qwen3.5-MoE expert routing and MoE GEMM under tensor parallelism:
+# expert weight sharding, routing index consistency, and collective correctness.
+echo -e "${YELLOW}[8/${TOTAL_STEPS}] Running Qwen35 MoE NodeLocalTP parity tests...${NC}"
+echo ""
+
+set +e
+ctest --test-dir "$BUILD_V2_INTEGRATION" -R "^V2_Integration_Parity_Qwen35MoE_NodeLocalTP" --no-tests=error --output-on-failure --timeout 600
+QWEN35MOE_NLTP_EXIT_CODE=$?
+set -e
+
+echo ""
+if [ $QWEN35MOE_NLTP_EXIT_CODE -ne 0 ]; then
+    echo -e "${RED}❌ Qwen35 MoE NodeLocalTP parity tests failed — possible TP regression in MoE layers.${NC}"
+    echo ""
+    echo -e "${YELLOW}Run manually for details:${NC}"
+    echo -e "${YELLOW}  ctest --test-dir $BUILD_V2_INTEGRATION -R V2_Integration_Parity_Qwen35MoE_NodeLocalTP -V${NC}"
+    echo ""
+    echo -e "${YELLOW}Commit blocked. Fix failing tests or use:${NC}"
+    echo -e "${YELLOW}  git commit --no-verify${NC}"
+    echo -e "${YELLOW}to skip this check.${NC}"
+    exit 1
+fi
+echo -e "${GREEN}✓ Qwen35 MoE NodeLocalTP parity tests passed${NC}"
+echo ""
+
+fi  # end FULL_SUITE (steps 3-8)
 
 # Step 3 (feature) / Step 7 (full): E2E Server Integration Tests (~2 min)
 # Spins up llaminar2 --serve on CPU, CUDA, and ROCm, validates multi-turn
 # inference via the REST API with curl.
 if $FULL_SUITE; then
-    E2E_STEP=7
+    E2E_STEP=9
 else
     E2E_STEP=3
 fi
@@ -234,7 +286,7 @@ echo ""
 # benchmark_baseline.json and compares prefill/decode throughput against
 # canonical baselines. Devices that are unavailable are skipped gracefully.
 if $FULL_SUITE; then
-    BENCH_STEP=8
+    BENCH_STEP=10
 else
     BENCH_STEP=4
 fi
@@ -271,6 +323,8 @@ echo -e "${GREEN}  • Qwen2 parity: OK${NC}"
 echo -e "${GREEN}  • Qwen35 parity: OK${NC}"
 echo -e "${GREEN}  • Qwen2 NodeLocalTP parity: OK${NC}"
 echo -e "${GREEN}  • Qwen35 NodeLocalTP parity: OK${NC}"
+echo -e "${GREEN}  • Qwen35 MoE parity: OK${NC}"
+echo -e "${GREEN}  • Qwen35 MoE NodeLocalTP parity: OK${NC}"
 fi
 echo -e "${GREEN}  • E2E server tests: OK${NC}"
 echo -e "${GREEN}  • Performance benchmarks: OK${NC}"

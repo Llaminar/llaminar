@@ -1133,7 +1133,7 @@ namespace llaminar2
             // mmap-backed, so no extra physical RAM — pages fault in on demand.
             const auto& env = debugEnv();
             if (env.moe_rebalance.mode == "dynamic") {
-                LOG_INFO("[WeightManager] MoE rebalance=dynamic: loading FULL expert tensor "
+                LOG_DEBUG("[WeightManager] MoE rebalance=dynamic: loading FULL expert tensor "
                          << name << " (replicated mmap, all experts accessible)");
                 return getReplicatedWeight(name, device);
             }

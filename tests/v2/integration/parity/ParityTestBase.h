@@ -208,6 +208,12 @@ namespace llaminar2::test::parity
         size_t total_elements = 0;
         TensorDistributionStats llaminar_stats;
         TensorDistributionStats pytorch_stats;
+
+        // --- MoE routing-specific metrics (NaN for non-routing stages) ---
+        bool is_routing_stage = false;     ///< True for MOE_ROUTING_INDICES / MOE_ROUTING_WEIGHTS
+        float routing_overlap = std::numeric_limits<float>::quiet_NaN();     ///< Set overlap (Jaccard) for indices, sparse-vector cosine for weights
+        float routing_top1_match = std::numeric_limits<float>::quiet_NaN();  ///< Fraction of tokens where top-1 expert matches (indices only)
+        float routing_weight_l1 = std::numeric_limits<float>::quiet_NaN();   ///< Mean L1 distance of sparse weight vectors (weights only)
     };
 
     /**
@@ -2380,11 +2386,12 @@ namespace llaminar2::test::parity
                     position_0_match++;
             }
 
-            result.cosine_similarity = static_cast<float>(total_overlap / seq_len);
-            // Repurpose snr_db for top-1 match rate (both are diagnostic "quality" metrics)
-            result.snr_db = static_cast<float>(position_0_match) / static_cast<float>(seq_len);
-            result.max_abs_diff = 1.0f - result.cosine_similarity; // "distance" from perfect
-            result.passed = (result.cosine_similarity >= config_.cosine_threshold);
+            result.is_routing_stage = true;
+            result.routing_overlap = static_cast<float>(total_overlap / seq_len);
+            result.routing_top1_match = static_cast<float>(position_0_match) / static_cast<float>(seq_len);
+            result.cosine_similarity = result.routing_overlap; // Keep for backward compat (layer log)
+            result.max_abs_diff = 1.0f - result.routing_overlap; // "distance" from perfect
+            result.passed = (result.routing_overlap >= config_.cosine_threshold);
             return result;
         }
 
@@ -2461,10 +2468,12 @@ namespace llaminar2::test::parity
                 total_l1 += l1;
             }
 
-            result.cosine_similarity = static_cast<float>(total_cosine / seq_len);
-            result.rmse = static_cast<float>(total_l1 / seq_len); // Repurpose for mean L1
+            result.is_routing_stage = true;
+            result.routing_overlap = static_cast<float>(total_cosine / seq_len); // sparse-vector cosine
+            result.routing_weight_l1 = static_cast<float>(total_l1 / seq_len);
+            result.cosine_similarity = result.routing_overlap; // Keep for backward compat (layer log)
             result.max_abs_diff = max_weight_diff;
-            result.passed = (result.cosine_similarity >= config_.cosine_threshold);
+            result.passed = (result.routing_overlap >= config_.cosine_threshold);
             return result;
         }
 
@@ -3477,15 +3486,33 @@ namespace llaminar2::test::parity
                     {
                         result = compareTensors(compare_data, pytorch_data, llaminar_size, stage);
                     }
-                    stats.stages_compared++;
-                    sum_cosine += result.cosine_similarity;
                     stats.stage_results.push_back(result);
 
-                    // Per-stage cosine logging for diagnostics
-                    LOG_INFO("[Parity] Layer " << layer_idx << " " << stage
-                                               << (did_allreduce ? " (allreduced)" : "")
-                                               << " cosine=" << std::fixed << std::setprecision(6) << result.cosine_similarity
-                                               << " size=" << llaminar_size);
+                    // Routing stages use set-overlap (Jaccard), not cosine similarity.
+                    // Include them in stage_results for logging/CSV but exclude from
+                    // layer-level min/avg aggregation to avoid metric contamination.
+                    if (!isRoutingStage(stage))
+                    {
+                        stats.stages_compared++;
+                        sum_cosine += result.cosine_similarity;
+                    }
+
+                    // Per-stage logging for diagnostics
+                    if (result.is_routing_stage)
+                    {
+                        LOG_INFO("[Parity] Layer " << layer_idx << " " << stage
+                                                   << " routing_overlap=" << std::fixed << std::setprecision(6) << result.routing_overlap
+                                                   << (!std::isnan(result.routing_top1_match) ? " top1_match=" + std::to_string(result.routing_top1_match) : "")
+                                                   << (!std::isnan(result.routing_weight_l1) ? " weight_l1=" + std::to_string(result.routing_weight_l1) : "")
+                                                   << " size=" << llaminar_size);
+                    }
+                    else
+                    {
+                        LOG_INFO("[Parity] Layer " << layer_idx << " " << stage
+                                                   << (did_allreduce ? " (allreduced)" : "")
+                                                   << " cosine=" << std::fixed << std::setprecision(6) << result.cosine_similarity
+                                                   << " size=" << llaminar_size);
+                    }
 
                     // Per-row cosine diagnostic for ATTENTION_CONTEXT (layer 0 only)
                     if (stage == "ATTENTION_CONTEXT" && layer_idx == 0)
@@ -3532,7 +3559,7 @@ namespace llaminar2::test::parity
                         stats.max_kurtosis_stage = stage;
                     }
 
-                    if (result.cosine_similarity < stats.min_cosine_sim)
+                    if (!isRoutingStage(stage) && result.cosine_similarity < stats.min_cosine_sim)
                     {
                         stats.min_cosine_sim = result.cosine_similarity;
                         stats.worst_stage = stage;
@@ -3540,10 +3567,16 @@ namespace llaminar2::test::parity
                 }
 
                 // Compute per-stage cosine drops (error introduced by each stage)
+                // Skip transitions involving routing stages (different metric scale)
                 if (stats.stage_results.size() >= 2)
                 {
                     for (size_t s = 1; s < stats.stage_results.size(); ++s)
                     {
+                        bool curr_routing = isRoutingStage(stats.stage_results[s].stage_name);
+                        bool prev_routing = isRoutingStage(stats.stage_results[s - 1].stage_name);
+                        if (curr_routing || prev_routing)
+                            continue;  // Skip drops involving routing stages
+
                         float drop = stats.stage_results[s - 1].cosine_similarity -
                                      stats.stage_results[s].cosine_similarity;
                         stats.stage_results[s].cosine_drop = drop;
@@ -4574,11 +4607,16 @@ namespace llaminar2::test::parity
                             {
                                 result = compareTensors(decode_compare, pytorch_data, llaminar_size, stage);
                             }
-                            stats.stages_compared++;
-                            sum_cosine += result.cosine_similarity;
                             stats.stage_results.push_back(result);
 
-                            if (result.cosine_similarity < stats.min_cosine_sim)
+                            // Routing stages use set-overlap, not cosine — exclude from aggregation
+                            if (!isRoutingStage(stage))
+                            {
+                                stats.stages_compared++;
+                                sum_cosine += result.cosine_similarity;
+                            }
+
+                            if (!isRoutingStage(stage) && result.cosine_similarity < stats.min_cosine_sim)
                             {
                                 stats.min_cosine_sim = result.cosine_similarity;
                                 stats.worst_stage = stage;
@@ -4586,10 +4624,16 @@ namespace llaminar2::test::parity
                         }
 
                         // Compute per-stage cosine drops (error introduced by each stage)
+                        // Skip transitions involving routing stages (different metric scale)
                         if (stats.stage_results.size() >= 2)
                         {
                             for (size_t s = 1; s < stats.stage_results.size(); ++s)
                             {
+                                bool curr_routing = isRoutingStage(stats.stage_results[s].stage_name);
+                                bool prev_routing = isRoutingStage(stats.stage_results[s - 1].stage_name);
+                                if (curr_routing || prev_routing)
+                                    continue;
+
                                 float drop = stats.stage_results[s - 1].cosine_similarity -
                                              stats.stage_results[s].cosine_similarity;
                                 stats.stage_results[s].cosine_drop = drop;
@@ -5310,7 +5354,8 @@ namespace llaminar2::test::parity
                 return;
             }
 
-            f << "backend,layer,stage,cosine,cosine_drop,rel_l2,max_abs_diff,snr_db,rmse,error_entropy,";
+            f << "backend,layer,stage,cosine,cosine_drop,rel_l2,max_abs_diff,snr_db,rmse,error_entropy,"
+                 "is_routing,routing_overlap,routing_top1_match,routing_weight_l1,";
             writeDistributionStatsHeader(f, "llaminar_");
             f << ",";
             writeDistributionStatsHeader(f, "pytorch_");
@@ -5323,13 +5368,17 @@ namespace llaminar2::test::parity
                     f << backend << ","
                       << ls.layer_idx << ","
                       << sr.stage_name << ","
-                      << sr.cosine_similarity << ","
-                      << sr.cosine_drop << ","
-                      << sr.rel_l2_norm << ","
+                      << (sr.is_routing_stage ? "" : std::to_string(sr.cosine_similarity)) << ","
+                      << (sr.is_routing_stage ? "" : std::to_string(sr.cosine_drop)) << ","
+                      << (sr.is_routing_stage ? "" : std::to_string(sr.rel_l2_norm)) << ","
                       << sr.max_abs_diff << ","
-                      << sr.snr_db << ","
-                      << sr.rmse << ","
-                      << sr.error_entropy << ",";
+                      << (sr.is_routing_stage ? "" : std::to_string(sr.snr_db)) << ","
+                      << (sr.is_routing_stage ? "" : std::to_string(sr.rmse)) << ","
+                      << (sr.is_routing_stage ? "" : std::to_string(sr.error_entropy)) << ","
+                      << (sr.is_routing_stage ? "1" : "0") << ","
+                      << (sr.is_routing_stage ? std::to_string(sr.routing_overlap) : "") << ","
+                      << (std::isnan(sr.routing_top1_match) ? "" : std::to_string(sr.routing_top1_match)) << ","
+                      << (std::isnan(sr.routing_weight_l1) ? "" : std::to_string(sr.routing_weight_l1)) << ",";
                     writeDistributionStatsData(f, sr.llaminar_stats);
                     f << ",";
                     writeDistributionStatsData(f, sr.pytorch_stats);
@@ -5379,7 +5428,8 @@ namespace llaminar2::test::parity
                 return;
             }
 
-            f << "backend,step,layer,stage,cosine,cosine_drop,rel_l2,max_abs_diff,snr_db,rmse,error_entropy,";
+            f << "backend,step,layer,stage,cosine,cosine_drop,rel_l2,max_abs_diff,snr_db,rmse,error_entropy,"
+                 "is_routing,routing_overlap,routing_top1_match,routing_weight_l1,";
             writeDistributionStatsHeader(f, "llaminar_");
             f << ",";
             writeDistributionStatsHeader(f, "pytorch_");
@@ -5395,13 +5445,17 @@ namespace llaminar2::test::parity
                           << ss.step_idx << ","
                           << ls.layer_idx << ","
                           << sr.stage_name << ","
-                          << sr.cosine_similarity << ","
-                          << sr.cosine_drop << ","
-                          << sr.rel_l2_norm << ","
+                          << (sr.is_routing_stage ? "" : std::to_string(sr.cosine_similarity)) << ","
+                          << (sr.is_routing_stage ? "" : std::to_string(sr.cosine_drop)) << ","
+                          << (sr.is_routing_stage ? "" : std::to_string(sr.rel_l2_norm)) << ","
                           << sr.max_abs_diff << ","
-                          << sr.snr_db << ","
-                          << sr.rmse << ","
-                          << sr.error_entropy << ",";
+                          << (sr.is_routing_stage ? "" : std::to_string(sr.snr_db)) << ","
+                          << (sr.is_routing_stage ? "" : std::to_string(sr.rmse)) << ","
+                          << (sr.is_routing_stage ? "" : std::to_string(sr.error_entropy)) << ","
+                          << (sr.is_routing_stage ? "1" : "0") << ","
+                          << (sr.is_routing_stage ? std::to_string(sr.routing_overlap) : "") << ","
+                          << (std::isnan(sr.routing_top1_match) ? "" : std::to_string(sr.routing_top1_match)) << ","
+                          << (std::isnan(sr.routing_weight_l1) ? "" : std::to_string(sr.routing_weight_l1)) << ",";
                         writeDistributionStatsData(f, sr.llaminar_stats);
                         f << ",";
                         writeDistributionStatsData(f, sr.pytorch_stats);

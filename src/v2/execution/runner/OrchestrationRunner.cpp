@@ -34,6 +34,7 @@
 #include "../../utils/WeightLoadingProfiler.h"
 #include "../local_execution/orchestrators/DeviceGraphOrchestrator.h"
 #include "../../execution/moe/MoERebalanceController.h"
+#include "../../execution/moe/ExpertWeightTransfer.h"
 
 #include <algorithm>
 #include <cctype>
@@ -468,6 +469,31 @@ namespace llaminar2
                 result.is_complete = true;
                 break;
             }
+
+            // Incremental MoE expert rebalancing: when the decode histogram
+            // window fills, propose targeted expert swaps between sockets.
+            if (auto* controller = moeRebalanceController())
+            {
+                if (controller->shouldRebalance())
+                {
+                    auto old_placement = controller->currentPlacement();
+                    auto new_placement = controller->rebalance();
+                    if (!new_placement.empty())
+                    {
+                        auto manifest = ExpertWeightTransfer::buildManifest(
+                            old_placement, new_placement);
+                        ReceivedWeightsMap received;
+                        if (!manifest.empty())
+                        {
+                            received = transferExpertWeights(
+                                manifest, controller->numLayers());
+                        }
+                        int socket_id = mpi_ctx_ ? mpi_ctx_->rank() : 0;
+                        auto masks = controller->computeExpertMasks(socket_id);
+                        applyMoEExpertMasks(masks, received);
+                    }
+                }
+            }
         }
 
         // Restore normal logits gathering after generation
@@ -784,19 +810,46 @@ namespace llaminar2
         // In multi-rank mode, each rank independently mmaps and first-touches the
         // same file. Without coordination, this creates N concurrent page fault
         // streams that destroy disk readahead and cause ~60 MB/s throughput
-        // instead of ~1 GB/s. Fix: rank 0 reads the file sequentially to warm the
-        // page cache, then all ranks skip POSIX_FADV_DONTNEED so the OMP
-        // first-touch loop faults from cache (memory speed) instead of disk.
+        // instead of ~1 GB/s. Fix: node leaders read the file sequentially to warm
+        // the page cache, then all ranks on that node skip POSIX_FADV_DONTNEED so
+        // the OMP first-touch loop faults from cache (memory speed) instead of disk.
+        //
+        // Multi-node scaling: each physical machine has its own page cache, so we
+        // use the node-leader (lowest local rank) on each node to prepopulate
+        // independently. An intra-node barrier ensures same-node ranks wait only
+        // for their own leader, not a global rank-0.
         const bool is_multi_rank = mpi_ctx_ && mpi_ctx_->world_size() > 1;
         if (is_multi_rank && config_.use_mmap)
         {
-            if (mpi_ctx_->rank() == 0)
+            const auto *topo = mpi_ctx_->topology();
+            if (topo)
             {
-                LOG_INFO("Pre-populating page cache for multi-rank mmap...");
-                MmapRegion::prepopulatePageCache(model_path);
+                // Per-node prepopulation: each node leader warms its own page cache
+                if (topo->is_node_leader())
+                {
+                    LOG_INFO("Node leader (rank " << mpi_ctx_->rank()
+                             << ", node " << topo->placement().node_id
+                             << ") pre-populating page cache for multi-rank mmap...");
+                    MmapRegion::prepopulatePageCache(model_path);
+                }
+                // Intra-node barrier: same-node ranks wait for their node leader only.
+                // Ranks on other nodes proceed independently with their own leader.
+                MPI_Comm intra = mpi_ctx_->intra_node_comm();
+                if (intra != MPI_COMM_NULL)
+                    MPI_Barrier(intra);
+                else
+                    MPI_Barrier(mpi_ctx_->communicator());
             }
-            // Barrier: all ranks wait for rank 0 to finish populating page cache
-            MPI_Barrier(mpi_ctx_->communicator());
+            else
+            {
+                // Fallback: no topology available (mock or non-standard context)
+                if (mpi_ctx_->rank() == 0)
+                {
+                    LOG_INFO("Pre-populating page cache for multi-rank mmap (rank 0 fallback)...");
+                    MmapRegion::prepopulatePageCache(model_path);
+                }
+                MPI_Barrier(mpi_ctx_->communicator());
+            }
             weight_config.skip_mmap_cache_eviction = true;
         }
 
@@ -1323,15 +1376,67 @@ namespace llaminar2
         return nullptr;
     }
 
-    void OrchestrationRunner::applyMoEExpertMasks(const std::vector<std::vector<bool>>& masks)
+    void OrchestrationRunner::applyMoEExpertMasks(
+        const std::vector<std::vector<bool>>& masks,
+        const ReceivedWeightsMap& received)
     {
         if (runner_)
         {
             if (auto* dgo = dynamic_cast<DeviceGraphOrchestrator*>(runner_.get()))
             {
-                dgo->applyExpertMasks(masks);
+                dgo->applyExpertMasks(masks, received);
             }
         }
+    }
+
+    void OrchestrationRunner::setExpertReplicaSet(
+        const ExpertReplicaSet& replicas, int socket_id)
+    {
+        if (runner_)
+        {
+            if (auto* dgo = dynamic_cast<DeviceGraphOrchestrator*>(runner_.get()))
+            {
+                dgo->setExpertReplicaSet(replicas, socket_id);
+            }
+        }
+    }
+
+    ReceivedWeightsMap OrchestrationRunner::transferExpertWeights(
+        const std::vector<ExpertMigration>& manifest, int num_layers)
+    {
+        if (runner_)
+        {
+            if (auto* dgo = dynamic_cast<DeviceGraphOrchestrator*>(runner_.get()))
+            {
+                return dgo->transferExpertWeights(manifest, num_layers);
+            }
+        }
+        return {};
+    }
+
+    ReceivedWeightsMap OrchestrationRunner::transferReplicaWeights(
+        const ExpertReplicaSet& replicas, int num_layers)
+    {
+        if (runner_)
+        {
+            if (auto* dgo = dynamic_cast<DeviceGraphOrchestrator*>(runner_.get()))
+            {
+                return dgo->transferReplicaWeights(replicas, num_layers);
+            }
+        }
+        return {};
+    }
+
+    size_t OrchestrationRunner::releaseRawExpertWeights()
+    {
+        if (runner_)
+        {
+            if (auto* dgo = dynamic_cast<DeviceGraphOrchestrator*>(runner_.get()))
+            {
+                return dgo->releaseRawExpertWeights();
+            }
+        }
+        return 0;
     }
 
     int OrchestrationRunner::sampleGreedyOnDevice()
