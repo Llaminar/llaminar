@@ -31,6 +31,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from experiments.quantum_hj_quartic import (  # noqa: E402
     align_phase,
+    continuous_complex_sqrt,
     count_caustics,
     fidelity,
     fitted_correction_metrics,
@@ -457,3 +458,11 @@ class TestDiagnostics:
         q = np.array([0.0, 0.5, 2.0, 3.0])
         weights = trajectory_quadrature_weights(q)
         np.testing.assert_allclose(weights, [0.25, 1.0, 1.25, 0.5])
+
+    def test_continuous_complex_sqrt_avoids_principal_branch_jump(self):
+        values = np.exp(1j * np.linspace(0.8 * np.pi, 1.2 * np.pi, 16))
+        roots = continuous_complex_sqrt(values)
+
+        neighbor_jumps = np.abs(np.diff(roots))
+        assert np.max(neighbor_jumps) < 0.2
+        np.testing.assert_allclose(roots**2, values)

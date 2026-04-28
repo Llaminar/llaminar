@@ -558,6 +558,24 @@ def gaussian_smooth_periodic(
     return np.fft.ifft(np.fft.fft(values) * filt)
 
 
+def continuous_complex_sqrt(values: np.ndarray) -> np.ndarray:
+    """Return sqrt(values) with signs chosen continuously along the array.
+
+    Complex square roots are two-valued.  Semiclassical monodromy prefactors
+    use one branch continuously along neighboring trajectory labels; the
+    principal branch can inject artificial sign flips that look like spurious
+    caustics.  This helper flips each sample's sign when doing so keeps it
+    closer to the preceding selected value.
+    """
+    roots = np.sqrt(values.astype(complex))
+    if len(roots) < 2:
+        return roots
+    for idx in range(1, len(roots)):
+        if abs(-roots[idx] - roots[idx - 1]) < abs(roots[idx] - roots[idx - 1]):
+            roots[idx] = -roots[idx]
+    return roots
+
+
 def reconstruct_gaussian_ivr(
     x_grid: np.ndarray,
     q_arr: np.ndarray,
@@ -601,7 +619,7 @@ def reconstruct_gaussian_ivr(
             # envelope exp[-γ(x-q)²/2].  The square-root branch is left
             # continuous by NumPy's principal sqrt; Maslov phase from J is
             # still tracked separately for direct comparison with the HJ sum.
-            prefactor = np.sqrt(
+            prefactor = continuous_complex_sqrt(
                 0.5
                 * (
                     A_traj
@@ -616,20 +634,22 @@ def reconstruct_gaussian_ivr(
             prefactor = np.sqrt(0.5 * (A_traj + 1.0j * C_traj / gamma))
         prefactor = np.where(np.isfinite(prefactor), prefactor, 0.0)
 
+    denom_sqrt = None
+    evolved_gamma = None
+    if thawed_width and B_traj is not None and D_traj is not None:
+        denom = A_traj + 1.0j * gamma * B_traj
+        denom_sqrt = continuous_complex_sqrt(denom)
+        evolved_gamma = (D_traj * gamma - 1.0j * C_traj) / denom
+
     psi = np.zeros(len(x_grid), dtype=complex)
     for start in range(0, len(q_arr), chunk_size):
         end = min(start + chunk_size, len(q_arr))
         dx_mat = x_grid[None, :] - x_traj[start:end, None]
-        if thawed_width and B_traj is not None and D_traj is not None:
-            denom = A_traj[start:end, None] + 1.0j * gamma * B_traj[start:end, None]
-            evolved_gamma = (
-                D_traj[start:end, None] * gamma
-                - 1.0j * C_traj[start:end, None]
-            ) / denom
+        if denom_sqrt is not None and evolved_gamma is not None:
             envelope = (
                 norm
-                / np.sqrt(denom)
-                * np.exp(-0.5 * evolved_gamma * dx_mat**2)
+                / denom_sqrt[start:end, None]
+                * np.exp(-0.5 * evolved_gamma[start:end, None] * dx_mat**2)
             )
         else:
             envelope = norm * np.exp(-(dx_mat**2) / (4.0 * width**2))
