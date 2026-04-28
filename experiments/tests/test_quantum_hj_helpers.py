@@ -335,8 +335,15 @@ class TestReconstructionVariants:
         assert np.all(np.isfinite(psi_n))
         assert np.sqrt(np.sum(np.abs(psi_n) ** 2) * dx) == pytest.approx(1.0, abs=1e-10)
 
-    @pytest.mark.parametrize("thawed_width,full_hk_prefactor", [(True, False), (False, True)])
-    def test_full_monodromy_packet_variants_are_finite(self, thawed_width, full_hk_prefactor):
+    @pytest.mark.parametrize(
+        "use_thawed_width,use_full_hk_prefactor",
+        [(True, False), (False, True)],
+    )
+    def test_full_monodromy_packet_variants_are_finite(
+        self,
+        use_thawed_width,
+        use_full_hk_prefactor,
+    ):
         x, dx = _grid(N=128, L=4.0)
         q_arr = np.linspace(-4.0, 4.0, 600)
         rho0_arr = initial_density(q_arr, 0.0, 0.5)
@@ -348,9 +355,9 @@ class TestReconstructionVariants:
             rho0_arr,
             snap,
             packet_width=0.5,
-            use_hk_prefactor=full_hk_prefactor,
-            thawed_width=thawed_width,
-            full_hk_prefactor=full_hk_prefactor,
+            use_hk_prefactor=use_full_hk_prefactor,
+            use_thawed_width=use_thawed_width,
+            use_full_hk_prefactor=use_full_hk_prefactor,
         )
         psi_n = normalize(psi, dx)
 

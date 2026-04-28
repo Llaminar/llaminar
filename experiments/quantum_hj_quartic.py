@@ -583,8 +583,8 @@ def reconstruct_gaussian_ivr(
     snap: dict,
     packet_width: float,
     use_hk_prefactor: bool = False,
-    thawed_width: bool = False,
-    full_hk_prefactor: bool = False,
+    use_thawed_width: bool = False,
+    use_full_hk_prefactor: bool = False,
     chunk_size: int = 256,
 ) -> np.ndarray:
     """Reconstruct ψ from finite-width trajectory packets.
@@ -592,10 +592,11 @@ def reconstruct_gaussian_ivr(
     This replaces singular ray contributions with Gaussian coherent packets
     centered on each classical trajectory.  With ``use_hk_prefactor=True`` it
     additionally applies a Herman-Kluk-style complex stability prefactor.
-    ``full_hk_prefactor=True`` uses the full monodromy matrix when available;
-    otherwise the historical diagnostic approximation from ``J`` and ``P`` is
-    used.  ``thawed_width=True`` propagates each packet's complex width using
-    the same full monodromy matrix, yielding a 1-D thawed-Gaussian comparison.
+    ``use_full_hk_prefactor=True`` uses the full monodromy matrix when
+    available; otherwise the historical diagnostic approximation from ``J`` and
+    ``P`` is used.  ``use_thawed_width=True`` propagates each packet's complex
+    width using the same full monodromy matrix, yielding a 1-D thawed-Gaussian
+    comparison.
     """
     width = max(float(packet_width), 1e-12)
     dq_weights = trajectory_quadrature_weights(q_arr)
@@ -614,7 +615,7 @@ def reconstruct_gaussian_ivr(
 
     prefactor = np.ones_like(x_traj, dtype=complex)
     if use_hk_prefactor:
-        if full_hk_prefactor and B_traj is not None and D_traj is not None:
+        if use_full_hk_prefactor and B_traj is not None and D_traj is not None:
             # 1-D Herman-Kluk prefactor for frozen coherent states with
             # envelope exp[-γ(x-q)²/2].  The square-root branch is left
             # continuous by NumPy's principal sqrt; Maslov phase from J is
@@ -630,13 +631,13 @@ def reconstruct_gaussian_ivr(
             )
         else:
             # Historical diagnostic approximation used before B and D were
-            # tracked.  Kept as ``herman_kluk`` for A/B comparisons.
+            # tracked.  Kept as ``herman_kluk`` for legacy/baseline comparisons.
             prefactor = np.sqrt(0.5 * (A_traj + 1.0j * C_traj / gamma))
         prefactor = np.where(np.isfinite(prefactor), prefactor, 0.0)
 
     denom_sqrt = None
     evolved_gamma = None
-    if thawed_width and B_traj is not None and D_traj is not None:
+    if use_thawed_width and B_traj is not None and D_traj is not None:
         denom = A_traj + 1.0j * gamma * B_traj
         denom_sqrt = continuous_complex_sqrt(denom)
         evolved_gamma = (D_traj * gamma - 1.0j * C_traj) / denom
@@ -814,7 +815,7 @@ def reconstruct_by_method(
             snap,
             packet_width=packet_width,
             use_hk_prefactor=True,
-            full_hk_prefactor=True,
+            use_full_hk_prefactor=True,
         )
     if method == "thawed_gaussian":
         return reconstruct_gaussian_ivr(
@@ -823,7 +824,7 @@ def reconstruct_by_method(
             rho0_arr,
             snap,
             packet_width=packet_width,
-            thawed_width=True,
+            use_thawed_width=True,
         )
     if method == "quantum_potential":
         psi = reconstruct_psi_hj(
