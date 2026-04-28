@@ -111,6 +111,7 @@ from typing import List, Optional
 import numpy as np
 
 logger = logging.getLogger(__name__)
+DEFAULT_MAX_SNAPSHOTS = 200
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Potential and its derivatives  (nondimensional: m = ℏ = ω = 1)
@@ -555,8 +556,8 @@ def reconstruct_gaussian_ivr(
     prefactor from the variational variables ``J`` and ``P``.
     """
     width = max(float(packet_width), 1e-12)
-    dq = float(np.median(np.diff(q_arr))) if len(q_arr) > 1 else 1.0
-    weights = np.sqrt(np.maximum(rho0_arr, 0.0) * abs(dq))
+    dq_weights = trajectory_quadrature_weights(q_arr)
+    weights = np.sqrt(np.maximum(rho0_arr, 0.0) * dq_weights)
     norm = (2.0 * np.pi * width**2) ** (-0.25)
 
     x_traj = snap["x"]
@@ -568,6 +569,8 @@ def reconstruct_gaussian_ivr(
     if use_hk_prefactor:
         J_traj = snap["J"]
         P_traj = snap["P"]
+        # gamma = 1/(2σ²) is the coherent-state width parameter used by this
+        # simple Herman-Kluk-style stability prefactor.
         gamma = 1.0 / (2.0 * width**2)
         prefactor = np.sqrt(0.5 * (J_traj + 1.0j * P_traj / gamma))
         prefactor = np.where(np.isfinite(prefactor), prefactor, 0.0)
@@ -586,6 +589,20 @@ def reconstruct_gaussian_ivr(
         psi += np.sum(coeff * envelope * np.exp(1j * phase), axis=0)
 
     return psi
+
+
+def trajectory_quadrature_weights(q_arr: np.ndarray) -> np.ndarray:
+    """Return trapezoidal quadrature weights for trajectory labels."""
+    if len(q_arr) == 0:
+        return np.array([], dtype=float)
+    if len(q_arr) == 1:
+        return np.ones(1, dtype=float)
+
+    weights = np.empty(len(q_arr), dtype=float)
+    weights[0] = 0.5 * abs(q_arr[1] - q_arr[0])
+    weights[-1] = 0.5 * abs(q_arr[-1] - q_arr[-2])
+    weights[1:-1] = 0.5 * np.abs(q_arr[2:] - q_arr[:-2])
+    return weights
 
 
 def second_derivative_periodic(values: np.ndarray, dx: float) -> np.ndarray:
@@ -650,17 +667,17 @@ def fitted_correction_metrics(
     psi_test: np.ndarray,
     dx: float,
 ) -> dict:
-    """Diagnostic amplitude-only, phase-only, and full local-fit metrics."""
+    """Diagnostic amplitude-only, phase-only, and oracle upper-bound metrics."""
     amp_fit = normalize(np.abs(psi_ref) * np.exp(1j * np.angle(psi_test)), dx)
     phase_fit = normalize(np.abs(psi_test) * np.exp(1j * np.angle(psi_ref)), dx)
-    both_fit = normalize(np.abs(psi_ref) * np.exp(1j * np.angle(psi_ref)), dx)
+    oracle_fit = normalize(np.abs(psi_ref) * np.exp(1j * np.angle(psi_ref)), dx)
     return {
         "amplitude_fit_L2": l2_error(psi_ref, amp_fit, dx),
         "amplitude_fit_fidelity": fidelity(psi_ref, amp_fit, dx),
         "phase_fit_L2": l2_error(psi_ref, phase_fit, dx),
         "phase_fit_fidelity": fidelity(psi_ref, phase_fit, dx),
-        "local_fit_L2": l2_error(psi_ref, both_fit, dx),
-        "local_fit_fidelity": fidelity(psi_ref, both_fit, dx),
+        "oracle_fit_L2": l2_error(psi_ref, oracle_fit, dx),
+        "oracle_fit_fidelity": fidelity(psi_ref, oracle_fit, dx),
     }
 
 
@@ -1025,8 +1042,9 @@ def run_experiment(
     x_grid = np.linspace(-L, L, N, endpoint=False)
     dx = x_grid[1] - x_grid[0]
     n_steps = max(1, int(round(T / dt)))
-    # Aim for ~200 recorded snapshots (never more than n_steps)
-    record_every = max(1, n_steps // 200)
+    # Bound memory/plot size while retaining enough temporal resolution for
+    # residual diagnostics.
+    record_every = max(1, n_steps // DEFAULT_MAX_SNAPSHOTS)
     n_records = n_steps // record_every
     if methods is None:
         methods = ["raw_hj"]
@@ -1106,8 +1124,8 @@ def run_experiment(
                     "amplitude_fit_fidelity": 1.0,
                     "phase_fit_L2": 0.0,
                     "phase_fit_fidelity": 1.0,
-                    "local_fit_L2": 0.0,
-                    "local_fit_fidelity": 1.0,
+                    "oracle_fit_L2": 0.0,
+                    "oracle_fit_fidelity": 1.0,
                 }
             )
         records.append(row)

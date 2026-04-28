@@ -48,6 +48,7 @@ from experiments.quantum_hj_quartic import (  # noqa: E402
     reconstruct_psi_hj,
     run_schrodinger,
     second_derivative_periodic,
+    trajectory_quadrature_weights,
 )
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -380,5 +381,10 @@ class TestDiagnostics:
 
         for key, value in metrics.items():
             assert np.isfinite(value), key
-        assert metrics["local_fit_L2"] == pytest.approx(0.0, abs=1e-12)
-        assert metrics["local_fit_fidelity"] == pytest.approx(1.0, abs=1e-12)
+        assert metrics["oracle_fit_L2"] == pytest.approx(0.0, abs=1e-12)
+        assert metrics["oracle_fit_fidelity"] == pytest.approx(1.0, abs=1e-12)
+
+    def test_trajectory_quadrature_weights_support_nonuniform_grid(self):
+        q = np.array([0.0, 0.5, 2.0, 3.0])
+        weights = trajectory_quadrature_weights(q)
+        np.testing.assert_allclose(weights, [0.25, 1.0, 1.25, 0.5])
