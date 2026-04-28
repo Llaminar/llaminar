@@ -111,7 +111,7 @@ from typing import List, Optional
 import numpy as np
 
 logger = logging.getLogger(__name__)
-DEFAULT_MAX_SNAPSHOTS = 200
+MAX_SNAPSHOTS_DEFAULT = 200
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Potential and its derivatives  (nondimensional: m = ℏ = ω = 1)
@@ -570,8 +570,10 @@ def reconstruct_gaussian_ivr(
         J_traj = snap["J"]
         P_traj = snap["P"]
         # gamma = 1/(2σ²) is the coherent-state width parameter used by this
-        # simplified Herman-Kluk-style stability prefactor.  This is a compact
-        # diagnostic approximation, not the full monodromy-matrix expression.
+        # simplified Herman-Kluk-style stability prefactor.  The full HK
+        # prefactor uses the complete monodromy matrix
+        # M = [[dq/dq0, dq/dp0], [dp/dq0, dp/dp0]]; here we only have the
+        # q0-derivative column (J, P), so this is a diagnostic approximation.
         gamma = 1.0 / (2.0 * width**2)
         prefactor = np.sqrt(0.5 * (J_traj + 1.0j * P_traj / gamma))
         prefactor = np.where(np.isfinite(prefactor), prefactor, 0.0)
@@ -1050,7 +1052,7 @@ def run_experiment(
     n_steps = max(1, int(round(T / dt)))
     # Bound memory/plot size while retaining enough temporal resolution for
     # residual diagnostics.
-    record_every = max(1, n_steps // DEFAULT_MAX_SNAPSHOTS)
+    record_every = max(1, n_steps // MAX_SNAPSHOTS_DEFAULT)
     n_records = n_steps // record_every
     if methods is None:
         methods = ["raw_hj"]

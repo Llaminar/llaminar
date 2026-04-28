@@ -383,6 +383,8 @@ class TestDiagnostics:
 
         for key, value in metrics.items():
             assert np.isfinite(value), key
+        assert metrics["amplitude_fit_L2"] > 0.0
+        assert metrics["phase_fit_L2"] > 0.0
         assert metrics["oracle_upper_bound_L2"] == pytest.approx(0.0, abs=1e-12)
         assert metrics["oracle_upper_bound_fidelity"] == pytest.approx(1.0, abs=1e-12)
 
