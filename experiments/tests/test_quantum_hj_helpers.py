@@ -103,7 +103,7 @@ class TestPotential:
         np.testing.assert_allclose(Vpp_analytic, Vpp_numeric, rtol=1e-4)
 
     def test_second_deriv_positive_definite(self):
-        """V''(x) = 1 + 12λx² ≥ 1 > 0 for λ ≥ 0 (ensures a confining potential)."""
+        """V''(x) = 1 + 12λx² ≥ 1 > 0 for λ (``lam`` in code) ≥ 0."""
         xs = np.linspace(-5.0, 5.0, 100)
         assert np.all(potential_second_deriv(xs, LAM_DEFAULT) > 0.0)
 
@@ -125,7 +125,7 @@ class TestNormalize:
         x, dx = _grid()
         psi = initial_gaussian(x, 0.0, 1.0, 0.5)
         psi_n = normalize(psi, dx)
-        # Dividing by a real positive scalar should not change the phase pattern
+        # Normalizing by a real positive scalar should not change the phase pattern
         ratio = psi_n / psi
         # All ratios should have the same argument (constant real positive scalar)
         np.testing.assert_allclose(np.imag(ratio), 0.0, atol=1e-12)
