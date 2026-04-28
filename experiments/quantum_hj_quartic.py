@@ -39,11 +39,17 @@ For each label q on a dense initial grid:
 
        dS/dt = p²/2 - V(x)
 
-3. Evolve the Jacobian variational equations::
+3. Evolve the full 1-D monodromy / variational equations::
 
-       dJ/dt = P,   dP/dt = -V''(x) J
-       where J = ∂x(t;q)/∂q,  P = ∂p(t;q)/∂q
-       Initial: J(0)=1, P(0)=∂²S₀/∂q² (= 0 for uniform initial momentum)
+       dA/dt = C,   dB/dt = D
+       dC/dt = -V''(x) A,   dD/dt = -V''(x) B
+
+       M = [[A, B], [C, D]]
+         = [[∂x(t)/∂q₀, ∂x(t)/∂p₀],
+            [∂p(t)/∂q₀, ∂p(t)/∂p₀]]
+
+       The original HJ Jacobian variables are J=A and P=C for this test's
+       uniform initial momentum field p₀(q)=const.
 
 4. Track Maslov index μ: increment by 1 each time J passes through zero
    (a caustic, i.e., a fold in the Lagrangian map).
@@ -271,32 +277,35 @@ def traj_rhs(state: np.ndarray, lam: float) -> np.ndarray:
 
     State is a flat concatenation over N_traj trajectories::
 
-        state = [x₁..xₙ | p₁..pₙ | S₁..Sₙ | J₁..Jₙ | P₁..Pₙ]
+        state = [x₁..xₙ | p₁..pₙ | S₁..Sₙ | A₁..Aₙ | B₁..Bₙ | C₁..Cₙ | D₁..Dₙ]
 
     Equations (m = ℏ = 1)::
 
         dx/dt = p
         dp/dt = -V'(x)
         dS/dt = p²/2 - V(x)   (Lagrangian)
-        dJ/dt = P
-        dP/dt = -V''(x) · J
+        dA/dt = C
+        dB/dt = D
+        dC/dt = -V''(x) · A
+        dD/dt = -V''(x) · B
 
     Parameters
     ----------
     state:
-        Concatenated state array of length 5·N_traj.
+        Concatenated state array of length 7·N_traj.
     lam:
         Quartic coupling λ.
 
     Returns
     -------
-    rhs : array of length 5·N_traj
+        rhs : array of length 7·N_traj
     """
-    n = len(state) // 5
+    n = len(state) // 7
     x = state[0:n]
     p = state[n : 2 * n]
-    J = state[3 * n : 4 * n]
-    P = state[4 * n : 5 * n]
+    A = state[3 * n : 4 * n]
+    B = state[4 * n : 5 * n]
+    C = state[5 * n : 6 * n]
 
     Vp = potential_first_deriv(x, lam)
     Vpp = potential_second_deriv(x, lam)
@@ -307,8 +316,10 @@ def traj_rhs(state: np.ndarray, lam: float) -> np.ndarray:
             p,               # dx/dt
             -Vp,             # dp/dt
             0.5 * p**2 - V,  # dS/dt  (Lagrangian)
-            P,               # dJ/dt
-            -Vpp * J,        # dP/dt
+            C,               # dA/dt
+            state[6 * n : 7 * n],  # dB/dt = D
+            -Vpp * A,        # dC/dt
+            -Vpp * B,        # dD/dt
         ]
     )
 
@@ -324,8 +335,10 @@ def run_trajectories(
 ) -> tuple[np.ndarray, List[dict]]:
     """Run classical trajectories using a vectorized 4th-order Runge–Kutta.
 
-    Also integrates the Jacobian variational equations (J, P) and tracks
-    the Maslov index for each trajectory.
+    Also integrates the full 1-D monodromy matrix
+    ``M = [[A, B], [C, D]]`` and tracks the Maslov index for each trajectory.
+    The legacy HJ Jacobian fields ``J`` and ``P`` are emitted as aliases for
+    ``A`` and ``C`` because this experiment uses uniform initial momentum.
 
     Parameters
     ----------
@@ -348,19 +361,21 @@ def run_trajectories(
     -------
     times : array of shape (n_records,)
     snapshots : list of dicts, each with keys:
-        ``x``, ``p``, ``S``, ``J``, ``P`` (shape (N_traj,)) and
-        ``mu`` (integer array, shape (N_traj,))
+        ``x``, ``p``, ``S``, ``A``, ``B``, ``C``, ``D``, ``J``, ``P``
+        (shape (N_traj,)) and ``mu`` (integer array, shape (N_traj,))
     """
     n = len(q_arr)
-    # J(0) = 1 (identity Lagrangian map), P(0) = ∂p₀/∂q = 0 (uniform initial momentum)
-    J0 = np.ones(n)
-    P0 = np.zeros(n)
+    # Full monodromy initial condition is identity.
+    A0 = np.ones(n)
+    B0 = np.zeros(n)
+    C0 = np.zeros(n)
+    D0 = np.ones(n)
 
-    state = np.concatenate([q_arr, p0_arr, S0_arr, J0, P0])
+    state = np.concatenate([q_arr, p0_arr, S0_arr, A0, B0, C0, D0])
 
-    # Maslov index: increment by 1 at each caustic (J sign change)
+    # Maslov index: increment by 1 at each caustic (J=A sign change)
     mu = np.zeros(n, dtype=int)
-    prev_sign_J = np.sign(J0)  # initially all +1
+    prev_sign_J = np.sign(A0)  # initially all +1
 
     times: List[float] = []
     snapshots: List[dict] = []
@@ -389,8 +404,12 @@ def run_trajectories(
                     "x": state[0:n].copy(),
                     "p": state[n : 2 * n].copy(),
                     "S": state[2 * n : 3 * n].copy(),
+                    "A": state[3 * n : 4 * n].copy(),
+                    "B": state[4 * n : 5 * n].copy(),
+                    "C": state[5 * n : 6 * n].copy(),
+                    "D": state[6 * n : 7 * n].copy(),
                     "J": state[3 * n : 4 * n].copy(),
-                    "P": state[4 * n : 5 * n].copy(),
+                    "P": state[5 * n : 6 * n].copy(),
                     "mu": mu.copy(),
                 }
             )
@@ -546,45 +565,74 @@ def reconstruct_gaussian_ivr(
     snap: dict,
     packet_width: float,
     use_hk_prefactor: bool = False,
+    thawed_width: bool = False,
+    full_hk_prefactor: bool = False,
     chunk_size: int = 256,
 ) -> np.ndarray:
     """Reconstruct ψ from finite-width trajectory packets.
 
     This replaces singular ray contributions with Gaussian coherent packets
     centered on each classical trajectory.  With ``use_hk_prefactor=True`` it
-    additionally applies a simple Herman-Kluk-style complex stability
-    prefactor from the variational variables ``J`` and ``P``.
+    additionally applies a Herman-Kluk-style complex stability prefactor.
+    ``full_hk_prefactor=True`` uses the full monodromy matrix when available;
+    otherwise the historical diagnostic approximation from ``J`` and ``P`` is
+    used.  ``thawed_width=True`` propagates each packet's complex width using
+    the same full monodromy matrix, yielding a 1-D thawed-Gaussian comparison.
     """
     width = max(float(packet_width), 1e-12)
     dq_weights = trajectory_quadrature_weights(q_arr)
     weights = np.sqrt(np.maximum(rho0_arr, 0.0) * dq_weights)
     norm = (2.0 * np.pi * width**2) ** (-0.25)
+    gamma = 1.0 / (2.0 * width**2)
 
     x_traj = snap["x"]
     p_traj = snap.get("p", np.zeros_like(x_traj))
     S_traj = snap["S"]
     mu_traj = snap["mu"].astype(float)
+    A_traj = snap.get("A", snap.get("J"))
+    B_traj = snap.get("B")
+    C_traj = snap.get("C", snap.get("P"))
+    D_traj = snap.get("D")
 
     prefactor = np.ones_like(x_traj, dtype=complex)
     if use_hk_prefactor:
-        J_traj = snap["J"]
-        P_traj = snap["P"]
-        # gamma = 1/(2σ²) is the coherent-state width parameter used by this
-        # simplified Herman-Kluk-style stability prefactor.  The full HK
-        # prefactor (Herman & Kluk, Chem. Phys. 1984) uses the complete
-        # monodromy matrix M = [[dq/dq0, dq/dp0], [dp/dq0, dp/dp0]].  Tracking
-        # all four elements would require additional variational equations;
-        # here we only have the q0-derivative column (J, P), so this is a
-        # diagnostic approximation.
-        gamma = 1.0 / (2.0 * width**2)
-        prefactor = np.sqrt(0.5 * (J_traj + 1.0j * P_traj / gamma))
+        if full_hk_prefactor and B_traj is not None and D_traj is not None:
+            # 1-D Herman-Kluk prefactor for frozen coherent states with
+            # envelope exp[-γ(x-q)²/2].  The square-root branch is left
+            # continuous by NumPy's principal sqrt; Maslov phase from J is
+            # still tracked separately for direct comparison with the HJ sum.
+            prefactor = np.sqrt(
+                0.5
+                * (
+                    A_traj
+                    + D_traj
+                    - 1.0j * gamma * B_traj
+                    + 1.0j * C_traj / gamma
+                )
+            )
+        else:
+            # Historical diagnostic approximation used before B and D were
+            # tracked.  Kept as ``herman_kluk`` for A/B comparisons.
+            prefactor = np.sqrt(0.5 * (A_traj + 1.0j * C_traj / gamma))
         prefactor = np.where(np.isfinite(prefactor), prefactor, 0.0)
 
     psi = np.zeros(len(x_grid), dtype=complex)
     for start in range(0, len(q_arr), chunk_size):
         end = min(start + chunk_size, len(q_arr))
         dx_mat = x_grid[None, :] - x_traj[start:end, None]
-        envelope = norm * np.exp(-(dx_mat**2) / (4.0 * width**2))
+        if thawed_width and B_traj is not None and D_traj is not None:
+            denom = A_traj[start:end, None] + 1.0j * gamma * B_traj[start:end, None]
+            evolved_gamma = (
+                D_traj[start:end, None] * gamma
+                - 1.0j * C_traj[start:end, None]
+            ) / denom
+            envelope = (
+                norm
+                / np.sqrt(denom)
+                * np.exp(-0.5 * evolved_gamma * dx_mat**2)
+            )
+        else:
+            envelope = norm * np.exp(-(dx_mat**2) / (4.0 * width**2))
         phase = (
             S_traj[start:end, None]
             + p_traj[start:end, None] * dx_mat
@@ -737,6 +785,25 @@ def reconstruct_by_method(
             snap,
             packet_width=packet_width,
             use_hk_prefactor=True,
+        )
+    if method == "full_herman_kluk":
+        return reconstruct_gaussian_ivr(
+            x_grid,
+            q_arr,
+            rho0_arr,
+            snap,
+            packet_width=packet_width,
+            use_hk_prefactor=True,
+            full_hk_prefactor=True,
+        )
+    if method == "thawed_gaussian":
+        return reconstruct_gaussian_ivr(
+            x_grid,
+            q_arr,
+            rho0_arr,
+            snap,
+            packet_width=packet_width,
+            thawed_width=True,
         )
     if method == "quantum_potential":
         psi = reconstruct_psi_hj(
@@ -1031,8 +1098,8 @@ def run_experiment(
         Number of classical trajectories.
     methods:
         Reconstruction methods to compare.  Available methods are
-        ``raw_hj``, ``smoothed_hj``, ``gaussian_ivr``, ``herman_kluk``, and
-        ``quantum_potential``.
+        ``raw_hj``, ``smoothed_hj``, ``gaussian_ivr``, ``herman_kluk``,
+        ``full_herman_kluk``, ``thawed_gaussian``, and ``quantum_potential``.
     caustic_width:
         Jacobian regularization used by smoothed methods.
     smooth_sigma:
@@ -1320,6 +1387,8 @@ def _build_parser() -> argparse.ArgumentParser:
             "smoothed_hj",
             "gaussian_ivr",
             "herman_kluk",
+            "full_herman_kluk",
+            "thawed_gaussian",
             "quantum_potential",
         ],
         default=None,
@@ -1391,6 +1460,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             "smoothed_hj",
             "gaussian_ivr",
             "herman_kluk",
+            "full_herman_kluk",
+            "thawed_gaussian",
             "quantum_potential",
         ]
     records = run_experiment(

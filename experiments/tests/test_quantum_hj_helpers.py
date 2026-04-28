@@ -46,6 +46,7 @@ from experiments.quantum_hj_quartic import (  # noqa: E402
     reconstruct_by_method,
     reconstruct_gaussian_ivr,
     reconstruct_psi_hj,
+    run_trajectories,
     run_schrodinger,
     second_derivative_periodic,
     trajectory_quadrature_weights,
@@ -292,6 +293,10 @@ class TestReconstructionVariants:
             "x": q_arr.copy(),
             "p": np.full_like(q_arr, p0),
             "S": q_arr * p0,
+            "A": np.ones_like(q_arr),
+            "B": np.zeros_like(q_arr),
+            "C": np.zeros_like(q_arr),
+            "D": np.ones_like(q_arr),
             "J": np.ones_like(q_arr),
             "P": np.zeros_like(q_arr),
             "mu": np.zeros(len(q_arr), dtype=int),
@@ -329,9 +334,39 @@ class TestReconstructionVariants:
         assert np.all(np.isfinite(psi_n))
         assert np.sqrt(np.sum(np.abs(psi_n) ** 2) * dx) == pytest.approx(1.0, abs=1e-10)
 
+    @pytest.mark.parametrize("thawed_width,full_hk_prefactor", [(True, False), (False, True)])
+    def test_full_monodromy_packet_variants_are_finite(self, thawed_width, full_hk_prefactor):
+        x, dx = _grid(N=128, L=4.0)
+        q_arr = np.linspace(-4.0, 4.0, 600)
+        rho0_arr = initial_density(q_arr, 0.0, 0.5)
+        snap = self._t0_snapshot(q_arr, p0=0.3)
+
+        psi = reconstruct_gaussian_ivr(
+            x,
+            q_arr,
+            rho0_arr,
+            snap,
+            packet_width=0.5,
+            use_hk_prefactor=full_hk_prefactor,
+            thawed_width=thawed_width,
+            full_hk_prefactor=full_hk_prefactor,
+        )
+        psi_n = normalize(psi, dx)
+
+        assert np.all(np.isfinite(psi_n))
+        assert np.max(np.abs(psi_n)) > 0.0
+
     @pytest.mark.parametrize(
         "method",
-        ["raw_hj", "smoothed_hj", "gaussian_ivr", "herman_kluk", "quantum_potential"],
+        [
+            "raw_hj",
+            "smoothed_hj",
+            "gaussian_ivr",
+            "herman_kluk",
+            "full_herman_kluk",
+            "thawed_gaussian",
+            "quantum_potential",
+        ],
     )
     def test_reconstruct_by_method_dispatches(self, method):
         x, dx = _grid(N=96, L=4.0)
@@ -359,6 +394,31 @@ class TestReconstructionVariants:
     def test_count_caustics_detects_jacobian_sign_changes(self):
         snap = {"J": np.array([1.0, 0.5, -0.2, -0.1, 0.4])}
         assert count_caustics(snap) == 2
+
+    def test_trajectory_snapshots_include_symplectic_monodromy(self):
+        q_arr = np.linspace(-1.0, 1.0, 32)
+        p0_arr = np.full_like(q_arr, 0.2)
+        S0_arr = q_arr * 0.2
+
+        _times, snaps = run_trajectories(
+            q_arr,
+            p0_arr,
+            S0_arr,
+            lam=0.1,
+            dt=0.005,
+            n_steps=20,
+            record_every=20,
+        )
+        snap = snaps[-1]
+
+        for key in ["A", "B", "C", "D", "J", "P"]:
+            assert key in snap
+            assert np.all(np.isfinite(snap[key]))
+        np.testing.assert_allclose(snap["J"], snap["A"])
+        np.testing.assert_allclose(snap["P"], snap["C"])
+
+        determinant = snap["A"] * snap["D"] - snap["B"] * snap["C"]
+        np.testing.assert_allclose(determinant, 1.0, atol=1e-8)
 
 
 class TestDiagnostics:
