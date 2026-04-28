@@ -385,10 +385,11 @@ class TestDiagnostics:
             assert np.isfinite(value), key
         assert metrics["amplitude_fit_L2"] > 0.0
         assert metrics["phase_fit_L2"] > 0.0
-        assert metrics["oracle_upper_bound_L2"] == pytest.approx(0.0, abs=1e-12)
-        assert metrics["oracle_upper_bound_fidelity"] == pytest.approx(1.0, abs=1e-12)
+        assert metrics["oracle_best_case_L2"] == pytest.approx(0.0, abs=1e-12)
+        assert metrics["oracle_best_case_fidelity"] == pytest.approx(1.0, abs=1e-12)
 
     def test_trajectory_quadrature_weights_support_nonuniform_grid(self):
+        """Trapezoidal weights: half-width edges, centered spans internally."""
         q = np.array([0.0, 0.5, 2.0, 3.0])
         weights = trajectory_quadrature_weights(q)
         np.testing.assert_allclose(weights, [0.25, 1.0, 1.25, 0.5])

@@ -111,7 +111,7 @@ from typing import List, Optional
 import numpy as np
 
 logger = logging.getLogger(__name__)
-MAX_SNAPSHOTS_DEFAULT = 200
+SNAPSHOT_LIMIT = 200
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Potential and its derivatives  (nondimensional: m = ℏ = ω = 1)
@@ -673,10 +673,10 @@ def fitted_correction_metrics(
     """Diagnostic amplitude-only, phase-only, and oracle upper-bound metrics."""
     amp_fit = normalize(np.abs(psi_ref) * np.exp(1j * np.angle(psi_test)), dx)
     phase_fit = normalize(np.abs(psi_test) * np.exp(1j * np.angle(psi_ref)), dx)
-    # The oracle upper bound intentionally rebuilds psi_ref from its own
+    # The oracle best case intentionally rebuilds psi_ref from its own
     # amplitude and phase.  It is a diagnostic reference for the best possible
     # local amplitude+phase correction, so its L2/fidelity are 0/1 by design.
-    oracle_upper_bound = normalize(
+    oracle_best_case = normalize(
         np.abs(psi_ref) * np.exp(1j * np.angle(psi_ref)), dx
     )
     return {
@@ -684,8 +684,8 @@ def fitted_correction_metrics(
         "amplitude_fit_fidelity": fidelity(psi_ref, amp_fit, dx),
         "phase_fit_L2": l2_error(psi_ref, phase_fit, dx),
         "phase_fit_fidelity": fidelity(psi_ref, phase_fit, dx),
-        "oracle_upper_bound_L2": l2_error(psi_ref, oracle_upper_bound, dx),
-        "oracle_upper_bound_fidelity": fidelity(psi_ref, oracle_upper_bound, dx),
+        "oracle_best_case_L2": l2_error(psi_ref, oracle_best_case, dx),
+        "oracle_best_case_fidelity": fidelity(psi_ref, oracle_best_case, dx),
     }
 
 
@@ -1052,7 +1052,7 @@ def run_experiment(
     n_steps = max(1, int(round(T / dt)))
     # Bound memory/plot size while retaining enough temporal resolution for
     # residual diagnostics.
-    record_every = max(1, n_steps // MAX_SNAPSHOTS_DEFAULT)
+    record_every = max(1, n_steps // SNAPSHOT_LIMIT)
     n_records = n_steps // record_every
     if methods is None:
         methods = ["raw_hj"]
@@ -1132,8 +1132,8 @@ def run_experiment(
                     "amplitude_fit_fidelity": 1.0,
                     "phase_fit_L2": 0.0,
                     "phase_fit_fidelity": 1.0,
-                    "oracle_upper_bound_L2": 0.0,
-                    "oracle_upper_bound_fidelity": 1.0,
+                    "oracle_best_case_L2": 0.0,
+                    "oracle_best_case_fidelity": 1.0,
                 }
             )
         records.append(row)
