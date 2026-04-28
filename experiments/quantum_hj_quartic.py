@@ -407,6 +407,8 @@ def reconstruct_psi_hj(
     q_arr: np.ndarray,
     rho0_arr: np.ndarray,
     snap: dict,
+    caustic_width: float = 0.0,
+    post_smooth_sigma: float = 0.0,
 ) -> np.ndarray:
     """Reconstruct ψ_HJ on *x_grid* from one trajectory snapshot.
 
@@ -428,6 +430,14 @@ def reconstruct_psi_hj(
         Initial density ρ₀(q), shape (N_traj,).
     snap:
         Trajectory snapshot dict with keys ``x``, ``S``, ``J``, ``mu``.
+    caustic_width:
+        Optional finite Jacobian floor.  When positive, the Van Vleck
+        denominator uses ``sqrt(J² + caustic_width²)`` instead of ``|J|`` to
+        suppress unphysical caustic spikes.
+    post_smooth_sigma:
+        Optional Gaussian smoothing width in x-units, applied after branch
+        summation.  This is a controlled finite-width regularization of the
+        ray-density result.
 
     Returns
     -------
@@ -497,14 +507,219 @@ def reconstruct_psi_hj(
         # Round Maslov index (interpolation may introduce small non-integers)
         mu_at_x = np.round(np.interp(x_eval, x_b, mu_b)).astype(int)
 
-        # Avoid division by zero near caustics
-        safe_J = np.maximum(absJ_at_x, 1e-30)
+        # Avoid division by zero near caustics.  caustic_width=0 preserves the
+        # raw Van Vleck/Jacobian reconstruction.
+        if caustic_width > 0.0:
+            safe_J = np.sqrt(absJ_at_x**2 + caustic_width**2)
+        else:
+            safe_J = np.maximum(absJ_at_x, 1e-30)
         amplitude = np.sqrt(np.maximum(rho0_at_x / safe_J, 0.0))
         phase = S_at_x - 0.5 * np.pi * mu_at_x
 
         psi[mask] += amplitude * np.exp(1j * phase)
 
+    if post_smooth_sigma > 0.0:
+        dx = x_grid[1] - x_grid[0]
+        psi = gaussian_smooth_periodic(psi, dx, post_smooth_sigma)
+
     return psi
+
+
+def gaussian_smooth_periodic(
+    values: np.ndarray,
+    dx: float,
+    sigma: float,
+) -> np.ndarray:
+    """Smooth a periodic grid function with a Gaussian kernel via FFT."""
+    if sigma <= 0.0:
+        return values.copy()
+    k = 2.0 * np.pi * np.fft.fftfreq(len(values), d=dx)
+    filt = np.exp(-0.5 * (sigma * k) ** 2)
+    return np.fft.ifft(np.fft.fft(values) * filt)
+
+
+def reconstruct_gaussian_ivr(
+    x_grid: np.ndarray,
+    q_arr: np.ndarray,
+    rho0_arr: np.ndarray,
+    snap: dict,
+    packet_width: float,
+    use_hk_prefactor: bool = False,
+    chunk_size: int = 256,
+) -> np.ndarray:
+    """Reconstruct ψ from finite-width trajectory packets.
+
+    This replaces singular ray contributions with Gaussian coherent packets
+    centered on each classical trajectory.  With ``use_hk_prefactor=True`` it
+    additionally applies a simple Herman-Kluk-style complex stability
+    prefactor from the variational variables ``J`` and ``P``.
+    """
+    width = max(float(packet_width), 1e-12)
+    dq = float(np.median(np.diff(q_arr))) if len(q_arr) > 1 else 1.0
+    weights = np.sqrt(np.maximum(rho0_arr, 0.0) * abs(dq))
+    norm = (2.0 * np.pi * width**2) ** (-0.25)
+
+    x_traj = snap["x"]
+    p_traj = snap.get("p", np.zeros_like(x_traj))
+    S_traj = snap["S"]
+    mu_traj = snap["mu"].astype(float)
+
+    prefactor = np.ones_like(x_traj, dtype=complex)
+    if use_hk_prefactor:
+        J_traj = snap["J"]
+        P_traj = snap["P"]
+        gamma = 1.0 / (2.0 * width**2)
+        prefactor = np.sqrt(0.5 * (J_traj + 1.0j * P_traj / gamma))
+        prefactor = np.where(np.isfinite(prefactor), prefactor, 0.0)
+
+    psi = np.zeros(len(x_grid), dtype=complex)
+    for start in range(0, len(q_arr), chunk_size):
+        end = min(start + chunk_size, len(q_arr))
+        dx_mat = x_grid[None, :] - x_traj[start:end, None]
+        envelope = norm * np.exp(-(dx_mat**2) / (4.0 * width**2))
+        phase = (
+            S_traj[start:end, None]
+            + p_traj[start:end, None] * dx_mat
+            - 0.5 * np.pi * mu_traj[start:end, None]
+        )
+        coeff = weights[start:end, None] * prefactor[start:end, None]
+        psi += np.sum(coeff * envelope * np.exp(1j * phase), axis=0)
+
+    return psi
+
+
+def second_derivative_periodic(values: np.ndarray, dx: float) -> np.ndarray:
+    """Second derivative using a periodic centered finite difference."""
+    return (np.roll(values, -1) - 2.0 * values + np.roll(values, 1)) / dx**2
+
+
+def quantum_potential_from_psi(
+    psi: np.ndarray,
+    dx: float,
+    density_floor: float = 1e-12,
+) -> np.ndarray:
+    """Return the Madelung/Bohm quantum potential Q = -½ ∂xx√ρ / √ρ."""
+    sqrt_rho = np.sqrt(np.maximum(np.abs(psi) ** 2, density_floor))
+    return -0.5 * second_derivative_periodic(sqrt_rho, dx) / sqrt_rho
+
+
+def apply_quantum_potential_phase_correction(
+    psi: np.ndarray,
+    dx: float,
+    time: float,
+    strength: float = 1.0,
+) -> np.ndarray:
+    """Apply a diagnostic Madelung quantum-potential phase correction."""
+    Q = quantum_potential_from_psi(psi, dx)
+    return psi * np.exp(-1j * strength * time * Q)
+
+
+def count_caustics(snap: dict) -> int:
+    """Count sign changes of the trajectory Jacobian J in a snapshot."""
+    sign_J = np.sign(snap["J"])
+    change = (
+        (sign_J[:-1] != 0)
+        & (sign_J[1:] != 0)
+        & (sign_J[:-1] != sign_J[1:])
+    )
+    return int(np.count_nonzero(change))
+
+
+def schrodinger_residual_norm(
+    psi_now: np.ndarray,
+    psi_prev: Optional[np.ndarray],
+    dt_record: float,
+    x_grid: np.ndarray,
+    lam: float,
+    dx: float,
+) -> float:
+    """Return ||i∂tψ + ½∂xxψ - Vψ||₂ for a reconstructed wavefunction."""
+    if psi_prev is None or dt_record <= 0.0:
+        return float("nan")
+    dpsi_dt = (psi_now - psi_prev) / dt_record
+    residual = (
+        1.0j * dpsi_dt
+        + 0.5 * second_derivative_periodic(psi_now, dx)
+        - potential(x_grid, lam) * psi_now
+    )
+    return float(np.sqrt(np.sum(np.abs(residual) ** 2) * dx))
+
+
+def fitted_correction_metrics(
+    psi_ref: np.ndarray,
+    psi_test: np.ndarray,
+    dx: float,
+) -> dict:
+    """Diagnostic amplitude-only, phase-only, and full local-fit metrics."""
+    amp_fit = normalize(np.abs(psi_ref) * np.exp(1j * np.angle(psi_test)), dx)
+    phase_fit = normalize(np.abs(psi_test) * np.exp(1j * np.angle(psi_ref)), dx)
+    both_fit = normalize(np.abs(psi_ref) * np.exp(1j * np.angle(psi_ref)), dx)
+    return {
+        "amplitude_fit_L2": l2_error(psi_ref, amp_fit, dx),
+        "amplitude_fit_fidelity": fidelity(psi_ref, amp_fit, dx),
+        "phase_fit_L2": l2_error(psi_ref, phase_fit, dx),
+        "phase_fit_fidelity": fidelity(psi_ref, phase_fit, dx),
+        "local_fit_L2": l2_error(psi_ref, both_fit, dx),
+        "local_fit_fidelity": fidelity(psi_ref, both_fit, dx),
+    }
+
+
+def reconstruct_by_method(
+    method: str,
+    x_grid: np.ndarray,
+    q_arr: np.ndarray,
+    rho0_arr: np.ndarray,
+    snap: dict,
+    dx: float,
+    time: float,
+    caustic_width: float,
+    smooth_sigma: float,
+    packet_width: float,
+    quantum_potential_strength: float,
+) -> np.ndarray:
+    """Dispatch one named reconstruction method."""
+    if method == "raw_hj":
+        return reconstruct_psi_hj(x_grid, q_arr, rho0_arr, snap)
+    if method == "smoothed_hj":
+        return reconstruct_psi_hj(
+            x_grid,
+            q_arr,
+            rho0_arr,
+            snap,
+            caustic_width=caustic_width,
+            post_smooth_sigma=smooth_sigma,
+        )
+    if method == "gaussian_ivr":
+        return reconstruct_gaussian_ivr(
+            x_grid,
+            q_arr,
+            rho0_arr,
+            snap,
+            packet_width=packet_width,
+            use_hk_prefactor=False,
+        )
+    if method == "herman_kluk":
+        return reconstruct_gaussian_ivr(
+            x_grid,
+            q_arr,
+            rho0_arr,
+            snap,
+            packet_width=packet_width,
+            use_hk_prefactor=True,
+        )
+    if method == "quantum_potential":
+        psi = reconstruct_psi_hj(
+            x_grid,
+            q_arr,
+            rho0_arr,
+            snap,
+            caustic_width=caustic_width,
+            post_smooth_sigma=smooth_sigma,
+        )
+        return apply_quantum_potential_phase_correction(
+            psi, dx, time, strength=quantum_potential_strength
+        )
+    raise ValueError(f"Unknown reconstruction method: {method}")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -627,6 +842,11 @@ def _try_plot(
     x_grid: np.ndarray,
     dx: float,
     out_path: Path,
+    methods: List[str],
+    caustic_width: float,
+    smooth_sigma: float,
+    packet_width: float,
+    quantum_potential_strength: float,
 ) -> None:
     """Generate optional diagnostic plots if matplotlib is available."""
     try:
@@ -636,23 +856,27 @@ def _try_plot(
         return
 
     # ── Plot 1: metrics vs time ──────────────────────────────────────────────
-    times = [r["t"] for r in records]
-    errs = [r["L2_error"] for r in records]
-    fids = [r["fidelity"] for r in records]
-
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(8, 6), sharex=True)
-    ax1.semilogy(times, errs, color="tab:red", lw=1.5)
+    for method in methods:
+        method_records = [r for r in records if r.get("method") == method]
+        times = [r["t"] for r in method_records]
+        errs = [r["L2_error"] for r in method_records]
+        fids = [r["fidelity"] for r in method_records]
+        ax1.semilogy(times, errs, lw=1.5, label=method)
+        ax2.plot(times, fids, lw=1.5, label=method)
+
     ax1.set_ylabel("Phase-aligned L₂ error  ε(t)")
     ax1.set_title(
-        "Quartic oscillator: Schrödinger vs classical HJ reconstruction"
+        "Quartic oscillator: Schrödinger vs classical reconstructions"
     )
+    ax1.legend(fontsize=8)
     ax1.grid(True, which="both", alpha=0.3)
 
-    ax2.plot(times, fids, color="tab:blue", lw=1.5)
-    ax2.set_ylabel("Fidelity  F(t) = |⟨ψ_Sch|ψ_HJ⟩|²")
+    ax2.set_ylabel("Fidelity  F(t)")
     ax2.set_xlabel("Time  t")
     ax2.set_ylim([-0.05, 1.05])
     ax2.axhline(1.0, ls="--", color="gray", lw=0.8)
+    ax2.legend(fontsize=8)
     ax2.grid(True, alpha=0.3)
 
     plt.tight_layout()
@@ -688,7 +912,23 @@ def _try_plot(
         t_snap = traj_times[si]
         snap = traj_snaps[si]
         psi_sch = normalize(sch_psi_list[si], dx)
-        psi_hj = normalize(reconstruct_psi_hj(x_grid, q_arr, rho0_arr, snap), dx)
+        method = methods[0]
+        psi_hj = normalize(
+            reconstruct_by_method(
+                method,
+                x_grid,
+                q_arr,
+                rho0_arr,
+                snap,
+                dx,
+                float(t_snap),
+                caustic_width,
+                smooth_sigma,
+                packet_width,
+                quantum_potential_strength,
+            ),
+            dx,
+        )
 
         ax.plot(x_grid, np.abs(psi_sch) ** 2, lw=1.5, label="Schrödinger", color="tab:blue")
         ax.plot(
@@ -696,7 +936,7 @@ def _try_plot(
             np.abs(psi_hj) ** 2,
             lw=1.5,
             ls="--",
-            label="HJ reconstruction",
+            label=f"{method} reconstruction",
             color="tab:orange",
         )
         ax.set_ylabel("|ψ|²")
@@ -727,6 +967,12 @@ def run_experiment(
     p0: float = 1.0,
     sigma: float = 0.5,
     N_traj: int = 2000,
+    methods: Optional[List[str]] = None,
+    caustic_width: float = 1e-3,
+    smooth_sigma: float = 0.02,
+    packet_width: Optional[float] = None,
+    quantum_potential_strength: float = 1.0,
+    fit_corrections: bool = False,
     out_dir: Optional[str] = None,
     verbose: bool = True,
 ) -> List[dict]:
@@ -752,6 +998,20 @@ def run_experiment(
         Initial packet width.
     N_traj:
         Number of classical trajectories.
+    methods:
+        Reconstruction methods to compare.  Available methods are
+        ``raw_hj``, ``smoothed_hj``, ``gaussian_ivr``, ``herman_kluk``, and
+        ``quantum_potential``.
+    caustic_width:
+        Jacobian regularization used by smoothed methods.
+    smooth_sigma:
+        Post-reconstruction Gaussian smoothing width in x-units.
+    packet_width:
+        Finite coherent-packet width for IVR methods.  Defaults to ``sigma``.
+    quantum_potential_strength:
+        Strength of the Madelung quantum-potential phase correction.
+    fit_corrections:
+        If true, add diagnostic amplitude/phase/local-fit metrics.
     out_dir:
         If given, write ``diagnostics.csv`` and optional plots there.
     verbose:
@@ -759,7 +1019,7 @@ def run_experiment(
 
     Returns
     -------
-    records : list of dicts, each with keys ``t``, ``L2_error``, ``fidelity``.
+    records : list of dicts with one row per time and reconstruction method.
     """
     # ── Setup ─────────────────────────────────────────────────────────────────
     x_grid = np.linspace(-L, L, N, endpoint=False)
@@ -768,6 +1028,10 @@ def run_experiment(
     # Aim for ~200 recorded snapshots (never more than n_steps)
     record_every = max(1, n_steps // 200)
     n_records = n_steps // record_every
+    if methods is None:
+        methods = ["raw_hj"]
+    methods = list(dict.fromkeys(methods))
+    packet_width_value = sigma if packet_width is None else packet_width
 
     if verbose:
         logging.basicConfig(level=logging.INFO, format="%(message)s", stream=sys.stdout)
@@ -777,7 +1041,8 @@ def run_experiment(
             "  Grid    : N=%d, L=%.2f, dx=%.4f\n"
             "  Time    : T=%.2f, dt=%.4f, steps=%d, snapshots=%d\n"
             "  Packet  : x₀=%.2f, p₀=%.2f, σ=%.2f\n"
-            "  Traj.   : N_traj=%d\n",
+            "  Traj.   : N_traj=%d\n"
+            "  Methods : %s\n",
             lam,
             N,
             L,
@@ -790,6 +1055,7 @@ def run_experiment(
             p0,
             sigma,
             N_traj,
+            ", ".join(methods),
         )
 
     # ── Initial wavefunction ──────────────────────────────────────────────────
@@ -821,25 +1087,90 @@ def run_experiment(
         logger.info("Computing HJ reconstruction and metrics …")
 
     records: List[dict] = []
-    # t = 0: exact by construction (reconstruction = initial wavefunction)
-    records.append({"t": 0.0, "L2_error": 0.0, "fidelity": 1.0})
+    # t = 0: exact by construction for all method baselines.
+    for method in methods:
+        row = {
+            "t": 0.0,
+            "method": method,
+            "L2_error": 0.0,
+            "fidelity": 1.0,
+            "norm": 1.0,
+            "caustic_count": 0,
+            "max_density": float(np.max(np.abs(psi0) ** 2)),
+            "residual_norm": float("nan"),
+        }
+        if fit_corrections:
+            row.update(
+                {
+                    "amplitude_fit_L2": 0.0,
+                    "amplitude_fit_fidelity": 1.0,
+                    "phase_fit_L2": 0.0,
+                    "phase_fit_fidelity": 1.0,
+                    "local_fit_L2": 0.0,
+                    "local_fit_fidelity": 1.0,
+                }
+            )
+        records.append(row)
 
     report_stride = max(1, n_records // 10)
+    prev_psi_by_method: dict[str, Optional[np.ndarray]] = {
+        method: None for method in methods
+    }
+    dt_record = record_every * dt
 
     for i, (t, snap, psi_sch) in enumerate(
         zip(traj_times, traj_snaps, sch_psi_list)
     ):
-        psi_hj_raw = reconstruct_psi_hj(x_grid, q_arr, rho0_arr, snap)
         psi_sch_n = normalize(psi_sch, dx)
-        psi_hj_n = normalize(psi_hj_raw, dx)
+        caustics = count_caustics(snap)
+        log_parts = []
 
-        err = l2_error(psi_sch_n, psi_hj_n, dx)
-        fid = fidelity(psi_sch_n, psi_hj_n, dx)
+        for method in methods:
+            psi_raw = reconstruct_by_method(
+                method,
+                x_grid,
+                q_arr,
+                rho0_arr,
+                snap,
+                dx,
+                float(t),
+                caustic_width,
+                smooth_sigma,
+                packet_width_value,
+                quantum_potential_strength,
+            )
+            raw_norm = float(np.sqrt(np.sum(np.abs(psi_raw) ** 2) * dx))
+            psi_n = normalize(psi_raw, dx)
 
-        records.append({"t": float(t), "L2_error": err, "fidelity": fid})
+            err = l2_error(psi_sch_n, psi_n, dx)
+            fid = fidelity(psi_sch_n, psi_n, dx)
+            residual = schrodinger_residual_norm(
+                psi_n,
+                prev_psi_by_method[method],
+                dt_record,
+                x_grid,
+                lam,
+                dx,
+            )
+            prev_psi_by_method[method] = psi_n.copy()
+
+            row = {
+                "t": float(t),
+                "method": method,
+                "L2_error": err,
+                "fidelity": fid,
+                "norm": raw_norm,
+                "caustic_count": caustics,
+                "max_density": float(np.max(np.abs(psi_n) ** 2)),
+                "residual_norm": residual,
+            }
+            if fit_corrections:
+                row.update(fitted_correction_metrics(psi_sch_n, psi_n, dx))
+            records.append(row)
+            log_parts.append(f"{method}: L2={err:.3e}, F={fid:.5f}")
 
         if verbose and (i % report_stride == 0 or i == n_records - 1):
-            logger.info("  t=%6.3f  L2_error=%.4e  fidelity=%.6f", t, err, fid)
+            logger.info("  t=%6.3f  %s", t, " | ".join(log_parts))
 
     # ── Output ────────────────────────────────────────────────────────────────
     if out_dir is not None:
@@ -856,6 +1187,11 @@ def run_experiment(
             x_grid,
             dx,
             out_path,
+            methods,
+            caustic_width,
+            smooth_sigma,
+            packet_width_value,
+            quantum_potential_strength,
         )
 
     return records
@@ -944,6 +1280,61 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Number of classical trajectories (default: %(default)s)",
     )
     p.add_argument(
+        "--method",
+        dest="methods",
+        action="append",
+        choices=[
+            "raw_hj",
+            "smoothed_hj",
+            "gaussian_ivr",
+            "herman_kluk",
+            "quantum_potential",
+        ],
+        default=None,
+        help=(
+            "Reconstruction method to run. May be repeated. "
+            "Default: raw_hj"
+        ),
+    )
+    p.add_argument(
+        "--compare-all",
+        action="store_true",
+        help="Run all reconstruction methods on the same trajectory data",
+    )
+    p.add_argument(
+        "--caustic-width",
+        type=float,
+        default=1e-3,
+        metavar="FLOAT",
+        help="Jacobian regularization width for caustic smoothing (default: %(default)s)",
+    )
+    p.add_argument(
+        "--smooth-sigma",
+        type=float,
+        default=0.02,
+        metavar="FLOAT",
+        help="Post-reconstruction Gaussian smoothing width in x-units (default: %(default)s)",
+    )
+    p.add_argument(
+        "--packet-width",
+        type=float,
+        default=None,
+        metavar="FLOAT",
+        help="Gaussian IVR packet width; defaults to initial sigma",
+    )
+    p.add_argument(
+        "--quantum-potential-strength",
+        type=float,
+        default=1.0,
+        metavar="FLOAT",
+        help="Strength for quantum-potential phase correction (default: %(default)s)",
+    )
+    p.add_argument(
+        "--fit-corrections",
+        action="store_true",
+        help="Add amplitude-only, phase-only, and local-fit diagnostic metrics",
+    )
+    p.add_argument(
         "--out",
         dest="out_dir",
         type=str,
@@ -961,6 +1352,15 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Optional[List[str]] = None) -> int:
     args = _build_parser().parse_args(argv)
+    methods = args.methods
+    if args.compare_all:
+        methods = [
+            "raw_hj",
+            "smoothed_hj",
+            "gaussian_ivr",
+            "herman_kluk",
+            "quantum_potential",
+        ]
     records = run_experiment(
         N=args.N,
         L=args.L,
@@ -971,18 +1371,28 @@ def main(argv: Optional[List[str]] = None) -> int:
         p0=args.p0,
         sigma=args.sigma,
         N_traj=args.N_traj,
+        methods=methods,
+        caustic_width=args.caustic_width,
+        smooth_sigma=args.smooth_sigma,
+        packet_width=args.packet_width,
+        quantum_potential_strength=args.quantum_potential_strength,
+        fit_corrections=args.fit_corrections,
         out_dir=args.out_dir,
         verbose=not args.quiet,
     )
 
     # Print final summary
     if records:
-        final = records[-1]
-        print(
-            f"\nFinal metrics at t={final['t']:.4f}: "
-            f"L2_error={final['L2_error']:.4e}  "
-            f"fidelity={final['fidelity']:.6f}"
-        )
+        final_t = records[-1]["t"]
+        print(f"\nFinal metrics at t={final_t:.4f}:")
+        for row in records:
+            if row["t"] == final_t:
+                print(
+                    f"  {row['method']}: "
+                    f"L2_error={row['L2_error']:.4e}  "
+                    f"fidelity={row['fidelity']:.6f}  "
+                    f"norm={row['norm']:.6f}"
+                )
     return 0
 
 

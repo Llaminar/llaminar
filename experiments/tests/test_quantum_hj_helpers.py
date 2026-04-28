@@ -31,7 +31,10 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from experiments.quantum_hj_quartic import (  # noqa: E402
     align_phase,
+    count_caustics,
     fidelity,
+    fitted_correction_metrics,
+    gaussian_smooth_periodic,
     initial_density,
     initial_gaussian,
     l2_error,
@@ -39,8 +42,12 @@ from experiments.quantum_hj_quartic import (  # noqa: E402
     potential,
     potential_first_deriv,
     potential_second_deriv,
+    quantum_potential_from_psi,
+    reconstruct_by_method,
+    reconstruct_gaussian_ivr,
     reconstruct_psi_hj,
     run_schrodinger,
+    second_derivative_periodic,
 )
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -274,3 +281,104 @@ class TestHJt0Reconstruction:
             f"t=0 HJ fidelity too low: {fid:.6f}.  "
             "Check reconstruct_psi_hj or initial conditions."
         )
+
+
+class TestReconstructionVariants:
+    def _t0_snapshot(self, q_arr, p0):
+        return {
+            "x": q_arr.copy(),
+            "p": np.full_like(q_arr, p0),
+            "S": q_arr * p0,
+            "J": np.ones_like(q_arr),
+            "P": np.zeros_like(q_arr),
+            "mu": np.zeros(len(q_arr), dtype=int),
+        }
+
+    def test_caustic_regularization_bounds_amplitude(self):
+        x, _ = _grid(N=128, L=4.0)
+        q_arr = np.linspace(-4.0, 4.0, 400)
+        rho0_arr = initial_density(q_arr, 0.0, 0.5)
+        snap = self._t0_snapshot(q_arr, p0=0.0)
+        snap["J"][len(q_arr) // 2] = 0.0
+
+        psi_raw = reconstruct_psi_hj(x, q_arr, rho0_arr, snap)
+        psi_smooth = reconstruct_psi_hj(
+            x, q_arr, rho0_arr, snap, caustic_width=1e-2
+        )
+
+        assert np.max(np.abs(psi_smooth)) < np.max(np.abs(psi_raw))
+
+    def test_gaussian_smoothing_reduces_high_frequency_component(self):
+        x, dx = _grid(N=128, L=4.0)
+        values = np.exp(1j * 20.0 * x)
+        smoothed = gaussian_smooth_periodic(values, dx, sigma=0.1)
+        assert np.max(np.abs(smoothed)) < np.max(np.abs(values))
+
+    def test_gaussian_ivr_returns_finite_nonzero_wavefunction(self):
+        x, dx = _grid(N=128, L=4.0)
+        q_arr = np.linspace(-4.0, 4.0, 600)
+        rho0_arr = initial_density(q_arr, 0.0, 0.5)
+        snap = self._t0_snapshot(q_arr, p0=0.3)
+
+        psi = reconstruct_gaussian_ivr(x, q_arr, rho0_arr, snap, packet_width=0.5)
+        psi_n = normalize(psi, dx)
+
+        assert np.all(np.isfinite(psi_n))
+        assert np.sqrt(np.sum(np.abs(psi_n) ** 2) * dx) == pytest.approx(1.0, abs=1e-10)
+
+    @pytest.mark.parametrize(
+        "method",
+        ["raw_hj", "smoothed_hj", "gaussian_ivr", "herman_kluk", "quantum_potential"],
+    )
+    def test_reconstruct_by_method_dispatches(self, method):
+        x, dx = _grid(N=96, L=4.0)
+        q_arr = np.linspace(-4.0, 4.0, 300)
+        rho0_arr = initial_density(q_arr, 0.0, 0.5)
+        snap = self._t0_snapshot(q_arr, p0=0.2)
+
+        psi = reconstruct_by_method(
+            method,
+            x,
+            q_arr,
+            rho0_arr,
+            snap,
+            dx,
+            time=0.0,
+            caustic_width=1e-3,
+            smooth_sigma=0.02,
+            packet_width=0.5,
+            quantum_potential_strength=1.0,
+        )
+
+        assert np.all(np.isfinite(psi))
+        assert np.max(np.abs(psi)) > 0.0
+
+    def test_count_caustics_detects_jacobian_sign_changes(self):
+        snap = {"J": np.array([1.0, 0.5, -0.2, -0.1, 0.4])}
+        assert count_caustics(snap) == 2
+
+
+class TestDiagnostics:
+    def test_second_derivative_periodic_matches_sine(self):
+        x, dx = _grid(N=256, L=np.pi)
+        values = np.sin(2.0 * x)
+        d2 = second_derivative_periodic(values, dx)
+        np.testing.assert_allclose(d2, -4.0 * values, atol=5e-3)
+
+    def test_quantum_potential_finite_for_gaussian(self):
+        x, dx = _grid(N=256, L=6.0)
+        psi = normalize(initial_gaussian(x, 0.0, 0.0, 0.5), dx)
+        Q = quantum_potential_from_psi(psi, dx)
+        assert np.all(np.isfinite(Q))
+
+    def test_fitted_correction_metrics_are_bounded(self):
+        x, dx = _grid(N=128, L=5.0)
+        psi_ref = normalize(initial_gaussian(x, 0.0, 0.0, 0.5), dx)
+        psi_test = normalize(initial_gaussian(x, 0.5, 1.0, 0.7), dx)
+
+        metrics = fitted_correction_metrics(psi_ref, psi_test, dx)
+
+        for key, value in metrics.items():
+            assert np.isfinite(value), key
+        assert metrics["local_fit_L2"] == pytest.approx(0.0, abs=1e-12)
+        assert metrics["local_fit_fidelity"] == pytest.approx(1.0, abs=1e-12)
