@@ -617,8 +617,13 @@ def reconstruct_gaussian_ivr(
     if use_hk_prefactor:
         if use_full_hk_prefactor and B_traj is not None and D_traj is not None:
             # 1-D Herman-Kluk prefactor for frozen coherent states with
-            # envelope exp[-γ(x-q)²/2].  The square-root branch is left
-            # continuous by NumPy's principal sqrt; Maslov phase from J is
+            # envelope exp[-γ(x-q)²/2].  In 1-D this is the standard
+            # propagator determinant factor
+            #   sqrt(0.5 * (A + D - iγB + iC/γ))
+            # corresponding to det(M + iγΣ)^(1/2) with symplectic metric Σ
+            # (Herman & Kluk 1984; Kay 1994).  We choose a continuous
+            # square-root branch along trajectory labels to avoid artificial
+            # sign flips at the principal branch cut.  Maslov phase from J is
             # still tracked separately for direct comparison with the HJ sum.
             prefactor = continuous_complex_sqrt(
                 0.5
@@ -638,6 +643,9 @@ def reconstruct_gaussian_ivr(
     denom_sqrt = None
     evolved_gamma = None
     if use_thawed_width and B_traj is not None and D_traj is not None:
+        # Heller thawed Gaussian propagation for the complex width parameter:
+        #   γ(t) = (D γ₀ - i C) / (A + i γ₀ B)
+        # with envelope normalization det(A + i γ₀ B)^(-1/2) in 1-D.
         denom = A_traj + 1.0j * gamma * B_traj
         denom_sqrt = continuous_complex_sqrt(denom)
         evolved_gamma = (D_traj * gamma - 1.0j * C_traj) / denom

@@ -337,7 +337,7 @@ class TestReconstructionVariants:
 
     @pytest.mark.parametrize(
         "use_thawed_width,use_full_hk_prefactor",
-        [(True, False), (False, True)],
+        [(False, False), (True, False), (False, True), (True, True)],
     )
     def test_full_monodromy_packet_variants_are_finite(
         self,
