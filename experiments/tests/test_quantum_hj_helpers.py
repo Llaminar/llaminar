@@ -374,7 +374,7 @@ class TestDiagnostics:
         Q = quantum_potential_from_psi(psi, dx)
         assert np.all(np.isfinite(Q))
 
-    def test_fitted_correction_metrics_are_bounded(self):
+    def test_fitted_correction_metrics_are_nontrivial_for_distinct_states(self):
         x, dx = _grid(N=128, L=5.0)
         psi_ref = normalize(initial_gaussian(x, 0.0, 0.0, 0.5), dx)
         psi_test = normalize(initial_gaussian(x, 0.5, 1.0, 0.7), dx)
@@ -385,8 +385,12 @@ class TestDiagnostics:
             assert np.isfinite(value), key
         assert metrics["amplitude_fit_L2"] > 0.0
         assert metrics["phase_fit_L2"] > 0.0
-        assert metrics["oracle_best_case_L2"] == pytest.approx(0.0, abs=1e-12)
-        assert metrics["oracle_best_case_fidelity"] == pytest.approx(1.0, abs=1e-12)
+        assert metrics["amplitude_phase_identity_L2"] == pytest.approx(
+            0.0, abs=1e-12
+        )
+        assert metrics["amplitude_phase_identity_fidelity"] == pytest.approx(
+            1.0, abs=1e-12
+        )
 
     def test_trajectory_quadrature_weights_support_nonuniform_grid(self):
         """Trapezoidal weights: half-width edges, centered spans internally."""
