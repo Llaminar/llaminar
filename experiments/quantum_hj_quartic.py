@@ -570,7 +570,8 @@ def reconstruct_gaussian_ivr(
         J_traj = snap["J"]
         P_traj = snap["P"]
         # gamma = 1/(2σ²) is the coherent-state width parameter used by this
-        # simple Herman-Kluk-style stability prefactor.
+        # simplified Herman-Kluk-style stability prefactor.  This is a compact
+        # diagnostic approximation, not the full monodromy-matrix expression.
         gamma = 1.0 / (2.0 * width**2)
         prefactor = np.sqrt(0.5 * (J_traj + 1.0j * P_traj / gamma))
         prefactor = np.where(np.isfinite(prefactor), prefactor, 0.0)
@@ -670,14 +671,19 @@ def fitted_correction_metrics(
     """Diagnostic amplitude-only, phase-only, and oracle upper-bound metrics."""
     amp_fit = normalize(np.abs(psi_ref) * np.exp(1j * np.angle(psi_test)), dx)
     phase_fit = normalize(np.abs(psi_test) * np.exp(1j * np.angle(psi_ref)), dx)
-    oracle_fit = normalize(np.abs(psi_ref) * np.exp(1j * np.angle(psi_ref)), dx)
+    # The oracle upper bound intentionally rebuilds psi_ref from its own
+    # amplitude and phase.  It is a diagnostic reference for the best possible
+    # local amplitude+phase correction, so its L2/fidelity are 0/1 by design.
+    oracle_upper_bound = normalize(
+        np.abs(psi_ref) * np.exp(1j * np.angle(psi_ref)), dx
+    )
     return {
         "amplitude_fit_L2": l2_error(psi_ref, amp_fit, dx),
         "amplitude_fit_fidelity": fidelity(psi_ref, amp_fit, dx),
         "phase_fit_L2": l2_error(psi_ref, phase_fit, dx),
         "phase_fit_fidelity": fidelity(psi_ref, phase_fit, dx),
-        "oracle_fit_L2": l2_error(psi_ref, oracle_fit, dx),
-        "oracle_fit_fidelity": fidelity(psi_ref, oracle_fit, dx),
+        "oracle_upper_bound_L2": l2_error(psi_ref, oracle_upper_bound, dx),
+        "oracle_upper_bound_fidelity": fidelity(psi_ref, oracle_upper_bound, dx),
     }
 
 
@@ -1124,8 +1130,8 @@ def run_experiment(
                     "amplitude_fit_fidelity": 1.0,
                     "phase_fit_L2": 0.0,
                     "phase_fit_fidelity": 1.0,
-                    "oracle_fit_L2": 0.0,
-                    "oracle_fit_fidelity": 1.0,
+                    "oracle_upper_bound_L2": 0.0,
+                    "oracle_upper_bound_fidelity": 1.0,
                 }
             )
         records.append(row)

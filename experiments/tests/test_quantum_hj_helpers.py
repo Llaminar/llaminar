@@ -215,7 +215,9 @@ class TestSchrodingerNormConservation:
         x, dx = _grid(N=256, L=8.0)
         psi0 = normalize(initial_gaussian(x, 0.0, 1.0, 0.5), dx)
         # 100 steps of dt=0.01
-        _, psi_list = run_schrodinger(psi0, x, lam=lam, dt=0.01, n_steps=100, record_every=50)
+        _times, psi_list = run_schrodinger(
+            psi0, x, lam=lam, dt=0.01, n_steps=100, record_every=50
+        )
         for psi in psi_list:
             norm = np.sqrt(np.sum(np.abs(psi) ** 2) * dx)
             assert norm == pytest.approx(1.0, abs=1e-6), (
@@ -381,8 +383,8 @@ class TestDiagnostics:
 
         for key, value in metrics.items():
             assert np.isfinite(value), key
-        assert metrics["oracle_fit_L2"] == pytest.approx(0.0, abs=1e-12)
-        assert metrics["oracle_fit_fidelity"] == pytest.approx(1.0, abs=1e-12)
+        assert metrics["oracle_upper_bound_L2"] == pytest.approx(0.0, abs=1e-12)
+        assert metrics["oracle_upper_bound_fidelity"] == pytest.approx(1.0, abs=1e-12)
 
     def test_trajectory_quadrature_weights_support_nonuniform_grid(self):
         q = np.array([0.0, 0.5, 2.0, 3.0])
