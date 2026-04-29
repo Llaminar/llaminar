@@ -5,10 +5,10 @@
 
 #include "app/modes/SingleShotChatMode.h"
 #include "app/AppContext.h"
+#include "app/MPIShutdown.h"
 #include "utils/Logger.h"
 #include "utils/ChatTemplate.h"
 #include "utils/Sampler.h"
-#include <mpi.h>
 #include <iostream>
 #include <vector>
 
@@ -37,7 +37,7 @@ namespace llaminar2
             if (mpi_ctx->world_size() > 1)
                 mpi_ctx->barrier();
             runner->shutdown();
-            MPI_Finalize();
+            mpiShutdown();
             return 1;
         }
 
@@ -81,7 +81,7 @@ namespace llaminar2
         if (token_count <= 0)
         {
             runner->shutdown();
-            MPI_Finalize();
+            mpiShutdown();
             return 1;
         }
 
@@ -106,7 +106,7 @@ namespace llaminar2
                 LOG_ERROR("Chat prefill failed: " << runner->lastError());
             }
             runner->shutdown();
-            MPI_Finalize();
+            mpiShutdown();
             return 1;
         }
 
@@ -142,7 +142,7 @@ namespace llaminar2
                     LOG_ERROR("Decode step failed: " << result.error);
                 }
                 runner->shutdown();
-                MPI_Finalize();
+                mpiShutdown();
                 return 1;
             }
 
@@ -179,7 +179,7 @@ namespace llaminar2
         }
 
         runner->shutdown();
-        MPI_Finalize();
+        mpiShutdown();
         return 0;
     }
 

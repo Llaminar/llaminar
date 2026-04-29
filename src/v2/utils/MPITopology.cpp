@@ -376,6 +376,12 @@ namespace llaminar2
     {
         if (owns_comms_)
         {
+            // Guard against static destruction after MPI_Finalize
+            int mpi_finalized = 0;
+            MPI_Finalized(&mpi_finalized);
+            if (mpi_finalized)
+                return;
+
             if (intra_node_comm_ != MPI_COMM_NULL)
             {
                 MPI_Comm_free(&intra_node_comm_);
@@ -413,10 +419,15 @@ namespace llaminar2
             // Clean up existing
             if (owns_comms_)
             {
-                if (intra_node_comm_ != MPI_COMM_NULL)
-                    MPI_Comm_free(&intra_node_comm_);
-                if (inter_node_comm_ != MPI_COMM_NULL)
-                    MPI_Comm_free(&inter_node_comm_);
+                int mpi_finalized = 0;
+                MPI_Finalized(&mpi_finalized);
+                if (!mpi_finalized)
+                {
+                    if (intra_node_comm_ != MPI_COMM_NULL)
+                        MPI_Comm_free(&intra_node_comm_);
+                    if (inter_node_comm_ != MPI_COMM_NULL)
+                        MPI_Comm_free(&inter_node_comm_);
+                }
             }
 
             // Move

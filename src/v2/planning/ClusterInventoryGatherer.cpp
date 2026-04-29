@@ -104,19 +104,55 @@ namespace llaminar2
                 }
             }
 
-            // If explicit tp_devices are configured, use those instead (override)
+            // If explicit tp_devices are configured, filter the enumerated list to match
             if (!explicit_tp_devices.empty())
             {
                 LOG_DEBUG("[gatherClusterInventory] Using explicitly configured TP devices (count="
                           << explicit_tp_devices.size() << ")");
+
+                // Map DeviceType → ComputeBackendType for lookup
+                auto toBackendType = [](DeviceType dt) -> ComputeBackendType
+                {
+                    switch (dt)
+                    {
+                    case DeviceType::CUDA:   return ComputeBackendType::GPU_CUDA;
+                    case DeviceType::ROCm:   return ComputeBackendType::GPU_ROCM;
+                    case DeviceType::Vulkan: return ComputeBackendType::GPU_VULKAN;
+                    case DeviceType::Metal:  return ComputeBackendType::GPU_METAL;
+                    default:                 return ComputeBackendType::CPU;
+                    }
+                };
+
                 rank_inv.gpus.clear();
                 for (size_t i = 0; i < explicit_tp_devices.size(); ++i)
                 {
                     const auto &addr = explicit_tp_devices[i];
                     DeviceInfo gpu;
                     gpu.type = addr.device_type;
-                    gpu.local_device_id = static_cast<int>(i);
-                    gpu.memory_bytes = 0; // Unknown without actual enumeration
+                    gpu.local_device_id = addr.device_ordinal;
+
+                    // Look up actual device info from DeviceManager enumeration
+                    int dev_idx = dm.find_device(toBackendType(addr.device_type), addr.device_ordinal);
+                    if (dev_idx >= 0)
+                    {
+                        const auto &dev = devices[static_cast<size_t>(dev_idx)];
+                        gpu.memory_bytes = dev.total_memory_bytes;
+                        gpu.free_memory_bytes = dev.free_memory_bytes;
+                        gpu.name = dev.name;
+                        gpu.numa_node = dev.numa_node;
+                        gpu.compute_capability_major = dev.compute_capability / 10;
+                        gpu.compute_capability_minor = dev.compute_capability % 10;
+                        LOG_DEBUG("[gatherClusterInventory] Explicit TP device " << i << ": "
+                                  << dev.name << " (ordinal=" << addr.device_ordinal
+                                  << ", " << dev.total_memory_bytes / (1024 * 1024) << " MB total, "
+                                  << dev.free_memory_bytes / (1024 * 1024) << " MB free)");
+                    }
+                    else
+                    {
+                        LOG_WARN("[gatherClusterInventory] Explicit TP device " << i
+                                  << " (ordinal=" << addr.device_ordinal
+                                  << ") not found in DeviceManager — memory info unavailable");
+                    }
                     rank_inv.gpus.push_back(gpu);
                 }
             }

@@ -201,6 +201,21 @@ namespace llaminar2
             std::function<bool(const std::string &)> layer_filter = nullptr) override;
 
         /**
+         * @brief Pack GEMM weights via GPU pipeline (LoadOrchestrator)
+         *
+         * Primary GPU weight loading path: single VRAM allocation, pipelined
+         * H2D transfers, and GPU-side VNNI repack kernels. Used unconditionally
+         * for all GPU devices. CPU devices use packGemmWeights() instead.
+         *
+         * @param target_device Target GPU device (ROCm or CUDA)
+         * @param layer_filter Optional filter for specific layers
+         * @return true if all GEMM weights were loaded successfully
+         */
+        bool packGemmWeightsViaPipeline(
+            DeviceId target_device,
+            std::function<bool(const std::string &)> layer_filter = nullptr);
+
+        /**
          * @brief Upload all non-GEMM weights to GPU
          *
          * Non-GEMM weights (norms, embeddings, biases) don't need GEMM packing

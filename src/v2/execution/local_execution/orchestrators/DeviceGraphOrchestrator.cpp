@@ -33,6 +33,7 @@
 #include "../../../backends/BackendManager.h"
 #include "../../../interfaces/IWorkspaceConsumer.h"
 #include "../../moe/MoERebalanceController.h"
+#include "../../../utils/Sampler.h" // LogitPenalty
 #include <chrono>
 #include <algorithm>
 #include <iomanip>
@@ -1882,6 +1883,38 @@ namespace llaminar2
             return -1;
 
         return max_idx;
+    }
+
+    bool DeviceGraphOrchestrator::applyPenaltiesOnDevice(const std::vector<LogitPenalty> &penalties,
+                                                          int vocab_size)
+    {
+        if (penalties.empty())
+            return true; // Nothing to apply, success
+
+        if (!state_.device_id.is_gpu() || !state_.logits)
+            return false;
+
+        IBackend *backend = getBackendFor(state_.device_id);
+        if (!backend)
+            return false;
+
+        void *gpu_ptr = state_.logits->gpu_data_ptr();
+        if (!gpu_ptr)
+            return false;
+
+        // Build SoA arrays for the backend
+        std::vector<int> token_ids(penalties.size());
+        std::vector<float> penalty_values(penalties.size());
+        for (size_t i = 0; i < penalties.size(); ++i)
+        {
+            token_ids[i] = penalties[i].token_id;
+            penalty_values[i] = penalties[i].penalty;
+        }
+
+        return backend->applyLogitPenaltiesF32(
+            gpu_ptr, token_ids.data(), penalty_values.data(),
+            static_cast<int>(penalties.size()), vocab_size,
+            state_.device_id.gpu_ordinal());
     }
 
     // =========================================================================

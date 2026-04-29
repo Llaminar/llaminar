@@ -1615,6 +1615,43 @@ namespace llaminar2::test::parity
         }
 
     protected:
+        /**
+         * @brief Required snapshot version for compatibility.
+         *
+         * Bump this when the snapshot format or V-head reversal semantics change.
+         * Snapshots with a lower version will be automatically regenerated.
+         *   v1: original format (V-head reversal applied to all models)
+         *   v2: MoE-only V-head reversal (dense models skip reversal)
+         */
+        static constexpr int kRequiredSnapshotVersion = 2;
+
+        /**
+         * @brief Read snapshot_version from metadata.txt
+         * @return version number, or 0 if not found (pre-versioning snapshots)
+         */
+        static int readSnapshotVersion(const std::filesystem::path &metadata_path)
+        {
+            std::ifstream f(metadata_path);
+            if (!f.is_open())
+                return 0;
+            std::string line;
+            while (std::getline(f, line))
+            {
+                if (line.rfind("snapshot_version:", 0) == 0)
+                {
+                    try
+                    {
+                        return std::stoi(line.substr(17));
+                    }
+                    catch (...)
+                    {
+                        return 0;
+                    }
+                }
+            }
+            return 0; // Pre-versioning snapshot (no version line)
+        }
+
         ParityConfig config_;
         std::shared_ptr<ModelContext> model_ctx_;
         std::unique_ptr<IInferenceRunner> runner_;
@@ -1819,7 +1856,8 @@ namespace llaminar2::test::parity
             // Regenerate snapshots only on rank 0 to avoid race conditions
             // and redundant work. All ranks wait at barrier before proceeding.
             // OPTIMIZATION: Skip regeneration if snapshots already exist on disk
-            // (metadata.txt is the marker file written by all Python generators).
+            // (metadata.txt is the marker file written by all Python generators)
+            // AND the snapshot version matches the expected version.
             // This is critical for MPI_PROCS>1 tests where popen()/fork() inside
             // an MPI-managed process can crash the HNP event loop.
             if (isRank0())
@@ -1836,8 +1874,19 @@ namespace llaminar2::test::parity
                     auto metadata_path = std::filesystem::path(config_.snapshot_dir) / "metadata.txt";
                     if (std::filesystem::exists(metadata_path))
                     {
-                        LOG_INFO("[" << getBackendName() << " Parity] Found existing snapshots on disk: " << config_.snapshot_dir);
-                        need_regen = false;
+                        int disk_version = readSnapshotVersion(metadata_path);
+                        if (disk_version >= kRequiredSnapshotVersion)
+                        {
+                            LOG_INFO("[" << getBackendName() << " Parity] Found existing v" << disk_version
+                                         << " snapshots on disk: " << config_.snapshot_dir);
+                            need_regen = false;
+                        }
+                        else
+                        {
+                            LOG_WARN("[" << getBackendName() << " Parity] Stale snapshots (v"
+                                         << disk_version << " < required v" << kRequiredSnapshotVersion
+                                         << ") — regenerating: " << config_.snapshot_dir);
+                        }
                     }
                 }
 
@@ -1868,8 +1917,8 @@ namespace llaminar2::test::parity
             mpiBarrier();
 
             // CRITICAL: Clear kernel cache BEFORE destroying model context!
-            // KernelFactory::clearCache() accesses tensor->rocm_cache_ and tensor->cuda_cache_
-            // to free device memory. If we destroy the tensors first (via model_ctx_.reset()),
+            // KernelFactory::clearCache() accesses tensor->cache_ (CPU packed weights)
+            // to free resources. If we destroy the tensors first (via model_ctx_.reset()),
             // clearCache() would be accessing freed memory (use-after-free).
             llaminar::v2::kernels::KernelFactory::clearCache();
 
@@ -2023,36 +2072,46 @@ namespace llaminar2::test::parity
         // GDN V-head permutation for parity comparison
         // =================================================================
         //
-        // Llaminar stores GDN V/Z heads in "ratio-grouped" order:
-        //   [ratio_0 of all groups, ratio_1 of all groups, ...]
-        // PyTorch stores them in "interleaved" order:
-        //   [group_0 all ratios, group_1 all ratios, ...]
+        // V-head ordering context:
         //
-        // With n_k_heads=16, n_v_heads=32: heads_per_group = 2.
-        //   Llaminar: [even_heads_0..15, odd_heads_16..31]
-        //   PyTorch:  [h0, h1, h2, h3, ..., h31] interleaved
+        // GGUF stores V-heads in tiled order for efficient ggml broadcast.
+        // For **dense** Qwen3.5 models, both Llaminar and PyTorch use
+        // GGUF tiled V-head order (the Python GGUF loader skips reversal
+        // for dense models). No comparison-time permutation is needed.
         //
-        // The inverse permutation maps LL ordering → PT ordering:
-        //   inv_perm[pt_head] = ll_head
-        //   where ll_head = (pt_head % heads_per_group) * n_k_heads
-        //                  + (pt_head / heads_per_group)
+        // For **MoE** Qwen3.5 models, the Python GGUF loader reverses
+        // V-head tiling to HF grouped order (the MoE Llaminar GDN
+        // implementation expects grouped V-head order). Comparison-time
+        // permutation maps Llaminar's output (grouped) to PyTorch's
+        // output (also grouped after reversal) — which are already
+        // aligned. However, the QKV_PROJECTION snapshot captures the
+        // raw projection output before GDN processes it, so V-heads
+        // appear in different order between Llaminar (tiled) and
+        // PyTorch (grouped after weight reversal). The permutation
+        // fixes this for comparison.
         //
-        // This applies to the V portion of QKV_PROJECTION, and to
-        // GDN_Z_PROJECTION, GDN_DELTA_RULE_OUTPUT, GDN_NORM_GATE_OUTPUT.
 
         /**
-         * @brief Check if the model has GDN layers with non-trivial head permutation
-         * @return {n_k_heads, n_v_heads, d_state} or {0,0,0} if no permutation needed
+         * @brief GDN head configuration with MoE detection for V-head permutation
+         *
+         * V-head permutation is only needed for MoE models where the Python
+         * GGUF loader applies V-head reversal (tiled→grouped). Dense models
+         * skip reversal, so both sides use tiled order and no permutation
+         * is needed at comparison time.
          */
         struct GDNHeadConfig
         {
             int n_k_heads = 0;
             int n_v_heads = 0;
             int d_state = 0;
+            bool is_moe = false;
 
             bool needsPermutation() const
             {
-                return n_k_heads > 0 && n_v_heads > n_k_heads && d_state > 0;
+                // Only MoE models need comparison-time permutation because
+                // the Python GGUF loader reverses V-head tiling for MoE only.
+                // Dense models skip reversal, so both sides match already.
+                return is_moe && n_k_heads > 0 && n_v_heads > 0 && n_k_heads != n_v_heads;
             }
 
             int headsPerGroup() const
@@ -2086,6 +2145,7 @@ namespace llaminar2::test::parity
             cfg.n_k_heads = getMetaInt("ssm.group_count");
             cfg.n_v_heads = getMetaInt("ssm.time_step_rank");
             cfg.d_state = getMetaInt("ssm.state_size");
+            cfg.is_moe = (getMetaInt("expert_count") > 0);
             return cfg;
         }
 
@@ -4991,8 +5051,8 @@ namespace llaminar2::test::parity
             }
 
             // For cross-rank PP, only the tail rank has valid logits for decode comparison.
-            // Detect by checking if any decode step produced valid metrics.
-            const bool has_logit_data = (summary.steps_passed > 0 || summary.avg_cosine > 0.0f);
+            // Detect by checking if any decode step actually produced metrics (not whether they're good).
+            const bool has_logit_data = !summary.step_stats.empty();
 
             // Render table first (rank 0 only)
             if (isRank0())

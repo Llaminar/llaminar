@@ -564,12 +564,15 @@ namespace llaminar2
         }
 
         // ===== KERNEL-MANAGED DATA SKIP =====
+        // If the tensor has GEMM weights registered in KernelFactory's prepared
+        // GEMM registry, the GPU pipeline has already uploaded the data into pooled
+        // VRAM.  The kernel owns the device copy — skip raw upload.
         if (!tensor->gpu_data_ptr_ && !::llaminar2::isDeviceValid(tensor->coherence_state_) &&
-            target_device.is_gpu() && tensor->hasCachedDeviceData(target_device.type))
+            target_device.is_gpu() && tensor->isInPreparedGemmRegistry())
         {
             LOG_DEBUG("[TransferEngine::uploadFull] Skipping raw upload for tensor "
                       << (tensor->debug_name_.empty() ? "(unnamed)" : tensor->debug_name_)
-                      << " — kernel manages its own device representation");
+                      << " — kernel manages its own device representation (prepared GEMM registry)");
             return TransferResult::ok(TransferMethod::NOOP);
         }
 

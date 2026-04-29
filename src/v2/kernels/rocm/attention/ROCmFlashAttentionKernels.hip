@@ -687,8 +687,13 @@ namespace
         const int lane_id = tid % WAVEFRONT_SIZE;
 
         // GQA mapping: multiple Q heads can share one KV head
+        // When gqa_n_rep > 0, KV heads are REPLICATED (each device has all KV heads),
+        // so use the global head position (head_start + head_idx). When gqa_n_rep == 0,
+        // KV heads are SHARDED (each device has only local_n_kv_heads), so use local indexing.
         const int effective_gqa_ratio = (gqa_n_rep > 0) ? gqa_n_rep : (n_heads / n_kv_heads);
-        const int kv_head_idx = (head_start + head_idx) / effective_gqa_ratio;
+        const int kv_head_idx = (gqa_n_rep > 0)
+            ? (head_start + head_idx) / effective_gqa_ratio
+            : head_idx / effective_gqa_ratio;
 
         // Q row range for this block
         const int q_block_start = q_tile_idx * tile_q;
@@ -1176,7 +1181,9 @@ namespace
         const int batch_idx = blockIdx.z;
 
         const int effective_gqa_ratio = (gqa_n_rep > 0) ? gqa_n_rep : (n_heads / n_kv_heads);
-        const int kv_head_idx = (head_start + head_idx) / effective_gqa_ratio;
+        const int kv_head_idx = (gqa_n_rep > 0)
+            ? (head_start + head_idx) / effective_gqa_ratio
+            : head_idx / effective_gqa_ratio;
 
         // Split range
         const int split_size = (kv_len_runtime + num_splits - 1) / num_splits;
@@ -1913,6 +1920,9 @@ static PrefillPoolState& get_stream_pool(int device_id) {
     auto it = s_stream_pools.find(device_id);
     if (it != s_stream_pools.end()) return it->second;
 
+    // Ensure streams/handles are created on the correct device for multi-GPU TP
+    hipSetDevice(device_id);
+
     auto& state = s_stream_pools[device_id];
     for (int i = 0; i < NUM_PREFILL_STREAMS; i++) {
         hipStreamCreateWithFlags(&state.streams[i].stream, hipStreamNonBlocking);
@@ -2194,6 +2204,8 @@ static float* get_dequant_buffer(int device_id, size_t required_bytes) {
     std::lock_guard<std::mutex> lock(s_dequant_mtx);
     auto& buf = s_dequant_bufs[device_id];
     if (required_bytes > buf.cap) {
+        // Ensure allocation targets the correct device for multi-GPU TP
+        hipSetDevice(device_id);
         if (buf.ptr) hipFree(buf.ptr);
         hipError_t err = hipMalloc(&buf.ptr, required_bytes);
         if (err != hipSuccess) {

@@ -31,6 +31,7 @@
 #include <gtest/gtest.h>
 #include "backends/BackendManager.h"
 #include "backends/IBackend.h"
+#include "utils/Sampler.h"
 
 #include <vector>
 #include <cmath>
@@ -1282,6 +1283,768 @@ namespace
             EXPECT_FLOAT_EQ(values[0], 50.0f) << "Iteration " << iter;
 
             freeDevice(d_ptr);
+        }
+    }
+
+    // =========================================================================
+    //  LOGIT PENALTY TESTS — GPU-side penalty application + sampling
+    // =========================================================================
+
+    // ------------------------------------------------------------------
+    // Helper: download GPU logits back to host for verification
+    // ------------------------------------------------------------------
+    static std::vector<float> downloadLogits(IBackend *backend, void *d_ptr,
+                                             int count, int device_id)
+    {
+        std::vector<float> result(count);
+        bool ok = backend->deviceToHost(result.data(), d_ptr,
+                                        count * sizeof(float), device_id);
+        EXPECT_TRUE(ok) << "D2H transfer failed";
+        return result;
+    }
+
+    TEST_P(GPUSamplingTest, Penalty_SingleToken_Subtracted)
+    {
+        // Apply a penalty to token 2 and verify logit is reduced
+        std::vector<float> logits = {1.0f, 2.0f, 5.0f, 0.5f, 1.5f};
+        void *d_ptr = uploadLogits(logits);
+        ASSERT_NE(d_ptr, nullptr);
+
+        std::vector<int> token_ids = {2};
+        std::vector<float> penalties = {3.0f};
+
+        bool ok = backend_->applyLogitPenaltiesF32(
+            d_ptr, token_ids.data(), penalties.data(),
+            1, static_cast<int>(logits.size()), device_id_);
+        ASSERT_TRUE(ok) << "applyLogitPenaltiesF32 not supported on " << GetParam();
+
+        auto result = downloadLogits(backend_, d_ptr,
+                                     static_cast<int>(logits.size()), device_id_);
+
+        // Token 2: 5.0 - 3.0 = 2.0
+        EXPECT_FLOAT_EQ(result[0], 1.0f) << "Unpenalized tokens should be unchanged";
+        EXPECT_FLOAT_EQ(result[1], 2.0f) << "Unpenalized tokens should be unchanged";
+        EXPECT_FLOAT_EQ(result[2], 2.0f) << "Token 2 should be penalized: 5.0 - 3.0 = 2.0";
+        EXPECT_FLOAT_EQ(result[3], 0.5f) << "Unpenalized tokens should be unchanged";
+        EXPECT_FLOAT_EQ(result[4], 1.5f) << "Unpenalized tokens should be unchanged";
+
+        freeDevice(d_ptr);
+    }
+
+    TEST_P(GPUSamplingTest, Penalty_MultipleTokens_AllSubtracted)
+    {
+        std::vector<float> logits = {10.0f, 20.0f, 30.0f, 40.0f, 50.0f};
+        void *d_ptr = uploadLogits(logits);
+        ASSERT_NE(d_ptr, nullptr);
+
+        std::vector<int> token_ids = {0, 2, 4};
+        std::vector<float> penalties = {1.0f, 5.0f, 10.0f};
+
+        bool ok = backend_->applyLogitPenaltiesF32(
+            d_ptr, token_ids.data(), penalties.data(),
+            3, static_cast<int>(logits.size()), device_id_);
+        ASSERT_TRUE(ok);
+
+        auto result = downloadLogits(backend_, d_ptr,
+                                     static_cast<int>(logits.size()), device_id_);
+
+        EXPECT_FLOAT_EQ(result[0], 9.0f);  // 10 - 1
+        EXPECT_FLOAT_EQ(result[1], 20.0f); // unchanged
+        EXPECT_FLOAT_EQ(result[2], 25.0f); // 30 - 5
+        EXPECT_FLOAT_EQ(result[3], 40.0f); // unchanged
+        EXPECT_FLOAT_EQ(result[4], 40.0f); // 50 - 10
+
+        freeDevice(d_ptr);
+    }
+
+    TEST_P(GPUSamplingTest, Penalty_ZeroPenalties_NoOp)
+    {
+        // Empty penalty list — backends return false (no-op, nothing to do)
+        // The caller (OrchestrationRunner) skips the call when the map is empty,
+        // so this documents the backend contract rather than a usage pattern.
+        std::vector<float> logits = {1.0f, 2.0f, 3.0f};
+        void *d_ptr = uploadLogits(logits);
+        ASSERT_NE(d_ptr, nullptr);
+
+        bool ok = backend_->applyLogitPenaltiesF32(
+            d_ptr, nullptr, nullptr, 0,
+            static_cast<int>(logits.size()), device_id_);
+        // Backends early-return false for num_penalties <= 0
+        EXPECT_FALSE(ok) << "Zero penalties → backend returns false (no-op)";
+
+        // Logits should still be unchanged
+        auto result = downloadLogits(backend_, d_ptr,
+                                     static_cast<int>(logits.size()), device_id_);
+        EXPECT_FLOAT_EQ(result[0], 1.0f);
+        EXPECT_FLOAT_EQ(result[1], 2.0f);
+        EXPECT_FLOAT_EQ(result[2], 3.0f);
+
+        freeDevice(d_ptr);
+    }
+
+    TEST_P(GPUSamplingTest, Penalty_OutOfBoundsTokenId_Ignored)
+    {
+        // Token IDs outside [0, vocab_size) should be silently ignored
+        std::vector<float> logits = {5.0f, 5.0f, 5.0f};
+        void *d_ptr = uploadLogits(logits);
+        ASSERT_NE(d_ptr, nullptr);
+
+        std::vector<int> token_ids = {-1, 999, 1}; // -1 and 999 are OOB for vocab=3
+        std::vector<float> penalties = {100.0f, 100.0f, 2.0f};
+
+        bool ok = backend_->applyLogitPenaltiesF32(
+            d_ptr, token_ids.data(), penalties.data(),
+            3, static_cast<int>(logits.size()), device_id_);
+        ASSERT_TRUE(ok);
+
+        auto result = downloadLogits(backend_, d_ptr,
+                                     static_cast<int>(logits.size()), device_id_);
+
+        EXPECT_FLOAT_EQ(result[0], 5.0f) << "OOB tokens should not corrupt logits";
+        EXPECT_FLOAT_EQ(result[1], 3.0f) << "Valid token should be penalized: 5.0 - 2.0";
+        EXPECT_FLOAT_EQ(result[2], 5.0f) << "OOB tokens should not corrupt logits";
+
+        freeDevice(d_ptr);
+    }
+
+    TEST_P(GPUSamplingTest, Penalty_NegativePenalty_BoostsLogit)
+    {
+        // Negative penalty = boost (used for negative presence penalty)
+        std::vector<float> logits = {0.0f, 0.0f, 0.0f};
+        void *d_ptr = uploadLogits(logits);
+        ASSERT_NE(d_ptr, nullptr);
+
+        std::vector<int> token_ids = {1};
+        std::vector<float> penalties = {-5.0f}; // Boost by 5
+
+        bool ok = backend_->applyLogitPenaltiesF32(
+            d_ptr, token_ids.data(), penalties.data(),
+            1, static_cast<int>(logits.size()), device_id_);
+        ASSERT_TRUE(ok);
+
+        auto result = downloadLogits(backend_, d_ptr,
+                                     static_cast<int>(logits.size()), device_id_);
+
+        EXPECT_FLOAT_EQ(result[0], 0.0f);
+        EXPECT_FLOAT_EQ(result[1], 5.0f) << "Negative penalty should boost: 0.0 - (-5.0) = 5.0";
+        EXPECT_FLOAT_EQ(result[2], 0.0f);
+
+        freeDevice(d_ptr);
+    }
+
+    TEST_P(GPUSamplingTest, Penalty_ThenArgmax_ChangesSelection)
+    {
+        // End-to-end: penalty shifts argmax from token 0 to token 1
+        std::vector<float> logits = {10.0f, 9.5f, 1.0f, 1.0f, 1.0f};
+        void *d_ptr = uploadLogits(logits);
+        ASSERT_NE(d_ptr, nullptr);
+
+        // Verify initial argmax is token 0
+        float val = 0;
+        int idx = -1;
+        backend_->argmaxF32(d_ptr, static_cast<int>(logits.size()),
+                            device_id_, &val, &idx);
+        EXPECT_EQ(idx, 0) << "Before penalty, argmax should be token 0";
+
+        // Penalize token 0 enough to make token 1 win
+        std::vector<int> token_ids = {0};
+        std::vector<float> penalties = {2.0f}; // 10.0 - 2.0 = 8.0 < 9.5
+
+        bool ok = backend_->applyLogitPenaltiesF32(
+            d_ptr, token_ids.data(), penalties.data(),
+            1, static_cast<int>(logits.size()), device_id_);
+        ASSERT_TRUE(ok);
+
+        // After penalty, argmax should shift to token 1
+        backend_->argmaxF32(d_ptr, static_cast<int>(logits.size()),
+                            device_id_, &val, &idx);
+        EXPECT_EQ(idx, 1) << "After penalty, argmax should shift to token 1 (9.5 > 8.0)";
+        EXPECT_FLOAT_EQ(val, 9.5f);
+
+        freeDevice(d_ptr);
+    }
+
+    TEST_P(GPUSamplingTest, Penalty_LargeVocab_SparseApplication)
+    {
+        // Real-world: Qwen2 vocab (151936) with sparse penalties
+        const int vocab_size = 151936;
+        std::vector<float> logits(vocab_size, 0.0f);
+        logits[0] = 10.0f;
+        logits[42] = 9.0f;
+        logits[1000] = 8.0f;
+
+        void *d_ptr = uploadLogits(logits);
+        ASSERT_NE(d_ptr, nullptr);
+
+        // Penalize only 3 tokens out of 151K
+        std::vector<int> token_ids = {0, 42, 1000};
+        std::vector<float> penalties = {5.0f, 1.0f, 0.5f};
+
+        bool ok = backend_->applyLogitPenaltiesF32(
+            d_ptr, token_ids.data(), penalties.data(),
+            3, vocab_size, device_id_);
+        ASSERT_TRUE(ok);
+
+        // Verify via argmax — token 42 should now win (9.0 - 1.0 = 8.0 > 10.0 - 5.0 = 5.0)
+        // token 1000: 8.0 - 0.5 = 7.5
+        float val = 0;
+        int idx = -1;
+        backend_->argmaxF32(d_ptr, vocab_size, device_id_, &val, &idx);
+        EXPECT_EQ(idx, 42) << "After penalties, token 42 (8.0) should beat token 0 (5.0)";
+
+        freeDevice(d_ptr);
+    }
+
+    TEST_P(GPUSamplingTest, Penalty_ManyPenalties_AllApplied)
+    {
+        // Stress test: apply 256 penalties
+        const int vocab_size = 1000;
+        std::vector<float> logits(vocab_size, 1.0f);
+        void *d_ptr = uploadLogits(logits);
+        ASSERT_NE(d_ptr, nullptr);
+
+        const int num_penalties = 256;
+        std::vector<int> token_ids(num_penalties);
+        std::vector<float> penalties(num_penalties);
+        for (int i = 0; i < num_penalties; ++i)
+        {
+            token_ids[i] = i;
+            penalties[i] = 0.5f;
+        }
+
+        bool ok = backend_->applyLogitPenaltiesF32(
+            d_ptr, token_ids.data(), penalties.data(),
+            num_penalties, vocab_size, device_id_);
+        ASSERT_TRUE(ok);
+
+        auto result = downloadLogits(backend_, d_ptr, vocab_size, device_id_);
+
+        // First 256 tokens should be 0.5, rest should be 1.0
+        for (int i = 0; i < num_penalties; ++i)
+        {
+            EXPECT_FLOAT_EQ(result[i], 0.5f)
+                << "Token " << i << " should be penalized: 1.0 - 0.5 = 0.5";
+        }
+        for (int i = num_penalties; i < vocab_size; ++i)
+        {
+            EXPECT_FLOAT_EQ(result[i], 1.0f)
+                << "Token " << i << " should be unchanged";
+        }
+
+        freeDevice(d_ptr);
+    }
+
+    TEST_P(GPUSamplingTest, Penalty_DRYStyle_ExponentialPenalty)
+    {
+        // Simulate DRY-style exponential penalty: multiple tokens with varying
+        // penalty magnitudes that reflect repeat_len differences
+        const int vocab_size = 10;
+        std::vector<float> logits = {10.0f, 10.0f, 10.0f, 10.0f, 10.0f,
+                                     10.0f, 10.0f, 10.0f, 10.0f, 10.0f};
+        void *d_ptr = uploadLogits(logits);
+        ASSERT_NE(d_ptr, nullptr);
+
+        // DRY penalties: multiplier=1.0, base=1.75
+        // repeat_len=3, allowed=1 → 1.75^2 = 3.0625
+        // repeat_len=5, allowed=1 → 1.75^4 = 9.3789
+        float dry_3 = std::pow(1.75f, 2.0f);
+        float dry_5 = std::pow(1.75f, 4.0f);
+
+        std::vector<int> token_ids = {2, 7};
+        std::vector<float> penalties = {dry_3, dry_5};
+
+        bool ok = backend_->applyLogitPenaltiesF32(
+            d_ptr, token_ids.data(), penalties.data(),
+            2, vocab_size, device_id_);
+        ASSERT_TRUE(ok);
+
+        auto result = downloadLogits(backend_, d_ptr, vocab_size, device_id_);
+
+        EXPECT_NEAR(result[2], 10.0f - dry_3, 0.001f)
+            << "Token 2 should have DRY penalty for repeat_len=3";
+        EXPECT_NEAR(result[7], 10.0f - dry_5, 0.001f)
+            << "Token 7 should have larger DRY penalty for repeat_len=5";
+
+        // Unpenalized tokens should be unchanged
+        EXPECT_FLOAT_EQ(result[0], 10.0f);
+        EXPECT_FLOAT_EQ(result[5], 10.0f);
+
+        freeDevice(d_ptr);
+    }
+
+    TEST_P(GPUSamplingTest, Penalty_CombinedWithTopK_ChangesRanking)
+    {
+        // End-to-end: penalty → topK should reflect penalized logits
+        std::vector<float> logits = {10.0f, 9.0f, 8.0f, 7.0f, 6.0f};
+        void *d_ptr = uploadLogits(logits);
+        ASSERT_NE(d_ptr, nullptr);
+
+        // Penalize top-2 tokens heavily
+        std::vector<int> token_ids = {0, 1};
+        std::vector<float> penalties = {8.0f, 7.0f}; // 10→2, 9→2
+
+        bool ok = backend_->applyLogitPenaltiesF32(
+            d_ptr, token_ids.data(), penalties.data(),
+            2, static_cast<int>(logits.size()), device_id_);
+        ASSERT_TRUE(ok);
+
+        // topK=3: should now be [2(8.0), 3(7.0), 4(6.0)] instead of [0,1,2]
+        std::vector<float> values(3);
+        std::vector<int> indices(3);
+        ok = backend_->topKF32(d_ptr, static_cast<int>(logits.size()),
+                               3, device_id_, values.data(), indices.data());
+        ASSERT_TRUE(ok);
+
+        EXPECT_EQ(indices[0], 2) << "After penalty, token 2 (8.0) should be top-1";
+        EXPECT_FLOAT_EQ(values[0], 8.0f);
+        EXPECT_EQ(indices[1], 3) << "Token 3 (7.0) should be top-2";
+        EXPECT_EQ(indices[2], 4) << "Token 4 (6.0) should be top-3";
+
+        freeDevice(d_ptr);
+    }
+
+    // =========================================================================
+    //  DRY PENALTY CPU↔GPU PARITY TESTS
+    //
+    //  These tests compute DRY penalties via the CPU Sampler, then apply them
+    //  to identical logit arrays on both CPU and GPU, verifying bit-exact
+    //  parity. This validates the full DRY pipeline: CPU computes the sparse
+    //  penalty map → GPU applies it in-place → results match CPU application.
+    // =========================================================================
+
+    // Helper: apply CPU penalties in-place (same as Sampler::apply_penalties)
+    static void applyCpuPenalties(std::vector<float> &logits,
+                                  const std::vector<LogitPenalty> &penalties)
+    {
+        for (const auto &entry : penalties)
+            logits[entry.token_id] -= entry.penalty;
+    }
+
+    // Helper: apply GPU penalties, download result
+    static std::vector<float> applyGpuPenalties(
+        IBackend *backend, int device_id,
+        const std::vector<float> &logits,
+        const std::vector<LogitPenalty> &penalties)
+    {
+        size_t bytes = logits.size() * sizeof(float);
+        void *d_ptr = backend->allocate(bytes, device_id);
+        EXPECT_NE(d_ptr, nullptr);
+        bool ok = backend->hostToDevice(d_ptr, logits.data(), bytes, device_id);
+        EXPECT_TRUE(ok);
+
+        if (!penalties.empty())
+        {
+            // Convert AoS → SoA
+            std::vector<int> token_ids(penalties.size());
+            std::vector<float> penalty_vals(penalties.size());
+            for (size_t i = 0; i < penalties.size(); ++i)
+            {
+                token_ids[i] = penalties[i].token_id;
+                penalty_vals[i] = penalties[i].penalty;
+            }
+
+            ok = backend->applyLogitPenaltiesF32(
+                d_ptr, token_ids.data(), penalty_vals.data(),
+                static_cast<int>(penalties.size()),
+                static_cast<int>(logits.size()), device_id);
+            EXPECT_TRUE(ok);
+        }
+
+        auto result = downloadLogits(backend, d_ptr,
+                                     static_cast<int>(logits.size()), device_id);
+        backend->free(d_ptr, device_id);
+        return result;
+    }
+
+    TEST_P(GPUSamplingTest, DRYParity_SimpleRepeat)
+    {
+        // History: [A, B, C, A, B, C] — "A B C" repeated
+        // DRY should penalize token A (extending the repeat)
+        const int vocab_size = 100;
+        const int A = 10, B = 20, C = 30;
+
+        Sampler sampler(42);
+        for (int token : {A, B, C, A, B, C})
+            sampler.record_token(token);
+
+        SamplingParams params;
+        params.dry_multiplier = 1.0f;
+        params.dry_base = 1.75f;
+        params.dry_allowed_length = 1;
+        params.dry_penalty_last_n = -1;
+
+        auto penalties = sampler.compute_penalty_map(params, vocab_size);
+        ASSERT_FALSE(penalties.empty()) << "DRY should produce penalties for repeated pattern";
+
+        // Identical logits for CPU and GPU
+        std::vector<float> logits(vocab_size, 5.0f);
+
+        auto cpu_result = logits;
+        applyCpuPenalties(cpu_result, penalties);
+
+        auto gpu_result = applyGpuPenalties(backend_, device_id_, logits, penalties);
+
+        for (int i = 0; i < vocab_size; ++i)
+        {
+            EXPECT_FLOAT_EQ(cpu_result[i], gpu_result[i])
+                << "CPU↔GPU mismatch at token " << i;
+        }
+    }
+
+    TEST_P(GPUSamplingTest, DRYParity_ExponentialScaling)
+    {
+        // History: [A, B, C, D, A, B, C, D] — repeat of length 4
+        // Produces penalty = 2.0 * 1.75^(4-1) = 10.72 on token A
+        const int vocab_size = 100;
+        const int A = 10, B = 20, C = 30, D = 40;
+
+        Sampler sampler(42);
+        for (int token : {A, B, C, D, A, B, C, D})
+            sampler.record_token(token);
+
+        SamplingParams params;
+        params.dry_multiplier = 2.0f;
+        params.dry_base = 1.75f;
+        params.dry_allowed_length = 1;
+        params.dry_penalty_last_n = -1;
+
+        auto penalties = sampler.compute_penalty_map(params, vocab_size);
+        ASSERT_FALSE(penalties.empty());
+
+        std::vector<float> logits(vocab_size, 10.0f);
+
+        auto cpu_result = logits;
+        applyCpuPenalties(cpu_result, penalties);
+
+        auto gpu_result = applyGpuPenalties(backend_, device_id_, logits, penalties);
+
+        for (int i = 0; i < vocab_size; ++i)
+        {
+            EXPECT_FLOAT_EQ(cpu_result[i], gpu_result[i])
+                << "CPU↔GPU mismatch at token " << i;
+        }
+
+        // Sanity: token A should have the expected exponential penalty
+        float expected_penalty = 2.0f * std::pow(1.75f, 3.0f);
+        EXPECT_NEAR(gpu_result[A], 10.0f - expected_penalty, 0.01f);
+    }
+
+    TEST_P(GPUSamplingTest, DRYParity_CombinedWithPresenceFrequency)
+    {
+        // DRY + presence + frequency penalties all combined
+        const int vocab_size = 100;
+        const int A = 10;
+
+        Sampler sampler(42);
+        for (int i = 0; i < 4; ++i)
+            sampler.record_token(A);
+
+        SamplingParams params;
+        params.presence_penalty = 1.0f;
+        params.frequency_penalty = 0.5f;
+        params.dry_multiplier = 1.0f;
+        params.dry_base = 1.75f;
+        params.dry_allowed_length = 0;
+        params.dry_penalty_last_n = -1;
+
+        auto penalties = sampler.compute_penalty_map(params, vocab_size);
+        ASSERT_FALSE(penalties.empty());
+
+        std::vector<float> logits(vocab_size, 5.0f);
+
+        auto cpu_result = logits;
+        applyCpuPenalties(cpu_result, penalties);
+
+        auto gpu_result = applyGpuPenalties(backend_, device_id_, logits, penalties);
+
+        for (int i = 0; i < vocab_size; ++i)
+        {
+            EXPECT_FLOAT_EQ(cpu_result[i], gpu_result[i])
+                << "CPU↔GPU mismatch at token " << i;
+        }
+
+        // Verify the combined penalty is additive (pres+freq + DRY)
+        float pf_penalty = 1.0f + 0.5f * 4.0f; // 3.0
+        EXPECT_GT(5.0f - gpu_result[A], pf_penalty)
+            << "Combined penalty should exceed presence+frequency alone";
+    }
+
+    TEST_P(GPUSamplingTest, DRYParity_SequenceBreakers)
+    {
+        // History with a breaker in the middle — should NOT penalize across it
+        const int vocab_size = 100;
+        const int A = 10, NEWLINE = 50;
+
+        Sampler sampler(42);
+        sampler.initDryBreakers({"\n"}, [&](const std::string &) -> std::vector<int> {
+            return {NEWLINE};
+        });
+        for (int token : {A, NEWLINE, A})
+            sampler.record_token(token);
+
+        SamplingParams params;
+        params.dry_multiplier = 1.0f;
+        params.dry_allowed_length = 1;
+        params.dry_penalty_last_n = -1;
+
+        auto penalties = sampler.compute_penalty_map(params, vocab_size);
+
+        // With breaker, A should not be penalized — penalty map may be empty
+        std::vector<float> logits(vocab_size, 5.0f);
+
+        auto cpu_result = logits;
+        applyCpuPenalties(cpu_result, penalties);
+
+        auto gpu_result = applyGpuPenalties(backend_, device_id_, logits, penalties);
+
+        for (int i = 0; i < vocab_size; ++i)
+        {
+            EXPECT_FLOAT_EQ(cpu_result[i], gpu_result[i])
+                << "CPU↔GPU mismatch at token " << i;
+        }
+
+        // Token A should be unpenalized (breaker prevents detection)
+        EXPECT_FLOAT_EQ(gpu_result[A], 5.0f)
+            << "Sequence breaker should prevent DRY penalty on token A";
+    }
+
+    TEST_P(GPUSamplingTest, DRYParity_SingleTokenBreakerExemption)
+    {
+        // Token that is itself a single-token breaker should be exempt
+        const int vocab_size = 100;
+        const int A = 10, NEWLINE = 50;
+
+        Sampler sampler(42);
+        sampler.initDryBreakers({"\n"}, [&](const std::string &) -> std::vector<int> {
+            return {NEWLINE};
+        });
+        // NEWLINE A NEWLINE A NEWLINE — repeat pattern, but NEWLINE is a breaker
+        for (int token : {NEWLINE, A, NEWLINE, A, NEWLINE})
+            sampler.record_token(token);
+
+        SamplingParams params;
+        params.dry_multiplier = 1.0f;
+        params.dry_allowed_length = 0;
+        params.dry_penalty_last_n = -1;
+
+        auto penalties = sampler.compute_penalty_map(params, vocab_size);
+
+        std::vector<float> logits(vocab_size, 5.0f);
+
+        auto cpu_result = logits;
+        applyCpuPenalties(cpu_result, penalties);
+
+        auto gpu_result = applyGpuPenalties(backend_, device_id_, logits, penalties);
+
+        for (int i = 0; i < vocab_size; ++i)
+        {
+            EXPECT_FLOAT_EQ(cpu_result[i], gpu_result[i])
+                << "CPU↔GPU mismatch at token " << i;
+        }
+
+        // NEWLINE should be exempt (single-token breaker)
+        EXPECT_FLOAT_EQ(gpu_result[NEWLINE], 5.0f)
+            << "Single-token breaker should be exempt from DRY penalty";
+    }
+
+    TEST_P(GPUSamplingTest, DRYParity_OverflowProtection)
+    {
+        // Large repeat count with base=2.0 — should not overflow to inf
+        const int vocab_size = 100;
+        const int A = 10;
+
+        Sampler sampler(42);
+        for (int i = 0; i < 50; ++i)
+            sampler.record_token(A);
+
+        SamplingParams params;
+        params.dry_multiplier = 1.0f;
+        params.dry_base = 2.0f;
+        params.dry_allowed_length = 0;
+        params.dry_penalty_last_n = -1;
+
+        auto penalties = sampler.compute_penalty_map(params, vocab_size);
+        ASSERT_FALSE(penalties.empty());
+
+        // Verify no overflow in CPU computation
+        for (const auto &p : penalties)
+        {
+            EXPECT_FALSE(std::isinf(p.penalty)) << "CPU penalty should not overflow";
+            EXPECT_FALSE(std::isnan(p.penalty)) << "CPU penalty should not be NaN";
+        }
+
+        std::vector<float> logits(vocab_size, 100.0f);
+
+        auto cpu_result = logits;
+        applyCpuPenalties(cpu_result, penalties);
+
+        auto gpu_result = applyGpuPenalties(backend_, device_id_, logits, penalties);
+
+        for (int i = 0; i < vocab_size; ++i)
+        {
+            EXPECT_FLOAT_EQ(cpu_result[i], gpu_result[i])
+                << "CPU↔GPU mismatch at token " << i;
+        }
+    }
+
+    TEST_P(GPUSamplingTest, DRYParity_WindowLimitsDetection)
+    {
+        // With a small window, long repeats outside the window should not be detected
+        const int vocab_size = 100;
+
+        Sampler sampler(42);
+        for (int token : {1, 2, 3, 4, 5, 1, 2, 3, 4, 5})
+            sampler.record_token(token);
+
+        SamplingParams params;
+        params.dry_multiplier = 1.0f;
+        params.dry_allowed_length = 0;
+        params.dry_penalty_last_n = 3; // Only see last 3 tokens
+
+        auto penalties = sampler.compute_penalty_map(params, vocab_size);
+
+        std::vector<float> logits(vocab_size, 5.0f);
+
+        auto cpu_result = logits;
+        applyCpuPenalties(cpu_result, penalties);
+
+        auto gpu_result = applyGpuPenalties(backend_, device_id_, logits, penalties);
+
+        for (int i = 0; i < vocab_size; ++i)
+        {
+            EXPECT_FLOAT_EQ(cpu_result[i], gpu_result[i])
+                << "CPU↔GPU mismatch at token " << i;
+        }
+
+        // With only 3-token window, cannot detect the full 5-length repeat
+        float full_penalty = std::pow(1.75f, 4.0f);
+        for (const auto &p : penalties)
+        {
+            EXPECT_LT(p.penalty, full_penalty)
+                << "Window should prevent detection of full repeat";
+        }
+    }
+
+    TEST_P(GPUSamplingTest, DRYParity_ArgmaxShift)
+    {
+        // End-to-end: DRY penalty shifts GPU argmax to match CPU argmax
+        const int vocab_size = 10;
+
+        Sampler sampler(42);
+        // Token 5 and 7 alternate — so token 5 would extend the repeat
+        for (int token : {5, 7, 5, 7})
+            sampler.record_token(token);
+
+        SamplingParams params;
+        params.dry_multiplier = 5.0f;
+        params.dry_base = 1.75f;
+        params.dry_allowed_length = 0;
+        params.dry_penalty_last_n = -1;
+
+        auto penalties = sampler.compute_penalty_map(params, vocab_size);
+        ASSERT_FALSE(penalties.empty());
+
+        // Token 5 has highest logit but will be penalized by DRY
+        std::vector<float> logits = {0.0f, 0.0f, 0.0f, 9.5f, 0.0f,
+                                     10.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+
+        // CPU: apply penalties and find argmax
+        auto cpu_logits = logits;
+        applyCpuPenalties(cpu_logits, penalties);
+        int cpu_argmax = static_cast<int>(
+            std::max_element(cpu_logits.begin(), cpu_logits.end()) - cpu_logits.begin());
+
+        // GPU: apply penalties and find argmax
+        void *d_ptr = uploadLogits(logits);
+        ASSERT_NE(d_ptr, nullptr);
+
+        std::vector<int> token_ids(penalties.size());
+        std::vector<float> penalty_vals(penalties.size());
+        for (size_t i = 0; i < penalties.size(); ++i)
+        {
+            token_ids[i] = penalties[i].token_id;
+            penalty_vals[i] = penalties[i].penalty;
+        }
+
+        bool ok = backend_->applyLogitPenaltiesF32(
+            d_ptr, token_ids.data(), penalty_vals.data(),
+            static_cast<int>(penalties.size()), vocab_size, device_id_);
+        ASSERT_TRUE(ok);
+
+        float gpu_val = 0;
+        int gpu_argmax = -1;
+        ok = backend_->argmaxF32(d_ptr, vocab_size, device_id_, &gpu_val, &gpu_argmax);
+        ASSERT_TRUE(ok);
+
+        EXPECT_EQ(gpu_argmax, cpu_argmax)
+            << "GPU argmax should match CPU argmax after DRY penalties";
+        EXPECT_EQ(gpu_argmax, 3)
+            << "Token 3 (9.5) should win after token 5 is penalized by DRY";
+
+        freeDevice(d_ptr);
+    }
+
+    TEST_P(GPUSamplingTest, DRYParity_LargeVocab_RealisticScenario)
+    {
+        // Realistic scenario: Qwen2 vocab size, natural-looking token history
+        const int vocab_size = 151936;
+        std::mt19937 rng(12345);
+
+        Sampler sampler(42);
+        // Simulate a conversation with some repetitive patterns
+        std::vector<int> history = {
+            100, 200, 300, 400, 500,   // unique intro
+            100, 200, 300, 400, 500,   // exact repeat
+            600, 700, 800,             // break
+            100, 200, 300, 400, 500,   // another repeat
+            900, 1000                  // end
+        };
+        for (int token : history)
+            sampler.record_token(token);
+
+        SamplingParams params;
+        params.dry_multiplier = 1.5f;
+        params.dry_base = 1.75f;
+        params.dry_allowed_length = 2;
+        params.dry_penalty_last_n = -1;
+        params.presence_penalty = 0.5f;
+        params.frequency_penalty = 0.3f;
+
+        auto penalties = sampler.compute_penalty_map(params, vocab_size);
+        ASSERT_FALSE(penalties.empty());
+
+        // Generate logits with some structure
+        std::vector<float> logits(vocab_size);
+        std::uniform_real_distribution<float> dist(-5.0f, 15.0f);
+        for (auto &l : logits)
+            l = dist(rng);
+
+        auto cpu_result = logits;
+        applyCpuPenalties(cpu_result, penalties);
+
+        auto gpu_result = applyGpuPenalties(backend_, device_id_, logits, penalties);
+
+        // Spot-check penalized tokens
+        for (const auto &p : penalties)
+        {
+            EXPECT_FLOAT_EQ(cpu_result[p.token_id], gpu_result[p.token_id])
+                << "CPU↔GPU mismatch at penalized token " << p.token_id;
+        }
+
+        // Spot-check unpenalized tokens
+        std::set<int> penalized_ids;
+        for (const auto &p : penalties)
+            penalized_ids.insert(p.token_id);
+
+        int checked = 0;
+        for (int i = 0; i < vocab_size && checked < 100; ++i)
+        {
+            if (penalized_ids.find(i) == penalized_ids.end())
+            {
+                EXPECT_FLOAT_EQ(cpu_result[i], gpu_result[i])
+                    << "Unpenalized token " << i << " should be unchanged";
+                checked++;
+            }
         }
     }
 

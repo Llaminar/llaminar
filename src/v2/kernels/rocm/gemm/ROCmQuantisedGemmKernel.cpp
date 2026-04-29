@@ -1077,10 +1077,10 @@ namespace llaminar2
          * The dispatch policy is:
          *   - ≤6-bit weights (has_native_vnni) → NATIVE_VNNI
          *   - 8-bit weights (d_weights_int8_vnni) → INT8_VNNI_NATIVE
-         *   - LLAMINAR_ROCM_FORCE_CK=1 override  → CK_FALLBACK
+         *   - Otherwise → UNSUPPORTED (no viable path)
          *
-         * CK_FALLBACK is only reachable via the debug env override or if impl_ is
-         * missing / dimensions are invalid.
+         * UNSUPPORTED is returned when impl_ is missing, dimensions are invalid,
+         * or no VNNI weights are available.
          */
         ROCmQuantisedGemmKernel::PrefillDispatchPath ROCmQuantisedGemmKernel::selectPrefillDispatchPath(int m, int n, int k) const
         {
@@ -1088,17 +1088,15 @@ namespace llaminar2
 
             if (m <= 1 || k <= 0 || (k % 4) != 0)
             {
-                return PrefillDispatchPath::CK_FALLBACK;
+                return PrefillDispatchPath::UNSUPPORTED;
             }
 
             if (!impl_)
             {
-                return PrefillDispatchPath::CK_FALLBACK;
+                return PrefillDispatchPath::UNSUPPORTED;
             }
 
-            // CK path retired: LLAMINAR_ROCM_FORCE_CK is silently ignored.
-            // The CK workspace buffers are no longer allocated, so forcing CK
-            // would only hit an unreachable code path.
+            // CK path retired. No fallback path available.
 
             // ≤6-bit formats use native-VNNI (lossless decode, FP16 block scales)
             if (impl_->has_native_vnni)
@@ -1112,7 +1110,11 @@ namespace llaminar2
                 return PrefillDispatchPath::INT8_VNNI_NATIVE;
             }
 
-            return PrefillDispatchPath::CK_FALLBACK;
+            LOG_WARN("[ROCmQuantisedGemmKernel] No viable prefill dispatch path:"
+                     " has_native_vnni=" << impl_->has_native_vnni
+                     << " d_weights_int8_vnni=" << (const void *)impl_->d_weights_int8_vnni
+                     << " M=" << m << " N=" << n << " K=" << k);
+            return PrefillDispatchPath::UNSUPPORTED;
         }
 
         /**
@@ -1145,9 +1147,9 @@ namespace llaminar2
                     return "native_vnni";
                 case PrefillDispatchPath::INT8_VNNI_NATIVE:
                     return "int8_vnni_native";
-                case PrefillDispatchPath::CK_FALLBACK:
+                case PrefillDispatchPath::UNSUPPORTED:
                 default:
-                    return "ck_fallback";
+                    return "unsupported";
                 }
             };
 
@@ -1210,16 +1212,29 @@ namespace llaminar2
                     selected_once = &missing_buffers_once;
                 }
 
-                record_path_selected(PrefillDispatchPath::CK_FALLBACK);
+                record_path_selected(PrefillDispatchPath::UNSUPPORTED);
                 record_fallback_reason(reason);
 
                 std::call_once(*selected_once, [&]()
-                               { LOG_INFO("[" << callsite << "] Native prefill path falling back to CK (reason="
+                               { LOG_WARN("[" << callsite << "] Prefill GEMM unavailable (reason="
                                               << reason << ")"); });
             };
 
-            if (!impl_ || !d_A_int8 || !d_output || !d_scales_A || !d_scales_B || !effective_scratch_int32)
+            // Native-VNNI path uses impl_->d_weights_native_scales (not d_scales_B),
+            // so d_scales_B may be null when only native-VNNI weights are present
+            // (e.g. weights loaded via GPU pipeline / MoE batch constructor).
+            const bool native_vnni_available = impl_ && impl_->has_native_vnni;
+            if (!impl_ || !d_A_int8 || !d_output || !d_scales_A || !effective_scratch_int32 ||
+                (!d_scales_B && !native_vnni_available))
             {
+                LOG_WARN("[" << callsite << "] Prefill GEMM null pointer diagnostic:"
+                         " impl=" << (const void *)impl_.get()
+                         << " d_A_int8=" << (const void *)d_A_int8
+                         << " d_output=" << (const void *)d_output
+                         << " d_scales_A=" << (const void *)d_scales_A
+                         << " d_scales_B=" << (const void *)d_scales_B
+                         << " scratch=" << (const void *)effective_scratch_int32
+                         << " workspace=" << (const void *)workspace_);
                 logFallback("buffers");
                 return false;
             }
@@ -1246,6 +1261,9 @@ namespace llaminar2
 
                 if (!impl_->d_weights_native_vnni || !impl_->d_weights_native_scales)
                 {
+                    LOG_WARN("[" << callsite << "] Native-VNNI prefill missing weight buffers:"
+                             " d_weights_native_vnni=" << (const void *)impl_->d_weights_native_vnni
+                             << " d_weights_native_scales=" << (const void *)impl_->d_weights_native_scales);
                     logFallback("buffers");
                     return false;
                 }
@@ -1796,8 +1814,7 @@ namespace llaminar2
                 return false;
             }
 
-            // Phase-1 scaffold reuses the existing epilogue implementation so alpha,
-            // beta, and optional bias semantics exactly match the CK fallback path.
+            // Epilogue: apply activation/weight scales, alpha/beta, and optional bias.
             const float *d_existing = (beta != 0.0f) ? d_output : nullptr;
 
             std::chrono::high_resolution_clock::time_point epilogue_start{};
@@ -2063,9 +2080,14 @@ namespace llaminar2
                     {
                         return false;
                     }
+                    // d_scales_B is only used by the INT8-VNNI path, not native-VNNI.
+                    // Native-VNNI weights use impl_->d_weights_native_scales instead.
+                    if (d_scales_B && !validatePointerDeviceOrLog(
+                            d_scales_B, rocm_device_id_, "d_scales_B", "ROCmQuantisedGemmKernel::multiply_tensor"))
+                    {
+                        return false;
+                    }
                     if (!validatePointerDeviceOrLog(
-                            d_scales_B, rocm_device_id_, "d_scales_B", "ROCmQuantisedGemmKernel::multiply_tensor") ||
-                        !validatePointerDeviceOrLog(
                             impl_->d_A_int8, rocm_device_id_, "workspace::QUANT_A", "ROCmQuantisedGemmKernel::multiply_tensor") ||
                         !validatePointerDeviceOrLog(
                             impl_->d_scales_A, rocm_device_id_, "workspace::SCALES_A", "ROCmQuantisedGemmKernel::multiply_tensor") ||
@@ -2209,13 +2231,17 @@ namespace llaminar2
                 d_scales_B = impl_->d_scales_B;
             }
 
-            if (!d_scales_B)
+            // Native-VNNI path uses impl_->d_weights_native_scales (not d_scales_B),
+            // so d_scales_B may be null when only native-VNNI weights are present
+            // (e.g. weights loaded via GPU pipeline / MoE batch constructor).
+            const bool native_vnni_available_mt = impl_ && impl_->has_native_vnni;
+            if (!d_scales_B && !native_vnni_available_mt)
             {
                 LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] Weight scales not uploaded to device");
                 return false;
             }
 
-            if (!validatePointerDeviceOrLog(
+            if (d_scales_B && !validatePointerDeviceOrLog(
                     d_scales_B, rocm_device_id_, "d_scales_B", "ROCmQuantisedGemmKernel::multiply_tensor"))
             {
                 return false;
@@ -2726,11 +2752,36 @@ namespace llaminar2
                         {
                             throw std::runtime_error(
                                 "[ConcurrentPrefill] Projection " + std::to_string(pi) +
-                                " output has no GPU data — cannot continue inference");
+                                " output has no GPU data (shape=" +
+                                std::to_string(fp32_output->rows()) + "x" +
+                                std::to_string(fp32_output->cols()) +
+                                ", coherence=" +
+                                std::to_string(static_cast<int>(fp32_output->coherenceState())) +
+                                ") — ensure scratch tensors call allocateOnDevice()");
                         }
 
                         // Get per-projection weight scales and bias
-                        const float *d_scales_B = rocm_kernel->impl_->d_scales_B;
+                        const float *d_scales_B = nullptr;
+                        if (rocm_kernel->packed_)
+                        {
+                            d_scales_B = rocm_kernel->packed_->d_scales;
+                        }
+                        else if (rocm_kernel->impl_)
+                        {
+                            d_scales_B = rocm_kernel->impl_->d_scales_B;
+                        }
+                        if (!d_scales_B && !(rocm_kernel->impl_ && rocm_kernel->impl_->has_native_vnni))
+                        {
+                            LOG_WARN("[ConcurrentPrefill] Projection " << pi
+                                     << " (" << (proj.name ? proj.name : "?")
+                                     << ") d_scales_B=0 — packed_=" << (const void *)rocm_kernel->packed_
+                                     << " packed_->d_scales=" << (rocm_kernel->packed_ ? (const void *)rocm_kernel->packed_->d_scales : nullptr)
+                                     << " impl_=" << (const void *)rocm_kernel->impl_.get()
+                                     << " impl_->d_scales_B=" << (rocm_kernel->impl_ ? (const void *)rocm_kernel->impl_->d_scales_B : nullptr)
+                                     << " weights_converted=" << rocm_kernel->weights_converted_
+                                     << " N=" << rocm_kernel->N_ << " K=" << rocm_kernel->K_
+                                     << " device=" << rocm_kernel->rocm_device_id_);
+                        }
                         const float *d_bias = nullptr;
                         if (proj.bias)
                         {
@@ -3071,7 +3122,10 @@ namespace llaminar2
                     d_scales_B = rocm_kernel->impl_->d_scales_B;
                 }
 
-                if (!d_scales_B)
+                // Native-VNNI path uses impl_->d_weights_native_scales (not d_scales_B),
+                // so d_scales_B may be null when only native-VNNI weights are present.
+                const bool native_vnni_fused = rocm_kernel->impl_ && rocm_kernel->impl_->has_native_vnni;
+                if (!d_scales_B && !native_vnni_fused)
                 {
                     LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Projection " << i << " weight scales not on device");
                     all_success = false;

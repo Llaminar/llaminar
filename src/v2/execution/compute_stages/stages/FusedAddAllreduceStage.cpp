@@ -75,9 +75,21 @@ namespace llaminar2
         }
 
         bool success;
+        void *stage_stream = gpuStream();
         if (!params_.stage_name.empty())
         {
-            success = params_.tp_ctx->allreduce(output_tensor, params_.stage_name, effective_count);
+            // When a GPU stream is set, route through the on-stream path
+            // so the allreduce is graph-capturable and precision-aware.
+            if (stage_stream)
+            {
+                success = params_.tp_ctx->allreduceOnStream(
+                    output_tensor, params_.stage_name, effective_count, stage_stream,
+                    params_.precision);
+            }
+            else
+            {
+                success = params_.tp_ctx->allreduce(output_tensor, params_.stage_name, effective_count);
+            }
         }
         else
         {

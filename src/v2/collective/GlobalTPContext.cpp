@@ -271,8 +271,14 @@ namespace llaminar2
         // Free the communicator if we own it
         if (owns_communicator_ && domain_comm_ != MPI_COMM_NULL)
         {
-            LOG_DEBUG("GlobalTPContext: Freeing owned communicator for domain " << domain_id_);
-            MPI_Comm_free(&domain_comm_);
+            // Guard against static destruction after MPI_Finalize
+            int mpi_finalized = 0;
+            MPI_Finalized(&mpi_finalized);
+            if (!mpi_finalized)
+            {
+                LOG_DEBUG("GlobalTPContext: Freeing owned communicator for domain " << domain_id_);
+                MPI_Comm_free(&domain_comm_);
+            }
             domain_comm_ = MPI_COMM_NULL;
         }
     }
@@ -301,7 +307,10 @@ namespace llaminar2
             // Free our communicator if we own it
             if (owns_communicator_ && domain_comm_ != MPI_COMM_NULL)
             {
-                MPI_Comm_free(&domain_comm_);
+                int mpi_finalized = 0;
+                MPI_Finalized(&mpi_finalized);
+                if (!mpi_finalized)
+                    MPI_Comm_free(&domain_comm_);
             }
 
             // Transfer ownership

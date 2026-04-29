@@ -68,6 +68,13 @@ namespace llaminar2
             return params;
         }
 
+        std::string getStopThinkingPrompt() const override
+        {
+            // From Qwen3.5 paper (arxiv 2505.09388) — official stop-thinking prompt
+            return "Considering the limited time by the user, I have to give the "
+                   "solution based on the thinking directly now.\n</think>\n\n";
+        }
+
         WeightShardingConfig getWeightShardingConfig() const override
         {
             WeightShardingConfig config;

@@ -15,6 +15,7 @@
 
 #include "../IComputeStage.h"
 #include "../StageParamsBase.h"
+#include "../../../interfaces/IWorkspaceConsumer.h"
 #include "../../../memory/BufferId.h"
 #include "../../../kernels/IMoEKernel.h"
 #include "../../moe/ExpertWeightTransfer.h"
@@ -42,7 +43,7 @@ namespace llaminar2
      * Expert views are pre-extracted at graph build time to avoid
      * runtime 3D tensor slicing overhead.
      */
-    class MoEExpertComputeStage : public IComputeStage
+    class MoEExpertComputeStage : public IComputeStage, public IWorkspaceConsumer
     {
     public:
         struct Params
@@ -198,6 +199,7 @@ namespace llaminar2
 
         bool supportsBackend(ComputeBackendType backend) const override;
         StageBufferRequirements getBufferRequirements() const override;
+        StageBufferContract bufferContract() const override;
         StageDumpInfo buildDumpInfoImpl() const override;
 
         /// Extract 2D expert views from 3D packed tensors.
@@ -221,9 +223,19 @@ namespace llaminar2
         /// Used by the weight service for rebalancing operations.
         MoEWeightContext buildWeightContext();
 
+        // =====================================================================
+        // IWorkspaceConsumer Implementation
+        // =====================================================================
+        WorkspaceRequirements getWorkspaceRequirements(int m, int n = 0, int k = 0) const override;
+        void bindWorkspace(DeviceWorkspaceManager *workspace) override;
+        void unbindWorkspace() override;
+        bool hasWorkspace() const override;
+        DeviceWorkspaceManager *getWorkspace() const override;
+
     private:
         Params params_;
         bool raw_weights_released_ = false; ///< Set by releaseRawExpertWeights()
+        DeviceWorkspaceManager *bound_workspace_ = nullptr; ///< Workspace for expert GEMM engines
 
         /// Cached GEMM engines per expert (resolved on first execute)
         mutable std::vector<ITensorGemm *> cached_gate_gemm_;
@@ -270,7 +282,7 @@ namespace llaminar2
      * Runs standard SwiGLU (gate_proj → up_proj → silu(gate)*up → down_proj)
      * using the shared expert weights. Executes for ALL tokens unconditionally.
      */
-    class SharedExpertFFNStage : public IComputeStage
+    class SharedExpertFFNStage : public IComputeStage, public IWorkspaceConsumer
     {
     public:
         struct Params
@@ -298,10 +310,21 @@ namespace llaminar2
         size_t estimatedFlops() const override;
         bool supportsBackend(ComputeBackendType backend) const override;
         StageBufferRequirements getBufferRequirements() const override;
+        StageBufferContract bufferContract() const override;
         StageDumpInfo buildDumpInfoImpl() const override;
+
+        // =====================================================================
+        // IWorkspaceConsumer Implementation
+        // =====================================================================
+        WorkspaceRequirements getWorkspaceRequirements(int m, int n = 0, int k = 0) const override;
+        void bindWorkspace(DeviceWorkspaceManager *workspace) override;
+        void unbindWorkspace() override;
+        bool hasWorkspace() const override;
+        DeviceWorkspaceManager *getWorkspace() const override;
 
     private:
         Params params_;
+        DeviceWorkspaceManager *bound_workspace_ = nullptr; ///< Workspace for shared expert GEMM engines
 
         mutable ITensorGemm *cached_gate_gemm_ = nullptr;
         mutable ITensorGemm *cached_up_gemm_ = nullptr;
@@ -350,6 +373,7 @@ namespace llaminar2
         size_t estimatedFlops() const override;
         bool supportsBackend(ComputeBackendType backend) const override;
         StageBufferRequirements getBufferRequirements() const override;
+        StageBufferContract bufferContract() const override;
         StageDumpInfo buildDumpInfoImpl() const override;
 
     private:

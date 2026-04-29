@@ -109,6 +109,12 @@ def write_metadata(
     config = model.hf_model.config
     metadata_path = output_dir / "metadata.txt"
     with open(metadata_path, "w") as f:
+        # Snapshot version: bumped when the snapshot format or V-head
+        # reversal semantics change. The C++ parity test framework checks
+        # this version and regenerates snapshots automatically when stale.
+        #   v1: original format
+        #   v2: MoE-only V-head reversal (dense models skip reversal)
+        f.write(f"snapshot_version: 2\n")
         f.write(f"Model: {model_path}\n")
         arch = getattr(config, "architectures", [config.__class__.__name__])
         f.write(f"Architecture: {arch[0] if arch else config.__class__.__name__}\n")

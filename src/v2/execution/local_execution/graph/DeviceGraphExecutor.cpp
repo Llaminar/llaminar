@@ -774,6 +774,15 @@ namespace llaminar2
                     {
                         if (auto *tb = dynamic_cast<TensorBase *>(weight))
                         {
+                            // Skip weights whose GEMM representation is managed by the
+                            // GPU pipeline (KernelFactory::prepared_gemm_registry_).
+                            // The kernel owns its device copy in pooled VRAM — calling
+                            // ensureOnDevice would fail because the host data may have
+                            // been released after pipeline upload.
+                            if (tb->isInPreparedGemmRegistry())
+                            {
+                                continue;
+                            }
                             if (!tb->ensureOnDevice(target_device, stage_stream))
                             {
                                 LOG_ERROR("[DeviceGraphExecutor] Weight upload failed for stage '"

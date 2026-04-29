@@ -5,10 +5,10 @@
 
 #include "app/modes/InteractiveChatMode.h"
 #include "app/AppContext.h"
+#include "app/MPIShutdown.h"
 #include "app/InferenceRunnerAdapter.h"
 #include "utils/Logger.h"
 #include "utils/ChatUI.h"
-#include <mpi.h>
 
 namespace llaminar2
 {
@@ -31,7 +31,7 @@ namespace llaminar2
             {
                 LOG_ERROR("Chat mode requires a model with a chat template.");
                 LOG_ERROR("Use --chat-template to specify one (e.g., --chat-template chatml)");
-                MPI_Finalize();
+                mpiShutdown();
                 return 1;
             }
 
@@ -57,7 +57,7 @@ namespace llaminar2
                 runner->shutdownMPIWorkers();
 
             runner->shutdown();
-            MPI_Finalize();
+            mpiShutdown();
             return result;
         }
         else
@@ -70,7 +70,7 @@ namespace llaminar2
                 runner->runMPIWorkerLoop();
             }
             runner->shutdown();
-            MPI_Finalize();
+            mpiShutdown();
             return 0;
         }
     }

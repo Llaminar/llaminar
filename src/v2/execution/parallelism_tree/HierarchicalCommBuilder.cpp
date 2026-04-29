@@ -143,6 +143,16 @@ namespace llaminar2
             return;
         }
 
+        // Guard against calls after MPI_Finalize (static destruction ordering)
+        int mpi_finalized = 0;
+        MPI_Finalized(&mpi_finalized);
+        if (mpi_finalized)
+        {
+            comms_.clear();
+            root_path_.clear();
+            return;
+        }
+
         // Sort by depth DESCENDING so we free children before parents
         std::vector<std::pair<std::string, CommEntry>> entries(comms_.begin(), comms_.end());
         std::sort(entries.begin(), entries.end(),

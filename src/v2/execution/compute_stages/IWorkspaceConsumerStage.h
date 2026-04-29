@@ -54,6 +54,7 @@
 #include "../../interfaces/IWorkspaceConsumer.h"
 #include "../local_execution/device/DeviceWorkspaceManager.h"
 #include "../../utils/Logger.h"
+#include <stdexcept>
 
 namespace llaminar2
 {
@@ -121,17 +122,16 @@ namespace llaminar2
          */
         void bindWorkspace(DeviceWorkspaceManager *workspace) override
         {
+            bound_workspace_ = workspace;
             auto *consumer = getKernelAsWorkspaceConsumer();
             if (consumer)
             {
                 consumer->bindWorkspace(workspace);
-                bound_workspace_ = workspace;
                 LOG_DEBUG("[IWorkspaceConsumerStage] Bound workspace to kernel");
             }
             else
             {
-                LOG_WARN("[IWorkspaceConsumerStage] No kernel available for workspace binding");
-                bound_workspace_ = workspace; // Store anyway for hasWorkspace() check
+                LOG_TRACE("[IWorkspaceConsumerStage] No kernel available, storing workspace locally");
             }
         }
 

@@ -86,14 +86,14 @@ namespace llaminar2
                 continue;
             }
 
-            // Check if tensor has cached device data (e.g., packed INT8 weights for CUDA GEMM)
-            // These tensors don't need raw data upload - the kernel uses its own representation
-            if (tensor_base->hasCachedDeviceData(target_device.type))
+            // Skip tensors whose GEMM weights are managed by the GPU pipeline.
+            // The prepared GEMM kernel owns the device copy in pooled VRAM.
+            if (tensor_base->isInPreparedGemmRegistry())
             {
                 if (trace_coherence)
                 {
                     LOG_INFO("[StageCoherence] Input '" << (buf.name ? buf.name : "unknown")
-                                                        << "' has cached device data for " << target_device.to_string()
+                                                        << "' is in prepared GEMM registry for " << target_device.to_string()
                                                         << " (skipping raw upload)");
                 }
                 continue;

@@ -5,9 +5,9 @@
 
 #include "app/modes/CompletionMode.h"
 #include "app/AppContext.h"
+#include "app/MPIShutdown.h"
 #include "utils/Logger.h"
 #include "utils/Sampler.h"
-#include <mpi.h>
 #include <iostream>
 #include <climits>
 #include <sstream>
@@ -42,7 +42,7 @@ namespace llaminar2
                     LOG_ERROR("Tokenization resulted in empty token sequence");
                 }
                 runner->shutdown();
-                MPI_Finalize();
+                mpiShutdown();
                 return 1;
             }
 
@@ -68,7 +68,7 @@ namespace llaminar2
                 LOG_ERROR("Error tokenizing prompt: " << e.what());
             }
             runner->shutdown();
-            MPI_Finalize();
+            mpiShutdown();
             return 1;
         }
 
@@ -101,7 +101,7 @@ namespace llaminar2
                 LOG_ERROR("Error: Prefill forward pass failed: " << runner->lastError());
             }
             runner->shutdown();
-            MPI_Finalize();
+            mpiShutdown();
             return 1;
         }
 
@@ -135,7 +135,7 @@ namespace llaminar2
                     LOG_ERROR("\nError: Decode step failed at token " << (i + 1) << ": " << result.error);
                 }
                 runner->shutdown();
-                MPI_Finalize();
+                mpiShutdown();
                 return 1;
             }
 
@@ -187,7 +187,7 @@ namespace llaminar2
             mpi_ctx->barrier();
         }
 
-        MPI_Finalize();
+        mpiShutdown();
         return 0;
     }
 

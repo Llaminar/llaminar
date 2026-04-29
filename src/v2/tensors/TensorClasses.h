@@ -673,21 +673,16 @@ namespace llaminar2
         // Generic cache for CPU kernel state (e.g. packed VNNI weights)
         mutable std::any cache_;
 
-        // Generic cache for CUDA kernel state (e.g. packed INT8 weights)
-        // Separate from cache_ to allow both CPU and CUDA paths to coexist
-        mutable std::any cuda_cache_;
-
-        // Generic cache for ROCm kernel state (e.g. packed INT8 weights for CK)
-        // Separate from cache_ and cuda_cache_ to allow CPU, CUDA, and ROCm paths to coexist
-        mutable std::any rocm_cache_;
-
-        // Set by KernelFactory::getOrCreatePreparedGemmWeights when an entry is
-        // added to prepared_gemm_registry_.  Checked by the destructor so that
-        // clearCacheFor(this) is called even when cache_/cuda_cache_/rocm_cache_
-        // are empty (CPU NativeVNNI, FP32 tensors, etc.).
+        // Set by KernelFactory when this tensor has been registered in
+        // prepared_gemm_registry_ (via getOrCreatePreparedGemmWeights or
+        // registerPreparedGemmFromTransfer).  The GPU pipeline uploads GEMM
+        // weights into a pooled VRAM allocation that is owned by the GEMM
+        // kernel — not by TensorBase::gpu_data_ptr_.  This flag lets the
+        // coherence and weight-release paths know the tensor is GPU-ready
+        // without checking dead legacy fields.
         mutable bool in_prepared_gemm_registry_ = false;
 
-        // Synchronizes cache_ / cuda_cache_ / rocm_cache_ initialization and reset
+        // Synchronizes cache_ initialization and reset
         mutable std::mutex packed_cache_mutex_;
 
         // Shape and type - each concrete tensor class has its own shape_ member
@@ -1062,7 +1057,7 @@ namespace llaminar2
          *   Any → MAPPED           (shared memory, always in sync)
          */
         void transitionTo(TensorCoherenceState new_state,
-                          std::optional<DeviceId> authoritative_dev = std::nullopt)
+                          std::optional<DeviceId> authoritative_dev = std::nullopt) override
         {
             std::lock_guard<std::mutex> lock(coherence_mutex_);
             setCoherenceState_(new_state);
@@ -1096,20 +1091,16 @@ namespace llaminar2
                                    void *stream = nullptr);
 
         /**
-         * @brief Check if tensor has cached device data via internal packing mechanisms
+         * @brief Check if this tensor's GEMM weights are managed by the GPU pipeline
          *
-         * CUDA/ROCm GEMM kernels often convert quantized weights to a different
-         * representation (e.g., Q8_0 -> INT8 + per-column scales) and upload that
-         * instead of the raw tensor data. This method checks if such cached data exists.
+         * When true, the tensor's GEMM representation lives in pooled VRAM owned
+         * by the prepared-GEMM kernel (via KernelFactory::prepared_gemm_registry_).
+         * The raw host data may already be released.  Callers should skip
+         * ensureOnDevice() for such tensors — the kernel has its own device copy.
          *
-         * Use this to skip redundant ensureOnDevice() calls for weight tensors
-         * that use internal packing - they don't need raw tensor uploads.
-         *
-         * @param device_type Device type to check (CUDA or ROCm)
-         * @return true if tensor has cached device data uploaded for the given device type
-         * @note Implementation checks cuda_cache_/rocm_cache_ for uploaded packed weights
+         * @return true if KernelFactory has a prepared GEMM entry for this tensor
          */
-        virtual bool hasCachedDeviceData(DeviceType device_type) const;
+        bool isInPreparedGemmRegistry() const { return in_prepared_gemm_registry_; }
 
         /**
          * @brief Check if tensor uses zero-copy mapped memory

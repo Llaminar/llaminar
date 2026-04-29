@@ -1062,6 +1062,55 @@ namespace llaminar2
         WeightLoadingProfiler::end(WeightLoadPhase::TENSOR_LOAD);
 
         // =====================================================================
+        // Load global weights BEFORE finalization so they are available for
+        // the GPU pipeline (GEMM packing, non-GEMM upload, embedding prep).
+        // validateLayerWeights only loads blk.N.* per-layer weights; global
+        // weights (output.weight, token_embd.weight, output_norm.weight)
+        // must be loaded separately.
+        //
+        // For tied-embeddings models (Qwen3, Qwen3.5): output.weight is
+        // absent and token_embd.weight is reused as the LM head. The GPU
+        // GEMM pipeline (packGemmWeightsViaPipeline) has tied-embeddings
+        // logic that includes token_embd.weight in the GEMM pipeline when
+        // output.weight is missing — but it can only find the tensor if
+        // it's already in cache_. Loading it here ensures that.
+        //
+        // output_norm.weight is also loaded so uploadNonGemmWeights() can
+        // upload it to GPU during finalization rather than needing a lazy
+        // ensureOnDevice() call later.
+        // =====================================================================
+        {
+            // Load global weights into cache_ using the DEFAULT device (CPU)
+            // so they sit alongside per-layer weights. Do NOT pass `device`
+            // here — passing CUDA:0 would put them in per_device_cache_,
+            // which makes packGemmWeightsViaPipeline() think per_device_cache_
+            // is the primary source and skip all per-layer weights from cache_.
+            auto lm_head = weight_mgr->getWeightForDevice("output.weight");
+            if (!lm_head && model_ctx->hasTensor("token_embd.weight"))
+            {
+                // Tied embeddings: output.weight absent, token_embd.weight
+                // will be reused as the LM head GEMM weight. Load it now so
+                // packGemmWeightsViaPipeline() can find it in cache_ and
+                // include it in the GPU GEMM pipeline for repacking.
+                weight_mgr->getWeightForDevice("token_embd.weight");
+                LOG_DEBUG("[InferenceRunner] Tied embeddings: token_embd.weight loaded for GPU GEMM pipeline");
+            }
+            else if (lm_head)
+            {
+                LOG_DEBUG("[InferenceRunner] output.weight loaded into cache for GPU pipeline enrollment");
+                // Also load token_embd.weight for embedding stage
+                if (model_ctx->hasTensor("token_embd.weight"))
+                    weight_mgr->getWeightForDevice("token_embd.weight");
+            }
+
+            // Load output_norm for GPU upload during finalization
+            if (model_ctx->hasTensor("output_norm.weight"))
+                weight_mgr->getWeightForDevice("output_norm.weight");
+
+            LOG_DEBUG("[InferenceRunner] Global weights loaded into cache");
+        }
+
+        // =====================================================================
         // Weight rotation (activation_rotation) is intentionally NOT registered
         // as a weight preprocessor. GEMM invariance (R(X) @ R(W)^T = X @ W^T)
         // means weight rotation produces identical outputs in exact arithmetic,
@@ -1076,7 +1125,11 @@ namespace llaminar2
         // =====================================================================
         weight_mgr->finalizeForDevice(device);
 
-        // Build weights via polymorphic builder (centralizes weight name knowledge)
+        // Build weights via polymorphic builder (centralizes weight name knowledge).
+        // Uses default CPU device for getWeightForDevice() — this returns the
+        // original tensors from cache_, matching the prepared GEMM registry keys
+        // (which also use cache_ originals). The PreparedEmbedding registry uses
+        // weight names (not pointers), so pointer identity doesn't matter there.
         auto config_builder = createGraphConfigBuilder(arch);
         auto weights = config_builder->buildWeights(
             [weight_mgr](const std::string &name)
@@ -1174,10 +1227,13 @@ namespace llaminar2
             return false;
         }
 
-        // Load global weights this stage owns
+        // Load global weights this stage owns.
+        // IMPORTANT: Pass the target device so first_device_ is set to the GPU
+        // device (not cpu). This ensures packGemmWeightsViaPipeline() and
+        // buildWeights() use the same tensor pointers, avoiding GPU GEMM cache misses.
         if (pp_config.has_embedding)
         {
-            auto embedding = weight_mgr->getWeightForDevice("token_embd.weight");
+            auto embedding = weight_mgr->getWeightForDevice("token_embd.weight", device);
             if (!embedding)
             {
                 LOG_ERROR("[PPStageRunner] Stage has_embedding=true but token_embd.weight missing");
@@ -1188,11 +1244,11 @@ namespace llaminar2
 
         if (pp_config.has_lm_head)
         {
-            auto final_norm = weight_mgr->getWeightForDevice("output_norm.weight");
-            auto lm_head = weight_mgr->getWeightForDevice("output.weight");
+            auto final_norm = weight_mgr->getWeightForDevice("output_norm.weight", device);
+            auto lm_head = weight_mgr->getWeightForDevice("output.weight", device);
             if (!lm_head)
             {
-                auto embedding_fallback = weight_mgr->getWeightForDevice("token_embd.weight");
+                auto embedding_fallback = weight_mgr->getWeightForDevice("token_embd.weight", device);
                 if (embedding_fallback)
                 {
                     LOG_INFO("[PPStageRunner] output.weight not found, using tied embeddings");
@@ -1209,7 +1265,7 @@ namespace llaminar2
         // Load layer weights
         for (const auto &[weight_name, is_optional] : pp_validation.weights_to_load)
         {
-            auto weight = weight_mgr->getWeightForDevice(weight_name);
+            auto weight = weight_mgr->getWeightForDevice(weight_name, device);
 
             if (!weight)
             {

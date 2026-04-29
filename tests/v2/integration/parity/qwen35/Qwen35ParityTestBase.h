@@ -63,17 +63,28 @@ namespace llaminar2::test::parity::qwen35
             // fall back to Qwen2's default token IDs, embedding the wrong tokens
             // and producing catastrophic cosine drops (~0.18) at every stage.
             //
-            // Trigger snapshot regeneration here if metadata is missing, so the
-            // token IDs are always consistent with what PyTorch will emit. Skip
-            // the regen if the model file is missing (the test will GTEST_SKIP
-            // later in ParityTestBase::SetUp when it sees the missing model).
+            // Trigger snapshot regeneration here if metadata is missing or stale
+            // (wrong snapshot_version), so token IDs are always consistent with
+            // what PyTorch will emit. Skip if the model file is missing (the test
+            // will GTEST_SKIP later in ParityTestBase::SetUp).
             const auto metadata_path = std::filesystem::path(Base::config_.snapshot_dir) /
                                        "metadata.txt";
-            if (!std::filesystem::exists(metadata_path) &&
-                std::filesystem::exists(Base::config_.model_path))
+            bool needs_regen = !std::filesystem::exists(metadata_path);
+            if (!needs_regen)
             {
-                LOG_INFO("[Qwen3.5 Parity] metadata.txt missing — running PyTorch "
-                         "snapshot generator early to obtain consistent prefill tokens");
+                int disk_ver = Base::readSnapshotVersion(metadata_path);
+                if (disk_ver < Base::kRequiredSnapshotVersion)
+                {
+                    LOG_INFO("[Qwen3.5 Parity] Stale snapshots (v" << disk_ver
+                             << " < required v" << Base::kRequiredSnapshotVersion
+                             << ") — regenerating");
+                    needs_regen = true;
+                }
+            }
+            if (needs_regen && std::filesystem::exists(Base::config_.model_path))
+            {
+                LOG_INFO("[Qwen3.5 Parity] Running PyTorch snapshot generator "
+                         "to obtain consistent prefill tokens and up-to-date snapshots");
                 if (!regeneratePyTorchSnapshots())
                 {
                     LOG_ERROR("[Qwen3.5 Parity] Early snapshot regeneration failed; "

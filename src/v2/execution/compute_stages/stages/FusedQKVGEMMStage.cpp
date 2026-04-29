@@ -479,10 +479,10 @@ namespace llaminar2
             return {};
 
         auto contract = StageBufferContract::build()
-            .addInput(*params_.input_buffer_id)
-            .addOutput(*params_.output_q_buffer_id)
-            .addOutput(*params_.output_k_buffer_id)
-            .addOutput(*params_.output_v_buffer_id);
+                            .addInput(*params_.input_buffer_id)
+                            .addOutput(*params_.output_q_buffer_id)
+                            .addOutput(*params_.output_k_buffer_id)
+                            .addOutput(*params_.output_v_buffer_id);
         // Model weights are not arena-managed
         if (params_.wq)
             contract.addWeight(const_cast<ITensor *>(params_.wq));

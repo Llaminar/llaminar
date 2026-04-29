@@ -2207,7 +2207,6 @@ namespace llaminar2
      * - `LLAMINAR_ROCM_RATIO_PREFILL_LINEAR_KB=<n>` - Force linear-codebook ratio prefill split-K blocks (`0`=use global/auto)
      * - `LLAMINAR_ROCM_RATIO_PREFILL_IQ4_VARIANT=<id>` - Force IQ4-codebook ratio prefill tile variant (`-1`=use global/auto)
      * - `LLAMINAR_ROCM_RATIO_PREFILL_IQ4_KB=<n>` - Force IQ4-codebook ratio prefill split-K blocks (`0`=use global/auto)
-     * - `LLAMINAR_ROCM_STARTUP_GPU_REPACK=1` - Enable startup GPU-native GEMM repack pipeline (Phase 4, flag-only in Step 1)
      * - `LLAMINAR_ROCM_REPACK_SLOTS=<n>` - Ring-buffer slot count for startup GPU repack pipeline
      * - `LLAMINAR_ROCM_REPACK_BUDGET_MB=<mb>` - VRAM budget cap for startup GPU repack staging buffers
      * - `LLAMINAR_ROCM_REPACK_STREAMS=<n>` - Stream count hint for startup GPU repack pipeline
@@ -2263,6 +2262,11 @@ namespace llaminar2
         bool concurrent_prefill = true;        ///< Multi-stream concurrent fused GEMM projections during prefill (LLAMINAR_ROCM_CONCURRENT_PREFILL, default ON)
         bool concurrent_decode = false;        ///< Enable multi-stream concurrent fused GEMV projections during decode (LLAMINAR_ROCM_CONCURRENT_DECODE)
 
+        // --- Startup GPU weight loading pipeline (LoadOrchestrator) ---
+        int repack_slots = 3;                  ///< Ring-buffer slot count for startup GPU repack pipeline (LLAMINAR_ROCM_REPACK_SLOTS)
+        int repack_budget_mb = 0;              ///< VRAM budget cap for startup GPU repack staging buffers, 0=unlimited (LLAMINAR_ROCM_REPACK_BUDGET_MB)
+        int repack_streams = 3;                ///< H2D stream count for startup GPU repack pipeline (LLAMINAR_ROCM_REPACK_STREAMS)
+
         ROCmConfig()
         {
             reload();
@@ -2313,6 +2317,9 @@ namespace llaminar2
             ratio_prefill_iq4_kb = 0;
             concurrent_prefill = true;
             concurrent_decode = false;
+            repack_slots = 3;
+            repack_budget_mb = 0;
+            repack_streams = 3;
 
             const char *trace_coh_env = std::getenv("LLAMINAR_ROCM_TRACE_COHERENCE");
             if (trace_coh_env)
@@ -2588,6 +2595,24 @@ namespace llaminar2
             if (concurrent_decode_env)
             {
                 concurrent_decode = (std::atoi(concurrent_decode_env) != 0);
+            }
+
+            const char *repack_slots_env = std::getenv("LLAMINAR_ROCM_REPACK_SLOTS");
+            if (repack_slots_env)
+            {
+                repack_slots = std::clamp(std::atoi(repack_slots_env), 1, 8);
+            }
+
+            const char *repack_budget_env = std::getenv("LLAMINAR_ROCM_REPACK_BUDGET_MB");
+            if (repack_budget_env)
+            {
+                repack_budget_mb = std::max(0, std::atoi(repack_budget_env));
+            }
+
+            const char *repack_streams_env = std::getenv("LLAMINAR_ROCM_REPACK_STREAMS");
+            if (repack_streams_env)
+            {
+                repack_streams = std::clamp(std::atoi(repack_streams_env), 1, 8);
             }
         }
     };

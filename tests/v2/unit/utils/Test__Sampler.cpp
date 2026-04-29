@@ -1267,4 +1267,409 @@ namespace
         EXPECT_EQ(token, 42);
     }
 
+    // =============================================================================
+    // DRY Penalty Tests
+    // =============================================================================
+
+    TEST_F(SamplerTest, DRY_NoPenaltyWhenDisabled)
+    {
+        // DRY is disabled when multiplier == 0 (default)
+        const int vocab_size = 100;
+        sampler_->record_token(5);
+        sampler_->record_token(6);
+        sampler_->record_token(5);
+        sampler_->record_token(6);
+
+        SamplingParams params;
+        params.dry_multiplier = 0.0f; // disabled
+        auto penalties = sampler_->compute_penalty_map(params, vocab_size);
+        EXPECT_TRUE(penalties.empty());
+    }
+
+    TEST_F(SamplerTest, DRY_NoPenaltyWithNoHistory)
+    {
+        SamplingParams params;
+        params.dry_multiplier = 1.0f;
+        auto penalties = sampler_->compute_penalty_map(params, 100);
+        EXPECT_TRUE(penalties.empty());
+    }
+
+    TEST_F(SamplerTest, DRY_DetectsSimpleRepeat)
+    {
+        // History: [A, B, C, A, B, C] — "A B C" repeated
+        // The token that would continue the repeat is A (token 10)
+        const int A = 10, B = 20, C = 30;
+        for (int token : {A, B, C, A, B, C})
+            sampler_->record_token(token);
+
+        SamplingParams params;
+        params.dry_multiplier = 1.0f;
+        params.dry_base = 1.75f;
+        params.dry_allowed_length = 1; // Trigger on repeat_len > 1
+        params.dry_penalty_last_n = -1; // Use full history
+
+        auto penalties = sampler_->compute_penalty_map(params, 100);
+
+        // Token A should be penalized (extending the repeat "A B C" → "A B C A")
+        bool found_A = false;
+        for (const auto &p : penalties)
+        {
+            if (p.token_id == A)
+            {
+                found_A = true;
+                EXPECT_GT(p.penalty, 0.0f);
+            }
+        }
+        EXPECT_TRUE(found_A) << "Token A should be penalized for extending the repeat";
+    }
+
+    TEST_F(SamplerTest, DRY_AllowedLengthPreventsShortRepeats)
+    {
+        // History: [A, B, A, B] — "A B" is length 2
+        // llama.cpp semantics: allowed_length means "penalize repeats >= this length"
+        // So allowed_length=3 means repeats of length 2 are NOT penalized
+        const int A = 10, B = 20;
+        for (int token : {A, B, A, B})
+            sampler_->record_token(token);
+
+        SamplingParams params;
+        params.dry_multiplier = 1.0f;
+        params.dry_base = 1.75f;
+        params.dry_allowed_length = 3; // Don't penalize repeats of length < 3
+        params.dry_penalty_last_n = -1;
+
+        auto penalties = sampler_->compute_penalty_map(params, 100);
+        // The repeat is length 2, which is < allowed_length 3, so no penalty
+        EXPECT_TRUE(penalties.empty())
+            << "Repeats < allowed_length should not be penalized";
+    }
+
+    TEST_F(SamplerTest, DRY_ExponentialPenaltyScaling)
+    {
+        // History: [A, B, C, D, A, B, C, D] — repeat of length 4
+        const int A = 10, B = 20, C = 30, D = 40;
+        for (int token : {A, B, C, D, A, B, C, D})
+            sampler_->record_token(token);
+
+        SamplingParams params;
+        params.dry_multiplier = 2.0f;
+        params.dry_base = 1.75f;
+        params.dry_allowed_length = 1;
+        params.dry_penalty_last_n = -1;
+
+        auto penalties = sampler_->compute_penalty_map(params, 100);
+
+        // Find penalty for A (the token that would extend the repeat)
+        float penalty_A = 0.0f;
+        for (const auto &p : penalties)
+        {
+            if (p.token_id == A)
+                penalty_A = p.penalty;
+        }
+
+        // Expected: multiplier * base^(repeat_len - allowed_length) = 2.0 * 1.75^(4-1) = 2.0 * 5.359375
+        float expected = 2.0f * std::pow(1.75f, 3.0f);
+        EXPECT_NEAR(penalty_A, expected, 0.01f)
+            << "DRY penalty should scale exponentially";
+    }
+
+    TEST_F(SamplerTest, DRY_WindowLimitsHistory)
+    {
+        // Fill history: [1, 2, 3, 4, 5, 1, 2, 3, 4, 5]
+        for (int token : {1, 2, 3, 4, 5, 1, 2, 3, 4, 5})
+            sampler_->record_token(token);
+
+        SamplingParams params;
+        params.dry_multiplier = 1.0f;
+        params.dry_allowed_length = 0;
+        params.dry_penalty_last_n = 3; // Only look at last 3 tokens [4, 5]... wait, [3,4,5]
+
+        auto penalties = sampler_->compute_penalty_map(params, 100);
+
+        // With only 3 tokens of history visible, longer repeats won't be detected
+        // The 3-token window sees [3, 4, 5] — need at least repeat_len+1 tokens to detect
+        // So the full 5-token repeat can't be seen
+        // But smaller sub-patterns within the window might still trigger
+        // The key test is that with dry_penalty_last_n=3, we don't get the full-length penalty
+        float full_penalty = std::pow(1.75f, 4.0f); // 5-1-0 = 4, never reached
+        for (const auto &p : penalties)
+        {
+            EXPECT_LT(p.penalty, full_penalty)
+                << "Window should prevent detection of full repeat";
+        }
+    }
+
+    TEST_F(SamplerTest, DRY_SequenceBreakersResetDetection)
+    {
+        // History: [A, NEWLINE, A] where NEWLINE is a breaker
+        const int A = 10, NEWLINE = 50;
+        for (int token : {A, NEWLINE, A})
+            sampler_->record_token(token);
+
+        // Set up breaker: token 50 (NEWLINE) is a single-token breaker
+        sampler_->initDryBreakers({"\n"}, [&](const std::string &) -> std::vector<int> {
+            return {NEWLINE}; // Mock: "\n" tokenizes to [NEWLINE]
+        });
+
+        SamplingParams params;
+        params.dry_multiplier = 1.0f;
+        params.dry_allowed_length = 1;
+        params.dry_penalty_last_n = -1;
+
+        auto penalties = sampler_->compute_penalty_map(params, 100);
+
+        // The NEWLINE between the two A tokens should break repeat detection
+        // So A should NOT be penalized
+        for (const auto &p : penalties)
+        {
+            if (p.token_id == A)
+            {
+                FAIL() << "Token A should not be penalized when a sequence breaker intervenes";
+            }
+        }
+    }
+
+    TEST_F(SamplerTest, DRY_CombinesWithPresenceFrequencyPenalty)
+    {
+        const int A = 10;
+        sampler_->record_token(A);
+        sampler_->record_token(A);
+        sampler_->record_token(A);
+        sampler_->record_token(A);
+
+        SamplingParams params;
+        params.presence_penalty = 1.0f;
+        params.frequency_penalty = 0.5f;
+        params.dry_multiplier = 1.0f;
+        params.dry_allowed_length = 0;
+        params.dry_penalty_last_n = -1;
+
+        auto penalties = sampler_->compute_penalty_map(params, 100);
+
+        // Token A should have combined penalty from presence + frequency + DRY
+        float total_penalty = 0.0f;
+        for (const auto &p : penalties)
+        {
+            if (p.token_id == A)
+                total_penalty = p.penalty;
+        }
+
+        // Presence: 1.0, Frequency: 0.5 * 4 = 2.0, total presence+freq = 3.0
+        // DRY also adds on top of that
+        EXPECT_GT(total_penalty, 3.0f)
+            << "DRY should add to presence+frequency penalties";
+    }
+
+    TEST_F(SamplerTest, DRY_AffectsSampling)
+    {
+        // Create a scenario where DRY penalty changes the argmax
+        const int vocab_size = 10;
+        std::vector<float> logits(vocab_size, 0.0f);
+
+        // Token 5 has the highest logit
+        logits[5] = 10.0f;
+        logits[3] = 9.5f;
+
+        // Build history that would cause DRY to penalize token 5
+        // History: [5, 7, 5, 7] — repeating pattern, next would be 5
+        sampler_->record_token(5);
+        sampler_->record_token(7);
+        sampler_->record_token(5);
+        sampler_->record_token(7);
+
+        SamplingParams params;
+        params.temperature = 0.0f; // Greedy
+        params.dry_multiplier = 5.0f;
+        params.dry_base = 1.75f;
+        params.dry_allowed_length = 0;
+        params.dry_penalty_last_n = -1;
+
+        int token = sampler_->sample(logits, params);
+        // Token 5 should be penalized enough that token 3 wins
+        EXPECT_EQ(token, 3) << "DRY penalty should prevent repeating token 5";
+    }
+
+    TEST_F(SamplerTest, DRY_ResetHistoryClearsDryState)
+    {
+        sampler_->record_token(1);
+        sampler_->record_token(2);
+        sampler_->record_token(1);
+        sampler_->record_token(2);
+
+        sampler_->reset_history();
+
+        SamplingParams params;
+        params.dry_multiplier = 1.0f;
+        params.dry_allowed_length = 0;
+        params.dry_penalty_last_n = -1;
+
+        auto penalties = sampler_->compute_penalty_map(params, 100);
+        EXPECT_TRUE(penalties.empty())
+            << "After reset, DRY should have no history to detect repeats from";
+    }
+
+    TEST_F(SamplerTest, DRY_PenaltyLastN_Zero_DisablesDRY)
+    {
+        sampler_->record_token(5);
+        sampler_->record_token(5);
+        sampler_->record_token(5);
+
+        SamplingParams params;
+        params.dry_multiplier = 1.0f;
+        params.dry_penalty_last_n = 0; // Disabled
+
+        auto penalties = sampler_->compute_penalty_map(params, 100);
+        EXPECT_TRUE(penalties.empty());
+    }
+
+    TEST_F(SamplerTest, DRY_LogitPenaltyStruct)
+    {
+        // Basic sanity check for LogitPenalty
+        LogitPenalty lp{42, 3.14f};
+        EXPECT_EQ(lp.token_id, 42);
+        EXPECT_FLOAT_EQ(lp.penalty, 3.14f);
+    }
+
+    TEST_F(SamplerTest, DRY_HasPenaltiesIncludesDRY)
+    {
+        SamplingParams params;
+        params.dry_multiplier = 0.0f;
+        EXPECT_FALSE(params.has_penalties());
+
+        params.dry_multiplier = 1.0f;
+        EXPECT_TRUE(params.has_penalties());
+    }
+
+    TEST_F(SamplerTest, DRY_OverflowProtection)
+    {
+        // With a very large repeat, pow() should not overflow to infinity
+        // History: 50 copies of token A → repeat_len = 49
+        const int A = 10;
+        for (int i = 0; i < 50; ++i)
+            sampler_->record_token(A);
+
+        SamplingParams params;
+        params.dry_multiplier = 1.0f;
+        params.dry_base = 2.0f;         // 2^49 would overflow float
+        params.dry_allowed_length = 0;
+        params.dry_penalty_last_n = -1;
+
+        auto penalties = sampler_->compute_penalty_map(params, 100);
+
+        for (const auto &p : penalties)
+        {
+            EXPECT_FALSE(std::isinf(p.penalty))
+                << "DRY penalty should not overflow to infinity";
+            EXPECT_FALSE(std::isnan(p.penalty))
+                << "DRY penalty should not be NaN";
+            EXPECT_GT(p.penalty, 0.0f)
+                << "DRY penalty should still be positive after clamping";
+        }
+    }
+
+    TEST_F(SamplerTest, DRY_SingleTokenBreakerExemption)
+    {
+        // If a token is itself a single-token sequence breaker, it should be
+        // exempt from DRY penalty even if it would extend a repeat.
+        // This aligns with llama.cpp's Step 4 breaker exemption.
+        const int A = 10, NEWLINE = 50;
+
+        // History: [NEWLINE, A, NEWLINE, A, NEWLINE]
+        // The repeat "NEWLINE A" appears twice, so NEWLINE would normally be penalized
+        // as the token that extends the repeat. But NEWLINE is a breaker → exempt.
+        for (int token : {NEWLINE, A, NEWLINE, A, NEWLINE})
+            sampler_->record_token(token);
+
+        sampler_->initDryBreakers({"\n"}, [&](const std::string &) -> std::vector<int> {
+            return {NEWLINE};
+        });
+
+        SamplingParams params;
+        params.dry_multiplier = 1.0f;
+        params.dry_allowed_length = 0;
+        params.dry_penalty_last_n = -1;
+
+        auto penalties = sampler_->compute_penalty_map(params, 100);
+
+        // NEWLINE should be exempt from penalty because it's a single-token breaker
+        for (const auto &p : penalties)
+        {
+            EXPECT_NE(p.token_id, NEWLINE)
+                << "Single-token breaker should be exempt from DRY penalty";
+        }
+    }
+
+    TEST_F(SamplerTest, DRY_BaseLessThanOneDisabled)
+    {
+        // dry_base < 1.0 should disable DRY (aligned with llama.cpp)
+        const int A = 10;
+        for (int token : {A, A, A, A})
+            sampler_->record_token(token);
+
+        SamplingParams params;
+        params.dry_multiplier = 1.0f;
+        params.dry_base = 0.5f;  // < 1.0 → disabled
+        params.dry_allowed_length = 0;
+        params.dry_penalty_last_n = -1;
+
+        auto penalties = sampler_->compute_penalty_map(params, 100);
+        EXPECT_TRUE(penalties.empty())
+            << "DRY should be disabled when dry_base < 1.0";
+    }
+
+    TEST_F(SamplerTest, DRY_PenaltyIsAddedToPresenceFrequency)
+    {
+        // Verify DRY penalty is ADDED to presence+frequency, not max'd
+        const int A = 10;
+        sampler_->record_token(A);
+        sampler_->record_token(A);
+        sampler_->record_token(A);
+
+        // Compute presence+frequency only
+        SamplingParams params_pf;
+        params_pf.presence_penalty = 1.0f;
+        params_pf.frequency_penalty = 0.5f;
+
+        Sampler sampler_pf(42);
+        sampler_pf.record_token(A);
+        sampler_pf.record_token(A);
+        sampler_pf.record_token(A);
+        auto penalties_pf = sampler_pf.compute_penalty_map(params_pf, 100);
+        float pf_only = 0.0f;
+        for (const auto &p : penalties_pf)
+            if (p.token_id == A) pf_only = p.penalty;
+
+        // Compute DRY only
+        SamplingParams params_dry;
+        params_dry.dry_multiplier = 1.0f;
+        params_dry.dry_allowed_length = 0;
+        params_dry.dry_penalty_last_n = -1;
+
+        Sampler sampler_dry(42);
+        sampler_dry.record_token(A);
+        sampler_dry.record_token(A);
+        sampler_dry.record_token(A);
+        auto penalties_dry = sampler_dry.compute_penalty_map(params_dry, 100);
+        float dry_only = 0.0f;
+        for (const auto &p : penalties_dry)
+            if (p.token_id == A) dry_only = p.penalty;
+
+        // Compute combined
+        SamplingParams params_both;
+        params_both.presence_penalty = 1.0f;
+        params_both.frequency_penalty = 0.5f;
+        params_both.dry_multiplier = 1.0f;
+        params_both.dry_allowed_length = 0;
+        params_both.dry_penalty_last_n = -1;
+
+        auto penalties_both = sampler_->compute_penalty_map(params_both, 100);
+        float combined = 0.0f;
+        for (const auto &p : penalties_both)
+            if (p.token_id == A) combined = p.penalty;
+
+        // Combined should equal pf + dry (additive, not max)
+        EXPECT_NEAR(combined, pf_only + dry_only, 0.001f)
+            << "DRY should be added to presence+frequency penalties, not max'd";
+    }
+
 } // anonymous namespace

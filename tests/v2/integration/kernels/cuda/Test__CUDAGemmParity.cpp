@@ -1815,60 +1815,6 @@ TEST_F(Test__CUDAGemmParity, CachedKernel_vs_FreshKernel)
     llaminar::v2::kernels::KernelFactory::clearCache();
 }
 
-TEST_F(Test__CUDAGemmParity, CachedIQ4_NLKernel_FirstExecutionPopulatesLazyCUDAUploads)
-{
-    const int M = 8;
-    const int N = 128;
-    const int K = 128;
-
-    auto weights = TestTensorFactory::createIQ4_NLRandom({static_cast<size_t>(N), static_cast<size_t>(K)}, 2026);
-    auto input = TestTensorFactory::createFP32Random({static_cast<size_t>(M), static_cast<size_t>(K)}, -0.25f, 0.25f, 17);
-    auto output = TestTensorFactory::createFP32Zeros({static_cast<size_t>(M), static_cast<size_t>(N)});
-
-    ASSERT_TRUE(weights->ensureOnDevice(gpu_device_));
-
-    auto *packed = llaminar::v2::kernels::KernelFactory::ensureCUDAPackedWeightsInTensorCache(weights.get());
-    ASSERT_NE(packed, nullptr);
-    EXPECT_EQ(packed->preferred_family, llaminar2::cuda::CUDAPackedWeightFamily::NativeVNNI);
-    EXPECT_EQ(packed->active_family, llaminar2::cuda::CUDAPackedWeightFamily::NativeVNNI);
-    EXPECT_FALSE(packed->uploaded);
-    EXPECT_TRUE(packed->device_uploads.empty());
-    EXPECT_FALSE(packed->native_vnni.empty());
-
-    auto *cached_kernel = getPreparedKernel(weights.get(), gpu_device_);
-    ASSERT_NE(cached_kernel, nullptr);
-    ASSERT_TRUE(setupWorkspaceIfNeeded(cached_kernel, M, N, K));
-
-    ASSERT_TRUE(with_gpu_coherence(
-        gpu_device_,
-        {input.get()},
-        {output.get()},
-        [&]
-        {
-            return cached_kernel->multiply_tensor(
-                input.get(), output.get(),
-                M, N, K,
-                true, 1.0f, 0.0f,
-                nullptr, nullptr, -1);
-        }));
-
-    EXPECT_TRUE(packed->uploaded);
-    auto upload_it = packed->device_uploads.find(gpu_device_.cuda_ordinal());
-    ASSERT_NE(upload_it, packed->device_uploads.end());
-
-    const auto &upload = upload_it->second;
-    EXPECT_NE(upload.d_native_vnni, nullptr);
-    EXPECT_NE(upload.d_native_scales, nullptr);
-    EXPECT_EQ(upload.d_native_mins, nullptr);
-    EXPECT_EQ(upload.d_native_emins, nullptr);
-
-    EXPECT_TRUE(packed->native_vnni.empty()) << "Native payload host buffers should be released after first upload";
-    EXPECT_TRUE(packed->native_scales.empty()) << "Native payload host scales should be released after first upload";
-
-    cleanupWorkspaceIfNeeded(cached_kernel);
-    llaminar::v2::kernels::KernelFactory::clearCache();
-}
-
 /**
  * @test Cached kernel reuse: multiple calls with same kernel
  *

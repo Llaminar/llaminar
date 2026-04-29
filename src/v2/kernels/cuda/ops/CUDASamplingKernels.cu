@@ -181,6 +181,28 @@ __global__ void cuda_topk_f32_kernel(
 }
 
 // ============================================================================
+// Logit Penalty Application Kernel — Subtract sparse penalties from logits
+// ============================================================================
+
+__global__ void cuda_apply_logit_penalties_f32_kernel(
+    float *__restrict__ logits,
+    const int *__restrict__ token_ids,
+    const float *__restrict__ penalties,
+    int num_penalties,
+    int vocab_size)
+{
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= num_penalties)
+        return;
+
+    int token_id = token_ids[idx];
+    if (token_id >= 0 && token_id < vocab_size)
+    {
+        logits[token_id] -= penalties[idx];
+    }
+}
+
+// ============================================================================
 // Extern "C" Wrappers
 // ============================================================================
 
@@ -243,6 +265,41 @@ extern "C"
         if (err != cudaSuccess)
         {
             fprintf(stderr, "CUDA Top-K FP32 kernel launch failed: %s\n",
+                    cudaGetErrorString(err));
+            return false;
+        }
+        return true;
+    }
+
+    // ============================================================================
+    // Logit Penalty Application Kernel
+    // ============================================================================
+
+    bool cudaOps_apply_logit_penalties_f32(
+        float *logits,
+        const int *token_ids,
+        const float *penalties,
+        int num_penalties,
+        int vocab_size,
+        int device_idx,
+        void *stream)
+    {
+        if (num_penalties <= 0 || !logits || !token_ids || !penalties)
+            return false;
+
+        cudaSetDevice(device_idx);
+
+        // Simple 1D grid: one thread per penalty entry
+        const int threads = 256;
+        const int blocks = (num_penalties + threads - 1) / threads;
+
+        cuda_apply_logit_penalties_f32_kernel<<<blocks, threads, 0, static_cast<cudaStream_t>(stream)>>>(
+            logits, token_ids, penalties, num_penalties, vocab_size);
+
+        cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess)
+        {
+            fprintf(stderr, "CUDA Apply Logit Penalties kernel launch failed: %s\n",
                     cudaGetErrorString(err));
             return false;
         }

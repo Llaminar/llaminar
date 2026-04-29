@@ -142,7 +142,7 @@ Each weight job advances through slot `i` in a ring-buffer pool:
    - Prepared-handle creation remains authoritative; readiness set when commit event completes.
 4. `DebugEnv`
    - Add feature flags + tunables:
-     - `LLAMINAR_ROCM_STARTUP_GPU_REPACK=1`
+     - GPU repack pipeline is now the unconditional default for all GPU devices
      - `LLAMINAR_ROCM_REPACK_SLOTS=<n>`
      - `LLAMINAR_ROCM_REPACK_BUDGET_MB=<mb>`
      - `LLAMINAR_ROCM_REPACK_STREAMS=<n>` (optional, default fixed 3)

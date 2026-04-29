@@ -233,6 +233,8 @@ namespace llaminar2
         void setSamplingParams(const SamplingParams &params) override;
         SamplingParams getSamplingParams() const { return active_sampling_params_; }
         SamplingParams getRecommendedSamplingParams() const override;
+        std::string getStopThinkingPrompt() const override;
+        ToolCallFormat getToolCallFormat() const override;
 
         // =====================================================================
         // MPI Worker Loop (for non-root ranks in server mode)
@@ -428,6 +430,8 @@ namespace llaminar2
         Sampler sampler_;
         SamplingParams active_sampling_params_;      // Current sampling params for decodeStep()
         SamplingParams recommended_sampling_params_; // Model-specific defaults
+        std::string stop_thinking_prompt_;            // Model-specific stop-thinking prompt
+        ToolCallFormat tool_call_format_{ToolCallFormat::HERMES_2_PRO}; // Model-specific tool call format
         int32_t last_token_{0};                      // Last token for decode step
         bool prefill_logits_ready_{false};           // True after prefill(); first decodeStep() samples from existing logits
         bool mpi_coordinated_mode_{false};           // When true, rank 0 broadcasts commands for worker loop

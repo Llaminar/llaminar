@@ -13,6 +13,19 @@
 #include "../tensors/TensorSlice.h"
 #include "../kernels/KernelFactory.h"
 #include "../backends/BackendManager.h"
+
+// GPU weight loading pipeline
+#include "gpu_pipeline/LoadOrchestrator.h"
+#include "gpu_pipeline/WeightVRAMPool.h"
+#include "gpu_pipeline/RepackFormat.h"
+
+// Backend-specific GEMM kernels (for GPU pipeline kernel creation)
+#ifdef HAVE_ROCM
+#include "../kernels/rocm/gemm/ROCmQuantisedGemmKernel.h"
+#endif
+#ifdef HAVE_CUDA
+#include "../kernels/cuda/gemm/CUDAQuantisedGemmKernel.h"
+#endif
 #include <iostream>
 #include <cstring>
 #include <stdexcept>
@@ -22,6 +35,7 @@
 #include <condition_variable>
 #include <deque>
 #include <atomic>
+#include <iomanip>
 #include <thread>
 #include <future>
 #include <unordered_map>
@@ -157,9 +171,7 @@ namespace llaminar2
             // the tensor has a valid GPU copy OR kernel-managed device data.
             if (!ptr->deviceValid())
             {
-                bool has_kernel_device_data =
-                    ptr->hasCachedDeviceData(DeviceType::CUDA) ||
-                    ptr->hasCachedDeviceData(DeviceType::ROCm);
+                bool has_kernel_device_data = ptr->isInPreparedGemmRegistry();
 
                 if (!has_kernel_device_data)
                 {
@@ -2090,6 +2102,26 @@ namespace llaminar2
                      << weight_names.size() << " tensors)");
         }
 
+        // Add virtual weights that exist in the sharding config but not in
+        // the GGUF file. Example: "output.weight" when tied to
+        // "token_embd.weight" — the GGUF has no "output.weight" tensor, but
+        // getShardedWeightForAssignment() knows how to synthesize one.
+        // Without this, packGemmWeightsViaPipeline() never sees the LM head,
+        // and the later buildWeights() call creates a different tensor object
+        // that misses the prepared-GEMM registry.
+        if (has_sharding_config_)
+        {
+            std::unordered_set<std::string> name_set(weight_names.begin(), weight_names.end());
+            for (const auto &[name, mode] : sharding_config_.exact_matches)
+            {
+                if (name_set.find(name) == name_set.end())
+                {
+                    weight_names.push_back(name);
+                    LOG_DEBUG("[WeightManager] Adding virtual weight to preload: " << name);
+                }
+            }
+        }
+
         size_t loaded_tensors = 0;
         size_t total_uploads = 0;
         size_t load_failures = 0;
@@ -2132,7 +2164,13 @@ namespace llaminar2
                 //   and never reads the raw Q8_0 gpu_data_ptr_. Without this,
                 //   both the raw Q8_0 AND the VNNI copy sit on GPU — ~1.9 GB
                 //   wasted per device.
-                if (device.is_gpu() && (name == "token_embd.weight" || is_gemm_weight))
+                //
+                // - MoE 3D expert tensors (_exps.weight): MoEExpertWeightService
+                //   reads host views and batch-packs into VNNI slabs with its own
+                //   GPU upload.  Uploading the raw 3D tensor here wastes ~8 GB/device
+                //   and fragments VRAM, making subsequent hipMalloc calls very slow.
+                const bool is_moe_expert = (name.find("_exps.weight") != std::string::npos);
+                if (device.is_gpu() && (name == "token_embd.weight" || is_gemm_weight || is_moe_expert))
                 {
                     tensor->setHostResident();
                 }
@@ -2203,11 +2241,15 @@ namespace llaminar2
         const char *device_name = device.is_rocm() ? "ROCm" : (device.is_cuda() ? "CUDA" : "CPU");
 
         // Step 1: Pack GEMM weights (async on GPU for overlap with step 2)
+        // GPU devices use the GPU-native pipeline (LoadOrchestrator) which does
+        // single VRAM alloc + pipelined H2D + GPU repack kernels.
+        // CPU devices use the CPU-side VNNI packing path.
         std::future<bool> gemm_future;
         if (is_gpu)
         {
+            LOG_INFO("[WeightManager] Using GPU weight loading pipeline for " << device_name);
             gemm_future = std::async(std::launch::async, [this, device, &layer_filter]()
-                                     { return packGemmWeights(device, nullptr, /*release_raw_data=*/false, layer_filter); });
+                                     { return packGemmWeightsViaPipeline(device, layer_filter); });
         }
 
         // Step 2: Upload non-GEMM weights (norms, embeddings) to device
@@ -2230,20 +2272,14 @@ namespace llaminar2
             using namespace llaminar::v2::kernels;
             const int d_model = static_cast<int>(loader_.embeddingLength());
 
-            const TensorBase *embed_tensor = nullptr;
-            {
-                std::lock_guard<std::mutex> lock(cache_mutex_);
-                const std::string device_key = device.to_string() + ":token_embd.weight";
-                auto pdit = per_device_cache_.find(device_key);
-                if (pdit != per_device_cache_.end() && pdit->second)
-                    embed_tensor = pdit->second.get();
-                else
-                {
-                    auto it = cache_.find("token_embd.weight");
-                    if (it != cache_.end() && it->second)
-                        embed_tensor = it->second.get();
-                }
-            }
+            // Use getWeightForDevice() to get the canonical tensor pointer —
+            // this is the same pointer that InferenceRunnerFactory will pass to
+            // EmbeddingStage at execution time. Previously we looked up
+            // per_device_cache_ directly, which could return a different clone
+            // than what getWeightForDevice() returns for first_device_ (it
+            // returns the original from cache_, not the per-device clone).
+            auto embed_shared = getWeightForDevice("token_embd.weight", device);
+            const TensorBase *embed_tensor = embed_shared ? embed_shared.get() : nullptr;
 
             if (embed_tensor && d_model > 0)
             {
@@ -2271,70 +2307,6 @@ namespace llaminar2
         {
             LOG_WARN("[WeightManager] GEMM weight packing failed for " << device_name
                                                                        << ", will use lazy kernel creation");
-        }
-
-        // Step 4: For tied-embedding models, pre-pack token_embd.weight as GEMM
-        // so it can be used for lm_head projection. Without this, the lm_head
-        // kernel would lazy-pack on first forward() — but by that point host
-        // weight data may have been released by releaseAllHostWeightData(),
-        // causing a segfault when reading the original quantized blocks.
-        //
-        // Applies to PP stages that own the lm_head (has_lm_head=true) when
-        // output.weight is absent in the GGUF (tied to token_embd.weight).
-        if (is_gpu && layer_filter)
-        {
-            bool stage_has_lm_head = layer_filter("output.weight");
-            if (stage_has_lm_head)
-            {
-                auto output_shape = loader_.getTensorShape("output.weight");
-                bool tied = !output_shape || output_shape->empty();
-                if (tied)
-                {
-                    using namespace llaminar::v2::kernels;
-                    const TensorBase *embed_for_lm = nullptr;
-                    {
-                        std::lock_guard<std::mutex> lock(cache_mutex_);
-                        const std::string device_key = device.to_string() + ":token_embd.weight";
-                        auto pdit = per_device_cache_.find(device_key);
-                        if (pdit != per_device_cache_.end() && pdit->second)
-                            embed_for_lm = pdit->second.get();
-                        else
-                        {
-                            auto it = cache_.find("token_embd.weight");
-                            if (it != cache_.end() && it->second)
-                                embed_for_lm = it->second.get();
-                        }
-                    }
-
-                    if (!embed_for_lm)
-                    {
-                        throw std::runtime_error(
-                            std::string("[WeightManager] Tied lm_head requested for ") +
-                            device_name + " but token_embd.weight is not loaded on the device");
-                    }
-
-                    const auto *handle = KernelFactory::getOrCreatePreparedGemmWeights(
-                        embed_for_lm, device);
-                    if (!handle)
-                    {
-                        throw std::runtime_error(
-                            std::string("[WeightManager] Failed to prepare tied lm_head GEMM weights for ") +
-                            device_name);
-                    }
-
-                    auto *kernel = KernelFactory::getOrCreateGemmEngine(handle);
-                    if (!kernel)
-                    {
-                        throw std::runtime_error(
-                            std::string("[WeightManager] Failed to create GEMM engine for tied lm_head on ") +
-                            device_name);
-                    }
-
-                    kernel->prepareWeights();
-                    LOG_INFO("[WeightManager] Pre-packed tied lm_head (token_embd.weight) as GEMM for "
-                             << device_name);
-                }
-            }
         }
 
         return gemm_ok && non_gemm_ok;
@@ -2381,19 +2353,60 @@ namespace llaminar2
             return false;
         }
 
-        // Step 2: Pack GEMM weights per device (sequential across devices to
-        // avoid HIP/CUDA runtime races from concurrent multi-device hipMemcpy).
-        // Each packGemmWeights call has internal producer/consumer parallelism
-        // for the single target device's weights.
+        // Step 2: Pack GEMM weights per device.
+        // GPU devices use the GPU-native pipeline (LoadOrchestrator) with
+        // pipelined H2D + GPU repack kernels. CPU devices use CPU-side packing.
+        // Each GPU gets its own LoadOrchestrator, VRAM pool, and pinned ring
+        // buffer — fully independent, safe to parallelize.
         bool all_ok = true;
-        for (const auto &dev : devices)
+
+        const auto gemm_wall_start = std::chrono::high_resolution_clock::now();
+
         {
-            if (!packGemmWeights(dev, nullptr, /*release_raw_data=*/false))
+            std::vector<std::future<bool>> gemm_futures;
+            std::vector<std::chrono::high_resolution_clock::time_point> per_device_start(devices.size());
+            gemm_futures.reserve(devices.size());
+
+            for (size_t i = 0; i < devices.size(); ++i)
             {
-                LOG_WARN("[WeightManager] GEMM packing failed for device " << dev.toString());
-                all_ok = false;
+                const auto &dev = devices[i];
+                per_device_start[i] = std::chrono::high_resolution_clock::now();
+
+                if (dev.is_gpu())
+                {
+                    LOG_INFO("[WeightManager] finalizeForDevices: launching GPU pipeline for "
+                             << dev.toString());
+                    gemm_futures.push_back(std::async(std::launch::async,
+                        [this, dev]() { return packGemmWeightsViaPipeline(dev, nullptr); }));
+                }
+                else
+                {
+                    gemm_futures.push_back(std::async(std::launch::async,
+                        [this, dev]() { return packGemmWeights(dev, nullptr, /*release_raw_data=*/false); }));
+                }
+            }
+
+            for (size_t i = 0; i < devices.size(); ++i)
+            {
+                const bool ok = gemm_futures[i].get();
+                const auto pack_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::high_resolution_clock::now() - per_device_start[i]).count();
+                if (!ok)
+                {
+                    LOG_WARN("[WeightManager] GEMM packing failed for device " << devices[i].toString());
+                    all_ok = false;
+                }
+                const char *mode = devices[i].is_gpu() ? "GPU pipeline" : "CPU repack";
+                LOG_INFO("[WeightManager] packGemmWeights for " << devices[i].toString()
+                         << " completed in " << pack_ms << " ms (" << mode << ")");
             }
         }
+
+        const auto gemm_wall_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::high_resolution_clock::now() - gemm_wall_start).count();
+        LOG_INFO("[WeightManager] All " << devices.size() << " devices GEMM packed in "
+                 << gemm_wall_ms << " ms wall-clock"
+                 << (devices.size() > 1 ? " (parallel)" : ""));
 
         // Step 2b: Prepare embedding weights for each device.
         // Repacks from native quantized format (Q8_0, etc.) → EmbedQ8Block
@@ -2408,28 +2421,12 @@ namespace llaminar2
                 if (!dev.is_gpu())
                     continue;
 
-                // Find the embedding tensor for this device
-                const TensorBase *embed_tensor = nullptr;
-                {
-                    std::lock_guard<std::mutex> lock(cache_mutex_);
-
-                    // Check per-device cache first (LOCAL TP — may hold a vocab slice)
-                    const std::string device_key = dev.to_string() + ":token_embd.weight";
-                    auto pdit = per_device_cache_.find(device_key);
-                    if (pdit != per_device_cache_.end() && pdit->second)
-                    {
-                        embed_tensor = pdit->second.get();
-                    }
-                    else
-                    {
-                        // Fall back to global cache
-                        auto it = cache_.find("token_embd.weight");
-                        if (it != cache_.end() && it->second)
-                        {
-                            embed_tensor = it->second.get();
-                        }
-                    }
-                }
+                // Use getWeightForDevice() for the canonical tensor pointer —
+                // same pointer that the graph builder will use at execution time.
+                // For TP with vocab-parallel sharding, per-device cache may hold
+                // a vocab slice; getWeightForDevice handles this correctly.
+                auto embed_shared = getWeightForDevice("token_embd.weight", dev);
+                const TensorBase *embed_tensor = embed_shared ? embed_shared.get() : nullptr;
 
                 if (embed_tensor && d_model > 0)
                 {
@@ -2585,9 +2582,11 @@ namespace llaminar2
                     }
                 }
             }
-            else
+
+            // Fall back to main cache if per_device_cache had no GEMM weights
+            // (e.g. only non-GEMM entries exist in per_device_cache for this device)
+            if (gemm_weights.empty())
             {
-                // Single-device: iterate cache_ as before
                 gemm_weights.reserve(cache_.size());
                 for (const auto &[name, tensor] : cache_)
                 {
@@ -2643,21 +2642,12 @@ namespace llaminar2
                                              << target_device.to_string());
 
         const size_t total = gemm_weights.size();
-        const unsigned hardware_threads = std::max(1u, std::thread::hardware_concurrency());
 
-        unsigned prepare_workers = target_device.is_gpu()
-                                       ? std::min<unsigned>(8u, hardware_threads)
-                                       : 1u;
-        unsigned upload_workers = target_device.is_gpu()
-                                      ? std::min<unsigned>(2u, hardware_threads)
-                                      : 1u;
-        size_t queue_capacity = std::max<size_t>(4, static_cast<size_t>(upload_workers) * 4);
-
-        // Architectural direction is now VNNI-only startup preparation. The
-        // legacy ROCm CK row-major startup repack pipeline (and its per-device
-        // budget/worker shaping) has been removed. We intentionally keep the
-        // default producer/consumer topology since there is no corresponding
-        // GPU overlap benefit to recover.
+        // CPU-only path: single producer, single consumer.
+        // GPU devices use packGemmWeightsViaPipeline() instead.
+        constexpr unsigned prepare_workers = 1;
+        constexpr unsigned upload_workers = 1;
+        constexpr size_t queue_capacity = 4;
 
         struct PreparedJob
         {
@@ -2677,7 +2667,6 @@ namespace llaminar2
         std::atomic<bool> producer_done{false};
         std::atomic<bool> all_success{true};
         std::atomic<size_t> local_cpu_packed{0};
-        std::atomic<size_t> local_gpu_packed{0};
 
         auto prepare_job = [&](const std::pair<std::string, std::shared_ptr<TensorBase>> &entry) -> PreparedJob
         {
@@ -2706,7 +2695,7 @@ namespace llaminar2
                 return false;
             }
 
-            auto run_upload = [&]() -> bool
+            try
             {
                 auto *kernel = KernelFactory::getOrCreateGemmEngine(job.prepared);
                 if (!kernel)
@@ -2721,21 +2710,6 @@ namespace llaminar2
                     return false;
                 }
                 return true;
-            };
-
-            try
-            {
-                if (target_device.is_rocm())
-                {
-                    KernelFactory::ROCmOrdinalGuard guard(target_device.ordinal);
-                    return run_upload();
-                }
-                if (target_device.is_cuda())
-                {
-                    KernelFactory::CUDAOrdinalGuard guard(target_device.ordinal);
-                    return run_upload();
-                }
-                return run_upload();
             }
             catch (const std::exception &e)
             {
@@ -2838,38 +2812,24 @@ namespace llaminar2
                 }
                 else
                 {
-                    if (target_device.is_gpu())
+                    markPrepState(job.name, target_device, WeightPrepState::PACKED_HOST, true, "GEMM packed on CPU");
+                    local_cpu_packed.fetch_add(1, std::memory_order_relaxed);
+                    // Only release host data for quantized tensors on CPU.
+                    // Quantized GEMM kernels (VNNI) prepack data into their own buffers,
+                    // so the original host data is no longer needed.
+                    // Floating-point GEMM (oneDNN) reads weight_tensor_->data() live
+                    // at every inference call — releasing would cause a null dereference.
+                    if (release_raw_data && job.tensor &&
+                        dynamic_cast<IINT8Unpackable *>(job.tensor.get()))
                     {
-                        markPrepState(job.name, target_device, WeightPrepState::UPLOADED_DEVICE, true, "GEMM packed + uploaded");
-                        local_gpu_packed.fetch_add(1, std::memory_order_relaxed);
-                        // Release heap-allocated row-slice data now that weights are on GPU.
-                        // Mmap-backed tensors (is_view()==true) are zero-copy and cost nothing.
-                        if (release_raw_data && job.tensor && !job.tensor->is_view())
-                        {
-                            job.tensor->release_raw_data();
-                        }
-                    }
-                    else
-                    {
-                        markPrepState(job.name, target_device, WeightPrepState::PACKED_HOST, true, "GEMM packed on CPU");
-                        local_cpu_packed.fetch_add(1, std::memory_order_relaxed);
-                        // Only release host data for quantized tensors on CPU.
-                        // Quantized GEMM kernels (VNNI) prepack data into their own buffers,
-                        // so the original host data is no longer needed.
-                        // Floating-point GEMM (oneDNN) reads weight_tensor_->data() live
-                        // at every inference call — releasing would cause a null dereference.
-                        if (release_raw_data && job.tensor &&
-                            dynamic_cast<IINT8Unpackable *>(job.tensor.get()))
-                        {
-                            job.tensor->release_host_weight_data();
-                        }
+                        job.tensor->release_host_weight_data();
                     }
 
                     markPrepState(job.name, target_device, WeightPrepState::READY, true, "GEMM weight ready");
                     evaluateReclaimEligibility(job.name, true);
 
                     // Release mmap pages for this weight now that the GEMM engine
-                    // has its own copy (VNNI-packed on CPU, or uploaded to GPU).
+                    // has its own copy (VNNI-packed on CPU).
                     // is_mmap_data() checks the tensor's data is actually in an
                     // mmap'd region. is_view() is NOT safe here — TensorSlice
                     // (from TP sharding) returns is_view()=true but has heap data.
@@ -2919,7 +2879,6 @@ namespace llaminar2
         {
             std::lock_guard<std::mutex> lock(cache_mutex_);
             num_cpu_packed_ += local_cpu_packed.load(std::memory_order_relaxed);
-            num_gpu_packed_ += local_gpu_packed.load(std::memory_order_relaxed);
         }
 
         if (detail_enabled)
@@ -2948,6 +2907,322 @@ namespace llaminar2
         }
 
         return all_success.load(std::memory_order_relaxed);
+    }
+
+    bool WeightManager::packGemmWeightsViaPipeline(
+        DeviceId target_device,
+        std::function<bool(const std::string &)> layer_filter)
+    {
+        using namespace llaminar::v2::kernels;
+        using Clock = std::chrono::high_resolution_clock;
+        const auto start = Clock::now();
+
+        if (!target_device.is_gpu())
+        {
+            LOG_ERROR("[WeightManager] GPU pipeline only supports GPU devices");
+            return false;
+        }
+
+        // ------------------------------------------------------------------
+        // Step 1: Collect GEMM weights (same logic as packGemmWeights)
+        // ------------------------------------------------------------------
+        std::vector<std::pair<std::string, std::shared_ptr<TensorBase>>> gemm_weights;
+        {
+            std::lock_guard<std::mutex> lock(cache_mutex_);
+            const std::string device_prefix = target_device.to_string() + ":";
+            bool has_per_device_entries = false;
+
+            for (const auto &[key, tensor] : per_device_cache_)
+            {
+                if (key.compare(0, device_prefix.size(), device_prefix) == 0)
+                {
+                    has_per_device_entries = true;
+                    break;
+                }
+            }
+
+            if (has_per_device_entries)
+            {
+                for (const auto &[key, tensor] : per_device_cache_)
+                {
+                    if (key.compare(0, device_prefix.size(), device_prefix) != 0)
+                        continue;
+                    const std::string name = key.substr(device_prefix.size());
+                    if (isGemmWeight(name) && tensor)
+                    {
+                        if (layer_filter && !layer_filter(name))
+                            continue;
+                        gemm_weights.emplace_back(name, tensor);
+                    }
+                }
+            }
+
+            // Fall back to main cache if per_device_cache had no GEMM weights
+            // (e.g. only non-GEMM entries exist in per_device_cache for this device)
+            if (gemm_weights.empty())
+            {
+                gemm_weights.reserve(cache_.size());
+                for (const auto &[name, tensor] : cache_)
+                {
+                    if (isGemmWeight(name) && tensor)
+                    {
+                        if (layer_filter && !layer_filter(name))
+                            continue;
+                        gemm_weights.emplace_back(name, tensor);
+                    }
+                }
+            }
+
+            // Tied LM head: if this stage owns lm_head (layer_filter passes
+            // output.weight) but output.weight wasn't collected, the model
+            // ties token_embd.weight as the LM projection weight. Include
+            // it in the pipeline so it gets GPU-repacked instead of falling
+            // back to CPU-side VNNI packing + lazy H2D.
+            if (!layer_filter || layer_filter("output.weight"))
+            {
+                bool has_output_weight = false;
+                for (const auto &[n, _] : gemm_weights)
+                {
+                    if (n == "output.weight") { has_output_weight = true; break; }
+                }
+                if (!has_output_weight)
+                {
+                    std::shared_ptr<TensorBase> embed_tensor;
+                    const std::string device_key = target_device.to_string() + ":token_embd.weight";
+                    auto pdit = per_device_cache_.find(device_key);
+                    if (pdit != per_device_cache_.end() && pdit->second)
+                        embed_tensor = pdit->second;
+                    else
+                    {
+                        auto it = cache_.find("token_embd.weight");
+                        if (it != cache_.end() && it->second)
+                            embed_tensor = it->second;
+                    }
+                    if (embed_tensor)
+                    {
+                        gemm_weights.emplace_back("token_embd.weight", embed_tensor);
+                        LOG_INFO("[WeightManager] GPU pipeline: including tied token_embd.weight as LM head GEMM");
+                    }
+                }
+            }
+        }
+
+        if (gemm_weights.empty())
+        {
+            LOG_DEBUG("[WeightManager] GPU pipeline: no GEMM weights to load");
+            return true;
+        }
+
+        LOG_INFO("[WeightManager] GPU pipeline: loading " << gemm_weights.size()
+                 << " GEMM weights for " << target_device.to_string());
+
+        // ------------------------------------------------------------------
+        // Step 2: Get backend
+        // ------------------------------------------------------------------
+        IBackend *backend = target_device.is_rocm() ? getROCmBackend()
+                            : target_device.is_cuda() ? getCUDABackend()
+                                                      : nullptr;
+        if (!backend)
+        {
+            LOG_ERROR("[WeightManager] GPU pipeline: no backend for " << target_device.to_string());
+            return false;
+        }
+
+        // ------------------------------------------------------------------
+        // Step 3: Create orchestrator and plan weights
+        // ------------------------------------------------------------------
+        auto orchestrator = std::make_shared<LoadOrchestrator>(backend);
+        orchestrator->addDevice(target_device.ordinal);
+
+        size_t max_raw_bytes = 0;
+        size_t planned_count = 0;
+        std::vector<std::pair<std::string, const NativeVnniFormatInfo *>> weight_formats;
+        weight_formats.reserve(gemm_weights.size());
+
+        for (const auto &[name, tensor] : gemm_weights)
+        {
+            auto *unpackable = dynamic_cast<IINT8Unpackable *>(tensor.get());
+            const NativeVnniFormatInfo *vnni = unpackable ? unpackable->vnniFormatInfo() : nullptr;
+            if (!vnni)
+            {
+                LOG_WARN("[WeightManager] GPU pipeline: skipping non-VNNI weight: " << name);
+                weight_formats.emplace_back(name, nullptr);
+                continue;
+            }
+
+            const int N = static_cast<int>(tensor->rows());
+            const int K = static_cast<int>(tensor->cols());
+            const size_t raw_bytes = tensor->size_bytes();
+
+            orchestrator->planWeight(target_device.ordinal, name, N, K,
+                                     vnni->payload_bytes, vnni->is_asymmetric,
+                                     vnni->has_emins, raw_bytes);
+            max_raw_bytes = std::max(max_raw_bytes, raw_bytes);
+            ++planned_count;
+            weight_formats.emplace_back(name, vnni);
+        }
+
+        if (planned_count == 0)
+        {
+            LOG_WARN("[WeightManager] GPU pipeline: no weights with VNNI format info");
+            return false;
+        }
+
+        // ------------------------------------------------------------------
+        // Step 4: Allocate VRAM pool + pinned ring buffer
+        // ------------------------------------------------------------------
+        const auto &rocm_cfg = debugEnv().rocm;
+        orchestrator->allocate(max_raw_bytes, rocm_cfg.repack_streams);
+
+        // ------------------------------------------------------------------
+        // Step 5: Create weight jobs
+        // ------------------------------------------------------------------
+        for (size_t i = 0; i < gemm_weights.size(); ++i)
+        {
+            const auto &[name, tensor] = gemm_weights[i];
+            const auto *vnni = weight_formats[i].second;
+            if (!vnni)
+                continue;
+
+            auto repack_fmt = codebookIdToRepackFormat(vnni->codebook_id, vnni->is_superblock);
+            if (!repack_fmt)
+            {
+                LOG_WARN("[WeightManager] GPU pipeline: unsupported format for " << name
+                         << " (codebook=" << static_cast<int>(vnni->codebook_id)
+                         << ", superblock=" << vnni->is_superblock << ")");
+                continue;
+            }
+
+            WeightJob job;
+            job.name = name;
+            job.host_raw_data = tensor->raw_data();
+            job.raw_bytes = tensor->size_bytes();
+            job.format = *repack_fmt;
+            job.N = static_cast<int>(tensor->rows());
+            job.K = static_cast<int>(tensor->cols());
+            job.is_asymmetric = vnni->is_asymmetric;
+
+            orchestrator->addWeightJob(target_device.ordinal, job);
+        }
+
+        // ------------------------------------------------------------------
+        // Step 6: Execute pipeline (H2D + GPU repack)
+        // ------------------------------------------------------------------
+        orchestrator->load();
+
+        // ------------------------------------------------------------------
+        // Step 7: Create GEMM kernels from pool slots and register in KernelFactory
+        // ------------------------------------------------------------------
+        auto *pool = orchestrator->getPool(target_device.ordinal);
+        if (!pool)
+        {
+            LOG_ERROR("[WeightManager] GPU pipeline: pool not found after load");
+            return false;
+        }
+
+        size_t registered = 0;
+        for (size_t i = 0; i < gemm_weights.size(); ++i)
+        {
+            const auto &[name, tensor] = gemm_weights[i];
+            const auto *vnni = weight_formats[i].second;
+            if (!vnni)
+                continue;
+
+            auto slot = pool->getSlot(name);
+            if (!slot)
+            {
+                LOG_WARN("[WeightManager] GPU pipeline: no slot for " << name);
+                continue;
+            }
+
+            const int N = static_cast<int>(tensor->rows());
+            const int K = static_cast<int>(tensor->cols());
+            const uint32_t blocks_per_row = static_cast<uint32_t>(K / 32);
+
+            std::unique_ptr<ITensorGemm> kernel;
+
+#ifdef HAVE_ROCM
+            if (target_device.is_rocm())
+            {
+                kernel = std::make_unique<llaminar2::rocm::ROCmQuantisedGemmKernel>(
+                    N, K, target_device.ordinal,
+                    slot->d_native_vnni_payload,
+                    slot->d_native_vnni_scales,
+                    slot->d_native_vnni_mins,
+                    slot->d_native_vnni_emins,
+                    vnni->codebook_id, blocks_per_row,
+                    orchestrator); // lifetime owner: keeps VRAM pool alive
+            }
+#endif
+
+#ifdef HAVE_CUDA
+            if (target_device.is_cuda())
+            {
+                kernel = std::make_unique<llaminar2::cuda::CUDAQuantisedGemmKernel>(
+                    N, K, target_device.ordinal,
+                    slot->d_native_vnni_payload,
+                    static_cast<uint16_t *>(slot->d_native_vnni_scales),
+                    static_cast<uint16_t *>(slot->d_native_vnni_mins),
+                    static_cast<uint32_t *>(slot->d_native_vnni_emins),
+                    vnni->codebook_id, blocks_per_row,
+                    orchestrator); // lifetime owner: keeps VRAM pool alive
+            }
+#endif
+
+            if (kernel)
+            {
+                auto *handle = KernelFactory::registerPreparedGemmFromTransfer(
+                    tensor.get(), target_device, std::move(kernel));
+                if (handle)
+                {
+                    markPrepState(name, target_device, WeightPrepState::UPLOADED_DEVICE, true,
+                                  "GPU pipeline: loaded + registered");
+                    markPrepState(name, target_device, WeightPrepState::READY, true,
+                                  "GPU pipeline: GEMM weight ready");
+                    ++registered;
+
+                    // Release host weight data — the GEMM kernel now owns device copies
+                    // in the WeightVRAMPool.  in_prepared_gemm_registry_ is already set
+                    // by registerPreparedGemmFromTransfer(), so releaseAllHostWeightData()
+                    // would also catch these, but releasing inline saves peak host memory.
+                    // Skip for token_embd.weight: it's also used for embedding lookup,
+                    // which runs concurrently (Steps 2/2b). Its host data is freed
+                    // later by releaseAllHostWeightData().
+                    if (name != "token_embd.weight")
+                    {
+                        try
+                        {
+                            tensor->release_host_weight_data();
+                        }
+                        catch (const std::exception &e)
+                        {
+                            LOG_DEBUG("[WeightManager] GPU pipeline: failed to release host data for "
+                                      << name << ": " << e.what());
+                        }
+                    }
+                }
+                else
+                {
+                    LOG_ERROR("[WeightManager] GPU pipeline: failed to register kernel for " << name);
+                }
+            }
+        }
+
+        const auto elapsed = std::chrono::duration<double, std::milli>(Clock::now() - start).count();
+        LOG_INFO("[WeightManager] GPU pipeline: loaded " << registered << "/" << gemm_weights.size()
+                 << " weights in " << std::fixed << std::setprecision(1) << elapsed << " ms");
+
+        // Release orchestrator staging resources now that all weights are loaded.
+        // The VRAM pool is kept alive by the GEMM kernels' lifetime_owner_ shared_ptrs,
+        // but the staging buffers (pinned ring) are no longer needed.
+        orchestrator->finalize();
+
+        {
+            std::lock_guard<std::mutex> lock(cache_mutex_);
+            num_gpu_packed_ += registered;
+        }
+
+        return registered == planned_count;
     }
 
     bool WeightManager::uploadNonGemmWeights(
@@ -3098,10 +3373,8 @@ namespace llaminar2
             // be freed. Similarly, PreparedEmbeddingWeights hold their own GPU copy.
             if (!ptr->deviceValid())
             {
-                // Check if kernel has its own device copy (CUDA/ROCm packed weights)
-                bool has_kernel_device_data =
-                    ptr->hasCachedDeviceData(DeviceType::CUDA) ||
-                    ptr->hasCachedDeviceData(DeviceType::ROCm);
+                // Check if kernel has its own device copy (prepared GEMM registry)
+                bool has_kernel_device_data = ptr->isInPreparedGemmRegistry();
 
                 // Check if tensor has PreparedEmbeddingWeights (embedding table).
                 // Since we don't know which device the weights are prepared for,
@@ -3119,8 +3392,7 @@ namespace llaminar2
                     LOG_DEBUG("[WeightManager] RETAINED host data for " << key
                                                                         << " (" << (tensor_bytes / 1024) << " KB)"
                                                                         << " deviceValid=" << ptr->deviceValid()
-                                                                        << " hasCUDA=" << ptr->hasCachedDeviceData(DeviceType::CUDA)
-                                                                        << " hasROCm=" << ptr->hasCachedDeviceData(DeviceType::ROCm)
+                                                                        << " inGemmRegistry=" << ptr->isInPreparedGemmRegistry()
                                                                         << " hostResident=" << ptr->isHostResident()
                                                                         << " type=" << static_cast<int>(ptr->native_type()));
                     return;

@@ -13,10 +13,12 @@
 
 #include "utils/Sampler.h"
 #include "utils/ChatTemplate.h"
+#include "utils/ToolCallTypes.h"
 #include <string>
 #include <vector>
 #include <optional>
 #include <functional>
+#include <nlohmann/json.hpp>
 
 namespace llaminar2
 {
@@ -40,6 +42,11 @@ namespace llaminar2
         bool presence_penalty{false};
         bool frequency_penalty{false};
         bool seed{false};
+        bool dry_multiplier{false};
+        bool dry_base{false};
+        bool dry_allowed_length{false};
+        bool dry_penalty_last_n{false};
+        bool dry_sequence_breakers{false};
     };
 
     struct ChatCompletionRequest
@@ -53,6 +60,26 @@ namespace llaminar2
         bool stream{false};         ///< If true, use SSE streaming response
         bool enable_thinking{true}; ///< If true, enable thinking mode for thinking models
         std::string model;          ///< Model identifier from request (optional)
+
+        /// Thinking budget: maximum tokens to spend in thinking mode.
+        /// -1 = no budget (unlimited thinking), 0 = disable thinking.
+        /// When exhausted, a stop-thinking sequence is injected into the stream.
+        int thinking_budget_tokens{-1};
+
+        // =================================================================
+        // Tool Calling Fields (OpenAI-compatible)
+        // =================================================================
+
+        /// Tool definitions available for the model to call.
+        /// JSON array of {type: "function", function: {name, description, parameters}}.
+        nlohmann::json tools;
+
+        /// Tool choice control: "none", "auto", "required", or
+        /// {"type": "function", "function": {"name": "..."}} to force a specific tool.
+        nlohmann::json tool_choice;
+
+        /// Allow model to call multiple tools in a single response.
+        bool parallel_tool_calls{false};
     };
 
     /**

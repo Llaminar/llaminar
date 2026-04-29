@@ -1788,10 +1788,13 @@ namespace llaminar2::cpu::native_vnni
                         gemv_native_vnni_scalar(packed, A_q8, d.output + n_start, n_cols, K_blocks);
                     }
 #endif
-                    // Bias applied in separate pass (output may be partial
-                    // from tail chunk writing into aligned temp buffer)
+                    // Barrier: all GEMV chunks must complete before bias pass
+                    // reads d.output. Without this, threads with 0 GEMV chunks
+                    // (when N_chunks < num_threads) race into the bias loop
+                    // and read output locations still being written by GEMV threads.
                     if (d.bias)
                     {
+#pragma omp barrier
 #pragma omp for schedule(static) nowait
                         for (int i = 0; i < d.N; ++i)
                             d.output[i] += d.bias[i];

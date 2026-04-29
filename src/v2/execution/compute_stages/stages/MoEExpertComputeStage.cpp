@@ -7,6 +7,8 @@
 #include "../../../execution/moe/DecodeExpertHistogram.h"
 #include "../../../execution/moe/ExpertWeightTransfer.h"
 #include "../../../execution/moe/MoEExpertWeightService.h"
+#include "../../../execution/local_execution/device/WorkspaceDescriptor.h"
+#include "../../../interfaces/IWorkspaceConsumer.h"
 #include "../../../tensors/Tensors.h"
 #include "../../../tensors/BlockStructures.h"
 #include "../../../kernels/KernelFactory.h"
@@ -33,16 +35,21 @@ namespace llaminar2
 
     namespace
     {
+        /// Create an FP32 scratch tensor with GPU memory pre-allocated when
+        /// running on a GPU device.  Without this, scratch tensors are HOST_ONLY
+        /// and multiply_fused_tensor() fails when it calls gpu_data_ptr().
+        std::shared_ptr<FP32Tensor> makeScratchFP32(
+            size_t rows, size_t cols, DeviceId device)
+        {
+            auto t = std::make_shared<FP32Tensor>(
+                std::vector<size_t>{rows, cols});
+            if (device.is_gpu())
+                t->allocateOnDevice(device);
+            return t;
+        }
         /// Execute SwiGLU activation + Down projection via fused kernel when available,
-        /// falling back to IMoEKernel::swiGLU + separate GEMM when not (e.g., FP32 weights).
-        /// @param gate_tensor [m, intermediate] — gate projection output (modified in-place on fallback)
-        /// @param up_tensor [m, intermediate] — up projection output
-        /// @param output [m, n] — final output
-        /// @param down_gemm GEMM engine for down projection
-        /// @param moe_kernel MoE kernel for SwiGLU fallback
-        /// @param m sequence length / batch size
-        /// @param n output dimension (d_model)
-        /// @param intermediate intermediate dimension
+        /// falling back to IMoEKernel::swiGLUFromTensors + separate GEMM when not (e.g., FP32 weights).
+        /// Fully device-agnostic — tensor-aware kernel methods handle CPU/GPU dispatch.
         void fusedSwigluDown(
             FP32Tensor *gate_tensor, FP32Tensor *up_tensor, TensorBase *output,
             ITensorGemm *down_gemm, IMoEKernel *moe_kernel,
@@ -56,11 +63,9 @@ namespace llaminar2
                 return;
             }
 
-            // Fallback: SwiGLU via device-agnostic kernel, then separate down GEMM
-            float *g = gate_tensor->mutable_data();
-            const float *u = up_tensor->data();
+            // Fallback: SwiGLU via tensor-aware kernel, then separate down GEMM.
             const int count = m * intermediate;
-            moe_kernel->swiGLU(g, u, count);
+            moe_kernel->swiGLUFromTensors(gate_tensor, up_tensor, count);
             down_gemm->multiply_tensor(
                 gate_tensor, output,
                 m, n, intermediate);
@@ -190,6 +195,7 @@ namespace llaminar2
         const int num_experts = params_.num_experts;
         const int top_k = params_.top_k;
         const int intermediate = params_.expert_intermediate;
+        const bool is_gpu = params_.device_id.is_gpu();
 
         if (params_.expert_gate_views.empty())
         {
@@ -198,40 +204,121 @@ namespace llaminar2
             return false;
         }
 
-        const float *hidden = params_.input->data();
-        float *output = params_.output->mutable_data();
-
-        // Read pre-computed routing results from MoERoutingStage
-        const float *routing_idx_data = params_.routing_indices->data();
-        const float *routing_wt_data = params_.routing_weights->data();
-
         // Get device-appropriate MoE kernel for gather/scatter
         IMoEKernel *kernel = ensureMoEKernel();
 
-        // Step 2: Zero output
-        std::memset(output, 0, static_cast<size_t>(seq_len) * d_model * sizeof(float));
+        // Zero the output buffer via tensor-aware kernel (works for both CPU and GPU)
+        const size_t output_bytes = static_cast<size_t>(seq_len) * d_model * sizeof(float);
+        kernel->zeroBuffer(params_.output, output_bytes);
 
-        // Step 3: Group tokens by expert for batched GEMM execution.
-        // With EP, we only process experts in our local range, but still
-        // build the full routing map so scratch sizing is correct.
+        // Expert Parallelism: determine which experts this rank processes
         const int local_start = params_.local_expert_start;
         const int local_count = (params_.local_expert_count < 0)
                                     ? num_experts
                                     : params_.local_expert_count;
         const int local_end = local_start + local_count;
 
-        std::vector<std::vector<std::pair<int, float>>> expert_token_lists(num_experts);
-
-        // During prefill, replicated experts must only run on their owner
-        // socket.  If both sockets process the same expert, the allreduce
-        // will double-count that expert's contribution (correctness bug)
-        // and waste ~12% compute (performance bug).
-        //
-        // Use pre-built prefill mask when available (zero per-expert overhead).
-        // Falls back to multi-branch check if mask isn't built yet.
         const bool has_prefill_mask = !params_.replica_set.prefill_mask.empty();
         const std::vector<bool>& prefill_mask_ref = params_.replica_set.prefill_mask;
         const bool has_replicas = params_.replica_set.num_replicated > 0;
+
+        // =====================================================================
+        // GPU prefill path: grouping + gather/scatter stay on device
+        // Avoids D2H of routing tensors and CPU grouping O(seq_len * top_k)
+        // =====================================================================
+        if (is_gpu && kernel->prepareExpertGroups(
+                params_.routing_indices, params_.routing_weights,
+                seq_len, num_experts, top_k))
+        {
+            ensureGemmEnginesCached();
+
+            // Scratch sizing based on max local expert token count
+            int max_batch = 0;
+            for (int e = 0; e < num_experts; ++e)
+            {
+                bool is_local;
+                if (has_prefill_mask) is_local = prefill_mask_ref[e];
+                else if (!params_.expert_mask.empty())
+                {
+                    is_local = params_.expert_mask[e];
+                    if (is_local && has_replicas &&
+                        params_.replica_set.is_replicated[e] &&
+                        params_.replica_set.owner_socket[e] != params_.my_socket_id)
+                        is_local = false;
+                }
+                else is_local = (e >= local_start && e < local_end);
+                if (is_local)
+                    max_batch = std::max(max_batch, kernel->getExpertTokenCount(e));
+            }
+
+            if (max_batch > 0 && max_batch > scratch_capacity_)
+            {
+                scratch_batch_ = makeScratchFP32(max_batch, d_model, params_.device_id);
+                scratch_gate_ = makeScratchFP32(max_batch, intermediate, params_.device_id);
+                scratch_up_ = makeScratchFP32(max_batch, intermediate, params_.device_id);
+                scratch_out_ = makeScratchFP32(max_batch, d_model, params_.device_id);
+                scratch_capacity_ = max_batch;
+            }
+
+            for (int expert_id = 0; expert_id < num_experts; ++expert_id)
+            {
+                int count = kernel->getExpertTokenCount(expert_id);
+                if (count == 0) continue;
+
+                // Same locality check as CPU path
+                bool is_local;
+                if (has_prefill_mask) is_local = prefill_mask_ref[expert_id];
+                else if (!params_.expert_mask.empty())
+                {
+                    is_local = params_.expert_mask[expert_id];
+                    if (is_local && has_replicas &&
+                        params_.replica_set.is_replicated[expert_id] &&
+                        params_.replica_set.owner_socket[expert_id] != params_.my_socket_id)
+                        is_local = false;
+                }
+                else is_local = (expert_id >= local_start && expert_id < local_end);
+                if (!is_local) continue;
+
+                kernel->gatherExpertBatch(
+                    params_.input, scratch_batch_.get(), expert_id, d_model);
+
+                ITensorGemm *gate_gemm = cached_gate_gemm_[expert_id];
+                ITensorGemm *up_gemm = cached_up_gemm_[expert_id];
+                ITensorGemm *down_gemm = cached_down_gemm_[expert_id];
+
+                std::vector<ITensorGemm::TensorProjectionDesc> projections = {
+                    {gate_gemm, scratch_gate_.get(), intermediate, nullptr, "gate"},
+                    {up_gemm, scratch_up_.get(), intermediate, nullptr, "up"}};
+                gate_gemm->multiply_fused_tensor(
+                    scratch_batch_.get(), projections, count, d_model);
+
+                fusedSwigluDown(
+                    scratch_gate_.get(), scratch_up_.get(), scratch_out_.get(),
+                    down_gemm, kernel, count, d_model, intermediate);
+
+                kernel->scatterExpertResults(
+                    params_.output, scratch_out_.get(), expert_id, d_model);
+            }
+
+            LOG_TRACE("[MoEExpertComputeStage] GPU prefill: " << seq_len << " tokens, "
+                                                 << top_k << " experts per token");
+            return true;
+        }
+
+        // =====================================================================
+        // CPU prefill path: D2H routing data + host-side grouping
+        // =====================================================================
+
+        // Read pre-computed routing results from MoERoutingStage.
+        // These are small (seq_len * top_k floats each), so D2H is acceptable.
+        const float *routing_idx_data = params_.routing_indices->data();
+        const float *routing_wt_data = params_.routing_weights->data();
+
+        // Step 3: Group tokens by expert for batched GEMM execution.
+        // With EP, we only process experts in our local range, but still
+        // build the full routing map so scratch sizing is correct.
+
+        std::vector<std::vector<std::pair<int, float>>> expert_token_lists(num_experts);
 
         for (int t = 0; t < seq_len; ++t)
         {
@@ -274,14 +361,10 @@ namespace llaminar2
 
         if (max_batch > 0 && max_batch > scratch_capacity_)
         {
-            scratch_batch_ = std::make_shared<FP32Tensor>(
-                std::vector<size_t>{static_cast<size_t>(max_batch), static_cast<size_t>(d_model)});
-            scratch_gate_ = std::make_shared<FP32Tensor>(
-                std::vector<size_t>{static_cast<size_t>(max_batch), static_cast<size_t>(intermediate)});
-            scratch_up_ = std::make_shared<FP32Tensor>(
-                std::vector<size_t>{static_cast<size_t>(max_batch), static_cast<size_t>(intermediate)});
-            scratch_out_ = std::make_shared<FP32Tensor>(
-                std::vector<size_t>{static_cast<size_t>(max_batch), static_cast<size_t>(d_model)});
+            scratch_batch_ = makeScratchFP32(max_batch, d_model, params_.device_id);
+            scratch_gate_ = makeScratchFP32(max_batch, intermediate, params_.device_id);
+            scratch_up_ = makeScratchFP32(max_batch, intermediate, params_.device_id);
+            scratch_out_ = makeScratchFP32(max_batch, d_model, params_.device_id);
             scratch_capacity_ = max_batch;
         }
 
@@ -303,9 +386,11 @@ namespace llaminar2
                 token_weights[i] = token_list[i].second;
             }
 
-            // Gather tokens into reusable scratch batch via kernel
-            kernel->gatherTokenBatch(
-                hidden, scratch_batch_->mutable_data(),
+            // Gather tokens into reusable scratch batch via tensor-aware kernel.
+            // CPU: kernel reads data()/mutable_data().
+            // GPU: kernel uploads indices to device staging, gathers on device.
+            kernel->gatherTokenBatchFromTensors(
+                params_.input, scratch_batch_.get(),
                 token_indices.data(), num_tokens, d_model);
 
             // Use cached GEMM engines (device-agnostic via ITensorGemm)
@@ -326,9 +411,9 @@ namespace llaminar2
                 scratch_gate_.get(), scratch_up_.get(), scratch_out_.get(),
                 down_gemm, kernel, num_tokens, d_model, intermediate);
 
-            // Scatter weighted results back via kernel
-            kernel->scatterAddWeighted(
-                output, scratch_out_->data(),
+            // Scatter weighted results back via tensor-aware kernel.
+            kernel->scatterAddWeightedFromTensors(
+                params_.output, scratch_out_.get(),
                 token_indices.data(), token_weights.data(),
                 num_tokens, d_model);
         }
@@ -355,6 +440,7 @@ namespace llaminar2
         const int num_experts = params_.num_experts;
         const int top_k = params_.top_k;
         const int intermediate = params_.expert_intermediate;
+        const bool is_gpu = params_.device_id.is_gpu();
 
         if (params_.expert_gate_views.empty())
         {
@@ -362,10 +448,8 @@ namespace llaminar2
             return false;
         }
 
-        const float *hidden = params_.input->data();
-        float *output = params_.output->mutable_data();
-
-        // Read pre-computed routing results from MoERoutingStage
+        // Read pre-computed routing results from MoERoutingStage.
+        // Routing tensors are small (top_k floats each), so D2H is acceptable.
         if (!params_.routing_indices || !params_.routing_weights)
         {
             LOG_ERROR("[MoEExpertComputeStage] Null routing_indices or routing_weights (single-token)");
@@ -375,8 +459,8 @@ namespace llaminar2
         const float *routing_wt_data = params_.routing_weights->data();
         IMoEKernel *kernel = ensureMoEKernel();
 
-        // Zero output
-        std::memset(output, 0, static_cast<size_t>(d_model) * sizeof(float));
+        // Zero output via tensor-aware kernel (works for both CPU and GPU)
+        kernel->zeroBuffer(params_.output, static_cast<size_t>(d_model) * sizeof(float));
 
         // EP range
         const int local_start = params_.local_expert_start;
@@ -397,17 +481,14 @@ namespace llaminar2
             scratch_up_batch_.resize(top_k);
             for (int i = 0; i < top_k; ++i)
             {
-                scratch_gate_batch_[i] = std::make_shared<FP32Tensor>(
-                    std::vector<size_t>{1, static_cast<size_t>(intermediate)});
-                scratch_up_batch_[i] = std::make_shared<FP32Tensor>(
-                    std::vector<size_t>{1, static_cast<size_t>(intermediate)});
+                scratch_gate_batch_[i] = makeScratchFP32(1, intermediate, params_.device_id);
+                scratch_up_batch_[i] = makeScratchFP32(1, intermediate, params_.device_id);
             }
         }
         // Scratch for down projection output (reused per expert)
         if (!scratch_out_)
         {
-            scratch_out_ = std::make_shared<FP32Tensor>(
-                std::vector<size_t>{1, static_cast<size_t>(d_model)});
+            scratch_out_ = makeScratchFP32(1, d_model, params_.device_id);
         }
 
         // Use input tensor directly (no gather needed for 1 token)
@@ -497,12 +578,55 @@ namespace llaminar2
         // ---------------------------------------------------------------
         // Phase 2: Fused SwiGLU + Down projection + weighted accumulate
         //
-        // Strategy: apply SwiGLU for all experts first, then fuse all
-        // down projections into a single OMP region. This saves
-        // (num_active-1) OMP fork/join cycles (~8µs each) and improves
-        // load balance via nowait (128 total chunks vs 4×32).
-        // Falls back to sequential if fused path unavailable.
+        // GPU path: per-expert fusedSwigluDown (tensor-based, runs on GPU)
+        //           + GPU weightedAdd (avoids all D2H transfers).
+        // CPU path: batch SwiGLU + fused multi-input down projections
+        //           + vec_axpy accumulation in a single OMP region.
         // ---------------------------------------------------------------
+
+        if (is_gpu)
+        {
+            // GPU Phase 2: sequential per-expert SwiGLU+Down on GPU + GPU accumulate.
+            // fusedSwigluDown uses multiply_tensor_with_fused_swiglu (tensor-based,
+            // executed on GPU by ROCmQuantisedGemmKernel).  No D2H transfers occur.
+            // Scratch for down projection output (reused per expert)
+            if (!scratch_out_)
+                scratch_out_ = makeScratchFP32(1, d_model, params_.device_id);
+
+            for (int i = 0; i < num_active; ++i)
+            {
+                const auto &info = active_experts[i];
+                ITensorGemm *down_gemm = cached_down_gemm_[info.expert_id];
+
+                if (!down_gemm)
+                {
+                    LOG_ERROR("[MoEExpertComputeStage] FATAL: Null down GEMM engine for expert "
+                        << info.expert_id << " (layer " << params_.layer_idx << ")");
+                    MPI_Abort(MPI_COMM_WORLD, 1);
+                }
+
+                // Fused SwiGLU + Down on GPU (tensor-based).
+                // After Phase 1, scratch_gate/up are DEVICE_AUTHORITATIVE.
+                // fusedSwigluDown primary path calls multiply_tensor_with_fused_swiglu
+                // which handles tensor coherence internally.
+                fusedSwigluDown(
+                    scratch_gate_batch_[info.batch_idx].get(),
+                    scratch_up_batch_[info.batch_idx].get(),
+                    scratch_out_.get(),
+                    down_gemm, kernel, /*m=*/1, d_model, intermediate);
+
+                // GPU weighted accumulate: output += weight * scratch_out
+                kernel->weightedAddFromTensors(
+                    params_.output, scratch_out_.get(), info.weight, d_model);
+            }
+            // Output tensor is already DEVICE_AUTHORITATIVE (set during zeroing).
+            // The GPU accumulations wrote directly to device memory.
+        }
+        else
+        {
+        // CPU Phase 2: batch SwiGLU + fused down projections + vec_axpy
+
+        float *output = params_.output->mutable_data();
 
         // Ensure per-expert output buffers for fused approach
         if (static_cast<int>(scratch_down_batch_.size()) < num_active)
@@ -511,8 +635,7 @@ namespace llaminar2
             for (int i = 0; i < num_active; ++i)
             {
                 if (!scratch_down_batch_[i])
-                    scratch_down_batch_[i] = std::make_shared<FP32Tensor>(
-                        std::vector<size_t>{1, static_cast<size_t>(d_model)});
+                    scratch_down_batch_[i] = makeScratchFP32(1, d_model, params_.device_id);
             }
         }
 
@@ -587,6 +710,8 @@ namespace llaminar2
                 primitives::vec_axpy(output, scratch_out_ptr, info.weight, d_model);
             }
         }
+
+        } // end CPU Phase 2 else block
 
         LOG_TRACE("[MoEExpertComputeStage] Single-token decode (batched gate+up): " << num_active << " experts");
         return true;
@@ -736,6 +861,18 @@ namespace llaminar2
         return reqs;
     }
 
+    StageBufferContract MoEExpertComputeStage::bufferContract() const
+    {
+        auto contract = StageBufferContract::build();
+
+        contract.addInput(params_.input_buffer_id);
+        contract.addInput(params_.routing_indices_buffer_id);
+        contract.addInput(params_.routing_weights_buffer_id);
+        contract.addOutput(params_.output_buffer_id);
+
+        return contract;
+    }
+
     StageDumpInfo MoEExpertComputeStage::buildDumpInfoImpl() const
     {
         StageDumpInfo info;
@@ -762,6 +899,91 @@ namespace llaminar2
         info.addScalarInt("local_expert_start", params_.local_expert_start);
         info.addScalarInt("local_expert_count", params_.local_expert_count);
         return info;
+    }
+
+    // =========================================================================
+    // MoEExpertComputeStage — IWorkspaceConsumer Implementation
+    // =========================================================================
+
+    WorkspaceRequirements MoEExpertComputeStage::getWorkspaceRequirements(int m, int n, int k) const
+    {
+        // All expert GEMM engines use shared buffer names (not per-instance),
+        // so requirements from any one engine represent all of them.
+        const auto &engines = params_.prepared_gate_gemm.empty()
+                                  ? cached_gate_gemm_
+                                  : params_.prepared_gate_gemm;
+        for (auto *gemm : engines)
+        {
+            if (!gemm)
+                continue;
+            auto *consumer = dynamic_cast<IWorkspaceConsumer *>(gemm);
+            if (consumer)
+                return consumer->getWorkspaceRequirements(m, n, k);
+        }
+        return WorkspaceRequirements{};
+    }
+
+    void MoEExpertComputeStage::bindWorkspace(DeviceWorkspaceManager *workspace)
+    {
+        // Bind workspace to ALL expert GEMM engines (gate, up, down for each expert)
+        auto bindAll = [workspace](const std::vector<ITensorGemm *> &engines)
+        {
+            for (auto *gemm : engines)
+            {
+                if (!gemm)
+                    continue;
+                auto *consumer = dynamic_cast<IWorkspaceConsumer *>(gemm);
+                if (consumer)
+                    consumer->bindWorkspace(workspace);
+            }
+        };
+
+        const auto &gate = params_.prepared_gate_gemm.empty() ? cached_gate_gemm_ : params_.prepared_gate_gemm;
+        const auto &up = params_.prepared_up_gemm.empty() ? cached_up_gemm_ : params_.prepared_up_gemm;
+        const auto &down = params_.prepared_down_gemm.empty() ? cached_down_gemm_ : params_.prepared_down_gemm;
+
+        bindAll(gate);
+        bindAll(up);
+        bindAll(down);
+
+        bound_workspace_ = workspace;
+        LOG_DEBUG("[MoEExpertComputeStage] Bound workspace to "
+                  << gate.size() + up.size() + down.size() << " expert GEMM engines");
+    }
+
+    void MoEExpertComputeStage::unbindWorkspace()
+    {
+        auto unbindAll = [](const std::vector<ITensorGemm *> &engines)
+        {
+            for (auto *gemm : engines)
+            {
+                if (!gemm)
+                    continue;
+                auto *consumer = dynamic_cast<IWorkspaceConsumer *>(gemm);
+                if (consumer)
+                    consumer->unbindWorkspace();
+            }
+        };
+
+        const auto &gate = params_.prepared_gate_gemm.empty() ? cached_gate_gemm_ : params_.prepared_gate_gemm;
+        const auto &up = params_.prepared_up_gemm.empty() ? cached_up_gemm_ : params_.prepared_up_gemm;
+        const auto &down = params_.prepared_down_gemm.empty() ? cached_down_gemm_ : params_.prepared_down_gemm;
+
+        unbindAll(gate);
+        unbindAll(up);
+        unbindAll(down);
+
+        bound_workspace_ = nullptr;
+    }
+
+    bool MoEExpertComputeStage::hasWorkspace() const
+    {
+        return bound_workspace_ != nullptr;
+    }
+
+    DeviceWorkspaceManager *MoEExpertComputeStage::getWorkspace() const
+    {
+        return bound_workspace_;
     }
 
     // =========================================================================
@@ -809,10 +1031,8 @@ namespace llaminar2
         // Ensure scratch buffers are large enough
         if (seq_len > scratch_seq_len_)
         {
-            scratch_gate_ = std::make_shared<FP32Tensor>(
-                std::vector<size_t>{static_cast<size_t>(seq_len), static_cast<size_t>(intermediate)});
-            scratch_up_ = std::make_shared<FP32Tensor>(
-                std::vector<size_t>{static_cast<size_t>(seq_len), static_cast<size_t>(intermediate)});
+            scratch_gate_ = makeScratchFP32(seq_len, intermediate, params_.device_id);
+            scratch_up_ = makeScratchFP32(seq_len, intermediate, params_.device_id);
             scratch_seq_len_ = seq_len;
         }
 
@@ -874,6 +1094,24 @@ namespace llaminar2
         return reqs;
     }
 
+    StageBufferContract SharedExpertFFNStage::bufferContract() const
+    {
+        auto contract = StageBufferContract::build();
+
+        contract.addInput(params_.input_buffer_id);
+        contract.addOutput(params_.output_buffer_id);
+
+        // Weights are model weights, not arena-managed
+        if (params_.gate_w)
+            contract.addWeight(params_.gate_w);
+        if (params_.up_w)
+            contract.addWeight(params_.up_w);
+        if (params_.down_w)
+            contract.addWeight(params_.down_w);
+
+        return contract;
+    }
+
     StageDumpInfo SharedExpertFFNStage::buildDumpInfoImpl() const
     {
         StageDumpInfo info;
@@ -891,6 +1129,62 @@ namespace llaminar2
         info.addScalarInt("d_model", params_.d_model);
         info.addScalarInt("intermediate", params_.intermediate);
         return info;
+    }
+
+    // =========================================================================
+    // SharedExpertFFNStage — IWorkspaceConsumer Implementation
+    // =========================================================================
+
+    WorkspaceRequirements SharedExpertFFNStage::getWorkspaceRequirements(int m, int n, int k) const
+    {
+        auto *self = const_cast<SharedExpertFFNStage *>(this);
+        self->ensureGemmEnginesCached();
+
+        WorkspaceRequirements combined;
+        if (auto *c = dynamic_cast<IWorkspaceConsumer *>(cached_gate_gemm_))
+            combined.merge(c->getWorkspaceRequirements(m, n, k));
+        if (auto *c = dynamic_cast<IWorkspaceConsumer *>(cached_up_gemm_))
+            combined.merge(c->getWorkspaceRequirements(m, n, k));
+        if (auto *c = dynamic_cast<IWorkspaceConsumer *>(cached_down_gemm_))
+            combined.merge(c->getWorkspaceRequirements(m, n, k));
+        return combined;
+    }
+
+    void SharedExpertFFNStage::bindWorkspace(DeviceWorkspaceManager *workspace)
+    {
+        ensureGemmEnginesCached();
+
+        if (auto *c = dynamic_cast<IWorkspaceConsumer *>(cached_gate_gemm_))
+            c->bindWorkspace(workspace);
+        if (auto *c = dynamic_cast<IWorkspaceConsumer *>(cached_up_gemm_))
+            c->bindWorkspace(workspace);
+        if (auto *c = dynamic_cast<IWorkspaceConsumer *>(cached_down_gemm_))
+            c->bindWorkspace(workspace);
+
+        bound_workspace_ = workspace;
+        LOG_DEBUG("[SharedExpertFFNStage] Bound workspace to gate/up/down GEMM engines");
+    }
+
+    void SharedExpertFFNStage::unbindWorkspace()
+    {
+        if (auto *c = dynamic_cast<IWorkspaceConsumer *>(cached_gate_gemm_))
+            c->unbindWorkspace();
+        if (auto *c = dynamic_cast<IWorkspaceConsumer *>(cached_up_gemm_))
+            c->unbindWorkspace();
+        if (auto *c = dynamic_cast<IWorkspaceConsumer *>(cached_down_gemm_))
+            c->unbindWorkspace();
+
+        bound_workspace_ = nullptr;
+    }
+
+    bool SharedExpertFFNStage::hasWorkspace() const
+    {
+        return bound_workspace_ != nullptr;
+    }
+
+    DeviceWorkspaceManager *SharedExpertFFNStage::getWorkspace() const
+    {
+        return bound_workspace_;
     }
 
     // =========================================================================
@@ -919,13 +1213,13 @@ namespace llaminar2
         const int seq_len = params_.seq_len;
         const int d_model = params_.d_model;
 
-        const float *input = params_.input->data();
-        const float *gate_inp = params_.gate_inp->data();
-        float *shared = params_.shared_output->mutable_data();
-
-        // Delegate sigmoid gating to device-agnostic MoE kernel
+        // Delegate sigmoid gating to device-appropriate MoE kernel.
+        // Tensor-aware API handles CPU/GPU dispatch internally.
         IMoEKernel *kernel = ensureMoEKernel();
-        kernel->sharedExpertGate(input, gate_inp, shared, seq_len, d_model);
+
+        kernel->sharedExpertGateFromTensors(
+            params_.input, params_.gate_inp, params_.shared_output,
+            seq_len, d_model);
 
         return true;
     }
@@ -970,6 +1264,20 @@ namespace llaminar2
         if (params_.shared_output)
             reqs.addOutput("shared_output", params_.shared_output->shape(), toBufferTensorType(params_.shared_output->native_type()));
         return reqs;
+    }
+
+    StageBufferContract SharedExpertGateStage::bufferContract() const
+    {
+        auto contract = StageBufferContract::build();
+
+        contract.addInput(params_.input_buffer_id);
+        contract.addOutput(params_.output_buffer_id);
+
+        // Gate vector is a model weight, not arena-managed
+        if (params_.gate_inp)
+            contract.addWeight(params_.gate_inp);
+
+        return contract;
     }
 
     StageDumpInfo SharedExpertGateStage::buildDumpInfoImpl() const

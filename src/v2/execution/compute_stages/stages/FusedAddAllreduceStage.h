@@ -41,6 +41,7 @@ namespace llaminar2
             ITPContext *tp_ctx = nullptr;       ///< TP context for allreduce
             size_t allreduce_count = 0;        ///< Elements to allreduce (0 = use num_elements)
             std::string stage_name;            ///< Stage name for TP context lookup
+            std::string precision;             ///< Allreduce precision override ("fp32", "fp16", "bf16", "" = use global default)
 
             // Buffer IDs for contract-based coherence
             std::optional<BufferId> input_a_buffer_id;

@@ -233,6 +233,8 @@ namespace llaminar2
                     if (factory)
                     {
                         recommended_sampling_params_ = factory->getRecommendedSamplingParams();
+                        stop_thinking_prompt_ = factory->getStopThinkingPrompt();
+                        tool_call_format_ = factory->getToolCallFormat();
                         if (recommended_sampling_params_.has_penalties() || recommended_sampling_params_.temperature != 1.0f)
                         {
                             LOG_INFO("[OrchestrationRunner] Model-recommended sampling: "
@@ -241,6 +243,11 @@ namespace llaminar2
                                      << " top_k=" << recommended_sampling_params_.top_k
                                      << " presence_penalty=" << recommended_sampling_params_.presence_penalty
                                      << " frequency_penalty=" << recommended_sampling_params_.frequency_penalty);
+                        }
+                        if (!stop_thinking_prompt_.empty())
+                        {
+                            LOG_INFO("[OrchestrationRunner] Stop-thinking prompt configured ("
+                                     << stop_thinking_prompt_.size() << " chars)");
                         }
                     }
                 }
@@ -358,14 +365,47 @@ namespace llaminar2
         }
 
         // Tail stage: try GPU-side sampling first, fall back to CPU
-        // Note: GPU sampling cannot apply presence/frequency penalties
-        // (penalty history is only on CPU), so force CPU path when penalties are active.
+        // When penalties are active, compute the sparse penalty map on CPU,
+        // upload to GPU, apply in-place, then sample on GPU.
+        // This avoids the full ~600KB D2H transfer of logits.
         int token = -1;
 
         if (active_sampling_params_.has_penalties())
         {
-            // Penalties require CPU-side sampling with token history
-            token = -1; // Force CPU fallback below
+            // Compute sparse penalty map on CPU (presence + frequency + DRY)
+            int vocab = vocabSize();
+            auto penalty_map = sampler_.compute_penalty_map(active_sampling_params_, vocab);
+
+            if (!penalty_map.empty())
+            {
+                // Try GPU-side penalty application + sampling
+                bool gpu_penalties_applied = runner_->applyPenaltiesOnDevice(penalty_map, vocab);
+                if (gpu_penalties_applied)
+                {
+                    // Penalties applied on GPU — now sample from penalized logits
+                    if (active_sampling_params_.is_greedy())
+                    {
+                        token = runner_->sampleGreedyOnDevice();
+                    }
+                    else
+                    {
+                        token = runner_->sampleOnDevice(active_sampling_params_);
+                    }
+                }
+            }
+            else
+            {
+                // No penalties to apply — sample directly on GPU
+                if (active_sampling_params_.is_greedy())
+                {
+                    token = runner_->sampleGreedyOnDevice();
+                }
+                else
+                {
+                    token = runner_->sampleOnDevice(active_sampling_params_);
+                }
+            }
+            // If GPU path failed, fall through to CPU fallback below
         }
         else if (active_sampling_params_.is_greedy())
         {
@@ -1527,6 +1567,16 @@ namespace llaminar2
     SamplingParams OrchestrationRunner::getRecommendedSamplingParams() const
     {
         return recommended_sampling_params_;
+    }
+
+    std::string OrchestrationRunner::getStopThinkingPrompt() const
+    {
+        return stop_thinking_prompt_;
+    }
+
+    ToolCallFormat OrchestrationRunner::getToolCallFormat() const
+    {
+        return tool_call_format_;
     }
 
     // =========================================================================

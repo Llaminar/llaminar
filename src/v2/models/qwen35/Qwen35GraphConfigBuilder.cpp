@@ -92,6 +92,17 @@ namespace llaminar2
         config.has_attention_output_gate = true;
 
         // =====================================================================
+        // KV cache scales for FA layers (QK-norm produces large V activations)
+        // =====================================================================
+        // Qwen3.5 FA layers share the same attention mechanism as Qwen3
+        // (QK-norm, same value growth pattern in later layers).
+        // Parent sets Qwen2 defaults (K=512, V=32) which clip badly:
+        //   V absmax ~64 at later layers → 13.5% clip rate with V=32
+        //   K absmax ~417 post-RoPE → clips at ±256 with K=512
+        config.kv_cache_scale_k = 1024.0f; // K: ±512 representable
+        config.kv_cache_scale_v = 256.0f;  // V: ±128 representable
+
+        // =====================================================================
         // Partial RoPE for FA layers
         // =====================================================================
         // Qwen3.5 uses partial RoPE: rope.dimension_count / head_dim

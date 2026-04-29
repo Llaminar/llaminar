@@ -404,11 +404,12 @@ class TestQwen35HookRegistration:
         """Hooks should be registered on the model."""
         # 4 layers. Per layer: attn_norm, attn_out, attn_residual(pre), ffn_norm, ffn_down, ffn_residual
         # Linear layers (0,1,2) also get: qkv_proj, conv1d, z_proj, delta_rule(pre), norm_gate
+        # Full-attn layers (3) also get: q_proj, k_proj, v_proj
         # Plus: embedding, final_norm = 2 global hooks
         # Per linear layer: 6 shared + 5 GDN = 11
-        # Per full_attn layer: 6 shared
-        # Total: 3*11 + 1*6 + 2 = 41
-        assert len(tiny_model._hook_handles) == 41
+        # Per full_attn layer: 6 shared + 3 projections = 9
+        # Total: 3*11 + 1*9 + 2 = 44
+        assert len(tiny_model._hook_handles) == 44
 
     def test_gdn_hooks_capture_on_linear_layers(self, tiny_model):
         """GDN-specific stages should fire only on linear attention layers."""

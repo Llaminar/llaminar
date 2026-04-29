@@ -57,6 +57,13 @@ namespace llaminar2
             return params;
         }
 
+        std::string getStopThinkingPrompt() const override
+        {
+            // Qwen3 uses the same thinking format as Qwen3.5
+            return "Considering the limited time by the user, I have to give the "
+                   "solution based on the thinking directly now.\n</think>\n\n";
+        }
+
         /**
          * @brief Get weight sharding configuration for Qwen3 tensor parallelism
          *

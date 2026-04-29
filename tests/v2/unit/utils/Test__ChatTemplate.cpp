@@ -725,10 +725,12 @@ TEST(Test__ChatParser, ParsesOutputWithOnlyThinking)
     // If the thinking end tag was derived from start tag:
     if (parser.expectsThinking())
     {
-        // Model is still thinking (no end tag in output)
+        // Model is still thinking (no end tag in output) — everything is reasoning
         auto result = parser.parse("I'm still thinking about this...");
-        // Without end tag in output, everything is treated as content
-        EXPECT_EQ(result.content, "I'm still thinking about this...");
+        // Without end tag in output, everything goes to reasoning_content
+        EXPECT_TRUE(result.has_reasoning);
+        EXPECT_EQ(result.reasoning_content, "I'm still thinking about this...");
+        EXPECT_TRUE(result.content.empty());
     }
 }
 

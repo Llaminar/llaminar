@@ -83,6 +83,7 @@ enum NativeVNNIFormat : uint8_t {
     NVNNI_IQ2_XXS= 15,  // IQ2 grid (8 elem/lookup), 8-bit index, pre-resolved signs
     NVNNI_IQ1_S  = 16,  // IQ1 grid (8 elem/lookup), 11-bit index, signed values {-1,0,+1}, delta correction
     NVNNI_IQ1_M  = 17,  // IQ1 grid (8 elem/lookup), 11-bit index, signed values {-1,0,+1}, dual-scale + delta
+    NVNNI_Q8_0   = 19,  // 8-bit symmetric, direct INT8 payload (32 bytes)
 };
 
 // Compile-time format properties
@@ -117,8 +118,10 @@ struct NVNNITraits {
     static constexpr bool is_6bit       = (FMT == NVNNI_Q6_K);
     static constexpr bool is_3bit       = (FMT == NVNNI_Q3_K);
     static constexpr bool is_2bit       = (FMT == NVNNI_Q2_K);
+    static constexpr bool is_8bit       = (FMT == NVNNI_Q8_0);
     static constexpr bool uses_lut      = (FMT == NVNNI_IQ4_NL);
     static constexpr int  payload_bytes =
+        is_8bit ? 32 :                                // Q8_0: 32 raw INT8 values
         is_iq1_grid ? 6 :                            // IQ1_S(6), IQ1_M(6): qs[4]+qh[2] only
         is_iq3_grid ? (has_qh ? 13 : 12) :
         is_iq2_grid ? (has_qh ? 9 : 8) :
@@ -1068,6 +1071,13 @@ __global__ void gemv_native_vnni_kernel_t(
                             packed_groups[7] = static_cast<int32_t>(static_cast<uint32_t>(g >> 32));
                         }
                     }
+                    else if constexpr (Traits::is_8bit)
+                    {
+                        // Q8_0: 32 raw INT8 values — direct load, no decode needed
+                        #pragma unroll
+                        for (int g = 0; g < 8; ++g)
+                            packed_groups[g] = *reinterpret_cast<const int32_t*>(payload + g * 4);
+                    }
                     else
                     {
                         // Q4_0 / Q4_1: 4-bit nibble decode via SWAR / v_perm_b32
@@ -1642,6 +1652,7 @@ bool rocmGemv_native_vnni_fp32(
         case NVNNI_IQ2_XXS:  LAUNCH_NATIVE_VNNI(NVNNI_IQ2_XXS);  break;
         case NVNNI_IQ1_S:    LAUNCH_NATIVE_VNNI(NVNNI_IQ1_S);    break;
         case NVNNI_IQ1_M:    LAUNCH_NATIVE_VNNI(NVNNI_IQ1_M);    break;
+        case NVNNI_Q8_0:     LAUNCH_NATIVE_VNNI(NVNNI_Q8_0);     break;
         default:
             fprintf(stderr, "[rocmGemv_native_vnni_fp32] Unknown codebook_id=%u (N=%d K=%d)\n",
                     static_cast<unsigned>(codebook_id), N, K);

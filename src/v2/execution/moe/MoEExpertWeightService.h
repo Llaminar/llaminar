@@ -106,16 +106,37 @@ public:
         const std::vector<bool>& new_mask,
         const std::unordered_map<int, ExpertWeightBlobs>* received_weights);
 
+    // ── GPU-direct transfer ──────────────────────────────────────────
+
+    /// Transfer expert weights directly between GPU devices (GPU↔GPU memcpy).
+    /// ~50x faster than serialize → MPI → deserialize → repack for intra-node
+    /// transfers since both GPUs use the identical packed weight format.
+    /// @param src_ctx Source MoE weight context (has packed GPU weights)
+    /// @param dst_ctx Destination MoE weight context (will receive weights)
+    /// @param expert_ids Experts to transfer
+    /// @param layer_idx Layer index (for logging)
+    /// @return true if GPU-direct transfer succeeded, false to fall back to serialize path
+    static bool transferExpertsGPUDirect(
+        const MoEWeightContext& src_ctx,
+        MoEWeightContext& dst_ctx,
+        const std::vector<int>& expert_ids,
+        int layer_idx);
+
 private:
-    /// Register transferred packed weights for one expert.
+    /// Register transferred packed weights for one expert (CPU path only).
     static bool registerTransferredExpert(MoEWeightContext& ctx, int expert_id, const ExpertWeightBlobs& blobs);
 
-#ifdef HAVE_CUDA
-    static bool prepareGemmEnginesCUDA(MoEWeightContext& ctx);
-#endif
-#ifdef HAVE_ROCM
-    static bool prepareGemmEnginesROCm(MoEWeightContext& ctx);
-#endif
+    /// GPU pipeline path: raw H2D + GPU repack via LoadOrchestrator.
+    /// Unified for CUDA and ROCm — no CPU-side VNNI interleaving.
+    static bool prepareGemmEnginesGPU(MoEWeightContext& ctx);
+
+    /// GPU rebalance path: repack new experts on GPU via LoadOrchestrator.
+    /// Called by registerAndPrepareNewExperts() for GPU devices instead of
+    /// the CPU KernelFactory fallback.
+    static bool registerAndPrepareNewExpertsGPU(
+        MoEWeightContext& ctx, const std::vector<int>& new_experts);
+
+
 };
 
 } // namespace llaminar2

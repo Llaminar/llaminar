@@ -847,6 +847,79 @@ namespace llaminar2
         return true;
     }
 
+    // Forward declaration for CUDA penalty kernel
+    extern "C" bool cudaOps_apply_logit_penalties_f32(
+        float *logits, const int *token_ids, const float *penalties,
+        int num_penalties, int vocab_size, int device_idx, void *stream);
+
+    bool CUDABackend::applyLogitPenaltiesF32(void *logits_device,
+                                              const int *token_ids_host,
+                                              const float *penalties_host,
+                                              int num_penalties, int vocab_size,
+                                              int device_id, void *stream)
+    {
+        if (device_id >= device_count_ || device_id < 0 || !logits_device ||
+            !token_ids_host || !penalties_host || num_penalties <= 0)
+            return false;
+
+        // Lazily allocate per-device penalty upload buffers
+        if (penalty_buffers_.empty())
+            penalty_buffers_.resize(device_count_);
+
+        auto &bufs = penalty_buffers_[device_id];
+
+        // Reallocate if num_penalties exceeds current allocation
+        if (bufs.allocated_count < num_penalties)
+        {
+            CUDA_WARN_IF_FAIL(cudaSetDevice(device_id));
+            if (bufs.token_ids_ptr)
+                CUDA_WARN_IF_FAIL(cudaFree(bufs.token_ids_ptr));
+            if (bufs.penalties_ptr)
+                CUDA_WARN_IF_FAIL(cudaFree(bufs.penalties_ptr));
+
+            cudaError_t err = cudaMalloc(&bufs.token_ids_ptr, num_penalties * sizeof(int));
+            if (err != cudaSuccess)
+            {
+                bufs.token_ids_ptr = nullptr;
+                bufs.allocated_count = 0;
+                return false;
+            }
+            err = cudaMalloc(&bufs.penalties_ptr, num_penalties * sizeof(float));
+            if (err != cudaSuccess)
+            {
+                CUDA_WARN_IF_FAIL(cudaFree(bufs.token_ids_ptr));
+                bufs.token_ids_ptr = nullptr;
+                bufs.allocated_count = 0;
+                return false;
+            }
+            bufs.allocated_count = num_penalties;
+        }
+
+        CUDA_CHECK_OR_THROW(cudaSetDevice(device_id));
+        cudaStream_t s = resolveStream(device_id, stream);
+
+        // Upload penalty data to device
+        CUDA_CHECK_OR_THROW(cudaMemcpyAsync(bufs.token_ids_ptr, token_ids_host,
+                                             num_penalties * sizeof(int),
+                                             cudaMemcpyHostToDevice, s));
+        CUDA_CHECK_OR_THROW(cudaMemcpyAsync(bufs.penalties_ptr, penalties_host,
+                                             num_penalties * sizeof(float),
+                                             cudaMemcpyHostToDevice, s));
+
+        // Apply penalties in-place on device
+        if (!cudaOps_apply_logit_penalties_f32(
+                static_cast<float *>(logits_device),
+                static_cast<const int *>(bufs.token_ids_ptr),
+                static_cast<const float *>(bufs.penalties_ptr),
+                num_penalties, vocab_size, device_id, s))
+        {
+            return false;
+        }
+
+        CUDA_CHECK_OR_THROW(cudaStreamSynchronize(s));
+        return true;
+    }
+
     // ====================================================================
     // Async Operations (Route through NvidiaDeviceContext worker thread)
     // ====================================================================
@@ -1105,6 +1178,53 @@ namespace llaminar2
             return false;
         }
         return true;
+    }
+
+    // ====================================================================
+    // Async H2D Without Sync (Pipeline Support)
+    // ====================================================================
+
+    bool CUDABackend::hostToDeviceOnStream(void *dst, const void *src, size_t bytes,
+                                           int device_id, void *stream)
+    {
+        if (device_id >= device_count_ || device_id < 0)
+            return false;
+        if (!setDevice(device_id))
+            return false;
+
+        cudaError_t err = cudaMemcpyAsync(dst, src, bytes, cudaMemcpyHostToDevice,
+                                          static_cast<cudaStream_t>(stream));
+        if (err != cudaSuccess)
+        {
+            LOG_ERROR("[CUDABackend::hostToDeviceOnStream] failed: " << cudaGetErrorString(err));
+            return false;
+        }
+        return true;
+    }
+
+    // ====================================================================
+    // Pinned Host Memory
+    // ====================================================================
+
+    void *CUDABackend::allocatePinned(size_t bytes, int device_id)
+    {
+        (void)device_id;
+        void *ptr = nullptr;
+        cudaError_t err = cudaHostAlloc(&ptr, bytes, cudaHostAllocDefault);
+        if (err != cudaSuccess)
+        {
+            LOG_ERROR("[CUDABackend::allocatePinned] cudaHostAlloc(" << bytes
+                      << ") failed: " << cudaGetErrorString(err));
+            return nullptr;
+        }
+        return ptr;
+    }
+
+    void CUDABackend::freePinned(void *ptr, int device_id)
+    {
+        (void)device_id;
+        if (ptr)
+            CUDA_WARN_IF_FAIL(cudaFreeHost(ptr));
     }
 
     // ====================================================================

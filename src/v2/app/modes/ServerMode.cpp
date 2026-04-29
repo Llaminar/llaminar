@@ -10,6 +10,7 @@
 #include "app/modes/ServerMode.h"
 #include "app/modes/ChatCompletionHandler.h"
 #include "app/AppContext.h"
+#include "app/MPIShutdown.h"
 #include "utils/Logger.h"
 
 // cpp-httplib (header-only)
@@ -18,7 +19,6 @@
 // nlohmann/json (header-only)
 #include "nlohmann/json.hpp"
 
-#include <mpi.h>
 #include <iostream>
 #include <mutex>
 #include <atomic>
@@ -67,7 +67,7 @@ namespace llaminar2
             runner->setMPICoordinatedMode(true);
             runner->runMPIWorkerLoop();
             runner->shutdown();
-            MPI_Finalize();
+            mpiShutdown();
             return 0;
         }
 
@@ -77,7 +77,7 @@ namespace llaminar2
             if (mpi_ctx->world_size() > 1)
                 runner->shutdownMPIWorkers();
             runner->shutdown();
-            MPI_Finalize();
+            mpiShutdown();
             return 1;
         }
 
@@ -197,7 +197,7 @@ namespace llaminar2
                 if (mpi_ctx->world_size() > 1)
                     runner->shutdownMPIWorkers();
                 runner->shutdown();
-                MPI_Finalize();
+                mpiShutdown();
                 return 1;
             }
         }
@@ -210,7 +210,7 @@ namespace llaminar2
             runner->shutdownMPIWorkers();
 
         runner->shutdown();
-        MPI_Finalize();
+        mpiShutdown();
         return 0;
     }
 

@@ -412,7 +412,19 @@ namespace llaminar2
         uint64_t headCountKV() const override { return model_.head_count_kv; }
         uint64_t vocabSize() const override { return model_.vocab_size; }
         uint64_t contextLength() const override { return model_.context_length; }
-        uint64_t feedForwardLength() const override { return getUInt64("feed_forward_length", 0); }
+        uint64_t feedForwardLength() const override {
+            uint64_t d_ff = getUInt64("feed_forward_length", 0);
+            if (d_ff == 0)
+            {
+                // MoE models may not have feed_forward_length; fall back to shared expert or per-expert FFN
+                d_ff = getUInt64("expert_shared_feed_forward_length", 0);
+            }
+            if (d_ff == 0)
+            {
+                d_ff = getUInt64("expert_feed_forward_length", 0);
+            }
+            return d_ff;
+        }
         uint64_t keyLength() const override { return model_.key_length; }
         float ropeTheta() const override { return model_.rope_theta; }
         float rmsNormEps() const override { return model_.rms_norm_eps; }

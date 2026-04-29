@@ -627,14 +627,13 @@ namespace llaminar2
              *
              * This enum is intentionally small and explicit so logs, counters, and
              * future telemetry can categorize prefill routing decisions in a stable
-             * way. We keep `CK_FALLBACK` as an explicit value because fallback is a
-             * first-class execution mode, not an error condition.
+             * way. `UNSUPPORTED` indicates no viable prefill kernel path is available.
              */
             enum class PrefillDispatchPath
             {
                 NATIVE_VNNI,      ///< Native-VNNI path (lossless ≤6-bit decode, FP16 scales)
                 INT8_VNNI_NATIVE, ///< INT8-VNNI path (requantized 8-bit weights)
-                CK_FALLBACK       ///< CK ComposableKernel (debug override only)
+                UNSUPPORTED       ///< No viable prefill path (dimensions/weights unsupported)
             };
 
             // =========================================================================
@@ -646,8 +645,8 @@ namespace llaminar2
              *
              * The selection policy is deliberately conservative:
              * - Decode (`m == 1`) never calls this helper.
-             * - Unsupported metadata/shape immediately maps to `CK_FALLBACK`.
-             * - Feature flag disablement also maps to `CK_FALLBACK`.
+             * - Unsupported metadata/shape maps to `UNSUPPORTED`.
+             * - Missing VNNI weights also maps to `UNSUPPORTED`.
              *
              * @param m Number of rows in activation matrix.
              * @param n Number of output features.

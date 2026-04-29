@@ -203,12 +203,6 @@ namespace llaminar2
         // temporary tensor destruction (e.g., Q16_1 scratch in KV cache append).
         if (in_prepared_gemm_registry_
             || cache_.has_value()
-#ifdef HAVE_CUDA
-            || cuda_cache_.has_value()
-#endif
-#ifdef HAVE_ROCM
-            || rocm_cache_.has_value()
-#endif
         )
         {
             llaminar::v2::kernels::KernelFactory::clearCacheFor(this);
@@ -1559,54 +1553,6 @@ namespace llaminar2
         }
 
         return summary;
-    }
-
-    // ========================================================================
-    // hasCachedDeviceData - Check for kernel-cached device representations
-    // ========================================================================
-
-    bool TensorBase::hasCachedDeviceData(DeviceType device_type) const
-    {
-        // Check if we have cached packed weights for the given device type
-        // These caches are populated by KernelFactory when creating GEMM kernels
-        // and contain converted/packed weight data that's already on device.
-
-        if (device_type == DeviceType::CUDA)
-        {
-#ifdef HAVE_CUDA
-            if (cuda_cache_.has_value())
-            {
-                // The cache contains TensorCUDAPackedWeightsCache* which wraps CUDAPackedWeights
-                // We can't include the header here, but we know if cuda_cache_ has a value,
-                // the packing was done. Check if uploaded by examining the value.
-                try
-                {
-                    // Use the packed weights header type to check upload status
-                    // This relies on KernelFactory storing the cache in a known format
-                    // For now, if cuda_cache_ has value, assume it's been packed
-                    // The actual upload status is tracked in CUDAPackedWeights::uploaded
-                    return true; // Cache exists = packed weights ready
-                }
-                catch (...)
-                {
-                    return false;
-                }
-            }
-#endif
-            return false;
-        }
-        else if (device_type == DeviceType::ROCm)
-        {
-#ifdef HAVE_ROCM
-            if (rocm_cache_.has_value())
-            {
-                return true; // Cache exists = packed weights ready
-            }
-#endif
-            return false;
-        }
-
-        return false; // CPU doesn't use device caching
     }
 
     // =========================================================================

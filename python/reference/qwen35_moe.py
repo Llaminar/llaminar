@@ -287,6 +287,31 @@ class Qwen35MoEReferenceModel(HuggingFaceReferenceModel):
                     attn_module.register_forward_hook(_attn_out)
                 )
 
+            # FA-specific hooks for full attention layers
+            if not is_linear and attn_module is not None:
+                fa = attn_module
+
+                def _q_proj(mod, inp, out, i=idx):
+                    if self._should_capture(PipelineStage.Q_PROJECTION):
+                        self.capture_stage(PipelineStage.Q_PROJECTION, out, i)
+                self._hook_handles.append(
+                    fa.q_proj.register_forward_hook(_q_proj)
+                )
+
+                def _k_proj(mod, inp, out, i=idx):
+                    if self._should_capture(PipelineStage.K_PROJECTION):
+                        self.capture_stage(PipelineStage.K_PROJECTION, out, i)
+                self._hook_handles.append(
+                    fa.k_proj.register_forward_hook(_k_proj)
+                )
+
+                def _v_proj(mod, inp, out, i=idx):
+                    if self._should_capture(PipelineStage.V_PROJECTION):
+                        self.capture_stage(PipelineStage.V_PROJECTION, out, i)
+                self._hook_handles.append(
+                    fa.v_proj.register_forward_hook(_v_proj)
+                )
+
             # GDN-specific hooks for linear attention layers
             if is_linear:
                 gdn = layer.linear_attn

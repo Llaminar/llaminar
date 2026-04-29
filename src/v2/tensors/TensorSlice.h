@@ -308,6 +308,12 @@ namespace llaminar2
             inner()->mark_host_dirty();
         }
 
+        void transitionTo(TensorCoherenceState new_state,
+                          std::optional<DeviceId> authoritative_dev = std::nullopt) override
+        {
+            inner()->transitionTo(new_state, authoritative_dev);
+        }
+
         bool isHostValid() const override
         {
             return inner()->isHostValid();

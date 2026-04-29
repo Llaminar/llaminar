@@ -608,6 +608,39 @@ namespace llaminar2
             return false; // Not supported by default
         }
 
+        /**
+         * @brief GPU-side sparse logit penalty application
+         *
+         * Applies a sparse set of additive penalties to logits in-place on the GPU.
+         * Each entry (token_id, penalty) subtracts the penalty from logits[token_id].
+         * Used to apply presence, frequency, and DRY penalties without a full D2H
+         * transfer of the logits tensor (~600KB for 151K vocab).
+         *
+         * @param logits_device Device pointer to FP32 logits [vocab_size] — modified in-place
+         * @param token_ids_host Host array of token IDs to penalize
+         * @param penalties_host Host array of penalty values (positive = penalize)
+         * @param num_penalties Number of entries in token_ids and penalties arrays
+         * @param vocab_size Total vocabulary size (for bounds checking)
+         * @param device_id Device where logits reside
+         * @param stream Optional stream for async execution
+         * @return true if executed on device, false if not supported
+         */
+        virtual bool applyLogitPenaltiesF32(void *logits_device,
+                                            const int *token_ids_host,
+                                            const float *penalties_host,
+                                            int num_penalties, int vocab_size,
+                                            int device_id, void *stream = nullptr)
+        {
+            (void)logits_device;
+            (void)token_ids_host;
+            (void)penalties_host;
+            (void)num_penalties;
+            (void)vocab_size;
+            (void)device_id;
+            (void)stream;
+            return false; // Not supported by default
+        }
+
         // ====================================================================
         // Compute Operations
         // ====================================================================
@@ -726,6 +759,76 @@ namespace llaminar2
             (void)event;
             (void)device_id;
             return true;
+        }
+
+        // ====================================================================
+        // Async Host-to-Device Transfer (no implicit sync)
+        // ====================================================================
+
+        /**
+         * @brief Submit async H2D copy on a specific stream WITHOUT synchronizing
+         *
+         * Unlike hostToDevice() which syncs after the memcpy, this submits the
+         * copy and returns immediately. Caller is responsible for synchronization
+         * (typically via recordEvent + streamWaitEvent or synchronizeStream).
+         *
+         * @param dst Device destination pointer (must be pre-allocated)
+         * @param src Host source pointer (should be pinned for true async DMA)
+         * @param bytes Number of bytes to copy
+         * @param device_id GPU device ID (0-based)
+         * @param stream Opaque stream handle (must not be nullptr)
+         * @return true on success, false on error
+         *
+         * **Semantics**:
+         * - CUDA: cudaMemcpyAsync(dst, src, bytes, cudaMemcpyHostToDevice, stream)
+         * - ROCm: hipMemcpyAsync(dst, src, bytes, hipMemcpyHostToDevice, stream)
+         * - CPU: memcpy (synchronous fallback)
+         */
+        virtual bool hostToDeviceOnStream(void *dst, const void *src, size_t bytes,
+                                          int device_id, void *stream)
+        {
+            // Default: fall back to synchronous hostToDevice
+            return hostToDevice(dst, src, bytes, device_id, stream);
+        }
+
+        // ====================================================================
+        // Pinned Host Memory Allocation
+        // ====================================================================
+
+        /**
+         * @brief Allocate pinned (page-locked) host memory for async DMA transfers
+         *
+         * Pinned memory enables true async H2D/D2H transfers without internal
+         * staging copies. Required for overlapped pipeline transfers.
+         *
+         * @param bytes Number of bytes to allocate
+         * @param device_id GPU device ID (for device affinity, 0-based)
+         * @return Host pointer (nullptr on failure)
+         *
+         * **Semantics**:
+         * - CUDA: cudaHostAlloc(&ptr, bytes, cudaHostAllocDefault)
+         * - ROCm: hipHostMalloc(&ptr, bytes, hipHostMallocDefault)
+         * - CPU: malloc(bytes)
+         *
+         * **Lifetime**: Caller owns memory, must call freePinned()
+         */
+        virtual void *allocatePinned(size_t bytes, int device_id)
+        {
+            (void)bytes;
+            (void)device_id;
+            return nullptr;
+        }
+
+        /**
+         * @brief Free pinned host memory allocated by allocatePinned()
+         *
+         * @param ptr Host pointer from allocatePinned() (may be nullptr)
+         * @param device_id GPU device ID used for allocation
+         */
+        virtual void freePinned(void *ptr, int device_id)
+        {
+            (void)ptr;
+            (void)device_id;
         }
 
         // ====================================================================

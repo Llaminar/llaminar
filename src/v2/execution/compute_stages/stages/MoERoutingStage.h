@@ -75,6 +75,7 @@ namespace llaminar2
         bool allowsZeroOutput() const override { return false; }
         bool supportsBackend(ComputeBackendType backend) const override;
         StageBufferRequirements getBufferRequirements() const override;
+        StageBufferContract bufferContract() const override;
         StageDumpInfo buildDumpInfoImpl() const override;
 
     private:

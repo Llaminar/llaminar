@@ -7,6 +7,7 @@
  */
 
 #include "MoEExpertWeightService.h"
+#include "GPUExpertTransfer.h"
 #include "../../tensors/Tensors.h"
 #include "../../tensors/BlockStructures.h"
 #include "../../kernels/KernelFactory.h"
@@ -14,7 +15,10 @@
 #include "../../kernels/cpu/native_vnni/CPUPackedWeights.h"
 #include "../../kernels/cpu/native_vnni/CPUNativeVNNIGemmKernel.h"
 #include "../../loaders/MmapRegion.h"
+#include "../../loaders/gpu_pipeline/LoadOrchestrator.h"
+#include "../../backends/BackendManager.h"
 #include "../../utils/Assertions.h"
+#include "../../utils/DebugEnv.h"
 #include "../../utils/Logger.h"
 #include "../../utils/OpenMPUtils.h"
 
@@ -296,18 +300,11 @@ bool MoEExpertWeightService::prepareGemmEngines(MoEWeightContext& ctx)
               << " experts (3 weights each = " << (prep_count * 3) << " total"
               << (use_mask ? " [dynamic rebalance: mask-active only]" : "") << ")...");
 
-#ifdef HAVE_CUDA
-    if (ctx.device_id.is_cuda())
+    // GPU path: unified H2D + GPU repack via LoadOrchestrator pipeline.
+    if (ctx.device_id.is_gpu())
     {
-        return prepareGemmEnginesCUDA(ctx);
+        return prepareGemmEnginesGPU(ctx);
     }
-#endif
-#ifdef HAVE_ROCM
-    if (ctx.device_id.is_rocm())
-    {
-        return prepareGemmEnginesROCm(ctx);
-    }
-#endif
 
     // CPU path: parallelize expert GEMM engine preparation.
     // Each expert has unique tensors (unique raw_data() keys), so no cache
@@ -543,6 +540,18 @@ bool MoEExpertWeightService::registerAndPrepareNewExperts(
     }
     if (new_experts.empty()) return true;
 
+    // GPU path: raw H2D + GPU repack via LoadOrchestrator.
+    // Ignores received_weights (CPU-serialized packed weights are useless on GPU).
+    // Uses raw GGUF data from expert views — same pipeline as initial load.
+    if (ctx.device_id.is_gpu()) {
+        if (received_weights && !received_weights->empty()) {
+            LOG_DEBUG("[MoEWeightService] Ignoring " << received_weights->size()
+                      << " CPU-serialized weight blobs — using GPU repack pipeline instead");
+        }
+        return registerAndPrepareNewExpertsGPU(ctx, new_experts);
+    }
+
+    // CPU path: deserialize transferred weights, then KernelFactory pack
     auto t_start = std::chrono::high_resolution_clock::now();
     int transferred_count = 0;
     std::atomic<bool> error_flag{false};
@@ -612,154 +621,446 @@ bool MoEExpertWeightService::registerAndPrepareNewExperts(
 }
 
 // =========================================================================
-// CUDA batch packing
+// GPU rebalance path (LoadOrchestrator: raw H2D + GPU repack for new experts)
 // =========================================================================
+
+bool MoEExpertWeightService::registerAndPrepareNewExpertsGPU(
+    MoEWeightContext& ctx, const std::vector<int>& new_experts)
+{
+    using Clock = std::chrono::high_resolution_clock;
+    const auto t_start = Clock::now();
+
+    const int gpu_ordinal = ctx.device_id.is_cuda()
+                                ? ctx.device_id.cuda_ordinal()
+                                : ctx.device_id.rocm_ordinal();
+    const int count = static_cast<int>(new_experts.size());
+
+    IBackend* backend = getBackendFor(ctx.device_id);
+    if (!backend)
+    {
+        LOG_ERROR("[MoEWeightService::GPU-rebalance] No backend for "
+                  << ctx.device_id.to_string());
+        return false;
+    }
+
+    // Weight groups: gate, up, down
+    struct WeightGroup {
+        const char* label;
+        std::vector<std::shared_ptr<TensorBase>>& views;
+        std::vector<ITensorGemm*>& out_gemms;
+    };
+    WeightGroup groups[] = {
+        {"gate", ctx.expert_gate_views, ctx.prepared_gate_gemm},
+        {"up",   ctx.expert_up_views,   ctx.prepared_up_gemm},
+        {"down", ctx.expert_down_views,  ctx.prepared_down_gemm},
+    };
+
+    auto orchestrator = std::make_shared<LoadOrchestrator>(backend);
+    orchestrator->addDevice(gpu_ordinal);
+
+    size_t max_raw_bytes = 0;
+    size_t total_planned = 0;
+
+    // Phase 1: Plan weights for new experts
+    for (auto& grp : groups)
+    {
+        for (int idx = 0; idx < count; ++idx)
+        {
+            const int e = new_experts[idx];
+            const auto& view = grp.views[e];
+            if (!view)
+            {
+                LOG_ERROR("[MoEWeightService::GPU-rebalance] Null view for expert "
+                          << e << " in " << grp.label);
+                return false;
+            }
+
+            auto* unpackable = dynamic_cast<IINT8Unpackable*>(view.get());
+            const NativeVnniFormatInfo* vnni = unpackable ? unpackable->vnniFormatInfo() : nullptr;
+            if (!vnni)
+            {
+                LOG_ERROR("[MoEWeightService::GPU-rebalance] Expert " << e << " "
+                          << grp.label << " has no VNNI format info");
+                return false;
+            }
+
+            const int N = static_cast<int>(view->rows());
+            const int K = static_cast<int>(view->cols());
+            const size_t raw_bytes = view->size_bytes();
+            const std::string slot_name = std::string(grp.label) + "_e" + std::to_string(e);
+
+            orchestrator->planWeight(gpu_ordinal, slot_name, N, K,
+                                     vnni->payload_bytes, vnni->is_asymmetric,
+                                     vnni->has_emins, raw_bytes);
+            max_raw_bytes = std::max(max_raw_bytes, raw_bytes);
+            ++total_planned;
+        }
+    }
+
+    LOG_DEBUG("[MoEWeightService::GPU-rebalance] Planned " << total_planned
+              << " expert weights for " << ctx.device_id.to_string()
+              << " (layer " << ctx.layer_idx << ")");
+
+    // Phase 2: Allocate VRAM pool + pinned ring buffer
+    const auto& rocm_cfg = debugEnv().rocm;
+    orchestrator->allocate(max_raw_bytes, rocm_cfg.repack_streams);
+
+    // Phase 3: Create weight jobs from raw GGUF data
+    for (auto& grp : groups)
+    {
+        for (int idx = 0; idx < count; ++idx)
+        {
+            const int e = new_experts[idx];
+            const auto& view = grp.views[e];
+
+            auto* unpackable = dynamic_cast<IINT8Unpackable*>(view.get());
+            const NativeVnniFormatInfo* vnni = unpackable->vnniFormatInfo();
+
+            auto repack_fmt = codebookIdToRepackFormat(vnni->codebook_id, vnni->is_superblock);
+            if (!repack_fmt)
+            {
+                LOG_ERROR("[MoEWeightService::GPU-rebalance] Unsupported repack format for expert "
+                          << e << " " << grp.label
+                          << " (codebook=" << static_cast<int>(vnni->codebook_id)
+                          << ", superblock=" << vnni->is_superblock << ")");
+                return false;
+            }
+
+            const std::string slot_name = std::string(grp.label) + "_e" + std::to_string(e);
+
+            WeightJob job;
+            job.name = slot_name;
+            job.host_raw_data = view->raw_data();
+            job.raw_bytes = view->size_bytes();
+            job.format = *repack_fmt;
+            job.N = static_cast<int>(view->rows());
+            job.K = static_cast<int>(view->cols());
+            job.is_asymmetric = vnni->is_asymmetric;
+
+            orchestrator->addWeightJob(gpu_ordinal, job);
+        }
+    }
+
+    // Phase 4: Execute pipeline (pipelined H2D + GPU repack)
+    orchestrator->load();
+
+    auto* pool = orchestrator->getPool(gpu_ordinal);
+    if (!pool)
+    {
+        LOG_ERROR("[MoEWeightService::GPU-rebalance] Pool not found after load");
+        return false;
+    }
+
+    // Phase 5: Create per-expert GEMM kernels from pool slots
+    for (auto& grp : groups)
+    {
+        for (int idx = 0; idx < count; ++idx)
+        {
+            const int e = new_experts[idx];
+            const auto& view = grp.views[e];
+            const std::string slot_name = std::string(grp.label) + "_e" + std::to_string(e);
+
+            auto slot = pool->getSlot(slot_name);
+            if (!slot)
+            {
+                LOG_ERROR("[MoEWeightService::GPU-rebalance] No slot for " << slot_name);
+                return false;
+            }
+
+            auto* unpackable = dynamic_cast<IINT8Unpackable*>(view.get());
+            const NativeVnniFormatInfo* vnni = unpackable->vnniFormatInfo();
+            const int N = static_cast<int>(view->rows());
+            const int K = static_cast<int>(view->cols());
+            const uint32_t blocks_per_row = static_cast<uint32_t>(K / 32);
+
+            std::shared_ptr<ITensorGemm> kernel;
 
 #ifdef HAVE_CUDA
-bool MoEExpertWeightService::prepareGemmEnginesCUDA(MoEWeightContext& ctx)
-{
-    using namespace llaminar2::cuda;
-    const int num_experts = ctx.num_experts;
-    const int cuda_id = ctx.device_id.cuda_ordinal();
-
-    // Helper: batch-pack one weight group and create per-expert kernels
-    auto batchPackAndCreateKernels = [&](
-        const std::vector<std::shared_ptr<TensorBase>> &views,
-        std::vector<ITensorGemm *> &out_gemms,
-        std::shared_ptr<void> &out_lifetime,
-        const char *label) -> bool
-    {
-        const int rows = static_cast<int>(views[0]->rows());
-        const int K = static_cast<int>(views[0]->cols());
-
-        auto batch = packMoEExpertsCUDA(views, num_experts, rows);
-        if (!batch)
-        {
-            LOG_ERROR("[MoEWeightService::CUDA] Failed to batch-pack " << label);
-            return false;
-        }
-
-        if (!batch->uploadToDevice(cuda_id))
-        {
-            LOG_ERROR("[MoEWeightService::CUDA] Failed to upload " << label << " to device " << cuda_id);
-            return false;
-        }
-
-        for (int e = 0; e < num_experts; ++e)
-        {
-            auto expert_ptrs = batch->getExpertDevicePointers(cuda_id, e);
-            auto kernel = std::make_shared<llaminar2::cuda::CUDAQuantisedGemmKernel>(
-                rows, K, cuda_id,
-                expert_ptrs.d_vnni, expert_ptrs.d_scales,
-                expert_ptrs.d_mins, expert_ptrs.d_emins,
-                batch->codebook_id, static_cast<uint32_t>(batch->blocks_per_row),
-                batch);
-            out_gemms[e] = kernel.get();
-            ctx.moe_owned_kernels.push_back(std::move(kernel));
-        }
-
-        batch->freeHostBuffers();
-        out_lifetime = std::move(batch);
-        return true;
-    };
-
-    if (!batchPackAndCreateKernels(ctx.expert_gate_views, ctx.prepared_gate_gemm,
-                                   ctx.moe_packed_gate_lifetime, "gate"))
-        return false;
-    if (!batchPackAndCreateKernels(ctx.expert_up_views, ctx.prepared_up_gemm,
-                                   ctx.moe_packed_up_lifetime, "up"))
-        return false;
-    if (!batchPackAndCreateKernels(ctx.expert_down_views, ctx.prepared_down_gemm,
-                                   ctx.moe_packed_down_lifetime, "down"))
-        return false;
-
-    LOG_DEBUG("[MoEWeightService] All " << (num_experts * 3)
-              << " expert GEMM engines prepared (CUDA batch path, 3 GPU allocs)");
-
-    // Release mmap pages for raw expert weights (now uploaded to GPU).
-    {
-        size_t released = 0;
-        if (ctx.gate_exps && ctx.gate_exps->is_mmap_data())
-            released += MmapRegion::adviseDontneedRange(ctx.gate_exps->raw_data(), ctx.gate_exps->size_bytes());
-        if (ctx.up_exps && ctx.up_exps->is_mmap_data())
-            released += MmapRegion::adviseDontneedRange(ctx.up_exps->raw_data(), ctx.up_exps->size_bytes());
-        if (ctx.down_exps && ctx.down_exps->is_mmap_data())
-            released += MmapRegion::adviseDontneedRange(ctx.down_exps->raw_data(), ctx.down_exps->size_bytes());
-        if (released > 0)
-            LOG_DEBUG("[MoEWeightService] Advised " << (released >> 20) << " MB of mmap pages DONTNEED after CUDA packing");
-    }
-
-    return true;
-}
-#endif // HAVE_CUDA
-
-// =========================================================================
-// ROCm batch packing
-// =========================================================================
-
+            if (ctx.device_id.is_cuda())
+            {
+                kernel = std::make_shared<llaminar2::cuda::CUDAQuantisedGemmKernel>(
+                    N, K, gpu_ordinal,
+                    slot->d_native_vnni_payload,
+                    static_cast<uint16_t*>(slot->d_native_vnni_scales),
+                    static_cast<uint16_t*>(slot->d_native_vnni_mins),
+                    static_cast<uint32_t*>(slot->d_native_vnni_emins),
+                    vnni->codebook_id, blocks_per_row,
+                    orchestrator);
+            }
+#endif
 #ifdef HAVE_ROCM
-bool MoEExpertWeightService::prepareGemmEnginesROCm(MoEWeightContext& ctx)
-{
-    using namespace llaminar2::rocm;
-    const int num_experts = ctx.num_experts;
-    const int rocm_id = ctx.device_id.rocm_ordinal();
+            if (ctx.device_id.is_rocm())
+            {
+                kernel = std::make_shared<llaminar2::rocm::ROCmQuantisedGemmKernel>(
+                    N, K, gpu_ordinal,
+                    slot->d_native_vnni_payload,
+                    slot->d_native_vnni_scales,
+                    slot->d_native_vnni_mins,
+                    slot->d_native_vnni_emins,
+                    vnni->codebook_id, blocks_per_row,
+                    orchestrator);
+            }
+#endif
 
-    auto batchPackAndCreateKernels = [&](
-        const std::vector<std::shared_ptr<TensorBase>> &views,
-        std::vector<ITensorGemm *> &out_gemms,
-        std::shared_ptr<void> &out_lifetime,
-        const char *label) -> bool
-    {
-        const int rows = static_cast<int>(views[0]->rows());
-        const int K = static_cast<int>(views[0]->cols());
+            if (!kernel)
+            {
+                LOG_ERROR("[MoEWeightService::GPU-rebalance] Failed to create kernel for " << slot_name);
+                return false;
+            }
 
-        auto batch = packMoEExpertsROCm(views, num_experts, rows);
-        if (!batch)
-        {
-            LOG_ERROR("[MoEWeightService::ROCm] Failed to batch-pack " << label);
-            return false;
-        }
-
-        if (!batch->uploadToDevice(rocm_id))
-        {
-            LOG_ERROR("[MoEWeightService::ROCm] Failed to upload " << label << " to device " << rocm_id);
-            return false;
-        }
-
-        for (int e = 0; e < num_experts; ++e)
-        {
-            auto expert_ptrs = batch->getExpertDevicePointers(rocm_id, e);
-            auto kernel = std::make_shared<llaminar2::rocm::ROCmQuantisedGemmKernel>(
-                rows, K, rocm_id,
-                expert_ptrs.d_native_vnni,
-                expert_ptrs.d_native_scales,
-                expert_ptrs.d_native_mins,
-                expert_ptrs.d_native_emins,
-                batch->codebook_id, static_cast<uint32_t>(batch->blocks_per_row),
-                batch);
-            out_gemms[e] = kernel.get();
+            grp.out_gemms[e] = kernel.get();
             ctx.moe_owned_kernels.push_back(std::move(kernel));
         }
+    }
 
-        batch->freeHostBuffers();
-        out_lifetime = std::move(batch);
+    // Phase 6: Release staging resources; VRAM pool stays alive via kernel lifetime_owner_
+    orchestrator->finalize();
+
+    const auto elapsed_ms = std::chrono::duration<double, std::milli>(Clock::now() - t_start).count();
+    LOG_INFO("[MoEWeightService::GPU-rebalance] " << (count * 3) << " expert GEMM engines "
+             << "prepared via GPU pipeline in "
+             << std::fixed << std::setprecision(1) << elapsed_ms << " ms"
+             << " (layer " << ctx.layer_idx << ", "
+             << ctx.device_id.to_string() << ")");
+
+    return true;
+}
+
+// =========================================================================
+// GPU pipeline path (LoadOrchestrator: raw H2D + GPU repack)
+// =========================================================================
+
+bool MoEExpertWeightService::prepareGemmEnginesGPU(MoEWeightContext& ctx)
+{
+    using Clock = std::chrono::high_resolution_clock;
+    const auto t_start = Clock::now();
+
+    const int num_experts = ctx.num_experts;
+    const int gpu_ordinal = ctx.device_id.is_cuda()
+                                ? ctx.device_id.cuda_ordinal()
+                                : ctx.device_id.rocm_ordinal();
+
+    // Build list of local expert indices (same as old batch path).
+    std::vector<int> local_experts;
+    {
+        const bool use_mask = !ctx.expert_mask.empty();
+        const int local_start = ctx.local_expert_start;
+        const int local_count = (ctx.local_expert_count < 0)
+                                    ? num_experts
+                                    : ctx.local_expert_count;
+        const int local_end = local_start + local_count;
+        if (use_mask)
+        {
+            for (int e = 0; e < num_experts; ++e)
+                if (ctx.expert_mask[e])
+                    local_experts.push_back(e);
+        }
+        else
+        {
+            for (int e = local_start; e < local_end; ++e)
+                local_experts.push_back(e);
+        }
+    }
+    const int local_count = static_cast<int>(local_experts.size());
+    if (local_count == 0)
+    {
+        LOG_WARN("[MoEWeightService::GPU] No local experts to prepare");
         return true;
+    }
+
+    // Get backend
+    IBackend* backend = getBackendFor(ctx.device_id);
+    if (!backend)
+    {
+        LOG_ERROR("[MoEWeightService::GPU] No backend for " << ctx.device_id.to_string());
+        return false;
+    }
+
+    // Weight groups: gate, up, down — each with local_count expert views.
+    struct WeightGroup {
+        const char* label;
+        std::vector<std::shared_ptr<TensorBase>>& views;
+        std::vector<ITensorGemm*>& out_gemms;
+        std::shared_ptr<void>& out_lifetime;
+    };
+    WeightGroup groups[] = {
+        {"gate", ctx.expert_gate_views, ctx.prepared_gate_gemm, ctx.moe_packed_gate_lifetime},
+        {"up",   ctx.expert_up_views,   ctx.prepared_up_gemm,   ctx.moe_packed_up_lifetime},
+        {"down", ctx.expert_down_views,  ctx.prepared_down_gemm,  ctx.moe_packed_down_lifetime},
     };
 
-    if (!batchPackAndCreateKernels(ctx.expert_gate_views, ctx.prepared_gate_gemm,
-                                   ctx.moe_packed_gate_lifetime, "gate"))
-        return false;
-    if (!batchPackAndCreateKernels(ctx.expert_up_views, ctx.prepared_up_gemm,
-                                   ctx.moe_packed_up_lifetime, "up"))
-        return false;
-    if (!batchPackAndCreateKernels(ctx.expert_down_views, ctx.prepared_down_gemm,
-                                   ctx.moe_packed_down_lifetime, "down"))
-        return false;
+    // Create one LoadOrchestrator for ALL expert weights (3 groups × local_count).
+    // Single VRAM allocation, pipelined H2D + GPU repack.
+    auto orchestrator = std::make_shared<LoadOrchestrator>(backend);
+    orchestrator->addDevice(gpu_ordinal);
 
-    LOG_DEBUG("[MoEWeightService] All " << (num_experts * 3)
-              << " expert GEMM engines prepared (ROCm batch path, 3 GPU allocs)");
+    size_t max_raw_bytes = 0;
+    size_t total_planned = 0;
 
-    // Release mmap pages for raw expert weights (now uploaded to GPU).
+    // Phase 1: Plan all expert weights
+    for (auto& grp : groups)
+    {
+        for (int idx = 0; idx < local_count; ++idx)
+        {
+            const int e = local_experts[idx];
+            const auto& view = grp.views[e];
+            if (!view)
+            {
+                LOG_ERROR("[MoEWeightService::GPU] Null view for expert " << e
+                          << " in " << grp.label);
+                return false;
+            }
+
+            auto* unpackable = dynamic_cast<IINT8Unpackable*>(view.get());
+            const NativeVnniFormatInfo* vnni = unpackable ? unpackable->vnniFormatInfo() : nullptr;
+            if (!vnni)
+            {
+                LOG_ERROR("[MoEWeightService::GPU] Expert " << e << " " << grp.label
+                          << " has no VNNI format info — cannot use GPU repack");
+                return false;
+            }
+
+            const int N = static_cast<int>(view->rows());
+            const int K = static_cast<int>(view->cols());
+            const size_t raw_bytes = view->size_bytes();
+
+            // Unique name per expert per group
+            const std::string slot_name = std::string(grp.label) + "_e" + std::to_string(e);
+
+            orchestrator->planWeight(gpu_ordinal, slot_name, N, K,
+                                     vnni->payload_bytes, vnni->is_asymmetric,
+                                     vnni->has_emins, raw_bytes);
+            max_raw_bytes = std::max(max_raw_bytes, raw_bytes);
+            ++total_planned;
+        }
+    }
+
+    LOG_INFO("[MoEWeightService::GPU] Planned " << total_planned << " expert weights for "
+             << ctx.device_id.to_string() << " (layer " << ctx.layer_idx << ")");
+
+    // Phase 2: Allocate VRAM pool + pinned ring buffer
+    const auto& rocm_cfg = debugEnv().rocm;
+    orchestrator->allocate(max_raw_bytes, rocm_cfg.repack_streams);
+
+    // Phase 3: Create weight jobs
+    for (auto& grp : groups)
+    {
+        for (int idx = 0; idx < local_count; ++idx)
+        {
+            const int e = local_experts[idx];
+            const auto& view = grp.views[e];
+
+            auto* unpackable = dynamic_cast<IINT8Unpackable*>(view.get());
+            const NativeVnniFormatInfo* vnni = unpackable->vnniFormatInfo();
+
+            auto repack_fmt = codebookIdToRepackFormat(vnni->codebook_id, vnni->is_superblock);
+            if (!repack_fmt)
+            {
+                LOG_ERROR("[MoEWeightService::GPU] Unsupported repack format for expert " << e
+                          << " " << grp.label << " (codebook=" << static_cast<int>(vnni->codebook_id)
+                          << ", superblock=" << vnni->is_superblock << ")");
+                return false;
+            }
+
+            const std::string slot_name = std::string(grp.label) + "_e" + std::to_string(e);
+
+            WeightJob job;
+            job.name = slot_name;
+            job.host_raw_data = view->raw_data();
+            job.raw_bytes = view->size_bytes();
+            job.format = *repack_fmt;
+            job.N = static_cast<int>(view->rows());
+            job.K = static_cast<int>(view->cols());
+            job.is_asymmetric = vnni->is_asymmetric;
+
+            orchestrator->addWeightJob(gpu_ordinal, job);
+        }
+    }
+
+    // Phase 4: Execute pipeline (pipelined H2D + GPU repack)
+    orchestrator->load();
+
+    auto* pool = orchestrator->getPool(gpu_ordinal);
+    if (!pool)
+    {
+        LOG_ERROR("[MoEWeightService::GPU] Pool not found after load");
+        return false;
+    }
+
+    // Phase 5: Create per-expert GEMM kernels from pool slots
+    for (auto& grp : groups)
+    {
+        for (int idx = 0; idx < local_count; ++idx)
+        {
+            const int e = local_experts[idx];
+            const auto& view = grp.views[e];
+            const std::string slot_name = std::string(grp.label) + "_e" + std::to_string(e);
+
+            auto slot = pool->getSlot(slot_name);
+            if (!slot)
+            {
+                LOG_ERROR("[MoEWeightService::GPU] No slot for " << slot_name);
+                return false;
+            }
+
+            auto* unpackable = dynamic_cast<IINT8Unpackable*>(view.get());
+            const NativeVnniFormatInfo* vnni = unpackable->vnniFormatInfo();
+            const int N = static_cast<int>(view->rows());
+            const int K = static_cast<int>(view->cols());
+            const uint32_t blocks_per_row = static_cast<uint32_t>(K / 32);
+
+            std::shared_ptr<ITensorGemm> kernel;
+
+#ifdef HAVE_CUDA
+            if (ctx.device_id.is_cuda())
+            {
+                kernel = std::make_shared<llaminar2::cuda::CUDAQuantisedGemmKernel>(
+                    N, K, gpu_ordinal,
+                    slot->d_native_vnni_payload,
+                    static_cast<uint16_t*>(slot->d_native_vnni_scales),
+                    static_cast<uint16_t*>(slot->d_native_vnni_mins),
+                    static_cast<uint32_t*>(slot->d_native_vnni_emins),
+                    vnni->codebook_id, blocks_per_row,
+                    orchestrator); // lifetime: keeps VRAM pool alive
+            }
+#endif
+#ifdef HAVE_ROCM
+            if (ctx.device_id.is_rocm())
+            {
+                kernel = std::make_shared<llaminar2::rocm::ROCmQuantisedGemmKernel>(
+                    N, K, gpu_ordinal,
+                    slot->d_native_vnni_payload,
+                    slot->d_native_vnni_scales,
+                    slot->d_native_vnni_mins,
+                    slot->d_native_vnni_emins,
+                    vnni->codebook_id, blocks_per_row,
+                    orchestrator); // lifetime: keeps VRAM pool alive
+            }
+#endif
+
+            if (!kernel)
+            {
+                LOG_ERROR("[MoEWeightService::GPU] Failed to create kernel for " << slot_name);
+                return false;
+            }
+
+            grp.out_gemms[e] = kernel.get();
+            ctx.moe_owned_kernels.push_back(std::move(kernel));
+        }
+    }
+
+    // Phase 6: Release orchestrator staging resources (pinned ring).
+    // The VRAM pool stays alive via the shared_ptr in each kernel's lifetime_owner_.
+    orchestrator->finalize();
+
+    const auto elapsed_ms = std::chrono::duration<double, std::milli>(Clock::now() - t_start).count();
+    LOG_INFO("[MoEWeightService::GPU] " << (local_count * 3) << "/" << (num_experts * 3)
+             << " expert GEMM engines prepared via GPU pipeline in "
+             << std::fixed << std::setprecision(1) << elapsed_ms << " ms"
+             << " (layer " << ctx.layer_idx << ", "
+             << ctx.device_id.to_string() << ")");
+
+    // Release mmap pages for raw expert weights (now repacked on GPU).
     {
         size_t released = 0;
         if (ctx.gate_exps && ctx.gate_exps->is_mmap_data())
@@ -769,11 +1070,130 @@ bool MoEExpertWeightService::prepareGemmEnginesROCm(MoEWeightContext& ctx)
         if (ctx.down_exps && ctx.down_exps->is_mmap_data())
             released += MmapRegion::adviseDontneedRange(ctx.down_exps->raw_data(), ctx.down_exps->size_bytes());
         if (released > 0)
-            LOG_DEBUG("[MoEWeightService] Advised " << (released >> 20) << " MB of mmap pages DONTNEED after ROCm packing");
+            LOG_DEBUG("[MoEWeightService] Advised " << (released >> 20) << " MB of mmap pages DONTNEED after GPU repack");
     }
 
     return true;
 }
-#endif // HAVE_ROCM
+
+
+// =========================================================================
+// GPU-direct expert transfer (GPU↔GPU, same packed format)
+// =========================================================================
+
+bool MoEExpertWeightService::transferExpertsGPUDirect(
+    const MoEWeightContext& src_ctx,
+    MoEWeightContext& dst_ctx,
+    const std::vector<int>& expert_ids,
+    int layer_idx)
+{
+#ifdef HAVE_ROCM
+    if (!src_ctx.device_id.is_rocm() || !dst_ctx.device_id.is_rocm()) {
+        LOG_DEBUG("[MoEWeightService] GPU-direct transfer requires both contexts on ROCm "
+                  << "(src=" << src_ctx.device_id.to_string()
+                  << " dst=" << dst_ctx.device_id.to_string() << ")");
+        return false;
+    }
+
+    using namespace llaminar2::rocm;
+
+    // Get source batch packed weights from lifetime pointers
+    auto* src_gate_batch = static_cast<MoEBatchPackedWeightsROCm*>(src_ctx.moe_packed_gate_lifetime.get());
+    auto* src_up_batch = static_cast<MoEBatchPackedWeightsROCm*>(src_ctx.moe_packed_up_lifetime.get());
+    auto* src_down_batch = static_cast<MoEBatchPackedWeightsROCm*>(src_ctx.moe_packed_down_lifetime.get());
+
+    if (!src_gate_batch || !src_up_batch || !src_down_batch) {
+        LOG_DEBUG("[MoEWeightService] GPU-direct transfer: source batch packed weights not available");
+        return false;
+    }
+
+    auto* dst_gate_batch = static_cast<MoEBatchPackedWeightsROCm*>(dst_ctx.moe_packed_gate_lifetime.get());
+    auto* dst_up_batch = static_cast<MoEBatchPackedWeightsROCm*>(dst_ctx.moe_packed_up_lifetime.get());
+    auto* dst_down_batch = static_cast<MoEBatchPackedWeightsROCm*>(dst_ctx.moe_packed_down_lifetime.get());
+
+    if (!dst_gate_batch || !dst_up_batch || !dst_down_batch) {
+        LOG_DEBUG("[MoEWeightService] GPU-direct transfer: destination batch packed weights not available");
+        return false;
+    }
+
+    const int src_rocm = src_ctx.device_id.rocm_ordinal();
+    const int dst_rocm = dst_ctx.device_id.rocm_ordinal();
+
+    auto transferOneBatch = [&](
+        MoEBatchPackedWeightsROCm* src_batch,
+        MoEBatchPackedWeightsROCm* dst_batch,
+        std::shared_ptr<void>& dst_lifetime,
+        std::vector<ITensorGemm*>& dst_gemms,
+        const char* label) -> bool
+    {
+        const size_t vnni_per_expert = src_batch->vnni_bytes_per_expert;
+        const size_t scales_per_expert = src_batch->scales_per_expert * sizeof(uint16_t);
+        const size_t mins_per_expert = src_batch->mins_per_expert * sizeof(uint16_t);
+        const size_t emins_per_expert = src_batch->emins_per_expert * sizeof(uint32_t);
+
+        for (int expert_id : expert_ids) {
+            auto src_ptrs = src_batch->getExpertDevicePointers(src_rocm, expert_id);
+            auto dst_ptrs_rocm = dst_batch->getExpertDevicePointers(dst_rocm, expert_id);
+
+            GPUExpertPointers src_gep, dst_gep;
+            src_gep.d_vnni = src_ptrs.d_native_vnni;
+            src_gep.d_scales = src_ptrs.d_native_scales;
+            src_gep.d_mins = src_ptrs.d_native_mins;
+            src_gep.d_emins = src_ptrs.d_native_emins;
+            dst_gep.d_vnni = dst_ptrs_rocm.d_native_vnni;
+            dst_gep.d_scales = dst_ptrs_rocm.d_native_scales;
+            dst_gep.d_mins = dst_ptrs_rocm.d_native_mins;
+            dst_gep.d_emins = dst_ptrs_rocm.d_native_emins;
+
+            if (!GPUExpertTransfer::transferExpert(
+                    src_gep, dst_gep,
+                    src_ctx.device_id, dst_ctx.device_id,
+                    vnni_per_expert, scales_per_expert, mins_per_expert, emins_per_expert,
+                    nullptr)) {
+                LOG_ERROR("[MoEWeightService] GPU-direct transfer failed for "
+                          << label << " expert " << expert_id
+                          << " layer " << layer_idx);
+                return false;
+            }
+
+            // Create GEMM engine for the destination device pointing to transferred data
+            auto kernel = std::make_shared<ROCmQuantisedGemmKernel>(
+                dst_batch->rows_per_expert, dst_batch->K, dst_rocm,
+                dst_ptrs_rocm.d_native_vnni,
+                dst_ptrs_rocm.d_native_scales,
+                dst_ptrs_rocm.d_native_mins,
+                dst_ptrs_rocm.d_native_emins,
+                dst_batch->codebook_id, static_cast<uint32_t>(dst_batch->blocks_per_row),
+                dst_lifetime);
+            dst_gemms[expert_id] = kernel.get();
+            dst_ctx.moe_owned_kernels.push_back(std::move(kernel));
+        }
+        return true;
+    };
+
+    if (!transferOneBatch(src_gate_batch, dst_gate_batch,
+                          dst_ctx.moe_packed_gate_lifetime,
+                          dst_ctx.prepared_gate_gemm, "gate"))
+        return false;
+    if (!transferOneBatch(src_up_batch, dst_up_batch,
+                          dst_ctx.moe_packed_up_lifetime,
+                          dst_ctx.prepared_up_gemm, "up"))
+        return false;
+    if (!transferOneBatch(src_down_batch, dst_down_batch,
+                          dst_ctx.moe_packed_down_lifetime,
+                          dst_ctx.prepared_down_gemm, "down"))
+        return false;
+
+    LOG_INFO("[MoEWeightService] GPU-direct transferred " << expert_ids.size()
+             << " experts (3 weight types) ROCm:" << src_rocm
+             << " → ROCm:" << dst_rocm << " layer " << layer_idx);
+    return true;
+
+#else
+    (void)src_ctx; (void)dst_ctx; (void)expert_ids; (void)layer_idx;
+    LOG_DEBUG("[MoEWeightService] GPU-direct transfer requires ROCm");
+    return false;
+#endif
+}
 
 } // namespace llaminar2

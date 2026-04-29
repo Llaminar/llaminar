@@ -26,9 +26,11 @@
 #include "../memory/BufferId.h"
 #include "../config/TensorParallelConfig.h"
 #include "../config/TPDomain.h"
+#include "../utils/ToolCallTypes.h"
 #include <functional>
 #include <map>
 #include <memory>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -148,6 +150,15 @@ namespace llaminar2
         DeviceId default_device = DeviceId::cpu(); ///< Default device for execution
         bool enable_profiling = false;
         bool enable_validation = false;
+
+        // =================================================================
+        // Tool Calling Configuration
+        // =================================================================
+        /// Tool call output format for this model. Determines how raw model
+        /// output text is parsed into structured tool_calls objects.
+        /// Default: HERMES_2_PRO (covers Qwen 2.5, Qwen 3, Hermes, etc.)
+        /// Set to NONE to disable tool call detection.
+        ToolCallFormat tool_call_format = ToolCallFormat::HERMES_2_PRO;
 
         /// Use graph-managed buffer allocation with aliasing optimization.
         /// When true, the graph builder uses DeviceGraphBufferManager to allocate
@@ -289,6 +300,37 @@ namespace llaminar2
             for (int i = 0; i < n_layers; ++i)
             {
                 tp_allreduce_precision[i] = (i < fp32_count) ? "fp32" : schema_default;
+            }
+        }
+
+        /**
+         * @brief Populate the precision map with layer-type awareness
+         *
+         * For hybrid architectures (e.g., Qwen3.5 GDN+FA), certain layer types
+         * may require FP32 allreduce regardless of their position. This overload
+         * forces FP32 for layers in fp32_forced_layers, and applies the standard
+         * count-based policy to all other layers.
+         *
+         * @param schema_default Default precision for non-forced layers beyond fp32 count
+         * @param fp32_count Number of initial non-forced layers that get FP32
+         * @param fp32_forced_layers Layer indices always forced to FP32 (e.g., FA layers)
+         */
+        void populateAllreducePrecision(const std::string &schema_default, int fp32_count,
+                                        const std::set<int> &fp32_forced_layers)
+        {
+            tp_allreduce_precision.clear();
+            int non_forced_idx = 0; // Count of non-forced layers seen so far
+            for (int i = 0; i < n_layers; ++i)
+            {
+                if (fp32_forced_layers.count(i))
+                {
+                    tp_allreduce_precision[i] = "fp32";
+                }
+                else
+                {
+                    tp_allreduce_precision[i] = (non_forced_idx < fp32_count) ? "fp32" : schema_default;
+                    ++non_forced_idx;
+                }
             }
         }
 

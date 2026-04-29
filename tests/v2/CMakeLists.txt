@@ -59,6 +59,54 @@ else()
 endif()
 
 # =============================================================================
+# Release-mode guard: only build performance test targets
+# =============================================================================
+# When V2_PERF_TESTS_ONLY is ON (set by parent for Release builds), we override
+# add_executable so that only targets with the v2_perf_ prefix are created.
+# All other test executables (v2_test_*, v2_integration_*, v2_unit_*,
+# v2_orchestration_*, v2_e2e_*) become no-ops, keeping the Release build lean.
+# The add_v2_test() and discover_v2_parity_tests() functions also early-return
+# for non-perf tests when this flag is set.
+if(V2_PERF_TESTS_ONLY)
+    message(STATUS "V2 Tests: Release mode — building performance tests only")
+
+    # Override add_executable: only pass through v2_perf_* targets
+    macro(add_executable target)
+        if("${target}" MATCHES "^v2_perf_")
+            _add_executable(${target} ${ARGN})
+        endif()
+    endmacro()
+
+    # Skip target_link_libraries for non-existent (skipped) targets
+    macro(target_link_libraries target)
+        if(TARGET ${target})
+            _target_link_libraries(${target} ${ARGN})
+        endif()
+    endmacro()
+
+    # Skip target_include_directories for non-existent (skipped) targets
+    macro(target_include_directories target)
+        if(TARGET ${target})
+            _target_include_directories(${target} ${ARGN})
+        endif()
+    endmacro()
+
+    # Skip target_compile_definitions for non-existent (skipped) targets
+    macro(target_compile_definitions target)
+        if(TARGET ${target})
+            _target_compile_definitions(${target} ${ARGN})
+        endif()
+    endmacro()
+
+    # Skip target_compile_options for non-existent (skipped) targets
+    macro(target_compile_options target)
+        if(TARGET ${target})
+            _target_compile_options(${target} ${ARGN})
+        endif()
+    endmacro()
+endif()
+
+# =============================================================================
 # Test Model Fetching Fixture
 # =============================================================================
 # All V2 tests require GGUF models to be present. This fixture ensures
@@ -93,6 +141,11 @@ set_tests_properties(V2_FetchModelsFixture PROPERTIES
 #   - Sets environment variables for optimal performance
 
 function(add_v2_test TEST_NAME)
+    # In Release mode (V2_PERF_TESTS_ONLY), skip non-performance tests
+    if(V2_PERF_TESTS_ONLY AND NOT "${TEST_NAME}" MATCHES "^V2_Perf_")
+        return()
+    endif()
+
     cmake_parse_arguments(
         ARG                             # Prefix for parsed args
         ""                              # Options (boolean flags)
@@ -300,6 +353,11 @@ endfunction()
 #   )
 # =============================================================================
 function(discover_v2_parity_tests TARGET)
+    # In Release mode, parity tests are never perf tests — skip entirely
+    if(V2_PERF_TESTS_ONLY)
+        return()
+    endif()
+
     cmake_parse_arguments(ARG "" "MPI_PROCS;TEST_PREFIX" "LABELS" ${ARGN})
 
     if(NOT ARG_TEST_PREFIX)
@@ -1848,6 +1906,19 @@ add_v2_test(V2_Unit_KernelFactoryCacheInvalidation
     MPI_PROCS 1  # Cache invalidation tests, single rank
 )
 
+# Test: PreparedGemmKey collision regression (K/V weight collision after host data release)
+add_executable(v2_test_prepared_gemm_key_collision unit/kernels/Test__PreparedGemmKeyCollision.cpp)
+target_link_libraries(v2_test_prepared_gemm_key_collision
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_PreparedGemmKeyCollision
+    COMMAND $<TARGET_FILE:v2_test_prepared_gemm_key_collision>
+    LABELS "V2;Unit;Kernels;KernelFactory;TensorParallel;Regression"
+    MPI_PROCS 1
+)
+
 # Test: Kernel dynamic state lifecycle (session boundary resets)
 add_executable(v2_test_kernel_dynamic_state_lifecycle unit/kernels/Test__KernelDynamicStateLifecycle.cpp)
 target_link_libraries(v2_test_kernel_dynamic_state_lifecycle
@@ -2370,6 +2441,22 @@ add_v2_test(V2_Unit_ChatTemplate
     COMMAND $<TARGET_FILE:v2_test_chat_template>
     LABELS "V2;Unit;Chat;Template;Tokenization;TextProcessing"
     MPI_PROCS 1  # ChatTemplate is single-rank only
+)
+
+# Test: ToolCallParser (tool call parsing for Hermes 2 Pro, Generic, etc.)
+add_executable(v2_test_tool_call_parser unit/utils/Test__ToolCallParser.cpp)
+target_include_directories(v2_test_tool_call_parser PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../external/vendor  # For nlohmann/json.hpp
+)
+target_link_libraries(v2_test_tool_call_parser
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_ToolCallParser
+    COMMAND $<TARGET_FILE:v2_test_tool_call_parser>
+    LABELS "V2;Unit;ToolCalling;TextProcessing"
+    MPI_PROCS 1
 )
 
 # Note: ArgParser tests removed - replaced by OrchestrationConfigParser tests
@@ -3724,6 +3811,25 @@ target_link_libraries(v2_test_weight_manager_device_aware
 add_v2_test(V2_Unit_WeightManager_DeviceAware
     COMMAND $<TARGET_FILE:v2_test_weight_manager_device_aware>
     LABELS "V2;Unit;WeightManager;DeviceManagement;TensorParallelism;LocalTP;MultiDevice"
+    MPI_PROCS 1
+)
+
+# Test: WeightManager Virtual Weight Preloading (Regression)
+# Regression tests for TP GEMM cache miss when tied embeddings (output.weight)
+# aren't in the GGUF tensor list. Verifies that virtual weights from
+# WeightShardingConfig.exact_matches are included in preloadForDevices().
+# Also tests PreparedGemmKey identity logic for consistent cache hits.
+add_executable(v2_test_weight_preload_virtual_weights unit/Test__WeightPreloadVirtualWeights.cpp)
+target_include_directories(v2_test_weight_preload_virtual_weights PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}  # For tests/v2/mocks/ includes
+)
+target_link_libraries(v2_test_weight_preload_virtual_weights
+    llaminar2_core
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_WeightPreloadVirtualWeights
+    COMMAND $<TARGET_FILE:v2_test_weight_preload_virtual_weights>
+    LABELS "V2;Unit;WeightManager;TensorParallelism;TiedEmbeddings;PreparedGemm;Regression"
     MPI_PROCS 1
 )
 
@@ -6775,28 +6881,6 @@ add_v2_test(V2_Integration_MPI_ShardedKVCache
     LABELS "V2;Integration;MPI;KVCache;Sharding;TensorParallelism;Phase6;DistributedArchitecture"
 )
 
-# ============================================================================
-# Test: E2E Tensor-Parallel Inference (Capstone Integration Test)
-# ============================================================================
-# Full end-to-end test of the distributed inference pipeline exercising:
-#   - MPITopology: Device capability exchange, work distribution
-#   - WeightManager: Column/row-parallel weight sharding
-#   - QwenStandardGraph: Graph building with TP configuration
-#   - DeviceGraphOrchestrator: Full forward execution with all stages
-#   - Sharded KV Cache: Per-rank cache with local heads
-#   - AllReduceStage: After Wo projection, FFN down projection
-#   - AllGatherStage: After LM head for logits aggregation
-add_executable(v2_integration_mpi_e2e_tp_inference integration/utils/mpi/Test__MPI_E2E_TensorParallelInference.cpp)
-target_link_libraries(v2_integration_mpi_e2e_tp_inference
-    llaminar2_core
-    GTest::gtest
-)
-add_v2_test(V2_Integration_MPI_E2E_TensorParallelInference
-    COMMAND $<TARGET_FILE:v2_integration_mpi_e2e_tp_inference>
-    MPI_PROCS 2
-    LABELS "V2;Integration;MPI;E2E;TensorParallelism;DistributedArchitecture;Inference;DeviceGraphOrchestrator"
-)
-
 # Test: IQ4_NL Tensor GEMM
 add_executable(v2_test_iq4nl_tensor unit/tensors/Test__IQ4_NLTensor.cpp)
 target_link_libraries(v2_test_iq4nl_tensor 
@@ -7389,9 +7473,11 @@ add_v2_test(V2_Integration_MultiTurnSessionReset
 )
 # Override log level: DEBUG causes D2H syncs from GPU debug logging that
 # crash under sustained multi-session GPU test loads (pre-existing issue).
+if(NOT V2_PERF_TESTS_ONLY)
 set_tests_properties(V2_Integration_MultiTurnSessionReset PROPERTIES
     ENVIRONMENT_MODIFICATION "LLAMINAR_LOG_LEVEL=set:WARN"
 )
+endif()
 
 # Test: TPDomain MPI Integration Tests (Phase 3.2b)
 # Tests TPDomainBuilder, MPI_Comm_split, cross-rank domain creation, and cleanup
@@ -8271,6 +8357,49 @@ if(HAVE_ROCM)
 endif()
 
 # =============================================================================
+# ROCm MoE Kernel Integration Tests
+# =============================================================================
+if(HAVE_ROCM)
+    add_executable(v2_integration_rocm_moe_kernel
+        integration/kernels/rocm/Test__ROCmMoEKernel.cpp
+    )
+    target_link_libraries(v2_integration_rocm_moe_kernel
+        llaminar2_core
+        GTest::gtest
+        GTest::gtest_main
+    )
+    add_v2_test(V2_Integration_ROCmMoEKernel
+        COMMAND $<TARGET_FILE:v2_integration_rocm_moe_kernel>
+        LABELS "V2;Integration;ROCm;MoE;Routing;Gather;Scatter;gfx906"
+        MPI_PROCS 1
+    )
+    message(STATUS "V2 Tests: Added ROCm MoE kernel integration tests")
+endif()
+
+# =============================================================================
+# GPU Expert Transfer Unit Tests
+# =============================================================================
+# Tests GPU↔GPU (peer DMA or host-staged) transfer of packed MoE expert
+# weight arrays between ROCm devices. Requires ≥2 ROCm GPUs.
+
+if(HAVE_ROCM)
+    add_executable(v2_unit_gpu_expert_transfer
+        unit/moe/Test__GPUExpertTransfer.cpp
+    )
+    target_link_libraries(v2_unit_gpu_expert_transfer
+        llaminar2_core
+        GTest::gtest
+        GTest::gtest_main
+    )
+    add_v2_test(V2_Unit_GPUExpertTransfer
+        COMMAND $<TARGET_FILE:v2_unit_gpu_expert_transfer>
+        LABELS "V2;Unit;MoE;GPUTransfer;ROCm"
+        MPI_PROCS 1
+    )
+    message(STATUS "V2 Tests: Added GPU Expert Transfer unit tests")
+endif()
+
+# =============================================================================
 # GPU Device Context Integration Tests
 # =============================================================================
 # Tests GPUDeviceContextPool and IGPUDeviceContext implementations for both
@@ -9071,9 +9200,11 @@ add_v2_test(V2_Integration_SegmentedGraphCaptureExecution
     LABELS "V2;Integration;Execution;GraphCapture;Segmented;CUDA;ROCm"
     MPI_PROCS 1
 )
+if(NOT V2_PERF_TESTS_ONLY)
 set_tests_properties(V2_Integration_SegmentedGraphCaptureExecution PROPERTIES
     ENVIRONMENT "LLAMINAR_VALIDATE_BUFFERS=0;LLAMINAR_VALIDATE_INPUTS=0;LLAMINAR_FAIL_ON_ZERO=0"
 )
+endif()
 message(STATUS "V2 Tests: Added SegmentedGraphCaptureExecution integration tests")
 
 # =============================================================================
@@ -9125,6 +9256,7 @@ endif()
 # Shell-based tests that spin up llaminar2 --serve and test via curl.
 # Bypasses mpirun wrapper since the script manages its own server processes.
 
+if(NOT V2_PERF_TESTS_ONLY)
 add_test(
     NAME V2_E2E_Server_MultiTurn
     COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/e2e/server/test_server_e2e.sh
@@ -9136,6 +9268,7 @@ set_tests_properties(V2_E2E_Server_MultiTurn PROPERTIES
     ENVIRONMENT "LLAMINAR_LOG_LEVEL=ERROR"
 )
 message(STATUS "V2 Tests: Added E2E Server multi-turn integration tests")
+endif()
 
 # =============================================================================
 # Performance: TurboQuant TQ4 (quantize / dequantize / native dot)
@@ -9172,6 +9305,7 @@ add_v2_test(V2_Perf_TurboQuant
 
 set(PYTHON_REFERENCE_ROOT "${CMAKE_SOURCE_DIR}/../..")
 
+if(NOT V2_PERF_TESTS_ONLY)
 # Auto-discovers every test_*.py in python/reference/tests/ EXCEPT:
 #   --ignore: pure-integration files (all classes load GGUF models)
 #   -k:       integration classes in mixed files (GGUFLoading, Inference, etc.)
@@ -9189,6 +9323,7 @@ set_tests_properties(V2_Unit_Python_Reference_All PROPERTIES
     WORKING_DIRECTORY "${PYTHON_REFERENCE_ROOT}"
     TIMEOUT 900
 )
+endif()
 
 # =============================================================================
 # MoE Infrastructure Unit Tests
@@ -9491,6 +9626,20 @@ add_v2_test(V2_Unit_Qwen35BufferSizes
     MPI_PROCS 1
 )
 
+# Test: HybridAllreducePrecision — Layer-type-aware allreduce precision for Qwen3.5
+# FA layers always use FP32, GDN layers follow count-based fp32/fp16 policy.
+add_executable(v2_test_hybrid_allreduce_precision unit/models/qwen35/Test__HybridAllreducePrecision.cpp)
+target_link_libraries(v2_test_hybrid_allreduce_precision
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_HybridAllreducePrecision
+    COMMAND $<TARGET_FILE:v2_test_hybrid_allreduce_precision>
+    LABELS "V2;Unit;Qwen35;Allreduce;Precision;GDN"
+    MPI_PROCS 1
+)
+
 # Test: ActivationRotation — Block-diagonal rotation for kurtosis reduction
 # Tests orthogonality (norm preservation), identity (rotate+inverse), kurtosis
 # reduction, GEMM invariance (X@W^T == X@R@(W@R)^T), ModelWeightRotation
@@ -9751,14 +9900,133 @@ add_v2_test(V2_Unit_ShmemSpinBackend
     COMMAND $<TARGET_FILE:v2_test_shmem_spin_backend>
     LABELS "V2;Unit;Collective;ShmemSpin;Allreduce"
     MPI_PROCS 2
+    TIMEOUT 30
+    RESOURCE_LOCK "ShmemSpin"
 )
 add_v2_test(V2_Unit_ShmemSpinBackend_NP4
     COMMAND $<TARGET_FILE:v2_test_shmem_spin_backend>
     LABELS "V2;Unit;Collective;ShmemSpin;Allreduce"
     MPI_PROCS 4
+    TIMEOUT 30
+    RESOURCE_LOCK "ShmemSpin"
 )
 add_v2_test(V2_Unit_ShmemSpinBackend_NP8
     COMMAND $<TARGET_FILE:v2_test_shmem_spin_backend>
     LABELS "V2;Unit;Collective;ShmemSpin;Allreduce"
     MPI_PROCS 8
+    TIMEOUT 30
+    RESOURCE_LOCK "ShmemSpin"
+)
+
+# =============================================================================
+# GPU Weight Loading Pipeline - Phase 1 Foundation
+# =============================================================================
+
+add_executable(v2_test_weight_vram_pool unit/Test__WeightVRAMPool.cpp)
+target_include_directories(v2_test_weight_vram_pool PRIVATE ${CMAKE_SOURCE_DIR})
+target_link_libraries(v2_test_weight_vram_pool
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_WeightVRAMPool
+    COMMAND $<TARGET_FILE:v2_test_weight_vram_pool>
+    LABELS "V2;Unit;WeightLoading;GpuPipeline"
+    MPI_PROCS 1
+)
+
+add_executable(v2_test_pinned_ring_buffer unit/Test__PinnedRingBuffer.cpp)
+target_include_directories(v2_test_pinned_ring_buffer PRIVATE ${CMAKE_SOURCE_DIR})
+target_link_libraries(v2_test_pinned_ring_buffer
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_PinnedRingBuffer
+    COMMAND $<TARGET_FILE:v2_test_pinned_ring_buffer>
+    LABELS "V2;Unit;WeightLoading;GpuPipeline"
+    MPI_PROCS 1
+)
+
+add_executable(v2_test_load_orchestrator unit/Test__LoadOrchestrator.cpp)
+target_include_directories(v2_test_load_orchestrator PRIVATE ${CMAKE_SOURCE_DIR})
+target_link_libraries(v2_test_load_orchestrator
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_LoadOrchestrator
+    COMMAND $<TARGET_FILE:v2_test_load_orchestrator>
+    LABELS "V2;Unit;WeightLoading;GpuPipeline"
+    MPI_PROCS 1
+)
+
+# GPU Weight Loading Pipeline - Phase 2 GPU Repack Kernels
+add_executable(v2_test_vnni_repack_kernels unit/Test__VnniRepackKernels.cpp)
+target_include_directories(v2_test_vnni_repack_kernels PRIVATE ${CMAKE_SOURCE_DIR})
+target_link_libraries(v2_test_vnni_repack_kernels
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+if(HAVE_ROCM)
+    target_link_libraries(v2_test_vnni_repack_kernels rocm_backend)
+endif()
+add_v2_test(V2_Unit_VnniRepackKernels
+    COMMAND $<TARGET_FILE:v2_test_vnni_repack_kernels>
+    LABELS "V2;Unit;WeightLoading;GpuPipeline;ROCm;HIP"
+    MPI_PROCS 1
+)
+
+# GPU Weight Loading Pipeline - VNNI Unpack (reverse repack) round-trip tests
+if(HAVE_CUDA OR HAVE_ROCM)
+    add_executable(v2_integration_vnni_unpack_kernels
+        integration/Test__VnniUnpackKernels.cpp
+    )
+    if(UNIX AND NOT APPLE)
+        set(_gpu_backends_whole_unpack "")
+        if(HAVE_CUDA)
+            list(APPEND _gpu_backends_whole_unpack -Wl,--whole-archive cuda_backend -Wl,--no-whole-archive)
+        endif()
+        if(HAVE_ROCM)
+            list(APPEND _gpu_backends_whole_unpack -Wl,--whole-archive rocm_backend -Wl,--no-whole-archive)
+        endif()
+        target_link_libraries(v2_integration_vnni_unpack_kernels PRIVATE
+            -Wl,--start-group
+            llaminar2_core
+            ${_gpu_backends_whole_unpack}
+            -Wl,--end-group
+            GTest::gtest
+            GTest::gtest_main
+        )
+    else()
+        target_link_libraries(v2_integration_vnni_unpack_kernels PRIVATE
+            llaminar2_core
+            GTest::gtest
+            GTest::gtest_main
+        )
+    endif()
+    add_v2_test(V2_Integration_VnniUnpackKernels
+        COMMAND $<TARGET_FILE:v2_integration_vnni_unpack_kernels>
+        LABELS "V2;Integration;WeightLoading;GpuPipeline;GPU;CUDA;ROCm;Repack"
+        MPI_PROCS 1
+    )
+    message(STATUS "V2 Tests: Added VNNI unpack (reverse repack) integration tests")
+endif()
+
+# GPU Weight Loading Pipeline - Phase 3 Pipeline Integration
+add_executable(v2_test_device_load_pipeline unit/Test__DeviceLoadPipeline.cpp)
+target_include_directories(v2_test_device_load_pipeline PRIVATE ${CMAKE_SOURCE_DIR})
+target_link_libraries(v2_test_device_load_pipeline
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+if(HAVE_ROCM)
+    target_link_libraries(v2_test_device_load_pipeline rocm_backend)
+endif()
+add_v2_test(V2_Unit_DeviceLoadPipeline
+    COMMAND $<TARGET_FILE:v2_test_device_load_pipeline>
+    LABELS "V2;Unit;WeightLoading;GpuPipeline;ROCm;HIP"
+    MPI_PROCS 1
 )

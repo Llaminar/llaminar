@@ -396,7 +396,17 @@ class GGUFLoader:
 
         To reverse, we call the same function with num_k_heads and num_v_per_k swapped:
         reshape [num_v_per_k, num_k, head_dim] → swaps → [num_k, num_v_per_k, head_dim].
+
+        NOTE: V-head reversal is only applied for MoE models (qwen35moe).
+        For dense Qwen3.5 models, both Llaminar and PyTorch use GGUF tiled
+        V-head order, so no reversal is needed. The MoE Llaminar GDN
+        implementation already handles grouped V-head order natively.
         """
+        # Only apply V-head reversal for MoE models
+        is_moe = any(k.startswith('qwen35moe.') for k in metadata)
+        if not is_moe:
+            return tensor, False
+
         # Extract GDN config from GGUF metadata
         # Try model-prefixed keys first (e.g. qwen35moe.ssm.group_count),
         # fall back to unprefixed

@@ -1394,6 +1394,14 @@ namespace llaminar2
             else
             {
                 // Fallback: workspace-based lazy repack (for tests, CPU-only, etc.)
+                if (!prepared)
+                {
+                    LOG_DEBUG("[CUDAEmbeddingKernelT] Prepared embedding lookup miss: "
+                              << "tensor_ptr=" << static_cast<const void *>(embed_table)
+                              << " device=" << dev_id.to_string()
+                              << " registry_size=" << KernelFactory::preparedEmbeddingRegistrySize()
+                              << " — using workspace fallback");
+                }
                 d_embed_q8 = workspace_ ? workspace_->getBuffer(EmbeddingWorkspaceBuffers::EMBED_TABLE) : nullptr;
                 if (!d_embed_q8)
                 {

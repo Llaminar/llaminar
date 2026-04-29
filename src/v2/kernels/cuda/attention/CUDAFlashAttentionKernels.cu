@@ -365,9 +365,12 @@ namespace
         const int warp_id = threadIdx.x / WARP_SIZE;
         const int lane_id = threadIdx.x % WARP_SIZE;
 
-        // GQA mapping (TP-aware: use global head position when gqa_n_rep provided)
+        // GQA mapping: when gqa_n_rep > 0 KV heads are REPLICATED (use global head position),
+        // when gqa_n_rep == 0 KV heads are SHARDED (use local indexing only).
         const int effective_gqa = (gqa_n_rep > 0) ? gqa_n_rep : ((n_heads == n_kv_heads) ? 1 : (n_heads / n_kv_heads));
-        const int kv_head_idx = (n_heads == n_kv_heads && gqa_n_rep == 0) ? head_idx : ((head_start + head_idx) / effective_gqa);
+        const int kv_head_idx = (gqa_n_rep > 0)
+            ? (head_start + head_idx) / effective_gqa
+            : head_idx / effective_gqa;
 
         // Q row range
         const int q_block_start = q_tile_idx * tile_q;
@@ -922,7 +925,9 @@ namespace
         const int batch_idx = blockIdx.z;
 
         const int effective_gqa = (gqa_n_rep > 0) ? gqa_n_rep : ((n_heads == n_kv_heads) ? 1 : (n_heads / n_kv_heads));
-        const int kv_head_idx = (n_heads == n_kv_heads && gqa_n_rep == 0) ? head_idx : ((head_start + head_idx) / effective_gqa);
+        const int kv_head_idx = (gqa_n_rep > 0)
+            ? (head_start + head_idx) / effective_gqa
+            : head_idx / effective_gqa;
 
         const int split_size = (kv_len_runtime + num_splits - 1) / num_splits;
         const int kv_start = split_idx * split_size;
@@ -1178,7 +1183,9 @@ namespace
         const int batch_idx = blockIdx.z;
 
         const int effective_gqa = (gqa_n_rep > 0) ? gqa_n_rep : ((n_heads == n_kv_heads) ? 1 : (n_heads / n_kv_heads));
-        const int kv_head_idx = (n_heads == n_kv_heads && gqa_n_rep == 0) ? head_idx : ((head_start + head_idx) / effective_gqa);
+        const int kv_head_idx = (gqa_n_rep > 0)
+            ? (head_start + head_idx) / effective_gqa
+            : head_idx / effective_gqa;
 
         const int split_size = (kv_len_runtime + num_splits - 1) / num_splits;
         const int kv_start = split_idx * split_size;
@@ -1370,7 +1377,9 @@ namespace
         const int batch_idx = blockIdx.z;
 
         const int effective_gqa = (gqa_n_rep > 0) ? gqa_n_rep : ((n_heads == n_kv_heads) ? 1 : (n_heads / n_kv_heads));
-        const int kv_head_idx = (n_heads == n_kv_heads && gqa_n_rep == 0) ? head_idx : ((head_start + head_idx) / effective_gqa);
+        const int kv_head_idx = (gqa_n_rep > 0)
+            ? (head_start + head_idx) / effective_gqa
+            : head_idx / effective_gqa;
 
         const int split_size = (kv_len_runtime + num_splits - 1) / num_splits;
         const int kv_start = split_idx * split_size;
@@ -1639,8 +1648,9 @@ namespace
         const int batch_idx = blockIdx.z;
 
         const int effective_gqa = (gqa_n_rep > 0) ? gqa_n_rep : ((n_heads == n_kv_heads) ? 1 : (n_heads / n_kv_heads));
-        const int kv_head_idx = (n_heads == n_kv_heads && gqa_n_rep == 0) ? head_idx
-                                                                          : ((head_start + head_idx) / effective_gqa);
+        const int kv_head_idx = (gqa_n_rep > 0)
+            ? (head_start + head_idx) / effective_gqa
+            : head_idx / effective_gqa;
 
         int kv_count_rt = kv_count;
         if (device_params)

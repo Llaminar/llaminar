@@ -23,6 +23,7 @@ namespace llaminar2
     struct PlacementPlan;
     struct GraphExecutorStats;
     struct SamplingParams;
+    struct LogitPenalty;
 
     /**
      * @brief Lightweight view of a device runner's local logits state
@@ -187,6 +188,28 @@ namespace llaminar2
         {
             (void)params;
             return -1;
+        }
+
+        /**
+         * @brief Apply sparse logit penalties on device (GPU-side)
+         *
+         * Uploads a sparse penalty map to the GPU and applies it in-place to the
+         * logits tensor. This avoids a full D2H transfer of the logits tensor
+         * (~600KB for 151K vocab) just to apply penalties.
+         *
+         * After this call, the penalized logits remain on GPU and can be sampled
+         * via sampleGreedyOnDevice() or sampleOnDevice().
+         *
+         * @param penalties Sparse penalty entries (token_id, penalty) to subtract
+         * @param vocab_size Vocabulary size (for bounds checking)
+         * @return true if applied on device, false if not supported (caller should fall back)
+         */
+        virtual bool applyPenaltiesOnDevice(const std::vector<LogitPenalty> &penalties,
+                                            int vocab_size)
+        {
+            (void)penalties;
+            (void)vocab_size;
+            return false;
         }
 
         /**

@@ -405,8 +405,24 @@ namespace llaminar2
         // requiring a wider scale. V values are typically much smaller (±3-5).
         // With block-diagonal rotation enabled, these scales provide
         // headroom while maximizing precision for each tensor.
-        config.kv_cache_scale_k = 512.0f; // K: ±256 representable after VNNI headroom
-        config.kv_cache_scale_v = 32.0f;  // V: ±16 representable, excellent precision
+        //
+        // Qwen3+ models (with QK-norm) produce much larger V activations in
+        // later layers (absmax ~64 at layer 25/28) and K post-RoPE outliers
+        // up to ~417. The Qwen2 defaults (K=512, V=32) cause severe clipping:
+        //   V: 13.5% clip rate at layer 25, 8 of 28 layers clip
+        //   K: layer 0 clips at 0.3%
+        const std::string &arch = ctx.architecture();
+        const bool is_qwen3_family = (arch == "qwen3" || arch == "Qwen3");
+        if (is_qwen3_family)
+        {
+            config.kv_cache_scale_k = 1024.0f; // K: ±512 representable (covers absmax ~417)
+            config.kv_cache_scale_v = 256.0f;   // V: ±128 representable (covers absmax ~64)
+        }
+        else
+        {
+            config.kv_cache_scale_k = 512.0f; // K: ±256 representable after VNNI headroom
+            config.kv_cache_scale_v = 32.0f;  // V: ±16 representable, excellent precision
+        }
 
         return true;
     }

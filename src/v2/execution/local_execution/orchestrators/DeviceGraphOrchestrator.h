@@ -1547,6 +1547,12 @@ namespace llaminar2
         int sampleGreedyOnDevice() override;
 
         /**
+         * @brief Apply sparse logit penalties on device
+         */
+        bool applyPenaltiesOnDevice(const std::vector<LogitPenalty> &penalties,
+                                     int vocab_size) override;
+
+        /**
          * @brief Get logits (IInferenceRunner override - already declared above)
          */
         // const float *logits() const; - declared above

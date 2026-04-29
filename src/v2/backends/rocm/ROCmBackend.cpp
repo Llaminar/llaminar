@@ -406,6 +406,79 @@ namespace llaminar2
         return true;
     }
 
+    // Forward declaration for HIP penalty kernel (implemented in ROCmSamplingKernels.hip)
+    extern "C" bool rocmOps_apply_logit_penalties_f32(
+        float *logits, const int *token_ids, const float *penalties,
+        int num_penalties, int vocab_size, int device_idx, void *stream);
+
+    bool ROCmBackend::applyLogitPenaltiesF32(void *logits_device,
+                                              const int *token_ids_host,
+                                              const float *penalties_host,
+                                              int num_penalties, int vocab_size,
+                                              int device_id, void *stream)
+    {
+        if (device_id >= device_count_ || device_id < 0 || !logits_device ||
+            !token_ids_host || !penalties_host || num_penalties <= 0)
+            return false;
+
+        // Lazily allocate per-device penalty upload buffers
+        if (penalty_buffers_.empty())
+            penalty_buffers_.resize(device_count_);
+
+        auto &bufs = penalty_buffers_[device_id];
+
+        // Reallocate if num_penalties exceeds current allocation
+        if (bufs.allocated_count < num_penalties)
+        {
+            HIP_CHECK_OR_THROW(hipSetDevice(device_id));
+            if (bufs.token_ids_ptr)
+                HIP_WARN_IF_FAIL(hipFree(bufs.token_ids_ptr));
+            if (bufs.penalties_ptr)
+                HIP_WARN_IF_FAIL(hipFree(bufs.penalties_ptr));
+
+            hipError_t err = hipMalloc(&bufs.token_ids_ptr, num_penalties * sizeof(int));
+            if (err != hipSuccess)
+            {
+                bufs.token_ids_ptr = nullptr;
+                bufs.allocated_count = 0;
+                return false;
+            }
+            err = hipMalloc(&bufs.penalties_ptr, num_penalties * sizeof(float));
+            if (err != hipSuccess)
+            {
+                HIP_WARN_IF_FAIL(hipFree(bufs.token_ids_ptr));
+                bufs.token_ids_ptr = nullptr;
+                bufs.allocated_count = 0;
+                return false;
+            }
+            bufs.allocated_count = num_penalties;
+        }
+
+        HIP_CHECK_OR_THROW(hipSetDevice(device_id));
+        hipStream_t s = resolveStream(device_id, stream);
+
+        // Upload penalty data to device
+        HIP_CHECK_OR_THROW(hipMemcpyAsync(bufs.token_ids_ptr, token_ids_host,
+                                           num_penalties * sizeof(int),
+                                           hipMemcpyHostToDevice, s));
+        HIP_CHECK_OR_THROW(hipMemcpyAsync(bufs.penalties_ptr, penalties_host,
+                                           num_penalties * sizeof(float),
+                                           hipMemcpyHostToDevice, s));
+
+        // Apply penalties in-place on device
+        if (!rocmOps_apply_logit_penalties_f32(
+                static_cast<float *>(logits_device),
+                static_cast<const int *>(bufs.token_ids_ptr),
+                static_cast<const float *>(bufs.penalties_ptr),
+                num_penalties, vocab_size, device_id, s))
+        {
+            return false;
+        }
+
+        HIP_CHECK_OR_THROW(hipStreamSynchronize(s));
+        return true;
+    }
+
     bool ROCmBackend::hostToDevice(void *dst, const void *src, size_t bytes, int device_id, void *stream)
     {
         if (device_id >= device_count_ || device_id < 0)
@@ -1120,6 +1193,116 @@ namespace llaminar2
         (void)device_id;
 
         return false;
+    }
+
+    // ====================================================================
+    // Stream Management
+    // ====================================================================
+
+    void *ROCmBackend::createStream(int device_id)
+    {
+        hipError_t err = hipSetDevice(device_id);
+        if (err != hipSuccess)
+        {
+            LOG_ERROR("[ROCmBackend::createStream] hipSetDevice(" << device_id
+                      << ") failed: " << hipGetErrorString(err));
+            return nullptr;
+        }
+
+        hipStream_t stream;
+        err = hipStreamCreateWithFlags(&stream, hipStreamNonBlocking);
+        if (err != hipSuccess)
+        {
+            LOG_ERROR("[ROCmBackend::createStream] hipStreamCreateWithFlags failed: "
+                      << hipGetErrorString(err));
+            return nullptr;
+        }
+        return stream;
+    }
+
+    void ROCmBackend::destroyStream(void *stream, int device_id)
+    {
+        if (!stream)
+            return;
+        (void)hipSetDevice(device_id);
+        (void)hipStreamDestroy(static_cast<hipStream_t>(stream));
+    }
+
+    bool ROCmBackend::synchronizeStream(void *stream, int device_id)
+    {
+        hipError_t err = hipSetDevice(device_id);
+        if (err != hipSuccess)
+            return false;
+        err = hipStreamSynchronize(static_cast<hipStream_t>(stream));
+        if (err != hipSuccess)
+        {
+            LOG_ERROR("[ROCmBackend::synchronizeStream] failed: " << hipGetErrorString(err));
+            return false;
+        }
+        return true;
+    }
+
+    bool ROCmBackend::streamWaitEvent(void *stream, void *event, int device_id)
+    {
+        (void)device_id;
+        hipError_t err = hipStreamWaitEvent(
+            static_cast<hipStream_t>(stream),
+            static_cast<hipEvent_t>(event), 0);
+        if (err != hipSuccess)
+        {
+            LOG_ERROR("[ROCmBackend::streamWaitEvent] failed: " << hipGetErrorString(err));
+            return false;
+        }
+        return true;
+    }
+
+    // ====================================================================
+    // Async H2D Without Sync (Pipeline Support)
+    // ====================================================================
+
+    bool ROCmBackend::hostToDeviceOnStream(void *dst, const void *src, size_t bytes,
+                                            int device_id, void *stream)
+    {
+        if (device_id >= device_count_ || device_id < 0)
+            return false;
+
+        hipError_t err = hipSetDevice(device_id);
+        if (err != hipSuccess)
+            return false;
+
+        err = hipMemcpyAsync(dst, src, bytes, hipMemcpyHostToDevice,
+                             static_cast<hipStream_t>(stream));
+        if (err != hipSuccess)
+        {
+            LOG_ERROR("[ROCmBackend::hostToDeviceOnStream] failed: " << hipGetErrorString(err));
+            return false;
+        }
+        return true;
+    }
+
+    // ====================================================================
+    // Pinned Host Memory
+    // ====================================================================
+
+    void *ROCmBackend::allocatePinned(size_t bytes, int device_id)
+    {
+        (void)device_id;
+        void *ptr = nullptr;
+        hipError_t err = hipHostMalloc(&ptr, bytes, hipHostMallocDefault);
+        if (err != hipSuccess)
+        {
+            LOG_ERROR("[ROCmBackend::allocatePinned] hipHostMalloc(" << bytes
+                      << ") failed: " << hipGetErrorString(err));
+            return nullptr;
+        }
+        return ptr;
+    }
+
+    void ROCmBackend::freePinned(void *ptr, int device_id)
+    {
+        (void)device_id;
+        if (ptr)
+            (void)hipHostFree(ptr);
     }
 
     // ====================================================================

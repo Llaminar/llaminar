@@ -90,6 +90,8 @@ namespace llaminar2::test
         MOCK_METHOD(void, flushStageTimeline, (), (override));
         MOCK_METHOD(void, setSkipLogitsGatherDecode, (bool skip), (override));
         MOCK_METHOD(void, setSkipLogitsGatherPrefill, (bool skip), (override));
+        MOCK_METHOD(std::string, getStopThinkingPrompt, (), (const, override));
+        MOCK_METHOD(ToolCallFormat, getToolCallFormat, (), (const, override));
 
         // =====================================================================
         // Test Helpers

@@ -94,6 +94,13 @@ namespace llaminar2
         // Quantization
         QUANTIZE_ACTIVATIONS, ///< FP32 -> INT8 activation quantization
 
+        // MoE operations
+        MOE_ROUTE,       ///< MoE routing (gate logits + softmax + top-k)
+        MOE_GATHER,      ///< MoE token gather into expert batch
+        MOE_SCATTER,     ///< MoE weighted scatter-add
+        MOE_SHARED_GATE, ///< Shared expert sigmoid gate
+        MOE_SWIGLU,      ///< MoE SwiGLU activation
+
         COUNT ///< Sentinel for array sizing
     };
 
@@ -150,6 +157,16 @@ namespace llaminar2
             return "D2D_TRANSFER";
         case ROCmKernelType::QUANTIZE_ACTIVATIONS:
             return "QUANTIZE_ACTIVATIONS";
+        case ROCmKernelType::MOE_ROUTE:
+            return "MOE_ROUTE";
+        case ROCmKernelType::MOE_GATHER:
+            return "MOE_GATHER";
+        case ROCmKernelType::MOE_SCATTER:
+            return "MOE_SCATTER";
+        case ROCmKernelType::MOE_SHARED_GATE:
+            return "MOE_SHARED_GATE";
+        case ROCmKernelType::MOE_SWIGLU:
+            return "MOE_SWIGLU";
         default:
             return "UNKNOWN";
         }

@@ -70,29 +70,23 @@ namespace llaminar2
         const int num_experts = params_.num_experts;
         const int top_k = params_.top_k;
 
-        const float *hidden = params_.input->data();
-        const float *gate_w = params_.gate_weights->data();
-
-        // Get device-appropriate MoE kernel for routing
+        // Delegate entirely to the kernel's tensor-aware API.
+        // CPU: uses data()/mutable_data() — no device involvement.
+        // GPU: routing runs on device, results written D2D to tensors,
+        //      host_result populated via D2H for CPU-side expert dispatch.
+        //      No intermediate H2D transfers.
         IMoEKernel *kernel = ensureMoEKernel();
 
-        // Route: softmax top-k via device kernel
-        if (!kernel->route(hidden, gate_w, seq_len, d_model,
-                           num_experts, top_k, params_.norm_topk_prob, cached_routing_))
+        if (!kernel->routeWithTensors(
+                params_.input, params_.gate_weights,
+                seq_len, d_model, num_experts, top_k,
+                params_.norm_topk_prob,
+                params_.output_indices, params_.output_weights,
+                cached_routing_))
         {
             LOG_ERROR("[MoERoutingStage] Routing failed");
             return false;
         }
-
-        // Copy results to output tensors
-        const size_t n = static_cast<size_t>(seq_len) * top_k;
-        float *out_idx = params_.output_indices->mutable_data();
-        float *out_wt = params_.output_weights->mutable_data();
-
-        for (size_t i = 0; i < n; ++i)
-            out_idx[i] = static_cast<float>(cached_routing_.expert_indices[i]);
-        std::copy(cached_routing_.expert_weights.begin(),
-                  cached_routing_.expert_weights.end(), out_wt);
 
 #ifdef ENABLE_PIPELINE_SNAPSHOTS
         // Stash routing data for snapshot capture
@@ -156,6 +150,21 @@ namespace llaminar2
         if (params_.output_weights)
             reqs.addOutput("output_weights", params_.output_weights->shape(), toBufferTensorType(params_.output_weights->native_type()));
         return reqs;
+    }
+
+    StageBufferContract MoERoutingStage::bufferContract() const
+    {
+        auto contract = StageBufferContract::build();
+
+        contract.addInput(params_.input_buffer_id);
+        contract.addOutput(params_.output_indices_buffer_id);
+        contract.addOutput(params_.output_weights_buffer_id);
+
+        // Gate weights are model weights, not arena-managed
+        if (params_.gate_weights)
+            contract.addWeight(params_.gate_weights);
+
+        return contract;
     }
 
     StageDumpInfo MoERoutingStage::buildDumpInfoImpl() const

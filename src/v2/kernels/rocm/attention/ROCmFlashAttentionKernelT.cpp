@@ -671,6 +671,16 @@ namespace llaminar2
             // Native KV dispatch: call typed kernel directly, skip FP32 conversion
             if (use_native_kv)
             {
+                // Set HIP device context for multi-device TP — required before
+                // any hipMalloc, stream creation, or hipBLAS calls in downstream
+                // helpers (get_stream_pool, get_dequant_buffer, ensure_scores_buffer).
+                if (hipFlashAttn_setDevice(dev) != 0)
+                {
+                    LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>::compute_tensor] "
+                              "Failed to set device " << dev << " for native KV dispatch");
+                    return false;
+                }
+
                 int result;
                 if (seq_len == 1)
                 {

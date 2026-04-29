@@ -235,6 +235,9 @@ if(HAVE_CUDA)
         kernels/cuda/kvcache/CUDARingKVCacheTQ.cu     # TurboQuant KV cache (TQ8-K/TQ4-V split)
         # GDN (Gated Delta Net) kernels for Qwen 3.5
         kernels/cuda/gdn/CUDAGatedDeltaNetKernels.cu  # GDN recurrence, conv1d, GatedRMSNorm, OutputGate
+        # GPU repack kernels (GGUF → VNNI layout on device)
+        kernels/cuda/repack/CUDAVnniRepackKernels.cu   # VNNI repack for all 18 quantization formats
+        kernels/cuda/repack/CUDAVnniUnpackKernels.cu   # VNNI reverse repack (GPU separated → raw GGUF)
         # Profiling utilities
         utils/CUDAKernelProfiler.cu                   # CUDA event-based kernel profiling
     )
@@ -465,6 +468,11 @@ if(HAVE_ROCM)
         kernels/rocm/ops/ROCmCastKernels.hip                  # FP32↔FP16 cast kernels for mixed-precision allreduce
         # GDN (Gated Delta Net) kernels for Qwen 3.5
         kernels/rocm/gdn/ROCmGatedDeltaNetKernels.hip        # GDN recurrence, conv1d, GatedRMSNorm, OutputGate
+        # MoE (Mixture of Experts) kernels
+        kernels/rocm/moe/ROCmMoEKernels.hip                  # MoE routing, gather, scatter, gate, swiglu
+        # GPU weight loading pipeline repack kernels
+        kernels/rocm/repack/VnniRepackKernels.hip            # VNNI repack: Q4_0, IQ4_NL, Q4_K on-device
+        kernels/rocm/repack/VnniUnpackKernels.hip            # VNNI reverse repack (GPU separated → raw GGUF)
         # Profiling utilities
         utils/ROCmKernelProfiler.hip                         # ROCm/HIP event-based kernel profiling
     )
@@ -1160,6 +1168,7 @@ add_library(llaminar2_core STATIC
     execution/moe/SocketAwareRebalancer.cpp
     execution/moe/MoERebalanceController.cpp
     execution/moe/MoEExpertWeightService.cpp
+    execution/moe/GPUExpertTransfer.cpp
     execution/moe/MoEPipeline.cpp
     execution/cache/HybridCacheManager.cpp
     execution/compute_stages/stages/KVCacheAppendStage.cpp
@@ -1250,6 +1259,7 @@ add_library(llaminar2_core STATIC
     app/InferenceRunnerAdapter.cpp
     app/ChatTemplateResolver.cpp
     app/MPIBootstrapPhase.cpp
+    app/MPIShutdown.cpp
     app/RuntimeInitPhase.cpp
     # Subcommands
     app/commands/CommandMPI.cpp
@@ -1277,6 +1287,11 @@ add_library(llaminar2_core STATIC
     loaders/WeightStreamerFactory.cpp
     # Partial weight loader (Phase 3 - PP partial weight loading)
     loaders/PartialWeightLoader.cpp
+    # GPU weight loading pipeline (Phase 1 - Foundation)
+    loaders/gpu_pipeline/WeightVRAMPool.cpp
+    loaders/gpu_pipeline/PinnedRingBuffer.cpp
+    loaders/gpu_pipeline/LoadOrchestrator.cpp
+    loaders/gpu_pipeline/DeviceLoadPipeline.cpp
     # Layer device placement (Phase 2 - multi-device graph building)
     execution/local_execution/device/LayerDevicePlacement.cpp
     # Qwen2 model and graph configuration
@@ -1349,6 +1364,7 @@ add_library(llaminar2_core STATIC
     kernels/cpu/gdn/CPUShortConvolution.cpp
     kernels/cpu/gdn/CPUGatedDeltaNet.cpp
     # MoE kernel implementations (routing, gather/scatter, SwiGLU fallback)
+    kernels/IMoEKernel.cpp
     kernels/cpu/moe/CPUMoEKernel.cpp
     # Kernel dispatch factory (centralized device-aware kernel creation)
     kernels/KernelFactory.cpp
@@ -1369,6 +1385,7 @@ add_library(llaminar2_core STATIC
     utils/Sampler.cpp
     utils/ChatTemplate.cpp
     utils/ChatUI.cpp
+    utils/ToolCallParser.cpp
     utils/BenchmarkRunner.cpp
     # Collective communication infrastructure
     collective/DeviceGroup.cpp
@@ -1626,6 +1643,7 @@ if(HAVE_ROCM)
         kernels/rocm/ops/ROCmRoPEKernelT.cpp                  # RoPE ITensor implementation
         kernels/rocm/ops/ROCmRMSNormKernelT.cpp               # RMSNorm ITensor implementation
         kernels/rocm/ops/ROCmEmbeddingKernelT.cpp             # Embedding ITensor implementation
+        kernels/rocm/moe/ROCmMoEKernel.cpp                    # MoE kernel (routing, gather, scatter, gate, swiglu)
     )
     
     message(STATUS "V2: Linked ROCm backend library with hipBLAS GEMM")
@@ -1719,11 +1737,19 @@ if(HAVE_CUDA AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../../benchmarks/v2/gemm_sw
 endif()
 
 # Enable testing for V2
+# Release builds only include performance tests; all other builds include everything.
+if(CMAKE_BUILD_TYPE STREQUAL "Release")
+    set(V2_PERF_TESTS_ONLY ON)
+else()
+    set(V2_PERF_TESTS_ONLY OFF)
+endif()
+
 enable_testing()
 
 # V2 Tests
-# Include test subdirectory (unit, integration, e2e, pytorch_parity)
+# Include test subdirectory (unit, integration, e2e, pytorch_parity, performance)
 # Note: The source tree is at ../../tests/v2 relative to src/v2
+# In Release mode, V2_PERF_TESTS_ONLY=ON skips non-perf targets.
 add_subdirectory(../../tests/v2 ${CMAKE_BINARY_DIR}/tests/v2)
 
 # TODO: GPU backends (CUDA, ROCm, Vulkan) - not yet implemented

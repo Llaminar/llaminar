@@ -39,11 +39,13 @@ namespace llaminar2::test
         MOCK_METHOD(void, setChatTemplate, (std::unique_ptr<ChatTemplate> tmpl), (override));
 
         MOCK_METHOD(std::vector<int>, encodeChat,
-                    (const std::vector<ChatMessage> &messages, bool add_generation_prompt),
+                    (const std::vector<ChatMessage> &messages, bool add_generation_prompt,
+                     const std::string &tools_json),
                     (const, override));
 
         MOCK_METHOD(std::string, applyTemplate,
-                    (const std::vector<ChatMessage> &messages, bool add_generation_prompt),
+                    (const std::vector<ChatMessage> &messages, bool add_generation_prompt,
+                     const std::string &tools_json),
                     (const, override));
     };
 

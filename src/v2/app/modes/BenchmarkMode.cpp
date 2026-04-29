@@ -12,7 +12,7 @@
 #include "utils/DebugEnv.h"
 #include "utils/KernelProfiler.h"
 #include "utils/BenchmarkRunner.h"
-#include <mpi.h>
+#include "app/MPIShutdown.h"
 
 namespace llaminar2
 {
@@ -151,7 +151,7 @@ namespace llaminar2
         }
 
         runner->shutdown();
-        MPI_Finalize();
+        mpiShutdown();
         return result.success ? 0 : 1;
     }
 

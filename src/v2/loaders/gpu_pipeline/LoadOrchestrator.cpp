@@ -1,0 +1,232 @@
+#include "loaders/gpu_pipeline/LoadOrchestrator.h"
+#include "loaders/gpu_pipeline/DeviceLoadPipeline.h"
+#include "backends/IBackend.h"
+#include "utils/Logger.h"
+#include "utils/WeightLoadingProfiler.h"
+
+// Backend-specific kernel headers (linked conditionally)
+#ifdef HAVE_ROCM
+#include "kernels/rocm/repack/VnniRepackKernels.h"
+#endif
+
+#ifdef HAVE_CUDA
+#include "kernels/cuda/repack/CUDAVnniRepackKernels.h"
+#endif
+
+#include <stdexcept>
+
+namespace llaminar2
+{
+
+LoadOrchestrator::LoadOrchestrator(IBackend* backend)
+    : backend_(backend)
+{
+}
+
+LoadOrchestrator::~LoadOrchestrator() { release(); }
+
+void LoadOrchestrator::addDevice(int device_id)
+{
+    if (findDevice(device_id))
+    {
+        LOG_ERROR("LoadOrchestrator: device " << device_id << " already added");
+        throw std::runtime_error("LoadOrchestrator: duplicate device id " +
+                                 std::to_string(device_id));
+    }
+
+    DeviceContext ctx;
+    ctx.device_id = device_id;
+    ctx.pool = std::make_unique<WeightVRAMPool>();
+    devices_.push_back(std::move(ctx));
+
+    LOG_DEBUG("LoadOrchestrator: added device " << device_id);
+}
+
+void LoadOrchestrator::planWeight(int device_id, const std::string& name,
+                                  int N, int K, int payload_bytes_per_block,
+                                  bool is_asymmetric, bool has_emins,
+                                  size_t raw_gguf_bytes)
+{
+    auto* ctx = findDevice(device_id);
+    if (!ctx)
+    {
+        LOG_ERROR("LoadOrchestrator: unknown device " << device_id);
+        throw std::runtime_error("LoadOrchestrator: unknown device " +
+                                 std::to_string(device_id));
+    }
+
+    ctx->pool->planWeight(name, N, K, payload_bytes_per_block, is_asymmetric,
+                          has_emins, raw_gguf_bytes);
+}
+
+void LoadOrchestrator::allocate(size_t pinned_slot_size, int num_h2d_streams)
+{
+    ScopedWeightLoadDetailTimer alloc_timer("gpu_pipeline.allocate");
+
+    for (auto& ctx : devices_)
+    {
+        // Allocate VRAM pool with staging slots
+        if (!ctx.pool->allocate(backend_, ctx.device_id, num_h2d_streams))
+        {
+            throw std::runtime_error("LoadOrchestrator: failed to allocate pool for device " +
+                                     std::to_string(ctx.device_id));
+        }
+
+        // Allocate pinned ring buffer
+        if (pinned_slot_size > 0 && num_h2d_streams > 0)
+        {
+            ctx.pinned_ring = std::make_unique<PinnedRingBuffer>(pinned_slot_size, num_h2d_streams);
+            if (!ctx.pinned_ring->allocate(backend_, ctx.device_id))
+            {
+                throw std::runtime_error("LoadOrchestrator: failed to allocate pinned ring for device " +
+                                         std::to_string(ctx.device_id));
+            }
+        }
+    }
+
+    LOG_INFO("LoadOrchestrator: allocated " << devices_.size() << " device(s)");
+}
+
+WeightVRAMPool* LoadOrchestrator::getPool(int device_id)
+{
+    auto* ctx = findDevice(device_id);
+    return ctx ? ctx->pool.get() : nullptr;
+}
+
+const WeightVRAMPool* LoadOrchestrator::getPool(int device_id) const
+{
+    auto* ctx = findDevice(device_id);
+    return ctx ? ctx->pool.get() : nullptr;
+}
+
+size_t LoadOrchestrator::numDevices() const { return devices_.size(); }
+
+void LoadOrchestrator::addWeightJob(int device_id, const WeightJob& job)
+{
+    auto* ctx = findDevice(device_id);
+    if (!ctx)
+    {
+        LOG_ERROR("LoadOrchestrator::addWeightJob: unknown device " << device_id);
+        throw std::runtime_error("LoadOrchestrator: unknown device " +
+                                 std::to_string(device_id));
+    }
+    ctx->pending_jobs.push_back(job);
+}
+
+RepackKernels LoadOrchestrator::createRepackKernels() const
+{
+    if (!backend_)
+    {
+        throw std::runtime_error("LoadOrchestrator: no backend set, cannot create repack kernels");
+    }
+
+    RepackKernels kernels{};
+    const auto name = backend_->backendName();
+
+#ifdef HAVE_CUDA
+    if (name == "CUDA")
+    {
+        kernels.vnniRepack = launchVnniRepackCUDA;
+        return kernels;
+    }
+#endif
+
+#ifdef HAVE_ROCM
+    if (name == "ROCm")
+    {
+        kernels.vnniRepack = launchVnniRepack;
+        return kernels;
+    }
+#endif
+
+    throw std::runtime_error("LoadOrchestrator: unsupported backend: " + name);
+}
+
+void LoadOrchestrator::load()
+{
+    if (devices_.empty())
+    {
+        return; // Nothing to do
+    }
+
+    if (!backend_)
+    {
+        throw std::runtime_error("LoadOrchestrator::load: no backend set");
+    }
+
+    ScopedWeightLoadDetailTimer total_timer("gpu_pipeline.total");
+
+    const auto kernels = createRepackKernels();
+
+    for (auto& ctx : devices_)
+    {
+        if (ctx.pending_jobs.empty())
+        {
+            LOG_DEBUG("LoadOrchestrator::load: no jobs for device " << ctx.device_id);
+            continue;
+        }
+
+        if (!ctx.pool || !ctx.pool->isAllocated())
+        {
+            throw std::runtime_error("LoadOrchestrator::load: pool not allocated for device " +
+                                     std::to_string(ctx.device_id));
+        }
+
+        if (!ctx.pinned_ring || !ctx.pinned_ring->isAllocated())
+        {
+            throw std::runtime_error("LoadOrchestrator::load: pinned ring not allocated for device " +
+                                     std::to_string(ctx.device_id));
+        }
+
+        const int num_streams = ctx.pinned_ring->numSlots();
+        DeviceLoadPipeline pipeline(*backend_, ctx.device_id, *ctx.pool,
+                                     *ctx.pinned_ring, kernels, num_streams);
+
+        if (!pipeline.initialize())
+        {
+            throw std::runtime_error("LoadOrchestrator::load: pipeline init failed for device " +
+                                     std::to_string(ctx.device_id));
+        }
+
+        LOG_INFO("LoadOrchestrator::load: processing " << ctx.pending_jobs.size()
+                 << " weights on device " << ctx.device_id);
+
+        if (!pipeline.processJobs(ctx.pending_jobs))
+        {
+            throw std::runtime_error("LoadOrchestrator::load: pipeline failed for device " +
+                                     std::to_string(ctx.device_id));
+        }
+
+        ctx.pending_jobs.clear();
+    }
+}
+
+void LoadOrchestrator::release()
+{
+    for (auto& ctx : devices_)
+    {
+        if (ctx.pinned_ring) ctx.pinned_ring->release();
+        if (ctx.pool) ctx.pool->release();
+    }
+    devices_.clear();
+}
+
+LoadOrchestrator::DeviceContext* LoadOrchestrator::findDevice(int device_id)
+{
+    for (auto& ctx : devices_)
+    {
+        if (ctx.device_id == device_id) return &ctx;
+    }
+    return nullptr;
+}
+
+const LoadOrchestrator::DeviceContext* LoadOrchestrator::findDevice(int device_id) const
+{
+    for (const auto& ctx : devices_)
+    {
+        if (ctx.device_id == device_id) return &ctx;
+    }
+    return nullptr;
+}
+
+} // namespace llaminar2

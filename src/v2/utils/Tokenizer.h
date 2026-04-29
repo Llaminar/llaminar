@@ -152,11 +152,13 @@ namespace llaminar2
          *
          * @param messages Vector of chat messages (role + content)
          * @param add_generation_prompt Whether to add assistant prompt suffix
+         * @param tools Optional JSON array of tool definitions for tool-calling templates
          * @return Encoded token IDs ready for inference
          */
         virtual std::vector<int> encodeChat(
             const std::vector<ChatMessage> &messages,
-            bool add_generation_prompt = true) const = 0;
+            bool add_generation_prompt = true,
+            const std::string &tools_json = "") const = 0;
 
         /**
          * @brief Format messages using chat template (without encoding)
@@ -165,11 +167,13 @@ namespace llaminar2
          *
          * @param messages Vector of chat messages
          * @param add_generation_prompt Whether to add assistant prompt suffix
+         * @param tools Optional JSON array of tool definitions for tool-calling templates
          * @return Formatted text string
          */
         virtual std::string applyTemplate(
             const std::vector<ChatMessage> &messages,
-            bool add_generation_prompt = true) const = 0;
+            bool add_generation_prompt = true,
+            const std::string &tools_json = "") const = 0;
     };
 
     /**
@@ -222,10 +226,12 @@ namespace llaminar2
         void setChatTemplate(std::unique_ptr<ChatTemplate> tmpl) override;
         std::vector<int> encodeChat(
             const std::vector<ChatMessage> &messages,
-            bool add_generation_prompt = true) const override;
+            bool add_generation_prompt = true,
+            const std::string &tools_json = "") const override;
         std::string applyTemplate(
             const std::vector<ChatMessage> &messages,
-            bool add_generation_prompt = true) const override;
+            bool add_generation_prompt = true,
+            const std::string &tools_json = "") const override;
 
     private:
         /**

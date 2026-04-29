@@ -229,4 +229,59 @@ bool rocmOps_topk_f32(
     return true;
 }
 
+// ============================================================================
+// Logit Penalty Application Kernel — Subtract sparse penalties from logits
+// ============================================================================
+
+__global__ void rocm_apply_logit_penalties_f32_kernel(
+    float *__restrict__ logits,
+    const int *__restrict__ token_ids,
+    const float *__restrict__ penalties,
+    int num_penalties,
+    int vocab_size)
+{
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= num_penalties)
+        return;
+
+    int token_id = token_ids[idx];
+    if (token_id >= 0 && token_id < vocab_size)
+    {
+        logits[token_id] -= penalties[idx];
+    }
+}
+
+bool rocmOps_apply_logit_penalties_f32(
+    float *logits,
+    const int *token_ids,
+    const float *penalties,
+    int num_penalties,
+    int vocab_size,
+    int device_idx,
+    void *stream)
+{
+    if (num_penalties <= 0 || !logits || !token_ids || !penalties)
+        return false;
+
+    llaminar2::HipDeviceGuard::setDevice(device_idx);
+
+    const int threads = 256;
+    const int blocks = (num_penalties + threads - 1) / threads;
+
+    hipLaunchKernelGGL(
+        rocm_apply_logit_penalties_f32_kernel,
+        dim3(blocks), dim3(threads), 0, static_cast<hipStream_t>(stream),
+        logits, token_ids, penalties, num_penalties, vocab_size);
+
+    (void)hipGetLastError();  // Clear stale errors
+    hipError_t err = hipGetLastError();
+    if (err != hipSuccess)
+    {
+        fprintf(stderr, "ROCm Apply Logit Penalties kernel launch failed: %s\n",
+                hipGetErrorString(err));
+        return false;
+    }
+    return true;
+}
+
 } // extern "C"

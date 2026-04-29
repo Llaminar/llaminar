@@ -82,6 +82,13 @@ namespace llaminar2
         bool topKF32(const void *data_device, int n, int k, int device_id,
                      float *out_values, int *out_indices, void *stream = nullptr) override;
 
+        // GPU-side sparse logit penalty application
+        bool applyLogitPenaltiesF32(void *logits_device,
+                                    const int *token_ids_host,
+                                    const float *penalties_host,
+                                    int num_penalties, int vocab_size,
+                                    int device_id, void *stream = nullptr) override;
+
         // Capability queries
         bool supportsBF16(int device_id) const override;
         bool supportsFP16(int device_id) const override;
@@ -102,6 +109,14 @@ namespace llaminar2
         void destroyStream(void *stream, int device_id) override;
         bool synchronizeStream(void *stream, int device_id) override;
         bool streamWaitEvent(void *stream, void *event, int device_id) override;
+
+        // Async H2D without sync (for pipelined loading)
+        bool hostToDeviceOnStream(void *dst, const void *src, size_t bytes,
+                                  int device_id, void *stream) override;
+
+        // Pinned host memory
+        void *allocatePinned(size_t bytes, int device_id) override;
+        void freePinned(void *ptr, int device_id) override;
 
         // Stream-aware memory operations
         bool deviceCopyAsync(void *dst, const void *src, size_t bytes,
@@ -133,6 +148,15 @@ namespace llaminar2
             int allocated_k = 0;
         };
         std::vector<TopKDeviceBuffers> topk_buffers_;
+
+        // Per-device penalty upload buffers (lazily allocated)
+        struct PenaltyDeviceBuffers
+        {
+            void *token_ids_ptr = nullptr;   // int[] on device
+            void *penalties_ptr = nullptr;    // float[] on device
+            int allocated_count = 0;
+        };
+        std::vector<PenaltyDeviceBuffers> penalty_buffers_;
     };
 
 } // namespace llaminar2

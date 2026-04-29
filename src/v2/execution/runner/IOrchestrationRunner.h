@@ -24,6 +24,7 @@
 #include "../../config/OrchestrationConfig.h"
 #include "../mpi_orchestration/RankExecutionPlan.h"
 #include "../../utils/Sampler.h"
+#include "../../utils/ToolCallTypes.h"
 #include <memory>
 #include <string>
 #include <vector>
@@ -384,6 +385,25 @@ namespace llaminar2
          * as defaults when the user hasn't specified explicit values.
          */
         virtual SamplingParams getRecommendedSamplingParams() const { return {}; }
+
+        /**
+         * @brief Get the stop-thinking prompt for thinking budget enforcement
+         *
+         * Returns the model-specific string that forces the model out of
+         * thinking mode. Empty string means the model doesn't support thinking budgets.
+         */
+        virtual std::string getStopThinkingPrompt() const { return ""; }
+
+        /**
+         * @brief Get the tool call output format for this model
+         *
+         * Returns the format used by the loaded model to emit tool calls
+         * in raw text. Used by ChatCompletionHandler to parse tool calls
+         * from model output.
+         *
+         * @return ToolCallFormat enum value (default: HERMES_2_PRO)
+         */
+        virtual ToolCallFormat getToolCallFormat() const { return ToolCallFormat::HERMES_2_PRO; }
 
         // =====================================================================
         // MPI Worker Loop (for non-root ranks in server mode)

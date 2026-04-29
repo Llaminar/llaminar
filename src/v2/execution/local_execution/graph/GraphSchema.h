@@ -26,6 +26,7 @@
 #include "../../../backends/DeviceId.h"
 #include "../../StageShardingMode.h"
 #include "../../../utils/Sampler.h"
+#include "../../../utils/ToolCallTypes.h"
 #include <string>
 #include <vector>
 #include <unordered_map>
@@ -657,6 +658,12 @@ namespace llaminar2
         /// errors compound through subsequent layers. Layers beyond this count
         /// use tp_allreduce_default_precision.
         int tp_allreduce_fp32_layer_count = 0;
+
+        /// Layer indices that are ALWAYS forced to FP32 allreduce regardless
+        /// of their position relative to fp32_layer_count. Used for hybrid
+        /// architectures (e.g., Qwen3.5) where full-attention layers are more
+        /// sensitive to allreduce precision loss than GDN layers.
+        std::vector<int> tp_allreduce_fp32_forced_layers;
     };
 
     // =========================================================================
@@ -793,6 +800,40 @@ namespace llaminar2
         virtual SamplingParams getRecommendedSamplingParams() const
         {
             return SamplingParams{}; // Standard defaults
+        }
+
+        /**
+         * @brief Get the stop-thinking prompt for thinking budget enforcement
+         *
+         * When the thinking token budget is exhausted, this string is tokenized
+         * and injected token-by-token into the generation stream to gracefully
+         * force the model out of thinking mode.
+         *
+         * Default: empty string (no stop-thinking support).
+         * Override in model-specific factories for models that support thinking.
+         *
+         * @return Stop-thinking prompt string, or empty if not supported
+         */
+        virtual std::string getStopThinkingPrompt() const
+        {
+            return "";
+        }
+
+        /**
+         * @brief Get the tool call output format for this model architecture
+         *
+         * Returns the format the model uses to emit tool calls in its raw text
+         * output. Used by ChatCompletionHandler to parse structured tool_calls
+         * from model output.
+         *
+         * Default: HERMES_2_PRO (covers Qwen 2.5, Qwen 3, Hermes, most models).
+         * Override in model-specific factories to use a different format.
+         *
+         * @return ToolCallFormat enum value
+         */
+        virtual ToolCallFormat getToolCallFormat() const
+        {
+            return ToolCallFormat::HERMES_2_PRO;
         }
     };
 

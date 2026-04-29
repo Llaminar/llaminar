@@ -67,6 +67,7 @@ enum NativeVNNIGemmFormat : uint8_t {
     NVNNI_GEMM_IQ2_XXS = 15,  // IQ2 grid, 8-bit index
     NVNNI_GEMM_IQ1_S   = 16,  // IQ1 grid, 11-bit index, asymmetric, embedded scales
     NVNNI_GEMM_IQ1_M   = 17,  // IQ1 grid, 11-bit index, dual-scale + embedded mins
+    NVNNI_GEMM_Q8_0    = 19,  // 8-bit symmetric, direct INT8 payload (32 bytes)
 };
 
 // ============================================================================
@@ -99,8 +100,10 @@ struct NVNNIGemmTraits {
     static constexpr bool is_6bit   = (FMT == NVNNI_GEMM_Q6_K);
     static constexpr bool is_3bit   = (FMT == NVNNI_GEMM_Q3_K);
     static constexpr bool is_2bit   = (FMT == NVNNI_GEMM_Q2_K);
+    static constexpr bool is_8bit   = (FMT == NVNNI_GEMM_Q8_0);
     static constexpr bool uses_lut  = (FMT == NVNNI_GEMM_IQ4_NL);
     static constexpr int  payload_bytes =
+        is_8bit ? 32 :                              // Q8_0: 32 raw INT8 values
         is_iq1_grid ? 6 :                          // IQ1_S/IQ1_M: qs[4]+qh[2], native size
         is_iq3_grid ? (has_qh ? 13 : 12) :
         is_iq2_grid ? (has_qh ? 9 : 8) :
@@ -227,6 +230,8 @@ __device__ __forceinline__ void load_payload(const uint8_t* __restrict__ src,
         out[0] = p.x; out[1] = p.y; out[2] = p.z; out[3] = p.w;
         if constexpr (FULL_DW >= 5) out[4] = *reinterpret_cast<const uint32_t*>(src + 16);
         if constexpr (FULL_DW >= 6) out[5] = *reinterpret_cast<const uint32_t*>(src + 20);
+        if constexpr (FULL_DW >= 7) out[6] = *reinterpret_cast<const uint32_t*>(src + 24);
+        if constexpr (FULL_DW >= 8) out[7] = *reinterpret_cast<const uint32_t*>(src + 28);
     } else if constexpr (PB >= 8) {
         uint2 p = *reinterpret_cast<const uint2*>(src);
         out[0] = p.x; out[1] = p.y;
@@ -311,6 +316,13 @@ __device__ __forceinline__ void decode_block(
             packed_groups[g]     = static_cast<int32_t>(raw[g] & 0x0F0F0F0Fu);
             packed_groups[g + 4] = static_cast<int32_t>((raw[g] >> 4) & 0x0F0F0F0Fu);
         }
+    }
+    else if constexpr (Traits::is_8bit)
+    {
+        // Q8_0: 32 raw INT8 values — direct load, no decode needed
+        #pragma unroll
+        for (int g = 0; g < 8; ++g)
+            packed_groups[g] = static_cast<int32_t>(raw[g]);
     }
     else if constexpr (Traits::is_5bit)
     {
@@ -2572,6 +2584,7 @@ bool rocmGemm_native_vnni_fp32(
     case NVNNI_GEMM_IQ2_XXS:  LAUNCH_GEMM(NVNNI_GEMM_IQ2_XXS);
     case NVNNI_GEMM_IQ1_S:    LAUNCH_GEMM(NVNNI_GEMM_IQ1_S);
     case NVNNI_GEMM_IQ1_M:    LAUNCH_GEMM(NVNNI_GEMM_IQ1_M);
+    case NVNNI_GEMM_Q8_0:     LAUNCH_GEMM(NVNNI_GEMM_Q8_0);
     default:
         fprintf(stderr, "[rocmGemm_native_vnni_fp32] Unsupported codebook_id=%d\n",
                 codebook_id);

@@ -170,7 +170,8 @@ namespace llaminar2
 
     std::string ChatTemplate::renderJinja(const std::vector<ChatMessage> &messages,
                                           bool add_generation_prompt,
-                                          bool enable_thinking) const
+                                          bool enable_thinking,
+                                          const std::string &tools_json) const
     {
         if (!jinja_state_)
             return {};
@@ -186,13 +187,45 @@ namespace llaminar2
 
             jinja::context ctx(jinja_state_->source);
 
-            // Build the messages array as ordered JSON
+            // Build the messages array as ordered JSON, including tool-calling fields
             nlohmann::ordered_json msg_array = nlohmann::ordered_json::array();
             for (const auto &msg : messages)
             {
                 nlohmann::ordered_json jmsg;
                 jmsg["role"] = msg.role;
-                jmsg["content"] = msg.content;
+
+                // content can be null for assistant messages with tool_calls
+                if (msg.hasToolCalls() && msg.content.empty())
+                    jmsg["content"] = nullptr;
+                else
+                    jmsg["content"] = msg.content;
+
+                // Include tool_calls for assistant messages (parse from JSON strings)
+                if (!msg.tool_calls.empty())
+                {
+                    jmsg["tool_calls"] = nlohmann::ordered_json::array();
+                    for (const auto &tc_str : msg.tool_calls)
+                    {
+                        try
+                        {
+                            jmsg["tool_calls"].push_back(
+                                nlohmann::ordered_json::parse(tc_str));
+                        }
+                        catch (const nlohmann::ordered_json::parse_error &)
+                        {
+                            // Skip malformed tool call entries
+                        }
+                    }
+                }
+
+                // Include tool_call_id for tool result messages
+                if (!msg.tool_call_id.empty())
+                    jmsg["tool_call_id"] = msg.tool_call_id;
+
+                // Include name for tool result messages
+                if (!msg.name.empty())
+                    jmsg["name"] = msg.name;
+
                 msg_array.push_back(jmsg);
             }
 
@@ -206,6 +239,19 @@ namespace llaminar2
                 inp["add_generation_prompt"] = true;
             }
             inp["enable_thinking"] = enable_thinking;
+
+            // Pass tools array to Jinja context if provided
+            if (!tools_json.empty())
+            {
+                try
+                {
+                    inp["tools"] = nlohmann::ordered_json::parse(tools_json);
+                }
+                catch (const nlohmann::ordered_json::parse_error &)
+                {
+                    // Invalid tools JSON — skip
+                }
+            }
 
             // Load context into jinja runtime
             jinja::global_from_json(ctx, inp, false);
@@ -554,12 +600,13 @@ namespace llaminar2
 
     std::string ChatTemplate::apply(const std::vector<ChatMessage> &messages,
                                     bool add_generation_prompt,
-                                    bool enable_thinking) const
+                                    bool enable_thinking,
+                                    const std::string &tools_json) const
     {
         // Primary path: Jinja2 rendering
         if (jinja_available_)
         {
-            std::string result = renderJinja(messages, add_generation_prompt, enable_thinking);
+            std::string result = renderJinja(messages, add_generation_prompt, enable_thinking, tools_json);
             if (!result.empty())
             {
                 return result;
@@ -567,7 +614,7 @@ namespace llaminar2
             LOG_WARN("[ChatTemplate] Jinja2 render returned empty, falling back to hardcoded format");
         }
 
-        // Fallback path: hardcoded format implementations
+        // Fallback path: hardcoded format implementations (no tools support)
         return applyFallback(messages, add_generation_prompt);
     }
 
@@ -1137,9 +1184,12 @@ namespace llaminar2
         }
         else
         {
-            // No end tag found — entire output is reasoning (model still thinking)
-            // or non-thinking model output. Treat as content.
-            result.content = text;
+            // No end tag found — model produced thinking but never closed it
+            // (e.g. hit max_tokens while still in <think> block).
+            // Since the generation prompt ends with the start tag, everything
+            // the model wrote is reasoning content, not final content.
+            result.has_reasoning = true;
+            result.reasoning_content = text;
         }
 
         return result;

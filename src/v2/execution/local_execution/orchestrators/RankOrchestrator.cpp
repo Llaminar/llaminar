@@ -45,6 +45,9 @@
 #include <numeric>
 #include <sstream>
 #include <stdexcept>
+#ifdef __linux__
+#include <malloc.h> // malloc_trim for deferred host weight release
+#endif
 
 namespace llaminar2
 {
@@ -619,21 +622,17 @@ namespace llaminar2
                 device_ids.push_back(device_addr.toLocalDeviceId());
             }
 
-            // Finalize weights for all devices: clone + upload + GEMM pack + release
+            // Finalize weights for all devices: clone + upload + GEMM pack.
+            // Host data release is DEFERRED until after device runners are created,
+            // because graph building (which happens during runner creation) may need
+            // host data — e.g. MoE expert VNNI packing reads from host tensors.
             auto weight_mgr = model_ctx_->weightManager();
             if (weight_mgr)
             {
-                // When this MDO is itself a nested TP stage inside a larger PP
-                // pipeline (hybrid PP+TP), the outer caller still owns host
-                // copies that later PP stages need. Skip release here — the
-                // outer caller will release once all stages are prepared.
-                const bool is_nested_tp_in_pp = config_.nested_pp_stage_config.has_value();
-                const bool release_host_data = !is_nested_tp_in_pp;
-
                 LOG_INFO("RankOrchestrator: Finalizing weights for "
                          << device_ids.size() << " devices"
-                         << " (release_host_data=" << release_host_data << ")");
-                if (!weight_mgr->finalizeForDevices(device_ids, release_host_data))
+                         << " (release_host_data=false, deferred until after graph build)");
+                if (!weight_mgr->finalizeForDevices(device_ids, /*release_host_data=*/false))
                 {
                     LOG_WARN("RankOrchestrator: Weight finalization failed, will use lazy packing");
                 }
@@ -740,6 +739,35 @@ namespace llaminar2
             device_runners_.push_back(std::move(result.runner));
 
             LOG_DEBUG("RankOrchestrator: Successfully created runner for device " << result.device_idx);
+        }
+
+        // =====================================================================
+        // DEFERRED HOST WEIGHT RELEASE
+        // =====================================================================
+        // Now that all device runners are created (which includes graph building
+        // and MoE expert VNNI packing that reads from host tensor data), we can
+        // safely release the host weight copies to reclaim RAM.
+        // Skip release for nested TP-in-PP where a later PP stage still needs
+        // host copies to clone from.
+        //
+        // NOTE: Graph building for some architectures (e.g., MoE) is LAZY —
+        // it happens during the first forward pass, not during runner creation.
+        // MoE expert VNNI packing reads host tensor data during lazy graph build.
+        // Therefore, host data release is deferred to after the first forward()
+        // call via the deferred_host_release_pending_ flag.
+        // =====================================================================
+        {
+            const bool is_nested_tp_in_pp = config_.nested_pp_stage_config.has_value();
+            if (!is_nested_tp_in_pp)
+            {
+                deferred_host_release_pending_ = true;
+                LOG_INFO("RankOrchestrator: Host weight release deferred until after first forward pass");
+            }
+            else
+            {
+                LOG_INFO("RankOrchestrator: Retaining host weight data "
+                         "(nested TP-in-PP; outer caller will release)");
+            }
         }
 
         // Create logits gatherer for combined logits buffer management
@@ -1222,21 +1250,45 @@ namespace llaminar2
 
     bool RankOrchestrator::forward(const int *tokens, int seq_len)
     {
+        bool success = false;
+
         // Dispatch to appropriate implementation based on parallelism mode
         switch (mode_)
         {
         case ParallelismMode::TP:
-            return forwardTP(tokens, seq_len);
+            success = forwardTP(tokens, seq_len);
+            break;
         case ParallelismMode::PP:
         case ParallelismMode::TP_PP:
             // PP and TP_PP both use sequential stage execution
             // The difference is that TP_PP stages may be nested MDOs (TP domains)
             // but forwardPP() works through IInferenceRunner interface regardless
-            return forwardPP(tokens, seq_len);
+            success = forwardPP(tokens, seq_len);
+            break;
         default:
             LOG_ERROR("RankOrchestrator::forward: Unknown parallelism mode");
             return false;
         }
+
+        // After the first successful forward pass, release deferred host weight data.
+        // Graph building (including MoE expert VNNI packing) happens lazily during
+        // the first forward, so host data must remain available until that completes.
+        if (success && deferred_host_release_pending_)
+        {
+            deferred_host_release_pending_ = false;
+            auto weight_mgr = model_ctx_->weightManager();
+            if (weight_mgr)
+            {
+                size_t released = weight_mgr->releaseAllHostWeightData();
+                LOG_INFO("RankOrchestrator: Deferred host weight release after first forward: "
+                         << released << " tensors released");
+#ifdef __linux__
+                ::malloc_trim(0);
+#endif
+            }
+        }
+
+        return success;
     }
 
     // =========================================================================

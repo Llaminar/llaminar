@@ -7,6 +7,7 @@
 #include "execution/runner/IOrchestrationRunner.h"
 #include "utils/Tokenizer.h"
 #include "utils/Logger.h"
+#include "utils/ToolCallParser.h"
 #include "nlohmann/json.hpp"
 
 #include <algorithm>
@@ -189,10 +190,40 @@ namespace llaminar2
             return std::nullopt;
         }
 
-        // Validate each message
+        // Validate each message — tool-related messages have relaxed requirements
         for (const auto &msg : body["messages"])
         {
-            if (!msg.contains("role") || !msg.contains("content"))
+            if (!msg.contains("role"))
+            {
+                error_out.ok = false;
+                error_out.http_status = 400;
+                json err = {{"error", {{"message", "Each message must have a \"role\" field"}, {"type", "invalid_request_error"}}}};
+                error_out.json_body = err.dump();
+                return std::nullopt;
+            }
+
+            std::string role = msg["role"].get<std::string>();
+
+            // Assistant messages with tool_calls may have null/missing content
+            if (role == "assistant" && msg.contains("tool_calls"))
+                continue;
+
+            // Tool result messages need tool_call_id but content is required
+            if (role == "tool")
+            {
+                if (!msg.contains("tool_call_id"))
+                {
+                    error_out.ok = false;
+                    error_out.http_status = 400;
+                    json err = {{"error", {{"message", "Tool messages must have a \"tool_call_id\" field"}, {"type", "invalid_request_error"}}}};
+                    error_out.json_body = err.dump();
+                    return std::nullopt;
+                }
+                continue;
+            }
+
+            // Standard messages require content
+            if (!msg.contains("content"))
             {
                 error_out.ok = false;
                 error_out.http_status = 400;
@@ -254,12 +285,73 @@ namespace llaminar2
             request.sampling_set.frequency_penalty = true;
         }
 
-        // Build conversation
+        // DRY penalty parameters
+        if (body.contains("dry_multiplier"))
+        {
+            request.sampling.dry_multiplier = body["dry_multiplier"].get<float>();
+            request.sampling_set.dry_multiplier = true;
+        }
+        if (body.contains("dry_base"))
+        {
+            request.sampling.dry_base = body["dry_base"].get<float>();
+            request.sampling_set.dry_base = true;
+        }
+        if (body.contains("dry_allowed_length"))
+        {
+            request.sampling.dry_allowed_length = body["dry_allowed_length"].get<int>();
+            request.sampling_set.dry_allowed_length = true;
+        }
+        if (body.contains("dry_penalty_last_n"))
+        {
+            request.sampling.dry_penalty_last_n = body["dry_penalty_last_n"].get<int>();
+            request.sampling_set.dry_penalty_last_n = true;
+        }
+        if (body.contains("dry_sequence_breakers"))
+        {
+            request.sampling.dry_sequence_breakers.clear();
+            for (const auto &b : body["dry_sequence_breakers"])
+                request.sampling.dry_sequence_breakers.push_back(b.get<std::string>());
+            request.sampling_set.dry_sequence_breakers = true;
+        }
+
+        // Thinking budget
+        if (body.contains("thinking_budget_tokens"))
+            request.thinking_budget_tokens = body["thinking_budget_tokens"].get<int>();
+
+        // Tool calling parameters
+        if (body.contains("tools") && body["tools"].is_array())
+            request.tools = body["tools"];
+        if (body.contains("tool_choice"))
+            request.tool_choice = body["tool_choice"];
+        if (body.contains("parallel_tool_calls"))
+            request.parallel_tool_calls = body["parallel_tool_calls"].get<bool>();
+
+        // Build conversation with full tool-calling support
         for (const auto &msg : body["messages"])
         {
-            request.messages.emplace_back(
-                msg["role"].get<std::string>(),
-                msg["content"].get<std::string>());
+            ChatMessage cm;
+            cm.role = msg["role"].get<std::string>();
+
+            // Content may be null or missing for assistant messages with tool_calls
+            if (msg.contains("content") && !msg["content"].is_null())
+                cm.content = msg["content"].get<std::string>();
+
+            // Parse tool_calls from assistant messages (store as serialized JSON strings)
+            if (msg.contains("tool_calls") && msg["tool_calls"].is_array())
+            {
+                for (const auto &tc : msg["tool_calls"])
+                    cm.tool_calls.push_back(tc.dump());
+            }
+
+            // Parse tool_call_id from tool result messages
+            if (msg.contains("tool_call_id"))
+                cm.tool_call_id = msg["tool_call_id"].get<std::string>();
+
+            // Parse name from tool result messages
+            if (msg.contains("name"))
+                cm.name = msg["name"].get<std::string>();
+
+            request.messages.push_back(std::move(cm));
         }
 
         return request;
@@ -297,6 +389,16 @@ namespace llaminar2
             effective.frequency_penalty = model_defaults.frequency_penalty;
         if (!set_.seed)
             effective.seed = model_defaults.seed;
+        if (!set_.dry_multiplier)
+            effective.dry_multiplier = model_defaults.dry_multiplier;
+        if (!set_.dry_base)
+            effective.dry_base = model_defaults.dry_base;
+        if (!set_.dry_allowed_length)
+            effective.dry_allowed_length = model_defaults.dry_allowed_length;
+        if (!set_.dry_penalty_last_n)
+            effective.dry_penalty_last_n = model_defaults.dry_penalty_last_n;
+        if (!set_.dry_sequence_breakers)
+            effective.dry_sequence_breakers = model_defaults.dry_sequence_breakers;
 
         LOG_INFO("[ChatCompletion] Sampling params (user-set fields marked *): "
                  << "temp=" << effective.temperature << (set_.temperature ? "* " : " ")
@@ -307,8 +409,12 @@ namespace llaminar2
 
         runner_.setSamplingParams(effective);
 
-        // Encode with chat template
-        auto token_ids = tokenizer_.encodeChat(request.messages, /*add_generation_prompt=*/true);
+        // Encode with chat template (pass tools for tool-aware templates)
+        std::string tools_json;
+        if (request.tools.is_array() && !request.tools.empty())
+            tools_json = request.tools.dump();
+        auto token_ids = tokenizer_.encodeChat(request.messages, /*add_generation_prompt=*/true,
+                                               tools_json);
 
         if (token_ids.empty())
         {
@@ -372,33 +478,89 @@ namespace llaminar2
         int completion_tokens = 0;
         std::string finish_reason = "length";
 
+        // Thinking budget state
+        int thinking_tokens = 0;
+        bool in_thinking = true; // Assume we start in thinking mode
+        bool thinking_budget_active = (request.thinking_budget_tokens >= 0 && request.enable_thinking);
+        std::vector<int32_t> stop_thinking_tokens; // Injected token sequence
+        int stop_thinking_idx = 0;                 // Current position in injection
+
+        // Pre-tokenize stop-thinking prompt if budget is active
+        if (thinking_budget_active)
+        {
+            std::string stop_prompt = runner_.getStopThinkingPrompt();
+            if (!stop_prompt.empty())
+            {
+                auto encoded = tokenizer_.encode(stop_prompt);
+                stop_thinking_tokens.assign(encoded.begin(), encoded.end());
+            }
+        }
+
         for (int i = 0; i < effective_max_tokens; ++i)
         {
-            GenerationResult result = runner_.decodeStep();
+            int32_t next_token;
 
-            if (!result.success())
+            // Check if we're injecting stop-thinking tokens
+            if (stop_thinking_idx > 0 && stop_thinking_idx < static_cast<int>(stop_thinking_tokens.size()))
             {
-                response.http_status = 500;
-                json err = {{"error", {{"message", std::string("Decode failed: ") + result.error}, {"type", "server_error"}}}};
-                response.json_body = err.dump();
-                return response;
+                // Inject next token from stop-thinking sequence
+                next_token = stop_thinking_tokens[stop_thinking_idx++];
+                // Feed the injected token through the model (for KV cache consistency)
+                runner_.decodeStep(); // Run forward pass but discard the sampled token
+            }
+            else
+            {
+                GenerationResult result = runner_.decodeStep();
+
+                if (!result.success())
+                {
+                    response.http_status = 500;
+                    json err = {{"error", {{"message", std::string("Decode failed: ") + result.error}, {"type", "server_error"}}}};
+                    response.json_body = err.dump();
+                    return response;
+                }
+
+                if (result.tokens.empty())
+                {
+                    finish_reason = "stop";
+                    break;
+                }
+
+                next_token = result.tokens[0];
+
+                if (result.is_complete || tokenizer_.is_stop_token(next_token))
+                {
+                    completion_tokens++;
+                    finish_reason = "stop";
+                    break;
+                }
+
+                // Check thinking budget
+                if (thinking_budget_active && in_thinking)
+                {
+                    std::string token_text = tokenizer_.decode_token(next_token);
+                    if (token_text.find("</think>") != std::string::npos)
+                    {
+                        in_thinking = false;
+                    }
+                    else
+                    {
+                        thinking_tokens++;
+                        if (thinking_tokens >= request.thinking_budget_tokens &&
+                            !stop_thinking_tokens.empty())
+                        {
+                            // Budget exhausted — start injecting stop-thinking sequence
+                            LOG_INFO("[ChatCompletion] Thinking budget exhausted ("
+                                     << thinking_tokens << " tokens), injecting stop-thinking prompt");
+                            next_token = stop_thinking_tokens[0];
+                            stop_thinking_idx = 1;
+                            in_thinking = false;
+                        }
+                    }
+                }
             }
 
-            if (result.tokens.empty())
-            {
-                finish_reason = "stop";
-                break;
-            }
-
-            int32_t next_token = result.tokens[0];
             completion_tokens++;
-
-            if (result.is_complete || tokenizer_.is_stop_token(next_token))
-            {
-                finish_reason = "stop";
-                break;
-            }
-
             generated_text += tokenizer_.decode_token(next_token);
         }
 
@@ -419,12 +581,41 @@ namespace llaminar2
             }
         }
 
+        // Parse tool calls from model output (if tools were requested)
+        ToolCallParseResult tool_result;
+        bool has_tool_calls = false;
+        if (request.tools.is_array() && !request.tools.empty())
+        {
+            ToolCallFormat format = runner_.getToolCallFormat();
+            tool_result = parseToolCalls(content, format);
+            has_tool_calls = tool_result.hasToolCalls();
+            if (has_tool_calls)
+            {
+                content = tool_result.content;
+                finish_reason = "tool_calls";
+            }
+        }
+
         // Build response metadata
         std::string request_id = generateRequestId();
         std::string model = request.model.empty() ? model_name_ : request.model;
         int64_t created = static_cast<int64_t>(std::time(nullptr));
 
-        json message = {{"role", "assistant"}, {"content", content}};
+        json message = {{"role", "assistant"}};
+        if (has_tool_calls)
+        {
+            // Tool call response: content may be null, tool_calls array present
+            message["content"] = content.empty() ? json(nullptr) : json(content);
+            json tc_array = json::array();
+            for (const auto &tc : tool_result.tool_calls)
+                tc_array.push_back(toolCallToJson(tc));
+            message["tool_calls"] = tc_array;
+        }
+        else
+        {
+            message["content"] = content;
+        }
+
         if (!reasoning_content.empty())
         {
             message["reasoning_content"] = reasoning_content;
@@ -523,33 +714,66 @@ namespace llaminar2
         int completion_tokens = 0;
         std::string finish_reason = "length";
 
+        // Tool call state: when tools are provided, accumulate output for post-processing
+        bool has_tools = request.tools.is_array() && !request.tools.empty();
+        std::string accumulated_text; // Always accumulate for tool call detection
+
+        // Thinking budget state
+        int thinking_tokens = 0;
+        bool thinking_budget_active = (request.thinking_budget_tokens >= 0 && request.enable_thinking);
+        std::vector<int32_t> stop_thinking_tokens;
+        int stop_thinking_idx = 0;
+
+        if (thinking_budget_active)
+        {
+            std::string stop_prompt = runner_.getStopThinkingPrompt();
+            if (!stop_prompt.empty())
+            {
+                auto encoded = tokenizer_.encode(stop_prompt);
+                stop_thinking_tokens.assign(encoded.begin(), encoded.end());
+            }
+        }
+
         for (int i = 0; i < effective_max_tokens; ++i)
         {
-            GenerationResult result = runner_.decodeStep();
+            int32_t next_token;
+            bool is_complete = false;
 
-            if (!result.success())
+            // Check if we're injecting stop-thinking tokens
+            if (stop_thinking_idx > 0 && stop_thinking_idx < static_cast<int>(stop_thinking_tokens.size()))
             {
-                // Emit error as a final chunk and terminate
-                json error_data = {{"error", result.error}};
-                emit_chunk(error_data, "stop");
-                chunk_cb("data: [DONE]\n\n");
-                response.ok = false;
-                response.http_status = 500;
-                json err = {{"error", {{"message", std::string("Decode failed: ") + result.error}, {"type", "server_error"}}}};
-                response.json_body = err.dump();
-                return response;
+                next_token = stop_thinking_tokens[stop_thinking_idx++];
+                runner_.decodeStep(); // Keep model state consistent
+            }
+            else
+            {
+                GenerationResult result = runner_.decodeStep();
+
+                if (!result.success())
+                {
+                    json error_data = {{"error", result.error}};
+                    emit_chunk(error_data, "stop");
+                    chunk_cb("data: [DONE]\n\n");
+                    response.ok = false;
+                    response.http_status = 500;
+                    json err = {{"error", {{"message", std::string("Decode failed: ") + result.error}, {"type", "server_error"}}}};
+                    response.json_body = err.dump();
+                    return response;
+                }
+
+                if (result.tokens.empty())
+                {
+                    finish_reason = "stop";
+                    break;
+                }
+
+                next_token = result.tokens[0];
+                is_complete = result.is_complete;
             }
 
-            if (result.tokens.empty())
-            {
-                finish_reason = "stop";
-                break;
-            }
-
-            int32_t next_token = result.tokens[0];
             completion_tokens++;
 
-            if (result.is_complete || tokenizer_.is_stop_token(next_token))
+            if (is_complete || tokenizer_.is_stop_token(next_token))
             {
                 finish_reason = "stop";
                 break;
@@ -557,15 +781,35 @@ namespace llaminar2
 
             std::string token_text = tokenizer_.decode_token(next_token);
 
+            // Check thinking budget (before emitting)
+            if (thinking_budget_active && use_think_split && splitter.inThinking() &&
+                stop_thinking_idx == 0)
+            {
+                thinking_tokens++;
+                if (thinking_tokens >= request.thinking_budget_tokens &&
+                    !stop_thinking_tokens.empty())
+                {
+                    LOG_INFO("[ChatCompletion/stream] Thinking budget exhausted ("
+                             << thinking_tokens << " tokens), injecting stop-thinking prompt");
+                    next_token = stop_thinking_tokens[0];
+                    stop_thinking_idx = 1;
+                    token_text = tokenizer_.decode_token(next_token);
+                }
+            }
+
             if (use_think_split)
             {
                 auto split = splitter.process(token_text);
                 if (!split.text.empty())
                 {
-                    json delta;
-                    delta[split.field] = split.text;
-                    if (!emit_chunk(delta, nullptr))
-                        break;
+                    accumulated_text += split.text;
+                    if (!has_tools)
+                    {
+                        json delta;
+                        delta[split.field] = split.text;
+                        if (!emit_chunk(delta, nullptr))
+                            break;
+                    }
                 }
 
                 // Check if the splitter transitioned and has buffered content
@@ -574,19 +818,27 @@ namespace llaminar2
                     auto flushed = splitter.flush();
                     if (!flushed.text.empty())
                     {
-                        json delta;
-                        delta[flushed.field] = flushed.text;
-                        if (!emit_chunk(delta, nullptr))
-                            break;
+                        accumulated_text += flushed.text;
+                        if (!has_tools)
+                        {
+                            json delta;
+                            delta[flushed.field] = flushed.text;
+                            if (!emit_chunk(delta, nullptr))
+                                break;
+                        }
                     }
                 }
             }
             else
             {
-                json delta;
-                delta["content"] = token_text;
-                if (!emit_chunk(delta, nullptr))
-                    break;
+                accumulated_text += token_text;
+                if (!has_tools)
+                {
+                    json delta;
+                    delta["content"] = token_text;
+                    if (!emit_chunk(delta, nullptr))
+                        break;
+                }
             }
         }
 
@@ -596,13 +848,49 @@ namespace llaminar2
             auto flushed = splitter.flush();
             if (!flushed.text.empty())
             {
-                json delta;
-                delta[flushed.field] = flushed.text;
-                emit_chunk(delta, nullptr);
+                accumulated_text += flushed.text;
+                if (!has_tools)
+                {
+                    json delta;
+                    delta[flushed.field] = flushed.text;
+                    emit_chunk(delta, nullptr);
+                }
             }
         }
 
         runner_.flushStageTimeline();
+
+        // Post-generation: if tools were provided, parse for tool calls and emit
+        if (has_tools)
+        {
+            ToolCallFormat format = runner_.getToolCallFormat();
+            auto tool_result = parseToolCalls(accumulated_text, format);
+            if (tool_result.hasToolCalls())
+            {
+                // Emit tool_calls deltas
+                for (size_t ti = 0; ti < tool_result.tool_calls.size(); ++ti)
+                {
+                    const auto &tc = tool_result.tool_calls[ti];
+                    json tc_delta = {
+                        {"index", static_cast<int>(ti)},
+                        {"id", tc.id},
+                        {"type", "function"},
+                        {"function", {{"name", tc.name}, {"arguments", tc.arguments}}}};
+                    json delta = {{"tool_calls", json::array({tc_delta})}};
+                    emit_chunk(delta, nullptr);
+                }
+                finish_reason = "tool_calls";
+            }
+            else
+            {
+                // No tool calls found — emit buffered content as single chunk
+                if (!accumulated_text.empty())
+                {
+                    json delta = {{"content", accumulated_text}};
+                    emit_chunk(delta, nullptr);
+                }
+            }
+        }
 
         // Final chunk with finish_reason
         emit_chunk(json::object(), finish_reason.c_str());

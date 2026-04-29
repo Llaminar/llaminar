@@ -5,6 +5,7 @@
 
 #include "app/commands/CommandMPI.h"
 #include "app/MPIBootstrapPhase.h"
+#include "app/MPIShutdown.h"
 #include "backends/ComputeBackend.h"
 #include "config/OrchestrationConfig.h"
 #include "utils/Logger.h"
@@ -25,7 +26,7 @@ namespace llaminar2
     {
         if (mpi_initialized_)
         {
-            MPI_Finalize();
+            mpiShutdown();
         }
     }
 
@@ -48,7 +49,7 @@ namespace llaminar2
         if (this != &other)
         {
             if (mpi_initialized_)
-                MPI_Finalize();
+                mpiShutdown();
 
             inventory = std::move(other.inventory);
             is_output_rank = other.is_output_rank;

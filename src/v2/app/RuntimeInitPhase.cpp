@@ -5,6 +5,7 @@
 
 #include "app/RuntimeInitPhase.h"
 #include "app/MPIBootstrapPhase.h"
+#include "app/MPIShutdown.h"
 #include "app/ChatTemplateResolver.h"
 #include "backends/ComputeBackend.h"
 #include "backends/InventoryPrinter.h"
@@ -106,7 +107,7 @@ namespace llaminar2
                 {
                     LOG_ERROR("[Main] Startup thread affinity verification failed: " << affinity_details);
                     LOG_ERROR("[Main] Fix launcher pinning (mpirun binding/cpu-set) or set LLAMINAR_ASSERT_THREAD_AFFINITY=0 to downgrade to warning");
-                    MPI_Finalize();
+                    mpiShutdown();
                     return std::nullopt;
                 }
 
@@ -246,7 +247,7 @@ namespace llaminar2
             {
                 LOG_INFO("[Main] --dry-run requested: configuration validated, skipping model load/inference");
             }
-            MPI_Finalize();
+            mpiShutdown();
             return std::nullopt;
         }
 
@@ -258,7 +259,7 @@ namespace llaminar2
                 LOG_ERROR("Error: Model path required (-m)\n\n");
                 std::cout << OrchestrationConfigParser::getHelpText() << std::endl;
             }
-            MPI_Finalize();
+            mpiShutdown();
             return std::nullopt;
         }
 
@@ -272,7 +273,7 @@ namespace llaminar2
             {
                 LOG_ERROR("Error: Failed to create orchestration runner");
             }
-            MPI_Finalize();
+            mpiShutdown();
             return std::nullopt;
         }
 
@@ -282,7 +283,7 @@ namespace llaminar2
             {
                 LOG_ERROR("Failed to initialize: " << runner->lastError());
             }
-            MPI_Finalize();
+            mpiShutdown();
             return std::nullopt;
         }
 
@@ -294,7 +295,7 @@ namespace llaminar2
             {
                 LOG_ERROR("Failed to get tokenizer from runner");
             }
-            MPI_Finalize();
+            mpiShutdown();
             return std::nullopt;
         }
 

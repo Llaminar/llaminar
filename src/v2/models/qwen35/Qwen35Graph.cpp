@@ -14,9 +14,74 @@
 #include "../../utils/Assertions.h"
 #include "../../utils/Logger.h"
 
+#include <set>
+
 namespace llaminar2
 {
     using KernelFactory = llaminar::v2::kernels::KernelFactory;
+
+    // =========================================================================
+    // Helper: populate allreduce precision with FA-layer awareness
+    // =========================================================================
+
+    static void populateHybridAllreducePrecision(GraphConfig &config)
+    {
+        if (!config.tp_allreduce_precision.empty() || config.n_layers <= 0)
+            return;
+
+        Qwen35SchemaFactory factory;
+        auto schema = factory.createSchema();
+
+        // Build the forced-FP32 set from FA layer indices.
+        // FA layers are more sensitive to allreduce precision drift because
+        // they carry the full sequence-length attention context, whereas
+        // GDN layers operate on compressed recurrent state.
+        std::set<int> fa_layers;
+        for (int i = 0; i < config.n_layers; ++i)
+        {
+            if (i < static_cast<int>(config.layer_types.size()) &&
+                config.layer_types[i] == "full_attention")
+            {
+                fa_layers.insert(i);
+            }
+        }
+
+        if (!fa_layers.empty())
+        {
+            // Use layer-type-aware overload: FA layers always FP32,
+            // first N GDN layers FP32, rest GDN layers use schema default
+            config.populateAllreducePrecision(
+                schema.tp_allreduce_default_precision,
+                schema.tp_allreduce_fp32_layer_count,
+                fa_layers);
+
+            int gdn_fp32 = 0, gdn_fp16 = 0;
+            for (int i = 0; i < config.n_layers; ++i)
+            {
+                if (!fa_layers.count(i))
+                {
+                    if (config.tp_allreduce_precision[i] == "fp32")
+                        ++gdn_fp32;
+                    else
+                        ++gdn_fp16;
+                }
+            }
+            LOG_DEBUG("[Qwen35Graph] Hybrid allreduce precision: "
+                      << fa_layers.size() << " FA layers=fp32, "
+                      << gdn_fp32 << " GDN layers=fp32, "
+                      << gdn_fp16 << " GDN layers=" << schema.tp_allreduce_default_precision);
+        }
+        else
+        {
+            // No layer types available — fall back to count-based policy
+            config.populateAllreducePrecision(
+                schema.tp_allreduce_default_precision,
+                schema.tp_allreduce_fp32_layer_count);
+            LOG_DEBUG("[Qwen35Graph] Allreduce precision (count-based): "
+                      << "fp32_layers=" << schema.tp_allreduce_fp32_layer_count
+                      << " default=" << schema.tp_allreduce_default_precision);
+        }
+    }
 
     // =========================================================================
     // Constructors
@@ -28,6 +93,7 @@ namespace llaminar2
         const GraphConfig &config)
         : QwenGraphBase(std::move(model_ctx), std::move(mpi_ctx), config)
     {
+        populateHybridAllreducePrecision(config_);
     }
 
     Qwen35Graph::Qwen35Graph(
@@ -35,6 +101,7 @@ namespace llaminar2
         std::shared_ptr<IMPIContext> mpi_ctx)
         : QwenGraphBase(config, std::move(mpi_ctx))
     {
+        populateHybridAllreducePrecision(config_);
     }
 
     // =========================================================================
