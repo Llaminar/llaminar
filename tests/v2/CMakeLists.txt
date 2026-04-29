@@ -7902,6 +7902,29 @@ if(HAVE_ROCM)
     )
     message(STATUS "V2 Tests: Added Native-VNNI Q4_0 sweep benchmark")
 
+    # Performance Test: Q8_0 Native-VNNI GEMV Tuning
+    # Compares INT8-VNNI vs Native-VNNI decode paths for Q8_0 weights.
+    # Sweeps TARGET_WAVES_PER_CU and KB to find optimal dispatch for Q8_0.
+    add_executable(v2_perf_q8_0_native_vnni_gemv_tuning
+        performance/kernels/rocm/Perf__Q8_0_NativeVNNI_GemvTuning.cpp
+        performance/kernels/rocm/GpuVerification.hip
+    )
+    target_link_libraries(v2_perf_q8_0_native_vnni_gemv_tuning
+        llaminar2_core
+        GTest::gtest
+        GTest::gtest_main
+        OpenMP::OpenMP_CXX
+        roc::hipblas
+    )
+    target_compile_options(v2_perf_q8_0_native_vnni_gemv_tuning PRIVATE -fopenmp)
+    target_link_options(v2_perf_q8_0_native_vnni_gemv_tuning PRIVATE -fopenmp)
+    add_v2_test(V2_Perf_Q8_0_NativeVNNI_GemvTuning
+        COMMAND $<TARGET_FILE:v2_perf_q8_0_native_vnni_gemv_tuning>
+        LABELS "V2;Performance;ROCm;GEMV;NativeVNNI;Q8_0;Quantized;gfx906;Benchmark;Tuning"
+        MPI_PROCS 1
+    )
+    message(STATUS "V2 Tests: Added Q8_0 Native-VNNI GEMV tuning benchmark")
+
     # Performance Microbenchmark: IQ Decode Strategy Lab
     # Isolated decode-only benchmark for IQ grid-index quantization formats.
     # Tests multiple decode strategies (baseline, vsub4, LDS cache, ksigns64)

@@ -41,6 +41,26 @@
 
 #include "../../../backends/rocm/HipDeviceGuard.h"
 
+#include <atomic>
+
+// ============================================================================
+// Runtime tuning overrides for native-VNNI GEMV dispatch.
+// Values < 0 mean "use default heuristic".
+// ============================================================================
+static std::atomic<int> g_native_vnni_kb_override{-1};
+static std::atomic<int> g_native_vnni_target_waves_override{-1};
+
+extern "C" void rocmGemv_native_vnni_set_tuning_overrides(int kb, int target_waves_per_cu)
+{
+    g_native_vnni_kb_override.store(kb, std::memory_order_relaxed);
+    g_native_vnni_target_waves_override.store(target_waves_per_cu, std::memory_order_relaxed);
+}
+
+extern "C" void rocmGemv_native_vnni_reset_tuning_overrides()
+{
+    rocmGemv_native_vnni_set_tuning_overrides(-1, -1);
+}
+
 constexpr uint8_t CODEBOOK_IQ4 = 4;
 
 __device__ __constant__ int8_t k_iq4_codebook_i8[16] = {
@@ -1589,8 +1609,22 @@ bool rocmGemv_native_vnni_fp32(
 
         const int grid_n = (N + TN - 1) / TN;
 
-        constexpr int TARGET_WAVES_PER_CU = 24;
-        int target_total_waves = TARGET_WAVES_PER_CU * NUM_CUS;  // 1440
+        // Check runtime tuning overrides
+        const int kb_override = g_native_vnni_kb_override.load(std::memory_order_relaxed);
+        const int waves_override = g_native_vnni_target_waves_override.load(std::memory_order_relaxed);
+
+        constexpr int DEFAULT_TARGET_WAVES_PER_CU = 24;
+
+        // Q8_0 (codebook_id=19) has a trivial decode path (direct INT8 load),
+        // so it benefits from lower occupancy pressure. Tuning sweep shows
+        // tw=4 matches or beats INT8-VNNI on MI50/MI60 across all 7B shapes.
+        constexpr int Q8_0_TARGET_WAVES_PER_CU = 4;
+        const int default_waves = (codebook_id == static_cast<uint8_t>(NVNNI_Q8_0))
+                                      ? Q8_0_TARGET_WAVES_PER_CU
+                                      : DEFAULT_TARGET_WAVES_PER_CU;
+
+        const int TARGET_WAVES_PER_CU = (waves_override > 0) ? waves_override : default_waves;
+        int target_total_waves = TARGET_WAVES_PER_CU * NUM_CUS;
         int kb_raw = max(1, (target_total_waves + grid_n - 1) / grid_n);
         int kb_max = max(1, blocks_per_row / MIN_BLOCKS_PER_WAVE);
         kb_max = min(kb_max, KB_CAP);
@@ -1606,6 +1640,13 @@ bool rocmGemv_native_vnni_fp32(
             }
         }
         if (kb < 1) kb = 1;
+
+        // Apply direct KB override (takes priority over heuristic)
+        if (kb_override > 0)
+        {
+            kb = min(kb_override, KB_CAP);
+            if (kb > blocks_per_row) kb = blocks_per_row;
+        }
 
         if (kb > 1 && !d_partial_fp32)
         {
