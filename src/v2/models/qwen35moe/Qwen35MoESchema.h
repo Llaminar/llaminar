@@ -97,8 +97,32 @@ namespace llaminar2
             // Override schema name
             schema.name = "qwen35moe";
 
-            // TODO: Replace dense FFN stages with MoE FFN stages in templates
-            // For now, the dense FFN stages serve as placeholder
+            // Add MoE-specific activation buffers
+            // Routing outputs: expert indices and weights for top-k selection
+            schema.layer_buffers.push_back(
+                {"moe_expert_indices", {"seq_len", "moe_top_k"}, "fp32", BufferSemantic::Scratch,
+                 "moe_scratch", 10, "MoE top-k expert indices per token (as float)"});
+            schema.layer_buffers.push_back(
+                {"moe_expert_weights", {"seq_len", "moe_top_k"}, "fp32", BufferSemantic::Scratch,
+                 "moe_scratch", 9, "MoE top-k routing weights per token"});
+
+            // Expert compute output: combined weighted expert output
+            schema.layer_buffers.push_back(
+                {"moe_combined_output", {"seq_len", "d_model"}, "fp32", BufferSemantic::Scratch,
+                 "moe_output_scratch", 10, "Combined routed expert FFN output"});
+
+            // Shared expert output
+            schema.layer_buffers.push_back(
+                {"moe_shared_expert_output", {"seq_len", "d_model"}, "fp32", BufferSemantic::Scratch,
+                 "moe_output_scratch", 5, "Shared expert FFN output"});
+
+            // Expert GEMM scratch buffers (for gate/up projections)
+            schema.layer_buffers.push_back(
+                {"moe_gate_scratch", {"seq_len", "moe_expert_intermediate"}, "fp32", BufferSemantic::Scratch,
+                 "moe_gemm_scratch", 10, "Expert gate projection scratch"});
+            schema.layer_buffers.push_back(
+                {"moe_up_scratch", {"seq_len", "moe_expert_intermediate"}, "fp32", BufferSemantic::Scratch,
+                 "moe_gemm_scratch", 5, "Expert up projection scratch"});
 
             return schema;
         }
