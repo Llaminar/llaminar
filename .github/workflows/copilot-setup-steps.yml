@@ -19,8 +19,13 @@ jobs:
     # Set the permissions to the lowest permissions possible needed for your steps.
     # Copilot will be given its own token for its operations.
     permissions:
-      # If you want to clone the repository as part of your setup steps, for example to install dependencies, you'll need the `contents: read` permission. If you don't clone the repository in your setup steps, Copilot will do this for you automatically after the steps complete.
+      # If you want to clone the repository as part of your setup steps, for example to install dependencies, you'll need the `contents: read` permission. If you don't clone the repository in your setup steps, Copilot will do this for you.
       contents: read
+
+    env:
+      CUDA_VERSION: "13.1"
+      ROCM_VERSION: "7.2"
+      GCC_VERSION: "15"
 
     # You can define any steps you want, and they will run before the agent starts.
     # If you do not check out your code, Copilot will do this for you.
@@ -63,6 +68,7 @@ jobs:
             ca-certificates \
             gnupg \
             lsb-release \
+            software-properties-common \
             python3 \
             python3-pip \
             python3-dev \
@@ -73,6 +79,106 @@ jobs:
             libeigen3-dev
           sudo apt-get clean
           sudo rm -rf /var/lib/apt/lists/*
+
+      - name: Install GCC 15
+        run: |
+          sudo add-apt-repository -y ppa:ubuntu-toolchain-r/test
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            gcc-${GCC_VERSION} \
+            g++-${GCC_VERSION} \
+            cpp-${GCC_VERSION} \
+            gfortran-${GCC_VERSION}
+          sudo update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-${GCC_VERSION} 150 \
+            --slave /usr/bin/g++ g++ /usr/bin/g++-${GCC_VERSION} \
+            --slave /usr/bin/cpp cpp /usr/bin/cpp-${GCC_VERSION} \
+            --slave /usr/bin/gfortran gfortran /usr/bin/gfortran-${GCC_VERSION}
+          sudo update-alternatives --set gcc /usr/bin/gcc-${GCC_VERSION}
+          sudo apt-get clean
+          sudo rm -rf /var/lib/apt/lists/*
+
+      - name: Install CUDA 13.1
+        run: |
+          set -euo pipefail
+
+          ubuntu_version="$(. /etc/os-release && echo "${VERSION_ID//./}")"
+          cuda_repo="ubuntu${ubuntu_version}"
+          keyring_pkg="cuda-keyring_1.1-1_all.deb"
+
+          wget -q "https://developer.download.nvidia.com/compute/cuda/repos/${cuda_repo}/x86_64/${keyring_pkg}" -O "/tmp/${keyring_pkg}"
+          sudo dpkg -i "/tmp/${keyring_pkg}"
+          rm -f "/tmp/${keyring_pkg}"
+
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cuda-toolkit-${CUDA_VERSION/./-}
+          sudo apt-get clean
+          sudo rm -rf /var/lib/apt/lists/*
+
+          cuda_home="/usr/local/cuda-${CUDA_VERSION}"
+          if [ -d "$cuda_home" ]; then
+            echo "CUDA_HOME=$cuda_home" >> "$GITHUB_ENV"
+            echo "$cuda_home/bin" >> "$GITHUB_PATH"
+            echo "LD_LIBRARY_PATH=$cuda_home/lib64:${LD_LIBRARY_PATH:-}" >> "$GITHUB_ENV"
+          fi
+
+      - name: Install ROCm 7.2 with gfx906 Tensile overlay
+        run: |
+          set -euo pipefail
+
+          apt_opts=(
+            -o Acquire::Retries=5
+            -o Acquire::http::Timeout=30
+            -o Acquire::https::Timeout=30
+          )
+
+          # Match .devcontainer/Dockerfile via scripts/docker/install-rocm.sh:
+          # install ROCm through AMD's canonical amdgpu-install package, skip
+          # DKMS because the host driver is provided by the self-hosted runner,
+          # then graft the gfx906 Tensile kernels from Arch's rocBLAS package.
+          rocm_codename="$(lsb_release -cs)"
+          amdgpu_base_url="https://repo.radeon.com/amdgpu-install/${ROCM_VERSION}/ubuntu/${rocm_codename}"
+          amdgpu_deb="$(curl -fsSL --retry 5 --retry-delay 5 "${amdgpu_base_url}/" \
+            | grep -oE 'amdgpu-install_[^"[:space:]]+_all\.deb' \
+            | sort -V \
+            | tail -n1)"
+
+          if [ -z "${amdgpu_deb}" ]; then
+            echo "Failed to find amdgpu-install package at ${amdgpu_base_url}" >&2
+            exit 1
+          fi
+
+          curl -fsSL --retry 5 --retry-delay 5 \
+            -o /tmp/amdgpu-install.deb \
+            "${amdgpu_base_url}/${amdgpu_deb}"
+
+          sudo apt-get "${apt_opts[@]}" update
+          sudo apt-get "${apt_opts[@]}" install -y /tmp/amdgpu-install.deb
+          rm -f /tmp/amdgpu-install.deb
+
+          sudo amdgpu-install --usecase=rocm --no-dkms -y
+
+          # Restore gfx906 (MI50 / Vega 20) Tensile kernels removed in ROCm 7.x.
+          sudo apt-get "${apt_opts[@]}" install -y --no-install-recommends zstd
+          curl -fsSL --retry 5 --retry-delay 5 \
+            -o /tmp/rocblas-arch.pkg.tar.zst \
+            "https://archlinux.org/packages/extra/x86_64/rocblas/download"
+          mkdir -p /tmp/rocblas-arch
+          tar -I zstd -xf /tmp/rocblas-arch.pkg.tar.zst -C /tmp/rocblas-arch
+          if compgen -G "/tmp/rocblas-arch/opt/rocm/lib/rocblas/library/*gfx906*" >/dev/null; then
+            sudo cp /tmp/rocblas-arch/opt/rocm/lib/rocblas/library/*gfx906* \
+              /opt/rocm/lib/rocblas/library/
+          fi
+          rm -rf /tmp/rocblas-arch /tmp/rocblas-arch.pkg.tar.zst
+
+          sudo apt-get autoremove -y
+          sudo apt-get clean
+          sudo rm -rf /var/lib/apt/lists/*
+
+          echo "ROCM_PATH=/opt/rocm" >> "$GITHUB_ENV"
+          echo "ROCM_HOME=/opt/rocm" >> "$GITHUB_ENV"
+          echo "HIP_PATH=/opt/rocm" >> "$GITHUB_ENV"
+          echo "/opt/rocm/bin" >> "$GITHUB_PATH"
+          echo "LD_LIBRARY_PATH=/opt/rocm/lib:/opt/rocm/lib64:${LD_LIBRARY_PATH:-}" >> "$GITHUB_ENV"
 
       - name: Build and install GoogleTest libraries
         run: |
@@ -107,6 +213,22 @@ jobs:
           echo ""
           echo "=== G++ Version ==="
           g++ --version
+          echo ""
+          echo "=== CUDA Version ==="
+          nvcc --version
+          echo ""
+          echo "=== ROCm Version ==="
+          if command -v rocminfo >/dev/null 2>&1; then
+            rocminfo | head -40
+          else
+            echo "rocminfo not found"
+          fi
+          echo ""
+          echo "=== HIP Version ==="
+          hipcc --version
+          echo ""
+          echo "=== gfx906 rocBLAS Tensile Kernels ==="
+          find /opt/rocm/lib/rocblas/library -name '*gfx906*' -print | head -20
           echo ""
           echo "=== MPI Version ==="
           mpirun --version
