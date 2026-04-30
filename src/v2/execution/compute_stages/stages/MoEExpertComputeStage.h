@@ -271,7 +271,8 @@ namespace llaminar2
         bool executeSingleToken(IDeviceContext *ctx);
 
 
-        void ensureGemmEnginesCached() const;
+        void ensureGemmEnginesCached();
+        bool ensureGemmEnginesForExperts(const std::vector<int>& expert_ids);
         void ensureScratchBuffers(int max_batch) const;
         IMoEKernel *ensureMoEKernel() const;
     };
@@ -329,6 +330,19 @@ namespace llaminar2
         mutable ITensorGemm *cached_gate_gemm_ = nullptr;
         mutable ITensorGemm *cached_up_gemm_ = nullptr;
         mutable ITensorGemm *cached_down_gemm_ = nullptr;
+
+        mutable std::vector<bool> shared_expert_mask_;
+        mutable std::vector<std::shared_ptr<TensorBase>> shared_gate_views_;
+        mutable std::vector<std::shared_ptr<TensorBase>> shared_up_views_;
+        mutable std::vector<std::shared_ptr<TensorBase>> shared_down_views_;
+        mutable std::vector<ITensorGemm *> shared_prepared_gate_gemm_;
+        mutable std::vector<ITensorGemm *> shared_prepared_up_gemm_;
+        mutable std::vector<ITensorGemm *> shared_prepared_down_gemm_;
+        mutable std::vector<std::shared_ptr<ITensorGemm>> shared_owned_kernels_;
+        mutable std::shared_ptr<void> shared_packed_gate_lifetime_;
+        mutable std::shared_ptr<void> shared_packed_up_lifetime_;
+        mutable std::shared_ptr<void> shared_packed_down_lifetime_;
+
         mutable std::shared_ptr<FP32Tensor> scratch_gate_;
         mutable std::shared_ptr<FP32Tensor> scratch_up_;
         mutable int scratch_seq_len_ = 0;

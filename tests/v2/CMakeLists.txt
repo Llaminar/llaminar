@@ -4779,6 +4779,54 @@ if(ZLIB_FOUND)
 
     message(STATUS "V2: Qwen3.5 MoE SingleDevice parity tests enabled")
 
+    # ---- LocalTP MoE Parity (2x ROCm with Expert Parallelism + RCCL) ----
+    add_executable(v2_integration_parity_qwen35moe_local_tp
+        integration/parity/qwen35moe/Test__Qwen35MoE_LocalTP_Parity.cpp
+        ${WORKSPACE_ROOT_PARITY}/external/cnpy/cnpy.cpp
+    )
+    target_link_libraries(v2_integration_parity_qwen35moe_local_tp
+        llaminar2_core
+        v2_test_utils
+        GTest::gtest
+        ZLIB::ZLIB
+    )
+    target_include_directories(v2_integration_parity_qwen35moe_local_tp PRIVATE
+        ${WORKSPACE_ROOT_PARITY}/external/cnpy
+        ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+
+    discover_v2_parity_tests(v2_integration_parity_qwen35moe_local_tp
+        TEST_PREFIX V2_Integration_Parity_Qwen35MoE_LocalTP
+        LABELS "V2;Integration;Parity;Qwen35MoE;MixtureOfExperts;LocalTP;RCCL;ROCm;TensorParallel;ExpertParallel"
+        MPI_PROCS 1
+    )
+
+    message(STATUS "V2: Qwen3.5 MoE LocalTP parity tests enabled")
+
+    # ---- Hybrid PP+TP MoE Parity (ROCm GPU cache + CPU routed expert domain) ----
+    add_executable(v2_integration_parity_qwen35moe_hybrid_pptp
+        integration/parity/qwen35moe/Test__Qwen35MoE_HybridPPTP_Parity.cpp
+        ${WORKSPACE_ROOT_PARITY}/external/cnpy/cnpy.cpp
+    )
+    target_link_libraries(v2_integration_parity_qwen35moe_hybrid_pptp
+        llaminar2_core
+        v2_test_utils
+        GTest::gtest
+        ZLIB::ZLIB
+    )
+    target_include_directories(v2_integration_parity_qwen35moe_hybrid_pptp PRIVATE
+        ${WORKSPACE_ROOT_PARITY}/external/cnpy
+        ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+
+    discover_v2_parity_tests(v2_integration_parity_qwen35moe_hybrid_pptp
+        TEST_PREFIX V2_Integration_Parity_Qwen35MoE_HybridPPTP
+        LABELS "V2;Integration;Parity;Qwen35MoE;MixtureOfExperts;HybridPPTP;LocalPP;LocalTP;ROCm;CPU;ExpertMigration;GpuExpertCache"
+        MPI_PROCS 1
+    )
+
+    message(STATUS "V2: Qwen3.5 MoE HybridPPTP parity tests enabled")
+
     # ---- NodeLocalTP MoE Parity (Cross-Socket CPU TP with Expert Parallelism) ----
     #
     # Tests Node-Local Tensor Parallelism for MoE models:

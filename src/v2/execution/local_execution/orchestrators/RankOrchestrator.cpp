@@ -35,6 +35,7 @@
 #include "../../../utils/ROCmKernelProfiler.h"         // Phase propagation to worker threads
 #include "../../../utils/CUDAKernelProfiler.h"         // Phase propagation to worker threads
 #include "../../../utils/KVCacheProfiler.h"            // Phase propagation to worker threads
+#include "../../../utils/DebugEnv.h"
 #include "../../mpi_orchestration/RankExecutionPlan.h" // For Config::fromPlan()
 #include "../../../collective/PPActivationContract.h"  // PPActivationContract for forwardPP
 #include "fort.hpp"                                    // libfort for TP profiling summary table
@@ -2676,6 +2677,93 @@ namespace llaminar2
         if (tp_ctx_)
         {
             tp_ctx_->synchronize();
+        }
+    }
+
+    MoERebalanceController *RankOrchestrator::moeRebalanceController() const
+    {
+        for (const auto &runner : device_runners_)
+        {
+            if (auto *dgo = dynamic_cast<DeviceGraphOrchestrator *>(runner.get()))
+            {
+                if (auto *controller = dgo->moeRebalanceController())
+                    return controller;
+            }
+        }
+        for (const auto &runner : pp_stage_runners_)
+        {
+            if (auto *rank = dynamic_cast<RankOrchestrator *>(runner.get()))
+            {
+                if (auto *controller = rank->moeRebalanceController())
+                    return controller;
+            }
+            if (auto *dgo = dynamic_cast<DeviceGraphOrchestrator *>(runner.get()))
+            {
+                if (auto *controller = dgo->moeRebalanceController())
+                    return controller;
+            }
+        }
+        return nullptr;
+    }
+
+    void RankOrchestrator::applyMoEExpertMasksForAllDevices(const MoERebalanceController &controller)
+    {
+        const int gpu_cache_experts = debugEnv().moe_rebalance.gpu_cache_experts_per_layer;
+        if (gpu_cache_experts > 0)
+        {
+            auto masks_by_socket = controller.computeGpuCacheExpertMasks(gpu_cache_experts);
+            applyMoEExpertMasksForAllDevices(masks_by_socket);
+            return;
+        }
+
+        std::vector<std::vector<std::vector<bool>>> masks_by_socket;
+        masks_by_socket.reserve(device_runners_.size());
+        for (size_t device_idx = 0; device_idx < device_runners_.size(); ++device_idx)
+            masks_by_socket.push_back(controller.computeExpertMasks(static_cast<int>(device_idx)));
+
+        applyMoEExpertMasksForAllDevices(masks_by_socket);
+    }
+
+    void RankOrchestrator::applyMoEExpertMasksForAllDevices(
+        const std::vector<std::vector<std::vector<bool>>> &masks_by_socket)
+    {
+        int applied = 0;
+        for (size_t device_idx = 0; device_idx < device_runners_.size(); ++device_idx)
+        {
+            if (device_idx >= masks_by_socket.size())
+                continue;
+
+            auto *dgo = dynamic_cast<DeviceGraphOrchestrator *>(device_runners_[device_idx].get());
+            if (!dgo)
+                continue;
+
+            dgo->applyExpertMasks(masks_by_socket[device_idx], ReceivedWeightsMap{});
+            ++applied;
+        }
+
+        if (applied == 0 && !pp_stage_runners_.empty())
+        {
+            for (auto &runner : pp_stage_runners_)
+            {
+                if (auto *rank = dynamic_cast<RankOrchestrator *>(runner.get()))
+                {
+                    rank->applyMoEExpertMasksForAllDevices(masks_by_socket);
+                    ++applied;
+                    break;
+                }
+            }
+        }
+        LOG_INFO("[RankOrchestrator] Applied LocalTP MoE expert masks to "
+                 << applied << "/" << device_runners_.size() << " device runners");
+    }
+
+    void RankOrchestrator::setExpertReplicaSetForAllDevices(const ExpertReplicaSet &replicas)
+    {
+        for (size_t device_idx = 0; device_idx < device_runners_.size(); ++device_idx)
+        {
+            auto *dgo = dynamic_cast<DeviceGraphOrchestrator *>(device_runners_[device_idx].get());
+            if (dgo)
+                dgo->setExpertReplicaSet(replicas, static_cast<int>(device_idx));
         }
     }
 

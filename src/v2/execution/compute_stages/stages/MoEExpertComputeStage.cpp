@@ -230,10 +230,9 @@ namespace llaminar2
                 params_.routing_indices, params_.routing_weights,
                 seq_len, num_experts, top_k))
         {
-            ensureGemmEnginesCached();
-
             // Scratch sizing based on max local expert token count
             int max_batch = 0;
+            std::vector<int> active_local_experts;
             for (int e = 0; e < num_experts; ++e)
             {
                 bool is_local;
@@ -248,7 +247,17 @@ namespace llaminar2
                 }
                 else is_local = (e >= local_start && e < local_end);
                 if (is_local)
+                {
+                    if (kernel->getExpertTokenCount(e) > 0)
+                        active_local_experts.push_back(e);
                     max_batch = std::max(max_batch, kernel->getExpertTokenCount(e));
+                }
+            }
+
+            if (!ensureGemmEnginesForExperts(active_local_experts))
+            {
+                LOG_ERROR("[MoEExpertComputeStage] Failed to prepare GPU GEMM engines for active experts");
+                return false;
             }
 
             if (max_batch > 0 && max_batch > scratch_capacity_)
@@ -469,9 +478,6 @@ namespace llaminar2
                                     : params_.local_expert_count;
         const int local_end = local_start + local_count;
 
-        // Ensure GEMM engines are cached
-        ensureGemmEnginesCached();
-
         // Ensure batch scratch buffers for gate+up (one per top-k expert).
         // All experts' gate+up are fused into a single OMP region, so we need
         // all outputs to exist simultaneously.
@@ -538,6 +544,24 @@ namespace llaminar2
                 else
                     compute_here[k] = (expert_id >= local_start && expert_id < local_end);
             }
+        }
+
+        if (is_gpu)
+        {
+            std::vector<int> active_expert_ids;
+            active_expert_ids.reserve(top_k);
+            for (int k = 0; k < top_k; ++k)
+                if (compute_here[k])
+                    active_expert_ids.push_back(routing_int_indices[k]);
+            if (!ensureGemmEnginesForExperts(active_expert_ids))
+            {
+                LOG_ERROR("[MoEExpertComputeStage] Failed to prepare GPU GEMM engines for decode experts");
+                return false;
+            }
+        }
+        else
+        {
+            ensureGemmEnginesCached();
         }
 
         for (int k = 0; k < top_k; ++k)
@@ -717,7 +741,7 @@ namespace llaminar2
         return true;
     }
 
-    void MoEExpertComputeStage::ensureGemmEnginesCached() const
+    void MoEExpertComputeStage::ensureGemmEnginesCached()
     {
         if (!cached_gate_gemm_.empty())
             return;
@@ -761,6 +785,81 @@ namespace llaminar2
             cached_up_gemm_[e] = KernelFactory::getOrCreateGemmEngine(up);
             cached_down_gemm_[e] = KernelFactory::getOrCreateGemmEngine(dp);
         }
+    }
+
+    bool MoEExpertComputeStage::ensureGemmEnginesForExperts(const std::vector<int>& expert_ids)
+    {
+        const int num_experts = params_.num_experts;
+        if (expert_ids.empty())
+            return true;
+
+        if (!params_.device_id.is_gpu())
+        {
+            ensureGemmEnginesCached();
+            return true;
+        }
+
+        if (params_.prepared_gate_gemm.size() != static_cast<size_t>(num_experts))
+        {
+            params_.prepared_gate_gemm.assign(num_experts, nullptr);
+            params_.prepared_up_gemm.assign(num_experts, nullptr);
+            params_.prepared_down_gemm.assign(num_experts, nullptr);
+        }
+
+        std::vector<bool> needed(num_experts, false);
+        bool has_missing = false;
+        for (int expert_id : expert_ids)
+        {
+            if (expert_id < 0 || expert_id >= num_experts)
+            {
+                LOG_ERROR("[MoEExpertComputeStage] Invalid expert id " << expert_id
+                          << " for layer " << params_.layer_idx);
+                return false;
+            }
+            needed[expert_id] = true;
+            if (!params_.prepared_gate_gemm[expert_id] ||
+                !params_.prepared_up_gemm[expert_id] ||
+                !params_.prepared_down_gemm[expert_id])
+            {
+                has_missing = true;
+            }
+        }
+
+        if (has_missing)
+        {
+            auto ctx = buildWeightContext();
+            if (!MoEExpertWeightService::registerAndPrepareNewExperts(ctx, needed, nullptr))
+                return false;
+        }
+
+        cached_gate_gemm_ = params_.prepared_gate_gemm;
+        cached_up_gemm_ = params_.prepared_up_gemm;
+        cached_down_gemm_ = params_.prepared_down_gemm;
+
+        auto bind_if_needed = [this](ITensorGemm *gemm)
+        {
+            if (!bound_workspace_ || !gemm)
+                return;
+            auto *consumer = dynamic_cast<IWorkspaceConsumer *>(gemm);
+            if (consumer && !consumer->hasWorkspace())
+                consumer->bindWorkspace(bound_workspace_);
+        };
+
+        for (int expert_id : expert_ids)
+        {
+            if (!cached_gate_gemm_[expert_id] ||
+                !cached_up_gemm_[expert_id] ||
+                !cached_down_gemm_[expert_id])
+            {
+                LOG_ERROR("[MoEExpertComputeStage] Missing prepared GPU GEMM engine for expert "
+                          << expert_id << " layer " << params_.layer_idx);
+                return false;
+            }
+            bind_if_needed(cached_gate_gemm_[expert_id]);
+            bind_if_needed(cached_up_gemm_[expert_id]);
+            bind_if_needed(cached_down_gemm_[expert_id]);
+        }
+        return true;
     }
 
     // =========================================================================
@@ -999,12 +1098,72 @@ namespace llaminar2
     {
         if (cached_gate_gemm_)
             return;
+
+        if (params_.device_id.is_gpu())
+        {
+            shared_expert_mask_ = {true};
+            shared_gate_views_ = {std::shared_ptr<TensorBase>(params_.gate_w, [](TensorBase *) {})};
+            shared_up_views_ = {std::shared_ptr<TensorBase>(params_.up_w, [](TensorBase *) {})};
+            shared_down_views_ = {std::shared_ptr<TensorBase>(params_.down_w, [](TensorBase *) {})};
+            shared_prepared_gate_gemm_.assign(1, nullptr);
+            shared_prepared_up_gemm_.assign(1, nullptr);
+            shared_prepared_down_gemm_.assign(1, nullptr);
+
+            MoEWeightContext ctx{
+                params_.device_id,
+                1,
+                params_.intermediate,
+                params_.d_model,
+                0,
+                1,
+                -1,
+                shared_expert_mask_,
+                nullptr,
+                nullptr,
+                nullptr,
+                shared_gate_views_,
+                shared_up_views_,
+                shared_down_views_,
+                shared_prepared_gate_gemm_,
+                shared_prepared_up_gemm_,
+                shared_prepared_down_gemm_,
+                shared_owned_kernels_,
+                shared_packed_gate_lifetime_,
+                shared_packed_up_lifetime_,
+                shared_packed_down_lifetime_};
+
+            if (!MoEExpertWeightService::prepareGemmEngines(ctx))
+            {
+                LOG_ERROR("[SharedExpertFFNStage] Failed to prepare shared expert GEMM engines on "
+                          << params_.device_id.to_string());
+                return;
+            }
+
+            cached_gate_gemm_ = shared_prepared_gate_gemm_[0];
+            cached_up_gemm_ = shared_prepared_up_gemm_[0];
+            cached_down_gemm_ = shared_prepared_down_gemm_[0];
+        }
+        else
+        {
         auto *gp = KernelFactory::getOrCreatePreparedGemmWeights(params_.gate_w, params_.device_id);
         auto *up = KernelFactory::getOrCreatePreparedGemmWeights(params_.up_w, params_.device_id);
         auto *dp = KernelFactory::getOrCreatePreparedGemmWeights(params_.down_w, params_.device_id);
         cached_gate_gemm_ = KernelFactory::getOrCreateGemmEngine(gp);
         cached_up_gemm_ = KernelFactory::getOrCreateGemmEngine(up);
         cached_down_gemm_ = KernelFactory::getOrCreateGemmEngine(dp);
+        }
+
+        auto bind_if_needed = [this](ITensorGemm *gemm)
+        {
+            if (!bound_workspace_ || !gemm)
+                return;
+            auto *consumer = dynamic_cast<IWorkspaceConsumer *>(gemm);
+            if (consumer && !consumer->hasWorkspace())
+                consumer->bindWorkspace(bound_workspace_);
+        };
+        bind_if_needed(cached_gate_gemm_);
+        bind_if_needed(cached_up_gemm_);
+        bind_if_needed(cached_down_gemm_);
     }
 
     bool SharedExpertFFNStage::execute(IDeviceContext *ctx)
@@ -1027,6 +1186,11 @@ namespace llaminar2
 
         // Cache GEMM engines on first call
         ensureGemmEnginesCached();
+        if (!cached_gate_gemm_ || !cached_up_gemm_ || !cached_down_gemm_)
+        {
+            LOG_ERROR("[SharedExpertFFNStage] Missing shared expert GEMM engine");
+            return false;
+        }
 
         // Ensure scratch buffers are large enough
         if (seq_len > scratch_seq_len_)

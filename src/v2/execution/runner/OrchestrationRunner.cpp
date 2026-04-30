@@ -28,6 +28,7 @@
 #include "../../backends/DeviceAddressAdapter.h"
 #include "../../tensors/TensorFactory.h"
 #include "../../utils/Logger.h"
+#include "../../utils/DebugEnv.h"
 #include "../../utils/MPITopology.h"
 #include "../../utils/NodeDetection.h"
 #include "../../utils/NUMATopology.h"
@@ -516,21 +517,38 @@ namespace llaminar2
             {
                 if (controller->shouldRebalance())
                 {
+                    std::vector<std::vector<std::vector<bool>>> gpu_cache_masks;
+                    const int gpu_cache_experts = debugEnv().moe_rebalance.gpu_cache_experts_per_layer;
+                    if (gpu_cache_experts > 0)
+                        gpu_cache_masks = controller->computeGpuCacheExpertMasks(gpu_cache_experts);
+
                     auto old_placement = controller->currentPlacement();
                     auto new_placement = controller->rebalance();
-                    if (!new_placement.empty())
+                    if (!gpu_cache_masks.empty())
                     {
-                        auto manifest = ExpertWeightTransfer::buildManifest(
-                            old_placement, new_placement);
-                        ReceivedWeightsMap received;
-                        if (!manifest.empty())
+                        if (!applyMoEExpertMasksForAllLocalDevices(gpu_cache_masks))
                         {
-                            received = transferExpertWeights(
-                                manifest, controller->numLayers());
+                            int socket_id = mpi_ctx_ ? mpi_ctx_->rank() : 0;
+                            if (socket_id >= 0 && socket_id < static_cast<int>(gpu_cache_masks.size()))
+                                applyMoEExpertMasks(gpu_cache_masks[socket_id], ReceivedWeightsMap{});
                         }
-                        int socket_id = mpi_ctx_ ? mpi_ctx_->rank() : 0;
-                        auto masks = controller->computeExpertMasks(socket_id);
-                        applyMoEExpertMasks(masks, received);
+                    }
+                    else if (!new_placement.empty())
+                    {
+                        if (!applyMoEExpertMasksForAllLocalDevices(*controller))
+                        {
+                            auto manifest = ExpertWeightTransfer::buildManifest(
+                                old_placement, new_placement);
+                            ReceivedWeightsMap received;
+                            if (!manifest.empty())
+                            {
+                                received = transferExpertWeights(
+                                    manifest, controller->numLayers());
+                            }
+                            int socket_id = mpi_ctx_ ? mpi_ctx_->rank() : 0;
+                            auto masks = controller->computeExpertMasks(socket_id);
+                            applyMoEExpertMasks(masks, received);
+                        }
                     }
                 }
             }
@@ -1412,6 +1430,10 @@ namespace llaminar2
             {
                 return dgo->moeRebalanceController();
             }
+            if (auto* rank = dynamic_cast<RankOrchestrator*>(runner_.get()))
+            {
+                return rank->moeRebalanceController();
+            }
         }
         return nullptr;
     }
@@ -1429,6 +1451,32 @@ namespace llaminar2
         }
     }
 
+    bool OrchestrationRunner::applyMoEExpertMasksForAllLocalDevices(
+        const MoERebalanceController& controller)
+    {
+        if (!runner_)
+            return false;
+        if (auto* rank = dynamic_cast<RankOrchestrator*>(runner_.get()))
+        {
+            rank->applyMoEExpertMasksForAllDevices(controller);
+            return true;
+        }
+        return false;
+    }
+
+    bool OrchestrationRunner::applyMoEExpertMasksForAllLocalDevices(
+        const std::vector<std::vector<std::vector<bool>>>& masks_by_socket)
+    {
+        if (!runner_)
+            return false;
+        if (auto* rank = dynamic_cast<RankOrchestrator*>(runner_.get()))
+        {
+            rank->applyMoEExpertMasksForAllDevices(masks_by_socket);
+            return true;
+        }
+        return false;
+    }
+
     void OrchestrationRunner::setExpertReplicaSet(
         const ExpertReplicaSet& replicas, int socket_id)
     {
@@ -1437,6 +1485,10 @@ namespace llaminar2
             if (auto* dgo = dynamic_cast<DeviceGraphOrchestrator*>(runner_.get()))
             {
                 dgo->setExpertReplicaSet(replicas, socket_id);
+            }
+            else if (auto* rank = dynamic_cast<RankOrchestrator*>(runner_.get()))
+            {
+                rank->setExpertReplicaSetForAllDevices(replicas);
             }
         }
     }

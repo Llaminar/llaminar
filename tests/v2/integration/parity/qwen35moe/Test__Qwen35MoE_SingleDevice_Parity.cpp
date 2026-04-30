@@ -15,7 +15,7 @@
  * Configurations:
  *   - CPU: Full-precision baseline with FP16 KV cache
  *   - CUDA: Single NVIDIA GPU (SKIP for now — model too large for single 3090)
- *   - ROCm: Single AMD GPU (SKIP for now — requires testing)
+ *   - ROCm: Single AMD GPU
  *
  * Model: Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf at /opt/llaminar-models/
  *   - Q4_K/Q5_K/Q6_K quantization (expect wider tolerances than Q8_0)
@@ -84,13 +84,26 @@ static const std::vector<TestConfig> kQwen35MoESingleDeviceConfigs = {
         .activation_precision = ActivationPrecision::FP32,
         .kv_cache_precision = KVCachePrecision::FP16,
     },
-    // =========================================================================
-    // GPU configs (CUDA, ROCm) — DISABLED
-    //
-    // The 35B MoE model needs ~21GB for weights alone + expert GEMM slabs.
-    // Single-GPU parity tests OOM on both 24GB (RTX 3090) and 32GB (MI100).
-    // Re-enable once weight streaming or a smaller MoE checkpoint is available.
-    // =========================================================================
+    {
+        .name = "Qwen35MoE_35B_ROCm_KV_FP16",
+        .devices = {ParityDeviceType::ROCm},
+        .parallelism = Parallelism::None,
+        .collective = Collective::None,
+        .thresholds = {
+            .cosine_threshold = 0.94f,
+            .decode_cosine_threshold = 0.96f,
+            .early_layers_count = 6,
+            .min_early_layers_passed = 5,
+            .kl_threshold = 0.05f,
+            .min_top1_accuracy = 0.80f,
+            .min_top5_accuracy = 0.60f,
+            .pytorch_top1_in_topk = 4,
+        },
+        .model_path = "/opt/llaminar-models/Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf",
+        .snapshot_dir = "pytorch_qwen35_moe_snapshots",
+        .activation_precision = ActivationPrecision::FP32,
+        .kv_cache_precision = KVCachePrecision::FP16,
+    },
 };
 
 // =============================================================================

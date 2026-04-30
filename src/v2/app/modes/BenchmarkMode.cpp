@@ -51,8 +51,14 @@ namespace llaminar2
                     benchmark.setPostWarmupCallback([orch_runner, controller, &mpi_ctx]() {
                         controller->logHistogramSummary();
 
+                        std::vector<std::vector<std::vector<bool>>> gpu_cache_masks;
+                        const int gpu_cache_experts = debugEnv().moe_rebalance.gpu_cache_experts_per_layer;
+                        const bool gpu_cache_enabled = gpu_cache_experts > 0;
+                        if (gpu_cache_enabled)
+                            gpu_cache_masks = controller->computeGpuCacheExpertMasks(gpu_cache_experts);
+
                         // Propose replicas BEFORE rebalance (which resets the histogram window)
-                        int max_replicas = debugEnv().moe_rebalance.max_replicas;
+                        int max_replicas = gpu_cache_enabled ? 0 : debugEnv().moe_rebalance.max_replicas;
                         if (max_replicas > 0)
                         {
                             auto replicas = controller->proposeReplicas(max_replicas);
@@ -97,10 +103,22 @@ namespace llaminar2
                                 controller->numLayers());
                         }
 
-                        // Apply masks (includes replicas if active)
                         int socket_id = mpi_ctx->rank();
-                        auto masks = controller->computeExpertMasks(socket_id);
-                        orch_runner->applyMoEExpertMasks(masks, received);
+
+                        // Apply masks (includes replicas if active)
+                        if (!gpu_cache_masks.empty())
+                        {
+                            if (!orch_runner->applyMoEExpertMasksForAllLocalDevices(gpu_cache_masks))
+                            {
+                                if (socket_id >= 0 && socket_id < static_cast<int>(gpu_cache_masks.size()))
+                                    orch_runner->applyMoEExpertMasks(gpu_cache_masks[socket_id], received);
+                            }
+                        }
+                        else if (!orch_runner->applyMoEExpertMasksForAllLocalDevices(*controller))
+                        {
+                            auto masks = controller->computeExpertMasks(socket_id);
+                            orch_runner->applyMoEExpertMasks(masks, received);
+                        }
 
                         // Set replica dispatch info on stages
                         if (controller->hasReplicas())

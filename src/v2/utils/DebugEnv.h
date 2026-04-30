@@ -2720,6 +2720,9 @@ namespace llaminar2
             float window_growth_factor = 1.5f;
             /// Max experts to replicate per socket (0 = auto: 2×top_k) (from LLAMINAR_MOE_REBALANCE_REPLICAS)
             int max_replicas = 0;
+            /// Routed experts per layer to cache on GPU in mixed CPU/GPU MoE domains.
+            /// 0 disables cross-domain GPU-cache placement. (from LLAMINAR_MOE_GPU_EXPERT_CACHE)
+            int gpu_cache_experts_per_layer = 0;
             /// Release raw expert weight data after VNNI packing (from LLAMINAR_MOE_RELEASE_RAW_WEIGHTS)
             /// Frees heap-allocated raw data and confirms mmap DONTNEED for mmap-backed data.
             /// Only safe when prepacked MPI transfer is available (replicas > 0).
@@ -2806,6 +2809,11 @@ namespace llaminar2
             const char *moe_reb_replicas = std::getenv("LLAMINAR_MOE_REBALANCE_REPLICAS");
             if (moe_reb_replicas)
                 moe_rebalance.max_replicas = std::atoi(moe_reb_replicas);
+            const char *moe_gpu_cache = std::getenv("LLAMINAR_MOE_GPU_EXPERT_CACHE");
+            if (!moe_gpu_cache)
+                moe_gpu_cache = std::getenv("LLAMINAR_MOE_GPU_EXPERT_CACHE_PER_LAYER");
+            if (moe_gpu_cache)
+                moe_rebalance.gpu_cache_experts_per_layer = std::atoi(moe_gpu_cache);
             const char *moe_reb_release_ctor = std::getenv("LLAMINAR_MOE_RELEASE_RAW_WEIGHTS");
             if (moe_reb_release_ctor)
                 moe_rebalance.release_raw_weights = (std::atoi(moe_reb_release_ctor) != 0);
@@ -2865,6 +2873,12 @@ namespace llaminar2
             const char *moe_reb_replicas = std::getenv("LLAMINAR_MOE_REBALANCE_REPLICAS");
             if (moe_reb_replicas)
                 moe_rebalance.max_replicas = std::atoi(moe_reb_replicas);
+            moe_rebalance.gpu_cache_experts_per_layer = 0;
+            const char *moe_gpu_cache = std::getenv("LLAMINAR_MOE_GPU_EXPERT_CACHE");
+            if (!moe_gpu_cache)
+                moe_gpu_cache = std::getenv("LLAMINAR_MOE_GPU_EXPERT_CACHE_PER_LAYER");
+            if (moe_gpu_cache)
+                moe_rebalance.gpu_cache_experts_per_layer = std::atoi(moe_gpu_cache);
             moe_rebalance.release_raw_weights = false;
             const char *moe_reb_release = std::getenv("LLAMINAR_MOE_RELEASE_RAW_WEIGHTS");
             if (moe_reb_release)

@@ -242,6 +242,113 @@ namespace llaminar2
         return masks;
     }
 
+    std::vector<std::vector<std::vector<bool>>> MoERebalanceController::computeGpuCacheExpertMasks(
+        int gpu_cache_experts_per_layer) const
+    {
+        const int num_layers = config_.num_layers;
+        const int num_experts = config_.num_experts;
+        const int num_sockets = static_cast<int>(config_.sockets.size());
+
+        std::vector<std::vector<std::vector<bool>>> masks_by_socket(num_sockets);
+        for (int s = 0; s < num_sockets; ++s)
+            masks_by_socket[s].assign(num_layers, std::vector<bool>(num_experts, false));
+
+        auto fallback = [&]() {
+            for (int s = 0; s < num_sockets; ++s)
+                masks_by_socket[s] = computeExpertMasks(s);
+            return masks_by_socket;
+        };
+
+        if (gpu_cache_experts_per_layer <= 0 || !histogram_ || num_layers <= 0 || num_experts <= 0)
+            return fallback();
+
+        std::vector<int> gpu_sockets;
+        std::vector<int> cpu_sockets;
+        for (int s = 0; s < num_sockets; ++s)
+        {
+            if (config_.sockets[s].is_gpu())
+                gpu_sockets.push_back(s);
+            else
+                cpu_sockets.push_back(s);
+        }
+
+        if (gpu_sockets.empty() || cpu_sockets.empty())
+            return fallback();
+
+        const int cache_count = std::min(gpu_cache_experts_per_layer, num_experts);
+        int total_gpu_assignments = 0;
+
+        for (int l = 0; l < num_layers; ++l)
+        {
+            auto counts = histogram_->layerHistogram(l);
+            std::vector<int> experts(num_experts);
+            std::iota(experts.begin(), experts.end(), 0);
+            std::sort(experts.begin(), experts.end(),
+                      [&](int a, int b) {
+                          if (counts[a] != counts[b])
+                              return counts[a] > counts[b];
+                          return a < b;
+                      });
+
+            std::vector<bool> gpu_cached(num_experts, false);
+            for (int i = 0; i < cache_count; ++i)
+            {
+                const int expert = experts[i];
+                gpu_cached[expert] = true;
+            }
+
+            auto assign_lpt = [&](const std::vector<int>& socket_ids,
+                                  const std::vector<int>& expert_ids) {
+                std::vector<uint64_t> loads(socket_ids.size(), 0);
+                std::vector<int> expert_counts(socket_ids.size(), 0);
+                for (int expert : expert_ids)
+                {
+                    size_t best = 0;
+                    for (size_t i = 1; i < socket_ids.size(); ++i)
+                    {
+                        if (loads[i] < loads[best] ||
+                            (loads[i] == loads[best] && expert_counts[i] < expert_counts[best]))
+                        {
+                            best = i;
+                        }
+                    }
+                    const int socket = socket_ids[best];
+                    masks_by_socket[socket][l][expert] = true;
+                    loads[best] += counts[expert];
+                    expert_counts[best]++;
+                }
+            };
+
+            std::vector<int> hot_experts;
+            hot_experts.reserve(cache_count);
+            for (int expert : experts)
+            {
+                if (gpu_cached[expert])
+                    hot_experts.push_back(expert);
+            }
+
+            std::vector<int> cold_experts;
+            cold_experts.reserve(num_experts - cache_count);
+            for (int expert : experts)
+            {
+                if (!gpu_cached[expert])
+                    cold_experts.push_back(expert);
+            }
+
+            assign_lpt(gpu_sockets, hot_experts);
+            assign_lpt(cpu_sockets, cold_experts);
+            total_gpu_assignments += static_cast<int>(hot_experts.size());
+        }
+
+        LOG_INFO("[MoERebalanceController] GPU expert cache masks: "
+                 << cache_count << "/" << num_experts << " routed experts per layer on GPU domain"
+                 << " (gpu_sockets=" << gpu_sockets.size()
+                 << ", cpu_sockets=" << cpu_sockets.size()
+                 << ", assignments=" << total_gpu_assignments << ")");
+
+        return masks_by_socket;
+    }
+
     void MoERebalanceController::rebalanceLPT()
     {
         if (!histogram_)

@@ -50,6 +50,7 @@
 #include "../../../backends/GlobalDeviceAddress.h"
 #include "../../../config/OrchestrationConfig.h"
 #include "../../../collective/ILocalPPContext.h"
+#include "../../moe/MoERebalanceController.h"
 #include "../../config/RuntimeConfig.h"
 #include "../../debug/TPSnapshot.h"
 #include "../../factory/FactoryPPStageConfig.h" // For FactoryPPStageConfig (circular-dependency-safe)
@@ -681,6 +682,12 @@ namespace llaminar2
          * Ensures all pending operations have completed.
          */
         void synchronizeDevices() override;
+
+        MoERebalanceController *moeRebalanceController() const;
+        void applyMoEExpertMasksForAllDevices(const MoERebalanceController &controller);
+        void applyMoEExpertMasksForAllDevices(
+            const std::vector<std::vector<std::vector<bool>>> &masks_by_socket);
+        void setExpertReplicaSetForAllDevices(const ExpertReplicaSet &replicas);
 
     private:
         // =====================================================================

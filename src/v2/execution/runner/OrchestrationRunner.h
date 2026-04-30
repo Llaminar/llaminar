@@ -204,6 +204,15 @@ namespace llaminar2
             const std::vector<std::vector<bool>>& masks,
             const ReceivedWeightsMap& received = {});
 
+        /// Apply MoE masks to every local device runner when the underlying
+        /// runner is a RankOrchestrator. Returns true if handled.
+        bool applyMoEExpertMasksForAllLocalDevices(const MoERebalanceController& controller);
+
+        /// Apply precomputed MoE masks to every local device runner when the
+        /// underlying runner is a RankOrchestrator. Returns true if handled.
+        bool applyMoEExpertMasksForAllLocalDevices(
+            const std::vector<std::vector<std::vector<bool>>>& masks_by_socket);
+
         /// Set expert replica info for per-token dynamic dispatch
         void setExpertReplicaSet(const ExpertReplicaSet& replicas, int socket_id);
 

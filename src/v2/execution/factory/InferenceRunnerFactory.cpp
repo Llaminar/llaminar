@@ -705,8 +705,17 @@ namespace llaminar2
                 {
                     int world_size = mpi_ctx ? mpi_ctx->world_size() : 1;
                     std::vector<DeviceId> sockets;
-                    for (int s = 0; s < world_size; ++s)
-                        sockets.push_back(DeviceId(DeviceType::CPU, s));
+                    if (local_tp_ctx && local_tp_ctx->degree() > 1)
+                    {
+                        for (const auto &device : local_tp_ctx->devices())
+                            sockets.push_back(device.toLocalDeviceId());
+                        world_size = local_tp_ctx->degree();
+                    }
+                    else
+                    {
+                        for (int s = 0; s < world_size; ++s)
+                            sockets.push_back(DeviceId(DeviceType::CPU, s));
+                    }
 
                     std::vector<int> initial_placement(graph_config.moe.num_experts);
                     int experts_per_socket = graph_config.moe.num_experts / std::max(1, world_size);

@@ -315,6 +315,111 @@ static void fillWindowWithExperts(DecodeExpertHistogram& hist, int window_size,
     }
 }
 
+static void recordExpertHits(DecodeExpertHistogram& hist, int layer,
+                             const std::vector<std::pair<int, int>>& expert_counts)
+{
+    constexpr float weight = 1.0f;
+    for (const auto& [expert, count] : expert_counts)
+    {
+        for (int i = 0; i < count; ++i)
+            hist.record(layer, &expert, &weight, 1);
+    }
+}
+
+static bool anyGpuSocketHas(const std::vector<std::vector<std::vector<bool>>>& masks,
+                            int layer, int expert)
+{
+    return masks[0][layer][expert] || masks[1][layer][expert];
+}
+
+static bool anyCpuSocketHas(const std::vector<std::vector<std::vector<bool>>>& masks,
+                            int layer, int expert)
+{
+    return masks[2][layer][expert] || masks[3][layer][expert];
+}
+
+TEST(Test__MoERebalanceController, GpuCacheMasks_AssignsHottestExpertsToGpuDomain)
+{
+    auto cfg = makeConfig(MoERebalanceMode::DYNAMIC, /*num_experts=*/8, /*num_sockets=*/4,
+                          /*num_layers=*/1, /*top_k=*/1, /*window_size=*/32);
+    cfg.sockets = {DeviceId::rocm(0), DeviceId::rocm(1), DeviceId::cpu(), DeviceId(DeviceType::CPU, 1)};
+    MoERebalanceController ctrl(cfg);
+
+    recordExpertHits(*ctrl.histogram(), 0, {{3, 12}, {5, 9}, {0, 6}, {7, 2}});
+
+    auto masks = ctrl.computeGpuCacheExpertMasks(/*gpu_cache_experts_per_layer=*/2);
+    ASSERT_EQ(static_cast<int>(masks.size()), 4);
+    ASSERT_EQ(static_cast<int>(masks[0].size()), 1);
+    ASSERT_EQ(static_cast<int>(masks[0][0].size()), 8);
+
+    EXPECT_TRUE(anyGpuSocketHas(masks, 0, 3));
+    EXPECT_TRUE(anyGpuSocketHas(masks, 0, 5));
+    EXPECT_FALSE(anyCpuSocketHas(masks, 0, 3));
+    EXPECT_FALSE(anyCpuSocketHas(masks, 0, 5));
+
+    EXPECT_TRUE(anyCpuSocketHas(masks, 0, 0));
+    EXPECT_TRUE(anyCpuSocketHas(masks, 0, 7));
+    EXPECT_FALSE(anyGpuSocketHas(masks, 0, 0));
+    EXPECT_FALSE(anyGpuSocketHas(masks, 0, 7));
+}
+
+TEST(Test__MoERebalanceController, GpuCacheMasks_SpreadsHotExpertsAcrossGpuSockets)
+{
+    auto cfg = makeConfig(MoERebalanceMode::DYNAMIC, /*num_experts=*/8, /*num_sockets=*/4,
+                          /*num_layers=*/1, /*top_k=*/1, /*window_size=*/32);
+    cfg.sockets = {DeviceId::rocm(0), DeviceId::rocm(1), DeviceId::cpu(), DeviceId(DeviceType::CPU, 1)};
+    MoERebalanceController ctrl(cfg);
+
+    recordExpertHits(*ctrl.histogram(), 0, {{0, 10}, {1, 10}, {2, 10}, {3, 10}});
+
+    auto masks = ctrl.computeGpuCacheExpertMasks(/*gpu_cache_experts_per_layer=*/4);
+    int gpu0_count = 0;
+    int gpu1_count = 0;
+    for (int e = 0; e < 4; ++e)
+    {
+        gpu0_count += masks[0][0][e] ? 1 : 0;
+        gpu1_count += masks[1][0][e] ? 1 : 0;
+    }
+
+    EXPECT_EQ(gpu0_count, 2);
+    EXPECT_EQ(gpu1_count, 2);
+}
+
+TEST(Test__MoERebalanceController, GpuCacheMasks_CanPlaceAllExpertsOnGpuDomain)
+{
+    auto cfg = makeConfig(MoERebalanceMode::DYNAMIC, /*num_experts=*/4, /*num_sockets=*/3,
+                          /*num_layers=*/1, /*top_k=*/1, /*window_size=*/16);
+    cfg.sockets = {DeviceId::rocm(0), DeviceId::cpu(), DeviceId(DeviceType::CPU, 1)};
+    MoERebalanceController ctrl(cfg);
+
+    recordExpertHits(*ctrl.histogram(), 0, {{0, 4}, {1, 3}, {2, 2}, {3, 1}});
+
+    auto masks = ctrl.computeGpuCacheExpertMasks(/*gpu_cache_experts_per_layer=*/4);
+    for (int e = 0; e < 4; ++e)
+    {
+        EXPECT_TRUE(masks[0][0][e]) << "expert " << e << " should be cached on GPU";
+        EXPECT_FALSE(masks[1][0][e]);
+        EXPECT_FALSE(masks[2][0][e]);
+    }
+}
+
+TEST(Test__MoERebalanceController, GpuCacheMasks_FallsBackWithoutMixedDomains)
+{
+    auto cfg = makeConfig(MoERebalanceMode::DYNAMIC, /*num_experts=*/8, /*num_sockets=*/2,
+                          /*num_layers=*/2, /*top_k=*/1, /*window_size=*/16);
+    MoERebalanceController ctrl(cfg);
+
+    recordExpertHits(*ctrl.histogram(), 0, {{0, 10}, {1, 8}});
+
+    auto expected_s0 = ctrl.computeExpertMasks(0);
+    auto expected_s1 = ctrl.computeExpertMasks(1);
+    auto masks = ctrl.computeGpuCacheExpertMasks(/*gpu_cache_experts_per_layer=*/2);
+
+    ASSERT_EQ(static_cast<int>(masks.size()), 2);
+    EXPECT_EQ(masks[0], expected_s0);
+    EXPECT_EQ(masks[1], expected_s1);
+}
+
 // ── rebalanceLPT() Tests ──────────────────────────────
 
 TEST(Test__MoERebalanceController, RebalanceLPT_BalancedInput_NearPerfectBalance)

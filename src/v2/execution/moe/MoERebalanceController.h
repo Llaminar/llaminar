@@ -154,6 +154,14 @@ namespace llaminar2
         /// When replicas are active, the mask includes both owned and replicated experts.
         std::vector<std::vector<bool>> computeExpertMasks(int socket_id) const;
 
+        /// Compute expert masks for all sockets with a bounded GPU routed-expert cache.
+        /// The hottest experts per layer are placed on GPU sockets up to
+        /// gpu_cache_experts_per_layer; all remaining experts are placed on CPU sockets.
+        /// If the topology does not contain both GPU and CPU sockets, falls back to
+        /// computeExpertMasks() for each socket.
+        std::vector<std::vector<std::vector<bool>>> computeGpuCacheExpertMasks(
+            int gpu_cache_experts_per_layer) const;
+
         /// Propose experts to replicate across sockets based on histogram data.
         /// Identifies the top-N hottest experts on each socket and proposes
         /// replicating them on the other socket. max_replicas_per_socket controls

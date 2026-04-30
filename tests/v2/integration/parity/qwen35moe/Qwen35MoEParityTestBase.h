@@ -49,7 +49,7 @@ namespace llaminar2::test::parity::qwen35moe
 
         void configureModel(std::shared_ptr<ModelContext> model_ctx) override
         {
-            if (Base::cfg().is_local_tp() || Base::cfg().is_cross_rank_tp())
+            if (Base::cfg().is_local_tp() || Base::cfg().is_cross_rank_tp() || Base::cfg().is_hybrid_pp_tp())
             {
                 // Use Qwen3.5 MoE schema factory for proper weight sharding
                 // (expert weights are replicated; attention weights shard like dense Qwen3.5)

@@ -208,8 +208,19 @@ namespace llaminar2
                 LOG_ERROR("[Qwen35MoEGraph] Failed to extract expert views for layer " << layer_idx);
             }
 
-            // Pre-resolve GEMM engines for all experts (avoids first-call repacking)
-            MoEExpertComputeStage::prepareExpertGemmEngines(expert_params);
+            // Pre-resolve CPU GEMM engines for all local experts.  On GPU, Qwen3.5
+            // MoE 35B cannot keep every expert for every layer resident on a 32 GiB
+            // device, so expert engines are prepared lazily for routed experts.
+            if (device.is_gpu())
+            {
+                expert_params.prepared_gate_gemm.assign(config_.moe.num_experts, nullptr);
+                expert_params.prepared_up_gemm.assign(config_.moe.num_experts, nullptr);
+                expert_params.prepared_down_gemm.assign(config_.moe.num_experts, nullptr);
+            }
+            else
+            {
+                MoEExpertComputeStage::prepareExpertGemmEngines(expert_params);
+            }
 
             graph.addNode(prefix + "moe_expert_ffn",
                           ComputeStageFactory::createMoEExpertCompute(expert_params),

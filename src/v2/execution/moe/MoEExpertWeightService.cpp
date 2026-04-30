@@ -146,6 +146,50 @@ static void auditExpertNUMA(
     }
 }
 
+static size_t quantizedViewRawBytes(const TensorBase& tensor)
+{
+    const size_t reported = tensor.size_bytes();
+    if (reported > 0)
+        return reported;
+
+    const auto& shape = tensor.shape();
+    if (shape.size() != 2)
+        return 0;
+
+    const size_t rows = shape[0];
+    const size_t cols = shape[1];
+    auto bytes_for = [rows, cols](size_t block_size, size_t block_bytes) -> size_t
+    {
+        const size_t blocks_per_row = (cols + block_size - 1) / block_size;
+        return rows * blocks_per_row * block_bytes;
+    };
+
+    switch (tensor.native_type())
+    {
+    case TensorType::IQ4_NL: return bytes_for(IQ4_NLBlock::BLOCK_SIZE, sizeof(IQ4_NLBlock));
+    case TensorType::IQ4_XS: return bytes_for(IQ4_XSBlock::BLOCK_SIZE, sizeof(IQ4_XSBlock));
+    case TensorType::Q8_0: return bytes_for(Q8_0Block::BLOCK_SIZE, sizeof(Q8_0Block));
+    case TensorType::Q4_0: return bytes_for(Q4_0Block::BLOCK_SIZE, sizeof(Q4_0Block));
+    case TensorType::Q4_1: return bytes_for(Q4_1Block::BLOCK_SIZE, sizeof(Q4_1Block));
+    case TensorType::Q5_0: return bytes_for(Q5_0Block::BLOCK_SIZE, sizeof(Q5_0Block));
+    case TensorType::Q5_1: return bytes_for(Q5_1Block::BLOCK_SIZE, sizeof(Q5_1Block));
+    case TensorType::Q2_K: return bytes_for(Q2_KBlock::BLOCK_SIZE, sizeof(Q2_KBlock));
+    case TensorType::Q3_K: return bytes_for(Q3_KBlock::BLOCK_SIZE, sizeof(Q3_KBlock));
+    case TensorType::Q4_K: return bytes_for(Q4_KBlock::BLOCK_SIZE, sizeof(Q4_KBlock));
+    case TensorType::Q5_K: return bytes_for(Q5_KBlock::BLOCK_SIZE, sizeof(Q5_KBlock));
+    case TensorType::Q6_K: return bytes_for(Q6_KBlock::BLOCK_SIZE, sizeof(Q6_KBlock));
+    case TensorType::Q8_K: return bytes_for(Q8_KBlock::BLOCK_SIZE, sizeof(Q8_KBlock));
+    case TensorType::IQ2_XXS: return bytes_for(IQ2_XXSBlock::BLOCK_SIZE, sizeof(IQ2_XXSBlock));
+    case TensorType::IQ2_XS: return bytes_for(IQ2_XSBlock::BLOCK_SIZE, sizeof(IQ2_XSBlock));
+    case TensorType::IQ2_S: return bytes_for(IQ2_SBlock::BLOCK_SIZE, sizeof(IQ2_SBlock));
+    case TensorType::IQ3_XXS: return bytes_for(IQ3_XXSBlock::BLOCK_SIZE, sizeof(IQ3_XXSBlock));
+    case TensorType::IQ3_S: return bytes_for(IQ3_SBlock::BLOCK_SIZE, sizeof(IQ3_SBlock));
+    case TensorType::IQ1_S: return bytes_for(IQ1_SBlock::BLOCK_SIZE, sizeof(IQ1_SBlock));
+    case TensorType::IQ1_M: return bytes_for(IQ1_MBlock::BLOCK_SIZE, sizeof(IQ1_MBlock));
+    default: return 0;
+    }
+}
+
 } // anonymous namespace
 
 // =========================================================================
@@ -686,7 +730,13 @@ bool MoEExpertWeightService::registerAndPrepareNewExpertsGPU(
 
             const int N = static_cast<int>(view->rows());
             const int K = static_cast<int>(view->cols());
-            const size_t raw_bytes = view->size_bytes();
+            const size_t raw_bytes = quantizedViewRawBytes(*view);
+            if (raw_bytes == 0)
+            {
+                LOG_ERROR("[MoEWeightService::GPU-rebalance] Could not determine raw byte size for expert "
+                          << e << " " << grp.label);
+                return false;
+            }
             const std::string slot_name = std::string(grp.label) + "_e" + std::to_string(e);
 
             orchestrator->planWeight(gpu_ordinal, slot_name, N, K,
@@ -731,7 +781,7 @@ bool MoEExpertWeightService::registerAndPrepareNewExpertsGPU(
             WeightJob job;
             job.name = slot_name;
             job.host_raw_data = view->raw_data();
-            job.raw_bytes = view->size_bytes();
+            job.raw_bytes = quantizedViewRawBytes(*view);
             job.format = *repack_fmt;
             job.N = static_cast<int>(view->rows());
             job.K = static_cast<int>(view->cols());
@@ -922,7 +972,13 @@ bool MoEExpertWeightService::prepareGemmEnginesGPU(MoEWeightContext& ctx)
 
             const int N = static_cast<int>(view->rows());
             const int K = static_cast<int>(view->cols());
-            const size_t raw_bytes = view->size_bytes();
+            const size_t raw_bytes = quantizedViewRawBytes(*view);
+            if (raw_bytes == 0)
+            {
+                LOG_ERROR("[MoEWeightService::GPU] Could not determine raw byte size for expert "
+                          << e << " " << grp.label);
+                return false;
+            }
 
             // Unique name per expert per group
             const std::string slot_name = std::string(grp.label) + "_e" + std::to_string(e);
@@ -967,7 +1023,7 @@ bool MoEExpertWeightService::prepareGemmEnginesGPU(MoEWeightContext& ctx)
             WeightJob job;
             job.name = slot_name;
             job.host_raw_data = view->raw_data();
-            job.raw_bytes = view->size_bytes();
+            job.raw_bytes = quantizedViewRawBytes(*view);
             job.format = *repack_fmt;
             job.N = static_cast<int>(view->rows());
             job.K = static_cast<int>(view->cols());
