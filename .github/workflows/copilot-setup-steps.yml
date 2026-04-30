@@ -89,11 +89,17 @@ jobs:
             g++-${GCC_VERSION} \
             cpp-${GCC_VERSION} \
             gfortran-${GCC_VERSION}
-          sudo update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-${GCC_VERSION} 150 \
-            --slave /usr/bin/g++ g++ /usr/bin/g++-${GCC_VERSION} \
-            --slave /usr/bin/cpp cpp /usr/bin/cpp-${GCC_VERSION} \
-            --slave /usr/bin/gfortran gfortran /usr/bin/gfortran-${GCC_VERSION}
+
+          sudo update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-${GCC_VERSION} 150
+          sudo update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-${GCC_VERSION} 150
+          sudo update-alternatives --install /usr/bin/cpp cpp /usr/bin/cpp-${GCC_VERSION} 150
+          sudo update-alternatives --install /usr/bin/gfortran gfortran /usr/bin/gfortran-${GCC_VERSION} 150
+
           sudo update-alternatives --set gcc /usr/bin/gcc-${GCC_VERSION}
+          sudo update-alternatives --set g++ /usr/bin/g++-${GCC_VERSION}
+          sudo update-alternatives --set cpp /usr/bin/cpp-${GCC_VERSION}
+          sudo update-alternatives --set gfortran /usr/bin/gfortran-${GCC_VERSION}
+
           sudo apt-get clean
           sudo rm -rf /var/lib/apt/lists/*
 
