@@ -1907,9 +1907,12 @@ namespace llaminar2
             // Ensure weights converted
             ensureWeightsConverted();
 
-            logArchitectureAndDispatch("fp32_to_fp32",
-                                       (m == 1) ? selectDecodeDispatchPath(m, n, k) : selectPrefillDispatchPath(m, n, k),
-                                       m, n, k);
+            if (Logger::getInstance().shouldLog(LogLevel::VERBOSITY_DEBUG))
+            {
+                logArchitectureAndDispatch("fp32_to_fp32",
+                                           (m == 1) ? selectDecodeDispatchPath(m, n, k) : selectPrefillDispatchPath(m, n, k),
+                                           m, n, k);
+            }
 
             // ──── cuBLAS FP16 GEMM path (LLAMINAR_CUBLAS_GEMM=1) ────────────
             // Dequant Q4_0 native VNNI weights → FP16 per-call,
@@ -2012,9 +2015,12 @@ namespace llaminar2
             // Ensure weights converted
             ensureWeightsConverted();
 
-            logArchitectureAndDispatch("fp32_to_fp32_with_bias",
-                                       (m == 1) ? selectDecodeDispatchPath(m, n, k) : selectPrefillDispatchPath(m, n, k),
-                                       m, n, k);
+            if (Logger::getInstance().shouldLog(LogLevel::VERBOSITY_DEBUG))
+            {
+                logArchitectureAndDispatch("fp32_to_fp32_with_bias",
+                                           (m == 1) ? selectDecodeDispatchPath(m, n, k) : selectPrefillDispatchPath(m, n, k),
+                                           m, n, k);
+            }
 
             // Use blockwise quantization whenever K is block-aligned.
             const bool use_blockwise =

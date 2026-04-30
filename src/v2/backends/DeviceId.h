@@ -80,7 +80,7 @@ namespace llaminar2
     {
         DeviceType type;
         int ordinal; // GPU ordinal (0-based), 0 for CPU, -1 for invalid
-        std::optional<DeviceArchInfo> arch; // Descriptive metadata, not identity.
+        std::optional<DeviceArchInfo> arch_metadata; // Descriptive metadata, not identity.
 
         // =========================================================================
         // Default constructor creates INVALID device (breaks silent CPU fallback)
@@ -95,7 +95,7 @@ namespace llaminar2
 
         /// Explicit construction with descriptive architecture metadata.
         DeviceId(DeviceType t, int ord, const DeviceArchInfo &arch_info)
-            : type(t), ordinal(ord), arch(arch_info) {}
+            : type(t), ordinal(ord), arch_metadata(arch_info) {}
 
         // Factory methods for clarity (preferred way to create DeviceIds)
         static DeviceId cpu() { return {DeviceType::CPU, 0}; }
@@ -111,13 +111,13 @@ namespace llaminar2
         bool is_rocm() const { return type == DeviceType::ROCm && ordinal >= 0; }
         bool is_gpu() const { return (type == DeviceType::CUDA || type == DeviceType::ROCm) && ordinal >= 0; }
         bool is_valid() const { return ordinal >= 0; }
-        bool has_arch_info() const { return arch.has_value(); }
-        const DeviceArchInfo *arch_info() const { return arch ? &(*arch) : nullptr; }
+        bool has_arch_info() const { return arch_metadata.has_value(); }
+        const DeviceArchInfo *arch_info() const { return arch_metadata ? &(*arch_metadata) : nullptr; }
 
         DeviceId with_arch_info(const DeviceArchInfo &arch_info) const
         {
             DeviceId copy = *this;
-            copy.arch = arch_info;
+            copy.arch_metadata = arch_info;
             return copy;
         }
 

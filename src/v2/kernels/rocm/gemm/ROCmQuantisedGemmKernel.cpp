@@ -1306,7 +1306,10 @@ namespace llaminar2
             }
 
             const PrefillDispatchPath path = selectPrefillDispatchPath(m, n, k);
-            logArchitectureAndDispatch(callsite, path, m, n, k);
+            if (Logger::getInstance().shouldLog(LogLevel::VERBOSITY_DEBUG))
+            {
+                logArchitectureAndDispatch(callsite, path, m, n, k);
+            }
             record_path_selected(path);
             bool native_ok = false;
             const bool profiling_enabled = debugEnv().profile.enabled;
