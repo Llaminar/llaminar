@@ -206,11 +206,7 @@ jobs:
 
       - name: Install Python packages
         run: |
-          pip3 install --user --break-system-packages \
-            conan \
-            numpy \
-            matplotlib \
-            pytest
+          bash ./.devcontainer/setup-python-env.sh
 
       - name: Verify installations
         run: |
