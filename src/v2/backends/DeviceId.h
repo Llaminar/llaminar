@@ -51,7 +51,7 @@ namespace llaminar2
         int multiprocessor_count = 0; // SM count for CUDA, CU count for ROCm.
         int warp_or_wave_size = 0;
 
-        bool valid() const { return ordinal >= 0; }
+        bool is_populated() const { return ordinal >= 0; }
 
         std::string arch_string() const
         {

@@ -31,6 +31,13 @@
 
 namespace llaminar2
 {
+    namespace
+    {
+        std::pair<int, int> splitComputeCapability(int capability)
+        {
+            return {capability / 10, capability % 10};
+        }
+    }
 
     // =========================================================================
     // Singleton Instance
@@ -210,7 +217,7 @@ namespace llaminar2
             DeviceInfo info;
             info.name = dev.name;
             info.numa_affinity = numa_node;
-            info.compute_capability = {dev.compute_capability / 10, dev.compute_capability % 10};
+            info.compute_capability = splitComputeCapability(dev.compute_capability);
             info.arch_info = dev.arch_info;
 
             // Get memory and compute capability from backend
@@ -253,7 +260,7 @@ namespace llaminar2
             DeviceInfo info;
             info.name = dev.name;
             info.numa_affinity = numa_node;
-            info.compute_capability = {dev.compute_capability / 10, dev.compute_capability % 10};
+            info.compute_capability = splitComputeCapability(dev.compute_capability);
             info.arch_info = dev.arch_info;
 
             // Get memory from backend

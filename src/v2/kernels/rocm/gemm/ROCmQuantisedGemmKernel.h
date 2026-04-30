@@ -665,6 +665,7 @@ namespace llaminar2
             PrefillDispatchPath selectPrefillDispatchPath(int m, int n, int k) const;
             const char *prefillDispatchPathName(PrefillDispatchPath path) const;
             void logArchitectureAndDispatch(const char *context, PrefillDispatchPath path, int m, int n, int k) const;
+            void bindTargetDevice(DeviceId device_id);
 
             /**
              * @brief Attempt native INT8 VNNI prefill execution for M>1.

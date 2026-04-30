@@ -1015,9 +1015,7 @@ namespace llaminar2
         ROCmQuantisedGemmKernel::ROCmQuantisedGemmKernel(const TensorBase *weights, DeviceId device_id)
             : ROCmQuantisedGemmKernel(weights, device_id.rocm_ordinal())
         {
-            target_device_ = device_id;
-            LOG_DEBUG("[ROCmQuantisedGemmKernel] Bound metadata device=" << target_device_.toString()
-                                                                        << " arch=" << (target_device_.arch_info() ? target_device_.arch_info()->arch_string() : "unknown"));
+            bindTargetDevice(device_id);
         }
 
         ROCmQuantisedGemmKernel::ROCmQuantisedGemmKernel(ROCmPackedWeights *packed, int rocm_device_id)
@@ -1049,9 +1047,7 @@ namespace llaminar2
         ROCmQuantisedGemmKernel::ROCmQuantisedGemmKernel(ROCmPackedWeights *packed, DeviceId device_id)
             : ROCmQuantisedGemmKernel(packed, device_id.rocm_ordinal())
         {
-            target_device_ = device_id;
-            LOG_DEBUG("[ROCmQuantisedGemmKernel] Bound metadata device=" << target_device_.toString()
-                                                                        << " arch=" << (target_device_.arch_info() ? target_device_.arch_info()->arch_string() : "unknown"));
+            bindTargetDevice(device_id);
         }
 
         ROCmQuantisedGemmKernel::ROCmQuantisedGemmKernel(
@@ -1095,9 +1091,7 @@ namespace llaminar2
                                       d_native_mins, d_native_emins, codebook_id, blocks_per_row,
                                       std::move(lifetime_owner))
         {
-            target_device_ = device_id;
-            LOG_DEBUG("[ROCmQuantisedGemmKernel] Bound metadata device=" << target_device_.toString()
-                                                                        << " arch=" << (target_device_.arch_info() ? target_device_.arch_info()->arch_string() : "unknown"));
+            bindTargetDevice(device_id);
         }
 
         ROCmQuantisedGemmKernel::~ROCmQuantisedGemmKernel() = default;
@@ -1140,6 +1134,13 @@ namespace llaminar2
                                                    << " gcnArchName=" << (arch ? arch->gcn_arch_name : "")
                                                    << " path=" << prefillDispatchPathName(path)
                                                    << " M=" << m << " N=" << n << " K=" << k);
+        }
+
+        void ROCmQuantisedGemmKernel::bindTargetDevice(DeviceId device_id)
+        {
+            target_device_ = device_id;
+            LOG_DEBUG("[ROCmQuantisedGemmKernel] Bound metadata device=" << target_device_.toString()
+                                                                        << " arch=" << (target_device_.arch_info() ? target_device_.arch_info()->arch_string() : "unknown"));
         }
 
         ROCmQuantisedGemmKernel::PrefillDispatchPath ROCmQuantisedGemmKernel::selectPrefillDispatchPath(int m, int n, int k) const

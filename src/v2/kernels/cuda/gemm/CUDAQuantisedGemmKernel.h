@@ -416,6 +416,7 @@ namespace llaminar2
             DispatchPath selectPrefillDispatchPath(int m, int n, int k) const;
             const char *dispatchPathName(DispatchPath path) const;
             void logArchitectureAndDispatch(const char *context, DispatchPath path, int m, int n, int k) const;
+            void bindTargetDevice(DeviceId device_id);
 
             // =========================================================================
             // Internal dispatch methods

@@ -622,6 +622,13 @@ namespace llaminar2
                                                    << " M=" << m << " N=" << n << " K=" << k);
         }
 
+        void CUDAQuantisedGemmKernel::bindTargetDevice(DeviceId device_id)
+        {
+            target_device_ = device_id;
+            LOG_DEBUG("[CUDAQuantisedGemmKernel] Bound metadata device=" << target_device_.toString()
+                                                                        << " arch=" << (target_device_.arch_info() ? target_device_.arch_info()->arch_string() : "unknown"));
+        }
+
         // =====================================================================
         // Constructor / Destructor
         // =====================================================================
@@ -687,9 +694,7 @@ namespace llaminar2
         CUDAQuantisedGemmKernel::CUDAQuantisedGemmKernel(const TensorBase *weights, DeviceId device_id)
             : CUDAQuantisedGemmKernel(weights, device_id.cuda_ordinal())
         {
-            target_device_ = device_id;
-            LOG_DEBUG("[CUDAQuantisedGemmKernel] Bound metadata device=" << target_device_.toString()
-                                                                        << " arch=" << (target_device_.arch_info() ? target_device_.arch_info()->arch_string() : "unknown"));
+            bindTargetDevice(device_id);
         }
 
         CUDAQuantisedGemmKernel::CUDAQuantisedGemmKernel(CUDAPackedWeights *packed, int cuda_device_id)
@@ -720,9 +725,7 @@ namespace llaminar2
         CUDAQuantisedGemmKernel::CUDAQuantisedGemmKernel(CUDAPackedWeights *packed, DeviceId device_id)
             : CUDAQuantisedGemmKernel(packed, device_id.cuda_ordinal())
         {
-            target_device_ = device_id;
-            LOG_DEBUG("[CUDAQuantisedGemmKernel] Bound metadata device=" << target_device_.toString()
-                                                                        << " arch=" << (target_device_.arch_info() ? target_device_.arch_info()->arch_string() : "unknown"));
+            bindTargetDevice(device_id);
         }
 
         CUDAQuantisedGemmKernel::CUDAQuantisedGemmKernel(
@@ -761,9 +764,7 @@ namespace llaminar2
             : CUDAQuantisedGemmKernel(N, K, device_id.cuda_ordinal(), d_vnni, d_scales, d_mins, d_emins,
                                       codebook_id, blocks_per_row, std::move(lifetime_owner))
         {
-            target_device_ = device_id;
-            LOG_DEBUG("[CUDAQuantisedGemmKernel] Bound metadata device=" << target_device_.toString()
-                                                                        << " arch=" << (target_device_.arch_info() ? target_device_.arch_info()->arch_string() : "unknown"));
+            bindTargetDevice(device_id);
         }
 
         CUDAQuantisedGemmKernel::~CUDAQuantisedGemmKernel() = default;
