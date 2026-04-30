@@ -16,7 +16,6 @@
 #include <stdexcept>
 #include <ostream>
 #include <optional>
-#include <utility>
 
 namespace llaminar2
 {
@@ -96,7 +95,7 @@ namespace llaminar2
 
         /// Explicit construction with descriptive architecture metadata.
         DeviceId(DeviceType t, int ord, DeviceArchInfo arch_info)
-            : type(t), ordinal(ord), arch(std::move(arch_info)) {}
+            : type(t), ordinal(ord), arch(arch_info) {}
 
         // Factory methods for clarity (preferred way to create DeviceIds)
         static DeviceId cpu() { return {DeviceType::CPU, 0}; }
@@ -118,7 +117,7 @@ namespace llaminar2
         DeviceId with_arch_info(DeviceArchInfo arch_info) const
         {
             DeviceId copy = *this;
-            copy.arch = std::move(arch_info);
+            copy.arch = arch_info;
             return copy;
         }
 
