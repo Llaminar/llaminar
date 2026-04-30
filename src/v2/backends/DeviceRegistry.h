@@ -34,6 +34,7 @@
 #include <mutex>
 #include <unordered_map>
 #include <memory>
+#include <optional>
 
 namespace llaminar2
 {
@@ -104,6 +105,21 @@ namespace llaminar2
          */
         std::optional<GlobalDeviceAddress> defaultDevice(DeviceType type) const;
 
+        /**
+         * @brief Return architecture metadata for a local DeviceId if discovered.
+         *
+         * Metadata is descriptive only; DeviceId identity remains (type, ordinal).
+         */
+        std::optional<DeviceArchInfo> archInfo(DeviceId device) const;
+
+        /**
+         * @brief Return a copy of DeviceId enriched with discovered metadata.
+         *
+         * If the registry has no metadata for the device, returns the original
+         * DeviceId unchanged.
+         */
+        DeviceId resolve(DeviceId device) const;
+
     private:
         DeviceRegistry();
         ~DeviceRegistry() = default;
@@ -138,6 +154,7 @@ namespace llaminar2
             int numa_affinity = -1;
             std::string pcie_bus_id;
             std::pair<int, int> compute_capability{0, 0};
+            std::optional<DeviceArchInfo> arch_info;
             bool available = true;
         };
         std::unordered_map<std::string, DeviceInfo> device_info_;

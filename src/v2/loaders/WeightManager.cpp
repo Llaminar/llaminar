@@ -13,6 +13,7 @@
 #include "../tensors/TensorSlice.h"
 #include "../kernels/KernelFactory.h"
 #include "../backends/BackendManager.h"
+#include "../backends/DeviceRegistry.h"
 
 // GPU weight loading pipeline
 #include "gpu_pipeline/LoadOrchestrator.h"
@@ -3138,6 +3139,7 @@ namespace llaminar2
             const int N = static_cast<int>(tensor->rows());
             const int K = static_cast<int>(tensor->cols());
             const uint32_t blocks_per_row = static_cast<uint32_t>(K / 32);
+            const DeviceId resolved_target_device = DeviceRegistry::instance().resolve(target_device);
 
             std::unique_ptr<ITensorGemm> kernel;
 
@@ -3145,7 +3147,7 @@ namespace llaminar2
             if (target_device.is_rocm())
             {
                 kernel = std::make_unique<llaminar2::rocm::ROCmQuantisedGemmKernel>(
-                    N, K, target_device.ordinal,
+                    N, K, resolved_target_device,
                     slot->d_native_vnni_payload,
                     slot->d_native_vnni_scales,
                     slot->d_native_vnni_mins,
@@ -3159,7 +3161,7 @@ namespace llaminar2
             if (target_device.is_cuda())
             {
                 kernel = std::make_unique<llaminar2::cuda::CUDAQuantisedGemmKernel>(
-                    N, K, target_device.ordinal,
+                    N, K, resolved_target_device,
                     slot->d_native_vnni_payload,
                     static_cast<uint16_t *>(slot->d_native_vnni_scales),
                     static_cast<uint16_t *>(slot->d_native_vnni_mins),

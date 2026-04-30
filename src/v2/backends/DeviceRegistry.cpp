@@ -210,6 +210,8 @@ namespace llaminar2
             DeviceInfo info;
             info.name = dev.name;
             info.numa_affinity = numa_node;
+            info.compute_capability = {dev.compute_capability / 10, dev.compute_capability % 10};
+            info.arch_info = dev.arch_info;
 
             // Get memory and compute capability from backend
             IBackend *backend = getCUDABackend();
@@ -251,6 +253,8 @@ namespace llaminar2
             DeviceInfo info;
             info.name = dev.name;
             info.numa_affinity = numa_node;
+            info.compute_capability = {dev.compute_capability / 10, dev.compute_capability % 10};
+            info.arch_info = dev.arch_info;
 
             // Get memory from backend
             IBackend *backend = getROCmBackend();
@@ -511,6 +515,41 @@ namespace llaminar2
         }
 
         return std::nullopt;
+    }
+
+    std::optional<DeviceArchInfo> DeviceRegistry::archInfo(DeviceId device) const
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+
+        if (!device.is_gpu())
+        {
+            return std::nullopt;
+        }
+
+        for (const auto &addr : devices_)
+        {
+            if (addr.device_type == device.type && addr.device_ordinal == device.ordinal)
+            {
+                const DeviceInfo *info = findInfo(addr);
+                if (info && info->arch_info)
+                {
+                    return info->arch_info;
+                }
+                return std::nullopt;
+            }
+        }
+
+        return std::nullopt;
+    }
+
+    DeviceId DeviceRegistry::resolve(DeviceId device) const
+    {
+        auto info = archInfo(device);
+        if (!info)
+        {
+            return device;
+        }
+        return device.with_arch_info(*info);
     }
 
     // =========================================================================

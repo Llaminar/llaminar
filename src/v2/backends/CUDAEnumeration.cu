@@ -55,6 +55,15 @@ namespace llaminar2
                 dev.device_id = i;
                 dev.compute_capability = prop.major * 10 + prop.minor;
                 dev.total_memory_bytes = prop.totalGlobalMem;
+                dev.arch_info.type = DeviceType::CUDA;
+                dev.arch_info.ordinal = i;
+                dev.arch_info.device_name = dev.name;
+                dev.arch_info.cc_major = prop.major;
+                dev.arch_info.cc_minor = prop.minor;
+                dev.arch_info.sm = dev.compute_capability;
+                dev.arch_info.sm_string = "sm_" + std::to_string(dev.arch_info.sm);
+                dev.arch_info.multiprocessor_count = prop.multiProcessorCount;
+                dev.arch_info.warp_or_wave_size = prop.warpSize;
 
                 // Get free memory
                 size_t free_bytes = 0, total_bytes = 0;
@@ -72,6 +81,11 @@ namespace llaminar2
                 dev.supports_fp16 = (prop.major >= 6); // Pascal (SM 6.0+)
                 dev.supports_bf16 = (prop.major >= 8); // Ampere (SM 8.0+)
                 dev.supports_int8 = (prop.major >= 6); // DP4A on Pascal+
+                dev.arch_info.supports_dp4a = (dev.compute_capability >= 61);
+                dev.arch_info.supports_wmma = (dev.compute_capability >= 70);
+                dev.arch_info.supports_mfma = false;
+                dev.arch_info.supports_int8_tensor_cores = (dev.compute_capability >= 75);
+                dev.arch_info.supports_native_vnni = dev.arch_info.supports_dp4a;
 
                 LOG_INFO("[CUDA] Device " << i << ": " << dev.name
                                           << " (SM " << prop.major << "." << prop.minor

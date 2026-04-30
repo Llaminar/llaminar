@@ -95,6 +95,7 @@
 #include "../../../tensors/TensorKernels.h"
 #include "../../../tensors/BlockStructures.h"
 #include "../../../interfaces/IWorkspaceConsumer.h"
+#include "../../../backends/DeviceId.h"
 
 #include <memory>
 #include <cstdint>
@@ -353,6 +354,7 @@ namespace llaminar2
              */
             [[deprecated("Use KernelFactory::getOrCreatePreparedGemmWeights() + getOrCreateGemmEngine(), or pre-pack via ROCmPackedWeights.")]]
             ROCmQuantisedGemmKernel(const TensorBase *weights, int rocm_device_id);
+            ROCmQuantisedGemmKernel(const TensorBase *weights, DeviceId device_id);
 
             /**
              * @brief Construct kernel from pre-packed INT8 weights (PREFERRED)
@@ -366,6 +368,7 @@ namespace llaminar2
              * @throws std::runtime_error if packed is null or has invalid dimensions
              */
             ROCmQuantisedGemmKernel(ROCmPackedWeights *packed, int rocm_device_id);
+            ROCmQuantisedGemmKernel(ROCmPackedWeights *packed, DeviceId device_id);
 
             /**
              * @brief Construct kernel from pre-uploaded device pointers (MoE batch path)
@@ -387,6 +390,12 @@ namespace llaminar2
              */
             ROCmQuantisedGemmKernel(
                 int N, int K, int rocm_device_id,
+                uint8_t *d_native_vnni, void *d_native_scales,
+                void *d_native_mins, void *d_native_emins,
+                uint8_t codebook_id, uint32_t blocks_per_row,
+                std::shared_ptr<void> lifetime_owner);
+            ROCmQuantisedGemmKernel(
+                int N, int K, DeviceId device_id,
                 uint8_t *d_native_vnni, void *d_native_scales,
                 void *d_native_mins, void *d_native_emins,
                 uint8_t codebook_id, uint32_t blocks_per_row,
@@ -654,6 +663,8 @@ namespace llaminar2
              * @return Selected prefill dispatch path.
              */
             PrefillDispatchPath selectPrefillDispatchPath(int m, int n, int k) const;
+            const char *prefillDispatchPathName(PrefillDispatchPath path) const;
+            void logArchitectureAndDispatch(const char *context, PrefillDispatchPath path, int m, int n, int k) const;
 
             /**
              * @brief Attempt native INT8 VNNI prefill execution for M>1.
@@ -758,6 +769,7 @@ namespace llaminar2
             const TensorBase *weights_ = nullptr; // Original weight tensor (null if using packed_)
             ROCmPackedWeights *packed_ = nullptr; // Pre-packed weights (owned by tensor cache)
             std::shared_ptr<void> lifetime_owner_; // Keeps shared MoE batch allocation alive
+            DeviceId target_device_;
             int rocm_device_id_;
             size_t N_; // Output features (weight rows)
             size_t K_; // Input features (weight cols)

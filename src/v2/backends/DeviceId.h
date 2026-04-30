@@ -15,9 +15,59 @@
 #include <string>
 #include <stdexcept>
 #include <ostream>
+#include <optional>
+#include <utility>
 
 namespace llaminar2
 {
+    /**
+     * @brief Descriptive hardware architecture metadata for a DeviceId.
+     *
+     * This metadata is intentionally NOT part of DeviceId identity. Equality,
+     * ordering, and hashing for DeviceId continue to use only (type, ordinal).
+     */
+    struct DeviceArchInfo
+    {
+        DeviceType type = DeviceType::CPU;
+        int ordinal = -1;
+        std::string device_name;
+
+        // CUDA architecture information.
+        int cc_major = 0;
+        int cc_minor = 0;
+        int sm = 0;
+        std::string sm_string;
+
+        // ROCm architecture information.
+        std::string gcn_arch_name;
+
+        // Common capability flags used by runtime dispatch.
+        bool supports_dp4a = false;
+        bool supports_wmma = false;
+        bool supports_mfma = false;
+        bool supports_int8_tensor_cores = false;
+        bool supports_native_vnni = false;
+
+        // Optional topology/execution details.
+        int multiprocessor_count = 0; // SM count for CUDA, CU count for ROCm.
+        int warp_or_wave_size = 0;
+
+        bool valid() const { return ordinal >= 0; }
+
+        std::string arch_string() const
+        {
+            if (!gcn_arch_name.empty())
+            {
+                return gcn_arch_name;
+            }
+            if (!sm_string.empty())
+            {
+                return sm_string;
+            }
+            return "unknown";
+        }
+    };
+
     /**
      * @brief Type-safe device identifier
      *
@@ -31,6 +81,7 @@ namespace llaminar2
     {
         DeviceType type;
         int ordinal; // GPU ordinal (0-based), 0 for CPU, -1 for invalid
+        std::optional<DeviceArchInfo> arch; // Descriptive metadata, not identity.
 
         // =========================================================================
         // Default constructor creates INVALID device (breaks silent CPU fallback)
@@ -42,6 +93,10 @@ namespace llaminar2
 
         /// Explicit construction (use factory methods instead)
         DeviceId(DeviceType t, int ord) : type(t), ordinal(ord) {}
+
+        /// Explicit construction with descriptive architecture metadata.
+        DeviceId(DeviceType t, int ord, DeviceArchInfo arch_info)
+            : type(t), ordinal(ord), arch(std::move(arch_info)) {}
 
         // Factory methods for clarity (preferred way to create DeviceIds)
         static DeviceId cpu() { return {DeviceType::CPU, 0}; }
@@ -57,6 +112,15 @@ namespace llaminar2
         bool is_rocm() const { return type == DeviceType::ROCm && ordinal >= 0; }
         bool is_gpu() const { return (type == DeviceType::CUDA || type == DeviceType::ROCm) && ordinal >= 0; }
         bool is_valid() const { return ordinal >= 0; }
+        bool has_arch_info() const { return arch.has_value(); }
+        const DeviceArchInfo *arch_info() const { return arch ? &(*arch) : nullptr; }
+
+        DeviceId with_arch_info(DeviceArchInfo arch_info) const
+        {
+            DeviceId copy = *this;
+            copy.arch = std::move(arch_info);
+            return copy;
+        }
 
         // Get CUDA device ordinal - throws if not valid CUDA
         int cuda_ordinal() const

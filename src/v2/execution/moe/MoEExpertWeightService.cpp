@@ -17,6 +17,7 @@
 #include "../../loaders/MmapRegion.h"
 #include "../../loaders/gpu_pipeline/LoadOrchestrator.h"
 #include "../../backends/BackendManager.h"
+#include "../../backends/DeviceRegistry.h"
 #include "../../utils/Assertions.h"
 #include "../../utils/DebugEnv.h"
 #include "../../utils/Logger.h"
@@ -772,6 +773,7 @@ bool MoEExpertWeightService::registerAndPrepareNewExpertsGPU(
             const int N = static_cast<int>(view->rows());
             const int K = static_cast<int>(view->cols());
             const uint32_t blocks_per_row = static_cast<uint32_t>(K / 32);
+            const DeviceId resolved_device = DeviceRegistry::instance().resolve(ctx.device_id);
 
             std::shared_ptr<ITensorGemm> kernel;
 
@@ -779,7 +781,7 @@ bool MoEExpertWeightService::registerAndPrepareNewExpertsGPU(
             if (ctx.device_id.is_cuda())
             {
                 kernel = std::make_shared<llaminar2::cuda::CUDAQuantisedGemmKernel>(
-                    N, K, gpu_ordinal,
+                    N, K, resolved_device,
                     slot->d_native_vnni_payload,
                     static_cast<uint16_t*>(slot->d_native_vnni_scales),
                     static_cast<uint16_t*>(slot->d_native_vnni_mins),
@@ -792,7 +794,7 @@ bool MoEExpertWeightService::registerAndPrepareNewExpertsGPU(
             if (ctx.device_id.is_rocm())
             {
                 kernel = std::make_shared<llaminar2::rocm::ROCmQuantisedGemmKernel>(
-                    N, K, gpu_ordinal,
+                    N, K, resolved_device,
                     slot->d_native_vnni_payload,
                     slot->d_native_vnni_scales,
                     slot->d_native_vnni_mins,
@@ -1008,6 +1010,7 @@ bool MoEExpertWeightService::prepareGemmEnginesGPU(MoEWeightContext& ctx)
             const int N = static_cast<int>(view->rows());
             const int K = static_cast<int>(view->cols());
             const uint32_t blocks_per_row = static_cast<uint32_t>(K / 32);
+            const DeviceId resolved_device = DeviceRegistry::instance().resolve(ctx.device_id);
 
             std::shared_ptr<ITensorGemm> kernel;
 
@@ -1015,7 +1018,7 @@ bool MoEExpertWeightService::prepareGemmEnginesGPU(MoEWeightContext& ctx)
             if (ctx.device_id.is_cuda())
             {
                 kernel = std::make_shared<llaminar2::cuda::CUDAQuantisedGemmKernel>(
-                    N, K, gpu_ordinal,
+                    N, K, resolved_device,
                     slot->d_native_vnni_payload,
                     static_cast<uint16_t*>(slot->d_native_vnni_scales),
                     static_cast<uint16_t*>(slot->d_native_vnni_mins),
@@ -1028,7 +1031,7 @@ bool MoEExpertWeightService::prepareGemmEnginesGPU(MoEWeightContext& ctx)
             if (ctx.device_id.is_rocm())
             {
                 kernel = std::make_shared<llaminar2::rocm::ROCmQuantisedGemmKernel>(
-                    N, K, gpu_ordinal,
+                    N, K, resolved_device,
                     slot->d_native_vnni_payload,
                     slot->d_native_vnni_scales,
                     slot->d_native_vnni_mins,
@@ -1157,8 +1160,9 @@ bool MoEExpertWeightService::transferExpertsGPUDirect(
             }
 
             // Create GEMM engine for the destination device pointing to transferred data
+            const DeviceId resolved_dst_device = DeviceRegistry::instance().resolve(dst_ctx.device_id);
             auto kernel = std::make_shared<ROCmQuantisedGemmKernel>(
-                dst_batch->rows_per_expert, dst_batch->K, dst_rocm,
+                dst_batch->rows_per_expert, dst_batch->K, resolved_dst_device,
                 dst_ptrs_rocm.d_native_vnni,
                 dst_ptrs_rocm.d_native_scales,
                 dst_ptrs_rocm.d_native_mins,

@@ -50,6 +50,7 @@
 #include <memory>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 
 namespace llaminar2
 {
@@ -578,6 +579,49 @@ namespace llaminar2
         void CUDAQuantisedGemmKernel::setForceCutlassFallback(bool /*enabled*/) {}
         bool CUDAQuantisedGemmKernel::isForceCutlassFallback() { return false; }
 
+        const char *CUDAQuantisedGemmKernel::dispatchPathName(DispatchPath path) const
+        {
+            switch (path)
+            {
+            case DispatchPath::NATIVE_VNNI:
+                return "native_vnni";
+            case DispatchPath::UNSUPPORTED:
+            default:
+                return "unsupported";
+            }
+        }
+
+        CUDAQuantisedGemmKernel::DispatchPath CUDAQuantisedGemmKernel::selectDecodeDispatchPath(int m, int n, int k) const
+        {
+            (void)n;
+            if (m != 1 || k <= 0 || (k % 32) != 0 || !canUseNativeVNNIBlockwise(impl_.get(), m, k))
+            {
+                return DispatchPath::UNSUPPORTED;
+            }
+            return DispatchPath::NATIVE_VNNI;
+        }
+
+        CUDAQuantisedGemmKernel::DispatchPath CUDAQuantisedGemmKernel::selectPrefillDispatchPath(int m, int n, int k) const
+        {
+            (void)n;
+            if (m <= 1 || k <= 0 || (k % 32) != 0 || !impl_ || !impl_->d_weights_native_vnni)
+            {
+                return DispatchPath::UNSUPPORTED;
+            }
+            return DispatchPath::NATIVE_VNNI;
+        }
+
+        void CUDAQuantisedGemmKernel::logArchitectureAndDispatch(const char *context, DispatchPath path, int m, int n, int k) const
+        {
+            const DeviceArchInfo *arch = target_device_.arch_info();
+            LOG_DEBUG("[CUDAQuantisedGemmKernel] " << context
+                                                   << " device=" << target_device_.toString()
+                                                   << " arch=" << (arch ? arch->arch_string() : "unknown")
+                                                   << " sm=" << (arch ? arch->sm : 0)
+                                                   << " path=" << dispatchPathName(path)
+                                                   << " M=" << m << " N=" << n << " K=" << k);
+        }
+
         // =====================================================================
         // Constructor / Destructor
         // =====================================================================
@@ -585,6 +629,7 @@ namespace llaminar2
         CUDAQuantisedGemmKernel::CUDAQuantisedGemmKernel(const TensorBase *weights, int cuda_device_id)
             : weights_(weights),
               packed_(nullptr),
+              target_device_(DeviceId::cuda(cuda_device_id)),
               cuda_device_id_(cuda_device_id),
               N_(0),
               K_(0),
@@ -639,9 +684,18 @@ namespace llaminar2
                                                                         << ") on CUDA device " << cuda_device_id_);
         }
 
+        CUDAQuantisedGemmKernel::CUDAQuantisedGemmKernel(const TensorBase *weights, DeviceId device_id)
+            : CUDAQuantisedGemmKernel(weights, device_id.cuda_ordinal())
+        {
+            target_device_ = std::move(device_id);
+            LOG_DEBUG("[CUDAQuantisedGemmKernel] Bound metadata device=" << target_device_.toString()
+                                                                        << " arch=" << (target_device_.arch_info() ? target_device_.arch_info()->arch_string() : "unknown"));
+        }
+
         CUDAQuantisedGemmKernel::CUDAQuantisedGemmKernel(CUDAPackedWeights *packed, int cuda_device_id)
             : weights_(nullptr),
               packed_(packed),
+              target_device_(DeviceId::cuda(cuda_device_id)),
               cuda_device_id_(cuda_device_id),
               N_(0),
               K_(0),
@@ -663,6 +717,14 @@ namespace llaminar2
                                                                             << " INT8 weights on CUDA device " << cuda_device_id_);
         }
 
+        CUDAQuantisedGemmKernel::CUDAQuantisedGemmKernel(CUDAPackedWeights *packed, DeviceId device_id)
+            : CUDAQuantisedGemmKernel(packed, device_id.cuda_ordinal())
+        {
+            target_device_ = std::move(device_id);
+            LOG_DEBUG("[CUDAQuantisedGemmKernel] Bound metadata device=" << target_device_.toString()
+                                                                        << " arch=" << (target_device_.arch_info() ? target_device_.arch_info()->arch_string() : "unknown"));
+        }
+
         CUDAQuantisedGemmKernel::CUDAQuantisedGemmKernel(
             int N, int K, int cuda_device_id,
             uint8_t *d_vnni, uint16_t *d_scales, uint16_t *d_mins, uint32_t *d_emins,
@@ -671,6 +733,7 @@ namespace llaminar2
             : weights_(nullptr),
               packed_(nullptr),
               lifetime_owner_(std::move(lifetime_owner)),
+              target_device_(DeviceId::cuda(cuda_device_id)),
               cuda_device_id_(cuda_device_id),
               N_(static_cast<size_t>(N)),
               K_(static_cast<size_t>(K)),
@@ -688,6 +751,19 @@ namespace llaminar2
 
             LOG_DEBUG("[CUDAQuantisedGemmKernel] Created (MoE batch) for " << N_ << "x" << K_
                                                                            << " on CUDA device " << cuda_device_id_);
+        }
+
+        CUDAQuantisedGemmKernel::CUDAQuantisedGemmKernel(
+            int N, int K, DeviceId device_id,
+            uint8_t *d_vnni, uint16_t *d_scales, uint16_t *d_mins, uint32_t *d_emins,
+            uint8_t codebook_id, uint32_t blocks_per_row,
+            std::shared_ptr<void> lifetime_owner)
+            : CUDAQuantisedGemmKernel(N, K, device_id.cuda_ordinal(), d_vnni, d_scales, d_mins, d_emins,
+                                      codebook_id, blocks_per_row, std::move(lifetime_owner))
+        {
+            target_device_ = std::move(device_id);
+            LOG_DEBUG("[CUDAQuantisedGemmKernel] Bound metadata device=" << target_device_.toString()
+                                                                        << " arch=" << (target_device_.arch_info() ? target_device_.arch_info()->arch_string() : "unknown"));
         }
 
         CUDAQuantisedGemmKernel::~CUDAQuantisedGemmKernel() = default;
@@ -737,6 +813,7 @@ namespace llaminar2
             : weights_(other.weights_),
               packed_(other.packed_),
               lifetime_owner_(std::move(other.lifetime_owner_)),
+              target_device_(std::move(other.target_device_)),
               cuda_device_id_(other.cuda_device_id_),
               N_(other.N_),
               K_(other.K_),
@@ -757,6 +834,7 @@ namespace llaminar2
                 weights_ = other.weights_;
                 packed_ = other.packed_;
                 lifetime_owner_ = std::move(other.lifetime_owner_);
+                target_device_ = std::move(other.target_device_);
                 cuda_device_id_ = other.cuda_device_id_;
                 N_ = other.N_;
                 K_ = other.K_;
@@ -1829,6 +1907,10 @@ namespace llaminar2
             // Ensure weights converted
             ensureWeightsConverted();
 
+            logArchitectureAndDispatch("fp32_to_fp32",
+                                       (m == 1) ? selectDecodeDispatchPath(m, n, k) : selectPrefillDispatchPath(m, n, k),
+                                       m, n, k);
+
             // ──── cuBLAS FP16 GEMM path (LLAMINAR_CUBLAS_GEMM=1) ────────────
             // Dequant Q4_0 native VNNI weights → FP16 per-call,
             // convert FP32 activations → FP16,
@@ -1929,6 +2011,10 @@ namespace llaminar2
 
             // Ensure weights converted
             ensureWeightsConverted();
+
+            logArchitectureAndDispatch("fp32_to_fp32_with_bias",
+                                       (m == 1) ? selectDecodeDispatchPath(m, n, k) : selectPrefillDispatchPath(m, n, k),
+                                       m, n, k);
 
             // Use blockwise quantization whenever K is block-aligned.
             const bool use_blockwise =

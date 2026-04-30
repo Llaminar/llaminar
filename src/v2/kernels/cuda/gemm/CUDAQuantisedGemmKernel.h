@@ -38,6 +38,7 @@
 #include "tensors/TensorKernels.h"
 #include "tensors/BlockStructures.h"
 #include "interfaces/IWorkspaceConsumer.h"
+#include "backends/DeviceId.h"
 #include <memory>
 #include <cstdint>
 #include <string>
@@ -119,6 +120,7 @@ namespace llaminar2
              * @throws std::runtime_error if weight not quantized or not on GPU
              */
             CUDAQuantisedGemmKernel(const TensorBase *weights, int cuda_device_id);
+            CUDAQuantisedGemmKernel(const TensorBase *weights, DeviceId device_id);
 
             /**
              * @brief Construct kernel from pre-packed CUDA weights (preferred path)
@@ -132,6 +134,7 @@ namespace llaminar2
              * @throws std::runtime_error if packed is null or has invalid dimensions
              */
             CUDAQuantisedGemmKernel(CUDAPackedWeights *packed, int cuda_device_id);
+            CUDAQuantisedGemmKernel(CUDAPackedWeights *packed, DeviceId device_id);
 
             /**
              * @brief Construct kernel from pre-uploaded device pointers (MoE batch path)
@@ -153,6 +156,11 @@ namespace llaminar2
              */
             CUDAQuantisedGemmKernel(
                 int N, int K, int cuda_device_id,
+                uint8_t *d_vnni, uint16_t *d_scales, uint16_t *d_mins, uint32_t *d_emins,
+                uint8_t codebook_id, uint32_t blocks_per_row,
+                std::shared_ptr<void> lifetime_owner);
+            CUDAQuantisedGemmKernel(
+                int N, int K, DeviceId device_id,
                 uint8_t *d_vnni, uint16_t *d_scales, uint16_t *d_mins, uint32_t *d_emins,
                 uint8_t codebook_id, uint32_t blocks_per_row,
                 std::shared_ptr<void> lifetime_owner);
@@ -398,6 +406,17 @@ namespace llaminar2
                 float alpha = 1.0f, float beta = 0.0f);
 
         private:
+            enum class DispatchPath
+            {
+                NATIVE_VNNI,
+                UNSUPPORTED
+            };
+
+            DispatchPath selectDecodeDispatchPath(int m, int n, int k) const;
+            DispatchPath selectPrefillDispatchPath(int m, int n, int k) const;
+            const char *dispatchPathName(DispatchPath path) const;
+            void logArchitectureAndDispatch(const char *context, DispatchPath path, int m, int n, int k) const;
+
             // =========================================================================
             // Internal dispatch methods
             // =========================================================================
@@ -492,6 +511,7 @@ namespace llaminar2
             const TensorBase *weights_ = nullptr; // Original weight tensor (null if using packed_)
             CUDAPackedWeights *packed_ = nullptr; // Pre-packed weights (owned by tensor cache)
             std::shared_ptr<void> lifetime_owner_; // Keeps shared MoE batch allocation alive
+            DeviceId target_device_;
             int cuda_device_id_;
             size_t N_; // Output features (weight rows)
             size_t K_; // Input features (weight cols)

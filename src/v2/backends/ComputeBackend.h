@@ -99,6 +99,7 @@ namespace llaminar2
         bool supports_fp16;        // Hardware FP16 support
         bool supports_bf16;        // Hardware BF16 support
         bool supports_int8;        // Hardware INT8 support
+        DeviceArchInfo arch_info;  // Detailed architecture metadata for runtime dispatch
         PCIeLinkInfo pcie;         // PCIe link information (GPU devices only)
     };
 

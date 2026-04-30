@@ -101,6 +101,7 @@
 #include <mutex>
 #include <set>
 #include <unordered_map>
+#include <utility>
 
 #ifdef HAVE_ROCM
 #include <hip/hip_runtime.h>
@@ -975,6 +976,7 @@ namespace llaminar2
         ROCmQuantisedGemmKernel::ROCmQuantisedGemmKernel(const TensorBase *weights, int rocm_device_id)
             : weights_(weights),
               packed_(nullptr),
+              target_device_(DeviceId::rocm(rocm_device_id)),
               rocm_device_id_(rocm_device_id),
               N_(0),
               K_(0),
@@ -1010,9 +1012,18 @@ namespace llaminar2
                                                                         << ") on ROCm device " << rocm_device_id_);
         }
 
+        ROCmQuantisedGemmKernel::ROCmQuantisedGemmKernel(const TensorBase *weights, DeviceId device_id)
+            : ROCmQuantisedGemmKernel(weights, device_id.rocm_ordinal())
+        {
+            target_device_ = std::move(device_id);
+            LOG_DEBUG("[ROCmQuantisedGemmKernel] Bound metadata device=" << target_device_.toString()
+                                                                        << " arch=" << (target_device_.arch_info() ? target_device_.arch_info()->arch_string() : "unknown"));
+        }
+
         ROCmQuantisedGemmKernel::ROCmQuantisedGemmKernel(ROCmPackedWeights *packed, int rocm_device_id)
             : weights_(nullptr),
               packed_(packed),
+              target_device_(DeviceId::rocm(rocm_device_id)),
               rocm_device_id_(rocm_device_id),
               N_(0),
               K_(0),
@@ -1035,6 +1046,14 @@ namespace llaminar2
                                                                             << " INT8 weights on ROCm device " << rocm_device_id_);
         }
 
+        ROCmQuantisedGemmKernel::ROCmQuantisedGemmKernel(ROCmPackedWeights *packed, DeviceId device_id)
+            : ROCmQuantisedGemmKernel(packed, device_id.rocm_ordinal())
+        {
+            target_device_ = std::move(device_id);
+            LOG_DEBUG("[ROCmQuantisedGemmKernel] Bound metadata device=" << target_device_.toString()
+                                                                        << " arch=" << (target_device_.arch_info() ? target_device_.arch_info()->arch_string() : "unknown"));
+        }
+
         ROCmQuantisedGemmKernel::ROCmQuantisedGemmKernel(
             int N, int K, int rocm_device_id,
             uint8_t *d_native_vnni, void *d_native_scales,
@@ -1044,6 +1063,7 @@ namespace llaminar2
             : weights_(nullptr),
               packed_(nullptr),
               lifetime_owner_(std::move(lifetime_owner)),
+              target_device_(DeviceId::rocm(rocm_device_id)),
               rocm_device_id_(rocm_device_id),
               N_(static_cast<size_t>(N)),
               K_(static_cast<size_t>(K)),
@@ -1065,6 +1085,21 @@ namespace llaminar2
                                                                                         << " on ROCm device " << rocm_device_id_);
         }
 
+        ROCmQuantisedGemmKernel::ROCmQuantisedGemmKernel(
+            int N, int K, DeviceId device_id,
+            uint8_t *d_native_vnni, void *d_native_scales,
+            void *d_native_mins, void *d_native_emins,
+            uint8_t codebook_id, uint32_t blocks_per_row,
+            std::shared_ptr<void> lifetime_owner)
+            : ROCmQuantisedGemmKernel(N, K, device_id.rocm_ordinal(), d_native_vnni, d_native_scales,
+                                      d_native_mins, d_native_emins, codebook_id, blocks_per_row,
+                                      std::move(lifetime_owner))
+        {
+            target_device_ = std::move(device_id);
+            LOG_DEBUG("[ROCmQuantisedGemmKernel] Bound metadata device=" << target_device_.toString()
+                                                                        << " arch=" << (target_device_.arch_info() ? target_device_.arch_info()->arch_string() : "unknown"));
+        }
+
         ROCmQuantisedGemmKernel::~ROCmQuantisedGemmKernel() = default;
 
         ROCmQuantisedGemmKernel::ROCmQuantisedGemmKernel(ROCmQuantisedGemmKernel &&) noexcept = default;
@@ -1082,6 +1117,31 @@ namespace llaminar2
          * UNSUPPORTED is returned when impl_ is missing, dimensions are invalid,
          * or no VNNI weights are available.
          */
+        const char *ROCmQuantisedGemmKernel::prefillDispatchPathName(PrefillDispatchPath path) const
+        {
+            switch (path)
+            {
+            case PrefillDispatchPath::NATIVE_VNNI:
+                return "native_vnni";
+            case PrefillDispatchPath::INT8_VNNI_NATIVE:
+                return "int8_vnni_native";
+            case PrefillDispatchPath::UNSUPPORTED:
+            default:
+                return "unsupported";
+            }
+        }
+
+        void ROCmQuantisedGemmKernel::logArchitectureAndDispatch(const char *context, PrefillDispatchPath path, int m, int n, int k) const
+        {
+            const DeviceArchInfo *arch = target_device_.arch_info();
+            LOG_DEBUG("[ROCmQuantisedGemmKernel] " << context
+                                                   << " device=" << target_device_.toString()
+                                                   << " arch=" << (arch ? arch->arch_string() : "unknown")
+                                                   << " gcnArchName=" << (arch ? arch->gcn_arch_name : "")
+                                                   << " path=" << prefillDispatchPathName(path)
+                                                   << " M=" << m << " N=" << n << " K=" << k);
+        }
+
         ROCmQuantisedGemmKernel::PrefillDispatchPath ROCmQuantisedGemmKernel::selectPrefillDispatchPath(int m, int n, int k) const
         {
             (void)n;
@@ -1246,6 +1306,7 @@ namespace llaminar2
             }
 
             const PrefillDispatchPath path = selectPrefillDispatchPath(m, n, k);
+            logArchitectureAndDispatch(callsite, path, m, n, k);
             record_path_selected(path);
             bool native_ok = false;
             const bool profiling_enabled = debugEnv().profile.enabled;

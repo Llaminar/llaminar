@@ -62,6 +62,12 @@ namespace llaminar2
                 dev.type = ComputeBackendType::GPU_ROCM;
                 dev.device_id = i;
                 dev.total_memory_bytes = prop.totalGlobalMem;
+                dev.arch_info.type = DeviceType::ROCm;
+                dev.arch_info.ordinal = i;
+                dev.arch_info.device_name = std::string(prop.name);
+                dev.arch_info.gcn_arch_name = prop.gcnArchName;
+                dev.arch_info.multiprocessor_count = prop.multiProcessorCount;
+                dev.arch_info.warp_or_wave_size = prop.warpSize;
 
                 // Parse gcnArchName for architecture info
                 // Format: "gfx906:sramecc+:xnack-" or similar
@@ -112,6 +118,10 @@ namespace llaminar2
                     }
                 }
                 dev.compute_capability = arch_num;
+                if (!gfx_name.empty())
+                {
+                    dev.arch_info.gcn_arch_name = gfx_name;
+                }
 
                 // Get free memory
                 size_t free_bytes = 0, total_bytes = 0;
@@ -130,6 +140,11 @@ namespace llaminar2
                 dev.supports_fp16 = (arch_num >= 900);
                 dev.supports_bf16 = (arch_num >= 908);
                 dev.supports_int8 = (arch_num >= 906);
+                dev.arch_info.supports_dp4a = dev.supports_int8;
+                dev.arch_info.supports_wmma = (arch_num >= 1100);
+                dev.arch_info.supports_mfma = (arch_num >= 908);
+                dev.arch_info.supports_int8_tensor_cores = dev.arch_info.supports_mfma;
+                dev.arch_info.supports_native_vnni = (arch_num >= 906);
 
                 LOG_INFO("[ROCm] Device " << i << ": " << dev.name
                                           << " (" << (dev.total_memory_bytes / (1024 * 1024 * 1024)) << " GB)");
