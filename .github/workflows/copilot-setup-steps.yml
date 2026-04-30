@@ -243,3 +243,4 @@ jobs:
           echo ""
           echo "=== Ninja Version ==="
           ninja --version
+
