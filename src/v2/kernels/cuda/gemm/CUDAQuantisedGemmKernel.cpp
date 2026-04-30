@@ -813,7 +813,7 @@ namespace llaminar2
             : weights_(other.weights_),
               packed_(other.packed_),
               lifetime_owner_(std::move(other.lifetime_owner_)),
-              target_device_(std::move(other.target_device_)),
+              target_device_(other.target_device_),
               cuda_device_id_(other.cuda_device_id_),
               N_(other.N_),
               K_(other.K_),
@@ -834,7 +834,7 @@ namespace llaminar2
                 weights_ = other.weights_;
                 packed_ = other.packed_;
                 lifetime_owner_ = std::move(other.lifetime_owner_);
-                target_device_ = std::move(other.target_device_);
+                target_device_ = other.target_device_;
                 cuda_device_id_ = other.cuda_device_id_;
                 N_ = other.N_;
                 K_ = other.K_;

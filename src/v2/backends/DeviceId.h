@@ -94,7 +94,7 @@ namespace llaminar2
         DeviceId(DeviceType t, int ord) : type(t), ordinal(ord) {}
 
         /// Explicit construction with descriptive architecture metadata.
-        DeviceId(DeviceType t, int ord, DeviceArchInfo arch_info)
+        DeviceId(DeviceType t, int ord, const DeviceArchInfo &arch_info)
             : type(t), ordinal(ord), arch(arch_info) {}
 
         // Factory methods for clarity (preferred way to create DeviceIds)
@@ -114,7 +114,7 @@ namespace llaminar2
         bool has_arch_info() const { return arch.has_value(); }
         const DeviceArchInfo *arch_info() const { return arch ? &(*arch) : nullptr; }
 
-        DeviceId with_arch_info(DeviceArchInfo arch_info) const
+        DeviceId with_arch_info(const DeviceArchInfo &arch_info) const
         {
             DeviceId copy = *this;
             copy.arch = arch_info;
