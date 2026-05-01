@@ -2503,6 +2503,19 @@ namespace llaminar2
             (void)token_ids;
             (void)num_tokens;
         }
+
+        /**
+         * @brief Set local vocab range for vocab-parallel embedding shards.
+         *
+         * Local TP runs multiple devices inside one MPI rank, so MPI rank cannot
+         * identify the vocabulary shard. CPU implementations use this range to
+         * zero tokens outside the local shard before the embedding allreduce.
+         */
+        virtual void setVocabRange(int vocab_offset, int local_vocab_size)
+        {
+            (void)vocab_offset;
+            (void)local_vocab_size;
+        }
     };
 
     /**

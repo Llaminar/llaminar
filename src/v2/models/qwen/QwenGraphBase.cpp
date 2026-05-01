@@ -37,6 +37,32 @@
 
 namespace llaminar2
 {
+    namespace
+    {
+        int embeddingVocabOffsetForDevice(const GraphConfig &config, DeviceId device)
+        {
+            if (!config.tp_config)
+                return 0;
+
+            // NodeLocalTP uses one MPI rank per CPU socket, but DeviceId::cpu()
+            // is a singleton.  Matching by device would always find rank 0's
+            // assignment, so prefer the current rank's assignment when it owns
+            // the requested device.
+            if (const auto *assignment = config.getAssignment())
+            {
+                if (assignment->device == device)
+                    return assignment->vocab_start;
+            }
+
+            for (const auto &assignment : config.tp_config->assignments())
+            {
+                if (assignment.device == device)
+                    return assignment.vocab_start;
+            }
+            return 0;
+        }
+    }
+
 
     // Import graph_utils for cleaner code
     using namespace graph_utils;
@@ -277,6 +303,8 @@ namespace llaminar2
         embed_params.num_tokens = total_tokens;
         embed_params.d_model = config_.d_model;
         embed_params.vocab_size = config_.vocab_size;
+        embed_params.vocab_offset = embeddingVocabOffsetForDevice(config_, config_.default_device);
+        embed_params.local_vocab_size = weights_.embedding_table ? static_cast<int>(weights_.embedding_table->rows()) : 0;
         embed_params.device_id = config_.default_device;
         embed_params.output_buffer_id = BufferId::HIDDEN_STATE;
         embed_params.mpi_ctx = mpi_ctx_.get();
@@ -539,6 +567,8 @@ namespace llaminar2
             embed_params.num_tokens = total_tokens;
             embed_params.d_model = config_.d_model;
             embed_params.vocab_size = config_.vocab_size;
+            embed_params.vocab_offset = embeddingVocabOffsetForDevice(config_, config_.default_device);
+            embed_params.local_vocab_size = weights_.embedding_table ? static_cast<int>(weights_.embedding_table->rows()) : 0;
             embed_params.device_id = config_.default_device;
             embed_params.output_buffer_id = BufferId::HIDDEN_STATE;
             embed_params.mpi_ctx = mpi_ctx_.get();
@@ -899,6 +929,8 @@ namespace llaminar2
                 embed_params.num_tokens = total_tokens;
                 embed_params.d_model = config_.d_model;
                 embed_params.vocab_size = config_.vocab_size;
+                embed_params.vocab_offset = embeddingVocabOffsetForDevice(config_, stage_device);
+                embed_params.local_vocab_size = weights_.embedding_table ? static_cast<int>(weights_.embedding_table->rows()) : 0;
                 embed_params.device_id = stage_device;
                 embed_params.mpi_ctx = mpi_ctx_.get();
 
@@ -1192,6 +1224,8 @@ namespace llaminar2
         params.num_tokens = input.batch_size * input.seq_len;
         params.d_model = config_.d_model;
         params.vocab_size = config_.vocab_size;
+        params.vocab_offset = embeddingVocabOffsetForDevice(config_, config_.default_device);
+        params.local_vocab_size = weights_.embedding_table ? static_cast<int>(weights_.embedding_table->rows()) : 0;
         params.device_id = config_.default_device;
 
         graph.addNode("embedding",

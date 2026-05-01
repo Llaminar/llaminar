@@ -23,11 +23,27 @@
 #include <memory>
 #include <mutex>
 #include <unordered_map>
+#include <unordered_set>
 #include <deque>
 #include <thread>
 
 namespace llaminar2
 {
+
+    namespace
+    {
+        std::mutex &rocmPinnedAllocationsMutex()
+        {
+            static std::mutex mutex;
+            return mutex;
+        }
+
+        std::unordered_map<void *, int> &rocmPinnedAllocations()
+        {
+            static std::unordered_map<void *, int> allocations;
+            return allocations;
+        }
+    }
 
     // Check a HIP API result and throw on failure with full diagnostic context.
     //
@@ -1286,7 +1302,14 @@ namespace llaminar2
 
     void *ROCmBackend::allocatePinned(size_t bytes, int device_id)
     {
-        (void)device_id;
+        hipError_t set_err = hipSetDevice(device_id);
+        if (set_err != hipSuccess)
+        {
+            LOG_ERROR("[ROCmBackend::allocatePinned] hipSetDevice(" << device_id
+                      << ") failed: " << hipGetErrorString(set_err));
+            return nullptr;
+        }
+
         void *ptr = nullptr;
         hipError_t err = hipHostMalloc(&ptr, bytes, hipHostMallocDefault);
         if (err != hipSuccess)
@@ -1295,14 +1318,46 @@ namespace llaminar2
                       << ") failed: " << hipGetErrorString(err));
             return nullptr;
         }
+        {
+            std::lock_guard<std::mutex> lock(rocmPinnedAllocationsMutex());
+            rocmPinnedAllocations()[ptr] = device_id;
+        }
         return ptr;
     }
 
     void ROCmBackend::freePinned(void *ptr, int device_id)
     {
-        (void)device_id;
-        if (ptr)
-            (void)hipHostFree(ptr);
+        if (!ptr)
+            return;
+
+        int owner_device = device_id;
+        {
+            std::lock_guard<std::mutex> lock(rocmPinnedAllocationsMutex());
+            auto &allocations = rocmPinnedAllocations();
+            auto it = allocations.find(ptr);
+            if (it == allocations.end())
+            {
+                LOG_WARN("[ROCmBackend::freePinned] skipping untracked pinned pointer " << ptr);
+                return;
+            }
+            owner_device = it->second;
+            allocations.erase(it);
+        }
+
+        hipError_t set_err = hipSetDevice(owner_device);
+        if (set_err != hipSuccess)
+        {
+            LOG_WARN("[ROCmBackend::freePinned] hipSetDevice(" << owner_device
+                     << ") failed before hipHostFree: " << hipGetErrorString(set_err));
+            return;
+        }
+
+        hipError_t err = hipHostFree(ptr);
+        if (err != hipSuccess)
+        {
+            LOG_WARN("[ROCmBackend::freePinned] hipHostFree failed for " << ptr
+                     << " on device " << owner_device << ": " << hipGetErrorString(err));
+        }
     }
 
     // ====================================================================

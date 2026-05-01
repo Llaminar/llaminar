@@ -44,6 +44,8 @@ namespace llaminar2
             int num_tokens = 0;
             int d_model = 0;
             int vocab_size = 0;
+            int vocab_offset = 0;
+            int local_vocab_size = 0;
 
             // Batched input (alternative to token_ids)
             const std::vector<std::vector<int>> *token_batches = nullptr;

@@ -101,6 +101,13 @@ namespace llaminar2
             const IMPIContext *mpi_ctx = nullptr,
             int device_idx = -1) override;
 
+        void setVocabRange(int vocab_offset, int local_vocab_size) override
+        {
+            explicit_vocab_range_ = true;
+            vocab_offset_ = vocab_offset;
+            local_vocab_size_ = local_vocab_size;
+        }
+
         KernelSnapshotInfo getKernelSnapshotInfo() const override
         {
             return KernelSnapshotInfo::embedding()
@@ -123,6 +130,8 @@ namespace llaminar2
         /// Tokens outside [vocab_offset_, vocab_offset_ + local_vocab_size_) produce zeros.
         int vocab_offset_ = 0;
         int local_vocab_size_ = 0;
+        bool explicit_vocab_range_ = false;
+        bool vocab_parallel_ = false;
     };
 
     // Backward compatibility alias

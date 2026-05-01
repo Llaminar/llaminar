@@ -11,6 +11,7 @@
 #include "../../execution/compute_stages/stages/MoEExpertComputeStage.h"
 #include "../../memory/BufferId.h"
 #include "../../execution/local_execution/graph/GraphResolver.h"
+#include "../../utils/DebugEnv.h"
 
 namespace llaminar2
 {
@@ -198,6 +199,17 @@ namespace llaminar2
             expert_params.output_buffer_id = BufferId::MOE_COMBINED_OUTPUT;
             expert_params.input_buffer_id = BufferId::NORMALIZED;
 
+            const int gpu_cache_experts = debugEnv().moe_rebalance.gpu_cache_experts_per_layer;
+            if (gpu_cache_experts > 0)
+            {
+                expert_params.expert_mask.assign(config_.moe.num_experts, false);
+                for (int expert = 0; expert < config_.moe.num_experts; ++expert)
+                    expert_params.expert_mask[expert] = !device.is_gpu();
+                LOG_DEBUG("[Qwen35MoEGraph] Initial MoE GPU expert cache bootstrap mask: device="
+                          << device.to_string() << " layer=" << layer_idx
+                          << " cpu_initial_owner=" << (!device.is_gpu()));
+            }
+
             // GPU scratch buffers
             expert_params.gate_scratch = buffers.get(BufferId::MOE_GATE_SCRATCH);
             expert_params.up_scratch = buffers.get(BufferId::MOE_UP_SCRATCH);
@@ -208,10 +220,10 @@ namespace llaminar2
                 LOG_ERROR("[Qwen35MoEGraph] Failed to extract expert views for layer " << layer_idx);
             }
 
-            // Pre-resolve CPU GEMM engines for all local experts.  On GPU, Qwen3.5
-            // MoE 35B cannot keep every expert for every layer resident on a 32 GiB
-            // device, so expert engines are prepared lazily for routed experts.
-            if (device.is_gpu())
+            // Pre-resolve CPU GEMM engines for all local experts. On GPU, only
+            // pre-resolve when an explicit expert cache mask is present; otherwise
+            // Qwen3.5 MoE 35B cannot keep every expert for every layer resident.
+            if (device.is_gpu() && expert_params.expert_mask.empty())
             {
                 expert_params.prepared_gate_gemm.assign(config_.moe.num_experts, nullptr);
                 expert_params.prepared_up_gemm.assign(config_.moe.num_experts, nullptr);
@@ -227,6 +239,26 @@ namespace llaminar2
                           device);
             graph.addDependency(prefix + "moe_expert_ffn", prefix + "moe_routing");
             ffn_terminal = prefix + "moe_expert_ffn";
+
+            // Qwen35 MoE expert weights are normally replicated, so every rank
+            // computes the full routed-expert contribution. Only allreduce this
+            // path when an explicit expert range/mask makes the output partial.
+            const bool routed_expert_output_is_partial =
+                expert_params.local_expert_count >= 0 || !expert_params.expert_mask.empty();
+            if (routed_expert_output_is_partial && needsTPAllreduce())
+            {
+                size_t allreduce_count = static_cast<size_t>(total_tokens) * static_cast<size_t>(config_.d_model);
+                std::string ar_name = prefix + "moe_expert_allreduce";
+                auto allreduce_stage = createTPAllreduceStage(
+                    moe_output, allreduce_count, device, layer_idx,
+                    /*is_attention=*/false, ar_name, BufferId::MOE_COMBINED_OUTPUT);
+                if (allreduce_stage)
+                {
+                    graph.addNode(ar_name, std::move(allreduce_stage), device);
+                    graph.addDependency(ar_name, prefix + "moe_expert_ffn");
+                    ffn_terminal = ar_name;
+                }
+            }
         }
 
         // =====================================================================
@@ -320,7 +352,7 @@ namespace llaminar2
                 graph.addNode(prefix + "moe_combine",
                               ComputeStageFactory::createResidualAdd(add_params),
                               device);
-                graph.addDependency(prefix + "moe_combine", prefix + "moe_expert_ffn");
+                graph.addDependency(prefix + "moe_combine", ffn_terminal);
                 graph.addDependency(prefix + "moe_combine", shared_ffn_last);
                 ffn_terminal = prefix + "moe_combine";
             }
@@ -342,7 +374,7 @@ namespace llaminar2
                     graph.addNode(prefix + "moe_combine",
                                   ComputeStageFactory::createResidualAdd(copy_params),
                                   device);
-                    graph.addDependency(prefix + "moe_combine", prefix + "moe_expert_ffn");
+                    graph.addDependency(prefix + "moe_combine", ffn_terminal);
                     ffn_terminal = prefix + "moe_combine";
                 }
             }

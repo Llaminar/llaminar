@@ -1916,6 +1916,34 @@ namespace llaminar2::test::parity
             // Barrier before teardown to ensure all ranks are done
             mpiBarrier();
 
+            // Ensure all GPU work that may reference graph stages or cached
+            // prepared weights has completed before any owner is destroyed.
+#ifdef HAVE_CUDA
+            if (auto *cuda_backend = llaminar2::getCUDABackend())
+            {
+                for (int d = 0; d < cuda_backend->deviceCount(); ++d)
+                {
+                    cuda_backend->synchronize(d);
+                }
+                cudaGetLastError();
+            }
+#endif
+#ifdef HAVE_ROCM
+            if (auto *rocm_backend = llaminar2::getROCmBackend())
+            {
+                for (int d = 0; d < rocm_backend->deviceCount(); ++d)
+                {
+                    rocm_backend->synchronize(d);
+                }
+            }
+#endif
+
+            // Destroy graph/stage owners before clearing global kernel caches.
+            // The model context remains alive until after clearCache(), so tensor
+            // cache cleanup can still access tensor-owned packed caches safely.
+            runner_.reset();
+            orch_runner_.reset();
+
             // CRITICAL: Clear kernel cache BEFORE destroying model context!
             // KernelFactory::clearCache() accesses tensor->cache_ (CPU packed weights)
             // to free resources. If we destroy the tensors first (via model_ctx_.reset()),
@@ -1930,8 +1958,6 @@ namespace llaminar2::test::parity
 #endif
 
             model_ctx_.reset();
-            runner_.reset();
-            orch_runner_.reset(); // Clean up modern orchestration runner
             pytorch_snapshots_.clear();
 
             // CRITICAL: Synchronize and clear error state on all GPU devices!

@@ -326,15 +326,20 @@ namespace llaminar2
         const int current_rank = mpi_ctx->rank();
         const int world_size = mpi_ctx->world_size();
 
-        // Compute local head distribution
-        auto [q_head_start, local_n_q_heads] = mpi_ctx->get_local_slice(
-            static_cast<size_t>(graph_config.n_heads));
-        auto [kv_head_start, local_n_kv_h] = mpi_ctx->get_local_slice(
-            static_cast<size_t>(graph_config.n_kv_heads));
+        std::vector<DeviceId> devices(world_size, graph_config.default_device);
+        auto tp_config = TensorParallelConfig::equalSplit(
+            world_size,
+            graph_config.n_heads,
+            graph_config.n_kv_heads,
+            graph_config.d_ff,
+            graph_config.vocab_size,
+            devices);
+        const auto &assignment = tp_config.forRank(current_rank);
 
-        graph_config.head_start = static_cast<int>(q_head_start);
-        graph_config.local_n_heads = static_cast<int>(local_n_q_heads);
-        graph_config.local_n_kv_heads = static_cast<int>(local_n_kv_h);
+        graph_config.tp_config = std::make_shared<TensorParallelConfig>(tp_config);
+        graph_config.head_start = assignment.head_start;
+        graph_config.local_n_heads = assignment.head_count;
+        graph_config.local_n_kv_heads = assignment.kv_head_count;
         graph_config.qkv_column_parallel = true;
         graph_config.local_rank = current_rank;
 
@@ -351,7 +356,7 @@ namespace llaminar2
                                                  << ") not divisible by world_size (" << world_size << ")");
             return false;
         }
-        graph_config.d_ff_local = graph_config.d_ff / world_size;
+        graph_config.d_ff_local = assignment.d_ff_count;
         graph_config.ffn_column_parallel = true;
 
         LOG_DEBUG("[InferenceRunner] FFN Column-Parallel enabled (equal split): "
@@ -365,7 +370,7 @@ namespace llaminar2
                                                        << ") not divisible by world_size (" << world_size << ")");
             return false;
         }
-        graph_config.vocab_local = graph_config.vocab_size / world_size;
+        graph_config.vocab_local = assignment.vocab_count;
         graph_config.lm_head_column_parallel = true;
 
         LOG_DEBUG("[InferenceRunner] LM Head Column-Parallel enabled (equal split): "
@@ -1872,6 +1877,31 @@ namespace llaminar2
             return nullptr;
         }
 
+        auto load_weight_for_runner = [model_ctx, device, tp_config = graph_config.tp_config](const std::string &name)
+            -> std::shared_ptr<TensorBase>
+        {
+            if (tp_config)
+            {
+                auto weight_mgr = model_ctx->weightManager();
+                auto concrete_mgr = std::dynamic_pointer_cast<WeightManager>(weight_mgr);
+                if (concrete_mgr)
+                {
+                    try
+                    {
+                        const auto &assignment = tp_config->forDevice(device);
+                        return concrete_mgr->getShardedWeightForAssignment(name, device, assignment, /*layer_idx=*/-1);
+                    }
+                    catch (const std::out_of_range &)
+                    {
+                        LOG_TRACE("[InferenceRunner] Device " << device.to_string()
+                                                               << " not in runner TensorParallelConfig, using standard loader for " << name);
+                    }
+                }
+            }
+
+            return model_ctx->getWeightForDevice(name, device);
+        };
+
         // Configure weights: PP-aware vs full
         if (config.pp_stage_config.has_value())
         {
@@ -1879,11 +1909,7 @@ namespace llaminar2
             // partial global weight requirements
             const auto &pp_cfg = config.pp_stage_config.value();
 
-            auto weights = config_builder->buildWeights(
-                [model_ctx, device](const std::string &name)
-                {
-                    return model_ctx->getWeightForDevice(name, device);
-                });
+            auto weights = config_builder->buildWeights(load_weight_for_runner);
 
             // Only check for global weights this PP stage actually owns
             if (pp_cfg.has_embedding && !weights.embedding_table)
@@ -1902,11 +1928,7 @@ namespace llaminar2
         else
         {
             // Full model: load all global weights
-            auto weights = config_builder->buildWeights(
-                [model_ctx, device](const std::string &name)
-                {
-                    return model_ctx->getWeightForDevice(name, device);
-                });
+            auto weights = config_builder->buildWeights(load_weight_for_runner);
 
             if (!weights.embedding_table || !weights.final_norm || !weights.lm_head)
             {

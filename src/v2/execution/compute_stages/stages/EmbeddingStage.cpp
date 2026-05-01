@@ -146,6 +146,11 @@ namespace llaminar2
         // Thread GPU stream for graph capture
         bindStageStream(kernel);
 
+        const int local_vocab_size = params_.local_vocab_size > 0
+                         ? params_.local_vocab_size
+                         : static_cast<int>(embed_table_base->rows());
+        kernel->setVocabRange(params_.vocab_offset, local_vocab_size);
+
         // Handle batched vs single sequence input
         if (params_.token_batches)
         {

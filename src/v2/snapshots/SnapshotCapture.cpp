@@ -281,6 +281,9 @@ namespace llaminar2
             // MoE stages
             {"_shared_expert_gate", "_MOE_SHARED_GATE_OUTPUT"},
             {"_shared_expert", "_MOE_SHARED_EXPERT_OUTPUT"},
+            {"_moe_expert_allreduce", "_MOE_EXPERT_OUTPUT"},
+            {"_moe_expert_ffn", "_MOE_EXPERT_OUTPUT"},
+            {"_moe_combine", "_MOE_COMBINED_OUTPUT"},
             {"_moe_ffn", "_MOE_EXPERT_OUTPUT"},
             {"_moe_add", "_MOE_COMBINED_OUTPUT"},
         };

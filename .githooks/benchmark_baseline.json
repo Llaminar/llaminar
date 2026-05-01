@@ -21,8 +21,8 @@
         },
         "cpu": {
           "prefill_tok_s": 337.99,
-          "decode_tok_s": 19.63,
-          "_comment": "High-water mark set at commit b91ddc53 on 2026-04-09. Note to agents: It is FORBIDDEN to update these thresholds without explicit human approval."
+          "decode_tok_s": 19.78,
+          "_comment": "High-water mark set at commit 74454c25 on 2026-05-01. Note to agents: It is FORBIDDEN to update these thresholds without explicit human approval."
         }
       }
     },
@@ -32,9 +32,9 @@
       "decode_tokens": 128,
       "devices": {
         "cpu": {
-          "prefill_tok_s": 440.03,
+          "prefill_tok_s": 453.80,
           "decode_tok_s": 28.41,
-          "_comment": "High-water mark set at commit 7510ad25 on 2026-04-26. Note to agents: It is FORBIDDEN to update these thresholds without explicit human approval."
+          "_comment": "High-water mark set at commit 74454c25 on 2026-05-01. Note to agents: It is FORBIDDEN to update these thresholds without explicit human approval."
         }
       }
     },
@@ -45,13 +45,13 @@
       "devices": {
         "cpu:0": {
           "prefill_tok_s": 156.63,
-          "decode_tok_s": 18.63,
-          "_comment": "High-water mark set at commit 7510ad25 on 2026-04-26. Note to agents: It is FORBIDDEN to update these thresholds without explicit human approval."
+          "decode_tok_s": 18.68,
+          "_comment": "High-water mark set at commit 74454c25 on 2026-05-01. Note to agents: It is FORBIDDEN to update these thresholds without explicit human approval."
         },
         "cpu": {
           "prefill_tok_s": 232.76,
-          "decode_tok_s": 27.79,
-          "_comment": "High-water mark set at commit 7510ad25 on 2026-04-26. Note to agents: It is FORBIDDEN to update these thresholds without explicit human approval."
+          "decode_tok_s": 27.92,
+          "_comment": "High-water mark set at commit 74454c25 on 2026-05-01. Note to agents: It is FORBIDDEN to update these thresholds without explicit human approval."
         }
       }
     }

@@ -19,6 +19,7 @@
 #include "config/TensorParallelConfig.h"
 #include "execution/local_execution/graph/GraphSchema.h"
 #include "kernels/KernelFactory.h"
+#include "kernels/cpu/ops/CPUEmbeddingKernelT.h"
 #include "kernels/common/EmbedQ8Repack.h"
 #include "kernels/common/PreparedEmbeddingWeights.h"
 #include "loaders/WeightSlicer.h"
@@ -304,6 +305,60 @@ TEST_F(Test__VocabParallelEmbeddingSharding, SingleDevice_FullVocab)
     EXPECT_EQ(r0.vocab_start, 0);
     EXPECT_EQ(r0.vocab_count, TEST_VOCAB);
     EXPECT_EQ(config.totalVocab(), TEST_VOCAB);
+}
+
+TEST_F(Test__VocabParallelEmbeddingSharding, EqualSplit_DuplicateCPUDevices_PreservesRankVocabOffsets)
+{
+    auto config = TensorParallelConfig::equalSplit(
+        2, TEST_HEADS, TEST_KV_HEADS, TEST_D_FF, TEST_VOCAB,
+        std::vector<DeviceId>{DeviceId::cpu(), DeviceId::cpu()});
+
+    const auto &r0 = config.forRank(0);
+    const auto &r1 = config.forRank(1);
+
+    EXPECT_EQ(r0.device, DeviceId::cpu());
+    EXPECT_EQ(r1.device, DeviceId::cpu());
+    EXPECT_EQ(r0.vocab_start, 0);
+    EXPECT_EQ(r1.vocab_start, r0.vocabEnd());
+    EXPECT_EQ(r0.vocab_count + r1.vocab_count, TEST_VOCAB);
+}
+
+TEST_F(Test__VocabParallelEmbeddingSharding, CPUEmbeddingKernel_ZeroesTokensOutsideLocalShard)
+{
+    constexpr int kLocalVocab = 4;
+    constexpr int kDModel = 3;
+    constexpr int kVocabOffset = 4;
+    const int token_ids[] = {5, 1, 7};
+
+    FP32Tensor embed_table({kLocalVocab, kDModel});
+    for (int row = 0; row < kLocalVocab; ++row)
+    {
+        for (int col = 0; col < kDModel; ++col)
+        {
+            embed_table.mutable_data()[row * kDModel + col] = 10.0f * row + static_cast<float>(col + 1);
+        }
+    }
+
+    FP32Tensor output({3, kDModel});
+    std::fill(output.mutable_data(), output.mutable_data() + output.numel(), -1.0f);
+
+    CPUEmbeddingKernelT<FP32Tensor> kernel;
+    kernel.setVocabRange(kVocabOffset, kLocalVocab);
+
+    ASSERT_TRUE(kernel.apply_tensor(&embed_table, token_ids, 3, kDModel, &output));
+
+    const float *out = output.data();
+    EXPECT_FLOAT_EQ(out[0], 11.0f);
+    EXPECT_FLOAT_EQ(out[1], 12.0f);
+    EXPECT_FLOAT_EQ(out[2], 13.0f);
+
+    EXPECT_FLOAT_EQ(out[3], 0.0f);
+    EXPECT_FLOAT_EQ(out[4], 0.0f);
+    EXPECT_FLOAT_EQ(out[5], 0.0f);
+
+    EXPECT_FLOAT_EQ(out[6], 31.0f);
+    EXPECT_FLOAT_EQ(out[7], 32.0f);
+    EXPECT_FLOAT_EQ(out[8], 33.0f);
 }
 
 // ============================================================================

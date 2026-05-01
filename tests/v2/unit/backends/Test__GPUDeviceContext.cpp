@@ -34,24 +34,37 @@ using namespace llaminar2;
 // Skip macros for hardware availability
 // ===========================================================================
 
-#define SKIP_IF_NO_CUDA()                                     \
-    if (!GPUDeviceContextPool::instance().hasNvidiaSupport()) \
-    {                                                         \
-        GTEST_SKIP() << "CUDA not available";                 \
-    }
+#if defined(GPU_CONTEXT_TEST_BACKEND_CUDA)
+#define SKIP_IF_NO_CUDA()                                      \
+    do                                                         \
+    {                                                          \
+        ensureNvidiaFactoryRegistered();                       \
+        if (!GPUDeviceContextPool::instance().hasNvidiaSupport()) \
+            GTEST_SKIP() << "CUDA not available";              \
+    } while (false)
+#else
+#define SKIP_IF_NO_CUDA() GTEST_SKIP() << "CUDA backend not linked in this test binary"
+#endif
 
-#define SKIP_IF_NO_ROCM()                                  \
-    if (!GPUDeviceContextPool::instance().hasAMDSupport()) \
-    {                                                      \
-        GTEST_SKIP() << "ROCm not available";              \
-    }
+#if defined(GPU_CONTEXT_TEST_BACKEND_ROCM)
+#define SKIP_IF_NO_ROCM()                                   \
+    do                                                      \
+    {                                                       \
+        ensureAMDFactoryRegistered();                       \
+        if (!GPUDeviceContextPool::instance().hasAMDSupport()) \
+            GTEST_SKIP() << "ROCm not available";           \
+    } while (false)
+#else
+#define SKIP_IF_NO_ROCM() GTEST_SKIP() << "ROCm backend not linked in this test binary"
+#endif
 
-#define SKIP_IF_NO_GPU()                                            \
-    if (!GPUDeviceContextPool::instance().hasNvidiaSupport() &&     \
-        !GPUDeviceContextPool::instance().hasAMDSupport())          \
-    {                                                               \
-        GTEST_SKIP() << "No GPU available (neither CUDA nor ROCm)"; \
-    }
+#if defined(GPU_CONTEXT_TEST_BACKEND_ROCM)
+#define SKIP_IF_NO_GPU() SKIP_IF_NO_ROCM()
+#elif defined(GPU_CONTEXT_TEST_BACKEND_CUDA)
+#define SKIP_IF_NO_GPU() SKIP_IF_NO_CUDA()
+#else
+#define SKIP_IF_NO_GPU() GTEST_SKIP() << "No GPU backend linked in this test binary"
+#endif
 
 // ===========================================================================
 // GPUDeviceContextPool Tests
