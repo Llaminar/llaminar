@@ -1818,7 +1818,7 @@ namespace llaminar2
         // After first prefill, release host-resident weight data.
         // GPU kernels (e.g., embedding) have now uploaded their own device copies,
         // so the host data is no longer needed.
-        if (!host_resident_released_ && seq_len > 1 && weight_manager_)
+        if (release_host_resident_after_forward_ && !host_resident_released_ && seq_len > 1 && weight_manager_)
         {
             host_resident_released_ = true;
             weight_manager_->releaseHostResidentWeightData();
@@ -2176,6 +2176,41 @@ namespace llaminar2
             moe_rebalance_controller_->recordPrepDuration(prep_ms);
         LOG_INFO("[DGO] Expert mask application + engine prep took "
                  << std::fixed << std::setprecision(1) << prep_ms << " ms");
+    }
+
+    ReceivedWeightsMap DeviceGraphOrchestrator::collectExpertWeightsForMasks(
+        const std::vector<std::vector<bool>>& masks) const
+    {
+        ReceivedWeightsMap result;
+
+        std::unordered_map<int, const MoEExpertComputeStage*> moe_by_layer;
+        if (forward_engine_)
+        {
+            forward_engine_->forEachCachedStage(
+                ComputeStageType::MOE_EXPERT_FFN,
+                [&](IComputeStage* stage) {
+                    const auto* moe_stage = dynamic_cast<const MoEExpertComputeStage*>(stage);
+                    if (moe_stage && moe_stage->layerIndex() >= 0)
+                        moe_by_layer[moe_stage->layerIndex()] = moe_stage;
+                });
+        }
+
+        for (size_t layer_idx = 0; layer_idx < masks.size(); ++layer_idx)
+        {
+            auto stage_it = moe_by_layer.find(static_cast<int>(layer_idx));
+            if (stage_it == moe_by_layer.end()) continue;
+
+            const auto& mask = masks[layer_idx];
+            for (size_t expert_idx = 0; expert_idx < mask.size(); ++expert_idx)
+            {
+                if (!mask[expert_idx]) continue;
+                auto blobs = stage_it->second->serializeExpert(static_cast<int>(expert_idx));
+                if (!blobs.empty())
+                    result[static_cast<int>(layer_idx)][static_cast<int>(expert_idx)] = std::move(blobs);
+            }
+        }
+
+        return result;
     }
 
     void DeviceGraphOrchestrator::setExpertReplicaSet(

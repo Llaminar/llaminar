@@ -93,7 +93,15 @@ namespace llaminar2
             bool apply_silu = true) override
         {
             rocmGDN_gpu_set_device(device_ordinal_);
-            float *effective_state = gpu_state_ ? gpu_state_ : conv_state;
+            const int required_state_size = channels * (kernel_size - 1);
+            if (!gpu_state_ || state_size_ != required_state_size)
+                allocateState(required_state_size);
+            if (!gpu_state_)
+            {
+                LOG_ERROR("[ROCmShortConvolution] Missing GPU convolution state");
+                return false;
+            }
+            float *effective_state = gpu_state_;
 
             // All pointers are device pointers — pass directly to HIP kernel.
             return rocmGDN_short_conv1d(

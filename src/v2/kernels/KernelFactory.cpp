@@ -41,7 +41,10 @@
 #include "../interfaces/IWorkspaceConsumer.h"
 #include "../backends/ComputeBackend.h"
 #include "../utils/Logger.h"
+#include "../utils/DebugEnv.h"
 #include "common/EmbedQ8Repack.h"
+#include "../loaders/gpu_pipeline/LoadOrchestrator.h"
+#include "../loaders/gpu_pipeline/RepackFormat.h"
 
 // CUDA kernel classes
 #ifdef HAVE_CUDA
@@ -87,6 +90,143 @@ namespace llaminar
             // ==========================================================================
             // Device Type Resolution
             // ==========================================================================
+
+            static const KernelFactory::PreparedGemmHandle *prepareGpuGemmOnDemand(
+                const llaminar2::TensorBase *tensor,
+                llaminar2::DeviceId target_device)
+            {
+                if (!tensor || !target_device.is_gpu())
+                    return nullptr;
+
+                auto *unpackable = dynamic_cast<const llaminar2::IINT8Unpackable *>(tensor);
+                const auto *vnni = unpackable ? unpackable->vnniFormatInfo() : nullptr;
+                if (!vnni)
+                    return nullptr;
+
+                auto repack_fmt = llaminar2::codebookIdToRepackFormat(vnni->codebook_id, vnni->is_superblock);
+                if (!repack_fmt)
+                {
+                    LOG_WARN("[KernelFactory] On-demand GPU GEMM preload unsupported format"
+                             << " codebook=" << static_cast<int>(vnni->codebook_id)
+                             << " superblock=" << vnni->is_superblock
+                             << " shape=[" << tensor->rows() << "," << tensor->cols() << "]");
+                    return nullptr;
+                }
+
+                const void *raw = tensor->raw_data();
+                const size_t raw_bytes = tensor->size_bytes();
+                if (!raw || raw_bytes == 0)
+                {
+                    LOG_WARN("[KernelFactory] On-demand GPU GEMM preload missing raw data"
+                             << " shape=[" << tensor->rows() << "," << tensor->cols() << "]"
+                             << " device=" << target_device.to_string());
+                    return nullptr;
+                }
+
+                llaminar2::IBackend *backend = target_device.is_rocm() ? llaminar2::getROCmBackend()
+                                           : target_device.is_cuda() ? llaminar2::getCUDABackend()
+                                                                     : nullptr;
+                if (!backend)
+                {
+                    LOG_WARN("[KernelFactory] On-demand GPU GEMM preload has no backend for "
+                             << target_device.to_string());
+                    return nullptr;
+                }
+
+                const int N = static_cast<int>(tensor->rows());
+                const int K = static_cast<int>(tensor->cols());
+                if (N <= 0 || K <= 0 || K % 32 != 0)
+                {
+                    LOG_WARN("[KernelFactory] On-demand GPU GEMM preload invalid shape ["
+                             << N << "," << K << "] for " << target_device.to_string());
+                    return nullptr;
+                }
+
+                auto orchestrator = std::make_shared<llaminar2::LoadOrchestrator>(backend);
+                orchestrator->addDevice(target_device.ordinal);
+                const std::string slot_name = "ondemand_" + std::to_string(reinterpret_cast<uintptr_t>(tensor))
+                                            + "_" + std::to_string(N) + "x" + std::to_string(K);
+
+                try
+                {
+                    orchestrator->planWeight(target_device.ordinal, slot_name, N, K,
+                                             vnni->payload_bytes, vnni->is_asymmetric,
+                                             vnni->has_emins, raw_bytes);
+                    orchestrator->allocate(raw_bytes, llaminar2::debugEnv().rocm.repack_streams);
+
+                    llaminar2::WeightJob job;
+                    job.name = slot_name;
+                    job.host_raw_data = raw;
+                    job.raw_bytes = raw_bytes;
+                    job.format = *repack_fmt;
+                    job.N = N;
+                    job.K = K;
+                    job.is_asymmetric = vnni->is_asymmetric;
+
+                    orchestrator->addWeightJob(target_device.ordinal, job);
+                    orchestrator->load();
+                }
+                catch (const std::exception &e)
+                {
+                    LOG_WARN("[KernelFactory] On-demand GPU GEMM preload failed for "
+                             << target_device.to_string() << " shape=[" << N << "," << K
+                             << "]: " << e.what());
+                    return nullptr;
+                }
+
+                auto *pool = orchestrator->getPool(target_device.ordinal);
+                auto slot = pool ? pool->getSlot(slot_name)
+                                 : std::optional<llaminar2::WeightVRAMPool::WeightSlot>{};
+                if (!slot)
+                {
+                    LOG_WARN("[KernelFactory] On-demand GPU GEMM preload produced no slot for "
+                             << slot_name);
+                    return nullptr;
+                }
+
+                std::unique_ptr<llaminar2::ITensorGemm> kernel;
+                const uint32_t blocks_per_row = static_cast<uint32_t>(K / 32);
+
+#ifdef HAVE_ROCM
+                if (target_device.is_rocm())
+                {
+                    kernel = std::make_unique<llaminar2::rocm::ROCmQuantisedGemmKernel>(
+                        N, K, target_device.ordinal,
+                        slot->d_native_vnni_payload,
+                        slot->d_native_vnni_scales,
+                        slot->d_native_vnni_mins,
+                        slot->d_native_vnni_emins,
+                        vnni->codebook_id, blocks_per_row,
+                        orchestrator);
+                }
+#endif
+
+#ifdef HAVE_CUDA
+                if (target_device.is_cuda())
+                {
+                    kernel = std::make_unique<llaminar2::cuda::CUDAQuantisedGemmKernel>(
+                        N, K, target_device.ordinal,
+                        slot->d_native_vnni_payload,
+                        static_cast<uint16_t *>(slot->d_native_vnni_scales),
+                        static_cast<uint16_t *>(slot->d_native_vnni_mins),
+                        static_cast<uint32_t *>(slot->d_native_vnni_emins),
+                        vnni->codebook_id, blocks_per_row,
+                        orchestrator);
+                }
+#endif
+
+                if (!kernel)
+                    return nullptr;
+
+                auto *handle = KernelFactory::registerPreparedGemmFromTransfer(
+                    tensor, target_device, std::move(kernel));
+                if (handle)
+                {
+                    LOG_INFO("[KernelFactory] On-demand GPU GEMM preload registered "
+                             << target_device.to_string() << " shape=[" << N << "," << K << "]");
+                }
+                return handle;
+            }
 
             DeviceType KernelFactory::getDeviceType(llaminar2::DeviceId device_id)
             {
@@ -3449,6 +3589,9 @@ namespace llaminar
                 if (resolved_kind == GemmPreparationKind::CUDA_INT8_PACKED ||
                     resolved_kind == GemmPreparationKind::ROCM_INT8_PACKED)
                 {
+                    if (const auto *prepared = prepareGpuGemmOnDemand(tensor, target_device))
+                        return prepared;
+
                     std::string msg = "[KernelFactory] GPU prepared-GEMM cache miss for tensor (shape=["
                         + std::to_string(tensor->shape().size() > 0 ? tensor->shape()[0] : 0) + ","
                         + std::to_string(tensor->shape().size() > 1 ? tensor->shape()[1] : 0)
@@ -3515,6 +3658,64 @@ namespace llaminar
                                                                       << " kind=" << static_cast<int>(resolved_kind)
                                                                       << " tensor=" << tensor);
                 return it->second.get();
+            }
+
+            const KernelFactory::PreparedGemmHandle *KernelFactory::findPreparedGemmWeights(
+                const llaminar2::TensorBase *tensor,
+                llaminar2::DeviceId target_device,
+                GemmPreparationKind prep_kind)
+            {
+                if (!tensor)
+                    return nullptr;
+
+                const bool quantized = dynamic_cast<const llaminar2::IINT8Unpackable *>(tensor) != nullptr;
+                GemmPreparationKind resolved_kind = prep_kind;
+                if (resolved_kind == GemmPreparationKind::AUTO)
+                {
+                    if (!quantized)
+                    {
+                        resolved_kind = GemmPreparationKind::FLOATING_POINT;
+                    }
+                    else
+                    {
+                        switch (getDeviceType(target_device))
+                        {
+                        case DeviceType::CPU:
+                            resolved_kind = GemmPreparationKind::CPU_PACKED;
+                            break;
+                        case DeviceType::CUDA:
+                            resolved_kind = GemmPreparationKind::CUDA_INT8_PACKED;
+                            break;
+                        case DeviceType::ROCm:
+                            resolved_kind = GemmPreparationKind::ROCM_INT8_PACKED;
+                            break;
+                        default:
+                            resolved_kind = GemmPreparationKind::FLOATING_POINT;
+                            break;
+                        }
+                    }
+                }
+
+                const size_t N = static_cast<size_t>(tensor->shape().size() > 0 ? tensor->shape()[0] : 0);
+                const size_t K = static_cast<size_t>(tensor->shape().size() > 1 ? tensor->shape()[1] : 0);
+                const void *key_data = tensor->raw_data();
+                const PreparedGemmKey primary_key{
+                    key_data,
+                    key_data ? nullptr : static_cast<const void *>(tensor),
+                    N, K, target_device, static_cast<int>(resolved_kind)};
+                const PreparedGemmKey fallback_key{
+                    nullptr,
+                    static_cast<const void *>(tensor),
+                    N, K, target_device, static_cast<int>(resolved_kind)};
+
+                std::lock_guard<std::mutex> lock(cache_mutex_);
+                auto it = prepared_gemm_registry_.find(primary_key);
+                if (it != prepared_gemm_registry_.end())
+                    return it->second.get();
+                it = prepared_gemm_registry_.find(fallback_key);
+                if (it != prepared_gemm_registry_.end())
+                    return it->second.get();
+                return nullptr;
             }
 
             const KernelFactory::PreparedGemmHandle *KernelFactory::registerPreparedGemmFromTransfer(

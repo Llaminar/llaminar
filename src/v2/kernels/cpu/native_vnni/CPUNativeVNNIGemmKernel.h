@@ -295,6 +295,27 @@ namespace llaminar2::cpu::native_vnni
             return result;
         }
 
+        std::unique_ptr<IPackedWeights> cloneWeights() const override
+        {
+            if (!valid_)
+                return nullptr;
+
+            if (deferred_packing_ && native_blocks_ptr_ != nullptr && native_block_size_ > 0)
+            {
+                const size_t native_bytes = static_cast<size_t>(packed_.N)
+                                          * static_cast<size_t>(packed_.blocks_per_row)
+                                          * native_block_size_;
+                const auto *src = static_cast<const uint8_t *>(native_blocks_ptr_);
+                std::vector<uint8_t> native_blocks(src, src + native_bytes);
+                return std::make_unique<CPUPackedWeightsWithNativeBlocks>(
+                    CPUNativeVNNIPackedWeights(packed_),
+                    std::move(native_blocks),
+                    native_block_size_);
+            }
+
+            return std::make_unique<CPUPackedWeights>(packed_);
+        }
+
         bool attachWeights(std::unique_ptr<IPackedWeights> weights) override
         {
             if (!weights || weights->format() != PackedWeightsFormat::CPU_NATIVE_VNNI)

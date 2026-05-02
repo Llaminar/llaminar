@@ -186,6 +186,13 @@ namespace llaminar2
          */
         int vocab_size() const override;
 
+        void enableSnapshotCapture(const std::string &output_dir = "") override;
+        void disableSnapshotCapture() override;
+        void clearSnapshots() override;
+        const float *getSnapshot(const std::string &key, size_t &out_size) const override;
+        SnapshotInfo getSnapshotWithShape(const std::string &key) const override;
+        std::vector<std::string> getSnapshotKeys() const override;
+
         /**
          * @brief Get execution path type
          */

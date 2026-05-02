@@ -58,7 +58,7 @@ See `.github/instructions/llaminar-architecture-v2.instructions.md` for a full-s
 ### Build Commands
 
 ```bash
-# Debug build (for development and debugging only)
+# Debug build (for debugging only)
 cmake -B build_v2 -S src/v2 -G Ninja -DCMAKE_BUILD_TYPE=Debug -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
 cmake --build build_v2 --parallel
 

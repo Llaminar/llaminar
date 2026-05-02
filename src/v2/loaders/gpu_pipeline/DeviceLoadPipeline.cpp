@@ -128,6 +128,20 @@ bool DeviceLoadPipeline::processJobs(const std::vector<WeightJob>& jobs)
         const auto& job = jobs[job_idx];
         const int stream_idx = static_cast<int>(job_idx % static_cast<size_t>(num_streams_));
 
+        if (job.raw_bytes == 0)
+        {
+            LOG_ERROR("DeviceLoadPipeline: job '" << job.name << "' has raw_bytes=0");
+            return false;
+        }
+
+        if (!job.host_raw_data)
+        {
+            LOG_ERROR("DeviceLoadPipeline: job '" << job.name
+                      << "' has null host_raw_data for " << job.raw_bytes
+                      << " raw bytes (host weight data was likely released before GPU repack)");
+            return false;
+        }
+
         // Validate raw bytes fit in staging slot
         if (job.raw_bytes > max_staging)
         {

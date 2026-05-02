@@ -18,6 +18,7 @@
 #include <cmath>
 #include <cstring>
 #include <cstdint>
+#include <cstdlib>
 #include <mutex>
 #include <numeric>
 #include <stdexcept>
@@ -676,6 +677,41 @@ namespace llaminar2
 
         const size_t effective_count = (count > 0) ? count : tensor->numel();
 
+        // HOST collectives are host-staged by definition (including mixed CPU/GPU TP).
+        // Synchronize the producer stream and go directly to the CPU barrier path.
+        if (backend_ == CollectiveBackendType::HOST)
+        {
+            auto tensor_device = tensor->current_device();
+            if (stream && tensor_device.has_value())
+            {
+#ifdef HAVE_CUDA
+                if (tensor_device->is_cuda())
+                {
+                    cudaError_t err = cudaStreamSynchronize(static_cast<cudaStream_t>(stream));
+                    if (err != cudaSuccess)
+                    {
+                        LOG_ERROR("LocalTPContext::allreduceOnStream: cudaStreamSynchronize failed for HOST fallback: "
+                                  << cudaGetErrorString(err));
+                        return false;
+                    }
+                }
+#endif
+#ifdef HAVE_ROCM
+                if (tensor_device->is_rocm())
+                {
+                    auto *rocm_backend = dynamic_cast<ROCmBackend *>(getBackendForDevice(*tensor_device));
+                    if (rocm_backend && !rocm_backend->synchronize(tensor_device->toKernelDeviceIndex()))
+                    {
+                        LOG_ERROR("LocalTPContext::allreduceOnStream: ROCm synchronize failed for HOST fallback on "
+                                  << tensor_device->toString());
+                        return false;
+                    }
+                }
+#endif
+            }
+            return allreduce(tensor, stage_name, effective_count);
+        }
+
         // Determine device index from tensor placement
         int device_index = -1;
         auto tensor_device = tensor->current_device();
@@ -1152,6 +1188,22 @@ namespace llaminar2
                       << ", count=" << count
                       << ", waiting for " << (num_participants - 1) << " more CPU devices");
         }
+        else if (!barrier_stage_name_.empty() && !stage_name.empty() && barrier_stage_name_ != stage_name)
+        {
+            LOG_ERROR("LocalTPContext::allreduceCpuBarrier: stage mismatch while waiting for HOST allreduce: first='"
+                      << barrier_stage_name_ << "' arrival='" << stage_name
+                      << "' arrival_order=" << arrival_order
+                      << ", expected=" << num_participants);
+            barrier_count_.store(0);
+            barrier_generation_.fetch_add(1);
+            barrier_tensors_.clear();
+            barrier_stage_name_.clear();
+            barrier_element_count_ = 0;
+
+            lock.unlock();
+            barrier_cv_.notify_all();
+            return false;
+        }
 
         // Use arrival_order for slot assignment (sum is commutative, order doesn't matter)
         barrier_tensors_[arrival_order] = tensor;
@@ -1198,24 +1250,113 @@ namespace llaminar2
                                                               << " CPU devices arrived, reducing "
                                                               << effective_count << " elements");
 
-        // Use tensor[0] as accumulator
-        float *accum = barrier_tensors_[0]->mutable_data();
+        const size_t bytes = effective_count * sizeof(float);
+
+        if (std::getenv("LLAMINAR_TP_HOST_ALLREDUCE_TRACE"))
+        {
+            for (int i = 0; i < num_participants; ++i)
+            {
+                TensorBase *tb = barrier_tensors_[i];
+                LOG_INFO("[LocalTPContext][HostAllreduceTrace] slot=" << i
+                         << " tensor=" << static_cast<void *>(tb)
+                         << " current_device=" << (tb && tb->current_device() ? tb->current_device()->toString() : "none")
+                         << " host=" << (tb ? tb->raw_data() : nullptr)
+                         << " gpu=" << (tb ? tb->gpu_data_ptr() : nullptr)
+                         << " numel=" << (tb ? tb->numel() : 0)
+                         << " count=" << effective_count
+                         << " stage=" << barrier_stage_name_);
+            }
+        }
+
+        auto copy_to_host = [&](TensorBase *tb, float *dst) -> bool
+        {
+            if (!tb || !dst)
+                return false;
+
+            auto dev = tb->current_device();
+            if (dev && dev->is_gpu() && tb->gpu_data_ptr())
+            {
+                IBackend *backend = getBackendForDevice(*dev);
+                if (!backend)
+                    return false;
+                return backend->deviceToHost(dst, tb->gpu_data_ptr(), bytes, dev->gpu_ordinal());
+            }
+
+            const float *src = tb->data();
+            if (!src)
+                return false;
+            std::memcpy(dst, src, bytes);
+            return true;
+        };
+
+        auto copy_from_host = [&](TensorBase *tb, const float *src) -> bool
+        {
+            if (!tb || !src)
+                return false;
+
+            auto dev = tb->current_device();
+            if (dev && dev->is_gpu() && tb->gpu_data_ptr())
+            {
+                IBackend *backend = getBackendForDevice(*dev);
+                if (!backend)
+                    return false;
+                if (!backend->hostToDevice(tb->gpu_data_ptr(), src, bytes, dev->gpu_ordinal()))
+                    return false;
+                tb->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, *dev);
+                return true;
+            }
+
+            float *dst = tb->mutable_data();
+            if (!dst)
+                return false;
+            std::memcpy(dst, src, bytes);
+            return true;
+        };
+
+        std::vector<float> accum(effective_count, 0.0f);
+        std::vector<float> temp(effective_count, 0.0f);
+
+        if (!copy_to_host(barrier_tensors_[0], accum.data()))
+        {
+            LOG_ERROR("LocalTPContext::allreduceCpuBarrier: failed to stage slot 0 to host");
+            barrier_result_ = false;
+            barrier_count_.store(0);
+            barrier_generation_.fetch_add(1);
+            lock.unlock();
+            barrier_cv_.notify_all();
+            return false;
+        }
 
         // Sum contributions from all other tensors
         for (int i = 1; i < num_participants; ++i)
         {
-            const float *src = barrier_tensors_[i]->data();
-            for (size_t j = 0; j < effective_count; ++j)
+            if (!copy_to_host(barrier_tensors_[i], temp.data()))
             {
-                accum[j] += src[j];
+                LOG_ERROR("LocalTPContext::allreduceCpuBarrier: failed to stage slot " << i << " to host");
+                barrier_result_ = false;
+                barrier_count_.store(0);
+                barrier_generation_.fetch_add(1);
+                lock.unlock();
+                barrier_cv_.notify_all();
+                return false;
             }
+            for (size_t j = 0; j < effective_count; ++j)
+                accum[j] += temp[j];
         }
 
         // Copy reduced result to all other tensors
-        for (int i = 1; i < num_participants; ++i)
+        for (int i = 0; i < num_participants; ++i)
         {
-            float *dst = barrier_tensors_[i]->mutable_data();
-            std::memcpy(dst, accum, effective_count * sizeof(float));
+            if (!copy_from_host(barrier_tensors_[i], accum.data()))
+            {
+                LOG_ERROR("LocalTPContext::allreduceCpuBarrier: failed to write reduced data to slot " << i);
+                barrier_result_ = false;
+                barrier_count_.store(0);
+                barrier_generation_.fetch_add(1);
+                lock.unlock();
+                barrier_cv_.notify_all();
+                return false;
+            }
         }
 
         // Cleanup and release waiters

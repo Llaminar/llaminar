@@ -237,6 +237,20 @@ namespace llaminar2
             bool ok;
             if (params_.seq_len == 1)
             {
+                LOG_INFO("[GDNRecurrenceStage] GPU launch pointers layer=" << params_.layer_idx
+                         << " Q=" << static_cast<const void *>(d_q)
+                         << " K=" << static_cast<const void *>(d_k)
+                         << " V=" << static_cast<const void *>(d_v)
+                         << " alpha=" << static_cast<const void *>(d_alpha)
+                         << " beta=" << static_cast<const void *>(d_beta)
+                         << " A_log=" << static_cast<const void *>(d_alog)
+                         << " dt_bias=" << static_cast<const void *>(d_dtbias)
+                         << " output=" << static_cast<void *>(d_output)
+                         << " state=" << static_cast<void *>(params_.recurrence_state)
+                         << " heads=" << params_.n_heads
+                         << " d_k=" << params_.d_k
+                         << " d_v=" << params_.d_v
+                         << " seq=" << params_.seq_len);
                 ok = params_.kernel->recurrent_step(
                     d_q, d_k, d_v,
                     d_alpha, d_beta,
@@ -247,6 +261,20 @@ namespace llaminar2
             }
             else
             {
+                LOG_INFO("[GDNRecurrenceStage] GPU launch pointers layer=" << params_.layer_idx
+                         << " Q=" << static_cast<const void *>(d_q)
+                         << " K=" << static_cast<const void *>(d_k)
+                         << " V=" << static_cast<const void *>(d_v)
+                         << " alpha=" << static_cast<const void *>(d_alpha)
+                         << " beta=" << static_cast<const void *>(d_beta)
+                         << " A_log=" << static_cast<const void *>(d_alog)
+                         << " dt_bias=" << static_cast<const void *>(d_dtbias)
+                         << " output=" << static_cast<void *>(d_output)
+                         << " state=" << static_cast<void *>(params_.recurrence_state)
+                         << " heads=" << params_.n_heads
+                         << " d_k=" << params_.d_k
+                         << " d_v=" << params_.d_v
+                         << " seq=" << params_.seq_len);
                 ok = params_.kernel->chunk_forward(
                     d_q, d_k, d_v,
                     d_alpha, d_beta,

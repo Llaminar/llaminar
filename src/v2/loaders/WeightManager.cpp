@@ -219,7 +219,8 @@ namespace llaminar2
                                  WeightDistributionStrategy strategy,
                                  WeightPrecision weight_precision)
         : loader_(loader), mpi_ctx_(mpi_ctx), placement_map_(placement_map),
-          strategy_(strategy), weight_precision_(weight_precision)
+                    strategy_(strategy), weight_precision_(weight_precision),
+                    weight_metadata_(std::make_shared<WeightMetadataRegistry>())
     {
         int rank = mpi_ctx_ ? mpi_ctx_->rank() : 0;
 
@@ -276,6 +277,94 @@ namespace llaminar2
         }
     }
 
+    WeightSliceSpec WeightManager::fullSliceSpec(const TensorBase &tensor) const
+    {
+        WeightSliceSpec spec;
+        const auto &shape = tensor.shape();
+        spec.source_rows = shape.empty() ? 0 : shape[0];
+        spec.source_cols = shape.size() > 1 ? shape[1] : 1;
+        spec.row_start = 0;
+        spec.row_count = spec.source_rows;
+        spec.col_start = 0;
+        spec.col_count = spec.source_cols;
+        if (shape.size() > 2)
+        {
+            spec.expert_start = 0;
+            spec.expert_count = shape[2];
+        }
+        return spec;
+    }
+
+    void WeightManager::registerSourceMetadata(
+        const std::string &name,
+        const std::shared_ptr<TensorBase> &tensor,
+        DeviceId device)
+    {
+        if (!tensor || !weight_metadata_)
+            return;
+
+        if (!weight_metadata_->has(tensor.get()))
+            weight_metadata_->registerSource(tensor.get(), name, device);
+
+        WeightLifecycleTrace::record(
+            WeightLifecycleEventType::SourceLoad,
+            name,
+            inferWeightRole(name),
+            inferWeightLayer(name),
+            device,
+            "source tensor loaded");
+    }
+
+    void WeightManager::registerDerivedMetadata(
+        const std::string &name,
+        const std::shared_ptr<TensorBase> &tensor,
+        WeightDerivationKind derivation,
+        WeightSliceSpec slice,
+        DeviceId device)
+    {
+        if (!tensor || !weight_metadata_)
+            return;
+
+        WeightIdentity identity = makeSourceWeightIdentity(name);
+        identity.derivation = derivation;
+        weight_metadata_->registerWeight(tensor.get(), std::move(identity), slice, WeightResidency{device, device});
+
+        WeightLifecycleTrace::record(
+            derivation == WeightDerivationKind::DeviceClone ? WeightLifecycleEventType::Clone : WeightLifecycleEventType::Slice,
+            name,
+            inferWeightRole(name),
+            inferWeightLayer(name),
+            device,
+            toString(derivation));
+    }
+
+    void WeightManager::registerCloneMetadata(
+        const std::string &name,
+        const std::shared_ptr<TensorBase> &source,
+        const std::shared_ptr<TensorBase> &clone,
+        DeviceId device)
+    {
+        if (!source || !clone || !weight_metadata_)
+            return;
+
+        if (!weight_metadata_->has(source.get()))
+            registerSourceMetadata(name, source, DeviceId::cpu());
+
+        if (!weight_metadata_->registerDerived(
+                clone.get(), source.get(), WeightDerivationKind::DeviceClone, fullSliceSpec(*source), device))
+        {
+            registerDerivedMetadata(name, clone, WeightDerivationKind::DeviceClone, fullSliceSpec(*source), device);
+        }
+
+        WeightLifecycleTrace::record(
+            WeightLifecycleEventType::Clone,
+            name,
+            inferWeightRole(name),
+            inferWeightLayer(name),
+            device,
+            "device clone");
+    }
+
     bool WeightManager::isGemmWeight(const std::string &name) const
     {
         if (!has_sharding_config_)
@@ -302,6 +391,7 @@ namespace llaminar2
             return nullptr;
         }
 
+        registerSourceMetadata(name, tensor, device);
         return tensor;
     }
 
@@ -470,6 +560,14 @@ namespace llaminar2
 
     namespace
     {
+        bool shouldRetainRawForLazyMoE(const std::string &key)
+        {
+            const auto &env = debugEnv();
+            return env.moe_rebalance.mode == "dynamic" &&
+                   !env.moe_rebalance.release_raw_weights &&
+                   key.find("_exps.weight") != std::string::npos;
+        }
+
         /**
          * @brief Create a typed tensor from raw bytes (generic for all tensor types)
          *
@@ -639,6 +737,15 @@ namespace llaminar2
                 true /* inner_is_presliced=true - slice already loaded */);
 
             auto slice = std::make_shared<TensorSlice>(std::move(slice_tensor), meta);
+            WeightSliceSpec row_slice;
+            row_slice.source_rows = total_rows;
+            row_slice.source_cols = cols;
+            row_slice.row_start = row_start;
+            row_slice.row_count = row_count;
+            row_slice.col_start = 0;
+            row_slice.col_count = cols;
+            row_slice.inner_is_presliced = true;
+            registerDerivedMetadata(name, slice, WeightDerivationKind::RowSlice, row_slice, device);
             return slice;
         }
         else if (mode == ShardingMode::COLUMN_PARALLEL)
@@ -1005,6 +1112,16 @@ namespace llaminar2
                     auto result = std::make_shared<TensorSlice>(
                         std::shared_ptr<TensorBase>(std::move(result_tensor)), meta);
 
+                    WeightSliceSpec fused_slice;
+                    fused_slice.source_rows = total_rows;
+                    fused_slice.source_cols = cols;
+                    fused_slice.row_start = 0;
+                    fused_slice.row_count = total_out_rows;
+                    fused_slice.col_start = 0;
+                    fused_slice.col_count = cols;
+                    fused_slice.inner_is_presliced = true;
+                    registerDerivedMetadata(name, result, WeightDerivationKind::FusedSubblockConcat, fused_slice, device);
+
                     LOG_DEBUG("[WeightManager] Rank " << rank
                                                       << " fused-QKV column-parallel " << name
                                                       << " [" << total_rows << ", " << cols << "]"
@@ -1058,6 +1175,15 @@ namespace llaminar2
                 true /* inner_is_presliced=true - slice already loaded */);
 
             auto slice = std::make_shared<TensorSlice>(std::move(slice_tensor), meta);
+            WeightSliceSpec column_slice;
+            column_slice.source_rows = total_rows;
+            column_slice.source_cols = cols;
+            column_slice.row_start = row_start;
+            column_slice.row_count = row_count;
+            column_slice.col_start = 0;
+            column_slice.col_count = cols;
+            column_slice.inner_is_presliced = true;
+            registerDerivedMetadata(name, slice, WeightDerivationKind::RowSlice, column_slice, device);
             return slice;
         }
         else if (mode == ShardingMode::INPUT_PARALLEL)
@@ -1136,6 +1262,15 @@ namespace llaminar2
                 true /* inner_is_presliced=true - slice already loaded */);
 
             auto slice = std::make_shared<TensorSlice>(std::move(slice_tensor), meta);
+            WeightSliceSpec input_slice;
+            input_slice.source_rows = rows;
+            input_slice.source_cols = total_cols;
+            input_slice.row_start = 0;
+            input_slice.row_count = rows;
+            input_slice.col_start = col_start;
+            input_slice.col_count = col_count;
+            input_slice.inner_is_presliced = true;
+            registerDerivedMetadata(name, slice, WeightDerivationKind::ColumnSlice, input_slice, device);
             return slice;
         }
         else if (mode == ShardingMode::EXPERT_PARALLEL)
@@ -1213,6 +1348,17 @@ namespace llaminar2
 
             // Return the sliced 3D tensor directly (no TensorSlice wrapping needed —
             // expert parallelism uses allreduce on the MoE output, not on weights)
+            WeightSliceSpec expert_slice;
+            expert_slice.source_rows = ne0;
+            expert_slice.source_cols = ne1;
+            expert_slice.row_start = 0;
+            expert_slice.row_count = ne0;
+            expert_slice.col_start = 0;
+            expert_slice.col_count = ne1;
+            expert_slice.expert_start = expert_start;
+            expert_slice.expert_count = expert_count;
+            expert_slice.inner_is_presliced = true;
+            registerDerivedMetadata(name, slice_tensor, WeightDerivationKind::ExpertSlice, expert_slice, device);
             return slice_tensor;
         }
 
@@ -1232,6 +1378,106 @@ namespace llaminar2
 
         LOG_ERROR("[WeightManager] INTERLEAVED strategy not yet implemented, falling back to REPLICATED");
         return getReplicatedWeight(name, device);
+    }
+
+    FrozenModelWeightSet WeightManager::materialize(const WeightPlan &plan)
+    {
+        ModelWeightSetBuilder builder(plan.strategy());
+
+        for (const auto &requirement : plan.requirements())
+        {
+            auto tensor = getWeightForDevice(
+                requirement.canonical_name,
+                requirement.target_device,
+                requirement.layer);
+
+            if (!tensor)
+            {
+                if (requirement.required)
+                {
+                    throw std::runtime_error("[WeightManager] Required weight missing during materialization: " +
+                                             requirement.canonical_name);
+                }
+                continue;
+            }
+
+            WeightBinding binding;
+            binding.identity = makeSourceWeightIdentity(
+                requirement.canonical_name,
+                plan.strategy().model_id);
+            binding.identity.role = requirement.role == WeightRole::Other
+                                        ? inferWeightRole(requirement.canonical_name)
+                                        : requirement.role;
+            binding.identity.layer = requirement.layer >= 0
+                                         ? requirement.layer
+                                         : inferWeightLayer(requirement.canonical_name);
+            binding.identity.expert = requirement.expert >= 0
+                                          ? requirement.expert
+                                          : inferWeightExpert(requirement.canonical_name);
+            binding.identity.pp_stage = requirement.pp_stage;
+            binding.identity.tp_domain = requirement.tp_domain;
+            binding.identity.tp_rank_or_device_index = requirement.tp_rank_or_device_index;
+
+            binding.slice = requirement.slice;
+            binding.residency.home_device = requirement.target_device;
+            binding.residency.resident_device = requirement.target_device;
+            binding.residency.host_policy = requirement.host_policy;
+            binding.tensor = tensor.get();
+
+            if (weight_metadata_)
+            {
+                if (auto metadata = weight_metadata_->metadata(tensor.get()))
+                {
+                    binding.identity = metadata->identity;
+                    binding.identity.model_id = plan.strategy().model_id;
+                    binding.identity.role = requirement.role == WeightRole::Other
+                                                ? metadata->identity.role
+                                                : requirement.role;
+                    binding.identity.layer = requirement.layer >= 0
+                                                 ? requirement.layer
+                                                 : metadata->identity.layer;
+                    binding.identity.expert = requirement.expert >= 0
+                                                  ? requirement.expert
+                                                  : metadata->identity.expert;
+                    binding.identity.pp_stage = requirement.pp_stage;
+                    binding.identity.tp_domain = requirement.tp_domain;
+                    binding.identity.tp_rank_or_device_index = requirement.tp_rank_or_device_index;
+                    binding.slice = metadata->slice;
+                    binding.residency = metadata->residency;
+                    binding.residency.home_device = requirement.target_device;
+                    binding.residency.resident_device = requirement.target_device;
+                    binding.residency.host_policy = requirement.host_policy;
+                }
+            }
+
+            if (binding.slice.source_rows == 0 && tensor)
+                binding.slice = fullSliceSpec(*tensor);
+
+            if (requirement.expected_prepared_kind != PreparedWeightKind::None)
+            {
+                binding.prepared = PreparedWeightRef{
+                    plan.strategy().model_id,
+                    0,
+                    requirement.expected_prepared_kind,
+                    requirement.target_device};
+            }
+
+            auto &added = builder.addBinding(std::move(binding));
+            if (added.prepared)
+                added.prepared->binding_id = added.binding_id;
+
+            WeightLifecycleTrace::record(
+                WeightLifecycleEventType::GraphBind,
+                requirement.canonical_name,
+                added.identity.role,
+                added.identity.layer,
+                requirement.target_device,
+                "materialized binding " + std::to_string(added.binding_id));
+        }
+
+        FrozenModelWeightSet frozen(plan.strategy(), builder.freezeBindings());
+        frozen.validateForGraph();
+        return frozen;
     }
 
     // =========================================================================
@@ -1369,6 +1615,26 @@ namespace llaminar2
         // Cache the decode shard
         if (decode_shard)
         {
+            if (decode_shard.get() != full_tensor.get())
+            {
+                WeightSliceSpec decode_slice = fullSliceSpec(*full_tensor);
+                decode_slice.inner_is_presliced = true;
+                if (mode == ShardingMode::COLUMN_PARALLEL)
+                {
+                    decode_slice.row_count = decode_shard->shape()[0];
+                    decode_slice.row_start = decode_slice.source_rows - decode_slice.row_count;
+                    decode_slice.col_start = 0;
+                    decode_slice.col_count = decode_slice.source_cols;
+                }
+                else
+                {
+                    decode_slice.row_start = 0;
+                    decode_slice.row_count = decode_slice.source_rows;
+                    decode_slice.col_count = decode_shard->shape().size() > 1 ? decode_shard->shape()[1] : 1;
+                    decode_slice.col_start = decode_slice.source_cols - decode_slice.col_count;
+                }
+                registerDerivedMetadata(name, decode_shard, WeightDerivationKind::DecodeShard, decode_slice, decode_device);
+            }
             decode_cache_[cache_key] = decode_shard;
         }
 
@@ -1887,6 +2153,7 @@ namespace llaminar2
                                                                 << " size_bytes=" << clone->size_bytes());
         }
 
+        registerCloneMetadata(name, original, clone, target_device);
         return clone;
     }
 
@@ -3188,7 +3455,7 @@ namespace llaminar2
                     // Skip for token_embd.weight: it's also used for embedding lookup,
                     // which runs concurrently (Steps 2/2b). Its host data is freed
                     // later by releaseAllHostWeightData().
-                    if (name != "token_embd.weight")
+                    if (name != "token_embd.weight" && !shouldRetainRawForLazyMoE(name))
                     {
                         try
                         {
@@ -3366,6 +3633,16 @@ namespace llaminar2
                 return;
             }
 
+            if (shouldRetainRawForLazyMoE(key))
+            {
+                skipped_count++;
+                retained_bytes += tensor_bytes;
+                retained_count++;
+                LOG_DEBUG("[WeightManager] RETAINED lazy-MoE raw expert data for " << key
+                                                                                    << " (" << (tensor_bytes / 1024) << " KB)");
+                return;
+            }
+
             // Release host data for tensors that have valid GPU data OR
             // kernel-managed device data (GEMM packed weights, prepared embedding).
             // GEMM kernels upload pre-packed representations to their own device
@@ -3458,6 +3735,11 @@ namespace llaminar2
                 return;
             if (!ptr->isHostResident())
                 return;
+            if (shouldRetainRawForLazyMoE(key))
+            {
+                LOG_DEBUG("[WeightManager] RETAINED host-resident lazy-MoE raw expert data for " << key);
+                return;
+            }
 
             size_t tensor_bytes = ptr->size_bytes();
             ptr->release_host_weight_data();
@@ -3731,6 +4013,7 @@ namespace llaminar2
         {
             throw std::runtime_error("[WeightManager] Failed to load 1D tensor: " + name);
         }
+        registerSourceMetadata(name, full_tensor, device);
 
         // Create sliced tensor
         auto *fp32_full = dynamic_cast<FP32Tensor *>(full_tensor.get());
@@ -3751,6 +4034,16 @@ namespace llaminar2
                                             << " [" << total_size << "]"
                                             << " -> [" << slice_start << ", " << (slice_start + slice_count) << ")"
                                             << " = " << slice_count << " elements");
+
+        WeightSliceSpec bias_slice;
+        bias_slice.source_rows = total_size;
+        bias_slice.source_cols = 1;
+        bias_slice.row_start = slice_start;
+        bias_slice.row_count = slice_count;
+        bias_slice.col_start = 0;
+        bias_slice.col_count = 1;
+        bias_slice.inner_is_presliced = true;
+        registerDerivedMetadata(name, sliced, WeightDerivationKind::RowSlice, bias_slice, device);
 
         return sliced;
     }
@@ -3796,6 +4089,16 @@ namespace llaminar2
             true /* inner_is_presliced */);
 
         auto result = std::make_shared<TensorSlice>(std::move(slice_tensor), meta);
+
+        WeightSliceSpec column_slice;
+        column_slice.source_rows = total_rows;
+        column_slice.source_cols = cols;
+        column_slice.row_start = row_start;
+        column_slice.row_count = row_count;
+        column_slice.col_start = 0;
+        column_slice.col_count = cols;
+        column_slice.inner_is_presliced = true;
+        registerDerivedMetadata(name, result, WeightDerivationKind::RowSlice, column_slice, device);
 
         LOG_DEBUG("[WeightManager] Device " << device.to_string()
                                             << " (rank " << assignment.local_rank << "/" << tp_config_->worldSize() << ")"
@@ -3966,6 +4269,16 @@ namespace llaminar2
         auto result = std::make_shared<TensorSlice>(
             std::shared_ptr<TensorBase>(std::move(result_tensor)), meta);
 
+        WeightSliceSpec fused_slice;
+        fused_slice.source_rows = total_rows;
+        fused_slice.source_cols = cols;
+        fused_slice.row_start = 0;
+        fused_slice.row_count = total_out_rows;
+        fused_slice.col_start = 0;
+        fused_slice.col_count = cols;
+        fused_slice.inner_is_presliced = true;
+        registerDerivedMetadata(name, result, WeightDerivationKind::FusedSubblockConcat, fused_slice, device);
+
         LOG_DEBUG("[WeightManager] Device " << device.to_string()
                                             << " (rank " << rank << "/" << world_size << ")"
                                             << " fused-QKV column-parallel " << name
@@ -4008,6 +4321,16 @@ namespace llaminar2
             true /* inner_is_presliced */);
 
         auto result = std::make_shared<TensorSlice>(std::move(slice_tensor), meta);
+
+        WeightSliceSpec row_slice;
+        row_slice.source_rows = total_rows;
+        row_slice.source_cols = cols;
+        row_slice.row_start = row_start;
+        row_slice.row_count = row_count;
+        row_slice.col_start = 0;
+        row_slice.col_count = cols;
+        row_slice.inner_is_presliced = true;
+        registerDerivedMetadata(name, result, WeightDerivationKind::RowSlice, row_slice, device);
 
         LOG_DEBUG("[WeightManager] Device " << device.to_string()
                                             << " (rank " << assignment.local_rank << "/" << tp_config_->worldSize() << ")"
@@ -4052,6 +4375,16 @@ namespace llaminar2
 
         auto result = std::make_shared<TensorSlice>(std::move(slice_tensor), meta);
 
+        WeightSliceSpec input_slice;
+        input_slice.source_rows = rows;
+        input_slice.source_cols = total_cols;
+        input_slice.row_start = 0;
+        input_slice.row_count = rows;
+        input_slice.col_start = col_start;
+        input_slice.col_count = col_count;
+        input_slice.inner_is_presliced = true;
+        registerDerivedMetadata(name, result, WeightDerivationKind::ColumnSlice, input_slice, device);
+
         LOG_DEBUG("[WeightManager] Device " << device.to_string()
                                             << " (rank " << assignment.local_rank << "/" << tp_config_->worldSize() << ")"
                                             << " input-parallel " << name
@@ -4072,6 +4405,12 @@ namespace llaminar2
         const DeviceShardingAssignment &assignment,
         int layer_idx)
     {
+        // Get sharding mode for this weight before consulting the per-device
+        // cache. Older/preload paths may have populated the cache with a plain
+        // device clone; for TP-sharded weights graph builders must see the
+        // TensorSlice wrapper so row/column-parallel metadata is preserved.
+        ShardingMode mode = getShardingMode(name);
+
         // Check per-device cache first.
         // WeightManager is rank-local, so device string uniquely identifies the
         // cache entry. LOCAL TP devices have distinct DeviceIds (e.g. cuda:0, cuda:1).
@@ -4079,11 +4418,24 @@ namespace llaminar2
         auto it = per_device_cache_.find(cache_key);
         if (it != per_device_cache_.end())
         {
-            return it->second;
-        }
+            TensorSlice *slice = dynamic_cast<TensorSlice *>(it->second.get());
+            const bool cache_matches_mode =
+                (mode == ShardingMode::REPLICATE) ||
+                (mode == ShardingMode::ROW_PARALLEL && slice && slice->is_row_parallel()) ||
+                (mode == ShardingMode::INPUT_PARALLEL && slice && slice->is_row_parallel()) ||
+                (mode == ShardingMode::COLUMN_PARALLEL && slice && slice->is_column_parallel()) ||
+                (mode == ShardingMode::EXPERT_PARALLEL);
 
-        // Get sharding mode for this weight
-        ShardingMode mode = getShardingMode(name);
+            if (cache_matches_mode)
+            {
+                return it->second;
+            }
+
+            LOG_DEBUG("[WeightManager] Ignoring stale per-device cache entry without TP slice metadata: "
+                      << cache_key << " mode=" << static_cast<int>(mode)
+                      << " tensor=" << it->second.get());
+            per_device_cache_.erase(it);
+        }
 
         LOG_TRACE("[WeightManager] getShardedWeightForAssignment: " << name
                                                                     << " device=" << device.to_string()
@@ -4103,23 +4455,28 @@ namespace llaminar2
             // separate GPU memory and releaseAllHostWeightData() may free host data
             // after the first device uploads (breaking the second device's upload).
             auto cached_it = cache_.find(name);
-            if (cached_it != cache_.end() && cached_it->second &&
-                cached_it->second->isHostResident())
+            if (cached_it == cache_.end() || !cached_it->second)
+            {
+                auto original = getReplicatedWeight(name, DeviceId::cpu());
+                if (original)
+                {
+                    cache_[name] = original;
+                    cached_it = cache_.find(name);
+                }
+            }
+
+            if (cached_it != cache_.end() && cached_it->second && cached_it->second->isHostResident())
             {
                 result = cached_it->second;
                 LOG_DEBUG("[WeightManager] Sharing host-resident REPLICATE weight: " << name
                                                                                      << " for " << device.to_string()
                                                                                      << " (" << (result->size_bytes() / (1024 * 1024)) << " MB)");
             }
-            else
+            else if (cached_it != cache_.end() && cached_it->second)
             {
-                result = getReplicatedWeight(name, device);
-                // Cache in cache_ so subsequent devices can find and share
-                // host-resident tensors (e.g., token_embd.weight).
+                result = cloneTensorForDevice(name, cached_it->second, device);
                 if (result)
-                {
-                    cache_[name] = result;
-                }
+                    per_device_cache_[cache_key] = result;
             }
             if (result)
             {
@@ -4159,6 +4516,16 @@ namespace llaminar2
                         total_rows, cols, assignment.local_rank, tp_config_->worldSize(),
                         true /* inner_is_presliced */);
                     result = std::make_shared<TensorSlice>(std::move(slice_tensor), meta);
+
+                    WeightSliceSpec tied_slice;
+                    tied_slice.source_rows = total_rows;
+                    tied_slice.source_cols = cols;
+                    tied_slice.row_start = row_start;
+                    tied_slice.row_count = row_count;
+                    tied_slice.col_start = 0;
+                    tied_slice.col_count = cols;
+                    tied_slice.inner_is_presliced = true;
+                    registerDerivedMetadata(name, result, WeightDerivationKind::TiedAlias, tied_slice, device);
 
                     LOG_DEBUG("[WeightManager] Device " << device.to_string()
                                                         << " tied embedding LM head"
@@ -4261,6 +4628,18 @@ namespace llaminar2
             {
                 throw std::runtime_error("[WeightManager] Failed to load expert slice for: " + name);
             }
+
+            WeightSliceSpec expert_slice;
+            expert_slice.source_rows = dims[0];
+            expert_slice.source_cols = dims[1];
+            expert_slice.row_start = 0;
+            expert_slice.row_count = dims[0];
+            expert_slice.col_start = 0;
+            expert_slice.col_count = dims[1];
+            expert_slice.expert_start = expert_start;
+            expert_slice.expert_count = expert_count;
+            expert_slice.inner_is_presliced = true;
+            registerDerivedMetadata(name, result, WeightDerivationKind::ExpertSlice, expert_slice, device);
 
             LOG_INFO("[WeightManager] Device " << device.to_string()
                                                << " expert-parallel " << name

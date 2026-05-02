@@ -730,6 +730,12 @@ namespace llaminar2
             const std::vector<std::vector<bool>>& masks,
             const ReceivedWeightsMap& received_weights = {});
 
+        /// Non-destructively collect packed expert weights for experts requested
+        /// by masks. Used for intra-rank migration between composed TP domains
+        /// without falling back to raw GGUF host tensors.
+        ReceivedWeightsMap collectExpertWeightsForMasks(
+            const std::vector<std::vector<bool>>& masks) const;
+
         /// Set expert replica info on all MoE stages for per-token dispatch.
         /// Call after applyExpertMasks() so GEMM engines are already prepared.
         void setExpertReplicaSet(const ExpertReplicaSet& replicas, int socket_id);
@@ -878,6 +884,11 @@ namespace llaminar2
          * @return Optional containing FactoryPPStageConfig if this is a PP stage
          */
         const std::optional<FactoryPPStageConfig> &ppStageConfig() const { return pp_stage_config_; }
+
+        /// Enable or disable this DGO's post-prefill host-resident weight release.
+        /// RankOrchestrator disables this for child DGOs because it owns the
+        /// synchronization point across sibling TP/PP runners.
+        void setHostResidentReleaseEnabled(bool enabled) { release_host_resident_after_forward_ = enabled; }
 
         /**
          * @brief Check if this orchestrator is running as a PP stage
@@ -2095,6 +2106,7 @@ namespace llaminar2
 
         /// Whether host-resident weight data has been released after first prefill
         bool host_resident_released_ = false;
+        bool release_host_resident_after_forward_ = true;
 
         // =========================================================================
         // MoE Expert Rebalance Controller

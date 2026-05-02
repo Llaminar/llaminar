@@ -2763,6 +2763,9 @@ namespace llaminar2
         /// 0 means wait forever (normal operation). Set to e.g. 30000 for a 30s safety net if debugging hangs.
         int tp_collect_timeout_ms = 0;
 
+        /// Enable model weight lifecycle trace events (env: LLAMINAR_WEIGHT_LIFECYCLE_TRACE=1)
+        bool weight_lifecycle_trace = false;
+
         DebugEnv()
         {
             const char *tp_env = std::getenv("LLAMINAR_TP_TIMING");
@@ -2782,6 +2785,8 @@ namespace llaminar2
             const char *collect_timeout = std::getenv("LLAMINAR_TP_COLLECT_TIMEOUT_MS");
             if (collect_timeout)
                 tp_collect_timeout_ms = std::atoi(collect_timeout);
+            const char *weight_trace = std::getenv("LLAMINAR_WEIGHT_LIFECYCLE_TRACE");
+            weight_lifecycle_trace = weight_trace && std::string(weight_trace) == "1";
             const char *coh_audit = std::getenv("LLAMINAR_COHERENCE_AUDIT");
             coherence_audit = coh_audit && std::string(coh_audit) == "1";
             const char *act_rot = std::getenv("LLAMINAR_ACTIVATION_ROTATION");
@@ -2839,6 +2844,8 @@ namespace llaminar2
             const char *collect_timeout = std::getenv("LLAMINAR_TP_COLLECT_TIMEOUT_MS");
             if (collect_timeout)
                 tp_collect_timeout_ms = std::atoi(collect_timeout);
+            const char *weight_trace = std::getenv("LLAMINAR_WEIGHT_LIFECYCLE_TRACE");
+            weight_lifecycle_trace = weight_trace && std::string(weight_trace) == "1";
             const char *coh_audit = std::getenv("LLAMINAR_COHERENCE_AUDIT");
             coherence_audit = coh_audit && std::string(coh_audit) == "1";
             activation_rotation = true; // default on

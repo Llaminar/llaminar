@@ -115,7 +115,15 @@ namespace llaminar2
         {
             (void)chunk_size;
             rocmGDN_gpu_set_device(device_ordinal_);
-            float *effective_state = gpu_state_ ? gpu_state_ : state;
+            const int required_state_size = n_heads * d_k * d_v;
+            if (!gpu_state_ || state_size_ != required_state_size)
+                allocateState(required_state_size);
+            if (!gpu_state_)
+            {
+                LOG_ERROR("[ROCmGatedDeltaNet] Missing GPU recurrence state");
+                return false;
+            }
+            float *effective_state = gpu_state_;
 
             // All pointers are device pointers — pass directly to HIP kernel.
             return rocmGDN_chunk_forward(
@@ -134,7 +142,15 @@ namespace llaminar2
             bool use_qk_l2norm) override
         {
             rocmGDN_gpu_set_device(device_ordinal_);
-            float *effective_state = gpu_state_ ? gpu_state_ : state;
+            const int required_state_size = n_heads * d_k * d_v;
+            if (!gpu_state_ || state_size_ != required_state_size)
+                allocateState(required_state_size);
+            if (!gpu_state_)
+            {
+                LOG_ERROR("[ROCmGatedDeltaNet] Missing GPU recurrence state");
+                return false;
+            }
+            float *effective_state = gpu_state_;
 
             // All pointers are device pointers — pass directly to HIP kernel.
             return rocmGDN_recurrent_step(

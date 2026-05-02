@@ -728,12 +728,21 @@ namespace llaminar2
                 auto *device_orchestrator = dynamic_cast<DeviceGraphOrchestrator *>(result.runner.get());
                 if (device_orchestrator)
                 {
+                    device_orchestrator->setHostResidentReleaseEnabled(false);
                     device_orchestrator->setPPStageConfig(config_.nested_pp_stage_config.value());
                     LOG_DEBUG("RankOrchestrator: Set PP stage config on device " << result.device_idx
                                                                                         << " (layers " << config_.nested_pp_stage_config->first_layer
                                                                                         << "-" << config_.nested_pp_stage_config->last_layer
                                                                                         << " has_lm_head=" << config_.nested_pp_stage_config->has_lm_head << ")");
                 }
+                else if (auto *dgo = dynamic_cast<DeviceGraphOrchestrator *>(result.runner.get()))
+                {
+                    dgo->setHostResidentReleaseEnabled(false);
+                }
+            }
+            else if (auto *dgo = dynamic_cast<DeviceGraphOrchestrator *>(result.runner.get()))
+            {
+                dgo->setHostResidentReleaseEnabled(false);
             }
 
             // Store as IInferenceRunner (decoupled from concrete DGO type)
@@ -993,6 +1002,9 @@ namespace llaminar2
                                              std::to_string(stage_idx) + " on device " +
                                              primary_device.to_string());
                 }
+
+                if (auto *dgo = dynamic_cast<DeviceGraphOrchestrator *>(runner.get()))
+                    dgo->setHostResidentReleaseEnabled(false);
 
                 pp_stage_runners_.push_back(std::move(runner));
 
@@ -1577,7 +1589,8 @@ namespace llaminar2
 
             // After first prefill, release host-resident weight data.
             // GPU kernels (e.g., embedding repack) have now uploaded their own
-            // device copies, so the host data is no longer needed.
+            // device copies, and later MoE migration must use prepared/packed
+            // weight transfer rather than falling back to raw GGUF bytes.
             if (!host_resident_released_ && seq_len > 1 && model_ctx_)
             {
                 host_resident_released_ = true;
@@ -2728,20 +2741,54 @@ namespace llaminar2
         const std::vector<std::vector<std::vector<bool>>> &masks_by_socket)
     {
         int applied = 0;
+        std::vector<DeviceGraphOrchestrator *> local_dgos;
+        local_dgos.reserve(device_runners_.size());
+        for (auto &runner : device_runners_)
+            local_dgos.push_back(dynamic_cast<DeviceGraphOrchestrator *>(runner.get()));
+
+        auto collect_local_transfers = [&](size_t destination_idx,
+                                           const std::vector<std::vector<bool>> &destination_masks) {
+            ReceivedWeightsMap merged;
+            for (size_t source_idx = 0; source_idx < local_dgos.size(); ++source_idx)
+            {
+                if (source_idx == destination_idx || !local_dgos[source_idx])
+                    continue;
+
+                auto source_blobs = local_dgos[source_idx]->collectExpertWeightsForMasks(destination_masks);
+                for (auto &layer_entry : source_blobs)
+                {
+                    auto &dst_layer = merged[layer_entry.first];
+                    for (auto &expert_entry : layer_entry.second)
+                    {
+                        if (dst_layer.find(expert_entry.first) == dst_layer.end())
+                            dst_layer.emplace(expert_entry.first, std::move(expert_entry.second));
+                    }
+                }
+            }
+            return merged;
+        };
+
+        std::vector<ReceivedWeightsMap> received_by_device(device_runners_.size());
+        for (size_t device_idx = 0; device_idx < device_runners_.size(); ++device_idx)
+        {
+            if (device_idx < masks_by_socket.size() && local_dgos[device_idx])
+                received_by_device[device_idx] = collect_local_transfers(device_idx, masks_by_socket[device_idx]);
+        }
+
         for (size_t device_idx = 0; device_idx < device_runners_.size(); ++device_idx)
         {
             if (device_idx >= masks_by_socket.size())
                 continue;
 
-            auto *dgo = dynamic_cast<DeviceGraphOrchestrator *>(device_runners_[device_idx].get());
+            auto *dgo = local_dgos[device_idx];
             if (!dgo)
                 continue;
 
-            dgo->applyExpertMasks(masks_by_socket[device_idx], ReceivedWeightsMap{});
+            dgo->applyExpertMasks(masks_by_socket[device_idx], received_by_device[device_idx]);
             ++applied;
         }
 
-        if (applied == 0 && !pp_stage_runners_.empty())
+        if (!pp_stage_runners_.empty())
         {
             for (auto &runner : pp_stage_runners_)
             {
@@ -2749,7 +2796,15 @@ namespace llaminar2
                 {
                     rank->applyMoEExpertMasksForAllDevices(masks_by_socket);
                     ++applied;
-                    break;
+                    continue;
+                }
+                if (auto *dgo = dynamic_cast<DeviceGraphOrchestrator *>(runner.get()))
+                {
+                    if (!masks_by_socket.empty())
+                    {
+                        dgo->applyExpertMasks(masks_by_socket.front(), ReceivedWeightsMap{});
+                        ++applied;
+                    }
                 }
             }
         }

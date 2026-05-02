@@ -330,9 +330,19 @@ namespace llaminar2
 
         if (!is_decode)
         {
-            // Prefill: fast path without graph capture overhead
-            success = executor_.executeFastDecode(
-                *forward_cache.graph, ctx, &forward_cache.collective_nodes);
+            if (executor_.config().snapshot_callback)
+            {
+                // Snapshot tests need callbacks on cached prefill replays too.
+                // executeFastDecode() intentionally disables callbacks, so use
+                // the full policy whenever capture is enabled.
+                success = executor_.execute(*forward_cache.graph, ctx);
+            }
+            else
+            {
+                // Prefill: fast path without graph capture overhead
+                success = executor_.executeFastDecode(
+                    *forward_cache.graph, ctx, &forward_cache.collective_nodes);
+            }
         }
         else
         {

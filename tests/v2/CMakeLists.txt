@@ -45,14 +45,22 @@ function(add_v2_gpu_backend_test TARGET_BASE SOURCE TEST_BASE)
         set(ROCM_TARGET ${TARGET_BASE}_rocm)
         add_executable(${ROCM_TARGET} ${SOURCE})
         target_compile_definitions(${ROCM_TARGET} PRIVATE GPU_CONTEXT_TEST_BACKEND_ROCM=1)
-        target_link_libraries(${ROCM_TARGET} PRIVATE
-            -Wl,--start-group
-            llaminar2_core
-            -Wl,--whole-archive rocm_backend -Wl,--no-whole-archive
-            -Wl,--end-group
-            GTest::gtest
-            GTest::gtest_main
-        )
+        if(LLAMINAR_SHARED_CORE)
+            target_link_libraries(${ROCM_TARGET} PRIVATE
+                llaminar2_core
+                GTest::gtest
+                GTest::gtest_main
+            )
+        else()
+            target_link_libraries(${ROCM_TARGET} PRIVATE
+                -Wl,--start-group
+                llaminar2_core
+                -Wl,--whole-archive rocm_backend -Wl,--no-whole-archive
+                -Wl,--end-group
+                GTest::gtest
+                GTest::gtest_main
+            )
+        endif()
         add_v2_test(${TEST_BASE}_ROCm
             COMMAND $<TARGET_FILE:${ROCM_TARGET}>
             LABELS ${TEST_LABELS} ROCm
@@ -64,14 +72,22 @@ function(add_v2_gpu_backend_test TARGET_BASE SOURCE TEST_BASE)
         set(CUDA_TARGET ${TARGET_BASE}_cuda)
         add_executable(${CUDA_TARGET} ${SOURCE})
         target_compile_definitions(${CUDA_TARGET} PRIVATE GPU_CONTEXT_TEST_BACKEND_CUDA=1)
-        target_link_libraries(${CUDA_TARGET} PRIVATE
-            -Wl,--start-group
-            llaminar2_core
-            -Wl,--whole-archive cuda_backend -Wl,--no-whole-archive
-            -Wl,--end-group
-            GTest::gtest
-            GTest::gtest_main
-        )
+        if(LLAMINAR_SHARED_CORE)
+            target_link_libraries(${CUDA_TARGET} PRIVATE
+                llaminar2_core
+                GTest::gtest
+                GTest::gtest_main
+            )
+        else()
+            target_link_libraries(${CUDA_TARGET} PRIVATE
+                -Wl,--start-group
+                llaminar2_core
+                -Wl,--whole-archive cuda_backend -Wl,--no-whole-archive
+                -Wl,--end-group
+                GTest::gtest
+                GTest::gtest_main
+            )
+        endif()
         add_v2_test(${TEST_BASE}_CUDA
             COMMAND $<TARGET_FILE:${CUDA_TARGET}>
             LABELS ${TEST_LABELS} CUDA
@@ -3782,6 +3798,31 @@ target_link_libraries(v2_test_weight_placement_map llaminar2_core GTest::gtest_m
 add_v2_test(V2_Unit_WeightPlacementMap
     COMMAND $<TARGET_FILE:v2_test_weight_placement_map>
     LABELS "V2;Unit;DeviceManagement;WeightPlacement;Heterogeneous;MoE"
+)
+
+# Test: Weight identity and lifecycle trace scaffolding
+add_executable(v2_unit_weight_identity unit/loaders/Test__WeightIdentity.cpp)
+target_link_libraries(v2_unit_weight_identity llaminar2_core GTest::gtest_main)
+add_v2_test(V2_Unit_WeightIdentity
+    COMMAND $<TARGET_FILE:v2_unit_weight_identity>
+    LABELS "V2;Unit;Loaders;Weights;Lifecycle;Identity"
+    MPI_PROCS 1
+)
+
+add_executable(v2_unit_weight_plan unit/loaders/Test__WeightPlan.cpp)
+target_link_libraries(v2_unit_weight_plan llaminar2_core GTest::gtest_main)
+add_v2_test(V2_Unit_WeightPlan
+    COMMAND $<TARGET_FILE:v2_unit_weight_plan>
+    LABELS "V2;Unit;Loaders;Weights;Lifecycle;Planning"
+    MPI_PROCS 1
+)
+
+add_executable(v2_unit_prepared_weight_store unit/loaders/Test__PreparedWeightStore.cpp)
+target_link_libraries(v2_unit_prepared_weight_store llaminar2_core GTest::gtest_main)
+add_v2_test(V2_Unit_PreparedWeightStore
+    COMMAND $<TARGET_FILE:v2_unit_prepared_weight_store>
+    LABELS "V2;Unit;Loaders;Weights;Lifecycle;PreparedWeights"
+    MPI_PROCS 1
 )
 
 # Test: WeightManager Sharding

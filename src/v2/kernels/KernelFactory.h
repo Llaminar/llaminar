@@ -1403,6 +1403,19 @@ namespace llaminar
                     GemmPreparationKind prep_kind = GemmPreparationKind::AUTO);
 
                 /**
+                 * @brief Find an existing prepared GEMM-weights handle without creating one.
+                 *
+                 * This is used by migration/rebalance paths that must not fall back
+                 * to raw host weight materialization after host bytes have been
+                 * released. Checks both the raw-data key and tensor-identity fallback
+                 * key registered by the preload path.
+                 */
+                static const PreparedGemmHandle *findPreparedGemmWeights(
+                    const llaminar2::TensorBase *tensor,
+                    llaminar2::DeviceId target_device,
+                    GemmPreparationKind prep_kind = GemmPreparationKind::AUTO);
+
+                /**
                  * @brief Clear prepared GEMM handle entries associated with a tensor
                  *
                  * Clears all prepared entries for the tensor across devices and prep kinds.

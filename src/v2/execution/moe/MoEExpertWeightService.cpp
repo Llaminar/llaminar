@@ -42,7 +42,9 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstring>
 #include <iomanip>
+#include <optional>
 #include <vector>
 
 namespace llaminar2 {
@@ -497,17 +499,40 @@ ExpertWeightBlobs MoEExpertWeightService::serializeExpert(const MoEWeightContext
 
     ExpertWeightBlobs blobs;
 
-    auto serialize_proj = [](ITensorGemm* engine) -> std::vector<uint8_t> {
+    auto serialize_proj = [](ITensorGemm* engine, const std::shared_ptr<TensorBase>& view) -> std::vector<uint8_t> {
         if (!engine || !engine->hasWeights()) return {};
-        auto* vnni_kernel = dynamic_cast<const CPUNativeVNNIGemmKernel*>(engine);
-        if (!vnni_kernel) return {};
-        CPUPackedWeights wrapper(vnni_kernel->packedWeights());
-        return packed_weights_serialization::serialize(wrapper);
+        auto packed = engine->cloneWeights();
+        if (!packed) return {};
+
+        if (packed->format() == PackedWeightsFormat::CPU_NATIVE_VNNI &&
+            dynamic_cast<CPUPackedWeightsWithNativeBlocks*>(packed.get()) == nullptr &&
+            view && view->raw_data())
+        {
+            auto* cpu_packed = dynamic_cast<CPUPackedWeights*>(packed.get());
+            if (cpu_packed)
+            {
+                const size_t raw_bytes = quantizedViewRawBytes(*view);
+                if (raw_bytes > 0)
+                {
+                    const auto* raw = static_cast<const uint8_t*>(view->raw_data());
+                    std::vector<uint8_t> native_blocks(raw, raw + raw_bytes);
+                    const size_t blocks = static_cast<size_t>(cpu_packed->packed().N)
+                                      * static_cast<size_t>(std::max(1, cpu_packed->packed().blocks_per_row));
+                    const size_t native_block_size = blocks > 0 ? raw_bytes / blocks : raw_bytes;
+                    packed = std::make_unique<CPUPackedWeightsWithNativeBlocks>(
+                        CPUNativeVNNIPackedWeights(cpu_packed->packed()),
+                        std::move(native_blocks),
+                        native_block_size);
+                }
+            }
+        }
+
+        return packed_weights_serialization::serialize(*packed);
     };
 
-    blobs.gate = serialize_proj(ctx.prepared_gate_gemm[expert_id]);
-    blobs.up   = serialize_proj(ctx.prepared_up_gemm[expert_id]);
-    blobs.down = serialize_proj(ctx.prepared_down_gemm[expert_id]);
+    blobs.gate = serialize_proj(ctx.prepared_gate_gemm[expert_id], ctx.expert_gate_views[expert_id]);
+    blobs.up   = serialize_proj(ctx.prepared_up_gemm[expert_id],   ctx.expert_up_views[expert_id]);
+    blobs.down = serialize_proj(ctx.prepared_down_gemm[expert_id],  ctx.expert_down_views[expert_id]);
 
     return blobs;
 }
@@ -584,15 +609,12 @@ bool MoEExpertWeightService::registerAndPrepareNewExperts(
     }
     if (new_experts.empty()) return true;
 
-    // GPU path: raw H2D + GPU repack via LoadOrchestrator.
-    // Ignores received_weights (CPU-serialized packed weights are useless on GPU).
-    // Uses raw GGUF data from expert views — same pipeline as initial load.
+    // GPU path: prefer transferred packed/source-domain payloads, converting
+    // CPU-native-with-blocks to GPU-repacked layout via the device pipeline.
+    // Raw GGUF data is only a fallback for initial materialization before host
+    // source bytes are released.
     if (ctx.device_id.is_gpu()) {
-        if (received_weights && !received_weights->empty()) {
-            LOG_DEBUG("[MoEWeightService] Ignoring " << received_weights->size()
-                      << " CPU-serialized weight blobs — using GPU repack pipeline instead");
-        }
-        return registerAndPrepareNewExpertsGPU(ctx, new_experts);
+        return registerAndPrepareNewExpertsGPU(ctx, new_experts, received_weights);
     }
 
     // CPU path: deserialize transferred weights, then KernelFactory pack
@@ -669,7 +691,9 @@ bool MoEExpertWeightService::registerAndPrepareNewExperts(
 // =========================================================================
 
 bool MoEExpertWeightService::registerAndPrepareNewExpertsGPU(
-    MoEWeightContext& ctx, const std::vector<int>& new_experts)
+    MoEWeightContext& ctx,
+    const std::vector<int>& new_experts,
+    const std::unordered_map<int, ExpertWeightBlobs>* received_weights)
 {
     using Clock = std::chrono::high_resolution_clock;
     const auto t_start = Clock::now();
@@ -677,8 +701,6 @@ bool MoEExpertWeightService::registerAndPrepareNewExpertsGPU(
     const int gpu_ordinal = ctx.device_id.is_cuda()
                                 ? ctx.device_id.cuda_ordinal()
                                 : ctx.device_id.rocm_ordinal();
-    const int count = static_cast<int>(new_experts.size());
-
     IBackend* backend = getBackendFor(ctx.device_id);
     if (!backend)
     {
@@ -705,12 +727,115 @@ bool MoEExpertWeightService::registerAndPrepareNewExpertsGPU(
     size_t max_raw_bytes = 0;
     size_t total_planned = 0;
 
+    struct TransferSource {
+        std::unique_ptr<IPackedWeights> packed;
+        const cpu::native_vnni::CPUPackedWeightsWithNativeBlocks* native = nullptr;
+        RepackFormat format = RepackFormat::Q4_0;
+    };
+    std::vector<TransferSource> transfer_sources;
+
+    auto blobFor = [&](int expert_id, const char* label) -> const std::vector<uint8_t>* {
+        if (!received_weights) return nullptr;
+        auto it = received_weights->find(expert_id);
+        if (it == received_weights->end()) return nullptr;
+        if (std::strcmp(label, "gate") == 0) return &it->second.gate;
+        if (std::strcmp(label, "up") == 0) return &it->second.up;
+        return &it->second.down;
+    };
+
+    auto hasAnyTransferredBlob = [&](int expert_id) {
+        for (auto& grp : groups)
+        {
+            auto* blob = blobFor(expert_id, grp.label);
+            if (blob && !blob->empty()) return true;
+        }
+        return false;
+    };
+
+    auto makeTransferSource = [&](const std::vector<uint8_t>& blob,
+                                  int expert_id,
+                                  const char* label) -> std::optional<TransferSource> {
+        if (blob.empty()) return std::nullopt;
+        auto packed = packed_weights_serialization::deserialize(blob.data(), blob.size());
+        if (!packed)
+        {
+            LOG_ERROR("[MoEWeightService::GPU-rebalance] Failed to deserialize transferred packed weights for expert "
+                      << expert_id << " " << label << " on " << ctx.device_id.to_string());
+            return std::nullopt;
+        }
+
+        auto* native = dynamic_cast<cpu::native_vnni::CPUPackedWeightsWithNativeBlocks*>(packed.get());
+        if (!native)
+        {
+            LOG_ERROR("[MoEWeightService::GPU-rebalance] Transferred expert " << expert_id << " " << label
+                      << " lacks native quantized blocks; CPU-packed-only conversion to GPU is not available yet");
+            return std::nullopt;
+        }
+
+        const auto& cpu_packed = native->packed();
+        auto repack_fmt = codebookIdToRepackFormat(cpu_packed.codebook_id, cpu_packed.is_superblock);
+        if (!repack_fmt)
+        {
+            LOG_ERROR("[MoEWeightService::GPU-rebalance] Unsupported transferred packed format for expert "
+                      << expert_id << " " << label
+                      << " (codebook=" << static_cast<int>(cpu_packed.codebook_id)
+                      << ", superblock=" << cpu_packed.is_superblock << ")");
+            return std::nullopt;
+        }
+
+        TransferSource source;
+        source.native = native;
+        source.format = *repack_fmt;
+        source.packed = std::move(packed);
+        return source;
+    };
+
+    std::vector<int> experts_to_load;
+    experts_to_load.reserve(new_experts.size());
+    for (int e : new_experts)
+    {
+        if (!hasAnyTransferredBlob(e))
+        {
+            bool cache_hit = true;
+            for (auto& grp : groups)
+            {
+                const auto& view = grp.views[e];
+                if (!view)
+                {
+                    cache_hit = false;
+                    break;
+                }
+                const auto* prepared = KernelFactory::findPreparedGemmWeights(view.get(), ctx.device_id);
+                if (!prepared)
+                {
+                    cache_hit = false;
+                    break;
+                }
+                grp.out_gemms[e] = KernelFactory::getOrCreateGemmEngine(prepared);
+                cache_hit = cache_hit && grp.out_gemms[e] != nullptr;
+            }
+            if (cache_hit)
+                continue;
+        }
+
+        experts_to_load.push_back(e);
+    }
+
+    const int count = static_cast<int>(experts_to_load.size());
+    if (count == 0)
+    {
+        LOG_DEBUG("[MoEWeightService::GPU-rebalance] All " << new_experts.size()
+                  << " requested experts already had prepared GPU handles on "
+                  << ctx.device_id.to_string() << " (layer " << ctx.layer_idx << ")");
+        return true;
+    }
+
     // Phase 1: Plan weights for new experts
     for (auto& grp : groups)
     {
         for (int idx = 0; idx < count; ++idx)
         {
-            const int e = new_experts[idx];
+            const int e = experts_to_load[idx];
             const auto& view = grp.views[e];
             if (!view)
             {
@@ -739,10 +864,19 @@ bool MoEExpertWeightService::registerAndPrepareNewExpertsGPU(
             }
             const std::string slot_name = std::string(grp.label) + "_e" + std::to_string(e);
 
+            size_t source_bytes = raw_bytes;
+            if (auto* blob = blobFor(e, grp.label))
+            {
+                auto source = makeTransferSource(*blob, e, grp.label);
+                if (!source) return false;
+                source_bytes = source->native->nativeBlocks().size();
+                transfer_sources.push_back(std::move(*source));
+            }
+
             orchestrator->planWeight(gpu_ordinal, slot_name, N, K,
                                      vnni->payload_bytes, vnni->is_asymmetric,
-                                     vnni->has_emins, raw_bytes);
-            max_raw_bytes = std::max(max_raw_bytes, raw_bytes);
+                                     vnni->has_emins, source_bytes);
+            max_raw_bytes = std::max(max_raw_bytes, source_bytes);
             ++total_planned;
         }
     }
@@ -756,11 +890,12 @@ bool MoEExpertWeightService::registerAndPrepareNewExpertsGPU(
     orchestrator->allocate(max_raw_bytes, rocm_cfg.repack_streams);
 
     // Phase 3: Create weight jobs from raw GGUF data
+    size_t transfer_source_idx = 0;
     for (auto& grp : groups)
     {
         for (int idx = 0; idx < count; ++idx)
         {
-            const int e = new_experts[idx];
+            const int e = experts_to_load[idx];
             const auto& view = grp.views[e];
 
             auto* unpackable = dynamic_cast<IINT8Unpackable*>(view.get());
@@ -780,12 +915,37 @@ bool MoEExpertWeightService::registerAndPrepareNewExpertsGPU(
 
             WeightJob job;
             job.name = slot_name;
-            job.host_raw_data = view->raw_data();
-            job.raw_bytes = quantizedViewRawBytes(*view);
             job.format = *repack_fmt;
             job.N = static_cast<int>(view->rows());
             job.K = static_cast<int>(view->cols());
             job.is_asymmetric = vnni->is_asymmetric;
+
+            if (auto* blob = blobFor(e, grp.label))
+            {
+                if (blob->empty()) return false;
+                if (transfer_source_idx >= transfer_sources.size())
+                {
+                    LOG_ERROR("[MoEWeightService::GPU-rebalance] Internal transfer source accounting mismatch");
+                    return false;
+                }
+                const auto& source = transfer_sources[transfer_source_idx++];
+                job.host_raw_data = source.native->nativeBlocks().data();
+                job.raw_bytes = source.native->nativeBlocks().size();
+                job.format = source.format;
+            }
+            else
+            {
+                job.host_raw_data = view->raw_data();
+                job.raw_bytes = quantizedViewRawBytes(*view);
+                if (!job.host_raw_data)
+                {
+                    LOG_ERROR("[MoEWeightService::GPU-rebalance] Expert " << e << " "
+                              << grp.label << " has no transferred packed source and no raw fallback for "
+                              << job.raw_bytes << " bytes on " << ctx.device_id.to_string()
+                              << " (layer " << ctx.layer_idx << ")");
+                    return false;
+                }
+            }
 
             orchestrator->addWeightJob(gpu_ordinal, job);
         }
@@ -806,7 +966,7 @@ bool MoEExpertWeightService::registerAndPrepareNewExpertsGPU(
     {
         for (int idx = 0; idx < count; ++idx)
         {
-            const int e = new_experts[idx];
+            const int e = experts_to_load[idx];
             const auto& view = grp.views[e];
             const std::string slot_name = std::string(grp.label) + "_e" + std::to_string(e);
 
@@ -914,7 +1074,8 @@ bool MoEExpertWeightService::prepareGemmEnginesGPU(MoEWeightContext& ctx)
     const int local_count = static_cast<int>(local_experts.size());
     if (local_count == 0)
     {
-        LOG_WARN("[MoEWeightService::GPU] No local experts to prepare");
+        LOG_DEBUG("[MoEWeightService::GPU] No local experts to prepare on "
+                  << ctx.device_id.to_string() << " (layer " << ctx.layer_idx << ")");
         return true;
     }
 
@@ -1024,6 +1185,14 @@ bool MoEExpertWeightService::prepareGemmEnginesGPU(MoEWeightContext& ctx)
             job.name = slot_name;
             job.host_raw_data = view->raw_data();
             job.raw_bytes = quantizedViewRawBytes(*view);
+            if (!job.host_raw_data)
+            {
+                LOG_ERROR("[MoEWeightService::GPU] Expert " << e << " "
+                          << grp.label << " has null raw host data for " << job.raw_bytes
+                          << " bytes on " << ctx.device_id.to_string()
+                          << " (layer " << ctx.layer_idx << ")");
+                return false;
+            }
             job.format = *repack_fmt;
             job.N = static_cast<int>(view->rows());
             job.K = static_cast<int>(view->cols());

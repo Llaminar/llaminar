@@ -20,6 +20,9 @@
 #pragma once
 
 #include "IModelLoader.h"
+#include "WeightLifecycleTrace.h"
+#include "WeightMetadataRegistry.h"
+#include "WeightPlan.h"
 #include "WeightPlacementMap.h"
 #include "WeightManagerConfig.h"
 #include "../backends/DeviceId.h"
@@ -404,6 +407,10 @@ namespace llaminar2
             weight_preprocessor_ = std::move(preprocessor);
         }
 
+        WeightMetadataRegistry *weightMetadataRegistry() const { return weight_metadata_.get(); }
+
+        FrozenModelWeightSet materialize(const WeightPlan &plan);
+
         /**
          * @brief Set layer range for LAYER_PARTITIONED strategy
          *
@@ -705,6 +712,25 @@ namespace llaminar2
 
         // Decode weight shard cache (separate from prefill cache)
         std::unordered_map<std::string, std::shared_ptr<TensorBase>> decode_cache_; ///< Decode shard cache
+
+        std::shared_ptr<WeightMetadataRegistry> weight_metadata_;
+
+        void registerSourceMetadata(
+            const std::string &name,
+            const std::shared_ptr<TensorBase> &tensor,
+            DeviceId device);
+        void registerDerivedMetadata(
+            const std::string &name,
+            const std::shared_ptr<TensorBase> &tensor,
+            WeightDerivationKind derivation,
+            WeightSliceSpec slice,
+            DeviceId device);
+        void registerCloneMetadata(
+            const std::string &name,
+            const std::shared_ptr<TensorBase> &source,
+            const std::shared_ptr<TensorBase> &clone,
+            DeviceId device);
+        WeightSliceSpec fullSliceSpec(const TensorBase &tensor) const;
 
         // =========================================================================
         // Layer range for Pipeline Parallelism (LAYER_PARTITIONED strategy)

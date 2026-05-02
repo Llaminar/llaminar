@@ -522,6 +522,12 @@ namespace llaminar2
                 return false;
             }
 
+                if (ctx->isGPU() && std::getenv("LLAMINAR_SYNC_AFTER_STAGE"))
+                {
+                    LOG_INFO("[DeviceGraphExecutor] sync after stage: " << node->name);
+                    ctx->synchronize();
+                }
+
             // Mark stage completed for graph dependency tracking
             graph.markCompleted(node->name);
 
@@ -762,10 +768,12 @@ namespace llaminar2
                 // dump_info.weights duplicates these, and dump_info.inputs are activation
                 // tensors already handled by arena coherence above.
                 //
-                // Session-level fast path: after the first successful forward pass,
-                // all weights are known to be on-device. Skip the per-node check
-                // since weight tensors don't move between forwards.
-                if (policy.weight_coherence && !node.weights_cohered && !weights_session_cohered_)
+                // Per-node fast path: a cached graph node only needs weight
+                // coherence once. Do not use a session-wide shortcut here:
+                // prefill and decode use distinct cached graph shapes, so a
+                // later decode graph may contain nodes whose weights have never
+                // been prepared for this device.
+                if (policy.weight_coherence && !node.weights_cohered)
                 {
                     if (profiling)
                         phase_start = std::chrono::high_resolution_clock::now();
@@ -788,6 +796,8 @@ namespace llaminar2
                                 LOG_ERROR("[DeviceGraphExecutor] Weight upload failed for stage '"
                                           << node.name << "'"
                                           << " tensor=" << static_cast<void *>(tb)
+                                          << " name=" << (tb->debugName().empty() ? "(unnamed)" : tb->debugName())
+                                          << " shape=[" << tb->rows() << "," << tb->cols() << "]"
                                           << " type=" << static_cast<int>(tb->native_type())
                                           << " device=" << target_device.toString());
                                 return false;

@@ -61,7 +61,6 @@ namespace
                 .min_top5_accuracy = 0.80f,
                 .pytorch_top1_in_topk = 5,
             },
-            .skip_reason = "Blocked: mixed CPU/GPU HybridPPTP for Qwen3.5 MoE still needs generic GPU DeviceLoadPipeline coverage for dense FFN GEMMs before MoE expert-cache parity can run.",
             .model_path = "/opt/llaminar-models/Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf",
             .snapshot_dir = "pytorch_qwen35_moe_snapshots",
             .pp_stage_sizes = {2, 2},

@@ -1191,6 +1191,19 @@ namespace llaminar2
         }
 
         /**
+         * @brief Clone packed weights without invalidating this kernel.
+         *
+         * Used for non-destructive expert replication/migration. Implementations
+         * should include any source-format side payload needed to convert to a
+         * different prepared format later (for example native quantized blocks
+         * alongside CPU VNNI metadata).
+         */
+        virtual std::unique_ptr<IPackedWeights> cloneWeights() const
+        {
+            return nullptr; // Default: not supported
+        }
+
+        /**
          * @brief Attach pre-packed weights to this kernel.
          *
          * Replaces any existing weights. The kernel takes ownership of the data.

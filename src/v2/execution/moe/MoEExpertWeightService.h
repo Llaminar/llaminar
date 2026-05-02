@@ -134,7 +134,9 @@ private:
     /// Called by registerAndPrepareNewExperts() for GPU devices instead of
     /// the CPU KernelFactory fallback.
     static bool registerAndPrepareNewExpertsGPU(
-        MoEWeightContext& ctx, const std::vector<int>& new_experts);
+        MoEWeightContext& ctx,
+        const std::vector<int>& new_experts,
+        const std::unordered_map<int, ExpertWeightBlobs>* received_weights);
 
 
 };

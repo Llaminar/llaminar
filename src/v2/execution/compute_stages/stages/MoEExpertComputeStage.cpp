@@ -79,6 +79,30 @@ namespace llaminar2
     MoEExpertComputeStage::MoEExpertComputeStage(Params params)
         : IComputeStage(params.device_id), params_(std::move(params))
     {
+        if (params_.device_id.is_gpu() && !params_.expert_mask.empty())
+        {
+            bool has_missing = params_.prepared_gate_gemm.size() != static_cast<size_t>(params_.num_experts) ||
+                               params_.prepared_up_gemm.size() != static_cast<size_t>(params_.num_experts) ||
+                               params_.prepared_down_gemm.size() != static_cast<size_t>(params_.num_experts);
+            if (!has_missing)
+            {
+                for (int e = 0; e < params_.num_experts; ++e)
+                {
+                    if (params_.expert_mask[e] &&
+                        (!params_.prepared_gate_gemm[e] || !params_.prepared_up_gemm[e] || !params_.prepared_down_gemm[e]))
+                    {
+                        has_missing = true;
+                        break;
+                    }
+                }
+            }
+
+            if (has_missing && !MoEExpertComputeStage::prepareExpertGemmEngines(params_))
+            {
+                LOG_ERROR("[MoEExpertComputeStage] Failed to pre-prepare GPU masked experts for layer "
+                          << params_.layer_idx << " on " << params_.device_id.to_string());
+            }
+        }
     }
 
     bool MoEExpertComputeStage::updateExpertMask(const std::vector<bool>& mask) {
@@ -1101,47 +1125,69 @@ namespace llaminar2
 
         if (params_.device_id.is_gpu())
         {
-            shared_expert_mask_ = {true};
-            shared_gate_views_ = {std::shared_ptr<TensorBase>(params_.gate_w, [](TensorBase *) {})};
-            shared_up_views_ = {std::shared_ptr<TensorBase>(params_.up_w, [](TensorBase *) {})};
-            shared_down_views_ = {std::shared_ptr<TensorBase>(params_.down_w, [](TensorBase *) {})};
-            shared_prepared_gate_gemm_.assign(1, nullptr);
-            shared_prepared_up_gemm_.assign(1, nullptr);
-            shared_prepared_down_gemm_.assign(1, nullptr);
-
-            MoEWeightContext ctx{
-                params_.device_id,
-                1,
-                params_.intermediate,
-                params_.d_model,
-                0,
-                1,
-                -1,
-                shared_expert_mask_,
-                nullptr,
-                nullptr,
-                nullptr,
-                shared_gate_views_,
-                shared_up_views_,
-                shared_down_views_,
-                shared_prepared_gate_gemm_,
-                shared_prepared_up_gemm_,
-                shared_prepared_down_gemm_,
-                shared_owned_kernels_,
-                shared_packed_gate_lifetime_,
-                shared_packed_up_lifetime_,
-                shared_packed_down_lifetime_};
-
-            if (!MoEExpertWeightService::prepareGemmEngines(ctx))
+            try
             {
-                LOG_ERROR("[SharedExpertFFNStage] Failed to prepare shared expert GEMM engines on "
-                          << params_.device_id.to_string());
-                return;
+                auto *gp = KernelFactory::getOrCreatePreparedGemmWeights(params_.gate_w, params_.device_id);
+                auto *up = KernelFactory::getOrCreatePreparedGemmWeights(params_.up_w, params_.device_id);
+                auto *dp = KernelFactory::getOrCreatePreparedGemmWeights(params_.down_w, params_.device_id);
+                cached_gate_gemm_ = KernelFactory::getOrCreateGemmEngine(gp);
+                cached_up_gemm_ = KernelFactory::getOrCreateGemmEngine(up);
+                cached_down_gemm_ = KernelFactory::getOrCreateGemmEngine(dp);
             }
+            catch (const std::exception &ex)
+            {
+                const bool can_repack_from_raw = params_.gate_w->raw_data() &&
+                                                 params_.up_w->raw_data() &&
+                                                 params_.down_w->raw_data();
+                if (!can_repack_from_raw)
+                {
+                    LOG_ERROR("[SharedExpertFFNStage] Shared expert GPU weights were not prepared before host release on "
+                              << params_.device_id.to_string() << ": " << ex.what());
+                    return;
+                }
 
-            cached_gate_gemm_ = shared_prepared_gate_gemm_[0];
-            cached_up_gemm_ = shared_prepared_up_gemm_[0];
-            cached_down_gemm_ = shared_prepared_down_gemm_[0];
+                shared_expert_mask_ = {true};
+                shared_gate_views_ = {std::shared_ptr<TensorBase>(params_.gate_w, [](TensorBase *) {})};
+                shared_up_views_ = {std::shared_ptr<TensorBase>(params_.up_w, [](TensorBase *) {})};
+                shared_down_views_ = {std::shared_ptr<TensorBase>(params_.down_w, [](TensorBase *) {})};
+                shared_prepared_gate_gemm_.assign(1, nullptr);
+                shared_prepared_up_gemm_.assign(1, nullptr);
+                shared_prepared_down_gemm_.assign(1, nullptr);
+
+                MoEWeightContext ctx{
+                    params_.device_id,
+                    1,
+                    params_.intermediate,
+                    params_.d_model,
+                    0,
+                    1,
+                    -1,
+                    shared_expert_mask_,
+                    nullptr,
+                    nullptr,
+                    nullptr,
+                    shared_gate_views_,
+                    shared_up_views_,
+                    shared_down_views_,
+                    shared_prepared_gate_gemm_,
+                    shared_prepared_up_gemm_,
+                    shared_prepared_down_gemm_,
+                    shared_owned_kernels_,
+                    shared_packed_gate_lifetime_,
+                    shared_packed_up_lifetime_,
+                    shared_packed_down_lifetime_};
+
+                if (!MoEExpertWeightService::prepareGemmEngines(ctx))
+                {
+                    LOG_ERROR("[SharedExpertFFNStage] Failed to prepare shared expert GEMM engines on "
+                              << params_.device_id.to_string());
+                    return;
+                }
+
+                cached_gate_gemm_ = shared_prepared_gate_gemm_[0];
+                cached_up_gemm_ = shared_prepared_up_gemm_[0];
+                cached_down_gemm_ = shared_prepared_down_gemm_[0];
+            }
         }
         else
         {

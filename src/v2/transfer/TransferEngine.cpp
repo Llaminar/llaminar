@@ -856,7 +856,9 @@ namespace llaminar2
                 return TransferResult::fail(TransferMethod::DEVICE_TO_HOST, "deviceToHost failed");
             }
 
-            // DEBUG DIAGNOSTIC: Check if D2H produced all zeros
+            // Optional transfer trace diagnostic. This only samples the first
+            // few floats, so keep it out of normal logs and validation output.
+            if (trace_cfg.enabled)
             {
                 const float *fp = static_cast<const float *>(dst);
                 size_t check_count = std::min(bytes / sizeof(float), static_cast<size_t>(8));
@@ -871,14 +873,14 @@ namespace llaminar2
                 }
                 if (all_zero && check_count > 0 && bytes >= 1024)
                 {
-                    LOG_WARN("[TransferEngine::downloadFull] D2H ALL ZEROS: tensor="
-                             << (tensor->debug_name_.empty() ? "(unnamed)" : tensor->debug_name_)
-                             << " bytes=" << bytes
-                             << " device=" << tensor->gpu_device_->toString()
-                             << " gpu_ptr=" << static_cast<const void *>(tensor->gpu_data_ptr_)
-                             << " dst=" << static_cast<const void *>(dst)
-                             << " d2h_ns=" << d2h_ns
-                             << " had_event=" << (tensor->device_completion_event_ ? "yes" : "no"));
+                    LOG_DEBUG("[TransferEngine::downloadFull] D2H leading sample is zero: tensor="
+                              << (tensor->debug_name_.empty() ? "(unnamed)" : tensor->debug_name_)
+                              << " bytes=" << bytes
+                              << " device=" << tensor->gpu_device_->toString()
+                              << " gpu_ptr=" << static_cast<const void *>(tensor->gpu_data_ptr_)
+                              << " dst=" << static_cast<const void *>(dst)
+                              << " d2h_ns=" << d2h_ns
+                              << " had_event=" << (tensor->device_completion_event_ ? "yes" : "no"));
                 }
             }
 

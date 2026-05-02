@@ -18,6 +18,37 @@
 #include <hip/hip_fp16.h>
 #include <cstdio>
 #include <cstdint>
+#include <cstdlib>
+
+namespace {
+
+const char *memory_type_name(hipMemoryType type)
+{
+    switch (type)
+    {
+    case hipMemoryTypeHost: return "host";
+    case hipMemoryTypeDevice: return "device";
+    case hipMemoryTypeArray: return "array";
+    case hipMemoryTypeUnified: return "unified";
+    default: return "unknown";
+    }
+}
+
+void print_pointer_attrs(const char *label, const void *ptr)
+{
+    hipPointerAttribute_t attrs{};
+    hipError_t err = hipPointerGetAttributes(&attrs, ptr);
+    if (err != hipSuccess)
+    {
+        fprintf(stderr, "[rocmGDN_ptr] %s=%p attrs=%s\n", label, ptr, hipGetErrorString(err));
+        return;
+    }
+    fprintf(stderr, "[rocmGDN_ptr] %s=%p type=%s device=%d devicePointer=%p hostPointer=%p\n",
+            label, ptr, memory_type_name(attrs.type), attrs.device,
+            attrs.devicePointer, attrs.hostPointer);
+}
+
+} // anonymous namespace (diagnostics)
 
 #include "../../../backends/rocm/HipDeviceGuard.h"
 
@@ -656,6 +687,14 @@ bool rocmGDN_deinterleave_qkv(
 {
     llaminar2::HipDeviceGuard::setDevice(device_idx);
 
+    if (std::getenv("LLAMINAR_ROCM_GDN_PTR_TRACE"))
+    {
+        print_pointer_attrs("merged", merged);
+        print_pointer_attrs("out_q", out_q);
+        print_pointer_attrs("out_k", out_k);
+        print_pointer_attrs("out_v", out_v);
+    }
+
     int q_dst_dim = n_v_heads * d_k;
     int k_dst_dim = n_v_heads * d_k;
     int v_dim = n_v_heads * d_v;
@@ -674,6 +713,15 @@ bool rocmGDN_deinterleave_qkv(
     {
         fprintf(stderr, "[rocmGDN_deinterleave_qkv] %s\n", hipGetErrorString(err));
         return false;
+    }
+    if (std::getenv("LLAMINAR_ROCM_GDN_SYNC"))
+    {
+        err = hipStreamSynchronize((hipStream_t)stream);
+        if (err != hipSuccess)
+        {
+            fprintf(stderr, "[rocmGDN_deinterleave_qkv_sync] %s\n", hipGetErrorString(err));
+            return false;
+        }
     }
     return true;
 }
@@ -696,6 +744,19 @@ bool rocmGDN_recurrent_step(
     int device_idx, void *stream)
 {
     llaminar2::HipDeviceGuard::setDevice(device_idx);
+
+    if (std::getenv("LLAMINAR_ROCM_GDN_PTR_TRACE"))
+    {
+        print_pointer_attrs("q", q);
+        print_pointer_attrs("k", k);
+        print_pointer_attrs("v", v);
+        print_pointer_attrs("alpha", alpha);
+        print_pointer_attrs("beta", beta_raw);
+        print_pointer_attrs("A_log", A_log);
+        print_pointer_attrs("dt_bias", dt_bias);
+        print_pointer_attrs("output", output);
+        print_pointer_attrs("state", state);
+    }
 
     // 2D grid: x=heads, y=column tiles (64 threads = 1 wavefront per block)
     int col_threads = 64;
@@ -727,6 +788,19 @@ bool rocmGDN_chunk_forward(
 {
     llaminar2::HipDeviceGuard::setDevice(device_idx);
 
+    if (std::getenv("LLAMINAR_ROCM_GDN_PTR_TRACE"))
+    {
+        print_pointer_attrs("Q", Q);
+        print_pointer_attrs("K", K);
+        print_pointer_attrs("V", V);
+        print_pointer_attrs("alpha", alpha);
+        print_pointer_attrs("beta", beta_raw);
+        print_pointer_attrs("A_log", A_log);
+        print_pointer_attrs("dt_bias", dt_bias);
+        print_pointer_attrs("output", output);
+        print_pointer_attrs("state", state);
+    }
+
     // Row-split: 256 threads per block, 4 threads per column = 64 cols/block.
     // 4 wavefronts/block — matches CUDA's ROW_SPLIT=4 to reduce per-step
     // reduction error that compounds through the GDN recurrence.
@@ -751,6 +825,15 @@ bool rocmGDN_chunk_forward(
     if (err != hipSuccess) {
         fprintf(stderr, "[rocmGDN_chunk_forward] %s\n", hipGetErrorString(err));
         return false;
+    }
+    if (std::getenv("LLAMINAR_ROCM_GDN_SYNC"))
+    {
+        err = hipStreamSynchronize((hipStream_t)stream);
+        if (err != hipSuccess)
+        {
+            fprintf(stderr, "[rocmGDN_chunk_forward_sync] %s\n", hipGetErrorString(err));
+            return false;
+        }
     }
     return true;
 }
