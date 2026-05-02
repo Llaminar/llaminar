@@ -115,6 +115,23 @@ namespace llaminar2
         return llaminar::v2::kernels::KernelFactory::getOrCreateGemmEngine(it->second.gemm_handle);
     }
 
+    ITensorFusedGateUpGemm *PreparedWeightStore::fusedGateUpKernel(
+        const PreparedWeightRef &gate_ref,
+        const PreparedWeightRef &up_ref) const
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto gate_it = entries_.find(gate_ref.binding_id);
+        auto up_it = entries_.find(up_ref.binding_id);
+        if (gate_it == entries_.end() || up_it == entries_.end())
+            return nullptr;
+        auto *gate_tensor = gate_it->second.binding.tensor;
+        auto *up_tensor = up_it->second.binding.tensor;
+        if (!gate_tensor || !up_tensor)
+            return nullptr;
+        return llaminar::v2::kernels::KernelFactory::getOrCreateFusedGateUpGemm(
+            gate_tensor, up_tensor, gate_ref.device);
+    }
+
     bool PreparedWeightStore::contains(const PreparedWeightRef &ref) const
     {
         std::lock_guard<std::mutex> lock(mutex_);

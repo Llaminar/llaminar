@@ -9,6 +9,7 @@
 #include "../IWorkspaceConsumerStage.h"
 #include "../StageParamsBase.h"
 #include "../../../memory/BufferId.h"
+#include "../../../loaders/WeightPlan.h"
 
 #include <optional>
 
@@ -17,6 +18,7 @@ namespace llaminar2
 
     // Forward declarations for cached kernel pointers
     class ITensorGemm;
+    class PreparedWeightStore;
 
     /**
      * @brief Fused Q/K/V projection stage
@@ -63,6 +65,14 @@ namespace llaminar2
             std::optional<BufferId> output_q_buffer_id;
             std::optional<BufferId> output_k_buffer_id;
             std::optional<BufferId> output_v_buffer_id;
+
+            // =================================================================
+            // Phase 7: PreparedWeightRef for direct kernel resolution
+            // =================================================================
+            std::optional<PreparedWeightRef> prepared_ref_q;
+            std::optional<PreparedWeightRef> prepared_ref_k;
+            std::optional<PreparedWeightRef> prepared_ref_v;
+            PreparedWeightStore *prepared_store = nullptr;
         };
 
         explicit FusedQKVGEMMStage(Params params);

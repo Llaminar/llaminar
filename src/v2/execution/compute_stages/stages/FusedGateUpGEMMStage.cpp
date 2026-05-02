@@ -11,6 +11,7 @@
 #include "../../../utils/Logger.h"
 #include "../../../kernels/KernelFactory.h"
 #include "../../../utils/GemmContext.h"
+#include "../../../loaders/PreparedWeightStore.h"
 
 namespace llaminar2
 {
@@ -79,8 +80,22 @@ namespace llaminar2
         ITensorFusedGateUpGemm *fused_kernel = cached_kernel_;
         if (!fused_kernel)
         {
-            fused_kernel = llaminar::v2::kernels::KernelFactory::getOrCreateFusedGateUpGemm(
-                w_gate_base, w_up_base, params_.device_id);
+            // Phase 7: Try PreparedWeightStore first
+            if (params_.prepared_store &&
+                params_.prepared_ref_gate.has_value() &&
+                params_.prepared_ref_up.has_value())
+            {
+                fused_kernel = params_.prepared_store->fusedGateUpKernel(
+                    params_.prepared_ref_gate.value(),
+                    params_.prepared_ref_up.value());
+            }
+
+            // Fallback: KernelFactory lookup
+            if (!fused_kernel)
+            {
+                fused_kernel = llaminar::v2::kernels::KernelFactory::getOrCreateFusedGateUpGemm(
+                    w_gate_base, w_up_base, params_.device_id);
+            }
             cached_kernel_ = fused_kernel;
         }
 

@@ -18,6 +18,7 @@
 #include "../IWorkspaceConsumerStage.h"
 #include "../StageParamsBase.h"
 #include "../../../memory/BufferId.h"
+#include "../../../loaders/WeightPlan.h"
 
 #include <optional>
 
@@ -25,6 +26,7 @@ namespace llaminar2
 {
 
     class ITensorGemm;
+    class PreparedWeightStore;
 
     /**
      * @brief 4-projection stage for GDN layers
@@ -75,6 +77,15 @@ namespace llaminar2
             std::optional<BufferId> output_z_buffer_id;
             std::optional<BufferId> output_a_buffer_id;
             std::optional<BufferId> output_b_buffer_id;
+
+            // =================================================================
+            // Phase 7: PreparedWeightRef for direct kernel resolution
+            // =================================================================
+            std::optional<PreparedWeightRef> prepared_ref_qkv;
+            std::optional<PreparedWeightRef> prepared_ref_z;
+            std::optional<PreparedWeightRef> prepared_ref_a;
+            std::optional<PreparedWeightRef> prepared_ref_b;
+            PreparedWeightStore *prepared_store = nullptr;
         };
 
         static_assert(StageParamsRequired<Params>);

@@ -6,6 +6,7 @@
 #include "MoEExpertComputeStage.h"
 #include "../../../execution/moe/DecodeExpertHistogram.h"
 #include "../../../execution/moe/ExpertWeightTransfer.h"
+#include "../../../execution/moe/ExpertWeightPayloadProvider.h"
 #include "../../../execution/moe/MoEExpertWeightService.h"
 #include "../../../execution/local_execution/device/WorkspaceDescriptor.h"
 #include "../../../interfaces/IWorkspaceConsumer.h"
@@ -15,6 +16,7 @@
 #include "../../../kernels/IMoEKernel.h"
 #include "../../../kernels/cpu/primitives/VectorPrimitives.h"
 #include "../../../kernels/cpu/primitives/SwiGLUPrimitives.h"
+#include "../../../loaders/PreparedWeightStore.h"
 #include "../../../utils/Assertions.h"
 #include "../../../utils/Logger.h"
 #include "../../../utils/OpenMPUtils.h"
@@ -176,7 +178,8 @@ namespace llaminar2
             params_.moe_owned_kernels,
             params_.moe_packed_gate_lifetime,
             params_.moe_packed_up_lifetime,
-            params_.moe_packed_down_lifetime
+            params_.moe_packed_down_lifetime,
+            payload_provider_
         };
     }
 
@@ -799,6 +802,11 @@ namespace llaminar2
         {
             if (!params_.expert_gate_views[e])
                 continue;
+
+            // Phase 7: PreparedWeightStore not used here because MoE expert
+            // views are per-expert slices that don't have individual bindings.
+            // The pre-resolved path (prepareExpertGemmEngines) is the intended
+            // Phase 7 path for MoE experts.
             auto *gp = KernelFactory::getOrCreatePreparedGemmWeights(
                 params_.expert_gate_views[e].get(), params_.device_id);
             auto *up = KernelFactory::getOrCreatePreparedGemmWeights(
@@ -852,7 +860,20 @@ namespace llaminar2
         if (has_missing)
         {
             auto ctx = buildWeightContext();
-            if (!MoEExpertWeightService::registerAndPrepareNewExperts(ctx, needed, nullptr))
+
+            // Use payload provider to supply serialized expert blobs instead of
+            // relying on raw GGUF host data. This enables host data release after
+            // initial GEMM preparation.
+            std::unordered_map<int, ExpertWeightBlobs> provider_payloads;
+            const std::unordered_map<int, ExpertWeightBlobs>* payloads_ptr = nullptr;
+            if (payload_provider_)
+            {
+                provider_payloads = payload_provider_->payloadsForLayer(params_.layer_idx);
+                if (!provider_payloads.empty())
+                    payloads_ptr = &provider_payloads;
+            }
+
+            if (!MoEExpertWeightService::registerAndPrepareNewExperts(ctx, needed, payloads_ptr))
                 return false;
         }
 
@@ -1122,6 +1143,19 @@ namespace llaminar2
     {
         if (cached_gate_gemm_)
             return;
+
+        // Phase 7: Try PreparedWeightStore first
+        if (params_.prepared_store)
+        {
+            if (params_.prepared_ref_gate.has_value())
+                cached_gate_gemm_ = params_.prepared_store->gemmKernel(params_.prepared_ref_gate.value());
+            if (params_.prepared_ref_up.has_value())
+                cached_up_gemm_ = params_.prepared_store->gemmKernel(params_.prepared_ref_up.value());
+            if (params_.prepared_ref_down.has_value())
+                cached_down_gemm_ = params_.prepared_store->gemmKernel(params_.prepared_ref_down.value());
+            if (cached_gate_gemm_ && cached_up_gemm_ && cached_down_gemm_)
+                return;
+        }
 
         if (params_.device_id.is_gpu())
         {

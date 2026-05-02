@@ -1793,4 +1793,219 @@ TEST_F(Test__DeviceGraphOrchestrator, DISABLED_WorkspaceConsistency_SameDimensio
 // IWorkspaceConsumer should be in tests/v2/integration/ as they require:
 // - GPU device availability
 // - Actual GEMM stages with workspace requirements
+
+// =============================================================================
+// Weight Pre-Resolution Tests (PP Layer Offset)
+// =============================================================================
+
+/**
+ * @brief Test fixture using MockGraphBuilder for weight pre-resolution tests
+ */
+class Test__DeviceGraphOrchestrator_WeightPreResolution : public ::testing::Test
+{
+protected:
+    void SetUp() override
+    {
+        DeviceManager::instance().initialize(-1);
+    }
+
+    std::shared_ptr<MockGraphBuilder> createMockBuilder(int n_layers, int pp_layer_offset = 0)
+    {
+        GraphConfig cfg;
+        cfg.d_model = 896;
+        cfg.d_ff = 4864;
+        cfg.n_heads = 14;
+        cfg.n_kv_heads = 2;
+        cfg.head_dim = 64;
+        cfg.n_layers = n_layers;
+        cfg.pp_layer_offset = pp_layer_offset;
+        cfg.vocab_size = 151936;
+        cfg.rms_norm_eps = 1e-6f;
+        cfg.rope_theta = 1000000.0f;
+        cfg.default_device = DeviceId::cpu();
+
+        auto mock = std::make_shared<MockGraphBuilder>();
+        mock->setConfig(cfg);
+        return mock;
+    }
+};
+
+TEST_F(Test__DeviceGraphOrchestrator_WeightPreResolution, SingleDeviceResolvesLocalIndices)
+{
+    // SingleDevice: pp_layer_offset=0, n_layers=4
+    // Should resolve indices 0, 1, 2, 3
+    auto mock = createMockBuilder(4, 0);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(mock, nullptr);
+
+    std::vector<int> resolved_indices;
+    ModelWeights weights;
+    weights.embedding_table = nullptr;
+    weights.final_norm = nullptr;
+    weights.lm_head = nullptr;
+    weights.get_layer_weights = [&resolved_indices](int idx) -> LayerWeights {
+        resolved_indices.push_back(idx);
+        LayerWeights lw;
+        // Use attn_norm as a marker to verify which layer was resolved
+        // (we'll use a unique pointer value per layer)
+        return lw;
+    };
+
+    orchestrator->setWeights(weights);
+
+    // Should have resolved indices 0, 1, 2, 3
+    ASSERT_EQ(resolved_indices.size(), 4u);
+    EXPECT_EQ(resolved_indices[0], 0);
+    EXPECT_EQ(resolved_indices[1], 1);
+    EXPECT_EQ(resolved_indices[2], 2);
+    EXPECT_EQ(resolved_indices[3], 3);
+}
+
+TEST_F(Test__DeviceGraphOrchestrator_WeightPreResolution, PPStage1ResolvesGlobalIndices)
+{
+    // PP Stage 1: pp_layer_offset=20, n_layers=20
+    // Should resolve indices 20, 21, ..., 39
+    auto mock = createMockBuilder(20, 20);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(mock, nullptr);
+
+    std::vector<int> resolved_indices;
+    ModelWeights weights;
+    weights.embedding_table = nullptr;
+    weights.final_norm = nullptr;
+    weights.lm_head = nullptr;
+    weights.get_layer_weights = [&resolved_indices](int idx) -> LayerWeights {
+        resolved_indices.push_back(idx);
+        return LayerWeights{};
+    };
+
+    orchestrator->setWeights(weights);
+
+    // Should have resolved indices 20..39
+    ASSERT_EQ(resolved_indices.size(), 20u);
+    EXPECT_EQ(resolved_indices.front(), 20);
+    EXPECT_EQ(resolved_indices.back(), 39);
+    for (int i = 0; i < 20; ++i)
+    {
+        EXPECT_EQ(resolved_indices[i], 20 + i);
+    }
+}
+
+TEST_F(Test__DeviceGraphOrchestrator_WeightPreResolution, FrozenLambdaReturnsCorrectWeightsForGlobalIndices)
+{
+    // PP Stage 1: pp_layer_offset=12, n_layers=12 (layers 12..23)
+    // After freezing, the graph builder's get_layer_weights should return
+    // the correct LayerWeights when queried with global indices.
+    auto mock = createMockBuilder(12, 12);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(mock, nullptr);
+
+    // Create unique marker tensors per layer
+    std::vector<std::unique_ptr<FP32Tensor>> markers;
+    for (int i = 0; i < 12; ++i)
+    {
+        markers.push_back(std::make_unique<FP32Tensor>(
+            std::vector<size_t>{1}, DeviceId::cpu()));
+    }
+
+    ModelWeights weights;
+    weights.embedding_table = nullptr;
+    weights.final_norm = nullptr;
+    weights.lm_head = nullptr;
+    weights.get_layer_weights = [&markers](int idx) -> LayerWeights {
+        // Map global index 12..23 to marker 0..11
+        int local = idx - 12;
+        if (local < 0 || local >= 12)
+            return LayerWeights{};
+        LayerWeights lw;
+        lw.attn_norm = markers[local].get();
+        return lw;
+    };
+
+    orchestrator->setWeights(weights);
+
+    // Now query the graph builder's frozen weights with global indices
+    const auto &frozen = mock->storedWeights();
+    ASSERT_TRUE(frozen.get_layer_weights);
+
+    // Global index 12 should return marker[0]
+    auto lw12 = frozen.get_layer_weights(12);
+    EXPECT_EQ(lw12.attn_norm, markers[0].get());
+
+    // Global index 23 should return marker[11]
+    auto lw23 = frozen.get_layer_weights(23);
+    EXPECT_EQ(lw23.attn_norm, markers[11].get());
+
+    // Global index 17 should return marker[5]
+    auto lw17 = frozen.get_layer_weights(17);
+    EXPECT_EQ(lw17.attn_norm, markers[5].get());
+
+    // Out-of-range indices should return empty LayerWeights
+    auto lw_below = frozen.get_layer_weights(11);
+    EXPECT_EQ(lw_below.attn_norm, nullptr);
+
+    auto lw_above = frozen.get_layer_weights(24);
+    EXPECT_EQ(lw_above.attn_norm, nullptr);
+}
+
+TEST_F(Test__DeviceGraphOrchestrator_WeightPreResolution, PPStage0ResolvesFromZero)
+{
+    // PP Stage 0: pp_layer_offset=0, n_layers=20 (layers 0..19)
+    // Equivalent to single-device with 20 layers
+    auto mock = createMockBuilder(20, 0);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(mock, nullptr);
+
+    std::vector<int> resolved_indices;
+    ModelWeights weights;
+    weights.embedding_table = nullptr;
+    weights.final_norm = nullptr;
+    weights.lm_head = nullptr;
+    weights.get_layer_weights = [&resolved_indices](int idx) -> LayerWeights {
+        resolved_indices.push_back(idx);
+        return LayerWeights{};
+    };
+
+    orchestrator->setWeights(weights);
+
+    ASSERT_EQ(resolved_indices.size(), 20u);
+    EXPECT_EQ(resolved_indices[0], 0);
+    EXPECT_EQ(resolved_indices[19], 19);
+}
+
+TEST_F(Test__DeviceGraphOrchestrator_WeightPreResolution, PPCallbackRejectingOutOfRangeDoesNotCrash)
+{
+    // Simulates the real PP weight callback from InferenceRunnerFactory
+    // which returns empty LayerWeights{} for indices outside its stage range.
+    // This test verifies that our frozen lambda doesn't crash even when the
+    // original callback would have returned empty (shouldn't happen with
+    // correct offset, but tests resilience).
+    auto mock = createMockBuilder(20, 20);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(mock, nullptr);
+
+    // Simulate the real PP wrapper: only accepts indices [20, 40)
+    ModelWeights weights;
+    weights.embedding_table = nullptr;
+    weights.final_norm = nullptr;
+    weights.lm_head = nullptr;
+    weights.get_layer_weights = [](int idx) -> LayerWeights {
+        if (idx < 20 || idx >= 40)
+            return LayerWeights{}; // Reject out-of-range
+        LayerWeights lw;
+        // Use a non-null pointer to distinguish valid from empty
+        lw.wq = reinterpret_cast<TensorBase *>(static_cast<uintptr_t>(idx + 1));
+        return lw;
+    };
+
+    // Should NOT crash — this was the original bug
+    EXPECT_NO_THROW(orchestrator->setWeights(weights));
+
+    // Verify the frozen lambda returns correct pointers for valid indices
+    const auto &frozen = mock->storedWeights();
+    auto lw20 = frozen.get_layer_weights(20);
+    EXPECT_EQ(lw20.wq, reinterpret_cast<TensorBase *>(21));
+
+    auto lw39 = frozen.get_layer_weights(39);
+    EXPECT_EQ(lw39.wq, reinterpret_cast<TensorBase *>(40));
+
+    // Out-of-range returns null
+    auto lw0 = frozen.get_layer_weights(0);
+    EXPECT_EQ(lw0.wq, nullptr);
+}
 // - DeviceWorkspaceManager allocation verification

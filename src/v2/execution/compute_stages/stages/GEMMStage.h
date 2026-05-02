@@ -10,14 +10,16 @@
 #include "../StageParamsBase.h"
 #include "../../../utils/GemmContext.h"
 #include "../../../memory/BufferId.h"
+#include "../../../loaders/WeightPlan.h"
 
 #include <optional>
 
 namespace llaminar2
 {
 
-    // Forward declaration
+    // Forward declarations
     class ITensorGemm;
+    class PreparedWeightStore;
 
     /**
      * @brief GEMM stage: C = alpha * A * B + beta * C
@@ -114,6 +116,24 @@ namespace llaminar2
             // Optional BufferIds for contract-based coherence
             std::optional<BufferId> a_buffer_id;
             std::optional<BufferId> c_buffer_id;
+
+            // =================================================================
+            // Phase 7: PreparedWeightRef for direct kernel resolution
+            // =================================================================
+
+            /**
+             * @brief Prepared weight reference for this GEMM's weight tensor.
+             * When set (together with prepared_store), the stage resolves its
+             * kernel via PreparedWeightStore::gemmKernel() instead of
+             * KernelFactory::getOrCreatePreparedGemmWeights().
+             */
+            std::optional<PreparedWeightRef> prepared_ref;
+
+            /**
+             * @brief PreparedWeightStore for resolving prepared_ref.
+             * Lifetime managed by DeviceGraphOrchestrator.
+             */
+            PreparedWeightStore *prepared_store = nullptr;
         };
 
         explicit GEMMStage(Params params);

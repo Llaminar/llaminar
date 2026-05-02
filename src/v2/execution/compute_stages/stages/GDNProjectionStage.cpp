@@ -5,6 +5,7 @@
 
 #include "GDNProjectionStage.h"
 #include "../../../kernels/KernelFactory.h"
+#include "../../../loaders/PreparedWeightStore.h"
 #include "../../../tensors/Tensors.h"
 #include "../../../tensors/TensorKernels.h"
 #include "../../../utils/Logger.h"
@@ -28,6 +29,31 @@ namespace llaminar2
         if (!B_base)
             return nullptr;
 
+        // Phase 7: Try PreparedWeightStore first (check which ref matches this weight)
+        if (params_.prepared_store)
+        {
+            const std::optional<PreparedWeightRef> *ref = nullptr;
+            if (weight == params_.w_qkv)
+                ref = &params_.prepared_ref_qkv;
+            else if (weight == params_.w_z)
+                ref = &params_.prepared_ref_z;
+            else if (weight == params_.w_a)
+                ref = &params_.prepared_ref_a;
+            else if (weight == params_.w_b)
+                ref = &params_.prepared_ref_b;
+
+            if (ref && ref->has_value())
+            {
+                auto *gemm = params_.prepared_store->gemmKernel(ref->value());
+                if (gemm)
+                {
+                    cached = gemm;
+                    return gemm;
+                }
+            }
+        }
+
+        // Fallback: KernelFactory
         auto *prepared = KernelFactory::getOrCreatePreparedGemmWeights(
             B_base, params_.device_id);
         auto *gemm = KernelFactory::getOrCreateGemmEngine(prepared);

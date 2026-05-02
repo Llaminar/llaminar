@@ -30,6 +30,9 @@
 #include "../../../kernels/HybridKVCacheConfig.h"
 #include "../../compute_stages/stages/MoEExpertComputeStage.h"
 #include "../../moe/ExpertWeightTransfer.h"
+#include "../../moe/ExpertWeightPayloadProvider.h"
+#include "../../../loaders/PreparedWeightStore.h"
+#include "../../../loaders/WeightPlan.h"
 #include "../../../backends/BackendManager.h"
 #include "../../../interfaces/IWorkspaceConsumer.h"
 #include "../../moe/MoERebalanceController.h"
@@ -239,8 +242,126 @@ namespace llaminar2
             LOG_ERROR("[DeviceGraphOrchestrator] Cannot set weights: graph builder not initialized");
             return;
         }
-        graph_builder_->setWeights(weights);
-        LOG_DEBUG("[DeviceGraphOrchestrator] Model weights configured for full forward pass");
+
+        // Phase 6: Pre-resolve all layer weights to freeze weight resolution.
+        // After this, graph construction reads pre-resolved pointers rather than
+        // calling getWeightForDevice() lazily during graph build.
+        const auto &cfg = graph_builder_->config();
+        const int n_layers = cfg.n_layers;
+        if (n_layers > 0 && weights.get_layer_weights)
+        {
+            // For PP stages, graph builders use global layer indices
+            // (pp_layer_offset .. pp_layer_offset + n_layers - 1).
+            // For single-device, pp_layer_offset=0 and indices are 0..n_layers-1.
+            const int first_layer = cfg.pp_layer_offset;
+            const int last_layer = first_layer + n_layers;
+
+            ModelWeights frozen_weights = weights;
+            auto resolved = std::make_shared<std::unordered_map<int, LayerWeights>>();
+            resolved->reserve(n_layers);
+            for (int i = first_layer; i < last_layer; ++i)
+                (*resolved)[i] = weights.get_layer_weights(i);
+
+            frozen_weights.get_layer_weights = [resolved](int layer_idx) -> LayerWeights {
+                auto it = resolved->find(layer_idx);
+                if (it != resolved->end())
+                    return it->second;
+                return {};
+            };
+
+            graph_builder_->setWeights(frozen_weights);
+
+            // Phase 6 (continued): Build FrozenModelWeightSet for audit, validation,
+            // and Phase 7 PreparedWeightStore integration.
+            buildFrozenWeightSet(weights, *resolved, first_layer, last_layer);
+
+            LOG_DEBUG("[DeviceGraphOrchestrator] Model weights frozen for " << n_layers
+                      << " layers [" << first_layer << ", " << last_layer << ")");
+        }
+        else
+        {
+            graph_builder_->setWeights(weights);
+            LOG_DEBUG("[DeviceGraphOrchestrator] Model weights configured for full forward pass");
+        }
+    }
+
+    void DeviceGraphOrchestrator::buildFrozenWeightSet(
+        const ModelWeights &weights,
+        const std::unordered_map<int, LayerWeights> &resolved_layers,
+        int first_layer, int last_layer)
+    {
+        // Determine strategy from current orchestrator state
+        InferenceStrategy strategy;
+        strategy.mode = WeightInferenceMode::SingleDevice;
+        strategy.pp_stages = 1;
+        strategy.tp_degree = 1;
+        if (graph_builder_)
+        {
+            const auto &cfg = graph_builder_->config();
+            strategy.devices.push_back(cfg.default_device);
+        }
+
+        // Build bindings from global weights + resolved layer weights
+        ModelWeightSetBuilder builder(strategy);
+
+        // Global weights
+        auto addGlobal = [&](TensorBase *tensor, const std::string &name, WeightRole role) {
+            if (!tensor)
+                return;
+            WeightIdentity id;
+            id.canonical_name = name;
+            id.role = role;
+            id.logical_id = stableWeightLogicalId(name);
+            WeightBinding binding;
+            binding.identity = id;
+            binding.tensor = tensor;
+            binding.immutable = true;
+            builder.addBinding(std::move(binding));
+        };
+
+        addGlobal(weights.embedding_table, "token_embd.weight", WeightRole::Embedding);
+        addGlobal(weights.final_norm, "output_norm.weight", WeightRole::OutputNorm);
+        addGlobal(weights.lm_head, "output.weight", WeightRole::LMHead);
+
+        // Per-layer weights
+        for (int layer_idx = first_layer; layer_idx < last_layer; ++layer_idx)
+        {
+            auto it = resolved_layers.find(layer_idx);
+            if (it == resolved_layers.end())
+                continue;
+            const auto &lw = it->second;
+
+            auto addLayer = [&](TensorBase *tensor, const std::string &suffix, WeightRole role) {
+                if (!tensor)
+                    return;
+                std::string canonical = "blk." + std::to_string(layer_idx) + "." + suffix;
+                WeightIdentity id;
+                id.canonical_name = canonical;
+                id.role = role;
+                id.layer = layer_idx;
+                id.logical_id = stableWeightLogicalId(canonical);
+                WeightBinding binding;
+                binding.identity = id;
+                binding.tensor = tensor;
+                binding.immutable = true;
+                builder.addBinding(std::move(binding));
+            };
+
+            addLayer(lw.wq, "attn_q.weight", WeightRole::AttentionQ);
+            addLayer(lw.wk, "attn_k.weight", WeightRole::AttentionK);
+            addLayer(lw.wv, "attn_v.weight", WeightRole::AttentionV);
+            addLayer(lw.wo, "attn_output.weight", WeightRole::AttentionWO);
+            addLayer(lw.attn_norm, "attn_norm.weight", WeightRole::Norm);
+            addLayer(lw.gate_proj, "ffn_gate.weight", WeightRole::FFNGate);
+            addLayer(lw.up_proj, "ffn_up.weight", WeightRole::FFNUp);
+            addLayer(lw.down_proj, "ffn_down.weight", WeightRole::FFNDown);
+            addLayer(lw.ffn_norm, "ffn_norm.weight", WeightRole::Norm);
+        }
+
+        frozen_weight_set_ = std::make_unique<FrozenModelWeightSet>(
+            strategy, builder.freezeBindings());
+        LOG_DEBUG("[DeviceGraphOrchestrator] FrozenModelWeightSet built with "
+                  << frozen_weight_set_->bindings().size() << " bindings");
     }
 
     void DeviceGraphOrchestrator::setBuffers(const ModelBuffers &buffers)
@@ -2089,11 +2210,130 @@ namespace llaminar2
         moe_rebalance_controller_ = std::move(controller);
     }
 
+    void DeviceGraphOrchestrator::initializeExpertPayloadProvider()
+    {
+        // Count MoE stages to decide if a provider is needed
+        int moe_stage_count = 0;
+        if (forward_engine_)
+        {
+            forward_engine_->forEachCachedStage(
+                ComputeStageType::MOE_EXPERT_FFN,
+                [&](IComputeStage*) { ++moe_stage_count; });
+        }
+
+        if (moe_stage_count == 0)
+        {
+            LOG_DEBUG("[DGO] No MoE stages found — skipping payload provider initialization");
+            return;
+        }
+
+        // Create provider
+        expert_payload_provider_ = std::make_unique<ExpertWeightPayloadProvider>();
+
+        // Wire to all cached MoE stages
+        int wired = 0;
+        forward_engine_->forEachCachedStage(
+            ComputeStageType::MOE_EXPERT_FFN,
+            [&](IComputeStage* s) {
+                auto* moe = dynamic_cast<MoEExpertComputeStage*>(s);
+                if (moe)
+                {
+                    moe->setPayloadProvider(expert_payload_provider_.get());
+                    ++wired;
+                }
+            });
+
+        // Wire to WeightManager for host retention decisions
+        if (weight_manager_)
+        {
+            weight_manager_->setExpertPayloadProvider(expert_payload_provider_.get());
+        }
+
+        LOG_INFO("[DGO] Expert payload provider initialized and wired to "
+                 << wired << " MoE stages");
+    }
+
+    void DeviceGraphOrchestrator::initializePreparedWeightStore(DeviceId device)
+    {
+        if (prepared_weight_store_)
+        {
+            LOG_DEBUG("[DGO] Prepared weight store already initialized");
+            return;
+        }
+
+        if (!weight_manager_)
+        {
+            LOG_DEBUG("[DGO] No weight manager — skipping prepared weight store");
+            return;
+        }
+
+        ModelContextId model_id{};
+        model_id.value = reinterpret_cast<uint64_t>(this); // Stable per-orchestrator ID
+
+        prepared_weight_store_ = std::make_unique<PreparedWeightStore>(model_id);
+
+        // Populate the store from weights already prepared via KernelFactory.
+        // This dual-registers prepared weights so they're queryable through
+        // the model-context-owned store (Phase 4 compatibility layer).
+        int registered = 0;
+        uint64_t next_binding_id = 1;
+
+        auto register_if_prepared = [&](const std::string& name, TensorBase* tensor) {
+            if (!tensor) return;
+
+            const auto* handle = llaminar::v2::kernels::KernelFactory::findPreparedGemmWeights(
+                tensor, device);
+            if (!handle) return;
+
+            WeightBinding binding;
+            binding.binding_id = next_binding_id++;
+            binding.identity.model_id = model_id;
+            binding.identity.canonical_name = name;
+            binding.identity.role = inferWeightRole(name);
+            binding.identity.layer = inferWeightLayer(name);
+            binding.residency.home_device = device;
+            binding.residency.resident_device = device;
+            binding.tensor = tensor;
+
+            try
+            {
+                PreparedWeightKind kind = device.is_cuda()
+                    ? PreparedWeightKind::CudaInt8PackedGemm
+                    : device.is_rocm()
+                        ? PreparedWeightKind::RocmInt8PackedGemm
+                        : PreparedWeightKind::CpuPackedGemm;
+
+                prepared_weight_store_->registerPreparedGemmFromPipeline(
+                    binding, kind, device, handle);
+                ++registered;
+            }
+            catch (const std::exception& e)
+            {
+                LOG_WARN("[DGO] Failed to register prepared weight '"
+                         << name << "' in store: " << e.what());
+            }
+        };
+
+        // Iterate weight manager cache and register prepared GEMM weights
+        weight_manager_->forEachWeight([&](const std::string& name, TensorBase* tensor) {
+            register_if_prepared(name, tensor);
+        });
+
+        LOG_INFO("[DGO] Prepared weight store initialized with "
+                 << registered << " entries for device " << device.toString());
+    }
+
     void DeviceGraphOrchestrator::applyExpertMasks(
         const std::vector<std::vector<bool>>& masks,
         const ReceivedWeightsMap& received_weights)
     {
         auto t_start = std::chrono::high_resolution_clock::now();
+
+        // Lazily initialize payload provider on first mask application
+        if (!expert_payload_provider_)
+        {
+            initializeExpertPayloadProvider();
+        }
 
         // ── Step 1: Collect all MoE stages ──────────────────────────────
         struct StageInfo {

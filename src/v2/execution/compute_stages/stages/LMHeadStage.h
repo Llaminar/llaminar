@@ -9,14 +9,16 @@
 #include "../IWorkspaceConsumerStage.h"
 #include "../StageParamsBase.h"
 #include "../../../memory/BufferId.h"
+#include "../../../loaders/WeightPlan.h"
 
 #include <optional>
 
 namespace llaminar2
 {
 
-    // Forward declaration
+    // Forward declarations
     class ITensorGemm;
+    class PreparedWeightStore;
 
     /**
      * @brief Language model head projection stage
@@ -55,6 +57,12 @@ namespace llaminar2
             // Optional BufferIds for contract-based coherence
             std::optional<BufferId> input_buffer_id;
             std::optional<BufferId> output_buffer_id;
+
+            // =================================================================
+            // Phase 7: PreparedWeightRef for direct kernel resolution
+            // =================================================================
+            std::optional<PreparedWeightRef> prepared_ref;
+            PreparedWeightStore *prepared_store = nullptr;
         };
 
         explicit LMHeadStage(Params params);

@@ -41,6 +41,7 @@
 
 namespace llaminar2
 {
+    class ExpertWeightPayloadProvider;
 
     // WeightDistributionStrategy and ShardingMode are now in WeightTypes.h
     // (included transitively via WeightManagerConfig.h → WeightTypes.h)
@@ -409,7 +410,44 @@ namespace llaminar2
 
         WeightMetadataRegistry *weightMetadataRegistry() const { return weight_metadata_.get(); }
 
+        /**
+         * @brief Set the expert weight payload provider for metadata-based host retention.
+         *
+         * When set, releaseAllHostWeightData() uses the provider to determine whether
+         * expert weight raw host data is still needed, instead of the string-matching
+         * shouldRetainRawForLazyMoE() heuristic.
+         *
+         * @param provider Model-context owned payload provider (may be nullptr to disable)
+         */
+        void setExpertPayloadProvider(ExpertWeightPayloadProvider *provider)
+        {
+            expert_payload_provider_ = provider;
+        }
+
+        /**
+         * @brief Check if raw host data is still required for a tensor.
+         *
+         * Uses WeightMetadataRegistry and ExpertWeightPayloadProvider to determine
+         * whether the tensor's raw host data should be retained. Replaces the
+         * string-matching shouldRetainRawForLazyMoE() heuristic.
+         *
+         * @param tensor The tensor to check
+         * @param key The cache key (canonical name) of the tensor
+         * @return true if raw host data must be retained
+         */
+        bool hostDataRequired(const TensorBase *tensor, const std::string &key) const;
+
         FrozenModelWeightSet materialize(const WeightPlan &plan);
+
+        /**
+         * @brief Iterate over all cached weights (source cache).
+         *
+         * Calls the visitor for each (name, tensor) pair in the primary weight cache.
+         * Thread-safe: acquires cache_mutex_ during iteration.
+         *
+         * @param visitor Callback receiving (canonical_name, raw_tensor_ptr)
+         */
+        void forEachWeight(std::function<void(const std::string &, TensorBase *)> visitor) const;
 
         /**
          * @brief Set layer range for LAYER_PARTITIONED strategy
@@ -714,6 +752,7 @@ namespace llaminar2
         std::unordered_map<std::string, std::shared_ptr<TensorBase>> decode_cache_; ///< Decode shard cache
 
         std::shared_ptr<WeightMetadataRegistry> weight_metadata_;
+        ExpertWeightPayloadProvider *expert_payload_provider_ = nullptr; ///< Optional, model-context owned
 
         void registerSourceMetadata(
             const std::string &name,

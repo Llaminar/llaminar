@@ -18,6 +18,7 @@
 #include "../../../interfaces/IWorkspaceConsumer.h"
 #include "../../../memory/BufferId.h"
 #include "../../../kernels/IMoEKernel.h"
+#include "../../../loaders/WeightPlan.h"
 #include "../../moe/ExpertWeightTransfer.h"
 #include "../../moe/MoERebalanceController.h"
 #include "../../moe/MoEExpertWeightService.h"
@@ -32,6 +33,8 @@ namespace llaminar2
     class ITensorGemm;
     class FP32Tensor;
     class DecodeExpertHistogram;
+    class ExpertWeightPayloadProvider;
+    class PreparedWeightStore;
 
     /**
      * @brief Unified MoE FFN stage (router + expert execution + combine)
@@ -130,6 +133,11 @@ namespace llaminar2
             // Buffer IDs for coherence
             BufferId input_buffer_id = BufferId::NORMALIZED;
             BufferId output_buffer_id = BufferId::MOE_COMBINED_OUTPUT;
+
+            // =================================================================
+            // Phase 7: PreparedWeightStore for decode-time fallback resolution
+            // =================================================================
+            PreparedWeightStore *prepared_store = nullptr;
         };
 
         explicit MoEExpertComputeStage(Params params);
@@ -223,6 +231,13 @@ namespace llaminar2
         /// Used by the weight service for rebalancing operations.
         MoEWeightContext buildWeightContext();
 
+        /// Set the payload provider for lazy GPU expert preparation.
+        /// The provider is model-context owned and outlives the stage.
+        void setPayloadProvider(ExpertWeightPayloadProvider *provider)
+        {
+            payload_provider_ = provider;
+        }
+
         // =====================================================================
         // IWorkspaceConsumer Implementation
         // =====================================================================
@@ -236,6 +251,7 @@ namespace llaminar2
         Params params_;
         bool raw_weights_released_ = false; ///< Set by releaseRawExpertWeights()
         DeviceWorkspaceManager *bound_workspace_ = nullptr; ///< Workspace for expert GEMM engines
+        ExpertWeightPayloadProvider *payload_provider_ = nullptr; ///< Model-context owned
 
         /// Cached GEMM engines per expert (resolved on first execute)
         mutable std::vector<ITensorGemm *> cached_gate_gemm_;
@@ -301,6 +317,14 @@ namespace llaminar2
 
             BufferId input_buffer_id = BufferId::NORMALIZED;
             BufferId output_buffer_id = BufferId::MOE_SHARED_EXPERT_OUTPUT;
+
+            // =================================================================
+            // Phase 7: PreparedWeightRef for direct kernel resolution
+            // =================================================================
+            std::optional<PreparedWeightRef> prepared_ref_gate;
+            std::optional<PreparedWeightRef> prepared_ref_up;
+            std::optional<PreparedWeightRef> prepared_ref_down;
+            PreparedWeightStore *prepared_store = nullptr;
         };
 
         explicit SharedExpertFFNStage(Params params);

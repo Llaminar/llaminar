@@ -9520,6 +9520,18 @@ add_v2_test(V2_Unit_ExpertWeightCache
     LABELS "V2;Unit;MoE;Cache;LRU;WeightCache"
 )
 
+# Test: ExpertWeightPayloadProvider — metadata-based host retention lifecycle
+add_executable(v2_test_expert_weight_payload_provider unit/moe/Test__ExpertWeightPayloadProvider.cpp)
+target_link_libraries(v2_test_expert_weight_payload_provider
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_ExpertWeightPayloadProvider
+    COMMAND $<TARGET_FILE:v2_test_expert_weight_payload_provider>
+    LABELS "V2;Unit;MoE;WeightLifecycle;PayloadProvider"
+)
+
 # Test: ExpertRebalancer — histogram-based dynamic weight movement
 add_executable(v2_test_expert_rebalancer unit/moe/Test__ExpertRebalancer.cpp)
 target_link_libraries(v2_test_expert_rebalancer

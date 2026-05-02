@@ -9,6 +9,7 @@
 #include "../../../utils/Logger.h"
 #include "../../../kernels/KernelFactory.h"
 #include "../../../utils/GemmContext.h"
+#include "../../../loaders/PreparedWeightStore.h"
 
 namespace llaminar2
 {
@@ -64,8 +65,18 @@ namespace llaminar2
                                                                     << ", rocm_ordinal=" << (params_.device_id.is_rocm() ? params_.device_id.rocm_ordinal() : -1) << ")"
                                                                     << " lm_head_weight=" << (void *)lm_head_weight
                                                                     << " shape=" << lm_head_weight->shape()[0] << "x" << lm_head_weight->shape()[1]);
-        auto *prepared = llaminar::v2::kernels::KernelFactory::getOrCreatePreparedGemmWeights(lm_head_weight, params_.device_id);
-        ITensorGemm *lm_gemm = llaminar::v2::kernels::KernelFactory::getOrCreateGemmEngine(prepared);
+
+        // Phase 7: Try PreparedWeightStore first
+        ITensorGemm *lm_gemm = nullptr;
+        if (params_.prepared_ref.has_value() && params_.prepared_store)
+        {
+            lm_gemm = params_.prepared_store->gemmKernel(params_.prepared_ref.value());
+        }
+        if (!lm_gemm)
+        {
+            auto *prepared = llaminar::v2::kernels::KernelFactory::getOrCreatePreparedGemmWeights(lm_head_weight, params_.device_id);
+            lm_gemm = llaminar::v2::kernels::KernelFactory::getOrCreateGemmEngine(prepared);
+        }
         LOG_DEBUG("[LMHeadStage] Got kernel=" << (void *)lm_gemm);
         if (!lm_gemm)
         {
@@ -232,6 +243,9 @@ namespace llaminar2
 
         auto *prepared = llaminar::v2::kernels::KernelFactory::getOrCreatePreparedGemmWeights(lm_head_weight, params_.device_id);
         ITensorGemm *lm_gemm = llaminar::v2::kernels::KernelFactory::getOrCreateGemmEngine(prepared);
+
+        // Note: getKernelAsWorkspaceConsumer() is called at graph setup time,
+        // so we always use KernelFactory here (PreparedWeightStore may not exist yet).
         if (!lm_gemm)
         {
             LOG_DEBUG("[LMHeadStage::getKernelAsWorkspaceConsumer] No GEMM kernel available");

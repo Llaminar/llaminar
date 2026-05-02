@@ -555,6 +555,9 @@ namespace llaminar2
             hidden_dim_ = cfg.d_model;
         }
 
+        /// Access stored weights (for test assertions after setWeights())
+        const ModelWeights &storedWeights() const { return weights_; }
+
         // =====================================================================
         // Call Tracking (for test assertions)
         // =====================================================================

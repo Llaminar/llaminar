@@ -10,6 +10,7 @@
 namespace llaminar2
 {
     class ITensorGemm;
+    class ITensorFusedGateUpGemm;
 
     class PreparedWeightStore
     {
@@ -27,6 +28,9 @@ namespace llaminar2
             DeviceId device,
             const llaminar::v2::kernels::KernelFactory::PreparedGemmHandle *handle);
         ITensorGemm *gemmKernel(const PreparedWeightRef &ref) const;
+        ITensorFusedGateUpGemm *fusedGateUpKernel(
+            const PreparedWeightRef &gate_ref,
+            const PreparedWeightRef &up_ref) const;
         bool contains(const PreparedWeightRef &ref) const;
         std::optional<WeightBinding> binding(const PreparedWeightRef &ref) const;
         size_t size() const;

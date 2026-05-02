@@ -58,6 +58,7 @@ namespace llaminar2
         {
         case WeightHostPolicy::RequiredForCPUExecution: return "RequiredForCPUExecution";
         case WeightHostPolicy::RequiredUntilGraphMaterialized: return "RequiredUntilGraphMaterialized";
+        case WeightHostPolicy::RequiredUntilPreparedOrTransferred: return "RequiredUntilPreparedOrTransferred";
         case WeightHostPolicy::ReleasableAfterPreparation: return "ReleasableAfterPreparation";
         case WeightHostPolicy::Released: return "Released";
         }

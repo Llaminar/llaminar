@@ -10,6 +10,7 @@
 #include "../../../utils/Logger.h"
 #include "../../../kernels/KernelFactory.h"
 #include "../../../utils/GemmContext.h"
+#include "../../../loaders/PreparedWeightStore.h"
 
 #include <cmath>
 #include <cstring>
@@ -85,12 +86,33 @@ namespace llaminar2
         // Get or cache individual Q/K/V kernels (avoid KernelFactory mutex per token)
         if (!cache_resolved_individual_)
         {
-            auto *prepared_q = llaminar::v2::kernels::KernelFactory::getOrCreatePreparedGemmWeights(wq_base, params_.device_id);
-            auto *prepared_k = llaminar::v2::kernels::KernelFactory::getOrCreatePreparedGemmWeights(wk_base, params_.device_id);
-            auto *prepared_v = llaminar::v2::kernels::KernelFactory::getOrCreatePreparedGemmWeights(wv_base, params_.device_id);
-            cached_gemm_q_ = llaminar::v2::kernels::KernelFactory::getOrCreateGemmEngine(prepared_q);
-            cached_gemm_k_ = llaminar::v2::kernels::KernelFactory::getOrCreateGemmEngine(prepared_k);
-            cached_gemm_v_ = llaminar::v2::kernels::KernelFactory::getOrCreateGemmEngine(prepared_v);
+            // Phase 7: Try PreparedWeightStore first
+            if (params_.prepared_store)
+            {
+                if (params_.prepared_ref_q.has_value())
+                    cached_gemm_q_ = params_.prepared_store->gemmKernel(params_.prepared_ref_q.value());
+                if (params_.prepared_ref_k.has_value())
+                    cached_gemm_k_ = params_.prepared_store->gemmKernel(params_.prepared_ref_k.value());
+                if (params_.prepared_ref_v.has_value())
+                    cached_gemm_v_ = params_.prepared_store->gemmKernel(params_.prepared_ref_v.value());
+            }
+
+            // Fallback: KernelFactory for any unresolved kernels
+            if (!cached_gemm_q_)
+            {
+                auto *prepared_q = llaminar::v2::kernels::KernelFactory::getOrCreatePreparedGemmWeights(wq_base, params_.device_id);
+                cached_gemm_q_ = llaminar::v2::kernels::KernelFactory::getOrCreateGemmEngine(prepared_q);
+            }
+            if (!cached_gemm_k_)
+            {
+                auto *prepared_k = llaminar::v2::kernels::KernelFactory::getOrCreatePreparedGemmWeights(wk_base, params_.device_id);
+                cached_gemm_k_ = llaminar::v2::kernels::KernelFactory::getOrCreateGemmEngine(prepared_k);
+            }
+            if (!cached_gemm_v_)
+            {
+                auto *prepared_v = llaminar::v2::kernels::KernelFactory::getOrCreatePreparedGemmWeights(wv_base, params_.device_id);
+                cached_gemm_v_ = llaminar::v2::kernels::KernelFactory::getOrCreateGemmEngine(prepared_v);
+            }
             cache_resolved_individual_ = true;
         }
         auto *gemm_q = cached_gemm_q_;

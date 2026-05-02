@@ -7,6 +7,7 @@
  */
 
 #include "MoEExpertWeightService.h"
+#include "ExpertWeightPayloadProvider.h"
 #include "GPUExpertTransfer.h"
 #include "../../tensors/Tensors.h"
 #include "../../tensors/BlockStructures.h"
@@ -408,6 +409,13 @@ bool MoEExpertWeightService::prepareGemmEngines(MoEWeightContext& ctx)
     auditExpertNUMA(experts_to_prep, ctx.prepared_gate_gemm,
                     "initial_pack", ctx.layer_idx);
 
+    // Mark experts as prepared in the payload provider (enables host data release)
+    if (ctx.payload_provider)
+    {
+        for (int e : experts_to_prep)
+            ctx.payload_provider->markExpertPrepared(ctx.layer_idx, e);
+    }
+
     // Release mmap pages backing the raw expert weight data.
     // The VNNI interleaved engines now own their own copy — the original
     // mmap data is never accessed again. Releasing per-layer reduces peak RSS
@@ -674,6 +682,13 @@ bool MoEExpertWeightService::registerAndPrepareNewExperts(
 
     if (error_flag.load()) return false;
 
+    // Mark experts as prepared in the payload provider
+    if (ctx.payload_provider)
+    {
+        for (int e : new_experts)
+            ctx.payload_provider->markExpertPrepared(ctx.layer_idx, e);
+    }
+
     auto t_end = std::chrono::high_resolution_clock::now();
     double prep_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
     LOG_DEBUG("[MoEWeightService] Engine prep for " << new_experts.size()
@@ -933,6 +948,57 @@ bool MoEExpertWeightService::registerAndPrepareNewExpertsGPU(
                 job.raw_bytes = source.native->nativeBlocks().size();
                 job.format = source.format;
             }
+            else if (ctx.payload_provider)
+            {
+                // Try the payload provider for serialized expert blobs before
+                // falling back to raw GGUF host data. This enables host data
+                // release after initial GEMM preparation.
+                auto payload = ctx.payload_provider->payloadFor(ctx.layer_idx, e);
+                if (payload)
+                {
+                    const std::vector<uint8_t>* payload_blob = nullptr;
+                    if (std::strcmp(grp.label, "gate") == 0) payload_blob = &payload->gate;
+                    else if (std::strcmp(grp.label, "up") == 0) payload_blob = &payload->up;
+                    else payload_blob = &payload->down;
+
+                    if (payload_blob && !payload_blob->empty())
+                    {
+                        auto source = makeTransferSource(*payload_blob, e, grp.label);
+                        if (!source) return false;
+                        job.host_raw_data = source->native->nativeBlocks().data();
+                        job.raw_bytes = source->native->nativeBlocks().size();
+                        job.format = source->format;
+                        transfer_sources.push_back(std::move(*source));
+                    }
+                    else
+                    {
+                        LOG_ERROR("[MoEWeightService::GPU-rebalance] Expert " << e << " "
+                                  << grp.label << " has empty payload from provider for "
+                                  << ctx.device_id.to_string() << " (layer " << ctx.layer_idx << ")");
+                        return false;
+                    }
+                }
+                else
+                {
+                    // Payload provider exists but has no payload for this expert.
+                    // Fall through to raw data as last resort.
+                    job.host_raw_data = view->raw_data();
+                    job.raw_bytes = quantizedViewRawBytes(*view);
+                    if (!job.host_raw_data)
+                    {
+                        LOG_ERROR("[MoEWeightService::GPU-rebalance] Expert " << e << " "
+                                  << grp.label << " has no payload from provider and no raw fallback on "
+                                  << ctx.device_id.to_string() << " (layer " << ctx.layer_idx << ")");
+                        return false;
+                    }
+#if LLAMINAR_ASSERTIONS_ACTIVE
+                    LOG_WARN("[MoEWeightService::GPU-rebalance] Expert " << e << " "
+                              << grp.label << " using raw GGUF fallback despite payload provider being set"
+                              << " (layer " << ctx.layer_idx << ", " << ctx.device_id.to_string()
+                              << "). This indicates the expert was not pre-materialized.");
+#endif
+                }
+            }
             else
             {
                 job.host_raw_data = view->raw_data();
@@ -945,6 +1011,12 @@ bool MoEExpertWeightService::registerAndPrepareNewExpertsGPU(
                               << " (layer " << ctx.layer_idx << ")");
                     return false;
                 }
+#if LLAMINAR_ASSERTIONS_ACTIVE
+                LOG_WARN("[MoEWeightService::GPU-rebalance] Expert " << e << " "
+                          << grp.label << " using raw GGUF fallback without payload provider"
+                          << " (layer " << ctx.layer_idx << ", " << ctx.device_id.to_string()
+                          << "). Set payload provider to enable host data release.");
+#endif
             }
 
             orchestrator->addWeightJob(gpu_ordinal, job);
@@ -1025,6 +1097,13 @@ bool MoEExpertWeightService::registerAndPrepareNewExpertsGPU(
 
     // Phase 6: Release staging resources; VRAM pool stays alive via kernel lifetime_owner_
     orchestrator->finalize();
+
+    // Phase 7: Mark experts as prepared in the payload provider
+    if (ctx.payload_provider)
+    {
+        for (int e : experts_to_load)
+            ctx.payload_provider->markExpertPrepared(ctx.layer_idx, e);
+    }
 
     const auto elapsed_ms = std::chrono::duration<double, std::milli>(Clock::now() - t_start).count();
     LOG_INFO("[MoEWeightService::GPU-rebalance] " << (count * 3) << " expert GEMM engines "
@@ -1277,6 +1356,13 @@ bool MoEExpertWeightService::prepareGemmEnginesGPU(MoEWeightContext& ctx)
     // Phase 6: Release orchestrator staging resources (pinned ring).
     // The VRAM pool stays alive via the shared_ptr in each kernel's lifetime_owner_.
     orchestrator->finalize();
+
+    // Phase 7: Mark experts as prepared in the payload provider
+    if (ctx.payload_provider)
+    {
+        for (int e : local_experts)
+            ctx.payload_provider->markExpertPrepared(ctx.layer_idx, e);
+    }
 
     const auto elapsed_ms = std::chrono::duration<double, std::milli>(Clock::now() - t_start).count();
     LOG_INFO("[MoEWeightService::GPU] " << (local_count * 3) << "/" << (num_experts * 3)

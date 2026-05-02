@@ -65,29 +65,6 @@ option(HAVE_CUDA "Enable CUDA backend" ON)
 option(HAVE_ROCM "Enable ROCm backend" ON)
 option(HAVE_VULKAN "Enable Vulkan backend" OFF)
 
-set(_LLAMINAR_SHARED_CORE_DEFAULT OFF)
-if(CMAKE_BUILD_TYPE MATCHES "Integration")
-    set(_LLAMINAR_SHARED_CORE_DEFAULT ON)
-endif()
-option(LLAMINAR_SHARED_CORE "Build llaminar2_core as a shared library for faster test executable links" ${_LLAMINAR_SHARED_CORE_DEFAULT})
-if(LLAMINAR_SHARED_CORE)
-    set(CMAKE_POSITION_INDEPENDENT_CODE ON)
-    set(CMAKE_BUILD_RPATH_USE_ORIGIN ON)
-    message(STATUS "V2: Building llaminar2_core as SHARED (faster downstream test links)")
-endif()
-
-# HIP executable links are very I/O heavy in the Integration build: hundreds of
-# test binaries link against the HIP-enabled core/backend libraries. Let Ninja
-# keep compilation fully parallel, but cap concurrent link jobs so ld.lld does
-# not flood storage and spend the build in iowait. Defaults to the same depth as
-# the CUDA nvlink pool, which has worked well for this project.
-set(LLAMINAR_HIP_LINK_JOBS "8" CACHE STRING "Max concurrent Ninja link jobs when ROCm/HIP is enabled")
-if(HAVE_ROCM AND CMAKE_GENERATOR MATCHES "Ninja")
-    set_property(GLOBAL APPEND PROPERTY JOB_POOLS hip_link_pool=${LLAMINAR_HIP_LINK_JOBS})
-    set(CMAKE_JOB_POOL_LINK hip_link_pool)
-    message(STATUS "V2: ROCm/HIP link job pool enabled: hip_link_pool=${LLAMINAR_HIP_LINK_JOBS}")
-endif()
-
 # ML Heuristic auto-retraining option
 # When enabled, automatically checks CSV hash and retrains ML model on every build
 # Only retrains if benchmark data actually changed (hash-based, fast check)
@@ -1138,13 +1115,7 @@ endif()
 # Typed Register Enforcement (JIT Code Quality)
 # =============================================================================
 # V2 Core Library
-set(LLAMINAR2_CORE_LIBRARY_TYPE STATIC)
-set(LLAMINAR2_CORE_IMPL_LINK_SCOPE PUBLIC)
-if(LLAMINAR_SHARED_CORE)
-    set(LLAMINAR2_CORE_LIBRARY_TYPE SHARED)
-    set(LLAMINAR2_CORE_IMPL_LINK_SCOPE PRIVATE)
-endif()
-add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
+add_library(llaminar2_core STATIC
     # Interfaces
     interfaces/IMPIContext.cpp
     backends/ComputeBackend.cpp
@@ -1197,6 +1168,7 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     execution/moe/SocketAwareRebalancer.cpp
     execution/moe/MoERebalanceController.cpp
     execution/moe/MoEExpertWeightService.cpp
+    execution/moe/ExpertWeightPayloadProvider.cpp
     execution/moe/GPUExpertTransfer.cpp
     execution/moe/MoEPipeline.cpp
     execution/cache/HybridCacheManager.cpp
@@ -1308,10 +1280,10 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     loaders/ModelLoader.cpp
     loaders/ModelContext.cpp
     loaders/ModelContextConfig.cpp
+    loaders/WeightManager.cpp
     loaders/PreparedWeightStore.cpp
     loaders/WeightIdentity.cpp
     loaders/WeightLifecycleTrace.cpp
-    loaders/WeightManager.cpp
     loaders/WeightMetadataRegistry.cpp
     loaders/WeightPlan.cpp
     loaders/WeightSlicer.cpp
@@ -1417,9 +1389,9 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     utils/MPIStager.cpp
     utils/Tokenizer.cpp
     utils/Sampler.cpp
+    utils/ToolCallParser.cpp
     utils/ChatTemplate.cpp
     utils/ChatUI.cpp
-    utils/ToolCallParser.cpp
     utils/BenchmarkRunner.cpp
     # Collective communication infrastructure
     collective/DeviceGroup.cpp
@@ -1614,7 +1586,7 @@ find_library(NUMA_LIBRARY NAMES numa)
 if(NUMA_LIBRARY)
     message(STATUS "Found libnuma: ${NUMA_LIBRARY}")
     target_compile_definitions(llaminar2_core PUBLIC HAVE_NUMA)
-    target_link_libraries(llaminar2_core ${LLAMINAR2_CORE_IMPL_LINK_SCOPE} ${NUMA_LIBRARY})
+    target_link_libraries(llaminar2_core PUBLIC ${NUMA_LIBRARY})
 else()
     message(STATUS "libnuma not found - NUMA-aware allocation disabled")
 endif()
@@ -1622,13 +1594,10 @@ endif()
 target_link_libraries(llaminar2_core PUBLIC
     MPI::MPI_CXX
     OpenMP::OpenMP_CXX
-    fort
-)
-
-target_link_libraries(llaminar2_core ${LLAMINAR2_CORE_IMPL_LINK_SCOPE}
     ftxui::screen
     ftxui::dom
     ftxui::component
+    fort
 )
 
 # OneDNN for INT8 GEMM acceleration
@@ -1644,7 +1613,7 @@ endif()
 # Link GPU Backend Libraries (Phase 3)
 # =============================================================================
 if(HAVE_CUDA)
-    target_link_libraries(llaminar2_core ${LLAMINAR2_CORE_IMPL_LINK_SCOPE} cuda_backend)
+    target_link_libraries(llaminar2_core PUBLIC cuda_backend)
     
     # Add CUDA kernel C++ adapter files (compiled with C++ compiler, NOT nvcc)
     # These implement ITensorGemm interface and can include MPI headers
@@ -1662,7 +1631,7 @@ if(HAVE_CUDA)
 endif()
 
 if(HAVE_ROCM)
-    target_link_libraries(llaminar2_core ${LLAMINAR2_CORE_IMPL_LINK_SCOPE} rocm_backend)
+    target_link_libraries(llaminar2_core PUBLIC rocm_backend)
     
     # Add ROCm kernel C++ adapter files (compiled with C++ compiler, NOT hipcc)
     # These implement ITensorGemm interface and can include MPI headers
@@ -1674,6 +1643,7 @@ if(HAVE_ROCM)
         kernels/rocm/attention/ROCmFlashAttentionKernelT.cpp  # Flash Attention ITensor implementation
         kernels/rocm/kvcache/ROCmRingKVCache.cpp              # Ring buffer KV cache implementation
         kernels/rocm/kvcache/ROCmRingKVCacheBase.cpp          # Shared base class for ring buffer KV caches
+        kernels/rocm/kvcache/ROCmRingKVCacheFactory.cpp       # Factory for creating ROCm KV cache instances
         kernels/rocm/kvcache/ROCmHybridRingKVCacheFactory.cpp # Factory for creating ROCm Hybrid KV cache instances
         kernels/rocm/ops/ROCmSwiGLUKernelT.cpp                # SwiGLU ITensor implementation
         kernels/rocm/ops/ROCmRoPEKernelT.cpp                  # RoPE ITensor implementation
@@ -1686,13 +1656,13 @@ if(HAVE_ROCM)
 endif()
 
 # Link device benchmarks library
-target_link_libraries(llaminar2_core ${LLAMINAR2_CORE_IMPL_LINK_SCOPE} device_benchmarks)
+target_link_libraries(llaminar2_core PUBLIC device_benchmarks)
 message(STATUS "V2: Linked device benchmarks library")
 
 if(HAVE_CUDA)
     target_compile_definitions(llaminar2_core PUBLIC HAVE_CUDA)
     target_include_directories(llaminar2_core PUBLIC ${CUDAToolkit_INCLUDE_DIRS})
-    target_link_libraries(llaminar2_core PUBLIC
+    target_link_libraries(llaminar2_core PUBLIC 
         CUDA::cudart 
         CUDA::cublas
         CUDA::cublasLt  # For fused GEMM+bias operations
@@ -1716,22 +1686,11 @@ endif()
 # =============================================================================
 if(HAVE_ROCM)
     target_compile_definitions(llaminar2_core PUBLIC HAVE_ROCM)
-    # Keep the implementation-heavy rocm_backend archive private when building
-    # shared llaminar2_core, but expose HIP/hipBLAS usage requirements for tests
-    # that include hip_runtime.h or call HIP APIs directly.
-    target_include_directories(llaminar2_core PUBLIC
-        ${ROCM_PATH}/include
-        ${ROCM_PATH}/hip/include
-        ${ROCM_PATH}/hipblas/include
-        ${ROCM_PATH}/hipblaslt/include
-    )
-    target_link_libraries(llaminar2_core PUBLIC
-        hip::host
-        roc::hipblas
-        ${ROCM_PATH}/lib/libhipblaslt.so
-        ${CMAKE_DL_LIBS}
-    )
-    message(STATUS "V2: ROCm HIP usage requirements exposed; rocm_backend remains an implementation dependency")
+    # NOTE: HIP runtime, hipBLAS, hipBLASLt, and ROCm include directories are
+    # linked to rocm_backend (not llaminar2_core) to consolidate all HIP
+    # dependencies in one place. They flow transitively via the PUBLIC link
+    # from rocm_backend → llaminar2_core → executables.
+    message(STATUS "V2: ROCm libraries available via rocm_backend (hip::host, hipBLAS, hipBLASLt)")
     
     # NOTE: RCCL is linked to rocm_backend (not llaminar2_core) to isolate symbols
     # from NCCL. Both libraries export the same symbols (ncclCommInitRank, etc.)
@@ -1747,7 +1706,7 @@ endif()
 if(HAVE_VULKAN)
     target_compile_definitions(llaminar2_core PUBLIC HAVE_VULKAN)
     find_package(Vulkan REQUIRED)
-    target_link_libraries(llaminar2_core ${LLAMINAR2_CORE_IMPL_LINK_SCOPE} Vulkan::Vulkan)
+    target_link_libraries(llaminar2_core PUBLIC Vulkan::Vulkan)
 endif()
 
 # =============================================================================
@@ -1755,7 +1714,7 @@ endif()
 # =============================================================================
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     # libmvec is part of glibc, link with -lmvec
-    target_link_libraries(llaminar2_core ${LLAMINAR2_CORE_IMPL_LINK_SCOPE} mvec)
+    target_link_libraries(llaminar2_core PUBLIC mvec)
     message(STATUS "V2: Linked libmvec for vectorized math (exp, log, sin, cos)")
 endif()
 

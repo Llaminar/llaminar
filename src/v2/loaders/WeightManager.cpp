@@ -6,6 +6,7 @@
 
 #include "WeightManager.h"
 #include "MmapRegion.h"
+#include "../execution/moe/ExpertWeightPayloadProvider.h"
 #include "../utils/Logger.h"
 #include "../utils/WeightLoadingProfiler.h"
 #include "../utils/DebugEnv.h"
@@ -567,6 +568,77 @@ namespace llaminar2
                    !env.moe_rebalance.release_raw_weights &&
                    key.find("_exps.weight") != std::string::npos;
         }
+    }
+
+    bool WeightManager::hostDataRequired(const TensorBase *tensor, const std::string &key) const
+    {
+        // If an expert payload provider is set, use it for metadata-based retention
+        // instead of the string-matching shouldRetainRawForLazyMoE() heuristic.
+        if (expert_payload_provider_)
+        {
+            // Check if this is an expert weight tensor
+            WeightRole role = inferWeightRole(key);
+            if (role == WeightRole::MoEExpertGate ||
+                role == WeightRole::MoEExpertUp ||
+                role == WeightRole::MoEExpertDown)
+            {
+                int layer = inferWeightLayer(key);
+                if (layer >= 0)
+                {
+                    // Check metadata registry for explicit host policy
+                    if (weight_metadata_ && weight_metadata_->has(tensor))
+                    {
+                        auto res = weight_metadata_->residency(tensor);
+                        if (res)
+                        {
+                            switch (res->host_policy)
+                            {
+                            case WeightHostPolicy::RequiredForCPUExecution:
+                                return true;
+                            case WeightHostPolicy::Released:
+                            case WeightHostPolicy::ReleasableAfterPreparation:
+                                return false;
+                            case WeightHostPolicy::RequiredUntilPreparedOrTransferred:
+                            {
+                                // Check if ALL experts for this layer are prepared or transferred
+                                // We infer num_experts from the 3D tensor shape
+                                int expert = inferWeightExpert(key);
+                                if (expert >= 0)
+                                    return expert_payload_provider_->isRawDataRequired(layer, expert);
+                                // For 3D packed tensors (gate_exps, up_exps, down_exps),
+                                // check if any expert in the layer still needs raw data
+                                return !expert_payload_provider_->allExpertsPreparedOrTransferred(
+                                    layer, tensor->shape().size() >= 3 ? static_cast<int>(tensor->shape()[2]) : 64);
+                            }
+                            case WeightHostPolicy::RequiredUntilGraphMaterialized:
+                                // Fall through to provider check
+                                break;
+                            }
+                        }
+                    }
+
+                    // No explicit host policy in metadata — check the payload provider.
+                    // If all experts for this weight's layer are prepared or transferred,
+                    // the raw host data is no longer needed.
+                    int expert = inferWeightExpert(key);
+                    if (expert >= 0)
+                        return expert_payload_provider_->isRawDataRequired(layer, expert);
+
+                    // For 3D packed tensors, we can't determine expert count easily.
+                    // Conservative: retain if we don't know.
+                    return true;
+                }
+            }
+            // Non-MoE-expert weights: not handled by payload provider
+            return false;
+        }
+
+        // Legacy fallback: string-matching heuristic
+        return shouldRetainRawForLazyMoE(key);
+    }
+
+    namespace
+    {
 
         /**
          * @brief Create a typed tensor from raw bytes (generic for all tensor types)
@@ -1378,6 +1450,16 @@ namespace llaminar2
 
         LOG_ERROR("[WeightManager] INTERLEAVED strategy not yet implemented, falling back to REPLICATED");
         return getReplicatedWeight(name, device);
+    }
+
+    void WeightManager::forEachWeight(std::function<void(const std::string &, TensorBase *)> visitor) const
+    {
+        std::lock_guard<std::mutex> lock(cache_mutex_);
+        for (const auto &[name, tensor] : cache_)
+        {
+            if (tensor)
+                visitor(name, tensor.get());
+        }
     }
 
     FrozenModelWeightSet WeightManager::materialize(const WeightPlan &plan)
@@ -3633,7 +3715,7 @@ namespace llaminar2
                 return;
             }
 
-            if (shouldRetainRawForLazyMoE(key))
+            if (shouldRetainRawForLazyMoE(key) || hostDataRequired(ptr, key))
             {
                 skipped_count++;
                 retained_bytes += tensor_bytes;
@@ -3735,7 +3817,7 @@ namespace llaminar2
                 return;
             if (!ptr->isHostResident())
                 return;
-            if (shouldRetainRawForLazyMoE(key))
+            if (shouldRetainRawForLazyMoE(key) || hostDataRequired(ptr, key))
             {
                 LOG_DEBUG("[WeightManager] RETAINED host-resident lazy-MoE raw expert data for " << key);
                 return;

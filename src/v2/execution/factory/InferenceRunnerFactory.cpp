@@ -1159,6 +1159,10 @@ namespace llaminar2
 
         orchestrator->setWeights(weights);
         LOG_DEBUG("[InferenceRunner] Weights configured on orchestrator");
+
+        // Phase 4-5: Populate prepared weight store from KernelFactory entries
+        orchestrator->initializePreparedWeightStore(device);
+
         return true;
     }
 

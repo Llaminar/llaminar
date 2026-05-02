@@ -70,11 +70,9 @@ if [ ${#SUITES[@]} -eq 0 ]; then
     # Suite 2: Qwen3.5 4B (hybrid GDN/FA architecture — CPU only for speed)
     # Uses max_tokens=200 because Qwen3.5 is a thinking model that emits
     # <think>...</think> tags before the actual answer.
-    # xfail_inference=1: GDN architecture is WIP — inference produces degenerate output.
-    # Server/health/error tests still validate normally.
     S2_MODEL="${REPO_ROOT}/models/Qwen3.5-4B-Q8_0.gguf"
     if [ -f "$S2_MODEL" ] && [ -z "$OVERRIDE_MODEL" ]; then
-        SUITES+=("${S2_MODEL}|cpu|200|xfail_inference")
+        SUITES+=("${S2_MODEL}|cpu|200")
     fi
 
     # Suite 3: Qwen3.5 35B MoE (MoE + GDN/FA architecture — CPU only)
@@ -103,7 +101,6 @@ NC='\033[0m'
 TOTAL_TESTS=0
 PASSED_TESTS=0
 FAILED_TESTS=0
-XFAIL_TESTS=0
 FAILED_DETAILS=""
 
 pass() {
@@ -117,13 +114,6 @@ fail() {
     FAILED_TESTS=$((FAILED_TESTS + 1))
     FAILED_DETAILS="${FAILED_DETAILS}\n  - $1"
     echo -e "  ${RED}✗${NC} $1"
-}
-
-# Expected failure — counts as a pass (known issue, not a regression)
-xfail() {
-    TOTAL_TESTS=$((TOTAL_TESTS + 1))
-    XFAIL_TESTS=$((XFAIL_TESTS + 1))
-    echo -e "  ${YELLOW}⊘${NC} [XFAIL] $1"
 }
 
 cleanup_server() {
@@ -168,14 +158,13 @@ fi
 
 # ─── Test Runner Function ─────────────────────────────────────────────────────
 # Runs the full test suite against a single model+backend combination.
-# Arguments: $1=model_path $2=backend $3=port $4=model_label $5=max_tokens $6=xfail_inference
+# Arguments: $1=model_path $2=backend $3=port $4=model_label $5=max_tokens
 run_backend_tests() {
     local model="$1"
     local backend="$2"
     local port="$3"
     local label="$4"
     local max_tokens="${5:-10}"
-    local xfail_inference="${6:-0}"
     local tag="${label}/${backend}"
 
     echo -e "${YELLOW}─── ${tag} (port ${port}) ───${NC}"
@@ -228,8 +217,6 @@ run_backend_tests() {
 
     if echo "$content" | grep -q "4"; then
         pass "[${tag}] Single-turn: got '${content}' (contains 4)"
-    elif [ "$xfail_inference" = "1" ]; then
-        xfail "[${tag}] Single-turn: expected 4, got '${content}' (GDN WIP)"
     else
         fail "[${tag}] Single-turn: expected 4, got '${content}'"
     fi
@@ -254,8 +241,6 @@ run_backend_tests() {
 
     if echo "$content" | grep -q "42"; then
         pass "[${tag}] Multi-turn: got '${content}' (contains 42)"
-    elif [ "$xfail_inference" = "1" ]; then
-        xfail "[${tag}] Multi-turn: expected 42, got '${content}' (GDN WIP)"
     else
         fail "[${tag}] Multi-turn: expected 42, got '${content}'"
     fi
@@ -277,8 +262,6 @@ run_backend_tests() {
 
     if echo "$content" | grep -q "8"; then
         pass "[${tag}] Cache-clear: got '${content}' (contains 8)"
-    elif [ "$xfail_inference" = "1" ]; then
-        xfail "[${tag}] Cache-clear: expected 8, got '${content}' (GDN WIP)"
     else
         fail "[${tag}] Cache-clear: expected 8, got '${content}'"
     fi
@@ -298,8 +281,6 @@ print('ok')
 
     if [ "$has_usage" = "ok" ]; then
         pass "[${tag}] Response format: valid usage + finish_reason"
-    elif [ "$xfail_inference" = "1" ]; then
-        xfail "[${tag}] Response format: missing/invalid usage or finish_reason (GDN WIP)"
     else
         fail "[${tag}] Response format: missing/invalid usage or finish_reason"
     fi
@@ -353,8 +334,6 @@ print('FAIL: no finish_reason chunk found')
 
     if [ "$stream_ok" = "ok" ]; then
         pass "[${tag}] SSE streaming: valid chunks with role, content, finish, [DONE]"
-    elif [ "$xfail_inference" = "1" ]; then
-        xfail "[${tag}] SSE streaming: ${stream_ok} (GDN WIP)"
     else
         fail "[${tag}] SSE streaming: ${stream_ok}"
     fi
@@ -383,8 +362,6 @@ print('ok')
 
     if [ "$stream_meta_ok" = "ok" ]; then
         pass "[${tag}] SSE streaming: metadata (id, system_fingerprint) consistent"
-    elif [ "$xfail_inference" = "1" ]; then
-        xfail "[${tag}] SSE streaming metadata: ${stream_meta_ok} (GDN WIP)"
     else
         fail "[${tag}] SSE streaming metadata: ${stream_meta_ok}"
     fi
@@ -404,8 +381,6 @@ print(d.get('error', {}).get('type', ''))
 
     if [ "$error_msg" = "invalid_request_error" ]; then
         pass "[${tag}] Error handling: invalid JSON returns 400"
-    elif [ "$xfail_inference" = "1" ]; then
-        xfail "[${tag}] Error handling: expected invalid_request_error, got '${error_msg}' (GDN WIP)"
     else
         fail "[${tag}] Error handling: expected invalid_request_error, got '${error_msg}'"
     fi
@@ -424,8 +399,6 @@ print(d.get('error', {}).get('type', ''))
 
     if [ "$error_msg" = "invalid_request_error" ]; then
         pass "[${tag}] Error handling: missing messages returns 400"
-    elif [ "$xfail_inference" = "1" ]; then
-        xfail "[${tag}] Error handling: expected invalid_request_error, got '${error_msg}' (GDN WIP)"
     else
         fail "[${tag}] Error handling: expected invalid_request_error, got '${error_msg}'"
     fi
@@ -443,26 +416,18 @@ echo ""
 echo -e "  Binary: ${BINARY}"
 echo -e "  Suites: ${#SUITES[@]}"
 for suite in "${SUITES[@]}"; do
-    IFS='|' read -r local_model local_backends _ local_flags <<< "$suite"
-    suffix=""
-    if [[ "$local_flags" == *"xfail_inference"* ]]; then suffix=" (xfail: GDN WIP)"; fi
-    echo -e "    $(basename "$local_model")  →  ${local_backends}${suffix}"
+    IFS='|' read -r local_model local_backends _ <<< "$suite"
+    echo -e "    $(basename "$local_model")  →  ${local_backends}"
 done
 echo ""
 
 PORT=$BASE_PORT
 
 for suite in "${SUITES[@]}"; do
-    # Parse suite: "model_path|backends[|max_tokens[|flags]]"
-    IFS='|' read -r SUITE_MODEL SUITE_BACKENDS SUITE_MAX_TOKENS SUITE_FLAGS <<< "$suite"
+    # Parse suite: "model_path|backends[|max_tokens]"
+    IFS='|' read -r SUITE_MODEL SUITE_BACKENDS SUITE_MAX_TOKENS <<< "$suite"
     SUITE_MAX_TOKENS="${SUITE_MAX_TOKENS:-10}"  # Default: 10 tokens
     SUITE_LABEL="$(basename "$SUITE_MODEL" .gguf)"
-
-    # Check for xfail_inference flag
-    SUITE_XFAIL=0
-    if [[ "$SUITE_FLAGS" == *"xfail_inference"* ]]; then
-        SUITE_XFAIL=1
-    fi
 
     # Validate model exists
     if [ ! -f "$SUITE_MODEL" ]; then
@@ -478,18 +443,14 @@ for suite in "${SUITES[@]}"; do
     for BACKEND in "${BACKEND_LIST[@]}"; do
         BACKEND=$(echo "$BACKEND" | xargs)  # trim whitespace
         PORT=$((PORT + 1))
-        run_backend_tests "$SUITE_MODEL" "$BACKEND" "$PORT" "$SUITE_LABEL" "$SUITE_MAX_TOKENS" "$SUITE_XFAIL"
+        run_backend_tests "$SUITE_MODEL" "$BACKEND" "$PORT" "$SUITE_LABEL" "$SUITE_MAX_TOKENS"
     done
 done
 
 # ─── Summary ──────────────────────────────────────────────────────────────────
 echo -e "${BLUE}════════════════════════════════════════════════════════════${NC}"
 if [ $FAILED_TESTS -eq 0 ]; then
-    if [ $XFAIL_TESTS -gt 0 ]; then
-        echo -e "${GREEN}  ✅ ALL PASSED: ${PASSED_TESTS}/${TOTAL_TESTS} tests passed (${XFAIL_TESTS} expected failures)${NC}"
-    else
-        echo -e "${GREEN}  ✅ ALL PASSED: ${PASSED_TESTS}/${TOTAL_TESTS} tests passed${NC}"
-    fi
+    echo -e "${GREEN}  ✅ ALL PASSED: ${PASSED_TESTS}/${TOTAL_TESTS} tests passed${NC}"
     echo -e "${BLUE}════════════════════════════════════════════════════════════${NC}"
     exit 0
 else

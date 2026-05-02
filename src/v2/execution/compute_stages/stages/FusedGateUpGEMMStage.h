@@ -9,14 +9,16 @@
 #include "../IWorkspaceConsumerStage.h"
 #include "../StageParamsBase.h"
 #include "../../../memory/BufferId.h"
+#include "../../../loaders/WeightPlan.h"
 
 #include <optional>
 
 namespace llaminar2
 {
 
-    // Forward declaration
+    // Forward declarations
     class ITensorFusedGateUpGemm;
+    class PreparedWeightStore;
 
     /**
      * @brief Fused Gate/Up projection stage for FFN
@@ -63,6 +65,13 @@ namespace llaminar2
             std::optional<BufferId> input_buffer_id;
             std::optional<BufferId> output_gate_buffer_id;
             std::optional<BufferId> output_up_buffer_id;
+
+            // =================================================================
+            // Phase 7: PreparedWeightRef for direct kernel resolution
+            // =================================================================
+            std::optional<PreparedWeightRef> prepared_ref_gate;
+            std::optional<PreparedWeightRef> prepared_ref_up;
+            PreparedWeightStore *prepared_store = nullptr;
         };
 
         explicit FusedGateUpGEMMStage(Params params);

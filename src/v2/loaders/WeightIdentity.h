@@ -61,6 +61,7 @@ namespace llaminar2
     {
         RequiredForCPUExecution,
         RequiredUntilGraphMaterialized,
+        RequiredUntilPreparedOrTransferred,
         ReleasableAfterPreparation,
         Released,
     };

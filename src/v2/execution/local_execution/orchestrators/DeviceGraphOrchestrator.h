@@ -72,6 +72,9 @@ namespace llaminar2
     class TensorParallelConfig;
     class TurboQuantContext;
     class MoERebalanceController;
+    class ExpertWeightPayloadProvider;
+    class PreparedWeightStore;
+    class FrozenModelWeightSet;
     struct ExpertReplicaSet;
     class ActivationRotation;
 
@@ -718,6 +721,29 @@ namespace llaminar2
 
         /// Set MoE rebalance controller (ownership transfer)
         void setMoERebalanceController(std::unique_ptr<MoERebalanceController> controller);
+
+        /// Initialize expert weight payload provider for metadata-based host retention.
+        /// Creates the provider, wires it to all cached MoE stages and the WeightManager.
+        /// Call after graph cache is populated and MoE stages are cached.
+        void initializeExpertPayloadProvider();
+
+        // =========================================================================
+        // Prepared Weight Store (Phase 4-5)
+        // =========================================================================
+
+        /// Initialize the model-context-owned prepared weight store.
+        /// Creates the store and populates it from already-prepared GEMM weights.
+        /// Call after weight finalization (finalizeForDevice) completes.
+        void initializePreparedWeightStore(DeviceId device);
+
+        /// Get prepared weight store (may be null if no GEMM weights prepared)
+        PreparedWeightStore* preparedWeightStore() const { return prepared_weight_store_.get(); }
+
+        /// Get frozen model weight set (may be null before setWeights is called)
+        const FrozenModelWeightSet* frozenWeightSet() const { return frozen_weight_set_.get(); }
+
+        /// Get expert weight payload provider (may be null for non-MoE models)
+        ExpertWeightPayloadProvider* expertPayloadProvider() const { return expert_payload_provider_.get(); }
 
         /// Get MoE rebalance controller (for post-decode logging)
         MoERebalanceController* moeRebalanceController() const { return moe_rebalance_controller_.get(); }
@@ -2114,6 +2140,21 @@ namespace llaminar2
 
         /// Optional MoE expert rebalance controller (owned)
         std::unique_ptr<MoERebalanceController> moe_rebalance_controller_;
+
+        /// Optional expert weight payload provider for metadata-based host retention (owned)
+        std::unique_ptr<ExpertWeightPayloadProvider> expert_payload_provider_;
+
+        /// Model-context-owned prepared weight store (Phase 4-5)
+        std::unique_ptr<PreparedWeightStore> prepared_weight_store_;
+
+        /// Frozen model weight set for audit/validation (Phase 6)
+        std::unique_ptr<FrozenModelWeightSet> frozen_weight_set_;
+
+        /// Build FrozenModelWeightSet from pre-resolved layer weights (Phase 6)
+        void buildFrozenWeightSet(
+            const ModelWeights &weights,
+            const std::unordered_map<int, LayerWeights> &resolved_layers,
+            int first_layer, int last_layer);
 
         /// Reset input-dependent dynamic state on all cached kernels
         /// Implemented in .cpp to avoid including KernelFactory.h in the header
