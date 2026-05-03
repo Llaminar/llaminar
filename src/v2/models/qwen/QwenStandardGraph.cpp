@@ -146,6 +146,7 @@ namespace llaminar2
                               .output_q_buffer_id = BufferId::Q_PROJ,
                               .output_k_buffer_id = BufferId::K_PROJ,
                               .output_v_buffer_id = BufferId::V_PROJ,
+                              .prepared_store = prepared_weight_store_,
                           }),
                           device);
             graph.addDependency(prefix + "qkv_proj", prefix + "attn_norm");

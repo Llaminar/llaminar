@@ -443,6 +443,7 @@ namespace llaminar2
         lm_params.vocab_size = lm_head_vocab_size;
         lm_params.bias_tensor = nullptr; // Qwen2 has no LM head bias
         lm_params.device_id = config_.default_device;
+        lm_params.prepared_store = prepared_weight_store_;
         lm_params.input_buffer_id = BufferId::NORMALIZED;
         lm_params.output_buffer_id = use_column_parallel ? BufferId::LOGITS_LOCAL : BufferId::LOGITS;
 
@@ -765,6 +766,7 @@ namespace llaminar2
             lm_params.vocab_size = lm_head_vocab_size;
             lm_params.bias_tensor = nullptr;
             lm_params.device_id = config_.default_device;
+            lm_params.prepared_store = prepared_weight_store_;
             lm_params.input_buffer_id = BufferId::NORMALIZED;
             lm_params.output_buffer_id = use_column_parallel ? BufferId::LOGITS_LOCAL : BufferId::LOGITS;
 
@@ -1103,6 +1105,7 @@ namespace llaminar2
                 lm_params.vocab_size = lm_head_vocab_size;
                 lm_params.bias_tensor = nullptr;
                 lm_params.device_id = stage_device;
+                lm_params.prepared_store = prepared_weight_store_;
 
                 graph.addNode("lm_head",
                               ComputeStageFactory::createLMHead(lm_params),
@@ -1336,6 +1339,7 @@ namespace llaminar2
         lm_params.vocab_size = lm_head_vocab_size;
         lm_params.bias_tensor = nullptr;
         lm_params.device_id = device;
+        lm_params.prepared_store = prepared_weight_store_;
 
         graph.addNode("lm_head",
                       ComputeStageFactory::createLMHead(lm_params),
@@ -1434,6 +1438,7 @@ namespace llaminar2
             gate_up_params.n_up = up_n;
             gate_up_params.mpi_ctx = mpi_ctx_.get();
             gate_up_params.device_id = device;
+            gate_up_params.prepared_store = prepared_weight_store_;
             gate_up_params.input_buffer_id = BufferId::NORMALIZED;
             gate_up_params.output_gate_buffer_id = BufferId::GATE_PROJ;
             gate_up_params.output_up_buffer_id = BufferId::UP_PROJ;
@@ -1471,7 +1476,8 @@ namespace llaminar2
                 .transpose_B = false,
                 .gemm_context = GemmContext::FFN,
                 .a_buffer_id = BufferId::UP_PROJ,
-                .c_buffer_id = BufferId::ATTN_PROJ};
+                .c_buffer_id = BufferId::ATTN_PROJ,
+                .prepared_store = prepared_weight_store_};
 
             // SwiGLU fusion: pass gate buffer to GEMM for fused silu(gate)*up + GEMM
             if (swiglu_fusion)
@@ -2184,6 +2190,7 @@ namespace llaminar2
                           .gemm_context = GemmContext::ATTN,
                           .a_buffer_id = BufferId::ATTN_OUTPUT,
                           .c_buffer_id = BufferId::ATTN_PROJ,
+                          .prepared_store = prepared_weight_store_,
                       }),
                       device);
         graph.addDependency(wo_node, dependency);

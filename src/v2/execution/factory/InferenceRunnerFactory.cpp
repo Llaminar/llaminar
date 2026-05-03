@@ -1163,6 +1163,9 @@ namespace llaminar2
         // Phase 4-5: Populate prepared weight store from KernelFactory entries
         orchestrator->initializePreparedWeightStore(device);
 
+        // Phase 9: Mark graph materialization complete — all weight bindings resolved
+        weight_mgr->markGraphMaterializationComplete();
+
         return true;
     }
 

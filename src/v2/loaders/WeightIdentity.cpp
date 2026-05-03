@@ -65,6 +65,21 @@ namespace llaminar2
         return "RequiredUntilGraphMaterialized";
     }
 
+    const char *toString(WeightLifecycleState state)
+    {
+        switch (state)
+        {
+        case WeightLifecycleState::Planned: return "Planned";
+        case WeightLifecycleState::SourceLoaded: return "SourceLoaded";
+        case WeightLifecycleState::DerivedMaterialized: return "DerivedMaterialized";
+        case WeightLifecycleState::DevicePrepared: return "DevicePrepared";
+        case WeightLifecycleState::GraphMaterialized: return "GraphMaterialized";
+        case WeightLifecycleState::Frozen: return "Frozen";
+        case WeightLifecycleState::HostReleased: return "HostReleased";
+        }
+        return "Unknown";
+    }
+
     WeightRole inferWeightRole(const std::string &name)
     {
         if (name == "token_embd.weight") return WeightRole::Embedding;

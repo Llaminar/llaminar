@@ -179,7 +179,11 @@ namespace llaminar2
             params_.moe_packed_gate_lifetime,
             params_.moe_packed_up_lifetime,
             params_.moe_packed_down_lifetime,
-            payload_provider_
+            payload_provider_,
+            params_.prepared_store,
+            params_.gate_slab_ref,
+            params_.up_slab_ref,
+            params_.down_slab_ref
         };
     }
 
@@ -784,6 +788,33 @@ namespace llaminar2
             return;
         }
 
+        // Phase C: Resolve from PreparedWeightStore if slab refs are cached
+        if (params_.prepared_store && params_.gate_slab_ref.has_value())
+        {
+            cached_gate_gemm_.resize(num_experts, nullptr);
+            cached_up_gemm_.resize(num_experts, nullptr);
+            cached_down_gemm_.resize(num_experts, nullptr);
+
+            const int local_start = params_.local_expert_start;
+            const int local_count = (params_.local_expert_count < 0)
+                                        ? num_experts
+                                        : params_.local_expert_count;
+            const int local_end = local_start + local_count;
+
+            for (int e = local_start; e < local_end; ++e)
+            {
+                if (!params_.expert_mask.empty() && !params_.expert_mask[e])
+                    continue;
+                cached_gate_gemm_[e] = params_.prepared_store->expertGemmKernel(*params_.gate_slab_ref, e);
+                cached_up_gemm_[e] = params_.prepared_store->expertGemmKernel(*params_.up_slab_ref, e);
+                cached_down_gemm_[e] = params_.prepared_store->expertGemmKernel(*params_.down_slab_ref, e);
+            }
+
+            LOG_DEBUG("[MoEExpertComputeStage] Resolved GEMM engines from PreparedWeightStore"
+                      << " (layer " << params_.layer_idx << ")");
+            return;
+        }
+
         // Fallback: resolve on first call (triggers VNNI repacking — slow)
         LOG_WARN("[MoEExpertComputeStage] GEMM engines not pre-resolved; "
                  "call prepareExpertGemmEngines() at graph build time for better perf");
@@ -803,19 +834,19 @@ namespace llaminar2
             if (!params_.expert_gate_views[e])
                 continue;
 
-            // Phase 7: PreparedWeightStore not used here because MoE expert
-            // views are per-expert slices that don't have individual bindings.
-            // The pre-resolved path (prepareExpertGemmEngines) is the intended
-            // Phase 7 path for MoE experts.
-            auto *gp = KernelFactory::getOrCreatePreparedGemmWeights(
+            auto gate_engine = KernelFactory::prepareExpertGemmLocal(
                 params_.expert_gate_views[e].get(), params_.device_id);
-            auto *up = KernelFactory::getOrCreatePreparedGemmWeights(
+            auto up_engine = KernelFactory::prepareExpertGemmLocal(
                 params_.expert_up_views[e].get(), params_.device_id);
-            auto *dp = KernelFactory::getOrCreatePreparedGemmWeights(
+            auto down_engine = KernelFactory::prepareExpertGemmLocal(
                 params_.expert_down_views[e].get(), params_.device_id);
-            cached_gate_gemm_[e] = KernelFactory::getOrCreateGemmEngine(gp);
-            cached_up_gemm_[e] = KernelFactory::getOrCreateGemmEngine(up);
-            cached_down_gemm_[e] = KernelFactory::getOrCreateGemmEngine(dp);
+            cached_gate_gemm_[e] = gate_engine.get();
+            cached_up_gemm_[e] = up_engine.get();
+            cached_down_gemm_[e] = down_engine.get();
+            // Keep engines alive for the lifetime of this stage
+            fallback_owned_kernels_.push_back(std::move(gate_engine));
+            fallback_owned_kernels_.push_back(std::move(up_engine));
+            fallback_owned_kernels_.push_back(std::move(down_engine));
         }
     }
 
@@ -962,9 +993,19 @@ namespace llaminar2
             params.moe_owned_kernels,
             params.moe_packed_gate_lifetime,
             params.moe_packed_up_lifetime,
-            params.moe_packed_down_lifetime
+            params.moe_packed_down_lifetime,
+            nullptr,
+            params.prepared_store,
+            params.gate_slab_ref,
+            params.up_slab_ref,
+            params.down_slab_ref
         };
-        return MoEExpertWeightService::prepareGemmEngines(ctx);
+        bool ok = MoEExpertWeightService::prepareGemmEngines(ctx);
+        // Phase C: Copy slab refs back to params for rebalance reuse
+        params.gate_slab_ref = ctx.gate_slab_ref;
+        params.up_slab_ref = ctx.up_slab_ref;
+        params.down_slab_ref = ctx.down_slab_ref;
+        return ok;
     }
 
     size_t MoEExpertComputeStage::estimatedFlops() const
@@ -1155,6 +1196,21 @@ namespace llaminar2
                 cached_down_gemm_ = params_.prepared_store->gemmKernel(params_.prepared_ref_down.value());
             if (cached_gate_gemm_ && cached_up_gemm_ && cached_down_gemm_)
                 return;
+
+            // Phase 10: Store configured, try tensor-based lookup for any missing
+            if (!cached_gate_gemm_)
+                cached_gate_gemm_ = params_.prepared_store->gemmKernelForTensor(params_.gate_w);
+            if (!cached_up_gemm_)
+                cached_up_gemm_ = params_.prepared_store->gemmKernelForTensor(params_.up_w);
+            if (!cached_down_gemm_)
+                cached_down_gemm_ = params_.prepared_store->gemmKernelForTensor(params_.down_w);
+            if (cached_gate_gemm_ && cached_up_gemm_ && cached_down_gemm_)
+                return;
+
+            LOG_ERROR("[SharedExpertFFNStage] PreparedWeightStore configured but shared expert kernel(s) not found. "
+                      "gate=" << (void *)cached_gate_gemm_ << " up=" << (void *)cached_up_gemm_
+                      << " down=" << (void *)cached_down_gemm_);
+            return;
         }
 
         if (params_.device_id.is_gpu())

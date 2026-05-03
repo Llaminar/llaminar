@@ -35,6 +35,7 @@ namespace llaminar2
     struct PipelineConfig;
     class ILocalPPContext;
     class ILocalTPContext;
+    class PreparedWeightStore;
 
     // =========================================================================
     // Generic Input/Output Structures
@@ -229,6 +230,9 @@ namespace llaminar2
 
         /// Set buffer arena for arena-managed allocation
         virtual void setArena(BufferArena *arena) { (void)arena; }
+
+        /// Set prepared weight store for kernel lifecycle management (Phase 10)
+        virtual void setPreparedWeightStore(PreparedWeightStore *store) { (void)store; }
 
         /// Get current activation buffers
         virtual const ModelBuffers &buffers() const = 0;

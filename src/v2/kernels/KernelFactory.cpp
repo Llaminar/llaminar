@@ -8,6 +8,8 @@
 #include "../backends/BackendManager.h"
 #include "../planning/KVCacheMemoryEstimator.h"
 #include "cpu/native_vnni/CPUNativeVNNIGemmKernel.h"
+#include "cpu/native_vnni/CPUPackedWeights.h"
+#include "PackedWeightsSerialization.h"
 #include "cpu/gemm/FloatingPointGemmKernel.h"
 #include "../tensors/TensorSlice.h"
 #include "cpu/ops/CPURoPEKernelT.h"
@@ -3202,6 +3204,69 @@ namespace llaminar
                 }
             }
 
+            void KernelFactory::clearPreparedStateForTensor(const llaminar2::TensorBase *tensor)
+            {
+                std::lock_guard<std::mutex> lock(cache_mutex_);
+
+                // Remove sliced GEMM kernel entries for this tensor
+                for (auto it = sliced_cache_.begin(); it != sliced_cache_.end();)
+                {
+                    if (it->first.tensor == tensor)
+                    {
+                        it = sliced_cache_.erase(it);
+                    }
+                    else
+                    {
+                        ++it;
+                    }
+                }
+
+                // Remove fused Gate/Up kernels that reference this tensor's prepared handle
+                for (auto it = fused_gate_up_cache_.begin(); it != fused_gate_up_cache_.end();)
+                {
+                    const auto *gate_handle = it->first.w_gate_handle;
+                    const auto *up_handle = it->first.w_up_handle;
+                    const bool references_tensor =
+                        (gate_handle && gate_handle->tensor == tensor) ||
+                        (up_handle && up_handle->tensor == tensor);
+
+                    if (references_tensor)
+                    {
+                        it = fused_gate_up_cache_.erase(it);
+                    }
+                    else
+                    {
+                        ++it;
+                    }
+                }
+
+                // Remove prepared GEMM registry entries for this tensor
+                for (auto it = prepared_gemm_registry_.begin(); it != prepared_gemm_registry_.end();)
+                {
+                    if (it->second && it->second->tensor == tensor)
+                    {
+                        it = prepared_gemm_registry_.erase(it);
+                    }
+                    else
+                    {
+                        ++it;
+                    }
+                }
+
+                // Remove prepared embedding registry entries for this tensor
+                for (auto it = prepared_embedding_registry_.begin(); it != prepared_embedding_registry_.end();)
+                {
+                    if (it->first.tensor == tensor)
+                    {
+                        it = prepared_embedding_registry_.erase(it);
+                    }
+                    else
+                    {
+                        ++it;
+                    }
+                }
+            }
+
             void KernelFactory::clearCache()
             {
                 std::lock_guard<std::mutex> lock(cache_mutex_);
@@ -3637,18 +3702,20 @@ namespace llaminar
                 {
                     tensor->in_prepared_gemm_registry_ = true;
 
-                    // Pre-register a fallback key for post-host-release lookups.
-                    // After releaseAllHostWeightData(), raw_data() returns nullptr
-                    // and the lookup key becomes {nullptr, tensor_ptr, ...}.
-                    // By registering this alias now (while raw_data is valid),
-                    // lazy stage resolution after host release will cache-hit
-                    // instead of missing and triggering a hard failure.
-                    if (key_data)
+                    // Also register under tensor-pointer fallback key so the entry
+                    // remains findable after host data release (raw_data becomes null).
+                    // This is critical for initializePreparedWeightStore() which runs
+                    // after the Phase 2 reclaim system may have released host data.
+                    if (key_data != nullptr)
                     {
                         const PreparedGemmKey fallback_key{
                             nullptr,
                             static_cast<const void *>(tensor),
-                            key.N, key.K, key.device_id, key.prep_kind};
+                            static_cast<size_t>(tensor->shape().size() > 0 ? tensor->shape()[0] : 0),
+                            static_cast<size_t>(tensor->shape().size() > 1 ? tensor->shape()[1] : 0),
+                            target_device,
+                            static_cast<int>(resolved_kind)};
+                        // Non-owning alias — shares the same handle
                         prepared_gemm_registry_.emplace(fallback_key, it->second);
                     }
                 }
@@ -3658,6 +3725,105 @@ namespace llaminar
                                                                       << " kind=" << static_cast<int>(resolved_kind)
                                                                       << " tensor=" << tensor);
                 return it->second.get();
+            }
+
+            std::shared_ptr<llaminar2::ITensorGemm> KernelFactory::prepareExpertGemmLocal(
+                const llaminar2::TensorBase *tensor,
+                llaminar2::DeviceId target_device,
+                GemmPreparationKind prep_kind)
+            {
+                if (!tensor)
+                    return nullptr;
+
+                const bool quantized = dynamic_cast<const llaminar2::IINT8Unpackable *>(tensor) != nullptr;
+
+                GemmPreparationKind resolved_kind = prep_kind;
+                if (resolved_kind == GemmPreparationKind::AUTO)
+                {
+                    if (!quantized)
+                    {
+                        resolved_kind = GemmPreparationKind::FLOATING_POINT;
+                    }
+                    else
+                    {
+                        switch (getDeviceType(target_device))
+                        {
+                        case DeviceType::CPU:
+                            resolved_kind = GemmPreparationKind::CPU_PACKED;
+                            break;
+                        case DeviceType::CUDA:
+                            resolved_kind = GemmPreparationKind::CUDA_INT8_PACKED;
+                            break;
+                        case DeviceType::ROCm:
+                            resolved_kind = GemmPreparationKind::ROCM_INT8_PACKED;
+                            break;
+                        default:
+                            resolved_kind = GemmPreparationKind::FLOATING_POINT;
+                            break;
+                        }
+                    }
+                }
+
+                // GPU devices should use LoadOrchestrator pipeline, not this path
+                if (resolved_kind == GemmPreparationKind::CUDA_INT8_PACKED ||
+                    resolved_kind == GemmPreparationKind::ROCM_INT8_PACKED)
+                {
+                    LOG_ERROR("[KernelFactory::prepareExpertGemmLocal] GPU experts should use "
+                              "LoadOrchestrator pipeline, not local preparation");
+                    return nullptr;
+                }
+
+                if (!tensor->raw_data())
+                {
+                    LOG_ERROR("[KernelFactory::prepareExpertGemmLocal] Tensor has no raw data "
+                              "(host data already released?)");
+                    return nullptr;
+                }
+
+                // Pack weights into tensor-local cache (same as global path)
+                if (quantized && resolved_kind == GemmPreparationKind::CPU_PACKED)
+                    (void)ensurePackedWeightsInTensorCache(tensor);
+
+                // Create the GEMM kernel bound to this tensor
+                auto kernel = createPreparedKernelForDevice(tensor, target_device);
+                if (!kernel)
+                {
+                    LOG_ERROR("[KernelFactory::prepareExpertGemmLocal] Failed to create kernel for expert view");
+                    return nullptr;
+                }
+
+                // Return ownership to caller — NO global registry insertion,
+                // NO in_prepared_gemm_registry_ flag set
+                return std::shared_ptr<llaminar2::ITensorGemm>(std::move(kernel));
+            }
+
+            std::shared_ptr<llaminar2::ITensorGemm> KernelFactory::createExpertGemmFromTransferBlob(
+                const std::vector<uint8_t> &blob)
+            {
+                if (blob.empty())
+                    return nullptr;
+
+                auto packed_weights = llaminar2::packed_weights_serialization::deserialize(
+                    blob.data(), blob.size());
+                if (!packed_weights)
+                {
+                    LOG_ERROR("[KernelFactory::createExpertGemmFromTransferBlob] "
+                              "Failed to deserialize transferred blob (" << blob.size() << " bytes)");
+                    return nullptr;
+                }
+
+                auto *cpu_pw = dynamic_cast<llaminar2::cpu::native_vnni::CPUPackedWeights *>(
+                    packed_weights.get());
+                if (!cpu_pw)
+                {
+                    LOG_ERROR("[KernelFactory::createExpertGemmFromTransferBlob] "
+                              "Deserialized weights are not CPUPackedWeights");
+                    return nullptr;
+                }
+
+                auto kernel = std::make_shared<llaminar2::cpu::native_vnni::CPUNativeVNNIGemmKernel>(
+                    cpu_pw->takePacked());
+                return kernel;
             }
 
             const KernelFactory::PreparedGemmHandle *KernelFactory::findPreparedGemmWeights(
@@ -3778,13 +3944,16 @@ namespace llaminar
                 {
                     tensor->in_prepared_gemm_registry_ = true;
 
-                    // Pre-register fallback key (same rationale as getOrCreatePreparedGemmWeights)
-                    if (reg_key_data)
+                    // Also register under tensor-pointer fallback key (same as CPU path)
+                    if (reg_key_data != nullptr)
                     {
                         const PreparedGemmKey fallback_key{
                             nullptr,
                             static_cast<const void *>(tensor),
-                            key.N, key.K, key.device_id, key.prep_kind};
+                            static_cast<size_t>(tensor->shape().size() > 0 ? tensor->shape()[0] : 0),
+                            static_cast<size_t>(tensor->shape().size() > 1 ? tensor->shape()[1] : 0),
+                            target_device,
+                            static_cast<int>(resolved_kind)};
                         prepared_gemm_registry_.emplace(fallback_key, it->second);
                     }
                 }

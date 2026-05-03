@@ -90,7 +90,14 @@ namespace llaminar2
                     params_.prepared_ref_up.value());
             }
 
-            // Fallback: KernelFactory lookup
+            // Phase 10: Tensor-based store lookup
+            if (!fused_kernel && params_.prepared_store)
+            {
+                fused_kernel = params_.prepared_store->fusedGateUpKernelForTensors(
+                    w_gate_base, w_up_base, params_.device_id);
+            }
+
+            // No PreparedWeightStore or store miss: direct KernelFactory
             if (!fused_kernel)
             {
                 fused_kernel = llaminar::v2::kernels::KernelFactory::getOrCreateFusedGateUpGemm(

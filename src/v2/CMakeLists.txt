@@ -1281,16 +1281,16 @@ add_library(llaminar2_core STATIC
     loaders/ModelContext.cpp
     loaders/ModelContextConfig.cpp
     loaders/WeightManager.cpp
-    loaders/PreparedWeightStore.cpp
-    loaders/WeightIdentity.cpp
-    loaders/WeightLifecycleTrace.cpp
-    loaders/WeightMetadataRegistry.cpp
-    loaders/WeightPlan.cpp
     loaders/WeightSlicer.cpp
     loaders/WeightPlacementMap.cpp
     loaders/DeviceOrchestrator.cpp
     loaders/LayerWeightStreamer.cpp
     loaders/WeightStreamerFactory.cpp
+    loaders/PreparedWeightStore.cpp
+    loaders/WeightLifecycleTrace.cpp
+    loaders/WeightPlan.cpp
+    loaders/WeightIdentity.cpp
+    loaders/WeightMetadataRegistry.cpp
     # Partial weight loader (Phase 3 - PP partial weight loading)
     loaders/PartialWeightLoader.cpp
     # GPU weight loading pipeline (Phase 1 - Foundation)
@@ -1389,9 +1389,9 @@ add_library(llaminar2_core STATIC
     utils/MPIStager.cpp
     utils/Tokenizer.cpp
     utils/Sampler.cpp
-    utils/ToolCallParser.cpp
     utils/ChatTemplate.cpp
     utils/ChatUI.cpp
+    utils/ToolCallParser.cpp
     utils/BenchmarkRunner.cpp
     # Collective communication infrastructure
     collective/DeviceGroup.cpp

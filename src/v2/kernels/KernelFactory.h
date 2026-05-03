@@ -1228,6 +1228,21 @@ namespace llaminar
                 static void clearCacheFor(const llaminar2::TensorBase *tensor);
 
                 /**
+                 * @brief Clear prepared weight state for a tensor (Phase 8)
+                 *
+                 * Removes entries from prepared_gemm_registry_, fused_gate_up_cache_,
+                 * and sliced_cache_ that reference this tensor. Does NOT clear the
+                 * tensor's local packed_cache (cache_) — that is tensor-owned state.
+                 *
+                 * Called by PreparedWeightStore::releaseAllPreparedState() during
+                 * model teardown, so that subsequent tensor destruction does not need
+                 * to scan global registries.
+                 *
+                 * @param tensor Tensor whose prepared state should be removed
+                 */
+                static void clearPreparedStateForTensor(const llaminar2::TensorBase *tensor);
+
+                /**
                  * @brief Clear all cached kernels
                  *
                  * Useful for memory cleanup or when tensor lifetimes are uncertain.
@@ -1401,6 +1416,42 @@ namespace llaminar
                     const llaminar2::TensorBase *tensor,
                     llaminar2::DeviceId target_device,
                     GemmPreparationKind prep_kind = GemmPreparationKind::AUTO);
+
+                /**
+                 * @brief Prepare GEMM weights for an expert view WITHOUT global registry registration.
+                 *
+                 * Performs the same VNNI repacking / kernel binding as getOrCreatePreparedGemmWeights()
+                 * but returns a shared_ptr that the caller owns. The prepared weights are NOT stored
+                 * in prepared_gemm_registry_, so:
+                 * - ~TensorBase() has nothing to scan
+                 * - No dual-key fallback needed
+                 * - Lifetime is managed by the caller (PreparedWeightStore expert slab)
+                 *
+                 * @param tensor Expert view tensor (2D slice of 3D parent)
+                 * @param target_device Target device for preparation
+                 * @param prep_kind Preparation kind (AUTO resolves to CPU_PACKED for CPU)
+                 * @return shared_ptr to ITensorGemm — caller owns lifetime. Returns nullptr on failure.
+                 */
+                static std::shared_ptr<llaminar2::ITensorGemm> prepareExpertGemmLocal(
+                    const llaminar2::TensorBase *tensor,
+                    llaminar2::DeviceId target_device,
+                    GemmPreparationKind prep_kind = GemmPreparationKind::AUTO);
+
+                /**
+                 * @brief Create a GEMM engine from a transferred (pre-packed) weight blob.
+                 *
+                 * Deserializes the blob and constructs a CPUNativeVNNIGemmKernel directly
+                 * from the pre-packed representation. This avoids the expensive VNNI repack
+                 * that prepareExpertGemmLocal() performs from raw tensor data.
+                 *
+                 * Like prepareExpertGemmLocal(), does NOT insert into prepared_gemm_registry_.
+                 * Caller owns the returned shared_ptr lifetime.
+                 *
+                 * @param blob Serialized packed weight blob (from ExpertWeightTransfer)
+                 * @return shared_ptr to ITensorGemm, or nullptr if deserialization fails.
+                 */
+                static std::shared_ptr<llaminar2::ITensorGemm> createExpertGemmFromTransferBlob(
+                    const std::vector<uint8_t> &blob);
 
                 /**
                  * @brief Find an existing prepared GEMM-weights handle without creating one.

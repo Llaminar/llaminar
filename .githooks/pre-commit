@@ -9,7 +9,7 @@
 # All branches run the same 5-step suite:
 #   1. Integration build
 #   2. Unit tests (parallel)
-#   3. Focused parity baseline (26 tests, all model families, sequential)
+#   3. Focused parity baseline (27 tests, all model families, sequential)
 #   4. E2E server integration tests
 #   5. Performance regression benchmarks
 # Override with: git commit --no-verify
@@ -89,7 +89,7 @@ echo ""
 # Covers Qwen2, Qwen3, Qwen3.5 (dense), Qwen3.5 MoE (sparse),
 # NodeLocalTP (multi-device), and HybridPPTP (pipeline+tensor parallel).
 # Runs on ALL branches to catch accuracy regressions early.
-echo -e "${YELLOW}[3/${TOTAL_STEPS}] Running focused parity baseline (26 tests, all model families)...${NC}"
+echo -e "${YELLOW}[3/${TOTAL_STEPS}] Running focused parity baseline (27 tests, all model families)...${NC}"
 echo ""
 
 set +e
@@ -171,7 +171,7 @@ echo "================================================"
 echo -e "${GREEN}✅ SUCCESS: All checks passed!${NC}"
 echo -e "${GREEN}  • Integration build: OK${NC}"
 echo -e "${GREEN}  • Unit tests: OK${NC}"
-echo -e "${GREEN}  • Parity baseline (26 tests): OK${NC}"
+echo -e "${GREEN}  • Parity baseline (27 tests): OK${NC}"
 echo -e "${GREEN}  • E2E server tests: OK${NC}"
 echo -e "${GREEN}  • Performance benchmarks: OK${NC}"
 echo ""

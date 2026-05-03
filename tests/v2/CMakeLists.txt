@@ -423,10 +423,15 @@ function(add_v2_test TEST_NAME)
         )
     endif()
 
-    # Add TIMEOUT if specified (useful for slow integration/parity tests)
+    # Add TIMEOUT: use explicit value if specified, otherwise default to 60s
+    # for unit tests to prevent hangs from blocking CI indefinitely.
     if(ARG_TIMEOUT)
         set_tests_properties(${TEST_NAME} PROPERTIES
             TIMEOUT ${ARG_TIMEOUT}
+        )
+    elseif("${TEST_NAME}" MATCHES "^V2_Unit_")
+        set_tests_properties(${TEST_NAME} PROPERTIES
+            TIMEOUT 60
         )
     endif()
 endfunction()
@@ -3825,6 +3830,103 @@ add_v2_test(V2_Unit_PreparedWeightStore
     MPI_PROCS 1
 )
 
+add_executable(v2_unit_prepared_weight_store_expert_slab unit/loaders/Test__PreparedWeightStore_ExpertSlab.cpp)
+target_link_libraries(v2_unit_prepared_weight_store_expert_slab llaminar2_core GTest::gtest_main)
+add_v2_test(V2_Unit_PreparedWeightStore_ExpertSlab
+    COMMAND $<TARGET_FILE:v2_unit_prepared_weight_store_expert_slab>
+    LABELS "V2;Unit;Loaders;Weights;Lifecycle;PreparedWeights;MoE;ExpertSlab"
+    MPI_PROCS 1
+)
+
+# Test: MoE Weight Service Dual Registration (Phase B)
+# Validates that expert GEMM engines are registered in both KernelFactory and PreparedWeightStore
+add_executable(v2_unit_moe_weight_service_dual_registration unit/moe/Test__MoEWeightService_DualRegistration.cpp)
+target_link_libraries(v2_unit_moe_weight_service_dual_registration llaminar2_core GTest::gtest_main)
+add_v2_test(V2_Unit_MoEWeightService_DualRegistration
+    COMMAND $<TARGET_FILE:v2_unit_moe_weight_service_dual_registration>
+    LABELS "V2;Unit;MoE;Weights;Lifecycle;DualRegistration"
+    MPI_PROCS 1
+)
+
+# Test: Phase C store-based GEMM resolution
+add_executable(v2_unit_moe_phase_c_store_resolution unit/moe/Test__MoEPhaseC_StoreResolution.cpp)
+target_link_libraries(v2_unit_moe_phase_c_store_resolution llaminar2_core GTest::gtest_main)
+add_v2_test(V2_Unit_MoEPhaseC_StoreResolution
+    COMMAND $<TARGET_FILE:v2_unit_moe_phase_c_store_resolution>
+    LABELS "V2;Unit;MoE;Weights;Lifecycle;StoreResolution"
+    MPI_PROCS 1
+)
+
+# Test: Phase D — expert views don't register in global KernelFactory registry
+add_executable(v2_unit_moe_phase_d_no_global_registry unit/moe/Test__MoEPhaseD_NoGlobalRegistry.cpp)
+target_include_directories(v2_unit_moe_phase_d_no_global_registry PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(v2_unit_moe_phase_d_no_global_registry llaminar2_core GTest::gtest_main)
+add_v2_test(V2_Unit_MoEPhaseD_NoGlobalRegistry
+    COMMAND $<TARGET_FILE:v2_unit_moe_phase_d_no_global_registry>
+    LABELS "V2;Unit;MoE;Weights;Lifecycle;PhaseD;NoGlobalRegistry"
+    MPI_PROCS 1
+)
+
+# Test: Expert Transfer Fixes — transfer blob path, Phase D alignment, MPI guards
+add_executable(v2_unit_expert_transfer_fixes unit/moe/Test__ExpertTransferFixes.cpp)
+target_include_directories(v2_unit_expert_transfer_fixes PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(v2_unit_expert_transfer_fixes llaminar2_core GTest::gtest_main)
+add_v2_test(V2_Unit_ExpertTransferFixes
+    COMMAND $<TARGET_FILE:v2_unit_expert_transfer_fixes>
+    LABELS "V2;Unit;MoE;Weights;WeightTransfer;PhaseD;TransferBlob"
+    MPI_PROCS 1
+)
+
+# Test: GPU Expert Transfer Integration — device context, P2P, data integrity
+add_executable(v2_integration_gpu_expert_transfer integration/moe/Test__GPUExpertTransferIntegration.cpp)
+target_include_directories(v2_integration_gpu_expert_transfer PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(v2_integration_gpu_expert_transfer llaminar2_core GTest::gtest_main)
+add_v2_test(V2_Integration_GPUExpertTransfer
+    COMMAND $<TARGET_FILE:v2_integration_gpu_expert_transfer>
+    LABELS "V2;Integration;MoE;GPU;WeightTransfer"
+    MPI_PROCS 1
+)
+
+# Test: Expert Transfer Performance — repack vs transfer blob speedup
+add_executable(v2_perf_expert_transfer performance/moe/Test__ExpertTransferPerf.cpp)
+target_include_directories(v2_perf_expert_transfer PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(v2_perf_expert_transfer llaminar2_core GTest::gtest_main)
+add_v2_test(V2_Perf_ExpertTransfer
+    COMMAND $<TARGET_FILE:v2_perf_expert_transfer>
+    LABELS "V2;Performance;MoE;WeightTransfer;TransferBlob"
+    MPI_PROCS 1
+)
+
+# Test: Cross-Domain Expert Transfer Integration — GPU↔GPU, CPU↔GPU paths
+if(HAVE_CUDA OR HAVE_ROCM)
+    add_executable(v2_integration_cross_domain_expert_transfer integration/moe/Test__CrossDomainExpertTransferIntegration.cpp)
+    target_link_libraries(v2_integration_cross_domain_expert_transfer llaminar2_core GTest::gtest GTest::gtest_main)
+    target_include_directories(v2_integration_cross_domain_expert_transfer PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/utils
+    )
+    add_v2_test(V2_Integration_CrossDomainExpertTransfer
+        COMMAND $<TARGET_FILE:v2_integration_cross_domain_expert_transfer>
+        LABELS "V2;Integration;MoE;GPU;CrossDomain;WeightTransfer"
+        MPI_PROCS 1
+    )
+endif()
+
+# Test: Cross-Domain Transfer Performance — bandwidth and latency benchmarks
+if(HAVE_CUDA OR HAVE_ROCM)
+    add_executable(v2_perf_cross_domain_transfer performance/moe/Test__CrossDomainTransferPerf.cpp)
+    target_link_libraries(v2_perf_cross_domain_transfer llaminar2_core GTest::gtest GTest::gtest_main)
+    target_include_directories(v2_perf_cross_domain_transfer PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/utils
+    )
+    add_v2_test(V2_Perf_CrossDomainTransfer
+        COMMAND $<TARGET_FILE:v2_perf_cross_domain_transfer>
+        LABELS "V2;Performance;MoE;CrossDomain;WeightTransfer;Bandwidth"
+        MPI_PROCS 1
+    )
+endif()
+
 # Test: WeightManager Sharding
 # Tests weight sharding for tensor parallelism (Phase 1: row-parallel only)
 add_executable(v2_test_weight_manager_sharding unit/loaders/Test__WeightManagerSharding.cpp)
@@ -6244,6 +6346,7 @@ add_v2_test(V2_Unit_WeightManager_LayerPartitioned
     COMMAND $<TARGET_FILE:v2_test_weightmanager_layer_partitioned>
     LABELS "V2;Unit;PipelineParallel;WeightManager;LayerPartitioned;Memory"
     MPI_PROCS 1
+    TIMEOUT 120
 )
 
 # Test: CollectiveStageIntegration (AllreduceStage and AllGatherStage with CollectiveContext)
@@ -6601,6 +6704,7 @@ add_v2_test(V2_Unit_ModelLoaderRowSlice
     COMMAND $<TARGET_FILE:v2_test_model_loader_row_slice>
     MPI_PROCS 1
     LABELS "V2;Unit;ModelLoading;GGUF;RowSlice;MemoryEfficient"
+    TIMEOUT 120
 )
 
 # Test: WeightManager Memory Efficient Slicing

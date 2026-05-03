@@ -193,28 +193,24 @@ namespace llaminar2
         }
         else
         {
-            // Phase 7: Try PreparedWeightStore first (direct binding resolution)
+            // Phase 10: Resolve kernel through PreparedWeightStore or direct creation.
             if (params_.prepared_ref.has_value() && params_.prepared_store)
             {
                 gemm = params_.prepared_store->gemmKernel(params_.prepared_ref.value());
-                if (gemm)
-                {
-                    cached_gemm_ = gemm;
-                    cache_resolved_ = true;
-                    LOG_DEBUG("[GEMMStage] Resolved kernel via PreparedWeightStore (binding_id="
-                             << params_.prepared_ref->binding_id << ")");
-                }
             }
-
-            // Fallback: KernelFactory lookup (legacy path)
+            if (!gemm && params_.prepared_store)
+            {
+                gemm = params_.prepared_store->gemmKernelForTensor(B_base);
+            }
             if (!gemm)
             {
+                // Store miss or no store: direct KernelFactory (always available)
                 auto *prepared = llaminar::v2::kernels::KernelFactory::getOrCreatePreparedGemmWeights(B_base, params_.device_id);
                 gemm = llaminar::v2::kernels::KernelFactory::getOrCreateGemmEngine(prepared);
-                cached_gemm_ = gemm;
                 cached_prepared_ = prepared;
-                cache_resolved_ = true;
             }
+            cached_gemm_ = gemm;
+            cache_resolved_ = true;
         }
 
         if (!gemm)

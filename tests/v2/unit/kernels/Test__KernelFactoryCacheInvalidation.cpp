@@ -1,15 +1,16 @@
 /**
  * @file Test__KernelFactoryCacheInvalidation.cpp
- * @brief Unit tests for automatic KernelFactory cache invalidation
+ * @brief Unit tests for KernelFactory cache invalidation APIs
  * @author David Sanftenberg
  *
- * Tests verify that when a tensor is destroyed, its entry in the
- * KernelFactory cache is automatically removed. This prevents use-after-free
- * bugs when a new tensor is allocated at the same memory address as a
- * previously destroyed tensor.
+ * Phase 10 (Weight Lifetime Redesign): TensorBase destructors no longer
+ * auto-clear KernelFactory caches. Instead, explicit cleanup is performed via:
+ *   - KernelFactory::clearPreparedStateForTensor() — per-tensor cleanup
+ *   - KernelFactory::clearCacheFor() — legacy per-tensor cleanup
+ *   - PreparedWeightStore::releaseAllPreparedState() — bulk model teardown
  *
- * The fix works by having TensorBase's destructor call
- * KernelFactory::clearCacheFor(this).
+ * These tests verify that explicit cleanup APIs work correctly, and that
+ * the cache retains entries across tensor destruction (the new contract).
  */
 
 #include <gtest/gtest.h>
@@ -99,13 +100,17 @@ TEST_F(Test__KernelFactoryCacheInvalidation, CacheGrowsAfterGetOrCreateGemm)
     EXPECT_GT(size_after, 0u);
 }
 
-TEST_F(Test__KernelFactoryCacheInvalidation, CacheAutoInvalidatesOnTensorDestruction)
+TEST_F(Test__KernelFactoryCacheInvalidation, CacheRetainedAfterTensorDestruction)
 {
-    // This is the KEY test for the automatic invalidation feature
+    // Phase 10: TensorBase destructor no longer clears KernelFactory cache.
+    // Cache entries persist until explicit cleanup via clearPreparedStateForTensor().
+
+    const TensorBase *captured_ptr = nullptr;
 
     // Create tensor in a scope
     {
         auto tensor = createTestTensor();
+        captured_ptr = tensor.get();
 
         // Add to cache
         auto *kernel = getPreparedKernel(tensor.get());
@@ -115,18 +120,23 @@ TEST_F(Test__KernelFactoryCacheInvalidation, CacheAutoInvalidatesOnTensorDestruc
         auto [size_during, _] = KernelFactory::cacheStats();
         EXPECT_GT(size_during, 0u);
 
-        // tensor goes out of scope here -> destructor runs
+        // tensor goes out of scope here -> destructor runs but does NOT clear cache
     }
 
-    // After tensor destruction, cache entry should be automatically removed
+    // Phase 10: Cache entry persists after tensor destruction
     auto [size_after, bytes_after] = KernelFactory::cacheStats();
-    EXPECT_EQ(size_after, 0u) << "Cache should be empty after tensor destruction";
-    EXPECT_EQ(bytes_after, 0u) << "Packed bytes should be zero after tensor destruction";
+    EXPECT_GT(size_after, 0u) << "Phase 10: cache should persist after tensor destruction";
+
+    // Explicit cleanup removes the entry
+    KernelFactory::clearPreparedStateForTensor(captured_ptr);
+    auto [size_cleaned, _] = KernelFactory::cacheStats();
+    EXPECT_EQ(size_cleaned, 0u) << "Explicit clearPreparedStateForTensor should remove entry";
 }
 
-TEST_F(Test__KernelFactoryCacheInvalidation, MultipleTensors_IndependentInvalidation)
+TEST_F(Test__KernelFactoryCacheInvalidation, MultipleTensors_ExplicitInvalidation)
 {
-    // Create two tensors
+    // Phase 10: Explicit cleanup removes specific tensor entries
+
     auto tensor1 = createTestTensor();
     auto tensor2 = createTestTensor();
 
@@ -138,20 +148,20 @@ TEST_F(Test__KernelFactoryCacheInvalidation, MultipleTensors_IndependentInvalida
     auto [size_both, _] = KernelFactory::cacheStats();
     EXPECT_GT(size_both, 0u);
 
-    // Destroy tensor1
-    tensor1.reset();
+    // Explicit cleanup for tensor1
+    KernelFactory::clearPreparedStateForTensor(tensor1.get());
 
     // Should have fewer entries (tensor2 remains)
     auto [size_one, __] = KernelFactory::cacheStats();
     EXPECT_GT(size_one, 0u) << "tensor2's kernel should remain in cache";
-    EXPECT_LT(size_one, size_both) << "Destroying tensor1 should reduce cache size";
+    EXPECT_LT(size_one, size_both) << "Clearing tensor1 should reduce cache size";
 
-    // Destroy tensor2
-    tensor2.reset();
+    // Explicit cleanup for tensor2
+    KernelFactory::clearPreparedStateForTensor(tensor2.get());
 
     // Cache should now be empty
     auto [size_none, ___] = KernelFactory::cacheStats();
-    EXPECT_EQ(size_none, 0u) << "Cache should be empty after all tensors destroyed";
+    EXPECT_EQ(size_none, 0u) << "Cache should be empty after explicit cleanup of all tensors";
 }
 
 TEST_F(Test__KernelFactoryCacheInvalidation, ClearCacheForNonExistentTensor_NoOp)
@@ -190,16 +200,10 @@ TEST_F(Test__KernelFactoryCacheInvalidation, CacheHit_SamePointerReturnssamKerne
 // Regression Test: Memory Reuse Scenario
 // ============================================================================
 
-TEST_F(Test__KernelFactoryCacheInvalidation, MemoryReuse_NoStaleKernel)
+TEST_F(Test__KernelFactoryCacheInvalidation, MemoryReuse_ExplicitCleanupPreventsStaleEntries)
 {
-    // This test simulates the exact bug that was occurring:
-    // 1. Create tensor A, cache its kernel
-    // 2. Destroy tensor A
-    // 3. Create tensor B (may get same address as A)
-    // 4. Query cache for tensor B -> should NOT get A's stale kernel
-
-    // We can't guarantee memory reuse, but we can verify that after
-    // destruction, no stale entries exist
+    // Phase 10: Explicit cleanup before tensor destruction prevents stale entries.
+    // This simulates what PreparedWeightStore::releaseAllPreparedState() does.
 
     const TensorBase *captured_ptr = nullptr;
 
@@ -212,39 +216,41 @@ TEST_F(Test__KernelFactoryCacheInvalidation, MemoryReuse_NoStaleKernel)
 
         auto [size_during, _] = KernelFactory::cacheStats();
         EXPECT_GT(size_during, 0u);
+
+        // Explicit cleanup BEFORE destruction (the Phase 10 pattern)
+        KernelFactory::clearPreparedStateForTensor(tensor.get());
     }
 
-    // After destruction, even if we query with the old pointer address,
-    // we should NOT find any entry (cache should be clean)
+    // After explicit cleanup + destruction, cache is clean
     auto [size_after, _] = KernelFactory::cacheStats();
-    EXPECT_EQ(size_after, 0u) << "Cache should be empty after tensor destruction";
-
-    // Note: We can't call getPreparedKernel(captured_ptr) because that would be UB.
-    // The important thing is that the cache is clean, so if a new tensor
-    // happens to be allocated at the same address, it won't hit a stale entry.
+    EXPECT_EQ(size_after, 0u) << "Cache should be clean after explicit cleanup";
 }
 
 // ============================================================================
 // FP32 Tensor (non-quantized) Test
 // ============================================================================
 
-TEST_F(Test__KernelFactoryCacheInvalidation, FP32Tensor_AutoInvalidation)
+TEST_F(Test__KernelFactoryCacheInvalidation, FP32Tensor_ExplicitInvalidation)
 {
-    // FP32 tensors also go through the cache
+    // FP32 tensors: explicit cleanup works
+    const TensorBase *captured_ptr = nullptr;
     {
         const size_t rows = 32;
         const size_t cols = 32;
-        // FP32Tensor constructor takes shape and optional device_idx (defaults to -1 for CPU)
         auto tensor = std::make_unique<FP32Tensor>(std::vector<size_t>{rows, cols});
+        captured_ptr = tensor.get();
 
         auto *kernel = getPreparedKernel(tensor.get());
         ASSERT_NE(kernel, nullptr);
 
         auto [size_during, _] = KernelFactory::cacheStats();
         EXPECT_GT(size_during, 0u);
+
+        // Explicit cleanup before destruction
+        KernelFactory::clearPreparedStateForTensor(tensor.get());
     }
 
-    // After destruction, cache should be empty
+    // After explicit cleanup, cache should be empty
     auto [size_after, _] = KernelFactory::cacheStats();
     EXPECT_EQ(size_after, 0u);
 }
@@ -267,25 +273,26 @@ TEST_F(Test__KernelFactoryCacheInvalidation, TensorWithoutKernel_DestructorSafe)
     EXPECT_EQ(size, 0u);
 }
 
-TEST_F(Test__KernelFactoryCacheInvalidation, RapidCreateDestroy_CacheStaysClean)
+TEST_F(Test__KernelFactoryCacheInvalidation, RapidCreateDestroy_ExplicitCleanup)
 {
-    // Rapidly create and destroy many tensors
+    // Phase 10: explicit cleanup keeps cache bounded during rapid cycles
     for (int i = 0; i < 100; ++i)
     {
         auto tensor = createTestTensor();
         getPreparedKernel(tensor.get());
+        KernelFactory::clearPreparedStateForTensor(tensor.get());
     }
 
-    // After all destroys, cache should be empty
+    // After all explicit cleanups, cache should be empty
     auto [size, _] = KernelFactory::cacheStats();
-    EXPECT_EQ(size, 0u) << "Cache should be clean after rapid create/destroy cycles";
+    EXPECT_EQ(size, 0u) << "Cache should be clean after rapid create/cleanup cycles";
 }
 
 // ============================================================================
 // Packed Weights Cache Cleanup Tests
 // ============================================================================
 
-TEST_F(Test__KernelFactoryCacheInvalidation, CPUPackedWeights_CleanedUpOnDestruction)
+TEST_F(Test__KernelFactoryCacheInvalidation, CPUPackedWeights_CleanedUpByExplicitCall)
 {
     // NativeVNNI kernels manage their own weight packing internally.
     // tensor->cache_ is NOT used for CPU packed weights anymore.
@@ -302,10 +309,13 @@ TEST_F(Test__KernelFactoryCacheInvalidation, CPUPackedWeights_CleanedUpOnDestruc
         // cache_ stays empty — NativeVNNI packs weights in the kernel itself
         EXPECT_FALSE(tensor->cache_.has_value())
             << "NativeVNNI kernels don't use tensor->cache_ for CPU packed weights";
+
+        // Phase 10: explicit cleanup
+        KernelFactory::clearPreparedStateForTensor(tensor.get());
     }
 
     auto [size_after, _] = KernelFactory::cacheStats();
-    EXPECT_EQ(size_after, 0u) << "Cache should be empty after tensor destruction";
+    EXPECT_EQ(size_after, 0u) << "Cache should be empty after explicit cleanup";
 }
 
 TEST_F(Test__KernelFactoryCacheInvalidation, CPUPackedWeights_ClearedByExplicitClearCacheFor)
@@ -355,67 +365,54 @@ TEST_F(Test__KernelFactoryCacheInvalidation, MultiplePackedWeightsCreation_OnlyP
 
 #ifdef HAVE_CUDA
 // ============================================================================
-// REGRESSION: Device-Targeted Cache Invalidation (GitHub Issue #XXX)
+// Device-Targeted Cache: Explicit Cleanup Tests (Phase 10)
 // ============================================================================
-// These tests verify that device_targeted_cache_ is properly cleared when
-// a tensor is destroyed. This is a regression test for a bug where
-// device-specific prepared-handle kernels
-// were NOT being cleared, causing use-after-free when tensor memory was reused.
+// Phase 10: TensorBase destructor no longer auto-clears caches.
+// These tests verify that explicit clearPreparedStateForTensor() works for
+// device-targeted (GPU) cache entries.
 
-TEST_F(Test__KernelFactoryCacheInvalidation, DeviceTargetedCache_CUDA_AutoInvalidation)
+TEST_F(Test__KernelFactoryCacheInvalidation, DeviceTargetedCache_CUDA_ExplicitCleanup)
 {
-    // This test verifies the bug fix: device_targeted_cache_ entries must be
-    // cleared when a tensor is destroyed.
-    //
-    // Bug scenario:
-    // 1. Create tensor A, register device-targeted CUDA kernel (cached by tensor ptr)
-    // 2. Destroy tensor A (cache entry SHOULD be removed)
-    // 3. Create tensor B at same memory address (memory reuse)
-    // 4. Query cache for tensor B -> WITHOUT FIX: returns stale kernel from A
-    //                                WITH FIX: cache miss, creates new kernel
+    // Phase 10: explicit cleanup removes device-targeted entries
 
-    {
-        auto tensor = createTestTensor();
+    auto tensor = createTestTensor();
 
-        // Register a GPU kernel via the production GPU pipeline API
-        auto *kernel = registerAndGetGPUKernel(tensor.get(), DeviceId::cuda(0));
-        ASSERT_NE(kernel, nullptr);
+    // Register a GPU kernel via the production GPU pipeline API
+    auto *kernel = registerAndGetGPUKernel(tensor.get(), DeviceId::cuda(0));
+    ASSERT_NE(kernel, nullptr);
 
-        // Verify cache has an entry
-        auto [size_during, _] = KernelFactory::cacheStats();
-        EXPECT_GE(size_during, 1u) << "Cache should have at least one entry";
+    // Verify cache has an entry
+    auto [size_during, _] = KernelFactory::cacheStats();
+    EXPECT_GE(size_during, 1u) << "Cache should have at least one entry";
 
-        // tensor goes out of scope here -> destructor should clear cache entry
-    }
+    // Explicit cleanup
+    KernelFactory::clearPreparedStateForTensor(tensor.get());
 
-    // After destruction, the device-targeted cache entry should be removed
-    // This is the key assertion for the bug fix
-    auto [size_after, _] = KernelFactory::cacheStats();
+    auto [size_after, __] = KernelFactory::cacheStats();
     EXPECT_EQ(size_after, 0u)
-        << "REGRESSION: device_targeted_cache_ was not cleared on tensor destruction. "
-           "This causes use-after-free when memory is reused.";
+        << "clearPreparedStateForTensor should remove device-targeted cache entries";
 }
 
-TEST_F(Test__KernelFactoryCacheInvalidation, DeviceTargetedCache_CPU_AutoInvalidation)
+TEST_F(Test__KernelFactoryCacheInvalidation, DeviceTargetedCache_CPU_ExplicitCleanup)
 {
     // Same test but for CPU device-targeted kernels
-    {
-        auto tensor = createTestTensor();
+    auto tensor = createTestTensor();
 
-        // Create CPU device-targeted kernel
-        auto *kernel = getPreparedKernel(tensor.get(), DeviceId::cpu());
-        ASSERT_NE(kernel, nullptr);
+    // Create CPU device-targeted kernel
+    auto *kernel = getPreparedKernel(tensor.get(), DeviceId::cpu());
+    ASSERT_NE(kernel, nullptr);
 
-        auto [size_during, _] = KernelFactory::cacheStats();
-        EXPECT_GE(size_during, 1u);
-    }
+    auto [size_during, _] = KernelFactory::cacheStats();
+    EXPECT_GE(size_during, 1u);
 
-    auto [size_after, _] = KernelFactory::cacheStats();
+    KernelFactory::clearPreparedStateForTensor(tensor.get());
+
+    auto [size_after, __] = KernelFactory::cacheStats();
     EXPECT_EQ(size_after, 0u)
-        << "REGRESSION: device_targeted_cache_ (CPU) was not cleared on tensor destruction";
+        << "clearPreparedStateForTensor should remove CPU device-targeted entries";
 }
 
-TEST_F(Test__KernelFactoryCacheInvalidation, DeviceTargetedCache_MultipleDevices_IndependentInvalidation)
+TEST_F(Test__KernelFactoryCacheInvalidation, DeviceTargetedCache_MultipleDevices_IndependentCleanup)
 {
     // Test that clearing one tensor doesn't affect device-targeted kernels for other tensors
 
@@ -432,8 +429,8 @@ TEST_F(Test__KernelFactoryCacheInvalidation, DeviceTargetedCache_MultipleDevices
     auto [size_both, _] = KernelFactory::cacheStats();
     EXPECT_GE(size_both, 2u) << "Should have at least 2 cache entries";
 
-    // Destroy tensor1
-    tensor1.reset();
+    // Explicit cleanup for tensor1 only
+    KernelFactory::clearPreparedStateForTensor(tensor1.get());
 
     // tensor2's kernel should still be in cache
     auto [size_one, __] = KernelFactory::cacheStats();
@@ -443,39 +440,37 @@ TEST_F(Test__KernelFactoryCacheInvalidation, DeviceTargetedCache_MultipleDevices
     auto *kernel2_again = getPreparedKernel(tensor2.get(), DeviceId::cuda(0));
     EXPECT_EQ(kernel2, kernel2_again) << "Should return same cached kernel for tensor2";
 
-    // Destroy tensor2
-    tensor2.reset();
+    // Explicit cleanup for tensor2
+    KernelFactory::clearPreparedStateForTensor(tensor2.get());
 
     // Now cache should be empty
     auto [size_none, ___] = KernelFactory::cacheStats();
-    EXPECT_EQ(size_none, 0u) << "Cache should be empty after all tensors destroyed";
+    EXPECT_EQ(size_none, 0u) << "Cache should be empty after explicit cleanup of all tensors";
 }
 
-TEST_F(Test__KernelFactoryCacheInvalidation, DeviceTargetedCache_SameTensorBothDevices)
+TEST_F(Test__KernelFactoryCacheInvalidation, DeviceTargetedCache_SameTensorBothDevices_ExplicitCleanup)
 {
     // Test tensor with kernels cached for BOTH CPU and CUDA device types
 
-    {
-        auto tensor = createTestTensor();
+    auto tensor = createTestTensor();
 
-        // Create CPU kernel via normal path, CUDA kernel via GPU pipeline API
-        auto *cpu_kernel = getPreparedKernel(tensor.get(), DeviceId::cpu());
-        auto *cuda_kernel = registerAndGetGPUKernel(tensor.get(), DeviceId::cuda(0));
+    // Create CPU kernel via normal path, CUDA kernel via GPU pipeline API
+    auto *cpu_kernel = getPreparedKernel(tensor.get(), DeviceId::cpu());
+    auto *cuda_kernel = registerAndGetGPUKernel(tensor.get(), DeviceId::cuda(0));
 
-        ASSERT_NE(cpu_kernel, nullptr);
-        ASSERT_NE(cuda_kernel, nullptr);
-        EXPECT_NE(cpu_kernel, cuda_kernel) << "CPU and CUDA kernels should be different";
+    ASSERT_NE(cpu_kernel, nullptr);
+    ASSERT_NE(cuda_kernel, nullptr);
+    EXPECT_NE(cpu_kernel, cuda_kernel) << "CPU and CUDA kernels should be different";
 
-        auto [size_during, _] = KernelFactory::cacheStats();
-        EXPECT_GE(size_during, 2u) << "Should have entries for both device types";
+    auto [size_during, _] = KernelFactory::cacheStats();
+    EXPECT_GE(size_during, 2u) << "Should have entries for both device types";
 
-        // tensor goes out of scope here
-    }
+    // Single explicit cleanup should remove both entries
+    KernelFactory::clearPreparedStateForTensor(tensor.get());
 
-    // Both entries should be cleared
-    auto [size_after, _] = KernelFactory::cacheStats();
+    auto [size_after, __] = KernelFactory::cacheStats();
     EXPECT_EQ(size_after, 0u)
-        << "REGRESSION: Both CPU and CUDA device_targeted_cache_ entries should be cleared";
+        << "clearPreparedStateForTensor should remove both CPU and CUDA entries";
 }
 
 TEST_F(Test__KernelFactoryCacheInvalidation, DeviceTargetedCache_ExplicitClearCacheFor)
@@ -505,32 +500,20 @@ TEST_F(Test__KernelFactoryCacheInvalidation, DeviceTargetedCache_ExplicitClearCa
     // The key point is the cache was cleared and re-population works
 }
 
-TEST_F(Test__KernelFactoryCacheInvalidation, DeviceTargetedCache_MemoryReuseSimulation)
+TEST_F(Test__KernelFactoryCacheInvalidation, DeviceTargetedCache_RapidExplicitCleanup)
 {
-    // This test simulates the exact scenario that caused the original bug:
-    // Memory reuse after tensor destruction leading to stale cache hits.
-    //
-    // We can't force memory reuse, but we can verify the cache is clean
-    // after destruction, which prevents the bug.
-
-    // Simulate the bug scenario by rapidly creating/destroying tensors
-    // and checking that the cache stays clean
-
+    // Phase 10: explicit cleanup keeps cache bounded during rapid cycles
     for (int i = 0; i < 10; ++i)
     {
-        {
-            auto tensor = createTestTensor();
-            // Register GPU kernel via the production GPU pipeline API
-            auto *kernel = registerAndGetGPUKernel(tensor.get(), DeviceId::cuda(0));
-            ASSERT_NE(kernel, nullptr);
-            // tensor destroyed here
-        }
+        auto tensor = createTestTensor();
+        auto *kernel = registerAndGetGPUKernel(tensor.get(), DeviceId::cuda(0));
+        ASSERT_NE(kernel, nullptr);
 
-        // After each destruction, cache should be empty
+        KernelFactory::clearPreparedStateForTensor(tensor.get());
+
         auto [size, _] = KernelFactory::cacheStats();
         EXPECT_EQ(size, 0u)
-            << "REGRESSION: Iteration " << i << " - cache should be empty after tensor destruction. "
-                                                "Memory reuse could cause stale cache hits if not properly invalidated.";
+            << "Iteration " << i << " - cache should be empty after explicit cleanup";
     }
 }
 

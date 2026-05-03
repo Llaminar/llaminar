@@ -40,43 +40,14 @@ bool copyArrayPeerAsync(
         return true;
     }
 
-    // Host-staged fallback: D2H(src) then H2D(dst) via pinned bounce buffer
-    void* host_buf = nullptr;
-    hipError_t err = hipHostMalloc(&host_buf, bytes, hipHostMallocDefault);
+    // Fallback: hipMemcpyPeer handles host-staging internally and is much faster
+    // than manual bounce buffer allocation per array.
+    hipError_t err = hipMemcpyPeer(dst, dst_ordinal, src, src_ordinal, bytes);
     if (err != hipSuccess) {
-        LOG_ERROR("[GPUExpertTransfer] hipHostMalloc for bounce buffer failed: " << hipGetErrorString(err));
+        LOG_ERROR("[GPUExpertTransfer] hipMemcpyPeer fallback failed: " << hipGetErrorString(err)
+                  << " (src=" << src_ordinal << " dst=" << dst_ordinal << " bytes=" << bytes << ")");
         return false;
     }
-
-    // D2H from source device
-    err = hipSetDevice(src_ordinal);
-    if (err != hipSuccess) {
-        LOG_ERROR("[GPUExpertTransfer] hipSetDevice(src=" << src_ordinal << ") failed: " << hipGetErrorString(err));
-        hipHostFree(host_buf);
-        return false;
-    }
-    err = hipMemcpy(host_buf, src, bytes, hipMemcpyDeviceToHost);
-    if (err != hipSuccess) {
-        LOG_ERROR("[GPUExpertTransfer] D2H copy failed: " << hipGetErrorString(err));
-        hipHostFree(host_buf);
-        return false;
-    }
-
-    // H2D to destination device
-    err = hipSetDevice(dst_ordinal);
-    if (err != hipSuccess) {
-        LOG_ERROR("[GPUExpertTransfer] hipSetDevice(dst=" << dst_ordinal << ") failed: " << hipGetErrorString(err));
-        hipHostFree(host_buf);
-        return false;
-    }
-    err = hipMemcpy(dst, host_buf, bytes, hipMemcpyHostToDevice);
-    if (err != hipSuccess) {
-        LOG_ERROR("[GPUExpertTransfer] H2D copy failed: " << hipGetErrorString(err));
-        hipHostFree(host_buf);
-        return false;
-    }
-
-    hipHostFree(host_buf);
     return true;
 }
 
@@ -99,6 +70,10 @@ bool GPUExpertTransfer::transferExpert(
         return false;
     }
 
+    // Save caller's active device to restore on exit
+    int original_device = -1;
+    hipGetDevice(&original_device);
+
     const int src_ord = src_device.rocm_ordinal();
     const int dst_ord = dst_device.rocm_ordinal();
     const bool peer = canAccessPeer(src_ord, dst_ord);
@@ -110,36 +85,44 @@ bool GPUExpertTransfer::transferExpert(
     auto hip_stream = static_cast<hipStream_t>(stream);
 
     // Transfer all arrays
+    bool success = true;
     if (!copyArrayPeerAsync(dst_ptrs.d_vnni, dst_ord,
                             src_ptrs.d_vnni, src_ord,
                             vnni_bytes, hip_stream, peer))
-        return false;
+        success = false;
 
-    if (!copyArrayPeerAsync(dst_ptrs.d_scales, dst_ord,
+    if (success && !copyArrayPeerAsync(dst_ptrs.d_scales, dst_ord,
                             src_ptrs.d_scales, src_ord,
                             scales_bytes, hip_stream, peer))
-        return false;
+        success = false;
 
-    if (mins_bytes > 0) {
+    if (success && mins_bytes > 0) {
         if (!copyArrayPeerAsync(dst_ptrs.d_mins, dst_ord,
                                 src_ptrs.d_mins, src_ord,
                                 mins_bytes, hip_stream, peer))
-            return false;
+            success = false;
     }
 
-    if (emins_bytes > 0) {
+    if (success && emins_bytes > 0) {
         if (!copyArrayPeerAsync(dst_ptrs.d_emins, dst_ord,
                                 src_ptrs.d_emins, src_ord,
                                 emins_bytes, hip_stream, peer))
-            return false;
+            success = false;
     }
 
-    LOG_DEBUG("[GPUExpertTransfer] Transferred expert ROCm:" << src_ord
-              << " → ROCm:" << dst_ord
-              << " vnni=" << vnni_bytes << "B scales=" << scales_bytes << "B"
-              << " mins=" << mins_bytes << "B emins=" << emins_bytes << "B"
-              << (peer ? " (P2P)" : " (host-staged)"));
-    return true;
+    // Restore caller's original device context
+    if (original_device >= 0) {
+        hipSetDevice(original_device);
+    }
+
+    if (success) {
+        LOG_DEBUG("[GPUExpertTransfer] Transferred expert ROCm:" << src_ord
+                  << " → ROCm:" << dst_ord
+                  << " vnni=" << vnni_bytes << "B scales=" << scales_bytes << "B"
+                  << " mins=" << mins_bytes << "B emins=" << emins_bytes << "B"
+                  << (peer ? " (P2P)" : " (host-staged)"));
+    }
+    return success;
 }
 
 bool GPUExpertTransfer::canAccessPeer(int src_ordinal, int dst_ordinal)

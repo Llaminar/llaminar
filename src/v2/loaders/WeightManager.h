@@ -450,6 +450,17 @@ namespace llaminar2
         void forEachWeight(std::function<void(const std::string &, TensorBase *)> visitor) const;
 
         /**
+         * @brief Iterate ALL prepared tensors (cache_ + per_device_cache_)
+         *
+         * For PreparedWeightStore population in TP mode: iterates both the primary
+         * cache and per-device cache (which holds TP-sliced tensors). This ensures
+         * the store knows about every tensor pointer that stages will receive.
+         *
+         * @param visitor Callback receiving (canonical_name, raw_tensor_ptr)
+         */
+        void forEachPreparedWeight(std::function<void(const std::string &, TensorBase *)> visitor) const;
+
+        /**
          * @brief Set layer range for LAYER_PARTITIONED strategy
          *
          * For Pipeline Parallelism, restricts which layer weights are loaded.
@@ -682,6 +693,60 @@ namespace llaminar2
         static std::shared_ptr<TensorBase> sliceTailColumns(
             const std::shared_ptr<TensorBase> &full_tensor,
             float fraction);
+
+        // =========================================================================
+        // Phase 9: Weight Lifecycle Gates
+        // =========================================================================
+
+        /**
+         * @brief Get the current lifecycle gates (read-only)
+         */
+        const WeightLifecycleGates &lifecycleGates() const { return lifecycle_gates_; }
+
+        /**
+         * @brief Get the current lifecycle state (derived from gates)
+         */
+        WeightLifecycleState lifecycleState() const { return lifecycle_gates_.currentState(); }
+
+        /**
+         * @brief Mark source materialization complete
+         *
+         * Call after all source tensors and derived tensors (slices, clones,
+         * TP shards, expert views) are loaded and created. After this gate,
+         * no new tensors will be created from the model file.
+         */
+        void markMaterializationComplete()
+        {
+            lifecycle_gates_.materialization_complete = true;
+            LOG_DEBUG("[WeightManager] Lifecycle gate: materialization_complete");
+        }
+
+        /**
+         * @brief Mark device preparation complete
+         *
+         * Call after all GEMM weights are packed, all embeddings are prepared,
+         * and all GPU uploads are done. After this gate, no new prepared handles
+         * will be created for model weights.
+         */
+        void markDevicePreparationComplete()
+        {
+            lifecycle_gates_.device_preparation_complete = true;
+            LOG_DEBUG("[WeightManager] Lifecycle gate: device_preparation_complete");
+        }
+
+        /**
+         * @brief Mark graph materialization complete
+         *
+         * Call after all compute graphs have resolved their weight bindings.
+         * After this gate, graph replay will not attempt to resolve new weights.
+         */
+        void markGraphMaterializationComplete()
+        {
+            lifecycle_gates_.graph_materialization_complete = true;
+            lifecycle_gates_.host_release_allowed = lifecycle_gates_.canReleaseHostData();
+            LOG_DEBUG("[WeightManager] Lifecycle gate: graph_materialization_complete"
+                      << " (host_release_allowed=" << lifecycle_gates_.host_release_allowed << ")");
+        }
 
     private:
         /**
@@ -1068,6 +1133,12 @@ namespace llaminar2
         size_t num_gpu_packed_ = 0;
 
     private:
+        // =========================================================================
+        // Phase 9: Lifecycle gates (model-level state machine)
+        // =========================================================================
+
+        WeightLifecycleGates lifecycle_gates_;
+
         // =========================================================================
         // Phase 2: Per-weight/device readiness tickets and TP-safe reclaim eligibility
         // =========================================================================

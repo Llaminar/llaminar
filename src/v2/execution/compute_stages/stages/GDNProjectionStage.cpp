@@ -51,9 +51,19 @@ namespace llaminar2
                     return gemm;
                 }
             }
+
+            // Phase 10: Tensor-based store lookup
+            auto *gemm_from_store = params_.prepared_store->gemmKernelForTensor(B_base);
+            if (gemm_from_store)
+            {
+                cached = gemm_from_store;
+                return gemm_from_store;
+            }
+
+            // Store miss: fall through to KernelFactory
         }
 
-        // Fallback: KernelFactory
+        // No PreparedWeightStore (test/standalone context): direct KernelFactory
         auto *prepared = KernelFactory::getOrCreatePreparedGemmWeights(
             B_base, params_.device_id);
         auto *gemm = KernelFactory::getOrCreateGemmEngine(prepared);

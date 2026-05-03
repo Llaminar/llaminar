@@ -673,13 +673,14 @@ namespace llaminar2
         // Generic cache for CPU kernel state (e.g. packed VNNI weights)
         mutable std::any cache_;
 
-        // Set by KernelFactory when this tensor has been registered in
-        // prepared_gemm_registry_ (via getOrCreatePreparedGemmWeights or
-        // registerPreparedGemmFromTransfer).  The GPU pipeline uploads GEMM
-        // weights into a pooled VRAM allocation that is owned by the GEMM
-        // kernel — not by TensorBase::gpu_data_ptr_.  This flag lets the
-        // coherence and weight-release paths know the tensor is GPU-ready
-        // without checking dead legacy fields.
+        // Runtime hint: set by KernelFactory when this tensor's GEMM
+        // representation has been uploaded to pooled VRAM.  Used by
+        // StageCoherence, TransferEngine, and WeightManager to skip raw
+        // uploads and to determine host-release safety.
+        //
+        // NOTE (Phase 10): This flag has NO lifecycle implications.
+        // TensorBase destructor does NOT use it.  Cleanup of KernelFactory
+        // registries is the exclusive responsibility of PreparedWeightStore.
         mutable bool in_prepared_gemm_registry_ = false;
 
         // Synchronizes cache_ initialization and reset

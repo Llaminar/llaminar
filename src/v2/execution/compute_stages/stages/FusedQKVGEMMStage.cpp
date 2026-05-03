@@ -86,7 +86,7 @@ namespace llaminar2
         // Get or cache individual Q/K/V kernels (avoid KernelFactory mutex per token)
         if (!cache_resolved_individual_)
         {
-            // Phase 7: Try PreparedWeightStore first
+            // Phase 10: Try PreparedWeightStore (ref-based, then tensor-based)
             if (params_.prepared_store)
             {
                 if (params_.prepared_ref_q.has_value())
@@ -95,9 +95,17 @@ namespace llaminar2
                     cached_gemm_k_ = params_.prepared_store->gemmKernel(params_.prepared_ref_k.value());
                 if (params_.prepared_ref_v.has_value())
                     cached_gemm_v_ = params_.prepared_store->gemmKernel(params_.prepared_ref_v.value());
+
+                // Tensor-based fallback within the store
+                if (!cached_gemm_q_)
+                    cached_gemm_q_ = params_.prepared_store->gemmKernelForTensor(wq_base);
+                if (!cached_gemm_k_)
+                    cached_gemm_k_ = params_.prepared_store->gemmKernelForTensor(wk_base);
+                if (!cached_gemm_v_)
+                    cached_gemm_v_ = params_.prepared_store->gemmKernelForTensor(wv_base);
             }
 
-            // Fallback: KernelFactory for any unresolved kernels
+            // No PreparedWeightStore or store miss: direct KernelFactory
             if (!cached_gemm_q_)
             {
                 auto *prepared_q = llaminar::v2::kernels::KernelFactory::getOrCreatePreparedGemmWeights(wq_base, params_.device_id);

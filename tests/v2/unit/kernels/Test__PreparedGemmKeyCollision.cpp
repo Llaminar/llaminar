@@ -260,7 +260,10 @@ TEST_F(Test__PreparedGemmKeyCollision, PreparedGemm_TwoSlices_DistinctCacheEntri
 TEST_F(Test__PreparedGemmKeyCollision, PreparedGemm_TwoSlices_DistinctAfterRelease)
 {
     // This is the KEY REGRESSION TEST for the bug:
-    // After host data release, K and V must still get distinct cache entries.
+    // K and V with same shape must get distinct cache entries.
+    // Phase 10: post-release re-query via getOrCreatePreparedGemmWeights() is no
+    // longer supported (throws). Stages use PreparedWeightStore instead.
+    // The pre-release preparation must still produce distinct handles.
     auto k_inner = createQ4_0Tensor(64, 896);
     auto v_inner = createQ4_0Tensor(64, 896);
 
@@ -270,11 +273,13 @@ TEST_F(Test__PreparedGemmKeyCollision, PreparedGemm_TwoSlices_DistinctAfterRelea
     // Phase 1: Prepare GEMM weights (like packGemmWeights does before release)
     auto *k_handle = KernelFactory::getOrCreatePreparedGemmWeights(k_slice.get(), DeviceId::cpu());
     auto *v_handle = KernelFactory::getOrCreatePreparedGemmWeights(v_slice.get(), DeviceId::cpu());
-    ASSERT_NE(k_handle, v_handle);
+    ASSERT_NE(k_handle, v_handle)
+        << "REGRESSION: K and V must get distinct PreparedGemmHandles";
 
     auto *k_engine_before = KernelFactory::getOrCreateGemmEngine(k_handle);
     auto *v_engine_before = KernelFactory::getOrCreateGemmEngine(v_handle);
-    ASSERT_NE(k_engine_before, v_engine_before);
+    ASSERT_NE(k_engine_before, v_engine_before)
+        << "REGRESSION: K and V GEMM engines must be distinct";
 
     // Phase 2: Release host data (like releaseAllHostWeightData does)
     k_slice->release_raw_data();
@@ -282,31 +287,21 @@ TEST_F(Test__PreparedGemmKeyCollision, PreparedGemm_TwoSlices_DistinctAfterRelea
     ASSERT_EQ(k_slice->raw_data(), nullptr);
     ASSERT_EQ(v_slice->raw_data(), nullptr);
 
-    // Phase 3: Re-query (like FusedQKVGEMMStage does at inference time)
-    // With dual-key registration: fallback keys were pre-registered during Phase 1,
-    // so post-release lookups hit the cache and return the same handles.
-    auto *k_handle_after = KernelFactory::getOrCreatePreparedGemmWeights(k_slice.get(), DeviceId::cpu());
-    auto *v_handle_after = KernelFactory::getOrCreatePreparedGemmWeights(v_slice.get(), DeviceId::cpu());
+    // Phase 3: Post-release KernelFactory lookup still works via tensor-pointer
+    // fallback key. The dual-key registration ensures entries remain findable
+    // even after host data release (required for initializePreparedWeightStore).
+    auto *k_handle_post = KernelFactory::getOrCreatePreparedGemmWeights(k_slice.get(), DeviceId::cpu());
+    auto *v_handle_post = KernelFactory::getOrCreatePreparedGemmWeights(v_slice.get(), DeviceId::cpu());
+    EXPECT_EQ(k_handle_post, k_handle) << "Post-release lookup should return cached handle";
+    EXPECT_EQ(v_handle_post, v_handle) << "Post-release lookup should return cached handle";
+    EXPECT_NE(k_handle_post, v_handle_post) << "K and V must remain distinct after release";
 
-    ASSERT_NE(k_handle_after, nullptr);
-    ASSERT_NE(v_handle_after, nullptr);
-
-    // Handles should be the same objects as before release (cache hit on fallback key)
-    EXPECT_EQ(k_handle_after, k_handle)
-        << "Post-release lookup should return same handle via pre-registered fallback key";
-    EXPECT_EQ(v_handle_after, v_handle)
-        << "Post-release lookup should return same handle via pre-registered fallback key";
-
-    // CRITICAL: K and V must NEVER return the same handle
-    EXPECT_NE(k_handle_after, v_handle_after)
-        << "REGRESSION: K and V PreparedGemmHandles must be distinct even after "
-           "host data release (raw_data=nullptr). Before the fix, both K and V "
-           "hashed to {nullptr, 64, 896, cpu, 0} and V reused K's GEMM engine.";
-
-    auto *k_engine_after = KernelFactory::getOrCreateGemmEngine(k_handle_after);
-    auto *v_engine_after = KernelFactory::getOrCreateGemmEngine(v_handle_after);
-    EXPECT_NE(k_engine_after, v_engine_after)
-        << "REGRESSION: K and V GEMM engines must be distinct after host data release";
+    // The pre-registered handles remain valid for engine lookup
+    auto *k_engine_after = KernelFactory::getOrCreateGemmEngine(k_handle);
+    auto *v_engine_after = KernelFactory::getOrCreateGemmEngine(v_handle);
+    EXPECT_EQ(k_engine_after, k_engine_before) << "Handle should still resolve to same engine";
+    EXPECT_EQ(v_engine_after, v_engine_before) << "Handle should still resolve to same engine";
+    EXPECT_NE(k_engine_after, v_engine_after) << "K and V engines must remain distinct";
 }
 
 TEST_F(Test__PreparedGemmKeyCollision, PreparedGemm_SameTensorTwice_CacheHit)
@@ -319,10 +314,15 @@ TEST_F(Test__PreparedGemmKeyCollision, PreparedGemm_SameTensorTwice_CacheHit)
 
     EXPECT_EQ(handle1, handle2) << "Same tensor queried twice should return same handle (cache hit)";
 
-    // Also after release — fallback key was pre-registered, should cache-hit
+    // Phase 10: After release, KernelFactory lookup still works via tensor-pointer
+    // fallback key (dual-key registration preserves findability).
     slice->release_raw_data();
-    auto *handle3 = KernelFactory::getOrCreatePreparedGemmWeights(slice.get(), DeviceId::cpu());
-    EXPECT_EQ(handle1, handle3) << "After host release, fallback key should resolve to same handle";
+    auto *handle_post = KernelFactory::getOrCreatePreparedGemmWeights(slice.get(), DeviceId::cpu());
+    EXPECT_EQ(handle_post, handle1) << "Post-release lookup should return cached handle";
+
+    // Handle obtained pre-release still works for engine lookup
+    auto *engine = KernelFactory::getOrCreateGemmEngine(handle1);
+    EXPECT_NE(engine, nullptr) << "Pre-release handle should still resolve to engine";
 }
 
 TEST_F(Test__PreparedGemmKeyCollision, PreparedGemm_DifferentShapes_AlwaysDistinct)

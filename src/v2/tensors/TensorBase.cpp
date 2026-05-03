@@ -16,7 +16,6 @@
 #include "../backends/BackendManager.h"
 #include "../backends/ComputeBackend.h"
 #include "../backends/DeviceId.h"
-#include "../kernels/KernelFactory.h"
 #include "../collective/BackendRouter.h"
 #include "../execution/local_execution/graph/GraphCaptureGuard.h"
 #include "../transfer/TransferEngine.h"
@@ -198,14 +197,14 @@ namespace llaminar2
         // Unpin host memory if pinned (after freeing GPU memory)
         unpinHostMemory();
 
-        // Clear kernel cache — but skip for temporary tensors that never had
-        // cached state. This avoids a global mutex + cache scan on every
-        // temporary tensor destruction (e.g., Q16_1 scratch in KV cache append).
-        if (in_prepared_gemm_registry_
-            || cache_.has_value()
-        )
+        // Phase 10: TensorBase destructor NEVER touches global KernelFactory state.
+        // Cleanup of KernelFactory registries is the exclusive responsibility of
+        // PreparedWeightStore::releaseAllPreparedState() (called during orchestrator
+        // shutdown). Only clear local packed-weights cache here.
+        if (cache_.has_value())
         {
-            llaminar::v2::kernels::KernelFactory::clearCacheFor(this);
+            std::lock_guard<std::mutex> lock(packed_cache_mutex_);
+            cache_.reset();
         }
     }
 

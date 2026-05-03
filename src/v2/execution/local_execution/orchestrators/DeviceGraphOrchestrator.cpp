@@ -2314,13 +2314,20 @@ namespace llaminar2
             }
         };
 
-        // Iterate weight manager cache and register prepared GEMM weights
-        weight_manager_->forEachWeight([&](const std::string& name, TensorBase* tensor) {
+        // Iterate ALL weight tensors (including TP-sliced) and register prepared GEMM weights
+        weight_manager_->forEachPreparedWeight([&](const std::string& name, TensorBase* tensor) {
             register_if_prepared(name, tensor);
         });
 
         LOG_INFO("[DGO] Prepared weight store initialized with "
                  << registered << " entries for device " << device.toString());
+
+        // Phase 10: Wire prepared weight store to graph builder so stages
+        // can resolve kernels through the store instead of KernelFactory fallbacks.
+        if (graph_builder_)
+        {
+            graph_builder_->setPreparedWeightStore(prepared_weight_store_.get());
+        }
     }
 
     void DeviceGraphOrchestrator::applyExpertMasks(

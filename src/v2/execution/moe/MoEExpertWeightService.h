@@ -15,6 +15,7 @@
 #include "ExpertWeightTransfer.h"    // ExpertWeightBlobs
 #include "MoERebalanceController.h"  // ExpertReplicaSet
 #include "../../backends/DeviceId.h"
+#include "../../loaders/ExpertSlabTypes.h"
 
 #include <memory>
 #include <unordered_map>
@@ -25,6 +26,7 @@ namespace llaminar2 {
 class TensorBase;
 class ITensorGemm;
 class ExpertWeightPayloadProvider;
+class PreparedWeightStore;
 
 /// Lightweight reference struct pointing to the MoEExpertComputeStage::Params fields
 /// that the weight service operates on. Avoids coupling the service to the
@@ -63,6 +65,16 @@ struct MoEWeightContext {
     // Payload provider for lazy GPU expert preparation (model-context owned).
     // When non-null, used instead of raw GGUF host data for GPU repack.
     ExpertWeightPayloadProvider* payload_provider = nullptr;
+
+    // Phase B: dual-path registration target. When non-null, engines are
+    // registered in BOTH KernelFactory AND this PreparedWeightStore.
+    PreparedWeightStore* prepared_store = nullptr;
+
+    // Phase C: Cached slab refs (set by prepareGemmEngines, reused by rebalance).
+    // Optional because they're only populated when prepared_store is non-null.
+    std::optional<ExpertSlabRef> gate_slab_ref;
+    std::optional<ExpertSlabRef> up_slab_ref;
+    std::optional<ExpertSlabRef> down_slab_ref;
 };
 
 /// Weight lifecycle service for MoE expert GEMM engines.

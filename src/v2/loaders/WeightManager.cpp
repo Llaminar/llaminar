@@ -1462,6 +1462,27 @@ namespace llaminar2
         }
     }
 
+    void WeightManager::forEachPreparedWeight(std::function<void(const std::string &, TensorBase *)> visitor) const
+    {
+        std::lock_guard<std::mutex> lock(cache_mutex_);
+        // Primary cache (original tensors, used in single-device mode)
+        for (const auto &[name, tensor] : cache_)
+        {
+            if (tensor)
+                visitor(name, tensor.get());
+        }
+        // Per-device cache (TP-sliced tensors, used in LOCAL TP mode)
+        // Keys are "device:name", extract the weight name after the first ':'
+        for (const auto &[cache_key, tensor] : per_device_cache_)
+        {
+            if (!tensor) continue;
+            auto colon_pos = cache_key.find(':');
+            if (colon_pos == std::string::npos) continue;
+            std::string name = cache_key.substr(colon_pos + 1);
+            visitor(name, tensor.get());
+        }
+    }
+
     FrozenModelWeightSet WeightManager::materialize(const WeightPlan &plan)
     {
         ModelWeightSetBuilder builder(plan.strategy());
@@ -2670,8 +2691,20 @@ namespace llaminar2
         const bool is_gpu = device.is_gpu();
         const char *device_name = device.is_rocm() ? "ROCm" : (device.is_cuda() ? "CUDA" : "CPU");
 
+        // Phase 9: Mark materialization complete before preparation
+        if (!lifecycle_gates_.materialization_complete)
+        {
+            markMaterializationComplete();
+        }
+
         // Phase 1: Prepare (pack + upload, no release)
         bool ok = prepareWeightsForDevice(device);
+
+        // Phase 9: Mark device preparation complete after packing/upload
+        if (ok && !lifecycle_gates_.device_preparation_complete)
+        {
+            markDevicePreparationComplete();
+        }
 
         // Phase 2: Release host copies (only for GPU, since CPU reads from host)
         if (is_gpu && ok)
@@ -3691,6 +3724,23 @@ namespace llaminar2
 
     size_t WeightManager::releaseAllHostWeightData()
     {
+        // Phase 9: Check lifecycle gate before releasing host data.
+        // If graph materialization is not complete, host release may corrupt
+        // lazy graph building (MoE expert packing, deferred weight resolution).
+        if (!lifecycle_gates_.canReleaseHostData())
+        {
+            LOG_WARN("[WeightManager] releaseAllHostWeightData() called before all lifecycle "
+                     "gates are complete (state=" << toString(lifecycle_gates_.currentState())
+                     << "). Proceeding with release (compatibility mode). "
+                     "Set lifecycle gates for deterministic behavior.");
+        }
+
+        // Mark host_release_allowed if all gates are complete
+        if (lifecycle_gates_.canReleaseHostData())
+        {
+            lifecycle_gates_.host_release_allowed = true;
+        }
+
         std::lock_guard<std::mutex> lock(cache_mutex_);
 
         size_t released_count = 0;

@@ -155,6 +155,11 @@ namespace llaminar2
          */
         void setArena(BufferArena *arena) override;
 
+        void setPreparedWeightStore(PreparedWeightStore *store) override
+        {
+            prepared_weight_store_ = store;
+        }
+
         BufferArena *arena() const { return arena_; }
         const ModelBuffers &buffers() const override;
 
@@ -263,6 +268,7 @@ namespace llaminar2
         std::shared_ptr<IMPIContext> mpi_ctx_;
         TensorFactory *tensor_factory_ = nullptr;
         BufferArena *arena_ = nullptr;
+        PreparedWeightStore *prepared_weight_store_ = nullptr;
         ModelWeights weights_;
         ModelBuffers buffers_;
         StageSnapshotCallback snapshot_callback_;

@@ -357,6 +357,7 @@ namespace llaminar2
         // =====================================================================
         GDNProjectionStage::Params proj_params;
         proj_params.device_id = device;
+        proj_params.prepared_store = prepared_weight_store_;
         proj_params.input = buffers.normalized;
         proj_params.m = total_tokens;
         proj_params.k = d_model;
@@ -610,6 +611,7 @@ namespace llaminar2
                               .output_q_buffer_id = BufferId::FA_Q_RAW,
                               .output_k_buffer_id = BufferId::K_PROJ,
                               .output_v_buffer_id = BufferId::V_PROJ,
+                              .prepared_store = prepared_weight_store_,
                           }),
                           device);
             graph.addDependency(prefix + "qkv_proj", prefix + "attn_norm");

@@ -66,14 +66,20 @@ namespace llaminar2
                                                                     << " lm_head_weight=" << (void *)lm_head_weight
                                                                     << " shape=" << lm_head_weight->shape()[0] << "x" << lm_head_weight->shape()[1]);
 
-        // Phase 7: Try PreparedWeightStore first
+        // Phase 10: Resolve GEMM kernel through PreparedWeightStore.
+        // Order: prepared_ref → tensor-based store lookup → KernelFactory fallback.
         ITensorGemm *lm_gemm = nullptr;
         if (params_.prepared_ref.has_value() && params_.prepared_store)
         {
             lm_gemm = params_.prepared_store->gemmKernel(params_.prepared_ref.value());
         }
+        if (!lm_gemm && params_.prepared_store)
+        {
+            lm_gemm = params_.prepared_store->gemmKernelForTensor(lm_head_weight);
+        }
         if (!lm_gemm)
         {
+            // Store miss or no store: direct KernelFactory (always available)
             auto *prepared = llaminar::v2::kernels::KernelFactory::getOrCreatePreparedGemmWeights(lm_head_weight, params_.device_id);
             lm_gemm = llaminar::v2::kernels::KernelFactory::getOrCreateGemmEngine(prepared);
         }

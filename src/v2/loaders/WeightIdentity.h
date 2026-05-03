@@ -110,6 +110,101 @@ namespace llaminar2
         bool raw_device_data_valid = false;
     };
 
+    // =========================================================================
+    // Phase 9: Model-level weight lifecycle state machine
+    // =========================================================================
+
+    /**
+     * @brief Global lifecycle state for all model weights within a context
+     *
+     * Represents the progression of model weights from loading through to
+     * frozen execution state. Transitions are one-directional (monotonically
+     * increasing). The state applies to the model context as a whole, not to
+     * individual weights (individual per-weight readiness uses WeightPrepState).
+     *
+     * State transitions:
+     *   Planned → SourceLoaded → DerivedMaterialized → DevicePrepared
+     *            → GraphMaterialized → Frozen → HostReleased
+     *
+     * Each state implies all previous states are complete. For example,
+     * DevicePrepared means all sources are loaded and all derived tensors
+     * (slices, clones, TP shards) are materialized.
+     */
+    enum class WeightLifecycleState
+    {
+        /// Weights planned but not yet loaded from source (GGUF)
+        Planned = 0,
+
+        /// All source tensors loaded from model file into host memory
+        SourceLoaded,
+
+        /// All derived tensors (TP slices, PP layers, expert views, clones) materialized
+        DerivedMaterialized,
+
+        /// All GEMM/embedding weights prepared for their target devices
+        /// (CPU packed, CUDA/ROCm uploaded, prepared handles created)
+        DevicePrepared,
+
+        /// Graph construction complete — all weight bindings resolved and stages
+        /// hold frozen references to prepared weights
+        GraphMaterialized,
+
+        /// Weight state is frozen — no further mutations, graph replay is safe.
+        /// Host data may still be present for CPU execution or future host access.
+        Frozen,
+
+        /// Host raw data released — only prepared device state remains.
+        /// Cannot create new prepared handles or access raw weight data after this point.
+        HostReleased,
+    };
+
+    /**
+     * @brief Completion gates for weight lifecycle transitions (Phase 9)
+     *
+     * Each gate is a boolean flag set exactly once when the corresponding
+     * lifecycle phase completes. Gates are monotonic — once set, never cleared.
+     * They provide deterministic ordering for host release and freeze semantics,
+     * replacing ad hoc timing comments and convention-based ordering.
+     */
+    struct WeightLifecycleGates
+    {
+        /// All source tensors loaded from GGUF file
+        bool materialization_complete = false;
+
+        /// All device-specific preparation done (GEMM packing, embedding prep, GPU upload)
+        bool device_preparation_complete = false;
+
+        /// All graph builders have resolved their weight bindings
+        bool graph_materialization_complete = false;
+
+        /// Host data release is allowed (all gates above must be true)
+        bool host_release_allowed = false;
+
+        /// Current lifecycle state (derived from gates)
+        WeightLifecycleState currentState() const
+        {
+            if (host_release_allowed)
+                return WeightLifecycleState::HostReleased;
+            if (graph_materialization_complete)
+                return WeightLifecycleState::Frozen;
+            if (device_preparation_complete)
+                return WeightLifecycleState::DevicePrepared;
+            if (materialization_complete)
+                return WeightLifecycleState::DerivedMaterialized;
+            return WeightLifecycleState::Planned;
+        }
+
+        /// Check if host release is safe (all prerequisites met)
+        bool canReleaseHostData() const
+        {
+            return materialization_complete &&
+                   device_preparation_complete &&
+                   graph_materialization_complete;
+        }
+    };
+
+    const char *toString(WeightLifecycleState state);
+
     std::string toString(WeightRole role);
     std::string toString(WeightDerivationKind derivation);
     std::string toString(WeightHostPolicy policy);

@@ -22,6 +22,7 @@
 #include "../../utils/DebugEnv.h"
 #include "../../utils/Logger.h"
 #include "../../utils/OpenMPUtils.h"
+#include "../../loaders/PreparedWeightStore.h"
 
 #ifdef HAVE_CUDA
 #include "../../kernels/cuda/gemm/CUDAWeightPacker.h"
@@ -355,9 +356,14 @@ bool MoEExpertWeightService::prepareGemmEngines(MoEWeightContext& ctx)
 
     // CPU path: parallelize expert GEMM engine preparation.
     // Each expert has unique tensors (unique raw_data() keys), so no cache
-    // key collisions.  The heavy VNNI interleave runs lock-free; only the
-    // KernelFactory registry insert takes a brief mutex.
+    // key collisions.  The heavy VNNI interleave runs lock-free.
+    // Phase D: prepareExpertGemmLocal returns shared_ptr without global registry.
     std::atomic<bool> error_flag{false};
+
+    // Per-expert engine storage for parallel assignment (avoids push_back race)
+    std::vector<std::shared_ptr<ITensorGemm>> local_gate_engines(prep_count);
+    std::vector<std::shared_ptr<ITensorGemm>> local_up_engines(prep_count);
+    std::vector<std::shared_ptr<ITensorGemm>> local_down_engines(prep_count);
 
     #pragma omp parallel for schedule(static)
     for (int idx = 0; idx < prep_count; ++idx)
@@ -372,29 +378,42 @@ bool MoEExpertWeightService::prepareGemmEngines(MoEWeightContext& ctx)
             continue;
         }
 
-        auto *gp = KernelFactory::getOrCreatePreparedGemmWeights(
+        auto gate_engine = KernelFactory::prepareExpertGemmLocal(
             ctx.expert_gate_views[e].get(), ctx.device_id);
-        auto *up = KernelFactory::getOrCreatePreparedGemmWeights(
+        auto up_engine = KernelFactory::prepareExpertGemmLocal(
             ctx.expert_up_views[e].get(), ctx.device_id);
-        auto *dp = KernelFactory::getOrCreatePreparedGemmWeights(
+        auto down_engine = KernelFactory::prepareExpertGemmLocal(
             ctx.expert_down_views[e].get(), ctx.device_id);
 
-        if (!gp || !up || !dp)
+        if (!gate_engine || !up_engine || !down_engine)
         {
             LOG_ERROR("[MoEWeightService] Failed to prepare GEMM weights for expert " << e);
             error_flag.store(true, std::memory_order_relaxed);
             continue;
         }
 
-        ctx.prepared_gate_gemm[e] = KernelFactory::getOrCreateGemmEngine(gp);
-        ctx.prepared_up_gemm[e] = KernelFactory::getOrCreateGemmEngine(up);
-        ctx.prepared_down_gemm[e] = KernelFactory::getOrCreateGemmEngine(dp);
+        ctx.prepared_gate_gemm[e] = gate_engine.get();
+        ctx.prepared_up_gemm[e] = up_engine.get();
+        ctx.prepared_down_gemm[e] = down_engine.get();
 
-        if (!ctx.prepared_gate_gemm[e] || !ctx.prepared_up_gemm[e] || !ctx.prepared_down_gemm[e])
+        // Store in per-index slot (no contention — each idx is unique)
+        local_gate_engines[idx] = std::move(gate_engine);
+        local_up_engines[idx] = std::move(up_engine);
+        local_down_engines[idx] = std::move(down_engine);
+    }
+
+    // Transfer engine lifetimes to ctx after parallel region (single-threaded)
+    if (!error_flag.load())
+    {
+        ctx.moe_owned_kernels.reserve(ctx.moe_owned_kernels.size() + prep_count * 3);
+        for (int idx = 0; idx < prep_count; ++idx)
         {
-            LOG_ERROR("[MoEWeightService] Failed to create GEMM engine for expert " << e);
-            error_flag.store(true, std::memory_order_relaxed);
-            continue;
+            if (local_gate_engines[idx])
+                ctx.moe_owned_kernels.push_back(std::move(local_gate_engines[idx]));
+            if (local_up_engines[idx])
+                ctx.moe_owned_kernels.push_back(std::move(local_up_engines[idx]));
+            if (local_down_engines[idx])
+                ctx.moe_owned_kernels.push_back(std::move(local_down_engines[idx]));
         }
     }
 
@@ -404,6 +423,70 @@ bool MoEExpertWeightService::prepareGemmEngines(MoEWeightContext& ctx)
     }
 
     LOG_DEBUG("[MoEWeightService] All " << (prep_count * 3) << " expert GEMM engines prepared (CPU/KernelFactory path)");
+
+    // ── Phase B: Dual-path registration into PreparedWeightStore ─────────
+    if (ctx.prepared_store)
+    {
+        // Register three slabs (gate, up, down) for this layer.
+        // Use the 3D parent tensor identity for source_identity when available.
+        auto register_slab = [&](WeightRole role, const std::vector<ITensorGemm*>& engines,
+                                 const std::vector<std::shared_ptr<TensorBase>>& views,
+                                 TensorBase* parent_3d) -> ExpertSlabRef
+        {
+            ExpertSlabDescriptor desc;
+            desc.layer_idx = ctx.layer_idx;
+            desc.role = role;
+            desc.device = ctx.device_id;
+            desc.num_experts = ctx.num_experts;
+            desc.local_expert_start = ctx.local_expert_start;
+            desc.local_expert_count = (ctx.local_expert_count < 0) ? ctx.num_experts : ctx.local_expert_count;
+            desc.rows_per_expert = ctx.expert_intermediate;
+            desc.cols_per_expert = ctx.d_model;
+            // source_identity left default — TensorBase doesn't expose WeightIdentity.
+            // Phase C will wire this through WeightManager lookup.
+            (void)parent_3d;
+
+            auto slab_ref = ctx.prepared_store->registerExpertSlab(desc);
+
+            // Build arrivals for all prepared experts
+            std::vector<ExpertArrival> arrivals;
+            arrivals.reserve(experts_to_prep.size());
+            for (int e : experts_to_prep)
+            {
+                if (!engines[e]) continue;
+                ExpertArrival arrival;
+                arrival.expert_id = e;
+                arrival.engine = engines[e];
+                // Find engine_lifetime from moe_owned_kernels
+                for (const auto& owned : ctx.moe_owned_kernels)
+                {
+                    if (owned.get() == engines[e])
+                    {
+                        arrival.engine_lifetime = owned;
+                        break;
+                    }
+                }
+                arrival.view_lifetime = (e < static_cast<int>(views.size())) ? views[e] : nullptr;
+                arrival.derivation = WeightDerivationKind::ExpertSlice;
+                arrivals.push_back(std::move(arrival));
+            }
+
+            ctx.prepared_store->registerArrivedExperts(slab_ref, arrivals);
+            return slab_ref;
+        };
+
+        ctx.gate_slab_ref = register_slab(WeightRole::MoEExpertGate, ctx.prepared_gate_gemm,
+                                          ctx.expert_gate_views, ctx.gate_exps);
+        ctx.up_slab_ref = register_slab(WeightRole::MoEExpertUp, ctx.prepared_up_gemm,
+                                        ctx.expert_up_views, ctx.up_exps);
+        ctx.down_slab_ref = register_slab(WeightRole::MoEExpertDown, ctx.prepared_down_gemm,
+                                          ctx.expert_down_views, ctx.down_exps);
+
+        LOG_DEBUG("[MoEWeightService] Phase B: Registered " << (prep_count * 3)
+                  << " expert engines in PreparedWeightStore ("
+                  << ctx.prepared_store->expertSlabCount() << " slabs total, "
+                  << ctx.prepared_store->totalPopulatedExperts() << " populated experts)");
+    }
 
     // NUMA audit: verify packed weights landed on the correct NUMA node.
     auditExpertNUMA(experts_to_prep, ctx.prepared_gate_gemm,
@@ -579,9 +662,12 @@ std::vector<const TensorBase*> MoEExpertWeightService::releaseDepartedExperts(
     MoEWeightContext& ctx, const std::vector<bool>& new_mask)
 {
     std::vector<const TensorBase*> evict_tensors;
+    std::vector<int> departed_ids;
 
     for (int e = 0; e < ctx.num_experts; ++e) {
         if (!new_mask[e] && ctx.prepared_gate_gemm[e]) {
+            departed_ids.push_back(e);
+
             // Release packed weights from GEMM engines
             ctx.prepared_gate_gemm[e]->releaseWeights();
             ctx.prepared_up_gemm[e]->releaseWeights();
@@ -601,6 +687,21 @@ std::vector<const TensorBase*> MoEExpertWeightService::releaseDepartedExperts(
             ctx.prepared_down_gemm[e] = nullptr;
         }
     }
+
+    // Phase C: Notify PreparedWeightStore of departed experts
+    if (ctx.prepared_store && !departed_ids.empty())
+    {
+        if (ctx.gate_slab_ref.has_value())
+            ctx.prepared_store->releaseDepartedExperts(*ctx.gate_slab_ref, departed_ids);
+        if (ctx.up_slab_ref.has_value())
+            ctx.prepared_store->releaseDepartedExperts(*ctx.up_slab_ref, departed_ids);
+        if (ctx.down_slab_ref.has_value())
+            ctx.prepared_store->releaseDepartedExperts(*ctx.down_slab_ref, departed_ids);
+
+        LOG_DEBUG("[MoEWeightService] Phase C: Released " << departed_ids.size()
+                  << " departed experts from PreparedWeightStore");
+    }
+
     return evict_tensors;
 }
 
@@ -631,19 +732,8 @@ bool MoEExpertWeightService::registerAndPrepareNewExperts(
     std::atomic<bool> error_flag{false};
     const int count = static_cast<int>(new_experts.size());
 
-    // Register transferred weights (single-threaded, fast deserialization)
-    if (received_weights) {
-        for (int idx = 0; idx < count; ++idx) {
-            const int e = new_experts[idx];
-            auto it = received_weights->find(e);
-            if (it != received_weights->end() && !it->second.empty()) {
-                if (registerTransferredExpert(ctx, e, it->second))
-                    ++transferred_count;
-            }
-        }
-    }
-
-    // Prepare engines (cache hit for transferred, full pack for rest)
+    // Prepare engines: use transferred blobs directly (fast deserialization, no repack),
+    // or fall back to prepareExpertGemmLocal (full VNNI repack from raw tensor data).
     for (int idx = 0; idx < count; ++idx) {
         if (error_flag.load(std::memory_order_relaxed)) break;
         const int e = new_experts[idx];
@@ -655,29 +745,60 @@ bool MoEExpertWeightService::registerAndPrepareNewExperts(
             continue;
         }
 
-        auto *gp = KernelFactory::getOrCreatePreparedGemmWeights(
-            ctx.expert_gate_views[e].get(), ctx.device_id);
-        auto *up = KernelFactory::getOrCreatePreparedGemmWeights(
-            ctx.expert_up_views[e].get(), ctx.device_id);
-        auto *dp = KernelFactory::getOrCreatePreparedGemmWeights(
-            ctx.expert_down_views[e].get(), ctx.device_id);
+        std::shared_ptr<ITensorGemm> gate_engine, up_engine, down_engine;
 
-        if (!gp || !up || !dp) {
+        // Fast path: create kernels directly from pre-packed transferred blobs
+        const ExpertWeightBlobs* blobs = nullptr;
+        if (received_weights) {
+            auto it = received_weights->find(e);
+            if (it != received_weights->end() && !it->second.empty())
+                blobs = &it->second;
+        }
+
+        if (blobs) {
+            gate_engine = KernelFactory::createExpertGemmFromTransferBlob(blobs->gate);
+            up_engine   = KernelFactory::createExpertGemmFromTransferBlob(blobs->up);
+            down_engine = KernelFactory::createExpertGemmFromTransferBlob(blobs->down);
+
+            if (gate_engine && up_engine && down_engine) {
+                ++transferred_count;
+            } else {
+                // Fallback to full repack if any blob deserialization failed
+                LOG_WARN("[MoEWeightService] Blob deserialization failed for expert " << e
+                         << ", falling back to full repack");
+                gate_engine.reset();
+                up_engine.reset();
+                down_engine.reset();
+            }
+        }
+
+        // Slow path: full VNNI repack from raw tensor data
+        if (!gate_engine) {
+            gate_engine = KernelFactory::prepareExpertGemmLocal(
+                ctx.expert_gate_views[e].get(), ctx.device_id);
+        }
+        if (!up_engine) {
+            up_engine = KernelFactory::prepareExpertGemmLocal(
+                ctx.expert_up_views[e].get(), ctx.device_id);
+        }
+        if (!down_engine) {
+            down_engine = KernelFactory::prepareExpertGemmLocal(
+                ctx.expert_down_views[e].get(), ctx.device_id);
+        }
+
+        if (!gate_engine || !up_engine || !down_engine) {
             LOG_ERROR("[MoEWeightService] Failed GEMM weights for new expert " << e);
             error_flag.store(true, std::memory_order_relaxed);
             continue;
         }
 
-        ctx.prepared_gate_gemm[e] = KernelFactory::getOrCreateGemmEngine(gp);
-        ctx.prepared_up_gemm[e] = KernelFactory::getOrCreateGemmEngine(up);
-        ctx.prepared_down_gemm[e] = KernelFactory::getOrCreateGemmEngine(dp);
+        ctx.prepared_gate_gemm[e] = gate_engine.get();
+        ctx.prepared_up_gemm[e] = up_engine.get();
+        ctx.prepared_down_gemm[e] = down_engine.get();
 
-        if (!ctx.prepared_gate_gemm[e] || !ctx.prepared_up_gemm[e] ||
-            !ctx.prepared_down_gemm[e]) {
-            LOG_ERROR("[MoEWeightService] Failed GEMM engine for new expert " << e);
-            error_flag.store(true, std::memory_order_relaxed);
-            continue;
-        }
+        ctx.moe_owned_kernels.push_back(std::move(gate_engine));
+        ctx.moe_owned_kernels.push_back(std::move(up_engine));
+        ctx.moe_owned_kernels.push_back(std::move(down_engine));
     }
 
     if (error_flag.load()) return false;
@@ -698,6 +819,50 @@ bool MoEExpertWeightService::registerAndPrepareNewExperts(
     auditExpertNUMA(new_experts, ctx.prepared_gate_gemm,
                     (transferred_count > 0 ? "rebalance_transferred" : "rebalance_repacked"),
                     ctx.layer_idx);
+
+    // Phase C: Register new arrivals in PreparedWeightStore using cached slab refs
+    if (ctx.prepared_store && !new_experts.empty())
+    {
+        auto register_rebalance_arrivals = [&](const std::optional<ExpertSlabRef>& slab_ref,
+                                               const std::vector<ITensorGemm*>& engines,
+                                               const std::vector<std::shared_ptr<TensorBase>>& views)
+        {
+            if (!slab_ref.has_value()) return;
+
+            std::vector<ExpertArrival> arrivals;
+            for (int e : new_experts)
+            {
+                if (e < 0 || e >= static_cast<int>(engines.size()) || !engines[e]) continue;
+                ExpertArrival arrival;
+                arrival.expert_id = e;
+                arrival.engine = engines[e];
+                // Find engine_lifetime from moe_owned_kernels
+                for (const auto& owned : ctx.moe_owned_kernels)
+                {
+                    if (owned.get() == engines[e])
+                    {
+                        arrival.engine_lifetime = owned;
+                        break;
+                    }
+                }
+                arrival.view_lifetime = (e < static_cast<int>(views.size())) ? views[e] : nullptr;
+                arrival.derivation = WeightDerivationKind::RebalancedExpertReplica;
+                arrivals.push_back(std::move(arrival));
+            }
+
+            if (!arrivals.empty())
+                ctx.prepared_store->registerArrivedExperts(*slab_ref, arrivals);
+        };
+
+        register_rebalance_arrivals(ctx.gate_slab_ref, ctx.prepared_gate_gemm, ctx.expert_gate_views);
+        register_rebalance_arrivals(ctx.up_slab_ref, ctx.prepared_up_gemm, ctx.expert_up_views);
+        register_rebalance_arrivals(ctx.down_slab_ref, ctx.prepared_down_gemm, ctx.expert_down_views);
+
+        LOG_DEBUG("[MoEWeightService] Phase C rebalance: Registered "
+                  << new_experts.size() * 3 << " new expert engines in PreparedWeightStore"
+                  << " (using cached slab refs)");
+    }
+
     return true;
 }
 
@@ -1112,6 +1277,46 @@ bool MoEExpertWeightService::registerAndPrepareNewExpertsGPU(
              << " (layer " << ctx.layer_idx << ", "
              << ctx.device_id.to_string() << ")");
 
+    // Phase C: Register GPU rebalanced experts in PreparedWeightStore
+    if (ctx.prepared_store)
+    {
+        auto register_gpu_rebalance = [&](const std::optional<ExpertSlabRef>& slab_ref,
+                                          const std::vector<ITensorGemm*>& engines)
+        {
+            if (!slab_ref.has_value()) return;
+
+            std::vector<ExpertArrival> arrivals;
+            for (int e : experts_to_load)
+            {
+                if (!engines[e]) continue;
+                ExpertArrival arrival;
+                arrival.expert_id = e;
+                arrival.engine = engines[e];
+                // Find shared_ptr lifetime
+                for (const auto& owned : ctx.moe_owned_kernels)
+                {
+                    if (owned.get() == engines[e])
+                    {
+                        arrival.engine_lifetime = owned;
+                        break;
+                    }
+                }
+                arrival.derivation = WeightDerivationKind::RebalancedExpertReplica;
+                arrivals.push_back(std::move(arrival));
+            }
+
+            if (!arrivals.empty())
+                ctx.prepared_store->registerArrivedExperts(*slab_ref, arrivals);
+        };
+
+        register_gpu_rebalance(ctx.gate_slab_ref, ctx.prepared_gate_gemm);
+        register_gpu_rebalance(ctx.up_slab_ref, ctx.prepared_up_gemm);
+        register_gpu_rebalance(ctx.down_slab_ref, ctx.prepared_down_gemm);
+
+        LOG_DEBUG("[MoEWeightService::GPU-rebalance] Phase C: Registered "
+                  << (count * 3) << " rebalanced expert engines in PreparedWeightStore");
+    }
+
     return true;
 }
 
@@ -1382,6 +1587,59 @@ bool MoEExpertWeightService::prepareGemmEnginesGPU(MoEWeightContext& ctx)
             released += MmapRegion::adviseDontneedRange(ctx.down_exps->raw_data(), ctx.down_exps->size_bytes());
         if (released > 0)
             LOG_DEBUG("[MoEWeightService] Advised " << (released >> 20) << " MB of mmap pages DONTNEED after GPU repack");
+    }
+
+    // ── Phase C: Register GPU expert engines in PreparedWeightStore ──────
+    if (ctx.prepared_store)
+    {
+        auto register_gpu_slab = [&](WeightRole role,
+                                     const std::vector<ITensorGemm*>& engines) -> ExpertSlabRef
+        {
+            ExpertSlabDescriptor desc;
+            desc.layer_idx = ctx.layer_idx;
+            desc.role = role;
+            desc.device = ctx.device_id;
+            desc.num_experts = ctx.num_experts;
+            desc.local_expert_start = ctx.local_expert_start;
+            desc.local_expert_count = (ctx.local_expert_count < 0) ? ctx.num_experts : ctx.local_expert_count;
+            desc.rows_per_expert = ctx.expert_intermediate;
+            desc.cols_per_expert = ctx.d_model;
+
+            auto slab_ref = ctx.prepared_store->registerExpertSlab(desc);
+
+            std::vector<ExpertArrival> arrivals;
+            arrivals.reserve(local_experts.size());
+            for (int e : local_experts)
+            {
+                if (!engines[e]) continue;
+                ExpertArrival arrival;
+                arrival.expert_id = e;
+                arrival.engine = engines[e];
+                // Find the shared_ptr lifetime in moe_owned_kernels
+                for (const auto& owned : ctx.moe_owned_kernels)
+                {
+                    if (owned.get() == engines[e])
+                    {
+                        arrival.engine_lifetime = owned;
+                        break;
+                    }
+                }
+                arrival.derivation = WeightDerivationKind::ExpertSlice;
+                arrivals.push_back(std::move(arrival));
+            }
+
+            ctx.prepared_store->registerArrivedExperts(slab_ref, arrivals);
+            return slab_ref;
+        };
+
+        ctx.gate_slab_ref = register_gpu_slab(WeightRole::MoEExpertGate, ctx.prepared_gate_gemm);
+        ctx.up_slab_ref = register_gpu_slab(WeightRole::MoEExpertUp, ctx.prepared_up_gemm);
+        ctx.down_slab_ref = register_gpu_slab(WeightRole::MoEExpertDown, ctx.prepared_down_gemm);
+
+        LOG_DEBUG("[MoEWeightService::GPU] Phase C: Registered " << (local_count * 3)
+                  << " GPU expert engines in PreparedWeightStore ("
+                  << ctx.prepared_store->expertSlabCount() << " slabs, "
+                  << ctx.prepared_store->totalPopulatedExperts() << " populated)");
     }
 
     return true;

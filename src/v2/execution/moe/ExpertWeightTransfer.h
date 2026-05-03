@@ -20,6 +20,7 @@
 
 #include <mpi.h>
 #include <chrono>
+#include <climits>
 #include <functional>
 #include <memory>
 #include <unordered_map>
@@ -262,6 +263,13 @@ public:
                 for (int proj = 0; proj < 3; ++proj)
                 {
                     if (entry.sizes[proj] == 0) continue;
+                    if (entry.sizes[proj] > static_cast<uint64_t>(INT_MAX))
+                    {
+                        LOG_ERROR("[ExpertWeightTransfer] Expert " << entry.expert_id
+                                  << " layer " << entry.layer << " proj " << proj
+                                  << " exceeds MPI int limit: " << entry.sizes[proj] << " bytes");
+                        return {};
+                    }
                     int tag = mpi_tags::weightTransferDataTag(entry.layer, entry.expert_id, proj);
                     MPI_Request req;
                     int rc = MPI_Irecv(
@@ -291,6 +299,13 @@ public:
                     for (int proj = 0; proj < 3; ++proj)
                     {
                         if (proj_data[proj]->empty()) continue;
+                        if (proj_data[proj]->size() > static_cast<size_t>(INT_MAX))
+                        {
+                            LOG_ERROR("[ExpertWeightTransfer] Send blob for expert " << m.expert_id
+                                      << " layer " << layer << " proj " << proj
+                                      << " exceeds MPI int limit: " << proj_data[proj]->size() << " bytes");
+                            return {};
+                        }
                         int tag = mpi_tags::weightTransferDataTag(layer, m.expert_id, proj);
                         MPI_Request req;
                         int rc = MPI_Isend(

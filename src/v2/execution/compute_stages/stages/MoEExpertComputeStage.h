@@ -19,6 +19,7 @@
 #include "../../../memory/BufferId.h"
 #include "../../../kernels/IMoEKernel.h"
 #include "../../../loaders/WeightPlan.h"
+#include "../../../loaders/ExpertSlabTypes.h"
 #include "../../moe/ExpertWeightTransfer.h"
 #include "../../moe/MoERebalanceController.h"
 #include "../../moe/MoEExpertWeightService.h"
@@ -138,6 +139,11 @@ namespace llaminar2
             // Phase 7: PreparedWeightStore for decode-time fallback resolution
             // =================================================================
             PreparedWeightStore *prepared_store = nullptr;
+
+            // Phase C: Cached slab refs for store-based resolution and rebalance
+            std::optional<ExpertSlabRef> gate_slab_ref;
+            std::optional<ExpertSlabRef> up_slab_ref;
+            std::optional<ExpertSlabRef> down_slab_ref;
         };
 
         explicit MoEExpertComputeStage(Params params);
@@ -257,6 +263,10 @@ namespace llaminar2
         mutable std::vector<ITensorGemm *> cached_gate_gemm_;
         mutable std::vector<ITensorGemm *> cached_up_gemm_;
         mutable std::vector<ITensorGemm *> cached_down_gemm_;
+
+        /// Fallback-owned GEMM engines for tier 3 (lazy preparation) path.
+        /// Only populated if ensureGemmEnginesCached() uses prepareExpertGemmLocal().
+        mutable std::vector<std::shared_ptr<ITensorGemm>> fallback_owned_kernels_;
 
         /// Reusable scratch tensors (allocated on first use, grown if needed)
         mutable std::shared_ptr<FP32Tensor> scratch_batch_;
