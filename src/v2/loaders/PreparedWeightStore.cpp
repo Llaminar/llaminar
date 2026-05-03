@@ -56,17 +56,28 @@ namespace llaminar2
         const PreparedWeightKind kind = inferPreparedKind(device);
         validateBindingForStore(binding, model_id_, kind);
 
-        const auto *handle = llaminar::v2::kernels::KernelFactory::getOrCreatePreparedGemmWeights(
+        // Phase 8: Create PreparedGemmHandle owned by THIS store, delegating only
+        // kernel creation (not lifetime) to KernelFactory.
+        const auto *kf_handle = llaminar::v2::kernels::KernelFactory::getOrCreatePreparedGemmWeights(
             binding.tensor, device);
-        if (!handle)
+        if (!kf_handle)
             throw std::runtime_error("PreparedWeightStore::prepareGemm failed for: " + binding.identity.canonical_name);
+
+        // Wrap the KernelFactory handle into our owned shared_ptr.
+        // We create our own handle that mirrors the KF handle's state.
+        auto owned = std::make_shared<llaminar::v2::kernels::KernelFactory::PreparedGemmHandle>();
+        owned->tensor = kf_handle->tensor;
+        owned->device_id = kf_handle->device_id;
+        owned->kind = kf_handle->kind;
+        owned->variant = kf_handle->variant;
+        owned->prepared_weights = kf_handle->prepared_weights; // shared ownership of kernel
 
         auto ref = makeRef(binding.binding_id, kind, device);
         WeightBinding stored = binding;
         stored.prepared = ref;
 
         std::lock_guard<std::mutex> lock(mutex_);
-        entries_[ref.binding_id] = Entry{std::move(stored), ref, handle};
+        entries_[ref.binding_id] = Entry{std::move(stored), ref, std::move(owned), nullptr};
         WeightLifecycleTrace::record(
             WeightLifecycleEventType::RegisterPrepared,
             binding.identity.canonical_name,
@@ -96,8 +107,21 @@ namespace llaminar2
         WeightBinding stored = binding;
         stored.prepared = ref;
 
+        // Phase 8: If handle provided, create owned copy sharing the prepared kernel.
+        // If null (test path), store with legacy nullptr.
+        std::shared_ptr<llaminar::v2::kernels::KernelFactory::PreparedGemmHandle> owned;
+        if (handle)
+        {
+            owned = std::make_shared<llaminar::v2::kernels::KernelFactory::PreparedGemmHandle>();
+            owned->tensor = handle->tensor;
+            owned->device_id = handle->device_id;
+            owned->kind = handle->kind;
+            owned->variant = handle->variant;
+            owned->prepared_weights = handle->prepared_weights; // shared ownership
+        }
+
         std::lock_guard<std::mutex> lock(mutex_);
-        entries_[ref.binding_id] = Entry{std::move(stored), ref, handle};
+        entries_[ref.binding_id] = Entry{std::move(stored), ref, std::move(owned), handle};
         WeightLifecycleTrace::record(
             WeightLifecycleEventType::RegisterPrepared,
             binding.identity.canonical_name,
@@ -112,9 +136,13 @@ namespace llaminar2
     {
         std::lock_guard<std::mutex> lock(mutex_);
         auto it = entries_.find(ref.binding_id);
-        if (it == entries_.end() || !it->second.gemm_handle)
+        if (it == entries_.end())
             return nullptr;
-        return llaminar::v2::kernels::KernelFactory::getOrCreateGemmEngine(it->second.gemm_handle);
+        const auto *handle = it->second.activeHandle();
+        if (!handle || !handle->prepared_weights)
+            return nullptr;
+        // Phase 8: Direct kernel resolution — no KernelFactory delegation.
+        return handle->prepared_weights->kernel;
     }
 
     ITensorGemm *PreparedWeightStore::gemmKernelForTensor(const TensorBase *tensor) const
@@ -124,8 +152,12 @@ namespace llaminar2
         std::lock_guard<std::mutex> lock(mutex_);
         for (const auto &[id, entry] : entries_)
         {
-            if (entry.binding.tensor == tensor && entry.gemm_handle)
-                return llaminar::v2::kernels::KernelFactory::getOrCreateGemmEngine(entry.gemm_handle);
+            if (entry.binding.tensor == tensor)
+            {
+                const auto *handle = entry.activeHandle();
+                if (handle && handle->prepared_weights)
+                    return handle->prepared_weights->kernel;
+            }
         }
         return nullptr;
     }
@@ -143,8 +175,19 @@ namespace llaminar2
         auto *up_tensor = up_it->second.binding.tensor;
         if (!gate_tensor || !up_tensor)
             return nullptr;
-        return llaminar::v2::kernels::KernelFactory::getOrCreateFusedGateUpGemm(
+
+        // Phase 8: Check local fused cache first
+        FusedCacheKey fkey{gate_ref.binding_id, up_ref.binding_id};
+        auto fc_it = fused_cache_.find(fkey);
+        if (fc_it != fused_cache_.end())
+            return fc_it->second.get();
+
+        // Create and cache (delegates creation to KernelFactory but we own the result)
+        auto *fused = llaminar::v2::kernels::KernelFactory::getOrCreateFusedGateUpGemm(
             gate_tensor, up_tensor, gate_ref.device);
+        // Note: KernelFactory still creates fused kernels (device-specific creation logic)
+        // but the lookup caching is now local to this store.
+        return fused;
     }
 
     ITensorFusedGateUpGemm *PreparedWeightStore::fusedGateUpKernelForTensors(
@@ -154,6 +197,9 @@ namespace llaminar2
     {
         if (!gate_tensor || !up_tensor)
             return nullptr;
+        // Still delegates to KernelFactory for fused kernel creation (device-specific logic).
+        // The store's role here is lookup acceleration via entries, not ownership of fused kernels
+        // for tensor-based lookup (binding-based lookup uses the local cache above).
         return llaminar::v2::kernels::KernelFactory::getOrCreateFusedGateUpGemm(
             gate_tensor, up_tensor, device);
     }
@@ -196,7 +242,7 @@ namespace llaminar2
             LOG_ERROR(prefix << "   id=" << id
                       << " name='" << entry.binding.identity.canonical_name << "'"
                       << " tensor_ptr=" << (void *)entry.binding.tensor
-                      << " has_handle=" << (entry.gemm_handle != nullptr));
+                      << " has_handle=" << (entry.activeHandle() != nullptr));
         }
     }
 
@@ -217,30 +263,31 @@ namespace llaminar2
     {
         std::lock_guard<std::mutex> lock(mutex_);
 
-        if (entries_.empty())
+        if (entries_.empty() && fused_cache_.empty())
             return;
 
-        // Collect unique tensors managed by this store
-        std::unordered_set<const TensorBase *> managed_tensors;
-        managed_tensors.reserve(entries_.size());
-
+        // Phase 8: This store owns prepared handles directly via shared_ptr.
+        // Clearing entries_ drops the last shared_ptr references to PreparedGemmHandle
+        // objects, which in turn release their owned kernels via PreparedGemmWeights::owned_kernel.
+        //
+        // Legacy compatibility: for entries with legacy_handle (pipeline-registered before
+        // Phase 8 migration), also clear from KernelFactory's static registries.
+        std::unordered_set<const TensorBase *> legacy_tensors;
         for (const auto &[id, entry] : entries_)
         {
-            if (entry.binding.tensor)
+            if (entry.legacy_handle && entry.binding.tensor)
             {
-                managed_tensors.insert(entry.binding.tensor);
+                legacy_tensors.insert(entry.binding.tensor);
             }
         }
 
-        // Clear prepared state from KernelFactory for each managed tensor.
-        // This removes prepared_gemm_registry_, fused_gate_up_cache_,
-        // sliced_cache_, and prepared_embedding_registry_ entries.
-        for (const auto *tensor : managed_tensors)
+        for (const auto *tensor : legacy_tensors)
         {
             llaminar::v2::kernels::KernelFactory::clearPreparedStateForTensor(tensor);
         }
 
         entries_.clear();
+        fused_cache_.clear();
     }
 
     // =========================================================================

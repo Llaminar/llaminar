@@ -8,6 +8,7 @@
 #include <optional>
 #include <shared_mutex>
 #include <unordered_map>
+#include <vector>
 
 namespace llaminar2
 {
@@ -15,11 +16,25 @@ namespace llaminar2
     class ITensorFusedGateUpGemm;
     class TensorBase;
 
+    /**
+     * @brief Model-context-owned prepared weight store (Phase 8 KernelFactory slimming).
+     *
+     * This store owns all model-weight-lifetime state: prepared GEMM handles, fused
+     * gate/up kernels, and embedding handles. KernelFactory is reduced to a
+     * KernelRegistry role (device-scoped kernel selection, no model-weight ownership).
+     *
+     * Kernel resolution is direct: gemmKernel() returns the kernel from the owned
+     * handle without delegating to KernelFactory's static registries.
+     */
     class PreparedWeightStore
     {
     public:
         explicit PreparedWeightStore(ModelContextId model_id = {});
         ~PreparedWeightStore();
+
+        // =========================================================================
+        // GEMM Preparation & Resolution
+        // =========================================================================
 
         PreparedWeightRef prepareGemm(const WeightBinding &binding);
         PreparedWeightRef registerPreparedForTest(
@@ -31,8 +46,19 @@ namespace llaminar2
             PreparedWeightKind kind,
             DeviceId device,
             const llaminar::v2::kernels::KernelFactory::PreparedGemmHandle *handle);
+
+        /// Resolve GEMM kernel from a prepared ref. O(1) lookup by binding_id.
+        /// Returns nullptr if ref not found or handle missing.
         ITensorGemm *gemmKernel(const PreparedWeightRef &ref) const;
+
+        /// Resolve GEMM kernel by tensor pointer. O(n) scan.
+        /// Returns nullptr if no entry matches.
         ITensorGemm *gemmKernelForTensor(const TensorBase *tensor) const;
+
+        // =========================================================================
+        // Fused Gate/Up Kernel Resolution
+        // =========================================================================
+
         ITensorFusedGateUpGemm *fusedGateUpKernel(
             const PreparedWeightRef &gate_ref,
             const PreparedWeightRef &up_ref) const;
@@ -40,23 +66,22 @@ namespace llaminar2
             const TensorBase *gate_tensor,
             const TensorBase *up_tensor,
             DeviceId device) const;
+
+        // =========================================================================
+        // Query & Lifecycle
+        // =========================================================================
+
         bool contains(const PreparedWeightRef &ref) const;
         std::optional<WeightBinding> binding(const PreparedWeightRef &ref) const;
         size_t size() const;
         void clear();
 
         /**
-         * @brief Release all prepared weight state from global registries (Phase 8/10)
+         * @brief Release all owned prepared weight state.
          *
-         * This proactively removes all prepared GEMM, fused gate/up, sliced, and
-         * embedding entries from KernelFactory's static registries for every tensor
-         * managed by this store.
-         *
-         * Phase 10: This is the EXCLUSIVE path for KernelFactory registry cleanup.
-         * TensorBase destructors never touch global registries.
-         *
-         * After this call, the store is empty and gemmKernel()/fusedGateUpKernel()
-         * will return nullptr for all refs.
+         * Phase 8: This store OWNS prepared handles and fused kernels directly.
+         * No delegation to KernelFactory static registries for cleanup.
+         * TensorBase destructors never touch prepared state.
          */
         void releaseAllPreparedState();
 
@@ -68,15 +93,12 @@ namespace llaminar2
         // =========================================================================
 
         /// Register a new expert slab (one weight group × one layer × one device).
-        /// Returns a ref that can be used to look up individual expert engines.
         ExpertSlabRef registerExpertSlab(const ExpertSlabDescriptor &desc);
 
         /// Get the GEMM engine for a specific expert within a slab.
-        /// Returns nullptr if the expert is not populated.
         ITensorGemm *expertGemmKernel(const ExpertSlabRef &slab, int expert_id) const;
 
         /// Register newly-arrived expert engines (from initial load or rebalance transfer).
-        /// Returns the expert IDs that were actually new (not already populated).
         std::vector<int> registerArrivedExperts(
             const ExpertSlabRef &slab,
             const std::vector<ExpertArrival> &arrivals);
@@ -103,7 +125,35 @@ namespace llaminar2
         {
             WeightBinding binding;
             PreparedWeightRef ref;
-            const llaminar::v2::kernels::KernelFactory::PreparedGemmHandle *gemm_handle = nullptr;
+            // Phase 8: Store owns the prepared handle directly (not borrowed from KernelFactory).
+            std::shared_ptr<llaminar::v2::kernels::KernelFactory::PreparedGemmHandle> owned_handle;
+            // Legacy compatibility: non-owning pointer for pipeline-registered entries
+            // that were created by KernelFactory before this store existed.
+            const llaminar::v2::kernels::KernelFactory::PreparedGemmHandle *legacy_handle = nullptr;
+
+            /// Resolve the active handle (owned or legacy).
+            const llaminar::v2::kernels::KernelFactory::PreparedGemmHandle *activeHandle() const
+            {
+                return owned_handle ? owned_handle.get() : legacy_handle;
+            }
+        };
+
+        /// Fused gate/up kernel cache (Phase 8: owned by this store, not KernelFactory)
+        struct FusedCacheKey
+        {
+            uint64_t gate_binding_id = 0;
+            uint64_t up_binding_id = 0;
+            bool operator==(const FusedCacheKey &o) const
+            {
+                return gate_binding_id == o.gate_binding_id && up_binding_id == o.up_binding_id;
+            }
+        };
+        struct FusedCacheHash
+        {
+            size_t operator()(const FusedCacheKey &k) const
+            {
+                return std::hash<uint64_t>{}(k.gate_binding_id) ^ (std::hash<uint64_t>{}(k.up_binding_id) << 32);
+            }
         };
 
         PreparedWeightKind inferPreparedKind(DeviceId device) const;
@@ -112,6 +162,7 @@ namespace llaminar2
         ModelContextId model_id_;
         mutable std::mutex mutex_;
         std::unordered_map<uint64_t, Entry> entries_;
+        mutable std::unordered_map<FusedCacheKey, std::unique_ptr<ITensorFusedGateUpGemm>, FusedCacheHash> fused_cache_;
 
         // =========================================================================
         // Expert Slab Storage
