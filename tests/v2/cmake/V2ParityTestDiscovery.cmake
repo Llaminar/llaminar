@@ -161,9 +161,10 @@ foreach(_full_name IN LISTS _all_tests)
     string(APPEND _output "    ENVIRONMENT \"${_env_escaped}\"\n")
     string(APPEND _output "    WORKING_DIRECTORY \"${WORKING_DIR}\"\n")
     string(APPEND _output "    PROCESSORS 4\n")
-    # Serialize all parity tests: they load large models and consume significant
-    # memory/GPU resources. Running multiple concurrently causes OOM and contention.
-    string(APPEND _output "    RESOURCE_LOCK \"Parity_Model_Execution\"\n")
+    # Serialize with ALL integration tests (same lock as add_v2_mpi_test).
+    # Parity tests load large models and consume significant memory/GPU resources.
+    # Using the same lock as regular integration tests prevents any concurrent execution.
+    string(APPEND _output "    RESOURCE_LOCK \"Integration_Serial\"\n")
     string(APPEND _output ")\n\n")
 endforeach()
 

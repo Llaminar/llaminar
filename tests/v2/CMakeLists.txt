@@ -410,10 +410,9 @@ function(add_v2_test TEST_NAME)
     )
 
     # Add RESOURCE_LOCK if specified (prevents parallel execution of tests needing same resource)
-    # All integration tests share a single lock to force serial execution even
-    # under `ctest --parallel`.  Parity tests have their own lock
-    # ("Parity_Model_Execution") set by discover_v2_parity_tests(), so they are
-    # unaffected here.
+    # All integration tests (including parity) share a single lock to force serial
+    # execution even under `ctest --parallel`.  This prevents OOM and GPU contention
+    # when multiple model-loading tests run simultaneously.
     if("${ARG_LABELS}" MATCHES "Integration")
         list(APPEND ARG_RESOURCE_LOCK "Integration_Serial")
     endif()
