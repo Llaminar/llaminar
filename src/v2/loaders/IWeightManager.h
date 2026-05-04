@@ -323,6 +323,18 @@ namespace llaminar2
         virtual size_t releaseAllHostWeightData() { return 0; }
 
         /**
+         * @brief Mark graph materialization complete (enables host release).
+         * Phase 9: lifecycle gate control.
+         */
+        virtual void markGraphMaterializationComplete() {}
+
+        /**
+         * @brief Reset graph materialization gate for lazy graph building paths.
+         * Phase 9: prevents premature host release when lazy builds are pending.
+         */
+        virtual void resetGraphMaterializationGate() {}
+
+        /**
          * @brief Release host data for tensors that were retained as host-resident
          *
          * Called after the first forward pass completes, when GPU kernels have

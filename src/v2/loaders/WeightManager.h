@@ -740,12 +740,30 @@ namespace llaminar2
          * Call after all compute graphs have resolved their weight bindings.
          * After this gate, graph replay will not attempt to resolve new weights.
          */
-        void markGraphMaterializationComplete()
+        void markGraphMaterializationComplete() override
         {
             lifecycle_gates_.graph_materialization_complete = true;
             lifecycle_gates_.host_release_allowed = lifecycle_gates_.canReleaseHostData();
             LOG_DEBUG("[WeightManager] Lifecycle gate: graph_materialization_complete"
                       << " (host_release_allowed=" << lifecycle_gates_.host_release_allowed << ")");
+        }
+
+        /**
+         * @brief Reset graph materialization gate for lazy graph building paths.
+         *
+         * Phase 9: Used by RankOrchestrator when the model has lazy graph building
+         * (e.g., MoE expert VNNI packing during first forward). Resets the gate
+         * to prevent premature host data release. After lazy graph building
+         * completes, call markGraphMaterializationComplete() to re-enable release.
+         *
+         * This replaces the ad-hoc deferred_host_release_pending_ flag.
+         */
+        void resetGraphMaterializationGate() override
+        {
+            lifecycle_gates_.graph_materialization_complete = false;
+            lifecycle_gates_.host_release_allowed = false;
+            LOG_DEBUG("[WeightManager] Lifecycle gate RESET: graph_materialization_complete=false"
+                      << " (lazy graph building pending)");
         }
 
     private:

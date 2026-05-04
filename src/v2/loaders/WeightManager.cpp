@@ -3724,22 +3724,20 @@ namespace llaminar2
 
     size_t WeightManager::releaseAllHostWeightData()
     {
-        // Phase 9: Check lifecycle gate before releasing host data.
-        // If graph materialization is not complete, host release may corrupt
-        // lazy graph building (MoE expert packing, deferred weight resolution).
+        // Phase 9: Hard gate — do NOT release host data until all lifecycle gates
+        // are complete. This replaces the old ad-hoc deferred_host_release_pending_
+        // flag in RankOrchestrator. The caller must mark graph_materialization_complete
+        // AFTER lazy graph builds (MoE expert packing) finish.
         if (!lifecycle_gates_.canReleaseHostData())
         {
-            LOG_WARN("[WeightManager] releaseAllHostWeightData() called before all lifecycle "
-                     "gates are complete (state=" << toString(lifecycle_gates_.currentState())
-                     << "). Proceeding with release (compatibility mode). "
-                     "Set lifecycle gates for deterministic behavior.");
+            LOG_INFO("[WeightManager] releaseAllHostWeightData() blocked by lifecycle gate "
+                     "(state=" << toString(lifecycle_gates_.currentState())
+                     << "). Host data retained until all gates complete.");
+            return 0;
         }
 
-        // Mark host_release_allowed if all gates are complete
-        if (lifecycle_gates_.canReleaseHostData())
-        {
-            lifecycle_gates_.host_release_allowed = true;
-        }
+        // Mark host_release_allowed now that we're proceeding
+        lifecycle_gates_.host_release_allowed = true;
 
         std::lock_guard<std::mutex> lock(cache_mutex_);
 
@@ -3765,13 +3763,18 @@ namespace llaminar2
                 return;
             }
 
-            if (shouldRetainRawForLazyMoE(key) || hostDataRequired(ptr, key))
+            // Phase 9: hostDataRequired() handles all retention decisions including
+            // dynamic MoE rebalancing. The lazy-graph-build case is now handled by
+            // the lifecycle gate (graph_materialization_complete blocks release until
+            // lazy builds are done).
+            if (hostDataRequired(ptr, key))
             {
                 skipped_count++;
                 retained_bytes += tensor_bytes;
                 retained_count++;
-                LOG_DEBUG("[WeightManager] RETAINED lazy-MoE raw expert data for " << key
-                                                                                    << " (" << (tensor_bytes / 1024) << " KB)");
+                LOG_DEBUG("[WeightManager] RETAINED host data for " << key
+                                                                    << " (" << (tensor_bytes / 1024) << " KB)"
+                                                                    << " (host policy requires retention)");
                 return;
             }
 
@@ -3867,9 +3870,10 @@ namespace llaminar2
                 return;
             if (!ptr->isHostResident())
                 return;
-            if (shouldRetainRawForLazyMoE(key) || hostDataRequired(ptr, key))
+            if (hostDataRequired(ptr, key))
             {
-                LOG_DEBUG("[WeightManager] RETAINED host-resident lazy-MoE raw expert data for " << key);
+                LOG_DEBUG("[WeightManager] RETAINED host-resident weight for " << key
+                                                                               << " (host policy requires retention)");
                 return;
             }
 

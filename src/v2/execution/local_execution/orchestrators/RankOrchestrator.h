@@ -810,7 +810,7 @@ namespace llaminar2
         /// Flag indicating if stats need re-aggregation
         mutable bool stats_dirty_ = true;
         bool host_resident_released_ = false; ///< Whether host-resident weight data has been released after first prefill
-        bool deferred_host_release_pending_ = false; ///< Whether host weight data release is deferred until after first forward
+        bool first_forward_complete_ = false; ///< Phase 9: tracks whether first forward has completed (for gate-based host release)
 
         /// Stage type → sharding mode map from the model's schema factory.
         /// Initialized at construction from SchemaFactoryRegistry::getStageShardingConfig().

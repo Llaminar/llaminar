@@ -752,26 +752,28 @@ namespace llaminar2
         }
 
         // =====================================================================
-        // DEFERRED HOST WEIGHT RELEASE
+        // GATE-CONTROLLED HOST WEIGHT RELEASE (Phase 9)
         // =====================================================================
-        // Now that all device runners are created (which includes graph building
-        // and MoE expert VNNI packing that reads from host tensor data), we can
-        // safely release the host weight copies to reclaim RAM.
-        // Skip release for nested TP-in-PP where a later PP stage still needs
-        // host copies to clone from.
+        // After device runners are created, graph building for eager architectures
+        // has completed. However, MoE models have LAZY graph building that happens
+        // during the first forward() call (expert VNNI packing reads host data).
         //
-        // NOTE: Graph building for some architectures (e.g., MoE) is LAZY —
-        // it happens during the first forward pass, not during runner creation.
-        // MoE expert VNNI packing reads host tensor data during lazy graph build.
-        // Therefore, host data release is deferred to after the first forward()
-        // call via the deferred_host_release_pending_ flag.
+        // Phase 9: Reset the graph_materialization_complete gate to prevent
+        // premature host release. The gate will be re-marked after first forward.
+        // This replaces the old deferred_host_release_pending_ flag with typed
+        // lifecycle gate semantics.
         // =====================================================================
         {
             const bool is_nested_tp_in_pp = config_.nested_pp_stage_config.has_value();
             if (!is_nested_tp_in_pp)
             {
-                deferred_host_release_pending_ = true;
-                LOG_INFO("RankOrchestrator: Host weight release deferred until after first forward pass");
+                auto weight_mgr = model_ctx_->weightManager();
+                if (weight_mgr)
+                {
+                    weight_mgr->resetGraphMaterializationGate();
+                    LOG_INFO("RankOrchestrator: Graph materialization gate reset — host weight "
+                             "release blocked until after first forward pass completes");
+                }
             }
             else
             {
@@ -1283,21 +1285,28 @@ namespace llaminar2
             return false;
         }
 
-        // After the first successful forward pass, release deferred host weight data.
-        // Graph building (including MoE expert VNNI packing) happens lazily during
-        // the first forward, so host data must remain available until that completes.
-        if (success && deferred_host_release_pending_)
+        // Phase 9: After first successful forward, mark graph materialization complete
+        // (lazy graph building, including MoE expert VNNI packing, is now done).
+        // Then release host weight data through the lifecycle gate system.
+        if (success && !first_forward_complete_)
         {
-            deferred_host_release_pending_ = false;
+            first_forward_complete_ = true;
             auto weight_mgr = model_ctx_->weightManager();
             if (weight_mgr)
             {
+                // Re-mark the gate now that lazy graph builds are done
+                weight_mgr->markGraphMaterializationComplete();
+
+                // Gate-controlled release — will succeed now that all gates are true
                 size_t released = weight_mgr->releaseAllHostWeightData();
-                LOG_INFO("RankOrchestrator: Deferred host weight release after first forward: "
-                         << released << " tensors released");
+                if (released > 0)
+                {
+                    LOG_INFO("RankOrchestrator: Host weight release after first forward: "
+                             << released << " tensors released");
 #ifdef __linux__
-                ::malloc_trim(0);
+                    ::malloc_trim(0);
 #endif
+                }
             }
         }
 

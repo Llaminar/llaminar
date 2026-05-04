@@ -41,6 +41,10 @@ public:
                         WeightDistributionStrategy::REPLICATED,
                         WeightPrecision::NATIVE)
     {
+        // Mark all lifecycle gates open so release decision logic is testable
+        markMaterializationComplete();
+        markDevicePreparationComplete();
+        markGraphMaterializationComplete();
     }
 
     size_t getPreparedEmbeddingCount() const override

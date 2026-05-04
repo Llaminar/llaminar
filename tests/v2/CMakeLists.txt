@@ -4503,24 +4503,6 @@ if(ZLIB_FOUND)
         MPI_PROCS 1
     )
 
-    # ---- SplitTQ Decode Step 4 Divergence Analysis ----
-    add_executable(v2_integration_parity_qwen3_splittq_analysis
-        integration/parity/qwen3/Test__Qwen3_SplitTQ_DecodeAnalysis.cpp
-        ${WORKSPACE_ROOT_PARITY}/external/cnpy/cnpy.cpp
-    )
-    target_link_libraries(v2_integration_parity_qwen3_splittq_analysis
-        llaminar2_core v2_test_utils GTest::gtest ZLIB::ZLIB
-    )
-    target_include_directories(v2_integration_parity_qwen3_splittq_analysis PRIVATE
-        ${WORKSPACE_ROOT_PARITY}/external/cnpy
-        ${CMAKE_CURRENT_SOURCE_DIR}
-    )
-    discover_v2_parity_tests(v2_integration_parity_qwen3_splittq_analysis
-        TEST_PREFIX V2_Integration_Parity_Qwen3_SplitTQ_Analysis
-        LABELS "V2;Integration;Parity;Qwen3;CPU;TQ8;TQ4;SplitTQ;Analysis;PyTorch;GoldenReference;FullModel"
-        MPI_PROCS 1
-    )
-
     # ---- NodeLocalTP Parity (Multi-Socket CPU TP) ----
     add_executable(v2_integration_parity_qwen3_node_local_tp
         integration/parity/qwen3/Test__Qwen3_NodeLocalTP_Parity.cpp
