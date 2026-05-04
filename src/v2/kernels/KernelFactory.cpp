@@ -3700,7 +3700,7 @@ namespace llaminar
                 auto [it, inserted] = prepared_gemm_registry_.emplace(key, std::move(handle));
                 if (inserted)
                 {
-                    tensor->in_prepared_gemm_registry_ = true;
+                    tensor->has_prepared_device_state_ = true;
 
                     // Also register under tensor-pointer fallback key so the entry
                     // remains findable after host data release (raw_data becomes null).
@@ -3793,7 +3793,7 @@ namespace llaminar
                 }
 
                 // Return ownership to caller — NO global registry insertion,
-                // NO in_prepared_gemm_registry_ flag set
+                // NO has_prepared_device_state_ flag set
                 return std::shared_ptr<llaminar2::ITensorGemm>(std::move(kernel));
             }
 
@@ -3942,7 +3942,7 @@ namespace llaminar
                 auto [it, inserted] = prepared_gemm_registry_.emplace(key, std::move(handle));
                 if (inserted)
                 {
-                    tensor->in_prepared_gemm_registry_ = true;
+                    tensor->has_prepared_device_state_ = true;
 
                     // Also register under tensor-pointer fallback key (same as CPU path)
                     if (reg_key_data != nullptr)

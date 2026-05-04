@@ -673,15 +673,16 @@ namespace llaminar2
         // Generic cache for CPU kernel state (e.g. packed VNNI weights)
         mutable std::any cache_;
 
-        // Runtime hint: set by KernelFactory when this tensor's GEMM
-        // representation has been uploaded to pooled VRAM.  Used by
-        // StageCoherence, TransferEngine, and WeightManager to skip raw
-        // uploads and to determine host-release safety.
+        // Runtime hint: set when this tensor's device representation is managed
+        // by the prepared weight pipeline (PreparedWeightStore / KernelFactory).
+        // Used by StageCoherence, TransferEngine, DeviceGraphExecutor, and
+        // WeightManager to skip raw uploads and determine host-release safety.
         //
-        // NOTE (Phase 10): This flag has NO lifecycle implications.
-        // TensorBase destructor does NOT use it.  Cleanup of KernelFactory
-        // registries is the exclusive responsibility of PreparedWeightStore.
-        mutable bool in_prepared_gemm_registry_ = false;
+        // Phase 8: This flag is a cheap O(1) alternative to mutex-guarded
+        // registry lookups on every stage boundary. It has NO lifecycle
+        // implications — TensorBase destructor does NOT use it.
+        // Cleanup is the exclusive responsibility of PreparedWeightStore.
+        mutable bool has_prepared_device_state_ = false;
 
         // Synchronizes cache_ initialization and reset
         mutable std::mutex packed_cache_mutex_;
@@ -1095,13 +1096,16 @@ namespace llaminar2
          * @brief Check if this tensor's GEMM weights are managed by the GPU pipeline
          *
          * When true, the tensor's GEMM representation lives in pooled VRAM owned
-         * by the prepared-GEMM kernel (via KernelFactory::prepared_gemm_registry_).
+         * by the prepared weight pipeline (PreparedWeightStore).
          * The raw host data may already be released.  Callers should skip
          * ensureOnDevice() for such tensors — the kernel has its own device copy.
          *
-         * @return true if KernelFactory has a prepared GEMM entry for this tensor
+         * @return true if this tensor has prepared device state
          */
-        bool isInPreparedGemmRegistry() const { return in_prepared_gemm_registry_; }
+        bool hasPreparedDeviceState() const { return has_prepared_device_state_; }
+
+        /// @deprecated Use hasPreparedDeviceState() — semantically identical.
+        bool isInPreparedGemmRegistry() const { return has_prepared_device_state_; }
 
         /**
          * @brief Check if tensor uses zero-copy mapped memory

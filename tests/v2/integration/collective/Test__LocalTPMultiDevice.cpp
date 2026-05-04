@@ -372,6 +372,7 @@ TEST_F(Test__LocalTPMultiDevice, DetectsHeterogeneousSetup)
 TEST_F(Test__LocalTPMultiDevice, CUDA_TwoGPU_LocalTPContextCreation)
 {
     skipIfLessThan2CUDA();
+    if (IsSkipped()) return;
 
     std::vector<GlobalDeviceAddress> devices = {
         GlobalDeviceAddress::cuda(0),

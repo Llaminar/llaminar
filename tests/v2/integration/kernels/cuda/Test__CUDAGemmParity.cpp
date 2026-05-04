@@ -37,7 +37,6 @@
 #include "../../../utils/TestModelHelper.h"
 #ifdef HAVE_CUDA
 #include "backends/cuda/CUDABackend.h"
-#include <cuda_runtime.h> // For cudaMalloc, cudaMemcpy, etc.
 #endif
 
 // Now include test utils
@@ -461,13 +460,13 @@ TEST_F(Test__CUDAGemmParity, FP32_SmallMatrix_128x256x512)
     EXPECT_TRUE(weights->isOnGPU());
 
     // Create CUDA kernel via KernelFactory
-    auto cuda_kernel = llaminar::v2::kernels::KernelFactory::createGemm(
-        weights.get(), KernelDeviceType::CUDA);
+    auto *cuda_kernel = getPreparedKernel(
+        weights.get(), gpu_device_);
     ASSERT_NE(cuda_kernel, nullptr) << "Failed to create CUDA kernel";
 
     // Execute CUDA GEMM via tensor coherence
     std::vector<float> C_cuda(M * N, 0.0f);
-    ASSERT_TRUE(cudaMultiplyViaTensor(cuda_kernel.get(), A_data.data(), C_cuda.data(), M, N, K, gpu_device_));
+    ASSERT_TRUE(cudaMultiplyViaTensor(cuda_kernel, A_data.data(), C_cuda.data(), M, N, K, gpu_device_));
 
     // ===== Compare =====
     auto result = checkParity(C_cuda.data(), C_cpu.data(), M * N, 0.9999, 0.01);
@@ -478,6 +477,8 @@ TEST_F(Test__CUDAGemmParity, FP32_SmallMatrix_128x256x512)
         << "Cosine similarity too low: " << result.cosine_similarity;
     EXPECT_LE(result.relative_l2_error, 0.01)
         << "Relative L2 error too high: " << (result.relative_l2_error * 100) << "%";
+
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights.get());
 }
 
 TEST_F(Test__CUDAGemmParity, FP32_DecodeSize_1x896x896)
@@ -500,13 +501,15 @@ TEST_F(Test__CUDAGemmParity, FP32_DecodeSize_1x896x896)
 
     // CUDA
     ASSERT_TRUE(weights->ensureOnDevice(gpu_device_));
-    auto cuda_kernel = llaminar::v2::kernels::KernelFactory::createGemm(
-        weights.get(), KernelDeviceType::CUDA);
+    auto *cuda_kernel = getPreparedKernel(
+        weights.get(), gpu_device_);
     ASSERT_NE(cuda_kernel, nullptr);
 
     float *d_A, *d_C;
     std::vector<float> C_cuda(M * N, 0.0f);
-    ASSERT_TRUE(cudaMultiplyViaTensor(cuda_kernel.get(), A_data.data(), C_cuda.data(), M, N, K, gpu_device_));
+    ASSERT_TRUE(cudaMultiplyViaTensor(cuda_kernel, A_data.data(), C_cuda.data(), M, N, K, gpu_device_));
+
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights.get());
 }
 
 TEST_F(Test__CUDAGemmParity, FP32_PrefillSize_512x896x896)
@@ -529,13 +532,15 @@ TEST_F(Test__CUDAGemmParity, FP32_PrefillSize_512x896x896)
 
     // CUDA
     ASSERT_TRUE(weights->ensureOnDevice(gpu_device_));
-    auto cuda_kernel = llaminar::v2::kernels::KernelFactory::createGemm(
-        weights.get(), KernelDeviceType::CUDA);
+    auto *cuda_kernel = getPreparedKernel(
+        weights.get(), gpu_device_);
     ASSERT_NE(cuda_kernel, nullptr);
 
     float *d_A, *d_C;
     std::vector<float> C_cuda(M * N, 0.0f);
-    ASSERT_TRUE(cudaMultiplyViaTensor(cuda_kernel.get(), A_data.data(), C_cuda.data(), M, N, K, gpu_device_));
+    ASSERT_TRUE(cudaMultiplyViaTensor(cuda_kernel, A_data.data(), C_cuda.data(), M, N, K, gpu_device_));
+
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights.get());
 }
 
 // ============================================================================
@@ -572,17 +577,19 @@ TEST_F(Test__CUDAGemmParity, IQ4_NL_SmallMatrix_128x896x896)
     EXPECT_TRUE(weights->isOnGPU());
 
     // Create CUDA kernel via KernelFactory
-    auto cuda_kernel = llaminar::v2::kernels::KernelFactory::createGemm(
-        weights.get(), KernelDeviceType::CUDA);
+    auto *cuda_kernel = getPreparedKernel(
+        weights.get(), gpu_device_);
     ASSERT_NE(cuda_kernel, nullptr) << "Failed to create CUDA IQ4_NL kernel";
 
     // Set up workspace for quantized kernel
-    ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel.get(), M, N, K));
+    ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel, M, N, K));
 
     // Allocate GPU memory for activations and output
     float *d_A, *d_C;
     std::vector<float> C_cuda(M * N, 0.0f);
-    ASSERT_TRUE(cudaMultiplyViaTensor(cuda_kernel.get(), A_data.data(), C_cuda.data(), M, N, K, gpu_device_));
+    ASSERT_TRUE(cudaMultiplyViaTensor(cuda_kernel, A_data.data(), C_cuda.data(), M, N, K, gpu_device_));
+
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights.get());
 }
 
 TEST_F(Test__CUDAGemmParity, IQ4_NL_DecodeSize_1x896x896)
@@ -604,16 +611,18 @@ TEST_F(Test__CUDAGemmParity, IQ4_NL_DecodeSize_1x896x896)
 
     // CUDA
     ASSERT_TRUE(weights->ensureOnDevice(gpu_device_));
-    auto cuda_kernel = llaminar::v2::kernels::KernelFactory::createGemm(
-        weights.get(), KernelDeviceType::CUDA);
+    auto *cuda_kernel = getPreparedKernel(
+        weights.get(), gpu_device_);
     ASSERT_NE(cuda_kernel, nullptr);
 
     // Set up workspace for quantized kernel
-    ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel.get(), M, N, K));
+    ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel, M, N, K));
 
     float *d_A, *d_C;
     std::vector<float> C_cuda(M * N, 0.0f);
-    ASSERT_TRUE(cudaMultiplyViaTensor(cuda_kernel.get(), A_data.data(), C_cuda.data(), M, N, K, gpu_device_));
+    ASSERT_TRUE(cudaMultiplyViaTensor(cuda_kernel, A_data.data(), C_cuda.data(), M, N, K, gpu_device_));
+
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights.get());
 }
 
 TEST_F(Test__CUDAGemmParity, IQ4_NL_PrefillSize_512x896x896)
@@ -635,16 +644,18 @@ TEST_F(Test__CUDAGemmParity, IQ4_NL_PrefillSize_512x896x896)
 
     // CUDA
     ASSERT_TRUE(weights->ensureOnDevice(gpu_device_));
-    auto cuda_kernel = llaminar::v2::kernels::KernelFactory::createGemm(
-        weights.get(), KernelDeviceType::CUDA);
+    auto *cuda_kernel = getPreparedKernel(
+        weights.get(), gpu_device_);
     ASSERT_NE(cuda_kernel, nullptr);
 
     // Set up workspace for quantized kernel
-    ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel.get(), M, N, K));
+    ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel, M, N, K));
 
     float *d_A, *d_C;
     std::vector<float> C_cuda(M * N, 0.0f);
-    ASSERT_TRUE(cudaMultiplyViaTensor(cuda_kernel.get(), A_data.data(), C_cuda.data(), M, N, K, gpu_device_));
+    ASSERT_TRUE(cudaMultiplyViaTensor(cuda_kernel, A_data.data(), C_cuda.data(), M, N, K, gpu_device_));
+
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights.get());
 }
 
 // ============================================================================
@@ -681,15 +692,15 @@ TEST_F(Test__CUDAGemmParity, IQ4_NL_PrefillSize_512x896x896)
                                                                                                   \
         /* CUDA */                                                                                \
         ASSERT_TRUE(weights->ensureOnDevice(gpu_device_));                                        \
-        auto cuda_kernel = llaminar::v2::kernels::KernelFactory::createGemm(                      \
-            weights.get(), KernelDeviceType::CUDA);                                               \
+        auto *cuda_kernel = getPreparedKernel(                                                    \
+            weights.get(), gpu_device_);                                                          \
         ASSERT_NE(cuda_kernel, nullptr) << "Failed to create CUDA kernel for " #TensorType;       \
                                                                                                   \
         /* Set up workspace for quantized kernel */                                               \
-        ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel.get(), M, N, K));                          \
+        ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel, M, N, K));                                \
                                                                                                   \
         std::vector<float> C_cuda(M * N, 0.0f);                                                   \
-        ASSERT_TRUE(cudaMultiplyViaTensor(cuda_kernel.get(), A_data.data(),                       \
+        ASSERT_TRUE(cudaMultiplyViaTensor(cuda_kernel, A_data.data(),                             \
                                           C_cuda.data(), M, N, K, gpu_device_));                  \
                                                                                                   \
         auto result = checkParity(C_cuda.data(), C_cpu.data(), M * N, 0.99, 0.15);                \
@@ -699,7 +710,8 @@ TEST_F(Test__CUDAGemmParity, IQ4_NL_PrefillSize_512x896x896)
         EXPECT_GE(result.cosine_similarity, 0.99)                                                 \
             << "Cosine similarity too low: " << result.cosine_similarity;                         \
                                                                                                   \
-        cleanupWorkspaceIfNeeded(cuda_kernel.get());                                              \
+        cleanupWorkspaceIfNeeded(cuda_kernel);                                                    \
+        llaminar::v2::kernels::KernelFactory::clearCacheFor(weights.get());                       \
     }
 
 /**
@@ -729,14 +741,14 @@ TEST_F(Test__CUDAGemmParity, IQ4_NL_PrefillSize_512x896x896)
                                                                                                   \
         /* CUDA */                                                                                \
         ASSERT_TRUE(weights->ensureOnDevice(gpu_device_));                                        \
-        auto cuda_kernel = llaminar::v2::kernels::KernelFactory::createGemm(                      \
-            weights.get(), KernelDeviceType::CUDA);                                               \
+        auto *cuda_kernel = getPreparedKernel(                                                    \
+            weights.get(), gpu_device_);                                                          \
         ASSERT_NE(cuda_kernel, nullptr) << "Failed to create CUDA kernel for " #TensorType;       \
                                                                                                   \
-        ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel.get(), M, N, K));                          \
+        ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel, M, N, K));                                \
                                                                                                   \
         std::vector<float> C_cuda(M * N, 0.0f);                                                   \
-        ASSERT_TRUE(cudaMultiplyViaTensor(cuda_kernel.get(), A_data.data(),                       \
+        ASSERT_TRUE(cudaMultiplyViaTensor(cuda_kernel, A_data.data(),                             \
                                           C_cuda.data(), M, N, K, gpu_device_));                  \
                                                                                                   \
         auto result = checkParity(C_cuda.data(), C_cpu.data(), M * N, 0.99, 0.15);                \
@@ -746,7 +758,8 @@ TEST_F(Test__CUDAGemmParity, IQ4_NL_PrefillSize_512x896x896)
         EXPECT_GE(result.cosine_similarity, 0.99)                                                 \
             << "Cosine similarity too low: " << result.cosine_similarity;                         \
                                                                                                   \
-        cleanupWorkspaceIfNeeded(cuda_kernel.get());                                              \
+        cleanupWorkspaceIfNeeded(cuda_kernel);                                                    \
+        llaminar::v2::kernels::KernelFactory::clearCacheFor(weights.get());                       \
     }
 
 // ============================================================================
@@ -770,15 +783,17 @@ TEST_F(Test__CUDAGemmParity, Q8_0_DecodeSize_1x896x896)
     ASSERT_TRUE(cpuMultiplyToVector(cpu_kernel.get(), A_data.data(), C_cpu.data(), M, N, K));
 
     ASSERT_TRUE(weights->ensureOnDevice(gpu_device_));
-    auto cuda_kernel = llaminar::v2::kernels::KernelFactory::createGemm(
-        weights.get(), KernelDeviceType::CUDA);
+    auto *cuda_kernel = getPreparedKernel(
+        weights.get(), gpu_device_);
 
     // Set up workspace for quantized kernel
-    ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel.get(), M, N, K));
+    ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel, M, N, K));
 
     float *d_A, *d_C;
     std::vector<float> C_cuda(M * N, 0.0f);
-    ASSERT_TRUE(cudaMultiplyViaTensor(cuda_kernel.get(), A_data.data(), C_cuda.data(), M, N, K, gpu_device_));
+    ASSERT_TRUE(cudaMultiplyViaTensor(cuda_kernel, A_data.data(), C_cuda.data(), M, N, K, gpu_device_));
+
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights.get());
 }
 
 // ============================================================================
@@ -802,15 +817,17 @@ TEST_F(Test__CUDAGemmParity, Q4_0_DecodeSize_1x896x896)
     ASSERT_TRUE(cpuMultiplyToVector(cpu_kernel.get(), A_data.data(), C_cpu.data(), M, N, K));
 
     ASSERT_TRUE(weights->ensureOnDevice(gpu_device_));
-    auto cuda_kernel = llaminar::v2::kernels::KernelFactory::createGemm(
-        weights.get(), KernelDeviceType::CUDA);
+    auto *cuda_kernel = getPreparedKernel(
+        weights.get(), gpu_device_);
 
     // Set up workspace for quantized kernel
-    ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel.get(), M, N, K));
+    ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel, M, N, K));
 
     float *d_A, *d_C;
     std::vector<float> C_cuda(M * N, 0.0f);
-    ASSERT_TRUE(cudaMultiplyViaTensor(cuda_kernel.get(), A_data.data(), C_cuda.data(), M, N, K, gpu_device_));
+    ASSERT_TRUE(cudaMultiplyViaTensor(cuda_kernel, A_data.data(), C_cuda.data(), M, N, K, gpu_device_));
+
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights.get());
 }
 
 TEST_F(Test__CUDAGemmParity, Q4_1_DecodeSize_1x896x896)
@@ -829,16 +846,18 @@ TEST_F(Test__CUDAGemmParity, Q4_1_DecodeSize_1x896x896)
     ASSERT_TRUE(cpuMultiplyToVector(cpu_kernel.get(), A_data.data(), C_cpu.data(), M, N, K));
 
     ASSERT_TRUE(weights->ensureOnDevice(gpu_device_));
-    auto cuda_kernel = llaminar::v2::kernels::KernelFactory::createGemm(
-        weights.get(), KernelDeviceType::CUDA);
+    auto *cuda_kernel = getPreparedKernel(
+        weights.get(), gpu_device_);
     ASSERT_NE(cuda_kernel, nullptr);
 
-    ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel.get(), M, N, K));
+    ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel, M, N, K));
 
     float *d_A = nullptr;
     float *d_C = nullptr;
     std::vector<float> C_cuda(M * N, 0.0f);
-    ASSERT_TRUE(cudaMultiplyViaTensor(cuda_kernel.get(), A_data.data(), C_cuda.data(), M, N, K, gpu_device_));
+    ASSERT_TRUE(cudaMultiplyViaTensor(cuda_kernel, A_data.data(), C_cuda.data(), M, N, K, gpu_device_));
+
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights.get());
 }
 
 // ============================================================================
@@ -869,16 +888,18 @@ TEST_F(Test__CUDAGemmParity, Q5_0_DecodeSize_1x896x896)
     ASSERT_TRUE(cpuMultiplyToVector(cpu_kernel.get(), A_data.data(), C_cpu.data(), M, N, K));
 
     ASSERT_TRUE(weights->ensureOnDevice(gpu_device_));
-    auto cuda_kernel = llaminar::v2::kernels::KernelFactory::createGemm(
-        weights.get(), KernelDeviceType::CUDA);
+    auto *cuda_kernel = getPreparedKernel(
+        weights.get(), gpu_device_);
     ASSERT_NE(cuda_kernel, nullptr);
 
-    ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel.get(), M, N, K));
+    ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel, M, N, K));
 
     float *d_A = nullptr;
     float *d_C = nullptr;
     std::vector<float> C_cuda(M * N, 0.0f);
-    ASSERT_TRUE(cudaMultiplyViaTensor(cuda_kernel.get(), A_data.data(), C_cuda.data(), M, N, K, gpu_device_));
+    ASSERT_TRUE(cudaMultiplyViaTensor(cuda_kernel, A_data.data(), C_cuda.data(), M, N, K, gpu_device_));
+
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights.get());
 }
 
 // ============================================================================
@@ -903,16 +924,18 @@ TEST_F(Test__CUDAGemmParity, Q5_1_DecodeSize_1x896x896)
     ASSERT_TRUE(cpuMultiplyToVector(cpu_kernel.get(), A_data.data(), C_cpu.data(), M, N, K));
 
     ASSERT_TRUE(weights->ensureOnDevice(gpu_device_));
-    auto cuda_kernel = llaminar::v2::kernels::KernelFactory::createGemm(
-        weights.get(), KernelDeviceType::CUDA);
+    auto *cuda_kernel = getPreparedKernel(
+        weights.get(), gpu_device_);
     ASSERT_NE(cuda_kernel, nullptr);
 
-    ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel.get(), M, N, K));
+    ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel, M, N, K));
 
     float *d_A = nullptr;
     float *d_C = nullptr;
     std::vector<float> C_cuda(M * N, 0.0f);
-    ASSERT_TRUE(cudaMultiplyViaTensor(cuda_kernel.get(), A_data.data(), C_cuda.data(), M, N, K, gpu_device_));
+    ASSERT_TRUE(cudaMultiplyViaTensor(cuda_kernel, A_data.data(), C_cuda.data(), M, N, K, gpu_device_));
+
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights.get());
 }
 
 // ============================================================================
@@ -937,6 +960,7 @@ DEFINE_QUANTIZED_DECODE_PARITY_TEST(Q5_K_DecodeSize, Q5_KTensor, createQ5_KRando
 
 DEFINE_QUANTIZED_PARITY_TEST(IQ4_XS_SmallMatrix, IQ4_XSTensor, createIQ4_XSRandom, 256, 301)
 DEFINE_QUANTIZED_PARITY_TEST(IQ2_XXS_SmallMatrix, IQ2_XXSTensor, createIQ2_XXSRandom, 256, 302)
+
 DEFINE_QUANTIZED_PARITY_TEST(IQ2_XS_SmallMatrix, IQ2_XSTensor, createIQ2_XSRandom, 256, 303)
 DEFINE_QUANTIZED_PARITY_TEST(IQ2_S_SmallMatrix, IQ2_STensor, createIQ2_SRandom, 256, 304)
 DEFINE_QUANTIZED_PARITY_TEST(IQ3_XXS_SmallMatrix, IQ3_XXSTensor, createIQ3_XXSRandom, 256, 305)
@@ -1019,16 +1043,19 @@ TEST_F(Test__CUDAGemmParity, RealModel_Q4_0_AttnQ_Layer0)
     ASSERT_TRUE(q4_tensor->ensureOnDevice(gpu_device_));
     EXPECT_TRUE(q4_tensor->isOnGPU());
 
-    auto cuda_kernel = llaminar::v2::kernels::KernelFactory::createGemm(
-        q4_tensor, KernelDeviceType::CUDA);
+    auto *cuda_kernel = getPreparedKernel(
+        q4_tensor, gpu_device_);
     ASSERT_NE(cuda_kernel, nullptr) << "Failed to create CUDA kernel";
 
     // Set up workspace for quantized kernel
-    ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel.get(), M, N, K));
+    ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel, M, N, K));
 
     float *d_A, *d_C;
     std::vector<float> C_cuda(M * N, 0.0f);
-    ASSERT_TRUE(cudaMultiplyViaTensor(cuda_kernel.get(), A_data.data(), C_cuda.data(), M, N, K, gpu_device_));
+    ASSERT_TRUE(cudaMultiplyViaTensor(cuda_kernel, A_data.data(), C_cuda.data(), M, N, K, gpu_device_));
+
+    // Clean up cache entry while tensor is still alive
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights.get());
 }
 
 /**
@@ -1075,15 +1102,18 @@ TEST_F(Test__CUDAGemmParity, RealModel_Q4_0_AttnK_Layer0)
 
     // CUDA
     ASSERT_TRUE(q4_tensor->ensureOnDevice(gpu_device_));
-    auto cuda_kernel = llaminar::v2::kernels::KernelFactory::createGemm(
-        q4_tensor, KernelDeviceType::CUDA);
+    auto *cuda_kernel = getPreparedKernel(
+        q4_tensor, gpu_device_);
 
     // Set up workspace for quantized kernel
-    ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel.get(), M, N, K));
+    ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel, M, N, K));
 
     float *d_A, *d_C;
     std::vector<float> C_cuda(M * N, 0.0f);
-    ASSERT_TRUE(cudaMultiplyViaTensor(cuda_kernel.get(), A_data.data(), C_cuda.data(), M, N, K, gpu_device_));
+    ASSERT_TRUE(cudaMultiplyViaTensor(cuda_kernel, A_data.data(), C_cuda.data(), M, N, K, gpu_device_));
+
+    // Clean up cache entry while tensor is still alive
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights.get());
 }
 
 /**
@@ -1130,15 +1160,18 @@ TEST_F(Test__CUDAGemmParity, RealModel_Q4_0_AttnV_Layer0)
 
     // CUDA
     ASSERT_TRUE(q4_tensor->ensureOnDevice(gpu_device_));
-    auto cuda_kernel = llaminar::v2::kernels::KernelFactory::createGemm(
-        q4_tensor, KernelDeviceType::CUDA);
+    auto *cuda_kernel = getPreparedKernel(
+        q4_tensor, gpu_device_);
 
     // Set up workspace for quantized kernel
-    ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel.get(), M, N, K));
+    ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel, M, N, K));
 
     float *d_A, *d_C;
     std::vector<float> C_cuda(M * N, 0.0f);
-    ASSERT_TRUE(cudaMultiplyViaTensor(cuda_kernel.get(), A_data.data(), C_cuda.data(), M, N, K, gpu_device_));
+    ASSERT_TRUE(cudaMultiplyViaTensor(cuda_kernel, A_data.data(), C_cuda.data(), M, N, K, gpu_device_));
+
+    // Clean up cache entry while tensor is still alive
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights.get());
 }
 
 /**
@@ -1184,15 +1217,18 @@ TEST_F(Test__CUDAGemmParity, RealModel_Q4_0_FFNGate_Layer0)
 
     // CUDA
     ASSERT_TRUE(q4_tensor->ensureOnDevice(gpu_device_));
-    auto cuda_kernel = llaminar::v2::kernels::KernelFactory::createGemm(
-        q4_tensor, KernelDeviceType::CUDA);
+    auto *cuda_kernel = getPreparedKernel(
+        q4_tensor, gpu_device_);
 
     // Set up workspace for quantized kernel
-    ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel.get(), M, N, K));
+    ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel, M, N, K));
 
     float *d_A, *d_C;
     std::vector<float> C_cuda(M * N, 0.0f);
-    ASSERT_TRUE(cudaMultiplyViaTensor(cuda_kernel.get(), A_data.data(), C_cuda.data(), M, N, K, gpu_device_));
+    ASSERT_TRUE(cudaMultiplyViaTensor(cuda_kernel, A_data.data(), C_cuda.data(), M, N, K, gpu_device_));
+
+    // Clean up cache entry while tensor is still alive
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights.get());
 }
 
 /**
@@ -1245,15 +1281,18 @@ TEST_F(Test__CUDAGemmParity, RealModel_Q4_0_LMHead)
 
     // CUDA
     ASSERT_TRUE(q4_tensor->ensureOnDevice(gpu_device_));
-    auto cuda_kernel = llaminar::v2::kernels::KernelFactory::createGemm(
-        q4_tensor, KernelDeviceType::CUDA);
+    auto *cuda_kernel = getPreparedKernel(
+        q4_tensor, gpu_device_);
 
     // Set up workspace for quantized kernel
-    ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel.get(), M, N, K));
+    ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel, M, N, K));
 
     float *d_A, *d_C;
     std::vector<float> C_cuda(static_cast<size_t>(M) * N, 0.0f);
-    ASSERT_TRUE(cudaMultiplyViaTensor(cuda_kernel.get(), A_data.data(), C_cuda.data(), M, N, K, gpu_device_));
+    ASSERT_TRUE(cudaMultiplyViaTensor(cuda_kernel, A_data.data(), C_cuda.data(), M, N, K, gpu_device_));
+
+    // Clean up cache entry while tensor is still alive
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights.get());
 }
 
 /**
@@ -1315,12 +1354,12 @@ TEST_F(Test__CUDAGemmParity, RealModel_Q4_0_AttnQ_TensorAPI)
     // First ensure weights are on GPU
     ASSERT_TRUE(q4_tensor->ensureOnDevice(gpu_device_));
 
-    auto cuda_kernel = llaminar::v2::kernels::KernelFactory::createGemm(
-        q4_tensor, KernelDeviceType::CUDA);
+    auto *cuda_kernel = getPreparedKernel(
+        q4_tensor, gpu_device_);
     ASSERT_NE(cuda_kernel, nullptr);
 
     // Set up workspace for quantized kernel
-    ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel.get(), M, N, K));
+    ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel, M, N, K));
 
     // Use with_gpu_coherence for automatic input/output coherence management
     ASSERT_TRUE(with_gpu_coherence(
@@ -1335,7 +1374,7 @@ TEST_F(Test__CUDAGemmParity, RealModel_Q4_0_AttnQ_TensorAPI)
         }));
 
     // Clean up workspace
-    cleanupWorkspaceIfNeeded(cuda_kernel.get());
+    cleanupWorkspaceIfNeeded(cuda_kernel);
 
     // ===== Compare =====
     // data() will automatically sync to host if needed
@@ -1348,6 +1387,9 @@ TEST_F(Test__CUDAGemmParity, RealModel_Q4_0_AttnQ_TensorAPI)
     EXPECT_GE(result.cosine_similarity, 0.99)
         << "multiply_tensor() API shows divergence!";
     EXPECT_FALSE(result.has_nan_inf);
+
+    // Clean up cache entry while tensor is still alive
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights.get());
 }
 
 /**
@@ -1409,25 +1451,23 @@ TEST_F(Test__CUDAGemmParity, FusedQKV_TensorAPI_vs_Separate)
     std::cout << "FusedQKV test: M=" << M << " K=" << K
               << " N_q=" << N_q << " N_k=" << N_k << " N_v=" << N_v << "\n";
 
-    // Ensure all weights are on GPU
-    ASSERT_TRUE(weights_q->ensureOnDevice(gpu_device_));
-    ASSERT_TRUE(weights_k->ensureOnDevice(gpu_device_));
-    ASSERT_TRUE(weights_v->ensureOnDevice(gpu_device_));
+    // Note: ensureOnDevice is NOT needed for CUDA quantized GEMM path -
+    // prepareGpuGemmOnDemand handles the upload via WeightVRAMPool internally
 
     // Create CUDA kernels for each projection
-    auto cuda_kernel_q = llaminar::v2::kernels::KernelFactory::createGemm(
-        weights_q, KernelDeviceType::CUDA);
-    auto cuda_kernel_k = llaminar::v2::kernels::KernelFactory::createGemm(
-        weights_k, KernelDeviceType::CUDA);
-    auto cuda_kernel_v = llaminar::v2::kernels::KernelFactory::createGemm(
-        weights_v, KernelDeviceType::CUDA);
+    auto *cuda_kernel_q = getPreparedKernel(
+        weights_q, gpu_device_);
+    auto *cuda_kernel_k = getPreparedKernel(
+        weights_k, gpu_device_);
+    auto *cuda_kernel_v = getPreparedKernel(
+        weights_v, gpu_device_);
     ASSERT_NE(cuda_kernel_q, nullptr) << "Failed to create CUDA kernel for Q";
     ASSERT_NE(cuda_kernel_k, nullptr) << "Failed to create CUDA kernel for K";
     ASSERT_NE(cuda_kernel_v, nullptr) << "Failed to create CUDA kernel for V";
 
     // Set up SHARED workspace for fused QKV (all kernels share workspace)
     ASSERT_TRUE(setupSharedWorkspace(
-        {cuda_kernel_q.get(), cuda_kernel_k.get(), cuda_kernel_v.get()},
+        {cuda_kernel_q, cuda_kernel_k, cuda_kernel_v},
         M, {N_q, N_k, N_v}, K));
 
     // Create input tensor with random data
@@ -1479,11 +1519,11 @@ TEST_F(Test__CUDAGemmParity, FusedQKV_TensorAPI_vs_Separate)
 
     // Build projection descriptors
     std::vector<TensorProjectionDesc> projections;
-    projections.emplace_back(cuda_kernel_q.get(), output_q_fused.get(), N_q,
+    projections.emplace_back(cuda_kernel_q, output_q_fused.get(), N_q,
                              nullptr, "Q");
-    projections.emplace_back(cuda_kernel_k.get(), output_k_fused.get(), N_k,
+    projections.emplace_back(cuda_kernel_k, output_k_fused.get(), N_k,
                              nullptr, "K");
-    projections.emplace_back(cuda_kernel_v.get(), output_v_fused.get(), N_v,
+    projections.emplace_back(cuda_kernel_v, output_v_fused.get(), N_v,
                              nullptr, "V");
 
     // Call fused method with coherence wrapper
@@ -1547,6 +1587,7 @@ TEST_F(Test__CUDAGemmParity, FusedQKV_TensorAPI_vs_Separate)
 
     auto result_q_cpu = checkParity(q_fused, q_cpu.data(), M * N_q, 0.99, 0.10);
     result_q_cpu.print("Q projection (CUDA fused vs CPU)");
+
     EXPECT_GE(result_q_cpu.cosine_similarity, 0.99);
 
     auto result_k_cpu = checkParity(k_fused, k_cpu.data(), M * N_k, 0.99, 0.10);
@@ -1558,7 +1599,12 @@ TEST_F(Test__CUDAGemmParity, FusedQKV_TensorAPI_vs_Separate)
     EXPECT_GE(result_v_cpu.cosine_similarity, 0.99);
 
     // Clean up shared workspace
-    cleanupSharedWorkspace({cuda_kernel_q.get(), cuda_kernel_k.get(), cuda_kernel_v.get()});
+    cleanupSharedWorkspace({cuda_kernel_q, cuda_kernel_k, cuda_kernel_v});
+
+    // Clean up cache entries while tensors are still alive
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights_q);
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights_k);
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights_v);
 }
 
 /**
@@ -1612,16 +1658,16 @@ TEST_F(Test__CUDAGemmParity, FusedQKV_DecodeSize_M1)
     ASSERT_TRUE(weights_k->ensureOnDevice(gpu_device_));
     ASSERT_TRUE(weights_v->ensureOnDevice(gpu_device_));
 
-    auto cuda_kernel_q = llaminar::v2::kernels::KernelFactory::createGemm(
-        weights_q, KernelDeviceType::CUDA);
-    auto cuda_kernel_k = llaminar::v2::kernels::KernelFactory::createGemm(
-        weights_k, KernelDeviceType::CUDA);
-    auto cuda_kernel_v = llaminar::v2::kernels::KernelFactory::createGemm(
-        weights_v, KernelDeviceType::CUDA);
+    auto *cuda_kernel_q = getPreparedKernel(
+        weights_q, gpu_device_);
+    auto *cuda_kernel_k = getPreparedKernel(
+        weights_k, gpu_device_);
+    auto *cuda_kernel_v = getPreparedKernel(
+        weights_v, gpu_device_);
 
     // Set up SHARED workspace for fused QKV (all kernels share workspace)
     ASSERT_TRUE(setupSharedWorkspace(
-        {cuda_kernel_q.get(), cuda_kernel_k.get(), cuda_kernel_v.get()},
+        {cuda_kernel_q, cuda_kernel_k, cuda_kernel_v},
         M, {N_q, N_k, N_v}, K));
 
     auto input_tensor = std::make_unique<FP32Tensor>(
@@ -1642,11 +1688,11 @@ TEST_F(Test__CUDAGemmParity, FusedQKV_DecodeSize_M1)
 
     // Run fused with coherence wrapper
     std::vector<TensorProjectionDesc> projections;
-    projections.emplace_back(cuda_kernel_q.get(), output_q_fused.get(), N_q,
+    projections.emplace_back(cuda_kernel_q, output_q_fused.get(), N_q,
                              nullptr, "Q");
-    projections.emplace_back(cuda_kernel_k.get(), output_k_fused.get(), N_k,
+    projections.emplace_back(cuda_kernel_k, output_k_fused.get(), N_k,
                              nullptr, "K");
-    projections.emplace_back(cuda_kernel_v.get(), output_v_fused.get(), N_v,
+    projections.emplace_back(cuda_kernel_v, output_v_fused.get(), N_v,
                              nullptr, "V");
 
     ASSERT_TRUE(with_gpu_coherence(
@@ -1693,7 +1739,12 @@ TEST_F(Test__CUDAGemmParity, FusedQKV_DecodeSize_M1)
     EXPECT_FALSE(result_v.has_nan_inf);
 
     // Clean up shared workspace
-    cleanupSharedWorkspace({cuda_kernel_q.get(), cuda_kernel_k.get(), cuda_kernel_v.get()});
+    cleanupSharedWorkspace({cuda_kernel_q, cuda_kernel_k, cuda_kernel_v});
+
+    // Clean up cache entries while tensors are still alive
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights_q_base.get());
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights_k_base.get());
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights_v_base.get());
 }
 
 // ============================================================================
@@ -1716,9 +1767,6 @@ TEST_F(Test__CUDAGemmParity, CachedKernel_vs_FreshKernel)
     {
         GTEST_SKIP() << "Model file not found: " << REAL_MODEL_PATH;
     }
-
-    // Clear any existing cached kernels
-    llaminar::v2::kernels::KernelFactory::clearCache();
 
     auto mpi_ctx = std::make_shared<MPIContext>(0, 1, MPI_COMM_WORLD);
     TensorFactory factory(*mpi_ctx);
@@ -1744,26 +1792,19 @@ TEST_F(Test__CUDAGemmParity, CachedKernel_vs_FreshKernel)
     // Ensure on GPU
     ASSERT_TRUE(q4_tensor->ensureOnDevice(gpu_device_));
 
-    // Create fresh kernel (not cached)
-    auto fresh_kernel = llaminar::v2::kernels::KernelFactory::createGemm(
-        q4_tensor, KernelDeviceType::CUDA);
-    ASSERT_NE(fresh_kernel, nullptr);
+    // Get kernel via prepared GEMM path (legacy createGemm GPU path removed)
+    auto *cuda_kernel = getPreparedKernel(q4_tensor, gpu_device_);
+    ASSERT_NE(cuda_kernel, nullptr);
 
-    // Get cached kernel (this is what the pipeline uses)
-    auto *cached_kernel = getPreparedKernel(q4_tensor, gpu_device_);
-    ASSERT_NE(cached_kernel, nullptr);
-
-    // Set up SHARED workspace for both kernels
-    ASSERT_TRUE(setupSharedWorkspace(
-        {fresh_kernel.get(), cached_kernel},
-        M, {N, N}, K));
+    // Set up workspace
+    ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel, M, N, K));
 
     // Create input and outputs
     auto input_tensor = std::make_unique<FP32Tensor>(
         std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(K)});
-    auto output_fresh = std::make_unique<FP32Tensor>(
+    auto output_a = std::make_unique<FP32Tensor>(
         std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N)});
-    auto output_cached = std::make_unique<FP32Tensor>(
+    auto output_b = std::make_unique<FP32Tensor>(
         std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N)});
 
     // Fill input
@@ -1773,46 +1814,45 @@ TEST_F(Test__CUDAGemmParity, CachedKernel_vs_FreshKernel)
         input_data[i] = dist_(rng_);
     }
 
-    // Run fresh kernel with coherence wrapper
+    // Run kernel twice — should produce identical results
     ASSERT_TRUE(with_gpu_coherence(
         gpu_device_,
         {input_tensor.get()},
-        {output_fresh.get()},
+        {output_a.get()},
         [&]
         {
-            return fresh_kernel->multiply_tensor(
-                input_tensor.get(), output_fresh.get(),
+            return cuda_kernel->multiply_tensor(
+                input_tensor.get(), output_a.get(),
                 M, N, K, true, 1.0f, 0.0f, nullptr, nullptr, -1);
         }));
 
-    // Run cached kernel with coherence wrapper
     ASSERT_TRUE(with_gpu_coherence(
         gpu_device_,
         {input_tensor.get()},
-        {output_cached.get()},
+        {output_b.get()},
         [&]
         {
-            return cached_kernel->multiply_tensor(
-                input_tensor.get(), output_cached.get(),
+            return cuda_kernel->multiply_tensor(
+                input_tensor.get(), output_b.get(),
                 M, N, K, true, 1.0f, 0.0f, nullptr, nullptr, -1);
         }));
 
-    // Compare: should be EXACTLY the same (same kernel, same weights)
-    const float *fresh_data = output_fresh->data();
-    const float *cached_data = output_cached->data();
+    // Compare: should be EXACTLY the same (same kernel, same weights, same input)
+    const float *data_a = output_a->data();
+    const float *data_b = output_b->data();
 
-    auto result = checkParity(cached_data, fresh_data, M * N, 0.9999, 0.001);
-    result.print("Cached kernel vs Fresh kernel");
+    auto result = checkParity(data_b, data_a, M * N, 0.9999, 0.001);
+    result.print("Kernel run A vs run B (same prepared kernel)");
 
     EXPECT_GE(result.cosine_similarity, 0.9999)
-        << "Cached and fresh kernels should produce nearly identical results";
+        << "Same prepared kernel should produce nearly identical results";
     EXPECT_FALSE(result.has_nan_inf);
 
-    // Clean up shared workspace
-    cleanupSharedWorkspace({fresh_kernel.get(), cached_kernel});
+    // Clean up workspace
+    cleanupWorkspaceIfNeeded(cuda_kernel);
 
-    // Clear cache for next test
-    llaminar::v2::kernels::KernelFactory::clearCache();
+    // Clean up cache entry while tensor is still alive
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights.get());
 }
 
 /**
@@ -1827,8 +1867,6 @@ TEST_F(Test__CUDAGemmParity, CachedKernel_MultipleCallsConsistent)
     {
         GTEST_SKIP() << "Model file not found: " << REAL_MODEL_PATH;
     }
-
-    llaminar::v2::kernels::KernelFactory::clearCache();
 
     auto mpi_ctx = std::make_shared<MPIContext>(0, 1, MPI_COMM_WORLD);
     TensorFactory factory(*mpi_ctx);
@@ -1906,7 +1944,8 @@ TEST_F(Test__CUDAGemmParity, CachedKernel_MultipleCallsConsistent)
     // Clean up workspace
     cleanupWorkspaceIfNeeded(kernel);
 
-    llaminar::v2::kernels::KernelFactory::clearCache();
+    // Clean up cache entry while tensor is still alive
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights.get());
 }
 
 /**
@@ -1922,8 +1961,6 @@ TEST_F(Test__CUDAGemmParity, CachedKernel_VaryingBatchSizes)
     {
         GTEST_SKIP() << "Model file not found: " << REAL_MODEL_PATH;
     }
-
-    llaminar::v2::kernels::KernelFactory::clearCache();
 
     auto mpi_ctx = std::make_shared<MPIContext>(0, 1, MPI_COMM_WORLD);
     TensorFactory factory(*mpi_ctx);
@@ -2006,7 +2043,8 @@ TEST_F(Test__CUDAGemmParity, CachedKernel_VaryingBatchSizes)
     // Clean up workspace
     cleanupWorkspaceIfNeeded(kernel);
 
-    llaminar::v2::kernels::KernelFactory::clearCache();
+    // Clean up cache entry while tensor is still alive
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights.get());
 }
 
 // ============================================================================
@@ -2025,8 +2063,6 @@ TEST_F(Test__CUDAGemmParity, FusedQKV_WithBias)
     {
         GTEST_SKIP() << "Model file not found: " << REAL_MODEL_PATH;
     }
-
-    llaminar::v2::kernels::KernelFactory::clearCache();
 
     auto mpi_ctx = std::make_shared<MPIContext>(0, 1, MPI_COMM_WORLD);
     TensorFactory factory(*mpi_ctx);
@@ -2090,16 +2126,16 @@ TEST_F(Test__CUDAGemmParity, FusedQKV_WithBias)
         ASSERT_TRUE(bias_v->ensureOnDevice(gpu_device_));
 
     // Create kernels
-    auto cuda_kernel_q = llaminar::v2::kernels::KernelFactory::createGemm(
-        wq, KernelDeviceType::CUDA);
-    auto cuda_kernel_k = llaminar::v2::kernels::KernelFactory::createGemm(
-        wk, KernelDeviceType::CUDA);
-    auto cuda_kernel_v = llaminar::v2::kernels::KernelFactory::createGemm(
-        wv, KernelDeviceType::CUDA);
+    auto *cuda_kernel_q = getPreparedKernel(
+        wq, gpu_device_);
+    auto *cuda_kernel_k = getPreparedKernel(
+        wk, gpu_device_);
+    auto *cuda_kernel_v = getPreparedKernel(
+        wv, gpu_device_);
 
     // Set up SHARED workspace for fused QKV (all kernels share workspace)
     ASSERT_TRUE(setupSharedWorkspace(
-        {cuda_kernel_q.get(), cuda_kernel_k.get(), cuda_kernel_v.get()},
+        {cuda_kernel_q, cuda_kernel_k, cuda_kernel_v},
         M, {N_q, N_k, N_v}, K));
 
     // Create input
@@ -2125,11 +2161,11 @@ TEST_F(Test__CUDAGemmParity, FusedQKV_WithBias)
 
     // Run fused GEMM with biases
     std::vector<TensorProjectionDesc> projections;
-    projections.emplace_back(cuda_kernel_q.get(), output_q.get(), N_q,
+    projections.emplace_back(cuda_kernel_q, output_q.get(), N_q,
                              bias_q.get(), "Q");
-    projections.emplace_back(cuda_kernel_k.get(), output_k.get(), N_k,
+    projections.emplace_back(cuda_kernel_k, output_k.get(), N_k,
                              bias_k.get(), "K");
-    projections.emplace_back(cuda_kernel_v.get(), output_v.get(), N_v,
+    projections.emplace_back(cuda_kernel_v, output_v.get(), N_v,
                              bias_v.get(), "V");
 
     ASSERT_TRUE(cuda_kernel_q->multiply_fused_tensor(
@@ -2210,9 +2246,12 @@ TEST_F(Test__CUDAGemmParity, FusedQKV_WithBias)
     EXPECT_FALSE(result_v.has_nan_inf);
 
     // Clean up shared workspace
-    cleanupSharedWorkspace({cuda_kernel_q.get(), cuda_kernel_k.get(), cuda_kernel_v.get()});
+    cleanupSharedWorkspace({cuda_kernel_q, cuda_kernel_k, cuda_kernel_v});
 
-    llaminar::v2::kernels::KernelFactory::clearCache();
+    // Clean up cache entries while tensors are still alive
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights_q.get());
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights_k.get());
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights_v.get());
 }
 
 /**
@@ -2229,8 +2268,6 @@ TEST_F(Test__CUDAGemmParity, FusedQKV_CachedKernels_MultipleIterations)
     {
         GTEST_SKIP() << "Model file not found: " << REAL_MODEL_PATH;
     }
-
-    llaminar::v2::kernels::KernelFactory::clearCache();
 
     auto mpi_ctx = std::make_shared<MPIContext>(0, 1, MPI_COMM_WORLD);
     TensorFactory factory(*mpi_ctx);
@@ -2361,7 +2398,10 @@ TEST_F(Test__CUDAGemmParity, FusedQKV_CachedKernels_MultipleIterations)
     // Clean up shared workspace
     cleanupSharedWorkspace({kernel_q, kernel_k, kernel_v});
 
-    llaminar::v2::kernels::KernelFactory::clearCache();
+    // Clean up cache entries while tensors are still alive
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights_q.get());
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights_k.get());
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights_v.get());
 }
 
 #endif // HAVE_CUDA

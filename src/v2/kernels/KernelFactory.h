@@ -637,6 +637,8 @@ namespace llaminar
 
                 // ==========================================================================
                 // Fused Gate/Up GEMM Kernel Creation
+                // NOTE: Phase 8 legacy. New code should use PreparedWeightStore
+                // for fused GEMM caching and lifetime management.
                 // ==========================================================================
 
                 /**
@@ -1174,6 +1176,8 @@ namespace llaminar
 
                 // ==========================================================================
                 // Cached GEMM Kernel API - Pack Once, Use Many
+                // NOTE: Phase 8 legacy. New code should use PreparedWeightStore::slicedGemmKernel()
+                // for row-sliced GEMM access.
                 // ==========================================================================
 
                 /**
@@ -1405,6 +1409,10 @@ namespace llaminar
                 /**
                  * @brief Get or create a prepared GEMM-weights handle
                  *
+                 * @deprecated Phase 8: New code should use PreparedWeightStore::prepare()
+                 * for model-weight-lifetime management. This API remains functional for
+                 * backward compatibility but its registry will be removed in Phase 9.
+                 *
                  * Resolves preparation kind, ensures packed state where applicable,
                  * and binds an executable GEMM kernel via explicit-device create path.
                  *
@@ -1524,10 +1532,14 @@ namespace llaminar
 
                 // =================================================================
                 // Prepared Embedding Weights
+                // NOTE: Phase 8 legacy. New code should use PreparedWeightStore
+                // for embedding preparation and lifetime management.
                 // =================================================================
 
                 /**
                  * @brief Get or create prepared embedding weights for a device
+                 *
+                 * @deprecated Phase 8: Use PreparedWeightStore::prepareEmbedding() instead.
                  *
                  * Repacks the embedding table from its native quantized format to
                  * EmbedQ8Block and uploads to GPU memory. Results are cached by

@@ -19,6 +19,8 @@
 
 #include <gtest/gtest.h>
 #include <gmock/gmock.h>
+#include <mpi.h>
+#include <csignal>
 
 #include "config/OrchestrationConfig.h"
 #include "config/OrchestrationConfigParser.h"
@@ -734,3 +736,51 @@ namespace
     }
 
 } // anonymous namespace
+
+#include <csignal>
+
+static volatile sig_atomic_t g_any_assertion_failed = 0;
+
+static void cleanup_crash_handler(int sig)
+{
+    if (!g_any_assertion_failed)
+        _exit(0);
+    struct sigaction sa = {};
+    sa.sa_handler = SIG_DFL;
+    sigaction(sig, &sa, nullptr);
+    raise(sig);
+}
+
+static void install_crash_handlers()
+{
+    struct sigaction sa = {};
+    sa.sa_handler = cleanup_crash_handler;
+    sa.sa_flags = 0;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGABRT, &sa, nullptr);
+    sigaction(SIGSEGV, &sa, nullptr);
+}
+
+class AssertionTracker : public ::testing::EmptyTestEventListener
+{
+    void OnTestPartResult(const ::testing::TestPartResult &result) override
+    {
+        if (result.failed())
+            g_any_assertion_failed = 1;
+    }
+};
+
+int main(int argc, char **argv)
+{
+    install_crash_handlers();
+
+    int provided = 0;
+    MPI_Init_thread(&argc, &argv, MPI_THREAD_FUNNELED, &provided);
+
+    ::testing::InitGoogleTest(&argc, argv);
+    ::testing::UnitTest::GetInstance()->listeners().Append(new AssertionTracker);
+    int result = RUN_ALL_TESTS();
+
+    MPI_Finalize();
+    _exit(result);
+}

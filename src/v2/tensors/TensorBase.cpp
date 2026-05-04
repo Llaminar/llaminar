@@ -173,7 +173,15 @@ namespace llaminar2
         }
         secondary_device_buffers_.clear();
 
-        // Free GPU memory if allocated (before unpinning host memory)
+        // Unpin host memory BEFORE freeing GPU memory.
+        // When a non-blocking stream was used for H2D transfer (e.g., via
+        // GPUDeviceContextPool's default stream in resolveStream()), calling
+        // cudaHostUnregister AFTER cudaFree can corrupt the CUDA driver's
+        // internal pinned-memory bookkeeping, leading to silent data corruption
+        // in subsequent GPU allocations and kernel launches.
+        unpinHostMemory();
+
+        // Free GPU memory if allocated
         if (gpu_data_ptr_ && gpu_device_.has_value())
         {
             IBackend *backend = resolveBackend(*gpu_device_);
@@ -193,9 +201,6 @@ namespace llaminar2
             gpu_data_ptr_ = nullptr;
             applyCoherenceOp_(CoherenceOp::RELEASE_DEVICE); // GPU memory freed
         }
-
-        // Unpin host memory if pinned (after freeing GPU memory)
-        unpinHostMemory();
 
         // Phase 10: TensorBase destructor NEVER touches global KernelFactory state.
         // Cleanup of KernelFactory registries is the exclusive responsibility of

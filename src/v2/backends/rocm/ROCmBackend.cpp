@@ -32,16 +32,20 @@ namespace llaminar2
 
     namespace
     {
+        // Immortal singletons: heap-allocated and never destroyed.
+        // Prevents static destruction order fiasco when KernelFactory's static
+        // caches (which hold GEMM kernels with shared_ptr<LoadOrchestrator>)
+        // are destroyed during __cxa_finalize AFTER these singletons.
         std::mutex &rocmPinnedAllocationsMutex()
         {
-            static std::mutex mutex;
-            return mutex;
+            static auto *mutex = new std::mutex();
+            return *mutex;
         }
 
         std::unordered_map<void *, int> &rocmPinnedAllocations()
         {
-            static std::unordered_map<void *, int> allocations;
-            return allocations;
+            static auto *allocations = new std::unordered_map<void *, int>();
+            return *allocations;
         }
     }
 
@@ -139,9 +143,12 @@ namespace llaminar2
             bool active = false;
         };
 
-        std::mutex g_ptr_registry_mutex;
-        std::unordered_map<void *, ROCmPointerOwnerInfo> g_active_ptrs;
-        std::deque<PointerEvent> g_ptr_events;
+        // Immortal: heap-allocated and never destroyed to avoid static
+        // destruction order issues during process exit.
+        std::mutex &g_ptr_registry_mutex = *new std::mutex();
+        std::unordered_map<void *, ROCmPointerOwnerInfo> &g_active_ptrs =
+            *new std::unordered_map<void *, ROCmPointerOwnerInfo>();
+        std::deque<PointerEvent> &g_ptr_events = *new std::deque<PointerEvent>();
         uint64_t g_ptr_sequence = 0;
         constexpr size_t kMaxPointerEvents = 512;
 
@@ -1335,28 +1342,40 @@ namespace llaminar2
             std::lock_guard<std::mutex> lock(rocmPinnedAllocationsMutex());
             auto &allocations = rocmPinnedAllocations();
             auto it = allocations.find(ptr);
-            if (it == allocations.end())
+            if (it != allocations.end())
             {
-                LOG_WARN("[ROCmBackend::freePinned] skipping untracked pinned pointer " << ptr);
-                return;
+                owner_device = it->second;
+                allocations.erase(it);
             }
-            owner_device = it->second;
-            allocations.erase(it);
+            else
+            {
+                // Pointer not found in tracking map. This can happen during static
+                // destruction when the Meyers singleton (rocmPinnedAllocations) was
+                // destroyed before KernelFactory's static caches, causing the map
+                // to be re-created empty. Still proceed with hipHostFree using the
+                // caller-provided device_id.
+                LOG_DEBUG("[ROCmBackend::freePinned] untracked pinned pointer " << ptr
+                          << " (normal during static destruction)");
+            }
         }
 
         hipError_t set_err = hipSetDevice(owner_device);
         if (set_err != hipSuccess)
         {
-            LOG_WARN("[ROCmBackend::freePinned] hipSetDevice(" << owner_device
-                     << ") failed before hipHostFree: " << hipGetErrorString(set_err));
+            // During static destruction, hipSetDevice may fail if the HIP runtime
+            // has already been torn down. This is expected — skip the free.
+            LOG_DEBUG("[ROCmBackend::freePinned] hipSetDevice(" << owner_device
+                     << ") failed before hipHostFree: " << hipGetErrorString(set_err)
+                     << " (may be normal during shutdown)");
             return;
         }
 
         hipError_t err = hipHostFree(ptr);
         if (err != hipSuccess)
         {
-            LOG_WARN("[ROCmBackend::freePinned] hipHostFree failed for " << ptr
-                     << " on device " << owner_device << ": " << hipGetErrorString(err));
+            LOG_DEBUG("[ROCmBackend::freePinned] hipHostFree failed for " << ptr
+                     << " on device " << owner_device << ": " << hipGetErrorString(err)
+                     << " (may be normal during shutdown)");
         }
     }
 

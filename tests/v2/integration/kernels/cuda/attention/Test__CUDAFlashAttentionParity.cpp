@@ -508,7 +508,7 @@ TEST_F(Test__CUDAFlashAttentionParity, FlashDecode_FP32_Short_Parity)
         1, // seq_len = 1 (single query token)
         kv_len,
         n_heads, n_kv_heads, head_dim,
-        true); // causal
+        true, kv_len - 1); // causal, position_offset for decode
     ASSERT_TRUE(cpu_success) << "CPU compute_decode failed";
 
     // CUDA decode
@@ -581,7 +581,7 @@ TEST_F(Test__CUDAFlashAttentionParity, FlashDecode_FP32_Long_Parity)
     bool cpu_success = cpu_kernel.compute_decode(
         Q_data.data(), K_data.data(), V_data.data(), cpu_output.data(),
         1, kv_len, n_heads, n_kv_heads, head_dim,
-        true); // causal
+        true, kv_len - 1); // causal, position_offset for decode
     ASSERT_TRUE(cpu_success) << "CPU compute_decode failed";
 
     // CUDA decode
@@ -651,7 +651,7 @@ TEST_F(Test__CUDAFlashAttentionParity, FlashDecode_Q81KVCacheConsumption_Parity)
     ASSERT_TRUE(cpu_kernel.compute_decode(
         Q_data.data(), K_data_fp32.data(), V_data_fp32.data(), cpu_baseline_output.data(),
         1, kv_len, n_heads, n_kv_heads, head_dim,
-        true));
+        true, kv_len - 1));
 
     MPIContext local_mpi_ctx(0, 1, MPI_COMM_WORLD);
     auto kv_cache = std::make_unique<CPURingKVCache<ActivationPrecision::Q8_1>>(
@@ -690,7 +690,7 @@ TEST_F(Test__CUDAFlashAttentionParity, FlashDecode_Q81KVCacheConsumption_Parity)
     ASSERT_TRUE(cpu_kernel.compute_decode(
         Q_data.data(), K_from_q81, V_from_q81, cpu_q81_output.data(),
         1, kv_len, n_heads, n_kv_heads, head_dim,
-        true));
+        true, kv_len - 1));
 
     llaminar2::cuda::CUDAFlashAttentionKernelT<ActivationPrecision::FP32> cuda_kernel(0);
 
@@ -766,7 +766,7 @@ TEST_F(Test__CUDAFlashAttentionParity, FlashDecode_FP32_VeryLong_Parity)
     CPUFlashAttentionKernelT<ActivationPrecision::FP32> cpu_kernel;
     bool cpu_success = cpu_kernel.compute_decode(
         Q_data.data(), K_data.data(), V_data.data(), cpu_output.data(),
-        1, kv_len, n_heads, n_kv_heads, head_dim, true);
+        1, kv_len, n_heads, n_kv_heads, head_dim, true, kv_len - 1);
     ASSERT_TRUE(cpu_success) << "CPU compute_decode failed";
 
     // CUDA decode
@@ -833,7 +833,7 @@ TEST_F(Test__CUDAFlashAttentionParity, FlashDecode_FP32_MHA_Parity)
     CPUFlashAttentionKernelT<ActivationPrecision::FP32> cpu_kernel;
     bool cpu_success = cpu_kernel.compute_decode(
         Q_data.data(), K_data.data(), V_data.data(), cpu_output.data(),
-        1, kv_len, n_heads, n_kv_heads, head_dim, true);
+        1, kv_len, n_heads, n_kv_heads, head_dim, true, kv_len - 1);
     ASSERT_TRUE(cpu_success) << "CPU compute_decode failed";
 
     llaminar2::cuda::CUDAFlashAttentionKernelT<ActivationPrecision::FP32> cuda_kernel(0);
@@ -899,7 +899,7 @@ TEST_F(Test__CUDAFlashAttentionParity, FlashDecode_FP32_HeadDim128_Parity)
     CPUFlashAttentionKernelT<ActivationPrecision::FP32> cpu_kernel;
     bool cpu_success = cpu_kernel.compute_decode(
         Q_data.data(), K_data.data(), V_data.data(), cpu_output.data(),
-        1, kv_len, n_heads, n_kv_heads, head_dim, true);
+        1, kv_len, n_heads, n_kv_heads, head_dim, true, kv_len - 1);
     ASSERT_TRUE(cpu_success) << "CPU compute_decode failed";
 
     llaminar2::cuda::CUDAFlashAttentionKernelT<ActivationPrecision::FP32> cuda_kernel(0);

@@ -72,6 +72,14 @@ namespace
     constexpr const char *MODEL_PATH = "models/qwen2.5-0.5b-instruct-q4_0.gguf";
     constexpr int NUM_REPETITIONS = 10;
 
+    ITensorGemm *getPreparedKernel(const TensorBase *tensor, DeviceId device_id)
+    {
+        auto *prepared = llaminar::v2::kernels::KernelFactory::getOrCreatePreparedGemmWeights(tensor, device_id);
+        if (!prepared)
+            return nullptr;
+        return llaminar::v2::kernels::KernelFactory::getOrCreateGemmEngine(prepared);
+    }
+
     double cosineSimilarity(const float *a, const float *b, size_t count)
     {
         double dot = 0.0, norm_a = 0.0, norm_b = 0.0;
@@ -286,12 +294,12 @@ protected:
         if (!weight->ensureOnDevice(gpu_device_))
             return false;
 
-        auto kernel = llaminar::v2::kernels::KernelFactory::createGemm(
-            weight, KernelDeviceType::CUDA);
+        auto *kernel = getPreparedKernel(
+            weight, gpu_device_);
         if (!kernel)
             return false;
 
-        auto *ws = dynamic_cast<IWorkspaceConsumer *>(kernel.get());
+        auto *ws = dynamic_cast<IWorkspaceConsumer *>(kernel);
         if (!ws)
             return false;
 
@@ -474,16 +482,16 @@ TEST_F(Test__CUDAGemmNonDeterminism, FusedGateUp_SelfConsistency)
     ASSERT_TRUE(w_up->ensureOnDevice(gpu_device_));
 
     // Create CUDA kernels
-    auto kernel_gate = llaminar::v2::kernels::KernelFactory::createGemm(
-        w_gate, KernelDeviceType::CUDA);
-    auto kernel_up = llaminar::v2::kernels::KernelFactory::createGemm(
-        w_up, KernelDeviceType::CUDA);
+    auto *kernel_gate = getPreparedKernel(
+        w_gate, gpu_device_);
+    auto *kernel_up = getPreparedKernel(
+        w_up, gpu_device_);
     ASSERT_NE(kernel_gate, nullptr);
     ASSERT_NE(kernel_up, nullptr);
 
     // Set up SHARED workspace (mirrors FusedGateUpGEMMStage)
     ASSERT_TRUE(setupSharedWorkspace(
-        {kernel_gate.get(), kernel_up.get()},
+        {kernel_gate, kernel_up},
         M, {N_gate, N_up}, K));
 
     // Create fixed input (deterministic seed)
@@ -511,9 +519,9 @@ TEST_F(Test__CUDAGemmNonDeterminism, FusedGateUp_SelfConsistency)
 
         // Build projection descriptors
         std::vector<TensorProjectionDesc> projections;
-        projections.emplace_back(kernel_gate.get(), out_gate.get(), N_gate,
+        projections.emplace_back(kernel_gate, out_gate.get(), N_gate,
                                  nullptr, "gate");
-        projections.emplace_back(kernel_up.get(), out_up.get(), N_up,
+        projections.emplace_back(kernel_up, out_up.get(), N_up,
                                  nullptr, "up");
 
         // Call fused method with coherence wrapper
@@ -580,7 +588,7 @@ TEST_F(Test__CUDAGemmNonDeterminism, FusedGateUp_SelfConsistency)
     EXPECT_GE(min_up_cos, 0.9999)
         << "Up projection is non-deterministic across " << NUM_REPETITIONS << " calls";
 
-    cleanupSharedWorkspace({kernel_gate.get(), kernel_up.get()});
+    cleanupSharedWorkspace({kernel_gate, kernel_up});
 }
 
 // ============================================================================
@@ -627,15 +635,15 @@ TEST_F(Test__CUDAGemmNonDeterminism, FusedQKV_SelfConsistency)
     ASSERT_TRUE(w_k->ensureOnDevice(gpu_device_));
     ASSERT_TRUE(w_v->ensureOnDevice(gpu_device_));
 
-    auto k_q = llaminar::v2::kernels::KernelFactory::createGemm(w_q, KernelDeviceType::CUDA);
-    auto k_k = llaminar::v2::kernels::KernelFactory::createGemm(w_k, KernelDeviceType::CUDA);
-    auto k_v = llaminar::v2::kernels::KernelFactory::createGemm(w_v, KernelDeviceType::CUDA);
+    auto *k_q = getPreparedKernel(w_q, gpu_device_);
+    auto *k_k = getPreparedKernel(w_k, gpu_device_);
+    auto *k_v = getPreparedKernel(w_v, gpu_device_);
     ASSERT_NE(k_q, nullptr);
     ASSERT_NE(k_k, nullptr);
     ASSERT_NE(k_v, nullptr);
 
     ASSERT_TRUE(setupSharedWorkspace(
-        {k_q.get(), k_k.get(), k_v.get()},
+        {k_q, k_k, k_v},
         M, {N_q, N_k, N_v}, K));
 
     auto input = std::make_unique<FP32Tensor>(
@@ -658,9 +666,9 @@ TEST_F(Test__CUDAGemmNonDeterminism, FusedQKV_SelfConsistency)
             std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N_v)});
 
         std::vector<TensorProjectionDesc> projections;
-        projections.emplace_back(k_q.get(), out_q.get(), N_q, nullptr, "Q");
-        projections.emplace_back(k_k.get(), out_k.get(), N_k, nullptr, "K");
-        projections.emplace_back(k_v.get(), out_v.get(), N_v, nullptr, "V");
+        projections.emplace_back(k_q, out_q.get(), N_q, nullptr, "Q");
+        projections.emplace_back(k_k, out_k.get(), N_k, nullptr, "K");
+        projections.emplace_back(k_v, out_v.get(), N_v, nullptr, "V");
 
         ASSERT_TRUE(with_gpu_coherence(
             gpu_device_,
@@ -736,7 +744,7 @@ TEST_F(Test__CUDAGemmNonDeterminism, FusedQKV_SelfConsistency)
     EXPECT_FLOAT_EQ(max_k_abs, 0.0f) << "K projection max_abs drift should be zero";
     EXPECT_FLOAT_EQ(max_v_abs, 0.0f) << "V projection max_abs drift should be zero";
 
-    cleanupSharedWorkspace({k_q.get(), k_k.get(), k_v.get()});
+    cleanupSharedWorkspace({k_q, k_k, k_v});
 }
 
 // ============================================================================
@@ -774,12 +782,12 @@ TEST_F(Test__CUDAGemmNonDeterminism, SingleKernel_SelfConsistency)
 
     ASSERT_TRUE(w_up->ensureOnDevice(gpu_device_));
 
-    auto kernel = llaminar::v2::kernels::KernelFactory::createGemm(
-        w_up, KernelDeviceType::CUDA);
+    auto *kernel = getPreparedKernel(
+        w_up, gpu_device_);
     ASSERT_NE(kernel, nullptr);
 
     // Set up workspace for single kernel
-    auto *ws = dynamic_cast<IWorkspaceConsumer *>(kernel.get());
+    auto *ws = dynamic_cast<IWorkspaceConsumer *>(kernel);
     if (ws)
     {
         auto reqs = ws->getWorkspaceRequirements(M, N, K);
@@ -901,10 +909,10 @@ TEST_F(Test__CUDAGemmNonDeterminism, NativeVNNI_SelfConsistency)
     ASSERT_NE(w_down, nullptr);
     ASSERT_TRUE(w_down->ensureOnDevice(gpu_device_));
 
-    auto kernel = llaminar::v2::kernels::KernelFactory::createGemm(w_down, KernelDeviceType::CUDA);
+    auto *kernel = getPreparedKernel(w_down, gpu_device_);
     ASSERT_NE(kernel, nullptr);
 
-    auto *ws = dynamic_cast<IWorkspaceConsumer *>(kernel.get());
+    auto *ws = dynamic_cast<IWorkspaceConsumer *>(kernel);
     ASSERT_NE(ws, nullptr);
     auto reqs = ws->getWorkspaceRequirements(M, N, K);
     workspace_ = std::make_unique<DeviceWorkspaceManager>(gpu_device_, 128 * 1024 * 1024);

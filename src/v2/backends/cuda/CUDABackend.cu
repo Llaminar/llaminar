@@ -98,26 +98,23 @@ namespace llaminar2
     // Stream Resolution Helper
     // ====================================================================
 
-    /// Resolve a CUDA stream for the given device. When the caller passes
-    /// nullptr we look up the device context's default (non-blocking) stream
-    /// so that NO operation ever runs on the null CUDA stream.
+    /// Resolve a CUDA stream for the given device.
+    ///
+    /// Returns the caller-provided stream if non-null, otherwise nullptr
+    /// (legacy default stream). The pool's non-blocking default stream is
+    /// NOT used as a fallback because non-blocking streams have different
+    /// synchronization semantics: cudaFree and cudaHostUnregister do NOT
+    /// implicitly synchronize with non-blocking streams, causing silent
+    /// data corruption when tensors are destroyed and GPU memory is reused
+    /// by subsequent operations (e.g., weight repack pipelines).
+    ///
+    /// Callers that need the pool's stream (e.g., DeviceGraphExecutor)
+    /// should pass it explicitly via the stream parameter.
     static cudaStream_t resolveStream(int device_id, void *stream)
     {
         if (stream)
             return static_cast<cudaStream_t>(stream);
-
-        try
-        {
-            auto &ctx = GPUDeviceContextPool::instance().getNvidiaContext(device_id);
-            void *def = ctx.defaultStream();
-            if (def)
-                return static_cast<cudaStream_t>(def);
-        }
-        catch (...)
-        {
-            // Context not yet initialised (early weight load, tests).
-        }
-        return nullptr; // absolute fallback
+        return nullptr; // Use legacy default stream
     }
 
     // ====================================================================
@@ -423,7 +420,8 @@ namespace llaminar2
         cudaError_t err = cudaSetDevice(device_id);
         if (err != cudaSuccess)
         {
-            LOG_ERROR("[CUDABackend] Failed to set device " << device_id << " before cudaFree: "
+            // Benign during process exit — driver is already shutting down
+            LOG_DEBUG("[CUDABackend] Failed to set device " << device_id << " before cudaFree: "
                                                             << cudaGetErrorString(err));
             return;
         }
@@ -431,7 +429,7 @@ namespace llaminar2
         err = cudaFree(ptr);
         if (err != cudaSuccess)
         {
-            LOG_ERROR("[CUDABackend] cudaFree failed for ptr=" << std::hex << ptr << std::dec
+            LOG_DEBUG("[CUDABackend] cudaFree failed for ptr=" << std::hex << ptr << std::dec
                                                                << " on device " << device_id << ": " << cudaGetErrorString(err));
         }
     }

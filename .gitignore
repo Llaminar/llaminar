@@ -41,6 +41,7 @@ compile_commands.json
 *.pdb
 **/gpucore*
 **/core.*
+**/vgcore*
 
 # System files
 .DS_Store

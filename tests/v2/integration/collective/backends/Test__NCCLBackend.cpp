@@ -164,20 +164,18 @@ namespace llaminar2
             return group;
         }
 
-        /**
-         * @brief Skip test if fewer than required GPUs
-         */
-        void skipIfLessThan(int required_gpus)
-        {
-            if (device_count_ < required_gpus)
-            {
-                GTEST_SKIP() << "Test requires " << required_gpus
-                             << " GPUs, only " << device_count_ << " available";
-            }
-        }
-
         int device_count_ = 0;
     };
+
+// GTEST_SKIP() only returns from the function it's called in, so this must be
+// a macro (not a method) to return from the TEST_F body itself.
+#define SKIP_IF_LESS_THAN(required_gpus)                                       \
+    do {                                                                       \
+        if (device_count_ < (required_gpus)) {                                 \
+            GTEST_SKIP() << "Test requires " << (required_gpus)                \
+                         << " GPUs, only " << device_count_ << " available";   \
+        }                                                                      \
+    } while (0)
 
     // =========================================================================
     // Availability Tests
@@ -245,7 +243,7 @@ namespace llaminar2
 
     TEST_F(NCCLBackendTest, Initialize_MultiGPU)
     {
-        skipIfLessThan(2);
+        SKIP_IF_LESS_THAN(2);
 
         NCCLBackend backend;
         DeviceGroup group = createDeviceGroup(2);
@@ -630,7 +628,7 @@ namespace llaminar2
 
     TEST_F(NCCLBackendTest, AllReduce_MultiGPU_DoesNotCrash)
     {
-        skipIfLessThan(2);
+        SKIP_IF_LESS_THAN(2);
 
         NCCLBackend backend;
         DeviceGroup group = createDeviceGroup(2);
@@ -672,7 +670,7 @@ namespace llaminar2
      */
     TEST_F(NCCLBackendTest, AllReduce_MultiGPU_SingleProcess)
     {
-        skipIfLessThan(2);
+        SKIP_IF_LESS_THAN(2);
 
         NCCLBackend backend;
         DeviceGroup group = createDeviceGroup(device_count_);
@@ -750,7 +748,7 @@ namespace llaminar2
      */
     TEST_F(NCCLBackendTest, AllGather_MultiGPU_SingleProcess)
     {
-        skipIfLessThan(2);
+        SKIP_IF_LESS_THAN(2);
 
         NCCLBackend backend;
         DeviceGroup group = createDeviceGroup(device_count_);
@@ -837,7 +835,7 @@ namespace llaminar2
      */
     TEST_F(NCCLBackendTest, Broadcast_MultiGPU_SingleProcess)
     {
-        skipIfLessThan(2);
+        SKIP_IF_LESS_THAN(2);
 
         NCCLBackend backend;
         DeviceGroup group = createDeviceGroup(device_count_);

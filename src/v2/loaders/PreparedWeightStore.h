@@ -3,6 +3,7 @@
 #include "ExpertSlabTypes.h"
 #include "WeightPlan.h"
 #include "../kernels/KernelFactory.h"
+#include "../kernels/common/PreparedEmbeddingWeights.h"
 
 #include <mutex>
 #include <optional>
@@ -66,6 +67,43 @@ namespace llaminar2
             const TensorBase *gate_tensor,
             const TensorBase *up_tensor,
             DeviceId device) const;
+
+        // =========================================================================
+        // Embedding Preparation & Resolution
+        // =========================================================================
+
+        /// Prepare embedding weights on a target device. Delegates creation to
+        /// KernelFactory but owns the handle lifetime.
+        PreparedWeightRef prepareEmbedding(
+            const WeightBinding &binding,
+            int d_model,
+            size_t vocab_offset = 0,
+            size_t total_vocab = 0);
+
+        /// Register an already-prepared embedding handle from the pipeline.
+        PreparedWeightRef registerPreparedEmbeddingFromPipeline(
+            const WeightBinding &binding,
+            DeviceId device,
+            const PreparedEmbeddingHandle *handle);
+
+        /// Look up prepared embedding weights by ref. O(1).
+        const PreparedEmbeddingHandle *embeddingHandle(const PreparedWeightRef &ref) const;
+
+        /// Look up prepared embedding by tensor pointer. O(n) scan.
+        const PreparedEmbeddingHandle *embeddingHandleForTensor(
+            const TensorBase *tensor,
+            DeviceId device) const;
+
+        // =========================================================================
+        // Sliced GEMM (TP row-range) Resolution
+        // =========================================================================
+
+        /// Get or create a sliced GEMM kernel for a row-range of a weight tensor.
+        /// Delegates creation to KernelFactory, caches the result locally.
+        ITensorGemm *slicedGemmKernel(
+            const TensorBase *tensor,
+            size_t row_start,
+            size_t row_end) const;
 
         // =========================================================================
         // Query & Lifecycle
@@ -163,6 +201,70 @@ namespace llaminar2
         mutable std::mutex mutex_;
         std::unordered_map<uint64_t, Entry> entries_;
         mutable std::unordered_map<FusedCacheKey, std::unique_ptr<ITensorFusedGateUpGemm>, FusedCacheHash> fused_cache_;
+
+        // =========================================================================
+        // Embedding Storage (Phase 8: owned by this store)
+        // =========================================================================
+
+        struct EmbeddingEntry
+        {
+            WeightBinding binding;
+            PreparedWeightRef ref;
+            std::shared_ptr<PreparedEmbeddingHandle> owned_handle;
+            const PreparedEmbeddingHandle *legacy_handle = nullptr;
+
+            const PreparedEmbeddingHandle *activeHandle() const
+            {
+                return owned_handle ? owned_handle.get() : legacy_handle;
+            }
+        };
+
+        struct EmbeddingKey
+        {
+            const TensorBase *tensor = nullptr;
+            DeviceId device;
+            bool operator==(const EmbeddingKey &o) const
+            {
+                return tensor == o.tensor && device == o.device;
+            }
+        };
+        struct EmbeddingKeyHash
+        {
+            size_t operator()(const EmbeddingKey &k) const
+            {
+                return std::hash<const void *>{}(k.tensor) ^ (std::hash<DeviceId>{}(k.device) << 16);
+            }
+        };
+
+        std::unordered_map<uint64_t, EmbeddingEntry> embedding_entries_;
+        std::unordered_map<EmbeddingKey, uint64_t, EmbeddingKeyHash> embedding_by_tensor_;
+
+        // =========================================================================
+        // Sliced GEMM Cache (Phase 8: owned by this store)
+        // =========================================================================
+
+        struct SlicedKey
+        {
+            const TensorBase *tensor = nullptr;
+            size_t row_start = 0;
+            size_t row_end = 0;
+            bool operator==(const SlicedKey &o) const
+            {
+                return tensor == o.tensor && row_start == o.row_start && row_end == o.row_end;
+            }
+        };
+        struct SlicedKeyHash
+        {
+            size_t operator()(const SlicedKey &k) const
+            {
+                auto h = std::hash<const void *>{}(k.tensor);
+                h ^= std::hash<size_t>{}(k.row_start) << 16;
+                h ^= std::hash<size_t>{}(k.row_end) << 32;
+                return h;
+            }
+        };
+
+        mutable std::unordered_map<SlicedKey, ITensorGemm *, SlicedKeyHash> sliced_cache_;
 
         // =========================================================================
         // Expert Slab Storage

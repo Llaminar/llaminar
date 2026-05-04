@@ -22,6 +22,7 @@
  */
 
 #include <gtest/gtest.h>
+#include <mpi.h>
 #include <fstream>
 #include <cmath>
 #include <numeric>
@@ -286,3 +287,22 @@ INSTANTIATE_TEST_SUITE_P(
     Test__MultiTurnSessionReset,
     ::testing::Values(TestBackend::CPU, TestBackend::CUDA, TestBackend::ROCm),
     backendName);
+
+// ============================================================================
+// Custom main() — MPI must be initialized before the runner factory is called
+// ============================================================================
+
+int main(int argc, char **argv)
+{
+    int provided = 0;
+    MPI_Init_thread(&argc, &argv, MPI_THREAD_FUNNELED, &provided);
+
+    ::testing::InitGoogleTest(&argc, argv);
+    int result = RUN_ALL_TESTS();
+
+    MPI_Finalize();
+
+    // Use _exit() to skip static destructors — CUDA/ROCm driver cleanup
+    // races with MPI teardown, causing hangs or SIGABRT on process exit.
+    _exit(result);
+}

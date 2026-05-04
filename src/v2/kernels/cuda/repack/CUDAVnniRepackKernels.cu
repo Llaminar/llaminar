@@ -673,9 +673,7 @@ __global__ void cuda_repack_iq2xs_to_vnni(
     payload_buf[4] = qh_byte;
 
     uint8_t* dst = d_payload + linear * 9;
-    *reinterpret_cast<uint32_t*>(dst) = *reinterpret_cast<uint32_t*>(payload_buf);
-    *reinterpret_cast<uint32_t*>(dst + 4) = *reinterpret_cast<uint32_t*>(payload_buf + 4);
-    dst[8] = payload_buf[8];
+    memcpy(dst, payload_buf, 9);
 
     float d_f = __half2float(*reinterpret_cast<const __half*>(&blk.d));
     uint8_t sc = blk.scales[sub_idx];
@@ -760,8 +758,7 @@ __global__ void cuda_repack_iq1s_to_vnni(
     payload_buf[4] = static_cast<uint8_t>(qh_word & 0xFF);
     payload_buf[5] = static_cast<uint8_t>((qh_word >> 8) & 0xFF);
 
-    *reinterpret_cast<uint32_t*>(d_payload + linear * 6) = *reinterpret_cast<uint32_t*>(payload_buf);
-    *reinterpret_cast<uint16_t*>(d_payload + linear * 6 + 4) = *reinterpret_cast<uint16_t*>(payload_buf + 4);
+    memcpy(d_payload + linear * 6, payload_buf, 6);
 
     float d_f = __half2float(*reinterpret_cast<const __half*>(&blk.d));
     int scale_sel = (qh_word >> 12) & 7;
@@ -821,8 +818,7 @@ __global__ void cuda_repack_iq1m_to_vnni(
     payload_buf[4] = qh[0];
     payload_buf[5] = qh[1];
 
-    *reinterpret_cast<uint32_t*>(d_payload + linear * 6) = *reinterpret_cast<uint32_t*>(payload_buf);
-    *reinterpret_cast<uint16_t*>(d_payload + linear * 6 + 4) = *reinterpret_cast<uint16_t*>(payload_buf + 4);
+    memcpy(d_payload + linear * 6, payload_buf, 6);
 
     d_scales[linear] = __half_as_ushort(__float2half_rn(dl1));
     d_mins[linear]   = __half_as_ushort(__float2half_rn(dl2));

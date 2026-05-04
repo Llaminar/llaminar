@@ -3564,7 +3564,7 @@ namespace llaminar2
                     ++registered;
 
                     // Release host weight data — the GEMM kernel now owns device copies
-                    // in the WeightVRAMPool.  in_prepared_gemm_registry_ is already set
+                    // in the WeightVRAMPool.  has_prepared_device_state_ is already set
                     // by registerPreparedGemmFromTransfer(), so releaseAllHostWeightData()
                     // would also catch these, but releasing inline saves peak host memory.
                     // Skip for token_embd.weight: it's also used for embedding lookup,
