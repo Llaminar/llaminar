@@ -1291,6 +1291,7 @@ add_library(llaminar2_core STATIC
     loaders/WeightPlan.cpp
     loaders/WeightIdentity.cpp
     loaders/WeightMetadataRegistry.cpp
+    loaders/ExpertGemmRegistry.cpp
     # Partial weight loader (Phase 3 - PP partial weight loading)
     loaders/PartialWeightLoader.cpp
     # GPU weight loading pipeline (Phase 1 - Foundation)

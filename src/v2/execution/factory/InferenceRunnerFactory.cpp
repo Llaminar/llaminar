@@ -766,6 +766,7 @@ namespace llaminar2
         {
             ScopedWeightLoadDetailTimer timer("graph.build.create_orchestrator");
             auto graph_builder = GraphBuilderRegistry::create(architecture, graph_config, mpi_ctx);
+            graph_builder->setModelContext(model_ctx);
             orchestrator = std::make_unique<DeviceGraphOrchestrator>(
                 std::move(graph_builder), mpi_ctx);
         }
@@ -1539,6 +1540,7 @@ namespace llaminar2
         DeviceGraphOrchestrator::Dependencies deps;
         deps.model_ctx = model_ctx;
         deps.graph_builder = GraphBuilderRegistry::create(architecture, graph_config, nullptr);
+        deps.graph_builder->setModelContext(model_ctx);
         deps.pipeline_config = pipeline_config;
 
         auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(
@@ -1693,6 +1695,7 @@ namespace llaminar2
         // Note: No MPI context for PP stages - inter-stage comm handled externally
         // =====================================================================
         auto graph_builder = GraphBuilderRegistry::create(architecture, graph_config, nullptr);
+        graph_builder->setModelContext(model_ctx);
         auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(
             std::move(graph_builder), nullptr /* no mpi_ctx */);
 
@@ -1860,6 +1863,7 @@ namespace llaminar2
         DeviceGraphOrchestrator::Dependencies deps;
         deps.model_ctx = model_ctx;
         deps.graph_builder = GraphBuilderRegistry::create(architecture, graph_config, nullptr);
+        deps.graph_builder->setModelContext(model_ctx);
         deps.turboquant_ctx = std::move(turboquant_ctx);
         deps.kv_rotation = std::move(kv_rotation);
         if (config.pp_stage_config.has_value())

@@ -27,6 +27,7 @@ class TensorBase;
 class ITensorGemm;
 class ExpertWeightPayloadProvider;
 class PreparedWeightStore;
+class ExpertGemmRegistry;
 
 /// Lightweight reference struct pointing to the MoEExpertComputeStage::Params fields
 /// that the weight service operates on. Avoids coupling the service to the
@@ -69,6 +70,10 @@ struct MoEWeightContext {
     // Phase B: dual-path registration target. When non-null, engines are
     // registered in BOTH KernelFactory AND this PreparedWeightStore.
     PreparedWeightStore* prepared_store = nullptr;
+
+    // ExpertGemmRegistry for dynamic rebalancing registry updates.
+    // When non-null, engine arrivals/departures are mirrored to the registry.
+    ExpertGemmRegistry* expert_registry = nullptr;
 
     // Phase C: Cached slab refs (set by prepareGemmEngines, reused by rebalance).
     // Optional because they're only populated when prepared_store is non-null.

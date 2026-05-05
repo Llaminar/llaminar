@@ -116,6 +116,49 @@ namespace llaminar2
                                                                    << " weights on CUDA device " << cuda_device_id_);
         }
 
+        CUDAFloatingPointGemmKernel::CUDAFloatingPointGemmKernel(
+            const void *d_weights,
+            int N, int K,
+            int cuda_device_id,
+            Precision precision,
+            std::shared_ptr<void> lifetime_owner)
+            : weights_(nullptr),
+              d_weights_(d_weights),
+              cuda_device_id_(cuda_device_id),
+              precision_(precision),
+              N_(static_cast<size_t>(N)),
+              K_(static_cast<size_t>(K)),
+              cublas_kernel_(nullptr),
+              lifetime_owner_(std::move(lifetime_owner))
+        {
+            if (!d_weights)
+            {
+                throw std::runtime_error("[CUDAFloatingPointGemmKernel] Null device weight pointer");
+            }
+
+            // Create underlying cuBLAS kernel
+            CuBLASGemmKernel::Precision cublas_precision;
+            switch (precision)
+            {
+            case Precision::FP32:
+                cublas_precision = CuBLASGemmKernel::Precision::FP32;
+                break;
+            case Precision::FP16:
+                cublas_precision = CuBLASGemmKernel::Precision::FP16;
+                break;
+            case Precision::BF16:
+                cublas_precision = CuBLASGemmKernel::Precision::BF16;
+                break;
+            default:
+                cublas_precision = CuBLASGemmKernel::Precision::FP32;
+            }
+
+            cublas_kernel_ = std::make_unique<CuBLASGemmKernel>(cuda_device_id_, cublas_precision);
+
+            LOG_DEBUG("[CUDAFloatingPointGemmKernel] Created (raw ptr) for " << N_ << "x" << K_
+                      << " weights on CUDA device " << cuda_device_id_);
+        }
+
         CUDAFloatingPointGemmKernel::~CUDAFloatingPointGemmKernel()
         {
             if (d_mapped_redirect_)
@@ -134,6 +177,7 @@ namespace llaminar2
               N_(other.N_),
               K_(other.K_),
               cublas_kernel_(std::move(other.cublas_kernel_)),
+              lifetime_owner_(std::move(other.lifetime_owner_)),
               d_mapped_redirect_(other.d_mapped_redirect_),
               mapped_redirect_capacity_(other.mapped_redirect_capacity_)
         {

@@ -220,14 +220,79 @@ namespace llaminar2
                 LOG_ERROR("[Qwen35MoEGraph] Failed to extract expert views for layer " << layer_idx);
             }
 
-            // Pre-resolve CPU GEMM engines for all local experts. On GPU, only
-            // pre-resolve when an explicit expert cache mask is present; otherwise
-            // Qwen3.5 MoE 35B cannot keep every expert for every layer resident.
-            if (device.is_gpu() && expert_params.expert_mask.empty())
+            // Set expert_registry for dynamic rebalancing registry updates
+            if (model_ctx_)
             {
-                expert_params.prepared_gate_gemm.assign(config_.moe.num_experts, nullptr);
-                expert_params.prepared_up_gemm.assign(config_.moe.num_experts, nullptr);
-                expert_params.prepared_down_gemm.assign(config_.moe.num_experts, nullptr);
+                auto weight_mgr = model_ctx_->concreteWeightManager();
+                if (weight_mgr)
+                    expert_params.expert_registry = &weight_mgr->expertGemmRegistry();
+            }
+
+            // CPU prepares engines inline. GPU graph construction must consume the
+            // unified pipeline registry and fail before execution if required
+            // resident expert engines are absent.
+            if (device.is_gpu())
+            {
+                const bool has_active_masked_expert = hasActiveExpertMask(expert_params.expert_mask);
+
+                auto weight_mgr = model_ctx_ ? model_ctx_->concreteWeightManager() : nullptr;
+                if (!weight_mgr)
+                {
+                    if (expert_params.expert_mask.empty() || has_active_masked_expert)
+                        failMissingGpuExpertGemmEngines(device, layer_idx, "WeightManager unavailable");
+
+                    expert_params.prepared_gate_gemm.assign(config_.moe.num_experts, nullptr);
+                    expert_params.prepared_up_gemm.assign(config_.moe.num_experts, nullptr);
+                    expert_params.prepared_down_gemm.assign(config_.moe.num_experts, nullptr);
+                }
+                else
+                {
+                    const auto &registry = weight_mgr->expertGemmRegistry();
+                    const bool complete_layer = registry.hasCompleteLayer(device, layer_idx, config_.moe.num_experts);
+                    const bool populated = registry.populateExpertEngines(device, layer_idx, config_.moe.num_experts,
+                                                                          expert_params.prepared_gate_gemm,
+                                                                          expert_params.prepared_up_gemm,
+                                                                          expert_params.prepared_down_gemm);
+
+                    if (expert_params.expert_mask.empty())
+                    {
+                        if (!complete_layer || !populated)
+                            failMissingGpuExpertGemmEngines(
+                                device, layer_idx,
+                                "incomplete ExpertGemmRegistry entry (" +
+                                    describeMissingExpertGemmEngine(config_.moe.num_experts,
+                                                                    expert_params.expert_mask,
+                                                                    expert_params.prepared_gate_gemm,
+                                                                    expert_params.prepared_up_gemm,
+                                                                    expert_params.prepared_down_gemm) +
+                                    ")");
+                    }
+                    else if (has_active_masked_expert)
+                    {
+                        for (int expert = 0; expert < config_.moe.num_experts; ++expert)
+                        {
+                            if (!expert_params.expert_mask[expert])
+                                continue;
+                            if (expert_params.prepared_gate_gemm[expert] == nullptr ||
+                                expert_params.prepared_up_gemm[expert] == nullptr ||
+                                expert_params.prepared_down_gemm[expert] == nullptr)
+                                failMissingGpuExpertGemmEngines(
+                                    device, layer_idx,
+                                    "missing active masked expert engine (" +
+                                        describeMissingExpertGemmEngine(config_.moe.num_experts,
+                                                                        expert_params.expert_mask,
+                                                                        expert_params.prepared_gate_gemm,
+                                                                        expert_params.prepared_up_gemm,
+                                                                        expert_params.prepared_down_gemm) +
+                                        ")");
+                        }
+                    }
+
+                    LOG_DEBUG("[Qwen35MoEGraph] Layer " << layer_idx
+                              << ": populated expert GEMM engines from registry"
+                              << " complete_layer=" << complete_layer
+                              << " active_masked_expert=" << has_active_masked_expert);
+                }
             }
             else
             {

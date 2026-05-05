@@ -30,6 +30,7 @@
 #include "../../execution/compute_stages/stages/QKNormStage.h"
 #include "../../config/PipelineConfig.h"
 #include "../../memory/BufferId.h" // Phase 2: contract BufferIds
+#include <algorithm>
 #include <chrono>
 #include <chrono>
 #include <cstring>
@@ -107,6 +108,60 @@ namespace llaminar2
                                                                         << " default_device=" << config_.default_device.to_string());
 
         LOG_DEBUG("[QwenGraphBase] Initialized (layer-only)");
+    }
+
+    void QwenGraphBase::setModelContext(std::shared_ptr<IModelContext> model_ctx)
+    {
+        model_ctx_ = std::dynamic_pointer_cast<ModelContext>(std::move(model_ctx));
+        if (!model_ctx_)
+        {
+            LOG_DEBUG("[QwenGraphBase] setModelContext ignored non-ModelContext instance");
+        }
+    }
+
+    bool QwenGraphBase::hasActiveExpertMask(const std::vector<bool> &expert_mask) const
+    {
+        return std::any_of(expert_mask.begin(), expert_mask.end(), [](bool active)
+                           { return active; });
+    }
+
+    std::string QwenGraphBase::describeMissingExpertGemmEngine(
+        int num_experts,
+        const std::vector<bool> &expert_mask,
+        const std::vector<ITensorGemm *> &gate_gemm,
+        const std::vector<ITensorGemm *> &up_gemm,
+        const std::vector<ITensorGemm *> &down_gemm) const
+    {
+        for (int expert = 0; expert < num_experts; ++expert)
+        {
+            if (!expert_mask.empty())
+            {
+                if (expert >= static_cast<int>(expert_mask.size()))
+                    return "expert=" + std::to_string(expert) + " role=mask";
+                if (!expert_mask[expert])
+                    continue;
+            }
+
+            if (expert >= static_cast<int>(gate_gemm.size()) || gate_gemm[expert] == nullptr)
+                return "expert=" + std::to_string(expert) + " role=gate";
+            if (expert >= static_cast<int>(up_gemm.size()) || up_gemm[expert] == nullptr)
+                return "expert=" + std::to_string(expert) + " role=up";
+            if (expert >= static_cast<int>(down_gemm.size()) || down_gemm[expert] == nullptr)
+                return "expert=" + std::to_string(expert) + " role=down";
+        }
+
+        return "unknown missing expert engine";
+    }
+
+    void QwenGraphBase::failMissingGpuExpertGemmEngines(
+        DeviceId device,
+        int layer_idx,
+        const std::string &reason) const
+    {
+        const std::string message = "[" + architectureName() + "] Missing GPU expert GEMM engines for layer " +
+                                    std::to_string(layer_idx) + " on " + device.to_string() + ": " + reason;
+        LOG_ERROR(message);
+        throw std::runtime_error(message);
     }
 
     // =============================================================================

@@ -19,6 +19,7 @@
 
 #pragma once
 
+#include "ExpertGemmRegistry.h"
 #include "IModelLoader.h"
 #include "WeightLifecycleTrace.h"
 #include "WeightMetadataRegistry.h"
@@ -411,13 +412,14 @@ namespace llaminar2
         WeightMetadataRegistry *weightMetadataRegistry() const { return weight_metadata_.get(); }
 
         /**
-         * @brief Set the expert weight payload provider for metadata-based host retention.
+         * @brief Set the expert weight payload provider.
          *
-         * When set, releaseAllHostWeightData() uses the provider to determine whether
-         * expert weight raw host data is still needed, instead of the string-matching
-         * shouldRetainRawForLazyMoE() heuristic.
+         * Used by MoE stages to track which experts have been prepared/transferred.
+         * After Phase 9 final, the provider is informational only — host release
+         * no longer depends on per-expert preparation state because all experts
+         * are prepared upfront at graph-build time.
          *
-         * @param provider Model-context owned payload provider (may be nullptr to disable)
+         * @param provider Model-context owned payload provider (may be nullptr)
          */
         void setExpertPayloadProvider(ExpertWeightPayloadProvider *provider)
         {
@@ -427,9 +429,10 @@ namespace llaminar2
         /**
          * @brief Check if raw host data is still required for a tensor.
          *
-         * Uses WeightMetadataRegistry and ExpertWeightPayloadProvider to determine
-         * whether the tensor's raw host data should be retained. Replaces the
-         * string-matching shouldRetainRawForLazyMoE() heuristic.
+         * Uses WeightMetadataRegistry host policy to determine whether the tensor's
+         * raw host data should be retained. Only RequiredForCPUExecution policy
+         * causes retention. All other policies (including expert weights) allow
+         * release after device preparation completes.
          *
          * @param tensor The tensor to check
          * @param key The cache key (canonical name) of the tensor
@@ -703,6 +706,10 @@ namespace llaminar2
          */
         const WeightLifecycleGates &lifecycleGates() const { return lifecycle_gates_; }
 
+        /// Access the expert GEMM registry (populated by GPU pipeline, queried by graph builders)
+        ExpertGemmRegistry &expertGemmRegistry() { return expert_gemm_registry_; }
+        const ExpertGemmRegistry &expertGemmRegistry() const { return expert_gemm_registry_; }
+
         /**
          * @brief Get the current lifecycle state (derived from gates)
          */
@@ -746,24 +753,6 @@ namespace llaminar2
             lifecycle_gates_.host_release_allowed = lifecycle_gates_.canReleaseHostData();
             LOG_DEBUG("[WeightManager] Lifecycle gate: graph_materialization_complete"
                       << " (host_release_allowed=" << lifecycle_gates_.host_release_allowed << ")");
-        }
-
-        /**
-         * @brief Reset graph materialization gate for lazy graph building paths.
-         *
-         * Phase 9: Used by RankOrchestrator when the model has lazy graph building
-         * (e.g., MoE expert VNNI packing during first forward). Resets the gate
-         * to prevent premature host data release. After lazy graph building
-         * completes, call markGraphMaterializationComplete() to re-enable release.
-         *
-         * This replaces the ad-hoc deferred_host_release_pending_ flag.
-         */
-        void resetGraphMaterializationGate() override
-        {
-            lifecycle_gates_.graph_materialization_complete = false;
-            lifecycle_gates_.host_release_allowed = false;
-            LOG_DEBUG("[WeightManager] Lifecycle gate RESET: graph_materialization_complete=false"
-                      << " (lazy graph building pending)");
         }
 
     private:
@@ -1156,6 +1145,8 @@ namespace llaminar2
         // =========================================================================
 
         WeightLifecycleGates lifecycle_gates_;
+
+        ExpertGemmRegistry expert_gemm_registry_;
 
         // =========================================================================
         // Phase 2: Per-weight/device readiness tickets and TP-safe reclaim eligibility

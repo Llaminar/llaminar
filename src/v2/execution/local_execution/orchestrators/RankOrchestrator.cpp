@@ -623,10 +623,9 @@ namespace llaminar2
                 device_ids.push_back(device_addr.toLocalDeviceId());
             }
 
-            // Finalize weights for all devices: clone + upload + GEMM pack.
-            // Host data release is DEFERRED until after device runners are created,
-            // because graph building (which happens during runner creation) may need
-            // host data — e.g. MoE expert VNNI packing reads from host tensors.
+            // Finalize weights for all devices: clone, upload, and prepare GEMM
+            // weights. Host data release is deferred until after device runners are
+            // created because graph construction resolves prepared weight bindings.
             auto weight_mgr = model_ctx_->weightManager();
             if (weight_mgr)
             {
@@ -635,7 +634,7 @@ namespace llaminar2
                          << " (release_host_data=false, deferred until after graph build)");
                 if (!weight_mgr->finalizeForDevices(device_ids, /*release_host_data=*/false))
                 {
-                    LOG_WARN("RankOrchestrator: Weight finalization failed, will use lazy packing");
+                    LOG_WARN("RankOrchestrator: Weight finalization failed; prepared kernels may be unavailable");
                 }
             }
         }
@@ -752,16 +751,14 @@ namespace llaminar2
         }
 
         // =====================================================================
-        // GATE-CONTROLLED HOST WEIGHT RELEASE (Phase 9)
+        // SYNCHRONOUS HOST WEIGHT RELEASE (Phase 9 final)
         // =====================================================================
-        // After device runners are created, graph building for eager architectures
-        // has completed. However, MoE models have LAZY graph building that happens
-        // during the first forward() call (expert VNNI packing reads host data).
+        // All expert GEMM preparation is resolved before host release: GPU paths
+        // consume the unified ExpertGemmRegistry and CPU paths prepare inline.
+        // There is no lazy graph building path.
+        // Dynamic MoE rebalancing uses serialized transfer blobs, not raw host data.
         //
-        // Phase 9: Reset the graph_materialization_complete gate to prevent
-        // premature host release. The gate will be re-marked after first forward.
-        // This replaces the old deferred_host_release_pending_ flag with typed
-        // lifecycle gate semantics.
+        // Mark graph_materialization_complete and release host data immediately.
         // =====================================================================
         {
             const bool is_nested_tp_in_pp = config_.nested_pp_stage_config.has_value();
@@ -770,9 +767,17 @@ namespace llaminar2
                 auto weight_mgr = model_ctx_->weightManager();
                 if (weight_mgr)
                 {
-                    weight_mgr->resetGraphMaterializationGate();
-                    LOG_INFO("RankOrchestrator: Graph materialization gate reset — host weight "
-                             "release blocked until after first forward pass completes");
+                    weight_mgr->markGraphMaterializationComplete();
+
+                    size_t released = weight_mgr->releaseAllHostWeightData();
+                    if (released > 0)
+                    {
+                        LOG_INFO("RankOrchestrator: Host weight release after graph materialization: "
+                                 << released << " tensors released");
+#ifdef __linux__
+                        ::malloc_trim(0);
+#endif
+                    }
                 }
             }
             else
@@ -1283,31 +1288,6 @@ namespace llaminar2
         default:
             LOG_ERROR("RankOrchestrator::forward: Unknown parallelism mode");
             return false;
-        }
-
-        // Phase 9: After first successful forward, mark graph materialization complete
-        // (lazy graph building, including MoE expert VNNI packing, is now done).
-        // Then release host weight data through the lifecycle gate system.
-        if (success && !first_forward_complete_)
-        {
-            first_forward_complete_ = true;
-            auto weight_mgr = model_ctx_->weightManager();
-            if (weight_mgr)
-            {
-                // Re-mark the gate now that lazy graph builds are done
-                weight_mgr->markGraphMaterializationComplete();
-
-                // Gate-controlled release — will succeed now that all gates are true
-                size_t released = weight_mgr->releaseAllHostWeightData();
-                if (released > 0)
-                {
-                    LOG_INFO("RankOrchestrator: Host weight release after first forward: "
-                             << released << " tensors released");
-#ifdef __linux__
-                    ::malloc_trim(0);
-#endif
-                }
-            }
         }
 
         return success;

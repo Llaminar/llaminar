@@ -3,8 +3,9 @@
  * @brief Unit tests for ExpertWeightPayloadProvider lifecycle tracking.
  *
  * Tests the register/query/mark/release lifecycle of the payload provider
- * which replaces string-matching shouldRetainRawForLazyMoE() with
- * metadata-based expert preparation state tracking.
+ * which tracks expert preparation state for dynamic MoE rebalancing.
+ * All local experts are prepared upfront at graph-build time; the provider
+ * supplies serialized transfer blobs for dynamically-arrived experts.
  */
 
 #include <gtest/gtest.h>

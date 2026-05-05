@@ -125,6 +125,36 @@ void WeightVRAMPool::planWeight(const std::string& name, int N, int K,
               << " emins=" << plan.emins_bytes);
 }
 
+void WeightVRAMPool::planRawWeight(const std::string& name, int N, int K, size_t raw_bytes)
+{
+    if (allocated_)
+    {
+        LOG_ERROR("Cannot plan weights after allocation");
+        throw std::runtime_error("WeightVRAMPool: cannot plan after allocate()");
+    }
+    if (plans_.count(name))
+    {
+        LOG_ERROR("Duplicate weight name: " << name);
+        throw std::runtime_error("WeightVRAMPool: duplicate weight name '" + name + "'");
+    }
+
+    WeightPlan plan;
+    plan.N = N;
+    plan.K = K;
+    plan.staging_bytes = raw_bytes;
+
+    // For raw FP weights, the entire allocation is in the payload region.
+    // No scales/mins/emins needed.
+    plan.payload_bytes = raw_bytes;
+    plan.payload_offset = allocateRegion(raw_bytes);
+
+    plans_[name] = plan;
+    weight_order_.push_back(name);
+
+    LOG_DEBUG("Planned raw weight '" << name << "' N=" << N << " K=" << K
+              << " bytes=" << raw_bytes);
+}
+
 bool WeightVRAMPool::allocate(IBackend* backend, int device_id, int staging_slot_count)
 {
     if (allocated_)
@@ -205,7 +235,7 @@ std::optional<WeightVRAMPool::WeightSlot> WeightVRAMPool::getSlot(const std::str
     if (base)
     {
         slot.d_native_vnni_payload = base + plan.payload_offset;
-        slot.d_native_vnni_scales = base + plan.scales_offset;
+        slot.d_native_vnni_scales = plan.scales_bytes > 0 ? base + plan.scales_offset : nullptr;
         slot.d_native_vnni_mins = plan.mins_bytes > 0 ? base + plan.mins_offset : nullptr;
         slot.d_native_vnni_emins = plan.emins_bytes > 0 ? base + plan.emins_offset : nullptr;
     }

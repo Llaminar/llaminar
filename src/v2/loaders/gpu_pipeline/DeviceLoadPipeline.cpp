@@ -217,7 +217,7 @@ bool DeviceLoadPipeline::processJobs(const std::vector<WeightJob>& jobs)
             return false;
         }
 
-        // 6. Launch GPU repack kernel on repack stream
+        // 6. Launch GPU repack kernel on repack stream (or direct D2D copy for raw FP)
         auto slot = pool_.getSlot(job.name);
         if (!slot)
         {
@@ -225,20 +225,36 @@ bool DeviceLoadPipeline::processJobs(const std::vector<WeightJob>& jobs)
             return false;
         }
 
-        bool repack_ok = kernels_.vnniRepack(
-            job.format,
-            staging_ptr,
-            slot->d_native_vnni_payload,
-            static_cast<uint16_t*>(slot->d_native_vnni_scales),
-            static_cast<uint16_t*>(slot->d_native_vnni_mins),
-            static_cast<uint32_t*>(slot->d_native_vnni_emins),
-            job.N, job.K, repack_stream_);
-
-        if (!repack_ok)
+        if (job.format == RepackFormat::RAW_FP)
         {
-            LOG_ERROR("DeviceLoadPipeline: repack kernel failed for '"
-                      << job.name << "'");
-            return false;
+            // Floating-point passthrough: copy staging → payload (no repack needed).
+            // Use the repack stream for ordering consistency with other slots.
+            if (!backend_.deviceToDevice(
+                    slot->d_native_vnni_payload, staging_ptr, job.raw_bytes,
+                    device_id_, repack_stream_))
+            {
+                LOG_ERROR("DeviceLoadPipeline: D2D copy failed for FP weight '"
+                          << job.name << "'");
+                return false;
+            }
+        }
+        else
+        {
+            bool repack_ok = kernels_.vnniRepack(
+                job.format,
+                staging_ptr,
+                slot->d_native_vnni_payload,
+                static_cast<uint16_t*>(slot->d_native_vnni_scales),
+                static_cast<uint16_t*>(slot->d_native_vnni_mins),
+                static_cast<uint32_t*>(slot->d_native_vnni_emins),
+                job.N, job.K, repack_stream_);
+
+            if (!repack_ok)
+            {
+                LOG_ERROR("DeviceLoadPipeline: repack kernel failed for '"
+                          << job.name << "'");
+                return false;
+            }
         }
 
         // 7. Record repack completion for this staging slot

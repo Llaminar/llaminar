@@ -58,6 +58,7 @@ namespace llaminar2
 {
 
     // Forward declarations
+    class ITensorGemm;
     class Qwen2Pipeline;
 
     /**
@@ -159,6 +160,8 @@ namespace llaminar2
         {
             prepared_weight_store_ = store;
         }
+
+        void setModelContext(std::shared_ptr<IModelContext> model_ctx) override;
 
         BufferArena *arena() const { return arena_; }
         const ModelBuffers &buffers() const override;
@@ -279,6 +282,19 @@ namespace llaminar2
 
         TensorContext buildTensorContext() const;
         bool needsTPAllreduce() const;
+        bool hasActiveExpertMask(const std::vector<bool> &expert_mask) const;
+
+        std::string describeMissingExpertGemmEngine(
+            int num_experts,
+            const std::vector<bool> &expert_mask,
+            const std::vector<ITensorGemm *> &gate_gemm,
+            const std::vector<ITensorGemm *> &up_gemm,
+            const std::vector<ITensorGemm *> &down_gemm) const;
+
+        [[noreturn]] void failMissingGpuExpertGemmEngines(
+            DeviceId device,
+            int layer_idx,
+            const std::string &reason) const;
 
         std::unique_ptr<IComputeStage> createTPAllreduceStage(
             TensorBase *buffer,

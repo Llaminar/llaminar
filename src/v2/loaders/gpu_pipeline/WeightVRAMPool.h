@@ -39,6 +39,10 @@ class WeightVRAMPool
                     int payload_bytes_per_block, bool is_asymmetric, bool has_emins,
                     size_t raw_gguf_bytes);
 
+    /// Phase 1 (raw): Plan a floating-point weight that needs no repack.
+    /// Allocates a contiguous region for raw bytes (H2D copy only, no repack).
+    void planRawWeight(const std::string& name, int N, int K, size_t raw_bytes);
+
     /// Phase 2: Allocate — single device allocation for all planned weights + staging.
     /// @param backend  GPU backend (CUDA or ROCm) — if null, falls back to no-op (unit tests)
     /// @param device_id  Device ordinal

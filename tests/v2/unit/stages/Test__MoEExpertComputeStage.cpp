@@ -450,6 +450,7 @@ TEST_F(MoEExpertComputeStageTest, MoEFFN_OutputNonZero_Q4K)
 
     // Extract 2D expert views from 3D packed tensors (required by GEMM path)
     ASSERT_TRUE(MoEExpertComputeStage::extractExpertViews(params));
+    ASSERT_TRUE(MoEExpertComputeStage::prepareExpertGemmEngines(params));
 
     MoEExpertComputeStage stage(params);
     ASSERT_TRUE(stage.execute(cpu_ctx_.get()));
@@ -512,6 +513,7 @@ TEST_F(MoEExpertComputeStageTest, MoEFFN_OutputNonZero_Q5K)
     params.expert_intermediate = inter;
 
     ASSERT_TRUE(MoEExpertComputeStage::extractExpertViews(params));
+    ASSERT_TRUE(MoEExpertComputeStage::prepareExpertGemmEngines(params));
 
     MoEExpertComputeStage stage(params);
     ASSERT_TRUE(stage.execute(cpu_ctx_.get()));
@@ -567,6 +569,7 @@ TEST_F(MoEExpertComputeStageTest, MoEFFN_MultipleTokens)
     params.expert_intermediate = inter;
 
     ASSERT_TRUE(MoEExpertComputeStage::extractExpertViews(params));
+    ASSERT_TRUE(MoEExpertComputeStage::prepareExpertGemmEngines(params));
 
     MoEExpertComputeStage stage(params);
     ASSERT_TRUE(stage.execute(cpu_ctx_.get()));
@@ -657,6 +660,7 @@ TEST_F(MoEExpertComputeStageTest, MoEFFN_DifferentTokensGetDifferentOutputs)
     params.expert_intermediate = inter;
 
     ASSERT_TRUE(MoEExpertComputeStage::extractExpertViews(params));
+    ASSERT_TRUE(MoEExpertComputeStage::prepareExpertGemmEngines(params));
 
     MoEExpertComputeStage stage(params);
     ASSERT_TRUE(stage.execute(cpu_ctx_.get()));
@@ -711,6 +715,7 @@ TEST_F(MoEExpertComputeStageTest, MoEFFN_NormTopKProbSumsToOne)
         params.expert_intermediate = inter;
 
         ASSERT_TRUE(MoEExpertComputeStage::extractExpertViews(params));
+        ASSERT_TRUE(MoEExpertComputeStage::prepareExpertGemmEngines(params));
 
         MoEExpertComputeStage stage(params);
         ASSERT_TRUE(stage.execute(cpu_ctx_.get()));
@@ -736,6 +741,7 @@ TEST_F(MoEExpertComputeStageTest, MoEFFN_NormTopKProbSumsToOne)
         params.expert_intermediate = inter;
 
         ASSERT_TRUE(MoEExpertComputeStage::extractExpertViews(params));
+        ASSERT_TRUE(MoEExpertComputeStage::prepareExpertGemmEngines(params));
 
         MoEExpertComputeStage stage(params);
         ASSERT_TRUE(stage.execute(cpu_ctx_.get()));

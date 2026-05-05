@@ -128,6 +128,8 @@ protected:
 
         if (!MoEExpertComputeStage::extractExpertViews(params))
             return false;
+        if (!MoEExpertComputeStage::prepareExpertGemmEngines(params))
+            return false;
 
         MoEExpertComputeStage stage(params);
         return stage.execute(cpu_ctx_.get());

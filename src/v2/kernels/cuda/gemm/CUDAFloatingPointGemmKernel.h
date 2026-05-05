@@ -86,6 +86,26 @@ namespace llaminar2
                 int cuda_device_id,
                 Precision precision = Precision::FP32);
 
+            /**
+             * @brief Construct kernel from raw device pointer (GPU pipeline path)
+             *
+             * Used when weights have been uploaded to a VRAM pool and the caller
+             * already has the device pointer. No TensorBase needed.
+             *
+             * @param d_weights Device pointer to weight data (already on GPU)
+             * @param N Output features (weight rows)
+             * @param K Input features (weight cols)
+             * @param cuda_device_id CUDA device ID
+             * @param precision Precision mode
+             * @param lifetime_owner Shared pointer that keeps the VRAM pool alive
+             */
+            CUDAFloatingPointGemmKernel(
+                const void *d_weights,
+                int N, int K,
+                int cuda_device_id,
+                Precision precision,
+                std::shared_ptr<void> lifetime_owner);
+
             ~CUDAFloatingPointGemmKernel() override;
 
             // Non-copyable
@@ -180,7 +200,7 @@ namespace llaminar2
             Precision precision() const { return precision_; }
 
         private:
-            const TensorBase *weights_; // Weight tensor (stored for metadata)
+            const TensorBase *weights_; // Weight tensor (stored for metadata, may be null for pool path)
             const void *d_weights_;     // Device pointer to weight data
             int cuda_device_id_;
             Precision precision_;
@@ -189,6 +209,9 @@ namespace llaminar2
 
             // cuBLAS kernel (created at construction)
             std::unique_ptr<CuBLASGemmKernel> cublas_kernel_;
+
+            // Lifetime owner: keeps VRAM pool alive when constructed from raw pointer
+            std::shared_ptr<void> lifetime_owner_;
 
             // GPU stream for graph capture (nullptr = default stream)
             void *gpu_stream_ = nullptr;

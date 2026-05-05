@@ -22,6 +22,8 @@
 #include "../../../models/GraphTypes.h"
 #include "../../../backends/DeviceId.h"
 
+#include <memory>
+
 namespace llaminar2
 {
 
@@ -36,6 +38,7 @@ namespace llaminar2
     class ILocalPPContext;
     class ILocalTPContext;
     class PreparedWeightStore;
+    class IModelContext;
 
     // =========================================================================
     // Generic Input/Output Structures
@@ -233,6 +236,9 @@ namespace llaminar2
 
         /// Set prepared weight store for kernel lifecycle management (Phase 10)
         virtual void setPreparedWeightStore(PreparedWeightStore *store) { (void)store; }
+
+        /// Set model context for registry-created builders in tests/dependency injection.
+        virtual void setModelContext(std::shared_ptr<IModelContext> model_ctx) { (void)model_ctx; }
 
         /// Get current activation buffers
         virtual const ModelBuffers &buffers() const = 0;

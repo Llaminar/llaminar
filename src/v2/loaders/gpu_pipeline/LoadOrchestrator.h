@@ -37,6 +37,9 @@ class LoadOrchestrator
                     bool is_asymmetric, bool has_emins,
                     size_t raw_gguf_bytes);
 
+    /// Plan a raw (floating-point) weight for a specific device. No repack needed.
+    void planRawWeight(int device_id, const std::string& name, int N, int K, size_t raw_bytes);
+
     /// Allocate all device pools. Throws on failure.
     /// @param pinned_slot_size  Max raw GGUF weight size (bytes per pinned slot).
     /// @param num_h2d_streams   Number of ring buffer slots.

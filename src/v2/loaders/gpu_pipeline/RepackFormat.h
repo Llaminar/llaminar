@@ -36,6 +36,7 @@ enum class RepackFormat : uint8_t {
     IQ1_S   = 16,  ///< IQ 1-bit (256-element super-blocks, 50 bytes)
     IQ1_M   = 17,  ///< IQ 1-bit (256-element super-blocks, 56 bytes)
     Q8_0    = 18,  ///< Symmetric 8-bit (32-element blocks, 34 bytes)
+    RAW_FP  = 255, ///< Floating-point passthrough (no repack, direct H2D copy)
 };
 
 /// Function pointer types for backend-agnostic repack kernel dispatch.

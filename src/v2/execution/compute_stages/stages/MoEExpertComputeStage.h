@@ -36,6 +36,7 @@ namespace llaminar2
     class DecodeExpertHistogram;
     class ExpertWeightPayloadProvider;
     class PreparedWeightStore;
+    class ExpertGemmRegistry;
 
     /**
      * @brief Unified MoE FFN stage (router + expert execution + combine)
@@ -117,6 +118,10 @@ namespace llaminar2
             std::shared_ptr<void> moe_packed_gate_lifetime;
             std::shared_ptr<void> moe_packed_up_lifetime;
             std::shared_ptr<void> moe_packed_down_lifetime;
+
+            // ExpertGemmRegistry for dynamic rebalancing registry updates.
+            // Set by graph builder when model_ctx is available.
+            ExpertGemmRegistry* expert_registry = nullptr;
 
             // Scratch buffers for GPU expert execution
             TensorBase *gate_scratch = nullptr; ///< [seq_len, intermediate] FP32 scratch
@@ -263,10 +268,6 @@ namespace llaminar2
         mutable std::vector<ITensorGemm *> cached_gate_gemm_;
         mutable std::vector<ITensorGemm *> cached_up_gemm_;
         mutable std::vector<ITensorGemm *> cached_down_gemm_;
-
-        /// Fallback-owned GEMM engines for tier 3 (lazy preparation) path.
-        /// Only populated if ensureGemmEnginesCached() uses prepareExpertGemmLocal().
-        mutable std::vector<std::shared_ptr<ITensorGemm>> fallback_owned_kernels_;
 
         /// Reusable scratch tensors (allocated on first use, grown if needed)
         mutable std::shared_ptr<FP32Tensor> scratch_batch_;

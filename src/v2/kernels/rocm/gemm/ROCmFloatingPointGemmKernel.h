@@ -91,6 +91,26 @@ namespace llaminar2
                 int rocm_device_id,
                 Precision precision = Precision::FP32);
 
+            /**
+             * @brief Construct kernel from raw device pointer (GPU pipeline path)
+             *
+             * Used when weights have been uploaded to a VRAM pool and the caller
+             * already has the device pointer. No TensorBase needed.
+             *
+             * @param d_weights Device pointer to weight data (already on GPU)
+             * @param N Output features (weight rows)
+             * @param K Input features (weight cols)
+             * @param rocm_device_id ROCm device ID
+             * @param precision Precision mode
+             * @param lifetime_owner Shared pointer that keeps the VRAM pool alive
+             */
+            ROCmFloatingPointGemmKernel(
+                const void *d_weights,
+                int N, int K,
+                int rocm_device_id,
+                Precision precision,
+                std::shared_ptr<void> lifetime_owner);
+
             ~ROCmFloatingPointGemmKernel() override;
 
             // Non-copyable
@@ -185,7 +205,7 @@ namespace llaminar2
             Precision precision() const { return precision_; }
 
         private:
-            const TensorBase *weights_; // Weight tensor (stored for metadata)
+            const TensorBase *weights_; // Weight tensor (stored for metadata, may be null for pool path)
             const void *d_weights_;     // Device pointer to weight data
             int rocm_device_id_;
             Precision precision_;
@@ -195,6 +215,9 @@ namespace llaminar2
             // hipBLAS kernel - shared across all ROCm GEMM kernels on same device
             // Owned by DeviceKernelCache, not this kernel instance
             HipBLASGemmKernel *hipblas_kernel_ = nullptr;
+
+            // Lifetime owner: keeps VRAM pool alive when constructed from raw pointer
+            std::shared_ptr<void> lifetime_owner_;
 
             // GPU stream for profiling (set via setGPUStream)
             void *gpu_stream_ = nullptr;

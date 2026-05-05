@@ -23,10 +23,13 @@
 // Backend-specific GEMM kernels (for GPU pipeline kernel creation)
 #ifdef HAVE_ROCM
 #include "../kernels/rocm/gemm/ROCmQuantisedGemmKernel.h"
+#include "../kernels/rocm/gemm/ROCmFloatingPointGemmKernel.h"
 #endif
 #ifdef HAVE_CUDA
 #include "../kernels/cuda/gemm/CUDAQuantisedGemmKernel.h"
+#include "../kernels/cuda/gemm/CUDAFloatingPointGemmKernel.h"
 #endif
+#include "../tensors/BlockStructures.h"
 #include <iostream>
 #include <cstring>
 #include <stdexcept>
@@ -559,82 +562,38 @@ namespace llaminar2
         return sliced;
     }
 
-    namespace
-    {
-        bool shouldRetainRawForLazyMoE(const std::string &key)
-        {
-            const auto &env = debugEnv();
-            return env.moe_rebalance.mode == "dynamic" &&
-                   !env.moe_rebalance.release_raw_weights &&
-                   key.find("_exps.weight") != std::string::npos;
-        }
-    }
-
     bool WeightManager::hostDataRequired(const TensorBase *tensor, const std::string &key) const
     {
-        // If an expert payload provider is set, use it for metadata-based retention
-        // instead of the string-matching shouldRetainRawForLazyMoE() heuristic.
-        if (expert_payload_provider_)
+        // Phase 9 final: All expert GEMM preparation happens upfront at graph-build
+        // time. No lazy host-data fallback exists. Expert weights are always
+        // releasable after device preparation completes. Dynamic rebalancing uses
+        // serialized transfer blobs, never raw host tensor data.
+        //
+        // The only case where host data must be retained is explicit CPU execution
+        // (RequiredForCPUExecution policy in metadata).
+
+        if (weight_metadata_ && weight_metadata_->has(tensor))
         {
-            // Check if this is an expert weight tensor
-            WeightRole role = inferWeightRole(key);
-            if (role == WeightRole::MoEExpertGate ||
-                role == WeightRole::MoEExpertUp ||
-                role == WeightRole::MoEExpertDown)
+            auto res = weight_metadata_->residency(tensor);
+            if (res)
             {
-                int layer = inferWeightLayer(key);
-                if (layer >= 0)
+                switch (res->host_policy)
                 {
-                    // Check metadata registry for explicit host policy
-                    if (weight_metadata_ && weight_metadata_->has(tensor))
-                    {
-                        auto res = weight_metadata_->residency(tensor);
-                        if (res)
-                        {
-                            switch (res->host_policy)
-                            {
-                            case WeightHostPolicy::RequiredForCPUExecution:
-                                return true;
-                            case WeightHostPolicy::Released:
-                            case WeightHostPolicy::ReleasableAfterPreparation:
-                                return false;
-                            case WeightHostPolicy::RequiredUntilPreparedOrTransferred:
-                            {
-                                // Check if ALL experts for this layer are prepared or transferred
-                                // We infer num_experts from the 3D tensor shape
-                                int expert = inferWeightExpert(key);
-                                if (expert >= 0)
-                                    return expert_payload_provider_->isRawDataRequired(layer, expert);
-                                // For 3D packed tensors (gate_exps, up_exps, down_exps),
-                                // check if any expert in the layer still needs raw data
-                                return !expert_payload_provider_->allExpertsPreparedOrTransferred(
-                                    layer, tensor->shape().size() >= 3 ? static_cast<int>(tensor->shape()[2]) : 64);
-                            }
-                            case WeightHostPolicy::RequiredUntilGraphMaterialized:
-                                // Fall through to provider check
-                                break;
-                            }
-                        }
-                    }
-
-                    // No explicit host policy in metadata — check the payload provider.
-                    // If all experts for this weight's layer are prepared or transferred,
-                    // the raw host data is no longer needed.
-                    int expert = inferWeightExpert(key);
-                    if (expert >= 0)
-                        return expert_payload_provider_->isRawDataRequired(layer, expert);
-
-                    // For 3D packed tensors, we can't determine expert count easily.
-                    // Conservative: retain if we don't know.
+                case WeightHostPolicy::RequiredForCPUExecution:
                     return true;
+                case WeightHostPolicy::Released:
+                case WeightHostPolicy::ReleasableAfterPreparation:
+                case WeightHostPolicy::RequiredUntilPreparedOrTransferred:
+                case WeightHostPolicy::RequiredUntilGraphMaterialized:
+                    return false;
                 }
             }
-            // Non-MoE-expert weights: not handled by payload provider
-            return false;
         }
 
-        // Legacy fallback: string-matching heuristic
-        return shouldRetainRawForLazyMoE(key);
+        // No metadata or no explicit policy: host data is not required.
+        // All preparation (GEMM packing, embedding prep, GPU upload) completes
+        // before releaseAllHostWeightData() is called.
+        return false;
     }
 
     namespace
@@ -2676,7 +2635,7 @@ namespace llaminar2
         if (!gemm_ok)
         {
             LOG_WARN("[WeightManager] GEMM weight packing failed for " << device_name
-                                                                       << ", will use lazy kernel creation");
+                                                                       << "; required prepared kernels may be unavailable");
         }
 
         return gemm_ok && non_gemm_ok;
@@ -3291,6 +3250,129 @@ namespace llaminar2
         return all_success.load(std::memory_order_relaxed);
     }
 
+    // -------------------------------------------------------------------------
+    // Helper: compute raw byte size for a 2D quantized view whose size_bytes()
+    // may report 0 (views alias parent storage without tracking their own size).
+    // Duplicated from MoEExpertWeightService.cpp — kept as a static helper here
+    // to avoid cross-module dependencies.
+    // -------------------------------------------------------------------------
+    static size_t quantizedViewRawBytes(const TensorBase &tensor)
+    {
+        const size_t reported = tensor.size_bytes();
+        if (reported > 0)
+            return reported;
+
+        const auto &shape = tensor.shape();
+        if (shape.size() != 2)
+            return 0;
+
+        const size_t rows = shape[0];
+        const size_t cols = shape[1];
+        auto bytes_for = [rows, cols](size_t block_size, size_t block_bytes) -> size_t
+        {
+            const size_t blocks_per_row = (cols + block_size - 1) / block_size;
+            return rows * blocks_per_row * block_bytes;
+        };
+
+        switch (tensor.native_type())
+        {
+        case TensorType::IQ4_NL: return bytes_for(IQ4_NLBlock::BLOCK_SIZE, sizeof(IQ4_NLBlock));
+        case TensorType::IQ4_XS: return bytes_for(IQ4_XSBlock::BLOCK_SIZE, sizeof(IQ4_XSBlock));
+        case TensorType::Q8_0: return bytes_for(Q8_0Block::BLOCK_SIZE, sizeof(Q8_0Block));
+        case TensorType::Q4_0: return bytes_for(Q4_0Block::BLOCK_SIZE, sizeof(Q4_0Block));
+        case TensorType::Q4_1: return bytes_for(Q4_1Block::BLOCK_SIZE, sizeof(Q4_1Block));
+        case TensorType::Q5_0: return bytes_for(Q5_0Block::BLOCK_SIZE, sizeof(Q5_0Block));
+        case TensorType::Q5_1: return bytes_for(Q5_1Block::BLOCK_SIZE, sizeof(Q5_1Block));
+        case TensorType::Q2_K: return bytes_for(Q2_KBlock::BLOCK_SIZE, sizeof(Q2_KBlock));
+        case TensorType::Q3_K: return bytes_for(Q3_KBlock::BLOCK_SIZE, sizeof(Q3_KBlock));
+        case TensorType::Q4_K: return bytes_for(Q4_KBlock::BLOCK_SIZE, sizeof(Q4_KBlock));
+        case TensorType::Q5_K: return bytes_for(Q5_KBlock::BLOCK_SIZE, sizeof(Q5_KBlock));
+        case TensorType::Q6_K: return bytes_for(Q6_KBlock::BLOCK_SIZE, sizeof(Q6_KBlock));
+        case TensorType::Q8_K: return bytes_for(Q8_KBlock::BLOCK_SIZE, sizeof(Q8_KBlock));
+        case TensorType::IQ2_XXS: return bytes_for(IQ2_XXSBlock::BLOCK_SIZE, sizeof(IQ2_XXSBlock));
+        case TensorType::IQ2_XS: return bytes_for(IQ2_XSBlock::BLOCK_SIZE, sizeof(IQ2_XSBlock));
+        case TensorType::IQ2_S: return bytes_for(IQ2_SBlock::BLOCK_SIZE, sizeof(IQ2_SBlock));
+        case TensorType::IQ3_XXS: return bytes_for(IQ3_XXSBlock::BLOCK_SIZE, sizeof(IQ3_XXSBlock));
+        case TensorType::IQ3_S: return bytes_for(IQ3_SBlock::BLOCK_SIZE, sizeof(IQ3_SBlock));
+        case TensorType::IQ1_S: return bytes_for(IQ1_SBlock::BLOCK_SIZE, sizeof(IQ1_SBlock));
+        case TensorType::IQ1_M: return bytes_for(IQ1_MBlock::BLOCK_SIZE, sizeof(IQ1_MBlock));
+        default: return 0;
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Helper: parse layer index from "blk.N.ffn_gate_exps.weight" etc.
+    // Returns -1 on parse failure.
+    // -------------------------------------------------------------------------
+    static int parseMoELayerIndex(const std::string &name)
+    {
+        // Expect "blk.N.<suffix>"
+        if (name.compare(0, 4, "blk.") != 0)
+            return -1;
+        auto dot2 = name.find('.', 4);
+        if (dot2 == std::string::npos)
+            return -1;
+        try
+        {
+            return std::stoi(name.substr(4, dot2 - 4));
+        }
+        catch (...)
+        {
+            return -1;
+        }
+    }
+
+    static const char *moeWeightRoleName(ExpertGemmRegistry::WeightRole role)
+    {
+        switch (role)
+        {
+        case ExpertGemmRegistry::WeightRole::GATE: return "gate";
+        case ExpertGemmRegistry::WeightRole::UP: return "up";
+        case ExpertGemmRegistry::WeightRole::DOWN: return "down";
+        default: return "unknown";
+        }
+    }
+
+    static bool parseMoEExpertParentName(const std::string &name,
+                                         int &layer_idx,
+                                         ExpertGemmRegistry::WeightRole &role)
+    {
+        layer_idx = parseMoELayerIndex(name);
+        if (layer_idx < 0)
+            return false;
+
+        if (name.find("ffn_gate_exps.weight") != std::string::npos)
+        {
+            role = ExpertGemmRegistry::WeightRole::GATE;
+            return true;
+        }
+        if (name.find("ffn_up_exps.weight") != std::string::npos)
+        {
+            role = ExpertGemmRegistry::WeightRole::UP;
+            return true;
+        }
+        if (name.find("ffn_down_exps.weight") != std::string::npos)
+        {
+            role = ExpertGemmRegistry::WeightRole::DOWN;
+            return true;
+        }
+
+        return false;
+    }
+
+    static int moeExpertCountFromParentTensor(const TensorBase &tensor)
+    {
+        const auto &shape = tensor.shape();
+        if (shape.size() != 3)
+            return 0;
+        return static_cast<int>(shape[2]);
+    }
+
+    static std::string formatMiB(size_t bytes)
+    {
+        return std::to_string(bytes / (1024 * 1024)) + " MiB";
+    }
+
     bool WeightManager::packGemmWeightsViaPipeline(
         DeviceId target_device,
         std::function<bool(const std::string &)> layer_filter)
@@ -3358,8 +3440,8 @@ namespace llaminar2
             // Tied LM head: if this stage owns lm_head (layer_filter passes
             // output.weight) but output.weight wasn't collected, the model
             // ties token_embd.weight as the LM projection weight. Include
-            // it in the pipeline so it gets GPU-repacked instead of falling
-            // back to CPU-side VNNI packing + lazy H2D.
+            // it in the pipeline so it gets GPU-repacked with the rest of the
+            // resident GEMM weights.
             if (!layer_filter || layer_filter("output.weight"))
             {
                 bool has_output_weight = false;
@@ -3389,14 +3471,150 @@ namespace llaminar2
             }
         }
 
-        if (gemm_weights.empty())
+        // ------------------------------------------------------------------
+        // Step 1b: Collect MoE expert weights (3D _exps.weight tensors)
+        //
+        // These are filtered OUT by isGemmWeight() because isNonGemmWeight()
+        // returns true for _exps.weight. We scan for them separately, create
+        // 2D views for each expert, and include them in the same orchestrator.
+        // ------------------------------------------------------------------
+        struct MoEExpertJob
         {
-            LOG_DEBUG("[WeightManager] GPU pipeline: no GEMM weights to load");
+            int layer_idx;
+            int expert_idx;
+            ExpertGemmRegistry::WeightRole role;
+            std::string slot_name;               // e.g., "moe_L0_gate_e5"
+            std::shared_ptr<TensorBase> view;     // 2D expert view (keeps parent alive)
+        };
+        std::vector<MoEExpertJob> moe_jobs;
+
+        // Track 3D parent tensors by name so release readiness is tensor-specific.
+        std::vector<std::pair<std::string, std::shared_ptr<TensorBase>>> moe_parent_tensors;
+
+        {
+            std::lock_guard<std::mutex> lock(cache_mutex_);
+
+            // Group 3D expert tensors by layer: layer_idx -> {gate, up, down}
+            struct MoELayerTensors
+            {
+                std::shared_ptr<TensorBase> gate;
+                std::shared_ptr<TensorBase> up;
+                std::shared_ptr<TensorBase> down;
+                std::string gate_name;
+                std::string up_name;
+                std::string down_name;
+            };
+            std::unordered_map<int, MoELayerTensors> moe_layers;
+
+            for (const auto &[name, tensor] : cache_)
+            {
+                if (!tensor || name.find("_exps.weight") == std::string::npos)
+                    continue;
+                if (layer_filter && !layer_filter(name))
+                    continue;
+
+                int layer_idx = parseMoELayerIndex(name);
+                if (layer_idx < 0)
+                    continue;
+
+                if (name.find("ffn_gate_exps.weight") != std::string::npos)
+                {
+                    moe_layers[layer_idx].gate = tensor;
+                    moe_layers[layer_idx].gate_name = name;
+                }
+                else if (name.find("ffn_up_exps.weight") != std::string::npos)
+                {
+                    moe_layers[layer_idx].up = tensor;
+                    moe_layers[layer_idx].up_name = name;
+                }
+                else if (name.find("ffn_down_exps.weight") != std::string::npos)
+                {
+                    moe_layers[layer_idx].down = tensor;
+                    moe_layers[layer_idx].down_name = name;
+                }
+            }
+
+            // Create 2D expert views for each complete layer
+            for (auto &[layer_idx, tensors] : moe_layers)
+            {
+                if (!tensors.gate || !tensors.up || !tensors.down)
+                {
+                    LOG_WARN("[WeightManager] GPU pipeline: incomplete MoE expert tensors for layer "
+                             << layer_idx << " — skipping");
+                    continue;
+                }
+
+                // GGUF 3D: shape[0]=cols (K, fastest), shape[1]=rows_per_expert, shape[2]=num_experts
+                const auto &gate_shape = tensors.gate->shape();
+                if (gate_shape.size() != 3)
+                {
+                    LOG_WARN("[WeightManager] GPU pipeline: MoE gate tensor for layer "
+                             << layer_idx << " is not 3D — skipping");
+                    continue;
+                }
+
+                const int num_experts = static_cast<int>(gate_shape[2]);
+
+                moe_parent_tensors.emplace_back(tensors.gate_name, tensors.gate);
+                moe_parent_tensors.emplace_back(tensors.up_name, tensors.up);
+                moe_parent_tensors.emplace_back(tensors.down_name, tensors.down);
+
+                struct RoleTensor
+                {
+                    ExpertGemmRegistry::WeightRole role;
+                    const char *tag;
+                    TensorBase *tensor_3d;
+                };
+                RoleTensor roles[] = {
+                    {ExpertGemmRegistry::WeightRole::GATE, "gate", tensors.gate.get()},
+                    {ExpertGemmRegistry::WeightRole::UP, "up", tensors.up.get()},
+                    {ExpertGemmRegistry::WeightRole::DOWN, "down", tensors.down.get()},
+                };
+
+                for (const auto &rt : roles)
+                {
+                    // Each role tensor may have different dimensions
+                    // (e.g., down is [intermediate, d_model, num_experts] while gate/up are [d_model, intermediate, num_experts])
+                    const auto &role_shape = rt.tensor_3d->shape();
+                    const size_t role_cols = role_shape[0];
+                    const size_t role_rows_per_expert = role_shape[1];
+                    const size_t role_elements_per_expert = role_rows_per_expert * role_cols;
+
+                    for (int e = 0; e < num_experts; ++e)
+                    {
+                        const size_t element_offset = static_cast<size_t>(e) * role_elements_per_expert;
+                        std::vector<size_t> view_shape = {role_rows_per_expert, role_cols};
+                        auto view = rt.tensor_3d->create_view(view_shape, element_offset);
+                        if (!view)
+                        {
+                            throw std::runtime_error(
+                                "[WeightManager] GPU pipeline: failed to create expert view for layer "
+                                + std::to_string(layer_idx) + " " + rt.tag + " expert " + std::to_string(e)
+                                + " (shape=[" + std::to_string(role_rows_per_expert) + "," + std::to_string(role_cols)
+                                + "], offset=" + std::to_string(element_offset) + ")");
+                        }
+
+                        std::string slot_name = "moe_L" + std::to_string(layer_idx) + "_"
+                                                + rt.tag + "_e" + std::to_string(e);
+
+                        moe_jobs.push_back({layer_idx, e, rt.role, std::move(slot_name), std::move(view)});
+                    }
+                }
+
+                LOG_DEBUG("[WeightManager] GPU pipeline: collected " << num_experts
+                          << " experts × 3 roles for MoE layer " << layer_idx);
+            }
+        }
+
+        if (gemm_weights.empty() && moe_jobs.empty())
+        {
+            LOG_DEBUG("[WeightManager] GPU pipeline: no weights to load");
             return true;
         }
 
         LOG_INFO("[WeightManager] GPU pipeline: loading " << gemm_weights.size()
-                 << " GEMM weights for " << target_device.to_string());
+                 << " GEMM weights + " << moe_jobs.size()
+                 << " MoE expert slots for " << target_device.to_string());
 
         // ------------------------------------------------------------------
         // Step 2: Get backend
@@ -3427,9 +3645,25 @@ namespace llaminar2
             const NativeVnniFormatInfo *vnni = unpackable ? unpackable->vnniFormatInfo() : nullptr;
             if (!vnni)
             {
-                LOG_WARN("[WeightManager] GPU pipeline: skipping non-VNNI weight: " << name);
-                weight_formats.emplace_back(name, nullptr);
-                continue;
+                // Floating-point types (FP32, FP16, BF16) don't use VNNI repack —
+                // they go through the pipeline as raw H2D copies (no GPU repack kernel).
+                const auto type = tensor->native_type();
+                if (type == TensorType::FP32 || type == TensorType::FP16 || type == TensorType::BF16)
+                {
+                    const int N = static_cast<int>(tensor->rows());
+                    const int K = static_cast<int>(tensor->cols());
+                    const size_t raw_bytes = tensor->size_bytes();
+
+                    orchestrator->planRawWeight(target_device.ordinal, name, N, K, raw_bytes);
+                    max_raw_bytes = std::max(max_raw_bytes, raw_bytes);
+                    ++planned_count;
+                    weight_formats.emplace_back(name, nullptr);
+                    continue;
+                }
+                // Any quantized type that doesn't implement IINT8Unpackable is a bug.
+                throw std::runtime_error(
+                    "[WeightManager] GPU pipeline: weight does not implement "
+                    "IINT8Unpackable (unsupported quantized type for GPU repack): " + name);
             }
 
             const int N = static_cast<int>(tensor->rows());
@@ -3444,9 +3678,52 @@ namespace llaminar2
             weight_formats.emplace_back(name, vnni);
         }
 
+        // Plan MoE expert weights into the same orchestrator
+        std::vector<const NativeVnniFormatInfo *> moe_vnni_infos;
+        moe_vnni_infos.reserve(moe_jobs.size());
+        for (const auto &mj : moe_jobs)
+        {
+            auto *unpackable = dynamic_cast<IINT8Unpackable *>(mj.view.get());
+            const NativeVnniFormatInfo *vnni = unpackable ? unpackable->vnniFormatInfo() : nullptr;
+            if (!vnni)
+            {
+                // Floating-point types (FP32, FP16, BF16) don't use VNNI repack —
+                // they go through the pipeline as raw H2D copies.
+                const auto type = mj.view->native_type();
+                if (type == TensorType::FP32 || type == TensorType::FP16 || type == TensorType::BF16)
+                {
+                    const int N = static_cast<int>(mj.view->rows());
+                    const int K = static_cast<int>(mj.view->cols());
+                    const size_t raw_bytes = mj.view->size_bytes();
+
+                    orchestrator->planRawWeight(target_device.ordinal, mj.slot_name, N, K, raw_bytes);
+                    max_raw_bytes = std::max(max_raw_bytes, raw_bytes);
+                    ++planned_count;
+                    moe_vnni_infos.push_back(nullptr);
+                    continue;
+                }
+                // Any quantized type that doesn't implement IINT8Unpackable is a bug.
+                throw std::runtime_error(
+                    "[WeightManager] GPU pipeline: MoE expert view does not implement "
+                    "IINT8Unpackable (unsupported quantized type for GPU repack): " + mj.slot_name);
+            }
+
+            // 2D view: rows()=rows_per_expert, cols()=cols
+            const int N = static_cast<int>(mj.view->rows());
+            const int K = static_cast<int>(mj.view->cols());
+            const size_t raw_bytes = quantizedViewRawBytes(*mj.view);
+
+            orchestrator->planWeight(target_device.ordinal, mj.slot_name, N, K,
+                                     vnni->payload_bytes, vnni->is_asymmetric,
+                                     vnni->has_emins, raw_bytes);
+            max_raw_bytes = std::max(max_raw_bytes, raw_bytes);
+            ++planned_count;
+            moe_vnni_infos.push_back(vnni);
+        }
+
         if (planned_count == 0)
         {
-            LOG_WARN("[WeightManager] GPU pipeline: no weights with VNNI format info");
+            LOG_WARN("[WeightManager] GPU pipeline: no weights to load");
             return false;
         }
 
@@ -3454,6 +3731,40 @@ namespace llaminar2
         // Step 4: Allocate VRAM pool + pinned ring buffer
         // ------------------------------------------------------------------
         const auto &rocm_cfg = debugEnv().rocm;
+        const int repack_streams = rocm_cfg.repack_streams;
+        const auto *planned_pool = orchestrator->getPool(target_device.ordinal);
+        const size_t planned_weight_bytes = planned_pool ? planned_pool->totalPlannedBytes() : 0;
+        const size_t staging_bytes = max_raw_bytes * static_cast<size_t>(std::max(0, repack_streams));
+        const size_t required_vram_bytes = planned_weight_bytes + staging_bytes;
+        const size_t free_vram_bytes = backend->deviceMemoryFree(target_device.ordinal);
+        const size_t total_vram_bytes = backend->deviceMemoryTotal(target_device.ordinal);
+        const size_t safety_margin_bytes = std::max<size_t>(512ULL * 1024ULL * 1024ULL,
+                                                            total_vram_bytes / 20ULL); // 5%, at least 512 MiB
+
+        if (free_vram_bytes > 0 && required_vram_bytes + safety_margin_bytes > free_vram_bytes)
+        {
+            LOG_ERROR("[WeightManager] GPU pipeline VRAM preflight failed for "
+                      << target_device.to_string()
+                      << ": required=" << formatMiB(required_vram_bytes)
+                      << " available_after_margin="
+                      << formatMiB(free_vram_bytes > safety_margin_bytes ? free_vram_bytes - safety_margin_bytes : 0)
+                      << " free=" << formatMiB(free_vram_bytes)
+                      << " total=" << formatMiB(total_vram_bytes)
+                      << " planned_weights=" << formatMiB(planned_weight_bytes)
+                      << " staging=" << formatMiB(staging_bytes)
+                      << " safety_margin=" << formatMiB(safety_margin_bytes)
+                      << ". Mitigations: set LLAMINAR_WEIGHT_STREAMING=1, use a smaller model, "
+                      << "reduce context/KV cache pressure, or reduce resident experts.");
+            return false;
+        }
+
+        LOG_DEBUG("[WeightManager] GPU pipeline VRAM preflight for " << target_device.to_string()
+                  << ": required=" << formatMiB(required_vram_bytes)
+                  << " planned_weights=" << formatMiB(planned_weight_bytes)
+                  << " staging=" << formatMiB(staging_bytes)
+                  << " free=" << formatMiB(free_vram_bytes)
+                  << " safety_margin=" << formatMiB(safety_margin_bytes));
+
         orchestrator->allocate(max_raw_bytes, rocm_cfg.repack_streams);
 
         // ------------------------------------------------------------------
@@ -3464,7 +3775,23 @@ namespace llaminar2
             const auto &[name, tensor] = gemm_weights[i];
             const auto *vnni = weight_formats[i].second;
             if (!vnni)
+            {
+                // Floating-point weight: submit as RAW_FP passthrough job
+                const auto type = tensor->native_type();
+                if (type == TensorType::FP32 || type == TensorType::FP16 || type == TensorType::BF16)
+                {
+                    WeightJob job;
+                    job.name = name;
+                    job.host_raw_data = tensor->raw_data();
+                    job.raw_bytes = tensor->size_bytes();
+                    job.format = RepackFormat::RAW_FP;
+                    job.N = static_cast<int>(tensor->rows());
+                    job.K = static_cast<int>(tensor->cols());
+                    job.is_asymmetric = false;
+                    orchestrator->addWeightJob(target_device.ordinal, job);
+                }
                 continue;
+            }
 
             auto repack_fmt = codebookIdToRepackFormat(vnni->codebook_id, vnni->is_superblock);
             if (!repack_fmt)
@@ -3482,6 +3809,50 @@ namespace llaminar2
             job.format = *repack_fmt;
             job.N = static_cast<int>(tensor->rows());
             job.K = static_cast<int>(tensor->cols());
+            job.is_asymmetric = vnni->is_asymmetric;
+
+            orchestrator->addWeightJob(target_device.ordinal, job);
+        }
+
+        // Add MoE expert weight jobs
+        for (size_t i = 0; i < moe_jobs.size(); ++i)
+        {
+            const auto *vnni = moe_vnni_infos[i];
+            if (!vnni)
+            {
+                // Floating-point MoE expert: submit as RAW_FP passthrough job
+                const auto &mj = moe_jobs[i];
+                const auto type = mj.view->native_type();
+                if (type == TensorType::FP32 || type == TensorType::FP16 || type == TensorType::BF16)
+                {
+                    WeightJob job;
+                    job.name = mj.slot_name;
+                    job.host_raw_data = mj.view->raw_data();
+                    job.raw_bytes = mj.view->size_bytes();
+                    job.format = RepackFormat::RAW_FP;
+                    job.N = static_cast<int>(mj.view->rows());
+                    job.K = static_cast<int>(mj.view->cols());
+                    job.is_asymmetric = false;
+                    orchestrator->addWeightJob(target_device.ordinal, job);
+                }
+                continue;
+            }
+
+            auto repack_fmt = codebookIdToRepackFormat(vnni->codebook_id, vnni->is_superblock);
+            if (!repack_fmt)
+            {
+                LOG_WARN("[WeightManager] GPU pipeline: unsupported MoE format for "
+                         << moe_jobs[i].slot_name);
+                continue;
+            }
+
+            WeightJob job;
+            job.name = moe_jobs[i].slot_name;
+            job.host_raw_data = moe_jobs[i].view->raw_data();
+            job.raw_bytes = quantizedViewRawBytes(*moe_jobs[i].view);
+            job.format = *repack_fmt;
+            job.N = static_cast<int>(moe_jobs[i].view->rows());
+            job.K = static_cast<int>(moe_jobs[i].view->cols());
             job.is_asymmetric = vnni->is_asymmetric;
 
             orchestrator->addWeightJob(target_device.ordinal, job);
@@ -3507,21 +3878,55 @@ namespace llaminar2
         {
             const auto &[name, tensor] = gemm_weights[i];
             const auto *vnni = weight_formats[i].second;
-            if (!vnni)
-                continue;
 
             auto slot = pool->getSlot(name);
             if (!slot)
             {
-                LOG_WARN("[WeightManager] GPU pipeline: no slot for " << name);
+                // Slot missing means this weight wasn't planned (shouldn't happen)
+                if (vnni)
+                    LOG_WARN("[WeightManager] GPU pipeline: no slot for " << name);
                 continue;
             }
 
             const int N = static_cast<int>(tensor->rows());
             const int K = static_cast<int>(tensor->cols());
-            const uint32_t blocks_per_row = static_cast<uint32_t>(K / 32);
 
             std::unique_ptr<ITensorGemm> kernel;
+
+            if (!vnni)
+            {
+                // Floating-point weight: create FP GEMM kernel from raw device pointer
+                const auto type = tensor->native_type();
+#ifdef HAVE_ROCM
+                if (target_device.is_rocm())
+                {
+                    auto precision = rocm::ROCmFloatingPointGemmKernel::Precision::FP32;
+                    if (type == TensorType::FP16)
+                        precision = rocm::ROCmFloatingPointGemmKernel::Precision::FP16;
+                    else if (type == TensorType::BF16)
+                        precision = rocm::ROCmFloatingPointGemmKernel::Precision::BF16;
+                    kernel = std::make_unique<llaminar2::rocm::ROCmFloatingPointGemmKernel>(
+                        slot->d_native_vnni_payload, N, K,
+                        target_device.ordinal, precision, orchestrator);
+                }
+#endif
+#ifdef HAVE_CUDA
+                if (target_device.is_cuda())
+                {
+                    auto precision = cuda::CUDAFloatingPointGemmKernel::Precision::FP32;
+                    if (type == TensorType::FP16)
+                        precision = cuda::CUDAFloatingPointGemmKernel::Precision::FP16;
+                    else if (type == TensorType::BF16)
+                        precision = cuda::CUDAFloatingPointGemmKernel::Precision::BF16;
+                    kernel = std::make_unique<llaminar2::cuda::CUDAFloatingPointGemmKernel>(
+                        slot->d_native_vnni_payload, N, K,
+                        target_device.ordinal, precision, orchestrator);
+                }
+#endif
+            }
+            else
+            {
+            const uint32_t blocks_per_row = static_cast<uint32_t>(K / 32);
 
 #ifdef HAVE_ROCM
             if (target_device.is_rocm())
@@ -3550,6 +3955,7 @@ namespace llaminar2
                     orchestrator); // lifetime owner: keeps VRAM pool alive
             }
 #endif
+            } // end else (quantized path)
 
             if (kernel)
             {
@@ -3570,7 +3976,7 @@ namespace llaminar2
                     // Skip for token_embd.weight: it's also used for embedding lookup,
                     // which runs concurrently (Steps 2/2b). Its host data is freed
                     // later by releaseAllHostWeightData().
-                    if (name != "token_embd.weight" && !shouldRetainRawForLazyMoE(name))
+                    if (name != "token_embd.weight")
                     {
                         try
                         {
@@ -3590,9 +3996,144 @@ namespace llaminar2
             }
         }
 
+        // ------------------------------------------------------------------
+        // Step 7b: Create MoE expert GEMM kernels and register in ExpertGemmRegistry
+        // ------------------------------------------------------------------
+        size_t moe_registered = 0;
+        for (size_t i = 0; i < moe_jobs.size(); ++i)
+        {
+            const auto *vnni = moe_vnni_infos[i];
+            const auto &mj = moe_jobs[i];
+
+            auto slot = pool->getSlot(mj.slot_name);
+            if (!slot)
+            {
+                if (vnni)
+                    LOG_WARN("[WeightManager] GPU pipeline: no slot for MoE expert " << mj.slot_name);
+                continue;
+            }
+
+            const int N = static_cast<int>(mj.view->rows());
+            const int K = static_cast<int>(mj.view->cols());
+
+            std::shared_ptr<ITensorGemm> kernel;
+
+            if (!vnni)
+            {
+                // Floating-point MoE expert: create FP GEMM kernel
+                const auto type = mj.view->native_type();
+#ifdef HAVE_ROCM
+                if (target_device.is_rocm())
+                {
+                    auto precision = rocm::ROCmFloatingPointGemmKernel::Precision::FP32;
+                    if (type == TensorType::FP16)
+                        precision = rocm::ROCmFloatingPointGemmKernel::Precision::FP16;
+                    else if (type == TensorType::BF16)
+                        precision = rocm::ROCmFloatingPointGemmKernel::Precision::BF16;
+                    kernel = std::make_shared<llaminar2::rocm::ROCmFloatingPointGemmKernel>(
+                        slot->d_native_vnni_payload, N, K,
+                        target_device.ordinal, precision, orchestrator);
+                }
+#endif
+#ifdef HAVE_CUDA
+                if (target_device.is_cuda())
+                {
+                    auto precision = cuda::CUDAFloatingPointGemmKernel::Precision::FP32;
+                    if (type == TensorType::FP16)
+                        precision = cuda::CUDAFloatingPointGemmKernel::Precision::FP16;
+                    else if (type == TensorType::BF16)
+                        precision = cuda::CUDAFloatingPointGemmKernel::Precision::BF16;
+                    kernel = std::make_shared<llaminar2::cuda::CUDAFloatingPointGemmKernel>(
+                        slot->d_native_vnni_payload, N, K,
+                        target_device.ordinal, precision, orchestrator);
+                }
+#endif
+            }
+            else
+            {
+            const uint32_t blocks_per_row = static_cast<uint32_t>(K / 32);
+
+#ifdef HAVE_ROCM
+            if (target_device.is_rocm())
+            {
+                kernel = std::make_shared<llaminar2::rocm::ROCmQuantisedGemmKernel>(
+                    N, K, target_device.ordinal,
+                    slot->d_native_vnni_payload,
+                    slot->d_native_vnni_scales,
+                    slot->d_native_vnni_mins,
+                    slot->d_native_vnni_emins,
+                    vnni->codebook_id, blocks_per_row,
+                    orchestrator);
+            }
+#endif
+
+#ifdef HAVE_CUDA
+            if (target_device.is_cuda())
+            {
+                kernel = std::make_shared<llaminar2::cuda::CUDAQuantisedGemmKernel>(
+                    N, K, target_device.ordinal,
+                    slot->d_native_vnni_payload,
+                    static_cast<uint16_t *>(slot->d_native_vnni_scales),
+                    static_cast<uint16_t *>(slot->d_native_vnni_mins),
+                    static_cast<uint32_t *>(slot->d_native_vnni_emins),
+                    vnni->codebook_id, blocks_per_row,
+                    orchestrator);
+            }
+#endif
+            } // end else (quantized path)
+
+            if (kernel)
+            {
+                ITensorGemm *raw_ptr = kernel.get();
+                expert_gemm_registry_.registerEngine(
+                    target_device, mj.layer_idx, mj.expert_idx, mj.role,
+                    raw_ptr, std::move(kernel));
+                ++moe_registered;
+            }
+        }
+
+        // Mark 3D MoE parent tensors ready only after their exact layer/role has
+        // all expert engines registered for this device. Host release happens in
+        // releaseAllHostWeightData(), after all expected device tickets are ready.
+        for (const auto &[name, parent] : moe_parent_tensors)
+        {
+            if (!parent)
+                continue;
+
+            int layer_idx = -1;
+            ExpertGemmRegistry::WeightRole role = ExpertGemmRegistry::WeightRole::GATE;
+            const int num_experts = moeExpertCountFromParentTensor(*parent);
+            if (!parseMoEExpertParentName(name, layer_idx, role) || num_experts <= 0)
+            {
+                markPrepState(name, target_device, WeightPrepState::FAILED, true,
+                              "GPU pipeline: invalid MoE parent tensor metadata");
+                continue;
+            }
+
+            if (expert_gemm_registry_.hasCompleteRole(target_device, layer_idx, num_experts, role))
+            {
+                markPrepState(name, target_device, WeightPrepState::READY, true,
+                              std::string("GPU pipeline: MoE ") + moeWeightRoleName(role) +
+                                  " expert parent ready");
+            }
+            else
+            {
+                markPrepState(name, target_device, WeightPrepState::FAILED, true,
+                              std::string("GPU pipeline: incomplete MoE ") + moeWeightRoleName(role) +
+                                  " expert registry entries");
+            }
+        }
+
+        if (moe_registered > 0)
+        {
+            LOG_INFO("[WeightManager] GPU pipeline: registered " << moe_registered
+                     << " MoE expert GEMM kernels in ExpertGemmRegistry");
+        }
+
         const auto elapsed = std::chrono::duration<double, std::milli>(Clock::now() - start).count();
         LOG_INFO("[WeightManager] GPU pipeline: loaded " << registered << "/" << gemm_weights.size()
-                 << " weights in " << std::fixed << std::setprecision(1) << elapsed << " ms");
+                 << " dense + " << moe_registered << "/" << moe_jobs.size()
+                 << " MoE expert weights in " << std::fixed << std::setprecision(1) << elapsed << " ms");
 
         // Release orchestrator staging resources now that all weights are loaded.
         // The VRAM pool is kept alive by the GEMM kernels' lifetime_owner_ shared_ptrs,
@@ -3604,7 +4145,8 @@ namespace llaminar2
             num_gpu_packed_ += registered;
         }
 
-        return registered == planned_count;
+        const size_t total_registered = registered + moe_registered;
+        return total_registered == planned_count;
     }
 
     bool WeightManager::uploadNonGemmWeights(
@@ -3631,6 +4173,12 @@ namespace llaminar2
             {
                 if (!isGemmWeight(name) && tensor)
                 {
+                    // MoE 3D expert parent tensors are prepared through per-expert
+                    // views in the unified GPU pipeline. Uploading the raw parent
+                    // as a non-GEMM tensor duplicates several GB of data and can
+                    // exhaust VRAM before graph execution.
+                    if (name.find("_exps.weight") != std::string::npos)
+                        continue;
                     if (layer_filter && !layer_filter(name))
                         continue;
                     non_gemm_names.push_back(name);
@@ -3648,8 +4196,8 @@ namespace llaminar2
                 auto base_it = cache_.find(name);
                 if (base_it == cache_.end() || !base_it->second)
                 {
-                    LOG_ERROR("[WeightManager] Non-GEMM weight missing from cache: " << name);
-                    continue;
+                    throw std::runtime_error(
+                        "[WeightManager] Non-GEMM weight missing from cache: " + name);
                 }
                 tensor = base_it->second;
 
@@ -3689,8 +4237,8 @@ namespace llaminar2
 
             if (!device_tensor_holder)
             {
-                LOG_ERROR("[WeightManager] Failed to get device tensor for: " << name);
-                continue;
+                throw std::runtime_error(
+                    "[WeightManager] Failed to get device tensor for: " + name);
             }
 
             TensorBase *device_tensor = device_tensor_holder.get();
@@ -3727,7 +4275,7 @@ namespace llaminar2
         // Phase 9: Hard gate — do NOT release host data until all lifecycle gates
         // are complete. This replaces the old ad-hoc deferred_host_release_pending_
         // flag in RankOrchestrator. The caller must mark graph_materialization_complete
-        // AFTER lazy graph builds (MoE expert packing) finish.
+        // after all graphs have resolved their prepared weight bindings.
         if (!lifecycle_gates_.canReleaseHostData())
         {
             LOG_INFO("[WeightManager] releaseAllHostWeightData() blocked by lifecycle gate "
@@ -3749,6 +4297,37 @@ namespace llaminar2
         size_t retained_count = 0;
         std::unordered_set<TensorBase *> visited_ptrs;
 
+        auto moe_parent_ready_for_release = [&](const TensorBase &tensor, const std::string &key) -> bool
+        {
+            int layer_idx = -1;
+            ExpertGemmRegistry::WeightRole role = ExpertGemmRegistry::WeightRole::GATE;
+            if (!parseMoEExpertParentName(key, layer_idx, role))
+                return false;
+
+            const int num_experts = moeExpertCountFromParentTensor(tensor);
+            if (num_experts <= 0)
+                return false;
+
+            std::lock_guard<std::mutex> prep_lock(prep_ticket_mutex_);
+            auto expected_it = expected_devices_by_weight_.find(key);
+            auto tickets_it = prep_tickets_.find(key);
+            if (expected_it == expected_devices_by_weight_.end() ||
+                tickets_it == prep_tickets_.end() ||
+                expected_it->second.empty())
+            {
+                return false;
+            }
+
+            const auto &tickets = tickets_it->second;
+            return std::all_of(expected_it->second.begin(), expected_it->second.end(),
+                               [&](const std::string &device_key)
+                               {
+                                   auto ticket_it = tickets.find(device_key);
+                                   return ticket_it != tickets.end() &&
+                                          ticket_it->second.state == WeightPrepState::READY;
+                               });
+        };
+
         auto try_release = [&](TensorBase *ptr, const std::string &key)
         {
             if (!ptr || !visited_ptrs.insert(ptr).second)
@@ -3763,10 +4342,9 @@ namespace llaminar2
                 return;
             }
 
-            // Phase 9: hostDataRequired() handles all retention decisions including
-            // dynamic MoE rebalancing. The lazy-graph-build case is now handled by
-            // the lifecycle gate (graph_materialization_complete blocks release until
-            // lazy builds are done).
+            // Phase 9: hostDataRequired() handles policy-based retention. The
+            // lifecycle gate ensures graph construction has consumed prepared
+            // bindings before raw host data can be reclaimed.
             if (hostDataRequired(ptr, key))
             {
                 skipped_count++;
@@ -3796,6 +4374,16 @@ namespace llaminar2
                 {
                     has_kernel_device_data = getPreparedEmbeddingCount() > 0;
                 }
+
+                // 3D MoE expert tensors (_exps.weight) are safe to release only
+                // after this exact parent layer/role has complete expert engines
+                // for every expected device. A non-empty global registry is not
+                // sufficient proof for an unrelated parent tensor.
+                if (!has_kernel_device_data && key.find("_exps.weight") != std::string::npos)
+                {
+                    has_kernel_device_data = moe_parent_ready_for_release(*ptr, key);
+                }
+
                 if (!has_kernel_device_data)
                 {
                     skipped_count++;

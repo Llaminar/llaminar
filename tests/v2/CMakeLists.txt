@@ -410,9 +410,10 @@ function(add_v2_test TEST_NAME)
     )
 
     # Add RESOURCE_LOCK if specified (prevents parallel execution of tests needing same resource)
-    # All integration tests (including parity) share a single lock to force serial
-    # execution even under `ctest --parallel`.  This prevents OOM and GPU contention
-    # when multiple model-loading tests run simultaneously.
+    # All integration tests share a single lock to force serial execution even
+    # under `ctest --parallel`.  Parity tests have their own lock
+    # ("Parity_Model_Execution") set by discover_v2_parity_tests(), so they are
+    # unaffected here.
     if("${ARG_LABELS}" MATCHES "Integration")
         list(APPEND ARG_RESOURCE_LOCK "Integration_Serial")
     endif()
@@ -550,6 +551,35 @@ target_link_libraries(v2_test_tensor_basics
 add_v2_test(V2_Unit_TensorBasics 
     COMMAND $<TARGET_FILE:v2_test_tensor_basics>
     LABELS "V2;Unit;TensorOperations;FP32;Basics;GEMM"
+)
+
+# Test: ExpertGemmRegistry - MoE expert GEMM engine registry
+add_executable(v2_unit_expert_gemm_registry unit/loaders/Test__ExpertGemmRegistry.cpp)
+target_link_libraries(v2_unit_expert_gemm_registry
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_ExpertGemmRegistry
+    COMMAND $<TARGET_FILE:v2_unit_expert_gemm_registry>
+    LABELS "V2;Unit;Loaders;MoE"
+    MPI_PROCS 1
+)
+
+# Test: Unified Pipeline MoE Collection - MoE expert weight collection in GPU pipeline
+add_executable(v2_unit_unified_pipeline_moe unit/loaders/Test__UnifiedPipelineMoECollection.cpp)
+target_include_directories(v2_unit_unified_pipeline_moe PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}  # For tests/v2/utils/ includes
+)
+target_link_libraries(v2_unit_unified_pipeline_moe
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_UnifiedPipelineMoECollection
+    COMMAND $<TARGET_FILE:v2_unit_unified_pipeline_moe>
+    LABELS "V2;Unit;Loaders;MoE"
+    MPI_PROCS 1
 )
 
 # Test: Tensor Host Release Lifecycle (CPU-only tensor release guard regression)
@@ -4261,9 +4291,11 @@ add_v2_test(V2_Integration_RCCLBackend
 )
 # RCCL/ROCm driver segfaults during static destructor teardown after all tests pass.
 # Signal handlers can't help here since this binary uses gtest_main (no custom main).
+if(TEST V2_Integration_RCCLBackend)
 set_tests_properties(V2_Integration_RCCLBackend PROPERTIES
     PASS_REGULAR_EXPRESSION "\\[  PASSED  \\]"
 )
+endif()
 message(STATUS "V2 Tests: Added RCCL backend integration tests")
 
 # Test: RCCLAllreduceAccuracy - Focused numerical accuracy tests for RCCL allreduce
@@ -4283,9 +4315,11 @@ add_v2_test(V2_Integration_RCCLAllreduceAccuracy
 # glibc abort() forcibly resets SIGABRT to SIG_DFL before raising, so signal
 # handlers cannot catch it. Use PASS_REGULAR_EXPRESSION as the only reliable
 # workaround — CTest passes if GTest printed "[ PASSED ]" before the crash.
+if(TEST V2_Integration_RCCLAllreduceAccuracy)
 set_tests_properties(V2_Integration_RCCLAllreduceAccuracy PROPERTIES
     PASS_REGULAR_EXPRESSION "\\[  PASSED  \\]"
 )
+endif()
 message(STATUS "V2 Tests: Added RCCL allreduce accuracy integration tests")
 endif()
 
@@ -6474,6 +6508,44 @@ add_v2_test(V2_Integration_WeightManagerMemoryEfficient
     COMMAND $<TARGET_FILE:v2_test_weight_manager_memory_efficient>
     MPI_PROCS 2
     LABELS "V2;Integration;WeightManager;TensorSlice;MemoryEfficient;Sharding"
+)
+
+# Test: Unified GPU Pipeline (dense + MoE weights in single pipeline)
+# Loads Qwen3.5-35B-A3B Q4_K model and verifies:
+# - ExpertGemmRegistry populated for all layers/experts
+# - Host data released for 3D MoE tensors
+# - Dense and MoE weights in same VRAM pool
+# - Expert GEMM engines produce correct matmul results
+# Model: /opt/llaminar-models/Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf
+add_executable(v2_integration_unified_gpu_pipeline integration/loaders/Test__UnifiedGPUPipeline.cpp)
+target_include_directories(v2_integration_unified_gpu_pipeline PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}  # For tests/v2/utils/ includes
+)
+target_link_libraries(v2_integration_unified_gpu_pipeline
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Integration_UnifiedGPUPipeline
+    COMMAND $<TARGET_FILE:v2_integration_unified_gpu_pipeline>
+    MPI_PROCS 1
+    LABELS "V2;Integration;WeightManager;MoE;GPU;Pipeline"
+)
+
+# Integration Test: Unified GPU Pipeline with Floating-Point (BF16) Model
+add_executable(v2_integration_unified_gpu_pipeline_fp integration/loaders/Test__UnifiedGPUPipeline_FP.cpp)
+target_include_directories(v2_integration_unified_gpu_pipeline_fp PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}  # For tests/v2/utils/ includes
+)
+target_link_libraries(v2_integration_unified_gpu_pipeline_fp
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Integration_UnifiedGPUPipelineFP
+    COMMAND $<TARGET_FILE:v2_integration_unified_gpu_pipeline_fp>
+    MPI_PROCS 1
+    LABELS "V2;Integration;WeightManager;MoE;GPU;Pipeline;FP;BF16"
 )
 
 # Test: WeightManager Proportional Slicing (TensorParallelConfig support)
@@ -10056,5 +10128,22 @@ endif()
 add_v2_test(V2_Unit_DeviceLoadPipeline
     COMMAND $<TARGET_FILE:v2_test_device_load_pipeline>
     LABELS "V2;Unit;WeightLoading;GpuPipeline;ROCm;HIP"
+    MPI_PROCS 1
+)
+
+# GPU Weight Loading Pipeline - FP Weight Pipeline Unit Tests
+add_executable(v2_test_fp_weight_pipeline unit/Test__FPWeightPipeline.cpp)
+target_include_directories(v2_test_fp_weight_pipeline PRIVATE ${CMAKE_SOURCE_DIR})
+target_link_libraries(v2_test_fp_weight_pipeline
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+if(HAVE_ROCM)
+    target_link_libraries(v2_test_fp_weight_pipeline rocm_backend)
+endif()
+add_v2_test(V2_Unit_FPWeightPipeline
+    COMMAND $<TARGET_FILE:v2_test_fp_weight_pipeline>
+    LABELS "V2;Unit;WeightLoading;GpuPipeline;FP"
     MPI_PROCS 1
 )

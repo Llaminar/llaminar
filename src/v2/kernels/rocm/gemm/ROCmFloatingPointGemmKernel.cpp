@@ -101,6 +101,42 @@ namespace llaminar2
                                                                    << " (using cached hipBLAS kernel)");
         }
 
+        ROCmFloatingPointGemmKernel::ROCmFloatingPointGemmKernel(
+            const void *d_weights,
+            int N, int K,
+            int rocm_device_id,
+            Precision precision,
+            std::shared_ptr<void> lifetime_owner)
+            : weights_(nullptr),
+              d_weights_(d_weights),
+              rocm_device_id_(rocm_device_id),
+              precision_(precision),
+              N_(static_cast<size_t>(N)),
+              K_(static_cast<size_t>(K)),
+              hipblas_kernel_(nullptr),
+              lifetime_owner_(std::move(lifetime_owner))
+        {
+            if (!d_weights)
+            {
+                throw std::runtime_error("[ROCmFloatingPointGemmKernel] Null device weight pointer");
+            }
+
+            // Warn about BF16 emulation on MI50
+            if (precision == Precision::BF16)
+            {
+                LOG_WARN("[ROCmFloatingPointGemmKernel] BF16 will be emulated via FP32 - "
+                         "MI50 (gfx906) has no native BF16 support");
+            }
+
+            // Get shared hipBLAS kernel from DeviceKernelCache
+            DeviceId device = DeviceId::rocm(rocm_device_id_);
+            hipblas_kernel_ = DeviceKernelCache::getKernel<HipBLASGemmKernel>(device, KernelType::BLAS_GEMM);
+
+            LOG_DEBUG("[ROCmFloatingPointGemmKernel] Created (raw ptr) for " << N_ << "x" << K_
+                      << " weights on ROCm device " << rocm_device_id_
+                      << " (using cached hipBLAS kernel)");
+        }
+
         ROCmFloatingPointGemmKernel::~ROCmFloatingPointGemmKernel()
         {
             if (d_mapped_redirect_)
@@ -119,6 +155,7 @@ namespace llaminar2
               N_(other.N_),
               K_(other.K_),
               hipblas_kernel_(other.hipblas_kernel_), // Just copy the shared pointer
+              lifetime_owner_(std::move(other.lifetime_owner_)),
               d_mapped_redirect_(other.d_mapped_redirect_),
               mapped_redirect_capacity_(other.mapped_redirect_capacity_)
         {

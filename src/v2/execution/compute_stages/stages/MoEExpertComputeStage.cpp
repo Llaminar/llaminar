@@ -181,6 +181,7 @@ namespace llaminar2
             params_.moe_packed_down_lifetime,
             payload_provider_,
             params_.prepared_store,
+            params_.expert_registry,
             params_.gate_slab_ref,
             params_.up_slab_ref,
             params_.down_slab_ref
@@ -815,39 +816,16 @@ namespace llaminar2
             return;
         }
 
-        // Fallback: resolve on first call (triggers VNNI repacking — slow)
-        LOG_WARN("[MoEExpertComputeStage] GEMM engines not pre-resolved; "
-                 "call prepareExpertGemmEngines() at graph build time for better perf");
+        // All local experts must be prepared at graph-build time.
+        // If we reach here, it means prepareExpertGemmEngines() was not called.
+        LOG_ERROR("[MoEExpertComputeStage] GEMM engines not pre-resolved for layer "
+                  << params_.layer_idx << ". All experts must be prepared at graph build time. "
+                  << "Ensure prepareExpertGemmEngines() is called during graph construction.");
 
-        const int local_start = params_.local_expert_start;
-        const int local_count = (params_.local_expert_count < 0)
-                                    ? num_experts
-                                    : params_.local_expert_count;
-        const int local_end = local_start + local_count;
-
+        // Initialize empty cache to avoid repeated error logging
         cached_gate_gemm_.resize(num_experts, nullptr);
         cached_up_gemm_.resize(num_experts, nullptr);
         cached_down_gemm_.resize(num_experts, nullptr);
-
-        for (int e = local_start; e < local_end; ++e)
-        {
-            if (!params_.expert_gate_views[e])
-                continue;
-
-            auto gate_engine = KernelFactory::prepareExpertGemmLocal(
-                params_.expert_gate_views[e].get(), params_.device_id);
-            auto up_engine = KernelFactory::prepareExpertGemmLocal(
-                params_.expert_up_views[e].get(), params_.device_id);
-            auto down_engine = KernelFactory::prepareExpertGemmLocal(
-                params_.expert_down_views[e].get(), params_.device_id);
-            cached_gate_gemm_[e] = gate_engine.get();
-            cached_up_gemm_[e] = up_engine.get();
-            cached_down_gemm_[e] = down_engine.get();
-            // Keep engines alive for the lifetime of this stage
-            fallback_owned_kernels_.push_back(std::move(gate_engine));
-            fallback_owned_kernels_.push_back(std::move(up_engine));
-            fallback_owned_kernels_.push_back(std::move(down_engine));
-        }
     }
 
     bool MoEExpertComputeStage::ensureGemmEnginesForExperts(const std::vector<int>& expert_ids)
@@ -890,21 +868,30 @@ namespace llaminar2
 
         if (has_missing)
         {
-            auto ctx = buildWeightContext();
-
-            // Use payload provider to supply serialized expert blobs instead of
-            // relying on raw GGUF host data. This enables host data release after
-            // initial GEMM preparation.
-            std::unordered_map<int, ExpertWeightBlobs> provider_payloads;
-            const std::unordered_map<int, ExpertWeightBlobs>* payloads_ptr = nullptr;
-            if (payload_provider_)
+            // Missing experts MUST come from transfer blobs (dynamic rebalancing).
+            // No fallback to raw host tensor data — all local experts are prepared
+            // upfront at graph-build time. Missing engines at this point means either
+            // a newly-arrived expert via rebalancing (must have a transfer blob) or
+            // an initialization error.
+            if (!payload_provider_)
             {
-                provider_payloads = payload_provider_->payloadsForLayer(params_.layer_idx);
-                if (!provider_payloads.empty())
-                    payloads_ptr = &provider_payloads;
+                LOG_ERROR("[MoEExpertComputeStage] Missing GEMM engines for layer "
+                          << params_.layer_idx << " but no payload provider available. "
+                          << "All local experts must be prepared at graph-build time.");
+                return false;
             }
 
-            if (!MoEExpertWeightService::registerAndPrepareNewExperts(ctx, needed, payloads_ptr))
+            auto provider_payloads = payload_provider_->payloadsForLayer(params_.layer_idx);
+            if (provider_payloads.empty())
+            {
+                LOG_ERROR("[MoEExpertComputeStage] Missing GEMM engines for layer "
+                          << params_.layer_idx << " and no transfer blobs available. "
+                          << "Ensure prepareExpertGemmEngines() prepared all local experts.");
+                return false;
+            }
+
+            auto ctx = buildWeightContext();
+            if (!MoEExpertWeightService::registerAndPrepareNewExperts(ctx, needed, &provider_payloads))
                 return false;
         }
 
@@ -996,6 +983,7 @@ namespace llaminar2
             params.moe_packed_down_lifetime,
             nullptr,
             params.prepared_store,
+            params.expert_registry,
             params.gate_slab_ref,
             params.up_slab_ref,
             params.down_slab_ref

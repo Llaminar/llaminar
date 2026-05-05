@@ -16,6 +16,7 @@
 #include "../../kernels/cpu/native_vnni/CPUPackedWeights.h"
 #include "../../kernels/cpu/native_vnni/CPUNativeVNNIGemmKernel.h"
 #include "../../loaders/MmapRegion.h"
+#include "../../loaders/ExpertGemmRegistry.h"
 #include "../../loaders/gpu_pipeline/LoadOrchestrator.h"
 #include "../../backends/BackendManager.h"
 #include "../../utils/Assertions.h"
@@ -688,6 +689,19 @@ std::vector<const TensorBase*> MoEExpertWeightService::releaseDepartedExperts(
         }
     }
 
+    // Mirror departures to ExpertGemmRegistry (keeps registry in sync with stage state)
+    if (ctx.expert_registry && !departed_ids.empty())
+    {
+        for (int e : departed_ids)
+        {
+            ctx.expert_registry->removeEngine(ctx.device_id, ctx.layer_idx, e, ExpertGemmRegistry::WeightRole::GATE);
+            ctx.expert_registry->removeEngine(ctx.device_id, ctx.layer_idx, e, ExpertGemmRegistry::WeightRole::UP);
+            ctx.expert_registry->removeEngine(ctx.device_id, ctx.layer_idx, e, ExpertGemmRegistry::WeightRole::DOWN);
+        }
+        LOG_DEBUG("[MoEWeightService] Removed " << departed_ids.size()
+                  << " departed experts from ExpertGemmRegistry (layer " << ctx.layer_idx << ")");
+    }
+
     // Phase C: Notify PreparedWeightStore of departed experts
     if (ctx.prepared_store && !departed_ids.empty())
     {
@@ -913,23 +927,50 @@ bool MoEExpertWeightService::registerAndPrepareNewExpertsGPU(
         RepackFormat format = RepackFormat::Q4_0;
     };
     std::vector<TransferSource> transfer_sources;
+    std::unordered_map<int, ExpertWeightBlobs> provider_payload_cache;
 
-    auto blobFor = [&](int expert_id, const char* label) -> const std::vector<uint8_t>* {
-        if (!received_weights) return nullptr;
-        auto it = received_weights->find(expert_id);
-        if (it == received_weights->end()) return nullptr;
-        if (std::strcmp(label, "gate") == 0) return &it->second.gate;
-        if (std::strcmp(label, "up") == 0) return &it->second.up;
-        return &it->second.down;
+    auto blobsForExpert = [&](int expert_id) -> const ExpertWeightBlobs* {
+        if (received_weights)
+        {
+            auto it = received_weights->find(expert_id);
+            if (it != received_weights->end() && !it->second.empty())
+                return &it->second;
+        }
+
+        auto cached = provider_payload_cache.find(expert_id);
+        if (cached != provider_payload_cache.end())
+            return &cached->second;
+
+        if (ctx.payload_provider)
+        {
+            auto payload = ctx.payload_provider->payloadFor(ctx.layer_idx, expert_id);
+            if (payload && !payload->empty())
+            {
+                auto [it, inserted] = provider_payload_cache.emplace(expert_id, std::move(*payload));
+                (void)inserted;
+                return &it->second;
+            }
+        }
+
+        return nullptr;
     };
 
-    auto hasAnyTransferredBlob = [&](int expert_id) {
+    auto blobFor = [&](int expert_id, const char* label) -> const std::vector<uint8_t>* {
+        const ExpertWeightBlobs* blobs = blobsForExpert(expert_id);
+        if (!blobs) return nullptr;
+        if (std::strcmp(label, "gate") == 0) return &blobs->gate;
+        if (std::strcmp(label, "up") == 0) return &blobs->up;
+        return &blobs->down;
+    };
+
+    auto hasCompleteTransferredBlobs = [&](int expert_id) {
         for (auto& grp : groups)
         {
             auto* blob = blobFor(expert_id, grp.label);
-            if (blob && !blob->empty()) return true;
+            if (!blob || blob->empty())
+                return false;
         }
-        return false;
+        return true;
     };
 
     auto makeTransferSource = [&](const std::vector<uint8_t>& blob,
@@ -974,28 +1015,34 @@ bool MoEExpertWeightService::registerAndPrepareNewExpertsGPU(
     experts_to_load.reserve(new_experts.size());
     for (int e : new_experts)
     {
-        if (!hasAnyTransferredBlob(e))
+        bool cache_hit = true;
+        for (auto& grp : groups)
         {
-            bool cache_hit = true;
-            for (auto& grp : groups)
+            const auto& view = grp.views[e];
+            if (!view)
             {
-                const auto& view = grp.views[e];
-                if (!view)
-                {
-                    cache_hit = false;
-                    break;
-                }
-                const auto* prepared = KernelFactory::findPreparedGemmWeights(view.get(), ctx.device_id);
-                if (!prepared)
-                {
-                    cache_hit = false;
-                    break;
-                }
-                grp.out_gemms[e] = KernelFactory::getOrCreateGemmEngine(prepared);
-                cache_hit = cache_hit && grp.out_gemms[e] != nullptr;
+                cache_hit = false;
+                break;
             }
-            if (cache_hit)
-                continue;
+            const auto* prepared = KernelFactory::findPreparedGemmWeights(view.get(), ctx.device_id);
+            if (!prepared)
+            {
+                cache_hit = false;
+                break;
+            }
+            grp.out_gemms[e] = KernelFactory::getOrCreateGemmEngine(prepared);
+            cache_hit = cache_hit && grp.out_gemms[e] != nullptr;
+        }
+        if (cache_hit)
+            continue;
+
+        if (!hasCompleteTransferredBlobs(e))
+        {
+            LOG_ERROR("[MoEWeightService::GPU-rebalance] Expert " << e
+                      << " requires transferred/provider blobs for all gate/up/down weights on "
+                      << ctx.device_id.to_string() << " (layer " << ctx.layer_idx
+                      << "). Raw GGUF fallback is not allowed during GPU rebalance after host release.");
+            return false;
         }
 
         experts_to_load.push_back(e);
@@ -1044,14 +1091,19 @@ bool MoEExpertWeightService::registerAndPrepareNewExpertsGPU(
             }
             const std::string slot_name = std::string(grp.label) + "_e" + std::to_string(e);
 
-            size_t source_bytes = raw_bytes;
-            if (auto* blob = blobFor(e, grp.label))
+            auto* blob = blobFor(e, grp.label);
+            if (!blob || blob->empty())
             {
-                auto source = makeTransferSource(*blob, e, grp.label);
-                if (!source) return false;
-                source_bytes = source->native->nativeBlocks().size();
-                transfer_sources.push_back(std::move(*source));
+                LOG_ERROR("[MoEWeightService::GPU-rebalance] Missing required transferred/provider blob for expert "
+                          << e << " " << grp.label << " on " << ctx.device_id.to_string()
+                          << " (layer " << ctx.layer_idx << ")");
+                return false;
             }
+
+            auto source = makeTransferSource(*blob, e, grp.label);
+            if (!source) return false;
+            const size_t source_bytes = source->native->nativeBlocks().size();
+            transfer_sources.push_back(std::move(*source));
 
             orchestrator->planWeight(gpu_ordinal, slot_name, N, K,
                                      vnni->payload_bytes, vnni->is_asymmetric,
@@ -1100,89 +1152,15 @@ bool MoEExpertWeightService::registerAndPrepareNewExpertsGPU(
             job.K = static_cast<int>(view->cols());
             job.is_asymmetric = vnni->is_asymmetric;
 
-            if (auto* blob = blobFor(e, grp.label))
+            if (transfer_source_idx >= transfer_sources.size())
             {
-                if (blob->empty()) return false;
-                if (transfer_source_idx >= transfer_sources.size())
-                {
-                    LOG_ERROR("[MoEWeightService::GPU-rebalance] Internal transfer source accounting mismatch");
-                    return false;
-                }
-                const auto& source = transfer_sources[transfer_source_idx++];
-                job.host_raw_data = source.native->nativeBlocks().data();
-                job.raw_bytes = source.native->nativeBlocks().size();
-                job.format = source.format;
+                LOG_ERROR("[MoEWeightService::GPU-rebalance] Internal transfer source accounting mismatch");
+                return false;
             }
-            else if (ctx.payload_provider)
-            {
-                // Try the payload provider for serialized expert blobs before
-                // falling back to raw GGUF host data. This enables host data
-                // release after initial GEMM preparation.
-                auto payload = ctx.payload_provider->payloadFor(ctx.layer_idx, e);
-                if (payload)
-                {
-                    const std::vector<uint8_t>* payload_blob = nullptr;
-                    if (std::strcmp(grp.label, "gate") == 0) payload_blob = &payload->gate;
-                    else if (std::strcmp(grp.label, "up") == 0) payload_blob = &payload->up;
-                    else payload_blob = &payload->down;
-
-                    if (payload_blob && !payload_blob->empty())
-                    {
-                        auto source = makeTransferSource(*payload_blob, e, grp.label);
-                        if (!source) return false;
-                        job.host_raw_data = source->native->nativeBlocks().data();
-                        job.raw_bytes = source->native->nativeBlocks().size();
-                        job.format = source->format;
-                        transfer_sources.push_back(std::move(*source));
-                    }
-                    else
-                    {
-                        LOG_ERROR("[MoEWeightService::GPU-rebalance] Expert " << e << " "
-                                  << grp.label << " has empty payload from provider for "
-                                  << ctx.device_id.to_string() << " (layer " << ctx.layer_idx << ")");
-                        return false;
-                    }
-                }
-                else
-                {
-                    // Payload provider exists but has no payload for this expert.
-                    // Fall through to raw data as last resort.
-                    job.host_raw_data = view->raw_data();
-                    job.raw_bytes = quantizedViewRawBytes(*view);
-                    if (!job.host_raw_data)
-                    {
-                        LOG_ERROR("[MoEWeightService::GPU-rebalance] Expert " << e << " "
-                                  << grp.label << " has no payload from provider and no raw fallback on "
-                                  << ctx.device_id.to_string() << " (layer " << ctx.layer_idx << ")");
-                        return false;
-                    }
-#if LLAMINAR_ASSERTIONS_ACTIVE
-                    LOG_WARN("[MoEWeightService::GPU-rebalance] Expert " << e << " "
-                              << grp.label << " using raw GGUF fallback despite payload provider being set"
-                              << " (layer " << ctx.layer_idx << ", " << ctx.device_id.to_string()
-                              << "). This indicates the expert was not pre-materialized.");
-#endif
-                }
-            }
-            else
-            {
-                job.host_raw_data = view->raw_data();
-                job.raw_bytes = quantizedViewRawBytes(*view);
-                if (!job.host_raw_data)
-                {
-                    LOG_ERROR("[MoEWeightService::GPU-rebalance] Expert " << e << " "
-                              << grp.label << " has no transferred packed source and no raw fallback for "
-                              << job.raw_bytes << " bytes on " << ctx.device_id.to_string()
-                              << " (layer " << ctx.layer_idx << ")");
-                    return false;
-                }
-#if LLAMINAR_ASSERTIONS_ACTIVE
-                LOG_WARN("[MoEWeightService::GPU-rebalance] Expert " << e << " "
-                          << grp.label << " using raw GGUF fallback without payload provider"
-                          << " (layer " << ctx.layer_idx << ", " << ctx.device_id.to_string()
-                          << "). Set payload provider to enable host data release.");
-#endif
-            }
+            const auto& source = transfer_sources[transfer_source_idx++];
+            job.host_raw_data = source.native->nativeBlocks().data();
+            job.raw_bytes = source.native->nativeBlocks().size();
+            job.format = source.format;
 
             orchestrator->addWeightJob(gpu_ordinal, job);
         }
@@ -1268,6 +1246,34 @@ bool MoEExpertWeightService::registerAndPrepareNewExpertsGPU(
     {
         for (int e : experts_to_load)
             ctx.payload_provider->markExpertPrepared(ctx.layer_idx, e);
+    }
+
+    // Mirror arrivals to ExpertGemmRegistry (keeps registry in sync with stage state)
+    if (ctx.expert_registry)
+    {
+        for (int e : experts_to_load)
+        {
+            auto find_ownership = [&](ITensorGemm* raw) -> std::shared_ptr<ITensorGemm> {
+                for (const auto& owned : ctx.moe_owned_kernels)
+                    if (owned.get() == raw) return owned;
+                return nullptr;
+            };
+
+            if (ctx.prepared_gate_gemm[e])
+                ctx.expert_registry->replaceEngine(ctx.device_id, ctx.layer_idx, e,
+                    ExpertGemmRegistry::WeightRole::GATE,
+                    ctx.prepared_gate_gemm[e], find_ownership(ctx.prepared_gate_gemm[e]));
+            if (ctx.prepared_up_gemm[e])
+                ctx.expert_registry->replaceEngine(ctx.device_id, ctx.layer_idx, e,
+                    ExpertGemmRegistry::WeightRole::UP,
+                    ctx.prepared_up_gemm[e], find_ownership(ctx.prepared_up_gemm[e]));
+            if (ctx.prepared_down_gemm[e])
+                ctx.expert_registry->replaceEngine(ctx.device_id, ctx.layer_idx, e,
+                    ExpertGemmRegistry::WeightRole::DOWN,
+                    ctx.prepared_down_gemm[e], find_ownership(ctx.prepared_down_gemm[e]));
+        }
+        LOG_DEBUG("[MoEWeightService::GPU-rebalance] Registered " << experts_to_load.size()
+                  << " arrived experts in ExpertGemmRegistry (layer " << ctx.layer_idx << ")");
     }
 
     const auto elapsed_ms = std::chrono::duration<double, std::milli>(Clock::now() - t_start).count();

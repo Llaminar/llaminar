@@ -10,10 +10,12 @@
 #include <gtest/gtest.h>
 
 #include "execution/moe/MoEExpertWeightService.h"
+#include "loaders/ExpertGemmRegistry.h"
 #include "tensors/Tensors.h"
 #include "tensors/BlockStructures.h"
 #include "kernels/KernelFactory.h"
 #include "backends/DeviceId.h"
+#include "backends/BackendManager.h"
 #include "utils/TestTensorFactory.h"
 
 #include <memory>
@@ -82,6 +84,7 @@ struct TestWeightContextOwner {
     std::shared_ptr<void> moe_packed_gate_lifetime;
     std::shared_ptr<void> moe_packed_up_lifetime;
     std::shared_ptr<void> moe_packed_down_lifetime;
+    ExpertGemmRegistry* expert_registry = nullptr;
 
     // 3D parent tensors (owned — must be shared_ptr for create_view/shared_from_this)
     std::shared_ptr<Q4_0Tensor> gate_3d;
@@ -118,10 +121,23 @@ struct TestWeightContextOwner {
             moe_owned_kernels,
             moe_packed_gate_lifetime,
             moe_packed_up_lifetime,
-            moe_packed_down_lifetime
+            moe_packed_down_lifetime,
+            nullptr,
+            nullptr,
+            expert_registry
         };
     }
 };
+
+bool hasGPU() {
+    return hasROCmBackend() || hasCUDABackend();
+}
+
+DeviceId firstGPU() {
+    if (hasROCmBackend()) return DeviceId(DeviceType::ROCm, 0);
+    if (hasCUDABackend()) return DeviceId(DeviceType::CUDA, 0);
+    return DeviceId::cpu();
+}
 
 } // namespace
 
@@ -304,6 +320,36 @@ TEST(Test__MoEExpertWeightService, ReleaseDepartedExperts_ClearsEngines) {
     }
 }
 
+TEST(Test__MoEExpertWeightService, ReleaseDepartedExperts_RemovesRegistryEntries) {
+    TestWeightContextOwner owner;
+    ExpertGemmRegistry registry;
+    owner.expert_registry = &registry;
+
+    { auto ctx = owner.buildContext(); ASSERT_TRUE(MoEExpertWeightService::extractExpertViews(ctx)); }
+    { auto ctx = owner.buildContext(); ASSERT_TRUE(MoEExpertWeightService::prepareGemmEngines(ctx)); }
+
+    for (int e = 0; e < kNumExperts; ++e) {
+        registry.registerEngine(owner.device_id, 0, e, ExpertGemmRegistry::WeightRole::GATE,
+                                owner.prepared_gate_gemm[e], nullptr);
+        registry.registerEngine(owner.device_id, 0, e, ExpertGemmRegistry::WeightRole::UP,
+                                owner.prepared_up_gemm[e], nullptr);
+        registry.registerEngine(owner.device_id, 0, e, ExpertGemmRegistry::WeightRole::DOWN,
+                                owner.prepared_down_gemm[e], nullptr);
+    }
+    ASSERT_TRUE(registry.hasCompleteLayer(owner.device_id, 0, kNumExperts));
+
+    std::vector<bool> new_mask = {true, false, true, false};
+    { auto ctx = owner.buildContext(); (void)MoEExpertWeightService::releaseDepartedExperts(ctx, new_mask); }
+
+    EXPECT_NE(registry.getEngine(owner.device_id, 0, 0, ExpertGemmRegistry::WeightRole::GATE), nullptr);
+    EXPECT_EQ(registry.getEngine(owner.device_id, 0, 1, ExpertGemmRegistry::WeightRole::GATE), nullptr);
+    EXPECT_EQ(registry.getEngine(owner.device_id, 0, 1, ExpertGemmRegistry::WeightRole::UP), nullptr);
+    EXPECT_EQ(registry.getEngine(owner.device_id, 0, 1, ExpertGemmRegistry::WeightRole::DOWN), nullptr);
+    EXPECT_NE(registry.getEngine(owner.device_id, 0, 2, ExpertGemmRegistry::WeightRole::GATE), nullptr);
+    EXPECT_EQ(registry.getEngine(owner.device_id, 0, 3, ExpertGemmRegistry::WeightRole::GATE), nullptr);
+    EXPECT_FALSE(registry.hasCompleteLayer(owner.device_id, 0, kNumExperts));
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // registerAndPrepareNewExperts
 // ─────────────────────────────────────────────────────────────────────────────
@@ -336,6 +382,29 @@ TEST(Test__MoEExpertWeightService, RegisterAndPrepareNewExperts_NoNewExperts) {
     // Same mask — no new experts
     std::vector<bool> same_mask = {true, true, true, true};
     { auto ctx = owner.buildContext(); EXPECT_TRUE(MoEExpertWeightService::registerAndPrepareNewExperts(ctx, same_mask, nullptr)); }
+}
+
+TEST(Test__MoEExpertWeightService, GPURebalanceRequiresPayloadWhenCacheMissing) {
+        if (!hasGPU()) {
+                GTEST_SKIP() << "No GPU backend available";
+        }
+
+        TestWeightContextOwner owner;
+        owner.device_id = firstGPU();
+        owner.expert_mask = {true, false, false, false};
+        owner.prepared_gate_gemm.assign(kNumExperts, nullptr);
+        owner.prepared_up_gemm.assign(kNumExperts, nullptr);
+        owner.prepared_down_gemm.assign(kNumExperts, nullptr);
+
+        { auto ctx = owner.buildContext(); ASSERT_TRUE(MoEExpertWeightService::extractExpertViews(ctx)); }
+
+        std::vector<bool> new_mask = {true, true, false, false};
+        { auto ctx = owner.buildContext();
+            EXPECT_FALSE(MoEExpertWeightService::registerAndPrepareNewExperts(ctx, new_mask, nullptr)); }
+
+        EXPECT_EQ(owner.prepared_gate_gemm[1], nullptr);
+        EXPECT_EQ(owner.prepared_up_gemm[1], nullptr);
+        EXPECT_EQ(owner.prepared_down_gemm[1], nullptr);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

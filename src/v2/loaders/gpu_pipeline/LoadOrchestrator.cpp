@@ -59,6 +59,20 @@ void LoadOrchestrator::planWeight(int device_id, const std::string& name,
                           has_emins, raw_gguf_bytes);
 }
 
+void LoadOrchestrator::planRawWeight(int device_id, const std::string& name,
+                                     int N, int K, size_t raw_bytes)
+{
+    auto* ctx = findDevice(device_id);
+    if (!ctx)
+    {
+        LOG_ERROR("LoadOrchestrator: unknown device " << device_id);
+        throw std::runtime_error("LoadOrchestrator: unknown device " +
+                                 std::to_string(device_id));
+    }
+
+    ctx->pool->planRawWeight(name, N, K, raw_bytes);
+}
+
 void LoadOrchestrator::allocate(size_t pinned_slot_size, int num_h2d_streams)
 {
     ScopedWeightLoadDetailTimer alloc_timer("gpu_pipeline.allocate");

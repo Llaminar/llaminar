@@ -44,9 +44,9 @@
       "decode_tokens": 128,
       "devices": {
         "cpu:0": {
-          "prefill_tok_s": 156.63,
-          "decode_tok_s": 18.96,
-          "_comment": "High-water mark set at commit fb4d70b2 on 2026-05-03. Note to agents: It is FORBIDDEN to update these thresholds without explicit human approval."
+          "prefill_tok_s": 157.67,
+          "decode_tok_s": 19.38,
+          "_comment": "High-water mark set at commit 7ae5d727 on 2026-05-05. Note to agents: It is FORBIDDEN to update these thresholds without explicit human approval."
         },
         "cpu": {
           "prefill_tok_s": 234.49,
