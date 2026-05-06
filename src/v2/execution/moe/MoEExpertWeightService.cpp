@@ -317,8 +317,8 @@ bool MoEExpertWeightService::prepareGemmEngines(MoEWeightContext& ctx)
     // EP range
     // Dynamic rebalancing: when expert_mask is set, prepare ONLY mask-active
     // experts (not all). Views exist for all experts, but GEMM engines are
-    // expensive (VNNI repacking). Newly-acquired experts get engines lazily
-    // via registerAndPrepareNewExperts() after rebalancing.
+    // expensive (VNNI repacking). Newly-acquired experts get engines from
+    // serialized payloads via registerAndPrepareNewExperts() after rebalancing.
     const bool use_mask = !ctx.expert_mask.empty();
     const int local_start = ctx.local_expert_start;
     const int local_count = (ctx.local_expert_count < 0)

@@ -13,10 +13,63 @@
 #include "kernels/cuda/repack/CUDAVnniRepackKernels.h"
 #endif
 
+#include <algorithm>
 #include <stdexcept>
 
 namespace llaminar2
 {
+
+namespace
+{
+std::string formatMiB(size_t bytes)
+{
+    return std::to_string(bytes / (1024 * 1024)) + " MiB";
+}
+
+bool vramBudgetPreflight(IBackend* backend,
+                         int device_id,
+                         size_t planned_weight_bytes,
+                         size_t staging_bytes)
+{
+    if (!backend)
+        return true;
+
+    const size_t required_vram_bytes = planned_weight_bytes + staging_bytes;
+    if (required_vram_bytes == 0)
+        return true;
+
+    const size_t free_vram_bytes = backend->deviceMemoryFree(device_id);
+    const size_t total_vram_bytes = backend->deviceMemoryTotal(device_id);
+    if (free_vram_bytes == 0)
+        return true;
+
+    const size_t safety_margin_bytes = std::max<size_t>(512ULL * 1024ULL * 1024ULL,
+                                                        total_vram_bytes / 20ULL);
+    if (required_vram_bytes + safety_margin_bytes <= free_vram_bytes)
+    {
+        LOG_DEBUG("LoadOrchestrator: VRAM preflight passed for device " << device_id
+                  << " required=" << formatMiB(required_vram_bytes)
+                  << " planned_weights=" << formatMiB(planned_weight_bytes)
+                  << " staging=" << formatMiB(staging_bytes)
+                  << " free=" << formatMiB(free_vram_bytes)
+                  << " safety_margin=" << formatMiB(safety_margin_bytes));
+        return true;
+    }
+
+    LOG_ERROR("LoadOrchestrator: VRAM preflight failed for device " << device_id
+              << ": required=" << formatMiB(required_vram_bytes)
+              << " available_after_margin="
+              << formatMiB(free_vram_bytes > safety_margin_bytes ? free_vram_bytes - safety_margin_bytes : 0)
+              << " free=" << formatMiB(free_vram_bytes)
+              << " total=" << formatMiB(total_vram_bytes)
+              << " planned_weights=" << formatMiB(planned_weight_bytes)
+              << " staging=" << formatMiB(staging_bytes)
+              << " safety_margin=" << formatMiB(safety_margin_bytes)
+              << ". Mitigations: set LLAMINAR_WEIGHT_STREAMING=1, use a smaller model, "
+              << "reduce context/KV cache pressure, or reduce resident experts.");
+    return false;
+}
+} // namespace
 
 LoadOrchestrator::LoadOrchestrator(IBackend* backend)
     : backend_(backend)
@@ -79,6 +132,15 @@ void LoadOrchestrator::allocate(size_t pinned_slot_size, int num_h2d_streams)
 
     for (auto& ctx : devices_)
     {
+        const int staging_slots = std::max(0, num_h2d_streams);
+        const size_t planned_weight_bytes = ctx.pool ? ctx.pool->totalPlannedBytes() : 0;
+        const size_t staging_bytes = pinned_slot_size * static_cast<size_t>(staging_slots);
+        if (!vramBudgetPreflight(backend_, ctx.device_id, planned_weight_bytes, staging_bytes))
+        {
+            throw std::runtime_error("LoadOrchestrator: VRAM budget preflight failed for device " +
+                                     std::to_string(ctx.device_id));
+        }
+
         // Allocate VRAM pool with staging slots
         if (!ctx.pool->allocate(backend_, ctx.device_id, num_h2d_streams))
         {

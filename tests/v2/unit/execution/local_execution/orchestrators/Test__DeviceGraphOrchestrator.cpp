@@ -19,12 +19,15 @@
 #include "execution/compute_stages/IComputeStage.h"
 #include "interfaces/IWorkspaceConsumer.h"
 #include "models/qwen/QwenStandardGraph.h"
+#include "loaders/WeightPlan.h"
+#include "loaders/PreparedWeightStore.h"
 #include "backends/ComputeBackend.h"
 #include "utils/Logger.h"
 #include "tensors/Tensors.h"
 #include "tensors/TensorFactory.h"
 #include "kernels/cpu/CPURingKVCache.h"
 #include <memory>
+#include <utility>
 
 using namespace llaminar2;
 
@@ -57,6 +60,40 @@ protected:
 
     GraphConfig config_;
     std::shared_ptr<QwenStandardGraph> graph_builder_;
+};
+
+class CapturingQwenStandardGraph : public QwenStandardGraph
+{
+public:
+    CapturingQwenStandardGraph(const GraphConfig &config, std::shared_ptr<IMPIContext> mpi_ctx)
+        : QwenStandardGraph(config, std::move(mpi_ctx)) {}
+
+    void setWeights(const ModelWeights &weights) override
+    {
+        captured_weights = weights;
+        QwenStandardGraph::setWeights(weights);
+    }
+
+    void setWeightBindings(const ModelWeightBindings &bindings) override
+    {
+        ++binding_set_count;
+        captured_bindings = bindings;
+        QwenStandardGraph::setWeightBindings(bindings);
+    }
+
+    TensorContext exposeTensorContext() const { return buildTensorContext(); }
+    LayerWeights exposeLayerWeightsForGraph(int layer_idx) const { return layerWeightsForGraph(layer_idx); }
+    std::optional<PreparedWeightRef> exposePreparedRefForGraphWeight(
+        const WeightBinding *binding,
+        const TensorBase *tensor,
+        DeviceId device) const
+    {
+        return preparedRefForGraphWeight(binding, tensor, device);
+    }
+
+    int binding_set_count = 0;
+    ModelWeights captured_weights;
+    ModelWeightBindings captured_bindings;
 };
 
 // =============================================================================
@@ -100,6 +137,87 @@ TEST_F(Test__DeviceGraphOrchestrator, NullGraphBuilderThrows)
     EXPECT_THROW(
         DeviceGraphOrchestrator(std::shared_ptr<QwenStandardGraph>(nullptr), nullptr),
         std::invalid_argument);
+}
+
+TEST_F(Test__DeviceGraphOrchestrator, SetWeightsFreezesBindingsAndDoesNotExposeLazyCallback)
+{
+    config_.n_layers = 3;
+    auto capturing_builder = std::make_shared<CapturingQwenStandardGraph>(config_, nullptr);
+    DeviceGraphOrchestrator orchestrator(capturing_builder, nullptr);
+
+    auto embedding = std::make_shared<FP32Tensor>(std::vector<size_t>{16, 8});
+    auto attn_q = std::make_shared<FP32Tensor>(std::vector<size_t>{8, 8});
+    auto ssm_alpha = std::make_shared<FP32Tensor>(std::vector<size_t>{8, 8});
+    auto moe_gate_exps = std::make_shared<FP32Tensor>(std::vector<size_t>{4, 8, 2});
+
+    int callback_calls = 0;
+    ModelWeights weights;
+    weights.embedding_table = embedding.get();
+    weights.get_layer_weights = [&](int layer_idx) {
+        ++callback_calls;
+        LayerWeights layer;
+        layer.wq = attn_q.get();
+        layer.ssm_alpha = ssm_alpha.get();
+        layer.moe_gate_exps = moe_gate_exps.get();
+        return layer;
+    };
+
+    orchestrator.setWeights(weights);
+
+    EXPECT_EQ(callback_calls, config_.n_layers);
+    ASSERT_EQ(capturing_builder->binding_set_count, 1);
+    ASSERT_TRUE(capturing_builder->captured_bindings.get_layer_weights != nullptr);
+    ASSERT_TRUE(capturing_builder->captured_weights.get_layer_weights != nullptr);
+
+    const FrozenModelWeightSet *frozen = orchestrator.frozenWeightSet();
+    ASSERT_NE(frozen, nullptr);
+    EXPECT_NE(frozen->optionalLayer(0, "attn_q.weight"), nullptr);
+    EXPECT_NE(frozen->optionalLayer(0, "ssm_alpha.weight"), nullptr);
+    EXPECT_NE(frozen->optionalLayer(0, "ffn_gate_exps.weight"), nullptr);
+
+    auto binding_layer = capturing_builder->captured_bindings.get_layer_weights(0);
+    ASSERT_NE(binding_layer.ssm_alpha, nullptr);
+    ASSERT_NE(binding_layer.moe_gate_exps, nullptr);
+    EXPECT_EQ(binding_layer.ssm_alpha->tensor, ssm_alpha.get());
+    EXPECT_EQ(binding_layer.moe_gate_exps->tensor, moe_gate_exps.get());
+
+    auto legacy_layer = capturing_builder->captured_weights.get_layer_weights(0);
+    EXPECT_EQ(legacy_layer.wq, attn_q.get());
+    EXPECT_EQ(legacy_layer.ssm_alpha, ssm_alpha.get());
+    EXPECT_EQ(legacy_layer.moe_gate_exps, moe_gate_exps.get());
+
+    callback_calls = 0;
+    (void)capturing_builder->captured_weights.get_layer_weights(1);
+    EXPECT_EQ(callback_calls, 0);
+
+    callback_calls = 0;
+    auto helper_layer = capturing_builder->exposeLayerWeightsForGraph(1);
+    EXPECT_EQ(helper_layer.ssm_alpha, ssm_alpha.get());
+    EXPECT_EQ(callback_calls, 0);
+
+    TensorContext tensor_context = capturing_builder->exposeTensorContext();
+    ASSERT_NE(tensor_context.model_weight_bindings["embedding_table"], nullptr);
+    EXPECT_EQ(tensor_context.model_weight_bindings["embedding_table"]->tensor, embedding.get());
+    ASSERT_TRUE(tensor_context.get_layer_weight_binding != nullptr);
+    const WeightBinding *gdn_binding = tensor_context.get_layer_weight_binding(0, "ssm_alpha");
+    ASSERT_NE(gdn_binding, nullptr);
+    EXPECT_EQ(gdn_binding->identity.canonical_name, "blk.0.ssm_alpha.weight");
+    EXPECT_EQ(gdn_binding->tensor, ssm_alpha.get());
+
+    PreparedWeightStore store;
+    auto registered_ref = store.registerPreparedForTest(
+        *gdn_binding,
+        PreparedWeightKind::CpuPackedGemm,
+        DeviceId::cpu());
+    capturing_builder->setPreparedWeightStore(&store);
+
+    auto graph_ref = capturing_builder->exposePreparedRefForGraphWeight(
+        gdn_binding,
+        ssm_alpha.get(),
+        DeviceId::cpu());
+    ASSERT_TRUE(graph_ref.has_value());
+    EXPECT_EQ(graph_ref->binding_id, registered_ref.binding_id);
+    EXPECT_EQ(graph_ref->binding_id, gdn_binding->binding_id);
 }
 
 // =============================================================================

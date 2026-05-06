@@ -342,7 +342,7 @@ namespace llaminar2
             /**
              * @brief Construct kernel for quantized weight tensor (legacy lazy conversion)
              *
-             * Deprecated: use KernelFactory::getOrCreatePreparedGemmWeights() +
+             * Deprecated: use PreparedWeightStore or KernelFactory::prepareGemmHandleLocal() +
              * KernelFactory::getOrCreateGemmEngine(), or explicitly pre-pack via
              * ROCmPackedWeights and use the packed constructor below.
              *
@@ -351,7 +351,7 @@ namespace llaminar2
              *
              * @throws std::runtime_error if weight not quantized or not on GPU
              */
-            [[deprecated("Use KernelFactory::getOrCreatePreparedGemmWeights() + getOrCreateGemmEngine(), or pre-pack via ROCmPackedWeights.")]]
+            [[deprecated("Use PreparedWeightStore or prepareGemmHandleLocal() + getOrCreateGemmEngine(), or pre-pack via ROCmPackedWeights.")]]
             ROCmQuantisedGemmKernel(const TensorBase *weights, int rocm_device_id);
 
             /**

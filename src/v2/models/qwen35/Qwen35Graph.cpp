@@ -288,6 +288,7 @@ namespace llaminar2
         ComputeGraph graph;
         std::string prefix = "layer" + std::to_string(layer_idx) + "_";
         int total_tokens = batch_size * seq_len;
+        LayerWeightBindings layer_bindings = layerWeightBindingsForGraph(layer_idx);
 
         // Get GDN state from hybrid KV cache
         auto *hybrid_cache = dynamic_cast<IHybridKVCache *>(kv_cache);
@@ -363,18 +364,22 @@ namespace llaminar2
         proj_params.k = d_model;
 
         proj_params.w_qkv = layer.attn_qkv;
+        proj_params.prepared_ref_qkv = preparedRefForGraphWeight(layer_bindings.attn_qkv, layer.attn_qkv, device);
         proj_params.output_qkv = buffers.get(BufferId::GDN_QKV);
         proj_params.n_qkv = qkv_dim;
 
         proj_params.w_z = layer.attn_gate; // Z projection = attn_gate.weight (in_proj_z in HF)
+        proj_params.prepared_ref_z = preparedRefForGraphWeight(layer_bindings.attn_gate, layer.attn_gate, device);
         proj_params.output_z = buffers.get(BufferId::GDN_Z);
         proj_params.n_z = value_dim; // Z gate operates on value_dim (n_v_heads * d_v)
 
         proj_params.w_a = layer.ssm_alpha;
+        proj_params.prepared_ref_a = preparedRefForGraphWeight(layer_bindings.ssm_alpha, layer.ssm_alpha, device);
         proj_params.output_a = buffers.get(BufferId::GDN_ALPHA);
         proj_params.n_a = n_v_heads; // Alpha is per-value-head
 
         proj_params.w_b = layer.ssm_beta;
+        proj_params.prepared_ref_b = preparedRefForGraphWeight(layer_bindings.ssm_beta, layer.ssm_beta, device);
         proj_params.output_b = buffers.get(BufferId::GDN_BETA);
         proj_params.n_b = n_v_heads; // Beta is per-value-head
 
@@ -550,6 +555,7 @@ namespace llaminar2
         ComputeGraph graph;
         std::string prefix = "layer" + std::to_string(layer_idx) + "_";
         int total_tokens = batch_size * seq_len;
+        LayerWeightBindings layer_bindings = layerWeightBindingsForGraph(layer_idx);
 
         LOG_DEBUG("[Qwen35Graph::buildFAAttentionGraph] layer=" << layer_idx
                                                                 << " seq_len=" << seq_len << " batch_size=" << batch_size
@@ -611,6 +617,9 @@ namespace llaminar2
                               .output_q_buffer_id = BufferId::FA_Q_RAW,
                               .output_k_buffer_id = BufferId::K_PROJ,
                               .output_v_buffer_id = BufferId::V_PROJ,
+                              .prepared_ref_q = preparedRefForGraphWeight(layer_bindings.wq, layer.wq, device),
+                              .prepared_ref_k = preparedRefForGraphWeight(layer_bindings.wk, layer.wk, device),
+                              .prepared_ref_v = preparedRefForGraphWeight(layer_bindings.wv, layer.wv, device),
                               .prepared_store = prepared_weight_store_,
                           }),
                           device);

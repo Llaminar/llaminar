@@ -4,7 +4,6 @@
  */
 
 #include "GDNProjectionStage.h"
-#include "../../../kernels/KernelFactory.h"
 #include "../../../loaders/PreparedWeightStore.h"
 #include "../../../tensors/Tensors.h"
 #include "../../../tensors/TensorKernels.h"
@@ -12,11 +11,53 @@
 
 namespace llaminar2
 {
-    using KernelFactory = llaminar::v2::kernels::KernelFactory;
-
     GDNProjectionStage::GDNProjectionStage(Params params)
         : IComputeStage(params.device_id), params_(std::move(params))
     {
+    }
+
+    bool GDNProjectionStage::validatePreparedWeights(std::string *error) const
+    {
+        auto fail = [error](const std::string &message)
+        {
+            if (error)
+                *error = message;
+            return false;
+        };
+
+        if (!params_.w_qkv && !params_.w_z && !params_.w_a && !params_.w_b)
+        {
+            if (error)
+                error->clear();
+            return true;
+        }
+
+        if (!params_.prepared_store)
+            return fail("PreparedWeightStore is required for GDNProjectionStage weights");
+
+        auto check = [&](const char *name, const TensorBase *weight, const std::optional<PreparedWeightRef> &ref)
+        {
+            if (!weight)
+                return true;
+            if (!ref.has_value())
+                return fail(std::string("missing PreparedWeightRef for ") + name);
+            if (!params_.prepared_store->contains(ref.value()))
+                return fail(std::string("PreparedWeightStore does not contain ref for ") + name);
+            return true;
+        };
+
+        if (!check("w_qkv", requireTensorBase(params_.w_qkv, "w_qkv"), params_.prepared_ref_qkv))
+            return false;
+        if (!check("w_z", requireTensorBase(params_.w_z, "w_z"), params_.prepared_ref_z))
+            return false;
+        if (!check("w_a", requireTensorBase(params_.w_a, "w_a"), params_.prepared_ref_a))
+            return false;
+        if (!check("w_b", requireTensorBase(params_.w_b, "w_b"), params_.prepared_ref_b))
+            return false;
+
+        if (error)
+            error->clear();
+        return true;
     }
 
     ITensorGemm *GDNProjectionStage::resolveGemm(
@@ -29,47 +70,32 @@ namespace llaminar2
         if (!B_base)
             return nullptr;
 
-        // Phase 7: Try PreparedWeightStore first (check which ref matches this weight)
-        if (params_.prepared_store)
+        if (!params_.prepared_store)
         {
-            const std::optional<PreparedWeightRef> *ref = nullptr;
-            if (weight == params_.w_qkv)
-                ref = &params_.prepared_ref_qkv;
-            else if (weight == params_.w_z)
-                ref = &params_.prepared_ref_z;
-            else if (weight == params_.w_a)
-                ref = &params_.prepared_ref_a;
-            else if (weight == params_.w_b)
-                ref = &params_.prepared_ref_b;
-
-            if (ref && ref->has_value())
-            {
-                auto *gemm = params_.prepared_store->gemmKernel(ref->value());
-                if (gemm)
-                {
-                    cached = gemm;
-                    return gemm;
-                }
-            }
-
-            // Phase 10: Tensor-based store lookup
-            auto *gemm_from_store = params_.prepared_store->gemmKernelForTensor(B_base);
-            if (gemm_from_store)
-            {
-                cached = gemm_from_store;
-                return gemm_from_store;
-            }
-
-            // Store miss: fall through to KernelFactory
+            LOG_ERROR("[GDNProjectionStage] PreparedWeightStore is required for " << name);
+            return nullptr;
         }
 
-        // No PreparedWeightStore (test/standalone context): direct KernelFactory
-        auto *prepared = KernelFactory::getOrCreatePreparedGemmWeights(
-            B_base, params_.device_id);
-        auto *gemm = KernelFactory::getOrCreateGemmEngine(prepared);
+        const std::optional<PreparedWeightRef> *ref = nullptr;
+        if (weight == params_.w_qkv)
+            ref = &params_.prepared_ref_qkv;
+        else if (weight == params_.w_z)
+            ref = &params_.prepared_ref_z;
+        else if (weight == params_.w_a)
+            ref = &params_.prepared_ref_a;
+        else if (weight == params_.w_b)
+            ref = &params_.prepared_ref_b;
+
+        if (!ref || !ref->has_value())
+        {
+            LOG_ERROR("[GDNProjectionStage] PreparedWeightRef is required for " << name);
+            return nullptr;
+        }
+
+        auto *gemm = params_.prepared_store->gemmKernel(ref->value());
         if (!gemm)
         {
-            LOG_ERROR("[GDNProjectionStage] Failed to resolve GEMM kernel for " << name);
+            LOG_ERROR("[GDNProjectionStage] PreparedWeightRef was provided but no GEMM kernel was found in PreparedWeightStore for " << name);
             return nullptr;
         }
         cached = gemm;

@@ -225,6 +225,18 @@ set_tests_properties(V2_FetchModelsFixture PROPERTIES
     LABELS "V2;Fixture;Models"
 )
 
+if(NOT V2_PERF_TESTS_ONLY)
+    add_test(
+        NAME V2_Unit_Static_NoNewStagePreparedGemmFactoryFallbacks
+        COMMAND bash ${PROJECT_ROOT}/scripts/check_no_new_stage_prepared_gemm_factory_calls.sh ${PROJECT_ROOT}
+        WORKING_DIRECTORY ${PROJECT_ROOT}
+    )
+    set_tests_properties(V2_Unit_Static_NoNewStagePreparedGemmFactoryFallbacks PROPERTIES
+        LABELS "V2;Unit;StaticAnalysis;Weights;PreparedWeights;KernelFactory"
+        TIMEOUT 30
+    )
+endif()
+
 # =============================================================================
 # Helper Function: Add V2 Test with Model Dependency and MPI
 # =============================================================================
@@ -1991,16 +2003,16 @@ add_v2_test(V2_Perf_VNNIRepack
     MPI_PROCS 1
 )
 
-# Test: KernelFactory sliced GEMM for tensor parallelism (Phase 2.1)
-add_executable(v2_test_kernel_factory_sliced unit/kernels/Test__KernelFactorySliced.cpp)
-target_link_libraries(v2_test_kernel_factory_sliced
+# Test: PreparedWeightStore sliced GEMM for tensor parallelism (Phase 2.1)
+add_executable(v2_test_prepared_weight_store_sliced unit/loaders/Test__PreparedWeightStoreSliced.cpp)
+target_link_libraries(v2_test_prepared_weight_store_sliced
     llaminar2_core
     GTest::gtest
     GTest::gtest_main
 )
-add_v2_test(V2_Unit_KernelFactorySliced
-    COMMAND $<TARGET_FILE:v2_test_kernel_factory_sliced>
-    LABELS "V2;Unit;Kernels;KernelFactory;TensorParallelism;SlicedGEMM;Phase2"
+add_v2_test(V2_Unit_PreparedWeightStoreSliced
+    COMMAND $<TARGET_FILE:v2_test_prepared_weight_store_sliced>
+    LABELS "V2;Unit;Loaders;PreparedWeightStore;TensorParallelism;SlicedGEMM;Phase2"
     MPI_PROCS 1  # Sliced kernel tests, single rank
 )
 
@@ -2015,19 +2027,6 @@ add_v2_test(V2_Unit_KernelFactoryCacheInvalidation
     COMMAND $<TARGET_FILE:v2_test_kernel_factory_cache_invalidation>
     LABELS "V2;Unit;Kernels;KernelFactory;CacheInvalidation;MemorySafety"
     MPI_PROCS 1  # Cache invalidation tests, single rank
-)
-
-# Test: PreparedGemmKey collision regression (K/V weight collision after host data release)
-add_executable(v2_test_prepared_gemm_key_collision unit/kernels/Test__PreparedGemmKeyCollision.cpp)
-target_link_libraries(v2_test_prepared_gemm_key_collision
-    llaminar2_core
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Unit_PreparedGemmKeyCollision
-    COMMAND $<TARGET_FILE:v2_test_prepared_gemm_key_collision>
-    LABELS "V2;Unit;Kernels;KernelFactory;TensorParallel;Regression"
-    MPI_PROCS 1
 )
 
 # Test: Kernel dynamic state lifecycle (session boundary resets)
@@ -5698,6 +5697,9 @@ add_v2_test(V2_Unit_DeviceGraphOrchestrator
 # - Phase-aware weight selection logic
 # - CPU decode participation checks
 add_executable(v2_test_device_graph_orchestrator_phase_aware_weights unit/execution/local_execution/orchestrators/Test__DeviceGraphOrchestratorPhaseAwareWeights.cpp)
+target_include_directories(v2_test_device_graph_orchestrator_phase_aware_weights PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}  # For mocks/ include path
+)
 target_link_libraries(v2_test_device_graph_orchestrator_phase_aware_weights llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Unit_DeviceGraphOrchestrator_PhaseAwareWeights
     COMMAND $<TARGET_FILE:v2_test_device_graph_orchestrator_phase_aware_weights>
@@ -7434,7 +7436,7 @@ add_v2_test(V2_Integration_MPITopology
 
 # Test: Sliced GEMM MPI Integration Tests (Phase 2)
 # Tests row-parallel GEMM with AllGatherv and column-parallel with AllReduce
-# using the new KernelFactory::getOrCreateGemmSliced() API.
+# using the PreparedWeightStore ref-based sliced GEMM API.
 add_executable(v2_integration_sliced_gemm_mpi integration/utils/mpi/Test__SlicedGEMM_MPI_Integration.cpp)
 target_link_libraries(v2_integration_sliced_gemm_mpi
     llaminar2_core

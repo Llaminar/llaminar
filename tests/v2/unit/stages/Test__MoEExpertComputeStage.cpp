@@ -21,6 +21,7 @@
 #include "kernels/IMoEKernel.h"
 #include "mocks/MockComputeStage.h"
 #include "utils/TestTensorFactory.h"
+#include "utils/PreparedWeightTestHarness.h"
 
 #include <cmath>
 #include <numeric>
@@ -180,6 +181,8 @@ TEST_F(MoEExpertComputeStageTest, SharedExpert_OutputNonZero)
     auto up_w = TestTensorFactory::createFP32Random({INTERMEDIATE, D_MODEL}, -0.1f, 0.1f, 102);
     auto down_w = TestTensorFactory::createFP32Random({D_MODEL, INTERMEDIATE}, -0.1f, 0.1f, 103);
     auto output = TestTensorFactory::createFP32({SEQ_LEN, D_MODEL});
+    auto prepared = makePreparedFFNFixture(
+        gate_w.get(), up_w.get(), down_w.get(), DeviceId::cpu(), 0, "ffn_shexp");
 
     // Zero the output
     std::memset(output->mutable_data(), 0, output->numel() * sizeof(float));
@@ -194,6 +197,10 @@ TEST_F(MoEExpertComputeStageTest, SharedExpert_OutputNonZero)
     params.seq_len = SEQ_LEN;
     params.d_model = D_MODEL;
     params.intermediate = INTERMEDIATE;
+    params.prepared_ref_gate = prepared.gate_ref;
+    params.prepared_ref_up = prepared.up_ref;
+    params.prepared_ref_down = prepared.down_ref;
+    params.prepared_store = prepared.store.get();
 
     SharedExpertFFNStage stage(params);
     ASSERT_TRUE(stage.execute(cpu_ctx_.get()));
@@ -231,6 +238,8 @@ TEST_F(MoEExpertComputeStageTest, SharedExpert_MatchesReference)
     auto up_w = TestTensorFactory::createFP32({inter, d});
     auto down_w = TestTensorFactory::createFP32({d, inter});
     auto output = TestTensorFactory::createFP32({seq, d});
+    auto prepared = makePreparedFFNFixture(
+        gate_w.get(), up_w.get(), down_w.get(), DeviceId::cpu(), 0, "ffn_shexp");
 
     // Fill with simple values
     float *inp = input->mutable_data();
@@ -262,6 +271,10 @@ TEST_F(MoEExpertComputeStageTest, SharedExpert_MatchesReference)
     params.seq_len = seq;
     params.d_model = d;
     params.intermediate = inter;
+    params.prepared_ref_gate = prepared.gate_ref;
+    params.prepared_ref_up = prepared.up_ref;
+    params.prepared_ref_down = prepared.down_ref;
+    params.prepared_store = prepared.store.get();
 
     SharedExpertFFNStage stage(params);
     ASSERT_TRUE(stage.execute(cpu_ctx_.get()));

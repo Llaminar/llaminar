@@ -93,6 +93,7 @@ namespace llaminar2
         explicit GDNProjectionStage(Params params);
 
         bool execute(IDeviceContext *ctx) override;
+        bool validatePreparedWeights(std::string *error) const override;
         ComputeStageType type() const override { return ComputeStageType::GDN_PROJECTION; }
         size_t estimatedFlops() const override;
         size_t estimatedMemoryBytes() const override;
@@ -113,7 +114,7 @@ namespace llaminar2
         bool isGraphCapturable() const override { return true; }
 
     private:
-        /// Lazily resolve a GEMM kernel from a weight tensor via KernelFactory.
+        /// Lazily resolve a GEMM kernel from a prepared weight ref.
         /// Caches the result in @p cached for subsequent calls (like GEMMStage).
         ITensorGemm *resolveGemm(
             const ITensor *weight, ITensorGemm *&cached, const char *name);

@@ -1,8 +1,65 @@
 #include <gtest/gtest.h>
 #include "loaders/gpu_pipeline/LoadOrchestrator.h"
+#include "../mocks/MockBackend.h"
+
+#include <cstdlib>
 
 namespace llaminar2
 {
+
+namespace
+{
+static constexpr size_t kMiB = 1024ULL * 1024ULL;
+
+class BudgetMockBackend : public test::MockBackend
+{
+  public:
+    BudgetMockBackend(size_t total_bytes, size_t free_bytes)
+        : test::MockBackend(DeviceType::ROCm), total_bytes_(total_bytes), free_bytes_(free_bytes)
+    {
+    }
+
+    void* allocate(size_t bytes, int device_id) override
+    {
+        ++allocate_calls_;
+        last_allocate_bytes_ = bytes;
+        return test::MockBackend::allocate(bytes, device_id);
+    }
+
+    void* allocatePinned(size_t bytes, int device_id) override
+    {
+        (void)device_id;
+        return std::malloc(bytes);
+    }
+
+    void freePinned(void* ptr, int device_id) override
+    {
+        (void)device_id;
+        std::free(ptr);
+    }
+
+    size_t deviceMemoryTotal(int device_id) const override
+    {
+        (void)device_id;
+        return total_bytes_;
+    }
+
+    size_t deviceMemoryFree(int device_id) const override
+    {
+        (void)device_id;
+        return free_bytes_;
+    }
+
+    int allocateCalls() const { return allocate_calls_; }
+    size_t lastAllocateBytes() const { return last_allocate_bytes_; }
+
+  private:
+    size_t total_bytes_ = 0;
+    size_t free_bytes_ = 0;
+    int allocate_calls_ = 0;
+    size_t last_allocate_bytes_ = 0;
+};
+} // namespace
 
 static constexpr int kQ4PayloadBytes = 16;
 
@@ -84,6 +141,38 @@ TEST(Test__LoadOrchestrator, AllocateSucceeds)
     orch.planWeight(0, "w1", 64, 64, kQ4PayloadBytes, false, false, 1024);
 
     ASSERT_NO_THROW(orch.allocate(1024, 3));
+
+    auto* pool = orch.getPool(0);
+    ASSERT_NE(pool, nullptr);
+    EXPECT_TRUE(pool->isAllocated());
+}
+
+TEST(Test__LoadOrchestrator, AllocateFailsBeforeBackendAllocationWhenVramBudgetExceeded)
+{
+    BudgetMockBackend backend(/*total_bytes=*/4ULL * 1024ULL * kMiB,
+                              /*free_bytes=*/640ULL * kMiB);
+    LoadOrchestrator orch(&backend);
+    orch.addDevice(0);
+    orch.planRawWeight(0, "large_raw_weight", 1, 1, 128ULL * kMiB);
+
+    // Required = 128 MiB planned + 32 MiB staging + 512 MiB safety margin,
+    // which exceeds the reported 640 MiB free budget.
+    EXPECT_THROW(orch.allocate(32ULL * kMiB, 1), std::runtime_error);
+    EXPECT_EQ(backend.allocateCalls(), 0)
+        << "VRAM preflight should fail before WeightVRAMPool calls backend->allocate()";
+}
+
+TEST(Test__LoadOrchestrator, AllocateSucceedsWhenVramBudgetHasHeadroom)
+{
+    BudgetMockBackend backend(/*total_bytes=*/4ULL * 1024ULL * kMiB,
+                              /*free_bytes=*/1024ULL * kMiB);
+    LoadOrchestrator orch(&backend);
+    orch.addDevice(0);
+    orch.planRawWeight(0, "large_raw_weight", 1, 1, 128ULL * kMiB);
+
+    ASSERT_NO_THROW(orch.allocate(32ULL * kMiB, 1));
+    EXPECT_GT(backend.allocateCalls(), 0);
+    EXPECT_GT(backend.lastAllocateBytes(), 0u);
 
     auto* pool = orch.getPool(0);
     ASSERT_NE(pool, nullptr);

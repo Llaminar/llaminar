@@ -48,6 +48,7 @@ namespace llaminar2
     class TensorBase;
     class IKVCache;
     class ComputeGraph;
+    struct WeightBinding;
 
     // =========================================================================
     // Runtime Configuration (Input to Resolver)
@@ -206,9 +207,15 @@ namespace llaminar2
         /// Model weights by name (e.g., "embedding_table", "final_norm")
         std::unordered_map<std::string, TensorBase *> model_weights;
 
+        /// Optional model weight binding metadata by name.
+        std::unordered_map<std::string, const WeightBinding *> model_weight_bindings;
+
         /// Per-layer weights accessor
         /// layer_weights[layer_idx]["wq"], ["wk"], etc.
         std::function<TensorBase *(int layer_idx, const std::string &name)> get_layer_weight;
+
+        /// Optional per-layer binding metadata accessor.
+        std::function<const WeightBinding *(int layer_idx, const std::string &name)> get_layer_weight_binding;
 
         /// Activation buffers by name (e.g., "hidden", "Q", "K")
         std::unordered_map<std::string, TensorBase *> buffers;

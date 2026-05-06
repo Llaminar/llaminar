@@ -10,13 +10,13 @@
  *   4. Multiple experts get independent engine instances
  *   5. GPU device correctly rejected (returns nullptr)
  *   6. Null tensor returns nullptr (no throw)
- *   7. Contrast: getOrCreatePreparedGemmWeights registers globally,
- *      prepareExpertGemmLocal does not
+ *   7. Contrast: explicit transfer registration is global, prepareExpertGemmLocal is not
  */
 
 #include <gtest/gtest.h>
 
 #include "kernels/KernelFactory.h"
+#include "kernels/cpu/native_vnni/CPUNativeVNNIGemmKernel.h"
 #include "backends/DeviceId.h"
 #include "utils/TestTensorFactory.h"
 
@@ -152,14 +152,16 @@ TEST_F(Test__MoEPhaseD_NoGlobalRegistry, NullTensorReturnsNullptr)
 }
 
 // ---------------------------------------------------------------------------
-// 7. Contrast: global path registers, local path does not
+// 7. Contrast: explicit global registration path registers, local path does not
 // ---------------------------------------------------------------------------
 
 TEST_F(Test__MoEPhaseD_NoGlobalRegistry, GlobalPathRegistersLocalPathDoesNot)
 {
-    // Tensor A — use the global registration path
+    // Tensor A — use the explicit global transfer registration path
     auto tensor_a = TestTensorFactory::createFP32Random({64, 128}, /*seed=*/42);
-    const auto *handle_a = KF::getOrCreatePreparedGemmWeights(tensor_a.get(), DeviceId::cpu());
+    auto kernel_a = std::make_unique<cpu::native_vnni::CPUNativeVNNIGemmKernel>(tensor_a.get());
+    const auto *handle_a = KF::registerPreparedGemmFromTransfer(
+        tensor_a.get(), DeviceId::cpu(), std::move(kernel_a));
     ASSERT_NE(handle_a, nullptr) << "Global path must return a valid handle";
 
     // Verify it IS in the global registry

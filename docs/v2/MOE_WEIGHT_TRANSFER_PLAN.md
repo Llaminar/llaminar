@@ -169,7 +169,7 @@ For each newly-acquired expert e:
 ### Design Constraints
 
 - `registerPreparedGemmEngine()` inserts into `prepared_gemm_registry_` with same key scheme
-- Must not break existing `getOrCreatePreparedGemmWeights()` flow
+- Must remain compatible with the `PreparedWeightStore`/explicit transfer registration flow; the old lazy global prepared-GEMM fallback has been removed.
 - Transferred weights must produce bit-identical decode output
 
 ---

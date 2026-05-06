@@ -1,14 +1,13 @@
 /**
  * @file ExpertWeightPayloadProvider.h
- * @brief Provides serialized expert weight payloads for lazy GPU expert preparation.
+ * @brief Provides serialized expert weight payloads for runtime GPU expert arrivals.
  *
  * Replaces the implicit fallback to raw GGUF host tensor data in
  * MoEExpertWeightService::registerAndPrepareNewExpertsGPU(). After graph
  * materialization and GEMM preparation, expert weights are serialized into
- * transferable blobs and registered here. When a GPU expert needs lazy
- * preparation (e.g., dynamic rebalancing without MPI-received blobs),
- * the provider supplies the serialized payload instead of requiring retained
- * raw host tensor data.
+ * transferable blobs and registered here. When a GPU expert arrives through
+ * dynamic rebalancing without MPI-received blobs, the provider supplies the
+ * serialized payload instead of requiring retained raw host tensor data.
  *
  * Ownership: model-context or orchestration-owned (not stage-local).
  * Thread safety: all methods are thread-safe (internal mutex).
@@ -39,7 +38,7 @@ namespace llaminar2
      *
      * After initial graph-build GEMM preparation, expert weights are serialized
      * and stored here as transferable blobs. This enables:
-     * - Lazy GPU expert preparation without retaining raw host tensor data
+      * - Runtime GPU expert arrival preparation without retaining raw host tensor data
      * - Dynamic MoE rebalancing with pre-materialized payloads
      * - Explicit tracking of which experts are prepared/transferred/releasable
      */

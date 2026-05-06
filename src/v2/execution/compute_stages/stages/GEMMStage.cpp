@@ -8,12 +8,44 @@
 #include "../../../utils/DebugEnv.h"
 #include "../../../tensors/Tensors.h"
 #include "../../../utils/Logger.h"
-#include "../../../kernels/KernelFactory.h"
 #include "../../../interfaces/IWorkspaceConsumer.h"
 #include "../../../loaders/PreparedWeightStore.h"
 
 namespace llaminar2
 {
+    namespace
+    {
+        ITensorGemm *resolvePreparedGemmForStage(
+            const char *caller,
+            const GEMMStage::Params &params,
+            bool is_sliced)
+        {
+            if (!params.prepared_store || !params.prepared_ref.has_value())
+            {
+                LOG_ERROR("[" << caller << "] PreparedWeightStore and PreparedWeightRef are required for model GEMM resolution");
+                return nullptr;
+            }
+
+            ITensorGemm *gemm = nullptr;
+            if (is_sliced)
+            {
+                gemm = params.prepared_store->slicedGemmKernel(
+                    params.prepared_ref.value(),
+                    params.output_range.start,
+                    params.output_range.end);
+            }
+            else
+            {
+                gemm = params.prepared_store->gemmKernel(params.prepared_ref.value());
+            }
+
+            if (!gemm)
+            {
+                LOG_ERROR("[" << caller << "] PreparedWeightRef was provided but no GEMM kernel was found in PreparedWeightStore");
+            }
+            return gemm;
+        }
+    }
 
     // =============================================================================
     // GEMMStage::Params Implementation
@@ -100,6 +132,23 @@ namespace llaminar2
     {
     }
 
+    bool GEMMStage::validatePreparedWeights(std::string *error) const
+    {
+        if (!params_.B)
+            return true;
+        if (!params_.prepared_store || !params_.prepared_ref.has_value())
+        {
+            if (error) *error = "GEMMStage requires PreparedWeightStore and PreparedWeightRef";
+            return false;
+        }
+        if (!params_.prepared_store->contains(params_.prepared_ref.value()))
+        {
+            if (error) *error = "GEMMStage PreparedWeightRef is not present in PreparedWeightStore";
+            return false;
+        }
+        return true;
+    }
+
     bool GEMMStage::execute(IDeviceContext *ctx)
     {
         ScopedGemmContext gemm_ctx(params_.gemm_context);
@@ -167,13 +216,10 @@ namespace llaminar2
         }
 #endif
 
-        // Cast weights to TensorBase for KernelFactory
+        // Cast weights to TensorBase for diagnostics and tensor-aware kernel calls.
         auto *B_base = requireTensorBase(params_.B, "weight B");
 
-        // Get kernel — use stage-level cache to avoid KernelFactory mutex per call.
-        // KernelFactory caches are append-only (never evict), so raw pointers are
-        // valid for the entire program lifetime after first resolve.
-        auto target_dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(params_.device_id);
+        // Get kernel — use stage-level cache to avoid store lookup per call.
         llaminar2::ITensorGemm *gemm = nullptr;
 
         if (cache_resolved_)
@@ -181,36 +227,18 @@ namespace llaminar2
             // Fast path: reuse previously-resolved kernel (no mutex)
             gemm = cached_gemm_;
         }
-        else if (is_sliced)
-        {
-            // Use sliced kernel for tensor parallelism
-            gemm = llaminar::v2::kernels::KernelFactory::getOrCreateGemmSliced(
-                B_base, params_.output_range.start, params_.output_range.end);
-            cached_gemm_ = gemm;
-            cache_resolved_ = true;
-            LOG_DEBUG("[GEMMStage] Using sliced kernel for rows [" << params_.output_range.start
-                                                                   << ", " << params_.output_range.end << ")");
-        }
         else
         {
-            // Phase 10: Resolve kernel through PreparedWeightStore or direct creation.
-            if (params_.prepared_ref.has_value() && params_.prepared_store)
-            {
-                gemm = params_.prepared_store->gemmKernel(params_.prepared_ref.value());
-            }
-            if (!gemm && params_.prepared_store)
-            {
-                gemm = params_.prepared_store->gemmKernelForTensor(B_base);
-            }
+            gemm = resolvePreparedGemmForStage("GEMMStage", params_, is_sliced);
             if (!gemm)
-            {
-                // Store miss or no store: direct KernelFactory (always available)
-                auto *prepared = llaminar::v2::kernels::KernelFactory::getOrCreatePreparedGemmWeights(B_base, params_.device_id);
-                gemm = llaminar::v2::kernels::KernelFactory::getOrCreateGemmEngine(prepared);
-                cached_prepared_ = prepared;
-            }
+                return false;
             cached_gemm_ = gemm;
             cache_resolved_ = true;
+            if (is_sliced)
+            {
+                LOG_DEBUG("[GEMMStage] Using prepared sliced kernel for rows [" << params_.output_range.start
+                                                                                << ", " << params_.output_range.end << ")");
+            }
         }
 
         if (!gemm)
@@ -406,7 +434,6 @@ namespace llaminar2
 
     IWorkspaceConsumer *GEMMStage::getKernelAsWorkspaceConsumer()
     {
-        // Get kernel from KernelFactory (which caches by tensor + device)
         if (!params_.B)
         {
             LOG_WARN("[GEMMStage::getKernelAsWorkspaceConsumer] Weight tensor B not set");
@@ -420,21 +447,9 @@ namespace llaminar2
             return nullptr;
         }
 
-        auto target_dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(params_.device_id);
-        ITensorGemm *gemm = nullptr;
-
-        if (!params_.output_range.empty())
-        {
-            // Sliced kernel for tensor parallelism
-            gemm = llaminar::v2::kernels::KernelFactory::getOrCreateGemmSliced(
-                B_base, params_.output_range.start, params_.output_range.end);
-        }
-        else
-        {
-            // Standard GEMM kernel
-            auto *prepared = llaminar::v2::kernels::KernelFactory::getOrCreatePreparedGemmWeights(B_base, params_.device_id);
-            gemm = llaminar::v2::kernels::KernelFactory::getOrCreateGemmEngine(prepared);
-        }
+        const bool is_sliced = !params_.output_range.empty();
+        ITensorGemm *gemm = resolvePreparedGemmForStage(
+            "GEMMStage::getKernelAsWorkspaceConsumer", params_, is_sliced);
 
         return dynamic_cast<IWorkspaceConsumer *>(gemm);
     }

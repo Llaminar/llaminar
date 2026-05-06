@@ -13,6 +13,8 @@
 #include "../../config/InferenceMode.h"
 #include "../../../loaders/WeightManager.h"
 #include "../../../loaders/WeightPlacementMap.h"
+#include "../../../loaders/IWeightManager.h"
+#include "../../../loaders/IWeightPlacementMap.h"
 #include "../../../config/TensorParallelConfig.h"
 #include "../../../config/PipelineConfig.h"
 #include "../../../collective/ILocalTPContext.h" // createLocalTPContext()
@@ -269,11 +271,20 @@ namespace llaminar2
                 return {};
             };
 
-            graph_builder_->setWeights(frozen_weights);
-
             // Phase 6 (continued): Build FrozenModelWeightSet for audit, validation,
             // and Phase 7 PreparedWeightStore integration.
             buildFrozenWeightSet(weights, *resolved, first_layer, last_layer);
+
+            if (frozen_weight_set_)
+            {
+                auto weight_bindings = makeModelWeightBindings(*frozen_weight_set_);
+                graph_builder_->setWeightBindings(weight_bindings);
+                graph_builder_->setWeights(toLegacyModelWeights(weight_bindings));
+            }
+            else
+            {
+                graph_builder_->setWeights(frozen_weights);
+            }
 
             LOG_DEBUG("[DeviceGraphOrchestrator] Model weights frozen for " << n_layers
                       << " layers [" << first_layer << ", " << last_layer << ")");
@@ -352,14 +363,37 @@ namespace llaminar2
             addLayer(lw.wv, "attn_v.weight", WeightRole::AttentionV);
             addLayer(lw.wo, "attn_output.weight", WeightRole::AttentionWO);
             addLayer(lw.attn_norm, "attn_norm.weight", WeightRole::Norm);
+            addLayer(lw.q_bias, "attn_q.bias", WeightRole::Bias);
+            addLayer(lw.k_bias, "attn_k.bias", WeightRole::Bias);
+            addLayer(lw.v_bias, "attn_v.bias", WeightRole::Bias);
+            addLayer(lw.q_norm, "attn_q_norm.weight", WeightRole::Norm);
+            addLayer(lw.k_norm, "attn_k_norm.weight", WeightRole::Norm);
+            addLayer(lw.attn_qkv, "attn_qkv.weight", WeightRole::FusedQKV);
+            addLayer(lw.attn_gate, "attn_gate.weight", WeightRole::GDNProjection);
+            addLayer(lw.ssm_alpha, "ssm_alpha.weight", WeightRole::GDNSsmParam);
+            addLayer(lw.ssm_beta, "ssm_beta.weight", WeightRole::GDNSsmParam);
+            addLayer(lw.ssm_conv1d, "ssm_conv1d.weight", WeightRole::GDNSsmParam);
+            addLayer(lw.ssm_dt_bias, "ssm_dt_bias.weight", WeightRole::Bias);
+            addLayer(lw.ssm_a, "ssm_a.weight", WeightRole::GDNSsmParam);
+            addLayer(lw.ssm_norm, "ssm_norm.weight", WeightRole::Norm);
+            addLayer(lw.ssm_out, "ssm_out.weight", WeightRole::GDNProjection);
             addLayer(lw.gate_proj, "ffn_gate.weight", WeightRole::FFNGate);
             addLayer(lw.up_proj, "ffn_up.weight", WeightRole::FFNUp);
             addLayer(lw.down_proj, "ffn_down.weight", WeightRole::FFNDown);
             addLayer(lw.ffn_norm, "ffn_norm.weight", WeightRole::Norm);
+            addLayer(lw.moe_gate, "ffn_gate_inp.weight", WeightRole::MoERouter);
+            addLayer(lw.moe_gate_exps, "ffn_gate_exps.weight", WeightRole::MoEExpertGate);
+            addLayer(lw.moe_up_exps, "ffn_up_exps.weight", WeightRole::MoEExpertUp);
+            addLayer(lw.moe_down_exps, "ffn_down_exps.weight", WeightRole::MoEExpertDown);
+            addLayer(lw.shared_expert_gate, "ffn_gate_shexp.weight", WeightRole::SharedExpertGate);
+            addLayer(lw.shared_expert_up, "ffn_up_shexp.weight", WeightRole::SharedExpertUp);
+            addLayer(lw.shared_expert_down, "ffn_down_shexp.weight", WeightRole::SharedExpertDown);
+            addLayer(lw.shared_expert_gate_inp, "ffn_gate_inp_shexp.weight", WeightRole::SharedExpertGate);
         }
 
         frozen_weight_set_ = std::make_unique<FrozenModelWeightSet>(
             strategy, builder.freezeBindings());
+        frozen_weight_set_->validateForGraph();
         LOG_DEBUG("[DeviceGraphOrchestrator] FrozenModelWeightSet built with "
                   << frozen_weight_set_->bindings().size() << " bindings");
     }
@@ -2277,34 +2311,92 @@ namespace llaminar2
         // the model-context-owned store (Phase 4 compatibility layer).
         int registered = 0;
         uint64_t next_binding_id = 1;
+        if (frozen_weight_set_)
+        {
+            for (const auto &binding : frozen_weight_set_->bindings())
+                next_binding_id = std::max(next_binding_id, binding.binding_id + 1);
+        }
 
-        auto register_if_prepared = [&](const std::string& name, TensorBase* tensor) {
+        auto register_if_prepared = [&](const WeightBinding &source_binding) {
+            const std::string &name = source_binding.identity.canonical_name;
+            TensorBase *tensor = source_binding.tensor;
             if (!tensor) return;
 
-            const auto* handle = llaminar::v2::kernels::KernelFactory::findPreparedGemmWeights(
-                tensor, device);
-            if (!handle) return;
+            WeightBinding binding = source_binding;
 
-            WeightBinding binding;
-            binding.binding_id = next_binding_id++;
-            binding.identity.model_id = model_id;
-            binding.identity.canonical_name = name;
-            binding.identity.role = inferWeightRole(name);
-            binding.identity.layer = inferWeightLayer(name);
+            if (binding.identity.model_id.value == 0)
+                binding.identity.model_id = model_id;
             binding.residency.home_device = device;
             binding.residency.resident_device = device;
-            binding.tensor = tensor;
 
             try
             {
+                if (binding.identity.role == WeightRole::Embedding)
+                {
+                    const auto *embedding_handle = llaminar::v2::kernels::KernelFactory::getPreparedEmbeddingWeights(
+                        tensor, device);
+                    if (embedding_handle)
+                    {
+                        prepared_weight_store_->registerPreparedEmbeddingFromPipeline(
+                            binding, device, embedding_handle);
+                        ++registered;
+                        return;
+                    }
+
+                    if (device.is_gpu() && dynamic_cast<const IINT8Unpackable *>(tensor))
+                    {
+                        const auto &cfg = graph_builder_->config();
+                        size_t vocab_offset = 0;
+                        size_t total_vocab = static_cast<size_t>(cfg.vocab_size);
+                        if (cfg.tp_config)
+                        {
+                            try
+                            {
+                                const auto &assignment = cfg.tp_config->forDevice(device);
+                                vocab_offset = static_cast<size_t>(assignment.vocab_start);
+                                total_vocab = static_cast<size_t>(cfg.tp_config->totalVocab());
+                            }
+                            catch (const std::exception &)
+                            {
+                                // Fall back to unsharded metadata below.
+                            }
+                        }
+
+                        prepared_weight_store_->prepareEmbedding(
+                            binding,
+                            cfg.d_model,
+                            vocab_offset,
+                            total_vocab);
+                        ++registered;
+                    }
+                    return;
+                }
+
+                const auto* handle = llaminar::v2::kernels::KernelFactory::findPreparedGemmWeights(
+                    tensor, device);
+
                 PreparedWeightKind kind = device.is_cuda()
                     ? PreparedWeightKind::CudaInt8PackedGemm
                     : device.is_rocm()
                         ? PreparedWeightKind::RocmInt8PackedGemm
                         : PreparedWeightKind::CpuPackedGemm;
 
-                prepared_weight_store_->registerPreparedGemmFromPipeline(
-                    binding, kind, device, handle);
+                if (handle)
+                {
+                    prepared_weight_store_->registerPreparedGemmFromPipeline(
+                        binding, kind, device, handle);
+                }
+                else
+                {
+                    if (binding.identity.role == WeightRole::Embedding ||
+                        binding.identity.role == WeightRole::Norm ||
+                        binding.identity.role == WeightRole::Bias ||
+                        tensor->shape().size() != 2)
+                    {
+                        return;
+                    }
+                    prepared_weight_store_->prepareGemm(binding);
+                }
                 ++registered;
             }
             catch (const std::exception& e)
@@ -2314,10 +2406,27 @@ namespace llaminar2
             }
         };
 
-        // Iterate ALL weight tensors (including TP-sliced) and register prepared GEMM weights
-        weight_manager_->forEachPreparedWeight([&](const std::string& name, TensorBase* tensor) {
-            register_if_prepared(name, tensor);
-        });
+        if (frozen_weight_set_)
+        {
+            // Iterate graph-frozen bindings rather than WeightManager names so
+            // aliases such as tied output.weight -> token_embd.weight keep their
+            // own binding ids and roles.
+            for (const auto &binding : frozen_weight_set_->bindings())
+                register_if_prepared(binding);
+        }
+        else
+        {
+            // Fallback for non-frozen legacy graph setup.
+            weight_manager_->forEachPreparedWeight([&](const std::string& name, TensorBase* tensor) {
+                WeightBinding binding;
+                binding.binding_id = next_binding_id++;
+                binding.identity.canonical_name = name;
+                binding.identity.role = inferWeightRole(name);
+                binding.identity.layer = inferWeightLayer(name);
+                binding.tensor = tensor;
+                register_if_prepared(binding);
+            });
+        }
 
         LOG_INFO("[DGO] Prepared weight store initialized with "
                  << registered << " entries for device " << device.toString());
@@ -2622,13 +2731,13 @@ namespace llaminar2
     // Phase-Aware Weight Access (Gap 3 - CPU Decode Participation)
     // =========================================================================
 
-    void DeviceGraphOrchestrator::setWeightManager(std::shared_ptr<WeightManager> weight_manager)
+    void DeviceGraphOrchestrator::setWeightManager(std::shared_ptr<IWeightManager> weight_manager)
     {
         weight_manager_ = std::move(weight_manager);
         LOG_DEBUG("[DeviceGraphOrchestrator] WeightManager set");
     }
 
-    void DeviceGraphOrchestrator::setWeightPlacementMap(std::shared_ptr<WeightPlacementMap> placement_map)
+    void DeviceGraphOrchestrator::setWeightPlacementMap(std::shared_ptr<IWeightPlacementMap> placement_map)
     {
         weight_placement_map_ = std::move(placement_map);
         LOG_DEBUG("[DeviceGraphOrchestrator] WeightPlacementMap set");

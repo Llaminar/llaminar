@@ -70,6 +70,10 @@ namespace llaminar2
         }
 
         void setGPUStream(void *stream) override;
+        void setPreparedEmbeddingHandle(const PreparedEmbeddingHandle *handle) override
+        {
+            prepared_embedding_handle_ = handle;
+        }
 
         // ITensorEmbedding interface - FP32 output
         bool apply(
@@ -201,6 +205,7 @@ namespace llaminar2
         int device_idx_;
         IWorkerGPUContext *device_ctx_ = nullptr;
         void *gpu_stream_ = nullptr;
+        const PreparedEmbeddingHandle *prepared_embedding_handle_ = nullptr;
 
         mutable std::mutex stream_mutex_;
         std::unordered_map<int, void *> stream_by_device_;

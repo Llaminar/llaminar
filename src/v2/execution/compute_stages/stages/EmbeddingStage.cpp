@@ -10,6 +10,7 @@
 #include "../../../utils/KernelProfiler.h"
 #include "../../../interfaces/IWorkspaceConsumer.h"
 #include "../../../kernels/KernelFactory.h"
+#include "../../../loaders/PreparedWeightStore.h"
 #include <cstring>
 
 namespace llaminar2
@@ -22,6 +23,34 @@ namespace llaminar2
     EmbeddingStage::EmbeddingStage(Params params)
         : IComputeStage(params.device_id), params_(std::move(params))
     {
+    }
+
+    bool EmbeddingStage::validatePreparedWeights(std::string *error) const
+    {
+        auto *embed_base = dynamic_cast<const TensorBase *>(params_.embed_table);
+        if (!embed_base || !params_.device_id.is_gpu())
+            return true;
+
+        // FP32 weights already resident on GPU do not need prepared embedding data.
+        if (!dynamic_cast<const IINT8Unpackable *>(embed_base))
+            return true;
+
+        if (!params_.prepared_store || !params_.prepared_ref.has_value())
+        {
+            if (error) *error = "EmbeddingStage requires PreparedWeightStore and PreparedWeightRef for quantized GPU embedding";
+            return false;
+        }
+
+        if (!params_.prepared_store->contains(params_.prepared_ref.value()) ||
+            !params_.prepared_store->embeddingHandle(params_.prepared_ref.value()))
+        {
+            if (error) *error = "EmbeddingStage PreparedWeightRef is not present in PreparedWeightStore or has no embedding handle";
+            return false;
+        }
+
+        if (error)
+            error->clear();
+        return true;
     }
 
     ITensorEmbedding *EmbeddingStage::getOrCreateKernel()
@@ -59,6 +88,17 @@ namespace llaminar2
             LOG_ERROR("[EmbeddingStage::getOrCreateKernel] Failed to resolve embedding kernel for "
                       << output_base->dtype_name());
             return nullptr;
+        }
+
+        if (params_.device_id.is_gpu() && params_.prepared_store && params_.prepared_ref.has_value())
+        {
+            const auto *handle = params_.prepared_store->embeddingHandle(params_.prepared_ref.value());
+            if (!handle)
+            {
+                LOG_ERROR("[EmbeddingStage::getOrCreateKernel] Prepared embedding ref was provided but no handle was found in PreparedWeightStore");
+                return nullptr;
+            }
+            kernel->setPreparedEmbeddingHandle(handle);
         }
 
         auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(params_.device_id);

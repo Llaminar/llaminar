@@ -81,30 +81,60 @@ namespace llaminar2
     MoEExpertComputeStage::MoEExpertComputeStage(Params params)
         : IComputeStage(params.device_id), params_(std::move(params))
     {
-        if (params_.device_id.is_gpu() && !params_.expert_mask.empty())
-        {
-            bool has_missing = params_.prepared_gate_gemm.size() != static_cast<size_t>(params_.num_experts) ||
-                               params_.prepared_up_gemm.size() != static_cast<size_t>(params_.num_experts) ||
-                               params_.prepared_down_gemm.size() != static_cast<size_t>(params_.num_experts);
-            if (!has_missing)
-            {
-                for (int e = 0; e < params_.num_experts; ++e)
-                {
-                    if (params_.expert_mask[e] &&
-                        (!params_.prepared_gate_gemm[e] || !params_.prepared_up_gemm[e] || !params_.prepared_down_gemm[e]))
-                    {
-                        has_missing = true;
-                        break;
-                    }
-                }
-            }
+    }
 
-            if (has_missing && !MoEExpertComputeStage::prepareExpertGemmEngines(params_))
-            {
-                LOG_ERROR("[MoEExpertComputeStage] Failed to pre-prepare GPU masked experts for layer "
-                          << params_.layer_idx << " on " << params_.device_id.to_string());
-            }
+    bool MoEExpertComputeStage::validatePreparedWeights(std::string *error) const
+    {
+        auto fail = [error](const std::string &message)
+        {
+            if (error)
+                *error = message;
+            return false;
+        };
+
+        const bool has_slab_ref = params_.gate_slab_ref.has_value() ||
+                                  params_.up_slab_ref.has_value() ||
+                                  params_.down_slab_ref.has_value();
+        if (!has_slab_ref)
+        {
+            if (error)
+                error->clear();
+            return true;
         }
+
+        if (!params_.prepared_store)
+            return fail("PreparedWeightStore is required for MoE expert slab refs");
+        if (!params_.gate_slab_ref.has_value() ||
+            !params_.up_slab_ref.has_value() ||
+            !params_.down_slab_ref.has_value())
+        {
+            return fail("gate/up/down ExpertSlabRefs must be provided together");
+        }
+
+        auto check_slab = [&](const char *name, const ExpertSlabRef &ref)
+        {
+            const auto availability = params_.prepared_store->expertAvailabilityMask(ref);
+            if (availability.empty())
+                return fail(std::string("PreparedWeightStore does not contain expert slab for ") + name);
+            if (params_.num_experts > 0 && availability.size() != static_cast<size_t>(params_.num_experts))
+            {
+                return fail(std::string("expert slab size mismatch for ") + name +
+                            ": got " + std::to_string(availability.size()) +
+                            ", expected " + std::to_string(params_.num_experts));
+            }
+            return true;
+        };
+
+        if (!check_slab("gate", *params_.gate_slab_ref))
+            return false;
+        if (!check_slab("up", *params_.up_slab_ref))
+            return false;
+        if (!check_slab("down", *params_.down_slab_ref))
+            return false;
+
+        if (error)
+            error->clear();
+        return true;
     }
 
     bool MoEExpertComputeStage::updateExpertMask(const std::vector<bool>& mask) {
@@ -392,7 +422,7 @@ namespace llaminar2
             }
         }
 
-        // Ensure GEMM engines are cached (lazy init on first call)
+        // Ensure GEMM engine pointers are copied into the stage-local cache.
         ensureGemmEnginesCached();
 
         // Ensure scratch buffers have enough capacity for largest expert batch
@@ -886,7 +916,8 @@ namespace llaminar2
             {
                 LOG_ERROR("[MoEExpertComputeStage] Missing GEMM engines for layer "
                           << params_.layer_idx << " and no transfer blobs available. "
-                          << "Ensure prepareExpertGemmEngines() prepared all local experts.");
+                          << "Ensure the unified registry prepared all local experts, "
+                          << "or dynamic expert transfer blobs were registered.");
                 return false;
             }
 
@@ -1168,113 +1199,71 @@ namespace llaminar2
     {
     }
 
+    bool SharedExpertFFNStage::validatePreparedWeights(std::string *error) const
+    {
+        auto fail = [error](const std::string &message)
+        {
+            if (error)
+                *error = message;
+            return false;
+        };
+
+        if (!params_.gate_w && !params_.up_w && !params_.down_w)
+        {
+            if (error)
+                error->clear();
+            return true;
+        }
+
+        if (!params_.prepared_store)
+            return fail("PreparedWeightStore is required for SharedExpertFFNStage weights");
+
+        auto check = [&](const char *name, const TensorBase *weight, const std::optional<PreparedWeightRef> &ref)
+        {
+            if (!weight)
+                return true;
+            if (!ref.has_value())
+                return fail(std::string("missing PreparedWeightRef for ") + name);
+            if (!params_.prepared_store->contains(ref.value()))
+                return fail(std::string("PreparedWeightStore does not contain ref for ") + name);
+            return true;
+        };
+
+        if (!check("gate_w", params_.gate_w, params_.prepared_ref_gate))
+            return false;
+        if (!check("up_w", params_.up_w, params_.prepared_ref_up))
+            return false;
+        if (!check("down_w", params_.down_w, params_.prepared_ref_down))
+            return false;
+
+        if (error)
+            error->clear();
+        return true;
+    }
+
     void SharedExpertFFNStage::ensureGemmEnginesCached() const
     {
         if (cached_gate_gemm_)
             return;
 
-        // Phase 7: Try PreparedWeightStore first
-        if (params_.prepared_store)
+        if (!params_.prepared_store ||
+            !params_.prepared_ref_gate.has_value() ||
+            !params_.prepared_ref_up.has_value() ||
+            !params_.prepared_ref_down.has_value())
         {
-            if (params_.prepared_ref_gate.has_value())
-                cached_gate_gemm_ = params_.prepared_store->gemmKernel(params_.prepared_ref_gate.value());
-            if (params_.prepared_ref_up.has_value())
-                cached_up_gemm_ = params_.prepared_store->gemmKernel(params_.prepared_ref_up.value());
-            if (params_.prepared_ref_down.has_value())
-                cached_down_gemm_ = params_.prepared_store->gemmKernel(params_.prepared_ref_down.value());
-            if (cached_gate_gemm_ && cached_up_gemm_ && cached_down_gemm_)
-                return;
-
-            // Phase 10: Store configured, try tensor-based lookup for any missing
-            if (!cached_gate_gemm_)
-                cached_gate_gemm_ = params_.prepared_store->gemmKernelForTensor(params_.gate_w);
-            if (!cached_up_gemm_)
-                cached_up_gemm_ = params_.prepared_store->gemmKernelForTensor(params_.up_w);
-            if (!cached_down_gemm_)
-                cached_down_gemm_ = params_.prepared_store->gemmKernelForTensor(params_.down_w);
-            if (cached_gate_gemm_ && cached_up_gemm_ && cached_down_gemm_)
-                return;
-
-            LOG_ERROR("[SharedExpertFFNStage] PreparedWeightStore configured but shared expert kernel(s) not found. "
-                      "gate=" << (void *)cached_gate_gemm_ << " up=" << (void *)cached_up_gemm_
-                      << " down=" << (void *)cached_down_gemm_);
+            LOG_ERROR("[SharedExpertFFNStage] PreparedWeightStore and gate/up/down PreparedWeightRefs are required");
             return;
         }
 
-        if (params_.device_id.is_gpu())
+        cached_gate_gemm_ = params_.prepared_store->gemmKernel(params_.prepared_ref_gate.value());
+        cached_up_gemm_ = params_.prepared_store->gemmKernel(params_.prepared_ref_up.value());
+        cached_down_gemm_ = params_.prepared_store->gemmKernel(params_.prepared_ref_down.value());
+        if (!cached_gate_gemm_ || !cached_up_gemm_ || !cached_down_gemm_)
         {
-            try
-            {
-                auto *gp = KernelFactory::getOrCreatePreparedGemmWeights(params_.gate_w, params_.device_id);
-                auto *up = KernelFactory::getOrCreatePreparedGemmWeights(params_.up_w, params_.device_id);
-                auto *dp = KernelFactory::getOrCreatePreparedGemmWeights(params_.down_w, params_.device_id);
-                cached_gate_gemm_ = KernelFactory::getOrCreateGemmEngine(gp);
-                cached_up_gemm_ = KernelFactory::getOrCreateGemmEngine(up);
-                cached_down_gemm_ = KernelFactory::getOrCreateGemmEngine(dp);
-            }
-            catch (const std::exception &ex)
-            {
-                const bool can_repack_from_raw = params_.gate_w->raw_data() &&
-                                                 params_.up_w->raw_data() &&
-                                                 params_.down_w->raw_data();
-                if (!can_repack_from_raw)
-                {
-                    LOG_ERROR("[SharedExpertFFNStage] Shared expert GPU weights were not prepared before host release on "
-                              << params_.device_id.to_string() << ": " << ex.what());
-                    return;
-                }
-
-                shared_expert_mask_ = {true};
-                shared_gate_views_ = {std::shared_ptr<TensorBase>(params_.gate_w, [](TensorBase *) {})};
-                shared_up_views_ = {std::shared_ptr<TensorBase>(params_.up_w, [](TensorBase *) {})};
-                shared_down_views_ = {std::shared_ptr<TensorBase>(params_.down_w, [](TensorBase *) {})};
-                shared_prepared_gate_gemm_.assign(1, nullptr);
-                shared_prepared_up_gemm_.assign(1, nullptr);
-                shared_prepared_down_gemm_.assign(1, nullptr);
-
-                MoEWeightContext ctx{
-                    params_.device_id,
-                    1,
-                    params_.intermediate,
-                    params_.d_model,
-                    0,
-                    1,
-                    -1,
-                    shared_expert_mask_,
-                    nullptr,
-                    nullptr,
-                    nullptr,
-                    shared_gate_views_,
-                    shared_up_views_,
-                    shared_down_views_,
-                    shared_prepared_gate_gemm_,
-                    shared_prepared_up_gemm_,
-                    shared_prepared_down_gemm_,
-                    shared_owned_kernels_,
-                    shared_packed_gate_lifetime_,
-                    shared_packed_up_lifetime_,
-                    shared_packed_down_lifetime_};
-
-                if (!MoEExpertWeightService::prepareGemmEngines(ctx))
-                {
-                    LOG_ERROR("[SharedExpertFFNStage] Failed to prepare shared expert GEMM engines on "
-                              << params_.device_id.to_string());
-                    return;
-                }
-
-                cached_gate_gemm_ = shared_prepared_gate_gemm_[0];
-                cached_up_gemm_ = shared_prepared_up_gemm_[0];
-                cached_down_gemm_ = shared_prepared_down_gemm_[0];
-            }
-        }
-        else
-        {
-        auto *gp = KernelFactory::getOrCreatePreparedGemmWeights(params_.gate_w, params_.device_id);
-        auto *up = KernelFactory::getOrCreatePreparedGemmWeights(params_.up_w, params_.device_id);
-        auto *dp = KernelFactory::getOrCreatePreparedGemmWeights(params_.down_w, params_.device_id);
-        cached_gate_gemm_ = KernelFactory::getOrCreateGemmEngine(gp);
-        cached_up_gemm_ = KernelFactory::getOrCreateGemmEngine(up);
-        cached_down_gemm_ = KernelFactory::getOrCreateGemmEngine(dp);
+            LOG_ERROR("[SharedExpertFFNStage] PreparedWeightRefs were provided but shared expert kernel(s) were missing from PreparedWeightStore. "
+                      "gate=" << (void *)cached_gate_gemm_ << " up=" << (void *)cached_up_gemm_
+                      << " down=" << (void *)cached_down_gemm_);
+            return;
         }
 
         auto bind_if_needed = [this](ITensorGemm *gemm)

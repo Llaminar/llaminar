@@ -56,6 +56,18 @@ namespace llaminar2
         /// Returns nullptr if no entry matches.
         ITensorGemm *gemmKernelForTensor(const TensorBase *tensor) const;
 
+        /// Resolve a prepared ref by tensor pointer and device. O(n) scan.
+        /// Returns std::nullopt if no prepared GEMM/embedding entry matches.
+        std::optional<PreparedWeightRef> preparedRefForTensor(
+            const TensorBase *tensor,
+            DeviceId device) const;
+
+        /// Resolve a prepared ref by frozen binding identity. O(1) lookup by binding id.
+        /// Returns std::nullopt if the binding has not been prepared for this device.
+        std::optional<PreparedWeightRef> preparedRefForBinding(
+            uint64_t binding_id,
+            DeviceId device) const;
+
         // =========================================================================
         // Fused Gate/Up Kernel Resolution
         // =========================================================================
@@ -98,10 +110,10 @@ namespace llaminar2
         // Sliced GEMM (TP row-range) Resolution
         // =========================================================================
 
-        /// Get or create a sliced GEMM kernel for a row-range of a weight tensor.
-        /// Delegates creation to KernelFactory, caches the result locally.
+        /// Get or create a sliced GEMM kernel for a prepared weight ref.
+        /// Uses the binding id as the store-owned cache identity.
         ITensorGemm *slicedGemmKernel(
-            const TensorBase *tensor,
+            const PreparedWeightRef &ref,
             size_t row_start,
             size_t row_end) const;
 
@@ -245,26 +257,31 @@ namespace llaminar2
 
         struct SlicedKey
         {
+            uint64_t binding_id = 0;
             const TensorBase *tensor = nullptr;
             size_t row_start = 0;
             size_t row_end = 0;
             bool operator==(const SlicedKey &o) const
             {
-                return tensor == o.tensor && row_start == o.row_start && row_end == o.row_end;
+                return binding_id == o.binding_id &&
+                       tensor == o.tensor &&
+                       row_start == o.row_start &&
+                       row_end == o.row_end;
             }
         };
         struct SlicedKeyHash
         {
             size_t operator()(const SlicedKey &k) const
             {
-                auto h = std::hash<const void *>{}(k.tensor);
+                auto h = std::hash<uint64_t>{}(k.binding_id);
+                h ^= std::hash<const void *>{}(k.tensor) << 8;
                 h ^= std::hash<size_t>{}(k.row_start) << 16;
                 h ^= std::hash<size_t>{}(k.row_end) << 32;
                 return h;
             }
         };
 
-        mutable std::unordered_map<SlicedKey, ITensorGemm *, SlicedKeyHash> sliced_cache_;
+        mutable std::unordered_map<SlicedKey, std::unique_ptr<ITensorGemm>, SlicedKeyHash> sliced_cache_;
 
         // =========================================================================
         // Expert Slab Storage

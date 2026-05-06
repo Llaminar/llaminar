@@ -93,6 +93,7 @@ namespace llaminar2
         ComputeGraph graph;
         std::string prefix = "layer" + std::to_string(layer_idx) + "_";
         int total_tokens = batch_size * seq_len;
+        LayerWeightBindings layer_bindings = layerWeightBindingsForGraph(layer_idx);
 
         LOG_DEBUG("[buildAttentionGraph] layer_idx=" << layer_idx << " seq_len=" << seq_len
                                                      << " batch_size=" << batch_size
@@ -146,6 +147,9 @@ namespace llaminar2
                               .output_q_buffer_id = BufferId::Q_PROJ,
                               .output_k_buffer_id = BufferId::K_PROJ,
                               .output_v_buffer_id = BufferId::V_PROJ,
+                              .prepared_ref_q = preparedRefForGraphWeight(layer_bindings.wq, layer.wq, device),
+                              .prepared_ref_k = preparedRefForGraphWeight(layer_bindings.wk, layer.wk, device),
+                              .prepared_ref_v = preparedRefForGraphWeight(layer_bindings.wv, layer.wv, device),
                               .prepared_store = prepared_weight_store_,
                           }),
                           device);

@@ -23,6 +23,7 @@ namespace llaminar2
     // Forward declarations
     class ITensor; // Device-agnostic tensor interface
     class TensorBase;
+    struct PreparedEmbeddingHandle;
     struct Q8_1Block;
     class IDeviceContext; // For kernel execute() interface
 
@@ -2502,6 +2503,18 @@ namespace llaminar2
             TensorBase *output,
             const IMPIContext *mpi_ctx = nullptr,
             int device_idx = -1) = 0;
+
+        /**
+         * @brief Provide a model-owned prepared embedding handle for execution.
+         *
+         * Graph-built model paths resolve this through PreparedWeightStore.
+         * Implementations may keep using their legacy lookup/fallback path when
+         * no handle is provided (for direct kernel tests and non-model callers).
+         */
+        virtual void setPreparedEmbeddingHandle(const PreparedEmbeddingHandle *handle)
+        {
+            (void)handle;
+        }
 
         /**
          * @brief Update token IDs stored in a graph-safe device-side buffer for replay

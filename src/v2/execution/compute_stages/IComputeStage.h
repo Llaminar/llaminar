@@ -384,6 +384,20 @@ namespace llaminar2
          */
         virtual bool execute(IDeviceContext *ctx) = 0;
 
+        /**
+         * @brief Validate prepared model-weight references before execution.
+         *
+         * Non-weight stages return true. Model-weight-backed GEMM stages override
+         * this to ensure graph construction provided PreparedWeightStore refs and
+         * that the store still contains those refs.
+         */
+        virtual bool validatePreparedWeights(std::string *error) const
+        {
+            if (error)
+                error->clear();
+            return true;
+        }
+
         // =========================================================================
         // Introspection
         // =========================================================================

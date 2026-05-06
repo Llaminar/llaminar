@@ -26,8 +26,10 @@
 #include "../memory/BufferId.h"
 #include "../config/TensorParallelConfig.h"
 #include "../config/TPDomain.h"
+#include "../loaders/WeightPlan.h"
 #include "../utils/ToolCallTypes.h"
 #include <functional>
+#include <exception>
 #include <map>
 #include <memory>
 #include <set>
@@ -539,6 +541,114 @@ namespace llaminar2
     };
 
     /**
+     * @brief Graph-facing layer weight bindings.
+     *
+     * This is the Phase 6 bridge from frozen model-weight bindings to the
+     * legacy TensorBase* stage params. Graph builders can inspect identity,
+     * residency, and prepared refs while existing stages continue to consume
+     * raw tensor pointers through toLegacyLayerWeights().
+     */
+    struct LayerWeightBindings
+    {
+        // Attention weights (Full Attention layers)
+        const WeightBinding *wq = nullptr;
+        const WeightBinding *wk = nullptr;
+        const WeightBinding *wv = nullptr;
+        const WeightBinding *wo = nullptr;
+        const WeightBinding *attn_norm = nullptr;
+
+        // Attention biases
+        const WeightBinding *q_bias = nullptr;
+        const WeightBinding *k_bias = nullptr;
+        const WeightBinding *v_bias = nullptr;
+
+        // QK norm weights
+        const WeightBinding *q_norm = nullptr;
+        const WeightBinding *k_norm = nullptr;
+
+        // GDN weights
+        const WeightBinding *attn_qkv = nullptr;
+        const WeightBinding *attn_gate = nullptr;
+        const WeightBinding *ssm_alpha = nullptr;
+        const WeightBinding *ssm_beta = nullptr;
+        const WeightBinding *ssm_conv1d = nullptr;
+        const WeightBinding *ssm_dt_bias = nullptr;
+        const WeightBinding *ssm_a = nullptr;
+        const WeightBinding *ssm_norm = nullptr;
+        const WeightBinding *ssm_out = nullptr;
+
+        // FFN weights
+        const WeightBinding *gate_proj = nullptr;
+        const WeightBinding *up_proj = nullptr;
+        const WeightBinding *down_proj = nullptr;
+        const WeightBinding *ffn_norm = nullptr;
+
+        // MoE weights
+        const WeightBinding *moe_gate = nullptr;
+        const WeightBinding *moe_gate_exps = nullptr;
+        const WeightBinding *moe_up_exps = nullptr;
+        const WeightBinding *moe_down_exps = nullptr;
+        const WeightBinding *shared_expert_gate = nullptr;
+        const WeightBinding *shared_expert_up = nullptr;
+        const WeightBinding *shared_expert_down = nullptr;
+        const WeightBinding *shared_expert_gate_inp = nullptr;
+    };
+
+    inline TensorBase *legacyTensor(const WeightBinding *binding)
+    {
+        return binding ? binding->tensor : nullptr;
+    }
+
+    inline LayerWeights toLegacyLayerWeights(const LayerWeightBindings &bindings)
+    {
+        LayerWeights weights;
+        weights.wq = legacyTensor(bindings.wq);
+        weights.wk = legacyTensor(bindings.wk);
+        weights.wv = legacyTensor(bindings.wv);
+        weights.wo = legacyTensor(bindings.wo);
+        weights.attn_norm = legacyTensor(bindings.attn_norm);
+        weights.q_bias = legacyTensor(bindings.q_bias);
+        weights.k_bias = legacyTensor(bindings.k_bias);
+        weights.v_bias = legacyTensor(bindings.v_bias);
+        weights.q_norm = legacyTensor(bindings.q_norm);
+        weights.k_norm = legacyTensor(bindings.k_norm);
+        weights.attn_qkv = legacyTensor(bindings.attn_qkv);
+        weights.attn_gate = legacyTensor(bindings.attn_gate);
+        weights.ssm_alpha = legacyTensor(bindings.ssm_alpha);
+        weights.ssm_beta = legacyTensor(bindings.ssm_beta);
+        weights.ssm_conv1d = legacyTensor(bindings.ssm_conv1d);
+        weights.ssm_dt_bias = legacyTensor(bindings.ssm_dt_bias);
+        weights.ssm_a = legacyTensor(bindings.ssm_a);
+        weights.ssm_norm = legacyTensor(bindings.ssm_norm);
+        weights.ssm_out = legacyTensor(bindings.ssm_out);
+        weights.gate_proj = legacyTensor(bindings.gate_proj);
+        weights.up_proj = legacyTensor(bindings.up_proj);
+        weights.down_proj = legacyTensor(bindings.down_proj);
+        weights.ffn_norm = legacyTensor(bindings.ffn_norm);
+        weights.moe_gate = legacyTensor(bindings.moe_gate);
+        weights.moe_gate_exps = legacyTensor(bindings.moe_gate_exps);
+        weights.moe_up_exps = legacyTensor(bindings.moe_up_exps);
+        weights.moe_down_exps = legacyTensor(bindings.moe_down_exps);
+        weights.shared_expert_gate = legacyTensor(bindings.shared_expert_gate);
+        weights.shared_expert_up = legacyTensor(bindings.shared_expert_up);
+        weights.shared_expert_down = legacyTensor(bindings.shared_expert_down);
+        weights.shared_expert_gate_inp = legacyTensor(bindings.shared_expert_gate_inp);
+        return weights;
+    }
+
+    /**
+     * @brief Model-level frozen weight bindings.
+     */
+    struct ModelWeightBindings
+    {
+        const WeightBinding *embedding_table = nullptr;
+        const WeightBinding *final_norm = nullptr;
+        const WeightBinding *lm_head = nullptr;
+
+        std::function<LayerWeightBindings(int layer_idx)> get_layer_weights;
+    };
+
+    /**
      * @brief Model-level weights
      *
      * Provides access to global weights and per-layer accessor.
@@ -552,6 +662,83 @@ namespace llaminar2
         /// Accessor for per-layer weights
         std::function<LayerWeights(int layer_idx)> get_layer_weights;
     };
+
+    inline ModelWeights toLegacyModelWeights(const ModelWeightBindings &bindings)
+    {
+        ModelWeights weights;
+        weights.embedding_table = legacyTensor(bindings.embedding_table);
+        weights.final_norm = legacyTensor(bindings.final_norm);
+        weights.lm_head = legacyTensor(bindings.lm_head);
+        if (bindings.get_layer_weights)
+        {
+            weights.get_layer_weights = [get_layer_weights = bindings.get_layer_weights](int layer_idx) {
+                return toLegacyLayerWeights(get_layer_weights(layer_idx));
+            };
+        }
+        return weights;
+    }
+
+    inline const WeightBinding *optionalGlobalBinding(
+        const FrozenModelWeightSet &weight_set,
+        const std::string &canonical_name)
+    {
+        try
+        {
+            return &weight_set.global(canonical_name);
+        }
+        catch (const std::exception &)
+        {
+            return nullptr;
+        }
+    }
+
+    inline ModelWeightBindings makeModelWeightBindings(const FrozenModelWeightSet &weight_set)
+    {
+        ModelWeightBindings bindings;
+        bindings.embedding_table = optionalGlobalBinding(weight_set, "token_embd.weight");
+        bindings.final_norm = optionalGlobalBinding(weight_set, "output_norm.weight");
+        bindings.lm_head = optionalGlobalBinding(weight_set, "output.weight");
+        bindings.get_layer_weights = [&weight_set](int layer_idx) {
+            LayerWeightBindings layer;
+            auto get = [&weight_set, layer_idx](const std::string &suffix) {
+                return weight_set.optionalLayer(layer_idx, suffix);
+            };
+
+            layer.wq = get("attn_q.weight");
+            layer.wk = get("attn_k.weight");
+            layer.wv = get("attn_v.weight");
+            layer.wo = get("attn_output.weight");
+            layer.attn_norm = get("attn_norm.weight");
+            layer.q_bias = get("attn_q.bias");
+            layer.k_bias = get("attn_k.bias");
+            layer.v_bias = get("attn_v.bias");
+            layer.q_norm = get("attn_q_norm.weight");
+            layer.k_norm = get("attn_k_norm.weight");
+            layer.attn_qkv = get("attn_qkv.weight");
+            layer.attn_gate = get("attn_gate.weight");
+            layer.ssm_alpha = get("ssm_alpha.weight");
+            layer.ssm_beta = get("ssm_beta.weight");
+            layer.ssm_conv1d = get("ssm_conv1d.weight");
+            layer.ssm_dt_bias = get("ssm_dt_bias.weight");
+            layer.ssm_a = get("ssm_a.weight");
+            layer.ssm_norm = get("ssm_norm.weight");
+            layer.ssm_out = get("ssm_out.weight");
+            layer.gate_proj = get("ffn_gate.weight");
+            layer.up_proj = get("ffn_up.weight");
+            layer.down_proj = get("ffn_down.weight");
+            layer.ffn_norm = get("ffn_norm.weight");
+            layer.moe_gate = get("ffn_gate_inp.weight");
+            layer.moe_gate_exps = get("ffn_gate_exps.weight");
+            layer.moe_up_exps = get("ffn_up_exps.weight");
+            layer.moe_down_exps = get("ffn_down_exps.weight");
+            layer.shared_expert_gate = get("ffn_gate_shexp.weight");
+            layer.shared_expert_up = get("ffn_up_shexp.weight");
+            layer.shared_expert_down = get("ffn_down_shexp.weight");
+            layer.shared_expert_gate_inp = get("ffn_gate_inp_shexp.weight");
+            return layer;
+        };
+        return bindings;
+    }
 
     // =========================================================================
     // Activation Buffers

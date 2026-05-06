@@ -10,11 +10,13 @@
 #include "../StageParamsBase.h"
 #include "../../../tensors/TensorKernels.h"
 #include "../../../memory/BufferId.h"
+#include "../../../loaders/WeightPlan.h"
 
 #include <optional>
 
 namespace llaminar2
 {
+    class PreparedWeightStore;
 
     /**
      * @brief Embedding lookup stage
@@ -53,6 +55,10 @@ namespace llaminar2
 
             // Optional BufferIds for contract-based coherence
             std::optional<BufferId> output_buffer_id;
+
+            // Phase 7/8: Prepared embedding data owned by PreparedWeightStore.
+            std::optional<PreparedWeightRef> prepared_ref;
+            PreparedWeightStore *prepared_store = nullptr;
         };
 
         explicit EmbeddingStage(Params params);
@@ -62,6 +68,7 @@ namespace llaminar2
         size_t estimatedFlops() const override;
         size_t estimatedMemoryBytes() const override;
         bool supportsBackend(ComputeBackendType backend) const override;
+        bool validatePreparedWeights(std::string *error) const override;
         bool isGraphCapturable() const override { return true; }
         bool hasDynamicParams() const override { return true; }
         /// In vocab-parallel TP, each device only embeds tokens in its shard;

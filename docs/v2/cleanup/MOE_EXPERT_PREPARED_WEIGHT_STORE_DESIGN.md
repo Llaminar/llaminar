@@ -44,11 +44,10 @@ GGUF 3D tensor [cols, rows_per_expert, num_experts]
      ▼ MoEExpertWeightService::extractExpertViews()
      │   → params.expert_gate_views[e] = shared_ptr<TensorBase> (2D view)
      │
-     ▼ MoEExpertWeightService::prepareGemmEngines()
-     │   ├── CPU: KernelFactory::getOrCreatePreparedGemmWeights(view.get())
-     │   │        → PreparedGemmHandle* in global registry
-     │   │   KernelFactory::getOrCreateGemmEngine(handle)
-     │   │        → ITensorGemm* stored in params.prepared_gate_gemm[e]
+    ▼ MoEExpertWeightService::prepareGemmEngines()
+    │   ├── CPU: PreparedWeightStore / local expert GEMM preparation
+    │   │        → store-owned prepared handle or expert slab entry
+    │   │        → ITensorGemm* stored in params.prepared_gate_gemm[e]
      │   │
      │   └── GPU: LoadOrchestrator pipeline → moe_owned_kernels + packed_lifetime
      │
@@ -221,8 +220,8 @@ Step 3: Weight Preparation
     │   ├── Check PreparedWeightStore cache (expertGemmKernel returns non-null?)
     │   ├── Cache hit → skip
     │   └── Cache miss:
-    │       ├── CPU: KernelFactory::getOrCreatePreparedGemmWeights(view)
-    │       │   (view still exists — raw weights held by parent 3D tensor)
+    │       ├── CPU: PreparedWeightStore expert slab lookup or local expert GEMM preparation
+    │       │   (view/payload exists according to the binding host-retention policy)
     │       └── GPU: LoadOrchestrator pipeline from blob/payload/raw
     │
     └── PreparedWeightStore::registerArrivedExperts(slab, arrivals)
@@ -323,7 +322,7 @@ MoEExpertWeightService::prepareAndRegisterExperts(ctx, store);
 ```cpp
 void MoEExpertComputeStage::ensureGemmEnginesCached() {
     // Copy from params.prepared_*_gemm → cached_*_gemm_
-    // Fallback: KernelFactory::getOrCreatePreparedGemmWeights(view)
+    // No fallback to global KernelFactory preparation; refs/slabs must be store-backed.
 }
 ```
 

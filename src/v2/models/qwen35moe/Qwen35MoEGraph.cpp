@@ -110,6 +110,7 @@ namespace llaminar2
         std::string prefix = "layer" + std::to_string(layer_idx) + "_";
         std::string ffn_terminal;
         int total_tokens = batch_size * seq_len;
+        LayerWeightBindings layer_bindings = layerWeightBindingsForGraph(layer_idx);
 
         // =====================================================================
         // Stage 1: Pre-FFN RMSNorm (fused with attention residual add)
@@ -198,6 +199,7 @@ namespace llaminar2
             expert_params.output = moe_output;
             expert_params.output_buffer_id = BufferId::MOE_COMBINED_OUTPUT;
             expert_params.input_buffer_id = BufferId::NORMALIZED;
+            expert_params.prepared_store = prepared_weight_store_;
 
             const int gpu_cache_experts = debugEnv().moe_rebalance.gpu_cache_experts_per_layer;
             if (gpu_cache_experts > 0)
@@ -351,6 +353,13 @@ namespace llaminar2
             shared_params.intermediate = shared_intermediate;
             shared_params.input_buffer_id = BufferId::NORMALIZED;
             shared_params.output_buffer_id = BufferId::MOE_SHARED_EXPERT_OUTPUT;
+            shared_params.prepared_ref_gate = preparedRefForGraphWeight(
+                layer_bindings.shared_expert_gate, layer.shared_expert_gate, device);
+            shared_params.prepared_ref_up = preparedRefForGraphWeight(
+                layer_bindings.shared_expert_up, layer.shared_expert_up, device);
+            shared_params.prepared_ref_down = preparedRefForGraphWeight(
+                layer_bindings.shared_expert_down, layer.shared_expert_down, device);
+            shared_params.prepared_store = prepared_weight_store_;
 
             graph.addNode(prefix + "shared_expert_ffn",
                           ComputeStageFactory::createSharedExpertFFN(shared_params),

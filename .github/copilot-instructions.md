@@ -1265,18 +1265,19 @@ class IQ4_NLTensor : public TensorBase, public ITensorGemmTileDataProvider {
 // Device type detection
 DeviceType dev = KernelFactory::getDeviceType(device_id);
 
-// Prepared GEMM weights (pack once, use many)
-auto* prepared = KernelFactory::getOrCreatePreparedGemmWeights(tensor, device_id);
-auto* engine = KernelFactory::getOrCreateGemmEngine(prepared);
+// Low-level non-model GEMM preparation (caller owns the prepared handle)
+auto prepared = KernelFactory::prepareGemmHandleLocal(tensor, device_id);
+auto* engine = KernelFactory::getOrCreateGemmEngine(prepared.get());
 
 // Multi-GPU: use ordinal guard for targeted device
 {
     KernelFactory::CUDAOrdinalGuard guard(1); // Target CUDA device 1
-    auto* prepared = KernelFactory::getOrCreatePreparedGemmWeights(tensor, DeviceId::cuda(1));
+    auto prepared = KernelFactory::prepareGemmHandleLocal(tensor, DeviceId::cuda(1));
+    auto* engine = KernelFactory::getOrCreateGemmEngine(prepared.get());
 }
 ```
 
-**Note**: Graph builders (e.g., `Qwen2Graph`) configure stages with their kernels during graph construction. `KernelFactory` is primarily used during weight loading and preparation, not at stage execution time.
+**Note**: Graph builders (e.g., `Qwen2Graph`) must pass `WeightBinding`/`PreparedWeightRef` metadata for model GEMM stages. Model-weight lifetime is owned by `PreparedWeightStore`; stage execution and workspace planning should resolve model GEMM kernels through that store. `KernelFactory::prepareGemmHandleLocal()` is only for low-level non-model/test paths where the caller explicitly owns the handle.
 
 ### SIMD Guidelines
 

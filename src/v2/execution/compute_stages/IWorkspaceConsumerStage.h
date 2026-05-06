@@ -33,17 +33,15 @@
  * class GEMMStage : public IComputeStage, public IWorkspaceConsumerStage
  * {
  *     IWorkspaceConsumer* getKernelAsWorkspaceConsumer() override {
- *         // Resolve through prepared-handle + device-scoped GEMM engine
- *         auto* prepared = KernelFactory::getOrCreatePreparedGemmWeights(weights_, target_device_);
- *         auto* engine = KernelFactory::getOrCreateGemmEngine(prepared);
- *         auto* gemm = engine->resolveKernel(prepared);
+ *         // Resolve the model-weight kernel through the graph's PreparedWeightStore.
+ *         auto* gemm = prepared_store_->gemmKernel(prepared_ref_);
  *         return dynamic_cast<IWorkspaceConsumer*>(gemm);
  *     }
  * };
  * @endcode
  *
- * Note: No explicit caching needed at the stage level. KernelFactory owns both
- * prepared-weight handles (tensor+device scoped) and device-scoped GEMM engines.
+ * Note: model-weight lifetime is owned by PreparedWeightStore; workspace paths
+ * must use the same prepared refs as execution and must not lazily prepare weights.
  *
  * @see IWorkspaceConsumer for the base interface
  * @see DeviceGraphBufferManager::allocateDeviceWorkspace() for the binding logic
@@ -67,9 +65,9 @@ namespace llaminar2
      *
      * ## Kernel Resolution
      *
-     * KernelFactory owns prepared GEMM handles and device-scoped GEMM engines,
-     * so stages don't need their own caching. getKernelAsWorkspaceConsumer() can
-     * resolve the active kernel from those shared registries.
+      * Graph-built model stages resolve prepared kernels through PreparedWeightStore.
+      * getKernelAsWorkspaceConsumer() should use the same prepared refs as execute(),
+      * so workspace planning cannot become a hidden weight-preparation path.
      *
      * ## Thread Safety
      *

@@ -19,6 +19,7 @@
 #include <random>
 #include <memory>
 #include <numeric>
+#include <optional>
 
 #include "execution/compute_stages/ComputeStages.h"
 #include "execution/local_execution/device/DeviceContext.h"
@@ -26,6 +27,7 @@
 #include "tensors/IQQuantTables.h"
 #include "tensors/FP16Utils.h"
 #include "utils/Logger.h"
+#include "../../../../utils/PreparedWeightTestHarness.h"
 
 namespace llaminar2
 {
@@ -131,6 +133,8 @@ namespace llaminar2
             wq_ = create_mock_weights(n_q_, k_, 100);
             wk_ = create_mock_weights(n_k_, k_, 200);
             wv_ = create_mock_weights(n_v_, k_, 300);
+            prepared_qkv_.emplace(test::makePreparedQKVFixture(
+                wq_.get(), wk_.get(), wv_.get(), DeviceId::cpu(), 0));
 
             // Create output tensors
             output_q_ = std::make_unique<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(m_), static_cast<size_t>(n_q_)}, DeviceId::cpu());
@@ -156,6 +160,14 @@ namespace llaminar2
             std::copy(bias_v_data_.begin(), bias_v_data_.end(), bias_v_->mutable_data());
         }
 
+        void attachPreparedRefs(FusedQKVGEMMStage::Params &params)
+        {
+            params.prepared_ref_q = prepared_qkv_->q_ref;
+            params.prepared_ref_k = prepared_qkv_->k_ref;
+            params.prepared_ref_v = prepared_qkv_->v_ref;
+            params.prepared_store = prepared_qkv_->store.get();
+        }
+
         // Dimensions
         int m_, k_, n_q_, n_k_, n_v_;
 
@@ -165,6 +177,7 @@ namespace llaminar2
         // Tensors
         std::unique_ptr<FP32Tensor> input_;
         std::unique_ptr<TensorBase> wq_, wk_, wv_;
+        std::optional<test::PreparedQKVFixture> prepared_qkv_;
         std::unique_ptr<FP32Tensor> output_q_, output_k_, output_v_;
 
         // Bias tensors (FP32Tensor for API compatibility)
@@ -195,6 +208,8 @@ namespace llaminar2
             .output_v = output_v_.get(),
             .n_v = n_v_,
             .bias_v = nullptr};
+
+        attachPreparedRefs(params);
 
         FusedQKVGEMMStage stage(params);
 
@@ -270,6 +285,8 @@ namespace llaminar2
                 .n_v = n_v_,
                 .bias_v = nullptr};
 
+            attachPreparedRefs(params);
+
             FusedQKVGEMMStage stage(params);
             ASSERT_TRUE(stage.execute(ctx_.get()));
 
@@ -306,6 +323,8 @@ namespace llaminar2
                 .output_v = output_v_.get(),
                 .n_v = n_v_,
                 .bias_v = bias_v_.get()};
+
+            attachPreparedRefs(params);
 
             FusedQKVGEMMStage stage(params);
             ASSERT_TRUE(stage.execute(ctx_.get()));
@@ -394,6 +413,8 @@ namespace llaminar2
                 .n_v = n_v_,
                 .bias_v = nullptr};
 
+            attachPreparedRefs(params);
+
             FusedQKVGEMMStage stage(params);
             ASSERT_TRUE(stage.execute(ctx_.get()));
 
@@ -428,6 +449,8 @@ namespace llaminar2
                 .output_v = output_v_.get(),
                 .n_v = n_v_,
                 .bias_v = nullptr};
+
+            attachPreparedRefs(params);
 
             FusedQKVGEMMStage stage(params);
             ASSERT_TRUE(stage.execute(ctx_.get()));

@@ -255,7 +255,7 @@ TEST_F(UnifiedGPUPipeline_FP_Test, BF16_DenseWeightsRegistered)
     auto shexp_gate = weight_mgr_->getWeightForDevice("blk.0.ffn_gate_shexp.weight");
     ASSERT_NE(shexp_gate, nullptr) << "Shared expert gate weight should exist";
 
-    auto *prepared = KernelFactory::getOrCreatePreparedGemmWeights(shexp_gate.get(), device_);
+    auto *prepared = KernelFactory::findPreparedGemmWeights(shexp_gate.get(), device_);
     EXPECT_NE(prepared, nullptr)
         << "BF16 ffn_gate_shexp.weight should have been packed by the FP pipeline";
 
@@ -263,7 +263,7 @@ TEST_F(UnifiedGPUPipeline_FP_Test, BF16_DenseWeightsRegistered)
     auto qkv = weight_mgr_->getWeightForDevice("blk.0.attn_qkv.weight");
     if (qkv)
     {
-        auto *qkv_prepared = KernelFactory::getOrCreatePreparedGemmWeights(qkv.get(), device_);
+        auto *qkv_prepared = KernelFactory::findPreparedGemmWeights(qkv.get(), device_);
         EXPECT_NE(qkv_prepared, nullptr)
             << "BF16 attn_qkv.weight should have been packed by the FP pipeline";
     }

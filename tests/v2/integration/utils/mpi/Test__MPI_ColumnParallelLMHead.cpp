@@ -38,12 +38,14 @@ namespace
 {
     ITensorGemm *getPreparedKernel(const TensorBase *tensor, DeviceId device_id = DeviceId::cpu())
     {
-        auto *prepared = llaminar::v2::kernels::KernelFactory::getOrCreatePreparedGemmWeights(tensor, device_id);
+        static std::vector<std::shared_ptr<llaminar::v2::kernels::KernelFactory::PreparedGemmHandle>> handles;
+        auto prepared = llaminar::v2::kernels::KernelFactory::prepareGemmHandleLocal(tensor, device_id);
         if (!prepared)
         {
             return nullptr;
         }
-        return llaminar::v2::kernels::KernelFactory::getOrCreateGemmEngine(prepared);
+        handles.push_back(std::move(prepared));
+        return llaminar::v2::kernels::KernelFactory::getOrCreateGemmEngine(handles.back().get());
     }
 }
 

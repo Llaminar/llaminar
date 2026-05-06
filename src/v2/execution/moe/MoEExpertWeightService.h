@@ -63,7 +63,7 @@ struct MoEWeightContext {
     std::shared_ptr<void>& moe_packed_up_lifetime;
     std::shared_ptr<void>& moe_packed_down_lifetime;
 
-    // Payload provider for lazy GPU expert preparation (model-context owned).
+    // Payload provider for runtime GPU expert arrivals (model-context owned).
     // When non-null, used instead of raw GGUF host data for GPU repack.
     ExpertWeightPayloadProvider* payload_provider = nullptr;
 

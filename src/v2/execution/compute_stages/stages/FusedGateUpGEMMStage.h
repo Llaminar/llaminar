@@ -77,6 +77,7 @@ namespace llaminar2
         explicit FusedGateUpGEMMStage(Params params);
 
         bool execute(IDeviceContext *ctx) override;
+        bool validatePreparedWeights(std::string *error) const override;
         ComputeStageType type() const override { return ComputeStageType::GEMM_FUSED_GATE_UP; }
         size_t estimatedFlops() const override;
         size_t estimatedMemoryBytes() const override;
@@ -93,6 +94,8 @@ namespace llaminar2
     private:
         Params params_;
         ITensorFusedGateUpGemm *cached_kernel_ = nullptr; ///< Cached for workspace binding
+
+        ITensorFusedGateUpGemm *resolvePreparedKernel(const char *caller);
     };
 
 } // namespace llaminar2

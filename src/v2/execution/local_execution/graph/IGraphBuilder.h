@@ -228,6 +228,9 @@ namespace llaminar2
         /// Set model weights
         virtual void setWeights(const ModelWeights &weights) = 0;
 
+        /// Set frozen model-weight bindings for graph-build validation and diagnostics.
+        virtual void setWeightBindings(const ModelWeightBindings &bindings) { (void)bindings; }
+
         /// Set activation buffers (for manual buffer management)
         virtual void setBuffers(const ModelBuffers &buffers) = 0;
 

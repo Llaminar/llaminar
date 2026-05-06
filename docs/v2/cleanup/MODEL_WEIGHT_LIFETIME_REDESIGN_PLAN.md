@@ -480,10 +480,10 @@ public:
 };
 ```
 
-- Initially implement this store as a wrapper over:
-  - `KernelFactory::getOrCreatePreparedGemmWeights()`
-  - `KernelFactory::registerPreparedGemmFromTransfer()`
-  - `KernelFactory::getOrCreatePreparedEmbeddingWeights()`
+- Historical migration note: this store was initially allowed to wrap existing
+  `KernelFactory` preparation/transfer APIs. The lazy global prepared-GEMM
+  factory fallback has since been removed; model GEMM preparation now flows
+  through store-owned refs or explicit pipeline registration.
 - Store full identity metadata next to the current prepared handle.
 - Add a check that every prepared handle references the expected binding identity.
 
@@ -566,7 +566,7 @@ struct ModelWeightBindings {
   - `LMHeadStage`
   - MoE expert/shared expert stages as applicable
 - Stage params should carry `WeightBindingRef` or `PreparedWeightRef` for GEMM weights.
-- Replace stage execution calls to `KernelFactory::getOrCreatePreparedGemmWeights()` with `PreparedWeightStore::gemmKernel(ref)`.
+- Replace stage execution calls to the old lazy global prepared-GEMM factory fallback with `PreparedWeightStore::gemmKernel(ref)`.
 - For CPU fallback, prepared refs can resolve to CPU packed or floating-point kernels.
 - For non-GEMM kernels, keep `KernelRegistry` device/type selection.
 
@@ -638,6 +638,8 @@ enum class WeightLifecycleState {
 
 ### Phase 10: Remove Compatibility APIs
 
+**Implementation note (2026-05-06)**: The `KernelFactory::getOrCreatePreparedGemmWeights()` compatibility path has been removed by `KERNELFACTORY_PREPARED_GEMM_FALLBACK_REMOVAL_PLAN.md`. Graph-built model GEMM stages now carry `PreparedWeightRef` metadata and resolve through `PreparedWeightStore`; stage/workspace lazy preparation through the deleted factory method is forbidden by the static guard `V2_Unit_Static_NoNewStagePreparedGemmFactoryFallbacks`.
+
 **Goal**: Delete old paths after all production modes use frozen bindings and prepared stores.
 
 **Tasks**:
@@ -653,7 +655,7 @@ enum class WeightLifecycleState {
 
 - All V2 unit tests pass.
 - All integration/parity tests pass for at least SingleDevice, LocalTP, LocalPP, and a MoE model.
-- No production code calls `KernelFactory::getOrCreatePreparedGemmWeights()` directly.
+- No production code calls the old lazy global prepared-GEMM factory fallback directly.
 
 ---
 

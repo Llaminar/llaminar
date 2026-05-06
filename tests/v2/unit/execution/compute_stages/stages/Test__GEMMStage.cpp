@@ -18,9 +18,12 @@
 #include "interfaces/IWorkspaceConsumer.h"
 #include "tensors/Tensors.h"
 #include "backends/DeviceId.h"
+#include "../../../../utils/PreparedWeightTestHarness.h"
 #include <memory>
+#include <optional>
 
 using namespace llaminar2;
+using namespace llaminar2::test;
 
 // =============================================================================
 // Test Fixture
@@ -43,6 +46,11 @@ protected:
         std::fill_n(A_->mutable_data(), 4 * 8, 0.0f);
         std::fill_n(B_->mutable_data(), 16 * 8, 0.0f);
         std::fill_n(C_->mutable_data(), 4 * 16, 0.0f);
+
+        prepared_B_.emplace(makePreparedGemmFixture(
+            B_.get(),
+            DeviceId::cpu(),
+            "blk.0.test_gemm.weight"));
     }
 
     // Helper to create valid params
@@ -59,10 +67,13 @@ protected:
         params.beta = 0.0f;
         params.transpose_B = true;
         params.device_id = DeviceId::cpu();
+        params.prepared_ref = prepared_B_->ref;
+        params.prepared_store = prepared_B_->store.get();
         return params;
     }
 
     std::unique_ptr<FP32Tensor> A_, B_, C_;
+    std::optional<PreparedGemmFixture> prepared_B_;
 };
 
 // =============================================================================

@@ -56,21 +56,10 @@ namespace llaminar2
         const PreparedWeightKind kind = inferPreparedKind(device);
         validateBindingForStore(binding, model_id_, kind);
 
-        // Phase 8: Create PreparedGemmHandle owned by THIS store, delegating only
-        // kernel creation (not lifetime) to KernelFactory.
-        const auto *kf_handle = llaminar::v2::kernels::KernelFactory::getOrCreatePreparedGemmWeights(
+        auto owned = llaminar::v2::kernels::KernelFactory::prepareGemmHandleLocal(
             binding.tensor, device);
-        if (!kf_handle)
+        if (!owned)
             throw std::runtime_error("PreparedWeightStore::prepareGemm failed for: " + binding.identity.canonical_name);
-
-        // Wrap the KernelFactory handle into our owned shared_ptr.
-        // We create our own handle that mirrors the KF handle's state.
-        auto owned = std::make_shared<llaminar::v2::kernels::KernelFactory::PreparedGemmHandle>();
-        owned->tensor = kf_handle->tensor;
-        owned->device_id = kf_handle->device_id;
-        owned->kind = kf_handle->kind;
-        owned->variant = kf_handle->variant;
-        owned->prepared_weights = kf_handle->prepared_weights; // shared ownership of kernel
 
         auto ref = makeRef(binding.binding_id, kind, device);
         WeightBinding stored = binding;
@@ -162,6 +151,50 @@ namespace llaminar2
         return nullptr;
     }
 
+    std::optional<PreparedWeightRef> PreparedWeightStore::preparedRefForTensor(
+        const TensorBase *tensor,
+        DeviceId device) const
+    {
+        if (!tensor)
+            return std::nullopt;
+
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (const auto &[id, entry] : entries_)
+        {
+            (void)id;
+            if (entry.binding.tensor == tensor && entry.ref.device == device)
+                return entry.ref;
+        }
+
+        auto emb_it = embedding_by_tensor_.find(EmbeddingKey{tensor, device});
+        if (emb_it != embedding_by_tensor_.end())
+        {
+            auto entry_it = embedding_entries_.find(emb_it->second);
+            if (entry_it != embedding_entries_.end())
+                return entry_it->second.ref;
+        }
+        return std::nullopt;
+    }
+
+    std::optional<PreparedWeightRef> PreparedWeightStore::preparedRefForBinding(
+        uint64_t binding_id,
+        DeviceId device) const
+    {
+        if (binding_id == 0)
+            return std::nullopt;
+
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto it = entries_.find(binding_id);
+        if (it != entries_.end() && it->second.ref.device == device)
+            return it->second.ref;
+
+        auto emb_it = embedding_entries_.find(binding_id);
+        if (emb_it != embedding_entries_.end() && emb_it->second.ref.device == device)
+            return emb_it->second.ref;
+
+        return std::nullopt;
+    }
+
     ITensorFusedGateUpGemm *PreparedWeightStore::fusedGateUpKernel(
         const PreparedWeightRef &gate_ref,
         const PreparedWeightRef &up_ref) const
@@ -182,12 +215,13 @@ namespace llaminar2
         if (fc_it != fused_cache_.end())
             return fc_it->second.get();
 
-        // Create and cache (delegates creation to KernelFactory but we own the result)
-        auto *fused = llaminar::v2::kernels::KernelFactory::getOrCreateFusedGateUpGemm(
-            gate_tensor, up_tensor, gate_ref.device);
-        // Note: KernelFactory still creates fused kernels (device-specific creation logic)
-        // but the lookup caching is now local to this store.
-        return fused;
+        auto fused = llaminar::v2::kernels::KernelFactory::createFusedGateUpGemmLocal(
+            gate_it->second.activeHandle(), up_it->second.activeHandle(), gate_ref.device);
+        if (!fused)
+            return nullptr;
+        auto *raw = fused.get();
+        fused_cache_[fkey] = std::move(fused);
+        return raw;
     }
 
     ITensorFusedGateUpGemm *PreparedWeightStore::fusedGateUpKernelForTensors(
@@ -197,11 +231,11 @@ namespace llaminar2
     {
         if (!gate_tensor || !up_tensor)
             return nullptr;
-        // Still delegates to KernelFactory for fused kernel creation (device-specific logic).
-        // The store's role here is lookup acceleration via entries, not ownership of fused kernels
-        // for tensor-based lookup (binding-based lookup uses the local cache above).
-        return llaminar::v2::kernels::KernelFactory::getOrCreateFusedGateUpGemm(
-            gate_tensor, up_tensor, device);
+        auto gate_ref = preparedRefForTensor(gate_tensor, device);
+        auto up_ref = preparedRefForTensor(up_tensor, device);
+        if (!gate_ref.has_value() || !up_ref.has_value())
+            return nullptr;
+        return fusedGateUpKernel(gate_ref.value(), up_ref.value());
     }
 
     // =========================================================================
@@ -219,17 +253,10 @@ namespace llaminar2
 
         const DeviceId device = binding.residency.resident_device.value_or(binding.residency.home_device);
 
-        // Delegate creation to KernelFactory (device-specific embedding repacking logic).
-        const auto *kf_handle = llaminar::v2::kernels::KernelFactory::getOrCreatePreparedEmbeddingWeights(
+        auto owned = llaminar::v2::kernels::KernelFactory::prepareEmbeddingHandleLocal(
             binding.tensor, d_model, device, vocab_offset, total_vocab);
-        if (!kf_handle)
+        if (!owned)
             throw std::runtime_error("PreparedWeightStore::prepareEmbedding failed for: " + binding.identity.canonical_name);
-
-        // Create owned copy
-        auto owned = std::make_shared<PreparedEmbeddingHandle>();
-        owned->tensor = kf_handle->tensor;
-        owned->device_id = kf_handle->device_id;
-        owned->weights = kf_handle->weights; // shared ownership of prepared data
 
         auto ref = makeRef(binding.binding_id, PreparedWeightKind::PreparedEmbedding, device);
         WeightBinding stored = binding;
@@ -301,48 +328,74 @@ namespace llaminar2
     // =========================================================================
 
     ITensorGemm *PreparedWeightStore::slicedGemmKernel(
-        const TensorBase *tensor,
+        const PreparedWeightRef &ref,
         size_t row_start,
         size_t row_end) const
     {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto entry_it = entries_.find(ref.binding_id);
+        if (entry_it == entries_.end() ||
+            entry_it->second.ref.model_id != ref.model_id ||
+            entry_it->second.ref.kind != ref.kind ||
+            entry_it->second.ref.device != ref.device)
+            return nullptr;
+
+        const TensorBase *tensor = entry_it->second.binding.tensor;
         if (!tensor)
             return nullptr;
 
-        std::lock_guard<std::mutex> lock(mutex_);
-        SlicedKey key{tensor, row_start, row_end};
-        auto it = sliced_cache_.find(key);
-        if (it != sliced_cache_.end())
-            return it->second;
+        SlicedKey key{ref.binding_id, nullptr, row_start, row_end};
+        auto cache_it = sliced_cache_.find(key);
+        if (cache_it != sliced_cache_.end())
+            return cache_it->second.get();
 
-        // Cache miss — delegate to KernelFactory (still owns creation logic)
-        auto *kernel = llaminar::v2::kernels::KernelFactory::getOrCreateGemmSliced(
+        auto kernel = llaminar::v2::kernels::KernelFactory::createGemmSlicedLocal(
             tensor, row_start, row_end);
         if (kernel)
-            sliced_cache_[key] = kernel;
-        return kernel;
+        {
+            auto *raw = kernel.get();
+            sliced_cache_[key] = std::move(kernel);
+            return raw;
+        }
+        return nullptr;
     }
 
     bool PreparedWeightStore::contains(const PreparedWeightRef &ref) const
     {
         std::lock_guard<std::mutex> lock(mutex_);
         auto it = entries_.find(ref.binding_id);
-        if (it == entries_.end())
+        if (it != entries_.end())
+        {
+            return it->second.ref.model_id == ref.model_id &&
+                   it->second.ref.kind == ref.kind &&
+                   it->second.ref.device == ref.device;
+        }
+
+        auto emb_it = embedding_entries_.find(ref.binding_id);
+        if (emb_it == embedding_entries_.end())
             return false;
-        return it->second.ref.model_id == ref.model_id &&
-               it->second.ref.kind == ref.kind &&
-               it->second.ref.device == ref.device;
+        return emb_it->second.ref.model_id == ref.model_id &&
+               emb_it->second.ref.kind == ref.kind &&
+               emb_it->second.ref.device == ref.device;
     }
 
     std::optional<WeightBinding> PreparedWeightStore::binding(const PreparedWeightRef &ref) const
     {
         std::lock_guard<std::mutex> lock(mutex_);
         auto it = entries_.find(ref.binding_id);
-        if (it == entries_.end() ||
-            it->second.ref.model_id != ref.model_id ||
-            it->second.ref.kind != ref.kind ||
-            it->second.ref.device != ref.device)
+        if (it != entries_.end() &&
+            it->second.ref.model_id == ref.model_id &&
+            it->second.ref.kind == ref.kind &&
+            it->second.ref.device == ref.device)
+            return it->second.binding;
+
+        auto emb_it = embedding_entries_.find(ref.binding_id);
+        if (emb_it == embedding_entries_.end() ||
+            emb_it->second.ref.model_id != ref.model_id ||
+            emb_it->second.ref.kind != ref.kind ||
+            emb_it->second.ref.device != ref.device)
             return std::nullopt;
-        return it->second.binding;
+        return emb_it->second.binding;
     }
 
     size_t PreparedWeightStore::size() const

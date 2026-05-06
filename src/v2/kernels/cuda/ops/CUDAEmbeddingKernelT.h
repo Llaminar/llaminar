@@ -68,6 +68,10 @@ namespace llaminar2
 
         // GPU stream for graph capture support
         void setGPUStream(void *stream) override { gpu_stream_ = stream; }
+        void setPreparedEmbeddingHandle(const PreparedEmbeddingHandle *handle) override
+        {
+            prepared_embedding_handle_ = handle;
+        }
 
         bool supports_device(int device_idx) const override
         {
@@ -235,6 +239,7 @@ namespace llaminar2
         int device_idx_ = 0;
         IWorkerGPUContext *device_ctx_ = nullptr;
         void *gpu_stream_ = nullptr;
+        const PreparedEmbeddingHandle *prepared_embedding_handle_ = nullptr;
 
         // IWorkspaceConsumer state
         DeviceWorkspaceManager *workspace_ = nullptr; ///< Bound workspace manager (not owned)

@@ -848,6 +848,14 @@ namespace llaminar2
         // =====================================================================
         // ENTRY Verification (Debug/Integration only)
         // =====================================================================
+        std::string prepared_error;
+        if (!node.stage->validatePreparedWeights(&prepared_error))
+        {
+            LOG_ERROR("[DeviceGraphExecutor] Prepared weight validation failed for stage '"
+                  << node.name << "': " << prepared_error);
+            return false;
+        }
+
 #if LLAMINAR_ASSERTIONS_ACTIVE
         if (policy.validation && debugEnv().validation.validate_inputs)
         {

@@ -362,8 +362,8 @@ namespace llaminar
                  * @code
                  * {
                  *     KernelFactory::CUDAOrdinalGuard guard(1); // Target CUDA device 1
-                 *     auto* prepared = KernelFactory::getOrCreatePreparedGemmWeights(tensor, DeviceId::cuda(1));
-                 *     auto* kernel = KernelFactory::getOrCreateGemmEngine(prepared);
+                 *     auto prepared = KernelFactory::prepareGemmHandleLocal(tensor, DeviceId::cuda(1));
+                 *     auto* kernel = KernelFactory::getOrCreateGemmEngine(prepared.get());
                  *     // kernel will target CUDA device 1
                  * } // guard goes out of scope, thread-local cleared
                  * @endcode
@@ -391,8 +391,8 @@ namespace llaminar
                  * @code
                  * {
                  *     KernelFactory::ROCmOrdinalGuard guard(1); // Target ROCm device 1
-                 *     auto* prepared = KernelFactory::getOrCreatePreparedGemmWeights(tensor, DeviceId::rocm(1));
-                 *     auto* kernel = KernelFactory::getOrCreateGemmEngine(prepared);
+                 *     auto prepared = KernelFactory::prepareGemmHandleLocal(tensor, DeviceId::rocm(1));
+                 *     auto* kernel = KernelFactory::getOrCreateGemmEngine(prepared.get());
                  *     // kernel will target ROCm device 1
                  * } // guard goes out of scope, thread-local cleared
                  * @endcode
@@ -634,48 +634,6 @@ namespace llaminar
                  */
                 static std::unique_ptr<llaminar2::ITensorGemm> createGemm(
                     const llaminar2::BF16Tensor *tensor, DeviceType dev_type, int device_ordinal = -1);
-
-                // ==========================================================================
-                // Fused Gate/Up GEMM Kernel Creation
-                // NOTE: Phase 8 legacy. New code should use PreparedWeightStore
-                // for fused GEMM caching and lifetime management.
-                // ==========================================================================
-
-                /**
-                 * @brief Get or create cached fused Gate/Up GEMM kernel
-                 *
-                 * Compatibility overload for call sites that only provide DeviceType.
-                 * Internally delegates to the DeviceId overload.
-                 *
-                 * @param w_gate Gate weight tensor
-                 * @param w_up Up weight tensor
-                 * @param dev_type Target device type
-                 * @return Kernel pointer (factory owns lifetime)
-                 */
-                static llaminar2::ITensorFusedGateUpGemm *getOrCreateFusedGateUpGemm(
-                    const llaminar2::TensorBase *w_gate,
-                    const llaminar2::TensorBase *w_up,
-                    DeviceType dev_type = DeviceType::CPU);
-
-                /**
-                 * @brief Get or create cached fused Gate/Up GEMM kernel with explicit DeviceId
-                 *
-                 * Same as getOrCreateFusedGateUpGemm but uses DeviceId to specify BOTH
-                 * the device type AND the device ordinal (e.g., ROCm:1 vs ROCm:0).
-                 * Use this when weights are on CPU but need to run on a specific GPU.
-                 *
-                 * @param w_gate Gate weight tensor
-                 * @param w_up Up weight tensor
-                 * @param target_device DeviceId specifying type and ordinal
-                 * @return Kernel pointer (factory owns lifetime)
-                 *
-                 * @note Cache key includes prepared-handle identity and DeviceId,
-                 * so entries stay aligned with per-device prepared GEMM readiness.
-                 */
-                static llaminar2::ITensorFusedGateUpGemm *getOrCreateFusedGateUpGemm(
-                    const llaminar2::TensorBase *w_gate,
-                    const llaminar2::TensorBase *w_up,
-                    llaminar2::DeviceId target_device);
 
                 // ==========================================================================
                 // RoPE Kernel Creation - Device-aware dispatch
@@ -1174,38 +1132,6 @@ namespace llaminar
                 static std::unique_ptr<llaminar2::IKVCache> createROCmKVCache(const KVCacheConfig &config);
 #endif
 
-                // ==========================================================================
-                // Cached GEMM Kernel API - Pack Once, Use Many
-                // NOTE: Phase 8 legacy. New code should use PreparedWeightStore::slicedGemmKernel()
-                // for row-sliced GEMM access.
-                // ==========================================================================
-
-                /**
-                 * @brief Get or create a cached row-sliced GEMM kernel for tensor parallelism
-                 *
-                 * Creates a kernel that only packs rows [row_start, row_end) from the weight tensor.
-                 * This is used for row-parallel tensor parallelism where each MPI rank computes
-                 * a slice of the output dimension.
-                 *
-                 * For a weight matrix [N, K]:
-                 * - Full kernel: packs all N rows, output C is [M, N]
-                 * - Sliced kernel: packs only (row_end - row_start) rows, output C is [M, row_end - row_start]
-                 *
-                 * @param tensor Weight tensor (quantized)
-                 * @param row_start First row to include (0-indexed)
-                 * @param row_end One past the last row to include
-                 * @return Cached GEMM kernel pointer (lifetime managed by cache)
-                 *
-                 * @note Cache key includes row range, so different slices get different kernels
-                 * @note Thread-safe via mutex protection
-                 * @note The resulting kernel has N = (row_end - row_start), K unchanged
-                 * @note After sliced GEMM, caller is responsible for AllReduce if needed
-                 */
-                static llaminar2::ITensorGemm *getOrCreateGemmSliced(
-                    const llaminar2::TensorBase *tensor,
-                    size_t row_start,
-                    size_t row_end);
-
                 /**
                  * @brief Ensure tensor has packed weights in its cache and return pointer
                  *
@@ -1234,8 +1160,8 @@ namespace llaminar
                 /**
                  * @brief Clear prepared weight state for a tensor (Phase 8)
                  *
-                 * Removes entries from prepared_gemm_registry_, fused_gate_up_cache_,
-                 * and sliced_cache_ that reference this tensor. Does NOT clear the
+                 * Removes entries from prepared_gemm_registry_ and fused_gate_up_cache_
+                 * that reference this tensor. Does NOT clear the
                  * tensor's local packed_cache (cache_) — that is tensor-owned state.
                  *
                  * Called by PreparedWeightStore::releaseAllPreparedState() during
@@ -1407,29 +1333,48 @@ namespace llaminar
                     const PreparedGemmHandle *prepared);
 
                 /**
-                 * @brief Get or create a prepared GEMM-weights handle
+                 * @brief Prepare GEMM weights without inserting into KernelFactory global registries.
                  *
-                 * @deprecated Phase 8: New code should use PreparedWeightStore::prepare()
-                 * for model-weight-lifetime management. This API remains functional for
-                 * backward compatibility but its registry will be removed in Phase 9.
-                 *
-                 * Resolves preparation kind, ensures packed state where applicable,
-                 * and binds an executable GEMM kernel via explicit-device create path.
-                 *
-                 * Returned handles are stable identity objects for cache keying and
-                 * may be shared by multiple callers (stages, fused adapters, preloaders)
-                 * targeting the same tensor/device/preparation tuple.
+                 * The returned handle is owned by the caller. This is the model-context
+                 * path used by PreparedWeightStore; TensorBase destructors and global
+                 * KernelFactory cleanup do not participate in its lifetime.
                  */
-                static const PreparedGemmHandle *getOrCreatePreparedGemmWeights(
+                static std::shared_ptr<PreparedGemmHandle> prepareGemmHandleLocal(
                     const llaminar2::TensorBase *tensor,
                     llaminar2::DeviceId target_device,
                     GemmPreparationKind prep_kind = GemmPreparationKind::AUTO);
 
                 /**
+                 * @brief Create a sliced CPU GEMM kernel without using the global sliced cache.
+                 */
+                static std::unique_ptr<llaminar2::ITensorGemm> createGemmSlicedLocal(
+                    const llaminar2::TensorBase *tensor,
+                    size_t row_start,
+                    size_t row_end);
+
+                /**
+                 * @brief Create a fused Gate/Up adapter from prepared handles without global cache insertion.
+                 */
+                static std::unique_ptr<llaminar2::ITensorFusedGateUpGemm> createFusedGateUpGemmLocal(
+                    const PreparedGemmHandle *prepared_gate,
+                    const PreparedGemmHandle *prepared_up,
+                    llaminar2::DeviceId target_device);
+
+                /**
+                 * @brief Prepare embedding weights without inserting into KernelFactory global registries.
+                 */
+                static std::shared_ptr<llaminar2::PreparedEmbeddingHandle> prepareEmbeddingHandleLocal(
+                    const llaminar2::TensorBase *tensor,
+                    int d_model,
+                    llaminar2::DeviceId target_device,
+                    size_t vocab_offset = 0,
+                    size_t total_vocab = 0);
+
+                /**
                  * @brief Prepare GEMM weights for an expert view WITHOUT global registry registration.
                  *
-                 * Performs the same VNNI repacking / kernel binding as getOrCreatePreparedGemmWeights()
-                 * but returns a shared_ptr that the caller owns. The prepared weights are NOT stored
+                 * Performs local VNNI repacking / kernel binding and returns a
+                 * shared_ptr that the caller owns. The prepared weights are NOT stored
                  * in prepared_gemm_registry_, so:
                  * - ~TensorBase() has nothing to scan
                  * - No dual-key fallback needed
@@ -1624,33 +1569,6 @@ namespace llaminar
                 KernelFactory() = delete; // Static-only class
 
                 static std::mutex cache_mutex_;
-
-                // Sliced GEMM cache - keyed by (tensor, row_start, row_end)
-                struct SlicedCacheKey
-                {
-                    const llaminar2::TensorBase *tensor;
-                    size_t row_start;
-                    size_t row_end;
-
-                    bool operator==(const SlicedCacheKey &other) const
-                    {
-                        return tensor == other.tensor &&
-                               row_start == other.row_start &&
-                               row_end == other.row_end;
-                    }
-                };
-
-                struct SlicedKeyHash
-                {
-                    size_t operator()(const SlicedCacheKey &k) const
-                    {
-                        return std::hash<const void *>()(k.tensor) ^
-                               (std::hash<size_t>()(k.row_start) << 1) ^
-                               (std::hash<size_t>()(k.row_end) << 2);
-                    }
-                };
-
-                static std::unordered_map<SlicedCacheKey, std::unique_ptr<llaminar2::ITensorGemm>, SlicedKeyHash> sliced_cache_;
 
                 // Fused Gate/Up GEMM cache - keyed by prepared-handle identity + device
                 struct FusedGateUpCacheKey

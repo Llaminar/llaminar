@@ -8,7 +8,6 @@
 #include "../../../utils/DebugEnv.h"
 #include "../../../tensors/Tensors.h"
 #include "../../../utils/Logger.h"
-#include "../../../kernels/KernelFactory.h"
 #include "../../../utils/GemmContext.h"
 #include "../../../loaders/PreparedWeightStore.h"
 
@@ -26,6 +25,59 @@ namespace llaminar2
     FusedQKVGEMMStage::FusedQKVGEMMStage(Params params)
         : IComputeStage(params.device_id), params_(std::move(params))
     {
+    }
+
+    bool FusedQKVGEMMStage::validatePreparedWeights(std::string *error) const
+    {
+        if (!params_.wq && !params_.wk && !params_.wv)
+            return true;
+        if (!params_.prepared_store ||
+            !params_.prepared_ref_q.has_value() ||
+            !params_.prepared_ref_k.has_value() ||
+            !params_.prepared_ref_v.has_value())
+        {
+            if (error) *error = "FusedQKVGEMMStage requires PreparedWeightStore and Q/K/V PreparedWeightRefs";
+            return false;
+        }
+        if (!params_.prepared_store->contains(params_.prepared_ref_q.value()) ||
+            !params_.prepared_store->contains(params_.prepared_ref_k.value()) ||
+            !params_.prepared_store->contains(params_.prepared_ref_v.value()))
+        {
+            if (error) *error = "FusedQKVGEMMStage has a PreparedWeightRef missing from PreparedWeightStore";
+            return false;
+        }
+        return true;
+    }
+
+    bool FusedQKVGEMMStage::resolveIndividualKernels(const char *caller)
+    {
+        if (cache_resolved_individual_)
+            return cached_gemm_q_ && cached_gemm_k_ && cached_gemm_v_;
+
+        if (!params_.prepared_store ||
+            !params_.prepared_ref_q.has_value() ||
+            !params_.prepared_ref_k.has_value() ||
+            !params_.prepared_ref_v.has_value())
+        {
+            LOG_ERROR("[" << caller << "] PreparedWeightStore and Q/K/V PreparedWeightRefs are required");
+            return false;
+        }
+
+        cached_gemm_q_ = params_.prepared_store->gemmKernel(params_.prepared_ref_q.value());
+        cached_gemm_k_ = params_.prepared_store->gemmKernel(params_.prepared_ref_k.value());
+        cached_gemm_v_ = params_.prepared_store->gemmKernel(params_.prepared_ref_v.value());
+
+        if (!cached_gemm_q_ || !cached_gemm_k_ || !cached_gemm_v_)
+        {
+            LOG_ERROR("[" << caller << "] PreparedWeightRefs were provided but one or more Q/K/V GEMM kernels were missing from PreparedWeightStore"
+                      << " q=" << static_cast<const void *>(cached_gemm_q_)
+                      << " k=" << static_cast<const void *>(cached_gemm_k_)
+                      << " v=" << static_cast<const void *>(cached_gemm_v_));
+            return false;
+        }
+
+        cache_resolved_individual_ = true;
+        return true;
     }
 
     bool FusedQKVGEMMStage::execute(IDeviceContext *ctx)
@@ -75,54 +127,8 @@ namespace llaminar2
             return false;
         }
 
-        // Cast weights to TensorBase for KernelFactory
-        auto *wq_base = requireTensorBase(params_.wq, "wq");
-        auto *wk_base = requireTensorBase(params_.wk, "wk");
-        auto *wv_base = requireTensorBase(params_.wv, "wv");
-
-        // Get the target device type from device_id
-        DeviceType target_dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(params_.device_id);
-
-        // Get or cache individual Q/K/V kernels (avoid KernelFactory mutex per token)
-        if (!cache_resolved_individual_)
-        {
-            // Phase 10: Try PreparedWeightStore (ref-based, then tensor-based)
-            if (params_.prepared_store)
-            {
-                if (params_.prepared_ref_q.has_value())
-                    cached_gemm_q_ = params_.prepared_store->gemmKernel(params_.prepared_ref_q.value());
-                if (params_.prepared_ref_k.has_value())
-                    cached_gemm_k_ = params_.prepared_store->gemmKernel(params_.prepared_ref_k.value());
-                if (params_.prepared_ref_v.has_value())
-                    cached_gemm_v_ = params_.prepared_store->gemmKernel(params_.prepared_ref_v.value());
-
-                // Tensor-based fallback within the store
-                if (!cached_gemm_q_)
-                    cached_gemm_q_ = params_.prepared_store->gemmKernelForTensor(wq_base);
-                if (!cached_gemm_k_)
-                    cached_gemm_k_ = params_.prepared_store->gemmKernelForTensor(wk_base);
-                if (!cached_gemm_v_)
-                    cached_gemm_v_ = params_.prepared_store->gemmKernelForTensor(wv_base);
-            }
-
-            // No PreparedWeightStore or store miss: direct KernelFactory
-            if (!cached_gemm_q_)
-            {
-                auto *prepared_q = llaminar::v2::kernels::KernelFactory::getOrCreatePreparedGemmWeights(wq_base, params_.device_id);
-                cached_gemm_q_ = llaminar::v2::kernels::KernelFactory::getOrCreateGemmEngine(prepared_q);
-            }
-            if (!cached_gemm_k_)
-            {
-                auto *prepared_k = llaminar::v2::kernels::KernelFactory::getOrCreatePreparedGemmWeights(wk_base, params_.device_id);
-                cached_gemm_k_ = llaminar::v2::kernels::KernelFactory::getOrCreateGemmEngine(prepared_k);
-            }
-            if (!cached_gemm_v_)
-            {
-                auto *prepared_v = llaminar::v2::kernels::KernelFactory::getOrCreatePreparedGemmWeights(wv_base, params_.device_id);
-                cached_gemm_v_ = llaminar::v2::kernels::KernelFactory::getOrCreateGemmEngine(prepared_v);
-            }
-            cache_resolved_individual_ = true;
-        }
+        if (!resolveIndividualKernels("FusedQKVGEMMStage"))
+            return false;
         auto *gemm_q = cached_gemm_q_;
         auto *gemm_k = cached_gemm_k_;
         auto *gemm_v = cached_gemm_v_;
@@ -132,7 +138,7 @@ namespace llaminar2
             gemm_k->setGPUStream(gpuStream());
         if (gemm_v)
             gemm_v->setGPUStream(gpuStream());
-        const bool gpu_execution = (target_dev_type == DeviceType::CUDA || target_dev_type == DeviceType::ROCm);
+        const bool gpu_execution = params_.device_id.is_gpu();
         LOG_DEBUG("[FusedQKVGEMMStage] device_id=" << params_.device_id.to_string()
                                                    << " is_gpu=" << gpu_execution);
         bool success = false;
@@ -358,9 +364,6 @@ namespace llaminar2
 
     IWorkspaceConsumer *FusedQKVGEMMStage::getKernelAsWorkspaceConsumer()
     {
-        // Get kernel from KernelFactory for the Q projection weight
-        // All three projections share the same workspace, so returning any one works.
-        // The Q kernel is always present, so use that.
         if (!params_.wq)
         {
             LOG_WARN("[FusedQKVGEMMStage::getKernelAsWorkspaceConsumer] Q weight tensor not set");
@@ -374,13 +377,8 @@ namespace llaminar2
             return nullptr;
         }
 
-        // Use cached kernel if available, otherwise resolve
-        if (!cache_resolved_individual_)
-        {
-            auto *prepared = llaminar::v2::kernels::KernelFactory::getOrCreatePreparedGemmWeights(wq_base, params_.device_id);
-            cached_gemm_q_ = llaminar::v2::kernels::KernelFactory::getOrCreateGemmEngine(prepared);
-            // Note: K/V will be resolved on first execute() or bindWorkspace()
-        }
+        if (!resolveIndividualKernels("FusedQKVGEMMStage::getKernelAsWorkspaceConsumer"))
+            return nullptr;
 
         return dynamic_cast<IWorkspaceConsumer *>(cached_gemm_q_);
     }
@@ -389,37 +387,8 @@ namespace llaminar2
     {
         // Ensure all three kernels are resolved so we report ALL per-instance buffers.
         auto *self = const_cast<FusedQKVGEMMStage *>(this);
-        if (!cache_resolved_individual_)
-        {
-            if (params_.wq)
-            {
-                auto *wq_base = dynamic_cast<TensorBase *>(const_cast<ITensor *>(params_.wq));
-                if (wq_base)
-                {
-                    auto *prepared = llaminar::v2::kernels::KernelFactory::getOrCreatePreparedGemmWeights(wq_base, params_.device_id);
-                    self->cached_gemm_q_ = llaminar::v2::kernels::KernelFactory::getOrCreateGemmEngine(prepared);
-                }
-            }
-            if (params_.wk)
-            {
-                auto *wk_base = dynamic_cast<TensorBase *>(const_cast<ITensor *>(params_.wk));
-                if (wk_base)
-                {
-                    auto *prepared = llaminar::v2::kernels::KernelFactory::getOrCreatePreparedGemmWeights(wk_base, params_.device_id);
-                    self->cached_gemm_k_ = llaminar::v2::kernels::KernelFactory::getOrCreateGemmEngine(prepared);
-                }
-            }
-            if (params_.wv)
-            {
-                auto *wv_base = dynamic_cast<TensorBase *>(const_cast<ITensor *>(params_.wv));
-                if (wv_base)
-                {
-                    auto *prepared = llaminar::v2::kernels::KernelFactory::getOrCreatePreparedGemmWeights(wv_base, params_.device_id);
-                    self->cached_gemm_v_ = llaminar::v2::kernels::KernelFactory::getOrCreateGemmEngine(prepared);
-                }
-            }
-            self->cache_resolved_individual_ = true;
-        }
+        if (!self->resolveIndividualKernels("FusedQKVGEMMStage::getWorkspaceRequirements"))
+            return {};
 
         WorkspaceRequirements combined;
         if (auto *consumer_q = dynamic_cast<IWorkspaceConsumer *>(cached_gemm_q_))
@@ -435,38 +404,8 @@ namespace llaminar2
     {
         // Bind workspace to ALL THREE kernels (Q, K, V)
         // Each kernel needs workspace for GPU execution
-        // Resolve and cache individual kernels if not already done
-        if (!cache_resolved_individual_)
-        {
-            if (params_.wq)
-            {
-                auto *wq_base = dynamic_cast<TensorBase *>(const_cast<ITensor *>(params_.wq));
-                if (wq_base)
-                {
-                    auto *prepared_q = llaminar::v2::kernels::KernelFactory::getOrCreatePreparedGemmWeights(wq_base, params_.device_id);
-                    cached_gemm_q_ = llaminar::v2::kernels::KernelFactory::getOrCreateGemmEngine(prepared_q);
-                }
-            }
-            if (params_.wk)
-            {
-                auto *wk_base = dynamic_cast<TensorBase *>(const_cast<ITensor *>(params_.wk));
-                if (wk_base)
-                {
-                    auto *prepared_k = llaminar::v2::kernels::KernelFactory::getOrCreatePreparedGemmWeights(wk_base, params_.device_id);
-                    cached_gemm_k_ = llaminar::v2::kernels::KernelFactory::getOrCreateGemmEngine(prepared_k);
-                }
-            }
-            if (params_.wv)
-            {
-                auto *wv_base = dynamic_cast<TensorBase *>(const_cast<ITensor *>(params_.wv));
-                if (wv_base)
-                {
-                    auto *prepared_v = llaminar::v2::kernels::KernelFactory::getOrCreatePreparedGemmWeights(wv_base, params_.device_id);
-                    cached_gemm_v_ = llaminar::v2::kernels::KernelFactory::getOrCreateGemmEngine(prepared_v);
-                }
-            }
-            cache_resolved_individual_ = true;
-        }
+        if (!resolveIndividualKernels("FusedQKVGEMMStage::bindWorkspace"))
+            return;
 
         // Bind workspace using cached kernels
         if (auto *consumer_q = dynamic_cast<IWorkspaceConsumer *>(cached_gemm_q_))

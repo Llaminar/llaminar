@@ -9,7 +9,6 @@
 #include "../../../tensors/Tensors.h"
 #include "../../../tensors/TensorKernels.h"
 #include "../../../utils/Logger.h"
-#include "../../../kernels/KernelFactory.h"
 #include "../../../utils/GemmContext.h"
 #include "../../../loaders/PreparedWeightStore.h"
 
@@ -23,6 +22,49 @@ namespace llaminar2
     FusedGateUpGEMMStage::FusedGateUpGEMMStage(Params params)
         : IComputeStage(params.device_id), params_(std::move(params))
     {
+    }
+
+    bool FusedGateUpGEMMStage::validatePreparedWeights(std::string *error) const
+    {
+        if (!params_.w_gate && !params_.w_up)
+            return true;
+        if (!params_.prepared_store ||
+            !params_.prepared_ref_gate.has_value() ||
+            !params_.prepared_ref_up.has_value())
+        {
+            if (error) *error = "FusedGateUpGEMMStage requires PreparedWeightStore and gate/up PreparedWeightRefs";
+            return false;
+        }
+        if (!params_.prepared_store->contains(params_.prepared_ref_gate.value()) ||
+            !params_.prepared_store->contains(params_.prepared_ref_up.value()))
+        {
+            if (error) *error = "FusedGateUpGEMMStage has a PreparedWeightRef missing from PreparedWeightStore";
+            return false;
+        }
+        return true;
+    }
+
+    ITensorFusedGateUpGemm *FusedGateUpGEMMStage::resolvePreparedKernel(const char *caller)
+    {
+        if (cached_kernel_)
+            return cached_kernel_;
+
+        if (!params_.prepared_store ||
+            !params_.prepared_ref_gate.has_value() ||
+            !params_.prepared_ref_up.has_value())
+        {
+            LOG_ERROR("[" << caller << "] PreparedWeightStore and gate/up PreparedWeightRefs are required");
+            return nullptr;
+        }
+
+        cached_kernel_ = params_.prepared_store->fusedGateUpKernel(
+            params_.prepared_ref_gate.value(),
+            params_.prepared_ref_up.value());
+        if (!cached_kernel_)
+        {
+            LOG_ERROR("[" << caller << "] PreparedWeightRefs were provided but no fused gate/up kernel was found in PreparedWeightStore");
+        }
+        return cached_kernel_;
     }
 
     bool FusedGateUpGEMMStage::execute(IDeviceContext *ctx)
@@ -64,7 +106,7 @@ namespace llaminar2
                                                        << " output_gate_type=" << params_.output_gate->dtype_name()
                                                        << " output_up_type=" << params_.output_up->dtype_name());
 
-        // Cast ITensor* to TensorBase* for KernelFactory
+        // Validate weight tensor types for diagnostics and dump coherence.
         auto *w_gate_base = requireTensorBase(params_.w_gate, "w_gate");
         auto *w_up_base = requireTensorBase(params_.w_up, "w_up");
         if (!w_gate_base || !w_up_base)
@@ -76,35 +118,7 @@ namespace llaminar2
         LOG_DEBUG("[FusedGateUpGEMMStage] Looking up kernel for gate=" << (void *)w_gate_base
                                                                        << " up=" << (void *)w_up_base << " device=" << params_.device_id.to_string());
 
-        // Get fused Gate/Up kernel — use stage-level cache to avoid KernelFactory mutex per call
-        ITensorFusedGateUpGemm *fused_kernel = cached_kernel_;
-        if (!fused_kernel)
-        {
-            // Phase 7: Try PreparedWeightStore first
-            if (params_.prepared_store &&
-                params_.prepared_ref_gate.has_value() &&
-                params_.prepared_ref_up.has_value())
-            {
-                fused_kernel = params_.prepared_store->fusedGateUpKernel(
-                    params_.prepared_ref_gate.value(),
-                    params_.prepared_ref_up.value());
-            }
-
-            // Phase 10: Tensor-based store lookup
-            if (!fused_kernel && params_.prepared_store)
-            {
-                fused_kernel = params_.prepared_store->fusedGateUpKernelForTensors(
-                    w_gate_base, w_up_base, params_.device_id);
-            }
-
-            // No PreparedWeightStore or store miss: direct KernelFactory
-            if (!fused_kernel)
-            {
-                fused_kernel = llaminar::v2::kernels::KernelFactory::getOrCreateFusedGateUpGemm(
-                    w_gate_base, w_up_base, params_.device_id);
-            }
-            cached_kernel_ = fused_kernel;
-        }
+        ITensorFusedGateUpGemm *fused_kernel = resolvePreparedKernel("FusedGateUpGEMMStage");
 
         LOG_DEBUG("[FusedGateUpGEMMStage] Got fused_kernel=" << (void *)fused_kernel);
 
@@ -274,7 +288,7 @@ namespace llaminar2
             return nullptr;
         }
 
-        // Cast to TensorBase for KernelFactory
+        // Validate tensor types before resolving the prepared fused kernel.
         auto *w_gate_base = dynamic_cast<const TensorBase *>(params_.w_gate);
         auto *w_up_base = dynamic_cast<const TensorBase *>(params_.w_up);
         if (!w_gate_base || !w_up_base)
@@ -284,9 +298,7 @@ namespace llaminar2
             return nullptr;
         }
 
-        // Get the fused kernel (cached by KernelFactory) using explicit DeviceId
-        cached_kernel_ = llaminar::v2::kernels::KernelFactory::getOrCreateFusedGateUpGemm(
-            w_gate_base, w_up_base, params_.device_id);
+        cached_kernel_ = resolvePreparedKernel("FusedGateUpGEMMStage::getKernelAsWorkspaceConsumer");
 
         if (!cached_kernel_)
         {

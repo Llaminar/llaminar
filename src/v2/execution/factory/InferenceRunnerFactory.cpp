@@ -1360,6 +1360,10 @@ namespace llaminar2
 
         orchestrator->setWeights(weights);
         LOG_DEBUG("[PPStageRunner] Weights configured for PP stage [" << first_layer << ", " << last_layer << ")");
+
+        // PP runners build the same frozen graph bindings as full runners, so
+        // initialize the model-owned prepared store before graph construction.
+        orchestrator->initializePreparedWeightStore(device);
         return true;
     }
 
@@ -1868,6 +1872,8 @@ namespace llaminar2
         deps.kv_rotation = std::move(kv_rotation);
         if (config.pp_stage_config.has_value())
             deps.pp_stage_config = config.pp_stage_config.value();
+        if (auto concrete_model_ctx = std::dynamic_pointer_cast<ModelContext>(model_ctx))
+            deps.weight_manager = concrete_model_ctx->concreteWeightManager();
         // topology and collective_ctx left as nullptr for single-rank testing
 
         // Create DeviceGraphOrchestrator with injected dependencies
@@ -1935,6 +1941,7 @@ namespace llaminar2
             }
 
             orchestrator->setWeights(weights);
+            orchestrator->initializePreparedWeightStore(device);
         }
         else
         {
@@ -1948,6 +1955,7 @@ namespace llaminar2
             }
 
             orchestrator->setWeights(weights);
+            orchestrator->initializePreparedWeightStore(device);
         }
 
         LOG_INFO("[InferenceRunner] Testable DeviceGraphOrchestrator created successfully");

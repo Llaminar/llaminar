@@ -154,6 +154,7 @@ namespace llaminar2
         explicit MoEExpertComputeStage(Params params);
 
         bool execute(IDeviceContext *ctx) override;
+        bool validatePreparedWeights(std::string *error) const override;
         ComputeStageType type() const override { return ComputeStageType::MOE_EXPERT_FFN; }
         std::string name() const override { return "moe_ffn"; }
         size_t estimatedFlops() const override;
@@ -242,7 +243,7 @@ namespace llaminar2
         /// Used by the weight service for rebalancing operations.
         MoEWeightContext buildWeightContext();
 
-        /// Set the payload provider for lazy GPU expert preparation.
+        /// Set the payload provider for runtime GPU expert arrivals.
         /// The provider is model-context owned and outlives the stage.
         void setPayloadProvider(ExpertWeightPayloadProvider *provider)
         {
@@ -341,6 +342,7 @@ namespace llaminar2
         explicit SharedExpertFFNStage(Params params);
 
         bool execute(IDeviceContext *ctx) override;
+        bool validatePreparedWeights(std::string *error) const override;
         ComputeStageType type() const override { return ComputeStageType::MOE_SHARED_EXPERT_FFN; }
         std::string name() const override { return "shared_expert_ffn"; }
         size_t estimatedFlops() const override;

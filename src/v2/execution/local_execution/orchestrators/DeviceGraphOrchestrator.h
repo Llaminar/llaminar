@@ -67,6 +67,8 @@ namespace llaminar2
     // Forward declarations
     class IMPIContext;
     class IKVCache;
+    class IWeightManager;
+    class IWeightPlacementMap;
     class WeightManager;
     class WeightPlacementMap;
     class TensorParallelConfig;
@@ -387,10 +389,10 @@ namespace llaminar2
             std::shared_ptr<IWeightStreamer> weight_streamer = nullptr;
 
             /// Weight manager for full weights and decode shards
-            std::shared_ptr<WeightManager> weight_manager = nullptr;
+            std::shared_ptr<IWeightManager> weight_manager = nullptr;
 
             /// Weight placement map for decode device selection
-            std::shared_ptr<WeightPlacementMap> weight_placement_map = nullptr;
+            std::shared_ptr<IWeightPlacementMap> weight_placement_map = nullptr;
 
             /// Tensor parallelism configuration (proportional TP splits)
             std::shared_ptr<TensorParallelConfig> tp_config = nullptr;
@@ -816,7 +818,7 @@ namespace llaminar2
          *
          * @param weight_manager Shared pointer to WeightManager
          */
-        void setWeightManager(std::shared_ptr<WeightManager> weight_manager);
+        void setWeightManager(std::shared_ptr<IWeightManager> weight_manager);
 
         /**
          * @brief Retain model context to prevent dangling WeightManager references
@@ -836,7 +838,7 @@ namespace llaminar2
          * @brief Get weight manager
          * @return Shared pointer to WeightManager (may be nullptr)
          */
-        std::shared_ptr<WeightManager> weightManager() const { return weight_manager_; }
+        std::shared_ptr<IWeightManager> weightManager() const { return weight_manager_; }
 
         /**
          * @brief Set weight placement map for decode device selection
@@ -845,13 +847,13 @@ namespace llaminar2
          *
          * @param placement_map Shared pointer to WeightPlacementMap
          */
-        void setWeightPlacementMap(std::shared_ptr<WeightPlacementMap> placement_map);
+        void setWeightPlacementMap(std::shared_ptr<IWeightPlacementMap> placement_map);
 
         /**
          * @brief Get weight placement map
          * @return Shared pointer to WeightPlacementMap (may be nullptr)
          */
-        std::shared_ptr<WeightPlacementMap> weightPlacementMap() const { return weight_placement_map_; }
+        std::shared_ptr<IWeightPlacementMap> weightPlacementMap() const { return weight_placement_map_; }
 
         // =========================================================================
         // Tensor Parallel Configuration (Phase 1c: Proportional TP)
@@ -2039,10 +2041,10 @@ namespace llaminar2
         // =========================================================================
 
         /// Weight manager for full weights and decode shards
-        std::shared_ptr<WeightManager> weight_manager_;
+        std::shared_ptr<IWeightManager> weight_manager_;
 
         /// Weight placement map for decode device selection
-        std::shared_ptr<WeightPlacementMap> weight_placement_map_;
+        std::shared_ptr<IWeightPlacementMap> weight_placement_map_;
 
         /// Current inference phase (PREFILL or DECODE)
         InferencePhase current_phase_ = InferencePhase::PREFILL;

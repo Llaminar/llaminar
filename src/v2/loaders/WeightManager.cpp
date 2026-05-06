@@ -2994,7 +2994,7 @@ namespace llaminar2
         {
             std::string name;
             std::shared_ptr<TensorBase> tensor;
-            const KernelFactory::PreparedGemmHandle *prepared = nullptr;
+            std::shared_ptr<KernelFactory::PreparedGemmHandle> prepared;
             bool preparation_ok = false;
         };
 
@@ -3017,7 +3017,7 @@ namespace llaminar2
 
             try
             {
-                job.prepared = KernelFactory::getOrCreatePreparedGemmWeights(job.tensor.get(), target_device);
+                job.prepared = KernelFactory::prepareGemmHandleLocal(job.tensor.get(), target_device);
                 job.preparation_ok = (job.prepared != nullptr);
             }
             catch (const std::exception &e)
@@ -3038,7 +3038,7 @@ namespace llaminar2
 
             try
             {
-                auto *kernel = KernelFactory::getOrCreateGemmEngine(job.prepared);
+                auto *kernel = KernelFactory::getOrCreateGemmEngine(job.prepared.get());
                 if (!kernel)
                 {
                     return false;

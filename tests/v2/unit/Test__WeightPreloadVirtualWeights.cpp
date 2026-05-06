@@ -250,7 +250,7 @@ TEST_F(Test__WeightPreloadVirtualWeights, PreparedGemmKeyUsesRawDataWhenAvailabl
     // raw_data() should be non-null for a tensor with host data
     ASSERT_NE(tensor->raw_data(), nullptr);
 
-    // Construct a PreparedGemmKey the way getOrCreatePreparedGemmWeights does
+    // Construct a PreparedGemmKey the way prepared GEMM registry lookup does
     const void *key_data = tensor->raw_data();
     const void *key_identity = key_data ? nullptr : static_cast<const void *>(tensor.get());
 

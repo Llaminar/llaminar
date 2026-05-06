@@ -2,10 +2,12 @@
 
 #include "loaders/WeightPlan.h"
 #include "loaders/WeightManager.h"
+#include "models/GraphTypes.h"
 #include "../../mocks/MockModelLoader.h"
 #include "tensors/Tensors.h"
 
 #include <memory>
+#include <utility>
 
 using namespace llaminar2;
 using namespace llaminar2::test;
@@ -15,13 +17,15 @@ namespace
     WeightBinding makeBinding(
         const std::string &name,
         DeviceId device,
-        PreparedWeightKind prepared_kind = PreparedWeightKind::None)
+        PreparedWeightKind prepared_kind = PreparedWeightKind::None,
+        TensorBase *tensor = nullptr)
     {
         WeightBinding binding;
         binding.identity = makeSourceWeightIdentity(name, ModelContextId{7}, 0);
         binding.residency.home_device = device;
         binding.residency.resident_device = device;
         binding.residency.host_policy = WeightHostPolicy::ReleasableAfterPreparation;
+        binding.tensor = tensor;
         if (prepared_kind != PreparedWeightKind::None)
         {
             binding.prepared = PreparedWeightRef{ModelContextId{7}, 0, prepared_kind, device};
@@ -141,6 +145,58 @@ TEST(Test__WeightManagerMaterialize, ProducesFrozenBindingsFromPlan)
     EXPECT_EQ(down.prepared->kind, PreparedWeightKind::CpuPackedGemm);
     EXPECT_NE(down.tensor, nullptr);
     EXPECT_EQ(frozen.optionalLayer(0, "missing.weight"), nullptr);
+}
+
+TEST(Test__ModelWeightBindings, AdaptsFrozenBindingsToLegacyPointers)
+{
+    auto embedding_tensor = std::make_shared<FP32Tensor>(std::vector<size_t>{16, 8});
+    auto gdn_tensor = std::make_shared<FP32Tensor>(std::vector<size_t>{8, 8});
+    auto moe_tensor = std::make_shared<FP32Tensor>(std::vector<size_t>{4, 8, 2});
+
+    InferenceStrategy strategy;
+    strategy.model_id = ModelContextId{7};
+
+    ModelWeightSetBuilder builder(strategy);
+    auto embedding_binding = makeBinding(
+        "token_embd.weight",
+        DeviceId::cpu(),
+        PreparedWeightKind::PreparedEmbedding,
+        embedding_tensor.get());
+    auto gdn_binding = makeBinding(
+        "blk.3.ssm_alpha.weight",
+        DeviceId::cpu(),
+        PreparedWeightKind::CpuPackedGemm,
+        gdn_tensor.get());
+    auto moe_binding = makeBinding(
+        "blk.3.ffn_gate_exps.weight",
+        DeviceId::cpu(),
+        PreparedWeightKind::MoeExpertSlab,
+        moe_tensor.get());
+    embedding_binding.identity.role = WeightRole::Embedding;
+    gdn_binding.identity.role = WeightRole::GDNSsmParam;
+    moe_binding.identity.role = WeightRole::MoEExpertGate;
+    builder.addBinding(std::move(embedding_binding));
+    builder.addBinding(std::move(gdn_binding));
+    builder.addBinding(std::move(moe_binding));
+
+    FrozenModelWeightSet frozen(strategy, builder.freezeBindings());
+    auto bindings = makeModelWeightBindings(frozen);
+    ASSERT_NE(bindings.embedding_table, nullptr);
+    ASSERT_TRUE(bindings.get_layer_weights != nullptr);
+
+    EXPECT_EQ(bindings.embedding_table->identity.role, WeightRole::Embedding);
+    auto layer_bindings = bindings.get_layer_weights(3);
+    ASSERT_NE(layer_bindings.ssm_alpha, nullptr);
+    ASSERT_NE(layer_bindings.moe_gate_exps, nullptr);
+    EXPECT_EQ(layer_bindings.ssm_alpha->identity.role, WeightRole::GDNSsmParam);
+    EXPECT_EQ(layer_bindings.moe_gate_exps->identity.role, WeightRole::MoEExpertGate);
+
+    auto legacy = toLegacyModelWeights(bindings);
+    EXPECT_EQ(legacy.embedding_table, embedding_tensor.get());
+    auto legacy_layer = legacy.get_layer_weights(3);
+    EXPECT_EQ(legacy_layer.ssm_alpha, gdn_tensor.get());
+    EXPECT_EQ(legacy_layer.moe_gate_exps, moe_tensor.get());
+    EXPECT_EQ(legacy.get_layer_weights(4).ssm_alpha, nullptr);
 }
 
 TEST(Test__WeightManagerMaterialize, ThrowsForMissingRequiredWeight)

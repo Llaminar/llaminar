@@ -19,6 +19,7 @@
 #include <random>
 #include <memory>
 #include <numeric>
+#include <optional>
 
 #include "execution/compute_stages/ComputeStages.h"
 #include "execution/local_execution/device/DeviceContext.h"
@@ -27,6 +28,7 @@
 #include "tensors/FP16Utils.h"
 #include "kernels/KernelFactory.h"
 #include "utils/Logger.h"
+#include "../../../../utils/PreparedWeightTestHarness.h"
 
 namespace llaminar2
 {
@@ -120,6 +122,8 @@ namespace llaminar2
             // Create weight tensors
             w_gate_ = create_mock_weights(n_gate_, k_, 100);
             w_up_ = create_mock_weights(n_up_, k_, 200);
+            prepared_gate_up_.emplace(test::makePreparedGateUpFixture(
+                w_gate_.get(), w_up_.get(), DeviceId::cpu(), 0));
 
             // Create output tensors
             output_gate_ = std::make_unique<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(m_), static_cast<size_t>(n_gate_)}, DeviceId::cpu());
@@ -140,6 +144,13 @@ namespace llaminar2
             std::copy(bias_up_data_.begin(), bias_up_data_.end(), bias_up_->mutable_data());
         }
 
+        void attachPreparedRefs(FusedGateUpGEMMStage::Params &params)
+        {
+            params.prepared_ref_gate = prepared_gate_up_->gate_ref;
+            params.prepared_ref_up = prepared_gate_up_->up_ref;
+            params.prepared_store = prepared_gate_up_->store.get();
+        }
+
         void TearDown() override
         {
             // Clear kernel cache to prevent stale pointers
@@ -155,6 +166,7 @@ namespace llaminar2
         // Tensors
         std::unique_ptr<FP32Tensor> input_;
         std::unique_ptr<TensorBase> w_gate_, w_up_;
+        std::optional<test::PreparedGateUpFixture> prepared_gate_up_;
         std::unique_ptr<FP32Tensor> output_gate_, output_up_;
 
         // Bias tensors (FP32Tensor for API compatibility)
@@ -181,6 +193,8 @@ namespace llaminar2
             .output_up = output_up_.get(),
             .n_up = n_up_,
             .bias_up = nullptr};
+
+        attachPreparedRefs(params);
 
         FusedGateUpGEMMStage stage(params);
 
@@ -240,6 +254,8 @@ namespace llaminar2
                 .n_up = n_up_,
                 .bias_up = nullptr};
 
+            attachPreparedRefs(params);
+
             FusedGateUpGEMMStage stage(params);
             ASSERT_TRUE(stage.execute(ctx_.get()));
 
@@ -269,6 +285,8 @@ namespace llaminar2
                 .output_up = output_up_.get(),
                 .n_up = n_up_,
                 .bias_up = bias_up_.get()};
+
+            attachPreparedRefs(params);
 
             FusedGateUpGEMMStage stage(params);
             ASSERT_TRUE(stage.execute(ctx_.get()));
@@ -334,6 +352,8 @@ namespace llaminar2
                 .n_up = n_up_,
                 .bias_up = nullptr};
 
+            attachPreparedRefs(params);
+
             FusedGateUpGEMMStage stage(params);
             ASSERT_TRUE(stage.execute(ctx_.get()));
 
@@ -361,6 +381,8 @@ namespace llaminar2
                 .output_up = output_up_.get(),
                 .n_up = n_up_,
                 .bias_up = nullptr};
+
+            attachPreparedRefs(params);
 
             FusedGateUpGEMMStage stage(params);
             ASSERT_TRUE(stage.execute(ctx_.get()));

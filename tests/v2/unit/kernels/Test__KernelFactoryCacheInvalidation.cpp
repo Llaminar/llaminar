@@ -58,8 +58,11 @@ static std::unique_ptr<IQ4_NLTensor> createTestTensor()
 
 static ITensorGemm *getPreparedKernel(const TensorBase *tensor, DeviceId device = DeviceId::cpu())
 {
-    auto *prepared = KernelFactory::getOrCreatePreparedGemmWeights(tensor, device);
-    return KernelFactory::getOrCreateGemmEngine(prepared);
+    auto kernel = std::make_unique<llaminar2::cpu::native_vnni::CPUNativeVNNIGemmKernel>(tensor);
+    auto *handle = KernelFactory::registerPreparedGemmFromTransfer(tensor, device, std::move(kernel));
+    if (!handle)
+        return nullptr;
+    return KernelFactory::getOrCreateGemmEngine(handle);
 }
 
 // Register a kernel under a GPU device ID using the GPU pipeline API.

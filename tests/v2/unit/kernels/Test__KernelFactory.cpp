@@ -14,6 +14,7 @@
 #include <gtest/gtest.h>
 #include "kernels/KernelFactory.h"
 #include "tensors/Tensors.h"
+#include "tensors/TensorSlice.h"
 #include "backends/ComputeBackend.h"
 
 using namespace llaminar::v2::kernels;
@@ -457,6 +458,32 @@ TEST_F(Test__KernelFactory, CreateGemm_BF16_CPU)
     auto kernel = KernelFactory::createGemm(&tensor, DeviceType::CPU);
 
     ASSERT_NE(kernel, nullptr);
+}
+
+TEST_F(Test__KernelFactory, PrepareGemm_FP32TensorSlice_UsesFloatingPointKind)
+{
+    std::unique_ptr<TensorBase> inner = std::make_unique<FP32Tensor>(std::vector<size_t>{32, 32});
+    SliceMetadata metadata;
+    metadata.mode = SliceMode::FULL;
+    metadata.original_rows = 32;
+    metadata.original_cols = 32;
+    metadata.slice_start = 0;
+    metadata.slice_end = 32;
+
+    TensorSlice slice(std::move(inner), metadata);
+
+    ASSERT_NE(dynamic_cast<const IINT8Unpackable *>(&slice), nullptr)
+        << "TensorSlice inherits IINT8Unpackable even when the inner tensor is FP32";
+    ASSERT_EQ(slice.vnniFormatInfo(), nullptr)
+        << "FP32 TensorSlice must not be treated as VNNI-packable";
+
+    auto prepared = KernelFactory::prepareGemmHandleLocal(&slice, DeviceId::cpu());
+
+    ASSERT_NE(prepared, nullptr);
+    EXPECT_EQ(prepared->kind, KernelFactory::GemmPreparationKind::FLOATING_POINT);
+    ASSERT_NE(prepared->prepared_weights, nullptr);
+    EXPECT_EQ(prepared->prepared_weights->kind, KernelFactory::GemmPreparationKind::FLOATING_POINT);
+    EXPECT_NE(prepared->prepared_weights->kernel, nullptr);
 }
 
 // ============================================================================

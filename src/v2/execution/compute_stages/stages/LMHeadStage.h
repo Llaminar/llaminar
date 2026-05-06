@@ -68,6 +68,7 @@ namespace llaminar2
         explicit LMHeadStage(Params params);
 
         bool execute(IDeviceContext *ctx) override;
+        bool validatePreparedWeights(std::string *error) const override;
         ComputeStageType type() const override { return ComputeStageType::LM_HEAD; }
         size_t estimatedFlops() const override;
         size_t estimatedMemoryBytes() const override;
@@ -96,7 +97,7 @@ namespace llaminar2
         /**
          * @brief Get the GEMM kernel as IWorkspaceConsumer for delegation
          *
-         * Fetches the kernel from KernelFactory (which caches by tensor+device).
+         * Fetches the prepared kernel from PreparedWeightStore.
          * The same kernel is returned on every call for this stage.
          *
          * @return Kernel implementing IWorkspaceConsumer, or nullptr if not available
@@ -105,6 +106,9 @@ namespace llaminar2
 
     private:
         Params params_;
+        ITensorGemm *cached_gemm_ = nullptr;
+
+        ITensorGemm *resolvePreparedKernel(const char *caller);
     };
 
 } // namespace llaminar2

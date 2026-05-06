@@ -78,6 +78,7 @@ namespace llaminar2
         explicit FusedQKVGEMMStage(Params params);
 
         bool execute(IDeviceContext *ctx) override;
+        bool validatePreparedWeights(std::string *error) const override;
         ComputeStageType type() const override { return ComputeStageType::GEMM_FUSED_QKV; }
         size_t estimatedFlops() const override;
         size_t estimatedMemoryBytes() const override;
@@ -93,7 +94,7 @@ namespace llaminar2
         /**
          * @brief Get a GEMM kernel as IWorkspaceConsumer for delegation
          *
-         * Returns the Q projection kernel from KernelFactory. Used for
+         * Returns the Q projection kernel from PreparedWeightStore. Used for
          * single-kernel operations (e.g., hasWorkspace checks).
          *
          * @return Kernel implementing IWorkspaceConsumer, or nullptr if not available
@@ -130,6 +131,8 @@ namespace llaminar2
         ITensorGemm *cached_gemm_k_ = nullptr;
         ITensorGemm *cached_gemm_v_ = nullptr;
         bool cache_resolved_individual_ = false;
+
+        bool resolveIndividualKernels(const char *caller);
     };
 
 } // namespace llaminar2

@@ -79,6 +79,29 @@ static DeviceId getFirstGPU()
     return DeviceId::cpu();
 }
 
+static int getROCmDeviceCountForTest()
+{
+#ifdef HAVE_ROCM
+    if (auto *backend = getROCmBackend())
+        return backend->deviceCount();
+#endif
+    return 0;
+}
+
+static std::vector<DeviceId> firstROCmDevices(int count)
+{
+    std::vector<DeviceId> devices;
+    devices.reserve(static_cast<size_t>(count));
+    for (int ordinal = 0; ordinal < count; ++ordinal)
+    {
+        devices.emplace_back(DeviceType::ROCm, ordinal);
+    }
+    return devices;
+}
+
+static void verifyLayer0ExpertsReadyOnDevices(WeightManager &weight_mgr,
+                                              const std::vector<DeviceId> &devices);
+
 // =============================================================================
 // Test Fixture
 // =============================================================================
@@ -181,6 +204,24 @@ protected:
         };
     }
 
+    void runFinalizeForRocmDevices(int device_count)
+    {
+        const int available = getROCmDeviceCountForTest();
+        if (available < device_count)
+        {
+            GTEST_SKIP() << "Need at least " << device_count << " ROCm GPUs, found " << available;
+        }
+
+        auto devices = firstROCmDevices(device_count);
+        loadLayerWeights(0, 1);
+
+        ASSERT_TRUE(weight_mgr_->finalizeForDevices(devices, /*release_host_data=*/false))
+            << "finalizeForDevices should prepare independent GPU pipelines for "
+            << device_count << " ROCm devices";
+
+        verifyLayer0ExpertsReadyOnDevices(*weight_mgr_, devices);
+    }
+
     DeviceId device_;
     std::shared_ptr<MPIContext> mpi_ctx_;
     std::unique_ptr<TensorFactory> factory_;
@@ -188,9 +229,36 @@ protected:
     std::unique_ptr<WeightManager> weight_mgr_;
 };
 
+static void verifyLayer0ExpertsReadyOnDevices(WeightManager &weight_mgr,
+                                              const std::vector<DeviceId> &devices)
+{
+    const auto &registry = weight_mgr.expertGemmRegistry();
+    for (const auto &device : devices)
+    {
+        EXPECT_TRUE(registry.hasCompleteLayer(device, 0, EXPECTED_NUM_EXPERTS))
+            << "Layer 0 experts should be complete on " << device.to_string();
+        EXPECT_NE(registry.getEngine(device, 0, 0, ExpertGemmRegistry::WeightRole::GATE), nullptr)
+            << "Missing gate expert 0 on " << device.to_string();
+        EXPECT_NE(registry.getEngine(device, 0, 0, ExpertGemmRegistry::WeightRole::UP), nullptr)
+            << "Missing up expert 0 on " << device.to_string();
+        EXPECT_NE(registry.getEngine(device, 0, 0, ExpertGemmRegistry::WeightRole::DOWN), nullptr)
+            << "Missing down expert 0 on " << device.to_string();
+    }
+}
+
 // =============================================================================
 // Test: ExpertGemmRegistry is populated after pipeline
 // =============================================================================
+
+TEST_F(UnifiedGPUPipelineTest, FinalizeForDevicesTwoWayRocmPreparesExpertsOnEachGpu)
+{
+    runFinalizeForRocmDevices(2);
+}
+
+TEST_F(UnifiedGPUPipelineTest, FinalizeForDevicesFourWayRocmPreparesExpertsOnEachGpu)
+{
+    runFinalizeForRocmDevices(4);
+}
 
 TEST_F(UnifiedGPUPipelineTest, RegistryPopulatedForAllExperts)
 {
@@ -261,7 +329,7 @@ TEST_F(UnifiedGPUPipelineTest, DenseAndMoEInSamePipeline)
     ASSERT_NE(shexp_gate, nullptr) << "Shared expert gate weight should exist";
 
     // Dense weights should have a PreparedGemmWeights entry
-    auto *prepared = KernelFactory::getOrCreatePreparedGemmWeights(shexp_gate.get(), device_);
+    auto *prepared = KernelFactory::findPreparedGemmWeights(shexp_gate.get(), device_);
     EXPECT_NE(prepared, nullptr)
         << "Dense ffn_gate_shexp.weight should have been packed by the pipeline";
 
@@ -351,7 +419,7 @@ TEST_F(UnifiedGPUPipelineTest, FALayerAttentionWeightsPacked)
         auto tensor = weight_mgr_->getWeightForDevice(name);
         ASSERT_NE(tensor, nullptr) << "FA weight " << name << " should exist";
 
-        auto *prepared = KernelFactory::getOrCreatePreparedGemmWeights(tensor.get(), device_);
+        auto *prepared = KernelFactory::findPreparedGemmWeights(tensor.get(), device_);
         EXPECT_NE(prepared, nullptr)
             << "FA weight " << name << " should have been packed by the pipeline";
     }

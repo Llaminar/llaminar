@@ -146,6 +146,7 @@ namespace llaminar2
         }
 
         void setWeights(const ModelWeights &weights) override { weights_ = weights; }
+        void setWeightBindings(const ModelWeightBindings &bindings) override { weight_bindings_ = bindings; }
         void setBuffers(const ModelBuffers &buffers) override { buffers_ = buffers; }
 
         /**
@@ -199,7 +200,7 @@ namespace llaminar2
 
         bool isInitialized() const override
         {
-            return weights_.get_layer_weights != nullptr;
+            return weight_bindings_.get_layer_weights != nullptr || weights_.get_layer_weights != nullptr;
         }
 
         // =====================================================================
@@ -273,6 +274,7 @@ namespace llaminar2
         BufferArena *arena_ = nullptr;
         PreparedWeightStore *prepared_weight_store_ = nullptr;
         ModelWeights weights_;
+        ModelWeightBindings weight_bindings_;
         ModelBuffers buffers_;
         StageSnapshotCallback snapshot_callback_;
 
@@ -283,6 +285,19 @@ namespace llaminar2
         TensorContext buildTensorContext() const;
         bool needsTPAllreduce() const;
         bool hasActiveExpertMask(const std::vector<bool> &expert_mask) const;
+        bool hasLayerWeightSource() const;
+        LayerWeightBindings layerWeightBindingsForGraph(int layer_idx) const;
+        LayerWeights layerWeightsForGraph(int layer_idx) const;
+        TensorBase *modelEmbeddingTable() const;
+        TensorBase *modelFinalNorm() const;
+        TensorBase *modelLMHead() const;
+        const WeightBinding *modelEmbeddingBinding() const;
+        const WeightBinding *modelFinalNormBinding() const;
+        const WeightBinding *modelLMHeadBinding() const;
+        std::optional<PreparedWeightRef> preparedRefForGraphWeight(
+            const WeightBinding *binding,
+            const TensorBase *tensor,
+            DeviceId device) const;
 
         std::string describeMissingExpertGemmEngine(
             int num_experts,

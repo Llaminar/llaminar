@@ -38,6 +38,7 @@ RUN MODE=build /tmp/install-scripts/install-system-deps.sh
 # graphics libs for GPU debug, linux-tools for `perf`.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         bc \
+        ripgrep \
         bsdmainutils \
         htop \
         libcurl4-openssl-dev \

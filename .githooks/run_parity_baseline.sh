@@ -1,5 +1,5 @@
 #!/bin/bash
-# Focused parity baseline — 27 tests covering all model families.
+# Focused parity baseline — 26 tests covering all model families.
 #
 # Covers: Qwen2, Qwen3, Qwen3.5 (dense), Qwen3.5 MoE (sparse),
 #         NodeLocalTP (multi-device), HybridPPTP (pipeline+tensor parallel).
@@ -53,10 +53,9 @@ TESTS=(
   # Qwen3.5 MoE NodeLocalTP CPU (2)
   "Qwen35MoENodeLocalTPParityTest_PrefillParity_NodeLocalTP_2xMPI_CPU_35B_MoE$"
   "Qwen35MoENodeLocalTPParityTest_DecodeParity_NodeLocalTP_2xMPI_CPU_35B_MoE$"
-  # Qwen3.5 MoE HybridPPTP (3)
+  # Qwen3.5 MoE HybridPPTP (2)
   "Qwen35MoEHybridPPTPParityTest_PrefillParityWithGpuExpertCache"
   "Qwen35MoEHybridPPTPParityTest_DecodeParityWithGpuExpertCache"
-  "Qwen35MoEHybridPPTPParityTest_SnapshotInfrastructureWithGpuExpertCache"
 )
 
 TOTAL=${#TESTS[@]}

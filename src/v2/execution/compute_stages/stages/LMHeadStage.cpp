@@ -7,7 +7,6 @@
 #include "../../../utils/DebugEnv.h"
 #include "../../../tensors/Tensors.h"
 #include "../../../utils/Logger.h"
-#include "../../../kernels/KernelFactory.h"
 #include "../../../utils/GemmContext.h"
 #include "../../../loaders/PreparedWeightStore.h"
 
@@ -21,6 +20,41 @@ namespace llaminar2
     LMHeadStage::LMHeadStage(Params params)
         : IComputeStage(params.device_id), params_(std::move(params))
     {
+    }
+
+    bool LMHeadStage::validatePreparedWeights(std::string *error) const
+    {
+        if (!params_.lm_head_weight)
+            return true;
+        if (!params_.prepared_store || !params_.prepared_ref.has_value())
+        {
+            if (error) *error = "LMHeadStage requires PreparedWeightStore and PreparedWeightRef";
+            return false;
+        }
+        if (!params_.prepared_store->contains(params_.prepared_ref.value()))
+        {
+            if (error) *error = "LMHeadStage PreparedWeightRef is not present in PreparedWeightStore";
+            return false;
+        }
+        return true;
+    }
+
+    ITensorGemm *LMHeadStage::resolvePreparedKernel(const char *caller)
+    {
+        if (cached_gemm_)
+            return cached_gemm_;
+        if (!params_.prepared_store || !params_.prepared_ref.has_value())
+        {
+            LOG_ERROR("[" << caller << "] PreparedWeightStore and PreparedWeightRef are required for LM head GEMM resolution");
+            return nullptr;
+        }
+
+        cached_gemm_ = params_.prepared_store->gemmKernel(params_.prepared_ref.value());
+        if (!cached_gemm_)
+        {
+            LOG_ERROR("[" << caller << "] PreparedWeightRef was provided but no GEMM kernel was found in PreparedWeightStore");
+        }
+        return cached_gemm_;
     }
 
     bool LMHeadStage::execute(IDeviceContext *ctx)
@@ -66,23 +100,7 @@ namespace llaminar2
                                                                     << " lm_head_weight=" << (void *)lm_head_weight
                                                                     << " shape=" << lm_head_weight->shape()[0] << "x" << lm_head_weight->shape()[1]);
 
-        // Phase 10: Resolve GEMM kernel through PreparedWeightStore.
-        // Order: prepared_ref → tensor-based store lookup → KernelFactory fallback.
-        ITensorGemm *lm_gemm = nullptr;
-        if (params_.prepared_ref.has_value() && params_.prepared_store)
-        {
-            lm_gemm = params_.prepared_store->gemmKernel(params_.prepared_ref.value());
-        }
-        if (!lm_gemm && params_.prepared_store)
-        {
-            lm_gemm = params_.prepared_store->gemmKernelForTensor(lm_head_weight);
-        }
-        if (!lm_gemm)
-        {
-            // Store miss or no store: direct KernelFactory (always available)
-            auto *prepared = llaminar::v2::kernels::KernelFactory::getOrCreatePreparedGemmWeights(lm_head_weight, params_.device_id);
-            lm_gemm = llaminar::v2::kernels::KernelFactory::getOrCreateGemmEngine(prepared);
-        }
+        ITensorGemm *lm_gemm = resolvePreparedKernel("LMHeadStage");
         LOG_DEBUG("[LMHeadStage] Got kernel=" << (void *)lm_gemm);
         if (!lm_gemm)
         {
@@ -247,11 +265,7 @@ namespace llaminar2
             return nullptr;
         }
 
-        auto *prepared = llaminar::v2::kernels::KernelFactory::getOrCreatePreparedGemmWeights(lm_head_weight, params_.device_id);
-        ITensorGemm *lm_gemm = llaminar::v2::kernels::KernelFactory::getOrCreateGemmEngine(prepared);
-
-        // Note: getKernelAsWorkspaceConsumer() is called at graph setup time,
-        // so we always use KernelFactory here (PreparedWeightStore may not exist yet).
+        ITensorGemm *lm_gemm = resolvePreparedKernel("LMHeadStage::getKernelAsWorkspaceConsumer");
         if (!lm_gemm)
         {
             LOG_DEBUG("[LMHeadStage::getKernelAsWorkspaceConsumer] No GEMM kernel available");

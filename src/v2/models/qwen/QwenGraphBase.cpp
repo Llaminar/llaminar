@@ -19,6 +19,7 @@
 #include "../../utils/MPIStrategy.h"
 #include "../../execution/local_execution/graph/GraphBuildUtils.h"
 #include "../../execution/config/RuntimeConfig.h"
+#include "../../loaders/PreparedWeightStore.h"
 #include "../../collective/ILocalTPContext.h"
 #include "../../collective/ITPContext.h"
 #include "../../collective/ILocalPPContext.h"
@@ -117,6 +118,78 @@ namespace llaminar2
         {
             LOG_DEBUG("[QwenGraphBase] setModelContext ignored non-ModelContext instance");
         }
+    }
+
+    bool QwenGraphBase::hasLayerWeightSource() const
+    {
+        return weight_bindings_.get_layer_weights != nullptr || weights_.get_layer_weights != nullptr;
+    }
+
+    LayerWeightBindings QwenGraphBase::layerWeightBindingsForGraph(int layer_idx) const
+    {
+        if (weight_bindings_.get_layer_weights)
+            return weight_bindings_.get_layer_weights(layer_idx);
+        return {};
+    }
+
+    LayerWeights QwenGraphBase::layerWeightsForGraph(int layer_idx) const
+    {
+        if (weight_bindings_.get_layer_weights)
+            return toLegacyLayerWeights(weight_bindings_.get_layer_weights(layer_idx));
+        if (weights_.get_layer_weights)
+            return weights_.get_layer_weights(layer_idx);
+        return {};
+    }
+
+    TensorBase *QwenGraphBase::modelEmbeddingTable() const
+    {
+        TensorBase *bound = legacyTensor(weight_bindings_.embedding_table);
+        return bound ? bound : weights_.embedding_table;
+    }
+
+    TensorBase *QwenGraphBase::modelFinalNorm() const
+    {
+        TensorBase *bound = legacyTensor(weight_bindings_.final_norm);
+        return bound ? bound : weights_.final_norm;
+    }
+
+    TensorBase *QwenGraphBase::modelLMHead() const
+    {
+        TensorBase *bound = legacyTensor(weight_bindings_.lm_head);
+        return bound ? bound : weights_.lm_head;
+    }
+
+    const WeightBinding *QwenGraphBase::modelEmbeddingBinding() const
+    {
+        return weight_bindings_.embedding_table;
+    }
+
+    const WeightBinding *QwenGraphBase::modelFinalNormBinding() const
+    {
+        return weight_bindings_.final_norm;
+    }
+
+    const WeightBinding *QwenGraphBase::modelLMHeadBinding() const
+    {
+        return weight_bindings_.lm_head;
+    }
+
+    std::optional<PreparedWeightRef> QwenGraphBase::preparedRefForGraphWeight(
+        const WeightBinding *binding,
+        const TensorBase *tensor,
+        DeviceId device) const
+    {
+        if (binding && binding->prepared.has_value() && binding->prepared->device == device)
+            return binding->prepared;
+        if (binding && prepared_weight_store_)
+        {
+            auto ref = prepared_weight_store_->preparedRefForBinding(binding->binding_id, device);
+            if (ref.has_value())
+                return ref;
+        }
+        if (prepared_weight_store_)
+            return prepared_weight_store_->preparedRefForTensor(tensor, device);
+        return std::nullopt;
     }
 
     bool QwenGraphBase::hasActiveExpertMask(const std::vector<bool> &expert_mask) const
@@ -287,13 +360,13 @@ namespace llaminar2
         }
 
         // Get layer weights
-        if (!weights_.get_layer_weights)
+        if (!hasLayerWeightSource())
         {
             LOG_ERROR("[QwenGraphBase::buildLayerGraph] Layer weight accessor not set");
             return ComputeGraph{};
         }
 
-        LayerWeights layer_weights = weights_.get_layer_weights(ctx.layer_idx);
+        LayerWeights layer_weights = layerWeightsForGraph(ctx.layer_idx);
 
         // Build attention graph
         ComputeGraph attn_graph = buildAttentionGraph(
@@ -325,7 +398,7 @@ namespace llaminar2
                   << "batch_size=" << input.batch_size
                   << ", seq_len=" << input.seq_len);
 
-        if (!weights_.embedding_table || !weights_.final_norm || !weights_.lm_head)
+        if (!modelEmbeddingTable() || !modelFinalNorm() || !modelLMHead())
         {
             LOG_ERROR("[QwenGraphBase] Weights not set! Call setWeights() first.");
             throw std::runtime_error("QwenStandardGraph weights not initialized");
@@ -352,17 +425,19 @@ namespace llaminar2
                                        : buffers_.current_hidden;
 
         EmbeddingStage::Params embed_params;
-        embed_params.embed_table = weights_.embedding_table;
+        embed_params.embed_table = modelEmbeddingTable();
         embed_params.token_ids = input.token_ids;
         embed_params.output = embed_output;
         embed_params.num_tokens = total_tokens;
         embed_params.d_model = config_.d_model;
         embed_params.vocab_size = config_.vocab_size;
         embed_params.vocab_offset = embeddingVocabOffsetForDevice(config_, config_.default_device);
-        embed_params.local_vocab_size = weights_.embedding_table ? static_cast<int>(weights_.embedding_table->rows()) : 0;
+        embed_params.local_vocab_size = modelEmbeddingTable() ? static_cast<int>(modelEmbeddingTable()->rows()) : 0;
         embed_params.device_id = config_.default_device;
         embed_params.output_buffer_id = BufferId::HIDDEN_STATE;
         embed_params.mpi_ctx = mpi_ctx_.get();
+        embed_params.prepared_ref = preparedRefForGraphWeight(modelEmbeddingBinding(), modelEmbeddingTable(), config_.default_device);
+        embed_params.prepared_store = prepared_weight_store_;
 
         graph.addNode("embedding",
                       ComputeStageFactory::createEmbedding(embed_params),
@@ -375,8 +450,8 @@ namespace llaminar2
         // vocab_size/tp_degree rows. Tokens outside the local range produce zeros.
         // AllReduce(sum) combines the partial results.
         const bool embedding_is_sharded =
-            weights_.embedding_table &&
-            static_cast<int>(weights_.embedding_table->rows()) < config_.vocab_size;
+            modelEmbeddingTable() &&
+            static_cast<int>(modelEmbeddingTable()->rows()) < config_.vocab_size;
         if (embedding_is_sharded && needsTPAllreduce())
         {
             size_t allreduce_count = static_cast<size_t>(total_tokens) * config_.d_model;
@@ -410,7 +485,7 @@ namespace llaminar2
         }
 
         // Check if we have layer weight accessor
-        if (!weights_.get_layer_weights)
+        if (!hasLayerWeightSource())
         {
             LOG_ERROR("[QwenGraphBase] Layer weight accessor not set!");
             throw std::runtime_error("QwenStandardGraph layer weight accessor not initialized");
@@ -420,7 +495,7 @@ namespace llaminar2
         for (int layer = 0; layer < config_.n_layers; ++layer)
         {
             // Get layer weights
-            LayerWeights layer_weights = weights_.get_layer_weights(layer);
+            LayerWeights layer_weights = layerWeightsForGraph(layer);
 
             // Build attention graph for this layer
             // Pass sequence_lengths for proper batch-aware attention masking
@@ -491,7 +566,8 @@ namespace llaminar2
         LMHeadStage::Params lm_params;
         // Feed LM head from the final RMSNorm output (FP32).
         lm_params.hidden_states = buffers_.layer_buffers.normalized;
-        lm_params.lm_head_weight = weights_.lm_head;
+        lm_params.lm_head_weight = modelLMHead();
+        lm_params.prepared_ref = preparedRefForGraphWeight(modelLMHeadBinding(), modelLMHead(), device);
         lm_params.logits = lm_head_output;
         lm_params.seq_len = total_tokens;
         lm_params.d_model = config_.d_model;
@@ -571,17 +647,17 @@ namespace llaminar2
         }
 
         // Validate required weights based on configuration
-        if (has_embedding && !weights_.embedding_table)
+        if (has_embedding && !modelEmbeddingTable())
         {
             LOG_ERROR("[QwenGraphBase] Embedding weights required but not set");
             throw std::runtime_error("QwenStandardGraph embedding weights not initialized");
         }
-        if (has_lm_head && (!weights_.final_norm || !weights_.lm_head))
+        if (has_lm_head && (!modelFinalNorm() || !modelLMHead()))
         {
             LOG_ERROR("[QwenGraphBase] LM head weights required but not set");
             throw std::runtime_error("QwenStandardGraph LM head weights not initialized");
         }
-        if (!weights_.get_layer_weights)
+        if (!hasLayerWeightSource())
         {
             LOG_ERROR("[QwenGraphBase] Layer weight accessor not set");
             throw std::runtime_error("QwenStandardGraph layer weight accessor not initialized");
@@ -617,17 +693,19 @@ namespace llaminar2
                                            : buffers_.current_hidden;
 
             EmbeddingStage::Params embed_params;
-            embed_params.embed_table = weights_.embedding_table;
+            embed_params.embed_table = modelEmbeddingTable();
             embed_params.token_ids = input.token_ids;
             embed_params.output = embed_output;
             embed_params.num_tokens = total_tokens;
             embed_params.d_model = config_.d_model;
             embed_params.vocab_size = config_.vocab_size;
             embed_params.vocab_offset = embeddingVocabOffsetForDevice(config_, config_.default_device);
-            embed_params.local_vocab_size = weights_.embedding_table ? static_cast<int>(weights_.embedding_table->rows()) : 0;
+            embed_params.local_vocab_size = modelEmbeddingTable() ? static_cast<int>(modelEmbeddingTable()->rows()) : 0;
             embed_params.device_id = config_.default_device;
             embed_params.output_buffer_id = BufferId::HIDDEN_STATE;
             embed_params.mpi_ctx = mpi_ctx_.get();
+            embed_params.prepared_ref = preparedRefForGraphWeight(modelEmbeddingBinding(), modelEmbeddingTable(), config_.default_device);
+            embed_params.prepared_store = prepared_weight_store_;
 
             graph.addNode("embedding",
                           ComputeStageFactory::createEmbedding(embed_params),
@@ -639,8 +717,8 @@ namespace llaminar2
             // vocab_size/tp_degree rows. Tokens outside the local range produce zeros.
             // AllReduce(sum) combines the partial results.
             const bool embedding_is_sharded =
-                weights_.embedding_table &&
-                static_cast<int>(weights_.embedding_table->rows()) < config_.vocab_size;
+                modelEmbeddingTable() &&
+                static_cast<int>(modelEmbeddingTable()->rows()) < config_.vocab_size;
             if (embedding_is_sharded && needsTPAllreduce())
             {
                 size_t allreduce_count = static_cast<size_t>(total_tokens) * config_.d_model;
@@ -743,7 +821,7 @@ namespace llaminar2
         for (int layer = first_layer; layer < last_layer; ++layer)
         {
             // Get layer weights
-            LayerWeights layer_weights = weights_.get_layer_weights(layer);
+            LayerWeights layer_weights = layerWeightsForGraph(layer);
 
             // Build attention graph for this layer
             ComputeGraph attn_graph = buildAttentionGraph(
@@ -814,7 +892,8 @@ namespace llaminar2
 
             LMHeadStage::Params lm_params;
             lm_params.hidden_states = buffers_.layer_buffers.normalized;
-            lm_params.lm_head_weight = weights_.lm_head;
+            lm_params.lm_head_weight = modelLMHead();
+            lm_params.prepared_ref = preparedRefForGraphWeight(modelLMHeadBinding(), modelLMHead(), device);
             lm_params.logits = lm_head_output;
             lm_params.seq_len = total_tokens;
             lm_params.d_model = config_.d_model;
@@ -902,7 +981,7 @@ namespace llaminar2
                   << ", seq_len=" << input.seq_len);
 
         // Validate weights
-        if (!weights_.get_layer_weights)
+        if (!hasLayerWeightSource())
         {
             LOG_ERROR("[QwenGraphBase] Layer weight accessor not set");
             throw std::runtime_error("QwenStandardGraph layer weight accessor not initialized");
@@ -966,7 +1045,7 @@ namespace llaminar2
             // -----------------------------------------------------------------
             if (pp_stage.has_embedding)
             {
-                if (!weights_.embedding_table)
+                if (!modelEmbeddingTable())
                 {
                     LOG_ERROR("[QwenGraphBase] Embedding weights required but not set");
                     throw std::runtime_error("Embedding weights not initialized for unified PP graph");
@@ -980,16 +1059,18 @@ namespace llaminar2
                                                : buffers_.current_hidden;
 
                 EmbeddingStage::Params embed_params;
-                embed_params.embed_table = weights_.embedding_table;
+                embed_params.embed_table = modelEmbeddingTable();
                 embed_params.token_ids = input.token_ids;
                 embed_params.output = embed_output;
                 embed_params.num_tokens = total_tokens;
                 embed_params.d_model = config_.d_model;
                 embed_params.vocab_size = config_.vocab_size;
                 embed_params.vocab_offset = embeddingVocabOffsetForDevice(config_, stage_device);
-                embed_params.local_vocab_size = weights_.embedding_table ? static_cast<int>(weights_.embedding_table->rows()) : 0;
+                embed_params.local_vocab_size = modelEmbeddingTable() ? static_cast<int>(modelEmbeddingTable()->rows()) : 0;
                 embed_params.device_id = stage_device;
                 embed_params.mpi_ctx = mpi_ctx_.get();
+                embed_params.prepared_ref = preparedRefForGraphWeight(modelEmbeddingBinding(), modelEmbeddingTable(), stage_device);
+                embed_params.prepared_store = prepared_weight_store_;
 
                 graph.addNode("embedding",
                               ComputeStageFactory::createEmbedding(embed_params),
@@ -1025,7 +1106,7 @@ namespace llaminar2
             for (int layer = pp_stage.first_layer; layer < pp_stage.last_layer; ++layer)
             {
                 // Get layer weights
-                LayerWeights layer_weights = weights_.get_layer_weights(layer);
+                LayerWeights layer_weights = layerWeightsForGraph(layer);
 
                 // Get KV cache for this stage's device (PP-aware)
                 IKVCache *layer_kv_cache = input.getKVCacheForDevice(stage_device);
@@ -1128,7 +1209,7 @@ namespace llaminar2
             // -----------------------------------------------------------------
             if (pp_stage.has_lm_head)
             {
-                if (!weights_.final_norm || !weights_.lm_head)
+                if (!modelFinalNorm() || !modelLMHead())
                 {
                     LOG_ERROR("[QwenGraphBase] LM head weights required but not set");
                     throw std::runtime_error("LM head weights not initialized for unified PP graph");
@@ -1153,7 +1234,8 @@ namespace llaminar2
 
                 LMHeadStage::Params lm_params;
                 lm_params.hidden_states = buffers_.layer_buffers.normalized;
-                lm_params.lm_head_weight = weights_.lm_head;
+                lm_params.lm_head_weight = modelLMHead();
+                lm_params.prepared_ref = preparedRefForGraphWeight(modelLMHeadBinding(), modelLMHead(), stage_device);
                 lm_params.logits = lm_head_output;
                 lm_params.seq_len = total_tokens;
                 lm_params.d_model = config_.d_model;
@@ -1276,15 +1358,17 @@ namespace llaminar2
         ComputeGraph graph;
 
         EmbeddingStage::Params params;
-        params.embed_table = weights_.embedding_table;
+        params.embed_table = modelEmbeddingTable();
         params.token_ids = input.token_ids;
         params.output = output_hidden;
         params.num_tokens = input.batch_size * input.seq_len;
         params.d_model = config_.d_model;
         params.vocab_size = config_.vocab_size;
         params.vocab_offset = embeddingVocabOffsetForDevice(config_, config_.default_device);
-        params.local_vocab_size = weights_.embedding_table ? static_cast<int>(weights_.embedding_table->rows()) : 0;
+        params.local_vocab_size = modelEmbeddingTable() ? static_cast<int>(modelEmbeddingTable()->rows()) : 0;
         params.device_id = config_.default_device;
+        params.prepared_ref = preparedRefForGraphWeight(modelEmbeddingBinding(), modelEmbeddingTable(), config_.default_device);
+        params.prepared_store = prepared_weight_store_;
 
         graph.addNode("embedding",
                       ComputeStageFactory::createEmbedding(params),
@@ -1356,7 +1440,7 @@ namespace llaminar2
         RMSNormStage::Params norm_params;
         norm_params.input = hidden_states;
         norm_params.output = hidden_states; // In-place norm
-        norm_params.gamma = weights_.final_norm;
+        norm_params.gamma = modelFinalNorm();
         norm_params.eps = config_.rms_norm_eps;
         norm_params.seq_len = total_tokens;
         norm_params.device_id = device;
@@ -1387,7 +1471,8 @@ namespace llaminar2
         // LM Head projection
         LMHeadStage::Params lm_params;
         lm_params.hidden_states = hidden_states;
-        lm_params.lm_head_weight = weights_.lm_head;
+        lm_params.lm_head_weight = modelLMHead();
+        lm_params.prepared_ref = preparedRefForGraphWeight(modelLMHeadBinding(), modelLMHead(), device);
         lm_params.logits = lm_head_output;
         lm_params.seq_len = total_tokens;
         lm_params.d_model = config_.d_model;
@@ -1447,6 +1532,7 @@ namespace llaminar2
 
         // Compute total tokens for GEMM m parameter
         int total_tokens = batch_size * seq_len;
+        LayerWeightBindings layer_bindings = layerWeightBindingsForGraph(layer_idx);
 
         // Stage 1: Pre-FFN RMSNorm (fused with attention residual add)
         // Combines the attention output residual add with FFN normalization.
@@ -1486,9 +1572,11 @@ namespace llaminar2
             gate_up_params.m = total_tokens; // Use total_tokens = batch_size * seq_len
             gate_up_params.k = k;
             gate_up_params.w_gate = layer.gate_proj;
+            gate_up_params.prepared_ref_gate = preparedRefForGraphWeight(layer_bindings.gate_proj, layer.gate_proj, device);
             gate_up_params.output_gate = buffers.gate;
             gate_up_params.n_gate = gate_n;
             gate_up_params.w_up = layer.up_proj;
+            gate_up_params.prepared_ref_up = preparedRefForGraphWeight(layer_bindings.up_proj, layer.up_proj, device);
             gate_up_params.output_up = buffers.up;
             gate_up_params.n_up = up_n;
             gate_up_params.mpi_ctx = mpi_ctx_.get();
@@ -1532,6 +1620,7 @@ namespace llaminar2
                 .gemm_context = GemmContext::FFN,
                 .a_buffer_id = BufferId::UP_PROJ,
                 .c_buffer_id = BufferId::ATTN_PROJ,
+                .prepared_ref = preparedRefForGraphWeight(layer_bindings.down_proj, layer.down_proj, device),
                 .prepared_store = prepared_weight_store_};
 
             // SwiGLU fusion: pass gate buffer to GEMM for fused silu(gate)*up + GEMM
@@ -1656,17 +1745,20 @@ namespace llaminar2
         tensors.buffers["logits_local"] = buffers_.logits_local;
 
         // Model-level weights
-        tensors.model_weights["embedding_table"] = weights_.embedding_table;
-        tensors.model_weights["final_norm"] = weights_.final_norm;
-        tensors.model_weights["lm_head"] = weights_.lm_head;
+        tensors.model_weights["embedding_table"] = modelEmbeddingTable();
+        tensors.model_weights["final_norm"] = modelFinalNorm();
+        tensors.model_weights["lm_head"] = modelLMHead();
+        tensors.model_weight_bindings["embedding_table"] = modelEmbeddingBinding();
+        tensors.model_weight_bindings["final_norm"] = modelFinalNormBinding();
+        tensors.model_weight_bindings["lm_head"] = modelLMHeadBinding();
 
         // Layer weight accessor
         tensors.get_layer_weight = [this](int layer_idx, const std::string &name) -> TensorBase *
         {
-            if (!weights_.get_layer_weights)
+            if (!hasLayerWeightSource())
                 return nullptr;
 
-            LayerWeights layer = weights_.get_layer_weights(layer_idx);
+            LayerWeights layer = layerWeightsForGraph(layer_idx);
 
             if (name == "wq")
                 return layer.wq;
@@ -1684,6 +1776,28 @@ namespace llaminar2
                 return layer.k_bias;
             if (name == "v_bias")
                 return layer.v_bias;
+            if (name == "q_norm")
+                return layer.q_norm;
+            if (name == "k_norm")
+                return layer.k_norm;
+            if (name == "attn_qkv")
+                return layer.attn_qkv;
+            if (name == "attn_gate")
+                return layer.attn_gate;
+            if (name == "ssm_alpha")
+                return layer.ssm_alpha;
+            if (name == "ssm_beta")
+                return layer.ssm_beta;
+            if (name == "ssm_conv1d")
+                return layer.ssm_conv1d;
+            if (name == "ssm_dt_bias")
+                return layer.ssm_dt_bias;
+            if (name == "ssm_a")
+                return layer.ssm_a;
+            if (name == "ssm_norm")
+                return layer.ssm_norm;
+            if (name == "ssm_out")
+                return layer.ssm_out;
             if (name == "gate_proj")
                 return layer.gate_proj;
             if (name == "up_proj")
@@ -1692,8 +1806,92 @@ namespace llaminar2
                 return layer.down_proj;
             if (name == "ffn_norm")
                 return layer.ffn_norm;
+            if (name == "moe_gate")
+                return layer.moe_gate;
+            if (name == "moe_gate_exps")
+                return layer.moe_gate_exps;
+            if (name == "moe_up_exps")
+                return layer.moe_up_exps;
+            if (name == "moe_down_exps")
+                return layer.moe_down_exps;
+            if (name == "shared_expert_gate")
+                return layer.shared_expert_gate;
+            if (name == "shared_expert_up")
+                return layer.shared_expert_up;
+            if (name == "shared_expert_down")
+                return layer.shared_expert_down;
+            if (name == "shared_expert_gate_inp")
+                return layer.shared_expert_gate_inp;
 
             LOG_WARN("[TensorContext] Unknown layer weight: " << name);
+            return nullptr;
+        };
+        tensors.get_layer_weight_binding = [this](int layer_idx, const std::string &name) -> const WeightBinding *
+        {
+            LayerWeightBindings layer = layerWeightBindingsForGraph(layer_idx);
+
+            if (name == "wq")
+                return layer.wq;
+            if (name == "wk")
+                return layer.wk;
+            if (name == "wv")
+                return layer.wv;
+            if (name == "wo")
+                return layer.wo;
+            if (name == "attn_norm")
+                return layer.attn_norm;
+            if (name == "q_bias")
+                return layer.q_bias;
+            if (name == "k_bias")
+                return layer.k_bias;
+            if (name == "v_bias")
+                return layer.v_bias;
+            if (name == "q_norm")
+                return layer.q_norm;
+            if (name == "k_norm")
+                return layer.k_norm;
+            if (name == "attn_qkv")
+                return layer.attn_qkv;
+            if (name == "attn_gate")
+                return layer.attn_gate;
+            if (name == "ssm_alpha")
+                return layer.ssm_alpha;
+            if (name == "ssm_beta")
+                return layer.ssm_beta;
+            if (name == "ssm_conv1d")
+                return layer.ssm_conv1d;
+            if (name == "ssm_dt_bias")
+                return layer.ssm_dt_bias;
+            if (name == "ssm_a")
+                return layer.ssm_a;
+            if (name == "ssm_norm")
+                return layer.ssm_norm;
+            if (name == "ssm_out")
+                return layer.ssm_out;
+            if (name == "gate_proj")
+                return layer.gate_proj;
+            if (name == "up_proj")
+                return layer.up_proj;
+            if (name == "down_proj")
+                return layer.down_proj;
+            if (name == "ffn_norm")
+                return layer.ffn_norm;
+            if (name == "moe_gate")
+                return layer.moe_gate;
+            if (name == "moe_gate_exps")
+                return layer.moe_gate_exps;
+            if (name == "moe_up_exps")
+                return layer.moe_up_exps;
+            if (name == "moe_down_exps")
+                return layer.moe_down_exps;
+            if (name == "shared_expert_gate")
+                return layer.shared_expert_gate;
+            if (name == "shared_expert_up")
+                return layer.shared_expert_up;
+            if (name == "shared_expert_down")
+                return layer.shared_expert_down;
+            if (name == "shared_expert_gate_inp")
+                return layer.shared_expert_gate_inp;
             return nullptr;
         };
 
@@ -1784,7 +1982,7 @@ namespace llaminar2
         RMSNormStage::Params norm_params;
         norm_params.input = hidden;
         norm_params.output = normalized_out;
-        norm_params.gamma = weights_.final_norm;
+        norm_params.gamma = modelFinalNorm();
         norm_params.eps = config_.rms_norm_eps;
         norm_params.seq_len = n_tokens;
         norm_params.device_id = device;
@@ -2245,6 +2443,7 @@ namespace llaminar2
                           .gemm_context = GemmContext::ATTN,
                           .a_buffer_id = BufferId::ATTN_OUTPUT,
                           .c_buffer_id = BufferId::ATTN_PROJ,
+                          .prepared_ref = preparedRefForGraphWeight(nullptr, wo_weight, device),
                           .prepared_store = prepared_weight_store_,
                       }),
                       device);

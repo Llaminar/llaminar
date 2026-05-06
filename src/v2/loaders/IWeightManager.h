@@ -47,6 +47,7 @@ namespace llaminar2
     // Forward declarations
     class TensorBase;
     class TensorParallelConfig;
+    class ExpertWeightPayloadProvider;
 
     /**
      * @brief Interface for managing model weights with distribution strategies
@@ -350,6 +351,36 @@ namespace llaminar2
         virtual size_t getPreparedEmbeddingCount() const { return 0; }
 
         virtual std::pair<size_t, size_t> preloadStats() const { return {0, 0}; }
+
+        // =========================================================================
+        // MoE Expert Support (default no-ops)
+        // =========================================================================
+
+        /**
+         * @brief Advise the OS to reclaim mmap physical pages
+         *
+         * Safe to call after all GEMM engines have packed their weight data.
+         *
+         * @return Total bytes advised
+         */
+        virtual size_t adviseMmapDontneed() { return 0; }
+
+        /**
+         * @brief Set expert weight payload provider for metadata-based host retention
+         *
+         * @param provider Model-context owned payload provider (may be nullptr)
+         */
+        virtual void setExpertPayloadProvider(ExpertWeightPayloadProvider * /*provider*/) {}
+
+        /**
+         * @brief Iterate ALL prepared tensors (cache_ + per_device_cache_)
+         *
+         * For PreparedWeightStore population: iterates both the primary cache
+         * and per-device cache (which holds TP-sliced tensors).
+         *
+         * @param visitor Callback receiving (canonical_name, raw_tensor_ptr)
+         */
+        virtual void forEachPreparedWeight(std::function<void(const std::string &, TensorBase *)> /*visitor*/) const {}
     };
 
 } // namespace llaminar2

@@ -30,7 +30,7 @@ namespace llaminar2
      *
      * **Tensor Parallelism Support (Phase 2)**:
      * When `output_range` is set, executes a row-sliced GEMM for tensor parallelism:
-     * - Uses `KernelFactory::getOrCreateGemmSliced()` to create sliced kernel
+      * - Uses `PreparedWeightStore::slicedGemmKernel()` to resolve a prepared slice
      * - Only computes output rows in [output_range.start, output_range.end)
      * - Caller is responsible for MPI AllReduce after execution if needed
      *
@@ -124,8 +124,7 @@ namespace llaminar2
             /**
              * @brief Prepared weight reference for this GEMM's weight tensor.
              * When set (together with prepared_store), the stage resolves its
-             * kernel via PreparedWeightStore::gemmKernel() instead of
-             * KernelFactory::getOrCreatePreparedGemmWeights().
+             * kernel via PreparedWeightStore::gemmKernel() or slicedGemmKernel().
              */
             std::optional<PreparedWeightRef> prepared_ref;
 
@@ -139,6 +138,7 @@ namespace llaminar2
         explicit GEMMStage(Params params);
 
         bool execute(IDeviceContext *ctx) override;
+        bool validatePreparedWeights(std::string *error) const override;
         ComputeStageType type() const override { return ComputeStageType::GEMM; }
         size_t estimatedFlops() const override;
         size_t estimatedMemoryBytes() const override;
@@ -159,8 +159,8 @@ namespace llaminar2
         /**
          * @brief Get the GEMM kernel as IWorkspaceConsumer for delegation
          *
-         * Fetches the kernel from KernelFactory (which caches by tensor+device).
-         * The same kernel is returned on every call for this stage.
+         * Fetches the prepared kernel from PreparedWeightStore. The same kernel
+         * is returned on every call for this stage.
          *
          * @return Kernel implementing IWorkspaceConsumer, or nullptr if not available
          */
@@ -174,7 +174,6 @@ namespace llaminar2
         // The KernelFactory owns the lifetime of these objects (they're in
         // registry maps), so raw pointers are safe here.
         ITensorGemm *cached_gemm_ = nullptr;
-        const void *cached_prepared_ = nullptr; // PreparedGemmHandle*
         bool cache_resolved_ = false;
     };
 
