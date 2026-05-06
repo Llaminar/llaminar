@@ -3051,8 +3051,6 @@ namespace llaminar
             std::unordered_map<DeviceKernelKey, std::shared_ptr<void>, DeviceKernelKeyHash> KernelFactory::device_kernel_registry_;
             std::unordered_map<KernelFactory::PreparedGemmKey, std::shared_ptr<KernelFactory::PreparedGemmHandle>, KernelFactory::PreparedGemmKeyHash> KernelFactory::prepared_gemm_registry_;
             std::unordered_map<DeviceKernelKey, std::shared_ptr<KernelFactory::IGemmEngine>, DeviceKernelKeyHash> KernelFactory::device_gemm_engine_registry_;
-            std::unordered_map<KernelFactory::PreparedEmbeddingKey, std::shared_ptr<llaminar2::PreparedEmbeddingHandle>, KernelFactory::PreparedEmbeddingKeyHash> KernelFactory::prepared_embedding_registry_;
-
             // NOTE: Device-level kernel caching (hipBLAS, cuBLAS handles, etc.)
             // has moved to DeviceKernelCache. See kernels/DeviceKernelCache.h
 
@@ -3164,18 +3162,6 @@ namespace llaminar
                     }
                 }
 
-                // Remove prepared embedding registry entries for this tensor
-                for (auto it = prepared_embedding_registry_.begin(); it != prepared_embedding_registry_.end();)
-                {
-                    if (it->first.tensor == tensor)
-                    {
-                        it = prepared_embedding_registry_.erase(it);
-                    }
-                    else
-                    {
-                        ++it;
-                    }
-                }
             }
 
             void KernelFactory::clearCache()
@@ -3235,8 +3221,6 @@ namespace llaminar
                 device_kernel_registry_.clear();
                 prepared_gemm_registry_.clear();
                 device_gemm_engine_registry_.clear();
-                prepared_embedding_registry_.clear();
-
 #ifdef HAVE_CUDA
                 // Clear CUDA GEMV static caches (row-major weight transpose, sweep
                 // state) to prevent cross-test contamination.
@@ -3908,99 +3892,6 @@ namespace llaminar
             // Prepared Embedding Weights
             // ==========================================================================
 
-            const llaminar2::PreparedEmbeddingHandle *KernelFactory::getOrCreatePreparedEmbeddingWeights(
-                const llaminar2::TensorBase *tensor,
-                int d_model,
-                llaminar2::DeviceId target_device,
-                size_t vocab_offset,
-                size_t total_vocab)
-            {
-                if (!tensor)
-                    throw std::runtime_error("getOrCreatePreparedEmbeddingWeights: null tensor");
-
-                // Only tensors with native VNNI format metadata need EmbedQ8 repack.
-                if (!isVnniPackableTensor(tensor))
-                    return nullptr; // FP32 embedding tables are used directly, no prep needed
-
-                const PreparedEmbeddingKey key{tensor, target_device};
-
-                // Cache lookup
-                {
-                    std::lock_guard<std::mutex> lock(cache_mutex_);
-                    auto it = prepared_embedding_registry_.find(key);
-                    if (it != prepared_embedding_registry_.end())
-                        return it->second.get();
-                }
-
-                // Resolve vocab metadata
-                const size_t shard_rows = tensor->rows();
-                const size_t effective_total = (total_vocab > 0) ? total_vocab : shard_rows;
-                const bool is_sharded = (shard_rows < effective_total);
-
-                // CPU-side repack: Q8_0/Q4_0/etc. → EmbedQ8Block array
-                // The tensor is already sliced to the correct rows— repack all of them
-                auto repacked = llaminar2::repackEmbeddingToQ8(tensor, d_model);
-
-                // Allocate GPU memory and upload
-                auto weights = std::make_shared<llaminar2::PreparedEmbeddingWeights>();
-                weights->byte_size = repacked.byte_size;
-                weights->blocks_per_row = repacked.blocks_per_row;
-                weights->vocab_size = repacked.vocab_size;
-                weights->vocab_offset = vocab_offset;
-                weights->total_vocab = effective_total;
-                weights->d_model = d_model;
-                weights->device_id = target_device;
-
-                bool upload_ok = false;
-                llaminar2::IBackend *backend = llaminar2::getBackendFor(target_device);
-                if (!backend)
-                {
-                    LOG_ERROR("[PreparedEmbeddingWeights] No backend for device " << target_device.to_string());
-                    return nullptr;
-                }
-
-                weights->device_data = backend->allocate(repacked.byte_size, target_device.ordinal);
-                if (!weights->device_data)
-                {
-                    LOG_ERROR("[PreparedEmbeddingWeights] GPU allocation failed for "
-                              << target_device.to_string() << " (" << (repacked.byte_size / (1024 * 1024)) << " MB)");
-                    return nullptr;
-                }
-
-                upload_ok = backend->hostToDevice(weights->device_data, repacked.data.data(),
-                                                  repacked.byte_size, target_device.ordinal);
-                if (!upload_ok)
-                {
-                    LOG_ERROR("[PreparedEmbeddingWeights] H2D upload failed for " << target_device.to_string());
-                    backend->free(weights->device_data, target_device.ordinal);
-                    weights->device_data = nullptr;
-                    return nullptr;
-                }
-
-                LOG_INFO("[PreparedEmbeddingWeights] Prepared embedding for "
-                         << target_device.to_string() << ": "
-                         << llaminar2::tensorTypeName(tensor->native_type()) << " "
-                         << repacked.vocab_size << "x" << d_model
-                         << (is_sharded ? (" (vocab_offset=" + std::to_string(vocab_offset) +
-                                           " of " + std::to_string(effective_total) + ")")
-                                        : "")
-                         << " → " << (repacked.byte_size / (1024 * 1024)) << " MB"
-                         << " (" << repacked.blocks_per_row << " blocks/row)");
-
-                auto handle = std::make_shared<llaminar2::PreparedEmbeddingHandle>();
-                handle->tensor = tensor;
-                handle->device_id = target_device;
-                handle->weights = std::move(weights);
-
-                LOG_DEBUG("[PreparedEmbeddingWeights] Registered: tensor_ptr="
-                          << static_cast<const void *>(tensor)
-                          << " device=" << target_device.to_string());
-
-                std::lock_guard<std::mutex> lock(cache_mutex_);
-                auto [it, inserted] = prepared_embedding_registry_.emplace(key, std::move(handle));
-                return it->second.get();
-            }
-
             std::shared_ptr<llaminar2::PreparedEmbeddingHandle> KernelFactory::prepareEmbeddingHandleLocal(
                 const llaminar2::TensorBase *tensor,
                 int d_model,
@@ -4069,44 +3960,6 @@ namespace llaminar
                 handle->device_id = target_device;
                 handle->weights = std::move(weights);
                 return handle;
-            }
-
-            const llaminar2::PreparedEmbeddingHandle *KernelFactory::getPreparedEmbeddingWeights(
-                const llaminar2::TensorBase *tensor,
-                llaminar2::DeviceId target_device)
-            {
-                std::lock_guard<std::mutex> lock(cache_mutex_);
-
-                // Primary lookup: exact (tensor pointer, device) match.
-                const PreparedEmbeddingKey key{tensor, target_device};
-                auto it = prepared_embedding_registry_.find(key);
-                if (it != prepared_embedding_registry_.end())
-                    return it->second.get();
-
-                // Fallback: device-only lookup. Each device has at most one prepared
-                // embedding table (or one vocab shard in TP). The pointer mismatch
-                // happens when the caller holds a different TensorBase* than the one
-                // used during registration (e.g., original from cache_ vs clone from
-                // per_device_cache_). The device alone is sufficient to disambiguate.
-                for (const auto &[k, v] : prepared_embedding_registry_)
-                {
-                    if (k.device_id == target_device)
-                    {
-                        LOG_DEBUG("[PreparedEmbeddingWeights] Pointer miss but device-fallback hit: "
-                                  << "lookup_ptr=" << static_cast<const void *>(tensor)
-                                  << " registered_ptr=" << static_cast<const void *>(k.tensor)
-                                  << " device=" << target_device.to_string());
-                        return v.get();
-                    }
-                }
-
-                return nullptr;
-            }
-
-            size_t KernelFactory::preparedEmbeddingRegistrySize()
-            {
-                std::lock_guard<std::mutex> lock(cache_mutex_);
-                return prepared_embedding_registry_.size();
             }
 
             // ==========================================================================

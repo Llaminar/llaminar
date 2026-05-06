@@ -262,8 +262,6 @@ namespace llaminar2
          */
         size_t adviseMmapDontneed() { return loader_.adviseMmapDontneed(); }
 
-        size_t getPreparedEmbeddingCount() const override;
-
         /**
          * @brief Get statistics about preloaded weights
          *
@@ -690,7 +688,6 @@ namespace llaminar2
          * where in_local = in_dim * fraction, starting from in_dim - in_local.
          *
          * @param full_tensor Full weight tensor
-         * @param fraction Fraction of columns to extract (from tail)
          * @return Sliced tensor containing tail columns
          */
         static std::shared_ptr<TensorBase> sliceTailColumns(

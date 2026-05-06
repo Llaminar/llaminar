@@ -2333,17 +2333,8 @@ namespace llaminar2
             {
                 if (binding.identity.role == WeightRole::Embedding)
                 {
-                    const auto *embedding_handle = llaminar::v2::kernels::KernelFactory::getPreparedEmbeddingWeights(
-                        tensor, device);
-                    if (embedding_handle)
-                    {
-                        prepared_weight_store_->registerPreparedEmbeddingFromPipeline(
-                            binding, device, embedding_handle);
-                        ++registered;
-                        return;
-                    }
-
-                    if (device.is_gpu() && dynamic_cast<const IINT8Unpackable *>(tensor))
+                    const auto *unpackable = dynamic_cast<const IINT8Unpackable *>(tensor);
+                    if (device.is_gpu() && unpackable && unpackable->vnniFormatInfo())
                     {
                         const auto &cfg = graph_builder_->config();
                         size_t vocab_offset = 0;

@@ -175,7 +175,7 @@ namespace llaminar2
             // the tensor has a valid GPU copy OR kernel-managed device data.
             if (!ptr->deviceValid())
             {
-                bool has_kernel_device_data = ptr->isInPreparedGemmRegistry();
+                bool has_kernel_device_data = ptr->hasPreparedDeviceState();
 
                 if (!has_kernel_device_data)
                 {
@@ -2592,35 +2592,6 @@ namespace llaminar2
             }
         }
 
-        // Step 2b: Prepare embedding weights for GPU devices.
-        // Repacks from native quantized format (Q8_0, etc.) → EmbedQ8Block
-        // and uploads to GPU memory, following the PreparedGemmWeights pattern.
-        // Only if no layer_filter or if filter includes embedding.
-        if (is_gpu && (!layer_filter || layer_filter("token_embd.weight")))
-        {
-            using namespace llaminar::v2::kernels;
-            const int d_model = static_cast<int>(loader_.embeddingLength());
-
-            // Use getWeightForDevice() to get the canonical tensor pointer —
-            // this is the same pointer that InferenceRunnerFactory will pass to
-            // EmbeddingStage at execution time. Previously we looked up
-            // per_device_cache_ directly, which could return a different clone
-            // than what getWeightForDevice() returns for first_device_ (it
-            // returns the original from cache_, not the per-device clone).
-            auto embed_shared = getWeightForDevice("token_embd.weight", device);
-            const TensorBase *embed_tensor = embed_shared ? embed_shared.get() : nullptr;
-
-            if (embed_tensor && d_model > 0)
-            {
-                auto *handle = KernelFactory::getOrCreatePreparedEmbeddingWeights(
-                    embed_tensor, d_model, device, /*vocab_offset=*/0, /*total_vocab=*/0);
-                if (!handle)
-                    LOG_ERROR("[WeightManager] Embedding preparation failed for " << device_name);
-                else
-                    LOG_DEBUG("[WeightManager] Embedding prepared for " << device_name);
-            }
-        }
-
         // Step 3: Wait for GEMM pack (or do sync pack for CPU)
         bool gemm_ok = true;
         if (is_gpu)
@@ -2748,55 +2719,6 @@ namespace llaminar2
         LOG_INFO("[WeightManager] All " << devices.size() << " devices GEMM packed in "
                  << gemm_wall_ms << " ms wall-clock"
                  << (devices.size() > 1 ? " (parallel)" : ""));
-
-        // Step 2b: Prepare embedding weights for each device.
-        // Repacks from native quantized format (Q8_0, etc.) → EmbedQ8Block
-        // and uploads to GPU memory, following the PreparedGemmWeights pattern.
-        // With TP, each device gets only its vocab shard (vocab-parallel embedding).
-        {
-            using namespace llaminar::v2::kernels;
-            const int d_model = static_cast<int>(loader_.embeddingLength());
-
-            for (const auto &dev : devices)
-            {
-                if (!dev.is_gpu())
-                    continue;
-
-                // Use getWeightForDevice() for the canonical tensor pointer —
-                // same pointer that the graph builder will use at execution time.
-                // For TP with vocab-parallel sharding, per-device cache may hold
-                // a vocab slice; getWeightForDevice handles this correctly.
-                auto embed_shared = getWeightForDevice("token_embd.weight", dev);
-                const TensorBase *embed_tensor = embed_shared ? embed_shared.get() : nullptr;
-
-                if (embed_tensor && d_model > 0)
-                {
-                    // Determine vocab sharding metadata for this device
-                    size_t vocab_offset = 0;
-                    size_t total_vocab = 0;
-                    if (tp_config_)
-                    {
-                        // Find the assignment for this device
-                        for (const auto &a : tp_config_->assignments())
-                        {
-                            if (a.device == dev)
-                            {
-                                vocab_offset = static_cast<size_t>(a.vocab_start);
-                                total_vocab = static_cast<size_t>(tp_config_->totalVocab());
-                                break;
-                            }
-                        }
-                    }
-
-                    auto *handle = KernelFactory::getOrCreatePreparedEmbeddingWeights(
-                        embed_tensor, d_model, dev, vocab_offset, total_vocab);
-                    if (!handle)
-                    {
-                        LOG_ERROR("[WeightManager] Embedding preparation failed for " << dev.toString());
-                    }
-                }
-            }
-        }
 
         // Step 3: Release all host weight data (unless caller opts out — e.g.
         // nested TP-in-PP, where a later PP stage on a different device still
@@ -4363,17 +4285,7 @@ namespace llaminar2
             // be freed. Similarly, PreparedEmbeddingWeights hold their own GPU copy.
             if (!ptr->deviceValid())
             {
-                // Check if kernel has its own device copy (prepared GEMM registry)
-                bool has_kernel_device_data = ptr->isInPreparedGemmRegistry();
-
-                // Check if tensor has PreparedEmbeddingWeights (embedding table).
-                // Since we don't know which device the weights are prepared for,
-                // check if it's a host-resident tensor with prepared embeddings
-                // existing in the registry.
-                if (!has_kernel_device_data && ptr->isHostResident())
-                {
-                    has_kernel_device_data = getPreparedEmbeddingCount() > 0;
-                }
+                bool has_kernel_device_data = ptr->hasPreparedDeviceState();
 
                 // 3D MoE expert tensors (_exps.weight) are safe to release only
                 // after this exact parent layer/role has complete expert engines
@@ -4392,7 +4304,7 @@ namespace llaminar2
                     LOG_DEBUG("[WeightManager] RETAINED host data for " << key
                                                                         << " (" << (tensor_bytes / 1024) << " KB)"
                                                                         << " deviceValid=" << ptr->deviceValid()
-                                                                        << " inGemmRegistry=" << ptr->isInPreparedGemmRegistry()
+                                                                        << " hasPreparedDeviceState=" << ptr->hasPreparedDeviceState()
                                                                         << " hostResident=" << ptr->isHostResident()
                                                                         << " type=" << static_cast<int>(ptr->native_type()));
                     return;
@@ -4434,12 +4346,6 @@ namespace llaminar2
                                                                << " per_device=" << per_device_cache_.size()
                                                                << " decode=" << decode_cache_.size());
         return released_count;
-    }
-
-    size_t WeightManager::getPreparedEmbeddingCount() const
-    {
-        using namespace llaminar::v2::kernels;
-        return KernelFactory::preparedEmbeddingRegistrySize();
     }
 
     size_t WeightManager::releaseHostResidentWeightData()

@@ -25,13 +25,11 @@ using namespace llaminar2;
 using namespace llaminar2::test;
 
 // ============================================================================
-// TestableWeightManager — overrides getPreparedEmbeddingCount for test control
+// TestableWeightManager — opens lifecycle gates for release decision tests
 // ============================================================================
 
 class PPSafetyTestableWeightManager : public WeightManager
 {
-    size_t mock_embedding_count_ = 0;
-
 public:
     PPSafetyTestableWeightManager(IModelLoader &loader,
                                   WeightPrecision precision = WeightPrecision::NATIVE)
@@ -44,13 +42,6 @@ public:
         markDevicePreparationComplete();
         markGraphMaterializationComplete();
     }
-
-    size_t getPreparedEmbeddingCount() const override
-    {
-        return mock_embedding_count_;
-    }
-
-    void setMockEmbeddingCount(size_t n) { mock_embedding_count_ = n; }
 };
 
 // ============================================================================
@@ -207,7 +198,6 @@ TEST_F(Test__WeightManager_PPSafety, ReleaseAll_RetainsCPUOnlyFP32Tensor)
     mock_loader_->addFP32RandomTensor("test_weight", {64, 64});
 
     PPSafetyTestableWeightManager wm(*mock_loader_);
-    wm.setMockEmbeddingCount(0); // No prepared embeddings
 
     auto tensor = wm.getWeightForDevice("test_weight", DeviceId::cpu(), 0);
     ASSERT_NE(tensor, nullptr);
@@ -233,7 +223,6 @@ TEST_F(Test__WeightManager_PPSafety, ReleaseAll_RetainsCPUOnlyQuantizedTensor)
     mock_loader_->addQ8_0RandomTensor("test_weight", {64, 64});
 
     PPSafetyTestableWeightManager wm(*mock_loader_);
-    wm.setMockEmbeddingCount(0);
 
     auto tensor = wm.getWeightForDevice("test_weight", DeviceId::cpu(), 0);
     ASSERT_NE(tensor, nullptr);
@@ -246,7 +235,7 @@ TEST_F(Test__WeightManager_PPSafety, ReleaseAll_RetainsCPUOnlyQuantizedTensor)
 }
 
 /**
- * @test Host-resident tensor IS released when prepared embeddings exist
+ * @test Host-resident tensor IS released when prepared device state exists
  *
  * Verifies the safety fix doesn't break the normal release path for
  * tensors that have been explicitly marked as host-resident (mmap-backed).
@@ -257,16 +246,16 @@ TEST_F(Test__WeightManager_PPSafety, ReleaseAll_ReleasesHostResidentWithPrepared
     mock_loader_->addQ8_0RandomTensor("test_weight", {64, 64});
 
     PPSafetyTestableWeightManager wm(*mock_loader_);
-    wm.setMockEmbeddingCount(1); // Has prepared embeddings
 
     auto tensor = wm.getWeightForDevice("test_weight", DeviceId::cpu(), 0);
     ASSERT_NE(tensor, nullptr);
     tensor->setHostResident();
+    tensor->has_prepared_device_state_ = true;
 
     size_t released = wm.releaseAllHostWeightData();
     EXPECT_GE(released, 1);
     EXPECT_TRUE(tensor->is_raw_data_released())
-        << "Host-resident tensor with prepared embeddings should be released";
+        << "Host-resident tensor with prepared device state should be released";
 }
 
 // ============================================================================

@@ -632,8 +632,6 @@ namespace llaminar2
             const PreparedEmbeddingHandle *prepared = nullptr;
             if (prepared_embedding_handle_ && prepared_embedding_handle_->device_id == dev_id)
                 prepared = prepared_embedding_handle_;
-            else
-                prepared = KernelFactory::getPreparedEmbeddingWeights(embed_table, dev_id);
 
             void *d_embed_q8 = nullptr;
             size_t blocks_per_row = 0;
@@ -926,8 +924,7 @@ namespace llaminar2
         // Only needed when PreparedEmbeddingWeights are NOT available (test/fallback path).
         // When weights are prepared during loading, the prepared data lives in its own
         // GPU allocation and this workspace buffer is unused.
-        if (!prepared_embedding_handle_ &&
-            llaminar::v2::kernels::KernelFactory::preparedEmbeddingRegistrySize() == 0)
+        if (!prepared_embedding_handle_)
         {
             constexpr size_t DEFAULT_VOCAB_SIZE = 151936;
             size_t vocab_size = (n > 0) ? static_cast<size_t>(n) : DEFAULT_VOCAB_SIZE;

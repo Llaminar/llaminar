@@ -235,6 +235,16 @@ if(NOT V2_PERF_TESTS_ONLY)
         LABELS "V2;Unit;StaticAnalysis;Weights;PreparedWeights;KernelFactory"
         TIMEOUT 30
     )
+
+    add_test(
+        NAME V2_Unit_Static_NoKernelFactoryPreparedEmbeddingRegistry
+        COMMAND bash ${PROJECT_ROOT}/scripts/check_no_kernel_factory_prepared_embedding_registry.sh ${PROJECT_ROOT}
+        WORKING_DIRECTORY ${PROJECT_ROOT}
+    )
+    set_tests_properties(V2_Unit_Static_NoKernelFactoryPreparedEmbeddingRegistry PROPERTIES
+        LABELS "V2;Unit;StaticAnalysis;Weights;PreparedWeights;KernelFactory;Embedding"
+        TIMEOUT 30
+    )
 endif()
 
 # =============================================================================
@@ -9804,8 +9814,8 @@ add_v2_test(V2_Unit_ExecutorWeightCoherence
     MPI_PROCS 1
 )
 
-# Test: PreparedEmbeddingWeightsLifecycle — KernelFactory prepared embedding registry
-# lifecycle: creation, cache hits, move semantics, lookup, device separation, clear.
+# Test: PreparedEmbeddingWeightsLifecycle — PreparedWeightStore-owned embedding
+# lifecycle: creation, lookup, device separation, clear, move semantics.
 add_executable(v2_test_prepared_embedding_lifecycle unit/kernels/Test__PreparedEmbeddingWeightsLifecycle.cpp)
 target_link_libraries(v2_test_prepared_embedding_lifecycle llaminar2_core GTest::gtest GTest::gtest_main)
 target_include_directories(v2_test_prepared_embedding_lifecycle PRIVATE
@@ -9818,8 +9828,8 @@ add_v2_test(V2_Unit_PreparedEmbeddingWeightsLifecycle
 )
 
 # Test: WeightManagerHostRelease — WeightManager host memory release decision logic:
-# releaseAllHostWeightData and releaseHostResidentWeightData with controllable
-# getPreparedEmbeddingCount() override.
+# releaseAllHostWeightData and releaseHostResidentWeightData with per-tensor
+# prepared-device-state metadata.
 add_executable(v2_test_weight_manager_host_release unit/loaders/Test__WeightManagerHostRelease.cpp)
 target_link_libraries(v2_test_weight_manager_host_release llaminar2_core GTest::gtest GTest::gtest_main)
 target_include_directories(v2_test_weight_manager_host_release PRIVATE

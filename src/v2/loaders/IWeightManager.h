@@ -26,17 +26,18 @@
  * @author David Sanftenberg
  * @date January 2026
  */
-
 #pragma once
 
-#include "WeightTypes.h"
 #include "WeightManagerConfig.h"
+#include "WeightTypes.h"
 #include "../backends/DeviceId.h"
-#include <memory>
-#include <string>
+
 #include <vector>
 #include <cstddef>
 #include <functional>
+#include <memory>
+#include <string>
+#include <utility>
 
 namespace llaminar2
 {
@@ -339,16 +340,6 @@ namespace llaminar2
          * @return Number of tensors whose host data was released
          */
         virtual size_t releaseHostResidentWeightData() { return 0; }
-
-        /**
-         * @brief Query how many prepared embedding entries exist
-         *
-         * Used by releaseAllHostWeightData() to decide whether host-resident
-         * embedding tensors can be freed (because a GPU-side repack exists).
-         * Override in tests to control release decisions without depending
-         * on KernelFactory static state.
-         */
-        virtual size_t getPreparedEmbeddingCount() const { return 0; }
 
         virtual std::pair<size_t, size_t> preloadStats() const { return {0, 0}; }
 

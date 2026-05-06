@@ -4,17 +4,17 @@
  *
  * Tests verify:
  * 1. TOKEN_IDS workspace buffer is always requested
- * 2. EMBED_TABLE workspace buffer is requested when no prepared embeddings exist
- * 3. EMBED_TABLE workspace buffer is skipped when prepared embeddings exist
+ * 2. EMBED_TABLE workspace buffer is requested when no prepared embedding handle is injected
+ * 3. EMBED_TABLE workspace buffer is skipped when a prepared embedding handle is injected
  * 4. GPU embedding kernel can be created (GTEST_SKIP if no GPU)
  *
- * These tests manipulate KernelFactory static state to control whether
- * prepared embeddings exist, then verify workspace requirements.
+ * These tests inject explicit prepared embedding handles to verify workspace requirements.
  * GPU tests are skipped if no CUDA/ROCm device is available.
  */
 
 #include <gtest/gtest.h>
 #include <algorithm>
+#include <memory>
 
 #include "kernels/KernelFactory.h"
 #include "kernels/common/PreparedEmbeddingWeights.h"
@@ -97,9 +97,6 @@ TEST_F(Test__EmbeddingKernelPreparedPath, TokenIDsAlwaysRequested)
     auto *ws_consumer = dynamic_cast<IWorkspaceConsumer *>(kernel.get());
     ASSERT_NE(ws_consumer, nullptr);
 
-    // No prepared embeddings
-    ASSERT_EQ(KernelFactory::preparedEmbeddingRegistrySize(), 0);
-
     auto reqs = ws_consumer->getWorkspaceRequirements(512, 100, 64);
 
     EXPECT_TRUE(hasBuffer(reqs, EmbeddingWorkspaceBuffers::TOKEN_IDS));
@@ -118,9 +115,6 @@ TEST_F(Test__EmbeddingKernelPreparedPath, EmbedTableRequestedWhenNoPrepared)
     auto *ws_consumer = dynamic_cast<IWorkspaceConsumer *>(kernel.get());
     ASSERT_NE(ws_consumer, nullptr);
 
-    // No prepared embeddings → EMBED_TABLE should be requested
-    ASSERT_EQ(KernelFactory::preparedEmbeddingRegistrySize(), 0);
-
     auto reqs = ws_consumer->getWorkspaceRequirements(512, 100, 64);
 
     EXPECT_TRUE(hasBuffer(reqs, EmbeddingWorkspaceBuffers::TOKEN_IDS));
@@ -132,18 +126,16 @@ TEST_F(Test__EmbeddingKernelPreparedPath, EmbedTableSkippedWhenPreparedExists)
     if (!hasGPU())
         GTEST_SKIP() << "No GPU available";
 
-    // Create a Q8_0 tensor and prepare it to populate the registry
-    auto q8_tensor = TestTensorFactory::createQ8_0Random({100, 64});
-    auto *handle = KernelFactory::getOrCreatePreparedEmbeddingWeights(
-        q8_tensor.get(), 64, gpuDeviceId());
-    ASSERT_NE(handle, nullptr);
-    ASSERT_GT(KernelFactory::preparedEmbeddingRegistrySize(), 0);
-
-    // Now create an embedding kernel and check workspace
     auto embed_table = TestTensorFactory::createFP32Random({100, 64});
     auto kernel = KernelFactory::createEmbedding(
         static_cast<const FP32Tensor *>(embed_table.get()), gpuDeviceType(), 0);
     ASSERT_NE(kernel, nullptr);
+
+    PreparedEmbeddingHandle handle;
+    handle.tensor = embed_table.get();
+    handle.device_id = gpuDeviceId();
+    handle.weights = std::make_shared<PreparedEmbeddingWeights>();
+    kernel->setPreparedEmbeddingHandle(&handle);
 
     auto *ws_consumer = dynamic_cast<IWorkspaceConsumer *>(kernel.get());
     ASSERT_NE(ws_consumer, nullptr);
@@ -155,21 +147,11 @@ TEST_F(Test__EmbeddingKernelPreparedPath, EmbedTableSkippedWhenPreparedExists)
         << "EMBED_TABLE should be skipped when PreparedEmbeddingWeights exist";
 }
 
-TEST_F(Test__EmbeddingKernelPreparedPath, EmbedTableReappearsAfterCacheClear)
+TEST_F(Test__EmbeddingKernelPreparedPath, EmbedTableRequestedWithoutInjectedPreparedHandle)
 {
     if (!hasGPU())
         GTEST_SKIP() << "No GPU available";
 
-    // Populate registry
-    auto q8_tensor = TestTensorFactory::createQ8_0Random({100, 64});
-    KernelFactory::getOrCreatePreparedEmbeddingWeights(q8_tensor.get(), 64, gpuDeviceId());
-    ASSERT_GT(KernelFactory::preparedEmbeddingRegistrySize(), 0);
-
-    // Clear registry
-    KernelFactory::clearCache();
-    ASSERT_EQ(KernelFactory::preparedEmbeddingRegistrySize(), 0);
-
-    // Now EMBED_TABLE should be requested again
     auto embed_table = TestTensorFactory::createFP32Random({100, 64});
     auto kernel = KernelFactory::createEmbedding(
         static_cast<const FP32Tensor *>(embed_table.get()), gpuDeviceType(), 0);
@@ -181,7 +163,7 @@ TEST_F(Test__EmbeddingKernelPreparedPath, EmbedTableReappearsAfterCacheClear)
     auto reqs = ws_consumer->getWorkspaceRequirements(512, 100, 64);
 
     EXPECT_TRUE(hasBuffer(reqs, EmbeddingWorkspaceBuffers::EMBED_TABLE))
-        << "EMBED_TABLE should reappear after cache clear";
+        << "EMBED_TABLE should be requested when no prepared handle is injected";
 }
 
 // ============================================================================

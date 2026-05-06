@@ -4,17 +4,16 @@
  *
  * Tests verify:
  * 1. releaseAllHostWeightData() retains tensors with no device copy
- * 2. releaseAllHostWeightData() releases host-resident tensors when prepared embeddings exist
- * 3. releaseAllHostWeightData() retains host-resident tensors when no prepared embeddings
+ * 2. releaseAllHostWeightData() releases host-resident tensors with prepared device state
+ * 3. releaseAllHostWeightData() retains host-resident tensors without prepared device state
  * 4. releaseAllHostWeightData() skips already-released tensors
  * 5. releaseHostResidentWeightData() releases only host-resident tensors
  * 6. releaseHostResidentWeightData() retains non-host-resident tensors
  * 7. releaseHostResidentWeightData() deduplicates shared tensor pointers
  * 8. Return counts are correct
  *
- * Uses a TestableWeightManager subclass that overrides getPreparedEmbeddingCount()
- * (Option A injection) to control the release decision tree without depending on
- * KernelFactory static state.
+ * Uses lifecycle-gate control plus TensorBase prepared-device-state metadata to
+ * exercise the release decision tree without depending on KernelFactory static state.
  */
 
 #include <gtest/gtest.h>
@@ -28,13 +27,11 @@ using namespace llaminar2;
 using namespace llaminar2::test;
 
 // ============================================================================
-// TestableWeightManager — overrides getPreparedEmbeddingCount for test control
+// TestableWeightManager — opens lifecycle gates for release decision tests
 // ============================================================================
 
 class TestableWeightManager : public WeightManager
 {
-    size_t mock_embedding_count_ = 0;
-
 public:
     TestableWeightManager(IModelLoader &loader)
         : WeightManager(loader, nullptr, nullptr,
@@ -46,13 +43,6 @@ public:
         markDevicePreparationComplete();
         markGraphMaterializationComplete();
     }
-
-    size_t getPreparedEmbeddingCount() const override
-    {
-        return mock_embedding_count_;
-    }
-
-    void setMockEmbeddingCount(size_t n) { mock_embedding_count_ = n; }
 };
 
 // ============================================================================
@@ -87,10 +77,9 @@ protected:
 
 TEST_F(Test__WeightManagerHostRelease, RetainsWhenNoDeviceData)
 {
-    // Tensor loaded on CPU only, no GPU copy, not host-resident, no prepared embeddings
+    // Tensor loaded on CPU only, no GPU copy, not host-resident, no prepared device state
     // → should be retained (no safe device copy exists)
     TestableWeightManager wm(*mock_loader_);
-    wm.setMockEmbeddingCount(0);
 
     auto tensor = loadTensor(wm, "token_embd.weight");
     ASSERT_NE(tensor, nullptr);
@@ -104,13 +93,13 @@ TEST_F(Test__WeightManagerHostRelease, RetainsWhenNoDeviceData)
 
 TEST_F(Test__WeightManagerHostRelease, ReleasesHostResidentWhenPreparedExists)
 {
-    // Tensor is host-resident AND prepared embeddings exist → should release
+    // Tensor is host-resident AND has prepared device state → should release
     TestableWeightManager wm(*mock_loader_);
-    wm.setMockEmbeddingCount(2); // Simulate 2 prepared embeddings
 
     auto tensor = loadTensor(wm, "token_embd.weight");
     ASSERT_NE(tensor, nullptr);
     tensor->setHostResident();
+    tensor->has_prepared_device_state_ = true;
     ASSERT_TRUE(tensor->isHostResident());
 
     size_t released = wm.releaseAllHostWeightData();
@@ -121,9 +110,8 @@ TEST_F(Test__WeightManagerHostRelease, ReleasesHostResidentWhenPreparedExists)
 
 TEST_F(Test__WeightManagerHostRelease, RetainsHostResidentWhenNoPrepared)
 {
-    // Tensor is host-resident but NO prepared embeddings → should retain
+    // Tensor is host-resident but has NO prepared device state → should retain
     TestableWeightManager wm(*mock_loader_);
-    wm.setMockEmbeddingCount(0);
 
     auto tensor = loadTensor(wm, "token_embd.weight");
     ASSERT_NE(tensor, nullptr);
@@ -139,7 +127,6 @@ TEST_F(Test__WeightManagerHostRelease, SkipsAlreadyReleased)
 {
     // Tensor already released → releaseAll should skip it
     TestableWeightManager wm(*mock_loader_);
-    wm.setMockEmbeddingCount(2);
 
     auto tensor = loadTensor(wm, "token_embd.weight");
     ASSERT_NE(tensor, nullptr);
@@ -157,9 +144,8 @@ TEST_F(Test__WeightManagerHostRelease, SkipsAlreadyReleased)
 
 TEST_F(Test__WeightManagerHostRelease, ReturnsCorrectReleaseCount)
 {
-    // Load multiple tensors as host-resident with prepared embeddings
+    // Load multiple tensors as host-resident with prepared device state
     TestableWeightManager wm(*mock_loader_);
-    wm.setMockEmbeddingCount(1);
 
     auto t1 = loadTensor(wm, "token_embd.weight");
     auto t2 = loadTensor(wm, "output_norm.weight");
@@ -170,7 +156,9 @@ TEST_F(Test__WeightManagerHostRelease, ReturnsCorrectReleaseCount)
 
     // Mark only two as host-resident
     t1->setHostResident();
+    t1->has_prepared_device_state_ = true;
     t3->setHostResident();
+    t3->has_prepared_device_state_ = true;
     // t2 stays non host-resident with no device data → retained
 
     size_t released = wm.releaseAllHostWeightData();
@@ -183,9 +171,8 @@ TEST_F(Test__WeightManagerHostRelease, ReturnsCorrectReleaseCount)
 
 TEST_F(Test__WeightManagerHostRelease, MixedStatesProcessedCorrectly)
 {
-    // Mix of: already-released, host-resident with prepared, non-host-resident
+    // Mix of: already-released, host-resident with prepared state, non-host-resident
     TestableWeightManager wm(*mock_loader_);
-    wm.setMockEmbeddingCount(1);
 
     auto already_released = loadTensor(wm, "token_embd.weight");
     auto host_resident = loadTensor(wm, "output_norm.weight");
@@ -195,6 +182,7 @@ TEST_F(Test__WeightManagerHostRelease, MixedStatesProcessedCorrectly)
     already_released->release_host_weight_data();
     // Mark one host-resident
     host_resident->setHostResident();
+    host_resident->has_prepared_device_state_ = true;
     // cpu_only stays default (no device, not host-resident)
 
     size_t released = wm.releaseAllHostWeightData();

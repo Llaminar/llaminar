@@ -37,7 +37,7 @@ These areas were migrated before the factory method was deleted.
 The initial inventory was captured on 2026-05-05 with:
 
 ```bash
-rg "getOrCreatePreparedGemmWeights|getOrCreateGemmSliced|getOrCreatePreparedEmbeddingWeights|getKernelAsWorkspaceConsumer" src/v2 tests/v2
+rg "getOrCreatePreparedGemmWeights|getOrCreateGemmSliced|getKernelAsWorkspaceConsumer" src/v2 tests/v2
 ```
 
 The Phase 0 static guard originally ratcheted production stage fallback calls to `KernelFactory::getOrCreatePreparedGemmWeights()`. It has since been tightened to a zero-tolerance final guard: any stage file reference to the deleted API fails `V2_Unit_Static_NoNewStagePreparedGemmFactoryFallbacks`.
@@ -139,7 +139,7 @@ If hardware or model availability makes the full integration gate impossible in 
 - Run and record the current call inventory:
 
 ```bash
-rg "getOrCreatePreparedGemmWeights|getOrCreateGemmSliced|getOrCreatePreparedEmbeddingWeights|getKernelAsWorkspaceConsumer" src/v2 tests/v2
+rg "getOrCreatePreparedGemmWeights|getOrCreateGemmSliced|getKernelAsWorkspaceConsumer" src/v2 tests/v2
 ```
 
 - Classify every match as one of:

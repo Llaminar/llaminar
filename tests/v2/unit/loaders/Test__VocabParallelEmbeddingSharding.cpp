@@ -15,6 +15,7 @@
 #include <gtest/gtest.h>
 #include <algorithm>
 #include <cmath>
+#include <memory>
 
 #include "config/TensorParallelConfig.h"
 #include "execution/local_execution/graph/GraphSchema.h"
@@ -22,6 +23,7 @@
 #include "kernels/cpu/ops/CPUEmbeddingKernelT.h"
 #include "kernels/common/EmbedQ8Repack.h"
 #include "kernels/common/PreparedEmbeddingWeights.h"
+#include "loaders/PreparedWeightStore.h"
 #include "loaders/WeightSlicer.h"
 #include "models/qwen/Qwen2Schema.h"
 #include "models/qwen3/Qwen3Schema.h"
@@ -75,6 +77,36 @@ protected:
         KernelFactory::clearCache();
     }
 
+    WeightBinding makeEmbeddingBinding(uint64_t binding_id, TensorBase *tensor,
+                                       DeviceId device = DeviceId::cpu()) const
+    {
+        WeightBinding binding;
+        binding.binding_id = binding_id;
+        binding.identity.model_id = kModelId;
+        binding.identity.logical_id = binding_id;
+        binding.identity.instance_id = binding_id;
+        binding.identity.canonical_name = "token_embd.weight";
+        binding.identity.role = WeightRole::Embedding;
+        binding.identity.derivation = WeightDerivationKind::ColumnSlice;
+        binding.residency.home_device = device;
+        binding.residency.resident_device = device;
+        binding.tensor = tensor;
+        return binding;
+    }
+
+    const PreparedEmbeddingHandle *prepareEmbeddingForTest(
+        PreparedWeightStore &store,
+        uint64_t binding_id,
+        TensorBase *tensor,
+        int d_model,
+        size_t vocab_offset = 0,
+        size_t total_vocab = 0) const
+    {
+        auto binding = makeEmbeddingBinding(binding_id, tensor);
+        auto ref = store.prepareEmbedding(binding, d_model, vocab_offset, total_vocab);
+        return store.embeddingHandle(ref);
+    }
+
     ModelDimensions makeDimensions(int n_heads = TEST_HEADS, int n_kv = TEST_KV_HEADS,
                                    int hd = TEST_HEAD_DIM) const
     {
@@ -83,6 +115,8 @@ protected:
             .n_kv_heads = n_kv,
             .head_dim = static_cast<size_t>(hd)};
     }
+
+    static constexpr ModelContextId kModelId{7001};
 };
 
 // ============================================================================
@@ -552,9 +586,9 @@ TEST_F(Test__VocabParallelEmbeddingSharding, PreparedWeights_UnshardedDefaults)
     constexpr size_t kVocab = 128;
     constexpr int kDModel = 64;
 
+    PreparedWeightStore store(kModelId);
     auto tensor = TestTensorFactory::createQ8_0Random({kVocab, static_cast<size_t>(kDModel)});
-    auto *handle = KernelFactory::getOrCreatePreparedEmbeddingWeights(
-        tensor.get(), kDModel, DeviceId::cpu());
+    auto *handle = prepareEmbeddingForTest(store, 1, tensor.get(), kDModel);
 
     ASSERT_NE(handle, nullptr);
     ASSERT_NE(handle->weights, nullptr);
@@ -572,9 +606,9 @@ TEST_F(Test__VocabParallelEmbeddingSharding, PreparedWeights_ShardedMetadata)
     constexpr size_t kVocabOffset = 64;
     constexpr size_t kTotalVocab = 128;
 
+    PreparedWeightStore store(kModelId);
     auto tensor = TestTensorFactory::createQ8_0Random({kLocalVocab, static_cast<size_t>(kDModel)});
-    auto *handle = KernelFactory::getOrCreatePreparedEmbeddingWeights(
-        tensor.get(), kDModel, DeviceId::cpu(), kVocabOffset, kTotalVocab);
+    auto *handle = prepareEmbeddingForTest(store, 1, tensor.get(), kDModel, kVocabOffset, kTotalVocab);
 
     ASSERT_NE(handle, nullptr);
     ASSERT_NE(handle->weights, nullptr);
@@ -590,13 +624,12 @@ TEST_F(Test__VocabParallelEmbeddingSharding, PreparedWeights_TwoShards_Complemen
     constexpr size_t kLocalVocab = 64;
     constexpr int kDModel = 64;
 
+    PreparedWeightStore store(kModelId);
     auto tensor0 = TestTensorFactory::createQ8_0Random({kLocalVocab, static_cast<size_t>(kDModel)}, 42);
     auto tensor1 = TestTensorFactory::createQ8_0Random({kLocalVocab, static_cast<size_t>(kDModel)}, 99);
 
-    auto *handle0 = KernelFactory::getOrCreatePreparedEmbeddingWeights(
-        tensor0.get(), kDModel, DeviceId::cpu(), 0, kTotalVocab);
-    auto *handle1 = KernelFactory::getOrCreatePreparedEmbeddingWeights(
-        tensor1.get(), kDModel, DeviceId::cpu(), kLocalVocab, kTotalVocab);
+    auto *handle0 = prepareEmbeddingForTest(store, 1, tensor0.get(), kDModel, 0, kTotalVocab);
+    auto *handle1 = prepareEmbeddingForTest(store, 2, tensor1.get(), kDModel, kLocalVocab, kTotalVocab);
 
     ASSERT_NE(handle0, nullptr);
     ASSERT_NE(handle1, nullptr);
@@ -1081,7 +1114,8 @@ TEST_F(Test__VocabParallelEmbeddingSharding, PreparedWeights_4Shards_Metadata)
     constexpr int N = 4;
     constexpr size_t kLocalVocab = kTotalVocab / N;
 
-    // Keep all tensors alive to prevent allocator pointer reuse (cache key = raw pointer)
+    PreparedWeightStore store(kModelId);
+    // Keep all tensors alive for store-owned tensor-key lookups.
     std::vector<std::unique_ptr<TensorBase>> tensors;
     for (int r = 0; r < N; ++r)
     {
@@ -1089,8 +1123,8 @@ TEST_F(Test__VocabParallelEmbeddingSharding, PreparedWeights_4Shards_Metadata)
             {kLocalVocab, static_cast<size_t>(kDModel)}, 42 + r));
         size_t offset = r * kLocalVocab;
 
-        auto *handle = KernelFactory::getOrCreatePreparedEmbeddingWeights(
-            tensors.back().get(), kDModel, DeviceId::cpu(), offset, kTotalVocab);
+        auto *handle = prepareEmbeddingForTest(
+            store, static_cast<uint64_t>(r + 1), tensors.back().get(), kDModel, offset, kTotalVocab);
 
         ASSERT_NE(handle, nullptr) << "Shard " << r;
         ASSERT_NE(handle->weights, nullptr) << "Shard " << r;
@@ -1115,7 +1149,8 @@ TEST_F(Test__VocabParallelEmbeddingSharding, PreparedWeights_16Shards_Contiguous
     };
     std::vector<ShardInfo> shards;
 
-    // Keep all tensors alive to prevent allocator pointer reuse (cache key = raw pointer)
+    PreparedWeightStore store(kModelId);
+    // Keep all tensors alive for store-owned tensor-key lookups.
     std::vector<std::unique_ptr<TensorBase>> tensors;
     for (int r = 0; r < N; ++r)
     {
@@ -1123,8 +1158,8 @@ TEST_F(Test__VocabParallelEmbeddingSharding, PreparedWeights_16Shards_Contiguous
             {kLocalVocab, static_cast<size_t>(kDModel)}, 100 + r));
         size_t offset = r * kLocalVocab;
 
-        auto *handle = KernelFactory::getOrCreatePreparedEmbeddingWeights(
-            tensors.back().get(), kDModel, DeviceId::cpu(), offset, kTotalVocab);
+        auto *handle = prepareEmbeddingForTest(
+            store, static_cast<uint64_t>(r + 1), tensors.back().get(), kDModel, offset, kTotalVocab);
 
         ASSERT_NE(handle, nullptr) << "Shard " << r;
         ShardInfo si;

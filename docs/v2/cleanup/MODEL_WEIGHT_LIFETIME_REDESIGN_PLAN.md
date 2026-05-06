@@ -586,7 +586,7 @@ struct ModelWeightBindings {
 
 - Rename or introduce `KernelRegistry` for stateless/device-scoped kernel selection.
 - Move prepared GEMM registry to `PreparedWeightStore`.
-- Move prepared embedding registry to `PreparedWeightStore`.
+- Prepared embedding registry ownership has moved to `PreparedWeightStore`; the deleted `KernelFactory` prepared embedding registry APIs are guarded by `V2_Unit_Static_NoKernelFactoryPreparedEmbeddingRegistry`.
 - Move fused weight caches that key on prepared handles into `PreparedWeightStore` or stage-local caches.
 - Keep device-scoped non-weight kernels in a separate `DeviceKernelCache` or the existing dedicated cache.
 - Remove `TensorBase::~TensorBase()` dependency on `KernelFactory::clearCacheFor()` for model weights.
