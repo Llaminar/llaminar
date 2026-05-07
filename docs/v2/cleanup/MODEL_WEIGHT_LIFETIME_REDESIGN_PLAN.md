@@ -638,7 +638,7 @@ enum class WeightLifecycleState {
 
 ### Phase 10: Remove Compatibility APIs
 
-**Implementation note (2026-05-06)**: The `KernelFactory::getOrCreatePreparedGemmWeights()` compatibility path has been removed by `KERNELFACTORY_PREPARED_GEMM_FALLBACK_REMOVAL_PLAN.md`. Graph-built model GEMM stages now carry `PreparedWeightRef` metadata and resolve through `PreparedWeightStore`; stage/workspace lazy preparation through the deleted factory method is forbidden by the static guard `V2_Unit_Static_NoNewStagePreparedGemmFactoryFallbacks`.
+**Implementation note (2026-05-06)**: The `KernelFactory::getOrCreatePreparedGemmWeights()` compatibility path has been removed by `KERNELFACTORY_PREPARED_GEMM_FALLBACK_REMOVAL_PLAN.md`. Graph-built model GEMM stages now carry `PreparedWeightRef` metadata and resolve through `PreparedWeightStore`; stage/workspace lazy preparation through the deleted factory method should not be reintroduced.
 
 **Goal**: Delete old paths after all production modes use frozen bindings and prepared stores.
 

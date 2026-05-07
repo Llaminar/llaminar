@@ -11,7 +11,7 @@
  * 2. BF16 dense weights (shared experts, attention) load via RAW_FP
  * 3. ExpertGemmRegistry is populated with FP GEMM kernels
  * 4. FP GEMM kernels produce correct matmul results (spot-check)
- * 5. Dense FP GEMM weights are registered in KernelFactory
+ * 5. Dense FP GEMM weights are registered in PreparedWeightStore
  *
  * @author David Sanftenberg
  */
@@ -23,6 +23,7 @@
 
 #include "../../utils/TestModelHelper.h"
 #include "../../src/v2/loaders/WeightManager.h"
+#include "../../src/v2/loaders/PreparedWeightStore.h"
 #include "../../src/v2/loaders/ModelLoader.h"
 #include "../../src/v2/loaders/ExpertGemmRegistry.h"
 #include "../../src/v2/tensors/Tensors.h"
@@ -241,7 +242,7 @@ TEST_F(UnifiedGPUPipeline_FP_Test, BF16_ExpertsRegisteredInRegistry)
 }
 
 // =============================================================================
-// Test: BF16 dense weights (shared experts) registered in KernelFactory
+// Test: BF16 dense weights (shared experts) registered in PreparedWeightStore
 // =============================================================================
 
 TEST_F(UnifiedGPUPipeline_FP_Test, BF16_DenseWeightsRegistered)
@@ -255,16 +256,14 @@ TEST_F(UnifiedGPUPipeline_FP_Test, BF16_DenseWeightsRegistered)
     auto shexp_gate = weight_mgr_->getWeightForDevice("blk.0.ffn_gate_shexp.weight");
     ASSERT_NE(shexp_gate, nullptr) << "Shared expert gate weight should exist";
 
-    auto *prepared = KernelFactory::findPreparedGemmWeights(shexp_gate.get(), device_);
-    EXPECT_NE(prepared, nullptr)
+    EXPECT_TRUE(shexp_gate->hasPreparedDeviceState())
         << "BF16 ffn_gate_shexp.weight should have been packed by the FP pipeline";
 
     // GDN QKV projection should also be registered
     auto qkv = weight_mgr_->getWeightForDevice("blk.0.attn_qkv.weight");
     if (qkv)
     {
-        auto *qkv_prepared = KernelFactory::findPreparedGemmWeights(qkv.get(), device_);
-        EXPECT_NE(qkv_prepared, nullptr)
+        EXPECT_TRUE(qkv->hasPreparedDeviceState())
             << "BF16 attn_qkv.weight should have been packed by the FP pipeline";
     }
 }

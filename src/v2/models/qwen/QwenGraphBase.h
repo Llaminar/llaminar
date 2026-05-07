@@ -296,7 +296,6 @@ namespace llaminar2
         const WeightBinding *modelLMHeadBinding() const;
         std::optional<PreparedWeightRef> preparedRefForGraphWeight(
             const WeightBinding *binding,
-            const TensorBase *tensor,
             DeviceId device) const;
 
         std::string describeMissingExpertGemmEngine(
@@ -400,6 +399,7 @@ namespace llaminar2
             const std::string &prefix,
             ActivationBuffers &buffers,
             TensorBase *wo_weight,
+            const WeightBinding *wo_binding,
             int total_tokens,
             int layer_idx,
             DeviceId device,

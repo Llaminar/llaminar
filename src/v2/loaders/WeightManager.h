@@ -47,6 +47,8 @@ namespace llaminar2
     // WeightDistributionStrategy and ShardingMode are now in WeightTypes.h
     // (included transitively via WeightManagerConfig.h → WeightTypes.h)
 
+    class PreparedWeightStore;
+
     /**
      * @brief Weight manager with distribution strategy and caching
      *
@@ -130,6 +132,20 @@ namespace llaminar2
          * @return true on success
          */
         bool prepareWeightsForDevice(DeviceId device) override;
+
+        /**
+         * @brief Prepare weights for a device using graph-frozen bindings.
+         *
+         * This is the preferred graph-build path: prepared GEMM handles are
+         * registered under the exact WeightBinding ids that graph stages will
+         * reference, including PP/TP slices and tied aliases. Set
+         * include_expert_jobs=false when an explicit expert-cache preparation
+         * pass has already populated ExpertGemmRegistry for this device.
+         */
+        bool prepareWeightsForDevice(
+            const FrozenModelWeightSet &frozen_weights,
+            DeviceId device,
+            bool include_expert_jobs = true);
 
         /**
          * @brief Prepare weights for a single device, filtered to a layer range
@@ -218,7 +234,9 @@ namespace llaminar2
          */
         bool packGemmWeightsViaPipeline(
             DeviceId target_device,
-            std::function<bool(const std::string &)> layer_filter = nullptr);
+            std::function<bool(const std::string &)> layer_filter = nullptr,
+            const FrozenModelWeightSet *frozen_weights = nullptr,
+            bool include_expert_jobs = true);
 
         /**
          * @brief Upload all non-GEMM weights to GPU
@@ -707,6 +725,10 @@ namespace llaminar2
         ExpertGemmRegistry &expertGemmRegistry() { return expert_gemm_registry_; }
         const ExpertGemmRegistry &expertGemmRegistry() const { return expert_gemm_registry_; }
 
+        std::shared_ptr<PreparedWeightStore> preparedWeightStore();
+        std::shared_ptr<PreparedWeightStore> preparedWeightStoreIfInitialized() const;
+        void setPreparedWeightStore(std::shared_ptr<PreparedWeightStore> store);
+
         /**
          * @brief Get the current lifecycle state (derived from gates)
          */
@@ -882,7 +904,9 @@ namespace llaminar2
          */
         bool prepareWeightsForDeviceImpl(
             DeviceId device,
-            std::function<bool(const std::string &)> layer_filter);
+            std::function<bool(const std::string &)> layer_filter,
+            const FrozenModelWeightSet *frozen_weights = nullptr,
+            bool include_expert_jobs = true);
 
         // =========================================================================
         // Per-device tensor cache for multi-device scenarios (LOCAL TP)
@@ -1134,6 +1158,7 @@ namespace llaminar2
         // Preload statistics (folded from WeightPreloader)
         // =========================================================================
         size_t num_cpu_packed_ = 0;
+
         size_t num_gpu_packed_ = 0;
 
     private:
@@ -1144,6 +1169,8 @@ namespace llaminar2
         WeightLifecycleGates lifecycle_gates_;
 
         ExpertGemmRegistry expert_gemm_registry_;
+        std::shared_ptr<PreparedWeightStore> prepared_weight_store_;
+        uint64_t next_pipeline_prepared_binding_id_ = (1ULL << 48);
 
         // =========================================================================
         // Phase 2: Per-weight/device readiness tickets and TP-safe reclaim eligibility
@@ -1158,7 +1185,6 @@ namespace llaminar2
             READY,
             FAILED
         };
-
         struct WeightPrepTicket
         {
             WeightPrepState state = WeightPrepState::UNKNOWN;

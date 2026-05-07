@@ -568,7 +568,7 @@ namespace llaminar2
         // GEMM registry, the GPU pipeline has already uploaded the data into pooled
         // VRAM.  The kernel owns the device copy — skip raw upload.
         if (!tensor->gpu_data_ptr_ && !::llaminar2::isDeviceValid(tensor->coherence_state_) &&
-            target_device.is_gpu() && tensor->isInPreparedGemmRegistry())
+            target_device.is_gpu() && tensor->hasPreparedDeviceState())
         {
             LOG_DEBUG("[TransferEngine::uploadFull] Skipping raw upload for tensor "
                       << (tensor->debug_name_.empty() ? "(unnamed)" : tensor->debug_name_)

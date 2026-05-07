@@ -82,6 +82,17 @@ TEST(Test__PreparedWeightStore, RejectsWrongModelOrDevice)
     EXPECT_FALSE(store.binding(wrong_device).has_value());
 }
 
+TEST(Test__PreparedWeightStore, RejectsStageLocalBindingModelIds)
+{
+    PreparedWeightStore store(ModelContextId{99});
+    auto binding = makeStoreBinding(17, "blk.0.attn_q.weight", DeviceId::cpu());
+    binding.identity.model_id = ModelContextId{1234};
+
+    EXPECT_THROW(store.registerPreparedForTest(
+                     binding, PreparedWeightKind::CpuPackedGemm, DeviceId::cpu()),
+                 std::runtime_error);
+}
+
 TEST(Test__PreparedWeightStore, MockEntriesHaveNoExecutableKernel)
 {
     PreparedWeightStore store(ModelContextId{99});
@@ -95,7 +106,7 @@ TEST(Test__PreparedWeightStore, MockEntriesHaveNoExecutableKernel)
     EXPECT_FALSE(store.contains(ref));
 }
 
-TEST(Test__PreparedWeightStore, ResolvesPreparedRefByTensorAndDevice)
+TEST(Test__PreparedWeightStore, ResolvesPreparedRefByBindingAndDevice)
 {
     PreparedWeightStore store(ModelContextId{99});
     auto tensor = std::make_shared<FP32Tensor>(std::vector<size_t>{8, 8});
@@ -105,14 +116,67 @@ TEST(Test__PreparedWeightStore, ResolvesPreparedRefByTensorAndDevice)
     auto ref = store.registerPreparedForTest(
         binding, PreparedWeightKind::RocmInt8PackedGemm, DeviceId::rocm(0));
 
-    auto resolved = store.preparedRefForTensor(tensor.get(), DeviceId::rocm(0));
+    auto resolved = store.preparedRefForBinding(binding.binding_id, DeviceId::rocm(0));
     ASSERT_TRUE(resolved.has_value());
     EXPECT_EQ(resolved->binding_id, ref.binding_id);
     EXPECT_EQ(resolved->kind, PreparedWeightKind::RocmInt8PackedGemm);
-    EXPECT_FALSE(store.preparedRefForTensor(tensor.get(), DeviceId::rocm(1)).has_value());
+    EXPECT_FALSE(store.preparedRefForBinding(binding.binding_id, DeviceId::rocm(1)).has_value());
 }
 
-TEST(Test__PreparedWeightStore, ResolvesPreparedEmbeddingRefsByTensorAndBinding)
+TEST(Test__PreparedWeightStore, RegistersOwnedPipelineHandleByBinding)
+{
+    PreparedWeightStore store(ModelContextId{99});
+    auto tensor = std::make_shared<FP32Tensor>(std::vector<size_t>{8, 8});
+    auto binding = makeStoreBinding(13, "blk.0.ffn_up.weight", DeviceId::cuda(0));
+    binding.tensor = tensor.get();
+
+    auto handle = std::make_shared<llaminar::v2::kernels::KernelFactory::PreparedGemmHandle>();
+    handle->tensor = tensor.get();
+    handle->device_id = DeviceId::cuda(0);
+    handle->kind = llaminar::v2::kernels::KernelFactory::GemmPreparationKind::FLOATING_POINT;
+    handle->prepared_weights = std::make_shared<llaminar::v2::kernels::KernelFactory::PreparedGemmWeights>();
+
+    auto ref = store.registerPreparedGemmHandle(
+        binding,
+        PreparedWeightKind::CudaInt8PackedGemm,
+        DeviceId::cuda(0),
+        std::move(handle));
+
+    EXPECT_TRUE(store.contains(ref));
+    auto resolved = store.preparedRefForBinding(binding.binding_id, DeviceId::cuda(0));
+    ASSERT_TRUE(resolved.has_value());
+    EXPECT_EQ(resolved->binding_id, ref.binding_id);
+    EXPECT_TRUE(tensor->hasPreparedDeviceState());
+}
+
+TEST(Test__PreparedWeightStore, SameTensorDifferentBindingDoesNotResolveAccidentally)
+{
+    PreparedWeightStore store(ModelContextId{99});
+    auto tensor = std::make_shared<FP32Tensor>(std::vector<size_t>{8, 8});
+
+    auto prepared_binding = makeStoreBinding(21, "blk.0.ffn_gate.weight", DeviceId::cuda(0));
+    prepared_binding.tensor = tensor.get();
+    auto unprepared_binding = makeStoreBinding(22, "blk.0.ffn_up.weight", DeviceId::cuda(0));
+    unprepared_binding.tensor = tensor.get();
+
+    auto ref = store.registerPreparedForTest(
+        prepared_binding,
+        PreparedWeightKind::CudaInt8PackedGemm,
+        DeviceId::cuda(0));
+
+    ASSERT_TRUE(store.contains(ref));
+    EXPECT_TRUE(store.preparedRefForBinding(prepared_binding.binding_id, DeviceId::cuda(0)).has_value());
+    EXPECT_FALSE(store.preparedRefForBinding(unprepared_binding.binding_id, DeviceId::cuda(0)).has_value());
+
+    PreparedWeightRef wrong_ref{
+        ModelContextId{99},
+        unprepared_binding.binding_id,
+        PreparedWeightKind::CudaInt8PackedGemm,
+        DeviceId::cuda(0)};
+    EXPECT_FALSE(store.contains(wrong_ref));
+}
+
+TEST(Test__PreparedWeightStore, ResolvesPreparedEmbeddingRefsByBinding)
 {
     PreparedWeightStore store(ModelContextId{99});
     auto tensor = makeQ8_0Tensor(64, 96);
@@ -125,10 +189,6 @@ TEST(Test__PreparedWeightStore, ResolvesPreparedEmbeddingRefsByTensorAndBinding)
 
     EXPECT_EQ(ref.kind, PreparedWeightKind::PreparedEmbedding);
     EXPECT_TRUE(store.contains(ref));
-
-    auto by_tensor = store.preparedRefForTensor(tensor.get(), DeviceId::cuda(0));
-    ASSERT_TRUE(by_tensor.has_value());
-    EXPECT_EQ(by_tensor->binding_id, ref.binding_id);
 
     auto by_binding = store.preparedRefForBinding(binding.binding_id, DeviceId::cuda(0));
     ASSERT_TRUE(by_binding.has_value());

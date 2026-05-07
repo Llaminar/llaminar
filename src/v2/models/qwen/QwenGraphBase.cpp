@@ -176,19 +176,20 @@ namespace llaminar2
 
     std::optional<PreparedWeightRef> QwenGraphBase::preparedRefForGraphWeight(
         const WeightBinding *binding,
-        const TensorBase *tensor,
         DeviceId device) const
     {
-        if (binding && binding->prepared.has_value() && binding->prepared->device == device)
-            return binding->prepared;
+        // Model GEMM stages must be wired from frozen WeightBinding ids. The
+        // store lookup is intentionally binding-first so cloned or sliced tensor
+        // pointers cannot accidentally select a prepared handle for a different
+        // graph binding, device, PP stage, or TP shard.
         if (binding && prepared_weight_store_)
         {
             auto ref = prepared_weight_store_->preparedRefForBinding(binding->binding_id, device);
             if (ref.has_value())
                 return ref;
         }
-        if (prepared_weight_store_)
-            return prepared_weight_store_->preparedRefForTensor(tensor, device);
+        if (binding && binding->prepared.has_value() && binding->prepared->device == device)
+            return binding->prepared;
         return std::nullopt;
     }
 
@@ -436,7 +437,7 @@ namespace llaminar2
         embed_params.device_id = config_.default_device;
         embed_params.output_buffer_id = BufferId::HIDDEN_STATE;
         embed_params.mpi_ctx = mpi_ctx_.get();
-        embed_params.prepared_ref = preparedRefForGraphWeight(modelEmbeddingBinding(), modelEmbeddingTable(), config_.default_device);
+        embed_params.prepared_ref = preparedRefForGraphWeight(modelEmbeddingBinding(), config_.default_device);
         embed_params.prepared_store = prepared_weight_store_;
 
         graph.addNode("embedding",
@@ -567,7 +568,7 @@ namespace llaminar2
         // Feed LM head from the final RMSNorm output (FP32).
         lm_params.hidden_states = buffers_.layer_buffers.normalized;
         lm_params.lm_head_weight = modelLMHead();
-        lm_params.prepared_ref = preparedRefForGraphWeight(modelLMHeadBinding(), modelLMHead(), device);
+        lm_params.prepared_ref = preparedRefForGraphWeight(modelLMHeadBinding(), device);
         lm_params.logits = lm_head_output;
         lm_params.seq_len = total_tokens;
         lm_params.d_model = config_.d_model;
@@ -704,7 +705,7 @@ namespace llaminar2
             embed_params.device_id = config_.default_device;
             embed_params.output_buffer_id = BufferId::HIDDEN_STATE;
             embed_params.mpi_ctx = mpi_ctx_.get();
-            embed_params.prepared_ref = preparedRefForGraphWeight(modelEmbeddingBinding(), modelEmbeddingTable(), config_.default_device);
+            embed_params.prepared_ref = preparedRefForGraphWeight(modelEmbeddingBinding(), config_.default_device);
             embed_params.prepared_store = prepared_weight_store_;
 
             graph.addNode("embedding",
@@ -893,7 +894,7 @@ namespace llaminar2
             LMHeadStage::Params lm_params;
             lm_params.hidden_states = buffers_.layer_buffers.normalized;
             lm_params.lm_head_weight = modelLMHead();
-            lm_params.prepared_ref = preparedRefForGraphWeight(modelLMHeadBinding(), modelLMHead(), device);
+            lm_params.prepared_ref = preparedRefForGraphWeight(modelLMHeadBinding(), device);
             lm_params.logits = lm_head_output;
             lm_params.seq_len = total_tokens;
             lm_params.d_model = config_.d_model;
@@ -1069,7 +1070,7 @@ namespace llaminar2
                 embed_params.local_vocab_size = modelEmbeddingTable() ? static_cast<int>(modelEmbeddingTable()->rows()) : 0;
                 embed_params.device_id = stage_device;
                 embed_params.mpi_ctx = mpi_ctx_.get();
-                embed_params.prepared_ref = preparedRefForGraphWeight(modelEmbeddingBinding(), modelEmbeddingTable(), stage_device);
+                embed_params.prepared_ref = preparedRefForGraphWeight(modelEmbeddingBinding(), stage_device);
                 embed_params.prepared_store = prepared_weight_store_;
 
                 graph.addNode("embedding",
@@ -1235,7 +1236,7 @@ namespace llaminar2
                 LMHeadStage::Params lm_params;
                 lm_params.hidden_states = buffers_.layer_buffers.normalized;
                 lm_params.lm_head_weight = modelLMHead();
-                lm_params.prepared_ref = preparedRefForGraphWeight(modelLMHeadBinding(), modelLMHead(), stage_device);
+                lm_params.prepared_ref = preparedRefForGraphWeight(modelLMHeadBinding(), stage_device);
                 lm_params.logits = lm_head_output;
                 lm_params.seq_len = total_tokens;
                 lm_params.d_model = config_.d_model;
@@ -1367,7 +1368,7 @@ namespace llaminar2
         params.vocab_offset = embeddingVocabOffsetForDevice(config_, config_.default_device);
         params.local_vocab_size = modelEmbeddingTable() ? static_cast<int>(modelEmbeddingTable()->rows()) : 0;
         params.device_id = config_.default_device;
-        params.prepared_ref = preparedRefForGraphWeight(modelEmbeddingBinding(), modelEmbeddingTable(), config_.default_device);
+        params.prepared_ref = preparedRefForGraphWeight(modelEmbeddingBinding(), config_.default_device);
         params.prepared_store = prepared_weight_store_;
 
         graph.addNode("embedding",
@@ -1472,7 +1473,7 @@ namespace llaminar2
         LMHeadStage::Params lm_params;
         lm_params.hidden_states = hidden_states;
         lm_params.lm_head_weight = modelLMHead();
-        lm_params.prepared_ref = preparedRefForGraphWeight(modelLMHeadBinding(), modelLMHead(), device);
+        lm_params.prepared_ref = preparedRefForGraphWeight(modelLMHeadBinding(), device);
         lm_params.logits = lm_head_output;
         lm_params.seq_len = total_tokens;
         lm_params.d_model = config_.d_model;
@@ -1572,11 +1573,11 @@ namespace llaminar2
             gate_up_params.m = total_tokens; // Use total_tokens = batch_size * seq_len
             gate_up_params.k = k;
             gate_up_params.w_gate = layer.gate_proj;
-            gate_up_params.prepared_ref_gate = preparedRefForGraphWeight(layer_bindings.gate_proj, layer.gate_proj, device);
+            gate_up_params.prepared_ref_gate = preparedRefForGraphWeight(layer_bindings.gate_proj, device);
             gate_up_params.output_gate = buffers.gate;
             gate_up_params.n_gate = gate_n;
             gate_up_params.w_up = layer.up_proj;
-            gate_up_params.prepared_ref_up = preparedRefForGraphWeight(layer_bindings.up_proj, layer.up_proj, device);
+            gate_up_params.prepared_ref_up = preparedRefForGraphWeight(layer_bindings.up_proj, device);
             gate_up_params.output_up = buffers.up;
             gate_up_params.n_up = up_n;
             gate_up_params.mpi_ctx = mpi_ctx_.get();
@@ -1620,7 +1621,7 @@ namespace llaminar2
                 .gemm_context = GemmContext::FFN,
                 .a_buffer_id = BufferId::UP_PROJ,
                 .c_buffer_id = BufferId::ATTN_PROJ,
-                .prepared_ref = preparedRefForGraphWeight(layer_bindings.down_proj, layer.down_proj, device),
+                .prepared_ref = preparedRefForGraphWeight(layer_bindings.down_proj, device),
                 .prepared_store = prepared_weight_store_};
 
             // SwiGLU fusion: pass gate buffer to GEMM for fused silu(gate)*up + GEMM
@@ -2414,6 +2415,7 @@ namespace llaminar2
         const std::string &prefix,
         ActivationBuffers &buffers,
         TensorBase *wo_weight,
+        const WeightBinding *wo_binding,
         int total_tokens,
         int layer_idx,
         DeviceId device,
@@ -2443,7 +2445,7 @@ namespace llaminar2
                           .gemm_context = GemmContext::ATTN,
                           .a_buffer_id = BufferId::ATTN_OUTPUT,
                           .c_buffer_id = BufferId::ATTN_PROJ,
-                          .prepared_ref = preparedRefForGraphWeight(nullptr, wo_weight, device),
+                          .prepared_ref = preparedRefForGraphWeight(wo_binding, device),
                           .prepared_store = prepared_weight_store_,
                       }),
                       device);

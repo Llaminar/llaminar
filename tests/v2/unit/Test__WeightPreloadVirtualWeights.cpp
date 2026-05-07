@@ -7,8 +7,6 @@
  *    included in preloadForDevices() even when they don't exist in the GGUF file
  * 2. The preloaded weights use consistent tensor identity across
  *    packGemmWeightsViaPipeline() and later buildWeights() calls
- * 3. The PreparedGemmKey uses raw_data for matching when available
- *
  * Regression tests for fixes:
  * - TP GEMM cache miss for tied output.weight (April 2026)
  * - PP eager load device parameter mismatch (April 2026)
@@ -18,7 +16,6 @@
 #include "loaders/WeightManager.h"
 #include "config/TensorParallelConfig.h"
 #include "execution/local_execution/graph/GraphSchema.h"
-#include "kernels/KernelFactory.h"
 #include "tensors/Tensors.h"
 #include "backends/DeviceId.h"
 
@@ -27,7 +24,6 @@
 
 using namespace llaminar2;
 using namespace llaminar2::test;
-using namespace llaminar::v2::kernels;
 
 // ============================================================================
 // Test Fixture
@@ -197,8 +193,7 @@ TEST_F(Test__WeightPreloadVirtualWeights, PreloadedVirtualWeightReturnsSameTenso
     ASSERT_NE(second_call, nullptr);
 
     EXPECT_EQ(first_call.get(), second_call.get())
-        << "Repeated getWeightForDevice should return the same cached tensor, "
-           "ensuring consistent identity for PreparedGemmKey matching";
+        << "Repeated getWeightForDevice should return the same cached tensor";
 }
 
 // ============================================================================
@@ -236,98 +231,6 @@ TEST_F(Test__WeightPreloadVirtualWeights, TiedEmbeddingProducesVocabParallelSlic
     // Columns should be full d_model on both
     EXPECT_EQ(cols_dev0, static_cast<size_t>(D_MODEL));
     EXPECT_EQ(cols_dev1, static_cast<size_t>(D_MODEL));
-}
-
-// ============================================================================
-// Test: PreparedGemmKey uses raw_data when available (not tensor identity)
-// ============================================================================
-
-TEST_F(Test__WeightPreloadVirtualWeights, PreparedGemmKeyUsesRawDataWhenAvailable)
-{
-    // Create a simple tensor with valid host data
-    auto tensor = std::make_shared<FP32Tensor>(std::vector<size_t>{32, 32});
-
-    // raw_data() should be non-null for a tensor with host data
-    ASSERT_NE(tensor->raw_data(), nullptr);
-
-    // Construct a PreparedGemmKey the way prepared GEMM registry lookup does
-    const void *key_data = tensor->raw_data();
-    const void *key_identity = key_data ? nullptr : static_cast<const void *>(tensor.get());
-
-    // When raw_data is available, identity should be nullptr
-    EXPECT_NE(key_data, nullptr);
-    EXPECT_EQ(key_identity, nullptr)
-        << "When raw_data is non-null, tensor_identity should be nullptr";
-
-    KernelFactory::PreparedGemmKey key1{
-        key_data, key_identity,
-        tensor->shape()[0], tensor->shape()[1],
-        DeviceId::cpu(), 0};
-
-    // Same key constructed again should be equal
-    KernelFactory::PreparedGemmKey key2{
-        key_data, key_identity,
-        tensor->shape()[0], tensor->shape()[1],
-        DeviceId::cpu(), 0};
-
-    EXPECT_EQ(key1, key2);
-
-    // Hash should also match
-    KernelFactory::PreparedGemmKeyHash hasher;
-    EXPECT_EQ(hasher(key1), hasher(key2));
-}
-
-// ============================================================================
-// Test: PreparedGemmKey falls back to tensor identity when raw_data is null
-// ============================================================================
-
-TEST_F(Test__WeightPreloadVirtualWeights, PreparedGemmKeyFallsBackToIdentity)
-{
-    // Simulate a tensor whose host data was released
-    auto tensor1 = std::make_shared<FP32Tensor>(std::vector<size_t>{32, 32});
-    auto tensor2 = std::make_shared<FP32Tensor>(std::vector<size_t>{32, 32});
-
-    // Simulate null raw_data (as happens after release_raw_data())
-    const void *null_data = nullptr;
-
-    KernelFactory::PreparedGemmKey key1{
-        null_data, static_cast<const void *>(tensor1.get()),
-        32, 32, DeviceId::cpu(), 0};
-
-    KernelFactory::PreparedGemmKey key2{
-        null_data, static_cast<const void *>(tensor2.get()),
-        32, 32, DeviceId::cpu(), 0};
-
-    // Different tensor identities → different keys
-    EXPECT_NE(key1, key2)
-        << "Keys with different tensor_identity should not be equal";
-
-    // Same tensor identity → same key
-    KernelFactory::PreparedGemmKey key3{
-        null_data, static_cast<const void *>(tensor1.get()),
-        32, 32, DeviceId::cpu(), 0};
-
-    EXPECT_EQ(key1, key3);
-}
-
-// ============================================================================
-// Test: PreparedGemmKey device isolation
-// ============================================================================
-
-TEST_F(Test__WeightPreloadVirtualWeights, PreparedGemmKeyDeviceIsolation)
-{
-    auto tensor = std::make_shared<FP32Tensor>(std::vector<size_t>{32, 32});
-    const void *data = tensor->raw_data();
-
-    KernelFactory::PreparedGemmKey key_dev0{
-        data, nullptr, 32, 32, tpDevice0(), 0};
-
-    KernelFactory::PreparedGemmKey key_dev1{
-        data, nullptr, 32, 32, tpDevice1(), 0};
-
-    // Same tensor, different device → different keys
-    EXPECT_NE(key_dev0, key_dev1)
-        << "Keys for different devices should not be equal even with same raw_data";
 }
 
 // ============================================================================

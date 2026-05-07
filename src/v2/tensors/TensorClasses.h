@@ -659,7 +659,7 @@ namespace llaminar2
         friend MemoryDescriptor makeMemoryDescriptor(const TensorBase *); // Allow descriptor factory
 
     public:
-        virtual ~TensorBase(); // Implemented in TensorBase.cpp - clears KernelFactory cache
+        virtual ~TensorBase(); // Implemented in TensorBase.cpp
 
         // Non-copyable: tensors contain mutexes and cached kernels
         // Use copyFrom() method to copy data between tensors
@@ -674,7 +674,7 @@ namespace llaminar2
         mutable std::any cache_;
 
         // Runtime hint: set when this tensor's device representation is managed
-        // by the prepared weight pipeline (PreparedWeightStore / KernelFactory).
+        // by the prepared weight pipeline (PreparedWeightStore).
         // Used by StageCoherence, TransferEngine, DeviceGraphExecutor, and
         // WeightManager to skip raw uploads and determine host-release safety.
         //
@@ -1103,9 +1103,6 @@ namespace llaminar2
          * @return true if this tensor has prepared device state
          */
         bool hasPreparedDeviceState() const { return has_prepared_device_state_; }
-
-        /// @deprecated Use hasPreparedDeviceState() — semantically identical.
-        bool isInPreparedGemmRegistry() const { return has_prepared_device_state_; }
 
         /**
          * @brief Check if tensor uses zero-copy mapped memory

@@ -633,32 +633,6 @@ ExpertWeightBlobs MoEExpertWeightService::serializeExpert(const MoEWeightContext
 // Phased rebalance API
 // =========================================================================
 
-bool MoEExpertWeightService::registerTransferredExpert(MoEWeightContext& ctx, int expert_id, const ExpertWeightBlobs& blobs)
-{
-    using namespace cpu::native_vnni;
-
-    auto register_one = [&](const std::vector<uint8_t>& blob,
-                            const std::shared_ptr<TensorBase>& view) -> bool {
-        if (blob.empty() || !view) return false;
-
-        auto packed_weights = packed_weights_serialization::deserialize(blob.data(), blob.size());
-        if (!packed_weights) return false;
-
-        auto* cpu_pw = dynamic_cast<CPUPackedWeights*>(packed_weights.get());
-        if (!cpu_pw) return false;
-
-        auto kernel = std::make_unique<CPUNativeVNNIGemmKernel>(cpu_pw->takePacked());
-        return KernelFactory::registerPreparedGemmFromTransfer(
-            view.get(), ctx.device_id, std::move(kernel)) != nullptr;
-    };
-
-    bool gate_ok = register_one(blobs.gate, ctx.expert_gate_views[expert_id]);
-    bool up_ok   = register_one(blobs.up,   ctx.expert_up_views[expert_id]);
-    bool down_ok = register_one(blobs.down,  ctx.expert_down_views[expert_id]);
-
-    return gate_ok && up_ok && down_ok;
-}
-
 std::vector<const TensorBase*> MoEExpertWeightService::releaseDepartedExperts(
     MoEWeightContext& ctx, const std::vector<bool>& new_mask)
 {
@@ -1013,28 +987,24 @@ bool MoEExpertWeightService::registerAndPrepareNewExpertsGPU(
 
     std::vector<int> experts_to_load;
     experts_to_load.reserve(new_experts.size());
+    auto cached_engine_for = [&](const std::optional<ExpertSlabRef>& slab_ref, int expert_id) -> ITensorGemm*
+    {
+        if (!ctx.prepared_store || !slab_ref.has_value())
+            return nullptr;
+        return ctx.prepared_store->expertGemmKernel(*slab_ref, expert_id);
+    };
     for (int e : new_experts)
     {
-        bool cache_hit = true;
-        for (auto& grp : groups)
+        ITensorGemm* cached_gate = cached_engine_for(ctx.gate_slab_ref, e);
+        ITensorGemm* cached_up = cached_engine_for(ctx.up_slab_ref, e);
+        ITensorGemm* cached_down = cached_engine_for(ctx.down_slab_ref, e);
+        if (cached_gate && cached_up && cached_down)
         {
-            const auto& view = grp.views[e];
-            if (!view)
-            {
-                cache_hit = false;
-                break;
-            }
-            const auto* prepared = KernelFactory::findPreparedGemmWeights(view.get(), ctx.device_id);
-            if (!prepared)
-            {
-                cache_hit = false;
-                break;
-            }
-            grp.out_gemms[e] = KernelFactory::getOrCreateGemmEngine(prepared);
-            cache_hit = cache_hit && grp.out_gemms[e] != nullptr;
-        }
-        if (cache_hit)
+            groups[0].out_gemms[e] = cached_gate;
+            groups[1].out_gemms[e] = cached_up;
+            groups[2].out_gemms[e] = cached_down;
             continue;
+        }
 
         if (!hasCompleteTransferredBlobs(e))
         {

@@ -82,7 +82,7 @@ public:
     // === Existing API ===
     PreparedWeightRef prepareGemm(const WeightBinding& binding);
     ITensorGemm* gemmKernel(const PreparedWeightRef& ref) const;
-    ITensorGemm* gemmKernelForTensor(const TensorBase* tensor) const;
+    std::optional<PreparedWeightRef> preparedRefForBinding(uint64_t binding_id, DeviceId device) const;
 
     // === New: MoE Expert Slab API ===
 

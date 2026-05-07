@@ -227,16 +227,6 @@ set_tests_properties(V2_FetchModelsFixture PROPERTIES
 
 if(NOT V2_PERF_TESTS_ONLY)
     add_test(
-        NAME V2_Unit_Static_NoNewStagePreparedGemmFactoryFallbacks
-        COMMAND bash ${PROJECT_ROOT}/scripts/check_no_new_stage_prepared_gemm_factory_calls.sh ${PROJECT_ROOT}
-        WORKING_DIRECTORY ${PROJECT_ROOT}
-    )
-    set_tests_properties(V2_Unit_Static_NoNewStagePreparedGemmFactoryFallbacks PROPERTIES
-        LABELS "V2;Unit;StaticAnalysis;Weights;PreparedWeights;KernelFactory"
-        TIMEOUT 30
-    )
-
-    add_test(
         NAME V2_Unit_Static_NoKernelFactoryPreparedEmbeddingRegistry
         COMMAND bash ${PROJECT_ROOT}/scripts/check_no_kernel_factory_prepared_embedding_registry.sh ${PROJECT_ROOT}
         WORKING_DIRECTORY ${PROJECT_ROOT}
@@ -1053,20 +1043,6 @@ target_link_libraries(v2_unit_expert_weight_transfer
 add_v2_test(V2_Unit_ExpertWeightTransfer
     COMMAND $<TARGET_FILE:v2_unit_expert_weight_transfer>
     LABELS "V2;Unit;MoE;WeightTransfer;PackedWeights"
-    MPI_PROCS 1
-)
-
-# Test: MoE Weight Transfer Attach — Phase 3 integration (register + round-trip)
-add_executable(v2_unit_moe_weight_transfer_attach unit/moe/Test__MoEWeightTransferAttach.cpp)
-target_include_directories(v2_unit_moe_weight_transfer_attach PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(v2_unit_moe_weight_transfer_attach
-    llaminar2_core
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Unit_MoEWeightTransferAttach
-    COMMAND $<TARGET_FILE:v2_unit_moe_weight_transfer_attach>
-    LABELS "V2;Unit;MoE;WeightTransfer;PackedWeights;Attach"
     MPI_PROCS 1
 )
 
@@ -2024,19 +2000,6 @@ add_v2_test(V2_Unit_PreparedWeightStoreSliced
     COMMAND $<TARGET_FILE:v2_test_prepared_weight_store_sliced>
     LABELS "V2;Unit;Loaders;PreparedWeightStore;TensorParallelism;SlicedGEMM;Phase2"
     MPI_PROCS 1  # Sliced kernel tests, single rank
-)
-
-# Test: KernelFactory automatic cache invalidation on tensor destruction
-add_executable(v2_test_kernel_factory_cache_invalidation unit/kernels/Test__KernelFactoryCacheInvalidation.cpp)
-target_link_libraries(v2_test_kernel_factory_cache_invalidation
-    llaminar2_core
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Unit_KernelFactoryCacheInvalidation
-    COMMAND $<TARGET_FILE:v2_test_kernel_factory_cache_invalidation>
-    LABELS "V2;Unit;Kernels;KernelFactory;CacheInvalidation;MemorySafety"
-    MPI_PROCS 1  # Cache invalidation tests, single rank
 )
 
 # Test: Kernel dynamic state lifecycle (session boundary resets)
@@ -3852,7 +3815,6 @@ add_v2_test(V2_Unit_WeightManager_DeviceAware
 # Regression tests for TP GEMM cache miss when tied embeddings (output.weight)
 # aren't in the GGUF tensor list. Verifies that virtual weights from
 # WeightShardingConfig.exact_matches are included in preloadForDevices().
-# Also tests PreparedGemmKey identity logic for consistent cache hits.
 add_executable(v2_test_weight_preload_virtual_weights unit/Test__WeightPreloadVirtualWeights.cpp)
 target_include_directories(v2_test_weight_preload_virtual_weights PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}  # For tests/v2/mocks/ includes
@@ -3863,7 +3825,7 @@ target_link_libraries(v2_test_weight_preload_virtual_weights
 )
 add_v2_test(V2_Unit_WeightPreloadVirtualWeights
     COMMAND $<TARGET_FILE:v2_test_weight_preload_virtual_weights>
-    LABELS "V2;Unit;WeightManager;TensorParallelism;TiedEmbeddings;PreparedGemm;Regression"
+    LABELS "V2;Unit;WeightManager;TensorParallelism;TiedEmbeddings;Regression"
     MPI_PROCS 1
 )
 

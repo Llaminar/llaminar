@@ -147,9 +147,9 @@ namespace llaminar2
                               .output_q_buffer_id = BufferId::Q_PROJ,
                               .output_k_buffer_id = BufferId::K_PROJ,
                               .output_v_buffer_id = BufferId::V_PROJ,
-                              .prepared_ref_q = preparedRefForGraphWeight(layer_bindings.wq, layer.wq, device),
-                              .prepared_ref_k = preparedRefForGraphWeight(layer_bindings.wk, layer.wk, device),
-                              .prepared_ref_v = preparedRefForGraphWeight(layer_bindings.wv, layer.wv, device),
+                              .prepared_ref_q = preparedRefForGraphWeight(layer_bindings.wq, device),
+                              .prepared_ref_k = preparedRefForGraphWeight(layer_bindings.wk, device),
+                              .prepared_ref_v = preparedRefForGraphWeight(layer_bindings.wv, device),
                               .prepared_store = prepared_weight_store_,
                           }),
                           device);
@@ -191,7 +191,7 @@ namespace llaminar2
 
         // Stage 5: Wo projection + optional TP allreduce
         std::string terminal = addWoProjectionAndAllreduce(
-            graph, prefix, buffers, layer.wo,
+            graph, prefix, buffers, layer.wo, layer_bindings.wo,
             total_tokens, layer_idx, device, attn_node);
 
         graph.setTerminalNode(terminal);

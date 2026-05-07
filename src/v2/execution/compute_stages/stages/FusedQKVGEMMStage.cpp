@@ -39,11 +39,18 @@ namespace llaminar2
             if (error) *error = "FusedQKVGEMMStage requires PreparedWeightStore and Q/K/V PreparedWeightRefs";
             return false;
         }
-        if (!params_.prepared_store->contains(params_.prepared_ref_q.value()) ||
-            !params_.prepared_store->contains(params_.prepared_ref_k.value()) ||
-            !params_.prepared_store->contains(params_.prepared_ref_v.value()))
+        const bool has_q = params_.prepared_store->contains(params_.prepared_ref_q.value());
+        const bool has_k = params_.prepared_store->contains(params_.prepared_ref_k.value());
+        const bool has_v = params_.prepared_store->contains(params_.prepared_ref_v.value());
+        if (!has_q || !has_k || !has_v)
         {
-            if (error) *error = "FusedQKVGEMMStage has a PreparedWeightRef missing from PreparedWeightStore";
+            if (error)
+            {
+                *error = "FusedQKVGEMMStage has a PreparedWeightRef missing from PreparedWeightStore"
+                         " q=" + std::to_string(params_.prepared_ref_q->binding_id) + ":" + (has_q ? "1" : "0") +
+                         " k=" + std::to_string(params_.prepared_ref_k->binding_id) + ":" + (has_k ? "1" : "0") +
+                         " v=" + std::to_string(params_.prepared_ref_v->binding_id) + ":" + (has_v ? "1" : "0");
+            }
             return false;
         }
         return true;

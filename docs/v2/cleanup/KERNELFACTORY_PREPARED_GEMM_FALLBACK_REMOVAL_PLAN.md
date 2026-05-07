@@ -40,7 +40,7 @@ The initial inventory was captured on 2026-05-05 with:
 rg "getOrCreatePreparedGemmWeights|getOrCreateGemmSliced|getKernelAsWorkspaceConsumer" src/v2 tests/v2
 ```
 
-The Phase 0 static guard originally ratcheted production stage fallback calls to `KernelFactory::getOrCreatePreparedGemmWeights()`. It has since been tightened to a zero-tolerance final guard: any stage file reference to the deleted API fails `V2_Unit_Static_NoNewStagePreparedGemmFactoryFallbacks`.
+The Phase 0 static guard originally ratcheted production stage fallback calls to `KernelFactory::getOrCreatePreparedGemmWeights()`. That grep-based guard was intentionally temporary and has been removed after the cleanup; the durable contract is enforced by binding-first prepared-weight wiring and regression tests.
 
 Final stage fallback baseline:
 
@@ -199,7 +199,7 @@ ITensorGemm* slicedGemmKernel(const PreparedWeightRef& ref,
 Add or extend `tests/v2/unit/loaders/Test__PreparedWeightStore.cpp` for:
 
 - `gemmKernel(ref)` success and missing-ref failure.
-- `preparedRefForTensor(tensor, device)` only as a transition lookup.
+- `preparedRefForBinding(binding_id, device)` success and wrong-device/wrong-binding failures.
 - `slicedGemmKernel(ref, start, end)` success, cache reuse, invalid ranges.
 - fused gate/up lookup by refs.
 - store cleanup releases owned handles and fused/sliced caches.

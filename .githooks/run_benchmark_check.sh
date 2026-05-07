@@ -9,9 +9,12 @@
 #   { "regression_threshold_pct": 10,
 #     "models": [
 #       { "name": "...", "model": "...", "decode_tokens": 128,
-#         "devices": { "cpu": { "prefill_tok_s": ..., "decode_tok_s": ... }, ... } },
+#         "devices": { "cpu": { "prefill_tok_s": ..., "decode_tok_s": ..., "regression_threshold_pct": 25 }, ... } },
 #       ...
 #     ] }
+#
+# Device-specific thresholds override model/global thresholds. CPU entries use
+# 25% tolerance to avoid noisy local-load commit blocks; GPU entries stay tight.
 #
 # Usage:
 #   .githooks/run_benchmark_check.sh                  # normal regression check

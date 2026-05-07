@@ -19,6 +19,7 @@
 
 #include "../../utils/TestModelHelper.h"
 #include "../../src/v2/loaders/WeightManager.h"
+#include "../../src/v2/loaders/PreparedWeightStore.h"
 #include "../../src/v2/loaders/ModelLoader.h"
 #include "../../src/v2/loaders/ExpertGemmRegistry.h"
 #include "../../src/v2/tensors/Tensors.h"
@@ -328,9 +329,10 @@ TEST_F(UnifiedGPUPipelineTest, DenseAndMoEInSamePipeline)
     auto shexp_gate = weight_mgr_->getWeightForDevice("blk.0.ffn_gate_shexp.weight");
     ASSERT_NE(shexp_gate, nullptr) << "Shared expert gate weight should exist";
 
-    // Dense weights should have a PreparedGemmWeights entry
-    auto *prepared = KernelFactory::findPreparedGemmWeights(shexp_gate.get(), device_);
-    EXPECT_NE(prepared, nullptr)
+    // Dense weights should have been prepared by the pipeline. Graph-time lookup
+    // is intentionally binding-id based; this tensor flag only verifies that the
+    // pipeline attached prepared state to the resident weight object.
+    EXPECT_TRUE(shexp_gate->hasPreparedDeviceState())
         << "Dense ffn_gate_shexp.weight should have been packed by the pipeline";
 
     // MoE expert weights should also be registered
@@ -419,8 +421,7 @@ TEST_F(UnifiedGPUPipelineTest, FALayerAttentionWeightsPacked)
         auto tensor = weight_mgr_->getWeightForDevice(name);
         ASSERT_NE(tensor, nullptr) << "FA weight " << name << " should exist";
 
-        auto *prepared = KernelFactory::findPreparedGemmWeights(tensor.get(), device_);
-        EXPECT_NE(prepared, nullptr)
+        EXPECT_TRUE(tensor->hasPreparedDeviceState())
             << "FA weight " << name << " should have been packed by the pipeline";
     }
 

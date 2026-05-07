@@ -88,7 +88,7 @@ namespace llaminar2
 
             // Skip tensors whose GEMM weights are managed by the GPU pipeline.
             // The prepared GEMM kernel owns the device copy in pooled VRAM.
-            if (tensor_base->isInPreparedGemmRegistry())
+            if (tensor_base->hasPreparedDeviceState())
             {
                 if (trace_coherence)
                 {

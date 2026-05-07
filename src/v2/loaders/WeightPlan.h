@@ -47,14 +47,17 @@ namespace llaminar2
     struct WeightRequirement
     {
         std::string canonical_name;
+        std::string source_name;
         bool required = true;
         WeightRole role = WeightRole::Other;
+        WeightDerivationKind derivation = WeightDerivationKind::Source;
         int layer = -1;
         int expert = -1;
         int pp_stage = -1;
         int tp_domain = -1;
         int tp_rank_or_device_index = 0;
         DeviceId target_device = DeviceId::cpu();
+        std::optional<DeviceId> lookup_device;
         WeightHostPolicy host_policy = WeightHostPolicy::RequiredUntilGraphMaterialized;
         PreparedWeightKind expected_prepared_kind = PreparedWeightKind::None;
         WeightSliceSpec slice;

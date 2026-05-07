@@ -719,14 +719,16 @@ namespace llaminar2
             layer.ssm_alpha = get("ssm_alpha.weight");
             layer.ssm_beta = get("ssm_beta.weight");
             layer.ssm_conv1d = get("ssm_conv1d.weight");
-            layer.ssm_dt_bias = get("ssm_dt_bias.weight");
-            layer.ssm_a = get("ssm_a.weight");
+            layer.ssm_dt_bias = get("ssm_dt.bias");
+            layer.ssm_a = get("ssm_a");
             layer.ssm_norm = get("ssm_norm.weight");
             layer.ssm_out = get("ssm_out.weight");
             layer.gate_proj = get("ffn_gate.weight");
             layer.up_proj = get("ffn_up.weight");
             layer.down_proj = get("ffn_down.weight");
             layer.ffn_norm = get("ffn_norm.weight");
+            if (!layer.ffn_norm)
+                layer.ffn_norm = get("post_attention_norm.weight");
             layer.moe_gate = get("ffn_gate_inp.weight");
             layer.moe_gate_exps = get("ffn_gate_exps.weight");
             layer.moe_up_exps = get("ffn_up_exps.weight");

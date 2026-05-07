@@ -296,6 +296,30 @@ namespace llaminar2
         }
     }
 
+    void DeviceGraphOrchestrator::setFrozenWeightSet(std::unique_ptr<FrozenModelWeightSet> weight_set)
+    {
+        if (!graph_builder_)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Cannot set frozen weights: graph builder not initialized");
+            return;
+        }
+        if (!weight_set)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Cannot set frozen weights: null weight set");
+            return;
+        }
+
+        weight_set->validateForGraph();
+        frozen_weight_set_ = std::move(weight_set);
+
+        auto weight_bindings = makeModelWeightBindings(*frozen_weight_set_);
+        graph_builder_->setWeightBindings(weight_bindings);
+        graph_builder_->setWeights(toLegacyModelWeights(weight_bindings));
+
+        LOG_DEBUG("[DeviceGraphOrchestrator] FrozenModelWeightSet configured directly with "
+                  << frozen_weight_set_->bindings().size() << " bindings");
+    }
+
     void DeviceGraphOrchestrator::buildFrozenWeightSet(
         const ModelWeights &weights,
         const std::unordered_map<int, LayerWeights> &resolved_layers,
@@ -373,8 +397,8 @@ namespace llaminar2
             addLayer(lw.ssm_alpha, "ssm_alpha.weight", WeightRole::GDNSsmParam);
             addLayer(lw.ssm_beta, "ssm_beta.weight", WeightRole::GDNSsmParam);
             addLayer(lw.ssm_conv1d, "ssm_conv1d.weight", WeightRole::GDNSsmParam);
-            addLayer(lw.ssm_dt_bias, "ssm_dt_bias.weight", WeightRole::Bias);
-            addLayer(lw.ssm_a, "ssm_a.weight", WeightRole::GDNSsmParam);
+            addLayer(lw.ssm_dt_bias, "ssm_dt.bias", WeightRole::Bias);
+            addLayer(lw.ssm_a, "ssm_a", WeightRole::GDNSsmParam);
             addLayer(lw.ssm_norm, "ssm_norm.weight", WeightRole::Norm);
             addLayer(lw.ssm_out, "ssm_out.weight", WeightRole::GDNProjection);
             addLayer(lw.gate_proj, "ffn_gate.weight", WeightRole::FFNGate);
@@ -2289,26 +2313,37 @@ namespace llaminar2
 
     void DeviceGraphOrchestrator::initializePreparedWeightStore(DeviceId device)
     {
-        if (prepared_weight_store_)
-        {
-            LOG_DEBUG("[DGO] Prepared weight store already initialized");
-            return;
-        }
-
         if (!weight_manager_)
         {
             LOG_DEBUG("[DGO] No weight manager — skipping prepared weight store");
             return;
         }
 
-        ModelContextId model_id{};
-        model_id.value = reinterpret_cast<uint64_t>(this); // Stable per-orchestrator ID
+        ModelContextId requested_model_id{};
+        requested_model_id.value = reinterpret_cast<uint64_t>(this); // Fallback only when no model-owned store exists
+        if (frozen_weight_set_ && frozen_weight_set_->strategy().model_id.value != 0)
+            requested_model_id = frozen_weight_set_->strategy().model_id;
 
-        prepared_weight_store_ = std::make_unique<PreparedWeightStore>(model_id);
+        if (!prepared_weight_store_)
+        {
+            if (auto concrete_weight_manager = std::dynamic_pointer_cast<WeightManager>(weight_manager_))
+            {
+                prepared_weight_store_ = concrete_weight_manager->preparedWeightStoreIfInitialized();
+            }
+            if (!prepared_weight_store_)
+            {
+                prepared_weight_store_ = std::make_shared<PreparedWeightStore>(requested_model_id);
+            }
+            if (auto concrete_weight_manager = std::dynamic_pointer_cast<WeightManager>(weight_manager_))
+            {
+                concrete_weight_manager->setPreparedWeightStore(prepared_weight_store_);
+            }
+        }
 
-        // Populate the store from weights already prepared via KernelFactory.
-        // This dual-registers prepared weights so they're queryable through
-        // the model-context-owned store (Phase 4 compatibility layer).
+        ModelContextId model_id = prepared_weight_store_->modelId();
+        if (model_id.value == 0)
+            model_id = requested_model_id;
+
         int registered = 0;
         uint64_t next_binding_id = 1;
         if (frozen_weight_set_)
@@ -2324,7 +2359,9 @@ namespace llaminar2
 
             WeightBinding binding = source_binding;
 
-            if (binding.identity.model_id.value == 0)
+            if (!frozen_weight_set_)
+                binding.identity.model_id = model_id;
+            else if (binding.identity.model_id.value == 0)
                 binding.identity.model_id = model_id;
             binding.residency.home_device = device;
             binding.residency.resident_device = device;
@@ -2336,6 +2373,8 @@ namespace llaminar2
                     const auto *unpackable = dynamic_cast<const IINT8Unpackable *>(tensor);
                     if (device.is_gpu() && unpackable && unpackable->vnniFormatInfo())
                     {
+                        if (prepared_weight_store_->preparedRefForBinding(binding.binding_id, device).has_value())
+                            return;
                         const auto &cfg = graph_builder_->config();
                         size_t vocab_offset = 0;
                         size_t total_vocab = static_cast<size_t>(cfg.vocab_size);
@@ -2363,32 +2402,24 @@ namespace llaminar2
                     return;
                 }
 
-                const auto* handle = llaminar::v2::kernels::KernelFactory::findPreparedGemmWeights(
-                    tensor, device);
-
-                PreparedWeightKind kind = device.is_cuda()
-                    ? PreparedWeightKind::CudaInt8PackedGemm
-                    : device.is_rocm()
-                        ? PreparedWeightKind::RocmInt8PackedGemm
-                        : PreparedWeightKind::CpuPackedGemm;
-
-                if (handle)
+                if (binding.identity.role == WeightRole::Embedding ||
+                    binding.identity.role == WeightRole::Norm ||
+                    binding.identity.role == WeightRole::Bias ||
+                    tensor->shape().size() != 2)
                 {
-                    prepared_weight_store_->registerPreparedGemmFromPipeline(
-                        binding, kind, device, handle);
+                    return;
                 }
-                else
+
+                if (prepared_weight_store_->preparedRefForBinding(binding.binding_id, device).has_value())
                 {
-                    if (binding.identity.role == WeightRole::Embedding ||
-                        binding.identity.role == WeightRole::Norm ||
-                        binding.identity.role == WeightRole::Bias ||
-                        tensor->shape().size() != 2)
-                    {
-                        return;
-                    }
+                    return;
+                }
+
+                if (device.is_cpu())
+                {
                     prepared_weight_store_->prepareGemm(binding);
+                    ++registered;
                 }
-                ++registered;
             }
             catch (const std::exception& e)
             {
@@ -2420,7 +2451,8 @@ namespace llaminar2
         }
 
         LOG_INFO("[DGO] Prepared weight store initialized with "
-                 << registered << " entries for device " << device.toString());
+             << prepared_weight_store_->size() << " entries for device " << device.toString()
+             << " (new=" << registered << ")");
 
         // Phase 10: Wire prepared weight store to graph builder so stages
         // can resolve kernels through the store instead of KernelFactory fallbacks.
@@ -2482,18 +2514,13 @@ namespace llaminar2
             }
         }
 
-        // ── Step 2: Phase 1 — release departed experts, collect views ───
-        std::vector<const TensorBase*> all_evict;
+        // ── Step 2: Phase 1 — release departed experts ─────────────────
         for (auto& [stage, layer] : moe_stages)
         {
-            auto evict = stage->releaseDepartedExperts(masks[layer]);
-            all_evict.insert(all_evict.end(), evict.begin(), evict.end());
+            (void)stage->releaseDepartedExperts(masks[layer]);
         }
 
-        // ── Step 3: Batch cache eviction (ONE scan, not thousands) ──────
-        llaminar::v2::kernels::KernelFactory::clearPreparedGemmWeightsForBatch(all_evict);
-
-        // ── Step 4: Phase 2 — register + prepare (parallel across stages)
+        // ── Step 3: Phase 2 — register + prepare (parallel across stages)
         std::atomic<int> applied{0};
         const int n = static_cast<int>(moe_stages.size());
 

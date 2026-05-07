@@ -1,12 +1,11 @@
 /**
  * @file Test__ExpertTransferFixes.cpp
  * @brief Tests for cross-domain expert transfer fixes:
- *   1. createExpertGemmFromTransferBlob creates valid kernel without global registry
+ *   1. createExpertGemmFromTransferBlob creates valid caller-owned kernels
  *   2. Transfer blob path produces numerically identical results to full repack
  *   3. Empty/corrupt blobs return nullptr gracefully
- *   4. Phase D alignment: transferred experts don't pollute global registry
- *   5. MPI INT_MAX size guard in ExpertWeightTransfer
- *   6. Serialization → createExpertGemmFromTransferBlob round-trip correctness
+ *   4. MPI INT_MAX size guard in ExpertWeightTransfer
+ *   5. Serialization → createExpertGemmFromTransferBlob round-trip correctness
  */
 
 #include <gtest/gtest.h>
@@ -73,28 +72,7 @@ TEST_F(Test__ExpertTransferFixes, TransferBlob_ReturnsValidEngine)
 }
 
 // ---------------------------------------------------------------------------
-// 2. Transfer blob path does NOT register in global registry
-// ---------------------------------------------------------------------------
-
-TEST_F(Test__ExpertTransferFixes, TransferBlob_NoGlobalRegistry)
-{
-    auto tensor = TestTensorFactory::createQ4_0Random({64, 128});
-    auto blob = createPackedBlob(tensor.get());
-    ASSERT_FALSE(blob.empty());
-
-    // Clear cache to ensure clean slate
-    KF::clearCache();
-
-    auto engine = KF::createExpertGemmFromTransferBlob(blob);
-    ASSERT_NE(engine, nullptr);
-
-    // Global registry should remain empty
-    EXPECT_EQ(KF::preparedGemmRegistrySize(), 0u)
-        << "createExpertGemmFromTransferBlob must NOT insert into global registry";
-}
-
-// ---------------------------------------------------------------------------
-// 3. Transfer blob preserves weight data through round-trip
+// 2. Transfer blob preserves weight data through round-trip
 // ---------------------------------------------------------------------------
 
 TEST_F(Test__ExpertTransferFixes, TransferBlob_NumericalParity)
@@ -129,7 +107,7 @@ TEST_F(Test__ExpertTransferFixes, TransferBlob_NumericalParity)
 }
 
 // ---------------------------------------------------------------------------
-// 4. Empty blob returns nullptr
+// 3. Empty blob returns nullptr
 // ---------------------------------------------------------------------------
 
 TEST_F(Test__ExpertTransferFixes, TransferBlob_EmptyReturnsNull)
@@ -140,7 +118,7 @@ TEST_F(Test__ExpertTransferFixes, TransferBlob_EmptyReturnsNull)
 }
 
 // ---------------------------------------------------------------------------
-// 5. Corrupt blob returns nullptr (no crash)
+// 4. Corrupt blob returns nullptr (no crash)
 // ---------------------------------------------------------------------------
 
 TEST_F(Test__ExpertTransferFixes, TransferBlob_CorruptReturnsNull)
@@ -151,7 +129,7 @@ TEST_F(Test__ExpertTransferFixes, TransferBlob_CorruptReturnsNull)
 }
 
 // ---------------------------------------------------------------------------
-// 6. Multiple blobs produce independent engines
+// 5. Multiple blobs produce independent engines
 // ---------------------------------------------------------------------------
 
 TEST_F(Test__ExpertTransferFixes, TransferBlob_IndependentEngines)
@@ -180,7 +158,7 @@ TEST_F(Test__ExpertTransferFixes, TransferBlob_IndependentEngines)
 }
 
 // ---------------------------------------------------------------------------
-// 7. Lifetime governed by shared_ptr (no registry dependency)
+// 6. Lifetime governed by shared_ptr
 // ---------------------------------------------------------------------------
 
 TEST_F(Test__ExpertTransferFixes, TransferBlob_LifetimeViaSharedPtr)
@@ -202,7 +180,7 @@ TEST_F(Test__ExpertTransferFixes, TransferBlob_LifetimeViaSharedPtr)
 }
 
 // ---------------------------------------------------------------------------
-// 8. Full round-trip: pack → serialize → transfer blob → valid engine (Q8_0)
+// 7. Full round-trip: pack → serialize → transfer blob → valid engine (Q8_0)
 // ---------------------------------------------------------------------------
 
 TEST_F(Test__ExpertTransferFixes, FullRoundTrip_Q8_0)
@@ -234,7 +212,7 @@ TEST_F(Test__ExpertTransferFixes, FullRoundTrip_Q8_0)
 }
 
 // ---------------------------------------------------------------------------
-// 9. ExpertWeightBlobs: empty gate/up/down detection
+// 8. ExpertWeightBlobs: empty gate/up/down detection
 // ---------------------------------------------------------------------------
 
 TEST_F(Test__ExpertTransferFixes, ExpertWeightBlobs_EmptyDetection)
@@ -249,33 +227,7 @@ TEST_F(Test__ExpertTransferFixes, ExpertWeightBlobs_EmptyDetection)
 }
 
 // ---------------------------------------------------------------------------
-// 10. Contrast: prepareExpertGemmLocal vs createExpertGemmFromTransferBlob
-//     Neither pollutes global registry (Phase D alignment)
-// ---------------------------------------------------------------------------
-
-TEST_F(Test__ExpertTransferFixes, PhaseDAlignment_NeitherPathRegistersGlobally)
-{
-    auto tensor = TestTensorFactory::createQ4_0Random({64, 128});
-
-    // Path 1: local prep (from raw data)
-    auto engine_local = KF::prepareExpertGemmLocal(tensor.get(), DeviceId::cpu());
-    ASSERT_NE(engine_local, nullptr);
-
-    // Path 2: transfer blob (from serialized)
-    auto blob = createPackedBlob(tensor.get());
-    KF::clearCache(); // Clear any side effects from createPackedBlob
-    auto engine_transfer = KF::createExpertGemmFromTransferBlob(blob);
-    ASSERT_NE(engine_transfer, nullptr);
-
-    // Neither should appear in global registry
-    const auto* found = KF::findPreparedGemmWeights(tensor.get(), DeviceId::cpu());
-    EXPECT_EQ(found, nullptr)
-        << "Neither local prep nor transfer blob should register globally";
-    EXPECT_EQ(KF::preparedGemmRegistrySize(), 0u);
-}
-
-// ---------------------------------------------------------------------------
-// 11. MPI INT_MAX guard — size tag computation stays in range
+// 9. MPI INT_MAX guard — size tag computation stays in range
 // ---------------------------------------------------------------------------
 
 TEST_F(Test__ExpertTransferFixes, MPITagRange_SizeAndDataSeparate)

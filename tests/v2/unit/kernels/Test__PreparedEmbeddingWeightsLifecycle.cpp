@@ -93,10 +93,10 @@ protected:
 TEST_F(Test__PreparedEmbeddingWeightsLifecycle, StoreStartsWithoutEmbeddingEntries)
 {
     PreparedWeightStore store(kModelId);
-    auto tensor = TestTensorFactory::createQ8_0Random({kVocabSize, kDModel});
+    PreparedWeightRef missing{kModelId, 1, PreparedWeightKind::PreparedEmbedding, DeviceId::cpu()};
 
-    EXPECT_EQ(store.embeddingHandleForTensor(tensor.get(), DeviceId::cpu()), nullptr);
-    EXPECT_FALSE(store.preparedRefForTensor(tensor.get(), DeviceId::cpu()).has_value());
+    EXPECT_EQ(store.embeddingHandle(missing), nullptr);
+    EXPECT_FALSE(store.preparedRefForBinding(missing.binding_id, missing.device).has_value());
 }
 
 TEST_F(Test__PreparedEmbeddingWeightsLifecycle, ClearReleasesEmbeddingEntries)
@@ -107,13 +107,11 @@ TEST_F(Test__PreparedEmbeddingWeightsLifecycle, ClearReleasesEmbeddingEntries)
 
     ASSERT_TRUE(store.contains(ref));
     ASSERT_NE(store.embeddingHandle(ref), nullptr);
-    ASSERT_NE(store.embeddingHandleForTensor(tensor.get(), DeviceId::cpu()), nullptr);
 
     store.clear();
 
     EXPECT_FALSE(store.contains(ref));
     EXPECT_EQ(store.embeddingHandle(ref), nullptr);
-    EXPECT_EQ(store.embeddingHandleForTensor(tensor.get(), DeviceId::cpu()), nullptr);
 }
 
 // ============================================================================
@@ -129,7 +127,8 @@ TEST_F(Test__PreparedEmbeddingWeightsLifecycle, FP32TensorRejectsPackedPreparati
     EXPECT_THROW(
         store.prepareEmbedding(binding, kDModelInt),
         std::runtime_error);
-    EXPECT_EQ(store.embeddingHandleForTensor(tensor.get(), DeviceId::cpu()), nullptr);
+    PreparedWeightRef rejected{kModelId, binding.binding_id, PreparedWeightKind::PreparedEmbedding, DeviceId::cpu()};
+    EXPECT_EQ(store.embeddingHandle(rejected), nullptr);
 }
 
 // ============================================================================
@@ -223,36 +222,33 @@ TEST_F(Test__PreparedEmbeddingWeightsLifecycle, DifferentBindingsGetSeparateEntr
 TEST_F(Test__PreparedEmbeddingWeightsLifecycle, LookupOnlyDoesNotCreate)
 {
     PreparedWeightStore store(kModelId);
-    auto tensor = TestTensorFactory::createQ8_0Random({kVocabSize, kDModel});
+    PreparedWeightRef missing{kModelId, 1, PreparedWeightKind::PreparedEmbedding, DeviceId::cpu()};
 
-    EXPECT_EQ(store.embeddingHandleForTensor(tensor.get(), DeviceId::cpu()), nullptr);
-    EXPECT_FALSE(store.preparedRefForTensor(tensor.get(), DeviceId::cpu()).has_value());
+    EXPECT_EQ(store.embeddingHandle(missing), nullptr);
+    EXPECT_FALSE(store.preparedRefForBinding(missing.binding_id, missing.device).has_value());
 }
 
-TEST_F(Test__PreparedEmbeddingWeightsLifecycle, LookupFindsCreatedEntry)
+TEST_F(Test__PreparedEmbeddingWeightsLifecycle, BindingLookupFindsCreatedEntry)
 {
     PreparedWeightStore store(kModelId);
     auto tensor = TestTensorFactory::createQ8_0Random({kVocabSize, kDModel});
     auto ref = prepareEmbedding(store, 1, tensor.get());
 
-    auto *found = store.embeddingHandleForTensor(tensor.get(), DeviceId::cpu());
-    ASSERT_NE(found, nullptr);
-    EXPECT_EQ(found, store.embeddingHandle(ref));
-    EXPECT_EQ(found->tensor, tensor.get());
-
-    auto found_ref = store.preparedRefForTensor(tensor.get(), DeviceId::cpu());
+    auto found_ref = store.preparedRefForBinding(ref.binding_id, DeviceId::cpu());
     ASSERT_TRUE(found_ref.has_value());
     EXPECT_EQ(found_ref->binding_id, ref.binding_id);
+    EXPECT_EQ(store.embeddingHandle(*found_ref), store.embeddingHandle(ref));
 }
 
 TEST_F(Test__PreparedEmbeddingWeightsLifecycle, LookupMissesWrongDevice)
 {
     PreparedWeightStore store(kModelId);
     auto tensor = TestTensorFactory::createQ8_0Random({kVocabSize, kDModel});
-    prepareEmbedding(store, 1, tensor.get());
+    auto ref = prepareEmbedding(store, 1, tensor.get());
 
-    auto *found = store.embeddingHandleForTensor(tensor.get(), DeviceId(DeviceType::CPU, 1));
-    EXPECT_EQ(found, nullptr);
+    auto wrong_device = ref;
+    wrong_device.device = DeviceId(DeviceType::CPU, 1);
+    EXPECT_EQ(store.embeddingHandle(wrong_device), nullptr);
 }
 
 // ============================================================================

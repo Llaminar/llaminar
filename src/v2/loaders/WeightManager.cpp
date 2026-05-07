@@ -6,6 +6,7 @@
 
 #include "WeightManager.h"
 #include "MmapRegion.h"
+#include "PreparedWeightStore.h"
 #include "../execution/moe/ExpertWeightPayloadProvider.h"
 #include "../utils/Logger.h"
 #include "../utils/WeightLoadingProfiler.h"
@@ -50,6 +51,55 @@
 
 namespace llaminar2
 {
+
+    namespace
+    {
+        uint64_t stableMaterializedBindingId(
+            const WeightRequirement &requirement,
+            const InferenceStrategy &strategy)
+        {
+            uint64_t hash = 1469598103934665603ull;
+            auto mixByte = [&](uint8_t byte) {
+                hash ^= static_cast<uint64_t>(byte);
+                hash *= 1099511628211ull;
+            };
+            auto mixString = [&](const std::string &value) {
+                for (unsigned char ch : value)
+                    mixByte(ch);
+                mixByte(0xffu);
+            };
+            auto mixInt = [&](int64_t value) {
+                uint64_t bits = static_cast<uint64_t>(value);
+                for (int i = 0; i < 8; ++i)
+                    mixByte(static_cast<uint8_t>((bits >> (i * 8)) & 0xffu));
+            };
+            auto mixSize = [&](size_t value) {
+                mixInt(static_cast<int64_t>(value));
+            };
+
+            mixInt(static_cast<int64_t>(strategy.model_id.value));
+            mixString(requirement.canonical_name);
+            mixString(requirement.source_name);
+            mixInt(static_cast<int>(requirement.role));
+            mixInt(static_cast<int>(requirement.derivation));
+            mixInt(requirement.layer);
+            mixInt(requirement.expert);
+            mixInt(requirement.pp_stage);
+            mixInt(requirement.tp_domain);
+            mixInt(requirement.tp_rank_or_device_index);
+            mixInt(static_cast<int>(requirement.target_device.type));
+            mixInt(requirement.target_device.ordinal);
+            mixSize(requirement.slice.row_start);
+            mixSize(requirement.slice.row_count);
+            mixSize(requirement.slice.col_start);
+            mixSize(requirement.slice.col_count);
+            mixSize(requirement.slice.expert_start);
+            mixSize(requirement.slice.expert_count);
+
+            return hash == 0 ? 1 : hash;
+        }
+
+    }
 
     const char *WeightManager::weightPrepStateName(WeightPrepState state)
     {
@@ -1442,15 +1492,39 @@ namespace llaminar2
         }
     }
 
+    std::shared_ptr<PreparedWeightStore> WeightManager::preparedWeightStore()
+    {
+        std::lock_guard<std::mutex> lock(cache_mutex_);
+        if (!prepared_weight_store_)
+            prepared_weight_store_ = std::make_shared<PreparedWeightStore>();
+        return prepared_weight_store_;
+    }
+
+    std::shared_ptr<PreparedWeightStore> WeightManager::preparedWeightStoreIfInitialized() const
+    {
+        std::lock_guard<std::mutex> lock(cache_mutex_);
+        return prepared_weight_store_;
+    }
+
+    void WeightManager::setPreparedWeightStore(std::shared_ptr<PreparedWeightStore> store)
+    {
+        std::lock_guard<std::mutex> lock(cache_mutex_);
+        prepared_weight_store_ = std::move(store);
+    }
+
     FrozenModelWeightSet WeightManager::materialize(const WeightPlan &plan)
     {
         ModelWeightSetBuilder builder(plan.strategy());
 
         for (const auto &requirement : plan.requirements())
         {
+            const std::string &load_name = requirement.source_name.empty()
+                                               ? requirement.canonical_name
+                                               : requirement.source_name;
+            const DeviceId lookup_device = requirement.lookup_device.value_or(requirement.target_device);
             auto tensor = getWeightForDevice(
-                requirement.canonical_name,
-                requirement.target_device,
+                load_name,
+                lookup_device,
                 requirement.layer);
 
             if (!tensor)
@@ -1458,15 +1532,19 @@ namespace llaminar2
                 if (requirement.required)
                 {
                     throw std::runtime_error("[WeightManager] Required weight missing during materialization: " +
-                                             requirement.canonical_name);
+                                             requirement.canonical_name +
+                                             (load_name == requirement.canonical_name ? "" : " (source: " + load_name + ")"));
                 }
                 continue;
             }
 
             WeightBinding binding;
+            binding.binding_id = stableMaterializedBindingId(requirement, plan.strategy());
             binding.identity = makeSourceWeightIdentity(
                 requirement.canonical_name,
-                plan.strategy().model_id);
+                plan.strategy().model_id,
+                binding.binding_id);
+            binding.identity.derivation = requirement.derivation;
             binding.identity.role = requirement.role == WeightRole::Other
                                         ? inferWeightRole(requirement.canonical_name)
                                         : requirement.role;
@@ -1491,10 +1569,12 @@ namespace llaminar2
                 if (auto metadata = weight_metadata_->metadata(tensor.get()))
                 {
                     binding.identity = metadata->identity;
+                    binding.identity.canonical_name = requirement.canonical_name;
                     binding.identity.model_id = plan.strategy().model_id;
                     binding.identity.role = requirement.role == WeightRole::Other
                                                 ? metadata->identity.role
                                                 : requirement.role;
+                    binding.identity.derivation = requirement.derivation;
                     binding.identity.layer = requirement.layer >= 0
                                                  ? requirement.layer
                                                  : metadata->identity.layer;
@@ -1512,8 +1592,17 @@ namespace llaminar2
                 }
             }
 
+            if (requirement.slice.source_rows != 0 || requirement.slice.source_cols != 0 ||
+                requirement.slice.row_count != 0 || requirement.slice.col_count != 0 ||
+                requirement.slice.expert_count != 0)
+            {
+                binding.slice = requirement.slice;
+            }
+
             if (binding.slice.source_rows == 0 && tensor)
                 binding.slice = fullSliceSpec(*tensor);
+
+            binding.identity.instance_id = binding.binding_id;
 
             if (requirement.expected_prepared_kind != PreparedWeightKind::None)
             {
@@ -1527,6 +1616,23 @@ namespace llaminar2
             auto &added = builder.addBinding(std::move(binding));
             if (added.prepared)
                 added.prepared->binding_id = added.binding_id;
+
+            if (added.prepared.has_value())
+            {
+                if (auto store = preparedWeightStoreIfInitialized())
+                {
+                    if (store->adoptPreparedGemmForBinding(added, requirement.target_device))
+                    {
+                        WeightLifecycleTrace::record(
+                            WeightLifecycleEventType::RegisterPrepared,
+                            requirement.canonical_name,
+                            added.identity.role,
+                            added.identity.layer,
+                            requirement.target_device,
+                            "adopted prepared handle for materialized binding");
+                    }
+                }
+            }
 
             WeightLifecycleTrace::record(
                 WeightLifecycleEventType::GraphBind,
@@ -2545,6 +2651,52 @@ namespace llaminar2
     }
 
     bool WeightManager::prepareWeightsForDevice(
+        const FrozenModelWeightSet &frozen_weights,
+        DeviceId device,
+        bool include_expert_jobs)
+    {
+        LOG_INFO("[WeightManager] prepareWeightsForDevice(" << device.to_string()
+                                                            << ", frozen_bindings=" << frozen_weights.bindings().size() << ")");
+        if (!lifecycle_gates_.materialization_complete)
+            markMaterializationComplete();
+
+        if (device.is_cpu())
+        {
+            auto store = preparedWeightStore();
+            int registered = 0;
+            for (const auto &binding : frozen_weights.bindings())
+            {
+                if (!binding.prepared.has_value() || binding.prepared->device != device)
+                    continue;
+                if (!binding.tensor || binding.tensor->shape().size() != 2)
+                    continue;
+                if (binding.identity.role == WeightRole::Embedding ||
+                    binding.identity.role == WeightRole::Norm ||
+                    binding.identity.role == WeightRole::Bias)
+                {
+                    continue;
+                }
+                if (!store->preparedRefForBinding(binding.binding_id, device).has_value())
+                {
+                    store->prepareGemm(binding);
+                    ++registered;
+                }
+            }
+
+            if (!lifecycle_gates_.device_preparation_complete)
+                markDevicePreparationComplete();
+            LOG_INFO("[WeightManager] Binding-driven CPU preparation registered "
+                     << registered << " GEMM bindings for " << device.to_string());
+            return true;
+        }
+
+        const bool ok = prepareWeightsForDeviceImpl(device, nullptr, &frozen_weights, include_expert_jobs);
+        if (ok && !lifecycle_gates_.device_preparation_complete)
+            markDevicePreparationComplete();
+        return ok;
+    }
+
+    bool WeightManager::prepareWeightsForDevice(
         DeviceId device,
         int first_layer, int last_layer,
         bool has_embedding, bool has_lm_head)
@@ -2564,7 +2716,9 @@ namespace llaminar2
 
     bool WeightManager::prepareWeightsForDeviceImpl(
         DeviceId device,
-        std::function<bool(const std::string &)> layer_filter)
+        std::function<bool(const std::string &)> layer_filter,
+        const FrozenModelWeightSet *frozen_weights,
+        bool include_expert_jobs)
     {
         const bool is_gpu = device.is_gpu();
         const char *device_name = device.is_rocm() ? "ROCm" : (device.is_cuda() ? "CUDA" : "CPU");
@@ -2577,8 +2731,8 @@ namespace llaminar2
         if (is_gpu)
         {
             LOG_INFO("[WeightManager] Using GPU weight loading pipeline for " << device_name);
-            gemm_future = std::async(std::launch::async, [this, device, &layer_filter]()
-                                     { return packGemmWeightsViaPipeline(device, layer_filter); });
+            gemm_future = std::async(std::launch::async, [this, device, &layer_filter, frozen_weights, include_expert_jobs]()
+                                     { return packGemmWeightsViaPipeline(device, layer_filter, frozen_weights, include_expert_jobs); });
         }
 
         // Step 2: Upload non-GEMM weights (norms, embeddings) to device
@@ -3297,7 +3451,9 @@ namespace llaminar2
 
     bool WeightManager::packGemmWeightsViaPipeline(
         DeviceId target_device,
-        std::function<bool(const std::string &)> layer_filter)
+        std::function<bool(const std::string &)> layer_filter,
+        const FrozenModelWeightSet *frozen_weights,
+        bool include_expert_jobs)
     {
         using namespace llaminar::v2::kernels;
         using Clock = std::chrono::high_resolution_clock;
@@ -3312,82 +3468,126 @@ namespace llaminar2
         // ------------------------------------------------------------------
         // Step 1: Collect GEMM weights (same logic as packGemmWeights)
         // ------------------------------------------------------------------
-        std::vector<std::pair<std::string, std::shared_ptr<TensorBase>>> gemm_weights;
+        struct DenseGemmJob
+        {
+            std::string name;
+            TensorBase *tensor = nullptr;
+            std::shared_ptr<TensorBase> owner;
+            std::optional<WeightBinding> binding;
+        };
+
+        std::vector<DenseGemmJob> gemm_weights;
         {
             std::lock_guard<std::mutex> lock(cache_mutex_);
-            const std::string device_prefix = target_device.to_string() + ":";
-            bool has_per_device_entries = false;
-
-            for (const auto &[key, tensor] : per_device_cache_)
+            if (frozen_weights)
             {
-                if (key.compare(0, device_prefix.size(), device_prefix) == 0)
+                for (const auto &binding : frozen_weights->bindings())
                 {
-                    has_per_device_entries = true;
-                    break;
+                    if (!binding.prepared.has_value() || binding.prepared->device != target_device)
+                        continue;
+                    if (!binding.tensor || binding.tensor->shape().size() != 2)
+                        continue;
+                    if (binding.identity.role == WeightRole::Embedding ||
+                        binding.identity.role == WeightRole::Norm ||
+                        binding.identity.role == WeightRole::Bias)
+                    {
+                        continue;
+                    }
+
+                    gemm_weights.push_back(DenseGemmJob{
+                        binding.identity.canonical_name,
+                        binding.tensor,
+                        nullptr,
+                        binding});
                 }
             }
-
-            if (has_per_device_entries)
+            else
             {
+                const std::string device_prefix = target_device.to_string() + ":";
+                bool has_per_device_entries = false;
+                std::unordered_set<std::string> collected_names;
+
                 for (const auto &[key, tensor] : per_device_cache_)
                 {
-                    if (key.compare(0, device_prefix.size(), device_prefix) != 0)
-                        continue;
-                    const std::string name = key.substr(device_prefix.size());
-                    if (isGemmWeight(name) && tensor)
+                    if (key.compare(0, device_prefix.size(), device_prefix) == 0)
                     {
-                        if (layer_filter && !layer_filter(name))
-                            continue;
-                        gemm_weights.emplace_back(name, tensor);
+                        has_per_device_entries = true;
+                        break;
                     }
                 }
-            }
 
-            // Fall back to main cache if per_device_cache had no GEMM weights
-            // (e.g. only non-GEMM entries exist in per_device_cache for this device)
-            if (gemm_weights.empty())
-            {
-                gemm_weights.reserve(cache_.size());
-                for (const auto &[name, tensor] : cache_)
+                if (has_per_device_entries)
                 {
-                    if (isGemmWeight(name) && tensor)
+                    for (const auto &[key, tensor] : per_device_cache_)
                     {
-                        if (layer_filter && !layer_filter(name))
+                        if (key.compare(0, device_prefix.size(), device_prefix) != 0)
                             continue;
-                        gemm_weights.emplace_back(name, tensor);
+                        const std::string name = key.substr(device_prefix.size());
+                        if (isGemmWeight(name) && tensor)
+                        {
+                            if (layer_filter && !layer_filter(name))
+                                continue;
+                            gemm_weights.push_back(DenseGemmJob{name, tensor.get(), tensor, std::nullopt});
+                            collected_names.insert(name);
+                        }
                     }
                 }
-            }
 
-            // Tied LM head: if this stage owns lm_head (layer_filter passes
-            // output.weight) but output.weight wasn't collected, the model
-            // ties token_embd.weight as the LM projection weight. Include
-            // it in the pipeline so it gets GPU-repacked with the rest of the
-            // resident GEMM weights.
-            if (!layer_filter || layer_filter("output.weight"))
-            {
-                bool has_output_weight = false;
-                for (const auto &[n, _] : gemm_weights)
+                // Supplement from the main cache for weights that do not have a
+                // device-specific clone. Hybrid PP/TP can populate per_device_cache_
+                // partially; treating any per-device entry as complete skips dense
+                // PP-stage weights that still live in cache_.
                 {
-                    if (n == "output.weight") { has_output_weight = true; break; }
-                }
-                if (!has_output_weight)
-                {
-                    std::shared_ptr<TensorBase> embed_tensor;
-                    const std::string device_key = target_device.to_string() + ":token_embd.weight";
-                    auto pdit = per_device_cache_.find(device_key);
-                    if (pdit != per_device_cache_.end() && pdit->second)
-                        embed_tensor = pdit->second;
-                    else
+                    for (const auto &[name, tensor] : cache_)
                     {
-                        auto it = cache_.find("token_embd.weight");
-                        if (it != cache_.end() && it->second)
-                            embed_tensor = it->second;
+                        if (collected_names.count(name) != 0)
+                            continue;
+                        if (isGemmWeight(name) && tensor)
+                        {
+                            if (layer_filter && !layer_filter(name))
+                                continue;
+                            gemm_weights.push_back(DenseGemmJob{name, tensor.get(), tensor, std::nullopt});
+                            collected_names.insert(name);
+                        }
                     }
-                    if (embed_tensor)
+                }
+
+                // Tied LM head: if this stage owns lm_head (layer_filter passes
+                // output.weight) but output.weight wasn't collected, the model
+                // ties token_embd.weight as the LM projection weight. Include
+                // it in the pipeline so it gets GPU-repacked with the rest of the
+                // resident GEMM weights.
+                if (!layer_filter || layer_filter("output.weight"))
+                {
+                    bool has_output_weight = false;
+                    for (const auto &job : gemm_weights)
                     {
-                        gemm_weights.emplace_back("token_embd.weight", embed_tensor);
-                        LOG_INFO("[WeightManager] GPU pipeline: including tied token_embd.weight as LM head GEMM");
+                        if (job.name == "output.weight") { has_output_weight = true; break; }
+                    }
+                    if (!has_output_weight)
+                    {
+                        std::shared_ptr<TensorBase> embed_tensor;
+                        const std::string device_key = target_device.to_string() + ":token_embd.weight";
+                        auto pdit = per_device_cache_.find(device_key);
+                        if (pdit != per_device_cache_.end() && pdit->second)
+                            embed_tensor = pdit->second;
+                        else
+                        {
+                            auto it = cache_.find("token_embd.weight");
+                            if (it != cache_.end() && it->second)
+                                embed_tensor = it->second;
+                        }
+                        if (embed_tensor)
+                        {
+                            // The tensor data comes from token_embd.weight, but the
+                            // graph owns and resolves the LM projection through the
+                            // canonical output.weight binding. Registering the
+                            // prepared handle under output.weight keeps tied-embedding
+                            // models on the same binding-first path as untied models.
+                            gemm_weights.push_back(DenseGemmJob{"output.weight", embed_tensor.get(), embed_tensor, std::nullopt});
+                            collected_names.insert("output.weight");
+                            LOG_INFO("[WeightManager] GPU pipeline: including tied token_embd.weight as canonical output.weight LM head GEMM");
+                        }
                     }
                 }
             }
@@ -3413,6 +3613,7 @@ namespace llaminar2
         // Track 3D parent tensors by name so release readiness is tensor-specific.
         std::vector<std::pair<std::string, std::shared_ptr<TensorBase>>> moe_parent_tensors;
 
+        if (include_expert_jobs)
         {
             std::lock_guard<std::mutex> lock(cache_mutex_);
 
@@ -3561,9 +3762,14 @@ namespace llaminar2
         std::vector<std::pair<std::string, const NativeVnniFormatInfo *>> weight_formats;
         weight_formats.reserve(gemm_weights.size());
 
-        for (const auto &[name, tensor] : gemm_weights)
+        for (const auto &job : gemm_weights)
         {
-            auto *unpackable = dynamic_cast<IINT8Unpackable *>(tensor.get());
+            const std::string &name = job.name;
+            TensorBase *tensor = job.tensor;
+            if (!tensor)
+                continue;
+
+            auto *unpackable = dynamic_cast<IINT8Unpackable *>(tensor);
             const NativeVnniFormatInfo *vnni = unpackable ? unpackable->vnniFormatInfo() : nullptr;
             if (!vnni)
             {
@@ -3694,8 +3900,12 @@ namespace llaminar2
         // ------------------------------------------------------------------
         for (size_t i = 0; i < gemm_weights.size(); ++i)
         {
-            const auto &[name, tensor] = gemm_weights[i];
+            const auto &dense_job = gemm_weights[i];
+            const std::string &name = dense_job.name;
+            TensorBase *tensor = dense_job.tensor;
             const auto *vnni = weight_formats[i].second;
+            if (!tensor)
+                continue;
             if (!vnni)
             {
                 // Floating-point weight: submit as RAW_FP passthrough job
@@ -3796,10 +4006,87 @@ namespace llaminar2
         }
 
         size_t registered = 0;
+        auto prepared_kind_for_device = [](DeviceId device) {
+            if (device.is_cuda()) return PreparedWeightKind::CudaInt8PackedGemm;
+            if (device.is_rocm()) return PreparedWeightKind::RocmInt8PackedGemm;
+            return PreparedWeightKind::CpuPackedGemm;
+        };
+
+        auto register_pipeline_gemm = [&](const DenseGemmJob &dense_job,
+                                          std::unique_ptr<ITensorGemm> kernel) -> bool
+        {
+            const std::string &name = dense_job.name;
+            TensorBase *tensor = dense_job.tensor;
+            if (!tensor || !kernel)
+                return false;
+
+            const bool quantized = dynamic_cast<IINT8Unpackable *>(tensor) != nullptr;
+            KernelFactory::GemmPreparationKind resolved_kind = quantized
+                ? (target_device.is_cuda() ? KernelFactory::GemmPreparationKind::CUDA_INT8_PACKED
+                   : target_device.is_rocm() ? KernelFactory::GemmPreparationKind::ROCM_INT8_PACKED
+                                             : KernelFactory::GemmPreparationKind::CPU_PACKED)
+                : KernelFactory::GemmPreparationKind::FLOATING_POINT;
+
+            auto owned_kernel = std::shared_ptr<ITensorGemm>(std::move(kernel));
+            auto prepared_weights = std::make_shared<KernelFactory::PreparedGemmWeights>();
+            prepared_weights->kind = resolved_kind;
+            prepared_weights->owned_kernel = owned_kernel;
+            prepared_weights->kernel = owned_kernel.get();
+
+            auto handle = std::make_shared<KernelFactory::PreparedGemmHandle>();
+            handle->tensor = tensor;
+            handle->device_id = target_device;
+            handle->kind = resolved_kind;
+            handle->variant = static_cast<int>(tensor->native_type());
+            handle->prepared_weights = std::move(prepared_weights);
+
+            WeightBinding binding;
+            if (dense_job.binding.has_value())
+            {
+                binding = *dense_job.binding;
+            }
+            else
+            {
+                std::lock_guard<std::mutex> lock(cache_mutex_);
+                binding.binding_id = next_pipeline_prepared_binding_id_++;
+                binding.identity = makeSourceWeightIdentity(name, {}, binding.binding_id);
+            }
+            binding.tensor = tensor;
+            if (binding.slice.source_rows == 0 && binding.slice.source_cols == 0 &&
+                binding.slice.row_count == 0 && binding.slice.col_count == 0)
+            {
+                binding.slice = fullSliceSpec(*tensor);
+            }
+            binding.residency.home_device = target_device;
+            binding.residency.resident_device = target_device;
+            binding.residency.host_policy = WeightHostPolicy::ReleasableAfterPreparation;
+            binding.immutable = true;
+
+            try
+            {
+                preparedWeightStore()->registerPreparedGemmHandle(
+                    binding,
+                    prepared_kind_for_device(target_device),
+                    target_device,
+                    std::move(handle));
+                return true;
+            }
+            catch (const std::exception &e)
+            {
+                LOG_ERROR("[WeightManager] GPU pipeline: failed to register prepared store entry for "
+                          << name << ": " << e.what());
+                return false;
+            }
+        };
+
         for (size_t i = 0; i < gemm_weights.size(); ++i)
         {
-            const auto &[name, tensor] = gemm_weights[i];
+            const auto &dense_job = gemm_weights[i];
+            const std::string &name = dense_job.name;
+            TensorBase *tensor = dense_job.tensor;
             const auto *vnni = weight_formats[i].second;
+            if (!tensor)
+                continue;
 
             auto slot = pool->getSlot(name);
             if (!slot)
@@ -3881,9 +4168,7 @@ namespace llaminar2
 
             if (kernel)
             {
-                auto *handle = KernelFactory::registerPreparedGemmFromTransfer(
-                    tensor.get(), target_device, std::move(kernel));
-                if (handle)
+                if (register_pipeline_gemm(dense_job, std::move(kernel)))
                 {
                     markPrepState(name, target_device, WeightPrepState::UPLOADED_DEVICE, true,
                                   "GPU pipeline: loaded + registered");
@@ -3892,13 +4177,15 @@ namespace llaminar2
                     ++registered;
 
                     // Release host weight data — the GEMM kernel now owns device copies
-                    // in the WeightVRAMPool.  has_prepared_device_state_ is already set
-                    // by registerPreparedGemmFromTransfer(), so releaseAllHostWeightData()
-                    // would also catch these, but releasing inline saves peak host memory.
+                    // in the WeightVRAMPool. PreparedWeightStore registration marks
+                    // has_prepared_device_state_, so releaseAllHostWeightData() would
+                    // also catch these, but releasing inline saves peak host memory.
                     // Skip for token_embd.weight: it's also used for embedding lookup,
                     // which runs concurrently (Steps 2/2b). Its host data is freed
                     // later by releaseAllHostWeightData().
-                    if (name != "token_embd.weight")
+                    const bool tied_alias = dense_job.binding.has_value() &&
+                                            dense_job.binding->identity.derivation == WeightDerivationKind::TiedAlias;
+                    if (name != "token_embd.weight" && !tied_alias)
                     {
                         try
                         {

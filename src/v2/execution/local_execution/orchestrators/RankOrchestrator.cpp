@@ -23,6 +23,7 @@
 #include "../../../config/TensorParallelConfig.h"
 #include "../../../interfaces/IModelContext.h"
 #include "../../../loaders/ModelContext.h"
+#include "../../../loaders/PreparedWeightStore.h"
 #include "../../../loaders/WeightManager.h"
 #include "../graph/SchemaFactoryRegistry.h" // Model-agnostic sharding config access
 #include "../../../tensors/TensorClasses.h"
@@ -629,12 +630,31 @@ namespace llaminar2
             auto weight_mgr = model_ctx_->weightManager();
             if (weight_mgr)
             {
-                LOG_INFO("RankOrchestrator: Finalizing weights for "
-                         << device_ids.size() << " devices"
-                         << " (release_host_data=false, deferred until after graph build)");
-                if (!weight_mgr->finalizeForDevices(device_ids, /*release_host_data=*/false))
+                if (auto concrete_weight_mgr = std::dynamic_pointer_cast<WeightManager>(weight_mgr))
                 {
-                    LOG_WARN("RankOrchestrator: Weight finalization failed; prepared kernels may be unavailable");
+                    concrete_weight_mgr->setPreparedWeightStore(
+                        std::make_shared<PreparedWeightStore>(
+                            ModelContextId{reinterpret_cast<uint64_t>(model_ctx_.get())}));
+                }
+                if (config_.nested_pp_stage_config.has_value())
+                {
+                    LOG_INFO("RankOrchestrator: Preloading weights for "
+                             << device_ids.size() << " nested TP-in-PP devices"
+                             << " (binding-driven preparation deferred to runner materialization)");
+                    if (!weight_mgr->preloadForDevices(device_ids))
+                    {
+                        LOG_WARN("RankOrchestrator: Weight preload failed; runner materialization may fail");
+                    }
+                }
+                else
+                {
+                    LOG_INFO("RankOrchestrator: Finalizing weights for "
+                             << device_ids.size() << " devices"
+                             << " (release_host_data=false, deferred until after graph build)");
+                    if (!weight_mgr->finalizeForDevices(device_ids, /*release_host_data=*/false))
+                    {
+                        LOG_WARN("RankOrchestrator: Weight finalization failed; prepared kernels may be unavailable");
+                    }
                 }
             }
         }

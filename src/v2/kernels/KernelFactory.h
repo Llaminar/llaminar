@@ -1158,21 +1158,6 @@ namespace llaminar
                 static void clearCacheFor(const llaminar2::TensorBase *tensor);
 
                 /**
-                 * @brief Clear prepared weight state for a tensor (Phase 8)
-                 *
-                 * Removes entries from prepared_gemm_registry_ and fused_gate_up_cache_
-                 * that reference this tensor. Does NOT clear the
-                 * tensor's local packed_cache (cache_) — that is tensor-owned state.
-                 *
-                 * Called by PreparedWeightStore::releaseAllPreparedState() during
-                 * model teardown, so that subsequent tensor destruction does not need
-                 * to scan global registries.
-                 *
-                 * @param tensor Tensor whose prepared state should be removed
-                 */
-                static void clearPreparedStateForTensor(const llaminar2::TensorBase *tensor);
-
-                /**
                  * @brief Clear all cached kernels
                  *
                  * Useful for memory cleanup or when tensor lifetimes are uncertain.
@@ -1374,11 +1359,8 @@ namespace llaminar
                  * @brief Prepare GEMM weights for an expert view WITHOUT global registry registration.
                  *
                  * Performs local VNNI repacking / kernel binding and returns a
-                 * shared_ptr that the caller owns. The prepared weights are NOT stored
-                 * in prepared_gemm_registry_, so:
-                 * - ~TensorBase() has nothing to scan
-                 * - No dual-key fallback needed
-                 * - Lifetime is managed by the caller (PreparedWeightStore expert slab)
+                 * shared_ptr that the caller owns. Lifetime is managed by the caller
+                 * (PreparedWeightStore expert slab).
                  *
                  * @param tensor Expert view tensor (2D slice of 3D parent)
                  * @param target_device Target device for preparation
@@ -1397,7 +1379,6 @@ namespace llaminar
                  * from the pre-packed representation. This avoids the expensive VNNI repack
                  * that prepareExpertGemmLocal() performs from raw tensor data.
                  *
-                 * Like prepareExpertGemmLocal(), does NOT insert into prepared_gemm_registry_.
                  * Caller owns the returned shared_ptr lifetime.
                  *
                  * @param blob Serialized packed weight blob (from ExpertWeightTransfer)
@@ -1407,58 +1388,6 @@ namespace llaminar
                     const std::vector<uint8_t> &blob);
 
                 /**
-                 * @brief Find an existing prepared GEMM-weights handle without creating one.
-                 *
-                 * This is used by migration/rebalance paths that must not fall back
-                 * to raw host weight materialization after host bytes have been
-                 * released. Checks both the raw-data key and tensor-identity fallback
-                 * key registered by the preload path.
-                 */
-                static const PreparedGemmHandle *findPreparedGemmWeights(
-                    const llaminar2::TensorBase *tensor,
-                    llaminar2::DeviceId target_device,
-                    GemmPreparationKind prep_kind = GemmPreparationKind::AUTO);
-
-                /**
-                 * @brief Clear prepared GEMM handle entries associated with a tensor
-                 *
-                 * Clears all prepared entries for the tensor across devices and prep kinds.
-                 * Implementation is responsible for coordinated fused-cache eviction so
-                 * no fused entry retains stale prepared-handle identity.
-                 */
-                static void clearPreparedGemmWeightsFor(const llaminar2::TensorBase *tensor);
-
-                /**
-                 * @brief Batch-clear prepared GEMM entries for multiple tensors.
-                 *
-                 * Performs a SINGLE scan of each cache (fused QKV, fused gate+up,
-                 * prepared GEMM registry) checking against a hash set of tensor
-                 * pointers.  This is O(cache_size) regardless of how many tensors
-                 * are being evicted, vs O(cache_size × tensor_count) for individual
-                 * clearPreparedGemmWeightsFor() calls.
-                 */
-                static void clearPreparedGemmWeightsForBatch(
-                    const std::vector<const llaminar2::TensorBase *> &tensors);
-
-                /**
-                 * @brief Register a pre-packed GEMM kernel from cross-rank transfer.
-                 *
-                 * Inserts a PreparedGemmHandle into the registry using the tensor's key,
-                 * binding the provided kernel WITHOUT triggering the packing pipeline.
-                 * The kernel must already have valid packed weights (via pre-packed
-                 * constructor or attachWeights()).
-                 *
-                 * @param tensor        The tensor view this kernel is associated with (for cache key)
-                 * @param target_device Device ID for this kernel
-                 * @param kernel        Pre-packed GEMM kernel (ownership transferred to registry)
-                 * @return Prepared handle pointer, or nullptr on failure
-                 */
-                static const PreparedGemmHandle *registerPreparedGemmFromTransfer(
-                    const llaminar2::TensorBase *tensor,
-                    llaminar2::DeviceId target_device,
-                    std::unique_ptr<llaminar2::ITensorGemm> kernel);
-
-                /**
                  * @brief Number of active GEMM engine registry entries
                  *
                  * Alias for the device-scoped GEMM engine registry size.
@@ -1466,58 +1395,9 @@ namespace llaminar
                 static size_t gemmEngineRegistrySize();
 
                 /**
-                 * @brief Number of prepared GEMM registry entries
-                 */
-                static size_t preparedGemmRegistrySize();
-
-                /**
                  * @brief Number of device-scoped GEMM engine entries
                  */
                 static size_t deviceScopedGemmEngineRegistrySize();
-
-                // Public for unit test access (PreparedGemmKey equality/hash tests)
-                struct PreparedGemmKey
-                {
-                    // Key by data identity (raw_data pointer + dimensions) rather than
-                    // tensor object pointer. This allows views into the same underlying
-                    // data (e.g., MoE expert views created independently by prefill and
-                    // decode graphs) to share the same prepared GEMM engine, eliminating
-                    // duplicate interleaved weight storage.
-                    //
-                    // IMPORTANT: When raw_data is nullptr (e.g., TensorSlice after host
-                    // data release), we fall back to the tensor object pointer to prevent
-                    // collision between different tensors that have the same shape/device
-                    // (e.g., K and V weights in TP mode both have shape [n_kv_heads, d_model]).
-                    const void *raw_data{nullptr};
-                    const void *tensor_identity{nullptr}; // fallback when raw_data is nullptr
-                    size_t N{0};
-                    size_t K{0};
-                    llaminar2::DeviceId device_id;
-                    int prep_kind{0};
-
-                    bool operator==(const PreparedGemmKey &other) const
-                    {
-                        return raw_data == other.raw_data &&
-                               tensor_identity == other.tensor_identity &&
-                               N == other.N && K == other.K &&
-                               device_id == other.device_id &&
-                               prep_kind == other.prep_kind;
-                    }
-                };
-
-                struct PreparedGemmKeyHash
-                {
-                    size_t operator()(const PreparedGemmKey &k) const
-                    {
-                        return std::hash<const void *>()(k.raw_data) ^
-                               (std::hash<const void *>()(k.tensor_identity) << 6) ^
-                               (std::hash<size_t>()(k.N) << 1) ^
-                               (std::hash<size_t>()(k.K) << 2) ^
-                               (std::hash<int>()(static_cast<int>(k.device_id.type)) << 3) ^
-                               (std::hash<int>()(k.device_id.ordinal) << 4) ^
-                               (std::hash<int>()(k.prep_kind) << 5);
-                    }
-                };
 
             private:
                 KernelFactory() = delete; // Static-only class
@@ -1729,8 +1609,7 @@ namespace llaminar
                 // Generic device-scoped non-GEMM registry
                 static std::unordered_map<DeviceKernelKey, std::shared_ptr<void>, DeviceKernelKeyHash> device_kernel_registry_;
 
-                // Prepared-weight and device-scoped GEMM engine registries
-                static std::unordered_map<PreparedGemmKey, std::shared_ptr<PreparedGemmHandle>, PreparedGemmKeyHash> prepared_gemm_registry_;
+                // Device-scoped GEMM engine registry
                 static std::unordered_map<DeviceKernelKey, std::shared_ptr<IGemmEngine>, DeviceKernelKeyHash> device_gemm_engine_registry_;
 
                 // NOTE: Universal device kernel caching (hipBLAS, cuBLAS handles, etc.)

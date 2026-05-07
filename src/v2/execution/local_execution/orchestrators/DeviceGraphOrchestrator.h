@@ -615,6 +615,14 @@ namespace llaminar2
         void setWeights(const ModelWeights &weights);
 
         /**
+         * @brief Set pre-materialized frozen model weight bindings.
+         *
+         * Used by planned weight setup paths where WeightManager has already
+         * resolved all graph-bound tensors into a FrozenModelWeightSet.
+         */
+        void setFrozenWeightSet(std::unique_ptr<FrozenModelWeightSet> weight_set);
+
+        /**
          * @brief Set activation buffers for full forward pass
          *
          * @param buffers Model buffers including current_hidden, logits, layer_buffers
@@ -2147,7 +2155,7 @@ namespace llaminar2
         std::unique_ptr<ExpertWeightPayloadProvider> expert_payload_provider_;
 
         /// Model-context-owned prepared weight store (Phase 4-5)
-        std::unique_ptr<PreparedWeightStore> prepared_weight_store_;
+        std::shared_ptr<PreparedWeightStore> prepared_weight_store_;
 
         /// Frozen model weight set for audit/validation (Phase 6)
         std::unique_ptr<FrozenModelWeightSet> frozen_weight_set_;

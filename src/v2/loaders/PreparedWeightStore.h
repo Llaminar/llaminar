@@ -33,6 +33,8 @@ namespace llaminar2
         explicit PreparedWeightStore(ModelContextId model_id = {});
         ~PreparedWeightStore();
 
+        ModelContextId modelId() const { return model_id_; }
+
         // =========================================================================
         // GEMM Preparation & Resolution
         // =========================================================================
@@ -42,25 +44,18 @@ namespace llaminar2
             const WeightBinding &binding,
             PreparedWeightKind kind,
             DeviceId device);
-        PreparedWeightRef registerPreparedGemmFromPipeline(
+        PreparedWeightRef registerPreparedGemmHandle(
             const WeightBinding &binding,
             PreparedWeightKind kind,
             DeviceId device,
-            const llaminar::v2::kernels::KernelFactory::PreparedGemmHandle *handle);
+            std::shared_ptr<llaminar::v2::kernels::KernelFactory::PreparedGemmHandle> handle);
+        bool adoptPreparedGemmForBinding(
+            const WeightBinding &binding,
+            DeviceId device);
 
         /// Resolve GEMM kernel from a prepared ref. O(1) lookup by binding_id.
         /// Returns nullptr if ref not found or handle missing.
         ITensorGemm *gemmKernel(const PreparedWeightRef &ref) const;
-
-        /// Resolve GEMM kernel by tensor pointer. O(n) scan.
-        /// Returns nullptr if no entry matches.
-        ITensorGemm *gemmKernelForTensor(const TensorBase *tensor) const;
-
-        /// Resolve a prepared ref by tensor pointer and device. O(n) scan.
-        /// Returns std::nullopt if no prepared GEMM/embedding entry matches.
-        std::optional<PreparedWeightRef> preparedRefForTensor(
-            const TensorBase *tensor,
-            DeviceId device) const;
 
         /// Resolve a prepared ref by frozen binding identity. O(1) lookup by binding id.
         /// Returns std::nullopt if the binding has not been prepared for this device.
@@ -75,10 +70,6 @@ namespace llaminar2
         ITensorFusedGateUpGemm *fusedGateUpKernel(
             const PreparedWeightRef &gate_ref,
             const PreparedWeightRef &up_ref) const;
-        ITensorFusedGateUpGemm *fusedGateUpKernelForTensors(
-            const TensorBase *gate_tensor,
-            const TensorBase *up_tensor,
-            DeviceId device) const;
 
         // =========================================================================
         // Embedding Preparation & Resolution
@@ -100,11 +91,6 @@ namespace llaminar2
 
         /// Look up prepared embedding weights by ref. O(1).
         const PreparedEmbeddingHandle *embeddingHandle(const PreparedWeightRef &ref) const;
-
-        /// Look up prepared embedding by tensor pointer. O(n) scan.
-        const PreparedEmbeddingHandle *embeddingHandleForTensor(
-            const TensorBase *tensor,
-            DeviceId device) const;
 
         // =========================================================================
         // Sliced GEMM (TP row-range) Resolution
@@ -177,14 +163,11 @@ namespace llaminar2
             PreparedWeightRef ref;
             // Phase 8: Store owns the prepared handle directly (not borrowed from KernelFactory).
             std::shared_ptr<llaminar::v2::kernels::KernelFactory::PreparedGemmHandle> owned_handle;
-            // Legacy compatibility: non-owning pointer for pipeline-registered entries
-            // that were created by KernelFactory before this store existed.
-            const llaminar::v2::kernels::KernelFactory::PreparedGemmHandle *legacy_handle = nullptr;
 
             /// Resolve the active handle (owned or legacy).
             const llaminar::v2::kernels::KernelFactory::PreparedGemmHandle *activeHandle() const
             {
-                return owned_handle ? owned_handle.get() : legacy_handle;
+                return owned_handle.get();
             }
         };
 
@@ -231,25 +214,7 @@ namespace llaminar2
             }
         };
 
-        struct EmbeddingKey
-        {
-            const TensorBase *tensor = nullptr;
-            DeviceId device;
-            bool operator==(const EmbeddingKey &o) const
-            {
-                return tensor == o.tensor && device == o.device;
-            }
-        };
-        struct EmbeddingKeyHash
-        {
-            size_t operator()(const EmbeddingKey &k) const
-            {
-                return std::hash<const void *>{}(k.tensor) ^ (std::hash<DeviceId>{}(k.device) << 16);
-            }
-        };
-
         std::unordered_map<uint64_t, EmbeddingEntry> embedding_entries_;
-        std::unordered_map<EmbeddingKey, uint64_t, EmbeddingKeyHash> embedding_by_tensor_;
 
         // =========================================================================
         // Sliced GEMM Cache (Phase 8: owned by this store)

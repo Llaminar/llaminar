@@ -364,22 +364,22 @@ namespace llaminar2
         proj_params.k = d_model;
 
         proj_params.w_qkv = layer.attn_qkv;
-        proj_params.prepared_ref_qkv = preparedRefForGraphWeight(layer_bindings.attn_qkv, layer.attn_qkv, device);
+        proj_params.prepared_ref_qkv = preparedRefForGraphWeight(layer_bindings.attn_qkv, device);
         proj_params.output_qkv = buffers.get(BufferId::GDN_QKV);
         proj_params.n_qkv = qkv_dim;
 
         proj_params.w_z = layer.attn_gate; // Z projection = attn_gate.weight (in_proj_z in HF)
-        proj_params.prepared_ref_z = preparedRefForGraphWeight(layer_bindings.attn_gate, layer.attn_gate, device);
+        proj_params.prepared_ref_z = preparedRefForGraphWeight(layer_bindings.attn_gate, device);
         proj_params.output_z = buffers.get(BufferId::GDN_Z);
         proj_params.n_z = value_dim; // Z gate operates on value_dim (n_v_heads * d_v)
 
         proj_params.w_a = layer.ssm_alpha;
-        proj_params.prepared_ref_a = preparedRefForGraphWeight(layer_bindings.ssm_alpha, layer.ssm_alpha, device);
+        proj_params.prepared_ref_a = preparedRefForGraphWeight(layer_bindings.ssm_alpha, device);
         proj_params.output_a = buffers.get(BufferId::GDN_ALPHA);
         proj_params.n_a = n_v_heads; // Alpha is per-value-head
 
         proj_params.w_b = layer.ssm_beta;
-        proj_params.prepared_ref_b = preparedRefForGraphWeight(layer_bindings.ssm_beta, layer.ssm_beta, device);
+        proj_params.prepared_ref_b = preparedRefForGraphWeight(layer_bindings.ssm_beta, device);
         proj_params.output_b = buffers.get(BufferId::GDN_BETA);
         proj_params.n_b = n_v_heads; // Beta is per-value-head
 
@@ -507,7 +507,7 @@ namespace llaminar2
         // Stage 6: Output Projection (Wo GEMM) + optional TP AllReduce
         // =====================================================================
         std::string terminal_node = addWoProjectionAndAllreduce(
-            graph, prefix, buffers, layer.ssm_out,
+            graph, prefix, buffers, layer.ssm_out, layer_bindings.ssm_out,
             total_tokens, layer_idx, device,
             prefix + "gated_norm",
             "gdn_out_proj", "gdn_wo_allreduce");
@@ -617,9 +617,9 @@ namespace llaminar2
                               .output_q_buffer_id = BufferId::FA_Q_RAW,
                               .output_k_buffer_id = BufferId::K_PROJ,
                               .output_v_buffer_id = BufferId::V_PROJ,
-                              .prepared_ref_q = preparedRefForGraphWeight(layer_bindings.wq, layer.wq, device),
-                              .prepared_ref_k = preparedRefForGraphWeight(layer_bindings.wk, layer.wk, device),
-                              .prepared_ref_v = preparedRefForGraphWeight(layer_bindings.wv, layer.wv, device),
+                              .prepared_ref_q = preparedRefForGraphWeight(layer_bindings.wq, device),
+                              .prepared_ref_k = preparedRefForGraphWeight(layer_bindings.wk, device),
+                              .prepared_ref_v = preparedRefForGraphWeight(layer_bindings.wv, device),
                               .prepared_store = prepared_weight_store_,
                           }),
                           device);
@@ -711,7 +711,7 @@ namespace llaminar2
         // Stage 5: Wo projection + optional TP allreduce
         // =================================================================
         std::string terminal = addWoProjectionAndAllreduce(
-            graph, prefix, buffers, layer.wo,
+            graph, prefix, buffers, layer.wo, layer_bindings.wo,
             total_tokens, layer_idx, device,
             prefix + "attn_output_gate");
 

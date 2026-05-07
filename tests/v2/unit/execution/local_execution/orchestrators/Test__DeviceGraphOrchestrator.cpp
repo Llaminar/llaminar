@@ -85,10 +85,9 @@ public:
     LayerWeights exposeLayerWeightsForGraph(int layer_idx) const { return layerWeightsForGraph(layer_idx); }
     std::optional<PreparedWeightRef> exposePreparedRefForGraphWeight(
         const WeightBinding *binding,
-        const TensorBase *tensor,
         DeviceId device) const
     {
-        return preparedRefForGraphWeight(binding, tensor, device);
+        return preparedRefForGraphWeight(binding, device);
     }
 
     int binding_set_count = 0;
@@ -213,11 +212,64 @@ TEST_F(Test__DeviceGraphOrchestrator, SetWeightsFreezesBindingsAndDoesNotExposeL
 
     auto graph_ref = capturing_builder->exposePreparedRefForGraphWeight(
         gdn_binding,
-        ssm_alpha.get(),
         DeviceId::cpu());
     ASSERT_TRUE(graph_ref.has_value());
     EXPECT_EQ(graph_ref->binding_id, registered_ref.binding_id);
     EXPECT_EQ(graph_ref->binding_id, gdn_binding->binding_id);
+}
+
+TEST_F(Test__DeviceGraphOrchestrator, SetFrozenWeightSetConfiguresBindingsDirectly)
+{
+    config_.n_layers = 1;
+    auto capturing_builder = std::make_shared<CapturingQwenStandardGraph>(config_, nullptr);
+    DeviceGraphOrchestrator orchestrator(capturing_builder, nullptr);
+
+    auto embedding = std::make_shared<FP32Tensor>(std::vector<size_t>{16, 8});
+    auto final_norm = std::make_shared<FP32Tensor>(std::vector<size_t>{8});
+    auto lm_head = std::make_shared<FP32Tensor>(std::vector<size_t>{16, 8});
+    auto attn_q = std::make_shared<FP32Tensor>(std::vector<size_t>{8, 8});
+
+    auto make_binding = [](const std::string &name, WeightRole role, TensorBase *tensor) {
+        WeightBinding binding;
+        binding.identity = makeSourceWeightIdentity(name, ModelContextId{42});
+        binding.identity.role = role;
+        binding.identity.layer = inferWeightLayer(name);
+        binding.tensor = tensor;
+        binding.residency.home_device = DeviceId::cpu();
+        binding.residency.resident_device = DeviceId::cpu();
+        return binding;
+    };
+
+    InferenceStrategy strategy;
+    strategy.mode = WeightInferenceMode::SingleDevice;
+    strategy.model_id = ModelContextId{42};
+    strategy.devices = {DeviceId::cpu()};
+
+    ModelWeightSetBuilder builder(strategy);
+    builder.addBinding(make_binding("token_embd.weight", WeightRole::Embedding, embedding.get()));
+    builder.addBinding(make_binding("output_norm.weight", WeightRole::OutputNorm, final_norm.get()));
+    builder.addBinding(make_binding("output.weight", WeightRole::LMHead, lm_head.get()));
+    builder.addBinding(make_binding("blk.0.attn_q.weight", WeightRole::AttentionQ, attn_q.get()));
+
+    auto frozen = std::make_unique<FrozenModelWeightSet>(strategy, builder.freezeBindings());
+    orchestrator.setFrozenWeightSet(std::move(frozen));
+
+    ASSERT_NE(orchestrator.frozenWeightSet(), nullptr);
+    ASSERT_EQ(capturing_builder->binding_set_count, 1);
+    ASSERT_NE(capturing_builder->captured_bindings.embedding_table, nullptr);
+    ASSERT_NE(capturing_builder->captured_bindings.final_norm, nullptr);
+    ASSERT_NE(capturing_builder->captured_bindings.lm_head, nullptr);
+    EXPECT_EQ(capturing_builder->captured_bindings.embedding_table->tensor, embedding.get());
+    EXPECT_EQ(capturing_builder->captured_weights.embedding_table, embedding.get());
+
+    ASSERT_TRUE(capturing_builder->captured_bindings.get_layer_weights != nullptr);
+    auto layer_bindings = capturing_builder->captured_bindings.get_layer_weights(0);
+    ASSERT_NE(layer_bindings.wq, nullptr);
+    EXPECT_EQ(layer_bindings.wq->tensor, attn_q.get());
+
+    ASSERT_TRUE(capturing_builder->captured_weights.get_layer_weights != nullptr);
+    auto legacy_layer = capturing_builder->captured_weights.get_layer_weights(0);
+    EXPECT_EQ(legacy_layer.wq, attn_q.get());
 }
 
 // =============================================================================

@@ -17,6 +17,7 @@
 #include "../local_execution/orchestrators/DeviceGraphOrchestrator.h"
 #include "../../loaders/ModelContext.h"
 #include "../../loaders/ModelLoader.h"
+#include "../../loaders/PreparedWeightStore.h"
 #include "../../loaders/WeightManager.h"
 #include "../../loaders/WeightStreamerFactory.h"
 #include "../../collective/ILocalTPContext.h"
@@ -52,6 +53,222 @@ namespace llaminar2
         DeviceGraphOrchestrator *orchestrator,
         std::shared_ptr<ModelContext> model_ctx,
         DeviceId device);
+
+    static PreparedWeightKind expectedGemmPreparedKind(DeviceId device)
+    {
+        if (device.is_cuda()) return PreparedWeightKind::CudaInt8PackedGemm;
+        if (device.is_rocm()) return PreparedWeightKind::RocmInt8PackedGemm;
+        return PreparedWeightKind::CpuPackedGemm;
+    }
+
+    static bool isMoEExpertTensorName(const std::string &name)
+    {
+        return name.find("_exps.weight") != std::string::npos;
+    }
+
+    static PreparedWeightKind expectedPreparedKindForWeight(
+        const WeightManager &weight_mgr,
+        const std::string &name,
+        DeviceId device)
+    {
+        if (isMoEExpertTensorName(name))
+            return PreparedWeightKind::None;
+        try
+        {
+            if (weight_mgr.isGemmWeight(name))
+                return expectedGemmPreparedKind(device);
+        }
+        catch (const std::exception &e)
+        {
+            LOG_WARN("[InferenceRunner] Could not classify prepared kind for " << name << ": " << e.what());
+        }
+        return PreparedWeightKind::None;
+    }
+
+    static WeightRequirement makeSingleDeviceRequirement(
+        const WeightManager &weight_mgr,
+        const std::string &canonical_name,
+        DeviceId device,
+        bool required = true,
+        WeightRole role = WeightRole::Other,
+        std::string source_name = {},
+        WeightDerivationKind derivation = WeightDerivationKind::Source,
+        std::optional<DeviceId> lookup_device = DeviceId::cpu(),
+        int tp_rank_or_device_index = 0,
+        int tp_domain = -1,
+        int pp_stage = -1,
+        WeightSliceSpec slice = {})
+    {
+        WeightRequirement requirement;
+        requirement.canonical_name = canonical_name;
+        requirement.source_name = std::move(source_name);
+        requirement.required = required;
+        requirement.role = role;
+        requirement.derivation = derivation;
+        requirement.tp_domain = tp_domain;
+        requirement.tp_rank_or_device_index = tp_rank_or_device_index;
+        requirement.pp_stage = pp_stage;
+        requirement.target_device = device;
+        requirement.lookup_device = lookup_device;
+        requirement.host_policy = device.is_cpu()
+                                      ? WeightHostPolicy::RequiredForCPUExecution
+                                      : WeightHostPolicy::RequiredUntilGraphMaterialized;
+        requirement.expected_prepared_kind = role == WeightRole::Embedding
+                                                 ? PreparedWeightKind::None
+                                                 : expectedPreparedKindForWeight(weight_mgr, canonical_name, device);
+        requirement.slice = slice;
+        return requirement;
+    }
+
+    static WeightSliceSpec vocabSliceSpecForAssignment(
+        const TensorParallelConfig *tp_config,
+        DeviceId device)
+    {
+        WeightSliceSpec slice;
+        if (!tp_config)
+            return slice;
+        try
+        {
+            const auto &assignment = tp_config->forDevice(device);
+            slice.source_rows = static_cast<size_t>(tp_config->totalVocab());
+            slice.row_start = static_cast<size_t>(assignment.vocab_start);
+            slice.row_count = static_cast<size_t>(assignment.vocab_count);
+        }
+        catch (const std::out_of_range &)
+        {
+        }
+        return slice;
+    }
+
+    static WeightPlan buildSingleDeviceWeightPlan(
+        const WeightManager &weight_mgr,
+        const ModelContext &model_ctx,
+        const WeightValidationResult &validation,
+        DeviceId device,
+        const TensorParallelConfig *tp_config = nullptr,
+        const FactoryPPStageConfig *pp_config = nullptr)
+    {
+        InferenceStrategy strategy;
+        const bool has_tp = tp_config && tp_config->worldSize() > 1;
+        const bool has_pp = pp_config != nullptr;
+        strategy.mode = has_pp && has_tp ? WeightInferenceMode::HybridPPTP
+                      : has_pp          ? WeightInferenceMode::LocalPP
+                      : has_tp          ? WeightInferenceMode::LocalTP
+                                        : WeightInferenceMode::SingleDevice;
+        strategy.model_id = ModelContextId{reinterpret_cast<uint64_t>(&model_ctx)};
+        strategy.pp_stages = has_pp ? 2 : 1;
+        strategy.tp_degree = tp_config ? tp_config->worldSize() : 1;
+        if (tp_config)
+        {
+            for (const auto &assignment : tp_config->assignments())
+                strategy.devices.push_back(assignment.device);
+        }
+        else
+        {
+            strategy.devices = {device};
+        }
+
+        WeightPlan plan(strategy);
+
+        int tp_rank_or_device_index = 0;
+        int tp_domain = -1;
+        std::optional<DeviceId> lookup_device = DeviceId::cpu();
+        if (tp_config)
+        {
+            const auto &assignment = tp_config->forDevice(device);
+            tp_rank_or_device_index = assignment.local_rank;
+            tp_domain = 0;
+            lookup_device = device;
+        }
+
+        const WeightSliceSpec vocab_slice = vocabSliceSpecForAssignment(tp_config, device);
+        const int pp_stage = pp_config ? pp_config->first_layer : -1;
+
+        if (!pp_config || pp_config->has_embedding)
+        {
+            plan.add(makeSingleDeviceRequirement(
+                weight_mgr,
+                "token_embd.weight",
+                device,
+                true,
+                WeightRole::Embedding,
+                {},
+                WeightDerivationKind::Source,
+                lookup_device,
+                tp_rank_or_device_index,
+                tp_domain,
+                pp_stage,
+                vocab_slice));
+        }
+
+        if (!pp_config || pp_config->has_lm_head)
+        {
+            plan.add(makeSingleDeviceRequirement(
+                weight_mgr,
+                "output_norm.weight",
+                device,
+                true,
+                WeightRole::OutputNorm,
+                {},
+                WeightDerivationKind::Source,
+                lookup_device,
+                tp_rank_or_device_index,
+                tp_domain,
+                pp_stage));
+
+            if (model_ctx.hasTensor("output.weight"))
+            {
+                plan.add(makeSingleDeviceRequirement(
+                    weight_mgr,
+                    "output.weight",
+                    device,
+                    true,
+                    WeightRole::LMHead,
+                    {},
+                    WeightDerivationKind::Source,
+                    lookup_device,
+                    tp_rank_or_device_index,
+                    tp_domain,
+                    pp_stage,
+                    vocab_slice));
+            }
+            else
+            {
+                const std::string tied_lm_head_source = tp_config ? "output.weight" : "token_embd.weight";
+                plan.add(makeSingleDeviceRequirement(
+                    weight_mgr,
+                    "output.weight",
+                    device,
+                    true,
+                    WeightRole::LMHead,
+                    tied_lm_head_source,
+                    WeightDerivationKind::TiedAlias,
+                    lookup_device,
+                    tp_rank_or_device_index,
+                    tp_domain,
+                    pp_stage,
+                    vocab_slice));
+            }
+        }
+
+        for (const auto &[weight_name, is_optional] : validation.weights_to_load)
+        {
+            plan.add(makeSingleDeviceRequirement(
+                weight_mgr,
+                weight_name,
+                device,
+                !is_optional,
+                WeightRole::Other,
+                {},
+                WeightDerivationKind::Source,
+                lookup_device,
+                tp_rank_or_device_index,
+                tp_domain,
+                pp_stage));
+        }
+
+        return plan;
+    }
 
     // =========================================================================
     // Helper: Build ClusterInventory for GPU Collective Context
@@ -1125,6 +1342,16 @@ namespace llaminar2
             LOG_DEBUG("[InferenceRunner] Global weights loaded into cache");
         }
 
+        auto weight_plan = buildSingleDeviceWeightPlan(
+            *weight_mgr,
+            *model_ctx,
+            validation,
+            device);
+        weight_mgr->setPreparedWeightStore(
+            std::make_shared<PreparedWeightStore>(weight_plan.strategy().model_id));
+        LOG_DEBUG("[InferenceRunner] SingleDevice WeightPlan built with "
+                  << weight_plan.size() << " requirements");
+
         // =====================================================================
         // Weight rotation (activation_rotation) is intentionally NOT registered
         // as a weight preprocessor. GEMM invariance (R(X) @ R(W)^T = X @ W^T)
@@ -1135,33 +1362,27 @@ namespace llaminar2
         // =====================================================================
         const auto &env = debugEnv();
 
-        // =====================================================================
-        // Finalize weights: GEMM pack → upload → release host copies
-        // =====================================================================
-        weight_mgr->finalizeForDevice(device);
+        FrozenModelWeightSet frozen_weights = weight_mgr->materialize(weight_plan);
+        auto weight_bindings = makeModelWeightBindings(frozen_weights);
+        auto legacy_weights = toLegacyModelWeights(weight_bindings);
 
-        // Build weights via polymorphic builder (centralizes weight name knowledge).
-        // Uses default CPU device for getWeightForDevice() — this returns the
-        // original tensors from cache_, matching the prepared GEMM registry keys
-        // (which also use cache_ originals). The PreparedEmbedding registry uses
-        // weight names (not pointers), so pointer identity doesn't matter there.
-        auto config_builder = createGraphConfigBuilder(arch);
-        auto weights = config_builder->buildWeights(
-            [weight_mgr](const std::string &name)
-            {
-                return weight_mgr->getWeightForDevice(name);
-            });
-
-        if (!weights.embedding_table || !weights.final_norm || !weights.lm_head)
+        if (!legacy_weights.embedding_table || !legacy_weights.final_norm || !legacy_weights.lm_head)
         {
             LOG_ERROR("[InferenceRunner] Missing global weights");
             return false;
         }
 
-        orchestrator->setWeights(weights);
-        LOG_DEBUG("[InferenceRunner] Weights configured on orchestrator");
+        if (!weight_mgr->prepareWeightsForDevice(frozen_weights, device))
+        {
+            LOG_WARN("[InferenceRunner] Binding-driven weight preparation had issues for device "
+                     << device.to_string());
+        }
 
-        // Phase 4-5: Populate prepared weight store from KernelFactory entries
+        orchestrator->setFrozenWeightSet(
+            std::make_unique<FrozenModelWeightSet>(std::move(frozen_weights)));
+        LOG_DEBUG("[InferenceRunner] Frozen weight bindings configured on orchestrator");
+
+        // Phase 4-5: Populate prepared weight store from frozen bindings
         orchestrator->initializePreparedWeightStore(device);
 
         // Phase 9: Mark graph materialization complete — all weight bindings resolved
@@ -1304,13 +1525,35 @@ namespace llaminar2
         }
         LOG_DEBUG("[PPStageRunner] All layer weights for stage loaded into cache");
 
+        auto weight_plan = buildSingleDeviceWeightPlan(
+            *weight_mgr,
+            *model_ctx,
+            pp_validation,
+            device,
+            nullptr,
+            &pp_config);
+        weight_mgr->setPreparedWeightStore(
+            std::make_shared<PreparedWeightStore>(weight_plan.strategy().model_id));
+        FrozenModelWeightSet frozen_weights = weight_mgr->materialize(weight_plan);
+        auto weight_bindings = makeModelWeightBindings(frozen_weights);
+        auto legacy_weights = toLegacyModelWeights(weight_bindings);
+
+        if (pp_config.has_embedding && !legacy_weights.embedding_table)
+        {
+            LOG_ERROR("[PPStageRunner] Frozen PP stage has_embedding=true but embedding missing");
+            return false;
+        }
+        if (pp_config.has_lm_head && (!legacy_weights.final_norm || !legacy_weights.lm_head))
+        {
+            LOG_ERROR("[PPStageRunner] Frozen PP stage has_lm_head=true but final_norm/lm_head missing");
+            return false;
+        }
+
         // =====================================================================
         // Prepare weights: GEMM pack + upload (layer-filtered, no host release)
         // Host copies are released by the caller after ALL PP stages are prepared.
         // =====================================================================
-        bool prepare_ok = weight_mgr->prepareWeightsForDevice(
-            device, first_layer, last_layer,
-            pp_config.has_embedding, pp_config.has_lm_head);
+        bool prepare_ok = weight_mgr->prepareWeightsForDevice(frozen_weights, device);
 
         if (!prepare_ok)
         {
@@ -1318,47 +1561,8 @@ namespace llaminar2
                      << device.to_string() << " layers [" << first_layer << ", " << last_layer << ")");
         }
 
-        // =====================================================================
-        // Build weights via polymorphic builder AFTER finalization
-        // (ensures getWeightForDevice returns per-device clones with stable pointers)
-        // =====================================================================
-        auto config_builder = createGraphConfigBuilder(arch);
-        auto builder_weights = config_builder->buildWeights(
-            [weight_mgr, device](const std::string &name)
-            {
-                return weight_mgr->getWeightForDevice(name, device);
-            });
-
-        ModelWeights weights;
-
-        // Set global weight pointers from builder (post-finalization, stable pointers)
-        if (pp_config.has_embedding)
-        {
-            weights.embedding_table = builder_weights.embedding_table;
-        }
-        if (pp_config.has_lm_head)
-        {
-            weights.final_norm = builder_weights.final_norm;
-            weights.lm_head = builder_weights.lm_head;
-        }
-
-        // Layer weight accessor via polymorphic builder with PP layer-range validation
-        const int stage_first_layer = first_layer;
-        const int stage_last_layer = last_layer;
-        auto builder_get_layer = builder_weights.get_layer_weights;
-
-        weights.get_layer_weights = [builder_get_layer, stage_first_layer, stage_last_layer](int layer_idx) -> LayerWeights
-        {
-            if (layer_idx < stage_first_layer || layer_idx >= stage_last_layer)
-            {
-                LOG_ERROR("[PPStageRunner] Layer " << layer_idx << " requested but stage only owns ["
-                                                   << stage_first_layer << ", " << stage_last_layer << ")");
-                return LayerWeights{};
-            }
-            return builder_get_layer(layer_idx);
-        };
-
-        orchestrator->setWeights(weights);
+        orchestrator->setFrozenWeightSet(
+            std::make_unique<FrozenModelWeightSet>(std::move(frozen_weights)));
         LOG_DEBUG("[PPStageRunner] Weights configured for PP stage [" << first_layer << ", " << last_layer << ")");
 
         // PP runners build the same frozen graph bindings as full runners, so
@@ -1922,40 +2126,142 @@ namespace llaminar2
         // Configure weights: PP-aware vs full
         if (config.pp_stage_config.has_value())
         {
-            // Nested TP-in-PP: use standard TP-sharded weight loading but with
-            // partial global weight requirements
             const auto &pp_cfg = config.pp_stage_config.value();
-
-            auto weights = config_builder->buildWeights(load_weight_for_runner);
-
-            // Only check for global weights this PP stage actually owns
-            if (pp_cfg.has_embedding && !weights.embedding_table)
+            auto concrete_model_ctx = std::dynamic_pointer_cast<ModelContext>(model_ctx);
+            auto concrete_weight_mgr = concrete_model_ctx ? concrete_model_ctx->concreteWeightManager() : nullptr;
+            if (!concrete_model_ctx || !concrete_weight_mgr)
             {
-                LOG_ERROR("[InferenceRunner] PP stage has_embedding=true but embedding missing");
-                return nullptr;
-            }
-            if (pp_cfg.has_lm_head && (!weights.final_norm || !weights.lm_head))
-            {
-                LOG_ERROR("[InferenceRunner] PP stage has_lm_head=true but final_norm/lm_head missing");
+                LOG_ERROR("[InferenceRunner] PP stage materialization requires concrete ModelContext/WeightManager");
                 return nullptr;
             }
 
-            orchestrator->setWeights(weights);
+            concrete_weight_mgr->setWeightShardingConfig(
+                SchemaFactoryRegistry::getWeightShardingConfig(architecture));
+
+            auto schema_factory = SchemaFactoryRegistry::getFactory(architecture);
+            auto validation = validateLayerWeights(
+                *schema_factory,
+                concrete_model_ctx->totalBlockCount(),
+                [concrete_model_ctx](const std::string &name)
+                { return concrete_model_ctx->hasTensor(name); },
+                pp_cfg.first_layer,
+                pp_cfg.last_layer);
+
+            if (!validation.success)
+            {
+                LOG_ERROR("[InferenceRunner] " << validation.error_message());
+                return nullptr;
+            }
+
+            auto weight_plan = buildSingleDeviceWeightPlan(
+                *concrete_weight_mgr,
+                *concrete_model_ctx,
+                validation,
+                device,
+                graph_config.tp_config.get(),
+                &pp_cfg);
+            auto frozen_weights = concrete_weight_mgr->materialize(weight_plan);
+            auto weight_bindings = makeModelWeightBindings(frozen_weights);
+            auto legacy_weights = toLegacyModelWeights(weight_bindings);
+
+            if (pp_cfg.has_embedding && !legacy_weights.embedding_table)
+            {
+                LOG_ERROR("[InferenceRunner] Frozen PP stage has_embedding=true but embedding missing");
+                return nullptr;
+            }
+            if (pp_cfg.has_lm_head && (!legacy_weights.final_norm || !legacy_weights.lm_head))
+            {
+                LOG_ERROR("[InferenceRunner] Frozen PP stage has_lm_head=true but final_norm/lm_head missing");
+                return nullptr;
+            }
+
+            // Nested TP-in-PP RankOrchestrators may have run broad device
+            // finalization before this runner materialized its PP-stage frozen
+            // bindings. Re-run the stage-filtered preparation here, after
+            // materialization, so GPU pipeline handles are registered under the
+            // graph binding ids instead of pipeline-local ids.
+            bool prepare_ok = concrete_weight_mgr->prepareWeightsForDevice(
+                frozen_weights,
+                device);
+
+            if (!prepare_ok)
+            {
+                LOG_WARN("[InferenceRunner] PP stage weight preparation had issues for device "
+                         << device.to_string() << " layers [" << pp_cfg.first_layer << ", " << pp_cfg.last_layer << ")");
+            }
+
+            orchestrator->setFrozenWeightSet(
+                std::make_unique<FrozenModelWeightSet>(std::move(frozen_weights)));
             orchestrator->initializePreparedWeightStore(device);
         }
         else
         {
-            // Full model: load all global weights
-            auto weights = config_builder->buildWeights(load_weight_for_runner);
-
-            if (!weights.embedding_table || !weights.final_norm || !weights.lm_head)
+            bool configured_from_frozen = false;
+            if (graph_config.tp_config)
             {
-                LOG_ERROR("[InferenceRunner] Missing global weights from IModelContext");
-                return nullptr;
+                auto concrete_model_ctx = std::dynamic_pointer_cast<ModelContext>(model_ctx);
+                auto concrete_weight_mgr = concrete_model_ctx ? concrete_model_ctx->concreteWeightManager() : nullptr;
+                if (concrete_model_ctx && concrete_weight_mgr)
+                {
+                    auto schema_factory = SchemaFactoryRegistry::getFactory(architecture);
+                    auto validation = validateLayerWeights(
+                        *schema_factory,
+                        concrete_model_ctx->totalBlockCount(),
+                        [concrete_model_ctx](const std::string &name)
+                        { return concrete_model_ctx->hasTensor(name); });
+
+                    if (!validation.success)
+                    {
+                        LOG_ERROR("[InferenceRunner] " << validation.error_message());
+                        return nullptr;
+                    }
+
+                    auto weight_plan = buildSingleDeviceWeightPlan(
+                        *concrete_weight_mgr,
+                        *concrete_model_ctx,
+                        validation,
+                        device,
+                        graph_config.tp_config.get());
+                    auto frozen_weights = concrete_weight_mgr->materialize(weight_plan);
+                    auto weight_bindings = makeModelWeightBindings(frozen_weights);
+                    auto legacy_weights = toLegacyModelWeights(weight_bindings);
+
+                    if (!legacy_weights.embedding_table || !legacy_weights.final_norm || !legacy_weights.lm_head)
+                    {
+                        LOG_ERROR("[InferenceRunner] Missing global weights from materialized LocalTP bindings");
+                        return nullptr;
+                    }
+
+                    if (!concrete_weight_mgr->prepareWeightsForDevice(
+                            frozen_weights,
+                            device,
+                            /*include_expert_jobs=*/false))
+                    {
+                        LOG_WARN("[InferenceRunner] LocalTP binding-driven weight preparation had issues for device "
+                                 << device.to_string());
+                    }
+
+                    orchestrator->setFrozenWeightSet(
+                        std::make_unique<FrozenModelWeightSet>(std::move(frozen_weights)));
+                    orchestrator->initializePreparedWeightStore(device);
+                    configured_from_frozen = true;
+                }
             }
 
-            orchestrator->setWeights(weights);
-            orchestrator->initializePreparedWeightStore(device);
+            if (!configured_from_frozen)
+            {
+                // Full model: load all global weights
+                auto weights = config_builder->buildWeights(load_weight_for_runner);
+
+                if (!weights.embedding_table || !weights.final_norm || !weights.lm_head)
+                {
+                    LOG_ERROR("[InferenceRunner] Missing global weights from IModelContext");
+                    return nullptr;
+                }
+
+                orchestrator->setWeights(weights);
+                orchestrator->initializePreparedWeightStore(device);
+            }
         }
 
         LOG_INFO("[InferenceRunner] Testable DeviceGraphOrchestrator created successfully");

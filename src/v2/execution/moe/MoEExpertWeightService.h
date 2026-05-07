@@ -143,9 +143,6 @@ public:
         int layer_idx);
 
 private:
-    /// Register transferred packed weights for one expert (CPU path only).
-    static bool registerTransferredExpert(MoEWeightContext& ctx, int expert_id, const ExpertWeightBlobs& blobs);
-
     /// GPU pipeline path: raw H2D + GPU repack via LoadOrchestrator.
     /// Unified for CUDA and ROCm — no CPU-side VNNI interleaving.
     static bool prepareGemmEnginesGPU(MoEWeightContext& ctx);

@@ -354,11 +354,11 @@ namespace llaminar2
             shared_params.input_buffer_id = BufferId::NORMALIZED;
             shared_params.output_buffer_id = BufferId::MOE_SHARED_EXPERT_OUTPUT;
             shared_params.prepared_ref_gate = preparedRefForGraphWeight(
-                layer_bindings.shared_expert_gate, layer.shared_expert_gate, device);
+                layer_bindings.shared_expert_gate, device);
             shared_params.prepared_ref_up = preparedRefForGraphWeight(
-                layer_bindings.shared_expert_up, layer.shared_expert_up, device);
+                layer_bindings.shared_expert_up, device);
             shared_params.prepared_ref_down = preparedRefForGraphWeight(
-                layer_bindings.shared_expert_down, layer.shared_expert_down, device);
+                layer_bindings.shared_expert_down, device);
             shared_params.prepared_store = prepared_weight_store_;
 
             graph.addNode(prefix + "shared_expert_ffn",
