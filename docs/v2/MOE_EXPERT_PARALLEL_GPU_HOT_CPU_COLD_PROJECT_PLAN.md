@@ -321,7 +321,9 @@ Validation must enforce:
 
 ## Config Surface
 
-Start with YAML support. CLI flags can come later.
+Support both YAML and CLI. Both surfaces must parse into the same `MoEExpertParallelPlan` value, and validation must run after merging all config sources.
+
+YAML is the most readable surface for persistent topology files:
 
 ```yaml
 moe_expert_parallel:
@@ -372,6 +374,113 @@ moe_expert_parallel:
 ```
 
 This should be parsed separately from `--define-domain`/`--pp-stage`. Named domains can share parsing helpers, but this feature is not pipeline stage assignment.
+
+### CLI Surface
+
+Use `--moe-expert-overlay` as the canonical CLI entry point. The flag enables the same-layer MoE overlay and selects the execution kind:
+
+```text
+--moe-expert-overlay off|single-domain|tiered
+```
+
+Recommended values:
+
+| CLI value | Plan value | Meaning |
+| --- | --- | --- |
+| `off` | `enabled=false` | Disable MoE expert overlay. |
+| `single-domain` | `SingleDomainExpertSharded` | Existing CPU socket EP: one domain covers every routed expert by expert-id ownership/rebalancing. |
+| `tiered` | `TieredExpertOverlay` | Ordered routed tiers contribute to the same MoE layer. |
+
+#### Tiered Overlay Example
+
+The NVIDIA + AMD + CPU layout above should be expressible as:
+
+```bash
+./build_v2_release/llaminar2 oneshot \
+  -m models/qwen35-moe.gguf \
+  -p "Hello" \
+  --moe-expert-overlay tiered \
+  --moe-expert-overlay-continuation nvidia_fast \
+  --moe-expert-overlay-shared-domain nvidia_fast \
+  --moe-expert-overlay-residency histogram \
+  --moe-expert-overlay-domain "nvidia_fast=0:cuda:0,0:cuda:1;scope=local;backend=nccl;compute=tensor_parallel_experts" \
+  --moe-expert-overlay-domain "amd_warm=0:rocm:0,0:rocm:1;scope=local;backend=rccl;compute=tensor_parallel_experts" \
+  --moe-expert-overlay-domain "cpu_cold=0:cpu:0,1:cpu:0;scope=node_local;backend=upi;compute=tensor_parallel_experts" \
+  --moe-expert-overlay-tier "hottest@nvidia_fast;priority=0;max-experts-per-layer=8;memory-mb=auto" \
+  --moe-expert-overlay-tier "warm@amd_warm;priority=1;max-experts-per-layer=12;memory-mb=auto" \
+  --moe-expert-overlay-tier "cold@cpu_cold;priority=2;fallback=true"
+```
+
+This is intentionally not written as `--tp-devices` or `--pp-stage`. Each overlay domain may have its own inner TP mode, but the overlay itself is a same-layer MoE dispatch/reduce policy.
+
+#### CLI Grammar
+
+```text
+--moe-expert-overlay <kind>
+    kind := off | single-domain | tiered
+
+--moe-expert-overlay-continuation <domain-name>
+    domain-name := name of the domain that receives the final reduced MoE output
+
+--moe-expert-overlay-shared-domain <domain-name>
+    domain-name := domain where shared experts are resident and executed
+
+--moe-expert-overlay-residency <policy>
+    policy := static-by-id | histogram | explicit-masks
+
+--moe-expert-overlay-domain "<name>=<devices>;scope=<scope>;backend=<backend>;compute=<compute>[;owner=<rank>][;ranks=<rank-list>]"
+    devices := comma-separated GlobalDeviceAddress values, e.g. 0:cuda:0,0:cuda:1 or 0:cpu:0,1:cpu:0
+    scope := single | local | node_local
+    backend := auto | nccl | rccl | host | mpi | upi
+    compute := replicated_experts | expert_id_sharded | tensor_parallel_experts
+
+--moe-expert-overlay-tier "<name>@<domain>;priority=<n>[;max-experts-per-layer=<n>][;memory-mb=<n|auto>][;fallback=true]"
+    Lower priority means hotter / more preferred.
+    Exactly one tier must set fallback=true.
+```
+
+#### YAML Mapping
+
+The CLI example maps to YAML as follows:
+
+| CLI flag | YAML field |
+| --- | --- |
+| `--moe-expert-overlay tiered` | `moe_expert_parallel.enabled=true`, `execution_kind=tiered_expert_overlay` |
+| `--moe-expert-overlay-continuation nvidia_fast` | `continuation_domain: nvidia_fast` |
+| `--moe-expert-overlay-shared-domain nvidia_fast` | `shared_expert_domain: nvidia_fast` |
+| `--moe-expert-overlay-residency histogram` | `residency.mode: histogram` |
+| `--moe-expert-overlay-domain "name=..."` | `domains.<name>` |
+| `--moe-expert-overlay-tier "name@domain;..."` | one item in `routed_tiers` |
+
+#### Single-Domain CPU Socket Example
+
+The existing CPU-socket EP scenario should use the same flag family but select `single-domain`:
+
+```bash
+./build_v2_release/llaminar2 oneshot \
+  -m models/qwen35-moe.gguf \
+  -p "Hello" \
+  --moe-expert-overlay single-domain \
+  --moe-expert-overlay-continuation cpu_sockets \
+  --moe-expert-overlay-shared-domain cpu_sockets \
+  --moe-expert-overlay-domain "cpu_sockets=0:cpu:0,1:cpu:0;scope=node_local;backend=upi;compute=expert_id_sharded" \
+  --moe-expert-overlay-tier "routed@cpu_sockets;priority=0;fallback=true"
+```
+
+This keeps the term "expert overlay" at the user-facing orchestration layer while preserving `TPMode::ExpertParallel` as the lower-level expert-id sharding mode inside the `cpu_sockets` domain.
+
+#### CLI Validation Rules
+
+Validation must reject:
+
+1. `--moe-expert-overlay tiered` with fewer than one `--moe-expert-overlay-tier`.
+2. Any tier whose domain was not declared by `--moe-expert-overlay-domain` or YAML `domains`.
+3. More or fewer than one fallback tier.
+4. Duplicate domain names or duplicate tier names.
+5. `compute=expert_id_sharded` without a compatible stage-local `TPMode::ExpertParallel` lowering path.
+6. `compute=tensor_parallel_experts` without a domain-scoped TP context.
+7. Combining `--moe-expert-overlay-*` tier/domain flags with `--pp-stage` as if they assigned layer ranges. Overlay domains may coexist with PP in a future design, but these flags must not be interpreted as PP stage ownership.
+8. `--moe-expert-overlay off` with any other `--moe-expert-overlay-*` flag except possibly diagnostics.
 
 ## Runtime Design
 
@@ -474,149 +583,282 @@ tests/v2/integration/parity/qwen35moe/Test__Qwen35MoE_ExpertParallel_Parity.cpp
 
 ## Phased Delivery Plan
 
+Each phase must leave the tree in a testable state. A phase is not done until its named unit or integration target exists, is wired into `tests/v2/CMakeLists.txt`, and passes in `build_v2_integration` with full parallelism.
+
 ### Phase 0: Freeze the Diagnosis and Retire the Wrong Test Semantics
 
-Tasks:
+Deliverables:
 
 - Add a short note to the existing HybridPPTP handover or test comments explaining that sequential PP cannot represent same-layer GPU-hot/CPU-cold expert split.
-- Rename or disable the current `PrefillParityWithGpuExpertCache` expectation as a known-invalid topology until Expert Parallel exists.
+- Rename, skip, or re-scope the current `PrefillParityWithGpuExpertCache` expectation as a known-invalid topology until Expert Overlay exists.
 - Preserve the multi-domain PP runner tests, since they validate useful sequential PP infrastructure.
+
+Required tests:
+
+```bash
+ctest --test-dir build_v2_integration -R "Qwen35MoEHybridPPTP" --output-on-failure --parallel
+```
 
 Acceptance criteria:
 
 - Future agents do not try to fix the current parity failure by snapshot allreduce or by broadening PP masks.
 - The test suite no longer treats sequential PP plus hot/cold masks as the consumer-inference correctness target.
+- Existing HybridPPTP tests still pass or explicitly skip the invalid GPU-cache parity case with a reason that points to this plan.
 
 ### Phase 1: Add Value Types and Validation
 
-Tasks:
+Deliverables:
 
-- Add `MoEExpertParallelPlan`, `ExpertComputeDomain`, and related enums.
+- Add `src/v2/execution/moe/MoEExpertParallelPlan.h` with `MoEExpertExecutionKind`, `ExpertDomainComputeKind`, `ExpertComputeDomain`, `ExpertRoutedTier`, `ExpertLayerPlacement`, and `MoEExpertParallelPlan`.
 - Embed an optional plan in `GraphConfig::MoEConfig`.
-- Add validation helpers that enforce per-layer expert coverage and domain references.
-- Add unit tests for valid and invalid plans.
+- Add validation helpers that enforce domain references, tier references, coverage, one fallback tier, and compatible `compute_kind` choices.
+- Add `tests/v2/unit/execution/moe/Test__MoEExpertParallelPlan.cpp`.
+
+Required tests:
+
+```bash
+ctest --test-dir build_v2_integration -R "V2_Unit_.*MoEExpertParallelPlan" --output-on-failure --parallel
+```
 
 Acceptance criteria:
 
-- Unit tests cover full coverage, missing expert, duplicate expert, missing domain, and unsupported weight-parallelism combinations.
+- Unit tests cover valid two-tier and three-tier plans.
+- Unit tests reject missing expert coverage, duplicate expert ownership, missing domain, duplicate domain names, duplicate tier names, missing fallback tier, multiple fallback tiers, and unsupported `compute_kind` combinations.
 - No graph execution changes yet.
 
-### Phase 2: Parse YAML Configuration
+### Phase 2: Parse YAML and `--moe-expert-overlay` CLI
 
-Tasks:
+Deliverables:
 
 - Extend YAML parsing for `moe_expert_parallel`.
+- Add `--moe-expert-overlay` and related CLI flags:
+    - `--moe-expert-overlay-continuation`
+    - `--moe-expert-overlay-shared-domain`
+    - `--moe-expert-overlay-residency`
+    - `--moe-expert-overlay-domain`
+    - `--moe-expert-overlay-tier`
 - Convert YAML domains into `ExpertComputeDomain` values.
-- Parse hot-cache configuration and explicit masks if provided.
-- Keep CLI changes out of this phase unless trivial.
+- Convert CLI domain and tier specs into the same `MoEExpertParallelPlan` shape as YAML.
+- Parse tiered-cache configuration and explicit masks if provided.
+- Run one shared validator after YAML and CLI values are merged.
+- Add parser tests under `tests/v2/unit/config/`, either in the existing orchestration parser test file or in a new `Test__MoEExpertOverlayConfig.cpp`.
+
+Required tests:
+
+```bash
+ctest --test-dir build_v2_integration -R "V2_Unit_.*(OrchestrationConfigParser|MoEExpertOverlayConfig)" --output-on-failure --parallel
+```
 
 Acceptance criteria:
 
-- Parser tests construct the sample GPU-hot/CPU-cold plan.
+- Parser tests construct the 2x ROCm TP + CPU NodeLocalTP plan from YAML and CLI.
+- Parser tests construct the 1x CUDA + 2x ROCm + CPU NodeLocalTP plan from YAML and CLI.
+- Parser tests cover the `single-domain` CPU socket EP CLI form.
 - Invalid configs produce validation errors before model execution.
 
 ### Phase 3: Static Residency Planner
 
-Tasks:
+Deliverables:
 
-- Add `MoEExpertParallelPlanner`.
-- Implement `StaticById` or explicit-mask placement first.
+- Add `src/v2/execution/moe/MoEExpertParallelPlanner.{h,cpp}`.
+- Implement `StaticById` and explicit-mask placement first.
 - Implement `HistogramTieredCache` as a deterministic policy using existing `DecodeExpertHistogram` data when available, with a fallback to by-id tier assignment.
 - Estimate shared expert and routed expert memory footprint from model metadata and tensor types.
+- Add `tests/v2/unit/execution/moe/Test__MoEExpertParallelPlanner.cpp`.
+
+Required tests:
+
+```bash
+ctest --test-dir build_v2_integration -R "V2_Unit_.*MoEExpertParallelPlanner" --output-on-failure --parallel
+```
 
 Acceptance criteria:
 
-- Unit tests prove the planner assigns shared experts to the configured shared domain first, then fills routed tiers in priority order before assigning the fallback tier.
-- Planner output satisfies the Phase 1 coverage validator.
+- Unit tests prove the planner assigns shared experts to the configured shared domain first.
+- Unit tests prove routed experts fill tiers in priority order before assigning the fallback tier.
+- Unit tests prove the planner is deterministic for equal histogram counts.
+- Planner output satisfies the Phase 1 coverage validator for both required final topologies.
 
 ### Phase 4: Model-Light Dispatch and Reduce Stages
 
-Tasks:
+Deliverables:
 
 - Add `MoEExpertDispatchStage` for producing per-tier work descriptors from routing results.
 - Add `MoEExpertParallelReduceStage` that sums N dense partial tensors into the continuation output.
 - First implementation may use host memory and CPU tensors only.
+- Add `tests/v2/unit/execution/compute_stages/Test__MoEExpertDispatchStage.cpp`.
+- Add `tests/v2/unit/execution/compute_stages/Test__MoEExpertParallelReduceStage.cpp`.
+
+Required tests:
+
+```bash
+ctest --test-dir build_v2_integration -R "V2_Unit_.*MoEExpert(Dispatch|ParallelReduce)Stage" --output-on-failure --parallel
+```
 
 Acceptance criteria:
 
-- Unit tests use synthetic routing and partial tensors to prove shared + every routed tier contribution sums exactly.
 - Dispatch tests cover prefill and decode shapes.
+- Dispatch tests cover two routed tiers and three routed tiers.
+- Reduce tests use synthetic partial tensors to prove shared + every routed tier contribution sums exactly.
+- Reduce tests preserve the continuation-domain output shape and do not mutate input partials unexpectedly.
 
 ### Phase 5: Single-Process Correctness MVP
 
-Tasks:
+Deliverables:
 
-- Teach `Qwen35MoEGraph::buildFFNGraph()` to emit the Expert Parallel composite path when `config_.moe.expert_parallel.enabled` is true.
+- Teach `Qwen35MoEGraph::buildFFNGraph()` to emit the Expert Overlay composite path when `config_.moe.expert_parallel.enabled` is true.
 - In the MVP, run all routed tiers in one process with CPU tensors or mock contexts.
 - Reuse `MoEExpertComputeStage` masks for per-tier partitions.
+- Add a model-light graph test, for example `tests/v2/unit/models/qwen35moe/Test__Qwen35MoEExpertOverlayGraph.cpp`.
+
+Required tests:
+
+```bash
+ctest --test-dir build_v2_integration -R "V2_Unit_.*Qwen35MoEExpertOverlayGraph" --output-on-failure --parallel
+ctest --test-dir build_v2_integration -R "V2_Integration_Parity_Qwen35MoE_SingleDevice" --output-on-failure --parallel
+```
 
 Acceptance criteria:
 
-- A model-light graph test proves all routed experts are covered and the final MoE output matches a reference full-expert compute.
-- Existing non-EP Qwen35 MoE tests continue to use the old path.
+- The model-light graph test proves all routed experts are covered exactly once.
+- The final MoE output matches a reference full-expert compute for two-tier and three-tier placements.
+- Existing non-overlay Qwen35 MoE tests continue to use the old path.
 
-### Phase 6: Real CPU Cold NodeLocalTP Domain
+### Phase 6: Real CPU Fallback NodeLocalTP Domain
 
-Tasks:
+Deliverables:
 
-- Create a domain-scoped NodeLocalTP context for the cold expert domain.
-- Move cold expert computation to CPU socket ranks.
-- Add activation transfer from continuation/GPU domain to CPU cold domain.
-- Add return transfer of the cold partial output to the continuation domain.
+- Create a domain-scoped NodeLocalTP context for the CPU fallback expert domain.
+- Move fallback expert computation to CPU socket ranks.
+- Add activation transfer from the continuation domain to the CPU fallback domain.
+- Add return transfer of the CPU fallback partial output to the continuation domain.
 - Start with `ReplicatedExperts` if needed for correctness.
+- Add an MPI integration test, for example `tests/v2/integration/moe/Test__MoEExpertOverlay_CPUFallback_MPI.cpp`.
+
+Required tests:
+
+```bash
+ctest --test-dir build_v2_integration -R "V2_Integration_.*MoEExpertOverlay_CPUFallback" --output-on-failure --parallel
+```
 
 Acceptance criteria:
 
-- MPI integration test with two CPU ranks computes cold routed partials and returns a correct reduced result.
-- No deadlocks: all MPI communicator splits and transfers are deterministic and domain-scoped.
+- Two CPU ranks compute fallback routed partials and return a correct reduced result.
+- Communicator creation is deterministic and domain-scoped.
+- The test fails fast on missing MPI ranks instead of hanging.
 
-### Phase 7: CPU TensorParallelExperts for Cold Experts
+### Phase 7: CPU `TensorParallelExperts` for Fallback Experts
 
-Tasks:
+Deliverables:
 
-- Extend weight planning/materialization for cold expert gate/up/down tensors sharded across CPU NodeLocalTP participants.
+- Extend weight planning/materialization for fallback expert gate/up/down tensors sharded across CPU NodeLocalTP participants.
 - Support per-expert tensor-parallel GEMM execution:
-  - gate/up column-parallel
-  - down input-parallel
-  - domain allreduce for each cold partial output
+    - gate/up column-parallel
+    - down input-parallel
+    - domain allreduce for each fallback partial output
 - Keep prepared-weight ownership stage/domain scoped.
+- Add `tests/v2/integration/moe/Test__MoEExpertOverlay_CPUTensorParallelExperts_MPI.cpp`.
+
+Required tests:
+
+```bash
+ctest --test-dir build_v2_integration -R "V2_Integration_.*MoEExpertOverlay_CPUTensorParallelExperts" --output-on-failure --parallel
+```
 
 Acceptance criteria:
 
-- CPU cold domain uses both socket ranks to compute the same selected cold experts.
-- Output matches replicated-expert CPU cold mode within established tolerances.
+- CPU fallback domain uses both socket ranks to compute the same selected fallback experts.
+- Output matches replicated-expert CPU fallback mode within established tolerances.
 - Prepared handles from shared, accelerator-tier, and CPU fallback domains do not overwrite each other.
 
-### Phase 8: Sparse Token-Row Transfer Optimization
+### Phase 8: Multi-Accelerator Tier Integration
 
-Tasks:
+Deliverables:
+
+- Support more than one accelerator routed tier in the same overlay plan.
+- Support a single-device CUDA tier with `compute=replicated_experts`.
+- Support a 2x ROCm tier with `compute=tensor_parallel_experts` and RCCL local TP.
+- Add cross-domain reduce from ROCm partials back to a CUDA continuation domain.
+- Add an integration test, for example `tests/v2/integration/moe/Test__MoEExpertOverlay_MultiAcceleratorTiers.cpp`.
+
+Required tests:
+
+```bash
+ctest --test-dir build_v2_integration -R "V2_Integration_.*MoEExpertOverlay_MultiAcceleratorTiers" --output-on-failure --parallel
+```
+
+Acceptance criteria:
+
+- Synthetic three-tier execution succeeds with `cuda_fast`, `rocm_hot`, and `cpu_cold` domains.
+- Cross-domain reduce produces the same result as a single-domain reference.
+- Tests skip with a clear message when CUDA or ROCm hardware is unavailable.
+
+### Phase 9: Sparse Token-Row Transfer Optimization
+
+Deliverables:
 
 - Optimize prefill dispatch to send only token rows that route to non-continuation or fallback tiers.
 - Preserve original token row indices for scatter-add on return.
-- Add decode fast path for one-token cold routes.
+- Add decode fast path for one-token fallback routes.
+- Add transfer-volume assertions to the dispatch/reduce integration tests.
+
+Required tests:
+
+```bash
+ctest --test-dir build_v2_integration -R "V2_Integration_.*MoEExpertOverlay.*(Sparse|Transfer)" --output-on-failure --parallel
+```
 
 Acceptance criteria:
 
-- Prefill data transferred to CPU scales with cold-routed token rows, not full sequence length.
-- Decode cold path transfers one hidden row plus top-k metadata.
+- Prefill data transferred to CPU scales with fallback-routed token rows, not full sequence length.
+- Decode fallback path transfers one hidden row plus top-k metadata.
+- Dense-transfer fallback remains available behind a debug or compatibility option.
 
-### Phase 9: Qwen35 Expert Parallel Parity Test
+### Phase 10: Qwen35 MoE Expert Overlay Parity
 
-Tasks:
+Deliverables:
 
-- Add `Test__Qwen35MoE_ExpertParallel_Parity.cpp`.
-- Configure:
-  - GPU LocalTP domain for shared experts and hot routed expert cache.
-  - CPU NodeLocalTP domain for cold routed experts.
-  - Same-layer Expert Parallel plan for all MoE layers.
-- Validate topology before running parity.
+- Add `tests/v2/integration/parity/qwen35moe/Test__Qwen35MoE_ExpertOverlay_Parity.cpp`.
+- Wire it into `tests/v2/CMakeLists.txt` with labels such as `Qwen35MoE;ExpertOverlay;MixtureOfExperts;Parity;MPI`.
+- Add final parity cases for both required layouts:
+    - `PrefillParity_ROCm2TP_SharedHot_CPU2NodeLocalTP_Cold`
+    - `DecodeParity_ROCm2TP_SharedHot_CPU2NodeLocalTP_Cold`
+    - `PrefillParity_CUDA1_SharedHot_ROCm2TP_Hot_CPU2NodeLocalTP_Cold`
+    - `DecodeParity_CUDA1_SharedHot_ROCm2TP_Hot_CPU2NodeLocalTP_Cold`
+- Validate overlay topology before running parity.
 - Compare `MOE_EXPERT_OUTPUT`, `MOE_COMBINED_OUTPUT`, and `LM_HEAD` against PyTorch snapshots.
 
+Required final test command:
+
+```bash
+ctest --test-dir build_v2_integration -R "Qwen35MoEExpertOverlay" --output-on-failure --parallel
+```
+
+Required final parity layouts:
+
+```text
+Layout A: ROCm shared/hot + CPU cold
+  continuation_domain = rocm_hot
+  shared_expert_domain = rocm_hot
+  routed_tier_0 = rocm_hot, devices 0:rocm:0,0:rocm:1, scope local, backend rccl, compute tensor_parallel_experts
+  routed_fallback = cpu_cold, devices 0:cpu:0,1:cpu:0, scope node_local, backend upi, compute tensor_parallel_experts
+
+Layout B: CUDA shared/hottest + ROCm hot + CPU cold
+  continuation_domain = cuda_fast
+  shared_expert_domain = cuda_fast
+  routed_tier_0 = cuda_fast, devices 0:cuda:0, scope single, backend auto, compute replicated_experts
+  routed_tier_1 = rocm_hot, devices 0:rocm:0,0:rocm:1, scope local, backend rccl, compute tensor_parallel_experts
+  routed_fallback = cpu_cold, devices 0:cpu:0,1:cpu:0, scope node_local, backend upi, compute tensor_parallel_experts
+```
+
 Acceptance criteria:
 
+- Both final layouts pass prefill parity.
+- Decode parity passes for at least one generated token per layout, or is explicitly tracked as a separate blocker with a failing test if decode support is incomplete.
 - `MOE_EXPERT_OUTPUT` no longer shows hot-only sparsity.
 - Early-layer MoE parity matches the NodeLocalTP baseline envelope.
 - LM head KL/top-k thresholds match or improve on the current NodeLocalTP MoE parity thresholds.
+- Tests skip with explicit hardware-precondition messages when the required CUDA, ROCm, or two-rank CPU NodeLocalTP resources are unavailable.
 
 ## Test Strategy
 
@@ -624,16 +866,25 @@ Use Integration builds for parity and MPI tests:
 
 ```bash
 cmake --build build_v2_integration --parallel
-ctest --test-dir build_v2_integration -R "V2_Unit_.*MoEExpertParallel" --output-on-failure --parallel
-ctest --test-dir build_v2_integration -R "V2_Integration_.*MoEExpertParallel" --output-on-failure --parallel
+ctest --test-dir build_v2_integration -R "V2_Unit_.*MoEExpert(Parallel|Overlay)" --output-on-failure --parallel
+ctest --test-dir build_v2_integration -R "V2_Integration_.*MoEExpert(Parallel|Overlay)" --output-on-failure --parallel
 ```
 
-For the eventual Qwen35 parity test:
+For the final Qwen35 parity matrix:
 
 ```bash
 ctest --test-dir build_v2_integration \
-  -R "Qwen35MoEExpertParallel.*PrefillParity" \
+    -R "Qwen35MoEExpertOverlay" \
   --output-on-failure --parallel
+```
+
+The final parity target must include these test cases:
+
+```text
+Qwen35MoEExpertOverlayParity.PrefillParity_ROCm2TP_SharedHot_CPU2NodeLocalTP_Cold
+Qwen35MoEExpertOverlayParity.DecodeParity_ROCm2TP_SharedHot_CPU2NodeLocalTP_Cold
+Qwen35MoEExpertOverlayParity.PrefillParity_CUDA1_SharedHot_ROCm2TP_Hot_CPU2NodeLocalTP_Cold
+Qwen35MoEExpertOverlayParity.DecodeParity_CUDA1_SharedHot_ROCm2TP_Hot_CPU2NodeLocalTP_Cold
 ```
 
 Do not artificially limit build or test parallelism.
@@ -651,31 +902,43 @@ LLAMINAR_MOE_EP_TRANSFER_TRACE=1
 Recommended trace output:
 
 ```text
-layer, domain, role, enabled_experts, selected_token_rows, transferred_bytes
-layer, hot_experts, cold_experts, shared_on_gpu, gpu_budget_mb
-layer, hot_partial_norm, cold_partial_norm, final_moe_norm
+layer, tier, domain, role, enabled_experts, selected_token_rows, transferred_bytes
+layer, tier_order, fallback_tier, shared_domain, continuation_domain
+layer, shared_partial_norm, tier_partial_norms, final_moe_norm
 ```
 
 CSV output should be optional and should not run in hot paths by default.
 
 ## Open Decisions
 
-1. Should the first correctness MVP implement CPU cold `ReplicatedExperts` before `TensorParallelExperts`, or go straight to sharded CPU expert GEMMs?
-2. Should router execution always stay on GPU/root, or should CPU cold participants recompute routing from the transferred hidden state for simpler data movement?
+1. Should the first correctness MVP implement CPU fallback `ReplicatedExperts` before `TensorParallelExperts`, or go straight to sharded CPU expert GEMMs?
+2. Should router execution always stay on the continuation domain, or should fallback participants recompute routing from the transferred hidden state for simpler data movement?
 3. Should shared expert GPU residency be mandatory for this mode, or should the planner fall back to CPU shared expert when VRAM is too small?
-4. How should hot expert cache eviction work during decode: per-layer fixed count, global VRAM budget, or hybrid?
+4. How should tier cache eviction work during decode: per-layer fixed count, per-tier VRAM budget, global VRAM budget, or hybrid?
 5. Should the cross-domain reducer be a compute stage in the normal graph or a higher-level sub-orchestrator call owned by a composite MoE stage?
 
 ## Definition of Done
 
-The feature is complete when Llaminar can express and execute this same-layer MoE Expert Parallel topology:
+The feature is complete when Llaminar can express and execute same-layer MoE Expert Overlay topologies where ordered expert tiers contribute to the same MoE layer and reduce back to the continuation domain.
+
+The final implementation must support at least these two layouts:
 
 ```text
-MoEExpertParallel(
-    continuation = LocalTP(ROCm GPUs),
-    shared_expert = LocalTP(ROCm GPUs),
-    routed_hot = LocalTP(ROCm GPUs, cache limited by VRAM),
-    routed_cold = NodeLocalTP(CPU socket ranks, tensor-parallel expert GEMMs)
+Layout A:
+MoEExpertOverlay(
+    continuation = LocalTP(2x ROCm GPUs),
+    shared_expert = LocalTP(2x ROCm GPUs),
+    routed_tier_0 = LocalTP(2x ROCm GPUs, shared/hot experts),
+    routed_fallback = NodeLocalTP(2 CPU socket ranks, cold experts, tensor-parallel expert GEMMs)
+)
+
+Layout B:
+MoEExpertOverlay(
+    continuation = SingleDevice(1x CUDA GPU),
+    shared_expert = SingleDevice(1x CUDA GPU),
+    routed_tier_0 = SingleDevice(1x CUDA GPU, shared/hottest experts),
+    routed_tier_1 = LocalTP(2x ROCm GPUs, hot routed experts),
+    routed_fallback = NodeLocalTP(2 CPU socket ranks, cold experts, tensor-parallel expert GEMMs)
 )
 ```
 
@@ -684,5 +947,6 @@ and Qwen3.5 MoE parity demonstrates:
 - every routed expert contribution is covered exactly once,
 - hot-only sparsity in `MOE_EXPERT_OUTPUT` disappears,
 - shared expert output remains GPU-resident when configured,
-- cold expert output is computed by CPU NodeLocalTP participants,
+- fallback expert output is computed by CPU NodeLocalTP participants,
+- intermediate accelerator tier output is included when configured,
 - final logits match PyTorch within the calibrated Qwen35 MoE parity thresholds.
