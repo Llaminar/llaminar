@@ -656,7 +656,7 @@ namespace llaminar2
             .long_name = "--define-domain",
             .category = "Named Domains (advanced)",
             .value_label = "<spec>",
-            .description = "Define domain: \"name=device1,device2[;weights=w1,w2][;backend=type]\"",
+            .description = "Define domain: \"name=dev1,dev2[;weights=w1,w2][;backend=type][;scope=local|node_local|global][;owner=N][;ranks=0,1,...]\"",
             .setter = setters::custom<OrchestrationConfig>(
                 [](OrchestrationConfig &c, const std::string &v)
                 {
@@ -1085,6 +1085,41 @@ namespace llaminar2
             if (trimmed.empty() || trimmed[0] == '#')
             {
                 continue;
+            }
+
+            // Minimal YAML list support for named-domain configs:
+            // domains:
+            //   - "gpu=0:cuda:0;scope=local;owner=0"
+            // pp_stages:
+            //   - "0=gpu:0-11"
+            if (trimmed.rfind("-", 0) == 0)
+            {
+                std::string item = trim(trimmed.substr(1));
+                if (item.size() >= 2 &&
+                    ((item.front() == '"' && item.back() == '"') ||
+                     (item.front() == '\'' && item.back() == '\'')))
+                {
+                    item = item.substr(1, item.size() - 2);
+                }
+
+                if (current_section == "domains")
+                {
+                    auto domain = DomainDefinition::tryParse(item);
+                    if (domain)
+                    {
+                        config.domain_definitions.push_back(*domain);
+                    }
+                    continue;
+                }
+                if (current_section == "pp_stages")
+                {
+                    auto stage = PPStageDefinition::tryParse(item);
+                    if (stage)
+                    {
+                        config.pp_stage_definitions.push_back(*stage);
+                    }
+                    continue;
+                }
             }
 
             // Check for section headers

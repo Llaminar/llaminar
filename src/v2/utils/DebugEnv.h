@@ -2759,9 +2759,15 @@ namespace llaminar2
         /// FP16/BF16 halves PCIe transfer bandwidth; FP32 is lossless but slower on bandwidth-limited links.
         std::string allreduce_precision = "fp32";
 
-        /// Timeout in ms for TPWorkerPool::collectAll() (env: LLAMINAR_TP_COLLECT_TIMEOUT_MS, default: 0 = unlimited)
-        /// 0 means wait forever (normal operation). Set to e.g. 30000 for a 30s safety net if debugging hangs.
+        /// Timeout in ms for tensor-parallel coordination waits and blocking MPI collectives
+        /// (env: LLAMINAR_TP_COLLECT_TIMEOUT_MS).
+        /// Debug/Integration builds default to a 30s safety net to avoid deadlocked tests;
+        /// Release builds default to 0 (wait forever) for production runs.
+    #if LLAMINAR_ASSERTIONS_ACTIVE
+        int tp_collect_timeout_ms = 30000;
+    #else
         int tp_collect_timeout_ms = 0;
+    #endif
 
         /// Enable model weight lifecycle trace events (env: LLAMINAR_WEIGHT_LIFECYCLE_TRACE=1)
         bool weight_lifecycle_trace = false;

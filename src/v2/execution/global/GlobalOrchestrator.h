@@ -29,15 +29,147 @@
 #include "../global_pp/GlobalPPRankPlan.h"
 #include "../../interfaces/IMPIContext.h"
 #include "../../collective/ITPContext.h"
+#include "../../collective/ILocalTPContext.h"
+#include "../../collective/IGlobalTPContext.h"
+#include "../factory/FactoryPPStageConfig.h"
 #include "../../utils/Sampler.h"
 
 #include <memory>
+#include <optional>
 #include <string>
+#include <vector>
 
 namespace llaminar2
 {
 
     class TensorBase;
+    class PreparedWeightStore;
+
+    /**
+     * @brief Stage-local weight ownership record for one pipeline domain.
+     *
+     * The prepared store is intentionally stage scoped so one runner's prepared
+     * handles are not replaced when another runner installs its own store on the
+     * shared WeightManager during construction.
+     */
+    struct StageWeightContext
+    {
+        int stage_id = -1;
+        std::string domain_name;
+        std::optional<FactoryPPStageConfig> pp_stage_config;
+        std::shared_ptr<PreparedWeightStore> prepared_store;
+    };
+
+    /**
+     * @brief Owned runner for one pipeline stage/domain on this MPI rank.
+     *
+     * The context shared_ptrs (local_tp_ctx, global_tp_ctx) ensure the TP context
+     * outlives the runner that uses it. pp_stage_config records the layer range
+     * that this runner executes, enabling callers to verify correct PP slicing.
+     */
+    struct StageRunnerEntry
+    {
+        int stage_id = -1;
+        std::string domain_name;
+        RankStageAction action;
+
+        /// Lifetime owner for local TP context (ILocalTPContext) if this stage
+        /// uses local multi-device TP via RankOrchestrator.
+        std::shared_ptr<ILocalTPContext> local_tp_ctx;
+
+        /// Lifetime owner for global TP context (IGlobalTPContext) if this stage
+        /// uses cross-rank TP via GlobalTPContext/DomainCommunicatorRegistry.
+        std::shared_ptr<IGlobalTPContext> global_tp_ctx;
+
+        /// PP layer range for this stage runner. Records first_layer/last_layer
+        /// (exclusive last_layer) as passed to the factory. Useful for verification.
+        std::optional<FactoryPPStageConfig> pp_stage_config;
+
+        /// Stage-local weight context and prepared handle store lifetime owner.
+        std::shared_ptr<StageWeightContext> weight_context;
+
+        /// Runner is declared after its context owners so destruction tears the
+        /// runner down before any raw TP/prepared-store pointers can expire.
+        std::unique_ptr<IInferenceRunner> runner;
+    };
+
+    /**
+     * @brief Owns and dispatches the local stage runners for a global PP rank.
+     */
+    class StageRunnerRegistry
+    {
+    public:
+        StageRunnerRegistry() = default;
+        ~StageRunnerRegistry() = default;
+
+        StageRunnerRegistry(const StageRunnerRegistry &) = delete;
+        StageRunnerRegistry &operator=(const StageRunnerRegistry &) = delete;
+        StageRunnerRegistry(StageRunnerRegistry &&) = default;
+        StageRunnerRegistry &operator=(StageRunnerRegistry &&) = default;
+
+        void add(StageRunnerEntry entry);
+        void setCompatibilityRunner(std::unique_ptr<IInferenceRunner> runner);
+
+        bool empty() const;
+        size_t size() const;
+        bool hasRunnerForStage(int stage_id) const;
+
+        StageRunnerEntry *entryForStage(int stage_id);
+        const StageRunnerEntry *entryForStage(int stage_id) const;
+        StageRunnerEntry *entryForDomain(const std::string &domain_name);
+        const StageRunnerEntry *entryForDomain(const std::string &domain_name) const;
+
+        IInferenceRunner *runnerForStage(int stage_id);
+        const IInferenceRunner *runnerForStage(int stage_id) const;
+        IInferenceRunner *runnerForDomain(const std::string &domain_name);
+        const IInferenceRunner *runnerForDomain(const std::string &domain_name) const;
+
+        IInferenceRunner *pipelineHeadRunner();
+        const IInferenceRunner *pipelineHeadRunner() const;
+        IInferenceRunner *pipelineTailRunner();
+        const IInferenceRunner *pipelineTailRunner() const;
+        IInferenceRunner *defaultRunner();
+        const IInferenceRunner *defaultRunner() const;
+        IInferenceRunner *lastLocalRunner();
+        const IInferenceRunner *lastLocalRunner() const;
+
+        void clearCacheAll();
+        void setSkipLogitsGatherDecodeAll(bool skip);
+        void setSkipLogitsGatherPrefillAll(bool skip);
+        void setSuppressTimelineAll(bool suppress);
+        void setAccumulatePrefillAll(bool accumulate);
+        void flushStageTimelineAll();
+        void enableSnapshotCaptureAll(const std::string &output_dir);
+        void disableSnapshotCaptureAll();
+        void clearSnapshotsAll();
+        const float *getSnapshot(const std::string &key, size_t &out_size) const;
+        SnapshotInfo getSnapshotWithShape(const std::string &key) const;
+        std::vector<std::string> snapshotKeysAll() const;
+
+    private:
+        std::vector<StageRunnerEntry> entries_;
+        std::unique_ptr<IInferenceRunner> compatibility_runner_;
+    };
+
+    /**
+     * @brief Moves activations between stage runners and MPI peers.
+     */
+    class StageActivationRouter
+    {
+    public:
+        bool executeTransfer(const RankTransferAction &action,
+                             StageRunnerRegistry &registry,
+                             IMPIContext &mpi_ctx,
+                             int rank,
+                             int last_seq_len,
+                             int d_model,
+                             std::shared_ptr<TensorBase> &activation_buffer) const;
+
+    private:
+        static size_t transferElementCount(int last_seq_len, int d_model);
+        static void ensureActivationBufferSize(std::shared_ptr<TensorBase> &activation_buffer,
+                                               size_t num_elements);
+    };
 
     /**
      * @brief Cross-machine MPI cluster inference orchestrator
@@ -73,7 +205,10 @@ namespace llaminar2
             // Global TP context (optional, not owned)
             ITPContext *global_tp_ctx = nullptr;
 
-            // Per-rank local runner (ownership transferred)
+            // Per-stage local runners (ownership transferred). New multi-domain path.
+            std::vector<StageRunnerEntry> stage_runners;
+
+            // Per-rank local runner (ownership transferred). Legacy compatibility path.
             std::unique_ptr<IInferenceRunner> rank_runner;
 
             // Model metadata
@@ -91,7 +226,7 @@ namespace llaminar2
          *
          * Builds the rank's execution plan from the topology, allocates
          * activation transfer buffers (for PP), and takes ownership of
-         * the rank runner.
+         * the rank/stage runners.
          *
          * @param config Configuration (rank_runner ownership transferred)
          * @throws std::invalid_argument if config is invalid
@@ -125,7 +260,7 @@ namespace llaminar2
         /**
          * @brief Greedy sampling with cross-rank broadcast
          *
-         * On the tail rank: delegates to rank_runner_->sampleGreedyOnDevice().
+         * On the tail rank: delegates to the local tail stage runner.
          * On all ranks: MPI_Bcast the sampled token from tail to all others.
          *
          * @return Token ID on all ranks
@@ -135,7 +270,7 @@ namespace llaminar2
         /**
          * @brief Full sampling with cross-rank broadcast
          *
-         * On the tail rank: delegates to rank_runner_->sampleOnDevice(params).
+         * On the tail rank: delegates to the local tail stage runner.
          * On all ranks: MPI_Bcast the sampled token from tail to all others.
          *
          * @return Token ID on all ranks
@@ -205,6 +340,25 @@ namespace llaminar2
         /** @brief The cluster topology */
         const GlobalPPTopology &topology() const;
 
+        /** @brief Number of local stage/domain runners owned by this rank */
+        size_t stageRunnerCount() const;
+
+        /** @brief Stage runner entry for a local stage, or nullptr if absent */
+        StageRunnerEntry *stageRunnerEntryForStage(int stage_id);
+        const StageRunnerEntry *stageRunnerEntryForStage(int stage_id) const;
+
+        /** @brief Stage runner entry for a local named domain, or nullptr if absent */
+        StageRunnerEntry *stageRunnerEntryForDomain(const std::string &domain_name);
+        const StageRunnerEntry *stageRunnerEntryForDomain(const std::string &domain_name) const;
+
+        /** @brief Runner for a local stage, or nullptr if absent */
+        IInferenceRunner *stageRunnerForStage(int stage_id);
+        const IInferenceRunner *stageRunnerForStage(int stage_id) const;
+
+        /** @brief Runner for a local named domain, or nullptr if absent */
+        IInferenceRunner *stageRunnerForDomain(const std::string &domain_name);
+        const IInferenceRunner *stageRunnerForDomain(const std::string &domain_name) const;
+
         /** @brief The global TP context (may be nullptr for pure PP) */
         ITPContext *globalTPContext() const;
 
@@ -244,8 +398,8 @@ namespace llaminar2
         Config config_;
         GlobalPPRankPlan rank_plan_;
 
-        // Per-rank local execution (owned)
-        std::unique_ptr<IInferenceRunner> rank_runner_;
+        // Per-rank local stage execution (owned)
+        StageRunnerRegistry stage_runners_;
 
         // Activation transfer buffer (for PP send/recv)
         std::shared_ptr<TensorBase> activation_buffer_;
@@ -256,9 +410,6 @@ namespace llaminar2
         bool is_pipeline_tail_ = false;
 
         int last_seq_len_ = 0;   ///< Sequence length from last forward() call (for buffer sizing)
-
-        /// Ensure activation buffer can hold seq_len * d_model elements
-        void ensureActivationBufferCapacity(size_t num_elements);
     };
 
 } // namespace llaminar2

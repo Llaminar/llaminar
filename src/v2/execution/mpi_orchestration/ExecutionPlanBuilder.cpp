@@ -1129,4 +1129,223 @@ namespace llaminar2
         return CollectiveBackendType::MPI;
     }
 
+    // =========================================================================
+    // GlobalPPTopology Emission (Phase 5)
+    // =========================================================================
+
+    GlobalPPTopology ExecutionPlanBuilder::buildGlobalPPTopology(
+        const OrchestrationConfig &config,
+        const ModelConfig &model_config,
+        const ClusterInventory &cluster_inventory)
+    {
+        auto domains = resolveDomains(config, cluster_inventory);
+        auto pp_stages = resolvePPStages(config, model_config, domains, cluster_inventory);
+
+        // Sort by stage_id
+        std::sort(pp_stages.begin(), pp_stages.end(),
+                  [](const ResolvedPPStage &a, const ResolvedPPStage &b)
+                  { return a.stage_id < b.stage_id; });
+
+        std::vector<GlobalPPStageSpec> specs;
+        specs.reserve(pp_stages.size());
+
+        for (size_t i = 0; i < pp_stages.size(); ++i)
+        {
+            const auto &stage = pp_stages[i];
+
+            // Find matching DomainDefinition for scope/owner/ranks
+            const DomainDefinition *dom_def = nullptr;
+            for (const auto &dd : config.domain_definitions)
+            {
+                if (dd.name == stage.domain_name)
+                {
+                    dom_def = &dd;
+                    break;
+                }
+            }
+
+            // Find resolved domain
+            const ResolvedDomain *resolved = nullptr;
+            for (const auto &d : domains)
+            {
+                if (d.id == stage.domain_id)
+                {
+                    resolved = &d;
+                    break;
+                }
+            }
+
+            GlobalPPStageSpec spec;
+            spec.stage_id = stage.stage_id;
+            spec.domain_name = stage.domain_name;
+            spec.first_layer = stage.first_layer;
+            spec.last_layer = stage.last_layer;
+            spec.has_embedding = (i == 0);
+            spec.has_lm_head = (i + 1 == pp_stages.size());
+            if (dom_def)
+            {
+                spec.backend = dom_def->backend;
+            }
+            else if (resolved)
+            {
+                spec.backend = resolved->backend;
+            }
+
+            // Determine effective scope
+            TPScope effective_scope = dom_def ? dom_def->scope : TPScope::AUTO;
+
+            bool is_local;
+            if (effective_scope == TPScope::LOCAL)
+            {
+                is_local = true;
+            }
+            else if (effective_scope == TPScope::GLOBAL || effective_scope == TPScope::NODE_LOCAL)
+            {
+                is_local = false;
+            }
+            else
+            {
+                // AUTO: single-rank resolved domain → local; multi-rank → global
+                is_local = (!resolved || resolved->ranks.size() <= 1);
+            }
+
+            if (is_local)
+            {
+                spec.is_global_tp = false;
+
+                // Owner rank
+                if (dom_def && dom_def->owner_rank.has_value())
+                {
+                    spec.owning_rank = *dom_def->owner_rank;
+                }
+                else if (resolved && !resolved->ranks.empty())
+                {
+                    spec.owning_rank = resolved->ranks.front();
+                }
+                else
+                {
+                    spec.owning_rank = 0;
+                }
+
+                // Devices and weights from resolved domain
+                if (resolved)
+                {
+                    spec.devices = resolved->devices;
+                    spec.tp_weights = resolved->weights;
+                }
+                else if (dom_def)
+                {
+                    spec.devices = dom_def->devices;
+                    spec.tp_weights = dom_def->weights;
+                }
+
+                spec.inner_mode = (spec.devices.size() > 1)
+                                      ? InnerParallelism::LOCAL_TP
+                                      : InnerParallelism::SINGLE_DEVICE;
+            }
+            else
+            {
+                spec.is_global_tp = true;
+
+                // Participating ranks
+                if (dom_def && !dom_def->explicit_ranks.empty())
+                {
+                    spec.participating_ranks = dom_def->explicit_ranks;
+                }
+                else if (resolved && !resolved->ranks.empty())
+                {
+                    spec.participating_ranks = resolved->ranks;
+                }
+                else
+                {
+                    // Fallback: all ranks
+                    for (int r = 0; r < cluster_inventory.world_size; ++r)
+                    {
+                        spec.participating_ranks.push_back(r);
+                    }
+                }
+                std::sort(spec.participating_ranks.begin(), spec.participating_ranks.end());
+                spec.participating_ranks.erase(
+                    std::unique(spec.participating_ranks.begin(), spec.participating_ranks.end()),
+                    spec.participating_ranks.end());
+
+                // Per-rank device: use first device from the domain if available
+                if (dom_def && !dom_def->devices.empty())
+                {
+                    spec.per_rank_device = dom_def->devices.front();
+                    if (dom_def->devices.size() == spec.participating_ranks.size())
+                    {
+                        spec.per_rank_devices = dom_def->devices;
+                    }
+                }
+                else if (resolved && !resolved->devices.empty())
+                {
+                    spec.per_rank_device = resolved->devices.front();
+                    if (resolved->devices.size() == spec.participating_ranks.size())
+                    {
+                        spec.per_rank_devices = resolved->devices;
+                    }
+                }
+                else
+                {
+                    spec.per_rank_device = GlobalDeviceAddress::cpu();
+                }
+            }
+
+            specs.push_back(std::move(spec));
+        }
+
+        if (specs.empty())
+        {
+            // Degenerate: single stage covering all layers
+            GlobalPPStageSpec single;
+            single.stage_id = 0;
+            single.first_layer = 0;
+            single.last_layer = model_config.n_layers - 1;
+            single.has_embedding = true;
+            single.has_lm_head = true;
+            single.is_global_tp = false;
+            single.owning_rank = 0;
+            single.inner_mode = InnerParallelism::SINGLE_DEVICE;
+            specs.push_back(std::move(single));
+        }
+
+        return GlobalPPTopology::build(std::move(specs), model_config.n_layers, cluster_inventory.world_size);
+    }
+
+    // =========================================================================
+    // Free Function: renderMultiDomainTopologyInfo (Phase 5)
+    // =========================================================================
+
+    std::string renderMultiDomainTopologyInfo(const GlobalPPTopology &topo, int world_size)
+    {
+        std::ostringstream oss;
+        oss << topo.toTable();
+        oss << "\nPer-rank stage runner counts:\n";
+
+        for (int r = 0; r < world_size; ++r)
+        {
+            auto stage_ids = topo.stagesForRank(r);
+            oss << "  rank " << r << ": " << stage_ids.size() << " stage runner(s) [";
+            bool first = true;
+            for (int sid : stage_ids)
+            {
+                if (!first) oss << ", ";
+                first = false;
+                oss << "stage" << sid;
+                for (const auto &s : topo.stages)
+                {
+                    if (s.stage_id == sid && !s.domain_name.empty())
+                    {
+                        oss << "(" << s.domain_name << ")";
+                        break;
+                    }
+                }
+            }
+            oss << "]\n";
+        }
+
+        return oss.str();
+    }
+
 } // namespace llaminar2

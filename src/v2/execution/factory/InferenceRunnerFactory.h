@@ -79,6 +79,7 @@ namespace llaminar2
     class ITPContext;
     class ILocalTPContext;
     class IRankOrchestrator;
+    class PreparedWeightStore;
 
     // Note: FactoryPPStageConfig is now defined in FactoryPPStageConfig.h
     // to avoid circular dependencies with RankOrchestrator.h
@@ -154,6 +155,10 @@ namespace llaminar2
         /// When set, NodeDetection uses hostfile hostname ordering to assign node IDs
         /// instead of relying purely on first-appearance ordering from MPI_Allgather.
         std::string hostfile;
+
+        /// Optional stage-local prepared store. When supplied, concrete factory
+        /// paths install this store before materializing/preparing weights.
+        std::shared_ptr<PreparedWeightStore> prepared_weight_store;
 
         /**
          * @brief Canonical factory: build InferenceRunnerConfig from a RankExecutionPlan

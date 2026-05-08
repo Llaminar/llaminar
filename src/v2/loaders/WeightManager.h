@@ -312,6 +312,8 @@ namespace llaminar2
          */
         void configure(const WeightManagerConfig &config) override
         {
+            std::lock_guard<std::mutex> lock(sharding_mode_cache_mutex_);
+
             // Sharding config
             if (config.hasShardingConfig())
             {
@@ -377,6 +379,7 @@ namespace llaminar2
          */
         void setWeightShardingConfig(const WeightShardingConfig &config)
         {
+            std::lock_guard<std::mutex> lock(sharding_mode_cache_mutex_);
             sharding_config_ = config;
             has_sharding_config_ = true;
             sharding_mode_cache_.clear(); // Invalidate cache

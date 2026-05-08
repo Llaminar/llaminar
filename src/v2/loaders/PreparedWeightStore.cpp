@@ -37,6 +37,25 @@ namespace llaminar2
     {
     }
 
+    ModelContextId PreparedWeightStore::modelId() const
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return model_id_;
+    }
+
+    bool PreparedWeightStore::bindModelIdIfUnset(ModelContextId model_id)
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (model_id.value == 0)
+            return model_id_.value == 0;
+        if (model_id_.value == 0)
+        {
+            model_id_ = model_id;
+            return true;
+        }
+        return model_id_ == model_id;
+    }
+
     PreparedWeightKind PreparedWeightStore::inferPreparedKind(DeviceId device) const
     {
         if (device.is_cuda()) return PreparedWeightKind::CudaInt8PackedGemm;

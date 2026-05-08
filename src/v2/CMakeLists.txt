@@ -1430,6 +1430,10 @@ add_library(llaminar2_core STATIC
     execution/global_pp/GlobalPPRankPlanBuilder.cpp
     # GlobalOrchestrator (Phase 1: cross-machine MPI cluster inference)
     execution/global/GlobalOrchestrator.cpp
+    # DomainCommunicatorRegistry (Phase 3: per-domain MPI communicator creation)
+    execution/global/DomainCommunicatorRegistry.cpp
+    # StageRunnerFactory (Phase 3: per-domain stage runner construction)
+    execution/global/StageRunnerFactory.cpp
     # GlobalOrchestratorRunner (Phase 4: IOrchestrationRunner adapter)
     execution/global/GlobalOrchestratorRunner.cpp
     # Parallelism tree (recursive PP/TP composition)
@@ -1442,6 +1446,7 @@ add_library(llaminar2_core STATIC
     # Orchestration runner (Phase 5: end-to-end integration)
     execution/runner/OrchestrationRunner.cpp
     execution/runner/OrchestrationRunnerFactory.cpp
+    execution/runner/NamedDomainGlobalRunner.cpp
     # Snapshot capture (Phase 2: extracted from DeviceGraphOrchestrator)
     snapshots/SnapshotCapture.cpp
     # Forward execution engine (Phase 3: extracted from DeviceGraphOrchestrator)

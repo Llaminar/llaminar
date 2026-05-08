@@ -4805,7 +4805,7 @@ if(ZLIB_FOUND)
     discover_v2_parity_tests(v2_integration_parity_qwen35moe_hybrid_pptp
         TEST_PREFIX V2_Integration_Parity_Qwen35MoE_HybridPPTP
         LABELS "V2;Integration;Parity;Qwen35MoE;MixtureOfExperts;HybridPPTP;LocalPP;LocalTP;ROCm;CPU;ExpertMigration;GpuExpertCache"
-        MPI_PROCS 1
+        MPI_PROCS 2
     )
 
     message(STATUS "V2: Qwen3.5 MoE HybridPPTP parity tests enabled")
@@ -8983,6 +8983,43 @@ add_v2_test(V2_Unit_GlobalOrchestrator
 )
 
 message(STATUS "V2 Tests: Added GlobalOrchestrator unit tests")
+
+# Test: StageRunnerFactory
+# Unit tests for StageRunnerFactory (Phase 3 of Multi-Domain Pipeline Plan).
+# Tests single-device, local TP, and global TP stage building via model-light
+# MockModelContext. Global TP uses injected GlobalTPContext (MPI_COMM_SELF, 1 rank).
+# Uses mpi_gtest_main.cpp because GlobalTPContext::createForTest calls MPI_Comm_rank.
+add_executable(v2_test_stage_runner_factory
+    unit/execution/global/Test__StageRunnerFactory.cpp
+    integration/mpi_gtest_main.cpp)
+target_include_directories(v2_test_stage_runner_factory PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}  # For tests/v2/mocks/ include path
+)
+target_link_libraries(v2_test_stage_runner_factory llaminar2_core GTest::gtest MPI::MPI_CXX)
+add_v2_test(V2_Unit_StageRunnerFactory
+    COMMAND $<TARGET_FILE:v2_test_stage_runner_factory>
+    LABELS "V2;Unit;StageRunnerFactory;GlobalPP;PipelineParallel;TensorParallel;DomainComm"
+    MPI_PROCS 1
+)
+
+message(STATUS "V2 Tests: Added StageRunnerFactory unit tests")
+
+# Test: DomainCommunicatorRegistry (MPI integration, 3 ranks)
+# Integration tests for DomainCommunicatorRegistry (Phase 3).
+# Two global TP stages with overlapping participant sets {0,1} and {1,2}.
+# Asserts: rank 0 gets only stage 0 ctx, rank 1 gets both, rank 2 gets only stage 1.
+# Verifies worldRanks(), degree(), domainId(), myIndex() correctness.
+add_executable(v2_test_domain_communicator_registry_mpi
+    integration/execution/Test__DomainCommunicatorRegistry_MPI.cpp
+    integration/mpi_gtest_main.cpp)
+target_link_libraries(v2_test_domain_communicator_registry_mpi llaminar2_core GTest::gtest MPI::MPI_CXX)
+add_v2_test(V2_Integration_DomainCommunicatorRegistry_MPI
+    COMMAND $<TARGET_FILE:v2_test_domain_communicator_registry_mpi>
+    LABELS "V2;Integration;DomainCommunicatorRegistry;GlobalTP;MPI;PipelineParallel"
+    MPI_PROCS 3
+)
+
+message(STATUS "V2 Tests: Added DomainCommunicatorRegistry MPI integration tests")
 
 # Test: GlobalOrchestratorRunner
 # Unit tests for IOrchestrationRunner adapter wrapping GlobalOrchestrator (Phase 4).

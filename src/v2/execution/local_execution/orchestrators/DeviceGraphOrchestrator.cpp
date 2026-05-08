@@ -42,6 +42,7 @@
 #include <chrono>
 #include <algorithm>
 #include <iomanip>
+#include <stdexcept>
 
 namespace llaminar2
 {
@@ -2338,6 +2339,14 @@ namespace llaminar2
             {
                 concrete_weight_manager->setPreparedWeightStore(prepared_weight_store_);
             }
+        }
+
+        if (!prepared_weight_store_->bindModelIdIfUnset(requested_model_id))
+        {
+            throw std::runtime_error(
+                "[DGO] Prepared weight store model id mismatch: store=" +
+                std::to_string(prepared_weight_store_->modelId().value) +
+                " requested=" + std::to_string(requested_model_id.value));
         }
 
         ModelContextId model_id = prepared_weight_store_->modelId();

@@ -281,6 +281,45 @@ namespace llaminar2
                 }
                 def.backend = *backend;
             }
+            else if (key == "scope")
+            {
+                auto s = parseTpScope(value);
+                if (!s || *s == TPScope::HYBRID)
+                {
+                    return std::nullopt; // hybrid is not a valid domain scope
+                }
+                def.scope = *s;
+            }
+            else if (key == "owner")
+            {
+                try
+                {
+                    int r = std::stoi(value);
+                    if (r < 0) return std::nullopt;
+                    def.owner_rank = r;
+                }
+                catch (const std::exception &)
+                {
+                    return std::nullopt;
+                }
+            }
+            else if (key == "ranks")
+            {
+                auto rank_strs = split(value, ',');
+                for (const auto &rs : rank_strs)
+                {
+                    try
+                    {
+                        int r = std::stoi(rs);
+                        if (r < 0) return std::nullopt;
+                        def.explicit_ranks.push_back(r);
+                    }
+                    catch (const std::exception &)
+                    {
+                        return std::nullopt;
+                    }
+                }
+            }
         }
 
         return def;
@@ -326,6 +365,20 @@ namespace llaminar2
             }
         }
 
+        // Phase 5: scope consistency
+        if (scope == TPScope::LOCAL && !explicit_ranks.empty())
+        {
+            errors.push_back("Domain '" + name + "' has scope=local but explicit_ranks is set (use owner= for local domains)");
+        }
+        if (owner_rank.has_value() && *owner_rank < 0)
+        {
+            errors.push_back("Domain '" + name + "' has invalid owner_rank " + std::to_string(*owner_rank));
+        }
+        if (scope == TPScope::LOCAL && explicit_ranks.size() > 1)
+        {
+            errors.push_back("Domain '" + name + "' has scope=local but multiple ranks specified");
+        }
+
         return errors;
     }
 
@@ -349,6 +402,25 @@ namespace llaminar2
                 if (i > 0)
                     oss << ",";
                 oss << weights[i];
+            }
+            oss << "]";
+        }
+
+        if (scope != TPScope::AUTO)
+        {
+            oss << " scope=" << tpScopeToString(scope);
+        }
+        if (owner_rank.has_value())
+        {
+            oss << " owner=" << *owner_rank;
+        }
+        if (!explicit_ranks.empty())
+        {
+            oss << " ranks=[";
+            for (size_t i = 0; i < explicit_ranks.size(); ++i)
+            {
+                if (i > 0) oss << ",";
+                oss << explicit_ranks[i];
             }
             oss << "]";
         }

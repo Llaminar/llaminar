@@ -33,7 +33,11 @@ namespace llaminar2
         explicit PreparedWeightStore(ModelContextId model_id = {});
         ~PreparedWeightStore();
 
-        ModelContextId modelId() const { return model_id_; }
+        ModelContextId modelId() const;
+
+        /// Bind a previously-unbound store to a model id. Returns true when the
+        /// store was unbound or already bound to the same id; false on mismatch.
+        bool bindModelIdIfUnset(ModelContextId model_id);
 
         // =========================================================================
         // GEMM Preparation & Resolution

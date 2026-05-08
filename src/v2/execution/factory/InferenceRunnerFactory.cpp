@@ -52,7 +52,32 @@ namespace llaminar2
     static bool configureOrchestratorWeightsImpl(
         DeviceGraphOrchestrator *orchestrator,
         std::shared_ptr<ModelContext> model_ctx,
-        DeviceId device);
+        DeviceId device,
+        const InferenceRunnerConfig &config,
+        const GraphConfig &graph_config);
+
+    static std::shared_ptr<PreparedWeightStore> installPreparedWeightStoreForPlan(
+        WeightManager &weight_mgr,
+        const InferenceRunnerConfig &config,
+        const WeightPlan &weight_plan,
+        const char *context)
+    {
+        const ModelContextId model_id = weight_plan.strategy().model_id;
+        auto store = config.prepared_weight_store
+                         ? config.prepared_weight_store
+                         : std::make_shared<PreparedWeightStore>(model_id);
+
+        if (!store->bindModelIdIfUnset(model_id))
+        {
+            LOG_ERROR(context << " prepared store model id mismatch: store="
+                              << store->modelId().value
+                              << " plan=" << model_id.value);
+            return nullptr;
+        }
+
+        weight_mgr.setPreparedWeightStore(store);
+        return store;
+    }
 
     static PreparedWeightKind expectedGemmPreparedKind(DeviceId device)
     {
@@ -83,6 +108,42 @@ namespace llaminar2
             LOG_WARN("[InferenceRunner] Could not classify prepared kind for " << name << ": " << e.what());
         }
         return PreparedWeightKind::None;
+    }
+
+    static WeightManagerConfig makeWeightManagerConfigForGraph(
+        const std::string &architecture,
+        const GraphConfig &graph_config,
+        bool include_tp_config)
+    {
+        WeightManagerConfig wm_config;
+        wm_config.sharding = SchemaFactoryRegistry::getWeightShardingConfig(architecture);
+        if (graph_config.n_heads > 0 && graph_config.head_dim > 0)
+        {
+            wm_config.dimensions.n_heads = graph_config.n_heads;
+            wm_config.dimensions.n_kv_heads = graph_config.n_kv_heads;
+            wm_config.dimensions.head_dim = graph_config.head_dim;
+        }
+        if (graph_config.gdn.enabled())
+        {
+            wm_config.dimensions.gdn_n_k_heads = graph_config.gdn.group_count;
+            wm_config.dimensions.gdn_n_v_heads = graph_config.gdn.time_step_rank;
+            wm_config.dimensions.gdn_d_state = graph_config.gdn.state_size;
+        }
+        if (include_tp_config)
+        {
+            wm_config.tp_config = graph_config.tp_config;
+        }
+        return wm_config;
+    }
+
+    static void configureWeightManagerForGraph(
+        WeightManager &weight_mgr,
+        const std::string &architecture,
+        const GraphConfig &graph_config,
+        bool include_tp_config)
+    {
+        weight_mgr.configure(makeWeightManagerConfigForGraph(
+            architecture, graph_config, include_tp_config));
     }
 
     static WeightRequirement makeSingleDeviceRequirement(
@@ -122,14 +183,17 @@ namespace llaminar2
 
     static WeightSliceSpec vocabSliceSpecForAssignment(
         const TensorParallelConfig *tp_config,
-        DeviceId device)
+        DeviceId device,
+        int tp_rank_override = -1)
     {
         WeightSliceSpec slice;
         if (!tp_config)
             return slice;
         try
         {
-            const auto &assignment = tp_config->forDevice(device);
+            const auto &assignment = tp_rank_override >= 0
+                                         ? tp_config->forRank(tp_rank_override)
+                                         : tp_config->forDevice(device);
             slice.source_rows = static_cast<size_t>(tp_config->totalVocab());
             slice.row_start = static_cast<size_t>(assignment.vocab_start);
             slice.row_count = static_cast<size_t>(assignment.vocab_count);
@@ -146,7 +210,8 @@ namespace llaminar2
         const WeightValidationResult &validation,
         DeviceId device,
         const TensorParallelConfig *tp_config = nullptr,
-        const FactoryPPStageConfig *pp_config = nullptr)
+        const FactoryPPStageConfig *pp_config = nullptr,
+        int tp_rank_override = -1)
     {
         InferenceStrategy strategy;
         const bool has_tp = tp_config && tp_config->worldSize() > 1;
@@ -175,13 +240,15 @@ namespace llaminar2
         std::optional<DeviceId> lookup_device = DeviceId::cpu();
         if (tp_config)
         {
-            const auto &assignment = tp_config->forDevice(device);
+            const auto &assignment = tp_rank_override >= 0
+                                         ? tp_config->forRank(tp_rank_override)
+                                         : tp_config->forDevice(device);
             tp_rank_or_device_index = assignment.local_rank;
             tp_domain = 0;
             lookup_device = device;
         }
 
-        const WeightSliceSpec vocab_slice = vocabSliceSpecForAssignment(tp_config, device);
+        const WeightSliceSpec vocab_slice = vocabSliceSpecForAssignment(tp_config, device, tp_rank_override);
         const int pp_stage = pp_config ? pp_config->first_layer : -1;
 
         if (!pp_config || pp_config->has_embedding)
@@ -392,6 +459,75 @@ namespace llaminar2
 
         graph_config.vocab_local = graph_config.vocab_size;
         graph_config.lm_head_column_parallel = false;
+    }
+
+    // =========================================================================
+    // Helper: Apply GLOBAL TP context assignment to graph config
+    // =========================================================================
+
+    /**
+     * @brief Apply equal-split global TP assignment from an injected IGlobalTPContext.
+     *
+     * Used when a pre-created IGlobalTPContext (from DomainCommunicatorRegistry or
+     * createTestableInferenceRunner) is provided directly instead of being
+     * auto-created from MPI_COMM_WORLD.
+     *
+     * @param graph_config    Config to modify with TP dimensions
+     * @param global_tp_ctx   The pre-created global TP context
+     * @param device_idx      This rank's index within the TP domain
+     * @return true if assignment succeeded, false on invalid input
+     */
+    static bool applyGlobalTPContextAssignment(
+        GraphConfig &graph_config,
+        IGlobalTPContext *global_tp_ctx,
+        int device_idx)
+    {
+        const int degree = global_tp_ctx->degree();
+        if (device_idx < 0 || device_idx >= degree)
+        {
+            LOG_ERROR("[InferenceRunner] Invalid device_idx " << device_idx
+                                                              << " for global TP context (degree=" << degree << ")");
+            return false;
+        }
+
+        // Equal split: build a TensorParallelConfig based on domain degree
+        std::vector<DeviceId> dummy_devices(degree, DeviceId::cpu());
+        auto tp_config = TensorParallelConfig::equalSplit(
+            degree,
+            graph_config.n_heads,
+            graph_config.n_kv_heads,
+            graph_config.d_ff,
+            graph_config.vocab_size,
+            dummy_devices);
+        const auto &assignment = tp_config.forRank(device_idx);
+
+        graph_config.tp_config = std::make_shared<TensorParallelConfig>(tp_config);
+        graph_config.local_rank = device_idx;
+
+        graph_config.head_start = assignment.head_start;
+        graph_config.local_n_heads = assignment.head_count;
+        graph_config.local_n_kv_heads = assignment.kv_head_count;
+        graph_config.qkv_column_parallel = true;
+
+        graph_config.d_ff_local = assignment.d_ff_count;
+        graph_config.ffn_column_parallel = true;
+
+        graph_config.vocab_local = assignment.vocab_count;
+        graph_config.lm_head_column_parallel = true;
+
+        // Store context so graph builders use TPAllreduceStage
+        graph_config.tp_ctx = global_tp_ctx;
+        graph_config.tp_device_idx = device_idx;
+
+        LOG_INFO("[InferenceRunner] Injected GlobalTPContext: degree=" << degree
+                                                                       << " device_idx=" << device_idx
+                                                                       << " domainId=" << global_tp_ctx->domainId());
+        LOG_DEBUG("[InferenceRunner] Global TP QKV: head_start=" << assignment.head_start
+                                                                 << " local_n_heads=" << assignment.head_count << "/" << graph_config.n_heads);
+        LOG_DEBUG("[InferenceRunner] Global TP FFN: d_ff_local=" << assignment.d_ff_count << "/" << graph_config.d_ff);
+        LOG_DEBUG("[InferenceRunner] Global TP LMHead: vocab_local=" << assignment.vocab_count << "/" << graph_config.vocab_size);
+
+        return true;
     }
 
     // =========================================================================
@@ -732,21 +868,7 @@ namespace llaminar2
         // (must be after populateFromModelContext which sets n_heads/n_kv_heads/head_dim)
         if (weight_mgr)
         {
-            WeightManagerConfig wm_config;
-            wm_config.sharding = SchemaFactoryRegistry::getWeightShardingConfig(architecture);
-            if (graph_config.n_heads > 0 && graph_config.head_dim > 0)
-            {
-                wm_config.dimensions.n_heads = graph_config.n_heads;
-                wm_config.dimensions.n_kv_heads = graph_config.n_kv_heads;
-                wm_config.dimensions.head_dim = graph_config.head_dim;
-            }
-            if (graph_config.gdn.enabled())
-            {
-                wm_config.dimensions.gdn_n_k_heads = graph_config.gdn.group_count;
-                wm_config.dimensions.gdn_n_v_heads = graph_config.gdn.time_step_rank;
-                wm_config.dimensions.gdn_d_state = graph_config.gdn.state_size;
-            }
-            weight_mgr->configure(wm_config);
+            configureWeightManagerForGraph(*weight_mgr, architecture, graph_config, false);
             LOG_DEBUG("[InferenceRunner] Applied " << architecture << " weight config to WeightManager");
         }
 
@@ -778,6 +900,20 @@ namespace llaminar2
                                                          << ", V=" << graph_config.kv_cache_scale_v);
         LOG_DEBUG("[InferenceRunner] KV cache precision mode: "
                   << kvCachePrecisionToString(config.kv_cache_precision));
+
+        // Partial pipeline stages, including global/node-local TP stages built
+        // through the concrete inference path, execute only their assigned layer
+        // range and consume external hidden state when they do not own embedding.
+        if (config.pp_stage_config.has_value())
+        {
+            graph_config.n_layers = config.pp_stage_config->layerCount();
+            graph_config.pp_layer_offset = config.pp_stage_config->first_layer;
+            LOG_INFO("[InferenceRunner] PP stage graph config: layers=["
+                     << config.pp_stage_config->first_layer << ", "
+                     << config.pp_stage_config->last_layer << ")"
+                     << " has_embedding=" << (config.pp_stage_config->has_embedding ? "yes" : "no")
+                     << " has_lm_head=" << (config.pp_stage_config->has_lm_head ? "yes" : "no"));
+        }
 
         // =====================================================================
         // TurboQuant Context (TQ4 / TQ KV Cache)
@@ -846,13 +982,23 @@ namespace llaminar2
         ILocalTPContext *local_tp_ctx = tp_ctx && tp_ctx->isLocal()
                                             ? static_cast<ILocalTPContext *>(tp_ctx)
                                             : nullptr;
+        IGlobalTPContext *injected_global_tp_ctx = (tp_ctx && !tp_ctx->isLocal())
+                                   ? dynamic_cast<IGlobalTPContext *>(tp_ctx)
+                                   : nullptr;
         const int tp_device_idx = config.tp_device_index;
 
         // Check if TensorParallelConfig is available from WeightManager (for GLOBAL TP)
         const TensorParallelConfig *tp_config = weight_mgr ? weight_mgr->tensorParallelConfig() : nullptr;
 
-        if (!applyTPAssignment(graph_config, local_tp_ctx, tp_device_idx,
-                               tp_config, mpi_ctx, weights_sharded))
+        if (injected_global_tp_ctx && injected_global_tp_ctx->degree() > 1)
+        {
+            if (!applyGlobalTPContextAssignment(graph_config, injected_global_tp_ctx, tp_device_idx))
+            {
+                return nullptr;
+            }
+        }
+        else if (!applyTPAssignment(graph_config, local_tp_ctx, tp_device_idx,
+                                    tp_config, mpi_ctx, weights_sharded))
         {
             return nullptr;
         }
@@ -861,20 +1007,24 @@ namespace llaminar2
         // Create GlobalTPContext for cross-MPI-rank tensor parallelism
         // =====================================================================
         // When GLOBAL TP is active (multi-rank with sharded weights, no LOCAL TP),
-        // create a GlobalTPContext so graph builders use TPAllreduceStage
-        // (same polymorphic ITPContext path as LOCAL TP) instead of the legacy
-        // direct-MPI AllreduceStage path.
-        // =====================================================================
-        // =====================================================================
-        // Create GlobalTPContext for cross-MPI-rank tensor parallelism
-        // =====================================================================
-        // When GLOBAL TP is active (multi-rank with sharded weights, no LOCAL TP),
-        // create a GlobalTPContext so graph builders use TPAllreduceStage
-        // (same polymorphic ITPContext path as LOCAL TP) instead of the legacy
-        // direct-MPI AllreduceStage path.
+        // either use a pre-created context injected via config.tp_ctx, or
+        // auto-create one over MPI_COMM_WORLD (legacy path for simple setups).
+        // The injected path is used by StageRunnerFactory (Phase 3) so each global
+        // TP stage gets a domain-scoped communicator, not a world-wide one.
         // =====================================================================
         std::shared_ptr<IGlobalTPContext> global_tp_ctx;
-        if (mpi_ctx && mpi_ctx->world_size() > 1 && weights_sharded && !local_tp_ctx)
+
+        if (injected_global_tp_ctx && injected_global_tp_ctx->degree() > 1)
+        {
+            // Use the provided domain-scoped context; the caller owns its lifetime.
+            graph_config.tp_ctx = injected_global_tp_ctx;
+            graph_config.tp_device_idx = config.tp_device_index;
+            LOG_INFO("[InferenceRunner] Using injected GlobalTPContext: degree="
+                     << injected_global_tp_ctx->degree()
+                     << " myIndex=" << config.tp_device_index
+                     << " domainId=" << injected_global_tp_ctx->domainId());
+        }
+        else if (mpi_ctx && mpi_ctx->world_size() > 1 && weights_sharded && !local_tp_ctx)
         {
             auto ctx = GlobalTPContext::createWithSplit(
                 MPI_COMM_WORLD,
@@ -1012,6 +1162,11 @@ namespace llaminar2
             orchestrator->setGlobalTPContext(std::move(global_tp_ctx));
         }
 
+        if (config.pp_stage_config.has_value())
+        {
+            orchestrator->setPPStageConfig(config.pp_stage_config.value());
+        }
+
         // Initialize graph cache
         {
             ScopedWeightLoadDetailTimer timer("graph.build.initialize_graph_cache");
@@ -1035,7 +1190,7 @@ namespace llaminar2
         // Load weights and configure orchestrator
         {
             ScopedWeightLoadDetailTimer timer("graph.build.configure_weights");
-            if (!configureOrchestratorWeightsImpl(orchestrator.get(), model_ctx, device))
+            if (!configureOrchestratorWeightsImpl(orchestrator.get(), model_ctx, device, config, graph_config))
             {
                 LOG_ERROR("[InferenceRunner] Failed to configure orchestrator weights");
                 return nullptr;
@@ -1153,7 +1308,9 @@ namespace llaminar2
     static bool configureOrchestratorWeightsImpl(
         DeviceGraphOrchestrator *orchestrator,
         std::shared_ptr<ModelContext> model_ctx,
-        DeviceId device)
+        DeviceId device,
+        const InferenceRunnerConfig &config,
+        const GraphConfig &graph_config)
     {
         if (!orchestrator || !model_ctx)
         {
@@ -1342,13 +1499,22 @@ namespace llaminar2
             LOG_DEBUG("[InferenceRunner] Global weights loaded into cache");
         }
 
+        configureWeightManagerForGraph(
+            *weight_mgr,
+            arch,
+            graph_config,
+            graph_config.tp_config != nullptr);
+
         auto weight_plan = buildSingleDeviceWeightPlan(
             *weight_mgr,
             *model_ctx,
             validation,
-            device);
-        weight_mgr->setPreparedWeightStore(
-            std::make_shared<PreparedWeightStore>(weight_plan.strategy().model_id));
+            device,
+            graph_config.tp_config.get(),
+            nullptr,
+            graph_config.tp_config ? graph_config.local_rank : -1);
+        if (!installPreparedWeightStoreForPlan(*weight_mgr, config, weight_plan, "[InferenceRunner]"))
+            return false;
         LOG_DEBUG("[InferenceRunner] SingleDevice WeightPlan built with "
                   << weight_plan.size() << " requirements");
 
@@ -1411,7 +1577,8 @@ namespace llaminar2
         DeviceGraphOrchestrator *orchestrator,
         std::shared_ptr<ModelContext> model_ctx,
         DeviceId device,
-        const FactoryPPStageConfig &pp_config)
+        const FactoryPPStageConfig &pp_config,
+        const InferenceRunnerConfig &config)
     {
         if (!orchestrator || !model_ctx)
         {
@@ -1532,8 +1699,8 @@ namespace llaminar2
             device,
             nullptr,
             &pp_config);
-        weight_mgr->setPreparedWeightStore(
-            std::make_shared<PreparedWeightStore>(weight_plan.strategy().model_id));
+        if (!installPreparedWeightStoreForPlan(*weight_mgr, config, weight_plan, "[PPStageRunner]"))
+            return false;
         FrozenModelWeightSet frozen_weights = weight_mgr->materialize(weight_plan);
         auto weight_bindings = makeModelWeightBindings(frozen_weights);
         auto legacy_weights = toLegacyModelWeights(weight_bindings);
@@ -1942,7 +2109,7 @@ namespace llaminar2
         // =====================================================================
         // Load weights for this PP stage (partial weight loading)
         // =====================================================================
-        if (!configurePPStageWeightsImpl(orchestrator.get(), model_ctx, device, pp_config))
+        if (!configurePPStageWeightsImpl(orchestrator.get(), model_ctx, device, pp_config, config))
         {
             LOG_ERROR("[PPStageRunner] Failed to configure PP stage weights");
             return nullptr;
@@ -2044,6 +2211,9 @@ namespace llaminar2
         ILocalTPContext *local_tp_ctx = tp_ctx && tp_ctx->isLocal()
                                             ? static_cast<ILocalTPContext *>(tp_ctx)
                                             : nullptr;
+        IGlobalTPContext *injected_global_tp_ctx = (tp_ctx && !tp_ctx->isLocal())
+                                                       ? dynamic_cast<IGlobalTPContext *>(tp_ctx)
+                                                       : nullptr;
         const int tp_device_idx = config.tp_device_index;
 
         if (local_tp_ctx && local_tp_ctx->degree() > 1)
@@ -2053,10 +2223,31 @@ namespace llaminar2
                 return nullptr;
             }
         }
+        else if (injected_global_tp_ctx && injected_global_tp_ctx->degree() > 1)
+        {
+            // Injected global TP context (from DomainCommunicatorRegistry or test)
+            // — apply equal-split assignment without auto-creating a world context.
+            if (!applyGlobalTPContextAssignment(graph_config, injected_global_tp_ctx, tp_device_idx))
+            {
+                return nullptr;
+            }
+        }
         else
         {
             // Single rank configuration (testable runner doesn't use MPI by default)
             setFullDimensions(graph_config);
+        }
+
+        if (auto concrete_model_ctx = std::dynamic_pointer_cast<ModelContext>(model_ctx))
+        {
+            if (auto concrete_weight_mgr = concrete_model_ctx->concreteWeightManager())
+            {
+                configureWeightManagerForGraph(
+                    *concrete_weight_mgr,
+                    architecture,
+                    graph_config,
+                    graph_config.tp_config != nullptr);
+            }
         }
 
         LOG_DEBUG("[InferenceRunner] TestableGraphConfig: "
@@ -2098,7 +2289,7 @@ namespace llaminar2
             return nullptr;
         }
 
-        auto load_weight_for_runner = [model_ctx, device, tp_config = graph_config.tp_config](const std::string &name)
+        auto load_weight_for_runner = [model_ctx, device, tp_config = graph_config.tp_config, tp_rank = graph_config.local_rank](const std::string &name)
             -> std::shared_ptr<TensorBase>
         {
             if (tp_config)
@@ -2109,7 +2300,7 @@ namespace llaminar2
                 {
                     try
                     {
-                        const auto &assignment = tp_config->forDevice(device);
+                        const auto &assignment = tp_config->forRank(tp_rank);
                         return concrete_mgr->getShardedWeightForAssignment(name, device, assignment, /*layer_idx=*/-1);
                     }
                     catch (const std::out_of_range &)
@@ -2123,17 +2314,18 @@ namespace llaminar2
             return model_ctx->getWeightForDevice(name, device);
         };
 
-        // Configure weights: PP-aware vs full
-        if (config.pp_stage_config.has_value())
+        // Configure weights: PP-aware vs full.
+        // When pp_stage_config is present but model context is non-concrete (e.g. MockModelContext
+        // in unit tests), skip PP weight materialization and fall through to the full model path.
+        auto pp_concrete_ctx = config.pp_stage_config.has_value()
+                                   ? std::dynamic_pointer_cast<ModelContext>(model_ctx)
+                                   : nullptr;
+        auto pp_concrete_mgr = pp_concrete_ctx ? pp_concrete_ctx->concreteWeightManager() : nullptr;
+        if (config.pp_stage_config.has_value() && pp_concrete_ctx && pp_concrete_mgr)
         {
             const auto &pp_cfg = config.pp_stage_config.value();
-            auto concrete_model_ctx = std::dynamic_pointer_cast<ModelContext>(model_ctx);
-            auto concrete_weight_mgr = concrete_model_ctx ? concrete_model_ctx->concreteWeightManager() : nullptr;
-            if (!concrete_model_ctx || !concrete_weight_mgr)
-            {
-                LOG_ERROR("[InferenceRunner] PP stage materialization requires concrete ModelContext/WeightManager");
-                return nullptr;
-            }
+            auto &concrete_model_ctx = pp_concrete_ctx;
+            auto &concrete_weight_mgr = pp_concrete_mgr;
 
             concrete_weight_mgr->setWeightShardingConfig(
                 SchemaFactoryRegistry::getWeightShardingConfig(architecture));
@@ -2159,7 +2351,10 @@ namespace llaminar2
                 validation,
                 device,
                 graph_config.tp_config.get(),
-                &pp_cfg);
+                &pp_cfg,
+                graph_config.tp_config ? graph_config.local_rank : -1);
+            if (!installPreparedWeightStoreForPlan(*concrete_weight_mgr, config, weight_plan, "[InferenceRunner] PP stage"))
+                return nullptr;
             auto frozen_weights = concrete_weight_mgr->materialize(weight_plan);
             auto weight_bindings = makeModelWeightBindings(frozen_weights);
             auto legacy_weights = toLegacyModelWeights(weight_bindings);
@@ -2196,6 +2391,13 @@ namespace llaminar2
         }
         else
         {
+            if (config.pp_stage_config.has_value())
+            {
+                // pp_stage_config is set but model context is non-concrete (e.g. MockModelContext):
+                // skip PP weight filtering and use the interface/mock weight provider.
+                LOG_DEBUG("[InferenceRunner] pp_stage_config present but non-concrete model ctx; "
+                          "using interface weight path (test/mock)");
+            }
             bool configured_from_frozen = false;
             if (graph_config.tp_config)
             {
@@ -2221,7 +2423,11 @@ namespace llaminar2
                         *concrete_model_ctx,
                         validation,
                         device,
-                        graph_config.tp_config.get());
+                        graph_config.tp_config.get(),
+                        nullptr,
+                        graph_config.tp_config ? graph_config.local_rank : -1);
+                    if (!installPreparedWeightStoreForPlan(*concrete_weight_mgr, config, weight_plan, "[InferenceRunner] LocalTP"))
+                        return nullptr;
                     auto frozen_weights = concrete_weight_mgr->materialize(weight_plan);
                     auto weight_bindings = makeModelWeightBindings(frozen_weights);
                     auto legacy_weights = toLegacyModelWeights(weight_bindings);
@@ -2250,6 +2456,17 @@ namespace llaminar2
 
             if (!configured_from_frozen)
             {
+                if (config.prepared_weight_store)
+                {
+                    if (auto concrete_model_ctx = std::dynamic_pointer_cast<ModelContext>(model_ctx))
+                    {
+                        if (auto concrete_weight_mgr = concrete_model_ctx->concreteWeightManager())
+                        {
+                            concrete_weight_mgr->setPreparedWeightStore(config.prepared_weight_store);
+                        }
+                    }
+                }
+
                 // Full model: load all global weights
                 auto weights = config_builder->buildWeights(load_weight_for_runner);
 

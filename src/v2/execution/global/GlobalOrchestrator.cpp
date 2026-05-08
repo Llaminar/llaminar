@@ -15,9 +15,774 @@
 #include <stdexcept>
 #include <cassert>
 #include <chrono>
+#include <algorithm>
+#include <cctype>
+#include <cstring>
+#include <optional>
 
 namespace llaminar2
 {
+    namespace
+    {
+        struct ParsedLayerSnapshotKey
+        {
+            int layer = -1;
+            std::string suffix;
+        };
+
+        std::optional<ParsedLayerSnapshotKey> parseLayerSnapshotKey(const std::string &key)
+        {
+            constexpr const char *prefix = "layer";
+            constexpr size_t prefix_len = 5;
+            if (key.rfind(prefix, 0) != 0 || key.size() <= prefix_len)
+            {
+                return std::nullopt;
+            }
+
+            size_t pos = prefix_len;
+            if (!std::isdigit(static_cast<unsigned char>(key[pos])))
+            {
+                return std::nullopt;
+            }
+
+            int layer = 0;
+            while (pos < key.size() && std::isdigit(static_cast<unsigned char>(key[pos])))
+            {
+                layer = layer * 10 + (key[pos] - '0');
+                ++pos;
+            }
+
+            if (pos >= key.size() || key[pos] != '_')
+            {
+                return std::nullopt;
+            }
+
+            return ParsedLayerSnapshotKey{layer, key.substr(pos)};
+        }
+
+        std::string makeLayerSnapshotKey(int layer, const std::string &suffix)
+        {
+            return "layer" + std::to_string(layer) + suffix;
+        }
+
+        bool stageOwnsGlobalLayer(const StageRunnerEntry &entry, int layer)
+        {
+            if (!entry.pp_stage_config.has_value())
+            {
+                return true;
+            }
+            const auto &stage = entry.pp_stage_config.value();
+            return layer >= stage.first_layer && layer < stage.last_layer;
+        }
+
+        std::string globalizeStageSnapshotKey(const StageRunnerEntry &entry,
+                                              const std::string &key)
+        {
+            auto parsed = parseLayerSnapshotKey(key);
+            if (!parsed || !entry.pp_stage_config.has_value())
+            {
+                return key;
+            }
+
+            const auto &stage = entry.pp_stage_config.value();
+            if (parsed->layer >= stage.first_layer && parsed->layer < stage.last_layer)
+            {
+                return key;
+            }
+
+            if (parsed->layer >= 0 && parsed->layer < stage.layerCount())
+            {
+                return makeLayerSnapshotKey(stage.first_layer + parsed->layer,
+                                            parsed->suffix);
+            }
+
+            return key;
+        }
+
+        std::optional<std::string> localStageSnapshotKey(const StageRunnerEntry &entry,
+                                                         const ParsedLayerSnapshotKey &parsed)
+        {
+            if (!entry.pp_stage_config.has_value())
+            {
+                return std::nullopt;
+            }
+
+            const auto &stage = entry.pp_stage_config.value();
+            const int local_layer = parsed.layer - stage.first_layer;
+            if (local_layer < 0 || local_layer >= stage.layerCount())
+            {
+                return std::nullopt;
+            }
+
+            return makeLayerSnapshotKey(local_layer, parsed.suffix);
+        }
+    }
+
+    // =========================================================================
+    // StageRunnerRegistry
+    // =========================================================================
+
+    void StageRunnerRegistry::add(StageRunnerEntry entry)
+    {
+        if (!entry.runner)
+        {
+            throw std::invalid_argument("StageRunnerRegistry: runner is required");
+        }
+
+        if (entry.stage_id < 0 && entry.action.stage_id >= 0)
+        {
+            entry.stage_id = entry.action.stage_id;
+        }
+        if (entry.action.stage_id < 0 && entry.stage_id >= 0)
+        {
+            entry.action.stage_id = entry.stage_id;
+        }
+        if (entry.stage_id < 0)
+        {
+            throw std::invalid_argument("StageRunnerRegistry: stage_id is required");
+        }
+        if (entry.action.stage_id >= 0 && entry.action.stage_id != entry.stage_id)
+        {
+            throw std::invalid_argument("StageRunnerRegistry: stage_id/action mismatch");
+        }
+        if (entry.domain_name.empty())
+        {
+            entry.domain_name = entry.action.domain_name;
+        }
+
+        for (const auto &existing : entries_)
+        {
+            if (existing.stage_id == entry.stage_id)
+            {
+                throw std::invalid_argument("StageRunnerRegistry: duplicate stage_id");
+            }
+        }
+
+        entries_.push_back(std::move(entry));
+    }
+
+    void StageRunnerRegistry::setCompatibilityRunner(std::unique_ptr<IInferenceRunner> runner)
+    {
+        if (!runner)
+        {
+            throw std::invalid_argument("StageRunnerRegistry: compatibility runner is required");
+        }
+        compatibility_runner_ = std::move(runner);
+    }
+
+    bool StageRunnerRegistry::empty() const
+    {
+        return entries_.empty() && !compatibility_runner_;
+    }
+
+    size_t StageRunnerRegistry::size() const
+    {
+        return entries_.size() + (compatibility_runner_ ? 1u : 0u);
+    }
+
+    bool StageRunnerRegistry::hasRunnerForStage(int stage_id) const
+    {
+        return runnerForStage(stage_id) != nullptr;
+    }
+
+    StageRunnerEntry *StageRunnerRegistry::entryForStage(int stage_id)
+    {
+        for (auto &entry : entries_)
+        {
+            if (entry.stage_id == stage_id)
+            {
+                return &entry;
+            }
+        }
+        return nullptr;
+    }
+
+    const StageRunnerEntry *StageRunnerRegistry::entryForStage(int stage_id) const
+    {
+        for (const auto &entry : entries_)
+        {
+            if (entry.stage_id == stage_id)
+            {
+                return &entry;
+            }
+        }
+        return nullptr;
+    }
+
+    StageRunnerEntry *StageRunnerRegistry::entryForDomain(const std::string &domain_name)
+    {
+        for (auto &entry : entries_)
+        {
+            if (entry.domain_name == domain_name)
+            {
+                return &entry;
+            }
+        }
+        return nullptr;
+    }
+
+    const StageRunnerEntry *StageRunnerRegistry::entryForDomain(const std::string &domain_name) const
+    {
+        for (const auto &entry : entries_)
+        {
+            if (entry.domain_name == domain_name)
+            {
+                return &entry;
+            }
+        }
+        return nullptr;
+    }
+
+    IInferenceRunner *StageRunnerRegistry::runnerForStage(int stage_id)
+    {
+        for (auto &entry : entries_)
+        {
+            if (entry.stage_id == stage_id)
+            {
+                return entry.runner.get();
+            }
+        }
+        return compatibility_runner_.get();
+    }
+
+    const IInferenceRunner *StageRunnerRegistry::runnerForStage(int stage_id) const
+    {
+        for (const auto &entry : entries_)
+        {
+            if (entry.stage_id == stage_id)
+            {
+                return entry.runner.get();
+            }
+        }
+        return compatibility_runner_.get();
+    }
+
+    IInferenceRunner *StageRunnerRegistry::runnerForDomain(const std::string &domain_name)
+    {
+        if (auto *entry = entryForDomain(domain_name))
+        {
+            return entry->runner.get();
+        }
+        return nullptr;
+    }
+
+    const IInferenceRunner *StageRunnerRegistry::runnerForDomain(const std::string &domain_name) const
+    {
+        if (const auto *entry = entryForDomain(domain_name))
+        {
+            return entry->runner.get();
+        }
+        return nullptr;
+    }
+
+    IInferenceRunner *StageRunnerRegistry::pipelineHeadRunner()
+    {
+        for (auto &entry : entries_)
+        {
+            if (entry.action.has_embedding)
+            {
+                return entry.runner.get();
+            }
+        }
+        return defaultRunner();
+    }
+
+    const IInferenceRunner *StageRunnerRegistry::pipelineHeadRunner() const
+    {
+        for (const auto &entry : entries_)
+        {
+            if (entry.action.has_embedding)
+            {
+                return entry.runner.get();
+            }
+        }
+        return defaultRunner();
+    }
+
+    IInferenceRunner *StageRunnerRegistry::pipelineTailRunner()
+    {
+        for (auto entry_it = entries_.rbegin(); entry_it != entries_.rend(); ++entry_it)
+        {
+            if (entry_it->action.has_lm_head)
+            {
+                return entry_it->runner.get();
+            }
+        }
+        return lastLocalRunner();
+    }
+
+    const IInferenceRunner *StageRunnerRegistry::pipelineTailRunner() const
+    {
+        for (auto entry_it = entries_.rbegin(); entry_it != entries_.rend(); ++entry_it)
+        {
+            if (entry_it->action.has_lm_head)
+            {
+                return entry_it->runner.get();
+            }
+        }
+        return lastLocalRunner();
+    }
+
+    IInferenceRunner *StageRunnerRegistry::defaultRunner()
+    {
+        if (!entries_.empty())
+        {
+            return entries_.front().runner.get();
+        }
+        return compatibility_runner_.get();
+    }
+
+    const IInferenceRunner *StageRunnerRegistry::defaultRunner() const
+    {
+        if (!entries_.empty())
+        {
+            return entries_.front().runner.get();
+        }
+        return compatibility_runner_.get();
+    }
+
+    IInferenceRunner *StageRunnerRegistry::lastLocalRunner()
+    {
+        if (!entries_.empty())
+        {
+            return entries_.back().runner.get();
+        }
+        return compatibility_runner_.get();
+    }
+
+    const IInferenceRunner *StageRunnerRegistry::lastLocalRunner() const
+    {
+        if (!entries_.empty())
+        {
+            return entries_.back().runner.get();
+        }
+        return compatibility_runner_.get();
+    }
+
+    void StageRunnerRegistry::clearCacheAll()
+    {
+        for (auto &entry : entries_)
+        {
+            entry.runner->clear_cache();
+        }
+        if (compatibility_runner_)
+        {
+            compatibility_runner_->clear_cache();
+        }
+    }
+
+    void StageRunnerRegistry::setSkipLogitsGatherDecodeAll(bool skip)
+    {
+        for (auto &entry : entries_)
+        {
+            entry.runner->setSkipLogitsGatherDecode(skip);
+        }
+        if (compatibility_runner_)
+        {
+            compatibility_runner_->setSkipLogitsGatherDecode(skip);
+        }
+    }
+
+    void StageRunnerRegistry::setSkipLogitsGatherPrefillAll(bool skip)
+    {
+        for (auto &entry : entries_)
+        {
+            entry.runner->setSkipLogitsGatherPrefill(skip);
+        }
+        if (compatibility_runner_)
+        {
+            compatibility_runner_->setSkipLogitsGatherPrefill(skip);
+        }
+    }
+
+    void StageRunnerRegistry::setSuppressTimelineAll(bool suppress)
+    {
+        for (auto &entry : entries_)
+        {
+            entry.runner->setSuppressTimeline(suppress);
+        }
+        if (compatibility_runner_)
+        {
+            compatibility_runner_->setSuppressTimeline(suppress);
+        }
+    }
+
+    void StageRunnerRegistry::setAccumulatePrefillAll(bool accumulate)
+    {
+        for (auto &entry : entries_)
+        {
+            entry.runner->setAccumulatePrefill(accumulate);
+        }
+        if (compatibility_runner_)
+        {
+            compatibility_runner_->setAccumulatePrefill(accumulate);
+        }
+    }
+
+    void StageRunnerRegistry::flushStageTimelineAll()
+    {
+        for (auto &entry : entries_)
+        {
+            entry.runner->flushStageTimeline();
+        }
+        if (compatibility_runner_)
+        {
+            compatibility_runner_->flushStageTimeline();
+        }
+    }
+
+    void StageRunnerRegistry::enableSnapshotCaptureAll(const std::string &output_dir)
+    {
+        for (auto &entry : entries_)
+        {
+            entry.runner->enableSnapshotCapture(output_dir);
+        }
+        if (compatibility_runner_)
+        {
+            compatibility_runner_->enableSnapshotCapture(output_dir);
+        }
+    }
+
+    void StageRunnerRegistry::disableSnapshotCaptureAll()
+    {
+        for (auto &entry : entries_)
+        {
+            entry.runner->disableSnapshotCapture();
+        }
+        if (compatibility_runner_)
+        {
+            compatibility_runner_->disableSnapshotCapture();
+        }
+    }
+
+    void StageRunnerRegistry::clearSnapshotsAll()
+    {
+        for (auto &entry : entries_)
+        {
+            entry.runner->clearSnapshots();
+        }
+        if (compatibility_runner_)
+        {
+            compatibility_runner_->clearSnapshots();
+        }
+    }
+
+    const float *StageRunnerRegistry::getSnapshot(const std::string &key, size_t &out_size) const
+    {
+        auto parsed = parseLayerSnapshotKey(key);
+        for (const auto &entry : entries_)
+        {
+            if (parsed && !stageOwnsGlobalLayer(entry, parsed->layer))
+            {
+                continue;
+            }
+
+            const float *snapshot = entry.runner->getSnapshot(key, out_size);
+            if (snapshot)
+            {
+                return snapshot;
+            }
+
+            if (parsed)
+            {
+                auto local_key = localStageSnapshotKey(entry, *parsed);
+                if (local_key && *local_key != key)
+                {
+                    snapshot = entry.runner->getSnapshot(*local_key, out_size);
+                    if (snapshot)
+                    {
+                        return snapshot;
+                    }
+                }
+            }
+        }
+        if (compatibility_runner_)
+        {
+            return compatibility_runner_->getSnapshot(key, out_size);
+        }
+        out_size = 0;
+        return nullptr;
+    }
+
+    SnapshotInfo StageRunnerRegistry::getSnapshotWithShape(const std::string &key) const
+    {
+        auto parsed = parseLayerSnapshotKey(key);
+        for (const auto &entry : entries_)
+        {
+            if (parsed && !stageOwnsGlobalLayer(entry, parsed->layer))
+            {
+                continue;
+            }
+
+            SnapshotInfo snapshot = entry.runner->getSnapshotWithShape(key);
+            if (snapshot)
+            {
+                return snapshot;
+            }
+
+            if (parsed)
+            {
+                auto local_key = localStageSnapshotKey(entry, *parsed);
+                if (local_key && *local_key != key)
+                {
+                    snapshot = entry.runner->getSnapshotWithShape(*local_key);
+                    if (snapshot)
+                    {
+                        return snapshot;
+                    }
+                }
+            }
+        }
+        if (compatibility_runner_)
+        {
+            return compatibility_runner_->getSnapshotWithShape(key);
+        }
+        return {};
+    }
+
+    std::vector<std::string> StageRunnerRegistry::snapshotKeysAll() const
+    {
+        std::vector<std::string> keys;
+        auto append_unique = [&keys](const std::vector<std::string> &runner_keys) {
+            for (const auto &key : runner_keys)
+            {
+                if (std::find(keys.begin(), keys.end(), key) == keys.end())
+                {
+                    keys.push_back(key);
+                }
+            }
+        };
+
+        for (const auto &entry : entries_)
+        {
+            auto runner_keys = entry.runner->getSnapshotKeys();
+            for (auto &key : runner_keys)
+            {
+                key = globalizeStageSnapshotKey(entry, key);
+            }
+            append_unique(runner_keys);
+        }
+        if (compatibility_runner_)
+        {
+            append_unique(compatibility_runner_->getSnapshotKeys());
+        }
+        return keys;
+    }
+
+    // =========================================================================
+    // StageActivationRouter
+    // =========================================================================
+
+    size_t StageActivationRouter::transferElementCount(int last_seq_len, int d_model)
+    {
+        const int effective_seq_len = last_seq_len > 0 ? last_seq_len : 1;
+        return static_cast<size_t>(effective_seq_len) * static_cast<size_t>(d_model);
+    }
+
+    void StageActivationRouter::ensureActivationBufferSize(std::shared_ptr<TensorBase> &activation_buffer,
+                                                           size_t num_elements)
+    {
+        if (!activation_buffer || activation_buffer->numel() != num_elements)
+        {
+            activation_buffer = std::make_shared<FP32Tensor>(std::vector<size_t>{num_elements});
+            LOG_DEBUG("StageActivationRouter: allocated activation buffer with "
+                      << num_elements << " elements");
+        }
+    }
+
+    bool StageActivationRouter::executeTransfer(const RankTransferAction &action,
+                                                StageRunnerRegistry &registry,
+                                                IMPIContext &mpi_ctx,
+                                                int rank,
+                                                int last_seq_len,
+                                                int d_model,
+                                                std::shared_ptr<TensorBase> &activation_buffer) const
+    {
+        if (action.direction == RankTransferAction::Direction::NONE)
+            return true;
+
+        const auto &mpi_log = debugEnv().mpi_logging;
+        const size_t count = transferElementCount(last_seq_len, d_model);
+
+        if (action.direction == RankTransferAction::Direction::LOCAL_HANDOFF)
+        {
+            IInferenceRunner *source_runner = registry.runnerForStage(action.from_stage);
+            IInferenceRunner *destination_runner = registry.runnerForStage(action.to_stage);
+            if (!source_runner || !destination_runner)
+            {
+                LOG_ERROR("StageActivationRouter: missing runner for local handoff stage "
+                          << action.from_stage << " -> " << action.to_stage
+                          << " on rank " << rank);
+                return false;
+            }
+
+            TensorBase *hidden = source_runner->getHiddenState();
+            if (!hidden)
+            {
+                LOG_ERROR("StageActivationRouter: rank " << rank
+                          << " has no hidden state for local handoff stage "
+                          << action.from_stage << " -> " << action.to_stage);
+                return false;
+            }
+            if (hidden->numel() < count)
+            {
+                LOG_ERROR("StageActivationRouter: hidden state too small for local handoff: have "
+                          << hidden->numel() << " elements, need " << count);
+                return false;
+            }
+
+            ensureActivationBufferSize(activation_buffer, count);
+            std::memmove(activation_buffer->mutable_data(), hidden->data(), count * sizeof(float));
+            destination_runner->setHiddenState(activation_buffer.get());
+
+            LOG_DEBUG("StageActivationRouter: rank " << rank
+                      << " LOCAL_HANDOFF " << count << " floats stage "
+                      << action.from_stage << " -> " << action.to_stage);
+            return true;
+        }
+
+        if (action.direction == RankTransferAction::Direction::SEND)
+        {
+            IInferenceRunner *source_runner = registry.runnerForStage(action.from_stage);
+            if (!source_runner)
+            {
+                LOG_ERROR("StageActivationRouter: missing source runner for SEND stage "
+                          << action.from_stage << " on rank " << rank);
+                return false;
+            }
+
+            TensorBase *hidden = source_runner->getHiddenState();
+            if (!hidden)
+            {
+                LOG_ERROR("StageActivationRouter: rank " << rank
+                          << " has no hidden state to send to rank " << action.peer_rank
+                          << " (stage " << action.from_stage << " -> " << action.to_stage << ")");
+                return false;
+            }
+            if (hidden->numel() < count)
+            {
+                LOG_ERROR("StageActivationRouter: hidden state too small for SEND: have "
+                          << hidden->numel() << " elements, need " << count);
+                return false;
+            }
+
+            const float *send_data = hidden->data();
+            if (mpi_log.log_collectives)
+            {
+                LOG_INFO("[MPI] rank " << rank << " SEND " << count
+                         << " floats (" << (count * sizeof(float) / 1024) << " KB)"
+                         << " to rank " << action.peer_rank << " tag=" << action.mpi_tag);
+            }
+            else
+            {
+                LOG_DEBUG("StageActivationRouter: rank " << rank
+                          << " SEND " << count << " floats to rank " << action.peer_rank
+                          << " tag=" << action.mpi_tag);
+            }
+
+            try
+            {
+                auto start_time = std::chrono::steady_clock::now();
+                mpi_ctx.sendFloat(send_data, count, action.peer_rank, action.mpi_tag);
+                if (mpi_log.log_timing)
+                {
+                    auto elapsed = std::chrono::steady_clock::now() - start_time;
+                    double ms = std::chrono::duration<double, std::milli>(elapsed).count();
+                    double bw_mbps = (count * sizeof(float)) / (ms * 1000.0);
+                    LOG_INFO("[MPI] rank " << rank << " SEND complete: "
+                             << ms << "ms, " << bw_mbps << " MB/s");
+                }
+            }
+            catch (const std::exception &e)
+            {
+                LOG_ERROR("StageActivationRouter: rank " << rank
+                          << " sendFloat failed (peer=" << action.peer_rank
+                          << " count=" << count << " tag=" << action.mpi_tag
+                          << "): " << e.what());
+                return false;
+            }
+            return true;
+        }
+
+        IInferenceRunner *destination_runner = registry.runnerForStage(action.to_stage);
+        if (!destination_runner)
+        {
+            LOG_ERROR("StageActivationRouter: missing destination runner for RECV stage "
+                      << action.to_stage << " on rank " << rank);
+            return false;
+        }
+
+        ensureActivationBufferSize(activation_buffer, count);
+        float *recv_data = activation_buffer->mutable_data();
+
+        if (mpi_log.log_collectives)
+        {
+            LOG_INFO("[MPI] rank " << rank << " RECV " << count
+                     << " floats (" << (count * sizeof(float) / 1024) << " KB)"
+                     << " from rank " << action.peer_rank << " tag=" << action.mpi_tag);
+        }
+        else
+        {
+            LOG_DEBUG("StageActivationRouter: rank " << rank
+                      << " RECV " << count << " floats from rank " << action.peer_rank
+                      << " tag=" << action.mpi_tag);
+        }
+
+        try
+        {
+            auto start_time = std::chrono::steady_clock::now();
+
+            int timeout_ms = mpi_log.recv_timeout_ms;
+            if (timeout_ms > 0)
+            {
+                bool ready = false;
+                auto deadline = start_time + std::chrono::milliseconds(timeout_ms);
+                bool warned = false;
+
+                while (!ready)
+                {
+                    MPI_Status probe_status;
+                    ready = mpi_ctx.iprobe(action.peer_rank, action.mpi_tag, &probe_status);
+                    if (ready) break;
+
+                    auto now = std::chrono::steady_clock::now();
+                    if (!warned && now >= deadline)
+                    {
+                        double elapsed_ms = std::chrono::duration<double, std::milli>(now - start_time).count();
+                        LOG_WARN("StageActivationRouter: rank " << rank
+                                 << " RECV from rank " << action.peer_rank
+                                 << " blocked for " << elapsed_ms << "ms"
+                                 << " (expected " << count << " floats, "
+                                 << (count * sizeof(float) / 1024) << " KB"
+                                 << ", tag=" << action.mpi_tag << ")");
+                        warned = true;
+                    }
+                }
+            }
+
+            mpi_ctx.recvFloat(recv_data, count, action.peer_rank, action.mpi_tag, nullptr);
+
+            if (mpi_log.log_timing)
+            {
+                auto elapsed = std::chrono::steady_clock::now() - start_time;
+                double ms = std::chrono::duration<double, std::milli>(elapsed).count();
+                double bw_mbps = (count * sizeof(float)) / (ms * 1000.0);
+                LOG_INFO("[MPI] rank " << rank << " RECV complete: "
+                         << ms << "ms, " << bw_mbps << " MB/s");
+            }
+        }
+        catch (const std::exception &e)
+        {
+            LOG_ERROR("StageActivationRouter: rank " << rank
+                      << " recvFloat failed (peer=" << action.peer_rank
+                      << " count=" << count << " tag=" << action.mpi_tag
+                      << "): " << e.what());
+            return false;
+        }
+
+        destination_runner->setHiddenState(activation_buffer.get());
+        return true;
+    }
 
     // =========================================================================
     // Construction
@@ -30,10 +795,6 @@ namespace llaminar2
         if (!config_.mpi_ctx)
         {
             throw std::invalid_argument("GlobalOrchestrator: mpi_ctx is required");
-        }
-        if (!config_.rank_runner)
-        {
-            throw std::invalid_argument("GlobalOrchestrator: rank_runner is required");
         }
         if (config_.topology.stages.empty())
         {
@@ -52,11 +813,32 @@ namespace llaminar2
             throw std::invalid_argument("GlobalOrchestrator: d_model must be positive");
         }
 
-        // Take ownership of rank runner
-        rank_runner_ = std::move(config_.rank_runner);
-
         // Build this rank's execution plan from topology
         rank_plan_ = GlobalPPRankPlanBuilder::build(config_.topology, config_.rank);
+
+        for (auto &entry : config_.stage_runners)
+        {
+            stage_runners_.add(std::move(entry));
+        }
+        config_.stage_runners.clear();
+
+        if (config_.rank_runner)
+        {
+            stage_runners_.setCompatibilityRunner(std::move(config_.rank_runner));
+        }
+
+        if (stage_runners_.empty())
+        {
+            throw std::invalid_argument("GlobalOrchestrator: rank_runner or stage_runners is required");
+        }
+
+        for (const auto *action : rank_plan_.executeStages())
+        {
+            if (!stage_runners_.hasRunnerForStage(action->stage_id))
+            {
+                throw std::invalid_argument("GlobalOrchestrator: missing runner for executable stage");
+            }
+        }
 
         LOG_INFO("GlobalOrchestrator: rank " << config_.rank << "/" << config_.world_size
                  << ", " << config_.topology.numStages() << " PP stages, "
@@ -142,7 +924,8 @@ namespace llaminar2
         // Only the tail rank (with LM head) has valid logits
         if (is_pipeline_tail_)
         {
-            return rank_runner_->logits();
+            const IInferenceRunner *runner = stage_runners_.pipelineTailRunner();
+            return runner ? runner->logits() : nullptr;
         }
         return nullptr;
     }
@@ -154,7 +937,7 @@ namespace llaminar2
 
     void GlobalOrchestrator::clear_cache()
     {
-        rank_runner_->clear_cache();
+        stage_runners_.clearCacheAll();
         // Synchronize across ranks to ensure all caches are cleared
         try
         {
@@ -169,12 +952,14 @@ namespace llaminar2
 
     int GlobalOrchestrator::get_position() const
     {
-        return rank_runner_->get_position();
+        const IInferenceRunner *runner = stage_runners_.defaultRunner();
+        return runner ? runner->get_position() : 0;
     }
 
     ExecutionPath GlobalOrchestrator::executionPath() const
     {
-        return rank_runner_->executionPath();
+        const IInferenceRunner *runner = stage_runners_.defaultRunner();
+        return runner ? runner->executionPath() : ExecutionPath::GRAPH;
     }
 
     const char *GlobalOrchestrator::architecture() const
@@ -194,7 +979,8 @@ namespace llaminar2
         if (is_pipeline_tail_)
         {
             // Tail rank: sample locally
-            token = rank_runner_->sampleGreedyOnDevice();
+            IInferenceRunner *runner = stage_runners_.pipelineTailRunner();
+            token = runner ? runner->sampleGreedyOnDevice() : -1;
             if (token < 0)
             {
                 // Fallback to CPU sampling
@@ -245,7 +1031,8 @@ namespace llaminar2
 
         if (is_pipeline_tail_)
         {
-            token = rank_runner_->sampleOnDevice(params);
+            IInferenceRunner *runner = stage_runners_.pipelineTailRunner();
+            token = runner ? runner->sampleOnDevice(params) : -1;
             if (token < 0)
             {
                 // Fallback: greedy
@@ -275,12 +1062,12 @@ namespace llaminar2
 
     void GlobalOrchestrator::setSkipLogitsGatherDecode(bool skip)
     {
-        rank_runner_->setSkipLogitsGatherDecode(skip);
+        stage_runners_.setSkipLogitsGatherDecodeAll(skip);
     }
 
     void GlobalOrchestrator::setSkipLogitsGatherPrefill(bool skip)
     {
-        rank_runner_->setSkipLogitsGatherPrefill(skip);
+        stage_runners_.setSkipLogitsGatherPrefillAll(skip);
     }
 
     // =========================================================================
@@ -289,17 +1076,17 @@ namespace llaminar2
 
     void GlobalOrchestrator::setSuppressTimeline(bool suppress)
     {
-        rank_runner_->setSuppressTimeline(suppress);
+        stage_runners_.setSuppressTimelineAll(suppress);
     }
 
     void GlobalOrchestrator::setAccumulatePrefill(bool accumulate)
     {
-        rank_runner_->setAccumulatePrefill(accumulate);
+        stage_runners_.setAccumulatePrefillAll(accumulate);
     }
 
     void GlobalOrchestrator::flushStageTimeline()
     {
-        rank_runner_->flushStageTimeline();
+        stage_runners_.flushStageTimelineAll();
     }
 
     // =========================================================================
@@ -308,27 +1095,37 @@ namespace llaminar2
 
     TensorBase *GlobalOrchestrator::getHiddenState()
     {
-        return rank_runner_->getHiddenState();
+        IInferenceRunner *runner = stage_runners_.lastLocalRunner();
+        return runner ? runner->getHiddenState() : nullptr;
     }
 
     const TensorBase *GlobalOrchestrator::getHiddenState() const
     {
-        return rank_runner_->getHiddenState();
+        const IInferenceRunner *runner = stage_runners_.lastLocalRunner();
+        return runner ? runner->getHiddenState() : nullptr;
     }
 
     void GlobalOrchestrator::setHiddenState(TensorBase *hidden_state)
     {
-        rank_runner_->setHiddenState(hidden_state);
+        IInferenceRunner *runner = stage_runners_.pipelineHeadRunner();
+        if (runner)
+        {
+            runner->setHiddenState(hidden_state);
+        }
     }
 
     bool GlobalOrchestrator::hasHiddenStateInput() const
     {
-        return rank_runner_->hasHiddenStateInput();
+        const IInferenceRunner *runner = stage_runners_.pipelineHeadRunner();
+        return runner ? runner->hasHiddenStateInput() : false;
     }
 
     void GlobalOrchestrator::clearHiddenStateInput()
     {
-        rank_runner_->clearHiddenStateInput();
+        if (IInferenceRunner *runner = stage_runners_.pipelineHeadRunner())
+        {
+            runner->clearHiddenStateInput();
+        }
     }
 
     // =========================================================================
@@ -337,32 +1134,32 @@ namespace llaminar2
 
     void GlobalOrchestrator::enableSnapshotCapture(const std::string &output_dir)
     {
-        rank_runner_->enableSnapshotCapture(output_dir);
+        stage_runners_.enableSnapshotCaptureAll(output_dir);
     }
 
     void GlobalOrchestrator::disableSnapshotCapture()
     {
-        rank_runner_->disableSnapshotCapture();
+        stage_runners_.disableSnapshotCaptureAll();
     }
 
     void GlobalOrchestrator::clearSnapshots()
     {
-        rank_runner_->clearSnapshots();
+        stage_runners_.clearSnapshotsAll();
     }
 
     const float *GlobalOrchestrator::getSnapshot(const std::string &key, size_t &out_size) const
     {
-        return rank_runner_->getSnapshot(key, out_size);
+        return stage_runners_.getSnapshot(key, out_size);
     }
 
     SnapshotInfo GlobalOrchestrator::getSnapshotWithShape(const std::string &key) const
     {
-        return rank_runner_->getSnapshotWithShape(key);
+        return stage_runners_.getSnapshotWithShape(key);
     }
 
     std::vector<std::string> GlobalOrchestrator::getSnapshotKeys() const
     {
-        return rank_runner_->getSnapshotKeys();
+        return stage_runners_.snapshotKeysAll();
     }
 
     // =========================================================================
@@ -371,20 +1168,27 @@ namespace llaminar2
 
     DeviceId GlobalOrchestrator::primaryDeviceId() const
     {
-        return rank_runner_->primaryDeviceId();
+        const IInferenceRunner *runner = stage_runners_.defaultRunner();
+        return runner ? runner->primaryDeviceId() : DeviceId::cpu();
     }
 
     bool GlobalOrchestrator::hasLogitsLocal() const
     {
         if (is_pipeline_tail_)
-            return rank_runner_->hasLogitsLocal();
+        {
+            const IInferenceRunner *runner = stage_runners_.pipelineTailRunner();
+            return runner ? runner->hasLogitsLocal() : false;
+        }
         return false;
     }
 
     LogitsLocalInfo GlobalOrchestrator::getLogitsLocalInfo() const
     {
         if (is_pipeline_tail_)
-            return rank_runner_->getLogitsLocalInfo();
+        {
+            const IInferenceRunner *runner = stage_runners_.pipelineTailRunner();
+            return runner ? runner->getLogitsLocalInfo() : LogitsLocalInfo{};
+        }
         return {};
     }
 
@@ -397,6 +1201,59 @@ namespace llaminar2
     int GlobalOrchestrator::pipelineDepth() const { return config_.topology.numStages(); }
     const GlobalPPRankPlan &GlobalOrchestrator::rankPlan() const { return rank_plan_; }
     const GlobalPPTopology &GlobalOrchestrator::topology() const { return config_.topology; }
+
+    size_t GlobalOrchestrator::stageRunnerCount() const
+    {
+        return stage_runners_.size();
+    }
+
+    StageRunnerEntry *GlobalOrchestrator::stageRunnerEntryForStage(int stage_id)
+    {
+        return stage_runners_.entryForStage(stage_id);
+    }
+
+    const StageRunnerEntry *GlobalOrchestrator::stageRunnerEntryForStage(int stage_id) const
+    {
+        return stage_runners_.entryForStage(stage_id);
+    }
+
+    StageRunnerEntry *GlobalOrchestrator::stageRunnerEntryForDomain(const std::string &domain_name)
+    {
+        return stage_runners_.entryForDomain(domain_name);
+    }
+
+    const StageRunnerEntry *GlobalOrchestrator::stageRunnerEntryForDomain(const std::string &domain_name) const
+    {
+        return stage_runners_.entryForDomain(domain_name);
+    }
+
+    IInferenceRunner *GlobalOrchestrator::stageRunnerForStage(int stage_id)
+    {
+        if (auto *entry = stage_runners_.entryForStage(stage_id))
+        {
+            return entry->runner.get();
+        }
+        return nullptr;
+    }
+
+    const IInferenceRunner *GlobalOrchestrator::stageRunnerForStage(int stage_id) const
+    {
+        if (const auto *entry = stage_runners_.entryForStage(stage_id))
+        {
+            return entry->runner.get();
+        }
+        return nullptr;
+    }
+
+    IInferenceRunner *GlobalOrchestrator::stageRunnerForDomain(const std::string &domain_name)
+    {
+        return stage_runners_.runnerForDomain(domain_name);
+    }
+
+    const IInferenceRunner *GlobalOrchestrator::stageRunnerForDomain(const std::string &domain_name) const
+    {
+        return stage_runners_.runnerForDomain(domain_name);
+    }
 
     ITPContext *GlobalOrchestrator::globalTPContext() const
     {
@@ -432,18 +1289,17 @@ namespace llaminar2
                       << " of " << action.tp_domain_size << ")");
         }
 
-        if (action.has_embedding)
+        IInferenceRunner *runner = stage_runners_.runnerForStage(action.stage_id);
+        if (!runner)
         {
-            // Pipeline head: pass tokens to rank runner for embedding + layers
-            return rank_runner_->forward(tokens, seq_len);
+            LOG_ERROR("GlobalOrchestrator: rank " << config_.rank
+                      << " has no runner for stage " << action.stage_id);
+            return false;
         }
-        else
-        {
-            // Middle/tail stage: hidden state already set via transfer
-            // rank_runner should have had setHiddenState() called after the
-            // preceding RECV transfer step.
-            return rank_runner_->forward(tokens, seq_len);
-        }
+
+        // Pipeline head stages consume tokens directly. Middle/tail stages should
+        // already have hidden state populated by a preceding transfer/handoff.
+        return runner->forward(action.has_embedding ? tokens : nullptr, seq_len);
     }
 
     // =========================================================================
@@ -452,165 +1308,14 @@ namespace llaminar2
 
     bool GlobalOrchestrator::executeTransfer(const RankTransferAction &action)
     {
-        if (action.direction == RankTransferAction::Direction::NONE)
-            return true;
-
-        const auto &mpi_log = debugEnv().mpi_logging;
-
-        if (action.direction == RankTransferAction::Direction::SEND)
-        {
-            // Get hidden state from rank runner
-            TensorBase *hidden = rank_runner_->getHiddenState();
-            if (!hidden)
-            {
-                LOG_ERROR("GlobalOrchestrator: rank " << config_.rank
-                          << " has no hidden state to send to rank " << action.peer_rank
-                          << " (stage " << action.from_stage << " → " << action.to_stage << ")");
-                return false;
-            }
-
-            // Send only the effective data (last_seq_len_ * d_model), not the full
-            // allocated buffer which may be max_seq_len * d_model.
-            const float *send_data = hidden->data();
-            size_t count = static_cast<size_t>(last_seq_len_) * config_.d_model;
-            if (count == 0) count = static_cast<size_t>(config_.d_model);
-
-            if (mpi_log.log_collectives)
-            {
-                LOG_INFO("[MPI] rank " << config_.rank << " SEND " << count
-                         << " floats (" << (count * sizeof(float) / 1024) << " KB)"
-                         << " → rank " << action.peer_rank << " tag=" << action.mpi_tag);
-            }
-            else
-            {
-                LOG_DEBUG("GlobalOrchestrator: rank " << config_.rank
-                          << " SEND " << count << " floats to rank " << action.peer_rank
-                          << " tag=" << action.mpi_tag);
-            }
-
-            try
-            {
-                auto t0 = std::chrono::steady_clock::now();
-                config_.mpi_ctx->sendFloat(send_data, count, action.peer_rank, action.mpi_tag);
-                if (mpi_log.log_timing)
-                {
-                    auto dt = std::chrono::steady_clock::now() - t0;
-                    double ms = std::chrono::duration<double, std::milli>(dt).count();
-                    double bw_mbps = (count * sizeof(float)) / (ms * 1000.0); // MB/s
-                    LOG_INFO("[MPI] rank " << config_.rank << " SEND complete: "
-                             << ms << "ms, " << bw_mbps << " MB/s");
-                }
-            }
-            catch (const std::exception &e)
-            {
-                LOG_ERROR("GlobalOrchestrator: rank " << config_.rank
-                          << " sendFloat failed (peer=" << action.peer_rank
-                          << " count=" << count << " tag=" << action.mpi_tag
-                          << "): " << e.what());
-                return false;
-            }
-            return true;
-        }
-        else // RECV
-        {
-            // Ensure activation buffer is sized for current sequence
-            size_t needed = static_cast<size_t>(last_seq_len_) * config_.d_model;
-            if (needed == 0) needed = static_cast<size_t>(config_.d_model); // fallback for single token
-            ensureActivationBufferCapacity(needed);
-
-            TensorBase *recv_tensor = activation_buffer_.get();
-            if (!recv_tensor)
-            {
-                LOG_ERROR("GlobalOrchestrator: rank " << config_.rank
-                          << " has no activation buffer for RECV from rank " << action.peer_rank
-                          << " (stage " << action.from_stage << " → " << action.to_stage << ")");
-                return false;
-            }
-
-            float *recv_data = recv_tensor->mutable_data();
-            size_t count = recv_tensor->numel();
-
-            if (mpi_log.log_collectives)
-            {
-                LOG_INFO("[MPI] rank " << config_.rank << " RECV " << count
-                         << " floats (" << (count * sizeof(float) / 1024) << " KB)"
-                         << " ← rank " << action.peer_rank << " tag=" << action.mpi_tag);
-            }
-            else
-            {
-                LOG_DEBUG("GlobalOrchestrator: rank " << config_.rank
-                          << " RECV " << count << " floats from rank " << action.peer_rank
-                          << " tag=" << action.mpi_tag);
-            }
-
-            try
-            {
-                auto t0 = std::chrono::steady_clock::now();
-
-                // Timeout detection: poll with iprobe before blocking recv
-                int timeout_ms = mpi_log.recv_timeout_ms;
-                if (timeout_ms > 0)
-                {
-                    bool ready = false;
-                    auto deadline = t0 + std::chrono::milliseconds(timeout_ms);
-                    bool warned = false;
-
-                    while (!ready)
-                    {
-                        MPI_Status probe_status;
-                        ready = config_.mpi_ctx->iprobe(action.peer_rank, action.mpi_tag, &probe_status);
-                        if (ready) break;
-
-                        auto now = std::chrono::steady_clock::now();
-                        if (!warned && now >= deadline)
-                        {
-                            double elapsed_ms = std::chrono::duration<double, std::milli>(now - t0).count();
-                            LOG_WARN("GlobalOrchestrator: rank " << config_.rank
-                                     << " RECV from rank " << action.peer_rank
-                                     << " blocked for " << elapsed_ms << "ms"
-                                     << " (expected " << count << " floats, "
-                                     << (count * sizeof(float) / 1024) << " KB"
-                                     << ", tag=" << action.mpi_tag << ")");
-                            warned = true;
-                            // Continue waiting — this is a warning, not an error
-                        }
-                    }
-                }
-
-                config_.mpi_ctx->recvFloat(recv_data, count, action.peer_rank, action.mpi_tag, nullptr);
-
-                if (mpi_log.log_timing)
-                {
-                    auto dt = std::chrono::steady_clock::now() - t0;
-                    double ms = std::chrono::duration<double, std::milli>(dt).count();
-                    double bw_mbps = (count * sizeof(float)) / (ms * 1000.0); // MB/s
-                    LOG_INFO("[MPI] rank " << config_.rank << " RECV complete: "
-                             << ms << "ms, " << bw_mbps << " MB/s");
-                }
-            }
-            catch (const std::exception &e)
-            {
-                LOG_ERROR("GlobalOrchestrator: rank " << config_.rank
-                          << " recvFloat failed (peer=" << action.peer_rank
-                          << " count=" << count << " tag=" << action.mpi_tag
-                          << "): " << e.what());
-                return false;
-            }
-
-            // Pass received hidden state to rank runner for the next stage
-            rank_runner_->setHiddenState(recv_tensor);
-            return true;
-        }
-    }
-
-    void GlobalOrchestrator::ensureActivationBufferCapacity(size_t num_elements)
-    {
-        if (!activation_buffer_ || activation_buffer_->numel() < num_elements)
-        {
-            activation_buffer_ = std::make_shared<FP32Tensor>(
-                std::vector<size_t>{num_elements});
-            LOG_DEBUG("GlobalOrchestrator: resized activation buffer to " << num_elements << " elements");
-        }
+        StageActivationRouter router;
+        return router.executeTransfer(action,
+                                      stage_runners_,
+                                      *config_.mpi_ctx,
+                                      config_.rank,
+                                      last_seq_len_,
+                                      config_.d_model,
+                                      activation_buffer_);
     }
 
     // =========================================================================

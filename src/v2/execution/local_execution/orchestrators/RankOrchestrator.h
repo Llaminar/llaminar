@@ -73,6 +73,7 @@ namespace llaminar2
     class TensorBase;
     class LogitsGatherer;
     class DeviceSampler;
+    class PreparedWeightStore;
     struct GraphExecutorStats;
     struct PlacementPlan;
     struct PPActivationContract;
@@ -220,6 +221,10 @@ namespace llaminar2
             /// When set, the TP device runners will build partial graphs instead of full graphs.
             /// Set by the parent MDO when creating a nested TP MDO for a PP stage.
             std::optional<FactoryPPStageConfig> nested_pp_stage_config;
+
+            /// Optional stage-local prepared store shared by this RankOrchestrator
+            /// and its per-device runners.
+            std::shared_ptr<PreparedWeightStore> prepared_weight_store;
 
             // =================================================================
             // Helper Methods

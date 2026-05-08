@@ -1522,10 +1522,33 @@ namespace llaminar2
                                                ? requirement.canonical_name
                                                : requirement.source_name;
             const DeviceId lookup_device = requirement.lookup_device.value_or(requirement.target_device);
-            auto tensor = getWeightForDevice(
-                load_name,
-                lookup_device,
-                requirement.layer);
+            std::shared_ptr<TensorBase> tensor;
+            if (tp_config_ && requirement.tp_domain >= 0 && requirement.tp_rank_or_device_index >= 0)
+            {
+                try
+                {
+                    const auto &assignment = tp_config_->forRank(requirement.tp_rank_or_device_index);
+                    tensor = getShardedWeightForAssignment(
+                        load_name,
+                        lookup_device,
+                        assignment,
+                        requirement.layer);
+                }
+                catch (const std::out_of_range &)
+                {
+                    LOG_WARN("[WeightManager] TP rank " << requirement.tp_rank_or_device_index
+                                                         << " not in TensorParallelConfig while materializing "
+                                                         << requirement.canonical_name
+                                                         << "; falling back to device lookup");
+                }
+            }
+            if (!tensor)
+            {
+                tensor = getWeightForDevice(
+                    load_name,
+                    lookup_device,
+                    requirement.layer);
+            }
 
             if (!tensor)
             {

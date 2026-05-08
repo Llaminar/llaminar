@@ -186,6 +186,15 @@ namespace llaminar2
             return nullptr;
         }
 
+        // Non-participant: color == MPI_UNDEFINED produces MPI_COMM_NULL.
+        // Return nullptr gracefully so the caller knows this rank is not in the domain.
+        if (new_comm == MPI_COMM_NULL)
+        {
+            LOG_DEBUG("GlobalTPContext::createWithSplit - rank excluded from domain " << domain_id
+                                                                                      << " (color=MPI_UNDEFINED)");
+            return nullptr;
+        }
+
         // Get our position in the new domain communicator
         int my_rank, domain_size;
         MPI_Comm_rank(new_comm, &my_rank);

@@ -632,9 +632,16 @@ namespace llaminar2
             {
                 if (auto concrete_weight_mgr = std::dynamic_pointer_cast<WeightManager>(weight_mgr))
                 {
-                    concrete_weight_mgr->setPreparedWeightStore(
-                        std::make_shared<PreparedWeightStore>(
-                            ModelContextId{reinterpret_cast<uint64_t>(model_ctx_.get())}));
+                    if (config_.prepared_weight_store)
+                    {
+                        concrete_weight_mgr->setPreparedWeightStore(config_.prepared_weight_store);
+                    }
+                    else
+                    {
+                        concrete_weight_mgr->setPreparedWeightStore(
+                            std::make_shared<PreparedWeightStore>(
+                                ModelContextId{reinterpret_cast<uint64_t>(model_ctx_.get())}));
+                    }
                 }
                 if (config_.nested_pp_stage_config.has_value())
                 {
@@ -704,6 +711,7 @@ namespace llaminar2
                                                  runner_config.kv_cache_scale_v = config_.kv_cache_scale_v;
                                                  runner_config.kv_cache_precision = config_.kv_cache_precision;
                                                  runner_config.use_mapped_memory = config_.use_mapped_memory;
+                                                 runner_config.prepared_weight_store = config_.prepared_weight_store;
 
                                                  // Set TP parameters (LOCAL TP context here)
                                                  runner_config.tp_ctx = tp_ctx_.get();
@@ -959,6 +967,7 @@ namespace llaminar2
             runner_config.kv_cache_scale_v = config_.kv_cache_scale_v;
             runner_config.kv_cache_precision = config_.kv_cache_precision;
             runner_config.use_mapped_memory = config_.use_mapped_memory;
+            runner_config.prepared_weight_store = config_.prepared_weight_store;
 
             // =====================================================================
             // Build FactoryPPStageConfig for the createPPStageRunner factory
@@ -993,6 +1002,7 @@ namespace llaminar2
                 nested_config.kv_cache_scale_v = config_.kv_cache_scale_v;
                 nested_config.kv_cache_precision = config_.kv_cache_precision;
                 nested_config.use_mapped_memory = config_.use_mapped_memory;
+                nested_config.prepared_weight_store = config_.prepared_weight_store;
 
                 // CRITICAL: Pass PP stage config to nested TP MDO so its DeviceGraphOrchestrators
                 // build partial graphs instead of full graphs. Without this, the TP devices would
@@ -1441,11 +1451,9 @@ namespace llaminar2
             launch_t1 = decode_breakdown ? std::chrono::high_resolution_clock::now()
                                          : std::chrono::high_resolution_clock::time_point{};
 
-            // Collect results from all workers.
-            // Default: wait indefinitely (tp_collect_timeout_ms=0). Workers always
-            // complete (success, failure, or exception) because the catch(...) in
-            // workerLoop ensures no exception escapes. Set LLAMINAR_TP_COLLECT_TIMEOUT_MS
-            // to a positive value (e.g. 30000) for a safety-net timeout when debugging hangs.
+            // Collect results from all workers. Debug/Integration builds default to
+            // a 30s safety net, while Release keeps unlimited waits unless
+            // LLAMINAR_TP_COLLECT_TIMEOUT_MS is set explicitly.
             auto results = tp_worker_pool_->collectAll(debugEnv().tp_collect_timeout_ms);
 
             // Process results with fault-tolerant exception handling.

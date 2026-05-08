@@ -257,6 +257,71 @@ TEST(Test__WeightManagerPrepare, RegistersExactFrozenBindingRefs)
     EXPECT_EQ(lm_head_binding.tensor, embedding_binding.tensor);
 }
 
+TEST(Test__WeightManagerPrepare, StagePreparedStoresRemainIndependentAcrossMaterializations)
+{
+    auto loader = MockModelLoaderBuilder()
+                      .addFP32RandomTensor("blk.0.ffn_down.weight", {16, 64})
+                      .addFP32RandomTensor("blk.1.ffn_down.weight", {16, 64})
+                      .build();
+
+    WeightManager manager(*loader);
+
+    auto make_plan = [](ModelContextId model_id, int layer, int pp_stage, int tp_domain) {
+        InferenceStrategy strategy;
+        strategy.mode = WeightInferenceMode::HybridPPTP;
+        strategy.model_id = model_id;
+        strategy.pp_stages = 2;
+        strategy.tp_degree = 1;
+        strategy.devices = {DeviceId::cpu()};
+
+        WeightPlan plan(strategy);
+        WeightRequirement ffn_down;
+        ffn_down.canonical_name = "blk." + std::to_string(layer) + ".ffn_down.weight";
+        ffn_down.layer = layer;
+        ffn_down.pp_stage = pp_stage;
+        ffn_down.tp_domain = tp_domain;
+        ffn_down.target_device = DeviceId::cpu();
+        ffn_down.expected_prepared_kind = PreparedWeightKind::CpuPackedGemm;
+        plan.add(ffn_down);
+        return plan;
+    };
+
+    auto store_a = std::make_shared<PreparedWeightStore>(ModelContextId{1001});
+    manager.setPreparedWeightStore(store_a);
+    WeightPlan plan_a = make_plan(ModelContextId{1001}, 0, 0, 10);
+    FrozenModelWeightSet frozen_a = manager.materialize(plan_a);
+    ASSERT_TRUE(manager.prepareWeightsForDevice(frozen_a, DeviceId::cpu()));
+
+    const auto &binding_a = frozen_a.layer(0, "ffn_down.weight");
+    ASSERT_TRUE(binding_a.prepared.has_value());
+    const PreparedWeightRef ref_a = *binding_a.prepared;
+    ASSERT_TRUE(store_a->contains(ref_a));
+    ASSERT_NE(store_a->gemmKernel(ref_a), nullptr);
+
+    auto store_b = std::make_shared<PreparedWeightStore>(ModelContextId{1002});
+    manager.setPreparedWeightStore(store_b);
+    WeightPlan plan_b = make_plan(ModelContextId{1002}, 1, 1, 20);
+    FrozenModelWeightSet frozen_b = manager.materialize(plan_b);
+    ASSERT_TRUE(manager.prepareWeightsForDevice(frozen_b, DeviceId::cpu()));
+
+    const auto &binding_b = frozen_b.layer(1, "ffn_down.weight");
+    ASSERT_TRUE(binding_b.prepared.has_value());
+    const PreparedWeightRef ref_b = *binding_b.prepared;
+
+    EXPECT_NE(store_a, store_b);
+    EXPECT_TRUE(store_a->contains(ref_a));
+    EXPECT_NE(store_a->gemmKernel(ref_a), nullptr);
+    EXPECT_FALSE(store_b->contains(ref_a));
+    EXPECT_FALSE(store_b->preparedRefForBinding(ref_a.binding_id, DeviceId::cpu()).has_value());
+
+    EXPECT_TRUE(store_b->contains(ref_b));
+    EXPECT_NE(store_b->gemmKernel(ref_b), nullptr);
+    EXPECT_FALSE(store_a->contains(ref_b));
+    EXPECT_FALSE(store_a->preparedRefForBinding(ref_b.binding_id, DeviceId::cpu()).has_value());
+    EXPECT_EQ(store_a->size(), 1u);
+    EXPECT_EQ(store_b->size(), 1u);
+}
+
 TEST(Test__WeightManagerMaterialize, LookupDeviceCanDifferFromTargetDevice)
 {
     auto loader = MockModelLoaderBuilder()

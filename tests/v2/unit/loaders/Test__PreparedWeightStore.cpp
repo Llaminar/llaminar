@@ -65,6 +65,26 @@ TEST(Test__PreparedWeightStore, RegistersAndFindsMockPreparedWeights)
     EXPECT_EQ(stored->prepared->kind, PreparedWeightKind::RocmInt8PackedGemm);
 }
 
+TEST(Test__PreparedWeightStore, BindModelIdIfUnsetBindsOnce)
+{
+    PreparedWeightStore store;
+
+    EXPECT_EQ(store.modelId().value, 0u);
+    EXPECT_TRUE(store.bindModelIdIfUnset(ModelContextId{77}));
+    EXPECT_EQ(store.modelId().value, 77u);
+    EXPECT_TRUE(store.bindModelIdIfUnset(ModelContextId{77}));
+    EXPECT_FALSE(store.bindModelIdIfUnset(ModelContextId{78}));
+    EXPECT_EQ(store.modelId().value, 77u);
+}
+
+TEST(Test__PreparedWeightStore, BindModelIdIfUnsetRejectsZeroAgainstBoundStore)
+{
+    PreparedWeightStore store(ModelContextId{88});
+
+    EXPECT_FALSE(store.bindModelIdIfUnset(ModelContextId{}));
+    EXPECT_EQ(store.modelId().value, 88u);
+}
+
 TEST(Test__PreparedWeightStore, RejectsWrongModelOrDevice)
 {
     PreparedWeightStore store(ModelContextId{99});

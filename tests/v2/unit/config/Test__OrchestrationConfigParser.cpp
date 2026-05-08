@@ -397,6 +397,28 @@ TEST(Test__OrchestrationConfigParser, ParseArgs_DefineDomain_WithWeightsAndBacke
     EXPECT_EQ(domain.backend, CollectiveBackendType::HETEROGENEOUS);
 }
 
+TEST(Test__OrchestrationConfigParser, ParseArgs_DefineDomain_WithScopeOwnerRanksBackend)
+{
+    ArgvHelper args{"llaminar2",
+                    "--define-domain", "rocm_socket0=0:rocm:0,0:rocm:1;scope=local;backend=rccl;owner=0",
+                    "--define-domain", "cpu_sockets=0:cpu:0,1:cpu:0;scope=node_local;backend=upi;ranks=0,1"};
+    OrchestrationConfigParser parser;
+
+    auto config = parser.parseArgs(args.argc(), args.argv());
+
+    ASSERT_EQ(config.domain_definitions.size(), 2u);
+    EXPECT_EQ(config.domain_definitions[0].scope, TPScope::LOCAL);
+    ASSERT_TRUE(config.domain_definitions[0].owner_rank.has_value());
+    EXPECT_EQ(*config.domain_definitions[0].owner_rank, 0);
+    EXPECT_EQ(config.domain_definitions[0].backend, CollectiveBackendType::RCCL);
+
+    EXPECT_EQ(config.domain_definitions[1].scope, TPScope::NODE_LOCAL);
+    EXPECT_EQ(config.domain_definitions[1].backend, CollectiveBackendType::UPI);
+    ASSERT_EQ(config.domain_definitions[1].explicit_ranks.size(), 2u);
+    EXPECT_EQ(config.domain_definitions[1].explicit_ranks[0], 0);
+    EXPECT_EQ(config.domain_definitions[1].explicit_ranks[1], 1);
+}
+
 TEST(Test__OrchestrationConfigParser, ParseArgs_PPStage)
 {
     ArgvHelper args{"llaminar2", "--pp-stage", "0=gpu_tp:0-13"};
@@ -589,6 +611,38 @@ tp_weights: [0.73, 0.27]
     EXPECT_EQ(config.tp_scope, TPScope::LOCAL);
     EXPECT_EQ(config.tp_devices.size(), 2);
     EXPECT_EQ(config.tp_weights.size(), 2);
+}
+
+TEST(Test__OrchestrationConfigParser, ParseYamlString_NamedDomainLists)
+{
+        OrchestrationConfigParser parser;
+
+        std::string yaml = R"(
+domains:
+    - "rocm_socket0=0:rocm:0,0:rocm:1;scope=local;backend=rccl;owner=0"
+    - "cpu_sockets=0:cpu:0,1:cpu:0;scope=node_local;backend=upi;ranks=0,1"
+pp_stages:
+    - "0=rocm_socket0:0-13"
+    - "1=cpu_sockets:14-27"
+)";
+
+        auto config = parser.parseYamlString(yaml);
+
+        ASSERT_EQ(config.domain_definitions.size(), 2u);
+        EXPECT_EQ(config.domain_definitions[0].name, "rocm_socket0");
+        EXPECT_EQ(config.domain_definitions[0].scope, TPScope::LOCAL);
+        ASSERT_TRUE(config.domain_definitions[0].owner_rank.has_value());
+        EXPECT_EQ(*config.domain_definitions[0].owner_rank, 0);
+        EXPECT_EQ(config.domain_definitions[0].backend, CollectiveBackendType::RCCL);
+        EXPECT_EQ(config.domain_definitions[1].scope, TPScope::NODE_LOCAL);
+        ASSERT_EQ(config.domain_definitions[1].explicit_ranks.size(), 2u);
+        EXPECT_EQ(config.domain_definitions[1].explicit_ranks[1], 1);
+
+        ASSERT_EQ(config.pp_stage_definitions.size(), 2u);
+        EXPECT_EQ(config.pp_stage_definitions[0].domain_name, "rocm_socket0");
+        EXPECT_EQ(config.pp_stage_definitions[1].domain_name, "cpu_sockets");
+        EXPECT_EQ(config.pp_stage_definitions[1].first_layer, 14);
+        EXPECT_EQ(config.pp_stage_definitions[1].last_layer, 27);
 }
 
 TEST(Test__OrchestrationConfigParser, ParseYamlString_AllIntrospectionFlags)

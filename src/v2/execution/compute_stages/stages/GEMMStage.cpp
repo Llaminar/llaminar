@@ -15,6 +15,33 @@ namespace llaminar2
 {
     namespace
     {
+        bool validateMatrixExtent(
+            const TensorBase *tensor,
+            const char *tensor_name,
+            int required_rows,
+            int required_cols)
+        {
+            if (!tensor)
+            {
+                LOG_ERROR("[GEMMStage] " << tensor_name << " is not a TensorBase");
+                return false;
+            }
+
+            const auto &shape = tensor->shape();
+            const size_t rows = shape.empty() ? 0 : shape[0];
+            const size_t cols = shape.size() < 2 ? 1 : shape[1];
+            if (rows < static_cast<size_t>(required_rows) ||
+                cols < static_cast<size_t>(required_cols))
+            {
+                LOG_ERROR("[GEMMStage] Tensor extent mismatch for " << tensor_name
+                                                                    << ": required >= ["
+                                                                    << required_rows << ", " << required_cols
+                                                                    << "], actual=[" << rows << ", " << cols << "]");
+                return false;
+            }
+            return true;
+        }
+
         ITensorGemm *resolvePreparedGemmForStage(
             const char *caller,
             const GEMMStage::Params &params,
@@ -186,6 +213,20 @@ namespace llaminar2
         // Check if this is a sliced (tensor-parallel) GEMM
         const bool is_sliced = !params_.output_range.empty();
         const int effective_n = is_sliced ? static_cast<int>(params_.output_range.size()) : params_.n;
+
+        const auto *A_extent = requireTensorBase(params_.A, "input A");
+        auto *C_extent = asTensorBase(params_.C, "output C");
+        if (!validateMatrixExtent(A_extent, "A", params_.m, params_.k) ||
+            !validateMatrixExtent(C_extent, "C", params_.m, effective_n))
+        {
+            return false;
+        }
+        if (params_.gate_input)
+        {
+            const auto *gate_extent = requireTensorBase(params_.gate_input, "gate input");
+            if (!validateMatrixExtent(gate_extent, "gate_input", params_.m, params_.k))
+                return false;
+        }
 
         LOG_DEBUG("[GEMMStage] Execute GEMM: " << params_.m << "x" << effective_n << "x" << params_.k
                                                << (is_sliced ? " (SLICED)" : "")

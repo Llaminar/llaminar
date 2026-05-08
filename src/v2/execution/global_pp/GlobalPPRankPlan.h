@@ -36,6 +36,7 @@ namespace llaminar2
     struct RankStageAction
     {
         int stage_id = -1;
+        std::string domain_name; ///< Optional named execution domain for this stage
 
         /** @brief Role of this rank in the stage */
         enum class Role
@@ -55,6 +56,7 @@ namespace llaminar2
         InnerParallelism inner_mode = InnerParallelism::SINGLE_DEVICE;
         std::vector<GlobalDeviceAddress> devices;
         std::vector<float> tp_weights;
+        CollectiveBackendType backend = CollectiveBackendType::AUTO;
 
         // For global TP EXECUTE:
         bool is_global_tp = false;       ///< This is a multi-rank global TP stage
@@ -84,6 +86,7 @@ namespace llaminar2
         {
             SEND,  ///< This rank sends data to peer
             RECV,  ///< This rank receives data from peer
+            LOCAL_HANDOFF, ///< This rank hands activations between local stage/domain runners
             NONE,  ///< No transfer needed (data already available)
         };
 
@@ -192,6 +195,7 @@ namespace llaminar2
                     const auto &sa = step.stage_action;
                     oss << "EXECUTE stage=" << sa.stage_id
                         << " layers=[" << sa.first_layer << "-" << sa.last_layer << "]";
+                    if (!sa.domain_name.empty()) oss << " domain=" << sa.domain_name;
                     if (sa.is_global_tp) oss << " global_tp(rank_in_domain=" << sa.tp_rank_in_domain << ")";
                     if (sa.has_embedding) oss << " +emb";
                     if (sa.has_lm_head) oss << " +lm";
@@ -206,6 +210,10 @@ namespace llaminar2
                     else if (ta.direction == RankTransferAction::Direction::RECV)
                     {
                         oss << "RECV from rank " << ta.peer_rank << " tag=" << ta.mpi_tag;
+                    }
+                    else if (ta.direction == RankTransferAction::Direction::LOCAL_HANDOFF)
+                    {
+                        oss << "LOCAL_HANDOFF rank " << ta.peer_rank << " tag=" << ta.mpi_tag;
                     }
                     else
                     {

@@ -3522,11 +3522,24 @@ namespace llaminar2::test::parity
                     std::string llaminar_key = "layer" + std::to_string(layer_idx) + "_" + stage;
                     std::string pytorch_key = llaminar_key;
 
-                    if (!available_snapshots.count(llaminar_key))
-                        continue;
-
                     auto pytorch_data = loadPyTorchSnapshot(pytorch_key);
                     if (pytorch_data.empty())
+                        continue;
+
+                    const bool is_allreduce_stage =
+                        mpi_ctx_ && !config_.allreduce_stages.empty() &&
+                        std::find(config_.allreduce_stages.begin(), config_.allreduce_stages.end(), stage) !=
+                            config_.allreduce_stages.end();
+
+                    const bool has_local_snapshot = available_snapshots.count(llaminar_key) > 0;
+                    float ranks_with_snapshot = has_local_snapshot ? 1.0f : 0.0f;
+                    if (is_allreduce_stage)
+                    {
+                        float local_has_snapshot = ranks_with_snapshot;
+                        mpi_ctx_->allreduce_sum(&local_has_snapshot, &ranks_with_snapshot, 1);
+                    }
+
+                    if (!has_local_snapshot)
                         continue;
 
                     size_t llaminar_size;
@@ -3542,9 +3555,8 @@ namespace llaminar2::test::parity
                     // EP/TP allreduce: reconstruct full output from partial sums across ranks
                     bool did_allreduce = false;
                     std::vector<float> allreduced_buf;
-                    if (mpi_ctx_ && !config_.allreduce_stages.empty() &&
-                        std::find(config_.allreduce_stages.begin(), config_.allreduce_stages.end(), stage) !=
-                            config_.allreduce_stages.end())
+                    if (is_allreduce_stage &&
+                        static_cast<int>(ranks_with_snapshot + 0.5f) == mpiWorldSize())
                     {
                         allreduced_buf.resize(llaminar_size);
                         mpi_ctx_->allreduce_sum(compare_data, allreduced_buf.data(), llaminar_size);
@@ -4622,13 +4634,27 @@ namespace llaminar2::test::parity
 
                             // Llaminar snapshot key: layer{N}_{STAGE}
                             std::string llaminar_key = "layer" + std::to_string(layer_idx) + "_" + stage;
-                            if (!available_snapshots.count(llaminar_key))
-                                continue;
 
                             // PyTorch snapshot key: decode_step{N}_layer{L}_{STAGE}
                             std::string pytorch_key = step_prefix + "_layer" + std::to_string(layer_idx) + "_" + stage;
                             auto pytorch_data = loadPyTorchSnapshot(pytorch_key);
                             if (pytorch_data.empty())
+                                continue;
+
+                            const bool is_allreduce_stage =
+                                mpi_ctx_ && !config_.allreduce_stages.empty() &&
+                                std::find(config_.allreduce_stages.begin(), config_.allreduce_stages.end(), stage) !=
+                                    config_.allreduce_stages.end();
+
+                            const bool has_local_snapshot = available_snapshots.count(llaminar_key) > 0;
+                            float ranks_with_snapshot = has_local_snapshot ? 1.0f : 0.0f;
+                            if (is_allreduce_stage)
+                            {
+                                float local_has_snapshot = ranks_with_snapshot;
+                                mpi_ctx_->allreduce_sum(&local_has_snapshot, &ranks_with_snapshot, 1);
+                            }
+
+                            if (!has_local_snapshot)
                                 continue;
 
                             size_t llaminar_size;
@@ -4662,9 +4688,8 @@ namespace llaminar2::test::parity
                             // EP/TP allreduce: reconstruct full output from partial sums across ranks
                             bool did_allreduce_decode = false;
                             std::vector<float> allreduced_decode_buf;
-                            if (mpi_ctx_ && !config_.allreduce_stages.empty() &&
-                                std::find(config_.allreduce_stages.begin(), config_.allreduce_stages.end(), stage) !=
-                                    config_.allreduce_stages.end())
+                            if (is_allreduce_stage &&
+                                static_cast<int>(ranks_with_snapshot + 0.5f) == mpiWorldSize())
                             {
                                 allreduced_decode_buf.resize(llaminar_size);
                                 mpi_ctx_->allreduce_sum(decode_compare, allreduced_decode_buf.data(), llaminar_size);

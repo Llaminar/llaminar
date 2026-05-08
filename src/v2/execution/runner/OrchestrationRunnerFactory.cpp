@@ -8,6 +8,7 @@
 
 #include "IOrchestrationRunnerFactory.h"
 #include "OrchestrationRunner.h"
+#include "NamedDomainGlobalRunner.h"
 #include "../../config/OrchestrationConfigParser.h"
 #include "../../config/ParallelismTreeParser.h"
 #include "../mpi_orchestration/ExecutionPlanBuilder.h"
@@ -168,16 +169,22 @@ namespace llaminar2
             }
 
             // ================================================================
-            // Global orchestration detection (Phase 4: GlobalOrchestrator path)
+            // Phase 5: Named-domain global pipeline runner
             // ================================================================
-            // When multi-rank PP or global/node-local TP is requested, the
-            // GlobalOrchestratorRunner should be used instead of OrchestrationRunner.
-            //
-            // Currently this is a detection + log hook. Automatic topology
-            // construction from OrchestrationConfig requires the model layer
-            // count (only known after model loading), which creates a circular
-            // dependency with the current factory flow. Full activation is
-            // Phase 7 work (parity tests provide explicit topologies).
+            // When the config has named domains with PP stages that span
+            // multiple MPI ranks, use NamedDomainGlobalRunner.  This supports
+            // scope=node_local, scope=global, and AUTO domains whose device
+            // list spans multiple hostnames.
+            if (NamedDomainGlobalRunner::shouldUse(config))
+            {
+                LOG_INFO("Named-domain global PP configuration detected — using NamedDomainGlobalRunner");
+                auto runner_plan_builder = createExecutionPlanBuilder();
+                return std::make_unique<NamedDomainGlobalRunner>(
+                    std::move(config),
+                    std::move(runner_plan_builder));
+            }
+
+            // Global orchestration detection (legacy path — simple --pp-degree mode)
             {
                 auto mpi_ctx = MPIContextFactory::global();
                 int world_size = mpi_ctx->world_size();
@@ -191,8 +198,8 @@ namespace llaminar2
                              << "world_size=" << world_size
                              << ", pp_degree=" << config.pp_degree
                              << ", tp_scope=" << tpScopeToString(config.tp_scope) << ")");
-                    LOG_INFO("Note: Automatic GlobalOrchestratorRunner creation "
-                             "requires model context. Using standard path for now.");
+                    LOG_INFO("Note: Non-named-domain global orchestration is not yet supported. "
+                             "Use --define-domain + --pp-stage with scope=node_local or scope=global.");
                 }
             }
 

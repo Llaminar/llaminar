@@ -18,6 +18,7 @@
 #pragma once
 
 #include "../../backends/GlobalDeviceAddress.h"
+#include "../../config/CollectiveBackendType.h"
 #include <string>
 #include <vector>
 
@@ -112,6 +113,7 @@ namespace llaminar2
     struct GlobalPPStageSpec
     {
         int stage_id = -1; ///< 0-indexed stage number in the pipeline
+        std::string domain_name; ///< Optional named execution domain for this stage
 
         // =====================================================================
         // Layer assignment
@@ -133,12 +135,14 @@ namespace llaminar2
         InnerParallelism inner_mode = InnerParallelism::SINGLE_DEVICE;
         std::vector<GlobalDeviceAddress> devices; ///< Devices for this stage
         std::vector<float> tp_weights;            ///< Proportional weights (heterogeneous LocalTP)
+        CollectiveBackendType backend = CollectiveBackendType::AUTO; ///< Domain-preferred collective backend
 
         // =====================================================================
         // Global TP config (multi-rank stages only)
         // =====================================================================
         std::vector<int> participating_ranks;     ///< Which MPI ranks participate (sorted)
         GlobalDeviceAddress per_rank_device;       ///< Device to use on each rank (e.g., cpu:0)
+        std::vector<GlobalDeviceAddress> per_rank_devices; ///< Optional device per participating_ranks entry
 
         // =====================================================================
         // Helpers
@@ -174,6 +178,29 @@ namespace llaminar2
         std::vector<std::string> validate() const;
     };
 
+    /**
+     * @brief Kind of transfer between adjacent Global PP stages
+     */
+    enum class GlobalPPTransferKind
+    {
+        MPI,           ///< Activation moves between MPI ranks
+        LOCAL_HANDOFF, ///< Activation is handed off between local stage/domain runners
+    };
+
+    /** @brief Convert GlobalPPTransferKind to string */
+    inline const char *globalPPTransferKindName(GlobalPPTransferKind kind)
+    {
+        switch (kind)
+        {
+        case GlobalPPTransferKind::MPI:
+            return "MPI";
+        case GlobalPPTransferKind::LOCAL_HANDOFF:
+            return "LOCAL_HANDOFF";
+        default:
+            return "UNKNOWN";
+        }
+    }
+
     // =========================================================================
     // GlobalPPTransfer
     // =========================================================================
@@ -181,20 +208,25 @@ namespace llaminar2
     /**
      * @brief Describes a transfer of activations between two adjacent Global PP stages
      *
-     * Derived automatically from the stage specifications. Each transfer has a
-     * unique sender rank and receiver rank, identified by MPI tag.
+     * Derived automatically from the stage specifications. MPI transfers have
+     * distinct sender/receiver ranks; local handoffs explicitly represent a
+     * same-rank activation handoff between adjacent stage/domain runners.
      */
     struct GlobalPPTransfer
     {
+        GlobalPPTransferKind kind = GlobalPPTransferKind::MPI; ///< Transfer mechanism
         int from_stage = -1;     ///< Source stage ID
         int to_stage = -1;       ///< Destination stage ID
-        int sender_rank = -1;    ///< MPI rank that sends
-        int receiver_rank = -1;  ///< MPI rank that receives (-1 if global TP → same set)
+        int sender_rank = -1;    ///< MPI rank that sends, or local handoff rank
+        int receiver_rank = -1;  ///< MPI rank that receives, or local handoff rank
         int mpi_tag = 0;         ///< Unique MPI tag for this transfer
         TransferLocality locality = TransferLocality::UNKNOWN; ///< Physical locality of this transfer
 
-        /** @brief Check if this transfer is a no-op (both ranks are the same) */
-        bool isNoop() const { return sender_rank == receiver_rank; }
+        /** @brief Check if this transfer is a legacy MPI no-op */
+        bool isNoop() const { return kind == GlobalPPTransferKind::MPI && sender_rank == receiver_rank; }
+
+        /** @brief Check if this transfer is a local handoff */
+        bool isLocalHandoff() const { return kind == GlobalPPTransferKind::LOCAL_HANDOFF; }
     };
 
     // =========================================================================

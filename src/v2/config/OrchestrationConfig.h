@@ -110,12 +110,14 @@ namespace llaminar2
     /**
      * @brief Named domain definition for complex TP configurations
      *
-     * Format: "name=device1,device2,...[;weights=w1,w2,...][;backend=type]"
+     * Format: "name=device1,device2,...[;weights=w1,w2,...][;backend=type][;scope=local|node_local|global][;owner=N][;ranks=0,1,...]"
      *
      * Examples:
      *   "gpu_tp=cuda:0,cuda:1" -> Equal split across 2 CUDA GPUs
      *   "mixed=cuda:0,rocm:0;weights=0.73,0.27" -> Proportional split
      *   "fast=cuda:0,cuda:1;backend=nccl" -> Force NCCL backend
+     *   "rocm_socket0=0:rocm:0,0:rocm:1;scope=local;backend=rccl;owner=0" -> Local TP, rank 0
+     *   "cpu_sockets=0:cpu:0,1:cpu:0;scope=node_local;backend=upi;ranks=0,1" -> Node-local TP
      */
     struct DomainDefinition
     {
@@ -123,6 +125,11 @@ namespace llaminar2
         std::vector<GlobalDeviceAddress> devices; ///< Devices in this domain
         std::vector<float> weights;               ///< Optional: proportional weights (must sum to 1.0)
         CollectiveBackendType backend = CollectiveBackendType::AUTO;
+
+        // Phase 5: domain scope and rank ownership
+        TPScope scope = TPScope::AUTO;     ///< Domain scope (local=single-rank, node_local/global=multi-rank)
+        std::optional<int> owner_rank;     ///< Explicit owner MPI rank for local domains (;owner=N)
+        std::vector<int> explicit_ranks;   ///< Explicit participating ranks for node_local/global (;ranks=0,1,...)
 
         /**
          * @brief Parse domain definition from string
