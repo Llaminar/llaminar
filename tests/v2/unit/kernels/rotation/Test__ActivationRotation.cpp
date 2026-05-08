@@ -19,9 +19,13 @@
  */
 
 #include <gtest/gtest.h>
+#include <algorithm>
 #include <cmath>
-#include <random>
+#include <cstdint>
+#include <limits>
 #include <numeric>
+#include <random>
+#include <vector>
 
 #include "kernels/cpu/rotation/ActivationRotation.h"
 #include "kernels/cpu/rotation/ModelWeightRotation.h"
@@ -30,6 +34,183 @@
 
 using namespace llaminar2;
 using namespace llaminar2::test;
+
+namespace
+{
+    struct RotationQuantMetrics
+    {
+        uint64_t seed = 0;
+        double mse = 0.0;
+        double cosine = 0.0;
+        double rotated_kurtosis = 0.0;
+        double rotated_max_over_std = 0.0;
+    };
+
+    static void quantizeDequantizeQ8_1Like(std::vector<float> &data)
+    {
+        constexpr int q_block = 32;
+        for (size_t base = 0; base < data.size(); base += q_block)
+        {
+            const size_t end = std::min(base + q_block, data.size());
+            float amax = 0.0f;
+            for (size_t i = base; i < end; ++i)
+                amax = std::max(amax, std::fabs(data[i]));
+
+            if (amax <= 1e-20f)
+                continue;
+
+            const float scale = amax / 127.0f;
+            for (size_t i = base; i < end; ++i)
+            {
+                int q = static_cast<int>(std::nearbyint(data[i] / scale));
+                q = std::max(-128, std::min(127, q));
+                data[i] = static_cast<float>(q) * scale;
+            }
+        }
+    }
+
+    static double computeMSE(const std::vector<float> &a, const std::vector<float> &b)
+    {
+        double sum = 0.0;
+        for (size_t i = 0; i < a.size(); ++i)
+        {
+            const double d = static_cast<double>(a[i]) - static_cast<double>(b[i]);
+            sum += d * d;
+        }
+        return sum / static_cast<double>(a.size());
+    }
+
+    static double computeCosine(const std::vector<float> &a, const std::vector<float> &b)
+    {
+        double dot = 0.0;
+        double na = 0.0;
+        double nb = 0.0;
+        for (size_t i = 0; i < a.size(); ++i)
+        {
+            const double av = a[i];
+            const double bv = b[i];
+            dot += av * bv;
+            na += av * av;
+            nb += bv * bv;
+        }
+        if (na <= 1e-30 || nb <= 1e-30)
+            return 0.0;
+        return dot / std::sqrt(na * nb);
+    }
+
+    static double computeExcessKurtosis(const std::vector<float> &x)
+    {
+        double mean = 0.0;
+        for (float v : x)
+            mean += v;
+        mean /= static_cast<double>(x.size());
+
+        double m2 = 0.0;
+        double m4 = 0.0;
+        for (float v : x)
+        {
+            const double d = static_cast<double>(v) - mean;
+            const double d2 = d * d;
+            m2 += d2;
+            m4 += d2 * d2;
+        }
+        m2 /= static_cast<double>(x.size());
+        m4 /= static_cast<double>(x.size());
+        if (m2 <= 1e-30)
+            return 0.0;
+        return m4 / (m2 * m2) - 3.0;
+    }
+
+    static double computeMaxOverStd(const std::vector<float> &x)
+    {
+        double mean = 0.0;
+        double amax = 0.0;
+        for (float v : x)
+        {
+            mean += v;
+            amax = std::max(amax, std::fabs(static_cast<double>(v)));
+        }
+        mean /= static_cast<double>(x.size());
+
+        double var = 0.0;
+        for (float v : x)
+        {
+            const double d = static_cast<double>(v) - mean;
+            var += d * d;
+        }
+        var /= static_cast<double>(x.size());
+        const double stddev = std::sqrt(var);
+        if (stddev <= 1e-30)
+            return 0.0;
+        return amax / stddev;
+    }
+
+    static RotationQuantMetrics evaluateQ8RoundTripWithSeed(
+        const std::vector<float> &activations,
+        int rows,
+        int dim,
+        int block_dim,
+        uint64_t seed)
+    {
+        ActivationRotation rot(dim, block_dim, seed);
+
+        std::vector<float> rotated = activations;
+        rot.rotate_rows_inplace(rotated.data(), rows, dim);
+
+        std::vector<float> reconstructed = rotated;
+        quantizeDequantizeQ8_1Like(reconstructed);
+        rot.inverse_rotate_rows_inplace(reconstructed.data(), rows, dim);
+
+        RotationQuantMetrics metrics;
+        metrics.seed = seed;
+        metrics.mse = computeMSE(activations, reconstructed);
+        metrics.cosine = computeCosine(activations, reconstructed);
+        metrics.rotated_kurtosis = computeExcessKurtosis(rotated);
+        metrics.rotated_max_over_std = computeMaxOverStd(rotated);
+        return metrics;
+    }
+
+    static std::vector<float> makeDefaultSeedStressActivations(
+        int rows,
+        int dim,
+        int block_dim,
+        float peak_scale)
+    {
+        // Build a corpus whose default-seed rotated representation has large
+        // per-Q8-block peaks plus many small values. This models the failure mode
+        // we care about: one outlier dominates a block scale and wastes int8
+        // dynamic range. A calibration pass can choose a different Hadamard sign
+        // seed that spreads those peaks more evenly at unchanged runtime cost.
+        const uint64_t current_seed = 31;
+        ActivationRotation current(dim, block_dim, current_seed);
+        std::vector<float> rotated(rows * dim, 0.0f);
+
+        for (int r = 0; r < rows; ++r)
+        {
+            const float row_scale = peak_scale * (1.0f + 0.013f * static_cast<float>(r % 11));
+            for (int k = 0; k < dim; ++k)
+            {
+                const float phase = static_cast<float>((r + 1) * (k + 3));
+                rotated[static_cast<size_t>(r) * dim + k] =
+                    0.23f * std::sin(0.017f * phase) +
+                    0.11f * std::cos(0.031f * phase);
+            }
+
+            for (int block = 0; block < dim; block += block_dim)
+            {
+                const int offsets[] = {0, 32, 64, 96};
+                const float amps[] = {1.00f, -0.86f, 0.73f, -0.61f};
+                for (int i = 0; i < 4; ++i)
+                    rotated[static_cast<size_t>(r) * dim + block + offsets[i]] +=
+                        row_scale * amps[i];
+            }
+        }
+
+        std::vector<float> activations = rotated;
+        current.inverse_rotate_rows_inplace(activations.data(), rows, dim);
+        return activations;
+    }
+}
 
 // ============================================================================
 // ActivationRotation Basic Tests
@@ -181,6 +362,78 @@ TEST(Test__ActivationRotation, RotationReducesKurtosis)
 
     EXPECT_LT(kurtosis_after, kurtosis_before)
         << "Rotation should reduce kurtosis of spiky vectors";
+}
+
+TEST(Test__ActivationRotation, CalibrationSelectedHadamardSeedImprovesQ8RoundTrip)
+{
+    // Exploratory proof-of-concept for calibration-selected Hadamard sign seeds.
+    //
+    // Current production rotation uses seed=31. The runtime cost of a different
+    // seed is identical: the same FWHT is used, only the deterministic sign mask
+    // changes. This test simulates an offline calibration pass that scores a
+    // small seed bank on calibration activations, then checks whether the chosen
+    // seed improves held-out Q8_1-style activation round-trip quality.
+    const int rows = 64;
+    const int dim = 512;
+    const int block_dim = 128;
+    const uint64_t current_seed = 31;
+
+    const auto calibration = makeDefaultSeedStressActivations(rows, dim, block_dim, 72.0f);
+    const auto heldout = makeDefaultSeedStressActivations(rows, dim, block_dim, 84.0f);
+
+    const auto current_cal = evaluateQ8RoundTripWithSeed(
+        calibration, rows, dim, block_dim, current_seed);
+    const auto current_heldout = evaluateQ8RoundTripWithSeed(
+        heldout, rows, dim, block_dim, current_seed);
+
+    RotationQuantMetrics best_cal;
+    best_cal.mse = std::numeric_limits<double>::infinity();
+
+    for (uint64_t seed = 1; seed <= 128; ++seed)
+    {
+        const auto candidate = evaluateQ8RoundTripWithSeed(
+            calibration, rows, dim, block_dim, seed);
+        if (candidate.mse < best_cal.mse)
+            best_cal = candidate;
+    }
+
+    const auto selected_heldout = evaluateQ8RoundTripWithSeed(
+        heldout, rows, dim, block_dim, best_cal.seed);
+
+    const double cal_mse_gain =
+        (current_cal.mse - best_cal.mse) / current_cal.mse;
+    const double heldout_mse_gain =
+        (current_heldout.mse - selected_heldout.mse) / current_heldout.mse;
+    const double heldout_papr_gain =
+        (current_heldout.rotated_max_over_std - selected_heldout.rotated_max_over_std) /
+        current_heldout.rotated_max_over_std;
+
+    LOG_INFO("[SelectedHadamardSeed] current_seed=" << current_seed
+                                                    << " selected_seed=" << best_cal.seed);
+    LOG_INFO("[SelectedHadamardSeed] calibration_mse current=" << current_cal.mse
+                                                               << " selected=" << best_cal.mse
+                                                               << " gain=" << (100.0 * cal_mse_gain) << "%");
+    LOG_INFO("[SelectedHadamardSeed] heldout_mse current=" << current_heldout.mse
+                                                           << " selected=" << selected_heldout.mse
+                                                           << " gain=" << (100.0 * heldout_mse_gain) << "%");
+    LOG_INFO("[SelectedHadamardSeed] heldout_cosine current=" << current_heldout.cosine
+                                                              << " selected=" << selected_heldout.cosine);
+    LOG_INFO("[SelectedHadamardSeed] heldout_max/std current="
+             << current_heldout.rotated_max_over_std
+             << " selected=" << selected_heldout.rotated_max_over_std
+             << " gain=" << (100.0 * heldout_papr_gain) << "%");
+
+    EXPECT_NE(best_cal.seed, current_seed)
+        << "The calibration sweep should find a non-default sign mask on this stress corpus";
+    EXPECT_LT(best_cal.mse, current_cal.mse * 0.80)
+        << "Selected seed should materially reduce calibration Q8_1 round-trip MSE";
+    EXPECT_LT(selected_heldout.mse, current_heldout.mse * 0.90)
+        << "Calibration-selected seed should generalize to held-out activations";
+    EXPECT_GT(selected_heldout.cosine, current_heldout.cosine)
+        << "Selected seed should improve held-out cosine similarity";
+    EXPECT_LT(selected_heldout.rotated_max_over_std,
+              current_heldout.rotated_max_over_std * 0.90)
+        << "Selected seed should lower held-out peak-to-std ratio in rotated space";
 }
 
 // ============================================================================
