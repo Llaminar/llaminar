@@ -190,6 +190,13 @@ namespace llaminar2
                 const float *d_bias,
                 int rocm_device_id, void *stream);
 
+            bool rocmQuantGemm_applyFp32Epilogue(
+                float *d_output,
+                const float *d_bias,
+                int M, int N,
+                float alpha,
+                int rocm_device_id, void *stream);
+
             // In-place bias addition: output[m,n] += bias[n] (common .hip)
             bool rocmQuantGemm_biasAdd(
                 float *d_output,     // [M × N] FP32 output (modified in-place)
@@ -1062,7 +1069,7 @@ namespace llaminar2
             impl_->rocm_device_id = rocm_device_id;
 
             LOG_DEBUG("[ROCmQuantisedGemmKernel] Created (MoE batch device ptrs) for " << N_ << "x" << K_
-                                                                                        << " on ROCm device " << rocm_device_id_);
+                                                                                       << " on ROCm device " << rocm_device_id_);
         }
 
         ROCmQuantisedGemmKernel::~ROCmQuantisedGemmKernel() = default;
@@ -1111,7 +1118,8 @@ namespace llaminar2
             }
 
             LOG_WARN("[ROCmQuantisedGemmKernel] No viable prefill dispatch path:"
-                     " has_native_vnni=" << impl_->has_native_vnni
+                     " has_native_vnni="
+                     << impl_->has_native_vnni
                      << " d_weights_int8_vnni=" << (const void *)impl_->d_weights_int8_vnni
                      << " M=" << m << " N=" << n << " K=" << k);
             return PrefillDispatchPath::UNSUPPORTED;
@@ -1228,13 +1236,14 @@ namespace llaminar2
                 (!d_scales_B && !native_vnni_available))
             {
                 LOG_WARN("[" << callsite << "] Prefill GEMM null pointer diagnostic:"
-                         " impl=" << (const void *)impl_.get()
-                         << " d_A_int8=" << (const void *)d_A_int8
-                         << " d_output=" << (const void *)d_output
-                         << " d_scales_A=" << (const void *)d_scales_A
-                         << " d_scales_B=" << (const void *)d_scales_B
-                         << " scratch=" << (const void *)effective_scratch_int32
-                         << " workspace=" << (const void *)workspace_);
+                                            " impl="
+                             << (const void *)impl_.get()
+                             << " d_A_int8=" << (const void *)d_A_int8
+                             << " d_output=" << (const void *)d_output
+                             << " d_scales_A=" << (const void *)d_scales_A
+                             << " d_scales_B=" << (const void *)d_scales_B
+                             << " scratch=" << (const void *)effective_scratch_int32
+                             << " workspace=" << (const void *)workspace_);
                 logFallback("buffers");
                 return false;
             }
@@ -1259,11 +1268,19 @@ namespace llaminar2
                 LOG_TRACE("[" << callsite << "] Trying native-VNNI prefill (M=" << m
                               << " N=" << n << " K=" << k << ")");
 
+                if (beta != 0.0f)
+                {
+                    LOG_WARN("[" << callsite << "] Native-VNNI prefill does not support beta != 0");
+                    logFallback("native_beta");
+                    return false;
+                }
+
                 if (!impl_->d_weights_native_vnni || !impl_->d_weights_native_scales)
                 {
                     LOG_WARN("[" << callsite << "] Native-VNNI prefill missing weight buffers:"
-                             " d_weights_native_vnni=" << (const void *)impl_->d_weights_native_vnni
-                             << " d_weights_native_scales=" << (const void *)impl_->d_weights_native_scales);
+                                                " d_weights_native_vnni="
+                                 << (const void *)impl_->d_weights_native_vnni
+                                 << " d_weights_native_scales=" << (const void *)impl_->d_weights_native_scales);
                     logFallback("buffers");
                     return false;
                 }
@@ -1297,17 +1314,18 @@ namespace llaminar2
                         std::chrono::duration<double, std::milli>(kernel_end - kernel_start).count());
                 }
 
-                if (d_bias)
+                if (alpha != 1.0f || d_bias)
                 {
                     std::chrono::high_resolution_clock::time_point epilogue_start{};
                     if (profiling_enabled)
                         epilogue_start = std::chrono::high_resolution_clock::now();
 
-                    if (!rocmQuantGemm_biasAdd(
+                    if (!rocmQuantGemm_applyFp32Epilogue(
                             d_output,
                             d_bias,
                             m,
                             n,
+                            alpha,
                             rocm_device_id_,
                             effective_stream))
                     {
@@ -2083,7 +2101,7 @@ namespace llaminar2
                     // d_scales_B is only used by the INT8-VNNI path, not native-VNNI.
                     // Native-VNNI weights use impl_->d_weights_native_scales instead.
                     if (d_scales_B && !validatePointerDeviceOrLog(
-                            d_scales_B, rocm_device_id_, "d_scales_B", "ROCmQuantisedGemmKernel::multiply_tensor"))
+                                          d_scales_B, rocm_device_id_, "d_scales_B", "ROCmQuantisedGemmKernel::multiply_tensor"))
                     {
                         return false;
                     }
@@ -2099,9 +2117,9 @@ namespace llaminar2
 
                     // =====================================================================
                     // Native-VNNI path: lossless Q4/IQ4 decode, FP16 block scales, scale_A inline
-                    // Output is final FP32 — no epilogue kernel needed.
+                    // Native GEMV produces FP32, then applies alpha/bias with the shared epilogue when needed.
                     // =====================================================================
-                    if (impl_->has_native_vnni && alpha == 1.0f && beta == 0.0f)
+                    if (impl_->has_native_vnni && beta == 0.0f)
                     {
                         if (!rocmQuantGemm_quantizeActivationsBlockwise(
                                 d_input, impl_->d_A_int8, impl_->d_scales_A_blockwise, m, k, rocm_device_id_, gpu_stream_))
@@ -2128,11 +2146,18 @@ namespace llaminar2
                             return false;
                         }
 
-                        if (d_bias)
+                        if (alpha != 1.0f || d_bias)
                         {
-                            if (!rocmQuantGemm_biasAdd(d_gemv_output, d_bias, m, n, rocm_device_id_, gpu_stream_))
+                            if (!rocmQuantGemm_applyFp32Epilogue(
+                                    d_gemv_output,
+                                    d_bias,
+                                    m,
+                                    n,
+                                    alpha,
+                                    rocm_device_id_,
+                                    gpu_stream_))
                             {
-                                LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] Native-VNNI bias add failed");
+                                LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] Native-VNNI epilogue failed");
                                 return false;
                             }
                         }
@@ -2179,17 +2204,23 @@ namespace llaminar2
                             LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] INT8 scatter GEMV failed");
                             return false;
                         }
+
+                        // Bulk DMA from HBM workspace to output
+                        if (gemv_output_needs_copyout)
+                        {
+                            hipMemcpyAsync(d_output, impl_->d_C_fp32,
+                                           static_cast<size_t>(n) * sizeof(float),
+                                           hipMemcpyDeviceToDevice,
+                                           static_cast<hipStream_t>(gpu_stream_));
+                        }
+                        return true;
                     }
 
-                    // Bulk DMA from HBM workspace to output
-                    if (gemv_output_needs_copyout)
-                    {
-                        hipMemcpyAsync(d_output, impl_->d_C_fp32,
-                                       static_cast<size_t>(n) * sizeof(float),
-                                       hipMemcpyDeviceToDevice,
-                                       static_cast<hipStream_t>(gpu_stream_));
-                    }
-                    return true;
+                    LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] M=1 decode has no supported GEMV path for alpha="
+                              << alpha << " beta=" << beta
+                              << " native_vnni=" << (impl_->has_native_vnni ? "true" : "false")
+                              << " int8_vnni=" << (d_weights_vnni ? "true" : "false"));
+                    return false;
                 }
                 // No VNNI weight pointers available for M=1 decode — this should
                 // not happen unless weights failed to upload.
@@ -2242,7 +2273,7 @@ namespace llaminar2
             }
 
             if (d_scales_B && !validatePointerDeviceOrLog(
-                    d_scales_B, rocm_device_id_, "d_scales_B", "ROCmQuantisedGemmKernel::multiply_tensor"))
+                                  d_scales_B, rocm_device_id_, "d_scales_B", "ROCmQuantisedGemmKernel::multiply_tensor"))
             {
                 return false;
             }
@@ -2773,14 +2804,14 @@ namespace llaminar2
                         if (!d_scales_B && !(rocm_kernel->impl_ && rocm_kernel->impl_->has_native_vnni))
                         {
                             LOG_WARN("[ConcurrentPrefill] Projection " << pi
-                                     << " (" << (proj.name ? proj.name : "?")
-                                     << ") d_scales_B=0 — packed_=" << (const void *)rocm_kernel->packed_
-                                     << " packed_->d_scales=" << (rocm_kernel->packed_ ? (const void *)rocm_kernel->packed_->d_scales : nullptr)
-                                     << " impl_=" << (const void *)rocm_kernel->impl_.get()
-                                     << " impl_->d_scales_B=" << (rocm_kernel->impl_ ? (const void *)rocm_kernel->impl_->d_scales_B : nullptr)
-                                     << " weights_converted=" << rocm_kernel->weights_converted_
-                                     << " N=" << rocm_kernel->N_ << " K=" << rocm_kernel->K_
-                                     << " device=" << rocm_kernel->rocm_device_id_);
+                                                                       << " (" << (proj.name ? proj.name : "?")
+                                                                       << ") d_scales_B=0 — packed_=" << (const void *)rocm_kernel->packed_
+                                                                       << " packed_->d_scales=" << (rocm_kernel->packed_ ? (const void *)rocm_kernel->packed_->d_scales : nullptr)
+                                                                       << " impl_=" << (const void *)rocm_kernel->impl_.get()
+                                                                       << " impl_->d_scales_B=" << (rocm_kernel->impl_ ? (const void *)rocm_kernel->impl_->d_scales_B : nullptr)
+                                                                       << " weights_converted=" << rocm_kernel->weights_converted_
+                                                                       << " N=" << rocm_kernel->N_ << " K=" << rocm_kernel->K_
+                                                                       << " device=" << rocm_kernel->rocm_device_id_);
                         }
                         const float *d_bias = nullptr;
                         if (proj.bias)
@@ -4471,8 +4502,8 @@ namespace llaminar2
 
                     validateWorkspace();
 
-                    // Native-VNNI path: lossless Q4/IQ4 decode, FP16 block scales, scale_A inline
-                    if (impl_->has_native_vnni && alpha == 1.0f && beta == 0.0f)
+                    // Native-VNNI path: lossless Q4/IQ4 decode, FP16 block scales, then optional alpha/bias epilogue.
+                    if (impl_->has_native_vnni && beta == 0.0f)
                     {
                         if (!rocmQuantGemm_quantizeActivationsBlockwise(
                                 d_A, impl_->d_A_int8, impl_->d_scales_A_blockwise, m, k, rocm_device_id_, gpu_stream_))
@@ -4499,11 +4530,18 @@ namespace llaminar2
                             return false;
                         }
 
-                        if (d_bias)
+                        if (alpha != 1.0f || d_bias)
                         {
-                            if (!rocmQuantGemm_biasAdd(d_C, d_bias, m, n, rocm_device_id_, gpu_stream_))
+                            if (!rocmQuantGemm_applyFp32Epilogue(
+                                    d_C,
+                                    d_bias,
+                                    m,
+                                    n,
+                                    alpha,
+                                    rocm_device_id_,
+                                    gpu_stream_))
                             {
-                                LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32_with_bias] Native-VNNI bias add failed");
+                                LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32_with_bias] Native-VNNI epilogue failed");
                                 return false;
                             }
                         }

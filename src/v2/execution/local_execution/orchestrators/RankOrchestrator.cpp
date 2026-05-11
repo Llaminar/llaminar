@@ -712,6 +712,7 @@ namespace llaminar2
                                                  runner_config.kv_cache_precision = config_.kv_cache_precision;
                                                  runner_config.use_mapped_memory = config_.use_mapped_memory;
                                                  runner_config.prepared_weight_store = config_.prepared_weight_store;
+                                                 runner_config.moe_expert_parallel_plan = config_.moe_expert_parallel_plan;
 
                                                  // Set TP parameters (LOCAL TP context here)
                                                  runner_config.tp_ctx = tp_ctx_.get();
@@ -968,6 +969,7 @@ namespace llaminar2
             runner_config.kv_cache_precision = config_.kv_cache_precision;
             runner_config.use_mapped_memory = config_.use_mapped_memory;
             runner_config.prepared_weight_store = config_.prepared_weight_store;
+            runner_config.moe_expert_parallel_plan = config_.moe_expert_parallel_plan;
 
             // =====================================================================
             // Build FactoryPPStageConfig for the createPPStageRunner factory
@@ -1003,6 +1005,7 @@ namespace llaminar2
                 nested_config.kv_cache_precision = config_.kv_cache_precision;
                 nested_config.use_mapped_memory = config_.use_mapped_memory;
                 nested_config.prepared_weight_store = config_.prepared_weight_store;
+                nested_config.moe_expert_parallel_plan = config_.moe_expert_parallel_plan;
 
                 // CRITICAL: Pass PP stage config to nested TP MDO so its DeviceGraphOrchestrators
                 // build partial graphs instead of full graphs. Without this, the TP devices would

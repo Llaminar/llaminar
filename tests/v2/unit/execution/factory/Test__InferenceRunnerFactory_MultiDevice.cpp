@@ -16,8 +16,12 @@
 #include "execution/local_execution/orchestrators/RankOrchestrator.h"
 #include "execution/local_execution/orchestrators/DeviceGraphOrchestrator.h"
 #include "execution/local_execution/orchestrators/IRankOrchestrator.h"
+#include "execution/moe/MoEExpertOverlayLocalTPExecutor.h"
+#include "execution/moe/MoEExpertOverlayRuntimePlan.h"
+#include "execution/moe/MoEExpertParallelPlanner.h"
 #include "collective/ILocalTPContext.h"
 #include "backends/GlobalDeviceAddress.h"
+#include "models/GraphTypes.h"
 #include "mocks/MockModelContext.h"
 
 using namespace llaminar2;
@@ -139,6 +143,118 @@ namespace
         std::vector<float> weights_;
     };
 
+    constexpr int kMoELayers = 3;
+    constexpr int kMoEExperts = 6;
+    constexpr int kMoEDModel = 16;
+    constexpr int kMoEIntermediate = 8;
+    constexpr size_t kF32RoutedExpertBytes =
+        3u * static_cast<size_t>(kMoEDModel) * static_cast<size_t>(kMoEIntermediate) * sizeof(float);
+
+    std::shared_ptr<MockModelContext> makeMoEModelContext()
+    {
+        auto model_ctx = MockModelContextBuilder()
+                             .setArchitecture("qwen3moe")
+                             .setBlockCount(kMoELayers)
+                             .setEmbeddingLength(kMoEDModel)
+                             .setHeadCount(4)
+                             .setHeadCountKV(2)
+                             .setVocabSize(128)
+                             .setContextLength(256)
+                             .setFeedForwardLength(kMoEIntermediate)
+                             .build();
+
+        model_ctx->mockLoader().setIntParam("qwen3moe.expert_count", kMoEExperts);
+        model_ctx->mockLoader().setIntParam("qwen3moe.expert_feed_forward_length", kMoEIntermediate);
+        model_ctx->mockLoader().setIntParam("qwen3moe.expert_shared_count", 1);
+        return model_ctx;
+    }
+
+    ExpertComputeDomain overlayDomain(
+        const std::string &name,
+        GlobalDeviceAddress participant)
+    {
+        ExpertComputeDomain domain;
+        domain.name = name;
+        domain.kind = ExpertDomainKind::SingleDevice;
+        domain.backend = CollectiveBackendType::AUTO;
+        domain.participants = {std::move(participant)};
+        domain.compute_kind = ExpertDomainComputeKind::ReplicatedExperts;
+        return domain;
+    }
+
+    ExpertRoutedTier overlayTier(
+        const std::string &name,
+        const std::string &domain,
+        int priority,
+        bool fallback = false)
+    {
+        ExpertRoutedTier tier;
+        tier.name = name;
+        tier.domain = domain;
+        tier.priority = priority;
+        tier.fallback = fallback;
+        return tier;
+    }
+
+    std::shared_ptr<MoEExpertParallelPlan> makeRequestedOverlayPlan(
+        ExpertResidencyPolicy policy = ExpertResidencyPolicy::StaticById)
+    {
+        auto plan = std::make_shared<MoEExpertParallelPlan>();
+        plan->enabled = true;
+        plan->execution_kind = MoEExpertExecutionKind::TieredExpertOverlay;
+        plan->continuation_domain = "gpu_hot";
+        plan->shared_expert_domain = "gpu_hot";
+        plan->residency_policy = policy;
+        plan->domains = {
+            overlayDomain("gpu_hot", GlobalDeviceAddress::cuda(0)),
+            overlayDomain("cpu_cold", GlobalDeviceAddress::cpu()),
+        };
+        plan->routed_tiers = {
+            overlayTier("hot", "gpu_hot", 0),
+            overlayTier("cold", "cpu_cold", 1, true),
+        };
+        plan->routed_tiers[0].max_experts_per_layer = kMoEExperts;
+        plan->routed_tiers[0].memory_budget_bytes = 2u * kF32RoutedExpertBytes;
+        return plan;
+    }
+
+    std::shared_ptr<MoEExpertParallelPlan> makeActiveRocmLocalTPOverlayPlan()
+    {
+        auto plan = std::make_shared<MoEExpertParallelPlan>();
+        plan->enabled = true;
+        plan->execution_kind = MoEExpertExecutionKind::TieredExpertOverlay;
+        plan->continuation_domain = "rocm_hot";
+        plan->shared_expert_domain = "rocm_hot";
+        plan->residency_policy = ExpertResidencyPolicy::ExplicitMasks;
+
+        ExpertComputeDomain rocm_hot;
+        rocm_hot.name = "rocm_hot";
+        rocm_hot.kind = ExpertDomainKind::LocalTP;
+        rocm_hot.backend = CollectiveBackendType::RCCL;
+        rocm_hot.compute_kind = ExpertDomainComputeKind::TensorParallelExperts;
+        rocm_hot.participants = {
+            GlobalDeviceAddress::rocm(0),
+            GlobalDeviceAddress::rocm(1),
+        };
+
+        ExpertComputeDomain cpu_cold;
+        cpu_cold.name = "cpu_cold";
+        cpu_cold.kind = ExpertDomainKind::NodeLocalTP;
+        cpu_cold.backend = CollectiveBackendType::HOST;
+        cpu_cold.compute_kind = ExpertDomainComputeKind::ReplicatedExperts;
+        cpu_cold.participants = {GlobalDeviceAddress::cpu()};
+
+        plan->domains = {rocm_hot, cpu_cold};
+        plan->routed_tiers = {
+            overlayTier("hot", "rocm_hot", 0),
+            overlayTier("cold", "cpu_cold", 1, true),
+        };
+        plan->placements = {
+            ExpertLayerPlacement{.layer = 0, .routed_expert_tier = {0, 0, 1, 1, 1, 1}},
+        };
+        return plan;
+    }
+
     // =============================================================================
     // Test Fixture
     // =============================================================================
@@ -237,6 +353,124 @@ namespace
         auto result = createTestableRankOrchestrator(
             model_ctx_, std::move(empty_runners), nullptr, config);
         EXPECT_EQ(result, nullptr);
+    }
+
+    TEST(Test__InferenceRunnerFactory_MoEOverlayPlanning, PlansMissingPlacementsFromModelMetadata)
+    {
+        auto model_ctx = makeMoEModelContext();
+        auto requested_plan = makeRequestedOverlayPlan();
+
+        InferenceRunnerConfig config;
+        config.moe_expert_parallel_plan = requested_plan;
+
+        auto resolved_plan = resolveMoEExpertParallelPlanForModel(*model_ctx, config);
+
+        ASSERT_NE(resolved_plan, nullptr);
+        EXPECT_NE(resolved_plan.get(), requested_plan.get());
+        EXPECT_TRUE(requested_plan->placements.empty());
+        ASSERT_EQ(resolved_plan->placements.size(), static_cast<size_t>(kMoELayers));
+        for (int layer = 0; layer < kMoELayers; ++layer)
+        {
+            const auto &placement = resolved_plan->placements[static_cast<size_t>(layer)];
+            EXPECT_EQ(placement.layer, layer);
+            EXPECT_EQ(placement.routed_expert_tier,
+                      (std::vector<int>{0, 0, 1, 1, 1, 1}));
+        }
+        ASSERT_EQ(resolved_plan->routed_tiers.size(), 2u);
+        EXPECT_EQ(resolved_plan->routed_tiers[1].domain, "cpu_cold");
+        EXPECT_TRUE(resolved_plan->routed_tiers[1].fallback);
+    }
+
+    TEST(Test__InferenceRunnerFactory_MoEOverlayPlanning, PreservesExplicitPlacements)
+    {
+        auto model_ctx = makeMoEModelContext();
+        auto explicit_plan = makeRequestedOverlayPlan(ExpertResidencyPolicy::ExplicitMasks);
+        explicit_plan->placements = {
+            ExpertLayerPlacement{.layer = 0, .routed_expert_tier = {0, 1, 0, 1, 0, 1}},
+            ExpertLayerPlacement{.layer = 1, .routed_expert_tier = {1, 0, 1, 0, 1, 0}},
+            ExpertLayerPlacement{.layer = 2, .routed_expert_tier = {0, 0, 1, 1, 0, 1}},
+        };
+
+        InferenceRunnerConfig config;
+        config.moe_expert_parallel_plan = explicit_plan;
+
+        auto resolved_plan = resolveMoEExpertParallelPlanForModel(*model_ctx, config);
+
+        EXPECT_EQ(resolved_plan, explicit_plan);
+        ASSERT_EQ(resolved_plan->placements.size(), 3u);
+        EXPECT_EQ(resolved_plan->placements[0].routed_expert_tier,
+                  (std::vector<int>{0, 1, 0, 1, 0, 1}));
+        EXPECT_EQ(resolved_plan->placements[1].routed_expert_tier,
+                  (std::vector<int>{1, 0, 1, 0, 1, 0}));
+        EXPECT_EQ(resolved_plan->placements[2].routed_expert_tier,
+                  (std::vector<int>{0, 0, 1, 1, 0, 1}));
+    }
+
+    TEST(Test__InferenceRunnerFactory_MoEOverlayPlanning, PlanningErrorsSurfaceBeforeGraphExecution)
+    {
+        auto model_ctx = makeMoEModelContext();
+        auto invalid_plan = makeRequestedOverlayPlan(ExpertResidencyPolicy::Disabled);
+
+        InferenceRunnerConfig config;
+        config.moe_expert_parallel_plan = invalid_plan;
+
+        try
+        {
+            (void)resolveMoEExpertParallelPlanForModel(*model_ctx, config);
+            FAIL() << "Expected overlay planning to fail";
+        }
+        catch (const std::invalid_argument &e)
+        {
+            EXPECT_THAT(std::string(e.what()), HasSubstr("Disabled residency policy"));
+        }
+    }
+
+    TEST(Test__InferenceRunnerFactory_MoEOverlayPlanning, PreservesInjectedDomainTPContextForActiveRocmLocalTPTier)
+    {
+        GraphConfig graph_config;
+        graph_config.moe.expert_parallel_plan = makeActiveRocmLocalTPOverlayPlan();
+        graph_config.moe.expert_overlay_runtime_plan = resolveMoEExpertOverlayRuntimePlan(
+            graph_config.moe.expert_parallel_plan);
+
+        MockLocalTPContext injected_context(
+            {GlobalDeviceAddress::rocm(0), GlobalDeviceAddress::rocm(1)},
+            {0.5f, 0.5f});
+        graph_config.domain_tp_contexts["rocm_hot"] = &injected_context;
+
+        DomainLocalTPContextMap owned_contexts;
+        ASSERT_TRUE(populateMoEExpertOverlayDomainTPContextsForGraph(
+            graph_config, owned_contexts, "[InferenceRunnerFactoryTest]"));
+
+        EXPECT_TRUE(owned_contexts.empty());
+        ASSERT_NE(graph_config.domain_tp_contexts.find("rocm_hot"), graph_config.domain_tp_contexts.end());
+        EXPECT_EQ(graph_config.domain_tp_contexts["rocm_hot"], &injected_context);
+    }
+
+    TEST(Test__InferenceRunnerFactory_MoEOverlayPlanning, CreatesOwnedDomainTPContextForActiveRocmLocalTPTier)
+    {
+        GraphConfig graph_config;
+        graph_config.moe.expert_parallel_plan = makeActiveRocmLocalTPOverlayPlan();
+        graph_config.moe.expert_overlay_runtime_plan = resolveMoEExpertOverlayRuntimePlan(
+            graph_config.moe.expert_parallel_plan);
+
+        DomainLocalTPContextMap owned_contexts;
+        if (!populateMoEExpertOverlayDomainTPContextsForGraph(
+                graph_config, owned_contexts, "[InferenceRunnerFactoryTest]"))
+        {
+            GTEST_SKIP() << "RCCL LocalTPContext is not available on this host";
+        }
+
+        auto context_it = graph_config.domain_tp_contexts.find("rocm_hot");
+        ASSERT_NE(context_it, graph_config.domain_tp_contexts.end());
+        ASSERT_NE(context_it->second, nullptr);
+        ASSERT_EQ(owned_contexts.count("rocm_hot"), 1u);
+
+        const auto *domain = graph_config.moe.expert_overlay_runtime_plan->domainForName("rocm_hot");
+        ASSERT_NE(domain, nullptr);
+
+        std::string reason;
+        EXPECT_TRUE(MoEExpertOverlayLocalTPExecutor::canExecute(*domain, *context_it->second, &reason))
+            << reason;
     }
 
     // =============================================================================

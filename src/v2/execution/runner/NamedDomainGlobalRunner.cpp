@@ -241,6 +241,7 @@ namespace llaminar2
             base_runner_cfg.batch_size = config_.batch_size;
             base_runner_cfg.activation_precision = runtime_cfg.activation_precision;
             base_runner_cfg.kv_cache_precision = runtime_cfg.kv_cache_precision;
+            base_runner_cfg.moe_expert_parallel_plan = config_.moe_expert_parallel_plan;
 
             // Load model context once; each stage runner slices its own weight plan
             std::shared_ptr<ModelContext> model_ctx;

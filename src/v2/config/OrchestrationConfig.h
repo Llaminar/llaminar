@@ -30,6 +30,7 @@
 #include "backends/GlobalDeviceAddress.h"
 #include "CollectiveBackendType.h"
 #include "execution/config/RuntimeConfig.h" // For FusedAttentionBackend
+#include "execution/moe/MoEExpertParallelPlan.h"
 #include "execution/parallelism_tree/ParallelismTree.h"
 #include <string>
 #include <vector>
@@ -419,6 +420,9 @@ namespace llaminar2
         bool moe_shared_experts_gpu = true; ///< Place shared experts on GPU
         bool moe_sparse_experts_cpu = true; ///< Place sparse experts on CPU
 
+        /// Optional same-layer MoE expert overlay / expert-parallel plan.
+        std::shared_ptr<MoEExpertParallelPlan> moe_expert_parallel_plan;
+
         // =========================================================================
         // Precision
         // =========================================================================
@@ -474,5 +478,15 @@ namespace llaminar2
          */
         static OrchestrationConfig defaults();
     };
+
+    /**
+     * @brief Validate only the MoE expert overlay portion of an orchestration config.
+     *
+     * This is intentionally separate from OrchestrationConfig::validate() so the
+     * CLI parser can validate overlay flags after YAML+CLI merging without also
+     * rejecting legacy/incomplete non-overlay CLI combinations that older parser
+     * tests and scripts still parse successfully.
+     */
+    std::vector<std::string> validateMoEExpertOverlayConfig(const OrchestrationConfig &config);
 
 } // namespace llaminar2

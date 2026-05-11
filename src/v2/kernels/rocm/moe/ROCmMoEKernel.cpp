@@ -18,6 +18,21 @@
 #include <cstdio>
 #include <stdexcept>
 
+namespace
+{
+    bool setMoEDevice(int device_ordinal, const char *context)
+    {
+        hipError_t err = hipSetDevice(device_ordinal);
+        if (err != hipSuccess)
+        {
+            LOG_ERROR("[ROCmMoEKernel] hipSetDevice(" << device_ordinal
+                                                      << ") failed in " << context << ": " << hipGetErrorString(err));
+            return false;
+        }
+        return true;
+    }
+}
+
 // Forward-declare extern "C" bridge functions (defined in ROCmMoEKernels.hip)
 extern "C"
 {
@@ -122,6 +137,7 @@ namespace llaminar2
 
     ROCmMoEKernel::~ROCmMoEKernel()
     {
+        (void)setMoEDevice(device_ordinal_, "destructor");
         if (d_histogram_)
         {
             hipFree(d_histogram_);
@@ -211,9 +227,9 @@ namespace llaminar2
 
         // Softmax + top-k selection
         if (!hipMoE_softmax_topk(bufs.d_logits, bufs.d_indices, bufs.d_weights,
-                                  seq_len, num_experts, top_k,
-                                  normalize_weights,
-                                  device_ordinal_, getStream()))
+                                 seq_len, num_experts, top_k,
+                                 normalize_weights,
+                                 device_ordinal_, getStream()))
         {
             hipFree(bufs.d_logits);
             hipFree(bufs.d_indices);
@@ -258,7 +274,9 @@ namespace llaminar2
         if (err != hipSuccess)
         {
             LOG_ERROR("[ROCmMoEKernel::route] D2H logits failed: " << hipGetErrorString(err));
-            hipFree(bufs.d_logits); hipFree(bufs.d_indices); hipFree(bufs.d_weights);
+            hipFree(bufs.d_logits);
+            hipFree(bufs.d_indices);
+            hipFree(bufs.d_weights);
             return false;
         }
 
@@ -268,7 +286,9 @@ namespace llaminar2
         if (err != hipSuccess)
         {
             LOG_ERROR("[ROCmMoEKernel::route] D2H indices failed: " << hipGetErrorString(err));
-            hipFree(bufs.d_logits); hipFree(bufs.d_indices); hipFree(bufs.d_weights);
+            hipFree(bufs.d_logits);
+            hipFree(bufs.d_indices);
+            hipFree(bufs.d_weights);
             return false;
         }
 
@@ -278,7 +298,9 @@ namespace llaminar2
         if (err != hipSuccess)
         {
             LOG_ERROR("[ROCmMoEKernel::route] D2H weights failed: " << hipGetErrorString(err));
-            hipFree(bufs.d_logits); hipFree(bufs.d_indices); hipFree(bufs.d_weights);
+            hipFree(bufs.d_logits);
+            hipFree(bufs.d_indices);
+            hipFree(bufs.d_weights);
             return false;
         }
 
@@ -301,7 +323,8 @@ namespace llaminar2
     {
         ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::MOE_GATHER, static_cast<hipStream_t>(getStream()));
 
-        if (num_tokens <= 0) return;
+        if (num_tokens <= 0)
+            return;
 
         if (!hipMoE_gather_tokens(hidden, batch_buffer, token_indices,
                                   num_tokens, d_model,
@@ -324,7 +347,8 @@ namespace llaminar2
     {
         ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::MOE_SCATTER, static_cast<hipStream_t>(getStream()));
 
-        if (num_tokens <= 0) return;
+        if (num_tokens <= 0)
+            return;
 
         if (!hipMoE_scatter_add(output, expert_output, token_indices, weights,
                                 num_tokens, d_model,
@@ -349,7 +373,8 @@ namespace llaminar2
     {
         ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::MOE_SHARED_GATE, static_cast<hipStream_t>(getStream()));
 
-        if (seq_len <= 0) return;
+        if (seq_len <= 0)
+            return;
 
         // Small scratch for per-token gate values
         float *d_gate_scratch = nullptr;
@@ -362,8 +387,8 @@ namespace llaminar2
         }
 
         if (!hipMoE_shared_expert_gate(input, gate_inp, shared_output, d_gate_scratch,
-                                        seq_len, d_model,
-                                        device_ordinal_, getStream()))
+                                       seq_len, d_model,
+                                       device_ordinal_, getStream()))
         {
             LOG_ERROR("[ROCmMoEKernel::sharedExpertGate] kernel launch failed");
         }
@@ -379,7 +404,8 @@ namespace llaminar2
     {
         ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::MOE_SWIGLU, static_cast<hipStream_t>(getStream()));
 
-        if (count <= 0) return;
+        if (count <= 0)
+            return;
 
         if (!hipMoE_swiglu(gate, up, count, device_ordinal_, getStream()))
         {
@@ -388,11 +414,12 @@ namespace llaminar2
     }
 
     void ROCmMoEKernel::weightedAdd(float *output, const float *input,
-                                     float weight, int count)
+                                    float weight, int count)
     {
         ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::MOE_SCATTER, static_cast<hipStream_t>(getStream()));
 
-        if (count <= 0) return;
+        if (count <= 0)
+            return;
 
         if (!hipMoE_weighted_add(output, input, weight, count, device_ordinal_, getStream()))
         {
@@ -446,7 +473,8 @@ namespace llaminar2
     {
         ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::MOE_ROUTE, static_cast<hipStream_t>(getStream()));
 
-        if (seq_len <= 0 || top_k <= 0) return;
+        if (seq_len <= 0 || top_k <= 0)
+            return;
 
         // Lazy allocate — assume at least layer_idx+1 layers, 256 experts as initial guess
         const int min_experts = 256;
@@ -454,7 +482,8 @@ namespace llaminar2
         {
             allocateHistogramBuffers(layer_idx + 1, (max_experts_ > 0) ? max_experts_ : min_experts);
         }
-        if (!d_histogram_) return;
+        if (!d_histogram_)
+            return;
 
         if (!hipMoE_histogram_record(
                 d_routing_indices,
@@ -479,7 +508,7 @@ namespace llaminar2
         if (layer_idx >= max_layers_ || num_experts > max_experts_)
         {
             LOG_ERROR("[ROCmMoEKernel::syncHistogramToHost] layer_idx=" << layer_idx
-                      << " or num_experts=" << num_experts << " out of range");
+                                                                        << " or num_experts=" << num_experts << " out of range");
             return;
         }
 
@@ -529,7 +558,8 @@ namespace llaminar2
     {
         ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::MOE_ROUTE, static_cast<hipStream_t>(getStream()));
 
-        if (num_experts <= 0) return;
+        if (num_experts <= 0)
+            return;
 
         // Allocate or reallocate if needed
         if (!d_expert_mask_ || num_experts > max_experts_)
@@ -568,7 +598,8 @@ namespace llaminar2
     {
         ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::MOE_ROUTE, static_cast<hipStream_t>(getStream()));
 
-        if (seq_len <= 0 || top_k <= 0) return;
+        if (seq_len <= 0 || top_k <= 0)
+            return;
 
         if (!d_expert_mask_)
         {
@@ -601,7 +632,8 @@ namespace llaminar2
     {
         ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::MOE_ROUTE, static_cast<hipStream_t>(getStream()));
 
-        if (seq_len <= 0 || num_experts <= 0 || top_k <= 0) return false;
+        if (seq_len <= 0 || num_experts <= 0 || top_k <= 0)
+            return false;
 
         const int total_slots = seq_len * top_k;
         hipStream_t stream = static_cast<hipStream_t>(getStream());
@@ -618,8 +650,8 @@ namespace llaminar2
 
         // Step 2: Count per expert
         if (!hipMoE_count_per_expert(d_routing_indices, d_expert_counts,
-                                      total_slots, num_experts,
-                                      device_ordinal_, getStream()))
+                                     total_slots, num_experts,
+                                     device_ordinal_, getStream()))
         {
             LOG_ERROR("[ROCmMoEKernel::groupTokensByExpertDevice] count_per_expert failed");
             return false;
@@ -627,8 +659,8 @@ namespace llaminar2
 
         // Step 3: Exclusive scan (expert_counts → expert_offsets)
         if (!hipMoE_exclusive_scan(d_expert_counts, d_expert_offsets,
-                                    num_experts,
-                                    device_ordinal_, getStream()))
+                                   num_experts,
+                                   device_ordinal_, getStream()))
         {
             LOG_ERROR("[ROCmMoEKernel::groupTokensByExpertDevice] exclusive_scan failed");
             return false;
@@ -663,10 +695,10 @@ namespace llaminar2
 
         // Step 5: Scatter tokens into grouped arrays
         if (!hipMoE_scatter_tokens(d_routing_indices, d_routing_weights,
-                                    d_expert_offsets, d_write_heads_,
-                                    d_grouped_token_indices, d_grouped_weights,
-                                    total_slots, num_experts, top_k,
-                                    device_ordinal_, getStream()))
+                                   d_expert_offsets, d_write_heads_,
+                                   d_grouped_token_indices, d_grouped_weights,
+                                   total_slots, num_experts, top_k,
+                                   device_ordinal_, getStream()))
         {
             LOG_ERROR("[ROCmMoEKernel::groupTokensByExpertDevice] scatter_tokens failed");
             return false;
@@ -688,11 +720,36 @@ namespace llaminar2
         if (count <= staging_capacity_)
             return;
 
-        if (d_staging_indices_) hipFree(d_staging_indices_);
-        if (d_staging_weights_) hipFree(d_staging_weights_);
+        if (!setMoEDevice(device_ordinal_, "ensureStagingCapacity"))
+            return;
 
-        hipMalloc(&d_staging_indices_, count * sizeof(int));
-        hipMalloc(&d_staging_weights_, count * sizeof(float));
+        if (d_staging_indices_)
+            (void)hipFree(d_staging_indices_);
+        if (d_staging_weights_)
+            (void)hipFree(d_staging_weights_);
+
+        hipError_t err = hipMalloc(&d_staging_indices_, count * sizeof(int));
+        if (err != hipSuccess)
+        {
+            LOG_ERROR("[ROCmMoEKernel::ensureStagingCapacity] hipMalloc indices failed: "
+                      << hipGetErrorString(err));
+            d_staging_indices_ = nullptr;
+            d_staging_weights_ = nullptr;
+            staging_capacity_ = 0;
+            return;
+        }
+
+        err = hipMalloc(&d_staging_weights_, count * sizeof(float));
+        if (err != hipSuccess)
+        {
+            LOG_ERROR("[ROCmMoEKernel::ensureStagingCapacity] hipMalloc weights failed: "
+                      << hipGetErrorString(err));
+            (void)hipFree(d_staging_indices_);
+            d_staging_indices_ = nullptr;
+            d_staging_weights_ = nullptr;
+            staging_capacity_ = 0;
+            return;
+        }
         staging_capacity_ = count;
     }
 
@@ -710,7 +767,8 @@ namespace llaminar2
         if (!h || !g)
         {
             LOG_ERROR("[ROCmMoEKernel::routeWithTensors] null device pointer "
-                      "(hidden=" << (const void *)h << " gate=" << (const void *)g << ")");
+                      "(hidden="
+                      << (const void *)h << " gate=" << (const void *)g << ")");
             return false;
         }
 
@@ -729,7 +787,9 @@ namespace llaminar2
         if (!d_idx || !d_wt)
         {
             LOG_ERROR("[ROCmMoEKernel::routeWithTensors] output tensors have no device allocation");
-            hipFree(bufs.d_logits); hipFree(bufs.d_indices); hipFree(bufs.d_weights);
+            hipFree(bufs.d_logits);
+            hipFree(bufs.d_indices);
+            hipFree(bufs.d_weights);
             return false;
         }
 
@@ -744,7 +804,9 @@ namespace llaminar2
         if (err != hipSuccess)
         {
             LOG_ERROR("[ROCmMoEKernel::routeWithTensors] D2D weights failed: " << hipGetErrorString(err));
-            hipFree(bufs.d_logits); hipFree(bufs.d_indices); hipFree(bufs.d_weights);
+            hipFree(bufs.d_logits);
+            hipFree(bufs.d_indices);
+            hipFree(bufs.d_weights);
             return false;
         }
 
@@ -789,15 +851,36 @@ namespace llaminar2
     {
         ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::MOE_GATHER, static_cast<hipStream_t>(getStream()));
 
-        if (num_tokens <= 0) return;
+        if (num_tokens <= 0)
+            return;
 
         const float *h = static_cast<const float *>(hidden->gpu_data_ptr());
         float *b = static_cast<float *>(batch_buffer->gpu_data_ptr());
 
+        if (!h || !b)
+        {
+            LOG_ERROR("[ROCmMoEKernel::gatherTokenBatchFromTensors] null device pointer");
+            return;
+        }
+
+        if (!setMoEDevice(device_ordinal_, "gatherTokenBatchFromTensors"))
+            return;
+
         // Upload host token indices to device staging buffer
         ensureStagingCapacity(num_tokens);
-        hipMemcpy(d_staging_indices_, host_token_indices,
-                  num_tokens * sizeof(int), hipMemcpyHostToDevice);
+        if (!d_staging_indices_)
+            return;
+
+        hipError_t err = hipMemcpyAsync(
+            d_staging_indices_, host_token_indices,
+            num_tokens * sizeof(int), hipMemcpyHostToDevice,
+            static_cast<hipStream_t>(getStream()));
+        if (err != hipSuccess)
+        {
+            LOG_ERROR("[ROCmMoEKernel::gatherTokenBatchFromTensors] H2D token indices failed: "
+                      << hipGetErrorString(err));
+            return;
+        }
 
         gatherTokenBatch(h, b, d_staging_indices_, num_tokens, d_model);
         batch_buffer->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
@@ -810,17 +893,47 @@ namespace llaminar2
     {
         ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::MOE_SCATTER, static_cast<hipStream_t>(getStream()));
 
-        if (num_tokens <= 0) return;
+        if (num_tokens <= 0)
+            return;
 
         float *o = static_cast<float *>(output->gpu_data_ptr());
         const float *e = static_cast<const float *>(expert_output->gpu_data_ptr());
 
+        if (!o || !e)
+        {
+            LOG_ERROR("[ROCmMoEKernel::scatterAddWeightedFromTensors] null device pointer");
+            return;
+        }
+
+        if (!setMoEDevice(device_ordinal_, "scatterAddWeightedFromTensors"))
+            return;
+
         // Upload host indices + weights to device staging
         ensureStagingCapacity(num_tokens);
-        hipMemcpy(d_staging_indices_, host_token_indices,
-                  num_tokens * sizeof(int), hipMemcpyHostToDevice);
-        hipMemcpy(d_staging_weights_, host_weights,
-                  num_tokens * sizeof(float), hipMemcpyHostToDevice);
+        if (!d_staging_indices_ || !d_staging_weights_)
+            return;
+
+        hipStream_t stream = static_cast<hipStream_t>(getStream());
+        hipError_t err = hipMemcpyAsync(
+            d_staging_indices_, host_token_indices,
+            num_tokens * sizeof(int), hipMemcpyHostToDevice,
+            stream);
+        if (err != hipSuccess)
+        {
+            LOG_ERROR("[ROCmMoEKernel::scatterAddWeightedFromTensors] H2D token indices failed: "
+                      << hipGetErrorString(err));
+            return;
+        }
+        err = hipMemcpyAsync(
+            d_staging_weights_, host_weights,
+            num_tokens * sizeof(float), hipMemcpyHostToDevice,
+            stream);
+        if (err != hipSuccess)
+        {
+            LOG_ERROR("[ROCmMoEKernel::scatterAddWeightedFromTensors] H2D weights failed: "
+                      << hipGetErrorString(err));
+            return;
+        }
 
         scatterAddWeighted(o, e, d_staging_indices_, d_staging_weights_,
                            num_tokens, d_model);
@@ -882,7 +995,8 @@ namespace llaminar2
         ITensor *routing_indices, ITensor *routing_weights,
         int seq_len, int num_experts, int top_k)
     {
-        if (seq_len <= 0 || num_experts <= 0 || top_k <= 0) return false;
+        if (seq_len <= 0 || num_experts <= 0 || top_k <= 0)
+            return false;
 
         const int total_slots = seq_len * top_k;
         hipStream_t stream = static_cast<hipStream_t>(getStream());
@@ -902,9 +1016,12 @@ namespace llaminar2
         // 2. Lazy-allocate grouping buffers
         if (total_slots > group_slots_cap_)
         {
-            if (d_group_int_indices_) hipFree(d_group_int_indices_);
-            if (d_group_token_indices_) hipFree(d_group_token_indices_);
-            if (d_group_weights_) hipFree(d_group_weights_);
+            if (d_group_int_indices_)
+                hipFree(d_group_int_indices_);
+            if (d_group_token_indices_)
+                hipFree(d_group_token_indices_);
+            if (d_group_weights_)
+                hipFree(d_group_weights_);
             hipMalloc(&d_group_int_indices_, total_slots * sizeof(int));
             hipMalloc(&d_group_token_indices_, total_slots * sizeof(int));
             hipMalloc(&d_group_weights_, total_slots * sizeof(float));
@@ -912,8 +1029,10 @@ namespace llaminar2
         }
         if (num_experts > group_experts_cap_)
         {
-            if (d_group_offsets_) hipFree(d_group_offsets_);
-            if (d_group_counts_) hipFree(d_group_counts_);
+            if (d_group_offsets_)
+                hipFree(d_group_offsets_);
+            if (d_group_counts_)
+                hipFree(d_group_counts_);
             hipMalloc(&d_group_offsets_, num_experts * sizeof(int));
             hipMalloc(&d_group_counts_, num_experts * sizeof(int));
             group_experts_cap_ = num_experts;
@@ -921,7 +1040,7 @@ namespace llaminar2
 
         // 3. Convert float indices → int on device
         if (!hipMoE_float_to_int(d_float_indices, d_group_int_indices_,
-                                  total_slots, device_ordinal_, getStream()))
+                                 total_slots, device_ordinal_, getStream()))
         {
             LOG_ERROR("[ROCmMoEKernel::prepareExpertGroups] float_to_int failed");
             return false;
@@ -963,7 +1082,8 @@ namespace llaminar2
         int expert_id, int d_model)
     {
         int count = getExpertTokenCount(expert_id);
-        if (count <= 0) return;
+        if (count <= 0)
+            return;
 
         const float *h = static_cast<const float *>(hidden->gpu_data_ptr());
         float *b = static_cast<float *>(batch_buffer->gpu_data_ptr());
@@ -977,14 +1097,15 @@ namespace llaminar2
         int expert_id, int d_model)
     {
         int count = getExpertTokenCount(expert_id);
-        if (count <= 0) return;
+        if (count <= 0)
+            return;
 
         float *o = static_cast<float *>(output->gpu_data_ptr());
         const float *r = static_cast<const float *>(expert_results->gpu_data_ptr());
         int offset = host_expert_offsets_[expert_id];
 
         scatterAddWeighted(o, r, d_group_token_indices_ + offset,
-                          d_group_weights_ + offset, count, d_model);
+                           d_group_weights_ + offset, count, d_model);
     }
 
 } // namespace llaminar2

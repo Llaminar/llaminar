@@ -108,6 +108,7 @@ TEST(Test__SnapshotCapture_KeyConversion, MoEStages)
     EXPECT_EQ(SnapshotCapture::convertStageNameToSnapshotKey("layer0_moe_ffn"), "layer0_MOE_EXPERT_OUTPUT");
     EXPECT_EQ(SnapshotCapture::convertStageNameToSnapshotKey("layer0_moe_expert_ffn"), "layer0_MOE_EXPERT_OUTPUT");
     EXPECT_EQ(SnapshotCapture::convertStageNameToSnapshotKey("layer0_moe_expert_allreduce"), "layer0_MOE_EXPERT_OUTPUT");
+    EXPECT_EQ(SnapshotCapture::convertStageNameToSnapshotKey("layer0_moe_expert_parallel_reduce"), "layer0_MOE_EXPERT_OUTPUT");
     EXPECT_EQ(SnapshotCapture::convertStageNameToSnapshotKey("layer0_shared_expert"), "layer0_MOE_SHARED_EXPERT_OUTPUT");
     EXPECT_EQ(SnapshotCapture::convertStageNameToSnapshotKey("layer0_shared_expert_gate"), "layer0_MOE_SHARED_GATE_OUTPUT");
     EXPECT_EQ(SnapshotCapture::convertStageNameToSnapshotKey("layer0_moe_add"), "layer0_MOE_COMBINED_OUTPUT");

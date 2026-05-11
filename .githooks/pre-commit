@@ -116,12 +116,13 @@ if $FULL_SUITE; then
     echo ""
 fi
 
-# Step 3/4: Run Focused Parity Baseline (26 tests, all model families, sequential)
+# Step 3/4: Run Focused Parity Baseline (30 tests, all model families, sequential)
 # Covers Qwen2, Qwen3, Qwen3.5 (dense), Qwen3.5 MoE (sparse),
-# NodeLocalTP (multi-device), and HybridPPTP (pipeline+tensor parallel).
+# NodeLocalTP (multi-device), HybridPPTP (pipeline+tensor parallel),
+# and ExpertOverlay (tiered same-layer expert residency).
 # Runs on ALL branches to catch accuracy regressions early.
 if $FULL_SUITE; then PARITY_STEP=4; else PARITY_STEP=3; fi
-echo -e "${YELLOW}[${PARITY_STEP}/${TOTAL_STEPS}] Running focused parity baseline (27 tests, all model families)...${NC}"
+echo -e "${YELLOW}[${PARITY_STEP}/${TOTAL_STEPS}] Running focused parity baseline (30 tests, all model families)...${NC}"
 echo ""
 
 set +e

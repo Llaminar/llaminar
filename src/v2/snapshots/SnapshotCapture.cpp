@@ -128,6 +128,18 @@ namespace llaminar2
             return;
         }
 
+        // Handle standalone MoE routing stage — split router logits, indices, and weights
+        if (name.find("_moe_routing") != std::string::npos && dump.outputs.size() >= 3)
+        {
+            size_t pos = name.find("_moe_routing");
+            std::string prefix = name.substr(0, pos);
+
+            storeOutput(prefix + "_MOE_ROUTER_OUTPUT", dump.outputs[0]);
+            storeOutput(prefix + "_MOE_ROUTING_INDICES", dump.outputs[1]);
+            storeOutput(prefix + "_MOE_ROUTING_WEIGHTS", dump.outputs[2]);
+            return;
+        }
+
         // Standard single-output stages
         LOG_DEBUG("[Snapshot] Standard path: stage=" << name
                                                      << " outputs.size=" << dump.outputs.size()
@@ -247,6 +259,14 @@ namespace llaminar2
 
     std::string SnapshotCapture::convertStageNameToSnapshotKey(const std::string &stage_name)
     {
+        if (stage_name.find("_moe_expert_ffn_tier") != std::string::npos)
+        {
+            std::string result = stage_name;
+            for (char &c : result)
+                c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+            return result;
+        }
+
         // Ordered vector: longest/most-specific suffixes FIRST to ensure correct
         // prefix extraction. E.g. "_gdn_wo_allreduce" must match before "_wo_allreduce"
         // so the prefix is "layerN" (not "layerN_gdn").
@@ -281,6 +301,7 @@ namespace llaminar2
             // MoE stages
             {"_shared_expert_gate", "_MOE_SHARED_GATE_OUTPUT"},
             {"_shared_expert", "_MOE_SHARED_EXPERT_OUTPUT"},
+            {"_moe_expert_parallel_reduce", "_MOE_EXPERT_OUTPUT"},
             {"_moe_expert_allreduce", "_MOE_EXPERT_OUTPUT"},
             {"_moe_expert_ffn", "_MOE_EXPERT_OUTPUT"},
             {"_moe_combine", "_MOE_COMBINED_OUTPUT"},

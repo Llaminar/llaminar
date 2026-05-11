@@ -39,6 +39,7 @@
 #include "../../mpi_orchestration/PlacementStrategy.h" // For InferencePhase
 #include "../../compute_stages/ComputeStages.h"        // For StageDumpInfo
 #include "../../moe/ExpertWeightTransfer.h"            // For ReceivedWeightsMap, ExpertMigration
+#include "../../moe/MoEExpertOverlayProfiler.h"        // For overlay profiling summary flush
 #include "../../factory/InferenceRunnerFactory.h"      // For FactoryPPStageConfig
 #include "../../../snapshots/SnapshotCapture.h"        // Snapshot capture (extracted Phase 2)
 #include "../engine/ForwardExecutionEngine.h"          // Forward execution engine (extracted Phase 3)
@@ -400,6 +401,10 @@ namespace llaminar2
             /// Multi-domain TP configuration (heterogeneous TP domains)
             std::shared_ptr<MultiDomainTPConfig> domain_config = nullptr;
 
+            /// Domain-scoped LocalTP contexts whose raw pointers are installed
+            /// into GraphConfig / graph builders before graph construction.
+            std::map<std::string, std::shared_ptr<ILocalTPContext>> domain_tp_contexts;
+
             // ---- Optional: graph caching ----
 
             /// Graph caching configuration
@@ -747,34 +752,34 @@ namespace llaminar2
         void initializePreparedWeightStore(DeviceId device);
 
         /// Get prepared weight store (may be null if no GEMM weights prepared)
-        PreparedWeightStore* preparedWeightStore() const { return prepared_weight_store_.get(); }
+        PreparedWeightStore *preparedWeightStore() const { return prepared_weight_store_.get(); }
 
         /// Get frozen model weight set (may be null before setWeights is called)
-        const FrozenModelWeightSet* frozenWeightSet() const { return frozen_weight_set_.get(); }
+        const FrozenModelWeightSet *frozenWeightSet() const { return frozen_weight_set_.get(); }
 
         /// Get expert weight payload provider (may be null for non-MoE models)
-        ExpertWeightPayloadProvider* expertPayloadProvider() const { return expert_payload_provider_.get(); }
+        ExpertWeightPayloadProvider *expertPayloadProvider() const { return expert_payload_provider_.get(); }
 
         /// Get MoE rebalance controller (for post-decode logging)
-        MoERebalanceController* moeRebalanceController() const { return moe_rebalance_controller_.get(); }
+        MoERebalanceController *moeRebalanceController() const { return moe_rebalance_controller_.get(); }
 
         /// Apply expert masks to all MoEExpertComputeStages in cached FFN graphs.
         /// Called after rebalancing to update which experts each rank computes.
         /// @param masks Per-layer expert masks (masks[layer][expert] == true means active)
         /// @param received_weights Optional transferred packed weights from MPI transfer
         void applyExpertMasks(
-            const std::vector<std::vector<bool>>& masks,
-            const ReceivedWeightsMap& received_weights = {});
+            const std::vector<std::vector<bool>> &masks,
+            const ReceivedWeightsMap &received_weights = {});
 
         /// Non-destructively collect packed expert weights for experts requested
         /// by masks. Used for intra-rank migration between composed TP domains
         /// without falling back to raw GGUF host tensors.
         ReceivedWeightsMap collectExpertWeightsForMasks(
-            const std::vector<std::vector<bool>>& masks) const;
+            const std::vector<std::vector<bool>> &masks) const;
 
         /// Set expert replica info on all MoE stages for per-token dispatch.
         /// Call after applyExpertMasks() so GEMM engines are already prepared.
-        void setExpertReplicaSet(const ExpertReplicaSet& replicas, int socket_id);
+        void setExpertReplicaSet(const ExpertReplicaSet &replicas, int socket_id);
 
         /// Release raw expert weight data from all MoE stages after initial VNNI packing.
         /// For mmap: confirms DONTNEED already applied. For heap: frees raw_data_ vectors.
@@ -786,7 +791,7 @@ namespace llaminar2
         /// Transfer packed weights for migrating experts via MPI.
         /// Returns received weights map: [layer_idx][expert_id] → blobs.
         ReceivedWeightsMap transferExpertWeights(
-            const std::vector<ExpertMigration>& manifest,
+            const std::vector<ExpertMigration> &manifest,
             int num_layers);
 
         /// Transfer packed weights for replicated experts via MPI.
@@ -796,7 +801,7 @@ namespace llaminar2
         /// @param num_layers Number of MoE layers
         /// @return Received weights map for this rank's new replicas
         ReceivedWeightsMap transferReplicaWeights(
-            const ExpertReplicaSet& replicas,
+            const ExpertReplicaSet &replicas,
             int num_layers);
 
         /**
@@ -813,6 +818,9 @@ namespace llaminar2
         {
             global_tp_ctx_ = std::move(ctx);
         }
+
+        /// Retain domain-scoped LocalTP contexts and wire them to the graph builder.
+        void setDomainTPContexts(std::map<std::string, std::shared_ptr<ILocalTPContext>> contexts);
 
         // =========================================================================
         // Weight Manager and Phase-Aware Weight Access (Gap 3)
@@ -1062,7 +1070,10 @@ namespace llaminar2
         void flushStageTimeline() override
         {
             if (!debugEnv().gpu_stage_timing)
+            {
+                MoEExpertOverlayProfiler::flush();
                 return;
+            }
 
             auto &timeline = executor_.stageTimeline();
             std::string dev_str = state_.device_id.toString();
@@ -1078,6 +1089,7 @@ namespace llaminar2
             {
                 timeline.printAccumulatedSummary("DECODE", dev_str.c_str());
             }
+            MoEExpertOverlayProfiler::flush();
         }
 
         /**
@@ -1597,7 +1609,7 @@ namespace llaminar2
          * @brief Apply sparse logit penalties on device
          */
         bool applyPenaltiesOnDevice(const std::vector<LogitPenalty> &penalties,
-                                     int vocab_size) override;
+                                    int vocab_size) override;
 
         /**
          * @brief Get logits (IInferenceRunner override - already declared above)

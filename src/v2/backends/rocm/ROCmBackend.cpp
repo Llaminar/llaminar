@@ -25,10 +25,18 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <deque>
+#include <limits>
 #include <thread>
 
 namespace llaminar2
 {
+
+    extern "C" bool rocmOps_vector_add_inplace_fp32(
+        float *output,
+        const float *input,
+        size_t count,
+        int device_idx,
+        void *stream);
 
     namespace
     {
@@ -1040,6 +1048,35 @@ namespace llaminar2
         }
 
         return true;
+    }
+
+    bool ROCmBackend::vectorAddInplace(void *output, const void *input, size_t count,
+                                       int element_size, int device_id, void *stream)
+    {
+        if (count == 0)
+            return true;
+        if (!output || !input)
+        {
+            LOG_ERROR("[ROCmBackend::vectorAddInplace] Null output or input pointer");
+            return false;
+        }
+        if (device_id >= device_count_ || device_id < 0)
+        {
+            LOG_ERROR("[ROCmBackend::vectorAddInplace] Invalid device ID " << device_id);
+            return false;
+        }
+        if (element_size != static_cast<int>(sizeof(float)))
+        {
+            LOG_ERROR("[ROCmBackend::vectorAddInplace] unsupported element_size: " << element_size);
+            return false;
+        }
+
+        return rocmOps_vector_add_inplace_fp32(
+            static_cast<float *>(output),
+            static_cast<const float *>(input),
+            count,
+            device_id,
+            stream ? stream : resolveStream(device_id, nullptr));
     }
 
     // ====================================================================

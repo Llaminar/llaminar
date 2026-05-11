@@ -49,6 +49,8 @@ namespace llaminar2
     class TurboQuantContext;
     class ActivationRotation;
     class DecodeExpertHistogram;
+    struct MoEExpertParallelPlan;
+    class MoEExpertOverlayRuntimePlan;
     struct PipelineConfig;
     enum class MoERebalanceMode;
 
@@ -365,6 +367,13 @@ namespace llaminar2
             /// MoE rebalancing mode (OFF / OBSERVE / DYNAMIC).
             /// Set by InferenceRunnerFactory from MoERebalanceController.
             MoERebalanceMode rebalance_mode{}; // default-initialized to OFF (value 0)
+
+            /// Optional same-layer expert-parallel overlay plan.
+            /// Phase 1 stores the validated value only; graph execution remains unchanged.
+            std::shared_ptr<MoEExpertParallelPlan> expert_parallel_plan = nullptr;
+
+            /// Runtime-resolved overlay descriptor for domain devices, ranks, and MVP lowering.
+            std::shared_ptr<MoEExpertOverlayRuntimePlan> expert_overlay_runtime_plan = nullptr;
 
             /// Returns true if MoE is enabled
             bool enabled() const { return num_experts > 0 && top_k > 0; }

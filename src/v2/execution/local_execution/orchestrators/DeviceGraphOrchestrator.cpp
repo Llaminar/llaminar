@@ -47,6 +47,49 @@
 namespace llaminar2
 {
 
+    static bool registerDomainTPComputeStreams(
+        const std::string &context,
+        ILocalTPContext &tp_context)
+    {
+        if (tp_context.degree() <= 1)
+            return true;
+
+        const auto &devices = tp_context.devices();
+        std::vector<void *> compute_streams;
+        compute_streams.reserve(devices.size());
+
+        for (const auto &device : devices)
+        {
+            DeviceId local_device = device.toLocalDeviceId();
+            if (!local_device.is_gpu())
+            {
+                LOG_DEBUG(context << ": skipping compute stream registration for non-GPU device "
+                                  << device.toString());
+                return true;
+            }
+
+            try
+            {
+                compute_streams.push_back(
+                    GPUDeviceContextPool::instance().getContext(local_device).defaultStream());
+            }
+            catch (const std::exception &e)
+            {
+                LOG_ERROR(context << ": failed to get compute stream for "
+                                  << local_device.toString() << ": " << e.what());
+                return false;
+            }
+        }
+
+        if (!compute_streams.empty())
+        {
+            tp_context.setComputeStreams(compute_streams);
+            LOG_INFO(context << ": registered " << compute_streams.size()
+                             << " compute streams for event-based LocalTP collective sync");
+        }
+        return true;
+    }
+
     // =========================================================================
     // Shared Executor Configuration
     // =========================================================================
@@ -133,7 +176,8 @@ namespace llaminar2
           weight_manager_(std::move(deps.weight_manager)),
           weight_placement_map_(std::move(deps.weight_placement_map)),
           tp_config_(std::move(deps.tp_config)),
-          domain_config_(std::move(deps.domain_config))
+          domain_config_(std::move(deps.domain_config)),
+          domain_tp_contexts_(std::move(deps.domain_tp_contexts))
     {
         if (!injected_model_ctx_)
         {
@@ -143,6 +187,17 @@ namespace llaminar2
         if (!graph_builder_)
         {
             throw std::invalid_argument("DeviceGraphOrchestrator Dependencies requires a valid graph_builder");
+        }
+
+        for (const auto &[name, ctx] : domain_tp_contexts_)
+        {
+            if (ctx)
+            {
+                registerDomainTPComputeStreams(
+                    "[DeviceGraphOrchestrator] domain TP context '" + name + "'",
+                    *ctx);
+                graph_builder_->setTPContext(name, ctx.get());
+            }
         }
 
         configureExecutor();
@@ -175,7 +230,8 @@ namespace llaminar2
                  << ", collective=" << (injected_collective_ctx_ ? "provided" : "none")
                  << ", turboquant=" << (turboquant_ctx_ ? "provided" : "none")
                  << ", pp_stage=" << (pp_stage_config_.has_value() ? "configured" : "none")
-                 << ", pipeline=" << (pipeline_config_ ? "provided" : "none"));
+                 << ", pipeline=" << (pipeline_config_ ? "provided" : "none")
+                 << ", domain_tp_contexts=" << domain_tp_contexts_.size());
     }
 
     DeviceGraphOrchestrator::DeviceGraphOrchestrator(
@@ -3134,6 +3190,41 @@ namespace llaminar2
         }
     }
 
+    void DeviceGraphOrchestrator::setDomainTPContexts(
+        std::map<std::string, std::shared_ptr<ILocalTPContext>> contexts)
+    {
+        for (auto &[name, ctx] : contexts)
+        {
+            if (!ctx)
+            {
+                LOG_WARN("[DeviceGraphOrchestrator] Ignoring null domain TP context for domain '"
+                         << name << "'");
+                continue;
+            }
+
+            auto existing = domain_tp_contexts_.find(name);
+            if (existing != domain_tp_contexts_.end() && existing->second)
+            {
+                LOG_DEBUG("[DeviceGraphOrchestrator] Preserving existing domain TP context for domain '"
+                          << name << "'");
+                continue;
+            }
+
+            if (!registerDomainTPComputeStreams(
+                    "[DeviceGraphOrchestrator] domain TP context '" + name + "'",
+                    *ctx))
+            {
+                LOG_WARN("[DeviceGraphOrchestrator] Retaining domain TP context for domain '"
+                         << name << "' without registered compute streams");
+            }
+
+            graph_builder_->setTPContext(name, ctx.get());
+            domain_tp_contexts_[name] = std::move(ctx);
+            LOG_DEBUG("[DeviceGraphOrchestrator] Retained domain TP context for domain '"
+                      << name << "'");
+        }
+    }
+
     bool DeviceGraphOrchestrator::initializePPContexts()
     {
         if (pp_contexts_initialized_)
@@ -3320,6 +3411,21 @@ namespace llaminar2
                 continue;
             }
 
+            auto existing = domain_tp_contexts_.find(domain.name);
+            if (existing != domain_tp_contexts_.end() && existing->second)
+            {
+                if (!registerDomainTPComputeStreams(
+                        "[DeviceGraphOrchestrator] domain TP context '" + domain.name + "'",
+                        *existing->second))
+                {
+                    return false;
+                }
+                graph_builder_->setTPContext(domain.name, existing->second.get());
+                LOG_DEBUG("[DeviceGraphOrchestrator] Reusing preconfigured TP context for domain '"
+                          << domain.name << "'");
+                continue;
+            }
+
             // Convert DeviceId to GlobalDeviceAddress
             std::vector<GlobalDeviceAddress> addresses;
             for (const auto &dev : domain.devices)
@@ -3339,7 +3445,15 @@ namespace llaminar2
                 return false;
             }
 
-            domain_tp_contexts_[domain.name] = std::shared_ptr<ILocalTPContext>(std::move(tp_ctx));
+            auto shared_tp_ctx = std::shared_ptr<ILocalTPContext>(std::move(tp_ctx));
+            if (!registerDomainTPComputeStreams(
+                    "[DeviceGraphOrchestrator] domain TP context '" + domain.name + "'",
+                    *shared_tp_ctx))
+            {
+                return false;
+            }
+
+            domain_tp_contexts_[domain.name] = std::move(shared_tp_ctx);
 
             LOG_DEBUG("[DeviceGraphOrchestrator] Created TP context for domain '" << domain.name
                                                                                   << "': " << domain.devices.size() << " devices, backend="

@@ -69,6 +69,445 @@ namespace llaminar2
                            { return std::tolower(c); });
             return lower;
         }
+
+        std::string normalizeToken(const std::string &str)
+        {
+            std::string normalized = toLower(trim(str));
+            std::replace(normalized.begin(), normalized.end(), '-', '_');
+            return normalized;
+        }
+
+        size_t leadingWhitespace(const std::string &line)
+        {
+            size_t count = 0;
+            while (count < line.size() && (line[count] == ' ' || line[count] == '\t'))
+            {
+                ++count;
+            }
+            return count;
+        }
+
+        std::string stripOuterQuotes(std::string value)
+        {
+            value = trim(value);
+            if (value.size() >= 2 &&
+                ((value.front() == '"' && value.back() == '"') ||
+                 (value.front() == '\'' && value.back() == '\'')))
+            {
+                value = value.substr(1, value.size() - 2);
+            }
+            return value;
+        }
+
+        bool parseBoolValue(const std::string &value)
+        {
+            const std::string normalized = normalizeToken(value);
+            if (normalized == "true" || normalized == "1" || normalized == "yes" || normalized == "on")
+                return true;
+            if (normalized == "false" || normalized == "0" || normalized == "no" || normalized == "off")
+                return false;
+            throw std::invalid_argument("Invalid boolean value: '" + value + "'");
+        }
+
+        std::shared_ptr<MoEExpertParallelPlan> ensureMoEExpertParallelPlan(OrchestrationConfig &config)
+        {
+            if (!config.moe_expert_parallel_plan)
+            {
+                config.moe_expert_parallel_plan = std::make_shared<MoEExpertParallelPlan>();
+            }
+            return config.moe_expert_parallel_plan;
+        }
+
+        MoEExpertExecutionKind parseMoEExpertExecutionKind(const std::string &value, bool &enabled)
+        {
+            const std::string normalized = normalizeToken(value);
+            if (normalized == "off" || normalized == "disabled" || normalized == "false")
+            {
+                enabled = false;
+                return MoEExpertExecutionKind::TieredExpertOverlay;
+            }
+            if (normalized == "tiered" || normalized == "tiered_expert_overlay")
+            {
+                enabled = true;
+                return MoEExpertExecutionKind::TieredExpertOverlay;
+            }
+            if (normalized == "single_domain" || normalized == "single_domain_expert_sharded")
+            {
+                enabled = true;
+                return MoEExpertExecutionKind::SingleDomainExpertSharded;
+            }
+            throw std::invalid_argument("Invalid MoE expert overlay kind: '" + value + "' (valid: off, single-domain, tiered)");
+        }
+
+        void applyMoEExpertOverlayKind(OrchestrationConfig &config, const std::string &value)
+        {
+            bool enabled = false;
+            const auto kind = parseMoEExpertExecutionKind(value, enabled);
+            auto plan = ensureMoEExpertParallelPlan(config);
+            plan->enabled = enabled;
+            if (enabled)
+            {
+                plan->execution_kind = kind;
+            }
+        }
+
+        ExpertResidencyPolicy parseExpertResidencyPolicyValue(const std::string &value)
+        {
+            const std::string normalized = normalizeToken(value);
+            if (normalized == "disabled" || normalized == "off" || normalized == "none")
+                return ExpertResidencyPolicy::Disabled;
+            if (normalized == "static_by_id")
+                return ExpertResidencyPolicy::StaticById;
+            if (normalized == "histogram" || normalized == "histogram_tiered_cache")
+                return ExpertResidencyPolicy::HistogramTieredCache;
+            if (normalized == "explicit_masks")
+                return ExpertResidencyPolicy::ExplicitMasks;
+            throw std::invalid_argument("Invalid MoE expert overlay residency policy: '" + value + "' (valid: static-by-id, histogram, explicit-masks)");
+        }
+
+        ExpertDomainKind parseExpertDomainKindValue(const std::string &value)
+        {
+            const std::string normalized = normalizeToken(value);
+            if (normalized == "single" || normalized == "single_device")
+                return ExpertDomainKind::SingleDevice;
+            if (normalized == "local" || normalized == "local_tp")
+                return ExpertDomainKind::LocalTP;
+            if (normalized == "node_local" || normalized == "node_local_tp")
+                return ExpertDomainKind::NodeLocalTP;
+            throw std::invalid_argument("Invalid MoE expert overlay domain scope: '" + value + "' (valid: single, local, node_local)");
+        }
+
+        ExpertDomainComputeKind parseExpertDomainComputeKindValue(const std::string &value)
+        {
+            const std::string normalized = normalizeToken(value);
+            if (normalized == "replicated_experts")
+                return ExpertDomainComputeKind::ReplicatedExperts;
+            if (normalized == "expert_id_sharded")
+                return ExpertDomainComputeKind::ExpertIdSharded;
+            if (normalized == "tensor_parallel_experts")
+                return ExpertDomainComputeKind::TensorParallelExperts;
+            throw std::invalid_argument("Invalid MoE expert overlay domain compute kind: '" + value + "' (valid: replicated_experts, expert_id_sharded, tensor_parallel_experts)");
+        }
+
+        std::vector<GlobalDeviceAddress> parseMoEOverlayDeviceList(const std::string &spec)
+        {
+            std::vector<GlobalDeviceAddress> devices;
+            for (const auto &part : split(spec, ','))
+            {
+                auto addr = GlobalDeviceAddress::tryParse(part);
+                if (!addr)
+                {
+                    throw std::invalid_argument("Invalid MoE expert overlay domain device: '" + part + "'");
+                }
+                devices.push_back(*addr);
+            }
+            if (devices.empty())
+            {
+                throw std::invalid_argument("MoE expert overlay domain must declare at least one device");
+            }
+            return devices;
+        }
+
+        std::vector<int> parseRankList(const std::string &value, const std::string &field_name)
+        {
+            const auto rank_parts = split(value, ',');
+            if (rank_parts.empty())
+            {
+                throw std::invalid_argument("MoE expert overlay domain " + field_name + " must not be empty");
+            }
+
+            std::vector<int> ranks;
+            ranks.reserve(rank_parts.size());
+            for (const auto &part : rank_parts)
+            {
+                try
+                {
+                    const int rank = std::stoi(part);
+                    if (rank < 0)
+                    {
+                        throw std::invalid_argument("negative rank");
+                    }
+                    ranks.push_back(rank);
+                }
+                catch (const std::exception &)
+                {
+                    throw std::invalid_argument("Invalid MoE expert overlay domain " + field_name + " entry: '" + part + "'");
+                }
+            }
+            return ranks;
+        }
+
+        ExpertComputeDomain parseMoEExpertOverlayDomainSpec(const std::string &spec)
+        {
+            const auto sections = split(spec, ';');
+            if (sections.empty())
+            {
+                throw std::invalid_argument("MoE expert overlay domain spec is empty");
+            }
+
+            const auto eq_pos = sections[0].find('=');
+            if (eq_pos == std::string::npos)
+            {
+                throw std::invalid_argument("Invalid MoE expert overlay domain spec: '" + spec + "' (expected name=devices;scope=...;backend=...;compute=...)");
+            }
+
+            ExpertComputeDomain domain;
+            domain.name = trim(sections[0].substr(0, eq_pos));
+            if (domain.name.empty())
+            {
+                throw std::invalid_argument("MoE expert overlay domain name must not be empty");
+            }
+            domain.participants = parseMoEOverlayDeviceList(sections[0].substr(eq_pos + 1));
+
+            bool saw_scope = false;
+            bool saw_compute = false;
+            for (size_t i = 1; i < sections.size(); ++i)
+            {
+                const auto part_eq = sections[i].find('=');
+                if (part_eq == std::string::npos)
+                {
+                    throw std::invalid_argument("Invalid MoE expert overlay domain option: '" + sections[i] + "'");
+                }
+
+                const std::string key = normalizeToken(sections[i].substr(0, part_eq));
+                const std::string value = trim(sections[i].substr(part_eq + 1));
+
+                if (key == "scope")
+                {
+                    domain.kind = parseExpertDomainKindValue(value);
+                    saw_scope = true;
+                }
+                else if (key == "backend")
+                {
+                    auto backend = parseCollectiveBackendType(value);
+                    if (!backend)
+                    {
+                        throw std::invalid_argument("Invalid MoE expert overlay domain backend: '" + value + "'");
+                    }
+                    domain.backend = *backend;
+                }
+                else if (key == "compute")
+                {
+                    domain.compute_kind = parseExpertDomainComputeKindValue(value);
+                    saw_compute = true;
+                }
+                else if (key == "owner")
+                {
+                    auto owner_ranks = parseRankList(value, "owner");
+                    if (owner_ranks.size() != 1)
+                    {
+                        throw std::invalid_argument("MoE expert overlay domain owner must be a single world rank");
+                    }
+                    domain.owner_rank = owner_ranks.front();
+                }
+                else if (key == "ranks")
+                {
+                    domain.world_ranks = parseRankList(value, "ranks");
+                }
+                else
+                {
+                    throw std::invalid_argument("Unknown MoE expert overlay domain option: '" + key + "'");
+                }
+            }
+
+            if (!saw_scope)
+            {
+                throw std::invalid_argument("MoE expert overlay domain '" + domain.name + "' is missing scope=<single|local|node_local>");
+            }
+            if (!saw_compute)
+            {
+                throw std::invalid_argument("MoE expert overlay domain '" + domain.name + "' is missing compute=<replicated_experts|expert_id_sharded|tensor_parallel_experts>");
+            }
+
+            return domain;
+        }
+
+        ExpertRoutedTier parseMoEExpertOverlayTierSpec(const std::string &spec)
+        {
+            const auto sections = split(spec, ';');
+            if (sections.empty())
+            {
+                throw std::invalid_argument("MoE expert overlay tier spec is empty");
+            }
+
+            const auto at_pos = sections[0].find('@');
+            if (at_pos == std::string::npos)
+            {
+                throw std::invalid_argument("Invalid MoE expert overlay tier spec: '" + spec + "' (expected name@domain;priority=N)");
+            }
+
+            ExpertRoutedTier tier;
+            tier.name = trim(sections[0].substr(0, at_pos));
+            tier.domain = trim(sections[0].substr(at_pos + 1));
+            if (tier.name.empty() || tier.domain.empty())
+            {
+                throw std::invalid_argument("MoE expert overlay tier must include non-empty name and domain");
+            }
+
+            bool saw_priority = false;
+            for (size_t i = 1; i < sections.size(); ++i)
+            {
+                const auto eq_pos = sections[i].find('=');
+                if (eq_pos == std::string::npos)
+                {
+                    throw std::invalid_argument("Invalid MoE expert overlay tier option: '" + sections[i] + "'");
+                }
+
+                const std::string key = normalizeToken(sections[i].substr(0, eq_pos));
+                const std::string value = trim(sections[i].substr(eq_pos + 1));
+
+                if (key == "priority")
+                {
+                    tier.priority = std::stoi(value);
+                    saw_priority = true;
+                }
+                else if (key == "max_experts_per_layer")
+                {
+                    tier.max_experts_per_layer = std::stoi(value);
+                    if (tier.max_experts_per_layer < 0)
+                    {
+                        throw std::invalid_argument("MoE expert overlay tier max-experts-per-layer must be >= 0");
+                    }
+                }
+                else if (key == "memory_mb")
+                {
+                    if (normalizeToken(value) == "auto")
+                    {
+                        tier.memory_budget_bytes = 0;
+                    }
+                    else
+                    {
+                        const auto mb = std::stoull(value);
+                        tier.memory_budget_bytes = mb * 1024ULL * 1024ULL;
+                    }
+                }
+                else if (key == "fallback")
+                {
+                    tier.fallback = parseBoolValue(value);
+                }
+                else
+                {
+                    throw std::invalid_argument("Unknown MoE expert overlay tier option: '" + key + "'");
+                }
+            }
+
+            if (!saw_priority)
+            {
+                throw std::invalid_argument("MoE expert overlay tier '" + tier.name + "' is missing priority=<n>");
+            }
+
+            return tier;
+        }
+
+        std::string formatMoEOverlayValidationErrors(const std::vector<std::string> &errors)
+        {
+            std::ostringstream message;
+            message << "Invalid MoE expert overlay configuration:";
+            for (const auto &error : errors)
+            {
+                message << "\n - " << error;
+            }
+            return message.str();
+        }
+
+        void parseMoEExpertParallelYamlBlock(const std::string &yaml, OrchestrationConfig &config)
+        {
+            std::istringstream stream(yaml);
+            std::string line;
+            bool in_moe_block = false;
+            std::string current_moe_section;
+
+            while (std::getline(stream, line))
+            {
+                const std::string trimmed = trim(line);
+                if (trimmed.empty() || trimmed[0] == '#')
+                {
+                    continue;
+                }
+
+                const size_t indent = leadingWhitespace(line);
+                if (!in_moe_block)
+                {
+                    if (indent == 0 && trimmed == "moe_expert_parallel:")
+                    {
+                        in_moe_block = true;
+                        current_moe_section.clear();
+                        ensureMoEExpertParallelPlan(config);
+                    }
+                    continue;
+                }
+
+                if (indent == 0)
+                {
+                    in_moe_block = false;
+                    current_moe_section.clear();
+                    if (trimmed == "moe_expert_parallel:")
+                    {
+                        in_moe_block = true;
+                        ensureMoEExpertParallelPlan(config);
+                    }
+                    continue;
+                }
+
+                auto plan = ensureMoEExpertParallelPlan(config);
+
+                if (trimmed.rfind("-", 0) == 0)
+                {
+                    const std::string item = stripOuterQuotes(trim(trimmed.substr(1)));
+                    if (current_moe_section == "domains")
+                    {
+                        plan->domains.push_back(parseMoEExpertOverlayDomainSpec(item));
+                    }
+                    else if (current_moe_section == "routed_tiers")
+                    {
+                        plan->routed_tiers.push_back(parseMoEExpertOverlayTierSpec(item));
+                    }
+                    continue;
+                }
+
+                if (trimmed.back() == ':' && trimmed.find(':') == trimmed.size() - 1)
+                {
+                    current_moe_section = normalizeToken(trimmed.substr(0, trimmed.size() - 1));
+                    continue;
+                }
+
+                const size_t colon_pos = trimmed.find(':');
+                if (colon_pos == std::string::npos)
+                {
+                    continue;
+                }
+
+                const std::string key = normalizeToken(trimmed.substr(0, colon_pos));
+                const std::string value = stripOuterQuotes(trim(trimmed.substr(colon_pos + 1)));
+
+                if (current_moe_section == "residency" && key == "mode")
+                {
+                    plan->residency_policy = parseExpertResidencyPolicyValue(value);
+                    continue;
+                }
+
+                if (key == "enabled")
+                {
+                    plan->enabled = parseBoolValue(value);
+                }
+                else if (key == "execution_kind" || key == "kind")
+                {
+                    applyMoEExpertOverlayKind(config, value);
+                }
+                else if (key == "continuation_domain")
+                {
+                    plan->continuation_domain = value;
+                }
+                else if (key == "shared_expert_domain" || key == "shared_domain")
+                {
+                    plan->shared_expert_domain = value;
+                }
+                else if (key == "residency_mode")
+                {
+                    plan->residency_policy = parseExpertResidencyPolicyValue(value);
+                }
+            }
+        }
     } // anonymous namespace
 
     // =========================================================================
@@ -761,6 +1200,74 @@ namespace llaminar2
             .description = "Place sparse experts on CPU (default)",
             .setter = setters::assignBoolTrue(&OrchestrationConfig::moe_sparse_experts_cpu),
         });
+        spec.add({
+            .long_name = "--moe-expert-overlay",
+            .category = "MoE Configuration",
+            .value_label = "<kind>",
+            .description = "Same-layer MoE expert overlay: off, single-domain, tiered",
+            .valid_values = {"off", "single-domain", "tiered"},
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &v)
+                {
+                    applyMoEExpertOverlayKind(c, v);
+                }),
+        });
+        spec.add({
+            .long_name = "--moe-expert-overlay-continuation",
+            .category = "MoE Configuration",
+            .value_label = "<domain>",
+            .description = "MoE overlay domain that receives the final reduced output",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &v)
+                {
+                    ensureMoEExpertParallelPlan(c)->continuation_domain = v;
+                }),
+        });
+        spec.add({
+            .long_name = "--moe-expert-overlay-shared-domain",
+            .category = "MoE Configuration",
+            .value_label = "<domain>",
+            .description = "MoE overlay domain where shared experts execute",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &v)
+                {
+                    ensureMoEExpertParallelPlan(c)->shared_expert_domain = v;
+                }),
+        });
+        spec.add({
+            .long_name = "--moe-expert-overlay-residency",
+            .category = "MoE Configuration",
+            .value_label = "<policy>",
+            .description = "MoE overlay residency: static-by-id, histogram, explicit-masks",
+            .valid_values = {"static-by-id", "histogram", "explicit-masks"},
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &v)
+                {
+                    ensureMoEExpertParallelPlan(c)->residency_policy = parseExpertResidencyPolicyValue(v);
+                }),
+        });
+        spec.add({
+            .long_name = "--moe-expert-overlay-domain",
+            .category = "MoE Configuration",
+            .value_label = "<spec>",
+            .description = "Define MoE overlay domain: \"name=devices;scope=single|local|node_local;backend=type;compute=replicated_experts|expert_id_sharded|tensor_parallel_experts[;owner=N][;ranks=0,1]\"",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &v)
+                {
+                    ensureMoEExpertParallelPlan(c)->domains.push_back(parseMoEExpertOverlayDomainSpec(v));
+                }),
+        });
+        spec.add({
+            .long_name = "--moe-expert-overlay-tier",
+            .category = "MoE Configuration",
+            .value_label = "<spec>",
+            .description = "Define MoE overlay routed tier: \"name@domain;priority=N[;max-experts-per-layer=N][;memory-mb=N|auto][;fallback=true]\"",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &v)
+                {
+                    ensureMoEExpertParallelPlan(c)->routed_tiers.push_back(parseMoEExpertOverlayTierSpec(v));
+                }),
+        });
 
         // --- Precision -------------------------------------------------------
         spec.add({
@@ -1042,6 +1549,12 @@ namespace llaminar2
                 "Cannot use --heterogeneous with both --no-gpu-tp and --no-cpu-tp");
         }
 
+        auto overlay_errors = validateMoEExpertOverlayConfig(config);
+        if (!overlay_errors.empty())
+        {
+            throw std::invalid_argument(formatMoEOverlayValidationErrors(overlay_errors));
+        }
+
         return config;
     }
 
@@ -1070,12 +1583,15 @@ namespace llaminar2
     {
         OrchestrationConfig config;
 
+        parseMoEExpertParallelYamlBlock(yaml, config);
+
         // Simple line-by-line YAML parser (sufficient for our flat structure)
         // For production, consider using a proper YAML library like yaml-cpp
 
         std::istringstream stream(yaml);
         std::string line;
         std::string current_section;
+        bool skipping_moe_block = false;
 
         while (std::getline(stream, line))
         {
@@ -1084,6 +1600,23 @@ namespace llaminar2
             // Skip empty lines and comments
             if (trimmed.empty() || trimmed[0] == '#')
             {
+                continue;
+            }
+
+            const size_t indent = leadingWhitespace(line);
+            if (skipping_moe_block)
+            {
+                if (indent > 0)
+                {
+                    continue;
+                }
+                skipping_moe_block = false;
+            }
+
+            if (indent == 0 && trimmed == "moe_expert_parallel:")
+            {
+                skipping_moe_block = true;
+                current_section.clear();
                 continue;
             }
 

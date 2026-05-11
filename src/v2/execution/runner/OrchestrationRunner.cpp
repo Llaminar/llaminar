@@ -35,6 +35,7 @@
 #include "../../utils/WeightLoadingProfiler.h"
 #include "../local_execution/orchestrators/DeviceGraphOrchestrator.h"
 #include "../../execution/moe/MoERebalanceController.h"
+#include "../../execution/moe/MoEExpertOverlayProfiler.h"
 #include "../../execution/moe/ExpertWeightTransfer.h"
 
 #include <algorithm>
@@ -513,7 +514,7 @@ namespace llaminar2
 
             // Incremental MoE expert rebalancing: when the decode histogram
             // window fills, propose targeted expert swaps between sockets.
-            if (auto* controller = moeRebalanceController())
+            if (auto *controller = moeRebalanceController())
             {
                 if (controller->shouldRebalance())
                 {
@@ -886,8 +887,8 @@ namespace llaminar2
                 if (topo->is_node_leader())
                 {
                     LOG_INFO("Node leader (rank " << mpi_ctx_->rank()
-                             << ", node " << topo->placement().node_id
-                             << ") pre-populating page cache for multi-rank mmap...");
+                                                  << ", node " << topo->placement().node_id
+                                                  << ") pre-populating page cache for multi-rank mmap...");
                     MmapRegion::prepopulatePageCache(model_path);
                 }
                 // Intra-node barrier: same-node ranks wait for their node leader only.
@@ -1034,10 +1035,10 @@ namespace llaminar2
         int my_rank = mpi_ctx_ ? mpi_ctx_->rank() : 0;
         if (my_rank < static_cast<int>(cluster_inventory_.ranks.size()))
         {
-            const auto& rank_inv = cluster_inventory_.ranks[my_rank];
+            const auto &rank_inv = cluster_inventory_.ranks[my_rank];
             if (device.is_gpu())
             {
-                for (const auto& gpu : rank_inv.gpus)
+                for (const auto &gpu : rank_inv.gpus)
                 {
                     if (gpu.local_device_id == device.ordinal)
                     {
@@ -1070,17 +1071,26 @@ namespace llaminar2
         // KV precision from runtime config
         switch (plan_.runtime.kv_cache_precision)
         {
-        case KVCachePrecision::FP16:  cfg.kv_precision = "fp16"; break;
-        case KVCachePrecision::FP32:  cfg.kv_precision = "fp32"; break;
-        case KVCachePrecision::Q8_1:  cfg.kv_precision = "q8_1"; break;
-        default:                      cfg.kv_precision = "fp16"; break;
+        case KVCachePrecision::FP16:
+            cfg.kv_precision = "fp16";
+            break;
+        case KVCachePrecision::FP32:
+            cfg.kv_precision = "fp32";
+            break;
+        case KVCachePrecision::Q8_1:
+            cfg.kv_precision = "q8_1";
+            break;
+        default:
+            cfg.kv_precision = "fp16";
+            break;
         }
 
         // Compute local KV heads for TP
         if (plan_.weight_shard.total_shards > 1 && profile.n_kv_heads > 0)
         {
             cfg.local_kv_heads = profile.n_kv_heads / plan_.weight_shard.total_shards;
-            if (cfg.local_kv_heads < 1) cfg.local_kv_heads = 1;
+            if (cfg.local_kv_heads < 1)
+                cfg.local_kv_heads = 1;
         }
 
         auto plan = MemoryPlanner::plan(profile, {cfg});
@@ -1089,14 +1099,15 @@ namespace llaminar2
         {
             std::string msg = "Memory plan validation failed — model does not fit on assigned device(s):\n";
             msg += plan.renderTable();
-            for (const auto& d : plan.diagnostics)
+            for (const auto &d : plan.diagnostics)
             {
                 msg += "\n  " + d;
             }
             return setError(msg);
         }
 
-        LOG_INFO("[MemoryPlanner] Memory validation passed:\n" << plan.renderTable());
+        LOG_INFO("[MemoryPlanner] Memory validation passed:\n"
+                 << plan.renderTable());
         return true;
     }
 
@@ -1170,6 +1181,7 @@ namespace llaminar2
 
         // Build config from execution plan via canonical factory
         auto mdo_config = RankOrchestrator::Config::fromPlan(plan_);
+        mdo_config.moe_expert_parallel_plan = config_.moe_expert_parallel_plan;
 
         LOG_INFO("[OrchestrationRunner] Multi-device precision config: activation="
                  << activationPrecisionToString(mdo_config.activation_precision)
@@ -1229,6 +1241,7 @@ namespace llaminar2
 
         // Build config from execution plan via canonical factory
         auto mdo_config = RankOrchestrator::Config::fromPlan(plan_);
+        mdo_config.moe_expert_parallel_plan = config_.moe_expert_parallel_plan;
 
         // Log PP stage details
         for (size_t i = 0; i < mdo_config.pp_stages.size(); ++i)
@@ -1318,6 +1331,7 @@ namespace llaminar2
         // Build config from execution plan via canonical factory
         auto runner_config = InferenceRunnerConfig::fromPlan(plan_);
         runner_config.hostfile = config_.hostfile;
+        runner_config.moe_expert_parallel_plan = config_.moe_expert_parallel_plan;
 
         LOG_INFO("[OrchestrationRunner] Single-device precision config: activation="
                  << activationPrecisionToString(runner_config.activation_precision)
@@ -1422,15 +1436,15 @@ namespace llaminar2
         }
     }
 
-    MoERebalanceController* OrchestrationRunner::moeRebalanceController() const
+    MoERebalanceController *OrchestrationRunner::moeRebalanceController() const
     {
         if (runner_)
         {
-            if (auto* dgo = dynamic_cast<DeviceGraphOrchestrator*>(runner_.get()))
+            if (auto *dgo = dynamic_cast<DeviceGraphOrchestrator *>(runner_.get()))
             {
                 return dgo->moeRebalanceController();
             }
-            if (auto* rank = dynamic_cast<RankOrchestrator*>(runner_.get()))
+            if (auto *rank = dynamic_cast<RankOrchestrator *>(runner_.get()))
             {
                 return rank->moeRebalanceController();
             }
@@ -1439,12 +1453,12 @@ namespace llaminar2
     }
 
     void OrchestrationRunner::applyMoEExpertMasks(
-        const std::vector<std::vector<bool>>& masks,
-        const ReceivedWeightsMap& received)
+        const std::vector<std::vector<bool>> &masks,
+        const ReceivedWeightsMap &received)
     {
         if (runner_)
         {
-            if (auto* dgo = dynamic_cast<DeviceGraphOrchestrator*>(runner_.get()))
+            if (auto *dgo = dynamic_cast<DeviceGraphOrchestrator *>(runner_.get()))
             {
                 dgo->applyExpertMasks(masks, received);
             }
@@ -1452,11 +1466,11 @@ namespace llaminar2
     }
 
     bool OrchestrationRunner::applyMoEExpertMasksForAllLocalDevices(
-        const MoERebalanceController& controller)
+        const MoERebalanceController &controller)
     {
         if (!runner_)
             return false;
-        if (auto* rank = dynamic_cast<RankOrchestrator*>(runner_.get()))
+        if (auto *rank = dynamic_cast<RankOrchestrator *>(runner_.get()))
         {
             rank->applyMoEExpertMasksForAllDevices(controller);
             return true;
@@ -1465,11 +1479,11 @@ namespace llaminar2
     }
 
     bool OrchestrationRunner::applyMoEExpertMasksForAllLocalDevices(
-        const std::vector<std::vector<std::vector<bool>>>& masks_by_socket)
+        const std::vector<std::vector<std::vector<bool>>> &masks_by_socket)
     {
         if (!runner_)
             return false;
-        if (auto* rank = dynamic_cast<RankOrchestrator*>(runner_.get()))
+        if (auto *rank = dynamic_cast<RankOrchestrator *>(runner_.get()))
         {
             rank->applyMoEExpertMasksForAllDevices(masks_by_socket);
             return true;
@@ -1478,15 +1492,15 @@ namespace llaminar2
     }
 
     void OrchestrationRunner::setExpertReplicaSet(
-        const ExpertReplicaSet& replicas, int socket_id)
+        const ExpertReplicaSet &replicas, int socket_id)
     {
         if (runner_)
         {
-            if (auto* dgo = dynamic_cast<DeviceGraphOrchestrator*>(runner_.get()))
+            if (auto *dgo = dynamic_cast<DeviceGraphOrchestrator *>(runner_.get()))
             {
                 dgo->setExpertReplicaSet(replicas, socket_id);
             }
-            else if (auto* rank = dynamic_cast<RankOrchestrator*>(runner_.get()))
+            else if (auto *rank = dynamic_cast<RankOrchestrator *>(runner_.get()))
             {
                 rank->setExpertReplicaSetForAllDevices(replicas);
             }
@@ -1494,11 +1508,11 @@ namespace llaminar2
     }
 
     ReceivedWeightsMap OrchestrationRunner::transferExpertWeights(
-        const std::vector<ExpertMigration>& manifest, int num_layers)
+        const std::vector<ExpertMigration> &manifest, int num_layers)
     {
         if (runner_)
         {
-            if (auto* dgo = dynamic_cast<DeviceGraphOrchestrator*>(runner_.get()))
+            if (auto *dgo = dynamic_cast<DeviceGraphOrchestrator *>(runner_.get()))
             {
                 return dgo->transferExpertWeights(manifest, num_layers);
             }
@@ -1507,11 +1521,11 @@ namespace llaminar2
     }
 
     ReceivedWeightsMap OrchestrationRunner::transferReplicaWeights(
-        const ExpertReplicaSet& replicas, int num_layers)
+        const ExpertReplicaSet &replicas, int num_layers)
     {
         if (runner_)
         {
-            if (auto* dgo = dynamic_cast<DeviceGraphOrchestrator*>(runner_.get()))
+            if (auto *dgo = dynamic_cast<DeviceGraphOrchestrator *>(runner_.get()))
             {
                 return dgo->transferReplicaWeights(replicas, num_layers);
             }
@@ -1523,7 +1537,7 @@ namespace llaminar2
     {
         if (runner_)
         {
-            if (auto* dgo = dynamic_cast<DeviceGraphOrchestrator*>(runner_.get()))
+            if (auto *dgo = dynamic_cast<DeviceGraphOrchestrator *>(runner_.get()))
             {
                 return dgo->releaseRawExpertWeights();
             }
@@ -1595,6 +1609,7 @@ namespace llaminar2
         {
             runner_->flushStageTimeline();
         }
+        MoEExpertOverlayProfiler::flush();
     }
 
     void OrchestrationRunner::setSamplingParams(const SamplingParams &params)

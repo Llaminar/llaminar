@@ -17,6 +17,32 @@ namespace llaminar2
     // Alias for fully-qualified KernelFactory access
     using KernelFactory = llaminar::v2::kernels::KernelFactory;
 
+    namespace
+    {
+        bool ensureRoutingOutputOnStageDevice(TensorBase *tensor, DeviceId device, const char *name)
+        {
+            if (!device.is_gpu())
+                return true;
+
+            if (!tensor->ensureOnDevice(device))
+            {
+                LOG_ERROR("[MoERoutingStage] Failed to make routing output '" << name
+                                                                                << "' available on " << device.to_string());
+                return false;
+            }
+
+            if (!tensor->is_on_device(device))
+            {
+                LOG_ERROR("[MoERoutingStage] Routing output '" << name
+                                                                << "' is not resident on " << device.to_string()
+                                                                << " after routing");
+                return false;
+            }
+
+            return true;
+        }
+    } // namespace
+
     MoERoutingStage::MoERoutingStage(Params params)
         : IComputeStage(params.device_id), params_(std::move(params))
     {
@@ -85,6 +111,12 @@ namespace llaminar2
                 cached_routing_))
         {
             LOG_ERROR("[MoERoutingStage] Routing failed");
+            return false;
+        }
+
+        if (!ensureRoutingOutputOnStageDevice(params_.output_indices, params_.device_id, "output_indices") ||
+            !ensureRoutingOutputOnStageDevice(params_.output_weights, params_.device_id, "output_weights"))
+        {
             return false;
         }
 

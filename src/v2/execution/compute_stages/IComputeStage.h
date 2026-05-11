@@ -287,6 +287,8 @@ namespace llaminar2
         MOE_EXPERT_FFN,
         MOE_SHARED_EXPERT_FFN, ///< Shared expert FFN (distinct from per-expert MOE_EXPERT_FFN)
         MOE_SHARED_EXPERT_GATE, ///< Shared expert sigmoid gate
+        MOE_EXPERT_DISPATCH, ///< Host-side dispatch descriptor builder for expert-parallel tiers
+        MOE_EXPERT_PARALLEL_REDUCE, ///< Host-side dense partial reduction for expert-parallel tiers
 
         // Collective
         ALLREDUCE,

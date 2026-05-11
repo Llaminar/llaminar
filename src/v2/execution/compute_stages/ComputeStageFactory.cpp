@@ -14,10 +14,15 @@
 #include "stages/KVCacheAppendStage.h"
 #include "stages/KVCacheGatherStage.h"
 #include "stages/LMHeadStage.h"
+#include "stages/MoEExpertDispatchStage.h"
+#include "stages/MoEExpertOverlayCPUFallbackStage.h"
+#include "stages/MoEExpertOverlayLocalTPStage.h"
+#include "stages/MoEExpertParallelReduceStage.h"
 #include "stages/MoERoutingStage.h"
 #include "stages/ReceiveActivationsStage.h"
 #include "stages/ResidualAddStage.h"
-#include "stages/RMSNormStage.h"\n #include "stages/QKNormStage.h"
+#include "stages/RMSNormStage.h"
+#include "stages/QKNormStage.h"
 #include "stages/RoPEStage.h"
 #include "stages/SendActivationsStage.h"
 #include "stages/GDNProjectionStage.h"
@@ -110,6 +115,30 @@ namespace llaminar2
         const MoERoutingStage::Params &params)
     {
         return std::make_unique<MoERoutingStage>(params);
+    }
+
+    std::unique_ptr<IComputeStage> ComputeStageFactory::createMoEExpertDispatch(
+        const MoEExpertDispatchStage::Params &params)
+    {
+        return std::make_unique<MoEExpertDispatchStage>(params);
+    }
+
+    std::unique_ptr<IComputeStage> ComputeStageFactory::createMoEExpertOverlayCPUFallback(
+        const MoEExpertOverlayCPUFallbackStage::Params &params)
+    {
+        return std::make_unique<MoEExpertOverlayCPUFallbackStage>(params);
+    }
+
+    std::unique_ptr<IComputeStage> ComputeStageFactory::createMoEExpertOverlayLocalTP(
+        const MoEExpertOverlayLocalTPStage::Params &params)
+    {
+        return std::make_unique<MoEExpertOverlayLocalTPStage>(params);
+    }
+
+    std::unique_ptr<IComputeStage> ComputeStageFactory::createMoEExpertParallelReduce(
+        const MoEExpertParallelReduceStage::Params &params)
+    {
+        return std::make_unique<MoEExpertParallelReduceStage>(params);
     }
 
     std::unique_ptr<IComputeStage> ComputeStageFactory::createSharedExpertFFN(

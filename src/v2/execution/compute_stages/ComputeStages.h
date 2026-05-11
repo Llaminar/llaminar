@@ -40,6 +40,10 @@
 #include "stages/AllreduceStage.h"
 #include "stages/AllGatherStage.h"
 
+// MoE stages
+#include "stages/MoEExpertDispatchStage.h"
+#include "stages/MoEExpertParallelReduceStage.h"
+
 // Qwen 3.5 FA stages
 #include "stages/QGateSplitStage.h"
 

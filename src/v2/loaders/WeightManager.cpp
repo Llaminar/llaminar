@@ -8,6 +8,7 @@
 #include "MmapRegion.h"
 #include "PreparedWeightStore.h"
 #include "../execution/moe/ExpertWeightPayloadProvider.h"
+#include "../execution/moe/MoEExpertOverlayRuntimePlan.h"
 #include "../utils/Logger.h"
 #include "../utils/WeightLoadingProfiler.h"
 #include "../utils/DebugEnv.h"
@@ -37,6 +38,7 @@
 #include <regex>
 #include <algorithm>
 #include <chrono>
+#include <cctype>
 #include <condition_variable>
 #include <deque>
 #include <atomic>
@@ -3432,6 +3434,15 @@ namespace llaminar2
         }
     }
 
+    static std::string registrySlotComponent(const std::string &value)
+    {
+        std::string result;
+        result.reserve(value.size());
+        for (unsigned char ch : value)
+            result.push_back(std::isalnum(ch) ? static_cast<char>(std::tolower(ch)) : '_');
+        return result.empty() ? std::string("default") : result;
+    }
+
     static bool parseMoEExpertParentName(const std::string &name,
                                          int &layer_idx,
                                          ExpertGemmRegistry::WeightRole &role)
@@ -3459,6 +3470,20 @@ namespace llaminar2
         return false;
     }
 
+    static std::string moeParentNameForRole(int layer_idx, ExpertGemmRegistry::WeightRole role)
+    {
+        switch (role)
+        {
+        case ExpertGemmRegistry::WeightRole::GATE:
+            return "blk." + std::to_string(layer_idx) + ".ffn_gate_exps.weight";
+        case ExpertGemmRegistry::WeightRole::UP:
+            return "blk." + std::to_string(layer_idx) + ".ffn_up_exps.weight";
+        case ExpertGemmRegistry::WeightRole::DOWN:
+            return "blk." + std::to_string(layer_idx) + ".ffn_down_exps.weight";
+        }
+        return {};
+    }
+
     static int moeExpertCountFromParentTensor(const TensorBase &tensor)
     {
         const auto &shape = tensor.shape();
@@ -3467,16 +3492,124 @@ namespace llaminar2
         return static_cast<int>(shape[2]);
     }
 
+    static size_t estimateMoEOverlayRoutedExpertBytesPerExpert(
+        const std::unordered_map<std::string, std::shared_ptr<TensorBase>> &cache)
+    {
+        struct LayerEstimate
+        {
+            size_t bytes = 0;
+            int role_count = 0;
+        };
+
+        std::unordered_map<int, LayerEstimate> by_layer;
+        for (const auto &[name, tensor] : cache)
+        {
+            if (!tensor)
+                continue;
+
+            int layer_idx = -1;
+            ExpertGemmRegistry::WeightRole role = ExpertGemmRegistry::WeightRole::GATE;
+            if (!parseMoEExpertParentName(name, layer_idx, role))
+                continue;
+
+            const int num_experts = moeExpertCountFromParentTensor(*tensor);
+            if (num_experts <= 0)
+                continue;
+
+            auto &estimate = by_layer[layer_idx];
+            estimate.bytes += tensor->size_bytes() / static_cast<size_t>(num_experts);
+            ++estimate.role_count;
+        }
+
+        size_t best_partial = 0;
+        for (const auto &[_, estimate] : by_layer)
+        {
+            if (estimate.role_count >= 3)
+                return estimate.bytes;
+            best_partial = std::max(best_partial, estimate.bytes);
+        }
+        return best_partial;
+    }
+
     static std::string formatMiB(size_t bytes)
     {
         return std::to_string(bytes / (1024 * 1024)) + " MiB";
+    }
+
+    bool WeightManager::prepareMoEExpertOverlayWeights(
+        const MoEExpertOverlayRuntimePlan &runtime_plan,
+        const FrozenModelWeightSet *frozen_weights)
+    {
+        (void)frozen_weights;
+
+        if (!runtime_plan.sourcePlan().isTieredOverlay())
+            return true;
+
+        size_t routed_expert_bytes_per_expert = 0;
+        {
+            std::lock_guard<std::mutex> lock(cache_mutex_);
+            routed_expert_bytes_per_expert = estimateMoEOverlayRoutedExpertBytesPerExpert(cache_);
+        }
+
+        auto preparation_plan = MoEExpertOverlayPreparationPlan::build(
+            runtime_plan,
+            routed_expert_bytes_per_expert);
+        moe_overlay_preparation_diagnostics_ = preparation_plan.diagnostics();
+
+        LOG_INFO("[WeightManager] " << moe_overlay_preparation_diagnostics_.render());
+
+        {
+            std::unordered_set<std::string> cpu_owned_parent_names;
+            for (const auto &request : preparation_plan.requests())
+            {
+                if (!request.device.is_cpu())
+                    continue;
+                auto parent_name = moeParentNameForRole(request.layer, request.role);
+                if (!parent_name.empty())
+                    cpu_owned_parent_names.insert(std::move(parent_name));
+            }
+
+            for (const auto &parent_name : cpu_owned_parent_names)
+            {
+                markPrepState(parent_name, DeviceId::cpu(), WeightPrepState::LOADED_HOST, true,
+                              "MoE overlay CPU fallback owns routed expert host parent");
+            }
+        }
+
+        if (preparation_plan.empty() || !preparation_plan.hasAcceleratorRequests())
+            return true;
+
+        bool ok = true;
+        for (const auto &device : preparation_plan.acceleratorDevices())
+        {
+            auto layer_role_filter = [&preparation_plan, device](const std::string &name) -> bool
+            {
+                int layer_idx = -1;
+                ExpertGemmRegistry::WeightRole role = ExpertGemmRegistry::WeightRole::GATE;
+                if (!parseMoEExpertParentName(name, layer_idx, role))
+                    return false;
+                return preparation_plan.hasAnyRequestForDeviceLayerRole(device, layer_idx, role);
+            };
+
+            LOG_INFO("[WeightManager] Preparing MoE overlay experts for " << device.to_string());
+            const bool device_ok = packGemmWeightsViaPipeline(
+                device,
+                layer_role_filter,
+                nullptr,
+                true,
+                &preparation_plan);
+            ok = ok && device_ok;
+        }
+
+        return ok;
     }
 
     bool WeightManager::packGemmWeightsViaPipeline(
         DeviceId target_device,
         std::function<bool(const std::string &)> layer_filter,
         const FrozenModelWeightSet *frozen_weights,
-        bool include_expert_jobs)
+        bool include_expert_jobs,
+        const MoEExpertOverlayPreparationPlan *overlay_preparation_plan)
     {
         using namespace llaminar::v2::kernels;
         using Clock = std::chrono::high_resolution_clock;
@@ -3629,6 +3762,9 @@ namespace llaminar2
             int expert_idx;
             ExpertGemmRegistry::WeightRole role;
             std::string slot_name;               // e.g., "moe_L0_gate_e5"
+            std::string domain_name;
+            std::string tier_name;
+            int tier_index = -1;
             std::shared_ptr<TensorBase> view;     // 2D expert view (keeps parent alive)
         };
         std::vector<MoEExpertJob> moe_jobs;
@@ -3728,6 +3864,14 @@ namespace llaminar2
 
                     for (int e = 0; e < num_experts; ++e)
                     {
+                        const auto *overlay_request = overlay_preparation_plan
+                                                          ? overlay_preparation_plan->requestFor(target_device, layer_idx, e, rt.role)
+                                                          : nullptr;
+                        if (overlay_preparation_plan && !overlay_request)
+                        {
+                            continue;
+                        }
+
                         const size_t element_offset = static_cast<size_t>(e) * role_elements_per_expert;
                         std::vector<size_t> view_shape = {role_rows_per_expert, role_cols};
                         auto view = rt.tensor_3d->create_view(view_shape, element_offset);
@@ -3742,8 +3886,22 @@ namespace llaminar2
 
                         std::string slot_name = "moe_L" + std::to_string(layer_idx) + "_"
                                                 + rt.tag + "_e" + std::to_string(e);
+                        std::string domain_name;
+                        std::string tier_name;
+                        int tier_index = -1;
+                        if (overlay_request)
+                        {
+                            domain_name = overlay_request->domain_name;
+                            tier_name = overlay_request->tier_name;
+                            tier_index = overlay_request->tier_index;
+                            slot_name = "moe_" + registrySlotComponent(domain_name) + "_tier" +
+                                        std::to_string(tier_index) + "_L" + std::to_string(layer_idx) +
+                                        "_" + rt.tag + "_e" + std::to_string(e);
+                        }
 
-                        moe_jobs.push_back({layer_idx, e, rt.role, std::move(slot_name), std::move(view)});
+                        moe_jobs.push_back({layer_idx, e, rt.role, std::move(slot_name),
+                                            std::move(domain_name), std::move(tier_name), tier_index,
+                                            std::move(view)});
                     }
                 }
 
@@ -4317,9 +4475,19 @@ namespace llaminar2
             if (kernel)
             {
                 ITensorGemm *raw_ptr = kernel.get();
-                expert_gemm_registry_.registerEngine(
-                    target_device, mj.layer_idx, mj.expert_idx, mj.role,
-                    raw_ptr, std::move(kernel));
+                if (!mj.domain_name.empty())
+                {
+                    expert_gemm_registry_.registerEngineForDomain(
+                        mj.domain_name,
+                        target_device, mj.layer_idx, mj.expert_idx, mj.role,
+                        raw_ptr, std::move(kernel));
+                }
+                else
+                {
+                    expert_gemm_registry_.registerEngine(
+                        target_device, mj.layer_idx, mj.expert_idx, mj.role,
+                        raw_ptr, std::move(kernel));
+                }
                 ++moe_registered;
             }
         }
@@ -4347,6 +4515,41 @@ namespace llaminar2
                 markPrepState(name, target_device, WeightPrepState::READY, true,
                               std::string("GPU pipeline: MoE ") + moeWeightRoleName(role) +
                                   " expert parent ready");
+            }
+            else if (overlay_preparation_plan)
+            {
+                const auto expected_domains = overlay_preparation_plan->domainsForDeviceLayerRole(
+                    target_device, layer_idx, role);
+                bool overlay_ready = !expected_domains.empty();
+                std::string missing_domain;
+                for (const auto &domain_name : expected_domains)
+                {
+                    const auto expected_experts = overlay_preparation_plan->expertsForDomainDeviceLayerRole(
+                        domain_name, target_device, layer_idx, role);
+                    if (expected_experts.empty())
+                        continue;
+                    if (!expert_gemm_registry_.hasCompleteRoleForExpertsInDomain(
+                            domain_name, target_device, layer_idx, expected_experts, role))
+                    {
+                        overlay_ready = false;
+                        missing_domain = domain_name;
+                        break;
+                    }
+                }
+
+                if (overlay_ready)
+                {
+                    markPrepState(name, target_device, WeightPrepState::READY, true,
+                                  std::string("GPU pipeline: MoE overlay ") + moeWeightRoleName(role) +
+                                      " expert subset ready");
+                }
+                else
+                {
+                    markPrepState(name, target_device, WeightPrepState::FAILED, true,
+                                  std::string("GPU pipeline: incomplete MoE overlay ") + moeWeightRoleName(role) +
+                                      " expert registry entries" +
+                                      (missing_domain.empty() ? std::string() : " for domain " + missing_domain));
+                }
             }
             else
             {

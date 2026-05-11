@@ -69,8 +69,10 @@
 #include "../mpi_orchestration/RankExecutionPlan.h"
 #include "../../config/PipelineConfig.h"
 #include "FactoryPPStageConfig.h"
+#include <map>
 #include <memory>
 #include <optional>
+#include <string>
 
 namespace llaminar2
 {
@@ -80,6 +82,10 @@ namespace llaminar2
     class ILocalTPContext;
     class IRankOrchestrator;
     class PreparedWeightStore;
+    struct GraphConfig;
+    struct MoEExpertParallelPlan;
+
+    using DomainLocalTPContextMap = std::map<std::string, std::shared_ptr<ILocalTPContext>>;
 
     // Note: FactoryPPStageConfig is now defined in FactoryPPStageConfig.h
     // to avoid circular dependencies with RankOrchestrator.h
@@ -160,6 +166,11 @@ namespace llaminar2
         /// paths install this store before materializing/preparing weights.
         std::shared_ptr<PreparedWeightStore> prepared_weight_store;
 
+        /// Optional same-layer MoE expert overlay plan injected by orchestration
+        /// and parity tests. When present, graph builders receive it through
+        /// GraphConfig::moe.expert_parallel_plan.
+        std::shared_ptr<MoEExpertParallelPlan> moe_expert_parallel_plan;
+
         /**
          * @brief Canonical factory: build InferenceRunnerConfig from a RankExecutionPlan
          *
@@ -223,6 +234,34 @@ namespace llaminar2
         std::shared_ptr<IModelContext> model_ctx,
         DeviceId device,
         const InferenceRunnerConfig &config = {});
+
+    /**
+     * @brief Resolve a requested MoE expert overlay plan against loaded model metadata.
+     *
+     * If no plan is configured, returns nullptr. If the plan is enabled and has no
+     * explicit placements, this runs the production MoEExpertParallelPlanner and
+     * returns a planned copy. If explicit placements are present, validates them
+     * against the model and returns the original shared plan.
+     *
+     * Throws std::invalid_argument/std::runtime_error with diagnostics on invalid
+     * metadata, validation, or planning failures.
+     */
+    std::shared_ptr<MoEExpertParallelPlan> resolveMoEExpertParallelPlanForModel(
+        IModelContext &model_ctx,
+        const InferenceRunnerConfig &config);
+
+    /**
+     * @brief Populate production-owned domain-scoped LocalTP contexts for active
+     * MoE expert overlay LocalTP TensorParallelExperts domains.
+     *
+     * The returned/updated owner map must stay alive for the graph builder and
+     * executor lifetime because GraphConfig stores raw ILocalTPContext pointers.
+     * Existing GraphConfig::domain_tp_contexts entries are preserved.
+     */
+    bool populateMoEExpertOverlayDomainTPContextsForGraph(
+        GraphConfig &graph_config,
+        DomainLocalTPContextMap &owned_contexts,
+        const char *context);
 
     /**
      * @brief Factory function to create a unified LOCAL PP runner

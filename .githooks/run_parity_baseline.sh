@@ -1,8 +1,9 @@
 #!/bin/bash
-# Focused parity baseline — 26 tests covering all model families.
+# Focused parity baseline — 30 tests covering all model families.
 #
 # Covers: Qwen2, Qwen3, Qwen3.5 (dense), Qwen3.5 MoE (sparse),
-#         NodeLocalTP (multi-device), HybridPPTP (pipeline+tensor parallel).
+#         NodeLocalTP (multi-device), HybridPPTP (pipeline+tensor parallel),
+#         and ExpertOverlay (tiered same-layer expert residency).
 #
 # Tests run sequentially (parity tests share GPU resources and use
 # RESOURCE_LOCK for serialization within CTest).
@@ -56,6 +57,11 @@ TESTS=(
   # Qwen3.5 MoE HybridPPTP (2)
   "Qwen35MoEHybridPPTPParityTest_PrefillParityWithGpuExpertCache"
   "Qwen35MoEHybridPPTPParityTest_DecodeParityWithGpuExpertCache"
+  # Qwen3.5 MoE ExpertOverlay (4)
+  "Qwen35MoEExpertOverlay_PrefillParity_ROCm2TP_SharedHot_CPU2NodeLocalTP_Cold$"
+  "Qwen35MoEExpertOverlay_DecodeParity_ROCm2TP_SharedHot_CPU2NodeLocalTP_Cold$"
+  "Qwen35MoEExpertOverlay_PrefillParity_CUDA1_SharedHot_ROCm2TP_Hot_CPU2NodeLocalTP_Cold$"
+  "Qwen35MoEExpertOverlay_DecodeParity_CUDA1_SharedHot_ROCm2TP_Hot_CPU2NodeLocalTP_Cold$"
 )
 
 TOTAL=${#TESTS[@]}

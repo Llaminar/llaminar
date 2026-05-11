@@ -7,6 +7,7 @@
  */
 
 #include "GlobalOrchestratorRunner.h"
+#include "execution/moe/MoEExpertOverlayProfiler.h"
 #include "../../utils/Logger.h"
 
 namespace llaminar2
@@ -51,11 +52,12 @@ namespace llaminar2
         int my_rank = config_.mpi_ctx ? config_.mpi_ctx->rank() : 0;
         if (my_rank == 0)
         {
-            LOG_INFO("GlobalOrchestratorRunner: PP topology:\n" << config_.topology.toTable());
+            LOG_INFO("GlobalOrchestratorRunner: PP topology:\n"
+                     << config_.topology.toTable());
         }
 
         LOG_INFO("GlobalOrchestratorRunner initialized: " << architecture_name_
-                 << " on rank " << my_rank);
+                                                          << " on rank " << my_rank);
         return true;
     }
 
@@ -371,6 +373,7 @@ namespace llaminar2
     {
         if (global_orch_)
             global_orch_->flushStageTimeline();
+        MoEExpertOverlayProfiler::flush();
     }
 
     void GlobalOrchestratorRunner::setSamplingParams(const SamplingParams &params)

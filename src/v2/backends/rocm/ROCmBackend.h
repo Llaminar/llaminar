@@ -80,6 +80,8 @@ namespace llaminar2
         void *allocate(size_t bytes, int device_id) override;
         void free(void *ptr, int device_id) override;
         bool memset(void *ptr, int value, size_t bytes, int device_id, void *stream = nullptr) override;
+        bool vectorAddInplace(void *output, const void *input, size_t count,
+                      int element_size, int device_id, void *stream = nullptr) override;
 
         // Zero-copy mapped memory operations
         void *allocateMapped(size_t bytes, int device_id, void **device_ptr) override;

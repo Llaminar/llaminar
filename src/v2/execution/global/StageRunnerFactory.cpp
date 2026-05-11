@@ -202,6 +202,7 @@ namespace llaminar2
         ro_config.use_mapped_memory = ctx.runner_config.use_mapped_memory;
         ro_config.nested_pp_stage_config = pp_cfg;
         ro_config.prepared_weight_store = weight_context->prepared_store;
+        ro_config.moe_expert_parallel_plan = ctx.runner_config.moe_expert_parallel_plan;
 
         auto rank_runner = createRankOrchestrator(
             ctx.model_ctx,

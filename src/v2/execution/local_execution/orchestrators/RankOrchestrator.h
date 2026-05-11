@@ -226,6 +226,10 @@ namespace llaminar2
             /// and its per-device runners.
             std::shared_ptr<PreparedWeightStore> prepared_weight_store;
 
+            /// Optional same-layer MoE expert overlay plan propagated from
+            /// orchestration config to per-device runner configs.
+            std::shared_ptr<MoEExpertParallelPlan> moe_expert_parallel_plan;
+
             // =================================================================
             // Helper Methods
             // =================================================================

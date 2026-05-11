@@ -557,6 +557,47 @@ namespace llaminar2
         return !domain_definitions.empty() || !pp_stage_definitions.empty();
     }
 
+    std::vector<std::string> validateMoEExpertOverlayConfig(const OrchestrationConfig &config)
+    {
+        std::vector<std::string> errors;
+        const auto &plan_ptr = config.moe_expert_parallel_plan;
+        if (!plan_ptr)
+        {
+            return errors;
+        }
+
+        const auto &plan = *plan_ptr;
+        const bool has_overlay_details =
+            !plan.continuation_domain.empty() ||
+            !plan.shared_expert_domain.empty() ||
+            plan.residency_policy != ExpertResidencyPolicy::Disabled ||
+            !plan.domains.empty() ||
+            !plan.routed_tiers.empty() ||
+            !plan.placements.empty();
+
+        if (!plan.enabled)
+        {
+            if (has_overlay_details)
+            {
+                errors.push_back("MoE expert overlay is off/disabled but overlay domain, tier, continuation, shared-domain, residency, or placement settings were also provided");
+            }
+            return errors;
+        }
+
+        auto plan_result = validateMoEExpertParallelPlan(plan);
+        for (const auto &error : plan_result.errors)
+        {
+            errors.push_back("MoE expert overlay: " + error);
+        }
+
+        if (!config.pp_stage_definitions.empty())
+        {
+            errors.push_back("MoE expert overlay cannot be combined with --pp-stage in Phase 2: overlay domains are same-layer expert roles, not PP layer ownership");
+        }
+
+        return errors;
+    }
+
     std::vector<std::string> OrchestrationConfig::validate() const
     {
         std::vector<std::string> errors;
@@ -671,6 +712,12 @@ namespace llaminar2
         if (cpu_layers < 0)
         {
             errors.push_back("CPU layers must be >= 0, got " + std::to_string(cpu_layers));
+        }
+
+        // Validate optional same-layer MoE expert overlay plan.
+        {
+            auto overlay_errors = validateMoEExpertOverlayConfig(*this);
+            errors.insert(errors.end(), overlay_errors.begin(), overlay_errors.end());
         }
 
         // Validate precision strings

@@ -227,6 +227,82 @@ namespace llaminar2
         }
 
         /**
+         * @brief Resolve a host-visible pointer for a dump buffer.
+         *
+         * StageDumpInfo records raw_data() when it is built, but GPU stages often
+         * leave tensors DEVICE_AUTHORITATIVE until a debug consumer explicitly
+         * requests a host copy.  Without this sync, stage dumps can contain stale
+         * host buffers (commonly all zeros) even though the device output is valid.
+         */
+        static const void *hostDataForDump(const StageDumpInfo::InputBuffer &buffer)
+        {
+            const void *data = buffer.data;
+            if (buffer.tensor)
+            {
+                if (buffer.tensor->ensureOnHost())
+                    data = buffer.tensor->raw_data();
+                else
+                    fprintf(stderr, "[STAGE_DUMP] Failed to sync input '%s' to host before dump\n",
+                            buffer.name ? buffer.name : "<unnamed>");
+            }
+            return data;
+        }
+
+        static const void *hostDataForDump(const StageDumpInfo::OutputBuffer &buffer)
+        {
+            return buffer.data;
+        }
+
+        static void writeWeightMetadata(const StageDumpContext &ctx, const StageDumpInfo &dump_info)
+        {
+            const auto &cfg = debugEnv().stage_dump;
+            if (!cfg.dump_weights)
+                return;
+
+            for (const auto &weight : dump_info.weights)
+            {
+                if (!weight.tensor)
+                    continue;
+
+                TensorDumpMeta meta;
+                meta.name = weight.name;
+                meta.rows = weight.rows;
+                meta.cols = weight.cols;
+                meta.dtype = weight.dtype ? weight.dtype : "unknown";
+                writeTensorMeta(ctx.dump_dir + "/weights/" + weight.name + "_meta.txt", meta);
+            }
+        }
+
+        static void writeScalars(const StageDumpContext &ctx, const StageDumpInfo &dump_info)
+        {
+            if (dump_info.scalars.empty())
+                return;
+
+            std::string params_path = ctx.dump_dir + "/scalars.txt";
+            FILE *f = fopen(params_path.c_str(), "w");
+            if (!f)
+                return;
+
+            for (const auto &scalar : dump_info.scalars)
+            {
+                if (std::string(scalar.dtype) == "int")
+                {
+                    fprintf(f, "%s=%d\n", scalar.name, static_cast<int>(scalar.value));
+                }
+                else if (std::string(scalar.dtype) == "bool")
+                {
+                    fprintf(f, "%s=%s\n", scalar.name, scalar.value != 0 ? "true" : "false");
+                }
+                else
+                {
+                    fprintf(f, "%s=%f\n", scalar.name, scalar.value);
+                }
+            }
+
+            fclose(f);
+        }
+
+        /**
          * @brief Begin a dump for a stage (creates directory, returns context)
          *
          * Call before stage->execute() to dump inputs.
@@ -313,7 +389,8 @@ namespace llaminar2
             {
                 for (const auto &input : dump_info.inputs)
                 {
-                    if (!input.data)
+                    const void *input_data = hostDataForDump(input);
+                    if (!input_data)
                         continue;
 
                     std::string path = ctx.dump_dir + "/inputs/" + input.name;
@@ -330,7 +407,7 @@ namespace llaminar2
                     if (std::string(input.dtype) == "FP32")
                     {
                         path += ".bin";
-                        dumpFP32Buffer(path, static_cast<const float *>(input.data),
+                        dumpFP32Buffer(path, static_cast<const float *>(input_data),
                                        input.rows * input.cols, meta);
                     }
                     else
@@ -340,7 +417,7 @@ namespace llaminar2
                         std::string dtype_lower = input.dtype;
                         std::transform(dtype_lower.begin(), dtype_lower.end(), dtype_lower.begin(), ::tolower);
                         path += "_" + dtype_lower + ".bin";
-                        dumpRawBuffer(path, input.data, dump_bytes, meta);
+                        dumpRawBuffer(path, input_data, dump_bytes, meta);
                     }
 
                     writeTensorMeta(ctx.dump_dir + "/inputs/" + input.name + "_meta.txt", meta);
@@ -350,51 +427,11 @@ namespace llaminar2
             // Dump weights
             if (cfg.dump_weights)
             {
-                for (const auto &weight : dump_info.weights)
-                {
-                    if (!weight.tensor)
-                        continue;
-
-                    std::string path = ctx.dump_dir + "/weights/" + weight.name;
-                    TensorDumpMeta meta;
-                    meta.name = weight.name;
-                    meta.rows = weight.rows;
-                    meta.cols = weight.cols;
-                    meta.dtype = weight.dtype ? weight.dtype : "unknown";
-
-                    // Dump weight metadata
-                    writeTensorMeta(ctx.dump_dir + "/weights/" + weight.name + "_meta.txt", meta);
-
-                    // Note: Full weight dumping would require dequantization
-                    // For now, we just record metadata - full dump can be added later
-                }
+                writeWeightMetadata(ctx, dump_info);
             }
 
             // Dump scalar params
-            if (!dump_info.scalars.empty())
-            {
-                std::string params_path = ctx.dump_dir + "/scalars.txt";
-                FILE *f = fopen(params_path.c_str(), "w");
-                if (f)
-                {
-                    for (const auto &scalar : dump_info.scalars)
-                    {
-                        if (std::string(scalar.dtype) == "int")
-                        {
-                            fprintf(f, "%s=%d\n", scalar.name, static_cast<int>(scalar.value));
-                        }
-                        else if (std::string(scalar.dtype) == "bool")
-                        {
-                            fprintf(f, "%s=%s\n", scalar.name, scalar.value != 0 ? "true" : "false");
-                        }
-                        else
-                        {
-                            fprintf(f, "%s=%f\n", scalar.name, scalar.value);
-                        }
-                    }
-                    fclose(f);
-                }
-            }
+            writeScalars(ctx, dump_info);
 
             return true;
         }
@@ -415,12 +452,16 @@ namespace llaminar2
 
             ctx.outputs_dumped = true;
 
-            // Get dump info from stage
+            // Get fresh dump info from stage so post-execute diagnostics and
+            // tensors populated during execute() are represented in the dump.
+            stage->invalidateDumpInfoCache();
             StageDumpInfo dump_info = stage->getDumpInfo();
+            dump_info.ensureOutputsOnHost();
 
             for (const auto &output : dump_info.outputs)
             {
-                if (!output.data)
+                const void *output_data = hostDataForDump(output);
+                if (!output_data)
                     continue;
 
                 std::string path = ctx.dump_dir + "/outputs/" + output.name;
@@ -437,7 +478,7 @@ namespace llaminar2
                 if (std::string(output.dtype) == "FP32")
                 {
                     path += ".bin";
-                    dumpFP32Buffer(path, static_cast<const float *>(output.data),
+                    dumpFP32Buffer(path, static_cast<const float *>(output_data),
                                    output.rows * output.cols, meta);
                 }
                 else
@@ -446,11 +487,13 @@ namespace llaminar2
                     std::string dtype_lower = output.dtype;
                     std::transform(dtype_lower.begin(), dtype_lower.end(), dtype_lower.begin(), ::tolower);
                     path += "_" + dtype_lower + ".bin";
-                    dumpRawBuffer(path, output.data, dump_bytes, meta);
+                    dumpRawBuffer(path, output_data, dump_bytes, meta);
                 }
 
                 writeTensorMeta(ctx.dump_dir + "/outputs/" + output.name + "_meta.txt", meta);
             }
+
+            writeScalars(ctx, dump_info);
 
             return true;
         }

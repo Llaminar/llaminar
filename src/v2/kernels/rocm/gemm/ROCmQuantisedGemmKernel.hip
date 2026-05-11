@@ -113,6 +113,24 @@ __global__ void applyScaling_full_kernel(
     }
 }
 
+__global__ void applyFp32Epilogue_kernel(
+    float* __restrict__ d_output,
+    const float* __restrict__ d_bias,
+    int M, int N,
+    float alpha)
+{
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = M * N;
+    if (idx >= total) return;
+
+    const int col = idx % N;
+    float result = alpha * d_output[idx];
+    if (d_bias != nullptr)
+    {
+        result += d_bias[col];
+    }
+    d_output[idx] = result;
+}
 // ============================================================================
 // Vectorized Scaling Kernel with 1D Flat Grid (M > 1 fast path)
 // ============================================================================
@@ -1441,6 +1459,43 @@ extern "C"
         return true;
     }
 
+    bool rocmQuantGemm_applyFp32Epilogue(
+        float *d_output,
+        const float *d_bias,
+        int M, int N,
+        float alpha,
+        int rocm_device_id, void* stream)
+    {
+        if (!d_output)
+        {
+            fprintf(stderr, "[rocmQuantGemm_applyFp32Epilogue] Null output pointer\n");
+            return false;
+        }
+
+        if (!rocmQuantGemm_setDevice(rocm_device_id))
+            return false;
+
+        if (alpha == 1.0f && d_bias == nullptr)
+            return true;
+
+        const int block_size = 256;
+        const int total = M * N;
+        const int grid_size = (total + block_size - 1) / block_size;
+        hipLaunchKernelGGL(
+            applyFp32Epilogue_kernel,
+            dim3(grid_size), dim3(block_size), 0, static_cast<hipStream_t>(stream),
+            d_output, d_bias, M, N, alpha);
+
+        hipError_t err = hipGetLastError();
+        if (err != hipSuccess)
+        {
+            fprintf(stderr, "[rocmQuantGemm_applyFp32Epilogue] Kernel launch failed: %s (M=%d, N=%d)\n",
+                    hipGetErrorString(err), M, N);
+            return false;
+        }
+
+        return true;
+    }
     // =========================================================================
     // WEIGHT-ONLY SCALING EPILOGUE (for blockwise activation-scaled GEMM)
     // =========================================================================

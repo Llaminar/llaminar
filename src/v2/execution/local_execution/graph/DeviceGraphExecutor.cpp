@@ -522,11 +522,11 @@ namespace llaminar2
                 return false;
             }
 
-                if (ctx->isGPU() && std::getenv("LLAMINAR_SYNC_AFTER_STAGE"))
-                {
-                    LOG_INFO("[DeviceGraphExecutor] sync after stage: " << node->name);
-                    ctx->synchronize();
-                }
+            if (ctx->isGPU() && std::getenv("LLAMINAR_SYNC_AFTER_STAGE"))
+            {
+                LOG_INFO("[DeviceGraphExecutor] sync after stage: " << node->name);
+                ctx->synchronize();
+            }
 
             // Mark stage completed for graph dependency tracking
             graph.markCompleted(node->name);
@@ -852,7 +852,7 @@ namespace llaminar2
         if (!node.stage->validatePreparedWeights(&prepared_error))
         {
             LOG_ERROR("[DeviceGraphExecutor] Prepared weight validation failed for stage '"
-                  << node.name << "': " << prepared_error);
+                      << node.name << "': " << prepared_error);
             return false;
         }
 
@@ -1018,9 +1018,16 @@ namespace llaminar2
             if (profiling)
                 phase_start = std::chrono::high_resolution_clock::now();
 
+            // Rebuild post-execute dump info before output dumping. Some stages
+            // populate diagnostic outputs during execute(), and async dumping
+            // consumes the StageDumpInfo passed here rather than re-fetching
+            // through StageDumper::dumpOutputs().
+            node.stage->invalidateDumpInfoCache();
+            const StageDumpInfo &output_dump_info = node.stage->getDumpInfo();
+
             if (dump_cfg.async_dump)
             {
-                AsyncStageDumper::enqueueOutputs(dump_ctx, cached_dump_info);
+                AsyncStageDumper::enqueueOutputs(dump_ctx, output_dump_info);
             }
             else
             {

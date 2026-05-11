@@ -2263,9 +2263,9 @@ namespace llaminar2
         bool concurrent_decode = false;        ///< Enable multi-stream concurrent fused GEMV projections during decode (LLAMINAR_ROCM_CONCURRENT_DECODE)
 
         // --- Startup GPU weight loading pipeline (LoadOrchestrator) ---
-        int repack_slots = 3;                  ///< Ring-buffer slot count for startup GPU repack pipeline (LLAMINAR_ROCM_REPACK_SLOTS)
-        int repack_budget_mb = 0;              ///< VRAM budget cap for startup GPU repack staging buffers, 0=unlimited (LLAMINAR_ROCM_REPACK_BUDGET_MB)
-        int repack_streams = 3;                ///< H2D stream count for startup GPU repack pipeline (LLAMINAR_ROCM_REPACK_STREAMS)
+        int repack_slots = 3;     ///< Ring-buffer slot count for startup GPU repack pipeline (LLAMINAR_ROCM_REPACK_SLOTS)
+        int repack_budget_mb = 0; ///< VRAM budget cap for startup GPU repack staging buffers, 0=unlimited (LLAMINAR_ROCM_REPACK_BUDGET_MB)
+        int repack_streams = 3;   ///< H2D stream count for startup GPU repack pipeline (LLAMINAR_ROCM_REPACK_STREAMS)
 
         ROCmConfig()
         {
@@ -2709,7 +2709,8 @@ namespace llaminar2
         MPIBootstrapEnvConfig mpi_bootstrap;       ///< MPI bootstrap environment snapshot
 
         /// MoE expert rebalancing configuration
-        struct {
+        struct
+        {
             /// Rebalance mode: "off", "observe", "dynamic" (from LLAMINAR_MOE_REBALANCE)
             std::string mode = "dynamic";
             /// Histogram window size in decode tokens (from LLAMINAR_MOE_REBALANCE_WINDOW)
@@ -2728,6 +2729,29 @@ namespace llaminar2
             /// Only safe when prepacked MPI transfer is available (replicas > 0).
             bool release_raw_weights = false;
         } moe_rebalance;
+
+        /// MoE expert overlay transfer/debug bridge configuration.
+        struct
+        {
+            /// Force dense full-sequence routed-tier transfers for compatibility/debugging.
+            /// Sparse token-row transfer remains the production default.
+            /// (env: LLAMINAR_MOE_EP_DENSE_TRANSFER)
+            bool dense_transfer = false;
+            /// Emit human-readable overlay profiling and routing diagnostics.
+            /// (env: LLAMINAR_MOE_EP_TRACE)
+            bool trace = false;
+            /// Dump resolved per-layer expert tier placement summaries.
+            /// (env: LLAMINAR_MOE_EP_DUMP_PLACEMENT)
+            bool dump_placement = false;
+            /// Trace selected rows, routed entries, and transfer byte estimates by domain.
+            /// (env: LLAMINAR_MOE_EP_TRANSFER_TRACE)
+            bool transfer_trace = false;
+            /// Write machine-readable overlay profiling rows at timeline flush.
+            /// (env: LLAMINAR_MOE_EP_PROFILE_CSV)
+            bool profile_csv_enabled = false;
+            /// CSV output path. Truthy env values use this default; non-bool env values are paths.
+            std::string profile_csv_path = "/tmp/llaminar_moe_ep_profile.csv";
+        } moe_expert_overlay;
 
         bool tp_timing = false;               ///< Enable TP forward timing breakdown (env: LLAMINAR_TP_TIMING)
         bool skip_allreduce = false;          ///< DIAGNOSTIC: Skip allreduce for profiling (env: LLAMINAR_SKIP_ALLREDUCE)
@@ -2763,14 +2787,65 @@ namespace llaminar2
         /// (env: LLAMINAR_TP_COLLECT_TIMEOUT_MS).
         /// Debug/Integration builds default to a 30s safety net to avoid deadlocked tests;
         /// Release builds default to 0 (wait forever) for production runs.
-    #if LLAMINAR_ASSERTIONS_ACTIVE
+#if LLAMINAR_ASSERTIONS_ACTIVE
         int tp_collect_timeout_ms = 30000;
-    #else
+#else
         int tp_collect_timeout_ms = 0;
-    #endif
+#endif
 
         /// Enable model weight lifecycle trace events (env: LLAMINAR_WEIGHT_LIFECYCLE_TRACE=1)
         bool weight_lifecycle_trace = false;
+
+        static std::string normalizedEnvValue(const char *value)
+        {
+            if (!value)
+                return {};
+            std::string normalized(value);
+            normalized.erase(normalized.begin(), std::find_if(normalized.begin(), normalized.end(), [](unsigned char ch)
+                                                              { return !std::isspace(ch); }));
+            normalized.erase(std::find_if(normalized.rbegin(), normalized.rend(), [](unsigned char ch)
+                                          { return !std::isspace(ch); })
+                                 .base(),
+                             normalized.end());
+            std::transform(normalized.begin(), normalized.end(), normalized.begin(), [](unsigned char ch)
+                           { return static_cast<char>(std::tolower(ch)); });
+            return normalized;
+        }
+
+        static bool isTruthyEnvValue(const char *value)
+        {
+            const std::string normalized = normalizedEnvValue(value);
+            if (!normalized.empty() &&
+                std::all_of(normalized.begin(), normalized.end(), [](unsigned char ch)
+                            { return std::isdigit(ch) != 0; }))
+            {
+                return std::atoi(normalized.c_str()) != 0;
+            }
+            return normalized == "1" || normalized == "true" || normalized == "on" || normalized == "yes";
+        }
+
+        static bool isFalseyEnvValue(const char *value)
+        {
+            const std::string normalized = normalizedEnvValue(value);
+            return normalized.empty() || normalized == "0" || normalized == "false" || normalized == "off" || normalized == "no";
+        }
+
+        void reloadMoEExpertOverlayEnv()
+        {
+            moe_expert_overlay.dense_transfer = isTruthyEnvValue(std::getenv("LLAMINAR_MOE_EP_DENSE_TRANSFER"));
+            moe_expert_overlay.trace = isTruthyEnvValue(std::getenv("LLAMINAR_MOE_EP_TRACE"));
+            moe_expert_overlay.dump_placement = isTruthyEnvValue(std::getenv("LLAMINAR_MOE_EP_DUMP_PLACEMENT"));
+            moe_expert_overlay.transfer_trace = isTruthyEnvValue(std::getenv("LLAMINAR_MOE_EP_TRANSFER_TRACE"));
+
+            moe_expert_overlay.profile_csv_enabled = false;
+            moe_expert_overlay.profile_csv_path = "/tmp/llaminar_moe_ep_profile.csv";
+            const char *csv = std::getenv("LLAMINAR_MOE_EP_PROFILE_CSV");
+            if (!csv || isFalseyEnvValue(csv))
+                return;
+            moe_expert_overlay.profile_csv_enabled = true;
+            if (!isTruthyEnvValue(csv))
+                moe_expert_overlay.profile_csv_path = csv;
+        }
 
         DebugEnv()
         {
@@ -2828,6 +2903,7 @@ namespace llaminar2
             const char *moe_reb_release_ctor = std::getenv("LLAMINAR_MOE_RELEASE_RAW_WEIGHTS");
             if (moe_reb_release_ctor)
                 moe_rebalance.release_raw_weights = (std::atoi(moe_reb_release_ctor) != 0);
+            reloadMoEExpertOverlayEnv();
         }
 
         void reload()
@@ -2896,6 +2972,7 @@ namespace llaminar2
             const char *moe_reb_release = std::getenv("LLAMINAR_MOE_RELEASE_RAW_WEIGHTS");
             if (moe_reb_release)
                 moe_rebalance.release_raw_weights = (std::atoi(moe_reb_release) != 0);
+            reloadMoEExpertOverlayEnv();
             gemm.reload();
             profile.reload();
             rmsnorm.reload();

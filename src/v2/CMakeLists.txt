@@ -26,6 +26,14 @@ set(CMAKE_CONFIGURATION_TYPES "Debug;Release;E2ERelease;Integration" CACHE STRIN
 # The build type flags are picked up by the compiler setup during project()
 project(llaminar2 LANGUAGES C CXX)
 
+set(LLAMINAR_LINK_POOL_SIZE 8 CACHE STRING "Maximum concurrent Ninja linker jobs")
+
+if(CMAKE_GENERATOR MATCHES "Ninja")
+    set_property(GLOBAL APPEND PROPERTY JOB_POOLS llaminar_link_pool=${LLAMINAR_LINK_POOL_SIZE})
+    set(CMAKE_JOB_POOL_LINK llaminar_link_pool)
+    message(STATUS "V2: Ninja link pool max concurrent link jobs: ${LLAMINAR_LINK_POOL_SIZE}")
+endif()
+
 # =============================================================================
 # Enable ccache if available
 find_program(CCACHE_PROGRAM ccache)
@@ -155,11 +163,7 @@ if(HAVE_CUDA)
     # per executable and massive link time. With per-library resolution, only the 3 GPU
     # libraries need device linking — executables link normally.
     #
-    # The nvlink_pool job limit is no longer needed (3 library device links vs 580+
-    # executable device links), but we keep a small pool as a safety net.
-    if(CMAKE_GENERATOR MATCHES "Ninja")
-        set_property(GLOBAL APPEND PROPERTY JOB_POOLS nvlink_pool=8)
-    endif()
+    # Heavy CUDA device-link steps use llaminar_link_pool when building with Ninja.
 endif()
 
 # =============================================================================
@@ -281,7 +285,7 @@ if(HAVE_CUDA)
         CUDA_RESOLVE_DEVICE_SYMBOLS ON
     )
     if(CMAKE_GENERATOR MATCHES "Ninja")
-        set_property(TARGET cuda_backend PROPERTY JOB_POOL_LINK nvlink_pool)
+        set_property(TARGET cuda_backend PROPERTY JOB_POOL_LINK llaminar_link_pool)
     endif()
     target_include_directories(cuda_backend PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
     
@@ -508,6 +512,9 @@ if(HAVE_ROCM)
     set_target_properties(rocm_backend PROPERTIES
         HIP_RESOLVE_DEVICE_SYMBOLS ON
     )
+    if(CMAKE_GENERATOR MATCHES "Ninja")
+        set_property(TARGET rocm_backend PROPERTY JOB_POOL_LINK llaminar_link_pool)
+    endif()
     target_include_directories(rocm_backend PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}
         ${ROCM_PATH}/include
@@ -834,14 +841,14 @@ if(HAVE_CUDA)
         CUDA_SEPARABLE_COMPILATION ON
         CUDA_RESOLVE_DEVICE_SYMBOLS ON
     )
-    if(CMAKE_GENERATOR MATCHES "Ninja")
-        set_property(TARGET device_benchmarks PROPERTY JOB_POOL_LINK nvlink_pool)
-    endif()
 endif()
 if(HAVE_ROCM)
     set_target_properties(device_benchmarks PROPERTIES
         HIP_RESOLVE_DEVICE_SYMBOLS ON
     )
+endif()
+if(CMAKE_GENERATOR MATCHES "Ninja" AND (HAVE_CUDA OR HAVE_ROCM))
+    set_property(TARGET device_benchmarks PROPERTY JOB_POOL_LINK llaminar_link_pool)
 endif()
 target_include_directories(device_benchmarks PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(device_benchmarks PRIVATE OpenMP::OpenMP_CXX)
@@ -1150,6 +1157,10 @@ add_library(llaminar2_core STATIC
     execution/compute_stages/stages/SendActivationsStage.cpp
     execution/compute_stages/stages/ReceiveActivationsStage.cpp
     execution/compute_stages/stages/MoEExpertComputeStage.cpp
+    execution/compute_stages/stages/MoEExpertDispatchStage.cpp
+    execution/compute_stages/stages/MoEExpertOverlayCPUFallbackStage.cpp
+    execution/compute_stages/stages/MoEExpertOverlayLocalTPStage.cpp
+    execution/compute_stages/stages/MoEExpertParallelReduceStage.cpp
     execution/compute_stages/stages/MoERoutingStage.cpp
     execution/compute_stages/stages/AttentionOutputGateStage.cpp
     execution/compute_stages/stages/GatedRMSNormStage.cpp
@@ -1165,6 +1176,15 @@ add_library(llaminar2_core STATIC
     execution/moe/ExpertWeightCache.cpp
     execution/moe/ExpertRebalancer.cpp
     execution/moe/DecodeExpertHistogram.cpp
+    execution/moe/MoEExpertParallelPlanner.cpp
+    execution/moe/MoEExpertOverlayRuntimePlan.cpp
+    execution/moe/MoEExpertOverlayExecutionPlan.cpp
+    execution/moe/MoEExpertOverlayPreparationPlan.cpp
+    execution/moe/MoEExpertTokenRowTransfer.cpp
+    execution/moe/MoEExpertOverlayDenseReduce.cpp
+    execution/moe/MoEExpertOverlayCPUFallback.cpp
+    execution/moe/MoEExpertOverlayLocalTPExecutor.cpp
+    execution/moe/MoEExpertOverlayProfiler.cpp
     execution/moe/SocketAwareRebalancer.cpp
     execution/moe/MoERebalanceController.cpp
     execution/moe/MoEExpertWeightService.cpp

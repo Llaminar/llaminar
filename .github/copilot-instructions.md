@@ -1196,6 +1196,8 @@ print(worst_routing[["step", "layer", "routing_overlap", "routing_top1_match"]])
 2. **Per-Tensor Device Affinity**: Tensors know their device placement
 3. **Strategy Pattern**: Generic kernels + format-specific decode via `ITensorGemmTileDataProvider`
 4. **ITensor Interfaces**: `ITensorGemm`, `ITensorAttention`, `ITensorRoPE`, etc.
+5. **Performance-conscious allocation/buffer management**: No allocations in the hot path, ever. This is a common mistake! Don't make it. Write into / read from arena buffers or one-time-allocated kernel-owned instance members. Hot path scratch allocations kill performance!!
+6. **Fatal Errors stop execution**: Unrecoverable errors should result in a LOG_ERROR and a hard throw, or a return:false that is verified to propagate up the chain into a hard throw. We never continue blindly with warnings or "fallbacks" in such cases. We fail loud and fail fast!
 
 ### TypedTensorBase and `typed_data()` Pattern
 

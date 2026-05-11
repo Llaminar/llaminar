@@ -139,6 +139,7 @@ namespace llaminar2
             // Buffer IDs for coherence
             BufferId input_buffer_id = BufferId::NORMALIZED;
             BufferId output_buffer_id = BufferId::MOE_COMBINED_OUTPUT;
+            bool output_registered_in_arena = true;
 
             // =================================================================
             // Phase 7: PreparedWeightStore for decode-time fallback resolution

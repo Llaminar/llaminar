@@ -97,6 +97,27 @@ TEST(Test__ExpertGemmRegistry, MultipleDevices)
     EXPECT_EQ(reg.getEngine(DeviceId::cuda(1), 0, 0, Role::GATE), &g2);
 }
 
+TEST(Test__ExpertGemmRegistry, DomainScopedEntriesOnSamePhysicalDeviceDoNotOverwrite)
+{
+    ExpertGemmRegistry reg;
+    auto fast = std::make_shared<MockGemm>(101);
+    auto warm = std::make_shared<MockGemm>(202);
+    auto legacy = std::make_shared<MockGemm>(303);
+    const DeviceId device = DeviceId::cuda(0);
+
+    reg.registerEngineForDomain("cuda_fast", device, 0, 1, Role::GATE, fast.get(), fast);
+    reg.registerEngineForDomain("cuda_warm", device, 0, 1, Role::GATE, warm.get(), warm);
+    reg.registerEngine(device, 0, 1, Role::GATE, legacy.get(), legacy);
+
+    EXPECT_EQ(reg.getEngineForDomain("cuda_fast", device, 0, 1, Role::GATE), fast.get());
+    EXPECT_EQ(reg.getEngineForDomain("cuda_warm", device, 0, 1, Role::GATE), warm.get());
+    EXPECT_EQ(reg.getEngine(device, 0, 1, Role::GATE), legacy.get());
+    EXPECT_EQ(reg.countEnginesForLayerInDomain("cuda_fast", device, 0), 1u);
+    EXPECT_EQ(reg.countEnginesForLayerInDomain("cuda_warm", device, 0), 1u);
+    EXPECT_EQ(reg.countEnginesForLayer(device, 0), 1u);
+    EXPECT_EQ(reg.size(), 3u);
+}
+
 TEST(Test__ExpertGemmRegistry, MultipleLayers)
 {
     ExpertGemmRegistry reg;
@@ -191,6 +212,43 @@ TEST(Test__ExpertGemmRegistry, PopulateExpertEngines)
     EXPECT_EQ(down[3], nullptr);
 }
 
+TEST(Test__ExpertGemmRegistry, PopulateExpertEnginesForDomainUsesOnlyThatDomain)
+{
+    ExpertGemmRegistry reg;
+    std::vector<std::shared_ptr<MockGemm>> keepalive;
+
+    for (int expert : {0, 1})
+    {
+        keepalive.push_back(std::make_shared<MockGemm>(10 + expert));
+        reg.registerEngineForDomain("cuda_fast", DeviceId::cuda(0), 2, expert, Role::GATE,
+                                    keepalive.back().get(), keepalive.back());
+        keepalive.push_back(std::make_shared<MockGemm>(20 + expert));
+        reg.registerEngineForDomain("cuda_fast", DeviceId::cuda(0), 2, expert, Role::UP,
+                                    keepalive.back().get(), keepalive.back());
+        keepalive.push_back(std::make_shared<MockGemm>(30 + expert));
+        reg.registerEngineForDomain("cuda_fast", DeviceId::cuda(0), 2, expert, Role::DOWN,
+                                    keepalive.back().get(), keepalive.back());
+    }
+
+    auto warm_gate = std::make_shared<MockGemm>(999);
+    reg.registerEngineForDomain("cuda_warm", DeviceId::cuda(0), 2, 0, Role::GATE,
+                                warm_gate.get(), warm_gate);
+
+    std::vector<ITensorGemm *> gate, up, down;
+    EXPECT_TRUE(reg.populateExpertEnginesForDomain("cuda_fast", DeviceId::cuda(0), 2, 2, gate, up, down));
+    EXPECT_EQ(gate[0], keepalive[0].get());
+    EXPECT_EQ(up[0], keepalive[1].get());
+    EXPECT_EQ(down[0], keepalive[2].get());
+    EXPECT_EQ(gate[1], keepalive[3].get());
+    EXPECT_EQ(up[1], keepalive[4].get());
+    EXPECT_EQ(down[1], keepalive[5].get());
+
+    EXPECT_FALSE(reg.populateExpertEnginesForDomain("cuda_warm", DeviceId::cuda(0), 2, 2, gate, up, down));
+    EXPECT_EQ(gate[0], warm_gate.get());
+    EXPECT_EQ(up[0], nullptr);
+    EXPECT_EQ(down[0], nullptr);
+}
+
 TEST(Test__ExpertGemmRegistry, CompleteLayerReturnsTrue)
 {
     ExpertGemmRegistry reg;
@@ -230,6 +288,29 @@ TEST(Test__ExpertGemmRegistry, MissingExpertMakesRoleIncomplete)
     EXPECT_TRUE(reg.hasCompleteRole(DeviceId::cuda(0), 4, 3, Role::UP));
     EXPECT_TRUE(reg.hasCompleteRole(DeviceId::cuda(0), 4, 3, Role::DOWN));
     EXPECT_FALSE(reg.hasCompleteLayer(DeviceId::cuda(0), 4, 3));
+}
+
+TEST(Test__ExpertGemmRegistry, SubsetCompletenessAndCountsAreDeviceScoped)
+{
+    ExpertGemmRegistry reg;
+    std::vector<std::shared_ptr<MockGemm>> keepalive;
+
+    for (int expert : {0, 2})
+    {
+        keepalive.push_back(registerMockEngine(reg, DeviceId::cuda(0), 3, expert, Role::GATE, 10 + expert));
+        keepalive.push_back(registerMockEngine(reg, DeviceId::cuda(0), 3, expert, Role::UP, 20 + expert));
+        keepalive.push_back(registerMockEngine(reg, DeviceId::cuda(0), 3, expert, Role::DOWN, 30 + expert));
+    }
+    keepalive.push_back(registerMockEngine(reg, DeviceId::rocm(0), 3, 1, Role::GATE, 101));
+    keepalive.push_back(registerMockEngine(reg, DeviceId::rocm(0), 3, 1, Role::UP, 201));
+    keepalive.push_back(registerMockEngine(reg, DeviceId::rocm(0), 3, 1, Role::DOWN, 301));
+
+    EXPECT_TRUE(reg.hasCompleteRoleForExperts(DeviceId::cuda(0), 3, {0, 2}, Role::GATE));
+    EXPECT_FALSE(reg.hasCompleteRoleForExperts(DeviceId::cuda(0), 3, {0, 1, 2}, Role::GATE));
+    EXPECT_EQ(reg.completeExpertsForLayer(DeviceId::cuda(0), 3, 4), (std::vector<int>{0, 2}));
+    EXPECT_EQ(reg.countCompleteExpertsForLayer(DeviceId::cuda(0), 3, 4), 2u);
+    EXPECT_EQ(reg.countEnginesForLayer(DeviceId::cuda(0), 3), 6u);
+    EXPECT_EQ(reg.countEnginesForDevice(DeviceId::rocm(0)), 3u);
 }
 
 TEST(Test__ExpertGemmRegistry, RemovalAndReplacementUpdateCompleteness)

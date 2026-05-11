@@ -26,6 +26,7 @@
 #include "WeightPlan.h"
 #include "WeightPlacementMap.h"
 #include "WeightManagerConfig.h"
+#include "../execution/moe/MoEExpertOverlayPreparationPlan.h"
 #include "../backends/DeviceId.h"
 #include "../config/TensorParallelConfig.h"
 #include "../execution/local_execution/graph/GraphSchema.h"
@@ -48,6 +49,7 @@ namespace llaminar2
     // (included transitively via WeightManagerConfig.h → WeightTypes.h)
 
     class PreparedWeightStore;
+    class MoEExpertOverlayRuntimePlan;
 
     /**
      * @brief Weight manager with distribution strategy and caching
@@ -147,6 +149,18 @@ namespace llaminar2
             DeviceId device,
             bool include_expert_jobs = true);
 
+        /// Prepare only the routed experts assigned to accelerator overlay tiers.
+        /// CPU-assigned routed experts remain host-owned and are intentionally not
+        /// inserted into ExpertGemmRegistry.
+        bool prepareMoEExpertOverlayWeights(
+            const MoEExpertOverlayRuntimePlan &runtime_plan,
+            const FrozenModelWeightSet *frozen_weights = nullptr);
+
+        const MoEExpertOverlayPreparationDiagnostics &moeExpertOverlayPreparationDiagnostics() const
+        {
+            return moe_overlay_preparation_diagnostics_;
+        }
+
         /**
          * @brief Prepare weights for a single device, filtered to a layer range
          *
@@ -236,7 +250,8 @@ namespace llaminar2
             DeviceId target_device,
             std::function<bool(const std::string &)> layer_filter = nullptr,
             const FrozenModelWeightSet *frozen_weights = nullptr,
-            bool include_expert_jobs = true);
+            bool include_expert_jobs = true,
+            const MoEExpertOverlayPreparationPlan *overlay_preparation_plan = nullptr);
 
         /**
          * @brief Upload all non-GEMM weights to GPU
@@ -1173,6 +1188,7 @@ namespace llaminar2
 
         ExpertGemmRegistry expert_gemm_registry_;
         std::shared_ptr<PreparedWeightStore> prepared_weight_store_;
+        MoEExpertOverlayPreparationDiagnostics moe_overlay_preparation_diagnostics_;
         uint64_t next_pipeline_prepared_binding_id_ = (1ULL << 48);
 
         // =========================================================================

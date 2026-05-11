@@ -25,6 +25,10 @@
 #include "stages/SendActivationsStage.h"
 #include "stages/ReceiveActivationsStage.h"
 #include "stages/MoEExpertComputeStage.h"
+#include "stages/MoEExpertDispatchStage.h"
+#include "stages/MoEExpertOverlayCPUFallbackStage.h"
+#include "stages/MoEExpertOverlayLocalTPStage.h"
+#include "stages/MoEExpertParallelReduceStage.h"
 #include "stages/MoERoutingStage.h"
 #include "stages/QKNormStage.h"
 #include "stages/FusedResidualNormStage.h"
@@ -187,6 +191,30 @@ namespace llaminar2
          */
         static std::unique_ptr<IComputeStage> createMoERouting(
             const MoERoutingStage::Params &params);
+
+        /**
+         * @brief Create a host-side MoE expert-parallel dispatch descriptor stage
+         */
+        static std::unique_ptr<IComputeStage> createMoEExpertDispatch(
+            const MoEExpertDispatchStage::Params &params);
+
+        /**
+         * @brief Create a graph-integrated NodeLocalTP CPU fallback stage for MoE expert overlays
+         */
+        static std::unique_ptr<IComputeStage> createMoEExpertOverlayCPUFallback(
+            const MoEExpertOverlayCPUFallbackStage::Params &params);
+
+        /**
+         * @brief Create an accelerator LocalTP TensorParallelExperts stage for MoE expert overlays
+         */
+        static std::unique_ptr<IComputeStage> createMoEExpertOverlayLocalTP(
+            const MoEExpertOverlayLocalTPStage::Params &params);
+
+        /**
+         * @brief Create a host-side dense partial reduce stage for MoE expert-parallel tiers
+         */
+        static std::unique_ptr<IComputeStage> createMoEExpertParallelReduce(
+            const MoEExpertParallelReduceStage::Params &params);
 
         /**
          * @brief Create a shared expert FFN stage (always-active dense SwiGLU)
