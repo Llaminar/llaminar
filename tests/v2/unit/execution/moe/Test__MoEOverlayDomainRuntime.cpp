@@ -321,12 +321,8 @@ namespace llaminar2::test
     TEST(Test__MoEOverlayDomainRuntime, GraphDispatchCollectiveInvokesConfiguredBackendWithSparseRequest)
     {
         auto plan = executionPlan();
-        FP32Tensor input({3, 4});
-        FP32Tensor routing_indices({3, 2});
-        FP32Tensor routing_weights({3, 2});
         FP32Tensor partial({3, 4});
         auto request = requestFor(cpuFallbackDomain(), cpuFallbackRuntimeDomain(), plan, &partial);
-        attachCpuFallbackGraphDispatchParams(request, &input, &routing_indices, &routing_weights);
 
         auto backend = std::make_shared<RecordingDispatchBackend>();
         backend->next_result.ok = true;
@@ -359,7 +355,7 @@ namespace llaminar2::test
         EXPECT_EQ(backend->last_selected_row_count, 2u);
         EXPECT_EQ(backend->last_routed_entry_count, 2u);
         EXPECT_GT(backend->last_transfer_bytes, 0u);
-        EXPECT_EQ(backend->last_input, &input);
+        EXPECT_EQ(backend->last_input, nullptr);
         EXPECT_EQ(backend->last_output, &partial);
         EXPECT_EQ(backend->last_ctx, &ctx);
     }

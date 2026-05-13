@@ -15,12 +15,15 @@
 #include "../../utils/DebugEnv.h"
 #include "../../utils/Logger.h"
 
+#include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cstring>    // memcpy
 #include <fcntl.h>    // O_CREAT, O_RDWR
 #include <immintrin.h>
 #include <limits>
 #include <mpi.h>
+#include <sstream>
 #include <sys/mman.h> // shm_open, mmap, munmap, shm_unlink
 #include <unistd.h>   // ftruncate, close
 
@@ -30,6 +33,9 @@ namespace llaminar2
     {
         constexpr uint64_t kAbortEpoch = std::numeric_limits<uint64_t>::max();
         constexpr int kDefaultReleaseTimeoutMs = 300000;
+        constexpr int kMaxCreateAttempts = 64;
+
+        std::atomic<uint64_t> g_shmem_name_counter{0};
 
         int shmemSpinTimeoutMs()
         {
@@ -37,6 +43,20 @@ namespace llaminar2
             if (configured < 0)
                 return 0;
             return configured > 0 ? configured : kDefaultReleaseTimeoutMs;
+        }
+
+        std::string makeUniqueShmemName(int domain_id)
+        {
+            const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+            const uint64_t sequence = g_shmem_name_counter.fetch_add(1, std::memory_order_relaxed) + 1;
+
+            std::ostringstream name;
+            name << "/llaminar_shmem_ar_u" << static_cast<unsigned long>(getuid())
+                 << "_d" << domain_id
+                 << "_p" << static_cast<unsigned long>(getpid())
+                 << "_t" << static_cast<unsigned long long>(now)
+                 << "_s" << sequence;
+            return name.str();
         }
     } // namespace
 
@@ -49,12 +69,8 @@ namespace llaminar2
                                        std::unique_ptr<UPICollectiveBackend> fallback)
         : domain_id_(domain_id), my_rank_(my_rank), fallback_(std::move(fallback))
     {
-        // Build deterministic shm name from domain ID
-        shm_name_ = "/llaminar_shmem_ar_" + std::to_string(domain_id_);
-
         LOG_DEBUG("ShmemSpinBackend: Created for domain " << domain_id_
-                                                          << " rank " << my_rank_
-                                                          << " (shm=" << shm_name_ << ")");
+                                                          << " rank " << my_rank_);
     }
 
     ShmemSpinBackend::~ShmemSpinBackend()
@@ -176,69 +192,127 @@ namespace llaminar2
 
     bool ShmemSpinBackend::setupSharedMemory()
     {
-        // All ranks create-or-open the same named segment.
-        // Rank 0 creates+truncates; other ranks open existing.
-        // MPI barrier (via fallback) ensures ordering.
+        // Rank 0 creates a fresh per-run segment with O_EXCL, broadcasts the
+        // generated name, then unlinks it after every rank has mapped it. The
+        // mapping stays alive through open file descriptors, while the name is
+        // removed from /dev/shm so failed or later runs cannot collide with it.
 
         arena_size_ = ShmemSpinArena::compute_size(num_ranks_);
 
+        if (!fallback_ || fallback_->domainComm() == MPI_COMM_NULL)
+        {
+            last_error_ = "fallback UPI backend has no domain communicator";
+            LOG_ERROR("ShmemSpinBackend::setupSharedMemory - " << last_error_);
+            return false;
+        }
+
+        MPI_Comm comm = fallback_->domainComm();
+        int create_success = 1;
+        int name_len = 0;
+
         if (my_rank_ == 0)
         {
-            // Rank 0: create the segment (unlink first to ensure clean state)
-            shm_unlink(shm_name_.c_str()); // Ignore errors (may not exist)
-
-            shm_fd_ = shm_open(shm_name_.c_str(), O_CREAT | O_RDWR, 0600);
-            if (shm_fd_ < 0)
+            for (int attempt = 0; attempt < kMaxCreateAttempts; ++attempt)
             {
-                last_error_ = "shm_open(create) failed: " + std::string(strerror(errno));
-                LOG_ERROR("ShmemSpinBackend::setupSharedMemory - " << last_error_);
-                return false;
+                shm_name_ = makeUniqueShmemName(domain_id_);
+                shm_unlinked_ = false;
+
+                shm_fd_ = shm_open(shm_name_.c_str(), O_CREAT | O_EXCL | O_RDWR, 0600);
+                if (shm_fd_ >= 0)
+                    break;
+
+                if (errno == EEXIST)
+                    continue;
+
+                last_error_ = "shm_open(create) failed for " + shm_name_ + ": " + std::string(strerror(errno));
+                break;
             }
 
-            if (ftruncate(shm_fd_, static_cast<off_t>(arena_size_)) != 0)
+            if (shm_fd_ < 0)
             {
-                last_error_ = "ftruncate failed: " + std::string(strerror(errno));
+                if (last_error_.empty())
+                    last_error_ = "shm_open(create) exhausted unique-name attempts";
+                LOG_ERROR("ShmemSpinBackend::setupSharedMemory - " << last_error_);
+                create_success = 0;
+            }
+            else if (ftruncate(shm_fd_, static_cast<off_t>(arena_size_)) != 0)
+            {
+                last_error_ = "ftruncate failed for " + shm_name_ + ": " + std::string(strerror(errno));
                 LOG_ERROR("ShmemSpinBackend::setupSharedMemory - " << last_error_);
                 close(shm_fd_);
                 shm_fd_ = -1;
                 shm_unlink(shm_name_.c_str());
-                return false;
+                shm_unlinked_ = true;
+                create_success = 0;
             }
+
+            name_len = static_cast<int>(shm_name_.size());
         }
 
-        // Barrier: rank 0 finishes creation before others open
-        if (fallback_)
+        MPI_Bcast(&create_success, 1, MPI_INT, 0, comm);
+        if (!create_success)
         {
-            fallback_->synchronize();
+            if (my_rank_ != 0)
+                last_error_ = "rank 0 failed to create shared-memory arena";
+            return false;
+        }
+
+        MPI_Bcast(&name_len, 1, MPI_INT, 0, comm);
+        if (name_len <= 0 || name_len >= 240)
+        {
+            last_error_ = "invalid shared-memory name length " + std::to_string(name_len);
+            LOG_ERROR("ShmemSpinBackend::setupSharedMemory - " << last_error_);
+            teardownSharedMemory();
+            return false;
         }
 
         if (my_rank_ != 0)
         {
-            // Non-zero ranks: open existing segment
-            shm_fd_ = shm_open(shm_name_.c_str(), O_RDWR, 0600);
+            shm_name_.assign(static_cast<size_t>(name_len), '\0');
+        }
+        MPI_Bcast(shm_name_.data(), name_len, MPI_CHAR, 0, comm);
+
+        if (my_rank_ != 0)
+        {
+            shm_fd_ = shm_open(shm_name_.c_str(), O_RDWR, 0);
             if (shm_fd_ < 0)
             {
-                last_error_ = "shm_open(open) failed: " + std::string(strerror(errno));
+                last_error_ = "shm_open(open) failed for " + shm_name_ + ": " + std::string(strerror(errno));
                 LOG_ERROR("ShmemSpinBackend::setupSharedMemory - " << last_error_);
-                return false;
             }
         }
 
-        // Map the shared memory
-        void *ptr = mmap(nullptr, arena_size_,
-                         PROT_READ | PROT_WRITE, MAP_SHARED,
-                         shm_fd_, 0);
-
-        if (ptr == MAP_FAILED)
+        void *ptr = MAP_FAILED;
+        if (shm_fd_ >= 0)
         {
-            last_error_ = "mmap failed: " + std::string(strerror(errno));
-            LOG_ERROR("ShmemSpinBackend::setupSharedMemory - " << last_error_);
-            close(shm_fd_);
-            shm_fd_ = -1;
-            return false;
+            ptr = mmap(nullptr, arena_size_,
+                       PROT_READ | PROT_WRITE, MAP_SHARED,
+                       shm_fd_, 0);
+
+            if (ptr == MAP_FAILED)
+            {
+                last_error_ = "mmap failed for " + shm_name_ + ": " + std::string(strerror(errno));
+                LOG_ERROR("ShmemSpinBackend::setupSharedMemory - " << last_error_);
+                close(shm_fd_);
+                shm_fd_ = -1;
+            }
+            else
+            {
+                arena_ = static_cast<ShmemSpinArena *>(ptr);
+            }
         }
 
-        arena_ = static_cast<ShmemSpinArena *>(ptr);
+        int local_ready = (arena_ != nullptr) ? 1 : 0;
+        int all_ready = 0;
+        MPI_Allreduce(&local_ready, &all_ready, 1, MPI_INT, MPI_MIN, comm);
+        if (!all_ready)
+        {
+            if (last_error_.empty())
+                last_error_ = "one or more ranks failed to map shared-memory arena " + shm_name_;
+            LOG_ERROR("ShmemSpinBackend::setupSharedMemory - " << last_error_);
+            teardownSharedMemory();
+            return false;
+        }
 
         // Rank 0 zero-initializes the arena and writes the header
         if (my_rank_ == 0)
@@ -248,15 +322,32 @@ namespace llaminar2
         }
 
         // Barrier: ensure zero-init completes before anyone uses it
-        if (fallback_)
+        if (MPI_Barrier(comm) != MPI_SUCCESS)
         {
-            fallback_->synchronize();
+            last_error_ = "MPI_Barrier failed after shared-memory initialization";
+            LOG_ERROR("ShmemSpinBackend::setupSharedMemory - " << last_error_);
+            teardownSharedMemory();
+            return false;
+        }
+
+        if (my_rank_ == 0)
+        {
+            if (shm_unlink(shm_name_.c_str()) == 0 || errno == ENOENT)
+            {
+                shm_unlinked_ = true;
+            }
+            else
+            {
+                LOG_WARN("ShmemSpinBackend::setupSharedMemory - shm_unlink(" << shm_name_
+                                                                              << ") failed after mmap: " << strerror(errno));
+            }
         }
 
         LOG_DEBUG("ShmemSpinBackend: Shared memory mapped at " << ptr
                                                                << " (" << arena_size_ << " bytes)"
                                                                << " for rank " << my_rank_
-                                                               << " of " << num_ranks_);
+                                                               << " of " << num_ranks_
+                                                               << " using " << shm_name_);
         return true;
     }
 
@@ -274,11 +365,22 @@ namespace llaminar2
             shm_fd_ = -1;
         }
 
-        // Rank 0 unlinks the segment (safe even if rank 1 still has it mapped)
-        if (my_rank_ == 0)
+        // Rank 0 normally unlinks immediately after all ranks map the segment.
+        // Retry here only for failures that occurred before that point.
+        if (my_rank_ == 0 && !shm_name_.empty() && !shm_unlinked_)
         {
-            shm_unlink(shm_name_.c_str());
+            if (shm_unlink(shm_name_.c_str()) == 0 || errno == ENOENT)
+            {
+                shm_unlinked_ = true;
+            }
+            else
+            {
+                LOG_WARN("ShmemSpinBackend::teardownSharedMemory - shm_unlink(" << shm_name_
+                                                                                 << ") failed: " << strerror(errno));
+            }
         }
+
+        shm_name_.clear();
     }
 
     // =========================================================================

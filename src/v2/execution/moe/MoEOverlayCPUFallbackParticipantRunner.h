@@ -20,6 +20,8 @@ namespace llaminar2
     class IMPIContext;
     class IDeviceContext;
     class PreparedWeightStore;
+    class MoEOverlayMPIDispatchBackend;
+    struct MoECPUFallbackDomainContext;
 
     class MoEOverlayCPUFallbackParticipantRunner final : public IInferenceRunner
     {
@@ -32,10 +34,10 @@ namespace llaminar2
             std::shared_ptr<const MoEExpertOverlayExecutionPlan> execution_plan;
             std::string hostfile_path;
 
-            // Temporary compatibility bridge for direct/native fallback loops.
-            // Graph-native endpoint ranks must not enter NodeLocalTP collectives
-            // unless a dispatch backend has explicitly opted into that behavior.
-            bool enable_native_compatibility_fallback = false;
+            // Graph-native CPU-cold dispatch message stream. When present, this
+            // endpoint consumes dispatch-point envelopes from the continuation
+            // graph instead of running the legacy all-layer compatibility loop.
+            std::shared_ptr<MoEOverlayMPIDispatchBackend> dispatch_backend;
         };
 
         explicit MoEOverlayCPUFallbackParticipantRunner(Config config);
@@ -70,14 +72,14 @@ namespace llaminar2
 
         const ExpertLayerPlacement *placementForLayer(int layer_idx) const;
         const ExpertComputeDomain *domainForName(const std::string &domain_name) const;
-        int cpuFallbackTierIndex() const;
         std::vector<bool> expertMaskForTier(const ExpertLayerPlacement &placement, int tier_index) const;
         bool hasActiveExpertMask(const std::vector<bool> &mask) const;
-        bool isMoELayer(int layer_idx) const;
         bool loadLayerWeights(int layer_idx, LayerFallbackWeights &weights);
         LayerFallbackWeights *cachedLayerWeights(int layer_idx);
+        std::shared_ptr<const MoECPUFallbackDomainContext> domainContextFor(const ExpertComputeDomain &domain);
         bool ensureScratch(int seq_len);
         int expertIntermediate(const LayerFallbackWeights &weights) const;
+        bool runDispatchEndpointPump(int seq_len);
         bool executeLayerFallback(int layer_idx, int tier_index, const ExpertComputeDomain &domain,
                                   const std::vector<bool> &expert_mask, const LayerFallbackWeights &weights);
 
@@ -85,6 +87,7 @@ namespace llaminar2
         std::unique_ptr<IDeviceContext> cpu_ctx_;
         std::shared_ptr<PreparedWeightStore> prepared_store_;
         std::unordered_map<int, LayerFallbackWeights> layer_weights_;
+        std::unordered_map<std::string, std::shared_ptr<const MoECPUFallbackDomainContext>> domain_contexts_;
         Scratch scratch_;
         std::string architecture_;
         int d_model_ = 0;

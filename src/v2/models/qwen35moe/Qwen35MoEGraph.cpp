@@ -146,40 +146,40 @@ namespace llaminar2
             return it == plan.domains.end() ? nullptr : &(*it);
         }
 
-        int participantIndexForDevice(
-            const MoEOverlayRuntimeDomain &domain,
-            DeviceId device)
-        {
-            for (const auto &participant : domain.participants)
-            {
-                if (participant.local_device == device)
-                    return participant.participant_index;
-            }
-            return domain.participants.empty() ? 0 : domain.participants.front().participant_index;
-        }
+                            int participantIndexForDevice(
+                                const MoEOverlayRuntimeDomain &domain,
+                                DeviceId device)
+                            {
+                                for (const auto &participant : domain.participants)
+                                {
+                                    if (participant.local_device == device)
+                                        return participant.participant_index;
+                                }
+                                return domain.participants.empty() ? 0 : domain.participants.front().participant_index;
+                            }
 
-        int ownerParticipantIndexFor(const MoEOverlayRuntimeDomain &domain)
-        {
-            if (domain.owner_rank >= 0)
-            {
-                for (const auto &participant : domain.participants)
-                {
-                    if (participant.world_rank_known && participant.world_rank == domain.owner_rank)
-                        return participant.participant_index;
-                }
-            }
-            return domain.participants.empty() ? 0 : domain.participants.front().participant_index;
-        }
+                            int ownerParticipantIndexFor(const MoEOverlayRuntimeDomain &domain)
+                            {
+                                if (domain.owner_rank >= 0)
+                                {
+                                    for (const auto &participant : domain.participants)
+                                    {
+                                        if (participant.world_rank_known && participant.world_rank == domain.owner_rank)
+                                            return participant.participant_index;
+                                    }
+                                }
+                                return domain.participants.empty() ? 0 : domain.participants.front().participant_index;
+                            }
 
-        int executorParticipantIndexFor(const MoEOverlayRuntimeDomain &domain)
-        {
-            for (const auto &participant : domain.participants)
-            {
-                if (participant.address == domain.primary_participant)
-                    return participant.participant_index;
-            }
-            return ownerParticipantIndexFor(domain);
-        }
+                            int executorParticipantIndexFor(const MoEOverlayRuntimeDomain &domain)
+                            {
+                                for (const auto &participant : domain.participants)
+                                {
+                                    if (participant.address == domain.primary_participant)
+                                        return participant.participant_index;
+                                }
+                                return ownerParticipantIndexFor(domain);
+                            }
 
         int stableDispatchGroupId(int domain_id, int layer_idx, int tier_index)
         {
@@ -525,6 +525,8 @@ namespace llaminar2
         std::vector<std::shared_ptr<TensorBase>> overlay_reduce_partial_lifetimes;
         std::vector<MoEExpertParallelReducePartialInfo> overlay_reduce_partial_infos;
         std::vector<std::shared_ptr<MoEOverlayDomainWorkResult>> overlay_reduce_runtime_results;
+        std::vector<TensorBase *> overlay_reduce_sparse_scratch;
+        std::vector<std::shared_ptr<TensorBase>> overlay_reduce_sparse_scratch_lifetimes;
         std::vector<std::string> overlay_reduce_dependencies;
         std::shared_ptr<MoEExpertParallelReduceDiagnostics> overlay_reduce_diagnostics;
         std::string overlay_continuation_domain;
@@ -756,6 +758,8 @@ namespace llaminar2
                 overlay_reduce_partial_lifetimes.reserve(overlay_plan->routed_tiers.size());
                 overlay_reduce_partial_infos.reserve(overlay_plan->routed_tiers.size() + 1);
                 overlay_reduce_runtime_results.reserve(overlay_plan->routed_tiers.size() + 1);
+                overlay_reduce_sparse_scratch.reserve(overlay_plan->routed_tiers.size());
+                overlay_reduce_sparse_scratch_lifetimes.reserve(overlay_plan->routed_tiers.size());
                 tier_node_names.reserve(overlay_plan->routed_tiers.size());
 
                 for (size_t tier_index = 0; tier_index < overlay_plan->routed_tiers.size(); ++tier_index)
@@ -801,6 +805,14 @@ namespace llaminar2
                     overlay_reduce_partial_lifetimes.push_back(std::move(partial));
                     auto runtime_result = std::make_shared<MoEOverlayDomainWorkResult>();
                     overlay_reduce_runtime_results.push_back(runtime_result);
+
+                    if (overlay_continuation_device.is_gpu())
+                    {
+                        auto scratch = std::make_shared<FP32Tensor>(
+                            std::vector<size_t>{static_cast<size_t>(total_tokens), static_cast<size_t>(config_.d_model)});
+                        overlay_reduce_sparse_scratch.push_back(scratch.get());
+                        overlay_reduce_sparse_scratch_lifetimes.push_back(std::move(scratch));
+                    }
 
                     const std::string tier_node = prefix + "moe_expert_ffn_" +
                                                   nodeSuffixForTier(tier, static_cast<int>(tier_index));
@@ -852,13 +864,6 @@ namespace llaminar2
 
                     if (use_cpu_node_local_fallback)
                     {
-                        const bool execute_cpu_fallback_on_this_local_tp_participant =
-                            !config_.tp_ctx || config_.tp_ctx->degree() <= 1 || config_.local_rank == 0;
-                        if (!execute_cpu_fallback_on_this_local_tp_participant)
-                        {
-                            tier_mask.assign(static_cast<size_t>(config_.moe.num_experts), false);
-                        }
-
                         MoEExpertOverlayCPUFallbackStage::Params fallback_params;
                         fallback_params.device_id = DeviceId::cpu();
                         fallback_params.mpi_ctx = config_.moe.overlay_mpi_ctx
@@ -1200,6 +1205,8 @@ namespace llaminar2
             reduce_params.partial_lifetimes = std::move(overlay_reduce_partial_lifetimes);
             reduce_params.partial_infos = std::move(overlay_reduce_partial_infos);
             reduce_params.runtime_partial_results = std::move(overlay_reduce_runtime_results);
+            reduce_params.sparse_expansion_scratch = std::move(overlay_reduce_sparse_scratch);
+            reduce_params.sparse_expansion_scratch_lifetimes = std::move(overlay_reduce_sparse_scratch_lifetimes);
             reduce_params.output = moe_output;
             reduce_params.output_buffer_id = BufferId::MOE_COMBINED_OUTPUT;
             reduce_params.rows = static_cast<size_t>(total_tokens);

@@ -7,12 +7,14 @@
 
 #include "execution/compute_stages/stages/MoEExpertOverlayCPUFallbackStage.h"
 #include "execution/local_execution/device/DeviceContext.h"
+#include "execution/moe/MoEOverlayMPIDispatchBackend.h"
 #include "interfaces/IMPIContext.h"
 #include "loaders/PreparedWeightStore.h"
 #include "tensors/Tensors.h"
 #include "utils/Logger.h"
 
 #include <algorithm>
+#include <sstream>
 #include <stdexcept>
 #include <utility>
 
@@ -154,22 +156,6 @@ namespace llaminar2
         return it == config_.overlay_plan->domains.end() ? nullptr : &(*it);
     }
 
-    int MoEOverlayCPUFallbackParticipantRunner::cpuFallbackTierIndex() const
-    {
-        for (size_t tier_index = 0; tier_index < config_.overlay_plan->routed_tiers.size(); ++tier_index)
-        {
-            const auto &tier = config_.overlay_plan->routed_tiers[tier_index];
-            const auto *domain = domainForName(tier.domain);
-            if (tier.fallback && domain &&
-                domain->kind == ExpertDomainKind::NodeLocalTP &&
-                domain->compute_kind == ExpertDomainComputeKind::TensorParallelExperts)
-            {
-                return static_cast<int>(tier_index);
-            }
-        }
-        return -1;
-    }
-
     std::vector<bool> MoEOverlayCPUFallbackParticipantRunner::expertMaskForTier(
         const ExpertLayerPlacement &placement,
         int tier_index) const
@@ -187,12 +173,6 @@ namespace llaminar2
     {
         return std::any_of(mask.begin(), mask.end(), [](bool enabled)
                            { return enabled; });
-    }
-
-    bool MoEOverlayCPUFallbackParticipantRunner::isMoELayer(int layer_idx) const
-    {
-        const std::string name = "blk." + std::to_string(layer_idx) + ".ffn_gate_inp.weight";
-        return config_.model_ctx && config_.model_ctx->hasTensor(name);
     }
 
     bool MoEOverlayCPUFallbackParticipantRunner::loadLayerWeights(
@@ -235,6 +215,44 @@ namespace llaminar2
         return &inserted->second;
     }
 
+    std::shared_ptr<const MoECPUFallbackDomainContext>
+    MoEOverlayCPUFallbackParticipantRunner::domainContextFor(const ExpertComputeDomain &domain)
+    {
+        const int root_world_rank = config_.execution_plan ? config_.execution_plan->continuation_root_rank : 0;
+        const int domain_id = MoEExpertOverlayCPUFallback::stableDomainId(domain.name);
+
+        std::ostringstream key;
+        key << domain.name << ":" << domain_id << ":" << root_world_rank << ":";
+        const auto world_ranks = MoEExpertOverlayCPUFallback::domainWorldRanks(domain);
+        for (size_t index = 0; index < world_ranks.size(); ++index)
+        {
+            if (index != 0)
+                key << ",";
+            key << world_ranks[index];
+        }
+
+        const std::string cache_key = key.str();
+        auto existing = domain_contexts_.find(cache_key);
+        if (existing != domain_contexts_.end())
+            return existing->second;
+
+        MoECPUFallbackDomainConfig domain_config;
+        domain_config.domain = domain;
+        domain_config.world_comm = config_.mpi_ctx && config_.mpi_ctx->communicator() != MPI_COMM_NULL
+                                       ? config_.mpi_ctx->communicator()
+                                       : MPI_COMM_WORLD;
+        domain_config.root_world_rank = root_world_rank;
+        domain_config.domain_id = domain_id;
+        domain_config.hostfile_path = config_.hostfile_path;
+
+        auto context = std::make_shared<MoECPUFallbackDomainContext>(
+            MoEExpertOverlayCPUFallback::createNodeLocalTPDomain(domain_config));
+        domain_contexts_.emplace(cache_key, context);
+        LOG_INFO("[MoEOverlayCPUFallbackParticipantRunner] Cached CPU fallback domain context domain='"
+                 << domain.name << "' root_rank=" << root_world_rank);
+        return context;
+    }
+
     bool MoEOverlayCPUFallbackParticipantRunner::ensureScratch(int seq_len)
     {
         if (seq_len <= 0)
@@ -268,6 +286,125 @@ namespace llaminar2
         return static_cast<int>(weights.gate->rows() / static_cast<size_t>(num_experts_));
     }
 
+    bool MoEOverlayCPUFallbackParticipantRunner::runDispatchEndpointPump(int seq_len)
+    {
+        if (!config_.dispatch_backend)
+        {
+            LOG_ERROR("[MoEOverlayCPUFallbackParticipantRunner] Missing graph-native dispatch backend");
+            return false;
+        }
+
+        while (true)
+        {
+            MoEOverlayMPIDispatchHeader header;
+            std::string error;
+            if (!config_.dispatch_backend->receiveHeader(header, &error))
+            {
+                LOG_ERROR("[MoEOverlayCPUFallbackParticipantRunner] Failed to receive dispatch message: " << error);
+                return false;
+            }
+
+            switch (header.kind)
+            {
+            case MoEOverlayMPIMessageKind::NoOp:
+                LOG_DEBUG("[MoEOverlayCPUFallbackParticipantRunner] No-op dispatch"
+                          << " domain_id=" << header.domain_id
+                          << " layer=" << header.layer_id
+                          << " tier=" << header.tier_index
+                          << " group=" << header.dispatch_group_id);
+                continue;
+
+            case MoEOverlayMPIMessageKind::RoutedWork:
+            {
+                if (header.layer_id < 0 || header.tier_index < 0 ||
+                    header.tier_index >= static_cast<int>(config_.overlay_plan->routed_tiers.size()))
+                {
+                    LOG_ERROR("[MoEOverlayCPUFallbackParticipantRunner] Invalid routed dispatch envelope"
+                              << " domain_id=" << header.domain_id
+                              << " layer=" << header.layer_id
+                              << " tier=" << header.tier_index
+                              << " group=" << header.dispatch_group_id);
+                    return false;
+                }
+
+                const auto *placement = placementForLayer(header.layer_id);
+                if (!placement)
+                {
+                    LOG_ERROR("[MoEOverlayCPUFallbackParticipantRunner] Missing expert placement for routed dispatch"
+                              << " layer=" << header.layer_id
+                              << " tier=" << header.tier_index);
+                    return false;
+                }
+
+                const auto &tier = config_.overlay_plan->routed_tiers[static_cast<size_t>(header.tier_index)];
+                const auto *domain = domainForName(tier.domain);
+                if (!domain)
+                {
+                    LOG_ERROR("[MoEOverlayCPUFallbackParticipantRunner] Routed dispatch references missing domain '"
+                              << tier.domain << "' layer=" << header.layer_id
+                              << " tier=" << header.tier_index);
+                    return false;
+                }
+                if (domain->kind != ExpertDomainKind::NodeLocalTP)
+                {
+                    LOG_ERROR("[MoEOverlayCPUFallbackParticipantRunner] Routed dispatch domain '"
+                              << domain->name << "' is not a NodeLocalTP CPU fallback domain");
+                    return false;
+                }
+
+                auto mask = expertMaskForTier(*placement, header.tier_index);
+                if (!hasActiveExpertMask(mask))
+                {
+                    LOG_ERROR("[MoEOverlayCPUFallbackParticipantRunner] Routed dispatch has no active CPU-cold experts"
+                              << " layer=" << header.layer_id
+                              << " tier=" << header.tier_index
+                              << " domain='" << domain->name << "'");
+                    return false;
+                }
+
+                auto *weights = cachedLayerWeights(header.layer_id);
+                if (!weights)
+                    return false;
+
+                LOG_DEBUG("[MoEOverlayCPUFallbackParticipantRunner] Routed dispatch envelope"
+                          << " domain_id=" << header.domain_id
+                          << " layer=" << header.layer_id
+                          << " tier=" << header.tier_index
+                          << " group=" << header.dispatch_group_id
+                          << " selected_rows=" << header.selected_row_count
+                          << " routed_entries=" << header.routed_entry_count
+                          << " transfer_bytes=" << header.transfer_bytes);
+
+                if (!executeLayerFallback(header.layer_id, header.tier_index, *domain, mask, *weights))
+                {
+                    LOG_ERROR("[MoEOverlayCPUFallbackParticipantRunner] CPU fallback dispatch envelope failed"
+                              << " layer=" << header.layer_id
+                              << " tier=" << header.tier_index
+                              << " domain='" << domain->name << "'");
+                    return false;
+                }
+                continue;
+            }
+
+            case MoEOverlayMPIMessageKind::Cancel:
+                LOG_WARN("[MoEOverlayCPUFallbackParticipantRunner] Dispatch canceled"
+                         << " domain_id=" << header.domain_id
+                         << " layer=" << header.layer_id
+                         << " tier=" << header.tier_index
+                         << " reason=" << header.cancel_reason_code);
+                return false;
+
+            case MoEOverlayMPIMessageKind::ForwardDone:
+                position_ += seq_len;
+                return true;
+
+            case MoEOverlayMPIMessageKind::Shutdown:
+                LOG_INFO("[MoEOverlayCPUFallbackParticipantRunner] Received dispatch shutdown");
+                return true;
+            }
+        }
+    }
+
     bool MoEOverlayCPUFallbackParticipantRunner::executeLayerFallback(
         int layer_idx,
         int tier_index,
@@ -299,6 +436,9 @@ namespace llaminar2
         params.transfer_mode = MoEExpertTransferMode::Auto;
         params.dispatch_tier_index = tier_index;
         params.prepared_store = prepared_store_.get();
+        params.domain_context = domainContextFor(domain);
+        if (!params.domain_context)
+            return false;
 
         MoEExpertOverlayCPUFallbackStage stage(std::move(params));
         return stage.execute(cpu_ctx_.get());
@@ -310,62 +450,20 @@ namespace llaminar2
         if (!initialized_ && !initialize())
             return false;
 
-        if (!config_.enable_native_compatibility_fallback)
+        if (!config_.dispatch_backend)
         {
             LOG_ERROR("[MoEOverlayCPUFallbackParticipantRunner] Rank " << config_.mpi_ctx->rank()
-                                                                       << " cannot execute graph-native CPU fallback endpoint work without an overlay dispatch backend; "
-                                                                       << "refusing native NodeLocalTP compatibility loop to avoid unmatched GlobalTP collectives");
+                                                                       << " requires a graph-native overlay dispatch backend; "
+                                                                       << "endpoint ranks must consume dispatch envelopes and cannot run an independent all-layer fallback loop");
             return false;
         }
 
         if (!ensureScratch(seq_len))
         {
-            LOG_ERROR("[MoEOverlayCPUFallbackParticipantRunner] Failed to allocate scratch for seq_len=" << seq_len);
+            LOG_ERROR("[MoEOverlayCPUFallbackParticipantRunner] Failed to allocate dispatch scratch for seq_len=" << seq_len);
             return false;
         }
-
-        const int tier_index = cpuFallbackTierIndex();
-        if (tier_index < 0)
-        {
-            LOG_ERROR("[MoEOverlayCPUFallbackParticipantRunner] No NodeLocalTP CPU fallback tier found");
-            return false;
-        }
-        const auto &tier = config_.overlay_plan->routed_tiers[static_cast<size_t>(tier_index)];
-        const auto *domain = domainForName(tier.domain);
-        if (!domain)
-        {
-            LOG_ERROR("[MoEOverlayCPUFallbackParticipantRunner] CPU fallback tier references missing domain '"
-                      << tier.domain << "'");
-            return false;
-        }
-
-        for (int layer_idx = 0; layer_idx < config_.model_ctx->totalBlockCount(); ++layer_idx)
-        {
-            if (!isMoELayer(layer_idx))
-                continue;
-
-            const auto *placement = placementForLayer(layer_idx);
-            if (!placement)
-                continue;
-
-            auto mask = expertMaskForTier(*placement, tier_index);
-            if (!hasActiveExpertMask(mask))
-                continue;
-
-            auto *weights = cachedLayerWeights(layer_idx);
-            if (!weights)
-                return false;
-
-            if (!executeLayerFallback(layer_idx, tier_index, *domain, mask, *weights))
-            {
-                LOG_ERROR("[MoEOverlayCPUFallbackParticipantRunner] CPU fallback participant failed at layer "
-                          << layer_idx << " tier " << tier_index << " domain '" << domain->name << "'");
-                return false;
-            }
-        }
-
-        position_ += seq_len;
-        return true;
+        return runDispatchEndpointPump(seq_len);
     }
 
     std::unique_ptr<IInferenceRunner> createMoEOverlayCPUFallbackParticipantRunner(

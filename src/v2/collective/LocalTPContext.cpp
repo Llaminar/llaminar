@@ -820,6 +820,8 @@ namespace llaminar2
 
         if (use_fp16_allreduce)
         {
+            constexpr size_t kFP16ScratchGuardBytes = 4096;
+
             // Lazy-init scratch buffer vectors
             if (fp16_scratch_buffers_.empty())
             {
@@ -831,7 +833,8 @@ namespace llaminar2
             if (fp16_scratch_counts_[device_index] < effective_count)
             {
                 const int ordinal = devices_[device_index].device_ordinal;
-                const size_t alloc_bytes = effective_count * sizeof(uint16_t); // FP16 = 2 bytes
+                const size_t live_bytes = effective_count * sizeof(uint16_t); // FP16 = 2 bytes
+                const size_t alloc_bytes = live_bytes + kFP16ScratchGuardBytes;
 
                 // Free old buffer if resizing
                 if (fp16_scratch_buffers_[device_index])
@@ -868,7 +871,8 @@ namespace llaminar2
                 {
                     fp16_scratch_counts_[device_index] = effective_count;
                     LOG_INFO("LocalTPContext: Allocated FP16 scratch buffer: "
-                             << (alloc_bytes / 1024) << " KB on device " << ordinal);
+                             << (alloc_bytes / 1024) << " KB (live="
+                             << (live_bytes / 1024) << " KB) on device " << ordinal);
                 }
             }
 

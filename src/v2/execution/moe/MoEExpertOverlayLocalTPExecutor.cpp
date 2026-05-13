@@ -23,8 +23,10 @@
 #include <cmath>
 #include <exception>
 #include <memory>
+#include <mutex>
 #include <sstream>
 #include <thread>
+#include <unordered_map>
 
 namespace llaminar2
 {
@@ -528,6 +530,18 @@ namespace
     {
         if (reason)
             *reason = message;
+    }
+
+    std::mutex &executionMutexFor(const ILocalTPContext &local_tp_context)
+    {
+        static std::mutex registry_mutex;
+        static std::unordered_map<const ILocalTPContext *, std::unique_ptr<std::mutex>> mutexes;
+
+        std::lock_guard<std::mutex> lock(registry_mutex);
+        auto &mutex = mutexes[&local_tp_context];
+        if (!mutex)
+            mutex = std::make_unique<std::mutex>();
+        return *mutex;
     }
 
     bool validateDomainAndContext(
@@ -1120,23 +1134,43 @@ namespace
         if (!refreshParticipantInputScratch(domain, params, prepared, participant_streams))
             return false;
 
-        const DeviceId primary_device = prepared.front().device;
-        IMoEKernel *primary_kernel = KernelFactory::getOrCreateMoEKernel(primary_device);
+        size_t output_participant_index = 0;
+        if (params.output_device.is_valid())
+        {
+            auto it = std::find_if(prepared.begin(), prepared.end(), [&](const auto &participant) {
+                return participant.device == params.output_device;
+            });
+            if (it != prepared.end())
+                output_participant_index = static_cast<size_t>(std::distance(prepared.begin(), it));
+            else
+            {
+                LOG_ERROR("[MoELocalTP] Output device " << params.output_device.to_string()
+                                                         << " is not a participant in domain '" << domain.name << "'");
+                return false;
+            }
+        }
+
+        const DeviceId output_device = prepared[output_participant_index].device;
+        IMoEKernel *primary_kernel = KernelFactory::getOrCreateMoEKernel(output_device);
         if (!primary_kernel)
         {
             LOG_ERROR("[MoELocalTP] Failed to resolve primary MoE kernel for "
-                      << primary_device.to_string() << " domain='" << domain.name << "'");
+                      << output_device.to_string() << " domain='" << domain.name << "'");
             return false;
         }
-        primary_kernel->setGPUStream(participant_streams.empty() ? nullptr : participant_streams.front());
+        primary_kernel->setGPUStream(output_participant_index < participant_streams.size()
+                                         ? participant_streams[output_participant_index]
+                                         : nullptr);
 
         std::fill_n(params.output->mutable_data(), params.output->numel(), 0.0f);
-        if (primary_device.is_gpu() &&
+        if (output_device.is_gpu() &&
             !params.output->ensureOnDevice(
-                primary_device,
-                participant_streams.empty() ? nullptr : participant_streams.front()))
+                output_device,
+                output_participant_index < participant_streams.size()
+                    ? participant_streams[output_participant_index]
+                    : nullptr))
         {
-            LOG_ERROR("[MoELocalTP] Failed to initialize output on " << primary_device.to_string()
+            LOG_ERROR("[MoELocalTP] Failed to initialize output on " << output_device.to_string()
                       << " for domain '" << domain.name << "'");
             return false;
         }
@@ -1299,13 +1333,13 @@ namespace
             }
             primary_kernel->scatterAddWeightedFromTensors(
                 params.output,
-                prepared.front().partial_scratch.get(),
-                prepared.front().token_indices.data(),
-                prepared.front().token_weights.data(),
+                prepared[output_participant_index].partial_scratch.get(),
+                prepared[output_participant_index].token_indices.data(),
+                prepared[output_participant_index].token_weights.data(),
                 num_tokens,
                 params.d_model);
-            if (primary_device.is_gpu())
-                params.output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, primary_device);
+            if (output_device.is_gpu())
+                params.output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, output_device);
 
             recordExecutedExpert(diagnostics, expert_id, static_cast<int>(token_list.size()));
             if (trace)
@@ -1320,12 +1354,14 @@ namespace
                   << " domain='" << domain.name
                   << "' executed prepared LocalTP expert path degree=" << degree
                   << " backend=" << collectiveBackendTypeToString(local_tp_context.backend()));
-        if (primary_device.is_gpu())
+        if (output_device.is_gpu())
         {
             params.output->transitionToWithEvent(
                 TensorCoherenceState::DEVICE_AUTHORITATIVE,
-                primary_device,
-                participant_streams.empty() ? nullptr : participant_streams.front());
+                output_device,
+                output_participant_index < participant_streams.size()
+                    ? participant_streams[output_participant_index]
+                    : nullptr);
         }
         return true;
     }
@@ -1362,6 +1398,8 @@ namespace
         std::vector<std::vector<std::pair<int, float>>> expert_token_lists;
         if (!buildExpertTokenLists(params, expert_token_lists))
             return false;
+
+        std::unique_lock<std::mutex> execution_lock(executionMutexFor(local_tp_context));
 
         if (params.prepared_participants && !params.prepared_participants->empty())
         {

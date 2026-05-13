@@ -16,6 +16,11 @@
 
 namespace llaminar2
 {
+    std::mutex MoEOverlayDomainRuntime::cpu_fallback_completion_mutex_;
+    std::condition_variable MoEOverlayDomainRuntime::cpu_fallback_completion_cv_;
+    std::map<std::string, std::shared_ptr<MoEOverlayDomainRuntime::CPUFallbackCompletion>>
+        MoEOverlayDomainRuntime::cpu_fallback_completions_;
+
     namespace
     {
         bool isSparseTransferMode(MoEExpertTransferMode mode)
@@ -168,6 +173,18 @@ namespace llaminar2
                     key << ",";
                 key << world_ranks[index];
             }
+            return key.str();
+        }
+
+        std::string dispatchCompletionKey(const MoEOverlayDispatchGroup &group)
+        {
+            std::ostringstream key;
+            key << group.domain_id
+                << ":" << group.layer_id
+                << ":" << group.dispatch_group_id
+                << ":" << group.stage_sequence
+                << ":" << group.microbatch_id
+                << ":" << group.decode_sequence;
             return key.str();
         }
 
@@ -368,9 +385,22 @@ namespace llaminar2
         if (!config_.dispatch_backend)
             return makeFailure(descriptor, "graph-native overlay dispatch backend is not configured");
 
-        const auto dispatch_request = buildDispatchRequest(request, descriptor);
+        auto dispatch_descriptor = descriptor;
+        if (request.has_cpu_fallback_params &&
+            dispatch_descriptor.request_kind == MoEOverlayDispatchRequestKind::RoutedWork &&
+            !dispatch_descriptor.dispatch_group.ownsExecution())
+        {
+            dispatch_descriptor.request_kind = MoEOverlayDispatchRequestKind::NoOp;
+            dispatch_descriptor.dispatch_metrics = {};
+            dispatch_descriptor.dispatch_metrics.no_op_count = 1;
+            dispatch_descriptor.selected_rows.clear();
+            dispatch_descriptor.routed_entries = 0;
+            dispatch_descriptor.transfer_volume = {};
+        }
+
+        const auto dispatch_request = buildDispatchRequest(request, dispatch_descriptor);
         auto dispatch_result = config_.dispatch_backend->dispatch(
-            descriptor.dispatch_group,
+            dispatch_descriptor.dispatch_group,
             dispatch_request,
             ctx);
 
@@ -389,6 +419,147 @@ namespace llaminar2
                 error << " with error_code=" << dispatch_result.error_code;
             result.error = error.str();
         }
+
+        const bool local_cpu_fallback_executor =
+            request.has_cpu_fallback_params &&
+            dispatch_request.kind == MoEOverlayDispatchRequestKind::RoutedWork &&
+            descriptor.dispatch_group.ownsExecution();
+
+        if (dispatch_result.ok && request.has_cpu_fallback_params &&
+            dispatch_result.request_kind == MoEOverlayDispatchRequestKind::RoutedWork &&
+            local_cpu_fallback_executor)
+        {
+            auto compute_result = runCPUFallbackGraphDispatch(request, descriptor, ctx);
+            compute_result.dispatch_metrics.merge(result.dispatch_metrics);
+            compute_result.request_kind = dispatch_result.request_kind;
+            publishCPUFallbackCompletion(descriptor.dispatch_group, compute_result);
+            return compute_result;
+        }
+        if (dispatch_result.ok && request.has_cpu_fallback_params &&
+            !local_cpu_fallback_executor)
+        {
+            if (descriptor.request_kind == MoEOverlayDispatchRequestKind::RoutedWork &&
+                dispatch_result.request_kind == MoEOverlayDispatchRequestKind::RoutedWork)
+            {
+                return waitForCPUFallbackCompletion(request, descriptor);
+            }
+            clearOutput(request.output);
+        }
+        return result;
+    }
+
+    void MoEOverlayDomainRuntime::publishCPUFallbackCompletion(
+        const MoEOverlayDispatchGroup &group,
+        const MoEOverlayDomainWorkResult &result)
+    {
+        if (group.participant_count <= 1)
+            return;
+
+        auto completion = std::make_shared<CPUFallbackCompletion>();
+        completion->complete = true;
+        completion->result = result;
+        completion->remaining_readers = std::max(0, group.participant_count - 1);
+
+        if (result.ok && result.partial_tensor)
+        {
+            auto *source = dynamic_cast<TensorBase *>(result.partial_tensor);
+            if (source && source->ensureOnHost())
+            {
+                const float *data = source->data();
+                if (data)
+                    completion->output_data.assign(data, data + source->numel());
+            }
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(cpu_fallback_completion_mutex_);
+            cpu_fallback_completions_[dispatchCompletionKey(group)] = std::move(completion);
+        }
+        cpu_fallback_completion_cv_.notify_all();
+    }
+
+    MoEOverlayDomainWorkResult MoEOverlayDomainRuntime::waitForCPUFallbackCompletion(
+        const MoEOverlayDomainWorkRequest &request,
+        const MoEOverlayDomainWorkDescriptor &descriptor)
+    {
+        MoEOverlayDomainWorkResult result;
+        result.descriptor = descriptor;
+        result.dispatch_kind = descriptor.dispatch_kind;
+        result.request_kind = MoEOverlayDispatchRequestKind::RoutedWork;
+        result.dispatch_metrics = descriptor.dispatch_metrics;
+        result.partial_tensor = request.output;
+        result.partial_info = descriptor.partial_info;
+
+        const std::string key = dispatchCompletionKey(descriptor.dispatch_group);
+        const int timeout_ms = debugEnv().tp_collect_timeout_ms;
+
+        std::unique_lock<std::mutex> lock(cpu_fallback_completion_mutex_);
+        auto ready = [&]() {
+            auto it = cpu_fallback_completions_.find(key);
+            return it != cpu_fallback_completions_.end() && it->second && it->second->complete;
+        };
+
+        bool completed = false;
+        if (timeout_ms > 0)
+        {
+            completed = cpu_fallback_completion_cv_.wait_for(
+                lock,
+                std::chrono::milliseconds(timeout_ms),
+                ready);
+        }
+        else
+        {
+            cpu_fallback_completion_cv_.wait(lock, ready);
+            completed = true;
+        }
+
+        if (!completed)
+        {
+            result.ok = false;
+            result.error = "timed out waiting for local CPU fallback completion";
+            return result;
+        }
+
+        auto it = cpu_fallback_completions_.find(key);
+        auto completion = it == cpu_fallback_completions_.end() ? nullptr : it->second;
+        if (!completion)
+        {
+            result.ok = false;
+            result.error = "missing local CPU fallback completion slot";
+            return result;
+        }
+
+        result = completion->result;
+        result.partial_tensor = request.output;
+        result.partial_info = descriptor.partial_info;
+
+        if (completion->remaining_readers > 0)
+            --completion->remaining_readers;
+        if (completion->remaining_readers == 0)
+            cpu_fallback_completions_.erase(it);
+
+        const std::vector<float> output_data = completion->output_data;
+        lock.unlock();
+
+        if (!result.ok)
+            return result;
+        if (!request.output)
+        {
+            result.ok = false;
+            result.error = "CPU fallback completion has no local output tensor";
+            return result;
+        }
+        if (output_data.size() != request.output->numel())
+        {
+            result.ok = false;
+            std::ostringstream error;
+            error << "CPU fallback completion output size mismatch: got " << output_data.size()
+                  << ", expected " << request.output->numel();
+            result.error = error.str();
+            return result;
+        }
+
+        std::copy(output_data.begin(), output_data.end(), request.output->mutable_data());
         return result;
     }
 
@@ -421,10 +592,6 @@ namespace llaminar2
             if (!params.domain_context)
             {
                 params.domain_context = cpuFallbackDomainContextFor(params);
-            }
-            if (params.domain_context && params.domain_context->participates())
-            {
-                result.dispatch_metrics.remote_endpoint_work_count += 1;
             }
             if (!params.transfer_stats)
                 params.transfer_stats = &transfer_stats;
@@ -571,17 +738,27 @@ namespace llaminar2
         }
 
         if (descriptor.dispatch_kind == MoEOverlayDomainRuntimeDispatchKind::GraphDispatchCollective &&
-            config_.dispatch_backend)
-        {
-            return runDispatchBackend(request, descriptor, ctx);
-        }
-
-        if (descriptor.dispatch_kind == MoEOverlayDomainRuntimeDispatchKind::GraphDispatchCollective &&
             request.has_cpu_fallback_params)
         {
             if (!cpuFallbackHasActiveExperts(request.cpu_fallback_params))
             {
+                if (config_.dispatch_backend)
+                {
+                    auto no_work_descriptor = descriptor;
+                    no_work_descriptor.request_kind = MoEOverlayDispatchRequestKind::NoOp;
+                    no_work_descriptor.dispatch_metrics = {};
+                    no_work_descriptor.dispatch_metrics.no_op_count = 1;
+                    no_work_descriptor.selected_rows.clear();
+                    no_work_descriptor.routed_entries = 0;
+                    no_work_descriptor.transfer_volume = {};
+                    return runDispatchBackend(request, no_work_descriptor, ctx);
+                }
                 return makeCPUFallbackNoWorkResult(request, descriptor, false);
+            }
+
+            if (config_.dispatch_backend)
+            {
+                return runDispatchBackend(request, descriptor, ctx);
             }
 
             const auto *plan = executionPlanFor(request);
@@ -595,6 +772,12 @@ namespace llaminar2
             }
 
             return runCPUFallbackGraphDispatch(request, descriptor, ctx);
+        }
+
+        if (descriptor.dispatch_kind == MoEOverlayDomainRuntimeDispatchKind::GraphDispatchCollective &&
+            config_.dispatch_backend)
+        {
+            return runDispatchBackend(request, descriptor, ctx);
         }
 
         if (descriptor.dispatch_kind == MoEOverlayDomainRuntimeDispatchKind::GraphDispatchCollective &&

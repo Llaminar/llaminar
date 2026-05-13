@@ -1149,7 +1149,8 @@ namespace
             result.domain_id,
             color,
             key,
-            config.hostfile_path);
+            config.hostfile_path,
+            config.domain.backend);
 
         if (my_domain_index >= 0)
         {

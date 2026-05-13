@@ -38,6 +38,7 @@
 #include "../../execution/moe/MoEExpertOverlayRuntimePlan.h"
 #include "../../execution/moe/MoEExpertParallelPlanner.h"
 #include "../../execution/moe/MoEOverlayDomainRuntime.h"
+#include "../../execution/moe/MoEOverlayMPIDispatchBackend.h"
 #include <algorithm>
 #include <atomic>
 #include <cmath>
@@ -323,6 +324,7 @@ namespace llaminar2
                 MoEOverlayDomainRuntime::Config runtime_config;
                 runtime_config.runtime_plan = graph_config.moe.expert_overlay_runtime_plan;
                 runtime_config.execution_plan = graph_config.moe.expert_overlay_execution_plan;
+                runtime_config.dispatch_backend = config.moe_overlay_dispatch_backend;
                 runtime_config.enable_compatibility_fallback = true;
                 graph_config.moe.overlay_domain_runtime = makeMoEOverlayDomainRuntime(std::move(runtime_config));
 

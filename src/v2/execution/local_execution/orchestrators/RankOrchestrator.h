@@ -74,6 +74,7 @@ namespace llaminar2
     class LogitsGatherer;
     class DeviceSampler;
     class IMPIContext;
+    class MoEOverlayMPIDispatchBackend;
     class PreparedWeightStore;
     struct GraphExecutorStats;
     struct MoEExpertParallelPlan;
@@ -233,6 +234,10 @@ namespace llaminar2
 
             /// Optional MPI context used by MoE overlay domain-worker commands.
             std::shared_ptr<IMPIContext> moe_expert_overlay_mpi_ctx;
+
+            /// Optional graph-native MPI dispatch backend shared by local graph
+            /// participants for remote MoE overlay domains such as cpu_cold.
+            std::shared_ptr<MoEOverlayMPIDispatchBackend> moe_overlay_dispatch_backend;
 
             // =================================================================
             // Helper Methods

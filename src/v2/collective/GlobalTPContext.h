@@ -17,6 +17,7 @@
 #include "config/OrchestrationConfig.h" // For CollectiveBackendType
 #include <atomic>
 #include <memory>
+#include <string>
 #include <vector>
 #include <mpi.h>
 
@@ -72,7 +73,8 @@ namespace llaminar2
             int domain_id,
             int color,
             int key,
-            const std::string &hostfile_path = "");
+            const std::string &hostfile_path = "",
+            CollectiveBackendType backend_type = CollectiveBackendType::UPI);
 
         /**
          * @brief Create for testing (uses existing communicator directly)
@@ -89,7 +91,8 @@ namespace llaminar2
             MPI_Comm comm,
             int domain_id,
             std::vector<int> world_ranks,
-            std::vector<int> node_ids = {});
+            std::vector<int> node_ids = {},
+            CollectiveBackendType backend_type = CollectiveBackendType::UPI);
 
         ~GlobalTPContext() override;
 
@@ -187,6 +190,8 @@ namespace llaminar2
          * @return Number of unique node IDs (1 if all same node)
          */
         int nodeCount() const;
+
+        std::string collectiveBackendNameForDiagnostics() const;
 
     private:
         // Private constructor - use factory methods

@@ -18,10 +18,14 @@
 
 #include <gtest/gtest.h>
 #include <mpi.h>
+#include <cerrno>
 #include <cmath>
 #include <cstring>
+#include <fcntl.h>
 #include <immintrin.h>
 #include <numeric>
+#include <sys/mman.h>
+#include <unistd.h>
 #include <vector>
 
 #include "collective/backends/ShmemSpinBackend.h"
@@ -46,6 +50,16 @@ static int mpiSize()
     int size;
     MPI_Comm_size(MPI_COMM_WORLD, &size);
     return size;
+}
+
+static DeviceGroup makeCpuDeviceGroup(int size)
+{
+    DeviceGroup group;
+    group.name = "test_shmem_spin";
+    group.scope = CollectiveScope::LOCAL;
+    for (int r = 0; r < size; ++r)
+        group.devices.push_back(DeviceId::cpu());
+    return group;
 }
 
 // ============================================================================
@@ -746,11 +760,7 @@ protected:
         auto upi = std::make_unique<UPICollectiveBackend>(MPI_COMM_WORLD, nullptr);
         backend_ = std::make_unique<ShmemSpinBackend>(domain_id_, rank_, std::move(upi));
 
-        DeviceGroup group;
-        group.name = "test_shmem_spin";
-        group.scope = CollectiveScope::LOCAL;
-        for (int r = 0; r < size_; ++r)
-            group.devices.push_back(DeviceId::cpu());
+        DeviceGroup group = makeCpuDeviceGroup(size_);
 
         ASSERT_TRUE(backend_->initialize(group));
         ASSERT_TRUE(backend_->isInitialized());
@@ -791,6 +801,99 @@ TEST_F(ShmemSpinMPITest, BasicAllreduce2048)
     {
         EXPECT_FLOAT_EQ(data[i], rank_sum_) << "Mismatch at index " << i;
     }
+}
+
+TEST_F(ShmemSpinMPITest, SharedMemoryNameUnlinkedAfterInitialize)
+{
+    const std::string name = backend_->shmName();
+    ASSERT_FALSE(name.empty());
+
+    errno = 0;
+    int fd = shm_open(name.c_str(), O_RDWR, 0);
+    EXPECT_EQ(fd, -1) << "ShmemSpinBackend should unlink its POSIX shm name after all ranks map it";
+    EXPECT_EQ(errno, ENOENT) << "Unexpected shm_open errno for unlinked name " << name;
+    if (fd >= 0)
+        close(fd);
+}
+
+TEST(Test__ShmemSpinBackend, ReinitializeUsesFreshSharedMemoryName)
+{
+    const int rank = mpiRank();
+    const int size = mpiSize();
+    if (size < 2)
+    {
+        GTEST_SKIP() << "Requires MPI_PROCS >= 2";
+    }
+
+    const int domain_id = 424200;
+    const auto create_backend = [&]() {
+        auto upi = std::make_unique<UPICollectiveBackend>(MPI_COMM_WORLD, nullptr);
+        return std::make_unique<ShmemSpinBackend>(domain_id, rank, std::move(upi));
+    };
+
+    DeviceGroup group = makeCpuDeviceGroup(size);
+
+    auto first = create_backend();
+    ASSERT_TRUE(first->initialize(group)) << first->lastError();
+    const std::string first_name = first->shmName();
+    ASSERT_FALSE(first_name.empty());
+    first->shutdown();
+    MPI_Barrier(MPI_COMM_WORLD);
+
+    auto second = create_backend();
+    ASSERT_TRUE(second->initialize(group)) << second->lastError();
+    const std::string second_name = second->shmName();
+    ASSERT_FALSE(second_name.empty());
+    EXPECT_NE(second_name, first_name)
+        << "Reinitializing the same domain must not reuse a deterministic shm name";
+    second->shutdown();
+    MPI_Barrier(MPI_COMM_WORLD);
+}
+
+TEST(Test__ShmemSpinBackend, LegacyDeterministicNameDoesNotBlockInitialization)
+{
+    const int rank = mpiRank();
+    const int size = mpiSize();
+    if (size < 2)
+    {
+        GTEST_SKIP() << "Requires MPI_PROCS >= 2";
+    }
+
+    const int domain_id = 424201;
+    const std::string legacy_name = "/llaminar_shmem_ar_" + std::to_string(domain_id);
+
+    if (rank == 0)
+    {
+        shm_unlink(legacy_name.c_str());
+        int fd = shm_open(legacy_name.c_str(), O_CREAT | O_EXCL | O_RDWR, 0600);
+        ASSERT_GE(fd, 0) << "Failed to create stale legacy shm object: " << strerror(errno);
+        ASSERT_EQ(ftruncate(fd, 4096), 0) << "Failed to size stale legacy shm object: " << strerror(errno);
+        close(fd);
+    }
+    MPI_Barrier(MPI_COMM_WORLD);
+
+    auto upi = std::make_unique<UPICollectiveBackend>(MPI_COMM_WORLD, nullptr);
+    ShmemSpinBackend backend(domain_id, rank, std::move(upi));
+    DeviceGroup group = makeCpuDeviceGroup(size);
+    ASSERT_TRUE(backend.initialize(group)) << backend.lastError();
+    EXPECT_NE(backend.shmName(), legacy_name)
+        << "Backend should use a fresh per-run name instead of the legacy deterministic name";
+
+    float value = static_cast<float>(rank + 1);
+    ASSERT_TRUE(backend.allreduce(&value, 1, CollectiveDataType::FLOAT32, CollectiveOp::ALLREDUCE_SUM));
+    EXPECT_FLOAT_EQ(value, static_cast<float>(size * (size + 1)) / 2.0f);
+
+    backend.shutdown();
+    MPI_Barrier(MPI_COMM_WORLD);
+
+    if (rank == 0)
+    {
+        errno = 0;
+        int unlink_result = shm_unlink(legacy_name.c_str());
+        EXPECT_TRUE(unlink_result == 0 || errno == ENOENT)
+            << "Failed to cleanup stale legacy shm object: " << strerror(errno);
+    }
+    MPI_Barrier(MPI_COMM_WORLD);
 }
 
 TEST_F(ShmemSpinMPITest, AllreduceVaryingValues)

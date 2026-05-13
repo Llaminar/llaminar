@@ -91,7 +91,9 @@ namespace llaminar2
                 base_comm,
                 domain.domain_id,
                 domain.domain_id,         // color = domain_id
-                domain.my_index_in_domain // key = my index
+                domain.my_index_in_domain, // key = my index
+                "",
+                domain.backend
             );
         }
 
@@ -163,7 +165,8 @@ namespace llaminar2
         int domain_id,
         int color,
         int key,
-        const std::string &hostfile_path)
+        const std::string &hostfile_path,
+        CollectiveBackendType backend)
     {
         if (base_comm == MPI_COMM_NULL)
         {
@@ -174,7 +177,7 @@ namespace llaminar2
         LOG_DEBUG("TPContextFactory::createGlobal - Creating GlobalTPContext with domain_id="
                   << domain_id << ", color=" << color << ", key=" << key);
 
-        return GlobalTPContext::createWithSplit(base_comm, domain_id, color, key, hostfile_path);
+        return GlobalTPContext::createWithSplit(base_comm, domain_id, color, key, hostfile_path, backend);
     }
 
     std::unique_ptr<IGlobalTPContext> TPContextFactory::createGlobalFromPlan(

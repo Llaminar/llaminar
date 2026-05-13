@@ -122,7 +122,8 @@ namespace llaminar2
             int domain_id,
             int color,
             int key,
-            const std::string &hostfile_path = "");
+            const std::string &hostfile_path = "",
+            CollectiveBackendType backend = CollectiveBackendType::UPI);
 
         /**
          * @brief Create GlobalTPContext from plan's global_tp fields

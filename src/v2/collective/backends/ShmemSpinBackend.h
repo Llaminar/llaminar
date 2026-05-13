@@ -110,7 +110,7 @@ namespace llaminar2
         /**
          * @brief Create shared-memory spin-wait backend
          *
-         * @param domain_id  Unique domain identifier (used in shm name)
+         * @param domain_id  Unique domain identifier (included in generated shm names)
          * @param my_rank    This rank's index (0 to N-1)
          * @param fallback   UPI backend for non-fast-path operations (takes ownership)
          */
@@ -190,6 +190,9 @@ namespace llaminar2
         /// Get this rank's epoch counter value
         uint64_t currentEpoch() const { return my_epoch_; }
 
+        /// Get the POSIX shared-memory name used by this initialized backend.
+        const std::string &shmName() const { return shm_name_; }
+
         /// Check if a given allreduce would use the fast path
         bool isFastPath(size_t count, CollectiveDataType dtype, CollectiveOp op) const;
 
@@ -245,10 +248,11 @@ namespace llaminar2
         int num_ranks_ = 0;                  ///< Total ranks (set during initialize)
         uint64_t my_epoch_ = 0;
 
-        std::string shm_name_;               ///< POSIX shm name (/llaminar_shmem_ar_<id>)
+        std::string shm_name_;               ///< POSIX shm name generated per initialize() call
         int shm_fd_ = -1;                    ///< File descriptor for shared memory
         size_t arena_size_ = 0;              ///< Mapped size in bytes (for munmap)
         ShmemSpinArena *arena_ = nullptr;     ///< Mapped shared-memory arena
+        bool shm_unlinked_ = false;           ///< Whether rank 0 has unlinked shm_name_
 
         std::unique_ptr<UPICollectiveBackend> fallback_; ///< MPI fallback for non-fast-path ops
         std::atomic<bool> abort_requested_{false};       ///< Local abort requested for this backend

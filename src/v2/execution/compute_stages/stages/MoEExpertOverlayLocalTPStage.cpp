@@ -360,6 +360,7 @@ namespace llaminar2
         run.top_k = params_.top_k;
         run.expert_intermediate = params_.expert_intermediate;
         run.layer_idx = params_.layer_idx;
+        run.output_device = params_.device_id;
         run.expert_mask = params_.expert_mask;
         run.stage_name_prefix = params_.stage_name_prefix;
         run.upload_partials_to_participant_devices = params_.upload_partials_to_participant_devices;

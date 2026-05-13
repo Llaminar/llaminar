@@ -33,7 +33,9 @@ This document provides practical guidelines for working with the **Llaminar V2**
 
 ## Architecture Overview
 
-**Design Philosophy**: Operator-free, tensor-centric, kernel-oriented design with declarative graph execution.
+**Overall Design Philosophy**: Tensor-centric, kernel-oriented design with declarative graph execution.
+
+**Graph Design Philosophy, The Design North Star**: Llaminar graphs are, and must remain, per-device and symmetric. We must never introduce nested multi-device subgraphs. Features like sparse MoE routing are represented as graph collectives. Every compute stage is participant-local. Devices with no work no-op until the next collective.
 
 **Key Characteristics**:
 - **DeviceGraphOrchestrator / RankOrchestrator**: Execution via declarative compute DAGs

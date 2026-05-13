@@ -61,9 +61,9 @@ namespace llaminar2
             node_count_ = domain_size_;
             all_same_node_ = (domain_size_ <= 1);
         }
-        // Create collective backend
-        // Fast path: 2-rank intra-node → ShmemSpinBackend (shared-memory spin-wait)
-        // Fallback:  UPICollectiveBackend (MPI) for all other topologies
+        // Create collective backend. Same-node UPI domains use ShmemSpin as an
+        // opportunistic fast path for supported allreduces, while retaining UPI
+        // as the fallback backend for unsupported collectives and init failures.
         if (domain_comm_ != MPI_COMM_NULL)
         {
             // Build the device group (needed by both backends)
@@ -75,39 +75,77 @@ namespace llaminar2
                 group.devices.push_back(DeviceId::cpu());
             }
 
-            if (all_same_node_ && domain_size_ == 2)
+            CollectiveBackendType effective_backend = backend_type_;
+            if (effective_backend == CollectiveBackendType::AUTO)
+                effective_backend = CollectiveBackendType::UPI;
+
+            auto create_upi_backend = [&]() -> std::unique_ptr<ICollectiveBackend>
             {
-                // Create UPI backend as fallback for non-fast-path operations
                 auto upi = std::make_unique<UPICollectiveBackend>(domain_comm_, nullptr);
-                upi->initialize(group);
+                if (!upi->initialize(group))
+                {
+                    LOG_ERROR("GlobalTPContext: Failed to initialize UPICollectiveBackend for domain "
+                              << domain_id_ << " requested_backend="
+                              << collectiveBackendTypeToString(backend_type_)
+                              << " error=" << upi->lastError());
+                    return nullptr;
+                }
+                return upi;
+            };
 
-                // Wrap in ShmemSpinBackend for fast allreduce
+            if (effective_backend == CollectiveBackendType::UPI && all_same_node_ && domain_size_ > 1)
+            {
+                backend_type_ = effective_backend;
+                auto upi_fallback = std::make_unique<UPICollectiveBackend>(domain_comm_, nullptr);
                 auto shmem = std::make_unique<ShmemSpinBackend>(
-                    domain_id_, my_rank_in_domain_, std::move(upi));
-                shmem->initialize(group);
-                backend_ = std::move(shmem);
+                    domain_id_, my_rank_in_domain_, std::move(upi_fallback));
 
-                LOG_INFO("GlobalTPContext: Using ShmemSpinBackend for domain " << domain_id_
-                                                                               << " (2-rank intra-node fast path)");
+                if (shmem->initialize(group))
+                {
+                    backend_ = std::move(shmem);
+                    LOG_INFO("GlobalTPContext: Using ShmemSpinBackend for domain " << domain_id_
+                                                                                   << " (same-node UPI fast path, domain_size="
+                                                                                   << domain_size_ << ")");
+                }
+                else
+                {
+                    LOG_WARN("GlobalTPContext: ShmemSpinBackend unavailable for domain " << domain_id_
+                                                                                         << "; falling back to UPI (error="
+                                                                                         << shmem->lastError() << ")");
+                    backend_ = create_upi_backend();
+                }
+            }
+            else if (effective_backend == CollectiveBackendType::UPI ||
+                     effective_backend == CollectiveBackendType::MPI)
+            {
+                backend_type_ = effective_backend;
+                backend_ = create_upi_backend();
+                if (backend_)
+                {
+                    LOG_DEBUG("GlobalTPContext: Using UPICollectiveBackend for domain " << domain_id_
+                                                                                         << " (domain_size=" << domain_size_
+                                                                                         << ", all_same_node=" << all_same_node_
+                                                                                         << ", requested_backend="
+                                                                                         << collectiveBackendTypeToString(backend_type_) << ")");
+                }
             }
             else
             {
-                // Standard MPI path for multi-node or >2 ranks
-                backend_ = std::make_unique<UPICollectiveBackend>(domain_comm_, nullptr);
-                backend_->initialize(group);
-
-                LOG_DEBUG("GlobalTPContext: Using UPICollectiveBackend for domain " << domain_id_
-                                                                                    << " (domain_size=" << domain_size_
-                                                                                    << ", all_same_node=" << all_same_node_ << ")");
+                LOG_ERROR("GlobalTPContext: Unsupported backend "
+                          << collectiveBackendTypeToString(backend_type_)
+                          << " for CPU cross-rank GlobalTP domain " << domain_id_);
             }
 
-            LOG_DEBUG("GlobalTPContext: Created for domain " << domain_id_
-                                                             << " with rank " << my_rank_in_domain_
-                                                             << "/" << domain_size_
-                                                             << " (owns_comm=" << owns_communicator_
-                                                             << ", all_same_node=" << all_same_node_
-                                                             << ", node_count=" << node_count_
-                                                             << ", backend=" << backend_->name() << ")");
+            if (backend_)
+            {
+                LOG_DEBUG("GlobalTPContext: Created for domain " << domain_id_
+                                                                 << " with rank " << my_rank_in_domain_
+                                                                 << "/" << domain_size_
+                                                                 << " (owns_comm=" << owns_communicator_
+                                                                 << ", all_same_node=" << all_same_node_
+                                                                 << ", node_count=" << node_count_
+                                                                 << ", backend=" << backend_->name() << ")");
+            }
         }
     }
 
@@ -172,7 +210,8 @@ namespace llaminar2
         int domain_id,
         int color,
         int key,
-        const std::string &hostfile_path)
+        const std::string &hostfile_path,
+        CollectiveBackendType backend_type)
     {
         if (base_comm == MPI_COMM_NULL)
         {
@@ -231,7 +270,7 @@ namespace llaminar2
             domain_size,
             std::move(world_ranks),
             true, // owns_communicator = true (we created it)
-            CollectiveBackendType::UPI,
+                backend_type,
             std::move(detection.node_ids)));
     }
 
@@ -239,7 +278,8 @@ namespace llaminar2
         MPI_Comm comm,
         int domain_id,
         std::vector<int> world_ranks,
-        std::vector<int> node_ids)
+        std::vector<int> node_ids,
+        CollectiveBackendType backend_type)
     {
         if (comm == MPI_COMM_NULL)
         {
@@ -270,7 +310,7 @@ namespace llaminar2
             domain_size,
             std::move(world_ranks),
             false, // owns_communicator = false (test owns it)
-            CollectiveBackendType::UPI,
+                backend_type,
             std::move(node_ids)));
     }
 
@@ -788,6 +828,11 @@ namespace llaminar2
     int GlobalTPContext::nodeCount() const
     {
         return node_count_;
+    }
+
+    std::string GlobalTPContext::collectiveBackendNameForDiagnostics() const
+    {
+        return backend_ ? backend_->name() : "none";
     }
 
     void GlobalTPContext::detectNodeIds()

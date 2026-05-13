@@ -1181,6 +1181,7 @@ add_library(llaminar2_core STATIC
     execution/moe/MoEExpertOverlayProfiler.cpp
     execution/moe/MoEExpertOverlayRuntimePlan.cpp
     execution/moe/MoEOverlayDispatchCollective.cpp
+    execution/moe/MoEOverlayMPIDispatchBackend.cpp
     execution/moe/MoEOverlayDomainRuntime.cpp
     execution/moe/SocketAwareRebalancer.cpp
     execution/moe/MoERebalanceController.cpp

@@ -54,6 +54,7 @@ namespace llaminar2
         int top_k = 0;
         int expert_intermediate = 0;
         int layer_idx = -1;
+        DeviceId output_device = DeviceId::invalid();
 
         std::vector<bool> expert_mask;
         std::string stage_name_prefix = "moe_localtp_tensor_parallel_expert";

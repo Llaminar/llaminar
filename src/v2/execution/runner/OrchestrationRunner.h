@@ -43,7 +43,14 @@ namespace llaminar2
 {
 
     class MoERebalanceController;
+    class IModelContext;
+    class MoEOverlayMPIDispatchBackend;
     struct ExpertReplicaSet;
+    struct MoEExpertOverlayExecutionPlan;
+
+    std::shared_ptr<MoEExpertParallelPlan> freezeMoEExpertOverlayPlanForModel(
+        IModelContext &model_ctx,
+        const std::shared_ptr<MoEExpertParallelPlan> &plan);
 
     /**
      * @brief Concrete implementation of IOrchestrationRunner
@@ -333,6 +340,8 @@ namespace llaminar2
          */
         bool loadWeights();
 
+        bool freezeMoEExpertOverlayPlanForLoadedModel();
+
         /**
          * @brief Validate TP/PP configuration against loaded model
          *
@@ -405,6 +414,17 @@ namespace llaminar2
          */
         bool buildSingleDeviceComputeGraph();
 
+        /**
+         * @brief Create shared MoE overlay MPI dispatch backend when this
+         * rank participates in a graph-native remote-domain overlay run.
+         */
+        void ensureMoEOverlayDispatchBackend(
+            const std::shared_ptr<const MoEExpertOverlayExecutionPlan> &overlay_execution_plan);
+
+        void beginMoEOverlayForwardDispatch();
+        void signalMoEOverlayForwardDone();
+        void signalMoEOverlayForwardCancel(int reason_code);
+
         // =====================================================================
         // Error Handling
         // =====================================================================
@@ -428,6 +448,7 @@ namespace llaminar2
         std::unique_ptr<IExecutionPlanBuilder> plan_builder_;
         std::shared_ptr<IMPIContext> mpi_ctx_;
         std::shared_ptr<IMPIContext> moe_expert_overlay_mpi_ctx_;
+        std::shared_ptr<MoEOverlayMPIDispatchBackend> moe_overlay_dispatch_backend_;
         std::shared_ptr<ModelContext> model_ctx_;
         std::unique_ptr<ILocalTPContext> local_tp_ctx_;
         std::unique_ptr<ILocalPPContext> local_pp_ctx_;

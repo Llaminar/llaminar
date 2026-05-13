@@ -9026,6 +9026,27 @@ add_v2_test(V2_Unit_MPICoordinatedMode
 )
 message(STATUS "V2 Tests: Added MPI coordinated mode unit tests")
 
+# MoE overlay plan freezing unit tests
+# Locks in that OrchestrationRunner uses model metadata to freeze YAML overlay
+# plans before root/endpoint graph construction.
+add_executable(v2_unit_orchestration_runner_moe_overlay_plan
+    unit/execution/runner/Test__OrchestrationRunnerMoEOverlayPlan.cpp
+)
+target_include_directories(v2_unit_orchestration_runner_moe_overlay_plan PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+target_link_libraries(v2_unit_orchestration_runner_moe_overlay_plan
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_OrchestrationRunner_MoEOverlayPlan
+    COMMAND $<TARGET_FILE:v2_unit_orchestration_runner_moe_overlay_plan>
+    LABELS "V2;Unit;Orchestration;OrchestrationRunner;MoE;Overlay;ExpertParallel"
+    MPI_PROCS 1
+)
+message(STATUS "V2 Tests: Added OrchestrationRunner MoE overlay plan unit tests")
+
 # Node-leader page cache coordination unit tests
 # Tests the per-node-leader page cache prepopulation logic using MockMPITopology.
 add_executable(v2_unit_node_leader_page_cache

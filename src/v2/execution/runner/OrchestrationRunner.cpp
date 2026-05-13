@@ -39,6 +39,7 @@
 #include "../../execution/moe/ExpertWeightTransfer.h"
 #include "../../execution/moe/MoEExpertParallelPlan.h"
 #include "../../execution/moe/MoEOverlayCPUFallbackParticipantRunner.h"
+#include "../../execution/moe/MoEOverlayMPIDispatchBackend.h"
 
 #include <algorithm>
 #include <cctype>
@@ -152,6 +153,43 @@ namespace llaminar2
 
             return true;
         }
+
+        MoEOverlayDispatchGroup overlayControlDispatchGroup()
+        {
+            MoEOverlayDispatchGroup group;
+            group.domain_id = 0;
+            group.layer_id = 0;
+            group.dispatch_group_id = 0;
+            group.participant_count = 1;
+            group.participant_index = 0;
+            group.owner_participant_index = 0;
+            group.executor_participant_index = 0;
+            return group;
+        }
+
+        bool hasCPUFallbackEndpointRank(const MoEExpertOverlayExecutionPlan &overlay_execution_plan)
+        {
+            return std::any_of(
+                overlay_execution_plan.rank_plans.begin(),
+                overlay_execution_plan.rank_plans.end(),
+                [](const OverlayRankPlan &rank_plan)
+                {
+                    return rank_plan.hasRole(OverlayRankRole::CpuFallbackParticipant) &&
+                           !rank_plan.builds_root_graph;
+                });
+        }
+    }
+
+    std::shared_ptr<MoEExpertParallelPlan> freezeMoEExpertOverlayPlanForModel(
+        IModelContext &model_ctx,
+        const std::shared_ptr<MoEExpertParallelPlan> &plan)
+    {
+        if (!plan)
+            return nullptr;
+
+        InferenceRunnerConfig runner_config;
+        runner_config.moe_expert_parallel_plan = plan;
+        return resolveMoEExpertParallelPlanForModel(model_ctx, runner_config);
     }
 
     // =========================================================================
@@ -233,6 +271,7 @@ namespace llaminar2
             return true;
         };
 
+
         try
         {
             // Step 1: Initialize MPI if needed
@@ -285,6 +324,19 @@ namespace llaminar2
                 return false;
             }
             if (!syncInitStep(true, "loadWeights"))
+            {
+                return false;
+            }
+
+            // Step 4b: Freeze model-aware MoE overlay placements before any
+            // endpoint or root graph is constructed. The raw YAML plan may
+            // intentionally omit placements and rely on the planner.
+            if (!freezeMoEExpertOverlayPlanForLoadedModel())
+            {
+                syncInitStep(false, "freezeMoEExpertOverlayPlanForLoadedModel");
+                return false;
+            }
+            if (!syncInitStep(true, "freezeMoEExpertOverlayPlanForLoadedModel"))
             {
                 return false;
             }
@@ -421,18 +473,22 @@ namespace llaminar2
         }
 
         // Run forward pass
+        beginMoEOverlayForwardDispatch();
         try
         {
             if (!runner_->forward(prompt_tokens.data(),
                                   static_cast<int>(prompt_tokens.size())))
             {
+                signalMoEOverlayForwardCancel(1);
                 return setError("Forward pass failed during prefill");
             }
         }
         catch (const std::exception &e)
         {
+            signalMoEOverlayForwardCancel(2);
             return setError(std::string("Prefill failed: ") + e.what());
         }
+        signalMoEOverlayForwardDone();
 
         // Signal that prefill logits are ready for sampling.
         // The first decodeStep() will sample from these logits directly
@@ -469,11 +525,14 @@ namespace llaminar2
         else
         {
             // Run single-token forward with last token
+            beginMoEOverlayForwardDispatch();
             if (!runner_->forward(&last_token_, 1))
             {
+                signalMoEOverlayForwardCancel(3);
                 result.error = "Forward pass failed during decode";
                 return result;
             }
+            signalMoEOverlayForwardDone();
         }
 
         // Tail stage: try GPU-side sampling first, fall back to CPU
@@ -1094,6 +1153,41 @@ namespace llaminar2
         return true;
     }
 
+    bool OrchestrationRunner::freezeMoEExpertOverlayPlanForLoadedModel()
+    {
+        if (!model_ctx_ || !config_.moe_expert_parallel_plan)
+            return true;
+
+        const bool requested_without_placements =
+            config_.moe_expert_parallel_plan->isTieredOverlay() &&
+            config_.moe_expert_parallel_plan->placements.empty();
+
+        try
+        {
+            auto frozen_plan = freezeMoEExpertOverlayPlanForModel(
+                *model_ctx_,
+                config_.moe_expert_parallel_plan);
+            if (!frozen_plan)
+                return true;
+
+            config_.moe_expert_parallel_plan = std::move(frozen_plan);
+            if (config_.moe_expert_parallel_plan->isTieredOverlay())
+            {
+                LOG_INFO("[OrchestrationRunner] MoE expert overlay plan frozen: placements="
+                         << config_.moe_expert_parallel_plan->placements.size()
+                         << " routed_tiers=" << config_.moe_expert_parallel_plan->routed_tiers.size()
+                         << " domains=" << config_.moe_expert_parallel_plan->domains.size()
+                         << (requested_without_placements ? " (planned from model metadata)" : ""));
+            }
+        }
+        catch (const std::exception &e)
+        {
+            return setError(std::string("Failed to freeze MoE expert overlay plan from model metadata: ") + e.what());
+        }
+
+        return true;
+    }
+
     bool OrchestrationRunner::validateTPPPConfiguration()
     {
         // Skip validation if no model loaded (testing mode)
@@ -1269,6 +1363,7 @@ namespace llaminar2
         auto overlay_execution_plan = resolveOverlayExecutionPlanForRunner(
             config_.moe_expert_parallel_plan,
             moe_expert_overlay_mpi_ctx_ ? moe_expert_overlay_mpi_ctx_ : mpi_ctx_);
+        ensureMoEOverlayDispatchBackend(overlay_execution_plan);
         if (overlay_execution_plan && !overlay_execution_plan->buildsRootGraph())
         {
             const auto &rank_plan = overlay_execution_plan->currentRankPlan();
@@ -1284,6 +1379,7 @@ namespace llaminar2
                 endpoint_config.overlay_plan = config_.moe_expert_parallel_plan;
                 endpoint_config.execution_plan = overlay_execution_plan;
                 endpoint_config.hostfile_path = config_.hostfile;
+                endpoint_config.dispatch_backend = moe_overlay_dispatch_backend_;
 
                 runner_ = createMoEOverlayCPUFallbackParticipantRunner(std::move(endpoint_config));
                 if (!runner_)
@@ -1311,6 +1407,70 @@ namespace llaminar2
 
         // Single-device path
         return buildSingleDeviceComputeGraph();
+    }
+
+    void OrchestrationRunner::ensureMoEOverlayDispatchBackend(
+        const std::shared_ptr<const MoEExpertOverlayExecutionPlan> &overlay_execution_plan)
+    {
+        if (moe_overlay_dispatch_backend_)
+            return;
+        if (!overlay_execution_plan || !config_.moe_expert_parallel_plan ||
+            !config_.moe_expert_parallel_plan->isTieredOverlay())
+            return;
+        if (!hasCPUFallbackEndpointRank(*overlay_execution_plan))
+            return;
+
+        auto overlay_mpi_ctx = moe_expert_overlay_mpi_ctx_ ? moe_expert_overlay_mpi_ctx_ : mpi_ctx_;
+        if (!overlay_mpi_ctx || overlay_mpi_ctx->world_size() <= 1)
+            return;
+
+        MoEOverlayMPIDispatchBackend::Config dispatch_config;
+        dispatch_config.mpi_ctx = overlay_mpi_ctx;
+        dispatch_config.root_rank = overlay_execution_plan->continuation_root_rank >= 0
+                                        ? overlay_execution_plan->continuation_root_rank
+                                        : 0;
+        dispatch_config.local_participant_count = std::max<int>(1, static_cast<int>(plan_.local_tp_devices.size()));
+        moe_overlay_dispatch_backend_ = std::make_shared<MoEOverlayMPIDispatchBackend>(std::move(dispatch_config));
+    }
+
+    void OrchestrationRunner::beginMoEOverlayForwardDispatch()
+    {
+        if (moe_overlay_dispatch_backend_)
+            moe_overlay_dispatch_backend_->beginForward();
+    }
+
+    void OrchestrationRunner::signalMoEOverlayForwardDone()
+    {
+        if (!moe_overlay_dispatch_backend_)
+            return;
+        auto overlay_mpi_ctx = moe_expert_overlay_mpi_ctx_ ? moe_expert_overlay_mpi_ctx_ : mpi_ctx_;
+        if (!overlay_mpi_ctx || overlay_mpi_ctx->rank() != moe_overlay_dispatch_backend_->rootRank())
+            return;
+        if (moe_overlay_dispatch_backend_->cancelBroadcastSinceForwardBegin())
+            return;
+
+        const auto group = overlayControlDispatchGroup();
+        if (!moe_overlay_dispatch_backend_->sendForwardDone(group, -1, -1))
+        {
+            LOG_WARN("[OrchestrationRunner] Failed to signal MoE overlay forward completion to endpoint ranks");
+        }
+    }
+
+    void OrchestrationRunner::signalMoEOverlayForwardCancel(int reason_code)
+    {
+        if (!moe_overlay_dispatch_backend_)
+            return;
+        auto overlay_mpi_ctx = moe_expert_overlay_mpi_ctx_ ? moe_expert_overlay_mpi_ctx_ : mpi_ctx_;
+        if (!overlay_mpi_ctx || overlay_mpi_ctx->rank() != moe_overlay_dispatch_backend_->rootRank())
+            return;
+        if (moe_overlay_dispatch_backend_->cancelBroadcastSinceForwardBegin())
+            return;
+
+        const auto group = overlayControlDispatchGroup();
+        if (!moe_overlay_dispatch_backend_->sendCancel(group, -1, -1, reason_code))
+        {
+            LOG_WARN("[OrchestrationRunner] Failed to signal MoE overlay forward cancel to endpoint ranks");
+        }
     }
 
     bool OrchestrationRunner::hasLocalTP() const
@@ -1364,6 +1524,7 @@ namespace llaminar2
         auto mdo_config = RankOrchestrator::Config::fromPlan(plan_);
         mdo_config.moe_expert_parallel_plan = config_.moe_expert_parallel_plan;
         mdo_config.moe_expert_overlay_mpi_ctx = moe_expert_overlay_mpi_ctx_ ? moe_expert_overlay_mpi_ctx_ : mpi_ctx_;
+        mdo_config.moe_overlay_dispatch_backend = moe_overlay_dispatch_backend_;
 
         LOG_INFO("[OrchestrationRunner] Multi-device precision config: activation="
                  << activationPrecisionToString(mdo_config.activation_precision)
@@ -1425,6 +1586,7 @@ namespace llaminar2
         auto mdo_config = RankOrchestrator::Config::fromPlan(plan_);
         mdo_config.moe_expert_parallel_plan = config_.moe_expert_parallel_plan;
         mdo_config.moe_expert_overlay_mpi_ctx = moe_expert_overlay_mpi_ctx_ ? moe_expert_overlay_mpi_ctx_ : mpi_ctx_;
+        mdo_config.moe_overlay_dispatch_backend = moe_overlay_dispatch_backend_;
 
         // Log PP stage details
         for (size_t i = 0; i < mdo_config.pp_stages.size(); ++i)
@@ -1516,6 +1678,7 @@ namespace llaminar2
         runner_config.hostfile = config_.hostfile;
         runner_config.moe_expert_parallel_plan = config_.moe_expert_parallel_plan;
         runner_config.moe_expert_overlay_mpi_ctx = moe_expert_overlay_mpi_ctx_ ? moe_expert_overlay_mpi_ctx_ : mpi_ctx_;
+        runner_config.moe_overlay_dispatch_backend = moe_overlay_dispatch_backend_;
 
         LOG_INFO("[OrchestrationRunner] Single-device precision config: activation="
                  << activationPrecisionToString(runner_config.activation_precision)

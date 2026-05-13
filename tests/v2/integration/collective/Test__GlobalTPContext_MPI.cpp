@@ -610,6 +610,29 @@ TEST_F(Test__GlobalTPContext_MPI, ScopeReflectsNodePlacement_AllRanks)
     EXPECT_EQ(ctx->nodeCount(), 1) << "Should detect 1 node in dev container";
 }
 
+TEST_F(Test__GlobalTPContext_MPI, SameNodeUPIUsesShmemSpinBackend)
+{
+    auto ctx = GlobalTPContext::createWithSplit(
+        MPI_COMM_WORLD,
+        /*domain_id=*/6060,
+        /*color=*/0,
+        /*key=*/world_rank_,
+        /*hostfile_path=*/"",
+        CollectiveBackendType::UPI);
+    ASSERT_NE(ctx, nullptr);
+
+    if (ctx->isAllRanksOnSameNode())
+    {
+        EXPECT_EQ(ctx->collectiveBackendNameForDiagnostics(), "ShmemSpin")
+            << "Same-node UPI GlobalTP domains should use the shared-memory fast path";
+    }
+    else
+    {
+        EXPECT_EQ(ctx->collectiveBackendNameForDiagnostics(), "UPI")
+            << "Cross-node UPI domains should stay on the MPI/UPI backend";
+    }
+}
+
 /**
  * @test DomainId_SameOnAllRanks
  * Verify domainId() returns same value on all ranks

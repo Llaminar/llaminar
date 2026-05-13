@@ -83,6 +83,7 @@ namespace llaminar2
     class IRankOrchestrator;
     class PreparedWeightStore;
     class IOverlayDomainRuntime;
+    class MoEOverlayMPIDispatchBackend;
     struct GraphConfig;
     struct MoEExpertOverlayExecutionPlan;
     struct MoEExpertParallelPlan;
@@ -173,6 +174,10 @@ namespace llaminar2
 
         /// Optional MPI context used by MoE overlay domain-worker commands.
         std::shared_ptr<IMPIContext> moe_expert_overlay_mpi_ctx;
+
+        /// Optional graph-native MPI dispatch backend shared by root graph
+        /// participants for remote MoE overlay domains such as cpu_cold.
+        std::shared_ptr<MoEOverlayMPIDispatchBackend> moe_overlay_dispatch_backend;
 
         /// Optional graph-level cancellation hook. Queried before each stage,
         /// usually backed by a TP collective abort flag.
