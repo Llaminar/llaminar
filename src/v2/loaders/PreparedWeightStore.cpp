@@ -168,7 +168,10 @@ namespace llaminar2
             if (entry.ref.device != device)
                 continue;
 
-            if (entry.binding.tensor != binding.tensor)
+            const bool same_tensor = entry.binding.tensor == binding.tensor;
+            const bool same_canonical_name = !entry.binding.identity.canonical_name.empty() &&
+                                             entry.binding.identity.canonical_name == binding.identity.canonical_name;
+            if (!same_tensor && !same_canonical_name)
                 continue;
 
             auto handle = entry.owned_handle;

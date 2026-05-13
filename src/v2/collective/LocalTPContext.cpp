@@ -19,6 +19,7 @@
 #include <cstring>
 #include <cstdint>
 #include <cstdlib>
+#include <iomanip>
 #include <mutex>
 #include <numeric>
 #include <stdexcept>
@@ -67,6 +68,8 @@ extern "C"
 
 namespace llaminar2
 {
+    std::atomic<uint64_t> LocalTPContext::next_context_id_{1};
+
     bool LocalTPContext::isLocalTPNCCLGraphPolicySupported(std::string *reason_out) const
     {
         const auto &exec = debugEnv().execution;
@@ -381,7 +384,8 @@ namespace llaminar2
         std::vector<GlobalDeviceAddress> devices,
         std::vector<float> weights,
         CollectiveBackendType backend)
-        : devices_(std::move(devices))
+        : context_id_(next_context_id_.fetch_add(1, std::memory_order_relaxed)),
+          devices_(std::move(devices))
     {
         // Validate devices
         if (devices_.empty())
@@ -418,9 +422,28 @@ namespace llaminar2
 
         // Build lookup index
         buildDeviceIndex();
+        onstream_sequence_by_slot_.assign(devices_.size(), 0);
 
         LOG_DEBUG("LocalTPContext created: degree=" << degree()
                                                     << ", backend=" << collectiveBackendTypeToString(backend_));
+        if (debugEnv().tp_collective_contract_trace)
+        {
+            LOG_INFO("[TP_COLLECTIVE_CONTEXT] event=localtp_create"
+                     << " context_id=" << context_id_
+                     << " context=" << static_cast<const void *>(this)
+                     << " degree=" << degree()
+                     << " backend=" << collectiveBackendTypeToString(backend_)
+                     << " devices=" << [&]()
+                     {
+                            std::string out;
+                            for (size_t i = 0; i < devices_.size(); ++i)
+                            {
+                                if (i > 0)
+                                    out += ",";
+                                out += devices_[i].toString();
+                            }
+                            return out; }());
+        }
 
         // Initialize backend for multi-device scenarios
         if (degree() > 1)
@@ -487,7 +510,28 @@ namespace llaminar2
             return;
         }
 
-        LOG_WARN("[LocalTPContext] Abort requested — aborting collective backend to unblock stuck devices");
+        LOG_WARN("[LocalTPContext] Abort requested — aborting collective backend to unblock stuck devices"
+                 << " context_id=" << context_id_
+                 << " context=" << static_cast<const void *>(this));
+
+        if (debugEnv().tp_collective_contract_trace)
+        {
+            std::lock_guard<std::mutex> trace_lock(contract_trace_mutex_);
+            for (const auto &entry_pair : onstream_contracts_)
+            {
+                const auto &entry = entry_pair.second;
+                LOG_WARN("[TP_COLLECTIVE_CONTRACT] event=localtp_abort_pending"
+                         << " context_id=" << context_id_
+                         << " context=" << static_cast<const void *>(this)
+                         << " sequence=" << entry_pair.first
+                         << " stage=" << (entry.stage_name.empty() ? "(none)" : entry.stage_name)
+                         << " arrivals=" << entry.arrivals << "/" << degree()
+                         << " seen_slots_mask=0x" << std::hex << entry.seen_slots << std::dec
+                         << " count=" << entry.count
+                         << " dtype=" << entry.dtype
+                         << " precision=" << (entry.precision.empty() ? "(default)" : entry.precision));
+            }
+        }
 
         if (backend_impl_)
         {
@@ -755,6 +799,12 @@ namespace llaminar2
 
         // Issue allreduce directly on the caller's stream (graph-capturable)
         CollectiveDataType dtype = tensorDTypeToCollective(tensor);
+        if (!traceOnStreamCollectiveContract(device_index, tensor, stage_name,
+                                             effective_count, dtype, stream, precision))
+        {
+            requestAbort();
+            return false;
+        }
 
         // =================================================================
         // FP16 mixed-precision allreduce path
@@ -1258,13 +1308,13 @@ namespace llaminar2
             {
                 TensorBase *tb = barrier_tensors_[i];
                 LOG_INFO("[LocalTPContext][HostAllreduceTrace] slot=" << i
-                         << " tensor=" << static_cast<void *>(tb)
-                         << " current_device=" << (tb && tb->current_device() ? tb->current_device()->toString() : "none")
-                         << " host=" << (tb ? tb->raw_data() : nullptr)
-                         << " gpu=" << (tb ? tb->gpu_data_ptr() : nullptr)
-                         << " numel=" << (tb ? tb->numel() : 0)
-                         << " count=" << effective_count
-                         << " stage=" << barrier_stage_name_);
+                                                                      << " tensor=" << static_cast<void *>(tb)
+                                                                      << " current_device=" << (tb && tb->current_device() ? tb->current_device()->toString() : "none")
+                                                                      << " host=" << (tb ? tb->raw_data() : nullptr)
+                                                                      << " gpu=" << (tb ? tb->gpu_data_ptr() : nullptr)
+                                                                      << " numel=" << (tb ? tb->numel() : 0)
+                                                                      << " count=" << effective_count
+                                                                      << " stage=" << barrier_stage_name_);
             }
         }
 
@@ -2604,10 +2654,133 @@ namespace llaminar2
 
     void LocalTPContext::setComputeStreams(const std::vector<void *> &compute_streams)
     {
+        if (debugEnv().tp_collective_contract_trace)
+        {
+            LOG_INFO("[TP_COLLECTIVE_CONTEXT] event=localtp_set_compute_streams"
+                     << " context_id=" << context_id_
+                     << " context=" << static_cast<const void *>(this)
+                     << " backend_impl=" << static_cast<const void *>(backend_impl_.get())
+                     << " stream_count=" << compute_streams.size());
+            for (size_t i = 0; i < compute_streams.size(); ++i)
+            {
+                LOG_INFO("[TP_COLLECTIVE_CONTEXT] event=localtp_compute_stream"
+                         << " context_id=" << context_id_
+                         << " slot=" << i
+                         << " stream=" << compute_streams[i]
+                         << " device=" << (i < devices_.size() ? devices_[i].toString() : std::string("(unknown)")));
+            }
+        }
+
         if (backend_initialized_ && backend_impl_)
         {
             backend_impl_->setComputeStreams(compute_streams);
         }
+    }
+
+    bool LocalTPContext::traceOnStreamCollectiveContract(int device_index,
+                                                         TensorBase *tensor,
+                                                         const std::string &stage_name,
+                                                         size_t effective_count,
+                                                         CollectiveDataType dtype,
+                                                         void *stream,
+                                                         const std::string &precision)
+    {
+        if (!debugEnv().tp_collective_contract_trace)
+        {
+            return true;
+        }
+
+        uint64_t sequence = 0;
+        bool mismatch = false;
+        std::string mismatch_reason;
+        {
+            std::lock_guard<std::mutex> lock(contract_trace_mutex_);
+            if (onstream_sequence_by_slot_.size() != devices_.size())
+            {
+                onstream_sequence_by_slot_.assign(devices_.size(), 0);
+            }
+
+            sequence = onstream_sequence_by_slot_[static_cast<size_t>(device_index)]++;
+            auto &entry = onstream_contracts_[sequence];
+            const int dtype_value = static_cast<int>(dtype);
+            if (!entry.initialized)
+            {
+                entry.initialized = true;
+                entry.stage_name = stage_name;
+                entry.count = effective_count;
+                entry.dtype = dtype_value;
+                entry.precision = precision;
+            }
+            else
+            {
+                if (entry.stage_name != stage_name)
+                {
+                    mismatch = true;
+                    mismatch_reason = "stage mismatch expected=" + (entry.stage_name.empty() ? std::string("(none)") : entry.stage_name) +
+                                      " actual=" + (stage_name.empty() ? std::string("(none)") : stage_name);
+                }
+                else if (entry.count != effective_count)
+                {
+                    mismatch = true;
+                    mismatch_reason = "count mismatch expected=" + std::to_string(entry.count) +
+                                      " actual=" + std::to_string(effective_count);
+                }
+                else if (entry.dtype != dtype_value)
+                {
+                    mismatch = true;
+                    mismatch_reason = "dtype mismatch expected=" + std::to_string(entry.dtype) +
+                                      " actual=" + std::to_string(dtype_value);
+                }
+            }
+
+            if (device_index >= 0 && device_index < 64)
+            {
+                const uint64_t bit = 1ull << static_cast<uint64_t>(device_index);
+                if ((entry.seen_slots & bit) != 0)
+                {
+                    mismatch = true;
+                    mismatch_reason = "duplicate slot arrival for sequence=" + std::to_string(sequence) +
+                                      " slot=" + std::to_string(device_index);
+                }
+                entry.seen_slots |= bit;
+            }
+            ++entry.arrivals;
+
+            if (entry.arrivals >= degree())
+            {
+                onstream_contracts_.erase(sequence);
+            }
+        }
+
+        LOG_INFO("[TP_COLLECTIVE_CONTRACT] event=localtp_onstream_arrival"
+                 << " context_id=" << context_id_
+                 << " context=" << static_cast<const void *>(this)
+                 << " backend=" << collectiveBackendTypeToString(backend_)
+                 << " backend_impl=" << static_cast<const void *>(backend_impl_.get())
+                 << " sequence=" << sequence
+                 << " slot=" << device_index
+                 << " degree=" << degree()
+                 << " stage=" << (stage_name.empty() ? "(none)" : stage_name)
+                 << " count=" << effective_count
+                 << " dtype=" << static_cast<int>(dtype)
+                 << " precision=" << (precision.empty() ? "(default)" : precision)
+                 << " stream=" << stream
+                 << " tensor=" << static_cast<void *>(tensor)
+                 << " tensor_name=" << (tensor && !tensor->debugName().empty() ? tensor->debugName() : "(unnamed)")
+                 << " gpu_ptr=" << (tensor ? tensor->gpu_data_ptr() : nullptr));
+
+        if (mismatch)
+        {
+            LOG_ERROR("[TP_COLLECTIVE_CONTRACT] event=localtp_onstream_mismatch"
+                      << " context_id=" << context_id_
+                      << " context=" << static_cast<const void *>(this)
+                      << " sequence=" << sequence
+                      << " slot=" << device_index
+                      << " reason=" << mismatch_reason);
+            return false;
+        }
+
+        return true;
     }
 
     // =========================================================================

@@ -27,144 +27,144 @@
 
 namespace llaminar2
 {
-    namespace
+namespace
+{
+    struct ProfilerState
     {
-        struct ProfilerState
-        {
-            std::mutex mutex;
-            std::vector<MoEExpertOverlayProfileRow> rows;
-            size_t version = 0;
-            size_t printed_version = 0;
-            size_t csv_version = 0;
-        };
+        std::mutex mutex;
+        std::vector<MoEExpertOverlayProfileRow> rows;
+        size_t version = 0;
+        size_t printed_version = 0;
+        size_t csv_version = 0;
+    };
 
-        ProfilerState &state()
-        {
-            static ProfilerState instance;
-            return instance;
-        }
+    ProfilerState &state()
+    {
+        static ProfilerState instance;
+        return instance;
+    }
 
-        bool sameKey(const MoEExpertOverlayProfileRow &lhs, const MoEExpertOverlayProfileRow &rhs)
-        {
-            return lhs.phase == rhs.phase && lhs.layer == rhs.layer && lhs.domain == rhs.domain;
-        }
+    bool sameKey(const MoEExpertOverlayProfileRow &lhs, const MoEExpertOverlayProfileRow &rhs)
+    {
+        return lhs.phase == rhs.phase && lhs.layer == rhs.layer && lhs.domain == rhs.domain;
+    }
 
-        void mergeTextField(std::string &target, const std::string &value)
+    void mergeTextField(std::string &target, const std::string &value)
+    {
+        if (value.empty() || value == "unknown")
+            return;
+        if (target.empty() || target == "unknown")
         {
-            if (value.empty() || value == "unknown")
-                return;
-            if (target.empty() || target == "unknown")
-            {
-                target = value;
-                return;
-            }
-            if (target.find(value) == std::string::npos)
-                target += "+" + value;
+            target = value;
+            return;
         }
+        if (target.find(value) == std::string::npos)
+            target += "+" + value;
+    }
 
-        void mergeRow(MoEExpertOverlayProfileRow &target, const MoEExpertOverlayProfileRow &row)
-        {
-            mergeTextField(target.domain_kind, row.domain_kind);
-            mergeTextField(target.backend, row.backend);
-            target.assigned_experts = std::max(target.assigned_experts, row.assigned_experts);
-            target.resident_experts = std::max(target.resident_experts, row.resident_experts);
-            target.routed_entries += row.routed_entries;
-            target.selected_rows += row.selected_rows;
-            target.transfer_bytes += row.transfer_bytes;
-            target.outbound_bytes += row.outbound_bytes;
-            target.return_bytes += row.return_bytes;
-            target.compute_ms += row.compute_ms;
-            target.domain_reduce_ms += row.domain_reduce_ms;
-            target.cross_domain_reduce_ms += row.cross_domain_reduce_ms;
-            target.participant_count = std::max(target.participant_count, row.participant_count);
-            mergeTextField(target.executed_experts, row.executed_experts);
-            mergeTextField(target.transport_mode, row.transport_mode);
-            mergeTextField(target.final_reduce_mode, row.final_reduce_mode);
-            mergeTextField(target.accumulation_path, row.accumulation_path);
-        }
+    void mergeRow(MoEExpertOverlayProfileRow &target, const MoEExpertOverlayProfileRow &row)
+    {
+        mergeTextField(target.domain_kind, row.domain_kind);
+        mergeTextField(target.backend, row.backend);
+        target.assigned_experts = std::max(target.assigned_experts, row.assigned_experts);
+        target.resident_experts = std::max(target.resident_experts, row.resident_experts);
+        target.routed_entries += row.routed_entries;
+        target.selected_rows += row.selected_rows;
+        target.transfer_bytes += row.transfer_bytes;
+        target.outbound_bytes += row.outbound_bytes;
+        target.return_bytes += row.return_bytes;
+        target.compute_ms += row.compute_ms;
+        target.domain_reduce_ms += row.domain_reduce_ms;
+        target.cross_domain_reduce_ms += row.cross_domain_reduce_ms;
+        target.participant_count = std::max(target.participant_count, row.participant_count);
+        mergeTextField(target.executed_experts, row.executed_experts);
+        mergeTextField(target.transport_mode, row.transport_mode);
+        mergeTextField(target.final_reduce_mode, row.final_reduce_mode);
+        mergeTextField(target.accumulation_path, row.accumulation_path);
+    }
 
-        std::string csvEscape(const std::string &value)
+    std::string csvEscape(const std::string &value)
+    {
+        if (value.find_first_of(",\"\n\r") == std::string::npos)
+            return value;
+        std::string escaped = "\"";
+        for (char ch : value)
         {
-            if (value.find_first_of(",\"\n\r") == std::string::npos)
-                return value;
-            std::string escaped = "\"";
-            for (char ch : value)
-            {
-                if (ch == '"')
-                    escaped += "\"\"";
-                else
-                    escaped += ch;
-            }
-            escaped += "\"";
-            return escaped;
+            if (ch == '"')
+                escaped += "\"\"";
+            else
+                escaped += ch;
         }
+        escaped += "\"";
+        return escaped;
+    }
 
-        std::string formatDouble(double value)
-        {
-            std::ostringstream out;
-            out.setf(std::ios::fixed, std::ios::floatfield);
-            out.precision(3);
-            out << value;
-            return out.str();
-        }
+    std::string formatDouble(double value)
+    {
+        std::ostringstream out;
+        out.setf(std::ios::fixed, std::ios::floatfield);
+        out.precision(3);
+        out << value;
+        return out.str();
+    }
 
-        std::string joinInts(std::vector<int> values)
+    std::string joinInts(std::vector<int> values)
+    {
+        if (values.empty())
+            return "unknown";
+        std::sort(values.begin(), values.end());
+        values.erase(std::unique(values.begin(), values.end()), values.end());
+        std::ostringstream out;
+        for (size_t i = 0; i < values.size(); ++i)
         {
-            if (values.empty())
-                return "unknown";
-            std::sort(values.begin(), values.end());
-            values.erase(std::unique(values.begin(), values.end()), values.end());
-            std::ostringstream out;
-            for (size_t i = 0; i < values.size(); ++i)
-            {
-                if (i > 0)
-                    out << ";";
-                out << values[i];
-            }
-            return out.str();
+            if (i > 0)
+                out << ";";
+            out << values[i];
         }
+        return out.str();
+    }
 
-        int countAssignedExperts(const ExpertLayerPlacement &placement, int tier_index)
-        {
-            return static_cast<int>(std::count(
-                placement.routed_expert_tier.begin(),
-                placement.routed_expert_tier.end(),
-                tier_index));
-        }
+    int countAssignedExperts(const ExpertLayerPlacement &placement, int tier_index)
+    {
+        return static_cast<int>(std::count(
+            placement.routed_expert_tier.begin(),
+            placement.routed_expert_tier.end(),
+            tier_index));
+    }
 
-        std::string backendString(CollectiveBackendType backend)
-        {
-            return collectiveBackendTypeToString(backend);
-        }
+    std::string backendString(CollectiveBackendType backend)
+    {
+        return collectiveBackendTypeToString(backend);
+    }
 
-        std::string finalReduceTransportMode(const MoEExpertParallelReduceDiagnostics &diagnostics)
-        {
-            if (diagnostics.host_staged)
-                return "host-staged";
-            if (diagnostics.output_resident_on_continuation)
-                return "continuation-device";
-            return "direct";
-        }
+    std::string finalReduceTransportMode(const MoEExpertParallelReduceDiagnostics &diagnostics)
+    {
+        if (diagnostics.host_staged)
+            return "host-staged";
+        if (diagnostics.output_resident_on_continuation)
+            return "continuation-device";
+        return "direct";
+    }
 
-        std::string accumulationPathSummary(const MoEExpertParallelReduceDiagnostics &diagnostics)
+    std::string accumulationPathSummary(const MoEExpertParallelReduceDiagnostics &diagnostics)
+    {
+        std::set<std::string> paths;
+        for (const auto &partial : diagnostics.partials)
+            paths.insert(toString(partial.accumulation_path));
+        if (paths.empty())
+            return diagnostics.host_staged ? "HostSummedCorrectnessFallback" : "unknown";
+        std::ostringstream out;
+        bool first = true;
+        for (const auto &path : paths)
         {
-            std::set<std::string> paths;
-            for (const auto &partial : diagnostics.partials)
-                paths.insert(toString(partial.accumulation_path));
-            if (paths.empty())
-                return diagnostics.host_staged ? "HostSummedCorrectnessFallback" : "unknown";
-            std::ostringstream out;
-            bool first = true;
-            for (const auto &path : paths)
-            {
-                if (!first)
-                    out << ";";
-                out << path;
-                first = false;
-            }
-            return out.str();
+            if (!first)
+                out << ";";
+            out << path;
+            first = false;
         }
-    } // namespace
+        return out.str();
+    }
+} // namespace
 
     bool MoEExpertOverlayProfiler::isEnabled()
     {
@@ -197,8 +197,9 @@ namespace llaminar2
 
         auto &s = state();
         std::lock_guard<std::mutex> lock(s.mutex);
-        auto existing = std::find_if(s.rows.begin(), s.rows.end(), [&](const auto &candidate)
-                                     { return sameKey(candidate, row); });
+        auto existing = std::find_if(s.rows.begin(), s.rows.end(), [&](const auto &candidate) {
+            return sameKey(candidate, row);
+        });
         if (existing != s.rows.end())
             mergeRow(*existing, row);
         else
@@ -249,8 +250,7 @@ namespace llaminar2
         }
 
         std::ostringstream out;
-        out << "\nMOE EXPERT OVERLAY PROFILING SUMMARY\n"
-            << table.to_string();
+        out << "\nMOE EXPERT OVERLAY PROFILING SUMMARY\n" << table.to_string();
         return out.str();
     }
 

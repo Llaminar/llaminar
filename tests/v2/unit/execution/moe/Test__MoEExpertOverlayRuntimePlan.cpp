@@ -3,6 +3,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -69,6 +70,14 @@ namespace llaminar2::test
             return domain;
         }
 
+        ExpertComputeDomain remoteCudaWorkerDomain(const std::string &name, int owner_rank)
+        {
+            ExpertComputeDomain domain = remoteCudaDomain(name);
+            domain.owner_rank = owner_rank;
+            domain.world_ranks = {owner_rank};
+            return domain;
+        }
+
         ExpertRoutedTier tier(const std::string &name, const std::string &domain, int priority, bool fallback = false)
         {
             ExpertRoutedTier result;
@@ -132,6 +141,29 @@ namespace llaminar2::test
             return plan;
         }
 
+        std::shared_ptr<MoEExpertParallelPlan> remoteExpertWorkerPlan()
+        {
+            auto plan = std::make_shared<MoEExpertParallelPlan>();
+            plan->enabled = true;
+            plan->execution_kind = MoEExpertExecutionKind::TieredExpertOverlay;
+            plan->continuation_domain = "cuda_fast";
+            plan->shared_expert_domain = "cuda_fast";
+            plan->residency_policy = ExpertResidencyPolicy::StaticById;
+            plan->domains = {
+                cudaSingleDomain("cuda_fast"),
+                remoteCudaWorkerDomain("remote_experts", 1),
+                cpuSingleFallbackDomain("cpu_cold", 2),
+            };
+            plan->domains[0].owner_rank = 0;
+            plan->domains[0].world_ranks = {0};
+            plan->routed_tiers = {
+                tier("fast", "cuda_fast", 0),
+                tier("remote", "remote_experts", 1),
+                tier("cold", "cpu_cold", 2, true),
+            };
+            return plan;
+        }
+
         std::string thrownMessageFor(
             std::shared_ptr<MoEExpertParallelPlan> plan,
             MoEExpertOverlayRuntimeResolverOptions options = {.current_world_rank = 0})
@@ -139,6 +171,21 @@ namespace llaminar2::test
             try
             {
                 (void)resolveMoEExpertOverlayRuntimePlan(std::move(plan), options);
+            }
+            catch (const std::exception &e)
+            {
+                return e.what();
+            }
+            return {};
+        }
+
+        std::string executionPlanThrownMessageFor(
+            std::shared_ptr<MoEExpertParallelPlan> plan,
+            MoEExpertOverlayExecutionPlanResolverOptions options)
+        {
+            try
+            {
+                (void)resolveMoEExpertOverlayExecutionPlan(std::move(plan), options);
             }
             catch (const std::exception &e)
             {
@@ -275,9 +322,59 @@ namespace llaminar2::test
         EXPECT_TRUE(containsDevice(rank, DeviceId::rocm(0)));
         EXPECT_TRUE(containsDevice(rank, DeviceId::rocm(1)));
         EXPECT_TRUE(rank.loads_tokenizer);
+        EXPECT_FALSE(rank.loads_worker_tokenizer_state);
         EXPECT_TRUE(rank.loads_full_model_metadata);
         EXPECT_TRUE(rank.loads_root_weights);
+        EXPECT_TRUE(rank.loads_shared_expert_weights);
+        EXPECT_TRUE(rank.loads_accelerator_routed_experts);
+        EXPECT_TRUE(rank.loads_cpu_fallback_experts);
+        EXPECT_FALSE(rank.loads_worker_fallback_experts);
         EXPECT_TRUE(rank.loads_expert_weights);
+        EXPECT_NE(std::find(rank.root_weight_domains.begin(), rank.root_weight_domains.end(), "rocm_hot"),
+              rank.root_weight_domains.end());
+        EXPECT_NE(std::find(rank.shared_expert_weight_domains.begin(), rank.shared_expert_weight_domains.end(), "rocm_hot"),
+              rank.shared_expert_weight_domains.end());
+        EXPECT_NE(std::find(rank.accelerator_routed_expert_domains.begin(), rank.accelerator_routed_expert_domains.end(), "rocm_hot"),
+              rank.accelerator_routed_expert_domains.end());
+        EXPECT_NE(std::find(rank.cpu_fallback_expert_domains.begin(), rank.cpu_fallback_expert_domains.end(), "cpu_cold"),
+              rank.cpu_fallback_expert_domains.end());
+    }
+
+    TEST(Test__MoEExpertOverlayRuntimePlan, LayoutAFullPlanRendersRootAndCpuFallbackRanks)
+    {
+        const auto execution_plan = resolveMoEExpertOverlayExecutionPlan(
+            layoutAPlan(),
+            MoEExpertOverlayExecutionPlanResolverOptions{
+                .current_world_rank = 0,
+                .world_size = 2,
+            });
+
+        ASSERT_EQ(execution_plan.rank_plans.size(), 2u);
+        EXPECT_EQ(execution_plan.continuation_root_rank, 0);
+        const auto *rank0 = execution_plan.rankPlanFor(0);
+        const auto *rank1 = execution_plan.rankPlanFor(1);
+        ASSERT_NE(rank0, nullptr);
+        ASSERT_NE(rank1, nullptr);
+
+        EXPECT_TRUE(rank0->hasRole(OverlayRankRole::ContinuationRoot));
+        EXPECT_TRUE(rank0->hasRole(OverlayRankRole::LocalAcceleratorParticipant));
+        EXPECT_TRUE(rank0->hasRole(OverlayRankRole::CpuFallbackParticipant));
+        EXPECT_TRUE(rank0->builds_root_graph);
+        EXPECT_TRUE(containsDomain(*rank0, "rocm_hot"));
+        EXPECT_TRUE(containsDomain(*rank0, "cpu_cold"));
+
+        EXPECT_EQ(rank1->role, OverlayRankRole::CpuFallbackParticipant);
+        EXPECT_TRUE(rank1->hasRole(OverlayRankRole::CpuFallbackParticipant));
+        EXPECT_FALSE(rank1->builds_root_graph);
+        EXPECT_TRUE(containsDomain(*rank1, "cpu_cold"));
+
+        const std::string diagnostics = execution_plan.diagnostics();
+        EXPECT_NE(diagnostics.find("rank[0]"), std::string::npos) << diagnostics;
+        EXPECT_NE(diagnostics.find("rank[1]"), std::string::npos) << diagnostics;
+        EXPECT_NE(diagnostics.find("ContinuationRoot"), std::string::npos) << diagnostics;
+        EXPECT_NE(diagnostics.find("CpuFallbackParticipant"), std::string::npos) << diagnostics;
+        EXPECT_NE(diagnostics.find("rocm_hot"), std::string::npos) << diagnostics;
+        EXPECT_NE(diagnostics.find("cpu_cold"), std::string::npos) << diagnostics;
     }
 
     TEST(Test__MoEExpertOverlayRuntimePlan, LayoutARank1PlansCpuFallbackOnlyWithoutRootGraph)
@@ -295,8 +392,13 @@ namespace llaminar2::test
         EXPECT_EQ(rank.owned_domains, (std::vector<std::string>{"cpu_cold"}));
         EXPECT_TRUE(containsDevice(rank, DeviceId::cpu()));
         EXPECT_FALSE(rank.loads_tokenizer);
+        EXPECT_TRUE(rank.loads_worker_tokenizer_state);
         EXPECT_TRUE(rank.loads_full_model_metadata);
         EXPECT_FALSE(rank.loads_root_weights);
+        EXPECT_FALSE(rank.loads_shared_expert_weights);
+        EXPECT_FALSE(rank.loads_accelerator_routed_experts);
+        EXPECT_TRUE(rank.loads_cpu_fallback_experts);
+        EXPECT_TRUE(rank.loads_worker_fallback_experts);
         EXPECT_TRUE(rank.loads_expert_weights);
     }
 
@@ -311,6 +413,11 @@ namespace llaminar2::test
         EXPECT_TRUE(root.builds_root_graph);
         EXPECT_TRUE(containsDomain(root, "cuda_fast"));
         EXPECT_TRUE(containsDevice(root, DeviceId::cuda(0)));
+        EXPECT_TRUE(root.loads_root_weights);
+        EXPECT_TRUE(root.loads_shared_expert_weights);
+        EXPECT_TRUE(root.loads_accelerator_routed_experts);
+        EXPECT_FALSE(root.loads_cpu_fallback_experts);
+        EXPECT_FALSE(root.loads_worker_fallback_experts);
 
         const auto &rocm = rocm_execution.currentRankPlan();
         EXPECT_EQ(rocm.role, OverlayRankRole::LocalAcceleratorParticipant);
@@ -320,6 +427,11 @@ namespace llaminar2::test
         EXPECT_TRUE(containsDomain(rocm, "rocm_warm"));
         EXPECT_TRUE(containsDevice(rocm, DeviceId::rocm(0)));
         EXPECT_TRUE(containsDevice(rocm, DeviceId::rocm(1)));
+        EXPECT_FALSE(rocm.loads_root_weights);
+        EXPECT_FALSE(rocm.loads_shared_expert_weights);
+        EXPECT_TRUE(rocm.loads_accelerator_routed_experts);
+        EXPECT_FALSE(rocm.loads_cpu_fallback_experts);
+        EXPECT_FALSE(rocm.loads_worker_fallback_experts);
 
         const auto &cpu = cpu_execution.currentRankPlan();
         EXPECT_EQ(cpu.role, OverlayRankRole::CpuFallbackParticipant);
@@ -328,6 +440,110 @@ namespace llaminar2::test
         EXPECT_FALSE(cpu.hasRole(OverlayRankRole::ContinuationRoot));
         EXPECT_TRUE(containsDomain(cpu, "cpu_cold"));
         EXPECT_TRUE(containsDevice(cpu, DeviceId::cpu()));
+        EXPECT_FALSE(cpu.loads_root_weights);
+        EXPECT_FALSE(cpu.loads_shared_expert_weights);
+        EXPECT_FALSE(cpu.loads_accelerator_routed_experts);
+        EXPECT_TRUE(cpu.loads_cpu_fallback_experts);
+        EXPECT_TRUE(cpu.loads_worker_fallback_experts);
+        EXPECT_TRUE(cpu.loads_worker_tokenizer_state);
+    }
+
+    TEST(Test__MoEExpertOverlayRuntimePlan, LayoutBFullPlanIncludesRelayOnlyRank)
+    {
+        const auto execution_plan = resolveMoEExpertOverlayExecutionPlan(
+            layoutBThreeRankPlan(),
+            MoEExpertOverlayExecutionPlanResolverOptions{
+                .current_world_rank = 0,
+                .world_size = 4,
+            });
+
+        ASSERT_EQ(execution_plan.rank_plans.size(), 4u);
+        ASSERT_NE(execution_plan.rankPlanFor(0), nullptr);
+        ASSERT_NE(execution_plan.rankPlanFor(1), nullptr);
+        ASSERT_NE(execution_plan.rankPlanFor(2), nullptr);
+        ASSERT_NE(execution_plan.rankPlanFor(3), nullptr);
+
+        EXPECT_EQ(execution_plan.rankPlanFor(0)->role, OverlayRankRole::ContinuationRoot);
+        EXPECT_EQ(execution_plan.rankPlanFor(1)->role, OverlayRankRole::LocalAcceleratorParticipant);
+        EXPECT_EQ(execution_plan.rankPlanFor(2)->role, OverlayRankRole::CpuFallbackParticipant);
+        EXPECT_EQ(execution_plan.rankPlanFor(3)->role, OverlayRankRole::RelayOnly);
+        EXPECT_FALSE(execution_plan.rankPlanFor(3)->builds_root_graph);
+        EXPECT_FALSE(execution_plan.rankPlanFor(3)->loads_full_model_metadata);
+
+        const std::string diagnostics = execution_plan.diagnostics();
+        EXPECT_NE(diagnostics.find("rank[3]: primary_role=RelayOnly"), std::string::npos) << diagnostics;
+        EXPECT_NE(diagnostics.find("rocm_warm"), std::string::npos) << diagnostics;
+        EXPECT_NE(diagnostics.find("cpu_cold"), std::string::npos) << diagnostics;
+        EXPECT_NE(diagnostics.find("root_weight_domains"), std::string::npos) << diagnostics;
+        EXPECT_NE(diagnostics.find("shared_expert_domains"), std::string::npos) << diagnostics;
+        EXPECT_NE(diagnostics.find("accelerator_routed_domains"), std::string::npos) << diagnostics;
+        EXPECT_NE(diagnostics.find("worker_fallback_domains"), std::string::npos) << diagnostics;
+    }
+
+    TEST(Test__MoEExpertOverlayRuntimePlan, RemoteExpertWorkerRankIsDistinctFromLocalAccelerator)
+    {
+        const auto execution_plan = resolveMoEExpertOverlayExecutionPlan(
+            remoteExpertWorkerPlan(),
+            MoEExpertOverlayExecutionPlanResolverOptions{
+                .current_world_rank = 1,
+                .world_size = 3,
+            });
+        const auto &rank = execution_plan.currentRankPlan();
+
+        EXPECT_EQ(rank.world_rank, 1);
+        EXPECT_EQ(rank.role, OverlayRankRole::RemoteExpertParticipant);
+        EXPECT_TRUE(rank.hasRole(OverlayRankRole::RemoteExpertParticipant));
+        EXPECT_FALSE(rank.hasRole(OverlayRankRole::LocalAcceleratorParticipant));
+        EXPECT_FALSE(rank.hasRole(OverlayRankRole::ContinuationRoot));
+        EXPECT_FALSE(rank.builds_root_graph);
+        EXPECT_TRUE(containsDomain(rank, "remote_experts"));
+        EXPECT_TRUE(containsDevice(rank, DeviceId::cuda(0)));
+    }
+
+    TEST(Test__MoEExpertOverlayRuntimePlan, InvalidExecutionTopologyReportsRankAndDomain)
+    {
+        const std::string too_small_world = executionPlanThrownMessageFor(
+            layoutAPlan(),
+            MoEExpertOverlayExecutionPlanResolverOptions{
+                .current_world_rank = 0,
+                .world_size = 1,
+            });
+        ASSERT_FALSE(too_small_world.empty());
+        EXPECT_NE(too_small_world.find("cpu_cold"), std::string::npos) << too_small_world;
+        EXPECT_NE(too_small_world.find("rank 1"), std::string::npos) << too_small_world;
+        EXPECT_NE(too_small_world.find("world size 1"), std::string::npos) << too_small_world;
+
+        const std::string bad_current_rank = executionPlanThrownMessageFor(
+            layoutAPlan(),
+            MoEExpertOverlayExecutionPlanResolverOptions{
+                .current_world_rank = 3,
+                .world_size = 2,
+            });
+        ASSERT_FALSE(bad_current_rank.empty());
+        EXPECT_NE(bad_current_rank.find("current rank 3"), std::string::npos) << bad_current_rank;
+        EXPECT_NE(bad_current_rank.find("world size 2"), std::string::npos) << bad_current_rank;
+    }
+
+    TEST(Test__MoEExpertOverlayRuntimePlan, OnlyContinuationOwnerBuildsRootGraph)
+    {
+        const auto execution_plan = resolveMoEExpertOverlayExecutionPlan(
+            layoutBThreeRankPlan(),
+            MoEExpertOverlayExecutionPlanResolverOptions{
+                .current_world_rank = 0,
+                .world_size = 4,
+            });
+
+        for (const auto &rank : execution_plan.rank_plans)
+        {
+            EXPECT_EQ(rank.builds_root_graph,
+                      rank.world_rank == execution_plan.continuation_root_rank)
+                << execution_plan.diagnostics();
+            if (rank.world_rank != execution_plan.continuation_root_rank)
+            {
+                EXPECT_FALSE(rank.hasRole(OverlayRankRole::ContinuationRoot))
+                    << execution_plan.diagnostics();
+            }
+        }
     }
 
     TEST(Test__MoEExpertOverlayRuntimePlan, LayoutARank1RegressionIsOrchestrationGapNotGraphMathGap)

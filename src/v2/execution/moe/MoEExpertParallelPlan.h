@@ -9,8 +9,7 @@
 
 #pragma once
 
-#include "backends/GlobalDeviceAddress.h"
-#include "config/CollectiveBackendType.h"
+#include "config/ExecutionDomainDefinition.h"
 
 #include <cstddef>
 #include <sstream>
@@ -74,6 +73,11 @@ namespace llaminar2
 
     struct ExpertComputeDomain
     {
+        // Migration note: ExpertComputeDomain is a compatibility wrapper for
+        // ExecutionDomainDefinition plus MoE-specific placement references.
+        // New domain fields belong on ExecutionDomainDefinition; continuation,
+        // shared expert, and routed tier ownership must remain placements over
+        // domains rather than domain-type semantics.
         std::string name;
         ExpertDomainKind kind = ExpertDomainKind::SingleDevice;
         CollectiveBackendType backend = CollectiveBackendType::AUTO;
@@ -81,6 +85,93 @@ namespace llaminar2
         std::vector<int> world_ranks;
         int owner_rank = -1;
         ExpertDomainComputeKind compute_kind = ExpertDomainComputeKind::ReplicatedExperts;
+        std::vector<float> weights;
+
+        ExecutionDomainDefinition toExecutionDomainDefinition() const
+        {
+            ExecutionDomainDefinition domain;
+            domain.name = name;
+            domain.participants = participants;
+            domain.weights = weights;
+            domain.backend = backend;
+            domain.owner_rank = owner_rank >= 0 ? std::optional<int>(owner_rank) : std::nullopt;
+            domain.ranks = world_ranks;
+
+            switch (kind)
+            {
+            case ExpertDomainKind::SingleDevice:
+                domain.scope = ExecutionDomainScope::SINGLE;
+                break;
+            case ExpertDomainKind::LocalTP:
+                domain.scope = ExecutionDomainScope::LOCAL;
+                break;
+            case ExpertDomainKind::NodeLocalTP:
+                domain.scope = ExecutionDomainScope::NODE_LOCAL;
+                break;
+            }
+
+            switch (compute_kind)
+            {
+            case ExpertDomainComputeKind::ReplicatedExperts:
+                domain.compute_kind = ExecutionDomainComputeKind::REPLICATED_EXPERTS;
+                break;
+            case ExpertDomainComputeKind::ExpertIdSharded:
+                domain.compute_kind = ExecutionDomainComputeKind::EXPERT_ID_SHARDED;
+                break;
+            case ExpertDomainComputeKind::TensorParallelExperts:
+                domain.compute_kind = ExecutionDomainComputeKind::TENSOR_PARALLEL_EXPERTS;
+                break;
+            }
+
+            return domain;
+        }
+
+        static ExpertComputeDomain fromExecutionDomainDefinition(const ExecutionDomainDefinition &domain)
+        {
+            ExpertComputeDomain result;
+            result.name = domain.name;
+            result.backend = domain.backend;
+            result.participants = domain.participants;
+            result.world_ranks = domain.ranks;
+            result.owner_rank = domain.owner_rank.value_or(-1);
+            result.weights = domain.weights;
+
+            switch (domain.scope)
+            {
+            case ExecutionDomainScope::SINGLE:
+                result.kind = ExpertDomainKind::SingleDevice;
+                break;
+            case ExecutionDomainScope::LOCAL:
+                result.kind = ExpertDomainKind::LocalTP;
+                break;
+            case ExecutionDomainScope::NODE_LOCAL:
+                result.kind = ExpertDomainKind::NodeLocalTP;
+                break;
+            case ExecutionDomainScope::AUTO:
+                result.kind = domain.participants.size() > 1
+                                  ? ExpertDomainKind::LocalTP
+                                  : ExpertDomainKind::SingleDevice;
+                break;
+            case ExecutionDomainScope::GLOBAL:
+                throw std::invalid_argument("MoE expert overlay domains do not support scope=global; use node_local or local");
+            }
+
+            switch (domain.compute_kind)
+            {
+            case ExecutionDomainComputeKind::UNSPECIFIED:
+            case ExecutionDomainComputeKind::REPLICATED_EXPERTS:
+                result.compute_kind = ExpertDomainComputeKind::ReplicatedExperts;
+                break;
+            case ExecutionDomainComputeKind::EXPERT_ID_SHARDED:
+                result.compute_kind = ExpertDomainComputeKind::ExpertIdSharded;
+                break;
+            case ExecutionDomainComputeKind::TENSOR_PARALLEL_EXPERTS:
+                result.compute_kind = ExpertDomainComputeKind::TensorParallelExperts;
+                break;
+            }
+
+            return result;
+        }
 
         bool isDomainScopedTPKind() const
         {
@@ -127,6 +218,7 @@ namespace llaminar2
         bool enabled = false;
         MoEExpertExecutionKind execution_kind = MoEExpertExecutionKind::TieredExpertOverlay;
         std::string continuation_domain;
+        std::string base_model_domain;
         std::string shared_expert_domain;
         ExpertResidencyPolicy residency_policy = ExpertResidencyPolicy::Disabled;
         std::vector<ExpertComputeDomain> domains;
@@ -136,6 +228,11 @@ namespace llaminar2
         bool isTieredOverlay() const
         {
             return enabled && execution_kind == MoEExpertExecutionKind::TieredExpertOverlay;
+        }
+
+        std::string effectiveBaseModelDomain() const
+        {
+            return base_model_domain.empty() ? continuation_domain : base_model_domain;
         }
     };
 
@@ -218,6 +315,12 @@ namespace llaminar2
         std::unordered_map<std::string, const ExpertComputeDomain *> domains_by_name;
         for (const auto &domain : plan.domains)
         {
+            const auto canonical_domain = domain.toExecutionDomainDefinition();
+            for (const auto &error : canonical_domain.validate())
+            {
+                addError("expert compute domain '" + domain.name + "': " + error);
+            }
+
             if (domain.name.empty())
             {
                 addError("expert compute domain name must not be empty");
@@ -299,6 +402,10 @@ namespace llaminar2
         };
 
         requireDomain("continuation", plan.continuation_domain);
+        if (!plan.base_model_domain.empty())
+        {
+            requireDomain("base/non-expert model", plan.base_model_domain);
+        }
         requireDomain("shared expert", plan.shared_expert_domain);
 
         if (plan.routed_tiers.empty())

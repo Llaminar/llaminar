@@ -29,6 +29,7 @@
 
 #include "backends/GlobalDeviceAddress.h"
 #include "CollectiveBackendType.h"
+#include "ExecutionDomainDefinition.h"
 #include "execution/config/RuntimeConfig.h" // For FusedAttentionBackend
 #include "execution/moe/MoEExpertParallelPlan.h"
 #include "execution/parallelism_tree/ParallelismTree.h"
@@ -109,7 +110,12 @@ namespace llaminar2
     // =========================================================================
 
     /**
-     * @brief Named domain definition for complex TP configurations
+    * @brief Named domain definition for complex TP configurations
+    *
+    * Migration note: this is a compatibility wrapper for the canonical
+    * ExecutionDomainDefinition contract. New orchestration code should convert
+    * through toExecutionDomainDefinition() and keep PP layer ownership in
+    * PPStageDefinition rather than extending this legacy wrapper.
      *
      * Format: "name=device1,device2,...[;weights=w1,w2,...][;backend=type][;scope=local|node_local|global][;owner=N][;ranks=0,1,...]"
      *
@@ -126,11 +132,15 @@ namespace llaminar2
         std::vector<GlobalDeviceAddress> devices; ///< Devices in this domain
         std::vector<float> weights;               ///< Optional: proportional weights (must sum to 1.0)
         CollectiveBackendType backend = CollectiveBackendType::AUTO;
+        ExecutionDomainComputeKind compute_kind = ExecutionDomainComputeKind::UNSPECIFIED;
 
         // Phase 5: domain scope and rank ownership
         TPScope scope = TPScope::AUTO;     ///< Domain scope (local=single-rank, node_local/global=multi-rank)
         std::optional<int> owner_rank;     ///< Explicit owner MPI rank for local domains (;owner=N)
         std::vector<int> explicit_ranks;   ///< Explicit participating ranks for node_local/global (;ranks=0,1,...)
+
+        ExecutionDomainDefinition toExecutionDomainDefinition() const;
+        static DomainDefinition fromExecutionDomainDefinition(const ExecutionDomainDefinition &domain);
 
         /**
          * @brief Parse domain definition from string
@@ -463,6 +473,16 @@ namespace llaminar2
         bool usesNamedDomains() const;
 
         /**
+         * @brief Canonical view of all user-declared execution domains.
+         *
+         * During the DomainDefinition/ExpertComputeDomain migration this joins
+         * legacy named-domain inputs and MoE overlay-domain inputs into one
+         * normalized inventory. Placements such as pp_stage_definitions and
+         * routed_tiers remain separate references over these domains.
+         */
+        std::vector<ExecutionDomainDefinition> executionDomainDefinitions() const;
+
+        /**
          * @brief Validate the configuration
          * @return Empty vector if valid, otherwise list of error messages
          */
@@ -488,5 +508,19 @@ namespace llaminar2
      * tests and scripts still parse successfully.
      */
     std::vector<std::string> validateMoEExpertOverlayConfig(const OrchestrationConfig &config);
+
+    /**
+     * @brief Reconcile legacy overlay-domain inputs with the canonical domain inventory.
+     *
+     * Phase 9C treats --define-domain as the single hardware-domain inventory.
+     * The legacy --moe-expert-overlay-domain/YAML domains syntax remains
+     * accepted as an alias: it contributes to the same inventory, then overlay
+     * placements (continuation/base/shared/tier) are resolved back into
+     * MoEExpertParallelPlan::domains for existing runtime consumers.
+     *
+     * @return Empty vector if normalization succeeded, otherwise conflict or
+     *         conversion errors suitable for user-facing validation output.
+     */
+    std::vector<std::string> normalizeMoEExpertOverlayDomains(OrchestrationConfig &config);
 
 } // namespace llaminar2

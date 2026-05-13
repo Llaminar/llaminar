@@ -33,6 +33,7 @@
 namespace llaminar2
 {
     class ITokenizer;          // Forward declaration
+    class IMPIContext;         // Forward declaration
     struct GraphExecutorStats; // Forward declaration
 }
 
@@ -425,6 +426,24 @@ namespace llaminar2
          * from runMPIWorkerLoop() after receiving this signal.
          */
         virtual void shutdownMPIWorkers() {}
+
+        /**
+         * @brief Signal MPI worker ranks to leave their worker loops after a fatal root-rank error.
+         *
+         * Implementations with a richer worker protocol may send an explicit
+         * abort command. The default keeps legacy runners safe by falling back
+         * to ordinary shutdown.
+         */
+        virtual void abortMPIWorkers(const std::string & /*reason*/) { shutdownMPIWorkers(); }
+
+        /**
+         * @brief Provide the real overlay-domain MPI context to nested runners.
+         *
+         * Composite overlay roots may intentionally use a local-only MPI context
+         * for the dense/root runner while still needing the global MPI context
+         * for same-layer expert domain-worker commands inside graph stages.
+         */
+        virtual void setMoEExpertOverlayMPIContext(std::shared_ptr<IMPIContext> /*mpi_ctx*/) {}
 
         /**
          * @brief Enable MPI coordinated mode.

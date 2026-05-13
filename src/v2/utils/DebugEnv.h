@@ -2753,11 +2753,12 @@ namespace llaminar2
             std::string profile_csv_path = "/tmp/llaminar_moe_ep_profile.csv";
         } moe_expert_overlay;
 
-        bool tp_timing = false;               ///< Enable TP forward timing breakdown (env: LLAMINAR_TP_TIMING)
-        bool skip_allreduce = false;          ///< DIAGNOSTIC: Skip allreduce for profiling (env: LLAMINAR_SKIP_ALLREDUCE)
-        bool gpu_stage_timing = true;         ///< GPU event-based per-stage timing (env: LLAMINAR_GPU_STAGE_TIMING)
-        bool gpu_stage_timing_detail = false; ///< Print per-stage detail (env: LLAMINAR_GPU_STAGE_TIMING_DETAIL)
-        bool coherence_audit = false;         ///< Per-tensor coherence audit log (env: LLAMINAR_COHERENCE_AUDIT)
+        bool tp_timing = false;                    ///< Enable TP forward timing breakdown (env: LLAMINAR_TP_TIMING)
+        bool skip_allreduce = false;               ///< DIAGNOSTIC: Skip allreduce for profiling (env: LLAMINAR_SKIP_ALLREDUCE)
+        bool tp_collective_contract_trace = false; ///< Trace LocalTP collective context identity and sequence contract (env: LLAMINAR_TP_COLLECTIVE_CONTRACT_TRACE)
+        bool gpu_stage_timing = true;              ///< GPU event-based per-stage timing (env: LLAMINAR_GPU_STAGE_TIMING)
+        bool gpu_stage_timing_detail = false;      ///< Print per-stage detail (env: LLAMINAR_GPU_STAGE_TIMING_DETAIL)
+        bool coherence_audit = false;              ///< Per-tensor coherence audit log (env: LLAMINAR_COHERENCE_AUDIT)
 
         /// Block-diagonal activation rotation for Q8_1 kurtosis reduction.
         /// Reduces outlier sensitivity in int8 quantization by spreading energy across blocks.
@@ -2853,6 +2854,7 @@ namespace llaminar2
             tp_timing = tp_env && std::string(tp_env) == "1";
             const char *skip_ar = std::getenv("LLAMINAR_SKIP_ALLREDUCE");
             skip_allreduce = skip_ar && std::string(skip_ar) == "1";
+            tp_collective_contract_trace = isTruthyEnvValue(std::getenv("LLAMINAR_TP_COLLECTIVE_CONTRACT_TRACE"));
             const char *stl_env = std::getenv("LLAMINAR_GPU_STAGE_TIMING");
             if (stl_env && std::string(stl_env) == "0")
                 gpu_stage_timing = false;
@@ -2912,6 +2914,7 @@ namespace llaminar2
             tp_timing = tp_env && std::string(tp_env) == "1";
             const char *skip_ar = std::getenv("LLAMINAR_SKIP_ALLREDUCE");
             skip_allreduce = skip_ar && std::string(skip_ar) == "1";
+            tp_collective_contract_trace = isTruthyEnvValue(std::getenv("LLAMINAR_TP_COLLECTIVE_CONTRACT_TRACE"));
             gpu_stage_timing = true; // default on
             const char *stl_env = std::getenv("LLAMINAR_GPU_STAGE_TIMING");
             if (stl_env && std::string(stl_env) == "0")

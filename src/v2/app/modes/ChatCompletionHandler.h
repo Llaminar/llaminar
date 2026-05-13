@@ -174,6 +174,10 @@ namespace llaminar2
                            ChatCompletionResponse &error_out,
                            std::vector<int32_t> &input_ids);
 
+        ChatCompletionResponse handleUnhandledRequestException(
+            const char *phase,
+            const std::string &detail);
+
         IOrchestrationRunner &runner_;
         ITokenizer &tokenizer_;
         std::string model_name_;

@@ -1,0 +1,14 @@
+domains:
+  - "rocm_hot=0:rocm:0,0:rocm:1;scope=local;backend=rccl;compute=tensor_parallel_experts;owner=0"
+  - "cpu_cold=0:cpu:0,1:cpu:0;scope=node_local;backend=upi;compute=tensor_parallel_experts;ranks=0,1"
+moe_expert_parallel:
+  enabled: true
+  execution_kind: tiered
+  continuation_domain: rocm_hot
+  base_model_domain: rocm_hot
+  shared_expert_domain: rocm_hot
+  residency:
+    mode: histogram
+  routed_tiers:
+    - "hot@rocm_hot;priority=0;max-experts-per-layer=8;memory-mb=auto"
+    - "cold@cpu_cold;priority=1;fallback=true"

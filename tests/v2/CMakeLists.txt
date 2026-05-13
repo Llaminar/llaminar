@@ -464,7 +464,7 @@ function(discover_v2_parity_tests TARGET)
         return()
     endif()
 
-    cmake_parse_arguments(ARG "" "MPI_PROCS;TEST_PREFIX" "LABELS" ${ARGN})
+    cmake_parse_arguments(ARG "" "MPI_PROCS;TEST_PREFIX;TIMEOUT" "LABELS" ${ARGN})
 
     if(NOT ARG_TEST_PREFIX)
         set(ARG_TEST_PREFIX "${TARGET}")
@@ -491,6 +491,7 @@ function(discover_v2_parity_tests TARGET)
             -D "NUM_SOCKETS=${V2_TEST_SOCKETS}"
             -D "CORES_PER_SOCKET=${V2_TEST_CORES_PER_SOCKET}"
             -D "WORKING_DIR=${_working_dir}"
+            -D "TIMEOUT=${ARG_TIMEOUT}"
             -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/V2ParityTestDiscovery.cmake"
         BYPRODUCTS "${_ctest_file}"
         COMMENT "Discovering parity tests in ${TARGET}..."
@@ -594,19 +595,6 @@ add_v2_test(V2_Unit_UnifiedPipelineMoECollection
     MPI_PROCS 1
 )
 
-# Test: WeightManager MoE expert overlay preparation request planning
-add_executable(v2_unit_weight_manager_moe_expert_overlay_preparation unit/loaders/Test__WeightManagerMoEExpertOverlayPreparation.cpp)
-target_link_libraries(v2_unit_weight_manager_moe_expert_overlay_preparation
-    llaminar2_core
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Unit_WeightManagerMoEExpertOverlayPreparation
-    COMMAND $<TARGET_FILE:v2_unit_weight_manager_moe_expert_overlay_preparation>
-    LABELS "V2;Unit;Loaders;MoE;ExpertParallel;Overlay;WeightManager"
-    MPI_PROCS 1
-)
-
 # Test: MoE Expert Parallel Plan - same-layer expert overlay value validation
 add_executable(v2_unit_moe_expert_parallel_plan unit/execution/moe/Test__MoEExpertParallelPlan.cpp)
 target_link_libraries(v2_unit_moe_expert_parallel_plan
@@ -633,29 +621,35 @@ add_v2_test(V2_Unit_MoEExpertParallelPlanner
     MPI_PROCS 1
 )
 
-# Test: MoE Expert Overlay Runtime Plan - resolved domain descriptors and MVP lowering
-add_executable(v2_unit_moe_expert_overlay_runtime_plan unit/execution/moe/Test__MoEExpertOverlayRuntimePlan.cpp)
-target_link_libraries(v2_unit_moe_expert_overlay_runtime_plan
+# Test: Graph-native MoE overlay sparse dispatch collective contract
+add_executable(v2_unit_moe_overlay_dispatch_collective unit/execution/moe/Test__MoEOverlayDispatchCollective.cpp)
+target_link_libraries(v2_unit_moe_overlay_dispatch_collective
     llaminar2_core
     GTest::gtest
     GTest::gtest_main
 )
-add_v2_test(V2_Unit_MoEExpertOverlayRuntimePlan
-    COMMAND $<TARGET_FILE:v2_unit_moe_expert_overlay_runtime_plan>
-    LABELS "V2;Unit;Execution;MoE;ExpertParallel;Overlay;RuntimePlan"
+add_v2_test(V2_Unit_MoEOverlayDispatchCollective
+    COMMAND $<TARGET_FILE:v2_unit_moe_overlay_dispatch_collective>
+    LABELS "V2;Unit;Execution;MoE;ExpertParallel;Overlay;Dispatch;Collective"
     MPI_PROCS 1
 )
 
-# Test: MoE Expert Overlay Phase 9A profiler aggregation and DebugEnv parsing
-add_executable(v2_unit_moe_expert_overlay_profiling unit/execution/moe/Test__MoEExpertOverlayProfiling.cpp)
-target_link_libraries(v2_unit_moe_expert_overlay_profiling
+# Test: MoE overlay domain runtime graph dispatch descriptors
+add_executable(v2_unit_moe_overlay_domain_runtime
+    unit/execution/moe/Test__MoEOverlayDomainRuntime.cpp
+    integration/mpi_gtest_main.cpp
+)
+target_include_directories(v2_unit_moe_overlay_domain_runtime PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+target_link_libraries(v2_unit_moe_overlay_domain_runtime
     llaminar2_core
     GTest::gtest
-    GTest::gtest_main
+    MPI::MPI_CXX
 )
-add_v2_test(V2_Unit_MoEExpertOverlayProfiling
-    COMMAND $<TARGET_FILE:v2_unit_moe_expert_overlay_profiling>
-    LABELS "V2;Unit;Execution;MoE;ExpertParallel;Overlay;Profiling"
+add_v2_test(V2_Unit_MoEOverlayDomainRuntime
+    COMMAND $<TARGET_FILE:v2_unit_moe_overlay_domain_runtime>
+    LABELS "V2;Unit;Execution;MoE;ExpertParallel;Overlay;Runtime;Dispatch"
     MPI_PROCS 1
 )
 
@@ -4892,12 +4886,13 @@ if(ZLIB_FOUND)
     )
 
     discover_v2_parity_tests(v2_integration_parity_qwen35moe_expert_overlay
-        TEST_PREFIX V2_Integration_Parity
-        LABELS "V2;Integration;Parity;Qwen35MoE;ExpertOverlay;MixtureOfExperts;MPI;ROCm;CUDA;CPU;NodeLocalTP;TensorParallelExperts;V2ParityHarness"
+        TEST_PREFIX V2_Integration_Parity_Qwen35MoEExpertOverlay
+        LABELS "V2;Integration;Parity;Qwen35MoE;ExpertOverlay;MixtureOfExperts;MPI;ROCm;CUDA;CPU;NodeLocalTP;TensorParallelExperts;ModelLight"
         MPI_PROCS 2
+        TIMEOUT 600
     )
 
-    message(STATUS "V2: Qwen3.5 MoE ExpertOverlay V2 parity tests enabled (requires mpirun -np 2+)")
+    message(STATUS "V2: Qwen3.5 MoE ExpertOverlay parity tests enabled (requires mpirun -np 2+)")
 
     # ---- NodeLocalTP MoE Parity (Cross-Socket CPU TP with Expert Parallelism) ----
     #
@@ -5897,6 +5892,23 @@ target_link_libraries(v2_test_chat_completion_handler llaminar2_core GTest::gtes
 add_v2_test(V2_Unit_ChatCompletionHandler
     COMMAND $<TARGET_FILE:v2_test_chat_completion_handler>
     LABELS "V2;Unit;Server;ChatCompletion;SamplingParams"
+    MPI_PROCS 1
+)
+
+# Completion and single-shot chat modes: MPI root/worker oneshot orchestration
+add_executable(v2_test_completion_single_shot_modes unit/app/modes/Test__CompletionAndSingleShotModes.cpp)
+target_include_directories(v2_test_completion_single_shot_modes PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}  # For tests/v2/mocks/ include path
+)
+target_link_libraries(v2_test_completion_single_shot_modes
+    llaminar2_core
+    GTest::gtest
+    GTest::gmock
+    MPI::MPI_CXX
+)
+add_v2_test(V2_Unit_CompletionModeSingleShotChatMode
+    COMMAND $<TARGET_FILE:v2_test_completion_single_shot_modes>
+    LABELS "V2;Unit;App;CompletionMode;SingleShotChatMode;MPI;Oneshot"
     MPI_PROCS 1
 )
 
@@ -8545,7 +8557,6 @@ endif()
 # =============================================================================
 # MoE Expert Overlay CPU Fallback MPI Integration Tests
 # =============================================================================
-# Phase 6: domain-scoped NodeLocalTP CPU fallback for routed expert overlay.
 add_executable(v2_integration_moe_expert_overlay_cpu_fallback_mpi
     integration/moe/Test__MoEExpertOverlay_CPUFallback_MPI.cpp
     integration/mpi_gtest_main.cpp
@@ -8588,7 +8599,7 @@ add_v2_test(V2_Integration_MoEExpertOverlay_CPUTensorParallelExperts_MPI
     MPI_PROCS 3
 )
 
-# Bridge Phase 5A: model-light CUDA + ROCm + CPU tier overlay and dense reduce audit support.
+# Phase 8: model-light CUDA + ROCm + CPU tier overlay and dense cross-domain reduce.
 add_executable(v2_integration_moe_expert_overlay_multi_accelerator_tiers
     integration/moe/Test__MoEExpertOverlay_MultiAcceleratorTiers.cpp
 )
@@ -9911,7 +9922,7 @@ add_v2_test(V2_Unit_Qwen35MoEGraph
     MPI_PROCS 1
 )
 
-# Test: Qwen35MoEExpertOverlayGraph — model-light expert overlay composite path
+# Test: Qwen35MoEExpertOverlayGraph — model-light expert overlay graph path
 add_executable(v2_test_qwen35moe_expert_overlay_graph unit/models/qwen35moe/Test__Qwen35MoEExpertOverlayGraph.cpp)
 target_link_libraries(v2_test_qwen35moe_expert_overlay_graph
     llaminar2_core

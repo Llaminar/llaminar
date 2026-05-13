@@ -28,6 +28,7 @@
 #include "stages/MoEExpertDispatchStage.h"
 #include "stages/MoEExpertOverlayCPUFallbackStage.h"
 #include "stages/MoEExpertOverlayLocalTPStage.h"
+#include "stages/MoEOverlayDomainRuntimeStage.h"
 #include "stages/MoEExpertParallelReduceStage.h"
 #include "stages/MoERoutingStage.h"
 #include "stages/QKNormStage.h"
@@ -209,6 +210,12 @@ namespace llaminar2
          */
         static std::unique_ptr<IComputeStage> createMoEExpertOverlayLocalTP(
             const MoEExpertOverlayLocalTPStage::Params &params);
+
+        /**
+         * @brief Create a runtime-service backed MoE overlay domain work stage
+         */
+        static std::unique_ptr<IComputeStage> createMoEOverlayDomainRuntime(
+            const MoEOverlayDomainRuntimeStage::Params &params);
 
         /**
          * @brief Create a host-side dense partial reduce stage for MoE expert-parallel tiers

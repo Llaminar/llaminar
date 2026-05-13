@@ -182,6 +182,9 @@ namespace llaminar2
          */
         void setSnapshotCallback(StageSnapshotCallback callback) override { config_.snapshot_callback = std::move(callback); }
 
+        void setStageFailureCallback(StageFailureCallback callback) { config_.stage_failure_callback = std::move(callback); }
+        void setCancellationCallback(ExecutionCancellationCallback callback) { config_.cancellation_requested = std::move(callback); }
+
         /**
          * @brief Set the current layer context for stage dumping
          */
@@ -539,6 +542,9 @@ namespace llaminar2
                        IDeviceContext *ctx,
                        const StageRunPolicy &policy,
                        const std::unordered_set<std::string> *collective_nodes = nullptr);
+
+        bool cancellationRequested(const std::string &node_name) const;
+        void notifyStageFailure(const std::string &node_name, const std::string &reason) const;
 
         /**
          * @brief Execute a single stage according to the given policy.

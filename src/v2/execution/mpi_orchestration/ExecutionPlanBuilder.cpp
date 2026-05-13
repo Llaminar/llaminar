@@ -184,12 +184,13 @@ namespace llaminar2
         for (size_t i = 0; i < config.domain_definitions.size(); ++i)
         {
             const auto &def = config.domain_definitions[i];
+            const auto canonical = def.toExecutionDomainDefinition();
             ResolvedDomain domain;
             domain.id = static_cast<int>(i);
-            domain.name = def.name;
-            domain.devices = def.devices;
-            domain.weights = def.weights;
-            domain.backend = def.backend;
+            domain.name = canonical.name;
+            domain.devices = canonical.participants;
+            domain.weights = canonical.weights;
+            domain.backend = canonical.backend;
 
             // Find ranks for each device
             std::set<int> rank_set;

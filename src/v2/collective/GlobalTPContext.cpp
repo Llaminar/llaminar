@@ -14,9 +14,12 @@
 #include "backends/ShmemSpinBackend.h"
 #include "../config/TPDomain.h"
 #include "../tensors/Tensors.h"
+#include "../utils/DebugEnv.h"
 #include "../utils/Logger.h"
 #include "../utils/NodeDetection.h"
+#include <chrono>
 #include <mpi.h>
+#include <thread>
 #include <utility>
 #include <algorithm>
 #include <set>
@@ -85,7 +88,7 @@ namespace llaminar2
                 backend_ = std::move(shmem);
 
                 LOG_INFO("GlobalTPContext: Using ShmemSpinBackend for domain " << domain_id_
-                                                                              << " (2-rank intra-node fast path)");
+                                                                               << " (2-rank intra-node fast path)");
             }
             else
             {
@@ -94,8 +97,8 @@ namespace llaminar2
                 backend_->initialize(group);
 
                 LOG_DEBUG("GlobalTPContext: Using UPICollectiveBackend for domain " << domain_id_
-                                                                                   << " (domain_size=" << domain_size_
-                                                                                   << ", all_same_node=" << all_same_node_ << ")");
+                                                                                    << " (domain_size=" << domain_size_
+                                                                                    << ", all_same_node=" << all_same_node_ << ")");
             }
 
             LOG_DEBUG("GlobalTPContext: Created for domain " << domain_id_
@@ -297,7 +300,7 @@ namespace llaminar2
     // =============================================================================
 
     GlobalTPContext::GlobalTPContext(GlobalTPContext &&other) noexcept
-        : domain_comm_(other.domain_comm_), domain_id_(other.domain_id_), my_rank_in_domain_(other.my_rank_in_domain_), domain_size_(other.domain_size_), world_ranks_(std::move(other.world_ranks_)), node_ids_(std::move(other.node_ids_)), all_same_node_(other.all_same_node_), node_count_(other.node_count_), owns_communicator_(other.owns_communicator_), backend_(std::move(other.backend_))
+        : domain_comm_(other.domain_comm_), domain_id_(other.domain_id_), my_rank_in_domain_(other.my_rank_in_domain_), domain_size_(other.domain_size_), world_ranks_(std::move(other.world_ranks_)), node_ids_(std::move(other.node_ids_)), all_same_node_(other.all_same_node_), node_count_(other.node_count_), owns_communicator_(other.owns_communicator_), backend_type_(other.backend_type_), backend_(std::move(other.backend_)), abort_requested_(other.abort_requested_.load(std::memory_order_acquire))
     {
         // Clear source to prevent double-free
         other.domain_comm_ = MPI_COMM_NULL;
@@ -332,7 +335,9 @@ namespace llaminar2
             all_same_node_ = other.all_same_node_;
             node_count_ = other.node_count_;
             owns_communicator_ = other.owns_communicator_;
+            backend_type_ = other.backend_type_;
             backend_ = std::move(other.backend_);
+            abort_requested_.store(other.abort_requested_.load(std::memory_order_acquire), std::memory_order_release);
 
             // Clear source to prevent double-free
             other.domain_comm_ = MPI_COMM_NULL;
@@ -368,6 +373,12 @@ namespace llaminar2
     bool GlobalTPContext::allreduce(TensorBase *tensor, const std::string &stage_name, size_t count)
     {
         (void)stage_name; // Stage name currently not used by GLOBAL TP backend
+
+        if (isAbortRequested())
+        {
+            LOG_ERROR("GlobalTPContext::allreduce - abort already requested for domain " << domain_id_);
+            return false;
+        }
 
         if (!tensor)
         {
@@ -411,6 +422,12 @@ namespace llaminar2
 
     bool GlobalTPContext::broadcast(TensorBase *tensor, int source_index)
     {
+        if (isAbortRequested())
+        {
+            LOG_ERROR("GlobalTPContext::broadcast - abort already requested for domain " << domain_id_);
+            return false;
+        }
+
         if (!tensor)
         {
             LOG_ERROR("GlobalTPContext::broadcast - tensor is null");
@@ -451,6 +468,12 @@ namespace llaminar2
 
     bool GlobalTPContext::allgather(const TensorBase *local_shard, TensorBase *global_tensor)
     {
+        if (isAbortRequested())
+        {
+            LOG_ERROR("GlobalTPContext::allgather - abort already requested for domain " << domain_id_);
+            return false;
+        }
+
         if (!local_shard)
         {
             LOG_ERROR("GlobalTPContext::allgather - local_shard is null");
@@ -501,6 +524,22 @@ namespace llaminar2
         return backend_->allgather(send_data, recv_data, local_count, CollectiveDataType::FLOAT32);
     }
 
+    void GlobalTPContext::requestAbort()
+    {
+        const bool was_set = abort_requested_.exchange(true, std::memory_order_acq_rel);
+        if (was_set)
+            return;
+
+        LOG_ERROR("GlobalTPContext: Abort requested for domain " << domain_id_
+                                                                 << " rank " << my_rank_in_domain_ << "/" << domain_size_
+                                                                 << "; aborting backend and MPI job to avoid rank desynchronization");
+        if (backend_)
+            backend_->abort();
+
+        if (domain_comm_ != MPI_COMM_NULL && domain_size_ > 1)
+            MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+
     // =============================================================================
     // IGlobalTPContext Implementation
     // =============================================================================
@@ -543,9 +582,54 @@ namespace llaminar2
 
     void GlobalTPContext::barrier() const
     {
-        if (domain_comm_ != MPI_COMM_NULL)
+        if (domain_comm_ == MPI_COMM_NULL)
+            return;
+
+        const int timeout_ms = debugEnv().tp_collect_timeout_ms;
+        if (timeout_ms <= 0)
         {
             MPI_Barrier(domain_comm_);
+            return;
+        }
+
+        MPI_Request request = MPI_REQUEST_NULL;
+        int result = MPI_Ibarrier(domain_comm_, &request);
+        if (result != MPI_SUCCESS)
+        {
+            LOG_ERROR("GlobalTPContext::barrier - MPI_Ibarrier failed with code " << result
+                                                                                  << " on domain " << domain_id_ << " rank " << my_rank_in_domain_
+                                                                                  << "/" << domain_size_);
+            return;
+        }
+
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+        int complete = 0;
+        while (!complete)
+        {
+            result = MPI_Test(&request, &complete, MPI_STATUS_IGNORE);
+            if (result != MPI_SUCCESS || complete)
+                break;
+
+            if (std::chrono::steady_clock::now() >= deadline)
+            {
+                LOG_ERROR("GlobalTPContext::barrier timed out after " << timeout_ms
+                                                                      << "ms on domain " << domain_id_ << " rank " << my_rank_in_domain_
+                                                                      << "/" << domain_size_
+                                                                      << "; aborting MPI job to avoid rank desynchronization");
+                if (backend_)
+                    backend_->abort();
+                MPI_Abort(MPI_COMM_WORLD, 1);
+                return;
+            }
+
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+
+        if (result != MPI_SUCCESS)
+        {
+            LOG_ERROR("GlobalTPContext::barrier - MPI_Test failed with code " << result
+                                                                              << " on domain " << domain_id_ << " rank " << my_rank_in_domain_
+                                                                              << "/" << domain_size_);
         }
     }
 

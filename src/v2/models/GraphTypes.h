@@ -43,13 +43,16 @@ namespace llaminar2
 
     // Forward declarations
     class TensorBase;
+    class IMPIContext;
     class ITPContext;
     class ILocalTPContext;
     class ILocalPPContext;
     class TurboQuantContext;
     class ActivationRotation;
     class DecodeExpertHistogram;
+    class IOverlayDomainRuntime;
     struct MoEExpertParallelPlan;
+    struct MoEExpertOverlayExecutionPlan;
     class MoEExpertOverlayRuntimePlan;
     struct PipelineConfig;
     enum class MoERebalanceMode;
@@ -374,6 +377,17 @@ namespace llaminar2
 
             /// Runtime-resolved overlay descriptor for domain devices, ranks, and MVP lowering.
             std::shared_ptr<MoEExpertOverlayRuntimePlan> expert_overlay_runtime_plan = nullptr;
+
+            /// Optional rank-role execution plan used by the overlay domain runtime service.
+            std::shared_ptr<const MoEExpertOverlayExecutionPlan> expert_overlay_execution_plan = nullptr;
+
+            /// Optional production service used by graph stages to submit non-continuation overlay domain work.
+            std::shared_ptr<IOverlayDomainRuntime> overlay_domain_runtime = nullptr;
+
+            /// Optional MPI context dedicated to overlay domain-worker commands.
+            /// It is intentionally separate from the graph-builder MPI context so
+            /// continuation-root graphs can avoid unrelated world collectives.
+            std::shared_ptr<IMPIContext> overlay_mpi_ctx = nullptr;
 
             /// Returns true if MoE is enabled
             bool enabled() const { return num_experts > 0 && top_k > 0; }

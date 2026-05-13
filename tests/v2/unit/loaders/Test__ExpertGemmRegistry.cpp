@@ -118,6 +118,24 @@ TEST(Test__ExpertGemmRegistry, DomainScopedEntriesOnSamePhysicalDeviceDoNotOverw
     EXPECT_EQ(reg.size(), 3u);
 }
 
+TEST(Test__ExpertGemmRegistry, ParticipantScopedEntriesOnSameDomainDeviceDoNotOverwrite)
+{
+    ExpertGemmRegistry reg;
+    auto rank0 = std::make_shared<MockGemm>(401);
+    auto rank1 = std::make_shared<MockGemm>(402);
+    auto domain_default = std::make_shared<MockGemm>(499);
+    const DeviceId device = DeviceId::cpu();
+
+    reg.registerEngineForParticipant("cpu_cold", device, 0, 0, 1, 2, Role::GATE, rank0.get(), rank0);
+    reg.registerEngineForParticipant("cpu_cold", device, 1, 1, 1, 2, Role::GATE, rank1.get(), rank1);
+    reg.registerEngineForDomain("cpu_cold", device, 1, 2, Role::GATE, domain_default.get(), domain_default);
+
+    EXPECT_EQ(reg.getEngineForParticipant("cpu_cold", device, 0, 0, 1, 2, Role::GATE), rank0.get());
+    EXPECT_EQ(reg.getEngineForParticipant("cpu_cold", device, 1, 1, 1, 2, Role::GATE), rank1.get());
+    EXPECT_EQ(reg.getEngineForDomain("cpu_cold", device, 1, 2, Role::GATE), domain_default.get());
+    EXPECT_EQ(reg.size(), 3u);
+}
+
 TEST(Test__ExpertGemmRegistry, MultipleLayers)
 {
     ExpertGemmRegistry reg;

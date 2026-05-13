@@ -16,6 +16,7 @@
 #include <numeric>
 #include <cmath>
 #include <set>
+#include <unordered_map>
 #include <unordered_set>
 
 namespace llaminar2
@@ -183,6 +184,96 @@ namespace llaminar2
     // DomainDefinition Implementation
     // =========================================================================
 
+    namespace
+    {
+        ExecutionDomainScope toExecutionDomainScope(TPScope scope)
+        {
+            switch (scope)
+            {
+            case TPScope::LOCAL:
+                return ExecutionDomainScope::LOCAL;
+            case TPScope::NODE_LOCAL:
+                return ExecutionDomainScope::NODE_LOCAL;
+            case TPScope::GLOBAL:
+                return ExecutionDomainScope::GLOBAL;
+            case TPScope::AUTO:
+            case TPScope::HYBRID:
+                return ExecutionDomainScope::AUTO;
+            }
+            return ExecutionDomainScope::AUTO;
+        }
+
+        TPScope toTPScope(ExecutionDomainScope scope)
+        {
+            switch (scope)
+            {
+            case ExecutionDomainScope::LOCAL:
+                return TPScope::LOCAL;
+            case ExecutionDomainScope::NODE_LOCAL:
+                return TPScope::NODE_LOCAL;
+            case ExecutionDomainScope::GLOBAL:
+                return TPScope::GLOBAL;
+            case ExecutionDomainScope::SINGLE:
+            case ExecutionDomainScope::AUTO:
+                return TPScope::AUTO;
+            }
+            return TPScope::AUTO;
+        }
+
+        bool sameWeights(const std::vector<float> &lhs, const std::vector<float> &rhs)
+        {
+            if (lhs.size() != rhs.size())
+                return false;
+            for (size_t index = 0; index < lhs.size(); ++index)
+            {
+                if (std::abs(lhs[index] - rhs[index]) > 1e-6f)
+                    return false;
+            }
+            return true;
+        }
+
+        bool sameDomainDefinition(
+            const ExecutionDomainDefinition &lhs,
+            const ExecutionDomainDefinition &rhs)
+        {
+            auto normalizedScope = [](const ExecutionDomainDefinition &domain) {
+                if (domain.scope == ExecutionDomainScope::SINGLE && domain.participants.size() == 1)
+                    return ExecutionDomainScope::AUTO;
+                return domain.scope;
+            };
+
+            return lhs.name == rhs.name &&
+                   lhs.participants == rhs.participants &&
+                   sameWeights(lhs.weights, rhs.weights) &&
+                   lhs.backend == rhs.backend &&
+                   normalizedScope(lhs) == normalizedScope(rhs) &&
+                   lhs.owner_rank == rhs.owner_rank &&
+                   lhs.ranks == rhs.ranks &&
+                   lhs.compute_kind == rhs.compute_kind;
+        }
+
+        void addUniqueName(std::vector<std::string> &names, const std::string &name)
+        {
+            if (name.empty())
+                return;
+            if (std::find(names.begin(), names.end(), name) == names.end())
+                names.push_back(name);
+        }
+
+        std::vector<std::string> overlayReferencedDomainNames(const MoEExpertParallelPlan &plan)
+        {
+            std::vector<std::string> names;
+            addUniqueName(names, plan.continuation_domain);
+            addUniqueName(names, plan.effectiveBaseModelDomain());
+            addUniqueName(names, plan.shared_expert_domain);
+            for (const auto &tier : plan.routed_tiers)
+                addUniqueName(names, tier.domain);
+            for (const auto &domain : plan.domains)
+                addUniqueName(names, domain.name);
+            return names;
+        }
+    } // namespace
+
     DomainDefinition DomainDefinition::parse(const std::string &spec)
     {
         auto result = tryParse(spec);
@@ -197,240 +288,51 @@ namespace llaminar2
 
     std::optional<DomainDefinition> DomainDefinition::tryParse(const std::string &spec)
     {
-        if (spec.empty())
-        {
-            return std::nullopt;
-        }
+        ExecutionDomainParseOptions options;
+        options.context = "domain definition";
 
+        auto parsed = ExecutionDomainDefinition::tryParse(spec, options);
+        if (!parsed)
+            return std::nullopt;
+        return fromExecutionDomainDefinition(*parsed);
+    }
+
+    ExecutionDomainDefinition DomainDefinition::toExecutionDomainDefinition() const
+    {
+        ExecutionDomainDefinition domain;
+        domain.name = name;
+        domain.participants = devices;
+        domain.weights = weights;
+        domain.backend = backend;
+        domain.scope = toExecutionDomainScope(scope);
+        domain.owner_rank = owner_rank;
+        domain.ranks = explicit_ranks;
+        domain.compute_kind = compute_kind;
+        return domain;
+    }
+
+    DomainDefinition DomainDefinition::fromExecutionDomainDefinition(const ExecutionDomainDefinition &domain)
+    {
         DomainDefinition def;
-
-        // Split by ';' for different sections
-        auto sections = split(spec, ';');
-        if (sections.empty())
-        {
-            return std::nullopt;
-        }
-
-        // First section must be "name=devices"
-        auto &main_section = sections[0];
-        size_t eq_pos = main_section.find('=');
-        if (eq_pos == std::string::npos)
-        {
-            return std::nullopt;
-        }
-
-        def.name = main_section.substr(0, eq_pos);
-        if (def.name.empty())
-        {
-            return std::nullopt;
-        }
-
-        // Parse devices (comma-separated)
-        std::string devices_str = main_section.substr(eq_pos + 1);
-        auto device_specs = split(devices_str, ',');
-        if (device_specs.empty())
-        {
-            return std::nullopt;
-        }
-
-        for (const auto &dev_spec : device_specs)
-        {
-            auto addr = GlobalDeviceAddress::tryParse(dev_spec);
-            if (!addr)
-            {
-                return std::nullopt;
-            }
-            def.devices.push_back(*addr);
-        }
-
-        // Parse optional sections (weights, backend)
-        for (size_t i = 1; i < sections.size(); ++i)
-        {
-            auto &section = sections[i];
-            eq_pos = section.find('=');
-            if (eq_pos == std::string::npos)
-            {
-                continue; // Ignore malformed sections
-            }
-
-            std::string key = toLower(section.substr(0, eq_pos));
-            std::string value = section.substr(eq_pos + 1);
-
-            if (key == "weights")
-            {
-                auto weight_strs = split(value, ',');
-                for (const auto &w_str : weight_strs)
-                {
-                    try
-                    {
-                        float w = std::stof(w_str);
-                        def.weights.push_back(w);
-                    }
-                    catch (const std::exception &)
-                    {
-                        return std::nullopt;
-                    }
-                }
-            }
-            else if (key == "backend")
-            {
-                auto backend = parseCollectiveBackendType(value);
-                if (!backend)
-                {
-                    return std::nullopt;
-                }
-                def.backend = *backend;
-            }
-            else if (key == "scope")
-            {
-                auto s = parseTpScope(value);
-                if (!s || *s == TPScope::HYBRID)
-                {
-                    return std::nullopt; // hybrid is not a valid domain scope
-                }
-                def.scope = *s;
-            }
-            else if (key == "owner")
-            {
-                try
-                {
-                    int r = std::stoi(value);
-                    if (r < 0) return std::nullopt;
-                    def.owner_rank = r;
-                }
-                catch (const std::exception &)
-                {
-                    return std::nullopt;
-                }
-            }
-            else if (key == "ranks")
-            {
-                auto rank_strs = split(value, ',');
-                for (const auto &rs : rank_strs)
-                {
-                    try
-                    {
-                        int r = std::stoi(rs);
-                        if (r < 0) return std::nullopt;
-                        def.explicit_ranks.push_back(r);
-                    }
-                    catch (const std::exception &)
-                    {
-                        return std::nullopt;
-                    }
-                }
-            }
-        }
-
+        def.name = domain.name;
+        def.devices = domain.participants;
+        def.weights = domain.weights;
+        def.backend = domain.backend;
+        def.compute_kind = domain.compute_kind;
+        def.scope = toTPScope(domain.scope);
+        def.owner_rank = domain.owner_rank;
+        def.explicit_ranks = domain.ranks;
         return def;
     }
 
     std::vector<std::string> DomainDefinition::validate() const
     {
-        std::vector<std::string> errors;
-
-        if (name.empty())
-        {
-            errors.push_back("Domain name cannot be empty");
-        }
-
-        if (devices.empty())
-        {
-            errors.push_back("Domain '" + name + "' has no devices");
-        }
-
-        if (!weights.empty())
-        {
-            if (weights.size() != devices.size())
-            {
-                errors.push_back("Domain '" + name + "' has " +
-                                 std::to_string(devices.size()) + " devices but " +
-                                 std::to_string(weights.size()) + " weights");
-            }
-
-            float sum = std::accumulate(weights.begin(), weights.end(), 0.0f);
-            if (std::abs(sum - 1.0f) > 0.01f)
-            {
-                errors.push_back("Domain '" + name + "' weights sum to " +
-                                 std::to_string(sum) + " (expected 1.0)");
-            }
-
-            for (size_t i = 0; i < weights.size(); ++i)
-            {
-                if (weights[i] < 0.0f || weights[i] > 1.0f)
-                {
-                    errors.push_back("Domain '" + name + "' has invalid weight " +
-                                     std::to_string(weights[i]) + " (expected 0.0-1.0)");
-                }
-            }
-        }
-
-        // Phase 5: scope consistency
-        if (scope == TPScope::LOCAL && !explicit_ranks.empty())
-        {
-            errors.push_back("Domain '" + name + "' has scope=local but explicit_ranks is set (use owner= for local domains)");
-        }
-        if (owner_rank.has_value() && *owner_rank < 0)
-        {
-            errors.push_back("Domain '" + name + "' has invalid owner_rank " + std::to_string(*owner_rank));
-        }
-        if (scope == TPScope::LOCAL && explicit_ranks.size() > 1)
-        {
-            errors.push_back("Domain '" + name + "' has scope=local but multiple ranks specified");
-        }
-
-        return errors;
+        return toExecutionDomainDefinition().validate();
     }
 
     std::string DomainDefinition::toString() const
     {
-        std::ostringstream oss;
-        oss << name << "=[";
-        for (size_t i = 0; i < devices.size(); ++i)
-        {
-            if (i > 0)
-                oss << ",";
-            oss << devices[i].toShortString();
-        }
-        oss << "]";
-
-        if (!weights.empty())
-        {
-            oss << " weights=[";
-            for (size_t i = 0; i < weights.size(); ++i)
-            {
-                if (i > 0)
-                    oss << ",";
-                oss << weights[i];
-            }
-            oss << "]";
-        }
-
-        if (scope != TPScope::AUTO)
-        {
-            oss << " scope=" << tpScopeToString(scope);
-        }
-        if (owner_rank.has_value())
-        {
-            oss << " owner=" << *owner_rank;
-        }
-        if (!explicit_ranks.empty())
-        {
-            oss << " ranks=[";
-            for (size_t i = 0; i < explicit_ranks.size(); ++i)
-            {
-                if (i > 0) oss << ",";
-                oss << explicit_ranks[i];
-            }
-            oss << "]";
-        }
-
-        if (backend != CollectiveBackendType::AUTO)
-        {
-            oss << " backend=" << collectiveBackendTypeToString(backend);
-        }
-
-        return oss.str();
+        return toExecutionDomainDefinition().toString();
     }
 
     // =========================================================================
@@ -557,6 +459,105 @@ namespace llaminar2
         return !domain_definitions.empty() || !pp_stage_definitions.empty();
     }
 
+    std::vector<ExecutionDomainDefinition> OrchestrationConfig::executionDomainDefinitions() const
+    {
+        std::vector<ExecutionDomainDefinition> domains;
+        domains.reserve(domain_definitions.size() +
+                        (moe_expert_parallel_plan ? moe_expert_parallel_plan->domains.size() : 0));
+
+        std::unordered_map<std::string, size_t> index_by_name;
+        auto appendIfNew = [&](const ExecutionDomainDefinition &domain) {
+            if (index_by_name.find(domain.name) != index_by_name.end())
+                return;
+            index_by_name.emplace(domain.name, domains.size());
+            domains.push_back(domain);
+        };
+
+        if (moe_expert_parallel_plan)
+        {
+            for (const auto &domain : moe_expert_parallel_plan->domains)
+                appendIfNew(domain.toExecutionDomainDefinition());
+        }
+
+        for (const auto &domain : domain_definitions)
+            appendIfNew(domain.toExecutionDomainDefinition());
+
+        return domains;
+    }
+
+    std::vector<std::string> normalizeMoEExpertOverlayDomains(OrchestrationConfig &config)
+    {
+        std::vector<std::string> errors;
+        auto &plan_ptr = config.moe_expert_parallel_plan;
+        if (!plan_ptr)
+            return errors;
+
+        auto &plan = *plan_ptr;
+        std::vector<ExecutionDomainDefinition> inventory;
+        std::unordered_map<std::string, size_t> index_by_name;
+
+        auto addDomain = [&](const ExecutionDomainDefinition &domain, const std::string &source) {
+            if (domain.name.empty())
+            {
+                errors.push_back(source + " defines an execution domain with an empty name");
+                return;
+            }
+
+            auto existing = index_by_name.find(domain.name);
+            if (existing != index_by_name.end())
+            {
+                const auto &prior = inventory[existing->second];
+                if (!sameDomainDefinition(prior, domain))
+                {
+                    errors.push_back("Conflicting execution domain definition for '" + domain.name +
+                                     "'. Define each hardware domain once with --define-domain; "
+                                     "--moe-expert-overlay-domain is a strict alias and must not "
+                                     "redefine a domain with different devices, scope, backend, ranks, weights, or compute kind");
+                }
+                return;
+            }
+
+            index_by_name.emplace(domain.name, inventory.size());
+            inventory.push_back(domain);
+        };
+
+        for (const auto &domain : config.domain_definitions)
+            addDomain(domain.toExecutionDomainDefinition(), "--define-domain");
+
+        for (const auto &domain : plan.domains)
+            addDomain(domain.toExecutionDomainDefinition(), "--moe-expert-overlay-domain");
+
+        if (!errors.empty())
+            return errors;
+
+        config.domain_definitions.clear();
+        config.domain_definitions.reserve(inventory.size());
+        for (const auto &domain : inventory)
+            config.domain_definitions.push_back(DomainDefinition::fromExecutionDomainDefinition(domain));
+
+        std::vector<ExpertComputeDomain> normalized_plan_domains;
+        for (const auto &name : overlayReferencedDomainNames(plan))
+        {
+            auto it = index_by_name.find(name);
+            if (it == index_by_name.end())
+                continue;
+            try
+            {
+                normalized_plan_domains.push_back(
+                    ExpertComputeDomain::fromExecutionDomainDefinition(inventory[it->second]));
+            }
+            catch (const std::exception &e)
+            {
+                errors.push_back("MoE expert overlay domain '" + name + "': " + e.what());
+            }
+        }
+
+        if (!normalized_plan_domains.empty() || !plan.domains.empty())
+            plan.domains = std::move(normalized_plan_domains);
+
+        return errors;
+    }
+
     std::vector<std::string> validateMoEExpertOverlayConfig(const OrchestrationConfig &config)
     {
         std::vector<std::string> errors;
@@ -569,6 +570,7 @@ namespace llaminar2
         const auto &plan = *plan_ptr;
         const bool has_overlay_details =
             !plan.continuation_domain.empty() ||
+            !plan.base_model_domain.empty() ||
             !plan.shared_expert_domain.empty() ||
             plan.residency_policy != ExpertResidencyPolicy::Disabled ||
             !plan.domains.empty() ||
@@ -588,6 +590,76 @@ namespace llaminar2
         for (const auto &error : plan_result.errors)
         {
             errors.push_back("MoE expert overlay: " + error);
+        }
+
+        if (config.device_for_this_rank.has_value() && !plan.continuation_domain.empty())
+        {
+            const std::string device_spec = config.cpu_global_tp_all_local
+                                                ? "cpu"
+                                                : config.device_for_this_rank->toShortString();
+            errors.push_back("Conflicting options: --device/-d " + device_spec +
+                             " and --moe-expert-overlay-continuation " +
+                             plan.continuation_domain +
+                             ". Overlay continuation is the root/base placement; remove -d or disable overlay");
+        }
+
+        if (config.device_for_this_rank.has_value() && !plan.base_model_domain.empty())
+        {
+            const std::string device_spec = config.cpu_global_tp_all_local
+                                                ? "cpu"
+                                                : config.device_for_this_rank->toShortString();
+            errors.push_back("Conflicting options: --device/-d " + device_spec +
+                             " and --moe-expert-overlay-base-domain " +
+                             plan.base_model_domain +
+                             ". Overlay base/non-expert placement is explicit; remove -d or disable overlay");
+        }
+
+        auto domainByName = [&](const std::string &name) -> const ExpertComputeDomain * {
+            auto it = std::find_if(plan.domains.begin(), plan.domains.end(),
+                                   [&](const auto &domain)
+                                   {
+                                       return domain.name == name;
+                                   });
+            return it == plan.domains.end() ? nullptr : &*it;
+        };
+
+        const auto *continuation_domain = domainByName(plan.continuation_domain);
+        const int continuation_owner = continuation_domain ? continuation_domain->owner_rank : -1;
+
+        const std::string base_domain_name = plan.effectiveBaseModelDomain();
+        const auto *base_domain = domainByName(base_domain_name);
+        if (!plan.base_model_domain.empty() && base_domain && continuation_owner >= 0)
+        {
+            const int base_owner = base_domain->owner_rank;
+            if (base_owner >= 0 && base_owner != continuation_owner)
+            {
+                errors.push_back("MoE expert overlay base/non-expert model domain '" + base_domain_name +
+                                 "' owner rank " + std::to_string(base_owner) +
+                                 " does not match continuation root rank " +
+                                 std::to_string(continuation_owner) +
+                                 "; current overlay root execution requires base and continuation placement on the same root rank");
+            }
+        }
+
+        for (const auto &tier : plan.routed_tiers)
+        {
+            if (tier.domain == plan.continuation_domain)
+                continue;
+
+            const auto *domain = domainByName(tier.domain);
+            if (!domain)
+                continue;
+
+            const bool remote_single_device =
+                domain->kind == ExpertDomainKind::SingleDevice &&
+                domain->owner_rank >= 0 &&
+                continuation_owner >= 0 &&
+                domain->owner_rank != continuation_owner;
+            if (remote_single_device)
+            {
+                errors.push_back("MoE expert overlay auxiliary domain '" + domain->name +
+                                 "' has no Phase 6 worker implementation for remote single-device replicated experts");
+            }
         }
 
         if (!config.pp_stage_definitions.empty())
@@ -716,7 +788,18 @@ namespace llaminar2
 
         // Validate optional same-layer MoE expert overlay plan.
         {
-            auto overlay_errors = validateMoEExpertOverlayConfig(*this);
+            OrchestrationConfig normalized = *this;
+            if (normalized.moe_expert_parallel_plan)
+            {
+                normalized.moe_expert_parallel_plan =
+                    std::make_shared<MoEExpertParallelPlan>(*normalized.moe_expert_parallel_plan);
+            }
+            auto normalize_errors = normalizeMoEExpertOverlayDomains(normalized);
+            for (const auto &error : normalize_errors)
+            {
+                errors.push_back("MoE expert overlay: " + error);
+            }
+            auto overlay_errors = validateMoEExpertOverlayConfig(normalized);
             errors.insert(errors.end(), overlay_errors.begin(), overlay_errors.end());
         }
 
@@ -783,20 +866,49 @@ namespace llaminar2
         }
 
         // Named domains
-        if (!domain_definitions.empty())
+        // Unified domain inventory
+        const auto inventory = executionDomainDefinitions();
+        if (!inventory.empty())
         {
-            oss << "  domains:\n";
-            for (const auto &d : domain_definitions)
+            oss << "  execution_domains:\n";
+            for (const auto &d : inventory)
             {
                 oss << "    - " << d.toString() << "\n";
             }
         }
         if (!pp_stage_definitions.empty())
         {
-            oss << "  pp_stages:\n";
+            oss << "  placements:\n";
+            oss << "    pp_layers:\n";
             for (const auto &s : pp_stage_definitions)
             {
-                oss << "    - " << s.toString() << "\n";
+                oss << "      - " << s.toString() << "\n";
+            }
+        }
+
+        if (moe_expert_parallel_plan && moe_expert_parallel_plan->enabled)
+        {
+            const auto &plan = *moe_expert_parallel_plan;
+            oss << "  moe_expert_overlay:\n";
+            oss << "    kind: " << llaminar2::toString(plan.execution_kind) << "\n";
+            oss << "    base_model_domain: " << plan.effectiveBaseModelDomain() << "\n";
+            oss << "    continuation_domain: " << plan.continuation_domain << "\n";
+            oss << "    shared_expert_domain: " << plan.shared_expert_domain << "\n";
+            if (!plan.routed_tiers.empty())
+            {
+                oss << "    routed_tiers:\n";
+                for (const auto &tier : plan.routed_tiers)
+                {
+                    oss << "      - " << tier.name << " -> " << tier.domain
+                        << " priority=" << tier.priority;
+                    if (tier.max_experts_per_layer > 0)
+                        oss << " max_experts_per_layer=" << tier.max_experts_per_layer;
+                    if (tier.memory_budget_bytes > 0)
+                        oss << " memory_bytes=" << tier.memory_budget_bytes;
+                    if (tier.fallback)
+                        oss << " fallback=true";
+                    oss << "\n";
+                }
             }
         }
 

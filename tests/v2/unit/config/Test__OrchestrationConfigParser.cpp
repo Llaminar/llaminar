@@ -419,6 +419,79 @@ TEST(Test__OrchestrationConfigParser, ParseArgs_DefineDomain_WithScopeOwnerRanks
     EXPECT_EQ(config.domain_definitions[1].explicit_ranks[1], 1);
 }
 
+TEST(Test__OrchestrationConfigParser, Phase9B_NamedAndOverlayDomainsShareCanonicalNormalization)
+{
+    OrchestrationConfigParser parser;
+    ArgvHelper named_args{"llaminar2",
+                          "--define-domain", "rocm_hot=0:rocm:0,0:rocm:1;weights=0.60,0.40;scope=local;backend=rccl;owner=0"};
+    ArgvHelper overlay_args{"llaminar2",
+                            "--moe-expert-overlay", "tiered",
+                            "--moe-expert-overlay-continuation", "rocm_hot",
+                            "--moe-expert-overlay-shared-domain", "rocm_hot",
+                            "--moe-expert-overlay-domain", "rocm_hot=0:rocm:0,0:rocm:1;weights=0.60,0.40;scope=local;backend=rccl;compute=tensor_parallel_experts;owner=0",
+                            "--moe-expert-overlay-domain", "cpu_cold=0:cpu:0,1:cpu:0;scope=node_local;backend=upi;compute=tensor_parallel_experts;ranks=0,1",
+                            "--moe-expert-overlay-tier", "hot@rocm_hot;priority=0",
+                            "--moe-expert-overlay-tier", "cold@cpu_cold;priority=1;fallback=true"};
+
+    const auto named_config = parser.parseArgs(named_args.argc(), named_args.argv());
+    const auto overlay_config = parser.parseArgs(overlay_args.argc(), overlay_args.argv());
+
+    ASSERT_EQ(named_config.domain_definitions.size(), 1u);
+    ASSERT_NE(overlay_config.moe_expert_parallel_plan, nullptr);
+    ASSERT_EQ(overlay_config.moe_expert_parallel_plan->domains.size(), 2u);
+
+    const auto named_domain = named_config.domain_definitions[0].toExecutionDomainDefinition();
+    const auto overlay_domain = overlay_config.moe_expert_parallel_plan->domains[0].toExecutionDomainDefinition();
+
+    EXPECT_EQ(named_domain.name, overlay_domain.name);
+    EXPECT_EQ(named_domain.participants, overlay_domain.participants);
+    EXPECT_EQ(named_domain.weights, overlay_domain.weights);
+    EXPECT_EQ(named_domain.scope, overlay_domain.scope);
+    EXPECT_EQ(named_domain.backend, overlay_domain.backend);
+    EXPECT_EQ(named_domain.owner_rank, overlay_domain.owner_rank);
+    EXPECT_EQ(named_domain.ranks, overlay_domain.ranks);
+    EXPECT_EQ(named_domain.compute_kind, ExecutionDomainComputeKind::UNSPECIFIED);
+    EXPECT_EQ(overlay_domain.compute_kind, ExecutionDomainComputeKind::TENSOR_PARALLEL_EXPERTS);
+
+    const auto inventory = overlay_config.executionDomainDefinitions();
+    ASSERT_EQ(inventory.size(), 2u);
+    EXPECT_EQ(inventory[0].logicalIdentity(), "rocm_hot");
+    EXPECT_EQ(inventory[1].logicalIdentity(), "cpu_cold");
+}
+
+TEST(Test__OrchestrationConfigParser, Phase9B_DomainIdentityIsNameScopedForSharedParticipants)
+{
+    const auto first = ExecutionDomainDefinition::parse(
+        "continuation=0:cuda:0;scope=single;backend=auto;compute=replicated_experts");
+    const auto second = ExecutionDomainDefinition::parse(
+        "shared_experts=0:cuda:0;scope=single;backend=auto;compute=replicated_experts");
+
+    EXPECT_TRUE(first.samePhysicalParticipants(second));
+    EXPECT_NE(first.logicalIdentity(), second.logicalIdentity());
+}
+
+TEST(Test__OrchestrationConfigParser, Phase9B_PPStageRemainsLayerPlacementNotMoEOverlay)
+{
+    ArgvHelper args{"llaminar2",
+                    "--define-domain", "gpu_tp=0:cuda:0,0:cuda:1;scope=local;backend=nccl;owner=0",
+                    "--pp-stage", "0=gpu_tp:0-3"};
+    OrchestrationConfigParser parser;
+
+    const auto config = parser.parseArgs(args.argc(), args.argv());
+
+    ASSERT_EQ(config.domain_definitions.size(), 1u);
+    ASSERT_EQ(config.pp_stage_definitions.size(), 1u);
+    EXPECT_EQ(config.pp_stage_definitions[0].domain_name, "gpu_tp");
+    EXPECT_EQ(config.pp_stage_definitions[0].first_layer, 0);
+    EXPECT_EQ(config.pp_stage_definitions[0].last_layer, 3);
+    EXPECT_EQ(config.moe_expert_parallel_plan, nullptr);
+
+    const auto inventory = config.executionDomainDefinitions();
+    ASSERT_EQ(inventory.size(), 1u);
+    EXPECT_EQ(inventory[0].logicalIdentity(), "gpu_tp");
+    EXPECT_EQ(inventory[0].compute_kind, ExecutionDomainComputeKind::UNSPECIFIED);
+}
+
 TEST(Test__OrchestrationConfigParser, ParseArgs_PPStage)
 {
     ArgvHelper args{"llaminar2", "--pp-stage", "0=gpu_tp:0-13"};

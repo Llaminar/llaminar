@@ -93,6 +93,12 @@ namespace llaminar2::test
         MOCK_METHOD(std::string, getStopThinkingPrompt, (), (const, override));
         MOCK_METHOD(ToolCallFormat, getToolCallFormat, (), (const, override));
 
+        // MPI worker coordination
+        MOCK_METHOD(void, runMPIWorkerLoop, (), (override));
+        MOCK_METHOD(void, shutdownMPIWorkers, (), (override));
+        MOCK_METHOD(void, abortMPIWorkers, (const std::string &reason), (override));
+        MOCK_METHOD(void, setMPICoordinatedMode, (bool enabled), (override));
+
         // =====================================================================
         // Test Helpers
         // =====================================================================

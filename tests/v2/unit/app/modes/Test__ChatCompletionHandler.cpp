@@ -15,6 +15,7 @@
 #include "nlohmann/json.hpp"
 
 #include <ctime>
+#include <stdexcept>
 
 using namespace llaminar2;
 using namespace llaminar2::test;
@@ -22,6 +23,7 @@ using json = nlohmann::json;
 using ::testing::_;
 using ::testing::Invoke;
 using ::testing::Return;
+using ::testing::Throw;
 
 // =============================================================================
 // Test fixture
@@ -721,6 +723,54 @@ TEST_F(Test__ChatCompletionHandler, HandleRequest_ClearsCacheBeforeEachRequest)
     request.messages = {ChatMessage("user", "test")};
 
     handler->handleRequest(request);
+}
+
+TEST_F(Test__ChatCompletionHandler, HandleRequest_ConsecutiveRequestsResetCacheAndSamplingEachTime)
+{
+    auto handler = makeHandler();
+
+    ON_CALL(*tokenizer_, encodeChat(_, _, _))
+        .WillByDefault(Return(std::vector<int>{1}));
+    ON_CALL(*tokenizer_, is_stop_token(_))
+        .WillByDefault(Return(false));
+    ON_CALL(*runner_, getRecommendedSamplingParams())
+        .WillByDefault(Return(SamplingParams{}));
+
+    EXPECT_CALL(*runner_, clearCache()).Times(2);
+    EXPECT_CALL(*runner_, setSamplingParams(_)).Times(2);
+    EXPECT_CALL(*runner_, prefill(_)).Times(2).WillRepeatedly(Return(true));
+    EXPECT_CALL(*runner_, decodeStep()).Times(2).WillRepeatedly(Return(makeToken(0, true)));
+
+    ChatCompletionRequest request;
+    request.messages = {ChatMessage("user", "test")};
+    request.max_tokens = 1;
+
+    auto first = handler->handleRequest(request);
+    auto second = handler->handleRequest(request);
+
+    EXPECT_TRUE(first.ok);
+    EXPECT_TRUE(second.ok);
+}
+
+TEST_F(Test__ChatCompletionHandler, HandleRequest_ExceptionAfterBoundaryReturns500AndResetsCache)
+{
+    auto handler = makeHandler();
+
+    EXPECT_CALL(*runner_, clearCache()).Times(2);
+    EXPECT_CALL(*runner_, setSamplingParams(_))
+        .WillOnce(Throw(std::runtime_error("sampling setup exploded")));
+    EXPECT_CALL(*runner_, prefill(_)).Times(0);
+
+    ChatCompletionRequest request;
+    request.messages = {ChatMessage("user", "test")};
+
+    auto response = handler->handleRequest(request);
+
+    EXPECT_FALSE(response.ok);
+    EXPECT_EQ(response.http_status, 500);
+    auto body = json::parse(response.json_body);
+    EXPECT_EQ(body["error"]["type"], "server_error");
+    EXPECT_NE(body["error"]["message"].get<std::string>().find("sampling setup exploded"), std::string::npos);
 }
 
 // =============================================================================

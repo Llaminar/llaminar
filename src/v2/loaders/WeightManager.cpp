@@ -8,6 +8,7 @@
 #include "MmapRegion.h"
 #include "PreparedWeightStore.h"
 #include "../execution/moe/ExpertWeightPayloadProvider.h"
+#include "../execution/moe/MoEExpertOverlayExecutionPlan.h"
 #include "../execution/moe/MoEExpertOverlayRuntimePlan.h"
 #include "../utils/Logger.h"
 #include "../utils/WeightLoadingProfiler.h"
@@ -89,6 +90,10 @@ namespace llaminar2
             mixInt(requirement.pp_stage);
             mixInt(requirement.tp_domain);
             mixInt(requirement.tp_rank_or_device_index);
+            mixInt(static_cast<int>(requirement.residency_category));
+            mixString(requirement.overlay_domain);
+            mixInt(requirement.overlay_participant_index);
+            mixInt(requirement.overlay_participant_world_rank);
             mixInt(static_cast<int>(requirement.target_device.type));
             mixInt(requirement.target_device.ordinal);
             mixSize(requirement.slice.row_start);
@@ -1582,6 +1587,10 @@ namespace llaminar2
             binding.identity.pp_stage = requirement.pp_stage;
             binding.identity.tp_domain = requirement.tp_domain;
             binding.identity.tp_rank_or_device_index = requirement.tp_rank_or_device_index;
+            binding.identity.residency_category = requirement.residency_category;
+            binding.identity.overlay_domain = requirement.overlay_domain;
+            binding.identity.overlay_participant_index = requirement.overlay_participant_index;
+            binding.identity.overlay_participant_world_rank = requirement.overlay_participant_world_rank;
 
             binding.slice = requirement.slice;
             binding.residency.home_device = requirement.target_device;
@@ -1609,6 +1618,10 @@ namespace llaminar2
                     binding.identity.pp_stage = requirement.pp_stage;
                     binding.identity.tp_domain = requirement.tp_domain;
                     binding.identity.tp_rank_or_device_index = requirement.tp_rank_or_device_index;
+                    binding.identity.residency_category = requirement.residency_category;
+                    binding.identity.overlay_domain = requirement.overlay_domain;
+                    binding.identity.overlay_participant_index = requirement.overlay_participant_index;
+                    binding.identity.overlay_participant_world_rank = requirement.overlay_participant_world_rank;
                     binding.slice = metadata->slice;
                     binding.residency = metadata->residency;
                     binding.residency.home_device = requirement.target_device;
@@ -3538,7 +3551,8 @@ namespace llaminar2
 
     bool WeightManager::prepareMoEExpertOverlayWeights(
         const MoEExpertOverlayRuntimePlan &runtime_plan,
-        const FrozenModelWeightSet *frozen_weights)
+        const FrozenModelWeightSet *frozen_weights,
+        const MoEExpertOverlayExecutionPlan *execution_plan)
     {
         (void)frozen_weights;
 
@@ -3554,6 +3568,8 @@ namespace llaminar2
         auto preparation_plan = MoEExpertOverlayPreparationPlan::build(
             runtime_plan,
             routed_expert_bytes_per_expert);
+        if (execution_plan)
+            preparation_plan = preparation_plan.filteredForRank(execution_plan->currentRankPlan());
         moe_overlay_preparation_diagnostics_ = preparation_plan.diagnostics();
 
         LOG_INFO("[WeightManager] " << moe_overlay_preparation_diagnostics_.render());
@@ -3765,6 +3781,8 @@ namespace llaminar2
             std::string domain_name;
             std::string tier_name;
             int tier_index = -1;
+            int participant_world_rank = -1;
+            int participant_index = -1;
             std::shared_ptr<TensorBase> view;     // 2D expert view (keeps parent alive)
         };
         std::vector<MoEExpertJob> moe_jobs;
@@ -3889,11 +3907,15 @@ namespace llaminar2
                         std::string domain_name;
                         std::string tier_name;
                         int tier_index = -1;
+                        int participant_world_rank = -1;
+                        int participant_index = -1;
                         if (overlay_request)
                         {
                             domain_name = overlay_request->domain_name;
                             tier_name = overlay_request->tier_name;
                             tier_index = overlay_request->tier_index;
+                            participant_world_rank = overlay_request->participant_world_rank;
+                            participant_index = overlay_request->participant_index;
                             slot_name = "moe_" + registrySlotComponent(domain_name) + "_tier" +
                                         std::to_string(tier_index) + "_L" + std::to_string(layer_idx) +
                                         "_" + rt.tag + "_e" + std::to_string(e);
@@ -3901,6 +3923,7 @@ namespace llaminar2
 
                         moe_jobs.push_back({layer_idx, e, rt.role, std::move(slot_name),
                                             std::move(domain_name), std::move(tier_name), tier_index,
+                                            participant_world_rank, participant_index,
                                             std::move(view)});
                     }
                 }
@@ -4034,6 +4057,102 @@ namespace llaminar2
         {
             LOG_WARN("[WeightManager] GPU pipeline: no weights to load");
             return false;
+        }
+
+        if (max_raw_bytes == 0)
+        {
+            size_t adopted_dense = 0;
+            size_t missing_dense = 0;
+            for (const auto &dense_job : gemm_weights)
+            {
+                if (!dense_job.binding.has_value())
+                    continue;
+                const auto &binding = *dense_job.binding;
+                if (preparedWeightStore()->preparedRefForBinding(binding.binding_id, target_device).has_value() ||
+                    preparedWeightStore()->adoptPreparedGemmForBinding(binding, target_device))
+                {
+                    markPrepState(dense_job.name, target_device, WeightPrepState::READY, true,
+                                  "GPU pipeline: adopted already-loaded prepared GEMM handle");
+                    ++adopted_dense;
+                }
+                else
+                {
+                    ++missing_dense;
+                    LOG_WARN("[WeightManager] GPU pipeline: no already-loaded prepared GEMM handle for "
+                             << dense_job.name << " on " << target_device.to_string());
+                }
+            }
+
+            size_t aliased_experts = 0;
+            size_t missing_experts = 0;
+            for (const auto &moe_job : moe_jobs)
+            {
+                if (moe_job.domain_name.empty())
+                    continue;
+
+                bool has_domain_engine = expert_gemm_registry_.getEngineForDomain(
+                                             moe_job.domain_name,
+                                             target_device,
+                                             moe_job.layer_idx,
+                                             moe_job.expert_idx,
+                                             moe_job.role) != nullptr;
+                if (!has_domain_engine)
+                {
+                    has_domain_engine = expert_gemm_registry_.aliasEngineForDomainFromDevice(
+                        moe_job.domain_name,
+                        target_device,
+                        moe_job.layer_idx,
+                        moe_job.expert_idx,
+                        moe_job.role);
+                }
+
+                bool has_participant_engine = true;
+                if (moe_job.participant_world_rank >= 0 || moe_job.participant_index >= 0)
+                {
+                    has_participant_engine = expert_gemm_registry_.getEngineForParticipant(
+                                                 moe_job.domain_name,
+                                                 target_device,
+                                                 moe_job.participant_world_rank,
+                                                 moe_job.participant_index,
+                                                 moe_job.layer_idx,
+                                                 moe_job.expert_idx,
+                                                 moe_job.role) != nullptr;
+                    if (!has_participant_engine)
+                    {
+                        has_participant_engine = expert_gemm_registry_.aliasEngineForParticipantFromDevice(
+                            moe_job.domain_name,
+                            target_device,
+                            moe_job.participant_world_rank,
+                            moe_job.participant_index,
+                            moe_job.layer_idx,
+                            moe_job.expert_idx,
+                            moe_job.role);
+                    }
+                }
+
+                if (has_domain_engine && has_participant_engine)
+                {
+                    ++aliased_experts;
+                }
+                else
+                {
+                    ++missing_experts;
+                    LOG_WARN("[WeightManager] GPU pipeline: no already-loaded expert GEMM engine for "
+                             << moe_job.domain_name << " layer=" << moe_job.layer_idx
+                             << " expert=" << moe_job.expert_idx
+                             << " role=" << moeWeightRoleName(moe_job.role)
+                             << " on " << target_device.to_string());
+                }
+            }
+
+            LOG_INFO("[WeightManager] GPU pipeline: planned " << planned_count
+                     << " weights for " << target_device.to_string()
+                     << " with no host-backed raw bytes; adopted_dense=" << adopted_dense
+                     << " missing_dense=" << missing_dense
+                     << " aliased_experts=" << aliased_experts
+                     << " missing_experts=" << missing_experts);
+
+            return missing_dense == 0 && missing_experts == 0;
         }
 
         // ------------------------------------------------------------------
@@ -4477,6 +4596,11 @@ namespace llaminar2
                 ITensorGemm *raw_ptr = kernel.get();
                 if (!mj.domain_name.empty())
                 {
+                    expert_gemm_registry_.registerEngineForParticipant(
+                        mj.domain_name,
+                        target_device, mj.participant_world_rank, mj.participant_index,
+                        mj.layer_idx, mj.expert_idx, mj.role,
+                        raw_ptr, kernel);
                     expert_gemm_registry_.registerEngineForDomain(
                         mj.domain_name,
                         target_device, mj.layer_idx, mj.expert_idx, mj.role,

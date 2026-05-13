@@ -43,14 +43,15 @@ namespace
     public:
         MockLocalTPContext(
             std::vector<GlobalDeviceAddress> devices,
-            std::vector<float> weights)
-            : devices_(std::move(devices)), weights_(std::move(weights))
+            std::vector<float> weights,
+            CollectiveBackendType backend = CollectiveBackendType::HOST)
+            : devices_(std::move(devices)), weights_(std::move(weights)), backend_(backend)
         {
         }
 
         const std::vector<GlobalDeviceAddress> &devices() const override { return devices_; }
         const std::vector<float> &weights() const override { return weights_; }
-        CollectiveBackendType backend() const override { return CollectiveBackendType::HOST; }
+        CollectiveBackendType backend() const override { return backend_; }
         int degree() const override { return static_cast<int>(devices_.size()); }
         int myIndex() const override { return 0; }
 
@@ -141,6 +142,7 @@ namespace
     private:
         std::vector<GlobalDeviceAddress> devices_;
         std::vector<float> weights_;
+        CollectiveBackendType backend_ = CollectiveBackendType::HOST;
     };
 
     constexpr int kMoELayers = 3;
@@ -444,6 +446,30 @@ namespace
         EXPECT_TRUE(owned_contexts.empty());
         ASSERT_NE(graph_config.domain_tp_contexts.find("rocm_hot"), graph_config.domain_tp_contexts.end());
         EXPECT_EQ(graph_config.domain_tp_contexts["rocm_hot"], &injected_context);
+    }
+
+    TEST(Test__InferenceRunnerFactory_MoEOverlayPlanning, ReusesRunnerLocalTPContextForMatchingActiveRocmLocalTPTier)
+    {
+        GraphConfig graph_config;
+        graph_config.moe.expert_parallel_plan = makeActiveRocmLocalTPOverlayPlan();
+        graph_config.moe.expert_overlay_runtime_plan = resolveMoEExpertOverlayRuntimePlan(
+            graph_config.moe.expert_parallel_plan);
+
+        MockLocalTPContext runner_context(
+            {GlobalDeviceAddress::rocm(0), GlobalDeviceAddress::rocm(1)},
+            {0.5f, 0.5f},
+            CollectiveBackendType::RCCL);
+
+        InferenceRunnerConfig runner_config;
+        runner_config.tp_ctx = &runner_context;
+
+        DomainLocalTPContextMap owned_contexts;
+        ASSERT_TRUE(populateMoEExpertOverlayDomainTPContextsForGraph(
+            graph_config, owned_contexts, "[InferenceRunnerFactoryTest]", &runner_config));
+
+        EXPECT_TRUE(owned_contexts.empty());
+        ASSERT_NE(graph_config.domain_tp_contexts.find("rocm_hot"), graph_config.domain_tp_contexts.end());
+        EXPECT_EQ(graph_config.domain_tp_contexts["rocm_hot"], &runner_context);
     }
 
     TEST(Test__InferenceRunnerFactory_MoEOverlayPlanning, CreatesOwnedDomainTPContextForActiveRocmLocalTPTier)

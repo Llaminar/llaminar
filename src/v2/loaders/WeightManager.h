@@ -50,6 +50,7 @@ namespace llaminar2
 
     class PreparedWeightStore;
     class MoEExpertOverlayRuntimePlan;
+    struct MoEExpertOverlayExecutionPlan;
 
     /**
      * @brief Weight manager with distribution strategy and caching
@@ -154,7 +155,8 @@ namespace llaminar2
         /// inserted into ExpertGemmRegistry.
         bool prepareMoEExpertOverlayWeights(
             const MoEExpertOverlayRuntimePlan &runtime_plan,
-            const FrozenModelWeightSet *frozen_weights = nullptr);
+            const FrozenModelWeightSet *frozen_weights = nullptr,
+            const MoEExpertOverlayExecutionPlan *execution_plan = nullptr);
 
         const MoEExpertOverlayPreparationDiagnostics &moeExpertOverlayPreparationDiagnostics() const
         {

@@ -65,6 +65,20 @@ namespace llaminar2
         return "RequiredUntilGraphMaterialized";
     }
 
+    std::string toString(WeightResidencyCategory category)
+    {
+        switch (category)
+        {
+        case WeightResidencyCategory::Unspecified: return "Unspecified";
+        case WeightResidencyCategory::RootNonExpert: return "RootNonExpert";
+        case WeightResidencyCategory::SharedExpert: return "SharedExpert";
+        case WeightResidencyCategory::AcceleratorRoutedExpert: return "AcceleratorRoutedExpert";
+        case WeightResidencyCategory::CpuFallbackExpert: return "CpuFallbackExpert";
+        case WeightResidencyCategory::WorkerFallbackExpert: return "WorkerFallbackExpert";
+        }
+        return "Unspecified";
+    }
+
     const char *toString(WeightLifecycleState state)
     {
         switch (state)

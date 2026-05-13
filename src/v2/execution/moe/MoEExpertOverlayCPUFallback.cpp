@@ -9,9 +9,11 @@
 #include "execution/compute_stages/stages/MoEExpertComputeStage.h"
 #include "execution/moe/MoEExpertTokenRowTransfer.h"
 #include "tensors/Tensors.h"
+#include "utils/DebugEnv.h"
 #include "utils/Logger.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <exception>
@@ -20,6 +22,7 @@
 #include <numeric>
 #include <sstream>
 #include <stdexcept>
+#include <thread>
 #include <utility>
 
 namespace llaminar2
@@ -59,11 +62,105 @@ namespace
         return true;
     }
 
+    bool waitForMPIRequest(MPI_Request &request,
+                           int timeout_ms,
+                           const char *operation,
+                           MPI_Comm comm,
+                           size_t count)
+    {
+        int rank = -1;
+        int size = 0;
+        MPI_Comm_rank(comm, &rank);
+        MPI_Comm_size(comm, &size);
+
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+        int complete = 0;
+        int result = MPI_SUCCESS;
+        while (!complete)
+        {
+            result = MPI_Test(&request, &complete, MPI_STATUS_IGNORE);
+            if (result != MPI_SUCCESS || complete)
+                break;
+
+            if (std::chrono::steady_clock::now() >= deadline)
+            {
+                LOG_ERROR("[MoECPUFallback] " << operation << " timed out after " << timeout_ms
+                          << "ms on comm rank " << rank << "/" << size
+                          << " (count=" << count << "); aborting MPI job to avoid rank desynchronization");
+                MPI_Abort(MPI_COMM_WORLD, 1);
+                return false;
+            }
+
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+
+        if (result != MPI_SUCCESS)
+        {
+            LOG_ERROR("[MoECPUFallback] " << operation << " failed with MPI code " << result
+                      << " on comm rank " << rank << "/" << size);
+            return false;
+        }
+        return true;
+    }
+
+    bool barrierWorld(MPI_Comm comm, const char *operation)
+    {
+        const int timeout_ms = debugEnv().tp_collect_timeout_ms;
+        if (timeout_ms <= 0)
+            return MPI_Barrier(comm) == MPI_SUCCESS;
+
+        MPI_Request request = MPI_REQUEST_NULL;
+        const int result = MPI_Ibarrier(comm, &request);
+        if (result != MPI_SUCCESS)
+        {
+            LOG_ERROR("[MoECPUFallback] MPI_Ibarrier failed with code " << result
+                      << " during " << operation);
+            return false;
+        }
+        return waitForMPIRequest(request, timeout_ms, operation, comm, 0);
+    }
+
+    bool bcastWorld(void *buffer,
+                    int count,
+                    MPI_Datatype dtype,
+                    int root,
+                    MPI_Comm comm,
+                    const char *operation)
+    {
+        const int timeout_ms = debugEnv().tp_collect_timeout_ms;
+        if (timeout_ms <= 0)
+            return MPI_Bcast(buffer, count, dtype, root, comm) == MPI_SUCCESS;
+
+        MPI_Request request = MPI_REQUEST_NULL;
+        const int result = MPI_Ibcast(buffer, count, dtype, root, comm, &request);
+        if (result != MPI_SUCCESS)
+        {
+            LOG_ERROR("[MoECPUFallback] MPI_Ibcast failed with code " << result
+                      << " during " << operation);
+            return false;
+        }
+        return waitForMPIRequest(request, timeout_ms, operation, comm, static_cast<size_t>(count));
+    }
+
     bool allRanksOk(MPI_Comm comm, bool local_ok)
     {
-        int ok = local_ok ? 1 : 0;
-        MPI_Allreduce(MPI_IN_PLACE, &ok, 1, MPI_INT, MPI_MIN, comm);
-        return ok == 1;
+        const int send = local_ok ? 1 : 0;
+        int recv = 0;
+        const int timeout_ms = debugEnv().tp_collect_timeout_ms;
+        if (timeout_ms <= 0)
+            return MPI_Allreduce(&send, &recv, 1, MPI_INT, MPI_MIN, comm) == MPI_SUCCESS && recv == 1;
+
+        MPI_Request request = MPI_REQUEST_NULL;
+        const int result = MPI_Iallreduce(&send, &recv, 1, MPI_INT, MPI_MIN, comm, &request);
+        if (result != MPI_SUCCESS)
+        {
+            LOG_ERROR("[MoECPUFallback] MPI_Iallreduce failed with code " << result
+                      << " while synchronizing rank status");
+            return false;
+        }
+        if (!waitForMPIRequest(request, timeout_ms, "MoE CPU fallback rank-status allreduce", comm, 1))
+            return false;
+        return recv == 1;
     }
 
     bool sendTensorWorld(const TensorBase *tensor, int dest_rank, int tag, MPI_Comm comm)
@@ -608,7 +705,12 @@ namespace
         if (!allRanksOk(domain.world_comm, local_ok))
             return false;
 
-        local_ok = MPI_Bcast(header, 2, MPI_INT, domain.root_world_rank, domain.world_comm) == MPI_SUCCESS;
+        local_ok = bcastWorld(header,
+                      2,
+                      MPI_INT,
+                      domain.root_world_rank,
+                      domain.world_comm,
+                      "MoE CPU fallback transfer header broadcast");
 
         MoEExpertTransferMode mode = MoEExpertTransferMode::DenseFullSequence;
         if (local_ok && !decodeTransferMode(header[0], mode))
@@ -632,11 +734,12 @@ namespace
 
         if (!plan.token_rows.empty())
         {
-            local_ok = MPI_Bcast(plan.token_rows.data(),
-                                 static_cast<int>(plan.token_rows.size()),
-                                 MPI_INT,
-                                 domain.root_world_rank,
-                                 domain.world_comm) == MPI_SUCCESS;
+            local_ok = bcastWorld(plan.token_rows.data(),
+                                  static_cast<int>(plan.token_rows.size()),
+                                  MPI_INT,
+                                  domain.root_world_rank,
+                                  domain.world_comm,
+                                  "MoE CPU fallback sparse token-row broadcast");
         }
 
         return allRanksOk(domain.world_comm, local_ok);
@@ -785,7 +888,8 @@ namespace
         if (!allRanksOk(domain.world_comm, local_ok))
             return false;
 
-        MPI_Barrier(domain.world_comm);
+        if (!barrierWorld(domain.world_comm, "MoE CPU fallback output return pre-transfer barrier"))
+            return false;
 
         if (domain.root_domain_index < 0)
         {
@@ -796,7 +900,8 @@ namespace
                 local_ok = recvTensorWorld(output, first_participant, tag, domain.world_comm) && local_ok;
         }
 
-        MPI_Barrier(domain.world_comm);
+        if (!barrierWorld(domain.world_comm, "MoE CPU fallback output return post-transfer barrier"))
+            return false;
         return allRanksOk(domain.world_comm, local_ok);
     }
 
@@ -1055,7 +1160,8 @@ namespace
             result.tp_context = std::shared_ptr<IGlobalTPContext>(std::move(created));
         }
 
-        MPI_Barrier(config.world_comm);
+        if (!barrierWorld(config.world_comm, "MoE CPU fallback NodeLocalTP domain creation barrier"))
+            throw std::runtime_error("Timed out creating MoE CPU fallback NodeLocalTP domain");
         return result;
     }
 
@@ -1100,7 +1206,8 @@ namespace
         if (!allRanksOk(domain.world_comm, local_ok))
             return false;
 
-        MPI_Barrier(domain.world_comm);
+        if (!barrierWorld(domain.world_comm, "MoE CPU fallback input transfer pre-barrier"))
+            return false;
 
         const int first_participant = domain.world_ranks.front();
         if (domain.root_domain_index >= 0)
@@ -1135,7 +1242,8 @@ namespace
             }
         }
 
-        MPI_Barrier(domain.world_comm);
+        if (!barrierWorld(domain.world_comm, "MoE CPU fallback input transfer post-barrier"))
+            return false;
         return allRanksOk(domain.world_comm, local_ok);
     }
 
@@ -1150,7 +1258,8 @@ namespace
         if (!allRanksOk(domain.world_comm, local_ok))
             return false;
 
-        MPI_Barrier(domain.world_comm);
+        if (!barrierWorld(domain.world_comm, "MoE CPU fallback partial reduction pre-barrier"))
+            return false;
 
         if (domain.participates())
         {
@@ -1169,7 +1278,8 @@ namespace
                 local_ok = recvTensorWorld(partial, first_participant, tag, domain.world_comm) && local_ok;
         }
 
-        MPI_Barrier(domain.world_comm);
+        if (!barrierWorld(domain.world_comm, "MoE CPU fallback partial reduction post-barrier"))
+            return false;
         return allRanksOk(domain.world_comm, local_ok);
     }
 

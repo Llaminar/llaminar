@@ -191,7 +191,7 @@ namespace llaminar2
     NCCLCoordinator::~NCCLCoordinator()
     {
         LOG_DEBUG("[NCCLCoordinator] Destroying");
-        if (initialized_.load())
+        if (initialized_.load() || running_.load() || coordinator_thread_.joinable())
         {
             shutdown();
         }
@@ -280,7 +280,7 @@ namespace llaminar2
 
     void NCCLCoordinator::shutdown()
     {
-        if (!initialized_.load() && !running_.load())
+        if (!initialized_.load() && !running_.load() && !coordinator_thread_.joinable())
         {
             return;
         }

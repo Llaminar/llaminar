@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include "execution/moe/MoEExpertOverlayPreparationPlan.h"
+#include "execution/moe/MoEExpertOverlayExecutionPlan.h"
 #include "execution/moe/MoEExpertParallelPlanner.h"
 
 #include <algorithm>
@@ -109,7 +110,7 @@ TEST(Test__WeightManagerMoEExpertOverlayPreparation, BuildsTierAwareRequestsAndD
     EXPECT_FALSE(prep.shouldPrepare(DeviceId::cuda(0), 0, 1, Role::GATE));
     EXPECT_TRUE(prep.shouldPrepare(DeviceId::rocm(0), 0, 1, Role::UP));
     EXPECT_TRUE(prep.shouldPrepare(DeviceId::rocm(1), 0, 1, Role::UP));
-    EXPECT_FALSE(prep.shouldPrepare(DeviceId::cpu(), 0, 2, Role::GATE));
+    EXPECT_TRUE(prep.shouldPrepare(DeviceId::cpu(), 0, 2, Role::GATE));
     EXPECT_TRUE(prep.hasCpuRoutedAssignments());
 
     const auto devices = prep.acceleratorDevices();
@@ -138,6 +139,57 @@ TEST(Test__WeightManagerMoEExpertOverlayPreparation, BuildsTierAwareRequestsAndD
     EXPECT_FALSE(cpu_stats->accelerator);
     EXPECT_TRUE(cpu_stats->fallback);
     EXPECT_EQ(cpu_stats->assigned_routed_experts, 4u);
+
+    const auto *cpu_rank0_stats = prep.diagnostics().domainStats("cpu_cold", DeviceId::cpu(), 0, 0);
+    const auto *cpu_rank1_stats = prep.diagnostics().domainStats("cpu_cold", DeviceId::cpu(), 1, 1);
+    ASSERT_NE(cpu_rank0_stats, nullptr);
+    ASSERT_NE(cpu_rank1_stats, nullptr);
+    EXPECT_EQ(cpu_rank0_stats->residency_category, WeightResidencyCategory::CpuFallbackExpert);
+    EXPECT_EQ(cpu_rank1_stats->residency_category, WeightResidencyCategory::CpuFallbackExpert);
+    EXPECT_EQ(cpu_rank0_stats->assigned_routed_experts, cpu_rank1_stats->assigned_routed_experts);
+    EXPECT_NE(prep.diagnostics().render().find("memory_by_role"), std::string::npos);
+    EXPECT_NE(prep.diagnostics().render().find("routed_tier="), std::string::npos);
+    EXPECT_NE(prep.diagnostics().render().find("fallback="), std::string::npos);
+}
+
+TEST(Test__WeightManagerMoEExpertOverlayPreparation, FiltersRequestsByOverlayRankRoleAndParticipant)
+{
+    auto plan = std::make_shared<MoEExpertParallelPlan>(threeTierPlan({
+        ExpertLayerPlacement{.layer = 0, .routed_expert_tier = {0, 1, 2, 0, 1, 2}},
+    }));
+    auto runtime_plan = resolveMoEExpertOverlayRuntimePlan(plan);
+    const auto prep = MoEExpertOverlayPreparationPlan::build(*runtime_plan, 2048);
+    const auto execution_plan = resolveMoEExpertOverlayExecutionPlan(
+        plan,
+        MoEExpertOverlayExecutionPlanResolverOptions{
+            .current_world_rank = 0,
+            .world_size = 2,
+        });
+
+    const auto *rank0 = execution_plan.rankPlanFor(0);
+    const auto *rank1 = execution_plan.rankPlanFor(1);
+    ASSERT_NE(rank0, nullptr);
+    ASSERT_NE(rank1, nullptr);
+
+    const auto root_filtered = prep.filteredForRank(*rank0);
+    EXPECT_TRUE(root_filtered.hasAcceleratorRequests());
+    EXPECT_TRUE(root_filtered.shouldPrepare(DeviceId::cuda(0), 0, 0, Role::GATE));
+    EXPECT_TRUE(root_filtered.shouldPrepare(DeviceId::rocm(0), 0, 1, Role::GATE));
+    EXPECT_TRUE(root_filtered.shouldPrepare(DeviceId::cpu(), 0, 2, Role::GATE));
+    EXPECT_NE(root_filtered.requestForParticipant("cpu_cold", DeviceId::cpu(), 0, 0, 0, 2, Role::GATE), nullptr);
+    EXPECT_EQ(root_filtered.requestForParticipant("cpu_cold", DeviceId::cpu(), 1, 1, 0, 2, Role::GATE), nullptr);
+
+    const auto worker_filtered = prep.filteredForRank(*rank1);
+    EXPECT_FALSE(worker_filtered.hasAcceleratorRequests());
+    EXPECT_TRUE(worker_filtered.hasCpuRoutedAssignments());
+    EXPECT_FALSE(worker_filtered.shouldPrepare(DeviceId::cuda(0), 0, 0, Role::GATE));
+    EXPECT_FALSE(worker_filtered.shouldPrepare(DeviceId::rocm(0), 0, 1, Role::GATE));
+    EXPECT_TRUE(worker_filtered.shouldPrepare(DeviceId::cpu(), 0, 2, Role::GATE));
+    const auto *worker_request = worker_filtered.requestForParticipant("cpu_cold", DeviceId::cpu(), 1, 1, 0, 2, Role::GATE);
+    ASSERT_NE(worker_request, nullptr);
+    EXPECT_EQ(worker_request->residency_category, WeightResidencyCategory::WorkerFallbackExpert);
+    EXPECT_NE(worker_filtered.diagnostics().render().find("worker="), std::string::npos);
+    EXPECT_EQ(worker_filtered.diagnostics().render().find("AcceleratorRoutedExpert"), std::string::npos);
 }
 
 TEST(Test__WeightManagerMoEExpertOverlayPreparation, SmallModelBudgetKeepsCudaPartialUnlessUncapped)

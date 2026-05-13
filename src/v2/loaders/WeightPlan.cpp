@@ -47,11 +47,15 @@ namespace llaminar2
     {
         fort::utf8_table table;
         table.set_border_style(FT_DOUBLE2_STYLE);
-        table << fort::header << "Name" << "Role" << "Layer" << "PP" << "TP" << "Device" << "Prepared" << "Host" << fort::endr;
+        table << fort::header << "Name" << "Role" << "Residency" << "Domain" << "Part" << "Rank" << "Layer" << "PP" << "TP" << "Device" << "Prepared" << "Host" << fort::endr;
         for (const auto &req : requirements_)
         {
             table << req.canonical_name
                   << toString(req.role)
+                  << toString(req.residency_category)
+                  << (req.overlay_domain.empty() ? "-" : req.overlay_domain)
+                  << req.overlay_participant_index
+                  << req.overlay_participant_world_rank
                   << req.layer
                   << req.pp_stage
                   << req.tp_rank_or_device_index
@@ -157,12 +161,16 @@ namespace llaminar2
     {
         fort::utf8_table table;
         table.set_border_style(FT_DOUBLE2_STYLE);
-        table << fort::header << "Binding" << "Name" << "Role" << "Derivation" << "Layer" << "Device" << "Prepared" << "Host" << fort::endr;
+        table << fort::header << "Binding" << "Name" << "Role" << "Residency" << "Domain" << "Part" << "Rank" << "Derivation" << "Layer" << "Device" << "Prepared" << "Host" << fort::endr;
         for (const auto &binding : bindings_)
         {
             table << binding.binding_id
                   << binding.identity.canonical_name
                   << toString(binding.identity.role)
+                  << toString(binding.identity.residency_category)
+                  << (binding.identity.overlay_domain.empty() ? "-" : binding.identity.overlay_domain)
+                  << binding.identity.overlay_participant_index
+                  << binding.identity.overlay_participant_world_rank
                   << toString(binding.identity.derivation)
                   << binding.identity.layer
                   << binding.residency.home_device.to_string()

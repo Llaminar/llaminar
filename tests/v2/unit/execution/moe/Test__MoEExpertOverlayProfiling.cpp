@@ -19,56 +19,56 @@
 
 namespace llaminar2::test
 {
-    namespace
+namespace
+{
+    constexpr const char *kMoEProfilerEnvVars[] = {
+        "LLAMINAR_MOE_EP_DENSE_TRANSFER",
+        "LLAMINAR_MOE_EP_TRACE",
+        "LLAMINAR_MOE_EP_DUMP_PLACEMENT",
+        "LLAMINAR_MOE_EP_TRANSFER_TRACE",
+        "LLAMINAR_MOE_EP_PROFILE_CSV",
+    };
+
+    void clearMoEProfilerEnv()
     {
-        constexpr const char *kMoEProfilerEnvVars[] = {
-            "LLAMINAR_MOE_EP_DENSE_TRANSFER",
-            "LLAMINAR_MOE_EP_TRACE",
-            "LLAMINAR_MOE_EP_DUMP_PLACEMENT",
-            "LLAMINAR_MOE_EP_TRANSFER_TRACE",
-            "LLAMINAR_MOE_EP_PROFILE_CSV",
-        };
+        for (const char *name : kMoEProfilerEnvVars)
+            unsetenv(name);
+        mutableDebugEnv().reload();
+        MoEExpertOverlayProfiler::reset();
+    }
 
-        void clearMoEProfilerEnv()
-        {
-            for (const char *name : kMoEProfilerEnvVars)
-                unsetenv(name);
-            mutableDebugEnv().reload();
-            MoEExpertOverlayProfiler::reset();
-        }
+    struct MoEProfilerEnvGuard
+    {
+        MoEProfilerEnvGuard() { clearMoEProfilerEnv(); }
+        ~MoEProfilerEnvGuard() { clearMoEProfilerEnv(); }
+    };
 
-        struct MoEProfilerEnvGuard
-        {
-            MoEProfilerEnvGuard() { clearMoEProfilerEnv(); }
-            ~MoEProfilerEnvGuard() { clearMoEProfilerEnv(); }
-        };
+    MoEOverlayRuntimeDomain makeLocalTPDomain()
+    {
+        MoEOverlayRuntimeDomain domain;
+        domain.name = "gpu_fast";
+        domain.kind = ExpertDomainKind::LocalTP;
+        domain.backend = CollectiveBackendType::NCCL;
+        domain.compute_kind = ExpertDomainComputeKind::TensorParallelExperts;
+        domain.participants.resize(2);
+        domain.participants[0].participant_index = 0;
+        domain.participants[0].local_device = DeviceId::cuda(0);
+        domain.participants[1].participant_index = 1;
+        domain.participants[1].local_device = DeviceId::cuda(1);
+        return domain;
+    }
 
-        MoEOverlayRuntimeDomain makeLocalTPDomain()
-        {
-            MoEOverlayRuntimeDomain domain;
-            domain.name = "gpu_fast";
-            domain.kind = ExpertDomainKind::LocalTP;
-            domain.backend = CollectiveBackendType::NCCL;
-            domain.compute_kind = ExpertDomainComputeKind::TensorParallelExperts;
-            domain.participants.resize(2);
-            domain.participants[0].participant_index = 0;
-            domain.participants[0].local_device = DeviceId::cuda(0);
-            domain.participants[1].participant_index = 1;
-            domain.participants[1].local_device = DeviceId::cuda(1);
-            return domain;
-        }
-
-        ExpertComputeDomain makeCPUFallbackDomain()
-        {
-            ExpertComputeDomain domain;
-            domain.name = "cpu_safety";
-            domain.kind = ExpertDomainKind::NodeLocalTP;
-            domain.backend = CollectiveBackendType::MPI;
-            domain.compute_kind = ExpertDomainComputeKind::TensorParallelExperts;
-            domain.participants.resize(2);
-            return domain;
-        }
-    } // namespace
+    ExpertComputeDomain makeCPUFallbackDomain()
+    {
+        ExpertComputeDomain domain;
+        domain.name = "cpu_safety";
+        domain.kind = ExpertDomainKind::NodeLocalTP;
+        domain.backend = CollectiveBackendType::MPI;
+        domain.compute_kind = ExpertDomainComputeKind::TensorParallelExperts;
+        domain.participants.resize(2);
+        return domain;
+    }
+} // namespace
 
     TEST(Test__MoEExpertOverlayProfiling, DebugEnvParsesOverlayProfilerControls)
     {

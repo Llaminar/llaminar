@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <ctime>
+#include <exception>
 #include <random>
 #include <sstream>
 #include <iomanip>
@@ -144,6 +145,32 @@ namespace llaminar2
         const std::string &model_name)
         : runner_(runner), tokenizer_(tokenizer), model_name_(model_name)
     {
+    }
+
+    ChatCompletionResponse ChatCompletionHandler::handleUnhandledRequestException(
+        const char *phase,
+        const std::string &detail)
+    {
+        LOG_ERROR("[ChatCompletion] " << phase << " failed with unhandled exception: " << detail);
+        try
+        {
+            runner_.clearCache();
+        }
+        catch (const std::exception &cleanup_error)
+        {
+            LOG_ERROR("[ChatCompletion] request cleanup failed: " << cleanup_error.what());
+        }
+        catch (...)
+        {
+            LOG_ERROR("[ChatCompletion] request cleanup failed with unknown exception");
+        }
+
+        ChatCompletionResponse response;
+        response.ok = false;
+        response.http_status = 500;
+        json err = { {"error", {{"message", std::string("Request failed: ") + detail}, {"type", "server_error"}}} };
+        response.json_body = err.dump();
+        return response;
     }
 
     std::string ChatCompletionHandler::generateRequestId()
@@ -457,6 +484,7 @@ namespace llaminar2
 
     ChatCompletionResponse ChatCompletionHandler::handleRequest(
         const ChatCompletionRequest &request)
+    try
     {
         ChatCompletionResponse response;
         std::vector<int32_t> input_ids;
@@ -637,6 +665,14 @@ namespace llaminar2
         response.json_body = json_response.dump();
         return response;
     }
+    catch (const std::exception &e)
+    {
+        return handleUnhandledRequestException("non-streaming request", e.what());
+    }
+    catch (...)
+    {
+        return handleUnhandledRequestException("non-streaming request", "unknown exception");
+    }
 
     // =========================================================================
     // Streaming inference (SSE)
@@ -645,6 +681,7 @@ namespace llaminar2
     ChatCompletionResponse ChatCompletionHandler::handleStreamingRequest(
         const ChatCompletionRequest &request,
         const StreamChunkCallback &chunk_cb)
+    try
     {
         ChatCompletionResponse response;
         std::vector<int32_t> input_ids;
@@ -902,6 +939,14 @@ namespace llaminar2
         response.http_status = 200;
         return response;
     }
+    catch (const std::exception &e)
+    {
+        return handleUnhandledRequestException("streaming request", e.what());
+    }
+    catch (...)
+    {
+        return handleUnhandledRequestException("streaming request", "unknown exception");
+    }
 
     // =========================================================================
     // Convenience: parse + execute (routes to streaming if stream=true)
@@ -910,6 +955,7 @@ namespace llaminar2
     ChatCompletionResponse ChatCompletionHandler::handleRawRequest(
         const std::string &json_body,
         const StreamChunkCallback &stream_cb)
+    try
     {
         ChatCompletionResponse error;
         auto request = parseRequest(json_body, error);
@@ -920,6 +966,14 @@ namespace llaminar2
             return handleStreamingRequest(*request, stream_cb);
 
         return handleRequest(*request);
+    }
+    catch (const std::exception &e)
+    {
+        return handleUnhandledRequestException("raw request", e.what());
+    }
+    catch (...)
+    {
+        return handleUnhandledRequestException("raw request", "unknown exception");
     }
 
 } // namespace llaminar2

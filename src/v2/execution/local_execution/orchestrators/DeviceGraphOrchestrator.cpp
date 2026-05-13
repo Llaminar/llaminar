@@ -47,61 +47,18 @@
 namespace llaminar2
 {
 
-    static bool registerDomainTPComputeStreams(
-        const std::string &context,
-        ILocalTPContext &tp_context)
-    {
-        if (tp_context.degree() <= 1)
-            return true;
-
-        const auto &devices = tp_context.devices();
-        std::vector<void *> compute_streams;
-        compute_streams.reserve(devices.size());
-
-        for (const auto &device : devices)
-        {
-            DeviceId local_device = device.toLocalDeviceId();
-            if (!local_device.is_gpu())
-            {
-                LOG_DEBUG(context << ": skipping compute stream registration for non-GPU device "
-                                  << device.toString());
-                return true;
-            }
-
-            try
-            {
-                compute_streams.push_back(
-                    GPUDeviceContextPool::instance().getContext(local_device).defaultStream());
-            }
-            catch (const std::exception &e)
-            {
-                LOG_ERROR(context << ": failed to get compute stream for "
-                                  << local_device.toString() << ": " << e.what());
-                return false;
-            }
-        }
-
-        if (!compute_streams.empty())
-        {
-            tp_context.setComputeStreams(compute_streams);
-            LOG_INFO(context << ": registered " << compute_streams.size()
-                             << " compute streams for event-based LocalTP collective sync");
-        }
-        return true;
-    }
-
     // =========================================================================
     // Shared Executor Configuration
     // =========================================================================
 
     void DeviceGraphOrchestrator::configureExecutor()
     {
-        GraphExecutorConfig exec_config;
+        GraphExecutorConfig exec_config = graph_builder_->config().executor_config;
         exec_config.default_device = graph_builder_->config().default_device;
 
         const auto &env = debugEnv();
-        exec_config.enable_profiling = graph_builder_->config().enable_profiling || env.execution.executor_profiling;
-        exec_config.enable_validation = graph_builder_->config().enable_validation;
+        exec_config.enable_profiling = exec_config.enable_profiling || graph_builder_->config().enable_profiling || env.execution.executor_profiling;
+        exec_config.enable_validation = exec_config.enable_validation || graph_builder_->config().enable_validation;
 
         if (env.execution.execution_mode == "parallel")
         {
@@ -172,12 +129,12 @@ namespace llaminar2
           kv_rotation_(std::move(deps.kv_rotation)),
           pp_stage_config_(std::move(deps.pp_stage_config)),
           pipeline_config_(std::move(deps.pipeline_config)),
+          domain_tp_contexts_(std::move(deps.domain_tp_contexts)),
           weight_streamer_(std::move(deps.weight_streamer)),
           weight_manager_(std::move(deps.weight_manager)),
           weight_placement_map_(std::move(deps.weight_placement_map)),
           tp_config_(std::move(deps.tp_config)),
-          domain_config_(std::move(deps.domain_config)),
-          domain_tp_contexts_(std::move(deps.domain_tp_contexts))
+          domain_config_(std::move(deps.domain_config))
     {
         if (!injected_model_ctx_)
         {
@@ -189,18 +146,15 @@ namespace llaminar2
             throw std::invalid_argument("DeviceGraphOrchestrator Dependencies requires a valid graph_builder");
         }
 
-        for (const auto &[name, ctx] : domain_tp_contexts_)
+        configureExecutor();
+
+        for (auto &[name, ctx] : domain_tp_contexts_)
         {
             if (ctx)
-            {
-                registerDomainTPComputeStreams(
-                    "[DeviceGraphOrchestrator] domain TP context '" + name + "'",
-                    *ctx);
                 graph_builder_->setTPContext(name, ctx.get());
-            }
         }
-
-        configureExecutor();
+        if (!domain_tp_contexts_.empty())
+            tp_contexts_initialized_ = true;
 
         // Propagate MPI rank to executor for stage dumping (from injected topology)
         if (injected_topology_)
@@ -230,8 +184,7 @@ namespace llaminar2
                  << ", collective=" << (injected_collective_ctx_ ? "provided" : "none")
                  << ", turboquant=" << (turboquant_ctx_ ? "provided" : "none")
                  << ", pp_stage=" << (pp_stage_config_.has_value() ? "configured" : "none")
-                 << ", pipeline=" << (pipeline_config_ ? "provided" : "none")
-                 << ", domain_tp_contexts=" << domain_tp_contexts_.size());
+                 << ", pipeline=" << (pipeline_config_ ? "provided" : "none"));
     }
 
     DeviceGraphOrchestrator::DeviceGraphOrchestrator(
@@ -321,7 +274,8 @@ namespace llaminar2
             for (int i = first_layer; i < last_layer; ++i)
                 (*resolved)[i] = weights.get_layer_weights(i);
 
-            frozen_weights.get_layer_weights = [resolved](int layer_idx) -> LayerWeights {
+            frozen_weights.get_layer_weights = [resolved](int layer_idx) -> LayerWeights
+            {
                 auto it = resolved->find(layer_idx);
                 if (it != resolved->end())
                     return it->second;
@@ -344,7 +298,7 @@ namespace llaminar2
             }
 
             LOG_DEBUG("[DeviceGraphOrchestrator] Model weights frozen for " << n_layers
-                      << " layers [" << first_layer << ", " << last_layer << ")");
+                                                                            << " layers [" << first_layer << ", " << last_layer << ")");
         }
         else
         {
@@ -397,7 +351,8 @@ namespace llaminar2
         ModelWeightSetBuilder builder(strategy);
 
         // Global weights
-        auto addGlobal = [&](TensorBase *tensor, const std::string &name, WeightRole role) {
+        auto addGlobal = [&](TensorBase *tensor, const std::string &name, WeightRole role)
+        {
             if (!tensor)
                 return;
             WeightIdentity id;
@@ -423,7 +378,8 @@ namespace llaminar2
                 continue;
             const auto &lw = it->second;
 
-            auto addLayer = [&](TensorBase *tensor, const std::string &suffix, WeightRole role) {
+            auto addLayer = [&](TensorBase *tensor, const std::string &suffix, WeightRole role)
+            {
                 if (!tensor)
                     return;
                 std::string canonical = "blk." + std::to_string(layer_idx) + "." + suffix;
@@ -1120,8 +1076,8 @@ namespace llaminar2
         {
             const float *input = buffers.current_hidden->fp32_data();
             LOG_TRACE("[ORCH_ATTN_INPUT] layer=" << layer_idx << " seq_len=" << seq_len
-                                                << " input[0:4]=" << input[0] << "," << input[1]
-                                                << "," << input[2] << "," << input[3]);
+                                                 << " input[0:4]=" << input[0] << "," << input[1]
+                                                 << "," << input[2] << "," << input[3]);
         }
 
         // Get device context
@@ -1241,8 +1197,8 @@ namespace llaminar2
         {
             const float *output = buffers.current_hidden->fp32_data();
             LOG_TRACE("[ORCH_ATTN_OUTPUT] layer=" << layer_idx << " seq_len=" << seq_len
-                                                 << " output[0:4]=" << output[0] << "," << output[1]
-                                                 << "," << output[2] << "," << output[3]);
+                                                  << " output[0:4]=" << output[0] << "," << output[1]
+                                                  << "," << output[2] << "," << output[3]);
         }
 
         if (!success)
@@ -1366,7 +1322,7 @@ namespace llaminar2
         DeviceId device)
     {
         LOG_TRACE("[DeviceGraphOrchestrator::executeLayer] LAYER_EXEC_ENTERED layer_idx="
-                 << layer_idx << " seq_len=" << seq_len);
+                  << layer_idx << " seq_len=" << seq_len);
 
         // =====================================================================
         // Weight Streaming Hooks (Option B)
@@ -2122,7 +2078,7 @@ namespace llaminar2
     }
 
     bool DeviceGraphOrchestrator::applyPenaltiesOnDevice(const std::vector<LogitPenalty> &penalties,
-                                                          int vocab_size)
+                                                         int vocab_size)
     {
         if (penalties.empty())
             return true; // Nothing to apply, success
@@ -2333,7 +2289,8 @@ namespace llaminar2
         {
             forward_engine_->forEachCachedStage(
                 ComputeStageType::MOE_EXPERT_FFN,
-                [&](IComputeStage*) { ++moe_stage_count; });
+                [&](IComputeStage *)
+                { ++moe_stage_count; });
         }
 
         if (moe_stage_count == 0)
@@ -2349,8 +2306,9 @@ namespace llaminar2
         int wired = 0;
         forward_engine_->forEachCachedStage(
             ComputeStageType::MOE_EXPERT_FFN,
-            [&](IComputeStage* s) {
-                auto* moe = dynamic_cast<MoEExpertComputeStage*>(s);
+            [&](IComputeStage *s)
+            {
+                auto *moe = dynamic_cast<MoEExpertComputeStage *>(s);
                 if (moe)
                 {
                     moe->setPayloadProvider(expert_payload_provider_.get());
@@ -2417,10 +2375,12 @@ namespace llaminar2
                 next_binding_id = std::max(next_binding_id, binding.binding_id + 1);
         }
 
-        auto register_if_prepared = [&](const WeightBinding &source_binding) {
+        auto register_if_prepared = [&](const WeightBinding &source_binding)
+        {
             const std::string &name = source_binding.identity.canonical_name;
             TensorBase *tensor = source_binding.tensor;
-            if (!tensor) return;
+            if (!tensor)
+                return;
 
             WeightBinding binding = source_binding;
 
@@ -2486,7 +2446,7 @@ namespace llaminar2
                     ++registered;
                 }
             }
-            catch (const std::exception& e)
+            catch (const std::exception &e)
             {
                 LOG_WARN("[DGO] Failed to register prepared weight '"
                          << name << "' in store: " << e.what());
@@ -2504,20 +2464,20 @@ namespace llaminar2
         else
         {
             // Fallback for non-frozen legacy graph setup.
-            weight_manager_->forEachPreparedWeight([&](const std::string& name, TensorBase* tensor) {
+            weight_manager_->forEachPreparedWeight([&](const std::string &name, TensorBase *tensor)
+                                                   {
                 WeightBinding binding;
                 binding.binding_id = next_binding_id++;
                 binding.identity.canonical_name = name;
                 binding.identity.role = inferWeightRole(name);
                 binding.identity.layer = inferWeightLayer(name);
                 binding.tensor = tensor;
-                register_if_prepared(binding);
-            });
+                register_if_prepared(binding); });
         }
 
         LOG_INFO("[DGO] Prepared weight store initialized with "
-             << prepared_weight_store_->size() << " entries for device " << device.toString()
-             << " (new=" << registered << ")");
+                 << prepared_weight_store_->size() << " entries for device " << device.toString()
+                 << " (new=" << registered << ")");
 
         // Phase 10: Wire prepared weight store to graph builder so stages
         // can resolve kernels through the store instead of KernelFactory fallbacks.
@@ -2528,8 +2488,8 @@ namespace llaminar2
     }
 
     void DeviceGraphOrchestrator::applyExpertMasks(
-        const std::vector<std::vector<bool>>& masks,
-        const ReceivedWeightsMap& received_weights)
+        const std::vector<std::vector<bool>> &masks,
+        const ReceivedWeightsMap &received_weights)
     {
         auto t_start = std::chrono::high_resolution_clock::now();
 
@@ -2540,8 +2500,9 @@ namespace llaminar2
         }
 
         // ── Step 1: Collect all MoE stages ──────────────────────────────
-        struct StageInfo {
-            MoEExpertComputeStage* stage;
+        struct StageInfo
+        {
+            MoEExpertComputeStage *stage;
             int layer;
         };
         std::vector<StageInfo> moe_stages;
@@ -2550,9 +2511,11 @@ namespace llaminar2
         {
             forward_engine_->forEachCachedStage(
                 ComputeStageType::MOE_EXPERT_FFN,
-                [&](IComputeStage* s) {
-                    auto* moe = dynamic_cast<MoEExpertComputeStage*>(s);
-                    if (!moe) return;
+                [&](IComputeStage *s)
+                {
+                    auto *moe = dynamic_cast<MoEExpertComputeStage *>(s);
+                    if (!moe)
+                        return;
                     int layer = moe->layerIndex();
                     if (layer >= 0 && static_cast<size_t>(layer) < masks.size())
                         moe_stages.push_back({moe, layer});
@@ -2564,23 +2527,26 @@ namespace llaminar2
         {
             for (size_t layer = 0; layer < layer_graph_cache_.size() && layer < masks.size(); ++layer)
             {
-                auto& cache = layer_graph_cache_[layer];
-                if (!cache.valid || !cache.ffn_decode) continue;
-                for (const auto& node_name : cache.ffn_decode->getExecutionOrder())
+                auto &cache = layer_graph_cache_[layer];
+                if (!cache.valid || !cache.ffn_decode)
+                    continue;
+                for (const auto &node_name : cache.ffn_decode->getExecutionOrder())
                 {
-                    auto* node = cache.ffn_decode->getNode(node_name);
-                    if (!node || !node->stage) continue;
+                    auto *node = cache.ffn_decode->getNode(node_name);
+                    if (!node || !node->stage)
+                        continue;
                     if (node->stage->type() == ComputeStageType::MOE_EXPERT_FFN)
                     {
-                        auto* moe = dynamic_cast<MoEExpertComputeStage*>(node->stage.get());
-                        if (moe) moe_stages.push_back({moe, static_cast<int>(layer)});
+                        auto *moe = dynamic_cast<MoEExpertComputeStage *>(node->stage.get());
+                        if (moe)
+                            moe_stages.push_back({moe, static_cast<int>(layer)});
                     }
                 }
             }
         }
 
         // ── Step 2: Phase 1 — release departed experts ─────────────────
-        for (auto& [stage, layer] : moe_stages)
+        for (auto &[stage, layer] : moe_stages)
         {
             (void)stage->releaseDepartedExperts(masks[layer]);
         }
@@ -2589,11 +2555,11 @@ namespace llaminar2
         std::atomic<int> applied{0};
         const int n = static_cast<int>(moe_stages.size());
 
-        #pragma omp parallel for schedule(dynamic)
+#pragma omp parallel for schedule(dynamic)
         for (int i = 0; i < n; ++i)
         {
-            auto& [stage, layer] = moe_stages[i];
-            const std::unordered_map<int, ExpertWeightBlobs>* layer_received = nullptr;
+            auto &[stage, layer] = moe_stages[i];
+            const std::unordered_map<int, ExpertWeightBlobs> *layer_received = nullptr;
             auto layer_it = received_weights.find(layer);
             if (layer_it != received_weights.end())
                 layer_received = &layer_it->second;
@@ -2603,11 +2569,11 @@ namespace llaminar2
         }
 
         // ── Step 5: Phase 3 — apply masks (fast, no heavy ops) ─────────
-        for (auto& [stage, layer] : moe_stages)
+        for (auto &[stage, layer] : moe_stages)
             stage->applyExpertMask(masks[layer]);
 
         LOG_INFO("[DGO] Applied expert masks to " << applied.load()
-                 << " MoEExpertComputeStages across " << masks.size() << " layers");
+                                                  << " MoEExpertComputeStages across " << masks.size() << " layers");
 
         auto t_end = std::chrono::high_resolution_clock::now();
         double prep_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
@@ -2618,17 +2584,18 @@ namespace llaminar2
     }
 
     ReceivedWeightsMap DeviceGraphOrchestrator::collectExpertWeightsForMasks(
-        const std::vector<std::vector<bool>>& masks) const
+        const std::vector<std::vector<bool>> &masks) const
     {
         ReceivedWeightsMap result;
 
-        std::unordered_map<int, const MoEExpertComputeStage*> moe_by_layer;
+        std::unordered_map<int, const MoEExpertComputeStage *> moe_by_layer;
         if (forward_engine_)
         {
             forward_engine_->forEachCachedStage(
                 ComputeStageType::MOE_EXPERT_FFN,
-                [&](IComputeStage* stage) {
-                    const auto* moe_stage = dynamic_cast<const MoEExpertComputeStage*>(stage);
+                [&](IComputeStage *stage)
+                {
+                    const auto *moe_stage = dynamic_cast<const MoEExpertComputeStage *>(stage);
                     if (moe_stage && moe_stage->layerIndex() >= 0)
                         moe_by_layer[moe_stage->layerIndex()] = moe_stage;
                 });
@@ -2637,12 +2604,14 @@ namespace llaminar2
         for (size_t layer_idx = 0; layer_idx < masks.size(); ++layer_idx)
         {
             auto stage_it = moe_by_layer.find(static_cast<int>(layer_idx));
-            if (stage_it == moe_by_layer.end()) continue;
+            if (stage_it == moe_by_layer.end())
+                continue;
 
-            const auto& mask = masks[layer_idx];
+            const auto &mask = masks[layer_idx];
             for (size_t expert_idx = 0; expert_idx < mask.size(); ++expert_idx)
             {
-                if (!mask[expert_idx]) continue;
+                if (!mask[expert_idx])
+                    continue;
                 auto blobs = stage_it->second->serializeExpert(static_cast<int>(expert_idx));
                 if (!blobs.empty())
                     result[static_cast<int>(layer_idx)][static_cast<int>(expert_idx)] = std::move(blobs);
@@ -2653,17 +2622,19 @@ namespace llaminar2
     }
 
     void DeviceGraphOrchestrator::setExpertReplicaSet(
-        const ExpertReplicaSet& replicas, int socket_id)
+        const ExpertReplicaSet &replicas, int socket_id)
     {
-        if (replicas.num_replicated == 0) return;
+        if (replicas.num_replicated == 0)
+            return;
 
         int count = 0;
         if (forward_engine_)
         {
             forward_engine_->forEachCachedStage(
                 ComputeStageType::MOE_EXPERT_FFN,
-                [&](IComputeStage* s) {
-                    auto* moe = dynamic_cast<MoEExpertComputeStage*>(s);
+                [&](IComputeStage *s)
+                {
+                    auto *moe = dynamic_cast<MoEExpertComputeStage *>(s);
                     if (moe)
                     {
                         moe->setReplicaSet(replicas, socket_id);
@@ -2673,7 +2644,7 @@ namespace llaminar2
         }
 
         LOG_INFO("[DGO] Set expert replica info (" << replicas.num_replicated
-                 << " replicas) on " << count << " MoE stages (socket " << socket_id << ")");
+                                                   << " replicas) on " << count << " MoE stages (socket " << socket_id << ")");
     }
 
     size_t DeviceGraphOrchestrator::releaseRawExpertWeights()
@@ -2685,8 +2656,9 @@ namespace llaminar2
         {
             forward_engine_->forEachCachedStage(
                 ComputeStageType::MOE_EXPERT_FFN,
-                [&](IComputeStage* s) {
-                    auto* moe = dynamic_cast<MoEExpertComputeStage*>(s);
+                [&](IComputeStage *s)
+                {
+                    auto *moe = dynamic_cast<MoEExpertComputeStage *>(s);
                     if (moe)
                     {
                         total_freed += moe->releaseRawExpertWeights();
@@ -2696,27 +2668,29 @@ namespace llaminar2
         }
 
         LOG_INFO("[DGO] Released raw expert weights across " << stage_count
-                 << " MoE stages: " << (total_freed >> 20) << " MB freed");
+                                                             << " MoE stages: " << (total_freed >> 20) << " MB freed");
         return total_freed;
     }
 
     ReceivedWeightsMap DeviceGraphOrchestrator::transferExpertWeights(
-        const std::vector<ExpertMigration>& manifest,
+        const std::vector<ExpertMigration> &manifest,
         int num_layers)
     {
-        if (manifest.empty() || !mpi_ctx_) return {};
+        if (manifest.empty() || !mpi_ctx_)
+            return {};
 
         int my_rank = mpi_ctx_->rank();
         MPI_Comm comm = mpi_ctx_->communicator();
 
         // Collect MoE stages by layer from forward engine's graph cache.
-        std::unordered_map<int, MoEExpertComputeStage*> moe_by_layer;
+        std::unordered_map<int, MoEExpertComputeStage *> moe_by_layer;
         if (forward_engine_)
         {
             forward_engine_->forEachCachedStage(
                 ComputeStageType::MOE_EXPERT_FFN,
-                [&](IComputeStage* stage) {
-                    auto* moe_stage = dynamic_cast<MoEExpertComputeStage*>(stage);
+                [&](IComputeStage *stage)
+                {
+                    auto *moe_stage = dynamic_cast<MoEExpertComputeStage *>(stage);
                     if (moe_stage && moe_stage->layerIndex() >= 0)
                         moe_by_layer[moe_stage->layerIndex()] = moe_stage;
                 });
@@ -2727,15 +2701,17 @@ namespace llaminar2
         {
             for (size_t layer_idx = 0; layer_idx < layer_graph_cache_.size(); ++layer_idx)
             {
-                auto& cache = layer_graph_cache_[layer_idx];
-                if (!cache.valid || !cache.ffn_decode) continue;
-                for (const auto& node_name : cache.ffn_decode->getExecutionOrder())
+                auto &cache = layer_graph_cache_[layer_idx];
+                if (!cache.valid || !cache.ffn_decode)
+                    continue;
+                for (const auto &node_name : cache.ffn_decode->getExecutionOrder())
                 {
-                    auto* node = cache.ffn_decode->getNode(node_name);
-                    if (!node || !node->stage) continue;
+                    auto *node = cache.ffn_decode->getNode(node_name);
+                    if (!node || !node->stage)
+                        continue;
                     if (node->stage->type() == ComputeStageType::MOE_EXPERT_FFN)
                     {
-                        auto* moe_stage = dynamic_cast<MoEExpertComputeStage*>(node->stage.get());
+                        auto *moe_stage = dynamic_cast<MoEExpertComputeStage *>(node->stage.get());
                         if (moe_stage)
                             moe_by_layer[static_cast<int>(layer_idx)] = moe_stage;
                     }
@@ -2744,11 +2720,13 @@ namespace llaminar2
         }
 
         LOG_DEBUG("[DGO] Found " << moe_by_layer.size() << " MoE stages for weight transfer"
-                 << " (forward_engine=" << (forward_engine_ ? "yes" : "no") << ")");
+                                 << " (forward_engine=" << (forward_engine_ ? "yes" : "no") << ")");
 
-        auto get_blobs = [&](int layer_idx, int expert_id) -> ExpertWeightBlobs {
+        auto get_blobs = [&](int layer_idx, int expert_id) -> ExpertWeightBlobs
+        {
             auto it = moe_by_layer.find(layer_idx);
-            if (it == moe_by_layer.end()) return {};
+            if (it == moe_by_layer.end())
+                return {};
             return it->second->detachAndSerializeExpert(expert_id);
         };
 
@@ -2756,7 +2734,7 @@ namespace llaminar2
     }
 
     ReceivedWeightsMap DeviceGraphOrchestrator::transferReplicaWeights(
-        const ExpertReplicaSet& replicas,
+        const ExpertReplicaSet &replicas,
         int num_layers)
     {
         if (replicas.num_replicated == 0 || !mpi_ctx_)
@@ -2771,7 +2749,8 @@ namespace llaminar2
         std::vector<ExpertMigration> manifest;
         for (int e = 0; e < static_cast<int>(replicas.is_replicated.size()); ++e)
         {
-            if (!replicas.is_replicated[e]) continue;
+            if (!replicas.is_replicated[e])
+                continue;
             int owner = replicas.owner_socket[e];
             // Owner sends to every other rank
             for (int r = 0; r < world_size; ++r)
@@ -2785,25 +2764,28 @@ namespace llaminar2
             return {};
 
         LOG_INFO("[DGO] Transferring " << replicas.num_replicated
-                 << " replicated experts × " << num_layers << " layers via MPI");
+                                       << " replicated experts × " << num_layers << " layers via MPI");
 
         // Collect MoE stages by layer
-        std::unordered_map<int, MoEExpertComputeStage*> moe_by_layer;
+        std::unordered_map<int, MoEExpertComputeStage *> moe_by_layer;
         if (forward_engine_)
         {
             forward_engine_->forEachCachedStage(
                 ComputeStageType::MOE_EXPERT_FFN,
-                [&](IComputeStage* stage) {
-                    auto* moe_stage = dynamic_cast<MoEExpertComputeStage*>(stage);
+                [&](IComputeStage *stage)
+                {
+                    auto *moe_stage = dynamic_cast<MoEExpertComputeStage *>(stage);
                     if (moe_stage && moe_stage->layerIndex() >= 0)
                         moe_by_layer[moe_stage->layerIndex()] = moe_stage;
                 });
         }
 
         // Non-destructive serialize callback — owner keeps its weights
-        auto get_blobs = [&](int layer_idx, int expert_id) -> ExpertWeightBlobs {
+        auto get_blobs = [&](int layer_idx, int expert_id) -> ExpertWeightBlobs
+        {
             auto it = moe_by_layer.find(layer_idx);
-            if (it == moe_by_layer.end()) return {};
+            if (it == moe_by_layer.end())
+                return {};
             return it->second->serializeExpert(expert_id);
         };
 
@@ -3190,39 +3172,16 @@ namespace llaminar2
         }
     }
 
-    void DeviceGraphOrchestrator::setDomainTPContexts(
-        std::map<std::string, std::shared_ptr<ILocalTPContext>> contexts)
+    void DeviceGraphOrchestrator::setDomainTPContexts(std::map<std::string, std::shared_ptr<ILocalTPContext>> contexts)
     {
-        for (auto &[name, ctx] : contexts)
+        domain_tp_contexts_ = std::move(contexts);
+        for (auto &[name, ctx] : domain_tp_contexts_)
         {
-            if (!ctx)
-            {
-                LOG_WARN("[DeviceGraphOrchestrator] Ignoring null domain TP context for domain '"
-                         << name << "'");
-                continue;
-            }
-
-            auto existing = domain_tp_contexts_.find(name);
-            if (existing != domain_tp_contexts_.end() && existing->second)
-            {
-                LOG_DEBUG("[DeviceGraphOrchestrator] Preserving existing domain TP context for domain '"
-                          << name << "'");
-                continue;
-            }
-
-            if (!registerDomainTPComputeStreams(
-                    "[DeviceGraphOrchestrator] domain TP context '" + name + "'",
-                    *ctx))
-            {
-                LOG_WARN("[DeviceGraphOrchestrator] Retaining domain TP context for domain '"
-                         << name << "' without registered compute streams");
-            }
-
-            graph_builder_->setTPContext(name, ctx.get());
-            domain_tp_contexts_[name] = std::move(ctx);
-            LOG_DEBUG("[DeviceGraphOrchestrator] Retained domain TP context for domain '"
-                      << name << "'");
+            if (ctx)
+                graph_builder_->setTPContext(name, ctx.get());
         }
+        if (!domain_tp_contexts_.empty())
+            tp_contexts_initialized_ = true;
     }
 
     bool DeviceGraphOrchestrator::initializePPContexts()
@@ -3411,21 +3370,6 @@ namespace llaminar2
                 continue;
             }
 
-            auto existing = domain_tp_contexts_.find(domain.name);
-            if (existing != domain_tp_contexts_.end() && existing->second)
-            {
-                if (!registerDomainTPComputeStreams(
-                        "[DeviceGraphOrchestrator] domain TP context '" + domain.name + "'",
-                        *existing->second))
-                {
-                    return false;
-                }
-                graph_builder_->setTPContext(domain.name, existing->second.get());
-                LOG_DEBUG("[DeviceGraphOrchestrator] Reusing preconfigured TP context for domain '"
-                          << domain.name << "'");
-                continue;
-            }
-
             // Convert DeviceId to GlobalDeviceAddress
             std::vector<GlobalDeviceAddress> addresses;
             for (const auto &dev : domain.devices)
@@ -3445,15 +3389,7 @@ namespace llaminar2
                 return false;
             }
 
-            auto shared_tp_ctx = std::shared_ptr<ILocalTPContext>(std::move(tp_ctx));
-            if (!registerDomainTPComputeStreams(
-                    "[DeviceGraphOrchestrator] domain TP context '" + domain.name + "'",
-                    *shared_tp_ctx))
-            {
-                return false;
-            }
-
-            domain_tp_contexts_[domain.name] = std::move(shared_tp_ctx);
+            domain_tp_contexts_[domain.name] = std::shared_ptr<ILocalTPContext>(std::move(tp_ctx));
 
             LOG_DEBUG("[DeviceGraphOrchestrator] Created TP context for domain '" << domain.name
                                                                                   << "': " << domain.devices.size() << " devices, backend="

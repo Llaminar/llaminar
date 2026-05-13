@@ -46,6 +46,7 @@ namespace llaminar2
             const MoEExpertDispatchOutput *dispatch_output = nullptr;
             std::shared_ptr<MoEExpertDispatchOutput> dispatch_output_lifetime;
             int dispatch_tier_index = -1;
+            std::shared_ptr<const MoECPUFallbackDomainContext> domain_context;
             PreparedWeightStore *prepared_store = nullptr;
             MoECPUFallbackTensorParallelStats *tensor_parallel_stats = nullptr;
             MoECPUFallbackTransferStats *transfer_stats = nullptr;

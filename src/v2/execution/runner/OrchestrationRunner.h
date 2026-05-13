@@ -37,6 +37,7 @@
 #include <memory>
 #include <mutex>
 #include <atomic>
+#include <utility>
 
 namespace llaminar2
 {
@@ -277,6 +278,10 @@ namespace llaminar2
          * @brief Signal workers to exit their loops.
          */
         void shutdownMPIWorkers() override;
+        void setMoEExpertOverlayMPIContext(std::shared_ptr<IMPIContext> mpi_ctx) override
+        {
+            moe_expert_overlay_mpi_ctx_ = std::move(mpi_ctx);
+        }
 
         /**
          * @brief Enable MPI coordinated mode.
@@ -422,6 +427,7 @@ namespace llaminar2
         // Dependencies (injected or created)
         std::unique_ptr<IExecutionPlanBuilder> plan_builder_;
         std::shared_ptr<IMPIContext> mpi_ctx_;
+        std::shared_ptr<IMPIContext> moe_expert_overlay_mpi_ctx_;
         std::shared_ptr<ModelContext> model_ctx_;
         std::unique_ptr<ILocalTPContext> local_tp_ctx_;
         std::unique_ptr<ILocalPPContext> local_pp_ctx_;

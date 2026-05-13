@@ -14,107 +14,108 @@
 
 #include <algorithm>
 #include <chrono>
+#include <optional>
 #include <stdexcept>
 #include <utility>
 
 namespace llaminar2
 {
-    namespace
+namespace
+{
+    MPI_Comm resolveWorldComm(const IMPIContext *mpi_ctx)
     {
-        MPI_Comm resolveWorldComm(const IMPIContext *mpi_ctx)
+        if (mpi_ctx && mpi_ctx->communicator() != MPI_COMM_NULL)
+            return mpi_ctx->communicator();
+        return MPI_COMM_WORLD;
+    }
+
+    bool validateShape2D(const TensorBase *tensor, int rows, int cols, const char *name)
+    {
+        if (!tensor)
         {
-            if (mpi_ctx && mpi_ctx->communicator() != MPI_COMM_NULL)
-                return mpi_ctx->communicator();
-            return MPI_COMM_WORLD;
+            LOG_ERROR("[MoEExpertOverlayCPUFallbackStage] Null " << name << " tensor");
+            return false;
+        }
+        const auto &shape = tensor->shape();
+        if (shape.size() != 2 || shape[0] < static_cast<size_t>(rows) || shape[1] != static_cast<size_t>(cols))
+        {
+            LOG_ERROR("[MoEExpertOverlayCPUFallbackStage] " << name << " shape mismatch: got rank "
+                      << shape.size() << ", expected at least [" << rows << ", " << cols << "]");
+            return false;
+        }
+        return true;
+    }
+
+    const MoEExpertTierDispatch *resolveDispatchTier(
+        const MoEExpertOverlayCPUFallbackStage::Params &params)
+    {
+        if (!params.dispatch_output)
+            return nullptr;
+        if (params.dispatch_tier_index < 0 ||
+            params.dispatch_tier_index >= static_cast<int>(params.dispatch_output->tiers.size()))
+        {
+            LOG_ERROR("[MoEExpertOverlayCPUFallbackStage] Dispatch tier index "
+                      << params.dispatch_tier_index << " is outside descriptor tier count "
+                      << params.dispatch_output->tiers.size());
+            return nullptr;
         }
 
-        bool validateShape2D(const TensorBase *tensor, int rows, int cols, const char *name)
+        if (params.dispatch_output->seq_len != params.seq_len ||
+            params.dispatch_output->top_k != params.top_k ||
+            params.dispatch_output->d_model != params.d_model)
         {
-            if (!tensor)
-            {
-                LOG_ERROR("[MoEExpertOverlayCPUFallbackStage] Null " << name << " tensor");
-                return false;
-            }
-            const auto &shape = tensor->shape();
-            if (shape.size() != 2 || shape[0] < static_cast<size_t>(rows) || shape[1] != static_cast<size_t>(cols))
-            {
-                LOG_ERROR("[MoEExpertOverlayCPUFallbackStage] " << name << " shape mismatch: got rank "
-                                                                << shape.size() << ", expected at least [" << rows << ", " << cols << "]");
-                return false;
-            }
-            return true;
+            LOG_ERROR("[MoEExpertOverlayCPUFallbackStage] Dispatch descriptor dimension mismatch for domain '"
+                      << params.domain.name << "': descriptor seq_len=" << params.dispatch_output->seq_len
+                      << " top_k=" << params.dispatch_output->top_k
+                      << " d_model=" << params.dispatch_output->d_model
+                      << " stage seq_len=" << params.seq_len
+                      << " top_k=" << params.top_k
+                      << " d_model=" << params.d_model);
+            return nullptr;
         }
 
-        const MoEExpertTierDispatch *resolveDispatchTier(
-            const MoEExpertOverlayCPUFallbackStage::Params &params)
+        const auto &tier = params.dispatch_output->tiers[static_cast<size_t>(params.dispatch_tier_index)];
+        if (tier.domain != params.domain.name)
         {
-            if (!params.dispatch_output)
-                return nullptr;
-            if (params.dispatch_tier_index < 0 ||
-                params.dispatch_tier_index >= static_cast<int>(params.dispatch_output->tiers.size()))
-            {
-                LOG_ERROR("[MoEExpertOverlayCPUFallbackStage] Dispatch tier index "
-                          << params.dispatch_tier_index << " is outside descriptor tier count "
-                          << params.dispatch_output->tiers.size());
-                return nullptr;
-            }
-
-            if (params.dispatch_output->seq_len != params.seq_len ||
-                params.dispatch_output->top_k != params.top_k ||
-                params.dispatch_output->d_model != params.d_model)
-            {
-                LOG_ERROR("[MoEExpertOverlayCPUFallbackStage] Dispatch descriptor dimension mismatch for domain '"
-                          << params.domain.name << "': descriptor seq_len=" << params.dispatch_output->seq_len
-                          << " top_k=" << params.dispatch_output->top_k
-                          << " d_model=" << params.dispatch_output->d_model
-                          << " stage seq_len=" << params.seq_len
-                          << " top_k=" << params.top_k
-                          << " d_model=" << params.d_model);
-                return nullptr;
-            }
-
-            const auto &tier = params.dispatch_output->tiers[static_cast<size_t>(params.dispatch_tier_index)];
-            if (tier.domain != params.domain.name)
-            {
-                LOG_ERROR("[MoEExpertOverlayCPUFallbackStage] Dispatch tier domain '" << tier.domain
-                                                                                      << "' does not match CPU fallback domain '" << params.domain.name << "'");
-                return nullptr;
-            }
-            return &tier;
+            LOG_ERROR("[MoEExpertOverlayCPUFallbackStage] Dispatch tier domain '" << tier.domain
+                      << "' does not match CPU fallback domain '" << params.domain.name << "'");
+            return nullptr;
         }
+        return &tier;
+    }
 
-        void clearOutput(TensorBase *output)
-        {
-            if (!output)
-                return;
-            std::fill_n(output->mutable_data(), output->numel(), 0.0f);
-        }
+    void clearOutput(TensorBase *output)
+    {
+        if (!output)
+            return;
+        std::fill_n(output->mutable_data(), output->numel(), 0.0f);
+    }
 
-        void traceDescriptorConsumption(
-            const MoEExpertOverlayCPUFallbackStage::Params &params,
-            const MoEExpertTierDispatch &tier)
-        {
-            const auto &env = debugEnv();
-            if (!env.moe_expert_overlay.transfer_trace && !env.moe_expert_overlay.trace && !env.profile.enabled)
-                return;
+    void traceDescriptorConsumption(
+        const MoEExpertOverlayCPUFallbackStage::Params &params,
+        const MoEExpertTierDispatch &tier)
+    {
+        const auto &env = debugEnv();
+        if (!env.moe_expert_overlay.transfer_trace && !env.moe_expert_overlay.trace && !env.profile.enabled)
+            return;
 
-            LOG_INFO("[MoEExpertOverlayCPUFallbackStage] layer=" << params.layer_idx
-                                                                 << " domain=" << params.domain.name
-                                                                 << " tier=" << tier.tier_index
-                                                                 << " selected_rows=" << tier.token_rows.size()
-                                                                 << " routed_entries=" << tier.entries.size()
-                                                                 << " mode=" << toString(tier.transfer_mode)
-                                                                 << " outbound_bytes=" << tier.transfer_volume.outbound_bytes
-                                                                 << " return_bytes=" << tier.transfer_volume.return_bytes);
-        }
+        LOG_INFO("[MoEExpertOverlayCPUFallbackStage] layer=" << params.layer_idx
+                 << " domain=" << params.domain.name
+                 << " tier=" << tier.tier_index
+                 << " selected_rows=" << tier.token_rows.size()
+                 << " routed_entries=" << tier.entries.size()
+                 << " mode=" << toString(tier.transfer_mode)
+                 << " outbound_bytes=" << tier.transfer_volume.outbound_bytes
+                 << " return_bytes=" << tier.transfer_volume.return_bytes);
+    }
 
-        int activeExpertCount(const std::vector<bool> &mask, int num_experts)
-        {
-            if (mask.empty())
-                return num_experts;
-            return static_cast<int>(std::count(mask.begin(), mask.end(), true));
-        }
-    } // namespace
+    int activeExpertCount(const std::vector<bool> &mask, int num_experts)
+    {
+        if (mask.empty())
+            return num_experts;
+        return static_cast<int>(std::count(mask.begin(), mask.end(), true));
+    }
+} // namespace
 
     MoEExpertOverlayCPUFallbackStage::MoEExpertOverlayCPUFallbackStage(Params params)
         : IComputeStage(params.device_id), params_(std::move(params))
@@ -139,7 +140,7 @@ namespace llaminar2
         if (params_.domain.kind != ExpertDomainKind::NodeLocalTP)
         {
             LOG_ERROR("[MoEExpertOverlayCPUFallbackStage] Domain '" << params_.domain.name
-                                                                    << "' must be NodeLocalTP, got " << toString(params_.domain.kind));
+                      << "' must be NodeLocalTP, got " << toString(params_.domain.kind));
             return false;
         }
         if (params_.seq_len <= 0 || params_.d_model <= 0 || params_.num_experts <= 0 ||
@@ -161,6 +162,12 @@ namespace llaminar2
             return false;
         }
 
+        if (!params_.expert_mask.empty() && activeExpertCount(params_.expert_mask, params_.num_experts) == 0)
+        {
+            clearOutput(params_.output);
+            return true;
+        }
+
         try
         {
             const bool profiling_enabled = MoEExpertOverlayProfiler::isEnabled();
@@ -168,14 +175,20 @@ namespace llaminar2
             MoECPUFallbackTransferStats local_transfer_stats;
             const MoEExpertTierDispatch *dispatch_tier = nullptr;
 
-            MoECPUFallbackDomainConfig domain_config;
-            domain_config.domain = params_.domain;
-            domain_config.world_comm = resolveWorldComm(params_.mpi_ctx);
-            domain_config.root_world_rank = params_.root_world_rank;
-            domain_config.domain_id = params_.domain_id;
-            domain_config.hostfile_path = params_.hostfile_path;
+            std::optional<MoECPUFallbackDomainContext> local_domain;
+            const MoECPUFallbackDomainContext *domain = params_.domain_context.get();
+            if (!domain)
+            {
+                MoECPUFallbackDomainConfig domain_config;
+                domain_config.domain = params_.domain;
+                domain_config.world_comm = resolveWorldComm(params_.mpi_ctx);
+                domain_config.root_world_rank = params_.root_world_rank;
+                domain_config.domain_id = params_.domain_id;
+                domain_config.hostfile_path = params_.hostfile_path;
 
-            auto domain = MoEExpertOverlayCPUFallback::createNodeLocalTPDomain(domain_config);
+                local_domain = MoEExpertOverlayCPUFallback::createNodeLocalTPDomain(domain_config);
+                domain = &*local_domain;
+            }
 
             MoECPUFallbackRunParams run;
             run.input = params_.input;
@@ -214,7 +227,7 @@ namespace llaminar2
 
             const auto start = profiling_enabled ? std::chrono::steady_clock::now()
                                                  : std::chrono::steady_clock::time_point{};
-            const bool ok = MoEExpertOverlayCPUFallback::runExpertFallback(domain, run, ctx);
+            const bool ok = MoEExpertOverlayCPUFallback::runExpertFallback(*domain, run, ctx);
             if (ok && profiling_enabled)
             {
                 const double compute_ms = std::chrono::duration<double, std::milli>(
@@ -235,7 +248,7 @@ namespace llaminar2
         catch (const std::exception &e)
         {
             LOG_ERROR("[MoEExpertOverlayCPUFallbackStage] Domain '" << params_.domain.name
-                                                                    << "' failed: " << e.what());
+                      << "' failed: " << e.what());
             return false;
         }
     }

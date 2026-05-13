@@ -774,6 +774,15 @@ bool rocmGDN_recurrent_step(
         fprintf(stderr, "[rocmGDN_recurrent_step] %s\n", hipGetErrorString(err));
         return false;
     }
+    if (std::getenv("LLAMINAR_ROCM_GDN_SYNC"))
+    {
+        err = hipStreamSynchronize((hipStream_t)stream);
+        if (err != hipSuccess)
+        {
+            fprintf(stderr, "[rocmGDN_recurrent_step_sync] %s\n", hipGetErrorString(err));
+            return false;
+        }
+    }
     return true;
 }
 

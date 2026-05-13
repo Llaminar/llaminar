@@ -56,6 +56,10 @@ namespace llaminar2
         int pp_stage = -1;
         int tp_domain = -1;
         int tp_rank_or_device_index = 0;
+        WeightResidencyCategory residency_category = WeightResidencyCategory::Unspecified;
+        std::string overlay_domain;
+        int overlay_participant_index = -1;
+        int overlay_participant_world_rank = -1;
         DeviceId target_device = DeviceId::cpu();
         std::optional<DeviceId> lookup_device;
         WeightHostPolicy host_policy = WeightHostPolicy::RequiredUntilGraphMaterialized;

@@ -422,6 +422,48 @@ ctest --test-dir build_v2_integration -R "V2_Integration_.*MoEExpertOverlay.*(On
 ctest --test-dir build_v2_integration -R "^V2_Integration_Parity_Qwen35MoEExpertOverlay_" --output-on-failure --parallel
 ```
 
+#### Smoke Commands
+
+Set `MODEL` to a local Qwen3.5 MoE GGUF before running these commands.
+
+Layout A: ROCm LocalTP continuation/shared tier plus CPU NodeLocalTP fallback workers.
+
+```bash
+mpirun -np 3 ./build_v2_integration/llaminar2 oneshot \
+    --explain-placement \
+    -m "$MODEL" \
+    -p "Explain tensor parallel MoE routing in one sentence." \
+    -n 1 -t 0 \
+    --moe-expert-overlay tiered \
+    --moe-expert-overlay-continuation rocm_shared_hot \
+    --moe-expert-overlay-shared-domain rocm_shared_hot \
+    --moe-expert-overlay-residency static-by-id \
+    --moe-expert-overlay-domain "rocm_shared_hot=0:rocm:0,0:rocm:1;scope=local;backend=rccl;compute=tensor_parallel_experts;owner=0" \
+    --moe-expert-overlay-domain "cpu_cold=0:cpu:0,1:cpu:0;scope=node_local;backend=upi;compute=tensor_parallel_experts;ranks=0,1" \
+    --moe-expert-overlay-tier "shared_hot@rocm_shared_hot;priority=0;max-experts-per-layer=8;memory-mb=auto" \
+    --moe-expert-overlay-tier "cold@cpu_cold;priority=1;fallback=true"
+```
+
+Layout B: CUDA continuation/shared tier, ROCm LocalTP hot tier, and CPU NodeLocalTP fallback workers.
+
+```bash
+mpirun -np 2 ./build_v2_integration/llaminar2 oneshot \
+    --explain-placement \
+    -m "$MODEL" \
+    -p "Explain tensor parallel MoE routing in one sentence." \
+    -n 1 -t 0 \
+    --moe-expert-overlay tiered \
+    --moe-expert-overlay-continuation cuda_shared_hot \
+    --moe-expert-overlay-shared-domain cuda_shared_hot \
+    --moe-expert-overlay-residency static-by-id \
+    --moe-expert-overlay-domain "cuda_shared_hot=0:cuda:0;scope=single;backend=auto;compute=replicated_experts;owner=0" \
+    --moe-expert-overlay-domain "rocm_hot=0:rocm:0,0:rocm:1;scope=local;backend=rccl;compute=tensor_parallel_experts;owner=1" \
+    --moe-expert-overlay-domain "cpu_cold=0:cpu:0,1:cpu:0;scope=node_local;backend=upi;compute=tensor_parallel_experts;ranks=0,2" \
+    --moe-expert-overlay-tier "shared_hottest@cuda_shared_hot;priority=0;max-experts-per-layer=4;memory-mb=2048" \
+    --moe-expert-overlay-tier "hot@rocm_hot;priority=1;max-experts-per-layer=8;memory-mb=auto" \
+    --moe-expert-overlay-tier "cold@cpu_cold;priority=2;fallback=true"
+```
+
 #### Acceptance Criteria
 
 - `llaminar2 oneshot` runs Layout A and Layout B without parity-only worker code.

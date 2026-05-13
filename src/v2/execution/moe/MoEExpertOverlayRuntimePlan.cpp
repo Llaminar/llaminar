@@ -108,18 +108,19 @@ namespace llaminar2
             const ExpertComputeDomain &domain,
             int current_world_rank)
         {
+            const auto canonical = domain.toExecutionDomainDefinition();
             MoEOverlayRuntimeDomain resolved;
-            resolved.name = domain.name;
+            resolved.name = canonical.name;
             resolved.kind = domain.kind;
-            resolved.backend = domain.backend;
+            resolved.backend = canonical.backend;
             resolved.compute_kind = domain.compute_kind;
-            resolved.owner_rank = domain.owner_rank;
+            resolved.owner_rank = canonical.owner_rank.value_or(-1);
 
-            resolved.participants.reserve(domain.participants.size());
-            for (size_t index = 0; index < domain.participants.size(); ++index)
+            resolved.participants.reserve(canonical.participants.size());
+            for (size_t index = 0; index < canonical.participants.size(); ++index)
             {
                 MoEOverlayDomainParticipant participant;
-                participant.address = domain.participants[index];
+                participant.address = canonical.participants[index];
                 participant.participant_index = static_cast<int>(index);
                 participant.world_rank = participantRankFor(domain, index, current_world_rank);
                 participant.world_rank_known = participantRankKnown(domain, index);
@@ -277,6 +278,7 @@ namespace llaminar2
         out << "MoE expert overlay runtime plan: current_rank=" << current_world_rank_
             << " continuation_domain=" << source_plan_->continuation_domain
             << " continuation_device=" << continuationDevice().to_string()
+            << " base_model_domain=" << source_plan_->effectiveBaseModelDomain()
             << " shared_expert_domain=" << source_plan_->shared_expert_domain;
 
         for (const auto &domain : domains_)

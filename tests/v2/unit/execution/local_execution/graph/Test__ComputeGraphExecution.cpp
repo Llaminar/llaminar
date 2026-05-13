@@ -434,6 +434,100 @@ TEST_F(ComputeGraphExecutionTest, Execute_FirstNodeFails_NoneComplete)
     EXPECT_EQ(log[0], "A");
 }
 
+TEST_F(ComputeGraphExecutionTest, Execute_StageFailureInvokesFailureCallback)
+{
+    int callback_count = 0;
+    std::string failed_stage;
+    std::string failure_reason;
+
+    GraphExecutorConfig config;
+    config.stage_failure_callback = [&](const std::string &node_name, const std::string &reason)
+    {
+        ++callback_count;
+        failed_stage = node_name;
+        failure_reason = reason;
+    };
+    LayerExecutor executor(config);
+
+    MockGraphBuilder builder;
+    builder.addNode("A", ComputeStageType::RMS_NORM);
+    builder.addNode("B", ComputeStageType::GEMM);
+    builder.addDependency("B", "A");
+    builder.getStage("B")->setShouldSucceed(false);
+
+    auto graph = builder.build();
+
+    EXPECT_FALSE(executor.execute(graph, ctx_.get()));
+    EXPECT_EQ(callback_count, 1);
+    EXPECT_EQ(failed_stage, "B");
+    EXPECT_NE(failure_reason.find("returned false"), std::string::npos);
+}
+
+TEST_F(ComputeGraphExecutionTest, Execute_CancellationStopsBeforeNextStage)
+{
+    bool cancel_requested = false;
+    int failure_callback_count = 0;
+
+    GraphExecutorConfig config;
+    config.cancellation_requested = [&]()
+    { return cancel_requested; };
+    config.stage_failure_callback = [&](const std::string &, const std::string &)
+    {
+        ++failure_callback_count;
+    };
+    LayerExecutor executor(config);
+
+    MockGraphBuilder builder;
+    builder.addNode("A", ComputeStageType::RMS_NORM);
+    builder.addNode("B", ComputeStageType::GEMM);
+    builder.addDependency("B", "A");
+    builder.getStage("A")->setOnExecute([&](IDeviceContext *)
+                                        { cancel_requested = true; });
+
+    auto graph = builder.build();
+
+    EXPECT_FALSE(executor.execute(graph, ctx_.get()));
+    EXPECT_EQ(failure_callback_count, 0);
+
+    auto &log = builder.executionLog();
+    ASSERT_EQ(log.size(), 1);
+    EXPECT_EQ(log[0], "A");
+    EXPECT_EQ(builder.getStage("B")->executionCount(), 0);
+}
+
+TEST_F(ComputeGraphExecutionTest, ExecuteMultiDevice_CancellationStopsBeforeNextStage)
+{
+    bool cancel_requested = false;
+    int failure_callback_count = 0;
+
+    GraphExecutorConfig config;
+    config.cancellation_requested = [&]()
+    { return cancel_requested; };
+    config.stage_failure_callback = [&](const std::string &, const std::string &)
+    {
+        ++failure_callback_count;
+    };
+    LayerExecutor executor(config);
+
+    MockGraphBuilder builder;
+    builder.addNode("A", ComputeStageType::RMS_NORM);
+    builder.addNode("B", ComputeStageType::GEMM);
+    builder.addDependency("B", "A");
+    builder.getStage("A")->setOnExecute([&](IDeviceContext *)
+                                        { cancel_requested = true; });
+
+    auto graph = builder.build();
+    std::unordered_map<DeviceId, IDeviceContext *> contexts{{DeviceId::cpu(), ctx_.get()}};
+
+    EXPECT_FALSE(executor.executeMultiDevice(graph, contexts));
+    EXPECT_EQ(failure_callback_count, 0);
+
+    auto &log = builder.executionLog();
+    ASSERT_EQ(log.size(), 1);
+    EXPECT_EQ(log[0], "A");
+    EXPECT_EQ(builder.getStage("B")->executionCount(), 0);
+}
+
 // =============================================================================
 // Graph Reset Tests
 // =============================================================================

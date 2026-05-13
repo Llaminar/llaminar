@@ -66,6 +66,16 @@ namespace llaminar2
         Released,
     };
 
+    enum class WeightResidencyCategory
+    {
+        Unspecified,
+        RootNonExpert,
+        SharedExpert,
+        AcceleratorRoutedExpert,
+        CpuFallbackExpert,
+        WorkerFallbackExpert,
+    };
+
     struct WeightIdentity
     {
         ModelContextId model_id;
@@ -80,6 +90,10 @@ namespace llaminar2
         int pp_stage = -1;
         int tp_domain = -1;
         int tp_rank_or_device_index = 0;
+        WeightResidencyCategory residency_category = WeightResidencyCategory::Unspecified;
+        std::string overlay_domain;
+        int overlay_participant_index = -1;
+        int overlay_participant_world_rank = -1;
 
         bool operator==(const WeightIdentity &other) const
         {
@@ -208,6 +222,7 @@ namespace llaminar2
     std::string toString(WeightRole role);
     std::string toString(WeightDerivationKind derivation);
     std::string toString(WeightHostPolicy policy);
+    std::string toString(WeightResidencyCategory category);
 
     WeightRole inferWeightRole(const std::string &canonical_name);
     int inferWeightLayer(const std::string &canonical_name);

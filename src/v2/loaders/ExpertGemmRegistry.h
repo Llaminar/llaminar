@@ -48,12 +48,32 @@ namespace llaminar2
                          DeviceId device, int layer, int expert, WeightRole role,
                          ITensorGemm *engine, std::shared_ptr<ITensorGemm> ownership);
 
+        /// Register a single expert GEMM engine under a logical overlay domain and participant.
+        void registerEngineForParticipant(const std::string &domain_name,
+                 DeviceId device, int participant_world_rank, int participant_index,
+                 int layer, int expert, WeightRole role,
+                 ITensorGemm *engine, std::shared_ptr<ITensorGemm> ownership);
+
+        /// Alias an existing device-scoped engine into a logical overlay domain.
+        /// Copies the owning shared_ptr so the aliased key preserves lifetime.
+        bool aliasEngineForDomainFromDevice(const std::string &domain_name,
+             DeviceId device, int layer, int expert, WeightRole role);
+
+        /// Alias an existing device-scoped engine into a logical overlay domain participant.
+        bool aliasEngineForParticipantFromDevice(const std::string &domain_name,
+             DeviceId device, int participant_world_rank, int participant_index,
+             int layer, int expert, WeightRole role);
+
         /// Look up a single expert GEMM engine. Returns nullptr if not found.
         ITensorGemm *getEngine(DeviceId device, int layer, int expert, WeightRole role) const;
 
         /// Look up a single expert GEMM engine in a logical overlay domain.
         ITensorGemm *getEngineForDomain(const std::string &domain_name,
                         DeviceId device, int layer, int expert, WeightRole role) const;
+
+        ITensorGemm *getEngineForParticipant(const std::string &domain_name,
+                DeviceId device, int participant_world_rank, int participant_index,
+                int layer, int expert, WeightRole role) const;
 
         /// Check if a full role is registered for every expert in a layer.
         bool hasCompleteRole(DeviceId device, int layer, int num_experts, WeightRole role) const;
@@ -137,6 +157,8 @@ namespace llaminar2
             int layer;
             int expert;
             WeightRole role;
+            int participant_world_rank = -1;
+            int participant_index = -1;
 
             bool operator==(const Key &other) const;
         };

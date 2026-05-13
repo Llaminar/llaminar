@@ -11,7 +11,7 @@ The earlier plan in `docs/v2/MOE_EXPERT_PARALLEL_GPU_HOT_CPU_COLD_PROJECT_PLAN.m
 
 The current implementation has important scaffolding in place: value types, parser/config support, planner tests, model-light dispatch/reduce helpers, CPU fallback helpers, sparse transfer helpers, multi-accelerator synthetic tests, and V2 parity test names. The remaining production gap is that the real Qwen3.5 MoE graph still does not execute all overlay domains as first-class runtime domains. Several paths are still model-light, primary-participant-only, host-staged, or test-preplanned.
 
-**2026-05-11 orchestration checkpoint:** Phase 8A parity is now accepted, but moving to release benchmarking exposed a broader orchestration mismatch that also applies to `oneshot` and `serve`: every MPI rank still tries to build a normal root runner, while MoE overlay needs a continuation-root actor plus auxiliary same-layer expert domain workers. The follow-on refactor plan is documented in `docs/v2/MOE_EXPERT_OVERLAY_ORCHESTRATION_REFACTOR_PLAN.md`. Phase 10A performance benchmarking should resume only after that composite overlay runtime is in place, so benchmark, parity, `oneshot`, and `serve` all exercise the same production path.
+**2026-05-12 graph-native dispatch checkpoint:** Release benchmarking exposed a deeper mismatch in the attempted worker/coordinator layering: side-effectful fallback-domain command streams were being driven from per-device continuation graph workers, which breaks the original one-graph-per-device execution model for accelerator `LocalTP` and risks similar drift for `LocalPP`. The next direction is to make MoE overlay a graph-native sparse collective. Continuation devices/ranks and fallback-domain participants meet at explicit dispatch points, just like existing collective points, and participants with no routed work enter with an empty/no-op request. Phase 10C performance benchmarking should resume only after Phase 10A restores this graph-native dispatch contract, Phase 10B hardens the collective ownership/ordering contract, and the domain/placement UX has been reconciled, so benchmark, parity, `oneshot`, and `serve` all exercise the same production graph path with the same final configuration model.
 
 This document is the implementation plan for closing those gaps. Each phase is intended to be dispatched to a coding subagent for implementation, then audited before the next phase begins.
 
@@ -27,16 +27,60 @@ The feature is complete only when all of the following are true.
 ```text
 Layout A: ROCm shared/hot + CPU cold
   continuation_domain = rocm_hot
+   base_model_domain = rocm_hot
   shared_expert_domain = rocm_hot
   routed_tier_0 = rocm_hot, devices 0:rocm:0,0:rocm:1, scope local, backend rccl, compute tensor_parallel_experts
   routed_fallback = cpu_cold, devices 0:cpu:0,1:cpu:0, scope node_local, backend upi, compute tensor_parallel_experts
 
 Layout B: CUDA shared/hottest + ROCm hot + CPU cold
   continuation_domain = cuda_fast
+   base_model_domain = cuda_fast
   shared_expert_domain = cuda_fast
   routed_tier_0 = cuda_fast, devices 0:cuda:0, scope single, backend auto, compute replicated_experts
   routed_tier_1 = rocm_hot, devices 0:rocm:0,0:rocm:1, scope local, backend rccl, compute tensor_parallel_experts
   routed_fallback = cpu_cold, devices 0:cpu:0,1:cpu:0, scope node_local, backend upi, compute tensor_parallel_experts
+```
+
+Phase 9C finalizes the placement language used by parity, oneshot, serve, and benchmark: define hardware domains once with `--define-domain` or top-level YAML `domains`, then reference those names from PP layer placement and MoE overlay placement. `--moe-expert-overlay-domain` remains accepted only as a strict compatibility alias into the same inventory; duplicating a logical domain with different devices, scope, backend, ranks, weights, or compute kind is invalid.
+
+Layout A YAML shape:
+
+```yaml
+domains:
+   - "rocm_hot=0:rocm:0,0:rocm:1;scope=local;backend=rccl;compute=tensor_parallel_experts;owner=0"
+   - "cpu_cold=0:cpu:0,1:cpu:0;scope=node_local;backend=upi;compute=tensor_parallel_experts;ranks=0,1"
+moe_expert_parallel:
+   enabled: true
+   execution_kind: tiered
+   continuation_domain: rocm_hot
+   base_model_domain: rocm_hot
+   shared_expert_domain: rocm_hot
+   residency:
+      mode: histogram
+   routed_tiers:
+      - "hot@rocm_hot;priority=0;max-experts-per-layer=8;memory-mb=auto"
+      - "cold@cpu_cold;priority=1;fallback=true"
+```
+
+Layout B YAML shape:
+
+```yaml
+domains:
+   - "cuda_fast=0:cuda:0;scope=single;backend=auto;compute=replicated_experts;owner=0"
+   - "rocm_warm=0:rocm:0,0:rocm:1;scope=local;backend=rccl;compute=tensor_parallel_experts;owner=1"
+   - "cpu_cold=0:cpu:0,1:cpu:0;scope=node_local;backend=upi;compute=tensor_parallel_experts;ranks=0,2"
+moe_expert_parallel:
+   enabled: true
+   execution_kind: tiered
+   continuation_domain: cuda_fast
+   base_model_domain: cuda_fast
+   shared_expert_domain: cuda_fast
+   residency:
+      mode: static-by-id
+   routed_tiers:
+      - "hottest@cuda_fast;priority=0;max-experts-per-layer=4;memory-mb=512"
+      - "warm@rocm_warm;priority=1;max-experts-per-layer=8;memory-mb=auto"
+      - "cold@cpu_cold;priority=2;fallback=true"
 ```
 
 2. **All three tiers must actually participate.**
@@ -783,7 +827,190 @@ ctest --test-dir build_v2_integration -R "^V2_Integration_Parity_Qwen35MoEExpert
 - Every active domain reports non-zero routed work and a complete compute/transfer/reduce breakdown.
 - Profiling output can distinguish direct peer transfer, host-staged transport, continuation-device accumulation, and host-summed correctness fallback.
 
-### Phase 10A: Release Benchmark and Performance Gate
+### Phase 9B: Unified Execution Domain Contract
+
+#### Goal
+
+Converge the older named-domain TP/PP system and the MoE overlay domain system on one canonical execution-domain value type and resolver before the release benchmark locks in the public configuration model.
+
+#### Deliverables
+
+- Close `DomainDefinition` and `ExpertComputeDomain` into a single canonical domain contract, or into one canonical type plus thin compatibility aliases during migration.
+- Preserve all fields required by both systems: name, participants/devices, scope, backend, owner/ranks, weights where meaningful, and domain-internal compute kind.
+- Move role-specific meaning out of the domain type. PP layer ownership, TP sharding, continuation ownership, shared expert placement, and routed expert tiers should be placements over domains, not separate definitions of what a domain is.
+- Replace duplicated parser, validation, normalization, and diagnostics for named domains and MoE overlay domains with shared code or a shared conversion path.
+- Ensure domain identity is stable enough for domain-scoped prepared weights, `ExpertGemmRegistry` entries, collective contexts, profiling, and trace output. Two logical domains that share one physical device must still have separate logical ownership where configured.
+- Keep existing CLI/YAML syntax working during the transition, but route both old named-domain and overlay-domain inputs through the unified representation.
+- Add migration comments near the compatibility aliases so future phases do not extend the old split types.
+
+#### Required Tests
+
+```bash
+ctest --test-dir build_v2_integration -R "V2_Unit_.*(OrchestrationConfigParser|ConfigValidator|ExecutionPlanBuilder|MoEExpertOverlayRuntimePlan|MoEExpertOverlayExecutionPlan|MoEExpertParallelPlanner)" --output-on-failure --parallel
+ctest --test-dir build_v2_integration -R "^V2_Integration_Parity_Qwen35MoEExpertOverlay_" --output-on-failure --parallel
+```
+
+#### Acceptance Criteria
+
+- `DomainDefinition` and `ExpertComputeDomain` can no longer drift in supported fields, parser behavior, validation rules, or diagnostics.
+- The same resolved domain inventory feeds legacy simple/named-domain TP/PP planning and MoE overlay runtime planning.
+- Overlay domains are still rejected as PP layer ownership; same-layer expert overlay remains a MoE placement over domains.
+- Domain-scoped prepared weights and collective contexts remain isolated by logical domain name even when domains share physical participants.
+- Existing accepted Layout A and Layout B parity still pass after the type convergence.
+
+### Phase 9C: Unified Placement UX and Configuration Model
+
+#### Goal
+
+Make TP, PP, and MoE overlay feel like one Llaminar orchestration language: define hardware domains once, then place root flow, layer ranges, tensor-parallel work, and same-layer MoE expert roles onto those domains.
+
+#### Deliverables
+
+- Define the final user-facing model for advanced heterogeneous runs:
+   - domains: hardware/collective groups,
+   - root or continuation placement: activation/logits owner,
+   - base/non-expert model placement: dense path and non-expert weights,
+   - PP layer placement: layer ranges over domains,
+   - MoE placement: shared expert domain plus ordered routed tiers over domains.
+- Add or finalize an explicit base/non-expert model domain option for overlay runs. Do not require `-d cpu` or any other fake root-device workaround to pass validation.
+- Decide the final CLI compatibility story:
+   - keep `-d`, `-tp`, `--tp-devices`, and `--pp-stage` as concise simple-mode shorthands,
+   - prefer unified named domains for advanced heterogeneous configs,
+   - either deprecate `--moe-expert-overlay-domain` in favor of shared domain definitions or make it a strict alias that populates the same canonical domain inventory.
+- Update YAML examples so Layout A and Layout B define each hardware domain once and reference those domains from overlay placements.
+- Update validation so ambiguous combinations fail early with user-facing guidance. In particular, `-d` should not silently override or conflict with `continuation_domain`, base model domain, or overlay tier domains.
+- Make `--explain-placement` render one coherent domain/placement tree for simple TP/PP, named-domain PP, and MoE overlay.
+- Ensure `benchmark`, `oneshot`, `serve`, and parity all consume the same final config shape rather than mode-specific wrappers.
+
+#### Required Tests
+
+```bash
+ctest --test-dir build_v2_integration -R "V2_Unit_.*(OrchestrationConfigParser|ConfigValidator|ExecutionPlanBuilder|OrchestrationRunnerFactory|MoEExpertOverlayExecutionPlan|MoEExpertOverlayRuntimePlan)" --output-on-failure --parallel
+ctest --test-dir build_v2_integration -R "^V2_Integration_Parity_Qwen35MoEExpertOverlay_" --output-on-failure --parallel
+```
+
+#### Acceptance Criteria
+
+- Layout A and Layout B can be expressed without `-d cpu` or duplicated domain definitions.
+- Existing simple commands for single-device, simple TP, explicit TP, and PP remain valid or receive clear migration diagnostics.
+- `--pp-stage` remains layer placement only and cannot be used to model same-layer hot/warm/cold expert overlay.
+- `--explain-placement` makes the continuity between legacy TP/PP and MoE overlay visible: one domain inventory, multiple placement kinds.
+- The Phase 10C benchmark commands use this final CLI/YAML shape.
+
+### Phase 10A: Graph-Native Overlay Dispatch Collectives
+
+#### Goal
+
+Bring MoE overlay back into the original graph execution model by treating overlay tier dispatch as a graph-level sparse collective, not as a separate rank-local coordinator or ad hoc worker command layer.
+
+Each continuation graph keeps its normal structure: single-device, accelerator `LocalTP`, `LocalPP`, and future hybrids all reach explicit overlay dispatch points in graph order. Every participant in the dispatch group enters the stage for the same logical layer/token/microbatch. Participants with routed work submit compact dispatch descriptors and selected token rows; participants with no routed work submit an empty/no-op request. CPU fallback and other remote overlay domains are graph participants/endpoints for that dispatch group, not a second orchestration plane.
+
+#### Deliverables
+
+- Replace the abandoned rank-local worker-coordinator direction with a graph-native overlay dispatch collective.
+- Keep one graph per continuation device/rank participant wherever the original system already does so; do not introduce a separate scheduler that owns layer progress outside the graph.
+- Define an `OverlayDispatchGroup`-style contract, analogous to a collective communicator, with cached integer identity for domain id, layer id, dispatch group id, participant count, participant index, owner/executor participant(s), and stage/microbatch/decode sequence.
+- Make overlay tier stages call a backend-shaped API such as `MoEOverlayBackend::dispatch(group, request, output)` rather than directly sending fallback-domain commands from arbitrary per-device graph workers.
+- Require all participants in a dispatch group to enter the dispatch point in graph order:
+   - single-device continuation: one continuation participant plus the fallback endpoint when needed;
+   - accelerator `LocalTP`: all local TP graph participants enter, even when one participant has no cold routed rows;
+   - `LocalPP`: only participants that own the pipeline stage/layer for that request enter the dispatch group; unrelated local devices are not forced into every fallback call.
+- Make empty/no-op dispatch a first-class request type with the same request identity as real work. No-op participants must be cheap and must still participate in ordering, cancellation, and tracing.
+- Have CPU fallback / remote-domain participants consume dispatch-point messages keyed by dispatch group and sequence, not duplicate same-rank command streams from individual local device workers.
+- Preserve exact route weights, selected token rows, sparse transfer metadata, output scatter semantics, and domain-local `TensorParallelExperts` behavior already implemented by prior phases.
+- Keep cross-domain reduce graph-native: fallback partials return as explicit dispatch results/partials and feed the existing `MoEExpertParallelReduceStage` or its successor, with continuation-domain accumulation semantics preserved.
+- Integrate failure/cancel semantics at the dispatch collective boundary: a failure from any participant wakes all local participants, sends cancel/no-op completion to remote participants as needed, and prevents remote fallback ranks from waiting for the full collective timeout.
+- Add trace/profiling hooks that can explain dispatch wait time, no-op count, routed request count, selected row count, remote endpoint work count, transfer bytes, and cancel events without forcing D2H transfers or hot-path string formatting.
+
+#### Performance Contract
+
+Overlay dispatch is part of the decode hot path. The graph-native path must preserve the low-overhead feel of existing TP collectives.
+
+- Preallocate dispatch request/result slots during graph/runtime initialization; no heap allocation in the per-token path.
+- Use cached integer ids for dispatch groups, domains, layers, participants, and request slots; no hot-path string lookups, YAML/config maps, dynamic casts for protocol identity, or formatted logging unless tracing is enabled.
+- Use fixed-size local rendezvous structures for accelerator `LocalTP` participants and avoid OS blocking in the normal all-participants-ready path.
+- Keep no-op dispatch close to a branch plus slot publish in the uncontended path.
+- Keep single-device continuation close to the existing direct stage call when no remote/fallback participant is active.
+- Measure dispatch-collective overhead separately from remote expert compute, transfers, local allreduce, and final reduce when `LLAMINAR_PROFILING=1` is enabled.
+
+#### Required Tests
+
+```bash
+ctest --test-dir build_v2_integration -R "V2_Unit_.*(MoEOverlay.*Dispatch|MoEExpertDispatchStage|MoEOverlayDomainRuntime|Qwen35MoEExpertOverlayGraph|TPWorkerPool)" --output-on-failure --parallel
+ctest --test-dir build_v2_integration -R "V2_Integration_.*MoEExpertOverlay_(CPUFallback|CPUTensorParallelExperts|MultiAcceleratorTiers)" --output-on-failure --parallel
+ctest --test-dir build_v2_integration -R "^V2_Integration_Parity_Qwen35MoEExpertOverlay_" --output-on-failure --parallel
+```
+
+#### Acceptance Criteria
+
+- The production overlay path remains graph-native: one graph per continuation device/rank participant, with overlay work represented by explicit graph dispatch stages.
+- Single-device continuation can call CPU fallback through the dispatch collective without fake TP participation or a separate rank-local coordinator.
+- Accelerator `LocalTP` participants all rendezvous at the same dispatch point for a logical layer/token/microbatch request, and participants with no routed work submit no-op requests rather than skipping the stage.
+- Accelerator `LocalTP` emits one coherent fallback-domain dispatch sequence for the logical request; remote fallback workers no longer observe duplicate same-rank command streams from multiple local device workers.
+- `LocalTP` participants all receive the correct returned fallback partials and cannot advance independently past a failed, canceled, or incomplete dispatch point.
+- `LocalPP` dispatch groups are scoped to the owning pipeline stage/layer/microbatch; unrelated local devices are not required to enter every fallback call.
+- CPU fallback and remote overlay-domain participants consume ordered dispatch-point messages and can distinguish real work, no-op, cancel, and shutdown without relying on accidental rank-global side effects.
+- Abort/cancel tests prove no local worker or remote fallback rank waits for the full collective timeout after a dispatch-side failure.
+- Profiling can report graph-native dispatch overhead, and release-mode no-op/single-device overhead is below 1 us per decode fallback request while `LocalTP` dispatch overhead remains a small fraction of remote expert compute.
+
+### Phase 10B: Collective Contract Hardening
+
+#### Goal
+
+Make dense TP, overlay tier TP, and remote fallback dispatch collectives impossible to confuse. A release benchmark is not accepted while a collective hang can only be diagnosed by waiting for `LLAMINAR_TP_COLLECT_TIMEOUT_MS`.
+
+The hard rule is: every collective belongs to exactly one resolved execution domain, uses exactly one owner-created context for that domain, and advances through a participant-visible ordered sequence. If a participant skips, duplicates, interleaves, or uses a sibling context for the same logical sequence, debug/integration builds must fail before NCCL/RCCL can hang.
+
+#### Deliverables
+
+- Add a lightweight collective trace/contract mode for LocalTP and overlay dispatch. It should stamp each collective with domain name, context identity, backend identity, stage/dispatch group name, sequence number, device/participant index, element count, dtype, stream pointer, and tensor pointer.
+- Trace dense continuation LocalTP separately from overlay expert-domain LocalTP and CPU fallback NodeLocalTP. The logs must make it obvious whether `GraphConfig::tp_ctx`, named-domain `domain_tp_contexts`, and overlay dispatch runtimes are sharing or separating contexts intentionally.
+- Add first-pass sequence validation for LocalTP on-stream allreduce: all participants in one domain/context must issue the same stage/sequence/count/dtype tuple in the same order. A mismatch should return a clear error and request collective abort rather than waiting for the generic TP timeout.
+- Ensure `RankOrchestrator` worker enter/leave logs can distinguish a worker stuck inside `runner->forward(...)` from a worker that returned but is waiting on GPU completion or result collection.
+- Audit root continuation graph construction so dense base-model collectives use the root `RankOrchestrator` LocalTP context, while overlay-domain collectives use explicit domain-scoped contexts from the resolved runtime registry. Graph builders must not independently create duplicate RCCL/NCCL contexts for the same logical domain.
+- Add context-identity diagnostics at `LocalTPContext` construction, compute stream registration, `RCCLBackend`/`NCCLBackend` coordinator creation, and on-stream allreduce launch.
+- Make timeout handling abort the affected LocalTP context/communicator when a TP worker does not complete, so failed benchmark attempts do not leave live child ranks holding accelerator memory.
+- Document the reduced-context Layout A triage sequence: first run with allreduce enabled and contract tracing, then run once with `LLAMINAR_SKIP_ALLREDUCE=1` only to prove or disprove dense LocalTP allreduce as the hang site.
+
+#### Required Tests
+
+```bash
+ctest --test-dir build_v2_integration -R "V2_Unit_.*(LocalTPContext|TPWorkerPool|MoEOverlay.*Dispatch|MoEOverlayDomainRuntime|Qwen35MoEExpertOverlayGraph)" --output-on-failure --parallel
+ctest --test-dir build_v2_integration -R "V2_Integration_.*MoEExpertOverlay_(CPUFallback|CPUTensorParallelExperts|MultiAcceleratorTiers)" --output-on-failure --parallel
+```
+
+Hardware-specific reduced-context triage, when the Qwen3.5 MoE model and two ROCm devices are available:
+
+```bash
+LLAMINAR_LOG_LEVEL=INFO \
+LLAMINAR_TP_COLLECTIVE_CONTRACT_TRACE=1 \
+LLAMINAR_TP_COLLECT_TIMEOUT_MS=60000 \
+./build_v2_release/llaminar2 benchmark \
+   --config configs/qwen35-moe-overlay-layout-a.yaml \
+   -m models/Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf \
+   -p Hello -n 0 -t 0 -c 512
+
+LLAMINAR_LOG_LEVEL=INFO \
+LLAMINAR_TP_COLLECTIVE_CONTRACT_TRACE=1 \
+LLAMINAR_SKIP_ALLREDUCE=1 \
+LLAMINAR_TP_COLLECT_TIMEOUT_MS=60000 \
+./build_v2_release/llaminar2 benchmark \
+   --config configs/qwen35-moe-overlay-layout-a.yaml \
+   -m models/Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf \
+   -p Hello -n 0 -t 0 -c 512
+```
+
+#### Acceptance Criteria
+
+- Layout A reduced-context benchmark no longer hangs silently: it either completes prefill, fails with a collective contract diagnostic that names the mismatched domain/context/sequence, or fails at a later named stage with enough worker-boundary evidence to continue the investigation.
+- Dense continuation LocalTP allreduces are proven to use one shared root context/coordinator across ROCm:0 and ROCm:1 for the root forward.
+- Overlay-domain LocalTP contexts are either intentionally aliased to the root context or intentionally separate by logical domain, and the trace output makes that choice explicit.
+- If two logical domains share physical devices, their prepared weights and collective contexts remain logically isolated unless the domain resolver explicitly aliases the collective context.
+- `LLAMINAR_SKIP_ALLREDUCE=1` is retained only as a diagnostic switch; no production or parity acceptance depends on skipped allreduce.
+- A timed-out TP worker triggers local context abort/communicator abort so follow-up benchmark runs do not require manual cleanup of live accelerator-owning children.
+- The investigation result is recorded before Phase 10C begins: root cause fixed, or a precise blocker documented with context/sequence evidence.
+
+### Phase 10C: Release Benchmark and Performance Gate
 
 #### Goal
 
@@ -805,11 +1032,7 @@ cmake --build build_v2_release --parallel
 LLAMINAR_PROFILING=1 \
 ./build_v2_release/llaminar2 benchmark \
    -m models/<qwen35-moe-model>.gguf \
-   --moe-expert-overlay tiered \
-   --moe-expert-overlay-continuation <domain> \
-   --moe-expert-overlay-shared-domain <domain> \
-   --moe-expert-overlay-domain "..." \
-   --moe-expert-overlay-tier "..."
+   --config configs/<layout-a-or-b-overlay>.yaml
 ```
 
 #### Acceptance Criteria
@@ -879,7 +1102,11 @@ From the current checkpoint, use this bridge dispatch order instead:
 7A. Cross-domain reduce back to continuation domain
 8A. Real V2 overlay parity unskip
 9A. Overlay profiling and diagnostics closure
-10A. Release benchmark and performance gate
+9B. Unified execution domain contract
+9C. Unified placement UX and configuration model
+10A. Graph-native overlay dispatch collectives
+10B. Collective contract hardening
+10C. Release benchmark and performance gate
 11A. Final hardening and documentation
 ```
 

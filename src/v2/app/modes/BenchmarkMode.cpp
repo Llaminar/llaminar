@@ -7,15 +7,44 @@
 #include "app/AppContext.h"
 #include "app/InferenceRunnerAdapter.h"
 #include "execution/runner/OrchestrationRunner.h"
+#include "execution/moe/MoEExpertOverlayProfiler.h"
 #include "execution/moe/MoERebalanceController.h"
+#include "interfaces/IMPIContext.h"
 #include "utils/Logger.h"
 #include "utils/DebugEnv.h"
 #include "utils/KernelProfiler.h"
 #include "utils/BenchmarkRunner.h"
 #include "app/MPIShutdown.h"
 
+#include <memory>
+#include <string>
+
 namespace llaminar2
 {
+    namespace
+    {
+        int finalizeAfterUnhandledException(AppContext &ctx, const std::string &detail)
+        {
+            const bool has_mpi = ctx.mpi_ctx != nullptr;
+            const bool is_root = !has_mpi || ctx.mpi_ctx->rank() == 0;
+            const bool notify_workers = has_mpi && ctx.mpi_ctx->world_size() > 1 && ctx.mpi_ctx->rank() == 0;
+
+            if (is_root)
+                LOG_ERROR("Benchmark mode failed with unhandled exception: " << detail);
+
+            if (ctx.runner)
+            {
+                if (notify_workers)
+                    ctx.runner->abortMPIWorkers(detail);
+                ctx.runner->shutdown();
+            }
+
+            MoEExpertOverlayProfiler::flush();
+            mpiShutdown();
+            return 1;
+        }
+
+    } // namespace
 
     bool BenchmarkMode::matches(const OrchestrationConfig &config) const
     {
@@ -23,10 +52,19 @@ namespace llaminar2
     }
 
     int BenchmarkMode::execute(AppContext &ctx)
+    try
     {
         auto &mpi_ctx = ctx.mpi_ctx;
         auto &runner = ctx.runner;
         auto &tokenizer = ctx.tokenizer;
+
+        auto shutdownAndFinalize = [&](bool success, const std::string &failure_reason = {}) -> int
+        {
+            MoEExpertOverlayProfiler::flush();
+            runner->shutdown();
+            mpiShutdown();
+            return success ? 0 : 1;
+        };
 
         if (mpi_ctx->rank() == 0)
         {
@@ -152,6 +190,7 @@ namespace llaminar2
 
         BenchmarkResult result = benchmark.run(ctx.config);
         benchmark.printResults(result);
+        MoEExpertOverlayProfiler::flush();
 
         // Log MoE histogram if controller is active
         if (auto* orch_runner = dynamic_cast<OrchestrationRunner*>(runner.get()))
@@ -168,9 +207,17 @@ namespace llaminar2
             }
         }
 
-        runner->shutdown();
-        mpiShutdown();
-        return result.success ? 0 : 1;
+        return shutdownAndFinalize(
+            result.success,
+            result.success ? std::string{} : "benchmark runner reported failure");
+    }
+    catch (const std::exception &e)
+    {
+        return finalizeAfterUnhandledException(ctx, e.what());
+    }
+    catch (...)
+    {
+        return finalizeAfterUnhandledException(ctx, "unknown exception");
     }
 
 } // namespace llaminar2

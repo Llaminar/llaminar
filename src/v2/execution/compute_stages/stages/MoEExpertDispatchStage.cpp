@@ -17,161 +17,161 @@
 
 namespace llaminar2
 {
-    namespace
+namespace
+{
+
+    bool isFlatOrMatrixRoutingShape(const ITensor *tensor, int seq_len, int top_k, const char *tensor_name)
     {
-
-        bool isFlatOrMatrixRoutingShape(const ITensor *tensor, int seq_len, int top_k, const char *tensor_name)
+        const size_t expected = static_cast<size_t>(seq_len) * static_cast<size_t>(top_k);
+        if (tensor->numel() < expected)
         {
-            const size_t expected = static_cast<size_t>(seq_len) * static_cast<size_t>(top_k);
-            if (tensor->numel() < expected)
-            {
-                LOG_ERROR("[MoEExpertDispatchStage] " << tensor_name << " has " << tensor->numel()
-                                                      << " elements, expected at least " << expected
-                                                      << " for seq_len=" << seq_len
-                                                      << " top_k=" << top_k);
-                return false;
-            }
-
-            const auto &shape = tensor->shape();
-            if (shape.size() == 1)
-                return true;
-            if (shape.size() == 2)
-            {
-                if (shape[0] >= static_cast<size_t>(seq_len) && shape[1] == static_cast<size_t>(top_k))
-                    return true;
-
-                LOG_ERROR("[MoEExpertDispatchStage] " << tensor_name << " must have shape ["
-                                                      << seq_len << " or larger, " << top_k
-                                                      << "] or be a sufficiently large flat tensor, got ["
-                                                      << shape[0] << ", " << shape[1] << "]");
-                return false;
-            }
-
-            LOG_ERROR("[MoEExpertDispatchStage] " << tensor_name << " must be 1D flat or 2D, got rank " << shape.size());
+            LOG_ERROR("[MoEExpertDispatchStage] " << tensor_name << " has " << tensor->numel()
+                                                   << " elements, expected at least " << expected
+                                                   << " for seq_len=" << seq_len
+                                                   << " top_k=" << top_k);
             return false;
         }
 
-        bool validateRoutingTensor(const ITensor *tensor, int seq_len, int top_k, const char *tensor_name)
-        {
-            if (!tensor)
-            {
-                LOG_ERROR("[MoEExpertDispatchStage] Null " << tensor_name << " tensor");
-                return false;
-            }
-            if (tensor->native_type() != TensorType::FP32)
-            {
-                LOG_ERROR("[MoEExpertDispatchStage] " << tensor_name << " must be FP32");
-                return false;
-            }
-            return isFlatOrMatrixRoutingShape(tensor, seq_len, top_k, tensor_name);
-        }
-
-        bool routeValueToExpertId(float value, int token_row, int route_slot, int &expert_id)
-        {
-            if (!std::isfinite(value))
-            {
-                LOG_ERROR("[MoEExpertDispatchStage] Non-finite expert id at token_row=" << token_row
-                                                                                        << " route_slot=" << route_slot);
-                return false;
-            }
-
-            const float rounded = std::round(value);
-            if (std::fabs(value - rounded) > 1e-4f)
-            {
-                LOG_ERROR("[MoEExpertDispatchStage] Non-integral expert id " << value
-                                                                             << " at token_row=" << token_row
-                                                                             << " route_slot=" << route_slot);
-                return false;
-            }
-
-            expert_id = static_cast<int>(rounded);
+        const auto &shape = tensor->shape();
+        if (shape.size() == 1)
             return true;
-        }
-
-        MoEExpertTransferMode resolveTierTransferMode(
-            MoEExpertTransferMode requested,
-            int seq_len,
-            size_t selected_rows)
+        if (shape.size() == 2)
         {
-            if (requested == MoEExpertTransferMode::Auto)
-            {
-                if (seq_len == 1 && selected_rows == 1)
-                    return MoEExpertTransferMode::DecodeOneToken;
-                return MoEExpertTransferMode::SparseTokenRows;
-            }
+            if (shape[0] >= static_cast<size_t>(seq_len) && shape[1] == static_cast<size_t>(top_k))
+                return true;
 
-            return requested;
+            LOG_ERROR("[MoEExpertDispatchStage] " << tensor_name << " must have shape ["
+                                                    << seq_len << " or larger, " << top_k
+                                                    << "] or be a sufficiently large flat tensor, got ["
+                                                    << shape[0] << ", " << shape[1] << "]");
+            return false;
         }
 
-        std::string summarizeTokenRows(const std::vector<int> &token_rows)
+        LOG_ERROR("[MoEExpertDispatchStage] " << tensor_name << " must be 1D flat or 2D, got rank " << shape.size());
+        return false;
+    }
+
+    bool validateRoutingTensor(const ITensor *tensor, int seq_len, int top_k, const char *tensor_name)
+    {
+        if (!tensor)
         {
-            constexpr size_t kMaxRowsToPrint = 16;
-            std::ostringstream out;
-            out << "[";
-            const size_t printed = std::min(token_rows.size(), kMaxRowsToPrint);
-            for (size_t i = 0; i < printed; ++i)
-            {
-                if (i > 0)
-                    out << ",";
-                out << token_rows[i];
-            }
-            if (token_rows.size() > printed)
-                out << ",...";
-            out << "]";
-            return out.str();
+            LOG_ERROR("[MoEExpertDispatchStage] Null " << tensor_name << " tensor");
+            return false;
         }
-
-        void traceDispatchOutput(const MoEExpertDispatchOutput &output, int layer)
+        if (tensor->native_type() != TensorType::FP32)
         {
-            const auto &env = debugEnv();
-            if (!env.moe_expert_overlay.transfer_trace && !env.moe_expert_overlay.trace && !env.profile.enabled)
-                return;
-
-            for (const auto &tier : output.tiers)
-            {
-                LOG_INFO("[MoEExpertDispatchStage] layer=" << layer
-                                                           << " tier=" << tier.tier_index
-                                                           << " name=" << tier.tier_name
-                                                           << " domain=" << tier.domain
-                                                           << " selected_rows=" << tier.token_rows.size()
-                                                           << " token_rows=" << summarizeTokenRows(tier.token_rows)
-                                                           << " routed_entries=" << tier.entries.size()
-                                                           << " transfer_required=" << tier.transfer_required
-                                                           << " mode=" << toString(tier.transfer_mode)
-                                                           << " outbound_bytes=" << tier.transfer_volume.outbound_bytes
-                                                           << " return_bytes=" << tier.transfer_volume.return_bytes
-                                                           << " dense_total_bytes=" << tier.transfer_volume.denseTotalBytes());
-            }
+            LOG_ERROR("[MoEExpertDispatchStage] " << tensor_name << " must be FP32");
+            return false;
         }
+        return isFlatOrMatrixRoutingShape(tensor, seq_len, top_k, tensor_name);
+    }
 
-        void dumpPlacementIfRequested(
-            const ExpertLayerPlacement &placement,
-            const std::vector<ExpertRoutedTier> &tiers)
+    bool routeValueToExpertId(float value, int token_row, int route_slot, int &expert_id)
+    {
+        if (!std::isfinite(value))
         {
-            if (!debugEnv().moe_expert_overlay.dump_placement)
-                return;
-
-            for (size_t tier_index = 0; tier_index < tiers.size(); ++tier_index)
-            {
-                const auto &tier = tiers[tier_index];
-                const int assigned_experts = static_cast<int>(std::count(
-                    placement.routed_expert_tier.begin(),
-                    placement.routed_expert_tier.end(),
-                    static_cast<int>(tier_index)));
-                const int resident_experts = tier.max_experts_per_layer > 0
-                                                 ? tier.max_experts_per_layer
-                                                 : assigned_experts;
-                LOG_INFO("[MoEExpertDispatchStage] placement layer=" << placement.layer
-                                                                     << " tier=" << tier_index
-                                                                     << " name=" << tier.name
-                                                                     << " domain=" << tier.domain
-                                                                     << " assigned_experts=" << assigned_experts
-                                                                     << " resident_experts=" << resident_experts
-                                                                     << " fallback=" << (tier.fallback ? "true" : "false"));
-            }
+            LOG_ERROR("[MoEExpertDispatchStage] Non-finite expert id at token_row=" << token_row
+                                                                                     << " route_slot=" << route_slot);
+            return false;
         }
 
-    } // namespace
+        const float rounded = std::round(value);
+        if (std::fabs(value - rounded) > 1e-4f)
+        {
+            LOG_ERROR("[MoEExpertDispatchStage] Non-integral expert id " << value
+                                                                         << " at token_row=" << token_row
+                                                                         << " route_slot=" << route_slot);
+            return false;
+        }
+
+        expert_id = static_cast<int>(rounded);
+        return true;
+    }
+
+    MoEExpertTransferMode resolveTierTransferMode(
+        MoEExpertTransferMode requested,
+        int seq_len,
+        size_t selected_rows)
+    {
+        if (requested == MoEExpertTransferMode::Auto)
+        {
+            if (seq_len == 1 && selected_rows == 1)
+                return MoEExpertTransferMode::DecodeOneToken;
+            return MoEExpertTransferMode::SparseTokenRows;
+        }
+
+        return requested;
+    }
+
+    std::string summarizeTokenRows(const std::vector<int> &token_rows)
+    {
+        constexpr size_t kMaxRowsToPrint = 16;
+        std::ostringstream out;
+        out << "[";
+        const size_t printed = std::min(token_rows.size(), kMaxRowsToPrint);
+        for (size_t i = 0; i < printed; ++i)
+        {
+            if (i > 0)
+                out << ",";
+            out << token_rows[i];
+        }
+        if (token_rows.size() > printed)
+            out << ",...";
+        out << "]";
+        return out.str();
+    }
+
+    void traceDispatchOutput(const MoEExpertDispatchOutput &output, int layer)
+    {
+        const auto &env = debugEnv();
+        if (!env.moe_expert_overlay.transfer_trace && !env.moe_expert_overlay.trace && !env.profile.enabled)
+            return;
+
+        for (const auto &tier : output.tiers)
+        {
+            LOG_INFO("[MoEExpertDispatchStage] layer=" << layer
+                     << " tier=" << tier.tier_index
+                     << " name=" << tier.tier_name
+                     << " domain=" << tier.domain
+                     << " selected_rows=" << tier.token_rows.size()
+                     << " token_rows=" << summarizeTokenRows(tier.token_rows)
+                     << " routed_entries=" << tier.entries.size()
+                     << " transfer_required=" << tier.transfer_required
+                     << " mode=" << toString(tier.transfer_mode)
+                     << " outbound_bytes=" << tier.transfer_volume.outbound_bytes
+                     << " return_bytes=" << tier.transfer_volume.return_bytes
+                     << " dense_total_bytes=" << tier.transfer_volume.denseTotalBytes());
+        }
+    }
+
+    void dumpPlacementIfRequested(
+        const ExpertLayerPlacement &placement,
+        const std::vector<ExpertRoutedTier> &tiers)
+    {
+        if (!debugEnv().moe_expert_overlay.dump_placement)
+            return;
+
+        for (size_t tier_index = 0; tier_index < tiers.size(); ++tier_index)
+        {
+            const auto &tier = tiers[tier_index];
+            const int assigned_experts = static_cast<int>(std::count(
+                placement.routed_expert_tier.begin(),
+                placement.routed_expert_tier.end(),
+                static_cast<int>(tier_index)));
+            const int resident_experts = tier.max_experts_per_layer > 0
+                                             ? tier.max_experts_per_layer
+                                             : assigned_experts;
+            LOG_INFO("[MoEExpertDispatchStage] placement layer=" << placement.layer
+                     << " tier=" << tier_index
+                     << " name=" << tier.name
+                     << " domain=" << tier.domain
+                     << " assigned_experts=" << assigned_experts
+                     << " resident_experts=" << resident_experts
+                     << " fallback=" << (tier.fallback ? "true" : "false"));
+        }
+    }
+
+} // namespace
 
     MoEExpertDispatchStage::MoEExpertDispatchStage(Params params)
         : IComputeStage(params.device_id), params_(std::move(params))
@@ -187,8 +187,8 @@ namespace llaminar2
         if (params_.seq_len <= 0 || params_.top_k <= 0 || params_.d_model <= 0)
         {
             LOG_ERROR("[MoEExpertDispatchStage] Invalid dimensions seq_len=" << params_.seq_len
-                                                                             << " top_k=" << params_.top_k
-                                                                             << " d_model=" << params_.d_model);
+                                                                              << " top_k=" << params_.top_k
+                                                                              << " d_model=" << params_.d_model);
             return false;
         }
         if (!params_.placement.has_value())
@@ -217,7 +217,7 @@ namespace llaminar2
         if (placement.routed_expert_tier.empty())
         {
             LOG_ERROR("[MoEExpertDispatchStage] Placement for layer " << placement.layer
-                                                                      << " has no routed expert assignments");
+                                                                       << " has no routed expert assignments");
             return false;
         }
 
@@ -259,11 +259,11 @@ namespace llaminar2
                 if (expert_id < 0 || expert_id >= static_cast<int>(placement.routed_expert_tier.size()))
                 {
                     LOG_ERROR("[MoEExpertDispatchStage] Expert id " << expert_id
-                                                                    << " at token_row=" << token_row
-                                                                    << " route_slot=" << route_slot
-                                                                    << " is outside placement coverage of "
-                                                                    << placement.routed_expert_tier.size()
-                                                                    << " experts");
+                                                                     << " at token_row=" << token_row
+                                                                     << " route_slot=" << route_slot
+                                                                     << " is outside placement coverage of "
+                                                                     << placement.routed_expert_tier.size()
+                                                                     << " experts");
                     return false;
                 }
 
@@ -271,8 +271,8 @@ namespace llaminar2
                 if (tier_index < 0 || tier_index >= static_cast<int>(params_.routed_tiers.size()))
                 {
                     LOG_ERROR("[MoEExpertDispatchStage] Expert id " << expert_id
-                                                                    << " maps to invalid tier index " << tier_index
-                                                                    << " for layer " << placement.layer);
+                                                                     << " maps to invalid tier index " << tier_index
+                                                                     << " for layer " << placement.layer);
                     return false;
                 }
 
@@ -351,8 +351,8 @@ namespace llaminar2
         }
 
         traceDispatchOutput(result, placement.layer);
-        dumpPlacementIfRequested(placement, params_.routed_tiers);
-        MoEExpertOverlayProfiler::recordDispatch(placement.layer, result, placement, params_.routed_tiers);
+    dumpPlacementIfRequested(placement, params_.routed_tiers);
+    MoEExpertOverlayProfiler::recordDispatch(placement.layer, result, placement, params_.routed_tiers);
 
         *params_.output = std::move(result);
         return true;

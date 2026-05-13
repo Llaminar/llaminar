@@ -13,7 +13,9 @@ namespace llaminar2
                device == other.device &&
                layer == other.layer &&
                expert == other.expert &&
-               role == other.role;
+               role == other.role &&
+               participant_world_rank == other.participant_world_rank &&
+               participant_index == other.participant_index;
     }
 
     size_t ExpertGemmRegistry::KeyHash::operator()(const Key &k) const
@@ -23,6 +25,8 @@ namespace llaminar2
         hash ^= std::hash<int>{}(k.layer) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
         hash ^= std::hash<int>{}(k.expert) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
         hash ^= std::hash<uint8_t>{}(static_cast<uint8_t>(k.role)) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
+        hash ^= std::hash<int>{}(k.participant_world_rank) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
+        hash ^= std::hash<int>{}(k.participant_index) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
         return hash;
     }
 
@@ -36,9 +40,44 @@ namespace llaminar2
                                                      DeviceId device, int layer, int expert, WeightRole role,
                                                      ITensorGemm *engine, std::shared_ptr<ITensorGemm> ownership)
     {
+        registerEngineForParticipant(domain_name, device, -1, -1, layer, expert, role, engine, std::move(ownership));
+    }
+
+    void ExpertGemmRegistry::registerEngineForParticipant(const std::string &domain_name,
+                                                          DeviceId device, int participant_world_rank, int participant_index,
+                                                          int layer, int expert, WeightRole role,
+                                                          ITensorGemm *engine, std::shared_ptr<ITensorGemm> ownership)
+    {
         std::unique_lock lock(mutex_);
         Key key{domain_name, device, layer, expert, role};
+        key.participant_world_rank = participant_world_rank;
+        key.participant_index = participant_index;
         engines_[key] = Entry{engine, std::move(ownership)};
+    }
+
+    bool ExpertGemmRegistry::aliasEngineForDomainFromDevice(const std::string &domain_name,
+                                                            DeviceId device, int layer, int expert, WeightRole role)
+    {
+        return aliasEngineForParticipantFromDevice(domain_name, device, -1, -1, layer, expert, role);
+    }
+
+    bool ExpertGemmRegistry::aliasEngineForParticipantFromDevice(const std::string &domain_name,
+                                                                 DeviceId device, int participant_world_rank, int participant_index,
+                                                                 int layer, int expert, WeightRole role)
+    {
+        std::unique_lock lock(mutex_);
+        Key source_key{{}, device, layer, expert, role};
+        source_key.participant_world_rank = -1;
+        source_key.participant_index = -1;
+        auto source = engines_.find(source_key);
+        if (source == engines_.end() || source->second.engine == nullptr)
+            return false;
+
+        Key alias_key{domain_name, device, layer, expert, role};
+        alias_key.participant_world_rank = participant_world_rank;
+        alias_key.participant_index = participant_index;
+        engines_[alias_key] = source->second;
+        return true;
     }
 
     ITensorGemm *ExpertGemmRegistry::getEngine(DeviceId device, int layer, int expert, WeightRole role) const
@@ -49,8 +88,17 @@ namespace llaminar2
     ITensorGemm *ExpertGemmRegistry::getEngineForDomain(const std::string &domain_name,
                                                         DeviceId device, int layer, int expert, WeightRole role) const
     {
+        return getEngineForParticipant(domain_name, device, -1, -1, layer, expert, role);
+    }
+
+    ITensorGemm *ExpertGemmRegistry::getEngineForParticipant(const std::string &domain_name,
+                                                             DeviceId device, int participant_world_rank, int participant_index,
+                                                             int layer, int expert, WeightRole role) const
+    {
         std::shared_lock lock(mutex_);
         Key key{domain_name, device, layer, expert, role};
+        key.participant_world_rank = participant_world_rank;
+        key.participant_index = participant_index;
         auto it = engines_.find(key);
         if (it == engines_.end())
             return nullptr;

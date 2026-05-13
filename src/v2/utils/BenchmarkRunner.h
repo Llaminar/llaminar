@@ -131,6 +131,14 @@ namespace llaminar2
         std::string generateDefaultPrompt() const;
 
         /**
+         * @brief Synchronize rank-local success across all benchmark ranks
+         * @param local_success Whether this rank completed the phase locally
+         * @param phase Human-readable phase name for diagnostics
+         * @return true only if every rank reported success
+         */
+        bool synchronizeSuccess(bool local_success, const char *phase) const;
+
+        /**
          * @brief Run prefill phase and measure timing
          * @param tokens Input token IDs
          * @return Pair of (success, time_ms)

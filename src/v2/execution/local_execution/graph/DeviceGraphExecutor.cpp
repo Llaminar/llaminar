@@ -441,6 +441,21 @@ namespace llaminar2
     // code paths where one path does coherence/validation and another skips it.
     // =========================================================================
 
+    bool DeviceGraphExecutor::cancellationRequested(const std::string &node_name) const
+    {
+        if (!config_.cancellation_requested || !config_.cancellation_requested())
+            return false;
+
+        LOG_WARN("[DeviceGraphExecutor] Execution canceled before stage: " << node_name);
+        return true;
+    }
+
+    void DeviceGraphExecutor::notifyStageFailure(const std::string &node_name, const std::string &reason) const
+    {
+        if (config_.stage_failure_callback)
+            config_.stage_failure_callback(node_name, reason);
+    }
+
     bool DeviceGraphExecutor::runStages(
         ComputeGraph &graph,
         IDeviceContext *ctx,
@@ -508,8 +523,12 @@ namespace llaminar2
             if (!node || !node->stage)
             {
                 LOG_ERROR("[DeviceGraphExecutor] Invalid node at schedule index " << i);
+                notifyStageFailure("(invalid)", "invalid node in execution schedule");
                 return false;
             }
+
+            if (cancellationRequested(node->name))
+                return false;
 
             ensureStageGPUStreamBound(*node, ctx);
 
@@ -519,6 +538,7 @@ namespace llaminar2
             if (!runStage(*node, ctx, policy, is_coll))
             {
                 LOG_ERROR("[DeviceGraphExecutor] Stage failed: " << node->name);
+                notifyStageFailure(node->name, "stage execution returned false");
                 return false;
             }
 
@@ -1208,6 +1228,9 @@ namespace llaminar2
             if (!node || !node->stage)
                 continue;
 
+            if (cancellationRequested(name))
+                return false;
+
             // Find appropriate context for this node's device
             IDeviceContext *ctx = default_ctx;
             if (node->device.is_gpu())
@@ -1222,6 +1245,7 @@ namespace llaminar2
             if (!executeNode(*node, ctx))
             {
                 LOG_ERROR("[DeviceGraphExecutor] Stage failed: " << name << " on device " << node->device.to_string());
+                notifyStageFailure(name, "stage execution returned false");
                 return false;
             }
 

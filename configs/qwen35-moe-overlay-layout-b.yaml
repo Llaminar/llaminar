@@ -1,0 +1,16 @@
+domains:
+  - "cuda_fast=0:cuda:0;scope=single;backend=auto;compute=replicated_experts;owner=0"
+  - "rocm_warm=0:rocm:0,0:rocm:1;scope=local;backend=rccl;compute=tensor_parallel_experts;owner=1"
+  - "cpu_cold=0:cpu:0,1:cpu:0;scope=node_local;backend=upi;compute=tensor_parallel_experts;ranks=0,2"
+moe_expert_parallel:
+  enabled: true
+  execution_kind: tiered
+  continuation_domain: cuda_fast
+  base_model_domain: cuda_fast
+  shared_expert_domain: cuda_fast
+  residency:
+    mode: static-by-id
+  routed_tiers:
+    - "hottest@cuda_fast;priority=0;max-experts-per-layer=4;memory-mb=512"
+    - "warm@rocm_warm;priority=1;max-experts-per-layer=8;memory-mb=auto"
+    - "cold@cpu_cold;priority=2;fallback=true"

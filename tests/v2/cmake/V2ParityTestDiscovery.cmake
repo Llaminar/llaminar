@@ -14,6 +14,7 @@
 #   NUM_SOCKETS      - Detected CPU socket count
 #   CORES_PER_SOCKET - Cores per socket
 #   WORKING_DIR      - Working directory for tests
+#   TIMEOUT          - Optional per-test timeout in seconds
 # =============================================================================
 
 # --- Run the binary to discover tests (no mpirun needed) --------------------
@@ -90,6 +91,7 @@ set(_mpi_cmd
     "--map-by" "socket"
     "--mca" "mpi_leave_pinned" "1"
     "--mca" "btl_vader_single_copy_mechanism" "none"
+    "--mca" "orte_allowed_exit_without_sync" "1"
 )
 
 # Add --oversubscribe if we have fewer sockets than MPI ranks
@@ -161,6 +163,9 @@ foreach(_full_name IN LISTS _all_tests)
     string(APPEND _output "    ENVIRONMENT \"${_env_escaped}\"\n")
     string(APPEND _output "    WORKING_DIRECTORY \"${WORKING_DIR}\"\n")
     string(APPEND _output "    PROCESSORS 4\n")
+    if(DEFINED TIMEOUT AND NOT "${TIMEOUT}" STREQUAL "")
+        string(APPEND _output "    TIMEOUT \"${TIMEOUT}\"\n")
+    endif()
     # Serialize with ALL integration tests (same lock as add_v2_mpi_test).
     # Parity tests load large models and consume significant memory/GPU resources.
     # Using the same lock as regular integration tests prevents any concurrent execution.

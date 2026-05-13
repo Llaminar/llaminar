@@ -11,9 +11,31 @@
 #include <iostream>
 #include <climits>
 #include <sstream>
+#include <string>
 
 namespace llaminar2
 {
+    namespace
+    {
+        int finalizeAfterUnhandledException(AppContext &ctx, const char *mode_name, const std::string &detail)
+        {
+            const bool has_mpi = ctx.mpi_ctx != nullptr;
+            const bool is_root = !has_mpi || ctx.mpi_ctx->rank() == 0;
+            const bool notify_workers = has_mpi && ctx.mpi_ctx->world_size() > 1 && ctx.mpi_ctx->rank() == 0;
+
+            if (is_root)
+                LOG_ERROR(mode_name << " failed with unhandled exception: " << detail);
+
+            if (ctx.runner)
+            {
+                if (notify_workers)
+                    ctx.runner->abortMPIWorkers(detail);
+                ctx.runner->shutdown();
+            }
+            mpiShutdown();
+            return 1;
+        }
+    } // namespace
 
     bool CompletionMode::matches(const OrchestrationConfig & /*config*/) const
     {
@@ -22,11 +44,40 @@ namespace llaminar2
     }
 
     int CompletionMode::execute(AppContext &ctx)
+    try
     {
         auto &config = ctx.config;
         auto &mpi_ctx = ctx.mpi_ctx;
         auto &runner = ctx.runner;
         auto &tokenizer = ctx.tokenizer;
+
+        const bool mpi_coordinated = mpi_ctx->world_size() > 1;
+        if (mpi_coordinated && mpi_ctx->rank() != 0)
+        {
+            LOG_INFO("Rank " << mpi_ctx->rank()
+                             << " entering MPI worker loop for completion inference");
+            runner->setMPICoordinatedMode(true);
+            runner->runMPIWorkerLoop();
+            runner->shutdown();
+            mpiShutdown();
+            return 0;
+        }
+
+        if (mpi_coordinated)
+        {
+            runner->setMPICoordinatedMode(true);
+        }
+
+        auto shutdownAndFinalize = [&](int exit_code) -> int
+        {
+            if (mpi_coordinated)
+            {
+                runner->shutdownMPIWorkers();
+            }
+            runner->shutdown();
+            mpiShutdown();
+            return exit_code;
+        };
 
         // Tokenize prompt
         std::vector<int32_t> tokens;
@@ -41,9 +92,7 @@ namespace llaminar2
                 {
                     LOG_ERROR("Tokenization resulted in empty token sequence");
                 }
-                runner->shutdown();
-                mpiShutdown();
-                return 1;
+                return shutdownAndFinalize(1);
             }
 
             if (mpi_ctx->rank() == 0)
@@ -67,9 +116,7 @@ namespace llaminar2
             {
                 LOG_ERROR("Error tokenizing prompt: " << e.what());
             }
-            runner->shutdown();
-            mpiShutdown();
-            return 1;
+            return shutdownAndFinalize(1);
         }
 
         // Set up sampling parameters
@@ -100,9 +147,7 @@ namespace llaminar2
             {
                 LOG_ERROR("Error: Prefill forward pass failed: " << runner->lastError());
             }
-            runner->shutdown();
-            mpiShutdown();
-            return 1;
+            return shutdownAndFinalize(1);
         }
 
         if (mpi_ctx->rank() == 0)
@@ -134,9 +179,7 @@ namespace llaminar2
                 {
                     LOG_ERROR("\nError: Decode step failed at token " << (i + 1) << ": " << result.error);
                 }
-                runner->shutdown();
-                mpiShutdown();
-                return 1;
+                return shutdownAndFinalize(1);
             }
 
             if (result.tokens.empty())
@@ -175,20 +218,15 @@ namespace llaminar2
             LOG_DEBUG("Generation complete.");
         }
 
-        if (mpi_ctx->world_size() > 1)
-        {
-            mpi_ctx->barrier();
-        }
-
-        runner->shutdown();
-
-        if (mpi_ctx->world_size() > 1)
-        {
-            mpi_ctx->barrier();
-        }
-
-        mpiShutdown();
-        return 0;
+        return shutdownAndFinalize(0);
+    }
+    catch (const std::exception &e)
+    {
+        return finalizeAfterUnhandledException(ctx, "Completion mode", e.what());
+    }
+    catch (...)
+    {
+        return finalizeAfterUnhandledException(ctx, "Completion mode", "unknown non-std exception");
     }
 
 } // namespace llaminar2

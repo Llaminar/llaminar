@@ -12,16 +12,34 @@
 #include "ShmemSpinBackend.h"
 #include "../../utils/Assertions.h"
 #include "../../utils/CPUFeatures.h"
+#include "../../utils/DebugEnv.h"
 #include "../../utils/Logger.h"
 
+#include <chrono>
 #include <cstring>    // memcpy
 #include <fcntl.h>    // O_CREAT, O_RDWR
 #include <immintrin.h>
+#include <limits>
+#include <mpi.h>
 #include <sys/mman.h> // shm_open, mmap, munmap, shm_unlink
 #include <unistd.h>   // ftruncate, close
 
 namespace llaminar2
 {
+    namespace
+    {
+        constexpr uint64_t kAbortEpoch = std::numeric_limits<uint64_t>::max();
+        constexpr int kDefaultReleaseTimeoutMs = 300000;
+
+        int shmemSpinTimeoutMs()
+        {
+            const int configured = debugEnv().tp_collect_timeout_ms;
+            if (configured < 0)
+                return 0;
+            return configured > 0 ? configured : kDefaultReleaseTimeoutMs;
+        }
+    } // namespace
+
 
     // =========================================================================
     // Constructor / Destructor
@@ -109,6 +127,7 @@ namespace llaminar2
             return false;
         }
 
+        abort_requested_.store(false, std::memory_order_release);
         initialized_ = true;
 
         LOG_DEBUG("ShmemSpinBackend initialized: domain=" << domain_id_
@@ -140,6 +159,15 @@ namespace llaminar2
         }
 
         LOG_DEBUG("ShmemSpinBackend shutdown: domain=" << domain_id_ << " rank=" << my_rank_);
+    }
+
+    void ShmemSpinBackend::abort()
+    {
+        abort_requested_.store(true, std::memory_order_release);
+        if (arena_ && my_rank_ >= 0)
+            arena_->epoch_at(my_rank_)->epoch.store(kAbortEpoch, std::memory_order_release);
+        if (fallback_)
+            fallback_->abort();
     }
 
     // =========================================================================
@@ -274,6 +302,55 @@ namespace llaminar2
         }
     }
 
+    bool ShmemSpinBackend::waitForPeerEpoch(int peer_rank, uint64_t target_epoch, const char *phase, size_t count)
+    {
+        const int timeout_ms = shmemSpinTimeoutMs();
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+        uint64_t spins = 0;
+
+        while (true)
+        {
+            const uint64_t peer_epoch = arena_->epoch_at(peer_rank)->epoch.load(std::memory_order_acquire);
+            if (peer_epoch == kAbortEpoch)
+            {
+                last_error_ = "peer rank " + std::to_string(peer_rank) +
+                              " aborted ShmemSpinBackend domain " + std::to_string(domain_id_) +
+                              " while " + phase;
+                LOG_ERROR("ShmemSpinBackend - " << last_error_);
+                abort();
+                return false;
+            }
+            if (peer_epoch >= target_epoch)
+                return true;
+            if (abort_requested_.load(std::memory_order_acquire))
+            {
+                last_error_ = "ShmemSpinBackend abort requested while waiting for peer rank " +
+                              std::to_string(peer_rank) + " to reach epoch " + std::to_string(target_epoch) +
+                              " while " + phase;
+                LOG_ERROR("ShmemSpinBackend - " << last_error_);
+                abort();
+                return false;
+            }
+            if (timeout_ms > 0 && (++spins & 0x3fffU) == 0 && std::chrono::steady_clock::now() >= deadline)
+            {
+                last_error_ = "ShmemSpinBackend timed out after " + std::to_string(timeout_ms) +
+                              "ms on domain " + std::to_string(domain_id_) +
+                              " rank " + std::to_string(my_rank_) +
+                              " waiting for peer " + std::to_string(peer_rank) +
+                              " while " + phase +
+                              " (target_epoch=" + std::to_string(target_epoch) +
+                              ", peer_epoch=" + std::to_string(peer_epoch) +
+                              ", count=" + std::to_string(count) + ")";
+                LOG_ERROR("ShmemSpinBackend - " << last_error_
+                          << "; aborting MPI job to avoid rank desynchronization");
+                abort();
+                MPI_Abort(MPI_COMM_WORLD, 1);
+                return false;
+            }
+            _mm_pause();
+        }
+    }
+
     // =========================================================================
     // Collective Operations
     // =========================================================================
@@ -281,6 +358,12 @@ namespace llaminar2
     bool ShmemSpinBackend::allreduce(void *buffer, size_t count,
                                      CollectiveDataType dtype, CollectiveOp op)
     {
+        if (abort_requested_.load(std::memory_order_acquire))
+        {
+            last_error_ = "ShmemSpinBackend abort has been requested";
+            return false;
+        }
+
         if (!initialized_ || !arena_)
         {
             last_error_ = "ShmemSpinBackend not initialized";
@@ -317,10 +400,8 @@ namespace llaminar2
             {
                 if (r == my_rank_)
                     continue;
-                while (arena_->epoch_at(r)->epoch.load(std::memory_order_acquire) < my_epoch_)
-                {
-                    _mm_pause();
-                }
+                if (!waitForPeerEpoch(r, my_epoch_, "entering allreduce fast path", count))
+                    return false;
             }
 
             // 4. N-way reduce: accumulate all rank buffers
@@ -380,10 +461,8 @@ namespace llaminar2
             {
                 if (r == my_rank_)
                     continue;
-                while (arena_->epoch_at(r)->epoch.load(std::memory_order_acquire) < my_epoch_)
-                {
-                    _mm_pause();
-                }
+                if (!waitForPeerEpoch(r, my_epoch_, "leaving allreduce fast path", count))
+                    return false;
             }
 
             return true;
@@ -465,10 +544,8 @@ namespace llaminar2
         {
             if (r == my_rank_)
                 continue;
-            while (arena_->epoch_at(r)->epoch.load(std::memory_order_acquire) < my_epoch_)
-            {
-                _mm_pause();
-            }
+            if (!waitForPeerEpoch(r, my_epoch_, "synchronizing", 0))
+                return false;
         }
         return true;
     }

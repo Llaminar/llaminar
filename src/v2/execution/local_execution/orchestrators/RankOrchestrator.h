@@ -73,8 +73,10 @@ namespace llaminar2
     class TensorBase;
     class LogitsGatherer;
     class DeviceSampler;
+    class IMPIContext;
     class PreparedWeightStore;
     struct GraphExecutorStats;
+    struct MoEExpertParallelPlan;
     struct PlacementPlan;
     struct PPActivationContract;
 
@@ -226,9 +228,11 @@ namespace llaminar2
             /// and its per-device runners.
             std::shared_ptr<PreparedWeightStore> prepared_weight_store;
 
-            /// Optional same-layer MoE expert overlay plan propagated from
-            /// orchestration config to per-device runner configs.
+            /// Optional same-layer MoE expert overlay plan propagated to child graph runners.
             std::shared_ptr<MoEExpertParallelPlan> moe_expert_parallel_plan;
+
+            /// Optional MPI context used by MoE overlay domain-worker commands.
+            std::shared_ptr<IMPIContext> moe_expert_overlay_mpi_ctx;
 
             // =================================================================
             // Helper Methods

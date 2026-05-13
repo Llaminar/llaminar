@@ -39,13 +39,17 @@ namespace llaminar2
         if (!enabled)
             return;
 
-        auto log_backend = [&](IBackend *b, const char *name) {
-            if (!b) return;
+        auto log_backend = [&](IBackend *b, const char *name)
+        {
+            if (!b)
+                return;
             int n = b->deviceCount();
-            for (int i = 0; i < n; ++i) {
+            for (int i = 0; i < n; ++i)
+            {
                 size_t free_b = b->deviceMemoryFree(i);
                 size_t total_b = b->deviceMemoryTotal(i);
-                if (total_b == 0) continue;
+                if (total_b == 0)
+                    continue;
                 double free_mb = free_b / (1024.0 * 1024.0);
                 double total_mb = total_b / (1024.0 * 1024.0);
                 double used_mb = total_mb - free_mb;
@@ -133,9 +137,8 @@ namespace llaminar2
 
         bool success = runner_->forward(tokens.data(), tokens.size());
 
-        // Synchronize after forward for accurate timing
-        if (mpi_ctx_->world_size() > 1)
-            mpi_ctx_->barrier();
+        // Synchronize after forward and propagate failures to every rank.
+        success = synchronizeSuccess(success, "prefill");
 
         auto end = std::chrono::high_resolution_clock::now();
         double time_ms = std::chrono::duration<double, std::milli>(end - start).count();
@@ -206,11 +209,9 @@ namespace llaminar2
             tokens_generated++;
 
             // Forward the token through pipeline
-            if (!runner_->forward(&next_token, 1))
+            const bool forward_success = runner_->forward(&next_token, 1);
+            if (!synchronizeSuccess(forward_success, "decode forward"))
             {
-                // Synchronize on failure
-                if (mpi_ctx_->world_size() > 1)
-                    mpi_ctx_->barrier();
                 auto end = std::chrono::high_resolution_clock::now();
                 double time_ms = std::chrono::duration<double, std::milli>(end - start).count();
                 return {false, time_ms, tokens_generated, generated_text};
@@ -222,11 +223,13 @@ namespace llaminar2
         }
 
         // Synchronize after decode phase (skip for single-rank)
-        if (mpi_ctx_->world_size() > 1)
-            mpi_ctx_->barrier();
+        const bool decode_success = synchronizeSuccess(true, "decode complete");
 
         auto end = std::chrono::high_resolution_clock::now();
         double time_ms = std::chrono::duration<double, std::milli>(end - start).count();
+
+        if (!decode_success)
+            return {false, time_ms, tokens_generated, generated_text};
 
         // Report sampler overhead
         if (profile_sampler && mpi_ctx_->rank() == 0 && tokens_generated > 0)
@@ -240,6 +243,38 @@ namespace llaminar2
         }
 
         return {true, time_ms, tokens_generated, generated_text};
+    }
+
+    bool BenchmarkRunner::synchronizeSuccess(bool local_success, const char *phase) const
+    {
+        if (!mpi_ctx_ || mpi_ctx_->world_size() <= 1)
+            return local_success;
+
+        const float local = local_success ? 1.0f : 0.0f;
+        float global_sum = 0.0f;
+
+        try
+        {
+            mpi_ctx_->allreduce_sum(&local, &global_sum, 1);
+        }
+        catch (const std::exception &e)
+        {
+            LOG_ERROR("Benchmark " << phase << " failure synchronization failed: " << e.what());
+            return false;
+        }
+        catch (...)
+        {
+            LOG_ERROR("Benchmark " << phase << " failure synchronization failed: unknown exception");
+            return false;
+        }
+
+        const bool global_success = global_sum >= static_cast<float>(mpi_ctx_->world_size()) - 0.5f;
+        if (!global_success && mpi_ctx_->rank() == 0)
+        {
+            LOG_ERROR("Benchmark " << phase << " failed on at least one rank (success_sum="
+                                   << global_sum << "/" << mpi_ctx_->world_size() << ")");
+        }
+        return global_success;
     }
 
     BenchmarkResult BenchmarkRunner::run(const OrchestrationConfig &config)
@@ -339,7 +374,8 @@ namespace llaminar2
         runner_->setSkipLogitsGatherPrefill(true);
 
         // Warmup prefill
-        auto [warmup_prefill_success, warmup_prefill_time] = runPrefill(tokens);        if (!warmup_prefill_success)
+        auto [warmup_prefill_success, warmup_prefill_time] = runPrefill(tokens);
+        if (!warmup_prefill_success)
         {
             if (mpi_ctx_->rank() == 0)
             {

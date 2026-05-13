@@ -27,12 +27,35 @@
 #include <fstream>
 #endif
 #include <csignal>
+#include <exception>
 #include <filesystem>
+#include <string>
 
 using json = nlohmann::json;
 
 namespace llaminar2
 {
+    namespace
+    {
+        int finalizeAfterUnhandledException(AppContext &ctx, const std::string &detail)
+        {
+            const bool has_mpi = ctx.mpi_ctx != nullptr;
+            const bool notify_workers = has_mpi && ctx.mpi_ctx->world_size() > 1 && ctx.mpi_ctx->rank() == 0;
+            const bool is_root = !has_mpi || ctx.mpi_ctx->rank() == 0;
+
+            if (is_root)
+                LOG_ERROR("Server mode failed with unhandled exception: " << detail);
+
+            if (ctx.runner)
+            {
+                if (notify_workers)
+                    ctx.runner->abortMPIWorkers(detail);
+                ctx.runner->shutdown();
+            }
+            mpiShutdown();
+            return 1;
+        }
+    } // namespace
 
     // Global signal handling for clean shutdown
     static std::atomic<bool> g_shutdown_requested{false};
@@ -51,6 +74,7 @@ namespace llaminar2
     }
 
     int ServerMode::execute(AppContext &ctx)
+    try
     {
         auto &config = ctx.config;
         auto &mpi_ctx = ctx.mpi_ctx;
@@ -212,6 +236,14 @@ namespace llaminar2
         runner->shutdown();
         mpiShutdown();
         return 0;
+    }
+    catch (const std::exception &e)
+    {
+        return finalizeAfterUnhandledException(ctx, e.what());
+    }
+    catch (...)
+    {
+        return finalizeAfterUnhandledException(ctx, "unknown exception");
     }
 
 } // namespace llaminar2

@@ -162,32 +162,27 @@ namespace llaminar2
         return true;
     }
 
-    bool MoEExpertComputeStage::updateExpertMask(const std::vector<bool> &mask)
-    {
-        if (static_cast<int>(mask.size()) != params_.num_experts)
-        {
+    bool MoEExpertComputeStage::updateExpertMask(const std::vector<bool>& mask) {
+        if (static_cast<int>(mask.size()) != params_.num_experts) {
             LOG_ERROR("[MoEExpertComputeStage] Expert mask size " << mask.size()
-                                                                  << " != num_experts " << params_.num_experts);
+                      << " != num_experts " << params_.num_experts);
             return false;
         }
         params_.expert_mask = mask;
         return true;
     }
 
-    ExpertWeightBlobs MoEExpertComputeStage::detachAndSerializeExpert(int expert_id)
-    {
+    ExpertWeightBlobs MoEExpertComputeStage::detachAndSerializeExpert(int expert_id) {
         auto ctx = buildWeightContext();
         return MoEExpertWeightService::detachAndSerializeExpert(ctx, expert_id);
     }
 
-    ExpertWeightBlobs MoEExpertComputeStage::serializeExpert(int expert_id) const
-    {
-        auto ctx = const_cast<MoEExpertComputeStage *>(this)->buildWeightContext();
+    ExpertWeightBlobs MoEExpertComputeStage::serializeExpert(int expert_id) const {
+        auto ctx = const_cast<MoEExpertComputeStage*>(this)->buildWeightContext();
         return MoEExpertWeightService::serializeExpert(ctx, expert_id);
     }
 
-    size_t MoEExpertComputeStage::releaseRawExpertWeights()
-    {
+    size_t MoEExpertComputeStage::releaseRawExpertWeights() {
         auto ctx = buildWeightContext();
         size_t freed = MoEExpertWeightService::releaseRawWeights(ctx);
         raw_weights_released_ = true;
@@ -196,31 +191,27 @@ namespace llaminar2
 
     // ── Phased rebalance API ─────────────────────────────────────────────
 
-    std::vector<const TensorBase *> MoEExpertComputeStage::releaseDepartedExperts(
-        const std::vector<bool> &new_mask)
-    {
+    std::vector<const TensorBase*> MoEExpertComputeStage::releaseDepartedExperts(
+        const std::vector<bool>& new_mask) {
         auto ctx = buildWeightContext();
         return MoEExpertWeightService::releaseDepartedExperts(ctx, new_mask);
     }
 
     bool MoEExpertComputeStage::registerAndPrepareNewExperts(
-        const std::vector<bool> &new_mask,
-        const std::unordered_map<int, ExpertWeightBlobs> *received_weights)
-    {
+        const std::vector<bool>& new_mask,
+        const std::unordered_map<int, ExpertWeightBlobs>* received_weights) {
         auto ctx = buildWeightContext();
         return MoEExpertWeightService::registerAndPrepareNewExperts(ctx, new_mask, received_weights);
     }
 
-    void MoEExpertComputeStage::applyExpertMask(const std::vector<bool> &new_mask)
-    {
+    void MoEExpertComputeStage::applyExpertMask(const std::vector<bool>& new_mask) {
         params_.expert_mask = new_mask;
         cached_gate_gemm_.clear();
         cached_up_gemm_.clear();
         cached_down_gemm_.clear();
     }
 
-    MoEWeightContext MoEExpertComputeStage::buildWeightContext()
-    {
+    MoEWeightContext MoEExpertComputeStage::buildWeightContext() {
         return MoEWeightContext{
             params_.device_id,
             params_.num_experts,
@@ -248,7 +239,8 @@ namespace llaminar2
             params_.expert_registry,
             params_.gate_slab_ref,
             params_.up_slab_ref,
-            params_.down_slab_ref};
+            params_.down_slab_ref
+        };
     }
 
     IMoEKernel *MoEExpertComputeStage::ensureMoEKernel() const
@@ -325,7 +317,7 @@ namespace llaminar2
         const int local_end = local_start + local_count;
 
         const bool has_prefill_mask = !params_.replica_set.prefill_mask.empty();
-        const std::vector<bool> &prefill_mask_ref = params_.replica_set.prefill_mask;
+        const std::vector<bool>& prefill_mask_ref = params_.replica_set.prefill_mask;
         const bool has_replicas = params_.replica_set.num_replicated > 0;
 
         // =====================================================================
@@ -333,8 +325,8 @@ namespace llaminar2
         // Avoids D2H of routing tensors and CPU grouping O(seq_len * top_k)
         // =====================================================================
         if (is_gpu && kernel->prepareExpertGroups(
-                          params_.routing_indices, params_.routing_weights,
-                          seq_len, num_experts, top_k))
+                params_.routing_indices, params_.routing_weights,
+                seq_len, num_experts, top_k))
         {
             // Scratch sizing based on max local expert token count
             int max_batch = 0;
@@ -342,8 +334,7 @@ namespace llaminar2
             for (int e = 0; e < num_experts; ++e)
             {
                 bool is_local;
-                if (has_prefill_mask)
-                    is_local = prefill_mask_ref[e];
+                if (has_prefill_mask) is_local = prefill_mask_ref[e];
                 else if (!params_.expert_mask.empty())
                 {
                     is_local = params_.expert_mask[e];
@@ -352,8 +343,7 @@ namespace llaminar2
                         params_.replica_set.owner_socket[e] != params_.my_socket_id)
                         is_local = false;
                 }
-                else
-                    is_local = (e >= local_start && e < local_end);
+                else is_local = (e >= local_start && e < local_end);
                 if (is_local)
                 {
                     if (kernel->getExpertTokenCount(e) > 0)
@@ -380,13 +370,11 @@ namespace llaminar2
             for (int expert_id = 0; expert_id < num_experts; ++expert_id)
             {
                 int count = kernel->getExpertTokenCount(expert_id);
-                if (count == 0)
-                    continue;
+                if (count == 0) continue;
 
                 // Same locality check as CPU path
                 bool is_local;
-                if (has_prefill_mask)
-                    is_local = prefill_mask_ref[expert_id];
+                if (has_prefill_mask) is_local = prefill_mask_ref[expert_id];
                 else if (!params_.expert_mask.empty())
                 {
                     is_local = params_.expert_mask[expert_id];
@@ -395,10 +383,8 @@ namespace llaminar2
                         params_.replica_set.owner_socket[expert_id] != params_.my_socket_id)
                         is_local = false;
                 }
-                else
-                    is_local = (expert_id >= local_start && expert_id < local_end);
-                if (!is_local)
-                    continue;
+                else is_local = (expert_id >= local_start && expert_id < local_end);
+                if (!is_local) continue;
 
                 kernel->gatherExpertBatch(
                     params_.input, scratch_batch_.get(), expert_id, d_model);
@@ -452,7 +438,7 @@ namespace llaminar2
                 markStandaloneGpuOutputWritten(params_.output, params_.device_id, gpuStream());
 
             LOG_TRACE("[MoEExpertComputeStage] GPU prefill: " << seq_len << " tokens, "
-                                                              << top_k << " experts per token");
+                                                 << top_k << " experts per token");
             return true;
         }
 
@@ -593,7 +579,7 @@ namespace llaminar2
         }
 
         LOG_TRACE("[MoEExpertComputeStage] Processed " << seq_len << " tokens via GEMM kernels, "
-                                                       << top_k << " experts per token");
+                                             << top_k << " experts per token");
         if (is_gpu && params_.output->needsUpload() &&
             !params_.output->ensureOnDevice(params_.device_id, gpuStream()))
         {
@@ -680,12 +666,7 @@ namespace llaminar2
         // OMP parallel region (not 8×), saving ~7×(2µs quant + 6µs OMP)
         // = ~56µs per layer × 36 MoE layers = ~2ms per decode token.
         // ---------------------------------------------------------------
-        struct ActiveExpert
-        {
-            int expert_id;
-            float weight;
-            int batch_idx;
-        };
+        struct ActiveExpert { int expert_id; float weight; int batch_idx; };
         ActiveExpert active_experts[16]; // stack-allocated, max top_k
         int num_active = 0;
 
@@ -745,8 +726,7 @@ namespace llaminar2
 
         for (int k = 0; k < top_k; ++k)
         {
-            if (!compute_here[k])
-                continue;
+            if (!compute_here[k]) continue;
 
             const int expert_id = routing_int_indices[k];
 
@@ -756,10 +736,10 @@ namespace llaminar2
             if (!gate_gemm || !up_gemm)
             {
                 LOG_ERROR("[MoEExpertComputeStage] FATAL: Null gate/up GEMM engine for expert "
-                          << expert_id << " (layer " << params_.layer_idx
-                          << ", mask=" << (params_.expert_mask.empty() ? -1 : (int)params_.expert_mask[expert_id])
-                          << ", replicated=" << params_.replica_set.is_replicated[expert_id]
-                          << ", prepared_gate=" << (bool)params_.prepared_gate_gemm[expert_id] << ")");
+                    << expert_id << " (layer " << params_.layer_idx
+                    << ", mask=" << (params_.expert_mask.empty() ? -1 : (int)params_.expert_mask[expert_id])
+                    << ", replicated=" << params_.replica_set.is_replicated[expert_id]
+                    << ", prepared_gate=" << (bool)params_.prepared_gate_gemm[expert_id] << ")");
                 MPI_Abort(MPI_COMM_WORLD, 1);
             }
 
@@ -815,7 +795,7 @@ namespace llaminar2
                 if (!down_gemm)
                 {
                     LOG_ERROR("[MoEExpertComputeStage] FATAL: Null down GEMM engine for expert "
-                              << info.expert_id << " (layer " << params_.layer_idx << ")");
+                        << info.expert_id << " (layer " << params_.layer_idx << ")");
                     MPI_Abort(MPI_COMM_WORLD, 1);
                 }
 
@@ -849,98 +829,98 @@ namespace llaminar2
         }
         else
         {
-            // CPU Phase 2: batch SwiGLU + fused down projections + vec_axpy
+        // CPU Phase 2: batch SwiGLU + fused down projections + vec_axpy
 
-            float *output = params_.output->mutable_data();
+        float *output = params_.output->mutable_data();
 
-            // Ensure per-expert output buffers for fused approach
-            if (static_cast<int>(scratch_down_batch_.size()) < num_active)
-            {
-                scratch_down_batch_.resize(num_active);
-                for (int i = 0; i < num_active; ++i)
-                {
-                    if (!scratch_down_batch_[i])
-                        scratch_down_batch_[i] = makeScratchFP32(1, d_model, params_.device_id);
-                }
-            }
-
-            // Validate down GEMM engines
+        // Ensure per-expert output buffers for fused approach
+        if (static_cast<int>(scratch_down_batch_.size()) < num_active)
+        {
+            scratch_down_batch_.resize(num_active);
             for (int i = 0; i < num_active; ++i)
             {
-                if (!cached_down_gemm_[active_experts[i].expert_id])
-                {
-                    LOG_ERROR("[MoEExpertComputeStage] FATAL: Null down GEMM engine for expert "
-                              << active_experts[i].expert_id << " (layer " << params_.layer_idx << ")");
-                    MPI_Abort(MPI_COMM_WORLD, 1);
-                }
+                if (!scratch_down_batch_[i])
+                    scratch_down_batch_[i] = makeScratchFP32(1, d_model, params_.device_id);
             }
+        }
 
-            // Phase 2a: Apply SwiGLU for all experts (serial, ~0.1µs each)
+        // Validate down GEMM engines
+        for (int i = 0; i < num_active; ++i)
+        {
+            if (!cached_down_gemm_[active_experts[i].expert_id])
+            {
+                LOG_ERROR("[MoEExpertComputeStage] FATAL: Null down GEMM engine for expert "
+                    << active_experts[i].expert_id << " (layer " << params_.layer_idx << ")");
+                MPI_Abort(MPI_COMM_WORLD, 1);
+            }
+        }
+
+        // Phase 2a: Apply SwiGLU for all experts (serial, ~0.1µs each)
+        for (int i = 0; i < num_active; ++i)
+        {
+            const auto &info = active_experts[i];
+            const float *gate_fp32 = scratch_gate_batch_[info.batch_idx]->data();
+            const float *up_fp32 = scratch_up_batch_[info.batch_idx]->data();
+            swiglu_scratch_batch_.resize(std::max(swiglu_scratch_batch_.size(),
+                                                  static_cast<size_t>(num_active)));
+            if (static_cast<int>(swiglu_scratch_batch_[i].size()) < intermediate)
+                swiglu_scratch_batch_[i].resize(intermediate);
+
+            primitives::compute_swiglu_serial(gate_fp32, up_fp32,
+                                              swiglu_scratch_batch_[i].data(), intermediate);
+        }
+
+        // Phase 2b: Try fused multi-input down projections
+        bool fused_ok = false;
+        if (num_active >= 2)
+        {
+            ITensorGemm::FusedExpertDownDesc down_descs[16];
+            for (int i = 0; i < num_active && i < 16; ++i)
+            {
+                const auto &info = active_experts[i];
+                down_descs[i].kernel = cached_down_gemm_[info.expert_id];
+                down_descs[i].input = swiglu_scratch_batch_[i].data();
+                down_descs[i].output = scratch_down_batch_[i]->mutable_data();
+                down_descs[i].n = d_model;
+            }
+            fused_ok = cached_down_gemm_[active_experts[0].expert_id]
+                           ->multiply_fused_expert_down(down_descs, num_active, 1, intermediate);
+        }
+
+        if (fused_ok)
+        {
+            // Phase 2c: Weighted accumulate all outputs
             for (int i = 0; i < num_active; ++i)
             {
                 const auto &info = active_experts[i];
-                const float *gate_fp32 = scratch_gate_batch_[info.batch_idx]->data();
-                const float *up_fp32 = scratch_up_batch_[info.batch_idx]->data();
-                swiglu_scratch_batch_.resize(std::max(swiglu_scratch_batch_.size(),
-                                                      static_cast<size_t>(num_active)));
-                if (static_cast<int>(swiglu_scratch_batch_[i].size()) < intermediate)
-                    swiglu_scratch_batch_[i].resize(intermediate);
-
-                primitives::compute_swiglu_serial(gate_fp32, up_fp32,
-                                                  swiglu_scratch_batch_[i].data(), intermediate);
+                primitives::vec_axpy(output, scratch_down_batch_[i]->data(),
+                                     info.weight, d_model);
             }
-
-            // Phase 2b: Try fused multi-input down projections
-            bool fused_ok = false;
-            if (num_active >= 2)
+        }
+        else
+        {
+            // Fallback: sequential per-expert SwiGLU + Down + accumulate
+            float *scratch_out_ptr = scratch_out_->mutable_data();
+            for (int i = 0; i < num_active; ++i)
             {
-                ITensorGemm::FusedExpertDownDesc down_descs[16];
-                for (int i = 0; i < num_active && i < 16; ++i)
-                {
-                    const auto &info = active_experts[i];
-                    down_descs[i].kernel = cached_down_gemm_[info.expert_id];
-                    down_descs[i].input = swiglu_scratch_batch_[i].data();
-                    down_descs[i].output = scratch_down_batch_[i]->mutable_data();
-                    down_descs[i].n = d_model;
-                }
-                fused_ok = cached_down_gemm_[active_experts[0].expert_id]
-                               ->multiply_fused_expert_down(down_descs, num_active, 1, intermediate);
-            }
+                const auto &info = active_experts[i];
+                ITensorGemm *down_gemm = cached_down_gemm_[info.expert_id];
 
-            if (fused_ok)
-            {
-                // Phase 2c: Weighted accumulate all outputs
-                for (int i = 0; i < num_active; ++i)
+                if (!fusedSwigluDown(
+                        scratch_gate_batch_[info.batch_idx].get(),
+                        scratch_up_batch_[info.batch_idx].get(),
+                        scratch_out_.get(),
+                        down_gemm, kernel, /*m=*/1, d_model, intermediate,
+                        params_.device_id, gpuStream()))
                 {
-                    const auto &info = active_experts[i];
-                    primitives::vec_axpy(output, scratch_down_batch_[i]->data(),
-                                         info.weight, d_model);
+                    LOG_ERROR("[MoEExpertComputeStage] Decode SwiGLU/down projection failed for expert "
+                              << info.expert_id << " layer " << params_.layer_idx);
+                    return false;
                 }
-            }
-            else
-            {
-                // Fallback: sequential per-expert SwiGLU + Down + accumulate
-                float *scratch_out_ptr = scratch_out_->mutable_data();
-                for (int i = 0; i < num_active; ++i)
-                {
-                    const auto &info = active_experts[i];
-                    ITensorGemm *down_gemm = cached_down_gemm_[info.expert_id];
 
-                    if (!fusedSwigluDown(
-                            scratch_gate_batch_[info.batch_idx].get(),
-                            scratch_up_batch_[info.batch_idx].get(),
-                            scratch_out_.get(),
-                            down_gemm, kernel, /*m=*/1, d_model, intermediate,
-                            params_.device_id, gpuStream()))
-                    {
-                        LOG_ERROR("[MoEExpertComputeStage] Decode SwiGLU/down projection failed for expert "
-                                  << info.expert_id << " layer " << params_.layer_idx);
-                        return false;
-                    }
-
-                    primitives::vec_axpy(output, scratch_out_ptr, info.weight, d_model);
-                }
+                primitives::vec_axpy(output, scratch_out_ptr, info.weight, d_model);
             }
+        }
 
         } // end CPU Phase 2 else block
 
@@ -1005,7 +985,7 @@ namespace llaminar2
         cached_down_gemm_.resize(num_experts, nullptr);
     }
 
-    bool MoEExpertComputeStage::ensureGemmEnginesForExperts(const std::vector<int> &expert_ids)
+    bool MoEExpertComputeStage::ensureGemmEnginesForExperts(const std::vector<int>& expert_ids)
     {
         const int num_experts = params_.num_experts;
         if (expert_ids.empty())
@@ -1031,7 +1011,7 @@ namespace llaminar2
             if (expert_id < 0 || expert_id >= num_experts)
             {
                 LOG_ERROR("[MoEExpertComputeStage] Invalid expert id " << expert_id
-                                                                       << " for layer " << params_.layer_idx);
+                          << " for layer " << params_.layer_idx);
                 return false;
             }
             needed[expert_id] = true;
@@ -1130,7 +1110,8 @@ namespace llaminar2
             params.moe_owned_kernels,
             params.moe_packed_gate_lifetime,
             params.moe_packed_up_lifetime,
-            params.moe_packed_down_lifetime};
+            params.moe_packed_down_lifetime
+        };
         return MoEExpertWeightService::extractExpertViews(ctx);
     }
 
@@ -1163,7 +1144,8 @@ namespace llaminar2
             params.expert_registry,
             params.gate_slab_ref,
             params.up_slab_ref,
-            params.down_slab_ref};
+            params.down_slab_ref
+        };
         bool ok = MoEExpertWeightService::prepareGemmEngines(ctx);
         // Phase C: Copy slab refs back to params for rebalance reuse
         params.gate_slab_ref = ctx.gate_slab_ref;
@@ -1407,8 +1389,7 @@ namespace llaminar2
         if (!cached_gate_gemm_ || !cached_up_gemm_ || !cached_down_gemm_)
         {
             LOG_ERROR("[SharedExpertFFNStage] PreparedWeightRefs were provided but shared expert kernel(s) were missing from PreparedWeightStore. "
-                      "gate="
-                      << (void *)cached_gate_gemm_ << " up=" << (void *)cached_up_gemm_
+                      "gate=" << (void *)cached_gate_gemm_ << " up=" << (void *)cached_up_gemm_
                       << " down=" << (void *)cached_down_gemm_);
             return;
         }

@@ -65,6 +65,12 @@ namespace llaminar2
          *   --backend <type>            Default collective backend (auto, nccl, rccl, etc.)
          *   --config <path>             Path to YAML configuration file
          *
+         *   MoE expert overlay uses named domains as the canonical hardware
+         *   inventory. Use --moe-expert-overlay-continuation for activation /
+         *   logits ownership and --moe-expert-overlay-base-domain for dense /
+         *   non-expert model placement (defaults to continuation). Do not
+         *   combine explicit overlay placements with --device/-d.
+         *
          * @param argc Argument count
          * @param argv Argument values
          * @return Parsed OrchestrationConfig
@@ -89,6 +95,16 @@ namespace llaminar2
          *     - stage: 0
          *       domain: gpu_tp
          *       layers: [0, 13]
+         *
+         * moe_expert_parallel:
+         *   enabled: true
+         *   execution_kind: tiered
+         *   continuation_domain: rocm_hot
+         *   base_model_domain: rocm_hot
+         *   shared_expert_domain: rocm_hot
+         *   routed_tiers:
+         *     - "hot@rocm_hot;priority=0"
+         *     - "cold@cpu_cold;priority=1;fallback=true"
          * ```
          *
          * @param path Path to YAML file

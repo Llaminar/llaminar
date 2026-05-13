@@ -22,6 +22,51 @@
 
 namespace llaminar2
 {
+    namespace
+    {
+        bool waitForCollectiveRequest(
+            MPI_Request &request,
+            int timeout_ms,
+            const std::string &operation,
+            int domain_rank,
+            int domain_size,
+            size_t count,
+            std::string &last_error)
+        {
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+            int complete = 0;
+            int result = MPI_SUCCESS;
+            while (!complete)
+            {
+                result = MPI_Test(&request, &complete, MPI_STATUS_IGNORE);
+                if (result != MPI_SUCCESS || complete)
+                    break;
+
+                if (std::chrono::steady_clock::now() >= deadline)
+                {
+                    last_error = operation + " timed out after " + std::to_string(timeout_ms) +
+                                 "ms on domain rank " + std::to_string(domain_rank) +
+                                 "/" + std::to_string(domain_size) +
+                                 " (count=" + std::to_string(count) + ")";
+                    LOG_ERROR("UPICollectiveBackend - " << last_error
+                              << "; aborting MPI job to avoid rank desynchronization");
+                    MPI_Abort(MPI_COMM_WORLD, 1);
+                    return false;
+                }
+
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+
+            if (result != MPI_SUCCESS)
+            {
+                last_error = operation + " failed with code " + std::to_string(result);
+                LOG_ERROR("UPICollectiveBackend - " << last_error);
+                return false;
+            }
+
+            return true;
+        }
+    } // namespace
 
     // =============================================================================
     // Constructor / Destructor
@@ -365,12 +410,39 @@ namespace llaminar2
 
         MPI_Datatype mpi_dtype = toMPIDatatype(dtype);
 
-        int result = MPI_Bcast(
-            buffer,
-            static_cast<int>(count),
-            mpi_dtype,
-            root_rank,
-            domain_comm_);
+        int result = MPI_SUCCESS;
+        const int timeout_ms = debugEnv().tp_collect_timeout_ms;
+        if (timeout_ms > 0)
+        {
+            MPI_Request request = MPI_REQUEST_NULL;
+            result = MPI_Ibcast(
+                buffer,
+                static_cast<int>(count),
+                mpi_dtype,
+                root_rank,
+                domain_comm_,
+                &request);
+            if (result == MPI_SUCCESS &&
+                !waitForCollectiveRequest(request,
+                                          timeout_ms,
+                                          "MPI_Ibcast",
+                                          domain_rank_,
+                                          domain_size_,
+                                          count,
+                                          last_error_))
+            {
+                return false;
+            }
+        }
+        else
+        {
+            result = MPI_Bcast(
+                buffer,
+                static_cast<int>(count),
+                mpi_dtype,
+                root_rank,
+                domain_comm_);
+        }
 
         if (result != MPI_SUCCESS)
         {
@@ -396,7 +468,28 @@ namespace llaminar2
             return false;
         }
 
-        int result = MPI_Barrier(domain_comm_);
+        int result = MPI_SUCCESS;
+        const int timeout_ms = debugEnv().tp_collect_timeout_ms;
+        if (timeout_ms > 0)
+        {
+            MPI_Request request = MPI_REQUEST_NULL;
+            result = MPI_Ibarrier(domain_comm_, &request);
+            if (result == MPI_SUCCESS &&
+                !waitForCollectiveRequest(request,
+                                          timeout_ms,
+                                          "MPI_Ibarrier",
+                                          domain_rank_,
+                                          domain_size_,
+                                          0,
+                                          last_error_))
+            {
+                return false;
+            }
+        }
+        else
+        {
+            result = MPI_Barrier(domain_comm_);
+        }
 
         if (result != MPI_SUCCESS)
         {

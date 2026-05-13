@@ -37,12 +37,122 @@
 #include "../../execution/moe/MoERebalanceController.h"
 #include "../../execution/moe/MoEExpertOverlayProfiler.h"
 #include "../../execution/moe/ExpertWeightTransfer.h"
+#include "../../execution/moe/MoEExpertParallelPlan.h"
+#include "../../execution/moe/MoEOverlayCPUFallbackParticipantRunner.h"
 
 #include <algorithm>
 #include <cctype>
 
 namespace llaminar2
 {
+    namespace
+    {
+        bool requiresOverlayMPIWorld(const std::shared_ptr<MoEExpertParallelPlan> &plan)
+        {
+            if (!plan || !plan->isTieredOverlay())
+                return false;
+
+            for (const auto &domain : plan->domains)
+            {
+                if (domain.owner_rank > 0)
+                    return true;
+                if (domain.world_ranks.size() > 1)
+                    return true;
+                if (domain.kind == ExpertDomainKind::NodeLocalTP && domain.participants.size() > 1)
+                    return true;
+            }
+            return false;
+        }
+
+        std::shared_ptr<const MoEExpertOverlayExecutionPlan> resolveOverlayExecutionPlanForRunner(
+            const std::shared_ptr<const MoEExpertParallelPlan> &plan,
+            const std::shared_ptr<IMPIContext> &mpi_ctx)
+        {
+            if (!plan || !plan->isTieredOverlay() || !mpi_ctx)
+                return nullptr;
+
+            return std::make_shared<MoEExpertOverlayExecutionPlan>(
+                resolveMoEExpertOverlayExecutionPlan(
+                    plan,
+                    MoEExpertOverlayExecutionPlanResolverOptions{
+                        .current_world_rank = mpi_ctx->rank(),
+                        .world_size = mpi_ctx->world_size(),
+                    }));
+        }
+
+        const ExpertComputeDomain *overlayDomainForName(
+            const MoEExpertParallelPlan &plan,
+            const std::string &domain_name)
+        {
+            auto it = std::find_if(plan.domains.begin(), plan.domains.end(),
+                                   [&](const ExpertComputeDomain &domain) {
+                                       return domain.name == domain_name;
+                                   });
+            return it == plan.domains.end() ? nullptr : &(*it);
+        }
+
+        bool applyOverlayRankRoleToExecutionPlan(
+            RankExecutionPlan &rank_plan,
+            const MoEExpertParallelPlan &overlay_plan,
+            const MoEExpertOverlayExecutionPlan &execution_plan,
+            std::string &error)
+        {
+            const auto &overlay_rank = execution_plan.currentRankPlan();
+            if (!overlay_rank.builds_root_graph)
+            {
+                rank_plan.local_tp_devices.clear();
+                rank_plan.local_tp_weights.clear();
+                rank_plan.local_tp_backend = CollectiveBackendType::AUTO;
+                rank_plan.local_pp_devices.clear();
+                rank_plan.local_pp_layer_boundaries.clear();
+                rank_plan.local_pp_stage_tp_info.clear();
+                rank_plan.primary_device = GlobalDeviceAddress::cpu();
+                rank_plan.weight_shard = {};
+                return true;
+            }
+
+            const std::string base_domain_name = overlay_plan.effectiveBaseModelDomain();
+            const auto *base_domain = overlayDomainForName(overlay_plan, base_domain_name);
+            if (!base_domain)
+            {
+                error = "MoE overlay base/continuation domain '" + base_domain_name + "' is not defined";
+                return false;
+            }
+            if (base_domain->participants.empty())
+            {
+                error = "MoE overlay base/continuation domain '" + base_domain_name + "' has no participants";
+                return false;
+            }
+            if (base_domain->kind == ExpertDomainKind::NodeLocalTP)
+            {
+                error = "MoE overlay base/continuation domain '" + base_domain_name +
+                        "' cannot be NodeLocalTP; NodeLocalTP is reserved for CPU fallback expert domains";
+                return false;
+            }
+
+            rank_plan.local_pp_devices.clear();
+            rank_plan.local_pp_layer_boundaries.clear();
+            rank_plan.local_pp_stage_tp_info.clear();
+            rank_plan.primary_device = base_domain->participants.front();
+            rank_plan.local_tp_backend = base_domain->backend;
+            rank_plan.local_tp_weights = base_domain->weights;
+            rank_plan.weight_shard = {};
+
+            if (base_domain->kind == ExpertDomainKind::LocalTP)
+            {
+                rank_plan.tp_scope = TPScope::LOCAL;
+                rank_plan.local_tp_devices = base_domain->participants;
+            }
+            else
+            {
+                rank_plan.local_tp_devices.clear();
+                rank_plan.local_tp_weights.clear();
+                rank_plan.tp_scope = TPScope::AUTO;
+            }
+
+            return true;
+        }
+    }
 
     // =========================================================================
     // Construction
@@ -514,7 +624,7 @@ namespace llaminar2
 
             // Incremental MoE expert rebalancing: when the decode histogram
             // window fills, propose targeted expert swaps between sockets.
-            if (auto *controller = moeRebalanceController())
+            if (auto* controller = moeRebalanceController())
             {
                 if (controller->shouldRebalance())
                 {
@@ -648,7 +758,8 @@ namespace llaminar2
         // Check if multi-rank MPI is needed
         bool needs_multi_rank_mpi = config_.pp_degree > 1 ||
                                     config_.tp_scope == TPScope::GLOBAL ||
-                                    config_.tp_scope == TPScope::HYBRID;
+                                    config_.tp_scope == TPScope::HYBRID ||
+                                    requiresOverlayMPIWorld(config_.moe_expert_parallel_plan);
 
         if (!needs_multi_rank_mpi)
         {
@@ -757,6 +868,34 @@ namespace llaminar2
         // Build plan for this rank
         int my_rank = mpi_ctx_ ? mpi_ctx_->rank() : 0;
         plan_ = plan_builder_->buildPlanForRank(config_, model_config, cluster_inventory_, my_rank);
+
+        auto overlay_execution_plan = resolveOverlayExecutionPlanForRunner(
+            config_.moe_expert_parallel_plan,
+            moe_expert_overlay_mpi_ctx_ ? moe_expert_overlay_mpi_ctx_ : mpi_ctx_);
+        if (overlay_execution_plan)
+        {
+            std::string overlay_plan_error;
+            if (!applyOverlayRankRoleToExecutionPlan(
+                    plan_,
+                    *config_.moe_expert_parallel_plan,
+                    *overlay_execution_plan,
+                    overlay_plan_error))
+            {
+                return setError(overlay_plan_error);
+            }
+
+            if (overlay_execution_plan->buildsRootGraph())
+            {
+                LOG_INFO("[OrchestrationRunner] MoE overlay root plan bound to base domain '"
+                         << config_.moe_expert_parallel_plan->effectiveBaseModelDomain()
+                         << "' devices=" << plan_.local_tp_devices.size());
+            }
+            else
+            {
+                LOG_INFO("[OrchestrationRunner] MoE overlay non-root plan narrowed to participant endpoint role "
+                         << toString(overlay_execution_plan->currentRankPlan().role));
+            }
+        }
 
         // Validate the built plan
         auto plan_errors = plan_.validate();
@@ -887,8 +1026,8 @@ namespace llaminar2
                 if (topo->is_node_leader())
                 {
                     LOG_INFO("Node leader (rank " << mpi_ctx_->rank()
-                                                  << ", node " << topo->placement().node_id
-                                                  << ") pre-populating page cache for multi-rank mmap...");
+                             << ", node " << topo->placement().node_id
+                             << ") pre-populating page cache for multi-rank mmap...");
                     MmapRegion::prepopulatePageCache(model_path);
                 }
                 // Intra-node barrier: same-node ranks wait for their node leader only.
@@ -1026,94 +1165,136 @@ namespace llaminar2
         // Build memory profile from the loaded model
         auto profile = ModelMemoryProfile::fromGGUF(model_ctx_->model());
 
-        // Determine device for this rank
-        DeviceId device = DeviceAddressAdapter::toDeviceId(plan_.primary_device);
-
-        // Find device memory from cluster inventory
-        size_t device_total = 0;
-        size_t device_free = 0;
-        int my_rank = mpi_ctx_ ? mpi_ctx_->rank() : 0;
-        if (my_rank < static_cast<int>(cluster_inventory_.ranks.size()))
-        {
-            const auto &rank_inv = cluster_inventory_.ranks[my_rank];
-            if (device.is_gpu())
+        auto memoryForDevice = [&](DeviceId device) {
+            std::pair<size_t, size_t> memory{0, 0};
+            int my_rank = mpi_ctx_ ? mpi_ctx_->rank() : 0;
+            if (my_rank < static_cast<int>(cluster_inventory_.ranks.size()))
             {
-                for (const auto &gpu : rank_inv.gpus)
+                const auto &rank_inv = cluster_inventory_.ranks[my_rank];
+                if (device.is_gpu())
                 {
-                    if (gpu.local_device_id == device.ordinal)
+                    for (const auto &gpu : rank_inv.gpus)
                     {
-                        device_total = gpu.memory_bytes;
-                        device_free = gpu.free_memory_bytes;
-                        break;
+                        if (gpu.local_device_id == device.ordinal)
+                        {
+                            memory.first = gpu.memory_bytes;
+                            memory.second = gpu.free_memory_bytes;
+                            break;
+                        }
                     }
                 }
+                else
+                {
+                    memory.first = rank_inv.cpu_memory_bytes;
+                    memory.second = rank_inv.cpu_memory_bytes;
+                }
             }
-            else
+            return memory;
+        };
+
+        std::vector<DevicePlanConfig> device_configs;
+        auto makeConfigForDevice = [&](DeviceId device, int shard_index, int total_shards) {
+            auto [device_total, device_free] = memoryForDevice(device);
+
+            DevicePlanConfig cfg;
+            cfg.device = device;
+            cfg.device_total_bytes = device_total;
+            cfg.device_free_bytes = device_free;
+            cfg.shard_index = shard_index;
+            cfg.total_shards = total_shards;
+            cfg.first_layer = plan_.first_layer;
+            cfg.last_layer = plan_.last_layer;
+            cfg.batch_size = plan_.runtime.batch_size;
+            cfg.max_seq_len = plan_.runtime.max_seq_len;
+
+            switch (plan_.runtime.kv_cache_precision)
             {
-                // CPU: use total system RAM (no strict budget enforcement)
-                device_total = rank_inv.cpu_memory_bytes;
-                device_free = rank_inv.cpu_memory_bytes;
+            case KVCachePrecision::FP16: cfg.kv_precision = "fp16"; break;
+            case KVCachePrecision::FP32: cfg.kv_precision = "fp32"; break;
+            case KVCachePrecision::Q8_1: cfg.kv_precision = "q8_1"; break;
+            default: cfg.kv_precision = "fp16"; break;
+            }
+
+            if (total_shards > 1 && profile.n_kv_heads > 0)
+            {
+                cfg.local_kv_heads = profile.n_kv_heads / total_shards;
+                if (cfg.local_kv_heads < 1)
+                    cfg.local_kv_heads = 1;
+            }
+            return cfg;
+        };
+
+        if (plan_.usesLocalTP())
+        {
+            const int total_shards = static_cast<int>(plan_.local_tp_devices.size());
+            device_configs.reserve(plan_.local_tp_devices.size());
+            for (int index = 0; index < total_shards; ++index)
+            {
+                device_configs.push_back(makeConfigForDevice(
+                    plan_.local_tp_devices[static_cast<size_t>(index)].toLocalDeviceId(),
+                    index,
+                    total_shards));
             }
         }
-
-        // Build device plan config from execution plan
-        DevicePlanConfig cfg;
-        cfg.device = device;
-        cfg.device_total_bytes = device_total;
-        cfg.device_free_bytes = device_free;
-        cfg.shard_index = plan_.weight_shard.shard_index;
-        cfg.total_shards = plan_.weight_shard.total_shards;
-        cfg.first_layer = plan_.first_layer;
-        cfg.last_layer = plan_.last_layer;
-        cfg.batch_size = plan_.runtime.batch_size;
-        cfg.max_seq_len = plan_.runtime.max_seq_len;
-
-        // KV precision from runtime config
-        switch (plan_.runtime.kv_cache_precision)
+        else
         {
-        case KVCachePrecision::FP16:
-            cfg.kv_precision = "fp16";
-            break;
-        case KVCachePrecision::FP32:
-            cfg.kv_precision = "fp32";
-            break;
-        case KVCachePrecision::Q8_1:
-            cfg.kv_precision = "q8_1";
-            break;
-        default:
-            cfg.kv_precision = "fp16";
-            break;
+            DeviceId device = DeviceAddressAdapter::toDeviceId(plan_.primary_device);
+            device_configs.push_back(makeConfigForDevice(
+                device,
+                plan_.weight_shard.shard_index,
+                plan_.weight_shard.total_shards));
         }
 
-        // Compute local KV heads for TP
-        if (plan_.weight_shard.total_shards > 1 && profile.n_kv_heads > 0)
-        {
-            cfg.local_kv_heads = profile.n_kv_heads / plan_.weight_shard.total_shards;
-            if (cfg.local_kv_heads < 1)
-                cfg.local_kv_heads = 1;
-        }
-
-        auto plan = MemoryPlanner::plan(profile, {cfg});
+        auto plan = MemoryPlanner::plan(profile, device_configs);
 
         if (!plan.fits())
         {
             std::string msg = "Memory plan validation failed — model does not fit on assigned device(s):\n";
             msg += plan.renderTable();
-            for (const auto &d : plan.diagnostics)
+            for (const auto& d : plan.diagnostics)
             {
                 msg += "\n  " + d;
             }
             return setError(msg);
         }
 
-        LOG_INFO("[MemoryPlanner] Memory validation passed:\n"
-                 << plan.renderTable());
+        LOG_INFO("[MemoryPlanner] Memory validation passed:\n" << plan.renderTable());
         return true;
     }
 
     bool OrchestrationRunner::buildComputeGraph()
     {
         ScopedWeightLoadTimer timer(WeightLoadPhase::GRAPH_BUILD);
+
+        auto overlay_execution_plan = resolveOverlayExecutionPlanForRunner(
+            config_.moe_expert_parallel_plan,
+            moe_expert_overlay_mpi_ctx_ ? moe_expert_overlay_mpi_ctx_ : mpi_ctx_);
+        if (overlay_execution_plan && !overlay_execution_plan->buildsRootGraph())
+        {
+            const auto &rank_plan = overlay_execution_plan->currentRankPlan();
+            if (rank_plan.hasRole(OverlayRankRole::CpuFallbackParticipant))
+            {
+                LOG_INFO("[OrchestrationRunner] Execution strategy: MoE overlay CPU fallback participant endpoint"
+                         << " rank=" << rank_plan.world_rank
+                         << " domains=" << rank_plan.owned_domains.size());
+
+                MoEOverlayCPUFallbackParticipantRunner::Config endpoint_config;
+                endpoint_config.model_ctx = model_ctx_;
+                endpoint_config.mpi_ctx = moe_expert_overlay_mpi_ctx_ ? moe_expert_overlay_mpi_ctx_ : mpi_ctx_;
+                endpoint_config.overlay_plan = config_.moe_expert_parallel_plan;
+                endpoint_config.execution_plan = overlay_execution_plan;
+                endpoint_config.hostfile_path = config_.hostfile;
+
+                runner_ = createMoEOverlayCPUFallbackParticipantRunner(std::move(endpoint_config));
+                if (!runner_)
+                    return setError("Failed to create MoE overlay CPU fallback participant endpoint");
+                return true;
+            }
+
+            return setError(std::string("MoE overlay rank ") + std::to_string(rank_plan.world_rank) +
+                            " has role " + toString(rank_plan.role) +
+                            " but only CPU fallback participant endpoints are implemented for graph-native benchmark execution");
+        }
 
         // Check if LOCAL PP is configured (takes priority over TP, because
         // TP-in-PP composition creates per-stage TP contexts inside the MDO)
@@ -1182,6 +1363,7 @@ namespace llaminar2
         // Build config from execution plan via canonical factory
         auto mdo_config = RankOrchestrator::Config::fromPlan(plan_);
         mdo_config.moe_expert_parallel_plan = config_.moe_expert_parallel_plan;
+        mdo_config.moe_expert_overlay_mpi_ctx = moe_expert_overlay_mpi_ctx_ ? moe_expert_overlay_mpi_ctx_ : mpi_ctx_;
 
         LOG_INFO("[OrchestrationRunner] Multi-device precision config: activation="
                  << activationPrecisionToString(mdo_config.activation_precision)
@@ -1242,6 +1424,7 @@ namespace llaminar2
         // Build config from execution plan via canonical factory
         auto mdo_config = RankOrchestrator::Config::fromPlan(plan_);
         mdo_config.moe_expert_parallel_plan = config_.moe_expert_parallel_plan;
+        mdo_config.moe_expert_overlay_mpi_ctx = moe_expert_overlay_mpi_ctx_ ? moe_expert_overlay_mpi_ctx_ : mpi_ctx_;
 
         // Log PP stage details
         for (size_t i = 0; i < mdo_config.pp_stages.size(); ++i)
@@ -1332,6 +1515,7 @@ namespace llaminar2
         auto runner_config = InferenceRunnerConfig::fromPlan(plan_);
         runner_config.hostfile = config_.hostfile;
         runner_config.moe_expert_parallel_plan = config_.moe_expert_parallel_plan;
+        runner_config.moe_expert_overlay_mpi_ctx = moe_expert_overlay_mpi_ctx_ ? moe_expert_overlay_mpi_ctx_ : mpi_ctx_;
 
         LOG_INFO("[OrchestrationRunner] Single-device precision config: activation="
                  << activationPrecisionToString(runner_config.activation_precision)
@@ -1436,15 +1620,15 @@ namespace llaminar2
         }
     }
 
-    MoERebalanceController *OrchestrationRunner::moeRebalanceController() const
+    MoERebalanceController* OrchestrationRunner::moeRebalanceController() const
     {
         if (runner_)
         {
-            if (auto *dgo = dynamic_cast<DeviceGraphOrchestrator *>(runner_.get()))
+            if (auto* dgo = dynamic_cast<DeviceGraphOrchestrator*>(runner_.get()))
             {
                 return dgo->moeRebalanceController();
             }
-            if (auto *rank = dynamic_cast<RankOrchestrator *>(runner_.get()))
+            if (auto* rank = dynamic_cast<RankOrchestrator*>(runner_.get()))
             {
                 return rank->moeRebalanceController();
             }
@@ -1453,12 +1637,12 @@ namespace llaminar2
     }
 
     void OrchestrationRunner::applyMoEExpertMasks(
-        const std::vector<std::vector<bool>> &masks,
-        const ReceivedWeightsMap &received)
+        const std::vector<std::vector<bool>>& masks,
+        const ReceivedWeightsMap& received)
     {
         if (runner_)
         {
-            if (auto *dgo = dynamic_cast<DeviceGraphOrchestrator *>(runner_.get()))
+            if (auto* dgo = dynamic_cast<DeviceGraphOrchestrator*>(runner_.get()))
             {
                 dgo->applyExpertMasks(masks, received);
             }
@@ -1466,11 +1650,11 @@ namespace llaminar2
     }
 
     bool OrchestrationRunner::applyMoEExpertMasksForAllLocalDevices(
-        const MoERebalanceController &controller)
+        const MoERebalanceController& controller)
     {
         if (!runner_)
             return false;
-        if (auto *rank = dynamic_cast<RankOrchestrator *>(runner_.get()))
+        if (auto* rank = dynamic_cast<RankOrchestrator*>(runner_.get()))
         {
             rank->applyMoEExpertMasksForAllDevices(controller);
             return true;
@@ -1479,11 +1663,11 @@ namespace llaminar2
     }
 
     bool OrchestrationRunner::applyMoEExpertMasksForAllLocalDevices(
-        const std::vector<std::vector<std::vector<bool>>> &masks_by_socket)
+        const std::vector<std::vector<std::vector<bool>>>& masks_by_socket)
     {
         if (!runner_)
             return false;
-        if (auto *rank = dynamic_cast<RankOrchestrator *>(runner_.get()))
+        if (auto* rank = dynamic_cast<RankOrchestrator*>(runner_.get()))
         {
             rank->applyMoEExpertMasksForAllDevices(masks_by_socket);
             return true;
@@ -1492,15 +1676,15 @@ namespace llaminar2
     }
 
     void OrchestrationRunner::setExpertReplicaSet(
-        const ExpertReplicaSet &replicas, int socket_id)
+        const ExpertReplicaSet& replicas, int socket_id)
     {
         if (runner_)
         {
-            if (auto *dgo = dynamic_cast<DeviceGraphOrchestrator *>(runner_.get()))
+            if (auto* dgo = dynamic_cast<DeviceGraphOrchestrator*>(runner_.get()))
             {
                 dgo->setExpertReplicaSet(replicas, socket_id);
             }
-            else if (auto *rank = dynamic_cast<RankOrchestrator *>(runner_.get()))
+            else if (auto* rank = dynamic_cast<RankOrchestrator*>(runner_.get()))
             {
                 rank->setExpertReplicaSetForAllDevices(replicas);
             }
@@ -1508,11 +1692,11 @@ namespace llaminar2
     }
 
     ReceivedWeightsMap OrchestrationRunner::transferExpertWeights(
-        const std::vector<ExpertMigration> &manifest, int num_layers)
+        const std::vector<ExpertMigration>& manifest, int num_layers)
     {
         if (runner_)
         {
-            if (auto *dgo = dynamic_cast<DeviceGraphOrchestrator *>(runner_.get()))
+            if (auto* dgo = dynamic_cast<DeviceGraphOrchestrator*>(runner_.get()))
             {
                 return dgo->transferExpertWeights(manifest, num_layers);
             }
@@ -1521,11 +1705,11 @@ namespace llaminar2
     }
 
     ReceivedWeightsMap OrchestrationRunner::transferReplicaWeights(
-        const ExpertReplicaSet &replicas, int num_layers)
+        const ExpertReplicaSet& replicas, int num_layers)
     {
         if (runner_)
         {
-            if (auto *dgo = dynamic_cast<DeviceGraphOrchestrator *>(runner_.get()))
+            if (auto* dgo = dynamic_cast<DeviceGraphOrchestrator*>(runner_.get()))
             {
                 return dgo->transferReplicaWeights(replicas, num_layers);
             }
@@ -1537,7 +1721,7 @@ namespace llaminar2
     {
         if (runner_)
         {
-            if (auto *dgo = dynamic_cast<DeviceGraphOrchestrator *>(runner_.get()))
+            if (auto* dgo = dynamic_cast<DeviceGraphOrchestrator*>(runner_.get()))
             {
                 return dgo->releaseRawExpertWeights();
             }

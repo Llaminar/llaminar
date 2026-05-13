@@ -34,15 +34,15 @@
 #include "../../kernels/cpu/rotation/ActivationRotation.h"
 #include "../../execution/moe/MoERebalanceController.h"
 #include "../../execution/moe/DecodeExpertHistogram.h"
-#include "../../execution/moe/MoEExpertParallelPlanner.h"
+#include "../../execution/moe/MoEExpertOverlayExecutionPlan.h"
 #include "../../execution/moe/MoEExpertOverlayRuntimePlan.h"
+#include "../../execution/moe/MoEExpertParallelPlanner.h"
+#include "../../execution/moe/MoEOverlayDomainRuntime.h"
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <future>
-#include <limits>
-#include <set>
 #include <sstream>
-#include <stdexcept>
 #include <thread>
 
 namespace llaminar2
@@ -86,375 +86,390 @@ namespace llaminar2
         return store;
     }
 
+    namespace
+    {
+        void installTPExecutorCancellation(
+            GraphConfig &graph_config,
+            ITPContext *tp_ctx,
+            const std::string &log_prefix)
+        {
+            if (!tp_ctx || tp_ctx->degree() <= 1)
+                return;
+
+            if (!graph_config.executor_config.cancellation_requested)
+            {
+                graph_config.executor_config.cancellation_requested = [tp_ctx]()
+                {
+                    return tp_ctx->isAbortRequested();
+                };
+            }
+
+            if (!graph_config.executor_config.stage_failure_callback)
+            {
+                graph_config.executor_config.stage_failure_callback = [tp_ctx, log_prefix](const std::string &stage_name, const std::string &reason)
+                {
+                    LOG_WARN(log_prefix << " stage failure triggers TP abort"
+                                        << " stage='" << stage_name << "' reason='" << reason << "'");
+                    tp_ctx->requestAbort();
+                };
+            }
+        }
+
+        MoEExpertModelMetadata moEExpertMetadataForModel(IModelContext &model_ctx)
+        {
+            auto loader = model_ctx.loader();
+            const std::string &arch = model_ctx.architecture();
+
+            MoEExpertModelMetadata metadata;
+            metadata.num_layers = std::max(model_ctx.totalBlockCount(), model_ctx.blockCount());
+            metadata.num_experts = loader ? loader->getInt(arch + ".expert_count", 0) : 0;
+            metadata.d_model = model_ctx.embeddingLength();
+            metadata.routed_intermediate_size = loader ? loader->getInt(arch + ".expert_feed_forward_length", 0) : 0;
+            if (metadata.routed_intermediate_size <= 0)
+                metadata.routed_intermediate_size = model_ctx.feedForwardLength();
+            metadata.shared_intermediate_size = metadata.routed_intermediate_size;
+            metadata.has_shared_expert = loader && loader->getInt(arch + ".expert_shared_count", 0) > 0;
+            return metadata;
+        }
+
+        const ExpertComputeDomain *findSourceDomain(
+            const MoEExpertParallelPlan &plan,
+            const std::string &domain_name)
+        {
+            for (const auto &domain : plan.domains)
+            {
+                if (domain.name == domain_name)
+                    return &domain;
+            }
+            return nullptr;
+        }
+
+        bool tierHasAssignedExperts(const MoEExpertParallelPlan &plan, size_t tier_index)
+        {
+            if (plan.placements.empty())
+                return true;
+
+            const int tier = static_cast<int>(tier_index);
+            for (const auto &placement : plan.placements)
+            {
+                for (int assigned_tier : placement.routed_expert_tier)
+                {
+                    if (assigned_tier == tier)
+                        return true;
+                }
+            }
+            return false;
+        }
+
+        bool domainNeedsLocalTPContext(const ExpertComputeDomain &domain)
+        {
+            return domain.kind == ExpertDomainKind::LocalTP &&
+                   domain.compute_kind == ExpertDomainComputeKind::TensorParallelExperts &&
+                   domain.participants.size() > 1;
+        }
+
+        std::string describeDeviceList(const std::vector<GlobalDeviceAddress> &devices)
+        {
+            std::ostringstream oss;
+            for (size_t index = 0; index < devices.size(); ++index)
+            {
+                if (index > 0)
+                    oss << ",";
+                oss << devices[index].toString();
+            }
+            return oss.str();
+        }
+
+        ILocalTPContext *localTPContextFromRunnerConfig(const InferenceRunnerConfig *runner_config)
+        {
+            if (!runner_config || !runner_config->tp_ctx || !runner_config->tp_ctx->isLocal())
+                return nullptr;
+            return static_cast<ILocalTPContext *>(runner_config->tp_ctx);
+        }
+
+        bool localTPContextMatchesDomain(
+            const ILocalTPContext &context,
+            const ExpertComputeDomain &domain,
+            std::string *reason = nullptr)
+        {
+            const auto fail = [&](const std::string &message)
+            {
+                if (reason)
+                    *reason = message;
+                return false;
+            };
+
+            if (context.degree() != static_cast<int>(domain.participants.size()))
+            {
+                std::ostringstream message;
+                message << "degree mismatch: context=" << context.degree()
+                        << " domain=" << domain.participants.size();
+                return fail(message.str());
+            }
+
+            if (domain.backend != CollectiveBackendType::AUTO &&
+                context.backend() != CollectiveBackendType::AUTO &&
+                context.backend() != domain.backend)
+            {
+                std::ostringstream message;
+                message << "backend mismatch: context=" << static_cast<int>(context.backend())
+                        << " domain=" << static_cast<int>(domain.backend);
+                return fail(message.str());
+            }
+
+            const auto &context_devices = context.devices();
+            if (context_devices.size() != domain.participants.size())
+            {
+                std::ostringstream message;
+                message << "device count mismatch: context=" << context_devices.size()
+                        << " domain=" << domain.participants.size();
+                return fail(message.str());
+            }
+
+            for (size_t index = 0; index < context_devices.size(); ++index)
+            {
+                if (!(context_devices[index] == domain.participants[index]))
+                {
+                    std::ostringstream message;
+                    message << "participant mismatch at index " << index
+                            << ": context=" << context_devices[index].toString()
+                            << " domain=" << domain.participants[index].toString();
+                    return fail(message.str());
+                }
+            }
+
+            if (!domain.weights.empty())
+            {
+                const auto &context_weights = context.weights();
+                if (context_weights.size() != domain.weights.size())
+                {
+                    std::ostringstream message;
+                    message << "weight count mismatch: context=" << context_weights.size()
+                            << " domain=" << domain.weights.size();
+                    return fail(message.str());
+                }
+                for (size_t index = 0; index < context_weights.size(); ++index)
+                {
+                    if (std::abs(context_weights[index] - domain.weights[index]) > 1e-4f)
+                    {
+                        std::ostringstream message;
+                        message << "weight mismatch at index " << index
+                                << ": context=" << context_weights[index]
+                                << " domain=" << domain.weights[index];
+                        return fail(message.str());
+                    }
+                }
+            }
+
+            if (reason)
+                reason->clear();
+            return true;
+        }
+
+        int overlayRankFor(
+            const std::shared_ptr<IMPIContext> &overlay_mpi_ctx,
+            const std::shared_ptr<IMPIContext> &runner_mpi_ctx)
+        {
+            if (overlay_mpi_ctx)
+                return overlay_mpi_ctx->rank();
+            if (runner_mpi_ctx)
+                return runner_mpi_ctx->rank();
+            return 0;
+        }
+
+        int overlayWorldSizeFor(
+            const std::shared_ptr<IMPIContext> &overlay_mpi_ctx,
+            const std::shared_ptr<IMPIContext> &runner_mpi_ctx)
+        {
+            if (overlay_mpi_ctx)
+                return overlay_mpi_ctx->world_size();
+            if (runner_mpi_ctx)
+                return runner_mpi_ctx->world_size();
+            return 1;
+        }
+
+        bool applyMoEExpertOverlayConfigToGraph(
+            IModelContext &model_ctx,
+            const InferenceRunnerConfig &config,
+            const std::shared_ptr<IMPIContext> &runner_mpi_ctx,
+            GraphConfig &graph_config,
+            DomainLocalTPContextMap &owned_domain_tp_contexts,
+            const std::string &log_prefix)
+        {
+            auto plan = resolveMoEExpertParallelPlanForModel(model_ctx, config);
+            if (!plan)
+                return true;
+
+            graph_config.moe.expert_parallel_plan = plan;
+            graph_config.moe.overlay_mpi_ctx = config.moe_expert_overlay_mpi_ctx
+                                                   ? config.moe_expert_overlay_mpi_ctx
+                                                   : runner_mpi_ctx;
+
+            if (plan->isTieredOverlay())
+            {
+                const int rank = overlayRankFor(config.moe_expert_overlay_mpi_ctx, runner_mpi_ctx);
+                const int world_size = overlayWorldSizeFor(config.moe_expert_overlay_mpi_ctx, runner_mpi_ctx);
+                graph_config.moe.expert_overlay_runtime_plan = resolveMoEExpertOverlayRuntimePlan(
+                    plan,
+                    MoEExpertOverlayRuntimeResolverOptions{.current_world_rank = rank});
+                graph_config.moe.expert_overlay_execution_plan = std::make_shared<MoEExpertOverlayExecutionPlan>(
+                    resolveMoEExpertOverlayExecutionPlan(
+                        plan,
+                        MoEExpertOverlayExecutionPlanResolverOptions{
+                            .current_world_rank = rank,
+                            .world_size = world_size,
+                        }));
+
+                MoEOverlayDomainRuntime::Config runtime_config;
+                runtime_config.runtime_plan = graph_config.moe.expert_overlay_runtime_plan;
+                runtime_config.execution_plan = graph_config.moe.expert_overlay_execution_plan;
+                runtime_config.enable_compatibility_fallback = true;
+                graph_config.moe.overlay_domain_runtime = makeMoEOverlayDomainRuntime(std::move(runtime_config));
+
+                if (!populateMoEExpertOverlayDomainTPContextsForGraph(
+                        graph_config,
+                        owned_domain_tp_contexts,
+                        log_prefix,
+                        &config))
+                {
+                    return false;
+                }
+            }
+
+            return true;
+        }
+
+        DeviceId effectiveMoEOverlayRootDevice(
+            const GraphConfig &graph_config,
+            DeviceId requested_device,
+            const std::string &log_prefix)
+        {
+            const auto &runtime_plan = graph_config.moe.expert_overlay_runtime_plan;
+            if (!runtime_plan)
+                return requested_device;
+
+            const auto &execution_plan = graph_config.moe.expert_overlay_execution_plan;
+            if (execution_plan && !execution_plan->buildsRootGraph())
+                return requested_device;
+
+            DeviceId continuation_device = runtime_plan->continuationDevice();
+            if (!continuation_device.is_valid() || continuation_device == requested_device)
+                return requested_device;
+
+            const auto &continuation_domain = runtime_plan->continuationDomain();
+            const bool requested_is_continuation_participant = std::any_of(
+                continuation_domain.participants.begin(),
+                continuation_domain.participants.end(),
+                [&](const MoEOverlayDomainParticipant &participant)
+                {
+                    return participant.local_device == requested_device;
+                });
+            if (requested_is_continuation_participant)
+                return requested_device;
+
+            LOG_INFO(log_prefix << " using MoE expert overlay continuation device "
+                                << continuation_device.to_string()
+                                << " instead of requested/default "
+                                << requested_device.to_string());
+            return continuation_device;
+        }
+    } // namespace
+
+    std::shared_ptr<MoEExpertParallelPlan> resolveMoEExpertParallelPlanForModel(
+        IModelContext &model_ctx,
+        const InferenceRunnerConfig &config)
+    {
+        auto plan = config.moe_expert_parallel_plan;
+        if (!plan)
+            return nullptr;
+        if (!plan->enabled || !plan->isTieredOverlay() || !plan->placements.empty())
+            return plan;
+
+        auto planner_result = MoEExpertParallelPlanner::plan(
+            *plan,
+            moEExpertMetadataForModel(model_ctx));
+        return std::make_shared<MoEExpertParallelPlan>(std::move(planner_result.planned_plan));
+    }
+
+    bool populateMoEExpertOverlayDomainTPContextsForGraph(
+        GraphConfig &graph_config,
+        DomainLocalTPContextMap &owned_contexts,
+        const std::string &log_prefix,
+        const InferenceRunnerConfig *runner_config)
+    {
+        const auto &plan = graph_config.moe.expert_parallel_plan;
+        if (!plan || !plan->isTieredOverlay())
+            return true;
+
+        ILocalTPContext *runner_local_tp_context = localTPContextFromRunnerConfig(runner_config);
+
+        for (size_t tier_index = 0; tier_index < plan->routed_tiers.size(); ++tier_index)
+        {
+            if (!tierHasAssignedExperts(*plan, tier_index))
+                continue;
+
+            const auto &tier = plan->routed_tiers[tier_index];
+            const auto *domain = findSourceDomain(*plan, tier.domain);
+            if (!domain || !domainNeedsLocalTPContext(*domain))
+                continue;
+
+            if (graph_config.domain_tp_contexts.find(domain->name) != graph_config.domain_tp_contexts.end())
+                continue;
+
+            if (runner_local_tp_context)
+            {
+                std::string reason;
+                if (localTPContextMatchesDomain(*runner_local_tp_context, *domain, &reason))
+                {
+                    graph_config.domain_tp_contexts[domain->name] = runner_local_tp_context;
+                    LOG_INFO(log_prefix << " using injected LOCAL TP context for MoE expert overlay domain '"
+                                        << domain->name << "' devices="
+                                        << describeDeviceList(runner_local_tp_context->devices())
+                                        << " backend=" << static_cast<int>(runner_local_tp_context->backend()));
+                    continue;
+                }
+
+                if (debugEnv().tp_collective_contract_trace)
+                {
+                    LOG_WARN(log_prefix << " [TP_COLLECTIVE_CONTEXT] event=moe_domain_injected_context_mismatch domain='"
+                                        << domain->name << "' reason=\"" << reason << "\""
+                                        << " injected_devices=" << describeDeviceList(runner_local_tp_context->devices())
+                                        << " domain_devices=" << describeDeviceList(domain->participants));
+                }
+            }
+
+            if (owned_contexts.find(domain->name) == owned_contexts.end())
+            {
+                std::vector<float> weights(domain->participants.size(),
+                                           1.0f / static_cast<float>(domain->participants.size()));
+                auto ctx = createLocalTPContext(domain->participants, weights, domain->backend);
+                if (!ctx)
+                {
+                    LOG_WARN(log_prefix << " failed to create LocalTPContext for MoE expert overlay domain '"
+                                        << domain->name << "'");
+                    return false;
+                }
+                owned_contexts.emplace(domain->name, std::shared_ptr<ILocalTPContext>(std::move(ctx)));
+            }
+
+            graph_config.domain_tp_contexts[domain->name] = owned_contexts.at(domain->name).get();
+        }
+
+        return true;
+    }
+
     static PreparedWeightKind expectedGemmPreparedKind(DeviceId device)
     {
-        if (device.is_cuda()) return PreparedWeightKind::CudaInt8PackedGemm;
-        if (device.is_rocm()) return PreparedWeightKind::RocmInt8PackedGemm;
+        if (device.is_cuda())
+            return PreparedWeightKind::CudaInt8PackedGemm;
+        if (device.is_rocm())
+            return PreparedWeightKind::RocmInt8PackedGemm;
         return PreparedWeightKind::CpuPackedGemm;
     }
 
     static bool isMoEExpertTensorName(const std::string &name)
     {
         return name.find("_exps.weight") != std::string::npos;
-    }
-
-    static const char *ggufTensorTypeToPlannerQuantType(GGUFTensorType type)
-    {
-        switch (type)
-        {
-        case GGUFTensorType::F32:
-            return "F32";
-        case GGUFTensorType::F16:
-            return "F16";
-        case GGUFTensorType::BF16:
-            return "BF16";
-        case GGUFTensorType::Q4_0:
-            return "Q4_0";
-        case GGUFTensorType::Q4_1:
-            return "Q4_1";
-        case GGUFTensorType::Q5_0:
-            return "Q5_0";
-        case GGUFTensorType::Q5_1:
-            return "Q5_1";
-        case GGUFTensorType::Q8_0:
-            return "Q8_0";
-        case GGUFTensorType::Q2_K:
-            return "Q2_K";
-        case GGUFTensorType::Q3_K:
-            return "Q3_K";
-        case GGUFTensorType::Q4_K:
-            return "Q4_K";
-        case GGUFTensorType::Q5_K:
-            return "Q5_K";
-        case GGUFTensorType::Q6_K:
-            return "Q6_K";
-        case GGUFTensorType::Q8_K:
-            return "Q8_K";
-        case GGUFTensorType::IQ4_NL:
-            return "IQ4_NL";
-        default:
-            return "F32";
-        }
-    }
-
-    static int readModelIntMetadata(
-        IModelContext &model_ctx,
-        IModelLoader &loader,
-        const std::string &suffix,
-        int default_value)
-    {
-        const int sentinel = std::numeric_limits<int>::min();
-        const std::string &arch = model_ctx.architecture();
-        if (!arch.empty())
-        {
-            const int prefixed = loader.getInt(arch + "." + suffix, sentinel);
-            if (prefixed != sentinel)
-                return prefixed;
-        }
-        return loader.getInt(suffix, default_value);
-    }
-
-    static std::string findConcreteMoEQuantType(
-        IModelContext &model_ctx,
-        const std::vector<std::string> &name_fragments,
-        const std::string &fallback)
-    {
-        auto *concrete = dynamic_cast<ModelContext *>(&model_ctx);
-        if (!concrete)
-            return fallback;
-
-        const auto &model = concrete->concreteLoader().getModel();
-        for (const auto &tensor : model.tensors)
-        {
-            for (const auto &fragment : name_fragments)
-            {
-                if (tensor.name.find(fragment) != std::string::npos)
-                    return ggufTensorTypeToPlannerQuantType(tensor.type);
-            }
-        }
-
-        return fallback;
-    }
-
-    static MoEExpertModelMetadata deriveMoEExpertModelMetadata(IModelContext &model_ctx)
-    {
-        auto loader = model_ctx.loader();
-        if (!loader)
-            throw std::runtime_error("MoE expert overlay planning requires a model loader");
-
-        MoEExpertModelMetadata metadata;
-        metadata.num_layers = model_ctx.totalBlockCount();
-        metadata.num_experts = readModelIntMetadata(model_ctx, *loader, "expert_count", 0);
-        metadata.d_model = model_ctx.embeddingLength();
-        metadata.routed_intermediate_size = readModelIntMetadata(model_ctx, *loader, "expert_feed_forward_length", 0);
-        if (metadata.routed_intermediate_size == 0)
-            metadata.routed_intermediate_size = model_ctx.feedForwardLength();
-
-        const int shared_count = readModelIntMetadata(model_ctx, *loader, "expert_shared_count", 0);
-        metadata.has_shared_expert = shared_count > 0;
-        metadata.shared_intermediate_size = metadata.has_shared_expert
-                                                ? readModelIntMetadata(model_ctx, *loader, "expert_shared_feed_forward_length", 0)
-                                                : 0;
-        if (metadata.has_shared_expert && metadata.shared_intermediate_size == 0)
-            metadata.shared_intermediate_size = metadata.routed_intermediate_size;
-
-        metadata.routed_quant_type = findConcreteMoEQuantType(
-            model_ctx,
-            {"ffn_gate_exps.weight", "ffn_up_exps.weight", "ffn_down_exps.weight"},
-            "F32");
-        metadata.shared_quant_type = metadata.has_shared_expert
-                                         ? findConcreteMoEQuantType(
-                                               model_ctx,
-                                               {"ffn_gate_shexp.weight", "ffn_up_shexp.weight", "ffn_down_shexp.weight"},
-                                               metadata.routed_quant_type)
-                                         : "F32";
-        return metadata;
-    }
-
-    static std::string formatMoEPlanValidationErrors(
-        const std::string &heading,
-        const MoEExpertParallelValidationResult &validation)
-    {
-        std::ostringstream message;
-        message << heading;
-        for (const auto &error : validation.errors)
-            message << "\n - " << error;
-        return message.str();
-    }
-
-    std::shared_ptr<MoEExpertParallelPlan> resolveMoEExpertParallelPlanForModel(
-        IModelContext &model_ctx,
-        const InferenceRunnerConfig &config)
-    {
-        const auto &requested_plan = config.moe_expert_parallel_plan;
-        if (!requested_plan)
-            return nullptr;
-        if (!requested_plan->enabled)
-            return requested_plan;
-
-        const MoEExpertModelMetadata metadata = deriveMoEExpertModelMetadata(model_ctx);
-        const MoEExpertParallelValidationOptions validation_options{
-            .layer_count = metadata.num_layers,
-            .routed_expert_count = metadata.num_experts,
-        };
-
-        if (!requested_plan->placements.empty())
-        {
-            const auto validation = validateMoEExpertParallelPlan(*requested_plan, validation_options);
-            if (!validation.ok())
-            {
-                throw std::invalid_argument(formatMoEPlanValidationErrors(
-                    "Invalid explicit MoE expert overlay placement for model metadata:",
-                    validation));
-            }
-            return requested_plan;
-        }
-
-        auto planner_result = MoEExpertParallelPlanner::plan(*requested_plan, metadata);
-        auto planned_plan = std::make_shared<MoEExpertParallelPlan>(std::move(planner_result.planned_plan));
-        LOG_INFO("[InferenceRunner] Planned MoE expert overlay: layers=" << metadata.num_layers
-                                                                          << " experts=" << metadata.num_experts
-                                                                          << " tiers=" << planned_plan->routed_tiers.size()
-                                                                          << " routed_quant=" << metadata.routed_quant_type
-                                                                          << " routed_expert_bytes=" << planner_result.memory.routed_expert_bytes_per_expert);
-        return planned_plan;
-    }
-
-    static bool assignResolvedMoEExpertParallelPlan(
-        IModelContext &model_ctx,
-        const InferenceRunnerConfig &config,
-        GraphConfig &graph_config,
-        const char *context,
-        int current_world_rank = 0)
-    {
-        try
-        {
-            graph_config.moe.expert_parallel_plan = resolveMoEExpertParallelPlanForModel(model_ctx, config);
-            graph_config.moe.expert_overlay_runtime_plan = resolveMoEExpertOverlayRuntimePlan(
-                graph_config.moe.expert_parallel_plan,
-                MoEExpertOverlayRuntimeResolverOptions{.current_world_rank = current_world_rank});
-            return true;
-        }
-        catch (const std::exception &e)
-        {
-            LOG_ERROR(context << " failed to resolve MoE expert overlay plan: " << e.what());
-            return false;
-        }
-    }
-
-    static DeviceId applyMoEOverlayContinuationDeviceIfResolved(
-        GraphConfig &graph_config,
-        DeviceId requested_device,
-        const char *context)
-    {
-        if (!graph_config.moe.expert_overlay_runtime_plan)
-        {
-            graph_config.default_device = requested_device;
-            return requested_device;
-        }
-
-        DeviceId continuation_device = graph_config.moe.expert_overlay_runtime_plan->continuationDevice();
-        if (!continuation_device.is_valid())
-        {
-            throw std::runtime_error(std::string(context) +
-                                     " resolved MoE expert overlay continuation domain to an invalid device");
-        }
-
-        graph_config.default_device = continuation_device;
-        if (continuation_device != requested_device)
-        {
-            LOG_INFO(context << " MoE expert overlay continuation_domain selects root device "
-                             << continuation_device.to_string()
-                             << " instead of requested/default " << requested_device.to_string());
-        }
-        else
-        {
-            LOG_DEBUG(context << " MoE expert overlay continuation_domain root device: "
-                              << continuation_device.to_string());
-        }
-        return continuation_device;
-    }
-
-    static bool isAcceleratorLocalTPTensorParallelOverlayDomain(
-        const MoEOverlayRuntimeDomain &domain)
-    {
-        if (domain.kind != ExpertDomainKind::LocalTP ||
-            domain.compute_kind != ExpertDomainComputeKind::TensorParallelExperts ||
-            domain.participants.size() < 2)
-        {
-            return false;
-        }
-
-        return std::all_of(domain.participants.begin(), domain.participants.end(),
-                           [](const MoEOverlayDomainParticipant &participant) {
-                               return participant.address.isGPU() &&
-                                      participant.locally_addressable &&
-                                      participant.local_device.is_gpu();
-                           });
-    }
-
-    static std::set<std::string> activeMoEOverlayRoutedDomainNames(
-        const MoEExpertOverlayRuntimePlan &runtime_plan)
-    {
-        std::set<size_t> active_tier_indices;
-        const auto &source_plan = runtime_plan.sourcePlan();
-        for (const auto &placement : source_plan.placements)
-        {
-            for (int tier_index : placement.routed_expert_tier)
-            {
-                if (tier_index >= 0 &&
-                    tier_index < static_cast<int>(runtime_plan.routedTiers().size()))
-                {
-                    active_tier_indices.insert(static_cast<size_t>(tier_index));
-                }
-            }
-        }
-
-        std::set<std::string> active_domains;
-        for (size_t tier_index : active_tier_indices)
-            active_domains.insert(runtime_plan.routedTiers()[tier_index].domain_name);
-        return active_domains;
-    }
-
-    static std::string formatMoEOverlayDomainParticipants(
-        const MoEOverlayRuntimeDomain &domain)
-    {
-        std::ostringstream message;
-        message << "[";
-        for (size_t index = 0; index < domain.participants.size(); ++index)
-        {
-            if (index > 0)
-                message << ", ";
-            const auto &participant = domain.participants[index];
-            message << participant.address.toShortString();
-            if (participant.local_device.is_valid())
-                message << "(" << participant.local_device.to_string() << ")";
-            if (participant.world_rank_known)
-                message << " rank=" << participant.world_rank;
-        }
-        message << "]";
-        return message.str();
-    }
-
-    bool populateMoEExpertOverlayDomainTPContextsForGraph(
-        GraphConfig &graph_config,
-        DomainLocalTPContextMap &owned_contexts,
-        const char *context)
-    {
-        const auto &runtime_plan = graph_config.moe.expert_overlay_runtime_plan;
-        if (!runtime_plan)
-            return true;
-
-        const std::set<std::string> active_domains = activeMoEOverlayRoutedDomainNames(*runtime_plan);
-        if (active_domains.empty())
-            return true;
-
-        const char *log_context = context ? context : "[InferenceRunner]";
-        for (const auto &domain : runtime_plan->domains())
-        {
-            if (active_domains.find(domain.name) == active_domains.end())
-                continue;
-            if (!isAcceleratorLocalTPTensorParallelOverlayDomain(domain))
-                continue;
-
-            auto injected = graph_config.domain_tp_contexts.find(domain.name);
-            if (injected != graph_config.domain_tp_contexts.end())
-            {
-                LOG_DEBUG(log_context << " preserving injected MoE expert overlay LocalTP context for domain '"
-                                      << domain.name << "'");
-                continue;
-            }
-
-            auto owned = owned_contexts.find(domain.name);
-            if (owned != owned_contexts.end())
-            {
-                graph_config.domain_tp_contexts[domain.name] = owned->second.get();
-                LOG_DEBUG(log_context << " reusing owned MoE expert overlay LocalTP context for domain '"
-                                      << domain.name << "'");
-                continue;
-            }
-
-            std::vector<GlobalDeviceAddress> participants;
-            participants.reserve(domain.participants.size());
-            for (const auto &participant : domain.participants)
-                participants.push_back(participant.address);
-
-            const std::string participants_desc = formatMoEOverlayDomainParticipants(domain);
-            try
-            {
-                auto local_tp_context = createLocalTPContext(
-                    std::move(participants), {}, domain.backend);
-                if (!local_tp_context)
-                {
-                    LOG_ERROR(log_context << " failed to create MoE expert overlay LocalTP context for domain '"
-                                          << domain.name << "' backend="
-                                          << collectiveBackendTypeToString(domain.backend)
-                                          << " participants=" << participants_desc
-                                          << ": original exception=<none; createLocalTPContext returned nullptr>");
-                    return false;
-                }
-
-                auto shared_context = std::shared_ptr<ILocalTPContext>(std::move(local_tp_context));
-                graph_config.domain_tp_contexts[domain.name] = shared_context.get();
-                owned_contexts.emplace(domain.name, std::move(shared_context));
-
-                LOG_INFO(log_context << " created MoE expert overlay LocalTP context for domain '"
-                                     << domain.name << "' backend="
-                                     << collectiveBackendTypeToString(domain.backend)
-                                     << " participants=" << participants_desc);
-            }
-            catch (const std::exception &e)
-            {
-                LOG_ERROR(log_context << " failed to create MoE expert overlay LocalTP context for domain '"
-                                      << domain.name << "' backend="
-                                      << collectiveBackendTypeToString(domain.backend)
-                                      << " participants=" << participants_desc
-                                      << ": original exception=" << e.what());
-                return false;
-            }
-        }
-
-        return true;
     }
 
     static PreparedWeightKind expectedPreparedKindForWeight(
@@ -583,9 +598,9 @@ namespace llaminar2
         const bool has_tp = tp_config && tp_config->worldSize() > 1;
         const bool has_pp = pp_config != nullptr;
         strategy.mode = has_pp && has_tp ? WeightInferenceMode::HybridPPTP
-                      : has_pp          ? WeightInferenceMode::LocalPP
-                      : has_tp          ? WeightInferenceMode::LocalTP
-                                        : WeightInferenceMode::SingleDevice;
+                        : has_pp         ? WeightInferenceMode::LocalPP
+                        : has_tp         ? WeightInferenceMode::LocalTP
+                                         : WeightInferenceMode::SingleDevice;
         strategy.model_id = ModelContextId{reinterpret_cast<uint64_t>(&model_ctx)};
         strategy.pp_stages = has_pp ? 2 : 1;
         strategy.tp_degree = tp_config ? tp_config->worldSize() : 1;
@@ -1229,9 +1244,18 @@ namespace llaminar2
         auto config_builder = createGraphConfigBuilder(architecture);
         GraphConfig graph_config;
         config_builder->populateFromModelContext(*model_ctx, graph_config);
-        const int current_world_rank = mpi_ctx ? mpi_ctx->rank() : 0;
-        if (!assignResolvedMoEExpertParallelPlan(*model_ctx, config, graph_config, "[InferenceRunner]", current_world_rank))
+        DomainLocalTPContextMap owned_domain_tp_contexts;
+        if (!applyMoEExpertOverlayConfigToGraph(
+                *model_ctx,
+                config,
+                mpi_ctx,
+                graph_config,
+                owned_domain_tp_contexts,
+                "[InferenceRunner]"))
+        {
             return nullptr;
+        }
+        device = effectiveMoEOverlayRootDevice(graph_config, device, "[InferenceRunner]");
 
         // Apply sharding config + model dimensions in a single call
         // (must be after populateFromModelContext which sets n_heads/n_kv_heads/head_dim)
@@ -1243,18 +1267,12 @@ namespace llaminar2
 
         // Execution-specific settings
         graph_config.max_seq_len = config.max_seq_len;
+        graph_config.executor_config.cancellation_requested = config.cancellation_requested;
+        graph_config.executor_config.stage_failure_callback = config.stage_failure_callback;
 
         // CRITICAL: Set default device for kernel dispatch
         // This determines which kernels (CPU vs CUDA) are selected for execution
-        try
-        {
-            device = applyMoEOverlayContinuationDeviceIfResolved(graph_config, device, "[InferenceRunner]");
-        }
-        catch (const std::exception &e)
-        {
-            LOG_ERROR("[InferenceRunner] " << e.what());
-            return nullptr;
-        }
+        graph_config.default_device = device;
         LOG_DEBUG("[InferenceRunner] Default device: " << graph_config.default_device.to_string());
 
         // Propagate activation precision from runtime config
@@ -1360,11 +1378,9 @@ namespace llaminar2
                                             ? static_cast<ILocalTPContext *>(tp_ctx)
                                             : nullptr;
         IGlobalTPContext *injected_global_tp_ctx = (tp_ctx && !tp_ctx->isLocal())
-                                   ? dynamic_cast<IGlobalTPContext *>(tp_ctx)
-                                   : nullptr;
+                                                       ? dynamic_cast<IGlobalTPContext *>(tp_ctx)
+                                                       : nullptr;
         const int tp_device_idx = config.tp_device_index;
-
-        DomainLocalTPContextMap moe_domain_tp_contexts;
 
         // Check if TensorParallelConfig is available from WeightManager (for GLOBAL TP)
         const TensorParallelConfig *tp_config = weight_mgr ? weight_mgr->tensorParallelConfig() : nullptr;
@@ -1428,6 +1444,8 @@ namespace llaminar2
             }
         }
 
+        installTPExecutorCancellation(graph_config, graph_config.tp_ctx, "[InferenceRunner]");
+
         LOG_DEBUG("[InferenceRunner] GraphConfig: "
                   << "vocab=" << graph_config.vocab_size
                   << ", d_model=" << graph_config.d_model
@@ -1436,12 +1454,6 @@ namespace llaminar2
                   << ", n_kv_heads=" << graph_config.n_kv_heads
                   << ", d_ff=" << graph_config.d_ff);
 
-            if (!populateMoEExpertOverlayDomainTPContextsForGraph(
-                graph_config, moe_domain_tp_contexts, "[InferenceRunner]"))
-            {
-                return nullptr;
-            }
-
         // =====================================================================
         // MoE Expert Rebalance Controller (Phase 4a)
         // =====================================================================
@@ -1449,7 +1461,7 @@ namespace llaminar2
         // propagates into MoEExpertComputeStage params during graph construction.
         std::unique_ptr<MoERebalanceController> moe_controller;
         {
-            const auto& env = debugEnv();
+            const auto &env = debugEnv();
             if (env.moe_rebalance.mode != "off" && graph_config.moe.enabled())
             {
                 MoERebalanceMode mode = MoERebalanceMode::OFF;
@@ -1523,8 +1535,10 @@ namespace llaminar2
                 std::move(graph_builder), mpi_ctx);
         }
 
-        if (!moe_domain_tp_contexts.empty())
-            orchestrator->setDomainTPContexts(std::move(moe_domain_tp_contexts));
+        if (!owned_domain_tp_contexts.empty())
+        {
+            orchestrator->setDomainTPContexts(std::move(owned_domain_tp_contexts));
+        }
 
         // Transfer TurboQuant context ownership to orchestrator
         if (turboquant_ctx)
@@ -1926,22 +1940,27 @@ namespace llaminar2
             return false;
         }
 
-        const bool has_moe_overlay = graph_config.moe.expert_overlay_runtime_plan != nullptr;
+        const bool has_overlay_runtime_plan = graph_config.moe.expert_overlay_runtime_plan != nullptr;
         if (!weight_mgr->prepareWeightsForDevice(
                 frozen_weights,
                 device,
-                /*include_expert_jobs=*/!has_moe_overlay))
+                /*include_expert_jobs=*/!has_overlay_runtime_plan))
         {
             LOG_WARN("[InferenceRunner] Binding-driven weight preparation had issues for device "
                      << device.to_string());
         }
 
-        if (has_moe_overlay &&
-            !weight_mgr->prepareMoEExpertOverlayWeights(*graph_config.moe.expert_overlay_runtime_plan,
-                                                        &frozen_weights))
+        if (graph_config.moe.expert_overlay_runtime_plan)
         {
-            LOG_ERROR("[InferenceRunner] MoE expert overlay weight preparation failed");
-            return false;
+            const auto *execution_plan = graph_config.moe.expert_overlay_execution_plan.get();
+            if (!weight_mgr->prepareMoEExpertOverlayWeights(
+                    *graph_config.moe.expert_overlay_runtime_plan,
+                    &frozen_weights,
+                    execution_plan))
+            {
+                LOG_ERROR("[InferenceRunner] Failed to prepare MoE expert overlay weights");
+                return false;
+            }
         }
 
         orchestrator->setFrozenWeightSet(
@@ -1978,8 +1997,7 @@ namespace llaminar2
         std::shared_ptr<ModelContext> model_ctx,
         DeviceId device,
         const FactoryPPStageConfig &pp_config,
-        const InferenceRunnerConfig &config,
-        const GraphConfig &graph_config)
+        const InferenceRunnerConfig &config)
     {
         if (!orchestrator || !model_ctx)
         {
@@ -2121,24 +2139,12 @@ namespace llaminar2
         // Prepare weights: GEMM pack + upload (layer-filtered, no host release)
         // Host copies are released by the caller after ALL PP stages are prepared.
         // =====================================================================
-        const bool has_moe_overlay = graph_config.moe.expert_overlay_runtime_plan != nullptr;
-        bool prepare_ok = weight_mgr->prepareWeightsForDevice(
-            frozen_weights,
-            device,
-            /*include_expert_jobs=*/!has_moe_overlay);
+        bool prepare_ok = weight_mgr->prepareWeightsForDevice(frozen_weights, device);
 
         if (!prepare_ok)
         {
             LOG_WARN("[PPStageRunner] Weight preparation had issues for device "
                      << device.to_string() << " layers [" << first_layer << ", " << last_layer << ")");
-        }
-
-        if (has_moe_overlay &&
-            !weight_mgr->prepareMoEExpertOverlayWeights(*graph_config.moe.expert_overlay_runtime_plan,
-                                                        &frozen_weights))
-        {
-            LOG_ERROR("[PPStageRunner] MoE expert overlay weight preparation failed");
-            return false;
         }
 
         orchestrator->setFrozenWeightSet(
@@ -2305,8 +2311,6 @@ namespace llaminar2
         auto config_builder = createGraphConfigBuilder(architecture);
         GraphConfig graph_config;
         config_builder->populateFromModelContext(*model_ctx, graph_config);
-        if (!assignResolvedMoEExpertParallelPlan(*model_ctx, config, graph_config, "[UnifiedPipeline]"))
-            return nullptr;
 
         // Execution-specific settings
         graph_config.max_seq_len = config.max_seq_len;
@@ -2315,30 +2319,14 @@ namespace llaminar2
         // Non-TP: use full dimensions
         setFullDimensions(graph_config);
 
-        DomainLocalTPContextMap moe_domain_tp_contexts;
-
         // Primary device is from first PP stage
         DeviceId primary_device = pipeline_config->getDeviceForLayer(0);
-        try
-        {
-            primary_device = applyMoEOverlayContinuationDeviceIfResolved(graph_config, primary_device, "[UnifiedPipeline]");
-        }
-        catch (const std::exception &e)
-        {
-            LOG_ERROR("[UnifiedPipeline] " << e.what());
-            return nullptr;
-        }
+        graph_config.default_device = primary_device;
 
         LOG_DEBUG("[UnifiedPipeline] GraphConfig: "
                   << "n_layers=" << graph_config.n_layers
                   << ", d_model=" << graph_config.d_model
                   << ", primary_device=" << primary_device.to_string());
-
-        if (!populateMoEExpertOverlayDomainTPContextsForGraph(
-            graph_config, moe_domain_tp_contexts, "[UnifiedPipeline]"))
-        {
-            return nullptr;
-        }
 
         // =====================================================================
         // Create DeviceGraphOrchestrator with injected dependencies
@@ -2348,7 +2336,6 @@ namespace llaminar2
         deps.graph_builder = GraphBuilderRegistry::create(architecture, graph_config, nullptr);
         deps.graph_builder->setModelContext(model_ctx);
         deps.pipeline_config = pipeline_config;
-        deps.domain_tp_contexts = std::move(moe_domain_tp_contexts);
 
         auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(
             std::move(deps));
@@ -2437,8 +2424,6 @@ namespace llaminar2
         auto config_builder = createGraphConfigBuilder(architecture);
         GraphConfig graph_config;
         config_builder->populateFromModelContext(*model_ctx, graph_config);
-        if (!assignResolvedMoEExpertParallelPlan(*model_ctx, config, graph_config, "[PPStageRunner]"))
-            return nullptr;
 
         // Override n_layers for PP stage: graph builds only this stage's layers,
         // not the full model. total_n_layers retains the full model count for
@@ -2447,15 +2432,7 @@ namespace llaminar2
 
         // Execution-specific settings
         graph_config.max_seq_len = config.max_seq_len;
-        try
-        {
-            device = applyMoEOverlayContinuationDeviceIfResolved(graph_config, device, "[PPStageRunner]");
-        }
-        catch (const std::exception &e)
-        {
-            LOG_ERROR("[PPStageRunner] " << e.what());
-            return nullptr;
-        }
+        graph_config.default_device = device;
         graph_config.activation_precision = config.activation_precision;
 
         graph_config.fused_attention_backend = resolveEffectiveAttentionBackend(
@@ -2463,8 +2440,6 @@ namespace llaminar2
 
         // kv_cache_scale_k/v set by config builder — don't overwrite
         graph_config.kv_cache_precision = config.kv_cache_precision;
-
-        DomainLocalTPContextMap moe_domain_tp_contexts;
 
         // TurboQuant context for TQ4/TQ KV cache
         std::shared_ptr<TurboQuantContext> turboquant_ctx;
@@ -2498,12 +2473,6 @@ namespace llaminar2
         // Inter-stage communication is handled by the PP orchestrator, not MPI collectives
         setFullDimensions(graph_config);
 
-        if (!populateMoEExpertOverlayDomainTPContextsForGraph(
-            graph_config, moe_domain_tp_contexts, "[PPStageRunner]"))
-        {
-            return nullptr;
-        }
-
         LOG_DEBUG("[PPStageRunner] GraphConfig (no TP): "
                   << "vocab=" << graph_config.vocab_size
                   << ", d_model=" << graph_config.d_model
@@ -2523,9 +2492,6 @@ namespace llaminar2
         graph_builder->setModelContext(model_ctx);
         auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(
             std::move(graph_builder), nullptr /* no mpi_ctx */);
-
-        if (!moe_domain_tp_contexts.empty())
-            orchestrator->setDomainTPContexts(std::move(moe_domain_tp_contexts));
 
         if (turboquant_ctx)
             orchestrator->setTurboQuantContext(std::move(turboquant_ctx));
@@ -2562,7 +2528,7 @@ namespace llaminar2
         // =====================================================================
         // Load weights for this PP stage (partial weight loading)
         // =====================================================================
-        if (!configurePPStageWeightsImpl(orchestrator.get(), model_ctx, device, pp_config, config, graph_config))
+        if (!configurePPStageWeightsImpl(orchestrator.get(), model_ctx, device, pp_config, config))
         {
             LOG_ERROR("[PPStageRunner] Failed to configure PP stage weights");
             return nullptr;
@@ -2625,20 +2591,23 @@ namespace llaminar2
         auto config_builder = createGraphConfigBuilder(architecture);
         GraphConfig graph_config;
         config_builder->populateFromModelContext(*model_ctx, graph_config);
-        if (!assignResolvedMoEExpertParallelPlan(*model_ctx, config, graph_config, "[InferenceRunner:testable]"))
+        DomainLocalTPContextMap owned_domain_tp_contexts;
+        const auto overlay_runner_mpi_ctx = config.moe_expert_overlay_mpi_ctx;
+        if (!applyMoEExpertOverlayConfigToGraph(
+                *model_ctx,
+                config,
+                overlay_runner_mpi_ctx,
+                graph_config,
+                owned_domain_tp_contexts,
+                "[InferenceRunner]"))
+        {
             return nullptr;
+        }
+        device = effectiveMoEOverlayRootDevice(graph_config, device, "[InferenceRunner] Testable");
 
         // Execution-specific settings
         graph_config.max_seq_len = config.max_seq_len;
-        try
-        {
-            device = applyMoEOverlayContinuationDeviceIfResolved(graph_config, device, "[InferenceRunner:testable]");
-        }
-        catch (const std::exception &e)
-        {
-            LOG_ERROR("[InferenceRunner:testable] " << e.what());
-            return nullptr;
-        }
+        graph_config.default_device = device;
         graph_config.activation_precision = config.activation_precision;
         graph_config.fused_attention_backend = config.fused_attention_backend;
         // kv_cache_scale_k/v set by config builder — don't overwrite
@@ -2679,8 +2648,6 @@ namespace llaminar2
                                                        : nullptr;
         const int tp_device_idx = config.tp_device_index;
 
-        DomainLocalTPContextMap moe_domain_tp_contexts;
-
         if (local_tp_ctx && local_tp_ctx->degree() > 1)
         {
             if (!applyLocalTPAssignment(graph_config, local_tp_ctx, tp_device_idx))
@@ -2703,11 +2670,7 @@ namespace llaminar2
             setFullDimensions(graph_config);
         }
 
-        if (!populateMoEExpertOverlayDomainTPContextsForGraph(
-                graph_config, moe_domain_tp_contexts, "[InferenceRunner:testable]"))
-        {
-            return nullptr;
-        }
+        installTPExecutorCancellation(graph_config, graph_config.tp_ctx, "[InferenceRunner] Testable");
 
         if (auto concrete_model_ctx = std::dynamic_pointer_cast<ModelContext>(model_ctx))
         {
@@ -2736,7 +2699,7 @@ namespace llaminar2
         deps.graph_builder->setModelContext(model_ctx);
         deps.turboquant_ctx = std::move(turboquant_ctx);
         deps.kv_rotation = std::move(kv_rotation);
-        deps.domain_tp_contexts = std::move(moe_domain_tp_contexts);
+        deps.domain_tp_contexts = std::move(owned_domain_tp_contexts);
         if (config.pp_stage_config.has_value())
             deps.pp_stage_config = config.pp_stage_config.value();
         if (auto concrete_model_ctx = std::dynamic_pointer_cast<ModelContext>(model_ctx))
@@ -2778,7 +2741,7 @@ namespace llaminar2
                     catch (const std::out_of_range &)
                     {
                         LOG_TRACE("[InferenceRunner] Device " << device.to_string()
-                                                               << " not in runner TensorParallelConfig, using standard loader for " << name);
+                                                              << " not in runner TensorParallelConfig, using standard loader for " << name);
                     }
                 }
             }
@@ -2847,24 +2810,14 @@ namespace llaminar2
             // bindings. Re-run the stage-filtered preparation here, after
             // materialization, so GPU pipeline handles are registered under the
             // graph binding ids instead of pipeline-local ids.
-            const bool has_moe_overlay = graph_config.moe.expert_overlay_runtime_plan != nullptr;
             bool prepare_ok = concrete_weight_mgr->prepareWeightsForDevice(
                 frozen_weights,
-                device,
-                /*include_expert_jobs=*/!has_moe_overlay);
+                device);
 
             if (!prepare_ok)
             {
                 LOG_WARN("[InferenceRunner] PP stage weight preparation had issues for device "
                          << device.to_string() << " layers [" << pp_cfg.first_layer << ", " << pp_cfg.last_layer << ")");
-            }
-
-            if (has_moe_overlay &&
-                !concrete_weight_mgr->prepareMoEExpertOverlayWeights(*graph_config.moe.expert_overlay_runtime_plan,
-                                                                     &frozen_weights))
-            {
-                LOG_ERROR("[InferenceRunner] PP stage MoE expert overlay weight preparation failed");
-                return nullptr;
             }
 
             orchestrator->setFrozenWeightSet(
@@ -2929,12 +2882,18 @@ namespace llaminar2
                                  << device.to_string());
                     }
 
-                    if (graph_config.moe.expert_overlay_runtime_plan &&
-                        !concrete_weight_mgr->prepareMoEExpertOverlayWeights(*graph_config.moe.expert_overlay_runtime_plan,
-                                                                            &frozen_weights))
+                    if (graph_config.moe.expert_overlay_runtime_plan)
                     {
-                        LOG_ERROR("[InferenceRunner] LocalTP MoE expert overlay weight preparation failed");
-                        return nullptr;
+                        const auto *execution_plan = graph_config.moe.expert_overlay_execution_plan.get();
+                        if (!concrete_weight_mgr->prepareMoEExpertOverlayWeights(
+                                *graph_config.moe.expert_overlay_runtime_plan,
+                                &frozen_weights,
+                                execution_plan))
+                        {
+                            LOG_ERROR("[InferenceRunner] LocalTP failed to prepare MoE expert overlay weights for device "
+                                      << device.to_string());
+                            return nullptr;
+                        }
                     }
 
                     orchestrator->setFrozenWeightSet(

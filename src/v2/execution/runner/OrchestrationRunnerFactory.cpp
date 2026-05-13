@@ -137,6 +137,17 @@ namespace llaminar2
         std::unique_ptr<IOrchestrationRunner> createFromOrchestrationConfig(
             OrchestrationConfig config) override
         {
+            auto normalize_errors = normalizeMoEExpertOverlayDomains(config);
+            if (!normalize_errors.empty())
+            {
+                LOG_ERROR("MoE expert overlay domain normalization failed:");
+                for (const auto &error : normalize_errors)
+                {
+                    LOG_ERROR("  - " << error);
+                }
+                return nullptr;
+            }
+
             // ================================================================
             // Handle topology tree if present (Phase 8: Global PP integration)
             // ================================================================

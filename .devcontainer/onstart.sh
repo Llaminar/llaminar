@@ -98,12 +98,15 @@ if command -v rocm-smi &>/dev/null; then
     echo "[onstart] Found $ROCM_COUNT ROCm GPU(s)"
 fi
 
-# Create models symlink
-if [ ! -L /workspace/models ]; then
-    ln -s /opt/llaminar-models /workspace/models
+# Create models symlink when the workspace does not already have a models path.
+WORKSPACE_DIR="${WORKSPACE_DIR:-/workspaces/llaminar}"
+if [ ! -e "$WORKSPACE_DIR/models" ]; then
+    ln -s /opt/llaminar-models "$WORKSPACE_DIR/models"
     echo "[onstart] Created symlink for models directory"
-else
+elif [ -L "$WORKSPACE_DIR/models" ]; then
     echo "[onstart] Symlink for models directory already exists"
+else
+    echo "[onstart] Workspace models directory already exists"
 fi
 
 echo "[onstart] Done."

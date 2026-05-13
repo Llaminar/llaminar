@@ -319,6 +319,31 @@ namespace llaminar2
             if (!dispatch_tier)
                 return false;
             traceDescriptorConsumption(params_, *dispatch_tier);
+
+            if (dispatch_tier->entries.empty())
+            {
+                clearOutput(params_.output);
+                initializeEmptyDiagnostics(params_, *params_.local_tp_context, *dispatch_tier, diagnostics);
+                if (profiling_enabled && diagnostics)
+                {
+                    diagnostics->compute_ms = std::chrono::duration<double, std::milli>(
+                                                  std::chrono::steady_clock::now() - stage_start)
+                                                  .count();
+                    MoEExpertOverlayProfiler::recordLocalTP(
+                        params_.layer_idx,
+                        params_.domain,
+                        activeExpertCount(params_.expert_mask, params_.num_experts),
+                        *diagnostics);
+                }
+                if (debugEnv().moe_expert_overlay.trace || debugEnv().tp_collective_contract_trace)
+                {
+                    LOG_INFO("[MoEExpertOverlayLocalTPStage] layer=" << params_.layer_idx
+                                                                     << " domain='" << params_.domain.name
+                                                                     << "' tier=" << dispatch_tier->tier_index
+                                                                     << " no routed work; skipped LocalTP executor");
+                }
+                return true;
+            }
         }
 
         MoEExpertOverlayLocalTPRunParams run;

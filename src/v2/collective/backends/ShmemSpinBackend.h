@@ -147,6 +147,7 @@ namespace llaminar2
         bool initialize(const DeviceGroup &group) override;
         bool isInitialized() const override;
         void shutdown() override;
+        void abort() override;
 
         // =====================================================================
         // Collective Operations
@@ -236,6 +237,9 @@ namespace llaminar2
         /// Unmap and optionally unlink the shared memory segment
         void teardownSharedMemory();
 
+        /// Wait for a peer epoch in the shared-memory protocol, with abort/timeout handling.
+        bool waitForPeerEpoch(int peer_rank, uint64_t target_epoch, const char *phase, size_t count = 0);
+
         int domain_id_;
         int my_rank_;
         int num_ranks_ = 0;                  ///< Total ranks (set during initialize)
@@ -247,6 +251,7 @@ namespace llaminar2
         ShmemSpinArena *arena_ = nullptr;     ///< Mapped shared-memory arena
 
         std::unique_ptr<UPICollectiveBackend> fallback_; ///< MPI fallback for non-fast-path ops
+        std::atomic<bool> abort_requested_{false};       ///< Local abort requested for this backend
         bool initialized_ = false;
         mutable std::string last_error_;
     };

@@ -17,6 +17,7 @@
 #include "stages/MoEExpertDispatchStage.h"
 #include "stages/MoEExpertOverlayCPUFallbackStage.h"
 #include "stages/MoEExpertOverlayLocalTPStage.h"
+#include "stages/MoEOverlayDomainRuntimeStage.h"
 #include "stages/MoEExpertParallelReduceStage.h"
 #include "stages/MoERoutingStage.h"
 #include "stages/ReceiveActivationsStage.h"
@@ -133,6 +134,12 @@ namespace llaminar2
         const MoEExpertOverlayLocalTPStage::Params &params)
     {
         return std::make_unique<MoEExpertOverlayLocalTPStage>(params);
+    }
+
+    std::unique_ptr<IComputeStage> ComputeStageFactory::createMoEOverlayDomainRuntime(
+        const MoEOverlayDomainRuntimeStage::Params &params)
+    {
+        return std::make_unique<MoEOverlayDomainRuntimeStage>(params);
     }
 
     std::unique_ptr<IComputeStage> ComputeStageFactory::createMoEExpertParallelReduce(

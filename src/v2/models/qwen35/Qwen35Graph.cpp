@@ -461,9 +461,13 @@ namespace llaminar2
         // V is sharded whenever n_v_heads < n_v_heads_full. Previously the
         // expansion case was missed, leaving rank>0 with offset=0 and reading
         // the wrong K-heads for its V-head slice.
-        if (mpi_ctx_ && mpi_ctx_->world_size() > 1 && n_v_heads < n_v_heads_full)
+        if (n_v_heads < n_v_heads_full)
         {
-            rec_params.global_v_head_offset = mpi_ctx_->rank() * n_v_heads;
+            rec_params.global_v_head_offset = config_.qkv_column_parallel
+                                                  ? config_.head_start
+                                                  : ((mpi_ctx_ && mpi_ctx_->world_size() > 1)
+                                                         ? mpi_ctx_->rank() * n_v_heads
+                                                         : 0);
         }
 
         rec_params.output_buffer_id = BufferId::ATTN_OUTPUT;

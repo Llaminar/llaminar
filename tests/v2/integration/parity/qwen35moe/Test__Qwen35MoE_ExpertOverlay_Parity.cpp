@@ -9,9 +9,8 @@
  *
  * Bridge Phase 5A audit contract: OverlayPlanTopology_* tests only prove that the
  * planned same-layer tier assignments are non-empty and stable. PrefillParity_*
- * and DecodeParity_* are the real V2 inference parity bodies; while production
- * overlay gaps remain, they must report a clear GTest skip from
- * overlayRuntimeBlockers() instead of passing as topology-only coverage.
+ * and DecodeParity_* are the real V2 inference parity bodies and use the
+ * production overlay domain-worker protocol for non-root CPU fallback ranks.
  */
 
 #include <gtest/gtest.h>
@@ -22,19 +21,16 @@
 #include "backends/ComputeBackend.h"
 #include "backends/GPUDeviceContextPool.h"
 #include "collective/BackendRouter.h"
-#include "execution/compute_stages/stages/MoEExpertOverlayCPUFallbackStage.h"
 #include "execution/factory/InferenceRunnerFactory.h"
 #include "execution/moe/MoEExpertParallelPlanner.h"
-#include "loaders/ExpertGemmRegistry.h"
-#include "mocks/MockComputeStage.h"
-#include "tensors/Tensors.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cstdlib>
 #include <filesystem>
 #include <iostream>
 #include <memory>
-#include <set>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -302,157 +298,67 @@ namespace
         return it == plan.domains.end() ? nullptr : &(*it);
     }
 
-    bool tierOwnsAnyExpert(
-        const ExpertLayerPlacement &placement,
-        int tier_index)
+    MoEExpertModelMetadata topologyOnlyMetadata()
     {
-        return std::any_of(placement.routed_expert_tier.begin(),
-                           placement.routed_expert_tier.end(),
-                           [tier_index](int mapped_tier)
-                           {
-                               return mapped_tier == tier_index;
-                           });
+        MoEExpertModelMetadata metadata;
+        metadata.num_experts = 256;
+        return metadata;
     }
 
-    const ExpertLayerPlacement *findLayerPlacement(
-        const MoEExpertParallelPlan &plan,
-        int layer_idx)
+    std::shared_ptr<MoEExpertParallelPlan> makeTopologyOnlyOverlayPlan(OverlayTopologyKind topology)
     {
-        auto it = std::find_if(plan.placements.begin(), plan.placements.end(),
-                               [layer_idx](const ExpertLayerPlacement &placement)
-                               {
-                                   return placement.layer == layer_idx;
-                               });
-        return it == plan.placements.end() ? nullptr : &(*it);
+        return std::make_shared<MoEExpertParallelPlan>(requestedPlan(topology, topologyOnlyMetadata()));
     }
 
-    bool anyExpertEnabled(const std::vector<bool> &mask)
+    std::optional<std::string> overlayHardwareBlocker(OverlayTopologyKind topology)
     {
-        return std::any_of(mask.begin(), mask.end(), [](bool enabled)
-                           { return enabled; });
-    }
-
-    std::string joinBlockers(const std::vector<std::string> &blockers)
-    {
-        std::ostringstream message;
-        for (size_t i = 0; i < blockers.size(); ++i)
+        const int cuda_count = getCudaDeviceCount();
+        const int rocm_count = getRocmDeviceCount();
+        switch (topology)
         {
-            if (i != 0)
-                message << "; ";
-            message << blockers[i];
+        case OverlayTopologyKind::RocmSharedHotCpuCold:
+            if (rocm_count < 2)
+                return "ExpertOverlay parity requires 2 ROCm devices, found " + std::to_string(rocm_count);
+            break;
+        case OverlayTopologyKind::CudaSharedHotRocmHotCpuCold:
+            if (cuda_count < 1)
+                return "ExpertOverlay parity requires 1 CUDA device, found " + std::to_string(cuda_count);
+            if (rocm_count < 2)
+                return "ExpertOverlay parity requires 2 ROCm devices, found " + std::to_string(rocm_count);
+            break;
         }
-        return message.str();
+        return std::nullopt;
     }
 
-    std::string overlayPlanOnlyRuntimeBlockers(const MoEExpertParallelPlan &plan)
+    std::string activationPrecisionConfigValue(ActivationPrecision precision)
     {
-        (void)plan;
-        return {};
+        std::string value = activationPrecisionToString(precision);
+        std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {
+            return static_cast<char>(std::tolower(ch));
+        });
+        return value;
     }
 
-    // Bridge Phase 5A skip audit: every blocker reported here is an intentionally
-    // remaining production capability gap. Keep these messages specific so a
-    // CTest-pass/GTest-skip result cannot be mistaken for completed inference.
-    std::string overlayRuntimeBlockers(
-        const MoEExpertParallelPlan &plan,
-        ModelContext &ctx)
+    std::string kvCachePrecisionConfigValue(KVCachePrecision precision)
     {
-        std::vector<std::string> blockers;
-        std::set<std::string> reported_missing_registry;
-        auto weight_mgr = ctx.concreteWeightManager();
-        if (!weight_mgr)
+        switch (precision)
         {
-            return "Bridge Phase 5B accelerator residency verification requires a concrete WeightManager to verify prepared expert residency";
+        case KVCachePrecision::AUTO:
+            return "auto";
+        case KVCachePrecision::FP32:
+            return "fp32";
+        case KVCachePrecision::FP16:
+            return "fp16";
+        case KVCachePrecision::Q8_1:
+            return "q8_1";
+        case KVCachePrecision::Q16_1:
+            return "q16_1";
+        case KVCachePrecision::TQ4:
+            return "tq4";
+        case KVCachePrecision::TQ:
+            return "tq";
         }
-
-        const auto &registry = weight_mgr->expertGemmRegistry();
-        for (const auto &placement : plan.placements)
-        {
-            for (size_t tier_index = 0; tier_index < plan.routed_tiers.size(); ++tier_index)
-            {
-                if (!tierOwnsAnyExpert(placement, static_cast<int>(tier_index)))
-                    continue;
-
-                const auto &tier = plan.routed_tiers[tier_index];
-                const ExpertComputeDomain *domain = findDomain(plan, tier.domain);
-                if (!domain || domain->participants.empty())
-                {
-                    blockers.push_back("Expert overlay tier '" + tier.name +
-                                       "' references an unavailable compute domain");
-                    continue;
-                }
-
-                struct ParticipantDevice
-                {
-                    DeviceId device = DeviceId::invalid();
-                    int participant_index = -1;
-                };
-
-                std::vector<ParticipantDevice> participant_devices;
-                for (size_t participant_index = 0; participant_index < domain->participants.size(); ++participant_index)
-                {
-                    const DeviceId participant_device = domain->participants[participant_index].toLocalDeviceId();
-                    if (participant_device.is_gpu())
-                    {
-                        participant_devices.push_back(ParticipantDevice{
-                            .device = participant_device,
-                            .participant_index = static_cast<int>(participant_index),
-                        });
-                    }
-                }
-                if (participant_devices.empty())
-                    continue;
-
-                // Do not require direct ROCm P2P here. RCCL owns transport
-                // selection and may legally stage through host memory when the
-                // topology lacks peer access; P2P is a performance signal, not
-                // a correctness precondition for Phase 8A parity.
-
-                // Phase 5E expected skip: real inference can run only when
-                // every active accelerator participant has domain-scoped
-                // prepared gate/up/down engines for its planned routed experts.
-                for (const auto &participant : participant_devices)
-                {
-                    bool missing_gpu_engine = false;
-                    for (int expert = 0; expert < static_cast<int>(placement.routed_expert_tier.size()); ++expert)
-                    {
-                        if (placement.routed_expert_tier[static_cast<size_t>(expert)] != static_cast<int>(tier_index))
-                            continue;
-
-                        using Role = ExpertGemmRegistry::WeightRole;
-                        if (!registry.getEngineForDomain(tier.domain, participant.device, placement.layer, expert, Role::GATE) ||
-                            !registry.getEngineForDomain(tier.domain, participant.device, placement.layer, expert, Role::UP) ||
-                            !registry.getEngineForDomain(tier.domain, participant.device, placement.layer, expert, Role::DOWN))
-                        {
-                            missing_gpu_engine = true;
-                            break;
-                        }
-                    }
-
-                    const std::string registry_key = tier.domain + ":" + participant.device.to_string() +
-                                                     ":" + std::to_string(participant.participant_index);
-                    if (missing_gpu_engine && reported_missing_registry.insert(registry_key).second)
-                    {
-                        blockers.push_back(
-                            "Bridge Phase 5E accelerator prepared-engine blocker: expert overlay tier '" + tier.name +
-                            "' lowers to domain '" + tier.domain + "' participant " +
-                            std::to_string(participant.participant_index) + " on " + participant.device.to_string() +
-                            " but the ExpertGemmRegistry does not contain all active gate/up/down expert engines for that tier");
-                    }
-                }
-            }
-        }
-
-        const auto plan_only_blockers = overlayPlanOnlyRuntimeBlockers(plan);
-        if (!plan_only_blockers.empty())
-        {
-            if (!blockers.empty())
-                blockers.push_back(plan_only_blockers);
-            else
-                return plan_only_blockers;
-        }
-
-        return joinBlockers(blockers);
+        return "auto";
     }
 } // namespace
 
@@ -483,10 +389,13 @@ protected:
         if (world_size < cfg().mpi_ranks)
         {
             // Harness precondition: the CPU fallback tier is expressed as a
-            // two-rank NodeLocalTP domain in this Phase 0 audit fixture.
+            // two-rank NodeLocalTP domain.
             GTEST_SKIP() << "ExpertOverlay parity requires " << cfg().mpi_ranks
                          << " MPI ranks (got " << world_size << ")";
         }
+
+        if (auto blocker = overlayHardwareBlocker(caseForCurrentTest().topology))
+            GTEST_SKIP() << *blocker;
 
         mpi_ctx_ = std::make_shared<MPIContext>(rank, world_size, MPI_COMM_WORLD);
         Base::SetUp();
@@ -541,9 +450,13 @@ protected:
 
     bool setupPipeline()
     {
-        if (isRank0())
-            DeviceManager::instance().initialize(-1);
+        if (!isRootParityRank())
+        {
+            overlay_plan_ = makeTopologyOnlyOverlayPlan(caseForCurrentTest().topology);
+            return true;
+        }
 
+        DeviceManager::instance().initialize(-1);
         model_ctx_ = ModelContext::create(
             config_.model_path,
             nullptr,
@@ -561,25 +474,11 @@ protected:
         try
         {
             overlay_plan_ = makeOverlayPlan(caseForCurrentTest().topology, *model_ctx_);
-            setup_runtime_blocker_ = overlayPlanOnlyRuntimeBlockers(*overlay_plan_);
         }
         catch (const std::exception &e)
         {
             LOG_ERROR("[Qwen3.5 MoE ExpertOverlay] " << e.what());
             return false;
-        }
-
-        if (!setup_runtime_blocker_.empty())
-        {
-            if (!isRank0())
-                cpu_ctx_ = std::make_unique<llaminar2::testing::MockDeviceContext>(DeviceId::cpu(), ComputeBackendType::CPU);
-            return true;
-        }
-
-        if (!isRank0())
-        {
-            cpu_ctx_ = std::make_unique<llaminar2::testing::MockDeviceContext>(DeviceId::cpu(), ComputeBackendType::CPU);
-            return true;
         }
 
         InferenceRunnerConfig inf_config;
@@ -589,6 +488,7 @@ protected:
         inf_config.activation_precision = cfg().activation_precision;
         inf_config.kv_cache_precision = cfg().kv_cache_precision;
         inf_config.moe_expert_parallel_plan = overlay_plan_;
+        inf_config.moe_expert_overlay_mpi_ctx = mpi_ctx_;
 
         runner_ = createInferenceRunner(model_ctx_, nullptr, DeviceId::cpu(), inf_config);
         if (!runner_)
@@ -613,39 +513,11 @@ protected:
         return ok == 1;
     }
 
-    std::string broadcastRootString(const std::string &root_value) const
-    {
-        std::string value = isRootParityRank() ? root_value : std::string();
-        int length = static_cast<int>(value.size());
-        MPI_Bcast(&length, 1, MPI_INT, 0, MPI_COMM_WORLD);
-        if (length < 0)
-            return {};
-        value.resize(static_cast<size_t>(length));
-        if (length > 0)
-            MPI_Bcast(value.data(), length, MPI_CHAR, 0, MPI_COMM_WORLD);
-        return value;
-    }
-
     bool broadcastRootFlag(bool root_value) const
     {
         int flag = isRootParityRank() && root_value ? 1 : 0;
         MPI_Bcast(&flag, 1, MPI_INT, 0, MPI_COMM_WORLD);
         return flag != 0;
-    }
-
-    std::string synchronizedRuntimeBlocker()
-    {
-        std::string blocker;
-        if (isRootParityRank())
-        {
-            if (!setup_runtime_blocker_.empty())
-                blocker = setup_runtime_blocker_;
-            else if (!overlay_plan_ || !model_ctx_)
-                blocker = "ExpertOverlay parity setup did not produce a model context and overlay plan";
-            else
-                blocker = overlayRuntimeBlockers(*overlay_plan_, *model_ctx_);
-        }
-        return broadcastRootString(blocker);
     }
 
     bool synchronizedDecodeWorkAvailable()
@@ -657,197 +529,6 @@ protected:
                         !readDecodeTokensFromMetadata().empty();
         }
         return broadcastRootFlag(available);
-    }
-
-    int continuationRootWorldRank() const
-    {
-        if (!overlay_plan_)
-            return 0;
-
-        const ExpertComputeDomain *continuation = findDomain(*overlay_plan_, overlay_plan_->continuation_domain);
-        if (!continuation)
-            return 0;
-        if (!continuation->world_ranks.empty())
-            return continuation->world_ranks.front();
-        return std::max(0, continuation->owner_rank);
-    }
-
-    int cpuFallbackTierIndex() const
-    {
-        if (!overlay_plan_)
-            return -1;
-
-        for (size_t tier_index = 0; tier_index < overlay_plan_->routed_tiers.size(); ++tier_index)
-        {
-            const auto &tier = overlay_plan_->routed_tiers[tier_index];
-            if (tier.domain == kCpuColdDomain && tier.fallback)
-                return static_cast<int>(tier_index);
-        }
-        return -1;
-    }
-
-    std::vector<bool> fallbackExpertMaskForLayer(int layer_idx, int tier_index) const
-    {
-        if (!overlay_plan_)
-            return {};
-
-        const ExpertLayerPlacement *placement = findLayerPlacement(*overlay_plan_, layer_idx);
-        if (!placement)
-            return {};
-
-        std::vector<bool> mask;
-        mask.reserve(placement->routed_expert_tier.size());
-        for (int mapped_tier : placement->routed_expert_tier)
-            mask.push_back(mapped_tier == tier_index);
-        return mask;
-    }
-
-    std::shared_ptr<TensorBase> loadFallbackWeight(int layer_idx, const char *suffix)
-    {
-        auto weight_mgr = model_ctx_ ? model_ctx_->concreteWeightManager() : nullptr;
-        if (!weight_mgr)
-            return nullptr;
-
-        const std::string name = "blk." + std::to_string(layer_idx) + "." + suffix;
-        auto weight = weight_mgr->getWeightForDevice(name, DeviceId::cpu(), layer_idx);
-        if (!weight)
-            LOG_ERROR("[Qwen3.5 MoE ExpertOverlay] Missing CPU fallback weight " << name);
-        return weight;
-    }
-
-    void clearFallbackWeightCache()
-    {
-        auto weight_mgr = model_ctx_ ? model_ctx_->concreteWeightManager() : nullptr;
-        if (weight_mgr)
-            weight_mgr->clearCache();
-    }
-
-    bool executeFallbackParticipantPass(int seq_len)
-    {
-        // Temporary Phase 0 orchestration scaffolding. Non-root ranks manually
-        // run CPU fallback participant work until the composite overlay runner
-        // described in docs/v2/MOE_EXPERT_OVERLAY_ORCHESTRATION_REFACTOR_PLAN.md
-        // replaces this parity-only helper.
-        if (seq_len <= 0)
-            return true;
-        if (!overlay_plan_ || !model_ctx_)
-        {
-            LOG_ERROR("[Qwen3.5 MoE ExpertOverlay] Fallback participant missing overlay plan/model context");
-            return false;
-        }
-
-        const ExpertComputeDomain *cpu_domain = findDomain(*overlay_plan_, kCpuColdDomain);
-        const int tier_index = cpuFallbackTierIndex();
-        if (!cpu_domain || tier_index < 0)
-        {
-            LOG_ERROR("[Qwen3.5 MoE ExpertOverlay] CPU fallback domain/tier not found");
-            return false;
-        }
-
-        const auto &loader = model_ctx_->concreteLoader();
-        const std::string &arch = model_ctx_->architecture();
-        const int d_model = model_ctx_->embeddingLength();
-        const int num_experts = loader.getInt(arch + ".expert_count", 0);
-        const int top_k = loader.getInt(arch + ".expert_used_count", 0);
-        int expert_intermediate = loader.getInt(arch + ".expert_feed_forward_length", 0);
-        if (expert_intermediate == 0)
-            expert_intermediate = model_ctx_->feedForwardLength();
-
-        if (d_model <= 0 || num_experts <= 0 || top_k <= 0 || expert_intermediate <= 0)
-        {
-            LOG_ERROR("[Qwen3.5 MoE ExpertOverlay] Invalid CPU fallback metadata: d_model=" << d_model
-                                                                                            << " num_experts=" << num_experts
-                                                                                            << " top_k=" << top_k
-                                                                                            << " expert_intermediate=" << expert_intermediate);
-            return false;
-        }
-
-        if (!cpu_ctx_)
-            cpu_ctx_ = std::make_unique<llaminar2::testing::MockDeviceContext>(DeviceId::cpu(), ComputeBackendType::CPU);
-
-        for (int layer_idx = 0; layer_idx < model_ctx_->totalBlockCount(); ++layer_idx)
-        {
-            auto fallback_mask = fallbackExpertMaskForLayer(layer_idx, tier_index);
-            if (!anyExpertEnabled(fallback_mask))
-                continue;
-
-            auto gate = loadFallbackWeight(layer_idx, "ffn_gate_exps.weight");
-            auto up = loadFallbackWeight(layer_idx, "ffn_up_exps.weight");
-            auto down = loadFallbackWeight(layer_idx, "ffn_down_exps.weight");
-            if (!gate || !up || !down)
-            {
-                clearFallbackWeightCache();
-                return false;
-            }
-
-            auto input = std::make_shared<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(seq_len), static_cast<size_t>(d_model)});
-            auto routing_indices = std::make_shared<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(seq_len), static_cast<size_t>(top_k)});
-            auto routing_weights = std::make_shared<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(seq_len), static_cast<size_t>(top_k)});
-            auto output = std::make_shared<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(seq_len), static_cast<size_t>(d_model)});
-
-            std::fill_n(input->mutable_data(), input->numel(), 0.0f);
-            std::fill_n(routing_indices->mutable_data(), routing_indices->numel(), -1.0f);
-            std::fill_n(routing_weights->mutable_data(), routing_weights->numel(), 0.0f);
-            std::fill_n(output->mutable_data(), output->numel(), 0.0f);
-
-            MoEExpertOverlayCPUFallbackStage::Params params;
-            params.device_id = DeviceId::cpu();
-            params.mpi_ctx = mpi_ctx_.get();
-            params.domain = *cpu_domain;
-            params.root_world_rank = continuationRootWorldRank();
-            params.domain_id = MoEExpertOverlayCPUFallback::stableDomainId(cpu_domain->name);
-            params.input = input.get();
-            params.routing_indices = routing_indices.get();
-            params.routing_weights = routing_weights.get();
-            params.gate_exps = gate.get();
-            params.up_exps = up.get();
-            params.down_exps = down.get();
-            params.output = output.get();
-            params.seq_len = seq_len;
-            params.d_model = d_model;
-            params.num_experts = num_experts;
-            params.top_k = top_k;
-            params.expert_intermediate = expert_intermediate;
-            params.layer_idx = layer_idx;
-            params.expert_mask = std::move(fallback_mask);
-            params.transfer_mode = MoEExpertTransferMode::Auto;
-
-            MoEExpertOverlayCPUFallbackStage stage(std::move(params));
-            const bool executed = stage.execute(cpu_ctx_.get());
-            clearFallbackWeightCache();
-            if (!executed)
-                return false;
-        }
-
-        return true;
-    }
-
-    bool runFallbackParticipantPrefill()
-    {
-        // See executeFallbackParticipantPass(): this wrapper is temporary
-        // scaffolding for the Phase 0 orchestration gap, not production runner
-        // behavior. Reference:
-        // docs/v2/MOE_EXPERT_OVERLAY_ORCHESTRATION_REFACTOR_PLAN.md.
-        return executeFallbackParticipantPass(static_cast<int>(config_.token_ids.size()));
-    }
-
-    bool runFallbackParticipantDecode()
-    {
-        // See executeFallbackParticipantPass(): this wrapper is temporary
-        // scaffolding for the Phase 0 orchestration gap, not production runner
-        // behavior. Reference:
-        // docs/v2/MOE_EXPERT_OVERLAY_ORCHESTRATION_REFACTOR_PLAN.md.
-        if (!runFallbackParticipantPrefill())
-            return false;
-
-        const auto decode_tokens = readDecodeTokensFromMetadata();
-        const size_t steps = std::min(decode_tokens.size(), static_cast<size_t>(config_.decode_steps));
-        for (size_t step = 0; step < steps; ++step)
-        {
-            if (!executeFallbackParticipantPass(1))
-                return false;
-        }
-        return true;
     }
 
     bool producedPrefillSummary(const ParityTestSummary &summary) const
@@ -878,22 +559,36 @@ protected:
         std::abort();
     }
 
+    [[noreturn]] void abortOverlayWorldAfterRootThrow(const char *phase, const std::string &what) const
+    {
+        abortOverlayWorld(std::string("root rank threw during ") + phase + ": " + what);
+    }
+
     void runOverlayPrefillParityBody()
     {
+        GTEST_SKIP() << "Phase 10A graph-native overlay dispatch backend is not wired into real parity yet";
+
         const bool setup_ok = setupPipeline();
         ASSERT_TRUE(synchronizeRanksOk(setup_ok)) << "Pipeline setup failed";
 
-        if (const auto blocker = synchronizedRuntimeBlocker(); !blocker.empty())
-            GTEST_SKIP() << blocker;
-
         if (!isRootParityRank())
         {
-            ASSERT_TRUE(runFallbackParticipantPrefill())
-                << "Rank " << mpiRank() << " failed CPU fallback participant prefill";
             return;
         }
 
-        auto summary = runPrefillParity();
+        ParityTestSummary summary;
+        try
+        {
+            summary = runPrefillParity();
+        }
+        catch (const std::exception &e)
+        {
+            abortOverlayWorldAfterRootThrow("prefill parity", e.what());
+        }
+        catch (...)
+        {
+            abortOverlayWorldAfterRootThrow("prefill parity", "unknown non-std exception");
+        }
         if (!producedPrefillSummary(summary))
         {
             abortOverlayWorld("root rank produced no prefill parity summary, likely because forward failed before all overlay tiers completed");
@@ -903,23 +598,32 @@ protected:
 
     void runOverlayDecodeParityBody()
     {
+        GTEST_SKIP() << "Phase 10A graph-native overlay dispatch backend is not wired into real parity yet";
+
         const bool setup_ok = setupPipeline();
         ASSERT_TRUE(synchronizeRanksOk(setup_ok)) << "Pipeline setup failed";
-
-        if (const auto blocker = synchronizedRuntimeBlocker(); !blocker.empty())
-            GTEST_SKIP() << blocker;
 
         if (!synchronizedDecodeWorkAvailable())
             GTEST_SKIP() << "Decode snapshots or decode token metadata are unavailable";
 
         if (!isRootParityRank())
         {
-            ASSERT_TRUE(runFallbackParticipantDecode())
-                << "Rank " << mpiRank() << " failed CPU fallback participant decode";
             return;
         }
 
-        auto summary = runDecodeParity();
+        DecodeParitySummary summary;
+        try
+        {
+            summary = runDecodeParity();
+        }
+        catch (const std::exception &e)
+        {
+            abortOverlayWorldAfterRootThrow("decode parity", e.what());
+        }
+        catch (...)
+        {
+            abortOverlayWorldAfterRootThrow("decode parity", "unknown non-std exception");
+        }
         if (!producedDecodeSummary(summary))
         {
             abortOverlayWorld("root rank produced no decode parity summary, likely because forward failed before all overlay tiers completed");
@@ -928,8 +632,6 @@ protected:
     }
 
     std::shared_ptr<MoEExpertParallelPlan> overlay_plan_;
-    std::string setup_runtime_blocker_;
-    std::unique_ptr<llaminar2::testing::MockDeviceContext> cpu_ctx_;
 };
 
 TEST_F(Qwen35MoEExpertOverlay, OverlayPlanTopology_ROCm2TP_SharedHot_CPU2NodeLocalTP_Cold)

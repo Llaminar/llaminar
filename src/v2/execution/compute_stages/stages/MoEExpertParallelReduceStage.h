@@ -28,6 +28,7 @@ namespace llaminar2
 {
 
     class TensorBase;
+    struct MoEOverlayDomainWorkResult;
 
     enum class MoEExpertParallelReduceMode
     {
@@ -67,8 +68,8 @@ namespace llaminar2
         size_t bytes = 0;
         bool host_sync_required = false;
         bool source_is_continuation = false;
-        bool is_sparse = false;      ///< True when partial uses compact selected_rows layout
-        size_t sparse_row_count = 0; ///< Number of selected rows when is_sparse=true
+        bool is_sparse = false;           ///< True when partial uses compact selected_rows layout
+        size_t sparse_row_count = 0;      ///< Number of selected rows when is_sparse=true
         MoEExpertParallelReducePartialAccumulationPath accumulation_path =
             MoEExpertParallelReducePartialAccumulationPath::HostSummedCorrectnessFallback;
     };
@@ -81,7 +82,7 @@ namespace llaminar2
         bool host_staged = true;
         bool output_resident_on_continuation = false;
         size_t partial_count = 0;
-        size_t sparse_partial_count = 0; ///< Number of compact sparse partials (Bridge Phase 7A interface; currently 0 in production)
+        size_t sparse_partial_count = 0;  ///< Number of compact sparse partials (Bridge Phase 7A interface; currently 0 in production)
         size_t input_bytes = 0;
         size_t host_staged_read_bytes = 0;
         size_t device_to_host_bytes = 0;
@@ -100,15 +101,16 @@ namespace llaminar2
         {
             STAGE_PARAMS_COMMON_FIELDS;
 
-            std::vector<const ITensor *> partials;                                       ///< FP32 partial tensors: dense [rows,cols] or sparse [selected_rows.size(),cols]
-            std::vector<std::shared_ptr<TensorBase>> partial_lifetimes;                  ///< Graph-owned partial tensor storage
-            std::vector<MoEExpertParallelReducePartialInfo> partial_infos;               ///< Optional per-partial source metadata
-            std::vector<TensorBase *> sparse_expansion_scratch;                          ///< Dense [rows,cols] FP32 scratch for optimized sparse partials
+            std::vector<const ITensor *> partials; ///< FP32 partial tensors: dense [rows,cols] or sparse [selected_rows.size(),cols]
+            std::vector<std::shared_ptr<TensorBase>> partial_lifetimes; ///< Graph-owned partial tensor storage
+            std::vector<MoEExpertParallelReducePartialInfo> partial_infos; ///< Optional per-partial source metadata
+            std::vector<std::shared_ptr<MoEOverlayDomainWorkResult>> runtime_partial_results; ///< Optional runtime-service results aligned with partials
+            std::vector<TensorBase *> sparse_expansion_scratch; ///< Dense [rows,cols] FP32 scratch for optimized sparse partials
             std::vector<std::shared_ptr<TensorBase>> sparse_expansion_scratch_lifetimes; ///< Optional owner for sparse_expansion_scratch
-            ITensor *output = nullptr;                                                   ///< Dense FP32 continuation output [rows, cols]
-            BufferId output_buffer_id = BufferId::_COUNT;                                ///< Arena output id when this reduce writes a managed buffer
-            size_t rows = 0;                                                             ///< Optional expected rows (0 = infer from output)
-            size_t cols = 0;                                                             ///< Optional expected cols (0 = infer from output)
+            ITensor *output = nullptr;             ///< Dense FP32 continuation output [rows, cols]
+            BufferId output_buffer_id = BufferId::_COUNT; ///< Arena output id when this reduce writes a managed buffer
+            size_t rows = 0;                       ///< Optional expected rows (0 = infer from output)
+            size_t cols = 0;                       ///< Optional expected cols (0 = infer from output)
             int layer_idx = -1;
 
             MoEExpertParallelReduceMode mode = MoEExpertParallelReduceMode::HostStagedCorrectness;

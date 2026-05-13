@@ -1,5 +1,6 @@
 #include "execution/compute_stages/ComputeStageFactory.h"
 #include "execution/compute_stages/stages/MoEExpertParallelReduceStage.h"
+#include "execution/moe/IOverlayDomainRuntime.h"
 #include "mocks/MockComputeStage.h"
 #include "utils/TestTensorFactory.h"
 
@@ -403,6 +404,52 @@ TEST_F(Test__MoEExpertParallelReduceStage, MixedSparseAndDensePartialsReduceCorr
     EXPECT_EQ(diagnostics.partials[0].bytes, 3u * 2u * sizeof(float));
     // Sparse bytes = 1 row (compact) * 2 cols * sizeof(float)
     EXPECT_EQ(diagnostics.partials[1].bytes, 1u * 2u * sizeof(float));
+}
+
+TEST_F(Test__MoEExpertParallelReduceStage, RuntimePartialResultMetadataOverridesStaticPartialInfo)
+{
+    auto sparse = fp32Tensor(1, 2, {10.0f, 20.0f});
+    auto output = fp32Tensor(3, 2, {0.0f, 0.0f,
+                                   0.0f, 0.0f,
+                                   0.0f, 0.0f});
+    auto runtime_result = std::make_shared<MoEOverlayDomainWorkResult>();
+    runtime_result->ok = true;
+    runtime_result->partial_tensor = sparse.get();
+    runtime_result->partial_info = MoEExpertParallelReducePartialInfo{
+        .name = "runtime_cold",
+        .source_domain = "cpu_cold",
+        .source_device = DeviceId::cpu(),
+        .selected_rows = {1},
+    };
+
+    MoEExpertParallelReduceDiagnostics diagnostics;
+    MoEExpertParallelReduceStage::Params params;
+    params.device_id = DeviceId::cpu();
+    params.partials = {sparse.get()};
+    params.partial_infos = {
+        MoEExpertParallelReducePartialInfo{
+            .name = "stale_dense_metadata",
+            .source_domain = "stale",
+            .source_device = DeviceId::cuda(0),
+        },
+    };
+    params.runtime_partial_results = {runtime_result};
+    params.output = output.get();
+    params.rows = 3;
+    params.cols = 2;
+    params.diagnostics = &diagnostics;
+
+    MoEExpertParallelReduceStage stage(std::move(params));
+    ASSERT_TRUE(stage.execute(ctx_.get()));
+
+    expectTensorValues(*output, {0.0f, 0.0f,
+                                 10.0f, 20.0f,
+                                 0.0f, 0.0f});
+    ASSERT_EQ(diagnostics.partials.size(), 1u);
+    EXPECT_EQ(diagnostics.partials[0].name, "runtime_cold");
+    EXPECT_EQ(diagnostics.partials[0].source_domain, "cpu_cold");
+    EXPECT_TRUE(diagnostics.partials[0].is_sparse);
+    EXPECT_EQ(diagnostics.partials[0].sparse_row_count, 1u);
 }
 
 TEST_F(Test__MoEExpertParallelReduceStage, SparsePartialShapeMismatchFailsClearly)
